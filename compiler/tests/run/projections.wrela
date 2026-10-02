@@ -1,0 +1,50 @@
+// run: projections: bindings, `mut` parameters, projection-returning functions
+// expect: proj_bind() = 3.0
+// expect: proj_ret() = 11.0
+// expect: proj_if(1) = 5.0
+// expect: proj_if(0) = 6.0
+// expect: proj_chain() = 7.0
+
+struct World {
+    a: [f32; 2],
+    b: f32,
+}
+
+fn mk() -> World {
+    World { a: [1.0, 2.0], b: 3.0 }
+}
+
+fn first(w: mut World) -> mut f32 {
+    mut w.a[0]
+}
+
+fn pick(w: mut World, c: bool) -> mut f32 {
+    if c { mut w.a[0] } else { mut w.a[1] }
+}
+
+pub fn proj_bind() -> f32 {
+    var w = mk()
+    mut b = w.b
+    b = b * 1.0
+    w.b
+}
+
+pub fn proj_ret() -> f32 {
+    var w = mk()
+    first(mut w) += 10.0
+    w.a[0]
+}
+
+pub fn proj_if(c: u32) -> f32 {
+    var w = mk()
+    pick(mut w, c == 1) += 4.0
+    if c == 1 { w.a[0] } else { w.a[1] + 0.0 * w.a[0] }
+}
+
+pub fn proj_chain() -> f32 {
+    var w = mk()
+    mut a = w.a
+    mut b = a
+    b[1] = 7.0
+    w.a[1]
+}

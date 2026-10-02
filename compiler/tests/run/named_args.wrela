@@ -1,0 +1,17 @@
+// run: named arguments are evaluated in the order they're written
+// expect: order() = 21
+
+fn note(log: mut i32, v: i32) -> i32 {
+    log = log * 10 + v
+    v
+}
+
+fn pick(a: i32, b: i32) -> i32 {
+    a - b
+}
+
+pub fn order() -> i32 {
+    var log = 0
+    let r = pick(b: note(mut log, 2), a: note(mut log, 1))
+    log + r * 0 + 0 * r
+}

@@ -29,12 +29,11 @@ pub const STD_SOURCES: &[(&str, &str)] = &[
     ("std::math", include_str!("../../std/math.wrela")),
 ];
 
-/// A checked program: its definitions, every function body's typed tree, and every constant.
+/// A checked program: its definitions, every function body's MIR, and every constant.
 #[derive(Debug)]
 pub struct Checked {
     pub program: Program,
-    pub bodies: BTreeMap<ty::FnId, thir::Body>,
-    /// Each well-typed body's MIR.
+    /// Each function body's MIR.
     pub mir: BTreeMap<ty::FnId, mir::Body>,
     pub consts: BTreeMap<ty::ConstId, (ty::TyId, thir::Expr)>,
 }
@@ -46,7 +45,6 @@ pub fn check_program(units: Vec<SourceUnit>, diags: &mut Vec<Diagnostic>) -> Che
     let p = &program;
     diags.extend(gpu::check_entries(p));
     let (const_tys, consts) = check::check_consts(p, diags);
-    let mut bodies = BTreeMap::new();
     let mut mir = BTreeMap::new();
     for i in 0..p.fns.len() {
         let f = ty::FnId(i as u32);
@@ -61,11 +59,10 @@ pub fn check_program(units: Vec<SourceUnit>, diags: &mut Vec<Diagnostic>) -> Che
                 diags.extend(borrowck::check(p, &m));
                 mir.insert(f, m);
             }
-            bodies.insert(f, b);
         }
     }
     for i in 0..p.adts.len() {
         diags.extend(check::check_field_defaults(p, &const_tys, ty::AdtId(i as u32)));
     }
-    Checked { program, bodies, mir, consts }
+    Checked { program, mir, consts }
 }

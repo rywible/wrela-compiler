@@ -1,0 +1,43 @@
+// run: direct and mutual recursion return their values
+// expect: f(5) = 120
+// expect: selfrec(3) = 10
+// expect: fib_of(10) = 55
+// expect: even(10) = 1
+// expect: even(7) = 0
+
+fn fact(n: u32) -> u32 {
+    if n <= 1 { 1 } else { n * fact(n - 1) }
+}
+
+pub fn f(n: u32) -> u32 {
+    fact(n)
+}
+
+pub fn selfrec(n: u32) -> u32 {
+    if n == 0 { 7 } else { selfrec(n - 1) + 1 }
+}
+
+fn fib(n: u32) -> u32 {
+    if n < 2 {
+        return n
+    }
+    let a = fib(n - 1)
+    let b = fib(n - 2)
+    a + b
+}
+
+pub fn fib_of(n: u32) -> u32 {
+    fib(n)
+}
+
+fn is_even(n: u32) -> bool {
+    if n == 0 { true } else { is_odd(n - 1) }
+}
+
+fn is_odd(n: u32) -> bool {
+    if n == 0 { false } else { is_even(n - 1) }
+}
+
+pub fn even(n: u32) -> u32 {
+    if is_even(n) { 1 } else { 0 }
+}

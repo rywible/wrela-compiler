@@ -8,7 +8,7 @@ use crate::{Cx, ModuleBuilder};
 use wrela_diag::{Diagnostic, Span, codes};
 use wrela_ir as ir;
 use wrela_sema::defs::{Entry, Lang, Mode};
-use wrela_sema::thir;
+use wrela_sema::mir;
 use wrela_sema::ty::*;
 
 /// A pipeline as CPU code names it.
@@ -167,7 +167,7 @@ fn handle(fl: &mut Fl, buf: ir::ValueId) -> ir::ValueId {
     fl.value(u, ir::Expr::Extract(buf, 0))
 }
 
-pub(crate) fn lower_dispatch(fl: &mut Fl, d: &thir::Dispatch, span: Span) {
+pub(crate) fn lower_dispatch(fl: &mut Fl, d: &mir::Dispatch, span: Span) {
     if fl.is_gpu() {
         host_effect(fl, "`dispatch`", span);
         return;
@@ -176,30 +176,28 @@ pub(crate) fn lower_dispatch(fl: &mut Fl, d: &thir::Dispatch, span: Span) {
     let pindex =
         pipeline_index(fl.cx, PipelineKey::Compute { kernel: d.kernel, substs: substs.clone() });
     let ptys = param_types(fl.cx, d.kernel, &substs);
-    let Some(gv) = fl.expr(&d.groups) else { return };
-    let gt = fl.concrete(d.groups.ty);
-    let groups = if matches!(fl.cx.checked.program.types.kind(gt), TyKind::Tuple(_)) {
-        let u = fl.mb.m.types.u32();
-        (0..3).map(|k| fl.value(u, ir::Expr::Extract(gv, k))).collect::<Vec<_>>()
-    } else {
-        let one = fl.u32c(1);
-        vec![gv, one, one]
-    };
+    let mut groups = Vec::new();
+    for g in &d.groups {
+        match fl.operand(g) {
+            Some(v) => groups.push(v),
+            None => return,
+        }
+    }
     let mut handles = Vec::new();
     let mut uniform_vals = Vec::new();
     let mut uniform_fields = Vec::new();
     for (i, &pt) in ptys.iter().enumerate() {
         let class = classify(fl.cx, d.kernel, i, pt, None);
-        let Some((_, arg)) = d.args.iter().find(|(j, _)| *j == i) else { continue };
+        let Some((_, arg, arg_span)) = d.args.iter().find(|(j, ..)| *j == i) else { continue };
         match class {
             ParamClass::Builtin(_) | ParamClass::Varyings => {}
             ParamClass::Buffer { .. } => {
-                let Some(v) = fl.expr(arg) else { return };
+                let Some(v) = fl.read(arg) else { return };
                 handles.push(handle(fl, v));
             }
             ParamClass::Uniform => {
-                let Some(v) = fl.expr(arg) else { continue };
-                let Some(t) = fl.cx.lower_ty(fl.mb, pt, arg.span) else { continue };
+                let Some(v) = fl.read(arg) else { continue };
+                let Some(t) = fl.cx.lower_ty(fl.mb, pt, *arg_span) else { continue };
                 let name = fl.cx.checked.program.func(d.kernel).params[i].name.clone();
                 uniform_fields.push((name, t));
                 uniform_vals.push(v);
@@ -259,7 +257,7 @@ fn render_uniform_params(cx: &mut Cx, key: &PipelineKey) -> Vec<(String, TyId)> 
     out
 }
 
-pub(crate) fn lower_draw(fl: &mut Fl, d: &thir::Draw, span: Span) {
+pub(crate) fn lower_draw(fl: &mut Fl, d: &mir::Draw, span: Span) {
     if fl.is_gpu() {
         host_effect(fl, "`draw`", span);
         return;
@@ -268,15 +266,15 @@ pub(crate) fn lower_draw(fl: &mut Fl, d: &thir::Draw, span: Span) {
     let fs = (d.fragment.0, d.fragment.1.iter().map(|&a| fl.concrete(a)).collect::<Vec<_>>());
     let key = PipelineKey::Render { vertex: vs, fragment: fs };
     let pindex = pipeline_index(fl.cx, key.clone());
-    let Some(vertices) = fl.expr(&d.vertices) else { return };
-    let Some(instances) = fl.expr(&d.instances) else { return };
+    let Some(vertices) = fl.operand(&d.vertices) else { return };
+    let Some(instances) = fl.operand(&d.instances) else { return };
     let params = render_uniform_params(fl.cx, &key);
     let mut fields = Vec::new();
     let mut vals = Vec::new();
     for (name, t) in params {
-        let Some((_, arg)) = d.args.iter().find(|(n, _)| *n == name) else { continue };
-        let Some(v) = fl.expr(arg) else { return };
-        let Some(it) = fl.cx.lower_ty(fl.mb, t, arg.span) else { continue };
+        let Some((_, arg, arg_span)) = d.args.iter().find(|(n, ..)| *n == name) else { continue };
+        let Some(v) = fl.read(arg) else { return };
+        let Some(it) = fl.cx.lower_ty(fl.mb, t, *arg_span) else { continue };
         fields.push((name, it));
         vals.push(v);
     }
@@ -292,8 +290,8 @@ pub(crate) fn lower_draw(fl: &mut Fl, d: &thir::Draw, span: Span) {
                 continue;
             }
             let name = fl.cx.checked.program.func(*f).params[i].name.clone();
-            let Some((_, arg)) = d.args.iter().find(|(n, _)| *n == name) else { return };
-            let Some(v) = fl.expr(arg) else { return };
+            let Some((_, arg, _)) = d.args.iter().find(|(n, ..)| *n == name) else { return };
+            let Some(v) = fl.read(arg) else { return };
             handles.push(handle(fl, v));
         }
     }
@@ -316,14 +314,14 @@ pub(crate) fn intrinsic(
     fl: &mut Fl,
     func: FnId,
     substs: &[TyId],
-    c: &thir::Call,
-    e: &thir::Expr,
+    c: &mir::Call,
+    ty: Option<TyId>,
 ) -> Option<ir::ValueId> {
     let lang = fl.cx.checked.program.func(func).lang;
-    let span = e.span;
+    let span = c.span;
     match lang {
         Some(Lang::Gradient | Lang::ValueAndGradient | Lang::IntervalOf) => {
-            return derived_call(fl, lang, substs, c, e);
+            return derived_call(fl, lang, substs, c, ty);
         }
         Some(Lang::Buffer | Lang::Write | Lang::BeginScreenPass | Lang::Present) if fl.is_gpu() => {
             let name = fl.cx.checked.program.func(func).name.clone();
@@ -336,28 +334,29 @@ pub(crate) fn intrinsic(
         Some(Lang::Buffer) => {
             let elem = fl.cx.lower_ty(fl.mb, substs[0], span)?;
             let elem_size = ir::layout::array_stride(&fl.mb.m.types, elem);
-            let count = fl.expr(&c.args[0])?;
+            let count = fl.arg_value(&c.args[0])?;
             let u = fl.mb.m.types.u32();
             let h =
                 fl.value(u, ir::Expr::Host(ir::HostOp::CreateBuffer { elem_size }, vec![count]));
-            let bt = fl.ty(e.ty, span)?;
+            let bt = fl.ty(ty?, span)?;
             Some(fl.value(bt, ir::Expr::Construct(bt, vec![h])))
         }
         Some(Lang::Write) => {
             let elem = fl.cx.lower_ty(fl.mb, substs[0], span)?;
             let elem_size = ir::layout::array_stride(&fl.mb.m.types, elem);
-            let buf = fl.expr(&c.args[0])?;
+            let buf = fl.arg_value(&c.args[0])?;
             let h = handle(fl, buf);
-            let at = fl.expr(&c.args[1])?;
+            let at = fl.arg_value(&c.args[1])?;
             let run_t = fl.mb.m.types.intern(ir::TypeDef::Run(elem));
-            let values = &c.args[2];
-            let vt = fl.concrete(values.ty);
+            let values = c.args[2].place()?;
+            let vt = mir::place_ty(&fl.cx.checked.program, &fl.mir.locals, values);
+            let vt = fl.concrete(vt);
             let run = match fl.cx.checked.program.types.kind(vt).clone() {
                 TyKind::Array(..) => {
-                    let p = fl.place_or_temp(values)?;
+                    let p = fl.place(values)?;
                     fl.value(run_t, ir::Expr::Run(p))
                 }
-                _ => fl.expr(values)?,
+                _ => fl.read(values)?,
             };
             fl.emit(ir::Stmt::Eval(ir::Expr::Host(
                 ir::HostOp::WriteBuffer { elem_size },
@@ -366,7 +365,7 @@ pub(crate) fn intrinsic(
             None
         }
         Some(Lang::BeginScreenPass) => {
-            let clear = fl.expr(&c.args[0])?;
+            let clear = fl.arg_value(&c.args[0])?;
             fl.emit(ir::Stmt::Eval(ir::Expr::Host(ir::HostOp::BeginScreenPass, vec![clear])));
             None
         }
@@ -456,8 +455,7 @@ pub(crate) fn check_derivative(fl: &mut Fl, span: Span) {
 
 /// The index of `out[id]` for a `Slots` write: the invocation's position in the whole dispatch,
 /// row by row.
-pub(crate) fn slot_index(fl: &mut Fl, id: &thir::Expr) -> Option<ir::ValueId> {
-    let idv = fl.expr(id)?;
+pub(crate) fn slot_index(fl: &mut Fl, idv: ir::ValueId) -> Option<ir::ValueId> {
     let u = fl.mb.m.types.u32();
     let x = fl.value(u, ir::Expr::Extract(idv, 0));
     let y = fl.value(u, ir::Expr::Extract(idv, 1));
@@ -864,7 +862,7 @@ pub(crate) fn bind_entry_params(fl: &mut Fl, func: FnId, entry: Entry) {
     let vret = vret.filter(|_| entry == Entry::Fragment);
     let mut input = 0u32;
     for (i, &t) in tys.iter().enumerate() {
-        let local = fl.body.params[i];
+        let local = fl.code.params[i];
         let class = classify(fl.cx, func, i, t, vret);
         match class {
             ParamClass::Builtin(_) => {
@@ -1084,24 +1082,24 @@ fn derived_call(
     fl: &mut Fl,
     lang: Option<Lang>,
     substs: &[TyId],
-    c: &thir::Call,
-    e: &thir::Expr,
+    c: &mir::Call,
+    ty: Option<TyId>,
 ) -> Option<ir::ValueId> {
     let kind = match lang {
         Some(Lang::Interval) | Some(Lang::IntervalOf) => DeriveKind::Interval,
         _ => DeriveKind::ValueAndGradient,
     };
-    let Some(Repr::Callable(callable, srcs)) = fl.callable_of(&c.args[0]) else {
+    let Some(Repr::Callable(callable, srcs)) = fl.callable_arg(&c.args[0]) else {
         fl.cx.err(Diagnostic::new(
             codes::E0700,
-            c.args[0].span,
+            c.args[0].span(),
             "a derived interpretation needs a closure or a named function",
         ));
         return None;
     };
     let input = substs[0];
     let key = InstanceKey::Derived { of: callable, kind, input };
-    let callee = fl.cx.instance(fl.mb, key, Some((fl.id, e.span)));
+    let callee = fl.cx.instance(fl.mb, key, Some((fl.id, c.span)));
     let mut args: Vec<ir::Arg> = Vec::new();
     for s in &srcs {
         args.push(if s.by_ref {
@@ -1111,14 +1109,14 @@ fn derived_call(
             ir::Arg::Value(fl.load(s.place.clone(), ty))
         });
     }
-    let x = fl.expr(&c.args[1])?;
+    let x = fl.arg_value(&c.args[1])?;
     args.push(ir::Arg::Value(x));
     let ret = fl.mb.m.functions[callee.index()].ret?;
     let v = fl.value(ret, ir::Expr::Call(callee, args));
     match lang {
         Some(Lang::Gradient) => {
             // value_and_gradient returns (f32, X); gradient wants the X.
-            let t = fl.ty(e.ty, e.span)?;
+            let t = fl.ty(ty?, c.span)?;
             Some(fl.value(t, ir::Expr::Extract(v, 1)))
         }
         _ => Some(v),

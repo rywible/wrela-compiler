@@ -5,7 +5,6 @@ use crate::{Cx, ModuleBuilder};
 use wrela_diag::{Diagnostic, Span, codes};
 use wrela_ir as ir;
 use wrela_sema::defs::{Mode, RetMode};
-use wrela_sema::thir;
 use wrela_sema::ty::*;
 
 /// How a parameter of type `ty` and `mode` is passed: `(by_ref, mutable)`. `mut` is by
@@ -62,7 +61,7 @@ impl<'a> Cx<'a> {
         let k = self.checked.program.types.kind(t).clone();
         match k {
             TyKind::Opaque(f, args) => {
-                let Some(hidden) = self.checked.bodies.get(&f).and_then(|b| b.hidden_ret) else {
+                let Some(hidden) = self.checked.mir.get(&f).and_then(|b| b.hidden_ret) else {
                     return self.checked.program.types.error;
                 };
                 let generics = self.checked.program.fn_all_generics(f);
@@ -298,13 +297,13 @@ impl<'a> Cx<'a> {
         match c {
             Callable::Func { .. } => Vec::new(),
             Callable::Closure { owner, id } => {
+                let checked = self.checked;
                 let Some(f) = owner.source_fn() else { return Vec::new() };
-                let Some(body) = self.checked.bodies.get(&f).cloned() else { return Vec::new() };
+                let Some(body) = checked.mir.get(&f) else { return Vec::new() };
                 let subst = self.instance_subst(owner);
-                let def = body.closures[id.0 as usize].clone();
                 let mut out = Vec::new();
-                for (l, written) in def.captures {
-                    let decl = body.local(l).clone();
+                for &(l, written) in &body.closures[id.0 as usize].captures {
+                    let decl = body.local(l);
                     let t = self.concrete(decl.ty, &subst);
                     if matches!(
                         self.checked.program.types.kind(t),
@@ -359,31 +358,31 @@ impl<'a> Cx<'a> {
                 f
             }
             InstanceKey::Closure { owner, id } => {
-                let c = Callable::Closure { owner: owner.clone(), id: *id };
-                let mut params =
-                    self.callable_params(mb, &c, Span::new(wrela_diag::FileId(0), 0, 0));
+                let checked = self.checked;
                 let Some(f) = owner.source_fn() else {
-                    return ir::Function::new("closure", params, None);
+                    return ir::Function::new("closure", Vec::new(), None);
                 };
-                let Some(body) = self.checked.bodies.get(&f).cloned() else {
-                    return ir::Function::new("closure", params, None);
+                let Some(body) = checked.mir.get(&f) else {
+                    return ir::Function::new("closure", Vec::new(), None);
                 };
+                let info = &body.closures[id.0 as usize];
+                let c = Callable::Closure { owner: owner.clone(), id: *id };
+                let mut params = self.callable_params(mb, &c, info.span);
                 let subst = self.instance_subst(owner);
-                let def = body.closures[id.0 as usize].clone();
-                for &l in &def.params {
-                    let decl = body.local(l).clone();
+                for &l in &info.params {
+                    let decl = body.local(l);
                     let t = self.concrete(decl.ty, &subst);
                     if let Some(ty) = self.lower_ty(mb, t, decl.span) {
                         params.push(ir::Param {
-                            name: decl.name,
+                            name: decl.name.clone(),
                             ty,
                             by_ref: false,
                             mutable: false,
                         });
                     }
                 }
-                let rt = self.concrete(def.ret, &subst);
-                let ret = self.lower_ty(mb, rt, def.span);
+                let rt = self.concrete(info.ret, &subst);
+                let ret = self.lower_ty(mb, rt, info.span);
                 let name = format!("{}_closure{}", self.checked.program.func(f).name, id.0);
                 ir::Function::new(name, params, ret)
             }
@@ -405,9 +404,4 @@ impl<'a> Cx<'a> {
             None => format!("fn_{n}"),
         }
     }
-}
-
-/// The body of an instance's source function (or its owner, for a closure).
-pub(crate) fn source_body(cx: &Cx, key: &InstanceKey) -> Option<thir::Body> {
-    key.source_fn().and_then(|f| cx.checked.bodies.get(&f).cloned())
 }

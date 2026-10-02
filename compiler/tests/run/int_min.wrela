@@ -1,0 +1,34 @@
+// run: the most negative integers are literals, not overflowing negations
+// expect: c_min() = -2147483648
+// expect: c_min_const() = -2147483648
+// expect: c_min64() = -9223372036854775808
+// expect: c_min_hex() = -2147483648
+// expect: neg_var(5) = -5
+// expect: neg_min() traps
+
+const MIN: i32 = -2147483648
+
+pub fn c_min() -> i32 {
+    -2147483648
+}
+
+pub fn c_min_const() -> i32 {
+    MIN
+}
+
+pub fn c_min64() -> i64 {
+    -9223372036854775808
+}
+
+pub fn c_min_hex() -> i32 {
+    -0x80000000
+}
+
+pub fn neg_var(x: i32) -> i32 {
+    -x
+}
+
+pub fn neg_min() -> i32 {
+    let m = MIN
+    -m
+}

@@ -1,0 +1,43 @@
+// run: assignments to swizzles and components
+// expect: swz() = 587.0
+// expect: comp() = 9.0
+// expect: idx() = 42.0
+// expect: mut_swizzle() = 324.0
+// expect: swizzle_alias() = 9.0
+
+pub fn swz() -> f32 {
+    var v = vec3(1.0, 2.0, 3.0)
+    v.x = 5.0
+    v.zy = vec2(7.0, 8.0)
+    v.x * 100.0 + v.y * 10.0 + v.z
+}
+
+pub fn comp() -> f32 {
+    var v = vec4(1.0, 2.0, 3.0, 4.0)
+    v.w += 5.0
+    v.w
+}
+
+pub fn idx() -> f32 {
+    var v = vec2(1.0, 2.0)
+    v[1] = 42.0
+    v[1]
+}
+
+fn nudge(v: mut vec2) {
+    v.x += 1.0
+    v.y += 2.0
+}
+
+pub fn mut_swizzle() -> f32 {
+    var v = vec3(1.0, 2.0, 3.0)
+    nudge(mut v.zx)
+    v.x * 100.0 + v.y * 10.0 + v.z
+}
+
+pub fn swizzle_alias() -> f32 {
+    var v = vec3(1.0, 2.0, 3.0)
+    mut s = v.zy
+    s.x = 9.0
+    v.z
+}

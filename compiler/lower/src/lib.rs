@@ -52,7 +52,7 @@ impl Roots {
         let mut gpu_checks = Vec::new();
         for (i, f) in p.fns.iter().enumerate() {
             let id = FnId(i as u32);
-            if p.is_std(f.module) || !checked.bodies.contains_key(&id) {
+            if p.is_std(f.module) || !checked.mir.contains_key(&id) {
                 continue;
             }
             if Some(f.module) == p.main
