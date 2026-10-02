@@ -18,7 +18,7 @@ use wrela_abi::Manifest;
 use wrela_abi::manifest::Stage;
 use wrela_abi::stream::{Command, decode};
 use wrela_host::{Host, Options, Value};
-use wrela_tests::{Bind, RawGpu, build, bytes_of, f32s, median, root, u32s};
+use wrela_tests::{Bind, RawGpu, built, bytes_of, f32s, median, root, u32s};
 
 /// 2²⁰ points ("1M").
 const POINTS: u32 = 1 << 20;
@@ -49,13 +49,10 @@ fn eval_g(@builtin(global_invocation_id) id: vec3u) {
 ";
 
 fn out_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("fields")
+    built("fields", PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("fields"))
 }
 
 fn load() -> Host {
-    if let Err(e) = build(&root().join("compiler/tests/fields"), &out_dir()) {
-        panic!("the grazer doesn't build:\n{e}");
-    }
     Host::load_with(out_dir(), &Options { record: true, ..Options::default() })
         .expect("load the grazer")
 }

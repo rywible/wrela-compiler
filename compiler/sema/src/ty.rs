@@ -270,10 +270,6 @@ impl Types {
         matches!(self.kind(t), TyKind::Int(_))
     }
 
-    pub fn is_scalar(&self, t: TyId) -> bool {
-        matches!(self.kind(t), TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool)
-    }
-
     pub fn is_unit(&self, t: TyId) -> bool {
         t == self.unit
     }

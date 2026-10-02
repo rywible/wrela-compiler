@@ -2020,6 +2020,7 @@ name = "wrela-sema"
 version = "0.1.0"
 dependencies = [
  "elsa",
+ "wrela-abi",
  "wrela-diag",
  "wrela-syntax",
 ]
@@ -2040,6 +2041,7 @@ dependencies = [
  "wrela-abi",
  "wrela-diag",
  "wrela-driver",
+ "wrela-grammar",
  "wrela-host",
  "wrela-syntax",
 ]

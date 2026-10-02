@@ -395,9 +395,7 @@ impl<'a> Cx<'a> {
                 let p = &self.checked.program;
                 let name = p.fn_display_name(f);
                 // Identifier-safe: `Sphere::distance` becomes `Sphere_distance`.
-                let clean: String =
-                    name.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
-                format!("{clean}_{n}")
+                format!("{}_{n}", ir::ident(&name))
             }
             None => format!("fn_{n}"),
         }

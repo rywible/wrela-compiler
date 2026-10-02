@@ -268,7 +268,8 @@ fn resolve_projections(p: &Program, ty: TyId) -> TyId {
     }
 }
 
-/// The method `name` of trait `t` (or a supertrait), if it has one.
+/// The method `name` declared in trait `t` itself, if it has one. Not its supertraits': the
+/// bounds that method lookup goes through already include them.
 pub fn trait_method(p: &Program, t: TraitId, name: &str) -> Option<FnId> {
     p.trait_(t).methods.iter().copied().find(|&f| p.func(f).name == name)
 }

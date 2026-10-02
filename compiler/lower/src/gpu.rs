@@ -8,6 +8,7 @@ use crate::{Cx, ModuleBuilder};
 use wrela_diag::{Diagnostic, Span, codes};
 use wrela_ir as ir;
 use wrela_sema::defs::{Entry, Lang, Mode};
+use wrela_sema::gpu::BuiltinInput;
 use wrela_sema::mir;
 use wrela_sema::ty::*;
 
@@ -70,6 +71,25 @@ pub struct GpuCx {
 }
 
 impl GpuCx {
+    /// A module for `what` (`the @compute kernel k`), lowered from `entry_fns`, starting with
+    /// `stage`'s.
+    pub fn new(what: String, entry_fns: Vec<FnId>, stage: Option<Entry>) -> GpuCx {
+        let workgroup_size = match stage {
+            Some(Entry::Compute(wg)) => wg,
+            _ => [1, 1, 1],
+        };
+        GpuCx {
+            what,
+            entry_fns,
+            stage,
+            workgroup_size,
+            num_workgroups: None,
+            uniform_fields: Vec::new(),
+            uniform: None,
+            buffer_params: Vec::new(),
+        }
+    }
+
     pub fn describe(&self) -> String {
         self.what.clone()
     }
@@ -91,36 +111,30 @@ enum ParamClass {
 
 fn classify(cx: &Cx, f: FnId, param: usize, ty: TyId, vertex_ret: Option<TyId>) -> ParamClass {
     let p = &cx.checked.program;
-    let mode = p.func(f).params[param].mode;
+    if let Some(b) = BuiltinInput::of(p, ty) {
+        return ParamClass::Builtin(match b {
+            BuiltinInput::GlobalId => ir::BuiltinInput::GlobalInvocationId,
+            BuiltinInput::LocalId => ir::BuiltinInput::LocalInvocationId,
+            BuiltinInput::WorkgroupId => ir::BuiltinInput::WorkgroupId,
+            BuiltinInput::VertexIndex => ir::BuiltinInput::VertexIndex,
+            BuiltinInput::InstanceIndex => ir::BuiltinInput::InstanceIndex,
+            BuiltinInput::FragCoord => ir::BuiltinInput::Position,
+        });
+    }
     match p.types.kind(ty) {
         TyKind::Adt(a, args) => {
-            match p.adt(*a).lang {
-                Some(Lang::GlobalId) => {
-                    return ParamClass::Builtin(ir::BuiltinInput::GlobalInvocationId);
-                }
-                Some(Lang::LocalId) => {
-                    return ParamClass::Builtin(ir::BuiltinInput::LocalInvocationId);
-                }
-                Some(Lang::WorkgroupId) => {
-                    return ParamClass::Builtin(ir::BuiltinInput::WorkgroupId);
-                }
-                Some(Lang::VertexIndex) => {
-                    return ParamClass::Builtin(ir::BuiltinInput::VertexIndex);
-                }
-                Some(Lang::InstanceIndex) => {
-                    return ParamClass::Builtin(ir::BuiltinInput::InstanceIndex);
-                }
-                Some(Lang::FragCoord) => return ParamClass::Builtin(ir::BuiltinInput::Position),
-                Some(Lang::Slots) => return ParamClass::Buffer { elem: args[0], read_write: true },
-                _ => {}
+            if p.adt(*a).lang == Some(Lang::Slots) {
+                return ParamClass::Buffer { elem: args[0], read_write: true };
             }
             if Some(ty) == vertex_ret {
                 return ParamClass::Varyings;
             }
-            let _ = mode;
             ParamClass::Uniform
         }
-        TyKind::Slice(e) => ParamClass::Buffer { elem: *e, read_write: mode == Mode::Mut },
+        TyKind::Slice(e) => {
+            let mode = p.func(f).params[param].mode;
+            ParamClass::Buffer { elem: *e, read_write: mode == Mode::Mut }
+        }
         _ => ParamClass::Uniform,
     }
 }
@@ -401,10 +415,13 @@ fn host_effect(fl: &mut Fl, what: &str, span: Span) {
 /// The call chain from the entry point down to the current function, as one note
 /// (`fill → helper → scratch`), when the current function isn't the entry point itself.
 fn call_chain(fl: &Fl) -> Vec<String> {
-    let mut names = vec![strip_suffix(&fl.f.name).to_string()];
+    let name_of = |id: ir::FuncId, ir_name: &str| {
+        fl.mb.source_names.get(&id).cloned().unwrap_or_else(|| ir_name.to_string())
+    };
+    let mut names = vec![name_of(fl.id, &fl.f.name)];
     let mut at = fl.id;
     while let Some(&(caller, _)) = fl.mb.callers.get(&at) {
-        let name = strip_suffix(&fl.mb.m.functions[caller.index()].name).to_string();
+        let name = name_of(caller, &fl.mb.m.functions[caller.index()].name);
         // An entry point's wrapper has the entry point's name.
         if names.last() != Some(&name) {
             names.push(name);
@@ -420,13 +437,6 @@ fn call_chain(fl: &Fl) -> Vec<String> {
     names.reverse();
     let chain: Vec<String> = names.iter().map(|n| format!("`{n}`")).collect();
     vec![format!("called through {}", chain.join(" → "))]
-}
-
-fn strip_suffix(name: &str) -> &str {
-    match name.rfind('_') {
-        Some(i) if name[i + 1..].bytes().all(|b| b.is_ascii_digit()) => &name[..i],
-        _ => name,
-    }
 }
 
 pub(crate) fn check_derivative(fl: &mut Fl, span: Span) {
@@ -479,7 +489,7 @@ pub(crate) fn slot_index(fl: &mut Fl, idv: ir::ValueId) -> Option<ir::ValueId> {
 // ---- GPU side: pipelines ------------------------------------------------------------------------
 
 fn sanitize(name: &str) -> String {
-    name.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect()
+    ir::ident(name)
 }
 
 /// The IR struct the GPU builtin `b` arrives as (the std struct for it).
@@ -574,12 +584,7 @@ fn bind_uniform(
             .find_map(|(f, _)| program.func(*f).params.iter().find(|p| p.name == *name))
             .map(|p| p.span)?;
         if !wrela_sema::traits::implements_builtin(program, *t, Lang::GpuData) {
-            let shown = program.display_ty(*t);
-            cx.err(
-                Diagnostic::new(codes::E0604, span, format!("the GPU parameter `{name}` is a `{shown}`, which isn't `GpuData`"))
-                    .with_note("data crossing to the GPU must be `GpuData`, so its layout is the same on both sides (§6.13)")
-                    .with_help("opt the type in: `struct Name: GpuData { ... }`"),
-            );
+            cx.err(wrela_sema::gpu::not_gpu_data(program, name, *t, span));
             return None;
         }
         let it = cx.lower_ty(mb, *t, span)?;
@@ -597,8 +602,7 @@ fn bind_uniform(
     let size = ir::layout::round_up(16, ir::layout::layout(&mb.m.types, ty).size);
     if let Some(g) = mb.gpu.as_mut() {
         g.uniform = Some(id);
-        for (fi, (f, substs)) in owners.iter().enumerate() {
-            let _ = fi;
+        for (f, substs) in owners {
             let tys = param_types(cx, *f, substs);
             for (i, &t) in tys.iter().enumerate() {
                 if classify(cx, *f, i, t, vret) == ParamClass::Uniform {
@@ -617,16 +621,11 @@ fn lower_compute(cx: &mut Cx, _index: u32, kernel: FnId, substs: &[TyId]) -> Opt
     let def = cx.checked.program.func(kernel).clone();
     let Some(Entry::Compute(wg)) = def.attrs.entry.map(|e| e.0) else { return None };
     let mut mb = ModuleBuilder::new(ir::Target::Gpu);
-    mb.gpu = Some(GpuCx {
-        what: format!("the `@compute` kernel `{}`", def.name),
-        entry_fns: vec![kernel],
-        stage: Some(Entry::Compute(wg)),
-        workgroup_size: wg,
-        num_workgroups: None,
-        uniform_fields: Vec::new(),
-        uniform: None,
-        buffer_params: Vec::new(),
-    });
+    mb.gpu = Some(GpuCx::new(
+        format!("the `@compute` kernel `{}`", def.name),
+        vec![kernel],
+        Some(Entry::Compute(wg)),
+    ));
     let mut buffers = Vec::new();
     let resources = bind_buffers(cx, &mut mb, kernel, substs, None, &mut buffers);
     let tys = param_types(cx, kernel, substs);
@@ -658,10 +657,10 @@ fn lower_compute(cx: &mut Cx, _index: u32, kernel: FnId, substs: &[TyId]) -> Opt
     }
     let key =
         InstanceKey::Fn { func: kernel, substs: substs.to_vec(), callables: Vec::new(), resources };
-    let entry = entry_function(cx, &mut mb, &key, &sanitize(&def.name), None, None);
+    let entry = entry_function(&mut mb, &key, &def.name, None, None);
     cx.drain(&mut mb);
     check_recursion(cx, &mb);
-    let inputs = entry_inputs(cx, &mut mb, kernel, substs, None, true);
+    let inputs = entry_inputs(cx, kernel, substs, None, true);
     mb.m.entry_points.push(ir::EntryPoint {
         name: sanitize(&def.name),
         stage: ir::Stage::Compute { workgroup_size: wg },
@@ -688,16 +687,11 @@ fn lower_render(
     let vdef = cx.checked.program.func(vertex.0).clone();
     let fdef = cx.checked.program.func(fragment.0).clone();
     let mut mb = ModuleBuilder::new(ir::Target::Gpu);
-    mb.gpu = Some(GpuCx {
-        what: format!("the vertex shader `{}`", vdef.name),
-        entry_fns: vec![vertex.0, fragment.0],
-        stage: Some(Entry::Vertex),
-        workgroup_size: [1, 1, 1],
-        num_workgroups: None,
-        uniform_fields: Vec::new(),
-        uniform: None,
-        buffer_params: Vec::new(),
-    });
+    mb.gpu = Some(GpuCx::new(
+        format!("the vertex shader `{}`", vdef.name),
+        vec![vertex.0, fragment.0],
+        Some(Entry::Vertex),
+    ));
     let vret = ret_type(cx, vertex.0, &vertex.1);
     let mut buffers = Vec::new();
     let vres = bind_buffers(cx, &mut mb, vertex.0, &vertex.1, Some(vret), &mut buffers);
@@ -713,7 +707,7 @@ fn lower_render(
         resources: vres,
     };
     let vret_ir = cx.lower_ty(&mut mb, vret, vdef.sig_span)?;
-    let ventry = entry_function(cx, &mut mb, &vkey, &sanitize(&vdef.name), Some(vret_ir), None);
+    let ventry = entry_function(&mut mb, &vkey, &vdef.name, Some(vret_ir), None);
     cx.drain(&mut mb);
     if let Some(g) = mb.gpu.as_mut() {
         g.stage = Some(Entry::Fragment);
@@ -730,18 +724,17 @@ fn lower_render(
     let ftys = param_types(cx, fragment.0, &fragment.1);
     let takes_varyings = ftys.contains(&vret) && !is_clip_position(cx, vret);
     let fentry = entry_function(
-        cx,
         &mut mb,
         &fkey,
-        &sanitize(&fdef.name),
+        &fdef.name,
         fret,
         if takes_varyings { Some(vret_ir) } else { None },
     );
     cx.drain(&mut mb);
     check_recursion(cx, &mb);
     let (position_field, flat) = varying_layout(cx, &mut mb, vret, vdef.sig_span)?;
-    let vin = entry_inputs(cx, &mut mb, vertex.0, &vertex.1, Some(vret), false);
-    let fin = entry_inputs(cx, &mut mb, fragment.0, &fragment.1, Some(vret), false);
+    let vin = entry_inputs(cx, vertex.0, &vertex.1, Some(vret), false);
+    let fin = entry_inputs(cx, fragment.0, &fragment.1, Some(vret), false);
     mb.m.entry_points.push(ir::EntryPoint {
         name: sanitize(&vdef.name),
         stage: ir::Stage::Vertex { position_field, flat: flat.clone() },
@@ -807,7 +800,6 @@ fn varying_layout(
 /// `num_workgroups`.
 fn entry_inputs(
     cx: &mut Cx,
-    mb: &mut ModuleBuilder,
     f: FnId,
     substs: &[TyId],
     vret: Option<TyId>,
@@ -823,13 +815,11 @@ fn entry_inputs(
     if compute {
         out.push(ir::BuiltinInput::NumWorkgroups);
     }
-    let _ = mb;
     out
 }
 
 /// Declares an entry point's function (no parameters but the varyings) and queues its body.
 fn entry_function(
-    cx: &mut Cx,
     mb: &mut ModuleBuilder,
     key: &InstanceKey,
     name: &str,
@@ -839,11 +829,11 @@ fn entry_function(
     let params = varyings
         .map(|t| vec![ir::Param { name: "varyings".into(), ty: t, by_ref: false, mutable: false }])
         .unwrap_or_default();
-    let f = ir::Function::new(name, params, ret);
+    let f = ir::Function::new(sanitize(name), params, ret);
     let id = mb.m.add_function(f);
     mb.instances.insert(key.clone(), id);
+    mb.source_names.insert(id, name.to_string());
     mb.queue.push_back((key.clone(), id));
-    let _ = cx;
     id
 }
 
@@ -957,7 +947,12 @@ fn check_recursion(cx: &mut Cx, mb: &ModuleBuilder) {
             let mut found = None;
             dfs(v, &adj, &mut state, &mut found);
             if let Some((w, span)) = found {
-                let name = strip_suffix(&mb.m.functions[w].name).to_string();
+                let id = ir::FuncId(w as u32);
+                let name = mb
+                    .source_names
+                    .get(&id)
+                    .cloned()
+                    .unwrap_or_else(|| mb.m.functions[w].name.clone());
                 let ctx = mb.gpu.as_ref().map(|g| g.describe()).unwrap_or_default();
                 cx.err(
                     Diagnostic::new(codes::E0600, span, format!("`{name}` calls itself, and {ctx} can't recurse"))
@@ -995,20 +990,9 @@ pub(crate) fn check_standalone(cx: &mut Cx, f: FnId, entry: Option<Entry>) {
         Some(stage) => {
             let def = cx.checked.program.func(f).clone();
             let mut mb = ModuleBuilder::new(ir::Target::Gpu);
-            mb.gpu = Some(GpuCx {
-                what: format!(
-                    "the {} shader `{}`",
-                    if stage == Entry::Vertex { "vertex" } else { "fragment" },
-                    def.name
-                ),
-                entry_fns: vec![f],
-                stage: Some(stage),
-                workgroup_size: [1, 1, 1],
-                num_workgroups: None,
-                uniform_fields: Vec::new(),
-                uniform: None,
-                buffer_params: Vec::new(),
-            });
+            let kind = if stage == Entry::Vertex { "vertex" } else { "fragment" };
+            mb.gpu =
+                Some(GpuCx::new(format!("the {kind} shader `{}`", def.name), vec![f], Some(stage)));
             let mut buffers = Vec::new();
             let res = bind_buffers(cx, &mut mb, f, &[], None, &mut buffers);
             let tys = param_types(cx, f, &[]);
@@ -1027,7 +1011,7 @@ pub(crate) fn check_standalone(cx: &mut Cx, f: FnId, entry: Option<Entry>) {
             };
             let rt = ret_type(cx, f, &[]);
             let ret = cx.lower_ty(&mut mb, rt, def.sig_span);
-            entry_function(cx, &mut mb, &key, &sanitize(&def.name), ret, None);
+            entry_function(&mut mb, &key, &def.name, ret, None);
             cx.drain(&mut mb);
             check_recursion(cx, &mb);
         }
@@ -1035,16 +1019,8 @@ pub(crate) fn check_standalone(cx: &mut Cx, f: FnId, entry: Option<Entry>) {
             // `@gpu`: an ordinary function, lowered for the GPU.
             let def = cx.checked.program.func(f).clone();
             let mut mb = ModuleBuilder::new(ir::Target::Gpu);
-            mb.gpu = Some(GpuCx {
-                what: format!("the `@gpu` function `{}`", def.name),
-                entry_fns: Vec::new(),
-                stage: None,
-                workgroup_size: [1, 1, 1],
-                num_workgroups: None,
-                uniform_fields: Vec::new(),
-                uniform: None,
-                buffer_params: Vec::new(),
-            });
+            mb.gpu =
+                Some(GpuCx::new(format!("the `@gpu` function `{}`", def.name), Vec::new(), None));
             let key = InstanceKey::plain(f, Vec::new());
             cx.instance(&mut mb, key, None);
             cx.drain(&mut mb);

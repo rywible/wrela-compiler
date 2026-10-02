@@ -31,14 +31,10 @@ pub fn wrela_files() -> Vec<PathBuf> {
     out
 }
 
-/// The `SAMPLE` program of compiler/syntax/tests/roundtrip.rs (a raw string literal there).
+/// The sample program of compiler/syntax/tests/roundtrip.rs.
 pub fn roundtrip_sample() -> String {
-    let path = repo_root().join("compiler/syntax/tests/roundtrip.rs");
-    let text = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
-    let start = text.find("const SAMPLE: &str = r#\"").expect("roundtrip.rs has no SAMPLE") + 24;
-    let len = text[start..].find("\"#;").expect("SAMPLE isn't closed");
-    text[start..start + len].to_string()
+    let path = repo_root().join("compiler/syntax/tests/sample.wrela");
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("reading {}: {e}", path.display()))
 }
 
 /// Runs `f` on a thread with a big stack: the oracle's derivation counting recurses once per

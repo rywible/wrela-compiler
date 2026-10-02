@@ -1,0 +1,29 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0600",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "`buffer` records GPU work, which the `@compute` kernel `fill` can't do",
+      "notes": [
+        "recording GPU work is the `host` effect; GPU entry points forbid it (language.md §8)",
+        "called through `fill` → `step_2`"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 36,
+        "end": 209,
+        "end_column": 45,
+        "end_line": 7,
+        "line": 7,
+        "start": 200
+      },
+      "title": "an effect a context forbids"
+    }
+  ],
+  "version": 2
+}

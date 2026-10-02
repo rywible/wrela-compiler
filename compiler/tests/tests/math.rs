@@ -3,15 +3,12 @@
 //! interpretation's CPU widening (four ulps for these) relies on it.
 
 use std::path::PathBuf;
-use wrela_host::{Host, Options, Value};
-use wrela_tests::{build, root};
+use wrela_host::{CpuHost, Value};
+use wrela_tests::{Rng, built};
 
-fn load() -> Host {
-    let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("math");
-    if let Err(e) = build(&root().join("compiler/tests/math"), &out) {
-        panic!("the math package doesn't build:\n{e}");
-    }
-    Host::load_with(&out, &Options::default()).expect("load")
+fn load() -> CpuHost {
+    let out = built("math", PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("math"));
+    CpuHost::load(out).expect("load")
 }
 
 /// The distance between two f32s in units in the last place of the reference.
@@ -26,22 +23,10 @@ fn ulps(got: f32, want: f32) -> f64 {
     (f64::from(got) - f64::from(want)).abs() / ulp
 }
 
-struct Rng(u64);
-
-impl Rng {
-    fn unit(&mut self) -> f64 {
-        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        ((z ^ (z >> 31)) >> 11) as f64 / (1u64 << 53) as f64
-    }
-}
-
 #[test]
 fn std_math_is_within_an_ulp() {
     let mut host = load();
-    let mut rng = Rng(42);
+    let mut rng = Rng::new(42);
     type One = fn(f64) -> f64;
     let ones: [(&str, One, f64, f64); 11] = [
         ("f_sin", f64::sin, -1e4, 1e4),
@@ -81,7 +66,7 @@ fn std_math_is_within_an_ulp() {
     let mut worst = (0.0f64, 0.0f64);
     for _ in 0..20_000 {
         let (x, y) = ((rng.unit() * 8.0) as f32, (rng.unit() * 16.0 - 8.0) as f32);
-        let got = |host: &mut Host, n: &str, a: f32, b: f32| match host
+        let got = |host: &mut CpuHost, n: &str, a: f32, b: f32| match host
             .call_export(n, &[Value::F32(a), Value::F32(b)])
             .expect(n)
             .as_slice()

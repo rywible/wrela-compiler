@@ -1448,20 +1448,7 @@ impl<'p> Checker<'p> {
 
     /// Whether a parameter type is a GPU builtin (supplied by the GPU, not the caller).
     pub(crate) fn is_gpu_builtin(&self, t: TyId) -> bool {
-        match self.p.types.kind(t) {
-            TyKind::Adt(a, _) => matches!(
-                self.p.adt(*a).lang,
-                Some(
-                    Lang::GlobalId
-                        | Lang::LocalId
-                        | Lang::WorkgroupId
-                        | Lang::VertexIndex
-                        | Lang::InstanceIndex
-                        | Lang::FragCoord
-                )
-            ),
-            _ => false,
-        }
+        crate::gpu::BuiltinInput::of(self.p, t).is_some()
     }
 
     /// The methods a value of type `t` has: its inherent ones, and those of every trait it

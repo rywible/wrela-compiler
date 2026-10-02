@@ -617,7 +617,7 @@ impl<'m> Fe<'m> {
                     let off = self.slot(t);
                     self.ins.extend([I::LocalGet(self.fp), I::I32Const(off as i32), I::I32Add]);
                 }
-                self.call_args(*f, args)?;
+                self.call_args(args)?;
                 self.ins.push(I::Call(self.fn_indices[f.index()]));
                 if callee.ret.is_some() && (callee.ret_ref || !aggregate) {
                     self.ins.push(I::Drop);
@@ -629,7 +629,7 @@ impl<'m> Fe<'m> {
         }
     }
 
-    fn call_args(&mut self, f: ir::FuncId, args: &[ir::Arg]) -> R<()> {
+    fn call_args(&mut self, args: &[ir::Arg]) -> R<()> {
         for a in args {
             match a {
                 ir::Arg::Value(v) => self.ins.push(I::LocalGet(self.v(*v))),
@@ -638,7 +638,6 @@ impl<'m> Fe<'m> {
                 }
             }
         }
-        let _ = f;
         Ok(())
     }
 
@@ -699,7 +698,7 @@ impl<'m> Fe<'m> {
                 if sret {
                     self.slot_addr(v)?;
                 }
-                self.call_args(*f, args)?;
+                self.call_args(args)?;
                 self.ins.push(I::Call(self.fn_indices[f.index()]));
                 if sret {
                     self.set_to_slot(v)?;

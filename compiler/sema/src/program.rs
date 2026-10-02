@@ -152,7 +152,6 @@ impl Program {
         fields.into_iter().map(|(n, t)| (n, self.types.subst(t, &subst))).collect()
     }
 
-    /// Whether a module is part of std.
     /// A fix that opts a struct in to a trait in its declaration (`struct S: Trait`), for a
     /// diagnostic: where to insert, and what. `None` for std's types, and for generic ones
     /// (whose parameters sit between the name and the opt-in list).
@@ -167,6 +166,7 @@ impl Program {
         })
     }
 
+    /// Whether a module is part of std.
     pub fn is_std(&self, m: ModuleId) -> bool {
         self.modules[m.index()].is_std
     }

@@ -480,7 +480,6 @@ impl<'a> Parser<'a> {
         }
         let name = self.ident("a parameter name")?;
         if !self.at(T::Colon) {
-            let t = self.tok();
             self.error(
                 Diagnostic::new(
                     codes::E0109,
@@ -489,7 +488,6 @@ impl<'a> Parser<'a> {
                 )
                 .with_help(format!("write `{}: Type`", name.name)),
             );
-            let _ = t;
             return Err(Failed);
         }
         self.bump();

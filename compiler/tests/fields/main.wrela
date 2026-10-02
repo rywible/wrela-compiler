@@ -377,11 +377,11 @@ fn unwidened_of(fi: u32, b: Box3) -> u32 {
     }
 }
 
-/// On the CPU: over `boxes` random boxes, how many sampled values function `fi`'s interval
-/// misses.
-pub fn misses_cpu(fi: u32, seed: u32, boxes: u32) -> u32 {
+/// On the CPU: over random boxes `first..first + count`, how many sampled values function
+/// `fi`'s interval misses.
+pub fn misses_cpu(fi: u32, seed: u32, first: u32, count: u32) -> u32 {
     var total = 0
-    for i in 0..boxes {
+    for i in first..first + count {
         total += misses_of(fi, random_box(seed, i), seed, i)
     }
     total

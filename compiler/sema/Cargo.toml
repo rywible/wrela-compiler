@@ -9,6 +9,7 @@ publish.workspace = true
 [dependencies]
 wrela-diag.workspace = true
 wrela-syntax.workspace = true
+wrela-abi.workspace = true
 elsa = "1.11"
 
 [lints]

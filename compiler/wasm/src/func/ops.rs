@@ -6,6 +6,10 @@ use wasm_encoder::{BlockType, Function, Instruction as I, ValType};
 use wrela_ir as ir;
 use wrela_ir::layout::{column_stride, layout, round_up};
 
+/// A batch's header and a command's header, in bytes (wrela-abi's stream format).
+const BATCH_HEADER: u32 = wrela_abi::stream::HEADER_LEN as u32;
+const CMD_HEADER: u32 = wrela_abi::stream::COMMAND_HEADER_LEN as u32;
+
 // ---- scalar arithmetic ---------------------------------------------------------------------------
 
 /// The range of a small integer type, for checked arithmetic on i8..u16 (held in i32).
@@ -52,168 +56,230 @@ fn is64(s: ir::Scalar) -> bool {
     matches!(s, ir::Scalar::I64 | ir::Scalar::U64)
 }
 
+/// Float instructions of one width.
+#[derive(Clone, Copy)]
+struct Fw {
+    f64_: bool,
+}
+
+macro_rules! float_ops {
+    ($($name:ident => $f32:ident, $f64:ident;)*) => {
+        impl Fw {
+            $(fn $name(self) -> I<'static> { if self.f64_ { I::$f64 } else { I::$f32 } })*
+        }
+    };
+}
+
+float_ops! {
+    add => F32Add, F64Add;
+    sub => F32Sub, F64Sub;
+    mul => F32Mul, F64Mul;
+    div => F32Div, F64Div;
+    eq => F32Eq, F64Eq;
+    ne => F32Ne, F64Ne;
+    lt => F32Lt, F64Lt;
+    le => F32Le, F64Le;
+    gt => F32Gt, F64Gt;
+    ge => F32Ge, F64Ge;
+    sqrt => F32Sqrt, F64Sqrt;
+    floor => F32Floor, F64Floor;
+    ceil => F32Ceil, F64Ceil;
+    trunc => F32Trunc, F64Trunc;
+    nearest => F32Nearest, F64Nearest;
+    abs => F32Abs, F64Abs;
+    min => F32Min, F64Min;
+    max => F32Max, F64Max;
+    neg => F32Neg, F64Neg;
+}
+
+impl Fw {
+    fn of(s: ir::Scalar) -> Fw {
+        Fw { f64_: s == ir::Scalar::F64 }
+    }
+
+    fn konst(self, x: f64) -> I<'static> {
+        if self.f64_ { I::F64Const(x.into()) } else { I::F32Const((x as f32).into()) }
+    }
+
+    fn valtype(self) -> ValType {
+        if self.f64_ { ValType::F64 } else { ValType::F32 }
+    }
+}
+
+/// Integer instructions of one width (8- and 16-bit integers are held in i32s).
+#[derive(Clone, Copy)]
+struct Iw {
+    wide: bool,
+    signed: bool,
+}
+
+macro_rules! int_ops {
+    ($($name:ident => $i32:ident, $i64:ident;)*) => {
+        impl Iw {
+            $(fn $name(self) -> I<'static> { if self.wide { I::$i64 } else { I::$i32 } })*
+        }
+    };
+}
+
+macro_rules! signed_int_ops {
+    ($($name:ident => $i32s:ident, $i32u:ident, $i64s:ident, $i64u:ident;)*) => {
+        impl Iw {
+            $(fn $name(self) -> I<'static> {
+                match (self.wide, self.signed) {
+                    (false, true) => I::$i32s,
+                    (false, false) => I::$i32u,
+                    (true, true) => I::$i64s,
+                    (true, false) => I::$i64u,
+                }
+            })*
+        }
+    };
+}
+
+int_ops! {
+    add => I32Add, I64Add;
+    sub => I32Sub, I64Sub;
+    mul => I32Mul, I64Mul;
+    and => I32And, I64And;
+    or => I32Or, I64Or;
+    xor => I32Xor, I64Xor;
+    eq => I32Eq, I64Eq;
+    ne => I32Ne, I64Ne;
+    shl => I32Shl, I64Shl;
+    ltu => I32LtU, I64LtU;
+    lts => I32LtS, I64LtS;
+    gts => I32GtS, I64GtS;
+}
+
+signed_int_ops! {
+    lt => I32LtS, I32LtU, I64LtS, I64LtU;
+    le => I32LeS, I32LeU, I64LeS, I64LeU;
+    gt => I32GtS, I32GtU, I64GtS, I64GtU;
+    ge => I32GeS, I32GeU, I64GeS, I64GeU;
+    div => I32DivS, I32DivU, I64DivS, I64DivU;
+    rem => I32RemS, I32RemU, I64RemS, I64RemU;
+    shr => I32ShrS, I32ShrU, I64ShrS, I64ShrU;
+}
+
+impl Iw {
+    fn of(s: ir::Scalar) -> Iw {
+        Iw { wide: is64(s), signed: s.signed() }
+    }
+
+    fn konst(self, x: i64) -> I<'static> {
+        if self.wide { I::I64Const(x) } else { I::I32Const(x as i32) }
+    }
+
+    fn valtype(self) -> ValType {
+        if self.wide { ValType::I64 } else { ValType::I32 }
+    }
+}
+
 /// Pushes `a op b` for scalars of type `s`, held in locals `a` and `b`. Integer arithmetic is
 /// checked unless the op is a wrapping one.
 fn scalar_bin(fe: &mut Fe, op: ir::BinOp, s: ir::Scalar, a: u32, b: u32) -> R<()> {
     use ir::BinOp as B;
     let (la, lb) = (I::LocalGet(a), I::LocalGet(b));
     if s.is_float() {
-        let f64_ = s == ir::Scalar::F64;
+        let f = Fw::of(s);
         let i = match op {
-            B::Add => {
-                if f64_ {
-                    I::F64Add
-                } else {
-                    I::F32Add
-                }
-            }
-            B::Sub => {
-                if f64_ {
-                    I::F64Sub
-                } else {
-                    I::F32Sub
-                }
-            }
-            B::Mul => {
-                if f64_ {
-                    I::F64Mul
-                } else {
-                    I::F32Mul
-                }
-            }
-            B::Div => {
-                if f64_ {
-                    I::F64Div
-                } else {
-                    I::F32Div
-                }
-            }
+            B::Add => f.add(),
+            B::Sub => f.sub(),
+            B::Mul => f.mul(),
+            B::Div => f.div(),
             B::Rem => {
                 // a - b * trunc(a / b), as WGSL defines it.
-                fe.ins.extend([la.clone(), lb.clone(), la, lb]);
-                if f64_ {
-                    fe.ins.extend([I::F64Div, I::F64Trunc, I::F64Mul, I::F64Sub]);
-                } else {
-                    fe.ins.extend([I::F32Div, I::F32Trunc, I::F32Mul, I::F32Sub]);
-                }
+                fe.ins.extend([
+                    la.clone(),
+                    lb.clone(),
+                    la,
+                    lb,
+                    f.div(),
+                    f.trunc(),
+                    f.mul(),
+                    f.sub(),
+                ]);
                 return Ok(());
             }
-            B::Eq => {
-                if f64_ {
-                    I::F64Eq
-                } else {
-                    I::F32Eq
-                }
-            }
-            B::Ne => {
-                if f64_ {
-                    I::F64Ne
-                } else {
-                    I::F32Ne
-                }
-            }
-            B::Lt => {
-                if f64_ {
-                    I::F64Lt
-                } else {
-                    I::F32Lt
-                }
-            }
-            B::Le => {
-                if f64_ {
-                    I::F64Le
-                } else {
-                    I::F32Le
-                }
-            }
-            B::Gt => {
-                if f64_ {
-                    I::F64Gt
-                } else {
-                    I::F32Gt
-                }
-            }
-            B::Ge => {
-                if f64_ {
-                    I::F64Ge
-                } else {
-                    I::F32Ge
-                }
-            }
+            B::Eq => f.eq(),
+            B::Ne => f.ne(),
+            B::Lt => f.lt(),
+            B::Le => f.le(),
+            B::Gt => f.gt(),
+            B::Ge => f.ge(),
             _ => return Err(format!("internal: {op:?} on floats")),
         };
         fe.ins.extend([la, lb, i]);
         return Ok(());
     }
-    let signed = s.signed();
-    if is64(s) {
-        return bin64(fe, op, signed, a, b);
-    }
-    let r = fe.new_local(ValType::I32);
+    let w = Iw::of(s);
+    let small = small_range(s).is_some();
     match op {
-        B::Add | B::Sub | B::Mul if small_range(s).is_some() => {
-            fe.ins.extend([
-                la,
-                lb,
-                match op {
-                    B::Add => I::I32Add,
-                    B::Sub => I::I32Sub,
-                    _ => I::I32Mul,
-                },
-            ]);
+        B::Add | B::Sub | B::Mul if small => {
+            // In 32 bits, then check it fits the small type.
+            let i = match op {
+                B::Add => w.add(),
+                B::Sub => w.sub(),
+                _ => w.mul(),
+            };
+            fe.ins.extend([la, lb, i]);
             check_small(fe, s);
         }
-        B::Add => {
-            fe.ins.extend([la.clone(), lb.clone(), I::I32Add, I::LocalSet(r)]);
-            if signed {
+        B::Add | B::Sub => {
+            let r = fe.new_local(w.valtype());
+            let i = if op == B::Add { w.add() } else { w.sub() };
+            fe.ins.extend([la.clone(), lb.clone(), i, I::LocalSet(r)]);
+            match (op, w.signed) {
                 // Overflow iff both operands' signs differ from the result's.
-                fe.ins.extend([
+                (B::Add, true) => fe.ins.extend([
                     la,
                     I::LocalGet(r),
-                    I::I32Xor,
+                    w.xor(),
                     lb,
                     I::LocalGet(r),
-                    I::I32Xor,
-                    I::I32And,
-                    I::I32Const(0),
-                    I::I32LtS,
-                ]);
-            } else {
-                fe.ins.extend([I::LocalGet(r), la, I::I32LtU]);
+                    w.xor(),
+                    w.and(),
+                    w.konst(0),
+                    w.lts(),
+                ]),
+                // Overflow iff the operands' signs differ and the result's differs from a's.
+                (B::Sub, true) => fe.ins.extend([
+                    la.clone(),
+                    lb,
+                    w.xor(),
+                    la,
+                    I::LocalGet(r),
+                    w.xor(),
+                    w.and(),
+                    w.konst(0),
+                    w.lts(),
+                ]),
+                (B::Add, false) => fe.ins.extend([I::LocalGet(r), la, w.ltu()]),
+                _ => fe.ins.extend([la, lb, w.ltu()]),
             }
             fe.trap_if();
             fe.ins.push(I::LocalGet(r));
         }
-        B::Sub => {
-            fe.ins.extend([la.clone(), lb.clone(), I::I32Sub, I::LocalSet(r)]);
-            if signed {
-                fe.ins.extend([
-                    la.clone(),
-                    lb,
-                    I::I32Xor,
-                    la,
-                    I::LocalGet(r),
-                    I::I32Xor,
-                    I::I32And,
-                    I::I32Const(0),
-                    I::I32LtS,
-                ]);
-            } else {
-                fe.ins.extend([la, lb, I::I32LtU]);
-            }
+        B::Mul if w.wide => {
+            // r = a * b; overflow iff a != 0 and r / a != b. (The signed MIN * -1 case traps in
+            // the division itself, which is the overflow trap we want.)
+            let r = fe.new_local(ValType::I64);
+            fe.ins.extend([la.clone(), lb.clone(), I::I64Mul, I::LocalSet(r)]);
+            fe.ins.extend([la.clone(), I::I64Const(0), I::I64Ne, I::If(BlockType::Empty)]);
+            fe.ins.extend([I::LocalGet(r), la, w.div(), lb, I::I64Ne]);
             fe.trap_if();
-            fe.ins.push(I::LocalGet(r));
+            fe.ins.extend([I::End, I::LocalGet(r)]);
         }
         B::Mul => {
             // In 64 bits, then check it fits.
-            let w = fe.new_local(ValType::I64);
-            let ext = if signed { I::I64ExtendI32S } else { I::I64ExtendI32U };
-            fe.ins.extend([la, ext.clone(), lb, ext, I::I64Mul, I::LocalTee(w)]);
-            if signed {
+            let wide = fe.new_local(ValType::I64);
+            let ext = if w.signed { I::I64ExtendI32S } else { I::I64ExtendI32U };
+            fe.ins.extend([la, ext.clone(), lb, ext, I::I64Mul, I::LocalTee(wide)]);
+            if w.signed {
                 fe.ins.extend([
                     I::I64Const(i32::MIN as i64),
                     I::I64LtS,
-                    I::LocalGet(w),
+                    I::LocalGet(wide),
                     I::I64Const(i32::MAX as i64),
                     I::I64GtS,
                     I::I32Or,
@@ -222,143 +288,45 @@ fn scalar_bin(fe: &mut Fe, op: ir::BinOp, s: ir::Scalar, a: u32, b: u32) -> R<()
                 fe.ins.extend([I::I64Const(u32::MAX as i64), I::I64GtU]);
             }
             fe.trap_if();
-            fe.ins.extend([I::LocalGet(w), I::I32WrapI64]);
+            fe.ins.extend([I::LocalGet(wide), I::I32WrapI64]);
         }
         B::Div => {
-            fe.ins.extend([la, lb, if signed { I::I32DivS } else { I::I32DivU }]);
+            fe.ins.extend([la, lb, w.div()]);
             check_small(fe, s);
         }
-        B::Rem => fe.ins.extend([la, lb, if signed { I::I32RemS } else { I::I32RemU }]),
+        B::Rem => fe.ins.extend([la, lb, w.rem()]),
         B::WrappingAdd | B::WrappingSub | B::WrappingMul => {
-            fe.ins.extend([
-                la,
-                lb,
-                match op {
-                    B::WrappingAdd => I::I32Add,
-                    B::WrappingSub => I::I32Sub,
-                    _ => I::I32Mul,
-                },
-            ]);
+            let i = match op {
+                B::WrappingAdd => w.add(),
+                B::WrappingSub => w.sub(),
+                _ => w.mul(),
+            };
+            fe.ins.extend([la, lb, i]);
             wrap_small(fe, s);
         }
         B::Shl | B::Shr => {
-            // A shift of at least the width traps on the CPU.
+            // A shift of at least the width traps on the CPU. The amount is a u32.
             fe.ins.extend([lb.clone(), I::I32Const(s.bits() as i32), I::I32GeU]);
             fe.trap_if();
-            fe.ins.extend([
-                la,
-                lb,
-                match (op, signed) {
-                    (B::Shl, _) => I::I32Shl,
-                    (_, true) => I::I32ShrS,
-                    _ => I::I32ShrU,
-                },
-            ]);
+            fe.ins.extend([la, lb]);
+            if w.wide {
+                fe.ins.push(I::I64ExtendI32U);
+            }
+            fe.ins.push(if op == B::Shl { w.shl() } else { w.shr() });
             wrap_small(fe, s);
         }
-        B::BitAnd | B::And => fe.ins.extend([la, lb, I::I32And]),
-        B::BitOr | B::Or => fe.ins.extend([la, lb, I::I32Or]),
-        B::BitXor => fe.ins.extend([la, lb, I::I32Xor]),
-        B::Eq => fe.ins.extend([la, lb, I::I32Eq]),
-        B::Ne => fe.ins.extend([la, lb, I::I32Ne]),
-        B::Lt => fe.ins.extend([la, lb, if signed { I::I32LtS } else { I::I32LtU }]),
-        B::Le => fe.ins.extend([la, lb, if signed { I::I32LeS } else { I::I32LeU }]),
-        B::Gt => fe.ins.extend([la, lb, if signed { I::I32GtS } else { I::I32GtU }]),
-        B::Ge => fe.ins.extend([la, lb, if signed { I::I32GeS } else { I::I32GeU }]),
-    }
-    Ok(())
-}
-
-fn bin64(fe: &mut Fe, op: ir::BinOp, signed: bool, a: u32, b: u32) -> R<()> {
-    use ir::BinOp as B;
-    let (la, lb) = (I::LocalGet(a), I::LocalGet(b));
-    let r = fe.new_local(ValType::I64);
-    match op {
-        B::Add => {
-            fe.ins.extend([la.clone(), lb.clone(), I::I64Add, I::LocalSet(r)]);
-            if signed {
-                fe.ins.extend([
-                    la,
-                    I::LocalGet(r),
-                    I::I64Xor,
-                    lb,
-                    I::LocalGet(r),
-                    I::I64Xor,
-                    I::I64And,
-                    I::I64Const(0),
-                    I::I64LtS,
-                ]);
-            } else {
-                fe.ins.extend([I::LocalGet(r), la, I::I64LtU]);
-            }
-            fe.trap_if();
-            fe.ins.push(I::LocalGet(r));
-        }
-        B::Sub => {
-            fe.ins.extend([la.clone(), lb.clone(), I::I64Sub, I::LocalSet(r)]);
-            if signed {
-                fe.ins.extend([
-                    la.clone(),
-                    lb,
-                    I::I64Xor,
-                    la,
-                    I::LocalGet(r),
-                    I::I64Xor,
-                    I::I64And,
-                    I::I64Const(0),
-                    I::I64LtS,
-                ]);
-            } else {
-                fe.ins.extend([la, lb, I::I64LtU]);
-            }
-            fe.trap_if();
-            fe.ins.push(I::LocalGet(r));
-        }
-        B::Mul => {
-            // r = a * b; overflow iff a != 0 and r / a != b. (The signed MIN * -1 case traps
-            // in the division itself, which is the overflow trap we want.)
-            fe.ins.extend([la.clone(), lb.clone(), I::I64Mul, I::LocalSet(r)]);
-            fe.ins.extend([la.clone(), I::I64Const(0), I::I64Ne, I::If(BlockType::Empty)]);
-            fe.ins.extend([
-                I::LocalGet(r),
-                la,
-                if signed { I::I64DivS } else { I::I64DivU },
-                lb,
-                I::I64Ne,
-            ]);
-            fe.trap_if();
-            fe.ins.extend([I::End, I::LocalGet(r)]);
-        }
-        B::Div => fe.ins.extend([la, lb, if signed { I::I64DivS } else { I::I64DivU }]),
-        B::Rem => fe.ins.extend([la, lb, if signed { I::I64RemS } else { I::I64RemU }]),
-        B::WrappingAdd => fe.ins.extend([la, lb, I::I64Add]),
-        B::WrappingSub => fe.ins.extend([la, lb, I::I64Sub]),
-        B::WrappingMul => fe.ins.extend([la, lb, I::I64Mul]),
-        B::Shl | B::Shr => {
-            // The amount is a u32.
-            fe.ins.extend([lb.clone(), I::I32Const(64), I::I32GeU]);
-            fe.trap_if();
-            fe.ins.extend([
-                la,
-                lb,
-                I::I64ExtendI32U,
-                match (op, signed) {
-                    (B::Shl, _) => I::I64Shl,
-                    (_, true) => I::I64ShrS,
-                    _ => I::I64ShrU,
-                },
-            ]);
-        }
-        B::BitAnd => fe.ins.extend([la, lb, I::I64And]),
-        B::BitOr => fe.ins.extend([la, lb, I::I64Or]),
-        B::BitXor => fe.ins.extend([la, lb, I::I64Xor]),
-        B::Eq => fe.ins.extend([la, lb, I::I64Eq]),
-        B::Ne => fe.ins.extend([la, lb, I::I64Ne]),
-        B::Lt => fe.ins.extend([la, lb, if signed { I::I64LtS } else { I::I64LtU }]),
-        B::Le => fe.ins.extend([la, lb, if signed { I::I64LeS } else { I::I64LeU }]),
-        B::Gt => fe.ins.extend([la, lb, if signed { I::I64GtS } else { I::I64GtU }]),
-        B::Ge => fe.ins.extend([la, lb, if signed { I::I64GeS } else { I::I64GeU }]),
-        B::And | B::Or => return Err("internal: logical op on i64".into()),
+        B::BitAnd => fe.ins.extend([la, lb, w.and()]),
+        B::BitOr => fe.ins.extend([la, lb, w.or()]),
+        B::And | B::Or if w.wide => return Err("internal: logical op on i64".into()),
+        B::And => fe.ins.extend([la, lb, w.and()]),
+        B::Or => fe.ins.extend([la, lb, w.or()]),
+        B::BitXor => fe.ins.extend([la, lb, w.xor()]),
+        B::Eq => fe.ins.extend([la, lb, w.eq()]),
+        B::Ne => fe.ins.extend([la, lb, w.ne()]),
+        B::Lt => fe.ins.extend([la, lb, w.lt()]),
+        B::Le => fe.ins.extend([la, lb, w.le()]),
+        B::Gt => fe.ins.extend([la, lb, w.gt()]),
+        B::Ge => fe.ins.extend([la, lb, w.ge()]),
     }
     Ok(())
 }
@@ -540,8 +508,9 @@ pub(super) fn unary(fe: &mut Fe, v: ir::ValueId, op: ir::UnOp, x: ir::ValueId) -
     }
     let s = fe.scalar(t)?;
     match (op, s) {
-        (ir::UnOp::Neg, ir::Scalar::F32) => fe.ins.extend([I::LocalGet(fe.v(x)), I::F32Neg]),
-        (ir::UnOp::Neg, ir::Scalar::F64) => fe.ins.extend([I::LocalGet(fe.v(x)), I::F64Neg]),
+        (ir::UnOp::Neg, s) if s.is_float() => {
+            fe.ins.extend([I::LocalGet(fe.v(x)), Fw::of(s).neg()])
+        }
         (ir::UnOp::Neg, s) => {
             // 0 - x, checked: negating the minimum overflows.
             let z = fe.new_local(super::super::valtype(s));
@@ -549,11 +518,9 @@ pub(super) fn unary(fe: &mut Fe, v: ir::ValueId, op: ir::UnOp, x: ir::ValueId) -
             scalar_bin(fe, ir::BinOp::Sub, s, z, fe.v(x))?;
         }
         (ir::UnOp::Not, ir::Scalar::Bool) => fe.ins.extend([I::LocalGet(fe.v(x)), I::I32Eqz]),
-        (ir::UnOp::Not, s) if is64(s) => {
-            fe.ins.extend([I::LocalGet(fe.v(x)), I::I64Const(-1), I::I64Xor])
-        }
         (ir::UnOp::Not, s) => {
-            fe.ins.extend([I::LocalGet(fe.v(x)), I::I32Const(-1), I::I32Xor]);
+            let w = Iw::of(s);
+            fe.ins.extend([I::LocalGet(fe.v(x)), w.konst(-1), w.xor()]);
             wrap_small(fe, s);
         }
     }
@@ -618,49 +585,36 @@ pub(super) fn convert(fe: &mut Fe, from: ir::Scalar, to: ir::Scalar) -> R<()> {
 /// Pushes the scalar built-in `b` of the f32 locals `xs`.
 fn scalar_builtin(fe: &mut Fe, b: ir::Builtin, s: ir::Scalar, xs: &[u32]) -> R<()> {
     use ir::Builtin as B;
-    let f64_ = s == ir::Scalar::F64;
     let g = |i: usize| I::LocalGet(xs[i]);
-    let fone = || if f64_ { I::F64Const(1.0f64.into()) } else { I::F32Const(1.0f32.into()) };
-    let fzero = || if f64_ { I::F64Const(0.0f64.into()) } else { I::F32Const(0.0f32.into()) };
     if s.is_int() {
-        let signed = s.signed();
+        let w = Iw::of(s);
         match b {
             B::Min | B::Max => {
-                let lt = if is64(s) {
-                    if signed { I::I64LtS } else { I::I64LtU }
-                } else if signed {
-                    I::I32LtS
-                } else {
-                    I::I32LtU
-                };
                 // select(a, b, a < b) for min.
-                fe.ins.extend([g(0), g(1), g(0), g(1), lt]);
+                fe.ins.extend([g(0), g(1), g(0), g(1), w.lt()]);
                 if b == B::Max {
                     fe.ins.push(I::I32Eqz);
                 }
                 fe.ins.push(I::Select);
             }
             B::Clamp => {
-                let lo = fe.new_local(super::super::valtype(s));
+                let lo = fe.new_local(w.valtype());
                 scalar_builtin(fe, B::Max, s, &[xs[0], xs[1]])?;
                 fe.ins.push(I::LocalSet(lo));
                 scalar_builtin(fe, B::Min, s, &[lo, xs[2]])?;
             }
-            B::Abs if signed => {
-                let z = fe.new_local(super::super::valtype(s));
-                fe.ins.extend([konst(s, 0.0), I::LocalSet(z)]);
-                let neg = fe.new_local(super::super::valtype(s));
+            B::Abs if w.signed => {
+                let z = fe.new_local(w.valtype());
+                fe.ins.extend([w.konst(0), I::LocalSet(z)]);
+                let neg = fe.new_local(w.valtype());
                 scalar_bin(fe, ir::BinOp::Sub, s, z, xs[0])?;
                 fe.ins.push(I::LocalSet(neg));
-                let lt = if is64(s) { I::I64LtS } else { I::I32LtS };
-                fe.ins.extend([I::LocalGet(neg), g(0), g(0), konst(s, 0.0), lt, I::Select]);
+                fe.ins.extend([I::LocalGet(neg), g(0), g(0), w.konst(0), w.lts(), I::Select]);
             }
             B::Abs => fe.ins.push(g(0)),
             B::Sign => {
-                let (gt, lt) =
-                    if is64(s) { (I::I64GtS, I::I64LtS) } else { (I::I32GtS, I::I32LtS) };
-                fe.ins.extend([g(0), konst(s, 0.0), gt, g(0), konst(s, 0.0), lt, I::I32Sub]);
-                if is64(s) {
+                fe.ins.extend([g(0), w.konst(0), w.gts(), g(0), w.konst(0), w.lts(), I::I32Sub]);
+                if w.wide {
                     fe.ins.push(I::I64ExtendI32S);
                 }
             }
@@ -668,106 +622,85 @@ fn scalar_builtin(fe: &mut Fe, b: ir::Builtin, s: ir::Scalar, xs: &[u32]) -> R<(
         }
         return Ok(());
     }
-    let (add, sub, mul, div) = if f64_ {
-        (I::F64Add, I::F64Sub, I::F64Mul, I::F64Div)
-    } else {
-        (I::F32Add, I::F32Sub, I::F32Mul, I::F32Div)
-    };
+    let f = Fw::of(s);
     match b {
-        B::Sqrt => fe.ins.extend([g(0), if f64_ { I::F64Sqrt } else { I::F32Sqrt }]),
-        B::InverseSqrt => {
-            fe.ins.extend([fone(), g(0), if f64_ { I::F64Sqrt } else { I::F32Sqrt }, div])
-        }
-        B::Floor => fe.ins.extend([g(0), if f64_ { I::F64Floor } else { I::F32Floor }]),
-        B::Ceil => fe.ins.extend([g(0), if f64_ { I::F64Ceil } else { I::F32Ceil }]),
-        B::Trunc => fe.ins.extend([g(0), if f64_ { I::F64Trunc } else { I::F32Trunc }]),
-        B::Round => fe.ins.extend([g(0), if f64_ { I::F64Nearest } else { I::F32Nearest }]),
-        B::Fract => fe.ins.extend([g(0), g(0), if f64_ { I::F64Floor } else { I::F32Floor }, sub]),
-        B::Abs => fe.ins.extend([g(0), if f64_ { I::F64Abs } else { I::F32Abs }]),
+        B::Sqrt => fe.ins.extend([g(0), f.sqrt()]),
+        B::InverseSqrt => fe.ins.extend([f.konst(1.0), g(0), f.sqrt(), f.div()]),
+        B::Floor => fe.ins.extend([g(0), f.floor()]),
+        B::Ceil => fe.ins.extend([g(0), f.ceil()]),
+        B::Trunc => fe.ins.extend([g(0), f.trunc()]),
+        B::Round => fe.ins.extend([g(0), f.nearest()]),
+        B::Fract => fe.ins.extend([g(0), g(0), f.floor(), f.sub()]),
+        B::Abs => fe.ins.extend([g(0), f.abs()]),
         B::Sign => {
             // 1 if x > 0, -1 if x < 0, else x (keeping 0, -0 and NaN).
-            let (gt, lt) = if f64_ { (I::F64Gt, I::F64Lt) } else { (I::F32Gt, I::F32Lt) };
-            let neg_one =
-                if f64_ { I::F64Const((-1.0f64).into()) } else { I::F32Const((-1.0f32).into()) };
             fe.ins.extend([
-                fone(),
-                neg_one,
+                f.konst(1.0),
+                f.konst(-1.0),
                 g(0),
                 g(0),
-                fzero(),
-                lt,
+                f.konst(0.0),
+                f.lt(),
                 I::Select,
                 g(0),
-                fzero(),
-                gt,
+                f.konst(0.0),
+                f.gt(),
                 I::Select,
             ]);
         }
-        B::Min => fe.ins.extend([g(0), g(1), if f64_ { I::F64Min } else { I::F32Min }]),
-        B::Max => fe.ins.extend([g(0), g(1), if f64_ { I::F64Max } else { I::F32Max }]),
-        B::Clamp => fe.ins.extend([
-            g(0),
-            g(1),
-            if f64_ { I::F64Max } else { I::F32Max },
-            g(2),
-            if f64_ { I::F64Min } else { I::F32Min },
-        ]),
-        B::Saturate => fe.ins.extend([
-            g(0),
-            fzero(),
-            if f64_ { I::F64Max } else { I::F32Max },
-            fone(),
-            if f64_ { I::F64Min } else { I::F32Min },
-        ]),
+        B::Min => fe.ins.extend([g(0), g(1), f.min()]),
+        B::Max => fe.ins.extend([g(0), g(1), f.max()]),
+        B::Clamp => fe.ins.extend([g(0), g(1), f.max(), g(2), f.min()]),
+        B::Saturate => fe.ins.extend([g(0), f.konst(0.0), f.max(), f.konst(1.0), f.min()]),
         B::Mix => {
             // WGSL: e1 * (1 - e3) + e2 * e3.
-            fe.ins.extend([g(0), fone(), g(2), sub.clone(), mul.clone(), g(1), g(2), mul, add]);
+            fe.ins.extend([
+                g(0),
+                f.konst(1.0),
+                g(2),
+                f.sub(),
+                f.mul(),
+                g(1),
+                g(2),
+                f.mul(),
+                f.add(),
+            ]);
         }
         B::Step => {
             // 1 if edge <= x.
-            fe.ins.extend([
-                fone(),
-                fzero(),
-                g(0),
-                g(1),
-                if f64_ { I::F64Le } else { I::F32Le },
-                I::Select,
-            ]);
+            fe.ins.extend([f.konst(1.0), f.konst(0.0), g(0), g(1), f.le(), I::Select]);
         }
         B::Smoothstep => {
             // t = clamp((x - e0) / (e1 - e0), 0, 1); t * t * (3 - 2t)
-            let t = fe.new_local(if f64_ { ValType::F64 } else { ValType::F32 });
-            let (mx, mn) = if f64_ { (I::F64Max, I::F64Min) } else { (I::F32Max, I::F32Min) };
+            let t = fe.new_local(f.valtype());
             fe.ins.extend([
                 g(2),
                 g(0),
-                sub.clone(),
+                f.sub(),
                 g(1),
                 g(0),
-                sub.clone(),
-                div,
-                fzero(),
-                mx,
-                fone(),
-                mn,
+                f.sub(),
+                f.div(),
+                f.konst(0.0),
+                f.max(),
+                f.konst(1.0),
+                f.min(),
                 I::LocalSet(t),
             ]);
-            let three = if f64_ { I::F64Const(3.0f64.into()) } else { I::F32Const(3.0f32.into()) };
-            let two = if f64_ { I::F64Const(2.0f64.into()) } else { I::F32Const(2.0f32.into()) };
             fe.ins.extend([
                 I::LocalGet(t),
                 I::LocalGet(t),
-                mul.clone(),
-                three,
-                two,
+                f.mul(),
+                f.konst(3.0),
+                f.konst(2.0),
                 I::LocalGet(t),
-                mul.clone(),
-                sub,
-                mul,
+                f.mul(),
+                f.sub(),
+                f.mul(),
             ]);
         }
-        B::Length => fe.ins.extend([g(0), if f64_ { I::F64Abs } else { I::F32Abs }]),
-        B::Distance => fe.ins.extend([g(0), g(1), sub, if f64_ { I::F64Abs } else { I::F32Abs }]),
+        B::Length => fe.ins.extend([g(0), f.abs()]),
+        B::Distance => fe.ins.extend([g(0), g(1), f.sub(), f.abs()]),
         _ => {
             return Err(format!(
                 "internal: the built-in {b:?} should have been lowered before the WASM back end"
@@ -988,11 +921,17 @@ pub(super) fn host(
                 I::GlobalSet(globals::NEXT_HANDLE),
             ]);
             let a = fe.new_local(ValType::I32);
-            fe.ins.extend([I::I32Const(16), I::Call(h.reserve), I::LocalSet(a)]);
+            // Payload: the handle and the size.
+            let payload = 8;
+            fe.ins.extend([
+                I::I32Const((CMD_HEADER + payload) as i32),
+                I::Call(h.reserve),
+                I::LocalSet(a),
+            ]);
             put(fe, a, 0, I::I32Const(Opcode::CreateBuffer as i32));
-            put(fe, a, 4, I::I32Const(8));
-            put(fe, a, 8, I::LocalGet(handle));
-            put(fe, a, 12, I::LocalGet(size));
+            put(fe, a, 4, I::I32Const(payload as i32));
+            put(fe, a, CMD_HEADER, I::LocalGet(handle));
+            put(fe, a, CMD_HEADER + 4, I::LocalGet(size));
             if let Some(v) = result {
                 fe.ins.extend([I::LocalGet(handle), I::LocalSet(fe.v(v))]);
             }
@@ -1030,15 +969,19 @@ pub(super) fn host(
             let usize_ = uniform.map_or(0, |t| round_up(16, layout(&fe.m.types, t).size));
             let payload = 4 * (fixed + 1 + nb as u32 + 1) + usize_;
             let a = fe.new_local(ValType::I32);
-            fe.ins.extend([I::I32Const(8 + payload as i32), I::Call(h.reserve), I::LocalSet(a)]);
+            fe.ins.extend([
+                I::I32Const((CMD_HEADER + payload) as i32),
+                I::Call(h.reserve),
+                I::LocalSet(a),
+            ]);
             let opc = if dispatch { Opcode::Dispatch } else { Opcode::Draw };
             put(fe, a, 0, I::I32Const(opc as i32));
             put(fe, a, 4, I::I32Const(payload as i32));
-            put(fe, a, 8, I::I32Const(*pipeline as i32));
+            put(fe, a, CMD_HEADER, I::I32Const(*pipeline as i32));
             for (k, x) in args.iter().take(fixed as usize - 1).enumerate() {
-                put(fe, a, 12 + 4 * k as u32, I::LocalGet(fe.v(*x)));
+                put(fe, a, CMD_HEADER + 4 + 4 * k as u32, I::LocalGet(fe.v(*x)));
             }
-            let mut off = 8 + 4 * fixed;
+            let mut off = CMD_HEADER + 4 * fixed;
             put(fe, a, off, I::I32Const(nb as i32));
             off += 4;
             for k in 0..nb {
@@ -1070,21 +1013,27 @@ pub(super) fn host(
         }
         ir::HostOp::BeginScreenPass => {
             let a = fe.new_local(ValType::I32);
-            fe.ins.extend([I::I32Const(24), I::Call(h.reserve), I::LocalSet(a)]);
+            // Payload: the clear colour, four f32s.
+            let payload = 16;
+            fe.ins.extend([
+                I::I32Const((CMD_HEADER + payload) as i32),
+                I::Call(h.reserve),
+                I::LocalSet(a),
+            ]);
             put(fe, a, 0, I::I32Const(Opcode::BeginScreenPass as i32));
-            put(fe, a, 4, I::I32Const(16));
+            put(fe, a, 4, I::I32Const(payload as i32));
             fe.ins.extend([
                 I::LocalGet(a),
-                I::I32Const(8),
+                I::I32Const(CMD_HEADER as i32),
                 I::I32Add,
                 I::LocalGet(fe.v(args[0])),
-                I::I32Const(16),
+                I::I32Const(payload as i32),
                 I::MemoryCopy { src_mem: 0, dst_mem: 0 },
             ]);
         }
         ir::HostOp::Present => {
             let a = fe.new_local(ValType::I32);
-            fe.ins.extend([I::I32Const(8), I::Call(h.reserve), I::LocalSet(a)]);
+            fe.ins.extend([I::I32Const(CMD_HEADER as i32), I::Call(h.reserve), I::LocalSet(a)]);
             put(fe, a, 0, I::I32Const(Opcode::Present as i32));
             put(fe, a, 4, I::I32Const(0));
         }
@@ -1118,7 +1067,7 @@ pub(super) fn helper_bodies(h: &Helpers) -> Vec<(Vec<ValType>, Vec<ValType>, Fun
         I::I32Store(mem(8, 2)),
         I::I32Const(CMD_BASE as i32),
         I::GlobalGet(globals::CMD_LEN),
-        I::I32Const(12),
+        I::I32Const(BATCH_HEADER as i32),
         I::I32Add,
         I::Call(h.submit),
         I::I32Const(0),
@@ -1142,7 +1091,7 @@ pub(super) fn helper_bodies(h: &Helpers) -> Vec<(Vec<ValType>, Vec<ValType>, Fun
         I::Unreachable,
         I::End,
         I::End,
-        I::I32Const(CMD_BASE as i32 + 12),
+        I::I32Const((CMD_BASE + BATCH_HEADER) as i32),
         I::GlobalGet(globals::CMD_LEN),
         I::I32Add,
         I::GlobalGet(globals::CMD_LEN),
@@ -1165,9 +1114,11 @@ pub(super) fn helper_bodies(h: &Helpers) -> Vec<(Vec<ValType>, Vec<ValType>, Fun
         I::Select,
         I::LocalSet(chunk),
     ]);
+    // Payload: the handle, the offset, the byte count, then the bytes.
+    let words = 12;
     write.extend([
         I::LocalGet(chunk),
-        I::I32Const(20),
+        I::I32Const((CMD_HEADER + words) as i32),
         I::I32Add,
         I::Call(h.reserve),
         I::LocalSet(a),
@@ -1177,16 +1128,16 @@ pub(super) fn helper_bodies(h: &Helpers) -> Vec<(Vec<ValType>, Vec<ValType>, Fun
     write.extend([
         I::LocalGet(a),
         I::LocalGet(chunk),
-        I::I32Const(12),
+        I::I32Const(words as i32),
         I::I32Add,
         I::I32Store(mem(4, 2)),
     ]);
-    write.extend(w(I::LocalGet(handle), 8));
-    write.extend(w(I::LocalGet(offset), 12));
-    write.extend(w(I::LocalGet(chunk), 16));
+    write.extend(w(I::LocalGet(handle), CMD_HEADER));
+    write.extend(w(I::LocalGet(offset), CMD_HEADER + 4));
+    write.extend(w(I::LocalGet(chunk), CMD_HEADER + 8));
     write.extend([
         I::LocalGet(a),
-        I::I32Const(20),
+        I::I32Const((CMD_HEADER + words) as i32),
         I::I32Add,
         I::LocalGet(ptr),
         I::LocalGet(chunk),

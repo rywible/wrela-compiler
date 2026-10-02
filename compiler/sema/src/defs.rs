@@ -28,8 +28,6 @@ pub struct Binding {
     /// `pub`: visible outside the module.
     pub public: bool,
     pub span: Span,
-    /// Brought in by `use`, rather than declared here.
-    pub imported: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -37,7 +35,6 @@ pub struct Module {
     /// `["shapes", "blob"]`; std modules start with `"std"`.
     pub path: Vec<String>,
     pub file: Option<FileId>,
-    pub parent: Option<ModuleId>,
     pub children: BTreeMap<String, ModuleId>,
     pub scope: BTreeMap<String, Binding>,
     pub is_std: bool,

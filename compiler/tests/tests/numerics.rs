@@ -5,25 +5,22 @@
 //! is tests/hello_field.rs; the module check for relaxed SIMD is wrela-wasm's.)
 
 use std::path::PathBuf;
-use wrela_host::{Error, Host, Options, Value};
-use wrela_tests::{build, root};
+use wrela_host::{CpuHost, Error, Value};
+use wrela_tests::built;
 
-fn load() -> Host {
-    let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("numerics");
-    if let Err(e) = build(&root().join("compiler/tests/numerics"), &out) {
-        panic!("the numerics package doesn't build:\n{e}");
-    }
-    Host::load_with(&out, &Options::default()).expect("load")
+fn load() -> CpuHost {
+    let out = built("numerics", PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("numerics"));
+    CpuHost::load(out).expect("load")
 }
 
-fn traps(host: &mut Host, name: &str, args: &[Value]) {
+fn traps(host: &mut CpuHost, name: &str, args: &[Value]) {
     match host.call_export(name, args) {
         Err(Error::Trap(_)) => {}
         other => panic!("{name}{args:?} should trap, got {other:?}"),
     }
 }
 
-fn returns(host: &mut Host, name: &str, args: &[Value], want: Value) {
+fn returns(host: &mut CpuHost, name: &str, args: &[Value], want: Value) {
     match host.call_export(name, args) {
         Ok(v) if v == [want] => {}
         other => panic!("{name}{args:?} should return {want:?}, got {other:?}"),

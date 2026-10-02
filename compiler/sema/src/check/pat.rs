@@ -540,12 +540,11 @@ impl<'p> Checker<'p> {
             PatKind::Tuple(ps) => {
                 DPat::Ctor(Ctor::Single, ps.iter().map(|x| self.dpat(x)).collect())
             }
-            PatKind::Adt { adt, variant, fields, args } => {
+            PatKind::Adt { adt, variant, fields, .. } => {
                 let n = match variant {
                     Some(v) => self.p.adt(*adt).variants()[*v as usize].fields.len(),
                     None => self.p.adt(*adt).fields().len(),
                 };
-                let _ = args;
                 let mut subs = vec![DPat::Wild; n];
                 for (i, f) in fields {
                     subs[*i as usize] = self.dpat(f);

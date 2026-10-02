@@ -7,7 +7,7 @@
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
-use wrela_tests::root;
+use wrela_tests::{Rng, root};
 
 const TOKENS: &[&str] = &[
     "{",
@@ -66,22 +66,6 @@ const TOKENS: &[&str] = &[
 ];
 
 /// SplitMix64.
-struct Rng(u64);
-
-impl Rng {
-    fn next(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        z ^ (z >> 31)
-    }
-
-    fn below(&mut self, n: usize) -> usize {
-        (self.next() % n.max(1) as u64) as usize
-    }
-}
-
 fn seeds(dir: &Path, out: &mut Vec<String>) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     for e in entries.flatten() {
@@ -150,7 +134,7 @@ fn mutated_programs_dont_crash_the_compiler() {
     let mut crashes = Vec::new();
     for i in 0..iters {
         let seed = base.wrapping_mul(1_000_003).wrapping_add(i as u64);
-        let mut rng = Rng(seed);
+        let mut rng = Rng::new(seed);
         let pick = rng.below(corpus.len());
         let text = mutate(&mut rng, corpus[pick].clone());
         std::fs::write(dir.join("main.wrela"), &text).expect("write");

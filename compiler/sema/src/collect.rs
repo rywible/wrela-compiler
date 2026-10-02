@@ -1,7 +1,6 @@
 //! Collects a program's definitions from its parsed files: the module tree, every item, `use`
 //! imports, and every signature (generics, fields, variants, traits, impls, functions).
 
-use crate::builtins::{BuiltinFn, BuiltinTy};
 use crate::defs::*;
 use crate::program::{LangRes, Program};
 use crate::resolve::{self, Scope, TyPos};
@@ -63,16 +62,10 @@ impl<'d> Collector<'d> {
 
     // ---- modules ---------------------------------------------------------------------------
 
-    fn new_module(
-        &mut self,
-        path: Vec<String>,
-        parent: Option<ModuleId>,
-        is_std: bool,
-    ) -> ModuleId {
+    fn new_module(&mut self, path: Vec<String>, is_std: bool) -> ModuleId {
         self.p.modules.push(Module {
             path,
             file: None,
-            parent,
             children: BTreeMap::new(),
             scope: BTreeMap::new(),
             is_std,
@@ -82,8 +75,8 @@ impl<'d> Collector<'d> {
     }
 
     fn build_modules(&mut self, units: &[SourceUnit]) {
-        let pkg = self.new_module(Vec::new(), None, false);
-        let std = self.new_module(vec!["std".into()], None, true);
+        let pkg = self.new_module(Vec::new(), false);
+        let std = self.new_module(vec!["std".into()], true);
         self.p.package_root = Some(pkg);
         self.p.std_root = Some(std);
         for u in units {
@@ -94,7 +87,7 @@ impl<'d> Collector<'d> {
                     None => {
                         let mut path = self.p.modules[m.index()].path.clone();
                         path.push(seg.clone());
-                        let c = self.new_module(path, Some(m), u.is_std);
+                        let c = self.new_module(path, u.is_std);
                         self.p.modules[m.index()].children.insert(seg.clone(), c);
                         c
                     }
@@ -109,7 +102,7 @@ impl<'d> Collector<'d> {
         }
     }
 
-    fn bind(&mut self, m: ModuleId, name: &ast::Ident, res: Res, public: bool, imported: bool) {
+    fn bind(&mut self, m: ModuleId, name: &ast::Ident, res: Res, public: bool) {
         let scope = &mut self.p.modules[m.index()].scope;
         if let Some(prev) = scope.get(&name.name) {
             let prev_span = prev.span;
@@ -124,7 +117,7 @@ impl<'d> Collector<'d> {
             );
             return;
         }
-        scope.insert(name.name.clone(), Binding { res, public, span: name.span, imported });
+        scope.insert(name.name.clone(), Binding { res, public, span: name.span });
     }
 
     // ---- items -----------------------------------------------------------------------------
@@ -206,7 +199,7 @@ impl<'d> Collector<'d> {
         match &item.kind {
             ast::ItemKind::Fn(f) => {
                 let id = self.new_fn(m, FnOwner::Free, f, public, &item.attrs, is_std);
-                self.bind(m, &f.name, Res::Fn(id), public, false);
+                self.bind(m, &f.name, Res::Fn(id), public);
                 self.pending.push((m, PendingItem::Fn(id, Rc::new(f.clone()))));
             }
             ast::ItemKind::Struct(s) => {
@@ -223,7 +216,7 @@ impl<'d> Collector<'d> {
                     name_span: s.name.span,
                     lang: None,
                 });
-                self.bind(m, &s.name, Res::Adt(id), public, false);
+                self.bind(m, &s.name, Res::Adt(id), public);
                 self.pending.push((m, PendingItem::Adt(id, Rc::new(item.clone()))));
             }
             ast::ItemKind::Enum(e) => {
@@ -240,7 +233,7 @@ impl<'d> Collector<'d> {
                     name_span: e.name.span,
                     lang: None,
                 });
-                self.bind(m, &e.name, Res::Adt(id), public, false);
+                self.bind(m, &e.name, Res::Adt(id), public);
                 self.pending.push((m, PendingItem::Adt(id, Rc::new(item.clone()))));
             }
             ast::ItemKind::Trait(t) => {
@@ -288,7 +281,7 @@ impl<'d> Collector<'d> {
                     }
                 }
                 self.p.traits[id.index()].methods = methods.iter().map(|(f, _)| *f).collect();
-                self.bind(m, &t.name, Res::Trait(id), public, false);
+                self.bind(m, &t.name, Res::Trait(id), public);
                 self.pending.push((m, PendingItem::Trait(id, Rc::new(t.clone()), methods)));
             }
             ast::ItemKind::Impl(i) => {
@@ -326,7 +319,7 @@ impl<'d> Collector<'d> {
                     public,
                     span: item.span,
                 });
-                self.bind(m, &c.name, Res::Const(id), public, false);
+                self.bind(m, &c.name, Res::Const(id), public);
                 self.pending.push((m, PendingItem::Const(id, Rc::new(c.clone()))));
             }
             ast::ItemKind::Use(u) => self.flatten_use(m, u, Vec::new(), public),
@@ -469,7 +462,9 @@ impl<'d> Collector<'d> {
                 }
             }
         }
-        let limits = [256u32, 256, 64];
+        // The limits a manifest is checked against (WebGPU's defaults).
+        use wrela_abi::manifest::{MAX_WORKGROUP_INVOCATIONS, MAX_WORKGROUP_SIZE};
+        let limits = MAX_WORKGROUP_SIZE;
         for i in 0..3 {
             if size[i] > limits[i] {
                 let axis = ["x", "y", "z"][i];
@@ -482,22 +477,27 @@ impl<'d> Collector<'d> {
                             limits[i], size[i]
                         ),
                     )
-                    .with_note(
-                        "WebGPU's default limits: 256, 256 and 64, and 256 invocations in all",
-                    ),
+                    .with_note(format!(
+                        "WebGPU's default limits: {}, {} and {}, and {MAX_WORKGROUP_INVOCATIONS} invocations in all",
+                        limits[0], limits[1], limits[2]
+                    )),
                 );
                 return None;
             }
         }
         let total = size[0] as u64 * size[1] as u64 * size[2] as u64;
-        if total > 256 {
+        if total > u64::from(MAX_WORKGROUP_INVOCATIONS) {
             self.err(
                 Diagnostic::new(
                     codes::E0605,
                     a.span,
-                    format!("a workgroup can have at most 256 invocations, not {total}"),
+                    format!(
+                        "a workgroup can have at most {MAX_WORKGROUP_INVOCATIONS} invocations, not {total}"
+                    ),
                 )
-                .with_note("WebGPU's default limit is 256 invocations per workgroup"),
+                .with_note(format!(
+                    "WebGPU's default limit is {MAX_WORKGROUP_INVOCATIONS} invocations per workgroup"
+                )),
             );
             return None;
         }
@@ -514,7 +514,7 @@ impl<'d> Collector<'d> {
             for u in pending {
                 match resolve::resolve_module_path(&self.p, u.module, &u.path) {
                     resolve::PathLookup::Found(res) => {
-                        self.bind(u.module, &u.alias, res, u.public, true);
+                        self.bind(u.module, &u.alias, res, u.public);
                     }
                     resolve::PathLookup::NotYet => still.push(u),
                     resolve::PathLookup::Error(d) => self.err(*d),
@@ -589,7 +589,7 @@ impl<'d> Collector<'d> {
         }
         for (m, item) in &pending {
             match item {
-                PendingItem::Trait(id, t, methods) => {
+                PendingItem::Trait(id, _, methods) => {
                     let self_ty = self.p.types.param(self.p.trait_(*id).self_param);
                     let mut scope = Scope::new(*m);
                     scope.self_ty = Some(self_ty);
@@ -600,7 +600,6 @@ impl<'d> Collector<'d> {
                         self.fn_bounds(*m, *fid, f, &scope.params);
                         self.fn_signature(&scope, *fid, f);
                     }
-                    let _ = t;
                 }
                 PendingItem::Impl(id, _, methods) => {
                     let mut scope = Scope::new(*m);
@@ -944,12 +943,11 @@ impl<'d> Collector<'d> {
             }
             None => (self.p.types.unit, RetMode::Owned),
         };
-        let ret = if let Some(traits) = &opaque {
+        let ret = if opaque.is_some() {
             // The return type names traits: it's this function's hidden concrete type.
             let all = self.p.fn_all_generics(id);
             let mut args: Vec<TyId> = all.iter().map(|&g| self.p.types.param(g)).collect();
             args.extend(implicit.iter().map(|&g| self.p.types.param(g)));
-            let _ = traits;
             self.p.types.intern(TyKind::Opaque(id, args))
         } else {
             ret
@@ -1507,12 +1505,4 @@ impl<'d> Collector<'d> {
             }
         }
     }
-}
-
-/// Makes the `Res` of a prelude name.
-pub fn builtin_res(name: &str) -> Option<Res> {
-    if let Some(t) = BuiltinTy::lookup(name) {
-        return Some(Res::BuiltinTy(t));
-    }
-    BuiltinFn::lookup(name).map(Res::BuiltinFn)
 }

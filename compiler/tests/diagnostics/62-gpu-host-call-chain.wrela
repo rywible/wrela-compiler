@@ -1,0 +1,14 @@
+// mistake: recording GPU work in a helper a kernel calls
+// expect: E0600
+// fix: no
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer}
+
+fn step_2(x: f32) -> f32 {
+    let _scratch: GpuBuffer<f32> = buffer(4)
+    x
+}
+
+@compute(64)
+fn fill(out: mut Slots<f32>, id: GlobalId) {
+    out[id] = step_2(1.0)
+}

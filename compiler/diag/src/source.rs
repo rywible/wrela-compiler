@@ -117,10 +117,6 @@ impl SourceFile {
         (start, start + self.line_text(line).len() as u32)
     }
 
-    pub fn line_count(&self) -> usize {
-        self.line_starts.len()
-    }
-
     pub fn slice(&self, span: Span) -> &str {
         &self.text[span.start as usize..span.end as usize]
     }
@@ -175,7 +171,6 @@ mod tests {
     #[test]
     fn crlf_is_one_break() {
         let f = SourceFile::new("a", "a\r\nb\rc");
-        assert_eq!(f.line_count(), 3);
         assert_eq!(f.line_text(0), "a");
         assert_eq!(f.line_text(1), "b");
         assert_eq!(f.line_col(5).line, 3);

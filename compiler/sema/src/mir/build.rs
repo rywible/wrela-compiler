@@ -424,7 +424,7 @@ impl<'a> Builder<'a> {
             }
             ExprKind::Swizzle(b, comps) => {
                 let p = self.place(b)?;
-                Some(self.swizzle(p, comps, b.ty, e.span))
+                Some(self.swizzle(p, comps))
             }
             ExprKind::Index(b, i) => {
                 let p = self.place(b)?;
@@ -432,7 +432,7 @@ impl<'a> Builder<'a> {
                     (self.p.types.kind(b.ty), &i.kind)
                 {
                     // A literal index into a vector is a component (checked in range).
-                    return Some(self.swizzle(p, &[*c as u8], b.ty, e.span));
+                    return Some(self.swizzle(p, &[*c as u8]));
                 }
                 let iv = self.value(i, Want::Read)?;
                 let t = self.operand_local(iv);
@@ -448,7 +448,7 @@ impl<'a> Builder<'a> {
     }
 
     /// `p.xyz`: components of a vector place. A swizzle of a swizzle is one swizzle.
-    fn swizzle(&mut self, p: Place, comps: &[u8], base_ty: TyId, span: Span) -> Place {
+    fn swizzle(&mut self, p: Place, comps: &[u8]) -> Place {
         let comps: Vec<u8> = match p.proj.last() {
             Some(Proj::Swizzle(prev)) => comps.iter().map(|&c| prev[c as usize]).collect(),
             Some(Proj::Comp(_)) => {
@@ -461,7 +461,6 @@ impl<'a> Builder<'a> {
         if matches!(base.proj.last(), Some(Proj::Swizzle(_))) {
             base.proj.pop();
         }
-        let _ = (base_ty, span);
         if comps.len() == 1 {
             base.with(Proj::Comp(comps[0]))
         } else {

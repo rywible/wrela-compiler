@@ -93,12 +93,12 @@ pub(crate) struct ModuleBuilder {
     pub gpu: Option<gpu::GpuCx>,
     /// The first caller of each instance, for call chains in diagnostics.
     pub callers: HashMap<ir::FuncId, (ir::FuncId, Span)>,
+    /// Each instance's source name (`Sphere::distance`, `main`'s closure), for diagnostics.
+    pub source_names: HashMap<ir::FuncId, String>,
     /// How many instantiations each instance is from a root (an export or entry point).
     pub depth: HashMap<ir::FuncId, u32>,
     /// Whether the instantiation limit has been reported in this module.
     pub too_deep: bool,
-    /// Instances being lowered right now.
-    pub active: Vec<ir::FuncId>,
     /// Every call between instances, for finding recursion on the GPU.
     pub edges: Vec<(ir::FuncId, ir::FuncId, Span)>,
     /// Derived functions built in this module.
@@ -115,9 +115,9 @@ impl ModuleBuilder {
             type_cache: HashMap::new(),
             gpu: None,
             callers: HashMap::new(),
+            source_names: HashMap::new(),
             depth: HashMap::new(),
             too_deep: false,
-            active: Vec::new(),
             edges: Vec::new(),
             derived: ir::derive::DeriveCache::default(),
         }
@@ -189,6 +189,9 @@ impl<'a> Cx<'a> {
         let f = self.signature(mb, &key);
         let id = mb.m.add_function(f);
         mb.instances.insert(key.clone(), id);
+        if let Some(name) = self.source_name(&key) {
+            mb.source_names.insert(id, name);
+        }
         mb.depth.insert(id, depth);
         if let Some(c) = caller {
             mb.callers.insert(id, c);
@@ -231,9 +234,7 @@ impl<'a> Cx<'a> {
     /// Lowers queued instance bodies until none are left.
     pub fn drain(&mut self, mb: &mut ModuleBuilder) {
         while let Some((key, id)) = mb.queue.pop_front() {
-            mb.active.push(id);
             body::lower_body(self, mb, &key, id);
-            mb.active.pop();
         }
     }
 
@@ -270,6 +271,19 @@ impl<'a> Cx<'a> {
             );
         }
         ok
+    }
+
+    /// An instance's function as the source names it: `Sphere::distance`, or `a closure in
+    /// main`. `None` for a derived interpretation, which has no source of its own.
+    pub fn source_name(&self, key: &InstanceKey) -> Option<String> {
+        let p = &self.checked.program;
+        match key {
+            InstanceKey::Fn { func, .. } => Some(p.fn_display_name(*func)),
+            InstanceKey::Closure { owner, .. } => {
+                owner.source_fn().map(|f| format!("a closure in {}", p.fn_display_name(f)))
+            }
+            InstanceKey::Derived { .. } => None,
+        }
     }
 
     /// The lang item function `l`.

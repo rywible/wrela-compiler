@@ -31,9 +31,14 @@ impl Rng {
         (self.next_u64() % n as u64) as usize
     }
 
+    /// A number in `[0, 1)`, uniformly.
+    pub fn unit(&mut self) -> f64 {
+        ((self.next_u64() >> 11) as f64) / ((1u64 << 53) as f64)
+    }
+
     /// True with probability `p`.
     pub fn chance(&mut self, p: f64) -> bool {
-        ((self.next_u64() >> 11) as f64) / ((1u64 << 53) as f64) < p
+        self.unit() < p
     }
 
     pub fn pick<'a, T>(&mut self, items: &'a [T]) -> &'a T {

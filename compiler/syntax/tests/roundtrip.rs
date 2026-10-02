@@ -35,70 +35,8 @@ fn round_trip(src: &str) -> String {
     once
 }
 
-const SAMPLE: &str = r#"use std::field::{Surface, sphere, round_cone}
-use std::gpu::{GlobalId, Slots}
-
-/// A field.
-pub fn blob(r: f32) -> SmoothUnion<Sphere, RoundCone> {
-    sphere(radius: r)
-        .smooth_union(round_cone(vec3(), vec3(y: 1.0), 0.3, 0.1), k: 0.1)
-}
-
-pub struct Grid: Copy + GpuData {
-    origin: vec3, // where it starts
-    cell: f32,
-    n: u32 = 4,
-}
-
-enum Shape { Ball(f32), Box { half: vec3 }, Nothing }
-
-trait Area {
-    type Out
-    fn area(self) -> f32
-    fn twice(self) -> f32 { self.area() * 2.0 }
-}
-
-impl Area for Grid {
-    type Out = f32
-
-    fn area(self) -> f32 {
-        self.cell * self.cell
-    }
-}
-
-const K: f32 = 1.5
-const N = 3
-
-@compute(64)
-fn sample<F: Surface>(field: F, grid: Grid, out: mut Slots<f32>, id: GlobalId) {
-    let i = id.x
-    let p = grid.origin + vec3(f32(i % grid.n), f32((i / grid.n) % grid.n), f32(i / (grid.n * grid.n))) * grid.cell
-    out[i] = field.distance(p)
-}
-
-fn modes(a: take Grid, b: mut [f32], c: Option<Option<u32>>) -> borrow f32 {
-    var x = take a; mut y = b[0]
-    y += 1.0
-    let (s, t) = (1, 2)
-    for mut v in b { v = v * 2.0 ** -1.0 }
-    for i in 0..10 { if i > 3 && !done { break } else if i == 2 { continue } else { x.cell = 1.0 } }
-    while x.cell < 10.0 {
-        x.cell *= 2.0
-    }
-    loop { return }
-    let m = match c {
-        Some(Some(n)) if n > 2 => n,
-        Some(_) | None => 0,
-    }
-    let f = |q: vec3| -> f32 { q.x }
-    let arr = [1, 2, 3]
-    let rep = [0.0; 4]
-    let t = arr.0
-    let s = Shape::Box { half: vec3(1.0), ..base }
-    f(take x, mut y, |a| a + 1, named: 2)
-    mut b[0]
-}
-"#;
+/// A file using most of the syntax (compiler/grammar's tests read it too).
+const SAMPLE: &str = include_str!("sample.wrela");
 
 #[test]
 fn sample_round_trips() {

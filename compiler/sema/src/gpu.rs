@@ -26,6 +26,65 @@ fn lang_of(p: &Program, t: TyId) -> Option<Lang> {
     }
 }
 
+/// A GPU builtin input, named by the std type that carries it (language.md §12).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BuiltinInput {
+    GlobalId,
+    LocalId,
+    WorkgroupId,
+    VertexIndex,
+    InstanceIndex,
+    FragCoord,
+}
+
+impl BuiltinInput {
+    /// The input a parameter of type `t` receives, if `t` is one of the input types.
+    pub fn of(p: &Program, t: TyId) -> Option<BuiltinInput> {
+        Some(match lang_of(p, t)? {
+            Lang::GlobalId => BuiltinInput::GlobalId,
+            Lang::LocalId => BuiltinInput::LocalId,
+            Lang::WorkgroupId => BuiltinInput::WorkgroupId,
+            Lang::VertexIndex => BuiltinInput::VertexIndex,
+            Lang::InstanceIndex => BuiltinInput::InstanceIndex,
+            Lang::FragCoord => BuiltinInput::FragCoord,
+            _ => return None,
+        })
+    }
+
+    /// Whether an entry point of this stage receives the input.
+    pub fn available(self, entry: Entry) -> bool {
+        match self {
+            BuiltinInput::GlobalId | BuiltinInput::LocalId | BuiltinInput::WorkgroupId => {
+                matches!(entry, Entry::Compute(_))
+            }
+            BuiltinInput::VertexIndex | BuiltinInput::InstanceIndex => entry == Entry::Vertex,
+            BuiltinInput::FragCoord => entry == Entry::Fragment,
+        }
+    }
+}
+
+/// E0604: data a GPU entry point receives by value (a uniform) whose type isn't `GpuData`.
+/// Reported where the entry point is declared, or, for a type a generic entry point is
+/// instantiated with, where it's dispatched.
+pub fn not_gpu_data(p: &Program, param: &str, ty: TyId, span: wrela_diag::Span) -> Diagnostic {
+    let shown = p.display_ty(ty);
+    let mut d = Diagnostic::new(
+        codes::E0604,
+        span,
+        format!("`{param}` is a `{shown}`, which isn't `GpuData`, so it can't go to the GPU"),
+    )
+    .with_note(
+        "data crossing to the GPU must be `GpuData`, so its layout is the same on both sides \
+         (§6.13)",
+    );
+    if let TyKind::Adt(a, _) = p.types.kind(ty)
+        && let Some((at, text)) = p.opt_in_fix(*a, "GpuData")
+    {
+        d = d.with_fix(format!("opt `{shown}` in to `GpuData`"), at, text);
+    }
+    d
+}
+
 fn stage_name(e: Entry) -> &'static str {
     match e {
         Entry::Compute(_) => "a `@compute` kernel",
@@ -80,14 +139,7 @@ fn check_entry(p: &Program, f: FnId, entry: Entry, out: &mut Vec<Diagnostic>) {
     // What it takes.
     for ps in &def.params {
         let lang = lang_of(p, ps.ty);
-        let builtin_stage = match lang {
-            Some(Lang::GlobalId | Lang::LocalId | Lang::WorkgroupId) => {
-                Some(matches!(entry, Entry::Compute(_)))
-            }
-            Some(Lang::VertexIndex | Lang::InstanceIndex) => Some(entry == Entry::Vertex),
-            Some(Lang::FragCoord) => Some(entry == Entry::Fragment),
-            _ => None,
-        };
+        let builtin_stage = BuiltinInput::of(p, ps.ty).map(|b| b.available(entry));
         if builtin_stage == Some(false) {
             let ty = p.display_ty(ps.ty);
             out.push(Diagnostic::new(
@@ -142,25 +194,7 @@ fn check_entry(p: &Program, f: FnId, entry: Entry, out: &mut Vec<Diagnostic>) {
             && !matches!(p.types.kind(ps.ty), TyKind::Slice(_) | TyKind::Param(_))
             && !p.types.has_params(ps.ty);
         if passed && !crate::traits::implements_builtin(p, ps.ty, Lang::GpuData) {
-            let ty = p.display_ty(ps.ty);
-            let mut d = Diagnostic::new(
-                codes::E0604,
-                ps.span,
-                format!(
-                    "`{}` is a `{ty}`, which isn't `GpuData`, so it can't go to the GPU",
-                    ps.name
-                ),
-            )
-            .with_note(
-                "data crossing to the GPU must be `GpuData`, so its layout is the same on both \
-                 sides (§6.13)",
-            );
-            if let TyKind::Adt(a, _) = p.types.kind(ps.ty)
-                && let Some((at, text)) = p.opt_in_fix(*a, "GpuData")
-            {
-                d = d.with_fix(format!("opt `{ty}` in to `GpuData`"), at, text);
-            }
-            out.push(d);
+            out.push(not_gpu_data(p, &ps.name, ps.ty, ps.span));
         }
         if slots && !matches!(entry, Entry::Compute(_)) {
             out.push(Diagnostic::new(

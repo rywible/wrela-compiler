@@ -4,7 +4,13 @@
 //! The GPU tests are `#[ignore]`d: they need a GPU and take the GPU lock (`wrela_host::lock`).
 //! `tools/check.sh` runs them with `--ignored`.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use wrela_host::map_read;
+
+/// SplitMix64, for tests' random inputs.
+pub use wrela_grammar::rng::Rng;
 
 /// The repository's root.
 pub fn root() -> PathBuf {
@@ -23,6 +29,23 @@ pub fn build(pkg: &Path, out: &Path) -> Result<(), String> {
         std::fs::write(out.join(path), bytes).map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+/// Builds the test package `compiler/tests/<pkg>` into `out` once per test process (the
+/// tests of one binary share it), and returns `out`. Panics with the errors if it doesn't
+/// build.
+pub fn built(pkg: &str, out: PathBuf) -> PathBuf {
+    static DONE: Mutex<Option<HashSet<PathBuf>>> = Mutex::new(None);
+    // Held while building, so a second test waits for the first's build rather than racing it.
+    let mut done = DONE.lock().unwrap_or_else(|p| p.into_inner());
+    let done = done.get_or_insert_with(HashSet::new);
+    if !done.contains(&out) {
+        if let Err(e) = build(&root().join("compiler/tests").join(pkg), &out) {
+            panic!("compiler/tests/{pkg} doesn't build:\n{e}");
+        }
+        done.insert(out.clone());
+    }
+    out
 }
 
 /// A little-endian `f32` array from bytes.
@@ -62,38 +85,12 @@ pub struct RawGpu {
     _lock: wrela_host::lock::GpuLock,
 }
 
-fn map_read(device: &wgpu::Device, buffer: &wgpu::Buffer) -> Result<Vec<u8>, String> {
-    let slice = buffer.slice(..);
-    let (tx, rx) = std::sync::mpsc::channel();
-    slice.map_async(wgpu::MapMode::Read, move |r| {
-        let _ = tx.send(r);
-    });
-    device.poll(wgpu::PollType::wait_indefinitely()).map_err(|e| e.to_string())?;
-    rx.recv().map_err(|e| e.to_string())?.map_err(|e| e.to_string())?;
-    let bytes = slice.get_mapped_range().map_err(|e| e.to_string())?.to_vec();
-    buffer.unmap();
-    Ok(bytes)
-}
-
 impl RawGpu {
     pub fn new() -> Result<RawGpu, String> {
         let lock = wrela_host::lock::GpuLock::acquire("wrela-tests").map_err(|e| e.to_string())?;
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::PRIMARY,
-            ..wgpu::InstanceDescriptor::new_without_display_handle()
-        });
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            ..Default::default()
-        }))
-        .map_err(|e| format!("no GPU adapter: {e}"))?;
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("hand-written"),
-            required_features: wgpu::Features::TIMESTAMP_QUERY,
-            required_limits: wgpu::Limits::default(),
-            ..Default::default()
-        }))
-        .map_err(|e| format!("can't open the device: {e}"))?;
+        let (device, queue) =
+            wrela_host::open_device("hand-written", wgpu::Features::TIMESTAMP_QUERY)
+                .map_err(|e| e.to_string())?;
         Ok(RawGpu { device, queue, _lock: lock })
     }
 
@@ -216,7 +213,8 @@ impl RawGpu {
             }
         }
         queue.submit([encoder.finish()]);
-        let ticks: Vec<u64> = map_read(device, &ts)?
+        let ticks: Vec<u64> = map_read(device, &ts)
+            .map_err(|e| e.to_string())?
             .chunks_exact(8)
             .map(|c| u64::from_le_bytes(c.try_into().expect("8 bytes")))
             .collect();
@@ -226,7 +224,7 @@ impl RawGpu {
             .collect();
         let mut outs = Vec::new();
         for rb in &readbacks {
-            outs.push(map_read(device, rb)?);
+            outs.push(map_read(device, rb).map_err(|e| e.to_string())?);
         }
         Ok((times, outs))
     }

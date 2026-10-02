@@ -5,8 +5,8 @@
 //! - Types keep the IR's layout (`wrela_ir::layout`), so struct member offsets in the WGSL are
 //!   the offsets the CPU wrote uniforms with.
 //! - Every IR value becomes a named WGSL `let`, so evaluation order is the IR's exactly.
-//! - Functions are ordered callees first, as naga requires; only those reachable from an entry
-//!   point are written.
+//! - Only entry points are written: GPU modules arrive flattened (`wrela_ir::opt` inlines
+//!   every call), so a call here is a compiler bug.
 
 use naga::{
     AddressSpace, ArraySize, BinaryOperator, Binding, Block, BuiltIn, Expression, Function,
@@ -19,6 +19,8 @@ use wrela_ir as ir;
 use wrela_ir::layout::{array_stride, field_offsets, layout};
 
 type R<T> = Result<T, String>;
+
+const CALL: &str = "internal: a call in a GPU module, which should have been flattened";
 
 /// Writes a GPU module as validated WGSL.
 pub fn emit(m: &ir::Module) -> R<String> {
@@ -39,13 +41,7 @@ pub fn validate(module: &naga::Module) -> R<naga::valid::ModuleInfo> {
 }
 
 fn sanitize(name: &str) -> String {
-    let mut s: String =
-        name.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
-    while s.contains("__") {
-        s = s.replace("__", "_");
-    }
-    let s = s.trim_matches('_').to_string();
-    if s.is_empty() || s.starts_with(|c: char| c.is_ascii_digit()) { format!("t_{s}") } else { s }
+    ir::ident(name)
 }
 
 fn vsize(n: u8) -> VectorSize {
@@ -71,38 +67,16 @@ struct Cx<'m> {
     out: naga::Module,
     types: HashMap<ir::TypeId, Handle<Type>>,
     globals: Vec<Option<Handle<GlobalVariable>>>,
-    functions: HashMap<ir::FuncId, Handle<Function>>,
 }
 
 pub fn to_naga(m: &ir::Module) -> R<naga::Module> {
-    let mut cx = Cx {
-        m,
-        out: naga::Module::default(),
-        types: HashMap::new(),
-        globals: Vec::new(),
-        functions: HashMap::new(),
-    };
+    let mut cx = Cx { m, out: naga::Module::default(), types: HashMap::new(), globals: Vec::new() };
     for r in &m.resources {
         let g = cx.global(r)?;
         cx.globals.push(Some(g));
     }
-    // Functions reachable from the entry points, callees first.
-    let entries: Vec<ir::FuncId> = m.entry_points.iter().map(|e| e.function).collect();
-    let mut order = Vec::new();
-    let mut seen = vec![false; m.functions.len()];
-    for &e in &entries {
-        postorder(m, e, &mut seen, &mut order);
-    }
-    for f in order {
-        if entries.contains(&f) {
-            continue;
-        }
-        let func = cx.function(f, None)?;
-        let h = cx.out.functions.append(func, Span::UNDEFINED);
-        cx.functions.insert(f, h);
-    }
     for e in m.entry_points.iter() {
-        let func = cx.function(e.function, Some(e))?;
+        let func = cx.function(e)?;
         let (stage, wg) = match &e.stage {
             ir::Stage::Compute { workgroup_size } => (ShaderStage::Compute, *workgroup_size),
             ir::Stage::Vertex { .. } => (ShaderStage::Vertex, [0; 3]),
@@ -121,38 +95,6 @@ pub fn to_naga(m: &ir::Module) -> R<naga::Module> {
         });
     }
     Ok(cx.out)
-}
-
-fn postorder(m: &ir::Module, f: ir::FuncId, seen: &mut [bool], out: &mut Vec<ir::FuncId>) {
-    if seen[f.index()] {
-        return;
-    }
-    seen[f.index()] = true;
-    let mut callees = Vec::new();
-    calls(&m.functions[f.index()].body, &mut callees);
-    for c in callees {
-        postorder(m, c, seen, out);
-    }
-    out.push(f);
-}
-
-fn calls(b: &ir::Block, out: &mut Vec<ir::FuncId>) {
-    for s in b {
-        match s {
-            ir::Stmt::Let(_, ir::Expr::Call(f, _)) | ir::Stmt::Eval(ir::Expr::Call(f, _)) => {
-                out.push(*f)
-            }
-            ir::Stmt::If { then, else_, .. } => {
-                calls(then, out);
-                calls(else_, out);
-            }
-            ir::Stmt::Loop { body, continuing } => {
-                calls(body, out);
-                calls(continuing, out);
-            }
-            _ => {}
-        }
-    }
 }
 
 impl<'m> Cx<'m> {
@@ -344,8 +286,8 @@ impl<'m> Cx<'m> {
         self.out.types.insert(Type { name: None, inner }, Span::UNDEFINED)
     }
 
-    fn function(&mut self, id: ir::FuncId, entry: Option<&'m ir::EntryPoint>) -> R<Function> {
-        let f = &self.m.functions[id.index()];
+    fn function(&mut self, entry: &'m ir::EntryPoint) -> R<Function> {
+        let f = &self.m.functions[entry.function.index()];
         let mut func = Function { name: Some(sanitize(&f.name)), ..Function::default() };
         let mut fb = Fb {
             cx: self,
@@ -377,7 +319,7 @@ struct Fb<'a, 'm> {
     func: &'a mut Function,
     values: HashMap<ir::ValueId, Handle<Expression>>,
     locals: Vec<Handle<LocalVariable>>,
-    entry: Option<&'m ir::EntryPoint>,
+    entry: &'m ir::EntryPoint,
     /// For a vertex entry: the output struct and how its members map to the IR struct's.
     io: Option<(Handle<Type>, IoMap, ir::TypeId)>,
     /// The entry's builtin inputs, as argument indices.
@@ -388,7 +330,6 @@ struct Fb<'a, 'm> {
 
 impl<'a, 'm> Fb<'a, 'm> {
     fn signature(&mut self) -> R<()> {
-        let m = self.cx.m;
         for l in &self.f.locals {
             let ty = self.cx.ty(l.ty)?;
             let h = self.func.local_variables.append(
@@ -397,99 +338,77 @@ impl<'a, 'm> Fb<'a, 'm> {
             );
             self.locals.push(h);
         }
-        match self.entry {
-            None => {
-                for p in &self.f.params {
-                    let base = self.cx.ty(p.ty)?;
-                    let ty = if p.by_ref {
-                        self.cx.ty_inner(TypeInner::Pointer { base, space: AddressSpace::Function })
-                    } else {
-                        base
-                    };
+        let e = self.entry;
+        // Builtin inputs first.
+        for (i, b) in e.inputs.iter().enumerate() {
+            let (builtin, inner) = match b {
+                ir::BuiltinInput::GlobalInvocationId => (
+                    BuiltIn::GlobalInvocationId,
+                    TypeInner::Vector { size: VectorSize::Tri, scalar: Scalar::U32 },
+                ),
+                ir::BuiltinInput::LocalInvocationId => (
+                    BuiltIn::LocalInvocationId,
+                    TypeInner::Vector { size: VectorSize::Tri, scalar: Scalar::U32 },
+                ),
+                ir::BuiltinInput::WorkgroupId => (
+                    BuiltIn::WorkGroupId,
+                    TypeInner::Vector { size: VectorSize::Tri, scalar: Scalar::U32 },
+                ),
+                ir::BuiltinInput::NumWorkgroups => (
+                    BuiltIn::NumWorkGroups,
+                    TypeInner::Vector { size: VectorSize::Tri, scalar: Scalar::U32 },
+                ),
+                ir::BuiltinInput::VertexIndex => {
+                    (BuiltIn::VertexIndex, TypeInner::Scalar(Scalar::U32))
+                }
+                ir::BuiltinInput::InstanceIndex => {
+                    (BuiltIn::InstanceIndex, TypeInner::Scalar(Scalar::U32))
+                }
+                ir::BuiltinInput::Position => (
+                    BuiltIn::Position { invariant: false },
+                    TypeInner::Vector { size: VectorSize::Quad, scalar: Scalar::F32 },
+                ),
+            };
+            let ty = self.cx.ty_inner(inner);
+            self.func.arguments.push(FunctionArgument {
+                name: Some(format!("input{i}")),
+                ty,
+                binding: Some(Binding::BuiltIn(builtin)),
+            });
+            self.inputs.push(i as u32);
+        }
+        self.param_base = e.inputs.len() as u32;
+        match &e.stage {
+            ir::Stage::Compute { .. } => {}
+            ir::Stage::Vertex { position_field, flat } => {
+                let rt = self.f.ret.ok_or("internal: a vertex shader with no output")?;
+                let (io, map) = self.cx.io_struct(rt, *position_field, flat)?;
+                self.func.result = Some(FunctionResult { ty: io, binding: None });
+                self.io = Some((io, map, rt));
+            }
+            ir::Stage::Fragment { varyings, position_field, flat } => {
+                if let (Some(vt), Some(pf)) = (varyings, position_field) {
+                    let (io, map) = self.cx.io_struct(*vt, *pf, flat)?;
                     self.func.arguments.push(FunctionArgument {
-                        name: Some(sanitize(&p.name)),
-                        ty,
+                        name: Some("varyings".into()),
+                        ty: io,
                         binding: None,
                     });
+                    self.io = Some((io, map, *vt));
                 }
-                if let Some(rt) = self.f.ret {
-                    self.func.result = Some(FunctionResult { ty: self.cx.ty(rt)?, binding: None });
-                }
-            }
-            Some(e) => {
-                // Builtin inputs first.
-                for (i, b) in e.inputs.iter().enumerate() {
-                    let (builtin, inner) = match b {
-                        ir::BuiltinInput::GlobalInvocationId => (
-                            BuiltIn::GlobalInvocationId,
-                            TypeInner::Vector { size: VectorSize::Tri, scalar: Scalar::U32 },
-                        ),
-                        ir::BuiltinInput::LocalInvocationId => (
-                            BuiltIn::LocalInvocationId,
-                            TypeInner::Vector { size: VectorSize::Tri, scalar: Scalar::U32 },
-                        ),
-                        ir::BuiltinInput::WorkgroupId => (
-                            BuiltIn::WorkGroupId,
-                            TypeInner::Vector { size: VectorSize::Tri, scalar: Scalar::U32 },
-                        ),
-                        ir::BuiltinInput::NumWorkgroups => (
-                            BuiltIn::NumWorkGroups,
-                            TypeInner::Vector { size: VectorSize::Tri, scalar: Scalar::U32 },
-                        ),
-                        ir::BuiltinInput::VertexIndex => {
-                            (BuiltIn::VertexIndex, TypeInner::Scalar(Scalar::U32))
-                        }
-                        ir::BuiltinInput::InstanceIndex => {
-                            (BuiltIn::InstanceIndex, TypeInner::Scalar(Scalar::U32))
-                        }
-                        ir::BuiltinInput::Position => (
-                            BuiltIn::Position { invariant: false },
-                            TypeInner::Vector { size: VectorSize::Quad, scalar: Scalar::F32 },
-                        ),
-                    };
-                    let ty = self.cx.ty_inner(inner);
-                    self.func.arguments.push(FunctionArgument {
-                        name: Some(format!("input{i}")),
-                        ty,
-                        binding: Some(Binding::BuiltIn(builtin)),
-                    });
-                    self.inputs.push(i as u32);
-                }
-                self.param_base = e.inputs.len() as u32;
-                match &e.stage {
-                    ir::Stage::Compute { .. } => {}
-                    ir::Stage::Vertex { position_field, flat } => {
-                        let rt = self.f.ret.ok_or("internal: a vertex shader with no output")?;
-                        let (io, map) = self.cx.io_struct(rt, *position_field, flat)?;
-                        self.func.result = Some(FunctionResult { ty: io, binding: None });
-                        self.io = Some((io, map, rt));
-                    }
-                    ir::Stage::Fragment { varyings, position_field, flat } => {
-                        if let (Some(vt), Some(pf)) = (varyings, position_field) {
-                            let (io, map) = self.cx.io_struct(*vt, *pf, flat)?;
-                            self.func.arguments.push(FunctionArgument {
-                                name: Some("varyings".into()),
-                                ty: io,
-                                binding: None,
-                            });
-                            self.io = Some((io, map, *vt));
-                        }
-                        let v4 = self.cx.ty_vec4();
-                        self.func.result = Some(FunctionResult {
-                            ty: v4,
-                            binding: Some(Binding::Location {
-                                location: 0,
-                                interpolation: None,
-                                sampling: None,
-                                blend_src: None,
-                                per_primitive: false,
-                            }),
-                        });
-                    }
-                }
+                let v4 = self.cx.ty_vec4();
+                self.func.result = Some(FunctionResult {
+                    ty: v4,
+                    binding: Some(Binding::Location {
+                        location: 0,
+                        interpolation: None,
+                        sampling: None,
+                        blend_src: None,
+                        per_primitive: false,
+                    }),
+                });
             }
         }
-        let _ = m;
         Ok(())
     }
 
@@ -563,30 +482,12 @@ impl<'a, 'm> Fb<'a, 'm> {
             ir::Stmt::Let(v, e) => {
                 let h = self.value(*v, e, out)?;
                 self.values.insert(*v, h);
-                if !self.func.expressions[h].needs_pre_emit()
-                    && !matches!(self.func.expressions[h], Expression::CallResult(_))
-                {
+                if !self.func.expressions[h].needs_pre_emit() {
                     self.func.named_expressions.insert(h, format!("v{}", v.0));
                 }
             }
             ir::Stmt::Eval(e) => match e {
-                ir::Expr::Call(f, args) => {
-                    let callee = *self
-                        .cx
-                        .functions
-                        .get(f)
-                        .ok_or("internal: a call to a missing function")?;
-                    let arguments = self.args(*f, args, out)?;
-                    let result = self.cx.m.functions[f.index()].ret.map(|_| {
-                        self.func
-                            .expressions
-                            .append(Expression::CallResult(callee), Span::UNDEFINED)
-                    });
-                    out.push(
-                        Statement::Call { function: callee, arguments, result },
-                        Span::UNDEFINED,
-                    );
-                }
+                ir::Expr::Call(..) => return Err(CALL.into()),
                 ir::Expr::Host(..) => return Err("GPU code can't record GPU work".into()),
                 _ => {}
             },
@@ -635,14 +536,10 @@ impl<'a, 'm> Fb<'a, 'm> {
     /// A vertex shader's return value, rebuilt as the output struct.
     fn output(&mut self, h: Handle<Expression>, out: &mut Block) -> R<Handle<Expression>> {
         let Some((io, map, _)) = self.io.clone() else { return Ok(h) };
-        if !matches!(self.entry.map(|e| &e.stage), Some(ir::Stage::Vertex { .. })) {
+        let ir::Stage::Vertex { position_field: position, .. } = self.entry.stage else {
             return Ok(h);
-        }
-        let mut comps = Vec::new();
-        let position = match &self.entry.map(|e| e.stage.clone()) {
-            Some(ir::Stage::Vertex { position_field, .. }) => *position_field,
-            _ => 0,
         };
+        let mut comps = Vec::new();
         let single = map.len() == 1
             && !self.f.ret.is_some_and(|r| matches!(self.cx.m.types.get(r), ir::TypeDef::Struct { fields, .. } if fields.len() > 1));
         for (i, is_flat) in map {
@@ -658,23 +555,6 @@ impl<'a, 'm> Fb<'a, 'm> {
             comps.push(v);
         }
         Ok(self.expr(Expression::Compose { ty: io, components: comps }, out))
-    }
-
-    fn args(
-        &mut self,
-        f: ir::FuncId,
-        args: &[ir::Arg],
-        out: &mut Block,
-    ) -> R<Vec<Handle<Expression>>> {
-        let _ = f;
-        let mut v = Vec::new();
-        for a in args {
-            v.push(match a {
-                ir::Arg::Value(x) => self.val(*x)?,
-                ir::Arg::Place(p) => self.place(p, out)?,
-            });
-        }
-        Ok(v)
     }
 
     fn splat_if_needed(
@@ -713,16 +593,13 @@ impl<'a, 'm> Fb<'a, 'm> {
             ir::Expr::Param(i) => {
                 // In a fragment shader, parameter 0 is the varyings: rebuild the IR struct.
                 if let Some((_, map, vt)) = self.io.clone()
-                    && matches!(self.entry.map(|e| &e.stage), Some(ir::Stage::Fragment { .. }))
+                    && let ir::Stage::Fragment { position_field, .. } = &self.entry.stage
                 {
                     let arg = self.expr(Expression::FunctionArgument(self.param_base + *i), out);
                     let ir::TypeDef::Struct { fields, .. } = types.get(vt).clone() else {
                         return Err("internal: varyings".into());
                     };
-                    let position = match self.entry.map(|e| e.stage.clone()) {
-                        Some(ir::Stage::Fragment { position_field: Some(p), .. }) => p,
-                        _ => u32::MAX,
-                    };
+                    let position = position_field.unwrap_or(u32::MAX);
                     let mut comps = Vec::new();
                     for (k, (i, is_flat)) in map.into_iter().enumerate() {
                         let member =
@@ -767,18 +644,7 @@ impl<'a, 'm> Fb<'a, 'm> {
                 let pointer = self.place(p, out)?;
                 self.expr(Expression::ArrayLength(pointer), out)
             }
-            ir::Expr::Call(f, args) => {
-                let callee =
-                    *self.cx.functions.get(f).ok_or("internal: a call to a missing function")?;
-                let arguments = self.args(*f, args, out)?;
-                let result =
-                    self.func.expressions.append(Expression::CallResult(callee), Span::UNDEFINED);
-                out.push(
-                    Statement::Call { function: callee, arguments, result: Some(result) },
-                    Span::UNDEFINED,
-                );
-                result
-            }
+            ir::Expr::Call(..) => return Err(CALL.into()),
             ir::Expr::Construct(ty, parts) => {
                 let components = parts.iter().map(|p| self.val(*p)).collect::<R<Vec<_>>>()?;
                 let ty = self.cx.ty(*ty)?;
@@ -905,7 +771,7 @@ impl<'a, 'm> Fb<'a, 'm> {
                 };
                 self.expr(Expression::Binary { op: bop, left, right }, out)
             }
-            ir::Expr::Builtin(b, args) => self.builtin(*b, args, t, out)?,
+            ir::Expr::Builtin(b, args) => self.builtin(*b, args, out)?,
             ir::Expr::Host(..) => return Err("GPU code can't record GPU work".into()),
             ir::Expr::Run(_) | ir::Expr::Addr(_) => {
                 return Err("internal: a CPU-only expression in GPU code".into());
@@ -917,7 +783,6 @@ impl<'a, 'm> Fb<'a, 'm> {
         &mut self,
         b: ir::Builtin,
         args: &[ir::ValueId],
-        t: ir::TypeId,
         out: &mut Block,
     ) -> R<Handle<Expression>> {
         use ir::Builtin as B;
@@ -999,7 +864,6 @@ impl<'a, 'm> Fb<'a, 'm> {
                 }
             }
         };
-        let _ = t;
         Ok(self.expr(e, out))
     }
 }

@@ -171,11 +171,6 @@ impl BuiltinFn {
         BuiltinFn::ALL.iter().copied().find(|b| b.name() == name && b.call() != Call::Free)
     }
 
-    /// Fragment-only derivatives.
-    pub fn is_derivative(self) -> bool {
-        matches!(self, BuiltinFn::Dpdx | BuiltinFn::Dpdy | BuiltinFn::Fwidth)
-    }
-
     /// Works out the result type from the argument types (all resolved, defaults applied), or
     /// says what's wrong.
     pub fn result(self, types: &Types, args: &[TyId]) -> Result<TyId, String> {

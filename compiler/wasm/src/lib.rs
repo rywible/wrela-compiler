@@ -21,11 +21,11 @@ use wrela_ir as ir;
 
 /// Where things are in linear memory.
 pub mod memory {
-    /// The command buffer: a 12-byte batch header, then commands.
+    /// The command buffer: a batch header, then commands.
     pub const CMD_BASE: u32 = 1024;
     pub const CMD_CAP: u32 = 1 << 20;
     /// The shadow stack grows down from the top of memory to here.
-    pub const STACK_LIMIT: u32 = CMD_BASE + 12 + CMD_CAP + 1024;
+    pub const STACK_LIMIT: u32 = CMD_BASE + wrela_abi::stream::HEADER_LEN as u32 + CMD_CAP + 1024;
     /// Memory size in 64 KiB pages: 16 MiB. Fixed: tier 0 has no heap.
     pub const PAGES: u64 = 256;
     pub const STACK_TOP: u32 = (PAGES as u32) * 65536;

@@ -494,8 +494,42 @@ impl Module {
     }
 }
 
+/// A name as an identifier both back ends accept: letters, digits and single underscores, not
+/// starting with a digit or an underscore (WGSL reserves names starting with `__`). The one
+/// place names are made identifiers, so an entry point's name in the manifest is its name in
+/// the shader.
+pub fn ident(name: &str) -> String {
+    let mut s = String::with_capacity(name.len());
+    for c in name.chars() {
+        let c = if c.is_ascii_alphanumeric() { c } else { '_' };
+        if !(c == '_' && (s.is_empty() || s.ends_with('_'))) {
+            s.push(c);
+        }
+    }
+    let s = s.trim_end_matches('_');
+    if s.is_empty() || s.starts_with(|c: char| c.is_ascii_digit()) {
+        format!("t_{s}")
+    } else {
+        s.to_string()
+    }
+}
+
 impl fmt::Display for Module {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&print::print(self))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ident;
+
+    #[test]
+    fn identifiers() {
+        assert_eq!(ident("Sphere::distance"), "Sphere_distance");
+        assert_eq!(ident("a__b"), "a_b");
+        assert_eq!(ident("__k"), "k");
+        assert_eq!(ident("2d"), "t_2d");
+        assert_eq!(ident("_"), "t_");
     }
 }

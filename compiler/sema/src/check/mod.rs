@@ -758,7 +758,7 @@ pub fn check_fn(p: &Program, consts: &ConstTypes, f: FnId) -> (Option<Body>, Vec
         }
     }
     let value = Expr { ty: block.ty, kind: ExprKind::Block(block), span: body.span };
-    let mut out = zonk::finish(c, params, value, hidden, f);
+    let mut out = zonk::finish(c, params, value, hidden);
     if let Some(b) = &mut out.0 {
         crate::check::zonk::check_opaque(p, f, b, &mut out.1);
     }

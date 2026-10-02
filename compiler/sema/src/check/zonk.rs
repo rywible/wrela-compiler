@@ -275,7 +275,6 @@ pub(super) fn finish(
     params: Vec<LocalId>,
     mut value: Expr,
     hidden: Option<TyId>,
-    f: FnId,
 ) -> (Option<Body>, Vec<Diagnostic>) {
     finish_common(&mut c);
     let infer = c.infer.clone();
@@ -297,7 +296,6 @@ pub(super) fn finish(
         resolve(&mut h);
         h
     });
-    let _ = f;
     let body = Body { params, locals, closures, value, hidden_ret };
     let diags = c.diags;
     (Some(body), diags)

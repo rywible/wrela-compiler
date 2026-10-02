@@ -30,7 +30,7 @@ pub mod lock;
 mod program;
 
 pub use error::{Error, Result};
-pub use gpu::{GpuTiming, SCREEN_FORMAT};
+pub use gpu::{GpuTiming, SCREEN_FORMAT, map_read, open_device};
 pub use program::Value;
 
 use gpu::Gpu;

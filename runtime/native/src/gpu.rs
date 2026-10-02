@@ -122,37 +122,37 @@ fn gpu_err(e: impl std::fmt::Display) -> Error {
     Error::Gpu(e.to_string())
 }
 
+/// Opens the high-performance adapter's device with `features` and WebGPU's default limits, as
+/// a browser's `requestDevice()` gives: both hosts accept the same programs.
+pub fn open_device(label: &str, features: wgpu::Features) -> Result<(wgpu::Device, wgpu::Queue)> {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::PRIMARY,
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
+    });
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        ..Default::default()
+    }))
+    .map_err(|e| Error::Gpu(format!("no GPU adapter: {e}")))?;
+    let missing = features - adapter.features();
+    if !missing.is_empty() {
+        return Err(Error::Gpu(format!("{} doesn't support {missing:?}", adapter.get_info().name)));
+    }
+    pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        label: Some(label),
+        required_features: features,
+        required_limits: wgpu::Limits::default(),
+        ..Default::default()
+    }))
+    .map_err(|e| Error::Gpu(format!("can't open the device: {e}")))
+}
+
 impl Gpu {
     /// Opens the GPU and builds every pipeline. `shaders[i]` is pipeline `i`'s WGSL source.
     pub(crate) fn new(manifest: &Manifest, shaders: &[String], timestamps: bool) -> Result<Gpu> {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::PRIMARY,
-            ..wgpu::InstanceDescriptor::new_without_display_handle()
-        });
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            ..Default::default()
-        }))
-        .map_err(|e| Error::Gpu(format!("no GPU adapter: {e}")))?;
-        let mut features = wgpu::Features::empty();
-        if timestamps {
-            if !adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
-                return Err(Error::Gpu(format!(
-                    "{} doesn't support timestamp queries",
-                    adapter.get_info().name
-                )));
-            }
-            features |= wgpu::Features::TIMESTAMP_QUERY;
-        }
-        // WebGPU's default limits, as a browser's `requestDevice()` gives: both hosts accept the
-        // same programs.
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("wrela-host"),
-            required_features: features,
-            required_limits: wgpu::Limits::default(),
-            ..Default::default()
-        }))
-        .map_err(|e| Error::Gpu(format!("can't open the device: {e}")))?;
+        let features =
+            if timestamps { wgpu::Features::TIMESTAMP_QUERY } else { wgpu::Features::empty() };
+        let (device, queue) = open_device("wrela-host", features)?;
 
         let errors = Arc::new(Mutex::new(Vec::new()));
         let sink = errors.clone();
@@ -731,7 +731,7 @@ fn create_ring(device: &wgpu::Device, capacity: u64) -> wgpu::Buffer {
 }
 
 /// Maps a `MAP_READ` buffer and copies it out, waiting for the GPU.
-fn map_read(device: &wgpu::Device, buffer: &wgpu::Buffer) -> Result<Vec<u8>> {
+pub fn map_read(device: &wgpu::Device, buffer: &wgpu::Buffer) -> Result<Vec<u8>> {
     let slice = buffer.slice(..);
     let (tx, rx) = std::sync::mpsc::channel();
     slice.map_async(wgpu::MapMode::Read, move |r| {
