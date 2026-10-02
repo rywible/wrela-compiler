@@ -1,0 +1,173 @@
+# wrela grammar, tier 0. Normative (D-104).
+#
+# This grammar is written over the token stream spec/lexical.md defines, not over characters.
+# The newline rules (L17-L19) are context-dependent, so the lexer applies them and hands the
+# grammar explicit NEWLINE tokens: a NEWLINE below is always a statement or item boundary. The
+# compiler's hand-written parser (compiler/syntax/src/parser.rs) conforms to this file by test:
+# the oracle parser in compiler/grammar reads this file, parses with the same lexer, and must
+# agree with it on the conformance suite and on grammar-generated programs.
+#
+# Dialect
+#   name ::= expr     a rule. It ends where the next `name ::=` begins, or at the end of the file.
+#   a b               sequence
+#   a | b             alternatives (binds loosest)
+#   ( a )             grouping
+#   a?  a*  a+        optional, zero or more, one or more (postfix, binds tightest)
+#   "fn"  "+="        a terminal: a keyword, `_`, or a punctuation token, by its text
+#   IDENT INT FLOAT   token classes (UPPERCASE), defined in spec/lexical.md (L21):
+#   SUFFIXED STRING   IDENT, INT, FLOAT, SUFFIXED, STRING, NEWLINE, EOF and GT_CLOSE.
+#   NEWLINE EOF       GT_CLOSE is a `>` that closes a generic list; it also matches the first
+#   GT_CLOSE          `>` of a `>>`, `>=` or `>>=` token, whose rest is the next token (L16).
+#   # ...             a comment, to the end of the line
+# Rule names are lowercase_with_underscores; each is defined once. The start rule is `file`.
+#
+# A repeated binary operator, `a ("+" a)*`, associates to the left; `**` associates to the right.
+# The grammar is unambiguous: one parse per accepted token sequence (the oracle checks this).
+#
+# What the grammar accepts is syntax only. Which attributes exist, which names resolve, and what
+# is tier 1 (units, strings, `?`) are the checker's rules, with their own diagnostics.
+
+# ---------------------------------------------------------------------------------------------
+# Files and items
+
+file             ::= sep* (item (sep+ item)* sep*)? EOF
+sep              ::= NEWLINE | ";"
+
+item             ::= attribute* (pub_item | impl_item)
+pub_item         ::= "pub"? (fn_item | struct_item | enum_item | trait_item | const_item | use_item)
+attribute        ::= "@" IDENT call_args? NEWLINE?
+
+fn_item          ::= fn_sig block
+fn_sig           ::= "fn" IDENT generic_params? "(" params? ")" ret_type?
+generic_params   ::= "<" (generic_param ("," generic_param)* ","?)? GT_CLOSE
+generic_param    ::= IDENT (":" bounds)?
+bounds           ::= path_type ("+" path_type)*
+params           ::= param ("," param)* ","?
+param            ::= mode? "self" | IDENT ":" mode? type ("=" expr)?
+mode             ::= "mut" | "take"
+ret_type         ::= "->" ("borrow" | "mut")? type
+
+# `struct S: A + B { ... }` opts S in to the traits A and B.
+struct_item      ::= "struct" IDENT generic_params? (":" bounds)? field_block
+field_block      ::= "{" (field_decl ("," field_decl)* ","?)? NEWLINE? "}"
+field_decl       ::= "pub"? IDENT ":" type ("=" expr)?
+
+enum_item        ::= "enum" IDENT generic_params? (":" bounds)? "{" (variant ("," variant)* ","?)? NEWLINE? "}"
+variant          ::= IDENT ("(" (type ("," type)* ","?)? ")" | field_block)?
+
+trait_item       ::= "trait" IDENT generic_params? (":" bounds)? "{" sep* (trait_member (sep+ trait_member)* sep*)? "}"
+trait_member     ::= attribute* (fn_sig block? | "type" IDENT (":" bounds)?)
+
+impl_item        ::= "impl" generic_params? type ("for" type)? "{" sep* (impl_member (sep+ impl_member)* sep*)? "}"
+impl_member      ::= attribute* "pub"? fn_item | "type" IDENT "=" type
+
+const_item       ::= "const" IDENT (":" type)? "=" expr
+
+use_item         ::= "use" use_tree
+use_tree         ::= IDENT ("::" IDENT)* ("::" "{" (use_tree ("," use_tree)* ","?)? NEWLINE? "}" | "as" IDENT)?
+
+# ---------------------------------------------------------------------------------------------
+# Types. `T::Kind` and `Self::Out` are paths. There are no reference types: `&T` is an error.
+
+type             ::= path_type
+                   | "[" type (";" expr)? "]"
+                   | "(" (type ("," type)* ","?)? ")"
+                   | "fn" "(" (type ("," type)* ","?)? ")" ("->" type)?
+path_type        ::= type_segment ("::" type_segment)*
+type_segment     ::= (IDENT | "Self") generic_args?
+generic_args     ::= "<" type ("," type)* ","? GT_CLOSE
+
+# ---------------------------------------------------------------------------------------------
+# Blocks and statements. A block's value is its last statement when that is an expression.
+
+block            ::= "{" sep* (stmt (sep+ stmt)* sep*)? "}"
+stmt             ::= bind_stmt | assign_stmt | while_stmt | loop_stmt | for_stmt | expr
+bind_stmt        ::= "let" pattern (":" type)? "=" expr
+                   | ("var" | "mut") IDENT (":" type)? "=" expr
+assign_stmt      ::= postfix_expr assign_op expr
+assign_op        ::= "=" | "+=" | "-=" | "*=" | "/=" | "%=" | "**=" | "&=" | "|=" | "^=" | "<<=" | ">>="
+while_stmt       ::= "while" expr_ns block
+loop_stmt        ::= "loop" block
+for_stmt         ::= "for" "mut"? pattern "in" expr_ns ((".." | "..=") expr_ns)? block
+
+# ---------------------------------------------------------------------------------------------
+# Expressions, loosest-binding first. A closure, `return`, `break` and `continue` are expressions
+# on their own, never operands: `f(|x| x + 1)`, not `a + |x| x`.
+
+expr             ::= closure | jump | or_expr
+jump             ::= "return" expr? | "break" | "continue"
+closure          ::= ("|" (closure_param ("," closure_param)* ","?)? "|" | "||") ("->" type block | expr)
+closure_param    ::= IDENT (":" type)?
+
+or_expr          ::= and_expr ("||" and_expr)*
+and_expr         ::= cmp_expr ("&&" cmp_expr)*
+cmp_expr         ::= bitor_expr (cmp_op bitor_expr)?          # comparisons don't chain
+cmp_op           ::= "==" | "!=" | "<" | "<=" | ">" | ">="
+bitor_expr       ::= bitxor_expr ("|" bitxor_expr)*
+bitxor_expr      ::= bitand_expr ("^" bitand_expr)*
+bitand_expr      ::= shift_expr ("&" shift_expr)*
+shift_expr       ::= add_expr (("<<" | ">>") add_expr)*
+add_expr         ::= mul_expr (("+" | "-") mul_expr)*
+mul_expr         ::= unary_expr (("*" | "/" | "%") unary_expr)*
+unary_expr       ::= ("-" | "!" | "take" | "mut") unary_expr | power_expr
+power_expr       ::= postfix_expr ("**" unary_expr)?          # -x ** 2 is -(x ** 2)
+
+# A field access is never directly followed by call arguments: `.name(` is always a method call.
+# To call a function stored in a field, write `(a.f)(x)`.
+postfix_expr     ::= primary_expr postfixes
+postfixes        ::= (postfix | field_access+ (index | method_call))* field_access*
+postfix          ::= call_args | index | method_call
+index            ::= "[" expr "]"
+method_call      ::= "." IDENT ("::" generic_args)? call_args
+field_access     ::= "." (IDENT | INT)
+
+# Positional arguments come first; once one is named, the rest are named too (D-039).
+call_args        ::= "(" args? ")"
+args             ::= expr ("," expr)* ("," named_arg)* ","? | named_arg ("," named_arg)* ","?
+named_arg        ::= IDENT ":" expr
+
+primary_expr     ::= literal | path_expr | struct_literal | paren_expr | array_expr | block
+                   | if_expr | match_expr
+literal          ::= INT | FLOAT | SUFFIXED | STRING | "true" | "false"
+path_expr        ::= expr_segment ("::" expr_segment)*
+expr_segment     ::= IDENT ("::" generic_args)? | "Self" | "self"
+paren_expr       ::= "(" (expr ("," expr)* ","?)? ")"
+array_expr       ::= "[" (expr (";" expr | ("," expr)* ","?))? "]"
+
+# `S { time }` is short for `S { time: time }`; `..base` fills the remaining fields.
+struct_literal   ::= path_expr "{" (field_init ("," field_init)* ("," ".." expr)? ","? | ".." expr ","?)? NEWLINE? "}"
+field_init       ::= IDENT (":" expr)?
+
+if_expr          ::= "if" expr_ns block ("else" (if_expr | block))?
+match_expr       ::= "match" expr_ns "{" (arm (arm_sep arm)* arm_sep?)? "}"
+arm              ::= pattern ("|" pattern)* ("if" expr_ns)? "=>" expr
+arm_sep          ::= "," | NEWLINE
+
+# ---------------------------------------------------------------------------------------------
+# Patterns
+
+pattern          ::= "_" | "-"? (INT | FLOAT) | "true" | "false"
+                   | path_expr ("(" (pattern ("," pattern)* ","?)? ")" | pattern_fields)?
+                   | "(" (pattern ("," pattern)* ","?)? ")"
+pattern_fields   ::= "{" (field_pattern ("," field_pattern)* ("," "..")? ","? | "..")? NEWLINE? "}"
+field_pattern    ::= IDENT (":" pattern)?
+
+# ---------------------------------------------------------------------------------------------
+# The head of an `if`, `while`, `for` or `match` can't hold a struct literal or a closure outside
+# brackets, as in Rust: in `if a == S { }` the `{` starts the block. These rules repeat the chain
+# above without them; inside ( ), [ ] or call arguments the full `expr` is back.
+
+expr_ns          ::= or_expr_ns
+or_expr_ns       ::= and_expr_ns ("||" and_expr_ns)*
+and_expr_ns      ::= cmp_expr_ns ("&&" cmp_expr_ns)*
+cmp_expr_ns      ::= bitor_expr_ns (cmp_op bitor_expr_ns)?
+bitor_expr_ns    ::= bitxor_expr_ns ("|" bitxor_expr_ns)*
+bitxor_expr_ns   ::= bitand_expr_ns ("^" bitand_expr_ns)*
+bitand_expr_ns   ::= shift_expr_ns ("&" shift_expr_ns)*
+shift_expr_ns    ::= add_expr_ns (("<<" | ">>") add_expr_ns)*
+add_expr_ns      ::= mul_expr_ns (("+" | "-") mul_expr_ns)*
+mul_expr_ns      ::= unary_expr_ns (("*" | "/" | "%") unary_expr_ns)*
+unary_expr_ns    ::= ("-" | "!" | "take" | "mut") unary_expr_ns | power_expr_ns
+power_expr_ns    ::= postfix_expr_ns ("**" unary_expr_ns)?
+postfix_expr_ns  ::= primary_expr_ns postfixes
+primary_expr_ns  ::= literal | path_expr | paren_expr | array_expr | block | if_expr | match_expr

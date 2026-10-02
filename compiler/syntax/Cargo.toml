@@ -1,0 +1,13 @@
+[package]
+name = "wrela-syntax"
+description = "The wrela lexer (spec/lexical.md), parser (spec/grammar.ebnf), AST and formatter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+wrela-diag.workspace = true
+
+[lints]
+workspace = true
