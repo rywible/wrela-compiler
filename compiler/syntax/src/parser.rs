@@ -189,13 +189,20 @@ impl<'a> Parser<'a> {
             T::ShrEq => T::Ge,
             _ => return Err(self.expected("`>`")),
         };
+        // Split the token in two: the `>` that closes the list, consumed here, then the rest of
+        // its text as the next token. (Consuming a real token keeps `prev_span` right, so the
+        // spans of the types and paths that end here include their `>`.)
         let split = t.span.start + 1;
-        self.tokens[self.pos] = Token {
+        let close = Span::new(self.file, t.span.start, split);
+        self.tokens[self.pos] = Token { kind: T::Gt, span: close, ..t };
+        let rest = Token {
             kind: rest,
             span: Span::new(self.file, split, t.span.end),
             line_break_before: false,
         };
-        Ok(Span::new(self.file, t.span.start, split))
+        self.tokens.insert(self.pos + 1, rest);
+        self.bump();
+        Ok(close)
     }
 
     fn at_sep(&self) -> bool {

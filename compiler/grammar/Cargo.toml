@@ -1,0 +1,26 @@
+[package]
+name = "wrela-grammar"
+description = "The grammar as an executable spec: an oracle parser for spec/grammar.ebnf, grammar-based program generation, and the GBNF export"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+wrela-diag.workspace = true
+wrela-syntax.workspace = true
+
+[[bin]]
+name = "differential"
+path = "src/bin/differential.rs"
+
+[[bin]]
+name = "export-gbnf"
+path = "src/bin/export_gbnf.rs"
+
+[[bin]]
+name = "gbnf-sample"
+path = "src/bin/gbnf_sample.rs"
+
+[lints]
+workspace = true

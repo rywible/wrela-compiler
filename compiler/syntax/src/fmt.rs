@@ -156,7 +156,7 @@ impl<'a> Printer<'a> {
             self.w("@");
             self.w(&a.name.name);
             if let Some(args) = &a.args {
-                self.args(args, false);
+                self.args(args, false, a.span.end);
             }
             self.newline();
         }
@@ -637,7 +637,8 @@ impl<'a> Printer<'a> {
 
     // ---- expressions -----------------------------------------------------------------------
 
-    fn args(&mut self, args: &[Arg], multiline: bool) {
+    /// A call's arguments; `end` is where the call ends (just past its `)`).
+    fn args(&mut self, args: &[Arg], multiline: bool, end: u32) {
         if args.is_empty() {
             self.w("()");
             return;
@@ -650,8 +651,8 @@ impl<'a> Printer<'a> {
                 self.arg(a);
                 self.w(",");
             }
-            let end = args.last().map_or(0, |a| a.span.end);
-            self.before_close(end);
+            // Comments up to the `)` belong inside the parentheses.
+            self.before_close(end.saturating_sub(1));
         } else {
             for (i, a) in args.iter().enumerate() {
                 if i > 0 {
@@ -699,7 +700,7 @@ impl<'a> Printer<'a> {
             }
             ExprKind::Call { callee, args, multiline } => {
                 self.expr(callee);
-                self.args(args, *multiline);
+                self.args(args, *multiline, e.span.end);
             }
             ExprKind::MethodCall { receiver, name, generics, args, newline_before, multiline } => {
                 self.expr(receiver);
@@ -713,13 +714,17 @@ impl<'a> Printer<'a> {
                     self.w("::");
                     self.generic_args(g);
                 }
-                self.args(args, *multiline);
+                self.args(args, *multiline, e.span.end);
                 if *newline_before {
                     self.indent -= 1;
                 }
             }
             ExprKind::Field { base, name } => {
                 self.expr(base);
+                // `1 .0` isn't `1.0`.
+                if matches!(name, FieldName::Index(..)) && matches!(base.kind, ExprKind::Lit(_)) {
+                    self.w(" ");
+                }
                 self.w(".");
                 self.w(&name.text());
             }

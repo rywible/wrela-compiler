@@ -490,11 +490,14 @@ impl<'a> Parser<'a> {
                         T::Int => {
                             let t = self.bump();
                             let text = self.text_of(t.span);
-                            let Some(n) = text.parse::<u32>().ok() else {
+                            // field_access ::= "." (IDENT | INT): any INT is a tuple index
+                            // (`t.0x1` is `t.1`, `t.1_0` is `t.10`); only its value is checked.
+                            let value = crate::lexer::int_value(text);
+                            let Some(n) = value.and_then(|v| u32::try_from(v).ok()) else {
                                 self.error(Diagnostic::new(
-                                    codes::E0100,
+                                    codes::E0006,
                                     t.span,
-                                    format!("`{text}` isn't a tuple field"),
+                                    format!("`{text}` is too large for a tuple index"),
                                 ));
                                 return Err(Failed);
                             };

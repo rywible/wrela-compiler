@@ -1,0 +1,847 @@
+//! Exports the grammar as GBNF (llama.cpp's grammar format) over **characters**, so a language
+//! model can be constrained to write wrela that the compiler parses.
+//!
+//! spec/grammar.ebnf is written over tokens, and three things between tokens are
+//! context-dependent at the character level. The export handles each by specializing every
+//! nonterminal of the (right-recursive) lowered grammar on a small amount of context, the
+//! classic intersection of a context-free grammar with a finite automaton, keeping only the
+//! variants reachable from `file`:
+//!
+//! - **Brackets (L19).** A variant is specialized on its innermost open bracket: `b` for `{` or
+//!   the top level, `p` for `(` or `[`. Brackets always open and close within one sequence of a
+//!   rule (the export checks this), so each position's bracket is known statically.
+//! - **The previous token (L17).** A variant is specialized on the class of the token before it
+//!   and the class of its own last token: a number, another word (name, keyword, `_`) or
+//!   punctuation, that can or can't end a statement (`nc`, `wc`, `wn`, `pc`, `pn`; the file
+//!   start counts as `pn`), or `|`/`||` (`bar`).
+//!   NEWLINE is only generated after a token that can end a statement, in a `b` context, as a
+//!   real line break (optionally after a comment); the lexer then produces exactly that NEWLINE.
+//!   The export checks that no NEWLINE can be followed by `.`, the one token that would cancel
+//!   it.
+//! - **Whitespace.** Between two tokens in a `b` context, a line break is allowed only where L17
+//!   makes it whitespace: after a token that can't end a statement, or before a `.`. Inside `p`
+//!   contexts line breaks and comments are free. Where the two tokens could merge when re-lexed
+//!   (two words; a number then `.`; punctuation pairs such as `-` `>`, `*` `*`, `.` `.`, `:` `:`,
+//!   `<` `=`, worked out with the real lexer), at least one space or tab is required; a GT_CLOSE
+//!   may touch a following `>`, `=` or `>=`, which L16 splits again. Which
+//!   tokens can come before a given token is over-approximated (from the specialized grammar),
+//!   so some layouts that would be fine are forbidden; none that would merge is allowed.
+//!
+//! IDENT excludes the keywords (through a trie: a regular grammar for the complement) and `_`.
+//! Tier-1 tokens (STRING, SUFFIXED) are left out: the checker rejects them in tier 0. An INT
+//! after `.` (a tuple index) is limited to four digits so it always fits in `u32`.
+//!
+//! The result is meant to be sound, not complete: every string it generates should parse, which
+//! the tests check by sampling (see [`crate::sampler`]); and it accepts the formatter's layout
+//! and the usual hand layouts (also tested), but not every valid one.
+
+use crate::cfg::{Cfg, Recursion, Sym};
+use crate::ebnf::{Grammar, Terminal};
+use crate::generate::{lexer_kind, no_glue_pairs};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::fmt::Write as _;
+use wrela_syntax::TokenKind;
+
+/// The innermost open bracket.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum Ctx {
+    /// `{`, or no bracket.
+    Brace,
+    /// `(` or `[`.
+    Paren,
+}
+
+/// The class of the previous token: a number, another word, or punctuation; and whether it can
+/// end a statement (L17). Numbers are their own class because `.` can't follow them directly
+/// (`1.0` is a FLOAT), while it can follow any other word.
+/// `|` and `||` are a class of their own because a closure can start right after one (a closure
+/// whose body is a closure), and `|` `|` would lex as `||`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum Prev {
+    Nc,
+    Wc,
+    Wn,
+    Pc,
+    Pn,
+    Bar,
+}
+
+const PREVS: [Prev; 6] = [Prev::Nc, Prev::Wc, Prev::Wn, Prev::Pc, Prev::Pn, Prev::Bar];
+
+impl Prev {
+    fn bit(self) -> u8 {
+        1 << (self as u8)
+    }
+
+    fn can_end(self) -> bool {
+        matches!(self, Prev::Nc | Prev::Wc | Prev::Pc)
+    }
+
+    fn code(self) -> &'static str {
+        match self {
+            Prev::Nc => "nc",
+            Prev::Wc => "wc",
+            Prev::Wn => "wn",
+            Prev::Pc => "pc",
+            Prev::Pn => "pn",
+            Prev::Bar => "bar",
+        }
+    }
+}
+
+fn class(t: Terminal) -> Prev {
+    let k = lexer_kind(t);
+    match k {
+        TokenKind::Int | TokenKind::Float | TokenKind::Suffixed => return Prev::Nc,
+        TokenKind::Pipe | TokenKind::OrOr => return Prev::Bar,
+        _ => {}
+    }
+    let word = matches!(
+        k,
+        TokenKind::Ident
+            | TokenKind::Int
+            | TokenKind::Float
+            | TokenKind::Suffixed
+            | TokenKind::Underscore
+    ) || k.is_keyword();
+    match (word, k.can_end_statement()) {
+        (true, true) => Prev::Wc,
+        (true, false) => Prev::Wn,
+        (false, true) => Prev::Pc,
+        (false, false) => Prev::Pn,
+    }
+}
+
+const NEWLINE: Terminal = Terminal::Token(TokenKind::Newline);
+const EOF: Terminal = Terminal::Token(TokenKind::Eof);
+
+/// What can't be exported faithfully.
+#[derive(Debug)]
+pub struct ExportError(pub String);
+
+impl std::fmt::Display for ExportError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ExportError {}
+
+/// A specialized nonterminal: (nonterminal, bracket, class before, class of its last token).
+type Key = (usize, Ctx, Prev, Prev);
+
+/// A symbol of a specialized production.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum SSym {
+    /// A terminal, with the class of the token before it and its bracket context.
+    T(Terminal, Prev, Ctx),
+    N(Key),
+}
+
+struct Specializer<'a> {
+    cfg: &'a Cfg,
+    /// Per production and position: the bracket the position is inside, if the production
+    /// itself opened it.
+    inner: Vec<Vec<Option<Ctx>>>,
+    excluded: HashSet<Terminal>,
+    /// For each (nonterminal, bracket, class before): the classes it can end in.
+    outs: BTreeMap<(usize, Ctx, Prev), u8>,
+}
+
+fn opener(t: Terminal) -> Option<Ctx> {
+    match lexer_kind(t) {
+        TokenKind::LBrace => Some(Ctx::Brace),
+        TokenKind::LParen | TokenKind::LBracket => Some(Ctx::Paren),
+        _ => None,
+    }
+}
+
+fn closer_of(t: Terminal) -> Option<TokenKind> {
+    match lexer_kind(t) {
+        TokenKind::RBrace => Some(TokenKind::LBrace),
+        TokenKind::RParen => Some(TokenKind::LParen),
+        TokenKind::RBracket => Some(TokenKind::LBracket),
+        _ => None,
+    }
+}
+
+/// The bracket each position of each production is inside, when the production opened it.
+fn bracket_contexts(cfg: &Cfg) -> Result<Vec<Vec<Option<Ctx>>>, ExportError> {
+    let mut out = Vec::new();
+    for p in &cfg.prods {
+        let mut stack: Vec<TokenKind> = Vec::new();
+        let mut ctxs = Vec::new();
+        for s in &p.rhs {
+            let here =
+                stack.last().map(|k| if *k == TokenKind::LBrace { Ctx::Brace } else { Ctx::Paren });
+            ctxs.push(here);
+            if let Sym::T(t) = s {
+                if opener(*t).is_some() {
+                    stack.push(lexer_kind(*t));
+                } else if let Some(open) = closer_of(*t)
+                    && stack.pop() != Some(open)
+                {
+                    return Err(ExportError(format!(
+                        "in `{}`, a closing bracket doesn't match an opening one in the same sequence",
+                        cfg.nts[p.lhs].name
+                    )));
+                }
+            }
+        }
+        if !stack.is_empty() {
+            return Err(ExportError(format!(
+                "in `{}`, a bracket isn't closed in the same sequence",
+                cfg.nts[p.lhs].name
+            )));
+        }
+        out.push(ctxs);
+    }
+    Ok(out)
+}
+
+impl Specializer<'_> {
+    fn allowed(&self, t: Terminal, prev: Prev, ctx: Ctx) -> bool {
+        if self.excluded.contains(&t) {
+            return false;
+        }
+        if t == NEWLINE {
+            return ctx == Ctx::Brace && prev.can_end();
+        }
+        true
+    }
+
+    fn out_mask(&mut self, nt: usize, ctx: Ctx, prev: Prev) -> u8 {
+        *self.outs.entry((nt, ctx, prev)).or_insert(0)
+    }
+
+    /// The classes production `p`, started after a `prev` token in `ctx`, can end in.
+    fn production_outs(&mut self, p: usize, ctx: Ctx, prev: Prev) -> u8 {
+        let mut cur = prev.bit();
+        for (i, s) in self.cfg.prods[p].rhs.clone().iter().enumerate() {
+            let c = self.inner[p][i].unwrap_or(ctx);
+            let mut next = 0;
+            for s_prev in PREVS {
+                if cur & s_prev.bit() == 0 {
+                    continue;
+                }
+                match *s {
+                    Sym::T(t) => {
+                        if self.allowed(t, s_prev, c) {
+                            next |= class(t).bit();
+                        }
+                    }
+                    Sym::N(n) => next |= self.out_mask(n, c, s_prev),
+                }
+            }
+            cur = next;
+            if cur == 0 {
+                break;
+            }
+        }
+        cur
+    }
+
+    fn solve(&mut self) {
+        self.outs.insert((self.cfg.start, Ctx::Brace, Prev::Pn), 0);
+        loop {
+            let keys: Vec<_> = self.outs.keys().copied().collect();
+            let mut changed = false;
+            for &(nt, ctx, prev) in &keys {
+                let mut mask = 0;
+                for &p in &self.cfg.nts[nt].prods.clone() {
+                    mask |= self.production_outs(p, ctx, prev);
+                }
+                let old = self.outs[&(nt, ctx, prev)];
+                if mask | old != old {
+                    self.outs.insert((nt, ctx, prev), mask | old);
+                    changed = true;
+                }
+            }
+            // Keys first met during this pass haven't been evaluated yet.
+            if !changed && self.outs.len() == keys.len() {
+                break;
+            }
+        }
+    }
+
+    /// The specialized alternatives of a variant.
+    fn alternatives(&self, key: Key) -> Vec<Vec<SSym>> {
+        let (nt, ctx, prev, last) = key;
+        let mut out = Vec::new();
+        for &p in &self.cfg.nts[nt].prods {
+            self.paths(p, 0, ctx, prev, last, &mut Vec::new(), &mut out);
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn paths(
+        &self,
+        p: usize,
+        i: usize,
+        ctx: Ctx,
+        cur: Prev,
+        last: Prev,
+        acc: &mut Vec<SSym>,
+        out: &mut Vec<Vec<SSym>>,
+    ) {
+        let rhs = &self.cfg.prods[p].rhs;
+        if i == rhs.len() {
+            if cur == last {
+                out.push(acc.clone());
+            }
+            return;
+        }
+        let c = self.inner[p][i].unwrap_or(ctx);
+        match rhs[i] {
+            Sym::T(t) => {
+                if self.allowed(t, cur, c) {
+                    acc.push(SSym::T(t, cur, c));
+                    self.paths(p, i + 1, ctx, class(t), last, acc, out);
+                    acc.pop();
+                }
+            }
+            Sym::N(n) => {
+                let mask = self.outs.get(&(n, c, cur)).copied().unwrap_or(0);
+                for next in PREVS {
+                    if mask & next.bit() != 0 {
+                        acc.push(SSym::N((n, c, cur, next)));
+                        self.paths(p, i + 1, ctx, next, last, acc, out);
+                        acc.pop();
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Sets of terminals as bitmasks over the grammar's terminals, plus one bit for "the start of
+/// the file".
+struct TermSet {
+    terms: Vec<Terminal>,
+}
+
+impl TermSet {
+    const START: u128 = 1 << 127;
+
+    fn bit(&self, t: Terminal) -> u128 {
+        1 << self
+            .terms
+            .iter()
+            .position(|x| *x == t)
+            .unwrap_or_else(|| unreachable!("unknown terminal"))
+    }
+
+    fn members(&self, mask: u128) -> impl Iterator<Item = Terminal> + '_ {
+        self.terms.iter().enumerate().filter(move |(i, _)| mask & (1 << i) != 0).map(|(_, t)| *t)
+    }
+}
+
+/// The specialized grammar, reduced to what's reachable and nonempty.
+struct Specialized {
+    rules: BTreeMap<Key, Vec<Vec<SSym>>>,
+    root: Key,
+}
+
+impl Specialized {
+    fn nullable(&self) -> HashSet<Key> {
+        let mut nullable = HashSet::new();
+        loop {
+            let before = nullable.len();
+            for (k, alts) in &self.rules {
+                if alts
+                    .iter()
+                    .any(|a| a.iter().all(|s| matches!(s, SSym::N(n) if nullable.contains(n))))
+                {
+                    nullable.insert(*k);
+                }
+            }
+            if nullable.len() == before {
+                return nullable;
+            }
+        }
+    }
+
+    /// Drops variants that derive only the empty string, and references to them.
+    fn remove_empty(&mut self) {
+        loop {
+            let empty: HashSet<Key> = self
+                .rules
+                .iter()
+                .filter(|(k, alts)| **k != self.root && alts.iter().all(Vec::is_empty))
+                .map(|(k, _)| *k)
+                .collect();
+            if empty.is_empty() {
+                return;
+            }
+            self.rules.retain(|k, _| !empty.contains(k));
+            for alts in self.rules.values_mut() {
+                for a in alts.iter_mut() {
+                    a.retain(|s| !matches!(s, SSym::N(n) if empty.contains(n)));
+                }
+                alts.sort();
+                alts.dedup();
+            }
+        }
+    }
+
+    /// For each variant, the terminals it can end with; and for each, the terminals (and the
+    /// file start) that can come right before it.
+    fn last_and_precede(&self, ts: &TermSet) -> (HashMap<Key, u128>, HashMap<Key, u128>) {
+        let nullable = self.nullable();
+        let mut last: HashMap<Key, u128> = self.rules.keys().map(|k| (*k, 0)).collect();
+        loop {
+            let mut changed = false;
+            for (k, alts) in &self.rules {
+                let mut m = 0;
+                for a in alts {
+                    m |= Self::scan_back(a, a.len(), &last, &nullable, ts).0;
+                }
+                if last[k] | m != last[k] {
+                    last.insert(*k, last[k] | m);
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        let mut precede: HashMap<Key, u128> = self.rules.keys().map(|k| (*k, 0)).collect();
+        precede.insert(self.root, TermSet::START);
+        loop {
+            let mut changed = false;
+            for (k, alts) in &self.rules {
+                for a in alts {
+                    for (i, s) in a.iter().enumerate() {
+                        if let SSym::N(n) = s {
+                            let (m, reached_start) = Self::scan_back(a, i, &last, &nullable, ts);
+                            let m = if reached_start { m | precede[k] } else { m };
+                            if precede[n] | m != precede[n] {
+                                precede.insert(*n, precede[n] | m);
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+            }
+            if !changed {
+                return (last, precede);
+            }
+        }
+    }
+
+    /// The terminals that can end `a[..end]`, and whether it can be empty.
+    fn scan_back(
+        a: &[SSym],
+        end: usize,
+        last: &HashMap<Key, u128>,
+        nullable: &HashSet<Key>,
+        ts: &TermSet,
+    ) -> (u128, bool) {
+        let mut m = 0;
+        for s in a[..end].iter().rev() {
+            match s {
+                SSym::T(t, ..) => return (m | ts.bit(*t), false),
+                SSym::N(n) => {
+                    m |= last[n];
+                    if !nullable.contains(n) {
+                        return (m, false);
+                    }
+                }
+            }
+        }
+        (m, true)
+    }
+
+    fn check_no_left_recursion(&self, names: &impl Fn(Key) -> String) -> Result<(), ExportError> {
+        let nullable = self.nullable();
+        let left: HashMap<Key, Vec<Key>> = self
+            .rules
+            .iter()
+            .map(|(k, alts)| {
+                let mut v = Vec::new();
+                for a in alts {
+                    for s in a {
+                        match s {
+                            SSym::T(..) => break,
+                            SSym::N(n) => {
+                                v.push(*n);
+                                if !nullable.contains(n) {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                (*k, v)
+            })
+            .collect();
+        for start in self.rules.keys() {
+            let mut seen = HashSet::new();
+            let mut stack = left[start].clone();
+            while let Some(k) = stack.pop() {
+                if k == *start {
+                    return Err(ExportError(format!(
+                        "`{}` is left-recursive, which GBNF can't express",
+                        names(*start)
+                    )));
+                }
+                if seen.insert(k) {
+                    stack.extend(&left[&k]);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The GBNF text for spec/grammar.ebnf.
+pub fn export(g: &Grammar) -> Result<String, ExportError> {
+    let cfg = Cfg::lower(g, Recursion::Right);
+    let inner = bracket_contexts(&cfg)?;
+    let excluded: HashSet<Terminal> =
+        [Terminal::Token(TokenKind::Str), Terminal::Token(TokenKind::Suffixed)]
+            .into_iter()
+            .collect();
+    let mut sp = Specializer { cfg: &cfg, inner, excluded, outs: BTreeMap::new() };
+    sp.solve();
+
+    // The variants reachable from the root.
+    let root_out = sp.outs[&(cfg.start, Ctx::Brace, Prev::Pn)];
+    let root_last = PREVS
+        .into_iter()
+        .find(|p| root_out & p.bit() != 0)
+        .ok_or_else(|| ExportError("`file` derives nothing".into()))?;
+    let root: Key = (cfg.start, Ctx::Brace, Prev::Pn, root_last);
+    let mut rules = BTreeMap::new();
+    let mut todo = vec![root];
+    while let Some(k) = todo.pop() {
+        if rules.contains_key(&k) {
+            continue;
+        }
+        let alts = sp.alternatives(k);
+        for a in &alts {
+            for s in a {
+                if let SSym::N(n) = s
+                    && !rules.contains_key(n)
+                {
+                    todo.push(*n);
+                }
+            }
+        }
+        rules.insert(k, alts);
+    }
+    let mut spec = Specialized { rules, root };
+    spec.remove_empty();
+
+    let names = |k: Key| -> String {
+        let (nt, ctx, prev, last) = k;
+        let base = cfg.nts[nt].name.replace(['_', '#'], "-");
+        let c = if ctx == Ctx::Brace { "b" } else { "p" };
+        format!("{base}-{c}-{}-{}", prev.code(), last.code())
+    };
+    spec.check_no_left_recursion(&names)?;
+    let mut seen_names = HashSet::new();
+    for k in spec.rules.keys() {
+        if !seen_names.insert(names(*k)) {
+            return Err(ExportError(format!("two variants are both named `{}`", names(*k))));
+        }
+    }
+
+    let ts = TermSet { terms: g.terminals() };
+    assert!(ts.terms.len() < 127, "too many terminals for the bitmask");
+    let (last, precede) = spec.last_and_precede(&ts);
+    let no_glue = no_glue_pairs();
+    let merges = |a: Terminal, b: Terminal| {
+        // L16: a GT_CLOSE written right before `>`, `=`, `>=` or another GT_CLOSE makes a
+        // `>>`, `>=` or `>>=` token, which the parser splits back where it expects GT_CLOSE.
+        if a == Terminal::GtClose
+            && matches!(
+                b,
+                Terminal::GtClose | Terminal::Token(TokenKind::Gt | TokenKind::Eq | TokenKind::Ge)
+            )
+        {
+            return false;
+        }
+        no_glue.contains(&(lexer_kind(a), lexer_kind(b)))
+    };
+    let nullable = spec.nullable();
+
+    let mut rules: Vec<(String, Vec<String>)> = Vec::new();
+    for (k, alts) in &spec.rules {
+        let mut rendered = Vec::new();
+        let mut has_empty = false;
+        for a in alts {
+            if a.is_empty() {
+                has_empty = true;
+                continue;
+            }
+            let mut parts = Vec::new();
+            for (i, s) in a.iter().enumerate() {
+                match *s {
+                    SSym::N(n) => parts.push(names(n)),
+                    SSym::T(t, prev, ctx) => {
+                        let (before, reached_start) =
+                            Specialized::scan_back(a, i, &last, &nullable, &ts);
+                        let before = if reached_start { before | precede[k] } else { before };
+                        if t == NEWLINE {
+                            parts.push("nl".into());
+                            continue;
+                        }
+                        if t == Terminal::Token(TokenKind::Dot) && before & ts.bit(NEWLINE) != 0 {
+                            return Err(ExportError(
+                                "a `.` can follow a NEWLINE, which the lexer would drop (L17)"
+                                    .into(),
+                            ));
+                        }
+                        let preds: Vec<Terminal> = ts.members(before).collect();
+                        let mandatory = preds.iter().any(|p| merges(*p, t));
+                        let line_breaks =
+                            ctx == Ctx::Paren || !prev.can_end() || lexer_kind(t) == TokenKind::Dot;
+                        // A gap may start with a comment unless a `/` can come before it.
+                        let slash = preds.contains(&Terminal::Token(TokenKind::Slash));
+                        let gap = if line_breaks {
+                            match (mandatory, slash) {
+                                (true, _) => "ws1",
+                                (false, false) => "lead",
+                                (false, true) => "ws",
+                            }
+                        } else if mandatory {
+                            "sp1"
+                        } else {
+                            "sp"
+                        };
+                        parts.push(gap.into());
+                        if t != EOF {
+                            parts.push(terminal_text(
+                                t,
+                                preds.iter().any(|p| lexer_kind(*p) == TokenKind::Dot),
+                            ));
+                        }
+                    }
+                }
+            }
+            rendered.push(parts.join(" "));
+        }
+        let body = rendered.join(" | ");
+        let body = match (has_empty, rendered.len()) {
+            (false, _) => body,
+            (true, 0) => unreachable!("an empty-only variant survived"),
+            (true, _) => format!("( {body} )?"),
+        };
+        rules.push((names(*k), body.split(' ').map(str::to_string).collect()));
+    }
+    let root_name = merge_identical_rules(&mut rules, &names(spec.root));
+
+    let mut out = String::new();
+    out.push_str(HEADER);
+    let _ = writeln!(out, "root ::= {root_name}\n");
+    for (name, body) in &rules {
+        let _ = writeln!(out, "{name} ::= {}", body.join(" "));
+    }
+    out.push('\n');
+    out.push_str(&lexical_rules());
+    Ok(out)
+}
+
+/// Merges rules with identical bodies into one (keeping the first name), repeatedly, since a
+/// merge can make other bodies identical. Returns the root's final name.
+fn merge_identical_rules(rules: &mut Vec<(String, Vec<String>)>, root: &str) -> String {
+    let mut root = root.to_string();
+    loop {
+        let mut first: HashMap<&[String], &str> = HashMap::new();
+        let mut alias: HashMap<String, String> = HashMap::new();
+        for (name, body) in rules.iter() {
+            match first.get(body.as_slice()) {
+                Some(keep) => {
+                    alias.insert(name.clone(), keep.to_string());
+                }
+                None => {
+                    first.insert(body, name);
+                }
+            }
+        }
+        if alias.is_empty() {
+            return root;
+        }
+        rules.retain(|(name, _)| !alias.contains_key(name));
+        for (_, body) in rules.iter_mut() {
+            for part in body.iter_mut() {
+                if let Some(a) = alias.get(part) {
+                    *part = a.clone();
+                }
+            }
+        }
+        if let Some(a) = alias.get(&root) {
+            root = a.clone();
+        }
+    }
+}
+
+fn terminal_text(t: Terminal, after_dot: bool) -> String {
+    match t {
+        Terminal::Token(TokenKind::Ident) => "ident".into(),
+        Terminal::Token(TokenKind::Int) if after_dot => "tuple-index".into(),
+        Terminal::Token(TokenKind::Int) => "int".into(),
+        Terminal::Token(TokenKind::Float) => "float".into(),
+        t => {
+            let text = t.fixed_text().unwrap_or_else(|| unreachable!("{t:?} has no text"));
+            format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\""))
+        }
+    }
+}
+
+const HEADER: &str = "\
+# wrela tier 0 source, as a GBNF grammar (llama.cpp) over characters.
+# GENERATED from spec/grammar.ebnf by `cargo run -p wrela-grammar --bin export-gbnf`; do not edit.
+#
+# The rules are the grammar's, specialized on context. `name-B-X-Y` is `name` inside bracket B
+# (b: `{` or none, p: `(` or `[`), after a token of class X, ending with a token of class Y.
+# Classes (spec/lexical.md L17): nc a number; wc, wn another word; pc, pn punctuation (c: can end
+# a statement, n: can't); bar `|` or `||`. NEWLINE is `nl`, a real line break. The gaps between
+# tokens are `sp` (spaces and tabs), `ws` (also line breaks and comments), `lead` (`ws` that may
+# start with a comment), and `sp1`/`ws1` (nonempty, where the tokens would otherwise merge).
+# Strings and unit suffixes (tier 1) are left out.
+#
+# It is meant to be sound, not complete: every string it generates parses (checked by sampling:
+# `cargo run -p wrela-grammar --bin gbnf-sample`), while some valid layouts are left out.
+
+";
+
+/// IDENT without the keywords and `_`, numbers, and whitespace.
+fn lexical_rules() -> String {
+    let mut out = String::new();
+    out.push_str("# IDENT (L10) minus the keywords (L11) and `_`: a trie over the keywords.\n");
+    let keywords: Vec<&str> = TokenKind::KEYWORDS.iter().filter_map(|k| k.fixed_text()).collect();
+    let prefixes: BTreeSet<&str> =
+        keywords.iter().flat_map(|k| (1..=k.len()).map(move |i| &k[..i])).collect();
+    let mut ids: BTreeMap<&str, usize> = BTreeMap::new();
+    for (i, p) in prefixes.iter().enumerate() {
+        ids.insert(p, i + 1);
+    }
+    let cont: BTreeSet<u8> =
+        (b'a'..=b'z').chain(b'A'..=b'Z').chain(b'0'..=b'9').chain(*b"_").collect();
+    let children = |p: &str| -> BTreeSet<u8> {
+        prefixes
+            .iter()
+            .filter(|q| q.len() == p.len() + 1 && q.starts_with(p))
+            .map(|q| q.as_bytes()[p.len()])
+            .collect()
+    };
+    let node =
+        |p: &str| if p.is_empty() { "ident".to_string() } else { format!("ident-{}", ids[p]) };
+    for p in std::iter::once("").chain(prefixes.iter().copied()) {
+        let kids = children(p);
+        let mut alts = Vec::new();
+        let first: BTreeSet<u8> = if p.is_empty() {
+            cont.iter().copied().filter(|b| !b.is_ascii_digit() && *b != b'_').collect()
+        } else {
+            cont.clone()
+        };
+        let others: BTreeSet<u8> = first.difference(&kids).copied().collect();
+        if !others.is_empty() {
+            alts.push(format!("{} [A-Za-z0-9_]*", char_class(&others)));
+        }
+        for c in &kids {
+            let q = format!("{p}{}", *c as char);
+            alts.push(format!("\"{}\" {}", *c as char, node(&q)));
+        }
+        if p.is_empty() {
+            alts.push("\"_\" [A-Za-z0-9_]+".into());
+        }
+        let body = alts.join(" | ");
+        let is_keyword = keywords.contains(&p);
+        let line = if p.is_empty() || is_keyword {
+            format!("{} ::= {body}", node(p))
+        } else {
+            format!("{} ::= ( {body} )?", node(p))
+        };
+        let _ = writeln!(
+            out,
+            "{line}{}",
+            if p.is_empty() { String::new() } else { format!("  # after \"{p}\"") }
+        );
+    }
+    out.push_str(
+        "\n# INT and FLOAT (L12, L13). A tuple index (an INT after `.`) is kept small enough for u32.
+int ::= [0-9] [0-9_]* | \"0x\" [0-9a-fA-F] [0-9a-fA-F_]* | \"0b\" [01] [01_]* | \"0o\" [0-7] [0-7_]*
+tuple-index ::= [0-9] [0-9]? [0-9]? [0-9]?
+float ::= [0-9] [0-9_]* \".\" [0-9] [0-9_]* exponent? | [0-9] [0-9_]* exponent
+exponent ::= [eE] [+-]? [0-9] [0-9_]*
+
+# Gaps between tokens, and NEWLINE (L5, L6, L17, L18). In `ws` and `ws1` a comment follows a
+# space or line break, so it can't join a `/` before it into `//`; `lead` is for gaps no `/`
+# can come before.
+sp ::= [ \\t]*
+sp1 ::= [ \\t]+
+ws ::= ( [ \\t\\n] ( \"//\" [^\\r\\n]* \"\\n\" )? )*
+ws1 ::= ( [ \\t\\n] ( \"//\" [^\\r\\n]* \"\\n\" )? )+
+lead ::= ( [ \\t\\n] | \"//\" [^\\r\\n]* \"\\n\" )*
+nl ::= [ \\t]* ( \"//\" [^\\r\\n]* )? \"\\n\"
+",
+    );
+    out
+}
+
+/// A GBNF character class for a set of ASCII bytes, as ranges.
+fn char_class(set: &BTreeSet<u8>) -> String {
+    let v: Vec<u8> = set.iter().copied().collect();
+    let mut out = String::from("[");
+    let mut i = 0;
+    while i < v.len() {
+        let mut j = i;
+        while j + 1 < v.len() && v[j + 1] == v[j] + 1 {
+            j += 1;
+        }
+        if j >= i + 2 {
+            let _ = write!(out, "{}-{}", v[i] as char, v[j] as char);
+        } else {
+            for b in &v[i..=j] {
+                out.push(*b as char);
+            }
+        }
+        i = j + 1;
+    }
+    out.push(']');
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn char_classes_use_ranges() {
+        let s: BTreeSet<u8> = b"abcdxyz_0".iter().copied().collect();
+        assert_eq!(char_class(&s), "[0_a-dx-z]");
+    }
+
+    #[test]
+    fn unbalanced_brackets_are_refused() {
+        let g = Grammar::parse("file ::= x EOF\nx ::= \"(\" IDENT | \")\"\n").unwrap();
+        assert!(export(&g).unwrap_err().0.contains("bracket"));
+    }
+
+    #[test]
+    fn a_dot_after_newline_is_refused() {
+        // The lexer drops a NEWLINE before `.` (L17), so this can't be written as characters.
+        let g = Grammar::parse("file ::= IDENT NEWLINE \".\" IDENT EOF\n").unwrap();
+        assert!(export(&g).unwrap_err().0.contains("NEWLINE"));
+    }
+
+    #[test]
+    fn newlines_follow_only_tokens_that_end_statements() {
+        let g = Grammar::parse("file ::= (IDENT | \"=\") NEWLINE? IDENT EOF\n").unwrap();
+        let text = export(&g).unwrap();
+        let gbnf = crate::sampler::Gbnf::parse(&text).unwrap();
+        for (src, ok) in
+            [("a\nb", true), ("a b", true), ("=\nb", true), ("= b", true), ("a\n", false)]
+        {
+            assert_eq!(gbnf.recognizes(gbnf.root, src), ok, "{src:?}");
+        }
+        // After `=` the line break is whitespace, so only after IDENT is it a NEWLINE (`nl`).
+        assert_eq!(text.matches(" nl").count(), 1, "{text}");
+    }
+}
