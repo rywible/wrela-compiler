@@ -90,8 +90,8 @@ fn the_native_frame_matches_the_golden_and_the_cpu() {
                 other => panic!("probe returned {other:?}"),
             };
             let at = 4 * (y * WIDTH + x) as usize;
-            for c in 0..4 {
-                let want = f64::from(cpu[c].clamp(0.0, 1.0)) * 255.0;
+            for (c, v) in cpu.iter().enumerate() {
+                let want = f64::from(v.clamp(0.0, 1.0)) * 255.0;
                 let d = (want - f64::from(run.frame[at + c])).abs();
                 assert!(
                     d <= PROBE_LIMIT,
