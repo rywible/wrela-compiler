@@ -77,6 +77,13 @@ impl<'a> Printer<'a> {
             self.next += 1;
             self.w(&c.text);
             self.newline();
+            // A blank line after a comment (a file's header, a section's divider) stays.
+            let next = self.comments.get(self.next).map_or(pos, |n| n.span.start.min(pos));
+            let next = next.min(self.text.len() as u32);
+            let only_space = self.text[c.span.end as usize..next as usize].trim().is_empty();
+            if only_space && self.blank_between(c.span.end, next) {
+                self.newline();
+            }
         }
     }
 
