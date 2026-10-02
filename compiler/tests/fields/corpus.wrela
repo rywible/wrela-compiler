@@ -1,0 +1,174 @@
+// AC3's test corpus: functions over 3D space whose gradients and intervals the compiler
+// derives. The fields are std's primitives and combinators, hello-field's creature and the
+// grazer; the rest exercise every operation the interval and gradient rules cover, including
+// branches on the input, early returns, loops and integer arithmetic. Each is a `Surface`, so
+// `gradient` and `interval` come from the trait's defaults.
+use grazer::{Grazer, grazer}
+use std::field::{Surface, ellipsoid, fbm, half_space, hash_u32, round_cone, smin, sphere, value_noise}
+
+/// The creature from examples/hello-field (shape.wrela), mid-breath.
+pub fn creature() -> Surface {
+    let body = ellipsoid(vec3(0.62, 0.435, 0.42))
+    let neck = round_cone(vec3(0.35, 0.15, 0.0), vec3(0.75, 0.62, 0.0), 0.16, 0.1)
+    let head = sphere(radius: 0.2).translate(vec3(0.82, 0.72, 0.0))
+    body
+        .smooth_union(neck, k: 0.12)
+        .smooth_union(head, k: 0.08)
+        .displace(fbm(freq: 6.0, octaves: 3, offset: vec3(3.0, 1.0, 7.0)), amp: 0.015)
+}
+
+/// Value noise at a frequency.
+pub struct Noise: Copy + Clone + GpuData {
+    pub freq: f32,
+}
+
+impl Surface for Noise {
+    fn distance(self, p: vec3) -> f32 {
+        value_noise(p * self.freq)
+    }
+}
+
+/// sin, cos, exp, sqrt.
+pub struct Waves: Copy + Clone + GpuData {
+    pub s: f32,
+}
+
+impl Surface for Waves {
+    fn distance(self, p: vec3) -> f32 {
+        sin(self.s * p.x) * cos(2.0 * p.y) + exp(0.3 * p.z) - sqrt(p.x * p.x + 1.0)
+    }
+}
+
+/// log, log2, pow, exp2, inverseSqrt.
+pub struct Logs: Copy + Clone + GpuData {
+    pub s: f32,
+}
+
+impl Surface for Logs {
+    fn distance(self, p: vec3) -> f32 {
+        log(1.0 + p.x * p.x) + log2(2.0 + sin(p.y)) * pow(1.5 + 0.5 * cos(p.z), self.s) + exp2(0.5 * p.y) - inverse_sqrt(1.0 + p.z * p.z)
+    }
+}
+
+/// tan, atan, atan2, asin, acos.
+pub struct Trig: Copy + Clone + GpuData {
+    pub s: f32,
+}
+
+impl Surface for Trig {
+    fn distance(self, p: vec3) -> f32 {
+        tan(self.s * p.x) + atan(p.y) + 0.3 * atan2(p.y, p.x + 3.0) + asin(clamp(0.4 * p.z, -1.0, 1.0)) + acos(0.5 * sin(p.x))
+    }
+}
+
+/// Division, products of the input with itself, remainders.
+pub struct Rational: Copy + Clone + GpuData {
+    pub s: f32,
+}
+
+impl Surface for Rational {
+    fn distance(self, p: vec3) -> f32 {
+        (p.x * p.y - p.z) / (1.0 + p.x * p.x + p.y * p.y) + self.s * p.x * p.y * p.z + 0.1 * ((p.x + 5.0) % 0.7)
+    }
+}
+
+/// The piecewise built-ins: smoothstep, mix with a varying weight, clamp, step, abs, floor,
+/// fract, sign, min, max.
+pub struct Pieces: Copy + Clone + GpuData {
+    pub s: f32,
+}
+
+impl Surface for Pieces {
+    fn distance(self, p: vec3) -> f32 {
+        smoothstep(-1.0, 1.0, p.x) * mix(p.y, p.z, smoothstep(0.0, 1.0, p.x * p.x)) + clamp(p.z, -0.5, 0.5) + 0.2 * step(0.3, p.y) + abs(p.x - p.y) + 0.1 * floor(2.0 * p.z) + 0.1 * fract(self.s * p.x) + 0.05 * sign(p.x) + min(p.x, p.z) - max(p.y, 0.5 * p.z) + saturate(p.y)
+    }
+}
+
+/// The vector built-ins: length, dot, normalize, cross, distance, swizzles, mix of vectors.
+pub struct Vectors: Copy + Clone + GpuData {
+    pub c: vec3,
+}
+
+impl Surface for Vectors {
+    fn distance(self, p: vec3) -> f32 {
+        let n = normalize(p + vec3(3.0, 0.5, 0.0))
+        length(p - self.c) + dot(n, vec3(1.0, 2.0, 3.0)) + cross(p, vec3(0.2, 1.0, 0.4)).x + 0.5 * distance(p, vec3(1.0, 1.0, 1.0)) + dot(p.zxy, mix(p, p.yzx, vec3(0.25)))
+    }
+}
+
+/// Branches on the input, an early return, and a loop of fixed length.
+pub struct Branchy: Copy + Clone + GpuData {
+    pub n: u32,
+}
+
+impl Surface for Branchy {
+    fn distance(self, p: vec3) -> f32 {
+        if p.z > 1.0 {
+            return 2.0 * p.z - p.x
+        }
+        var s = if p.x > p.y { p.x * p.x - p.z } else { sin(p.y) + p.z }
+        for i in 0..self.n {
+            if s < 0.0 {
+                s = s + 0.25 * f32(i) * p.x
+            } else {
+                s = 0.5 * s - p.y
+            }
+        }
+        s
+    }
+}
+
+/// Integer arithmetic on the input: lattice cells and hashes, as value noise does.
+pub struct Cells: Copy + Clone + GpuData {
+    pub s: f32,
+}
+
+impl Surface for Cells {
+    fn distance(self, p: vec3) -> f32 {
+        let i = i32(floor(self.s * p.x))
+        let j = i32(floor(self.s * p.y)) * 3 + i
+        let h = hash_u32(u32(j + 1000))
+        0.1 * f32(h % 7) + 0.05 * f32(i) - p.z + f32(j >> 1) * 0.01
+    }
+}
+
+/// smin of two shapes, alone: the combinator every creature is folded with.
+pub struct Blend: Copy + Clone + GpuData {
+    pub k: f32,
+}
+
+impl Surface for Blend {
+    fn distance(self, p: vec3) -> f32 {
+        smin(length(p) - 0.5, length(p - vec3(0.6, 0.2, 0.0)) - 0.3, self.k)
+    }
+}
+
+pub fn sphere_() -> Surface {
+    sphere(0.7)
+}
+
+pub fn ellipsoid_() -> Surface {
+    ellipsoid(vec3(0.5, 0.3, 0.8))
+}
+
+pub fn cone_() -> Surface {
+    round_cone(vec3(0.1, -0.5, 0.0), vec3(-0.2, 0.6, 0.3), 0.3, 0.1)
+}
+
+pub fn hoof_() -> Surface {
+    round_cone(vec3(), vec3(y: -0.08), 0.06, 0.07).intersect(half_space(vec3(y: -1.0), 0.07))
+}
+
+pub fn blob_() -> Surface {
+    sphere(radius: 0.5)
+        .smooth_union(round_cone(vec3(), vec3(y: 1.0), 0.3, 0.1), k: 0.1)
+        .smooth_union(ellipsoid(vec3(0.3, 0.2, 0.4)).translate(vec3(0.4, 0.1, 0.0)), k: 0.05)
+}
+
+pub fn fbm_() -> Surface {
+    sphere(0.6).displace(fbm(freq: 3.0, octaves: 4), amp: 0.2)
+}
+
+pub fn grazer_() -> Grazer {
+    grazer(1)
+}

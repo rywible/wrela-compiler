@@ -159,6 +159,20 @@ fn finish_common(c: &mut Checker) {
             );
         }
     }
+    // `-x` of an integer whose type inference settled later: it must be signed.
+    for (ty, span) in std::mem::take(&mut c.negated_ints) {
+        let ty = c.infer.resolve(&mut c.p.types, ty);
+        if let TyKind::Int(it) = c.p.types.kind(ty)
+            && !it.signed()
+        {
+            let shown = c.p.display_ty(ty);
+            c.err(
+                Diagnostic::new(codes::E0305, span, format!("`-` doesn't apply to `{shown}`"))
+                    .with_note("unsigned integers can't be negative; this one's type was inferred from how it's used later")
+                    .with_help("annotate it with a signed type, as in `let x: i32 = ...`"),
+            );
+        }
+    }
     // Integer literals must fit their types.
     let lits = std::mem::take(&mut c.int_literals);
     for (ty, v, neg, span) in lits {

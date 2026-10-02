@@ -50,6 +50,8 @@ pub(crate) struct Checker<'p> {
     obligations: Vec<Obligation>,
     /// Integer literals to range-check once their types are known.
     int_literals: Vec<(TyId, u64, bool, Span)>,
+    /// Negations of integers whose type wasn't known yet: they must turn out signed.
+    negated_ints: Vec<(TyId, Span)>,
 }
 
 impl<'p> Checker<'p> {
@@ -70,6 +72,7 @@ impl<'p> Checker<'p> {
             closure_stack: Vec::new(),
             obligations: Vec::new(),
             int_literals: Vec::new(),
+            negated_ints: Vec::new(),
         }
     }
 

@@ -2,6 +2,7 @@
 // evaluation at scattered points, for comparison with spike 01's hand-written kernel, and
 // block culling on the spike's grid, with the derived interval and with the spike's
 // hand-written Lipschitz bound.
+use corpus::{Blend, Branchy, Cells, Logs, Noise, Pieces, Rational, Trig, Vectors, Waves, blob_, cone_, creature, ellipsoid_, fbm_, grazer_, hoof_, sphere_}
 use grazer::{Grazer, P3, bounds, grazer, grazer_from, p3, params}
 use std::derive::Box3
 use std::field::{Surface, hash_u32}
@@ -266,4 +267,221 @@ pub fn torso_interval(seed: u32, lx: f32, ly: f32, lz: f32, hx: f32, hy: f32, hz
 pub fn neck_interval(seed: u32, lx: f32, ly: f32, lz: f32, hx: f32, hy: f32, hz: f32) -> vec2 {
     let r = grazer(seed).neck.interval(Box3 { lo: vec3(lx, ly, lz), hi: vec3(hx, hy, hz) })
     vec2(r.lo, r.hi)
+}
+
+// ---- AC3: the corpus ---------------------------------------------------------------------------
+/// The corpus, by number: the order the tests name them in.
+pub const FUNCTIONS: u32 = 17
+
+/// A float in [0, 1) for box `i`, draw `k`.
+fn rnd(seed: u32, i: u32, k: u32) -> f32 {
+    unit(hash_u32(hash_u32(i.wrapping_mul(16).wrapping_add(k)) ^ seed))
+}
+
+/// Box `i`: a centre in [-2, 2]³ and half-sizes from 10⁻⁴ to 2, log-uniform, each axis
+/// collapsed to a point one time in eight.
+fn random_box(seed: u32, i: u32) -> Box3 {
+    let c = vec3(rnd(seed, i, 0), rnd(seed, i, 1), rnd(seed, i, 2)) * 4.0 - 2.0
+    let e = vec3(rnd(seed, i, 3), rnd(seed, i, 4), rnd(seed, i, 5)) * 4.3 - 4.0
+    var h = vec3(pow(10.0, e.x), pow(10.0, e.y), pow(10.0, e.z))
+    if rnd(seed, i, 6) < 0.125 {
+        h.x = 0.0
+    }
+    if rnd(seed, i, 7) < 0.125 {
+        h.y = 0.0
+    }
+    if rnd(seed, i, 8) < 0.125 {
+        h.z = 0.0
+    }
+    Box3 { lo: c - h, hi: c + h }
+}
+
+/// How many of 16 points of box `i` (its corners and 8 inside) fall outside the derived
+/// interval.
+fn misses<F: Surface>(f: F, b: Box3, seed: u32, i: u32) -> u32 {
+    let r = f.interval(b)
+    var miss = 0
+    for k in 0..16 {
+        var p = vec3(
+            if (k & 1) == 0 { b.lo.x } else { b.hi.x },
+            if (k & 2) == 0 { b.lo.y } else { b.hi.y },
+            if (k & 4) == 0 { b.lo.z } else { b.hi.z },
+        )
+        if k >= 8 {
+            let u = vec3(rnd(seed, i, 9 + 3 * k), rnd(seed, i, 10 + 3 * k), rnd(seed, i, 11 + 3 * k))
+            p = clamp(b.lo + (b.hi - b.lo) * u, b.lo, b.hi)
+        }
+        let d = f.distance(p)
+        if !(r.lo <= d && d <= r.hi) {
+            miss += 1
+        }
+    }
+    miss
+}
+
+/// Whether the interval over a single point fails to hold the point's value strictly inside:
+/// both ends must be widened past it.
+fn unwidened<F: Surface>(f: F, b: Box3) -> u32 {
+    let r = f.interval(Box3 { lo: b.lo, hi: b.lo })
+    let d = f.distance(b.lo)
+    if r.lo < d && d < r.hi { 0 } else { 1 }
+}
+
+fn misses_of(fi: u32, b: Box3, seed: u32, i: u32) -> u32 {
+    match fi {
+        0 => misses(sphere_(), b, seed, i),
+        1 => misses(ellipsoid_(), b, seed, i),
+        2 => misses(cone_(), b, seed, i),
+        3 => misses(hoof_(), b, seed, i),
+        4 => misses(blob_(), b, seed, i),
+        5 => misses(Noise { freq: 2.5 }, b, seed, i),
+        6 => misses(fbm_(), b, seed, i),
+        7 => misses(creature(), b, seed, i),
+        8 => misses(grazer_(), b, seed, i),
+        9 => misses(Waves { s: 3.0 }, b, seed, i),
+        10 => misses(Logs { s: 2.3 }, b, seed, i),
+        11 => misses(Trig { s: 0.35 }, b, seed, i),
+        12 => misses(Rational { s: 0.2 }, b, seed, i),
+        13 => misses(Pieces { s: 2.0 }, b, seed, i),
+        14 => misses(Vectors { c: vec3(0.3, 0.3, 0.3) }, b, seed, i),
+        15 => misses(Branchy { n: 3 }, b, seed, i),
+        _ => misses(Cells { s: 3.0 }, b, seed, i),
+    }
+}
+
+fn unwidened_of(fi: u32, b: Box3) -> u32 {
+    match fi {
+        0 => unwidened(sphere_(), b),
+        1 => unwidened(ellipsoid_(), b),
+        2 => unwidened(cone_(), b),
+        3 => unwidened(hoof_(), b),
+        4 => unwidened(blob_(), b),
+        5 => unwidened(Noise { freq: 2.5 }, b),
+        6 => unwidened(fbm_(), b),
+        7 => unwidened(creature(), b),
+        8 => unwidened(grazer_(), b),
+        9 => unwidened(Waves { s: 3.0 }, b),
+        10 => unwidened(Logs { s: 2.3 }, b),
+        11 => unwidened(Trig { s: 0.35 }, b),
+        12 => unwidened(Rational { s: 0.2 }, b),
+        13 => unwidened(Pieces { s: 2.0 }, b),
+        14 => unwidened(Vectors { c: vec3(0.3, 0.3, 0.3) }, b),
+        15 => unwidened(Branchy { n: 3 }, b),
+        _ => unwidened(Cells { s: 3.0 }, b),
+    }
+}
+
+/// On the CPU: over `boxes` random boxes, how many sampled values function `fi`'s interval
+/// misses.
+pub fn misses_cpu(fi: u32, seed: u32, boxes: u32) -> u32 {
+    var total = 0
+    for i in 0..boxes {
+        total += misses_of(fi, random_box(seed, i), seed, i)
+    }
+    total
+}
+
+/// On the CPU: over `n` random points, how many intervals over a single point don't hold its
+/// value strictly inside.
+pub fn unwidened_cpu(fi: u32, seed: u32, n: u32) -> u32 {
+    var total = 0
+    for i in 0..n {
+        total += unwidened_of(fi, random_box(seed, i))
+    }
+    total
+}
+
+struct Boxes: Copy + Clone + GpuData {
+    seed: u32,
+    count: u32,
+}
+
+@compute(64)
+fn misses_gpu<F: Surface>(f: F, boxes: Boxes, out: mut Slots<u32>, id: GlobalId) {
+    if id.x < boxes.count {
+        let b = random_box(boxes.seed, id.x)
+        out[id] = misses(f, b, boxes.seed, id.x) + 256 * unwidened(f, b)
+    }
+}
+
+/// On the GPU: for each of `count` random boxes, into a new buffer, how many sampled values
+/// function `fi`'s interval misses, plus 256 if the interval over the box's low corner doesn't
+/// hold that point's value strictly inside.
+pub fn check_gpu(fi: u32, seed: u32, count: u32) {
+    let out: GpuBuffer<u32> = buffer(count)
+    let boxes = Boxes { seed, count }
+    let groups = (count + 63) / 64
+    match fi {
+        0 => dispatch(misses_gpu, groups: groups, f: sphere_(), boxes: boxes, out: out),
+        1 => dispatch(misses_gpu, groups: groups, f: ellipsoid_(), boxes: boxes, out: out),
+        2 => dispatch(misses_gpu, groups: groups, f: cone_(), boxes: boxes, out: out),
+        3 => dispatch(misses_gpu, groups: groups, f: hoof_(), boxes: boxes, out: out),
+        4 => dispatch(misses_gpu, groups: groups, f: blob_(), boxes: boxes, out: out),
+        5 => dispatch(misses_gpu, groups: groups, f: Noise { freq: 2.5 }, boxes: boxes, out: out),
+        6 => dispatch(misses_gpu, groups: groups, f: fbm_(), boxes: boxes, out: out),
+        7 => dispatch(misses_gpu, groups: groups, f: creature(), boxes: boxes, out: out),
+        8 => dispatch(misses_gpu, groups: groups, f: grazer_(), boxes: boxes, out: out),
+        9 => dispatch(misses_gpu, groups: groups, f: Waves { s: 3.0 }, boxes: boxes, out: out),
+        10 => dispatch(misses_gpu, groups: groups, f: Logs { s: 2.3 }, boxes: boxes, out: out),
+        11 => dispatch(misses_gpu, groups: groups, f: Trig { s: 0.35 }, boxes: boxes, out: out),
+        12 => dispatch(misses_gpu, groups: groups, f: Rational { s: 0.2 }, boxes: boxes, out: out),
+        13 => dispatch(misses_gpu, groups: groups, f: Pieces { s: 2.0 }, boxes: boxes, out: out),
+        14 => dispatch(misses_gpu, groups: groups, f: Vectors { c: vec3(0.3, 0.3, 0.3) }, boxes: boxes, out: out),
+        15 => dispatch(misses_gpu, groups: groups, f: Branchy { n: 3 }, boxes: boxes, out: out),
+        _ => dispatch(misses_gpu, groups: groups, f: Cells { s: 3.0 }, boxes: boxes, out: out),
+    }
+}
+
+fn value_of(fi: u32, p: vec3) -> f32 {
+    match fi {
+        0 => sphere_().distance(p),
+        1 => ellipsoid_().distance(p),
+        2 => cone_().distance(p),
+        3 => hoof_().distance(p),
+        4 => blob_().distance(p),
+        5 => Noise { freq: 2.5 }.distance(p),
+        6 => fbm_().distance(p),
+        7 => creature().distance(p),
+        8 => grazer_().distance(p),
+        9 => Waves { s: 3.0 }.distance(p),
+        10 => Logs { s: 2.3 }.distance(p),
+        11 => Trig { s: 0.35 }.distance(p),
+        12 => Rational { s: 0.2 }.distance(p),
+        13 => Pieces { s: 2.0 }.distance(p),
+        14 => Vectors { c: vec3(0.3, 0.3, 0.3) }.distance(p),
+        15 => Branchy { n: 3 }.distance(p),
+        _ => Cells { s: 3.0 }.distance(p),
+    }
+}
+
+fn gradient_of(fi: u32, p: vec3) -> vec3 {
+    match fi {
+        0 => sphere_().gradient(p),
+        1 => ellipsoid_().gradient(p),
+        2 => cone_().gradient(p),
+        3 => hoof_().gradient(p),
+        4 => blob_().gradient(p),
+        5 => Noise { freq: 2.5 }.gradient(p),
+        6 => fbm_().gradient(p),
+        7 => creature().gradient(p),
+        8 => grazer_().gradient(p),
+        9 => Waves { s: 3.0 }.gradient(p),
+        10 => Logs { s: 2.3 }.gradient(p),
+        11 => Trig { s: 0.35 }.gradient(p),
+        12 => Rational { s: 0.2 }.gradient(p),
+        13 => Pieces { s: 2.0 }.gradient(p),
+        14 => Vectors { c: vec3(0.3, 0.3, 0.3) }.gradient(p),
+        15 => Branchy { n: 3 }.gradient(p),
+        _ => Cells { s: 3.0 }.gradient(p),
+    }
+}
+
+/// Function `fi` at a point, on the CPU.
+pub fn value(fi: u32, x: f32, y: f32, z: f32) -> f32 {
+    value_of(fi, vec3(x, y, z))
+}
+
+/// Function `fi`'s derived gradient at a point, on the CPU.
+pub fn gradient(fi: u32, x: f32, y: f32, z: f32) -> vec3 {
+    gradient_of(fi, vec3(x, y, z))
 }

@@ -1,0 +1,52 @@
+// std's CPU math (std/math.wrela), exported for compiler/tests/tests/math.rs: each function is
+// checked against a correctly rounded reference. The interval interpretation's CPU widening
+// relies on these being within an ulp.
+pub fn frame(time: f32, width: u32, height: u32) {}
+
+pub fn f_sin(x: f32) -> f32 {
+    sin(x)
+}
+
+pub fn f_cos(x: f32) -> f32 {
+    cos(x)
+}
+
+pub fn f_tan(x: f32) -> f32 {
+    tan(x)
+}
+
+pub fn f_exp(x: f32) -> f32 {
+    exp(x)
+}
+
+pub fn f_exp2(x: f32) -> f32 {
+    exp2(x)
+}
+
+pub fn f_log(x: f32) -> f32 {
+    log(x)
+}
+
+pub fn f_log2(x: f32) -> f32 {
+    log2(x)
+}
+
+pub fn f_pow(x: f32, y: f32) -> f32 {
+    pow(x, y)
+}
+
+pub fn f_atan(x: f32) -> f32 {
+    atan(x)
+}
+
+pub fn f_atan2(y: f32, x: f32) -> f32 {
+    atan2(y, x)
+}
+
+pub fn f_asin(x: f32) -> f32 {
+    asin(x)
+}
+
+pub fn f_acos(x: f32) -> f32 {
+    acos(x)
+}

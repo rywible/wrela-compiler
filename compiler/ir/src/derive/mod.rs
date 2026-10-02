@@ -12,7 +12,7 @@ pub mod interval;
 pub(crate) mod single_exit;
 
 use crate::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Derived functions already built in a module, so each is built once.
 #[derive(Debug, Default)]
@@ -104,9 +104,12 @@ pub(crate) fn activity(
         returns: false,
         active_loop_exit: false,
     };
+    let mut uses = vec![0u32; f.locals.len()];
+    count_local_uses(&f.body, &mut uses);
+    let cx = Walk { m, f, mode, uses };
     loop {
         let before = (a.values.clone(), a.locals.clone(), a.returns);
-        walk(m, f, &f.body, &mut a, mode, false, callee_returns)?;
+        walk(&cx, &f.body, &mut a, None, callee_returns)?;
         if before == (a.values.clone(), a.locals.clone(), a.returns) {
             break;
         }
@@ -121,48 +124,111 @@ fn carries(m: &Module, t: TypeId, mode: Mode) -> bool {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+struct Walk<'a> {
+    m: &'a Module,
+    f: &'a Function,
+    mode: Mode,
+    /// How many places mention each local, in the whole function.
+    uses: Vec<u32>,
+}
+
+/// Counts the places that mention each local.
+fn count_local_uses(b: &Block, uses: &mut [u32]) {
+    let mut place = |p: &Place| {
+        if let PlaceRoot::Local(l) = p.root {
+            uses[l.index()] += 1;
+        }
+    };
+    let mut stack = vec![b];
+    while let Some(b) = stack.pop() {
+        for s in b {
+            match s {
+                Stmt::Let(_, e) | Stmt::Eval(e) => match e {
+                    Expr::Load(p) | Expr::Run(p) | Expr::Addr(p) => place(p),
+                    Expr::Call(_, args) => {
+                        for a in args {
+                            if let Arg::Place(p) = a {
+                                place(p);
+                            }
+                        }
+                    }
+                    _ => {}
+                },
+                Stmt::Store(p, _) => place(p),
+                Stmt::If { then, else_, .. } => {
+                    stack.push(then);
+                    stack.push(else_);
+                }
+                Stmt::Loop { body, continuing } => {
+                    stack.push(body);
+                    stack.push(continuing);
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// In interval mode, under a branch on the input, a store makes its place a range (both sides
+/// may run, and what they wrote is joined after the branch). `ctrl` is then the set of locals
+/// mentioned only inside the innermost such branch: their values never reach the join, so
+/// storing to them doesn't.
 fn walk(
-    m: &Module,
-    f: &Function,
+    cx: &Walk<'_>,
     b: &Block,
     a: &mut Activity,
-    mode: Mode,
-    ctrl: bool,
+    ctrl: Option<&HashSet<LocalId>>,
     callee_returns: &mut dyn FnMut(FuncId, Vec<bool>) -> Result<bool, String>,
 ) -> Result<(), String> {
+    let (m, f, mode) = (cx.m, cx.f, cx.mode);
+    let joined = |p: &Place| match (ctrl, &p.root) {
+        (None, _) => false,
+        (Some(inside), PlaceRoot::Local(l)) => !inside.contains(l),
+        (Some(_), _) => true,
+    };
     for s in b {
         match s {
             Stmt::Let(v, e) => {
                 if let Expr::Call(g, args) = e {
-                    call_writes(m, a, mode, ctrl, *g, args);
+                    call_writes(m, a, *g, args, &joined);
                 }
                 let active = expr_active(e, a, callee_returns)? && carries(m, f.value_ty(*v), mode);
                 if active {
                     a.values[v.index()] = true;
                 }
             }
-            Stmt::Eval(Expr::Call(g, args)) => call_writes(m, a, mode, ctrl, *g, args),
+            Stmt::Eval(Expr::Call(g, args)) => call_writes(m, a, *g, args, &joined),
             Stmt::Eval(_) => {}
             Stmt::Store(p, v) => {
-                if a.values[v.index()] || (mode == Mode::Interval && ctrl) {
+                if a.values[v.index()] || joined(p) {
                     mark_place(a, p);
                 }
             }
             Stmt::If { cond, then, else_ } => {
-                let c = ctrl || (mode == Mode::Interval && a.values[cond.index()]);
-                walk(m, f, then, a, mode, c, callee_returns)?;
-                walk(m, f, else_, a, mode, c, callee_returns)?;
+                if mode == Mode::Interval && a.values[cond.index()] {
+                    let mut inside = vec![0u32; f.locals.len()];
+                    count_local_uses(then, &mut inside);
+                    count_local_uses(else_, &mut inside);
+                    let internal: HashSet<LocalId> = (0..f.locals.len())
+                        .filter(|&l| inside[l] > 0 && inside[l] == cx.uses[l])
+                        .map(|l| LocalId(l as u32))
+                        .collect();
+                    walk(cx, then, a, Some(&internal), callee_returns)?;
+                    walk(cx, else_, a, Some(&internal), callee_returns)?;
+                } else {
+                    walk(cx, then, a, ctrl, callee_returns)?;
+                    walk(cx, else_, a, ctrl, callee_returns)?;
+                }
             }
             Stmt::Loop { body, continuing } => {
-                walk(m, f, body, a, mode, ctrl, callee_returns)?;
-                walk(m, f, continuing, a, mode, ctrl, callee_returns)?;
+                walk(cx, body, a, ctrl, callee_returns)?;
+                walk(cx, continuing, a, ctrl, callee_returns)?;
                 if mode == Mode::Interval && loop_exit_active(body, a) {
                     a.active_loop_exit = true;
                 }
             }
             Stmt::Return(Some(v)) => {
-                if a.values[v.index()] || (mode == Mode::Interval && ctrl) {
+                if a.values[v.index()] || ctrl.is_some() {
                     a.returns = true;
                 }
             }
@@ -193,13 +259,20 @@ fn loop_exit_active(b: &Block, a: &Activity) -> bool {
 }
 
 /// A callee given active arguments may write active values through its `mut` parameters, and
-/// in interval mode, so may one that runs under a condition on the input.
-fn call_writes(m: &Module, a: &mut Activity, mode: Mode, ctrl: bool, g: FuncId, args: &[Arg]) {
-    if args.iter().any(|x| arg_active(a, x)) || (mode == Mode::Interval && ctrl) {
-        for (arg, p) in args.iter().zip(&m.functions[g.index()].params) {
-            if let (Arg::Place(pl), true) = (arg, p.mutable) {
-                mark_place(a, pl);
-            }
+/// in interval mode, so may one that runs under a condition on the input (`joined`).
+fn call_writes(
+    m: &Module,
+    a: &mut Activity,
+    g: FuncId,
+    args: &[Arg],
+    joined: &dyn Fn(&Place) -> bool,
+) {
+    let any = args.iter().any(|x| arg_active(a, x));
+    for (arg, p) in args.iter().zip(&m.functions[g.index()].params) {
+        if let (Arg::Place(pl), true) = (arg, p.mutable)
+            && (any || joined(pl))
+        {
+            mark_place(a, pl);
         }
     }
 }

@@ -618,6 +618,9 @@ impl<'p> Checker<'p> {
             }
             self.err(d);
         }
+        if op == UnOp::Neg && vk == Some(VarKind::Int) {
+            self.negated_ints.push((i.ty, span));
+        }
         if op == UnOp::Neg
             && let ExprKind::Lit(Lit::Int(v)) = i.kind
             && let Some(last) = self.int_literals.last_mut()

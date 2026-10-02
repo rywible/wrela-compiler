@@ -1,5 +1,5 @@
 //! AC2 and AC3 on the grazer: sketch 01's creature written in tier-0 wrela
-//! (compiler/tests/grazer) against spike 01's hand-written WGSL.
+//! (compiler/tests/fields) against spike 01's hand-written WGSL.
 //!
 //! The fixtures are spike 01's files at the `design-archive-2026-10` tag, unchanged:
 //! `fixtures/spike01/field.wgsl` (the hand-written field) and `params-seed1.f32` (grazer.js's
@@ -49,11 +49,11 @@ fn eval_g(@builtin(global_invocation_id) id: vec3u) {
 ";
 
 fn out_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("grazer")
+    PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("fields")
 }
 
 fn load() -> Host {
-    if let Err(e) = build(&root().join("compiler/tests/grazer"), &out_dir()) {
+    if let Err(e) = build(&root().join("compiler/tests/fields"), &out_dir()) {
         panic!("the grazer doesn't build:\n{e}");
     }
     Host::load_with(out_dir(), &Options { record: true, ..Options::default() })

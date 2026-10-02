@@ -278,7 +278,7 @@ fn atan_f64(x: f64) -> f64 {
     if a > 100000000000000000000.0 {
         return if neg { -ATAN_HI[3] } else { ATAN_HI[3] }
     }
-    var id = -1
+    var id: i32 = -1
     if a >= 0.4375 {
         if a < 0.6875 {
             id = 0
@@ -301,7 +301,7 @@ fn atan_f64(x: f64) -> f64 {
     let r = if id < 0 {
         a - a * (s1 + s2)
     } else {
-        ATAN_HI[id] - ((a * (s1 + s2) - ATAN_LO[id]) - a)
+        ATAN_HI[u32(id)] - ((a * (s1 + s2) - ATAN_LO[u32(id)]) - a)
     }
     if neg {
         -r
