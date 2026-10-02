@@ -740,7 +740,7 @@ impl<'c, 'a> Fl<'c, 'a> {
         match swizzle {
             Some(cs) => {
                 // Load the vector the components are of, then pick them.
-                let vt = self.place_ty(&place);
+                let vt = self.place_ty(&place)?;
                 let v = self.load(place, vt);
                 let st = self.cx.lower_ty(self.mb, ty, self.code.span)?;
                 Some(self.value(st, ir::Expr::Swizzle(v, cs)))
@@ -799,36 +799,11 @@ impl<'c, 'a> Fl<'c, 'a> {
         self.value(ty, ir::Expr::Load(p))
     }
 
-    pub fn place_ty(&mut self, p: &ir::Place) -> ir::TypeId {
-        let mut t = match &p.root {
-            ir::PlaceRoot::Local(l) => self.f.locals[l.index()].ty,
-            ir::PlaceRoot::Param(i) => self.f.params[*i as usize].ty,
-            ir::PlaceRoot::Resource(r) => self.mb.m.resources[r.index()].ty,
-            ir::PlaceRoot::Ptr(v) => match self.mb.m.types.get(self.f.value_ty(*v)) {
-                ir::TypeDef::Ptr(t) => *t,
-                _ => self.f.value_ty(*v),
-            },
-        };
-        if let ir::PlaceRoot::Resource(r) = &p.root
-            && !matches!(self.mb.m.resources[r.index()].kind, ir::ResourceKind::Uniform { .. })
-        {
-            // A storage buffer's place is its array.
-            t = self.mb.m.types.intern(ir::TypeDef::RuntimeArray(t));
-        }
-        for proj in &p.path {
-            t = match (self.mb.m.types.get(t), proj) {
-                (ir::TypeDef::Struct { fields, .. }, ir::Proj::Field(i)) => fields[*i as usize].1,
-                (ir::TypeDef::Vector(_), _) => self.mb.m.types.f32(),
-                (ir::TypeDef::Matrix(n), _) => {
-                    let n = *n;
-                    self.mb.m.types.vector(n)
-                }
-                (
-                    ir::TypeDef::Array(e, _) | ir::TypeDef::RuntimeArray(e) | ir::TypeDef::Run(e),
-                    _,
-                ) => *e,
-                _ => t,
-            };
+    /// An IR place's type in the function being lowered.
+    pub fn place_ty(&mut self, p: &ir::Place) -> Option<ir::TypeId> {
+        let t = self.mb.m.place_ty(&self.f, p);
+        if t.is_none() {
+            self.cx.err(Diagnostic::internal(format!("a place with no type in lowering: {p:?}")));
         }
         t
     }
@@ -1206,11 +1181,9 @@ impl<'c, 'a> Fl<'c, 'a> {
                     wrela_sema::traits::resolve_trait_method(program, *method, st, &ta, &ma)
                 else {
                     let shown = program.display_ty(st);
-                    self.cx.err(Diagnostic::new(
-                        codes::E0702,
-                        span,
-                        format!("internal: no implementation of this method for `{shown}`"),
-                    ));
+                    self.cx.err(Diagnostic::internal(format!(
+                        "no implementation of a trait method for `{shown}` at lowering"
+                    )));
                     return None;
                 };
                 let generics = program.fn_all_generics(func);
@@ -1254,7 +1227,7 @@ impl<'c, 'a> Fl<'c, 'a> {
                 match self.callable_arg(a) {
                     Some(Repr::Callable(callable, srcs)) => {
                         for s in &srcs {
-                            out.push(self.capture_arg(s));
+                            out.push(self.capture_arg(s)?);
                         }
                         callables.push(Some(callable));
                     }
@@ -1338,19 +1311,19 @@ impl<'c, 'a> Fl<'c, 'a> {
             }
         };
         for (original, copy) in write_back {
-            let ty = self.place_ty(&copy);
+            let Some(ty) = self.place_ty(&copy) else { continue };
             let v = self.load(copy, ty);
             self.store(original, v);
         }
         result
     }
 
-    pub fn capture_arg(&mut self, s: &CaptureSrc) -> ir::Arg {
+    pub fn capture_arg(&mut self, s: &CaptureSrc) -> Option<ir::Arg> {
         if s.by_ref {
-            ir::Arg::Place(s.place.clone())
+            Some(ir::Arg::Place(s.place.clone()))
         } else {
-            let ty = self.place_ty(&s.place);
-            ir::Arg::Value(self.load(s.place.clone(), ty))
+            let ty = self.place_ty(&s.place)?;
+            Some(ir::Arg::Value(self.load(s.place.clone(), ty)))
         }
     }
 
@@ -1362,7 +1335,8 @@ impl<'c, 'a> Fl<'c, 'a> {
         args: &[mir::Arg],
         span: Span,
     ) -> Option<ir::ValueId> {
-        let mut out: Vec<ir::Arg> = srcs.iter().map(|s| self.capture_arg(s)).collect();
+        let mut out: Vec<ir::Arg> =
+            srcs.iter().map(|s| self.capture_arg(s)).collect::<Option<_>>()?;
         let key = match callable {
             Callable::Closure { owner, id } => {
                 InstanceKey::Closure { owner: owner.clone(), id: *id }

@@ -174,7 +174,11 @@ fn errors(case: &Case) -> BTreeMap<(String, usize), Vec<String>> {
     let built = wrela_driver::build(&dir);
     let mut out: BTreeMap<(String, usize), Vec<String>> = BTreeMap::new();
     for d in built.diagnostics.iter().filter(|d| d.is_error()) {
-        let span = d.primary.span;
+        let Some(span) = d.span() else {
+            // An internal error: a case can't expect one.
+            out.entry(("<internal>".into(), 0)).or_default().push(d.code.as_str().to_string());
+            continue;
+        };
         let file = built.sources.file(span.file);
         let line = file.line_index(span.start) + 1;
         let name = file.name.rsplit('/').next().unwrap_or(&file.name).to_string();

@@ -5,6 +5,7 @@
       "file": "main.wrela",
       "fixes": [],
       "help": [],
+      "internal": false,
       "label": null,
       "labels": [],
       "message": "`buffer` records GPU work, which the `@compute` kernel `fill` can't do",
@@ -24,5 +25,5 @@
       "title": "an effect a context forbids"
     }
   ],
-  "version": 1
+  "version": 2
 }

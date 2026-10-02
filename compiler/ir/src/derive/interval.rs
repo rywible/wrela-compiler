@@ -33,7 +33,7 @@ use super::single_exit::single_exit;
 use super::*;
 use std::collections::HashMap;
 
-type R<T> = Result<T, String>;
+type R<T> = Result<T>;
 /// An active value's bounds.
 type Iv = (ValueId, ValueId);
 
@@ -51,16 +51,16 @@ pub(super) fn interval(
 ) -> R<FuncId> {
     let func = m.functions[f.index()].clone();
     let xi = ncap as usize;
-    let x_ty = func.params.get(xi).ok_or("internal: no input parameter")?.ty;
+    let x_ty = func.params.get(xi).ok_or_else(|| Error::internal("no input parameter"))?.ty;
     if !matches!(m.types.get(x_ty), TypeDef::Scalar(Scalar::F32) | TypeDef::Vector(_)) {
-        return Err(format!(
+        return Err(Error::not_derivable(format!(
             "an interval needs an `f32` or a float vector input, not `{}`",
             m.types.display(x_ty)
-        ));
+        )));
     }
     let f32 = m.types.f32();
     if func.ret != Some(f32) {
-        return Err("an interval needs a function that returns an `f32`".into());
+        return Err(Error::not_derivable("an interval needs a function that returns an `f32`"));
     }
     let mut mask = vec![false; func.params.len()];
     mask[xi] = true;
@@ -90,7 +90,9 @@ pub(super) fn interval(
     // The input's `lo` takes its own slot; its `hi` is appended after the originals.
     args.push(Arg::Value(lo));
     args.push(Arg::Value(hi));
-    let rty = m.functions[d.index()].ret.ok_or("internal: a derived function returns nothing")?;
+    let rty = m.functions[d.index()]
+        .ret
+        .ok_or_else(|| Error::internal("a derived function returns nothing"))?;
     let r = g.new_value(rty);
     body.push(Stmt::Let(r, Expr::Call(d, args)));
     let (mut rlo, mut rhi) = (r, r);
@@ -153,7 +155,7 @@ fn derive(
     }
     let orig = m.functions[f.index()].clone();
     if let Some(why) = has_host_or_ptr(&orig.body) {
-        return Err(format!("`{}` {why}", orig.name));
+        return Err(Error::not_derivable(format!("`{}` {why}", orig.name)));
     }
     let (func, result) = match single_exit(m, &orig) {
         Some((nf, r)) => (nf, r),
@@ -165,18 +167,18 @@ fn derive(
         activity(mm, &func, &mask, Mode::Interval, &mut |g, mk| returns_active(mm, cache, g, mk))?
     };
     if act.active_loop_exit {
-        return Err(format!(
+        return Err(Error::ActiveLoopExit(format!(
             "`{}` has a loop whose exit depends on the input; an interval needs loops that run \
              the same number of times for every point",
             func.name
-        ));
+        )));
     }
     for (i, p) in func.params.iter().enumerate() {
         if act.params[i] && !mask[i] && p.mutable {
-            return Err(format!(
-                "internal: `{}` writes a range through its `mut` parameter `{}`",
+            return Err(Error::internal(format!(
+                "`{}` writes a range through its `mut` parameter `{}`",
                 func.name, p.name
-            ));
+            )));
         }
     }
     let mut nf = func.clone();
@@ -195,7 +197,7 @@ fn derive(
         }
     }
     if returns {
-        let r = func.ret.ok_or("internal: an active result of nothing")?;
+        let r = func.ret.ok_or_else(|| Error::internal("an active result of nothing"))?;
         nf.ret = Some(m.types.intern(TypeDef::Struct {
             name: format!("range<{}>", m.types.display(r)),
             fields: vec![("lo".into(), r), ("hi".into(), r)],
@@ -446,10 +448,10 @@ impl<'a> Ivx<'a> {
                 parts = (0..n).map(|k| (e, Expr::Extract(vals[0], k))).collect();
             }
             _ => {
-                return Err(format!(
+                return Err(Error::not_derivable(format!(
                     "an interval over a `{}` isn't supported",
                     self.m.types.display(ty)
-                ));
+                )));
             }
         }
         let u32t = self.m.types.u32();
@@ -544,37 +546,40 @@ impl<'a> Ivx<'a> {
     fn hi_root(&self, r: &PlaceRoot) -> R<PlaceRoot> {
         Ok(match r {
             PlaceRoot::Local(l) => PlaceRoot::Local(
-                self.hlocal[l.index()].ok_or("internal: an inactive local's range")?,
+                self.hlocal[l.index()]
+                    .ok_or_else(|| Error::internal("an inactive local's range"))?,
             ),
             PlaceRoot::Param(i) => PlaceRoot::Param(
-                self.hparam[*i as usize].ok_or("internal: an inactive parameter's range")?,
+                self.hparam[*i as usize]
+                    .ok_or_else(|| Error::internal("an inactive parameter's range"))?,
             ),
-            _ => return Err("an interval can't go through this place".into()),
+            _ => return Err(Error::not_derivable("an interval can't go through this place")),
         })
     }
 
     /// The places holding a range's `lo` and `hi`.
     fn places(&self, p: &Place) -> R<(Place, Place)> {
         if p.path.iter().any(|x| matches!(x, Proj::Index(v) if self.act.values[v.index()])) {
-            return Err(
-                "an interval through an array index that depends on the input isn't supported"
-                    .into(),
-            );
+            return Err(Error::not_derivable(
+                "an interval through an array index that depends on the input isn't supported",
+            ));
         }
         let hi = Place { root: self.hi_root(&p.root)?, path: p.path.clone() };
         Ok((p.clone(), hi))
     }
 
-    fn root_ty(&self, r: &PlaceRoot) -> TypeId {
+    fn root_ty(&self, r: &PlaceRoot) -> R<TypeId> {
         match r {
-            PlaceRoot::Local(l) => self.nf.locals[l.index()].ty,
-            PlaceRoot::Param(i) => self.nf.params[*i as usize].ty,
-            _ => TypeId(0),
+            PlaceRoot::Local(l) => Ok(self.nf.locals[l.index()].ty),
+            PlaceRoot::Param(i) => Ok(self.nf.params[*i as usize].ty),
+            PlaceRoot::Resource(_) | PlaceRoot::Ptr(_) => {
+                Err(Error::internal("the range of a resource or pointer as a whole"))
+            }
         }
     }
 
     fn load_root(&mut self, out: &mut Block, r: &PlaceRoot) -> R<Iv> {
-        let ty = self.root_ty(r);
+        let ty = self.root_ty(r)?;
         let h = self.hi_root(r)?;
         let lo = self.emit(out, ty, Expr::Load(Place { root: r.clone(), path: Vec::new() }));
         let hi = self.emit(out, ty, Expr::Load(Place { root: h, path: Vec::new() }));
@@ -713,7 +718,7 @@ impl<'a> Ivx<'a> {
                 self.speculative -= 1;
                 for (r, t) in roots.iter().zip(after_then) {
                     let e = self.load_root(out, r)?;
-                    let ty = self.root_ty(r);
+                    let ty = self.root_ty(r)?;
                     let j = self.merge(out, ty, c, t, e)?;
                     self.store_root(out, r, j)?;
                 }
@@ -733,7 +738,7 @@ impl<'a> Ivx<'a> {
             }
             Stmt::Return(Some(v)) if self.returns => {
                 let (lo, hi) = self.range(*v);
-                let rt = self.nf.ret.ok_or("internal: no range type")?;
+                let rt = self.nf.ret.ok_or_else(|| Error::internal("no range type"))?;
                 let r = self.emit(out, rt, Expr::Construct(rt, vec![lo, hi]));
                 out.push(Stmt::Return(Some(r)));
                 Ok(())
@@ -777,7 +782,9 @@ impl<'a> Ivx<'a> {
         new_args.extend(his);
         match (v, returns) {
             (Some(v), true) => {
-                let rt = self.m.functions[dg.index()].ret.ok_or("internal: no range type")?;
+                let rt = self.m.functions[dg.index()]
+                    .ret
+                    .ok_or_else(|| Error::internal("no range type"))?;
                 let r = self.emit(out, rt, Expr::Call(dg, new_args));
                 let ty = self.ty(v);
                 let lo = self.emit(out, ty, Expr::Extract(r, 0));
@@ -797,8 +804,8 @@ impl<'a> Ivx<'a> {
         let ty = self.ty(v);
         Ok(match e {
             Expr::Param(i) => {
-                let h =
-                    self.hparam[*i as usize].ok_or("internal: an inactive parameter's range")?;
+                let h = self.hparam[*i as usize]
+                    .ok_or_else(|| Error::internal("an inactive parameter's range"))?;
                 (self.emit(out, ty, Expr::Param(*i)), self.emit(out, ty, Expr::Param(h)))
             }
             Expr::Load(p) => {
@@ -833,12 +840,13 @@ impl<'a> Ivx<'a> {
                 let n = match self.m.types.get(self.ty(*x)) {
                     TypeDef::Array(_, n) => *n,
                     TypeDef::Vector(n) => *n as u32,
-                    _ => return Err("internal: a dynamic extract from a non-array".into()),
+                    _ => return Err(Error::internal("a dynamic extract from a non-array")),
                 };
                 if !matches!(self.m.types.get(ty), TypeDef::Scalar(_) | TypeDef::Vector(_)) {
-                    return Err("an interval over an array of aggregates indexed by a value that \
-                                depends on the input isn't supported"
-                        .into());
+                    return Err(Error::not_derivable(
+                        "an interval over an array of aggregates indexed by a value that \
+                                depends on the input isn't supported",
+                    ));
                 }
                 let (xl, xh) = self.range(*x);
                 let u32t = self.m.types.u32();
@@ -855,7 +863,7 @@ impl<'a> Ivx<'a> {
                         ),
                     });
                 }
-                acc.ok_or("internal: an empty array")?
+                acc.ok_or_else(|| Error::internal("an empty array"))?
             }
             Expr::Splat(x, n) => {
                 let (lo, hi) = self.range(*x);
@@ -885,11 +893,11 @@ impl<'a> Ivx<'a> {
                 }
             }
             Expr::Const(_) | Expr::Zero(_) | Expr::EntryInput(_) | Expr::ArrayLength(_) => {
-                return Err("internal: a constant marked active".into());
+                return Err(Error::internal("a constant marked active"));
             }
             Expr::Call(..) => unreachable!("calls are handled in `call_fn`"),
             Expr::Host(..) | Expr::Run(_) | Expr::Addr(_) => {
-                return Err("an interval can't go through this".into());
+                return Err(Error::not_derivable("an interval can't go through this"));
             }
         })
     }
@@ -944,13 +952,13 @@ impl<'a> Ivx<'a> {
     fn binary(&mut self, out: &mut Block, op: BinOp, a: ValueId, b: ValueId, ty: TypeId) -> R<Iv> {
         let (ta, tb) = (self.ty(a), self.ty(b));
         if [ta, tb, ty].iter().any(|t| matches!(self.m.types.get(*t), TypeDef::Matrix(_))) {
-            return Err("an interval over matrix arithmetic isn't supported".into());
+            return Err(Error::not_derivable("an interval over matrix arithmetic isn't supported"));
         }
         let (ra, rb) = (self.range(a), self.range(b));
         let os = self.elem(ta);
         if op.is_comparison() {
             if self.is_vector(ta) {
-                return Err("internal: a vector comparison".into());
+                return Err(Error::internal("a vector comparison"));
             }
             return Ok(self.compare(out, op, ra, rb, os));
         }
@@ -1016,7 +1024,7 @@ impl<'a> Ivx<'a> {
             }
             BinOp::Div => self.per_comp(out, ty, &[ra, rb], Self::div)?,
             BinOp::Rem => self.per_comp(out, ty, &[ra, rb], Self::rem)?,
-            _ => return Err(format!("internal: {op:?} on floats")),
+            _ => return Err(Error::internal(format!("{op:?} on floats"))),
         })
     }
 
@@ -1298,7 +1306,7 @@ impl<'a> Ivx<'a> {
             B::Dot => {
                 let at = self.ty(args[0]);
                 let TypeDef::Vector(n) = *self.m.types.get(at) else {
-                    return Err("internal: a dot of non-vectors".into());
+                    return Err(Error::internal("a dot of non-vectors"));
                 };
                 // dot(v, v) is a sum of squares.
                 let p = if self.same_value(args[0], args[1]) {
@@ -1357,7 +1365,9 @@ impl<'a> Ivx<'a> {
                 (lo, hi)
             }
             B::Dpdx | B::Dpdy | B::Fwidth => {
-                return Err("an interval of a screen-space derivative isn't supported".into());
+                return Err(Error::not_derivable(
+                    "an interval of a screen-space derivative isn't supported",
+                ));
             }
         })
     }

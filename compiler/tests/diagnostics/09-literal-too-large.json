@@ -7,6 +7,7 @@
       "help": [
         "use a wider integer type"
       ],
+      "internal": false,
       "label": null,
       "labels": [],
       "message": "`300` doesn't fit in `u8`, whose largest value is 255",
@@ -23,5 +24,5 @@
       "title": "an integer literal too large for its type"
     }
   ],
-  "version": 1
+  "version": 2
 }

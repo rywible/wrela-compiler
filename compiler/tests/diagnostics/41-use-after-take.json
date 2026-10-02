@@ -7,6 +7,7 @@
       "help": [
         "pass `log.clone()` where it's moved if you still need it here"
       ],
+      "internal": false,
       "label": null,
       "labels": [
         {
@@ -36,5 +37,5 @@
       "title": "a use of a moved value"
     }
   ],
-  "version": 1
+  "version": 2
 }

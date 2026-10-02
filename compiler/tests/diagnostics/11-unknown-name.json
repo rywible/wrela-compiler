@@ -17,6 +17,7 @@
         }
       ],
       "help": [],
+      "internal": false,
       "label": null,
       "labels": [],
       "message": "there's no `radus` in scope",
@@ -33,5 +34,5 @@
       "title": "an unknown name"
     }
   ],
-  "version": 1
+  "version": 2
 }

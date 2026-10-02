@@ -13,12 +13,15 @@
 //! resources and entry points.
 
 pub mod derive;
+mod error;
 pub mod layout;
 pub mod opt;
 pub mod print;
 mod types;
 mod verify;
+pub mod visit;
 
+pub use error::{Error, Result};
 pub use types::*;
 pub use verify::verify;
 
@@ -435,6 +438,52 @@ pub struct Module {
 }
 
 impl Module {
+    /// The type of a place in `f`: its root's, through each projection. `None` when a type it
+    /// passes through was never interned (a storage buffer's whole array, or the component
+    /// type of a vector in a module that names no `f32`), which a well-formed place never
+    /// needs.
+    pub fn place_ty(&self, f: &Function, p: &Place) -> Option<TypeId> {
+        let mut path = p.path.as_slice();
+        let mut t = match &p.root {
+            PlaceRoot::Local(l) => f.locals.get(l.index())?.ty,
+            PlaceRoot::Param(i) => f.params.get(*i as usize)?.ty,
+            PlaceRoot::Ptr(v) => match self.types.get(f.value_ty(*v)) {
+                TypeDef::Ptr(t) => *t,
+                _ => return None,
+            },
+            PlaceRoot::Resource(r) => {
+                let res = self.resources.get(r.index())?;
+                match res.kind {
+                    ResourceKind::Uniform { .. } | ResourceKind::Private => res.ty,
+                    // A storage buffer's place is its array of elements: an element's type is
+                    // the resource's.
+                    ResourceKind::StorageRead | ResourceKind::StorageReadWrite => match path {
+                        [Proj::Index(_), rest @ ..] => {
+                            path = rest;
+                            res.ty
+                        }
+                        _ => self.types.lookup(&TypeDef::RuntimeArray(res.ty))?,
+                    },
+                }
+            }
+        };
+        for proj in path {
+            t = match (self.types.get(t), proj) {
+                (TypeDef::Struct { fields, .. }, Proj::Field(i)) => fields.get(*i as usize)?.1,
+                (TypeDef::Vector(_), Proj::Comp(_) | Proj::Index(_)) => {
+                    self.types.lookup(&TypeDef::Scalar(Scalar::F32))?
+                }
+                (TypeDef::Matrix(n), Proj::Index(_)) => self.types.lookup(&TypeDef::Vector(*n))?,
+                (
+                    TypeDef::Array(e, _) | TypeDef::RuntimeArray(e) | TypeDef::Run(e),
+                    Proj::Index(_),
+                ) => *e,
+                _ => return None,
+            };
+        }
+        Some(t)
+    }
+
     pub fn add_function(&mut self, f: Function) -> FuncId {
         self.functions.push(f);
         FuncId(self.functions.len() as u32 - 1)

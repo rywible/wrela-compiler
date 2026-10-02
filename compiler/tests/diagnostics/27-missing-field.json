@@ -19,6 +19,7 @@
       "help": [
         "give every field a value, or a default in the declaration: mass: _"
       ],
+      "internal": false,
       "label": null,
       "labels": [],
       "message": "`Grazer` is missing `mass`",
@@ -35,5 +36,5 @@
       "title": "a missing struct field"
     }
   ],
-  "version": 1
+  "version": 2
 }

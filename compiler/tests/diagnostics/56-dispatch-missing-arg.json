@@ -5,6 +5,7 @@
       "file": "main.wrela",
       "fixes": [],
       "help": [],
+      "internal": false,
       "label": null,
       "labels": [],
       "message": "this dispatch doesn't pass `fill`'s parameter `scale`",
@@ -21,5 +22,5 @@
       "title": "a dispatch or draw that doesn't match its entry points"
     }
   ],
-  "version": 1
+  "version": 2
 }

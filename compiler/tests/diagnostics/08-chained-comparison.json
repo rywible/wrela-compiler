@@ -19,6 +19,7 @@
       "help": [
         "combine them with `&&`, as in `a < b && b < c`"
       ],
+      "internal": false,
       "label": null,
       "labels": [],
       "message": "comparisons don't chain",
@@ -35,5 +36,5 @@
       "title": "comparisons don't chain"
     }
   ],
-  "version": 1
+  "version": 2
 }

@@ -18,7 +18,7 @@ use crate::*;
 use std::collections::{HashMap, HashSet};
 
 /// Flattens a GPU module (see the module docs).
-pub fn flatten_gpu(m: &mut Module) -> Result<(), String> {
+pub fn flatten_gpu(m: &mut Module) -> Result<()> {
     inline_all(m)?;
     for i in 0..m.functions.len() {
         let mut f = std::mem::replace(&mut m.functions[i], Function::new("", Vec::new(), None));
@@ -30,149 +30,42 @@ pub fn flatten_gpu(m: &mut Module) -> Result<(), String> {
     Ok(())
 }
 
-// ---- generic rewriting ----------------------------------------------------------------------
-
-fn map_place(p: &mut Place, v: &mut impl FnMut(ValueId) -> ValueId) {
-    if let PlaceRoot::Ptr(x) = &mut p.root {
-        *x = v(*x);
-    }
-    for proj in &mut p.path {
-        if let Proj::Index(x) = proj {
-            *x = v(*x);
-        }
-    }
-}
+// ---- generic walking ------------------------------------------------------------------------
 
 fn map_expr(e: &mut Expr, v: &mut impl FnMut(ValueId) -> ValueId) {
-    match e {
-        Expr::Const(_) | Expr::Zero(_) | Expr::EntryInput(_) | Expr::Param(_) => {}
-        Expr::Load(p) | Expr::Run(p) | Expr::Addr(p) | Expr::ArrayLength(p) => map_place(p, v),
-        Expr::Unary(_, x)
-        | Expr::Extract(x, _)
-        | Expr::Splat(x, _)
-        | Expr::Swizzle(x, _)
-        | Expr::Convert(x, _)
-        | Expr::Bitcast(x, _) => *x = v(*x),
-        Expr::Binary(_, a, b) | Expr::ExtractDyn(a, b) => {
-            *a = v(*a);
-            *b = v(*b);
-        }
-        Expr::Builtin(_, xs) | Expr::Construct(_, xs) | Expr::Host(_, xs) => {
-            for x in xs {
-                *x = v(*x);
-            }
-        }
-        Expr::Select { cond, if_true, if_false } => {
-            *cond = v(*cond);
-            *if_true = v(*if_true);
-            *if_false = v(*if_false);
-        }
-        Expr::Call(_, args) => {
-            for a in args {
-                match a {
-                    Arg::Value(x) => *x = v(*x),
-                    Arg::Place(p) => map_place(p, v),
-                }
-            }
-        }
-    }
+    e.for_each_value_mut(&mut |x| *x = v(*x));
 }
 
 /// Calls `f` on every place in a block, recursively.
 fn each_place(b: &Block, f: &mut impl FnMut(&Place)) {
-    for s in b {
-        match s {
-            Stmt::Let(_, e) | Stmt::Eval(e) => match e {
-                Expr::Load(p) | Expr::Run(p) | Expr::Addr(p) | Expr::ArrayLength(p) => f(p),
-                Expr::Call(_, args) => {
-                    for a in args {
-                        if let Arg::Place(p) = a {
-                            f(p);
-                        }
-                    }
-                }
-                _ => {}
-            },
-            Stmt::Store(p, _) => f(p),
-            Stmt::If { then, else_, .. } => {
-                each_place(then, f);
-                each_place(else_, f);
-            }
-            Stmt::Loop { body, continuing } => {
-                each_place(body, f);
-                each_place(continuing, f);
-            }
-            _ => {}
-        }
-    }
+    visit::walk(b, &mut |s| s.for_each_place(f));
 }
 
 /// Calls `f` on every value a block uses (not defines), recursively.
-fn each_use(b: &Block, f: &mut dyn FnMut(ValueId)) {
-    let uses = |e: &Expr, f: &mut dyn FnMut(ValueId)| {
-        map_expr(&mut e.clone(), &mut |x| {
-            f(x);
-            x
-        })
-    };
-    for s in b {
-        match s {
-            Stmt::Let(_, e) | Stmt::Eval(e) => uses(e, f),
-            Stmt::Store(p, x) => {
-                uses(&Expr::Load(p.clone()), f);
-                f(*x);
-            }
-            Stmt::If { cond, then, else_ } => {
-                f(*cond);
-                each_use(then, f);
-                each_use(else_, f);
-            }
-            Stmt::Loop { body, continuing } => {
-                each_use(body, f);
-                each_use(continuing, f);
-            }
-            Stmt::Return(Some(x)) => f(*x),
-            _ => {}
-        }
-    }
+fn each_use(b: &Block, f: &mut impl FnMut(ValueId)) {
+    visit::walk(b, &mut |s| s.for_each_value(f));
 }
 
 // ---- inlining -------------------------------------------------------------------------------
 
-fn calls(b: &Block, out: &mut Vec<FuncId>) {
-    for s in b {
-        match s {
-            Stmt::Let(_, Expr::Call(g, _)) | Stmt::Eval(Expr::Call(g, _)) => out.push(*g),
-            Stmt::If { then, else_, .. } => {
-                calls(then, out);
-                calls(else_, out);
-            }
-            Stmt::Loop { body, continuing } => {
-                calls(body, out);
-                calls(continuing, out);
-            }
-            _ => {}
-        }
-    }
-}
-
 /// Inlines every call, callees first.
-fn inline_all(m: &mut Module) -> Result<(), String> {
+fn inline_all(m: &mut Module) -> Result<()> {
     let n = m.functions.len();
     let mut order = Vec::new();
     let mut state = vec![0u8; n]; // 0 new, 1 visiting, 2 done
-    fn visit(m: &Module, f: usize, state: &mut [u8], order: &mut Vec<usize>) -> Result<(), String> {
+    fn visit(m: &Module, f: usize, state: &mut [u8], order: &mut Vec<usize>) -> Result<()> {
         match state[f] {
             2 => return Ok(()),
             1 => {
-                return Err(format!("internal: `{}` is recursive on the GPU", m.functions[f].name));
+                return Err(Error::internal(format!(
+                    "`{}` is recursive on the GPU",
+                    m.functions[f].name
+                )));
             }
             _ => {}
         }
         state[f] = 1;
-        let mut cs = Vec::new();
-        calls(&m.functions[f].body, &mut cs);
-        for g in cs {
+        for g in visit::calls(&m.functions[f].body) {
             visit(m, g.index(), state, order)?;
         }
         state[f] = 2;
@@ -192,7 +85,7 @@ fn inline_all(m: &mut Module) -> Result<(), String> {
     Ok(())
 }
 
-fn func_body(cx: &mut Inliner<'_>, body: Block) -> Result<(), String> {
+fn func_body(cx: &mut Inliner<'_>, body: Block) -> Result<()> {
     let b = cx.block(body)?;
     cx.f.body = b;
     Ok(())
@@ -206,21 +99,11 @@ struct Inliner<'a> {
 }
 
 impl Inliner<'_> {
-    fn block(&mut self, b: Block) -> Result<Block, String> {
+    fn block(&mut self, b: Block) -> Result<Block> {
         let mut out = Vec::new();
         for mut s in b {
             let rename = &self.rename;
-            let mut r = |x: ValueId| rename.get(&x).copied().unwrap_or(x);
-            match &mut s {
-                Stmt::Let(_, e) | Stmt::Eval(e) => map_expr(e, &mut r),
-                Stmt::Store(p, x) => {
-                    map_place(p, &mut r);
-                    *x = r(*x);
-                }
-                Stmt::If { cond, .. } => *cond = r(*cond),
-                Stmt::Return(Some(x)) => *x = r(*x),
-                _ => {}
-            }
+            s.for_each_value_mut(&mut |x| *x = rename.get(x).copied().unwrap_or(*x));
             match s {
                 Stmt::Let(v, Expr::Call(g, args)) => {
                     if let Some(res) = self.inline(g, &args, &mut out)? {
@@ -247,12 +130,7 @@ impl Inliner<'_> {
     }
 
     /// Copies `g`'s body (already flattened) into `out`, returning the value its result now is.
-    fn inline(
-        &mut self,
-        g: FuncId,
-        args: &[Arg],
-        out: &mut Block,
-    ) -> Result<Option<ValueId>, String> {
+    fn inline(&mut self, g: FuncId, args: &[Arg], out: &mut Block) -> Result<Option<ValueId>> {
         let orig = self.m.functions[g.index()].clone();
         let callee = match single_exit(self.m, &orig) {
             Some((nf, _)) => nf,
@@ -279,7 +157,7 @@ impl Inliner<'_> {
         values: &mut HashMap<ValueId, ValueId>,
         locals: &HashMap<LocalId, LocalId>,
         result: &mut Option<ValueId>,
-    ) -> Result<Block, String> {
+    ) -> Result<Block> {
         let mut out = Vec::new();
         for s in b {
             match s {
@@ -289,7 +167,7 @@ impl Inliner<'_> {
                         values.insert(*v, *a);
                     }
                     Arg::Place(_) => {
-                        return Err("internal: a by-value parameter given a place".into());
+                        return Err(Error::internal("a by-value parameter given a place"));
                     }
                 },
                 Stmt::Let(v, e) => {
@@ -333,7 +211,7 @@ impl Inliner<'_> {
         args: &[Arg],
         values: &HashMap<ValueId, ValueId>,
         locals: &HashMap<LocalId, LocalId>,
-    ) -> Result<Place, String> {
+    ) -> Result<Place> {
         let mut path = Vec::new();
         let root = match &p.root {
             PlaceRoot::Local(l) => PlaceRoot::Local(locals[l]),
@@ -345,7 +223,7 @@ impl Inliner<'_> {
                     a.root.clone()
                 }
                 Arg::Value(_) => {
-                    return Err("internal: a by-reference parameter given a value".into());
+                    return Err(Error::internal("a by-reference parameter given a value"));
                 }
             },
         };
@@ -364,13 +242,13 @@ impl Inliner<'_> {
         args: &[Arg],
         values: &HashMap<ValueId, ValueId>,
         locals: &HashMap<LocalId, LocalId>,
-    ) -> Result<Expr, String> {
+    ) -> Result<Expr> {
         let mut e = e.clone();
         match &mut e {
             Expr::Load(p) | Expr::Run(p) | Expr::Addr(p) | Expr::ArrayLength(p) => {
                 *p = self.copy_place(p, args, values, locals)?;
             }
-            Expr::Call(..) => return Err("internal: a call left in a flattened callee".into()),
+            Expr::Call(..) => return Err(Error::internal("a call left in a flattened callee")),
             _ => {
                 let mut err = None;
                 map_expr(&mut e, &mut |x| {
@@ -388,8 +266,11 @@ impl Inliner<'_> {
     }
 }
 
-fn val(values: &HashMap<ValueId, ValueId>, v: ValueId) -> Result<ValueId, String> {
-    values.get(&v).copied().ok_or_else(|| format!("internal: v{} used before it's defined", v.0))
+fn val(values: &HashMap<ValueId, ValueId>, v: ValueId) -> Result<ValueId> {
+    values
+        .get(&v)
+        .copied()
+        .ok_or_else(|| Error::internal(format!("v{} used before it's defined", v.0)))
 }
 
 // ---- forwarding reads of uniform data -------------------------------------------------------
@@ -421,89 +302,80 @@ fn forward(m: &Module, f: &mut Function) {
 /// Locals written exactly once, as a whole, by a store that comes before every read of them in
 /// the same block (so it dominates them), and never written through or pointed to.
 fn forwardable_locals(f: &Function) -> HashSet<LocalId> {
-    let mut whole_stores: HashMap<LocalId, u32> = HashMap::new();
-    let mut other_writes: HashSet<LocalId> = HashSet::new();
-    fn scan(b: &Block, ws: &mut HashMap<LocalId, u32>, other: &mut HashSet<LocalId>) {
-        for s in b {
-            match s {
-                Stmt::Store(Place { root: PlaceRoot::Local(l), path }, _) => {
-                    if path.is_empty() {
-                        *ws.entry(*l).or_default() += 1;
+    let n = f.locals.len();
+    // Whole stores, and writes or pointers that rule a local out.
+    let mut whole_stores = vec![0u32; n];
+    let mut excluded = vec![false; n];
+    // Every mention of each local, the stores included.
+    let mut mentions = vec![0u32; n];
+    visit::walk(&f.body, &mut |s| {
+        match s {
+            Stmt::Store(p, _) => {
+                if let Some(l) = p.root_local() {
+                    if p.path.is_empty() {
+                        whole_stores[l.index()] += 1;
                     } else {
-                        other.insert(*l);
+                        excluded[l.index()] = true;
                     }
                 }
-                Stmt::Let(_, Expr::Addr(p) | Expr::Run(p)) => {
-                    if let PlaceRoot::Local(l) = p.root {
-                        other.insert(l);
-                    }
-                }
-                Stmt::Let(_, Expr::Call(_, args)) | Stmt::Eval(Expr::Call(_, args)) => {
-                    for a in args {
-                        if let Arg::Place(Place { root: PlaceRoot::Local(l), .. }) = a {
-                            other.insert(*l);
-                        }
-                    }
-                }
-                Stmt::If { then, else_, .. } => {
-                    scan(then, ws, other);
-                    scan(else_, ws, other);
-                }
-                Stmt::Loop { body, continuing } => {
-                    scan(body, ws, other);
-                    scan(continuing, ws, other);
-                }
-                _ => {}
             }
+            Stmt::Let(_, Expr::Addr(p) | Expr::Run(p)) => {
+                if let Some(l) = p.root_local() {
+                    excluded[l.index()] = true;
+                }
+            }
+            Stmt::Let(_, Expr::Call(_, args)) | Stmt::Eval(Expr::Call(_, args)) => {
+                for a in args {
+                    if let Arg::Place(p) = a
+                        && let Some(l) = p.root_local()
+                    {
+                        excluded[l.index()] = true;
+                    }
+                }
+            }
+            _ => {}
         }
-    }
-    scan(&f.body, &mut whole_stores, &mut other_writes);
-    let candidates: HashSet<LocalId> = whole_stores
-        .into_iter()
-        .filter(|(l, n)| *n == 1 && !other_writes.contains(l))
-        .map(|(l, _)| l)
-        .collect();
-    // Dominance: in the block holding the store, every load comes after it.
-    let mut ok = HashSet::new();
-    fn find(b: &Block, l: LocalId, ok: &mut HashSet<LocalId>, total: usize) -> bool {
-        for (i, s) in b.iter().enumerate() {
-            if matches!(s, Stmt::Store(Place { root: PlaceRoot::Local(x), .. }, _) if *x == l) {
-                let mut after = 0;
-                each_place(&b[i + 1..].to_vec(), &mut |p| {
-                    if p.root == PlaceRoot::Local(l) {
-                        after += 1;
-                    }
-                });
-                if after == total {
-                    ok.insert(l);
-                }
-                return true;
-            }
-            let found = match s {
-                Stmt::If { then, else_, .. } => {
-                    find(then, l, ok, total) || find(else_, l, ok, total)
-                }
-                Stmt::Loop { body, continuing } => {
-                    find(body, l, ok, total) || find(continuing, l, ok, total)
-                }
-                _ => false,
-            };
-            if found {
-                return true;
-            }
-        }
-        false
-    }
-    for l in candidates {
-        let mut total = 0;
-        each_place(&f.body, &mut |p| {
-            if p.root == PlaceRoot::Local(l) {
-                total += 1;
+        s.for_each_place(&mut |p| {
+            if let Some(l) = p.root_local() {
+                mentions[l.index()] += 1;
             }
         });
-        // The store itself is one of the places counted.
-        find(&f.body, l, &mut ok, total - 1);
+    });
+    let candidate: Vec<bool> = (0..n).map(|l| whole_stores[l] == 1 && !excluded[l]).collect();
+    // Dominance: in the block holding the store, every other mention comes after it. Each
+    // block's statements are counted from the end, so this is one pass over the code.
+    let mut ok = HashSet::new();
+    fn mentions_in(s: &Stmt, candidate: &[bool], out: &mut HashMap<LocalId, u32>) {
+        let mut count = |p: &Place| {
+            if let Some(l) = p.root_local()
+                && candidate[l.index()]
+            {
+                *out.entry(l).or_default() += 1;
+            }
+        };
+        s.for_each_place(&mut count);
+        for b in s.blocks() {
+            visit::walk(b, &mut |inner| inner.for_each_place(&mut count));
+        }
     }
+    fn scan(b: &Block, candidate: &[bool], mentions: &[u32], ok: &mut HashSet<LocalId>) {
+        let mut after: HashMap<LocalId, u32> = HashMap::new();
+        for s in b.iter().rev() {
+            if let Stmt::Store(p, _) = s
+                && p.path.is_empty()
+                && let Some(l) = p.root_local()
+                && candidate[l.index()]
+                && after.get(&l).copied().unwrap_or(0) + 1 == mentions[l.index()]
+            {
+                ok.insert(l);
+            }
+            mentions_in(s, candidate, &mut after);
+            for inner in s.blocks() {
+                scan(inner, candidate, mentions, ok);
+            }
+        }
+    }
+    scan(&f.body, &candidate, &mentions, &mut ok);
     ok
 }
 
@@ -614,68 +486,26 @@ fn compact_locals(f: &mut Function) {
         }
     }
     f.locals = kept;
-    fn go(b: &mut Block, remap: &[Option<LocalId>]) {
-        let fix = |p: &mut Place| {
+    visit::walk_mut(&mut f.body, &mut |s| {
+        s.for_each_place_mut(&mut |p| {
             if let PlaceRoot::Local(l) = &mut p.root {
                 *l = remap[l.index()].expect("a mentioned local is kept");
             }
-        };
-        for s in b {
-            match s {
-                Stmt::Let(_, e) | Stmt::Eval(e) => match e {
-                    Expr::Load(p) | Expr::Run(p) | Expr::Addr(p) | Expr::ArrayLength(p) => fix(p),
-                    Expr::Call(_, args) => {
-                        for a in args {
-                            if let Arg::Place(p) = a {
-                                fix(p);
-                            }
-                        }
-                    }
-                    _ => {}
-                },
-                Stmt::Store(p, _) => fix(p),
-                Stmt::If { then, else_, .. } => {
-                    go(then, remap);
-                    go(else_, remap);
-                }
-                Stmt::Loop { body, continuing } => {
-                    go(body, remap);
-                    go(continuing, remap);
-                }
-                _ => {}
-            }
-        }
-    }
-    go(&mut f.body, &remap);
+        })
+    });
 }
 
 /// The locals whose contents something reads (a load, a pointer, a call's argument).
 fn each_read_local(b: &Block, read: &mut HashSet<LocalId>) {
-    for s in b {
-        match s {
-            Stmt::Let(_, Expr::Load(p) | Expr::Run(p) | Expr::Addr(p) | Expr::ArrayLength(p)) => {
-                if let PlaceRoot::Local(l) = p.root {
+    visit::walk(b, &mut |s| {
+        if let Some(e) = s.expr() {
+            e.for_each_place(&mut |p| {
+                if let Some(l) = p.root_local() {
                     read.insert(l);
                 }
-            }
-            Stmt::Let(_, Expr::Call(_, args)) | Stmt::Eval(Expr::Call(_, args)) => {
-                for a in args {
-                    if let Arg::Place(Place { root: PlaceRoot::Local(l), .. }) = a {
-                        read.insert(*l);
-                    }
-                }
-            }
-            Stmt::If { then, else_, .. } => {
-                each_read_local(then, read);
-                each_read_local(else_, read);
-            }
-            Stmt::Loop { body, continuing } => {
-                each_read_local(body, read);
-                each_read_local(continuing, read);
-            }
-            _ => {}
+            });
         }
-    }
+    });
 }
 
 fn sweep(b: &mut Block, used: &[bool], read: &HashSet<LocalId>, changed: &mut bool) {
@@ -712,9 +542,7 @@ fn drop_uncalled(m: &mut Module) {
         if std::mem::replace(&mut keep[f.index()], true) {
             continue;
         }
-        let mut cs = Vec::new();
-        calls(&m.functions[f.index()].body, &mut cs);
-        stack.extend(cs);
+        stack.extend(visit::calls(&m.functions[f.index()].body));
     }
     let mut remap = vec![None; m.functions.len()];
     let mut kept = Vec::new();
@@ -738,18 +566,9 @@ fn drop_uncalled(m: &mut Module) {
 }
 
 fn remap_calls(b: &mut Block, r: &impl Fn(FuncId) -> FuncId) {
-    for s in b {
-        match s {
-            Stmt::Let(_, Expr::Call(g, _)) | Stmt::Eval(Expr::Call(g, _)) => *g = r(*g),
-            Stmt::If { then, else_, .. } => {
-                remap_calls(then, r);
-                remap_calls(else_, r);
-            }
-            Stmt::Loop { body, continuing } => {
-                remap_calls(body, r);
-                remap_calls(continuing, r);
-            }
-            _ => {}
+    visit::walk_mut(b, &mut |s| {
+        if let Some(Expr::Call(g, _)) = s.expr_mut() {
+            *g = r(*g);
         }
-    }
+    });
 }

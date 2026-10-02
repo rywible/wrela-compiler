@@ -23,6 +23,7 @@
         }
       ],
       "help": [],
+      "internal": false,
       "label": null,
       "labels": [],
       "message": "a line can't start with the binary operator `+`",
@@ -41,5 +42,5 @@
       "title": "a binary operator at the start of a line"
     }
   ],
-  "version": 1
+  "version": 2
 }

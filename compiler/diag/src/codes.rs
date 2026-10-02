@@ -3,7 +3,8 @@
 //!
 //! Ranges: E00xx lexical, E01xx syntax, E02xx names and modules, E03xx types, E04xx traits and
 //! generics, E05xx modes, moves, projections and exclusivity, E06xx effects and GPU rules, E07xx
-//! derived interpretations and back ends, E09xx not in tier 0, W0xxx warnings.
+//! derived interpretations and back ends, E09xx not in tier 0, W0xxx warnings, I0xxx bugs in
+//! the compiler itself.
 //!
 //! A code's number and meaning never change once released; retired codes stay reserved.
 
@@ -30,6 +31,11 @@ impl Code {
 
     pub fn severity(self) -> Severity {
         if self.0.code.starts_with('W') { Severity::Warning } else { Severity::Error }
+    }
+
+    /// Whether the code reports a bug in the compiler rather than in the program.
+    pub fn is_internal(self) -> bool {
+        self.0.code.starts_with('I')
     }
 
     /// Looks a code up by its text, e.g. `"E0001"`.
@@ -189,6 +195,9 @@ codes! {
     // ---- W0xxx: warnings -------------------------------------------------------------------
     W0001 = "W0001", "an unused local";
     W0002 = "W0002", "unreachable code";
+
+    // ---- I0xxx: bugs in the compiler -------------------------------------------------------
+    I0001 = "I0001", "an internal compiler error";
 }
 
 #[cfg(test)]
@@ -203,7 +212,7 @@ mod tests {
             assert!(seen.insert(c.as_str()), "{} declared twice", c);
             let s = c.as_str();
             assert_eq!(s.len(), 5, "{s}");
-            assert!(s.starts_with('E') || s.starts_with('W'), "{s}");
+            assert!(s.starts_with('E') || s.starts_with('W') || s.starts_with('I'), "{s}");
             assert!(s[1..].bytes().all(|b| b.is_ascii_digit()), "{s}");
             assert!(!c.title().is_empty());
         }

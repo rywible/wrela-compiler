@@ -7,6 +7,7 @@
       "help": [
         "put positional arguments first, or name this one too (D-039)"
       ],
+      "internal": false,
       "label": null,
       "labels": [
         {
@@ -36,5 +37,5 @@
       "title": "a positional argument after a named one"
     }
   ],
-  "version": 1
+  "version": 2
 }

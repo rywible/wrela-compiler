@@ -19,6 +19,7 @@
       "help": [
         "declare it with `var total` to change it"
       ],
+      "internal": false,
       "label": null,
       "labels": [
         {
@@ -48,5 +49,5 @@
       "title": "an assignment through a read-only place"
     }
   ],
-  "version": 1
+  "version": 2
 }

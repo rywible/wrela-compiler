@@ -1,4 +1,6 @@
 //! A diagnostic: a code, a message, a primary span, and optional labels, notes, help and fixes.
+//! An internal compiler error ([`Diagnostic::internal`]) has no span: it's about the compiler,
+//! not a place in the program.
 
 use crate::codes::Code;
 use crate::source::Span;
@@ -45,7 +47,8 @@ pub struct Diagnostic {
     pub code: Code,
     pub severity: Severity,
     pub message: String,
-    pub primary: Label,
+    /// Where the problem is; `None` only for an internal compiler error.
+    pub primary: Option<Label>,
     pub secondary: Vec<Label>,
     pub notes: Vec<String>,
     pub help: Vec<String>,
@@ -59,7 +62,7 @@ impl Diagnostic {
             code,
             severity: code.severity(),
             message: message.into(),
-            primary: Label { span, message: None },
+            primary: Some(Label { span, message: None }),
             secondary: Vec::new(),
             notes: Vec::new(),
             help: Vec::new(),
@@ -67,9 +70,28 @@ impl Diagnostic {
         }
     }
 
+    /// A bug in the compiler, not a problem with the program (I0001): no span, and a note
+    /// saying so.
+    pub fn internal(message: impl Into<String>) -> Diagnostic {
+        Diagnostic {
+            code: crate::codes::I0001,
+            severity: Severity::Error,
+            message: message.into(),
+            primary: None,
+            secondary: Vec::new(),
+            notes: vec![
+                "this is a bug in the wrela compiler, not in your program; please report it".into(),
+            ],
+            help: Vec::new(),
+            fixes: Vec::new(),
+        }
+    }
+
     /// A message under the primary span.
     pub fn with_label(mut self, message: impl Into<String>) -> Diagnostic {
-        self.primary.message = Some(message.into());
+        if let Some(p) = &mut self.primary {
+            p.message = Some(message.into());
+        }
         self
     }
 
@@ -103,8 +125,9 @@ impl Diagnostic {
         self
     }
 
-    pub fn span(&self) -> Span {
-        self.primary.span
+    /// The primary span: `None` for an internal compiler error.
+    pub fn span(&self) -> Option<Span> {
+        self.primary.as_ref().map(|p| p.span)
     }
 
     pub fn is_error(&self) -> bool {
@@ -115,13 +138,13 @@ impl Diagnostic {
 /// Sorts diagnostics into a stable order: by file, then position, then code. Duplicates (same
 /// code and primary span) are dropped.
 pub fn sort_and_dedup(diags: &mut Vec<Diagnostic>) {
-    diags.sort_by(|a, b| {
-        (a.primary.span.file, a.primary.span.start, a.primary.span.end, a.code.as_str()).cmp(&(
-            b.primary.span.file,
-            b.primary.span.start,
-            b.primary.span.end,
-            b.code.as_str(),
-        ))
+    // Internal errors first: they explain whatever else went wrong.
+    let key = |d: &Diagnostic| {
+        let s = d.span();
+        (s.is_some(), s.map(|s| (s.file, s.start, s.end)), d.code.as_str())
+    };
+    diags.sort_by(|a, b| key(a).cmp(&key(b)));
+    diags.dedup_by(|a, b| {
+        a.code == b.code && a.span() == b.span() && (a.span().is_some() || a.message == b.message)
     });
-    diags.dedup_by(|a, b| a.code == b.code && a.primary.span == b.primary.span);
 }

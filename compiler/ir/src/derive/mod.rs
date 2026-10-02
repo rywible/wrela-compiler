@@ -30,7 +30,7 @@ pub fn value_and_gradient(
     cache: &mut DeriveCache,
     f: FuncId,
     ncap: u32,
-) -> Result<FuncId, String> {
+) -> Result<FuncId> {
     ad::value_and_gradient(m, cache, f, ncap)
 }
 
@@ -46,7 +46,7 @@ pub fn interval(
     target: Target,
     box_ty: TypeId,
     interval_ty: TypeId,
-) -> Result<FuncId, String> {
+) -> Result<FuncId> {
     interval::interval(m, cache, f, ncap, target, box_ty, interval_ty)
 }
 
@@ -95,8 +95,8 @@ pub(crate) fn activity(
     f: &Function,
     params: &[bool],
     mode: Mode,
-    callee_returns: &mut dyn FnMut(FuncId, Vec<bool>) -> Result<bool, String>,
-) -> Result<Activity, String> {
+    callee_returns: &mut dyn FnMut(FuncId, Vec<bool>) -> Result<bool>,
+) -> Result<Activity> {
     let mut a = Activity {
         values: vec![false; f.values.len()],
         locals: vec![false; f.locals.len()],
@@ -178,8 +178,8 @@ fn walk(
     b: &Block,
     a: &mut Activity,
     ctrl: Option<&HashSet<LocalId>>,
-    callee_returns: &mut dyn FnMut(FuncId, Vec<bool>) -> Result<bool, String>,
-) -> Result<(), String> {
+    callee_returns: &mut dyn FnMut(FuncId, Vec<bool>) -> Result<bool>,
+) -> Result<()> {
     let (m, f, mode) = (cx.m, cx.f, cx.mode);
     let joined = |p: &Place| match (ctrl, &p.root) {
         (None, _) => false,
@@ -288,8 +288,8 @@ fn mark_place(a: &mut Activity, p: &Place) {
 fn expr_active(
     e: &Expr,
     a: &Activity,
-    callee_returns: &mut dyn FnMut(FuncId, Vec<bool>) -> Result<bool, String>,
-) -> Result<bool, String> {
+    callee_returns: &mut dyn FnMut(FuncId, Vec<bool>) -> Result<bool>,
+) -> Result<bool> {
     let v = |x: &ValueId| a.values[x.index()];
     Ok(match e {
         Expr::Const(_) | Expr::Zero(_) | Expr::EntryInput(_) => false,
@@ -342,29 +342,7 @@ pub(crate) fn has_host_or_ptr(b: &Block) -> Option<&'static str> {
     None
 }
 
-/// The type of a place, walking its projections.
-pub(crate) fn place_type(m: &Module, f: &Function, p: &Place) -> TypeId {
-    let mut t = match &p.root {
-        PlaceRoot::Local(l) => f.locals[l.index()].ty,
-        PlaceRoot::Param(i) => f.params[*i as usize].ty,
-        PlaceRoot::Resource(r) => m.resources[r.index()].ty,
-        PlaceRoot::Ptr(v) => match m.types.get(f.value_ty(*v)) {
-            TypeDef::Ptr(t) => *t,
-            _ => f.value_ty(*v),
-        },
-    };
-    for proj in &p.path {
-        t = match (m.types.get(t), proj) {
-            (TypeDef::Struct { fields, .. }, Proj::Field(k)) => fields[*k as usize].1,
-            (TypeDef::Vector(_), _) => find(m, &TypeDef::Scalar(Scalar::F32)),
-            (TypeDef::Matrix(n), _) => find(m, &TypeDef::Vector(*n)),
-            (TypeDef::Array(e, _) | TypeDef::RuntimeArray(e) | TypeDef::Run(e), _) => *e,
-            _ => t,
-        };
-    }
-    t
-}
-
-pub(crate) fn find(m: &Module, d: &TypeDef) -> TypeId {
-    m.types.iter().find(|(_, x)| *x == d).map_or(TypeId(0), |(t, _)| t)
+/// The type of a place.
+pub(crate) fn place_type(m: &Module, f: &Function, p: &Place) -> Result<TypeId> {
+    m.place_ty(f, p).ok_or_else(|| Error::internal(format!("a place with no type: {p:?}")))
 }

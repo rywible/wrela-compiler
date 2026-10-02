@@ -169,8 +169,7 @@ impl<'a> Parser<'a> {
         let mut d =
             Diagnostic::new(codes::E0100, t.span, format!("expected {what}, found {found}"));
         if t.kind == T::Newline {
-            // A NEWLINE token is empty; point at the end of the line instead.
-            d.primary.span = t.span;
+            // A NEWLINE token is the line's end, which is where the error points.
             d = d.with_note("a line break ends a statement unless the line ends with an operator or the next line starts with `.` (L17)");
         }
         self.error(d);

@@ -1,25 +1,31 @@
-//! Checks a module's structural invariants. A failure is a bug in the compiler (lowering or a
-//! transform), never in the user's program.
+//! Checks a module's invariants. A failure is a bug in the compiler (lowering or a transform),
+//! never in the user's program.
+//!
+//! - **Scoping:** values are defined once and used only where their definition is visible
+//!   (earlier in the same block or an enclosing one); `break` and `continue` are inside loops;
+//!   locals, parameters, resources and callees exist.
+//! - **Types:** each value's declared type is the one its expression makes; a store writes a
+//!   value of its place's type; a call passes what its callee's parameters take, each the way
+//!   the parameter is passed; a return returns the function's type; a condition is a `bool`.
 
 use crate::*;
 
-/// Checks every function: values are defined once and used only where their definition is
-/// visible (earlier in the same block or an enclosing one); `break` and `continue` are inside
-/// loops; locals, parameters, resources and callees exist.
-pub fn verify(m: &Module) -> Result<(), String> {
+pub fn verify(m: &Module) -> Result<()> {
     for (i, f) in m.functions.iter().enumerate() {
         let mut v = Verifier {
             m,
             f,
             defined: vec![false; f.values.len()],
-            scopes: vec![Vec::new()],
+            visible: vec![false; f.values.len()],
+            scopes: Vec::new(),
             loops: 0,
         };
-        v.block(&f.body).map_err(|e| format!("fn{i} {}: {e}", f.name))?;
+        v.block(&f.body)
+            .map_err(|e| Error::internal(format!("fn{i} `{}`: {}", f.name, e.message())))?;
     }
     for e in &m.entry_points {
         if e.function.index() >= m.functions.len() {
-            return Err(format!("entry {} names a missing function", e.name));
+            return Err(Error::internal(format!("entry {} names a missing function", e.name)));
         }
     }
     Ok(())
@@ -29,121 +35,393 @@ struct Verifier<'a> {
     m: &'a Module,
     f: &'a Function,
     defined: Vec<bool>,
+    /// Whether each value's definition is in scope here.
+    visible: Vec<bool>,
+    /// The values each open block defined, to put out of scope when it closes.
     scopes: Vec<Vec<ValueId>>,
     loops: u32,
 }
 
+fn bug(message: String) -> Error {
+    Error::internal(message)
+}
+
 impl Verifier<'_> {
-    fn visible(&self, v: ValueId) -> Result<(), String> {
+    fn show(&self, t: TypeId) -> String {
+        self.m.types.display(t)
+    }
+
+    fn visible(&self, v: ValueId) -> Result<()> {
         if v.index() >= self.f.values.len() {
-            return Err(format!("v{} doesn't exist", v.0));
+            return Err(bug(format!("v{} doesn't exist", v.0)));
         }
-        if !self.scopes.iter().any(|s| s.contains(&v)) {
-            return Err(format!("v{} is used where its definition isn't visible", v.0));
+        if !self.visible[v.index()] {
+            return Err(bug(format!("v{} is used where its definition isn't visible", v.0)));
         }
         Ok(())
     }
 
-    fn place(&self, p: &Place) -> Result<(), String> {
+    fn ty(&self, v: ValueId) -> TypeId {
+        self.f.value_ty(v)
+    }
+
+    fn def(&self, t: TypeId) -> &TypeDef {
+        self.m.types.get(t)
+    }
+
+    fn scalar(&self, t: TypeId) -> Option<Scalar> {
+        self.m.types.as_scalar(t)
+    }
+
+    fn is_f32(&self, t: TypeId) -> bool {
+        self.scalar(t) == Some(Scalar::F32)
+    }
+
+    fn is_bool(&self, t: TypeId) -> bool {
+        self.scalar(t) == Some(Scalar::Bool)
+    }
+
+    fn expect(&self, what: &str, want: TypeId, got: TypeId) -> Result<()> {
+        if want == got {
+            Ok(())
+        } else {
+            Err(bug(format!("{what} is a `{}`, not a `{}`", self.show(got), self.show(want))))
+        }
+    }
+
+    fn place(&self, p: &Place) -> Result<TypeId> {
         match &p.root {
             PlaceRoot::Local(l) if l.index() >= self.f.locals.len() => {
-                return Err(format!("l{} doesn't exist", l.0));
+                return Err(bug(format!("l{} doesn't exist", l.0)));
             }
             PlaceRoot::Param(i) if !self.f.params.get(*i as usize).is_some_and(|p| p.by_ref) => {
-                return Err(format!("p{i} isn't a by-reference parameter"));
+                return Err(bug(format!("p{i} isn't a by-reference parameter")));
             }
             PlaceRoot::Resource(r) if r.index() >= self.m.resources.len() => {
-                return Err(format!("r{} doesn't exist", r.0));
+                return Err(bug(format!("r{} doesn't exist", r.0)));
             }
-            PlaceRoot::Ptr(v) => self.visible(*v)?,
             _ => {}
         }
+        let mut err = Ok(());
+        p.for_each_value(&mut |v| {
+            if err.is_ok() {
+                err = self.visible(v);
+            }
+        });
+        err?;
         for proj in &p.path {
-            if let Proj::Index(v) = proj {
-                self.visible(*v)?;
+            if let Proj::Index(i) = proj
+                && !self.scalar(self.ty(*i)).is_some_and(|s| s.is_int())
+            {
+                return Err(bug(format!("an index v{} that isn't an integer", i.0)));
             }
         }
-        Ok(())
+        self.m.place_ty(self.f, p).ok_or_else(|| bug(format!("a place with no type: {p:?}")))
     }
 
-    fn expr(&self, e: &Expr) -> Result<(), String> {
-        let vs: Vec<ValueId> = match e {
-            Expr::Const(_) | Expr::Zero(_) | Expr::EntryInput(_) => Vec::new(),
-            Expr::Param(i) => {
-                if !self.f.params.get(*i as usize).is_some_and(|p| !p.by_ref) {
-                    return Err(format!("param {i} isn't a by-value parameter"));
-                }
-                Vec::new()
+    /// The type `e` makes; `None` for an expression evaluated only for its effect that makes
+    /// nothing (a call to a function with no result, a host op with none).
+    fn expr(&self, e: &Expr) -> Result<Option<TypeId>> {
+        let mut err = Ok(());
+        e.for_each_value(&mut |v| {
+            if err.is_ok() {
+                err = self.visible(v);
             }
-            Expr::Load(p) | Expr::Run(p) | Expr::Addr(p) | Expr::ArrayLength(p) => {
-                self.place(p)?;
-                Vec::new()
+        });
+        err?;
+        let types = &self.m.types;
+        let t = match e {
+            Expr::Const(c) => types.lookup(&TypeDef::Scalar(c.scalar())),
+            Expr::Zero(t) => Some(*t),
+            Expr::Param(i) => match self.f.params.get(*i as usize) {
+                Some(p) if !p.by_ref => Some(p.ty),
+                _ => return Err(bug(format!("param {i} isn't a by-value parameter"))),
+            },
+            Expr::EntryInput(_) => return Ok(None),
+            Expr::Load(p) => Some(self.place(p)?),
+            Expr::Run(p) => match self.def(self.place(p)?) {
+                TypeDef::Array(e, _) => types.lookup(&TypeDef::Run(*e)),
+                _ => return Err(bug("a run of something that isn't an array".into())),
+            },
+            Expr::Addr(p) => types.lookup(&TypeDef::Ptr(self.place(p)?)),
+            Expr::ArrayLength(p) => {
+                let storage = matches!(&p.root, PlaceRoot::Resource(r)
+                    if matches!(self.m.resources.get(r.index()).map(|r| r.kind),
+                        Some(ResourceKind::StorageRead | ResourceKind::StorageReadWrite)));
+                if !storage || !p.path.is_empty() {
+                    return Err(bug("the length of something that isn't a storage buffer".into()));
+                }
+                types.lookup(&TypeDef::Scalar(Scalar::U32))
             }
-            Expr::Unary(_, v)
-            | Expr::Extract(v, _)
-            | Expr::Splat(v, _)
-            | Expr::Swizzle(v, _)
-            | Expr::Convert(v, _)
-            | Expr::Bitcast(v, _) => vec![*v],
-            Expr::Binary(_, a, b) | Expr::ExtractDyn(a, b) => vec![*a, *b],
-            Expr::Call(f, args) => {
-                if f.index() >= self.m.functions.len() {
-                    return Err(format!("call to missing fn{}", f.0));
+            Expr::Unary(op, x) => {
+                let t = self.ty(*x);
+                let ok = match op {
+                    UnOp::Neg => types.element_scalar(t).is_some_and(|s| s != Scalar::Bool),
+                    UnOp::Not => self.is_bool(t) || self.scalar(t).is_some_and(|s| s.is_int()),
+                };
+                if !ok {
+                    return Err(bug(format!("{op:?} of a `{}`", self.show(t))));
                 }
-                let callee = &self.m.functions[f.index()];
-                if callee.params.len() != args.len() {
-                    return Err(format!(
-                        "call to {} with {} arguments, not {}",
-                        callee.name,
-                        args.len(),
-                        callee.params.len()
-                    ));
-                }
-                let mut vs = Vec::new();
-                for (a, p) in args.iter().zip(&callee.params) {
-                    match (a, p.by_ref) {
-                        (Arg::Value(v), false) => vs.push(*v),
-                        (Arg::Place(pl), true) => self.place(pl)?,
-                        _ => {
-                            return Err(format!(
-                                "argument {} of {} passed the wrong way",
-                                p.name, callee.name
-                            ));
-                        }
+                Some(t)
+            }
+            Expr::Binary(op, a, b) => Some(self.binary(*op, *a, *b)?),
+            Expr::Call(g, args) => return self.call(*g, args),
+            Expr::Builtin(_, args) => {
+                // Elementwise builtins make their arguments' type; the reductions a scalar.
+                // What each takes is the back ends' business; here, that the arguments are
+                // floats.
+                for a in args {
+                    let t = self.ty(*a);
+                    if !matches!(self.def(t), TypeDef::Scalar(_) | TypeDef::Vector(_)) {
+                        return Err(bug(format!("a builtin given a `{}`", self.show(t))));
                     }
                 }
-                vs
+                return Ok(None);
             }
-            Expr::Builtin(_, args) | Expr::Construct(_, args) | Expr::Host(_, args) => args.clone(),
-            Expr::Select { cond, if_true, if_false } => vec![*cond, *if_true, *if_false],
+            Expr::Construct(t, parts) => {
+                self.construct(*t, parts)?;
+                Some(*t)
+            }
+            Expr::Extract(x, k) => Some(self.extract(self.ty(*x), *k)?),
+            Expr::ExtractDyn(x, i) => {
+                if !self.scalar(self.ty(*i)).is_some_and(|s| s.is_int()) {
+                    return Err(bug("a dynamic extract at an index that isn't an integer".into()));
+                }
+                match self.def(self.ty(*x)) {
+                    TypeDef::Array(e, _) => Some(*e),
+                    TypeDef::Vector(_) => types.lookup(&TypeDef::Scalar(Scalar::F32)),
+                    TypeDef::Matrix(n) => types.lookup(&TypeDef::Vector(*n)),
+                    d => return Err(bug(format!("a dynamic extract from a `{d:?}`"))),
+                }
+            }
+            Expr::Splat(x, n) => {
+                if !self.is_f32(self.ty(*x)) {
+                    return Err(bug("a splat of something that isn't an `f32`".into()));
+                }
+                types.lookup(&TypeDef::Vector(*n))
+            }
+            Expr::Swizzle(x, comps) => {
+                let TypeDef::Vector(n) = self.def(self.ty(*x)) else {
+                    return Err(bug("a swizzle of something that isn't a vector".into()));
+                };
+                if comps.iter().any(|c| c >= n) || comps.len() < 2 || comps.len() > 4 {
+                    return Err(bug(format!("a swizzle {comps:?} of a vec{n}")));
+                }
+                types.lookup(&TypeDef::Vector(comps.len() as u8))
+            }
+            Expr::Convert(x, s) => {
+                if self.scalar(self.ty(*x)).is_none() {
+                    return Err(bug("a conversion of something that isn't a scalar".into()));
+                }
+                types.lookup(&TypeDef::Scalar(*s))
+            }
+            Expr::Bitcast(x, s) => {
+                let from = self.scalar(self.ty(*x));
+                if from.is_none_or(|f| f.bits() != s.bits()) {
+                    return Err(bug(format!(
+                        "a bitcast of a `{}` to {s:?}",
+                        self.show(self.ty(*x))
+                    )));
+                }
+                types.lookup(&TypeDef::Scalar(*s))
+            }
+            Expr::Select { cond, if_true, if_false } => {
+                if !self.is_bool(self.ty(*cond)) {
+                    return Err(bug("a select whose condition isn't a `bool`".into()));
+                }
+                self.expect("a select's second branch", self.ty(*if_true), self.ty(*if_false))?;
+                Some(self.ty(*if_true))
+            }
+            Expr::Host(_, _) => return Ok(None),
         };
-        for v in vs {
-            self.visible(v)?;
+        match t {
+            Some(t) => Ok(Some(t)),
+            None => Err(bug(format!("an expression whose type was never interned: {e:?}"))),
+        }
+    }
+
+    fn binary(&self, op: BinOp, a: ValueId, b: ValueId) -> Result<TypeId> {
+        let (ta, tb) = (self.ty(a), self.ty(b));
+        let types = &self.m.types;
+        let bool_t = || types.lookup(&TypeDef::Scalar(Scalar::Bool));
+        if op.is_comparison() {
+            if ta != tb || self.scalar(ta).is_none() {
+                return Err(bug(format!("{op:?} of `{}` and `{}`", self.show(ta), self.show(tb))));
+            }
+            return bool_t().ok_or_else(|| bug("a comparison with no `bool`".into()));
+        }
+        if matches!(op, BinOp::And | BinOp::Or) {
+            if !self.is_bool(ta) || !self.is_bool(tb) {
+                return Err(bug(format!("{op:?} of `{}` and `{}`", self.show(ta), self.show(tb))));
+            }
+            return Ok(ta);
+        }
+        if matches!(op, BinOp::Shl | BinOp::Shr) {
+            if !self.scalar(ta).is_some_and(|s| s.is_int()) || self.scalar(tb) != Some(Scalar::U32)
+            {
+                return Err(bug(format!("a shift of `{}` by `{}`", self.show(ta), self.show(tb))));
+            }
+            return Ok(ta);
+        }
+        if ta == tb {
+            return match self.def(ta) {
+                TypeDef::Scalar(Scalar::Bool) => {
+                    if matches!(op, BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor) {
+                        Ok(ta)
+                    } else {
+                        Err(bug(format!("{op:?} of bools")))
+                    }
+                }
+                TypeDef::Scalar(_) | TypeDef::Vector(_) => Ok(ta),
+                TypeDef::Matrix(_) if op == BinOp::Mul || matches!(op, BinOp::Add | BinOp::Sub) => {
+                    Ok(ta)
+                }
+                d => Err(bug(format!("{op:?} of `{d:?}`"))),
+            };
+        }
+        // A vector or matrix with a scalar (each component), a matrix with a vector.
+        match (self.def(ta), self.def(tb)) {
+            (TypeDef::Vector(_) | TypeDef::Matrix(_), TypeDef::Scalar(Scalar::F32)) => Ok(ta),
+            (TypeDef::Scalar(Scalar::F32), TypeDef::Vector(_) | TypeDef::Matrix(_)) => Ok(tb),
+            (TypeDef::Matrix(n), TypeDef::Vector(k)) | (TypeDef::Vector(k), TypeDef::Matrix(n))
+                if op == BinOp::Mul && n == k =>
+            {
+                Ok(if matches!(self.def(ta), TypeDef::Matrix(_)) { tb } else { ta })
+            }
+            _ => Err(bug(format!("{op:?} of `{}` and `{}`", self.show(ta), self.show(tb)))),
+        }
+    }
+
+    fn call(&self, g: FuncId, args: &[Arg]) -> Result<Option<TypeId>> {
+        let Some(callee) = self.m.functions.get(g.index()) else {
+            return Err(bug(format!("a call to missing fn{}", g.0)));
+        };
+        if callee.params.len() != args.len() {
+            return Err(bug(format!(
+                "a call to `{}` with {} arguments, not {}",
+                callee.name,
+                args.len(),
+                callee.params.len()
+            )));
+        }
+        for (a, p) in args.iter().zip(&callee.params) {
+            match (a, p.by_ref) {
+                (Arg::Value(v), false) => self.expect(
+                    &format!("`{}`'s argument `{}`", callee.name, p.name),
+                    p.ty,
+                    self.ty(*v),
+                )?,
+                (Arg::Place(pl), true) => {
+                    let t = self.place(pl)?;
+                    self.expect(&format!("`{}`'s argument `{}`", callee.name, p.name), p.ty, t)?
+                }
+                _ => {
+                    return Err(bug(format!(
+                        "argument `{}` of `{}` passed the wrong way",
+                        p.name, callee.name
+                    )));
+                }
+            }
+        }
+        Ok(match (callee.ret, callee.ret_ref) {
+            (Some(t), true) => Some(
+                self.m
+                    .types
+                    .lookup(&TypeDef::Ptr(t))
+                    .ok_or_else(|| bug("a projection call with no pointer type".into()))?,
+            ),
+            (r, _) => r,
+        })
+    }
+
+    fn construct(&self, t: TypeId, parts: &[ValueId]) -> Result<()> {
+        match self.def(t) {
+            TypeDef::Struct { fields, .. } => {
+                if fields.len() != parts.len() {
+                    return Err(bug(format!(
+                        "a `{}` built from {} parts",
+                        self.show(t),
+                        parts.len()
+                    )));
+                }
+                for ((name, ft), p) in fields.iter().zip(parts) {
+                    self.expect(
+                        &format!("field `{name}` of `{}`", self.show(t)),
+                        *ft,
+                        self.ty(*p),
+                    )?;
+                }
+            }
+            TypeDef::Vector(n) => {
+                if parts.len() != *n as usize || !parts.iter().all(|p| self.is_f32(self.ty(*p))) {
+                    return Err(bug(format!("a vec{n} built from {} parts", parts.len())));
+                }
+            }
+            TypeDef::Matrix(n) => {
+                let col = self.m.types.lookup(&TypeDef::Vector(*n));
+                if parts.len() != *n as usize || !parts.iter().all(|p| Some(self.ty(*p)) == col) {
+                    return Err(bug(format!("a mat{n} built from the wrong columns")));
+                }
+            }
+            TypeDef::Array(e, n) => {
+                if parts.len() != *n as usize {
+                    return Err(bug(format!("an array of {n} built from {} parts", parts.len())));
+                }
+                for p in parts {
+                    self.expect("an array element", *e, self.ty(*p))?;
+                }
+            }
+            d => return Err(bug(format!("a construct of `{d:?}`"))),
         }
         Ok(())
     }
 
-    fn block(&mut self, b: &Block) -> Result<(), String> {
+    fn extract(&self, t: TypeId, k: u32) -> Result<TypeId> {
+        let types = &self.m.types;
+        let r = match self.def(t) {
+            TypeDef::Struct { fields, .. } => fields.get(k as usize).map(|f| f.1),
+            TypeDef::Vector(n) if k < u32::from(*n) => types.lookup(&TypeDef::Scalar(Scalar::F32)),
+            TypeDef::Matrix(n) if k < u32::from(*n) => types.lookup(&TypeDef::Vector(*n)),
+            TypeDef::Array(e, n) if k < *n => Some(*e),
+            TypeDef::Run(_) if k < 2 => types.lookup(&TypeDef::Scalar(Scalar::U32)),
+            _ => None,
+        };
+        r.ok_or_else(|| bug(format!("part {k} of a `{}`", self.show(t))))
+    }
+
+    fn block(&mut self, b: &Block) -> Result<()> {
         self.scopes.push(Vec::new());
         for s in b {
             match s {
                 Stmt::Let(v, e) => {
-                    self.expr(e)?;
+                    let t = self.expr(e)?;
+                    if let Some(t) = t
+                        && !matches!(e, Expr::Builtin(..) | Expr::EntryInput(_) | Expr::Host(..))
+                    {
+                        self.expect(&format!("v{}", v.0), self.ty(*v), t)?;
+                    }
                     if self.defined[v.index()] {
-                        return Err(format!("v{} is defined twice", v.0));
+                        return Err(bug(format!("v{} is defined twice", v.0)));
                     }
                     self.defined[v.index()] = true;
+                    self.visible[v.index()] = true;
                     if let Some(scope) = self.scopes.last_mut() {
                         scope.push(*v);
                     }
                 }
-                Stmt::Eval(e) => self.expr(e)?,
+                Stmt::Eval(e) => {
+                    self.expr(e)?;
+                }
                 Stmt::Store(p, v) => {
-                    self.place(p)?;
+                    let t = self.place(p)?;
                     self.visible(*v)?;
+                    self.expect("a stored value", t, self.ty(*v))?;
                 }
                 Stmt::If { cond, then, else_ } => {
                     self.visible(*cond)?;
+                    if !self.is_bool(self.ty(*cond)) {
+                        return Err(bug("an `if` whose condition isn't a `bool`".into()));
+                    }
                     self.block(then)?;
                     self.block(else_)?;
                 }
@@ -159,17 +437,36 @@ impl Verifier<'_> {
                     self.loops = saved;
                 }
                 Stmt::Break | Stmt::Continue if self.loops == 0 => {
-                    return Err("break or continue outside a loop".into());
+                    return Err(bug("break or continue outside a loop".into()));
                 }
                 Stmt::Break | Stmt::Continue | Stmt::Trap => {}
-                Stmt::Return(v) => {
-                    if let Some(v) = v {
+                Stmt::Return(v) => match (v, self.f.ret) {
+                    (Some(v), Some(r)) => {
                         self.visible(*v)?;
+                        let want = if self.f.ret_ref {
+                            self.m.types.lookup(&TypeDef::Ptr(r)).unwrap_or(r)
+                        } else {
+                            r
+                        };
+                        self.expect("the returned value", want, self.ty(*v))?;
                     }
-                }
+                    (None, None) => {}
+                    (Some(_), None) => {
+                        return Err(bug(
+                            "a value returned from a function that returns nothing".into()
+                        ));
+                    }
+                    (None, Some(_)) => {
+                        return Err(bug(
+                            "nothing returned from a function that returns a value".into()
+                        ));
+                    }
+                },
             }
         }
-        self.scopes.pop();
+        for v in self.scopes.pop().unwrap_or_default() {
+            self.visible[v.index()] = false;
+        }
         Ok(())
     }
 }

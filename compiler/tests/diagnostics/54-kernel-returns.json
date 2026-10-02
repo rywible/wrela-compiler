@@ -7,6 +7,7 @@
       "help": [
         "write results through a `mut Slots<T>` parameter"
       ],
+      "internal": false,
       "label": null,
       "labels": [],
       "message": "a `@compute` kernel doesn't return a value",
@@ -23,5 +24,5 @@
       "title": "a GPU entry point with an invalid signature"
     }
   ],
-  "version": 1
+  "version": 2
 }

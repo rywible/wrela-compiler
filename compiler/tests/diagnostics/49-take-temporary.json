@@ -17,6 +17,7 @@
         }
       ],
       "help": [],
+      "internal": false,
       "label": null,
       "labels": [],
       "message": "`take` moves out of a named place, and this is a temporary",
@@ -35,5 +36,5 @@
       "title": "a `take` of a value that isn't a named place"
     }
   ],
-  "version": 1
+  "version": 2
 }

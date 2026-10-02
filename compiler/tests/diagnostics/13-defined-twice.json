@@ -7,6 +7,7 @@
       "help": [
         "rename one of them"
       ],
+      "internal": false,
       "label": null,
       "labels": [
         {
@@ -36,5 +37,5 @@
       "title": "a name defined twice"
     }
   ],
-  "version": 1
+  "version": 2
 }

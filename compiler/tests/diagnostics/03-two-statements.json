@@ -17,6 +17,7 @@
         }
       ],
       "help": [],
+      "internal": false,
       "label": null,
       "labels": [],
       "message": "expected a line break or `;` after a statement, found `let`",
@@ -33,5 +34,5 @@
       "title": "a missing statement separator"
     }
   ],
-  "version": 1
+  "version": 2
 }

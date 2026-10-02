@@ -41,8 +41,7 @@ pub fn layout(types: &Types, t: TypeId) -> Layout {
         TypeDef::Scalar(s) => scalar_layout(*s),
         TypeDef::Vector(n) => vector_layout(*n),
         TypeDef::Matrix(n) => {
-            let col = vector_layout(*n);
-            Layout { size: *n as u32 * round_up(col.align, col.size), align: col.align }
+            Layout { size: *n as u32 * column_stride(*n), align: vector_layout(*n).align }
         }
         TypeDef::Array(e, n) => {
             let el = layout(types, *e);
@@ -82,6 +81,12 @@ pub fn field_offsets(types: &Types, t: TypeId) -> Vec<u32> {
 }
 
 /// The distance between consecutive elements of an array of `elem`.
+/// The distance between a `matN`'s columns.
+pub fn column_stride(n: u8) -> u32 {
+    let col = vector_layout(n);
+    round_up(col.align, col.size)
+}
+
 pub fn array_stride(types: &Types, elem: TypeId) -> u32 {
     let l = layout(types, elem);
     round_up(l.align, l.size)

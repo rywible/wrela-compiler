@@ -19,6 +19,7 @@
       "help": [
         "for a parameter, write `x: T` to borrow it or `x: mut T` to change it; to refer to another value long-term, store a `Handle<T>`"
       ],
+      "internal": false,
       "label": null,
       "labels": [],
       "message": "`&` isn't a type in wrela",
@@ -37,5 +38,5 @@
       "title": "`&` isn't a type or an operator on places"
     }
   ],
-  "version": 1
+  "version": 2
 }

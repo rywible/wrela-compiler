@@ -17,6 +17,7 @@
         }
       ],
       "help": [],
+      "internal": false,
       "label": null,
       "labels": [],
       "message": "`Gait` has no variant `Trott`",
@@ -33,5 +34,5 @@
       "title": "an unknown variant"
     }
   ],
-  "version": 1
+  "version": 2
 }

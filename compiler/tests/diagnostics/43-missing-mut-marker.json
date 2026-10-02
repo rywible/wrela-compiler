@@ -17,6 +17,7 @@
         }
       ],
       "help": [],
+      "internal": false,
       "label": null,
       "labels": [],
       "message": "`x` is a `mut` parameter, so its argument is written `mut ...` at the call site",
@@ -35,5 +36,5 @@
       "title": "a `mut` argument without `mut` at the call site"
     }
   ],
-  "version": 1
+  "version": 2
 }

@@ -5,6 +5,7 @@
       "file": "main.wrela",
       "fixes": [],
       "help": [],
+      "internal": false,
       "label": null,
       "labels": [
         {
@@ -36,5 +37,5 @@
       "title": "overlapping arguments where one is `mut`"
     }
   ],
-  "version": 1
+  "version": 2
 }

@@ -88,17 +88,10 @@ impl Checker {
             Outcome::Accepted(_) if !hand_accepts => {
                 let mut msg = String::from("the grammar accepts, the parser rejects:");
                 for d in parser_errors.iter().take(3) {
-                    let _ = write!(
-                        msg,
-                        "\n  {} at {:?}: {}",
-                        d.code.as_str(),
-                        snippet(
-                            src,
-                            d.primary.span.start,
-                            d.primary.span.end.max(d.primary.span.start + 1)
-                        ),
-                        d.message
-                    );
+                    let at = d.span().map_or_else(String::new, |s| {
+                        format!("{:?}", snippet(src, s.start, s.end.max(s.start + 1)))
+                    });
+                    let _ = write!(msg, "\n  {} at {at}: {}", d.code.as_str(), d.message);
                 }
                 check.disagreement = Some(msg);
             }

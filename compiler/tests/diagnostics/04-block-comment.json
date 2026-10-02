@@ -19,6 +19,7 @@
       "help": [
         "use `//` comments, one per line"
       ],
+      "internal": false,
       "label": null,
       "labels": [],
       "message": "wrela has no block comments",
@@ -35,5 +36,5 @@
       "title": "a block comment (wrela has only `//` comments)"
     }
   ],
-  "version": 1
+  "version": 2
 }

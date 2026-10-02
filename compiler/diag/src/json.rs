@@ -5,9 +5,12 @@
 //! version. Offsets are bytes into the file's UTF-8 text; lines and columns are 1-based, and
 //! columns count characters.
 //!
+//! Version 2: an internal compiler error (`"internal": true`, code `I0001`) has `null` for
+//! `file`, `span` and `label`; every other diagnostic has all three, as in version 1.
+//!
 //! ```json
-//! {"version": 1, "diagnostics": [{
-//!   "code": "E0500", "severity": "error", "title": "a use of a moved value",
+//! {"version": 2, "diagnostics": [{
+//!   "code": "E0500", "severity": "error", "title": "a use of a moved value", "internal": false,
 //!   "message": "...", "file": "main.wrela",
 //!   "span": {"start": 16, "end": 19, "line": 2, "column": 5, "end_line": 2, "end_column": 8},
 //!   "label": "used here after the move",
@@ -22,7 +25,7 @@ use crate::source::{SourceMap, Span};
 use serde_json::{Value, json};
 
 /// The JSON format's version.
-pub const JSON_VERSION: u32 = 1;
+pub const JSON_VERSION: u32 = 2;
 
 fn span_json(map: &SourceMap, span: Span) -> Value {
     let file = map.file(span.file);
@@ -61,14 +64,23 @@ pub fn diagnostic_json(map: &SourceMap, d: &Diagnostic) -> Value {
             })
         })
         .collect();
+    let (file, span, label) = match &d.primary {
+        Some(p) => (
+            Value::from(map.file(p.span.file).name.clone()),
+            span_json(map, p.span),
+            json!(p.message),
+        ),
+        None => (Value::Null, Value::Null, Value::Null),
+    };
     json!({
         "code": d.code.as_str(),
         "severity": d.severity.as_str(),
         "title": d.code.title(),
+        "internal": d.code.is_internal(),
         "message": d.message,
-        "file": map.file(d.primary.span.file).name,
-        "span": span_json(map, d.primary.span),
-        "label": d.primary.message,
+        "file": file,
+        "span": span,
+        "label": label,
         "labels": labels,
         "notes": d.notes,
         "help": d.help,
@@ -105,11 +117,22 @@ mod tests {
             "x",
         );
         let v = to_json(&map, &[d]);
-        assert_eq!(v["version"], 1);
+        assert_eq!(v["version"], JSON_VERSION);
         let d = &v["diagnostics"][0];
         assert_eq!(d["code"], "E0200");
         assert_eq!(d["span"]["line"], 2);
         assert_eq!(d["span"]["column"], 1);
         assert_eq!(d["fixes"][0]["edits"][0]["replacement"], "x");
+        assert_eq!(d["internal"], false);
+    }
+
+    #[test]
+    fn internal_errors_have_no_place() {
+        let map = SourceMap::new();
+        let v = to_json(&map, &[Diagnostic::internal("a value without a slot")]);
+        let d = &v["diagnostics"][0];
+        assert_eq!(d["code"], "I0001");
+        assert_eq!(d["internal"], true);
+        assert!(d["span"].is_null() && d["file"].is_null());
     }
 }

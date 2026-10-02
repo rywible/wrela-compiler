@@ -5,6 +5,7 @@
       "file": "main.wrela",
       "fixes": [],
       "help": [],
+      "internal": false,
       "label": null,
       "labels": [
         {
@@ -34,5 +35,5 @@
       "title": "a private field"
     }
   ],
-  "version": 1
+  "version": 2
 }

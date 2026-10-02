@@ -17,6 +17,7 @@
         }
       ],
       "help": [],
+      "internal": false,
       "label": null,
       "labels": [],
       "message": "`Grazer` has no field `sped`",
@@ -33,5 +34,5 @@
       "title": "an unknown field"
     }
   ],
-  "version": 1
+  "version": 2
 }

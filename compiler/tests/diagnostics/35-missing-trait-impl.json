@@ -5,6 +5,7 @@
       "file": "main.wrela",
       "fixes": [],
       "help": [],
+      "internal": false,
       "label": null,
       "labels": [],
       "message": "`Rock` doesn't implement `Surface`, which `impl Surface` in `depth` needs",
@@ -21,5 +22,5 @@
       "title": "a type that doesn't implement a trait"
     }
   ],
-  "version": 1
+  "version": 2
 }

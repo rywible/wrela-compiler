@@ -19,6 +19,7 @@
       "help": [
         "compare it, as in `x != 0`"
       ],
+      "internal": false,
       "label": null,
       "labels": [],
       "message": "a condition must be `bool`, not `u32`",
@@ -35,5 +36,5 @@
       "title": "a condition that isn't `bool`"
     }
   ],
-  "version": 1
+  "version": 2
 }

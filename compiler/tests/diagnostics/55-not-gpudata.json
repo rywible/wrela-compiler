@@ -17,6 +17,7 @@
         }
       ],
       "help": [],
+      "internal": false,
       "label": null,
       "labels": [],
       "message": "`p` is a `Params`, which isn't `GpuData`, so it can't go to the GPU",
@@ -35,5 +36,5 @@
       "title": "data crossing to the GPU that isn't `GpuData`"
     }
   ],
-  "version": 1
+  "version": 2
 }

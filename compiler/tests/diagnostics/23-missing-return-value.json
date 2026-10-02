@@ -7,6 +7,7 @@
       "help": [
         "end the body with an expression of that type, or `return` one"
       ],
+      "internal": false,
       "label": null,
       "labels": [
         {
@@ -36,5 +37,5 @@
       "title": "a missing return value"
     }
   ],
-  "version": 1
+  "version": 2
 }

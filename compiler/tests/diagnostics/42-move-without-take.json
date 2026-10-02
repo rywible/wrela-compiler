@@ -17,6 +17,7 @@
         }
       ],
       "help": [],
+      "internal": false,
       "label": null,
       "labels": [],
       "message": "moving `log` out of a named place is written `take log`",
@@ -35,5 +36,5 @@
       "title": "a move out of a named place without `take`"
     }
   ],
-  "version": 1
+  "version": 2
 }

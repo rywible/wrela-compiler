@@ -6,14 +6,14 @@
 use super::*;
 use std::collections::HashMap;
 
-fn dims(m: &Module, t: TypeId) -> Result<u8, String> {
+fn dims(m: &Module, t: TypeId) -> Result<u8> {
     match m.types.get(t) {
         TypeDef::Scalar(Scalar::F32) => Ok(1),
         TypeDef::Vector(n) => Ok(*n),
-        _ => Err(format!(
+        _ => Err(Error::not_derivable(format!(
             "a gradient needs an `f32` or a float vector, not `{}`",
             m.types.display(t)
-        )),
+        ))),
     }
 }
 
@@ -22,13 +22,13 @@ pub(super) fn value_and_gradient(
     cache: &mut DeriveCache,
     f: FuncId,
     ncap: u32,
-) -> Result<FuncId, String> {
+) -> Result<FuncId> {
     let func = m.functions[f.index()].clone();
     let xi = ncap as usize;
-    let x_ty = func.params.get(xi).ok_or("internal: no input parameter")?.ty;
+    let x_ty = func.params.get(xi).ok_or_else(|| Error::internal("no input parameter"))?.ty;
     let n = dims(m, x_ty)?;
     if func.ret != Some(m.types.f32()) {
-        return Err("a gradient needs a function that returns an `f32`".into());
+        return Err(Error::not_derivable("a gradient needs a function that returns an `f32`"));
     }
     let mut mask = vec![false; func.params.len()];
     mask[xi] = true;
@@ -55,22 +55,33 @@ pub(super) fn value_and_gradient(
             args.push(Arg::Value(v));
         }
     }
-    // Seeds: the unit vectors along each component of x.
+    // Seeds: the unit vectors along each component of x, passed the way `x` is (a tangent
+    // parameter is passed like its original).
+    let x_by_ref = func.params[xi].by_ref;
     for k in 0..n {
         let one = g.new_value(f32);
         body.push(Stmt::Let(one, Expr::Const(Const::F32(1.0))));
-        if n == 1 {
-            args.push(Arg::Value(one));
-            continue;
+        let seed = if n == 1 {
+            one
+        } else {
+            let zero = g.new_value(f32);
+            body.push(Stmt::Let(zero, Expr::Const(Const::F32(0.0))));
+            let comps = (0..n).map(|c| if c == k { one } else { zero }).collect();
+            let e = g.new_value(x_ty);
+            body.push(Stmt::Let(e, Expr::Construct(x_ty, comps)));
+            e
+        };
+        if x_by_ref {
+            let l = g.new_local(format!("seed{k}"), x_ty);
+            body.push(Stmt::Store(Place::local(l), seed));
+            args.push(Arg::Place(Place::local(l)));
+        } else {
+            args.push(Arg::Value(seed));
         }
-        let zero = g.new_value(f32);
-        body.push(Stmt::Let(zero, Expr::Const(Const::F32(0.0))));
-        let comps = (0..n).map(|c| if c == k { one } else { zero }).collect();
-        let e = g.new_value(x_ty);
-        body.push(Stmt::Let(e, Expr::Construct(x_ty, comps)));
-        args.push(Arg::Value(e));
     }
-    let dual_ty = m.functions[d.index()].ret.ok_or("internal: derived function returns nothing")?;
+    let dual_ty = m.functions[d.index()]
+        .ret
+        .ok_or_else(|| Error::internal("derived function returns nothing"))?;
     let r = g.new_value(dual_ty);
     body.push(Stmt::Let(r, Expr::Call(d, args)));
     let (value, parts) = if returns {
@@ -110,7 +121,7 @@ pub(super) fn returns_active(
     cache: &mut DeriveCache,
     f: FuncId,
     mask: Vec<bool>,
-) -> Result<bool, String> {
+) -> Result<bool> {
     if let Some(&r) = cache.ad_returns.get(&(f, mask.clone())) {
         return Ok(r);
     }
@@ -129,13 +140,13 @@ pub(super) fn derive(
     f: FuncId,
     mask: Vec<bool>,
     n: u8,
-) -> Result<FuncId, String> {
+) -> Result<FuncId> {
     if let Some(&d) = cache.ad.get(&(f, mask.clone(), n)) {
         return Ok(d);
     }
     let func = m.functions[f.index()].clone();
     if let Some(why) = has_host_or_ptr(&func.body) {
-        return Err(format!("`{}` {why}", func.name));
+        return Err(Error::not_derivable(format!("`{}` {why}", func.name)));
     }
     let returns = returns_active(m, cache, f, mask.clone())?;
     let act = {
@@ -144,10 +155,10 @@ pub(super) fn derive(
     };
     for (i, p) in func.params.iter().enumerate() {
         if act.params[i] && !mask[i] && p.mutable {
-            return Err(format!(
+            return Err(Error::not_derivable(format!(
                 "`{}` writes a derivative through its `mut` parameter `{}`",
                 func.name, p.name
-            ));
+            )));
         }
     }
     let mut nf = func.clone();
@@ -176,7 +187,7 @@ pub(super) fn derive(
         }
     }
     if returns {
-        let r = func.ret.ok_or("internal")?;
+        let r = func.ret.ok_or_else(|| Error::internal("a missing result type"))?;
         let mut fields = vec![("v".to_string(), r)];
         for k in 0..n {
             fields.push((format!("d{k}"), r));
@@ -339,17 +350,19 @@ impl Ad<'_> {
         x.map(|x| self.bin(out, BinOp::Mul, x, y, ty))
     }
 
-    fn place(&self, p: &Place, k: usize) -> Result<Place, String> {
+    fn place(&self, p: &Place, k: usize) -> Result<Place> {
         let root = match &p.root {
             PlaceRoot::Local(l) => PlaceRoot::Local(
-                *self.tlocal[l.index()].get(k).ok_or("internal: an inactive local's tangent")?,
+                *self.tlocal[l.index()]
+                    .get(k)
+                    .ok_or_else(|| Error::internal("an inactive local's tangent"))?,
             ),
             PlaceRoot::Param(i) => PlaceRoot::Param(
                 *self.tparam[*i as usize]
                     .get(k)
-                    .ok_or("internal: an inactive parameter's tangent")?,
+                    .ok_or_else(|| Error::internal("an inactive parameter's tangent"))?,
             ),
-            _ => return Err("can't differentiate through this place".into()),
+            _ => return Err(Error::not_derivable("can't differentiate through this place")),
         };
         Ok(Place { root, path: p.path.clone() })
     }
@@ -358,7 +371,7 @@ impl Ad<'_> {
         self.emit(out, ty, Expr::Zero(ty))
     }
 
-    fn block(&mut self, b: &Block) -> Result<Block, String> {
+    fn block(&mut self, b: &Block) -> Result<Block> {
         let mut out = Vec::new();
         for s in b {
             self.stmt(s, &mut out)?;
@@ -371,7 +384,7 @@ impl Ad<'_> {
         c(a) == c(b)
     }
 
-    fn stmt(&mut self, s: &Stmt, out: &mut Block) -> Result<(), String> {
+    fn stmt(&mut self, s: &Stmt, out: &mut Block) -> Result<()> {
         // What one statement shares among its directions stays within it.
         self.made.clear();
         self.recips.clear();
@@ -393,7 +406,7 @@ impl Ad<'_> {
         r
     }
 
-    fn stmt_inner(&mut self, s: &Stmt, out: &mut Block) -> Result<(), String> {
+    fn stmt_inner(&mut self, s: &Stmt, out: &mut Block) -> Result<()> {
         match s {
             Stmt::Let(v, Expr::Call(g, args)) => self.call(Some(*v), *g, args, out),
             Stmt::Eval(Expr::Call(g, args)) => self.call(None, *g, args, out),
@@ -411,7 +424,7 @@ impl Ad<'_> {
             Stmt::Store(p, v) => {
                 out.push(s.clone());
                 if place_root_active(&self.act, p) && !matches!(p.root, PlaceRoot::Resource(_)) {
-                    let ty = place_type(self.m, self.f, p);
+                    let ty = place_type(self.m, self.f, p)?;
                     for k in 0..self.n as usize {
                         let tp = self.place(p, k)?;
                         let tv = match self.t(*v, k) {
@@ -436,7 +449,7 @@ impl Ad<'_> {
                 Ok(())
             }
             Stmt::Return(Some(v)) if self.returns => {
-                let r = self.f.ret.ok_or("internal")?;
+                let r = self.f.ret.ok_or_else(|| Error::internal("a missing result type"))?;
                 let mut parts = vec![*v];
                 for k in 0..self.n as usize {
                     let t = match self.t(*v, k) {
@@ -445,7 +458,7 @@ impl Ad<'_> {
                     };
                     parts.push(t);
                 }
-                let dual = self.nf.ret.ok_or("internal")?;
+                let dual = self.nf.ret.ok_or_else(|| Error::internal("a missing result type"))?;
                 let d = self.emit(out, dual, Expr::Construct(dual, parts));
                 out.push(Stmt::Return(Some(d)));
                 Ok(())
@@ -457,13 +470,7 @@ impl Ad<'_> {
         }
     }
 
-    fn call(
-        &mut self,
-        v: Option<ValueId>,
-        g: FuncId,
-        args: &[Arg],
-        out: &mut Block,
-    ) -> Result<(), String> {
+    fn call(&mut self, v: Option<ValueId>, g: FuncId, args: &[Arg], out: &mut Block) -> Result<()> {
         let mask: Vec<bool> = args.iter().map(|a| arg_active(&self.act, a)).collect();
         if !mask.iter().any(|b| *b) {
             out.push(match v {
@@ -495,7 +502,9 @@ impl Ad<'_> {
         }
         match (v, returns) {
             (Some(v), true) => {
-                let dual = self.m.functions[dg.index()].ret.ok_or("internal")?;
+                let dual = self.m.functions[dg.index()]
+                    .ret
+                    .ok_or_else(|| Error::internal("a missing result type"))?;
                 let r = self.emit(out, dual, Expr::Call(dg, new_args));
                 out.push(Stmt::Let(v, Expr::Extract(r, 0)));
                 let ty = self.ty(v);
@@ -518,7 +527,7 @@ impl Ad<'_> {
         e: &Expr,
         k: usize,
         out: &mut Block,
-    ) -> Result<Option<ValueId>, String> {
+    ) -> Result<Option<ValueId>> {
         let ty = self.ty(v);
         if !self.m.types.has_float(ty) {
             return Ok(None);
@@ -635,7 +644,7 @@ impl Ad<'_> {
             }
             Expr::Call(..) => unreachable!("calls are handled in `call`"),
             Expr::Host(..) | Expr::Run(_) | Expr::Addr(_) => {
-                return Err("can't differentiate this".into());
+                return Err(Error::not_derivable("can't differentiate this"));
             }
         })
     }
@@ -649,7 +658,7 @@ impl Ad<'_> {
         k: usize,
         ty: TypeId,
         out: &mut Block,
-    ) -> Result<Option<ValueId>, String> {
+    ) -> Result<Option<ValueId>> {
         use Builtin as B;
         let d: Vec<Option<ValueId>> = args.iter().map(|a| self.t(*a, k)).collect();
         let a0 = args[0];
@@ -658,7 +667,9 @@ impl Ad<'_> {
         Ok(match b {
             B::Floor | B::Ceil | B::Round | B::Trunc | B::Sign | B::Step | B::AllEqual => None,
             B::Dpdx | B::Dpdy | B::Fwidth => {
-                return Err("derivatives of screen-space derivatives aren't supported".into());
+                return Err(Error::not_derivable(
+                    "derivatives of screen-space derivatives aren't supported",
+                ));
             }
             B::Fract => d[0].map(|x| self.coerce(out, x, ty)),
             B::Sqrt => d[0].map(|da| {

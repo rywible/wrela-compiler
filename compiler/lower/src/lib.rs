@@ -138,6 +138,11 @@ pub fn lower(checked: &Checked, roots: &Roots) -> (Lowered, Vec<Diagnostic>) {
     cx.drain(&mut cpu);
     rewrite_cpu_math(&mut cx, &mut cpu);
     cx.drain(&mut cpu);
+    if !cx.diags.iter().any(|d| d.is_error())
+        && let Err(e) = ir::verify(&cpu.m)
+    {
+        cx.err(Diagnostic::internal(format!("the CPU module's IR is malformed: {e}")));
+    }
     // Pipelines: those CPU code records, then the standalone GPU checks.
     let mut pipelines = Vec::new();
     let mut i = 0;

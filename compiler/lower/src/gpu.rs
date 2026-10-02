@@ -375,11 +375,7 @@ pub(crate) fn intrinsic(
         }
         _ => {
             let name = fl.cx.checked.program.func(func).name.clone();
-            fl.cx.err(Diagnostic::new(
-                codes::E0702,
-                span,
-                format!("internal: the intrinsic `{name}` has no lowering"),
-            ));
+            fl.cx.err(Diagnostic::internal(format!("the intrinsic `{name}` has no lowering")));
             None
         }
     }
@@ -980,11 +976,7 @@ fn verify(cx: &mut Cx, mb: &mut ModuleBuilder, name: &str) -> Option<()> {
         .and_then(|()| ir::opt::flatten_gpu(&mut mb.m))
         .and_then(|()| ir::verify(&mb.m))
     {
-        cx.err(Diagnostic::new(
-            codes::E0702,
-            Span::new(wrela_diag::FileId(0), 0, 0),
-            format!("internal: the IR for `{name}` is malformed: {e}"),
-        ));
+        cx.err(Diagnostic::internal(format!("the IR for `{name}` is malformed: {e}")));
         return None;
     }
     Some(())
@@ -1102,12 +1094,7 @@ fn derived_call(
     let callee = fl.cx.instance(fl.mb, key, Some((fl.id, c.span)));
     let mut args: Vec<ir::Arg> = Vec::new();
     for s in &srcs {
-        args.push(if s.by_ref {
-            ir::Arg::Place(s.place.clone())
-        } else {
-            let ty = fl.place_ty(&s.place);
-            ir::Arg::Value(fl.load(s.place.clone(), ty))
-        });
+        args.push(fl.capture_arg(s)?);
     }
     let x = fl.arg_value(&c.args[1])?;
     args.push(ir::Arg::Value(x));
@@ -1213,29 +1200,45 @@ pub(crate) fn lower_derived(
                     box_ty,
                     interval_ty,
                 ),
-                _ => Err("internal: an interval's signature".into()),
+                _ => Err(ir::Error::internal("an interval's signature has no box or no result")),
             }
         }
     };
     match result {
         Ok(derived) => {
-            // The instance forwards to the derived function.
+            // The instance forwards to the derived function, passing each argument the way
+            // the derived function takes it (which follows the source function's parameters:
+            // a borrowed aggregate by reference on the CPU).
+            let takes: Vec<bool> =
+                mb.m.functions[derived.index()].params.iter().map(|p| p.by_ref).collect();
             let f = &mut mb.m.functions[id.index()];
             let ret = f.ret;
             let nparams = f.params.len();
             let mut args = Vec::new();
-            for i in 0..nparams {
+            for (i, &by_ref) in takes.iter().enumerate().take(nparams) {
                 let p = f.params[i].clone();
-                if p.by_ref {
-                    args.push(ir::Arg::Place(ir::Place {
-                        root: ir::PlaceRoot::Param(i as u32),
-                        path: Vec::new(),
-                    }));
-                } else {
-                    let v = f.new_value(p.ty);
-                    f.body.push(ir::Stmt::Let(v, ir::Expr::Param(i as u32)));
-                    args.push(ir::Arg::Value(v));
-                }
+                let own = ir::Place { root: ir::PlaceRoot::Param(i as u32), path: Vec::new() };
+                let arg = match (p.by_ref, by_ref) {
+                    (true, true) => ir::Arg::Place(own),
+                    (false, false) => {
+                        let v = f.new_value(p.ty);
+                        f.body.push(ir::Stmt::Let(v, ir::Expr::Param(i as u32)));
+                        ir::Arg::Value(v)
+                    }
+                    (false, true) => {
+                        let v = f.new_value(p.ty);
+                        f.body.push(ir::Stmt::Let(v, ir::Expr::Param(i as u32)));
+                        let l = f.new_local(&p.name, p.ty);
+                        f.body.push(ir::Stmt::Store(ir::Place::local(l), v));
+                        ir::Arg::Place(ir::Place::local(l))
+                    }
+                    (true, false) => {
+                        let v = f.new_value(p.ty);
+                        f.body.push(ir::Stmt::Let(v, ir::Expr::Load(own)));
+                        ir::Arg::Value(v)
+                    }
+                };
+                args.push(arg);
             }
             match ret {
                 Some(t) => {
@@ -1247,8 +1250,20 @@ pub(crate) fn lower_derived(
             }
         }
         Err(e) => {
-            let span = mb.callers.get(&id).map_or(Span::new(wrela_diag::FileId(0), 0, 0), |c| c.1);
-            let code = if e.contains("loop") { codes::E0701 } else { codes::E0700 };
+            // Reported where the interpretation is asked for: the `gradient(..)` or
+            // `interval(..)` call that made this instance.
+            let Some(&(_, span)) = mb.callers.get(&id) else {
+                cx.err(Diagnostic::internal(format!("a derived function with no caller: {e}")));
+                return;
+            };
+            let code = match &e {
+                ir::Error::NotDerivable(_) => codes::E0700,
+                ir::Error::ActiveLoopExit(_) => codes::E0701,
+                ir::Error::Internal(m) => {
+                    cx.err(Diagnostic::internal(format!("deriving a function failed: {m}")));
+                    return;
+                }
+            };
             cx.err(Diagnostic::new(code, span, format!("can't derive this function: {e}")));
         }
     }

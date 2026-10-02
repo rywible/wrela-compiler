@@ -5,6 +5,7 @@
       "file": "main.wrela",
       "fixes": [],
       "help": [],
+      "internal": false,
       "label": null,
       "labels": [
         {
@@ -34,5 +35,5 @@
       "title": "an impl method whose signature differs from the trait's"
     }
   ],
-  "version": 1
+  "version": 2
 }

@@ -7,6 +7,7 @@
       "help": [
         "both sides must have the same integer type; convert one, as in `u32(x)`"
       ],
+      "internal": false,
       "label": null,
       "labels": [],
       "message": "`+` doesn't apply to `i32` and `u32`",
@@ -23,5 +24,5 @@
       "title": "an operator that doesn't apply to these types"
     }
   ],
-  "version": 1
+  "version": 2
 }

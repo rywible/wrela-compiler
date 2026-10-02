@@ -17,6 +17,7 @@
         }
       ],
       "help": [],
+      "internal": false,
       "label": null,
       "labels": [],
       "message": "`else` must be on the same line as the `}` before it",
@@ -35,5 +36,5 @@
       "title": "`else` on a new line"
     }
   ],
-  "version": 1
+  "version": 2
 }

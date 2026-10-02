@@ -19,6 +19,7 @@
       "help": [
         "opt in where `Log` is declared: `struct Log: Clone { ... }`"
       ],
+      "internal": false,
       "label": null,
       "labels": [],
       "message": "`Log` doesn't implement `Clone`, which `.clone()` needs",
@@ -37,5 +38,5 @@
       "title": "a `.clone()` of a type that isn't `Clone`"
     }
   ],
-  "version": 1
+  "version": 2
 }

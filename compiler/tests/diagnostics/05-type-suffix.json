@@ -19,6 +19,7 @@
       "help": [
         "a literal takes its type from context; write `2.5`, or convert with `f32(2.5)`"
       ],
+      "internal": false,
       "label": null,
       "labels": [],
       "message": "number literals have no type suffixes, so `2.5f32` isn't valid",
@@ -35,5 +36,5 @@
       "title": "a number with a type suffix"
     }
   ],
-  "version": 1
+  "version": 2
 }

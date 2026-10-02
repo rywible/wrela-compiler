@@ -4,7 +4,7 @@ use super::{Fe, R, konst, mem};
 use crate::{Helpers, globals, memory};
 use wasm_encoder::{BlockType, Function, Instruction as I, ValType};
 use wrela_ir as ir;
-use wrela_ir::layout::{array_stride, layout, round_up};
+use wrela_ir::layout::{column_stride, layout, round_up};
 
 // ---- scalar arithmetic ---------------------------------------------------------------------------
 
@@ -379,7 +379,7 @@ fn comp(fe: &mut Fe, x: ir::ValueId, c: u32) -> u32 {
 
 /// Loads element (column `j`, row `i`) of matrix value `m` of size `n` into a new local.
 fn mat_elem(fe: &mut Fe, m: ir::ValueId, n: u8, j: u32, i: u32) -> u32 {
-    let stride = array_stride(&fe.m.types, fe.vector_ty(n));
+    let stride = column_stride(n);
     let l = fe.new_local(ValType::F32);
     fe.ins.extend([I::LocalGet(fe.v(m)), I::F32Load(mem(stride * j + 4 * i, 2)), I::LocalSet(l)]);
     l
@@ -452,7 +452,7 @@ pub(super) fn binary(
         }
         // matrix × matrix: column j of the result is a × b[j].
         (Some((true, n)), Some((true, _)), _) if op == ir::BinOp::Mul => {
-            let stride = array_stride(&fe.m.types, fe.vector_ty(n));
+            let stride = column_stride(n);
             for j in 0..n as u32 {
                 for i in 0..n as u32 {
                     let acc = fe.new_local(ValType::F32);
@@ -479,7 +479,7 @@ pub(super) fn binary(
         }
         // Elementwise: vector op vector/scalar, matrix ± matrix, matrix × scalar.
         (_, _, Some((is_mat, n))) => {
-            let stride = if is_mat { array_stride(&fe.m.types, fe.vector_ty(n)) } else { 0 };
+            let stride = if is_mat { column_stride(n) } else { 0 };
             let cols = if is_mat { n as u32 } else { 1 };
             for j in 0..cols {
                 for i in 0..n as u32 {
@@ -523,7 +523,7 @@ pub(super) fn unary(fe: &mut Fe, v: ir::ValueId, op: ir::UnOp, x: ir::ValueId) -
     let t = fe.vty(x);
     if let Some((is_mat, n)) = dims(fe, t) {
         let out = fe.fresh_slot(v)?;
-        let stride = if is_mat { array_stride(&fe.m.types, fe.vector_ty(n)) } else { 0 };
+        let stride = if is_mat { column_stride(n) } else { 0 };
         for j in 0..if is_mat { n as u32 } else { 1 } {
             for i in 0..n as u32 {
                 let off = stride * j + 4 * i;

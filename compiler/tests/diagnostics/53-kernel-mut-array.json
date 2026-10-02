@@ -7,6 +7,7 @@
       "help": [
         "take a `mut Slots<T>`: each invocation writes only its own slot"
       ],
+      "internal": false,
       "label": null,
       "labels": [],
       "message": "every invocation of a `@compute` kernel would hold `mut out` at once, so it can't be a plain `mut` parameter",
@@ -25,5 +26,5 @@
       "title": "a kernel `mut` parameter that isn't safe to share across invocations"
     }
   ],
-  "version": 1
+  "version": 2
 }

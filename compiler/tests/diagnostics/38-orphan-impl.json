@@ -7,6 +7,7 @@
       "help": [
         "wrap the type in a struct of your own, or define your own trait"
       ],
+      "internal": false,
       "label": null,
       "labels": [],
       "message": "this package can't implement std's `Surface` for std's `vec3`",
@@ -25,5 +26,5 @@
       "title": "an impl outside the trait's or the type's module tree (orphan rule)"
     }
   ],
-  "version": 1
+  "version": 2
 }

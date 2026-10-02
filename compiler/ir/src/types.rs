@@ -107,6 +107,11 @@ impl Types {
         &self.defs[t.index()]
     }
 
+    /// The type `d`, if it's been interned.
+    pub fn lookup(&self, d: &TypeDef) -> Option<TypeId> {
+        self.map.get(d).copied()
+    }
+
     pub fn len(&self) -> usize {
         self.defs.len()
     }

@@ -7,6 +7,7 @@
       "help": [
         "pass only the parts that don't overlap `w.speed`"
       ],
+      "internal": false,
       "label": null,
       "labels": [
         {
@@ -38,5 +39,5 @@
       "title": "an access that overlaps a live `mut` access"
     }
   ],
-  "version": 1
+  "version": 2
 }

@@ -19,6 +19,7 @@
       "help": [
         "in tier 0, write the number in the unit your code works in"
       ],
+      "internal": false,
       "label": null,
       "labels": [],
       "message": "`2m` has a unit, and units are tier 1",
@@ -35,5 +36,5 @@
       "title": "units are tier 1"
     }
   ],
-  "version": 1
+  "version": 2
 }

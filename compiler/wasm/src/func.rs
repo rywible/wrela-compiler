@@ -3,7 +3,7 @@
 use crate::{Helpers, globals, memory, repr, signature, valtype};
 use wasm_encoder::{BlockType, Function, Instruction as I, MemArg, ValType};
 use wrela_ir as ir;
-use wrela_ir::layout::{array_stride, field_offsets, layout, round_up};
+use wrela_ir::layout::{array_stride, column_stride, field_offsets, layout, round_up};
 
 type R<T> = Result<T, String>;
 
@@ -359,16 +359,19 @@ impl<'m> Fe<'m> {
                 if *c != 0 {
                     self.ins.extend([I::I32Const(4 * *c as i32), I::I32Add]);
                 }
-                Ok(self.m.types.as_scalar(t).map_or_else(|| self.f32_ty(), |_| t))
+                match self.m.types.as_scalar(t) {
+                    Some(_) => Ok(t),
+                    None => self.f32_ty(),
+                }
             }
             (ir::TypeDef::Vector(n), ir::Proj::Index(i)) => {
                 self.bounds_check(*i, n as u32);
                 self.ins.extend([I::LocalGet(self.v(*i)), I::I32Const(4), I::I32Mul, I::I32Add]);
-                Ok(self.f32_ty())
+                self.f32_ty()
             }
             (ir::TypeDef::Matrix(n), ir::Proj::Index(i)) => {
-                let col = self.vector_ty(n);
-                let stride = array_stride(&self.m.types, col);
+                let col = self.vector_ty(n)?;
+                let stride = column_stride(n);
                 self.bounds_check(*i, n as u32);
                 self.ins.extend([
                     I::LocalGet(self.v(*i)),
@@ -420,16 +423,17 @@ impl<'m> Fe<'m> {
         self.trap_if();
     }
 
-    fn f32_ty(&self) -> ir::TypeId {
+    fn f32_ty(&self) -> R<ir::TypeId> {
         self.find_type(&ir::TypeDef::Scalar(ir::Scalar::F32))
     }
 
-    fn vector_ty(&self, n: u8) -> ir::TypeId {
+    fn vector_ty(&self, n: u8) -> R<ir::TypeId> {
         self.find_type(&ir::TypeDef::Vector(n))
     }
 
-    fn find_type(&self, d: &ir::TypeDef) -> ir::TypeId {
-        self.m.types.iter().find(|(_, x)| *x == d).map_or(ir::TypeId(0), |(t, _)| t)
+    /// A type the module must already have (a vector's component, a matrix's column).
+    fn find_type(&self, d: &ir::TypeDef) -> R<ir::TypeId> {
+        self.m.types.lookup(d).ok_or_else(|| format!("internal: the type {d:?} isn't interned"))
     }
 
     fn load_place(&mut self, p: &ir::Place, dst: ir::ValueId) -> R<()> {
@@ -605,17 +609,17 @@ impl<'m> Fe<'m> {
             ir::Expr::Call(f, args) => {
                 let callee = &self.m.functions[f.index()];
                 // A callee that returns a value through a pointer still needs somewhere to put it.
-                if callee.ret.is_some_and(|t| !callee.ret_ref && self.m.types.is_aggregate(t)) {
-                    let t = callee.ret.unwrap_or(ir::TypeId(0));
+                let aggregate = callee.ret.is_some_and(|t| self.m.types.is_aggregate(t));
+                if let Some(t) = callee.ret
+                    && !callee.ret_ref
+                    && aggregate
+                {
                     let off = self.slot(t);
                     self.ins.extend([I::LocalGet(self.fp), I::I32Const(off as i32), I::I32Add]);
                 }
                 self.call_args(*f, args)?;
                 self.ins.push(I::Call(self.fn_indices[f.index()]));
-                if callee.ret.is_some()
-                    && (callee.ret_ref
-                        || !self.m.types.is_aggregate(callee.ret.unwrap_or(ir::TypeId(0))))
-                {
+                if callee.ret.is_some() && (callee.ret_ref || !aggregate) {
                     self.ins.push(I::Drop);
                 }
                 Ok(())
@@ -785,25 +789,7 @@ impl<'m> Fe<'m> {
     }
 
     fn place_ty(&mut self, p: &ir::Place) -> R<ir::TypeId> {
-        let mut t = match &p.root {
-            ir::PlaceRoot::Local(l) => self.f.locals[l.index()].ty,
-            ir::PlaceRoot::Param(i) => self.f.params[*i as usize].ty,
-            ir::PlaceRoot::Ptr(v) => match self.ty(self.vty(*v)) {
-                ir::TypeDef::Ptr(t) => *t,
-                _ => return Err("internal: pointer place".into()),
-            },
-            ir::PlaceRoot::Resource(_) => return Err("internal: resource".into()),
-        };
-        for proj in &p.path {
-            t = match (self.ty(t), proj) {
-                (ir::TypeDef::Struct { fields, .. }, ir::Proj::Field(k)) => fields[*k as usize].1,
-                (ir::TypeDef::Vector(_), _) => self.f32_ty(),
-                (ir::TypeDef::Matrix(n), _) => self.vector_ty(*n),
-                (ir::TypeDef::Array(e, _) | ir::TypeDef::Run(e), _) => *e,
-                _ => return Err("internal: bad projection".into()),
-            };
-        }
-        Ok(t)
+        self.m.place_ty(self.f, p).ok_or_else(|| format!("internal: a place with no type: {p:?}"))
     }
 
     fn construct(&mut self, v: ir::ValueId, t: ir::TypeId, parts: &[ir::ValueId]) -> R<()> {
@@ -821,7 +807,7 @@ impl<'m> Fe<'m> {
                 }
             }
             ir::TypeDef::Matrix(n) => {
-                let stride = array_stride(&self.m.types, self.vector_ty(n));
+                let stride = column_stride(n);
                 for (k, &p) in parts.iter().enumerate() {
                     self.store_at(a, stride * k as u32, p)?;
                 }
@@ -843,13 +829,13 @@ impl<'m> Fe<'m> {
             ir::TypeDef::Struct { fields, .. } => {
                 (field_offsets(&self.m.types, xt)[i as usize], fields[i as usize].1)
             }
-            ir::TypeDef::Vector(_) => (4 * i, self.f32_ty()),
+            ir::TypeDef::Vector(_) => (4 * i, self.f32_ty()?),
             ir::TypeDef::Matrix(n) => {
-                let col = self.vector_ty(n);
-                (array_stride(&self.m.types, col) * i, col)
+                let col = self.vector_ty(n)?;
+                (column_stride(n) * i, col)
             }
             ir::TypeDef::Array(e, _) => (array_stride(&self.m.types, e) * i, e),
-            ir::TypeDef::Run(_) => (4 * i, self.find_type(&ir::TypeDef::Scalar(ir::Scalar::U32))),
+            ir::TypeDef::Run(_) => (4 * i, self.find_type(&ir::TypeDef::Scalar(ir::Scalar::U32))?),
             d => return Err(format!("internal: extract from {d:?}")),
         };
         self.ins.push(I::LocalGet(self.v(x)));

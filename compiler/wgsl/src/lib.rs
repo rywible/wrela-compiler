@@ -644,7 +644,7 @@ impl<'a, 'm> Fb<'a, 'm> {
             _ => 0,
         };
         let single = map.len() == 1
-            && !matches!(self.cx.m.types.get(self.f.ret.unwrap_or(ir::TypeId(0))), ir::TypeDef::Struct { fields, .. } if fields.len() > 1);
+            && !self.f.ret.is_some_and(|r| matches!(self.cx.m.types.get(r), ir::TypeDef::Struct { fields, .. } if fields.len() > 1));
         for (i, is_flat) in map {
             let field = self.expr(Expression::AccessIndex { base: h, index: i }, out);
             let v = if i == position && !single {

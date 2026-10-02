@@ -207,11 +207,9 @@ impl<'a> Cx<'a> {
             | TyKind::Error => None,
             TyKind::Param(_) | TyKind::Projection { .. } | TyKind::Var(_) => {
                 let shown = self.checked.program.display_ty(t);
-                self.err(Diagnostic::new(
-                    codes::E0702,
-                    span,
-                    format!("internal: a type that should be concrete reached lowering: `{shown}`"),
-                ));
+                self.err(Diagnostic::internal(format!(
+                    "a type that should be concrete reached lowering: `{shown}`"
+                )));
                 None
             }
         };

@@ -19,6 +19,7 @@
       "help": [
         "move it with `take l`, or copy it with `l.clone()`"
       ],
+      "internal": false,
       "label": null,
       "labels": [],
       "message": "`var` owns its value, so it can't share `l`",
@@ -35,5 +36,5 @@
       "title": "`var` binding of a named place without `take` or `.clone()`"
     }
   ],
-  "version": 1
+  "version": 2
 }

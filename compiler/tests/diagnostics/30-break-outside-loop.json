@@ -5,6 +5,7 @@
       "file": "main.wrela",
       "fixes": [],
       "help": [],
+      "internal": false,
       "label": null,
       "labels": [],
       "message": "`break` outside a loop",
@@ -21,5 +22,5 @@
       "title": "`break` or `continue` outside a loop"
     }
   ],
-  "version": 1
+  "version": 2
 }

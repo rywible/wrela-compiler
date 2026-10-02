@@ -17,6 +17,7 @@
         }
       ],
       "help": [],
+      "internal": false,
       "label": null,
       "labels": [],
       "message": "`x` isn't a `mut` parameter, so it can't take `mut ...`",
@@ -33,5 +34,5 @@
       "title": "a `mut` marker where the parameter isn't `mut`"
     }
   ],
-  "version": 1
+  "version": 2
 }

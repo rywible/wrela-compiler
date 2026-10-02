@@ -15,8 +15,9 @@ fn warnings(name: &str, text: &str) -> Vec<(String, usize)> {
         .iter()
         .filter(|d| !d.is_error())
         .map(|d| {
-            let f = out.sources.file(d.primary.span.file);
-            (d.code.to_string(), f.line_index(d.primary.span.start) + 1)
+            let span = d.span().expect("warnings have spans");
+            let f = out.sources.file(span.file);
+            (d.code.to_string(), f.line_index(span.start) + 1)
         })
         .collect()
 }

@@ -17,6 +17,7 @@
         }
       ],
       "help": [],
+      "internal": false,
       "label": null,
       "labels": [],
       "message": "`Sphere` has no method `distanse`",
@@ -33,5 +34,5 @@
       "title": "an unknown method"
     }
   ],
-  "version": 1
+  "version": 2
 }

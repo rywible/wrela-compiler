@@ -2,7 +2,7 @@
 //! `game.wasm`, one WGSL module per pipeline, `manifest.json`, and the standard browser
 //! runtime, pinned to this compiler's version (D-100).
 
-use wrela_diag::{Diagnostic, FileId, Span, codes};
+use wrela_diag::Diagnostic;
 use wrela_lower::{Lowered, PipelineKind};
 
 /// The standard browser runtime, embedded in the compiler so every build ships the version the
@@ -20,10 +20,6 @@ pub struct BuildOutput {
     pub diagnostics: Vec<Diagnostic>,
 }
 
-fn internal(message: String) -> Diagnostic {
-    Diagnostic::new(codes::E0702, Span::new(FileId(0), 0, 0), message)
-}
-
 /// Runs the back ends over a lowered program.
 pub fn emit(l: &Lowered) -> BuildOutput {
     let mut diagnostics = Vec::new();
@@ -31,19 +27,19 @@ pub fn emit(l: &Lowered) -> BuildOutput {
     match wrela_wasm::emit(&l.cpu) {
         Ok(bytes) => {
             if let Err(e) = wrela_wasm::check_no_relaxed_simd(&bytes) {
-                diagnostics.push(internal(format!("internal: {e}")));
+                diagnostics.push(Diagnostic::internal(e.to_string()));
             }
             files.push(("game.wasm".to_string(), bytes));
         }
-        Err(e) => diagnostics.push(internal(format!("internal: the WASM back end failed: {e}"))),
+        Err(e) => diagnostics.push(Diagnostic::internal(format!("the WASM back end failed: {e}"))),
     }
     let mut manifest = wrela_abi::Manifest::new("game.wasm");
     for (i, p) in l.pipelines.iter().enumerate() {
         let shader = format!("pipeline_{i}.wgsl");
         match wrela_wgsl::emit(&p.module) {
             Ok(text) => files.push((shader.clone(), text.into_bytes())),
-            Err(e) => diagnostics.push(internal(format!(
-                "internal: the WGSL back end failed for `{}`: {e}",
+            Err(e) => diagnostics.push(Diagnostic::internal(format!(
+                "the WGSL back end failed for `{}`: {e}",
                 p.name
             ))),
         }
@@ -89,7 +85,7 @@ pub fn emit(l: &Lowered) -> BuildOutput {
         });
     }
     if let Err(e) = manifest.validate() {
-        diagnostics.push(internal(format!("internal: {e}")));
+        diagnostics.push(Diagnostic::internal(e.to_string()));
     }
     files.push(("manifest.json".to_string(), manifest.to_json().into_bytes()));
     for (path, bytes) in RUNTIME_FILES {

@@ -17,6 +17,7 @@
         }
       ],
       "help": [],
+      "internal": false,
       "label": null,
       "labels": [],
       "message": "`area` has no parameter `heigth`",
@@ -33,5 +34,5 @@
       "title": "an unknown named argument"
     }
   ],
-  "version": 1
+  "version": 2
 }

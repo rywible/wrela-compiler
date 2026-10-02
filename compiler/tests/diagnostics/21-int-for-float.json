@@ -25,6 +25,7 @@
       "help": [
         "convert it explicitly: `f32(...)`"
       ],
+      "internal": false,
       "label": null,
       "labels": [],
       "message": "expected `f32`, found `u32`",
@@ -41,5 +42,5 @@
       "title": "mismatched types"
     }
   ],
-  "version": 1
+  "version": 2
 }

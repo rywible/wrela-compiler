@@ -16,10 +16,17 @@ use std::fmt::Write;
 pub fn render(map: &SourceMap, d: &Diagnostic) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "{}[{}]: {}", d.severity.as_str(), d.code, d.message);
-    let file = map.file(d.primary.span.file);
-    let lc = file.line_col(d.primary.span.start);
-    let mut labels: Vec<&Label> = vec![&d.primary];
-    labels.extend(d.secondary.iter().filter(|l| l.span.file == d.primary.span.file));
+    let Some(primary) = &d.primary else {
+        // An internal error: no place in the program to show.
+        for note in &d.notes {
+            let _ = writeln!(out, "  = note: {note}");
+        }
+        return out;
+    };
+    let file = map.file(primary.span.file);
+    let lc = file.line_col(primary.span.start);
+    let mut labels: Vec<&Label> = vec![primary];
+    labels.extend(d.secondary.iter().filter(|l| l.span.file == primary.span.file));
     let width = labels
         .iter()
         .map(|l| (file.line_index(l.span.start) + 1).to_string().len())
@@ -59,7 +66,7 @@ pub fn render(map: &SourceMap, d: &Diagnostic) -> String {
             }
         }
     }
-    for label in d.secondary.iter().filter(|l| l.span.file != d.primary.span.file) {
+    for label in d.secondary.iter().filter(|l| l.span.file != primary.span.file) {
         let other = map.file(label.span.file);
         let lc = other.line_col(label.span.start);
         let msg = label.message.as_deref().unwrap_or("");

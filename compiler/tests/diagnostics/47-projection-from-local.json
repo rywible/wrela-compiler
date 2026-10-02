@@ -7,6 +7,7 @@
       "help": [
         "return an owned value instead: change the return type to `-> T` and return a copy or a new value"
       ],
+      "internal": false,
       "label": null,
       "labels": [],
       "message": "a projection must come from a `borrow` or `mut` parameter, and `w` isn't one",
@@ -25,5 +26,5 @@
       "title": "a projection that doesn't come from a `borrow` or `mut` parameter"
     }
   ],
-  "version": 1
+  "version": 2
 }

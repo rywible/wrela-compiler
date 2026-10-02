@@ -5,6 +5,7 @@
       "file": "main.wrela",
       "fixes": [],
       "help": [],
+      "internal": false,
       "label": null,
       "labels": [],
       "message": "there's no attribute `@inline`",
@@ -23,5 +24,5 @@
       "title": "an unknown attribute"
     }
   ],
-  "version": 1
+  "version": 2
 }
