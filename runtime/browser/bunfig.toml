@@ -1,0 +1,3 @@
+[test]
+# WebGPU's flag namespaces (GPUBufferUsage etc.), which bun doesn't have, for the fake GPU.
+preload = ["./test/setup.ts"]

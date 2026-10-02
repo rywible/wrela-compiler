@@ -1607,6 +1607,9 @@ impl<'c, 'a> Fl<'c, 'a> {
 
     /// A math builtin. On the CPU the transcendentals are std's wrela functions (§11), applied
     /// per component for vectors.
+    /// A math builtin. On the CPU the transcendentals become calls to std's wrela functions
+    /// (§11), but only after derived interpretations are built (`rewrite_cpu_math`), so
+    /// gradients and intervals see the functions themselves.
     pub fn math(
         &mut self,
         b: ir::Builtin,
@@ -1614,26 +1617,10 @@ impl<'c, 'a> Fl<'c, 'a> {
         ty: ir::TypeId,
         span: Span,
     ) -> Option<ir::ValueId> {
-        use ir::Builtin as I;
-        let lang = match b {
-            I::Sin => Lang::CpuSin,
-            I::Cos => Lang::CpuCos,
-            I::Tan => Lang::CpuTan,
-            I::Asin => Lang::CpuAsin,
-            I::Acos => Lang::CpuAcos,
-            I::Atan => Lang::CpuAtan,
-            I::Atan2 => Lang::CpuAtan2,
-            I::Exp => Lang::CpuExp,
-            I::Exp2 => Lang::CpuExp2,
-            I::Log => Lang::CpuLog,
-            I::Log2 => Lang::CpuLog2,
-            I::Pow => Lang::CpuPow,
-            _ => return Some(self.value(ty, ir::Expr::Builtin(b, args))),
-        };
-        if self.is_gpu() {
-            return Some(self.value(ty, ir::Expr::Builtin(b, args)));
-        }
-        if self.mb.m.types.element_scalar(ty) == Some(ir::Scalar::F64) {
+        if !self.is_gpu()
+            && crate::cpu_math_lang(b).is_some()
+            && self.mb.m.types.element_scalar(ty) == Some(ir::Scalar::F64)
+        {
             self.cx.err(
                 Diagnostic::new(
                     codes::E0702,
@@ -1644,34 +1631,7 @@ impl<'c, 'a> Fl<'c, 'a> {
             );
             return None;
         }
-        let Some(func) = self.cx.lang_fn(lang) else {
-            self.cx.err(Diagnostic::new(
-                codes::E0702,
-                span,
-                "internal: std's math library is missing",
-            ));
-            return None;
-        };
-        let callee =
-            self.cx.instance(self.mb, InstanceKey::plain(func, Vec::new()), Some((self.id, span)));
-        let f32 = self.mb.m.types.f32();
-        match self.mb.m.types.get(ty).clone() {
-            ir::TypeDef::Vector(n) => {
-                let mut comps = Vec::new();
-                for c in 0..n {
-                    let parts: Vec<ir::Arg> = args
-                        .iter()
-                        .map(|&a| ir::Arg::Value(self.value(f32, ir::Expr::Extract(a, c as u32))))
-                        .collect();
-                    comps.push(self.value(f32, ir::Expr::Call(callee, parts)));
-                }
-                Some(self.value(ty, ir::Expr::Construct(ty, comps)))
-            }
-            _ => {
-                let parts = args.into_iter().map(ir::Arg::Value).collect();
-                Some(self.value(ty, ir::Expr::Call(callee, parts)))
-            }
-        }
+        Some(self.value(ty, ir::Expr::Builtin(b, args)))
     }
 }
 

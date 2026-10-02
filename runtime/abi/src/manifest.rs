@@ -93,15 +93,30 @@ impl std::error::Error for ManifestError {}
 
 impl Manifest {
     pub fn new(wasm: impl Into<String>) -> Manifest {
-        Manifest { manifest_version: VERSION, stream_version: crate::stream::VERSION, wasm: wasm.into(), pipelines: Vec::new() }
+        Manifest {
+            manifest_version: VERSION,
+            stream_version: crate::stream::VERSION,
+            wasm: wasm.into(),
+            pipelines: Vec::new(),
+        }
     }
 
     /// Parses and validates a manifest; any other version is rejected.
     pub fn parse(json: &str) -> Result<Manifest, ManifestError> {
-        let v: serde_json::Value = serde_json::from_str(json).map_err(|e| ManifestError(e.to_string()))?;
-        let got = v.get("manifest_version").and_then(|x| x.as_u64());
-        if got != Some(VERSION as u64) {
-            return Err(ManifestError(format!("manifest version {got:?}, but this host reads version {VERSION}")));
+        let v: serde_json::Value =
+            serde_json::from_str(json).map_err(|e| ManifestError(e.to_string()))?;
+        match v.get("manifest_version") {
+            Some(got) if got.as_u64() == Some(VERSION as u64) => {}
+            Some(got) => {
+                return Err(ManifestError(format!(
+                    "manifest version {got}, but this host reads version {VERSION}"
+                )));
+            }
+            None => {
+                return Err(ManifestError(format!(
+                    "no manifest_version; this host reads version {VERSION}"
+                )));
+            }
         }
         let m: Manifest = serde_json::from_value(v).map_err(|e| ManifestError(e.to_string()))?;
         m.validate()?;
@@ -114,7 +129,11 @@ impl Manifest {
             return err(format!("manifest version {}, expected {VERSION}", self.manifest_version));
         }
         if self.stream_version != crate::stream::VERSION {
-            return err(format!("command stream version {}, but this host reads {}", self.stream_version, crate::stream::VERSION));
+            return err(format!(
+                "command stream version {}, but this host reads {}",
+                self.stream_version,
+                crate::stream::VERSION
+            ));
         }
         if self.wasm.is_empty() {
             return err("no WASM file".into());
@@ -126,10 +145,16 @@ impl Manifest {
             let mut bindings: Vec<u32> = p.buffers.iter().map(|b| b.binding).collect();
             if let Some(u) = &p.uniform {
                 if u.size == 0 || u.size % 4 != 0 {
-                    return err(format!("pipeline {i}'s uniform size {} isn't a positive multiple of 4", u.size));
+                    return err(format!(
+                        "pipeline {i}'s uniform size {} isn't a positive multiple of 4",
+                        u.size
+                    ));
                 }
                 if u.space == UniformSpace::Uniform && u.size % 16 != 0 {
-                    return err(format!("pipeline {i}'s uniform block of {} bytes isn't a multiple of 16", u.size));
+                    return err(format!(
+                        "pipeline {i}'s uniform block of {} bytes isn't a multiple of 16",
+                        u.size
+                    ));
                 }
                 bindings.push(u.binding);
             }
@@ -139,9 +164,12 @@ impl Manifest {
             if bindings.len() != n {
                 return err(format!("pipeline {i} uses a binding twice"));
             }
-            let storage = p.buffers.len() + usize::from(p.uniform.as_ref().is_some_and(|u| u.space == UniformSpace::Storage));
+            let storage = p.buffers.len()
+                + usize::from(p.uniform.as_ref().is_some_and(|u| u.space == UniformSpace::Storage));
             if storage > MAX_STORAGE_BUFFERS_PER_STAGE {
-                return err(format!("pipeline {i} has {storage} storage buffers; WebGPU's default limit is {MAX_STORAGE_BUFFERS_PER_STAGE}"));
+                return err(format!(
+                    "pipeline {i} has {storage} storage buffers; WebGPU's default limit is {MAX_STORAGE_BUFFERS_PER_STAGE}"
+                ));
             }
             match &p.stage {
                 Stage::Compute { entry, workgroup_size } => {
@@ -149,10 +177,15 @@ impl Manifest {
                         return err(format!("pipeline {i} has no entry point"));
                     }
                     let total: u64 = workgroup_size.iter().map(|&x| x as u64).product();
-                    let ok = workgroup_size.iter().zip(MAX_WORKGROUP_SIZE).all(|(&s, m)| s >= 1 && s <= m)
+                    let ok = workgroup_size
+                        .iter()
+                        .zip(MAX_WORKGROUP_SIZE)
+                        .all(|(&s, m)| s >= 1 && s <= m)
                         && total <= MAX_WORKGROUP_INVOCATIONS as u64;
                     if !ok {
-                        return err(format!("pipeline {i}'s workgroup size {workgroup_size:?} is outside WebGPU's limits"));
+                        return err(format!(
+                            "pipeline {i}'s workgroup size {workgroup_size:?} is outside WebGPU's limits"
+                        ));
                     }
                 }
                 Stage::Render { vertex_entry, fragment_entry } => {
@@ -262,7 +295,8 @@ mod tests {
         m.pipelines[0].buffers[0].binding = 0;
         assert!(m.validate().is_err());
         let mut m = sample();
-        m.pipelines[0].uniform = Some(UniformBlock { binding: 0, size: 20, space: UniformSpace::Uniform });
+        m.pipelines[0].uniform =
+            Some(UniformBlock { binding: 0, size: 20, space: UniformSpace::Uniform });
         assert!(m.validate().is_err());
     }
 }

@@ -1,0 +1,20 @@
+{
+  "name": "wrela-runtime",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "description": "The standard browser runtime: bootstrap, main-thread shim, render worker, manifest loader and command-stream decoder",
+  "scripts": {
+    "build": "bun scripts/build.ts",
+    "check-dist": "bun scripts/check-dist.ts",
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.worker.json",
+    "size": "bun scripts/size.ts",
+    "stage": "bun scripts/stage.ts",
+    "checks": "bun test && bun run typecheck && bun run check-dist && bun run size"
+  },
+  "devDependencies": {
+    "@types/bun": "1.4.2",
+    "@webgpu/types": "0.1.74",
+    "typescript": "5.9.3"
+  }
+}

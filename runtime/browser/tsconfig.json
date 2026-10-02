@@ -1,0 +1,10 @@
+{
+  "//": "The main thread, the code it shares with the worker, the tests and the build scripts. The worker is checked against the worker's globals by tsconfig.worker.json.",
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "types": ["@webgpu/types", "bun"]
+  },
+  "include": ["src", "test", "scripts"],
+  "exclude": ["src/worker.ts"]
+}

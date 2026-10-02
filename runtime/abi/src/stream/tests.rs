@@ -46,9 +46,20 @@ fn decodes_what_it_encodes() {
         cmds,
         vec![
             Command::CreateBuffer { handle: 1, size: 64 },
-            Command::Dispatch { pipeline: 2, groups: [4, 2, 1], buffers: vec![1, 3], uniforms: &[9, 9, 9, 9] },
+            Command::Dispatch {
+                pipeline: 2,
+                groups: [4, 2, 1],
+                buffers: vec![1, 3],
+                uniforms: &[9, 9, 9, 9]
+            },
             Command::BeginScreenPass { clear: [0.25, 0.5, 0.75, 1.0] },
-            Command::Draw { pipeline: 0, vertices: 3, instances: 2, buffers: vec![1], uniforms: &[] },
+            Command::Draw {
+                pipeline: 0,
+                vertices: 3,
+                instances: 2,
+                buffers: vec![1],
+                uniforms: &[]
+            },
             Command::Present,
         ]
     );
@@ -90,11 +101,25 @@ fn rejects_malformed_batches() {
 #[test]
 fn sequencing_rules() {
     let mut s = Sequencer::new();
-    assert!(s.step(&Command::Draw { pipeline: 0, vertices: 3, instances: 1, buffers: vec![], uniforms: &[] }).is_err());
+    assert!(
+        s.step(&Command::Draw {
+            pipeline: 0,
+            vertices: 3,
+            instances: 1,
+            buffers: vec![],
+            uniforms: &[]
+        })
+        .is_err()
+    );
     assert!(s.step(&Command::Present).is_err());
     s.step(&Command::BeginScreenPass { clear: [0.0; 4] }).expect("open");
     assert!(s.step(&Command::BeginScreenPass { clear: [0.0; 4] }).is_err());
-    assert!(s.step(&Command::Dispatch { pipeline: 0, groups: [1; 3], buffers: vec![], uniforms: &[] }).is_err());
+    assert!(
+        s.step(&Command::Dispatch { pipeline: 0, groups: [1; 3], buffers: vec![], uniforms: &[] })
+            .is_err()
+    );
     assert!(s.step(&Command::CreateBuffer { handle: 0, size: 4 }).is_err());
+    assert_eq!(s.end_frame(), Err(StreamError::UnclosedPass));
     s.step(&Command::Present).expect("close");
+    s.end_frame().expect("closed");
 }

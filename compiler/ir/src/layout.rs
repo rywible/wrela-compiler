@@ -94,7 +94,9 @@ pub fn uniform_compatible(types: &Types, t: TypeId) -> bool {
     match types.get(t) {
         TypeDef::Scalar(s) => s.on_gpu() && *s != Scalar::Bool,
         TypeDef::Vector(_) | TypeDef::Matrix(_) => true,
-        TypeDef::Array(e, _) => array_stride(types, *e).is_multiple_of(16) && uniform_compatible(types, *e),
+        TypeDef::Array(e, _) => {
+            array_stride(types, *e).is_multiple_of(16) && uniform_compatible(types, *e)
+        }
         TypeDef::Struct { fields, .. } => {
             let offsets = field_offsets(types, t);
             for (i, (_, f)) in fields.iter().enumerate() {

@@ -33,7 +33,9 @@
 //! - **Order:** commands take effect in the order they're recorded. A host that batches GPU
 //!   work must flush recorded dispatches before applying a later `WriteBuffer`.
 //! - **Frames:** `BeginScreenPass`, then any number of `Draw`s, then `Present`. Draws happen
-//!   only inside a screen pass; dispatches, buffer creation and writes only outside one.
+//!   only inside a screen pass; dispatches, buffer creation and writes only outside one. A
+//!   screen pass closes in the same call of `frame` that opened it (a browser's canvas texture
+//!   lives only until the frame's task ends): [`Sequencer::end_frame`].
 //!
 //! Malformed input is an error in every host, never undefined behaviour: [`decode`] and
 //! [`Sequencer`] say what's wrong.
@@ -113,29 +115,63 @@ impl Command<'_> {
 /// What's wrong with a batch.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StreamError {
-    TooShort { needed: usize, got: usize },
+    TooShort {
+        needed: usize,
+        got: usize,
+    },
     BadMagic([u8; 4]),
-    WrongVersion { expected: u32, got: u32 },
-    BodyLength { declared: usize, actual: usize },
-    UnknownOpcode { opcode: u32, at: usize },
-    BadPayload { opcode: Opcode, at: usize, why: String },
-    Sequence { opcode: Opcode, why: String },
+    WrongVersion {
+        expected: u32,
+        got: u32,
+    },
+    BodyLength {
+        declared: usize,
+        actual: usize,
+    },
+    UnknownOpcode {
+        opcode: u32,
+        at: usize,
+    },
+    BadPayload {
+        opcode: Opcode,
+        at: usize,
+        why: String,
+    },
+    Sequence {
+        opcode: Opcode,
+        why: String,
+    },
+    /// `frame` returned with a screen pass still open.
+    UnclosedPass,
 }
 
 impl fmt::Display for StreamError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            StreamError::TooShort { needed, got } => write!(f, "batch too short: needs {needed} bytes, has {got}"),
-            StreamError::BadMagic(m) => write!(f, "not a command batch: magic is {m:?}, not `WRCS`"),
+            StreamError::TooShort { needed, got } => {
+                write!(f, "batch too short: needs {needed} bytes, has {got}")
+            }
+            StreamError::BadMagic(m) => {
+                write!(f, "not a command batch: magic is {m:?}, not `WRCS`")
+            }
             StreamError::WrongVersion { expected, got } => {
                 write!(f, "command stream version {got}, but this host reads version {expected}")
             }
             StreamError::BodyLength { declared, actual } => {
                 write!(f, "batch declares {declared} bytes of commands but has {actual}")
             }
-            StreamError::UnknownOpcode { opcode, at } => write!(f, "unknown opcode {opcode} at byte {at}"),
-            StreamError::BadPayload { opcode, at, why } => write!(f, "malformed {} at byte {at}: {why}", opcode.name()),
-            StreamError::Sequence { opcode, why } => write!(f, "{} out of sequence: {why}", opcode.name()),
+            StreamError::UnknownOpcode { opcode, at } => {
+                write!(f, "unknown opcode {opcode} at byte {at}")
+            }
+            StreamError::BadPayload { opcode, at, why } => {
+                write!(f, "malformed {} at byte {at}: {why}", opcode.name())
+            }
+            StreamError::Sequence { opcode, why } => {
+                write!(f, "{} out of sequence: {why}", opcode.name())
+            }
+            StreamError::UnclosedPass => {
+                write!(f, "frame returned with a screen pass still open (no Present)")
+            }
         }
     }
 }
@@ -162,13 +198,19 @@ pub fn decode(batch: &[u8]) -> Result<Vec<Command<'_>>, StreamError> {
     }
     let body_len = word(batch, 8) as usize;
     if body_len != batch.len() - HEADER_LEN {
-        return Err(StreamError::BodyLength { declared: body_len, actual: batch.len() - HEADER_LEN });
+        return Err(StreamError::BodyLength {
+            declared: body_len,
+            actual: batch.len() - HEADER_LEN,
+        });
     }
     let mut out = Vec::new();
     let mut at = HEADER_LEN;
     while at < batch.len() {
         if batch.len() - at < COMMAND_HEADER_LEN {
-            return Err(StreamError::TooShort { needed: at + COMMAND_HEADER_LEN, got: batch.len() });
+            return Err(StreamError::TooShort {
+                needed: at + COMMAND_HEADER_LEN,
+                got: batch.len(),
+            });
         }
         let op = word(batch, at);
         let len = word(batch, at + 4) as usize;
@@ -177,7 +219,7 @@ pub fn decode(batch: &[u8]) -> Result<Vec<Command<'_>>, StreamError> {
         };
         let start = at + COMMAND_HEADER_LEN;
         let bad = |why: &str| StreamError::BadPayload { opcode, at, why: why.to_string() };
-        if len % 4 != 0 {
+        if !len.is_multiple_of(4) {
             return Err(bad("payload length isn't a multiple of 4"));
         }
         if batch.len() - start < len {
@@ -227,9 +269,20 @@ pub fn decode(batch: &[u8]) -> Result<Vec<Command<'_>>, StreamError> {
                 }
                 let uniforms = &p[ustart..];
                 if opcode == Opcode::Dispatch {
-                    Command::Dispatch { pipeline: w(0), groups: [w(1), w(2), w(3)], buffers, uniforms }
+                    Command::Dispatch {
+                        pipeline: w(0),
+                        groups: [w(1), w(2), w(3)],
+                        buffers,
+                        uniforms,
+                    }
                 } else {
-                    Command::Draw { pipeline: w(0), vertices: w(1), instances: w(2), buffers, uniforms }
+                    Command::Draw {
+                        pipeline: w(0),
+                        vertices: w(1),
+                        instances: w(2),
+                        buffers,
+                        uniforms,
+                    }
                 }
             }
             Opcode::BeginScreenPass => {
@@ -281,11 +334,20 @@ impl Sequencer {
                 self.in_pass = false;
                 Ok(())
             }
-            Command::Dispatch { .. } | Command::CreateBuffer { .. } | Command::WriteBuffer { .. } if self.in_pass => {
+            Command::Dispatch { .. }
+            | Command::CreateBuffer { .. }
+            | Command::WriteBuffer { .. }
+                if self.in_pass =>
+            {
                 err("only draws can happen inside a screen pass")
             }
             _ => Ok(()),
         }
+    }
+
+    /// Checks the end of a frame: a host calls this after each call of `frame` returns.
+    pub fn end_frame(&self) -> Result<(), StreamError> {
+        if self.in_pass { Err(StreamError::UnclosedPass) } else { Ok(()) }
     }
 }
 
@@ -306,7 +368,7 @@ impl Encoder {
     }
 
     fn command(&mut self, op: Opcode, payload_words: &[u32], bytes: &[u8]) {
-        assert!(bytes.len() % 4 == 0, "payload bytes must be a multiple of 4");
+        assert!(bytes.len().is_multiple_of(4), "payload bytes must be a multiple of 4");
         self.put(op as u32);
         self.put((payload_words.len() * 4 + bytes.len()) as u32);
         for &w in payload_words {
@@ -325,7 +387,13 @@ impl Encoder {
         self
     }
 
-    pub fn dispatch(&mut self, pipeline: u32, groups: [u32; 3], buffers: &[u32], uniforms: &[u8]) -> &mut Self {
+    pub fn dispatch(
+        &mut self,
+        pipeline: u32,
+        groups: [u32; 3],
+        buffers: &[u32],
+        uniforms: &[u8],
+    ) -> &mut Self {
         let mut words = vec![pipeline, groups[0], groups[1], groups[2], buffers.len() as u32];
         words.extend_from_slice(buffers);
         words.push(uniforms.len() as u32);
@@ -338,7 +406,14 @@ impl Encoder {
         self
     }
 
-    pub fn draw(&mut self, pipeline: u32, vertices: u32, instances: u32, buffers: &[u32], uniforms: &[u8]) -> &mut Self {
+    pub fn draw(
+        &mut self,
+        pipeline: u32,
+        vertices: u32,
+        instances: u32,
+        buffers: &[u32],
+        uniforms: &[u8],
+    ) -> &mut Self {
         let mut words = vec![pipeline, vertices, instances, buffers.len() as u32];
         words.extend_from_slice(buffers);
         words.push(uniforms.len() as u32);

@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>wrela</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #000; }
+  canvas#screen { display: block; width: 100vw; height: 100vh; }
+  #wrela-error {
+    position: fixed; inset: 0 0 auto 0; margin: 0; padding: 16px;
+    background: #400; color: #fff; font: 14px/1.4 ui-monospace, Menlo, monospace;
+    white-space: pre-wrap;
+  }
+</style>
+</head>
+<body>
+<canvas id="screen"></canvas>
+<script type="module" src="main.js"></script>
+</body>
+</html>

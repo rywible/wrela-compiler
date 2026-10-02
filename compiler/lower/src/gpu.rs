@@ -1169,9 +1169,11 @@ pub(crate) fn lower_derived(
     let target = mb.target;
     let result = match kind {
         DeriveKind::ValueAndGradient => {
-            ir::derive::value_and_gradient(&mut mb.m, inner, ncap as u32)
+            ir::derive::value_and_gradient(&mut mb.m, &mut mb.derived, inner, ncap as u32)
         }
-        DeriveKind::Interval => ir::derive::interval(&mut mb.m, inner, ncap as u32, target),
+        DeriveKind::Interval => {
+            ir::derive::interval(&mut mb.m, &mut mb.derived, inner, ncap as u32, target)
+        }
     };
     match result {
         Ok(derived) => {

@@ -9,8 +9,14 @@ pub const TS_PATH: &str = "runtime/browser/src/abi.gen.ts";
 /// The TypeScript module `runtime/browser/src/abi.gen.ts`.
 pub fn typescript() -> String {
     let mut s = String::new();
-    let _ = writeln!(s, "// Generated from the wrela-abi crate (runtime/abi): the one definition of the");
-    let _ = writeln!(s, "// command stream and manifest. Don't edit; run `cargo run -p wrela-abi --bin gen-ts`.");
+    let _ = writeln!(
+        s,
+        "// Generated from the wrela-abi crate (runtime/abi): the one definition of the"
+    );
+    let _ = writeln!(
+        s,
+        "// command stream and manifest. Don't edit; run `cargo run -p wrela-abi --bin gen-ts`."
+    );
     let _ = writeln!(s);
     let _ = writeln!(s, "export const STREAM_VERSION = {};", stream::VERSION);
     let _ = writeln!(s, "export const MANIFEST_VERSION = {};", manifest::VERSION);
@@ -31,8 +37,23 @@ pub fn typescript() -> String {
     let _ = writeln!(s, "export const EXPORT_FRAME = {:?};", crate::EXPORT_FRAME);
     let _ = writeln!(s, "export const EXPORT_MEMORY = {:?};", crate::EXPORT_MEMORY);
     let _ = writeln!(s, "export const SCREEN_FORMAT = {:?};", manifest::SCREEN_FORMAT);
-    let _ = writeln!(s, "export const MAX_WORKGROUP_SIZE = [{}, {}, {}];", manifest::MAX_WORKGROUP_SIZE[0], manifest::MAX_WORKGROUP_SIZE[1], manifest::MAX_WORKGROUP_SIZE[2]);
-    let _ = writeln!(s, "export const MAX_WORKGROUP_INVOCATIONS = {};", manifest::MAX_WORKGROUP_INVOCATIONS);
+    let _ = writeln!(
+        s,
+        "export const MAX_WORKGROUP_SIZE = [{}, {}, {}];",
+        manifest::MAX_WORKGROUP_SIZE[0],
+        manifest::MAX_WORKGROUP_SIZE[1],
+        manifest::MAX_WORKGROUP_SIZE[2]
+    );
+    let _ = writeln!(
+        s,
+        "export const MAX_WORKGROUP_INVOCATIONS = {};",
+        manifest::MAX_WORKGROUP_INVOCATIONS
+    );
+    let _ = writeln!(
+        s,
+        "export const MAX_STORAGE_BUFFERS_PER_STAGE = {};",
+        manifest::MAX_STORAGE_BUFFERS_PER_STAGE
+    );
     let _ = writeln!(s);
     let _ = writeln!(s, "export const FNV_OFFSET = 0x{:016x}n;", hash::FNV_OFFSET);
     let _ = writeln!(s, "export const FNV_PRIME = 0x{:016x}n;", hash::FNV_PRIME);

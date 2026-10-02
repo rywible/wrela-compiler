@@ -96,6 +96,8 @@ pub(crate) struct ModuleBuilder {
     pub active: Vec<ir::FuncId>,
     /// Every call between instances, for finding recursion on the GPU.
     pub edges: Vec<(ir::FuncId, ir::FuncId, Span)>,
+    /// Derived functions built in this module.
+    pub derived: ir::derive::DeriveCache,
 }
 
 impl ModuleBuilder {
@@ -110,6 +112,7 @@ impl ModuleBuilder {
             callers: HashMap::new(),
             active: Vec::new(),
             edges: Vec::new(),
+            derived: ir::derive::DeriveCache::default(),
         }
     }
 }
@@ -126,6 +129,8 @@ pub fn lower(checked: &mut Checked, roots: &Roots) -> (Lowered, Vec<Diagnostic>)
             cpu.m.exports.push((name, id));
         }
     }
+    cx.drain(&mut cpu);
+    rewrite_cpu_math(&mut cx, &mut cpu);
     cx.drain(&mut cpu);
     // Pipelines: those CPU code records, then the standalone GPU checks.
     let mut pipelines = Vec::new();
@@ -236,4 +241,93 @@ impl<'a> Cx<'a> {
 /// Rc helper so instance keys can nest.
 pub(crate) fn rc<T>(t: T) -> Rc<T> {
     Rc::new(t)
+}
+
+/// The std function implementing a transcendental builtin on the CPU (language.md §11).
+pub(crate) fn cpu_math_lang(b: ir::Builtin) -> Option<Lang> {
+    use ir::Builtin as I;
+    Some(match b {
+        I::Sin => Lang::CpuSin,
+        I::Cos => Lang::CpuCos,
+        I::Tan => Lang::CpuTan,
+        I::Asin => Lang::CpuAsin,
+        I::Acos => Lang::CpuAcos,
+        I::Atan => Lang::CpuAtan,
+        I::Atan2 => Lang::CpuAtan2,
+        I::Exp => Lang::CpuExp,
+        I::Exp2 => Lang::CpuExp2,
+        I::Log => Lang::CpuLog,
+        I::Log2 => Lang::CpuLog2,
+        I::Pow => Lang::CpuPow,
+        _ => return None,
+    })
+}
+
+/// Replaces the CPU module's transcendental builtins by calls to std's wrela implementations,
+/// per component for vectors. Runs after derived interpretations, which read the builtins.
+fn rewrite_cpu_math(cx: &mut Cx, mb: &mut ModuleBuilder) {
+    let mut i = 0;
+    while i < mb.m.functions.len() {
+        let mut f =
+            std::mem::replace(&mut mb.m.functions[i], ir::Function::new("", Vec::new(), None));
+        let body = std::mem::take(&mut f.body);
+        f.body = rewrite_block(cx, mb, &mut f, body);
+        mb.m.functions[i] = f;
+        i += 1;
+    }
+}
+
+fn rewrite_block(
+    cx: &mut Cx,
+    mb: &mut ModuleBuilder,
+    f: &mut ir::Function,
+    b: ir::Block,
+) -> ir::Block {
+    let mut out = Vec::with_capacity(b.len());
+    for s in b {
+        match s {
+            ir::Stmt::Let(v, ir::Expr::Builtin(op, args)) if cpu_math_lang(op).is_some() => {
+                let Some(func) = cpu_math_lang(op).and_then(|l| cx.lang_fn(l)) else {
+                    out.push(ir::Stmt::Let(v, ir::Expr::Builtin(op, args)));
+                    continue;
+                };
+                let callee = cx.instance(mb, InstanceKey::plain(func, Vec::new()), None);
+                let ty = f.value_ty(v);
+                let f32 = mb.m.types.f32();
+                match mb.m.types.get(ty).clone() {
+                    ir::TypeDef::Vector(n) => {
+                        let mut comps = Vec::new();
+                        for c in 0..n as u32 {
+                            let mut parts = Vec::new();
+                            for &a in &args {
+                                let x = f.new_value(f32);
+                                out.push(ir::Stmt::Let(x, ir::Expr::Extract(a, c)));
+                                parts.push(ir::Arg::Value(x));
+                            }
+                            let r = f.new_value(f32);
+                            out.push(ir::Stmt::Let(r, ir::Expr::Call(callee, parts)));
+                            comps.push(r);
+                        }
+                        out.push(ir::Stmt::Let(v, ir::Expr::Construct(ty, comps)));
+                    }
+                    _ => out.push(ir::Stmt::Let(
+                        v,
+                        ir::Expr::Call(callee, args.into_iter().map(ir::Arg::Value).collect()),
+                    )),
+                }
+            }
+            ir::Stmt::If { cond, then, else_ } => {
+                let then = rewrite_block(cx, mb, f, then);
+                let else_ = rewrite_block(cx, mb, f, else_);
+                out.push(ir::Stmt::If { cond, then, else_ });
+            }
+            ir::Stmt::Loop { body, continuing } => {
+                let body = rewrite_block(cx, mb, f, body);
+                let continuing = rewrite_block(cx, mb, f, continuing);
+                out.push(ir::Stmt::Loop { body, continuing });
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }

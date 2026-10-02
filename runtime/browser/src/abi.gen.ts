@@ -24,6 +24,7 @@ export const EXPORT_MEMORY = "memory";
 export const SCREEN_FORMAT = "rgba8unorm";
 export const MAX_WORKGROUP_SIZE = [256, 256, 64];
 export const MAX_WORKGROUP_INVOCATIONS = 256;
+export const MAX_STORAGE_BUFFERS_PER_STAGE = 8;
 
 export const FNV_OFFSET = 0xcbf29ce484222325n;
 export const FNV_PRIME = 0x00000100000001b3n;
