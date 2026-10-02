@@ -1,12 +1,13 @@
 //! wrela's semantics (language.md §§3–8, 12): modules and names, types, traits and generics,
 //! type inference, the memory model (§6), and the GPU rules (§12).
 
+pub mod borrowck;
 pub mod builtins;
 pub mod check;
 pub mod collect;
 pub mod defs;
 pub mod gpu;
-pub mod memory;
+pub mod mir;
 pub mod program;
 pub mod resolve;
 pub mod thir;
@@ -33,6 +34,8 @@ pub const STD_SOURCES: &[(&str, &str)] = &[
 pub struct Checked {
     pub program: Program,
     pub bodies: BTreeMap<ty::FnId, thir::Body>,
+    /// Each well-typed body's MIR.
+    pub mir: BTreeMap<ty::FnId, mir::Body>,
     pub consts: BTreeMap<ty::ConstId, (ty::TyId, thir::Expr)>,
 }
 
@@ -44,6 +47,7 @@ pub fn check_program(units: Vec<SourceUnit>, diags: &mut Vec<Diagnostic>) -> Che
     diags.extend(gpu::check_entries(p));
     let (const_tys, consts) = check::check_consts(p, diags);
     let mut bodies = BTreeMap::new();
+    let mut mir = BTreeMap::new();
     for i in 0..p.fns.len() {
         let f = ty::FnId(i as u32);
         let (body, d) = check::check_fn(p, &const_tys, f);
@@ -52,7 +56,10 @@ pub fn check_program(units: Vec<SourceUnit>, diags: &mut Vec<Diagnostic>) -> Che
         if let Some(b) = body {
             // The memory checker needs a well-typed body; it would only add noise otherwise.
             if typed {
-                diags.extend(memory::check_fn(p, f, &b));
+                let (m, d) = mir::build::build(p, &consts, f, &b);
+                diags.extend(d);
+                diags.extend(borrowck::check(p, &m));
+                mir.insert(f, m);
             }
             bodies.insert(f, b);
         }
@@ -60,5 +67,5 @@ pub fn check_program(units: Vec<SourceUnit>, diags: &mut Vec<Diagnostic>) -> Che
     for i in 0..p.adts.len() {
         diags.extend(check::check_field_defaults(p, &const_tys, ty::AdtId(i as u32)));
     }
-    Checked { program, bodies, consts }
+    Checked { program, bodies, mir, consts }
 }

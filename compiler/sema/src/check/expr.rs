@@ -201,7 +201,7 @@ impl<'p> Checker<'p> {
                     _ => self.new_var(VarKind::Int, span),
                 };
                 self.int_literals.push((ty, v, false, span));
-                Expr { ty, span, kind: ExprKind::Lit(Lit::Int(v)) }
+                Expr { ty, span, kind: ExprKind::Lit(Lit::Int(i128::from(v))) }
             }
             ast::LitKind::Float => {
                 let v = wrela_syntax::lexer::float_value(&lit.text);
@@ -365,7 +365,14 @@ impl<'p> Checker<'p> {
                     VariantShape::Unit => Expr {
                         ty,
                         span,
-                        kind: ExprKind::Adt { adt: a, args, variant: Some(v), fields: Vec::new() },
+                        kind: ExprKind::Adt {
+                            adt: a,
+                            args,
+                            variant: Some(v),
+                            fields: Vec::new(),
+                            order: Vec::new(),
+                            base: None,
+                        },
                     },
                     VariantShape::Tuple => {
                         self.err(
@@ -465,6 +472,8 @@ impl<'p> Checker<'p> {
                             args,
                             variant: Some(v as u32),
                             fields: Vec::new(),
+                            order: Vec::new(),
+                            base: None,
                         },
                     };
                 }
@@ -639,7 +648,7 @@ impl<'p> Checker<'p> {
         if op == UnOp::Neg
             && let ExprKind::Lit(Lit::Int(v)) = i.kind
             && let Some(last) = self.int_literals.last_mut()
-            && last.1 == v
+            && i128::from(last.1) == v
         {
             last.2 = true; // negated: `-2147483648` fits an i32
         }
@@ -1091,7 +1100,7 @@ impl<'p> Checker<'p> {
         // A vector's or matrix's components are fixed: a literal index past them is caught here
         // (a computed one traps at run time, like an array's).
         if let (TyKind::Vec(n) | TyKind::Mat(n), ExprKind::Lit(Lit::Int(v))) = (&k, &i.kind)
-            && *v >= u64::from(*n)
+            && *v >= i128::from(*n)
         {
             let shown = self.display(b.ty);
             let what = if matches!(k, TyKind::Vec(_)) { "components" } else { "columns" };
@@ -1197,6 +1206,7 @@ impl<'p> Checker<'p> {
             e
         });
         let mut given: Vec<Option<Expr>> = vec![None; decls.len()];
+        let mut order: Vec<u32> = Vec::new();
         let adt_mod = self.p.adt(adt).module;
         for f in fields {
             let Some(i) = decls.iter().position(|d| d.name == f.name.name) else {
@@ -1249,6 +1259,7 @@ impl<'p> Checker<'p> {
             };
             self.expect(value.ty, fty, value.span);
             given[i] = Some(value);
+            order.push(i as u32);
         }
         let mut out = Vec::new();
         let mut missing = Vec::new();
@@ -1258,15 +1269,12 @@ impl<'p> Checker<'p> {
                 None => {
                     if let Some(b) = &base_expr {
                         let fty = field_tys[i].1;
-                        out.push(Expr {
-                            ty: fty,
-                            span: b.span,
-                            kind: ExprKind::Field(Box::new(b.clone()), i as u32),
-                        });
+                        out.push(Expr { ty: fty, span: b.span, kind: ExprKind::FromBase });
                     } else if let Some(d) = &decls[i].default {
                         let fty = field_tys[i].1;
                         let e = self.check_default(d, fty);
                         out.push(e);
+                        order.push(i as u32);
                     } else {
                         missing.push((decls[i].name.clone(), field_tys[i].1));
                         out.push(self.error_expr(span));
@@ -1302,7 +1310,8 @@ impl<'p> Checker<'p> {
             }
             self.err(d);
         }
-        Expr { ty, span, kind: ExprKind::Adt { adt, args, variant, fields: out } }
+        let base = base_expr.map(Box::new);
+        Expr { ty, span, kind: ExprKind::Adt { adt, args, variant, fields: out, order, base } }
     }
 
     /// The source text of a zero of a scalar or vector type, for fixes.

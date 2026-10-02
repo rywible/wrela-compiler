@@ -219,6 +219,7 @@ impl<'p> Checker<'p> {
         }
         self.note_use(l, false);
         let modes = vec![Mode::Borrow; out.len()];
+        let n_args = out.len();
         Expr {
             ty: ret,
             span,
@@ -226,6 +227,7 @@ impl<'p> Checker<'p> {
                 callee: Callee::Local(l),
                 args: out,
                 modes,
+                order: (0..n_args).collect(),
                 receiver: false,
                 ret_mode: RetMode::Owned,
             }),
@@ -299,7 +301,7 @@ impl<'p> Checker<'p> {
         }
         let name = self.p.fn_display_name(f);
         let has_receiver = receiver.is_some();
-        let (call_args, modes) = self.match_args(&name, &params, receiver, args, span, f);
+        let (call_args, modes, order) = self.match_args(&name, &params, receiver, args, span, f);
         // A bound on a generic that's a parameter's whole type is reported at that argument.
         let spans: Vec<Span> = self
             .p
@@ -322,6 +324,7 @@ impl<'p> Checker<'p> {
                 callee: Callee::Fn { func: f, args: gen_args },
                 args: call_args,
                 modes,
+                order,
                 receiver: has_receiver,
                 ret_mode,
             }),
@@ -337,12 +340,15 @@ impl<'p> Checker<'p> {
         args: &[ast::Arg],
         span: Span,
         f: FnId,
-    ) -> (Vec<Expr>, Vec<Mode>) {
+    ) -> (Vec<Expr>, Vec<Mode>, Vec<usize>) {
         let offset = usize::from(receiver.is_some());
         let mut slots: Vec<Option<Expr>> = vec![None; params.len()];
         let mut suggested: Vec<String> = Vec::new();
+        // The order the arguments are written in: evaluation order (language.md §3).
+        let mut order: Vec<usize> = Vec::new();
         if let Some(r) = receiver {
             slots[0] = Some(r);
+            order.push(0);
         }
         let mut next = offset;
         for a in args {
@@ -406,6 +412,7 @@ impl<'p> Checker<'p> {
             let p = &params[idx];
             let e = self.check_arg(p, &a.value);
             slots[idx] = Some(e);
+            order.push(idx);
         }
         let mut out = Vec::new();
         let mut missing = Vec::new();
@@ -417,6 +424,7 @@ impl<'p> Checker<'p> {
                         let ty = params[i].ty;
                         let e = self.check_default(d, ty);
                         out.push(e);
+                        order.push(i);
                     }
                     None => {
                         if !suggested.contains(&params[i].name) {
@@ -438,7 +446,13 @@ impl<'p> Checker<'p> {
                 .with_secondary(self.p.func(f).sig_span, "declared here"),
             );
         }
-        (out, params.iter().map(|p| p.mode).collect())
+        // Arguments missing (already reported) are placeholders; evaluate them last.
+        for i in 0..out.len() {
+            if !order.contains(&i) {
+                order.push(i);
+            }
+        }
+        (out, params.iter().map(|p| p.mode).collect(), order)
     }
 
     /// One argument against its parameter: type, and the call-site marker for its mode.
@@ -606,7 +620,19 @@ impl<'p> Checker<'p> {
         for extra in args.iter().skip(ftys.len()) {
             self.check_expr(&extra.value, None);
         }
-        Expr { ty, span, kind: ExprKind::Adt { adt: a, args: gargs, variant: Some(v), fields } }
+        let order = (0..fields.len() as u32).collect();
+        Expr {
+            ty,
+            span,
+            kind: ExprKind::Adt {
+                adt: a,
+                args: gargs,
+                variant: Some(v),
+                fields,
+                order,
+                base: None,
+            },
+        }
     }
 
     /// A built-in function. Arguments are checked first; then literals take the type the
@@ -720,6 +746,7 @@ impl<'p> Checker<'p> {
         match b.result(&self.p.types, &tys) {
             Ok(ty) => {
                 let modes = vec![Mode::Borrow; xs.len()];
+                let n_args = xs.len();
                 Expr {
                     ty,
                     span,
@@ -727,6 +754,7 @@ impl<'p> Checker<'p> {
                         callee: Callee::Builtin(b),
                         args: xs,
                         modes,
+                        order: (0..n_args).collect(),
                         receiver: false,
                         ret_mode: RetMode::Owned,
                     }),
@@ -936,7 +964,7 @@ impl<'p> Checker<'p> {
             let method_args = self.method_generic_args(m, generics, span);
             let (params, ret) = self.trait_method_sig(m, ty, trait_args, &method_args);
             let fname = format!("{}::{}", self.p.display_ty(ty), name.name);
-            let (call_args, modes) = self.match_args(&fname, &params, None, args, span, m);
+            let (call_args, modes, order) = self.match_args(&fname, &params, None, args, span, m);
             let callee = Callee::TraitMethod {
                 method: m,
                 self_ty: ty,
@@ -950,6 +978,7 @@ impl<'p> Checker<'p> {
                     callee,
                     args: call_args,
                     modes,
+                    order,
                     receiver: false,
                     ret_mode: def.ret_mode,
                 }),
@@ -1321,7 +1350,7 @@ impl<'p> Checker<'p> {
                 }
                 self.receiver_mode_check(method, &recv);
                 let fname = format!("{}::{}", self.p.trait_(tr).name, def.name);
-                let (call_args, modes) =
+                let (call_args, modes, order) =
                     self.match_args(&fname, &params, Some(recv), args, span, method);
                 let callee = Callee::TraitMethod { method, self_ty: rt, trait_args, method_args };
                 Expr {
@@ -1331,6 +1360,7 @@ impl<'p> Checker<'p> {
                         callee,
                         args: call_args,
                         modes,
+                        order,
                         receiver: true,
                         ret_mode: def.ret_mode,
                     }),
@@ -1358,6 +1388,7 @@ impl<'p> Checker<'p> {
                         callee: Callee::Clone,
                         args: vec![recv],
                         modes: vec![Mode::Borrow],
+                        order: vec![0],
                         receiver: true,
                         ret_mode: RetMode::Owned,
                     }),
@@ -1503,7 +1534,7 @@ impl<'p> Checker<'p> {
         self.fn_obligations(kernel, &kernel_args, span);
         let kname = self.p.func(kernel).name.clone();
         let u32_ty = self.p.types.u32;
-        let mut groups: Option<[Expr; 3]> = None;
+        let mut groups: Option<Expr> = None;
         let user: Vec<(usize, CallParam)> = params
             .iter()
             .cloned()
@@ -1511,34 +1542,24 @@ impl<'p> Checker<'p> {
             .filter(|(_, p)| !self.is_gpu_builtin(p.ty))
             .collect();
         let mut given: Vec<Option<Expr>> = vec![None; user.len()];
+        let mut written: Vec<usize> = Vec::new();
         let mut next = 0usize;
         for (i, a) in args.iter().enumerate().skip(1) {
             let is_groups =
                 a.name.as_ref().is_some_and(|n| n.name == "groups") || (a.name.is_none() && i == 1);
             if is_groups {
                 let e = self.check_expr(&a.value, None);
-                let one = Expr { ty: u32_ty, span: a.span, kind: ExprKind::Lit(Lit::Int(1)) };
-                groups = match self.kind(e.ty) {
+                match self.kind(e.ty) {
                     TyKind::Tuple(ts) if ts.len() == 3 => {
                         for &t in &ts {
                             self.expect(t, u32_ty, e.span);
                         }
-                        let fields: Vec<Expr> = (0..3)
-                            .map(|k| Expr {
-                                ty: ts[k],
-                                span: e.span,
-                                kind: ExprKind::Field(Box::new(e.clone()), k as u32),
-                            })
-                            .collect();
-                        let [a, b, c] =
-                            <[Expr; 3]>::try_from(fields).unwrap_or_else(|_| unreachable!());
-                        Some([a, b, c])
                     }
                     _ => {
                         self.expect(e.ty, u32_ty, e.span);
-                        Some([e, one.clone(), one])
                     }
-                };
+                }
+                groups = Some(e);
                 continue;
             }
             let slot = match &a.name {
@@ -1574,6 +1595,9 @@ impl<'p> Checker<'p> {
                     format!("`{}` is given twice", user[k].1.name),
                 ));
             }
+            if given[k].is_none() {
+                written.push(k);
+            }
             given[k] = Some(e);
         }
         let Some(groups) = groups else {
@@ -1588,9 +1612,9 @@ impl<'p> Checker<'p> {
             return self.error_expr(span);
         };
         let mut out = Vec::new();
-        for (k, g) in given.into_iter().enumerate() {
+        for (k, g) in given.iter().enumerate() {
             match g {
-                Some(e) => out.push((user[k].0, e)),
+                Some(_) => {}
                 None => {
                     self.err(Diagnostic::new(
                         codes::E0603,
@@ -1603,7 +1627,12 @@ impl<'p> Checker<'p> {
                 }
             }
         }
-        let d = Dispatch { kernel, kernel_args, groups, args: out };
+        for k in written {
+            if let Some(e) = given[k].take() {
+                out.push((user[k].0, e));
+            }
+        }
+        let d = Dispatch { kernel, kernel_args, groups: Box::new(groups), args: out };
         Expr { ty: unit, span, kind: ExprKind::Dispatch(Box::new(d)) }
     }
 

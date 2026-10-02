@@ -74,8 +74,9 @@ impl Body {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Lit {
-    /// Any integer or float type's literal, as written (exact up to u64).
-    Int(u64),
+    /// Any integer or float type's literal: its exact value (negative only for a negated
+    /// literal in a pattern; a negation in an expression is a `Unary`).
+    Int(i128),
     Float(f64),
     Bool(bool),
 }
@@ -117,6 +118,9 @@ pub struct Call {
     pub modes: Vec<Mode>,
     /// Whether the first argument is a method receiver (unmarked at the call site, §6.2).
     pub receiver: bool,
+    /// The order the arguments are evaluated in: as written (the receiver first), then the
+    /// defaults, by parameter index into `args`.
+    pub order: Vec<usize>,
     /// A call to a function returning `borrow T` or `mut T` is a place.
     pub ret_mode: RetMode,
 }
@@ -136,14 +140,19 @@ pub enum ExprKind {
     /// Vector components: one index is a component, more make a vector.
     Swizzle(Box<Expr>, Vec<u8>),
     Index(Box<Expr>, Box<Expr>),
-    /// A struct (`variant: None`) or an enum variant. `fields` is complete and in
-    /// declaration order.
+    /// A struct (`variant: None`) or an enum variant. `fields` is complete and in declaration
+    /// order; a field `..base` supplies is [`ExprKind::FromBase`]. The fields given are evaluated
+    /// in the order written (`order`, by index into `fields`), then the defaults, then `base`.
     Adt {
         adt: AdtId,
         args: Vec<TyId>,
         variant: Option<u32>,
         fields: Vec<Expr>,
+        order: Vec<u32>,
+        base: Option<Box<Expr>>,
     },
+    /// A field of the enclosing struct literal that its `..base` supplies.
+    FromBase,
     Tuple(Vec<Expr>),
     Array(Vec<Expr>),
     ArrayRepeat(Box<Expr>, u32),
@@ -180,9 +189,10 @@ pub enum ExprKind {
 pub struct Dispatch {
     pub kernel: FnId,
     pub kernel_args: Vec<TyId>,
-    /// Workgroup counts: x, y, z (each a `u32` expression).
-    pub groups: [Expr; 3],
-    /// One per kernel parameter that isn't a builtin, in parameter order.
+    /// The workgroup count: a `u32` (in x; y and z are 1), or a `(u32, u32, u32)`.
+    pub groups: Box<Expr>,
+    /// One per kernel parameter that isn't a builtin, as (parameter index, argument), in the
+    /// order written.
     pub args: Vec<(usize, Expr)>,
 }
 

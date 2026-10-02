@@ -1,0 +1,138 @@
+// rejects: mem.loops mem.exclusivity mem.projections
+struct Inner {
+    v: u32,
+}
+
+struct Log {
+    count: u32,
+    last: f32,
+    inner: Inner,
+}
+
+impl Log {
+    fn push(mut self, x: f32) {
+        self.count += 1
+        self.last = x
+    }
+}
+
+struct World {
+    log: Log,
+    values: [f32; 4],
+}
+
+fn mk() -> World {
+    World { log: Log { count: 0, last: 0.0, inner: Inner { v: 1 } }, values: [0.0, 0.0, 0.0, 0.0] }
+}
+
+fn eat(l: take Log) -> u32 {
+    l.count
+}
+
+fn bump(x: mut f32) {
+    x += 1.0
+}
+
+fn bump_with(x: mut f32, w: mut World) {
+    x += w.values[1]
+}
+
+fn pair(a: mut f32, b: mut f32) {
+    a += 1.0
+    b += a
+}
+
+fn first(w: mut World) -> mut f32 {
+    mut w.values[0]
+}
+
+fn vals(w: mut World) -> mut [f32; 4] {
+    mut w.values
+}
+
+fn head(v: mut [f32; 4]) -> mut f32 {
+    mut v[0]
+}
+
+fn peek(w: World) -> borrow Log {
+    w.log
+}
+
+fn touch(w: mut World) {
+    w.values[0] = 100.0
+}
+
+// R1-1: a move flows around `continue` to the next iteration.
+fn moved_then_continue(n: u32) -> u32 {
+    let log = Log { count: 3, last: 0.0, inner: Inner { v: 1 } }
+    var total = 0
+    for i in 0..n {
+        if i > 0 {
+            total += log.count //~ E0515
+        }
+        let k = eat(take log) //~ E0515
+        total += k
+        continue
+    }
+    total
+}
+
+// R1-2: a projection-returning call as an argument holds its loan for the call.
+fn projection_arg() -> f32 {
+    var w = mk()
+    bump_with(mut first(mut w), mut w) //~ E0513
+    pair(mut first(mut w), mut first(mut w)) //~ E0513
+    w.values[0]
+}
+
+// R3-9: no writing through a `borrow` projection.
+fn through_borrow(w: World) {
+    peek(w).push(1.0) //~ E0512
+    bump(mut peek(w).last) //~ E0512
+    mut x = peek(w) //~ E0512
+    x.count = 99
+}
+
+// R3-10: an inner loop doesn't end the outer `for` loop's loan.
+fn nested_loops() -> f32 {
+    var w = mk()
+    for mut x in w.values {
+        for i in 0..1 {
+        }
+        touch(mut w) //~ E0506
+        x += 1.0
+    }
+    w.values[0]
+}
+
+// R3-11: loans held through projections of projections, and of call results.
+fn second_level() -> u32 {
+    var w = mk()
+    let g = w.log
+    let h = g
+    w.log = Log { count: 7, last: 0.0, inner: Inner { v: 2 } } //~ E0507
+    h.count
+}
+
+fn reborrow_mut() -> f32 {
+    var w = mk()
+    mut a = w.values
+    mut b = a
+    w.values[0] = 50.0 //~ E0506
+    b[0] += 1.0
+    w.values[0]
+}
+
+fn nested_call_projection() -> f32 {
+    var w = mk()
+    mut x = head(mut vals(mut w))
+    w.values[0] = 20.0 //~ E0506
+    x += 1.0
+    w.values[0]
+}
+
+fn field_of_call_projection(w: mut World) -> u32 {
+    let l = peek(w).inner
+    w.log.inner = Inner { v: 9 } //~ E0507
+    l.v
+}

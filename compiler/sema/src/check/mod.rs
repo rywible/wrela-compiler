@@ -284,6 +284,7 @@ impl<'p> Checker<'p> {
             }
             ast::StmtKind::Assign { target, op, value } => {
                 let place = self.check_expr(target, None);
+                self.check_assign_target(&place);
                 self.mark_written(&place);
                 let bin = op.binop();
                 let value = match bin {
@@ -329,6 +330,45 @@ impl<'p> Checker<'p> {
             }
         };
         Some(Stmt { kind, span: s.span })
+    }
+
+    /// An assignment writes a place: a local, a field, component or element of one, or what a
+    /// `mut` projection-returning call returned. Whether that place may be written is the
+    /// memory checker's question; whether it's a place at all is this one.
+    fn check_assign_target(&mut self, place: &Expr) {
+        let mut inner = place;
+        while let ExprKind::Field(b, _) | ExprKind::Swizzle(b, _) | ExprKind::Index(b, _) =
+            &inner.kind
+        {
+            inner = b;
+        }
+        let d = match &inner.kind {
+            ExprKind::Local(_) | ExprKind::Error => return,
+            ExprKind::Call(c) if c.ret_mode != RetMode::Owned => return,
+            ExprKind::Call(c) => {
+                let name = match &c.callee {
+                    Callee::Fn { func, .. } | Callee::TraitMethod { method: func, .. } => {
+                        format!("`{}`", self.p.func(*func).name)
+                    }
+                    _ => "the call".into(),
+                };
+                Diagnostic::new(
+                    codes::E0505,
+                    place.span,
+                    "can't assign to part of a temporary value",
+                )
+                .with_note(format!("{name} returns a value, not a projection, so the change would be lost"))
+            }
+            ExprKind::Const(c) => Diagnostic::new(
+                codes::E0505,
+                place.span,
+                format!("can't assign to the constant `{}`", self.p.const_(*c).name),
+            )
+            .with_help("copy it into a `var` to change it"),
+            _ => Diagnostic::new(codes::E0505, place.span, "can't assign to a temporary value")
+                .with_note("an assignment's target is a place: a variable, or a field, component or element of one"),
+        };
+        self.err(d);
     }
 
     fn expect_unit_block(&mut self, b: &Block) {
@@ -576,6 +616,7 @@ fn has_break(b: &Block) -> bool {
             | ExprKind::Closure(_)
             | ExprKind::FnRef(..)
             | ExprKind::Continue
+            | ExprKind::FromBase
             | ExprKind::Error => false,
             ExprKind::Unary(_, x)
             | ExprKind::Field(x, _)
@@ -586,10 +627,12 @@ fn has_break(b: &Block) -> bool {
             | ExprKind::MutArg(x) => in_expr(x),
             ExprKind::Binary(_, a, b) | ExprKind::Index(a, b) => in_expr(a) || in_expr(b),
             ExprKind::Call(c) => c.args.iter().any(in_expr),
-            ExprKind::Adt { fields: xs, .. }
-            | ExprKind::Tuple(xs)
-            | ExprKind::Array(xs)
-            | ExprKind::Construct(xs) => xs.iter().any(in_expr),
+            ExprKind::Adt { fields, base, .. } => {
+                fields.iter().any(in_expr) || base.as_ref().is_some_and(|b| in_expr(b))
+            }
+            ExprKind::Tuple(xs) | ExprKind::Array(xs) | ExprKind::Construct(xs) => {
+                xs.iter().any(in_expr)
+            }
             ExprKind::Block(b) => has_break(b),
             ExprKind::If { cond, then, else_ } => {
                 in_expr(cond) || has_break(then) || else_.as_ref().is_some_and(|e| in_expr(e))
@@ -601,9 +644,7 @@ fn has_break(b: &Block) -> bool {
                         .any(|a| a.guard.as_ref().is_some_and(in_expr) || in_expr(&a.body))
             }
             ExprKind::Return(v) => v.as_ref().is_some_and(|v| in_expr(v)),
-            ExprKind::Dispatch(d) => {
-                d.groups.iter().any(in_expr) || d.args.iter().any(|(_, a)| in_expr(a))
-            }
+            ExprKind::Dispatch(d) => in_expr(&d.groups) || d.args.iter().any(|(_, a)| in_expr(a)),
             ExprKind::Draw(d) => {
                 in_expr(&d.vertices)
                     || in_expr(&d.instances)

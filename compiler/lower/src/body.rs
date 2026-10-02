@@ -431,7 +431,10 @@ impl<'c, 'a> Fl<'c, 'a> {
             }
             ExprKind::Binary(op, a, b) => self.binary(*op, a, b, e),
             ExprKind::Call(c) => self.call(c, e),
-            ExprKind::Adt { adt, variant, fields, .. } => self.adt(*adt, *variant, fields, e),
+            ExprKind::Adt { adt, variant, fields, base, .. } => {
+                self.adt(*adt, *variant, fields, base.as_deref(), e)
+            }
+            ExprKind::FromBase => None,
             ExprKind::Tuple(xs) => {
                 let ty = self.ty(e.ty, span)?;
                 let vs: Vec<ir::ValueId> = xs.iter().filter_map(|x| self.expr(x)).collect();
@@ -548,7 +551,7 @@ impl<'c, 'a> Fl<'c, 'a> {
             (thir::Lit::Int(v), ir::Scalar::I32) => ir::Const::I32(v as i64 as i32),
             (thir::Lit::Int(v), ir::Scalar::U32) => ir::Const::U32(v as u32),
             (thir::Lit::Int(v), ir::Scalar::I64) => ir::Const::I64(v as i64),
-            (thir::Lit::Int(v), ir::Scalar::U64) => ir::Const::U64(v),
+            (thir::Lit::Int(v), ir::Scalar::U64) => ir::Const::U64(v as u64),
             (thir::Lit::Int(v), ir::Scalar::F32) => ir::Const::F32(v as f32),
             (thir::Lit::Int(v), ir::Scalar::F64) => ir::Const::F64(v as f64),
             (thir::Lit::Int(v), s) => ir::Const::Small(s, v as i64),
@@ -709,14 +712,22 @@ impl<'c, 'a> Fl<'c, 'a> {
         adt: AdtId,
         variant: Option<u32>,
         fields: &[thir::Expr],
+        base: Option<&thir::Expr>,
         e: &thir::Expr,
     ) -> Option<ir::ValueId> {
         let ty = self.ty(e.ty, e.span);
         let ct = self.concrete(e.ty);
         let mut vals = Vec::new();
         let map = self.cx.field_map(self.mb, ct, variant, e.span);
+        let base = base.and_then(|b| self.place_or_temp(b));
         for (i, x) in fields.iter().enumerate() {
-            let v = self.expr(x);
+            let v = match (&x.kind, &base, map.get(i).copied().flatten()) {
+                (ExprKind::FromBase, Some(bp), Some(fi)) => {
+                    let ft = self.ty(x.ty, x.span)?;
+                    Some(self.load(bp.with(ir::Proj::Field(fi)), ft))
+                }
+                _ => self.expr(x),
+            };
             if map.get(i).copied().flatten().is_some()
                 && let Some(v) = v
             {

@@ -234,7 +234,7 @@ impl<'p> Checker<'p> {
             }
             ast::LitKind::Int => {
                 let v = wrela_syntax::lexer::int_value(&lit.text)?;
-                Some(Lit::Int(if neg { v.wrapping_neg() } else { v }))
+                Some(Lit::Int(if neg { -i128::from(v) } else { i128::from(v) }))
             }
             ast::LitKind::Float => {
                 let v = wrela_syntax::lexer::float_value(&lit.text);
@@ -256,12 +256,7 @@ impl<'p> Checker<'p> {
                 let var = self.new_var(VarKind::Int, lit.span);
                 self.expect(var, ty, lit.span);
                 self.int_literals.push((ty, v, neg, lit.span));
-                if neg {
-                    // Matched as the negated value; stored as two's complement of u64.
-                    Some(Lit::Int(v.wrapping_neg()))
-                } else {
-                    Some(Lit::Int(v))
-                }
+                Some(Lit::Int(if neg { -i128::from(v) } else { i128::from(v) }))
             }
             ast::LitKind::Float => {
                 let v = wrela_syntax::lexer::float_value(&lit.text);

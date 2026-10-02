@@ -141,12 +141,12 @@ pub fn repeat(seed: u32, n: u32, reps: u32, gradient: u32) {
     let points = scattered(seed, n, a)
     if gradient == 0 {
         let dist: GpuBuffer<f32> = buffer(n)
-        for rep in 0..reps {
+        for _ in 0..reps {
             dispatch(distances, groups: n / 64, field: g, points: points, out: dist)
         }
     } else {
         let samp: GpuBuffer<vec4> = buffer(n)
-        for rep in 0..reps {
+        for _ in 0..reps {
             dispatch(samples, groups: n / 64, field: g, points: points, out: samp)
         }
     }

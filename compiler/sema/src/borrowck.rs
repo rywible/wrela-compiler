@@ -1,0 +1,1084 @@
+//! The memory checker (language.md §6): moves, projections and exclusivity, as dataflow over a
+//! function's MIR. Signatures say everything about callees.
+//!
+//! - **Places** are a local and a path. Two places overlap when one is a prefix of the other;
+//!   every element of a container overlaps every other.
+//! - **Moves** flow forward along the control-flow graph: a value moved on some path is
+//!   "possibly moved" where the paths join, and a move that reaches a use only around a loop's
+//!   back edge is a move inside the loop of a value from outside it (E0515).
+//! - **Loans** are held by locals: a projection (`let x = place`, `mut x = place`, a pattern's
+//!   binding, a `for` loop's element), a call's argument (until the call), what a
+//!   projection-returning call returned (a loan on each of the call's `borrow` and `mut`
+//!   arguments), and a closure (its captures). A loan lasts while its holder is live: used
+//!   later on some path (a simple non-lexical lifetime). A projection of a projection holds the
+//!   original's loans itself, so it can outlive it.
+//! - **The rule:** while a `mut` loan is live, no other access may touch an overlapping place;
+//!   while a shared loan is live, nothing may write, move or lend mutably an overlapping place.
+//!   An access through a projection is that projection's own use, and its loans' places are
+//!   what it touches.
+//!
+//! The rules that depend only on how code is written are checked while the MIR is built
+//! ([`crate::mir::build`]).
+
+use crate::defs::{Mode, RetMode};
+use crate::mir::*;
+use crate::program::Program;
+use crate::thir;
+use crate::ty::{ClosureId, TyKind};
+use std::collections::HashMap;
+use wrela_diag::{Diagnostic, Span, codes};
+
+/// Checks every function and closure body of `body`.
+pub fn check(p: &Program, body: &Body) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    for (i, f) in body.fns.iter().enumerate() {
+        let closure = (i > 0).then(|| ClosureId(i as u32 - 1));
+        out.extend(FnCheck::new(p, body, f, closure).run());
+    }
+    out.extend(unused_locals(body));
+    out
+}
+
+// ---- bit sets ------------------------------------------------------------------------------------
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Bits(Vec<u64>);
+
+impl Bits {
+    fn new(n: usize) -> Bits {
+        Bits(vec![0; n.div_ceil(64)])
+    }
+    fn insert(&mut self, i: usize) {
+        if i / 64 >= self.0.len() {
+            self.0.resize(i / 64 + 1, 0);
+        }
+        self.0[i / 64] |= 1 << (i % 64);
+    }
+    fn remove(&mut self, i: usize) {
+        if i / 64 < self.0.len() {
+            self.0[i / 64] &= !(1 << (i % 64));
+        }
+    }
+    fn contains(&self, i: usize) -> bool {
+        self.0.get(i / 64).is_some_and(|w| w & (1 << (i % 64)) != 0)
+    }
+    /// `self |= other`; whether anything changed.
+    fn union(&mut self, other: &Bits) -> bool {
+        if other.0.len() > self.0.len() {
+            self.0.resize(other.0.len(), 0);
+        }
+        let mut changed = false;
+        for (a, b) in self.0.iter_mut().zip(&other.0) {
+            let n = *a | b;
+            changed |= n != *a;
+            *a = n;
+        }
+        changed
+    }
+    fn iter(&self) -> impl Iterator<Item = usize> + '_ {
+        self.0.iter().enumerate().flat_map(|(w, &bits)| {
+            (0..64).filter(move |b| bits & (1 << b) != 0).map(move |b| w * 64 + b)
+        })
+    }
+}
+
+// ---- what statements use ---------------------------------------------------------------------
+
+fn place_uses(p: &Place, out: &mut Vec<Local>) {
+    out.push(p.local);
+    for proj in &p.proj {
+        if let Proj::Index(l) = proj {
+            out.push(*l);
+        }
+    }
+}
+
+fn operand_uses(o: &Operand, out: &mut Vec<Local>) {
+    if let Some(p) = o.place() {
+        place_uses(p, out);
+    }
+}
+
+fn rvalue_uses(r: &Rvalue, out: &mut Vec<Local>) {
+    match r {
+        Rvalue::Use(o) | Rvalue::Unary(_, o) | Rvalue::ArrayRepeat(o, _) | Rvalue::Convert(o) => {
+            operand_uses(o, out)
+        }
+        Rvalue::Binary(_, a, b) => {
+            operand_uses(a, out);
+            operand_uses(b, out);
+        }
+        Rvalue::Adt { fields: xs, .. }
+        | Rvalue::Tuple(xs)
+        | Rvalue::Array(xs)
+        | Rvalue::Construct(xs) => xs.iter().for_each(|x| operand_uses(x, out)),
+        Rvalue::Discriminant(p) | Rvalue::Len(p) => place_uses(p, out),
+        Rvalue::Call(c) => {
+            if let Callee::Local(l) = c.callee {
+                out.push(l);
+            }
+            for a in &c.args {
+                match a {
+                    Arg::Borrow(p, _) | Arg::Mut(p, _) => place_uses(p, out),
+                    Arg::Take(o) => operand_uses(o, out),
+                }
+            }
+        }
+        Rvalue::Closure(_) | Rvalue::FnRef(..) => {}
+        Rvalue::Dispatch(d) => {
+            d.groups.iter().for_each(|g| operand_uses(g, out));
+            d.args.iter().for_each(|(_, p, _)| place_uses(p, out));
+        }
+        Rvalue::Draw(d) => {
+            operand_uses(&d.vertices, out);
+            operand_uses(&d.instances, out);
+            d.args.iter().for_each(|(_, p, _)| place_uses(p, out));
+        }
+    }
+}
+
+/// A statement's uses and the local it defines (whose old value it's done with).
+fn stmt_uses_defs(body: &Body, s: &Statement) -> (Vec<Local>, Option<Local>) {
+    let mut uses = Vec::new();
+    let def = match &s.kind {
+        StatementKind::Assign(p, r) => {
+            rvalue_uses(r, &mut uses);
+            if p.proj.is_empty() && !is_bound_alias(body, p.local, r) {
+                // A whole local gets a new value (or a projection local, a call's place).
+                for l in &p.proj {
+                    if let Proj::Index(i) = l {
+                        uses.push(*i);
+                    }
+                }
+                Some(p.local)
+            } else {
+                // A write through a place: a use of its local.
+                place_uses(p, &mut uses);
+                None
+            }
+        }
+        StatementKind::Eval(r) => {
+            rvalue_uses(r, &mut uses);
+            None
+        }
+        StatementKind::Bind { local, place, .. } => {
+            place_uses(place, &mut uses);
+            Some(*local)
+        }
+        StatementKind::Live(l) | StatementKind::Dead(l) => Some(*l),
+    };
+    (uses, def)
+}
+
+/// Whether assigning `r` to the whole local `l` writes through it: `l` aliases a place, and `r`
+/// isn't the call that gives it one.
+fn is_bound_alias(body: &Body, l: Local, r: &Rvalue) -> bool {
+    body.local(l).kind.is_projection()
+        && !matches!(r, Rvalue::Call(c) if c.ret_mode != RetMode::Owned)
+}
+
+fn term_uses(t: &Terminator, out: &mut Vec<Local>) {
+    match &t.kind {
+        TerminatorKind::If { cond, .. } => operand_uses(cond, out),
+        TerminatorKind::Return(Some(o)) => operand_uses(o, out),
+        TerminatorKind::ReturnPlace(p) => place_uses(p, out),
+        _ => {}
+    }
+}
+
+// ---- loans and moves -----------------------------------------------------------------------------
+
+#[derive(Clone, Debug)]
+struct Loan {
+    place: Place,
+    mutable: bool,
+    holder: Local,
+    /// The projections the loan was reached through, `holder` first: accesses through any of
+    /// them are the loan's own.
+    via: Vec<Local>,
+    /// Whether `place` is exactly what the holder aliases (so a path through the holder
+    /// extends it), or only somewhere it points into (a call's result).
+    exact: bool,
+    span: Span,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct Moved {
+    place: Place,
+    span: Span,
+    /// Moved on some paths here, not all.
+    maybe: bool,
+    /// Reached here only around a loop's back edge.
+    back: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct State {
+    loans: Bits,
+    moves: Vec<Moved>,
+    /// Locals in scope that haven't been given their first value yet.
+    uninit: Bits,
+}
+
+impl State {
+    fn join(&mut self, other: &State) -> bool {
+        let mut changed = self.loans.union(&other.loans);
+        changed |= self.uninit.union(&other.uninit);
+        let mut out: Vec<Moved> = Vec::new();
+        for m in &self.moves {
+            match other.moves.iter().find(|n| n.place == m.place) {
+                Some(n) => out.push(Moved {
+                    place: m.place.clone(),
+                    span: m.span,
+                    maybe: m.maybe || n.maybe,
+                    back: m.back && n.back,
+                }),
+                None => out.push(Moved { maybe: true, ..m.clone() }),
+            }
+        }
+        for n in &other.moves {
+            if !self.moves.iter().any(|m| m.place == n.place) {
+                out.push(Moved { maybe: true, ..n.clone() });
+            }
+        }
+        if out != self.moves {
+            changed = true;
+            self.moves = out;
+        }
+        changed
+    }
+}
+
+fn overlaps(a: &Place, b: &Place) -> bool {
+    if a.local != b.local {
+        return false;
+    }
+    for (x, y) in a.proj.iter().zip(&b.proj) {
+        let same = match (x, y) {
+            (Proj::Field(i), Proj::Field(j)) => i == j,
+            (Proj::Downcast(_), Proj::Downcast(_)) => true,
+            (Proj::Comp(i), Proj::Comp(j)) => i == j,
+            (Proj::Comp(c), Proj::Swizzle(cs)) | (Proj::Swizzle(cs), Proj::Comp(c)) => {
+                cs.contains(c)
+            }
+            (Proj::Swizzle(a), Proj::Swizzle(b)) => a.iter().any(|c| b.contains(c)),
+            // Every element overlaps every other; an element overlaps its vector's components.
+            (Proj::Index(_), _) | (_, Proj::Index(_)) => true,
+            _ => false,
+        };
+        if !same {
+            return false;
+        }
+    }
+    true
+}
+
+/// Whether `prefix` is `p` or a place `p` is inside of.
+fn is_prefix(prefix: &Place, p: &Place) -> bool {
+    prefix.local == p.local
+        && prefix.proj.len() <= p.proj.len()
+        && prefix.proj.iter().zip(&p.proj).all(|(a, b)| match (a, b) {
+            (Proj::Index(_), Proj::Index(_)) => true,
+            _ => a == b,
+        })
+}
+
+/// What happens to a place.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Access {
+    Read,
+    Write,
+    Move,
+    Borrow,
+    MutBorrow,
+}
+
+/// A program point: a block and a statement in it (the terminator is `stmts.len()`).
+type Point = (BlockId, usize);
+
+struct FnCheck<'a> {
+    p: &'a Program,
+    body: &'a Body,
+    f: &'a FnBody,
+    closure: Option<ClosureId>,
+    /// Locals live after each point.
+    live_after: HashMap<Point, Bits>,
+    loans: Vec<Loan>,
+    /// Loans by where they're made and what they're on, so a block revisited makes the same.
+    loan_ids: HashMap<(Point, Place, Local, bool), usize>,
+    diags: Vec<Diagnostic>,
+    emit: bool,
+    /// Loans already reported in a conflict: one error per loan, at its first conflict (later
+    /// ones are usually its consequences).
+    reported: Vec<usize>,
+}
+
+impl<'a> FnCheck<'a> {
+    fn new(p: &'a Program, body: &'a Body, f: &'a FnBody, closure: Option<ClosureId>) -> Self {
+        FnCheck {
+            p,
+            body,
+            f,
+            closure,
+            live_after: HashMap::new(),
+            loans: Vec::new(),
+            loan_ids: HashMap::new(),
+            diags: Vec::new(),
+            emit: false,
+            reported: Vec::new(),
+        }
+    }
+
+    fn run(mut self) -> Vec<Diagnostic> {
+        let reachable = self.reachable();
+        self.liveness(&reachable);
+        // Forward: each reachable block's state on entry, to a fixpoint.
+        let n = self.f.blocks.len();
+        let empty = State { loans: Bits::new(0), moves: Vec::new(), uninit: Bits::new(0) };
+        let mut entry: Vec<Option<State>> = vec![None; n];
+        entry[0] = Some(empty);
+        let mut work = vec![FnBody::ENTRY];
+        while let Some(b) = work.pop() {
+            let Some(st) = entry[b.index()].clone() else { continue };
+            let out = self.transfer_block(b, st);
+            for s in self.f.successors(b) {
+                let mut incoming = out.clone();
+                if self.f.is_back_edge(b) {
+                    for m in &mut incoming.moves {
+                        m.back = true;
+                    }
+                }
+                let changed = match &mut entry[s.index()] {
+                    Some(e) => e.join(&incoming),
+                    slot @ None => {
+                        *slot = Some(incoming);
+                        true
+                    }
+                };
+                if changed && !work.contains(&s) {
+                    work.push(s);
+                }
+            }
+        }
+        // Then once more over each block, reporting.
+        self.emit = true;
+        for (i, e) in entry.iter().enumerate() {
+            if let Some(st) = e
+                && reachable[i]
+            {
+                self.transfer_block(BlockId(i as u32), st.clone());
+            }
+        }
+        self.diags
+    }
+
+    fn reachable(&self) -> Vec<bool> {
+        let mut seen = vec![false; self.f.blocks.len()];
+        let mut work = vec![FnBody::ENTRY];
+        while let Some(b) = work.pop() {
+            if std::mem::replace(&mut seen[b.index()], true) {
+                continue;
+            }
+            work.extend(self.f.successors(b));
+        }
+        seen
+    }
+
+    fn liveness(&mut self, reachable: &[bool]) {
+        let n = self.f.blocks.len();
+        let nl = self.body.locals.len();
+        let mut live_in: Vec<Bits> = vec![Bits::new(nl); n];
+        loop {
+            let mut changed = false;
+            for b in (0..n).rev() {
+                if !reachable[b] {
+                    continue;
+                }
+                let id = BlockId(b as u32);
+                let mut live = Bits::new(nl);
+                for s in self.f.successors(id) {
+                    live.union(&live_in[s.index()]);
+                }
+                let block = self.f.block(id);
+                self.live_after.insert((id, block.stmts.len()), live.clone());
+                let mut uses = Vec::new();
+                term_uses(&block.term, &mut uses);
+                uses.iter().for_each(|u| live.insert(u.index()));
+                for (i, s) in block.stmts.iter().enumerate().rev() {
+                    self.live_after.insert((id, i), live.clone());
+                    let (uses, def) = stmt_uses_defs(self.body, s);
+                    if let Some(d) = def {
+                        live.remove(d.index());
+                    }
+                    uses.iter().for_each(|u| live.insert(u.index()));
+                }
+                changed |= live_in[b].union(&live);
+            }
+            if !changed {
+                break;
+            }
+        }
+    }
+
+    fn local(&self, l: Local) -> &'a LocalDecl {
+        self.body.local(l)
+    }
+
+    fn is_alias(&self, l: Local) -> bool {
+        self.local(l).kind.is_projection()
+    }
+
+    /// Whether `l` is outside the closure being checked (a capture).
+    fn is_capture(&self, l: Local) -> bool {
+        match self.closure {
+            Some(c) => {
+                self.local(l).closure != Some(c)
+                    && !self.body.closures[c.0 as usize].params.contains(&l)
+            }
+            None => false,
+        }
+    }
+
+    fn describe(&self, p: &Place) -> String {
+        describe(self.p, &self.body.locals, p)
+    }
+
+    fn err(&mut self, d: Diagnostic) {
+        if self.emit {
+            self.diags.push(d);
+        }
+    }
+
+    // ---- transfer ------------------------------------------------------------------------------
+
+    fn transfer_block(&mut self, b: BlockId, mut st: State) -> State {
+        let block = self.f.block(b);
+        for (i, s) in block.stmts.iter().enumerate() {
+            self.statement(&mut st, (b, i), s);
+        }
+        let at = (b, block.stmts.len());
+        match &block.term.kind {
+            TerminatorKind::If { cond, .. } => self.operand(&mut st, at, cond),
+            TerminatorKind::Return(Some(o)) => self.operand(&mut st, at, o),
+            TerminatorKind::ReturnPlace(place) => self.return_place(&mut st, at, place),
+            _ => {}
+        }
+        st
+    }
+
+    fn statement(&mut self, st: &mut State, at: Point, s: &Statement) {
+        match &s.kind {
+            StatementKind::Assign(place, r) => {
+                self.rvalue(st, at, r, s.span);
+                if place.proj.is_empty() && !is_bound_alias(self.body, place.local, r) {
+                    // The whole local gets a new value: its first (a binding's), or a new one,
+                    // which is a write.
+                    let l = place.local;
+                    let first = st.uninit.contains(l.index())
+                        || !matches!(self.local(l).kind, LocalKind::User(_));
+                    if !first {
+                        self.write(st, at, place, s.span);
+                    }
+                    self.redefine(st, l);
+                    st.uninit.remove(l.index());
+                    match r {
+                        Rvalue::Call(c) if c.ret_mode != RetMode::Owned => {
+                            self.call_result_loans(st, at, place.local, c, s.span)
+                        }
+                        Rvalue::Closure(id) => self.closure_loans(st, at, place.local, *id, s.span),
+                        Rvalue::Use(Operand { kind: OperandKind::Copy(src), ty, .. })
+                            if src.proj.is_empty()
+                                && matches!(
+                                    self.p.types.kind(*ty),
+                                    TyKind::Closure(..) | TyKind::FnPtr(..) | TyKind::FnDef(..)
+                                ) =>
+                        {
+                            // A closure held by another local: its loans travel with it.
+                            self.inherit(st, at, place.local, src.local, s.span)
+                        }
+                        _ => {}
+                    }
+                } else {
+                    self.write(st, at, place, s.span);
+                }
+            }
+            StatementKind::Eval(r) => self.rvalue(st, at, r, s.span),
+            StatementKind::Bind { local, place, mutable } => {
+                self.bind(st, at, *local, place, *mutable, s.span)
+            }
+            StatementKind::Live(l) => {
+                self.redefine(st, *l);
+                st.uninit.insert(l.index());
+            }
+            StatementKind::Dead(l) => {
+                self.redefine(st, *l);
+                st.uninit.remove(l.index());
+            }
+        }
+    }
+
+    /// `l` gets a new value (or goes out of scope): its loans end, and what was moved out of
+    /// it is gone with the old value.
+    fn redefine(&mut self, st: &mut State, l: Local) {
+        let held: Vec<usize> = st.loans.iter().filter(|&i| self.loans[i].holder == l).collect();
+        for i in held {
+            st.loans.remove(i);
+        }
+        st.moves.retain(|m| m.place.local != l);
+    }
+
+    fn new_loan(&mut self, st: &mut State, at: Point, loan: Loan) {
+        let key = (at, loan.place.clone(), loan.holder, loan.mutable);
+        let id = match self.loan_ids.get(&key) {
+            Some(&i) => {
+                self.loans[i] = loan;
+                i
+            }
+            None => {
+                self.loans.push(loan);
+                let i = self.loans.len() - 1;
+                self.loan_ids.insert(key, i);
+                i
+            }
+        };
+        st.loans.insert(id);
+    }
+
+    fn operand(&mut self, st: &mut State, at: Point, o: &Operand) {
+        match &o.kind {
+            OperandKind::Copy(p) | OperandKind::Move(p, MoveKind::Unmarked) => {
+                self.access(st, at, p, Access::Read, o.span)
+            }
+            OperandKind::Move(p, _) => self.access(st, at, p, Access::Move, o.span),
+            OperandKind::Const(_) => {}
+        }
+    }
+
+    fn rvalue(&mut self, st: &mut State, at: Point, r: &Rvalue, span: Span) {
+        match r {
+            Rvalue::Use(o)
+            | Rvalue::Unary(_, o)
+            | Rvalue::ArrayRepeat(o, _)
+            | Rvalue::Convert(o) => self.operand(st, at, o),
+            Rvalue::Binary(_, a, b) => {
+                self.operand(st, at, a);
+                self.operand(st, at, b);
+            }
+            Rvalue::Adt { fields: xs, .. }
+            | Rvalue::Tuple(xs)
+            | Rvalue::Array(xs)
+            | Rvalue::Construct(xs) => xs.iter().for_each(|x| self.operand(st, at, x)),
+            Rvalue::Discriminant(p) | Rvalue::Len(p) => self.access(st, at, p, Access::Read, span),
+            Rvalue::Call(c) => {
+                for a in &c.args {
+                    match a {
+                        // Bound (and checked) where the argument was evaluated.
+                        Arg::Borrow(..) => {}
+                        Arg::Mut(p, span) => {
+                            if !self.is_alias(p.local) {
+                                self.access(st, at, p, Access::MutBorrow, *span);
+                            }
+                        }
+                        Arg::Take(o) => self.operand(st, at, o),
+                    }
+                }
+            }
+            Rvalue::Closure(_) | Rvalue::FnRef(..) => {}
+            Rvalue::Dispatch(d) => d.groups.iter().for_each(|g| self.operand(st, at, g)),
+            Rvalue::Draw(d) => {
+                self.operand(st, at, &d.vertices);
+                self.operand(st, at, &d.instances);
+            }
+        }
+    }
+
+    /// The places an access through `place` touches, each with the projections it's through
+    /// (empty for a place of a local that holds its value).
+    fn resolve(&self, st: &State, place: &Place) -> Vec<(Place, Vec<Local>, bool)> {
+        if !self.is_alias(place.local) {
+            return vec![(place.clone(), Vec::new(), true)];
+        }
+        let mut out: Vec<(Place, Vec<Local>, bool)> = Vec::new();
+        for i in st.loans.iter() {
+            let l = &self.loans[i];
+            if l.holder != place.local {
+                continue;
+            }
+            let target = if l.exact {
+                let mut t = l.place.clone();
+                t.proj.extend(place.proj.iter().cloned());
+                t
+            } else {
+                l.place.clone()
+            };
+            if !out.iter().any(|(p, ..)| *p == target) {
+                out.push((target, l.via.clone(), l.exact));
+            }
+        }
+        out
+    }
+
+    /// `local` starts aliasing `place`.
+    fn bind(
+        &mut self,
+        st: &mut State,
+        at: Point,
+        local: Local,
+        place: &Place,
+        mutable: bool,
+        span: Span,
+    ) {
+        let kind = if mutable { Access::MutBorrow } else { Access::Borrow };
+        let targets = self.resolve(st, place);
+        // What `local` held before (a loop's last pass) ends here, before the new loan's
+        // access is checked against the others.
+        self.redefine(st, local);
+        self.access(st, at, place, kind, span);
+        for (t, via, exact) in targets {
+            let mut v = vec![local];
+            v.extend(via);
+            self.new_loan(st, at, Loan { place: t, mutable, holder: local, via: v, exact, span });
+        }
+    }
+
+    /// What a projection-returning call returned: somewhere inside its `borrow` and `mut`
+    /// arguments (writable through only if it returned `mut`, from a `mut` argument).
+    fn call_result_loans(
+        &mut self,
+        st: &mut State,
+        at: Point,
+        holder: Local,
+        c: &Call,
+        span: Span,
+    ) {
+        for a in &c.args {
+            let (p, from_mut) = match a {
+                Arg::Borrow(p, _) => (p, false),
+                Arg::Mut(p, _) => (p, true),
+                Arg::Take(_) => continue,
+            };
+            let mutable = from_mut && c.ret_mode == RetMode::Mut;
+            for (t, via, _) in self.resolve(st, p) {
+                let mut v = vec![holder];
+                v.extend(via);
+                self.new_loan(
+                    st,
+                    at,
+                    Loan { place: t, mutable, holder, via: v, exact: false, span },
+                );
+            }
+        }
+    }
+
+    /// A closure borrows its captures while the local holding it is live: mutably those it
+    /// writes.
+    fn closure_loans(
+        &mut self,
+        st: &mut State,
+        at: Point,
+        holder: Local,
+        id: ClosureId,
+        span: Span,
+    ) {
+        let caps = self.body.closures[id.0 as usize].captures.clone();
+        for (l, written) in caps {
+            let place = Place::local(l);
+            let kind = if written { Access::MutBorrow } else { Access::Borrow };
+            let targets = self.resolve(st, &place);
+            self.access(st, at, &place, kind, span);
+            for (t, via, exact) in targets {
+                let mut v = vec![holder];
+                v.extend(via);
+                self.new_loan(
+                    st,
+                    at,
+                    Loan { place: t, mutable: written, holder, via: v, exact, span },
+                );
+            }
+        }
+    }
+
+    /// `to` holds what `from` holds (a closure copied to another local).
+    fn inherit(&mut self, st: &mut State, at: Point, to: Local, from: Local, span: Span) {
+        let held: Vec<Loan> =
+            st.loans.iter().map(|i| self.loans[i].clone()).filter(|l| l.holder == from).collect();
+        for l in held {
+            let mut via = vec![to];
+            via.extend(l.via.iter().copied());
+            self.new_loan(st, at, Loan { holder: to, via, span, ..l });
+        }
+    }
+
+    fn write(&mut self, st: &mut State, at: Point, place: &Place, span: Span) {
+        self.access(st, at, place, Access::Write, span);
+    }
+
+    // ---- accesses -----------------------------------------------------------------------------
+
+    /// Checks an access to `place`, then applies it (a move, or a reinitialization).
+    fn access(&mut self, st: &mut State, at: Point, place: &Place, access: Access, span: Span) {
+        let root = place.local;
+        let what = self.describe(place);
+        // Through a projection: it must allow the access; then the access is to what it
+        // aliases.
+        if self.is_alias(root) {
+            match access {
+                Access::Write | Access::MutBorrow if !self.local(root).kind.writable() => {
+                    self.read_only(root, &what, access, span);
+                    return;
+                }
+                Access::Move => {
+                    self.not_owned(root, &what, span);
+                    return;
+                }
+                _ => {}
+            }
+            for (target, via, _) in self.resolve(st, place) {
+                self.check_target(st, at, &target, &via, access, span);
+            }
+            return;
+        }
+        // A capture is the enclosing function's place: written only if captured mutably (the
+        // checker of the enclosing function saw to that), and never moved.
+        if self.is_capture(root) {
+            if access == Access::Move {
+                self.err(
+                    Diagnostic::new(
+                        codes::E0502,
+                        span,
+                        format!("can't move `{what}` out of the closure's surroundings"),
+                    )
+                    .with_note("a closure borrows what it uses; it doesn't own it (§6.7)")
+                    .with_help(format!("use `{what}.clone()`")),
+                );
+            }
+            return;
+        }
+        match access {
+            Access::Write | Access::MutBorrow if !self.local(root).kind.writable() => {
+                self.read_only(root, &what, access, span);
+                return;
+            }
+            Access::Move => {
+                let owned = matches!(
+                    self.local(root).kind,
+                    LocalKind::User(
+                        thir::LocalKind::Owned { .. } | thir::LocalKind::Param(Mode::Take)
+                    ) | LocalKind::Temp
+                        | LocalKind::TempVar
+                );
+                if !owned {
+                    self.not_owned(root, &what, span);
+                    return;
+                }
+                if place.proj.iter().any(|p| matches!(p, Proj::Index(_))) {
+                    self.err(
+                        Diagnostic::new(
+                            codes::E0502,
+                            span,
+                            format!("can't move out of `{what}`: it's an element of an array"),
+                        )
+                        .with_note(
+                            "an element can't be moved out on its own; the array would have a hole",
+                        )
+                        .with_help(format!("use `{what}.clone()`")),
+                    );
+                    return;
+                }
+            }
+            _ => {}
+        }
+        self.check_target(st, at, place, &[], access, span);
+    }
+
+    /// The moves and loans an access to `target` (a place of a local holding its value) meets,
+    /// through the projections `via`; then the access's effect.
+    fn check_target(
+        &mut self,
+        st: &mut State,
+        at: Point,
+        target: &Place,
+        via: &[Local],
+        access: Access,
+        span: Span,
+    ) {
+        // 1. Moved?
+        if let Some(m) = st.moves.iter().find(|m| overlaps(&m.place, target)).cloned() {
+            let reinit = access == Access::Write && m.place.proj.len() >= target.proj.len();
+            if !reinit {
+                self.moved(target, &m, span);
+                return;
+            }
+        }
+        // 2. Loans held by others, live here, on an overlapping place.
+        let live = self.live_after.get(&at).cloned().unwrap_or_else(|| Bits::new(0));
+        let conflict = st.loans.iter().find(|&i| {
+            let l = &self.loans[i];
+            live.contains(l.holder.index())
+                && !via.contains(&l.holder)
+                && overlaps(&l.place, target)
+                && (l.mutable || matches!(access, Access::Write | Access::Move | Access::MutBorrow))
+        });
+        if let Some(i) = conflict
+            && !(self.emit && self.reported.contains(&i))
+        {
+            if self.emit {
+                self.reported.push(i);
+            }
+            let l = self.loans[i].clone();
+            self.conflict(target, &l, access, span);
+        }
+        // 3. Apply.
+        let tracked = matches!(self.local(target.local).kind, LocalKind::User(_));
+        match access {
+            Access::Move if tracked => {
+                st.moves.push(Moved { place: target.clone(), span, maybe: false, back: false })
+            }
+            Access::Write => st.moves.retain(|m| !is_prefix(target, &m.place)),
+            _ => {}
+        }
+    }
+
+    fn moved(&mut self, target: &Place, m: &Moved, span: Span) {
+        let what = self.describe(target);
+        let moved = self.describe(&m.place);
+        let d = if m.back {
+            let mut e = Diagnostic::new(
+                codes::E0515,
+                span,
+                format!("`{moved}` is moved inside this loop, so the next iteration can't use it"),
+            );
+            if m.span != span {
+                e = e.with_secondary(m.span, "moved here");
+            }
+            e.with_note("a value from outside a loop can be moved inside it at most once")
+                .with_help(format!(
+                    "move `{moved}` before the loop, or move `{moved}.clone()` inside it"
+                ))
+        } else if m.maybe {
+            Diagnostic::new(codes::E0516, span, format!("`{what}` might have been moved already"))
+                .with_secondary(m.span, format!("`{moved}` is moved here on some paths"))
+                .with_help("move it on every path, or `.clone()` it where it's moved")
+        } else {
+            Diagnostic::new(
+                codes::E0500,
+                span,
+                format!("`{what}` was moved, so it can't be used here"),
+            )
+            .with_secondary(m.span, format!("`{moved}` is moved here"))
+            .with_help(format!("pass `{moved}.clone()` where it's moved if you still need it here"))
+        };
+        self.err(d);
+    }
+
+    /// How a loan's holder is named in a diagnostic.
+    fn holder_text(&self, h: Local) -> String {
+        let d = self.local(h);
+        match d.kind {
+            LocalKind::TempProjection { .. } if d.name.ends_with("(..)") => {
+                format!("the result of `{}`", d.name)
+            }
+            _ => format!("`{}`", d.name),
+        }
+    }
+
+    fn conflict(&mut self, target: &Place, l: &Loan, access: Access, span: Span) {
+        let what = self.describe(target);
+        let other = self.describe(&l.place);
+        let d = if let LocalKind::Arg { .. } = self.local(l.holder).kind {
+            Diagnostic::new(
+                codes::E0513,
+                span,
+                match (what == other, l.mutable) {
+                    (true, true) => format!("`{what}` is already passed `mut` in this call"),
+                    (true, false) => format!("`{what}` is already passed in this call"),
+                    (false, true) => {
+                        format!(
+                            "`{what}` overlaps `{other}`, which this call already takes mutably"
+                        )
+                    }
+                    (false, false) => {
+                        format!("`{what}` overlaps `{other}`, which this call already takes")
+                    }
+                },
+            )
+            .with_secondary(l.span, format!("`{other}` is passed here"))
+            .with_note("in one call, arguments can't overlap when one of them is `mut` (§6.5)")
+        } else {
+            let hn = self.holder_text(l.holder);
+            let msg = if l.mutable {
+                format!("`{what}` overlaps `{other}`, which {hn} is borrowing mutably")
+            } else {
+                format!("`{what}` can't be changed while {hn} borrows `{other}`")
+            };
+            let code = if l.mutable { codes::E0506 } else { codes::E0507 };
+            let mut d = Diagnostic::new(code, span, msg)
+                .with_secondary(l.span, format!("{hn} borrows `{other}` here"))
+                .with_note(format!("{hn} is used later, so the borrow is still live"));
+            if l.mutable
+                && matches!(access, Access::Borrow | Access::Read)
+                && target.proj.len() < l.place.proj.len()
+            {
+                d = d.with_help(format!("pass only the parts that don't overlap `{other}`"));
+            }
+            d
+        };
+        self.err(d);
+    }
+
+    fn read_only(&mut self, root: Local, what: &str, access: Access, span: Span) {
+        let decl = self.local(root);
+        let (code, verb) = if access == Access::Write {
+            (codes::E0505, "assign to")
+        } else {
+            (codes::E0512, "lend mutably")
+        };
+        let why = match decl.kind {
+            LocalKind::User(thir::LocalKind::Param(Mode::Borrow)) => {
+                format!("`{}` is borrowed, not `mut`", decl.name)
+            }
+            LocalKind::User(thir::LocalKind::Param(Mode::Take)) => {
+                format!("`{}` is taken, and a taken parameter is read-only", decl.name)
+            }
+            LocalKind::User(thir::LocalKind::Owned { .. }) => {
+                format!("`{}` is a `let` binding", decl.name)
+            }
+            LocalKind::User(thir::LocalKind::Projection { .. }) => {
+                format!("`{}` is a read-only projection", decl.name)
+            }
+            LocalKind::User(thir::LocalKind::ClosureParam) => {
+                format!("`{}` is a closure parameter", decl.name)
+            }
+            LocalKind::TempProjection { .. } if decl.name.ends_with("(..)") => {
+                format!("`{}` returns `borrow`, not `mut`", decl.name.trim_end_matches("(..)"))
+            }
+            _ => format!("`{}` is read-only", decl.name),
+        };
+        let mut d = Diagnostic::new(code, span, format!("can't {verb} `{what}`: {why}"));
+        d = match decl.kind {
+            LocalKind::User(thir::LocalKind::Param(_)) => d.with_help(format!(
+                "make the parameter `mut`: `{}: mut ...`, and pass `mut` at the call site",
+                decl.name
+            )),
+            LocalKind::User(thir::LocalKind::Owned { .. }) => {
+                let d = d
+                    .with_help(format!("declare it with `var {}` to change it", decl.name))
+                    .with_secondary(decl.span, "declared here");
+                match decl.keyword {
+                    Some(k) => d.with_fix("make it `var`", k, "var"),
+                    None => d,
+                }
+            }
+            LocalKind::User(thir::LocalKind::Projection { .. }) => d
+                .with_help(format!("project it with `mut {} = ...` to change it", decl.name))
+                .with_secondary(decl.span, "declared here"),
+            LocalKind::User(thir::LocalKind::ClosureParam) => {
+                d.with_help("copy it into a `var` first")
+            }
+            LocalKind::TempProjection { .. } => {
+                d.with_help("call a function that returns `mut` to change it")
+            }
+            _ => d,
+        };
+        self.err(d);
+    }
+
+    fn not_owned(&mut self, root: Local, what: &str, span: Span) {
+        let decl = self.local(root);
+        let why = match decl.kind {
+            LocalKind::User(thir::LocalKind::Param(_)) => {
+                format!("`{}` is borrowed by this function, not owned", decl.name)
+            }
+            LocalKind::User(thir::LocalKind::ClosureParam) => {
+                format!("`{}` is a closure parameter", decl.name)
+            }
+            _ => format!("`{}` is a projection of another place", decl.name),
+        };
+        let mut d =
+            Diagnostic::new(codes::E0502, span, format!("can't move out of `{what}`: {why}"))
+                .with_help(format!("use `{what}.clone()` for a copy you own"));
+        if let LocalKind::User(thir::LocalKind::Param(Mode::Borrow)) = decl.kind {
+            d = d.with_help(format!(
+                "or take ownership in the signature: `{}: take ...`",
+                decl.name
+            ));
+        }
+        self.err(d);
+    }
+
+    /// `-> borrow T` and `-> mut T` return a place of a `borrow` or `mut` parameter (§6.4).
+    fn return_place(&mut self, st: &mut State, at: Point, place: &Place) {
+        let mode = self.f.ret_mode;
+        let access = if mode == RetMode::Mut { Access::MutBorrow } else { Access::Borrow };
+        let ret_span = self.f.block(at.0).term.span;
+        self.access(st, at, place, access, ret_span);
+        for (target, ..) in self.resolve(st, place) {
+            let decl = self.local(target.local);
+            match decl.kind {
+                LocalKind::User(thir::LocalKind::Param(Mode::Mut)) => {}
+                LocalKind::User(thir::LocalKind::Param(Mode::Borrow)) if mode == RetMode::Borrow => {}
+                LocalKind::User(thir::LocalKind::Param(Mode::Borrow)) => self.err(
+                    Diagnostic::new(codes::E0512, ret_span, format!("can't return a `mut` projection of `{}`: it's borrowed, not `mut`", decl.name))
+                        .with_help(format!("make the parameter `{}: mut ...`", decl.name)),
+                ),
+                _ => self.err(
+                    Diagnostic::new(codes::E0508, ret_span, format!("a projection must come from a `borrow` or `mut` parameter, and `{}` isn't one", decl.name))
+                        .with_note("a projection can't outlive what it points into; this function's locals end when it returns (§6.4)")
+                        .with_help("return an owned value instead: change the return type to `-> T` and return a copy or a new value"),
+                ),
+            }
+        }
+    }
+}
+
+/// W0001: a local bound and never used. Parameters, `_` and names starting with `_` aren't
+/// reported.
+fn unused_locals(body: &Body) -> Vec<Diagnostic> {
+    let n = body.locals.len();
+    let mut used = vec![false; n];
+    let mut bound = vec![false; n];
+    for f in &body.fns {
+        for b in &f.blocks {
+            for s in &b.stmts {
+                let (uses, _) = stmt_uses_defs(body, s);
+                for u in uses {
+                    used[u.index()] = true;
+                }
+                match &s.kind {
+                    StatementKind::Live(l) => bound[l.index()] = true,
+                    StatementKind::Assign(p, _) if !p.proj.is_empty() => {
+                        used[p.local.index()] = true
+                    }
+                    _ => {}
+                }
+            }
+            let mut uses = Vec::new();
+            term_uses(&b.term, &mut uses);
+            for u in uses {
+                used[u.index()] = true;
+            }
+        }
+    }
+    for c in &body.closures {
+        for (l, _) in &c.captures {
+            used[l.index()] = true;
+        }
+    }
+    let mut out = Vec::new();
+    for (i, d) in body.locals.iter().enumerate() {
+        if !bound[i] || used[i] || d.name.starts_with('_') {
+            continue;
+        }
+        if !matches!(d.kind, LocalKind::User(_)) {
+            continue;
+        }
+        out.push(
+            Diagnostic::new(codes::W0001, d.span, format!("`{}` is never used", d.name)).with_fix(
+                format!("rename it `_{}`", d.name),
+                d.span.shrink_to_start(),
+                "_",
+            ),
+        );
+    }
+    out
+}

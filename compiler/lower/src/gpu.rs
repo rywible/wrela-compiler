@@ -176,13 +176,15 @@ pub(crate) fn lower_dispatch(fl: &mut Fl, d: &thir::Dispatch, span: Span) {
     let pindex =
         pipeline_index(fl.cx, PipelineKey::Compute { kernel: d.kernel, substs: substs.clone() });
     let ptys = param_types(fl.cx, d.kernel, &substs);
-    let mut groups = Vec::new();
-    for g in &d.groups {
-        match fl.expr(g) {
-            Some(v) => groups.push(v),
-            None => return,
-        }
-    }
+    let Some(gv) = fl.expr(&d.groups) else { return };
+    let gt = fl.concrete(d.groups.ty);
+    let groups = if matches!(fl.cx.checked.program.types.kind(gt), TyKind::Tuple(_)) {
+        let u = fl.mb.m.types.u32();
+        (0..3).map(|k| fl.value(u, ir::Expr::Extract(gv, k))).collect::<Vec<_>>()
+    } else {
+        let one = fl.u32c(1);
+        vec![gv, one, one]
+    };
     let mut handles = Vec::new();
     let mut uniform_vals = Vec::new();
     let mut uniform_fields = Vec::new();

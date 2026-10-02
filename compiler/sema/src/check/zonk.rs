@@ -17,6 +17,7 @@ pub fn walk_tys(e: &mut Expr, f: &mut impl FnMut(&mut TyId)) {
         | ExprKind::Local(_)
         | ExprKind::Const(_)
         | ExprKind::Closure(_)
+        | ExprKind::FromBase
         | ExprKind::Break
         | ExprKind::Continue
         | ExprKind::Error => {}
@@ -45,10 +46,13 @@ pub fn walk_tys(e: &mut Expr, f: &mut impl FnMut(&mut TyId)) {
                 walk_tys(a, f);
             }
         }
-        ExprKind::Adt { args, fields, .. } => {
+        ExprKind::Adt { args, fields, base, .. } => {
             args.iter_mut().for_each(&mut *f);
             for x in fields {
                 walk_tys(x, f);
+            }
+            if let Some(b) = base {
+                walk_tys(b, f);
             }
         }
         ExprKind::Tuple(xs) | ExprKind::Array(xs) | ExprKind::Construct(xs) => {
@@ -80,9 +84,7 @@ pub fn walk_tys(e: &mut Expr, f: &mut impl FnMut(&mut TyId)) {
         }
         ExprKind::Dispatch(d) => {
             d.kernel_args.iter_mut().for_each(&mut *f);
-            for g in &mut d.groups {
-                walk_tys(g, f);
-            }
+            walk_tys(&mut d.groups, f);
             for (_, a) in &mut d.args {
                 walk_tys(a, f);
             }

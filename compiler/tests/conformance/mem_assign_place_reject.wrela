@@ -1,0 +1,20 @@
+// rejects: mem.bindings
+const LIMIT: i32 = 3
+
+struct P {
+    x: i32,
+}
+
+fn mk() -> P {
+    P { x: 1 }
+}
+
+fn a2() -> i32 {
+    5 = 6 //~ E0505
+    (1, 2).0 = 3 //~ E0505
+    [1, 2, 3][0] = 5 //~ E0505
+    vec3(1.0).x = 2.0 //~ E0505
+    mk().x = 5 //~ E0505
+    LIMIT = 4 //~ E0505
+    1
+}
