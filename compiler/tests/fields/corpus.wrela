@@ -48,7 +48,10 @@ pub struct Logs: Copy + Clone + GpuData {
 
 impl Surface for Logs {
     fn distance(self, p: vec3) -> f32 {
-        log(1.0 + p.x * p.x) + log2(2.0 + sin(p.y)) * pow(1.5 + 0.5 * cos(p.z), self.s) + exp2(0.5 * p.y) - inverse_sqrt(1.0 + p.z * p.z)
+        log(1.0 + p.x * p.x) +
+            log2(2.0 + sin(p.y)) * pow(1.5 + 0.5 * cos(p.z), self.s) +
+            exp2(0.5 * p.y) -
+            inverse_sqrt(1.0 + p.z * p.z)
     }
 }
 
@@ -59,7 +62,11 @@ pub struct Trig: Copy + Clone + GpuData {
 
 impl Surface for Trig {
     fn distance(self, p: vec3) -> f32 {
-        tan(self.s * p.x) + atan(p.y) + 0.3 * atan2(p.y, p.x + 3.0) + asin(clamp(0.4 * p.z, -1.0, 1.0)) + acos(0.5 * sin(p.x))
+        tan(self.s * p.x) +
+            atan(p.y) +
+            0.3 * atan2(p.y, p.x + 3.0) +
+            asin(clamp(0.4 * p.z, -1.0, 1.0)) +
+            acos(0.5 * sin(p.x))
     }
 }
 
@@ -70,7 +77,9 @@ pub struct Rational: Copy + Clone + GpuData {
 
 impl Surface for Rational {
     fn distance(self, p: vec3) -> f32 {
-        (p.x * p.y - p.z) / (1.0 + p.x * p.x + p.y * p.y) + self.s * p.x * p.y * p.z + 0.1 * ((p.x + 5.0) % 0.7)
+        (p.x * p.y - p.z) / (1.0 + p.x * p.x + p.y * p.y) +
+            self.s * p.x * p.y * p.z +
+            0.1 * ((p.x + 5.0) % 0.7)
     }
 }
 
@@ -82,7 +91,16 @@ pub struct Pieces: Copy + Clone + GpuData {
 
 impl Surface for Pieces {
     fn distance(self, p: vec3) -> f32 {
-        smoothstep(-1.0, 1.0, p.x) * mix(p.y, p.z, smoothstep(0.0, 1.0, p.x * p.x)) + clamp(p.z, -0.5, 0.5) + 0.2 * step(0.3, p.y) + abs(p.x - p.y) + 0.1 * floor(2.0 * p.z) + 0.1 * fract(self.s * p.x) + 0.05 * sign(p.x) + min(p.x, p.z) - max(p.y, 0.5 * p.z) + saturate(p.y)
+        smoothstep(-1.0, 1.0, p.x) * mix(p.y, p.z, smoothstep(0.0, 1.0, p.x * p.x)) +
+            clamp(p.z, -0.5, 0.5) +
+            0.2 * step(0.3, p.y) +
+            abs(p.x - p.y) +
+            0.1 * floor(2.0 * p.z) +
+            0.1 * fract(self.s * p.x) +
+            0.05 * sign(p.x) +
+            min(p.x, p.z) -
+            max(p.y, 0.5 * p.z) +
+            saturate(p.y)
     }
 }
 
@@ -94,7 +112,11 @@ pub struct Vectors: Copy + Clone + GpuData {
 impl Surface for Vectors {
     fn distance(self, p: vec3) -> f32 {
         let n = normalize(p + vec3(3.0, 0.5, 0.0))
-        length(p - self.c) + dot(n, vec3(1.0, 2.0, 3.0)) + cross(p, vec3(0.2, 1.0, 0.4)).x + 0.5 * distance(p, vec3(1.0, 1.0, 1.0)) + dot(p.zxy, mix(p, p.yzx, vec3(0.25)))
+        length(p - self.c) +
+            dot(n, vec3(1.0, 2.0, 3.0)) +
+            cross(p, vec3(0.2, 1.0, 0.4)).x +
+            0.5 * distance(p, vec3(1.0, 1.0, 1.0)) +
+            dot(p.zxy, mix(p, p.yzx, vec3(0.25)))
     }
 }
 

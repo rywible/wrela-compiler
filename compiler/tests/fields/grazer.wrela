@@ -79,7 +79,12 @@ fn rest_skeleton() -> [P3; 29] {
     }
     let fore = [p3(0.0, -0.45, -0.04), p3(0.0, -0.42, 0.03), p3(0.0, -0.20, 0.02)]
     let hind = [p3(0.0, -0.50, 0.10), p3(0.0, -0.45, -0.12), p3(0.0, -0.22, 0.0)]
-    let hips = [p3(0.25, 1.15, 1.25), p3(-0.25, 1.15, 1.25), p3(0.25, 1.25, 0.05), p3(-0.25, 1.25, 0.05)]
+    let hips = [
+        p3(0.25, 1.15, 1.25),
+        p3(-0.25, 1.15, 1.25),
+        p3(0.25, 1.25, 0.05),
+        p3(-0.25, 1.25, 0.05),
+    ]
     for l in 0..4 {
         var p = hips[l]
         j[13 + l * 4] = p
@@ -257,7 +262,9 @@ pub fn grazer_from(a: [f32; 328]) -> Grazer {
         .smooth_union(ellipsoid(v4(a, TORSO, 3).xyz).translate(t2.xyz), k: t0.w)
         .displace(fbm(a[2], u32(a[3]), offset: vec3(a[4], a[5], a[6])), amp: a[1])
     let e = v4(a, HEAD, 0)
-    let head = ellipsoid(v4(a, HEAD, 1).xyz).translate(e.xyz).smooth_union(cone_at(a, HEAD, 2), k: e.w)
+    let head = ellipsoid(v4(a, HEAD, 1).xyz)
+        .translate(e.xyz)
+        .smooth_union(cone_at(a, HEAD, 2), k: e.w)
     var legs = [cone(a, LEG0); 12]
     for i in 0..12 {
         legs[i] = cone(a, LEG0 + i)

@@ -59,7 +59,10 @@ fn shade<F: Surface>(pixel: FragCoord, camera: Camera, field: F) -> vec4 {
 /// Grazer 1, turning slowly.
 pub fn frame(time: f32, width: u32, height: u32) {
     let a = 0.3 * time + 1.0
-    let camera = Camera { resolution: vec2(f32(width), f32(height)), eye: vec3(4.0 * sin(a), 1.6, 0.6 + 4.0 * cos(a)) }
+    let camera = Camera {
+        resolution: vec2(f32(width), f32(height)),
+        eye: vec3(4.0 * sin(a), 1.6, 0.6 + 4.0 * cos(a)),
+    }
     begin_screen_pass(clear: vec4(0.0, 0.0, 0.0, 1.0))
     draw(cover, shade, vertices: 3, camera: camera, field: grazer(1))
     present()
@@ -314,7 +317,11 @@ fn misses<F: Surface>(f: F, b: Box3, seed: u32, i: u32) -> u32 {
             if (k & 4) == 0 { b.lo.z } else { b.hi.z },
         )
         if k >= 8 {
-            let u = vec3(rnd(seed, i, 9 + 3 * k), rnd(seed, i, 10 + 3 * k), rnd(seed, i, 11 + 3 * k))
+            let u = vec3(
+                rnd(seed, i, 9 + 3 * k),
+                rnd(seed, i, 10 + 3 * k),
+                rnd(seed, i, 11 + 3 * k),
+            )
             p = clamp(b.lo + (b.hi - b.lo) * u, b.lo, b.hi)
         }
         let d = f.distance(p)
@@ -432,7 +439,13 @@ pub fn check_gpu(fi: u32, seed: u32, count: u32) {
         11 => dispatch(misses_gpu, groups: groups, f: Trig { s: 0.35 }, boxes: boxes, out: out),
         12 => dispatch(misses_gpu, groups: groups, f: Rational { s: 0.2 }, boxes: boxes, out: out),
         13 => dispatch(misses_gpu, groups: groups, f: Pieces { s: 2.0 }, boxes: boxes, out: out),
-        14 => dispatch(misses_gpu, groups: groups, f: Vectors { c: vec3(0.3, 0.3, 0.3) }, boxes: boxes, out: out),
+        14 => dispatch(
+            misses_gpu,
+            groups: groups,
+            f: Vectors { c: vec3(0.3, 0.3, 0.3) },
+            boxes: boxes,
+            out: out,
+        ),
         15 => dispatch(misses_gpu, groups: groups, f: Branchy { n: 3 }, boxes: boxes, out: out),
         _ => dispatch(misses_gpu, groups: groups, f: Cells { s: 3.0 }, boxes: boxes, out: out),
     }

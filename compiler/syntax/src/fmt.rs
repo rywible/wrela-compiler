@@ -1,117 +1,128 @@
-//! The formatter: one canonical layout for any parsed file (D-038: "the formatter normalizes").
+//! The formatter (D-038: "the formatter normalizes"). It lays a parsed file out in 100 columns:
 //!
 //! - Four-space indents; one statement per line; `;` separators become line breaks.
-//! - Comments are kept. A comment is printed before the first item, member, statement, field,
-//!   variant, arm or argument that starts after it, or after the previous one on the same line
-//!   when it trailed code. A comment inside an expression moves to the end of its statement.
+//! - A list (arguments, parameters, fields, elements, struct literals) goes on one line if it
+//!   fits, and otherwise one element per line, with a trailing comma. A chain of two or more
+//!   method calls breaks before each call, and a chain of binary operators after each operator
+//!   (but not after `>` or `>>`, L20). Lines break only where L17 makes the break whitespace.
 //! - The author's choices that carry meaning are kept: single blank lines between statements and
-//!   between `const`s, leading-dot chains, and whether a call's arguments, a struct literal, a
-//!   struct or an enum spans several lines.
+//!   between `const`s, leading-dot chains, and whether a call's arguments, a struct literal, an
+//!   array, a struct or an enum spans several lines. So the same code can be formatted in more
+//!   than one way; formatting any of them again changes nothing.
+//! - Comments stay where they are: on their own lines before the item, statement, element, arm,
+//!   operand or closing bracket they come before, or at the end of the line they trailed. A list
+//!   or chain with a comment inside breaks, so the comment can end its line. A comment where the
+//!   layout has no line break (between a keyword and a name, say) moves to the end of its line.
 //! - It never changes what a file means: parsing its output gives the same AST (tests check this
 //!   and that formatting is idempotent).
+
+mod doc;
 
 use crate::ast::*;
 use crate::parser::Parsed;
 use crate::token::Comment;
+use doc::{Doc, alone, block, broken, concat, group, if_break, indent, nil, text};
 use wrela_diag::Span;
+
+/// The width lines are laid out in.
+const MAX_WIDTH: usize = 100;
 
 /// Formats a file that parsed without errors.
 pub fn format(parsed: &Parsed, text: &str) -> String {
-    let mut p =
-        Printer { out: String::new(), indent: 0, comments: &parsed.comments, next: 0, text };
-    p.file(&parsed.file);
-    p.out
+    let mut out = format_once(parsed, text);
+    // A comment the layout has no place for moves to the end of a line, and there the next
+    // pass may lay its surroundings out differently. That settles after a move or two; the
+    // result is what formatting keeps.
+    for _ in 0..4 {
+        let again = crate::parser::parse(wrela_diag::FileId(0), &out);
+        if again.has_errors() {
+            break;
+        }
+        let next = format_once(&again, &out);
+        if next == out {
+            break;
+        }
+        out = next;
+    }
+    out
 }
 
-struct Printer<'a> {
-    out: String,
-    indent: usize,
+fn format_once(parsed: &Parsed, text: &str) -> String {
+    let mut b = Builder { comments: &parsed.comments, next: 0, text };
+    let d = b.file(&parsed.file);
+    let mut out = doc::print(&d, MAX_WIDTH);
+    while out.ends_with('\n') || out.ends_with(' ') {
+        out.pop();
+    }
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out
+}
+
+/// Builds the document, placing the comments in source order as it goes.
+struct Builder<'a> {
     comments: &'a [Comment],
+    /// The first comment not yet placed.
     next: usize,
     text: &'a str,
 }
 
-/// The column a `use` list wraps at.
-const MAX_WIDTH: usize = 100;
-const INDENT: &str = "    ";
+/// How a list is written.
+#[derive(Clone, Copy)]
+struct List {
+    open: &'static str,
+    close: &'static str,
+    /// Spaces inside the brackets when it's on one line (`{ x: 1 }`).
+    padded: bool,
+    /// One element per line whatever the width: the author wrote it so.
+    multiline: bool,
+    /// A comma after a lone element even on one line (`(x,)`).
+    lone_comma: bool,
+}
 
-impl<'a> Printer<'a> {
-    fn w(&mut self, s: &str) {
-        self.out.push_str(s);
+const PARENS: List =
+    List { open: "(", close: ")", padded: false, multiline: false, lone_comma: false };
+const BRACES: List =
+    List { open: "{", close: "}", padded: true, multiline: false, lone_comma: false };
+
+impl<'a> Builder<'a> {
+    // ---- comments ----------------------------------------------------------------------------
+
+    fn pending(&self) -> Option<&'a Comment> {
+        self.comments.get(self.next)
     }
 
-    fn newline(&mut self) {
-        while self.out.ends_with(' ') {
-            self.out.pop();
-        }
-        self.out.push('\n');
-        for _ in 0..self.indent {
-            self.out.push_str(INDENT);
-        }
+    fn has_comment_before(&self, pos: u32) -> bool {
+        self.pending().is_some_and(|c| c.span.start < pos)
     }
 
-    fn at_line_start(&self) -> bool {
-        self.out.is_empty() || self.out.trim_end_matches(' ').ends_with('\n')
-    }
-
-    /// Prints, at the end of the current line, the comments that trailed code and start before
-    /// `pos`.
-    fn flush_trailing(&mut self, pos: u32) {
-        while let Some(c) = self.comments.get(self.next) {
-            if c.span.start >= pos || c.own_line || self.at_line_start() {
+    /// The comments before `pos` that trailed code on their lines, for the end of the line.
+    fn trailing(&mut self, pos: u32) -> Vec<Doc> {
+        let mut out = Vec::new();
+        while let Some(c) = self.pending() {
+            if c.span.start >= pos || c.own_line {
                 break;
             }
             self.next += 1;
-            self.w(" ");
-            self.w(&c.text);
+            out.push(Doc::LineSuffix(format!(" {}", c.text)));
         }
+        out
     }
 
-    /// At the start of a line: prints every pending comment that starts before `pos`, each on
-    /// its own line.
-    fn flush_comments(&mut self, pos: u32) {
-        while let Some(c) = self.comments.get(self.next) {
+    /// The comments before `pos`, each with a line break before it. The line breaks belong to
+    /// the caller's indentation.
+    fn own_lines(&mut self, pos: u32) -> Vec<Doc> {
+        let mut out = Vec::new();
+        while let Some(c) = self.pending() {
             if c.span.start >= pos {
                 break;
             }
             self.next += 1;
-            self.w(&c.text);
-            self.newline();
-            // A blank line after a comment (a file's header, a section's divider) stays.
-            let next = self.comments.get(self.next).map_or(pos, |n| n.span.start.min(pos));
-            let next = next.min(self.text.len() as u32);
-            let only_space = self.text[c.span.end as usize..next as usize].trim().is_empty();
-            if only_space && self.blank_between(c.span.end, next) {
-                self.newline();
-            }
+            out.push(Doc::HardLine);
+            out.push(text(&c.text));
         }
-    }
-
-    /// Before an element of a multi-line sequence: trailing comments, a line break, and, when
-    /// `blank`, an empty line, then the comments that come before the element.
-    fn before_element(&mut self, start: u32, blank: bool) {
-        self.flush_trailing(start);
-        self.newline();
-        if blank {
-            self.newline();
-        }
-        self.flush_comments(start);
-    }
-
-    /// Before the `}` (or `)`, `]`) that closes a multi-line sequence at `end`: the remaining
-    /// comments inside it, then the closer's line. Leaves the indent one level out.
-    fn before_close(&mut self, end: u32) {
-        self.flush_trailing(end);
-        while let Some(c) = self.comments.get(self.next) {
-            if c.span.start >= end {
-                break;
-            }
-            self.next += 1;
-            self.newline();
-            self.w(&c.text);
-        }
-        self.indent -= 1;
-        self.newline();
+        out
     }
 
     /// Whether the source has a blank line between two positions.
@@ -123,9 +134,248 @@ impl<'a> Printer<'a> {
         parts.len() > 2 && parts[1..parts.len() - 1].iter().any(|l| l.trim().is_empty())
     }
 
-    // ---- items -----------------------------------------------------------------------------
+    /// The comments before `pos`, at the start of a line: each on its own line, and a blank
+    /// line after one where the source has one (a file's header, a section's divider).
+    fn leading(&mut self, pos: u32) -> Vec<Doc> {
+        let mut out = Vec::new();
+        while let Some(c) = self.pending() {
+            if c.span.start >= pos {
+                break;
+            }
+            self.next += 1;
+            out.push(text(&c.text));
+            out.push(Doc::HardLine);
+            let next = self.pending().map_or(pos, |n| n.span.start.min(pos));
+            let next = next.min(self.text.len() as u32);
+            let only_space = self.text[c.span.end as usize..next as usize].trim().is_empty();
+            if only_space && self.blank_between(c.span.end, next) {
+                out.push(Doc::HardLine);
+            }
+        }
+        out
+    }
 
-    fn file(&mut self, f: &File) {
+    /// The line break before an element of a sequence that is always one per line (items,
+    /// statements, members, arms), with a blank line if `blank`, and the comments before it.
+    fn hard_break(&mut self, pos: u32, blank: bool) -> Doc {
+        let mut out = self.trailing(pos);
+        out.push(Doc::HardLine);
+        if blank {
+            out.push(Doc::HardLine);
+        }
+        out.extend(self.leading(pos));
+        concat(out)
+    }
+
+    /// The comments before the closer of a sequence that is one per line, at `end`: trailing
+    /// ones at the end of the last line, the rest on lines of their own.
+    fn hard_close(&mut self, end: u32) -> Doc {
+        let mut out = self.trailing(end);
+        out.extend(self.own_lines(end));
+        concat(out)
+    }
+
+    /// A line break the group decides on (`line`), before the node at `pos`, with the comments
+    /// before the node: trailing ones end the line before, the rest go on lines of their own.
+    /// Either kind breaks the group.
+    fn soft_break(&mut self, pos: u32, line: Doc) -> Doc {
+        let mut out = self.trailing(pos);
+        let mut any = !out.is_empty();
+        out.push(line);
+        while let Some(c) = self.pending() {
+            if c.span.start >= pos {
+                break;
+            }
+            self.next += 1;
+            any = true;
+            out.push(text(&c.text));
+            out.push(Doc::HardLine);
+        }
+        if any {
+            out.push(Doc::BreakParent);
+        }
+        concat(out)
+    }
+
+    /// Whether only space and comments come between `from` and `pos` in the source: a comment
+    /// that ends at `from` is directly before what's at `pos`, so the line break after it was
+    /// there too.
+    fn adjacent(&self, from: u32, pos: u32) -> bool {
+        let mut i = from;
+        while i < pos {
+            let b = self.text.as_bytes()[i as usize];
+            if b.is_ascii_whitespace() {
+                i += 1;
+            } else if let Some(c) = self.comments.iter().find(|c| c.span.start == i) {
+                i = c.span.end;
+            } else {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// The comments before `pos` that are directly before it in the source (see
+    /// [`Self::adjacent`]); the others, which a layout without a place for them passed over,
+    /// go at the end of the current line, which adds no line break.
+    fn split_stale(&mut self, pos: u32) -> (Vec<Doc>, Vec<&'a Comment>) {
+        let mut stale = Vec::new();
+        let mut here = Vec::new();
+        while let Some(c) = self.pending() {
+            if c.span.start >= pos {
+                break;
+            }
+            self.next += 1;
+            if self.adjacent(c.span.end, pos) {
+                here.push(c);
+            } else {
+                stale.push(Doc::LineSuffix(format!(" {}", c.text)));
+            }
+        }
+        (stale, here)
+    }
+
+    /// The comments before a node at `pos` that no list, chain or sequence placed. Those
+    /// directly before it keep their line break (it was whitespace there in the source) and
+    /// the node goes on, indented, after them.
+    fn inline_comments(&mut self, pos: u32) -> Doc {
+        if !self.has_comment_before(pos) {
+            return nil();
+        }
+        let (mut out, here) = self.split_stale(pos);
+        if here.is_empty() {
+            return concat(out);
+        }
+        let mut lines = Vec::new();
+        for (i, c) in here.into_iter().enumerate() {
+            if i == 0 && !c.own_line {
+                out.push(Doc::LineSuffix(format!(" {}", c.text)));
+            } else {
+                lines.push(Doc::HardLine);
+                lines.push(text(&c.text));
+            }
+        }
+        lines.push(Doc::HardLine);
+        out.push(Doc::BreakParent);
+        out.push(broken(indent(concat(lines))));
+        concat(out)
+    }
+
+    /// The comments before a closer at `end` that ends a bracket written on one line (`)`, `]`).
+    /// Those directly before it keep their line break, before the closer.
+    fn inline_close(&mut self, end: u32) -> Doc {
+        self.close_comments(end, false)
+    }
+
+    /// [`Self::inline_close`]; with `comma`, a comma goes before a line break (the line before
+    /// a `>` that closes a generic list must not end on an operand, L17).
+    fn close_comments(&mut self, end: u32, comma: bool) -> Doc {
+        if !self.has_comment_before(end) {
+            return nil();
+        }
+        let (mut out, here) = self.split_stale(end);
+        if here.is_empty() {
+            return concat(out);
+        }
+        if comma {
+            out.insert(0, text(","));
+        }
+        let mut lines = Vec::new();
+        for (i, c) in here.into_iter().enumerate() {
+            if i == 0 && !c.own_line {
+                out.push(Doc::LineSuffix(format!(" {}", c.text)));
+            } else {
+                lines.push(Doc::HardLine);
+                lines.push(text(&c.text));
+            }
+        }
+        out.push(Doc::BreakParent);
+        out.push(broken(concat([indent(concat(lines)), Doc::HardLine])));
+        concat(out)
+    }
+
+    /// The comments before the `close` that ends a list whose last element ends at `from`:
+    /// placed before it, so none moves past a closer, where a line break could end a statement.
+    fn close_after(&mut self, from: u32, close: char) -> Doc {
+        // Between the last element and the closer: only space, comments and a trailing comma.
+        let mut i = from as usize;
+        let bytes = self.text.as_bytes();
+        loop {
+            match bytes.get(i) {
+                Some(b) if b.is_ascii_whitespace() || *b == b',' => i += 1,
+                Some(b'/') => match self.comments.iter().find(|c| c.span.start as usize == i) {
+                    Some(c) => i = c.span.end as usize,
+                    None => break,
+                },
+                _ => break,
+            }
+        }
+        if bytes.get(i) == Some(&(close as u8)) {
+            self.close_comments(i as u32, close == '>')
+        } else {
+            nil()
+        }
+    }
+
+    // ---- lists -------------------------------------------------------------------------------
+
+    /// A comma-separated list in brackets, ending at `end` (just past its closer).
+    fn list<T>(
+        &mut self,
+        items: &[T],
+        start: impl Fn(&T) -> u32,
+        mut item: impl FnMut(&mut Self, &T) -> Doc,
+        end: u32,
+        l: List,
+    ) -> Doc {
+        // Comments up to the closer belong inside the brackets.
+        let inner_end = end.saturating_sub(1);
+        if items.is_empty() && !self.has_comment_before(inner_end) {
+            return text(format!("{}{}", l.open, l.close));
+        }
+        let line = || if l.padded { Doc::Line } else { Doc::SoftLine };
+        let mut inner = Vec::new();
+        for (i, x) in items.iter().enumerate() {
+            if i > 0 {
+                inner.push(text(","));
+            }
+            inner.push(self.soft_break(start(x), if i == 0 { line() } else { Doc::Line }));
+            inner.push(item(self, x));
+        }
+        if !items.is_empty() {
+            inner.push(if l.lone_comma && items.len() == 1 {
+                text(",")
+            } else {
+                if_break(text(","), nil())
+            });
+        }
+        // Comments before the closer, on the elements' lines.
+        let close = self.hard_close(inner_end);
+        if close.has_hard_line() {
+            inner.push(close);
+            inner.push(Doc::BreakParent);
+        }
+        let d = concat([text(l.open), indent(concat(inner)), line(), text(l.close)]);
+        if l.multiline { broken(d) } else { group(d) }
+    }
+
+    /// A list that never breaks: where a line break could end a statement (generic parameters
+    /// and arguments, closure parameters) or where lists are always short.
+    fn flat_list<T>(&mut self, items: &[T], mut item: impl FnMut(&mut Self, &T) -> Doc) -> Doc {
+        let mut out = Vec::new();
+        for (i, x) in items.iter().enumerate() {
+            if i > 0 {
+                out.push(text(", "));
+            }
+            out.push(item(self, x));
+        }
+        concat(out)
+    }
+
+    // ---- items -------------------------------------------------------------------------------
+
+    fn file(&mut self, f: &File) -> Doc {
+        let mut out = Vec::new();
         let mut prev: Option<&Item> = None;
         for item in &f.items {
             if let Some(p) = prev {
@@ -140,884 +390,770 @@ impl<'a> Printer<'a> {
                 } else {
                     true
                 };
-                self.before_element(item.span.start, blank);
+                out.push(self.hard_break(item.span.start, blank));
             } else {
-                self.flush_comments(item.span.start);
+                out.extend(self.leading(item.span.start));
             }
-            self.item(item);
+            out.push(self.item(item));
             prev = Some(item);
         }
-        self.flush_trailing(u32::MAX);
-        if !self.at_line_start() {
-            self.newline();
+        if !f.items.is_empty() {
+            out.extend(self.trailing(u32::MAX));
         }
-        self.flush_comments(u32::MAX);
-        while self.out.ends_with('\n') || self.out.ends_with(' ') {
-            self.out.pop();
+        while let Some(c) = self.pending() {
+            self.next += 1;
+            if !out.is_empty() {
+                out.push(Doc::HardLine);
+            }
+            out.push(text(&c.text));
         }
-        if !self.out.is_empty() {
-            self.out.push('\n');
-        }
+        concat(out)
     }
 
-    fn attrs(&mut self, attrs: &[Attribute]) {
+    fn attrs(&mut self, attrs: &[Attribute]) -> Doc {
+        let mut out = Vec::new();
         for a in attrs {
-            self.w("@");
-            self.w(&a.name.name);
+            out.push(text(format!("@{}", a.name.name)));
             if let Some(args) = &a.args {
-                self.args(args, false, a.span.end);
+                out.push(self.args(args, false, a.span.end));
             }
             // A comment after the attribute, on its line, stays there.
             let end = a.span.end as usize;
             let eol = self.text[end..].find('\n').map_or(self.text.len(), |i| end + i);
-            self.flush_trailing(eol as u32);
-            self.newline();
+            out.extend(self.trailing(eol as u32));
+            out.push(Doc::HardLine);
         }
+        concat(out)
     }
 
-    fn item(&mut self, item: &Item) {
-        self.attrs(&item.attrs);
-        if item.vis.is_some() {
-            self.w("pub ");
-        }
-        match &item.kind {
+    fn item(&mut self, item: &Item) -> Doc {
+        let attrs = self.attrs(&item.attrs);
+        let vis = if item.vis.is_some() { text("pub ") } else { nil() };
+        let kind = match &item.kind {
             ItemKind::Fn(f) => self.fn_decl(f),
-            ItemKind::Struct(s) => {
-                self.w("struct ");
-                self.w(&s.name.name);
-                self.generic_params(&s.generics);
-                self.trait_list(&s.traits);
-                self.w(" ");
-                self.fields(&s.fields, s.multiline, item.span.end);
-            }
+            ItemKind::Struct(s) => concat([
+                text(format!("struct {}", s.name.name)),
+                self.generic_params(&s.generics),
+                self.trait_list(&s.traits),
+                text(" "),
+                self.fields(&s.fields, s.multiline, item.span.end),
+            ]),
             ItemKind::Enum(e) => {
-                self.w("enum ");
-                self.w(&e.name.name);
-                self.generic_params(&e.generics);
-                self.trait_list(&e.traits);
-                if e.variants.is_empty() {
-                    self.w(" {}");
-                    return;
-                }
-                self.w(" {");
-                if e.multiline {
-                    self.indent += 1;
-                    for v in &e.variants {
-                        self.before_element(v.span.start, false);
-                        self.variant(v);
-                        self.w(",");
-                    }
-                    self.before_close(item.span.end);
-                } else {
-                    self.w(" ");
-                    for (i, v) in e.variants.iter().enumerate() {
-                        if i > 0 {
-                            self.w(", ");
-                        }
-                        self.variant(v);
-                    }
-                    self.w(" ");
-                }
-                self.w("}");
+                let head = concat([
+                    text(format!("enum {}", e.name.name)),
+                    self.generic_params(&e.generics),
+                    self.trait_list(&e.traits),
+                    text(" "),
+                ]);
+                let l = List { multiline: e.multiline, ..BRACES };
+                let body =
+                    self.list(&e.variants, |v| v.span.start, |b, v| b.variant(v), item.span.end, l);
+                concat([head, body])
             }
             ItemKind::Trait(t) => {
-                self.w("trait ");
-                self.w(&t.name.name);
-                self.generic_params(&t.generics);
-                self.trait_list(&t.supertraits);
-                self.w(" {");
-                self.indent += 1;
-                let mut prev_end = None;
-                for m in &t.members {
-                    let blank = prev_end.is_some_and(|e| self.blank_between(e, m.span.start));
-                    self.before_element(m.span.start, blank);
-                    self.attrs(&m.attrs);
-                    match &m.kind {
-                        TraitMemberKind::Fn(f) => self.fn_decl(f),
-                        TraitMemberKind::Type { name, bounds } => {
-                            self.w("type ");
-                            self.w(&name.name);
-                            if !bounds.is_empty() {
-                                self.w(": ");
-                                self.bounds(bounds);
+                let head = concat([
+                    text(format!("trait {}", t.name.name)),
+                    self.generic_params(&t.generics),
+                    self.trait_list(&t.supertraits),
+                    text(" "),
+                ]);
+                let body = self.members(
+                    &t.members,
+                    |m| m.span,
+                    item.span.end,
+                    |b, m| {
+                        let attrs = b.attrs(&m.attrs);
+                        let kind = match &m.kind {
+                            TraitMemberKind::Fn(f) => b.fn_decl(f),
+                            TraitMemberKind::Type { name, bounds } => {
+                                concat([text(format!("type {}", name.name)), b.trait_list(bounds)])
                             }
-                        }
-                    }
-                    prev_end = Some(m.span.end);
-                }
-                self.close_braces(item.span.end, prev_end.is_some());
+                        };
+                        concat([attrs, kind])
+                    },
+                );
+                concat([head, body])
             }
             ItemKind::Impl(i) => {
-                self.w("impl");
-                self.generic_params(&i.generics);
-                self.w(" ");
+                let mut head = vec![text("impl"), self.generic_params(&i.generics), text(" ")];
                 if let Some(t) = &i.trait_ {
-                    self.ty(t);
-                    self.w(" for ");
+                    head.push(self.ty(t));
+                    head.push(text(" for "));
                 }
-                self.ty(&i.self_ty);
-                self.w(" {");
-                self.indent += 1;
-                let mut prev_end = None;
-                for m in &i.members {
-                    let blank = prev_end.is_some_and(|e| self.blank_between(e, m.span.start));
-                    self.before_element(m.span.start, blank);
-                    self.attrs(&m.attrs);
-                    if m.vis.is_some() {
-                        self.w("pub ");
-                    }
-                    match &m.kind {
-                        ImplMemberKind::Fn(f) => self.fn_decl(f),
-                        ImplMemberKind::Type { name, ty } => {
-                            self.w("type ");
-                            self.w(&name.name);
-                            self.w(" = ");
-                            self.ty(ty);
-                        }
-                    }
-                    prev_end = Some(m.span.end);
-                }
-                self.close_braces(item.span.end, prev_end.is_some());
+                head.push(self.ty(&i.self_ty));
+                head.push(text(" "));
+                let body = self.members(
+                    &i.members,
+                    |m| m.span,
+                    item.span.end,
+                    |b, m| {
+                        let attrs = b.attrs(&m.attrs);
+                        let vis = if m.vis.is_some() { text("pub ") } else { nil() };
+                        let kind = match &m.kind {
+                            ImplMemberKind::Fn(f) => b.fn_decl(f),
+                            ImplMemberKind::Type { name, ty } => {
+                                concat([text(format!("type {} = ", name.name)), b.ty(ty)])
+                            }
+                        };
+                        concat([attrs, vis, kind])
+                    },
+                );
+                concat([concat(head), body])
             }
             ItemKind::Const(c) => {
-                self.w("const ");
-                self.w(&c.name.name);
-                if let Some(t) = &c.ty {
-                    self.w(": ");
-                    self.ty(t);
-                }
-                self.w(" = ");
-                self.expr(&c.value);
+                let ty = match &c.ty {
+                    Some(t) => concat([text(": "), self.ty(t)]),
+                    None => nil(),
+                };
+                concat([
+                    text(format!("const {}", c.name.name)),
+                    ty,
+                    text(" = "),
+                    self.expr(&c.value),
+                ])
             }
             ItemKind::Use(u) => {
-                self.w("use ");
-                self.use_tree(u);
+                let column = if item.vis.is_some() { "pub use ".len() } else { "use ".len() };
+                concat([text("use "), use_tree(u, column)])
             }
-            ItemKind::Error(_) => self.w("<error>"),
-        }
+            ItemKind::Error(_) => text("<error>"),
+        };
+        concat([attrs, vis, kind])
     }
 
-    fn close_braces(&mut self, end: u32, any: bool) {
-        let pending = self.has_comment_before(end);
-        if any || pending {
-            self.before_close(end);
-        } else {
-            self.indent -= 1;
+    /// A trait's or impl's members in braces, one per line, keeping single blank lines.
+    fn members<T>(
+        &mut self,
+        members: &[T],
+        span: impl Fn(&T) -> Span,
+        end: u32,
+        mut member: impl FnMut(&mut Self, &T) -> Doc,
+    ) -> Doc {
+        if members.is_empty() && !self.has_comment_before(end) {
+            return text("{}");
         }
-        self.w("}");
+        let mut inner = Vec::new();
+        let mut prev_end = None;
+        for m in members {
+            let s = span(m);
+            let blank = prev_end.is_some_and(|e| self.blank_between(e, s.start));
+            inner.push(self.hard_break(s.start, blank));
+            inner.push(member(self, m));
+            prev_end = Some(s.end);
+        }
+        inner.push(self.hard_close(end));
+        block(concat([text("{"), indent(concat(inner)), Doc::HardLine, text("}")]))
     }
 
-    fn trait_list(&mut self, traits: &[TypeExpr]) {
-        if !traits.is_empty() {
-            self.w(": ");
-            self.bounds(traits);
-        }
+    fn trait_list(&mut self, traits: &[TypeExpr]) -> Doc {
+        if traits.is_empty() { nil() } else { concat([text(": "), self.bounds(traits)]) }
     }
 
-    fn bounds(&mut self, bounds: &[TypeExpr]) {
+    fn bounds(&mut self, bounds: &[TypeExpr]) -> Doc {
+        let mut out = Vec::new();
         for (i, b) in bounds.iter().enumerate() {
             if i > 0 {
-                self.w(" + ");
+                out.push(text(" + "));
             }
-            self.ty(b);
+            out.push(self.ty(b));
         }
+        concat(out)
     }
 
-    fn generic_params(&mut self, g: &[GenericParam]) {
+    fn generic_params(&mut self, g: &[GenericParam]) -> Doc {
         if g.is_empty() {
-            return;
+            return nil();
         }
-        self.w("<");
-        for (i, p) in g.iter().enumerate() {
-            if i > 0 {
-                self.w(", ");
-            }
-            self.w(&p.name.name);
-            if !p.bounds.is_empty() {
-                self.w(": ");
-                self.bounds(&p.bounds);
-            }
-        }
-        self.w(">");
+        let params =
+            self.flat_list(g, |b, p| concat([text(&p.name.name), b.trait_list(&p.bounds)]));
+        let last = g.last().map_or(0, |p| p.bounds.last().map_or(p.name.span.end, |b| b.span.end));
+        concat([text("<"), params, self.close_after(last, '>'), text(">")])
     }
 
-    fn fields(&mut self, fields: &[FieldDecl], multiline: bool, end: u32) {
-        if fields.is_empty() {
-            self.w("{}");
-            return;
-        }
-        self.w("{");
-        if multiline {
-            self.indent += 1;
-            for f in fields {
-                self.before_element(f.span.start, false);
-                self.field_decl(f);
-                self.w(",");
-            }
-            self.before_close(end);
-        } else {
-            self.w(" ");
-            for (i, f) in fields.iter().enumerate() {
-                if i > 0 {
-                    self.w(", ");
-                }
-                self.field_decl(f);
-            }
-            self.w(" ");
-        }
-        self.w("}");
+    fn fields(&mut self, fields: &[FieldDecl], multiline: bool, end: u32) -> Doc {
+        let l = List { multiline, ..BRACES };
+        self.list(fields, |f| f.span.start, |b, f| b.field_decl(f), end, l)
     }
 
-    fn field_decl(&mut self, f: &FieldDecl) {
-        if f.vis.is_some() {
-            self.w("pub ");
-        }
-        self.w(&f.name.name);
-        self.w(": ");
-        self.ty(&f.ty);
-        if let Some(d) = &f.default {
-            self.w(" = ");
-            self.expr(d);
-        }
+    fn field_decl(&mut self, f: &FieldDecl) -> Doc {
+        let vis = if f.vis.is_some() { text("pub ") } else { nil() };
+        let ty = self.ty(&f.ty);
+        let default = match &f.default {
+            Some(d) => concat([text(" = "), self.expr(d)]),
+            None => nil(),
+        };
+        concat([vis, text(format!("{}: ", f.name.name)), ty, default])
     }
 
-    fn variant(&mut self, v: &Variant) {
-        self.w(&v.name.name);
-        match &v.kind {
-            VariantKind::Unit => {}
+    fn variant(&mut self, v: &Variant) -> Doc {
+        let kind = match &v.kind {
+            VariantKind::Unit => nil(),
             VariantKind::Tuple(tys) => {
-                self.w("(");
-                for (i, t) in tys.iter().enumerate() {
-                    if i > 0 {
-                        self.w(", ");
-                    }
-                    self.ty(t);
-                }
-                self.w(")");
+                let list = self.flat_list(tys, |b, t| b.ty(t));
+                let close = tys.last().map_or(nil(), |t| self.close_after(t.span.end, ')'));
+                concat([text("("), list, close, text(")")])
             }
             VariantKind::Struct(fields) => {
-                self.w(" ");
-                self.fields(fields, false, v.span.end);
+                concat([text(" "), self.fields(fields, false, v.span.end)])
             }
-        }
+        };
+        concat([text(&v.name.name), kind])
     }
 
-    fn use_tree(&mut self, u: &UseTree) {
-        for (i, seg) in u.path.iter().enumerate() {
-            if i > 0 {
-                self.w("::");
-            }
-            self.w(&seg.name);
-        }
-        match &u.kind {
-            UseKind::Simple(None) => {}
-            UseKind::Simple(Some(r)) => {
-                self.w(" as ");
-                self.w(&r.name);
-            }
-            UseKind::Group(trees) => {
-                // On one line if it fits in 100 columns; otherwise one item per slot, packed
-                // into lines of up to 100.
-                let items: Vec<String> = trees
-                    .iter()
-                    .map(|t| {
-                        let mut p = Printer {
-                            out: String::new(),
-                            indent: 0,
-                            comments: &[],
-                            next: 0,
-                            text: self.text,
-                        };
-                        p.use_tree(t);
-                        p.out
-                    })
-                    .collect();
-                let column = self.out.len() - self.out.rfind('\n').map_or(0, |i| i + 1);
-                let inline = items.join(", ");
-                if column + 3 + inline.len() < MAX_WIDTH || items.iter().any(|i| i.contains('\n')) {
-                    self.w("::{");
-                    self.w(&inline);
-                    self.w("}");
-                    return;
-                }
-                self.w("::{");
-                self.indent += 1;
-                self.newline();
-                let indent = INDENT.len() * self.indent;
-                let mut line = indent;
-                for (i, item) in items.iter().enumerate() {
-                    let piece = item.len() + 1;
-                    if i > 0 {
-                        if line + 1 + piece > MAX_WIDTH {
-                            self.newline();
-                            line = indent;
-                        } else {
-                            self.w(" ");
-                            line += 1;
-                        }
-                    }
-                    self.w(item);
-                    self.w(",");
-                    line += piece;
-                }
-                self.indent -= 1;
-                self.newline();
-                self.w("}");
-            }
-        }
-    }
-
-    fn fn_decl(&mut self, f: &FnDecl) {
-        self.w("fn ");
-        self.w(&f.name.name);
-        self.generic_params(&f.generics);
-        self.w("(");
-        for (i, p) in f.params.iter().enumerate() {
-            if i > 0 {
-                self.w(", ");
-            }
-            match p {
-                Param::SelfParam { mode, .. } => {
-                    if *mode != Mode::Borrow {
-                        self.w(mode.keyword());
-                        self.w(" ");
-                    }
-                    self.w("self");
-                }
-                Param::Named { name, mode, ty, default, .. } => {
-                    self.w(&name.name);
-                    self.w(": ");
-                    if *mode != Mode::Borrow {
-                        self.w(mode.keyword());
-                        self.w(" ");
-                    }
-                    self.ty(ty);
-                    if let Some(d) = default {
-                        self.w(" = ");
-                        self.expr(d);
-                    }
-                }
-            }
-        }
-        self.w(")");
+    fn fn_decl(&mut self, f: &FnDecl) -> Doc {
+        let mut out = vec![text(format!("fn {}", f.name.name)), self.generic_params(&f.generics)];
+        // Where the parameters' `)` is: the first after the last parameter, or the name.
+        let from = f.params.last().map_or(f.name.span.end, |p| p.span().end) as usize;
+        let end = self.text[from..].find(')').map_or(from, |i| from + i) as u32 + 1;
+        out.push(self.list(&f.params, |p| p.span().start, |b, p| b.param(p), end, PARENS));
         if let Some(r) = &f.ret {
-            self.w(" -> ");
-            match r.mode {
-                RetMode::Owned => {}
-                RetMode::Borrow => self.w("borrow "),
-                RetMode::Mut => self.w("mut "),
-            }
-            self.ty(&r.ty);
+            out.push(text(match r.mode {
+                RetMode::Owned => " -> ",
+                RetMode::Borrow => " -> borrow ",
+                RetMode::Mut => " -> mut ",
+            }));
+            out.push(self.ty(&r.ty));
         }
         if let Some(b) = &f.body {
-            self.w(" ");
-            self.block(b, false);
+            out.push(text(" "));
+            out.push(self.block(b, false));
+        }
+        concat(out)
+    }
+
+    fn param(&mut self, p: &Param) -> Doc {
+        let mode =
+            |m: Mode| if m == Mode::Borrow { nil() } else { text(format!("{} ", m.keyword())) };
+        match p {
+            Param::SelfParam { mode: m, .. } => concat([mode(*m), text("self")]),
+            Param::Named { name, mode: m, ty, default, .. } => {
+                let ty = self.ty(ty);
+                let default = match default {
+                    Some(d) => concat([text(" = "), self.expr(d)]),
+                    None => nil(),
+                };
+                concat([text(format!("{}: ", name.name)), mode(*m), ty, default])
+            }
         }
     }
 
-    // ---- types -----------------------------------------------------------------------------
+    // ---- types -------------------------------------------------------------------------------
 
-    fn ty(&mut self, t: &TypeExpr) {
-        match &t.kind {
+    fn ty(&mut self, t: &TypeExpr) -> Doc {
+        let pre = self.inline_comments(t.span.start);
+        let d = match &t.kind {
             TypeExprKind::Path(p) => self.path(p, false),
             TypeExprKind::Array(elem, len) => {
-                self.w("[");
-                self.ty(elem);
-                if let Some(l) = len {
-                    self.w("; ");
-                    self.expr(l);
-                }
-                self.w("]");
+                // Built in source order: the comments are taken in order.
+                let elem = self.ty(elem);
+                let len = match len {
+                    Some(l) => concat([text("; "), self.expr(l)]),
+                    None => nil(),
+                };
+                let close = self.inline_close(t.span.end - 1);
+                concat([text("["), elem, len, close, text("]")])
             }
             TypeExprKind::Tuple(tys) => {
-                self.w("(");
-                for (i, t) in tys.iter().enumerate() {
-                    if i > 0 {
-                        self.w(", ");
-                    }
-                    self.ty(t);
-                }
-                if tys.len() == 1 {
-                    self.w(",");
-                }
-                self.w(")");
+                let lone = if tys.len() == 1 { text(",") } else { nil() };
+                let list = self.flat_list(tys, |b, t| b.ty(t));
+                let close = self.inline_close(t.span.end - 1);
+                concat([text("("), list, lone, close, text(")")])
             }
             TypeExprKind::Paren(inner) => {
-                self.w("(");
-                self.ty(inner);
-                self.w(")");
+                let inner = self.ty(inner);
+                concat([text("("), inner, self.inline_close(t.span.end - 1), text(")")])
             }
             TypeExprKind::Fn(params, ret) => {
-                self.w("fn(");
-                for (i, t) in params.iter().enumerate() {
-                    if i > 0 {
-                        self.w(", ");
-                    }
-                    self.ty(t);
-                }
-                self.w(")");
-                if let Some(r) = ret {
-                    self.w(" -> ");
-                    self.ty(r);
-                }
+                let list = self.flat_list(params, |b, t| b.ty(t));
+                let close = params.last().map_or(nil(), |p| self.close_after(p.span.end, ')'));
+                let ret = match ret {
+                    Some(r) => concat([text(" -> "), self.ty(r)]),
+                    None => nil(),
+                };
+                concat([text("fn("), list, close, text(")"), ret])
             }
-            TypeExprKind::Error => self.w("<error>"),
-        }
+            TypeExprKind::Error => text("<error>"),
+        };
+        concat([pre, d])
     }
 
     /// A path; in expressions, generic arguments are written with `::<`.
-    fn path(&mut self, p: &Path, expr: bool) {
+    fn path(&mut self, p: &Path, expr: bool) -> Doc {
+        let mut out = Vec::new();
         for (i, seg) in p.segments.iter().enumerate() {
             if i > 0 {
-                self.w("::");
+                out.push(text("::"));
             }
-            self.w(&seg.ident.name);
+            out.push(text(&seg.ident.name));
             if let Some(g) = &seg.generics {
                 if expr {
-                    self.w("::");
+                    out.push(text("::"));
                 }
-                self.generic_args(g);
+                out.push(self.generic_args(g));
             }
         }
+        concat(out)
     }
 
-    fn generic_args(&mut self, g: &[TypeExpr]) {
-        self.w("<");
-        for (i, t) in g.iter().enumerate() {
-            if i > 0 {
-                self.w(", ");
-            }
-            self.ty(t);
-        }
-        self.w(">");
+    fn generic_args(&mut self, g: &[TypeExpr]) -> Doc {
+        let list = self.flat_list(g, |b, t| b.ty(t));
+        let close = g.last().map_or(nil(), |t| self.close_after(t.span.end, '>'));
+        concat([text("<"), list, close, text(">")])
     }
 
-    // ---- blocks and statements -------------------------------------------------------------
+    // ---- blocks and statements ---------------------------------------------------------------
 
-    /// Prints a block. A block that held one short statement on one line stays on one line,
-    /// unless it's a function body.
-    fn block(&mut self, b: &Block, allow_inline: bool) {
+    /// A block. One that held one statement on one line stays on one line if it fits, unless
+    /// it's a function body.
+    fn block(&mut self, b: &Block, allow_inline: bool) -> Doc {
         if b.stmts.is_empty() && !self.has_comment_before(b.span.end) {
-            self.w("{}");
-            return;
+            return text("{}");
         }
         if allow_inline
             && b.stmts.len() == 1
             && !self.spans_lines(b.span)
             && !self.has_comment_before(b.span.end)
         {
-            let mut inner =
-                Printer { out: String::new(), indent: 0, comments: &[], next: 0, text: self.text };
-            inner.stmt(&b.stmts[0]);
-            if !inner.out.contains('\n') {
-                self.w("{ ");
-                self.w(&inner.out);
-                self.w(" }");
-                return;
+            let saved = self.next;
+            let s = self.stmt(&b.stmts[0]);
+            if !s.has_hard_line() {
+                return alone(concat([
+                    text("{"),
+                    indent(concat([Doc::Line, s])),
+                    Doc::Line,
+                    text("}"),
+                ]));
             }
+            self.next = saved;
         }
-        self.w("{");
-        self.indent += 1;
+        let mut inner = Vec::new();
         let mut prev_end: Option<u32> = None;
         for s in &b.stmts {
             let blank = prev_end.is_some_and(|e| self.blank_between(e, s.span.start));
-            self.before_element(s.span.start, blank);
-            self.stmt(s);
+            inner.push(self.hard_break(s.span.start, blank));
+            inner.push(self.stmt(s));
             prev_end = Some(s.span.end);
         }
-        self.before_close(b.span.end);
-        self.w("}");
-    }
-
-    fn has_comment_before(&self, pos: u32) -> bool {
-        self.comments.get(self.next).is_some_and(|c| c.span.start < pos)
+        inner.push(self.hard_close(b.span.end));
+        block(concat([text("{"), indent(concat(inner)), Doc::HardLine, text("}")]))
     }
 
     fn spans_lines(&self, s: Span) -> bool {
         self.text[s.start as usize..s.end as usize].contains('\n')
     }
 
-    fn stmt(&mut self, s: &Stmt) {
+    fn stmt(&mut self, s: &Stmt) -> Doc {
         match &s.kind {
             StmtKind::Bind { kind, pat, ty, init } => {
-                self.w(kind.keyword());
-                self.w(" ");
-                self.pat(pat);
-                if let Some(t) = ty {
-                    self.w(": ");
-                    self.ty(t);
-                }
-                self.w(" = ");
-                self.expr(init);
+                let pat = self.pat(pat);
+                let ty = match ty {
+                    Some(t) => concat([text(": "), self.ty(t)]),
+                    None => nil(),
+                };
+                concat([
+                    text(format!("{} ", kind.keyword())),
+                    pat,
+                    ty,
+                    text(" = "),
+                    self.expr(init),
+                ])
             }
             StmtKind::Assign { target, op, value } => {
-                self.expr(target);
-                self.w(" ");
-                self.w(op.text());
-                self.w(" ");
-                self.expr(value);
+                concat([self.expr(target), text(format!(" {} ", op.text())), self.expr(value)])
             }
             StmtKind::Expr(e) => self.expr(e),
             StmtKind::While { cond, body } => {
-                self.w("while ");
-                self.expr(cond);
-                self.w(" ");
-                self.block(body, true);
+                concat([text("while "), self.expr(cond), text(" "), self.block(body, true)])
             }
-            StmtKind::Loop { body } => {
-                self.w("loop ");
-                self.block(body, true);
-            }
+            StmtKind::Loop { body } => concat([text("loop "), self.block(body, true)]),
             StmtKind::For { mutable, pat, iter, body } => {
-                self.w("for ");
-                if *mutable {
-                    self.w("mut ");
-                }
-                self.pat(pat);
-                self.w(" in ");
+                let mut out = vec![text(if *mutable { "for mut " } else { "for " })];
+                out.push(self.pat(pat));
+                out.push(text(" in "));
                 match iter {
                     ForIter::Range { start, end, inclusive } => {
-                        self.expr(start);
-                        self.w(if *inclusive { "..=" } else { ".." });
-                        self.expr(end);
+                        out.push(self.expr(start));
+                        out.push(text(if *inclusive { "..=" } else { ".." }));
+                        out.push(self.expr(end));
                     }
-                    ForIter::Expr(e) => self.expr(e),
+                    ForIter::Expr(e) => out.push(self.expr(e)),
                 }
-                self.w(" ");
-                self.block(body, true);
+                out.push(text(" "));
+                out.push(self.block(body, true));
+                concat(out)
             }
         }
     }
 
-    // ---- expressions -----------------------------------------------------------------------
+    // ---- expressions -------------------------------------------------------------------------
 
     /// A call's arguments; `end` is where the call ends (just past its `)`).
-    fn args(&mut self, args: &[Arg], multiline: bool, end: u32) {
-        if args.is_empty() {
-            self.w("()");
-            return;
-        }
-        self.w("(");
-        if multiline {
-            self.indent += 1;
-            for a in args {
-                self.before_element(a.span.start, false);
-                self.arg(a);
-                self.w(",");
-            }
-            // Comments up to the `)` belong inside the parentheses.
-            self.before_close(end.saturating_sub(1));
+    fn args(&mut self, args: &[Arg], multiline: bool, end: u32) -> Doc {
+        let l = List { multiline, ..PARENS };
+        self.list(args, |a| a.span.start, |b, a| b.arg(a), end, l)
+    }
+
+    fn arg(&mut self, a: &Arg) -> Doc {
+        let name = match &a.name {
+            Some(n) => text(format!("{}: ", n.name)),
+            None => nil(),
+        };
+        concat([name, self.expr(&a.value)])
+    }
+
+    fn expr(&mut self, e: &Expr) -> Doc {
+        // A line break before a block's `{` could end the statement before it: comments there
+        // go inside the block, before its first statement.
+        let pre = if matches!(e.kind, ExprKind::Block(_)) {
+            nil()
         } else {
-            for (i, a) in args.iter().enumerate() {
-                if i > 0 {
-                    self.w(", ");
-                }
-                self.arg(a);
-            }
-        }
-        self.w(")");
+            self.inline_comments(e.span.start)
+        };
+        let d = self.expr_kind(e);
+        concat([pre, d])
     }
 
-    fn arg(&mut self, a: &Arg) {
-        if let Some(n) = &a.name {
-            self.w(&n.name);
-            self.w(": ");
-        }
-        self.expr(&a.value);
-    }
-
-    fn expr(&mut self, e: &Expr) {
+    fn expr_kind(&mut self, e: &Expr) -> Doc {
         match &e.kind {
-            ExprKind::Lit(l) => self.w(&l.text),
+            ExprKind::Lit(l) => text(&l.text),
             ExprKind::Path(p) => self.path(p, true),
             ExprKind::Unary(op, inner) => {
-                self.w(match op {
+                let op = match op {
                     UnOp::Neg => "-",
                     UnOp::Not => "!",
-                });
-                self.expr(inner);
+                };
+                concat([text(op), self.expr(inner)])
             }
-            ExprKind::Binary(op, a, b) => {
-                self.expr(a);
-                self.w(" ");
-                self.w(op.text());
-                self.w(" ");
-                self.expr(b);
-            }
-            ExprKind::Take(inner) => {
-                self.w("take ");
-                self.expr(inner);
-            }
-            ExprKind::MutArg(inner) => {
-                self.w("mut ");
-                self.expr(inner);
-            }
+            ExprKind::Binary(..) => self.binary(e),
+            ExprKind::Take(inner) => concat([text("take "), self.expr(inner)]),
+            ExprKind::MutArg(inner) => concat([text("mut "), self.expr(inner)]),
             ExprKind::Call { callee, args, multiline } => {
-                self.expr(callee);
-                self.args(args, *multiline, e.span.end);
+                concat([self.expr(callee), self.args(args, *multiline, e.span.end)])
             }
-            ExprKind::MethodCall { receiver, name, generics, args, newline_before, multiline } => {
-                self.expr(receiver);
-                if *newline_before {
-                    self.indent += 1;
-                    self.before_element(name.span.start, false);
-                }
-                self.w(".");
-                self.w(&name.name);
-                if let Some(g) = generics {
-                    self.w("::");
-                    self.generic_args(g);
-                }
-                self.args(args, *multiline, e.span.end);
-                if *newline_before {
-                    self.indent -= 1;
-                }
-            }
-            ExprKind::Field { base, name } => {
-                self.expr(base);
-                // `1 .0` isn't `1.0`.
-                if matches!(name, FieldName::Index(..)) && matches!(base.kind, ExprKind::Lit(_)) {
-                    self.w(" ");
-                }
-                self.w(".");
-                self.w(&name.text());
-            }
-            ExprKind::Index { base, index } => {
-                self.expr(base);
-                self.w("[");
-                self.expr(index);
-                self.w("]");
-            }
+            ExprKind::MethodCall { .. } | ExprKind::Field { .. } => self.chain(e),
+            ExprKind::Index { base, index } => concat([
+                self.expr(base),
+                text("["),
+                self.expr(index),
+                self.inline_close(e.span.end - 1),
+                text("]"),
+            ]),
             ExprKind::StructLit { path, fields, base, multiline } => {
-                self.path(path, true);
+                let path = self.path(path, true);
                 if fields.is_empty() && base.is_none() {
-                    self.w(" {}");
-                    return;
+                    return concat([path, text(" {}")]);
                 }
-                self.w(" {");
-                if *multiline {
-                    self.indent += 1;
-                    for f in fields {
-                        self.before_element(f.span.start, false);
-                        self.field_init(f);
-                        self.w(",");
-                    }
-                    if let Some(b) = base {
-                        self.before_element(b.span.start, false);
-                        self.w("..");
-                        self.expr(b);
-                        self.w(",");
-                    }
-                    self.before_close(e.span.end);
-                } else {
-                    self.w(" ");
-                    for (i, f) in fields.iter().enumerate() {
-                        if i > 0 {
-                            self.w(", ");
-                        }
-                        self.field_init(f);
-                    }
-                    if let Some(b) = base {
-                        if !fields.is_empty() {
-                            self.w(", ");
-                        }
-                        self.w("..");
-                        self.expr(b);
-                    }
-                    self.w(" ");
-                }
-                self.w("}");
+                let mut parts: Vec<Part> = fields.iter().map(Part::Field).collect();
+                parts.extend(base.as_deref().map(Part::Base));
+                let start = |p: &Part| match p {
+                    Part::Field(f) => f.span.start,
+                    Part::Base(b) => b.span.start,
+                };
+                let item = |b: &mut Self, p: &Part| match p {
+                    Part::Field(f) => b.field_init(f),
+                    Part::Base(x) => concat([text(".."), b.expr(x)]),
+                };
+                let l = List { multiline: *multiline, ..BRACES };
+                let body = self.list(&parts, start, item, e.span.end, l);
+                concat([path, text(" "), body])
             }
             ExprKind::Tuple(items) => {
-                self.w("(");
-                for (i, x) in items.iter().enumerate() {
-                    if i > 0 {
-                        self.w(", ");
-                    }
-                    self.expr(x);
-                }
-                if items.len() == 1 {
-                    self.w(",");
-                }
-                self.w(")");
+                let l = List { lone_comma: true, ..PARENS };
+                self.list(items, |x| x.span.start, |b, x| b.expr(x), e.span.end, l)
             }
             ExprKind::Array(items) => {
                 let multiline = items.first().is_some_and(|x| {
                     self.text[e.span.start as usize..x.span.start as usize].contains('\n')
                 });
-                self.w("[");
-                if multiline {
-                    self.indent += 1;
-                    for x in items {
-                        self.before_element(x.span.start, false);
-                        self.expr(x);
-                        self.w(",");
-                    }
-                    self.before_close(e.span.end);
-                } else {
-                    for (i, x) in items.iter().enumerate() {
-                        if i > 0 {
-                            self.w(", ");
-                        }
-                        self.expr(x);
-                    }
-                }
-                self.w("]");
+                let l = List { open: "[", close: "]", multiline, ..PARENS };
+                self.list(items, |x| x.span.start, |b, x| b.expr(x), e.span.end, l)
             }
-            ExprKind::ArrayRepeat { value, count } => {
-                self.w("[");
-                self.expr(value);
-                self.w("; ");
-                self.expr(count);
-                self.w("]");
-            }
+            ExprKind::ArrayRepeat { value, count } => concat([
+                text("["),
+                self.expr(value),
+                text("; "),
+                self.expr(count),
+                self.inline_close(e.span.end - 1),
+                text("]"),
+            ]),
             ExprKind::Paren(inner) => {
-                self.w("(");
-                self.expr(inner);
-                self.w(")");
+                concat([text("("), self.expr(inner), self.inline_close(e.span.end - 1), text(")")])
             }
             ExprKind::Block(b) => self.block(b, true),
             ExprKind::If { cond, then, else_ } => {
-                self.w("if ");
-                self.expr(cond);
-                self.w(" ");
-                self.block(then, true);
-                if let Some(e) = else_ {
-                    self.w(" else ");
-                    self.expr(e);
+                let mut out = vec![text("if "), self.expr(cond), text(" "), self.block(then, true)];
+                if let Some(x) = else_ {
+                    out.push(text(" else "));
+                    out.push(self.expr(x));
                 }
+                concat(out)
             }
             ExprKind::Match { scrutinee, arms } => {
-                self.w("match ");
-                self.expr(scrutinee);
-                self.w(" {");
-                self.indent += 1;
+                let head = concat([text("match "), self.expr(scrutinee), text(" ")]);
+                let mut inner = Vec::new();
                 for arm in arms {
-                    self.before_element(arm.span.start, false);
+                    inner.push(self.hard_break(arm.span.start, false));
+                    let mut a = Vec::new();
                     for (i, p) in arm.pats.iter().enumerate() {
                         if i > 0 {
-                            self.w(" | ");
+                            a.push(text(" | "));
                         }
-                        self.pat(p);
+                        a.push(self.pat(p));
                     }
                     if let Some(g) = &arm.guard {
-                        self.w(" if ");
-                        self.expr(g);
+                        a.push(text(" if "));
+                        a.push(self.expr(g));
                     }
-                    self.w(" => ");
-                    self.expr(&arm.body);
-                    self.w(",");
+                    a.push(text(" => "));
+                    a.push(self.expr(&arm.body));
+                    a.push(text(","));
+                    inner.push(concat(a));
                 }
-                self.before_close(e.span.end);
-                self.w("}");
+                inner.push(self.hard_close(e.span.end));
+                let body =
+                    block(concat([text("{"), indent(concat(inner)), Doc::HardLine, text("}")]));
+                concat([head, body])
             }
             ExprKind::Closure { params, ret, body } => {
-                if params.is_empty() {
-                    self.w("||");
+                let params = if params.is_empty() {
+                    text("||")
                 } else {
-                    self.w("|");
-                    for (i, p) in params.iter().enumerate() {
-                        if i > 0 {
-                            self.w(", ");
-                        }
-                        self.w(&p.name.name);
-                        if let Some(t) = &p.ty {
-                            self.w(": ");
-                            self.ty(t);
-                        }
+                    let ps = self.flat_list(params, |b, p| {
+                        let ty = match &p.ty {
+                            Some(t) => concat([text(": "), b.ty(t)]),
+                            None => nil(),
+                        };
+                        concat([text(&p.name.name), ty])
+                    });
+                    concat([text("|"), ps, text("|")])
+                };
+                let ret = match ret {
+                    Some(r) => concat([text("-> "), self.ty(r), text(" ")]),
+                    None => nil(),
+                };
+                concat([params, text(" "), ret, self.expr(body)])
+            }
+            ExprKind::Return(v) => match v {
+                Some(v) => concat([text("return "), self.expr(v)]),
+                None => text("return"),
+            },
+            ExprKind::Break => text("break"),
+            ExprKind::Continue => text("continue"),
+            ExprKind::Error => text("<error>"),
+        }
+    }
+
+    /// A chain of operators of one precedence (`a + b - c`): on one line if it fits, and
+    /// otherwise broken after each operator, the operands after the first indented.
+    fn binary(&mut self, e: &Expr) -> Doc {
+        let ExprKind::Binary(top, ..) = &e.kind else { return self.expr_kind(e) };
+        // `a ** b ** c` is `a ** (b ** c)`, and comparisons don't chain: neither is flattened.
+        let chains = |op: BinOp| {
+            op != BinOp::Pow && precedence(op) != 2 && precedence(op) == precedence(*top)
+        };
+        let mut rest: Vec<(BinOp, &Expr)> = Vec::new();
+        let mut first = e;
+        while let ExprKind::Binary(op, a, b) = &first.kind {
+            rest.push((*op, b));
+            first = a;
+            if !chains(*op) || !matches!(&first.kind, ExprKind::Binary(next, ..) if chains(*next)) {
+                break;
+            }
+        }
+        rest.reverse();
+        let head = self.expr(first);
+        let mut tail = Vec::new();
+        for (op, operand) in rest {
+            tail.push(text(format!(" {}", op.text())));
+            // A line break after `>` or `>>` could end the statement (L20).
+            if matches!(op, BinOp::Gt | BinOp::Shr) {
+                tail.push(text(" "));
+            } else {
+                tail.push(self.soft_break(operand.span.start, Doc::Line));
+            }
+            tail.push(self.expr(operand));
+        }
+        group(concat([head, indent(concat(tail))]))
+    }
+
+    /// Field accesses and method calls. A call written on its own line (a leading `.`) stays
+    /// there; a chain of two or more calls with none written so goes on one line if it fits,
+    /// and otherwise puts each call on its own line.
+    fn chain(&mut self, e: &Expr) -> Doc {
+        let mut links: Vec<&Expr> = Vec::new();
+        let mut base = e;
+        while let ExprKind::MethodCall { receiver: b, .. } | ExprKind::Field { base: b, .. } =
+            &base.kind
+        {
+            links.push(base);
+            base = b;
+        }
+        links.reverse();
+        let calls = links.iter().filter(|l| matches!(l.kind, ExprKind::MethodCall { .. })).count();
+        let leading_dots = links
+            .iter()
+            .any(|l| matches!(l.kind, ExprKind::MethodCall { newline_before: true, .. }));
+        let fit = calls >= 2 && !leading_dots;
+        let mut out = vec![self.expr(base)];
+        let mut tail = Vec::new();
+        for link in links {
+            let into = if fit { &mut tail } else { &mut out };
+            match &link.kind {
+                ExprKind::Field { base: b, name } => {
+                    // `1 .0` isn't `1.0`.
+                    if matches!(name, FieldName::Index(..)) && matches!(b.kind, ExprKind::Lit(_)) {
+                        into.push(text(" "));
                     }
-                    self.w("|");
+                    into.push(text(format!(".{}", name.text())));
                 }
-                self.w(" ");
-                if let Some(r) = ret {
-                    self.w("-> ");
-                    self.ty(r);
-                    self.w(" ");
+                ExprKind::MethodCall {
+                    name, generics, args, newline_before, multiline, ..
+                } => {
+                    // The break before the `.` first: the comments before it are its.
+                    let brk = (*newline_before || fit)
+                        .then(|| self.soft_break(name.span.start, Doc::SoftLine));
+                    let mut d = vec![text(format!(".{}", name.name))];
+                    if let Some(g) = generics {
+                        d.push(text("::"));
+                        d.push(self.generic_args(g));
+                    }
+                    d.push(self.args(args, *multiline, link.span.end));
+                    match brk {
+                        Some(brk) if *newline_before => {
+                            out.push(broken(indent(concat([brk, concat(d)]))));
+                        }
+                        Some(brk) => {
+                            tail.push(brk);
+                            tail.extend(d);
+                        }
+                        None => out.extend(d),
+                    }
                 }
-                self.expr(body);
+                _ => {}
             }
-            ExprKind::Return(v) => {
-                self.w("return");
-                if let Some(v) = v {
-                    self.w(" ");
-                    self.expr(v);
-                }
-            }
-            ExprKind::Break => self.w("break"),
-            ExprKind::Continue => self.w("continue"),
-            ExprKind::Error => self.w("<error>"),
+        }
+        if fit {
+            out.push(indent(concat(tail)));
+        }
+        // A group either way, so a chain is the same to the groups around it however its
+        // calls were laid out (a comment in it breaks it, not them).
+        group(concat(out))
+    }
+
+    fn field_init(&mut self, f: &FieldInit) -> Doc {
+        match &f.value {
+            Some(v) => concat([text(format!("{}: ", f.name.name)), self.expr(v)]),
+            None => text(&f.name.name),
         }
     }
 
-    fn field_init(&mut self, f: &FieldInit) {
-        self.w(&f.name.name);
-        if let Some(v) = &f.value {
-            self.w(": ");
-            self.expr(v);
-        }
-    }
-
-    fn pat(&mut self, p: &Pat) {
-        match &p.kind {
-            PatKind::Wild => self.w("_"),
-            PatKind::Ident(i) => self.w(&i.name),
+    fn pat(&mut self, p: &Pat) -> Doc {
+        let pre = self.inline_comments(p.span.start);
+        let d = match &p.kind {
+            PatKind::Wild => text("_"),
+            PatKind::Ident(i) => text(&i.name),
             PatKind::Lit { neg, lit } => {
-                if *neg {
-                    self.w("-");
-                }
-                self.w(&lit.text);
+                text(if *neg { format!("-{}", lit.text) } else { lit.text.clone() })
             }
             PatKind::Path(path) => self.path(path, true),
             PatKind::TupleStruct(path, pats) => {
-                self.path(path, true);
-                self.w("(");
-                for (i, x) in pats.iter().enumerate() {
-                    if i > 0 {
-                        self.w(", ");
-                    }
-                    self.pat(x);
-                }
-                self.w(")");
+                let path = self.path(path, true);
+                let list = self.flat_list(pats, |b, x| b.pat(x));
+                let close = self.inline_close(p.span.end - 1);
+                concat([path, text("("), list, close, text(")")])
             }
             PatKind::Struct { path, fields, rest } => {
-                self.path(path, true);
+                let path = self.path(path, true);
                 if fields.is_empty() && !rest {
-                    self.w(" {}");
-                    return;
+                    return concat([pre, path, text(" {}")]);
                 }
-                self.w(" { ");
-                for (i, f) in fields.iter().enumerate() {
-                    if i > 0 {
-                        self.w(", ");
-                    }
-                    self.w(&f.name.name);
-                    if let Some(x) = &f.pat {
-                        self.w(": ");
-                        self.pat(x);
-                    }
-                }
+                let mut parts = vec![self.flat_list(fields, |b, f| match &f.pat {
+                    Some(x) => concat([text(format!("{}: ", f.name.name)), b.pat(x)]),
+                    None => text(&f.name.name),
+                })];
                 if *rest {
-                    if !fields.is_empty() {
-                        self.w(", ");
-                    }
-                    self.w("..");
+                    parts.push(text(if fields.is_empty() { ".." } else { ", .." }));
                 }
-                self.w(" }");
+                let close = self.inline_close(p.span.end - 1);
+                concat([path, text(" { "), concat(parts), close, text(" }")])
             }
             PatKind::Tuple(pats) => {
-                self.w("(");
-                for (i, x) in pats.iter().enumerate() {
-                    if i > 0 {
-                        self.w(", ");
-                    }
-                    self.pat(x);
-                }
-                if pats.len() == 1 {
-                    self.w(",");
-                }
-                self.w(")");
+                let lone = if pats.len() == 1 { text(",") } else { nil() };
+                let list = self.flat_list(pats, |b, x| b.pat(x));
+                let close = self.inline_close(p.span.end - 1);
+                concat([text("("), list, lone, close, text(")")])
             }
-            PatKind::Error => self.w("<error>"),
+            PatKind::Error => text("<error>"),
+        };
+        concat([pre, d])
+    }
+}
+
+/// A part of a struct literal.
+enum Part<'e> {
+    Field(&'e FieldInit),
+    Base(&'e Expr),
+}
+
+/// A `use` tree starting at `column`. A group goes on one line if it fits in the width;
+/// otherwise its items are packed into lines of up to the width.
+fn use_tree(u: &UseTree, column: usize) -> Doc {
+    let path: Vec<&str> = u.path.iter().map(|s| s.name.as_str()).collect();
+    let path = path.join("::");
+    let UseKind::Group(trees) = &u.kind else { return text(use_text(u)) };
+    let items: Vec<String> = trees.iter().map(use_text).collect();
+    let inline = items.join(", ");
+    if column + path.len() + 4 + inline.len() <= MAX_WIDTH {
+        return text(format!("{path}::{{{inline}}}"));
+    }
+    let start = INDENT_COLS;
+    let mut lines = vec![Doc::HardLine];
+    let mut line = start;
+    for (i, item) in items.iter().enumerate() {
+        let piece = item.len() + 1;
+        if i > 0 {
+            if line + 1 + piece > MAX_WIDTH {
+                lines.push(Doc::HardLine);
+                line = start;
+            } else {
+                lines.push(text(" "));
+                line += 1;
+            }
         }
+        lines.push(text(format!("{item},")));
+        line += piece;
+    }
+    broken(concat([text(format!("{path}::{{")), indent(concat(lines)), Doc::HardLine, text("}")]))
+}
+
+const INDENT_COLS: usize = 4;
+
+/// A `use` tree on one line.
+fn use_text(u: &UseTree) -> String {
+    let path: Vec<&str> = u.path.iter().map(|s| s.name.as_str()).collect();
+    let path = path.join("::");
+    match &u.kind {
+        UseKind::Simple(None) => path,
+        UseKind::Simple(Some(r)) => format!("{path} as {}", r.name),
+        UseKind::Group(trees) => {
+            let items: Vec<String> = trees.iter().map(use_text).collect();
+            format!("{path}::{{{}}}", items.join(", "))
+        }
+    }
+}
+
+/// How tightly an operator binds: a chain of one strength is laid out as one.
+fn precedence(op: BinOp) -> u8 {
+    match op {
+        BinOp::Or => 0,
+        BinOp::And => 1,
+        BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => 2,
+        BinOp::BitOr => 3,
+        BinOp::BitXor => 4,
+        BinOp::BitAnd => 5,
+        BinOp::Shl | BinOp::Shr => 6,
+        BinOp::Add | BinOp::Sub => 7,
+        BinOp::Mul | BinOp::Div | BinOp::Rem => 8,
+        BinOp::Pow => 9,
     }
 }

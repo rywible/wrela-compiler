@@ -146,10 +146,16 @@ fn shape_diff(src: &str, grammar: &Shape, parser: &Shape) -> String {
     msg
 }
 
-/// The AST's Debug output with spans removed: two sources with equal skeletons parsed to the
-/// same tree.
+/// The AST's Debug output with spans removed, and the flags that record layout (whether a list
+/// or a chain link was written on several lines), which formatting may change: two sources
+/// with equal skeletons parsed to the same tree.
 pub fn ast_skeleton(file: &wrela_syntax::ast::File) -> String {
-    let text = format!("{file:?}");
+    let mut text = format!("{file:?}");
+    for flag in ["newline_before", "multiline"] {
+        for value in ["true", "false"] {
+            text = text.replace(&format!(", {flag}: {value}"), "");
+        }
+    }
     let mut out = String::with_capacity(text.len());
     let mut rest = text.as_str();
     while let Some(i) = rest.find("Span {") {
