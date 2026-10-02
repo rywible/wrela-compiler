@@ -214,3 +214,49 @@ pub fn check_no_relaxed_simd(bytes: &[u8]) -> Result<(), String> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn module(body: &str) -> Vec<u8> {
+        wat::parse_str(format!("(module (func (param v128 v128 v128) (result v128) {body}))"))
+            .expect("valid WAT")
+    }
+
+    #[test]
+    fn relaxed_simd_is_rejected() {
+        let fma = module("local.get 0 local.get 1 local.get 2 f32x4.relaxed_madd");
+        let e = check_no_relaxed_simd(&fma).expect_err("relaxed SIMD");
+        assert!(e.contains("F32x4RelaxedMadd"), "{e}");
+        let min = module("local.get 0 local.get 1 f32x4.relaxed_min");
+        assert!(check_no_relaxed_simd(&min).is_err());
+        // Plain SIMD is deterministic, and fine.
+        let plain = module("local.get 0 local.get 1 f32x4.mul");
+        assert_eq!(check_no_relaxed_simd(&plain), Ok(()));
+    }
+
+    #[test]
+    fn emitted_modules_pass() {
+        let mut m = wrela_ir::Module::default();
+        let f32t = m.types.f32();
+        let mut f = wrela_ir::Function::new("double", Vec::new(), Some(f32t));
+        f.params.push(wrela_ir::Param {
+            name: "x".into(),
+            ty: f32t,
+            by_ref: false,
+            mutable: false,
+        });
+        let x = f.new_value(f32t);
+        let y = f.new_value(f32t);
+        f.body = vec![
+            wrela_ir::Stmt::Let(x, wrela_ir::Expr::Param(0)),
+            wrela_ir::Stmt::Let(y, wrela_ir::Expr::Binary(wrela_ir::BinOp::Add, x, x)),
+            wrela_ir::Stmt::Return(Some(y)),
+        ];
+        let id = m.add_function(f);
+        m.exports.push(("double".into(), id));
+        let bytes = emit(&m).expect("emits");
+        assert_eq!(check_no_relaxed_simd(&bytes), Ok(()));
+    }
+}

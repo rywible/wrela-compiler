@@ -1,0 +1,65 @@
+// Strict CPU numerics (language.md §11, AC7), exported for compiler/tests/tests/numerics.rs:
+// integer arithmetic that overflows, divides by zero or shifts too far traps; wrapping
+// arithmetic and bit conversions don't; float-to-integer conversions out of range trap.
+pub fn frame(time: f32, width: u32, height: u32) {}
+
+pub fn add_i32(a: i32, b: i32) -> i32 {
+    a + b
+}
+
+pub fn sub_u32(a: u32, b: u32) -> u32 {
+    a - b
+}
+
+pub fn mul_i32(a: i32, b: i32) -> i32 {
+    a * b
+}
+
+pub fn mul_i64(a: i64, b: i64) -> i64 {
+    a * b
+}
+
+pub fn neg_i32(a: i32) -> i32 {
+    -a
+}
+
+pub fn div_i32(a: i32, b: i32) -> i32 {
+    a / b
+}
+
+pub fn rem_u32(a: u32, b: u32) -> u32 {
+    a % b
+}
+
+pub fn shl_u32(a: u32, b: u32) -> u32 {
+    a << b
+}
+
+pub fn add_u8(a: u32, b: u32) -> u32 {
+    u32(u8(a) + u8(b))
+}
+
+pub fn wrapping_add_i32(a: i32, b: i32) -> i32 {
+    a.wrapping_add(b)
+}
+
+pub fn wrapping_mul_u32(a: u32, b: u32) -> u32 {
+    a.wrapping_mul(b)
+}
+
+pub fn to_i32(x: f32) -> i32 {
+    i32(x)
+}
+
+pub fn to_u32(x: f32) -> u32 {
+    u32(x)
+}
+
+pub fn bits(x: i32) -> u32 {
+    u32(x)
+}
+
+pub fn index(i: u32) -> f32 {
+    let a = [1.0, 2.0, 3.0]
+    a[i]
+}

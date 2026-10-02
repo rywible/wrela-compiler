@@ -23,6 +23,26 @@ pub fn write_png(path: &Path, width: u32, height: u32, rgba: &[u8]) -> Result<()
     writer.finish().map_err(png_err)
 }
 
+/// Reads an RGBA8 PNG (a golden frame): its width, height and pixels, rows top to bottom.
+pub fn read_png(path: &Path) -> Result<(u32, u32, Vec<u8>)> {
+    let io = |e: std::io::Error| Error::io(path, e);
+    let decode = |e: png::DecodingError| Error::io(path, std::io::Error::other(e));
+    let file = std::fs::File::open(path).map_err(io)?;
+    let mut reader =
+        png::Decoder::new(std::io::BufReader::new(file)).read_info().map_err(decode)?;
+    let info = reader.info();
+    if (info.color_type, info.bit_depth) != (png::ColorType::Rgba, png::BitDepth::Eight) {
+        return Err(Error::io(path, std::io::Error::other("not an 8-bit RGBA PNG")));
+    }
+    let size = reader
+        .output_buffer_size()
+        .ok_or_else(|| Error::io(path, std::io::Error::other("the image is too large")))?;
+    let mut out = vec![0; size];
+    let frame = reader.next_frame(&mut out).map_err(decode)?;
+    out.truncate(frame.buffer_size());
+    Ok((frame.width, frame.height, out))
+}
+
 /// How far apart two frames are, over every channel of every pixel, in 8-bit steps.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FrameDiff {
@@ -69,13 +89,7 @@ mod tests {
         let path = dir.join("frame.png");
         let rgba: Vec<u8> = (0..2 * 3 * 4).map(|i| (i * 10) as u8).collect();
         write_png(&path, 2, 3, &rgba).expect("written");
-        let decoder =
-            png::Decoder::new(std::io::BufReader::new(std::fs::File::open(&path).expect("open")));
-        let mut reader = decoder.read_info().expect("header");
-        let mut out = vec![0; reader.output_buffer_size().expect("size")];
-        let info = reader.next_frame(&mut out).expect("frame");
-        assert_eq!((info.width, info.height), (2, 3));
-        assert_eq!(&out[..info.buffer_size()], &rgba[..]);
+        assert_eq!(read_png(&path).expect("decodes"), (2, 3, rgba.clone()));
         assert!(write_png(&path, 2, 2, &rgba).is_err());
         std::fs::remove_dir_all(&dir).expect("cleanup");
     }
