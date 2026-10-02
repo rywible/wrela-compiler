@@ -1,0 +1,5 @@
+# Run artefacts from tools/headless.sh and tools/serve.py
+**/results/DONE
+**/results/console.log
+**/results/chrome.log
+**/results/*.png
