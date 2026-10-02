@@ -1,0 +1,14 @@
+use std::derive::{interval, Interval}
+
+fn wave(t: f32) -> f32 {
+    sin(t) * t
+}
+
+/// Every value of sin(t) * t for t in [lo, hi], as (low, high).
+pub fn range_over(lo: f32, hi: f32) -> vec2 {
+    let r = interval(wave, Interval { lo, hi })
+    vec2(r.lo, r.hi)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+}

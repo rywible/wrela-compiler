@@ -1,0 +1,6 @@
+/// Rotates `v` about the origin by `angle` radians.
+pub fn rotate(v: vec2, angle: f32) -> vec2 {
+    let c = cos(angle)
+    let s = sin(angle)
+    vec2(v.x * c - v.y * s, v.x * s + v.y * c)
+}

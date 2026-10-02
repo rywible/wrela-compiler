@@ -1,0 +1,23 @@
+enum Shape {
+    Circle { r: f32 },
+    Rect { w: f32, h: f32 },
+    Square { side: f32 },
+}
+
+fn area(s: Shape) -> f32 {
+    match s {
+        Shape::Circle { r } => 3.14159 * r * r,
+        Shape::Rect { w, h } => w * h,
+        Shape::Square { side } => side * side,
+    }
+}
+
+pub fn total() -> f32 {
+    let c = Shape::Circle { r: 1.0 }
+    let r = Shape::Rect { w: 2.0, h: 3.0 }
+    let q = Shape::Square { side: 4.0 }
+    area(c) + area(r) + area(q)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+}

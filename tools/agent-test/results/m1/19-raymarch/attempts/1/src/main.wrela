@@ -1,0 +1,51 @@
+// Sphere tracing a unit sphere at the origin from a camera at (0, 0, -3).
+use std::field::{Surface, sphere}
+use std::gpu::{ClipPosition, FragCoord, VertexIndex, begin_screen_pass, draw, present}
+
+struct Scene: Copy + Clone + GpuData {
+    resolution: vec2,
+    eye: vec3,
+}
+
+/// One triangle that covers the screen.
+@vertex
+fn cover(vertex: VertexIndex) -> ClipPosition {
+    let x = f32(vertex.index % 2) * 4.0 - 1.0
+    let y = f32(vertex.index / 2) * 4.0 - 1.0
+    ClipPosition { position: vec4(x, y, 0.0, 1.0) }
+}
+
+fn shade_pixel<F: Surface>(pixel: vec2, scene: Scene, field: F) -> vec4 {
+    let uv = (pixel * 2.0 - scene.resolution) / scene.resolution.y
+    let dir = normalize(vec3(uv.x, -uv.y, 1.5))
+    var t = 0.0
+    var hit = false
+    var i = 0
+    while i < 64 && !hit && t < 10.0 {
+        let d = field.distance(scene.eye + dir * t)
+        if d < 0.001 {
+            hit = true
+        } else {
+            t += d
+        }
+        i += 1
+    }
+    if !hit {
+        return vec4(0.1, 0.1, 0.1, 1.0)
+    }
+    let p = scene.eye + dir * t
+    let n = normalize(field.gradient(p))
+    vec4(n * 0.5 + 0.5, 1.0)
+}
+
+@fragment
+fn shade<F: Surface>(pixel: FragCoord, scene: Scene, field: F) -> vec4 {
+    shade_pixel(pixel.position.xy, scene, field)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    let scene = Scene { resolution: vec2(f32(width), f32(height)), eye: vec3(0.0, 0.0, -3.0) }
+    begin_screen_pass(clear: vec4(0.0, 0.0, 0.0, 1.0))
+    draw(cover, shade, vertices: 3, scene: scene, field: sphere(radius: 1.0))
+    present()
+}

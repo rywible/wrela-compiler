@@ -1,0 +1,40 @@
+/// Something with a size.
+trait Measured {
+    fn size(self) -> f32
+
+    fn double(self) -> f32 {
+        self.size() * 2.0
+    }
+}
+
+struct Square {
+    side: f32,
+}
+
+struct Rect {
+    w: f32,
+    h: f32,
+}
+
+impl Measured for Square {
+    fn size(self) -> f32 {
+        self.side * self.side
+    }
+}
+
+impl Measured for Rect {
+    fn size(self) -> f32 {
+        self.w * self.h
+    }
+}
+
+fn double_both<T: Measured>(a: T, b: T) -> f32 {
+    a.double() + b.double()
+}
+
+pub fn measured_total() -> f32 {
+    double_both(Square { side: 2.0 }, Square { side: 3.0 })
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+}

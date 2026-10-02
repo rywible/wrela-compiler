@@ -1,0 +1,15 @@
+{
+  "test": "wrela agent syntax test (AC10 of #6, D-067 item 4). Measured, not gated; re-run every milestone with this file, tasks.json and the brief unchanged.",
+  "frozen_in": "milestone 1, 2026-10-02",
+  "model": "claude-sonnet-5-5",
+  "agents": "one fresh agent per task, run through Claude Code's Agent tool with model `sonnet`, from the repository root, prompted only with: \"Read <task-dir>/BRIEF.txt and do exactly what it says.\" BRIEF.txt is `brief` filled in for the task; <task-dir> is target/agent-test/<run>/<task id>.",
+  "max_attempts": 8,
+  "context": [
+    "docs/language.md",
+    "spec/lexical.md",
+    "spec/grammar.ebnf",
+    "examples/hello-field/main.wrela",
+    "examples/hello-field/shape.wrela"
+  ],
+  "brief": "You're writing a program in wrela, a new programming language for games, to measure how learnable it is. Read these files first, and only these (no other files in the repository: not the compiler, its tests or its standard library sources): {context}.\n\nYour task ({id}): {task}\n\nEvery program is a package: a directory whose entry file is `main.wrela`. Yours is {dir}/pkg; write your files there. Every program must export `pub fn frame(time: f32, width: u32, height: u32)`, called by the host once per frame (its body may be empty when the task has no GPU work).\n\nTo compile, run exactly `tools/agent-test/attempt.sh {dir}` from the repository root: it builds the package, records the attempt and prints the compiler's diagnostics. Don't run the compiler any other way. Write your whole first version before you compile it. You have at most {max_attempts} attempts; stop at the first that builds.\n\nWhen you're done, report: (1) whether it built, and on which attempt; (2) for each attempt that didn't build, each diagnostic's code, what you took it to mean, and what you changed in response; (3) anything in the language or its documentation that misled you."
+}

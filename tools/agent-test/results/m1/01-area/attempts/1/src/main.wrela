@@ -1,0 +1,7 @@
+/// The area of a circle of radius `r`.
+pub fn circle_area(r: f32) -> f32 {
+    3.14159265 * r * r
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+}

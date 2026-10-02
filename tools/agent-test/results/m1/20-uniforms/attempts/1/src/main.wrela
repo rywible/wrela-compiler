@@ -1,0 +1,25 @@
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch, write}
+
+/// The uniform block: one factor for the whole dispatch.
+struct Params: Copy + Clone + GpuData {
+    factor: f32,
+}
+
+/// One element per invocation: dst[i] = src[i] * factor.
+@compute(64)
+fn scale(src: [f32], params: Params, dst: mut Slots<f32>, id: GlobalId) {
+    dst[id] = src[id.x] * params.factor
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    var values = [0.0; 64]
+    var i = 0
+    while i < 64 {
+        values[i] = f32(i)
+        i += 1
+    }
+    let input: GpuBuffer<f32> = buffer(64)
+    let output: GpuBuffer<f32> = buffer(64)
+    write(input, 0, values)
+    dispatch(scale, groups: 1, src: input, params: Params { factor: 2.0 }, dst: output)
+}

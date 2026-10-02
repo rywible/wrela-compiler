@@ -1,0 +1,19 @@
+struct Particle {
+    pos: vec3,
+    vel: vec3,
+}
+
+fn step(p: mut Particle, dt: f32) {
+    p.pos += p.vel * dt
+}
+
+pub fn simulate(steps: u32, dt: f32) -> f32 {
+    var p = Particle { pos: vec3(), vel: vec3(1.0, 2.0, 0.0) }
+    for i in 0..steps {
+        step(mut p, dt)
+    }
+    p.pos.x
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+}

@@ -1,0 +1,25 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0207",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [],
+      "label": null,
+      "labels": [],
+      "message": "`[f32]` has no method `len`",
+      "notes": [],
+      "severity": "error",
+      "span": {
+        "column": 18,
+        "end": 155,
+        "end_column": 21,
+        "end_line": 4,
+        "line": 4,
+        "start": 152
+      },
+      "title": "an unknown method"
+    }
+  ],
+  "version": 1
+}

@@ -1,0 +1,9 @@
+const WEIGHTS: [f32; 5] = [0.1, 0.2, 0.4, 0.2, 0.1]
+
+/// The weighted sum of five values.
+pub fn smooth(a: f32, b: f32, c: f32, d: f32, e: f32) -> f32 {
+    WEIGHTS[0] * a + WEIGHTS[1] * b + WEIGHTS[2] * c + WEIGHTS[3] * d + WEIGHTS[4] * e
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+}

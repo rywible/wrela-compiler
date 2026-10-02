@@ -1,0 +1,82 @@
+[
+  {
+    "id": "01-area",
+    "task": "Export `pub fn circle_area(r: f32) -> f32`, the area of a circle of radius r."
+  },
+  {
+    "id": "02-particle",
+    "task": "Define a `Particle` struct with a position and a velocity (both vec3), and `fn step(p: mut Particle, dt: f32)` that advances the position by the velocity times dt. Export `pub fn simulate(steps: u32, dt: f32) -> f32`: a particle starting at the origin with velocity (1, 2, 0), stepped `steps` times; return its final x."
+  },
+  {
+    "id": "03-shapes",
+    "task": "Define an enum `Shape` with variants `Circle { r: f32 }`, `Rect { w: f32, h: f32 }` and `Square { side: f32 }`, and `fn area(s: Shape) -> f32` using `match`. Export `pub fn total() -> f32`, the summed area of one shape of each kind (any sizes)."
+  },
+  {
+    "id": "04-traits",
+    "task": "Define a trait `Measured` with a required method `fn size(self) -> f32` and a default method `fn double(self) -> f32` that returns twice the size. Implement it for two structs of your choosing. Write a generic function that returns the sum of `double()` of two values of the same type with the trait, and export a function that returns a result of it."
+  },
+  {
+    "id": "05-ownership",
+    "task": "Define a struct `Log { count: u32 }` that isn't `Copy`, with `fn bump(log: mut Log)` adding one and `fn archive(log: take Log) -> u32` returning its count. Export `pub fn run() -> u32`: create a log, bump it twice, make a copy of it, archive the copy, and return the original's count plus what archive returned."
+  },
+  {
+    "id": "06-field",
+    "task": "Using `std::field`, build a field: a sphere of radius 0.5, smoothly united (k = 0.1) with a round cone from the origin to (0, 1, 0) with radii 0.3 and 0.1, the whole translated by (0, -0.5, 0). Export `pub fn distance_at(x: f32, y: f32, z: f32) -> f32`, the field's distance at that point."
+  },
+  {
+    "id": "07-kernel",
+    "task": "Write a compute kernel that writes, for each point of a 16\u00d716\u00d716 grid with cell size 0.125 starting at (-1, -1, -1), the distance to a sphere of radius 0.75 into a buffer, one value per point. Each frame, dispatch it over the whole grid."
+  },
+  {
+    "id": "08-sky",
+    "task": "Each frame, draw a full-screen sky: a vertex shader that covers the screen with one triangle, and a fragment shader whose colour goes from deep blue at the top of the screen to white at the bottom. Pass the screen size to the shader."
+  },
+  {
+    "id": "09-normals",
+    "task": "Export `pub fn normal_at(x: f32, y: f32, z: f32) -> vec3`: the unit normal at that point of a field made of two spheres (radius 0.5 at the origin, radius 0.3 at (0.6, 0, 0)) smoothly united with k = 0.1, from the gradient the compiler derives."
+  },
+  {
+    "id": "10-interval",
+    "task": "Export `pub fn range_over(lo: f32, hi: f32) -> vec2`: a range holding every value of f(t) = sin(t) * t for t between lo and hi, from the compiler's derived interval, as (low, high)."
+  },
+  {
+    "id": "11-projection",
+    "task": "Define a struct `World` holding `values: [f32; 8]`. Write a function that takes a `World` mutably and an index and returns a mutable projection of that element. Export `pub fn bump_fourth() -> f32`: make a world of zeros, add 1 to element 3 through the projection, and return element 3."
+  },
+  {
+    "id": "12-closures",
+    "task": "Write `fn apply_twice(f: fn(f32) -> f32, x: f32) -> f32` that applies f twice. Export `pub fn scaled(s: f32) -> f32`, which calls apply_twice with a closure multiplying by s and then adding 1, starting from 2."
+  },
+  {
+    "id": "13-arrays",
+    "task": "Write a function that sums a run `[f32]`, and a function that returns the largest element of a `[f32; 5]`. Export `pub fn stats() -> vec2` returning (sum, max) for the array [3, -1, 4, 1, 5]."
+  },
+  {
+    "id": "14-option",
+    "task": "Write `fn first_negative(xs: [f32]) -> Option<u32>`, the index of the first negative element if there is one. Export `pub fn where_negative() -> u32`, which returns that index for [2, 7, -1, 3] or 99 if there is none."
+  },
+  {
+    "id": "15-modules",
+    "task": "Put a public function `rotate(v: vec2, angle: f32) -> vec2` (rotation about the origin) in its own module file `geometry.wrela`, use it from `main.wrela`, and export `pub fn rotated_x(angle: f32) -> f32`: the x of (1, 0) rotated by angle."
+  },
+  {
+    "id": "16-constants",
+    "task": "Define a constant array of five weights (0.1, 0.2, 0.4, 0.2, 0.1). Export `pub fn smooth(a: f32, b: f32, c: f32, d: f32, e: f32) -> f32`: the weighted sum of its arguments."
+  },
+  {
+    "id": "17-reflect",
+    "task": "Export `pub fn reflect_y(x: f32, y: f32, z: f32) -> vec3`: the direction (x, y, z), normalized, reflected about the surface normal (0, 1, 0)."
+  },
+  {
+    "id": "18-surface",
+    "task": "Define a struct `Cuboid` with half-extents (a vec3) that implements `std::field::Surface` with the exact signed distance of a box centred at the origin. Smoothly unite it (k = 0.05) with a sphere of radius 0.4 at (0.5, 0, 0) and export the distance at a point given as three floats."
+  },
+  {
+    "id": "19-raymarch",
+    "task": "Each frame, draw a sphere of radius 1 at the origin, seen from a camera at (0, 0, -3) looking at the origin: a full-screen triangle, and a fragment shader that sphere-traces the sphere's field (at most 64 steps) and shades hits by the normal from the derived gradient, and misses in a dark grey."
+  },
+  {
+    "id": "20-uniforms",
+    "task": "Write a compute kernel that multiplies each element of an input buffer of 64 floats by a factor passed as a uniform, writing an output buffer. Each frame, upload 64 values (0, 1, 2, ...) to the input and dispatch the kernel with factor 2."
+  }
+]

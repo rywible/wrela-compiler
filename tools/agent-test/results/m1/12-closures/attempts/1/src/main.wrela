@@ -1,0 +1,10 @@
+fn apply_twice(f: fn(f32) -> f32, x: f32) -> f32 {
+    f(f(x))
+}
+
+pub fn scaled(s: f32) -> f32 {
+    apply_twice(|v| v * s + 1.0, 2.0)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+}

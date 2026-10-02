@@ -1,0 +1,209 @@
+{
+  "tasks": 20,
+  "first_try_builds": 17,
+  "first_try_rate": 0.85,
+  "built_eventually": 20,
+  "mean_attempts_to_success": 1.15,
+  "codes_met": {
+    "E0207": 2,
+    "E0100": 1
+  },
+  "misread": [],
+  "per_task": [
+    {
+      "task": "01-area",
+      "attempts": 1,
+      "built_at": 1,
+      "codes_per_attempt": [
+        []
+      ]
+    },
+    {
+      "task": "02-particle",
+      "attempts": 2,
+      "built_at": 2,
+      "codes_per_attempt": [
+        [
+          "E0100"
+        ],
+        []
+      ]
+    },
+    {
+      "task": "03-shapes",
+      "attempts": 1,
+      "built_at": 1,
+      "codes_per_attempt": [
+        []
+      ]
+    },
+    {
+      "task": "04-traits",
+      "attempts": 1,
+      "built_at": 1,
+      "codes_per_attempt": [
+        []
+      ]
+    },
+    {
+      "task": "05-ownership",
+      "attempts": 1,
+      "built_at": 1,
+      "codes_per_attempt": [
+        []
+      ]
+    },
+    {
+      "task": "06-field",
+      "attempts": 1,
+      "built_at": 1,
+      "codes_per_attempt": [
+        []
+      ]
+    },
+    {
+      "task": "07-kernel",
+      "attempts": 1,
+      "built_at": 1,
+      "codes_per_attempt": [
+        []
+      ]
+    },
+    {
+      "task": "08-sky",
+      "attempts": 1,
+      "built_at": 1,
+      "codes_per_attempt": [
+        []
+      ]
+    },
+    {
+      "task": "09-normals",
+      "attempts": 1,
+      "built_at": 1,
+      "codes_per_attempt": [
+        []
+      ]
+    },
+    {
+      "task": "10-interval",
+      "attempts": 1,
+      "built_at": 1,
+      "codes_per_attempt": [
+        []
+      ]
+    },
+    {
+      "task": "11-projection",
+      "attempts": 1,
+      "built_at": 1,
+      "codes_per_attempt": [
+        []
+      ]
+    },
+    {
+      "task": "12-closures",
+      "attempts": 1,
+      "built_at": 1,
+      "codes_per_attempt": [
+        []
+      ]
+    },
+    {
+      "task": "13-arrays",
+      "attempts": 2,
+      "built_at": 2,
+      "codes_per_attempt": [
+        [
+          "E0207"
+        ],
+        []
+      ]
+    },
+    {
+      "task": "14-option",
+      "attempts": 2,
+      "built_at": 2,
+      "codes_per_attempt": [
+        [
+          "E0207"
+        ],
+        []
+      ]
+    },
+    {
+      "task": "15-modules",
+      "attempts": 1,
+      "built_at": 1,
+      "codes_per_attempt": [
+        []
+      ]
+    },
+    {
+      "task": "16-constants",
+      "attempts": 1,
+      "built_at": 1,
+      "codes_per_attempt": [
+        []
+      ]
+    },
+    {
+      "task": "17-reflect",
+      "attempts": 1,
+      "built_at": 1,
+      "codes_per_attempt": [
+        []
+      ]
+    },
+    {
+      "task": "18-surface",
+      "attempts": 1,
+      "built_at": 1,
+      "codes_per_attempt": [
+        []
+      ]
+    },
+    {
+      "task": "19-raymarch",
+      "attempts": 1,
+      "built_at": 1,
+      "codes_per_attempt": [
+        []
+      ]
+    },
+    {
+      "task": "20-uniforms",
+      "attempts": 1,
+      "built_at": 1,
+      "codes_per_attempt": [
+        []
+      ]
+    }
+  ],
+  "run": {
+    "milestone": "M1",
+    "date": "2026-10-02",
+    "model": "claude-sonnet-5-5",
+    "compiler": "wrela at the commit that adds this file's run",
+    "note": "Builds are what's measured; whether each program computes the right thing isn't."
+  },
+  "misread_review": "Each failed attempt's diagnostics and the agent's account of them were reviewed: all three were read correctly and fixed in one step, so none is listed as misread.",
+  "findings": [
+    {
+      "from": "02-particle",
+      "what": "`for _ in 0..n` was rejected (E0100, 'a `for` loop binds one name') although the grammar's for loop takes a pattern and `_` is one: a checker bug. Fixed after this run."
+    },
+    {
+      "from": "13-arrays, 14-option",
+      "what": "A run `[T]` has no `len()` (E0207), and language.md never says how to get a run's length; both agents switched to `for x in xs`."
+    },
+    {
+      "from": "several",
+      "what": "language.md doesn't list the built-in math functions (`sin`, `mix`, `clamp`, `length`, `dot`, `normalize`, ...) or say they apply per component to vectors, has no `PI`, no `for i in 0..n` example, no example of constructing or matching an enum variant, no example of `interval` over a function, and no user `impl Surface`; agents inferred these from the grammar and hello-field."
+    },
+    {
+      "from": "08-sky, 19-raymarch",
+      "what": "Which way FragCoord's y runs and which way a camera looks are left to WGSL convention."
+    }
+  ]
+}

@@ -1,0 +1,15 @@
+use std::field::{Surface, round_cone, sphere}
+
+/// A sphere smoothly united with a round cone, moved down by half a unit.
+fn shape() -> Surface {
+    sphere(radius: 0.5)
+        .smooth_union(round_cone(vec3(), vec3(y: 1.0), 0.3, 0.1), k: 0.1)
+        .translate(vec3(0.0, -0.5, 0.0))
+}
+
+pub fn distance_at(x: f32, y: f32, z: f32) -> f32 {
+    shape().distance(vec3(x, y, z))
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+}

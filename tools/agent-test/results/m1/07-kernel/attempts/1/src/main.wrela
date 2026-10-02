@@ -1,0 +1,22 @@
+use std::field::{Surface, sphere}
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch}
+
+struct Grid: Copy + Clone + GpuData {
+    origin: vec3,
+    cell: f32,
+    n: u32,
+}
+
+/// One grid point per invocation: the distance to the field at that point.
+@compute(64)
+fn sample<F: Surface>(field: F, grid: Grid, out: mut Slots<f32>, id: GlobalId) {
+    let i = id.x
+    let c = vec3(f32(i % grid.n), f32((i / grid.n) % grid.n), f32(i / (grid.n * grid.n)))
+    out[id] = field.distance(grid.origin + c * grid.cell)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    let out: GpuBuffer<f32> = buffer(4096)
+    let grid = Grid { origin: vec3(-1.0), cell: 0.125, n: 16 }
+    dispatch(sample, groups: 64, field: sphere(radius: 0.75), grid: grid, out: out)
+}

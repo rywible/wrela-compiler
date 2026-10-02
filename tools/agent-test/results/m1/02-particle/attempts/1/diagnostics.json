@@ -1,0 +1,25 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0100",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [],
+      "label": null,
+      "labels": [],
+      "message": "a `for` loop binds one name",
+      "notes": [],
+      "severity": "error",
+      "span": {
+        "column": 9,
+        "end": 232,
+        "end_column": 10,
+        "end_line": 12,
+        "line": 12,
+        "start": 231
+      },
+      "title": "unexpected token"
+    }
+  ],
+  "version": 1
+}

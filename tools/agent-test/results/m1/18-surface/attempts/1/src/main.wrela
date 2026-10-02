@@ -1,0 +1,28 @@
+use std::field::{Surface, sphere}
+
+/// A box centred at the origin, given by its half-extents along each axis.
+struct Cuboid: Copy + Clone + GpuData {
+    half: vec3,
+}
+
+impl Surface for Cuboid {
+    /// The exact signed distance: negative inside, the true Euclidean distance outside.
+    fn distance(self, p: vec3) -> f32 {
+        let q = abs(p) - self.half
+        length(max(q, vec3(0.0))) + min(max(q.x, max(q.y, q.z)), 0.0)
+    }
+}
+
+fn scene() -> Surface {
+    let block = Cuboid { half: vec3(0.5, 0.3, 0.2) }
+    let ball = sphere(radius: 0.4).translate(vec3(0.5, 0.0, 0.0))
+    block.smooth_union(ball, k: 0.05)
+}
+
+/// The distance to the united shape at the point (x, y, z).
+pub fn dist(x: f32, y: f32, z: f32) -> f32 {
+    scene().distance(vec3(x, y, z))
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+}
