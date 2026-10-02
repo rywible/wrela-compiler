@@ -48,193 +48,127 @@ impl BuiltinTy {
     }
 }
 
-/// A built-in function. Most are overloaded across scalar and vector types, like WGSL's.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum BuiltinFn {
+/// How a built-in function is called.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Call {
+    /// `f(x)`, and `x.f()` on its first argument.
+    Both,
+    /// `f(x)` only.
+    Free,
+    /// `x.f()` only.
+    Method,
+}
+
+/// The built-in functions, one row each: the variant, its name, how many arguments it takes,
+/// how it's called, whether an argument whose literal type isn't settled defaults to a float,
+/// and (for transcendentals) the std function that implements it on the CPU (language.md §11).
+macro_rules! builtin_fns {
+    ($( $(#[$m:meta])* $v:ident = $name:literal, $arity:literal, $call:ident, $float:literal, $cpu:expr; )*) => {
+        /// A built-in function. Most are overloaded across scalar and vector types, like WGSL's.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+        pub enum BuiltinFn {
+            $( $(#[$m])* $v, )*
+        }
+
+        impl BuiltinFn {
+            pub const ALL: &[BuiltinFn] = &[$(BuiltinFn::$v),*];
+
+            pub fn name(self) -> &'static str {
+                match self { $(BuiltinFn::$v => $name,)* }
+            }
+
+            /// How many arguments it takes.
+            pub fn arity(self) -> usize {
+                match self { $(BuiltinFn::$v => $arity,)* }
+            }
+
+            fn call(self) -> Call {
+                match self { $(BuiltinFn::$v => Call::$call,)* }
+            }
+
+            /// Whether an argument that's an unresolved literal defaults to a float.
+            pub fn wants_float(self) -> bool {
+                match self { $(BuiltinFn::$v => $float,)* }
+            }
+
+            /// The std function that computes it on the CPU, for a transcendental.
+            pub fn cpu_impl(self) -> Option<crate::defs::Lang> {
+                use crate::defs::Lang;
+                match self { $(BuiltinFn::$v => $cpu,)* }
+            }
+        }
+    };
+}
+
+builtin_fns! {
     // Componentwise on f32 scalars and vectors (and f64 on the CPU).
-    Sqrt,
-    InverseSqrt,
-    Sin,
-    Cos,
-    Tan,
-    Asin,
-    Acos,
-    Atan,
-    Exp,
-    Exp2,
-    Log,
-    Log2,
-    Floor,
-    Ceil,
-    Round,
-    Trunc,
-    Fract,
-    Saturate,
+    Sqrt = "sqrt", 1, Both, true, None;
+    InverseSqrt = "inverse_sqrt", 1, Both, true, None;
+    Sin = "sin", 1, Both, true, Some(Lang::CpuSin);
+    Cos = "cos", 1, Both, true, Some(Lang::CpuCos);
+    Tan = "tan", 1, Both, true, Some(Lang::CpuTan);
+    Asin = "asin", 1, Both, true, Some(Lang::CpuAsin);
+    Acos = "acos", 1, Both, true, Some(Lang::CpuAcos);
+    Atan = "atan", 1, Both, true, Some(Lang::CpuAtan);
+    Exp = "exp", 1, Both, true, Some(Lang::CpuExp);
+    Exp2 = "exp2", 1, Both, true, Some(Lang::CpuExp2);
+    Log = "log", 1, Both, true, Some(Lang::CpuLog);
+    Log2 = "log2", 1, Both, true, Some(Lang::CpuLog2);
+    Floor = "floor", 1, Both, true, None;
+    Ceil = "ceil", 1, Both, true, None;
+    Round = "round", 1, Both, true, None;
+    Trunc = "trunc", 1, Both, true, None;
+    Fract = "fract", 1, Both, true, None;
+    Saturate = "saturate", 1, Both, true, None;
     // Two arguments of one float type.
-    Atan2,
-    Pow,
-    Step,
+    Atan2 = "atan2", 2, Both, true, Some(Lang::CpuAtan2);
+    Pow = "pow", 2, Both, true, Some(Lang::CpuPow);
+    Step = "step", 2, Both, true, None;
     // Numeric (int or float), componentwise.
-    Abs,
-    Sign,
-    Min,
-    Max,
-    Clamp,
-    // mix(a, b, t): t is the same type as a and b, or f32.
-    Mix,
-    Smoothstep,
+    Abs = "abs", 1, Both, false, None;
+    Sign = "sign", 1, Both, false, None;
+    Min = "min", 2, Both, false, None;
+    Max = "max", 2, Both, false, None;
+    Clamp = "clamp", 3, Both, false, None;
+    /// `mix(a, b, t)`: `t` is the same type as `a` and `b`, or `f32`.
+    Mix = "mix", 3, Both, true, None;
+    Smoothstep = "smoothstep", 3, Both, true, None;
     // Vectors.
-    Length,
-    Distance,
-    Dot,
-    Cross,
-    Normalize,
-    /// select(if_false, if_true, cond)
-    Select,
-    BitcastU32,
-    BitcastI32,
-    BitcastF32,
+    Length = "length", 1, Both, true, None;
+    Distance = "distance", 2, Both, true, None;
+    Dot = "dot", 2, Both, true, None;
+    Cross = "cross", 2, Both, true, None;
+    Normalize = "normalize", 1, Both, true, None;
+    /// `select(if_false, if_true, cond)`.
+    Select = "select", 3, Free, false, None;
+    BitcastU32 = "bitcast_u32", 1, Free, true, None;
+    BitcastI32 = "bitcast_i32", 1, Free, true, None;
+    BitcastF32 = "bitcast_f32", 1, Free, false, None;
     /// CPU only (64-bit).
-    BitcastU64,
-    BitcastF64,
+    BitcastU64 = "bitcast_u64", 1, Free, true, None;
+    BitcastF64 = "bitcast_f64", 1, Free, false, None;
     /// Fragment shaders only.
-    Dpdx,
-    Dpdy,
-    Fwidth,
+    Dpdx = "dpdx", 1, Both, true, None;
+    Dpdy = "dpdy", 1, Both, true, None;
+    Fwidth = "fwidth", 1, Both, true, None;
     /// Integer methods: the only arithmetic that wraps on the CPU.
-    WrappingAdd,
-    WrappingSub,
-    WrappingMul,
+    WrappingAdd = "wrapping_add", 2, Method, false, None;
+    WrappingSub = "wrapping_sub", 2, Method, false, None;
+    WrappingMul = "wrapping_mul", 2, Method, false, None;
     /// `xs.len()` of a run or an array: its element count, a `u32`.
-    Len,
+    Len = "len", 1, Method, false, None;
 }
 
 impl BuiltinFn {
-    /// The free functions, by name. (Wrapping arithmetic is method-only.)
+    /// The free function of this name.
     pub fn lookup(name: &str) -> Option<BuiltinFn> {
-        use BuiltinFn::*;
-        Some(match name {
-            "sqrt" => Sqrt,
-            "inverse_sqrt" => InverseSqrt,
-            "sin" => Sin,
-            "cos" => Cos,
-            "tan" => Tan,
-            "asin" => Asin,
-            "acos" => Acos,
-            "atan" => Atan,
-            "exp" => Exp,
-            "exp2" => Exp2,
-            "log" => Log,
-            "log2" => Log2,
-            "floor" => Floor,
-            "ceil" => Ceil,
-            "round" => Round,
-            "trunc" => Trunc,
-            "fract" => Fract,
-            "saturate" => Saturate,
-            "atan2" => Atan2,
-            "pow" => Pow,
-            "step" => Step,
-            "abs" => Abs,
-            "sign" => Sign,
-            "min" => Min,
-            "max" => Max,
-            "clamp" => Clamp,
-            "mix" => Mix,
-            "smoothstep" => Smoothstep,
-            "length" => Length,
-            "distance" => Distance,
-            "dot" => Dot,
-            "cross" => Cross,
-            "normalize" => Normalize,
-            "select" => Select,
-            "bitcast_u32" => BitcastU32,
-            "bitcast_i32" => BitcastI32,
-            "bitcast_f32" => BitcastF32,
-            "bitcast_u64" => BitcastU64,
-            "bitcast_f64" => BitcastF64,
-            "dpdx" => Dpdx,
-            "dpdy" => Dpdy,
-            "fwidth" => Fwidth,
-            _ => return None,
-        })
+        BuiltinFn::ALL.iter().copied().find(|b| b.name() == name && b.call() != Call::Method)
     }
 
-    /// Builtins callable as methods on their first argument: `v.length()`, `n.wrapping_mul(3)`.
+    /// The built-in callable as a method of this name, on its first argument: `v.length()`,
+    /// `n.wrapping_mul(3)`.
     pub fn lookup_method(name: &str) -> Option<BuiltinFn> {
-        use BuiltinFn::*;
-        match name {
-            "wrapping_add" => Some(WrappingAdd),
-            "wrapping_sub" => Some(WrappingSub),
-            "wrapping_mul" => Some(WrappingMul),
-            "len" => Some(Len),
-            "select" | "bitcast_u32" | "bitcast_i32" | "bitcast_f32" | "bitcast_u64"
-            | "bitcast_f64" => None,
-            _ => BuiltinFn::lookup(name),
-        }
-    }
-
-    pub fn name(self) -> &'static str {
-        use BuiltinFn::*;
-        match self {
-            Sqrt => "sqrt",
-            InverseSqrt => "inverse_sqrt",
-            Sin => "sin",
-            Cos => "cos",
-            Tan => "tan",
-            Asin => "asin",
-            Acos => "acos",
-            Atan => "atan",
-            Exp => "exp",
-            Exp2 => "exp2",
-            Log => "log",
-            Log2 => "log2",
-            Floor => "floor",
-            Ceil => "ceil",
-            Round => "round",
-            Trunc => "trunc",
-            Fract => "fract",
-            Saturate => "saturate",
-            Atan2 => "atan2",
-            Pow => "pow",
-            Step => "step",
-            Abs => "abs",
-            Sign => "sign",
-            Min => "min",
-            Max => "max",
-            Clamp => "clamp",
-            Mix => "mix",
-            Smoothstep => "smoothstep",
-            Length => "length",
-            Distance => "distance",
-            Dot => "dot",
-            Cross => "cross",
-            Normalize => "normalize",
-            Select => "select",
-            BitcastU32 => "bitcast_u32",
-            BitcastI32 => "bitcast_i32",
-            BitcastF32 => "bitcast_f32",
-            BitcastU64 => "bitcast_u64",
-            BitcastF64 => "bitcast_f64",
-            Dpdx => "dpdx",
-            Dpdy => "dpdy",
-            Fwidth => "fwidth",
-            WrappingAdd => "wrapping_add",
-            Len => "len",
-            WrappingSub => "wrapping_sub",
-            WrappingMul => "wrapping_mul",
-        }
-    }
-
-    /// How many arguments it takes.
-    pub fn arity(self) -> usize {
-        use BuiltinFn::*;
-        match self {
-            Atan2 | Pow | Step | Min | Max | Distance | Dot | Cross | WrappingAdd | WrappingSub
-            | WrappingMul => 2,
-            Clamp | Mix | Smoothstep | Select => 3,
-            _ => 1,
-        }
+        BuiltinFn::ALL.iter().copied().find(|b| b.name() == name && b.call() != Call::Free)
     }
 
     /// Fragment-only derivatives.
@@ -468,22 +402,20 @@ pub fn scalar_of(types: &Types, t: TyId) -> TyId {
     }
 }
 
-/// What the type of an argument should default to when it's an unresolved literal: whether the
-/// builtin wants floats.
-pub fn wants_float(f: BuiltinFn) -> bool {
-    !matches!(
-        f,
-        BuiltinFn::Abs
-            | BuiltinFn::Sign
-            | BuiltinFn::Min
-            | BuiltinFn::Max
-            | BuiltinFn::Clamp
-            | BuiltinFn::Select
-            | BuiltinFn::BitcastF32
-            | BuiltinFn::BitcastF64
-            | BuiltinFn::WrappingAdd
-            | BuiltinFn::WrappingSub
-            | BuiltinFn::WrappingMul
-            | BuiltinFn::Len
-    )
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_builtin_is_found_by_its_name() {
+        for &b in BuiltinFn::ALL {
+            let free = BuiltinFn::lookup(b.name());
+            let method = BuiltinFn::lookup_method(b.name());
+            assert!(free == Some(b) || method == Some(b), "{} isn't found", b.name());
+            assert!(b.arity() >= 1);
+        }
+        assert_eq!(BuiltinFn::lookup("wrapping_add"), None);
+        assert_eq!(BuiltinFn::lookup_method("select"), None);
+        assert_eq!(BuiltinFn::lookup_method("len"), Some(BuiltinFn::Len));
+    }
 }

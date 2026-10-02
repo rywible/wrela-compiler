@@ -552,6 +552,7 @@ impl<'d> Collector<'d> {
                 .map(|s| ast::Ident { name: s.into(), span: Span::new(FileId(0), 0, 0) })
                 .collect();
             let Some(std) = self.p.std_root else { continue };
+            // The compiler relies on every lang item; std not having one is a bug in std.
             match resolve::resolve_module_path(&self.p, std, &segs) {
                 resolve::PathLookup::Found(Res::Adt(a)) => {
                     self.p.adts[a.index()].lang = Some(lang);
@@ -565,7 +566,9 @@ impl<'d> Collector<'d> {
                     self.p.fns[f.index()].lang = Some(lang);
                     self.p.lang.insert(lang, LangRes::Fn(f));
                 }
-                _ => {}
+                _ => self.err(Diagnostic::internal(format!(
+                    "std has no `{path}`, which the compiler relies on"
+                ))),
             }
         }
     }

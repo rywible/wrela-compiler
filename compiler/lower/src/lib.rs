@@ -24,6 +24,7 @@ use std::rc::Rc;
 use wrela_diag::{Diagnostic, Span};
 use wrela_ir as ir;
 use wrela_sema::Checked;
+use wrela_sema::builtins::BuiltinFn;
 use wrela_sema::defs::{Entry, Lang};
 use wrela_sema::ty::{FnId, TyId, TyKind};
 
@@ -290,23 +291,12 @@ pub(crate) fn rc<T>(t: T) -> Rc<T> {
     Rc::new(t)
 }
 
-/// The std function implementing a transcendental builtin on the CPU (language.md §11).
+/// The std function implementing a transcendental builtin on the CPU (language.md §11): the
+/// one the built-in function that lowers to it names.
 pub(crate) fn cpu_math_lang(b: ir::Builtin) -> Option<Lang> {
-    use ir::Builtin as I;
-    Some(match b {
-        I::Sin => Lang::CpuSin,
-        I::Cos => Lang::CpuCos,
-        I::Tan => Lang::CpuTan,
-        I::Asin => Lang::CpuAsin,
-        I::Acos => Lang::CpuAcos,
-        I::Atan => Lang::CpuAtan,
-        I::Atan2 => Lang::CpuAtan2,
-        I::Exp => Lang::CpuExp,
-        I::Exp2 => Lang::CpuExp2,
-        I::Log => Lang::CpuLog,
-        I::Log2 => Lang::CpuLog2,
-        I::Pow => Lang::CpuPow,
-        _ => return None,
+    BuiltinFn::ALL.iter().find_map(|&f| match body::builtin_ir(f) {
+        body::BuiltinIr::Math(m) if m == b => f.cpu_impl(),
+        _ => None,
     })
 }
 

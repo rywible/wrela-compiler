@@ -1367,86 +1367,21 @@ impl<'c, 'a> Fl<'c, 'a> {
         ty: ir::TypeId,
         span: Span,
     ) -> Option<ir::ValueId> {
-        use ir::Builtin as I;
-        let ib = match b {
-            BuiltinFn::Sqrt => I::Sqrt,
-            BuiltinFn::InverseSqrt => I::InverseSqrt,
-            BuiltinFn::Sin => I::Sin,
-            BuiltinFn::Cos => I::Cos,
-            BuiltinFn::Tan => I::Tan,
-            BuiltinFn::Asin => I::Asin,
-            BuiltinFn::Acos => I::Acos,
-            BuiltinFn::Atan => I::Atan,
-            BuiltinFn::Atan2 => I::Atan2,
-            BuiltinFn::Exp => I::Exp,
-            BuiltinFn::Exp2 => I::Exp2,
-            BuiltinFn::Log => I::Log,
-            BuiltinFn::Log2 => I::Log2,
-            BuiltinFn::Pow => I::Pow,
-            BuiltinFn::Floor => I::Floor,
-            BuiltinFn::Ceil => I::Ceil,
-            BuiltinFn::Round => I::Round,
-            BuiltinFn::Trunc => I::Trunc,
-            BuiltinFn::Fract => I::Fract,
-            BuiltinFn::Saturate => I::Saturate,
-            BuiltinFn::Step => I::Step,
-            BuiltinFn::Abs => I::Abs,
-            BuiltinFn::Sign => I::Sign,
-            BuiltinFn::Min => I::Min,
-            BuiltinFn::Max => I::Max,
-            BuiltinFn::Clamp => I::Clamp,
-            BuiltinFn::Mix => I::Mix,
-            BuiltinFn::Smoothstep => I::Smoothstep,
-            BuiltinFn::Length => I::Length,
-            BuiltinFn::Distance => I::Distance,
-            BuiltinFn::Dot => I::Dot,
-            BuiltinFn::Cross => I::Cross,
-            BuiltinFn::Normalize => I::Normalize,
-            BuiltinFn::Dpdx => I::Dpdx,
-            BuiltinFn::Dpdy => I::Dpdy,
-            BuiltinFn::Fwidth => I::Fwidth,
-            BuiltinFn::Select => {
-                return Some(self.value(
-                    ty,
-                    ir::Expr::Select { cond: args[2], if_true: args[1], if_false: args[0] },
-                ));
+        let e = match builtin_ir(b) {
+            BuiltinIr::Math(ib) => {
+                if matches!(ib, ir::Builtin::Dpdx | ir::Builtin::Dpdy | ir::Builtin::Fwidth) {
+                    crate::gpu::check_derivative(self, span);
+                }
+                return self.math(ib, args, ty, span, b.name());
             }
-            BuiltinFn::BitcastU32 => {
-                return Some(self.value(ty, ir::Expr::Bitcast(args[0], ir::Scalar::U32)));
+            BuiltinIr::Select => {
+                ir::Expr::Select { cond: args[2], if_true: args[1], if_false: args[0] }
             }
-            BuiltinFn::BitcastI32 => {
-                return Some(self.value(ty, ir::Expr::Bitcast(args[0], ir::Scalar::I32)));
-            }
-            BuiltinFn::BitcastF32 => {
-                return Some(self.value(ty, ir::Expr::Bitcast(args[0], ir::Scalar::F32)));
-            }
-            BuiltinFn::BitcastU64 => {
-                return Some(self.value(ty, ir::Expr::Bitcast(args[0], ir::Scalar::U64)));
-            }
-            BuiltinFn::BitcastF64 => {
-                return Some(self.value(ty, ir::Expr::Bitcast(args[0], ir::Scalar::F64)));
-            }
-            BuiltinFn::WrappingAdd => {
-                return Some(
-                    self.value(ty, ir::Expr::Binary(ir::BinOp::WrappingAdd, args[0], args[1])),
-                );
-            }
-            BuiltinFn::WrappingSub => {
-                return Some(
-                    self.value(ty, ir::Expr::Binary(ir::BinOp::WrappingSub, args[0], args[1])),
-                );
-            }
-            BuiltinFn::WrappingMul => {
-                return Some(
-                    self.value(ty, ir::Expr::Binary(ir::BinOp::WrappingMul, args[0], args[1])),
-                );
-            }
-            BuiltinFn::Len => unreachable!("`len` is `Rvalue::Len`"),
+            BuiltinIr::Bitcast(s) => ir::Expr::Bitcast(args[0], s),
+            BuiltinIr::Wrapping(op) => ir::Expr::Binary(op, args[0], args[1]),
+            BuiltinIr::Len => unreachable!("`len` is `Rvalue::Len`"),
         };
-        if matches!(ib, I::Dpdx | I::Dpdy | I::Fwidth) {
-            crate::gpu::check_derivative(self, span);
-        }
-        self.math(ib, args, ty, span, b.name())
+        Some(self.value(ty, e))
     }
 
     /// A math builtin (`what` as the source wrote it). On the CPU the transcendentals become
@@ -1485,4 +1420,66 @@ pub(crate) fn derived_signature(
     key: &InstanceKey,
 ) -> ir::Function {
     crate::gpu::derived_signature(cx, mb, key)
+}
+
+/// What a built-in function lowers to.
+pub(crate) enum BuiltinIr {
+    Math(ir::Builtin),
+    Select,
+    Bitcast(ir::Scalar),
+    Wrapping(ir::BinOp),
+    Len,
+}
+
+pub(crate) fn builtin_ir(b: BuiltinFn) -> BuiltinIr {
+    use BuiltinIr::Math;
+    use ir::Builtin as I;
+    match b {
+        BuiltinFn::Sqrt => Math(I::Sqrt),
+        BuiltinFn::InverseSqrt => Math(I::InverseSqrt),
+        BuiltinFn::Sin => Math(I::Sin),
+        BuiltinFn::Cos => Math(I::Cos),
+        BuiltinFn::Tan => Math(I::Tan),
+        BuiltinFn::Asin => Math(I::Asin),
+        BuiltinFn::Acos => Math(I::Acos),
+        BuiltinFn::Atan => Math(I::Atan),
+        BuiltinFn::Atan2 => Math(I::Atan2),
+        BuiltinFn::Exp => Math(I::Exp),
+        BuiltinFn::Exp2 => Math(I::Exp2),
+        BuiltinFn::Log => Math(I::Log),
+        BuiltinFn::Log2 => Math(I::Log2),
+        BuiltinFn::Pow => Math(I::Pow),
+        BuiltinFn::Floor => Math(I::Floor),
+        BuiltinFn::Ceil => Math(I::Ceil),
+        BuiltinFn::Round => Math(I::Round),
+        BuiltinFn::Trunc => Math(I::Trunc),
+        BuiltinFn::Fract => Math(I::Fract),
+        BuiltinFn::Saturate => Math(I::Saturate),
+        BuiltinFn::Step => Math(I::Step),
+        BuiltinFn::Abs => Math(I::Abs),
+        BuiltinFn::Sign => Math(I::Sign),
+        BuiltinFn::Min => Math(I::Min),
+        BuiltinFn::Max => Math(I::Max),
+        BuiltinFn::Clamp => Math(I::Clamp),
+        BuiltinFn::Mix => Math(I::Mix),
+        BuiltinFn::Smoothstep => Math(I::Smoothstep),
+        BuiltinFn::Length => Math(I::Length),
+        BuiltinFn::Distance => Math(I::Distance),
+        BuiltinFn::Dot => Math(I::Dot),
+        BuiltinFn::Cross => Math(I::Cross),
+        BuiltinFn::Normalize => Math(I::Normalize),
+        BuiltinFn::Dpdx => Math(I::Dpdx),
+        BuiltinFn::Dpdy => Math(I::Dpdy),
+        BuiltinFn::Fwidth => Math(I::Fwidth),
+        BuiltinFn::Select => BuiltinIr::Select,
+        BuiltinFn::BitcastU32 => BuiltinIr::Bitcast(ir::Scalar::U32),
+        BuiltinFn::BitcastI32 => BuiltinIr::Bitcast(ir::Scalar::I32),
+        BuiltinFn::BitcastF32 => BuiltinIr::Bitcast(ir::Scalar::F32),
+        BuiltinFn::BitcastU64 => BuiltinIr::Bitcast(ir::Scalar::U64),
+        BuiltinFn::BitcastF64 => BuiltinIr::Bitcast(ir::Scalar::F64),
+        BuiltinFn::WrappingAdd => BuiltinIr::Wrapping(ir::BinOp::WrappingAdd),
+        BuiltinFn::WrappingSub => BuiltinIr::Wrapping(ir::BinOp::WrappingSub),
+        BuiltinFn::WrappingMul => BuiltinIr::Wrapping(ir::BinOp::WrappingMul),
+        BuiltinFn::Len => BuiltinIr::Len,
+    }
 }

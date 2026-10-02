@@ -706,7 +706,7 @@ impl<'p> Checker<'p> {
         // Remaining literals default: float builtins want f32.
         for x in &xs {
             if let Some(k) = self.infer.var_kind(&self.p.types, x.ty) {
-                let t = if builtins::wants_float(b) || k == VarKind::Float {
+                let t = if b.wants_float() || k == VarKind::Float {
                     self.p.types.f32
                 } else {
                     self.p.types.i32

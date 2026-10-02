@@ -567,11 +567,14 @@ fn bind_uniform(
     }
     let mut fields = Vec::new();
     for (name, t) in params {
-        if !wrela_sema::traits::implements_builtin(&cx.checked.program, *t, Lang::GpuData) {
-            let shown = cx.checked.program.display_ty(*t);
-            let span = owners.first().map_or(Span::new(wrela_diag::FileId(0), 0, 0), |(f, _)| {
-                cx.checked.program.func(*f).sig_span
-            });
+        // The parameter, in the first entry point that has it.
+        let program = &cx.checked.program;
+        let span = owners
+            .iter()
+            .find_map(|(f, _)| program.func(*f).params.iter().find(|p| p.name == *name))
+            .map(|p| p.span)?;
+        if !wrela_sema::traits::implements_builtin(program, *t, Lang::GpuData) {
+            let shown = program.display_ty(*t);
             cx.err(
                 Diagnostic::new(codes::E0604, span, format!("the GPU parameter `{name}` is a `{shown}`, which isn't `GpuData`"))
                     .with_note("data crossing to the GPU must be `GpuData`, so its layout is the same on both sides (§6.13)")
@@ -579,7 +582,7 @@ fn bind_uniform(
             );
             return None;
         }
-        let it = cx.lower_ty(mb, *t, Span::new(wrela_diag::FileId(0), 0, 0))?;
+        let it = cx.lower_ty(mb, *t, span)?;
         fields.push((name.clone(), it));
     }
     let ty = mb.m.types.intern(ir::TypeDef::Struct { name: format!("Uniforms_{what}"), fields });
@@ -1110,6 +1113,21 @@ fn derived_call(
     }
 }
 
+/// Where a callable is defined: a closure's expression, or a function's signature.
+fn callable_span(cx: &Cx, c: &Callable) -> Span {
+    let program = &cx.checked.program;
+    match c {
+        Callable::Func { func, .. } => program.func(*func).sig_span,
+        Callable::Closure { owner, id } => {
+            let f = owner.source_fn().expect("a closure's owner is a function");
+            match cx.checked.mir.get(&f) {
+                Some(b) => b.closures[id.0 as usize].span,
+                None => program.func(f).sig_span,
+            }
+        }
+    }
+}
+
 /// A derived instance's signature: the callable's captures, then its input (a point, or a box),
 /// returning `(f32, X)` or an `Interval`.
 pub(crate) fn derived_signature(
@@ -1120,7 +1138,7 @@ pub(crate) fn derived_signature(
     let InstanceKey::Derived { of, kind, input } = key else {
         return ir::Function::new("derived", Vec::new(), None);
     };
-    let span = Span::new(wrela_diag::FileId(0), 0, 0);
+    let span = callable_span(cx, of);
     let mut params = cx.callable_params(mb, of, span);
     let x = cx.lower_ty(mb, *input, span);
     let f32 = mb.m.types.f32();
@@ -1179,7 +1197,8 @@ pub(crate) fn lower_derived(
         Callable::Closure { owner, id } => InstanceKey::Closure { owner: owner.clone(), id: *id },
         Callable::Func { func, substs } => InstanceKey::plain(*func, substs.clone()),
     };
-    let inner = cx.instance(mb, inner_key, Some((id, Span::new(wrela_diag::FileId(0), 0, 0))));
+    let at = mb.callers.get(&id).map_or_else(|| callable_span(cx, of), |c| c.1);
+    let inner = cx.instance(mb, inner_key, Some((id, at)));
     // Everything the inner function calls must be lowered before it's transformed.
     cx.drain(mb);
     let ncap = mb.m.functions[id.index()].params.len() - 1;

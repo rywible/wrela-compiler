@@ -279,7 +279,8 @@ impl<'p> Checker<'p> {
             return None;
         }
         // `Self::x`, `T::x`.
-        if first.name == "Self" || self.scope.param(&first.name).is_some() {
+        let param = self.scope.param(&first.name);
+        if first.name == "Self" || param.is_some() {
             if segs.len() != 2 {
                 self.err(Diagnostic::new(
                     codes::E0200,
@@ -301,7 +302,7 @@ impl<'p> Checker<'p> {
                     }
                 }
             } else {
-                let p = self.scope.param(&first.name).unwrap_or(ParamId(0));
+                let Some(p) = param else { unreachable!("checked above") };
                 self.p.types.param(p)
             };
             return Some(ValueRes::TypeRelative(base, segs[1].ident.clone()));
