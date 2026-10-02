@@ -296,19 +296,18 @@ pub struct Stmt {
     pub span: Span,
 }
 
+/// `var x = e` declares a variable; `mut x = e` names a place to change through.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum BindKind {
-    Let,
+pub enum VarKind {
     Var,
     Mut,
 }
 
-impl BindKind {
+impl VarKind {
     pub fn keyword(self) -> &'static str {
         match self {
-            BindKind::Let => "let",
-            BindKind::Var => "var",
-            BindKind::Mut => "mut",
+            VarKind::Var => "var",
+            VarKind::Mut => "mut",
         }
     }
 }
@@ -374,10 +373,16 @@ pub enum ForIter {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum StmtKind {
-    /// `let p = e`, `var x = e`, `mut x = e`. Only `let` takes a pattern other than a name.
-    Bind {
-        kind: BindKind,
+    /// `let p = e`.
+    Let {
         pat: Pat,
+        ty: Option<TypeExpr>,
+        init: Expr,
+    },
+    /// `var x = e` or `mut x = e`: one name, not a pattern.
+    Var {
+        kind: VarKind,
+        name: Ident,
         ty: Option<TypeExpr>,
         init: Expr,
     },
@@ -712,7 +717,7 @@ impl Block {
     pub fn for_each_expr<'a>(&'a self, f: &mut impl FnMut(&'a Expr)) {
         for s in &self.stmts {
             match &s.kind {
-                StmtKind::Bind { init, .. } => f(init),
+                StmtKind::Let { init, .. } | StmtKind::Var { init, .. } => f(init),
                 StmtKind::Assign { target, value, .. } => {
                     f(target);
                     f(value);

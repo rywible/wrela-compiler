@@ -744,19 +744,21 @@ impl<'a> Builder<'a> {
 
     fn stmt(&mut self, s: &Stmt) -> Doc {
         match &s.kind {
-            StmtKind::Bind { kind, pat, ty, init } => {
+            StmtKind::Let { pat, ty, init } => {
                 let pat = self.pat(pat);
                 let ty = match ty {
                     Some(t) => concat([text(": "), self.ty(t)]),
                     None => nil(),
                 };
-                concat([
-                    text(format!("{} ", kind.keyword())),
-                    pat,
-                    ty,
-                    text(" = "),
-                    self.expr(init),
-                ])
+                concat([text("let "), pat, ty, text(" = "), self.expr(init)])
+            }
+            StmtKind::Var { kind, name, ty, init } => {
+                let ty = match ty {
+                    Some(t) => concat([text(": "), self.ty(t)]),
+                    None => nil(),
+                };
+                let head = text(format!("{} {}", kind.keyword(), name.name));
+                concat([head, ty, text(" = "), self.expr(init)])
             }
             StmtKind::Assign { target, op, value } => {
                 concat([self.expr(target), text(format!(" {} ", op.text())), self.expr(value)])

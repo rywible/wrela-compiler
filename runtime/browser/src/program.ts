@@ -67,9 +67,17 @@ export function checkAbi(module: WebAssembly.Module, bytes: Uint8Array): void {
 
 type FrameFn = (time: number, width: number, height: number) => void;
 
+/** How a program is run. */
+export interface ProgramOptions {
+  /** Keep the state hash of every submitted byte (test mode reads it; it costs a pass over
+   * each batch, so a game running normally doesn't keep it). */
+  hash?: boolean;
+}
+
 /** A loaded program and everything that happens to its batches. */
 export class Program {
-  readonly hash = new StateHash();
+  /** The state hash, when the options ask for it. */
+  readonly hash: StateHash | null;
   readonly #sequencer = new Sequencer();
   #memory: WebAssembly.Memory | null = null;
   #frame: FrameFn | null = null;
@@ -81,9 +89,17 @@ export class Program {
   private constructor(
     readonly checker: Checker,
     readonly executor: Executor,
-  ) {}
+    options: ProgramOptions,
+  ) {
+    this.hash = options.hash ? new StateHash() : null;
+  }
 
-  static async load(wasm: Bytes, checker: Checker, executor: Executor): Promise<Program> {
+  static async load(wasm: Bytes, checker: Checker, executor: Executor, options: ProgramOptions = {}): Promise<Program> {
+    return Program.instantiate(await Program.compile(wasm), checker, executor, options);
+  }
+
+  /** Compiles a program's WASM and checks it against the program ABI. */
+  static async compile(wasm: Bytes): Promise<WebAssembly.Module> {
     let module: WebAssembly.Module;
     try {
       module = await WebAssembly.compile(wasm);
@@ -91,7 +107,17 @@ export class Program {
       throw new ProgramError(e instanceof Error ? e.message : String(e));
     }
     checkAbi(module, wasm);
-    const program = new Program(checker, executor);
+    return module;
+  }
+
+  /** Instantiates a compiled program against the decoder. */
+  static async instantiate(
+    module: WebAssembly.Module,
+    checker: Checker,
+    executor: Executor,
+    options: ProgramOptions = {},
+  ): Promise<Program> {
+    const program = new Program(checker, executor, options);
     const imports = {
       [IMPORT_MODULE]: { [IMPORT_SUBMIT]: (ptr: number, len: number) => program.#submitImport(ptr, len) },
     };
@@ -104,7 +130,7 @@ export class Program {
 
   /** Decodes and runs one batch. The state hash covers every submitted byte, valid or not. */
   #submit(batch: Bytes): void {
-    this.hash.update(batch);
+    this.hash?.update(batch);
     for (const cmd of decode(batch)) {
       this.#sequencer.step(cmd);
       this.checker.check(cmd);

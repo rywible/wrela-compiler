@@ -333,16 +333,12 @@ fn scalar_bin(fe: &mut Fe, op: ir::BinOp, s: ir::Scalar, a: u32, b: u32) -> R<()
 
 // ---- vectors and matrices ---------------------------------------------------------------------
 
-/// Loads component `c` of value `x` (a vector) into a new f32 local, or returns the local of
-/// a scalar `x` (broadcast).
+/// Loads component `c` of vector value `x` into a new f32 local. (Elementwise operations take
+/// operands of one type: the IR splats a scalar next to a vector.)
 fn comp(fe: &mut Fe, x: ir::ValueId, c: u32) -> u32 {
-    if fe.m.types.is_aggregate(fe.vty(x)) {
-        let l = fe.new_local(ValType::F32);
-        fe.ins.extend([I::LocalGet(fe.v(x)), I::F32Load(mem(4 * c, 2)), I::LocalSet(l)]);
-        l
-    } else {
-        fe.v(x)
-    }
+    let l = fe.new_local(ValType::F32);
+    fe.ins.extend([I::LocalGet(fe.v(x)), I::F32Load(mem(4 * c, 2)), I::LocalSet(l)]);
+    l
 }
 
 /// Loads element (column `j`, row `i`) of matrix value `m` of size `n` into a new local.
@@ -445,7 +441,7 @@ pub(super) fn binary(
                 }
             }
         }
-        // Elementwise: vector op vector/scalar, matrix ± matrix, matrix × scalar.
+        // Elementwise: vector op vector, matrix ± matrix, matrix × scalar.
         (_, _, Some((is_mat, n))) => {
             let stride = if is_mat { column_stride(n) } else { 0 };
             let cols = if is_mat { n as u32 } else { 1 };
@@ -845,7 +841,7 @@ pub(super) fn builtin(fe: &mut Fe, v: ir::ValueId, b: ir::Builtin, args: &[ir::V
             _ => {}
         }
     }
-    // Componentwise on vectors (scalar arguments broadcast), or plain scalars.
+    // Componentwise on vectors (all the arguments are), or plain scalars.
     match dims(fe, t) {
         Some((false, n)) => {
             let out = fe.fresh_slot(v)?;

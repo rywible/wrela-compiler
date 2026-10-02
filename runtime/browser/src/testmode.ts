@@ -1,6 +1,8 @@
 // Test mode: `index.html#test&frames=60&width=1920&height=1080&fps=60` runs a fixed number of
 // frames at fixed times and canvas size, then saves the last frame and the state hash to
-// `results/` for tools/headless.py.
+// `results/` for tools/headless.py. It's part of the shipped bundle, so the agreement test runs
+// the exact bytes a game ships, but only a page served from this machine (tools/serve.py and
+// tools/headless.py bind 127.0.0.1) enters it: a game's public URL ignores `#test`.
 
 export interface TestParams {
   frames: number;
@@ -10,6 +12,11 @@ export interface TestParams {
 }
 
 export const TEST_DEFAULTS: TestParams = { frames: 60, width: 1920, height: 1080, fps: 60 };
+
+/** Whether a page's host is this machine, where test mode may run. */
+export function isLoopback(hostname: string): boolean {
+  return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]" || hostname === "::1";
+}
 
 /** Test mode's parameters from a URL fragment, or null if the fragment doesn't ask for it. */
 export function parseTestParams(hash: string): TestParams | null {

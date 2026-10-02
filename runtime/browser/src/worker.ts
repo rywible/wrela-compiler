@@ -4,7 +4,7 @@
 /// <reference lib="webworker" />
 
 import { SCREEN_FORMAT } from "./abi.gen.ts";
-import { startProgram, loadBuild, type Host } from "./loader.ts";
+import { type Build, loadBuild, startProgram, type Host } from "./loader.ts";
 import type { FromWorker, ToWorker } from "./messages.ts";
 import { encodePng } from "./png.ts";
 import { frameTime, putResult, type TestParams } from "./testmode.ts";
@@ -60,9 +60,9 @@ function context(canvas: OffscreenCanvas, device: GPUDevice, usage: number): GPU
 let size = { width: 1, height: 1 };
 let visible = true;
 
-async function run(canvas: OffscreenCanvas, device: GPUDevice): Promise<void> {
+async function run(canvas: OffscreenCanvas, device: GPUDevice, build: Build): Promise<void> {
   const ctx = context(canvas, device, GPUTextureUsage.RENDER_ATTACHMENT);
-  const host: Host = await startProgram(device, await loadBuild(base), { texture: () => ctx.getCurrentTexture() });
+  const host: Host = await startProgram(device, build, { texture: () => ctx.getCurrentTexture() });
   const max = device.limits.maxTextureDimension2D;
   // Time is seconds of visible running: it pauses while the page is hidden.
   let elapsed = 0;
@@ -127,7 +127,7 @@ async function readTexture(device: GPUDevice, texture: GPUTexture): Promise<Uint
   return out;
 }
 
-async function runTest(canvas: OffscreenCanvas, device: GPUDevice, params: TestParams): Promise<void> {
+async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build, params: TestParams): Promise<void> {
   const { frames, width, height, fps } = params;
   canvas.width = width;
   canvas.height = height;
@@ -140,11 +140,17 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, params: TestP
     format: SCREEN_FORMAT,
     usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
   });
-  const host = await startProgram(device, await loadBuild(base), {
-    texture: () => screen,
-    afterPass: (encoder) =>
-      encoder.copyTextureToTexture({ texture: screen }, { texture: ctx.getCurrentTexture() }, [width, height]),
-  });
+  const host = await startProgram(
+    device,
+    build,
+    {
+      texture: () => screen,
+      afterPass: (encoder) =>
+        encoder.copyTextureToTexture({ texture: screen }, { texture: ctx.getCurrentTexture() }, [width, height]),
+    },
+    { hash: true },
+  );
+  const hash = host.program.hash!;
   for (let i = 0; i < frames; i++) {
     await scoped(device, () => host.program.frame(frameTime(i, fps), width, height));
     await device.queue.onSubmittedWorkDone();
@@ -152,8 +158,8 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, params: TestP
   const rgba = await readTexture(device, screen);
   await putResult(base, "frame.rgba", rgba);
   await putResult(base, "frame.png", encodePng(width, height, rgba));
-  await putResult(base, "hash.txt", `${host.program.hash.hex()}\n`);
-  console.log(`wrela test: ${frames} frames at ${width}x${height}, state hash ${host.program.hash.hex()}`);
+  await putResult(base, "hash.txt", `${hash.hex()}\n`);
+  console.log(`wrela test: ${frames} frames at ${width}x${height}, state hash ${hash.hex()}`);
   await putResult(base, "DONE", "ok");
 }
 
@@ -165,8 +171,9 @@ self.onmessage = (event: MessageEvent<ToWorker>) => {
       testing = msg.test !== null;
       size = { width: msg.width, height: msg.height };
       const test = msg.test;
-      openDevice()
-        .then((device) => (test ? runTest(msg.canvas, device, test) : run(msg.canvas, device)))
+      // The device and the build are fetched at once.
+      Promise.all([openDevice(), loadBuild(base)])
+        .then(([device, build]) => (test ? runTest(msg.canvas, device, build, test) : run(msg.canvas, device, build)))
         .catch(fatal);
       return;
     }

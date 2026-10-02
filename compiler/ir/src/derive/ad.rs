@@ -33,7 +33,7 @@ pub(super) fn value_and_gradient(
     let mut mask = vec![false; func.params.len()];
     mask[xi] = true;
     let d = derive(m, cache, f, mask.clone(), n)?;
-    let returns = returns_active(m, cache, f, mask)?;
+    let returns = returns_active(m, cache, f, mask, Mode::Ad)?;
     let f32 = m.types.f32();
     let tuple = m.types.intern(TypeDef::Struct {
         name: format!("(f32, {})", m.types.display(x_ty)),
@@ -114,25 +114,6 @@ pub(super) fn value_and_gradient(
     Ok(m.add_function(g))
 }
 
-/// Whether `f` with these active parameters returns an active value (memoized; a recursive call
-/// still being analyzed is assumed active).
-pub(super) fn returns_active(
-    m: &Module,
-    cache: &mut DeriveCache,
-    f: FuncId,
-    mask: Vec<bool>,
-) -> Result<bool> {
-    if let Some(&r) = cache.ad_returns.get(&(f, mask.clone())) {
-        return Ok(r);
-    }
-    cache.ad_returns.insert((f, mask.clone()), true);
-    let func = &m.functions[f.index()];
-    let a = activity(m, func, &mask, Mode::Ad, &mut |g, mk| returns_active(m, cache, g, mk))?;
-    let r = a.returns && func.ret.is_some_and(|t| m.types.has_float(t));
-    cache.ad_returns.insert((f, mask), r);
-    Ok(r)
-}
-
 /// The derivative of `f` with active parameters `mask` and `n` directions.
 pub(super) fn derive(
     m: &mut Module,
@@ -148,10 +129,12 @@ pub(super) fn derive(
     if let Some(why) = has_host_or_ptr(&func.body) {
         return Err(Error::not_derivable(format!("`{}` {why}", func.name)));
     }
-    let returns = returns_active(m, cache, f, mask.clone())?;
+    let returns = returns_active(m, cache, f, mask.clone(), Mode::Ad)?;
     let act = {
         let mm: &Module = m;
-        activity(mm, &func, &mask, Mode::Ad, &mut |g, mk| returns_active(mm, cache, g, mk))?
+        activity(mm, &func, &mask, Mode::Ad, &mut |g, mk| {
+            returns_active(mm, cache, g, mk, Mode::Ad)
+        })?
     };
     for (i, p) in func.params.iter().enumerate() {
         if act.params[i] && !mask[i] && p.mutable {
@@ -214,8 +197,7 @@ pub(super) fn derive(
         returns,
         recips: HashMap::new(),
         made: Vec::new(),
-        loads: Vec::new(),
-        same: HashMap::new(),
+        twins: LoadTwins::default(),
     };
     let body = b.block(&func.body)?;
     let mut nf = b.nf;
@@ -242,10 +224,7 @@ struct Ad<'a> {
     /// The expressions made while differentiating one statement, so what its directions share
     /// (`2v` for a square root, a clamp's masks) is made once.
     made: Vec<(TypeId, Expr, ValueId)>,
-    /// Loads since the last write or block boundary, by place, and each load's earlier twin:
-    /// `x * x` and `dot(v, v)` then get the derivative of a square.
-    loads: Vec<(Place, ValueId)>,
-    same: HashMap<ValueId, ValueId>,
+    twins: LoadTwins,
 }
 
 impl Ad<'_> {
@@ -274,15 +253,18 @@ impl Ad<'_> {
         self.tv.get(&v).and_then(|ts| ts[k])
     }
 
-    /// `x` as type `to`: a scalar is splatted to a vector.
+    /// `x` as an operand of type `to` (see [`splat_size`]).
     fn coerce(&mut self, out: &mut Block, x: ValueId, to: TypeId) -> ValueId {
-        match (self.m.types.get(self.ty(x)).clone(), self.m.types.get(to).clone()) {
-            (TypeDef::Scalar(_), TypeDef::Vector(n)) => self.emit(out, to, Expr::Splat(x, n)),
-            _ => x,
+        match splat_size(&self.m.types, self.ty(x), to) {
+            Some(n) => self.emit(out, to, Expr::Splat(x, n)),
+            None => x,
         }
     }
 
+    /// `a op b` of type `ty`, a scalar operand splatted to a vector `ty` (the IR's elementwise
+    /// operations take one type).
     fn bin(&mut self, out: &mut Block, op: BinOp, a: ValueId, b: ValueId, ty: TypeId) -> ValueId {
+        let (a, b) = (self.coerce(out, a, ty), self.coerce(out, b, ty));
         self.emit(out, ty, Expr::Binary(op, a, b))
     }
 
@@ -302,7 +284,14 @@ impl Ad<'_> {
         self.bin(out, BinOp::Mul, x, r, ty)
     }
 
+    /// The builtin `b` of type `ty`; an elementwise one's scalar arguments are splatted to a
+    /// vector `ty`.
     fn builtin(&mut self, out: &mut Block, b: Builtin, args: Vec<ValueId>, ty: TypeId) -> ValueId {
+        let args = if b.is_elementwise() {
+            args.into_iter().map(|x| self.coerce(out, x, ty)).collect()
+        } else {
+            args
+        };
         self.emit(out, ty, Expr::Builtin(b, args))
     }
 
@@ -316,7 +305,7 @@ impl Ad<'_> {
     ) -> Option<ValueId> {
         match (x, y) {
             (None, None) => None,
-            (Some(a), None) | (None, Some(a)) => Some(self.coerce(out, a, ty)),
+            (Some(a), None) | (None, Some(a)) => Some(a),
             (Some(a), Some(b)) => Some(self.bin(out, BinOp::Add, a, b, ty)),
         }
     }
@@ -330,7 +319,7 @@ impl Ad<'_> {
     ) -> Option<ValueId> {
         match (x, y) {
             (None, None) => None,
-            (Some(a), None) => Some(self.coerce(out, a, ty)),
+            (Some(a), None) => Some(a),
             (None, Some(b)) => {
                 let b = self.coerce(out, b, ty);
                 Some(self.emit(out, ty, Expr::Unary(UnOp::Neg, b)))
@@ -380,29 +369,16 @@ impl Ad<'_> {
     }
 
     fn same_value(&self, a: ValueId, b: ValueId) -> bool {
-        let c = |v: ValueId| self.same.get(&v).copied().unwrap_or(v);
-        c(a) == c(b)
+        self.twins.same_value(a, b)
     }
 
     fn stmt(&mut self, s: &Stmt, out: &mut Block) -> Result<()> {
         // What one statement shares among its directions stays within it.
         self.made.clear();
         self.recips.clear();
-        match s {
-            Stmt::Let(v, Expr::Load(p)) => match self.loads.iter().find(|(q, _)| q == p) {
-                Some(&(_, w)) => {
-                    self.same.insert(*v, w);
-                }
-                None => self.loads.push((p.clone(), *v)),
-            },
-            Stmt::Let(_, Expr::Call(..)) | Stmt::Eval(_) | Stmt::Store(..) => self.loads.clear(),
-            Stmt::If { .. } | Stmt::Loop { .. } => self.loads.clear(),
-            _ => {}
-        }
+        self.twins.before(s);
         let r = self.stmt_inner(s, out);
-        if matches!(s, Stmt::If { .. } | Stmt::Loop { .. }) {
-            self.loads.clear();
-        }
+        self.twins.after(s);
         r
     }
 
@@ -436,18 +412,6 @@ impl Ad<'_> {
                 }
                 Ok(())
             }
-            Stmt::If { cond, then, else_ } => {
-                let then = self.block(then)?;
-                let else_ = self.block(else_)?;
-                out.push(Stmt::If { cond: *cond, then, else_ });
-                Ok(())
-            }
-            Stmt::Loop { body, continuing } => {
-                let body = self.block(body)?;
-                let continuing = self.block(continuing)?;
-                out.push(Stmt::Loop { body, continuing });
-                Ok(())
-            }
             Stmt::Return(Some(v)) if self.returns => {
                 let r = self.f.ret.ok_or_else(|| Error::internal("a missing result type"))?;
                 let mut parts = vec![*v];
@@ -463,10 +427,7 @@ impl Ad<'_> {
                 out.push(Stmt::Return(Some(d)));
                 Ok(())
             }
-            other => {
-                out.push(other.clone());
-                Ok(())
-            }
+            other => pass_through(other, out, &mut |b| self.block(b)),
         }
     }
 
@@ -480,7 +441,7 @@ impl Ad<'_> {
             return Ok(());
         }
         let dg = derive(self.m, self.cache, g, mask.clone(), self.n)?;
-        let returns = returns_active(self.m, self.cache, g, mask.clone())?;
+        let returns = returns_active(self.m, self.cache, g, mask.clone(), Mode::Ad)?;
         let mut new_args = args.to_vec();
         let callee_params = self.m.functions[g.index()].params.clone();
         for (i, a) in args.iter().enumerate() {
@@ -671,7 +632,7 @@ impl Ad<'_> {
                     "derivatives of screen-space derivatives aren't supported",
                 ));
             }
-            B::Fract => d[0].map(|x| self.coerce(out, x, ty)),
+            B::Fract => d[0],
             B::Sqrt => d[0].map(|da| {
                 let two = self.f32c(out, 2.0);
                 let den = self.bin(out, BinOp::Mul, v, two, ty);

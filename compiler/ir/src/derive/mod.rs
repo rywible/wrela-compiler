@@ -18,9 +18,9 @@ use std::collections::{HashMap, HashSet};
 #[derive(Debug, Default)]
 pub struct DeriveCache {
     ad: HashMap<(FuncId, Vec<bool>, u8), FuncId>,
-    ad_returns: HashMap<(FuncId, Vec<bool>), bool>,
     interval: HashMap<(FuncId, Vec<bool>), FuncId>,
-    interval_returns: HashMap<(FuncId, Vec<bool>), bool>,
+    /// Whether a function returns an active value, by derivation and active parameters.
+    returns: HashMap<(Mode, FuncId, Vec<bool>), bool>,
 }
 
 /// A function of `f`'s captures and `x` (its last parameter) returning `(f32, X)`: `f(x)` and
@@ -50,7 +50,7 @@ pub fn interval(
     interval::interval(m, cache, f, ncap, target, box_ty, interval_ty)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Mode {
     /// Only floats carry derivatives; control flow doesn't.
     Ad,
@@ -319,6 +319,100 @@ fn expr_active(
 }
 
 /// Every statement's block, recursively: for `Let`s, gather their types.
+/// Whether `f` with these active parameters returns an active value: a derivative (for
+/// [`Mode::Ad`], of a float result) or a range. Memoized; a recursive call still being analyzed
+/// is assumed active.
+pub(super) fn returns_active(
+    m: &Module,
+    cache: &mut DeriveCache,
+    f: FuncId,
+    mask: Vec<bool>,
+    mode: Mode,
+) -> Result<bool> {
+    let key = (mode, f, mask);
+    if let Some(&r) = cache.returns.get(&key) {
+        return Ok(r);
+    }
+    cache.returns.insert(key.clone(), true);
+    let func = &m.functions[f.index()];
+    let a = activity(m, func, &key.2, mode, &mut |g, mk| returns_active(m, cache, g, mk, mode))?;
+    let r = a.returns && func.ret.is_some_and(|t| mode == Mode::Interval || m.types.has_float(t));
+    cache.returns.insert(key, r);
+    Ok(r)
+}
+
+/// Loads of a place that nothing wrote between are the same value, so `x * x` and `dot(v, v)`
+/// can get the rules for squares. Tracked within a straight run of statements.
+#[derive(Default)]
+pub(super) struct LoadTwins {
+    loads: Vec<(Place, ValueId)>,
+    /// A load's earlier twin.
+    same: HashMap<ValueId, ValueId>,
+}
+
+impl LoadTwins {
+    /// Before a statement: notes a load, and forgets the loads a write, a call or a branch may
+    /// change.
+    pub(super) fn before(&mut self, s: &Stmt) {
+        match s {
+            Stmt::Let(v, Expr::Load(p)) => match self.loads.iter().find(|(q, _)| q == p) {
+                Some(&(_, w)) => {
+                    self.same.insert(*v, w);
+                }
+                None => self.loads.push((p.clone(), *v)),
+            },
+            Stmt::Let(_, Expr::Call(..))
+            | Stmt::Eval(_)
+            | Stmt::Store(..)
+            | Stmt::If { .. }
+            | Stmt::Loop { .. } => self.loads.clear(),
+            Stmt::Let(..) | Stmt::Break | Stmt::Continue | Stmt::Return(_) | Stmt::Trap => {}
+        }
+    }
+
+    /// After a statement: forgets the loads made in its blocks.
+    pub(super) fn after(&mut self, s: &Stmt) {
+        if s.blocks().iter().any(|b| !b.is_empty()) {
+            self.loads.clear();
+        }
+    }
+
+    /// Whether two values are surely equal: the same value, or loads of an unchanged place.
+    pub(super) fn same_value(&self, a: ValueId, b: ValueId) -> bool {
+        let c = |v: ValueId| self.same.get(&v).copied().unwrap_or(v);
+        c(a) == c(b)
+    }
+}
+
+/// The size of the splat that makes a value of type `from` an operand of type `to`, if it
+/// takes one: a scalar next to a vector, in the derivations' own operations (the IR wants the
+/// operands of an elementwise operation of one type).
+pub(super) fn splat_size(types: &Types, from: TypeId, to: TypeId) -> Option<u8> {
+    match (types.get(from), types.get(to)) {
+        (TypeDef::Scalar(_), &TypeDef::Vector(n)) => Some(n),
+        _ => None,
+    }
+}
+
+/// What both derivations do with a statement they leave as it is: rebuild an `if` or a loop
+/// from their versions of its blocks (`block`), and copy anything else.
+pub(super) fn pass_through(
+    s: &Stmt,
+    out: &mut Block,
+    block: &mut impl FnMut(&Block) -> Result<Block>,
+) -> Result<()> {
+    out.push(match s {
+        Stmt::If { cond, then, else_ } => {
+            Stmt::If { cond: *cond, then: block(then)?, else_: block(else_)? }
+        }
+        Stmt::Loop { body, continuing } => {
+            Stmt::Loop { body: block(body)?, continuing: block(continuing)? }
+        }
+        other => other.clone(),
+    });
+    Ok(())
+}
+
 pub(crate) fn has_host_or_ptr(b: &Block) -> Option<&'static str> {
     for s in b {
         match s {

@@ -107,11 +107,11 @@ impl<'a> Parser<'a> {
                 self.expect_bind_eq()?;
                 // A value that fails to parse leaves the binding, so its uses still resolve.
                 let init = self.expr_or_error(Self::parse_expr);
-                StmtKind::Bind { kind: BindKind::Let, pat, ty, init }
+                StmtKind::Let { pat, ty, init }
             }
-            T::Var => self.parse_named_bind(BindKind::Var)?,
+            T::Var => self.parse_named_bind(VarKind::Var)?,
             T::Mut if self.nth(1) == T::Ident && matches!(self.nth(2), T::Eq | T::Colon) => {
-                self.parse_named_bind(BindKind::Mut)?
+                self.parse_named_bind(VarKind::Mut)?
             }
             T::While => {
                 self.bump();
@@ -211,14 +211,13 @@ impl<'a> Parser<'a> {
     }
 
     /// ("var" | "mut") IDENT (":" type)? "=" expr
-    fn parse_named_bind(&mut self, kind: BindKind) -> PResult<StmtKind> {
+    fn parse_named_bind(&mut self, kind: VarKind) -> PResult<StmtKind> {
         self.bump();
         let name = self.ident("a name")?;
-        let pat = Pat { span: name.span, kind: PatKind::Ident(name) };
         let ty = if self.eat(T::Colon) { Some(self.parse_type()?) } else { None };
         self.expect_bind_eq()?;
         let init = self.expr_or_error(Self::parse_expr);
-        Ok(StmtKind::Bind { kind, pat, ty, init })
+        Ok(StmtKind::Var { kind, name, ty, init })
     }
 
     fn assign_op(&self) -> Option<AssignOp> {

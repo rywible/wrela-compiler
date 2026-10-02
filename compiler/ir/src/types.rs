@@ -167,6 +167,10 @@ impl Types {
         }
     }
 
+    pub fn is_vector(&self, t: TypeId) -> bool {
+        matches!(self.get(t), TypeDef::Vector(_))
+    }
+
     /// Whether the type lives in memory on the CPU (everything but scalars and pointers).
     pub fn is_aggregate(&self, t: TypeId) -> bool {
         !matches!(self.get(t), TypeDef::Scalar(_) | TypeDef::Ptr(_))

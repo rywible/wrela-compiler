@@ -4,7 +4,7 @@
 import { Checker, limitsOf } from "./check.ts";
 import { buildPipelines, GpuExecutor, type ScreenTarget } from "./gpu.ts";
 import { type Manifest, parseManifest } from "./manifest.ts";
-import { Program } from "./program.ts";
+import { Program, type ProgramOptions } from "./program.ts";
 
 export interface Build {
   manifest: Manifest;
@@ -41,11 +41,20 @@ export interface Host {
   executor: GpuExecutor;
 }
 
-/** Builds every pipeline, then instantiates the program with the decoder behind its import. */
-export async function startProgram(device: GPUDevice, build: Build, screen: ScreenTarget): Promise<Host> {
-  const pipelines = await buildPipelines(device, build.manifest, build.shaders);
+/** Builds every pipeline while the WASM compiles, then instantiates the program with the
+ * decoder behind its import. */
+export async function startProgram(
+  device: GPUDevice,
+  build: Build,
+  screen: ScreenTarget,
+  options: ProgramOptions = {},
+): Promise<Host> {
+  const [pipelines, module] = await Promise.all([
+    buildPipelines(device, build.manifest, build.shaders),
+    Program.compile(build.wasm),
+  ]);
   const executor = new GpuExecutor(device, pipelines, screen);
   const checker = new Checker(build.manifest, limitsOf(device.limits));
-  const program = await Program.load(build.wasm, checker, executor);
+  const program = await Program.instantiate(module, checker, executor, options);
   return { program, executor };
 }

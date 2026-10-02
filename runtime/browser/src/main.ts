@@ -2,7 +2,7 @@
 // pixels) and the page's visibility, and shows fatal errors on the page and in the console.
 
 import type { FromWorker, ToWorker } from "./messages.ts";
-import { parseTestParams, putResult, type TestParams } from "./testmode.ts";
+import { isLoopback, parseTestParams, putResult, type TestParams } from "./testmode.ts";
 
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
@@ -37,7 +37,7 @@ function devicePixels(canvas: HTMLCanvasElement, entry?: ResizeObserverEntry): {
 function start(): void {
   let test: TestParams | null = null;
   try {
-    test = parseTestParams(location.hash);
+    test = isLoopback(location.hostname) ? parseTestParams(location.hash) : null;
     const canvas = document.querySelector<HTMLCanvasElement>("canvas#screen");
     if (!canvas) throw new Error("the page has no <canvas id=\"screen\">");
     if (!("gpu" in navigator)) throw new Error("this browser doesn't support WebGPU");

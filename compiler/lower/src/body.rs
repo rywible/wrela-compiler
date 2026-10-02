@@ -944,7 +944,22 @@ impl<'c, 'a> Fl<'c, 'a> {
             BinOp::Or => ir::BinOp::Or,
             BinOp::Pow => unreachable!("handled above"),
         };
+        // A scalar with a vector is splatted to the vector's size: the IR's elementwise
+        // operations take operands of one type.
+        let (av, bv) = (self.splat_to(av, bv), self.splat_to(bv, av));
         Some(self.value(rty, ir::Expr::Binary(iop, av, bv)))
+    }
+
+    /// `x` splatted to the type of `like`, if `x` is a scalar `f32` and `like` a vector.
+    fn splat_to(&mut self, x: ir::ValueId, like: ir::ValueId) -> ir::ValueId {
+        let types = &self.mb.m.types;
+        match (types.get(self.f.value_ty(x)), types.get(self.f.value_ty(like))) {
+            (ir::TypeDef::Scalar(ir::Scalar::F32), &ir::TypeDef::Vector(n)) => {
+                let t = self.f.value_ty(like);
+                self.value(t, ir::Expr::Splat(x, n))
+            }
+            _ => x,
+        }
     }
 
     /// `base ** exp` for integers: repeated multiplication (checked on the CPU).
@@ -1409,6 +1424,13 @@ impl<'c, 'a> Fl<'c, 'a> {
             );
             return None;
         }
+        // An elementwise builtin's scalar arguments next to vectors are splatted.
+        let args = match args.iter().find(|&&a| self.mb.m.types.is_vector(self.f.value_ty(a))) {
+            Some(&like) if b.is_elementwise() => {
+                args.iter().map(|&a| self.splat_to(a, like)).collect()
+            }
+            _ => args,
+        };
         Some(self.value(ty, ir::Expr::Builtin(b, args)))
     }
 }

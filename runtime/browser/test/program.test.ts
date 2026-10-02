@@ -13,7 +13,7 @@ import { batchProgram, buildModule, FRAME_TYPE, op, SUBMIT } from "./wasm-builde
 const U16 = new Uint8Array(16);
 
 async function load(wasm: Uint8Array<ArrayBuffer>): Promise<Program> {
-  return Program.load(wasm, checker(), new Recorder());
+  return Program.load(wasm, checker(), new Recorder(), { hash: true });
 }
 
 /** Runs every frame of a batch program; returns the program and the first error. */
@@ -96,7 +96,7 @@ test("hashes every submitted byte", async () => {
   expect(error).toBeNull();
   const expected = new StateHash();
   for (const batch of [a, b, c]) expected.update(batch);
-  expect(program.hash.hex()).toBe(expected.hex());
+  expect(program.hash!.hex()).toBe(expected.hex());
   expect((program.executor as Recorder).log).toEqual(["CreateBuffer", "BeginScreenPass", "Present", "end", "end"]);
 });
 
@@ -215,10 +215,15 @@ test("first-light's CPU side gives the native host's state hash", async () => {
   // runtime/native/tests/gpu.rs derives this hash independently (with the Rust reference
   // encoder) and checks the native host computes it; tests/agreement.rs checks Chrome does.
   const manifest = parseManifest(new TextDecoder().decode(readFixture("manifest.json")));
-  const program = await Program.load(readFixture("game.wasm"), checker(manifest), new Recorder());
+  const program = await Program.load(readFixture("game.wasm"), checker(manifest), new Recorder(), { hash: true });
   for (let i = 0; i < 60; i++) program.frame(i / 60, 640, 360);
-  expect(program.hash.hex()).toBe("72a286b95c5c7ecf");
+  expect(program.hash!.hex()).toBe("72a286b95c5c7ecf");
   const log = (program.executor as Recorder).log;
   expect(log.slice(0, 7)).toEqual(["CreateBuffer", "WriteBuffer", "Dispatch", "BeginScreenPass", "Draw", "Present", "end"]);
   expect(log.length).toBe(3 + 60 * 4);
+});
+
+test("runs without the state hash unless asked", async () => {
+  const program = await Program.load(readFixture("game.wasm"), checker(), new Recorder());
+  expect(program.hash).toBeNull();
 });

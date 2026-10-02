@@ -65,7 +65,7 @@ pub(super) fn interval(
     let mut mask = vec![false; func.params.len()];
     mask[xi] = true;
     let d = derive(m, cache, f, mask.clone(), target)?;
-    let returns = returns_active(m, cache, f, mask)?;
+    let returns = returns_active(m, cache, f, mask, Mode::Interval)?;
 
     let mut params = func.params[..xi].to_vec();
     params.push(Param { name: "over".into(), ty: box_ty, by_ref: false, mutable: false });
@@ -122,24 +122,6 @@ pub(super) fn interval(
     Ok(m.add_function(g))
 }
 
-/// Whether `f` with these active parameters returns a range rather than a single value.
-pub(super) fn returns_active(
-    m: &Module,
-    cache: &mut DeriveCache,
-    f: FuncId,
-    mask: Vec<bool>,
-) -> R<bool> {
-    if let Some(&r) = cache.interval_returns.get(&(f, mask.clone())) {
-        return Ok(r);
-    }
-    cache.interval_returns.insert((f, mask.clone()), true);
-    let func = &m.functions[f.index()];
-    let a = activity(m, func, &mask, Mode::Interval, &mut |g, mk| returns_active(m, cache, g, mk))?;
-    let r = a.returns && func.ret.is_some();
-    cache.interval_returns.insert((f, mask), r);
-    Ok(r)
-}
-
 /// The interval version of `f` with active parameters `mask`. It takes `f`'s parameters, the
 /// active ones as their `lo`, followed by a `hi` for each active one; it returns
 /// `range<T> { lo, hi }` when its result is active.
@@ -161,10 +143,12 @@ fn derive(
         Some((nf, r)) => (nf, r),
         None => (orig, None),
     };
-    let returns = returns_active(m, cache, f, mask.clone())?;
+    let returns = returns_active(m, cache, f, mask.clone(), Mode::Interval)?;
     let act = {
         let mm: &Module = m;
-        activity(mm, &func, &mask, Mode::Interval, &mut |g, mk| returns_active(mm, cache, g, mk))?
+        activity(mm, &func, &mask, Mode::Interval, &mut |g, mk| {
+            returns_active(mm, cache, g, mk, Mode::Interval)
+        })?
     };
     if act.active_loop_exit {
         return Err(Error::ActiveLoopExit(format!(
@@ -217,8 +201,7 @@ fn derive(
         iv: HashMap::new(),
         returns,
         speculative: 0,
-        loads: Vec::new(),
-        same: HashMap::new(),
+        twins: LoadTwins::default(),
     };
     let mut body = Vec::new();
     if let Some(r) = result.filter(|r| b.act.locals[r.index()]) {
@@ -253,11 +236,7 @@ struct Ivx<'a> {
     returns: bool,
     /// How many branches deep we are that run whether or not a point would take them.
     speculative: u32,
-    /// Loads since the last write or block boundary, by place: two loads of the same place
-    /// are the same value, so `x * x` and `dot(v, v)` get the rule for squares.
-    loads: Vec<(Place, ValueId)>,
-    /// A load's earlier twin.
-    same: HashMap<ValueId, ValueId>,
+    twins: LoadTwins,
 }
 
 impl<'a> Ivx<'a> {
@@ -273,10 +252,8 @@ impl<'a> Ivx<'a> {
         self.nf.value_ty(v)
     }
 
-    /// Whether two values are surely equal: the same value, or loads of an unchanged place.
     fn same_value(&self, a: ValueId, b: ValueId) -> bool {
-        let c = |v: ValueId| self.same.get(&v).copied().unwrap_or(v);
-        c(a) == c(b)
+        self.twins.same_value(a, b)
     }
 
     fn range(&self, v: ValueId) -> Iv {
@@ -295,7 +272,10 @@ impl<'a> Ivx<'a> {
         self.m.types.bool()
     }
 
+    /// `a op b` of type `ty`, a scalar operand splatted to a vector `ty` (the IR's elementwise
+    /// operations take one type).
     fn bin(&mut self, out: &mut Block, op: BinOp, a: ValueId, b: ValueId, ty: TypeId) -> ValueId {
+        let (a, b) = (self.coerce(out, a, ty), self.coerce(out, b, ty));
         self.emit(out, ty, Expr::Binary(op, a, b))
     }
 
@@ -304,7 +284,14 @@ impl<'a> Ivx<'a> {
         self.emit(out, bt, Expr::Binary(op, a, b))
     }
 
+    /// The builtin `b` of type `ty`; an elementwise one's scalar arguments are splatted to a
+    /// vector `ty`.
     fn call(&mut self, out: &mut Block, b: Builtin, args: Vec<ValueId>, ty: TypeId) -> ValueId {
+        let args = if b.is_elementwise() {
+            args.into_iter().map(|x| self.coerce(out, x, ty)).collect()
+        } else {
+            args
+        };
         self.emit(out, ty, Expr::Builtin(b, args))
     }
 
@@ -327,11 +314,11 @@ impl<'a> Ivx<'a> {
         self.coerce(out, v, ty)
     }
 
-    /// A scalar as type `ty`: splatted to a vector.
+    /// `x` as an operand of type `ty` (see [`splat_size`]).
     fn coerce(&mut self, out: &mut Block, x: ValueId, ty: TypeId) -> ValueId {
-        match (self.m.types.get(self.ty(x)).clone(), self.m.types.get(ty).clone()) {
-            (TypeDef::Scalar(_), TypeDef::Vector(n)) => self.emit(out, ty, Expr::Splat(x, n)),
-            _ => x,
+        match splat_size(&self.m.types, self.ty(x), ty) {
+            Some(n) => self.emit(out, ty, Expr::Splat(x, n)),
+            None => x,
         }
     }
 
@@ -644,28 +631,10 @@ impl<'a> Ivx<'a> {
     }
 
     fn stmt(&mut self, s: &Stmt, out: &mut Block) -> R<()> {
-        match s {
-            Stmt::Let(v, Expr::Load(p)) => {
-                if let Some(&(_, w)) = self.loads.iter().find(|(q, _)| q == p) {
-                    self.same.insert(*v, w);
-                } else {
-                    self.loads.push((p.clone(), *v));
-                }
-                self.let_(s, *v, &Expr::Load(p.clone()), out)
-            }
-            Stmt::Store(..) | Stmt::If { .. } | Stmt::Loop { .. } | Stmt::Eval(Expr::Call(..)) => {
-                self.loads.clear();
-                self.stmt_inner(s, out)?;
-                self.loads.clear();
-                Ok(())
-            }
-            Stmt::Let(v, e @ Expr::Call(..)) => {
-                self.loads.clear();
-                self.let_(s, *v, e, out)
-            }
-            Stmt::Let(v, e) => self.let_(s, *v, e, out),
-            _ => self.stmt_inner(s, out),
-        }
+        self.twins.before(s);
+        let r = self.stmt_inner(s, out);
+        self.twins.after(s);
+        r
     }
 
     fn let_(&mut self, s: &Stmt, v: ValueId, e: &Expr, out: &mut Block) -> R<()> {
@@ -724,18 +693,6 @@ impl<'a> Ivx<'a> {
                 }
                 Ok(())
             }
-            Stmt::If { cond, then, else_ } => {
-                let then = self.block(then)?;
-                let else_ = self.block(else_)?;
-                out.push(Stmt::If { cond: *cond, then, else_ });
-                Ok(())
-            }
-            Stmt::Loop { body, continuing } => {
-                let body = self.block(body)?;
-                let continuing = self.block(continuing)?;
-                out.push(Stmt::Loop { body, continuing });
-                Ok(())
-            }
             Stmt::Return(Some(v)) if self.returns => {
                 let (lo, hi) = self.range(*v);
                 let rt = self.nf.ret.ok_or_else(|| Error::internal("no range type"))?;
@@ -744,10 +701,7 @@ impl<'a> Ivx<'a> {
                 Ok(())
             }
             Stmt::Trap if self.speculative > 0 => Ok(()),
-            other => {
-                out.push(other.clone());
-                Ok(())
-            }
+            other => pass_through(other, out, &mut |b| self.block(b)),
         }
     }
 
@@ -761,7 +715,7 @@ impl<'a> Ivx<'a> {
             return Ok(());
         }
         let dg = derive(self.m, self.cache, g, mask.clone(), self.target)?;
-        let returns = returns_active(self.m, self.cache, g, mask.clone())?;
+        let returns = returns_active(self.m, self.cache, g, mask.clone(), Mode::Interval)?;
         let mut new_args = Vec::new();
         let mut his = Vec::new();
         for (a, active) in args.iter().zip(&mask) {
@@ -1003,8 +957,6 @@ impl<'a> Ivx<'a> {
             }));
         }
         // Floats.
-        let ra = self.coerce_iv(out, ra, ty);
-        let rb = self.coerce_iv(out, rb, ty);
         Ok(match op {
             BinOp::Add => {
                 let r = (self.bin(out, op, ra.0, rb.0, ty), self.bin(out, op, ra.1, rb.1, ty));
@@ -1229,10 +1181,7 @@ impl<'a> Ivx<'a> {
             B::Floor | B::Ceil | B::Round | B::Trunc | B::Sign | B::Saturate => {
                 self.monotone(out, b, &r, ty)
             }
-            B::Min | B::Max | B::Clamp => {
-                let r: Vec<Iv> = r.iter().map(|x| self.coerce_iv(out, *x, ty)).collect();
-                self.monotone(out, b, &r, ty)
-            }
+            B::Min | B::Max | B::Clamp => self.monotone(out, b, &r, ty),
             B::Step => {
                 // 1 where edge <= x: up in x, down in the edge.
                 let lo = self.call(out, B::Step, vec![r[0].1, r[1].0], ty);
@@ -1294,8 +1243,7 @@ impl<'a> Ivx<'a> {
             }
             B::Distance => {
                 let at = self.ty(args[0]);
-                let a = self.coerce_iv(out, r[0], at);
-                let bb = self.coerce_iv(out, r[1], at);
+                let (a, bb) = (r[0], r[1]);
                 let d = (
                     self.bin(out, BinOp::Sub, a.0, bb.1, at),
                     self.bin(out, BinOp::Sub, a.1, bb.0, at),

@@ -142,13 +142,33 @@ impl<'p> Checker<'p> {
     }
 
     fn declare_local(&mut self, name: &str, ty: TyId, kind: LocalKind, span: Span) -> LocalId {
+        let id = self.declare_unnamed(ty, kind, span);
+        self.locals[id.index()].name = name.into();
+        self.env.push((name.into(), id));
+        id
+    }
+
+    /// A local no name refers to: the counter of a `for _` loop.
+    fn declare_unnamed(&mut self, ty: TyId, kind: LocalKind, span: Span) -> LocalId {
         let id = LocalId(self.locals.len() as u32);
         let closure = self.closure_stack.last().map(|c| c.id);
-        self.locals.push(LocalDecl { name: name.into(), ty, kind, span, keyword: None, closure });
-        if name != "_" {
-            self.env.push((name.into(), id));
-        }
+        let name = "_".into();
+        self.locals.push(LocalDecl { name, ty, kind, span, keyword: None, closure });
         id
+    }
+
+    /// The loop variable of a `for`: the name, or none for `_`.
+    fn declare_binder(
+        &mut self,
+        name: Option<&ast::Ident>,
+        ty: TyId,
+        kind: LocalKind,
+        span: Span,
+    ) -> LocalId {
+        match name {
+            Some(n) => self.declare_local(&n.name, ty, kind, n.span),
+            None => self.declare_unnamed(ty, kind, span),
+        }
     }
 
     /// Finds a local by name, recording a capture if it's from outside the current closure.
@@ -260,44 +280,35 @@ impl<'p> Checker<'p> {
         }
     }
 
+    /// A binding's value, against its annotation if it has one; and the binding's type.
+    fn check_init(&mut self, annot: Option<&ast::TypeExpr>, init: &ast::Expr) -> (TyId, Expr) {
+        let annot = annot.map(|t| self.resolve_type(t));
+        let init = self.check_expr(init, annot);
+        if let Some(a) = annot {
+            self.expect(init.ty, a, init.span);
+        }
+        (annot.unwrap_or(init.ty), init)
+    }
+
     fn check_stmt(&mut self, s: &ast::Stmt) -> Option<Stmt> {
         let kind = match &s.kind {
-            ast::StmtKind::Bind { kind, pat, ty, init } => {
-                let annot = ty.as_ref().map(|t| self.resolve_type(t));
-                let init = self.check_expr(init, annot);
-                if let Some(a) = annot {
-                    self.expect(init.ty, a, init.span);
+            ast::StmtKind::Let { pat, ty, init } => {
+                let (ty, init) = self.check_init(ty.as_ref(), init);
+                let p = self.check_let_pattern(pat, ty, &init);
+                if let PatKind::Bind(id) = p.kind {
+                    let k = Span::new(s.span.file, s.span.start, s.span.start + 3);
+                    self.locals[id.index()].keyword = Some(k);
                 }
-                let ty = annot.unwrap_or(init.ty);
-                let pat = match kind {
-                    ast::BindKind::Let => {
-                        let p = self.check_let_pattern(pat, ty, &init);
-                        if let PatKind::Bind(id) = p.kind {
-                            let k = Span::new(s.span.file, s.span.start, s.span.start + 3);
-                            self.locals[id.index()].keyword = Some(k);
-                        }
-                        p
-                    }
-                    ast::BindKind::Var | ast::BindKind::Mut => {
-                        let ast::PatKind::Ident(name) = &pat.kind else {
-                            self.err(Diagnostic::new(
-                                codes::E0100,
-                                pat.span,
-                                "`var` and `mut` bind one name",
-                            ));
-                            return None;
-                        };
-                        let mutable = true;
-                        let lk = if *kind == ast::BindKind::Var {
-                            LocalKind::Owned { mutable }
-                        } else {
-                            LocalKind::Projection { mutable }
-                        };
-                        let id = self.declare_local(&name.name, ty, lk, name.span);
-                        Pat { ty, kind: PatKind::Bind(id), span: pat.span }
-                    }
+                StmtKind::Bind { pat: p, init }
+            }
+            ast::StmtKind::Var { kind, name, ty, init } => {
+                let (ty, init) = self.check_init(ty.as_ref(), init);
+                let lk = match kind {
+                    ast::VarKind::Var => LocalKind::Owned { mutable: true },
+                    ast::VarKind::Mut => LocalKind::Projection { mutable: true },
                 };
-                StmtKind::Bind { pat, init }
+                let id = self.declare_local(&name.name, ty, lk, name.span);
+                StmtKind::Bind { pat: Pat { ty, kind: PatKind::Bind(id), span: name.span }, init }
             }
             ast::StmtKind::Assign { target, op, value } => {
                 let place = self.check_expr(target, None);
@@ -447,10 +458,9 @@ impl<'p> Checker<'p> {
     ) -> Option<Stmt> {
         let env_len = self.env.len();
         // One name, or `_` for a loop that doesn't use it.
-        let wild = ast::Ident { name: "_".into(), span: pat.span };
         let name = match &pat.kind {
-            ast::PatKind::Ident(name) => name,
-            ast::PatKind::Wild => &wild,
+            ast::PatKind::Ident(name) => Some(name),
+            ast::PatKind::Wild => None,
             _ => {
                 self.err(Diagnostic::new(codes::E0100, pat.span, "a `for` loop binds one name"));
                 return None;
@@ -477,12 +487,8 @@ impl<'p> Checker<'p> {
                         format!("a range's bounds must be integers, not `{shown}`"),
                     ));
                 }
-                let var = self.declare_local(
-                    &name.name,
-                    s.ty,
-                    LocalKind::Owned { mutable: false },
-                    name.span,
-                );
+                let var =
+                    self.declare_binder(name, s.ty, LocalKind::Owned { mutable: false }, pat.span);
                 self.loop_depth += 1;
                 let b = self.check_block(body, None);
                 self.loop_depth -= 1;
@@ -517,7 +523,7 @@ impl<'p> Checker<'p> {
                 } else {
                     LocalKind::Projection { mutable }
                 };
-                let var = self.declare_local(&name.name, elem, kind, name.span);
+                let var = self.declare_binder(name, elem, kind, pat.span);
                 self.loop_depth += 1;
                 let b = self.check_block(body, None);
                 self.loop_depth -= 1;

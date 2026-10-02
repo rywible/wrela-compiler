@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { frameTime, parseTestParams, TEST_DEFAULTS } from "../src/testmode.ts";
+import { frameTime, isLoopback, parseTestParams, TEST_DEFAULTS } from "../src/testmode.ts";
 
 test("only #test fragments ask for test mode", () => {
   expect(parseTestParams("")).toBeNull();
@@ -29,4 +29,9 @@ test("frame times are i / fps, rounded to f32 like the native host's", () => {
   expect(frameTime(30, 60)).toBe(0.5);
   // f64 division then f32 rounding: what the WASM call does to the argument.
   expect(Math.fround(frameTime(1, 60))).toBe(Math.fround(1 / 60));
+});
+
+test("only a page served from this machine may enter test mode", () => {
+  for (const host of ["localhost", "127.0.0.1", "[::1]"]) expect(isLoopback(host)).toBe(true);
+  for (const host of ["example.com", "192.168.1.5", "localhost.example.com", ""]) expect(isLoopback(host)).toBe(false);
 });

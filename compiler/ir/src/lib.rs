@@ -163,6 +163,22 @@ pub enum Builtin {
     AllEqual,
 }
 
+impl Builtin {
+    /// Applies to each component of its arguments, which are all of one type: everything but
+    /// the geometric functions and `AllEqual`.
+    pub fn is_elementwise(self) -> bool {
+        !matches!(
+            self,
+            Builtin::Length
+                | Builtin::Distance
+                | Builtin::Dot
+                | Builtin::Cross
+                | Builtin::Normalize
+                | Builtin::AllEqual
+        )
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum PlaceRoot {
     Local(LocalId),

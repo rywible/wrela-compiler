@@ -386,10 +386,14 @@ impl AstWalker {
     fn stmt(&mut self, s: &Stmt) {
         self.add(s.span, Cat::Stmt);
         match &s.kind {
-            StmtKind::Bind { kind, pat, ty, init } => {
-                if *kind == BindKind::Let {
-                    self.pat(pat);
+            StmtKind::Let { pat, ty, init } => {
+                self.pat(pat);
+                if let Some(t) = ty {
+                    self.ty(t);
                 }
+                self.expr(init);
+            }
+            StmtKind::Var { ty, init, .. } => {
                 if let Some(t) = ty {
                     self.ty(t);
                 }

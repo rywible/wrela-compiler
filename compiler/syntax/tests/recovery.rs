@@ -67,7 +67,7 @@ fn errors_become_nodes_in_place() {
     // The binding stays, with an error for its value.
     assert!(matches!(
         &body[0].kind,
-        StmtKind::Bind { init: Expr { kind: ExprKind::Error, .. }, .. }
+        StmtKind::Let { init: Expr { kind: ExprKind::Error, .. }, .. }
     ));
     // The call keeps its good arguments.
     let StmtKind::Expr(Expr { kind: ExprKind::Call { args, .. }, .. }) = &body[1].kind else {

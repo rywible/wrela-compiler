@@ -557,21 +557,6 @@ impl<'a, 'm> Fb<'a, 'm> {
         Ok(self.expr(Expression::Compose { ty: io, components: comps }, out))
     }
 
-    fn splat_if_needed(
-        &mut self,
-        h: Handle<Expression>,
-        from: ir::TypeId,
-        to: ir::TypeId,
-        out: &mut Block,
-    ) -> Handle<Expression> {
-        match (self.cx.m.types.get(from), self.cx.m.types.get(to)) {
-            (ir::TypeDef::Scalar(_), ir::TypeDef::Vector(n)) => {
-                self.expr(Expression::Splat { size: vsize(*n), value: h }, out)
-            }
-            _ => h,
-        }
-    }
-
     fn value(&mut self, v: ir::ValueId, e: &ir::Expr, out: &mut Block) -> R<Handle<Expression>> {
         let t = self.f.value_ty(v);
         let types = &self.cx.m.types;
@@ -726,17 +711,10 @@ impl<'a, 'm> Fb<'a, 'm> {
                 self.expr(Expression::Unary { op, expr }, out)
             }
             ir::Expr::Binary(op, a, b) => {
-                let (ta, tb) = (self.f.value_ty(*a), self.f.value_ty(*b));
-                let mut left = self.val(*a)?;
-                let mut right = self.val(*b)?;
+                let ta = self.f.value_ty(*a);
+                let left = self.val(*a)?;
+                let right = self.val(*b)?;
                 let is_bool = matches!(types.get(ta), ir::TypeDef::Scalar(ir::Scalar::Bool));
-                let mat_mul = *op == ir::BinOp::Mul
-                    && (matches!(types.get(ta), ir::TypeDef::Matrix(_))
-                        || matches!(types.get(tb), ir::TypeDef::Matrix(_)));
-                if !mat_mul {
-                    left = self.splat_if_needed(left, ta, tb, out);
-                    right = self.splat_if_needed(right, tb, ta, out);
-                }
                 let bop = match op {
                     ir::BinOp::Add | ir::BinOp::WrappingAdd => BinaryOperator::Add,
                     ir::BinOp::Sub | ir::BinOp::WrappingSub => BinaryOperator::Subtract,
@@ -786,22 +764,7 @@ impl<'a, 'm> Fb<'a, 'm> {
         out: &mut Block,
     ) -> R<Handle<Expression>> {
         use ir::Builtin as B;
-        let mut hs = args.iter().map(|a| self.val(*a)).collect::<R<Vec<_>>>()?;
-        // Scalar arguments next to vectors are splatted (min, max, clamp, mix, step...).
-        if let Some(vt) = args
-            .iter()
-            .map(|a| self.f.value_ty(*a))
-            .find(|&x| matches!(self.cx.m.types.get(x), ir::TypeDef::Vector(_)))
-            && !matches!(
-                b,
-                B::Dot | B::Cross | B::Length | B::Distance | B::Normalize | B::AllEqual
-            )
-        {
-            for (k, a) in args.iter().enumerate() {
-                let at = self.f.value_ty(*a);
-                hs[k] = self.splat_if_needed(hs[k], at, vt, out);
-            }
-        }
+        let hs = args.iter().map(|a| self.val(*a)).collect::<R<Vec<_>>>()?;
         let deriv = |axis| Expression::Derivative {
             axis,
             ctrl: naga::DerivativeControl::None,

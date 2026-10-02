@@ -166,15 +166,21 @@ impl Verifier<'_> {
             }
             Expr::Binary(op, a, b) => Some(self.binary(*op, *a, *b)?),
             Expr::Call(g, args) => return self.call(*g, args),
-            Expr::Builtin(_, args) => {
-                // Elementwise builtins make their arguments' type; the reductions a scalar.
-                // What each takes is the back ends' business; here, that the arguments are
-                // floats.
+            Expr::Builtin(b, args) => {
+                // Elementwise builtins make their arguments' type, which is one type; the
+                // reductions a scalar. The arguments are scalars or vectors.
                 for a in args {
                     let t = self.ty(*a);
                     if !matches!(self.def(t), TypeDef::Scalar(_) | TypeDef::Vector(_)) {
                         return Err(bug(format!("a builtin given a `{}`", self.show(t))));
                     }
+                }
+                if b.is_elementwise()
+                    && let Some(first) = args.first()
+                    && let Some(odd) = args.iter().find(|a| self.ty(**a) != self.ty(*first))
+                {
+                    let (x, y) = (self.show(self.ty(*first)), self.show(self.ty(*odd)));
+                    return Err(bug(format!("{b:?} of `{x}` and `{y}`")));
                 }
                 return Ok(None);
             }
@@ -279,10 +285,11 @@ impl Verifier<'_> {
                 d => Err(bug(format!("{op:?} of `{d:?}`"))),
             };
         }
-        // A vector or matrix with a scalar (each component), a matrix with a vector.
+        // A matrix with a scalar (each element) or a vector. A vector with a scalar is splatted
+        // first.
         match (self.def(ta), self.def(tb)) {
-            (TypeDef::Vector(_) | TypeDef::Matrix(_), TypeDef::Scalar(Scalar::F32)) => Ok(ta),
-            (TypeDef::Scalar(Scalar::F32), TypeDef::Vector(_) | TypeDef::Matrix(_)) => Ok(tb),
+            (TypeDef::Matrix(_), TypeDef::Scalar(Scalar::F32)) => Ok(ta),
+            (TypeDef::Scalar(Scalar::F32), TypeDef::Matrix(_)) => Ok(tb),
             (TypeDef::Matrix(n), TypeDef::Vector(k)) | (TypeDef::Vector(k), TypeDef::Matrix(n))
                 if op == BinOp::Mul && n == k =>
             {
