@@ -23,6 +23,8 @@ pub struct LayoutError {
     pub path: String,
     pub message: String,
     pub help: Option<String>,
+    /// A symbolic link to a directory (E0208), rather than a layout or read problem (E0205).
+    pub symlink: bool,
 }
 
 /// Directories that never hold modules: build output and run results.
@@ -59,6 +61,7 @@ fn walk(
                 path: display(dir),
                 message: format!("can't read the directory: {e}"),
                 help: None,
+                symlink: false,
             });
             return;
         }
@@ -83,6 +86,7 @@ fn walk(
                     help: Some(
                         "check its target directly, or replace the link with the directory".into(),
                     ),
+                    symlink: true,
                 });
                 continue;
             }
@@ -98,6 +102,7 @@ fn walk(
                             "the directory `{name}` holds modules, so its name must be a wrela name"
                         ),
                         help: Some("rename it with letters, digits and `_`".into()),
+                        symlink: false,
                     });
                 }
                 continue;
@@ -115,6 +120,7 @@ fn walk(
                 help: Some(
                     "rename it with letters, digits and `_`, not starting with a digit".into(),
                 ),
+                symlink: false,
             });
             continue;
         }
@@ -177,6 +183,7 @@ mod tests {
         std::os::unix::fs::symlink(&target, d.join("linked")).expect("symlink");
         let errs = find_files(&d).expect_err("refused");
         assert!(errs[0].message.contains("symbolic link to a directory"));
+        assert!(errs[0].symlink, "reported as E0208");
         let _ = fs::remove_dir_all(&d);
         let _ = fs::remove_dir_all(&target);
     }

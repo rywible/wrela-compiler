@@ -126,7 +126,8 @@ fn check_package(db: &Db) -> CheckOutput {
         Err(errors) => {
             for e in errors {
                 let f = sources.add(e.path.clone(), "");
-                let mut d = Diagnostic::new(codes::E0205, Span::new(f, 0, 0), e.message);
+                let code = if e.symlink { codes::E0208 } else { codes::E0205 };
+                let mut d = Diagnostic::new(code, Span::new(f, 0, 0), e.message);
                 if let Some(h) = e.help {
                     d = d.with_help(h);
                 }
