@@ -1,0 +1,89 @@
+// GPU resources, entry-point builtins, and the CPU calls that record GPU work (language.md
+// §12, D-102). Every function here that CPU code calls carries the `host` effect.
+
+/// A buffer of `T`s on the GPU, named by a handle. CPU code can create it, write into it and
+/// pass it to kernels, but can't read through it (D-102).
+pub struct GpuBuffer<T>: Copy + Clone {
+    handle: u32,
+}
+
+/// A kernel parameter where each invocation writes only its own slot, indexed by its
+/// `GlobalId` (§6.13). The CPU passes a `GpuBuffer<T>` for it.
+pub struct Slots<T> {
+    handle: u32,
+}
+
+/// The invocation's position in the whole dispatch.
+pub struct GlobalId: Copy + Clone {
+    pub x: u32,
+    pub y: u32,
+    pub z: u32,
+}
+
+/// The invocation's position within its workgroup.
+pub struct LocalId: Copy + Clone {
+    pub x: u32,
+    pub y: u32,
+    pub z: u32,
+}
+
+/// The workgroup's position in the dispatch.
+pub struct WorkgroupId: Copy + Clone {
+    pub x: u32,
+    pub y: u32,
+    pub z: u32,
+}
+
+/// A vertex shader's vertex number.
+pub struct VertexIndex: Copy + Clone {
+    pub index: u32,
+}
+
+/// A vertex shader's instance number.
+pub struct InstanceIndex: Copy + Clone {
+    pub index: u32,
+}
+
+/// A fragment's window position: pixel centres are at half-integers.
+pub struct FragCoord: Copy + Clone {
+    pub position: vec4,
+}
+
+/// A vertex shader's clip-space output position.
+pub struct ClipPosition: Copy + Clone {
+    pub position: vec4,
+}
+
+/// A vertex output that isn't interpolated.
+pub struct Flat<T>: Copy + Clone {
+    pub value: T,
+}
+
+/// Creates a GPU buffer of `count` elements, zeroed.
+@intrinsic
+pub fn buffer<T: GpuData>(count: u32) -> GpuBuffer<T> {}
+
+/// Copies `values` into `buf`, starting at element `at`. The copy happens in recorded order
+/// with dispatches and draws.
+@intrinsic
+pub fn write<T: GpuData>(buf: GpuBuffer<T>, at: u32, values: [T]) {}
+
+/// Records a dispatch of a `@compute` kernel: `dispatch(kernel, groups: n, arg: value, ...)`.
+/// `groups` is a `u32` or a `(u32, u32, u32)`; the other arguments are the kernel's, by name or
+/// position, without its builtins. Small `GpuData` arguments travel as uniforms; a
+/// `GpuBuffer<T>` goes where the kernel takes `[T]` or `mut Slots<T>`.
+@intrinsic
+pub fn dispatch() {}
+
+/// Records a draw into the current screen pass: `draw(vertex_fn, fragment_fn, vertices: n,
+/// instances: m, arg: value, ...)`, with the two shaders' arguments by name.
+@intrinsic
+pub fn draw() {}
+
+/// Starts drawing to the screen, cleared to `clear`.
+@intrinsic
+pub fn begin_screen_pass(clear: vec4) {}
+
+/// Ends the screen pass and shows it.
+@intrinsic
+pub fn present() {}

@@ -1,0 +1,270 @@
+// Fields: functions over space (language.md §17). A field's structure is its type and its
+// numbers are data (D-070): `sphere(1.0).smooth_union(round_cone(...), k: 0.1)` has the type
+// `SmoothUnion<Sphere, RoundCone>`, whose value is a few floats that reach the GPU as a uniform.
+//
+// Kinds (`Exact`, `Bound`, `Lipschitz`) and channels come with facts in tier 1; in tier 0 a
+// surface is just its distance.
+
+use std::derive::{Box3, Interval, gradient, interval, value_and_gradient}
+
+/// A signed distance over 3D space: negative inside, positive outside.
+pub trait Surface: Copy + GpuData {
+    /// The signed distance from `p` to the surface.
+    fn distance(self, p: vec3) -> f32
+
+    /// The gradient of `distance`, derived by the compiler (§13): the surface normal, not
+    /// normalized.
+    fn gradient(self, p: vec3) -> vec3 {
+        gradient(|q| self.distance(q), p)
+    }
+
+    /// The distance and its gradient, from one derived evaluation.
+    fn sample(self, p: vec3) -> (f32, vec3) {
+        value_and_gradient(|q| self.distance(q), p)
+    }
+
+    /// A range holding every distance in `over`, derived by interval arithmetic.
+    fn interval(self, over: Box3) -> Interval {
+        interval(|q| self.distance(q), over)
+    }
+
+    fn union<B: Surface>(self, b: B) -> Union<Self, B> {
+        Union { a: self, b }
+    }
+
+    /// A union whose seam is rounded over a width of about `k`.
+    fn smooth_union<B: Surface>(self, b: B, k: f32) -> SmoothUnion<Self, B> {
+        SmoothUnion { a: self, b, k }
+    }
+
+    fn intersect<B: Surface>(self, b: B) -> Intersect<Self, B> {
+        Intersect { a: self, b }
+    }
+
+    fn translate(self, by: vec3) -> Translate<Self> {
+        Translate { inner: self, by }
+    }
+
+    /// Adds `amp` times a noise to the distance: wrinkles, bark, terrain.
+    fn displace<N: Noise>(self, noise: N, amp: f32) -> Displace<Self, N> {
+        Displace { inner: self, noise, amp }
+    }
+}
+
+/// A scalar function over 3D space, used to displace surfaces.
+pub trait Noise: Copy + GpuData {
+    fn value(self, p: vec3) -> f32
+}
+
+// ---- primitives ---------------------------------------------------------------------------------
+
+pub struct Sphere: Copy + Clone + GpuData {
+    pub radius: f32,
+}
+
+pub fn sphere(radius: f32) -> Sphere {
+    Sphere { radius }
+}
+
+impl Surface for Sphere {
+    fn distance(self, p: vec3) -> f32 {
+        length(p) - self.radius
+    }
+}
+
+/// An ellipsoid centred at the origin. No exact distance exists; this is the usual bound.
+pub struct Ellipsoid: Copy + Clone + GpuData {
+    pub radii: vec3,
+}
+
+pub fn ellipsoid(radii: vec3) -> Ellipsoid {
+    Ellipsoid { radii }
+}
+
+impl Surface for Ellipsoid {
+    fn distance(self, p: vec3) -> f32 {
+        let k0 = length(p / self.radii)
+        let k1 = max(length(p / (self.radii * self.radii)), 0.000000001)
+        k0 * (k0 - 1.0) / k1
+    }
+}
+
+/// The hull of two spheres, centred at `a` with radius `r1` and at `b` with radius `r2`.
+/// Exact.
+pub struct RoundCone: Copy + Clone + GpuData {
+    pub a: vec3,
+    pub b: vec3,
+    pub r1: f32,
+    pub r2: f32,
+}
+
+pub fn round_cone(a: vec3, b: vec3, r_top: f32, r_bottom: f32) -> RoundCone {
+    RoundCone { a, b, r1: r_top, r2: r_bottom }
+}
+
+impl Surface for RoundCone {
+    fn distance(self, p: vec3) -> f32 {
+        let ba = self.b - self.a
+        let l2 = dot(ba, ba)
+        let rr = self.r1 - self.r2
+        let a2 = l2 - rr * rr
+        let il2 = 1.0 / l2
+        let pa = p - self.a
+        let y = dot(pa, ba)
+        let z = y - l2
+        let xv = pa * l2 - ba * y
+        let x2 = dot(xv, xv)
+        let y2 = y * y * l2
+        let z2 = z * z * l2
+        let k = sign(rr) * rr * rr * x2
+        if sign(z) * a2 * z2 > k {
+            return sqrt(x2 + z2) * il2 - self.r2
+        }
+        if sign(y) * a2 * y2 < k {
+            return sqrt(x2 + y2) * il2 - self.r1
+        }
+        (sqrt(x2 * a2 * il2) + y * rr) * il2 - self.r1
+    }
+}
+
+/// Everything on the negative side of a plane: `dot(p, normal) < offset`.
+pub struct HalfSpace: Copy + Clone + GpuData {
+    pub normal: vec3,
+    pub offset: f32,
+}
+
+pub fn half_space(normal: vec3, offset: f32) -> HalfSpace {
+    HalfSpace { normal, offset }
+}
+
+impl Surface for HalfSpace {
+    fn distance(self, p: vec3) -> f32 {
+        dot(p, self.normal) - self.offset
+    }
+}
+
+// ---- combinators --------------------------------------------------------------------------------
+
+/// The smooth minimum of two distances: where `b >= a + k` it's exactly `a`.
+pub fn smin(a: f32, b: f32, k: f32) -> f32 {
+    let h = clamp(0.5 + 0.5 * (b - a) / k, 0.0, 1.0)
+    mix(b, a, h) - k * h * (1.0 - h)
+}
+
+pub struct Union<A, B>: Copy + Clone + GpuData {
+    pub a: A,
+    pub b: B,
+}
+
+impl<A: Surface, B: Surface> Surface for Union<A, B> {
+    fn distance(self, p: vec3) -> f32 {
+        min(self.a.distance(p), self.b.distance(p))
+    }
+}
+
+pub struct SmoothUnion<A, B>: Copy + Clone + GpuData {
+    pub a: A,
+    pub b: B,
+    pub k: f32,
+}
+
+impl<A: Surface, B: Surface> Surface for SmoothUnion<A, B> {
+    fn distance(self, p: vec3) -> f32 {
+        smin(self.a.distance(p), self.b.distance(p), self.k)
+    }
+}
+
+pub struct Intersect<A, B>: Copy + Clone + GpuData {
+    pub a: A,
+    pub b: B,
+}
+
+impl<A: Surface, B: Surface> Surface for Intersect<A, B> {
+    fn distance(self, p: vec3) -> f32 {
+        max(self.a.distance(p), self.b.distance(p))
+    }
+}
+
+pub struct Translate<S>: Copy + Clone + GpuData {
+    pub inner: S,
+    pub by: vec3,
+}
+
+impl<S: Surface> Surface for Translate<S> {
+    fn distance(self, p: vec3) -> f32 {
+        self.inner.distance(p - self.by)
+    }
+}
+
+pub struct Displace<S, N>: Copy + Clone + GpuData {
+    pub inner: S,
+    pub noise: N,
+    pub amp: f32,
+}
+
+impl<S: Surface, N: Noise> Surface for Displace<S, N> {
+    fn distance(self, p: vec3) -> f32 {
+        self.inner.distance(p) + self.amp * self.noise.value(p)
+    }
+}
+
+// ---- noise --------------------------------------------------------------------------------------
+
+/// A 32-bit integer hash (PCG-style), the same bits on the CPU and the GPU.
+pub fn hash_u32(x: u32) -> u32 {
+    var h = x.wrapping_mul(747796405).wrapping_add(2891336453)
+    h = ((h >> ((h >> 28) + 4)) ^ h).wrapping_mul(277803737)
+    (h >> 22) ^ h
+}
+
+/// A pseudo-random value in [-1, 1] for an integer lattice point.
+pub fn lattice(x: i32, y: i32, z: i32) -> f32 {
+    let h = hash_u32(u32(x).wrapping_add(hash_u32(u32(y).wrapping_add(hash_u32(u32(z))))))
+    f32(h) * (2.0 / 4294967295.0) - 1.0
+}
+
+/// Value noise with a quintic fade: in [-1, 1], smooth, one lattice cell per unit.
+pub fn value_noise(p: vec3) -> f32 {
+    let fl = floor(p)
+    let ix = i32(fl.x)
+    let iy = i32(fl.y)
+    let iz = i32(fl.z)
+    let f = p - fl
+    let u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0)
+    let a = lattice(ix, iy, iz)
+    let b = lattice(ix + 1, iy, iz)
+    let c = lattice(ix, iy + 1, iz)
+    let d = lattice(ix + 1, iy + 1, iz)
+    let e = lattice(ix, iy, iz + 1)
+    let f1 = lattice(ix + 1, iy, iz + 1)
+    let g = lattice(ix, iy + 1, iz + 1)
+    let h = lattice(ix + 1, iy + 1, iz + 1)
+    mix(mix(mix(a, b, u.x), mix(c, d, u.x), u.y), mix(mix(e, f1, u.x), mix(g, h, u.x), u.y), u.z)
+}
+
+/// Fractal noise: `octaves` layers of value noise, each at twice the frequency and half the
+/// amplitude of the last, sampled at `p + offset`.
+pub struct Fbm: Copy + Clone + GpuData {
+    pub freq: f32,
+    pub octaves: u32,
+    pub offset: vec3,
+}
+
+pub fn fbm(freq: f32, octaves: u32, offset: vec3 = vec3()) -> Fbm {
+    Fbm { freq, octaves, offset }
+}
+
+impl Noise for Fbm {
+    fn value(self, p: vec3) -> f32 {
+        let q = p + self.offset
+        var s = 0.0
+        var a = 1.0
+        var fr = self.freq
+        for o in 0..self.octaves {
+            s += a * value_noise(q * fr + f32(o) * 17.0)
+            a *= 0.5
+            fr *= 2.0
+        }
+        s
+    }
+}

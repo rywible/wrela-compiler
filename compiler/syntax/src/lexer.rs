@@ -549,6 +549,13 @@ fn insert_newlines(raw: Vec<Token>, file: FileId, _len: u32) -> Vec<Token> {
 /// The value of an INT token's text (`_` ignored, radix prefixes read), or `None` if it
 /// doesn't fit in a `u64`.
 pub fn int_value(text: &str) -> Option<u64> {
+    // A type suffix is already an error (E0003); read the digits before it. (Hex digits
+    // include `f`, so `0x1f32` is a plain hex number.)
+    let text = if text.starts_with("0x") {
+        text
+    } else {
+        TYPE_SUFFIXES.iter().find_map(|s| text.strip_suffix(s)).unwrap_or(text)
+    };
     let clean: String = text.chars().filter(|c| *c != '_').collect();
     let (digits, radix) = match clean.get(..2) {
         Some("0x") => (&clean[2..], 16),
@@ -561,6 +568,7 @@ pub fn int_value(text: &str) -> Option<u64> {
 
 /// The value of a FLOAT token's text, `_` ignored.
 pub fn float_value(text: &str) -> f64 {
+    let text = TYPE_SUFFIXES.iter().find_map(|s| text.strip_suffix(s)).unwrap_or(text);
     let clean: String = text.chars().filter(|c| *c != '_').collect();
     clean.parse().unwrap_or(f64::NAN)
 }

@@ -1,0 +1,18 @@
+// The prelude: in scope in every module, with the built-in types and functions.
+
+/// A value that may be absent. There's no null (language.md §6.1).
+pub enum Option<T>: Copy + Clone {
+    None,
+    Some(T),
+}
+
+/// Deep-copied with `.clone()` (§6.1). The compiler implements it structurally for types that
+/// opt in: `struct S: Clone { ... }`.
+pub trait Clone {}
+
+/// Copied implicitly (§6.1). Opted in like `Clone`; every field must be `Copy`.
+pub trait Copy: Clone {}
+
+/// Laid out by WGSL's rules everywhere, so its bytes are the same on the CPU and the GPU
+/// (§6.10). Opted in; every field must be `GpuData`.
+pub trait GpuData {}

@@ -3,6 +3,10 @@ resolver = "3"
 members = [
     "compiler/diag",
     "compiler/syntax",
+    "compiler/grammar",
+    "compiler/sema",
+    "compiler/driver",
+    "compiler/cli",
 ]
 
 [workspace.package]
@@ -14,6 +18,8 @@ publish = false
 [workspace.dependencies]
 wrela-diag = { path = "compiler/diag" }
 wrela-syntax = { path = "compiler/syntax" }
+wrela-sema = { path = "compiler/sema" }
+wrela-driver = { path = "compiler/driver" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

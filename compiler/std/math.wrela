@@ -1,0 +1,365 @@
+// The transcendental functions for CPU code (language.md §11): compiled to WASM with the
+// program, never taken from the host, so every host computes the same bits (D-015, D-074).
+// GPU code uses WGSL's own.
+//
+// Each function widens its f32 argument to f64, works there, and rounds once to f32. The
+// algorithms and coefficients follow musl's libm (MIT licence; FreeBSD msun before it):
+// __sindf, __cosdf and __tandf for sin, cos and tan; atan's table and polynomial; and textbook
+// series for exp and log. Accuracy (an estimate, not proved): within 1 ulp of the true f32
+// result, for sin, cos and tan when |x| < 2^20 (beyond that the range reduction loses phase,
+// deterministically).
+
+const INV_PIO2: f64 = 0.636619772367581382433
+// pi/2 split in two: the first 33 bits, then the rest.
+const PIO2_HI: f64 = 1.57079631090164184570
+const PIO2_LO: f64 = 0.0000000158932547735281966916
+const PI: f64 = 3.14159265358979311600
+const LN2: f64 = 0.693147180559945286227
+const LOG2E: f64 = 1.44269504088896338700
+const SQRT2: f64 = 1.41421356237309514547
+
+const S1: f64 = -0.166666666416265235595
+const S2: f64 = 0.0083333293858894631756
+const S3: f64 = -0.000198393348360966317347
+const S4: f64 = 0.0000027183114939898219064
+const C0: f64 = -0.499999997251031003120
+const C1: f64 = 0.0416666233237390631894
+const C2: f64 = -0.00138867637746099294692
+const C3: f64 = 0.0000243904487962774090654
+const T: [f64; 6] = [
+    0.333331395030791399758,
+    0.133392002712976742718,
+    0.0533812378445670393523,
+    0.0245283181166547278873,
+    0.00297435743359967304927,
+    0.00946564784943673166728,
+]
+
+const ATAN_HI: [f64; 4] = [
+    0.463647609000806093515,
+    0.785398163397448278999,
+    0.982793723247329054082,
+    1.57079632679489655800,
+]
+const ATAN_LO: [f64; 4] = [
+    0.0000000000000000226987774529616870924,
+    0.0000000000000000306161699786838301793,
+    0.0000000000000000139033110312309984516,
+    0.0000000000000000612323399573676603587,
+]
+const AT: [f64; 11] = [
+    0.333333333333329318027,
+    -0.199999999998764832476,
+    0.142857142725034663711,
+    -0.111111104054623557880,
+    0.0909088713343650656196,
+    -0.0769187620504482999495,
+    0.0666107313738753120669,
+    -0.0583357013379057348645,
+    0.0497687799461593236017,
+    -0.0365315727442169155270,
+    0.0162858201153657823623,
+]
+
+const F32_MAX: f32 = 340282346638528859811704183484516925440.0
+
+fn is_nan(x: f32) -> bool {
+    x != x
+}
+
+fn is_inf(x: f32) -> bool {
+    abs(x) > F32_MAX
+}
+
+/// `x` reduced to `y = x - n * pi/2` with |y| <= pi/4 (for |x| < 2^20), and `n`.
+fn reduce(x: f32) -> (f64, i32) {
+    let xd = f64(x)
+    let n = round(xd * INV_PIO2)
+    ((xd - n * PIO2_HI) - n * PIO2_LO, i32(n))
+}
+
+fn sin_kernel(x: f64) -> f64 {
+    let z = x * x
+    let w = z * z
+    let r = S3 + z * S4
+    let s = z * x
+    (x + s * (S1 + z * S2)) + s * w * r
+}
+
+fn cos_kernel(x: f64) -> f64 {
+    let z = x * x
+    let w = z * z
+    let r = C2 + z * C3
+    ((1.0 + z * C0) + w * C1) + (w * z) * r
+}
+
+pub fn sin(x: f32) -> f32 {
+    if is_nan(x) || is_inf(x) {
+        return x - x
+    }
+    let (y, n) = reduce(x)
+    let q = n & 3
+    let r = if q == 0 {
+        sin_kernel(y)
+    } else if q == 1 {
+        cos_kernel(y)
+    } else if q == 2 {
+        -sin_kernel(y)
+    } else {
+        -cos_kernel(y)
+    }
+    f32(r)
+}
+
+pub fn cos(x: f32) -> f32 {
+    if is_nan(x) || is_inf(x) {
+        return x - x
+    }
+    let (y, n) = reduce(x)
+    let q = n & 3
+    let r = if q == 0 {
+        cos_kernel(y)
+    } else if q == 1 {
+        -sin_kernel(y)
+    } else if q == 2 {
+        -cos_kernel(y)
+    } else {
+        sin_kernel(y)
+    }
+    f32(r)
+}
+
+pub fn tan(x: f32) -> f32 {
+    if is_nan(x) || is_inf(x) {
+        return x - x
+    }
+    let (y, n) = reduce(x)
+    let z = y * y
+    var r = T[4] + z * T[5]
+    let t = T[2] + z * T[3]
+    let w = z * z
+    let s = z * y
+    let u = T[0] + z * T[1]
+    r = (y + s * u) + (s * w) * (t + w * r)
+    if (n & 1) == 1 {
+        f32(-1.0 / r)
+    } else {
+        f32(r)
+    }
+}
+
+/// e^r for |r| <= ln(2)/2, by its Taylor series to degree 11.
+fn exp_poly(r: f64) -> f64 {
+    1.0 + r * (1.0 + r * (0.5 + r * (0.166666666666666667 + r * (0.0416666666666666667 + r * (0.00833333333333333333 + r * (0.00138888888888888889 + r * (0.000198412698412698413 + r * (0.0000248015873015873016 + r * (0.00000275573192239858907 + r * (0.000000275573192239858907 + r * 0.0000000250521083854417188))))))))))
+}
+
+/// 2^n as an f64, for -1022 <= n <= 1023.
+fn pow2(n: i32) -> f64 {
+    bitcast_f64(u64(n + 1023) << 52)
+}
+
+/// 2^x for an f64 `x`; overflows to infinity and underflows to 0 at f32's limits.
+fn exp2_f64(x: f64) -> f64 {
+    if x > 129.0 {
+        return 1.0 / 0.0
+    }
+    if x < -151.0 {
+        return 0.0
+    }
+    let n = round(x)
+    exp_poly((x - n) * LN2) * pow2(i32(n))
+}
+
+pub fn exp(x: f32) -> f32 {
+    if is_nan(x) {
+        return x
+    }
+    let xd = f64(x)
+    if xd > 89.0 {
+        return f32(1.0 / 0.0)
+    }
+    if xd < -104.0 {
+        return 0.0
+    }
+    let n = round(xd * LOG2E)
+    f32(exp_poly(xd - n * LN2) * pow2(i32(n)))
+}
+
+pub fn exp2(x: f32) -> f32 {
+    if is_nan(x) {
+        return x
+    }
+    f32(exp2_f64(f64(x)))
+}
+
+/// log2 of a positive, finite f64: the exponent plus log2 of the mantissa.
+fn log2_f64(x: f64) -> f64 {
+    let bits = bitcast_u64(x)
+    var e = i32((bits >> 52) & 2047) - 1023
+    var m = bitcast_f64((bits & 4503599627370495) | 4607182418800017408)
+    if m > SQRT2 {
+        m = m * 0.5
+        e = e + 1
+    }
+    // log(1 + f) = 2 atanh(s) with s = f / (2 + f): |s| <= 0.172.
+    let f = m - 1.0
+    let s = f / (2.0 + f)
+    let z = s * s
+    let ln = 2.0 * s * (1.0 + z * (0.333333333333333333 + z * (0.2 + z * (0.142857142857142857 + z * (0.111111111111111111 + z * (0.0909090909090909091 + z * 0.0769230769230769231))))))
+    f64(e) + ln * LOG2E
+}
+
+pub fn log2(x: f32) -> f32 {
+    if is_nan(x) || x < 0.0 {
+        return (x - x) / (x - x)
+    }
+    if x == 0.0 {
+        return -1.0 / 0.0
+    }
+    if is_inf(x) {
+        return x
+    }
+    f32(log2_f64(f64(x)))
+}
+
+pub fn log(x: f32) -> f32 {
+    if is_nan(x) || x < 0.0 {
+        return (x - x) / (x - x)
+    }
+    if x == 0.0 {
+        return -1.0 / 0.0
+    }
+    if is_inf(x) {
+        return x
+    }
+    f32(log2_f64(f64(x)) * LN2)
+}
+
+pub fn pow(x: f32, y: f32) -> f32 {
+    if y == 0.0 || x == 1.0 {
+        return 1.0
+    }
+    if is_nan(x) || is_nan(y) {
+        return x + y
+    }
+    if x == 0.0 {
+        if y > 0.0 {
+            return 0.0
+        }
+        return 1.0 / 0.0
+    }
+    if x < 0.0 {
+        if floor(y) != y {
+            return (x - x) / (x - x)
+        }
+        let r = f32(exp2_f64(f64(y) * log2_f64(-f64(x))))
+        // An odd integer power keeps the sign; |y| >= 2^24 is always even.
+        if abs(y) < 16777216.0 && (i32(y) & 1) == 1 {
+            return -r
+        }
+        return r
+    }
+    if is_inf(x) {
+        if y > 0.0 {
+            return x
+        }
+        return 0.0
+    }
+    f32(exp2_f64(f64(y) * log2_f64(f64(x))))
+}
+
+/// atan of an f64, by musl's reduction to |a| < 7/16 and an odd polynomial.
+fn atan_f64(x: f64) -> f64 {
+    if x != x {
+        return x
+    }
+    let neg = x < 0.0
+    var a = abs(x)
+    if a > 100000000000000000000.0 {
+        return if neg { -ATAN_HI[3] } else { ATAN_HI[3] }
+    }
+    var id = -1
+    if a >= 0.4375 {
+        if a < 0.6875 {
+            id = 0
+            a = (2.0 * a - 1.0) / (2.0 + a)
+        } else if a < 1.1875 {
+            id = 1
+            a = (a - 1.0) / (a + 1.0)
+        } else if a < 2.4375 {
+            id = 2
+            a = (a - 1.5) / (1.0 + 1.5 * a)
+        } else {
+            id = 3
+            a = -1.0 / a
+        }
+    }
+    let z = a * a
+    let w = z * z
+    let s1 = z * (AT[0] + w * (AT[2] + w * (AT[4] + w * (AT[6] + w * (AT[8] + w * AT[10])))))
+    let s2 = w * (AT[1] + w * (AT[3] + w * (AT[5] + w * (AT[7] + w * AT[9]))))
+    let r = if id < 0 {
+        a - a * (s1 + s2)
+    } else {
+        ATAN_HI[id] - ((a * (s1 + s2) - ATAN_LO[id]) - a)
+    }
+    if neg {
+        -r
+    } else {
+        r
+    }
+}
+
+/// Whether an f64's sign bit is set (true for -0.0).
+fn sign_bit(x: f64) -> bool {
+    (bitcast_u64(x) >> 63) == 1
+}
+
+fn atan2_f64(y: f64, x: f64) -> f64 {
+    if x != x || y != y {
+        return x + y
+    }
+    let big = 1.0e300
+    if y == 0.0 {
+        if sign_bit(x) {
+            return if sign_bit(y) { -PI } else { PI }
+        }
+        return y
+    }
+    if x == 0.0 {
+        return if y > 0.0 { PI * 0.5 } else { -PI * 0.5 }
+    }
+    if abs(x) > big && abs(y) > big {
+        let q = if x > 0.0 { PI * 0.25 } else { PI * 0.75 }
+        return if y > 0.0 { q } else { -q }
+    }
+    let t = atan_f64(abs(y / x))
+    let r = if x > 0.0 {
+        t
+    } else {
+        PI - t
+    }
+    if y < 0.0 {
+        -r
+    } else {
+        r
+    }
+}
+
+pub fn atan(x: f32) -> f32 {
+    f32(atan_f64(f64(x)))
+}
+
+pub fn atan2(y: f32, x: f32) -> f32 {
+    f32(atan2_f64(f64(y), f64(x)))
+}
+
+pub fn asin(x: f32) -> f32 {
+    let xd = f64(x)
+    f32(atan2_f64(xd, sqrt((1.0 - xd) * (1.0 + xd))))
+}
+
+pub fn acos(x: f32) -> f32 {
+    let xd = f64(x)
+    f32(atan2_f64(sqrt((1.0 - xd) * (1.0 + xd)), xd))
+}

@@ -1,0 +1,70 @@
+// Derived interpretations (language.md §13): the compiler derives them from the body of any
+// function that qualifies. Nothing here is specific to fields.
+
+/// A closed range `[lo, hi]` of `f32` values.
+pub struct Interval: Copy + Clone + GpuData {
+    pub lo: f32,
+    pub hi: f32,
+}
+
+impl Interval {
+    pub fn contains(self, x: f32) -> bool {
+        self.lo <= x && x <= self.hi
+    }
+
+    pub fn width(self) -> f32 {
+        self.hi - self.lo
+    }
+}
+
+/// An axis-aligned box in 2D.
+pub struct Box2: Copy + Clone + GpuData {
+    pub lo: vec2,
+    pub hi: vec2,
+}
+
+/// An axis-aligned box in 3D.
+pub struct Box3: Copy + Clone + GpuData {
+    pub lo: vec3,
+    pub hi: vec3,
+}
+
+/// An axis-aligned box in 4D.
+pub struct Box4: Copy + Clone + GpuData {
+    pub lo: vec4,
+    pub hi: vec4,
+}
+
+/// What a derived function can take: `f32` and the float vectors, each with its box type.
+pub trait Domain {
+    type Box
+}
+
+impl Domain for f32 {
+    type Box = Interval
+}
+
+impl Domain for vec2 {
+    type Box = Box2
+}
+
+impl Domain for vec3 {
+    type Box = Box3
+}
+
+impl Domain for vec4 {
+    type Box = Box4
+}
+
+/// The gradient of `f` at `at`, by forward-mode differentiation of `f`'s body.
+@intrinsic
+pub fn gradient<X: Domain>(f: fn(X) -> f32, at: X) -> X {}
+
+/// `f(at)` and its gradient, from one derived evaluation.
+@intrinsic
+pub fn value_and_gradient<X: Domain>(f: fn(X) -> f32, at: X) -> (f32, X) {}
+
+/// A range that contains `f(x)` for every `x` in `over`, by interval arithmetic over `f`'s
+/// body. On the GPU each operation widens its result outward by its error bound (D-075).
+@intrinsic
+pub fn interval<X: Domain>(f: fn(X) -> f32, over: X::Box) -> Interval {}

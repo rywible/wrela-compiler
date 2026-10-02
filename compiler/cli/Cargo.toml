@@ -1,0 +1,20 @@
+[package]
+name = "wrela"
+description = "The wrela command: check, build and fmt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "wrela"
+path = "src/main.rs"
+
+[dependencies]
+wrela-diag.workspace = true
+wrela-syntax.workspace = true
+wrela-driver.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

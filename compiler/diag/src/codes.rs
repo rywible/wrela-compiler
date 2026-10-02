@@ -116,12 +116,12 @@ codes! {
     E0318 = "E0318", "a recursive type";
     E0319 = "E0319", "an invalid conversion";
     E0320 = "E0320", "a pattern that doesn't match the type";
-    E0321 = "E0321", "an unreachable match arm";
     E0322 = "E0322", "a wrong number of generic arguments";
     E0323 = "E0323", "a vector constructor with the wrong components";
     E0324 = "E0324", "a struct default that isn't a constant";
     E0325 = "E0325", "an array length that isn't a constant";
     E0326 = "E0326", "a CPU-only type in GPU code";
+    E0327 = "E0327", "a run type `[T]` outside a parameter";
 
     // ---- E04xx: traits and generics --------------------------------------------------------
     E0400 = "E0400", "a type that doesn't implement a trait";
