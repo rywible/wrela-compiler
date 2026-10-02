@@ -1304,6 +1304,7 @@ impl<'c, 'a> Fl<'c, 'a> {
     pub fn call(&mut self, c: &thir::Call, e: &thir::Expr) -> Option<ir::ValueId> {
         let span = e.span;
         match &c.callee {
+            Callee::Builtin(BuiltinFn::Len) => self.len(&c.args[0], e),
             Callee::Builtin(b) => {
                 let args: Vec<ir::ValueId> = c.args.iter().filter_map(|a| self.expr(a)).collect();
                 let ty = self.ty(e.ty, span)?;
@@ -1517,6 +1518,24 @@ impl<'c, 'a> Fl<'c, 'a> {
 
     // ---- built-ins -------------------------------------------------------------------------
 
+    /// `xs.len()`: an array's length is its type's; a run's is in the run (CPU) or the buffer's
+    /// (GPU).
+    fn len(&mut self, xs: &thir::Expr, e: &thir::Expr) -> Option<ir::ValueId> {
+        let u = self.mb.m.types.u32();
+        let t = self.concrete(xs.ty);
+        if let TyKind::Array(_, n) = self.types().kind(t) {
+            let n = *n;
+            return Some(self.value(u, ir::Expr::Const(ir::Const::U32(n))));
+        }
+        if self.is_gpu() {
+            let p = self.place(xs)?;
+            return Some(self.value(u, ir::Expr::ArrayLength(p)));
+        }
+        let _ = e;
+        let run = self.expr(xs)?;
+        Some(self.value(u, ir::Expr::Extract(run, 1)))
+    }
+
     fn builtin(
         &mut self,
         b: BuiltinFn,
@@ -1598,6 +1617,7 @@ impl<'c, 'a> Fl<'c, 'a> {
                     self.value(ty, ir::Expr::Binary(ir::BinOp::WrappingMul, args[0], args[1])),
                 );
             }
+            BuiltinFn::Len => unreachable!("`len` is lowered by `Fl::len`"),
         };
         if matches!(ib, I::Dpdx | I::Dpdy | I::Fwidth) {
             crate::gpu::check_derivative(self, span);

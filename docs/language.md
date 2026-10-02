@@ -69,6 +69,8 @@ let total = base +                      // a continued line ends with the operat
 
 **Keywords** are listed in `spec/lexical.md` (L11), including those reserved for later tiers.
 
+**Control flow (T0)** is expressions and statements in the Rust family: `if`/`else` and `match` are expressions; `for i in 0..n` (and `0..=n`) counts over integers, `for x in xs` walks an array or a run, and `_` names an unused loop variable; `while`, `loop`, `break`, `continue` and `return` work as usual. A block's value is its last line when that's an expression.
+
 ---
 
 ## 3. Items
@@ -113,7 +115,18 @@ Enums are sum types with payloads, matched with `match`, which must be exhaustiv
 pub enum Edit: Copy + Clone {
     Dig { at: vec3, radius: f32 },
     Fill { at: vec3, radius: f32 },
+    Clear,
 }
+
+fn reach(e: Edit) -> f32 {
+    match e {
+        Edit::Dig { radius, .. } => radius,
+        Edit::Fill { at, radius } => radius + length(at),
+        Edit::Clear => 0.0,
+    }
+}
+
+let e = Edit::Dig { at: vec3(), radius: 1.5 }
 ```
 
 ### Traits and impls
@@ -152,8 +165,8 @@ use std::gpu::dispatch
 | `u8`, `i8`, `u16`, `i16` | CPU only in tier 0; packed in GPU storage later | T0 | D-074 |
 | `f16` | Explicit lossy type | T1 | D-049 |
 | `vec2`, `vec3`, `vec4`, `mat2`, `mat3`, `mat4` | f32 vectors and square matrices. Vectors generic over a unit (`vec3<m>`, §5) and `Quat` are tier 1. | T0 | D-076 |
-| `[T; N]` | Fixed-size array | T0 | |
-| `[T]`, `mut [T]` | A contiguous run, borrowed or mutable; a parameter's type only | T0 | §6.2 |
+| `[T; N]` | Fixed-size array; `[x; N]` repeats a `Copy` value | T0 | |
+| `[T]`, `mut [T]` | A contiguous run, borrowed or mutable; a parameter's type only. An array passes for a run. `xs.len()` is a run's or an array's length, a `u32`. | T0 | §6.2 |
 | `(A, B)` | Tuple | T0 | |
 | `Option<T>` | An ordinary enum in the prelude (`Some`, `None`); there's no null | T0 | §6.1 |
 | `Result<T, E>` and `?` | Recoverable errors | T1 | D-061, D-088 |
@@ -597,6 +610,8 @@ User-defined metadata, if it's ever needed, gets a different syntax, so `@` alwa
 
 **A value's bytes are a deterministic function of its fields** (zeroed padding, canonical NaNs). Equal values don't always have equal bytes: `-0.0 == 0.0` (D-074).
 
+**Built-in functions (T0)** are in scope everywhere, on CPU and GPU alike, and apply per component to vectors: `sin cos tan asin acos atan atan2 exp exp2 log log2 pow sqrt inverse_sqrt floor ceil round trunc fract abs sign min max clamp saturate mix step smoothstep`, `length distance dot cross normalize` for vectors, `select(if_false, if_true, cond)`, and `bitcast_u32 bitcast_i32 bitcast_f32` (`bitcast_u64`, `bitcast_f64` on the CPU). `dpdx`, `dpdy` and `fwidth` are for fragment shaders. Integers have the methods `wrapping_add`, `wrapping_sub` and `wrapping_mul`. Conversions are calls of the type: `f32(n)`, `u32(x)`, `vec3(x)` (all components x), `vec3(y: 1.0)` (the rest zero), `vec4(v3, 1.0)`. `std::math` has `PI` and `TAU`.
+
 **Evidence:** spike 01 hashed 1M evaluations of the grazer field, a mass integration and 10K raycasts, compiled from Rust with these rules. WASM in Chromium 152, in Chrome 154 and native aarch64 gave identical bits. That's Rust rather than wrela, on one machine.
 
 ---
@@ -640,6 +655,15 @@ The compiler derives these from any function that qualifies under the effect tab
 |---|---|---|---|
 | `gradient` | Forward-mode derivative | T0 | D-012 |
 | `interval` | A conservative range over a box | T0 | D-012, D-075 |
+
+```wrela
+use std::derive::{Interval, interval}
+
+pub fn range_over(lo: f32, hi: f32) -> vec2 {
+    let r = interval(|t: f32| sin(t) * t, Interval { lo, hi })   // r.lo <= sin(t) t <= r.hi
+    vec2(r.lo, r.hi)
+}
+```
 
 **In tier 0** they're `std::derive::{gradient, value_and_gradient, interval}`, over a closure or function of an `f32` or a float vector that returns an `f32`. `interval` takes the input's box type (`Interval`, `Box2`, `Box3`, `Box4`) and returns an `Interval`. `std::field::Surface` provides `gradient`, `sample` (distance and gradient) and `interval` for every surface. The compiler derives them from the function's body, and from every function it calls (`derive.gradient`, `derive.interval`):
 - **Gradients** are forward mode, one tangent per input component. They agree with central differences within 3.4e-4 relative, across the test corpus (compiler/tests/tests/derive.rs).
@@ -707,6 +731,26 @@ The sim/presentation split is an engine pattern built on this, not a language fe
 
 ### Fields are stdlib code
 
+- **A new primitive is a type that implements `Surface`.** It must be `Copy` and `GpuData` (it travels to the GPU as data), and the combinators and derived methods come with it:
+
+  ```wrela
+  use std::field::{Surface, sphere}
+
+  struct Cuboid: Copy + Clone + GpuData {
+      half: vec3,
+  }
+
+  impl Surface for Cuboid {
+      fn distance(self, p: vec3) -> f32 {
+          let q = abs(p) - self.half
+          length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0)
+      }
+  }
+
+  fn rounded() -> Surface {
+      Cuboid { half: vec3(0.5, 0.3, 0.2) }.smooth_union(sphere(0.4), k: 0.05)
+  }
+  ```
 - **Tier 0's field is `std::field::Surface`:** a signed distance (`distance(self, p: vec3) -> f32`), with `gradient`, `sample` and `interval` derived, primitives (`sphere`, `ellipsoid`, `round_cone`, `half_space`), combinators (`union`, `smooth_union`, `intersect`, `translate`, `displace`) and noise (`value_noise`, `fbm`). Kinds and channels below are tier 1.
 - **A field returns a distance plus channels** (D-002). Channel structs opt in to `Blend`, and each member's type decides how it blends: `Color` in linear space, `f32` linearly, `UnitVec3` renormalized, `Cat<T>` from the winner (D-026).
 - **Kinds are ordinary types** (D-056, D-077):

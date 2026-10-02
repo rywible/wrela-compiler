@@ -75,7 +75,7 @@ impl Verifier<'_> {
                 }
                 Vec::new()
             }
-            Expr::Load(p) | Expr::Run(p) | Expr::Addr(p) => {
+            Expr::Load(p) | Expr::Run(p) | Expr::Addr(p) | Expr::ArrayLength(p) => {
                 self.place(p)?;
                 Vec::new()
             }

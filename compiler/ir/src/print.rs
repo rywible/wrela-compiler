@@ -96,6 +96,7 @@ fn expr(m: &Module, e: &Expr) -> String {
         Expr::Const(c) => format!("{c:?}"),
         Expr::Zero(t) => format!("zero {}", m.types.display(*t)),
         Expr::Load(p) => format!("load {}", place(p)),
+        Expr::ArrayLength(p) => format!("array_length {}", place(p)),
         Expr::Unary(op, v) => format!("{op:?} v{}", v.0),
         Expr::Binary(op, a, b) => format!("{op:?} v{}, v{}", a.0, b.0),
         Expr::Call(f, args) => {

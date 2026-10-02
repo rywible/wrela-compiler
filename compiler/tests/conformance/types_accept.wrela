@@ -6,7 +6,7 @@ struct Herd {
 
 fn sum(xs: [f32]) -> f32 {
     var s = 0.0
-    for i in 0..3 {
+    for i in 0..xs.len() {
         s += xs[i]
     }
     s

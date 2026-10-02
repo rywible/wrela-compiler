@@ -46,7 +46,7 @@ fn map_place(p: &mut Place, v: &mut impl FnMut(ValueId) -> ValueId) {
 fn map_expr(e: &mut Expr, v: &mut impl FnMut(ValueId) -> ValueId) {
     match e {
         Expr::Const(_) | Expr::Zero(_) | Expr::EntryInput(_) | Expr::Param(_) => {}
-        Expr::Load(p) | Expr::Run(p) | Expr::Addr(p) => map_place(p, v),
+        Expr::Load(p) | Expr::Run(p) | Expr::Addr(p) | Expr::ArrayLength(p) => map_place(p, v),
         Expr::Unary(_, x)
         | Expr::Extract(x, _)
         | Expr::Splat(x, _)
@@ -83,7 +83,7 @@ fn each_place(b: &Block, f: &mut impl FnMut(&Place)) {
     for s in b {
         match s {
             Stmt::Let(_, e) | Stmt::Eval(e) => match e {
-                Expr::Load(p) | Expr::Run(p) | Expr::Addr(p) => f(p),
+                Expr::Load(p) | Expr::Run(p) | Expr::Addr(p) | Expr::ArrayLength(p) => f(p),
                 Expr::Call(_, args) => {
                     for a in args {
                         if let Arg::Place(p) = a {
@@ -367,7 +367,7 @@ impl Inliner<'_> {
     ) -> Result<Expr, String> {
         let mut e = e.clone();
         match &mut e {
-            Expr::Load(p) | Expr::Run(p) | Expr::Addr(p) => {
+            Expr::Load(p) | Expr::Run(p) | Expr::Addr(p) | Expr::ArrayLength(p) => {
                 *p = self.copy_place(p, args, values, locals)?;
             }
             Expr::Call(..) => return Err("internal: a call left in a flattened callee".into()),
@@ -623,7 +623,7 @@ fn compact_locals(f: &mut Function) {
         for s in b {
             match s {
                 Stmt::Let(_, e) | Stmt::Eval(e) => match e {
-                    Expr::Load(p) | Expr::Run(p) | Expr::Addr(p) => fix(p),
+                    Expr::Load(p) | Expr::Run(p) | Expr::Addr(p) | Expr::ArrayLength(p) => fix(p),
                     Expr::Call(_, args) => {
                         for a in args {
                             if let Arg::Place(p) = a {
@@ -653,7 +653,7 @@ fn compact_locals(f: &mut Function) {
 fn each_read_local(b: &Block, read: &mut HashSet<LocalId>) {
     for s in b {
         match s {
-            Stmt::Let(_, Expr::Load(p) | Expr::Run(p) | Expr::Addr(p)) => {
+            Stmt::Let(_, Expr::Load(p) | Expr::Run(p) | Expr::Addr(p) | Expr::ArrayLength(p)) => {
                 if let PlaceRoot::Local(l) = p.root {
                     read.insert(l);
                 }

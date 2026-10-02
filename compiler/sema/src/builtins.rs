@@ -105,6 +105,8 @@ pub enum BuiltinFn {
     WrappingAdd,
     WrappingSub,
     WrappingMul,
+    /// `xs.len()` of a run or an array: its element count, a `u32`.
+    Len,
 }
 
 impl BuiltinFn {
@@ -165,6 +167,7 @@ impl BuiltinFn {
             "wrapping_add" => Some(WrappingAdd),
             "wrapping_sub" => Some(WrappingSub),
             "wrapping_mul" => Some(WrappingMul),
+            "len" => Some(Len),
             "select" | "bitcast_u32" | "bitcast_i32" | "bitcast_f32" | "bitcast_u64"
             | "bitcast_f64" => None,
             _ => BuiltinFn::lookup(name),
@@ -217,6 +220,7 @@ impl BuiltinFn {
             Dpdy => "dpdy",
             Fwidth => "fwidth",
             WrappingAdd => "wrapping_add",
+            Len => "len",
             WrappingSub => "wrapping_sub",
             WrappingMul => "wrapping_mul",
         }
@@ -434,6 +438,13 @@ impl BuiltinFn {
                 }
                 Ok(types.f64)
             }
+            Len => match types.kind(args[0]) {
+                TyKind::Slice(_) | TyKind::Array(..) => Ok(types.u32),
+                _ => Err(format!(
+                    "`len` is a method of runs and arrays, not of `{}`",
+                    show(types, args[0])
+                )),
+            },
             WrappingAdd | WrappingSub | WrappingMul => {
                 let t = same(types, args)?;
                 if !types.is_int(t) {
@@ -473,5 +484,6 @@ pub fn wants_float(f: BuiltinFn) -> bool {
             | BuiltinFn::WrappingAdd
             | BuiltinFn::WrappingSub
             | BuiltinFn::WrappingMul
+            | BuiltinFn::Len
     )
 }

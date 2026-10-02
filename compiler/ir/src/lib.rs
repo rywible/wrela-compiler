@@ -268,6 +268,8 @@ pub enum Expr {
     /// A pointer to a place, as a value (CPU only: a projection to return).
     Addr(Place),
     Host(HostOp, Vec<ValueId>),
+    /// The element count of a storage buffer's runtime array (GPU only), a `u32`.
+    ArrayLength(Place),
     /// A GPU builtin input of the entry point (`@builtin(...)`), by index into the entry's
     /// inputs, as the std struct that holds it (`GlobalId`, `FragCoord`, ...).
     EntryInput(u32),

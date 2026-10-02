@@ -1,0 +1,28 @@
+// `len()` of runs and arrays (compiler/tests/tests/render.rs): on the CPU, and of a storage
+// buffer on the GPU.
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch, write}
+
+fn sum(xs: [f32]) -> f32 {
+    var s = 0.0
+    for i in 0..xs.len() {
+        s += xs[i]
+    }
+    s
+}
+
+pub fn lens() -> vec3 {
+    let a = [1.0, 2.0, 3.0, 4.0]
+    vec3(sum(a), f32(a.len()), 0.0)
+}
+
+@compute(64)
+fn count(input: [f32], out: mut Slots<u32>, id: GlobalId) {
+    out[id] = input.len() + id.x
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    let input: GpuBuffer<f32> = buffer(10)
+    write(input, 0, [1.0, 2.0, 3.0])
+    let out: GpuBuffer<u32> = buffer(64)
+    dispatch(count, groups: 1, input: input, out: out)
+}

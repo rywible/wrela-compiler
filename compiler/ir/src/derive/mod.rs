@@ -144,7 +144,7 @@ fn count_local_uses(b: &Block, uses: &mut [u32]) {
         for s in b {
             match s {
                 Stmt::Let(_, e) | Stmt::Eval(e) => match e {
-                    Expr::Load(p) | Expr::Run(p) | Expr::Addr(p) => place(p),
+                    Expr::Load(p) | Expr::Run(p) | Expr::Addr(p) | Expr::ArrayLength(p) => place(p),
                     Expr::Call(_, args) => {
                         for a in args {
                             if let Arg::Place(p) = a {
@@ -294,7 +294,9 @@ fn expr_active(
     Ok(match e {
         Expr::Const(_) | Expr::Zero(_) | Expr::EntryInput(_) => false,
         Expr::Param(i) => a.params[*i as usize],
-        Expr::Load(p) | Expr::Run(p) | Expr::Addr(p) => place_root_active(a, p),
+        Expr::Load(p) | Expr::Run(p) | Expr::Addr(p) | Expr::ArrayLength(p) => {
+            place_root_active(a, p)
+        }
         Expr::Unary(_, x)
         | Expr::Extract(x, _)
         | Expr::Splat(x, _)

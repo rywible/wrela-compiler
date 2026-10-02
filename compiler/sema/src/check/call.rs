@@ -1142,8 +1142,12 @@ impl<'p> Checker<'p> {
                 self.p.types.kind(rt),
                 TyKind::Int(_) | TyKind::Float(_) | TyKind::Vec(_) | TyKind::Mat(_)
             );
-            if builtin_ok && let Some(b) = BuiltinFn::lookup_method(&name.name) {
-                return Some(Pick::Builtin(b));
+            let sequence = matches!(self.p.types.kind(rt), TyKind::Slice(_) | TyKind::Array(..));
+            match BuiltinFn::lookup_method(&name.name) {
+                Some(BuiltinFn::Len) if sequence => return Some(Pick::Builtin(BuiltinFn::Len)),
+                Some(BuiltinFn::Len) => {}
+                Some(b) if builtin_ok => return Some(Pick::Builtin(b)),
+                _ => {}
             }
             if name.name == "clone" {
                 return Some(Pick::Clone);

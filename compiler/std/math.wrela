@@ -13,7 +13,13 @@ const INV_PIO2: f64 = 0.636619772367581382433
 // pi/2 split in two: the first 33 bits, then the rest.
 const PIO2_HI: f64 = 1.57079631090164184570
 const PIO2_LO: f64 = 0.0000000158932547735281966916
-const PI: f64 = 3.14159265358979311600
+const PI_F64: f64 = 3.14159265358979311600
+
+/// π, to f32's precision.
+pub const PI: f32 = 3.14159265
+
+/// 2π, to f32's precision.
+pub const TAU: f32 = 6.28318531
 const LN2: f64 = 0.693147180559945286227
 const LOG2E: f64 = 1.44269504088896338700
 const SQRT2: f64 = 1.41421356237309514547
@@ -322,22 +328,22 @@ fn atan2_f64(y: f64, x: f64) -> f64 {
     let big = 1.0e300
     if y == 0.0 {
         if sign_bit(x) {
-            return if sign_bit(y) { -PI } else { PI }
+            return if sign_bit(y) { -PI_F64 } else { PI_F64 }
         }
         return y
     }
     if x == 0.0 {
-        return if y > 0.0 { PI * 0.5 } else { -PI * 0.5 }
+        return if y > 0.0 { PI_F64 * 0.5 } else { -PI_F64 * 0.5 }
     }
     if abs(x) > big && abs(y) > big {
-        let q = if x > 0.0 { PI * 0.25 } else { PI * 0.75 }
+        let q = if x > 0.0 { PI_F64 * 0.25 } else { PI_F64 * 0.75 }
         return if y > 0.0 { q } else { -q }
     }
     let t = atan_f64(abs(y / x))
     let r = if x > 0.0 {
         t
     } else {
-        PI - t
+        PI_F64 - t
     }
     if y < 0.0 {
         -r

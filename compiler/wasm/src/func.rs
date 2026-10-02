@@ -738,6 +738,9 @@ impl<'m> Fe<'m> {
             ir::Expr::Builtin(b, args) => crate::func::builtin(self, v, *b, args)?,
             ir::Expr::Host(op, args) => crate::func::host(self, op, args, Some(v))?,
             ir::Expr::EntryInput(_) => return Err("internal: a GPU entry input in CPU code".into()),
+            ir::Expr::ArrayLength(_) => {
+                return Err("internal: a storage buffer's length in CPU code".into());
+            }
         }
         Ok(())
     }

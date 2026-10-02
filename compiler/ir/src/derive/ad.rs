@@ -525,7 +525,11 @@ impl Ad<'_> {
         }
         let t = |s: &Self, x: &ValueId| s.t(*x, k);
         Ok(match e {
-            Expr::Const(_) | Expr::Zero(_) | Expr::EntryInput(_) | Expr::Bitcast(..) => None,
+            Expr::Const(_)
+            | Expr::Zero(_)
+            | Expr::EntryInput(_)
+            | Expr::Bitcast(..)
+            | Expr::ArrayLength(_) => None,
             Expr::Param(i) => {
                 self.tparam[*i as usize].get(k).copied().map(|p| self.emit(out, ty, Expr::Param(p)))
             }

@@ -763,6 +763,10 @@ impl<'a, 'm> Fb<'a, 'm> {
                 let pointer = self.place(p, out)?;
                 self.expr(Expression::Load { pointer }, out)
             }
+            ir::Expr::ArrayLength(p) => {
+                let pointer = self.place(p, out)?;
+                self.expr(Expression::ArrayLength(pointer), out)
+            }
             ir::Expr::Call(f, args) => {
                 let callee =
                     *self.cx.functions.get(f).ok_or("internal: a call to a missing function")?;
