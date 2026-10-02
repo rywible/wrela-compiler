@@ -193,4 +193,13 @@ impl TyNames for Program {
     fn trait_name(&self, t: TraitId) -> String {
         self.traits[t.index()].name.clone()
     }
+    fn opaque_name(&self, f: FnId) -> String {
+        match &self.fns[f.index()].opaque {
+            Some(traits) if !traits.is_empty() => {
+                let names: Vec<String> = traits.iter().map(|r| self.display_trait_ref(r)).collect();
+                format!("impl {}", names.join(" + "))
+            }
+            _ => format!("the type `{}` returns", self.fns[f.index()].name),
+        }
+    }
 }

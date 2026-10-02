@@ -1,6 +1,14 @@
 # wrela: the language
 
-*The one prose reference for the language, as it stands. The syntax is imagined until the parser exists (M1). As features are built, their rules move into executable form (the grammar in `spec/`, the conformance tests, `wrela explain`), and the prose here shrinks to a pointer. Decision IDs (D-NNN), sketches and spikes refer to the design record in the git tag `design-archive-2026-10`.*
+*The one prose reference for the language, as it stands. Decision IDs (D-NNN), sketches and spikes refer to the design record in the git tag `design-archive-2026-10`.*
+
+**Tier 0 is implemented, and these hold it** (milestone 1):
+- **Syntax:** `spec/lexical.md` and `spec/grammar.ebnf`, normative. An oracle parser generated from the grammar is checked against the compiler's parser (`compiler/grammar`).
+- **Rules:** the conformance suite, `compiler/tests/conformance`. Each tier-0 rule below has a rule ID there (for example `mem.take`) with a program it accepts and one it rejects with the rule's diagnostic code.
+- **Diagnostics:** `compiler/tests/diagnostics`, the common mistakes with their messages, spans and fixes.
+- **The derived interpretations, numerics and the hosts:** the tests in `compiler/tests/tests` and `runtime/`.
+
+Where this prose and those disagree, they win, and the prose is a bug. Syntax beyond tier 0 is still imagined.
 
 ## How to read this
 
@@ -40,10 +48,11 @@ The compiler knows about exactly these execution targets:
 
 | Rule | Tier | Decisions |
 |---|---|---|
-| A newline ends a statement, unless it's inside open brackets or the next line starts with `.` | T0 | D-038, D-079 |
+| A newline ends a statement, unless it's inside open brackets or the next line starts with `.` (`lex.newline`) | T0 | D-038, D-079 |
 | A binary operator that continues a line must *trail* the line; a leading `-` or `\|` starts a new expression | T0 | D-079 |
 | `;` may separate statements on one line; the formatter normalizes | T0 | D-038 |
-| `//` comments, `///` doc comments | T0 | Placeholder (sketches) |
+| `else` goes on the line of the `}` before it: a line break after `}` ends the `if` (`lex.else`) | T0 | D-079 |
+| `//` comments, `///` doc comments; no block comments (`lex.comments`) | T0 | spec/lexical.md |
 | Files use the `.wrela` extension | T0 | D-040 |
 | Number literals have no type suffixes (no `1.0f32`) | T0 | D-025 |
 | A unit can follow a number as a suffix: `15cm` means `15 * cm` | T1 | D-025, D-076 |
@@ -58,7 +67,7 @@ let total = base +                      // a continued line ends with the operat
     extra
 ```
 
-**Keywords:** the sketches use `fn let var mut take borrow struct enum trait impl for in if else match return pub use const self Self true false unsafe`, plus the usual `while loop break continue`. **Open:** this is an inventory, not a decision.
+**Keywords** are listed in `spec/lexical.md` (L11), including those reserved for later tiers.
 
 ---
 
@@ -66,54 +75,56 @@ let total = base +                      // a continued line ends with the operat
 
 ### Functions (T0)
 
-- **Named arguments are optional, Kotlin-style** (D-039). Positional arguments come first, and once an argument is named, the rest must be named too. Parameters may have defaults. A lint suggests names for bare literals such as `6cm` or `true`.
+- **Named arguments are optional, Kotlin-style** (D-039). Positional arguments come first, and once an argument is named, the rest must be named too. Parameters may have defaults, which are literal values in tier 0 (`fn.named-args`, `fn.defaults`). A lint suggesting names for bare literals such as `6cm` or `true` isn't built yet.
 - **Parameters have modes** (§6): `x: T` (borrow), `x: mut T`, `x: take T`.
 - **Properties are attributes** (§9): `@deterministic fn step(...)`.
-- **Return-position `Field<K, C>`** (or any trait-shaped type) names one concrete, inferred type, like Rust's `impl Trait` (D-070).
+- **A trait in return position** (`-> Surface`; `Field<K, C>` in tier 1) names one concrete, inferred type, like Rust's `impl Trait` (D-070, `fn.return-trait`).
 
 ```wrela
-fn leg_segment(len: f32<m>, r_top: f32<m>, r_bottom: f32<m> = 6cm) -> Field<Exact, Tissue> {
-    round_cone(vec3(), vec3(y: -len), r_top, r_bottom).with(HIDE)
+fn leg_segment(len: f32, r_top: f32, r_bottom: f32 = 0.06) -> Surface {
+    round_cone(vec3(), vec3(y: -len), r_top, r_bottom)
 }
 
-leg_segment(45cm, r_top: 9cm)          // positional first, then named
+leg_segment(0.45, r_top: 0.09)         // positional first, then named
 ```
+
+(Sketch 01 writes this with units, `f32<m>` and `6cm`, and a field type with kinds and channels, `Field<Exact, Tissue>`: both tier 1.)
 
 ### Structs (T0)
 
-- **Fields may have defaults**, which must be evaluable at compile time (D-048). A struct literal may omit defaulted fields.
-- **A struct opts in to traits in its declaration:** `struct Tissue: Blend { ... }` (D-026, D-078).
-- **`..base`** fills the remaining fields from another value. Placeholder: sketch 01 uses it; no decision covers it.
+- **Fields may have defaults**, which must be evaluable at compile time (D-048); in tier 0, literal values. A struct literal may omit defaulted fields (`struct.defaults`).
+- **A struct opts in to traits in its declaration:** `struct Tissue: Blend { ... }` (D-026, D-078). In tier 0 these are `Copy`, `Clone` and `GpuData`, structural: every field must have the trait (`struct.opt-in`).
+- **`..base`** fills the remaining fields from another value of the same type (`struct.base`). Sketch 01 uses it; no decision covers it.
 
 ```wrela
-pub struct CreatureLook {
-    pub surface: Mesh   = Mesh { tolerance: 2mm },
-    pub shadow:  Shadow = Shadow::Map { resolution: 1024 },
+pub struct Look {
+    pub tolerance: f32 = 0.002,
+    pub resolution: u32 = 1024,
 }
 
-const GRAZER_LOOK = CreatureLook { surface: Mesh { tolerance: 1mm } }   // shadow keeps its default
+const FINE: Look = Look { tolerance: 0.001 }   // resolution keeps its default
 ```
 
 ### Enums (T0)
 
-Enums are sum types with payloads, matched with `match`. They're how structure is chosen at runtime from a known, finite set: every case is compiled, with a uniform branch (D-070).
+Enums are sum types with payloads, matched with `match`, which must be exhaustive (`enum.match`). They're how structure is chosen at runtime from a known, finite set: every case is compiled, with a uniform branch (D-070).
 
 ```wrela
-pub enum Edit: SimState + StateHash + Serialize + Copy {
-    Dig  { at: vec3<m>, radius: f32<m> },
-    Fill { at: vec3<m>, radius: f32<m> },
+pub enum Edit: Copy + Clone {
+    Dig { at: vec3, radius: f32 },
+    Fill { at: vec3, radius: f32 },
 }
 ```
 
 ### Traits and impls
 
-- **Traits have associated types and default methods** (D-071). T0.
-- **Coherence follows Rust's orphan rule:** an `impl` lives in the crate of the trait or of the type (D-071). T0.
+- **Traits have associated types and default methods** (D-071). T0 (`trait.items`).
+- **Coherence follows Rust's orphan rule:** an `impl` lives in the package of the trait or of the type; std is another package (D-071). T0 (`trait.orphan`). `Copy`, `Clone` and `GpuData` aren't implemented with an `impl`; a type opts in to them in its declaration.
 - **Structural defaults:** a trait can provide an implementation written in ordinary wrela that runs at compile time over a type's fields (D-060). That's how `Copy`, `Clone`, `StateHash`, `Serialize` and engine traits like `SimState` get implemented without anyone writing them by hand. T1. **Placeholder syntax:** `@comptime default for<T: struct> { ... }` (sketch 03 §5).
 
 ### Constants (T0 for literal values; T1 when the initializer must be evaluated)
 
-`const` items are evaluated at compile time (D-073). A `const` whose initializer calls functions needs the compile-time interpreter, which is tier 1 (D-088). Staging work earlier is done by writing a `const`, never by relying on the optimizer (D-072).
+`const` items are evaluated at compile time (D-073). In tier 0 a constant's value is a literal value: literals, vector constructors, array and struct literals, and other constants (`const.literal`). A `const` whose initializer calls functions needs the compile-time interpreter, which is tier 1 (D-088). Staging work earlier is done by writing a `const`, never by relying on the optimizer (D-072).
 
 ```wrela
 const HOOF_MODES = modal_modes(hoof())     // an eigenvalue solve, run by the compiler
@@ -121,7 +132,7 @@ const HOOF_MODES = modal_modes(hoof())     // an eigenvalue solve, run by the co
 
 ### Modules and packages
 
-**Modules (T0):** a program is one package. A file is a module and a directory is a module tree: `shapes/blob.wrela` is `shapes::blob`. `use` imports names; `pub` makes an item visible outside its file. The stdlib's root is `std::` (D-081).
+**Modules (T0):** a program is one package, a directory with a `main.wrela`. A file is a module and a directory is a module tree: `shapes/blob.wrela` is `shapes::blob`. `use` imports names; `pub` makes an item visible outside its file. A module has one namespace for all its items. The stdlib's root is `std::` (D-081). A symbolic link to a directory is refused rather than followed (E0208), until packages decide what a module tree is (`mod.use`, `mod.names`).
 
 ```wrela
 use shapes::blob::blob      // from shapes/blob.wrela
@@ -138,13 +149,13 @@ use std::gpu::dispatch
 |---|---|---|---|
 | `bool`, `i32`, `u32`, `f32` | Scalars, on CPU and GPU | T0 | D-074 |
 | `f64`, `i64`, `u64` | CPU only. GPU code is type-checked against what WGSL has. | T0 | D-074 |
-| `u8`, `i8`, `u16`, `i16` | CPU; on the GPU only packed in storage | T0 | D-074 |
+| `u8`, `i8`, `u16`, `i16` | CPU only in tier 0; packed in GPU storage later | T0 | D-074 |
 | `f16` | Explicit lossy type | T1 | D-049 |
-| `vec2<U>`, `vec3<U>`, `vec4<U>`, `mat3`, `mat4`, `Quat` | Vectors are generic over a unit (§5); `vec3` alone is unitless | T0 | D-076 |
+| `vec2`, `vec3`, `vec4`, `mat2`, `mat3`, `mat4` | f32 vectors and square matrices. Vectors generic over a unit (`vec3<m>`, §5) and `Quat` are tier 1. | T0 | D-076 |
 | `[T; N]` | Fixed-size array | T0 | |
-| `[T]`, `mut [T]` | A contiguous run, borrowed or mutable | T0 | §6.2 |
+| `[T]`, `mut [T]` | A contiguous run, borrowed or mutable; a parameter's type only | T0 | §6.2 |
 | `(A, B)` | Tuple | T0 | |
-| `Option<T>` | An ordinary enum; there's no null | T0 | §6.1 |
+| `Option<T>` | An ordinary enum in the prelude (`Some`, `None`); there's no null | T0 | §6.1 |
 | `Result<T, E>` and `?` | Recoverable errors | T1 | D-061, D-088 |
 | `String`, `Text`, `str` | Heap-owned UTF-8, region-resident text, a borrowed run | T1 | D-087 |
 | `borrow T`, `mut T` | Projection types: non-escaping. Returning them is T0; using them as type arguments (`Option<borrow T>`) comes with views and iterators in T1. | T0 / T1 | D-064, D-084, D-088 |
@@ -154,6 +165,8 @@ use std::gpu::dispatch
 | `dyn Trait` | CPU only, never in GPU or `@audio` code | T2 | D-071 |
 
 **`&T` doesn't exist** (D-064). There's no reference type to store, so there are no lifetimes.
+
+Implicit conversions don't exist either: an integer literal can be any numeric type, but a value converts only with a call such as `f32(n)` or `u32(i)` (`ty.scalars`). Units, strings, `?`, `unsafe` and `dyn` are rejected with a diagnostic saying which tier brings them (`ty.tiers`).
 
 ---
 
@@ -203,6 +216,7 @@ let wrong = density + 2m        // error: can't add kg/m³ to m
 | **Long-lived relationships are handles into arenas,** never pointers. | T1 |
 | **Regions:** `Region<T>` holds one root value in chunks. Its containers store offsets. Region-bound values (`Relocatable` but not `Plain`) stay in their region. | T1 |
 | **GPU layout:** a declared `GpuData` trait fixes a type's layout to WGSL rules everywhere. This is how tier 0's lossless GPU layout is expressed. | T0 |
+| **Rule IDs:** `mem.copy`, `mem.take`, `mem.clone`, `mem.modes`, `mem.receivers`, `mem.bindings`, `mem.projections`, `mem.exclusivity`, `mem.loops`, `mem.no-globals`, `mem.closures` in the conformance suite. | |
 | **Byte-level data:** the auto traits `Plain` and `Relocatable`. | T1 |
 | **Snapshots:** copy-on-first-write chunk checkpoints are stdlib operations on regions, not language features. | T2 |
 | **Destructors:** deterministic, at end of scope in reverse order; user `Drop` for types that aren't region-bound (D-087). | T1 |
@@ -329,7 +343,7 @@ This is what removed most of the cost of second-class references (D-058). Views 
 
 ### 6.7 Closures
 
-- **By default, a closure parameter is non-escaping.** The callee must finish with it before it returns. These closures can capture projections, both `borrow` and `mut`, and that access counts as live for the duration of the call.
+- **By default, a closure parameter is non-escaping.** The callee must finish with it before it returns. These closures can capture projections, both `borrow` and `mut`, and that access counts as live for the duration of the call. A function type (`fn(f32) -> f32`) is a parameter's type only, so a closure can't be returned or stored (`mem.closures`). In tier 0 a closure can't capture another closure.
 - **An escaping closure is marked `@escaping`.** It can be stored or spawned, and it captures only owned values and handles. Moving a named place into one is written `take`.
 
 ```wrela
@@ -432,13 +446,12 @@ Bulk data belongs in containers, which mark one element's chunk at a time. A hug
 - **Modes map onto WebGPU bindings:** `borrow` becomes a read-only storage or uniform binding, and `mut` becomes a `read_write` storage binding.
 - **WebGPU forbids aliasing writable bindings** within a dispatch, which matches exclusivity *per binding*.
 - **That doesn't cover a single dispatch.** Every invocation holds the same `mut` binding at once, so exclusivity says nothing about how invocations share it (D-084). A kernel's `mut` parameters therefore accept only invocation-safe types:
-  - atomics
-  - `Append<T>`
-  - `Slots<T>`, where each invocation writes only the slot keyed by its own ID
+  - `Slots<T>`, where each invocation writes only the slot keyed by its own ID (tier 0)
+  - atomics and `Append<T>` (milestone 2, with workgroup-shared memory)
 
-  A plain `mut` array parameter is rejected.
+  A plain `mut` array parameter is rejected (E0601, `gpu.kernel-mut`).
 - **Data that crosses to the GPU must be `Plain` and `GpuData`.**
-- **GPU-resident data is reached through handles** (D-102). `GpuBuffer<T>` is `Plain` and `Copy`, like `Handle<T>`, and can't be read through on the CPU. Uploads are explicit copies; readback is asynchronous and `nondet`. There's no zero-copy path between WASM memory and the GPU (vision.md).
+- **GPU-resident data is reached through handles** (D-102). `GpuBuffer<T>` is `Copy`, like `Handle<T>`, and can't be read through on the CPU. Uploads are explicit copies; readback is asynchronous and `nondet` (tier 2). There's no zero-copy path between WASM memory and the GPU (vision.md).
 - **`@audio` code** borrows preallocated `Plain` buffers and never allocates.
 
 ### 6.14 The unsafe core
@@ -495,17 +508,19 @@ error: `edits` is region-bound and can't be owned outside its region
 | **Auto traits:** `Plain`, `Relocatable`, `Sendable`, `Shareable`. A type gets one when all its fields have it, and can opt out. | T1 | D-054, D-078 |
 | **Declared traits with a structural check:** a library trait can require that every field also implements it (`SimState` is the engine's example). | T1 | D-078, D-060 |
 | **Library-authored diagnostics:** `@diagnostic(...)` attaches a message to a trait or type, for when a bound isn't met. | T1 | D-055 |
-| **Effects are checked per instantiation.** | T0 | D-071 |
+| **Effects are checked per instantiation**, through every call: an error shows the chain (`fill` → `scratch`). | T0 | D-071 |
 
 ```wrela
-/// Generic over any field with this shape; monomorphized per concrete field type.
+/// Generic over any field; monomorphized per concrete field type.
 @compute(64)
-fn cull_blocks<F: Surface>(field: F, grid: Grid, live: mut Append<LiveBlock>, id: GlobalId) {
-    let block = grid.block(id.x)
-    if !field.interval(block.bounds).contains(0m) { return }   // `interval` is derived (§13)
-    live.push(LiveBlock { block })
+fn cull<F: Surface>(field: F, grid: Grid, live: mut Slots<u32>, id: GlobalId) {
+    let b = grid.block(id.x)
+    let r = field.interval(Box3 { lo: b.lo, hi: b.hi })   // `interval` is derived (§13)
+    live[id] = if r.contains(0.0) { 1 } else { 0 }
 }
 ```
+
+(compiler/tests/fields/main.wrela has this kernel, culling the grazer's blocks.)
 
 ---
 
@@ -517,14 +532,14 @@ fn cull_blocks<F: Surface>(field: F, grid: Grid, live: mut Append<LiveBlock>, id
 
 | Context | Forbidden | Tier |
 |---|---|---|
-| GPU entry points (`@compute`, `@vertex`, `@fragment`) | `alloc`, `io`, `nondet`, `recursion`, `dyn`, `host`, `panic` | T0 |
+| GPU entry points (`@compute`, `@vertex`, `@fragment`) | `alloc`, `io`, `nondet`, `recursion`, `dyn`, `host`, `panic`. In tier 0 the language has no allocation, I/O, randomness or `dyn`, so `host` (recording GPU work) and recursion are what's checked (E0600, `eff.gpu`). | T0 |
 | `@audio` | `alloc`, `io`, `recursion`, `dyn`, `host` | T2 |
 | `@deterministic` | `nondet`, `host` (except declared deterministic host calls), `recursion` (D-094) | T1 |
 | Compile-time evaluation | `io` (except declared embeds), `host`, `nondet` | T1 |
-| Derived interpretations (gradient, interval) | `alloc`, `io`, `nondet`, `host` | T0 |
+| Derived interpretations (gradient, interval) | `alloc`, `io`, `nondet`, `host` (E0700, `eff.derived`) | T0 |
 
 - **Inside a package, effects are inferred** (D-010, D-030). Annotations only assert. Errors show the call chain: `extract → foo → bar allocates at line 42`.
-- **Exported functions state their effects** (D-030). `wrela fix` writes the annotations, and queries show what was inferred.
+- **Exported functions state their effects** (D-030), at the package boundary once packages exist; `wrela fix` will write the annotations, and queries show what was inferred. Neither is in tier 0.
 - **Public higher-order functions inherit effects from their closure arguments** by default (D-030). `map` is GPU-safe whenever its closure is.
 - **Staging is guaranteed or rejected, never best-effort** (D-072). The optimizer may hoist work, but code must not rely on it. Work that must happen earlier is written earlier, as a `const` or a parameter.
 
@@ -547,7 +562,7 @@ fn cull_blocks<F: Surface>(field: F, grid: Grid, live: mut Append<LiveBlock>, id
 | `@diagnostic(...)` | traits, types | A library-authored error message; not part of the type (D-055, D-081) | T1 |
 | `@audio` | functions | Audio-worklet entry point (D-072) | T2 |
 
-User-defined metadata, if it's ever needed, gets a different syntax, so `@` always means semantics (D-037).
+User-defined metadata, if it's ever needed, gets a different syntax, so `@` always means semantics (D-037). An unknown attribute is E0204; a tier-1 one is E0903 (`attr.closed`).
 
 ---
 
@@ -565,7 +580,7 @@ User-defined metadata, if it's ever needed, gets a different syntax, so `@` alwa
 
 **CPU code always uses strict IEEE floats** (D-074). There's no fast-math mode, no reassociation, no implicit FMA contraction and no relaxed SIMD. Transcendentals come from the stdlib, compiled to WASM, never from the host (D-015).
 
-**Tiers:** tier 0 emits WASM, whose float arithmetic is already IEEE-strict apart from NaN bits. The numeric rules (the table below, NaN canonicalization, stdlib transcendentals) are tier 1 with `@deterministic` (D-088).
+**Tiers:** tier 0 emits WASM, whose float arithmetic is already IEEE-strict apart from NaN bits, and the integer rules in the table below. Its transcendentals are already the stdlib's (`std::math`, computed in f64 and rounded once: within an ulp). NaN canonicalization is tier 1, with `@deterministic` (D-088). Tier 0's checks: the emitted WASM has no relaxed SIMD (a pass over every module), and a program's state hash is the same in Chrome and in the native host.
 
 **GPU code follows WGSL semantics,** and its results are presentation-only: GPU results can't reach `@deterministic` code (§14).
 
@@ -573,9 +588,11 @@ User-defined metadata, if it's ever needed, gets a different syntax, so `@` alwa
 
 | Case | CPU | GPU |
 |---|---|---|
-| Integer overflow | Traps in every build | Wraps |
-| Integer divide by zero, out-of-range float → int | Traps | WGSL-defined values |
-| Out-of-bounds index | Traps | Debug builds set an error flag; release builds clamp |
+| Integer overflow | Traps in every build. `wrapping_add`, `wrapping_sub` and `wrapping_mul` wrap. | Wraps |
+| Integer divide by zero, `MIN / -1`, a shift by the width or more | Traps | WGSL-defined values |
+| Float → int | Truncates; out of range or NaN traps | WGSL-defined values |
+| Int → int | Keeps the low bits (`u32(-1)` is 4294967295) | Keeps the low bits |
+| Out-of-bounds index | Traps | WebGPU's robust access (a value from inside the buffer, or zero); a debug flag is later |
 | NaN | Canonicalized wherever observable in `@deterministic` code: bit casts, sign tests, stores into `Plain` or `Relocatable` memory, hashing. Debug builds trap on NaN creation. | WGSL |
 
 **A value's bytes are a deterministic function of its fields** (zeroed padding, canonical NaNs). Equal values don't always have equal bytes: `-0.0 == 0.0` (D-074).
@@ -589,26 +606,29 @@ User-defined metadata, if it's ever needed, gets a different syntax, so `@` alwa
 | Rule | Tier | Decisions |
 |---|---|---|
 | **Entry points:** `@compute(...)`, `@vertex`, `@fragment` | T0 | D-010, D-035 |
-| **Builtins are typed:** `GlobalId`, `WorkgroupId`, `LocalId`, `ClipPosition`, and `Flat<T>` for values that aren't interpolated. The docs map them to WGSL's `@builtin(...)`. | T0 | D-046 |
-| **Closures and iterators are allowed when statically resolved:** monomorphized and inlined, fixed-size iterators unrolled. Diagnostics flag unrolling or inlining blowups. | T0 (closures) / T1 (iterators) | D-047, D-088 |
+| **Builtins are typed:** `GlobalId`, `WorkgroupId`, `LocalId` (compute), `VertexIndex`, `InstanceIndex` (vertex), `FragCoord` (fragment), `ClipPosition` (a vertex shader's output), and `Flat<T>` for values that aren't interpolated, in `std::gpu`. A stage takes only its own (E0602). | T0 | D-046 |
+| **Closures and iterators are allowed when statically resolved:** monomorphized and inlined, fixed-size iterators unrolled. In tier 0 every call in GPU code is inlined, so a kernel reads its uniform data in place; diagnostics for unrolling or inlining blowups are later. | T0 (closures) / T1 (iterators) | D-047, D-088 |
 | **Layout is automatic but lossless.** `GpuData` fixes a type's layout to WGSL rules everywhere (T0); lossy encodings are explicit types (T1). Nobody pads by hand. | T0 / T1 | D-049, D-084 |
-| **A kernel's `mut` parameters must be safe to share across invocations:** atomics, `Append<T>`, `Slots<T>` (each invocation writes only its own slot), `AtomicMap`. A plain `mut [u32]` is rejected. | T0 | D-084 |
+| **A kernel's `mut` parameters must be safe to share across invocations:** `Slots<T>` (each invocation writes only its own slot) in tier 0; atomics, `Append<T>` and `AtomicMap` in milestone 2. A plain `mut [u32]` is rejected. | T0 / M2 | D-084 |
+| **Entry-point signatures:** a kernel returns nothing; a vertex shader returns a `ClipPosition` or a struct with one `ClipPosition` field (the rest are passed to the fragment shader); a fragment shader returns a `vec4`. Parameters are builtins, `GpuData` values (passed as one uniform block), `[T]` buffers to read, `mut Slots<T>`, and, for a fragment shader, the vertex shader's output (`gpu.entry`, `gpu.data`). | T0 | D-102 |
 | **Uniform vs varying** is the target's own distinction, which WGSL already analyzes. | T0 | D-051 |
-| **Workgroup-shared memory and barriers.** Spike 01's `place_vertices` needed them. **Open:** the design. | T0 | D-093 |
-| **GPU interval arithmetic widens each result outward** by its operation's WGSL error bound, so it stays conservative. | T0 | D-075 |
-| **GPU-resident data is a type.** `GpuBuffer<T: GpuData>` and `GpuSpan<T>` are opaque `Plain`, `Copy` handles: CPU code can pass them to kernels, write into them or copy between them, but can't read through them. Names are placeholders. | T0 | D-102 |
-| **Transfers are explicit.** `gpu.write(buf, data)` copies. Calling a `@compute` function from CPU code (`dispatch`) records a dispatch; small `GpuData` arguments travel as uniforms, bulk data as buffers. Writes and dispatches take effect in recorded order, with no barriers between dispatches. GPU calls carry the `host` effect. | T0 | D-102 |
+| **Workgroup-shared memory and barriers.** Spike 01's `place_vertices` needed them. **Open:** the design. | M2 (Q4 of #6) | D-093 |
+| **GPU interval arithmetic widens each result outward** by its operation's WGSL error bound, so it stays conservative (§13). | T0 | D-075 |
+| **GPU-resident data is a type.** `GpuBuffer<T: GpuData>` is an opaque `Copy` handle: CPU code can create one (`buffer(count)`), pass it to kernels and shaders, and write into it, but can't read through it. `GpuSpan<T>` and copies between buffers are later. Names are placeholders. | T0 | D-102 |
+| **Transfers are explicit.** `write(buf, at, values)` copies. `dispatch(kernel, groups: n, arg: value, ...)` records a dispatch, and `draw(vertex, fragment, vertices: n, arg: value, ...)` a draw, between `begin_screen_pass(clear: ...)` and `present()`; `GpuData` arguments travel as one uniform block, `GpuBuffer`s as buffers. A kernel or shader can't be called directly (E0606). Writes and dispatches take effect in recorded order, with no barriers between dispatches. GPU calls carry the `host` effect (`gpu.dispatch`). | T0 | D-102 |
+| **A host program exports `frame(time: f32, width: u32, height: u32)`,** called once per frame. Its other `pub fn`s in `main.wrela` with scalar and vector parameters and results are exported too, for tests and tools. | T0 | D-102 |
 | **Readback is asynchronous:** `gpu.read(span)` returns a future and has the `nondet` effect, so `@deterministic` code can't call it. | T2 | D-102 |
 
 ```wrela
 @fragment
-fn shade<F: Surface + Channels<C>, C: Blend>(field: F, s: Skinned, lights: Lights) -> Color {
-    let fp = fwidth(s.rest_pos)                         // this pixel's footprint
-    let t  = field.channels(s.rest_pos, footprint: fp)  // only the channels used here are computed (D-002)
-    let n  = s.rot * field.gradient(s.rest_pos, footprint: fp).normalize()   // derived gradient
-    lights.shade(t.albedo, t.roughness, n)
+fn shade<F: Surface>(pixel: FragCoord, scene: Scene, field: F) -> vec4 {
+    let p = scene.hit(pixel.position.xy, field)          // sphere-traced
+    let n = normalize(field.gradient(p))                  // the derived gradient
+    vec4(scene.light(n), 1.0)
 }
 ```
+
+(examples/hello-field shades this way. With channels and footprints, tier 1, the shader reads only the channels it uses (D-002) and fades noise finer than a pixel (D-077).)
 
 ---
 
@@ -620,6 +640,11 @@ The compiler derives these from any function that qualifies under the effect tab
 |---|---|---|---|
 | `gradient` | Forward-mode derivative | T0 | D-012 |
 | `interval` | A conservative range over a box | T0 | D-012, D-075 |
+
+**In tier 0** they're `std::derive::{gradient, value_and_gradient, interval}`, over a closure or function of an `f32` or a float vector that returns an `f32`. `interval` takes the input's box type (`Interval`, `Box2`, `Box3`, `Box4`) and returns an `Interval`. `std::field::Surface` provides `gradient`, `sample` (distance and gradient) and `interval` for every surface. The compiler derives them from the function's body, and from every function it calls (`derive.gradient`, `derive.interval`):
+- **Gradients** are forward mode, one tangent per input component. They agree with central differences within 3.4e-4 relative, across the test corpus (compiler/tests/tests/derive.rs).
+- **Intervals** bound every value a point in the box can give, as the target computes it. On the CPU each rounded result is widened by its rounding (an ulp; four for the stdlib's transcendentals). On the GPU each is widened by twice its WGSL error bound, at least one ulp, plus 2⁻¹²⁶ for flushed subnormals. A branch on the input that could go either way runs both sides and joins their results. A loop whose exit depends on the input can't be bounded (E0701). Integers are exact when single-valued, otherwise their type's whole range. The test corpus encloses every sample of 10⁶ boxes per function, on both targets.
+- **Known limits of tier 0's intervals:** a NaN bound becomes infinite on the CPU, but not on the GPU, which may assume NaNs away; WGSL bounds `sin` and `cos` only on [-π, π], and outside it the same absolute error is assumed; a branch run speculatively can still trap on the CPU (an integer overflow, say) even if no point in the box would take it.
 | Lipschitz bound | Composed from declared facts on primitives; read through `facts::lipschitz(f)` at compile time | T1 | D-057, D-077 |
 | Pruning | `f.prune(bounds) -> LiveMask<F>`, `f.with_live(mask)` | T1 | D-045, D-080 |
 
@@ -682,6 +707,7 @@ The sim/presentation split is an engine pattern built on this, not a language fe
 
 ### Fields are stdlib code
 
+- **Tier 0's field is `std::field::Surface`:** a signed distance (`distance(self, p: vec3) -> f32`), with `gradient`, `sample` and `interval` derived, primitives (`sphere`, `ellipsoid`, `round_cone`, `half_space`), combinators (`union`, `smooth_union`, `intersect`, `translate`, `displace`) and noise (`value_noise`, `fbm`). Kinds and channels below are tier 1.
 - **A field returns a distance plus channels** (D-002). Channel structs opt in to `Blend`, and each member's type decides how it blends: `Color` in linear space, `f32` linearly, `UnitVec3` renormalized, `Cat<T>` from the winner (D-026).
 - **Kinds are ordinary types** (D-056, D-077):
 
@@ -714,38 +740,59 @@ The sim/presentation split is an engine pattern built on this, not a language fe
 
 ## 19. A tier-0 program
 
-This is the subset needed for "hello field" (D-088 tier 0): a field, a derived gradient, one compute kernel and one fragment shader. No units, regions or determinism.
+This is the subset needed for "hello field" (D-088 tier 0): a field, a derived gradient, one compute kernel and one fragment shader. No units, regions or determinism. `compiler/tests/tests/language.rs` builds this block, so it stays true; `examples/hello-field` is the full program.
 
 ```wrela
-use std::field::{Field, Bound, Surface, sphere, round_cone}
-use std::gpu::{GlobalId, Slots}
-
-/// A field. Its structure (a smooth union of two primitives) is its type;
-/// the radii are data, so every blob shares one pipeline.
-pub fn blob(r: f32) -> Field<Bound, ()> {
-    sphere(radius: r)
-        .smooth_union(round_cone(vec3(), vec3(y: 1.0), 0.3, 0.1), k: 0.1)
+use std::field::{Surface, round_cone, sphere}
+use std::gpu::{
+    ClipPosition, FragCoord, GlobalId, GpuBuffer, Slots, VertexIndex, begin_screen_pass, buffer,
+    dispatch, draw, present,
 }
 
-pub struct Grid: GpuData {
-    origin: vec3,             // `vec3` without a unit is unitless
-    cell:   f32,
-    n:      u32,
+/// A field. Its structure (a smooth union of two primitives) is its type;
+/// the radii are data, so every blob shares one pipeline. (In `main.wrela`, a `pub fn` is
+/// exported to the host, so this one is private.)
+fn blob(r: f32) -> Surface {
+    sphere(radius: r).smooth_union(round_cone(vec3(), vec3(y: 1.0), 0.3, 0.1), k: 0.1)
+}
+
+struct Grid: Copy + Clone + GpuData {
+    origin: vec3, // a `vec3` without a unit is unitless
+    cell: f32,
+    n: u32,
 }
 
 /// One sample per invocation. `Slots` lets each invocation write only its own slot.
 @compute(64)
 fn sample<F: Surface>(field: F, grid: Grid, out: mut Slots<f32>, id: GlobalId) {
     let i = id.x
-    let p = grid.origin + vec3(f32(i % grid.n), f32((i / grid.n) % grid.n), f32(i / (grid.n * grid.n))) * grid.cell
-    out[id] = field.distance(p)
+    let c = vec3(f32(i % grid.n), f32((i / grid.n) % grid.n), f32(i / (grid.n * grid.n)))
+    out[id] = field.distance(grid.origin + c * grid.cell)
+}
+
+/// One triangle over the whole screen.
+@vertex
+fn cover(v: VertexIndex) -> ClipPosition {
+    let x = f32(v.index % 2) * 4.0 - 1.0
+    let y = f32(v.index / 2) * 4.0 - 1.0
+    ClipPosition { position: vec4(x, y, 0.0, 1.0) }
 }
 
 /// Normals come from the derived gradient. Nobody wrote it.
 @fragment
-fn normals<F: Surface>(field: F, pos: vec3) -> Color {
-    let n = field.gradient(pos).normalize()
-    Color(n * 0.5 + 0.5)
+fn normals<F: Surface>(pixel: FragCoord, field: F) -> vec4 {
+    let p = vec3(pixel.position.xy * 0.004 - 1.0, 0.0)
+    let n = normalize(field.gradient(p))
+    vec4(n * 0.5 + 0.5, 1.0)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    let out: GpuBuffer<f32> = buffer(4096)
+    let grid = Grid { origin: vec3(-1.0), cell: 0.125, n: 16 }
+    dispatch(sample, groups: 64, field: blob(0.5), grid: grid, out: out)
+    begin_screen_pass(clear: vec4(0.0, 0.0, 0.0, 1.0))
+    draw(cover, normals, vertices: 3, field: blob(0.5 + 0.1 * sin(time)))
+    present()
 }
 ```
 
@@ -755,7 +802,8 @@ fn normals<F: Surface>(field: F, pos: vec3) -> Color {
 
 | Tier | Features |
 |---|---|
-| **T0** | Statements and literals; functions with modes and named arguments; structs with defaults; enums (including `Option`); `const` with literal values; traits with associated types and default methods; monomorphized generics and `impl Trait`; projections and exclusivity; non-escaping closures; scalar, vector and matrix types; `@compute`/`@vertex`/`@fragment`/`@gpu`; typed builtins; invocation-safe kernel outputs; workgroup-shared memory (D-093); lossless GPU layout through `GpuData`; GPU buffer handles, uploads and dispatch from CPU code (D-102); derived `gradient` and `interval`; WGSL and WASM emission. |
+| **T0** | Statements and literals; functions with modes and named arguments; structs with defaults; enums (including `Option`); `const` with literal values; traits with associated types and default methods; monomorphized generics and `impl Trait`; projections and exclusivity; non-escaping closures; scalar, vector and matrix types; `@compute`/`@vertex`/`@fragment`/`@gpu`; typed builtins; invocation-safe kernel outputs (`Slots<T>`); lossless GPU layout through `GpuData`; GPU buffer handles, uploads, dispatches and draws from CPU code (D-102); derived `gradient` and `interval`; WGSL and WASM emission. Built in milestone 1. |
+| **M2** | Workgroup-shared memory and barriers (D-093); atomics and `Append<T>` as kernel outputs. |
 | **T1** | Units; `@comptime`, evaluated `const` initializers and reflection; structural defaults; auto and declared traits; `@diagnostic`; `@deterministic` and the numeric rules; `@assert`/`@assume` and bandlimits; Lipschitz facts and pruning; handles, arenas and regions; `Plain`/`Relocatable`; views, iterators and other non-escaping types; lossy GPU encodings; strings; destructors; `Result`, `?` and panics; `@escaping`; the pipeline-count query. |
 | **T2** | Threads and parallel combinators; async; GPU readback; `@audio`; checkpoints and keyframes; `dyn Trait`; `stage::interpret`; any compiler tier in the browser. |
 
@@ -769,7 +817,8 @@ fn normals<F: Surface>(field: F, pos: vec3) -> Color {
 - **Syntax for structural defaults:** `@comptime default for<T: struct>` is a placeholder (§3).
 - **How a generic parameter declares that it accepts non-escaping types** (§6.4).
 - **Checking scopes:** how the compiler matches the scope a consumer needs against the scope a fact declares, and how scopes compose (D-092).
-- **Workgroup-shared memory and barriers in kernels** (§12, D-093).
+- **Workgroup-shared memory and barriers in kernels** (§12, D-093): milestone 2.
+- **Symbolic links to directories in a package:** refused for now (E0208); following them waits on what a module tree is.
 - **GPU buffer names and syntax, and kernels whose parameters exceed the target's binding limits** (§12, D-102).
 - **`from param` annotations** (§6.4).
 - **Region chunk sizes and undo-ring sizes** (§6.11).

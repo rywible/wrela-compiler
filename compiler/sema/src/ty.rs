@@ -385,6 +385,10 @@ pub trait TyNames {
     fn param_name(&self, p: ParamId) -> String;
     fn fn_name(&self, f: FnId) -> String;
     fn trait_name(&self, t: TraitId) -> String;
+    /// The type a function returns that's named by its traits: `impl Surface`.
+    fn opaque_name(&self, f: FnId) -> String {
+        format!("the type `{}` returns", self.fn_name(f))
+    }
 }
 
 /// Longer type names are cut here, so diagnostics stay readable.
@@ -462,9 +466,7 @@ fn write_ty(types: &Types, names: &dyn TyNames, t: TyId, s: &mut String) {
             s.push_str("::");
             s.push_str(name);
         }
-        TyKind::Opaque(f, _) => {
-            let _ = write!(s, "<the type `{}` returns>", names.fn_name(*f));
-        }
+        TyKind::Opaque(f, _) => s.push_str(&names.opaque_name(*f)),
         TyKind::FnPtr(ps, r) => {
             s.push_str("fn(");
             write_list(types, names, ps, s);
