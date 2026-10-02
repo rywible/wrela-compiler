@@ -37,6 +37,7 @@ const RULES: &[(&str, &str)] = &[
     // §3 items
     ("fn.named-args", "positional arguments first, then named ones, each once, all present"),
     ("fn.defaults", "parameters may have defaults"),
+    ("fn.return", "a function that returns a value ends with one, or returns one, on every path"),
     ("fn.return-trait", "a trait in return position names one inferred concrete type"),
     ("struct.defaults", "struct fields may have constant defaults a literal may omit"),
     ("struct.opt-in", "a struct opts in to Copy, Clone and GpuData in its declaration"),
@@ -170,12 +171,11 @@ fn errors(case: &Case) -> BTreeMap<(String, usize), Vec<String>> {
         std::fs::create_dir_all(p.parent().expect("parent")).expect("dir");
         std::fs::write(p, text).expect("write");
     }
-    let compiler = wrela_driver::Compiler::new(&dir);
-    let (check, diags, _) = compiler.build();
+    let built = wrela_driver::build(&dir);
     let mut out: BTreeMap<(String, usize), Vec<String>> = BTreeMap::new();
-    for d in diags.iter().filter(|d| d.is_error()) {
+    for d in built.diagnostics.iter().filter(|d| d.is_error()) {
         let span = d.primary.span;
-        let file = check.sources.file(span.file);
+        let file = built.sources.file(span.file);
         let line = file.line_index(span.start) + 1;
         let name = file.name.rsplit('/').next().unwrap_or(&file.name).to_string();
         let key = if file.name.starts_with('<') { file.name.clone() } else { name };

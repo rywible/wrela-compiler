@@ -21,16 +21,7 @@ fn strip(s: &str) -> String {
         rest = &rest[j..];
     }
     out.push_str(rest);
-    let mut cleaned = String::new();
-    for line in out.lines() {
-        let t = line.trim_start();
-        if t.starts_with("id: NodeId(") || t.starts_with("node_count:") {
-            continue;
-        }
-        cleaned.push_str(line);
-        cleaned.push('\n');
-    }
-    cleaned
+    out
 }
 
 fn round_trip(src: &str) -> String {

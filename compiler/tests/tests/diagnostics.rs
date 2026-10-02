@@ -30,16 +30,15 @@ fn compile(name: &str, text: &str) -> Outcome {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("dir");
     std::fs::write(dir.join("main.wrela"), text).expect("write");
-    let compiler = wrela_driver::Compiler::new(&dir);
-    let (check, diags, _) = compiler.build();
-    let errors: Vec<_> = diags.iter().filter(|d| d.is_error()).cloned().collect();
+    let built = wrela_driver::build(&dir);
+    let errors: Vec<_> = built.diagnostics.iter().filter(|d| d.is_error()).cloned().collect();
     let main =
-        check.sources.files().find(|(_, f)| f.name.ends_with("main.wrela")).map(|(id, _)| id);
+        built.sources.files().find(|(_, f)| f.name.ends_with("main.wrela")).map(|(id, _)| id);
     let fixed = main.map(|id| wrela_diag::apply_fixes(text, id, &errors));
     Outcome {
         codes: errors.iter().map(|d| d.code.as_str().to_string()).collect(),
-        json: wrela_diag::json::to_json_string(&check.sources, &errors),
-        text: wrela_diag::render::render_all(&check.sources, &errors),
+        json: wrela_diag::json::to_json_string(&built.sources, &errors),
+        text: wrela_diag::render::render_all(&built.sources, &errors),
         fixed: fixed.filter(|f| f != text),
     }
 }

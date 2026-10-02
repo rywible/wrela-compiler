@@ -37,8 +37,8 @@ pub fn parse_tokens(file: FileId, text: &str, lexed: Lexed) -> Parsed {
         tokens: lexed.tokens,
         pos: 0,
         diags: lexed.diagnostics,
-        next_id: 0,
         syntax_errors: 0,
+        nesting: 0,
     };
     let f = p.parse_file();
     Parsed { file: f, comments: lexed.comments, diagnostics: p.diags }
@@ -56,13 +56,24 @@ pub(crate) struct Parser<'a> {
     tokens: Vec<Token>,
     pos: usize,
     diags: Vec<Diagnostic>,
-    next_id: u32,
     syntax_errors: u32,
+    /// How deeply the rule being parsed is nested in others that nest (expressions, blocks,
+    /// types, patterns).
+    nesting: u32,
 }
 
 /// After this many syntax errors in one file, later ones are dropped: they're usually noise
 /// from the first.
 const MAX_SYNTAX_ERRORS: u32 = 20;
+
+/// How deeply expressions, blocks, types and patterns may nest in one another (L19). The
+/// parser and every pass after it recurse over the tree, so the limit keeps their stacks
+/// bounded; no reasonable program comes near it.
+pub const MAX_NESTING: u32 = 128;
+
+/// How deep an expression's tree may be, counting each operand of a chain of binary operators
+/// (`a + b + c` is two deep) (L19).
+pub const MAX_EXPR_DEPTH: u32 = 512;
 
 fn describe(kind: T) -> String {
     match kind {
@@ -124,9 +135,24 @@ impl<'a> Parser<'a> {
         &self.text[span.start as usize..span.end as usize]
     }
 
-    fn id(&mut self) -> NodeId {
-        self.next_id += 1;
-        NodeId(self.next_id - 1)
+    /// Runs a rule that nests, unless the nesting is already at [`MAX_NESTING`].
+    pub(crate) fn nested<R>(&mut self, f: impl FnOnce(&mut Self) -> PResult<R>) -> PResult<R> {
+        if self.nesting >= MAX_NESTING {
+            let span = self.span();
+            self.error(
+                Diagnostic::new(
+                    codes::E0112,
+                    span,
+                    format!("this is nested more than {MAX_NESTING} levels deep"),
+                )
+                .with_help("move the inner parts into `let` bindings or functions"),
+            );
+            return Err(Failed);
+        }
+        self.nesting += 1;
+        let r = f(self);
+        self.nesting -= 1;
+        r
     }
 
     fn error(&mut self, d: Diagnostic) {
@@ -245,7 +271,20 @@ impl<'a> Parser<'a> {
             let before = self.pos;
             match self.parse_item() {
                 Ok(item) => {
-                    items.push(item);
+                    if let Some(span) = too_deep(&item) {
+                        self.error(
+                            Diagnostic::new(
+                                codes::E0112,
+                                span,
+                                format!(
+                                    "this expression is more than {MAX_EXPR_DEPTH} levels deep"
+                                ),
+                            )
+                            .with_help("split it into `let` bindings"),
+                        );
+                    } else {
+                        items.push(item);
+                    }
                     if !self.at_sep() && !self.at(T::Eof) {
                         self.missing_sep("an item");
                         self.recover_to_item();
@@ -258,7 +297,7 @@ impl<'a> Parser<'a> {
                 self.bump();
             }
         }
-        File { items, span: start.to(self.span()), node_count: self.next_id }
+        File { items, span: start.to(self.span()) }
     }
 
     fn missing_sep(&mut self, what: &str) {
@@ -705,6 +744,10 @@ impl<'a> Parser<'a> {
 
     /// type ::= path_type | "[" type (";" expr)? "]" | "(" types ")" | "fn" "(" types ")" ("->" type)?
     pub(crate) fn parse_type(&mut self) -> PResult<TypeExpr> {
+        self.nested(Self::parse_type_inner)
+    }
+
+    fn parse_type_inner(&mut self) -> PResult<TypeExpr> {
         let start = self.span();
         if self.at(T::Dyn) {
             // `dyn Trait` is tier 2: say so, and read the trait as the type.
@@ -813,4 +856,21 @@ impl<'a> Parser<'a> {
         self.expect_gt_close()?;
         Ok(out)
     }
+}
+
+/// Where an item's expressions are deeper than [`MAX_EXPR_DEPTH`], if anywhere. Iterative, so
+/// the check itself doesn't recurse as deep as the tree.
+fn too_deep(item: &Item) -> Option<Span> {
+    let mut roots: Vec<&Expr> = Vec::new();
+    item.for_each_body_expr(&mut |e| roots.push(e));
+    for root in roots {
+        let mut stack: Vec<(&Expr, u32)> = vec![(root, 1)];
+        while let Some((e, d)) = stack.pop() {
+            if d > MAX_EXPR_DEPTH {
+                return Some(root.span.shrink_to_start());
+            }
+            e.for_each_child(&mut |c| stack.push((c, d + 1)));
+        }
+    }
+    None
 }

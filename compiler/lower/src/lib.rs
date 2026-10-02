@@ -92,6 +92,10 @@ pub(crate) struct ModuleBuilder {
     pub gpu: Option<gpu::GpuCx>,
     /// The first caller of each instance, for call chains in diagnostics.
     pub callers: HashMap<ir::FuncId, (ir::FuncId, Span)>,
+    /// How many instantiations each instance is from a root (an export or entry point).
+    pub depth: HashMap<ir::FuncId, u32>,
+    /// Whether the instantiation limit has been reported in this module.
+    pub too_deep: bool,
     /// Instances being lowered right now.
     pub active: Vec<ir::FuncId>,
     /// Every call between instances, for finding recursion on the GPU.
@@ -110,6 +114,8 @@ impl ModuleBuilder {
             type_cache: HashMap::new(),
             gpu: None,
             callers: HashMap::new(),
+            depth: HashMap::new(),
+            too_deep: false,
             active: Vec::new(),
             edges: Vec::new(),
             derived: ir::derive::DeriveCache::default(),
@@ -173,15 +179,47 @@ impl<'a> Cx<'a> {
             }
             return id;
         }
+        let depth = caller.map_or(0, |(from, _)| mb.depth.get(&from).copied().unwrap_or(0) + 1);
         let f = self.signature(mb, &key);
         let id = mb.m.add_function(f);
         mb.instances.insert(key.clone(), id);
+        mb.depth.insert(id, depth);
         if let Some(c) = caller {
             mb.callers.insert(id, c);
             mb.edges.push((c.0, id, c.1));
         }
+        if depth > MAX_INSTANCE_DEPTH {
+            // Polymorphic recursion: each instance calls one with a bigger type. Its body is
+            // never lowered, so the queue ends; the build stops on the error.
+            if !mb.too_deep {
+                mb.too_deep = true;
+                self.report_too_deep(&key, caller.map(|c| c.1));
+            }
+            mb.m.functions[id.index()].body = vec![ir::Stmt::Trap];
+            return id;
+        }
         mb.queue.push_back((key, id));
         id
+    }
+
+    fn report_too_deep(&mut self, key: &InstanceKey, at: Option<Span>) {
+        let Some(func) = key.source_fn() else { return };
+        let name = self.checked.program.fn_display_name(func);
+        let args: Vec<String> =
+            key.substs().iter().map(|&t| self.checked.program.display_ty(t)).collect();
+        let span = at.unwrap_or(self.checked.program.func(func).sig_span);
+        self.err(
+            Diagnostic::new(
+                wrela_diag::codes::E0412,
+                span,
+                format!("instantiating `{name}` never ends: each instance calls one with a larger type"),
+            )
+            .with_note(format!(
+                "after {MAX_INSTANCE_DEPTH} levels it's instantiated with <{}>",
+                args.join(", ")
+            ))
+            .with_note("generics are monomorphized (§7), so a generic function can't call itself with an ever-growing type"),
+        );
     }
 
     /// Lowers queued instance bodies until none are left.
@@ -237,6 +275,10 @@ impl<'a> Cx<'a> {
         self.checked.program.func(f).attrs.entry.map(|e| e.0)
     }
 }
+
+/// How many instantiations deep a call chain may go from an export or entry point. Real
+/// programs are a few levels deep; only polymorphic recursion gets near.
+const MAX_INSTANCE_DEPTH: u32 = 256;
 
 /// Rc helper so instance keys can nest.
 pub(crate) fn rc<T>(t: T) -> Rc<T> {

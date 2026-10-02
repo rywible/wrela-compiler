@@ -153,25 +153,16 @@ fn shape_diff(src: &str, grammar: &Shape, parser: &Shape) -> String {
     msg
 }
 
-/// The AST's Debug output with spans, node ids and node counts removed: two sources with equal
-/// skeletons parsed to the same tree.
+/// The AST's Debug output with spans removed: two sources with equal skeletons parsed to the
+/// same tree.
 pub fn ast_skeleton(file: &wrela_syntax::ast::File) -> String {
     let text = format!("{file:?}");
     let mut out = String::with_capacity(text.len());
     let mut rest = text.as_str();
-    loop {
-        let next = ["Span {", "NodeId(", "node_count: "]
-            .iter()
-            .filter_map(|pat| rest.find(pat).map(|i| (i, *pat)))
-            .min();
-        let Some((i, pat)) = next else { break };
+    while let Some(i) = rest.find("Span {") {
         out.push_str(&rest[..i]);
         let tail = &rest[i..];
-        let len = match pat {
-            "Span {" => tail.find('}').map_or(tail.len(), |j| j + 1),
-            "NodeId(" => tail.find(')').map_or(tail.len(), |j| j + 1),
-            _ => tail.find([',', '}']).unwrap_or(tail.len()),
-        };
+        let len = tail.find('}').map_or(tail.len(), |j| j + 1);
         out.push('_');
         rest = &tail[len..];
     }

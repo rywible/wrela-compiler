@@ -77,6 +77,7 @@ codes! {
     E0109 = "E0109", "a missing parameter type";
     E0110 = "E0110", "an assignment where an expression is expected";
     E0111 = "E0111", "`else` on a new line";
+    E0112 = "E0112", "an expression, block, type or pattern nested too deeply";
 
     // ---- E02xx: names and modules ----------------------------------------------------------
     E0200 = "E0200", "an unknown name";
@@ -137,6 +138,7 @@ codes! {
     E0409 = "E0409", "a return type that names a trait but no single type";
     E0410 = "E0410", "a trait used as a value type";
     E0411 = "E0411", "a cyclic supertrait";
+    E0412 = "E0412", "a generic function whose instantiations never end";
 
     // ---- E05xx: modes, moves, projections, exclusivity, closures -------------------------
     E0500 = "E0500", "a use of a moved value";

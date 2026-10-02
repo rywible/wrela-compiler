@@ -155,8 +155,7 @@ fn mutated_programs_dont_crash_the_compiler() {
         let text = mutate(&mut rng, corpus[pick].clone());
         std::fs::write(dir.join("main.wrela"), &text).expect("write");
         let result = catch_unwind(AssertUnwindSafe(|| {
-            let compiler = wrela_driver::Compiler::new(&dir);
-            let _ = compiler.build();
+            let _ = wrela_driver::build(&dir);
         }));
         if let Err(e) = result {
             let msg = e

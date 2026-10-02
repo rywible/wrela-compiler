@@ -18,7 +18,7 @@ pub fn run(args: &[String]) -> ExitCode {
             },
             "--json" => json = true,
             _ if dir.is_none() && !a.starts_with('-') => dir = Some(PathBuf::from(a)),
-            _ => return crate::usage(),
+            _ => return crate::unknown(a),
         }
     }
     let Some(dir) = dir else { return crate::usage() };
@@ -34,21 +34,14 @@ pub fn run(args: &[String]) -> ExitCode {
         return ExitCode::from(2);
     }
     let out = out.unwrap_or_else(|| dir.join("build"));
-    let compiler = wrela_driver::Compiler::new(&dir);
-    let (check, diags, files) = compiler.build();
-    let report = wrela_driver::CheckOutput {
-        sources: clone_sources(&check.sources),
-        diagnostics: diags,
-        checked: None,
-    };
-    let failed = crate::report(&report, json);
-    if failed {
+    let output = wrela_driver::build(&dir);
+    if crate::report(&output, json) {
         return ExitCode::from(1);
     }
-    match write(&out, &files.files) {
+    match write(&out, &output.files) {
         Ok(()) => {
             if !json {
-                eprintln!("built {} ({} files)", out.display(), files.files.len());
+                eprintln!("built {} ({} files)", out.display(), output.files.len());
             }
             ExitCode::SUCCESS
         }
@@ -57,14 +50,6 @@ pub fn run(args: &[String]) -> ExitCode {
             ExitCode::from(2)
         }
     }
-}
-
-fn clone_sources(map: &wrela_diag::SourceMap) -> wrela_diag::SourceMap {
-    let mut out = wrela_diag::SourceMap::new();
-    for (_, f) in map.files() {
-        out.add(f.name.clone(), f.text.clone());
-    }
-    out
 }
 
 fn write(out: &Path, files: &[(String, Vec<u8>)]) -> std::io::Result<()> {

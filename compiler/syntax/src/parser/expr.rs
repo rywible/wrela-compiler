@@ -15,13 +15,17 @@ pub(crate) enum Ctx {
 
 impl<'a> Parser<'a> {
     fn expr_node(&mut self, kind: ExprKind, span: Span) -> Expr {
-        Expr { id: self.id(), kind, span }
+        Expr { kind, span }
     }
 
     // ---- blocks and statements -------------------------------------------------------------
 
     /// block ::= "{" sep* (stmt (sep+ stmt)* sep*)? "}"
     pub(crate) fn parse_block(&mut self) -> PResult<Block> {
+        self.nested(Self::parse_block_inner)
+    }
+
+    fn parse_block_inner(&mut self) -> PResult<Block> {
         let open = self.expect(T::LBrace, "`{`")?.span;
         let mut stmts = Vec::new();
         self.skip_seps();
@@ -190,7 +194,7 @@ impl<'a> Parser<'a> {
     fn parse_named_bind(&mut self, kind: BindKind) -> PResult<StmtKind> {
         self.bump();
         let name = self.ident("a name")?;
-        let pat = Pat { id: self.id(), span: name.span, kind: PatKind::Ident(name) };
+        let pat = Pat { span: name.span, kind: PatKind::Ident(name) };
         let ty = if self.eat(T::Colon) { Some(self.parse_type()?) } else { None };
         self.expect_bind_eq()?;
         let init = self.parse_expr()?;
@@ -223,6 +227,10 @@ impl<'a> Parser<'a> {
     }
 
     pub(crate) fn parse_expr_ctx(&mut self, ctx: Ctx) -> PResult<Expr> {
+        self.nested(|p| p.parse_expr_inner(ctx))
+    }
+
+    fn parse_expr_inner(&mut self, ctx: Ctx) -> PResult<Expr> {
         if ctx == Ctx::Full {
             match self.kind() {
                 T::Pipe | T::OrOr => return self.parse_closure(),
@@ -385,7 +393,7 @@ impl<'a> Parser<'a> {
         let kind = self.kind();
         if matches!(kind, T::Minus | T::Bang | T::Take | T::Mut) {
             self.bump();
-            let inner = Box::new(self.parse_unary(ctx)?);
+            let inner = Box::new(self.nested(|p| p.parse_unary(ctx))?);
             let span = start.to(inner.span);
             let k = match kind {
                 T::Minus => ExprKind::Unary(UnOp::Neg, inner),
@@ -825,6 +833,10 @@ impl<'a> Parser<'a> {
     /// pattern ::= "_" | "-"? (INT | FLOAT) | "true" | "false"
     ///           | path_expr ("(" patterns ")" | pattern_fields)? | "(" patterns ")"
     pub(crate) fn parse_pattern(&mut self) -> PResult<Pat> {
+        self.nested(Self::parse_pattern_inner)
+    }
+
+    fn parse_pattern_inner(&mut self) -> PResult<Pat> {
         let t = self.tok();
         let kind = match t.kind {
             T::Underscore => {
@@ -914,7 +926,7 @@ impl<'a> Parser<'a> {
             }
             _ => return Err(self.expected("a pattern")),
         };
-        Ok(Pat { id: self.id(), kind, span: t.span.to(self.prev_span()) })
+        Ok(Pat { kind, span: t.span.to(self.prev_span()) })
     }
 }
 

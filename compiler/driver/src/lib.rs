@@ -1,127 +1,112 @@
-//! The compiler's driver: loads a package, then checks and builds it through queries.
+//! The compiler's driver: loads a package, then checks it (names, types, the memory model, the
+//! GPU rules, and the per-instantiation effects found while lowering) or builds it.
+//!
+//! Each call compiles the package from its files; nothing is cached between calls. Checking the
+//! examples takes tens of milliseconds, and the LSP (milestone 4) will decide what incremental
+//! reuse has to look like.
+//!
+//! The compiler recurses over syntax trees, so it runs on its own thread with a stack sized for
+//! the deepest tree the parser accepts (`wrela_syntax::MAX_NESTING`, `MAX_EXPR_DEPTH`).
 
 pub mod build;
 pub mod package;
-pub mod query;
 
-pub use build::{BuildOutput, BuildPackage, LowerPackage};
-
-use package::{LayoutError, PackageFile};
-use query::{Db, Input, Query};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::rc::Rc;
 use wrela_diag::{Diagnostic, FileId, SourceMap, Span, codes, sort_and_dedup};
-use wrela_sema::{Checked, STD_SOURCES, SourceUnit};
+use wrela_sema::{STD_SOURCES, SourceUnit};
 use wrela_syntax::Parsed;
 
-/// A value shared between queries; equal only to itself (so no early cutoff through it).
+/// What compiling a package produced.
 #[derive(Debug)]
-pub struct Shared<T>(pub Rc<T>);
-
-impl<T> Clone for Shared<T> {
-    fn clone(&self) -> Self {
-        Shared(self.0.clone())
-    }
-}
-
-impl<T> PartialEq for Shared<T> {
-    fn eq(&self, other: &Self) -> bool {
-        Rc::ptr_eq(&self.0, &other.0)
-    }
-}
-
-impl<T> std::ops::Deref for Shared<T> {
-    type Target = T;
-    fn deref(&self) -> &T {
-        &self.0
-    }
-}
-
-/// Input: the package's files, or what's wrong with its layout.
-pub struct PackageLayout;
-impl Input for PackageLayout {
-    type Key = ();
-    type Value = Result<Vec<PackageFile>, Vec<LayoutError>>;
-    const NAME: &'static str = "package_layout";
-}
-
-/// Input: a file's text, or why it couldn't be read.
-pub struct FileText;
-impl Input for FileText {
-    type Key = PathBuf;
-    type Value = Result<Rc<str>, String>;
-    const NAME: &'static str = "file_text";
-}
-
-/// A source file the compiler reads: a std module or one of the package's.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum SourceKey {
-    Std(usize),
-    Package(PathBuf),
-}
-
-/// Query: one file, parsed. Its `FileId` is part of the key, so spans are stable.
-pub struct ParseFile;
-impl Query for ParseFile {
-    type Key = (FileId, SourceKey);
-    type Value = Shared<(Rc<str>, Parsed)>;
-    const NAME: &'static str = "parse_file";
-    fn compute(db: &Db, (file, key): &Self::Key) -> Self::Value {
-        let text: Rc<str> = match key {
-            SourceKey::Std(i) => STD_SOURCES[*i].1.into(),
-            SourceKey::Package(p) => db.input::<FileText>(p).unwrap_or_else(|_| "".into()),
-        };
-        let parsed = wrela_syntax::parse(*file, &text);
-        Shared(Rc::new((text, parsed)))
-    }
-}
-
-/// The result of checking a package.
-#[derive(Debug)]
-pub struct CheckOutput {
+pub struct Output {
+    /// Every source file read: std's, then the package's.
     pub sources: SourceMap,
+    /// Every diagnostic, sorted.
     pub diagnostics: Vec<Diagnostic>,
-    /// `None` when the package couldn't be loaded or parsed.
-    pub checked: Option<Checked>,
+    /// The build's files by path relative to the output directory, in a fixed order; empty
+    /// unless building found no errors.
+    pub files: Vec<(String, Vec<u8>)>,
 }
 
-impl CheckOutput {
+impl Output {
     pub fn has_errors(&self) -> bool {
         self.diagnostics.iter().any(|d| d.is_error())
     }
 }
 
-/// Query: the whole package, checked (names, types, the memory model, GPU rules).
-pub struct CheckPackage;
-impl Query for CheckPackage {
-    type Key = ();
-    type Value = Shared<CheckOutput>;
-    const NAME: &'static str = "check_package";
-    fn compute(db: &Db, _: &()) -> Self::Value {
-        Shared(Rc::new(check_package(db)))
-    }
+/// The compiler thread's stack. Generous: it's reserved, not committed, and the deepest trees
+/// the parser accepts need far less.
+const STACK_SIZE: usize = 256 << 20;
+
+/// Checks the package at `root`: every diagnostic, including those lowering finds.
+pub fn check(root: &Path) -> Output {
+    on_compiler_thread(|| compile(root, false))
 }
 
-fn check_package(db: &Db) -> CheckOutput {
+/// Builds the package at `root`: its diagnostics, and its files when there are no errors.
+pub fn build(root: &Path) -> Output {
+    on_compiler_thread(|| compile(root, true))
+}
+
+fn on_compiler_thread<T: Send>(f: impl FnOnce() -> T + Send) -> T {
+    std::thread::scope(|s| {
+        let worker = std::thread::Builder::new()
+            .name("wrela".into())
+            .stack_size(STACK_SIZE)
+            .spawn_scoped(s, f)
+            .expect("can't start the compiler's thread");
+        worker.join().unwrap_or_else(|p| std::panic::resume_unwind(p))
+    })
+}
+
+fn compile(root: &Path, emit: bool) -> Output {
+    let (sources, mut diagnostics, units) = load(root);
+    let Some(units) = units else {
+        return Output { sources, diagnostics, files: Vec::new() };
+    };
+    let checked = wrela_sema::check_program(units, &mut diagnostics);
+    let mut files = Vec::new();
+    if !diagnostics.iter().any(|d| d.is_error()) {
+        let roots = wrela_lower::Roots::of(&checked);
+        let (lowered, d) = wrela_lower::lower(&checked, &roots);
+        let ok = !d.iter().any(|x| x.is_error());
+        diagnostics.extend(d);
+        if ok && emit {
+            let out = build::emit(&lowered);
+            diagnostics.extend(out.diagnostics);
+            files = out.files;
+        }
+    }
+    sort_and_dedup(&mut diagnostics);
+    if diagnostics.iter().any(|d| d.is_error()) {
+        files.clear();
+    }
+    Output { sources, diagnostics, files }
+}
+
+/// Reads and parses std and the package. The units are `None` when the package can't be
+/// loaded or a file has syntax errors that leave no usable tree.
+fn load(root: &Path) -> (SourceMap, Vec<Diagnostic>, Option<Vec<SourceUnit>>) {
     let mut sources = SourceMap::new();
     let mut diags = Vec::new();
     let mut units = Vec::new();
     let mut parse_failed = false;
-    for (i, (name, _)) in STD_SOURCES.iter().enumerate() {
+    for (i, (name, text)) in STD_SOURCES.iter().enumerate() {
         let file = FileId(i as u32);
-        let parsed = db.get::<ParseFile>(&(file, SourceKey::Std(i)));
-        let id = sources.add(format!("<{name}>"), parsed.0.0.to_string());
+        let parsed = wrela_syntax::parse(file, text);
+        let id = sources.add(format!("<{name}>"), text.to_string());
         debug_assert_eq!(id, file);
-        diags.extend(parsed.0.1.diagnostics.iter().cloned());
-        parse_failed |= syntax_failed(&parsed.0.1);
+        parse_failed |= syntax_failed(&parsed);
+        diags.extend(parsed.diagnostics);
         units.push(SourceUnit {
             path: name.split("::").map(String::from).collect(),
             file,
-            ast: Rc::new(parsed.0.1.file.clone()),
+            ast: Rc::new(parsed.file),
             is_std: true,
         });
     }
-    let files = match db.input::<PackageLayout>(&()) {
+    let files = match package::find_files(root) {
         Ok(files) => files,
         Err(errors) => {
             for e in errors {
@@ -133,13 +118,16 @@ fn check_package(db: &Db) -> CheckOutput {
                 }
                 diags.push(d);
             }
-            return CheckOutput { sources, diagnostics: diags, checked: None };
+            sort_and_dedup(&mut diags);
+            return (sources, diags, None);
         }
     };
     for pf in &files {
-        let file = FileId(sources.len() as u32);
-        match db.input::<FileText>(&pf.path) {
-            Ok(_) => {}
+        let text = std::fs::read(&pf.path).map_err(|e| e.to_string()).and_then(|b| {
+            String::from_utf8(b).map_err(|_| "the file isn't valid UTF-8 (L1)".to_string())
+        });
+        let text = match text {
+            Ok(t) => t,
             Err(why) => {
                 let f = sources.add(pf.display.clone(), "");
                 diags.push(Diagnostic::new(
@@ -149,86 +137,29 @@ fn check_package(db: &Db) -> CheckOutput {
                 ));
                 continue;
             }
-        }
-        let parsed = db.get::<ParseFile>(&(file, SourceKey::Package(pf.path.clone())));
-        let id = sources.add(pf.display.clone(), parsed.0.0.to_string());
+        };
+        let file = FileId(sources.len() as u32);
+        let parsed = wrela_syntax::parse(file, &text);
+        let id = sources.add(pf.display.clone(), text);
         debug_assert_eq!(id, file);
-        diags.extend(parsed.0.1.diagnostics.iter().cloned());
-        parse_failed |= syntax_failed(&parsed.0.1);
+        parse_failed |= syntax_failed(&parsed);
+        diags.extend(parsed.diagnostics);
         units.push(SourceUnit {
             path: pf.module.clone(),
             file,
-            ast: Rc::new(parsed.0.1.file.clone()),
+            ast: Rc::new(parsed.file),
             is_std: false,
         });
     }
     if parse_failed {
         sort_and_dedup(&mut diags);
-        return CheckOutput { sources, diagnostics: diags, checked: None };
+        return (sources, diags, None);
     }
-    let checked = wrela_sema::check_program(units, &mut diags);
-    sort_and_dedup(&mut diags);
-    CheckOutput { sources, diagnostics: diags, checked: Some(checked) }
+    (sources, diags, Some(units))
 }
 
 /// Whether a file's syntax errors make its AST unusable. Lexical errors (E00xx) leave a usable
 /// token stream, so checking goes on and reports more; parse errors (E01xx) stop it.
 fn syntax_failed(p: &Parsed) -> bool {
     p.diagnostics.iter().any(|d| d.is_error() && d.code.as_str().starts_with("E01"))
-}
-
-/// A compiler session for one package.
-pub struct Compiler {
-    pub db: Db,
-    pub root: PathBuf,
-}
-
-impl Compiler {
-    /// Reads the package at `root` into a new session.
-    pub fn new(root: &Path) -> Compiler {
-        let c = Compiler { db: Db::new(), root: root.to_path_buf() };
-        c.reload();
-        c
-    }
-
-    /// Re-reads the package's layout and files; unchanged files don't invalidate anything.
-    pub fn reload(&self) {
-        let layout = package::find_files(&self.root);
-        if let Ok(files) = &layout {
-            for f in files {
-                let text = std::fs::read(&f.path)
-                    .map_err(|e| e.to_string())
-                    .and_then(|b| {
-                        String::from_utf8(b)
-                            .map_err(|_| "the file isn't valid UTF-8 (L1)".to_string())
-                    })
-                    .map(|s| Rc::from(s.as_str()));
-                self.db.set_input::<FileText>(f.path.clone(), text);
-            }
-        }
-        self.db.set_input::<PackageLayout>((), layout);
-    }
-
-    pub fn check(&self) -> Shared<CheckOutput> {
-        self.db.get::<CheckPackage>(&())
-    }
-
-    /// Every diagnostic: checking's, then lowering's (effects per instantiation, GPU rules).
-    pub fn diagnostics(&self) -> (Shared<CheckOutput>, Vec<Diagnostic>) {
-        let check = self.check();
-        let mut all = check.diagnostics.clone();
-        if !check.has_errors() {
-            all.extend(self.db.get::<LowerPackage>(&()).diagnostics.iter().cloned());
-        }
-        sort_and_dedup(&mut all);
-        (check, all)
-    }
-
-    /// Builds the package: diagnostics, and the files when there were no errors.
-    pub fn build(&self) -> (Shared<CheckOutput>, Vec<Diagnostic>, Shared<BuildOutput>) {
-        let (check, mut diags) = self.diagnostics();
-        let out = self.db.get::<BuildPackage>(&());
-        diags.extend(out.diagnostics.iter().cloned());
-        (check, diags, out)
-    }
 }

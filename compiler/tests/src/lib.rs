@@ -14,13 +14,12 @@ pub fn root() -> PathBuf {
 /// Builds the package in `pkg` into `out`, as `wrela build` does. On errors, returns them
 /// rendered.
 pub fn build(pkg: &Path, out: &Path) -> Result<(), String> {
-    let compiler = wrela_driver::Compiler::new(pkg);
-    let (check, diags, files) = compiler.build();
-    if diags.iter().any(|d| d.is_error()) {
-        return Err(wrela_diag::render::render_all(&check.sources, &diags));
+    let built = wrela_driver::build(pkg);
+    if built.has_errors() {
+        return Err(wrela_diag::render::render_all(&built.sources, &built.diagnostics));
     }
     std::fs::create_dir_all(out).map_err(|e| e.to_string())?;
-    for (path, bytes) in &files.files {
+    for (path, bytes) in &built.files {
         std::fs::write(out.join(path), bytes).map_err(|e| e.to_string())?;
     }
     Ok(())

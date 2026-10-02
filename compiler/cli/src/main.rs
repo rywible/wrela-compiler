@@ -28,9 +28,16 @@ fn main() -> ExitCode {
     let rest = &args[1..];
     match cmd.as_str() {
         "check" => {
-            let json = rest.iter().any(|a| a == "--json");
-            let dirs: Vec<&String> = rest.iter().filter(|a| !a.starts_with("--")).collect();
-            let [dir] = dirs.as_slice() else { return usage() };
+            let mut json = false;
+            let mut dir = None;
+            for a in rest {
+                match a.as_str() {
+                    "--json" => json = true,
+                    _ if dir.is_none() && !a.starts_with('-') => dir = Some(a),
+                    _ => return unknown(a),
+                }
+            }
+            let Some(dir) = dir else { return usage() };
             check(Path::new(dir), json)
         }
         "build" => build::run(rest),
@@ -43,8 +50,18 @@ fn main() -> ExitCode {
     }
 }
 
+/// An argument the command doesn't take.
+pub(crate) fn unknown(arg: &str) -> ExitCode {
+    if arg.starts_with('-') {
+        eprintln!("error: unknown option `{arg}`");
+    } else {
+        eprintln!("error: unexpected argument `{arg}`");
+    }
+    usage()
+}
+
 /// Prints diagnostics, as JSON or for people. Returns whether there were errors.
-pub(crate) fn report(out: &wrela_driver::CheckOutput, json: bool) -> bool {
+pub(crate) fn report(out: &wrela_driver::Output, json: bool) -> bool {
     if json {
         print!("{}", wrela_diag::json::to_json_string(&out.sources, &out.diagnostics));
     } else {
@@ -61,12 +78,6 @@ fn check(dir: &Path, json: bool) -> ExitCode {
         );
         return ExitCode::from(2);
     }
-    let compiler = wrela_driver::Compiler::new(dir);
-    let (check, diagnostics) = compiler.diagnostics();
-    let mut sources = wrela_diag::SourceMap::new();
-    for (_, f) in check.sources.files() {
-        sources.add(f.name.clone(), f.text.clone());
-    }
-    let out = wrela_driver::CheckOutput { sources, diagnostics, checked: None };
+    let out = wrela_driver::check(dir);
     if report(&out, json) { ExitCode::from(1) } else { ExitCode::SUCCESS }
 }

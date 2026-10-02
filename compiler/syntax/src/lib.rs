@@ -7,6 +7,6 @@ pub mod parser;
 pub mod token;
 
 pub use lexer::{Lexed, lex};
-pub use parser::{Parsed, parse};
+pub use parser::{MAX_EXPR_DEPTH, MAX_NESTING, Parsed, parse};
 pub use token::{Comment, Token, TokenKind};
 pub mod fmt;

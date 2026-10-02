@@ -1,6 +1,6 @@
 [package]
 name = "wrela-driver"
-description = "Runs the compiler: loads a package, checks it, builds it, through a small incremental query layer"
+description = "Runs the compiler: loads a package, checks it, builds it"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

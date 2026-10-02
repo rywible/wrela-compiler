@@ -5,36 +5,65 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use wrela_diag::{FileId, SourceMap};
 
-fn collect(path: &Path, out: &mut Vec<PathBuf>) {
-    if path.is_dir() {
-        let Ok(entries) = std::fs::read_dir(path) else { return };
-        let mut entries: Vec<PathBuf> = entries.filter_map(Result::ok).map(|e| e.path()).collect();
-        entries.sort();
-        for e in entries {
-            let name = e.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-            if name.starts_with('.') || name == "build" || name == "results" {
-                continue;
-            }
-            if std::fs::symlink_metadata(&e).is_ok_and(|m| m.file_type().is_symlink()) {
-                continue;
-            }
-            collect(&e, out);
+/// The `.wrela` files under `path`. A package (a directory with a `main.wrela`) contributes
+/// exactly the files `wrela check` reads; other directories are searched for packages and
+/// files, skipping hidden entries and symbolic links. Returns whether the layout was readable.
+fn collect(path: &Path, out: &mut Vec<PathBuf>) -> bool {
+    if !path.is_dir() {
+        if path.extension().is_some_and(|x| x == "wrela") {
+            out.push(path.to_path_buf());
         }
-    } else if path.extension().is_some_and(|x| x == "wrela") {
-        out.push(path.to_path_buf());
+        return true;
     }
+    if path.join("main.wrela").is_file() {
+        return match wrela_driver::package::find_files(path) {
+            Ok(files) => {
+                out.extend(files.into_iter().map(|f| f.path));
+                true
+            }
+            Err(errors) => {
+                for e in errors {
+                    eprintln!("error: {}: {}", path.join(&e.path).display(), e.message);
+                }
+                false
+            }
+        };
+    }
+    let Ok(entries) = std::fs::read_dir(path) else { return true };
+    let mut entries: Vec<PathBuf> = entries.filter_map(Result::ok).map(|e| e.path()).collect();
+    entries.sort();
+    let mut ok = true;
+    for e in entries {
+        let hidden = e.file_name().is_some_and(|n| n.to_string_lossy().starts_with('.'));
+        if hidden || std::fs::symlink_metadata(&e).is_ok_and(|m| m.file_type().is_symlink()) {
+            continue;
+        }
+        ok &= collect(&e, out);
+    }
+    ok
 }
 
 pub fn run(args: &[String]) -> ExitCode {
-    let check_only = args.iter().any(|a| a == "--check");
+    let mut check_only = false;
     let mut files = Vec::new();
-    for a in args.iter().filter(|a| !a.starts_with("--")) {
+    let mut layout_ok = true;
+    for a in args {
+        if a == "--check" {
+            check_only = true;
+            continue;
+        }
+        if a.starts_with('-') {
+            return crate::unknown(a);
+        }
         let p = Path::new(a);
         if !p.exists() {
             eprintln!("error: `{a}` doesn't exist");
             return ExitCode::from(2);
         }
-        collect(p, &mut files);
+        layout_ok &= collect(p, &mut files);
+    }
+    if !layout_ok {
+        return ExitCode::from(2);
     }
     if files.is_empty() {
         eprintln!("usage: wrela fmt <file-or-dir>... [--check]");

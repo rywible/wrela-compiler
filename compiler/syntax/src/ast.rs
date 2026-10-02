@@ -3,10 +3,6 @@
 
 use wrela_diag::Span;
 
-/// Identifies an expression or pattern within its file; dense, in parse order.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct NodeId(pub u32);
-
 #[derive(Clone, Debug, PartialEq)]
 pub struct Ident {
     pub name: String,
@@ -17,8 +13,6 @@ pub struct Ident {
 pub struct File {
     pub items: Vec<Item>,
     pub span: Span,
-    /// How many [`NodeId`]s the file uses.
-    pub node_count: u32,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -533,7 +527,6 @@ impl FieldName {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Expr {
-    pub id: NodeId,
     pub kind: ExprKind,
     pub span: Span,
 }
@@ -614,7 +607,6 @@ pub struct FieldPat {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Pat {
-    pub id: NodeId,
     pub kind: PatKind,
     pub span: Span,
 }
@@ -640,10 +632,9 @@ pub enum PatKind {
 }
 
 impl Expr {
-    /// Calls `f` on this expression and every expression inside it, outermost first: operands,
-    /// arguments, fields, blocks' statements, arms and closure bodies.
-    pub fn walk(&self, f: &mut impl FnMut(&Expr)) {
-        f(self);
+    /// Calls `f` on each expression directly inside this one: operands, arguments, fields, the
+    /// expressions of a block's statements, arms (guards and bodies) and a closure's body.
+    pub fn for_each_child<'a>(&'a self, f: &mut impl FnMut(&'a Expr)) {
         match &self.kind {
             ExprKind::Lit(_)
             | ExprKind::Path(_)
@@ -654,82 +645,135 @@ impl Expr {
             | ExprKind::Take(x)
             | ExprKind::MutArg(x)
             | ExprKind::Paren(x)
-            | ExprKind::Field { base: x, .. } => x.walk(f),
+            | ExprKind::Field { base: x, .. } => f(x),
             ExprKind::Binary(_, a, b)
             | ExprKind::Index { base: a, index: b }
             | ExprKind::ArrayRepeat { value: a, count: b } => {
-                a.walk(f);
-                b.walk(f);
+                f(a);
+                f(b);
             }
             ExprKind::Call { callee, args, .. } => {
-                callee.walk(f);
-                args.iter().for_each(|a| a.value.walk(f));
+                f(callee);
+                args.iter().for_each(|a| f(&a.value));
             }
             ExprKind::MethodCall { receiver, args, .. } => {
-                receiver.walk(f);
-                args.iter().for_each(|a| a.value.walk(f));
+                f(receiver);
+                args.iter().for_each(|a| f(&a.value));
             }
             ExprKind::StructLit { fields, base, .. } => {
-                fields.iter().filter_map(|x| x.value.as_ref()).for_each(|v| v.walk(f));
+                fields.iter().filter_map(|x| x.value.as_ref()).for_each(&mut *f);
                 if let Some(b) = base {
-                    b.walk(f);
+                    f(b);
                 }
             }
-            ExprKind::Tuple(xs) | ExprKind::Array(xs) => xs.iter().for_each(|x| x.walk(f)),
-            ExprKind::Block(b) => b.walk(f),
+            ExprKind::Tuple(xs) | ExprKind::Array(xs) => xs.iter().for_each(f),
+            ExprKind::Block(b) => b.for_each_expr(f),
             ExprKind::If { cond, then, else_ } => {
-                cond.walk(f);
-                then.walk(f);
+                f(cond);
+                then.for_each_expr(f);
                 if let Some(e) = else_ {
-                    e.walk(f);
+                    f(e);
                 }
             }
             ExprKind::Match { scrutinee, arms } => {
-                scrutinee.walk(f);
+                f(scrutinee);
                 for a in arms {
                     if let Some(g) = &a.guard {
-                        g.walk(f);
+                        f(g);
                     }
-                    a.body.walk(f);
+                    f(&a.body);
                 }
             }
-            ExprKind::Closure { body, .. } => body.walk(f),
+            ExprKind::Closure { body, .. } => f(body),
             ExprKind::Return(v) => {
                 if let Some(v) = v {
-                    v.walk(f);
+                    f(v);
+                }
+            }
+        }
+    }
+
+    /// Calls `f` on this expression and every expression inside it, outermost first.
+    pub fn walk(&self, f: &mut impl FnMut(&Expr)) {
+        f(self);
+        self.for_each_child(&mut |c| c.walk(f));
+    }
+}
+
+impl Block {
+    /// Calls `f` on each expression directly in the block's statements.
+    pub fn for_each_expr<'a>(&'a self, f: &mut impl FnMut(&'a Expr)) {
+        for s in &self.stmts {
+            match &s.kind {
+                StmtKind::Bind { init, .. } => f(init),
+                StmtKind::Assign { target, value, .. } => {
+                    f(target);
+                    f(value);
+                }
+                StmtKind::Expr(e) => f(e),
+                StmtKind::While { cond, body } => {
+                    f(cond);
+                    body.for_each_expr(f);
+                }
+                StmtKind::Loop { body } => body.for_each_expr(f),
+                StmtKind::For { iter, body, .. } => {
+                    match iter {
+                        ForIter::Range { start, end, .. } => {
+                            f(start);
+                            f(end);
+                        }
+                        ForIter::Expr(e) => f(e),
+                    }
+                    body.for_each_expr(f);
                 }
             }
         }
     }
 }
 
-impl Block {
-    /// [`Expr::walk`] over every statement's expressions.
-    pub fn walk(&self, f: &mut impl FnMut(&Expr)) {
-        for s in &self.stmts {
-            match &s.kind {
-                StmtKind::Bind { init, .. } => init.walk(f),
-                StmtKind::Assign { target, value, .. } => {
-                    target.walk(f);
-                    value.walk(f);
-                }
-                StmtKind::Expr(e) => e.walk(f),
-                StmtKind::While { cond, body } => {
-                    cond.walk(f);
-                    body.walk(f);
-                }
-                StmtKind::Loop { body } => body.walk(f),
-                StmtKind::For { iter, body, .. } => {
-                    match iter {
-                        ForIter::Range { start, end, .. } => {
-                            start.walk(f);
-                            end.walk(f);
-                        }
-                        ForIter::Expr(e) => e.walk(f),
-                    }
-                    body.walk(f);
+impl Item {
+    /// Calls `f` on the item's top-level expressions: function bodies (as blocks' statements),
+    /// parameter and field defaults, and a constant's value.
+    pub fn for_each_body_expr<'a>(&'a self, f: &mut impl FnMut(&'a Expr)) {
+        fn fn_decl<'a>(d: &'a FnDecl, f: &mut impl FnMut(&'a Expr)) {
+            for p in &d.params {
+                if let Param::Named { default: Some(e), .. } = p {
+                    f(e);
                 }
             }
+            if let Some(b) = &d.body {
+                b.for_each_expr(f);
+            }
+        }
+        fn fields<'a>(fs: &'a [FieldDecl], f: &mut impl FnMut(&'a Expr)) {
+            fs.iter().filter_map(|x| x.default.as_ref()).for_each(f);
+        }
+        match &self.kind {
+            ItemKind::Fn(d) => fn_decl(d, f),
+            ItemKind::Struct(s) => fields(&s.fields, f),
+            ItemKind::Enum(e) => {
+                for v in &e.variants {
+                    if let VariantKind::Struct(fs) = &v.kind {
+                        fields(fs, f);
+                    }
+                }
+            }
+            ItemKind::Trait(t) => {
+                for m in &t.members {
+                    if let TraitMemberKind::Fn(d) = &m.kind {
+                        fn_decl(d, f);
+                    }
+                }
+            }
+            ItemKind::Impl(i) => {
+                for m in &i.members {
+                    if let ImplMemberKind::Fn(d) = &m.kind {
+                        fn_decl(d, f);
+                    }
+                }
+            }
+            ItemKind::Const(c) => f(&c.value),
+            ItemKind::Use(_) => {}
         }
     }
 }

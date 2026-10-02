@@ -2041,6 +2041,7 @@ dependencies = [
  "wrela-diag",
  "wrela-driver",
  "wrela-host",
+ "wrela-syntax",
 ]
 
 [[package]]
