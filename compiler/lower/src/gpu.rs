@@ -278,14 +278,33 @@ pub(crate) fn lower_draw(fl: &mut Fl, d: &thir::Draw, span: Span) {
         fields.push((name, it));
         vals.push(v);
     }
+    // Buffers, in the order the pipeline binds them: the vertex shader's, then the fragment
+    // shader's (`bind_buffers`), each by its parameter's name.
+    let PipelineKey::Render { vertex, fragment } = &key else { return };
+    let vret = ret_type(fl.cx, vertex.0, &vertex.1);
+    let mut handles = Vec::new();
+    for (f, substs) in [vertex, fragment] {
+        let tys = param_types(fl.cx, *f, substs);
+        for (i, &t) in tys.iter().enumerate() {
+            if !matches!(classify(fl.cx, *f, i, t, Some(vret)), ParamClass::Buffer { .. }) {
+                continue;
+            }
+            let name = fl.cx.checked.program.func(*f).params[i].name.clone();
+            let Some((_, arg)) = d.args.iter().find(|(n, _)| *n == name) else { return };
+            let Some(v) = fl.expr(arg) else { return };
+            handles.push(handle(fl, v));
+        }
+    }
     let uniform = uniform_block(fl, &fields, &vals, "draw");
     let mut args = vec![vertices, instances];
+    let nbuf = handles.len() as u32;
+    args.extend(handles);
     let uty = uniform.map(|(t, v)| {
         args.push(v);
         t
     });
     fl.emit(ir::Stmt::Eval(ir::Expr::Host(
-        ir::HostOp::Draw { pipeline: pindex, buffers: 0, uniform: uty },
+        ir::HostOp::Draw { pipeline: pindex, buffers: nbuf, uniform: uty },
         args,
     )));
 }

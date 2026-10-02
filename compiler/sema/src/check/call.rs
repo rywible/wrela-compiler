@@ -1532,8 +1532,10 @@ impl<'p> Checker<'p> {
                 }
                 other => match wanted.iter().position(|(w, _)| w == other) {
                     Some(k) => {
-                        let e = self.check_expr(&a.value, Some(wanted[k].1));
-                        self.expect(e.ty, wanted[k].1, e.span);
+                        // A buffer parameter (`[T]`) is passed a `GpuBuffer<T>`.
+                        let want = self.cpu_side_type(wanted[k].1);
+                        let e = self.check_expr(&a.value, Some(want));
+                        self.expect(e.ty, want, e.span);
                         given[k] = Some(e);
                     }
                     None => {

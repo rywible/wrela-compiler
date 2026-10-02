@@ -426,9 +426,7 @@ impl<'a> Printer<'a> {
                     .collect();
                 let column = self.out.len() - self.out.rfind('\n').map_or(0, |i| i + 1);
                 let inline = items.join(", ");
-                if column + 3 + inline.len() < MAX_WIDTH
-                    || items.iter().any(|i| i.contains('\n'))
-                {
+                if column + 3 + inline.len() < MAX_WIDTH || items.iter().any(|i| i.contains('\n')) {
                     self.w("::{");
                     self.w(&inline);
                     self.w("}");

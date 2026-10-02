@@ -1,0 +1,31 @@
+// A draw whose shaders read buffers (compiler/tests/tests/render.rs): the vertex shader places
+// a full-screen triangle from one buffer, the fragment shader colours it from another.
+use std::gpu::{
+    ClipPosition, FragCoord, GpuBuffer, VertexIndex, begin_screen_pass, buffer, draw, present,
+    write,
+}
+
+struct Tint: Copy + Clone + GpuData {
+    scale: f32,
+}
+
+@vertex
+fn cover(v: VertexIndex, corners: [vec2]) -> ClipPosition {
+    ClipPosition { position: vec4(corners[v.index], 0.0, 1.0) }
+}
+
+@fragment
+fn paint(pixel: FragCoord, colors: [vec4], tint: Tint) -> vec4 {
+    let left = if pixel.position.x < 8.0 { 0 } else { 1 }
+    colors[left] * tint.scale
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    let corners: GpuBuffer<vec2> = buffer(3)
+    write(corners, 0, [vec2(-1.0, -1.0), vec2(3.0, -1.0), vec2(-1.0, 3.0)])
+    let colors: GpuBuffer<vec4> = buffer(2)
+    write(colors, 0, [vec4(1.0, 0.0, 0.0, 1.0), vec4(0.0, 0.0, 1.0, 1.0)])
+    begin_screen_pass(clear: vec4(0.0, 0.0, 0.0, 1.0))
+    draw(cover, paint, vertices: 3, corners: corners, colors: colors, tint: Tint { scale: 0.5 })
+    present()
+}
