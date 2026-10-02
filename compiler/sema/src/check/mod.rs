@@ -376,9 +376,15 @@ impl<'p> Checker<'p> {
         span: Span,
     ) -> Option<Stmt> {
         let env_len = self.env.len();
-        let ast::PatKind::Ident(name) = &pat.kind else {
-            self.err(Diagnostic::new(codes::E0100, pat.span, "a `for` loop binds one name"));
-            return None;
+        // One name, or `_` for a loop that doesn't use it.
+        let wild = ast::Ident { name: "_".into(), span: pat.span };
+        let name = match &pat.kind {
+            ast::PatKind::Ident(name) => name,
+            ast::PatKind::Wild => &wild,
+            _ => {
+                self.err(Diagnostic::new(codes::E0100, pat.span, "a `for` loop binds one name"));
+                return None;
+            }
         };
         let kind = match iter {
             ast::ForIter::Range { start, end, inclusive } => {

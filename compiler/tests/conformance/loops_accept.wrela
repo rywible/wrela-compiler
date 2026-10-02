@@ -1,0 +1,22 @@
+// accepts: lex.newline
+// Loops: ranges, arrays and `_` for a value the loop doesn't use.
+fn f(xs: [f32], n: u32) -> f32 {
+    var total = 0.0
+    for _ in 0..n {
+        total += 1.0
+    }
+    for i in 0..=2 {
+        total += xs[i]
+    }
+    for x in xs {
+        total += x
+    }
+    var k = 0
+    while k < 3 {
+        k += 1
+    }
+    loop {
+        break
+    }
+    total
+}
