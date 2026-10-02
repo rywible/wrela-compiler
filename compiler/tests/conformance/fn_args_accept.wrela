@@ -1,0 +1,8 @@
+// accepts: fn.named-args fn.defaults
+fn area(width: f32, height: f32 = 1.0, scale: f32 = 2.0) -> f32 {
+    width * height * scale
+}
+
+fn f() -> f32 {
+    area(3.0) + area(3.0, 4.0) + area(3.0, scale: 0.5) + area(width: 1.0, height: 2.0, scale: 3.0)
+}

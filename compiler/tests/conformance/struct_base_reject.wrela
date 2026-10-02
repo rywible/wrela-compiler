@@ -1,0 +1,14 @@
+// rejects: struct.base
+struct A {
+    x: f32,
+    y: f32,
+}
+
+struct B {
+    x: f32,
+    y: f32,
+}
+
+fn f(b: B) -> A {
+    A { x: 1.0, ..b } //~ E0300
+}

@@ -1,0 +1,8 @@
+// rejects: fn.named-args
+fn area(width: f32, height: f32) -> f32 {
+    width * height
+}
+
+fn f() -> f32 {
+    area(width: 3.0, 4.0) //~ E0105
+}

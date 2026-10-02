@@ -1,0 +1,27 @@
+// accepts: ty.scalars ty.cpu-only ty.vectors ty.arrays ty.runs ty.tuples ty.no-ref ty.tiers
+// Tier 0: unitless numbers, no strings; another value is referred to by index, not `&`.
+struct Herd {
+    leader: u32,
+}
+
+fn sum(xs: [f32]) -> f32 {
+    var s = 0.0
+    for i in 0..3 {
+        s += xs[i]
+    }
+    s
+}
+
+fn f(a: i32, b: u32, c: bool) -> f64 {
+    let wide: f64 = 1.5
+    let big: i64 = 3
+    let small: u8 = 7
+    let v = vec3(1.0, 2.0, 3.0)
+    let w = vec4(v, 1.0).zyx + v.xxy
+    let m = mat3(v, v, v) * v
+    let arr: [f32; 3] = [1.0, 2.0, 3.0]
+    let pair = (a, b)
+    let total = sum(arr)
+    let flag = if c { 1 } else { 0 }
+    wide + f64(big) + f64(small) + f64(w.x + m.y + total) + f64(pair.0 + flag) + f64(pair.1)
+}

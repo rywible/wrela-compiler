@@ -1,0 +1,6 @@
+// rejects: derive.gradient
+use std::derive::gradient
+
+pub fn c(x: f32) -> f32 {
+    gradient(|t: f32| t > 0.0, x) //~ E0300
+}

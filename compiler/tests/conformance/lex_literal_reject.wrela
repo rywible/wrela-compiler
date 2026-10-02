@@ -1,0 +1,5 @@
+// rejects: lex.literals
+fn f() -> u8 {
+    let x: u8 = 256 //~ E0006
+    x
+}

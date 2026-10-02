@@ -1,0 +1,11 @@
+pub struct Blob {
+    pub r: f32,
+}
+
+pub fn blob(r: f32) -> Blob {
+    Blob { r: helper(r) }
+}
+
+fn helper(r: f32) -> f32 {
+    r
+}

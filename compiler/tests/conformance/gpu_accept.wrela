@@ -1,0 +1,50 @@
+// accepts: gpu.entry gpu.kernel-mut gpu.data gpu.dispatch gpu.workgroup eff.gpu attr.gpu attr.closed
+use std::gpu::{
+    ClipPosition, FragCoord, GlobalId, GpuBuffer, Slots, VertexIndex, begin_screen_pass, buffer,
+    dispatch, draw, present, write,
+}
+
+struct Params: Copy + Clone + GpuData {
+    scale: f32,
+    count: u32,
+}
+
+@gpu
+fn twice(x: f32) -> f32 {
+    2.0 * x
+}
+
+@compute(64)
+fn fill(p: Params, input: [f32], out: mut Slots<f32>, id: GlobalId) {
+    if id.x < p.count {
+        out[id] = twice(input[id.x]) * p.scale
+    }
+}
+
+@compute(8, 8)
+fn grid(out: mut Slots<u32>, id: GlobalId) {
+    out[id] = id.x + id.y
+}
+
+@vertex
+fn cover(v: VertexIndex) -> ClipPosition {
+    ClipPosition { position: vec4(f32(v.index), 0.0, 0.0, 1.0) }
+}
+
+@fragment
+fn paint(pixel: FragCoord, p: Params) -> vec4 {
+    vec4(pixel.position.xy * p.scale, 0.0, 1.0)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    let input: GpuBuffer<f32> = buffer(64)
+    write(input, 0, [1.0, 2.0, 3.0])
+    let out: GpuBuffer<f32> = buffer(64)
+    let p = Params { scale: time, count: 3 }
+    dispatch(fill, groups: 1, p: p, input: input, out: out)
+    let cells: GpuBuffer<u32> = buffer(64)
+    dispatch(grid, groups: (1, 1, 1), out: cells)
+    begin_screen_pass(clear: vec4(0.0, 0.0, 0.0, 1.0))
+    draw(cover, paint, vertices: 3, p: p)
+    present()
+}

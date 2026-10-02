@@ -1,0 +1,7 @@
+// rejects: gpu.workgroup
+use std::gpu::{GlobalId, Slots}
+
+@compute(512) //~ E0605
+fn big(out: mut Slots<u32>, id: GlobalId) {
+    out[id] = id.x
+}

@@ -1,0 +1,6 @@
+// accepts: mem.no-globals
+const LIMIT: u32 = 10
+
+fn f() -> u32 {
+    LIMIT
+}

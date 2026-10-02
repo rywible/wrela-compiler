@@ -1,0 +1,24 @@
+// rejects: gen.bounds gen.impl-trait
+trait Shape {
+    fn area(self) -> f32
+}
+
+struct Circle {
+    r: f32,
+}
+
+fn one(s: Shape) -> f32 {
+    s.area()
+}
+
+fn total<S: Shape>(a: S) -> f32 {
+    a.perimeter() //~ E0207
+}
+
+struct Holder {
+    s: Shape, //~ E0410
+}
+
+fn f() -> f32 {
+    one(Circle { r: 1.0 }) //~ E0400
+}

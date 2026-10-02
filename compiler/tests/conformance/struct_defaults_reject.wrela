@@ -1,0 +1,11 @@
+// rejects: struct.defaults
+struct Look {
+    tolerance: f32 = true, //~ E0300
+    resolution: u32 = 2 + 2, //~ E0324
+    soft: bool,
+}
+
+fn f() -> f32 {
+    let l = Look { tolerance: 0.5 } //~ E0307
+    l.tolerance
+}

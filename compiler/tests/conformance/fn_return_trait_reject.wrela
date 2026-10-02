@@ -1,0 +1,10 @@
+// rejects: fn.return-trait
+use std::field::{Surface, ellipsoid, sphere}
+
+fn shape(round: bool) -> Surface {
+    if round {
+        sphere(1.0)
+    } else {
+        ellipsoid(vec3(1.0, 2.0, 1.0)) //~ E0300
+    }
+}

@@ -1,0 +1,5 @@
+// rejects: lex.newline lex.semicolon
+fn f() -> i32 {
+    let a = 1 let b = 2 //~ E0104
+    a + b
+}

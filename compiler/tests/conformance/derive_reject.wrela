@@ -1,0 +1,24 @@
+// rejects: derive.gradient derive.interval eff.derived
+use std::derive::{Interval, gradient, interval}
+use std::gpu::{GpuBuffer, buffer}
+
+fn recorded(x: f32) -> f32 {
+    let b: GpuBuffer<f32> = buffer(4)
+    x
+}
+
+fn wobble(t: f32) -> f32 {
+    var x = t
+    while x > 0.0 {
+        x -= 1.0
+    }
+    x
+}
+
+pub fn a(x: f32) -> f32 {
+    gradient(recorded, x) //~ E0700
+}
+
+pub fn b(x: f32) -> f32 {
+    interval(wobble, Interval { lo: x, hi: x + 1.0 }).lo //~ E0701
+}

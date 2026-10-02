@@ -1,0 +1,19 @@
+// accepts: struct.defaults struct.opt-in struct.base
+struct Look: Copy + Clone {
+    tolerance: f32 = 0.002,
+    resolution: u32 = 1024,
+    soft: bool,
+}
+
+struct Pair: Copy + Clone + GpuData {
+    a: vec3,
+    b: f32,
+}
+
+fn f() -> u32 {
+    let base = Look { soft: true }
+    let fine = Look { tolerance: 0.001, ..base }
+    let p = Pair { a: vec3(), b: 1.0 }
+    let q = p
+    fine.resolution + u32(q.b + p.b)
+}

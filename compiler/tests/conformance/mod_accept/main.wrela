@@ -1,0 +1,8 @@
+// accepts: mod.use mod.names
+use shapes::blob::{Blob, blob}
+use std::field::sphere
+
+fn f() -> f32 {
+    let b: Blob = blob(2.0)
+    b.r + sphere(1.0).radius
+}

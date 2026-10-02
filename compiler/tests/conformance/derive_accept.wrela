@@ -1,0 +1,20 @@
+// accepts: derive.gradient derive.interval eff.derived
+use std::derive::{Box3, Interval, gradient, interval, value_and_gradient}
+use std::field::{Surface, sphere}
+
+fn f(p: vec3) -> f32 {
+    length(p) - 1.0
+}
+
+pub fn g(x: f32, y: f32, z: f32) -> vec3 {
+    let p = vec3(x, y, z)
+    let k = 2.0
+    gradient(f, p) + gradient(|q| k * f(q), p) + sphere(1.0).gradient(p)
+}
+
+pub fn h(x: f32) -> f32 {
+    let r = interval(|t: f32| t * t - 1.0, Interval { lo: x, hi: x + 1.0 })
+    let s = sphere(1.0).interval(Box3 { lo: vec3(), hi: vec3(x) })
+    let (v, d) = value_and_gradient(|t: f32| sin(t), x)
+    r.lo + s.hi + v + d
+}

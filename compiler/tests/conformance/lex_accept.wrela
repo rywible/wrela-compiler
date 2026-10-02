@@ -1,0 +1,20 @@
+// accepts: lex.newline lex.trailing-op lex.semicolon lex.comments lex.no-suffix lex.pow-xor lex.literals lex.else lex.chars
+/// A doc comment on a function.
+fn f(a: f32, b: f32) -> f32 {
+    // A line comment.
+    let x = a + b
+    let y = vec3(
+        x,
+        a,
+        b,
+    ).x
+    let p = 2.0 ** 3.0
+    let q = 6 ^ 3
+    let r = 255
+    let s: u8 = 255
+    if x > y {
+        p
+    } else {
+        f32(q + r) + f32(s)
+    }
+}

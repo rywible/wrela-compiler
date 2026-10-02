@@ -1,0 +1,9 @@
+// accepts: mem.closures
+fn apply(f: fn(f32) -> f32, x: f32) -> f32 {
+    f(x)
+}
+
+fn f(scale: f32) -> f32 {
+    let k = 2.0
+    apply(|x| x * k * scale, 3.0) + apply(|x| x + 1.0, 1.0)
+}

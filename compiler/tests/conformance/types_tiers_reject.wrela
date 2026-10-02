@@ -1,0 +1,9 @@
+// rejects: ty.tiers
+fn f() -> f32 {
+    let d = 2m //~ E0900
+    d
+}
+
+fn h(x: Option<f32>) {
+    let y = x? //~ E0902
+}

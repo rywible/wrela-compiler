@@ -437,6 +437,18 @@ impl<'a> Parser<'a> {
                         .expr_node(ExprKind::Call { callee: Box::new(e), args, multiline }, span);
                     after_field = false;
                 }
+                T::Question => {
+                    // `?` is tier 1: say so, and read on as if it weren't there.
+                    let q = self.bump();
+                    self.error(
+                        Diagnostic::new(
+                            codes::E0902,
+                            q.span,
+                            "`?` and `Result` are tier 1, so errors can't be propagated yet",
+                        )
+                        .with_help("match on the value instead"),
+                    );
+                }
                 T::LBracket => {
                     self.bump();
                     let index = self.parse_expr()?;
@@ -576,6 +588,17 @@ impl<'a> Parser<'a> {
                 };
                 let lit = Lit { kind, text: self.text_of(t.span).to_string(), span: t.span };
                 Ok(self.expr_node(ExprKind::Lit(lit), t.span))
+            }
+            T::Unsafe if self.nth(1) == T::LBrace => {
+                // `unsafe` is for the stdlib's core, in tier 1: say so, and read the block.
+                let u = self.bump();
+                self.error(
+                    Diagnostic::new(codes::E0904, u.span, "`unsafe` is tier 1")
+                        .with_note("only the stdlib's core will use it (language.md §6.14)"),
+                );
+                let b = self.parse_block()?;
+                let span = u.span.to(b.span);
+                Ok(self.expr_node(ExprKind::Block(b), span))
             }
             T::Ident | T::SelfType | T::SelfValue => {
                 let path = self.parse_path_expr()?;
@@ -721,15 +744,8 @@ impl<'a> Parser<'a> {
             return Err(self.expected("`{` to start the `if` body"));
         }
         let then = self.parse_block()?;
-        let else_ = if self.eat(T::Else) {
-            if self.at(T::If) {
-                Some(Box::new(self.parse_if()?))
-            } else {
-                let b = self.parse_block()?;
-                let span = b.span;
-                Some(Box::new(self.expr_node(ExprKind::Block(b), span)))
-            }
-        } else if self.at(T::Newline) && self.nth(1) == T::Else {
+        let misplaced = self.at(T::Newline) && self.nth(1) == T::Else;
+        if misplaced {
             let nl = self.tok().span;
             let els = self.tokens[self.pos + 1].span;
             self.error(
@@ -745,7 +761,17 @@ impl<'a> Parser<'a> {
                     " ",
                 ),
             );
-            return Err(Failed);
+            // Read on as if the lines were joined, so nothing else is reported for it.
+            self.bump();
+        }
+        let else_ = if self.eat(T::Else) {
+            if self.at(T::If) {
+                Some(Box::new(self.parse_if()?))
+            } else {
+                let b = self.parse_block()?;
+                let span = b.span;
+                Some(Box::new(self.expr_node(ExprKind::Block(b), span)))
+            }
         } else {
             None
         };

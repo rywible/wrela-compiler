@@ -1,0 +1,12 @@
+// rejects: mod.use mod.names
+use shapes::{blob, helper} //~ E0203
+use shapes::nothing //~ E0200
+use nowhere::thing //~ E0202
+
+fn f() -> f32 {
+    0.0
+}
+
+fn f() -> f32 { //~ E0201
+    1.0
+}

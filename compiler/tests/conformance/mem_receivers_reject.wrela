@@ -1,0 +1,15 @@
+// rejects: mem.receivers
+struct Builder {
+    n: u32,
+}
+
+impl Builder {
+    fn finish(take self) -> u32 {
+        self.n
+    }
+}
+
+fn f() -> u32 {
+    let b = Builder { n: 1 }
+    b.finish() //~ E0501
+}

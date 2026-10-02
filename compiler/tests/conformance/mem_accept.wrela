@@ -1,0 +1,62 @@
+// accepts: mem.copy mem.take mem.clone mem.modes mem.receivers mem.bindings mem.projections mem.exclusivity mem.loops
+struct Log: Clone {
+    count: u32,
+    last: f32,
+}
+
+impl Log {
+    fn push(mut self, x: f32) {
+        self.count += 1
+        self.last = x
+    }
+
+    fn finish(take self) -> u32 {
+        self.count
+    }
+}
+
+struct World {
+    log: Log,
+    other: Log,
+    values: [f32; 4],
+}
+
+fn archive(log: take Log) -> u32 {
+    log.count
+}
+
+fn bump(x: mut f32) {
+    x += 1.0
+}
+
+fn first(w: mut World) -> mut f32 {
+    mut w.values[0]
+}
+
+fn peek(w: World) -> borrow Log {
+    w.log
+}
+
+fn f(w: mut World) -> u32 {
+    let v = vec3(1.0, 2.0, 3.0)
+    let v2 = v
+    var log = Log { count: 0, last: v.x + v2.y }
+    var backup = log.clone()
+    log.push(1.0)
+    backup.push(2.0)
+    bump(mut w.log.last)
+    bump(mut w.other.last)
+    mut a = w.log
+    mut b = w.other
+    a.push(3.0)
+    b.push(4.0)
+    mut x = first(mut w)
+    x += 1.0
+    let seen = peek(w).count
+    var total = 0
+    for i in 0..3 {
+        let t = Log { count: i, last: 0.0 }
+        total += archive(take t)
+    }
+    total + seen + take backup.finish() + archive(take log)
+}

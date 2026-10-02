@@ -247,6 +247,11 @@ impl<'a> Walker<'a> {
 
     fn declare(&mut self, l: LocalId) {
         self.decl_depth[l.index()] = self.loops.len() as u32;
+        // A binding is a new value: in a loop's next pass, what the last one moved out of it is
+        // gone with it.
+        if let Some(m) = &mut self.moves {
+            m.retain(|x| x.place.root != l);
+        }
         let p = self.tick();
         if self.liveness && self.live_end[l.index()] < p {
             self.live_end[l.index()] = p;

@@ -1,0 +1,6 @@
+// rejects: const.literal
+fn twice(x: u32) -> u32 {
+    2 * x
+}
+
+const SIZE: u32 = twice(32) //~ E0906

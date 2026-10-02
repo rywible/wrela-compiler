@@ -1,0 +1,3 @@
+// rejects: lex.comments
+/* a block comment */ //~ E0002
+fn f() {}

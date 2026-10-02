@@ -4,7 +4,9 @@
 // branches on the input, early returns, loops and integer arithmetic. Each is a `Surface`, so
 // `gradient` and `interval` come from the trait's defaults.
 use grazer::{Grazer, grazer}
-use std::field::{Surface, ellipsoid, fbm, half_space, hash_u32, round_cone, smin, sphere, value_noise}
+use std::field::{
+    Surface, ellipsoid, fbm, half_space, hash_u32, round_cone, smin, sphere, value_noise,
+}
 
 /// The creature from examples/hello-field (shape.wrela), mid-breath.
 pub fn creature() -> Surface {

@@ -1,0 +1,31 @@
+// accepts: gen.bounds gen.impl-trait
+trait Shape {
+    fn area(self) -> f32
+}
+
+struct Square: Copy + Clone {
+    side: f32,
+}
+
+impl Shape for Square {
+    fn area(self) -> f32 {
+        self.side * self.side
+    }
+}
+
+fn total<S: Shape>(a: S, b: S) -> f32 {
+    a.area() + b.area()
+}
+
+fn one(s: Shape) -> f32 {
+    s.area()
+}
+
+fn pick<T: Copy>(c: bool, a: T, b: T) -> T {
+    if c { a } else { b }
+}
+
+fn f() -> f32 {
+    let s = Square { side: 2.0 }
+    total(s, s) + one(s) + pick(true, 1.0, 2.0) + f32(pick(false, 1, 2))
+}

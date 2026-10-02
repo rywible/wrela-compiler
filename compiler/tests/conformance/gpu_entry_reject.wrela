@@ -1,0 +1,12 @@
+// rejects: gpu.entry
+use std::gpu::{GlobalId, Slots}
+
+@compute(64)
+fn returns(id: GlobalId) -> f32 { //~ E0602
+    1.0
+}
+
+@vertex
+fn nothing(x: f32) -> f32 { //~ E0602
+    x
+}

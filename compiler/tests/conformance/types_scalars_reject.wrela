@@ -1,0 +1,16 @@
+// rejects: ty.scalars ty.vectors ty.arrays ty.tuples
+// Mixed integer types don't convert implicitly.
+fn f(a: i32, b: u32) -> u32 {
+    let c = a + b //~ E0305
+    let v = vec3(1.0, 2.0) //~ E0323
+    let w = v.xq //~ E0317
+    let n = 3
+    let arr = [0.0; n] //~ E0325
+    let t = (1, 2)
+    let z = t.2 //~ E0206
+    if a { //~ E0313
+        1
+    } else {
+        2
+    }
+}

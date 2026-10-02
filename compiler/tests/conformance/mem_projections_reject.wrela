@@ -1,0 +1,13 @@
+// rejects: mem.projections
+struct World {
+    values: [f32; 4],
+}
+
+fn local() -> borrow f32 {
+    let w = World { values: [0.0; 4] }
+    w.values[0] //~ E0508
+}
+
+fn owned(w: take World) -> borrow f32 {
+    w.values[1] //~ E0508
+}

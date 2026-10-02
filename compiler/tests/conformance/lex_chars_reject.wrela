@@ -1,0 +1,5 @@
+// rejects: lex.chars
+fn f() -> i32 {
+    let a$ = 1 //~ E0001
+    1
+}

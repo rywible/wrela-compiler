@@ -1,0 +1,18 @@
+// rejects: mem.take
+struct Log {
+    count: u32,
+}
+
+fn archive(log: take Log) -> u32 {
+    log.count
+}
+
+fn f(c: bool) -> u32 {
+    let log = Log { count: 1 }
+    if c {
+        archive(take log)
+    } else {
+        0
+    }
+    log.count //~ E0516
+}

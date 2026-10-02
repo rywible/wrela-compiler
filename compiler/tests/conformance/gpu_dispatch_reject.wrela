@@ -1,0 +1,17 @@
+// rejects: gpu.dispatch
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch}
+
+@compute(64)
+fn fill(scale: f32, out: mut Slots<f32>, id: GlobalId) {
+    out[id] = scale
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    let out: GpuBuffer<f32> = buffer(64)
+    dispatch(fill, groups: 1, out: out) //~ E0603
+    dispatch(fill, groups: 1, scale: 1.0, out: out, extra: 2.0) //~ E0603
+}
+
+fn direct() {
+    fill(1.0) //~ E0606
+}

@@ -21,6 +21,8 @@ struct Obligation {
     ty: TyId,
     trait_ref: TraitRef,
     span: Span,
+    /// The code reported if it isn't met: E0400, or a more specific one.
+    code: wrela_diag::Code,
     /// What needed it, for the message: "the argument `field` of `sample`".
     why: String,
 }
@@ -440,7 +442,19 @@ impl<'p> Checker<'p> {
     }
 
     pub(crate) fn obligation(&mut self, ty: TyId, trait_ref: TraitRef, span: Span, why: String) {
-        self.obligations.push(Obligation { ty, trait_ref, span, why });
+        self.obligations.push(Obligation { ty, trait_ref, span, code: codes::E0400, why });
+    }
+
+    /// An obligation reported with its own code when it isn't met.
+    pub(crate) fn obligation_coded(
+        &mut self,
+        code: wrela_diag::Code,
+        ty: TyId,
+        trait_ref: TraitRef,
+        span: Span,
+        why: String,
+    ) {
+        self.obligations.push(Obligation { ty, trait_ref, span, code, why });
     }
 
     // ---- closures --------------------------------------------------------------------------
@@ -569,6 +583,22 @@ pub fn check_fn(p: &mut Program, f: FnId) -> (Option<Body>, Vec<Diagnostic>) {
         let id = c.declare_local(&ps.name, ps.ty, LocalKind::Param(ps.mode), ps.span);
         params.push(id);
     }
+    // Defaults are checked here, where they're declared, as well as where they're used.
+    for ps in &def.params {
+        if let Some(d) = &ps.default {
+            let e = c.check_default(d, ps.ty);
+            if let Some(bad) = zonk::non_literal(&e) {
+                c.err(
+                    Diagnostic::new(
+                        codes::E0324,
+                        bad.span,
+                        "a parameter's default must be a literal value",
+                    )
+                    .with_note("evaluating calls and arithmetic at compile time is tier 1 (D-073)"),
+                );
+            }
+        }
+    }
     let hidden =
         if def.opaque.is_some() { Some(c.new_var(VarKind::General, def.sig_span)) } else { None };
     c.ret_ty = hidden.unwrap_or(def.ret);
@@ -601,6 +631,30 @@ pub fn check_fn(p: &mut Program, f: FnId) -> (Option<Body>, Vec<Diagnostic>) {
     let mut out = zonk::finish(c, params, value, hidden, f);
     if let Some(b) = &mut out.0 {
         crate::check::zonk::check_opaque(p, f, b, &mut out.1);
+    }
+    out
+}
+
+/// Checks a struct's field defaults where they're declared: literal values of the field's type.
+pub fn check_field_defaults(p: &mut Program, a: AdtId) -> Vec<Diagnostic> {
+    let def = p.adt(a).clone();
+    let mut out = Vec::new();
+    for f in def.fields() {
+        let Some(d) = &f.default else { continue };
+        let mut c = Checker::new(p, Scope::new(def.module), None);
+        let e = c.check_default(d, f.ty);
+        if let Some(bad) = zonk::non_literal(&e) {
+            c.err(
+                Diagnostic::new(
+                    codes::E0324,
+                    bad.span,
+                    "a field's default must be a literal value",
+                )
+                .with_note("evaluating calls and arithmetic at compile time is tier 1 (D-073)"),
+            );
+        }
+        zonk::finish_common(&mut c);
+        out.extend(c.diags);
     }
     out
 }

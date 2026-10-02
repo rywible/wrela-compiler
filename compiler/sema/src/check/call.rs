@@ -84,6 +84,11 @@ impl<'p> Checker<'p> {
                         )
                         .with_note("entry points run on the GPU and can't be called directly"),
                     );
+                    // Its arguments are still checked, but not against its parameters.
+                    for a in args {
+                        self.check_expr(&a.value, None);
+                    }
+                    return self.error_expr(span);
                 }
                 let gen_args = self.fresh_fn_args(f, path, span);
                 self.call_fn(f, gen_args, None, args, expected, span)
@@ -1234,7 +1239,8 @@ impl<'p> Checker<'p> {
                 }
                 let clone = self.p.lang_trait(Lang::Clone);
                 if let Some(c) = clone {
-                    self.obligation(
+                    self.obligation_coded(
+                        codes::E0514,
                         rt,
                         TraitRef { trait_: c, args: Vec::new() },
                         recv.span,

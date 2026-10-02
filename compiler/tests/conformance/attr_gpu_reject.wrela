@@ -1,0 +1,5 @@
+// rejects: attr.gpu
+@gpu
+fn wide(x: f32) -> f32 {
+    f32(f64(x) * 2.0) //~ E0326
+}

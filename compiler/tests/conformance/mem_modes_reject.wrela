@@ -1,0 +1,14 @@
+// rejects: mem.modes
+fn bump(x: mut f32) {
+    x += 1.0
+}
+
+fn read(x: f32) -> f32 {
+    x
+}
+
+fn f() -> f32 {
+    var a = 1.0
+    bump(a) //~ E0503
+    read(mut a) //~ E0504
+}

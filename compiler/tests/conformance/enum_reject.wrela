@@ -1,0 +1,17 @@
+// rejects: enum.match
+enum Edit {
+    Dig { radius: f32 },
+    Fill { radius: f32 },
+    Clear,
+}
+
+fn size(e: Edit) -> f32 {
+    match e { //~ E0309
+        Edit::Dig { radius } => radius,
+        Edit::Clear => 0.0,
+    }
+}
+
+fn other() -> Edit {
+    Edit::Grow //~ E0211
+}

@@ -1,0 +1,8 @@
+// rejects: trait.orphan
+use std::field::Surface
+
+impl Surface for vec3 { //~ E0404
+    fn distance(self, p: vec3) -> f32 {
+        length(p - self)
+    }
+}

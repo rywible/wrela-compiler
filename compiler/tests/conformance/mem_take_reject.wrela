@@ -1,0 +1,24 @@
+// rejects: mem.take mem.copy
+struct Log {
+    count: u32,
+}
+
+fn archive(log: take Log) -> u32 {
+    log.count
+}
+
+fn f() -> u32 {
+    let log = Log { count: 1 }
+    let a = archive(take log)
+    let b = archive(take log) //~ E0500
+    a + b
+}
+
+fn g() -> u32 {
+    let log = Log { count: 1 }
+    archive(log) //~ E0501
+}
+
+fn h() -> u32 {
+    archive(take Log { count: 2 }) //~ E0511
+}

@@ -1,0 +1,17 @@
+// rejects: mem.loops
+struct Log {
+    count: u32,
+}
+
+fn archive(log: take Log) -> u32 {
+    log.count
+}
+
+fn f() -> u32 {
+    let log = Log { count: 1 }
+    var total = 0
+    for i in 0..3 {
+        total += archive(take log) //~ E0515
+    }
+    total
+}

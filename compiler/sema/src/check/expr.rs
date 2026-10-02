@@ -132,7 +132,7 @@ impl<'p> Checker<'p> {
                 } else if !crate::traits::implements_builtin(self.p, vt, Lang::Copy) {
                     let shown = self.display(v.ty);
                     self.err(Diagnostic::new(
-                        codes::E0514,
+                        codes::E0400,
                         v.span,
                         format!("`[x; n]` copies `x`, so it must be `Copy`, and `{shown}` isn't"),
                     ));
@@ -481,6 +481,25 @@ impl<'p> Checker<'p> {
                         },
                     };
                 }
+                // An enum without that variant or method: say so, rather than that it must be
+                // called.
+                if let TyKind::Adt(a, _) = self.kind(ty)
+                    && self.p.adt(a).is_enum()
+                    && !self.has_associated_fn(a, &name.name)
+                {
+                    let adt = self.p.adt(a).clone();
+                    let mut d = Diagnostic::new(
+                        codes::E0211,
+                        name.span,
+                        format!("`{}` has no variant `{}`", adt.name, name.name),
+                    );
+                    let names = adt.variants().iter().map(|v| v.name.as_str());
+                    if let Some(s) = resolve::closest(&name.name, names) {
+                        d = d.with_fix(format!("did you mean `{s}`?"), name.span, s);
+                    }
+                    self.err(d);
+                    return self.error_expr(span);
+                }
                 self.err(Diagnostic::new(
                     codes::E0212,
                     span,
@@ -497,6 +516,15 @@ impl<'p> Checker<'p> {
                 self.error_expr(span)
             }
         }
+    }
+
+    /// Whether a type has an inherent associated function or method of this name.
+    fn has_associated_fn(&self, a: AdtId, name: &str) -> bool {
+        self.p.inherent_impls.get(&a).is_some_and(|impls| {
+            impls
+                .iter()
+                .any(|&i| self.p.impl_(i).methods.iter().any(|&f| self.p.func(f).name == name))
+        })
     }
 
     /// An ADT's generic arguments for a path: explicit (`Option::<u32>::None`), or fresh
@@ -1283,7 +1311,20 @@ impl<'p> Checker<'p> {
                         && self.infer.unify(&mut self.p.types, ex.ty, t.ty).is_err()
                     {
                         let (a, b) = (self.display(t.ty), self.display(ex.ty));
-                        self.err(Diagnostic::new(codes::E0300, ex.span, format!("the branches of this `if` have different types: `{a}` and `{b}`")).with_secondary(t.span, format!("this is `{a}`")));
+                        // Point at the values, not the blocks around them.
+                        let at = match &ex.kind {
+                            ExprKind::Block(b) => b.tail.as_ref().map_or(ex.span, |t| t.span),
+                            _ => ex.span,
+                        };
+                        let then_at = t.tail.as_ref().map_or(t.span, |x| x.span);
+                        self.err(
+                            Diagnostic::new(
+                                codes::E0300,
+                                at,
+                                format!("the branches of this `if` have different types: `{a}` and `{b}`"),
+                            )
+                            .with_secondary(then_at, format!("this is `{a}`")),
+                        );
                     }
                     t.ty
                 };

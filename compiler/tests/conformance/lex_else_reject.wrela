@@ -1,0 +1,9 @@
+// rejects: lex.else
+fn f(a: bool) -> i32 {
+    if a {
+        1
+    }
+    else { //~ E0111
+        2
+    }
+}

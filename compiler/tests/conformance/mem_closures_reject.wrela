@@ -1,0 +1,8 @@
+// rejects: mem.closures
+struct Holder {
+    f: fn(f32) -> f32, //~ E0510
+}
+
+fn make(k: f32) -> fn(f32) -> f32 { //~ E0510
+    |x| x * k
+}

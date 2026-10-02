@@ -31,6 +31,8 @@ struct Printer<'a> {
     text: &'a str,
 }
 
+/// The column a `use` list wraps at.
+const MAX_WIDTH: usize = 100;
 const INDENT: &str = "    ";
 
 impl<'a> Printer<'a> {
@@ -158,6 +160,10 @@ impl<'a> Printer<'a> {
             if let Some(args) = &a.args {
                 self.args(args, false, a.span.end);
             }
+            // A comment after the attribute, on its line, stays there.
+            let end = a.span.end as usize;
+            let eol = self.text[end..].find('\n').map_or(self.text.len(), |i| end + i);
+            self.flush_trailing(eol as u32);
             self.newline();
         }
     }
@@ -402,13 +408,54 @@ impl<'a> Printer<'a> {
                 self.w(&r.name);
             }
             UseKind::Group(trees) => {
-                self.w("::{");
-                for (i, t) in trees.iter().enumerate() {
-                    if i > 0 {
-                        self.w(", ");
-                    }
-                    self.use_tree(t);
+                // On one line if it fits in 100 columns; otherwise one item per slot, packed
+                // into lines of up to 100.
+                let items: Vec<String> = trees
+                    .iter()
+                    .map(|t| {
+                        let mut p = Printer {
+                            out: String::new(),
+                            indent: 0,
+                            comments: &[],
+                            next: 0,
+                            text: self.text,
+                        };
+                        p.use_tree(t);
+                        p.out
+                    })
+                    .collect();
+                let column = self.out.len() - self.out.rfind('\n').map_or(0, |i| i + 1);
+                let inline = items.join(", ");
+                if column + 3 + inline.len() + 1 <= MAX_WIDTH
+                    || items.iter().any(|i| i.contains('\n'))
+                {
+                    self.w("::{");
+                    self.w(&inline);
+                    self.w("}");
+                    return;
                 }
+                self.w("::{");
+                self.indent += 1;
+                self.newline();
+                let indent = INDENT.len() * self.indent;
+                let mut line = indent;
+                for (i, item) in items.iter().enumerate() {
+                    let piece = item.len() + 1;
+                    if i > 0 {
+                        if line + 1 + piece > MAX_WIDTH {
+                            self.newline();
+                            line = indent;
+                        } else {
+                            self.w(" ");
+                            line += 1;
+                        }
+                    }
+                    self.w(item);
+                    self.w(",");
+                    line += piece;
+                }
+                self.indent -= 1;
+                self.newline();
                 self.w("}");
             }
         }

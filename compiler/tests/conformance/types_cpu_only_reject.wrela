@@ -1,0 +1,12 @@
+// rejects: ty.cpu-only
+use std::gpu::{GlobalId, Slots}
+
+struct Params: Copy + Clone + GpuData {
+    scale: f32,
+}
+
+@compute(64)
+fn k(p: Params, out: mut Slots<f32>, id: GlobalId) {
+    let wide: f64 = f64(p.scale) //~ E0326
+    out[id] = f32(wide)
+}

@@ -1,0 +1,9 @@
+// rejects: mem.clone
+struct Log {
+    count: u32,
+}
+
+fn f(l: Log) -> u32 {
+    let c = l.clone() //~ E0514
+    c.count
+}

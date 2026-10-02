@@ -1,0 +1,6 @@
+// rejects: mem.no-globals
+var counter: u32 = 0 //~ E0213
+
+fn f() -> u32 {
+    1
+}

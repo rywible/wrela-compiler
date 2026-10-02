@@ -1,0 +1,4 @@
+// rejects: lex.pow-xor
+fn f(a: f32) -> f32 {
+    a ^ 2.0 //~ E0305
+}

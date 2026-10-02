@@ -1,0 +1,8 @@
+// accepts: gpu.cpu
+use std::gpu::FragCoord
+
+@fragment
+fn edge(pixel: FragCoord) -> vec4 {
+    let w = fwidth(pixel.position.x) + dpdx(pixel.position.y)
+    vec4(w, 0.0, 0.0, 1.0)
+}

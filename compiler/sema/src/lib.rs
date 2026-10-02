@@ -5,6 +5,7 @@ pub mod builtins;
 pub mod check;
 pub mod collect;
 pub mod defs;
+pub mod gpu;
 pub mod memory;
 pub mod program;
 pub mod resolve;
@@ -38,6 +39,7 @@ pub struct Checked {
 /// Collects and type-checks a whole program.
 pub fn check_program(units: Vec<SourceUnit>, diags: &mut Vec<Diagnostic>) -> Checked {
     let mut program = collect::collect(units, diags);
+    diags.extend(gpu::check_entries(&program));
     let mut bodies = BTreeMap::new();
     for i in 0..program.fns.len() {
         let f = ty::FnId(i as u32);
@@ -51,6 +53,9 @@ pub fn check_program(units: Vec<SourceUnit>, diags: &mut Vec<Diagnostic>) -> Che
             }
             bodies.insert(f, b);
         }
+    }
+    for i in 0..program.adts.len() {
+        diags.extend(check::check_field_defaults(&mut program, ty::AdtId(i as u32)));
     }
     let mut consts = BTreeMap::new();
     for i in 0..program.consts.len() {

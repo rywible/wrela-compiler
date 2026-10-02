@@ -1,0 +1,4 @@
+// rejects: gpu.cpu
+pub fn frame(time: f32, width: u32, height: u32) {
+    let w = dpdx(time) //~ E0607
+}

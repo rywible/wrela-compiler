@@ -1,0 +1,21 @@
+// accepts: enum.match ty.option
+enum Edit: Copy + Clone {
+    Dig { at: vec3, radius: f32 },
+    Fill { at: vec3, radius: f32 },
+    Clear,
+}
+
+fn size(e: Edit) -> f32 {
+    match e {
+        Edit::Dig { radius, .. } => radius,
+        Edit::Fill { radius, at } => radius + at.x,
+        Edit::Clear => 0.0,
+    }
+}
+
+fn first(x: Option<f32>) -> f32 {
+    match x {
+        Option::Some(v) => v,
+        Option::None => 0.0,
+    }
+}

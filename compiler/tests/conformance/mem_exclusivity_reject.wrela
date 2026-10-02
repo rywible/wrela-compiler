@@ -1,0 +1,27 @@
+// rejects: mem.exclusivity
+struct Log {
+    count: u32,
+}
+
+struct World {
+    log: Log,
+    values: [f32; 4],
+}
+
+fn pair(a: mut f32, b: mut f32) {
+    a += b
+}
+
+fn read(w: World) -> u32 {
+    w.log.count
+}
+
+fn f(w: mut World) -> u32 {
+    mut v = w.values[0]
+    let c = read(w) //~ E0506
+    v += 1.0
+    pair(mut w.values[1], mut w.values[2]) //~ E0513
+    let l = w.log
+    w.log = Log { count: 0 } //~ E0507
+    c + l.count
+}

@@ -1,0 +1,8 @@
+// rejects: fn.defaults
+fn area(width: f32, height: f32 = true) -> f32 { //~ E0300
+    width * height
+}
+
+fn scale(x: f32, by: f32 = area(1.0)) -> f32 { //~ E0324
+    x * by
+}

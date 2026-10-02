@@ -1,0 +1,11 @@
+// rejects: gpu.data
+use std::gpu::{GlobalId, Slots, dispatch}
+
+struct Loose: Copy + Clone {
+    scale: f32,
+}
+
+@compute(64)
+fn fill(p: Loose, out: mut Slots<f32>, id: GlobalId) { //~ E0604
+    out[id] = p.scale
+}

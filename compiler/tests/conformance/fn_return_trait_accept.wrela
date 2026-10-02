@@ -1,0 +1,10 @@
+// accepts: fn.return-trait
+use std::field::{Surface, sphere}
+
+fn ball(r: f32) -> Surface {
+    sphere(r).translate(vec3(y: r))
+}
+
+fn f() -> f32 {
+    ball(1.0).distance(vec3())
+}

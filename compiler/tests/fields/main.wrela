@@ -2,11 +2,17 @@
 // evaluation at scattered points, for comparison with spike 01's hand-written kernel, and
 // block culling on the spike's grid, with the derived interval and with the spike's
 // hand-written Lipschitz bound.
-use corpus::{Blend, Branchy, Cells, Logs, Noise, Pieces, Rational, Trig, Vectors, Waves, blob_, cone_, creature, ellipsoid_, fbm_, grazer_, hoof_, sphere_}
+use corpus::{
+    Blend, Branchy, Cells, Logs, Noise, Pieces, Rational, Trig, Vectors, Waves, blob_, cone_,
+    creature, ellipsoid_, fbm_, grazer_, hoof_, sphere_,
+}
 use grazer::{Grazer, P3, bounds, grazer, grazer_from, p3, params}
 use std::derive::Box3
 use std::field::{Surface, hash_u32}
-use std::gpu::{ClipPosition, FragCoord, GlobalId, GpuBuffer, Slots, VertexIndex, begin_screen_pass, buffer, dispatch, draw, present}
+use std::gpu::{
+    ClipPosition, FragCoord, GlobalId, GpuBuffer, Slots, VertexIndex, begin_screen_pass, buffer,
+    dispatch, draw, present,
+}
 
 // ---- a look at it ------------------------------------------------------------------------------
 struct Camera: Copy + Clone + GpuData {

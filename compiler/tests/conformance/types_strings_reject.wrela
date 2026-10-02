@@ -1,0 +1,16 @@
+// rejects: ty.tiers
+fn g() {
+    let s = "text" //~ E0901
+}
+
+fn k() {
+    unsafe { //~ E0904
+    }
+}
+
+fn d(x: dyn Shape) { //~ E0905
+}
+
+trait Shape {
+    fn area(self) -> f32
+}

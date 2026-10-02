@@ -148,7 +148,7 @@ fn walk_pat(p: &mut Pat, f: &mut impl FnMut(&mut TyId)) {
 }
 
 /// Resolves every type, and checks what needed resolved types.
-fn finish_common(c: &mut Checker) {
+pub(super) fn finish_common(c: &mut Checker) {
     let unknown = c.infer.apply_defaults(&mut c.p.types);
     let has_errors = c.diags.iter().any(|d| d.is_error());
     if !has_errors {
@@ -219,7 +219,7 @@ fn finish_common(c: &mut Checker) {
         if !traits::implements(c.p, ty, &r) {
             let (t, tr) = (c.p.display_ty(ty), c.p.display_trait_ref(&r));
             let mut d = Diagnostic::new(
-                codes::E0400,
+                o.code,
                 o.span,
                 format!("`{t}` doesn't implement `{tr}`, which {} needs", o.why),
             );

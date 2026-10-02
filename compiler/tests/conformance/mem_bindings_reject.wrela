@@ -1,0 +1,12 @@
+// rejects: mem.bindings
+struct Log {
+    count: u32,
+}
+
+fn f(l: Log) -> u32 {
+    let x = 1
+    x = 2 //~ E0505
+    var copy = l //~ E0517
+    mut m = l //~ E0512
+    copy.count + m.count
+}

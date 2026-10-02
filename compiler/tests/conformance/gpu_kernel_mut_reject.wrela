@@ -1,0 +1,7 @@
+// rejects: gpu.kernel-mut
+use std::gpu::GlobalId
+
+@compute(64)
+fn fill(out: mut [f32], id: GlobalId) { //~ E0601
+    out[id.x] = 1.0
+}

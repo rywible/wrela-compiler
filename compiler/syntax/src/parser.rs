@@ -706,6 +706,15 @@ impl<'a> Parser<'a> {
     /// type ::= path_type | "[" type (";" expr)? "]" | "(" types ")" | "fn" "(" types ")" ("->" type)?
     pub(crate) fn parse_type(&mut self) -> PResult<TypeExpr> {
         let start = self.span();
+        if self.at(T::Dyn) {
+            // `dyn Trait` is tier 2: say so, and read the trait as the type.
+            let d = self.bump();
+            self.error(
+                Diagnostic::new(codes::E0905, d.span, "`dyn` is tier 2")
+                    .with_help("take the trait as a generic parameter: `x: Trait` (§7)"),
+            );
+            return self.parse_type();
+        }
         match self.kind() {
             T::Ident | T::SelfType => {
                 let p = self.parse_path_type()?;

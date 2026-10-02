@@ -1,0 +1,7 @@
+pub fn blob(r: f32) -> f32 {
+    r
+}
+
+fn helper(r: f32) -> f32 {
+    r
+}

@@ -1,0 +1,6 @@
+// rejects: lex.trailing-op
+fn f(a: f32, b: f32) -> f32 {
+    let x = a
+        + b //~ E0103
+    x
+}

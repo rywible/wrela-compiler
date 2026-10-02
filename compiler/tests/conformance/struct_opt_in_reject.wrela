@@ -1,0 +1,18 @@
+// rejects: struct.opt-in
+struct Inner {
+    x: f32,
+}
+
+struct Outer: Copy + Clone {
+    inner: Inner, //~ E0407
+}
+
+struct Wide: GpuData {
+    x: f64, //~ E0407
+}
+
+struct P {
+    x: f32,
+}
+
+impl Copy for P {} //~ E0403

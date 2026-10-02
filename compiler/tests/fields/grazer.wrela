@@ -9,7 +9,10 @@
 //   spike's own params-seed1.f32.
 // - `Grazer` is the field (spike 01's field.wgsl, `grazer_d`): twenty parts smooth-unioned in a
 //   fixed order, built from those numbers. Its structure is its type; the numbers are data.
-use std::field::{Displace, Ellipsoid, Fbm, HalfSpace, Intersect, RoundCone, SmoothUnion, Surface, Translate, ellipsoid, fbm, half_space, round_cone, smin}
+use std::field::{
+    Displace, Ellipsoid, Fbm, HalfSpace, Intersect, RoundCone, SmoothUnion, Surface, Translate,
+    ellipsoid, fbm, half_space, round_cone, smin,
+}
 
 /// The spike's `Grazer` uniform: 8 header floats, then 20 parts of 16.
 pub const PARAM_FLOATS: u32 = 328
