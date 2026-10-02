@@ -1,0 +1,13 @@
+// mistake: a kernel parameter that isn't `GpuData`
+// expect: E0604
+// fix: yes
+use std::gpu::{GlobalId, Slots}
+
+struct Params: Copy + Clone {
+    scale: f32,
+}
+
+@compute(64)
+fn fill(p: Params, out: mut Slots<f32>, id: GlobalId) {
+    out[id] = p.scale
+}

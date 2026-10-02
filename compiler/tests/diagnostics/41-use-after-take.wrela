@@ -1,0 +1,16 @@
+// mistake: using a value after moving it out
+// expect: E0500
+// fix: no
+struct Log {
+    count: u32,
+}
+
+fn archive(log: take Log) -> u32 {
+    log.count
+}
+
+fn f() -> u32 {
+    let log = Log { count: 1 }
+    let a = archive(take log)
+    a + log.count
+}

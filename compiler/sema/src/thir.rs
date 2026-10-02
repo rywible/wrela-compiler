@@ -38,6 +38,8 @@ pub struct LocalDecl {
     pub ty: TyId,
     pub kind: LocalKind,
     pub span: Span,
+    /// The `let` that binds it alone (`let x = ...`), for fixes that change it to `var`.
+    pub keyword: Option<Span>,
     /// The closure this local belongs to, if it's declared inside one.
     pub closure: Option<ClosureId>,
 }

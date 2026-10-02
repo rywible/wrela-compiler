@@ -1,0 +1,39 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0511",
+      "file": "main.wrela",
+      "fixes": [
+        {
+          "edits": [
+            {
+              "end": 180,
+              "file": "main.wrela",
+              "replacement": "",
+              "start": 175
+            }
+          ],
+          "message": "remove `take`"
+        }
+      ],
+      "help": [],
+      "label": null,
+      "labels": [],
+      "message": "`take` moves out of a named place, and this is a temporary",
+      "notes": [
+        "temporaries move without a marker"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 18,
+        "end": 196,
+        "end_column": 34,
+        "end_line": 13,
+        "line": 13,
+        "start": 180
+      },
+      "title": "a `take` of a value that isn't a named place"
+    }
+  ],
+  "version": 1
+}

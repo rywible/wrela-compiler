@@ -344,10 +344,21 @@ impl<'a> Parser<'a> {
                 // cmp_expr ::= bitor_expr (cmp_op bitor_expr)?
                 if matches!(self.kind(), T::EqEq | T::Ne | T::Lt | T::Le | T::Gt | T::Ge) {
                     let t = self.tok();
-                    self.error(
-                        Diagnostic::new(codes::E0107, t.span, "comparisons don't chain")
-                            .with_help("combine them with `&&`, as in `a < b && b < c`"),
-                    );
+                    // `a < x < b` means `a < x && x < b`: repeat the middle operand.
+                    let mid = match &lhs.kind {
+                        ExprKind::Binary(_, _, m) => self.text_of(m.span).to_string(),
+                        _ => String::new(),
+                    };
+                    let mut d = Diagnostic::new(codes::E0107, t.span, "comparisons don't chain")
+                        .with_help("combine them with `&&`, as in `a < b && b < c`");
+                    if !mid.is_empty() && !mid.contains('\n') {
+                        d = d.with_fix(
+                            format!("compare `{mid}` twice, joined with `&&`"),
+                            Span::new(self.file, t.span.start, t.span.start),
+                            format!("&& {mid} "),
+                        );
+                    }
+                    self.error(d);
                     return Err(Failed);
                 }
                 break;

@@ -1,0 +1,15 @@
+// mistake: a match that misses a variant
+// expect: E0309
+// fix: no
+enum Gait {
+    Walk,
+    Trot,
+    Gallop,
+}
+
+fn speed(g: Gait) -> f32 {
+    match g {
+        Gait::Walk => 1.0,
+        Gait::Trot => 3.0,
+    }
+}

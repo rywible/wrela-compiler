@@ -1,0 +1,15 @@
+// mistake: moving out of a named place without `take`
+// expect: E0501
+// fix: yes
+struct Log {
+    count: u32,
+}
+
+fn archive(log: take Log) -> u32 {
+    log.count
+}
+
+fn f() -> u32 {
+    let log = Log { count: 1 }
+    archive(log)
+}

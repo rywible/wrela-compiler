@@ -1,0 +1,40 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0203",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [
+        "mark it `pub` in `std::math` to use it here"
+      ],
+      "label": null,
+      "labels": [
+        {
+          "file": "<std::math>",
+          "message": "declared here without `pub`",
+          "span": {
+            "column": 4,
+            "end": 7104,
+            "end_column": 12,
+            "end_line": 272,
+            "line": 272,
+            "start": 7096
+          }
+        }
+      ],
+      "message": "`atan_f64` is private to `std::math`",
+      "notes": [],
+      "severity": "error",
+      "span": {
+        "column": 16,
+        "end": 113,
+        "end_column": 24,
+        "end_line": 4,
+        "line": 4,
+        "start": 105
+      },
+      "title": "a private item"
+    }
+  ],
+  "version": 1
+}

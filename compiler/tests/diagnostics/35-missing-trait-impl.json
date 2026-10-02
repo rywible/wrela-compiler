@@ -1,0 +1,25 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0400",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [],
+      "label": null,
+      "labels": [],
+      "message": "`Rock` doesn't implement `Surface`, which `impl Surface` in `depth` needs",
+      "notes": [],
+      "severity": "error",
+      "span": {
+        "column": 11,
+        "end": 257,
+        "end_column": 29,
+        "end_line": 15,
+        "line": 15,
+        "start": 239
+      },
+      "title": "a type that doesn't implement a trait"
+    }
+  ],
+  "version": 1
+}

@@ -1,0 +1,8 @@
+// mistake: a mutable global
+// expect: E0213
+// fix: no
+var frames: u32 = 0
+
+fn f() -> u32 {
+    1
+}

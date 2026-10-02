@@ -1,0 +1,10 @@
+// mistake: opting in to `Copy` with a field that isn't
+// expect: E0407
+// fix: no
+struct Log {
+    count: u32,
+}
+
+struct Pair: Copy + Clone {
+    log: Log,
+}

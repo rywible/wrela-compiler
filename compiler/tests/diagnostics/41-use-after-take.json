@@ -1,0 +1,40 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0500",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [
+        "pass `log.clone()` where it's moved if you still need it here"
+      ],
+      "label": null,
+      "labels": [
+        {
+          "file": "main.wrela",
+          "message": "`log` is moved here",
+          "span": {
+            "column": 26,
+            "end": 233,
+            "end_column": 29,
+            "end_line": 14,
+            "line": 14,
+            "start": 230
+          }
+        }
+      ],
+      "message": "`log.count` was moved, so it can't be used here",
+      "notes": [],
+      "severity": "error",
+      "span": {
+        "column": 9,
+        "end": 252,
+        "end_column": 18,
+        "end_line": 15,
+        "line": 15,
+        "start": 243
+      },
+      "title": "a use of a moved value"
+    }
+  ],
+  "version": 1
+}

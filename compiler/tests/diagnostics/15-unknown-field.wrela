@@ -1,0 +1,10 @@
+// mistake: a misspelled field
+// expect: E0206
+// fix: yes
+struct Grazer {
+    speed: f32,
+}
+
+fn f(g: Grazer) -> f32 {
+    g.sped
+}

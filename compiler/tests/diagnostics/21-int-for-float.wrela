@@ -1,0 +1,10 @@
+// mistake: passing an integer variable where a float is wanted
+// expect: E0300
+// fix: yes
+fn half(x: f32) -> f32 {
+    x / 2.0
+}
+
+fn f(n: u32) -> f32 {
+    half(n)
+}

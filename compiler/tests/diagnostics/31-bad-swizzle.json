@@ -1,0 +1,27 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0317",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [],
+      "label": null,
+      "labels": [],
+      "message": "`.z` isn't a component of a `vec2`",
+      "notes": [
+        "a `vec2`'s components are x, y"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 7,
+        "end": 114,
+        "end_column": 8,
+        "end_line": 5,
+        "line": 5,
+        "start": 113
+      },
+      "title": "an invalid swizzle"
+    }
+  ],
+  "version": 1
+}

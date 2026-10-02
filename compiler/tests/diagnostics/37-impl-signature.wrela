@@ -1,0 +1,14 @@
+// mistake: an impl method whose signature differs from the trait's
+// expect: E0405
+// fix: no
+use std::field::Surface
+
+struct Rock: Copy + Clone + GpuData {
+    size: f32,
+}
+
+impl Surface for Rock {
+    fn distance(self, p: vec2) -> f32 {
+        length(p) - self.size
+    }
+}

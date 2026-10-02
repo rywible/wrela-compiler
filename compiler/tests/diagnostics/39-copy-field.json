@@ -1,0 +1,38 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0407",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [],
+      "label": null,
+      "labels": [
+        {
+          "file": "main.wrela",
+          "message": "`Copy` opted in here",
+          "span": {
+            "column": 14,
+            "end": 133,
+            "end_column": 18,
+            "end_line": 8,
+            "line": 8,
+            "start": 129
+          }
+        }
+      ],
+      "message": "`Pair` can't be `Copy`: the field `log` has type `Log`, and it isn't",
+      "notes": [],
+      "severity": "error",
+      "span": {
+        "column": 5,
+        "end": 156,
+        "end_column": 13,
+        "end_line": 9,
+        "line": 9,
+        "start": 148
+      },
+      "title": "a struct can't be `Copy` or `GpuData` because of a field"
+    }
+  ],
+  "version": 1
+}

@@ -1255,29 +1255,52 @@ impl<'p> Checker<'p> {
                         let e = self.check_default(d, fty);
                         out.push(e);
                     } else {
-                        missing.push(decls[i].name.clone());
+                        missing.push((decls[i].name.clone(), field_tys[i].1));
                         out.push(self.error_expr(span));
                     }
                 }
             }
         }
         if !missing.is_empty() {
-            let list = missing.iter().map(|m| format!("`{m}`")).collect::<Vec<_>>().join(", ");
-            let close = Span::new(span.file, span.end - 1, span.end - 1);
-            let inserts = missing.iter().map(|m| format!("{m}: _")).collect::<Vec<_>>().join(", ");
-            self.err(
-                Diagnostic::new(
-                    codes::E0307,
-                    path.span,
-                    format!("`{}` is missing {list}", self.p.adt(adt).name),
-                )
-                .with_help(format!(
-                    "give every field a value, or a default in the declaration: {inserts}"
-                )),
-            );
-            let _ = close;
+            let list = missing.iter().map(|(m, _)| format!("`{m}`")).collect::<Vec<_>>().join(", ");
+            let inserts =
+                missing.iter().map(|(m, _)| format!("{m}: _")).collect::<Vec<_>>().join(", ");
+            let mut d = Diagnostic::new(
+                codes::E0307,
+                path.span,
+                format!("`{}` is missing {list}", self.p.adt(adt).name),
+            )
+            .with_help(format!(
+                "give every field a value, or a default in the declaration: {inserts}"
+            ));
+            // A fix when every missing field has an obvious zero: after the last field given,
+            // or just inside the `{`.
+            let zeros: Option<Vec<String>> = missing
+                .iter()
+                .map(|(m, t)| self.zero_value(*t).map(|z| format!("{m}: {z}")))
+                .collect();
+            if let Some(zeros) = zeros {
+                let (at, text) = match fields.last() {
+                    Some(f) => (f.span.end, format!(", {}", zeros.join(", "))),
+                    None => (span.end - 1, zeros.join(", ")),
+                };
+                let what = if missing.len() == 1 { "it" } else { "them" };
+                d = d.with_fix(format!("add {what} as zero"), Span::new(span.file, at, at), text);
+            }
+            self.err(d);
         }
         Expr { ty, span, kind: ExprKind::Adt { adt, args, variant, fields: out } }
+    }
+
+    /// The source text of a zero of a scalar or vector type, for fixes.
+    fn zero_value(&self, t: TyId) -> Option<String> {
+        Some(match self.kind(t) {
+            TyKind::Float(_) => "0.0".into(),
+            TyKind::Int(_) => "0".into(),
+            TyKind::Bool => "false".into(),
+            TyKind::Vec(n) => format!("vec{n}()"),
+            _ => return None,
+        })
     }
 
     /// A field or parameter default, checked where it's used (it's a literal value).

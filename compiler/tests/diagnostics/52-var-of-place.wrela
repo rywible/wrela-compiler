@@ -1,0 +1,12 @@
+// mistake: `var` copying a named place without `take` or `.clone()`
+// expect: E0517
+// fix: yes
+struct Log: Clone {
+    count: u32,
+}
+
+fn f(l: Log) -> u32 {
+    var copy = l
+    copy.count += 1
+    copy.count
+}

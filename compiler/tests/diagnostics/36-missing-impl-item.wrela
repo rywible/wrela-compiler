@@ -1,0 +1,10 @@
+// mistake: an impl without one of the trait's methods
+// expect: E0401
+// fix: no
+use std::field::Surface
+
+struct Rock: Copy + Clone + GpuData {
+    size: f32,
+}
+
+impl Surface for Rock {}

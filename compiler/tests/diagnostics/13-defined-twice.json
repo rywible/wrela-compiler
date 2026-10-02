@@ -1,0 +1,40 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0201",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [
+        "rename one of them"
+      ],
+      "label": null,
+      "labels": [
+        {
+          "file": "main.wrela",
+          "message": "first defined here",
+          "span": {
+            "column": 4,
+            "end": 81,
+            "end_column": 9,
+            "end_line": 4,
+            "line": 4,
+            "start": 76
+          }
+        }
+      ],
+      "message": "`speed` is defined twice in this module",
+      "notes": [],
+      "severity": "error",
+      "span": {
+        "column": 4,
+        "end": 112,
+        "end_column": 9,
+        "end_line": 8,
+        "line": 8,
+        "start": 107
+      },
+      "title": "a name defined twice"
+    }
+  ],
+  "version": 1
+}

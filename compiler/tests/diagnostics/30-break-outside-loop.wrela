@@ -1,0 +1,6 @@
+// mistake: `break` outside a loop
+// expect: E0315
+// fix: no
+fn f() {
+    break
+}

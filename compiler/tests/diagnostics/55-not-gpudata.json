@@ -1,0 +1,39 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0604",
+      "file": "main.wrela",
+      "fixes": [
+        {
+          "edits": [
+            {
+              "end": 141,
+              "file": "main.wrela",
+              "replacement": " + GpuData",
+              "start": 141
+            }
+          ],
+          "message": "opt `Params` in to `GpuData`"
+        }
+      ],
+      "help": [],
+      "label": null,
+      "labels": [],
+      "message": "`p` is a `Params`, which isn't `GpuData`, so it can't go to the GPU",
+      "notes": [
+        "data crossing to the GPU must be `GpuData`, so its layout is the same on both sides (§6.13)"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 9,
+        "end": 193,
+        "end_column": 18,
+        "end_line": 11,
+        "line": 11,
+        "start": 184
+      },
+      "title": "data crossing to the GPU that isn't `GpuData`"
+    }
+  ],
+  "version": 1
+}

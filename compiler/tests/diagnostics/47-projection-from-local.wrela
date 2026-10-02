@@ -1,0 +1,11 @@
+// mistake: returning a projection of a local
+// expect: E0508
+// fix: no
+struct World {
+    speed: f32,
+}
+
+fn speed() -> borrow f32 {
+    let w = World { speed: 1.0 }
+    w.speed
+}

@@ -1,0 +1,41 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0106",
+      "file": "main.wrela",
+      "fixes": [
+        {
+          "edits": [
+            {
+              "end": 124,
+              "file": "main.wrela",
+              "replacement": "",
+              "start": 123
+            }
+          ],
+          "message": "remove the `&`"
+        }
+      ],
+      "help": [
+        "for a parameter, write `x: T` to borrow it or `x: mut T` to change it; to refer to another value long-term, store a `Handle<T>`"
+      ],
+      "label": null,
+      "labels": [],
+      "message": "`&` isn't a type in wrela",
+      "notes": [
+        "wrela has no references; parameters have modes instead (language.md §6.2)"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 13,
+        "end": 124,
+        "end_column": 14,
+        "end_line": 9,
+        "line": 9,
+        "start": 123
+      },
+      "title": "`&` isn't a type or an operator on places"
+    }
+  ],
+  "version": 1
+}

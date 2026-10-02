@@ -1,0 +1,6 @@
+// mistake: a type suffix on a number
+// expect: E0003
+// fix: yes
+fn f() -> f32 {
+    2.5f32
+}

@@ -1,0 +1,29 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0404",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [
+        "wrap the type in a struct of your own, or define your own trait"
+      ],
+      "label": null,
+      "labels": [],
+      "message": "this package can't implement std's `Surface` for std's `vec3`",
+      "notes": [
+        "an impl lives with its trait or with its type (D-071)"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 1,
+        "end": 201,
+        "end_column": 2,
+        "end_line": 10,
+        "line": 6,
+        "start": 105
+      },
+      "title": "an impl outside the trait's or the type's module tree (orphan rule)"
+    }
+  ],
+  "version": 1
+}

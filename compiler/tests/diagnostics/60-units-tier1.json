@@ -1,0 +1,39 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0900",
+      "file": "main.wrela",
+      "fixes": [
+        {
+          "edits": [
+            {
+              "end": 90,
+              "file": "main.wrela",
+              "replacement": "2",
+              "start": 88
+            }
+          ],
+          "message": "drop the unit"
+        }
+      ],
+      "help": [
+        "in tier 0, write the number in the unit your code works in"
+      ],
+      "label": null,
+      "labels": [],
+      "message": "`2m` has a unit, and units are tier 1",
+      "notes": [],
+      "severity": "error",
+      "span": {
+        "column": 18,
+        "end": 90,
+        "end_column": 20,
+        "end_line": 5,
+        "line": 5,
+        "start": 88
+      },
+      "title": "units are tier 1"
+    }
+  ],
+  "version": 1
+}

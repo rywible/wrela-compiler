@@ -1,0 +1,52 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0505",
+      "file": "main.wrela",
+      "fixes": [
+        {
+          "edits": [
+            {
+              "end": 93,
+              "file": "main.wrela",
+              "replacement": "var",
+              "start": 90
+            }
+          ],
+          "message": "make it `var`"
+        }
+      ],
+      "help": [
+        "declare it with `var total` to change it"
+      ],
+      "label": null,
+      "labels": [
+        {
+          "file": "main.wrela",
+          "message": "declared here",
+          "span": {
+            "column": 9,
+            "end": 99,
+            "end_column": 14,
+            "end_line": 5,
+            "line": 5,
+            "start": 94
+          }
+        }
+      ],
+      "message": "can't assign to `total`: `total` is a `let` binding",
+      "notes": [],
+      "severity": "error",
+      "span": {
+        "column": 5,
+        "end": 113,
+        "end_column": 10,
+        "end_line": 6,
+        "line": 6,
+        "start": 108
+      },
+      "title": "an assignment through a read-only place"
+    }
+  ],
+  "version": 1
+}

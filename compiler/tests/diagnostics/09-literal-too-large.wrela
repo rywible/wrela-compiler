@@ -1,0 +1,7 @@
+// mistake: an integer literal too large for its type
+// expect: E0006
+// fix: no
+fn f() -> u8 {
+    let x: u8 = 300
+    x
+}

@@ -1,0 +1,7 @@
+// mistake: two statements on one line without `;`
+// expect: E0104
+// fix: yes
+fn f() -> i32 {
+    let a = 1 let b = 2
+    a + b
+}

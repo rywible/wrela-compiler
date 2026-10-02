@@ -1,0 +1,12 @@
+// mistake: passing a `mut` parameter without `mut` at the call
+// expect: E0503
+// fix: yes
+fn bump(x: mut f32) {
+    x += 1.0
+}
+
+fn f() -> f32 {
+    var speed = 1.0
+    bump(speed)
+    speed
+}

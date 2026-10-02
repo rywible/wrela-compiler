@@ -1,0 +1,11 @@
+// mistake: `else` on the line after `}`
+// expect: E0111
+// fix: yes
+fn f(c: bool) -> i32 {
+    if c {
+        1
+    }
+    else {
+        2
+    }
+}

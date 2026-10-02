@@ -402,7 +402,15 @@ impl<'a> Walker<'a> {
                     );
                     d = match decl.kind {
                         LocalKind::Param(_) => d.with_help(format!("make the parameter `mut`: `{}: mut ...`, and pass `mut` at the call site", decl.name)),
-                        LocalKind::Owned { .. } => d.with_help(format!("declare it with `var {}` to change it", decl.name)).with_secondary(decl.span, "declared here"),
+                        LocalKind::Owned { .. } => {
+                            let d = d
+                                .with_help(format!("declare it with `var {}` to change it", decl.name))
+                                .with_secondary(decl.span, "declared here");
+                            match decl.keyword {
+                                Some(k) => d.with_fix("make it `var`", k, "var"),
+                                None => d,
+                            }
+                        }
                         LocalKind::Projection { .. } => d.with_help(format!("project it with `mut {} = ...` to change it", decl.name)).with_secondary(decl.span, "declared here"),
                         LocalKind::ClosureParam => d.with_help("copy it into a `var` first"),
                     };
@@ -503,14 +511,16 @@ impl<'a> Walker<'a> {
                 None => Diagnostic::new(
                     codes::E0513,
                     span,
-                    format!(
-                        "`{what}` overlaps `{other}`, which this call already takes {}",
-                        if l.mutable { "mutably" } else { "" }
-                    )
-                    .replace("  ", " ")
-                    .trim_end()
-                    .to_string()
-                        + "",
+                    match (what == other, l.mutable) {
+                        (true, true) => format!("`{what}` is already passed `mut` in this call"),
+                        (true, false) => format!("`{what}` is already passed in this call"),
+                        (false, true) => format!(
+                            "`{what}` overlaps `{other}`, which this call already takes mutably"
+                        ),
+                        (false, false) => {
+                            format!("`{what}` overlaps `{other}`, which this call already takes")
+                        }
+                    },
                 )
                 .with_secondary(l.span, format!("`{other}` is passed here"))
                 .with_note("in one call, arguments can't overlap when one of them is `mut` (§6.5)"),

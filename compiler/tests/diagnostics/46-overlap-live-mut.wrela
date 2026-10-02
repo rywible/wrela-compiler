@@ -1,0 +1,18 @@
+// mistake: reading a place while a `mut` projection of it is live
+// expect: E0506
+// fix: no
+struct World {
+    speed: f32,
+    mass: f32,
+}
+
+fn total(w: World) -> f32 {
+    w.speed + w.mass
+}
+
+fn f(w: mut World) -> f32 {
+    mut s = w.speed
+    let t = total(w)
+    s += 1.0
+    t
+}

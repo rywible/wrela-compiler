@@ -225,10 +225,14 @@ pub(super) fn finish_common(c: &mut Checker) {
             );
             if let Some(l) = c.p.trait_(r.trait_).lang {
                 if let TyKind::Adt(a, _) = c.p.types.kind(ty) {
-                    let name = c.p.adt(*a).name.clone();
+                    let a = *a;
+                    let name = c.p.adt(a).name.clone();
                     d = d.with_help(format!(
                         "opt in where `{name}` is declared: `struct {name}: {tr} {{ ... }}`"
                     ));
+                    if let Some((at, text)) = c.p.opt_in_fix(a, &tr) {
+                        d = d.with_fix(format!("opt `{name}` in to `{tr}`"), at, text);
+                    }
                 }
                 if l == Lang::Clone || l == Lang::Copy {
                     d = d.with_note(

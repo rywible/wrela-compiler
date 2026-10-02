@@ -1,0 +1,27 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0006",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [
+        "use a wider integer type"
+      ],
+      "label": null,
+      "labels": [],
+      "message": "`300` doesn't fit in `u8`, whose largest value is 255",
+      "notes": [],
+      "severity": "error",
+      "span": {
+        "column": 17,
+        "end": 116,
+        "end_column": 20,
+        "end_line": 5,
+        "line": 5,
+        "start": 113
+      },
+      "title": "an integer literal too large for its type"
+    }
+  ],
+  "version": 1
+}

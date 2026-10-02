@@ -1,0 +1,27 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0305",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [
+        "both sides must have the same integer type; convert one, as in `u32(x)`"
+      ],
+      "label": null,
+      "labels": [],
+      "message": "`+` doesn't apply to `i32` and `u32`",
+      "notes": [],
+      "severity": "error",
+      "span": {
+        "column": 5,
+        "end": 119,
+        "end_column": 10,
+        "end_line": 5,
+        "line": 5,
+        "start": 114
+      },
+      "title": "an operator that doesn't apply to these types"
+    }
+  ],
+  "version": 1
+}

@@ -1,0 +1,27 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0213",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [
+        "wrela has no globals; use `const NAME = value` for a constant, or pass state in as a parameter"
+      ],
+      "label": null,
+      "labels": [],
+      "message": "a file can't hold `let` or `var` bindings",
+      "notes": [],
+      "severity": "error",
+      "span": {
+        "column": 1,
+        "end": 60,
+        "end_column": 4,
+        "end_line": 4,
+        "line": 4,
+        "start": 57
+      },
+      "title": "mutable global state"
+    }
+  ],
+  "version": 1
+}

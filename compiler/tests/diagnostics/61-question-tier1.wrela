@@ -1,0 +1,6 @@
+// mistake: propagating with `?`
+// expect: E0902
+// fix: no
+fn f(x: Option<f32>) {
+    let y = x?
+}

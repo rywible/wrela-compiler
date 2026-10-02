@@ -1,0 +1,27 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0109",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [
+        "write `x: Type`"
+      ],
+      "label": null,
+      "labels": [],
+      "message": "the parameter `x` needs a type",
+      "notes": [],
+      "severity": "error",
+      "span": {
+        "column": 10,
+        "end": 77,
+        "end_column": 11,
+        "end_line": 4,
+        "line": 4,
+        "start": 76
+      },
+      "title": "a missing parameter type"
+    }
+  ],
+  "version": 1
+}

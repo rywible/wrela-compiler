@@ -1,0 +1,25 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0323",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [],
+      "label": null,
+      "labels": [],
+      "message": "`vec3` needs 3 components, but these make 2",
+      "notes": [],
+      "severity": "error",
+      "span": {
+        "column": 5,
+        "end": 114,
+        "end_column": 19,
+        "end_line": 5,
+        "line": 5,
+        "start": 100
+      },
+      "title": "a vector constructor with the wrong components"
+    }
+  ],
+  "version": 1
+}

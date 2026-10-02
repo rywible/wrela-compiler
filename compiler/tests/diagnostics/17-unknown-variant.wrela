@@ -1,0 +1,11 @@
+// mistake: a misspelled enum variant
+// expect: E0211
+// fix: yes
+enum Gait {
+    Walk,
+    Trot,
+}
+
+fn f() -> Gait {
+    Gait::Trott
+}

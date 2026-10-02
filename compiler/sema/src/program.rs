@@ -161,6 +161,20 @@ impl Program {
     }
 
     /// Whether a module is part of std.
+    /// A fix that opts a struct in to a trait in its declaration (`struct S: Trait`), for a
+    /// diagnostic: where to insert, and what. `None` for std's types, and for generic ones
+    /// (whose parameters sit between the name and the opt-in list).
+    pub fn opt_in_fix(&self, a: AdtId, trait_name: &str) -> Option<(wrela_diag::Span, String)> {
+        let adt = self.adt(a);
+        if self.is_std(adt.module) || !adt.generics.is_empty() {
+            return None;
+        }
+        Some(match adt.opt_in.last() {
+            Some((_, span)) => (span.shrink_to_end(), format!(" + {trait_name}")),
+            None => (adt.name_span.shrink_to_end(), format!(": {trait_name}")),
+        })
+    }
+
     pub fn is_std(&self, m: ModuleId) -> bool {
         self.modules[m.index()].is_std
     }

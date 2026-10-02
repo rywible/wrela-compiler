@@ -1,0 +1,40 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0105",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [
+        "put positional arguments first, or name this one too (D-039)"
+      ],
+      "label": null,
+      "labels": [
+        {
+          "file": "main.wrela",
+          "message": "`width` is named here",
+          "span": {
+            "column": 10,
+            "end": 179,
+            "end_column": 20,
+            "end_line": 9,
+            "line": 9,
+            "start": 169
+          }
+        }
+      ],
+      "message": "a positional argument can't follow a named one",
+      "notes": [],
+      "severity": "error",
+      "span": {
+        "column": 22,
+        "end": 184,
+        "end_column": 25,
+        "end_line": 9,
+        "line": 9,
+        "start": 181
+      },
+      "title": "a positional argument after a named one"
+    }
+  ],
+  "version": 1
+}

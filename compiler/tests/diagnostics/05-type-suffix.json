@@ -1,0 +1,39 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0003",
+      "file": "main.wrela",
+      "fixes": [
+        {
+          "edits": [
+            {
+              "end": 93,
+              "file": "main.wrela",
+              "replacement": "2.5",
+              "start": 87
+            }
+          ],
+          "message": "remove the suffix"
+        }
+      ],
+      "help": [
+        "a literal takes its type from context; write `2.5`, or convert with `f32(2.5)`"
+      ],
+      "label": null,
+      "labels": [],
+      "message": "number literals have no type suffixes, so `2.5f32` isn't valid",
+      "notes": [],
+      "severity": "error",
+      "span": {
+        "column": 8,
+        "end": 93,
+        "end_column": 11,
+        "end_line": 5,
+        "line": 5,
+        "start": 90
+      },
+      "title": "a number with a type suffix"
+    }
+  ],
+  "version": 1
+}

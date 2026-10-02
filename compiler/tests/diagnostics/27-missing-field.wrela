@@ -1,0 +1,11 @@
+// mistake: a struct literal without a field that has no default
+// expect: E0307
+// fix: yes
+struct Grazer {
+    speed: f32,
+    mass: f32,
+}
+
+fn f() -> Grazer {
+    Grazer { speed: 1.0 }
+}

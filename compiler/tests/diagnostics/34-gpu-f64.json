@@ -1,0 +1,27 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0326",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [],
+      "label": null,
+      "labels": [],
+      "message": "`f64` is CPU-only, and this is the `@compute` kernel `k`",
+      "notes": [
+        "WGSL has `bool`, `i32`, `u32` and `f32`; 64-bit and 8/16-bit types exist only on the CPU (language.md §4)"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 18,
+        "end": 169,
+        "end_column": 21,
+        "end_line": 8,
+        "line": 8,
+        "start": 166
+      },
+      "title": "a CPU-only type in GPU code"
+    }
+  ],
+  "version": 1
+}

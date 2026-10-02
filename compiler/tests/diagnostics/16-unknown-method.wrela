@@ -1,0 +1,8 @@
+// mistake: a misspelled method
+// expect: E0207
+// fix: yes
+use std::field::sphere
+
+fn f() -> f32 {
+    sphere(1.0).distanse(vec3())
+}

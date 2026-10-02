@@ -1,0 +1,41 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0514",
+      "file": "main.wrela",
+      "fixes": [
+        {
+          "edits": [
+            {
+              "end": 91,
+              "file": "main.wrela",
+              "replacement": ": Clone",
+              "start": 91
+            }
+          ],
+          "message": "opt `Log` in to `Clone`"
+        }
+      ],
+      "help": [
+        "opt in where `Log` is declared: `struct Log: Clone { ... }`"
+      ],
+      "label": null,
+      "labels": [],
+      "message": "`Log` doesn't implement `Clone`, which `.clone()` needs",
+      "notes": [
+        "`Copy` and `Clone` are opted in to in a type's declaration (§6.1)"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 16,
+        "end": 151,
+        "end_column": 17,
+        "end_line": 9,
+        "line": 9,
+        "start": 150
+      },
+      "title": "a `.clone()` of a type that isn't `Clone`"
+    }
+  ],
+  "version": 1
+}

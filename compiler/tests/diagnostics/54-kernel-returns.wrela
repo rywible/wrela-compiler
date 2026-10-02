@@ -1,0 +1,9 @@
+// mistake: a kernel that returns a value
+// expect: E0602
+// fix: no
+use std::gpu::GlobalId
+
+@compute(64)
+fn value(id: GlobalId) -> f32 {
+    f32(id.x)
+}

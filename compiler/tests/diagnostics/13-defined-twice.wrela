@@ -1,0 +1,10 @@
+// mistake: two functions with the same name
+// expect: E0201
+// fix: no
+fn speed() -> f32 {
+    1.0
+}
+
+fn speed() -> f32 {
+    2.0
+}

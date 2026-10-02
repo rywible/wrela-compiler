@@ -1,0 +1,14 @@
+// mistake: passing overlapping places, one of them `mut`
+// expect: E0513
+// fix: no
+fn add(to: mut f32, from: f32) {
+    to += from
+}
+
+struct World {
+    speed: f32,
+}
+
+fn f(w: mut World) {
+    add(mut w.speed, w.speed)
+}

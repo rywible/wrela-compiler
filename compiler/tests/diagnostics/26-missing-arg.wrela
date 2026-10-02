@@ -1,0 +1,10 @@
+// mistake: a missing argument
+// expect: E0303
+// fix: no
+fn area(width: f32, height: f32) -> f32 {
+    width * height
+}
+
+fn f() -> f32 {
+    area(1.0)
+}

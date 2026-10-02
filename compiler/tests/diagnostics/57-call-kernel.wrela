@@ -1,0 +1,13 @@
+// mistake: calling a kernel like a function
+// expect: E0606
+// fix: no
+use std::gpu::{GlobalId, Slots}
+
+@compute(64)
+fn fill(out: mut Slots<f32>, id: GlobalId) {
+    out[id] = 1.0
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    fill()
+}

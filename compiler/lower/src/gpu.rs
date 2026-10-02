@@ -401,21 +401,28 @@ fn host_effect(fl: &mut Fl, what: &str, span: Span) {
     fl.cx.err(d);
 }
 
-/// "called from `f`" notes, from the current function up to its entry point.
+/// The call chain from the entry point down to the current function, as one note
+/// (`fill → helper → scratch`), when the current function isn't the entry point itself.
 fn call_chain(fl: &Fl) -> Vec<String> {
-    let mut out = Vec::new();
+    let mut names = vec![strip_suffix(&fl.f.name).to_string()];
     let mut at = fl.id;
-    let mut seen = 0;
     while let Some(&(caller, _)) = fl.mb.callers.get(&at) {
-        let name = fl.mb.m.functions[caller.index()].name.clone();
-        out.push(format!("reached through `{}`", strip_suffix(&name)));
+        let name = strip_suffix(&fl.mb.m.functions[caller.index()].name).to_string();
+        // An entry point's wrapper has the entry point's name.
+        if names.last() != Some(&name) {
+            names.push(name);
+        }
         at = caller;
-        seen += 1;
-        if seen > 32 {
+        if names.len() > 32 {
             break;
         }
     }
-    out
+    if names.len() < 2 {
+        return Vec::new();
+    }
+    names.reverse();
+    let chain: Vec<String> = names.iter().map(|n| format!("`{n}`")).collect();
+    vec![format!("called through {}", chain.join(" → "))]
 }
 
 fn strip_suffix(name: &str) -> &str {

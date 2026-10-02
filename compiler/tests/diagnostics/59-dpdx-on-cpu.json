@@ -1,0 +1,27 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0607",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [],
+      "label": null,
+      "labels": [],
+      "message": "derivatives exist only in fragment shaders, and this is CPU code",
+      "notes": [
+        "`dpdx`, `dpdy` and `fwidth` compare neighbouring pixels"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 13,
+        "end": 151,
+        "end_column": 23,
+        "end_line": 5,
+        "line": 5,
+        "start": 141
+      },
+      "title": "a GPU feature used in CPU code"
+    }
+  ],
+  "version": 1
+}

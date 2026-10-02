@@ -1,0 +1,8 @@
+// mistake: reading a private field of another module
+// expect: E0210
+// fix: no
+use std::gpu::GpuBuffer
+
+fn f(b: GpuBuffer<f32>) -> u32 {
+    b.handle
+}

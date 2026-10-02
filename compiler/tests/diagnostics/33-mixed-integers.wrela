@@ -1,0 +1,6 @@
+// mistake: adding a signed and an unsigned integer
+// expect: E0305
+// fix: no
+fn f(a: i32, b: u32) -> u32 {
+    a + b
+}

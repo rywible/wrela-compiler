@@ -1,0 +1,38 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0405",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [],
+      "label": null,
+      "labels": [
+        {
+          "file": "<std::field>",
+          "message": "the trait declares it here",
+          "span": {
+            "column": 5,
+            "end": 687,
+            "end_column": 38,
+            "end_line": 13,
+            "line": 13,
+            "start": 654
+          }
+        }
+      ],
+      "message": "`distance` doesn't match the trait's signature: `p` has type `vec2`, but the trait says `vec3`",
+      "notes": [],
+      "severity": "error",
+      "span": {
+        "column": 5,
+        "end": 238,
+        "end_column": 38,
+        "end_line": 11,
+        "line": 11,
+        "start": 205
+      },
+      "title": "an impl method whose signature differs from the trait's"
+    }
+  ],
+  "version": 1
+}

@@ -1,0 +1,6 @@
+// mistake: a body that ends without its value
+// expect: E0314
+// fix: no
+fn f(x: f32) -> f32 {
+    let y = x * 2.0
+}

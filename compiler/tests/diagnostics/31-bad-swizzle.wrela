@@ -1,0 +1,6 @@
+// mistake: a swizzle with a component the vector lacks
+// expect: E0317
+// fix: no
+fn f(v: vec2) -> f32 {
+    v.z
+}

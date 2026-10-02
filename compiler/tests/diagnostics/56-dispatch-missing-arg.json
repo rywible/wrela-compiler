@@ -1,0 +1,25 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0603",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [],
+      "label": null,
+      "labels": [],
+      "message": "this dispatch doesn't pass `fill`'s parameter `scale`",
+      "notes": [],
+      "severity": "error",
+      "span": {
+        "column": 5,
+        "end": 374,
+        "end_column": 40,
+        "end_line": 13,
+        "line": 13,
+        "start": 339
+      },
+      "title": "a dispatch or draw that doesn't match its entry points"
+    }
+  ],
+  "version": 1
+}

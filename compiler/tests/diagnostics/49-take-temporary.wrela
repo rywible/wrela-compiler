@@ -1,0 +1,14 @@
+// mistake: `take` on a temporary
+// expect: E0511
+// fix: yes
+struct Log {
+    count: u32,
+}
+
+fn archive(log: take Log) -> u32 {
+    log.count
+}
+
+fn f() -> u32 {
+    archive(take Log { count: 1 })
+}

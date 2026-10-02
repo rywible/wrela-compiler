@@ -1,0 +1,6 @@
+// mistake: a screen-space derivative in CPU code
+// expect: E0607
+// fix: no
+pub fn frame(time: f32, width: u32, height: u32) {
+    let w = dpdx(time)
+}

@@ -1,0 +1,37 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0200",
+      "file": "main.wrela",
+      "fixes": [
+        {
+          "edits": [
+            {
+              "end": 106,
+              "file": "main.wrela",
+              "replacement": "radius",
+              "start": 101
+            }
+          ],
+          "message": "did you mean `radius`?"
+        }
+      ],
+      "help": [],
+      "label": null,
+      "labels": [],
+      "message": "there's no `radus` in scope",
+      "notes": [],
+      "severity": "error",
+      "span": {
+        "column": 5,
+        "end": 106,
+        "end_column": 10,
+        "end_line": 6,
+        "line": 6,
+        "start": 101
+      },
+      "title": "an unknown name"
+    }
+  ],
+  "version": 1
+}

@@ -1,0 +1,27 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0204",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [],
+      "label": null,
+      "labels": [],
+      "message": "there's no attribute `@inline`",
+      "notes": [
+        "attributes are a closed set defined by the language (D-037)"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 2,
+        "end": 79,
+        "end_column": 8,
+        "end_line": 4,
+        "line": 4,
+        "start": 73
+      },
+      "title": "an unknown attribute"
+    }
+  ],
+  "version": 1
+}

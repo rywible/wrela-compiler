@@ -119,7 +119,7 @@ impl<'p> Checker<'p> {
     fn declare_local(&mut self, name: &str, ty: TyId, kind: LocalKind, span: Span) -> LocalId {
         let id = LocalId(self.locals.len() as u32);
         let closure = self.closure_stack.last().map(|c| c.id);
-        self.locals.push(LocalDecl { name: name.into(), ty, kind, span, closure });
+        self.locals.push(LocalDecl { name: name.into(), ty, kind, span, keyword: None, closure });
         if name != "_" {
             self.env.push((name.into(), id));
         }
@@ -163,7 +163,19 @@ impl<'p> Checker<'p> {
         let (ka, ke) = (self.kind(actual), self.kind(expected));
         match (&ka, &ke) {
             (TyKind::Int(_) | TyKind::Float(_), TyKind::Int(_) | TyKind::Float(_)) => {
-                d = d.with_help(format!("convert it explicitly: `{e}(...)`"));
+                d = d.with_help(format!("convert it explicitly: `{e}(...)`")).with_fix_edits(
+                    format!("convert it: `{e}(...)`"),
+                    vec![
+                        wrela_diag::Edit {
+                            span: Span::new(span.file, span.start, span.start),
+                            replacement: format!("{e}("),
+                        },
+                        wrela_diag::Edit {
+                            span: Span::new(span.file, span.end, span.end),
+                            replacement: ")".into(),
+                        },
+                    ],
+                );
             }
             (TyKind::Float(_), TyKind::Vec(n)) | (TyKind::Int(_), TyKind::Vec(n)) => {
                 d = d.with_help(format!("make a vector from it with `vec{n}(...)`"));
@@ -228,7 +240,14 @@ impl<'p> Checker<'p> {
                 }
                 let ty = annot.unwrap_or(init.ty);
                 let pat = match kind {
-                    ast::BindKind::Let => self.check_let_pattern(pat, ty, &init),
+                    ast::BindKind::Let => {
+                        let p = self.check_let_pattern(pat, ty, &init);
+                        if let PatKind::Bind(id) = p.kind {
+                            let k = Span::new(s.span.file, s.span.start, s.span.start + 3);
+                            self.locals[id.index()].keyword = Some(k);
+                        }
+                        p
+                    }
                     ast::BindKind::Var | ast::BindKind::Mut => {
                         let ast::PatKind::Ident(name) = &pat.kind else {
                             self.err(Diagnostic::new(
@@ -329,14 +348,23 @@ impl<'p> Checker<'p> {
             }
         }
         let shown = self.display(c.ty);
-        self.err(
-            Diagnostic::new(
-                codes::E0313,
-                c.span,
-                format!("a condition must be `bool`, not `{shown}`"),
-            )
-            .with_help("compare it, as in `x != 0`"),
-        );
+        let mut d = Diagnostic::new(
+            codes::E0313,
+            c.span,
+            format!("a condition must be `bool`, not `{shown}`"),
+        )
+        .with_help("compare it, as in `x != 0`");
+        // A number: test it against zero.
+        let zero = match self.kind(c.ty) {
+            TyKind::Int(_) => Some("0"),
+            TyKind::Float(_) => Some("0.0"),
+            _ => None,
+        };
+        if let Some(z) = zero {
+            let end = Span::new(c.span.file, c.span.end, c.span.end);
+            d = d.with_fix(format!("compare it with `!= {z}`"), end, format!(" != {z}"));
+        }
+        self.err(d);
     }
 
     fn check_for(

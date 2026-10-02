@@ -1,0 +1,38 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0301",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [],
+      "label": null,
+      "labels": [
+        {
+          "file": "main.wrela",
+          "message": "declared here",
+          "span": {
+            "column": 1,
+            "end": 98,
+            "end_column": 40,
+            "end_line": 4,
+            "line": 4,
+            "start": 59
+          }
+        }
+      ],
+      "message": "`area` takes 2 arguments, but 3 were given",
+      "notes": [],
+      "severity": "error",
+      "span": {
+        "column": 20,
+        "end": 161,
+        "end_column": 23,
+        "end_line": 9,
+        "line": 9,
+        "start": 158
+      },
+      "title": "wrong number of arguments"
+    }
+  ],
+  "version": 1
+}

@@ -1,0 +1,10 @@
+// mistake: an `f64` in GPU code
+// expect: E0326
+// fix: no
+use std::gpu::{GlobalId, Slots}
+
+@compute(64)
+fn k(out: mut Slots<f32>, id: GlobalId) {
+    let x: f64 = 0.5
+    out[id] = f32(x)
+}

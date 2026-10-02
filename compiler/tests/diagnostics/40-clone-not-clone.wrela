@@ -1,0 +1,11 @@
+// mistake: `.clone()` of a type that isn't `Clone`
+// expect: E0514
+// fix: yes
+struct Log {
+    count: u32,
+}
+
+fn f(l: Log) -> u32 {
+    let copy = l.clone()
+    copy.count
+}

@@ -1,0 +1,6 @@
+// mistake: returning the wrong type
+// expect: E0300
+// fix: no
+fn f(x: f32) -> bool {
+    x * 2.0
+}

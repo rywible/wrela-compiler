@@ -8,12 +8,12 @@ use crate::ty::{FnId, TyId, TyKind};
 use wrela_diag::{Diagnostic, codes};
 
 /// Every entry point's signature.
-pub fn check_entries(p: &Program) -> Vec<Diagnostic> {
+pub fn check_entries(p: &mut Program) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     for i in 0..p.fns.len() {
         let f = FnId(i as u32);
-        if let Some((entry, _)) = &p.func(f).attrs.entry {
-            check_entry(p, f, *entry, &mut out);
+        if let Some((entry, _)) = p.func(f).attrs.entry {
+            check_entry(p, f, entry, &mut out);
         }
     }
     out
@@ -34,8 +34,8 @@ fn stage_name(e: Entry) -> &'static str {
     }
 }
 
-fn check_entry(p: &Program, f: FnId, entry: Entry, out: &mut Vec<Diagnostic>) {
-    let def = p.func(f);
+fn check_entry(p: &mut Program, f: FnId, entry: Entry, out: &mut Vec<Diagnostic>) {
+    let def = p.func(f).clone();
     let stage = stage_name(entry);
     let unit = p.types.unit;
     // What it returns.
@@ -133,6 +133,34 @@ fn check_entry(p: &Program, f: FnId, entry: Entry, out: &mut Vec<Diagnostic>) {
                 .with_note("to read a buffer, take a run `[T]`"),
             ),
             _ => {}
+        }
+        // Data passed by value travels as a uniform, so its layout must be the GPU's.
+        let varyings = matches!(p.types.kind(ps.ty), TyKind::Adt(a, _) if p.adt(*a).fields().iter().any(|fd| lang_of(p, fd.ty) == Some(Lang::ClipPosition)));
+        let passed = builtin_stage.is_none()
+            && !slots
+            && !varyings
+            && !matches!(p.types.kind(ps.ty), TyKind::Slice(_) | TyKind::Param(_))
+            && !p.types.has_params(ps.ty);
+        if passed && !crate::traits::implements_builtin(p, ps.ty, Lang::GpuData) {
+            let ty = p.display_ty(ps.ty);
+            let mut d = Diagnostic::new(
+                codes::E0604,
+                ps.span,
+                format!(
+                    "`{}` is a `{ty}`, which isn't `GpuData`, so it can't go to the GPU",
+                    ps.name
+                ),
+            )
+            .with_note(
+                "data crossing to the GPU must be `GpuData`, so its layout is the same on both \
+                 sides (§6.13)",
+            );
+            if let TyKind::Adt(a, _) = p.types.kind(ps.ty)
+                && let Some((at, text)) = p.opt_in_fix(*a, "GpuData")
+            {
+                d = d.with_fix(format!("opt `{ty}` in to `GpuData`"), at, text);
+            }
+            out.push(d);
         }
         if slots && !matches!(entry, Entry::Compute(_)) {
             out.push(Diagnostic::new(

@@ -1,0 +1,39 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0307",
+      "file": "main.wrela",
+      "fixes": [
+        {
+          "edits": [
+            {
+              "end": 186,
+              "file": "main.wrela",
+              "replacement": ", mass: 0.0",
+              "start": 186
+            }
+          ],
+          "message": "add it as zero"
+        }
+      ],
+      "help": [
+        "give every field a value, or a default in the declaration: mass: _"
+      ],
+      "label": null,
+      "labels": [],
+      "message": "`Grazer` is missing `mass`",
+      "notes": [],
+      "severity": "error",
+      "span": {
+        "column": 5,
+        "end": 173,
+        "end_column": 11,
+        "end_line": 10,
+        "line": 10,
+        "start": 167
+      },
+      "title": "a missing struct field"
+    }
+  ],
+  "version": 1
+}

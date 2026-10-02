@@ -1,0 +1,6 @@
+// mistake: a chained comparison
+// expect: E0107
+// fix: yes
+fn inside(a: f32, x: f32, b: f32) -> bool {
+    a < x < b
+}

@@ -1,0 +1,7 @@
+// mistake: a misspelled local
+// expect: E0200
+// fix: yes
+fn f() -> f32 {
+    let radius = 2.0
+    radus * 3.0
+}

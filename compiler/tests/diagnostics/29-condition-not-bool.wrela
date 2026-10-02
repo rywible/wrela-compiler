@@ -1,0 +1,10 @@
+// mistake: an integer used as a condition
+// expect: E0313
+// fix: yes
+fn f(n: u32) -> u32 {
+    if n {
+        1
+    } else {
+        0
+    }
+}

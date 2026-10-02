@@ -1,0 +1,40 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0513",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [],
+      "label": null,
+      "labels": [
+        {
+          "file": "main.wrela",
+          "message": "`w.speed` is passed here",
+          "span": {
+            "column": 13,
+            "end": 211,
+            "end_column": 20,
+            "end_line": 13,
+            "line": 13,
+            "start": 204
+          }
+        }
+      ],
+      "message": "`w.speed` is already passed `mut` in this call",
+      "notes": [
+        "in one call, arguments can't overlap when one of them is `mut` (§6.5)"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 22,
+        "end": 220,
+        "end_column": 29,
+        "end_line": 13,
+        "line": 13,
+        "start": 213
+      },
+      "title": "overlapping arguments where one is `mut`"
+    }
+  ],
+  "version": 1
+}

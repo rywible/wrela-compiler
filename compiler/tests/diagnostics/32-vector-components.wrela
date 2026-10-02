@@ -1,0 +1,6 @@
+// mistake: a vector built from too few components
+// expect: E0323
+// fix: no
+fn f() -> vec3 {
+    vec3(1.0, 2.0)
+}

@@ -1,0 +1,37 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0104",
+      "file": "main.wrela",
+      "fixes": [
+        {
+          "edits": [
+            {
+              "end": 109,
+              "file": "main.wrela",
+              "replacement": "\n",
+              "start": 109
+            }
+          ],
+          "message": "start a new line here"
+        }
+      ],
+      "help": [],
+      "label": null,
+      "labels": [],
+      "message": "expected a line break or `;` after a statement, found `let`",
+      "notes": [],
+      "severity": "error",
+      "span": {
+        "column": 15,
+        "end": 113,
+        "end_column": 18,
+        "end_line": 5,
+        "line": 5,
+        "start": 110
+      },
+      "title": "a missing statement separator"
+    }
+  ],
+  "version": 1
+}

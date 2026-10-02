@@ -1,0 +1,11 @@
+// mistake: writing `mut` where the parameter is borrowed
+// expect: E0504
+// fix: yes
+fn read(x: f32) -> f32 {
+    x
+}
+
+fn f() -> f32 {
+    var speed = 1.0
+    read(mut speed)
+}

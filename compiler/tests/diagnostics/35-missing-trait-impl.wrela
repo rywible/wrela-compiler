@@ -1,0 +1,16 @@
+// mistake: calling a generic function with a type that lacks the bound
+// expect: E0400
+// fix: no
+use std::field::Surface
+
+struct Rock {
+    size: f32,
+}
+
+fn depth(s: Surface) -> f32 {
+    s.distance(vec3())
+}
+
+fn f() -> f32 {
+    depth(Rock { size: 1.0 })
+}

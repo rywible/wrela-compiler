@@ -1,0 +1,10 @@
+// mistake: a reference type `&T`
+// expect: E0106
+// fix: no
+struct Grazer {
+    speed: f32,
+}
+
+struct Herd {
+    leader: &Grazer,
+}

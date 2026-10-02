@@ -39,7 +39,7 @@ pub struct Checked {
 /// Collects and type-checks a whole program.
 pub fn check_program(units: Vec<SourceUnit>, diags: &mut Vec<Diagnostic>) -> Checked {
     let mut program = collect::collect(units, diags);
-    diags.extend(gpu::check_entries(&program));
+    diags.extend(gpu::check_entries(&mut program));
     let mut bodies = BTreeMap::new();
     for i in 0..program.fns.len() {
         let f = ty::FnId(i as u32);

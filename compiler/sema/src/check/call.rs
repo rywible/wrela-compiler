@@ -250,6 +250,12 @@ impl<'p> Checker<'p> {
 
     /// Bounds on `f`'s generics become obligations.
     fn fn_obligations(&mut self, f: FnId, gen_args: &[TyId], span: Span) {
+        let n = self.p.fn_all_generics(f).len();
+        self.fn_obligations_at(f, gen_args, &vec![span; n]);
+    }
+
+    /// Bounds on `f`'s generics become obligations, each reported at its own span.
+    fn fn_obligations_at(&mut self, f: FnId, gen_args: &[TyId], spans: &[Span]) {
         let all = self.p.fn_all_generics(f);
         let subst = Subst::from_pairs(&all, gen_args);
         let name = self.p.fn_display_name(f);
@@ -264,7 +270,7 @@ impl<'p> Checker<'p> {
                 self.obligation(
                     gen_args[i],
                     TraitRef { trait_: b.trait_, args },
-                    span,
+                    spans[i],
                     format!("`{pname}` in `{name}`"),
                 );
             }
@@ -288,10 +294,24 @@ impl<'p> Checker<'p> {
             // only if it fits: a mismatch is reported where the value is used.
             self.try_unify(ret, e);
         }
-        self.fn_obligations(f, &gen_args, span);
         let name = self.p.fn_display_name(f);
         let has_receiver = receiver.is_some();
         let (call_args, modes) = self.match_args(&name, &params, receiver, args, span, f);
+        // A bound on a generic that's a parameter's whole type is reported at that argument.
+        let spans: Vec<Span> = self
+            .p
+            .fn_all_generics(f)
+            .iter()
+            .map(|&g| {
+                let def = self.p.func(f);
+                def.params
+                    .iter()
+                    .position(|ps| matches!(self.p.types.kind(ps.ty), TyKind::Param(q) if *q == g))
+                    .and_then(|j| call_args.get(j))
+                    .map_or(span, |a| a.span)
+            })
+            .collect();
+        self.fn_obligations_at(f, &gen_args, &spans);
         Expr {
             ty: ret,
             span,
@@ -317,6 +337,7 @@ impl<'p> Checker<'p> {
     ) -> (Vec<Expr>, Vec<Mode>) {
         let offset = usize::from(receiver.is_some());
         let mut slots: Vec<Option<Expr>> = vec![None; params.len()];
+        let mut suggested: Vec<String> = Vec::new();
         if let Some(r) = receiver {
             slots[0] = Some(r);
         }
@@ -357,6 +378,8 @@ impl<'p> Checker<'p> {
                             params[offset..].iter().map(|p| p.name.as_str()),
                         ) {
                             d = d.with_fix(format!("did you mean `{s}`?"), n.span, s);
+                            // The misspelling is that argument: don't also call it missing.
+                            suggested.push(s.to_string());
                         } else {
                             let names: Vec<String> =
                                 params[offset..].iter().map(|p| format!("`{}`", p.name)).collect();
@@ -393,7 +416,9 @@ impl<'p> Checker<'p> {
                         out.push(e);
                     }
                     None => {
-                        missing.push(params[i].name.clone());
+                        if !suggested.contains(&params[i].name) {
+                            missing.push(params[i].name.clone());
+                        }
                         out.push(self.error_expr(span));
                     }
                 },
@@ -1140,6 +1165,10 @@ impl<'p> Checker<'p> {
                 let pname = self.p.param(p).name.clone();
                 d = d.with_help(format!("add a bound that has `{}`: `{pname}: Trait`", name.name));
             }
+            let names = self.method_names(rt);
+            if let Some(s) = resolve::closest(&name.name, names.iter().map(String::as_str)) {
+                d = d.with_fix(format!("did you mean `{s}`?"), name.span, s);
+            }
             self.err(d);
             for a in args {
                 self.check_expr(&a.value, None);
@@ -1327,6 +1356,39 @@ impl<'p> Checker<'p> {
             ),
             _ => false,
         }
+    }
+
+    /// The methods a value of type `t` has: its inherent ones, and those of every trait it
+    /// implements (or, for a generic parameter, of its bounds). For suggestions.
+    fn method_names(&mut self, t: TyId) -> Vec<String> {
+        let mut out = Vec::new();
+        if let TyKind::Adt(a, _) = self.kind(t)
+            && let Some(impls) = self.p.inherent_impls.get(&a).cloned()
+        {
+            for i in impls {
+                for f in self.p.impl_(i).methods.clone() {
+                    out.push(self.p.func(f).name.clone());
+                }
+            }
+        }
+        let traits: Vec<TraitId> = match self.kind(t) {
+            TyKind::Param(p) => {
+                resolve::param_bounds_closure(self.p, p).into_iter().map(|r| r.trait_).collect()
+            }
+            _ => (0..self.p.traits.len() as u32)
+                .map(TraitId)
+                .filter(|&tr| {
+                    self.p.trait_(tr).generics.is_empty()
+                        && traits::implements(self.p, t, &TraitRef { trait_: tr, args: Vec::new() })
+                })
+                .collect(),
+        };
+        for tr in traits {
+            for f in self.p.trait_(tr).methods.clone() {
+                out.push(self.p.func(f).name.clone());
+            }
+        }
+        out
     }
 
     /// The type a CPU caller passes for a kernel parameter: a `GpuBuffer<T>` for `[T]` and

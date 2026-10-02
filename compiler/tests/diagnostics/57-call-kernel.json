@@ -1,0 +1,27 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0606",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [],
+      "label": null,
+      "labels": [],
+      "message": "`fill` is a GPU `@compute` kernel; record it with `dispatch(...)`",
+      "notes": [
+        "entry points run on the GPU and can't be called directly"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 5,
+        "end": 244,
+        "end_column": 9,
+        "end_line": 12,
+        "line": 12,
+        "start": 240
+      },
+      "title": "an entry point called directly"
+    }
+  ],
+  "version": 1
+}

@@ -1,0 +1,39 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0517",
+      "file": "main.wrela",
+      "fixes": [
+        {
+          "edits": [
+            {
+              "end": 175,
+              "file": "main.wrela",
+              "replacement": ".clone()",
+              "start": 175
+            }
+          ],
+          "message": "copy it: `l.clone()`"
+        }
+      ],
+      "help": [
+        "move it with `take l`, or copy it with `l.clone()`"
+      ],
+      "label": null,
+      "labels": [],
+      "message": "`var` owns its value, so it can't share `l`",
+      "notes": [],
+      "severity": "error",
+      "span": {
+        "column": 16,
+        "end": 175,
+        "end_column": 17,
+        "end_line": 9,
+        "line": 9,
+        "start": 174
+      },
+      "title": "`var` binding of a named place without `take` or `.clone()`"
+    }
+  ],
+  "version": 1
+}

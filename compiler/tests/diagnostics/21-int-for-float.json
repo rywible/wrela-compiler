@@ -1,0 +1,45 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0300",
+      "file": "main.wrela",
+      "fixes": [
+        {
+          "edits": [
+            {
+              "end": 164,
+              "file": "main.wrela",
+              "replacement": "f32(",
+              "start": 164
+            },
+            {
+              "end": 165,
+              "file": "main.wrela",
+              "replacement": ")",
+              "start": 165
+            }
+          ],
+          "message": "convert it: `f32(...)`"
+        }
+      ],
+      "help": [
+        "convert it explicitly: `f32(...)`"
+      ],
+      "label": null,
+      "labels": [],
+      "message": "expected `f32`, found `u32`",
+      "notes": [],
+      "severity": "error",
+      "span": {
+        "column": 10,
+        "end": 165,
+        "end_column": 11,
+        "end_line": 9,
+        "line": 9,
+        "start": 164
+      },
+      "title": "mismatched types"
+    }
+  ],
+  "version": 1
+}

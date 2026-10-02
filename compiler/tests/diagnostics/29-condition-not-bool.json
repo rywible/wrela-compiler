@@ -1,0 +1,39 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0313",
+      "file": "main.wrela",
+      "fixes": [
+        {
+          "edits": [
+            {
+              "end": 102,
+              "file": "main.wrela",
+              "replacement": " != 0",
+              "start": 102
+            }
+          ],
+          "message": "compare it with `!= 0`"
+        }
+      ],
+      "help": [
+        "compare it, as in `x != 0`"
+      ],
+      "label": null,
+      "labels": [],
+      "message": "a condition must be `bool`, not `u32`",
+      "notes": [],
+      "severity": "error",
+      "span": {
+        "column": 8,
+        "end": 102,
+        "end_column": 9,
+        "end_line": 5,
+        "line": 5,
+        "start": 101
+      },
+      "title": "a condition that isn't `bool`"
+    }
+  ],
+  "version": 1
+}

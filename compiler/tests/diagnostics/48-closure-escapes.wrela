@@ -1,0 +1,6 @@
+// mistake: returning a closure
+// expect: E0510
+// fix: no
+fn scaler(k: f32) -> fn(f32) -> f32 {
+    |x| x * k
+}

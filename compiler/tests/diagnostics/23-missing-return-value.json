@@ -1,0 +1,40 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0314",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [
+        "end the body with an expression of that type, or `return` one"
+      ],
+      "label": null,
+      "labels": [
+        {
+          "file": "main.wrela",
+          "message": "the body ends here",
+          "span": {
+            "column": 2,
+            "end": 118,
+            "end_column": 2,
+            "end_line": 6,
+            "line": 6,
+            "start": 118
+          }
+        }
+      ],
+      "message": "`f` returns `f32`, but its body can end without a value",
+      "notes": [],
+      "severity": "error",
+      "span": {
+        "column": 1,
+        "end": 94,
+        "end_column": 20,
+        "end_line": 4,
+        "line": 4,
+        "start": 75
+      },
+      "title": "a missing return value"
+    }
+  ],
+  "version": 1
+}

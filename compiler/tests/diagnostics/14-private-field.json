@@ -1,0 +1,38 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0210",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [],
+      "label": null,
+      "labels": [
+        {
+          "file": "<std::gpu>",
+          "message": "declared here without `pub`",
+          "span": {
+            "column": 5,
+            "end": 385,
+            "end_column": 16,
+            "end_line": 7,
+            "line": 7,
+            "start": 374
+          }
+        }
+      ],
+      "message": "the field `handle` of `GpuBuffer` is private",
+      "notes": [],
+      "severity": "error",
+      "span": {
+        "column": 7,
+        "end": 152,
+        "end_column": 13,
+        "end_line": 7,
+        "line": 7,
+        "start": 146
+      },
+      "title": "a private field"
+    }
+  ],
+  "version": 1
+}

@@ -1,0 +1,37 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0302",
+      "file": "main.wrela",
+      "fixes": [
+        {
+          "edits": [
+            {
+              "end": 175,
+              "file": "main.wrela",
+              "replacement": "height",
+              "start": 169
+            }
+          ],
+          "message": "did you mean `height`?"
+        }
+      ],
+      "help": [],
+      "label": null,
+      "labels": [],
+      "message": "`area` has no parameter `heigth`",
+      "notes": [],
+      "severity": "error",
+      "span": {
+        "column": 22,
+        "end": 175,
+        "end_column": 28,
+        "end_line": 9,
+        "line": 9,
+        "start": 169
+      },
+      "title": "an unknown named argument"
+    }
+  ],
+  "version": 1
+}

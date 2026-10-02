@@ -1,0 +1,6 @@
+// mistake: a parameter without a type
+// expect: E0109
+// fix: no
+fn scale(x) -> f32 {
+    x * 2.0
+}

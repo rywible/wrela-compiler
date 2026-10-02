@@ -1,0 +1,6 @@
+// mistake: using a function another module didn't make `pub`
+// expect: E0203
+// fix: no
+use std::math::atan_f64
+
+fn f() {}

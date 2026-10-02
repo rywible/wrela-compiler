@@ -1,0 +1,9 @@
+// mistake: a kernel writing a plain `mut` array
+// expect: E0601
+// fix: no
+use std::gpu::GlobalId
+
+@compute(64)
+fn fill(out: mut [f32], id: GlobalId) {
+    out[id.x] = 1.0
+}

@@ -1,0 +1,8 @@
+// mistake: assigning to a `let` binding
+// expect: E0505
+// fix: yes
+fn f() -> u32 {
+    let total = 0
+    total = 5
+    total
+}

@@ -1,0 +1,42 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0506",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [
+        "pass only the parts that don't overlap `w.speed`"
+      ],
+      "label": null,
+      "labels": [
+        {
+          "file": "main.wrela",
+          "message": "`s` borrows `w.speed` here",
+          "span": {
+            "column": 13,
+            "end": 243,
+            "end_column": 20,
+            "end_line": 14,
+            "line": 14,
+            "start": 236
+          }
+        }
+      ],
+      "message": "`w` overlaps `w.speed`, which `s` is borrowing mutably",
+      "notes": [
+        "`s` is used later, so the borrow is still live"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 19,
+        "end": 263,
+        "end_column": 20,
+        "end_line": 15,
+        "line": 15,
+        "start": 262
+      },
+      "title": "an access that overlaps a live `mut` access"
+    }
+  ],
+  "version": 1
+}

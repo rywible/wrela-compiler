@@ -1,0 +1,39 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0107",
+      "file": "main.wrela",
+      "fixes": [
+        {
+          "edits": [
+            {
+              "end": 116,
+              "file": "main.wrela",
+              "replacement": "&& x ",
+              "start": 116
+            }
+          ],
+          "message": "compare `x` twice, joined with `&&`"
+        }
+      ],
+      "help": [
+        "combine them with `&&`, as in `a < b && b < c`"
+      ],
+      "label": null,
+      "labels": [],
+      "message": "comparisons don't chain",
+      "notes": [],
+      "severity": "error",
+      "span": {
+        "column": 11,
+        "end": 117,
+        "end_column": 12,
+        "end_line": 5,
+        "line": 5,
+        "start": 116
+      },
+      "title": "comparisons don't chain"
+    }
+  ],
+  "version": 1
+}
