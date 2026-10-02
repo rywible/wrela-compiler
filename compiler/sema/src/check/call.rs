@@ -33,6 +33,15 @@ enum Pick {
 }
 
 impl<'p> Checker<'p> {
+    /// A call that can't be checked against its callee: its arguments are still checked (for
+    /// their own errors), and the call is an error expression.
+    fn failed_call(&mut self, args: &[ast::Arg], span: Span) -> Expr {
+        for a in args {
+            self.check_expr(&a.value, None);
+        }
+        self.error_expr(span)
+    }
+
     pub(crate) fn check_call(
         &mut self,
         callee: &ast::Expr,
@@ -50,16 +59,10 @@ impl<'p> Checker<'p> {
                     format!("`{shown}` can't be called"),
                 ));
             }
-            for a in args {
-                self.check_expr(&a.value, None);
-            }
-            return self.error_expr(span);
+            return self.failed_call(args, span);
         };
         let Some(res) = self.resolve_value_path(path) else {
-            for a in args {
-                self.check_expr(&a.value, None);
-            }
-            return self.error_expr(span);
+            return self.failed_call(args, span);
         };
         match res {
             ValueRes::Local(l) => self.call_local(l, args, span),
@@ -85,10 +88,7 @@ impl<'p> Checker<'p> {
                         .with_note("entry points run on the GPU and can't be called directly"),
                     );
                     // Its arguments are still checked, but not against its parameters.
-                    for a in args {
-                        self.check_expr(&a.value, None);
-                    }
-                    return self.error_expr(span);
+                    return self.failed_call(args, span);
                 }
                 let gen_args = self.fresh_fn_args(f, path, span);
                 self.call_fn(f, gen_args, None, args, expected, span)
@@ -164,10 +164,7 @@ impl<'p> Checker<'p> {
                     _ => "this can't be called".into(),
                 };
                 self.err(Diagnostic::new(codes::E0310, callee.span, what));
-                for a in args {
-                    self.check_expr(&a.value, None);
-                }
-                self.error_expr(span)
+                self.failed_call(args, span)
             }
         }
     }
@@ -990,10 +987,7 @@ impl<'p> Checker<'p> {
             name.span,
             format!("`{shown}` has no associated function `{}`", name.name),
         ));
-        for a in args {
-            self.check_expr(&a.value, None);
-        }
-        self.error_expr(span)
+        self.failed_call(args, span)
     }
 
     /// An inherent method of `ty` named `name`, and the impl's arguments for `ty`.
@@ -1133,10 +1127,7 @@ impl<'p> Checker<'p> {
         let recv = self.check_expr(receiver, None);
         let rt = self.shallow(recv.ty);
         if matches!(self.p.types.kind(rt), TyKind::Error) {
-            for a in args {
-                self.check_expr(&a.value, None);
-            }
-            return self.error_expr(span);
+            return self.failed_call(args, span);
         }
         if matches!(self.p.types.kind(rt), TyKind::Var(_)) {
             match self.infer.var_kind(&self.p.types, rt) {
@@ -1157,10 +1148,7 @@ impl<'p> Checker<'p> {
                         )
                         .with_help("annotate its type: `let x: T = ...`"),
                     );
-                    for a in args {
-                        self.check_expr(&a.value, None);
-                    }
-                    return self.error_expr(span);
+                    return self.failed_call(args, span);
                 }
             }
         }
@@ -1237,10 +1225,7 @@ impl<'p> Checker<'p> {
                 d = d.with_fix(format!("did you mean `{s}`?"), name.span, s);
             }
             self.err(d);
-            for a in args {
-                self.check_expr(&a.value, None);
-            }
-            return self.error_expr(span);
+            return self.failed_call(args, span);
         };
         self.finish_method(pick, recv, generics, args, expected, span, name.span)
     }

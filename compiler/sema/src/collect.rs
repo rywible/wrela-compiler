@@ -5,7 +5,7 @@ use crate::defs::*;
 use crate::program::{LangRes, Program};
 use crate::resolve::{self, Scope, TyPos};
 use crate::ty::*;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 use wrela_diag::{Diagnostic, FileId, Span, codes};
 use wrela_syntax::ast;
@@ -68,6 +68,7 @@ impl<'d> Collector<'d> {
             file: None,
             children: BTreeMap::new(),
             scope: BTreeMap::new(),
+            broken: BTreeSet::new(),
             is_std,
             ast: None,
         });
@@ -197,6 +198,11 @@ impl<'d> Collector<'d> {
             }
         }
         match &item.kind {
+            ast::ItemKind::Error(name) => {
+                if let Some(n) = name {
+                    self.p.modules[m.index()].broken.insert(n.name.clone());
+                }
+            }
             ast::ItemKind::Fn(f) => {
                 let id = self.new_fn(m, FnOwner::Free, f, public, &item.attrs, is_std);
                 self.bind(m, &f.name, Res::Fn(id), public);
@@ -517,6 +523,9 @@ impl<'d> Collector<'d> {
                         self.bind(u.module, &u.alias, res, u.public);
                     }
                     resolve::PathLookup::NotYet => still.push(u),
+                    resolve::PathLookup::Broken => {
+                        self.p.modules[u.module.index()].broken.insert(u.alias.name.clone());
+                    }
                     resolve::PathLookup::Error(d) => self.err(*d),
                 }
             }
@@ -528,6 +537,7 @@ impl<'d> Collector<'d> {
                 for u in still {
                     match resolve::resolve_module_path_in(&self.p, u.module, &u.path, true) {
                         resolve::PathLookup::Error(d) => self.err(*d),
+                        resolve::PathLookup::Broken => {}
                         _ => {
                             let text = u
                                 .path
@@ -546,23 +556,34 @@ impl<'d> Collector<'d> {
     }
 
     fn find_lang_items(&mut self) {
+        let Some(std) = self.p.std_root else { return };
         for &(lang, path) in Lang::PATHS {
-            let segs: Vec<ast::Ident> = path
-                .split("::")
-                .map(|s| ast::Ident { name: s.into(), span: Span::new(FileId(0), 0, 0) })
-                .collect();
-            let Some(std) = self.p.std_root else { continue };
-            // The compiler relies on every lang item; std not having one is a bug in std.
-            match resolve::resolve_module_path(&self.p, std, &segs) {
-                resolve::PathLookup::Found(Res::Adt(a)) => {
+            // The compiler relies on every lang item; std not having one is a bug in std. Each
+            // is declared where its path says (not re-exported), so the path is followed
+            // through modules' children to the item in the last one's scope.
+            let mut segs = path.split("::").skip(1).peekable();
+            let mut m = std;
+            let mut found = None;
+            while let Some(seg) = segs.next() {
+                let module = self.p.module(m);
+                if segs.peek().is_none() {
+                    found = module.scope.get(seg).map(|b| b.res);
+                } else if let Some(&c) = module.children.get(seg) {
+                    m = c;
+                } else {
+                    break;
+                }
+            }
+            match found {
+                Some(Res::Adt(a)) => {
                     self.p.adts[a.index()].lang = Some(lang);
                     self.p.lang.insert(lang, LangRes::Adt(a));
                 }
-                resolve::PathLookup::Found(Res::Trait(t)) => {
+                Some(Res::Trait(t)) => {
                     self.p.traits[t.index()].lang = Some(lang);
                     self.p.lang.insert(lang, LangRes::Trait(t));
                 }
-                resolve::PathLookup::Found(Res::Fn(f)) => {
+                Some(Res::Fn(f)) => {
                     self.p.fns[f.index()].lang = Some(lang);
                     self.p.lang.insert(lang, LangRes::Fn(f));
                 }

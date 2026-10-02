@@ -13,8 +13,10 @@ pub struct Layout {
     pub align: u32,
 }
 
+/// Sizes saturate at `u32::MAX` rather than overflow: no value that large fits in memory, and a
+/// function with one traps on entry, as a stack overflow.
 pub fn round_up(align: u32, n: u32) -> u32 {
-    n.div_ceil(align) * align
+    n.div_ceil(align).saturating_mul(align)
 }
 
 fn scalar_layout(s: Scalar) -> Layout {
@@ -37,26 +39,31 @@ pub fn vector_layout(n: u8) -> Layout {
 }
 
 pub fn layout(types: &Types, t: TypeId) -> Layout {
-    match types.get(t) {
+    types.layout(t)
+}
+
+/// The layout of a type being interned, from its parts' layouts.
+pub(crate) fn compute(types: &Types, d: &TypeDef) -> Layout {
+    match d {
         TypeDef::Scalar(s) => scalar_layout(*s),
         TypeDef::Vector(n) => vector_layout(*n),
         TypeDef::Matrix(n) => {
             Layout { size: *n as u32 * column_stride(*n), align: vector_layout(*n).align }
         }
         TypeDef::Array(e, n) => {
-            let el = layout(types, *e);
-            Layout { size: n * round_up(el.align, el.size), align: el.align }
+            let el = types.layout(*e);
+            Layout { size: n.saturating_mul(round_up(el.align, el.size)), align: el.align }
         }
         TypeDef::RuntimeArray(e) => {
-            let el = layout(types, *e);
+            let el = types.layout(*e);
             Layout { size: round_up(el.align, el.size), align: el.align }
         }
         TypeDef::Struct { fields, .. } => {
-            let mut offset = 0;
+            let mut offset = 0u32;
             let mut align = 1;
             for (_, f) in fields {
-                let l = layout(types, *f);
-                offset = round_up(l.align, offset) + l.size;
+                let l = types.layout(*f);
+                offset = round_up(l.align, offset).saturating_add(l.size);
                 align = align.max(l.align);
             }
             Layout { size: round_up(align, offset.max(1)), align }
@@ -75,7 +82,7 @@ pub fn field_offsets(types: &Types, t: TypeId) -> Vec<u32> {
         let l = layout(types, *f);
         let at = round_up(l.align, offset);
         out.push(at);
-        offset = at + l.size;
+        offset = at.saturating_add(l.size);
     }
     out
 }
@@ -114,7 +121,7 @@ pub fn uniform_compatible(types: &Types, t: TypeId) -> bool {
                 }
                 if matches!(types.get(*f), TypeDef::Struct { .. })
                     && let Some(&next) = offsets.get(i + 1)
-                    && next < offsets[i] + round_up(16, layout(types, *f).size)
+                    && next < offsets[i].saturating_add(round_up(16, layout(types, *f).size))
                 {
                     return false;
                 }

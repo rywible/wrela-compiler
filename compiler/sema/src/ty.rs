@@ -2,7 +2,7 @@
 
 use elsa::FrozenVec;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 
 macro_rules! id_type {
@@ -161,6 +161,9 @@ pub enum TyKind {
 pub struct Types {
     kinds: FrozenVec<Box<TyKind>>,
     map: RefCell<HashMap<TyKind, TyId>>,
+    /// Each type's size: the nodes of its tree, shared parts counted each time they appear
+    /// (saturating).
+    sizes: RefCell<Vec<u32>>,
     pub bool: TyId,
     pub i32: TyId,
     pub u32: TyId,
@@ -185,6 +188,7 @@ impl Types {
         let mut t = Types {
             kinds: FrozenVec::new(),
             map: RefCell::new(HashMap::new()),
+            sizes: RefCell::new(Vec::new()),
             bool: TyId(0),
             i32: TyId(0),
             u32: TyId(0),
@@ -216,6 +220,9 @@ impl Types {
             return id;
         }
         let id = TyId(self.kinds.len() as u32);
+        let mut size = 1u32;
+        children(&kind, &mut |c| size = size.saturating_add(self.size(c)));
+        self.sizes.borrow_mut().push(size);
         self.kinds.push(Box::new(kind.clone()));
         self.map.borrow_mut().insert(kind, id);
         id
@@ -223,6 +230,13 @@ impl Types {
 
     pub fn kind(&self, t: TyId) -> &TyKind {
         &self.kinds[t.index()]
+    }
+
+    /// The nodes of the type's tree, counting a shared part each time it appears (saturating):
+    /// what a walk over it that doesn't remember where it's been would visit. See
+    /// [`MAX_TYPE_SIZE`].
+    pub fn size(&self, t: TyId) -> u32 {
+        self.sizes.borrow()[t.index()]
     }
 
     /// How many types there are.
@@ -284,57 +298,83 @@ impl Types {
         self.any(t, &mut |k| matches!(k, TyKind::Param(_) | TyKind::Projection { .. }))
     }
 
-    /// Whether any part of `t` satisfies `f`.
+    /// Whether any part of `t` satisfies `f`, a test of the part alone.
     pub fn any(&self, t: TyId, f: &mut impl FnMut(&TyKind) -> bool) -> bool {
+        // Parts a type shares are tested once.
+        let mut seen = HashSet::new();
+        self.any_in(t, f, &mut seen)
+    }
+
+    fn any_in(
+        &self,
+        t: TyId,
+        f: &mut impl FnMut(&TyKind) -> bool,
+        seen: &mut HashSet<TyId>,
+    ) -> bool {
+        if self.size(t) > SHARING && !seen.insert(t) {
+            return false;
+        }
         let k = self.kind(t);
         if f(k) {
             return true;
         }
-        match k {
-            TyKind::Tuple(ts)
-            | TyKind::Adt(_, ts)
-            | TyKind::Opaque(_, ts)
-            | TyKind::Closure(_, ts)
-            | TyKind::FnDef(_, ts) => ts.clone().iter().any(|&t| self.any(t, f)),
-            TyKind::Array(e, _) | TyKind::Slice(e) => self.any(*e, f),
-            TyKind::Projection { self_ty, trait_args, .. } => {
-                let (s, a) = (*self_ty, trait_args.clone());
-                self.any(s, f) || a.iter().any(|&t| self.any(t, f))
-            }
-            TyKind::FnPtr(ps, r) => {
-                let (ps, r) = (ps.clone(), *r);
-                ps.iter().any(|&t| self.any(t, f)) || self.any(r, f)
-            }
-            _ => false,
-        }
+        let mut found = false;
+        children(k, &mut |c| found = found || self.any_in(c, f, seen));
+        found
     }
 
-    /// Rebuilds `t`, replacing each part for which `f` returns `Some`.
+    /// Rebuilds `t`, replacing each part for which `f`, a function of the part alone, returns
+    /// `Some`.
     pub fn map(&self, t: TyId, f: &mut impl FnMut(&Types, TyId) -> Option<TyId>) -> TyId {
+        // Parts a type shares are rebuilt once.
+        let mut done = HashMap::new();
+        self.map_in(t, f, &mut done)
+    }
+
+    fn map_in(
+        &self,
+        t: TyId,
+        f: &mut impl FnMut(&Types, TyId) -> Option<TyId>,
+        done: &mut HashMap<TyId, TyId>,
+    ) -> TyId {
+        let shared = self.size(t) > SHARING;
+        if shared && let Some(&r) = done.get(&t) {
+            return r;
+        }
+        let r = self.map_parts(t, f, done);
+        if shared {
+            done.insert(t, r);
+        }
+        r
+    }
+
+    fn map_parts(
+        &self,
+        t: TyId,
+        f: &mut impl FnMut(&Types, TyId) -> Option<TyId>,
+        done: &mut HashMap<TyId, TyId>,
+    ) -> TyId {
         if let Some(r) = f(self, t) {
             return r;
         }
-        let k = self.kind(t).clone();
-        let new = match k {
-            TyKind::Tuple(ts) => TyKind::Tuple(ts.iter().map(|&x| self.map(x, f)).collect()),
-            TyKind::Adt(a, ts) => TyKind::Adt(a, ts.iter().map(|&x| self.map(x, f)).collect()),
-            TyKind::Opaque(a, ts) => {
-                TyKind::Opaque(a, ts.iter().map(|&x| self.map(x, f)).collect())
-            }
-            TyKind::Closure(a, ts) => {
-                TyKind::Closure(a, ts.iter().map(|&x| self.map(x, f)).collect())
-            }
-            TyKind::FnDef(a, ts) => TyKind::FnDef(a, ts.iter().map(|&x| self.map(x, f)).collect()),
-            TyKind::Array(e, n) => TyKind::Array(self.map(e, f), n),
-            TyKind::Slice(e) => TyKind::Slice(self.map(e, f)),
+        let mut m = |x: TyId| self.map_in(x, f, done);
+        let new = match self.kind(t).clone() {
+            TyKind::Tuple(ts) => TyKind::Tuple(ts.into_iter().map(&mut m).collect()),
+            TyKind::Adt(a, ts) => TyKind::Adt(a, ts.into_iter().map(&mut m).collect()),
+            TyKind::Opaque(a, ts) => TyKind::Opaque(a, ts.into_iter().map(&mut m).collect()),
+            TyKind::Closure(a, ts) => TyKind::Closure(a, ts.into_iter().map(&mut m).collect()),
+            TyKind::FnDef(a, ts) => TyKind::FnDef(a, ts.into_iter().map(&mut m).collect()),
+            TyKind::Array(e, n) => TyKind::Array(m(e), n),
+            TyKind::Slice(e) => TyKind::Slice(m(e)),
             TyKind::Projection { self_ty, trait_, trait_args, name } => TyKind::Projection {
-                self_ty: self.map(self_ty, f),
+                self_ty: m(self_ty),
                 trait_,
-                trait_args: trait_args.iter().map(|&x| self.map(x, f)).collect(),
+                trait_args: trait_args.into_iter().map(&mut m).collect(),
                 name,
             },
             TyKind::FnPtr(ps, r) => {
-                TyKind::FnPtr(ps.iter().map(|&x| self.map(x, f)).collect(), self.map(r, f))
+                let ps = ps.into_iter().map(&mut m).collect();
+                TyKind::FnPtr(ps, m(r))
             }
             other => return self.intern(other),
         };
@@ -356,6 +396,44 @@ impl Types {
 impl std::fmt::Debug for Types {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Types({} interned)", self.len())
+    }
+}
+
+/// The largest type a program may have, in [`Types::size`]: far past any real type (a struct
+/// counts once, however many fields it has), and small enough that walking one is cheap. A
+/// type can double with each line (`let b = (a, a)`), so without a bound a short program
+/// could take the compiler forever (E0329).
+pub const MAX_TYPE_SIZE: u32 = 4096;
+
+/// Types larger than this are walked remembering the parts they share.
+const SHARING: u32 = 64;
+
+/// Calls `f` on each type `kind` is made of.
+pub fn children(kind: &TyKind, f: &mut impl FnMut(TyId)) {
+    match kind {
+        TyKind::Tuple(ts)
+        | TyKind::Adt(_, ts)
+        | TyKind::Opaque(_, ts)
+        | TyKind::Closure(_, ts)
+        | TyKind::FnDef(_, ts) => ts.iter().for_each(|&t| f(t)),
+        TyKind::Array(e, _) | TyKind::Slice(e) => f(*e),
+        TyKind::Projection { self_ty, trait_args, .. } => {
+            f(*self_ty);
+            trait_args.iter().for_each(|&t| f(t));
+        }
+        TyKind::FnPtr(ps, r) => {
+            ps.iter().for_each(|&t| f(t));
+            f(*r);
+        }
+        TyKind::Bool
+        | TyKind::Int(_)
+        | TyKind::Float(_)
+        | TyKind::Vec(_)
+        | TyKind::Mat(_)
+        | TyKind::Param(_)
+        | TyKind::Var(_)
+        | TyKind::Never
+        | TyKind::Error => {}
     }
 }
 

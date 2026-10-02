@@ -1,0 +1,12 @@
+// mistake: a syntax error in one function, and a type error in another
+// expect: E0100 E0300
+// fix: no
+fn half(x: f32) -> f32 {
+    let y = x * / 2.0
+    y
+}
+
+pub fn ready() -> bool {
+    let n: i32 = true
+    n == 1
+}

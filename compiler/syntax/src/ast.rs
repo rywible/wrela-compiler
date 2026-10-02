@@ -40,6 +40,8 @@ pub enum ItemKind {
     Impl(ImplDecl),
     Const(ConstDecl),
     Use(UseTree),
+    /// An item that failed to parse (the error is reported), with its name if that parsed.
+    Error(Option<Ident>),
 }
 
 impl ItemKind {
@@ -50,6 +52,7 @@ impl ItemKind {
             ItemKind::Enum(e) => Some(&e.name),
             ItemKind::Trait(t) => Some(&t.name),
             ItemKind::Const(c) => Some(&c.name),
+            ItemKind::Error(name) => name.as_ref(),
             ItemKind::Impl(_) | ItemKind::Use(_) => None,
         }
     }
@@ -137,6 +140,8 @@ pub enum TypeExprKind {
     Tuple(Vec<TypeExpr>),
     Paren(Box<TypeExpr>),
     Fn(Vec<TypeExpr>, Option<Box<TypeExpr>>),
+    /// Where a type failed to parse (the error is reported).
+    Error,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -629,6 +634,8 @@ pub enum PatKind {
         rest: bool,
     },
     Tuple(Vec<Pat>),
+    /// Where a pattern failed to parse (the error is reported).
+    Error,
 }
 
 impl Expr {
@@ -773,7 +780,7 @@ impl Item {
                 }
             }
             ItemKind::Const(c) => f(&c.value),
-            ItemKind::Use(_) => {}
+            ItemKind::Use(_) | ItemKind::Error(_) => {}
         }
     }
 }

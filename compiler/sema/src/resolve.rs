@@ -71,7 +71,14 @@ pub enum PathLookup {
     Found(Res),
     /// Not found yet: an import that would provide it may still be pending.
     NotYet,
+    /// Names an item that failed to parse: its error is reported.
+    Broken,
     Error(Box<Diagnostic>),
+}
+
+/// Whether `name` in module `m` is an item that failed to parse (or an import of one).
+pub fn is_broken(p: &Program, m: ModuleId, name: &str) -> bool {
+    p.module(m).broken.contains(name)
 }
 
 /// The closest of `candidates` to `name` by edit distance, if it's close enough to suggest.
@@ -203,6 +210,8 @@ pub fn resolve_module_path_in(
         Res::BuiltinTy(t)
     } else if let Some(f) = BuiltinFn::lookup(&first.name) {
         Res::BuiltinFn(f)
+    } else if is_broken(p, from, &first.name) {
+        return PathLookup::Broken;
     } else {
         if !final_pass {
             return PathLookup::NotYet;
@@ -239,6 +248,8 @@ pub fn resolve_module_path_in(
                     b.res
                 } else if let Some(&c) = module.children.get(&seg.name) {
                     Res::Module(c)
+                } else if module.broken.contains(&seg.name) {
+                    return PathLookup::Broken;
                 } else {
                     if !final_pass {
                         return PathLookup::NotYet;
@@ -313,7 +324,7 @@ pub fn resolve_trait_ref(
             diags.push(*d);
             return None;
         }
-        PathLookup::NotYet => return None,
+        PathLookup::NotYet | PathLookup::Broken => return None,
     };
     let Res::Trait(t) = res else {
         diags.push(
@@ -383,6 +394,8 @@ pub fn resolve_type(
     pos: TyPos,
 ) -> TyId {
     match &te.kind {
+        // Its syntax error is reported.
+        ast::TypeExprKind::Error => p.types.error,
         ast::TypeExprKind::Paren(inner) => resolve_type(p, diags, scope, inner, pos),
         ast::TypeExprKind::Tuple(elems) => {
             let ts =
@@ -534,6 +547,7 @@ fn resolve_type_path(
     let res = if segs.len() == 1 {
         match lookup_name(p, scope.module, first) {
             Some(r) => r,
+            None if is_broken(p, scope.module, first) => return p.types.error,
             None => {
                 let mut d = Diagnostic::new(
                     codes::E0200,
@@ -568,7 +582,7 @@ fn resolve_type_path(
                 diags.push(*d);
                 return p.types.error;
             }
-            PathLookup::NotYet => return p.types.error,
+            PathLookup::NotYet | PathLookup::Broken => return p.types.error,
         }
     };
     let args: Vec<TyId> = last

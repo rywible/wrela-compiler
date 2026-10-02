@@ -60,6 +60,11 @@ pub(crate) struct Checker<'p> {
     /// `base ** exp` types, to check once the base's type is known: an integer's exponent is
     /// a `u32`, a float's a float.
     pows: Vec<(TyId, TyId, Span)>,
+    /// A syntax error's node has been checked. Names that don't resolve after it aren't
+    /// reported (the broken code may have declared them), nor is a missing return value.
+    pub(crate) saw_syntax_error: bool,
+    /// E0329 has been reported: a type that grew too large once grows again from the error.
+    pub(crate) too_large: bool,
 }
 
 impl<'p> Checker<'p> {
@@ -88,6 +93,8 @@ impl<'p> Checker<'p> {
             int_literals: Vec::new(),
             negated_ints: Vec::new(),
             pows: Vec::new(),
+            saw_syntax_error: false,
+            too_large: false,
         }
     }
 
@@ -97,7 +104,12 @@ impl<'p> Checker<'p> {
 
     pub(crate) fn display(&mut self, t: TyId) -> String {
         let t = self.infer.resolve(&self.p.types, t);
-        self.p.display_ty(t)
+        // A literal whose type isn't known yet.
+        match self.infer.var_kind(&self.p.types, t) {
+            Some(VarKind::Int) => "{integer}".into(),
+            Some(VarKind::Float) => "{float}".into(),
+            _ => self.p.display_ty(t),
+        }
     }
 
     pub(crate) fn shallow(&self, t: TyId) -> TyId {
@@ -170,6 +182,11 @@ impl<'p> Checker<'p> {
         let (na, ne) = (self.normalized(actual), self.normalized(expected));
         if (na != actual || ne != expected) && self.try_unify(na, ne) {
             return true;
+        }
+        // A type made from one that already produced an error isn't reported again.
+        let is_error = |k: &TyKind| matches!(k, TyKind::Error);
+        if self.p.types.any(na, &mut { is_error }) || self.p.types.any(ne, &mut { is_error }) {
+            return false;
         }
         let (a, e) = (self.display(actual), self.display(expected));
         let mut d = Diagnostic::new(codes::E0300, span, format!("expected `{e}`, found `{a}`"));
@@ -697,11 +714,20 @@ fn fn_scope(p: &Program, f: FnId) -> Scope {
 
 /// Checks one function's body. `None` when it has no body to check (a required trait method,
 /// or a std intrinsic).
-pub fn check_fn(p: &Program, consts: &ConstTypes, f: FnId) -> (Option<Body>, Vec<Diagnostic>) {
+/// What checking a function's body found.
+pub struct FnCheck {
+    pub body: Option<Body>,
+    pub diags: Vec<Diagnostic>,
+    /// The body holds a syntax error's node, so it may be missing parts.
+    pub incomplete: bool,
+}
+
+pub fn check_fn(p: &Program, consts: &ConstTypes, f: FnId) -> FnCheck {
     let def = p.func(f).clone();
-    let Some(body) = def.body.clone() else { return (None, Vec::new()) };
+    let none = FnCheck { body: None, diags: Vec::new(), incomplete: false };
+    let Some(body) = def.body.clone() else { return none };
     if def.attrs.intrinsic {
-        return (None, Vec::new());
+        return none;
     }
     let mut scope = fn_scope(p, f);
     if let FnOwner::Trait(t) = def.owner {
@@ -737,7 +763,10 @@ pub fn check_fn(p: &Program, consts: &ConstTypes, f: FnId) -> (Option<Body>, Vec
     let block = c.check_block(&body, Some(ret));
     if !matches!(c.kind(block.ty), TyKind::Never) {
         let unit = c.p.types.unit;
-        if block.tail.is_none() && c.shallow(ret) != unit && !matches!(c.kind(ret), TyKind::Var(_))
+        if block.tail.is_none()
+            && c.shallow(ret) != unit
+            && !matches!(c.kind(ret), TyKind::Var(_))
+            && !c.saw_syntax_error
         {
             let shown = c.display(ret);
             let at = body.span.shrink_to_end();
@@ -758,11 +787,12 @@ pub fn check_fn(p: &Program, consts: &ConstTypes, f: FnId) -> (Option<Body>, Vec
         }
     }
     let value = Expr { ty: block.ty, kind: ExprKind::Block(block), span: body.span };
-    let mut out = zonk::finish(c, params, value, hidden);
-    if let Some(b) = &mut out.0 {
-        crate::check::zonk::check_opaque(p, f, b, &mut out.1);
+    let incomplete = c.saw_syntax_error;
+    let (mut body, mut diags) = zonk::finish(c, params, value, hidden);
+    if let Some(b) = &mut body {
+        crate::check::zonk::check_opaque(p, f, b, &mut diags);
     }
-    out
+    FnCheck { body, diags, incomplete }
 }
 
 /// Checks a struct's field defaults where they're declared: literal values of the field's type.

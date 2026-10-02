@@ -39,6 +39,8 @@ pub fn parse_tokens(file: FileId, text: &str, lexed: Lexed) -> Parsed {
         diags: lexed.diagnostics,
         syntax_errors: 0,
         nesting: 0,
+        recovered_at: None,
+        closers: Vec::new(),
     };
     let f = p.parse_file();
     Parsed { file: f, comments: lexed.comments, diagnostics: p.diags }
@@ -60,6 +62,11 @@ pub(crate) struct Parser<'a> {
     /// How deeply the rule being parsed is nested in others that nest (expressions, blocks,
     /// types, patterns).
     nesting: u32,
+    /// The token position recovery last stopped at: an error there is already reported.
+    pub(crate) recovered_at: Option<usize>,
+    /// The closers of the lists and blocks being parsed, innermost last. Recovery stops at one
+    /// of these; any other closer closes nothing (L19) and is skipped.
+    pub(crate) closers: Vec<T>,
 }
 
 /// After this many syntax errors in one file, later ones are dropped: they're usually noise
@@ -240,14 +247,20 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// The span from `start` to the last token consumed; empty at `start` if none was.
+    fn since(&self, start: Span) -> Span {
+        let prev = self.prev_span();
+        if prev.end <= start.start { start.shrink_to_start() } else { start.to(prev) }
+    }
+
     /// Skips to the next separator or closing `}` at this nesting depth (recovery).
     fn recover_to_sep(&mut self) {
         let mut depth = 0i32;
         loop {
             match self.kind() {
-                T::Eof => return,
-                T::Newline | T::Semi if depth == 0 => return,
-                T::RBrace if depth == 0 => return,
+                T::Eof => break,
+                T::Newline | T::Semi if depth == 0 => break,
+                T::RBrace if depth == 0 => break,
                 T::LParen | T::LBracket | T::LBrace => depth += 1,
                 T::RParen | T::RBracket | T::RBrace => depth -= 1,
                 _ => {}
@@ -257,6 +270,143 @@ impl<'a> Parser<'a> {
                 depth = 0;
             }
         }
+        self.recovered_at = Some(self.pos);
+    }
+
+    /// An expression, or, if it fails to parse, an error node in its place after skipping to
+    /// the end of the statement.
+    pub(crate) fn expr_or_error(&mut self, f: impl FnOnce(&mut Self) -> PResult<Expr>) -> Expr {
+        let start = self.span();
+        f(self).unwrap_or_else(|Failed| {
+            self.recover_to_sep();
+            Expr { kind: ExprKind::Error, span: self.since(start) }
+        })
+    }
+
+    /// Whether the token closes a list or block being parsed (`close`, or an enclosing one's,
+    /// which closes this one with it (L19)).
+    fn at_closer(&self, close: T) -> bool {
+        let k = self.kind();
+        k == close
+            || (matches!(k, T::RParen | T::RBracket | T::RBrace) && self.closers.contains(&k))
+    }
+
+    /// Whether the list that `close` ends ends here: at a closer (after a line break, in
+    /// braces), or at the file's end.
+    fn at_list_end(&self, close: T) -> bool {
+        match self.kind() {
+            T::Eof => true,
+            T::Newline => close == T::RBrace && self.nth(1) == T::RBrace,
+            _ => self.at_closer(close),
+        }
+    }
+
+    /// Skips tokens, bracket groups whole, until `stop` holds at this depth, or a closer of
+    /// the lists and blocks being parsed, or the file's end.
+    fn skip_until(&mut self, close: T, stop: impl Fn(T) -> bool) {
+        let mut depth = 0u32;
+        loop {
+            let k = self.kind();
+            if k == T::Eof || (depth == 0 && (stop(k) || self.at_closer(close))) {
+                break;
+            }
+            match k {
+                T::LParen | T::LBracket | T::LBrace => depth += 1,
+                // A closer with no opener here closes nothing (L19).
+                T::RParen | T::RBracket | T::RBrace => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+            self.bump();
+        }
+        self.recovered_at = Some(self.pos);
+    }
+
+    /// Recovery inside a list that `close` ends: skips to the next `,` or the end of the list
+    /// (neither consumed).
+    fn recover_in_list(&mut self, close: T) {
+        self.skip_until(close, |k| k == T::Comma || (k == T::Newline && close == T::RBrace));
+    }
+
+    /// The elements of a comma-separated list, up to the token that ends it (not consumed). An
+    /// element that fails to parse is skipped up to the next `,` or the list's end, and
+    /// replaced by what `broken` makes of it (given its first token's index and its span), if
+    /// anything. In braces, a line break between two elements is a missing comma: reported,
+    /// and read as one.
+    pub(crate) fn list<E>(
+        &mut self,
+        close: T,
+        mut elem: impl FnMut(&mut Self) -> PResult<E>,
+        broken: impl Fn(&Self, usize, Span) -> Option<E>,
+    ) -> Vec<E> {
+        self.closers.push(close);
+        let mut out = Vec::new();
+        while !self.at_list_end(close) {
+            let (first, start) = (self.pos, self.span());
+            match elem(self) {
+                Ok(e) => out.push(e),
+                Err(Failed) => {
+                    self.recover_in_list(close);
+                    out.extend(broken(self, first, self.since(start)));
+                }
+            }
+            if self.eat(T::Comma) {
+                continue;
+            }
+            if close == T::RBrace && self.at(T::Newline) && self.nth(1) != T::RBrace {
+                if self.recovered_at == Some(self.pos) {
+                    self.bump();
+                    continue;
+                }
+                let at = self.prev_span().shrink_to_end();
+                let t = self.tok();
+                self.error(
+                    Diagnostic::new(
+                        codes::E0100,
+                        t.span,
+                        "expected `,` or `}`, found a line break",
+                    )
+                    .with_help("separate the entries with commas")
+                    .with_fix("add a comma", at, ","),
+                );
+                self.bump();
+                continue;
+            }
+            break;
+        }
+        self.closers.pop();
+        out
+    }
+
+    /// The token that closes a list (after a line break, in braces): consumed, or reported
+    /// (unless recovery just stopped here) and skipped to. Returns where the list ends.
+    pub(crate) fn close_list(&mut self, close: T, what: &str) -> Span {
+        if close == T::RBrace && self.at(T::Newline) && self.nth(1) == T::RBrace {
+            self.bump();
+        }
+        if self.at(close) {
+            return self.bump().span;
+        }
+        if self.recovered_at != Some(self.pos) {
+            self.expected(what);
+        }
+        self.skip_until(close, |_| false);
+        if self.at(close) { self.bump().span } else { self.prev_span() }
+    }
+
+    /// The name of a broken list element that starts `pub? IDENT :`, for keeping the element.
+    pub(crate) fn name_at(&self, first: usize) -> Option<Ident> {
+        let i = if self.tokens.get(first).is_some_and(|t| t.kind == T::Pub) {
+            first + 1
+        } else {
+            first
+        };
+        let (t, colon) = (self.tokens.get(i)?, self.tokens.get(i + 1)?);
+        (t.kind == T::Ident && colon.kind == T::Colon)
+            .then(|| Ident { name: self.text_of(t.span).to_string(), span: t.span })
+    }
+
+    fn error_type(span: Span) -> TypeExpr {
+        TypeExpr { kind: TypeExprKind::Error, span }
     }
 
     // ---- file and items --------------------------------------------------------------------
@@ -267,7 +417,13 @@ impl<'a> Parser<'a> {
         let mut items = Vec::new();
         self.skip_seps();
         while !self.at(T::Eof) {
-            let before = self.pos;
+            let (before, start) = (self.pos, self.span());
+            let broken = |p: &Self| Item {
+                attrs: Vec::new(),
+                vis: None,
+                kind: ItemKind::Error(p.item_name_at(before)),
+                span: p.since(start),
+            };
             match self.parse_item() {
                 Ok(item) => {
                     if let Some(span) = too_deep(&item) {
@@ -281,15 +437,30 @@ impl<'a> Parser<'a> {
                             )
                             .with_help("split it into `let` bindings"),
                         );
+                        items.push(Item {
+                            kind: ItemKind::Error(item.kind.name().cloned()),
+                            ..item
+                        });
                     } else {
                         items.push(item);
                     }
                     if !self.at_sep() && !self.at(T::Eof) {
                         self.missing_sep("an item");
+                        let rest = self.span();
                         self.recover_to_item();
+                        let span = self.since(rest);
+                        items.push(Item {
+                            attrs: Vec::new(),
+                            vis: None,
+                            kind: ItemKind::Error(None),
+                            span,
+                        });
                     }
                 }
-                Err(Failed) => self.recover_to_item(),
+                Err(Failed) => {
+                    self.recover_to_item();
+                    items.push(broken(self));
+                }
             }
             self.skip_seps();
             if self.pos == before && !self.at(T::Eof) {
@@ -297,6 +468,32 @@ impl<'a> Parser<'a> {
             }
         }
         File { items, span: start.to(self.span()) }
+    }
+
+    /// The name of the item whose first token is at `first`, if it got that far: after its
+    /// attributes and `pub`, a keyword and an identifier.
+    fn item_name_at(&self, first: usize) -> Option<Ident> {
+        let mut i = first;
+        let mut depth = 0u32;
+        while let Some(t) = self.tokens.get(i) {
+            match t.kind {
+                // Attributes and their arguments.
+                T::LParen => depth += 1,
+                T::RParen => depth = depth.saturating_sub(1),
+                _ if depth > 0 => {}
+                T::At | T::Pub | T::Newline => {}
+                T::Ident if self.tokens.get(i.wrapping_sub(1)).is_some_and(|p| p.kind == T::At) => {
+                }
+                T::Fn | T::Struct | T::Enum | T::Trait | T::Const => {
+                    let n = self.tokens.get(i + 1)?;
+                    return (n.kind == T::Ident)
+                        .then(|| Ident { name: self.text_of(n.span).to_string(), span: n.span });
+                }
+                _ => return None,
+            }
+            i += 1;
+        }
+        None
     }
 
     fn missing_sep(&mut self, what: &str) {
@@ -411,14 +608,17 @@ impl<'a> Parser<'a> {
         let name = self.ident("a function name")?;
         let generics = if self.at(T::Lt) { self.parse_generic_params()? } else { Vec::new() };
         self.expect(T::LParen, "`(`")?;
-        let mut params = Vec::new();
-        while !self.at(T::RParen) {
-            params.push(self.parse_param()?);
-            if !self.eat(T::Comma) {
-                break;
-            }
-        }
-        self.expect(T::RParen, "`,` or `)`")?;
+        let params = self.list(T::RParen, Self::parse_param, |p, first, span| {
+            // `x: <broken type>`, or `x` with its type missing.
+            let t = p.tokens[first];
+            let name = p.name_at(first).or_else(|| {
+                (t.kind == T::Ident)
+                    .then(|| Ident { name: p.text_of(t.span).to_string(), span: t.span })
+            })?;
+            let ty = Self::error_type(span);
+            Some(Param::Named { name, mode: Mode::Borrow, ty, default: None, span })
+        });
+        self.close_list(T::RParen, "`,` or `)`");
         let ret = if self.eat(T::Arrow) {
             let mode = if self.eat(T::Borrow) {
                 RetMode::Borrow
@@ -522,44 +722,25 @@ impl<'a> Parser<'a> {
     fn parse_field_block(&mut self) -> PResult<(Vec<FieldDecl>, bool)> {
         self.expect(T::LBrace, "`{`")?;
         let multiline = self.tok().line_break_before && !self.at(T::RBrace);
-        let mut fields = Vec::new();
-        while !matches!(self.kind(), T::RBrace | T::Newline) {
-            let start = self.span();
-            let vis = if self.at(T::Pub) { Some(self.bump().span) } else { None };
-            let name = self.ident("a field name")?;
-            self.expect(T::Colon, "`:` and the field's type")?;
-            let ty = self.parse_type()?;
-            let default = if self.eat(T::Eq) { Some(self.parse_expr()?) } else { None };
-            fields.push(FieldDecl { vis, name, ty, default, span: start.to(self.prev_span()) });
-            if !self.eat(T::Comma) {
-                break;
-            }
-        }
-        self.close_list("`,` or `}`")?;
+        let fields = self.list(
+            T::RBrace,
+            |p| {
+                let start = p.span();
+                let vis = if p.at(T::Pub) { Some(p.bump().span) } else { None };
+                let name = p.ident("a field name")?;
+                p.expect(T::Colon, "`:` and the field's type")?;
+                let ty = p.parse_type()?;
+                let default = if p.eat(T::Eq) { Some(p.parse_expr()?) } else { None };
+                Ok(FieldDecl { vis, name, ty, default, span: start.to(p.prev_span()) })
+            },
+            |p, first, span| {
+                let vis = (p.tokens[first].kind == T::Pub).then_some(p.tokens[first].span);
+                let name = p.name_at(first)?;
+                Some(FieldDecl { vis, name, ty: Self::error_type(span), default: None, span })
+            },
+        );
+        self.close_list(T::RBrace, "`,` or `}`");
         Ok((fields, multiline))
-    }
-
-    /// NEWLINE? "}" at the end of a comma-separated list in braces.
-    fn close_list(&mut self, what: &str) -> PResult<Span> {
-        if self.at(T::Newline) && self.nth(1) == T::RBrace {
-            self.bump();
-        }
-        if self.at(T::Newline) {
-            // A line break between two entries: the comma is missing.
-            let at = self.prev_span().shrink_to_end();
-            let t = self.tok();
-            self.error(
-                Diagnostic::new(
-                    codes::E0100,
-                    t.span,
-                    format!("expected {what}, found a line break"),
-                )
-                .with_help("separate the entries with commas")
-                .with_fix("add a comma", at, ","),
-            );
-            return Err(Failed);
-        }
-        Ok(self.expect(T::RBrace, what)?.span)
     }
 
     /// enum_item ::= "enum" IDENT generic_params? (":" bounds)? "{" (variant ("," variant)* ","?)? NEWLINE? "}"
@@ -570,32 +751,40 @@ impl<'a> Parser<'a> {
         let traits = if self.eat(T::Colon) { self.parse_bounds()? } else { Vec::new() };
         self.expect(T::LBrace, "`{`")?;
         let multiline = self.tok().line_break_before && !self.at(T::RBrace);
-        let mut variants = Vec::new();
-        while !matches!(self.kind(), T::RBrace | T::Newline) {
-            let start = self.span();
-            let vname = self.ident("a variant name")?;
-            let kind = if self.at(T::LParen) {
-                self.bump();
-                let mut tys = Vec::new();
-                while !self.at(T::RParen) {
-                    tys.push(self.parse_type()?);
-                    if !self.eat(T::Comma) {
-                        break;
-                    }
+        let variants = self.list(
+            T::RBrace,
+            |p| {
+                let start = p.span();
+                let name = p.ident("a variant name")?;
+                let kind = if p.eat(T::LParen) {
+                    let tys = p.list(T::RParen, Self::parse_type, |_, _, span| {
+                        Some(Self::error_type(span))
+                    });
+                    p.close_list(T::RParen, "`,` or `)`");
+                    VariantKind::Tuple(tys)
+                } else if p.at(T::LBrace) {
+                    VariantKind::Struct(p.parse_field_block()?.0)
+                } else {
+                    VariantKind::Unit
+                };
+                Ok(Variant { name, kind, span: start.to(p.prev_span()) })
+            },
+            // A variant whose name parsed is kept, with fields of unknown types.
+            |p, first, span| {
+                let t = p.tokens[first];
+                if t.kind != T::Ident {
+                    return None;
                 }
-                self.expect(T::RParen, "`,` or `)`")?;
-                VariantKind::Tuple(tys)
-            } else if self.at(T::LBrace) {
-                VariantKind::Struct(self.parse_field_block()?.0)
-            } else {
-                VariantKind::Unit
-            };
-            variants.push(Variant { name: vname, kind, span: start.to(self.prev_span()) });
-            if !self.eat(T::Comma) {
-                break;
-            }
-        }
-        self.close_list("`,` or `}`")?;
+                let name = Ident { name: p.text_of(t.span).to_string(), span: t.span };
+                let kind = match p.tokens.get(first + 1).map(|t| t.kind) {
+                    Some(T::LParen) => VariantKind::Tuple(vec![Self::error_type(span)]),
+                    Some(T::LBrace) => VariantKind::Struct(Vec::new()),
+                    _ => VariantKind::Unit,
+                };
+                Some(Variant { name, kind, span })
+            },
+        );
+        self.close_list(T::RBrace, "`,` or `}`");
         Ok(EnumDecl { name, generics, traits, variants, multiline })
     }
 
@@ -698,7 +887,7 @@ impl<'a> Parser<'a> {
         let name = self.ident("a constant name")?;
         let ty = if self.eat(T::Colon) { Some(self.parse_type()?) } else { None };
         self.expect(T::Eq, "`=` and the constant's value")?;
-        let value = self.parse_expr()?;
+        let value = self.expr_or_error(Self::parse_expr);
         Ok(ConstDecl { name, ty, value })
     }
 
@@ -713,14 +902,8 @@ impl<'a> Parser<'a> {
             } else if self.at(T::ColonColon) && self.nth(1) == T::LBrace {
                 self.bump();
                 self.bump();
-                let mut trees = Vec::new();
-                while !matches!(self.kind(), T::RBrace | T::Newline) {
-                    trees.push(self.parse_use_tree()?);
-                    if !self.eat(T::Comma) {
-                        break;
-                    }
-                }
-                self.close_list("`,` or `}`")?;
+                let trees = self.list(T::RBrace, Self::parse_use_tree, |_, _, _| None);
+                self.close_list(T::RBrace, "`,` or `}`");
                 return Ok(UseTree {
                     path,
                     kind: UseKind::Group(trees),

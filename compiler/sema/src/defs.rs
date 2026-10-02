@@ -2,7 +2,7 @@
 
 use crate::builtins::{BuiltinFn, BuiltinTy};
 use crate::ty::*;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 use wrela_diag::{FileId, Span};
 use wrela_syntax::ast;
@@ -37,6 +37,9 @@ pub struct Module {
     pub file: Option<FileId>,
     pub children: BTreeMap<String, ModuleId>,
     pub scope: BTreeMap<String, Binding>,
+    /// The names of items that failed to parse (and of imports of them). Their errors are
+    /// reported, so uses of them aren't.
+    pub broken: BTreeSet<String>,
     pub is_std: bool,
     pub ast: Option<Rc<ast::File>>,
 }

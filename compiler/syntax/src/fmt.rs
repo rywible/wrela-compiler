@@ -293,6 +293,7 @@ impl<'a> Printer<'a> {
                 self.w("use ");
                 self.use_tree(u);
             }
+            ItemKind::Error(_) => self.w("<error>"),
         }
     }
 
@@ -560,6 +561,7 @@ impl<'a> Printer<'a> {
                     self.ty(r);
                 }
             }
+            TypeExprKind::Error => self.w("<error>"),
         }
     }
 
@@ -1015,6 +1017,7 @@ impl<'a> Printer<'a> {
                 }
                 self.w(")");
             }
+            PatKind::Error => self.w("<error>"),
         }
     }
 }

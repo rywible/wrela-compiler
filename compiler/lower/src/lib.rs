@@ -186,6 +186,19 @@ impl<'a> Cx<'a> {
             return id;
         }
         let depth = caller.map_or(0, |(from, _)| mb.depth.get(&from).copied().unwrap_or(0) + 1);
+        let types = &self.checked.program.types;
+        let huge = key.substs().iter().any(|&t| types.size(t) > wrela_sema::ty::MAX_TYPE_SIZE);
+        if huge {
+            // Its signature isn't made either: the types are too large to lower.
+            let id = mb.m.add_function(ir::Function::new("too_large", Vec::new(), None));
+            mb.m.functions[id.index()].body = vec![ir::Stmt::Trap];
+            mb.instances.insert(key.clone(), id);
+            if !mb.too_deep {
+                mb.too_deep = true;
+                self.report_too_deep(&key, caller.map(|c| c.1), true);
+            }
+            return id;
+        }
         let f = self.signature(mb, &key);
         let id = mb.m.add_function(f);
         mb.instances.insert(key.clone(), id);
@@ -202,7 +215,7 @@ impl<'a> Cx<'a> {
             // never lowered, so the queue ends; the build stops on the error.
             if !mb.too_deep {
                 mb.too_deep = true;
-                self.report_too_deep(&key, caller.map(|c| c.1));
+                self.report_too_deep(&key, caller.map(|c| c.1), false);
             }
             mb.m.functions[id.index()].body = vec![ir::Stmt::Trap];
             return id;
@@ -211,22 +224,33 @@ impl<'a> Cx<'a> {
         id
     }
 
-    fn report_too_deep(&mut self, key: &InstanceKey, at: Option<Span>) {
+    /// E0412, after [`MAX_INSTANCE_DEPTH`] levels or, if `huge`, at type arguments past
+    /// `MAX_TYPE_SIZE`.
+    fn report_too_deep(&mut self, key: &InstanceKey, at: Option<Span>, huge: bool) {
         let Some(func) = key.source_fn() else { return };
         let name = self.checked.program.fn_display_name(func);
         let args: Vec<String> =
             key.substs().iter().map(|&t| self.checked.program.display_ty(t)).collect();
         let span = at.unwrap_or(self.checked.program.func(func).sig_span);
+        let when = if huge {
+            format!(
+                "its type arguments grew past {} parts: <{}>",
+                wrela_sema::ty::MAX_TYPE_SIZE,
+                args.join(", ")
+            )
+        } else {
+            format!(
+                "after {MAX_INSTANCE_DEPTH} levels it's instantiated with <{}>",
+                args.join(", ")
+            )
+        };
         self.err(
             Diagnostic::new(
                 wrela_diag::codes::E0412,
                 span,
                 format!("instantiating `{name}` never ends: each instance calls one with a larger type"),
             )
-            .with_note(format!(
-                "after {MAX_INSTANCE_DEPTH} levels it's instantiated with <{}>",
-                args.join(", ")
-            ))
+            .with_note(when)
             .with_note("generics are monomorphized (§7), so a generic function can't call itself with an ever-growing type"),
         );
     }

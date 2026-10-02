@@ -231,6 +231,7 @@ impl AstWalker {
         self.add(item.span, Cat::Item);
         self.attrs(&item.attrs);
         match &item.kind {
+            ItemKind::Error(_) => {}
             ItemKind::Fn(f) => self.fn_decl(f),
             ItemKind::Struct(s) => {
                 self.generics(&s.generics);
@@ -357,6 +358,7 @@ impl AstWalker {
             }
             TypeExprKind::Tuple(tys) => self.types(tys),
             TypeExprKind::Paren(inner) => self.ty(inner),
+            TypeExprKind::Error => {}
             TypeExprKind::Fn(params, ret) => {
                 self.types(params);
                 if let Some(r) = ret {
@@ -520,7 +522,7 @@ impl AstWalker {
     fn pat(&mut self, p: &Pat) {
         self.add(p.span, Cat::Pat);
         match &p.kind {
-            PatKind::Wild | PatKind::Ident(_) | PatKind::Lit { .. } => {}
+            PatKind::Wild | PatKind::Ident(_) | PatKind::Lit { .. } | PatKind::Error => {}
             PatKind::Path(path) => self.path(path),
             PatKind::TupleStruct(path, pats) => {
                 self.path(path);

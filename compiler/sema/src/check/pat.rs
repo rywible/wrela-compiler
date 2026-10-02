@@ -59,6 +59,12 @@ impl<'p> Checker<'p> {
         let span = pat.span;
         let kind = match &pat.kind {
             ast::PatKind::Wild => PatKind::Wild,
+            // Its syntax error is reported; it matches anything, so the match isn't reported as
+            // missing what it was meant to cover.
+            ast::PatKind::Error => {
+                self.saw_syntax_error = true;
+                PatKind::Wild
+            }
             ast::PatKind::Ident(name) => {
                 // A unit variant or constant in scope is matched, not bound (`None`, `MAX`).
                 match resolve::lookup_name(self.p, self.scope.module, &name.name) {
@@ -122,7 +128,9 @@ impl<'p> Checker<'p> {
                             self.err(*d);
                             return Pat { ty, kind: PatKind::Wild, span };
                         }
-                        PathLookup::NotYet => return Pat { ty, kind: PatKind::Wild, span },
+                        PathLookup::NotYet | PathLookup::Broken => {
+                            return Pat { ty, kind: PatKind::Wild, span };
+                        }
                     };
                 match (&pat.kind, res) {
                     (ast::PatKind::Path(_), Res::Variant(a, v)) => {
@@ -494,7 +502,10 @@ impl<'p> Checker<'p> {
             out.push(Arm { pat, guard, body, span: arm.span });
         }
         let ty = result.unwrap_or(self.p.types.never);
-        self.check_exhaustive(&s, &out, span);
+        // An arm that failed to parse could have covered anything.
+        if !arms.iter().any(|a| a.pats.iter().any(has_error_pat)) {
+            self.check_exhaustive(&s, &out, span);
+        }
         Expr { ty, span, kind: ExprKind::Match { scrutinee: Box::new(s), arms: out } }
     }
 
@@ -761,4 +772,19 @@ fn witness(c: &mut Checker, rows: &[Vec<DPat>], ty: TyId) -> Option<String> {
         }
     }
     None
+}
+
+/// Whether a pattern holds a syntax error's node.
+fn has_error_pat(p: &ast::Pat) -> bool {
+    match &p.kind {
+        ast::PatKind::Error => true,
+        ast::PatKind::TupleStruct(_, ps) | ast::PatKind::Tuple(ps) => ps.iter().any(has_error_pat),
+        ast::PatKind::Struct { fields, .. } => {
+            fields.iter().any(|f| f.pat.as_ref().is_some_and(has_error_pat))
+        }
+        ast::PatKind::Wild
+        | ast::PatKind::Ident(_)
+        | ast::PatKind::Lit { .. }
+        | ast::PatKind::Path(_) => false,
+    }
 }

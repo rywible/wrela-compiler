@@ -15,7 +15,6 @@ use std::path::Path;
 use std::rc::Rc;
 use wrela_diag::{Diagnostic, FileId, SourceMap, Span, codes, sort_and_dedup};
 use wrela_sema::{STD_SOURCES, SourceUnit};
-use wrela_syntax::Parsed;
 
 /// What compiling a package produced.
 #[derive(Debug)]
@@ -86,18 +85,17 @@ fn compile(root: &Path, emit: bool) -> Output {
 }
 
 /// Reads and parses std and the package. The units are `None` when the package can't be
-/// loaded or a file has syntax errors that leave no usable tree.
+/// loaded. Files with syntax errors are still checked: the parser keeps what it could read,
+/// with error nodes where it couldn't, and checking stays quiet about those.
 fn load(root: &Path) -> (SourceMap, Vec<Diagnostic>, Option<Vec<SourceUnit>>) {
     let mut sources = SourceMap::new();
     let mut diags = Vec::new();
     let mut units = Vec::new();
-    let mut parse_failed = false;
     for (i, (name, text)) in STD_SOURCES.iter().enumerate() {
         let file = FileId(i as u32);
         let parsed = wrela_syntax::parse(file, text);
         let id = sources.add(format!("<{name}>"), text.to_string());
         debug_assert_eq!(id, file);
-        parse_failed |= syntax_failed(&parsed);
         diags.extend(parsed.diagnostics);
         units.push(SourceUnit {
             path: name.split("::").map(String::from).collect(),
@@ -142,7 +140,6 @@ fn load(root: &Path) -> (SourceMap, Vec<Diagnostic>, Option<Vec<SourceUnit>>) {
         let parsed = wrela_syntax::parse(file, &text);
         let id = sources.add(pf.display.clone(), text);
         debug_assert_eq!(id, file);
-        parse_failed |= syntax_failed(&parsed);
         diags.extend(parsed.diagnostics);
         units.push(SourceUnit {
             path: pf.module.clone(),
@@ -151,15 +148,5 @@ fn load(root: &Path) -> (SourceMap, Vec<Diagnostic>, Option<Vec<SourceUnit>>) {
             is_std: false,
         });
     }
-    if parse_failed {
-        sort_and_dedup(&mut diags);
-        return (sources, diags, None);
-    }
     (sources, diags, Some(units))
-}
-
-/// Whether a file's syntax errors make its AST unusable. Lexical errors (E00xx) leave a usable
-/// token stream, so checking goes on and reports more; parse errors (E01xx) stop it.
-fn syntax_failed(p: &Parsed) -> bool {
-    p.diagnostics.iter().any(|d| d.is_error() && d.code.as_str().starts_with("E01"))
 }

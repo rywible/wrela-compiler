@@ -48,12 +48,13 @@ pub fn check_program(units: Vec<SourceUnit>, diags: &mut Vec<Diagnostic>) -> Che
     let mut mir = BTreeMap::new();
     for i in 0..p.fns.len() {
         let f = ty::FnId(i as u32);
-        let (body, d) = check::check_fn(p, &const_tys, f);
+        let check::FnCheck { body, diags: d, incomplete } = check::check_fn(p, &const_tys, f);
         let typed = !d.iter().any(|x| x.is_error());
         diags.extend(d);
         if let Some(b) = body {
-            // The memory checker needs a well-typed body; it would only add noise otherwise.
-            if typed {
+            // The memory checker needs a well-typed, whole body; it would only add noise
+            // otherwise.
+            if typed && !incomplete {
                 let (m, d) = mir::build::build(p, &consts, f, &b);
                 diags.extend(d);
                 diags.extend(borrowck::check(p, &m));

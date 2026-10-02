@@ -24,6 +24,39 @@ impl<'p> Checker<'p> {
     }
 
     pub(crate) fn check_expr(&mut self, e: &ast::Expr, expected: Option<TyId>) -> Expr {
+        let out = self.check_expr_kind(e, expected);
+        // Where types grow: each is checked against the bound before it can grow further.
+        let grows = matches!(
+            e.kind,
+            ast::ExprKind::Tuple(_)
+                | ast::ExprKind::Array(_)
+                | ast::ExprKind::ArrayRepeat { .. }
+                | ast::ExprKind::StructLit { .. }
+                | ast::ExprKind::Call { .. }
+                | ast::ExprKind::MethodCall { .. }
+        );
+        if grows && self.p.types.size(self.infer.resolve(&self.p.types, out.ty)) > MAX_TYPE_SIZE {
+            if std::mem::replace(&mut self.too_large, true) {
+                return self.error_expr(out.span);
+            }
+            self.err(
+                Diagnostic::new(
+                    codes::E0329,
+                    out.span,
+                    format!(
+                        "this value's type is too large: it has more than {MAX_TYPE_SIZE} parts"
+                    ),
+                )
+                .with_note(
+                    "a type that doubles with each step, like `(a, a)`, grows past any machine",
+                ),
+            );
+            return self.error_expr(out.span);
+        }
+        out
+    }
+
+    fn check_expr_kind(&mut self, e: &ast::Expr, expected: Option<TyId>) -> Expr {
         let span = e.span;
         match &e.kind {
             ast::ExprKind::Lit(lit) => self.check_lit(lit, expected),
@@ -171,7 +204,10 @@ impl<'p> Checker<'p> {
                 };
                 Expr { ty: self.p.types.never, span, kind }
             }
-            ast::ExprKind::Error => self.error_expr(span),
+            ast::ExprKind::Error => {
+                self.saw_syntax_error = true;
+                self.error_expr(span)
+            }
         }
     }
 
@@ -265,6 +301,9 @@ impl<'p> Checker<'p> {
                 ));
                 return None;
             }
+            if self.saw_syntax_error || resolve::is_broken(self.p, self.scope.module, &first.name) {
+                return None;
+            }
             let mut names: Vec<String> = self.env.iter().map(|(n, _)| n.clone()).collect();
             names.extend(resolve::visible_names(self.p, self.scope.module));
             let mut d = Diagnostic::new(
@@ -310,7 +349,7 @@ impl<'p> Checker<'p> {
         let idents: Vec<ast::Ident> = segs.iter().map(|s| s.ident.clone()).collect();
         match resolve::resolve_module_path_in(self.p, self.scope.module, &idents, true) {
             PathLookup::Found(r) => Some(ValueRes::Item(r)),
-            PathLookup::NotYet => None,
+            PathLookup::NotYet | PathLookup::Broken => None,
             PathLookup::Error(d) => {
                 // Maybe `Type::assoc` or `Trait::method`.
                 let prefix = &idents[..idents.len() - 1];
@@ -1152,7 +1191,7 @@ impl<'p> Checker<'p> {
                     self.err(*d);
                     return self.error_expr(span);
                 }
-                PathLookup::NotYet => None,
+                PathLookup::NotYet | PathLookup::Broken => None,
             }
         };
         let (adt, variant) = match res {

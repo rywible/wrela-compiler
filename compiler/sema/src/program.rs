@@ -25,6 +25,9 @@ pub struct Program {
     pub impls_of_trait: HashMap<TraitId, Vec<ImplId>>,
     /// Inherent impls by the ADT they're for.
     pub inherent_impls: HashMap<AdtId, Vec<ImplId>>,
+    /// Whether a type implements a structural trait (`Copy`, `Clone`, `GpuData`): worked out
+    /// once per type, since struct types share their fields' types.
+    pub(crate) builtin_impls: std::cell::RefCell<HashMap<(TyId, Lang), bool>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -90,6 +90,9 @@ pub enum TypeDef {
 pub struct Types {
     defs: Vec<TypeDef>,
     map: HashMap<TypeDef, TypeId>,
+    /// Each type's layout, worked out when it's interned from its parts' (so a type that
+    /// repeats a part is laid out once, not once per repetition).
+    layouts: Vec<crate::layout::Layout>,
 }
 
 impl Types {
@@ -98,9 +101,14 @@ impl Types {
             return t;
         }
         let t = TypeId(self.defs.len() as u32);
+        self.layouts.push(crate::layout::compute(self, &d));
         self.defs.push(d.clone());
         self.map.insert(d, t);
         t
+    }
+
+    pub(crate) fn layout(&self, t: TypeId) -> crate::layout::Layout {
+        self.layouts[t.index()]
     }
 
     pub fn get(&self, t: TypeId) -> &TypeDef {

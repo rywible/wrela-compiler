@@ -170,21 +170,24 @@ pub(crate) fn emit_function(
         fe.ins.push(I::Unreachable);
     }
     fe.ins.push(I::End);
-    // Prologue, now that the frame's size is final: saved = sp; fp = sp - frame; trap if that's
-    // below the stack's limit; sp = fp.
+    // Prologue, now that the frame's size is final: saved = sp; trap if the room left below sp
+    // (sp - limit, never negative) is less than the frame; sp = fp = sp - frame. (Comparing
+    // sp - frame with the limit instead would wrap around when the frame is larger than sp.)
     let frame = round_up(16, fe.frame);
     let prologue = [
         I::GlobalGet(globals::SP),
         I::LocalTee(fe.saved_sp),
-        I::I32Const(frame as i32),
-        I::I32Sub,
-        I::LocalTee(fe.fp),
         I::I32Const(memory::STACK_LIMIT as i32),
+        I::I32Sub,
+        I::I32Const(frame as i32),
         I::I32LtU,
         I::If(BlockType::Empty),
         I::Unreachable,
         I::End,
-        I::LocalGet(fe.fp),
+        I::LocalGet(fe.saved_sp),
+        I::I32Const(frame as i32),
+        I::I32Sub,
+        I::LocalTee(fe.fp),
         I::GlobalSet(globals::SP),
     ];
     let mut func = Function::new(fe.locals.iter().map(|t| (1, *t)));
@@ -255,7 +258,7 @@ impl<'m> Fe<'m> {
         let l = layout(&self.m.types, t);
         let align = l.align.max(4);
         let off = round_up(align, self.frame);
-        self.frame = off + round_up(16, l.size);
+        self.frame = off.saturating_add(round_up(16, l.size));
         off
     }
 

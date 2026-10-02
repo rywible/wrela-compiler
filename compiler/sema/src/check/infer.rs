@@ -1,6 +1,7 @@
 //! Type inference within one body: variables, unification, and resolving what's left.
 
 use crate::ty::*;
+use std::collections::HashSet;
 use wrela_diag::Span;
 
 #[derive(Clone, Debug)]
@@ -76,11 +77,41 @@ impl Infer {
 
     /// Makes `a` and `b` the same type, or reports that they can't be.
     pub fn unify(&mut self, types: &Types, a: TyId, b: TyId) -> Result<(), Mismatch> {
+        self.unify_in(types, a, b, &mut HashSet::new())
+    }
+
+    /// `done` holds the pairs of large types already made the same: types share parts, and
+    /// unifying a shared part again would only repeat the work.
+    fn unify_in(
+        &mut self,
+        types: &Types,
+        a: TyId,
+        b: TyId,
+        done: &mut HashSet<(TyId, TyId)>,
+    ) -> Result<(), Mismatch> {
         let a = self.shallow(types, a);
         let b = self.shallow(types, b);
         if a == b {
             return Ok(());
         }
+        let large = types.size(a).max(types.size(b)) > 64;
+        if large && done.contains(&(a, b)) {
+            return Ok(());
+        }
+        self.unify_parts(types, a, b, done)?;
+        if large {
+            done.insert((a, b));
+        }
+        Ok(())
+    }
+
+    fn unify_parts(
+        &mut self,
+        types: &Types,
+        a: TyId,
+        b: TyId,
+        done: &mut HashSet<(TyId, TyId)>,
+    ) -> Result<(), Mismatch> {
         let (ka, kb) = (types.kind(a).clone(), types.kind(b).clone());
         match (&ka, &kb) {
             (TyKind::Error, _) | (_, TyKind::Error) => Ok(()),
@@ -103,13 +134,13 @@ impl Infer {
             (_, TyKind::Var(y)) => self.bind(types, *y, a),
             (TyKind::Tuple(xs), TyKind::Tuple(ys)) if xs.len() == ys.len() => {
                 for (&x, &y) in xs.iter().zip(ys) {
-                    self.unify(types, x, y)?;
+                    self.unify_in(types, x, y, done)?;
                 }
                 Ok(())
             }
             (TyKind::Adt(x, xs), TyKind::Adt(y, ys)) if x == y && xs.len() == ys.len() => {
                 for (&x, &y) in xs.iter().zip(ys) {
-                    self.unify(types, x, y)?;
+                    self.unify_in(types, x, y, done)?;
                 }
                 Ok(())
             }
@@ -118,31 +149,33 @@ impl Infer {
                 if x == y && xs.len() == ys.len() =>
             {
                 for (&x, &y) in xs.iter().zip(ys) {
-                    self.unify(types, x, y)?;
+                    self.unify_in(types, x, y, done)?;
                 }
                 Ok(())
             }
             (TyKind::Closure(x, xs), TyKind::Closure(y, ys)) if x == y => {
                 for (&x, &y) in xs.iter().zip(ys) {
-                    self.unify(types, x, y)?;
+                    self.unify_in(types, x, y, done)?;
                 }
                 Ok(())
             }
-            (TyKind::Array(x, n), TyKind::Array(y, m)) if n == m => self.unify(types, *x, *y),
-            (TyKind::Slice(x), TyKind::Slice(y)) => self.unify(types, *x, *y),
+            (TyKind::Array(x, n), TyKind::Array(y, m)) if n == m => {
+                self.unify_in(types, *x, *y, done)
+            }
+            (TyKind::Slice(x), TyKind::Slice(y)) => self.unify_in(types, *x, *y, done),
             (TyKind::FnPtr(xp, xr), TyKind::FnPtr(yp, yr)) if xp.len() == yp.len() => {
                 for (&x, &y) in xp.iter().zip(yp) {
-                    self.unify(types, x, y)?;
+                    self.unify_in(types, x, y, done)?;
                 }
-                self.unify(types, *xr, *yr)
+                self.unify_in(types, *xr, *yr, done)
             }
             (
                 TyKind::Projection { self_ty: s1, trait_: t1, trait_args: a1, name: n1 },
                 TyKind::Projection { self_ty: s2, trait_: t2, trait_args: a2, name: n2 },
             ) if t1 == t2 && n1 == n2 && a1.len() == a2.len() => {
-                self.unify(types, *s1, *s2)?;
+                self.unify_in(types, *s1, *s2, done)?;
                 for (&x, &y) in a1.iter().zip(a2) {
-                    self.unify(types, x, y)?;
+                    self.unify_in(types, x, y, done)?;
                 }
                 Ok(())
             }

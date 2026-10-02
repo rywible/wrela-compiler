@@ -167,6 +167,15 @@ pub fn implements(p: &Program, ty: TyId, r: &TraitRef) -> bool {
 
 /// `Copy`, `Clone` and `GpuData`, which are structural.
 pub fn implements_builtin(p: &Program, ty: TyId, lang: Lang) -> bool {
+    if let Some(&known) = p.builtin_impls.borrow().get(&(ty, lang)) {
+        return known;
+    }
+    let r = implements_builtin_uncached(p, ty, lang);
+    p.builtin_impls.borrow_mut().insert((ty, lang), r);
+    r
+}
+
+fn implements_builtin_uncached(p: &Program, ty: TyId, lang: Lang) -> bool {
     let k = p.types.kind(ty).clone();
     match k {
         TyKind::Error | TyKind::Never => true,
@@ -182,7 +191,7 @@ pub fn implements_builtin(p: &Program, ty: TyId, lang: Lang) -> bool {
             if !opted {
                 return false;
             }
-            let adt = p.adt(a).clone();
+            let adt = p.adt(a);
             let subst = Subst::from_pairs(&adt.generics, &args);
             let mut field_tys: Vec<TyId> = adt.fields().iter().map(|f| f.ty).collect();
             for v in adt.variants() {

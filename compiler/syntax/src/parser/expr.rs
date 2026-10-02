@@ -27,25 +27,9 @@ impl<'a> Parser<'a> {
 
     fn parse_block_inner(&mut self) -> PResult<Block> {
         let open = self.expect(T::LBrace, "`{`")?.span;
-        let mut stmts = Vec::new();
-        self.skip_seps();
-        while !self.at(T::RBrace) && !self.at(T::Eof) {
-            let before = self.pos;
-            match self.parse_stmt() {
-                Ok(s) => {
-                    stmts.push(s);
-                    if !self.at_sep() && !self.at(T::RBrace) {
-                        self.stmt_sep_error();
-                        self.recover_to_sep();
-                    }
-                }
-                Err(Failed) => self.recover_to_sep(),
-            }
-            self.skip_seps();
-            if self.pos == before && !self.at(T::RBrace) && !self.at(T::Eof) {
-                self.bump();
-            }
-        }
+        self.closers.push(T::RBrace);
+        let stmts = self.block_stmts();
+        self.closers.pop();
         if self.at(T::Eof) {
             self.error(
                 Diagnostic::new(codes::E0101, open, "this `{` is never closed")
@@ -55,6 +39,41 @@ impl<'a> Parser<'a> {
         }
         let close = self.bump().span;
         Ok(Block { stmts, span: open.to(close) })
+    }
+
+    /// The statements of a block, up to its `}` or the file's end.
+    fn block_stmts(&mut self) -> Vec<Stmt> {
+        let mut stmts = Vec::new();
+        self.skip_seps();
+        while !self.at(T::RBrace) && !self.at(T::Eof) {
+            let (before, start) = (self.pos, self.span());
+            match self.parse_stmt() {
+                Ok(s) => {
+                    stmts.push(s);
+                    if !self.at_sep() && !self.at(T::RBrace) {
+                        self.stmt_sep_error();
+                        let rest = self.span();
+                        self.recover_to_sep();
+                        let span = self.since(rest);
+                        let e = Expr { kind: ExprKind::Error, span };
+                        stmts.push(Stmt { kind: StmtKind::Expr(e), span });
+                    }
+                }
+                Err(Failed) => {
+                    // The statement stays, as an error node: later passes know something was
+                    // there.
+                    self.recover_to_sep();
+                    let span = self.since(start);
+                    let e = Expr { kind: ExprKind::Error, span };
+                    stmts.push(Stmt { kind: StmtKind::Expr(e), span });
+                }
+            }
+            self.skip_seps();
+            if self.pos == before && !self.at(T::RBrace) && !self.at(T::Eof) {
+                self.bump();
+            }
+        }
+        stmts
     }
 
     /// Two statements on one line without `;`, or a statement followed by junk.
@@ -86,7 +105,8 @@ impl<'a> Parser<'a> {
                 let pat = self.parse_pattern()?;
                 let ty = if self.eat(T::Colon) { Some(self.parse_type()?) } else { None };
                 self.expect_bind_eq()?;
-                let init = self.parse_expr()?;
+                // A value that fails to parse leaves the binding, so its uses still resolve.
+                let init = self.expr_or_error(Self::parse_expr);
                 StmtKind::Bind { kind: BindKind::Let, pat, ty, init }
             }
             T::Var => self.parse_named_bind(BindKind::Var)?,
@@ -197,7 +217,7 @@ impl<'a> Parser<'a> {
         let pat = Pat { span: name.span, kind: PatKind::Ident(name) };
         let ty = if self.eat(T::Colon) { Some(self.parse_type()?) } else { None };
         self.expect_bind_eq()?;
-        let init = self.parse_expr()?;
+        let init = self.expr_or_error(Self::parse_expr);
         Ok(StmtKind::Bind { kind, pat, ty, init })
     }
 
@@ -290,15 +310,22 @@ impl<'a> Parser<'a> {
         let mut params = Vec::new();
         if !self.eat(T::OrOr) {
             self.expect(T::Pipe, "`|`")?;
-            while !self.at(T::Pipe) {
-                let name = self.ident("a closure parameter")?;
-                let ty = if self.eat(T::Colon) { Some(self.parse_type()?) } else { None };
-                params.push(ClosureParam { name, ty });
-                if !self.eat(T::Comma) {
-                    break;
-                }
-            }
-            self.expect(T::Pipe, "`,` or `|`")?;
+            params = self.list(
+                T::Pipe,
+                |p| {
+                    let name = p.ident("a closure parameter")?;
+                    let ty = if p.eat(T::Colon) { Some(p.parse_type()?) } else { None };
+                    Ok(ClosureParam { name, ty })
+                },
+                |p, first, span| {
+                    let name = p.name_at(first)?;
+                    Some(ClosureParam {
+                        name,
+                        ty: Some(TypeExpr { kind: TypeExprKind::Error, span }),
+                    })
+                },
+            );
+            self.close_list(T::Pipe, "`,` or `|`");
         }
         let (ret, body) = if self.eat(T::Arrow) {
             let ty = self.parse_type()?;
@@ -555,39 +582,48 @@ impl<'a> Parser<'a> {
     pub(crate) fn parse_call_args(&mut self) -> PResult<(Vec<Arg>, bool)> {
         self.expect(T::LParen, "`(`")?;
         let multiline = self.tok().line_break_before && !self.at(T::RParen);
-        let mut args: Vec<Arg> = Vec::new();
-        while !self.at(T::RParen) {
-            let start = self.span();
-            let name = if self.at(T::Ident) && self.nth(1) == T::Colon {
-                let n = self.ident("a name")?;
-                self.bump();
-                Some(n)
-            } else {
-                None
-            };
-            let value = self.parse_expr()?;
-            let span = start.to(value.span);
-            if name.is_none()
-                && let Some(prev) = args.iter().rev().find(|a| a.name.is_some())
-            {
-                let prev_name = prev.name.as_ref().map(|n| n.name.clone()).unwrap_or_default();
-                self.error(
-                    Diagnostic::new(
-                        codes::E0105,
-                        span,
-                        "a positional argument can't follow a named one",
-                    )
-                    .with_secondary(prev.span, format!("`{prev_name}` is named here"))
-                    .with_help("put positional arguments first, or name this one too (D-039)"),
-                );
-                return Err(Failed);
-            }
-            args.push(Arg { name, value, span });
-            if !self.eat(T::Comma) {
-                break;
+        let args = self.list(
+            T::RParen,
+            |p| {
+                let start = p.span();
+                let name = if p.at(T::Ident) && p.nth(1) == T::Colon {
+                    let n = p.ident("a name")?;
+                    p.bump();
+                    Some(n)
+                } else {
+                    None
+                };
+                let value = p.parse_expr()?;
+                Ok(Arg { name, value, span: start.to(p.prev_span()) })
+            },
+            |p, first, span| {
+                let value = Expr { kind: ExprKind::Error, span };
+                Some(Arg { name: p.name_at(first), value, span })
+            },
+        );
+        self.close_list(T::RParen, "`,` or `)`");
+        // Positional arguments come first (D-039); the call is an error otherwise.
+        let mut named: Option<&Arg> = None;
+        for a in &args {
+            match (named, &a.name) {
+                (_, Some(_)) => named = Some(a),
+                (Some(prev), None) => {
+                    let prev_name = prev.name.as_ref().map(|n| n.name.clone()).unwrap_or_default();
+                    self.error(
+                        Diagnostic::new(
+                            codes::E0105,
+                            a.span,
+                            "a positional argument can't follow a named one",
+                        )
+                        .with_secondary(prev.span, format!("`{prev_name}` is named here"))
+                        .with_help("put positional arguments first, or name this one too (D-039)"),
+                    );
+                    self.recovered_at = Some(self.pos);
+                    return Err(Failed);
+                }
+                (None, None) => {}
             }
         }
-        self.expect(T::RParen, "`,` or `)`")?;
         Ok((args, multiline))
     }
 
@@ -629,16 +665,10 @@ impl<'a> Parser<'a> {
             }
             T::LParen => {
                 self.bump();
-                let mut items = Vec::new();
-                let mut trailing = false;
-                while !self.at(T::RParen) {
-                    items.push(self.parse_expr()?);
-                    trailing = self.eat(T::Comma);
-                    if !trailing {
-                        break;
-                    }
-                }
-                self.expect(T::RParen, "`,` or `)`")?;
+                let mut items =
+                    self.list(T::RParen, Self::parse_expr, |_, _, span| Some(error_expr(span)));
+                let trailing = self.tokens[self.pos - 1].kind == T::Comma;
+                self.close_list(T::RParen, "`,` or `)`");
                 let span = t.span.to(self.prev_span());
                 if items.len() == 1 && !trailing {
                     let inner = items.pop().ok_or(Failed)?;
@@ -665,14 +695,13 @@ impl<'a> Parser<'a> {
                         ));
                     }
                     items.push(first);
-                    while self.eat(T::Comma) {
-                        if self.at(T::RBracket) {
-                            break;
-                        }
-                        items.push(self.parse_expr()?);
+                    if self.eat(T::Comma) {
+                        items.extend(self.list(T::RBracket, Self::parse_expr, |_, _, span| {
+                            Some(error_expr(span))
+                        }));
                     }
                 }
-                self.expect(T::RBracket, "`,` or `]`")?;
+                self.close_list(T::RBracket, "`,` or `]`");
                 let span = t.span.to(self.prev_span());
                 Ok(self.expr_node(ExprKind::Array(items), span))
             }
@@ -734,23 +763,30 @@ impl<'a> Parser<'a> {
     fn parse_struct_literal(&mut self, path: Path) -> PResult<Expr> {
         self.expect(T::LBrace, "`{`")?;
         let multiline = self.tok().line_break_before && !self.at(T::RBrace);
-        let mut fields = Vec::new();
         let mut base = None;
-        while !matches!(self.kind(), T::RBrace | T::Newline) {
-            if self.eat(T::DotDot) {
-                base = Some(Box::new(self.parse_expr()?));
-                self.eat(T::Comma);
-                break;
-            }
-            let start = self.span();
-            let name = self.ident("a field name")?;
-            let value = if self.eat(T::Colon) { Some(self.parse_expr()?) } else { None };
-            fields.push(FieldInit { name, value, span: start.to(self.prev_span()) });
-            if !self.eat(T::Comma) {
-                break;
-            }
-        }
-        let close = self.close_list("`,` or `}`")?;
+        let fields = self.list(
+            T::RBrace,
+            |p| {
+                if base.is_some() {
+                    // `..base` comes last.
+                    return Err(p.expected("`}`"));
+                }
+                let start = p.span();
+                if p.eat(T::DotDot) {
+                    base = Some(Box::new(p.parse_expr()?));
+                    return Ok(None);
+                }
+                let name = p.ident("a field name")?;
+                let value = if p.eat(T::Colon) { Some(p.parse_expr()?) } else { None };
+                Ok(Some(FieldInit { name, value, span: start.to(p.prev_span()) }))
+            },
+            |p, first, span| {
+                let name = p.name_at(first)?;
+                Some(Some(FieldInit { name, value: Some(error_expr(span)), span }))
+            },
+        );
+        let fields: Vec<FieldInit> = fields.into_iter().flatten().collect();
+        let close = self.close_list(T::RBrace, "`,` or `}`");
         let span = path.span.to(close);
         Ok(self.expr_node(ExprKind::StructLit { path, fields, base, multiline }, span))
     }
@@ -806,22 +842,35 @@ impl<'a> Parser<'a> {
         let scrutinee = self.parse_expr_ctx(Ctx::NoStruct)?;
         self.expect(T::LBrace, "`{`")?;
         let mut arms = Vec::new();
-        while !self.at(T::RBrace) {
+        while !self.at(T::RBrace) && !self.at(T::Eof) {
             let arm_start = self.span();
-            let mut pats = vec![self.parse_pattern()?];
-            while self.eat(T::Pipe) {
-                pats.push(self.parse_pattern()?);
+            let arm = (|| -> PResult<Arm> {
+                let mut pats = vec![self.parse_pattern()?];
+                while self.eat(T::Pipe) {
+                    pats.push(self.parse_pattern()?);
+                }
+                let guard =
+                    if self.eat(T::If) { Some(self.parse_expr_ctx(Ctx::NoStruct)?) } else { None };
+                self.expect(T::FatArrow, "`=>`")?;
+                let body = self.parse_expr()?;
+                Ok(Arm { pats, guard, body, span: arm_start.to(self.prev_span()) })
+            })();
+            match arm {
+                Ok(a) => arms.push(a),
+                Err(Failed) => {
+                    // The arm stays, matching anything, so the match isn't reported as missing
+                    // the cases it covered.
+                    self.recover_in_list(T::RBrace);
+                    let span = self.since(arm_start);
+                    let pat = Pat { kind: PatKind::Error, span };
+                    arms.push(Arm { pats: vec![pat], guard: None, body: error_expr(span), span });
+                }
             }
-            let guard =
-                if self.eat(T::If) { Some(self.parse_expr_ctx(Ctx::NoStruct)?) } else { None };
-            self.expect(T::FatArrow, "`=>`")?;
-            let body = self.parse_expr()?;
-            arms.push(Arm { pats, guard, body, span: arm_start.to(self.prev_span()) });
             if !(self.eat(T::Comma) || self.eat(T::Newline)) {
                 break;
             }
         }
-        self.expect(T::RBrace, "`,`, a line break or `}`")?;
+        self.close_list(T::RBrace, "`,`, a line break or `}`");
         Ok(self.expr_node(
             ExprKind::Match { scrutinee: Box::new(scrutinee), arms },
             start.to(self.prev_span()),
@@ -867,36 +916,40 @@ impl<'a> Parser<'a> {
             }
             T::Ident | T::SelfType | T::SelfValue => {
                 let path = self.parse_path_expr()?;
-                if self.at(T::LParen) {
-                    self.bump();
-                    let mut pats = Vec::new();
-                    while !self.at(T::RParen) {
-                        pats.push(self.parse_pattern()?);
-                        if !self.eat(T::Comma) {
-                            break;
-                        }
-                    }
-                    self.expect(T::RParen, "`,` or `)`")?;
+                if self.eat(T::LParen) {
+                    let pats = self.list(T::RParen, Self::parse_pattern, |_, _, span| {
+                        Some(Pat { kind: PatKind::Error, span })
+                    });
+                    self.close_list(T::RParen, "`,` or `)`");
                     PatKind::TupleStruct(path, pats)
                 } else if self.at(T::LBrace) {
                     self.bump();
-                    let mut fields = Vec::new();
                     let mut rest = false;
-                    while !matches!(self.kind(), T::RBrace | T::Newline) {
-                        if self.eat(T::DotDot) {
-                            rest = true;
-                            self.eat(T::Comma);
-                            break;
-                        }
-                        let name = self.ident("a field name")?;
-                        let pat =
-                            if self.eat(T::Colon) { Some(self.parse_pattern()?) } else { None };
-                        fields.push(FieldPat { name, pat });
-                        if !self.eat(T::Comma) {
-                            break;
-                        }
-                    }
-                    self.close_list("`,` or `}`")?;
+                    let fields = self.list(
+                        T::RBrace,
+                        |p| {
+                            if rest {
+                                // `..` comes last.
+                                return Err(p.expected("`}`"));
+                            }
+                            if p.eat(T::DotDot) {
+                                rest = true;
+                                return Ok(None);
+                            }
+                            let name = p.ident("a field name")?;
+                            let pat = if p.eat(T::Colon) { Some(p.parse_pattern()?) } else { None };
+                            Ok(Some(FieldPat { name, pat }))
+                        },
+                        |p, first, span| {
+                            let name = p.name_at(first)?;
+                            Some(Some(FieldPat {
+                                name,
+                                pat: Some(Pat { kind: PatKind::Error, span }),
+                            }))
+                        },
+                    );
+                    let fields = fields.into_iter().flatten().collect();
+                    self.close_list(T::RBrace, "`,` or `}`");
                     PatKind::Struct { path, fields, rest }
                 } else if path.is_single() && t.kind == T::Ident {
                     PatKind::Ident(path.segments.into_iter().next().ok_or(Failed)?.ident)
@@ -906,16 +959,11 @@ impl<'a> Parser<'a> {
             }
             T::LParen => {
                 self.bump();
-                let mut pats = Vec::new();
-                let mut trailing = false;
-                while !self.at(T::RParen) {
-                    pats.push(self.parse_pattern()?);
-                    trailing = self.eat(T::Comma);
-                    if !trailing {
-                        break;
-                    }
-                }
-                self.expect(T::RParen, "`,` or `)`")?;
+                let mut pats = self.list(T::RParen, Self::parse_pattern, |_, _, span| {
+                    Some(Pat { kind: PatKind::Error, span })
+                });
+                let trailing = self.tokens[self.pos - 1].kind == T::Comma;
+                self.close_list(T::RParen, "`,` or `)`");
                 if pats.len() == 1 && !trailing {
                     // `(p)` is just `p`, parenthesized.
                     let mut inner = pats.pop().ok_or(Failed)?;
@@ -928,6 +976,10 @@ impl<'a> Parser<'a> {
         };
         Ok(Pat { kind, span: t.span.to(self.prev_span()) })
     }
+}
+
+fn error_expr(span: Span) -> Expr {
+    Expr { kind: ExprKind::Error, span }
 }
 
 /// The grammar's assignment target is a postfix_expr: a primary followed by postfixes.
