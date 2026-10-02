@@ -1,5 +1,6 @@
-# Run artefacts from tools/headless.sh and tools/serve.py
+# Run artefacts from tools/headless.py and tools/serve.py
 **/results/DONE
 **/results/console.log
-**/results/chrome.log
 **/results/*.png
+**/results/*.tmp
+__pycache__/

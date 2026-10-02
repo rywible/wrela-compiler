@@ -1,0 +1,45 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>GPU smoke</title>
+<!-- Checks the real setup tools/headless.py gives a page: cross-origin isolation, WebGPU on the
+     real adapter, and a compute dispatch read back. python3 tools/headless.py tools/tests/gpu-smoke -->
+<script type="module">
+const done = (body) => fetch("results/DONE", { method: "PUT", body });
+try {
+  if (!crossOriginIsolated) throw new Error("not cross-origin isolated");
+  const adapter = await navigator.gpu?.requestAdapter();
+  if (!adapter) throw new Error("no WebGPU adapter");
+  const device = await adapter.requestDevice();
+  const n = 256;
+  const buf = device.createBuffer({ size: n * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+  const read = device.createBuffer({ size: n * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+  const pipeline = device.createComputePipeline({
+    layout: "auto",
+    compute: {
+      module: device.createShaderModule({
+        code: `@group(0) @binding(0) var<storage, read_write> out: array<u32>;
+               @compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3u) {
+                 out[id.x] = id.x * id.x;
+               }`,
+      }),
+    },
+  });
+  const enc = device.createCommandEncoder();
+  const pass = enc.beginComputePass();
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: buf } }] }));
+  pass.dispatchWorkgroups(n / 64);
+  pass.end();
+  enc.copyBufferToBuffer(buf, 0, read, 0, n * 4);
+  device.queue.submit([enc.finish()]);
+  await read.mapAsync(GPUMapMode.READ);
+  const out = new Uint32Array(read.getMappedRange());
+  for (let i = 0; i < n; i++) if (out[i] !== i * i) throw new Error(`out[${i}] = ${out[i]}`);
+  const info = adapter.info ?? {};
+  console.log(`adapter: ${info.vendor} ${info.architecture}`);
+  await done("ok");
+} catch (e) {
+  console.error(e.stack ?? String(e));
+  await done(String(e));
+}
+</script>
