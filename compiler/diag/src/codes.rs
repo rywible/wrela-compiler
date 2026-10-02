@@ -122,6 +122,7 @@ codes! {
     E0325 = "E0325", "an array length that isn't a constant";
     E0326 = "E0326", "a CPU-only type in GPU code";
     E0327 = "E0327", "a run type `[T]` outside a parameter";
+    E0328 = "E0328", "a constant whose value refers to itself";
 
     // ---- E04xx: traits and generics --------------------------------------------------------
     E0400 = "E0400", "a type that doesn't implement a trait";

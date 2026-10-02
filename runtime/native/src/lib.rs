@@ -18,7 +18,9 @@
 //! # Ok::<(), wrela_host::Error>(())
 //! ```
 //!
-//! A [`Host`] holds the GPU lock ([`lock`]) for its lifetime.
+//! A [`Host`] holds the GPU lock ([`lock`]) for its lifetime. A [`CpuHost`] runs only the WASM:
+//! it checks what the program submits but executes none of it, so it needs neither a GPU nor
+//! the lock, for tests that call exports.
 
 mod check;
 mod error;
@@ -78,6 +80,28 @@ pub fn frame_time(i: u32, fps: f64) -> f32 {
     (f64::from(i) / fps) as f32
 }
 
+/// Reads a build's manifest, WASM and WGSL from `dir`.
+fn read_build(dir: &Path) -> Result<(Manifest, Vec<u8>, Vec<String>)> {
+    let read = |name: &str| {
+        let path = dir.join(name);
+        std::fs::read(&path).map_err(|e| Error::io(path, e))
+    };
+    let manifest_path = dir.join("manifest.json");
+    let manifest =
+        std::fs::read_to_string(&manifest_path).map_err(|e| Error::io(&manifest_path, e))?;
+    let manifest = Manifest::parse(&manifest)?;
+    let wasm = read(&manifest.wasm)?;
+    let shaders = manifest
+        .pipelines
+        .iter()
+        .map(|p| {
+            let path = dir.join(&p.shader);
+            std::fs::read_to_string(&path).map_err(|e| Error::io(path, e))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok((manifest, wasm, shaders))
+}
+
 /// A loaded program, ready to run.
 pub struct Host {
     program: Program<Gpu>,
@@ -94,23 +118,7 @@ impl Host {
 
     pub fn load_with(dir: impl AsRef<Path>, options: &Options) -> Result<Host> {
         let dir = dir.as_ref();
-        let read = |name: &str| {
-            let path = dir.join(name);
-            std::fs::read(&path).map_err(|e| Error::io(path, e))
-        };
-        let manifest_path = dir.join("manifest.json");
-        let manifest =
-            std::fs::read_to_string(&manifest_path).map_err(|e| Error::io(&manifest_path, e))?;
-        let manifest = Manifest::parse(&manifest)?;
-        let wasm = read(&manifest.wasm)?;
-        let shaders = manifest
-            .pipelines
-            .iter()
-            .map(|p| {
-                let path = dir.join(&p.shader);
-                std::fs::read_to_string(&path).map_err(|e| Error::io(path, e))
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let (manifest, wasm, shaders) = read_build(dir)?;
         // Everything that can be checked without the GPU is, before taking it.
         let compiled = program::compile(&wasm)?;
         let lock = lock::GpuLock::acquire(&format!("wrela-host {}", dir.display()))?;
@@ -160,5 +168,61 @@ impl Host {
         let gpu = self.program.executor();
         gpu.flush()?;
         Ok(gpu.take_timings())
+    }
+}
+
+/// Executes nothing: for [`CpuHost`], whose commands are only checked.
+struct NoGpu;
+
+impl program::Executor for NoGpu {
+    fn execute(&mut self, _cmd: &wrela_abi::stream::Command<'_>) -> Result<()> {
+        Ok(())
+    }
+
+    fn end_frame(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// A program's WASM alone: exports run under wasmtime, and what they submit is decoded,
+/// sequenced and checked like a [`Host`]'s, then dropped. No GPU, no lock.
+pub struct CpuHost {
+    program: Program<NoGpu>,
+}
+
+impl CpuHost {
+    /// Loads the build in `dir`; its shaders must exist but aren't compiled.
+    pub fn load(dir: impl AsRef<Path>) -> Result<CpuHost> {
+        let (manifest, wasm, _) = read_build(dir.as_ref())?;
+        let compiled = program::compile(&wasm)?;
+        let checker = check::Checker::new(&manifest, check::Limits::webgpu_defaults());
+        let mut program = Program::instantiate(&compiled, checker, NoGpu)?;
+        program.record_batches();
+        Ok(CpuHost { program })
+    }
+
+    /// Calls an export with numeric arguments.
+    pub fn call_export(&mut self, name: &str, args: &[Value]) -> Result<Vec<Value>> {
+        self.program.call(name, args)
+    }
+
+    /// Calls `frame(time, width, height)` and ends the frame.
+    pub fn frame(&mut self, time: f32, width: u32, height: u32) -> Result<()> {
+        self.program.frame(time, width, height)
+    }
+
+    /// The batches submitted since the last call (or load).
+    pub fn take_batches(&mut self) -> Vec<Vec<u8>> {
+        self.program.take_batches()
+    }
+
+    /// FNV-1a 64 of every byte submitted since the program loaded.
+    pub fn hash(&self) -> u64 {
+        self.program.hash().value()
+    }
+
+    /// The names and WASM types of the module's exported functions: `(params, results)`.
+    pub fn exports(&mut self) -> Vec<(String, Vec<&'static str>, Vec<&'static str>)> {
+        self.program.exports()
     }
 }

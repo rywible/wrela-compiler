@@ -571,7 +571,7 @@ fn bind_uniform(
     }
     let mut fields = Vec::new();
     for (name, t) in params {
-        if !wrela_sema::traits::implements_builtin(&mut cx.checked.program, *t, Lang::GpuData) {
+        if !wrela_sema::traits::implements_builtin(&cx.checked.program, *t, Lang::GpuData) {
             let shown = cx.checked.program.display_ty(*t);
             let span = owners.first().map_or(Span::new(wrela_diag::FileId(0), 0, 0), |(f, _)| {
                 cx.checked.program.func(*f).sig_span
@@ -1175,7 +1175,7 @@ pub(crate) fn derived_signature(
 fn box_type(cx: &mut Cx, x: TyId) -> Option<TyId> {
     let domain = cx.checked.program.lang_trait(Lang::Domain)?;
     let r = wrela_sema::defs::TraitRef { trait_: domain, args: Vec::new() };
-    let (i, subst) = wrela_sema::traits::find_impl(&mut cx.checked.program, x, &r)?;
+    let (i, subst) = wrela_sema::traits::find_impl(&cx.checked.program, x, &r)?;
     let b = *cx.checked.program.impl_(i).assoc_types.get("Box")?;
     Some(cx.checked.program.types.subst(b, &subst))
 }

@@ -8,7 +8,7 @@ use crate::ty::{FnId, TyId, TyKind};
 use wrela_diag::{Diagnostic, codes};
 
 /// Every entry point's signature.
-pub fn check_entries(p: &mut Program) -> Vec<Diagnostic> {
+pub fn check_entries(p: &Program) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     for i in 0..p.fns.len() {
         let f = FnId(i as u32);
@@ -34,7 +34,7 @@ fn stage_name(e: Entry) -> &'static str {
     }
 }
 
-fn check_entry(p: &mut Program, f: FnId, entry: Entry, out: &mut Vec<Diagnostic>) {
+fn check_entry(p: &Program, f: FnId, entry: Entry, out: &mut Vec<Diagnostic>) {
     let def = p.func(f).clone();
     let stage = stage_name(entry);
     let unit = p.types.unit;

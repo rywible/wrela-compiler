@@ -67,7 +67,7 @@ pub fn could_unify_all(p: &Program, a: &[TyId], b: &[TyId]) -> bool {
 
 /// The traits a type is known to have from its declaration rather than an impl: a generic
 /// parameter's bounds, an opaque return type's traits, an associated type's bounds.
-fn declared_bounds(p: &mut Program, ty: TyId) -> Option<Vec<TraitRef>> {
+fn declared_bounds(p: &Program, ty: TyId) -> Option<Vec<TraitRef>> {
     match p.types.kind(ty).clone() {
         TyKind::Param(id) => Some(param_bounds_closure(p, id)),
         TyKind::Opaque(f, args) => {
@@ -99,7 +99,7 @@ fn declared_bounds(p: &mut Program, ty: TyId) -> Option<Vec<TraitRef>> {
 
 /// Finds the impl of `r` for `ty`, with the impl's parameters solved. `None` if there's none
 /// (or `ty` is generic: its bounds answer instead).
-pub fn find_impl(p: &mut Program, ty: TyId, r: &TraitRef) -> Option<(ImplId, Subst)> {
+pub fn find_impl(p: &Program, ty: TyId, r: &TraitRef) -> Option<(ImplId, Subst)> {
     let impls = p.impls_of_trait.get(&r.trait_).cloned().unwrap_or_default();
     for i in impls {
         let imp = p.impl_(i).clone();
@@ -148,7 +148,7 @@ pub fn find_impl(p: &mut Program, ty: TyId, r: &TraitRef) -> Option<(ImplId, Sub
 }
 
 /// Whether `ty` implements `r`.
-pub fn implements(p: &mut Program, ty: TyId, r: &TraitRef) -> bool {
+pub fn implements(p: &Program, ty: TyId, r: &TraitRef) -> bool {
     match p.types.kind(ty) {
         TyKind::Error | TyKind::Never => return true,
         TyKind::Var(_) => return false,
@@ -166,7 +166,7 @@ pub fn implements(p: &mut Program, ty: TyId, r: &TraitRef) -> bool {
 }
 
 /// `Copy`, `Clone` and `GpuData`, which are structural.
-pub fn implements_builtin(p: &mut Program, ty: TyId, lang: Lang) -> bool {
+pub fn implements_builtin(p: &Program, ty: TyId, lang: Lang) -> bool {
     let k = p.types.kind(ty).clone();
     match k {
         TyKind::Error | TyKind::Never => true,
@@ -207,7 +207,7 @@ pub fn implements_builtin(p: &mut Program, ty: TyId, lang: Lang) -> bool {
 
 /// Replaces projections on concrete types by the impl's associated type. `in_impl` resolves
 /// `Self::Name` inside that impl.
-pub fn normalize(p: &mut Program, ty: TyId, in_impl: Option<&ImplDef>) -> TyId {
+pub fn normalize(p: &Program, ty: TyId, in_impl: Option<&ImplDef>) -> TyId {
     if !p.types.any(ty, &mut |k| matches!(k, TyKind::Projection { .. })) {
         return ty;
     }
@@ -232,7 +232,7 @@ pub fn normalize(p: &mut Program, ty: TyId, in_impl: Option<&ImplDef>) -> TyId {
     resolve_projections(p, ty)
 }
 
-fn resolve_projections(p: &mut Program, ty: TyId) -> TyId {
+fn resolve_projections(p: &Program, ty: TyId) -> TyId {
     let k = p.types.kind(ty).clone();
     match k {
         TyKind::Projection { self_ty, trait_, trait_args, name } => {
@@ -277,7 +277,7 @@ pub fn trait_method(p: &Program, t: TraitId, name: &str) -> Option<FnId> {
 /// substitution for its generics (impl's, then the method's own `method_args`). Falls back to
 /// the trait's default body.
 pub fn resolve_trait_method(
-    p: &mut Program,
+    p: &Program,
     method: FnId,
     self_ty: TyId,
     trait_args: &[TyId],

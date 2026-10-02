@@ -39,9 +39,32 @@ impl Scope {
 pub enum TyPos<'a> {
     Normal,
     /// A parameter's type: `x: Surface` makes the function generic over it.
-    Param(&'a mut Vec<ParamId>),
+    Param(&'a mut ImplicitParams),
     /// A return type: `-> Surface` names the one concrete type the body returns.
     Return(&'a mut Option<Vec<TraitRef>>),
+}
+
+/// The generic parameters a signature's `x: Trait` parameters introduce, numbered after the
+/// program's existing ones; the collector adds them to the program in order.
+pub struct ImplicitParams {
+    first: u32,
+    pub defs: Vec<ParamDef>,
+}
+
+impl ImplicitParams {
+    pub fn new(p: &Program) -> ImplicitParams {
+        ImplicitParams { first: p.params.len() as u32, defs: Vec::new() }
+    }
+
+    fn add(&mut self, def: ParamDef) -> ParamId {
+        self.defs.push(def);
+        ParamId(self.first + self.defs.len() as u32 - 1)
+    }
+
+    /// The ids of the parameters added so far.
+    pub fn ids(&self) -> Vec<ParamId> {
+        (0..self.defs.len() as u32).map(|i| ParamId(self.first + i)).collect()
+    }
 }
 
 pub enum PathLookup {
@@ -274,7 +297,7 @@ pub fn resolve_module_path_in(
 
 /// Resolves a bound or supertrait: a path naming a trait, with its generic arguments.
 pub fn resolve_trait_ref(
-    p: &mut Program,
+    p: &Program,
     diags: &mut Vec<Diagnostic>,
     scope: &Scope,
     te: &ast::TypeExpr,
@@ -328,7 +351,7 @@ pub fn resolve_trait_ref(
 }
 
 /// Every trait a generic parameter is bounded by, including supertraits, with arguments.
-pub fn param_bounds_closure(p: &mut Program, param: ParamId) -> Vec<TraitRef> {
+pub fn param_bounds_closure(p: &Program, param: ParamId) -> Vec<TraitRef> {
     let bounds = p.param(param).bounds.clone();
     let mut out: Vec<TraitRef> = Vec::new();
     for b in bounds {
@@ -338,7 +361,7 @@ pub fn param_bounds_closure(p: &mut Program, param: ParamId) -> Vec<TraitRef> {
 }
 
 /// Adds `r` and, transitively, its supertraits (with `Self` and arguments substituted).
-pub fn add_with_supertraits(p: &mut Program, r: TraitRef, out: &mut Vec<TraitRef>) {
+pub fn add_with_supertraits(p: &Program, r: TraitRef, out: &mut Vec<TraitRef>) {
     if out.contains(&r) {
         return;
     }
@@ -353,7 +376,7 @@ pub fn add_with_supertraits(p: &mut Program, r: TraitRef, out: &mut Vec<TraitRef
 
 /// Resolves a type expression.
 pub fn resolve_type(
-    p: &mut Program,
+    p: &Program,
     diags: &mut Vec<Diagnostic>,
     scope: &Scope,
     te: &ast::TypeExpr,
@@ -370,7 +393,7 @@ pub fn resolve_type(
             let e = resolve_type(p, diags, scope, elem, TyPos::Normal);
             match len {
                 Some(len) => {
-                    match array_len(p, scope, len) {
+                    match const_u32(p, scope.module, len) {
                         Some(n) => p.types.array(e, n),
                         None => {
                             diags.push(
@@ -414,24 +437,53 @@ pub fn resolve_type(
     }
 }
 
-fn array_len(p: &Program, scope: &Scope, e: &ast::Expr) -> Option<u32> {
-    match &e.kind {
-        ast::ExprKind::Lit(ast::Lit { kind: ast::LitKind::Int, text, .. }) => {
-            wrela_syntax::lexer::int_value(text).and_then(|v| u32::try_from(v).ok())
-        }
-        ast::ExprKind::Path(path) if path.is_single() => {
-            match lookup_name(p, scope.module, &path.segments[0].ident.name)? {
-                Res::Const(c) => array_len(p, scope, &p.const_(c).value),
-                _ => None,
+/// The value of an array length: an integer literal, or a constant holding one, resolved in
+/// `module`; a constant's own value is resolved in the module that defines it. `None` for
+/// anything else, including a constant whose value refers back to itself.
+pub fn const_u32(p: &Program, module: ModuleId, e: &ast::Expr) -> Option<u32> {
+    fn go(
+        p: &Program,
+        module: ModuleId,
+        e: &ast::Expr,
+        visiting: &mut Vec<ConstId>,
+    ) -> Option<u32> {
+        match &e.kind {
+            ast::ExprKind::Lit(ast::Lit { kind: ast::LitKind::Int, text, .. }) => {
+                wrela_syntax::lexer::int_value(text).and_then(|v| u32::try_from(v).ok())
             }
+            ast::ExprKind::Paren(inner) => go(p, module, inner, visiting),
+            ast::ExprKind::Path(path) => {
+                let Res::Const(c) = resolve_value_item(p, module, path)? else { return None };
+                if visiting.contains(&c) {
+                    return None;
+                }
+                visiting.push(c);
+                let def = p.const_(c);
+                let v = go(p, def.module, &def.value, visiting);
+                visiting.pop();
+                v
+            }
+            _ => None,
         }
-        ast::ExprKind::Paren(inner) => array_len(p, scope, inner),
+    }
+    go(p, module, e, &mut Vec::new())
+}
+
+/// The item a value path names from `module` (`N`, `a::inner::N`), if it names one; generic
+/// arguments are ignored.
+pub fn resolve_value_item(p: &Program, module: ModuleId, path: &ast::Path) -> Option<Res> {
+    if path.is_single() {
+        return lookup_name(p, module, &path.segments[0].ident.name);
+    }
+    let idents: Vec<ast::Ident> = path.segments.iter().map(|s| s.ident.clone()).collect();
+    match resolve_module_path_in(p, module, &idents, true) {
+        PathLookup::Found(r) => Some(r),
         _ => None,
     }
 }
 
 fn resolve_type_path(
-    p: &mut Program,
+    p: &Program,
     diags: &mut Vec<Diagnostic>,
     scope: &Scope,
     te: &ast::TypeExpr,
@@ -540,7 +592,7 @@ fn resolve_type_path(
                     .with_help(format!("write `{}`", last.ident.name)),
                 );
             }
-            b.ty(&mut p.types)
+            b.ty(&p.types)
         }
         Res::Adt(a) => {
             let want = p.adt(a).generics.len();
@@ -576,13 +628,12 @@ fn resolve_type_path(
             let r = TraitRef { trait_: t, args };
             match pos {
                 TyPos::Param(implicit) => {
-                    let id = p.new_param(ParamDef {
+                    let id = implicit.add(ParamDef {
                         name: format!("impl {}", p.trait_(t).name),
                         bounds: vec![r],
                         span: te.span,
                         is_self: false,
                     });
-                    implicit.push(id);
                     p.types.param(id)
                 }
                 TyPos::Return(opaque) => {
@@ -612,7 +663,7 @@ fn resolve_type_path(
 
 /// `T::Name` or `Self::Name`: finds the trait among `base`'s bounds that declares `Name`.
 fn projection(
-    p: &mut Program,
+    p: &Program,
     diags: &mut Vec<Diagnostic>,
     _scope: &Scope,
     base: TyId,

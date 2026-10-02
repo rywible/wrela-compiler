@@ -34,9 +34,8 @@ impl Query for LowerPackage {
         let Some(checked) = check.checked.as_ref().filter(|_| !check.has_errors()) else {
             return Shared(Rc::new(LowerOutput { lowered: None, diagnostics: Vec::new() }));
         };
-        let mut checked = checked.clone();
-        let roots = Roots::of(&checked);
-        let (lowered, diagnostics) = wrela_lower::lower(&mut checked, &roots);
+        let roots = Roots::of(checked);
+        let (lowered, diagnostics) = wrela_lower::lower(checked, &roots);
         let ok = !diagnostics.iter().any(|d| d.is_error());
         Shared(Rc::new(LowerOutput { lowered: ok.then_some(lowered), diagnostics }))
     }

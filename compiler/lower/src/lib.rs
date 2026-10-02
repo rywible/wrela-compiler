@@ -75,7 +75,7 @@ impl Roots {
 
 /// Shared state while lowering every module of one program.
 pub(crate) struct Cx<'a> {
-    pub checked: &'a mut Checked,
+    pub checked: &'a Checked,
     pub diags: Vec<Diagnostic>,
     /// Pipelines discovered by CPU code, deduplicated, in discovery order.
     pub pipelines: Vec<gpu::PipelineKey>,
@@ -118,7 +118,7 @@ impl ModuleBuilder {
 }
 
 /// Lowers a checked program (with no errors) to IR.
-pub fn lower(checked: &mut Checked, roots: &Roots) -> (Lowered, Vec<Diagnostic>) {
+pub fn lower(checked: &Checked, roots: &Roots) -> (Lowered, Vec<Diagnostic>) {
     let mut cx = Cx { checked, diags: Vec::new(), pipelines: Vec::new() };
     let mut cpu = ModuleBuilder::new(ir::Target::Cpu);
     for &f in &roots.exports {

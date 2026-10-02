@@ -1,5 +1,7 @@
 //! Types, interned. A [`TyId`] is cheap to copy and compare; equal types have equal ids.
 
+use elsa::FrozenVec;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt::Write;
 
@@ -152,10 +154,13 @@ pub enum TyKind {
 }
 
 /// The type interner. Also caches the common types.
-#[derive(Clone, Debug)]
+///
+/// Interning takes `&self`: the table only grows, and a [`TyKind`] never moves once it's in
+/// (each is boxed), so the program's definitions can be shared read-only by everything after
+/// collection while types are still being made.
 pub struct Types {
-    kinds: Vec<TyKind>,
-    map: HashMap<TyKind, TyId>,
+    kinds: FrozenVec<Box<TyKind>>,
+    map: RefCell<HashMap<TyKind, TyId>>,
     pub bool: TyId,
     pub i32: TyId,
     pub u32: TyId,
@@ -178,8 +183,8 @@ impl Default for Types {
 impl Types {
     pub fn new() -> Types {
         let mut t = Types {
-            kinds: Vec::new(),
-            map: HashMap::new(),
+            kinds: FrozenVec::new(),
+            map: RefCell::new(HashMap::new()),
             bool: TyId(0),
             i32: TyId(0),
             u32: TyId(0),
@@ -206,13 +211,13 @@ impl Types {
         t
     }
 
-    pub fn intern(&mut self, kind: TyKind) -> TyId {
-        if let Some(&id) = self.map.get(&kind) {
+    pub fn intern(&self, kind: TyKind) -> TyId {
+        if let Some(&id) = self.map.borrow().get(&kind) {
             return id;
         }
         let id = TyId(self.kinds.len() as u32);
-        self.kinds.push(kind.clone());
-        self.map.insert(kind, id);
+        self.kinds.push(Box::new(kind.clone()));
+        self.map.borrow_mut().insert(kind, id);
         id
     }
 
@@ -220,31 +225,40 @@ impl Types {
         &self.kinds[t.index()]
     }
 
-    pub fn vec(&mut self, n: u8) -> TyId {
+    /// How many types there are.
+    pub fn len(&self) -> usize {
+        self.kinds.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.kinds.len() == 0
+    }
+
+    pub fn vec(&self, n: u8) -> TyId {
         self.intern(TyKind::Vec(n))
     }
 
-    pub fn int(&mut self, i: IntTy) -> TyId {
+    pub fn int(&self, i: IntTy) -> TyId {
         self.intern(TyKind::Int(i))
     }
 
-    pub fn tuple(&mut self, elems: Vec<TyId>) -> TyId {
+    pub fn tuple(&self, elems: Vec<TyId>) -> TyId {
         self.intern(TyKind::Tuple(elems))
     }
 
-    pub fn array(&mut self, elem: TyId, n: u32) -> TyId {
+    pub fn array(&self, elem: TyId, n: u32) -> TyId {
         self.intern(TyKind::Array(elem, n))
     }
 
-    pub fn adt(&mut self, adt: AdtId, args: Vec<TyId>) -> TyId {
+    pub fn adt(&self, adt: AdtId, args: Vec<TyId>) -> TyId {
         self.intern(TyKind::Adt(adt, args))
     }
 
-    pub fn param(&mut self, p: ParamId) -> TyId {
+    pub fn param(&self, p: ParamId) -> TyId {
         self.intern(TyKind::Param(p))
     }
 
-    pub fn var(&mut self, v: VarId) -> TyId {
+    pub fn var(&self, v: VarId) -> TyId {
         self.intern(TyKind::Var(v))
     }
 
@@ -300,7 +314,7 @@ impl Types {
     }
 
     /// Rebuilds `t`, replacing each part for which `f` returns `Some`.
-    pub fn map(&mut self, t: TyId, f: &mut impl FnMut(&mut Types, TyId) -> Option<TyId>) -> TyId {
+    pub fn map(&self, t: TyId, f: &mut impl FnMut(&Types, TyId) -> Option<TyId>) -> TyId {
         if let Some(r) = f(self, t) {
             return r;
         }
@@ -332,7 +346,7 @@ impl Types {
     }
 
     /// Replaces generic parameters by `subst`.
-    pub fn subst(&mut self, t: TyId, subst: &Subst) -> TyId {
+    pub fn subst(&self, t: TyId, subst: &Subst) -> TyId {
         if subst.is_empty() {
             return t;
         }
@@ -340,6 +354,12 @@ impl Types {
             TyKind::Param(p) => subst.get(*p),
             _ => None,
         })
+    }
+}
+
+impl std::fmt::Debug for Types {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Types({} interned)", self.len())
     }
 }
 

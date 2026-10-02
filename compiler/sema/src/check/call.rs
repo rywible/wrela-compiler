@@ -645,7 +645,7 @@ impl<'p> Checker<'p> {
                 } else {
                     target
                 };
-                let _ = self.infer.unify(&mut self.p.types, x.ty, t);
+                let _ = self.infer.unify(&self.p.types, x.ty, t);
             }
         }
         // Remaining literals default: float builtins want f32.
@@ -656,12 +656,12 @@ impl<'p> Checker<'p> {
                 } else {
                     self.p.types.i32
                 };
-                let _ = self.infer.unify(&mut self.p.types, x.ty, t);
+                let _ = self.infer.unify(&self.p.types, x.ty, t);
             }
         }
         // A scalar literal next to a vector broadcasts for min/max/clamp/step/smoothstep.
         let mut tys: Vec<TyId> =
-            xs.iter().map(|x| self.infer.resolve(&mut self.p.types, x.ty)).collect();
+            xs.iter().map(|x| self.infer.resolve(&self.p.types, x.ty)).collect();
         if matches!(
             b,
             BuiltinFn::Min
@@ -688,7 +688,7 @@ impl<'p> Checker<'p> {
         if tys.iter().any(|&t| matches!(self.p.types.kind(t), TyKind::Error)) {
             return self.error_expr(span);
         }
-        match b.result(&mut self.p.types, &tys) {
+        match b.result(&self.p.types, &tys) {
             Ok(ty) => {
                 let modes = vec![Mode::Borrow; xs.len()];
                 Expr {
@@ -712,7 +712,7 @@ impl<'p> Checker<'p> {
 
     /// `f32(x)` and friends convert; `vec3(...)` and `mat3(...)` construct.
     fn call_type(&mut self, t: BuiltinTy, args: &[ast::Arg], span: Span) -> Expr {
-        let ty = t.ty(&mut self.p.types);
+        let ty = t.ty(&self.p.types);
         match t {
             BuiltinTy::Vec(n) => self.vec_ctor(n, ty, args, span),
             BuiltinTy::Mat(n) => {
@@ -746,7 +746,7 @@ impl<'p> Checker<'p> {
                     } else {
                         ty
                     };
-                    let _ = self.infer.unify(&mut self.p.types, x.ty, target);
+                    let _ = self.infer.unify(&self.p.types, x.ty, target);
                 }
                 let ok = matches!(
                     self.kind(x.ty),
@@ -817,7 +817,7 @@ impl<'p> Checker<'p> {
                 TyKind::Vec(m) => count += m as u32,
                 TyKind::Float(FloatTy::F32) => count += 1,
                 TyKind::Var(_) => {
-                    let _ = self.infer.unify(&mut self.p.types, e.ty, f32);
+                    let _ = self.infer.unify(&self.p.types, e.ty, f32);
                     count += 1;
                 }
                 TyKind::Error => count += 1,
@@ -949,7 +949,7 @@ impl<'p> Checker<'p> {
 
     /// The traits (with arguments) through which `ty` has a method `name`.
     fn traits_with_method(&mut self, ty: TyId, name: &str) -> Vec<(TraitId, Vec<TyId>)> {
-        let ty = self.infer.resolve(&mut self.p.types, ty);
+        let ty = self.infer.resolve(&self.p.types, ty);
         let mut out = Vec::new();
         let declared = match self.p.types.kind(ty).clone() {
             TyKind::Param(id) => Some(resolve::param_bounds_closure(self.p, id)),
@@ -1073,11 +1073,11 @@ impl<'p> Checker<'p> {
             match self.infer.var_kind(&self.p.types, rt) {
                 Some(VarKind::Float) => {
                     let f = self.p.types.f32;
-                    let _ = self.infer.unify(&mut self.p.types, rt, f);
+                    let _ = self.infer.unify(&self.p.types, rt, f);
                 }
                 Some(VarKind::Int) => {
                     let i = self.p.types.i32;
-                    let _ = self.infer.unify(&mut self.p.types, rt, i);
+                    let _ = self.infer.unify(&self.p.types, rt, i);
                 }
                 _ => {
                     self.err(
@@ -1564,7 +1564,7 @@ impl<'p> Checker<'p> {
             match wanted.iter().find(|(n, _)| *n == p.name) {
                 Some((_, t)) => {
                     let t = *t;
-                    if self.infer.unify(&mut self.p.types, t, p.ty).is_err() {
+                    if self.infer.unify(&self.p.types, t, p.ty).is_err() {
                         self.err(Diagnostic::new(
                             codes::E0603,
                             span,

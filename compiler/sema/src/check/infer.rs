@@ -20,7 +20,7 @@ pub struct Infer {
 }
 
 impl Infer {
-    pub fn new_var(&mut self, types: &mut Types, kind: VarKind, origin: Span) -> TyId {
+    pub fn new_var(&mut self, types: &Types, kind: VarKind, origin: Span) -> TyId {
         self.vars.push(VarInfo { kind, bound: None, origin });
         types.var(VarId(self.vars.len() as u32 - 1))
     }
@@ -44,7 +44,7 @@ impl Infer {
     }
 
     /// Substitutes every bound variable, deeply. Unbound ones stay.
-    pub fn resolve(&self, types: &mut Types, t: TyId) -> TyId {
+    pub fn resolve(&self, types: &Types, t: TyId) -> TyId {
         types.map(t, &mut |types, x| match types.kind(x) {
             TyKind::Var(v) => {
                 let b = self.vars[v.index()].bound?;
@@ -56,7 +56,7 @@ impl Infer {
 
     /// Gives literal variables their default types: `i32` for integers, `f32` for floats.
     /// Returns the origins of general variables nothing determined.
-    pub fn apply_defaults(&mut self, types: &mut Types) -> Vec<Span> {
+    pub fn apply_defaults(&mut self, types: &Types) -> Vec<Span> {
         let mut unknown = Vec::new();
         for i in 0..self.vars.len() {
             if self.vars[i].bound.is_some() {
@@ -75,7 +75,7 @@ impl Infer {
     }
 
     /// Makes `a` and `b` the same type, or reports that they can't be.
-    pub fn unify(&mut self, types: &mut Types, a: TyId, b: TyId) -> Result<(), Mismatch> {
+    pub fn unify(&mut self, types: &Types, a: TyId, b: TyId) -> Result<(), Mismatch> {
         let a = self.shallow(types, a);
         let b = self.shallow(types, b);
         if a == b {
@@ -150,7 +150,7 @@ impl Infer {
         }
     }
 
-    fn bind(&mut self, types: &mut Types, v: VarId, t: TyId) -> Result<(), Mismatch> {
+    fn bind(&mut self, types: &Types, v: VarId, t: TyId) -> Result<(), Mismatch> {
         let ok = match self.vars[v.index()].kind {
             VarKind::General => true,
             VarKind::Int => matches!(types.kind(t), TyKind::Int(_) | TyKind::Float(_)),

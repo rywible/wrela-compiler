@@ -638,3 +638,98 @@ pub enum PatKind {
     },
     Tuple(Vec<Pat>),
 }
+
+impl Expr {
+    /// Calls `f` on this expression and every expression inside it, outermost first: operands,
+    /// arguments, fields, blocks' statements, arms and closure bodies.
+    pub fn walk(&self, f: &mut impl FnMut(&Expr)) {
+        f(self);
+        match &self.kind {
+            ExprKind::Lit(_)
+            | ExprKind::Path(_)
+            | ExprKind::Break
+            | ExprKind::Continue
+            | ExprKind::Error => {}
+            ExprKind::Unary(_, x)
+            | ExprKind::Take(x)
+            | ExprKind::MutArg(x)
+            | ExprKind::Paren(x)
+            | ExprKind::Field { base: x, .. } => x.walk(f),
+            ExprKind::Binary(_, a, b)
+            | ExprKind::Index { base: a, index: b }
+            | ExprKind::ArrayRepeat { value: a, count: b } => {
+                a.walk(f);
+                b.walk(f);
+            }
+            ExprKind::Call { callee, args, .. } => {
+                callee.walk(f);
+                args.iter().for_each(|a| a.value.walk(f));
+            }
+            ExprKind::MethodCall { receiver, args, .. } => {
+                receiver.walk(f);
+                args.iter().for_each(|a| a.value.walk(f));
+            }
+            ExprKind::StructLit { fields, base, .. } => {
+                fields.iter().filter_map(|x| x.value.as_ref()).for_each(|v| v.walk(f));
+                if let Some(b) = base {
+                    b.walk(f);
+                }
+            }
+            ExprKind::Tuple(xs) | ExprKind::Array(xs) => xs.iter().for_each(|x| x.walk(f)),
+            ExprKind::Block(b) => b.walk(f),
+            ExprKind::If { cond, then, else_ } => {
+                cond.walk(f);
+                then.walk(f);
+                if let Some(e) = else_ {
+                    e.walk(f);
+                }
+            }
+            ExprKind::Match { scrutinee, arms } => {
+                scrutinee.walk(f);
+                for a in arms {
+                    if let Some(g) = &a.guard {
+                        g.walk(f);
+                    }
+                    a.body.walk(f);
+                }
+            }
+            ExprKind::Closure { body, .. } => body.walk(f),
+            ExprKind::Return(v) => {
+                if let Some(v) = v {
+                    v.walk(f);
+                }
+            }
+        }
+    }
+}
+
+impl Block {
+    /// [`Expr::walk`] over every statement's expressions.
+    pub fn walk(&self, f: &mut impl FnMut(&Expr)) {
+        for s in &self.stmts {
+            match &s.kind {
+                StmtKind::Bind { init, .. } => init.walk(f),
+                StmtKind::Assign { target, value, .. } => {
+                    target.walk(f);
+                    value.walk(f);
+                }
+                StmtKind::Expr(e) => e.walk(f),
+                StmtKind::While { cond, body } => {
+                    cond.walk(f);
+                    body.walk(f);
+                }
+                StmtKind::Loop { body } => body.walk(f),
+                StmtKind::For { iter, body, .. } => {
+                    match iter {
+                        ForIter::Range { start, end, .. } => {
+                            start.walk(f);
+                            end.walk(f);
+                        }
+                        ForIter::Expr(e) => e.walk(f),
+                    }
+                    body.walk(f);
+                }
+            }
+        }
+    }
+}

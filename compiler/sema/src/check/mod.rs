@@ -13,6 +13,7 @@ use crate::resolve::Scope;
 use crate::thir::*;
 use crate::ty::*;
 use infer::Infer;
+use std::collections::{BTreeMap, HashMap};
 use wrela_diag::{Diagnostic, Span, codes};
 use wrela_syntax::ast;
 
@@ -36,7 +37,9 @@ struct ClosureFrame {
 }
 
 pub(crate) struct Checker<'p> {
-    pub(crate) p: &'p mut Program,
+    pub(crate) p: &'p Program,
+    /// The types of the constants checked so far (all of them, once bodies are checked).
+    pub(crate) const_tys: &'p ConstTypes,
     pub(crate) diags: Vec<Diagnostic>,
     pub(crate) infer: Infer,
     pub(crate) fn_id: Option<FnId>,
@@ -57,10 +60,16 @@ pub(crate) struct Checker<'p> {
 }
 
 impl<'p> Checker<'p> {
-    fn new(p: &'p mut Program, scope: Scope, fn_id: Option<FnId>) -> Checker<'p> {
+    fn new(
+        p: &'p Program,
+        const_tys: &'p ConstTypes,
+        scope: Scope,
+        fn_id: Option<FnId>,
+    ) -> Checker<'p> {
         let unit = p.types.unit;
         Checker {
             p,
+            const_tys,
             diags: Vec::new(),
             infer: Infer::default(),
             fn_id,
@@ -83,7 +92,7 @@ impl<'p> Checker<'p> {
     }
 
     pub(crate) fn display(&mut self, t: TyId) -> String {
-        let t = self.infer.resolve(&mut self.p.types, t);
+        let t = self.infer.resolve(&self.p.types, t);
         self.p.display_ty(t)
     }
 
@@ -93,14 +102,14 @@ impl<'p> Checker<'p> {
 
     /// `t` with its variables resolved and its projections on concrete types replaced.
     pub(crate) fn normalized(&mut self, t: TyId) -> TyId {
-        let r = self.infer.resolve(&mut self.p.types, t);
+        let r = self.infer.resolve(&self.p.types, t);
         crate::traits::normalize(self.p, r, None)
     }
 
     /// Unifies `a` and `b` if they fit, leaving no trace if they don't.
     pub(crate) fn try_unify(&mut self, a: TyId, b: TyId) -> bool {
         let saved = self.infer.clone();
-        if self.infer.unify(&mut self.p.types, a, b).is_ok() {
+        if self.infer.unify(&self.p.types, a, b).is_ok() {
             true
         } else {
             self.infer = saved;
@@ -109,7 +118,7 @@ impl<'p> Checker<'p> {
     }
 
     pub(crate) fn new_var(&mut self, kind: VarKind, span: Span) -> TyId {
-        self.infer.new_var(&mut self.p.types, kind, span)
+        self.infer.new_var(&self.p.types, kind, span)
     }
 
     pub(crate) fn kind(&self, t: TyId) -> TyKind {
@@ -343,7 +352,7 @@ impl<'p> Checker<'p> {
         }
         if let TyKind::Var(_) = self.kind(c.ty) {
             let b = self.p.types.bool;
-            if self.infer.unify(&mut self.p.types, c.ty, b).is_ok() {
+            if self.infer.unify(&self.p.types, c.ty, b).is_ok() {
                 return;
             }
         }
@@ -601,7 +610,7 @@ fn fn_scope(p: &Program, f: FnId) -> Scope {
 
 /// Checks one function's body. `None` when it has no body to check (a required trait method,
 /// or a std intrinsic).
-pub fn check_fn(p: &mut Program, f: FnId) -> (Option<Body>, Vec<Diagnostic>) {
+pub fn check_fn(p: &Program, consts: &ConstTypes, f: FnId) -> (Option<Body>, Vec<Diagnostic>) {
     let def = p.func(f).clone();
     let Some(body) = def.body.clone() else { return (None, Vec::new()) };
     if def.attrs.intrinsic {
@@ -611,7 +620,7 @@ pub fn check_fn(p: &mut Program, f: FnId) -> (Option<Body>, Vec<Diagnostic>) {
     if let FnOwner::Trait(t) = def.owner {
         scope.self_ty = Some(p.types.param(p.trait_(t).self_param));
     }
-    let mut c = Checker::new(p, scope, Some(f));
+    let mut c = Checker::new(p, consts, scope, Some(f));
     let mut params = Vec::new();
     for ps in &def.params {
         let id = c.declare_local(&ps.name, ps.ty, LocalKind::Param(ps.mode), ps.span);
@@ -670,12 +679,12 @@ pub fn check_fn(p: &mut Program, f: FnId) -> (Option<Body>, Vec<Diagnostic>) {
 }
 
 /// Checks a struct's field defaults where they're declared: literal values of the field's type.
-pub fn check_field_defaults(p: &mut Program, a: AdtId) -> Vec<Diagnostic> {
+pub fn check_field_defaults(p: &Program, consts: &ConstTypes, a: AdtId) -> Vec<Diagnostic> {
     let def = p.adt(a).clone();
     let mut out = Vec::new();
     for f in def.fields() {
         let Some(d) = &f.default else { continue };
-        let mut c = Checker::new(p, Scope::new(def.module), None);
+        let mut c = Checker::new(p, consts, Scope::new(def.module), None);
         let e = c.check_default(d, f.ty);
         if let Some(bad) = zonk::non_literal(&e) {
             c.err(
@@ -693,11 +702,127 @@ pub fn check_field_defaults(p: &mut Program, a: AdtId) -> Vec<Diagnostic> {
     out
 }
 
+/// The types of the program's constants, by id.
+pub type ConstTypes = HashMap<ConstId, TyId>;
+
+/// Checks every `const` item, each after the constants its value names, so an unannotated
+/// constant's type is known wherever it's used. A constant whose value refers back to itself,
+/// directly or through others, is an error (E0328), and so is a constant naming one.
+pub fn check_consts(
+    p: &Program,
+    diags: &mut Vec<Diagnostic>,
+) -> (ConstTypes, BTreeMap<ConstId, (TyId, Expr)>) {
+    let n = p.consts.len();
+    let deps: Vec<Vec<ConstId>> = (0..n).map(|i| const_deps(p, ConstId(i as u32))).collect();
+    // Depth-first, so each constant comes after its dependencies; a back edge is a cycle.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Mark {
+        New,
+        Active,
+        Done,
+    }
+    let mut mark = vec![Mark::New; n];
+    let mut bad = vec![false; n];
+    let mut order = Vec::new();
+    for root in 0..n {
+        if mark[root] != Mark::New {
+            continue;
+        }
+        // (constant, next dependency to visit)
+        let mut stack: Vec<(usize, usize)> = vec![(root, 0)];
+        mark[root] = Mark::Active;
+        while let Some(&mut (c, ref mut next)) = stack.last_mut() {
+            if let Some(&d) = deps[c].get(*next) {
+                *next += 1;
+                let d = d.index();
+                match mark[d] {
+                    Mark::New => {
+                        mark[d] = Mark::Active;
+                        stack.push((d, 0));
+                    }
+                    Mark::Active => {
+                        // A cycle: `d` and everything above it on the stack.
+                        let at = stack.iter().position(|&(x, _)| x == d).unwrap_or(0);
+                        let cycle: Vec<usize> = stack[at..].iter().map(|&(x, _)| x).collect();
+                        report_const_cycle(p, &cycle, diags);
+                        for x in cycle {
+                            bad[x] = true;
+                        }
+                    }
+                    Mark::Done => {}
+                }
+                continue;
+            }
+            mark[c] = Mark::Done;
+            if deps[c].iter().any(|d| bad[d.index()]) {
+                bad[c] = true;
+            }
+            order.push(c);
+            stack.pop();
+        }
+    }
+    let mut tys = ConstTypes::new();
+    let mut out = BTreeMap::new();
+    for c in order {
+        let id = ConstId(c as u32);
+        if bad[c] {
+            tys.insert(id, p.types.error);
+            continue;
+        }
+        let (r, d) = check_const(p, &tys, id);
+        diags.extend(d);
+        let ty = r.as_ref().map_or(p.types.error, |(t, _)| *t);
+        tys.insert(id, ty);
+        if let Some(r) = r {
+            out.insert(id, r);
+        }
+    }
+    (tys, out)
+}
+
+/// The constants a constant's value names, resolved where it's defined.
+fn const_deps(p: &Program, c: ConstId) -> Vec<ConstId> {
+    let def = p.const_(c);
+    let mut out = Vec::new();
+    def.value.walk(&mut |e| {
+        if let ast::ExprKind::Path(path) = &e.kind
+            && let Some(crate::defs::Res::Const(d)) =
+                crate::resolve::resolve_value_item(p, def.module, path)
+            && !out.contains(&d)
+        {
+            out.push(d);
+        }
+    });
+    out
+}
+
+fn report_const_cycle(p: &Program, cycle: &[usize], diags: &mut Vec<Diagnostic>) {
+    let first = p.const_(ConstId(cycle[0] as u32));
+    let msg = if cycle.len() == 1 {
+        format!("the constant `{}`'s value refers to itself", first.name)
+    } else {
+        format!(
+            "the constant `{}`'s value refers back to itself through other constants",
+            first.name
+        )
+    };
+    let mut d = Diagnostic::new(codes::E0328, first.span, msg);
+    for &c in &cycle[1..] {
+        let def = p.const_(ConstId(c as u32));
+        d = d.with_secondary(def.span, format!("`{}` is part of the cycle", def.name));
+    }
+    diags.push(d.with_help("give one of them a literal value"));
+}
+
 /// Checks a `const` item's value: tier 0 allows literal values only (D-073).
-pub fn check_const(p: &mut Program, id: ConstId) -> (Option<(TyId, Expr)>, Vec<Diagnostic>) {
+fn check_const(
+    p: &Program,
+    consts: &ConstTypes,
+    id: ConstId,
+) -> (Option<(TyId, Expr)>, Vec<Diagnostic>) {
     let def = p.const_(id).clone();
     let scope = Scope::new(def.module);
-    let mut c = Checker::new(p, scope, None);
+    let mut c = Checker::new(p, consts, scope, None);
     if let Some(bad) = non_constant(&def.value) {
         c.err(
             Diagnostic::new(codes::E0906, bad.span, "a constant's value must be a literal value in tier 0")
@@ -738,19 +863,4 @@ pub fn non_constant(e: &ast::Expr) -> Option<&ast::Expr> {
         }
         _ => Some(e),
     }
-}
-
-/// The type of a `const` without an annotation, from its value (cached; a cycle is an error).
-pub fn const_type(p: &mut Program, c: ConstId) -> TyId {
-    if let Some(t) = p.const_tys.get(&c) {
-        return *t;
-    }
-    if !p.consts_in_progress.insert(c) {
-        return p.types.error;
-    }
-    let (r, _) = check_const(p, c);
-    p.consts_in_progress.remove(&c);
-    let t = r.map_or(p.types.error, |(t, _)| t);
-    p.const_tys.insert(c, t);
-    t
 }

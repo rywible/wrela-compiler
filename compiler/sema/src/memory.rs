@@ -105,7 +105,7 @@ fn merge(a: MoveState, b: MoveState) -> MoveState {
     }
 }
 
-pub fn check_fn(p: &mut Program, f: FnId, body: &Body) -> Vec<Diagnostic> {
+pub fn check_fn(p: &Program, f: FnId, body: &Body) -> Vec<Diagnostic> {
     let def = p.func(f).clone();
     let mut diags = Vec::new();
     let mut w = Walker::new(p, body, Some(def.ret_mode), None);
@@ -120,7 +120,7 @@ pub fn check_fn(p: &mut Program, f: FnId, body: &Body) -> Vec<Diagnostic> {
 }
 
 struct Walker<'a> {
-    p: &'a mut Program,
+    p: &'a Program,
     body: &'a Body,
     diags: Vec<Diagnostic>,
     /// The function's return mode (`None` inside a closure, whose returns are values).
@@ -150,7 +150,7 @@ struct LoopFrame {
 
 impl<'a> Walker<'a> {
     fn new(
-        p: &'a mut Program,
+        p: &'a Program,
         body: &'a Body,
         ret_mode: Option<RetMode>,
         closure: Option<ClosureId>,

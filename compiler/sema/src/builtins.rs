@@ -37,7 +37,7 @@ impl BuiltinTy {
         })
     }
 
-    pub fn ty(self, types: &mut Types) -> TyId {
+    pub fn ty(self, types: &Types) -> TyId {
         types.intern(match self {
             BuiltinTy::Bool => TyKind::Bool,
             BuiltinTy::Int(i) => TyKind::Int(i),
@@ -244,7 +244,7 @@ impl BuiltinFn {
 
     /// Works out the result type from the argument types (all resolved, defaults applied), or
     /// says what's wrong.
-    pub fn result(self, types: &mut Types, args: &[TyId]) -> Result<TyId, String> {
+    pub fn result(self, types: &Types, args: &[TyId]) -> Result<TyId, String> {
         use BuiltinFn::*;
         let float_like =
             |types: &Types, t: TyId| matches!(types.kind(t), TyKind::Float(_) | TyKind::Vec(_));

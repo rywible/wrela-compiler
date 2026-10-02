@@ -29,7 +29,7 @@ pub const STD_SOURCES: &[(&str, &str)] = &[
 ];
 
 /// A checked program: its definitions, every function body's typed tree, and every constant.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Checked {
     pub program: Program,
     pub bodies: BTreeMap<ty::FnId, thir::Body>,
@@ -38,33 +38,27 @@ pub struct Checked {
 
 /// Collects and type-checks a whole program.
 pub fn check_program(units: Vec<SourceUnit>, diags: &mut Vec<Diagnostic>) -> Checked {
-    let mut program = collect::collect(units, diags);
-    diags.extend(gpu::check_entries(&mut program));
+    let program = collect::collect(units, diags);
+    // From here on the definitions are read-only.
+    let p = &program;
+    diags.extend(gpu::check_entries(p));
+    let (const_tys, consts) = check::check_consts(p, diags);
     let mut bodies = BTreeMap::new();
-    for i in 0..program.fns.len() {
+    for i in 0..p.fns.len() {
         let f = ty::FnId(i as u32);
-        let (body, d) = check::check_fn(&mut program, f);
+        let (body, d) = check::check_fn(p, &const_tys, f);
         let typed = !d.iter().any(|x| x.is_error());
         diags.extend(d);
         if let Some(b) = body {
             // The memory checker needs a well-typed body; it would only add noise otherwise.
             if typed {
-                diags.extend(memory::check_fn(&mut program, f, &b));
+                diags.extend(memory::check_fn(p, f, &b));
             }
             bodies.insert(f, b);
         }
     }
-    for i in 0..program.adts.len() {
-        diags.extend(check::check_field_defaults(&mut program, ty::AdtId(i as u32)));
-    }
-    let mut consts = BTreeMap::new();
-    for i in 0..program.consts.len() {
-        let c = ty::ConstId(i as u32);
-        let (r, d) = check::check_const(&mut program, c);
-        diags.extend(d);
-        if let Some(r) = r {
-            consts.insert(c, r);
-        }
+    for i in 0..p.adts.len() {
+        diags.extend(check::check_field_defaults(p, &const_tys, ty::AdtId(i as u32)));
     }
     Checked { program, bodies, consts }
 }

@@ -617,7 +617,7 @@ impl<'d> Collector<'d> {
                     if let Some(t) = &c.ty {
                         let scope = Scope::new(*m);
                         let ty = resolve::resolve_type(
-                            &mut self.p,
+                            &self.p,
                             self.diags,
                             &scope,
                             t,
@@ -633,7 +633,7 @@ impl<'d> Collector<'d> {
     fn bounds_of(&mut self, scope: &Scope, bounds: &[ast::TypeExpr]) -> Vec<TraitRef> {
         bounds
             .iter()
-            .filter_map(|b| resolve::resolve_trait_ref(&mut self.p, self.diags, scope, b))
+            .filter_map(|b| resolve::resolve_trait_ref(&self.p, self.diags, scope, b))
             .collect()
     }
 
@@ -739,7 +739,7 @@ impl<'d> Collector<'d> {
                                 .map(|(i, t)| FieldDef {
                                     name: i.to_string(),
                                     ty: resolve::resolve_type(
-                                        &mut self.p,
+                                        &self.p,
                                         self.diags,
                                         &scope,
                                         t,
@@ -769,7 +769,7 @@ impl<'d> Collector<'d> {
         self.p.adts[id.index()].kind = kind;
         let mut opt_in = Vec::new();
         for t in traits {
-            if let Some(r) = resolve::resolve_trait_ref(&mut self.p, self.diags, &scope, t) {
+            if let Some(r) = resolve::resolve_trait_ref(&self.p, self.diags, &scope, t) {
                 opt_in.push((r, t.span));
             }
         }
@@ -796,7 +796,7 @@ impl<'d> Collector<'d> {
                 );
                 continue;
             }
-            let ty = resolve::resolve_type(&mut self.p, self.diags, scope, &f.ty, TyPos::Normal);
+            let ty = resolve::resolve_type(&self.p, self.diags, scope, &f.ty, TyPos::Normal);
             let default = if allow_default { f.default.clone() } else { None };
             if !allow_default && let Some(d) = &f.default {
                 self.err(Diagnostic::new(
@@ -822,17 +822,17 @@ impl<'d> Collector<'d> {
         scope.push_params(&self.p, &gens);
         self.set_param_bounds(&scope, &gens, &i.generics);
         let self_ty =
-            resolve::resolve_type(&mut self.p, self.diags, &scope, &i.self_ty, TyPos::Normal);
+            resolve::resolve_type(&self.p, self.diags, &scope, &i.self_ty, TyPos::Normal);
         self.p.impls[id.index()].self_ty = self_ty;
         scope.self_ty = Some(self_ty);
         if let Some(t) = &i.trait_ {
-            let r = resolve::resolve_trait_ref(&mut self.p, self.diags, &scope, t);
+            let r = resolve::resolve_trait_ref(&self.p, self.diags, &scope, t);
             self.p.impls[id.index()].trait_ref = r;
         }
         let mut assoc = BTreeMap::new();
         for member in &i.members {
             if let ast::ImplMemberKind::Type { name, ty } = &member.kind {
-                let t = resolve::resolve_type(&mut self.p, self.diags, &scope, ty, TyPos::Normal);
+                let t = resolve::resolve_type(&self.p, self.diags, &scope, ty, TyPos::Normal);
                 if assoc.insert(name.name.clone(), t).is_some() {
                     self.err(Diagnostic::new(
                         codes::E0201,
@@ -862,7 +862,7 @@ impl<'d> Collector<'d> {
         let mut scope = outer.clone();
         let gens = self.p.func(id).generics.clone();
         scope.push_params(&self.p, &gens);
-        let mut implicit = Vec::new();
+        let mut implicit = resolve::ImplicitParams::new(&self.p);
         let mut params: Vec<ParamSig> = Vec::new();
         let owner = self.p.func(id).owner;
         for (i, p) in f.params.iter().enumerate() {
@@ -904,7 +904,7 @@ impl<'d> Collector<'d> {
                         continue;
                     }
                     let t = resolve::resolve_type(
-                        &mut self.p,
+                        &self.p,
                         self.diags,
                         &scope,
                         ty,
@@ -921,11 +921,17 @@ impl<'d> Collector<'d> {
                 }
             }
         }
+        // The parameters `x: Trait` introduced, numbered as `ImplicitParams` promised.
+        let implicit_ids = implicit.ids();
+        for def in implicit.defs {
+            self.p.new_param(def);
+        }
+        let implicit = implicit_ids;
         let mut opaque = None;
         let (ret, ret_mode) = match &f.ret {
             Some(r) => {
                 let t = resolve::resolve_type(
-                    &mut self.p,
+                    &self.p,
                     self.diags,
                     &scope,
                     &r.ty,
@@ -1233,7 +1239,7 @@ impl<'d> Collector<'d> {
                 );
             }
             let expected = self.p.types.subst(pb.ty, &subst);
-            let expected = crate::traits::normalize(&mut self.p, expected, Some(imp));
+            let expected = crate::traits::normalize(&self.p, expected, Some(imp));
             if pa.ty != expected && !pa.is_self {
                 let (x, y) = (self.p.display_ty(pa.ty), self.p.display_ty(expected));
                 return mismatch(
@@ -1247,7 +1253,7 @@ impl<'d> Collector<'d> {
         }
         if b.opaque.is_none() && a.opaque.is_none() {
             let expected = self.p.types.subst(b.ret, &subst);
-            let expected = crate::traits::normalize(&mut self.p, expected, Some(imp));
+            let expected = crate::traits::normalize(&self.p, expected, Some(imp));
             if a.ret != expected {
                 let (x, y) = (self.p.display_ty(a.ret), self.p.display_ty(expected));
                 mismatch(self, format!("it returns `{x}`, but the trait says `{y}`"));
@@ -1299,7 +1305,7 @@ impl<'d> Collector<'d> {
                 continue; // conditional on the arguments; checked where it's used
             }
             let ok =
-                crate::traits::implements_builtin(&mut self.p, f.ty, lang.unwrap_or(Lang::Clone));
+                crate::traits::implements_builtin(&self.p, f.ty, lang.unwrap_or(Lang::Clone));
             if !ok {
                 let why = match lang {
                     Some(Lang::GpuData) => {

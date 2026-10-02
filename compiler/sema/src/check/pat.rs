@@ -208,7 +208,7 @@ impl<'p> Checker<'p> {
         let n = self.p.adt(a).generics.len();
         let args: Vec<TyId> = (0..n).map(|_| self.new_var(VarKind::General, span)).collect();
         let at = self.p.types.adt(a, args.clone());
-        if self.infer.unify(&mut self.p.types, at, ty).is_err() {
+        if self.infer.unify(&self.p.types, at, ty).is_err() {
             let (x, y) = (self.display(at), self.display(ty));
             self.err(Diagnostic::new(
                 codes::E0320,
@@ -387,7 +387,7 @@ impl<'p> Checker<'p> {
             match result {
                 Some(r) => {
                     if !matches!(self.kind(body.ty), TyKind::Never)
-                        && self.infer.unify(&mut self.p.types, body.ty, r).is_err()
+                        && self.infer.unify(&self.p.types, body.ty, r).is_err()
                     {
                         let (a, b) = (self.display(r), self.display(body.ty));
                         self.err(Diagnostic::new(
@@ -412,7 +412,7 @@ impl<'p> Checker<'p> {
     }
 
     fn check_exhaustive(&mut self, s: &Expr, arms: &[Arm], span: Span) {
-        let ty = self.infer.resolve(&mut self.p.types, s.ty);
+        let ty = self.infer.resolve(&self.p.types, s.ty);
         let mut rows: Vec<Vec<DPat>> = Vec::new();
         for arm in arms {
             let d = self.dpat(&arm.pat);

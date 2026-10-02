@@ -149,7 +149,7 @@ fn walk_pat(p: &mut Pat, f: &mut impl FnMut(&mut TyId)) {
 
 /// Resolves every type, and checks what needed resolved types.
 pub(super) fn finish_common(c: &mut Checker) {
-    let unknown = c.infer.apply_defaults(&mut c.p.types);
+    let unknown = c.infer.apply_defaults(&c.p.types);
     let has_errors = c.diags.iter().any(|d| d.is_error());
     if !has_errors {
         for span in unknown.into_iter().take(1) {
@@ -161,7 +161,7 @@ pub(super) fn finish_common(c: &mut Checker) {
     }
     // `-x` of an integer whose type inference settled later: it must be signed.
     for (ty, span) in std::mem::take(&mut c.negated_ints) {
-        let ty = c.infer.resolve(&mut c.p.types, ty);
+        let ty = c.infer.resolve(&c.p.types, ty);
         if let TyKind::Int(it) = c.p.types.kind(ty)
             && !it.signed()
         {
@@ -176,7 +176,7 @@ pub(super) fn finish_common(c: &mut Checker) {
     // Integer literals must fit their types.
     let lits = std::mem::take(&mut c.int_literals);
     for (ty, v, neg, span) in lits {
-        let t = c.infer.resolve(&mut c.p.types, ty);
+        let t = c.infer.resolve(&c.p.types, ty);
         match c.p.types.kind(t).clone() {
             TyKind::Int(i) => {
                 let max = if neg && i.signed() { i.max() + 1 } else { i.max() };
@@ -208,9 +208,9 @@ pub(super) fn finish_common(c: &mut Checker) {
     // Bounds.
     let obligations = std::mem::take(&mut c.obligations);
     for o in obligations {
-        let ty = c.infer.resolve(&mut c.p.types, o.ty);
+        let ty = c.infer.resolve(&c.p.types, o.ty);
         let args: Vec<TyId> =
-            o.trait_ref.args.iter().map(|&a| c.infer.resolve(&mut c.p.types, a)).collect();
+            o.trait_ref.args.iter().map(|&a| c.infer.resolve(&c.p.types, a)).collect();
         let r = TraitRef { trait_: o.trait_ref.trait_, args };
         if c.p.types.has_vars(ty) || matches!(c.p.types.kind(ty), TyKind::Error) {
             continue;
@@ -257,7 +257,7 @@ pub(super) fn finish(
 ) -> (Option<Body>, Vec<Diagnostic>) {
     finish_common(&mut c);
     let infer = c.infer.clone();
-    let types = &mut c.p.types;
+    let types = &c.p.types;
     let mut resolve = |t: &mut TyId| *t = infer.resolve(types, *t);
     walk_tys(&mut value, &mut resolve);
     let mut locals = std::mem::take(&mut c.locals);
@@ -284,7 +284,7 @@ pub(super) fn finish(
 pub(super) fn finish_const(mut c: Checker, mut e: Expr) -> (Option<(TyId, Expr)>, Vec<Diagnostic>) {
     finish_common(&mut c);
     let infer = c.infer.clone();
-    let types = &mut c.p.types;
+    let types = &c.p.types;
     walk_tys(&mut e, &mut |t| *t = infer.resolve(types, *t));
     if let Some(bad) = non_literal(&e) {
         c.err(
@@ -318,7 +318,7 @@ pub fn non_literal(e: &Expr) -> Option<&Expr> {
 }
 
 /// A function whose return type names traits: its body's type must have them.
-pub(super) fn check_opaque(p: &mut Program, f: FnId, body: &mut Body, diags: &mut Vec<Diagnostic>) {
+pub(super) fn check_opaque(p: &Program, f: FnId, body: &mut Body, diags: &mut Vec<Diagnostic>) {
     let Some(hidden) = body.hidden_ret else { return };
     let Some(traits_) = p.func(f).opaque.clone() else { return };
     let span = p.func(f).sig_span;

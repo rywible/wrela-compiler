@@ -3,9 +3,9 @@
 
 use crate::defs::*;
 use crate::ty::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 pub struct Program {
     pub types: Types,
     pub modules: Vec<Module>,
@@ -25,9 +25,6 @@ pub struct Program {
     pub impls_of_trait: HashMap<TraitId, Vec<ImplId>>,
     /// Inherent impls by the ADT they're for.
     pub inherent_impls: HashMap<AdtId, Vec<ImplId>>,
-    /// Types of `const`s without annotations, once inferred.
-    pub const_tys: HashMap<ConstId, TyId>,
-    pub consts_in_progress: HashSet<ConstId>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -138,7 +135,7 @@ impl Program {
     }
 
     /// The fields of a struct type, with the type's arguments substituted.
-    pub fn struct_fields(&mut self, adt: AdtId, args: &[TyId]) -> Vec<(String, TyId)> {
+    pub fn struct_fields(&self, adt: AdtId, args: &[TyId]) -> Vec<(String, TyId)> {
         let def = &self.adts[adt.index()];
         let subst = Subst::from_pairs(&def.generics, args);
         let fields: Vec<(String, TyId)> =
@@ -147,12 +144,7 @@ impl Program {
     }
 
     /// A variant's fields, substituted.
-    pub fn variant_fields(
-        &mut self,
-        adt: AdtId,
-        args: &[TyId],
-        variant: usize,
-    ) -> Vec<(String, TyId)> {
+    pub fn variant_fields(&self, adt: AdtId, args: &[TyId], variant: usize) -> Vec<(String, TyId)> {
         let def = &self.adts[adt.index()];
         let subst = Subst::from_pairs(&def.generics, args);
         let fields: Vec<(String, TyId)> =

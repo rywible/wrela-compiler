@@ -122,7 +122,7 @@ impl<'p> Checker<'p> {
                         0
                     }
                 };
-                let vt = self.infer.resolve(&mut self.p.types, v.ty);
+                let vt = self.infer.resolve(&self.p.types, v.ty);
                 if self.p.types.has_vars(vt) {
                     // Decided once inference is done.
                     if let Some(copy) = self.p.lang_trait(Lang::Copy) {
@@ -176,20 +176,7 @@ impl<'p> Checker<'p> {
     }
 
     pub(crate) fn const_u32(&self, e: &ast::Expr) -> Option<u32> {
-        match &e.kind {
-            ast::ExprKind::Lit(ast::Lit { kind: ast::LitKind::Int, text, .. }) => {
-                wrela_syntax::lexer::int_value(text).and_then(|v| u32::try_from(v).ok())
-            }
-            ast::ExprKind::Paren(i) => self.const_u32(i),
-            ast::ExprKind::Path(path) if path.is_single() => {
-                match resolve::lookup_name(self.p, self.scope.module, &path.segments[0].ident.name)?
-                {
-                    Res::Const(c) => self.const_u32(&self.p.const_(c).value.clone()),
-                    _ => None,
-                }
-            }
-            _ => None,
-        }
+        resolve::const_u32(self.p, self.scope.module, e)
     }
 
     fn check_lit(&mut self, lit: &ast::Lit, expected: Option<TyId>) -> Expr {
@@ -344,7 +331,7 @@ impl<'p> Checker<'p> {
                             return Some(ValueRes::TypeRelative(ty, last));
                         }
                         Res::BuiltinTy(b) => {
-                            let ty = b.ty(&mut self.p.types);
+                            let ty = b.ty(&self.p.types);
                             return Some(ValueRes::TypeRelative(ty, last));
                         }
                         Res::Trait(t) => return Some(ValueRes::TraitRelative(t, last)),
@@ -366,7 +353,7 @@ impl<'p> Checker<'p> {
             ValueRes::Item(Res::Const(c)) => {
                 let ty = match self.p.const_(c).ty {
                     Some(t) => t,
-                    None => crate::check::const_type(self.p, c),
+                    None => self.const_tys.get(&c).copied().unwrap_or(self.p.types.error),
                 };
                 Expr { ty, span, kind: ExprKind::Const(c) }
             }
@@ -559,7 +546,7 @@ impl<'p> Checker<'p> {
             if let TyKind::Adt(b, _) = self.kind(e)
                 && b == a
             {
-                let _ = self.infer.unify(&mut self.p.types, ty, e);
+                let _ = self.infer.unify(&self.p.types, ty, e);
             }
         }
         args
@@ -738,7 +725,7 @@ impl<'p> Checker<'p> {
         };
         match op {
             BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
-                if self.infer.unify(&mut self.p.types, a, b).is_err() {
+                if self.infer.unify(&self.p.types, a, b).is_err() {
                     return fail(self);
                 }
                 let k = self.kind(a);
@@ -772,7 +759,7 @@ impl<'p> Checker<'p> {
             }
             BinOp::And | BinOp::Or => Some(bool_ty),
             BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => {
-                if self.infer.unify(&mut self.p.types, a, b).is_err() {
+                if self.infer.unify(&self.p.types, a, b).is_err() {
                     return fail(self);
                 }
                 match self.kind(a) {
@@ -795,7 +782,7 @@ impl<'p> Checker<'p> {
             BinOp::Pow => match (self.kind(a), self.kind(b)) {
                 (TyKind::Int(_), _) => {
                     let u = self.p.types.u32;
-                    if self.infer.unify(&mut self.p.types, b, u).is_err() {
+                    if self.infer.unify(&self.p.types, b, u).is_err() {
                         self.err(Diagnostic::new(
                             codes::E0305,
                             span,
@@ -805,13 +792,13 @@ impl<'p> Checker<'p> {
                     Some(a)
                 }
                 _ => {
-                    if self.infer.unify(&mut self.p.types, a, b).is_err() {
+                    if self.infer.unify(&self.p.types, a, b).is_err() {
                         return fail(self);
                     }
                     match self.kind(a) {
                         TyKind::Float(_) | TyKind::Vec(_) => Some(a),
                         TyKind::Var(_) => {
-                            let _ = self.infer.unify(&mut self.p.types, a, f32);
+                            let _ = self.infer.unify(&self.p.types, a, f32);
                             Some(a)
                         }
                         _ => fail(self),
@@ -827,7 +814,7 @@ impl<'p> Checker<'p> {
                             || self.infer.var_kind(&self.p.types, b) != Some(VarKind::General) =>
                     {
                         if matches!(kb, TyKind::Var(_)) {
-                            let _ = self.infer.unify(&mut self.p.types, b, f32);
+                            let _ = self.infer.unify(&self.p.types, b, f32);
                         }
                         if self.shallow(b) != f32 {
                             return fail(self);
@@ -842,7 +829,7 @@ impl<'p> Checker<'p> {
                             || self.infer.var_kind(&self.p.types, a) != Some(VarKind::General) =>
                     {
                         if matches!(ka, TyKind::Var(_)) {
-                            let _ = self.infer.unify(&mut self.p.types, a, f32);
+                            let _ = self.infer.unify(&self.p.types, a, f32);
                         }
                         if self.shallow(a) != f32
                             || matches!(op, BinOp::Div | BinOp::Rem) && matches!(kb, TyKind::Mat(_))
@@ -864,7 +851,7 @@ impl<'p> Checker<'p> {
                     }
                     _ => {}
                 }
-                if self.infer.unify(&mut self.p.types, a, b).is_err() {
+                if self.infer.unify(&self.p.types, a, b).is_err() {
                     return fail(self);
                 }
                 match self.kind(a) {
@@ -1049,7 +1036,7 @@ impl<'p> Checker<'p> {
             let gid = self.p.lang_adt(Lang::GlobalId).map(|g| self.p.types.adt(g, Vec::new()));
             let i = self.check_expr(index, gid);
             if let Some(g) = gid
-                && self.infer.unify(&mut self.p.types, i.ty, g).is_err()
+                && self.infer.unify(&self.p.types, i.ty, g).is_err()
             {
                 let shown = self.display(i.ty);
                 self.err(
@@ -1075,7 +1062,7 @@ impl<'p> Checker<'p> {
             || self.infer.var_kind(&self.p.types, i.ty) == Some(VarKind::Int);
         if self.infer.var_kind(&self.p.types, i.ty) == Some(VarKind::Int) {
             let u = self.p.types.u32;
-            let _ = self.infer.unify(&mut self.p.types, i.ty, u);
+            let _ = self.infer.unify(&self.p.types, i.ty, u);
         }
         if !int_ok {
             let shown = self.display(i.ty);
@@ -1331,7 +1318,7 @@ impl<'p> Checker<'p> {
                     ex.ty
                 } else {
                     if !matches!(self.kind(ex.ty), TyKind::Never)
-                        && self.infer.unify(&mut self.p.types, ex.ty, t.ty).is_err()
+                        && self.infer.unify(&self.p.types, ex.ty, t.ty).is_err()
                     {
                         let (a, b) = (self.display(t.ty), self.display(ex.ty));
                         // Point at the values, not the blocks around them.
@@ -1393,7 +1380,7 @@ impl<'p> Checker<'p> {
                         format!("`return` needs a `{shown}` here"),
                     ));
                 } else {
-                    let _ = self.infer.unify(&mut self.p.types, target, unit);
+                    let _ = self.infer.unify(&self.p.types, target, unit);
                 }
                 None
             }

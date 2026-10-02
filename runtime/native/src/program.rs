@@ -251,6 +251,31 @@ impl<E: Executor> Program<E> {
             .collect()
     }
 
+    /// The exported functions' names and WASM signatures.
+    pub(crate) fn exports(&mut self) -> Vec<(String, Vec<&'static str>, Vec<&'static str>)> {
+        let names: Vec<String> =
+            self.instance.exports(&mut self.store).map(|e| e.name().to_string()).collect();
+        let name_of = |t: ValType| match t {
+            ValType::I32 => "i32",
+            ValType::I64 => "i64",
+            ValType::F32 => "f32",
+            ValType::F64 => "f64",
+            _ => "other",
+        };
+        let mut out = Vec::new();
+        for n in names {
+            if let Some(f) = self.instance.get_func(&mut self.store, &n) {
+                let ty = f.ty(&self.store);
+                out.push((
+                    n,
+                    ty.params().map(name_of).collect(),
+                    ty.results().map(name_of).collect(),
+                ));
+            }
+        }
+        out
+    }
+
     /// Turns a call's outcome into ours, preferring the typed error `submit` recorded.
     fn settle(&mut self, result: wasmtime::Result<()>) -> Result<()> {
         let failure = self.store.data_mut().failure.take();

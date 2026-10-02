@@ -1328,7 +1328,7 @@ impl<'c, 'a> Fl<'c, 'a> {
                 let ta: Vec<TyId> = trait_args.iter().map(|&a| self.concrete(a)).collect();
                 let ma: Vec<TyId> = method_args.iter().map(|&a| self.concrete(a)).collect();
                 let Some((func, subst)) = wrela_sema::traits::resolve_trait_method(
-                    &mut self.cx.checked.program,
+                    &self.cx.checked.program,
                     *method,
                     st,
                     &ta,

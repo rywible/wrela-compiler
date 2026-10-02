@@ -48,7 +48,7 @@ impl<'a> Cx<'a> {
     /// `t` with `subst` applied, projections normalized and return-position trait types
     /// replaced by the types their functions return.
     pub fn concrete(&mut self, t: TyId, subst: &Subst) -> TyId {
-        let p = &mut self.checked.program;
+        let p = &self.checked.program;
         let t = p.types.subst(t, subst);
         let t = wrela_sema::traits::normalize(p, t, None);
         self.reveal(t)
