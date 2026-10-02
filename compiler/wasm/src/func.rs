@@ -1,0 +1,902 @@
+//! One IR function to one WASM function, plus the generated helpers and export wrappers.
+
+use crate::{Helpers, globals, memory, repr, signature, valtype};
+use wasm_encoder::{BlockType, Function, Instruction as I, MemArg, ValType};
+use wrela_ir as ir;
+use wrela_ir::layout::{array_stride, field_offsets, layout, round_up};
+
+type R<T> = Result<T, String>;
+
+fn mem(offset: u32, align: u32) -> MemArg {
+    MemArg { offset: offset as u64, align, memory_index: 0 }
+}
+
+/// Load and store instructions for a scalar in memory.
+fn load_op(s: ir::Scalar, offset: u32) -> I<'static> {
+    match s {
+        ir::Scalar::I8 => I::I32Load8S(mem(offset, 0)),
+        ir::Scalar::U8 => I::I32Load8U(mem(offset, 0)),
+        ir::Scalar::I16 => I::I32Load16S(mem(offset, 1)),
+        ir::Scalar::U16 => I::I32Load16U(mem(offset, 1)),
+        ir::Scalar::I64 | ir::Scalar::U64 => I::I64Load(mem(offset, 3)),
+        ir::Scalar::F32 => I::F32Load(mem(offset, 2)),
+        ir::Scalar::F64 => I::F64Load(mem(offset, 3)),
+        _ => I::I32Load(mem(offset, 2)),
+    }
+}
+
+fn store_op(s: ir::Scalar, offset: u32) -> I<'static> {
+    match s {
+        ir::Scalar::I8 | ir::Scalar::U8 => I::I32Store8(mem(offset, 0)),
+        ir::Scalar::I16 | ir::Scalar::U16 => I::I32Store16(mem(offset, 1)),
+        ir::Scalar::I64 | ir::Scalar::U64 => I::I64Store(mem(offset, 3)),
+        ir::Scalar::F32 => I::F32Store(mem(offset, 2)),
+        ir::Scalar::F64 => I::F64Store(mem(offset, 3)),
+        _ => I::I32Store(mem(offset, 2)),
+    }
+}
+
+/// A WASM constant of scalar type `s`.
+fn konst(s: ir::Scalar, v: f64) -> I<'static> {
+    match s {
+        ir::Scalar::F32 => I::F32Const((v as f32).into()),
+        ir::Scalar::F64 => I::F64Const(v.into()),
+        ir::Scalar::I64 | ir::Scalar::U64 => I::I64Const(v as i64),
+        _ => I::I32Const(v as i32),
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum LocalRepr {
+    /// A scalar in a WASM local.
+    Scalar(u32),
+    /// An aggregate at this offset in the frame.
+    Slot(u32),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Label {
+    Plain,
+    LoopExit,
+    LoopTop,
+    LoopContinue,
+}
+
+struct Fe<'m> {
+    m: &'m ir::Module,
+    f: &'m ir::Function,
+    fn_indices: &'m [u32],
+    helpers: &'m Helpers,
+    ins: Vec<I<'static>>,
+    locals: Vec<ValType>,
+    nparams: u32,
+    sret: Option<u32>,
+    params: Vec<u32>,
+    fp: u32,
+    values: Vec<u32>,
+    value_slots: Vec<Option<u32>>,
+    ir_locals: Vec<LocalRepr>,
+    frame: u32,
+    labels: Vec<Label>,
+}
+
+/// Whether an expression makes a new aggregate in memory (and so needs a frame slot).
+fn makes_memory(m: &ir::Module, f: &ir::Function, v: ir::ValueId, e: &ir::Expr) -> bool {
+    if !m.types.is_aggregate(f.value_ty(v)) {
+        return false;
+    }
+    match e {
+        ir::Expr::Load(_)
+        | ir::Expr::Construct(..)
+        | ir::Expr::Zero(_)
+        | ir::Expr::Splat(..)
+        | ir::Expr::Swizzle(..)
+        | ir::Expr::Unary(..)
+        | ir::Expr::Binary(..)
+        | ir::Expr::Builtin(..)
+        | ir::Expr::Run(_) => true,
+        ir::Expr::Call(callee, _) => !m.functions[callee.index()].ret_ref,
+        _ => false,
+    }
+}
+
+pub(crate) fn emit_function(
+    m: &ir::Module,
+    index: usize,
+    fn_indices: &[u32],
+    helpers: &Helpers,
+) -> R<Function> {
+    let f = &m.functions[index];
+    let (params, _results, sret) = signature(m, f);
+    let mut fe = Fe {
+        m,
+        f,
+        fn_indices,
+        helpers,
+        ins: Vec::new(),
+        locals: Vec::new(),
+        nparams: params.len() as u32,
+        sret: sret.then_some(0),
+        params: Vec::new(),
+        fp: 0,
+        values: Vec::new(),
+        value_slots: vec![None; f.values.len()],
+        ir_locals: Vec::new(),
+        frame: 0,
+        labels: Vec::new(),
+    };
+    let first = u32::from(sret);
+    fe.params = (0..f.params.len() as u32).map(|i| first + i).collect();
+    fe.fp = fe.new_local(ValType::I32);
+    // Frame slots: aggregate locals, then each aggregate value made in memory.
+    for l in &f.locals {
+        if m.types.is_aggregate(l.ty) {
+            let off = fe.slot(l.ty);
+            fe.ir_locals.push(LocalRepr::Slot(off));
+        } else {
+            let w = fe.new_local(repr(&m.types, l.ty));
+            fe.ir_locals.push(LocalRepr::Scalar(w));
+        }
+    }
+    let mut lets = Vec::new();
+    collect_lets(&f.body, &mut lets);
+    for (v, e) in lets {
+        if makes_memory(m, f, v, e) {
+            let t = f.value_ty(v);
+            fe.value_slots[v.index()] = Some(fe.slot(t));
+        }
+    }
+    fe.values = f
+        .values
+        .iter()
+        .map(|&t| repr(&m.types, t))
+        .collect::<Vec<_>>()
+        .into_iter()
+        .map(|vt| fe.new_local(vt))
+        .collect();
+    fe.frame = round_up(16, fe.frame);
+    // Prologue: fp = sp - frame; trap if that's below the stack's limit; sp = fp.
+    fe.ins.extend([
+        I::GlobalGet(globals::SP),
+        I::I32Const(fe.frame as i32),
+        I::I32Sub,
+        I::LocalTee(fe.fp),
+        I::I32Const(memory::STACK_LIMIT as i32),
+        I::I32LtU,
+        I::If(BlockType::Empty),
+        I::Unreachable,
+        I::End,
+        I::LocalGet(fe.fp),
+        I::GlobalSet(globals::SP),
+    ]);
+    fe.block(&f.body)?;
+    // Falling off the end: only a function with no result can.
+    fe.epilogue();
+    if f.ret.is_some() && !sret {
+        fe.ins.push(I::Unreachable);
+    }
+    fe.ins.push(I::End);
+    let _ = fe.nparams;
+    let mut func = Function::new(fe.locals.iter().map(|t| (1, *t)));
+    for i in &fe.ins {
+        func.instruction(i);
+    }
+    Ok(func)
+}
+
+fn collect_lets<'a>(b: &'a ir::Block, out: &mut Vec<(ir::ValueId, &'a ir::Expr)>) {
+    for s in b {
+        match s {
+            ir::Stmt::Let(v, e) => out.push((*v, e)),
+            ir::Stmt::If { then, else_, .. } => {
+                collect_lets(then, out);
+                collect_lets(else_, out);
+            }
+            ir::Stmt::Loop { body, continuing } => {
+                collect_lets(body, out);
+                collect_lets(continuing, out);
+            }
+            _ => {}
+        }
+    }
+}
+
+impl<'m> Fe<'m> {
+    fn new_local(&mut self, t: ValType) -> u32 {
+        self.locals.push(t);
+        self.nparams + self.locals.len() as u32 - 1
+    }
+
+    fn slot(&mut self, t: ir::TypeId) -> u32 {
+        let l = layout(&self.m.types, t);
+        let align = l.align.max(4);
+        let off = round_up(align, self.frame);
+        self.frame = off + round_up(16, l.size);
+        off
+    }
+
+    fn ty(&self, t: ir::TypeId) -> &'m ir::TypeDef {
+        self.m.types.get(t)
+    }
+
+    fn scalar(&self, t: ir::TypeId) -> R<ir::Scalar> {
+        self.m
+            .types
+            .as_scalar(t)
+            .ok_or_else(|| format!("expected a scalar, found {}", self.m.types.display(t)))
+    }
+
+    fn epilogue(&mut self) {
+        self.ins.extend([
+            I::LocalGet(self.fp),
+            I::I32Const(self.frame as i32),
+            I::I32Add,
+            I::GlobalSet(globals::SP),
+        ]);
+    }
+
+    fn trap_if(&mut self) {
+        self.ins.extend([I::If(BlockType::Empty), I::Unreachable, I::End]);
+    }
+
+    fn v(&self, v: ir::ValueId) -> u32 {
+        self.values[v.index()]
+    }
+
+    fn vty(&self, v: ir::ValueId) -> ir::TypeId {
+        self.f.value_ty(v)
+    }
+
+    /// The address of a value's own frame slot.
+    fn slot_addr(&mut self, v: ir::ValueId) -> R<()> {
+        let off = self.value_slots[v.index()].ok_or("internal: a value without a slot")?;
+        self.ins.extend([I::LocalGet(self.fp), I::I32Const(off as i32), I::I32Add]);
+        Ok(())
+    }
+
+    /// Sets value `v` to its slot's address (for aggregate results).
+    fn set_to_slot(&mut self, v: ir::ValueId) -> R<()> {
+        self.slot_addr(v)?;
+        self.ins.push(I::LocalSet(self.v(v)));
+        Ok(())
+    }
+
+    // ---- places ----------------------------------------------------------------------------
+
+    /// The root's type and, for memory roots, pushes its address. Returns `None` for a scalar
+    /// local (which has no address).
+    fn root(&mut self, p: &ir::Place) -> R<(ir::TypeId, Option<u32>)> {
+        match &p.root {
+            ir::PlaceRoot::Local(l) => {
+                let t = self.f.locals[l.index()].ty;
+                match self.ir_locals[l.index()] {
+                    LocalRepr::Scalar(w) => Ok((t, Some(w))),
+                    LocalRepr::Slot(off) => {
+                        self.ins.extend([I::LocalGet(self.fp), I::I32Const(off as i32), I::I32Add]);
+                        Ok((t, None))
+                    }
+                }
+            }
+            ir::PlaceRoot::Param(i) => {
+                let t = self.f.params[*i as usize].ty;
+                self.ins.push(I::LocalGet(self.params[*i as usize]));
+                Ok((t, None))
+            }
+            ir::PlaceRoot::Ptr(v) => {
+                let t = match self.ty(self.vty(*v)) {
+                    ir::TypeDef::Ptr(t) => *t,
+                    _ => return Err("internal: a pointer place of a non-pointer value".into()),
+                };
+                self.ins.push(I::LocalGet(self.v(*v)));
+                Ok((t, None))
+            }
+            ir::PlaceRoot::Resource(_) => Err("internal: a GPU resource in CPU code".into()),
+        }
+    }
+
+    /// Pushes a place's address (it must be in memory) and returns its type.
+    fn addr(&mut self, p: &ir::Place) -> R<ir::TypeId> {
+        let (mut t, scalar_local) = self.root(p)?;
+        if scalar_local.is_some() {
+            return Err("internal: the address of a scalar local".into());
+        }
+        for proj in &p.path {
+            t = self.project(t, proj)?;
+        }
+        Ok(t)
+    }
+
+    /// Given an address on the stack of a value of type `t`, applies one projection.
+    fn project(&mut self, t: ir::TypeId, proj: &ir::Proj) -> R<ir::TypeId> {
+        match (self.ty(t).clone(), proj) {
+            (ir::TypeDef::Struct { fields, .. }, ir::Proj::Field(k)) => {
+                let off = field_offsets(&self.m.types, t)[*k as usize];
+                if off != 0 {
+                    self.ins.extend([I::I32Const(off as i32), I::I32Add]);
+                }
+                Ok(fields[*k as usize].1)
+            }
+            (ir::TypeDef::Vector(_), ir::Proj::Comp(c)) => {
+                if *c != 0 {
+                    self.ins.extend([I::I32Const(4 * *c as i32), I::I32Add]);
+                }
+                Ok(self.m.types.as_scalar(t).map_or_else(|| self.f32_ty(), |_| t))
+            }
+            (ir::TypeDef::Vector(n), ir::Proj::Index(i)) => {
+                self.bounds_check(*i, n as u32);
+                self.ins.extend([I::LocalGet(self.v(*i)), I::I32Const(4), I::I32Mul, I::I32Add]);
+                Ok(self.f32_ty())
+            }
+            (ir::TypeDef::Matrix(n), ir::Proj::Index(i)) => {
+                let col = self.vector_ty(n);
+                let stride = array_stride(&self.m.types, col);
+                self.bounds_check(*i, n as u32);
+                self.ins.extend([
+                    I::LocalGet(self.v(*i)),
+                    I::I32Const(stride as i32),
+                    I::I32Mul,
+                    I::I32Add,
+                ]);
+                Ok(col)
+            }
+            (ir::TypeDef::Array(e, n), ir::Proj::Index(i)) => {
+                let stride = array_stride(&self.m.types, e);
+                self.bounds_check(*i, n);
+                self.ins.extend([
+                    I::LocalGet(self.v(*i)),
+                    I::I32Const(stride as i32),
+                    I::I32Mul,
+                    I::I32Add,
+                ]);
+                Ok(e)
+            }
+            (ir::TypeDef::Run(e), ir::Proj::Index(i)) => {
+                // The run is {ptr, len}: check the index against len, then ptr + i * stride.
+                let stride = array_stride(&self.m.types, e);
+                let base = self.new_local(ValType::I32);
+                self.ins.push(I::LocalSet(base));
+                self.ins.extend([
+                    I::LocalGet(self.v(*i)),
+                    I::LocalGet(base),
+                    I::I32Load(mem(4, 2)),
+                    I::I32GeU,
+                ]);
+                self.trap_if();
+                self.ins.extend([
+                    I::LocalGet(base),
+                    I::I32Load(mem(0, 2)),
+                    I::LocalGet(self.v(*i)),
+                    I::I32Const(stride as i32),
+                    I::I32Mul,
+                    I::I32Add,
+                ]);
+                Ok(e)
+            }
+            (d, p) => Err(format!("internal: projection {p:?} of {d:?}")),
+        }
+    }
+
+    fn bounds_check(&mut self, i: ir::ValueId, n: u32) {
+        self.ins.extend([I::LocalGet(self.v(i)), I::I32Const(n as i32), I::I32GeU]);
+        self.trap_if();
+    }
+
+    fn f32_ty(&self) -> ir::TypeId {
+        self.find_type(&ir::TypeDef::Scalar(ir::Scalar::F32))
+    }
+
+    fn vector_ty(&self, n: u8) -> ir::TypeId {
+        self.find_type(&ir::TypeDef::Vector(n))
+    }
+
+    fn find_type(&self, d: &ir::TypeDef) -> ir::TypeId {
+        self.m.types.iter().find(|(_, x)| *x == d).map_or(ir::TypeId(0), |(t, _)| t)
+    }
+
+    fn load_place(&mut self, p: &ir::Place, dst: ir::ValueId) -> R<()> {
+        if let ir::PlaceRoot::Local(l) = &p.root
+            && p.path.is_empty()
+            && let LocalRepr::Scalar(w) = self.ir_locals[l.index()]
+        {
+            self.ins.extend([I::LocalGet(w), I::LocalSet(self.v(dst))]);
+            return Ok(());
+        }
+        let t = self.vty(dst);
+        if self.m.types.is_aggregate(t) {
+            // Copy into the value's own slot.
+            self.slot_addr(dst)?;
+            self.addr(p)?;
+            self.ins.extend([
+                I::I32Const(layout(&self.m.types, t).size as i32),
+                I::MemoryCopy { src_mem: 0, dst_mem: 0 },
+            ]);
+            self.set_to_slot(dst)
+        } else {
+            self.addr(p)?;
+            let s = self.scalar(t)?;
+            self.ins.extend([load_op(s, 0), I::LocalSet(self.v(dst))]);
+            Ok(())
+        }
+    }
+
+    fn store_place(&mut self, p: &ir::Place, v: ir::ValueId) -> R<()> {
+        if let ir::PlaceRoot::Local(l) = &p.root
+            && p.path.is_empty()
+            && let LocalRepr::Scalar(w) = self.ir_locals[l.index()]
+        {
+            self.ins.extend([I::LocalGet(self.v(v)), I::LocalSet(w)]);
+            return Ok(());
+        }
+        let t = self.vty(v);
+        self.addr(p)?;
+        if self.m.types.is_aggregate(t) {
+            self.ins.extend([
+                I::LocalGet(self.v(v)),
+                I::I32Const(layout(&self.m.types, t).size as i32),
+                I::MemoryCopy { src_mem: 0, dst_mem: 0 },
+            ]);
+        } else {
+            let s = self.scalar(t)?;
+            self.ins.extend([I::LocalGet(self.v(v)), store_op(s, 0)]);
+        }
+        Ok(())
+    }
+
+    /// Stores scalar or aggregate value `v` at `[addr local] + offset`.
+    fn store_at(&mut self, addr: u32, offset: u32, v: ir::ValueId) -> R<()> {
+        let t = self.vty(v);
+        if self.m.types.is_aggregate(t) {
+            self.ins.extend([
+                I::LocalGet(addr),
+                I::I32Const(offset as i32),
+                I::I32Add,
+                I::LocalGet(self.v(v)),
+                I::I32Const(layout(&self.m.types, t).size as i32),
+                I::MemoryCopy { src_mem: 0, dst_mem: 0 },
+            ]);
+        } else {
+            let s = self.scalar(t)?;
+            self.ins.extend([I::LocalGet(addr), I::LocalGet(self.v(v)), store_op(s, offset)]);
+        }
+        Ok(())
+    }
+
+    /// The address of value `v`'s slot, in a fresh local, zeroed.
+    fn fresh_slot(&mut self, v: ir::ValueId) -> R<u32> {
+        let a = self.new_local(ValType::I32);
+        self.slot_addr(v)?;
+        self.ins.push(I::LocalTee(a));
+        let size = layout(&self.m.types, self.vty(v)).size;
+        self.ins.extend([I::I32Const(0), I::I32Const(size as i32), I::MemoryFill(0)]);
+        self.ins.extend([I::LocalGet(a), I::LocalSet(self.v(v))]);
+        Ok(a)
+    }
+
+    // ---- statements ------------------------------------------------------------------------
+
+    fn block(&mut self, b: &ir::Block) -> R<()> {
+        for s in b {
+            self.stmt(s)?;
+        }
+        Ok(())
+    }
+
+    fn depth_of(&self, want: Label) -> R<u32> {
+        let pos =
+            self.labels.iter().rposition(|l| *l == want).ok_or("internal: break outside a loop")?;
+        Ok((self.labels.len() - 1 - pos) as u32)
+    }
+
+    fn stmt(&mut self, s: &ir::Stmt) -> R<()> {
+        match s {
+            ir::Stmt::Let(v, e) => self.expr(*v, e),
+            ir::Stmt::Eval(e) => self.eval(e),
+            ir::Stmt::Store(p, v) => self.store_place(p, *v),
+            ir::Stmt::If { cond, then, else_ } => {
+                self.ins.extend([I::LocalGet(self.v(*cond)), I::If(BlockType::Empty)]);
+                self.labels.push(Label::Plain);
+                self.block(then)?;
+                if !else_.is_empty() {
+                    self.ins.push(I::Else);
+                    self.block(else_)?;
+                }
+                self.labels.pop();
+                self.ins.push(I::End);
+                Ok(())
+            }
+            ir::Stmt::Loop { body, continuing } => {
+                self.ins.push(I::Block(BlockType::Empty));
+                self.labels.push(Label::LoopExit);
+                self.ins.push(I::Loop(BlockType::Empty));
+                self.labels.push(Label::LoopTop);
+                self.ins.push(I::Block(BlockType::Empty));
+                self.labels.push(Label::LoopContinue);
+                self.block(body)?;
+                self.labels.pop();
+                self.ins.push(I::End);
+                self.block(continuing)?;
+                self.ins.push(I::Br(0));
+                self.labels.pop();
+                self.ins.push(I::End);
+                self.labels.pop();
+                self.ins.push(I::End);
+                Ok(())
+            }
+            ir::Stmt::Break => {
+                let d = self.depth_of(Label::LoopExit)?;
+                self.ins.push(I::Br(d));
+                Ok(())
+            }
+            ir::Stmt::Continue => {
+                let d = self.depth_of(Label::LoopContinue)?;
+                self.ins.push(I::Br(d));
+                Ok(())
+            }
+            ir::Stmt::Return(v) => {
+                match (v, self.sret) {
+                    (Some(v), Some(sret)) => {
+                        let t = self.vty(*v);
+                        self.ins.extend([
+                            I::LocalGet(sret),
+                            I::LocalGet(self.v(*v)),
+                            I::I32Const(layout(&self.m.types, t).size as i32),
+                            I::MemoryCopy { src_mem: 0, dst_mem: 0 },
+                        ]);
+                        self.epilogue();
+                    }
+                    (Some(v), None) => {
+                        self.epilogue();
+                        self.ins.push(I::LocalGet(self.v(*v)));
+                    }
+                    (None, _) => self.epilogue(),
+                }
+                self.ins.push(I::Return);
+                Ok(())
+            }
+            ir::Stmt::Trap => {
+                self.ins.push(I::Unreachable);
+                Ok(())
+            }
+        }
+    }
+
+    /// An expression evaluated for its effect.
+    fn eval(&mut self, e: &ir::Expr) -> R<()> {
+        match e {
+            ir::Expr::Call(f, args) => {
+                let callee = &self.m.functions[f.index()];
+                // A callee that returns a value through a pointer still needs somewhere to put it.
+                if callee.ret.is_some_and(|t| !callee.ret_ref && self.m.types.is_aggregate(t)) {
+                    let t = callee.ret.unwrap_or(ir::TypeId(0));
+                    let off = self.slot(t);
+                    self.ins.extend([I::LocalGet(self.fp), I::I32Const(off as i32), I::I32Add]);
+                }
+                self.call_args(*f, args)?;
+                self.ins.push(I::Call(self.fn_indices[f.index()]));
+                if callee.ret.is_some()
+                    && (callee.ret_ref
+                        || !self.m.types.is_aggregate(callee.ret.unwrap_or(ir::TypeId(0))))
+                {
+                    self.ins.push(I::Drop);
+                }
+                Ok(())
+            }
+            ir::Expr::Host(op, args) => crate::func::host(self, op, args, None),
+            _ => Ok(()),
+        }
+    }
+
+    fn call_args(&mut self, f: ir::FuncId, args: &[ir::Arg]) -> R<()> {
+        for a in args {
+            match a {
+                ir::Arg::Value(v) => self.ins.push(I::LocalGet(self.v(*v))),
+                ir::Arg::Place(p) => {
+                    self.addr(p)?;
+                }
+            }
+        }
+        let _ = f;
+        Ok(())
+    }
+
+    // ---- expressions -----------------------------------------------------------------------
+
+    fn expr(&mut self, v: ir::ValueId, e: &ir::Expr) -> R<()> {
+        let t = self.vty(v);
+        match e {
+            ir::Expr::Const(c) => {
+                let i = match c {
+                    ir::Const::Bool(b) => I::I32Const(i32::from(*b)),
+                    ir::Const::I32(x) => I::I32Const(*x),
+                    ir::Const::U32(x) => I::I32Const(*x as i32),
+                    ir::Const::I64(x) => I::I64Const(*x),
+                    ir::Const::U64(x) => I::I64Const(*x as i64),
+                    ir::Const::Small(_, x) => I::I32Const(*x as i32),
+                    ir::Const::F32(x) => I::F32Const((*x).into()),
+                    ir::Const::F64(x) => I::F64Const((*x).into()),
+                };
+                self.ins.extend([i, I::LocalSet(self.v(v))]);
+            }
+            ir::Expr::Zero(_) => {
+                if self.m.types.is_aggregate(t) {
+                    self.fresh_slot(v)?;
+                } else {
+                    let s = self.scalar(t)?;
+                    self.ins.extend([konst(s, 0.0), I::LocalSet(self.v(v))]);
+                }
+            }
+            ir::Expr::Param(i) => {
+                self.ins.extend([I::LocalGet(self.params[*i as usize]), I::LocalSet(self.v(v))])
+            }
+            ir::Expr::Load(p) => self.load_place(p, v)?,
+            ir::Expr::Addr(p) => {
+                self.addr(p)?;
+                self.ins.push(I::LocalSet(self.v(v)));
+            }
+            ir::Expr::Run(p) => {
+                let pt = self.place_ty(p)?;
+                let n = match self.ty(pt) {
+                    ir::TypeDef::Array(_, n) => *n,
+                    _ => return Err("internal: a run of something that isn't an array".into()),
+                };
+                let a = self.fresh_slot(v)?;
+                self.ins.push(I::LocalGet(a));
+                self.addr(p)?;
+                self.ins.extend([
+                    I::I32Store(mem(0, 2)),
+                    I::LocalGet(a),
+                    I::I32Const(n as i32),
+                    I::I32Store(mem(4, 2)),
+                ]);
+            }
+            ir::Expr::Call(f, args) => {
+                let callee = &self.m.functions[f.index()];
+                let sret =
+                    callee.ret.is_some_and(|rt| !callee.ret_ref && self.m.types.is_aggregate(rt));
+                if sret {
+                    self.slot_addr(v)?;
+                }
+                self.call_args(*f, args)?;
+                self.ins.push(I::Call(self.fn_indices[f.index()]));
+                if sret {
+                    self.set_to_slot(v)?;
+                } else {
+                    self.ins.push(I::LocalSet(self.v(v)));
+                }
+            }
+            ir::Expr::Construct(_, parts) => self.construct(v, t, parts)?,
+            ir::Expr::Extract(x, i) => self.extract(v, *x, *i)?,
+            ir::Expr::ExtractDyn(x, i) => {
+                let xt = self.vty(*x);
+                self.ins.push(I::LocalGet(self.v(*x)));
+                let et = self.project(xt, &ir::Proj::Index(*i))?;
+                if self.m.types.is_aggregate(et) {
+                    self.ins.push(I::LocalSet(self.v(v)));
+                } else {
+                    let s = self.scalar(et)?;
+                    self.ins.extend([load_op(s, 0), I::LocalSet(self.v(v))]);
+                }
+            }
+            ir::Expr::Splat(x, n) => {
+                let a = self.fresh_slot(v)?;
+                for c in 0..*n as u32 {
+                    self.ins.extend([
+                        I::LocalGet(a),
+                        I::LocalGet(self.v(*x)),
+                        I::F32Store(mem(4 * c, 2)),
+                    ]);
+                }
+            }
+            ir::Expr::Swizzle(x, comps) => {
+                let a = self.fresh_slot(v)?;
+                for (k, c) in comps.iter().enumerate() {
+                    self.ins.extend([
+                        I::LocalGet(a),
+                        I::LocalGet(self.v(*x)),
+                        I::F32Load(mem(4 * *c as u32, 2)),
+                        I::F32Store(mem(4 * k as u32, 2)),
+                    ]);
+                }
+            }
+            ir::Expr::Convert(x, to) => {
+                let from = self.scalar(self.vty(*x))?;
+                self.ins.push(I::LocalGet(self.v(*x)));
+                crate::func::convert(self, from, *to)?;
+                self.ins.push(I::LocalSet(self.v(v)));
+            }
+            ir::Expr::Bitcast(x, to) => {
+                let from = self.scalar(self.vty(*x))?;
+                self.ins.push(I::LocalGet(self.v(*x)));
+                match (from, to) {
+                    (ir::Scalar::F32, ir::Scalar::U32 | ir::Scalar::I32) => {
+                        self.ins.push(I::I32ReinterpretF32)
+                    }
+                    (ir::Scalar::U32 | ir::Scalar::I32, ir::Scalar::F32) => {
+                        self.ins.push(I::F32ReinterpretI32)
+                    }
+                    (ir::Scalar::F64, ir::Scalar::U64 | ir::Scalar::I64) => {
+                        self.ins.push(I::I64ReinterpretF64)
+                    }
+                    (ir::Scalar::U64 | ir::Scalar::I64, ir::Scalar::F64) => {
+                        self.ins.push(I::F64ReinterpretI64)
+                    }
+                    _ => return Err(format!("internal: bitcast {from:?} to {to:?}")),
+                }
+                self.ins.push(I::LocalSet(self.v(v)));
+            }
+            ir::Expr::Select { cond, if_true, if_false } => {
+                self.ins.extend([
+                    I::LocalGet(self.v(*if_true)),
+                    I::LocalGet(self.v(*if_false)),
+                    I::LocalGet(self.v(*cond)),
+                    I::Select,
+                    I::LocalSet(self.v(v)),
+                ]);
+            }
+            ir::Expr::Unary(op, x) => crate::func::unary(self, v, *op, *x)?,
+            ir::Expr::Binary(op, a, b) => crate::func::binary(self, v, *op, *a, *b)?,
+            ir::Expr::Builtin(b, args) => crate::func::builtin(self, v, *b, args)?,
+            ir::Expr::Host(op, args) => crate::func::host(self, op, args, Some(v))?,
+            ir::Expr::EntryInput(_) => return Err("internal: a GPU entry input in CPU code".into()),
+        }
+        Ok(())
+    }
+
+    fn place_ty(&mut self, p: &ir::Place) -> R<ir::TypeId> {
+        let mut t = match &p.root {
+            ir::PlaceRoot::Local(l) => self.f.locals[l.index()].ty,
+            ir::PlaceRoot::Param(i) => self.f.params[*i as usize].ty,
+            ir::PlaceRoot::Ptr(v) => match self.ty(self.vty(*v)) {
+                ir::TypeDef::Ptr(t) => *t,
+                _ => return Err("internal: pointer place".into()),
+            },
+            ir::PlaceRoot::Resource(_) => return Err("internal: resource".into()),
+        };
+        for proj in &p.path {
+            t = match (self.ty(t), proj) {
+                (ir::TypeDef::Struct { fields, .. }, ir::Proj::Field(k)) => fields[*k as usize].1,
+                (ir::TypeDef::Vector(_), _) => self.f32_ty(),
+                (ir::TypeDef::Matrix(n), _) => self.vector_ty(*n),
+                (ir::TypeDef::Array(e, _) | ir::TypeDef::Run(e), _) => *e,
+                _ => return Err("internal: bad projection".into()),
+            };
+        }
+        Ok(t)
+    }
+
+    fn construct(&mut self, v: ir::ValueId, t: ir::TypeId, parts: &[ir::ValueId]) -> R<()> {
+        let a = self.fresh_slot(v)?;
+        match self.ty(t).clone() {
+            ir::TypeDef::Struct { .. } => {
+                let offs = field_offsets(&self.m.types, t);
+                for (k, &p) in parts.iter().enumerate() {
+                    self.store_at(a, offs[k], p)?;
+                }
+            }
+            ir::TypeDef::Vector(_) => {
+                for (k, &p) in parts.iter().enumerate() {
+                    self.store_at(a, 4 * k as u32, p)?;
+                }
+            }
+            ir::TypeDef::Matrix(n) => {
+                let stride = array_stride(&self.m.types, self.vector_ty(n));
+                for (k, &p) in parts.iter().enumerate() {
+                    self.store_at(a, stride * k as u32, p)?;
+                }
+            }
+            ir::TypeDef::Array(e, _) => {
+                let stride = array_stride(&self.m.types, e);
+                for (k, &p) in parts.iter().enumerate() {
+                    self.store_at(a, stride * k as u32, p)?;
+                }
+            }
+            d => return Err(format!("internal: construct {d:?}")),
+        }
+        Ok(())
+    }
+
+    fn extract(&mut self, v: ir::ValueId, x: ir::ValueId, i: u32) -> R<()> {
+        let xt = self.vty(x);
+        let (off, et) = match self.ty(xt).clone() {
+            ir::TypeDef::Struct { fields, .. } => {
+                (field_offsets(&self.m.types, xt)[i as usize], fields[i as usize].1)
+            }
+            ir::TypeDef::Vector(_) => (4 * i, self.f32_ty()),
+            ir::TypeDef::Matrix(n) => {
+                let col = self.vector_ty(n);
+                (array_stride(&self.m.types, col) * i, col)
+            }
+            ir::TypeDef::Array(e, _) => (array_stride(&self.m.types, e) * i, e),
+            ir::TypeDef::Run(_) => (4 * i, self.find_type(&ir::TypeDef::Scalar(ir::Scalar::U32))),
+            d => return Err(format!("internal: extract from {d:?}")),
+        };
+        self.ins.push(I::LocalGet(self.v(x)));
+        if self.m.types.is_aggregate(et) {
+            // An immutable view of part of an immutable value: no copy needed.
+            if off != 0 {
+                self.ins.extend([I::I32Const(off as i32), I::I32Add]);
+            }
+        } else {
+            let s = match self.ty(xt) {
+                ir::TypeDef::Run(_) => ir::Scalar::U32,
+                _ => self.scalar(et)?,
+            };
+            self.ins.push(load_op(s, off));
+        }
+        self.ins.push(I::LocalSet(self.v(v)));
+        Ok(())
+    }
+}
+
+mod ops;
+use ops::{binary, builtin, convert, host, unary};
+
+/// The generated helpers: flush, reserve and write (see `Helpers`).
+pub(crate) fn helper_bodies(h: &Helpers) -> Vec<(Vec<ValType>, Vec<ValType>, Function)> {
+    ops::helper_bodies(h)
+}
+
+/// An export's wrapper: scalars in, a scalar or a flattened vector out, then a flush.
+pub(crate) fn export_wrapper(
+    m: &ir::Module,
+    f: ir::FuncId,
+    index: u32,
+    h: &Helpers,
+) -> R<(Vec<ValType>, Vec<ValType>, Function)> {
+    let func = &m.functions[f.index()];
+    let mut params = Vec::new();
+    for p in &func.params {
+        if p.by_ref || m.types.is_aggregate(p.ty) {
+            return Err(format!("internal: export {} takes a non-scalar", func.name));
+        }
+        params.push(repr(&m.types, p.ty));
+    }
+    let (results, sret_size, comps) = match func.ret {
+        None => (Vec::new(), 0, 0),
+        Some(t) => match m.types.get(t) {
+            ir::TypeDef::Scalar(s) => (vec![valtype(*s)], 0, 0),
+            ir::TypeDef::Vector(n) => (vec![ValType::F32; *n as usize], 16, *n),
+            d => return Err(format!("internal: export returns {d:?}")),
+        },
+    };
+    let n = params.len() as u32;
+    let mut locals: Vec<ValType> = vec![ValType::I32];
+    let tmp_start = n + 1;
+    if sret_size == 0 && !results.is_empty() {
+        locals.push(results[0]);
+    }
+    let mut ins: Vec<I<'static>> = Vec::new();
+    if sret_size > 0 {
+        // Room for the result on the shadow stack.
+        ins.extend([
+            I::GlobalGet(globals::SP),
+            I::I32Const(sret_size),
+            I::I32Sub,
+            I::LocalTee(n),
+            I::GlobalSet(globals::SP),
+            I::LocalGet(n),
+        ]);
+    }
+    for i in 0..n {
+        ins.push(I::LocalGet(i));
+    }
+    ins.push(I::Call(index));
+    if sret_size == 0 && !results.is_empty() {
+        ins.push(I::LocalSet(tmp_start));
+    }
+    ins.push(I::Call(h.flush));
+    if sret_size > 0 {
+        for c in 0..comps as u32 {
+            ins.extend([I::LocalGet(n), I::F32Load(mem(4 * c, 2))]);
+        }
+        ins.extend([I::LocalGet(n), I::I32Const(sret_size), I::I32Add, I::GlobalSet(globals::SP)]);
+    } else if !results.is_empty() {
+        ins.push(I::LocalGet(tmp_start));
+    }
+    ins.push(I::End);
+    let mut fun = Function::new(locals.iter().map(|t| (1, *t)));
+    for i in &ins {
+        fun.instruction(i);
+    }
+    Ok((params, results, fun))
+}

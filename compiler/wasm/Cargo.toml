@@ -1,0 +1,16 @@
+[package]
+name = "wrela-wasm"
+description = "The WASM back end: strict floats, integer overflow traps, the command stream writer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+wrela-ir.workspace = true
+wrela-abi.workspace = true
+wasm-encoder = "0.261"
+wasmparser = "0.261"
+
+[lints]
+workspace = true

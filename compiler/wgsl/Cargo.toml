@@ -1,0 +1,14 @@
+[package]
+name = "wrela-wgsl"
+description = "The WGSL back end: IR to naga IR, validated, written as WGSL"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+wrela-ir.workspace = true
+naga = { version = "30", features = ["wgsl-out", "wgsl-in"] }
+
+[lints]
+workspace = true

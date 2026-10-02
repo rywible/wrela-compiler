@@ -10,6 +10,11 @@ publish.workspace = true
 wrela-diag.workspace = true
 wrela-syntax.workspace = true
 wrela-sema.workspace = true
+wrela-ir.workspace = true
+wrela-lower.workspace = true
+wrela-wasm.workspace = true
+wrela-wgsl.workspace = true
+wrela-abi.workspace = true
 
 [lints]
 workspace = true

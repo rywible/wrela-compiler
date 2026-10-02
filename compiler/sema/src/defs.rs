@@ -32,7 +32,7 @@ pub struct Binding {
     pub imported: bool,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Module {
     /// `["shapes", "blob"]`; std modules start with `"std"`.
     pub path: Vec<String>,

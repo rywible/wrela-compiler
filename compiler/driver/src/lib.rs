@@ -1,7 +1,10 @@
 //! The compiler's driver: loads a package, then checks and builds it through queries.
 
+pub mod build;
 pub mod package;
 pub mod query;
+
+pub use build::{BuildOutput, BuildPackage, LowerPackage};
 
 use package::{LayoutError, PackageFile};
 use query::{Db, Input, Query};
@@ -207,5 +210,24 @@ impl Compiler {
 
     pub fn check(&self) -> Shared<CheckOutput> {
         self.db.get::<CheckPackage>(&())
+    }
+
+    /// Every diagnostic: checking's, then lowering's (effects per instantiation, GPU rules).
+    pub fn diagnostics(&self) -> (Shared<CheckOutput>, Vec<Diagnostic>) {
+        let check = self.check();
+        let mut all = check.diagnostics.clone();
+        if !check.has_errors() {
+            all.extend(self.db.get::<LowerPackage>(&()).diagnostics.iter().cloned());
+        }
+        sort_and_dedup(&mut all);
+        (check, all)
+    }
+
+    /// Builds the package: diagnostics, and the files when there were no errors.
+    pub fn build(&self) -> (Shared<CheckOutput>, Vec<Diagnostic>, Shared<BuildOutput>) {
+        let (check, mut diags) = self.diagnostics();
+        let out = self.db.get::<BuildPackage>(&());
+        diags.extend(out.diagnostics.iter().cloned());
+        (check, diags, out)
     }
 }

@@ -5,7 +5,7 @@ use crate::defs::*;
 use crate::ty::*;
 use std::collections::{HashMap, HashSet};
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Program {
     pub types: Types,
     pub modules: Vec<Module>,

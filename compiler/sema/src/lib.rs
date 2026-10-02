@@ -28,7 +28,7 @@ pub const STD_SOURCES: &[(&str, &str)] = &[
 ];
 
 /// A checked program: its definitions, every function body's typed tree, and every constant.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Checked {
     pub program: Program,
     pub bodies: BTreeMap<ty::FnId, thir::Body>,

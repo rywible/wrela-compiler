@@ -7,6 +7,10 @@ members = [
     "compiler/sema",
     "compiler/driver",
     "compiler/cli",
+    "compiler/ir",
+    "compiler/lower",
+    "compiler/wasm",
+    "compiler/wgsl",
     "runtime/abi",
     "runtime/native",
 ]
@@ -23,6 +27,10 @@ wrela-syntax = { path = "compiler/syntax" }
 wrela-sema = { path = "compiler/sema" }
 wrela-driver = { path = "compiler/driver" }
 wrela-abi = { path = "runtime/abi" }
+wrela-ir = { path = "compiler/ir" }
+wrela-lower = { path = "compiler/lower" }
+wrela-wasm = { path = "compiler/wasm" }
+wrela-wgsl = { path = "compiler/wgsl" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

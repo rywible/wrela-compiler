@@ -152,7 +152,7 @@ pub enum TyKind {
 }
 
 /// The type interner. Also caches the common types.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Types {
     kinds: Vec<TyKind>,
     map: HashMap<TyKind, TyId>,

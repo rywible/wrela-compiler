@@ -15,7 +15,7 @@ use std::process::ExitCode;
 mod build;
 mod fmt;
 
-fn usage() -> ExitCode {
+pub(crate) fn usage() -> ExitCode {
     eprintln!(
         "usage:\n  wrela check <package-dir> [--json]\n  wrela build <package-dir> [-o <out-dir>] [--json]\n  wrela fmt <file-or-dir>... [--check]"
     );
@@ -62,6 +62,11 @@ fn check(dir: &Path, json: bool) -> ExitCode {
         return ExitCode::from(2);
     }
     let compiler = wrela_driver::Compiler::new(dir);
-    let out = compiler.check();
+    let (check, diagnostics) = compiler.diagnostics();
+    let mut sources = wrela_diag::SourceMap::new();
+    for (_, f) in check.sources.files() {
+        sources.add(f.name.clone(), f.text.clone());
+    }
+    let out = wrela_driver::CheckOutput { sources, diagnostics, checked: None };
     if report(&out, json) { ExitCode::from(1) } else { ExitCode::SUCCESS }
 }
