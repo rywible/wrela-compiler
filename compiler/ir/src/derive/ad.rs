@@ -190,7 +190,22 @@ pub(super) fn derive(
     nf.body = Vec::new();
     let id = m.add_function(Function::new(nf.name.clone(), Vec::new(), None));
     cache.ad.insert((f, mask, n), id);
-    let mut b = Ad { m, cache, f: &func, nf, act, n, tparam, tlocal, tv: HashMap::new(), returns };
+    let mut b = Ad {
+        m,
+        cache,
+        f: &func,
+        nf,
+        act,
+        n,
+        tparam,
+        tlocal,
+        tv: HashMap::new(),
+        returns,
+        recips: HashMap::new(),
+        made: Vec::new(),
+        loads: Vec::new(),
+        same: HashMap::new(),
+    };
     let body = b.block(&func.body)?;
     let mut nf = b.nf;
     nf.body = body;
@@ -210,18 +225,34 @@ struct Ad<'a> {
     /// Each active value's tangents (`None`: structurally zero).
     tv: HashMap<ValueId, Vec<Option<ValueId>>>,
     returns: bool,
+    /// Reciprocals made while differentiating one statement, shared by its `n` directions:
+    /// one division and `n` multiplications instead of `n` divisions.
+    recips: HashMap<ValueId, ValueId>,
+    /// The expressions made while differentiating one statement, so what its directions share
+    /// (`2v` for a square root, a clamp's masks) is made once.
+    made: Vec<(TypeId, Expr, ValueId)>,
+    /// Loads since the last write or block boundary, by place, and each load's earlier twin:
+    /// `x * x` and `dot(v, v)` then get the derivative of a square.
+    loads: Vec<(Place, ValueId)>,
+    same: HashMap<ValueId, ValueId>,
 }
 
 impl Ad<'_> {
-    fn new(&mut self, out: &mut Block, ty: TypeId, e: Expr) -> ValueId {
+    fn emit(&mut self, out: &mut Block, ty: TypeId, e: Expr) -> ValueId {
+        if let Some((_, _, v)) = self.made.iter().find(|(t, x, _)| *t == ty && *x == e) {
+            return *v;
+        }
         let v = self.nf.new_value(ty);
-        out.push(Stmt::Let(v, e));
+        out.push(Stmt::Let(v, e.clone()));
+        if !matches!(e, Expr::Call(..) | Expr::Host(..)) {
+            self.made.push((ty, e, v));
+        }
         v
     }
 
     fn f32c(&mut self, out: &mut Block, x: f32) -> ValueId {
         let t = self.m.types.f32();
-        self.new(out, t, Expr::Const(Const::F32(x)))
+        self.emit(out, t, Expr::Const(Const::F32(x)))
     }
 
     fn ty(&self, v: ValueId) -> TypeId {
@@ -235,17 +266,33 @@ impl Ad<'_> {
     /// `x` as type `to`: a scalar is splatted to a vector.
     fn coerce(&mut self, out: &mut Block, x: ValueId, to: TypeId) -> ValueId {
         match (self.m.types.get(self.ty(x)).clone(), self.m.types.get(to).clone()) {
-            (TypeDef::Scalar(_), TypeDef::Vector(n)) => self.new(out, to, Expr::Splat(x, n)),
+            (TypeDef::Scalar(_), TypeDef::Vector(n)) => self.emit(out, to, Expr::Splat(x, n)),
             _ => x,
         }
     }
 
     fn bin(&mut self, out: &mut Block, op: BinOp, a: ValueId, b: ValueId, ty: TypeId) -> ValueId {
-        self.new(out, ty, Expr::Binary(op, a, b))
+        self.emit(out, ty, Expr::Binary(op, a, b))
+    }
+
+    /// `x / d` as `x × (1 / d)`, with `1 / d` made once per statement.
+    fn div(&mut self, out: &mut Block, x: ValueId, d: ValueId, ty: TypeId) -> ValueId {
+        let r = match self.recips.get(&d) {
+            Some(&r) => r,
+            None => {
+                let dt = self.ty(d);
+                let one = self.f32c(out, 1.0);
+                let one = self.coerce(out, one, dt);
+                let r = self.bin(out, BinOp::Div, one, d, dt);
+                self.recips.insert(d, r);
+                r
+            }
+        };
+        self.bin(out, BinOp::Mul, x, r, ty)
     }
 
     fn builtin(&mut self, out: &mut Block, b: Builtin, args: Vec<ValueId>, ty: TypeId) -> ValueId {
-        self.new(out, ty, Expr::Builtin(b, args))
+        self.emit(out, ty, Expr::Builtin(b, args))
     }
 
     /// `x + y` where either may be zero.
@@ -275,7 +322,7 @@ impl Ad<'_> {
             (Some(a), None) => Some(self.coerce(out, a, ty)),
             (None, Some(b)) => {
                 let b = self.coerce(out, b, ty);
-                Some(self.new(out, ty, Expr::Unary(UnOp::Neg, b)))
+                Some(self.emit(out, ty, Expr::Unary(UnOp::Neg, b)))
             }
             (Some(a), Some(b)) => Some(self.bin(out, BinOp::Sub, a, b, ty)),
         }
@@ -308,7 +355,7 @@ impl Ad<'_> {
     }
 
     fn zero(&mut self, out: &mut Block, ty: TypeId) -> ValueId {
-        self.new(out, ty, Expr::Zero(ty))
+        self.emit(out, ty, Expr::Zero(ty))
     }
 
     fn block(&mut self, b: &Block) -> Result<Block, String> {
@@ -319,7 +366,34 @@ impl Ad<'_> {
         Ok(out)
     }
 
+    fn same_value(&self, a: ValueId, b: ValueId) -> bool {
+        let c = |v: ValueId| self.same.get(&v).copied().unwrap_or(v);
+        c(a) == c(b)
+    }
+
     fn stmt(&mut self, s: &Stmt, out: &mut Block) -> Result<(), String> {
+        // What one statement shares among its directions stays within it.
+        self.made.clear();
+        self.recips.clear();
+        match s {
+            Stmt::Let(v, Expr::Load(p)) => match self.loads.iter().find(|(q, _)| q == p) {
+                Some(&(_, w)) => {
+                    self.same.insert(*v, w);
+                }
+                None => self.loads.push((p.clone(), *v)),
+            },
+            Stmt::Let(_, Expr::Call(..)) | Stmt::Eval(_) | Stmt::Store(..) => self.loads.clear(),
+            Stmt::If { .. } | Stmt::Loop { .. } => self.loads.clear(),
+            _ => {}
+        }
+        let r = self.stmt_inner(s, out);
+        if matches!(s, Stmt::If { .. } | Stmt::Loop { .. }) {
+            self.loads.clear();
+        }
+        r
+    }
+
+    fn stmt_inner(&mut self, s: &Stmt, out: &mut Block) -> Result<(), String> {
         match s {
             Stmt::Let(v, Expr::Call(g, args)) => self.call(Some(*v), *g, args, out),
             Stmt::Eval(Expr::Call(g, args)) => self.call(None, *g, args, out),
@@ -372,7 +446,7 @@ impl Ad<'_> {
                     parts.push(t);
                 }
                 let dual = self.nf.ret.ok_or("internal")?;
-                let d = self.new(out, dual, Expr::Construct(dual, parts));
+                let d = self.emit(out, dual, Expr::Construct(dual, parts));
                 out.push(Stmt::Return(Some(d)));
                 Ok(())
             }
@@ -422,12 +496,12 @@ impl Ad<'_> {
         match (v, returns) {
             (Some(v), true) => {
                 let dual = self.m.functions[dg.index()].ret.ok_or("internal")?;
-                let r = self.new(out, dual, Expr::Call(dg, new_args));
+                let r = self.emit(out, dual, Expr::Call(dg, new_args));
                 out.push(Stmt::Let(v, Expr::Extract(r, 0)));
                 let ty = self.ty(v);
                 let mut ts = Vec::new();
                 for k in 0..self.n as usize {
-                    ts.push(Some(self.new(out, ty, Expr::Extract(r, 1 + k as u32))));
+                    ts.push(Some(self.emit(out, ty, Expr::Extract(r, 1 + k as u32))));
                 }
                 self.tv.insert(v, ts);
             }
@@ -452,20 +526,19 @@ impl Ad<'_> {
         let t = |s: &Self, x: &ValueId| s.t(*x, k);
         Ok(match e {
             Expr::Const(_) | Expr::Zero(_) | Expr::EntryInput(_) | Expr::Bitcast(..) => None,
-            Expr::Param(i) => match self.tparam[*i as usize].get(k) {
-                Some(&p) => Some(self.new(out, ty, Expr::Param(p))),
-                None => None,
-            },
+            Expr::Param(i) => {
+                self.tparam[*i as usize].get(k).copied().map(|p| self.emit(out, ty, Expr::Param(p)))
+            }
             Expr::Load(p) => {
                 if place_root_active(&self.act, p) && !matches!(p.root, PlaceRoot::Resource(_)) {
                     let tp = self.place(p, k)?;
-                    Some(self.new(out, ty, Expr::Load(tp)))
+                    Some(self.emit(out, ty, Expr::Load(tp)))
                 } else {
                     None
                 }
             }
             Expr::Unary(UnOp::Neg, x) => {
-                t(self, x).map(|dx| self.new(out, ty, Expr::Unary(UnOp::Neg, dx)))
+                t(self, x).map(|dx| self.emit(out, ty, Expr::Unary(UnOp::Neg, dx)))
             }
             Expr::Unary(UnOp::Not, _) => None,
             Expr::Binary(op, a, b) => {
@@ -473,6 +546,14 @@ impl Ad<'_> {
                 match op {
                     BinOp::Add => self.add(out, da, db, ty),
                     BinOp::Sub => self.sub(out, da, db, ty),
+                    BinOp::Mul if self.same_value(*a, *b) => {
+                        // d(a²) = 2 a da
+                        da.map(|da| {
+                            let two = self.f32c(out, 2.0);
+                            let t = self.bin(out, BinOp::Mul, *a, two, ty);
+                            self.bin(out, BinOp::Mul, da, t, ty)
+                        })
+                    }
                     BinOp::Mul => {
                         let x = self.mul(out, da, *b, ty);
                         let y = db.map(|db| self.bin(out, BinOp::Mul, *a, db, ty));
@@ -482,7 +563,7 @@ impl Ad<'_> {
                         // (da - v db) / b
                         let vdb = db.map(|db| self.bin(out, BinOp::Mul, v, db, ty));
                         let num = self.sub(out, da, vdb, ty);
-                        num.map(|n| self.bin(out, BinOp::Div, n, *b, ty))
+                        num.map(|n| self.div(out, n, *b, ty))
                     }
                     BinOp::Rem => {
                         // a - b trunc(a / b): da - db trunc(a / b)
@@ -508,22 +589,22 @@ impl Ad<'_> {
                             None => self.zero(out, pty),
                         });
                     }
-                    Some(self.new(out, *cty, Expr::Construct(*cty, comps)))
+                    Some(self.emit(out, *cty, Expr::Construct(*cty, comps)))
                 }
             }
-            Expr::Extract(x, i) => t(self, x).map(|dx| self.new(out, ty, Expr::Extract(dx, *i))),
+            Expr::Extract(x, i) => t(self, x).map(|dx| self.emit(out, ty, Expr::Extract(dx, *i))),
             Expr::ExtractDyn(x, i) => {
-                t(self, x).map(|dx| self.new(out, ty, Expr::ExtractDyn(dx, *i)))
+                t(self, x).map(|dx| self.emit(out, ty, Expr::ExtractDyn(dx, *i)))
             }
-            Expr::Splat(x, n) => t(self, x).map(|dx| self.new(out, ty, Expr::Splat(dx, *n))),
+            Expr::Splat(x, n) => t(self, x).map(|dx| self.emit(out, ty, Expr::Splat(dx, *n))),
             Expr::Swizzle(x, c) => {
-                t(self, x).map(|dx| self.new(out, ty, Expr::Swizzle(dx, c.clone())))
+                t(self, x).map(|dx| self.emit(out, ty, Expr::Swizzle(dx, c.clone())))
             }
             Expr::Convert(x, s) => {
                 if s.is_float()
                     && self.m.types.element_scalar(self.ty(*x)).is_some_and(|s| s.is_float())
                 {
-                    t(self, x).map(|dx| self.new(out, ty, Expr::Convert(dx, *s)))
+                    t(self, x).map(|dx| self.emit(out, ty, Expr::Convert(dx, *s)))
                 } else {
                     None
                 }
@@ -541,7 +622,11 @@ impl Ad<'_> {
                         Some(x) => self.coerce(out, x, ty),
                         None => self.zero(out, ty),
                     };
-                    Some(self.new(out, ty, Expr::Select { cond: *cond, if_true: dt, if_false: df }))
+                    Some(self.emit(
+                        out,
+                        ty,
+                        Expr::Select { cond: *cond, if_true: dt, if_false: df },
+                    ))
                 }
             }
             Expr::Call(..) => unreachable!("calls are handled in `call`"),
@@ -575,7 +660,7 @@ impl Ad<'_> {
             B::Sqrt => d[0].map(|da| {
                 let two = self.f32c(out, 2.0);
                 let den = self.bin(out, BinOp::Mul, v, two, ty);
-                self.bin(out, BinOp::Div, da, den, ty)
+                self.div(out, da, den, ty)
             }),
             B::InverseSqrt => d[0].map(|da| {
                 let h = self.f32c(out, -0.5);
@@ -590,7 +675,7 @@ impl Ad<'_> {
             }),
             B::Cos => d[0].map(|da| {
                 let s = self.builtin(out, B::Sin, vec![a0], ty);
-                let ns = self.new(out, ty, Expr::Unary(UnOp::Neg, s));
+                let ns = self.emit(out, ty, Expr::Unary(UnOp::Neg, s));
                 self.bin(out, BinOp::Mul, da, ns, ty)
             }),
             B::Tan => d[0].map(|da| {
@@ -604,14 +689,14 @@ impl Ad<'_> {
                 let a2 = self.bin(out, BinOp::Mul, a0, a0, ty);
                 let s = self.bin(out, BinOp::Sub, one, a2, ty);
                 let r = self.builtin(out, B::Sqrt, vec![s], ty);
-                let q = self.bin(out, BinOp::Div, da, r, ty);
-                if b == B::Acos { self.new(out, ty, Expr::Unary(UnOp::Neg, q)) } else { q }
+                let q = self.div(out, da, r, ty);
+                if b == B::Acos { self.emit(out, ty, Expr::Unary(UnOp::Neg, q)) } else { q }
             }),
             B::Atan => d[0].map(|da| {
                 let one = self.f32c(out, 1.0);
                 let a2 = self.bin(out, BinOp::Mul, a0, a0, ty);
                 let s = self.bin(out, BinOp::Add, a2, one, ty);
-                self.bin(out, BinOp::Div, da, s, ty)
+                self.div(out, da, s, ty)
             }),
             B::Atan2 => {
                 // (x dy - y dx) / (x² + y²), with y = args[0], x = args[1].
@@ -623,7 +708,7 @@ impl Ad<'_> {
                     let x2 = self.bin(out, BinOp::Mul, x, x, ty);
                     let y2 = self.bin(out, BinOp::Mul, y, y, ty);
                     let den = self.bin(out, BinOp::Add, x2, y2, ty);
-                    self.bin(out, BinOp::Div, n, den, ty)
+                    self.div(out, n, den, ty)
                 })
             }
             B::Exp => d[0].map(|da| self.bin(out, BinOp::Mul, da, v, ty)),
@@ -632,18 +717,18 @@ impl Ad<'_> {
                 let f = self.bin(out, BinOp::Mul, v, c, ty);
                 self.bin(out, BinOp::Mul, da, f, ty)
             }),
-            B::Log => d[0].map(|da| self.bin(out, BinOp::Div, da, a0, ty)),
+            B::Log => d[0].map(|da| self.div(out, da, a0, ty)),
             B::Log2 => d[0].map(|da| {
                 let c = self.f32c(out, ln2);
                 let den = self.bin(out, BinOp::Mul, a0, c, ty);
-                self.bin(out, BinOp::Div, da, den, ty)
+                self.div(out, da, den, ty)
             }),
             B::Pow => {
                 // v (db log a + b da / a)
                 let (a, bb) = (args[0], args[1]);
                 let x = d[0].map(|da| {
                     let t1 = self.bin(out, BinOp::Mul, da, bb, ty);
-                    let t2 = self.bin(out, BinOp::Div, t1, a, ty);
+                    let t2 = self.div(out, t1, a, ty);
                     self.bin(out, BinOp::Mul, t2, v, ty)
                 });
                 let y = d[1].map(|db| {
@@ -657,6 +742,25 @@ impl Ad<'_> {
                 let s = self.builtin(out, B::Sign, vec![a0], ty);
                 self.bin(out, BinOp::Mul, da, s, ty)
             }),
+            B::Min | B::Max if self.m.types.as_scalar(ty).is_some() => {
+                // A scalar: pick the taken argument's tangent (the first's, on a tie).
+                if d[0].is_none() && d[1].is_none() {
+                    return Ok(None);
+                }
+                let (a, bb) = (args[0], args[1]);
+                let bt = self.m.types.bool();
+                let op = if b == B::Min { BinOp::Le } else { BinOp::Ge };
+                let first = self.emit(out, bt, Expr::Binary(op, a, bb));
+                let x = match d[0] {
+                    Some(t) => t,
+                    None => self.zero(out, ty),
+                };
+                let y = match d[1] {
+                    Some(t) => t,
+                    None => self.zero(out, ty),
+                };
+                Some(self.emit(out, ty, Expr::Select { cond: first, if_true: x, if_false: y }))
+            }
             B::Min | B::Max => {
                 // m picks the argument that's taken (the first, on a tie).
                 let (a, bb) = (args[0], args[1]);
@@ -722,7 +826,7 @@ impl Ad<'_> {
                 let n1 = self.sub(out, d[2], d[0], ty);
                 let num = self.sub(out, n1, ude, ty);
                 num.map(|num| {
-                    let du = self.bin(out, BinOp::Div, num, w, ty);
+                    let du = self.div(out, num, w, ty);
                     let zero = self.zero(out, ty);
                     let one = self.f32c(out, 1.0);
                     let onev = self.coerce(out, one, ty);
@@ -737,7 +841,7 @@ impl Ad<'_> {
             B::Length => d[0].map(|dx| {
                 if matches!(self.m.types.get(a0ty), TypeDef::Vector(_)) {
                     let dot = self.builtin(out, B::Dot, vec![a0, dx], ty);
-                    self.bin(out, BinOp::Div, dot, v, ty)
+                    self.div(out, dot, v, ty)
                 } else {
                     let s = self.builtin(out, B::Sign, vec![a0], ty);
                     self.bin(out, BinOp::Mul, dx, s, ty)
@@ -749,13 +853,19 @@ impl Ad<'_> {
                     let diff = self.bin(out, BinOp::Sub, args[0], args[1], a0ty);
                     if matches!(self.m.types.get(a0ty), TypeDef::Vector(_)) {
                         let dot = self.builtin(out, B::Dot, vec![diff, dd], ty);
-                        self.bin(out, BinOp::Div, dot, v, ty)
+                        self.div(out, dot, v, ty)
                     } else {
                         let s = self.builtin(out, B::Sign, vec![diff], ty);
                         self.bin(out, BinOp::Mul, dd, s, ty)
                     }
                 })
             }
+            B::Dot if self.same_value(args[0], args[1]) => d[0].map(|da| {
+                // d(v·v) = 2 v·dv
+                let dot = self.builtin(out, B::Dot, vec![a0, da], ty);
+                let two = self.f32c(out, 2.0);
+                self.bin(out, BinOp::Mul, dot, two, ty)
+            }),
             B::Dot => {
                 let x = d[0].map(|da| self.builtin(out, B::Dot, vec![da, args[1]], ty));
                 let y = d[1].map(|db| self.builtin(out, B::Dot, vec![args[0], db], ty));
@@ -773,7 +883,7 @@ impl Ad<'_> {
                 let ndx = self.builtin(out, B::Dot, vec![v, dx], f32);
                 let proj = self.bin(out, BinOp::Mul, v, ndx, ty);
                 let num = self.bin(out, BinOp::Sub, dx, proj, ty);
-                self.bin(out, BinOp::Div, num, len, ty)
+                self.div(out, num, len, ty)
             }),
         })
     }

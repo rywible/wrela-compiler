@@ -68,12 +68,17 @@ struct State<E> {
     /// The typed error behind the most recent trap raised by `submit`, so the caller gets it
     /// rather than wasmtime's flattened message.
     failure: Option<Error>,
+    /// Copies of the submitted batches, when recording.
+    batches: Option<Vec<Vec<u8>>>,
 }
 
 impl<E: Executor> State<E> {
     fn submit(&mut self, batch: &[u8]) -> Result<()> {
         // The state hash covers every submitted byte, valid or not.
         self.hash.update(batch);
+        if let Some(b) = &mut self.batches {
+            b.push(batch.to_vec());
+        }
         for cmd in stream::decode(batch)? {
             self.sequencer.step(&cmd)?;
             self.checker.check(&cmd)?;
@@ -187,6 +192,7 @@ impl<E: Executor> Program<E> {
             hash: StateHash::new(),
             sequencer: Sequencer::new(),
             failure: None,
+            batches: None,
         };
         let mut store = Store::new(&compiled.engine, state);
         let instance = linker
@@ -258,6 +264,14 @@ impl<E: Executor> Program<E> {
     /// FNV-1a 64 of every byte submitted since the program loaded.
     pub(crate) fn hash(&self) -> StateHash {
         self.store.data().hash
+    }
+
+    pub(crate) fn record_batches(&mut self) {
+        self.store.data_mut().batches = Some(Vec::new());
+    }
+
+    pub(crate) fn take_batches(&mut self) -> Vec<Vec<u8>> {
+        self.store.data_mut().batches.as_mut().map(std::mem::take).unwrap_or_default()
     }
 
     pub(crate) fn executor(&mut self) -> &mut E {

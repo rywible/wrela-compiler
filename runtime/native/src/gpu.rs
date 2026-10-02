@@ -453,7 +453,7 @@ impl Gpu {
     }
 
     /// Submits everything recorded so far, after writing its uniform bytes.
-    fn flush(&mut self) -> Result<()> {
+    pub(crate) fn flush(&mut self) -> Result<()> {
         let Some(encoder) = self.encoder.take() else {
             debug_assert!(self.ring.staging.is_empty());
             return Ok(());

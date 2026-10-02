@@ -528,7 +528,9 @@ impl<'a, 'm> Fb<'a, 'm> {
                 self.expr(Expression::GlobalVariable(g), block)
             }
             ir::PlaceRoot::Ptr(_) => {
-                return Err("projections returned from functions aren't supported on the GPU".into());
+                return Err(
+                    "projections returned from functions aren't supported on the GPU".into()
+                );
             }
         };
         for proj in &p.path {
@@ -618,7 +620,12 @@ impl<'a, 'm> Fb<'a, 'm> {
             }
             ir::Stmt::Trap => {
                 // GPU code can't trap; an unreachable point returns a zero.
-                let value = self.func.result.as_ref().map(|r| r.ty).map(|t| self.expr(Expression::ZeroValue(t), out));
+                let value = self
+                    .func
+                    .result
+                    .as_ref()
+                    .map(|r| r.ty)
+                    .map(|t| self.expr(Expression::ZeroValue(t), out));
                 out.push(Statement::Return { value }, Span::UNDEFINED);
             }
         }

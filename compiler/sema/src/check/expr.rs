@@ -122,9 +122,14 @@ impl<'p> Checker<'p> {
                         0
                     }
                 };
-                if !crate::traits::implements_builtin(self.p, v.ty, Lang::Copy)
-                    && !matches!(self.kind(v.ty), TyKind::Var(_))
-                {
+                let vt = self.infer.resolve(&mut self.p.types, v.ty);
+                if self.p.types.has_vars(vt) {
+                    // Decided once inference is done.
+                    if let Some(copy) = self.p.lang_trait(Lang::Copy) {
+                        let r = crate::defs::TraitRef { trait_: copy, args: Vec::new() };
+                        self.obligation(vt, r, v.span, "`[x; n]`, which copies `x`,".into());
+                    }
+                } else if !crate::traits::implements_builtin(self.p, vt, Lang::Copy) {
                     let shown = self.display(v.ty);
                     self.err(Diagnostic::new(
                         codes::E0514,

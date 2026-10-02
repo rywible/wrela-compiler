@@ -1035,8 +1035,8 @@ pub(super) fn host(
             put(fe, a, 0, I::I32Const(opc as i32));
             put(fe, a, 4, I::I32Const(payload as i32));
             put(fe, a, 8, I::I32Const(*pipeline as i32));
-            for k in 0..(fixed as usize - 1) {
-                put(fe, a, 12 + 4 * k as u32, I::LocalGet(fe.v(args[k])));
+            for (k, x) in args.iter().take(fixed as usize - 1).enumerate() {
+                put(fe, a, 12 + 4 * k as u32, I::LocalGet(fe.v(*x)));
             }
             let mut off = 8 + 4 * fixed;
             put(fe, a, off, I::I32Const(nb as i32));

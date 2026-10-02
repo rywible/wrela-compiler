@@ -261,7 +261,8 @@ fn times_dispatches_and_passes_with_timestamps() {
         vec![e.finish()]
     };
     let frames: Vec<_> = (0..5).map(frame).collect();
-    let mut host = store_host("timestamps", &frames, &Options { timestamps: true });
+    let mut host =
+        store_host("timestamps", &frames, &Options { timestamps: true, ..Options::default() });
     let run = host.run_frames(&[0.0; 5], 64, 64).expect("runs");
     assert_eq!(run.timings.len(), 15, "{:?}", run.timings);
     for (i, t) in run.timings.iter().enumerate() {
@@ -281,8 +282,11 @@ fn times_more_passes_than_one_query_set_holds() {
     for i in 0..300 {
         e.dispatch(0, [1, 1, 1], &[1], &words(&[i, i, 0, 0]));
     }
-    let mut host =
-        store_host("many-timestamps", &[vec![e.finish()]], &Options { timestamps: true });
+    let mut host = store_host(
+        "many-timestamps",
+        &[vec![e.finish()]],
+        &Options { timestamps: true, ..Options::default() },
+    );
     let run = host.run_frames(&[0.0], 4, 4).expect("runs");
     assert_eq!(run.timings.len(), 300);
     assert!(

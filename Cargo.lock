@@ -2022,6 +2022,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "wrela-tests"
+version = "0.1.0"
+dependencies = [
+ "pollster",
+ "wgpu",
+ "wrela-abi",
+ "wrela-diag",
+ "wrela-driver",
+ "wrela-host",
+]
+
+[[package]]
 name = "wrela-wasm"
 version = "0.1.0"
 dependencies = [

@@ -11,6 +11,7 @@ members = [
     "compiler/lower",
     "compiler/wasm",
     "compiler/wgsl",
+    "compiler/tests",
     "runtime/abi",
     "runtime/native",
 ]
@@ -27,6 +28,7 @@ wrela-syntax = { path = "compiler/syntax" }
 wrela-sema = { path = "compiler/sema" }
 wrela-driver = { path = "compiler/driver" }
 wrela-abi = { path = "runtime/abi" }
+wrela-host = { path = "runtime/native" }
 wrela-ir = { path = "compiler/ir" }
 wrela-lower = { path = "compiler/lower" }
 wrela-wasm = { path = "compiler/wasm" }

@@ -1,0 +1,273 @@
+// Sketch 01's grazer in tier-0 wrela (no units, facts or channels): AC2's subject.
+//
+// Spike 01 (design-archive-2026-10, spikes/01-grazer) wrote this creature by hand, as WGSL and
+// JavaScript. Here it's written once, as a field, and the compiler derives the rest. Two parts:
+//
+// - `params(seed)` is the spike's `makeGrazer` (grazer.js): the skeleton, the per-individual
+//   numbers, and their layout as the spike's `Grazer` uniform. It computes in f64, as
+//   JavaScript does, so the numbers are the same bits; the test checks them against the
+//   spike's own params-seed1.f32.
+// - `Grazer` is the field (spike 01's field.wgsl, `grazer_d`): twenty parts smooth-unioned in a
+//   fixed order, built from those numbers. Its structure is its type; the numbers are data.
+use std::field::{Displace, Ellipsoid, Fbm, HalfSpace, Intersect, RoundCone, SmoothUnion, Surface, Translate, ellipsoid, fbm, half_space, round_cone, smin}
+
+/// The spike's `Grazer` uniform: 8 header floats, then 20 parts of 16.
+pub const PARAM_FLOATS: u32 = 328
+
+const HEADER: u32 = 8
+const PART: u32 = 16
+const TORSO: u32 = 0
+const NECK: u32 = 1
+const HEAD: u32 = 2
+const TAIL: u32 = 3
+const LEG0: u32 = 4
+const HOOF0: u32 = 16
+
+// ---- the spike's makeGrazer, in f64 ------------------------------------------------------------
+/// A point in f64 (vectors are f32), for the same bits as JavaScript's numbers.
+pub struct P3: Copy + Clone {
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+}
+
+pub fn p3(x: f64, y: f64, z: f64) -> P3 {
+    P3 { x, y, z }
+}
+
+fn add(a: P3, b: P3) -> P3 {
+    P3 { x: a.x + b.x, y: a.y + b.y, z: a.z + b.z }
+}
+
+fn scl(a: P3, s: f64) -> P3 {
+    P3 { x: a.x * s, y: a.y * s, z: a.z * s }
+}
+
+/// mulberry32, the spike's `rng`.
+struct Rng {
+    state: u32,
+}
+
+impl Rng {
+    fn next(mut self) -> f64 {
+        self.state = self.state.wrapping_add(0x6d2b79f5)
+        var t = self.state
+        t = (t ^ (t >> 15)).wrapping_mul(t | 1)
+        t = t ^ t.wrapping_add((t ^ (t >> 7)).wrapping_mul(t | 61))
+        f64(t ^ (t >> 14)) / 4294967296.0
+    }
+}
+
+/// The rest skeleton at scale 1, in metres: +y up, +z forward. 29 joints.
+fn rest_skeleton() -> [P3; 29] {
+    var j = [p3(0.0, 0.0, 0.0); 29]
+    j[0] = p3(0.0, 1.30, 0.0)
+    j[1] = p3(0.0, 1.30, 1.0)
+    let neck_base = p3(0.0, 1.50, 1.55)
+    let neck_span = p3(0.0, 0.55, 0.45)
+    for i in 0..4 {
+        j[2 + i] = add(neck_base, scl(neck_span, f64(i) / 4.0))
+    }
+    j[6] = add(add(neck_base, neck_span), p3(0.0, 0.0, 0.12))
+    let tail_base = p3(0.0, 1.45, -0.40)
+    let tail_span = p3(0.0, -0.55, -0.45)
+    for i in 0..6 {
+        j[7 + i] = add(tail_base, scl(tail_span, f64(i) / 6.0))
+    }
+    let fore = [p3(0.0, -0.45, -0.04), p3(0.0, -0.42, 0.03), p3(0.0, -0.20, 0.02)]
+    let hind = [p3(0.0, -0.50, 0.10), p3(0.0, -0.45, -0.12), p3(0.0, -0.22, 0.0)]
+    let hips = [p3(0.25, 1.15, 1.25), p3(-0.25, 1.15, 1.25), p3(0.25, 1.25, 0.05), p3(-0.25, 1.25, 0.05)]
+    for l in 0..4 {
+        var p = hips[l]
+        j[13 + l * 4] = p
+        for k in 0..3 {
+            p = add(p, if l < 2 { fore[k] } else { hind[k] })
+            j[14 + l * 4 + k] = p
+        }
+    }
+    j
+}
+
+fn set3(a: mut [f32; 328], at: u32, v: P3, w: f64) {
+    a[at] = f32(v.x)
+    a[at + 1] = f32(v.y)
+    a[at + 2] = f32(v.z)
+    a[at + 3] = f32(w)
+}
+
+/// One individual's numbers, laid out as the spike's `Grazer` uniform.
+pub fn params(seed: u32) -> [f32; 328] {
+    var rng = Rng { state: seed.wrapping_mul(7919).wrapping_add(17) }
+    let bulk = 0.9 + 0.25 * rng.next()
+    let s = 0.92 + 0.16 * rng.next()
+    let rest = rest_skeleton()
+    var j = [p3(0.0, 0.0, 0.0); 29]
+    for i in 0..29 {
+        j[i] = scl(rest[i], s)
+    }
+    var a = [0.0; 328]
+    // misc: blend k, fbm amplitude, fbm frequency, fbm octaves
+    a[0] = f32(0.06 * s)
+    a[1] = 0.003
+    a[2] = 25.0
+    a[3] = 4.0
+    // seed: the noise offset, and the dapple frequency
+    let ox = 100.0 * rng.next()
+    let oy = 100.0 * rng.next()
+    let oz = 100.0 * rng.next()
+    set3(mut a, 4, p3(ox, oy, oz), 3.0)
+
+    let c = j[1]
+    let pelvis = j[0]
+    let at = |part: u32, v: u32| HEADER + part * PART + v * 4
+    let sb = s * bulk
+    set3(mut a, at(TORSO, 0), add(c, scl(p3(0.0, 0.05, -0.15), s)), 0.15 * s)
+    set3(mut a, at(TORSO, 1), scl(p3(0.42, 0.48, 0.80), sb), pelvis.z)
+    set3(mut a, at(TORSO, 2), add(c, scl(p3(0.0, 0.05, -0.85), s)), 0.0)
+    set3(mut a, at(TORSO, 3), scl(p3(0.38, 0.44, 0.50), sb), c.z)
+
+    let neck_end = add(j[2], scl(p3(0.0, 0.55, 0.45), s))
+    set3(mut a, at(NECK, 0), j[2], 0.22 * s * bulk)
+    set3(mut a, at(NECK, 1), neck_end, 0.12 * s)
+
+    let h = j[6]
+    set3(mut a, at(HEAD, 0), add(h, scl(p3(0.0, -0.04, 0.10), s)), 0.05 * s)
+    set3(mut a, at(HEAD, 1), scl(p3(0.12, 0.15, 0.24), s), 0.0)
+    set3(mut a, at(HEAD, 2), add(h, scl(p3(0.0, -0.05, 0.15), s)), 0.10 * s)
+    set3(mut a, at(HEAD, 3), add(h, scl(p3(0.0, -0.16, 0.42), s)), 0.065 * s)
+
+    set3(mut a, at(TAIL, 0), j[7], 0.07 * s)
+    set3(mut a, at(TAIL, 1), add(j[7], scl(p3(0.0, -0.55, -0.45), s)), 0.025 * s)
+
+    let top = [0.10 * bulk, 0.065, 0.048]
+    let bottom = [0.065, 0.048, 0.042]
+    for l in 0..4 {
+        let b = 13 + l * 4
+        for k in 0..3 {
+            let part = LEG0 + l * 3 + k
+            set3(mut a, at(part, 0), j[b + k], top[k] * s)
+            set3(mut a, at(part, 1), j[b + k + 1], bottom[k] * s)
+        }
+        let foot = j[b + 3]
+        set3(mut a, at(HOOF0 + l, 0), foot, 0.06 * s)
+        set3(mut a, at(HOOF0 + l, 1), add(foot, p3(0.0, -0.08 * s, 0.0)), 0.07 * s)
+        set3(mut a, at(HOOF0 + l, 2), p3(foot.y - 0.07 * s, 0.0, 0.0), 0.0)
+    }
+    a
+}
+
+/// A box in f64.
+pub struct Bounds: Copy + Clone {
+    pub lo: P3,
+    pub hi: P3,
+}
+
+fn grow(b: mut Bounds, c: P3, r: P3) {
+    b.lo = p3(min(b.lo.x, c.x - r.x), min(b.lo.y, c.y - r.y), min(b.lo.z, c.z - r.z))
+    b.hi = p3(max(b.hi.x, c.x + r.x), max(b.hi.y, c.y + r.y), max(b.hi.z, c.z + r.z))
+}
+
+fn pt(a: [f32; 328], part: u32, k: u32) -> P3 {
+    let i = HEADER + part * PART + k * 4
+    p3(f64(a[i]), f64(a[i + 1]), f64(a[i + 2]))
+}
+
+fn pad3(r: P3, d: f64) -> P3 {
+    p3(r.x + d, r.y + d, r.z + d)
+}
+
+fn grow_cone(b: mut Bounds, a: [f32; 328], part: u32, k: u32) {
+    let r = max(f64(a[HEADER + part * PART + k * 4 + 3]), f64(a[HEADER + part * PART + k * 4 + 7]))
+    grow(mut b, pt(a, part, k), p3(r, r, r))
+    grow(mut b, pt(a, part, k + 1), p3(r, r, r))
+}
+
+/// The spike's conservative rest-space bounds (grazer.js `bounds`): each part's own bounds,
+/// padded for the blend. In f64, from the f32 numbers.
+pub fn bounds(a: [f32; 328]) -> Bounds {
+    var b = Bounds { lo: p3(1e300, 1e300, 1e300), hi: p3(-1e300, -1e300, -1e300) }
+    let amp = f64(a[1]) * 1.875
+    grow(mut b, pt(a, TORSO, 0), pad3(pt(a, TORSO, 1), amp))
+    grow(mut b, pt(a, TORSO, 2), pad3(pt(a, TORSO, 3), amp))
+    grow(mut b, pt(a, HEAD, 0), pt(a, HEAD, 1))
+    grow_cone(mut b, a, HEAD, 2)
+    grow_cone(mut b, a, NECK, 0)
+    grow_cone(mut b, a, TAIL, 0)
+    for i in LEG0..HOOF0 + 4 {
+        grow_cone(mut b, a, i, 0)
+    }
+    let pad = f64(a[0]) * 0.25
+    Bounds { lo: pad3(b.lo, -pad), hi: pad3(b.hi, pad) }
+}
+
+// ---- the field ---------------------------------------------------------------------------------
+/// The grazer: `.blend(k)` over all twenty parts, folded in the spike's order (torso, neck, head,
+/// tail, twelve leg segments, four hooves), starting from the spike's `BIG`.
+pub struct Grazer: Copy + Clone + GpuData {
+    pub k: f32,
+    pub torso: Displace<SmoothUnion<Translate<Ellipsoid>, Translate<Ellipsoid>>, Fbm>,
+    pub neck: RoundCone,
+    pub head: SmoothUnion<Translate<Ellipsoid>, RoundCone>,
+    pub tail: RoundCone,
+    pub legs: [RoundCone; 12],
+    pub hooves: [Intersect<RoundCone, HalfSpace>; 4],
+}
+
+impl Surface for Grazer {
+    fn distance(self, p: vec3) -> f32 {
+        var d = smin(1000000.0, self.torso.distance(p), self.k)
+        d = smin(d, self.neck.distance(p), self.k)
+        d = smin(d, self.head.distance(p), self.k)
+        d = smin(d, self.tail.distance(p), self.k)
+        for i in 0..12 {
+            d = smin(d, self.legs[i].distance(p), self.k)
+        }
+        for i in 0..4 {
+            d = smin(d, self.hooves[i].distance(p), self.k)
+        }
+        d
+    }
+}
+
+fn v4(a: [f32; 328], part: u32, k: u32) -> vec4 {
+    let i = HEADER + part * PART + k * 4
+    vec4(a[i], a[i + 1], a[i + 2], a[i + 3])
+}
+
+/// A round cone from a part's vectors `k` and `k + 1`.
+fn cone_at(a: [f32; 328], part: u32, k: u32) -> RoundCone {
+    let x = v4(a, part, k)
+    let y = v4(a, part, k + 1)
+    round_cone(x.xyz, y.xyz, x.w, y.w)
+}
+
+fn cone(a: [f32; 328], part: u32) -> RoundCone {
+    cone_at(a, part, 0)
+}
+
+/// The field for one individual's numbers.
+pub fn grazer_from(a: [f32; 328]) -> Grazer {
+    let t0 = v4(a, TORSO, 0)
+    let t2 = v4(a, TORSO, 2)
+    let torso = ellipsoid(v4(a, TORSO, 1).xyz)
+        .translate(t0.xyz)
+        .smooth_union(ellipsoid(v4(a, TORSO, 3).xyz).translate(t2.xyz), k: t0.w)
+        .displace(fbm(a[2], u32(a[3]), offset: vec3(a[4], a[5], a[6])), amp: a[1])
+    let e = v4(a, HEAD, 0)
+    let head = ellipsoid(v4(a, HEAD, 1).xyz).translate(e.xyz).smooth_union(cone_at(a, HEAD, 2), k: e.w)
+    var legs = [cone(a, LEG0); 12]
+    for i in 0..12 {
+        legs[i] = cone(a, LEG0 + i)
+    }
+    var hooves = [cone(a, HOOF0).intersect(half_space(vec3(y: -1.0), 0.0)); 4]
+    for i in 0..4 {
+        let sole = v4(a, HOOF0 + i, 2).x
+        hooves[i] = cone(a, HOOF0 + i).intersect(half_space(vec3(y: -1.0), -sole))
+    }
+    Grazer { k: a[0], torso, neck: cone(a, NECK), head, tail: cone(a, TAIL), legs, hooves }
+}
+
+/// One grazer.
+pub fn grazer(seed: u32) -> Grazer {
+    grazer_from(params(seed))
+}

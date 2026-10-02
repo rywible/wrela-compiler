@@ -145,10 +145,16 @@ impl Surface for HalfSpace {
 
 // ---- combinators --------------------------------------------------------------------------------
 
-/// The smooth minimum of two distances: where `b >= a + k` it's exactly `a`.
+/// The smooth minimum of two distances: where they're `k` or more apart it's exactly the
+/// smaller.
+///
+/// This is the usual polynomial blend, `mix(b, a, h) - k h (1 - h)` with
+/// `h = clamp(0.5 + 0.5 (b - a) / k, 0, 1)`, rearranged (it's the same function, up to
+/// rounding) so that what the compiler derives from it is cheap: its gradient doesn't carry
+/// terms that cancel, and its interval is the smaller distance's, less at most `k / 4`.
 pub fn smin(a: f32, b: f32, k: f32) -> f32 {
-    let h = clamp(0.5 + 0.5 * (b - a) / k, 0.0, 1.0)
-    mix(b, a, h) - k * h * (1.0 - h)
+    let m = max(k - abs(a - b), 0.0)
+    min(a, b) - m * m * (0.25 / k)
 }
 
 pub struct Union<A, B>: Copy + Clone + GpuData {
@@ -230,7 +236,9 @@ pub fn value_noise(p: vec3) -> f32 {
     let iy = i32(fl.y)
     let iz = i32(fl.z)
     let f = p - fl
-    let u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0)
+    // `saturate` changes no value (the fade maps [0, 1] onto itself), but it tells an interval
+    // the fade stays in [0, 1] even across a cell boundary, where `f` alone can't.
+    let u = saturate(f * f * f * (f * (f * 6.0 - 15.0) + 10.0))
     let a = lattice(ix, iy, iz)
     let b = lattice(ix + 1, iy, iz)
     let c = lattice(ix, iy + 1, iz)

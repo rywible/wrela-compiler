@@ -141,14 +141,13 @@ pub fn emit(m: &ir::Module) -> Result<Vec<u8>, String> {
     // Export wrappers: plain scalars in, scalars or a flattened vector out, then a flush.
     let mut exports = ExportSection::new();
     exports.export(wrela_abi::EXPORT_MEMORY, ExportKind::Memory, 0);
-    let mut next = first_fn + m.functions.len() as u32;
-    for (name, f) in &m.exports {
+    let wrappers = first_fn + m.functions.len() as u32..;
+    for (next, (name, f)) in wrappers.zip(&m.exports) {
         let (params, results, body) = func::export_wrapper(m, *f, indices[f.index()], &helpers)?;
         let ty = types.get(params, results);
         functions.function(ty);
         code.function(&body);
         exports.export(name, ExportKind::Func, next);
-        next += 1;
     }
     let mut memories = MemorySection::new();
     memories.memory(MemoryType {

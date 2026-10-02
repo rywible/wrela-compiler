@@ -1,0 +1,269 @@
+// The AC2 and AC3 harness for the grazer (compiler/tests/tests/grazer.rs drives it): GPU
+// evaluation at scattered points, for comparison with spike 01's hand-written kernel, and
+// block culling on the spike's grid, with the derived interval and with the spike's
+// hand-written Lipschitz bound.
+use grazer::{Grazer, P3, bounds, grazer, grazer_from, p3, params}
+use std::derive::Box3
+use std::field::{Surface, hash_u32}
+use std::gpu::{ClipPosition, FragCoord, GlobalId, GpuBuffer, Slots, VertexIndex, begin_screen_pass, buffer, dispatch, draw, present}
+
+// ---- a look at it ------------------------------------------------------------------------------
+struct Camera: Copy + Clone + GpuData {
+    resolution: vec2,
+    eye: vec3,
+}
+
+@vertex
+fn cover(vertex: VertexIndex) -> ClipPosition {
+    let x = f32(vertex.index % 2) * 4.0 - 1.0
+    let y = f32(vertex.index / 2) * 4.0 - 1.0
+    ClipPosition { position: vec4(x, y, 0.0, 1.0) }
+}
+
+/// Sphere-traced, lit by the derived gradient.
+@fragment
+fn shade<F: Surface>(pixel: FragCoord, camera: Camera, field: F) -> vec4 {
+    let uv = (pixel.position.xy * 2.0 - camera.resolution) / camera.resolution.y
+    let forward = normalize(vec3(0.0, 1.0, 0.6) - camera.eye)
+    let right = normalize(cross(forward, vec3(y: 1.0)))
+    let up = cross(right, forward)
+    let dir = normalize(forward * 1.8 + right * uv.x - up * uv.y)
+    var t = 0.0
+    var hit = false
+    var i = 0
+    while i < 128 && !hit && t < 12.0 {
+        let d = field.distance(camera.eye + dir * t)
+        if d < 0.0005 {
+            hit = true
+        } else {
+            t += d * 0.8
+        }
+        i += 1
+    }
+    let sky = mix(vec3(0.7, 0.78, 0.86), vec3(0.3, 0.38, 0.5), clamp(0.5 - 0.5 * dir.y, 0.0, 1.0))
+    if !hit {
+        return vec4(sky, 1.0)
+    }
+    let n = normalize(field.gradient(camera.eye + dir * t))
+    let diffuse = max(dot(n, normalize(vec3(0.5, 0.8, 0.4))), 0.0)
+    vec4(vec3(0.55, 0.43, 0.32) * (0.2 + 0.8 * diffuse), 1.0)
+}
+
+/// Grazer 1, turning slowly.
+pub fn frame(time: f32, width: u32, height: u32) {
+    let a = 0.3 * time + 1.0
+    let camera = Camera { resolution: vec2(f32(width), f32(height)), eye: vec3(4.0 * sin(a), 1.6, 0.6 + 4.0 * cos(a)) }
+    begin_screen_pass(clear: vec4(0.0, 0.0, 0.0, 1.0))
+    draw(cover, shade, vertices: 3, camera: camera, field: grazer(1))
+    present()
+}
+
+// ---- the tests' exports -----------------------------------------------------------------------
+/// One of the spike's parameters (its `Grazer` uniform, flattened) for an individual.
+pub fn param(seed: u32, i: u32) -> f32 {
+    params(seed)[i]
+}
+
+/// The distance at a point, on the CPU.
+pub fn distance(seed: u32, x: f32, y: f32, z: f32) -> f32 {
+    grazer(seed).distance(vec3(x, y, z))
+}
+
+// ---- evaluation at scattered points (AC2) -----------------------------------------------------
+struct Scatter: Copy + Clone + GpuData {
+    lo: vec3,
+    size: vec3,
+    seed: u32,
+}
+
+/// A float in [0, 1) from a hash's top 24 bits.
+fn unit(h: u32) -> f32 {
+    f32(h >> 8) * (1.0 / 16777216.0)
+}
+
+/// Uniform points in a box.
+@compute(64)
+fn scatter(s: Scatter, out: mut Slots<vec4>, id: GlobalId) {
+    let h0 = hash_u32(id.x ^ s.seed)
+    let h1 = hash_u32(h0)
+    let h2 = hash_u32(h1)
+    out[id] = vec4(s.lo + vec3(unit(h0), unit(h1), unit(h2)) * s.size, 0.0)
+}
+
+@compute(64)
+fn distances<F: Surface>(field: F, points: [vec4], out: mut Slots<f32>, id: GlobalId) {
+    out[id] = field.distance(points[id.x].xyz)
+}
+
+@compute(64)
+fn samples<F: Surface>(field: F, points: [vec4], out: mut Slots<vec4>, id: GlobalId) {
+    let s = field.sample(points[id.x].xyz)
+    out[id] = vec4(s.0, s.1)
+}
+
+fn v(p: P3) -> vec3 {
+    vec3(f32(p.x), f32(p.y), f32(p.z))
+}
+
+/// Scatters `n` points (a multiple of 64) over the individual's bounds into a new buffer.
+fn scattered(seed: u32, n: u32, a: [f32; 328]) -> GpuBuffer<vec4> {
+    let b = bounds(a)
+    let points: GpuBuffer<vec4> = buffer(n)
+    let lo = v(b.lo)
+    dispatch(scatter, groups: n / 64, s: Scatter { lo, size: v(b.hi) - lo, seed }, out: points)
+    points
+}
+
+/// Scatters `n` points over the individual's bounds into three new buffers: the points, the
+/// distance at each, and the distance and gradient at each.
+pub fn evaluate(seed: u32, n: u32) {
+    let a = params(seed)
+    let g = grazer_from(a)
+    let points = scattered(seed, n, a)
+    let dist: GpuBuffer<f32> = buffer(n)
+    let samp: GpuBuffer<vec4> = buffer(n)
+    dispatch(distances, groups: n / 64, field: g, points: points, out: dist)
+    dispatch(samples, groups: n / 64, field: g, points: points, out: samp)
+}
+
+/// For timing: the distance (`gradient` 0) or the distance and gradient (1) at `n` scattered
+/// points, `reps` times into the same buffer (so the dispatches run one after another).
+pub fn repeat(seed: u32, n: u32, reps: u32, gradient: u32) {
+    let a = params(seed)
+    let g = grazer_from(a)
+    let points = scattered(seed, n, a)
+    if gradient == 0 {
+        let dist: GpuBuffer<f32> = buffer(n)
+        for rep in 0..reps {
+            dispatch(distances, groups: n / 64, field: g, points: points, out: dist)
+        }
+    } else {
+        let samp: GpuBuffer<vec4> = buffer(n)
+        for rep in 0..reps {
+            dispatch(samples, groups: n / 64, field: g, points: points, out: samp)
+        }
+    }
+}
+
+// ---- block culling on the spike's grid (AC3) -------------------------------------------------
+/// Spike 01's extraction grid: blocks of 4×4×4 cells over the individual's padded bounds.
+struct Grid: Copy + Clone + GpuData {
+    origin: vec3,
+    cell: f32,
+    dx: u32,
+    dy: u32,
+    dz: u32,
+    blocks: u32,
+}
+
+/// The spike's `gridFor`, in f64 as in JavaScript.
+fn grid_for(a: [f32; 328], cell: f64) -> Grid {
+    let b = bounds(a)
+    let pad = 2.0 * cell
+    let o = p3(b.lo.x - pad, b.lo.y - pad, b.lo.z - pad)
+    let dx = u32(ceil((b.hi.x + pad - o.x) / (4.0 * cell)))
+    let dy = u32(ceil((b.hi.y + pad - o.y) / (4.0 * cell)))
+    let dz = u32(ceil((b.hi.z + pad - o.z) / (4.0 * cell)))
+    Grid { origin: v(o), cell: f32(cell), dx, dy, dz, blocks: dx * dy * dz }
+}
+
+/// A block's centre, and the half-size of the block grown by one cell.
+fn block(grid: Grid, b: u32) -> (vec3, f32) {
+    let size = grid.cell * 4.0
+    let c = vec3(f32(b % grid.dx), f32((b / grid.dx) % grid.dy), f32(b / (grid.dx * grid.dy)))
+    (grid.origin + (c + 0.5) * size, 0.5 * size + grid.cell)
+}
+
+/// Keeps a block when the derived interval over it holds zero.
+@compute(64)
+fn cull_interval<F: Surface>(field: F, grid: Grid, live: mut Slots<u32>, id: GlobalId) {
+    if id.x < grid.blocks {
+        let b = block(grid, id.x)
+        let r = field.interval(Box3 { lo: b.0 - b.1, hi: b.0 + b.1 })
+        live[id] = if r.lo > 0.0 || r.hi < 0.0 { 0 } else { 1 }
+    }
+}
+
+/// The spike's hand-written rule (extract.wgsl, `cull_blocks`): each part's distance at the
+/// block's centre plus its Lipschitz constant times the grown block's radius, folded with
+/// smin's interval rule.
+fn lipschitz_live(g: Grazer, center: vec3, r: f32) -> bool {
+    let k = g.k
+    let amp = g.torso.amp * 1.875
+    var lo = [0.0; 20]
+    var hi = [0.0; 20]
+    var min_hi = 1000000.0
+    for i in 0..20 {
+        var d = 0.0
+        var spread = r
+        if i == 0 {
+            d = g.torso.inner.distance(center)
+            spread = 1.25 * r + amp
+        } else if i == 1 {
+            d = g.neck.distance(center)
+        } else if i == 2 {
+            d = g.head.distance(center)
+            spread = 1.25 * r
+        } else if i == 3 {
+            d = g.tail.distance(center)
+        } else if i < 16 {
+            d = g.legs[i - 4].distance(center)
+        } else {
+            d = g.hooves[i - 16].distance(center)
+        }
+        lo[i] = d - spread
+        hi[i] = d + spread
+        min_hi = min(min_hi, hi[i])
+    }
+    var rlo = 1000000.0
+    var rhi = 1000000.0
+    for i in 0..20 {
+        if lo[i] < min_hi + k {
+            let apart = lo[i] >= rhi + k || rlo >= hi[i] + k
+            rlo = min(rlo, lo[i]) - if apart { 0.0 } else { 0.25 * k }
+            rhi = min(rhi, hi[i])
+        }
+    }
+    !(rlo > 0.0 || rhi < 0.0)
+}
+
+@compute(64)
+fn cull_lipschitz(field: Grazer, grid: Grid, live: mut Slots<u32>, id: GlobalId) {
+    if id.x < grid.blocks {
+        let b = block(grid, id.x)
+        let r = length(vec3(b.1))
+        live[id] = if lipschitz_live(field, b.0, r) { 1 } else { 0 }
+    }
+}
+
+/// Culls the individual's blocks at `cell` metres into a new buffer, by the derived interval
+/// (`lipschitz` 0) or the spike's rule (1). Returns the number of blocks.
+pub fn cull(seed: u32, cell: f32, lipschitz: u32) -> u32 {
+    let a = params(seed)
+    let g = grazer_from(a)
+    let grid = grid_for(a, f64(cell))
+    let live: GpuBuffer<u32> = buffer(grid.blocks)
+    let groups = (grid.blocks + 63) / 64
+    if lipschitz == 0 {
+        dispatch(cull_interval, groups: groups, field: g, grid: grid, live: live)
+    } else {
+        dispatch(cull_lipschitz, groups: groups, field: g, grid: grid, live: live)
+    }
+    grid.blocks
+}
+
+/// The derived interval over a box, on the CPU.
+pub fn interval_cpu(seed: u32, lx: f32, ly: f32, lz: f32, hx: f32, hy: f32, hz: f32) -> vec2 {
+    let r = grazer(seed).interval(Box3 { lo: vec3(lx, ly, lz), hi: vec3(hx, hy, hz) })
+    vec2(r.lo, r.hi)
+}
+
+pub fn torso_interval(seed: u32, lx: f32, ly: f32, lz: f32, hx: f32, hy: f32, hz: f32) -> vec2 {
+    let r = grazer(seed).torso.interval(Box3 { lo: vec3(lx, ly, lz), hi: vec3(hx, hy, hz) })
+    vec2(r.lo, r.hi)
+}
+
+pub fn neck_interval(seed: u32, lx: f32, ly: f32, lz: f32, hx: f32, hy: f32, hz: f32) -> vec2 {
+    let r = grazer(seed).neck.interval(Box3 { lo: vec3(lx, ly, lz), hi: vec3(hx, hy, hz) })
+    vec2(r.lo, r.hi)
+}

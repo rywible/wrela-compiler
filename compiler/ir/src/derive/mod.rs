@@ -9,7 +9,7 @@
 
 pub mod ad;
 pub mod interval;
-mod single_exit;
+pub(crate) mod single_exit;
 
 use crate::*;
 use std::collections::HashMap;
@@ -21,7 +21,6 @@ pub struct DeriveCache {
     ad_returns: HashMap<(FuncId, Vec<bool>), bool>,
     interval: HashMap<(FuncId, Vec<bool>), FuncId>,
     interval_returns: HashMap<(FuncId, Vec<bool>), bool>,
-    single_exit: HashMap<FuncId, FuncId>,
 }
 
 /// A function of `f`'s captures and `x` (its last parameter) returning `(f32, X)`: `f(x)` and
@@ -35,17 +34,20 @@ pub fn value_and_gradient(
     ad::value_and_gradient(m, cache, f, ncap)
 }
 
-/// A function of `f`'s captures and a box returning an `Interval` that contains `f(x)` for every
+/// A function of `f`'s captures and a box (`box_ty`, with fields `lo` and `hi`) returning an
+/// interval (`interval_ty`, likewise) that contains `f(x)`, as the target computes it, for every
 /// `x` in the box. On the GPU each operation's result is widened by its WGSL error bound
-/// (D-075); on the CPU by one rounding.
+/// (D-075); on the CPU by its rounding.
 pub fn interval(
     m: &mut Module,
     cache: &mut DeriveCache,
     f: FuncId,
     ncap: u32,
     target: Target,
+    box_ty: TypeId,
+    interval_ty: TypeId,
 ) -> Result<FuncId, String> {
-    interval::interval(m, cache, f, ncap, target)
+    interval::interval(m, cache, f, ncap, target, box_ty, interval_ty)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -104,7 +106,7 @@ pub(crate) fn activity(
     };
     loop {
         let before = (a.values.clone(), a.locals.clone(), a.returns);
-        walk(m, f, &f.body, &mut a, mode, false, 0, callee_returns)?;
+        walk(m, f, &f.body, &mut a, mode, false, callee_returns)?;
         if before == (a.values.clone(), a.locals.clone(), a.returns) {
             break;
         }
@@ -127,30 +129,20 @@ fn walk(
     a: &mut Activity,
     mode: Mode,
     ctrl: bool,
-    loop_depth_with_active_exit: u32,
     callee_returns: &mut dyn FnMut(FuncId, Vec<bool>) -> Result<bool, String>,
 ) -> Result<(), String> {
-    let _ = loop_depth_with_active_exit;
     for s in b {
         match s {
             Stmt::Let(v, e) => {
-                let active =
-                    expr_active(m, f, e, a, callee_returns)? && carries(m, f.value_ty(*v), mode);
+                if let Expr::Call(g, args) = e {
+                    call_writes(m, a, mode, ctrl, *g, args);
+                }
+                let active = expr_active(e, a, callee_returns)? && carries(m, f.value_ty(*v), mode);
                 if active {
                     a.values[v.index()] = true;
                 }
             }
-            Stmt::Eval(Expr::Call(g, args)) => {
-                // A callee given active arguments may write active values through its `mut`
-                // parameters.
-                if args.iter().any(|x| arg_active(a, x)) {
-                    for (arg, p) in args.iter().zip(&m.functions[g.index()].params) {
-                        if let (Arg::Place(pl), true) = (arg, p.mutable) {
-                            mark_place(a, pl);
-                        }
-                    }
-                }
-            }
+            Stmt::Eval(Expr::Call(g, args)) => call_writes(m, a, mode, ctrl, *g, args),
             Stmt::Eval(_) => {}
             Stmt::Store(p, v) => {
                 if a.values[v.index()] || (mode == Mode::Interval && ctrl) {
@@ -159,12 +151,12 @@ fn walk(
             }
             Stmt::If { cond, then, else_ } => {
                 let c = ctrl || (mode == Mode::Interval && a.values[cond.index()]);
-                walk(m, f, then, a, mode, c, 0, callee_returns)?;
-                walk(m, f, else_, a, mode, c, 0, callee_returns)?;
+                walk(m, f, then, a, mode, c, callee_returns)?;
+                walk(m, f, else_, a, mode, c, callee_returns)?;
             }
             Stmt::Loop { body, continuing } => {
-                walk(m, f, body, a, mode, ctrl, 0, callee_returns)?;
-                walk(m, f, continuing, a, mode, ctrl, 0, callee_returns)?;
+                walk(m, f, body, a, mode, ctrl, callee_returns)?;
+                walk(m, f, continuing, a, mode, ctrl, callee_returns)?;
                 if mode == Mode::Interval && loop_exit_active(body, a) {
                     a.active_loop_exit = true;
                 }
@@ -180,11 +172,12 @@ fn walk(
     Ok(())
 }
 
-/// Whether a loop's `break` (or `return`) sits under a condition that depends on the input.
+/// Whether a loop's `break`, `continue` (or `return`) sits under a condition that depends on
+/// the input.
 fn loop_exit_active(b: &Block, a: &Activity) -> bool {
     fn exits(b: &Block) -> bool {
         b.iter().any(|s| match s {
-            Stmt::Break | Stmt::Return(_) => true,
+            Stmt::Break | Stmt::Continue | Stmt::Return(_) => true,
             Stmt::If { then, else_, .. } => exits(then) || exits(else_),
             _ => false,
         })
@@ -199,6 +192,18 @@ fn loop_exit_active(b: &Block, a: &Activity) -> bool {
     })
 }
 
+/// A callee given active arguments may write active values through its `mut` parameters, and
+/// in interval mode, so may one that runs under a condition on the input.
+fn call_writes(m: &Module, a: &mut Activity, mode: Mode, ctrl: bool, g: FuncId, args: &[Arg]) {
+    if args.iter().any(|x| arg_active(a, x)) || (mode == Mode::Interval && ctrl) {
+        for (arg, p) in args.iter().zip(&m.functions[g.index()].params) {
+            if let (Arg::Place(pl), true) = (arg, p.mutable) {
+                mark_place(a, pl);
+            }
+        }
+    }
+}
+
 fn mark_place(a: &mut Activity, p: &Place) {
     match &p.root {
         PlaceRoot::Local(l) => a.locals[l.index()] = true,
@@ -208,8 +213,6 @@ fn mark_place(a: &mut Activity, p: &Place) {
 }
 
 fn expr_active(
-    m: &Module,
-    f: &Function,
     e: &Expr,
     a: &Activity,
     callee_returns: &mut dyn FnMut(FuncId, Vec<bool>) -> Result<bool, String>,
@@ -234,7 +237,6 @@ fn expr_active(
                 false
             } else {
                 // Arguments map to the callee's parameters one to one.
-                let _ = f;
                 callee_returns(*g, mask)?
             }
         }

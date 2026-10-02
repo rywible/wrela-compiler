@@ -163,7 +163,14 @@ pub fn resolve_module_path_in(
                 )));
             }
         }
-    } else if let Some(b) = p.module(from).scope.get(&first.name) {
+    } else if let Some(b) = p.module(from).scope.get(&first.name).filter(|b| {
+        // `use blob::blob` imports the function `blob` from the module `blob`; a later
+        // `blob::x` still means the module, since a function has no items.
+        segs.len() == 1
+            || matches!(b.res, Res::Module(_))
+            || matches!(b.res, Res::Adt(a) if p.adt(a).is_enum())
+            || !p.package_root.is_some_and(|r| p.module(r).children.contains_key(&first.name))
+    }) {
         b.res
     } else if let Some(&m) = p.package_root.and_then(|r| p.module(r).children.get(&first.name)) {
         Res::Module(m)

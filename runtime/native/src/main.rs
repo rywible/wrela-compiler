@@ -71,7 +71,8 @@ fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
 }
 
 fn run(args: &Args) -> Result<(), wrela_host::Error> {
-    let mut host = Host::load_with(&args.dir, &Options { timestamps: args.timestamps })?;
+    let mut host =
+        Host::load_with(&args.dir, &Options { timestamps: args.timestamps, ..Options::default() })?;
     let times: Vec<f32> = (0..args.frames).map(|i| frame_time(i, args.fps)).collect();
     let run = host.run_frames(&times, args.size.0, args.size.1)?;
     drop(host); // release the GPU (and its lock) before writing files

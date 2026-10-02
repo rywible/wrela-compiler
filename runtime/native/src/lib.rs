@@ -43,6 +43,9 @@ pub struct Options {
     /// The host then waits for the GPU at every submission, so use it for durations, not
     /// throughput. Fails to load if the adapter can't time.
     pub timestamps: bool,
+    /// Keep a copy of every batch the program submits ([`Host::take_batches`]): for tests
+    /// that look at what a program recorded, such as a dispatch's uniform bytes.
+    pub record: bool,
 }
 
 /// The outcome of [`Host::run_frames`].
@@ -113,7 +116,10 @@ impl Host {
         let lock = lock::GpuLock::acquire(&format!("wrela-host {}", dir.display()))?;
         let gpu = Gpu::new(&manifest, &shaders, options.timestamps)?;
         let checker = check::Checker::new(&manifest, check::Limits::webgpu_defaults());
-        let program = Program::instantiate(&compiled, checker, gpu)?;
+        let mut program = Program::instantiate(&compiled, checker, gpu)?;
+        if options.record {
+            program.record_batches();
+        }
         Ok(Host { program, _lock: lock })
     }
 
@@ -140,5 +146,19 @@ impl Host {
     /// Reads a GPU buffer back after a run. For tests: it waits for the GPU.
     pub fn read_buffer(&mut self, handle: u32) -> Result<Vec<u8>> {
         self.program.executor().read_buffer(handle)
+    }
+
+    /// The batches submitted since the last call (or load), with [`Options::record`]; decode
+    /// them with [`wrela_abi::stream::decode`].
+    pub fn take_batches(&mut self) -> Vec<Vec<u8>> {
+        self.program.take_batches()
+    }
+
+    /// The GPU durations recorded since the last call (or load), with [`Options::timestamps`]:
+    /// for timing work an export submits. It waits for the GPU.
+    pub fn take_timings(&mut self) -> Result<Vec<GpuTiming>> {
+        let gpu = self.program.executor();
+        gpu.flush()?;
+        Ok(gpu.take_timings())
     }
 }

@@ -643,7 +643,7 @@ fn lower_compute(cx: &mut Cx, _index: u32, kernel: FnId, substs: &[TyId]) -> Opt
         function: entry,
         inputs,
     });
-    verify(cx, &mb, &def.name)?;
+    verify(cx, &mut mb, &def.name)?;
     Some(PipelineOut {
         name: def.name.clone(),
         module: mb.m,
@@ -733,7 +733,7 @@ fn lower_render(
         function: fentry,
         inputs: fin,
     });
-    verify(cx, &mb, &name)?;
+    verify(cx, &mut mb, &name)?;
     Some(PipelineOut {
         name: format!("{}+{}", vdef.name, fdef.name),
         module: mb.m,
@@ -945,11 +945,15 @@ fn check_recursion(cx: &mut Cx, mb: &ModuleBuilder) {
     }
 }
 
-fn verify(cx: &mut Cx, mb: &ModuleBuilder, name: &str) -> Option<()> {
+/// Checks a pipeline's module and flattens it (`ir::opt::flatten_gpu`).
+fn verify(cx: &mut Cx, mb: &mut ModuleBuilder, name: &str) -> Option<()> {
     if cx.diags.iter().any(|d| d.is_error()) {
         return None;
     }
-    if let Err(e) = ir::verify(&mb.m) {
+    if let Err(e) = ir::verify(&mb.m)
+        .and_then(|()| ir::opt::flatten_gpu(&mut mb.m))
+        .and_then(|()| ir::verify(&mb.m))
+    {
         cx.err(Diagnostic::new(
             codes::E0702,
             Span::new(wrela_diag::FileId(0), 0, 0),
@@ -1172,7 +1176,19 @@ pub(crate) fn lower_derived(
             ir::derive::value_and_gradient(&mut mb.m, &mut mb.derived, inner, ncap as u32)
         }
         DeriveKind::Interval => {
-            ir::derive::interval(&mut mb.m, &mut mb.derived, inner, ncap as u32, target)
+            let sig = &mb.m.functions[id.index()];
+            match (sig.params.last().map(|p| p.ty), sig.ret) {
+                (Some(box_ty), Some(interval_ty)) => ir::derive::interval(
+                    &mut mb.m,
+                    &mut mb.derived,
+                    inner,
+                    ncap as u32,
+                    target,
+                    box_ty,
+                    interval_ty,
+                ),
+                _ => Err("internal: an interval's signature".into()),
+            }
         }
     };
     match result {

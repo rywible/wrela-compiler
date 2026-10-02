@@ -14,6 +14,7 @@
 
 pub mod derive;
 pub mod layout;
+pub mod opt;
 pub mod print;
 mod types;
 mod verify;
