@@ -7,6 +7,8 @@ members = [
     "compiler/sema",
     "compiler/driver",
     "compiler/cli",
+    "runtime/abi",
+    "runtime/native",
 ]
 
 [workspace.package]
@@ -20,6 +22,7 @@ wrela-diag = { path = "compiler/diag" }
 wrela-syntax = { path = "compiler/syntax" }
 wrela-sema = { path = "compiler/sema" }
 wrela-driver = { path = "compiler/driver" }
+wrela-abi = { path = "runtime/abi" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

@@ -1,0 +1,47 @@
+//! # The wrela runtime ABI
+//!
+//! This crate is the one definition of how a compiled wrela program talks to a host (the browser
+//! runtime in `runtime/browser`, or the native host in `runtime/native`). It's an executable
+//! spec: the format's version, opcodes and layouts are defined here, documented here, and
+//! pinned by golden byte tests. The browser runtime's constants are generated from it
+//! ([`typescript`]), and a test fails if the checked-in copy drifts.
+//!
+//! ## What a build ships (D-099)
+//!
+//! - `game.wasm`: the program's CPU code.
+//! - One WGSL module per pipeline.
+//! - `manifest.json`: a [`Manifest`]. It names the WASM and lists every pipeline.
+//! - The standard runtime, pinned to the version the program was built with (D-100).
+//!
+//! ## The program ABI
+//!
+//! The WASM module
+//! - exports its linear memory as `memory`;
+//! - exports `frame(time: f32, width: u32, height: u32)`, which the host calls once per frame
+//!   with the seconds since the program started and the canvas size in pixels;
+//! - imports exactly one function, `wrela.submit(ptr: i32, len: i32)`, which hands the host a
+//!   batch of commands: `len` bytes at `ptr` in its memory (see [`stream`]).
+//!
+//! Nothing else is imported, so nothing host-dependent can reach the program's arithmetic
+//! (D-015). Other exports are the program's own `pub fn`s, which tests may call.
+//!
+//! ## The state hash
+//!
+//! [`hash::StateHash`] is FNV-1a 64 over every byte of every batch the program submits, in
+//! order. Two hosts running the same program at the same frame times must compute the same
+//! hash (AC7).
+
+pub mod hash;
+pub mod manifest;
+pub mod stream;
+pub mod typescript;
+
+pub use manifest::Manifest;
+pub use typescript::typescript;
+
+/// The program's one import: module and name.
+pub const IMPORT_MODULE: &str = "wrela";
+pub const IMPORT_SUBMIT: &str = "submit";
+/// The export the host calls each frame.
+pub const EXPORT_FRAME: &str = "frame";
+pub const EXPORT_MEMORY: &str = "memory";

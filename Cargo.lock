@@ -103,6 +103,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "wrela-abi"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "wrela-diag"
 version = "0.1.0"
 dependencies = [
@@ -125,6 +133,13 @@ version = "0.1.0"
 dependencies = [
  "wrela-diag",
  "wrela-syntax",
+]
+
+[[package]]
+name = "wrela-host"
+version = "0.1.0"
+dependencies = [
+ "wrela-abi",
 ]
 
 [[package]]
