@@ -1,0 +1,91 @@
+// run: matching: literals, constants, enums with payloads, tuples, structs, or-patterns, guards
+// expect: classify(0) = 10
+// expect: classify(7) = 20
+// expect: classify(3) = 30
+// expect: classify(100) = 40
+// expect: shapes() = 1234
+// expect: tuples(1, 2) = 3
+// expect: tuples(0, 5) = 5
+// expect: guard(4) = 1
+// expect: guard(5) = 2
+// expect: nested() = 42
+// expect: const_pat(255) = 1
+// expect: const_pat(3) = 0
+// expect: opt(1) = 11
+// expect: opt(0) = 0
+
+const LIMIT: u32 = 255
+
+enum Shape {
+    Circle { r: f32 },
+    Rect { w: f32, h: f32 },
+    Dot,
+}
+
+struct Pair: Copy + Clone {
+    a: i32,
+    b: i32,
+}
+
+fn area(s: Shape) -> f32 {
+    match s {
+        Shape::Circle { r } => r * r,
+        Shape::Rect { w, h } => w * h,
+        Shape::Dot => 0.0,
+    }
+}
+
+pub fn classify(n: u32) -> u32 {
+    match n {
+        0 => 10,
+        7 => 20,
+        1 | 2 | 3 => 30,
+        _ => 40,
+    }
+}
+
+pub fn shapes() -> i32 {
+    let a = area(Shape::Circle { r: 1.0 })
+    let b = area(Shape::Rect { w: 2.0, h: 1.0 })
+    let c = area(Shape::Rect { w: 3.0, h: 1.0 })
+    let d = area(Shape::Rect { w: 2.0, h: 2.0 }) + area(Shape::Dot)
+    i32(a) * 1000 + i32(b) * 100 + i32(c) * 10 + i32(d)
+}
+
+pub fn tuples(x: i32, y: i32) -> i32 {
+    match (x, y) {
+        (0, b) => b,
+        (a, b) => a + b,
+    }
+}
+
+pub fn guard(n: i32) -> i32 {
+    match n {
+        k if k % 2 == 0 => 1,
+        _ => 2,
+    }
+}
+
+pub fn nested() -> i32 {
+    let p = Pair { a: 40, b: 2 }
+    let Pair { a, b } = p
+    match Some(p) {
+        Some(Pair { a: x, b: 2 }) => x + b,
+        _ => a,
+    }
+}
+
+pub fn const_pat(n: u32) -> u32 {
+    match n {
+        LIMIT => 1,
+        _ => 0,
+    }
+}
+
+pub fn opt(n: i32) -> i32 {
+    let o = if n > 0 { Some(n) } else { None }
+    match o {
+        Some(v) => v + 10,
+        None => 0,
+    }
+}

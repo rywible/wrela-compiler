@@ -1,0 +1,18 @@
+// rejects: mod.use
+use a::inner::{Secret, make}
+
+fn read() -> i32 {
+    let Secret { hidden, shown } = make() //~ E0210
+    hidden + shown
+}
+
+fn matched() -> i32 {
+    match make() {
+        Secret { hidden: h, shown: _ } => h, //~ E0210
+    }
+}
+
+fn with_rest() -> i32 {
+    let Secret { shown, .. } = make()
+    shown
+}

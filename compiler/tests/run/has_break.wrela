@@ -1,0 +1,10 @@
+// run: a loop whose `break` hides in an operand still returns through the function's end
+// expect: hb_ok(3) = 4
+
+pub fn hb_ok(n: i32) -> i32 {
+    var x = 0
+    loop {
+        x += if x > n { break } else { 1 }
+    }
+    x
+}

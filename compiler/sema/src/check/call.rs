@@ -99,7 +99,8 @@ impl<'p> Checker<'p> {
             ValueRes::Item(Res::BuiltinFn(b)) => self.call_builtin(b, None, args, span),
             ValueRes::Item(Res::BuiltinTy(t)) => self.call_type(t, args, span),
             ValueRes::TypeRelative(ty, name) => {
-                self.call_type_relative(ty, &name, args, expected, span)
+                let generics = path.segments.last().and_then(|s| s.generics.as_deref());
+                self.call_type_relative(ty, &name, generics, args, expected, span)
             }
             ValueRes::TraitRelative(t, name) => {
                 let Some(m) = traits::trait_method(self.p, t, &name.name) else {
@@ -130,9 +131,11 @@ impl<'p> Checker<'p> {
                     recv.span,
                     format!("calling `{}::{}`", self.p.trait_(t).name, name.name),
                 );
+                let generics = path.segments.last().and_then(|s| s.generics.as_deref());
                 self.finish_method(
                     Pick::Trait { method: m, trait_args },
                     recv,
+                    generics,
                     &args[1..],
                     expected,
                     span,
@@ -492,7 +495,33 @@ impl<'p> Checker<'p> {
         if let (TyKind::FnDef(f, args), TyKind::FnPtr(ps, r)) =
             (self.kind(e.ty), self.kind(param_ty))
         {
-            let (params, ret, _) = self.fn_params(f, &args);
+            let (params, ret, ret_mode) = self.fn_params(f, &args);
+            // A `fn(..)` type's parameters are borrowed and its result is owned.
+            if let Some(p) = params.iter().find(|p| p.mode != Mode::Borrow) {
+                let fname = self.p.func(f).name.clone();
+                self.err(
+                    Diagnostic::new(
+                        codes::E0300,
+                        e.span,
+                        format!(
+                            "`{fname}` takes `{}` as `{}`, but a `fn(..)` passes its arguments by borrow",
+                            p.name,
+                            p.mode.keyword()
+                        ),
+                    )
+                    .with_help(format!("pass a closure that calls it: `|..| {fname}(..)`")),
+                );
+                return;
+            }
+            if ret_mode != RetMode::Owned {
+                let fname = self.p.func(f).name.clone();
+                self.err(Diagnostic::new(
+                    codes::E0300,
+                    e.span,
+                    format!("`{fname}` returns a projection, but a `fn(..)` returns a value"),
+                ));
+                return;
+            }
             if params.len() != ps.len() {
                 self.err(Diagnostic::new(
                     codes::E0300,
@@ -739,19 +768,35 @@ impl<'p> Checker<'p> {
                     return self.error_expr(span);
                 }
                 let x = self.check_expr(&args[0].value, None);
-                if let Some(k) = self.infer.var_kind(&self.p.types, x.ty) {
-                    // `f32(1)`: the literal is the target type already.
+                // `f32(1)`: a literal is the target type already. Only a literal: a variable
+                // whose type isn't known yet keeps its own (`let n = 7; f32(n)` converts an
+                // `i32`). A negative literal converted to an unsigned type keeps its low bits
+                // (`u32(-1)`), so it's a signed integer first.
+                if let Some(negative) = literal_sign(&args[0].value)
+                    && let Some(k) = self.infer.var_kind(&self.p.types, x.ty)
+                {
+                    let unsigned = matches!(self.p.types.kind(ty), TyKind::Int(i) if !i.signed());
                     let target = if k == VarKind::Float && !self.p.types.is_float(ty) {
-                        self.p.types.f32
+                        Some(self.p.types.f32)
+                    } else if negative && unsigned {
+                        None
                     } else {
-                        ty
+                        Some(ty)
                     };
-                    let _ = self.infer.unify(&self.p.types, x.ty, target);
+                    if let Some(target) = target {
+                        let _ = self.infer.unify(&self.p.types, x.ty, target);
+                    }
                 }
-                let ok = matches!(
-                    self.kind(x.ty),
-                    TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Error
+                // A number whose type isn't settled yet defaults like any other.
+                let number_var = matches!(
+                    self.infer.var_kind(&self.p.types, x.ty),
+                    Some(VarKind::Int | VarKind::Float)
                 );
+                let ok = number_var
+                    || matches!(
+                        self.kind(x.ty),
+                        TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Error
+                    );
                 if !ok
                     || (t == BuiltinTy::Bool
                         && !matches!(self.kind(x.ty), TyKind::Bool | TyKind::Error))
@@ -852,6 +897,7 @@ impl<'p> Checker<'p> {
         &mut self,
         ty: TyId,
         name: &ast::Ident,
+        generics: Option<&[ast::TypeExpr]>,
         args: &[ast::Arg],
         expected: Option<TyId>,
         span: Span,
@@ -865,18 +911,16 @@ impl<'p> Checker<'p> {
             };
             return self.call_variant(a, v as u32, &path, args, expected.or(Some(ty)), span);
         }
-        if let Some((f, impl_args)) = self.find_inherent(ty, &name.name) {
-            let own = self.p.func(f).generics.len();
+        if let Some((f, impl_args)) = self.find_inherent(ty, &name.name, name.span) {
             let mut gargs = impl_args;
-            for _ in 0..own {
-                gargs.push(self.new_var(VarKind::General, span));
-            }
+            gargs.extend(self.method_generic_args(f, generics, span));
             return self.call_fn(f, gargs, None, args, expected, span);
         }
         // A trait's function, through a type that has the trait.
         let traits = self.traits_with_method(ty, &name.name);
-        if let [(t, trait_args)] = traits.as_slice() {
-            let m = traits::trait_method(self.p, *t, &name.name).unwrap_or(FnId(0));
+        if let [(t, trait_args)] = traits.as_slice()
+            && let Some(m) = traits::trait_method(self.p, *t, &name.name)
+        {
             let def = self.p.func(m).clone();
             if def.has_self() {
                 self.err(Diagnostic::new(
@@ -889,8 +933,7 @@ impl<'p> Checker<'p> {
                 ));
                 return self.error_expr(span);
             }
-            let method_args: Vec<TyId> =
-                def.generics.iter().map(|_| self.new_var(VarKind::General, span)).collect();
+            let method_args = self.method_generic_args(m, generics, span);
             let (params, ret) = self.trait_method_sig(m, ty, trait_args, &method_args);
             let fname = format!("{}::{}", self.p.display_ty(ty), name.name);
             let (call_args, modes) = self.match_args(&fname, &params, None, args, span, m);
@@ -925,7 +968,7 @@ impl<'p> Checker<'p> {
     }
 
     /// An inherent method of `ty` named `name`, and the impl's arguments for `ty`.
-    fn find_inherent(&mut self, ty: TyId, name: &str) -> Option<(FnId, Vec<TyId>)> {
+    fn find_inherent(&mut self, ty: TyId, name: &str, span: Span) -> Option<(FnId, Vec<TyId>)> {
         let TyKind::Adt(a, _) = self.kind(ty) else { return None };
         let impls = self.p.inherent_impls.get(&a).cloned().unwrap_or_default();
         for i in impls {
@@ -933,11 +976,8 @@ impl<'p> Checker<'p> {
             let Some(f) = imp.methods.iter().copied().find(|&f| self.p.func(f).name == name) else {
                 continue;
             };
-            let vars: Vec<TyId> = imp
-                .generics
-                .iter()
-                .map(|_| self.new_var(VarKind::General, Span::new(wrela_diag::FileId(0), 0, 0)))
-                .collect();
+            let vars: Vec<TyId> =
+                imp.generics.iter().map(|_| self.new_var(VarKind::General, span)).collect();
             let subst = Subst::from_pairs(&imp.generics, &vars);
             let self_ty = self.p.types.subst(imp.self_ty, &subst);
             if self.try_unify(self_ty, ty) {
@@ -1096,22 +1136,16 @@ impl<'p> Checker<'p> {
             }
         }
         let rt = self.shallow(recv.ty);
-        let _ = generics;
-        let pick = if let Some((f, impl_args)) = self.find_inherent(rt, &name.name) {
+        let pick = if let Some((f, impl_args)) = self.find_inherent(rt, &name.name, name.span) {
             Some(Pick::Inherent(f, impl_args))
         } else {
-            let traits = self.traits_with_method(rt, &name.name);
+            let mut traits = self.traits_with_method(rt, &name.name);
             match traits.len() {
                 0 => None,
                 1 => {
-                    let (t, trait_args) =
-                        traits.into_iter().next().unwrap_or((TraitId(0), Vec::new()));
-                    let m = traits::trait_method(self.p, t, &name.name).unwrap_or(FnId(0));
-                    let _ = m;
-                    Some(Pick::Trait {
-                        method: traits::trait_method(self.p, t, &name.name).unwrap_or(FnId(0)),
-                        trait_args,
-                    })
+                    let (t, trait_args) = traits.remove(0);
+                    traits::trait_method(self.p, t, &name.name)
+                        .map(|method| Pick::Trait { method, trait_args })
                 }
                 _ => {
                     let names: Vec<String> = traits
@@ -1179,19 +1213,61 @@ impl<'p> Checker<'p> {
             }
             return self.error_expr(span);
         };
-        self.finish_method(pick, recv, args, expected, span, name.span)
+        self.finish_method(pick, recv, generics, args, expected, span, name.span)
     }
 
+    /// A method's own generic arguments: those given with `::<...>`, in order, and fresh
+    /// variables for the rest (all of them when none are given).
+    fn method_generic_args(
+        &mut self,
+        f: FnId,
+        explicit: Option<&[ast::TypeExpr]>,
+        span: Span,
+    ) -> Vec<TyId> {
+        let own = self.p.func(f).generics.clone();
+        let fresh = |this: &mut Self| -> Vec<TyId> {
+            own.iter().map(|_| this.new_var(VarKind::General, span)).collect()
+        };
+        let Some(given) = explicit else { return fresh(self) };
+        // Implicit parameters (from `x: Trait`) can't be named; only declared ones count.
+        let declared: Vec<usize> =
+            (0..own.len()).filter(|&i| !self.p.param(own[i]).name.starts_with("impl ")).collect();
+        if given.len() != declared.len() {
+            self.err(Diagnostic::new(
+                codes::E0322,
+                span,
+                format!(
+                    "`{}` takes {} generic argument{}, not {}",
+                    self.p.func(f).name,
+                    declared.len(),
+                    if declared.len() == 1 { "" } else { "s" },
+                    given.len()
+                ),
+            ));
+            return fresh(self);
+        }
+        let mut out: Vec<Option<TyId>> = vec![None; own.len()];
+        for (&i, t) in declared.iter().zip(given) {
+            out[i] = Some(self.resolve_type(t));
+        }
+        out.into_iter().map(|t| t.unwrap_or_else(|| self.new_var(VarKind::General, span))).collect()
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn finish_method(
         &mut self,
         pick: Pick,
         recv: Expr,
+        generics: Option<&[ast::TypeExpr]>,
         args: &[ast::Arg],
         expected: Option<TyId>,
         span: Span,
         name_span: Span,
     ) -> Expr {
         let rt = self.shallow(recv.ty);
+        if generics.is_some() && matches!(pick, Pick::Builtin(_) | Pick::Clone) {
+            self.err(Diagnostic::new(codes::E0322, span, "this method takes no generic arguments"));
+        }
         match pick {
             Pick::Inherent(f, impl_args) => {
                 if !self.p.func(f).has_self() {
@@ -1204,11 +1280,8 @@ impl<'p> Checker<'p> {
                     ));
                     return self.error_expr(span);
                 }
-                let own = self.p.func(f).generics.len();
                 let mut gargs = impl_args;
-                for _ in 0..own {
-                    gargs.push(self.new_var(VarKind::General, span));
-                }
+                gargs.extend(self.method_generic_args(f, generics, span));
                 self.receiver_mode_check(f, &recv);
                 self.call_fn(f, gargs, Some(recv), args, expected, span)
             }
@@ -1222,13 +1295,11 @@ impl<'p> Checker<'p> {
                     ));
                     return self.error_expr(span);
                 }
-                let method_args: Vec<TyId> =
-                    def.generics.iter().map(|_| self.new_var(VarKind::General, span)).collect();
+                let method_args = self.method_generic_args(method, generics, span);
                 let (params, ret) = self.trait_method_sig(method, rt, &trait_args, &method_args);
                 // Bounds on the method's own generics.
-                let tr = match def.owner {
-                    FnOwner::Trait(t) => t,
-                    _ => TraitId(0),
+                let FnOwner::Trait(tr) = def.owner else {
+                    unreachable!("a trait pick is a trait's method")
                 };
                 let mut subst = Subst::from_pairs(&self.p.trait_(tr).generics.clone(), &trait_args);
                 subst.insert(self.p.trait_(tr).self_param, rt);
@@ -1638,5 +1709,17 @@ impl<'p> Checker<'p> {
         }
         let d = Draw { vertex: vs, fragment: fs, vertices, instances, args: out };
         Expr { ty: unit, span, kind: ExprKind::Draw(Box::new(d)) }
+    }
+}
+
+/// For a number literal, possibly negated or parenthesized: whether it's negative.
+fn literal_sign(e: &ast::Expr) -> Option<bool> {
+    match &e.kind {
+        ast::ExprKind::Lit(ast::Lit { kind: ast::LitKind::Int | ast::LitKind::Float, .. }) => {
+            Some(false)
+        }
+        ast::ExprKind::Unary(ast::UnOp::Neg, x) => literal_sign(x).map(|n| !n),
+        ast::ExprKind::Paren(x) => literal_sign(x),
+        _ => None,
     }
 }

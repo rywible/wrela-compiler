@@ -1,0 +1,25 @@
+// accepts: fn.return
+fn last(n: i32) -> i32 {
+    var x = 0
+    loop {
+        x += if x > n { break } else { 1 }
+    }
+    x
+}
+
+fn forever(n: i32) -> i32 {
+    loop {
+        if n > 0 {
+            return n
+        }
+    }
+}
+
+fn inner_break(n: i32) -> i32 {
+    loop {
+        while n > 0 {
+            break
+        }
+        return n
+    }
+}

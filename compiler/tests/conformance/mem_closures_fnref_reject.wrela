@@ -1,0 +1,22 @@
+// rejects: mem.closures
+fn bump(x: mut f32) {
+    x += 1.0
+}
+
+fn eat(x: take [f32; 2]) -> f32 {
+    x[0]
+}
+
+fn apply(f: fn(f32), v: f32) {
+    f(v)
+}
+
+fn apply_arr(f: fn([f32; 2]) -> f32, v: [f32; 2]) -> f32 {
+    f(v)
+}
+
+fn g() -> f32 {
+    let v = 1.0
+    apply(bump, v) //~ E0300
+    apply_arr(eat, [1.0, 2.0]) //~ E0300
+}

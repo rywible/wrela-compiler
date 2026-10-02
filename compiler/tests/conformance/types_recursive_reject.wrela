@@ -1,0 +1,34 @@
+// rejects: ty.option
+struct A: Clone { //~ E0318
+    next: Option<A>,
+}
+
+struct B { //~ E0318
+    c: C,
+}
+
+struct C {
+    bs: [B; 2],
+}
+
+enum List {
+    Cons { head: i32, tail: List }, //~^ E0318
+    Nil,
+}
+
+struct Wrap<T> {
+    t: T,
+}
+
+struct W { //~ E0318
+    inner: Wrap<W>,
+}
+
+// Not recursive: a parameter the type doesn't hold.
+struct Fine {
+    w: Wrap<i32>,
+}
+
+fn f(a: A) -> i32 {
+    0
+}

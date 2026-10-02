@@ -1,0 +1,70 @@
+// run: loops: ranges, inclusive ranges, while, loop with break values, for-each over arrays
+// expect: range_sum(5) = 10
+// expect: incl_sum(5) = 15
+// expect: incl_max() = 255
+// expect: while_count(100) = 7
+// expect: each_sum() = 10.0
+// expect: each_mut() = 20.0
+// expect: cont() = 25
+
+pub fn range_sum(n: u32) -> u32 {
+    var s = 0
+    for i in 0..n {
+        s += i
+    }
+    s
+}
+
+pub fn incl_sum(n: u32) -> u32 {
+    var s = 0
+    for i in 0..=n {
+        s += i
+    }
+    s
+}
+
+pub fn incl_max() -> u32 {
+    var last = 0
+    for i in 250..=255 {
+        last = u32(i)
+    }
+    last
+}
+
+pub fn while_count(n: u32) -> u32 {
+    var x = n
+    var k = 0
+    while x > 0 {
+        x /= 2
+        k += 1
+    }
+    k
+}
+
+pub fn each_sum() -> f32 {
+    let xs = [1.0, 2.0, 3.0, 4.0]
+    var s = 0.0
+    for x in xs {
+        s += x
+    }
+    s
+}
+
+pub fn each_mut() -> f32 {
+    var xs = [1.0, 2.0, 3.0, 4.0]
+    for mut x in xs {
+        x *= 2.0
+    }
+    xs[0] + xs[1] + xs[2] + xs[3]
+}
+
+pub fn cont() -> u32 {
+    var s = 0
+    for i in 0..10 {
+        if i % 2 == 0 {
+            continue
+        }
+        s += i
+    }
+    s
+}

@@ -1,0 +1,33 @@
+// run: integer `**` for every integer type, and literal exponents
+// expect: sq(-3) = 9
+// expect: sq64(-3) = 9
+// expect: cube(2) = 8
+// expect: lit_pow() = 8
+// expect: fpow(2.0) = 8.0
+// expect: pow_overflow() traps
+
+pub fn sq(a: i32) -> i32 {
+    a ** 2
+}
+
+pub fn sq64(a: i64) -> i64 {
+    a ** 2
+}
+
+pub fn cube(a: u32) -> u32 {
+    a ** 3
+}
+
+pub fn lit_pow() -> i32 {
+    let n = 2 ** 3
+    n
+}
+
+pub fn fpow(x: f32) -> f32 {
+    x ** 3.0
+}
+
+pub fn pow_overflow() -> i32 {
+    let a = 2
+    a ** 40
+}

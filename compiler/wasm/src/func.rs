@@ -50,7 +50,8 @@ fn konst(s: ir::Scalar, v: f64) -> I<'static> {
 enum LocalRepr {
     /// A scalar in a WASM local.
     Scalar(u32),
-    /// An aggregate at this offset in the frame.
+    /// At this offset in the frame: an aggregate, or a scalar whose address is taken (passed
+    /// by reference, or a projection's target).
     Slot(u32),
 }
 
@@ -73,6 +74,8 @@ struct Fe<'m> {
     sret: Option<u32>,
     params: Vec<u32>,
     fp: u32,
+    /// The stack pointer on entry, restored on every exit.
+    saved_sp: u32,
     values: Vec<u32>,
     value_slots: Vec<Option<u32>>,
     ir_locals: Vec<LocalRepr>,
@@ -119,6 +122,7 @@ pub(crate) fn emit_function(
         sret: sret.then_some(0),
         params: Vec::new(),
         fp: 0,
+        saved_sp: 0,
         values: Vec::new(),
         value_slots: vec![None; f.values.len()],
         ir_locals: Vec::new(),
@@ -128,9 +132,14 @@ pub(crate) fn emit_function(
     let first = u32::from(sret);
     fe.params = (0..f.params.len() as u32).map(|i| first + i).collect();
     fe.fp = fe.new_local(ValType::I32);
-    // Frame slots: aggregate locals, then each aggregate value made in memory.
-    for l in &f.locals {
-        if m.types.is_aggregate(l.ty) {
+    fe.saved_sp = fe.new_local(ValType::I32);
+    // Frame slots: aggregate and address-taken locals, then each aggregate value made in
+    // memory. More slots can be added while the body is emitted: the prologue, which sets the
+    // frame's size, is emitted last.
+    let mut addressed = vec![false; f.locals.len()];
+    address_taken(&f.body, &mut addressed);
+    for (l, &taken) in f.locals.iter().zip(&addressed) {
+        if m.types.is_aggregate(l.ty) || taken {
             let off = fe.slot(l.ty);
             fe.ir_locals.push(LocalRepr::Slot(off));
         } else {
@@ -154,11 +163,20 @@ pub(crate) fn emit_function(
         .into_iter()
         .map(|vt| fe.new_local(vt))
         .collect();
-    fe.frame = round_up(16, fe.frame);
-    // Prologue: fp = sp - frame; trap if that's below the stack's limit; sp = fp.
-    fe.ins.extend([
+    fe.block(&f.body)?;
+    // Falling off the end: only a function with no result can.
+    fe.epilogue();
+    if f.ret.is_some() && !sret {
+        fe.ins.push(I::Unreachable);
+    }
+    fe.ins.push(I::End);
+    // Prologue, now that the frame's size is final: saved = sp; fp = sp - frame; trap if that's
+    // below the stack's limit; sp = fp.
+    let frame = round_up(16, fe.frame);
+    let prologue = [
         I::GlobalGet(globals::SP),
-        I::I32Const(fe.frame as i32),
+        I::LocalTee(fe.saved_sp),
+        I::I32Const(frame as i32),
         I::I32Sub,
         I::LocalTee(fe.fp),
         I::I32Const(memory::STACK_LIMIT as i32),
@@ -168,20 +186,46 @@ pub(crate) fn emit_function(
         I::End,
         I::LocalGet(fe.fp),
         I::GlobalSet(globals::SP),
-    ]);
-    fe.block(&f.body)?;
-    // Falling off the end: only a function with no result can.
-    fe.epilogue();
-    if f.ret.is_some() && !sret {
-        fe.ins.push(I::Unreachable);
-    }
-    fe.ins.push(I::End);
-    let _ = fe.nparams;
+    ];
     let mut func = Function::new(fe.locals.iter().map(|t| (1, *t)));
-    for i in &fe.ins {
+    for i in prologue.iter().chain(&fe.ins) {
         func.instruction(i);
     }
     Ok(func)
+}
+
+/// Marks the locals whose address a body takes: passed by reference, or `Addr` of a place
+/// rooted at them.
+fn address_taken(b: &ir::Block, out: &mut [bool]) {
+    fn mark(p: &ir::Place, out: &mut [bool]) {
+        if let ir::PlaceRoot::Local(l) = p.root {
+            out[l.index()] = true;
+        }
+    }
+    for s in b {
+        match s {
+            ir::Stmt::Let(_, e) | ir::Stmt::Eval(e) => match e {
+                ir::Expr::Addr(p) | ir::Expr::Run(p) => mark(p, out),
+                ir::Expr::Call(_, args) => {
+                    for a in args {
+                        if let ir::Arg::Place(p) = a {
+                            mark(p, out);
+                        }
+                    }
+                }
+                _ => {}
+            },
+            ir::Stmt::If { then, else_, .. } => {
+                address_taken(then, out);
+                address_taken(else_, out);
+            }
+            ir::Stmt::Loop { body, continuing } => {
+                address_taken(body, out);
+                address_taken(continuing, out);
+            }
+            _ => {}
+        }
+    }
 }
 
 fn collect_lets<'a>(b: &'a ir::Block, out: &mut Vec<(ir::ValueId, &'a ir::Expr)>) {
@@ -227,12 +271,7 @@ impl<'m> Fe<'m> {
     }
 
     fn epilogue(&mut self) {
-        self.ins.extend([
-            I::LocalGet(self.fp),
-            I::I32Const(self.frame as i32),
-            I::I32Add,
-            I::GlobalSet(globals::SP),
-        ]);
+        self.ins.extend([I::LocalGet(self.saved_sp), I::GlobalSet(globals::SP)]);
     }
 
     fn trap_if(&mut self) {

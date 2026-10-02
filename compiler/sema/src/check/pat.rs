@@ -12,6 +12,9 @@ impl<'p> Checker<'p> {
     /// How a pattern binding of type `ty` holds its value: a `Copy` value is copied; anything
     /// else projects into the scrutinee when it's a place, and owns it when it's a temporary.
     fn binding_kind(&mut self, ty: TyId, from_place: bool) -> LocalKind {
+        // Through any inference variables bound so far: `[In { .. }; 2]`'s elements are `Copy`
+        // even before the array's type is written anywhere.
+        let ty = self.infer.resolve(&self.p.types, ty);
         if crate::traits::implements_builtin(self.p, ty, Lang::Copy)
             || matches!(self.kind(ty), TyKind::Var(_))
         {
@@ -57,13 +60,17 @@ impl<'p> Checker<'p> {
         let kind = match &pat.kind {
             ast::PatKind::Wild => PatKind::Wild,
             ast::PatKind::Ident(name) => {
-                // A unit variant or constant in scope is matched, not bound (`None`).
+                // A unit variant or constant in scope is matched, not bound (`None`, `MAX`).
                 match resolve::lookup_name(self.p, self.scope.module, &name.name) {
                     Some(Res::Variant(a, v))
                         if self.p.adt(a).variants()[v as usize].shape == VariantShape::Unit =>
                     {
                         return self.variant_pat(a, v, &[], span, ty);
                     }
+                    Some(Res::Const(c)) => match self.const_pat(c, ty, name.span) {
+                        Some(l) => PatKind::Lit(l),
+                        None => PatKind::Wild,
+                    },
                     _ => {
                         let kind = self.binding_kind(ty, from_place);
                         let id = self.declare_pattern_local(&name.name, ty, kind, name.span);
@@ -165,6 +172,76 @@ impl<'p> Checker<'p> {
         span: Span,
     ) -> LocalId {
         self.declare_local(name, ty, kind, span)
+    }
+
+    /// A constant used as a pattern: its value, which must be a number or a `bool`.
+    fn const_pat(&mut self, c: ConstId, ty: TyId, span: Span) -> Option<Lit> {
+        let ct = match self.p.const_(c).ty {
+            Some(t) => t,
+            None => self.const_tys.get(&c).copied().unwrap_or(self.p.types.error),
+        };
+        self.expect(ct, ty, span);
+        // Follow constants naming constants (cycles are reported where they're defined).
+        let mut seen = vec![c];
+        let mut cur = c;
+        let (neg, lit) = loop {
+            let def = self.p.const_(cur);
+            let mut e = &def.value;
+            let mut neg = false;
+            loop {
+                match &e.kind {
+                    ast::ExprKind::Paren(x) => e = x,
+                    ast::ExprKind::Unary(ast::UnOp::Neg, x) => {
+                        neg = !neg;
+                        e = x;
+                    }
+                    _ => break,
+                }
+            }
+            match &e.kind {
+                ast::ExprKind::Lit(l) => break (neg, l.clone()),
+                ast::ExprKind::Path(path) if !neg => {
+                    match resolve::resolve_value_item(self.p, def.module, path) {
+                        Some(Res::Const(d)) if !seen.contains(&d) => {
+                            seen.push(d);
+                            cur = d;
+                        }
+                        _ => return None,
+                    }
+                }
+                _ => {
+                    self.err(
+                        Diagnostic::new(
+                            codes::E0320,
+                            span,
+                            format!(
+                                "`{}` can't be a pattern: only a number or `bool` constant can",
+                                self.p.const_(c).name
+                            ),
+                        )
+                        .with_help("match its parts, or compare with `==` in a guard"),
+                    );
+                    return None;
+                }
+            }
+        };
+        let resolved = self.infer.resolve(&self.p.types, ty);
+        match lit.kind {
+            ast::LitKind::Bool(b) => Some(Lit::Bool(b)),
+            ast::LitKind::Int if self.p.types.is_float(resolved) => {
+                let v = wrela_syntax::lexer::int_value(&lit.text)? as f64;
+                Some(Lit::Float(if neg { -v } else { v }))
+            }
+            ast::LitKind::Int => {
+                let v = wrela_syntax::lexer::int_value(&lit.text)?;
+                Some(Lit::Int(if neg { v.wrapping_neg() } else { v }))
+            }
+            ast::LitKind::Float => {
+                let v = wrela_syntax::lexer::float_value(&lit.text);
+                Some(Lit::Float(if neg { -v } else { v }))
+            }
+            _ => None,
+        }
     }
 
     fn check_lit_pattern(&mut self, neg: bool, lit: &ast::Lit, ty: TyId) -> Option<Lit> {
@@ -316,6 +393,21 @@ impl<'p> Checker<'p> {
                 ));
                 continue;
             };
+            if v.is_none() && !decls[i].public && self.p.adt(a).module != self.scope.module {
+                self.err(
+                    Diagnostic::new(
+                        codes::E0210,
+                        f.name.span,
+                        format!(
+                            "the field `{}` of `{}` is private",
+                            f.name.name,
+                            self.p.adt(a).name
+                        ),
+                    )
+                    .with_secondary(decls[i].span, "declared here without `pub`")
+                    .with_help("leave it out with `..`"),
+                );
+            }
             let sub = match &f.pat {
                 Some(p) => self.check_pat(p, ftys[i].1, from_place),
                 None => {

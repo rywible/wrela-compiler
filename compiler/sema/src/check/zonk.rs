@@ -173,6 +173,26 @@ pub(super) fn finish_common(c: &mut Checker) {
             );
         }
     }
+    // `**` whose base's type settled later.
+    for (base, exp, span) in std::mem::take(&mut c.pows) {
+        let (b, e) = (c.infer.resolve(&c.p.types, base), c.infer.resolve(&c.p.types, exp));
+        let ok = match c.p.types.kind(b) {
+            TyKind::Int(_) => e == c.p.types.u32,
+            TyKind::Float(_) | TyKind::Vec(_) => e == b,
+            _ => true,
+        };
+        if !ok && !matches!(c.p.types.kind(e), TyKind::Error) {
+            let (bs, es) = (c.p.display_ty(b), c.p.display_ty(e));
+            c.err(
+                Diagnostic::new(
+                    codes::E0305,
+                    span,
+                    format!("`**` doesn't apply to `{bs}` and `{es}`"),
+                )
+                .with_note("an integer's exponent is a `u32`; a float's is the same float type"),
+            );
+        }
+    }
     // Integer literals must fit their types.
     let lits = std::mem::take(&mut c.int_literals);
     for (ty, v, neg, span) in lits {

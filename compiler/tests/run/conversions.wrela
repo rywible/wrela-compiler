@@ -1,0 +1,35 @@
+// run: a conversion doesn't retype the variable it converts
+// expect: semantic() = 3.0
+// expect: conv_u8() = 500
+// expect: f2(2.0) = 20.0
+// expect: neg_one() = 4294967295
+// expect: low_bits() = 255
+
+pub fn semantic() -> f32 {
+    let n = 7
+    let scale = 1.0 / f32(n)
+    f32(n / 2) + scale * 0.0
+}
+
+pub fn conv_u8() -> u32 {
+    let k = 5
+    let b = u8(k)
+    let wide = k * 100
+    u32(wide) + u32(b) * 0
+}
+
+pub fn f2(t: f32) -> f32 {
+    var acc = 0.0
+    for i in 0..5 {
+        acc += f32(i)
+    }
+    acc * t
+}
+
+pub fn neg_one() -> u32 {
+    u32(-1)
+}
+
+pub fn low_bits() -> u32 {
+    u32(u8(-1))
+}

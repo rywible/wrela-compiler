@@ -5,6 +5,7 @@ relative to the repo root, cross-origin isolated (COOP/COEP), as the browser run
 import http.server
 import os
 import sys
+import urllib.parse
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # the repo root
 
@@ -31,8 +32,10 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
     def results_path(self):
         """The file a PUT may write, or None. Only a file directly inside a `results/` directory
-        under the repo root; never through a symlink that leads out of the repo."""
-        rel = os.path.normpath(self.path.split("?", 1)[0].lstrip("/"))
+        under the repo root; never through a symlink that leads out of the repo. The path is
+        URL-decoded first, as a GET's is, so both name the same file."""
+        path = urllib.parse.unquote(self.path.split("?", 1)[0].split("#", 1)[0])
+        rel = os.path.normpath(path.lstrip("/"))
         parts = rel.split(os.sep)
         if rel.startswith("..") or os.path.isabs(rel) or len(parts) < 3 or parts[-2] != "results":
             return None

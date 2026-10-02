@@ -1,0 +1,21 @@
+// accepts: mem.copy
+struct In: Copy + Clone {
+    a: i32,
+}
+
+fn t() -> i32 {
+    var xs = [In { a: 1 }, In { a: 3 }]
+    let first = xs[0]
+    xs[0] = xs[1]
+    first.a
+}
+
+fn each() -> i32 {
+    var xs = [In { a: 1 }, In { a: 3 }]
+    var s = 0
+    for x in xs {
+        xs[0] = In { a: 5 }
+        s += x.a
+    }
+    s
+}

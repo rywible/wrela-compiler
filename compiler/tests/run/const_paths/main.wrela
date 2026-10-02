@@ -1,0 +1,21 @@
+// run: a constant used as an array length is resolved where it's defined
+// expect: len() = 4
+// expect: nval() = 4
+// expect: local_len() = 9
+
+use a::inner::N
+use helper::K
+
+pub fn len() -> u32 {
+    let xs = [0; N]
+    xs.len()
+}
+
+pub fn nval() -> u32 {
+    N
+}
+
+pub fn local_len() -> u32 {
+    let xs = [0; K]
+    xs.len()
+}

@@ -1,0 +1,28 @@
+// run: a method's generic arguments given with `::<...>`
+// expect: made() = 1.0
+// expect: zero() = 7
+
+struct S: Copy + Clone {
+    k: i32,
+}
+
+impl S {
+    fn make<T: Copy>(self, x: T) -> T {
+        x
+    }
+
+    fn zero<T: Copy>(self, x: i32) -> i32 {
+        x
+    }
+}
+
+pub fn made() -> f32 {
+    let s = S { k: 0 }
+    let y = s.make::<f32>(1)
+    y
+}
+
+pub fn zero() -> i32 {
+    let s = S { k: 0 }
+    s.zero::<f32>(7)
+}

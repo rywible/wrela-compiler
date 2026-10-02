@@ -44,6 +44,7 @@ pub fn collect(units: Vec<SourceUnit>, diags: &mut Vec<Diagnostic>) -> Program {
     c.resolve_imports();
     c.find_lang_items();
     c.resolve_signatures();
+    c.check_recursive_types();
     c.check_impls();
     c.p
 }
@@ -616,13 +617,8 @@ impl<'d> Collector<'d> {
                 PendingItem::Const(id, c) => {
                     if let Some(t) = &c.ty {
                         let scope = Scope::new(*m);
-                        let ty = resolve::resolve_type(
-                            &self.p,
-                            self.diags,
-                            &scope,
-                            t,
-                            TyPos::Normal,
-                        );
+                        let ty =
+                            resolve::resolve_type(&self.p, self.diags, &scope, t, TyPos::Normal);
                         self.p.consts[id.index()].ty = Some(ty);
                     }
                 }
@@ -821,8 +817,7 @@ impl<'d> Collector<'d> {
         let mut scope = Scope::new(m);
         scope.push_params(&self.p, &gens);
         self.set_param_bounds(&scope, &gens, &i.generics);
-        let self_ty =
-            resolve::resolve_type(&self.p, self.diags, &scope, &i.self_ty, TyPos::Normal);
+        let self_ty = resolve::resolve_type(&self.p, self.diags, &scope, &i.self_ty, TyPos::Normal);
         self.p.impls[id.index()].self_ty = self_ty;
         scope.self_ty = Some(self_ty);
         if let Some(t) = &i.trait_ {
@@ -965,6 +960,148 @@ impl<'d> Collector<'d> {
     }
 
     // ---- impls -----------------------------------------------------------------------------
+
+    /// A struct or enum that holds itself, directly or through other types, would be infinitely
+    /// large: there's no indirection in tier 0. Each cycle is reported once (E0318), and the
+    /// field that closes it gets the error type, so nothing later walks it forever.
+    fn check_recursive_types(&mut self) {
+        let n = self.p.adts.len();
+        let field_tys = |p: &Program, a: usize| -> Vec<(TyId, Span)> {
+            match &p.adts[a].kind {
+                AdtKind::Struct(fs) => fs.iter().map(|f| (f.ty, f.span)).collect(),
+                AdtKind::Enum(vs) => {
+                    vs.iter().flat_map(|v| v.fields.iter().map(|f| (f.ty, f.span))).collect()
+                }
+            }
+        };
+        // The ADTs a type holds by value, given which generic parameters each ADT holds.
+        fn held(p: &Program, holds: &[Vec<bool>], t: TyId, out: &mut Vec<TyKind>) {
+            match p.types.kind(t) {
+                TyKind::Adt(b, args) => {
+                    out.push(TyKind::Adt(*b, Vec::new()));
+                    for (i, &arg) in args.iter().enumerate() {
+                        if holds[b.index()].get(i).copied().unwrap_or(true) {
+                            held(p, holds, arg, out);
+                        }
+                    }
+                }
+                TyKind::Param(q) => out.push(TyKind::Param(*q)),
+                TyKind::Tuple(ts) => ts.iter().for_each(|&x| held(p, holds, x, out)),
+                TyKind::Array(e, _) => held(p, holds, *e, out),
+                _ => {}
+            }
+        }
+        // Which of its generic parameters each ADT holds by value: a fixpoint.
+        let mut holds: Vec<Vec<bool>> =
+            self.p.adts.iter().map(|a| vec![false; a.generics.len()]).collect();
+        loop {
+            let mut changed = false;
+            for a in 0..n {
+                for (t, _) in field_tys(&self.p, a) {
+                    let mut out = Vec::new();
+                    held(&self.p, &holds, t, &mut out);
+                    for k in out {
+                        if let TyKind::Param(q) = k
+                            && let Some(i) = self.p.adts[a].generics.iter().position(|&g| g == q)
+                            && !holds[a][i]
+                        {
+                            holds[a][i] = true;
+                            changed = true;
+                        }
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        // Edges: the ADTs each field holds, with the field.
+        let edges: Vec<Vec<(usize, usize)>> = (0..n)
+            .map(|a| {
+                let mut e = Vec::new();
+                for (fi, (t, _)) in field_tys(&self.p, a).into_iter().enumerate() {
+                    let mut out = Vec::new();
+                    held(&self.p, &holds, t, &mut out);
+                    for k in out {
+                        if let TyKind::Adt(b, _) = k {
+                            e.push((b.index(), fi));
+                        }
+                    }
+                }
+                e
+            })
+            .collect();
+        #[derive(Clone, Copy, PartialEq)]
+        enum Mark {
+            New,
+            Active,
+            Done,
+        }
+        let mut mark = vec![Mark::New; n];
+        let mut broken: Vec<(usize, usize)> = Vec::new();
+        for root in 0..n {
+            if mark[root] != Mark::New {
+                continue;
+            }
+            // (adt, next edge to follow)
+            let mut stack: Vec<(usize, usize)> = vec![(root, 0)];
+            mark[root] = Mark::Active;
+            while let Some(&mut (a, ref mut next)) = stack.last_mut() {
+                let Some(&(b, fi)) = edges[a].get(*next) else {
+                    mark[a] = Mark::Done;
+                    stack.pop();
+                    continue;
+                };
+                *next += 1;
+                match mark[b] {
+                    Mark::New => {
+                        mark[b] = Mark::Active;
+                        stack.push((b, 0));
+                    }
+                    Mark::Active => {
+                        let at = stack.iter().position(|&(x, _)| x == b).unwrap_or(0);
+                        let cycle: Vec<usize> = stack[at..].iter().map(|&(x, _)| x).collect();
+                        self.report_recursive(&cycle, a, field_tys(&self.p, a)[fi].1);
+                        broken.push((a, fi));
+                    }
+                    Mark::Done => {}
+                }
+            }
+        }
+        let error = self.p.types.error;
+        for (a, fi) in broken {
+            match &mut self.p.adts[a].kind {
+                AdtKind::Struct(fs) => fs[fi].ty = error,
+                AdtKind::Enum(vs) => {
+                    if let Some(f) = vs.iter_mut().flat_map(|v| v.fields.iter_mut()).nth(fi) {
+                        f.ty = error;
+                    }
+                }
+            }
+        }
+    }
+
+    fn report_recursive(&mut self, cycle: &[usize], last: usize, field_span: Span) {
+        let first = &self.p.adts[cycle[0]];
+        let msg = if cycle.len() == 1 {
+            format!(
+                "`{}` holds a `{}` inside itself, so it would be infinitely large",
+                first.name, first.name
+            )
+        } else {
+            let names: Vec<String> =
+                cycle.iter().map(|&a| format!("`{}`", self.p.adts[a].name)).collect();
+            format!("{} hold each other, so they would be infinitely large", names.join(", "))
+        };
+        let d = Diagnostic::new(codes::E0318, first.name_span, msg)
+            .with_secondary(
+                field_span,
+                format!("this field of `{}` closes the cycle", self.p.adts[last].name),
+            )
+            .with_note("a value holds its fields directly; there are no pointers in tier 0")
+            .with_help("hold an index into an array instead");
+        self.err(d);
+    }
 
     fn check_impls(&mut self) {
         // Opting in to a trait in a declaration implies an impl of it.
@@ -1304,8 +1441,7 @@ impl<'d> Collector<'d> {
             if self.p.types.has_params(f.ty) {
                 continue; // conditional on the arguments; checked where it's used
             }
-            let ok =
-                crate::traits::implements_builtin(&self.p, f.ty, lang.unwrap_or(Lang::Clone));
+            let ok = crate::traits::implements_builtin(&self.p, f.ty, lang.unwrap_or(Lang::Clone));
             if !ok {
                 let why = match lang {
                     Some(Lang::GpuData) => {

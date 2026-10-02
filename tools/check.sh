@@ -2,8 +2,8 @@
 # The local gate: what must pass before a commit lands on main. There's no CI (by design).
 #
 #   tools/check.sh           formatting, lints, every test that needs neither a GPU nor Chrome,
-#                            the browser runtime's checks, a fuzz smoke test, and the CLI's
-#                            speed budget
+#                            the tools' tests, the browser runtime's checks, a fuzz smoke test,
+#                            and the CLI's speed budget
 #   tools/check.sh --gpu     also the GPU and headless-Chrome tests (they queue on the GPU lock)
 #   tools/check.sh --long    also the full grammar run (10^6 programs) and a longer fuzz
 #
@@ -43,6 +43,9 @@ step "wrela fmt --check"
 
 step "tests: unit, conformance, diagnostics goldens, grammar, derived interpretations, ABI goldens, reproducibility, fuzz smoke"
 cargo test -q --workspace
+
+step "tools: the dev server and the headless-Chrome driver (fake Chrome)"
+python3 -m unittest discover -q -s tools/tests
 
 step "browser runtime: tests, types, dist is current, size budget"
 (cd runtime/browser && bun run checks)

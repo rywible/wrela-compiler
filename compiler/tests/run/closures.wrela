@@ -1,0 +1,37 @@
+// run: closures: captured reads and writes, passed down, called several times
+// expect: sum_to(4) = 10
+// expect: scaled(3.0) = 12.0
+// expect: fnref() = 9
+
+fn each(n: u32, f: fn(u32)) {
+    for i in 0..n {
+        f(i + 1)
+    }
+}
+
+pub fn sum_to(n: u32) -> u32 {
+    var s = 0
+    each(n, |i: u32| { s += i })
+    s
+}
+
+fn twice(f: fn(f32) -> f32, x: f32) -> f32 {
+    f(f(x))
+}
+
+pub fn scaled(x: f32) -> f32 {
+    let k = 2.0
+    twice(|v: f32| v * k, x)
+}
+
+fn add4(x: i32) -> i32 {
+    x + 4
+}
+
+fn call_with(f: fn(i32) -> i32, v: i32) -> i32 {
+    f(v)
+}
+
+pub fn fnref() -> i32 {
+    call_with(add4, 5)
+}

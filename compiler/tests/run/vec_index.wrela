@@ -1,0 +1,14 @@
+// run: vector indexing
+// expect: dyn_index(1) = 2.0
+// expect: dyn_index(3) traps
+// expect: lit_index() = 3.0
+
+pub fn dyn_index(i: u32) -> f32 {
+    let v = vec3(1.0, 2.0, 3.0)
+    v[i]
+}
+
+pub fn lit_index() -> f32 {
+    let v = vec3(1.0, 2.0, 3.0)
+    v[2]
+}

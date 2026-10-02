@@ -57,6 +57,9 @@ pub(crate) struct Checker<'p> {
     int_literals: Vec<(TyId, u64, bool, Span)>,
     /// Negations of integers whose type wasn't known yet: they must turn out signed.
     negated_ints: Vec<(TyId, Span)>,
+    /// `base ** exp` types, to check once the base's type is known: an integer's exponent is
+    /// a `u32`, a float's a float.
+    pows: Vec<(TyId, TyId, Span)>,
 }
 
 impl<'p> Checker<'p> {
@@ -84,6 +87,7 @@ impl<'p> Checker<'p> {
             obligations: Vec::new(),
             int_literals: Vec::new(),
             negated_ints: Vec::new(),
+            pows: Vec::new(),
         }
     }
 
@@ -449,6 +453,7 @@ impl<'p> Checker<'p> {
                 if mutable {
                     self.mark_written(&arr);
                 }
+                let elem = self.infer.resolve(&self.p.types, elem);
                 let copy = !mutable && crate::traits::implements_builtin(self.p, elem, Lang::Copy);
                 let kind = if copy {
                     LocalKind::Owned { mutable: false }
@@ -559,22 +564,63 @@ impl<'p> Checker<'p> {
     }
 }
 
+/// Whether a loop body can `break` out of its loop: a `break` anywhere in it, outside nested
+/// loops (whose `break`s are their own) and closures (which can't `break`).
 fn has_break(b: &Block) -> bool {
     fn in_expr(e: &Expr) -> bool {
         match &e.kind {
             ExprKind::Break => true,
+            ExprKind::Lit(_)
+            | ExprKind::Local(_)
+            | ExprKind::Const(_)
+            | ExprKind::Closure(_)
+            | ExprKind::FnRef(..)
+            | ExprKind::Continue
+            | ExprKind::Error => false,
+            ExprKind::Unary(_, x)
+            | ExprKind::Field(x, _)
+            | ExprKind::Swizzle(x, _)
+            | ExprKind::ArrayRepeat(x, _)
+            | ExprKind::Convert(x)
+            | ExprKind::Take(x)
+            | ExprKind::MutArg(x) => in_expr(x),
+            ExprKind::Binary(_, a, b) | ExprKind::Index(a, b) => in_expr(a) || in_expr(b),
+            ExprKind::Call(c) => c.args.iter().any(in_expr),
+            ExprKind::Adt { fields: xs, .. }
+            | ExprKind::Tuple(xs)
+            | ExprKind::Array(xs)
+            | ExprKind::Construct(xs) => xs.iter().any(in_expr),
             ExprKind::Block(b) => has_break(b),
-            ExprKind::If { then, else_, .. } => {
-                has_break(then) || else_.as_ref().is_some_and(|e| in_expr(e))
+            ExprKind::If { cond, then, else_ } => {
+                in_expr(cond) || has_break(then) || else_.as_ref().is_some_and(|e| in_expr(e))
             }
-            ExprKind::Match { arms, .. } => arms.iter().any(|a| in_expr(&a.body)),
-            _ => false,
+            ExprKind::Match { scrutinee, arms } => {
+                in_expr(scrutinee)
+                    || arms
+                        .iter()
+                        .any(|a| a.guard.as_ref().is_some_and(in_expr) || in_expr(&a.body))
+            }
+            ExprKind::Return(v) => v.as_ref().is_some_and(|v| in_expr(v)),
+            ExprKind::Dispatch(d) => {
+                d.groups.iter().any(in_expr) || d.args.iter().any(|(_, a)| in_expr(a))
+            }
+            ExprKind::Draw(d) => {
+                in_expr(&d.vertices)
+                    || in_expr(&d.instances)
+                    || d.args.iter().any(|(_, a)| in_expr(a))
+            }
         }
     }
     b.stmts.iter().any(|s| match &s.kind {
         StmtKind::Expr(e) => in_expr(e),
         StmtKind::Bind { init, .. } => in_expr(init),
-        _ => false, // a nested loop's `break` is its own
+        StmtKind::Assign { place, value, .. } => in_expr(place) || in_expr(value),
+        // A nested loop's `break`s end it (a `while` condition is part of the loop); a `for`
+        // loop's range or array is evaluated before it starts.
+        StmtKind::While { .. } => false,
+        StmtKind::ForRange { start, end, .. } => in_expr(start) || in_expr(end),
+        StmtKind::ForEach { array, .. } => in_expr(array),
+        StmtKind::Loop { .. } => false,
     }) || b.tail.as_ref().is_some_and(|t| in_expr(t))
 }
 

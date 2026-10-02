@@ -663,6 +663,16 @@ impl<'p> Checker<'p> {
                 self.expect(y.ty, t, y.span);
                 return Expr { ty: t, span, kind: ExprKind::Binary(op, Box::new(x), Box::new(y)) };
             }
+            BinOp::Pow => {
+                // An integer base takes a `u32` exponent; anything else, its own type.
+                let x = self.check_expr(a, expected);
+                let int_base = matches!(self.kind(x.ty), TyKind::Int(_))
+                    || self.infer.var_kind(&self.p.types, x.ty) == Some(VarKind::Int);
+                let hint = if int_base { self.p.types.u32 } else { x.ty };
+                let y = self.check_expr(b, Some(hint));
+                self.pows.push((x.ty, y.ty, span));
+                (x, y)
+            }
             BinOp::Shl | BinOp::Shr => {
                 let x = self.check_expr(a, if op.is_comparison() { None } else { expected });
                 let u = self.p.types.u32;
@@ -780,7 +790,10 @@ impl<'p> Checker<'p> {
                 _ => fail(self),
             },
             BinOp::Pow => match (self.kind(a), self.kind(b)) {
-                (TyKind::Int(_), _) => {
+                (TyKind::Int(_), _) | (TyKind::Var(_), _)
+                    if matches!(ka, TyKind::Int(_))
+                        || self.infer.var_kind(&self.p.types, a) == Some(VarKind::Int) =>
+                {
                     let u = self.p.types.u32;
                     if self.infer.unify(&self.p.types, b, u).is_err() {
                         self.err(Diagnostic::new(
@@ -1074,6 +1087,19 @@ impl<'p> Checker<'p> {
                 )
                 .with_help("convert it: `u32(i)`"),
             );
+        }
+        // A vector's or matrix's components are fixed: a literal index past them is caught here
+        // (a computed one traps at run time, like an array's).
+        if let (TyKind::Vec(n) | TyKind::Mat(n), ExprKind::Lit(Lit::Int(v))) = (&k, &i.kind)
+            && *v >= u64::from(*n)
+        {
+            let shown = self.display(b.ty);
+            let what = if matches!(k, TyKind::Vec(_)) { "components" } else { "columns" };
+            self.err(Diagnostic::new(
+                codes::E0312,
+                i.span,
+                format!("index {v} is out of range: a `{shown}` has {n} {what}"),
+            ));
         }
         let elem = match k {
             TyKind::Array(t, _) | TyKind::Slice(t) => t,

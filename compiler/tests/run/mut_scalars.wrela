@@ -1,0 +1,32 @@
+// run: scalar locals passed `mut`, and closures that write them
+// expect: a() = 1
+// expect: closures(3) = 6
+// expect: twice() = 2
+
+fn inc(n: mut i32) {
+    n += 1
+}
+
+pub fn a() -> i32 {
+    var n = 0
+    inc(mut n)
+    n
+}
+
+fn apply(f: fn(i32), a: i32) {
+    f(a)
+    f(a)
+}
+
+pub fn closures(a: i32) -> i32 {
+    var acc = 0
+    apply(|v: i32| { acc += v }, a)
+    acc
+}
+
+pub fn twice() -> i32 {
+    var n = 0
+    inc(mut n)
+    inc(mut n)
+    n
+}

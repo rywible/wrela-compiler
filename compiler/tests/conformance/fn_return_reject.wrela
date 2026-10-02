@@ -1,0 +1,27 @@
+// rejects: fn.return
+fn assign(n: i32) -> i32 { //~ E0314
+    var x = 0
+    loop {
+        x += if x > n { break } else { 1 }
+    }
+}
+
+fn operand(n: i32) -> i32 { //~ E0314
+    var x = 0
+    loop {
+        x += 1
+        if x > n && { break; true } {
+            x += 100
+        }
+    }
+}
+
+fn argument(n: i32) -> i32 { //~ E0314
+    loop {
+        let y = max(n, if n > 3 { break } else { 2 })
+    }
+}
+
+fn no_tail(n: i32) -> i32 { //~ E0314
+    let y = n + 1
+}

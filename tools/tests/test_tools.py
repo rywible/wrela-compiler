@@ -14,6 +14,7 @@ import threading
 import time
 import unittest
 import urllib.error
+import urllib.parse
 import urllib.request
 
 TESTS = os.path.dirname(os.path.abspath(__file__))
@@ -205,12 +206,24 @@ class ServeTest(unittest.TestCase):
             self.assertEqual(f.read(), b"{}")
         self.assertEqual(os.listdir(os.path.join(self.page_dir, "results")), ["out.json"])
 
+    def test_put_decodes_the_path_like_a_get(self):
+        spaced = tempfile.mkdtemp(prefix=".test page-", dir=TOOLS)
+        try:
+            rel = urllib.parse.quote(os.path.relpath(spaced, ROOT))
+            self.assertEqual(self.put(f"{rel}/results/out%20file.json", b"{}"), 201)
+            self.assertEqual(os.listdir(os.path.join(spaced, "results")), ["out file.json"])
+            with urllib.request.urlopen(f"{self.base}/{rel}/results/out%20file.json") as r:
+                self.assertEqual(r.read(), b"{}")
+        finally:
+            shutil.rmtree(spaced, ignore_errors=True)
+
     def test_put_elsewhere_is_refused(self):
         for path in [
             f"{self.page}/out.json",
             f"{self.page}/results/deeper/out.json",
             "results/out.json",
             f"{self.page}/results/../../../../escape/results/x",
+            f"{self.page}/results/%2e%2e/%2e%2e/%2e%2e/%2e%2e/escape/results/x",
         ]:
             self.assertEqual(self.put(path), 403, path)
 

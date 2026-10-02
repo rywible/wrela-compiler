@@ -1,0 +1,9 @@
+// rejects: ty.vectors
+fn f() -> f32 {
+    let v = vec3(1.0, 2.0, 3.0)
+    let m = mat2(vec2(1.0, 0.0), vec2(0.0, 1.0))
+    let a = v[7] //~ E0312
+    let b = v[256] //~ E0312
+    let c = m[2] //~ E0312
+    v[2] + m[1].x
+}
