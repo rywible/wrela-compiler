@@ -190,7 +190,10 @@ fn derive(
     }
     nf.body = Vec::new();
     let id = m.add_function(Function::new(nf.name.clone(), Vec::new(), None));
-    cache.interval.insert((f, mask), id);
+    // Cached before its body is built, for calls back into it; removed again if building
+    // fails, so a later request doesn't find the bodiless placeholder.
+    let key = (f, mask);
+    cache.interval.insert(key.clone(), id);
     let mut b = Ivx {
         m,
         cache,
@@ -206,13 +209,19 @@ fn derive(
         at: None,
     };
     let mut body = Vec::new();
-    if let Some(r) = result.filter(|r| b.act.locals[r.index()]) {
-        // The result starts empty, so a side that never returns adds nothing to the hull.
-        let ty = b.nf.locals[r.index()].ty;
-        let e = b.empty(&mut body, ty)?;
-        b.store_root(&mut body, &PlaceRoot::Local(r), e)?;
+    let built = (|| -> R<()> {
+        if let Some(r) = result.filter(|r| b.act.locals[r.index()]) {
+            // The result starts empty, so a side that never returns adds nothing to the hull.
+            let ty = b.nf.locals[r.index()].ty;
+            let e = b.empty(&mut body, ty)?;
+            b.store_root(&mut body, &PlaceRoot::Local(r), e)?;
+        }
+        b.block_into(&func.body, &mut body)
+    })();
+    if let Err(e) = built {
+        b.cache.interval.remove(&key);
+        return Err(e);
     }
-    b.block_into(&func.body, &mut body)?;
     let mut nf = b.nf;
     nf.body = body;
     m.functions[id.index()] = nf;
@@ -419,24 +428,21 @@ impl<'a> Ivx<'a> {
         vals: &[ValueId],
         f: &mut LeafFn<'_, 'a>,
     ) -> R<ValueId> {
-        let parts: Vec<(TypeId, Expr)>;
+        // The parts' types. `vals` may be empty (an empty range is built from nothing).
+        let parts: Vec<TypeId>;
         let mut arrays = false;
         match self.m.types.get(ty).clone() {
             TypeDef::Scalar(_) | TypeDef::Vector(_) => return f(self, out, ty, vals),
             TypeDef::Matrix(n) => {
                 let col = self.m.types.vector(n);
-                parts = (0..n as u32).map(|c| (col, Expr::Extract(vals[0], c))).collect();
+                parts = vec![col; n as usize];
             }
             TypeDef::Struct { fields, .. } => {
-                parts = fields
-                    .iter()
-                    .enumerate()
-                    .map(|(k, (_, t))| (*t, Expr::Extract(vals[0], k as u32)))
-                    .collect();
+                parts = fields.iter().map(|(_, t)| *t).collect();
             }
             TypeDef::Array(e, n) if n <= 256 => {
                 arrays = true;
-                parts = (0..n).map(|k| (e, Expr::Extract(vals[0], k))).collect();
+                parts = vec![e; n as usize];
             }
             _ => {
                 return Err(Error::not_derivable(format!(
@@ -447,7 +453,7 @@ impl<'a> Ivx<'a> {
         }
         let u32t = self.m.types.u32();
         let mut built = Vec::new();
-        for (k, (pt, _)) in parts.iter().enumerate() {
+        for (k, pt) in parts.iter().enumerate() {
             let mut xs = Vec::new();
             for &v in vals {
                 let e = if arrays {

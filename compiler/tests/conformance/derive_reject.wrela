@@ -31,3 +31,17 @@ fn outer(x: f32) -> f32 {
 pub fn c(x: f32) -> f32 {
     interval(outer, Interval { lo: x, hi: x + 1.0 }).lo
 }
+
+/// A failure inside a callee, asked for twice: the second request mustn't find the first's
+/// half-built derivation (it reports the loop again, not an internal error).
+fn doubled(t: f32) -> f32 {
+    wobble(t) * 2.0
+}
+
+pub fn d(x: f32) -> f32 {
+    interval(|t: f32| doubled(t), Interval { lo: x, hi: x + 1.0 }).lo
+}
+
+pub fn e(x: f32) -> f32 {
+    interval(|t: f32| doubled(t) + 1.0, Interval { lo: x, hi: x + 1.0 }).lo
+}

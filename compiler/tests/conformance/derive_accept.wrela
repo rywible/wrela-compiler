@@ -18,3 +18,11 @@ pub fn h(x: f32) -> f32 {
     let (v, d) = value_and_gradient(|t: f32| sin(t), x)
     r.lo + s.hi + v + d
 }
+
+/// Derivations nest: a Hessian row, and the interval of a gradient component.
+pub fn nested(x: f32) -> f32 {
+    let p = vec3(x, 1.0, 2.0)
+    let h = gradient(|q: vec3| gradient(f, q).x, p)
+    let r = interval(|q: vec3| gradient(f, q).y, Box3 { lo: p, hi: p + 1.0 })
+    h.y + r.hi
+}

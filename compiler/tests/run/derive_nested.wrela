@@ -1,0 +1,64 @@
+// run: derivations nest: a gradient of a gradient, an interval of a gradient; and a box's
+// gradient inside it, where `length(max(q, 0))` is at zero
+// expect: hxx(3.0) = 6.0
+// expect: hxy(2.0, 3.0) = 4.0
+// expect: encloses() = true
+// expect: encloses_exits() = true
+// expect: inside_x() = 0.0
+// expect: inside_y() = 1.0
+use std::derive::{Box3, gradient, interval}
+
+/// x² y: its Hessian has ∂²/∂x² = 2y and ∂²/∂x∂y = 2x, exactly in floats here.
+fn f(p: vec3) -> f32 {
+    p.x * p.x * p.y
+}
+
+pub fn hxx(y: f32) -> f32 {
+    gradient(|q: vec3| gradient(f, q).x, vec3(1.0, y, 0.0)).x
+}
+
+pub fn hxy(x: f32, y: f32) -> f32 {
+    gradient(|q: vec3| gradient(f, q).x, vec3(x, y, 0.0)).y
+}
+
+/// Over x in [1, 2], y in [3, 4], ∂f/∂x = 2xy is in [6, 16]: the interval of the gradient
+/// holds both ends.
+pub fn encloses() -> bool {
+    let r = interval(
+        |q: vec3| gradient(f, q).x,
+        Box3 { lo: vec3(1.0, 3.0, 0.0), hi: vec3(2.0, 4.0, 0.0) },
+    )
+    r.lo <= 6.0 && r.hi >= 16.0
+}
+
+/// x² y again, with two exits: its gradient's derived function then returns through a result
+/// local of the gradient's (struct) type, whose interval starts empty.
+fn g(p: vec3) -> f32 {
+    if p.z > 0.5 {
+        return p.x * p.x * p.y
+    }
+    p.x * p.x * p.y
+}
+
+pub fn encloses_exits() -> bool {
+    let r = interval(
+        |q: vec3| gradient(g, q).x,
+        Box3 { lo: vec3(1.0, 3.0, 0.0), hi: vec3(2.0, 4.0, 1.0) },
+    )
+    r.lo <= 6.0 && r.hi >= 16.0
+}
+
+/// The exact box (language.md §17). Inside it, `max(q, 0)` is zero and so is `length`'s, but
+/// its tangent is zero too: the gradient is the nearest face's normal, not 0/0.
+fn cuboid(p: vec3) -> f32 {
+    let q = abs(p) - vec3(1.0, 1.0, 1.0)
+    length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0)
+}
+
+pub fn inside_x() -> f32 {
+    gradient(cuboid, vec3(0.2, 0.5, 0.1)).x
+}
+
+pub fn inside_y() -> f32 {
+    gradient(cuboid, vec3(0.2, 0.5, 0.1)).y
+}

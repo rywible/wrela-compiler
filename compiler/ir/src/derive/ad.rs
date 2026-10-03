@@ -184,7 +184,10 @@ pub(super) fn derive(
     }
     nf.body = Vec::new();
     let id = m.add_function(Function::new(nf.name.clone(), Vec::new(), None));
-    cache.ad.insert((f, mask, n), id);
+    // Cached before its body is built, for calls back into it; removed again if building
+    // fails, so a later request doesn't find the bodiless placeholder.
+    let key = (f, mask, n);
+    cache.ad.insert(key.clone(), id);
     let mut b = Ad {
         m,
         cache,
@@ -201,7 +204,13 @@ pub(super) fn derive(
         twins: LoadTwins::default(),
         at: None,
     };
-    let body = b.block(&func.body)?;
+    let body = match b.block(&func.body) {
+        Ok(body) => body,
+        Err(e) => {
+            b.cache.ad.remove(&key);
+            return Err(e);
+        }
+    };
     let mut nf = b.nf;
     nf.body = body;
     m.functions[id.index()] = nf;
@@ -286,6 +295,19 @@ impl Ad<'_> {
             }
         };
         self.bin(out, BinOp::Mul, x, r, ty)
+    }
+
+    /// `x / d` for a vector's length `d`, with `d` raised to at least 10⁻³⁰. Where a length is
+    /// zero, `x` (its vector dotted with a tangent) is zero too: inside a box,
+    /// `length(max(q, 0))` is zero and moves in no direction, and its tangent is then zero, not
+    /// 0/0. One `max` per statement, shared by its directions. (`sqrt` keeps a plain division:
+    /// guarding it measurably slowed the grazer's gradient kernel, and its 0/0 happens only at
+    /// isolated points, such as a round cone's axis.)
+    fn div_from_zero(&mut self, out: &mut Block, x: ValueId, d: ValueId, ty: TypeId) -> ValueId {
+        let dt = self.ty(d);
+        let floor = self.f32c(out, 1e-30);
+        let d = self.builtin(out, Builtin::Max, vec![d, floor], dt);
+        self.div(out, x, d, ty)
     }
 
     /// The builtin `b` of type `ty`; an elementwise one's scalar arguments are splatted to a
@@ -828,7 +850,7 @@ impl Ad<'_> {
             B::Length => d[0].map(|dx| {
                 if matches!(self.m.types.get(a0ty), TypeDef::Vector(_)) {
                     let dot = self.builtin(out, B::Dot, vec![a0, dx], ty);
-                    self.div(out, dot, v, ty)
+                    self.div_from_zero(out, dot, v, ty)
                 } else {
                     let s = self.builtin(out, B::Sign, vec![a0], ty);
                     self.bin(out, BinOp::Mul, dx, s, ty)
@@ -840,7 +862,7 @@ impl Ad<'_> {
                     let diff = self.bin(out, BinOp::Sub, args[0], args[1], a0ty);
                     if matches!(self.m.types.get(a0ty), TypeDef::Vector(_)) {
                         let dot = self.builtin(out, B::Dot, vec![diff, dd], ty);
-                        self.div(out, dot, v, ty)
+                        self.div_from_zero(out, dot, v, ty)
                     } else {
                         let s = self.builtin(out, B::Sign, vec![diff], ty);
                         self.bin(out, BinOp::Mul, dd, s, ty)
