@@ -1,0 +1,10 @@
+// mistake: a block in an argument closed with `)` instead of `}`
+// expect: E0101
+// fix: no
+fn twice(x: i32) -> i32 {
+    x * 2
+}
+
+pub fn four() -> i32 {
+    twice({ 2 )
+}

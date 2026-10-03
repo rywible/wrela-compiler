@@ -320,7 +320,7 @@ pub fn decode(batch: &[u8]) -> Result<Vec<Command<'_>>, StreamError> {
 }
 
 /// Checks that commands come in a valid order across batches (see the module docs).
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Sequencer {
     in_pass: bool,
 }

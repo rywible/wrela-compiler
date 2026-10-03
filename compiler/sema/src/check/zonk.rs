@@ -7,7 +7,7 @@ use crate::program::Program;
 use crate::thir::*;
 use crate::traits;
 use crate::ty::*;
-use wrela_diag::{Diagnostic, codes};
+use wrela_diag::{Diagnostic, Span, codes};
 
 /// Applies `f` to every type in an expression tree.
 pub fn walk_tys(e: &mut Expr, f: &mut impl FnMut(&mut TyId)) {
@@ -188,6 +188,22 @@ pub(super) fn finish_common(c: &mut Checker) {
             );
         }
     }
+    // Indexes whose literal type settled later.
+    for (ty, span) in std::mem::take(&mut c.indexes) {
+        let ty = c.infer.resolve(&c.p.types, ty);
+        if !matches!(c.p.types.kind(ty), TyKind::Int(IntTy::I32 | IntTy::U32) | TyKind::Error) {
+            let shown = c.p.display_ty(ty);
+            c.err(
+                Diagnostic::new(
+                    codes::E0312,
+                    span,
+                    format!("an index must be a `u32` or `i32`, not `{shown}`"),
+                )
+                .with_note("its type was inferred from how it's used later")
+                .with_help("convert it: `u32(i)`"),
+            );
+        }
+    }
     // Built-in calls whose literal arguments settled later.
     for (b, tys, span) in std::mem::take(&mut c.builtin_calls) {
         let tys: Vec<TyId> = tys.iter().map(|&t| c.infer.resolve(&c.p.types, t)).collect();
@@ -252,9 +268,18 @@ pub(super) fn finish_common(c: &mut Checker) {
                 }
             }
             TyKind::Float(f) => {
+                // Rounded and converted back, it's the same number. 2⁶⁴ (u64::MAX rounded)
+                // doesn't fit back in a u64, where the conversion would saturate.
+                const TWO_64: f64 = 18446744073709551616.0;
                 let exact = match f {
-                    FloatTy::F32 => v <= (1 << 24) || (v as f32) as u64 == v,
-                    FloatTy::F64 => v <= (1 << 53) || (v as f64) as u64 == v,
+                    FloatTy::F32 => {
+                        let x = v as f32;
+                        f64::from(x) < TWO_64 && x as u64 == v
+                    }
+                    FloatTy::F64 => {
+                        let x = v as f64;
+                        x < TWO_64 && x as u64 == v
+                    }
                 };
                 if !exact {
                     c.err(
@@ -271,10 +296,10 @@ pub(super) fn finish_common(c: &mut Checker) {
         }
     }
     // Float literals must be finite in their types (rounding is accepted).
-    for (ty, v, span) in std::mem::take(&mut c.float_literals) {
+    for (ty, v, f, span) in std::mem::take(&mut c.float_literals) {
         let t = c.infer.resolve(&c.p.types, ty);
         let largest = match c.p.types.kind(t) {
-            TyKind::Float(FloatTy::F32) if !(v as f32).is_finite() => "3.4e38",
+            TyKind::Float(FloatTy::F32) if !f.is_finite() => "3.4e38",
             TyKind::Float(FloatTy::F64) if !v.is_finite() => "1.8e308",
             _ => continue,
         };
@@ -350,6 +375,17 @@ pub(super) fn finish(
     for l in &mut locals {
         resolve(&mut l.ty);
     }
+    // A type can grow past the bound after the expression that made it was checked, through
+    // variables bound later (`a = Some((b, b))` before `b`'s type is known): checked here.
+    if !c.too_large
+        && let Some(l) = locals.iter().find(|l| types.size(l.ty) > MAX_TYPE_SIZE)
+    {
+        c.diags.push(Diagnostic::new(
+            codes::E0329,
+            l.span,
+            format!("`{}`'s type is too large: it has more than {MAX_TYPE_SIZE} parts", l.name),
+        ));
+    }
     let mut closures: Vec<ClosureDef> =
         std::mem::take(&mut c.closures).into_iter().flatten().collect();
     for cl in &mut closures {
@@ -363,6 +399,136 @@ pub(super) fn finish(
     }
     let body = Body { params, locals, closures, value, hidden_ret };
     (body, c.diags)
+}
+
+/// E0504 for a `mut` marker that passes nothing mutably: it marks an argument, what a
+/// `-> mut T` function returns, or what a `mut` binding projects. And E0908 for `match mut`,
+/// which is tier 1 (its bindings would be read-only).
+pub(super) fn stray_markers(p: &Program, body: &Body, ret_mut: bool, out: &mut Vec<Diagnostic>) {
+    let walk = Markers { p, body, ret_mut };
+    walk.expr(&body.value, ret_mut, out);
+    for cl in &body.closures {
+        walk.expr(&cl.body, false, out);
+    }
+}
+
+struct Markers<'a> {
+    p: &'a Program,
+    body: &'a Body,
+    ret_mut: bool,
+}
+
+impl Markers<'_> {
+    /// `here`: whether a marker on `e` itself is one that passes a place mutably.
+    fn expr(&self, e: &Expr, here: bool, out: &mut Vec<Diagnostic>) {
+        match &e.kind {
+            ExprKind::MutArg(inner) => {
+                if !here {
+                    let marker = Span::new(e.span.file, e.span.start, inner.span.start);
+                    out.push(
+                        Diagnostic::new(
+                            codes::E0504,
+                            marker,
+                            "`mut` marks a place passed mutably, and nothing takes this one mutably",
+                        )
+                        .with_note("it goes on an argument for a `mut` parameter, or on what a `-> mut T` function returns")
+                        .with_fix("remove `mut`", marker, ""),
+                    );
+                }
+                self.expr(inner, false, out);
+            }
+            // A function's arguments are checked against its parameters at the call (E0503,
+            // E0504); a built-in's or a closure's are checked here.
+            ExprKind::Call(c) => {
+                let checked = match c.callee {
+                    Callee::Fn { .. } | Callee::TraitMethod { .. } => true,
+                    // A local that names a function is called as the function is.
+                    Callee::Local(l) => {
+                        matches!(self.p.types.kind(self.body.local(l).ty), TyKind::FnDef(..))
+                    }
+                    Callee::Builtin(_) | Callee::Clone => false,
+                };
+                for (i, a) in c.args.iter().enumerate() {
+                    self.expr(a, checked || c.modes.get(i) == Some(&Mode::Mut), out);
+                }
+            }
+            ExprKind::Dispatch(d) => {
+                self.expr(&d.groups, false, out);
+                d.args.iter().for_each(|(_, a)| self.expr(a, true, out));
+            }
+            ExprKind::Match { scrutinee, arms } => {
+                match &scrutinee.kind {
+                    ExprKind::MutArg(inner) => {
+                        out.push(
+                            Diagnostic::new(
+                                codes::E0908,
+                                scrutinee.span,
+                                "`match mut` is tier 1: the names it binds would be read-only",
+                            )
+                            .with_help(
+                                "match without `mut`, and write a changed value back to the place",
+                            ),
+                        );
+                        self.expr(inner, false, out);
+                    }
+                    _ => self.expr(scrutinee, false, out),
+                }
+                for arm in arms {
+                    if let Some(g) = &arm.guard {
+                        self.expr(g, false, out);
+                    }
+                    self.expr(&arm.body, here, out);
+                }
+            }
+            ExprKind::If { cond, then, else_ } => {
+                self.expr(cond, false, out);
+                self.block(then, here, out);
+                if let Some(x) = else_ {
+                    self.expr(x, here, out);
+                }
+            }
+            ExprKind::Block(b) => self.block(b, here, out),
+            ExprKind::Return(Some(v)) => self.expr(v, self.ret_mut, out),
+            _ => e.for_each_child(&mut |c| match c {
+                Child::Expr(x) => self.expr(x, false, out),
+                Child::Block(b) => self.block(b, false, out),
+            }),
+        }
+    }
+
+    fn block(&self, b: &Block, tail: bool, out: &mut Vec<Diagnostic>) {
+        for s in &b.stmts {
+            match &s.kind {
+                StmtKind::Bind { pat, init } => {
+                    let projects_mut = matches!(&pat.kind, PatKind::Bind(l)
+                        if matches!(self.body.local(*l).kind, LocalKind::Projection { mutable: true }));
+                    self.expr(init, projects_mut, out);
+                }
+                StmtKind::Assign { place, value, .. } => {
+                    self.expr(place, false, out);
+                    self.expr(value, false, out);
+                }
+                StmtKind::Expr(e) => self.expr(e, false, out),
+                StmtKind::While { cond, body } => {
+                    self.expr(cond, false, out);
+                    self.block(body, false, out);
+                }
+                StmtKind::Loop { body } => self.block(body, false, out),
+                StmtKind::ForRange { start, end, body, .. } => {
+                    self.expr(start, false, out);
+                    self.expr(end, false, out);
+                    self.block(body, false, out);
+                }
+                StmtKind::ForEach { array, body, .. } => {
+                    self.expr(array, false, out);
+                    self.block(body, false, out);
+                }
+            }
+        }
+        if let Some(t) = &b.tail {
+            self.expr(t, tail, out);
+        }
+    }
 }
 
 /// E0510 (§6.7): a function type is a parameter's type only, so a closure or function can't
@@ -425,12 +591,23 @@ fn stored_callables_block(p: &Program, b: &Block, out: &mut Vec<Diagnostic>) {
 
 /// Whether a value of type `t` is or holds a closure or function.
 fn holds_callable(types: &Types, t: TyId) -> bool {
-    match types.kind(t) {
-        TyKind::Closure(..) | TyKind::FnPtr(..) | TyKind::FnDef(..) => true,
-        TyKind::Tuple(ts) | TyKind::Adt(_, ts) => ts.iter().any(|&t| holds_callable(types, t)),
-        TyKind::Array(e, _) | TyKind::Slice(e) => holds_callable(types, *e),
-        _ => false,
+    // `clear`: parts found not to hold one, tested once however often a type shares them.
+    fn holds(types: &Types, t: TyId, clear: &mut std::collections::HashSet<TyId>) -> bool {
+        if clear.contains(&t) {
+            return false;
+        }
+        let found = match types.kind(t) {
+            TyKind::Closure(..) | TyKind::FnPtr(..) | TyKind::FnDef(..) => true,
+            TyKind::Tuple(ts) | TyKind::Adt(_, ts) => ts.iter().any(|&t| holds(types, t, clear)),
+            TyKind::Array(e, _) | TyKind::Slice(e) => holds(types, *e, clear),
+            _ => false,
+        };
+        if !found {
+            clear.insert(t);
+        }
+        found
     }
+    holds(types, t, &mut std::collections::HashSet::new())
 }
 
 pub(super) fn finish_const(mut c: Checker, mut e: Expr) -> ((TyId, Expr), Vec<Diagnostic>) {
@@ -447,6 +624,10 @@ pub(super) fn finish_const(mut c: Checker, mut e: Expr) -> ((TyId, Expr), Vec<Di
             )
             .with_note("evaluating calls and arithmetic at compile time is tier 1 (D-073)"),
         );
+        // A rejected value has no type for its uses: they stay quiet, and don't take what's
+        // made here (a closure belongs to this body) into another body.
+        let error = c.p.types.error;
+        return ((error, Expr { ty: error, span: e.span, kind: ExprKind::Error }), c.diags);
     }
     ((e.ty, e), c.diags)
 }

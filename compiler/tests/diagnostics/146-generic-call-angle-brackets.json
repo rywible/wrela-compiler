@@ -1,0 +1,40 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0107",
+      "file": "main.wrela",
+      "fixes": [
+        {
+          "edits": [
+            {
+              "end": 172,
+              "file": "main.wrela",
+              "replacement": "::",
+              "start": 172
+            }
+          ],
+          "message": "write `::<`"
+        }
+      ],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "in an expression, generic arguments are written `first::<...>`",
+      "notes": [
+        "`<` and `>` here are comparisons, which don't chain"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 14,
+        "end": 177,
+        "end_column": 15,
+        "end_line": 9,
+        "line": 9,
+        "start": 176
+      },
+      "title": "comparisons don't chain"
+    }
+  ],
+  "version": 2
+}

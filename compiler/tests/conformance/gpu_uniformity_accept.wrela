@@ -1,6 +1,8 @@
 // accepts: gpu.uniformity
 // Derivatives where every pixel reaches them together: before a branch, after branches that
-// meet again, in a branch on a uniform value, and after a loop.
+// meet again (an exhaustive `match` included), in a branch on a uniform value, and after a loop
+// (one left only by `return`, in a function the shader calls, included). A `@gpu` function
+// that takes a derivative is fine where a fragment shader calls it.
 use std::gpu::{ClipPosition, FragCoord, VertexIndex, begin_screen_pass, draw, present}
 
 struct Look: Copy + Clone + GpuData {
@@ -19,9 +21,31 @@ fn cover(v: VertexIndex) -> ClipPosition {
     ClipPosition { position: vec4(x, y, 0.0, 1.0) }
 }
 
+/// Marches until past 1: the loop is left only by `return`.
+fn march(d: f32) -> f32 {
+    var t = 0.0
+    loop {
+        t += d
+        if t > 1.0 {
+            return t
+        }
+    }
+}
+
+@gpu
+fn blur(x: f32) -> f32 {
+    fwidth(x)
+}
+
 @fragment
 fn paint(pixel: FragCoord, look: Look) -> vec4 {
     let d = ring(pixel.position.xy)
+    let k = match d < 0.0 {
+        true => 1.0,
+        false => 2.0,
+    }
+    let t = march(abs(d) * k + 0.01)
+    let ft = fwidth(t)
     let aa = fwidth(d)
     var inside = 0.0
     if d < 0.0 {
@@ -41,8 +65,8 @@ fn paint(pixel: FragCoord, look: Look) -> vec4 {
         x = x * 2.0
         n += 1
     }
-    let g = fwidth(x)
-    vec4(smoothstep(-aa, aa, d) + w + e, g, inside, 1.0)
+    let g = fwidth(x) + blur(d)
+    vec4(smoothstep(-aa, aa, d) + w + e + ft, g, inside, 1.0)
 }
 
 pub fn frame(time: f32, width: u32, height: u32) {

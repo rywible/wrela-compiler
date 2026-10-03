@@ -217,12 +217,9 @@ impl Fa<'_, '_> {
                 join(&mut self.ret_state, st);
                 return (RETURN, cf);
             }
-            // On the GPU, a trap returns a zero.
-            Stmt::Trap => {
-                self.ret |= cf;
-                join(&mut self.ret_state, st);
-                return (RETURN, cf);
-            }
+            // On the GPU, a trap is a point valid code never reaches (the WGSL back end writes
+            // nothing for it), so it changes no control flow.
+            Stmt::Trap => {}
             Stmt::At(span) => self.at = Some(*span),
         }
         (NEXT, cf)

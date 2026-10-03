@@ -20,3 +20,11 @@ fn make() -> P {
 
 // `..base` is part of the value even when every field is given.
 const D: P = P { a: 1.0, b: 2.0, ..make() } //~ E0906
+
+// A closure isn't a literal: the constant is rejected, and its uses add nothing to that.
+const PICK = || 1 //~ E0906
+
+fn picked() -> i32 {
+    let p = PICK
+    p()
+}

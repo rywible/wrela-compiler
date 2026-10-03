@@ -146,6 +146,8 @@ pub struct LocalDecl {
     pub span: Span,
     /// The `let` that binds it alone, for fixes that change it to `var`.
     pub keyword: Option<Span>,
+    /// Bound by a struct pattern's field shorthand (see `thir::LocalDecl`).
+    pub shorthand: bool,
     /// The closure whose body declares it.
     pub closure: Option<ClosureId>,
 }
@@ -322,6 +324,10 @@ pub enum StatementKind {
     /// A projection local starts aliasing `place` (`let x = w.a`, `mut x = w.a`, a pattern's
     /// binding into a place, a `for` loop's element).
     Bind { local: Local, place: Place, mutable: bool },
+    /// `place` is evaluated but maybe never accessed (a place on its own, a `_` pattern, a
+    /// projection not used yet): its indices are checked here, as an index out of range traps
+    /// wherever it's written (§11). A read, for the memory model.
+    Check(Place),
     /// A local's scope begins: a new value each time (a loop's next pass rebinds it).
     Live(Local),
     /// A local's scope ends.
@@ -438,7 +444,7 @@ pub(crate) fn is_capture(locals: &[LocalDecl], closure: Option<ClosureId>, l: Lo
 }
 
 /// Whether a value of type `t` can be called: a closure, or a function.
-pub(crate) fn is_callable(types: &Types, t: TyId) -> bool {
+pub fn is_callable(types: &Types, t: TyId) -> bool {
     matches!(types.kind(t), TyKind::Closure(..) | TyKind::FnPtr(..) | TyKind::FnDef(..))
 }
 

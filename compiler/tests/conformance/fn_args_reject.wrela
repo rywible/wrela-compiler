@@ -26,3 +26,17 @@ fn components() -> f32 {
     let v = vec3(x: 1.0, x: 2.0) //~ E0304
     v.x
 }
+
+// A matrix takes its columns in order: a name would read as a choice of column.
+fn columns() -> mat2 {
+    mat2(y: vec2(0.0, 1.0), x: vec2(1.0, 0.0)) //~ E0302 E0302
+}
+
+fn pair(f: fn(i32, i32) -> i32) -> i32 {
+    f(1, 2)
+}
+
+// A closure's parameters have one name each.
+fn same_name() -> i32 {
+    pair(|x, x| x) //~ E0201
+}

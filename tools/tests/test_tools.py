@@ -261,7 +261,30 @@ class ScoreTest(unittest.TestCase):
         self.assertEqual(task["built_at"], 3)
         self.assertEqual(task["unfinished"], [2])
         self.assertEqual(task["codes_per_attempt"], [["E0301"], [], []])
+        self.assertEqual(task["over_limit"], [])
         self.assertEqual(report["built_eventually"], 1)
+
+    def test_attempts_past_the_limit_dont_count(self):
+        with open(os.path.join(TOOLS, "agent-test", "tasks.json")) as f:
+            first = json.load(f)[0]["id"]
+        with open(os.path.join(TOOLS, "agent-test", "config.json")) as f:
+            limit = json.load(f)["max_attempts"]
+        with tempfile.TemporaryDirectory() as run:
+            for n in range(1, limit + 2):
+                at = os.path.join(run, first, "attempts", str(n))
+                os.makedirs(at)
+                with open(os.path.join(at, "status"), "w") as f:
+                    f.write("0\n" if n == limit + 1 else "1\n")
+            out = subprocess.run(
+                [sys.executable, os.path.join(TOOLS, "agent-test", "score.py"), run],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout
+        task = next(p for p in json.loads(out)["per_task"] if p["task"] == first)
+        self.assertEqual(task["attempts"], limit)
+        self.assertIsNone(task["built_at"])
+        self.assertEqual(task["over_limit"], [limit + 1])
 
 
 class ServeTest(PageDir, unittest.TestCase):
@@ -319,6 +342,24 @@ class ServeTest(PageDir, unittest.TestCase):
             self.assertEqual(os.listdir(outside), [])
         finally:
             shutil.rmtree(outside)
+
+    def test_only_this_machine_and_not_git(self):
+        # A page elsewhere that rebinds its name to 127.0.0.1 sends its own name as the Host.
+        req = urllib.request.Request(f"{self.base}/LICENSE", headers={"Host": "evil.example"})
+        with self.assertRaises(urllib.error.HTTPError) as e:
+            urllib.request.urlopen(req)
+        self.assertEqual(e.exception.code, 403)
+        e.exception.close()
+        port = self.server.server_address[1]
+        req = urllib.request.Request(f"{self.base}/LICENSE", headers={"Host": f"localhost:{port}"})
+        with urllib.request.urlopen(req) as r:
+            self.assertEqual(r.status, 200)
+        for path in [".git/HEAD", "%2egit/HEAD"]:
+            with self.assertRaises(urllib.error.HTTPError) as e:
+                urllib.request.urlopen(f"{self.base}/{path}")
+            self.assertEqual(e.exception.code, 404, path)
+            e.exception.close()
+        self.assertEqual(self.put(".git/results/x"), 404)
 
     def test_pages_are_cross_origin_isolated_with_the_right_types(self):
         with open(os.path.join(self.page_dir, "m.wasm"), "wb") as f:

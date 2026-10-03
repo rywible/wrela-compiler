@@ -198,10 +198,12 @@ codes! {
     E0904 = "E0904", "`unsafe` is tier 1";
     E0905 = "E0905", "`dyn` is tier 2";
     E0906 = "E0906", "an evaluated constant initializer is tier 1";
+    E0908 = "E0908", "`match mut` is tier 1";
 
     // ---- W0xxx: warnings -------------------------------------------------------------------
     W0001 = "W0001", "an unused local";
     W0002 = "W0002", "unreachable code";
+    W0003 = "W0003", "a file named like the entry module, in another case";
 
     // ---- I0xxx: bugs in the compiler -------------------------------------------------------
     I0001 = "I0001", "an internal compiler error";

@@ -1,7 +1,13 @@
-// run: vector indexing
+// run: vector and array indexing; an index out of range traps even where nothing reads it
 // expect: dyn_index(1) = 2.0
 // expect: dyn_index(3) traps
 // expect: lit_index() = 3.0
+// expect: unread_match(9) traps
+// expect: unread_match(1) = 20
+// expect: unread_statement(9) traps
+// expect: unread_wildcard(9) traps
+// expect: unread_projection(9) traps
+// expect: unread_projection(2) = 5
 
 pub fn dyn_index(i: u32) -> f32 {
     let v = vec3(1.0, 2.0, 3.0)
@@ -11,4 +17,30 @@ pub fn dyn_index(i: u32) -> f32 {
 pub fn lit_index() -> f32 {
     let v = vec3(1.0, 2.0, 3.0)
     v[2]
+}
+
+// An index out of range traps where it's written, even when nothing reads the element.
+pub fn unread_match(i: u32) -> i32 {
+    let xs = [1, 2, 3]
+    match xs[i] {
+        _ => 20,
+    }
+}
+
+pub fn unread_statement(i: u32) -> i32 {
+    let xs = [1, 2, 3]
+    xs[i]
+    5
+}
+
+pub fn unread_wildcard(i: u32) -> i32 {
+    let xs = [1, 2, 3]
+    let _ = xs[i]
+    5
+}
+
+pub fn unread_projection(i: u32) -> i32 {
+    var xs = [1, 2, 3]
+    mut p = xs[i]
+    5
 }

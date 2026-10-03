@@ -64,3 +64,19 @@ impl T {
         self.x + 100
     }
 }
+
+trait Firsts {
+    fn first(self) -> u32
+}
+
+impl<T> Firsts for (T, i32) {
+    fn first(self) -> u32 {
+        1
+    }
+}
+
+impl Firsts for (f32, i32) { //~ E0403
+    fn first(self) -> u32 {
+        2
+    }
+}

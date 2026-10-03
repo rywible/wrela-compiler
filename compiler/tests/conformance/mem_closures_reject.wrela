@@ -47,6 +47,38 @@ fn eat(v: take V) -> f32 {
     v.x
 }
 
+fn bump(x: mut i32, f: fn()) {
+    x += 1
+    f()
+}
+
+// `select` would choose a closure at run time.
+fn selected(c: bool) -> i32 {
+    var count = 0
+    let inc = || { count += 10 }
+    let g = select(inc, inc, c) //~ E0702
+    bump(mut count, g)
+    count
+}
+
+// A closure kept after its block can't borrow what the block declared.
+fn kept_after_block() -> f32 {
+    let c = {
+        let v = V { x: 1.0, y: 2.0 }
+        |k: f32| v.x * k //~ E0510
+    }
+    apply(c, 2.0)
+}
+
+// A closure moved into another local (`take`) still holds what it captured.
+fn taken_closure() -> i32 {
+    var count = 0
+    let inc = || { count += 10 }
+    let g = take inc
+    bump(mut count, g) //~ E0506
+    count
+}
+
 // A `mut` projection inside a closure writes what it captured.
 fn through_let() -> f32 {
     let v = V { x: 1.0, y: 2.0 }
@@ -70,6 +102,25 @@ fn captured_overlap() -> i32 {
     var x = 1
     run(|| { pair(mut x, mut x) }) //~ E0513
     x
+}
+
+// A projection the closure captures reaches what it aliased where the closure was made.
+fn captured_projection() -> i32 {
+    var x = 1
+    mut p = x
+    run(|| { pair(mut p, mut p) }) //~ E0513
+    x
+}
+
+fn captured_requote() -> f32 {
+    var v = V { x: 1.0, y: 2.0 }
+    mut p = v
+    run(|| {
+        mut q = p
+        p.x = 10.0 //~ E0506
+        q.x += 1.0
+    })
+    v.x
 }
 
 fn captured_confusion() -> i32 {
@@ -103,4 +154,15 @@ fn stored(k: f32) -> f32 {
     let b = Box { item: |x: f32| x * k } //~ E0510
     let f = pass(|x: f32| x * k) //~ E0510
     apply(f, 1.0)
+}
+
+// The body uses `v.x`, which `p` already projects mutably.
+fn same_part() -> f32 {
+    var v = vec3(1.0, 2.0, 3.0)
+    mut p = v.x
+    run(|| { //~ E0506
+        p += 1.0
+        v.x += 1.0
+    })
+    v.x
 }

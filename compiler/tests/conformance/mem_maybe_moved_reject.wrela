@@ -16,3 +16,26 @@ fn f(c: bool) -> u32 {
     }
     log.count //~ E0516
 }
+
+struct Pair {
+    a: Log,
+    b: Log,
+}
+
+fn archive_pair(p: take Pair) -> u32 {
+    p.a.count
+}
+
+// A field written after its struct may have been moved whole is a use of the moved struct,
+// whichever branch moves which.
+fn g(c: bool) -> u32 {
+    var p = Pair { a: Log { count: 1 }, b: Log { count: 2 } }
+    var n = 0
+    if c {
+        n = archive_pair(take p)
+    } else {
+        n = archive(take p.a)
+    }
+    p.a = Log { count: 5 } //~ E0516
+    n
+}

@@ -1,4 +1,6 @@
-// run: literals agree across a built-in's arguments, and a match's arms pass as a run
+// run: literals agree across a built-in's arguments, and a match's arms pass as a run; a bit
+// pattern too large for an `i32`, an index whose literal type settles later, and float literals
+// rounded once (beside an `f32` tie, and just under where an `f32` overflows)
 // expect: max_mixed() = 0.5
 // expect: min_mixed() = 1.0
 // expect: select_mixed(1.0) = 1.5
@@ -12,6 +14,11 @@
 // expect: select_ints(1) = 9
 // expect: select_arrays(1) = 3.0
 // expect: select_arrays(0) = 1.0
+// expect: bit_pattern() = -1.0
+// expect: negative_bit_pattern() = -1.0
+// expect: open_index() = 3
+// expect: beside_a_tie() = 1.0000001
+// expect: just_under_overflow() = 3.4028235e38
 
 fn sum(xs: [f32]) -> f32 {
     var s = 0.0
@@ -77,4 +84,30 @@ pub fn select_arrays(c: i32) -> f32 {
     let y = [3.0, 4.0]
     let z = select(x, y, c > 0)
     z[0]
+}
+
+pub fn bit_pattern() -> f32 {
+    bitcast_f32(0xBF800000)
+}
+
+pub fn negative_bit_pattern() -> f32 {
+    bitcast_f32(-1082130432)
+}
+
+/// An index can be a `u32` or an `i32`: indexing doesn't settle which `i` is.
+pub fn open_index() -> i32 {
+    let xs = [1, 2, 3]
+    let i = 1
+    let v = xs[i]
+    let j: i32 = i
+    v + j
+}
+
+/// Rounded to `f64` this is exactly an `f32` tie, which then goes up; it's below the tie.
+pub fn beside_a_tie() -> f32 {
+    1.000000178813934326171874999
+}
+
+pub fn just_under_overflow() -> f32 {
+    340282356779733661637539395458142568447.0
 }

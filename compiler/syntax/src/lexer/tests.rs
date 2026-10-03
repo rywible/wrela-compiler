@@ -221,3 +221,18 @@ fn int_and_float_values() {
     assert_eq!(int_value("0x"), IntValue::Malformed);
     assert_eq!(float_value("1.5e-3"), 1.5e-3);
 }
+
+/// A unit suffix starts after the whole number, exponent and radix digits included, so a fix
+/// that drops the unit keeps the number (`1e-3m` is `1e-3`, not `1`).
+#[test]
+fn a_suffix_starts_after_the_whole_number() {
+    for (text, number, unit) in [
+        ("1e-3m", "1e-3", "m"),
+        ("2.5e3kg", "2.5e3", "kg"),
+        ("0x1fcm", "0x1fc", "m"),
+        ("10_000ms", "10_000", "ms"),
+        ("3m", "3", "m"),
+    ] {
+        assert_eq!(super::split_suffix(text), (number, unit), "{text}");
+    }
+}

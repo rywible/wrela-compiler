@@ -104,3 +104,34 @@ pub fn k(x: f32) -> f32 {
     }, Interval { lo: x, hi: x + 1.0 })
     r.lo + last
 }
+
+// Two functions that each use the other's gradient: each derivation would need the other's.
+fn ping(x: f32) -> f32 {
+    gradient(pong, x) + x //~ E0700
+}
+
+fn pong(x: f32) -> f32 {
+    gradient(ping, x) * x //~ E0700
+}
+
+pub fn rally(x: f32) -> f32 {
+    ping(x)
+}
+
+// Values that depend on the input, passed as a run: not yet.
+fn sum_of(xs: [f32]) -> f32 {
+    var s = 0.0
+    for x in xs {
+        s += x
+    }
+    s
+}
+
+fn spread(x: f32) -> f32 {
+    let a = [x, 2.0 * x]
+    sum_of(a) //~ E0700
+}
+
+pub fn spread_slope(x: f32) -> f32 {
+    gradient(spread, x)
+}

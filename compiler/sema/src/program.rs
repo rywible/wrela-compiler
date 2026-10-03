@@ -19,8 +19,9 @@ pub struct Program {
     /// The root of the user's package and of std.
     pub package_root: Option<ModuleId>,
     pub std_root: Option<ModuleId>,
-    /// The entry module (`main.wrela`).
+    /// The entry module (`main.wrela`), and its file.
     pub main: Option<ModuleId>,
+    pub main_file: Option<wrela_diag::FileId>,
     pub lang: HashMap<Lang, LangRes>,
     /// Impls by trait, for trait solving.
     pub impls_of_trait: HashMap<TraitId, Vec<ImplId>>,

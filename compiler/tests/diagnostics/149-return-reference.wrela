@@ -1,0 +1,6 @@
+// mistake: returning `&x`
+// expect: E0106
+// fix: yes
+pub fn same(x: f32) -> f32 {
+    return &x
+}

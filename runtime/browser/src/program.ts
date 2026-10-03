@@ -3,7 +3,7 @@
 // work for each batch (hash, decode, sequence, check, execute), the same errors.
 
 import { EXPORT_FRAME, EXPORT_MEMORY, IMPORT_MODULE, IMPORT_SUBMIT } from "./abi.gen.ts";
-import type { Checker } from "./check.ts";
+import { type Checker, CommandError } from "./check.ts";
 import { errorMessage } from "./errors.ts";
 import { StateHash } from "./hash.ts";
 import { Lines, LINES_SECTION, wasmOffsets } from "./lines.ts";
@@ -82,7 +82,7 @@ export interface ProgramOptions {
 export class Program {
   /** The state hash, when the options ask for it. */
   readonly hash: StateHash | null;
-  readonly #sequencer = new Sequencer();
+  #sequencer = new Sequencer();
   #memory: WebAssembly.Memory | null = null;
   /** Where the code came from, for trap messages. */
   #lines: Lines | null = null;
@@ -91,6 +91,9 @@ export class Program {
   /** The error behind the most recent trap raised by `submit`, so the caller gets it rather
    * than whatever the engine wraps it in. */
   #failure: unknown = null;
+  /** The first error the executor gave: what it holds isn't known after it, so every later
+   * command fails. (A command the sequencer or the checker rejects leaves no trace.) */
+  #failed: string | null = null;
 
   private constructor(
     readonly checker: Checker,
@@ -132,7 +135,13 @@ export class Program {
     const imports = {
       [IMPORT_MODULE]: { [IMPORT_SUBMIT]: (ptr: number, len: number) => program.#submitImport(ptr, len) },
     };
-    const instance = await WebAssembly.instantiate(module, imports);
+    // As the native host words it: a module that can't be instantiated isn't a valid program.
+    let instance: WebAssembly.Instance;
+    try {
+      instance = await WebAssembly.instantiate(module, imports);
+    } catch (e) {
+      throw new ProgramError(errorMessage(e));
+    }
     program.#instance = instance;
     program.#memory = instance.exports[EXPORT_MEMORY] as WebAssembly.Memory;
     program.#frame = instance.exports[EXPORT_FRAME] as FrameFn;
@@ -143,9 +152,23 @@ export class Program {
   #submit(batch: Bytes): void {
     this.hash?.update(batch);
     for (const cmd of decode(batch)) {
+      if (this.#failed !== null) {
+        throw new CommandError(cmd.op, `the host failed to carry out an earlier command (${this.#failed})`);
+      }
+      const before = this.#sequencer.copy();
       this.#sequencer.step(cmd);
-      this.checker.check(cmd);
-      this.executor.execute(cmd);
+      try {
+        this.checker.check(cmd);
+      } catch (e) {
+        this.#sequencer = before;
+        throw e;
+      }
+      try {
+        this.executor.execute(cmd);
+      } catch (e) {
+        this.#failed = errorMessage(e);
+        throw e;
+      }
     }
   }
 
@@ -193,13 +216,20 @@ export class Program {
 
   #call<T>(f: () => T): T {
     this.#failure = null;
+    let result: T;
     try {
-      return f();
+      result = f();
     } catch (e) {
       const failure = this.#failure;
       this.#failure = null;
       if (failure !== null) throw failure;
       throw new TrapError(this.#describe(e));
     }
+    // A module can catch the exception a failed submit throws (WASM exception handling) and
+    // return as if nothing happened: the call fails anyway.
+    const failure = this.#failure;
+    this.#failure = null;
+    if (failure !== null) throw failure;
+    return result;
   }
 }

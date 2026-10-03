@@ -6,7 +6,7 @@ use crate::graph::{Visit, dfs_cycles};
 use crate::program::{LangRes, Program};
 use crate::resolve::{self, Scope, TyPos};
 use crate::ty::*;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 use wrela_diag::{Diagnostic, Span, codes};
 use wrela_syntax::ast;
@@ -43,6 +43,7 @@ pub fn collect(units: Vec<SourceUnit>, diags: &mut Vec<Diagnostic>) -> Program {
     c.p.syntax_errors = units.iter().flat_map(|u| u.syntax_errors.iter().copied()).collect();
     let modules = c.build_modules(&units);
     c.declare_items(&units, &modules);
+    c.check_items_beside_modules();
     c.resolve_imports();
     c.find_lang_items();
     c.resolve_signatures();
@@ -71,6 +72,30 @@ impl<'d, 'u> Collector<'d, 'u> {
             is_std,
         });
         ModuleId(self.p.modules.len() as u32 - 1)
+    }
+
+    /// E0201: an item with the name of a module beside it (`fn b` in `a.wrela` and the file
+    /// `a/b.wrela`): a module has one namespace, so `a::b` would name both.
+    fn check_items_beside_modules(&mut self) {
+        for m in &self.p.modules {
+            if m.is_std {
+                continue;
+            }
+            for (name, &child) in &m.children {
+                if let Some(b) = m.scope.get(name) {
+                    let path = self.p.modules[child.index()].path.join("/");
+                    self.diags.push(
+                        Diagnostic::new(
+                            codes::E0201,
+                            b.span,
+                            format!("`{name}` is defined twice in this module: it's also the module in `{path}.wrela` or `{path}/`"),
+                        )
+                        .with_note("a module has one namespace for its items and the modules in it (§3)")
+                        .with_help("rename the item or the module"),
+                    );
+                }
+            }
+        }
     }
 
     /// Builds the module tree; returns the module each unit is.
@@ -111,6 +136,7 @@ impl<'d, 'u> Collector<'d, 'u> {
             }
             if !u.is_std && u.path == ["main"] {
                 self.p.main = Some(m);
+                self.p.main_file = Some(u.ast.span.file);
             }
             modules.push(m);
         }
@@ -433,14 +459,21 @@ impl<'d, 'u> Collector<'d, 'u> {
                             }
                             if name == "vertex" { Entry::Vertex } else { Entry::Fragment }
                         }
-                        _ => match self.workgroup_size(a) {
-                            Some(size) => Entry::Compute(size),
-                            None => continue,
-                        },
+                        // A size that's wrong is reported; the kernel is still one, so its
+                        // dispatches aren't reported too.
+                        _ => Entry::Compute(self.workgroup_size(a).unwrap_or([1, 1, 1])),
                     };
                     out.entry = Some((entry, a.span));
                 }
-                "gpu" => out.gpu = Some(a.span),
+                "gpu" => {
+                    if a.args.is_some() {
+                        self.diags.push(
+                            Diagnostic::new(codes::E0602, a.span, "`@gpu` takes no arguments")
+                                .with_fix("remove the arguments", a.span, "@gpu"),
+                        );
+                    }
+                    out.gpu = Some(a.span);
+                }
                 "intrinsic" if is_std => out.intrinsic = true,
                 "comptime" | "deterministic" | "assert" | "assume" | "escaping" | "diagnostic" => {
                     self.diags.push(
@@ -1276,6 +1309,29 @@ impl<'d, 'u> Collector<'d, 'u> {
                 f.ty = error;
             }
         }
+        // An ADT's own fields don't show a cycle through a projection only an instance resolves
+        // (`k: T::K` in `S<T>`, with `type K = S<X>` in X's impl): each associated type is
+        // checked for holding itself once its projections are resolved.
+        let mut cyclic = Vec::new();
+        for (i, imp) in self.p.impls.iter().enumerate() {
+            for (name, &ty) in &imp.assoc_types {
+                let ty = crate::traits::normalize(&self.p, ty, Some(imp));
+                if holds_itself(&self.p, ty, &mut Vec::new(), &mut HashSet::new()) {
+                    self.diags.push(Diagnostic::new(
+                        codes::E0318,
+                        imp.span,
+                        format!(
+                            "`type {name} = {}` holds itself through its fields, so it would be infinitely large",
+                            self.p.display_ty(ty)
+                        ),
+                    ));
+                    cyclic.push((i, name.clone()));
+                }
+            }
+        }
+        for (i, name) in cyclic {
+            self.p.impls[i].assoc_types.insert(name, error);
+        }
     }
 
     /// Adds the impls that opting in implies, and indexes every impl by its trait or type.
@@ -1490,6 +1546,18 @@ fn check_impl(p: &Program, diags: &mut Vec<Diagnostic>, imp: &ImplDef) {
     for at in &tr.assoc_types {
         let Some(&ty) = imp.assoc_types.get(&at.name) else { continue };
         let ty = crate::traits::normalize(p, ty, Some(imp));
+        if let Some(cycle) = crate::traits::cyclic_projection(p, ty) {
+            diags.push(Diagnostic::new(
+                codes::E0318,
+                imp.span,
+                format!(
+                    "`type {}` is defined in terms of itself: `{}` never resolves to a type",
+                    at.name,
+                    p.display_ty(cycle)
+                ),
+            ));
+            continue;
+        }
         for b in &at.bounds {
             let b = b.subst(&p.types, &trait_subst);
             let b = TraitRef {
@@ -1851,11 +1919,17 @@ fn check_overlap(p: &Program, diags: &mut Vec<Diagnostic>) {
         pairs.dedup();
         for (x, y) in pairs {
             let (a, b) = (p.impl_(x), p.impl_(y));
-            let same_args = match (&a.trait_ref, &b.trait_ref) {
-                (Some(x), Some(y)) => crate::traits::could_unify_all(p, &x.args, &y.args),
-                _ => false,
+            let (Some(ra), Some(rb)) = (&a.trait_ref, &b.trait_ref) else { continue };
+            // The self type, then the trait's arguments, each impl's parameters bound once.
+            let heads = |self_ty: TyId, args: &[TyId]| {
+                std::iter::once(self_ty).chain(args.iter().copied()).collect::<Vec<_>>()
             };
-            if same_args && crate::traits::could_unify(p, a.self_ty, b.self_ty) {
+            let (ta, tb) = (heads(a.self_ty, &ra.args), heads(b.self_ty, &rb.args));
+            // An impl whose types have an error (reported) conflicts with nothing.
+            if ta.iter().chain(&tb).any(|&t| p.types.any(t, &mut |k| matches!(k, TyKind::Error))) {
+                continue;
+            }
+            if crate::traits::impls_could_meet(p, &ta, &tb) {
                 let name = a.trait_ref.as_ref().map_or("", |r| p.trait_(r.trait_).name.as_str());
                 diags.push(
                     Diagnostic::new(
@@ -1880,4 +1954,36 @@ pub(crate) fn and_list(items: &[String]) -> String {
         [one] => one.clone(),
         [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
     }
+}
+
+/// Whether the value `ty` holds itself by value, through its fields with their projections
+/// resolved: `stack` is the ADT instances being expanded, `finite` those known not to. A chain
+/// past 64 instances deep is taken as growing without end.
+fn holds_itself(p: &Program, ty: TyId, stack: &mut Vec<TyId>, finite: &mut HashSet<TyId>) -> bool {
+    if finite.contains(&ty) {
+        return false;
+    }
+    let holds = match p.types.kind(ty) {
+        TyKind::Adt(a, args) => {
+            if stack.contains(&ty) || stack.len() >= 64 {
+                return true;
+            }
+            stack.push(ty);
+            let adt = p.adt(*a);
+            let subst = Subst::from_pairs(&adt.generics, args);
+            let holds = adt.all_fields().any(|f| {
+                let ft = crate::traits::normalize(p, p.types.subst(f.ty, &subst), None);
+                holds_itself(p, ft, stack, finite)
+            });
+            stack.pop();
+            holds
+        }
+        TyKind::Tuple(ts) => ts.iter().any(|&t| holds_itself(p, t, stack, finite)),
+        TyKind::Array(e, _) => holds_itself(p, *e, stack, finite),
+        _ => false,
+    };
+    if !holds {
+        finite.insert(ty);
+    }
+    holds
 }

@@ -46,6 +46,21 @@ impl<'a> Parser<'a> {
             );
             return Err(Failed);
         }
+        if !self.at(T::RBrace) {
+            // A closer of a bracket opened before the block closes the block with it (L19); it
+            // stays for that bracket's list.
+            let t = self.tok();
+            let closer = t.kind.fixed_text().unwrap_or("?");
+            self.error(
+                Diagnostic::new(codes::E0101, open, "this `{` is never closed").with_secondary(
+                    t.span,
+                    format!(
+                        "this `{closer}` closes a bracket opened before it, and the block with it"
+                    ),
+                ),
+            );
+            return Ok(Block { stmts, span: open.to(self.prev_span()) });
+        }
         let close = self.bump().span;
         Ok(Block { stmts, span: open.to(close) })
     }
@@ -54,12 +69,12 @@ impl<'a> Parser<'a> {
     fn block_stmts(&mut self) -> Vec<Stmt> {
         let mut stmts = Vec::new();
         self.skip_seps();
-        while !self.at(T::RBrace) && !self.at(T::Eof) {
+        while !self.at_closer(T::RBrace) && !self.at(T::Eof) {
             let (before, start) = (self.pos, self.span());
             match self.parse_stmt() {
                 Ok(s) => {
                     stmts.push(s);
-                    if !self.at_sep() && !self.at(T::RBrace) {
+                    if !self.at_sep() && !self.at_closer(T::RBrace) {
                         self.stmt_sep_error();
                         let rest = self.span();
                         self.recover_to_sep();
@@ -76,7 +91,7 @@ impl<'a> Parser<'a> {
                 }
             }
             self.skip_seps();
-            if self.pos == before && !self.at(T::RBrace) && !self.at(T::Eof) {
+            if self.pos == before && !self.at_closer(T::RBrace) && !self.at(T::Eof) {
                 self.bump();
             }
         }
@@ -262,7 +277,12 @@ impl<'a> Parser<'a> {
                 T::Return => {
                     let start = self.bump().span;
                     let value =
-                        if self.starts_expr() { Some(Box::new(self.parse_expr()?)) } else { None };
+                        // (`return &x` is read as a return of a value, to say what `&` is.)
+                        if self.starts_expr() || matches!(self.kind(), T::Amp | T::AndAnd) {
+                            Some(Box::new(self.parse_expr()?))
+                        } else {
+                            None
+                        };
                     return Ok(Expr::new(ExprKind::Return(value), start.to(self.prev_span())));
                 }
                 T::Break => {
@@ -280,7 +300,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Can the current token start an expression (`expr`)?
-    fn starts_expr(&self) -> bool {
+    pub(crate) fn starts_expr(&self) -> bool {
         matches!(
             self.kind(),
             T::Ident
@@ -370,6 +390,25 @@ impl<'a> Parser<'a> {
                 // cmp_expr ::= bitor_expr (cmp_op bitor_expr)?
                 if BinOp::from_token(self.kind()).is_some_and(BinOp::is_comparison) {
                     let t = self.tok();
+                    // `first<f32>(x)`: generic arguments, which an expression writes `::<`.
+                    if let ExprKind::Binary(BinOp::Lt, l, m) = &lhs.kind
+                        && t.kind == T::Gt
+                        && matches!(l.kind, ExprKind::Path(_))
+                        && matches!(m.kind, ExprKind::Path(_))
+                        && self.nth(1) == T::LParen
+                    {
+                        let name = self.text_of(l.span).to_string();
+                        self.error(
+                            Diagnostic::new(
+                                codes::E0107,
+                                t.span,
+                                format!("in an expression, generic arguments are written `{name}::<...>`"),
+                            )
+                            .with_note("`<` and `>` here are comparisons, which don't chain")
+                            .with_fix("write `::<`", l.span.shrink_to_end(), "::"),
+                        );
+                        return Err(Failed);
+                    }
                     // `a < x < b` means `a < x && x < b`: repeat the middle operand.
                     let mid = match &lhs.kind {
                         ExprKind::Binary(_, _, m) => self.text_of(m.span).to_string(),

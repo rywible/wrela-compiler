@@ -133,7 +133,17 @@ impl Inliner<'_> {
         let values = vec![None; callee.values.len()];
         let mut cx = Copier { callee, caller: self.f, args, values, locals, result: None };
         out.extend(cx.block(&callee.body)?);
-        Ok(cx.result)
+        // A body that never ends (it loops forever, or traps) has no `return` to take the
+        // result from: what follows the call never runs, but needs a value.
+        let result = match (cx.result, callee.ret) {
+            (None, Some(t)) => {
+                let v = self.f.new_value(t);
+                out.push(Stmt::Let(v, Expr::Zero(t)));
+                Some(v)
+            }
+            (r, _) => r,
+        };
+        Ok(result)
     }
 }
 

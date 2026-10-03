@@ -136,11 +136,18 @@ impl<'p> Checker<'p> {
                 let n = match self.const_u32(count) {
                     Some(n) => n,
                     None => {
-                        self.err(Diagnostic::new(
-                            codes::E0325,
-                            count.span,
-                            "an array length is an integer literal or a constant holding one",
-                        ));
+                        let local = match &count.kind {
+                            ast::ExprKind::Path(p) if p.is_single() => {
+                                self.env.lookup(&p.segments[0].ident.name).is_some()
+                            }
+                            _ => false,
+                        };
+                        // A variable isn't a constant; anything else says why it isn't a length.
+                        self.err(if local {
+                            Diagnostic::new(codes::E0325, count.span, "an array length is an integer literal or a constant holding one, not a variable")
+                        } else {
+                            resolve::length_error(self.p, self.scope.module, count)
+                        });
                         0
                     }
                 };
@@ -201,6 +208,23 @@ impl<'p> Checker<'p> {
         resolve::const_u32(self.p, self.scope.module, e)
     }
 
+    /// What `Self` (a struct) or `Self::Variant` names in an impl of an ADT, for patterns and
+    /// struct literals. `None` when the path doesn't start with `Self`, or names nothing.
+    pub(crate) fn self_item(&self, segs: &[ast::PathSegment]) -> Option<Res> {
+        if segs.first()?.ident.name != "Self" {
+            return None;
+        }
+        let TyKind::Adt(a, _) = self.kind(self.scope.self_ty?) else { return None };
+        match segs {
+            [_] => Some(Res::Adt(*a)),
+            [_, v] => {
+                let i = self.p.adt(*a).variants().iter().position(|x| x.name == v.ident.name)?;
+                Some(Res::Variant(*a, i as u32))
+            }
+            _ => None,
+        }
+    }
+
     fn check_lit(&mut self, lit: &ast::Lit, expected: Option<TyId>) -> Expr {
         let span = lit.span;
         match lit.kind {
@@ -235,19 +259,17 @@ impl<'p> Checker<'p> {
                     Some(t) if matches!(self.kind(t), TyKind::Float(_)) => self.shallow(t),
                     _ => self.new_var(VarKind::Float, span),
                 };
-                self.float_literals.push((ty, v, span));
-                Expr { ty, span, kind: ExprKind::Lit(Lit::Float(v)) }
+                let f = wrela_syntax::lexer::float_value_f32(&lit.text);
+                self.float_literals.push((ty, v, f, span));
+                Expr { ty, span, kind: ExprKind::Lit(Lit::Float(v, f)) }
             }
             ast::LitKind::Str => {
                 self.err(Diagnostic::new(codes::E0901, span, "strings are tier 1"));
                 self.error_expr(span)
             }
             ast::LitKind::Suffixed => {
-                let digits: String = lit
-                    .text
-                    .chars()
-                    .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == '_')
-                    .collect();
+                // The number as written, exponent and radix included (`1e-3m` is `1e-3`).
+                let (digits, _) = wrela_syntax::lexer::split_suffix(&lit.text);
                 self.err(
                     Diagnostic::new(
                         codes::E0900,
@@ -580,6 +602,11 @@ impl<'p> Checker<'p> {
             let ty = self.p.types.adt(a, args.clone());
             let _ = self.infer.unify(&self.p.types, ty, e);
         }
+        // The arguments must have the generics' bounds (`S { t: 1 }` for `struct S<T: Tr>`).
+        let adt = self.p.adt(a);
+        let subst = Subst::from_pairs(&adt.generics, &args);
+        let name = adt.name.clone();
+        self.bound_obligations(&adt.generics, &args, &subst, &vec![span; n], &name);
         args
     }
 
@@ -762,7 +789,11 @@ impl<'p> Checker<'p> {
                 format!("`{}` doesn't apply to `{x}` and `{y}`", op.text()),
             );
             let (ka, kb) = (this.kind(a), this.kind(b));
-            if matches!(
+            if matches!(op, BinOp::Shl | BinOp::Shr) && matches!(ka, TyKind::Int(_)) {
+                d = d.with_help(
+                    "a shift's amount is a `u32`, whatever the shifted type: `x << u32(n)`",
+                );
+            } else if matches!(
                 (&ka, &kb),
                 (TyKind::Int(_), TyKind::Float(_)) | (TyKind::Float(_), TyKind::Int(_))
             ) {
@@ -920,6 +951,25 @@ impl<'p> Checker<'p> {
 
     fn check_take(&mut self, inner: &ast::Expr, expected: Option<TyId>, span: Span) -> Expr {
         let i = self.check_expr(inner, expected);
+        // `take recv.method()`: a method that consumes its receiver, a named place. (One that
+        // returns a projection is a place, which `take` moves out of.)
+        if let ExprKind::Call(c) = &i.kind
+            && c.receiver
+            && c.ret_mode == RetMode::Owned
+            && c.args.first().is_some_and(|r| r.is_place())
+            && c.modes.first() != Some(&Mode::Take)
+        {
+            self.err(
+                Diagnostic::new(
+                    codes::E0511,
+                    i.span,
+                    "`take` marks a call that consumes its receiver (`take self`), and this one doesn't",
+                )
+                .with_note("the call's result is a temporary, which moves without a marker")
+                .with_fix("remove `take`", Span::new(span.file, span.start, i.span.start), ""),
+            );
+            return Expr { ty: i.ty, span, kind: ExprKind::Take(Box::new(i)) };
+        }
         let ok = i.is_place()
             || matches!(&i.kind, ExprKind::Call(c) if c.receiver && c.args.first().is_some_and(|r| r.is_place()))
             || matches!(i.kind, ExprKind::Error);
@@ -945,7 +995,9 @@ impl<'p> Checker<'p> {
 
     fn check_field(&mut self, base: &ast::Expr, name: &ast::FieldName, span: Span) -> Expr {
         let b = self.check_expr(base, None);
-        match (self.kind(b.ty), name) {
+        // Resolved through: a field `T::Out` normalizes only once `T` is known.
+        let bt = self.infer.resolve(&self.p.types, b.ty);
+        match (self.kind(bt), name) {
             // Its error is reported.
             (TyKind::Error, _) | (_, ast::FieldName::BadIndex(_)) => self.error_expr(span),
             (&TyKind::Adt(a, ref args), ast::FieldName::Ident(n)) if !self.p.adt(a).is_enum() => {
@@ -1107,24 +1159,32 @@ impl<'p> Checker<'p> {
             return Expr { ty: elem, span, kind: ExprKind::Index(Box::new(b), Box::new(i)) };
         }
         let i = self.check_expr(index, None);
-        // An integer literal is a `u32` index.
-        let literal = self.infer.var_kind(&self.p.types, i.ty) == Some(VarKind::Int);
-        let int_ok = literal
-            || matches!(self.kind(i.ty), TyKind::Int(IntTy::I32 | IntTy::U32) | TyKind::Error);
-        if literal {
-            let u = self.p.types.u32;
-            let _ = self.infer.unify(&self.p.types, i.ty, u);
+        // An integer literal is a `u32` index. A value whose literal type isn't settled yet
+        // (`let i = 1`) can be either index type: it's checked once it's settled.
+        let open = self.infer.var_kind(&self.p.types, i.ty) == Some(VarKind::Int);
+        let int_ok =
+            open || matches!(self.kind(i.ty), TyKind::Int(IntTy::I32 | IntTy::U32) | TyKind::Error);
+        if open {
+            if matches!(i.kind, ExprKind::Lit(_)) {
+                let u = self.p.types.u32;
+                let _ = self.infer.unify(&self.p.types, i.ty, u);
+            } else {
+                self.indexes.push((i.ty, i.span));
+            }
         }
         if !int_ok {
             let shown = self.display(i.ty);
-            self.err(
-                Diagnostic::new(
-                    codes::E0312,
-                    i.span,
-                    format!("an index must be a `u32` or `i32`, not `{shown}`"),
-                )
-                .with_help("convert it: `u32(i)`"),
+            let d = Diagnostic::new(
+                codes::E0312,
+                i.span,
+                format!("an index must be a `u32` or `i32`, not `{shown}`"),
             );
+            // A number converts; a vector has components to choose from.
+            self.err(match self.kind(i.ty) {
+                TyKind::Int(_) | TyKind::Float(_) => d.with_help("convert it: `u32(i)`"),
+                TyKind::Vec(_) => d.with_help("index with one of its components: `[v.x]`"),
+                _ => d,
+            });
         }
         // A vector's or matrix's components are fixed: a literal index past them is caught here
         // (a computed one traps at run time, like an array's).
@@ -1168,12 +1228,9 @@ impl<'p> Checker<'p> {
         span: Span,
     ) -> Expr {
         let segs = &path.segments;
-        let is_self = segs.len() == 1 && segs[0].ident.name == "Self";
+        let is_self = segs.first().is_some_and(|s| s.ident.name == "Self");
         let res = if is_self {
-            match self.scope.self_ty.map(|t| self.kind(t)) {
-                Some(TyKind::Adt(a, _)) => Some(Res::Adt(*a)),
-                _ => None,
-            }
+            self.self_item(segs)
         } else {
             match resolve::resolve_module_path_in(self.p, self.scope.module, segs, true) {
                 PathLookup::Found(r) => Some(r),
@@ -1522,6 +1579,16 @@ impl<'p> Checker<'p> {
                     None => self.new_var(VarKind::General, p.name.span),
                 },
             };
+            if let Some(first) = params[..i].iter().find(|q| q.name.name == p.name.name) {
+                self.err(
+                    Diagnostic::new(
+                        codes::E0201,
+                        p.name.span,
+                        format!("`{}` is a parameter of this closure twice", p.name.name),
+                    )
+                    .with_secondary(first.name.span, "first here"),
+                );
+            }
             locals.push(self.declare_closure_param(&p.name, ty));
         }
         let b = self.without_loops(|this| this.check_expect(body, ret_ty));

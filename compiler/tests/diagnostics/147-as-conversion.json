@@ -1,0 +1,28 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0104",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [
+        "a conversion is a call of the type: `f32(x)`, not `x as f32`"
+      ],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "expected a line break or `;` after a statement, found `as`",
+      "notes": [],
+      "severity": "error",
+      "span": {
+        "column": 15,
+        "end": 132,
+        "end_column": 17,
+        "end_line": 5,
+        "line": 5,
+        "start": 130
+      },
+      "title": "a missing statement separator"
+    }
+  ],
+  "version": 2
+}

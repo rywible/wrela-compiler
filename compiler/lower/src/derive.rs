@@ -146,9 +146,28 @@ pub(crate) fn build_next(cx: &mut Cx, mb: &mut ModuleBuilder) {
         let p = mb.deriving.remove(i);
         return build(cx, mb, &p.key, p.id, p.inner);
     }
-    // Every one waits on another: drop those in a cycle, with an error, and the rest can go on.
-    for (p, r) in std::mem::take(&mut mb.deriving).into_iter().zip(reach) {
-        if !r.contains(&p.id) {
+    // Every one waits on another, so some wait in a cycle, each on the next (one on itself, or
+    // `f` deriving `g` while `g` derives `f`): drop those, with an error, and the rest can go on.
+    let waits: Vec<Vec<usize>> = reach
+        .iter()
+        .map(|r| r.iter().filter_map(|f| waiting.iter().position(|w| w == f)).collect())
+        .collect();
+    let in_cycle = |i: usize| {
+        let mut seen = vec![false; waits.len()];
+        let mut stack = waits[i].clone();
+        while let Some(j) = stack.pop() {
+            if j == i {
+                return true;
+            }
+            if !std::mem::replace(&mut seen[j], true) {
+                stack.extend(&waits[j]);
+            }
+        }
+        false
+    };
+    let cyclic: Vec<bool> = (0..waits.len()).map(in_cycle).collect();
+    for ((p, r), cyclic) in std::mem::take(&mut mb.deriving).into_iter().zip(reach).zip(cyclic) {
+        if !cyclic {
             mb.deriving.push(p);
             continue;
         }
@@ -158,10 +177,17 @@ pub(crate) fn build_next(cx: &mut Cx, mb: &mut ModuleBuilder) {
             InstanceKey::Derived { kind: DeriveKind::Interval, .. } => "its interval",
             _ => "its gradient",
         };
-        let msg = format!(
-            "can't derive this function: it uses {what}, so deriving it would need its \
-             derivative's derivative, without end"
-        );
+        let msg = if r.contains(&p.id) {
+            format!(
+                "can't derive this function: it uses {what}, so deriving it would need its \
+                 derivative's derivative, without end"
+            )
+        } else {
+            format!(
+                "can't derive this function: it uses the derivative of a function that uses \
+                 {what}, so each derivation would need the other's, without end"
+            )
+        };
         cx.err(match at {
             Some(at) => Diagnostic::new(codes::E0700, at, msg),
             None => Diagnostic::internal(msg),

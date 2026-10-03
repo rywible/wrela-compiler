@@ -309,10 +309,23 @@
       {
         "bytes": "57524353020000005800000001000000080000000100000040000000010000000800000002000000400000000300000030000000070000000100000001000000010000000200000001000000020000001000000000000000000000000000000000000000",
         "error": {
-          "message": "Dispatch failed: there's no pipeline 7 (the manifest has 4)",
+          "message": "Dispatch failed: there's no pipeline 7 (the manifest has 5)",
           "opcode": "Dispatch"
         },
         "name": "no such pipeline"
+      },
+      {
+        "bytes": "57524353020000004000000001000000080000000100000040000000010000000800000002000000400000000300000018000000040000000100000001000000010000000000000000000000",
+        "error": null,
+        "name": "a pipeline without uniforms"
+      },
+      {
+        "bytes": "5752435302000000500000000100000008000000010000004000000001000000080000000200000040000000030000002800000004000000010000000100000001000000000000001000000000000000000000000000000000000000",
+        "error": {
+          "message": "Dispatch failed: pipeline 4 (bare) takes 0 uniform bytes, but the command has 16",
+          "opcode": "Dispatch"
+        },
+        "name": "uniform bytes for a pipeline without uniforms"
       },
       {
         "bytes": "57524353020000006c0000000100000008000000010000004000000001000000080000000200000040000000040000001000000000000000000000000000000000000000050000002c0000000100000003000000010000000200000001000000020000001000000000000000000000000000000000000000",
@@ -405,7 +418,7 @@
         "name": "each dispatch is its own scope"
       }
     ],
-    "manifest": "{\n  \"manifest_version\": 1,\n  \"stream_version\": 2,\n  \"wasm\": \"game.wasm\",\n  \"pipelines\": [\n    {\n      \"name\": \"draw\",\n      \"shader\": \"draw.wgsl\",\n      \"kind\": \"render\",\n      \"vertex_entry\": \"vs\",\n      \"fragment_entry\": \"fs\",\n      \"uniform\": {\n        \"binding\": 0,\n        \"size\": 16,\n        \"space\": \"uniform\"\n      },\n      \"buffers\": [\n        {\n          \"binding\": 1,\n          \"access\": \"read\"\n        },\n        {\n          \"binding\": 2,\n          \"access\": \"read_write\"\n        }\n      ]\n    },\n    {\n      \"name\": \"compute\",\n      \"shader\": \"compute.wgsl\",\n      \"kind\": \"compute\",\n      \"entry\": \"main\",\n      \"workgroup_size\": [\n        64,\n        1,\n        1\n      ],\n      \"uniform\": {\n        \"binding\": 0,\n        \"size\": 16,\n        \"space\": \"uniform\"\n      },\n      \"buffers\": [\n        {\n          \"binding\": 1,\n          \"access\": \"read\"\n        },\n        {\n          \"binding\": 2,\n          \"access\": \"read_write\"\n        }\n      ]\n    },\n    {\n      \"name\": \"draw2\",\n      \"shader\": \"draw2.wgsl\",\n      \"kind\": \"render\",\n      \"vertex_entry\": \"vs\",\n      \"fragment_entry\": \"fs\",\n      \"uniform\": {\n        \"binding\": 0,\n        \"size\": 16,\n        \"space\": \"uniform\"\n      },\n      \"buffers\": [\n        {\n          \"binding\": 1,\n          \"access\": \"read_write\"\n        },\n        {\n          \"binding\": 2,\n          \"access\": \"read_write\"\n        }\n      ]\n    },\n    {\n      \"name\": \"compute2\",\n      \"shader\": \"compute2.wgsl\",\n      \"kind\": \"compute\",\n      \"entry\": \"main\",\n      \"workgroup_size\": [\n        64,\n        1,\n        1\n      ],\n      \"uniform\": {\n        \"binding\": 0,\n        \"size\": 16,\n        \"space\": \"uniform\"\n      },\n      \"buffers\": [\n        {\n          \"binding\": 1,\n          \"access\": \"read_write\"\n        },\n        {\n          \"binding\": 2,\n          \"access\": \"read_write\"\n        }\n      ]\n    }\n  ]\n}\n"
+    "manifest": "{\n  \"manifest_version\": 1,\n  \"stream_version\": 2,\n  \"wasm\": \"game.wasm\",\n  \"pipelines\": [\n    {\n      \"name\": \"draw\",\n      \"shader\": \"draw.wgsl\",\n      \"kind\": \"render\",\n      \"vertex_entry\": \"vs\",\n      \"fragment_entry\": \"fs\",\n      \"uniform\": {\n        \"binding\": 0,\n        \"size\": 16,\n        \"space\": \"uniform\"\n      },\n      \"buffers\": [\n        {\n          \"binding\": 1,\n          \"access\": \"read\"\n        },\n        {\n          \"binding\": 2,\n          \"access\": \"read_write\"\n        }\n      ]\n    },\n    {\n      \"name\": \"compute\",\n      \"shader\": \"compute.wgsl\",\n      \"kind\": \"compute\",\n      \"entry\": \"main\",\n      \"workgroup_size\": [\n        64,\n        1,\n        1\n      ],\n      \"uniform\": {\n        \"binding\": 0,\n        \"size\": 16,\n        \"space\": \"uniform\"\n      },\n      \"buffers\": [\n        {\n          \"binding\": 1,\n          \"access\": \"read\"\n        },\n        {\n          \"binding\": 2,\n          \"access\": \"read_write\"\n        }\n      ]\n    },\n    {\n      \"name\": \"draw2\",\n      \"shader\": \"draw2.wgsl\",\n      \"kind\": \"render\",\n      \"vertex_entry\": \"vs\",\n      \"fragment_entry\": \"fs\",\n      \"uniform\": {\n        \"binding\": 0,\n        \"size\": 16,\n        \"space\": \"uniform\"\n      },\n      \"buffers\": [\n        {\n          \"binding\": 1,\n          \"access\": \"read_write\"\n        },\n        {\n          \"binding\": 2,\n          \"access\": \"read_write\"\n        }\n      ]\n    },\n    {\n      \"name\": \"compute2\",\n      \"shader\": \"compute2.wgsl\",\n      \"kind\": \"compute\",\n      \"entry\": \"main\",\n      \"workgroup_size\": [\n        64,\n        1,\n        1\n      ],\n      \"uniform\": {\n        \"binding\": 0,\n        \"size\": 16,\n        \"space\": \"uniform\"\n      },\n      \"buffers\": [\n        {\n          \"binding\": 1,\n          \"access\": \"read_write\"\n        },\n        {\n          \"binding\": 2,\n          \"access\": \"read_write\"\n        }\n      ]\n    },\n    {\n      \"name\": \"bare\",\n      \"shader\": \"bare.wgsl\",\n      \"kind\": \"compute\",\n      \"entry\": \"main\",\n      \"workgroup_size\": [\n        64,\n        1,\n        1\n      ],\n      \"uniform\": null,\n      \"buffers\": []\n    }\n  ]\n}\n"
   },
   "comment": "Generated by the wrela-abi crate (runtime/abi/src/vectors.rs); don't edit. Run `cargo run -p wrela-abi --bin gen-ts`.",
   "hashes": [
@@ -611,6 +624,31 @@
       "name": "no WASM file"
     },
     {
+      "error": "invalid manifest: pipeline 1's shader name isn't a file name in the build directory",
+      "json": "{\n  \"manifest_version\": 1,\n  \"stream_version\": 2,\n  \"wasm\": \"game.wasm\",\n  \"pipelines\": [\n    {\n      \"name\": \"sample\",\n      \"shader\": \"pipeline_0.wgsl\",\n      \"kind\": \"compute\",\n      \"entry\": \"main\",\n      \"workgroup_size\": [\n        64,\n        1,\n        1\n      ],\n      \"uniform\": {\n        \"binding\": 0,\n        \"size\": 32,\n        \"space\": \"uniform\"\n      },\n      \"buffers\": [\n        {\n          \"binding\": 1,\n          \"access\": \"read_write\"\n        }\n      ]\n    },\n    {\n      \"name\": \"cover+shade\",\n      \"shader\": \"/etc/hosts\",\n      \"kind\": \"render\",\n      \"vertex_entry\": \"vs\",\n      \"fragment_entry\": \"fs\",\n      \"uniform\": null,\n      \"buffers\": []\n    }\n  ]\n}\n",
+      "name": "an absolute shader path"
+    },
+    {
+      "error": "invalid manifest: pipeline 0's shader name isn't a file name in the build directory",
+      "json": "{\n  \"manifest_version\": 1,\n  \"stream_version\": 2,\n  \"wasm\": \"game.wasm\",\n  \"pipelines\": [\n    {\n      \"name\": \"sample\",\n      \"shader\": \"../x.wgsl\",\n      \"kind\": \"compute\",\n      \"entry\": \"main\",\n      \"workgroup_size\": [\n        64,\n        1,\n        1\n      ],\n      \"uniform\": {\n        \"binding\": 0,\n        \"size\": 32,\n        \"space\": \"uniform\"\n      },\n      \"buffers\": [\n        {\n          \"binding\": 1,\n          \"access\": \"read_write\"\n        }\n      ]\n    },\n    {\n      \"name\": \"cover+shade\",\n      \"shader\": \"pipeline_1.wgsl\",\n      \"kind\": \"render\",\n      \"vertex_entry\": \"vs\",\n      \"fragment_entry\": \"fs\",\n      \"uniform\": null,\n      \"buffers\": []\n    }\n  ]\n}\n",
+      "name": "a shader path out of the directory"
+    },
+    {
+      "error": "invalid manifest: the WASM file's name isn't a file name in the build directory",
+      "json": "{\n  \"manifest_version\": 1,\n  \"stream_version\": 2,\n  \"wasm\": \"data:application/wasm,\",\n  \"pipelines\": [\n    {\n      \"name\": \"sample\",\n      \"shader\": \"pipeline_0.wgsl\",\n      \"kind\": \"compute\",\n      \"entry\": \"main\",\n      \"workgroup_size\": [\n        64,\n        1,\n        1\n      ],\n      \"uniform\": {\n        \"binding\": 0,\n        \"size\": 32,\n        \"space\": \"uniform\"\n      },\n      \"buffers\": [\n        {\n          \"binding\": 1,\n          \"access\": \"read_write\"\n        }\n      ]\n    },\n    {\n      \"name\": \"cover+shade\",\n      \"shader\": \"pipeline_1.wgsl\",\n      \"kind\": \"render\",\n      \"vertex_entry\": \"vs\",\n      \"fragment_entry\": \"fs\",\n      \"uniform\": null,\n      \"buffers\": []\n    }\n  ]\n}\n",
+      "name": "a WASM file as a URL"
+    },
+    {
+      "error": "invalid manifest: the WASM file's name isn't a file name in the build directory",
+      "json": "{\n  \"manifest_version\": 1,\n  \"stream_version\": 2,\n  \"wasm\": \"game.wasm#x\",\n  \"pipelines\": [\n    {\n      \"name\": \"sample\",\n      \"shader\": \"pipeline_0.wgsl\",\n      \"kind\": \"compute\",\n      \"entry\": \"main\",\n      \"workgroup_size\": [\n        64,\n        1,\n        1\n      ],\n      \"uniform\": {\n        \"binding\": 0,\n        \"size\": 32,\n        \"space\": \"uniform\"\n      },\n      \"buffers\": [\n        {\n          \"binding\": 1,\n          \"access\": \"read_write\"\n        }\n      ]\n    },\n    {\n      \"name\": \"cover+shade\",\n      \"shader\": \"pipeline_1.wgsl\",\n      \"kind\": \"render\",\n      \"vertex_entry\": \"vs\",\n      \"fragment_entry\": \"fs\",\n      \"uniform\": null,\n      \"buffers\": []\n    }\n  ]\n}\n",
+      "name": "a WASM file with a fragment"
+    },
+    {
+      "error": "invalid manifest: pipeline 0's shader name isn't a file name in the build directory",
+      "json": "{\n  \"manifest_version\": 1,\n  \"stream_version\": 2,\n  \"wasm\": \"game.wasm\",\n  \"pipelines\": [\n    {\n      \"name\": \"sample\",\n      \"shader\": \".hidden.wgsl\",\n      \"kind\": \"compute\",\n      \"entry\": \"main\",\n      \"workgroup_size\": [\n        64,\n        1,\n        1\n      ],\n      \"uniform\": {\n        \"binding\": 0,\n        \"size\": 32,\n        \"space\": \"uniform\"\n      },\n      \"buffers\": [\n        {\n          \"binding\": 1,\n          \"access\": \"read_write\"\n        }\n      ]\n    },\n    {\n      \"name\": \"cover+shade\",\n      \"shader\": \"pipeline_1.wgsl\",\n      \"kind\": \"render\",\n      \"vertex_entry\": \"vs\",\n      \"fragment_entry\": \"fs\",\n      \"uniform\": null,\n      \"buffers\": []\n    }\n  ]\n}\n",
+      "name": "a hidden shader file"
+    },
+    {
       "error": "invalid manifest: pipelines[0].kind must be one of compute, render, not 0",
       "json": "{\n  \"manifest_version\": 1,\n  \"stream_version\": 2,\n  \"wasm\": \"game.wasm\",\n  \"pipelines\": [\n    {\n      \"name\": \"sample\",\n      \"shader\": \"pipeline_0.wgsl\",\n      \"kind\": 0,\n      \"entry\": \"main\",\n      \"workgroup_size\": [\n        64,\n        1,\n        1\n      ],\n      \"uniform\": {\n        \"binding\": 0,\n        \"size\": 32,\n        \"space\": \"uniform\"\n      },\n      \"buffers\": [\n        {\n          \"binding\": 1,\n          \"access\": \"read_write\"\n        }\n      ]\n    },\n    {\n      \"name\": \"cover+shade\",\n      \"shader\": \"pipeline_1.wgsl\",\n      \"kind\": \"render\",\n      \"vertex_entry\": \"vs\",\n      \"fragment_entry\": \"fs\",\n      \"uniform\": null,\n      \"buffers\": []\n    }\n  ]\n}\n",
       "name": "a kind as a number"
@@ -717,6 +755,23 @@
       "json": "{\n  \"manifest_version\": 1,\n  \"stream_version\": 2,\n  \"wasm\": \"game.wasm\",\n  \"pipelines\": [\n    {\n      \"name\": \"\\ud800\",\n      \"shader\": \"pipeline_0.wgsl\",\n      \"kind\": \"compute\",\n      \"entry\": \"main\",\n      \"workgroup_size\": [\n        64,\n        1,\n        1\n      ],\n      \"uniform\": {\n        \"binding\": 0,\n        \"size\": 32,\n        \"space\": \"uniform\"\n      },\n      \"buffers\": [\n        {\n          \"binding\": 1,\n          \"access\": \"read_write\"\n        }\n      ]\n    },\n    {\n      \"name\": \"cover+shade\",\n      \"shader\": \"pipeline_1.wgsl\",\n      \"kind\": \"render\",\n      \"vertex_entry\": \"vs\",\n      \"fragment_entry\": \"fs\",\n      \"uniform\": null,\n      \"buffers\": []\n    }\n  ]\n}\n",
       "malformed": true,
       "name": "a lone surrogate"
+    },
+    {
+      "error": null,
+      "json": "{\n  \"manifest_version\": 1.0000000000000001110,\n  \"stream_version\": 2,\n  \"wasm\": \"game.wasm\",\n  \"pipelines\": [\n    {\n      \"name\": \"sample\",\n      \"shader\": \"pipeline_0.wgsl\",\n      \"kind\": \"compute\",\n      \"entry\": \"main\",\n      \"workgroup_size\": [\n        64,\n        1,\n        1\n      ],\n      \"uniform\": {\n        \"binding\": 0,\n        \"size\": 32,\n        \"space\": \"uniform\"\n      },\n      \"buffers\": [\n        {\n          \"binding\": 1,\n          \"access\": \"read_write\"\n        }\n      ]\n    },\n    {\n      \"name\": \"cover+shade\",\n      \"shader\": \"pipeline_1.wgsl\",\n      \"kind\": \"render\",\n      \"vertex_entry\": \"vs\",\n      \"fragment_entry\": \"fs\",\n      \"uniform\": null,\n      \"buffers\": []\n    }\n  ]\n}\n",
+      "name": "a fraction that rounds to a whole number"
+    },
+    {
+      "error": null,
+      "json": "{\n  \"manifest_version\": 1,\n  \"stream_version\": 2,\n  \"wasm\": \"game.wasm\", \"extra\": 1e400,\n  \"pipelines\": [\n    {\n      \"name\": \"sample\",\n      \"shader\": \"pipeline_0.wgsl\",\n      \"kind\": \"compute\",\n      \"entry\": \"main\",\n      \"workgroup_size\": [\n        64,\n        1,\n        1\n      ],\n      \"uniform\": {\n        \"binding\": 0,\n        \"size\": 32,\n        \"space\": \"uniform\"\n      },\n      \"buffers\": [\n        {\n          \"binding\": 1,\n          \"access\": \"read_write\"\n        }\n      ]\n    },\n    {\n      \"name\": \"cover+shade\",\n      \"shader\": \"pipeline_1.wgsl\",\n      \"kind\": \"render\",\n      \"vertex_entry\": \"vs\",\n      \"fragment_entry\": \"fs\",\n      \"uniform\": null,\n      \"buffers\": []\n    }\n  ]\n}\n",
+      "malformed": true,
+      "name": "a number past f64"
+    },
+    {
+      "error": null,
+      "json": "{\n  \"manifest_version\": 1,\n  \"stream_version\": 2,\n  \"wasm\": \"game.wasm\", \"extra\": [[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]],\n  \"pipelines\": [\n    {\n      \"name\": \"sample\",\n      \"shader\": \"pipeline_0.wgsl\",\n      \"kind\": \"compute\",\n      \"entry\": \"main\",\n      \"workgroup_size\": [\n        64,\n        1,\n        1\n      ],\n      \"uniform\": {\n        \"binding\": 0,\n        \"size\": 32,\n        \"space\": \"uniform\"\n      },\n      \"buffers\": [\n        {\n          \"binding\": 1,\n          \"access\": \"read_write\"\n        }\n      ]\n    },\n    {\n      \"name\": \"cover+shade\",\n      \"shader\": \"pipeline_1.wgsl\",\n      \"kind\": \"render\",\n      \"vertex_entry\": \"vs\",\n      \"fragment_entry\": \"fs\",\n      \"uniform\": null,\n      \"buffers\": []\n    }\n  ]\n}\n",
+      "malformed": true,
+      "name": "arrays nested 128 deep"
     }
   ],
   "sequences": [

@@ -22,3 +22,48 @@ struct Holder {
 fn f() -> f32 {
     one(Circle { r: 1.0 }) //~ E0400
 }
+
+struct Pair<T> {
+    v: T,
+}
+
+impl Pair<f32> {
+    fn tag() -> u32 {
+        1
+    }
+}
+
+impl Pair<u32> {
+    fn tag() -> u32 {
+        2
+    }
+}
+
+// Both impls have `tag` and nothing says which `Pair`: which runs mustn't depend on the order
+// the impls are written in.
+fn g() -> u32 {
+    Pair::tag() //~ E0306
+}
+
+fn h() -> u32 {
+    Pair::<u32>::tag()
+}
+
+trait Keyed {
+    fn key(self) -> u32
+}
+
+struct NeedsKey<T: Keyed> {
+    t: T,
+}
+
+// A struct's arguments must have its generics' bounds, wherever its type is written or made.
+fn needs_key(s: NeedsKey<i32>) -> i32 { //~ E0400
+    s.t
+}
+
+fn needs_key_local() -> u32 {
+    let o: Option<NeedsKey<f32>> = None //~ E0400
+    let n = NeedsKey { t: true } //~ E0400
+    1
+}

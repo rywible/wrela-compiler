@@ -172,6 +172,20 @@ pub fn lookup_name(p: &Program, m: ModuleId, name: &str) -> Option<Res> {
 }
 
 /// Every name visible in a module, for suggestions.
+/// The names visible in `m` that name types: structs, enums, traits and built-in types
+/// (and modules, which a type's path can start with).
+pub fn visible_type_names(p: &Program, m: ModuleId) -> Vec<String> {
+    let is_type =
+        |r: &Res| matches!(r, Res::Adt(_) | Res::Trait(_) | Res::BuiltinTy(_) | Res::Module(_));
+    let mut out: Vec<String> =
+        p.module(m).scope.iter().filter(|(_, b)| is_type(&b.res)).map(|(n, _)| n.clone()).collect();
+    if let Some(prelude) = prelude(p) {
+        let scope = &p.module(prelude).scope;
+        out.extend(scope.iter().filter(|(_, b)| is_type(&b.res)).map(|(n, _)| n.clone()));
+    }
+    out
+}
+
 pub fn visible_names(p: &Program, m: ModuleId) -> Vec<String> {
     let mut out: Vec<String> = p.module(m).scope.keys().cloned().collect();
     if let Some(prelude) = prelude(p) {
@@ -264,6 +278,12 @@ pub fn resolve_module_path_in(
             first.span,
             format!("there's no module or item `{}` here", first.name),
         );
+        if crate::OUTPUT_DIRS.contains(&first.name.as_str()) {
+            d = d.with_note(format!(
+                "a `{}/` directory at the package's top level holds outputs, so it's never a module",
+                first.name
+            ));
+        }
         let mut names = visible_names(p, from);
         if let Some(r) = p.package_root {
             names.extend(p.module(r).children.keys().cloned());
@@ -474,18 +494,13 @@ pub fn resolve_type(
         ast::TypeExprKind::Array(elem, len) => {
             let e = resolve_type(p, diags, scope, elem, TyPos::Normal);
             match len {
-                Some(len) => {
-                    match const_u32(p, scope.module, len) {
-                        Some(n) => p.types.array(e, n),
-                        None => {
-                            diags.push(
-                            Diagnostic::new(codes::E0325, len.span, "an array length is an integer literal or a constant holding one")
-                                .with_note("evaluating expressions at compile time is tier 1"),
-                        );
-                            p.types.error
-                        }
+                Some(len) => match const_u32(p, scope.module, len) {
+                    Some(n) => p.types.array(e, n),
+                    None => {
+                        diags.push(length_error(p, scope.module, len));
+                        p.types.error
                     }
-                }
+                },
                 None => {
                     if !matches!(pos, TyPos::Param(_)) {
                         diags.push(
@@ -518,6 +533,46 @@ pub fn resolve_type(
         }
         ast::TypeExprKind::Path(path) => resolve_type_path(p, diags, scope, te, path, pos),
     }
+}
+
+/// Why `len`, written as an array length in `module`, isn't one: a path that names nothing
+/// usable (a private constant, an unknown name), a literal past `u32`, or what a length may be.
+pub fn length_error(p: &Program, module: ModuleId, len: &ast::Expr) -> Diagnostic {
+    let mut inner = len;
+    while let ast::ExprKind::Paren(x) = &inner.kind {
+        inner = x;
+    }
+    match &inner.kind {
+        ast::ExprKind::Path(path) if !path.is_single() => {
+            if let PathLookup::Error(d) = resolve_module_path_in(p, module, &path.segments, true) {
+                return *d;
+            }
+        }
+        ast::ExprKind::Path(path) => {
+            let name = &path.segments[0].ident.name;
+            if lookup_name(p, module, name).is_none() && !is_broken(p, module, name) {
+                return Diagnostic::new(
+                    codes::E0200,
+                    len.span,
+                    format!("there's no constant `{name}` here"),
+                );
+            }
+        }
+        ast::ExprKind::Lit(ast::Lit { kind: ast::LitKind::Int(_), .. }) => {
+            return Diagnostic::new(
+                codes::E0325,
+                len.span,
+                format!("an array length is at most {} (a `u32`)", u32::MAX),
+            );
+        }
+        _ => {}
+    }
+    Diagnostic::new(
+        codes::E0325,
+        len.span,
+        "an array length is an integer literal or a constant holding one",
+    )
+    .with_note("evaluating expressions at compile time is tier 1")
 }
 
 /// The value of an array length: an integer literal, or a constant holding one, resolved in
@@ -622,7 +677,7 @@ fn resolve_type_path(
                     segs[0].ident.span,
                     format!("there's no type `{first}` here"),
                 );
-                let mut names = visible_names(p, scope.module);
+                let mut names = visible_type_names(p, scope.module);
                 names.extend(scope.params.iter().map(|(n, _)| n.clone()));
                 names.extend(
                     ["f32", "u32", "i32", "bool", "vec2", "vec3", "vec4", "mat3", "mat4"]

@@ -5,6 +5,7 @@ use crate::defs::*;
 use crate::program::Program;
 use crate::resolve::{add_with_supertraits, param_bounds_closure};
 use crate::ty::*;
+use std::collections::HashMap;
 
 /// Matches `pattern` (which may mention `vars`) against `ty`, binding `vars` in `subst`.
 pub fn match_ty(p: &Program, pattern: TyId, ty: TyId, vars: &[ParamId], subst: &mut Subst) -> bool {
@@ -62,13 +63,58 @@ pub fn could_unify(p: &Program, a: TyId, b: TyId) -> bool {
     }
 }
 
+/// Whether the types `a` and the types `b`, each of two impls' parameters standing for one
+/// type throughout, could be the same: `(T, T)` can't be `(i32, f32)`. Projections and
+/// variables could be anything.
+pub fn impls_could_meet(p: &Program, a: &[TyId], b: &[TyId]) -> bool {
+    let mut bound = HashMap::new();
+    a.len() == b.len() && a.iter().zip(b).all(|(&x, &y)| meet(p, x, y, &mut bound, 0))
+}
+
+fn meet(p: &Program, a: TyId, b: TyId, bound: &mut HashMap<ParamId, TyId>, depth: u32) -> bool {
+    if a == b || depth > 64 {
+        return true;
+    }
+    match (p.types.kind(a), p.types.kind(b)) {
+        (&TyKind::Param(x), _) => match bound.get(&x) {
+            Some(&t) => meet(p, t, b, bound, depth + 1),
+            None => {
+                bound.insert(x, b);
+                true
+            }
+        },
+        (_, &TyKind::Param(y)) => match bound.get(&y) {
+            Some(&t) => meet(p, a, t, bound, depth + 1),
+            None => {
+                bound.insert(y, a);
+                true
+            }
+        },
+        (TyKind::Error, _) | (_, TyKind::Error) => true,
+        (TyKind::Var(_), _) | (_, TyKind::Var(_)) => true,
+        (TyKind::Projection { .. }, _) | (_, TyKind::Projection { .. }) => true,
+        (TyKind::Adt(x, xs), TyKind::Adt(y, ys)) => {
+            x == y
+                && xs.len() == ys.len()
+                && xs.iter().zip(ys).all(|(&s, &t)| meet(p, s, t, bound, depth + 1))
+        }
+        (TyKind::Tuple(xs), TyKind::Tuple(ys)) => {
+            xs.len() == ys.len()
+                && xs.iter().zip(ys).all(|(&s, &t)| meet(p, s, t, bound, depth + 1))
+        }
+        (TyKind::Array(x, n), TyKind::Array(y, m)) => n == m && meet(p, *x, *y, bound, depth + 1),
+        (TyKind::Slice(x), TyKind::Slice(y)) => meet(p, *x, *y, bound, depth + 1),
+        _ => false,
+    }
+}
+
 pub fn could_unify_all(p: &Program, a: &[TyId], b: &[TyId]) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(&x, &y)| could_unify(p, x, y))
 }
 
 /// The traits a type is known to have from its declaration rather than an impl: a generic
 /// parameter's bounds, an opaque return type's traits, an associated type's bounds.
-fn declared_bounds(p: &Program, ty: TyId) -> Option<Vec<TraitRef>> {
+pub(crate) fn declared_bounds(p: &Program, ty: TyId) -> Option<Vec<TraitRef>> {
     match p.types.kind(ty) {
         TyKind::Param(id) => Some(param_bounds_closure(p, *id)),
         TyKind::Opaque(f, args) => {
@@ -203,6 +249,9 @@ pub fn implements_builtin(p: &Program, ty: TyId, lang: Lang) -> bool {
     if let Some(&known) = p.builtin_impls.borrow().get(&(ty, lang)) {
         return known;
     }
+    // Assumed while it's found: a type that holds itself (E0318, reported) doesn't send this
+    // round its fields forever.
+    p.builtin_impls.borrow_mut().insert((ty, lang), true);
     let r = implements_builtin_uncached(p, ty, lang);
     p.builtin_impls.borrow_mut().insert((ty, lang), r);
     r
@@ -225,7 +274,13 @@ fn implements_builtin_uncached(p: &Program, ty: TyId, lang: Lang) -> bool {
                 return false;
             }
             let subst = Subst::from_pairs(&adt.generics, args);
-            adt.all_fields().all(|f| implements_builtin(p, p.types.subst(f.ty, &subst), lang))
+            // A field `T::Out` is, with `T` known, the type the impl gives it.
+            adt.all_fields().all(|f| {
+                implements_builtin(p, normalize(p, p.types.subst(f.ty, &subst), None), lang)
+            })
+        }
+        TyKind::Projection { .. } if normalize(p, ty, None) != ty => {
+            implements_builtin(p, normalize(p, ty, None), lang)
         }
         TyKind::Param(_) | TyKind::Opaque(..) | TyKind::Projection { .. } => {
             let Some(want) = p.lang_trait(lang) else { return false };
@@ -264,28 +319,69 @@ pub fn normalize(p: &Program, ty: TyId, in_impl: Option<&ImplDef>) -> TyId {
 }
 
 fn resolve_projections(p: &Program, ty: TyId) -> TyId {
+    resolve_projections_in(p, ty, &mut Vec::new())
+}
+
+/// How many projections deep resolving one may go: `type A = W<Self>::A` makes a new one at
+/// each step.
+const MAX_PROJECTION_CHAIN: usize = 64;
+
+/// `active`: the projections being resolved. One met again is defined in terms of itself
+/// (`type A = Self::A`), and a chain past [`MAX_PROJECTION_CHAIN`] grows without end: either is
+/// left a projection, which [`cyclic_projection`] finds for the impl that declares it.
+fn resolve_projections_in(p: &Program, ty: TyId, active: &mut Vec<TyId>) -> TyId {
     p.types.map(ty, &mut |types, t| match types.kind(t) {
         TyKind::Projection { self_ty, trait_, trait_args, name } => {
-            let self_ty = resolve_projections(p, *self_ty);
+            let self_ty = resolve_projections_in(p, *self_ty, active);
             let r = TraitRef { trait_: *trait_, args: trait_args.clone() };
+            let this = types.intern(TyKind::Projection {
+                self_ty,
+                trait_: r.trait_,
+                trait_args: r.args.clone(),
+                name: name.clone(),
+            });
+            if active.contains(&this) || active.len() >= MAX_PROJECTION_CHAIN {
+                return Some(this);
+            }
             if !types.has_params(self_ty)
                 && !matches!(types.kind(self_ty), TyKind::Opaque(..) | TyKind::Var(_))
                 && let Some((i, subst)) = find_impl(p, self_ty, &r)
                 && let Some(&a) = p.impl_(i).assoc_types.get(name)
             {
-                return Some(resolve_projections(p, types.subst(a, &subst)));
+                active.push(this);
+                let resolved = resolve_projections_in(p, types.subst(a, &subst), active);
+                active.pop();
+                return Some(resolved);
             }
-            Some(types.intern(TyKind::Projection {
-                self_ty,
-                trait_: r.trait_,
-                trait_args: r.args,
-                name: name.clone(),
-            }))
+            Some(this)
         }
         // Left as they are, arguments and all.
         TyKind::Opaque(..) | TyKind::Closure(..) | TyKind::FnDef(..) => Some(t),
         _ => None,
     })
+}
+
+/// A projection in `ty`, normalized, that an impl defines but resolving couldn't end: an
+/// associated type defined in terms of itself.
+pub fn cyclic_projection(p: &Program, ty: TyId) -> Option<TyId> {
+    let mut found = None;
+    p.types.any(ty, &mut |k| {
+        if let TyKind::Projection { self_ty, trait_, trait_args, name } = k
+            && !p.types.has_params(*self_ty)
+            && !p.types.has_vars(*self_ty)
+            && !matches!(p.types.kind(*self_ty), TyKind::Opaque(..) | TyKind::Error)
+        {
+            let r = TraitRef { trait_: *trait_, args: trait_args.clone() };
+            if find_impl(p, *self_ty, &r)
+                .is_some_and(|(i, _)| p.impl_(i).assoc_types.contains_key(name))
+            {
+                found = Some(p.types.intern(k.clone()));
+                return true;
+            }
+        }
+        false
+    });
+    found
 }
 
 /// The method `name` declared in trait `t` itself, if it has one. Not its supertraits': the
@@ -294,17 +390,29 @@ pub fn trait_method(p: &Program, t: TraitId, name: &str) -> Option<FnId> {
     p.trait_(t).methods.iter().copied().find(|&f| p.func(f).name == name)
 }
 
-/// The method `name` of `r` or of one of its supertraits (`Sub::base(x)`), and the trait that
-/// declares it, with its arguments for `Self = self_ty`.
+/// The methods `name` of `r` or of its supertraits (`Sub::base(x)`), each with the trait that
+/// declares it, with its arguments for `Self = self_ty`: `r`'s own alone if it has one, else
+/// every supertrait's (more than one is ambiguous).
 pub fn trait_method_via(
     p: &Program,
     self_ty: TyId,
     r: TraitRef,
     name: &str,
-) -> Option<(FnId, TraitRef)> {
+) -> Vec<(FnId, TraitRef)> {
+    if let Some(m) = trait_method(p, r.trait_, name) {
+        return vec![(m, r)];
+    }
     let mut all = Vec::new();
     add_with_supertraits(p, self_ty, r, &mut all);
-    all.into_iter().find_map(|r| trait_method(p, r.trait_, name).map(|m| (m, r)))
+    let mut found: Vec<(FnId, TraitRef)> = Vec::new();
+    for r in all {
+        if let Some(m) = trait_method(p, r.trait_, name)
+            && !found.iter().any(|(f, _)| *f == m)
+        {
+            found.push((m, r));
+        }
+    }
+    found
 }
 
 /// The function that implements trait method `method` for the concrete type `self_ty`, and the

@@ -52,12 +52,18 @@ pub const STACK_SIZE: usize = 256 << 20;
 
 /// Checks the package at `root`: every diagnostic, including those lowering finds.
 pub fn check(root: &Path) -> Output {
-    on_compiler_thread(|| compile(root, false))
+    on_compiler_thread(|| compile(root, false, wrela_lower::Roots::of))
 }
 
 /// Builds the package at `root`: its diagnostics, and its files when there are no errors.
 pub fn build(root: &Path) -> Output {
-    on_compiler_thread(|| compile(root, true))
+    on_compiler_thread(|| compile(root, true, wrela_lower::Roots::of))
+}
+
+/// [`build`], lowering every function of the package that can be lowered on its own, exported
+/// or not ([`wrela_lower::Roots::every_fn`]): for tests of code that nothing calls.
+pub fn build_every_fn(root: &Path) -> Output {
+    on_compiler_thread(|| compile(root, true, wrela_lower::Roots::every_fn))
 }
 
 fn on_compiler_thread<T: Send>(f: impl FnOnce() -> T + Send) -> T {
@@ -71,7 +77,11 @@ fn on_compiler_thread<T: Send>(f: impl FnOnce() -> T + Send) -> T {
     })
 }
 
-fn compile(root: &Path, emit: bool) -> Output {
+fn compile(
+    root: &Path,
+    emit: bool,
+    roots: fn(&wrela_sema::Checked) -> wrela_lower::Roots,
+) -> Output {
     let (sources, mut diagnostics, units) = load(root);
     let Some(units) = units else {
         return Output { sources, diagnostics, files: Vec::new() };
@@ -79,7 +89,7 @@ fn compile(root: &Path, emit: bool) -> Output {
     let checked = wrela_sema::check_program(units, &mut diagnostics);
     let mut files = Vec::new();
     if !has_errors(&diagnostics) {
-        let roots = wrela_lower::Roots::of(&checked);
+        let roots = roots(&checked);
         let (lowered, d) = wrela_lower::lower(&checked, &roots, emit);
         let ok = !has_errors(&d);
         diagnostics.extend(d);
@@ -143,6 +153,26 @@ fn load(root: &Path) -> (SourceMap, Vec<Diagnostic>, Option<Vec<SourceUnit>>) {
         let (name, path) = (pf.display.clone(), pf.module.clone());
         units.push(add_unit(&mut sources, &mut diags, name, text, path, false));
     }
+    // Without `main.wrela` the package is a library, with no exports: a `Main.wrela` on a file
+    // system that ignores case is more likely a mistake than a module named `Main`.
+    let package = || units.iter().filter(|u| !u.is_std);
+    if !package().any(|u| u.path == ["main"])
+        && let Some(u) =
+            package().find(|u| u.path.len() == 1 && u.path[0].eq_ignore_ascii_case("main"))
+    {
+        let file = u.ast.span.file;
+        diags.push(
+            Diagnostic::new(
+                codes::W0003,
+                Span::new(file, 0, 0),
+                format!(
+                    "`{}.wrela` isn't the entry module, which is `main.wrela` in lower case: the package is a library, with no exports",
+                    u.path[0]
+                ),
+            )
+            .with_help("rename it `main.wrela`, or the module something else"),
+        );
+    }
     (sources, diags, Some(units))
 }
 
@@ -187,5 +217,49 @@ mod tests {
         let codes: Vec<&str> = out.diagnostics.iter().map(|x| x.code.as_str()).collect();
         assert_eq!(codes, ["E0205"], "{:?}", out.diagnostics);
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The codes `check` reports for a package of these files.
+    fn codes_of(name: &str, files: &[(&str, &str)]) -> Vec<&'static str> {
+        let d = std::env::temp_dir().join(format!("wrela-driver-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).expect("temp dir");
+        for (file, text) in files {
+            std::fs::write(d.join(file), text).expect("write");
+        }
+        let out = check(&d);
+        let _ = std::fs::remove_dir_all(&d);
+        out.diagnostics.iter().map(|x| x.code.as_str()).collect()
+    }
+
+    /// A pipe named like a module would block a read forever: it's refused (E0205).
+    #[cfg(unix)]
+    #[test]
+    fn a_pipe_is_no_module() {
+        let d = std::env::temp_dir().join(format!("wrela-driver-pipe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).expect("temp dir");
+        std::fs::write(
+            d.join("main.wrela"),
+            "pub fn frame(time: f32, width: u32, height: u32) {}\n",
+        )
+        .expect("write");
+        let made = std::process::Command::new("mkfifo").arg(d.join("pipe.wrela")).status();
+        if made.is_ok_and(|s| s.success()) {
+            let out = check(&d);
+            let codes: Vec<&str> = out.diagnostics.iter().map(|x| x.code.as_str()).collect();
+            assert_eq!(codes, ["E0205"], "{:?}", out.diagnostics);
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A main.wrela with no items has no `frame` either (E0703); `Main.wrela` instead of it
+    /// makes a library, which is likely a mistake (W0003).
+    #[test]
+    fn a_program_without_frame_is_e0703() {
+        assert_eq!(codes_of("empty", &[("main.wrela", "")]), ["E0703"]);
+        assert_eq!(codes_of("uses", &[("main.wrela", "use std::gpu::buffer\n")]), ["E0703"]);
+        let upper = codes_of("upper", &[("Main.wrela", "pub fn f() -> i32 {\n    1\n}\n")]);
+        assert_eq!(upper, ["W0003"]);
     }
 }

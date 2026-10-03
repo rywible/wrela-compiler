@@ -1,0 +1,16 @@
+// mistake: a method taking `&self`
+// expect: E0106
+// fix: yes
+struct Ball: Copy + Clone {
+    r: f32,
+}
+
+impl Ball {
+    fn radius(&self) -> f32 {
+        self.r
+    }
+}
+
+pub fn size() -> f32 {
+    Ball { r: 2.0 }.radius()
+}

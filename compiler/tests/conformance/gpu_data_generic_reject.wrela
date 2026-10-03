@@ -1,0 +1,15 @@
+// rejects: gpu.data
+use std::gpu::{GlobalId, GpuBuffer, LocalId, Slots, buffer, dispatch}
+
+// A parameter of a generic type is the caller's data, whatever the type: a `LocalId` given for
+// it is a value to send (not the invocation's id), and it isn't `GpuData`.
+@compute(64)
+fn generic<T: Copy>(x: T, out: mut Slots<f32>, id: GlobalId) { //~ E0604
+    let y = x
+    out[id] = 1.0
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    let out: GpuBuffer<f32> = buffer(64)
+    dispatch(generic, groups: 1, x: LocalId { x: 7, y: 9, z: 0 }, out: out)
+}

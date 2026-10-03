@@ -14,3 +14,14 @@ fn f(a: i32, b: u32) -> u32 {
         2
     }
 }
+
+// A tuple pattern on a value that's already an error isn't reported again.
+fn destructure_unknown() -> f32 {
+    let (a, b) = nothing_here //~ E0200
+    a + b
+}
+
+fn too_long() -> f32 {
+    let a: [f32; 5000000000] = [0.0; 5000000000] //~ E0325 E0325
+    a[0]
+}

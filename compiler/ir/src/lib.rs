@@ -610,7 +610,19 @@ impl fmt::Display for Module {
 
 #[cfg(test)]
 mod tests {
-    use super::ident;
+    use super::*;
+
+    /// A matrix's column and a vector's component are types of the module as soon as the
+    /// matrix is: `m[c][r]` projects through both, in a module (a GPU pipeline's) that may
+    /// make no `vecN` of its own.
+    #[test]
+    fn a_matrix_brings_its_parts() {
+        let mut m = Module::default();
+        let mat = m.types.intern(TypeDef::Matrix(3));
+        assert!(m.types.lookup(&TypeDef::Vector(3)).is_some());
+        assert!(m.types.lookup(&TypeDef::Scalar(Scalar::F32)).is_some());
+        assert_eq!(m.types.lookup(&TypeDef::Matrix(3)), Some(mat));
+    }
 
     #[test]
     fn identifiers() {

@@ -61,8 +61,8 @@ impl<'a> Cx<'a> {
             ExprKind::Unary(UnOp::Neg, x) => {
                 let l = match x.kind {
                     ExprKind::Lit(Lit::Int(v)) if types.is_int(e.ty) => Lit::Int(-v),
-                    ExprKind::Lit(Lit::Int(v)) => Lit::Float(-(v as f64)),
-                    ExprKind::Lit(Lit::Float(f)) => Lit::Float(-f),
+                    ExprKind::Lit(Lit::Int(v)) => Lit::Float(-(v as f64), -(v as f32)),
+                    ExprKind::Lit(Lit::Float(d, f)) => Lit::Float(-d, -f),
                     _ => return None,
                 };
                 scalar(self, mb, l)?

@@ -176,8 +176,8 @@ fn sequences() -> Vec<Value> {
 }
 
 /// The manifest the check vectors (and the native host's tests) run against: pipelines 0 and 2
-/// render, 1 and 3 compute; each takes 16 uniform bytes; 0 and 1 bind a read-only buffer then a
-/// read-write one, 2 and 3 two read-write ones.
+/// render, 1, 3 and 4 compute; 0 to 3 take 16 uniform bytes, 0 and 1 bind a read-only buffer
+/// then a read-write one, 2 and 3 two read-write ones; 4 takes nothing.
 pub fn check_manifest() -> Manifest {
     let mut m = Manifest::new("game.wasm");
     let shape = |name: &str, stage| Pipeline {
@@ -200,7 +200,9 @@ pub fn check_manifest() -> Manifest {
         p
     };
     m.pipelines.push(write_twice(shape("draw2", render)));
-    m.pipelines.push(write_twice(shape("compute2", compute)));
+    m.pipelines.push(write_twice(shape("compute2", compute.clone())));
+    // A kernel with no uniform block and no buffers.
+    m.pipelines.push(Pipeline { uniform: None, buffers: Vec::new(), ..shape("bare", compute) });
     m
 }
 
@@ -260,6 +262,16 @@ fn checks() -> Value {
             &with_buffers(&|e| _ = e.destroy_buffer(1).dispatch(1, [1; 3], &[1, 2], &u)),
         ),
         check("no such pipeline", &m, &with_buffers(&|e| _ = e.dispatch(7, [1; 3], &[1, 2], &u))),
+        check(
+            "a pipeline without uniforms",
+            &m,
+            &with_buffers(&|e| _ = e.dispatch(4, [1; 3], &[], &[])),
+        ),
+        check(
+            "uniform bytes for a pipeline without uniforms",
+            &m,
+            &with_buffers(&|e| _ = e.dispatch(4, [1; 3], &[], &u)),
+        ),
         check(
             "a draw with a compute pipeline",
             &m,
@@ -437,6 +449,12 @@ fn manifests() -> Vec<Value> {
             }),
         ),
         manifest("no WASM file", edited(&|m| m.wasm = String::new())),
+        // A file is one in the build directory: not a path out of it, nor a URL.
+        manifest("an absolute shader path", edited(&|m| m.pipelines[1].shader = "/etc/hosts".into())),
+        manifest("a shader path out of the directory", edited(&|m| m.pipelines[0].shader = "../x.wgsl".into())),
+        manifest("a WASM file as a URL", edited(&|m| m.wasm = "data:application/wasm,".into())),
+        manifest("a WASM file with a fragment", edited(&|m| m.wasm = "game.wasm#x".into())),
+        manifest("a hidden shader file", edited(&|m| m.pipelines[0].shader = ".hidden.wgsl".into())),
         // Each field is read one way: serde's other shapes are rejected.
         manifest("a kind as a number", golden.replace("\"kind\": \"compute\"", "\"kind\": 0")),
         manifest(
@@ -481,6 +499,22 @@ fn manifests() -> Vec<Value> {
         malformed("not JSON", golden.replace("}\n", "")),
         malformed("a byte-order mark", format!("\u{feff}{golden}")),
         malformed("a lone surrogate", golden.replace("\"sample\"", "\"\\ud800\"")),
+        // Numbers are read as JavaScript reads them, correctly rounded: this one is `1`.
+        manifest(
+            "a fraction that rounds to a whole number",
+            golden.replace("\"manifest_version\": 1", "\"manifest_version\": 1.0000000000000001110"),
+        ),
+        malformed(
+            "a number past f64",
+            golden.replace("\"wasm\": \"game.wasm\"", "\"wasm\": \"game.wasm\", \"extra\": 1e400"),
+        ),
+        malformed(
+            "arrays nested 128 deep",
+            golden.replace(
+                "\"wasm\": \"game.wasm\"",
+                &format!("\"wasm\": \"game.wasm\", \"extra\": {}{}", "[".repeat(127), "]".repeat(127)),
+            ),
+        ),
     ]
 }
 

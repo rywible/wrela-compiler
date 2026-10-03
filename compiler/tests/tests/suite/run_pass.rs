@@ -66,10 +66,11 @@ fn value(text: &str, ty: &str) -> Value {
     }
 }
 
+/// The same value: a float's sign of zero counts (`-0.0` isn't `0.0`), and any NaN is NaN.
 fn same(a: &Value, b: &Value) -> bool {
     match (a, b) {
-        (Value::F32(x), Value::F32(y)) => x == y || (x.is_nan() && y.is_nan()),
-        (Value::F64(x), Value::F64(y)) => x == y || (x.is_nan() && y.is_nan()),
+        (Value::F32(x), Value::F32(y)) => x.to_bits() == y.to_bits() || (x.is_nan() && y.is_nan()),
+        (Value::F64(x), Value::F64(y)) => x.to_bits() == y.to_bits() || (x.is_nan() && y.is_nan()),
         _ => a == b,
     }
 }
@@ -108,6 +109,9 @@ fn run_case(path: &Path) -> Result<usize, String> {
         let got = host.call_export(&e.call, &args);
         match (&e.want, got) {
             (Want::Traps, Err(Error::Trap(_))) => {}
+            (Want::Returns(v), Ok(_)) if results.is_empty() && v != "()" => {
+                problems.push(format!("`{}`: `{}` returns nothing: expect `()`", e.text, e.call));
+            }
             (Want::Returns(v), Ok(vals)) => {
                 let want: Vec<Value> = match results.first() {
                     Some(t) => vec![value(v, t)],
@@ -141,4 +145,5 @@ fn run_pass() {
     }
     println!("{} programs, {checked} expectations", cases.len());
     assert!(failures.is_empty(), "{} cases failed:\n\n{}", failures.len(), failures.join("\n\n"));
+    assert!(checked > 0, "no expectation was checked (WRELA_RUN_ONLY={only:?} names no case?)");
 }

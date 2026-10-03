@@ -12,6 +12,10 @@ pub mod mir;
 pub mod program;
 pub mod resolve;
 pub mod thir;
+
+/// Directories at a package's top level that hold outputs, never modules: builds, results a
+/// page saves, and the tools' own.
+pub const OUTPUT_DIRS: &[&str] = &["build", "results", "node_modules", "target"];
 pub mod traits;
 pub mod ty;
 
@@ -45,6 +49,7 @@ pub fn check_program(units: Vec<SourceUnit>, diags: &mut Vec<Diagnostic>) -> Che
     // From here on the definitions are read-only.
     let p = &program;
     diags.extend(gpu::check_entries(p));
+    diags.extend(check::check_declared_types(p));
     let (const_tys, consts) = check::check_consts(p, diags);
     let mut mir = BTreeMap::new();
     let mut hidden = Vec::new();

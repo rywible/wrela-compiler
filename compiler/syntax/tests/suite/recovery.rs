@@ -113,3 +113,23 @@ fn no_token_is_dropped() {
         assert_tokens_covered(&path.display().to_string(), &text);
     }
 }
+
+#[test]
+fn many_stray_closers_and_split_tokens_parse_quickly() {
+    // Each `]` closes nothing (L19) and is read as `)`, which changes what's open after it and
+    // so where the lines end; each `>>` is split in two (L16). Both once took time that grew
+    // with the square of the file's length.
+    let n = 20_000;
+    let mut src = String::from("fn f() {\n");
+    for i in 0..n {
+        src.push_str(&format!("    let a{i} = g(1]\n    let b{i}: Option<Option<f32>> = None\n"));
+    }
+    src.push_str("}\n\nfn last() {}\n");
+    let started = std::time::Instant::now();
+    let p = parse(FileId(0), &src);
+    assert!(started.elapsed().as_secs() < 10, "took {:?}", started.elapsed());
+    assert!(p.diagnostics.iter().all(|d| d.code.to_string() == "E0102"), "{:#?}", p.diagnostics);
+    let body = fn_named(&p.file, "f").body.as_ref().expect("a body");
+    assert_eq!(body.stmts.len(), 2 * n);
+    fn_named(&p.file, "last");
+}

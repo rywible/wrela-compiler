@@ -18,3 +18,11 @@ trait Shape {
 fn e() {
     let s = "a\q" //~ E0901 E0005
 }
+
+fn m() -> u32 {
+    var x = Some(1)
+    match mut x { //~ E0908
+        Some(n) => n,
+        None => 0,
+    }
+}

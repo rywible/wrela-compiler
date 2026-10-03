@@ -22,6 +22,15 @@ pub(crate) struct CallParam<'p> {
     pub module: ModuleId,
 }
 
+/// What looking up an inherent method found.
+enum Inherent {
+    Missing,
+    /// The method, and its impl's arguments for the type.
+    Method(FnId, Vec<TyId>),
+    /// More than one impl has it, and the type doesn't say which (E0306, reported).
+    Ambiguous,
+}
+
 /// What a method call resolved to.
 enum Pick {
     /// An inherent method, with its impl's arguments solved against the receiver.
@@ -66,6 +75,37 @@ impl<'p> Checker<'p> {
         let Some(res) = self.resolve_value_path(path) else {
             return self.failed_call(args, span);
         };
+        // Generic arguments where nothing takes them: on a module (`shapes::<i32>::blob`), a
+        // built-in function or a built-in type.
+        let n = path.segments.len();
+        let modules = match res {
+            ValueRes::Item(Res::Variant(..)) => n.saturating_sub(2),
+            ValueRes::Item(_) => n - 1,
+            _ => 0,
+        };
+        let takes_none = |i: usize| {
+            i < modules
+                || (i == n - 1
+                    && matches!(res, ValueRes::Item(Res::BuiltinFn(_) | Res::BuiltinTy(_))))
+        };
+        if let Some(seg) = path
+            .segments
+            .iter()
+            .enumerate()
+            .find(|&(i, s)| s.generics.is_some() && takes_none(i))
+            .map(|(_, s)| s)
+        {
+            let what = if takes_none(n - 1) && seg.ident.span == path.segments[n - 1].ident.span {
+                format!("the built-in `{}`", seg.ident.name)
+            } else {
+                format!("the module `{}`", seg.ident.name)
+            };
+            self.err(Diagnostic::new(
+                codes::E0322,
+                seg.ident.span,
+                format!("{what} takes no generic arguments"),
+            ));
+        }
         match res {
             ValueRes::Local(l) => self.call_local(l, args, expected, span),
             ValueRes::Item(Res::Fn(f)) => {
@@ -106,12 +146,28 @@ impl<'p> Checker<'p> {
             }
             ValueRes::TraitRelative(t, name) => {
                 let ntraits = self.p.trait_(t).generics.len();
-                let trait_args: Vec<TyId> =
-                    (0..ntraits).map(|_| self.new_var(VarKind::General, span)).collect();
+                // `Trait::<A>::method(x)` names the trait's arguments; without them they're
+                // inferred.
+                let written = path
+                    .segments
+                    .len()
+                    .checked_sub(2)
+                    .and_then(|i| path.segments[i].generics.as_deref());
+                let trait_args: Vec<TyId> = match written {
+                    Some(g) if g.len() == ntraits => {
+                        g.iter().map(|t| self.resolve_type(t)).collect()
+                    }
+                    Some(g) => {
+                        let tname = &self.p.trait_(t).name;
+                        self.err(resolve::wrong_generic_count(span, tname, ntraits, g.len()));
+                        (0..ntraits).map(|_| self.p.types.error).collect()
+                    }
+                    None => (0..ntraits).map(|_| self.new_var(VarKind::General, span)).collect(),
+                };
                 let own = TraitRef { trait_: t, args: trait_args };
                 // The method is the trait's own or a supertrait's (`Sub::base(x)`).
                 let error = self.p.types.error;
-                if traits::trait_method_via(self.p, error, own.clone(), &name.name).is_none() {
+                if traits::trait_method_via(self.p, error, own.clone(), &name.name).is_empty() {
                     self.err(Diagnostic::new(
                         codes::E0207,
                         name.span,
@@ -131,7 +187,32 @@ impl<'p> Checker<'p> {
                 let recv = self.check_expr(&first.value, None);
                 let rt = self.shallow(recv.ty);
                 self.trait_obligation(rt, &own, recv.span, &name.name);
-                let Some((m, via)) = traits::trait_method_via(self.p, rt, own, &name.name) else {
+                let found = traits::trait_method_via(self.p, rt, own, &name.name);
+                if found.len() > 1 {
+                    let names: Vec<String> = found
+                        .iter()
+                        .map(|(_, r)| format!("`{}`", self.p.trait_(r.trait_).name))
+                        .collect();
+                    self.err(
+                        Diagnostic::new(
+                            codes::E0406,
+                            name.span,
+                            format!(
+                                "`{}` is a method of more than one of `{}`'s supertraits: {}",
+                                name.name,
+                                self.p.trait_(t).name,
+                                names.join(", ")
+                            ),
+                        )
+                        .with_help(format!(
+                            "call it through the trait that declares it: `{}::{}(x, ...)`",
+                            self.p.trait_(found[0].1.trait_).name,
+                            name.name
+                        )),
+                    );
+                    return self.failed_call(&args[1..], span);
+                }
+                let Some((m, via)) = found.into_iter().next() else {
                     unreachable!("the method was found above")
                 };
                 let generics = path.segments.last().and_then(|s| s.generics.as_deref());
@@ -296,6 +377,18 @@ impl<'p> Checker<'p> {
     /// normalizes to: an impl's associated type, or the projection itself on a generic
     /// parameter. `last`: the body is done, so a literal it waits for takes its default type.
     pub(crate) fn settle_projections(&mut self, last: bool) {
+        // Settling one can settle another's types (`conv2(q)` where `q` is known only once an
+        // earlier call's projection is): passes until one settles nothing.
+        loop {
+            let before = self.projections.len();
+            self.settle_projections_once(last);
+            if self.projections.len() == before {
+                break;
+            }
+        }
+    }
+
+    fn settle_projections_once(&mut self, last: bool) {
         let mut i = 0;
         while i < self.projections.len() {
             let (var, proj, span) = self.projections[i];
@@ -343,7 +436,7 @@ impl<'p> Checker<'p> {
     /// Bounds on the generic parameters `params` become obligations on their arguments `args`:
     /// each bound with `subst` applied, reported at the parameter's span in `spans`, as needed
     /// by `` `P` in `name` ``.
-    fn bound_obligations(
+    pub(crate) fn bound_obligations(
         &mut self,
         params: &[ParamId],
         args: &[TyId],
@@ -377,16 +470,23 @@ impl<'p> Checker<'p> {
         let subst = Subst::from_pairs(&all, &gen_args);
         let (params, ret) = self.sig_under(f, &subst);
         let (params, ret) = self.defer_projections(f, params, ret, span);
-        if let Some(e) = expected
-            && !matches!(self.kind(ret), TyKind::Opaque(..))
-        {
-            // Let the expected type guide inference of the generics (`let x: T = f()`), but
-            // only if it fits: a mismatch is reported where the value is used.
+        // Let the expected type guide inference of the generics (`let x: T = f()`), but only
+        // if it fits: a mismatch is reported where the value is used. One not known yet (a
+        // literal's, in `0.5 * gradient(f, p)`) only after the arguments, which know better:
+        // a scalar times a vector is a vector.
+        let hint = expected.filter(|_| !matches!(self.kind(ret), TyKind::Opaque(..)));
+        let early = hint.filter(|&e| self.infer.var_kind(&self.p.types, e).is_none());
+        if let Some(e) = early {
             self.try_unify(ret, e);
         }
         let name = self.p.fn_display_name(f);
         let has_receiver = receiver.is_some();
         let (call_args, modes, order) = self.match_args(&name, &params, receiver, args, span, f);
+        if let Some(e) = hint
+            && early.is_none()
+        {
+            self.try_unify(ret, e);
+        }
         // A bound on a generic that's a parameter's whole type is reported at that argument.
         let def = self.p.func(f);
         let spans: Vec<Span> = all
@@ -751,7 +851,10 @@ impl<'p> Checker<'p> {
         // Literals take the type of the first concrete argument of the same role (all but
         // `select`'s condition): a vector's own type, unless the built-in broadcasts a scalar
         // across it; else that argument's scalar type.
-        let concrete = xs.iter().map(|x| x.ty).find(|&t| !matches!(self.kind(t), TyKind::Var(_)));
+        let concrete = xs
+            .iter()
+            .map(|x| self.infer.resolve(&self.p.types, x.ty))
+            .find(|&t| !matches!(self.kind(t), TyKind::Var(_)));
         if let Some(c) = concrete {
             let broadcasts = matches!(
                 b,
@@ -798,6 +901,16 @@ impl<'p> Checker<'p> {
                 }
             }
         }
+        // A bit pattern written as a literal is a `u32`: `bitcast_f32(0xBF800000)` doesn't fit
+        // an `i32`. (A negated one stays open, and settles on `i32`.)
+        if b == BuiltinFn::BitcastF32
+            && let Some(x) = xs.first()
+            && matches!(x.kind, ExprKind::Lit(_))
+            && self.infer.var_kind(&self.p.types, x.ty) == Some(VarKind::Int)
+        {
+            let u = self.p.types.u32;
+            let _ = self.infer.unify(&self.p.types, x.ty, u);
+        }
         // A scalar literal next to a vector broadcasts for min/max/clamp/step/smoothstep.
         let mut tys: Vec<TyId> =
             xs.iter().map(|x| self.infer.resolve(&self.p.types, x.ty)).collect();
@@ -820,6 +933,19 @@ impl<'p> Checker<'p> {
             }
         }
         if tys.iter().any(|&t| matches!(self.p.types.kind(t), TyKind::Error)) {
+            return self.error_expr(span);
+        }
+        // Lowering knows which closure or function a local holds, and `select` would choose at
+        // run time, as `if` and `match` can't either (E0702 in lowering).
+        if b == BuiltinFn::Select && crate::mir::is_callable(&self.p.types, tys[0]) {
+            self.err(
+                Diagnostic::new(
+                    codes::E0702,
+                    span,
+                    "choosing between closures or functions at run time isn't supported yet",
+                )
+                .with_help("call each one in its own branch"),
+            );
             return self.error_expr(span);
         }
         // Open literals are checked as their default types now, and as the types they settle
@@ -871,6 +997,14 @@ impl<'p> Checker<'p> {
                 }
                 let mut cols = Vec::new();
                 for a in args {
+                    // Columns are positional: a name would read as a choice of column.
+                    if let Some(name) = &a.name {
+                        self.err(Diagnostic::new(
+                            codes::E0302,
+                            name.span,
+                            format!("`mat{n}` takes its columns as positional arguments"),
+                        ));
+                    }
                     cols.push(self.check_expect(&a.value, col));
                 }
                 Expr { ty, span, kind: ExprKind::Construct(cols) }
@@ -892,7 +1026,11 @@ impl<'p> Checker<'p> {
                     let target = if k == VarKind::Float && !self.p.types.is_float(ty) {
                         Some(self.p.types.f32)
                     } else if negative && unsigned {
-                        None
+                        // An `i32` (it defaults to one), or an `i64` if it doesn't fit one:
+                        // `u64(-3000000000)`.
+                        let wide = negative_literal(&args[0].value)
+                            .is_some_and(|v| v < i128::from(i32::MIN));
+                        wide.then(|| self.p.types.int(IntTy::I64))
                     } else {
                         Some(ty)
                     };
@@ -964,7 +1102,7 @@ impl<'p> Checker<'p> {
         }
         if args.is_empty() {
             let xs = (0..n)
-                .map(|_| Expr { ty: f32, span, kind: ExprKind::Lit(Lit::Float(0.0)) })
+                .map(|_| Expr { ty: f32, span, kind: ExprKind::Lit(Lit::Float(0.0, 0.0)) })
                 .collect();
             return Expr { ty, span, kind: ExprKind::Construct(xs) };
         }
@@ -982,14 +1120,14 @@ impl<'p> Checker<'p> {
                 TyKind::Error => count += 1,
                 _ => {
                     let shown = self.display(e.ty);
-                    self.err(
-                        Diagnostic::new(
-                            codes::E0323,
-                            e.span,
-                            format!("a vector's components are `f32`s or vectors, not `{shown}`"),
-                        )
-                        .with_help("convert it: `f32(x)`"),
+                    let d = Diagnostic::new(
+                        codes::E0323,
+                        e.span,
+                        format!("a vector's components are `f32`s or vectors, not `{shown}`"),
                     );
+                    // A number converts; anything else has no `f32` to give.
+                    let number = matches!(self.kind(e.ty), TyKind::Int(_) | TyKind::Float(_));
+                    self.err(if number { d.with_help("convert it: `f32(x)`") } else { d });
                     count += 1;
                 }
             }
@@ -1017,7 +1155,7 @@ impl<'p> Checker<'p> {
         span: Span,
     ) -> Expr {
         let f32 = self.p.types.f32;
-        let zero = Expr { ty: f32, span, kind: ExprKind::Lit(Lit::Float(0.0)) };
+        let zero = Expr { ty: f32, span, kind: ExprKind::Lit(Lit::Float(0.0, 0.0)) };
         let pure = |e: &Option<Expr>| e.as_ref().is_none_or(|e| zonk::non_literal(e).is_none());
         if written.is_sorted() || comps.iter().filter(|c| !pure(c)).count() < 2 {
             let xs = comps.into_iter().map(|c| c.unwrap_or_else(|| zero.clone())).collect();
@@ -1058,10 +1196,14 @@ impl<'p> Checker<'p> {
             };
             return self.call_variant(a, v as u32, &path, args, expected.or(Some(ty)), span);
         }
-        if let Some((f, impl_args)) = self.find_inherent(ty, &name.name, name.span) {
-            let mut gargs = impl_args;
-            gargs.extend(self.method_generic_args(f, generics, span));
-            return self.call_fn(f, gargs, None, args, expected, span);
+        match self.find_inherent(ty, &name.name, name.span) {
+            Inherent::Method(f, impl_args) => {
+                let mut gargs = impl_args;
+                gargs.extend(self.method_generic_args(f, generics, span));
+                return self.call_fn(f, gargs, None, args, expected, span);
+            }
+            Inherent::Ambiguous => return self.failed_call(args, span),
+            Inherent::Missing => {}
         }
         // A trait's function, through a type that has the trait.
         let traits = self.traits_with_method(ty, &name.name, name.span);
@@ -1094,10 +1236,14 @@ impl<'p> Checker<'p> {
         self.failed_call(args, span)
     }
 
-    /// An inherent method of `ty` named `name`, and the impl's arguments for `ty`.
-    fn find_inherent(&mut self, ty: TyId, name: &str, span: Span) -> Option<(FnId, Vec<TyId>)> {
+    /// An inherent method of `ty` named `name`, and the impl's arguments for `ty`. When more
+    /// than one impl of `ty`'s type has it (`impl S<f32>` and `impl S<u32>`) and `ty`'s
+    /// arguments don't say which, choosing one would depend on the order the impls are written
+    /// in: that's E0306.
+    fn find_inherent(&mut self, ty: TyId, name: &str, span: Span) -> Inherent {
         let p = self.p;
-        let TyKind::Adt(a, _) = self.kind(ty) else { return None };
+        let TyKind::Adt(a, _) = self.kind(ty) else { return Inherent::Missing };
+        let mut fitting = Vec::new();
         for &i in p.inherent_impls.get(a).into_iter().flatten() {
             let imp = p.impl_(i);
             let Some(f) = imp.methods.iter().copied().find(|&f| p.func(f).name == name) else {
@@ -1107,24 +1253,39 @@ impl<'p> Checker<'p> {
                 imp.generics.iter().map(|_| self.new_var(VarKind::General, span)).collect();
             let subst = Subst::from_pairs(&imp.generics, &vars);
             let self_ty = p.types.subst(imp.self_ty, &subst);
-            if self.try_unify(self_ty, ty) {
-                let def = p.func(f);
-                if !def.public && def.module != self.scope.module {
-                    let m = p.module(def.module).name();
-                    self.err(
-                        Diagnostic::new(
-                            codes::E0203,
-                            span,
-                            format!("`{name}` is private to `{m}`"),
-                        )
-                        .with_secondary(def.name_span, "declared here without `pub`")
-                        .with_help(format!("mark it `pub` in `{m}` to use it here")),
-                    );
-                }
-                return Some((f, vars));
+            if self.fits(self_ty, ty) {
+                fitting.push((f, vars, self_ty));
             }
         }
-        None
+        if fitting.len() > 1 {
+            let shown = self.display(ty);
+            self.err(
+                Diagnostic::new(
+                    codes::E0306,
+                    span,
+                    format!(
+                        "more than one impl of `{shown}` has `{name}`, so its type must be known here"
+                    ),
+                )
+                .with_help(format!(
+                    "give its arguments, as in `{}::<...>`, or annotate the value's type",
+                    p.adt(*a).name
+                )),
+            );
+            return Inherent::Ambiguous;
+        }
+        let Some((f, vars, self_ty)) = fitting.pop() else { return Inherent::Missing };
+        let _ = self.try_unify(self_ty, ty);
+        let def = p.func(f);
+        if !def.public && def.module != self.scope.module {
+            let m = p.module(def.module).name();
+            self.err(
+                Diagnostic::new(codes::E0203, span, format!("`{name}` is private to `{m}`"))
+                    .with_secondary(def.name_span, "declared here without `pub`")
+                    .with_help(format!("mark it `pub` in `{m}` to use it here")),
+            );
+        }
+        Inherent::Method(f, vars)
     }
 
     /// Whether code being checked can see trait `t`: it's `pub`, or this module's own.
@@ -1153,23 +1314,9 @@ impl<'p> Checker<'p> {
         let mut out: Vec<(TraitId, Vec<TyId>, bool)> = Vec::new();
         let declared = match self.p.types.kind(ty) {
             TyKind::Param(id) => Some(resolve::param_bounds_closure(self.p, *id)),
-            TyKind::Opaque(..) | TyKind::Projection { .. } => {
-                // Reuse the solver's view of declared bounds by probing each trait.
-                let mut v = Vec::new();
-                for t in 0..self.p.traits.len() {
-                    let tid = TraitId(t as u32);
-                    if self.p.trait_(tid).generics.is_empty()
-                        && traits::implements(
-                            self.p,
-                            ty,
-                            &TraitRef { trait_: tid, args: Vec::new() },
-                        )
-                    {
-                        v.push(TraitRef { trait_: tid, args: Vec::new() });
-                    }
-                }
-                Some(v)
-            }
+            // The traits it's declared with, and their supertraits, with their arguments
+            // (`Scale<f32>`).
+            TyKind::Opaque(..) | TyKind::Projection { .. } => traits::declared_bounds(self.p, ty),
             _ => None,
         };
         match declared {
@@ -1288,8 +1435,17 @@ impl<'p> Checker<'p> {
             let _ = self.infer.unify(&self.p.types, rt, default);
         }
         let rt = self.shallow(recv.ty);
-        let pick = if let Some((f, impl_args)) = self.find_inherent(rt, &name.name, name.span) {
+        // `T::Out` with `T` known is the type the impl gives it.
+        let rt = if matches!(self.p.types.kind(rt), TyKind::Projection { .. }) {
+            self.normalized(rt)
+        } else {
+            rt
+        };
+        let inherent = self.find_inherent(rt, &name.name, name.span);
+        let pick = if let Inherent::Method(f, impl_args) = inherent {
             Some(Pick::Inherent(f, impl_args))
+        } else if let Inherent::Ambiguous = inherent {
+            return self.failed_call(args, span);
         } else {
             let mut traits = self.traits_with_method(rt, &name.name, name.span);
             match traits.len() {
@@ -1734,10 +1890,34 @@ impl<'p> Checker<'p> {
         let (fparams, _, _) = self.fn_params(fs.0, &fs.1);
         self.fn_obligations(vs.0, &vs.1, span);
         self.fn_obligations(fs.0, &fs.1, span);
+        // The fragment shader's parameter of the vertex output's struct is the vertex output,
+        // whatever its generic arguments are inferred to be (`draw(half, shade, ...)`).
+        if let &TyKind::Adt(out, _) = self.kind(vret)
+            && let Some(p) =
+                fparams.iter().find(|p| matches!(self.kind(p.ty), &TyKind::Adt(a, _) if a == out))
+        {
+            let _ = self.try_unify(p.ty, vret);
+        }
         // The uniforms: both shaders' parameters that aren't builtins or the vertex output.
         let mut wanted: Vec<(&str, TyId)> = Vec::new();
+        let out = self.infer.resolve(&self.p.types, vret);
         for p in vparams.iter().chain(&fparams) {
-            if self.is_gpu_builtin(p.ty) || self.shallow(p.ty) == self.shallow(vret) {
+            if self.is_gpu_builtin(p.ty) || self.infer.resolve(&self.p.types, p.ty) == out {
+                continue;
+            }
+            if matches!(p.name, "vertices" | "instances") {
+                // `draw`'s own counts have these names: nothing could pass this parameter.
+                self.err(
+                    Diagnostic::new(
+                        codes::E0603,
+                        span,
+                        format!(
+                            "a shader takes `{}`, which is `draw`'s count of {}",
+                            p.name, p.name
+                        ),
+                    )
+                    .with_help("rename the shader's parameter"),
+                );
                 continue;
             }
             match wanted.iter().find(|(n, _)| *n == p.name) {
@@ -1853,6 +2033,24 @@ fn plain_call(callee: Callee, args: Vec<Expr>, receiver: bool, ty: TyId, span: S
 }
 
 /// For a number literal, possibly negated or parenthesized: whether it's negative.
+/// The value of a negated integer literal (`-3000000000`), if `e` is one.
+fn negative_literal(e: &ast::Expr) -> Option<i128> {
+    fn int(e: &ast::Expr) -> Option<i128> {
+        match &e.kind {
+            ast::ExprKind::Lit(ast::Lit {
+                kind: ast::LitKind::Int(ast::IntValue::Ok(v)), ..
+            }) => Some(i128::from(*v)),
+            ast::ExprKind::Paren(x) => int(x),
+            _ => None,
+        }
+    }
+    match &e.kind {
+        ast::ExprKind::Unary(ast::UnOp::Neg, x) => int(x).map(|v| -v),
+        ast::ExprKind::Paren(x) => negative_literal(x),
+        _ => None,
+    }
+}
+
 fn literal_sign(e: &ast::Expr) -> Option<bool> {
     match &e.kind {
         ast::ExprKind::Lit(ast::Lit {

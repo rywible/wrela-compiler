@@ -28,9 +28,6 @@ pub struct LayoutError {
     pub symlink: bool,
 }
 
-/// Directories that never hold modules: build output and run results.
-const SKIPPED_DIRS: &[&str] = &["build", "results", "node_modules", "target"];
-
 pub fn find_files(root: &Path) -> Result<Vec<PackageFile>, Vec<LayoutError>> {
     let mut files = Vec::new();
     let mut errors = Vec::new();
@@ -68,7 +65,7 @@ fn walk(
             continue;
         }
         // Skipped whatever they are: a link to an output directory elsewhere is no module.
-        if prefix.is_empty() && SKIPPED_DIRS.contains(&name.as_str()) {
+        if prefix.is_empty() && wrela_sema::OUTPUT_DIRS.contains(&name.as_str()) {
             continue;
         }
         let Ok(meta) = fs::symlink_metadata(&path) else { continue };
@@ -107,6 +104,21 @@ fn walk(
             continue;
         }
         let Some(stem) = name.strip_suffix(".wrela") else { continue };
+        // A pipe or a device would block or never end when read.
+        let regular = if meta.file_type().is_symlink() {
+            fs::metadata(&path).is_ok_and(|m| m.is_file())
+        } else {
+            meta.is_file()
+        };
+        if !regular {
+            errors.push(LayoutError {
+                path: display(&path),
+                message: format!("`{name}` isn't a regular file, so it can't be a module"),
+                help: None,
+                symlink: false,
+            });
+            continue;
+        }
         if !is_name(stem) {
             errors.push(LayoutError {
                 path: display(&path),
@@ -213,7 +225,7 @@ mod tests {
         let d = tmp("outlink");
         let target = tmp("outlink-target");
         fs::write(d.join("main.wrela"), "").expect("write");
-        for name in SKIPPED_DIRS {
+        for name in wrela_sema::OUTPUT_DIRS {
             std::os::unix::fs::symlink(&target, d.join(name)).expect("symlink");
         }
         assert_eq!(find_files(&d).expect("ok").len(), 1);

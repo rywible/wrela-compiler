@@ -1,6 +1,7 @@
 // run: a method's generic arguments given with `::<...>`
 // expect: made() = 1.0
 // expect: zero() = 7
+// expect: trait_args() = 1006.0
 
 struct S: Copy + Clone {
     k: i32,
@@ -25,4 +26,26 @@ pub fn made() -> f32 {
 pub fn zero() -> i32 {
     let s = S { k: 0 }
     s.zero::<f32>(7)
+}
+
+trait Scale<T> {
+    fn scale(self, by: T) -> f32
+}
+
+impl Scale<i32> for S {
+    fn scale(self, by: i32) -> f32 {
+        f32(by)
+    }
+}
+
+impl Scale<u32> for S {
+    fn scale(self, by: u32) -> f32 {
+        f32(by) + 1000.0
+    }
+}
+
+/// The trait's arguments, given with `::<...>`, choose the impl: `u32`'s, not the first.
+pub fn trait_args() -> f32 {
+    let s = S { k: 0 }
+    Scale::<u32>::scale(s, 6)
 }

@@ -82,3 +82,21 @@ fn wrong_enum(k: K) -> i32 {
         K::C => 3,
     }
 }
+
+// A variant that holds values, named alone, is an error: bound, it would be a name that
+// matches everything (here `Some` would take `None` too).
+fn bare_payload(o: Option<i32>) -> i32 {
+    match o {
+        Some => 1, //~ E0320
+        None => 0,
+    }
+}
+
+// A name bound twice in one pattern would hide its first binding: `(a, a)` isn't a test that
+// both are equal.
+fn bound_twice(a: i32, b: i32) -> i32 {
+    let (x, x) = (a, b) //~ E0201
+    match (a, b) {
+        (p, p) => p + x, //~ E0201
+    }
+}

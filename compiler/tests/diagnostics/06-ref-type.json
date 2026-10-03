@@ -7,10 +7,10 @@
         {
           "edits": [
             {
-              "end": 124,
+              "end": 125,
               "file": "main.wrela",
               "replacement": "",
-              "start": 123
+              "start": 124
             }
           ],
           "message": "remove the `&`"
@@ -29,11 +29,11 @@
       "severity": "error",
       "span": {
         "column": 13,
-        "end": 124,
+        "end": 125,
         "end_column": 14,
         "end_line": 9,
         "line": 9,
-        "start": 123
+        "start": 124
       },
       "title": "`&` isn't a type or an operator on places"
     }

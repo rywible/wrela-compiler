@@ -60,6 +60,10 @@ pub(crate) mod globals {
     pub const NEXT_HANDLE: u32 = 2;
     /// The first handle not yet released.
     pub const LIVE_FROM: u32 = 3;
+    /// The first handle not yet submitted: a batch a trap left unsubmitted made the rest.
+    pub const SUBMITTED_TO: u32 = 4;
+    /// `LIVE_FROM` as submitted: the handles below it were destroyed.
+    pub const RELEASED_TO: u32 = 5;
 }
 
 pub(crate) fn valtype(s: ir::Scalar) -> ValType {
@@ -171,7 +175,8 @@ pub fn emit(m: &ir::Module) -> Result<Emitted, String> {
     exports.export(wrela_abi::EXPORT_MEMORY, ExportKind::Memory, 0);
     let wrappers = first_fn + m.functions.len() as u32..;
     for (next, (name, f)) in wrappers.zip(&m.exports) {
-        let (params, results, body) = func::export_wrapper(m, *f, first_fn + f.0, &helpers)?;
+        let (params, results, body) =
+            func::export_wrapper(m, *f, first_fn + f.0, &helpers, data_base)?;
         let ty = types.get(params, results);
         functions.function(ty);
         code.function(&body);
@@ -188,9 +193,10 @@ pub fn emit(m: &ir::Module) -> Result<Emitted, String> {
     let mut globals = GlobalSection::new();
     let g = |mutable| GlobalType { val_type: ValType::I32, mutable, shared: false };
     globals.global(g(true), &ConstExpr::i32_const(data_base as i32));
-    globals.global(g(true), &ConstExpr::i32_const(0));
-    globals.global(g(true), &ConstExpr::i32_const(0));
-    globals.global(g(true), &ConstExpr::i32_const(0));
+    // CMD_LEN, NEXT_HANDLE, LIVE_FROM, SUBMITTED_TO and RELEASED_TO start at 0.
+    for _ in globals::CMD_LEN..=globals::RELEASED_TO {
+        globals.global(g(true), &ConstExpr::i32_const(0));
+    }
     let mut module = Module::new();
     module.section(&types.section);
     module.section(&imports);

@@ -58,6 +58,20 @@ fn multiline_arguments_are_kept() {
 }
 
 #[test]
+fn blocks_nested_on_one_line_format_quickly() {
+    // Each block tries one line first; the `match` inside can't be, and trying again at each
+    // level would double the work 40 times.
+    let n = 40;
+    let src = format!(
+        "fn f(x: i32) -> i32 {{\n    {}match x {{ _ => 1 }}{}\n}}\n",
+        "if x > 0 { ".repeat(n),
+        " } else { 0 }".repeat(n)
+    );
+    let out = round_trip(&src);
+    assert!(out.contains("match x {\n"), "{out}");
+}
+
+#[test]
 #[ignore]
 fn show_sample() {
     println!("{}", round_trip(SAMPLE));
@@ -228,4 +242,14 @@ fn random_comments_survive(path: &std::path::Path, mut rng: XorShift) {
             assert_eq!(out.matches(&c).count(), 1, "{name}: {c} lost or doubled:\n{out}");
         }
     }
+}
+
+#[test]
+fn one_line_blocks_in_arguments_break_to_fit() {
+    // The call measures the block up to its `{`, since it may break there; the block then
+    // decides for itself, and breaks rather than run past the width.
+    let src = "fn g() -> f32 {\n    let value = apply(|x: f32| { x * 2.0 + some_long_argument_name_one + some_long_argument_name_two }, 4.0)\n    value\n}\n";
+    let out = round_trip(src);
+    assert!(out.lines().all(|l| l.chars().count() <= 100), "{out}");
+    assert!(out.contains("apply(|x: f32| {\n"), "{out}");
 }

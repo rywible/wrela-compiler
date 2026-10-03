@@ -435,6 +435,19 @@ enum NumberError {
 
 /// L13: classifies a number token's text.
 fn classify_number(text: &str) -> Result<TokenKind, NumberError> {
+    let (end, kind) = number_body(text)?;
+    classify_suffix(&text[end..], end, kind)
+}
+
+/// Where a suffixed number's digits end and its suffix starts: `1e-3m` is `1e-3` and `m`.
+pub fn split_suffix(text: &str) -> (&str, &str) {
+    let end = number_body(text).map_or(text.len(), |(end, _)| end);
+    text.split_at(end)
+}
+
+/// L13: where a number token's digits end (its suffix, if any, starts there), and whether
+/// they're an INT or a FLOAT.
+fn number_body(text: &str) -> Result<(usize, TokenKind), NumberError> {
     let b = text.as_bytes();
     let has_digit = |s: &str, radix: u32| s.chars().any(|c| c.is_digit(radix));
     if b.len() >= 2 && b[0] == b'0' && matches!(b[1], b'X' | b'B' | b'O') {
@@ -455,7 +468,7 @@ fn classify_number(text: &str) -> Result<TokenKind, NumberError> {
         if suffix.starts_with(|c: char| c.is_ascii_digit()) {
             return Err(NumberError::Malformed("a digit out of range for the radix"));
         }
-        return classify_suffix(suffix, 2 + end, TokenKind::Int);
+        return Ok((2 + end, TokenKind::Int));
     }
     // Decimal: digits, then an optional fraction and exponent.
     let mut i = digits_end(b, 0);
@@ -482,7 +495,7 @@ fn classify_number(text: &str) -> Result<TokenKind, NumberError> {
             return Err(NumberError::Malformed("an exponent needs at least one digit"));
         }
     }
-    classify_suffix(&text[i..], i, kind)
+    Ok((i, kind))
 }
 
 /// Where the run of decimal digits and `_` that starts at `from` ends.
@@ -514,9 +527,22 @@ pub fn line_break_is_newline(in_brace: bool, prev: TokenKind, next: TokenKind) -
 }
 
 /// The open brackets, as L19 tracks them.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Brackets {
     open: Vec<TokenKind>,
+    /// How many of each kind are open (`(`, `[`, `{`): a closer that closes nothing is seen
+    /// at once, however many brackets are open.
+    count: [u32; 3],
+}
+
+/// Where [`Brackets::count`] counts an opener of kind `k`.
+fn opener_index(k: TokenKind) -> Option<usize> {
+    match k {
+        TokenKind::LParen => Some(0),
+        TokenKind::LBracket => Some(1),
+        TokenKind::LBrace => Some(2),
+        _ => None,
+    }
 }
 
 impl Brackets {
@@ -524,12 +550,18 @@ impl Brackets {
     /// the innermost open bracket of its kind and every bracket opened after it, or nothing if
     /// none of its kind is open.
     pub fn track(&mut self, k: TokenKind) {
-        if matches!(k, TokenKind::LParen | TokenKind::LBracket | TokenKind::LBrace) {
+        if let Some(c) = opener_index(k) {
             self.open.push(k);
+            self.count[c] += 1;
         } else if let Some(open) = k.opener()
+            && opener_index(open).is_some_and(|c| self.count[c] > 0)
             && let Some(i) = self.open.iter().rposition(|o| *o == open)
         {
-            self.open.truncate(i);
+            for o in self.open.drain(i..) {
+                if let Some(c) = opener_index(o) {
+                    self.count[c] -= 1;
+                }
+            }
         }
     }
 
@@ -614,6 +646,13 @@ fn u64_value(text: &str) -> Option<u64> {
 pub fn float_value(text: &str) -> f64 {
     let clean: String = without_type_suffix(text).chars().filter(|c| *c != '_').collect();
     clean.parse().unwrap_or(f64::NAN)
+}
+
+/// [`float_value`] as an `f32`, rounded once from the decimal: rounding the `f64` again could
+/// land on the other side of a tie.
+pub fn float_value_f32(text: &str) -> f32 {
+    let clean: String = without_type_suffix(text).chars().filter(|c| *c != '_').collect();
+    clean.parse().unwrap_or(f32::NAN)
 }
 
 #[cfg(test)]

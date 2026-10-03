@@ -223,10 +223,12 @@ fn worker() {
     std::panic::set_hook(Box::new(|_| {}));
     let mut out = std::io::stdout().lock();
     for i in from..to {
-        let text = case(&corpus, seed_of(base, i));
+        // With a `frame` if it has none, and every function lowered, so a case that checks
+        // goes on through lowering and the back ends.
+        let text = crate::with_frame(&case(&corpus, seed_of(base, i)));
         std::fs::write(dir.join("main.wrela"), &text).expect("write");
         writeln!(out, "{MARK} start {i}").and_then(|()| out.flush()).expect("stdout");
-        let r = std::panic::catch_unwind(|| wrela_driver::build(&dir));
+        let r = std::panic::catch_unwind(|| wrela_driver::build_every_fn(&dir));
         match r {
             Ok(built) => {
                 if let Some(d) = built.diagnostics.iter().find(|d| d.code.is_internal()) {

@@ -7,3 +7,27 @@ fn f() -> f32 {
     let c = m[2] //~ E0312
     v[2] + m[1].x
 }
+
+fn nudge(p: mut vec2) {
+    p.x += 1.0
+}
+
+// A swizzle that names a component twice can't be written: its two components are one place.
+fn twice() -> f32 {
+    var v = vec2(1.0, 0.0)
+    v.xx = vec2(5.0, 6.0) //~ E0317
+    v.yy += vec2(1.0, 2.0) //~ E0317
+    mut s = v.xx //~ E0317
+    nudge(mut v.xx) //~ E0317
+    let r = v.xx
+    v.yx = vec2(1.0, 2.0)
+    r.x + v.x
+}
+
+// An index whose literal type settles later must still be a `u32` or an `i32`.
+fn settled_later() -> f32 {
+    let xs = [1.0, 2.0, 3.0]
+    let i = 1
+    let v = xs[i] //~ E0312
+    v + sqrt(i)
+}

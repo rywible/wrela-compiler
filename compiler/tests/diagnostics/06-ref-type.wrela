@@ -1,6 +1,6 @@
 // mistake: a reference type `&T`
 // expect: E0106
-// fix: no
+// fix: yes
 struct Grazer {
     speed: f32,
 }

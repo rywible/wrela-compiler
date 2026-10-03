@@ -1,0 +1,21 @@
+// mistake: a consuming method on a named place, with a field of its result read, unmarked
+// expect: E0501
+// fix: yes
+struct Builder {
+    n: u32,
+}
+
+struct Built: Copy + Clone {
+    n: u32,
+}
+
+impl Builder {
+    fn finish(take self) -> Built {
+        Built { n: self.n }
+    }
+}
+
+pub fn count() -> u32 {
+    let b = Builder { n: 3 }
+    b.finish().n
+}

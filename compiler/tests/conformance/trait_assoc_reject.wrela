@@ -58,3 +58,61 @@ fn either<T: Shape + Plot>(t: T) -> T::Measure { //~ E0406
 fn which(s: Square) -> f32 {
     s.area() //~ E0406
 }
+
+trait Left {
+    fn side(self) -> f32
+}
+
+trait Right {
+    fn side(self) -> f32
+}
+
+trait Both: Left + Right {}
+
+// Through a trait whose supertraits both have the method, the call is ambiguous, as it is with
+// method syntax: which one runs mustn't depend on the order the supertraits are written in.
+fn sides<T: Both>(t: T) -> f32 {
+    Both::side(t) //~ E0406
+}
+
+trait Converts {
+    type Out
+    fn converted(self) -> Self::Out
+}
+
+impl Converts for i32 {
+    type Out = f32
+    fn converted(self) -> f32 {
+        f32(self)
+    }
+}
+
+impl Converts for f32 {
+    type Out = vec2
+    fn converted(self) -> vec2 {
+        vec2(self)
+    }
+}
+
+fn convert<T: Converts>(x: T) -> T::Out {
+    x.converted()
+}
+
+// `q`'s type is known only once the later call's projection is resolved: its own projection
+// is checked then too (a `vec2` isn't a `u32`).
+fn settled_later(n: i32) -> u32 {
+    var r: u32 = 0
+    var v = None
+    var k = 0
+    while k < n {
+        match v {
+            Some(q) => {
+                r = convert(q) //~ E0300
+            },
+            None => {},
+        }
+        v = Some(convert(1))
+        k += 1
+    }
+    r
+}

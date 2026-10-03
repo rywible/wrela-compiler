@@ -10,3 +10,14 @@ fn f() -> f32 {
 fn f() -> f32 { //~ E0201
     1.0
 }
+
+// An array length that names a private constant, or nothing.
+fn lengths() -> f32 {
+    let a: [f32; shapes::SIDES] = [0.0; 4] //~ E0203
+    let b: [f32; MISSING] = [0.0] //~ E0200
+    0.0
+}
+
+fn module_args() -> f32 {
+    shapes::<i32>::blob(1.0) //~ E0322
+}

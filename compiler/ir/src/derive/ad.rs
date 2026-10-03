@@ -310,12 +310,12 @@ impl Ad<'_> {
         self.scale(out, x, r, ty)
     }
 
-    /// `x / d` for a vector's length `d`, with `d` raised to at least 10⁻³⁰. Where a length is
-    /// zero, `x` (its vector dotted with a tangent) is zero too: inside a box,
-    /// `length(max(q, 0))` is zero and moves in no direction, and its tangent is then zero, not
-    /// 0/0. One `max` per statement, shared by its directions. (`sqrt` keeps a plain division:
-    /// guarding it measurably slowed the grazer's gradient kernel, and its 0/0 happens only at
-    /// isolated points, such as a round cone's axis.)
+    /// `x / d` for a vector's length `d` or twice a square root, with `d` raised to at least
+    /// 10⁻³⁰. Where it's zero, `x` is often zero too: inside a box, `length(max(q, 0))` is zero
+    /// and moves in no direction, and `sqrt(max(1 - t², 0))` is zero for every |t| > 1. Their
+    /// tangents are then zero, not 0/0; and where `x` isn't zero, the tangent is large but
+    /// finite, so a mask of 0 that doesn't take it (`clamp`, a vector's `max`) gives 0, not
+    /// ∞ × 0. One `max` per statement, shared by its directions.
     fn div_from_zero(&mut self, out: &mut Block, x: ValueId, d: ValueId, ty: TypeId) -> ValueId {
         let dt = self.ty(d);
         let floor = self.fc(out, dt, 1e-30);
@@ -543,9 +543,10 @@ impl Ad<'_> {
                     }
                     BinOp::Mul => {
                         let x = self.mul(out, da, *b, ty);
-                        // A matrix product keeps its order (`scale` sees to that).
+                        // A matrix product keeps its order: `a db`, also for a vector times a
+                        // matrix (`v dM`, not `dM v`).
                         let y = db.map(|db| {
-                            if self.is_matrix(*a) {
+                            if self.is_matrix(*a) || self.is_matrix(db) {
                                 self.bin(out, BinOp::Mul, *a, db, ty)
                             } else {
                                 self.scale(out, db, *a, ty)
@@ -627,8 +628,15 @@ impl Ad<'_> {
                     None
                 }
             }
-            Expr::Host(..) | Expr::Run(_) => {
-                return Err(Error::not_derivable("can't differentiate this"));
+            Expr::Run(_) => {
+                return Err(Error::not_derivable(
+                    "can't differentiate through a run (`[T]`) of values that depend on the input yet: pass the array itself (`[f32; N]`)",
+                ));
+            }
+            Expr::Host(..) => {
+                return Err(Error::not_derivable(
+                    "can't differentiate GPU work (a buffer, a dispatch or a draw)",
+                ));
             }
         })
     }
@@ -658,7 +666,7 @@ impl Ad<'_> {
             B::Sqrt => d[0].map(|da| {
                 let two = self.fc(out, ty, 2.0);
                 let den = self.bin(out, BinOp::Mul, v, two, ty);
-                self.div(out, da, den, ty)
+                self.div_from_zero(out, da, den, ty)
             }),
             B::InverseSqrt => d[0].map(|da| {
                 let h = self.fc(out, ty, -0.5);
@@ -812,16 +820,19 @@ impl Ad<'_> {
                 self.add(out, x, y, ty)
             }
             B::Clamp => {
-                // WGSL: min(max(x, lo), hi).
+                // min(max(x, lo), hi), on both targets: the max takes x or lo, then the min takes
+                // that or hi. (With lo > hi, that's hi everywhere.)
                 let (x, lo, hi) = (args[0], args[1], args[2]);
                 let above_lo = self.builtin(out, B::Step, vec![lo, x], ty);
-                let below_hi = self.builtin(out, B::Step, vec![x, hi], ty);
+                let m = self.builtin(out, B::Max, vec![x, lo], ty);
+                let below_hi = self.builtin(out, B::Step, vec![m, hi], ty);
                 let inside = self.bin(out, BinOp::Mul, above_lo, below_hi, ty);
                 let one = self.fc(out, ty, 1.0);
                 let not_lo = self.bin(out, BinOp::Sub, one, above_lo, ty);
+                let lo_taken = self.bin(out, BinOp::Mul, not_lo, below_hi, ty);
                 let not_hi = self.bin(out, BinOp::Sub, one, below_hi, ty);
                 let t1 = self.mul(out, d[0], inside, ty);
-                let t2 = self.mul(out, d[1], not_lo, ty);
+                let t2 = self.mul(out, d[1], lo_taken, ty);
                 let t3 = self.mul(out, d[2], not_hi, ty);
                 let s = self.add(out, t1, t2, ty);
                 self.add(out, s, t3, ty)

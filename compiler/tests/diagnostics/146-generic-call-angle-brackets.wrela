@@ -1,0 +1,10 @@
+// mistake: generic arguments on a call written `f<T>(x)`, as in a type
+// expect: E0107
+// fix: yes
+fn first<T: Copy>(x: T) -> T {
+    x
+}
+
+pub fn one() -> f32 {
+    first<f32>(1.0)
+}

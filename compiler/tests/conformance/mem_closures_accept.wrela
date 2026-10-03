@@ -19,3 +19,19 @@ fn named(x: f32) -> f32 {
     let d = c
     h(x) + d(x) + apply(h, x)
 }
+
+fn twice(f: fn(u32)) {
+    f(0)
+    f(1)
+}
+
+// A closure borrows what its body uses of a capture: `v.y` here, apart from `p`'s `v.x`.
+fn parts() -> f32 {
+    var v = vec3(1.0, 2.0, 3.0)
+    mut p = v.x
+    twice(|i: u32| {
+        p += 1.0
+        v.y += 1.0
+    })
+    v.x + v.y
+}

@@ -9,7 +9,8 @@ codes seen; overall, the first-try build rate, the mean attempts to success, and
 agents met. `--misread` merges the reviewer's list of diagnostics the agents misread.
 
 An attempt that never finished (stopped before it wrote its status) counts as one that didn't
-build, and is listed as unfinished. Anything in attempts/ that isn't a numbered directory (such as
+build, and is listed as unfinished. Attempts past config.json's `max_attempts` don't count: they're
+listed as over the limit. Anything in attempts/ that isn't a numbered directory (such as
 .DS_Store) is ignored.
 """
 import json, os, sys
@@ -40,12 +41,16 @@ def main():
     misread = []
     if "--misread" in sys.argv:
         misread = read_json(sys.argv[sys.argv.index("--misread") + 1])
-    tasks = read_json(os.path.join(os.path.dirname(__file__), "tasks.json"))
+    here = os.path.dirname(__file__)
+    tasks = read_json(os.path.join(here, "tasks.json"))
+    limit = read_json(os.path.join(here, "config.json"))["max_attempts"]
     per = []
     for t in tasks:
         d = os.path.join(run, t["id"], "attempts")
         names = os.listdir(d) if os.path.isdir(d) else []
-        attempts = sorted(int(n) for n in names if n.isdigit() and os.path.isdir(os.path.join(d, n)))
+        numbered = sorted(int(n) for n in names if n.isdigit() and os.path.isdir(os.path.join(d, n)))
+        attempts = [n for n in numbered if n <= limit]
+        over = [n for n in numbered if n > limit]
         codes, success, unfinished = [], None, []
         for n in attempts:
             status, seen = attempt(os.path.join(d, str(n)))
@@ -55,7 +60,7 @@ def main():
             if status == "0" and success is None:
                 success = n
         per.append({"task": t["id"], "attempts": len(attempts), "built_at": success,
-                    "codes_per_attempt": codes, "unfinished": unfinished})
+                    "codes_per_attempt": codes, "unfinished": unfinished, "over_limit": over})
     built = [p for p in per if p["built_at"] is not None]
     first_try = sum(1 for p in per if p["built_at"] == 1)
     seen = Counter(c for p in per for cs in p["codes_per_attempt"] for c in cs)

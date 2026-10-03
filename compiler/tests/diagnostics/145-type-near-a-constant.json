@@ -1,0 +1,26 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0200",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "there's no type `Radiu` here",
+      "notes": [],
+      "severity": "error",
+      "span": {
+        "column": 12,
+        "end": 144,
+        "end_column": 17,
+        "end_line": 6,
+        "line": 6,
+        "start": 139
+      },
+      "title": "an unknown name"
+    }
+  ],
+  "version": 2
+}

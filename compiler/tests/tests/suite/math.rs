@@ -206,12 +206,24 @@ fn std_fields_hold_at_their_edge_cases() {
     }
     assert_eq!(call(&mut host, "f_blend", &[0.0, 0.0, 0.0, 0.0])[0], 0.0);
     assert_eq!(call(&mut host, "f_blend", &[3.0, 0.0, 0.0, 0.0])[0], 1.0);
+    // Two empty surfaces (infinite distances) blend to an empty one, and a huge `k` doesn't
+    // overflow: on the seam it's `a - k / 4`.
+    assert_eq!(call(&mut host, "f_smin", &[f32::INFINITY, f32::INFINITY, 0.1])[0], f32::INFINITY);
+    assert_eq!(call(&mut host, "f_smin", &[1.0, 1.0, 1e20])[0], 1.0 - 2.5e19);
 
-    // round_cone is exact everywhere: two spheres apart, one holding the other, or the same.
+    // round_cone is exact everywhere: two spheres apart, one holding the other, the same, or
+    // nearly the same (where the usual formula's terms leave f32's range).
     let mut worst = 0.0f64;
     for i in 0..2000 {
         let a = [r(-1.0, 1.0), r(-1.0, 1.0), r(-1.0, 1.0)];
-        let b = if i % 10 == 0 { a } else { [r(-1.0, 1.0), r(-1.0, 1.0), r(-1.0, 1.0)] };
+        let near = |a: [f32; 3], d: f32| [a[0] + d, a[1], a[2] - d];
+        let b = match i % 10 {
+            0 => a,
+            1 => near(a, 1e-9),
+            2 => near(a, 3e-8),
+            3 => near(a, 1e-6),
+            _ => [r(-1.0, 1.0), r(-1.0, 1.0), r(-1.0, 1.0)],
+        };
         let (r1, r2) = (r(0.0, 1.5), r(0.0, 1.5));
         let p = [r(-2.5, 2.5), r(-2.5, 2.5), r(-2.5, 2.5)];
         let args = [a[0], a[1], a[2], b[0], b[1], b[2], r1, r2, p[0], p[1], p[2]];
@@ -229,15 +241,26 @@ fn std_fields_hold_at_their_edge_cases() {
     assert!(call(&mut host, "f_ellipsoid", &[1.0, 2.0, 3.0, 1e-20, 0.0, 0.0])[0] < 0.0);
 
     // half_space is exact for a normal of any length, and keeps the same half-space.
-    let planes: [([f32; 3], f32); 3] =
-        [([0.0, 2.0, 0.0], 1.0), ([3.0, 0.0, 4.0], -5.0), ([0.0, -0.5, 0.0], 0.0)];
+    // Also one whose length's square would underflow or overflow.
+    let planes: [([f32; 3], f32); 6] = [
+        ([0.0, 2.0, 0.0], 1.0),
+        ([3.0, 0.0, 4.0], -5.0),
+        ([0.0, -0.5, 0.0], 0.0),
+        ([0.0, 1e-23, 0.0], 0.0),
+        ([3e-30, 0.0, 4e-30], 1e-30),
+        ([0.0, 1e20, 1e20], 2e20),
+    ];
     for (n, offset) in planes {
-        let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+        let n64 = n.map(f64::from);
+        let len = (n64[0] * n64[0] + n64[1] * n64[1] + n64[2] * n64[2]).sqrt();
         for p in [[0.0, 0.0, 0.0], [1.0, 2.0, 3.0], [-4.0, 0.5, 2.0]] {
             let got =
                 call(&mut host, "f_half_space", &[n[0], n[1], n[2], offset, p[0], p[1], p[2]]);
-            let want = (n[0] * p[0] + n[1] * p[1] + n[2] * p[2] - offset) / len;
-            assert!((got[0] - want).abs() < 1e-6, "half_space({n:?}, {offset}) at {p:?}: {got:?}");
+            let p64 = p.map(f64::from);
+            let want =
+                (n64[0] * p64[0] + n64[1] * p64[1] + n64[2] * p64[2] - f64::from(offset)) / len;
+            let e = (f64::from(got[0]) - want).abs();
+            assert!(e < 1e-6, "half_space({n:?}, {offset}) at {p:?}: {got:?}, want {want}");
         }
     }
 

@@ -1,10 +1,16 @@
-// run: integer `**` for every integer type, and literal exponents
+// run: integer `**` for every integer type, and literal exponents; a result of exactly the
+// type's minimum, a huge exponent (squaring: as fast as a small one), and one just past the range
 // expect: sq(-3) = 9
 // expect: sq64(-3) = 9
 // expect: cube(2) = 8
 // expect: lit_pow() = 8
 // expect: fpow(2.0) = 8.0
 // expect: pow_overflow() traps
+// expect: min_pow() = -2147483648
+// expect: min_pow64() = -9223372036854775808
+// expect: unsigned_pow() = 12157665459056928801
+// expect: big_exponent(4000000001) = 0
+// expect: just_over() traps
 
 pub fn sq(a: i32) -> i32 {
     a ** 2
@@ -30,4 +36,29 @@ pub fn fpow(x: f32) -> f32 {
 pub fn pow_overflow() -> i32 {
     let a = 2
     a ** 40
+}
+
+pub fn min_pow() -> i32 {
+    let a = -2
+    a ** 31
+}
+
+pub fn min_pow64() -> i64 {
+    let a: i64 = -2
+    a ** 63
+}
+
+pub fn unsigned_pow() -> u64 {
+    let a: u64 = 3
+    a ** 40
+}
+
+pub fn big_exponent(e: u32) -> i32 {
+    let (one, minus) = (1, -1)
+    one ** e + minus ** e
+}
+
+pub fn just_over() -> i32 {
+    let a = -2
+    a ** 32
 }

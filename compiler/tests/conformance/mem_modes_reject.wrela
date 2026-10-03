@@ -12,3 +12,41 @@ fn f() -> f32 {
     bump(a) //~ E0503
     read(mut a) //~ E0504
 }
+
+// A `mut` marker passes a place mutably: on an argument, or on what a `-> mut T` function
+// returns. Anywhere else nothing takes it mutably.
+fn stray() -> f32 {
+    var a = 1.0
+    let b = mut a //~ E0504
+    let c = 1.0 + mut a //~ E0504
+    mut d = mut a
+    d += 1.0
+    b + c
+}
+
+fn first(xs: mut [f32; 2]) -> mut f32 {
+    if xs[0] > 0.0 {
+        mut xs[0]
+    } else {
+        mut xs[1]
+    }
+}
+
+struct Holder: Copy + Clone {
+    a: f32,
+}
+
+// Nothing takes these mutably: a built-in, a variant, a struct field, a closure.
+fn stray_arguments() -> f32 {
+    var x = -1.0
+    let a = abs(mut x) //~ E0504
+    let o = Some(mut x) //~ E0504
+    let h = Holder { a: mut x } //~ E0504
+    let twice = |v: f32| v * 2.0
+    let d = twice(mut x) //~ E0504
+    a + h.a + d
+}
+
+fn read_only(h: Holder) -> borrow f32 {
+    mut h.a //~ E0504
+}

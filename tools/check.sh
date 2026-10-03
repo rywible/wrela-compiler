@@ -11,6 +11,10 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# The gate runs everything, the same way each time: a variable that narrows the tests, rewrites
+# goldens or picks a fuzz seed (left set in the shell by an earlier run) doesn't apply here.
+unset WRELA_RUN_ONLY WRELA_BLESS WRELA_FUZZ_ITERS WRELA_FUZZ_SEED WRELA_FUZZ_WORKER
+
 gpu=0
 long=0
 for arg in "$@"; do
@@ -36,7 +40,7 @@ cargo clippy -q --workspace --all-targets -- -D warnings
 
 step "build the CLI (release)"
 cargo build -q --release -p wrela
-wrela=target/release/wrela
+wrela="${CARGO_TARGET_DIR:-target}/release/wrela"
 
 step "wrela fmt --check"
 "$wrela" fmt --check "${WRELA_SOURCES[@]}"
@@ -52,7 +56,7 @@ step "browser runtime: tests, types, dist is current, size budget"
 
 step "speed: check < 200 ms and build < 2 s, cold processes; WGSL size (examples/hello-field)"
 python3 - "$wrela" <<'PY'
-import gzip, pathlib, subprocess, sys, tempfile, time
+import gzip, pathlib, shutil, subprocess, sys, tempfile, time
 wrela = sys.argv[1]
 def best(args, n=5):
     times = []
@@ -62,21 +66,24 @@ def best(args, n=5):
         times.append(time.perf_counter() - t)
     return min(times), max(times)
 out = tempfile.mkdtemp()
-for name, args, budget in [("check", ["check", "examples/hello-field"], 0.2),
-                           ("build", ["build", "examples/hello-field", "-o", out], 2.0)]:
-    lo, hi = best(args)
-    print(f"  wrela {name}: {lo * 1000:.0f}-{hi * 1000:.0f} ms (budget {budget * 1000:.0f} ms)")
-    if hi > budget:
-        sys.exit(f"wrela {name} took {hi * 1000:.0f} ms, over its budget")
-# Each pipeline's WGSL: what the browser downloads and the driver compiles (pipeline creation
-# time is budgeted by the --gpu tests).
-RAW, GZIPPED = 128 * 1024, 24 * 1024
-for wgsl in sorted(pathlib.Path(out).glob("*.wgsl")):
-    text = wgsl.read_bytes()
-    raw, packed = len(text), len(gzip.compress(text))
-    print(f"  {wgsl.name}: {raw / 1024:.0f} KiB, {packed / 1024:.0f} KiB gzipped (budget {RAW // 1024}, {GZIPPED // 1024})")
-    if raw > RAW or packed > GZIPPED:
-        sys.exit(f"{wgsl.name} is over its size budget")
+try:
+    for name, args, budget in [("check", ["check", "examples/hello-field"], 0.2),
+                               ("build", ["build", "examples/hello-field", "-o", out], 2.0)]:
+        lo, hi = best(args)
+        print(f"  wrela {name}: {lo * 1000:.0f}-{hi * 1000:.0f} ms (budget {budget * 1000:.0f} ms)")
+        if hi > budget:
+            sys.exit(f"wrela {name} took {hi * 1000:.0f} ms, over its budget")
+    # Each pipeline's WGSL: what the browser downloads and the driver compiles (pipeline
+    # creation time is budgeted by the --gpu tests).
+    RAW, GZIPPED = 128 * 1024, 24 * 1024
+    for wgsl in sorted(pathlib.Path(out).glob("*.wgsl")):
+        text = wgsl.read_bytes()
+        raw, packed = len(text), len(gzip.compress(text))
+        print(f"  {wgsl.name}: {raw / 1024:.0f} KiB, {packed / 1024:.0f} KiB gzipped (budget {RAW // 1024}, {GZIPPED // 1024})")
+        if raw > RAW or packed > GZIPPED:
+            sys.exit(f"{wgsl.name} is over its size budget")
+finally:
+    shutil.rmtree(out, ignore_errors=True)
 PY
 
 if [ "$gpu" = 1 ]; then

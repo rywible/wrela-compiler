@@ -4,6 +4,8 @@
 // expect: f2(2.0) = 20.0
 // expect: neg_one() = 4294967295
 // expect: low_bits() = 255
+// expect: wide_negative() = 18446744070709551616
+// expect: small_negative() = 56
 
 pub fn semantic() -> f32 {
     let n = 7
@@ -32,4 +34,13 @@ pub fn neg_one() -> u32 {
 
 pub fn low_bits() -> u32 {
     u32(u8(-1))
+}
+
+/// A negative literal that doesn't fit an `i32` is an `i64` first, then keeps its low bits.
+pub fn wide_negative() -> u64 {
+    u64(-3000000000)
+}
+
+pub fn small_negative() -> u8 {
+    u8(-200)
 }

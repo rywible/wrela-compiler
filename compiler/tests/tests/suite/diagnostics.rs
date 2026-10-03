@@ -55,7 +55,11 @@ fn diagnostics_meet_the_bar() {
             .split_whitespace()
             .map(String::from)
             .collect();
-        let wants_fix = first("fix") == Some("yes");
+        let wants_fix = match first("fix") {
+            Some("yes") => true,
+            Some("no") => false,
+            other => panic!("{name}: `fix:` is `yes` or `no`, not {other:?}"),
+        };
         let out = compile(&name, &text);
         let mut problems = Vec::new();
         if out.codes != expect {
@@ -70,6 +74,9 @@ fn diagnostics_meet_the_bar() {
                 Ok(_) => problems.push("JSON differs from the golden".into()),
                 Err(_) => problems.push("no golden; bless with WRELA_BLESS=1".into()),
             }
+        }
+        if !wants_fix && out.fixed.is_some() {
+            problems.push("a fix is suggested, but the header says `fix: no`".into());
         }
         if wants_fix {
             with_fixes += 1;

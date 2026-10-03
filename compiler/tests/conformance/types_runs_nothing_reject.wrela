@@ -1,0 +1,25 @@
+// rejects: ty.runs
+// A run of a type whose values hold nothing would have a length and no bytes, which neither
+// back end has a form for yet.
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch}
+
+struct Tag: Copy + Clone + GpuData {}
+
+fn count<T: Copy>(xs: [T]) -> u32 { //~ E0702
+    xs.len()
+}
+
+@compute(64)
+fn k(tags: [Tag], out: mut Slots<f32>, id: GlobalId) { //~ E0702
+    out[id] = 1.0
+}
+
+pub fn tags() -> u32 {
+    count([Tag {}, Tag {}, Tag {}]) + count([(), ()])
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    let tags: GpuBuffer<Tag> = buffer(3) //~ E0702
+    let out: GpuBuffer<f32> = buffer(64)
+    dispatch(k, groups: 1, tags: tags, out: out)
+}

@@ -1,0 +1,39 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0101",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [
+        {
+          "file": "main.wrela",
+          "message": "this `)` closes a bracket opened before it, and the block with it",
+          "span": {
+            "column": 15,
+            "end": 171,
+            "end_column": 16,
+            "end_line": 9,
+            "line": 9,
+            "start": 170
+          }
+        }
+      ],
+      "message": "this `{` is never closed",
+      "notes": [],
+      "severity": "error",
+      "span": {
+        "column": 11,
+        "end": 167,
+        "end_column": 12,
+        "end_line": 9,
+        "line": 9,
+        "start": 166
+      },
+      "title": "unclosed bracket"
+    }
+  ],
+  "version": 2
+}

@@ -19,21 +19,41 @@ fn builds_are_reproducible() {
             [src.clone(), src, moved]
         })
         .collect();
-    // Every build at once.
-    let outputs: Vec<_> = std::thread::scope(|s| {
-        let builds: Vec<_> = sources
-            .iter()
-            .map(|src| {
-                s.spawn(move || {
-                    build(src).unwrap_or_else(|e| panic!("{} doesn't build:\n{e}", src.display()))
+    // The first build of each package, and the copy's, at once; the second in a later
+    // second of the clock, so a timestamp would differ.
+    let wave = |srcs: Vec<&std::path::PathBuf>| -> Vec<wrela_driver::Output> {
+        std::thread::scope(|s| {
+            let builds: Vec<_> = srcs
+                .into_iter()
+                .map(|src| {
+                    s.spawn(move || {
+                        build(src)
+                            .unwrap_or_else(|e| panic!("{} doesn't build:\n{e}", src.display()))
+                    })
                 })
-            })
-            .collect();
-        builds
-            .into_iter()
-            .map(|b| b.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
-            .collect()
-    });
+                .collect();
+            builds
+                .into_iter()
+                .map(|b| b.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
+                .collect()
+        })
+    };
+    let now =
+        || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    let started = now().as_secs();
+    let mut early =
+        wave(sources.iter().enumerate().filter(|(k, _)| k % 3 != 1).map(|(_, s)| s).collect());
+    while now().as_secs() == started {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let mut late = wave(sources.iter().skip(1).step_by(3).collect());
+    // Back in the order of `sources`: for each package, first, second, copy.
+    let mut outputs = Vec::new();
+    for _ in &pkgs {
+        let first = early.remove(0);
+        let copy = early.remove(0);
+        outputs.extend([first, late.remove(0), copy]);
+    }
     for (pkg, out) in pkgs.iter().zip(outputs.chunks(3)) {
         let [first, second, third] = [0, 1, 2].map(|k| &out[k].files);
         assert!(first.iter().any(|(n, _)| n == "game.wasm"), "{pkg}: no game.wasm");

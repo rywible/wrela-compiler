@@ -1,0 +1,13 @@
+// mistake: a `var` sharing a named place of a type that isn't `Clone`
+// expect: E0517
+// fix: yes
+struct Log {
+    count: u32,
+}
+
+pub fn bump() -> u32 {
+    let l = Log { count: 1 }
+    var m = l
+    m.count += 1
+    m.count
+}

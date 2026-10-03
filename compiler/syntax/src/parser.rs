@@ -7,7 +7,7 @@
 mod expr;
 
 use crate::ast::*;
-use crate::lexer::Lexed;
+use crate::lexer::{Brackets, Lexed, line_break_is_newline};
 use crate::token::{Comment, Token, TokenKind as T};
 use wrela_diag::{Diagnostic, FileId, Span, codes};
 
@@ -34,7 +34,8 @@ pub fn parse_tokens(file: FileId, text: &str, lexed: Lexed) -> Parsed {
     let mut p = Parser {
         file,
         text,
-        tokens: lexed.tokens,
+        tokens: Tokens::new(file, lexed.tokens),
+        brackets: (0, Brackets::default()),
         pos: 0,
         diags: lexed.diagnostics,
         syntax_errors: 0,
@@ -42,6 +43,7 @@ pub fn parse_tokens(file: FileId, text: &str, lexed: Lexed) -> Parsed {
         recovered_at: None,
         closers: Vec::new(),
     };
+    p.tokens.reach(AHEAD);
     let f = p.parse_file();
     Parsed { file: f, comments: lexed.comments, diagnostics: p.diags }
 }
@@ -55,7 +57,9 @@ pub(crate) type PResult<T> = Result<T, Failed>;
 pub(crate) struct Parser<'a> {
     file: FileId,
     text: &'a str,
-    tokens: Vec<Token>,
+    tokens: Tokens,
+    /// The brackets open (L19) after the first `.0` tokens, kept for [`Parser::read_as`].
+    brackets: (usize, Brackets),
     pos: usize,
     diags: Vec<Diagnostic>,
     syntax_errors: u32,
@@ -69,6 +73,115 @@ pub(crate) struct Parser<'a> {
     /// nothing (L19) and is skipped.
     pub(crate) closers: Vec<T>,
 }
+
+/// The tokens. The parser changes them as it reads: it splits a `>>` in two (L16), and reads
+/// a stray closer as another (L19), which changes what's open after it and so the NEWLINEs
+/// there (L17). So a NEWLINE is decided only once the parser reaches it: then reading a closer
+/// as another redoes only the few tokens read ahead, not the rest of the file.
+struct Tokens {
+    file: FileId,
+    /// The tokens reached, NEWLINEs decided.
+    head: Vec<Token>,
+    /// The rest, without NEWLINEs, last first.
+    tail: Vec<Token>,
+    /// The brackets open after `head`.
+    open: Brackets,
+}
+
+impl Tokens {
+    fn new(file: FileId, tokens: Vec<Token>) -> Tokens {
+        let mut tail: Vec<Token> = tokens.into_iter().filter(|t| t.kind != T::Newline).collect();
+        tail.reverse();
+        let head = Vec::with_capacity(tail.len() + tail.len() / 4);
+        Tokens { file, head, tail, open: Brackets::default() }
+    }
+
+    /// Whether a NEWLINE goes between `prev` and `next`, with `open` open (L17).
+    fn newline(&self, open: &Brackets, prev: Option<&Token>, next: &Token) -> Option<Token> {
+        let p = prev?;
+        (next.line_break_before && line_break_is_newline(open.in_brace(), p.kind, next.kind)).then(
+            || Token {
+                kind: T::Newline,
+                span: Span::new(self.file, p.span.end, p.span.end),
+                line_break_before: false,
+            },
+        )
+    }
+
+    /// Reaches token `i` (or the end).
+    fn reach(&mut self, i: usize) {
+        while self.head.len() <= i
+            && let Some(t) = self.tail.pop()
+        {
+            if let Some(n) = self.newline(&self.open, self.head.last(), &t) {
+                self.head.push(n);
+            }
+            self.open.track(t.kind);
+            self.head.push(t);
+        }
+    }
+
+    /// Token `i`, deciding NEWLINEs on the way to it without keeping them if it hasn't been
+    /// reached (the parser seldom looks that far ahead).
+    fn get(&self, i: usize) -> Option<Token> {
+        if let Some(t) = self.head.get(i) {
+            return Some(*t);
+        }
+        let mut open = self.open.clone();
+        let mut prev = self.head.last().copied();
+        let mut at = self.head.len();
+        for t in self.tail.iter().rev() {
+            if let Some(n) = self.newline(&open, prev.as_ref(), t) {
+                if at == i {
+                    return Some(n);
+                }
+                at += 1;
+            }
+            if at == i {
+                return Some(*t);
+            }
+            at += 1;
+            open.track(t.kind);
+            prev = Some(*t);
+        }
+        None
+    }
+
+    fn insert(&mut self, i: usize, t: Token) {
+        self.reach(i.saturating_sub(1));
+        self.head.insert(i, t);
+    }
+
+    /// The token at `at` has become another kind, with `open` open after it: the tokens after
+    /// it are reached again.
+    fn redo_after(&mut self, at: usize, open: Brackets) {
+        while self.head.len() > at + 1
+            && let Some(t) = self.head.pop()
+        {
+            if t.kind != T::Newline {
+                self.tail.push(t);
+            }
+        }
+        self.open = open;
+    }
+}
+
+impl std::ops::Index<usize> for Tokens {
+    type Output = Token;
+
+    fn index(&self, i: usize) -> &Token {
+        self.head.get(i).expect("a token the parser has reached")
+    }
+}
+
+impl std::ops::IndexMut<usize> for Tokens {
+    fn index_mut(&mut self, i: usize) -> &mut Token {
+        self.head.get_mut(i).expect("a token the parser has reached")
+    }
+}
+
+/// How many tokens past the current one the parser reads ahead (`nth`).
+const AHEAD: usize = 3;
 
 /// After this many syntax errors in one file, later ones are dropped: they're usually noise
 /// from the first.
@@ -126,6 +239,7 @@ impl<'a> Parser<'a> {
         let t = self.tok();
         if t.kind != T::Eof {
             self.pos += 1;
+            self.tokens.reach(self.pos + AHEAD);
         }
         t
     }
@@ -265,6 +379,10 @@ impl<'a> Parser<'a> {
             line_break_before: false,
         };
         self.tokens.insert(self.pos + 1, rest);
+        if self.brackets.0 > self.pos + 1 {
+            // Not a bracket: what's open is the same.
+            self.brackets.0 += 1;
+        }
         self.bump();
         Ok(close)
     }
@@ -292,6 +410,8 @@ impl<'a> Parser<'a> {
             match self.kind() {
                 T::Eof => break,
                 T::Newline | T::Semi | T::RBrace if depth == 0 => break,
+                // A closer of a bracket opened before the statement (L19).
+                k @ (T::RParen | T::RBracket) if depth == 0 && self.closers.contains(&k) => break,
                 T::LParen | T::LBracket | T::LBrace => depth += 1,
                 T::RParen | T::RBracket | T::RBrace => depth = depth.saturating_sub(1),
                 _ => {}
@@ -313,7 +433,7 @@ impl<'a> Parser<'a> {
 
     /// Whether the token closes a list or block being parsed (`close`, or an enclosing one's,
     /// which closes this one with it (L19)).
-    fn at_closer(&self, close: T) -> bool {
+    pub(crate) fn at_closer(&self, close: T) -> bool {
         let k = self.kind();
         k == close
             || (matches!(k, T::RParen | T::RBracket | T::RBrace) && self.closers.contains(&k))
@@ -426,7 +546,10 @@ impl<'a> Parser<'a> {
                 format!("`{found}` doesn't close anything here: expected `{want}`"),
             )
             .with_fix(format!("close with `{want}`"), t.span, want);
-            if let Some(open) = self.opener_of(close) {
+            // (Only for an error that's kept: finding it reads back through the file.)
+            if self.syntax_errors < MAX_SYNTAX_ERRORS
+                && let Some(open) = self.opener_of(close)
+            {
                 d = d.with_secondary(open, "opened here");
             }
             self.error(d);
@@ -480,19 +603,23 @@ impl<'a> Parser<'a> {
         edits
     }
 
-    /// Reads the current token, a closer that closes nothing (L19), as `close`. The lexer's
-    /// NEWLINEs after it are redone to match: they depend on which brackets are open (L17).
+    /// Reads the current token, a closer that closes nothing (L19), as `close`. What's open
+    /// after it changes, and so the NEWLINEs after it (L17): the tokens read ahead are redone.
     fn read_as(&mut self, close: T) {
         let at = self.pos;
         self.tokens[at].kind = close;
-        let mut brackets = crate::lexer::Brackets::default();
-        for t in &self.tokens[..=at] {
-            brackets.track(t.kind);
+        // What's open before `at`, from where the last call left off.
+        let (k, mut open) = std::mem::take(&mut self.brackets);
+        if k > at {
+            open = Brackets::default();
         }
-        let rest: Vec<Token> =
-            self.tokens.drain(at + 1..).filter(|t| t.kind != T::Newline).collect();
-        let prev = Some(self.tokens[at]);
-        crate::lexer::newlines_after(prev, brackets, rest, self.file, &mut self.tokens);
+        for i in k.min(at)..at {
+            open.track(self.tokens[i].kind);
+        }
+        open.track(close);
+        self.brackets = (at + 1, open.clone());
+        self.tokens.redo_after(at, open);
+        self.tokens.reach(at + AHEAD);
     }
 
     /// The bracket that `close` would close: the nearest unclosed one of its kind before the
@@ -500,7 +627,8 @@ impl<'a> Parser<'a> {
     fn opener_of(&self, close: T) -> Option<Span> {
         let open = close.opener()?;
         let mut depth = 0u32;
-        for t in self.tokens[..self.pos.min(self.tokens.len())].iter().rev() {
+        for i in (0..self.pos.min(self.tokens.head.len())).rev() {
+            let t = &self.tokens[i];
             if t.kind == close {
                 depth += 1;
             } else if t.kind == open {
@@ -521,7 +649,7 @@ impl<'a> Parser<'a> {
             first
         };
         let (t, colon) = (self.tokens.get(i)?, self.tokens.get(i + 1)?);
-        (t.kind == T::Ident && colon.kind == T::Colon).then(|| self.ident_of(*t))
+        (t.kind == T::Ident && colon.kind == T::Colon).then(|| self.ident_of(t))
     }
 
     // ---- file and items --------------------------------------------------------------------
@@ -592,7 +720,7 @@ impl<'a> Parser<'a> {
                 }
                 T::Fn | T::Struct | T::Enum | T::Trait | T::Const => {
                     let n = self.tokens.get(i + 1)?;
-                    return (n.kind == T::Ident).then(|| self.ident_of(*n));
+                    return (n.kind == T::Ident).then(|| self.ident_of(n));
                 }
                 _ => return None,
             }
@@ -604,14 +732,39 @@ impl<'a> Parser<'a> {
     fn missing_sep(&mut self, what: &str) {
         let t = self.tok();
         let at = self.prev_span().shrink_to_end();
-        self.error(
-            Diagnostic::new(
-                codes::E0104,
-                t.span,
-                format!("expected a line break or `;` after {what}, found {}", describe(t.kind)),
-            )
-            .with_fix("start a new line here", at, "\n"),
+        let d = Diagnostic::new(
+            codes::E0104,
+            t.span,
+            format!("expected a line break or `;` after {what}, found {}", describe(t.kind)),
         );
+        // A new line helps only before something that can start a statement or an item.
+        let starts = self.starts_expr()
+            || matches!(
+                t.kind,
+                T::Let
+                    | T::Var
+                    | T::Borrow
+                    | T::For
+                    | T::While
+                    | T::Loop
+                    | T::Fn
+                    | T::Struct
+                    | T::Enum
+                    | T::Trait
+                    | T::Impl
+                    | T::Const
+                    | T::Use
+                    | T::Pub
+                    | T::At
+            );
+        self.error(match t.kind {
+            T::As => d.with_help("a conversion is a call of the type: `f32(x)`, not `x as f32`"),
+            T::DotDot | T::DotDotEq => {
+                d.with_help("a range is written only in a `for` loop: `for i in 0..10`")
+            }
+            _ if starts => d.with_fix("start a new line here", at, "\n"),
+            _ => d,
+        });
     }
 
     /// Skips to a token that can start an item, at the top level, after a separator.
@@ -796,6 +949,20 @@ impl<'a> Parser<'a> {
 
     /// param ::= mode? "self" | IDENT ":" mode? type ("=" expr)?
     fn parse_param(&mut self) -> PResult<Param> {
+        // `&self`, `&mut self`: reported, then read without the `&`.
+        if self.at(T::Amp)
+            && (self.nth(1) == T::SelfValue
+                || (self.nth(1) == T::Mut && self.nth(2) == T::SelfValue))
+        {
+            let amp = self.bump().span;
+            self.error(
+                Diagnostic::new(codes::E0106, amp, "`&` isn't a type in wrela")
+                    .with_note(
+                        "a method borrows `self` by default, and takes `mut self` to change it",
+                    )
+                    .with_fix("remove the `&`", amp, ""),
+            );
+        }
         let start = self.span();
         let mode = self.parse_mode();
         if self.at(T::SelfValue) {

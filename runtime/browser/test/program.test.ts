@@ -5,7 +5,7 @@ import { CommandError } from "../src/check.ts";
 import { parseManifest } from "../src/manifest.ts";
 import { checkAbi, Program, ProgramError, TrapError } from "../src/program.ts";
 import { StateHash } from "../src/hash.ts";
-import { StreamError } from "../src/stream.ts";
+import { type Command, StreamError } from "../src/stream.ts";
 import { wasmOffsets } from "../src/lines.ts";
 import { Encoder } from "./encoder.ts";
 import { checker, Recorder, readFixture, readFixtureText, shapes } from "./fixtures.ts";
@@ -101,6 +101,16 @@ describe("the ABI check", () => {
     await expect(load(Uint8Array.from([1, 2, 3]))).rejects.toThrow(ProgramError);
   });
 
+  test("a module that can't be instantiated is an invalid program, as natively", async () => {
+    // A data segment past the end of its memory fails at instantiation.
+    const wasm = buildModule({
+      memory: 1,
+      funcs: [frameOnly],
+      data: [{ offset: 70_000, bytes: new Uint8Array([1]) }],
+    });
+    await expect(load(wasm)).rejects.toThrow(ProgramError);
+  });
+
   test("accepts the first-light fixture", async () => {
     const wasm = readFixture("game.wasm");
     checkAbi(await WebAssembly.compile(wasm), wasm);
@@ -153,6 +163,52 @@ test("rejects submits outside memory", async () => {
   const program = await load(wasm);
   expect(() => program.frame(0, 1, 1)).toThrow(TrapError);
   expect(() => program.frame(0, 1, 1)).toThrow("submit(65530, 100) reaches past the end of the program's memory (65536 bytes)");
+});
+
+test("a rejected command leaves no trace", async () => {
+  // The sequencer passes a `BeginScreenPass` the checker then rejects: no pass is open after
+  // it. (The frame traps before it ends, so the next one sends the same batch: it's rejected
+  // the same way, not as a second pass.)
+  const nan = new Encoder().beginScreenPass([NaN, 0, 0, 1]).finish();
+  const executor = new Recorder();
+  const program = await Program.load(batchProgram([[nan]]), checker(), executor);
+  expect(() => program.frame(0, 64, 64)).toThrow(CommandError);
+  expect(() => program.frame(1 / 60, 64, 64)).toThrow("the clear colour's r isn't a finite number");
+  expect(executor.log).toEqual([]);
+});
+
+test("nothing runs after the host fails a command", async () => {
+  // What the executor holds after it fails isn't known: every later command fails.
+  class FailsOnce extends Recorder {
+    failed = false;
+    override execute(cmd: Command): void {
+      if (cmd.op === "Present" && !this.failed) {
+        this.failed = true;
+        throw new Error("lost");
+      }
+      super.execute(cmd);
+    }
+  }
+  const pass = new Encoder().beginScreenPass([0, 0, 0, 0]).present().finish();
+  const executor = new FailsOnce();
+  const program = await Program.load(batchProgram([[pass], [pass]]), checker(), executor);
+  expect(() => program.frame(0, 64, 64)).toThrow("lost");
+  expect(() => program.frame(1 / 60, 64, 64)).toThrow("the host failed to carry out an earlier command (lost)");
+  expect(executor.log).toEqual(["BeginScreenPass"]);
+});
+
+test("a failed submit fails the call even if the module catches it", async () => {
+  const nan = new Encoder().beginScreenPass([NaN, 0, 0, 1]).finish();
+  // try { submit(16, len) } catch_all {} (WASM exception handling)
+  const body = [0x06, 0x40, ...op.i32(16), ...op.i32(nan.length), ...op.call(0), 0x19, 0x0b];
+  const wasm = buildModule({
+    imports: [SUBMIT],
+    memory: 1,
+    funcs: [{ type: FRAME_TYPE, body, export: "frame" }],
+    data: [{ offset: 16, bytes: nan }],
+  });
+  const program = await load(wasm);
+  expect(() => program.frame(0, 64, 64)).toThrow(CommandError);
 });
 
 test("reports program traps", async () => {

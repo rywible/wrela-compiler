@@ -1,0 +1,38 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0517",
+      "file": "main.wrela",
+      "fixes": [
+        {
+          "edits": [
+            {
+              "end": 196,
+              "file": "main.wrela",
+              "replacement": "take ",
+              "start": 196
+            }
+          ],
+          "message": "move it: `take l`"
+        }
+      ],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "`var` owns its value, so it can't share `l`",
+      "notes": [],
+      "severity": "error",
+      "span": {
+        "column": 13,
+        "end": 197,
+        "end_column": 14,
+        "end_line": 10,
+        "line": 10,
+        "start": 196
+      },
+      "title": "`var` binding of a named place without `take` or `.clone()`"
+    }
+  ],
+  "version": 2
+}

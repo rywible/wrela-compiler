@@ -157,12 +157,18 @@ fn load_case(path: &Path) -> Case {
 /// The errors a case's package gets, through lowering: (file, line) -> codes.
 fn errors(case: &Case) -> BTreeMap<(String, usize), Vec<String>> {
     let dir = scratch(&format!("conformance/{}", case.name));
+    // An accepting case goes all the way: with a `frame` added if it has none (at the end, so
+    // no line moves), and every function lowered and emitted, called or not.
+    let accepting = case.rejects.is_empty();
     for (file, text) in &case.files {
         let p = dir.join(file);
         std::fs::create_dir_all(p.parent().expect("parent")).expect("dir");
+        let text =
+            if accepting && file == "main.wrela" { crate::with_frame(text) } else { text.clone() };
         std::fs::write(p, text).expect("write");
     }
-    let built = wrela_driver::build(&dir);
+    let built =
+        if accepting { wrela_driver::build_every_fn(&dir) } else { wrela_driver::build(&dir) };
     let mut out: BTreeMap<(String, usize), Vec<String>> = BTreeMap::new();
     // A case is about something else than `frame`, which a program must export: a case
     // without one isn't told so (`a_program_without_frame_is_rejected` is).
@@ -177,9 +183,9 @@ fn errors(case: &Case) -> BTreeMap<(String, usize), Vec<String>> {
         };
         let file = built.sources.file(span.file);
         let line = file.line_index(span.start) + 1;
-        let name = file.name.rsplit('/').next().unwrap_or(&file.name).to_string();
-        let key = if file.name.starts_with('<') { file.name.clone() } else { name };
-        out.entry((key, line)).or_default().push(d.code.as_str().to_string());
+        // By its path in the package (`shapes/blob.wrela`), as the markers are; std's files by
+        // their names (`<std::field>`).
+        out.entry((file.name.clone(), line)).or_default().push(d.code.as_str().to_string());
     }
     for codes in out.values_mut() {
         codes.sort();

@@ -26,6 +26,15 @@ pub const MAX_WORKGROUP_INVOCATIONS: u32 = 256;
 pub const MAX_STORAGE_BUFFERS_PER_STAGE: usize = 8;
 pub const MAX_UNIFORM_BUFFER_BINDING_SIZE: u32 = 65536;
 
+/// Whether a file the manifest names is one in the build directory, as both hosts read it: a
+/// name of letters, digits, `_`, `-` and `.`, not starting with `.`. Not a path that leaves
+/// the directory (`/`, `..`), nor anything a browser would read as a URL (`:`, `#`, `?`, `\`).
+pub fn plain_file_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('.')
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Manifest {
     pub manifest_version: u32,
@@ -140,9 +149,17 @@ impl Manifest {
         if self.wasm.is_empty() {
             return err("no WASM file".into());
         }
+        if !plain_file_name(&self.wasm) {
+            return err("the WASM file's name isn't a file name in the build directory".into());
+        }
         for (i, p) in self.pipelines.iter().enumerate() {
             if p.shader.is_empty() {
                 return err(format!("pipeline {i} has no shader"));
+            }
+            if !plain_file_name(&p.shader) {
+                return err(format!(
+                    "pipeline {i}'s shader name isn't a file name in the build directory"
+                ));
             }
             let mut bindings: Vec<u32> = p.buffers.iter().map(|b| b.binding).collect();
             if let Some(u) = &p.uniform {

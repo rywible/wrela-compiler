@@ -1,5 +1,6 @@
 // mistake: more types after `::<` than the function or type has generic parameters
 // expect: E0322 E0322
+// fix: no
 fn first<T: Copy>(x: T) -> T {
     x
 }

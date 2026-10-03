@@ -26,3 +26,8 @@ fn corner(v: VertexIndex) -> Corner {
         seen: Flat { value: true },
     }
 }
+
+@gpu(1, 2) //~ E0602
+fn helper(x: f32) -> f32 {
+    x
+}

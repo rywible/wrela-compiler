@@ -135,18 +135,19 @@ impl<'a> Cx<'a> {
             TyKind::Vec(n) => Some(mb.m.types.vector(*n)),
             TyKind::Mat(n) => Some(mb.m.types.intern(ir::TypeDef::Matrix(*n))),
             TyKind::Tuple(ts) => {
-                if ts.is_empty() {
-                    None
-                } else {
-                    let mut fields = Vec::new();
-                    for (i, &e) in ts.iter().enumerate() {
-                        if let Some(f) = self.lower_ty(mb, e, span) {
-                            fields.push((format!("_{i}"), f));
-                        }
+                let mut fields = Vec::new();
+                for (i, &e) in ts.iter().enumerate() {
+                    if let Some(f) = self.lower_ty(mb, e, span) {
+                        fields.push((format!("_{i}"), f));
                     }
-                    let name = self.checked.program.display_ty(t);
-                    Some(mb.m.types.intern(ir::TypeDef::Struct { name, fields }))
                 }
+                // Like a struct, a tuple none of whose elements has a value (`()`, `((), ())`)
+                // has none: WGSL has no empty structs.
+                if fields.is_empty() {
+                    return None;
+                }
+                let name = self.checked.program.display_ty(t);
+                Some(mb.m.types.intern(ir::TypeDef::Struct { name, fields }))
             }
             TyKind::Array(e, n) => {
                 if gpu && *n == 0 {
@@ -157,7 +158,10 @@ impl<'a> Cx<'a> {
                 self.lower_ty(mb, *e, span).map(|e| mb.m.types.intern(ir::TypeDef::Array(e, *n)))
             }
             TyKind::Slice(e) => {
-                let e = self.lower_ty(mb, *e, span)?;
+                let Some(e) = self.lower_ty(mb, *e, span) else {
+                    self.holds_nothing("run", *e, span);
+                    return None;
+                };
                 Some(mb.m.types.intern(if gpu {
                     ir::TypeDef::RuntimeArray(e)
                 } else {
@@ -268,6 +272,21 @@ impl<'a> Cx<'a> {
     }
 
     /// E0326: a type GPU code can't hold.
+    /// E0702: a run or a buffer of `elem`, a type whose values hold nothing (`()`, a struct
+    /// with no fields). It would have a length and no bytes, which neither back end has a form
+    /// for yet; dropping it would lose the length (and a dispatch that takes one).
+    pub(crate) fn holds_nothing(&mut self, what: &str, elem: TyId, span: Span) {
+        let shown = self.checked.program.display_ty(elem);
+        self.err(
+            Diagnostic::new(
+                codes::E0702,
+                span,
+                format!("a {what} of `{shown}`, whose values hold nothing, isn't supported yet"),
+            )
+            .with_help("give the type a field, or pass a count instead"),
+        );
+    }
+
     fn not_on_gpu(&mut self, mb: &ModuleBuilder, name: &str, note: &str, span: Span) {
         let what = mb.gpu.as_ref().map_or("GPU code", |g| g.what.as_str());
         self.err(

@@ -43,6 +43,7 @@ impl<'p> Checker<'p> {
     pub(crate) fn check_let_pattern(&mut self, pat: &ast::Pat, ty: TyId, init: &Expr) -> Pat {
         let from_place = init.is_place();
         let p = self.check_pat(pat, ty, from_place);
+        self.bound_once(&p);
         if !self.irrefutable(&p) {
             self.err(
                 Diagnostic::new(
@@ -54,6 +55,41 @@ impl<'p> Checker<'p> {
             );
         }
         p
+    }
+
+    /// E0201 for a name a pattern binds twice (`(x, x)`): the second would hide the first,
+    /// and `(a, a)` would read as a test that both are equal. Each alternative of an or-pattern
+    /// binds the same names, so the first stands for them.
+    pub(crate) fn bound_once(&mut self, p: &Pat) {
+        fn names(p: &Pat, out: &mut Vec<LocalId>) {
+            match &p.kind {
+                PatKind::Bind(l) => out.push(*l),
+                PatKind::Tuple(ps) => ps.iter().for_each(|x| names(x, out)),
+                PatKind::Adt { fields, .. } => fields.iter().for_each(|(_, x)| names(x, out)),
+                PatKind::Or(ps) => {
+                    if let Some(first) = ps.first() {
+                        names(first, out);
+                    }
+                }
+                PatKind::Wild | PatKind::Lit(_) => {}
+            }
+        }
+        let mut bound = Vec::new();
+        names(p, &mut bound);
+        for (i, &l) in bound.iter().enumerate() {
+            let decl = &self.locals[l.index()];
+            if let Some(&first) =
+                bound[..i].iter().find(|&&f| self.locals[f.index()].name == decl.name)
+            {
+                let (name, at, before) =
+                    (decl.name.clone(), decl.span, self.locals[first.index()].span);
+                self.err(
+                    Diagnostic::new(codes::E0201, at, format!("`{name}` is bound twice in this pattern"))
+                        .with_secondary(before, "first bound here")
+                        .with_help("give each binding its own name; to test that two parts are equal, use a guard: `if a == b`"),
+                );
+            }
+        }
     }
 
     fn irrefutable(&self, p: &Pat) -> bool {
@@ -80,11 +116,11 @@ impl<'p> Checker<'p> {
                 PatKind::Wild
             }
             ast::PatKind::Ident(name) => {
-                // A unit variant or constant in scope is matched, not bound (`None`, `MAX`).
+                // A variant or constant in scope is matched, not bound (`None`, `MAX`). A variant
+                // that holds values, named alone (`Some`), is E0320: bound, it would be a name
+                // that matches everything.
                 match resolve::lookup_name(self.p, self.scope.module, &name.name) {
-                    Some(Res::Variant(a, v))
-                        if self.p.adt(a).variants()[v as usize].shape == VariantShape::Unit =>
-                    {
+                    Some(Res::Variant(a, v)) => {
                         return self.variant_pat(a, v, span, ty);
                     }
                     Some(Res::Const(c)) => {
@@ -106,6 +142,8 @@ impl<'p> Checker<'p> {
                         self.expect(tt, ty, span);
                         ts
                     }
+                    // Its error is reported.
+                    TyKind::Error => return self.unmatched(pat, ty),
                     _ => {
                         let shown = self.display(ty);
                         self.err(Diagnostic::new(
@@ -124,9 +162,13 @@ impl<'p> Checker<'p> {
             | ast::PatKind::TupleStruct(path, _)
             | ast::PatKind::Struct { path, .. } => {
                 let module = self.scope.module;
-                let Some(res) =
-                    resolve::lookup_or_report(self.p, &mut self.diags, module, &path.segments)
-                else {
+                let res = match self.self_item(&path.segments) {
+                    Some(r) => Some(r),
+                    None => {
+                        resolve::lookup_or_report(self.p, &mut self.diags, module, &path.segments)
+                    }
+                };
+                let Some(res) = res else {
                     return self.unmatched(pat, ty);
                 };
                 match (&pat.kind, res) {
@@ -143,6 +185,11 @@ impl<'p> Checker<'p> {
                         if !self.p.adt(a).is_enum() =>
                     {
                         return self.struct_pat(a, None, fields, *rest, span, ty, from_place);
+                    }
+                    // A constant by its path (`limits::MAX`), as by its name.
+                    (ast::PatKind::Path(p), Res::Const(c)) => {
+                        let at = p.last().span;
+                        self.const_pat(c, ty, at).map_or(PatKind::Wild, PatKind::Lit)
                     }
                     _ => {
                         self.err(Diagnostic::new(
@@ -269,14 +316,17 @@ impl<'p> Checker<'p> {
         match lit.kind {
             ast::LitKind::Bool(b) => Some(Lit::Bool(b)),
             ast::LitKind::Int(v) if self.p.types.is_float(resolved) => {
-                let v = v.ok()? as f64;
-                Some(Lit::Float(if neg { -v } else { v }))
+                let (d, f) = (v.ok()? as f64, v.ok()? as f32);
+                Some(if neg { Lit::Float(-d, -f) } else { Lit::Float(d, f) })
             }
             ast::LitKind::Int(v) => {
                 let v = v.ok()?;
                 Some(Lit::Int(if neg { -i128::from(v) } else { i128::from(v) }))
             }
-            ast::LitKind::Float(v) => Some(Lit::Float(if neg { -v } else { v })),
+            ast::LitKind::Float(v) => {
+                let f = wrela_syntax::lexer::float_value_f32(&lit.text);
+                Some(if neg { Lit::Float(-v, -f) } else { Lit::Float(v, f) })
+            }
             _ => None,
         }
     }
@@ -327,8 +377,9 @@ impl<'p> Checker<'p> {
             ast::LitKind::Float(v) => {
                 let var = self.new_var(VarKind::Float, lit.span);
                 self.expect(var, ty, lit.span);
-                self.float_literals.push((ty, v, lit.span));
-                Some(Lit::Float(if neg { -v } else { v }))
+                let f = wrela_syntax::lexer::float_value_f32(&lit.text);
+                self.float_literals.push((ty, v, f, lit.span));
+                Some(if neg { Lit::Float(-v, -f) } else { Lit::Float(v, f) })
             }
             _ => {
                 self.err(Diagnostic::new(
@@ -482,6 +533,7 @@ impl<'p> Checker<'p> {
                 Some(p) => self.check_pat(p, ftys[i], from_place),
                 None => {
                     let id = self.declare_binding(&f.name, ftys[i], from_place);
+                    self.locals[id.index()].shorthand = true;
                     Pat { ty: ftys[i], kind: PatKind::Bind(id), span: f.name.span }
                 }
             };
@@ -529,6 +581,7 @@ impl<'p> Checker<'p> {
             let errors = self.diags.len();
             let pats: Vec<Pat> =
                 arm.pats.iter().map(|p| self.check_pat(p, s.ty, from_place)).collect();
+            pats.iter().for_each(|p| self.bound_once(p));
             bad_pattern |= wrela_diag::has_errors(&self.diags[errors..]);
             if pats.len() > 1 && pats.iter().any(has_binding) {
                 self.err(
@@ -590,9 +643,12 @@ impl<'p> Checker<'p> {
     fn check_exhaustive(&mut self, s: &Expr, arms: &[Arm], span: Span) {
         let ty = self.infer.resolve(&self.p.types, s.ty);
         let mut rows: Vec<Vec<DPat>> = Vec::new();
+        // One budget for all the arms' checks (out of steps, an arm is taken to be needed),
+        // another for the whole match's.
+        let mut steps = Steps::new();
         for arm in arms {
             let d = self.dpat(&arm.pat);
-            if !useful(self.p, &rows, std::slice::from_ref(&d), &[ty]) {
+            if !useful(self.p, &rows, std::slice::from_ref(&d), &[ty], &mut steps) {
                 self.err(
                     Diagnostic::new(
                         codes::W0002,
@@ -606,7 +662,19 @@ impl<'p> Checker<'p> {
                 rows.push(vec![d]);
             }
         }
-        if useful(self.p, &rows, &[DPat::Wild], &[ty]) {
+        let mut steps = Steps::new();
+        if useful(self.p, &rows, &[DPat::Wild], &[ty], &mut steps) {
+            if steps.out {
+                self.err(
+                    Diagnostic::new(
+                        codes::E0309,
+                        span,
+                        "this `match` has too many cases to check that it covers every value",
+                    )
+                    .with_help("add `_ => ...` for everything else"),
+                );
+                return;
+            }
             let missing = witness(self.p, &rows, ty).unwrap_or_else(|| "_".into());
             self.err(
                 Diagnostic::new(
@@ -625,6 +693,11 @@ impl<'p> Checker<'p> {
         match &p.kind {
             PatKind::Wild | PatKind::Bind(_) => DPat::Wild,
             PatKind::Lit(Lit::Bool(b)) => DPat::Ctor(Ctor::Variant(u32::from(*b)), Vec::new()),
+            // Keyed by value: `-0.0` is `0.0`, and `1.0` is `1`.
+            PatKind::Lit(Lit::Float(f, _)) if f.fract() == 0.0 && f.abs() < 9.0e15 => {
+                DPat::Lit(format!("{}", *f as i128))
+            }
+            PatKind::Lit(Lit::Int(i)) => DPat::Lit(format!("{i}")),
             PatKind::Lit(l) => DPat::Lit(format!("{l:?}")),
             PatKind::Tuple(ps) => {
                 DPat::Ctor(Ctor::Single, ps.iter().map(|x| self.dpat(x)).collect())
@@ -763,17 +836,50 @@ fn default_rows(rows: &[Vec<DPat>]) -> Vec<Vec<DPat>> {
     rows.iter().filter(|r| matches!(r[0], DPat::Wild)).map(|r| r[1..].to_vec()).collect()
 }
 
-/// Whether `row` matches some value no row of `rows` matches.
-fn useful(p: &Program, rows: &[Vec<DPat>], row: &[DPat], tys: &[TyId]) -> bool {
+/// The steps the usefulness checks of one `match` may take. Deciding usefulness is
+/// NP-complete (each row is a conjunction of tests), so a match can be written to take
+/// exponential time: out of steps, a row counts as useful.
+struct Steps {
+    left: u32,
+    /// The steps ran out.
+    out: bool,
+}
+
+impl Steps {
+    const MAX: u32 = 100_000;
+
+    fn new() -> Steps {
+        Steps { left: Steps::MAX, out: false }
+    }
+
+    /// Takes a step; false when none are left.
+    fn take(&mut self) -> bool {
+        match self.left.checked_sub(1) {
+            Some(l) => self.left = l,
+            None => self.out = true,
+        }
+        !self.out
+    }
+}
+
+/// Whether `row` matches some value no row of `rows` matches (or the steps ran out).
+fn useful(p: &Program, rows: &[Vec<DPat>], row: &[DPat], tys: &[TyId], steps: &mut Steps) -> bool {
+    if !steps.take() {
+        return true;
+    }
     if row.is_empty() {
         return rows.is_empty();
+    }
+    // A row of wildcards matches everything `row` does.
+    if rows.iter().any(|r| r.iter().all(|d| matches!(d, DPat::Wild))) {
+        return false;
     }
     let rows = expand(rows);
     if let DPat::Or(alts) = &row[0] {
         return alts.iter().any(|a| {
             let mut r = vec![a.clone()];
             r.extend_from_slice(&row[1..]);
-            useful(p, &rows, &r, tys)
+            useful(p, &rows, &r, tys, steps)
         });
     }
     let ty = tys[0];
@@ -785,7 +891,7 @@ fn useful(p: &Program, rows: &[Vec<DPat>], row: &[DPat], tys: &[TyId]) -> bool {
             ntys.extend_from_slice(&tys[1..]);
             let mut nrow = subs.clone();
             nrow.extend_from_slice(&row[1..]);
-            useful(p, &specialize(&rows, k, arity), &nrow, &ntys)
+            useful(p, &specialize(&rows, k, arity), &nrow, &ntys, steps)
         }
         DPat::Lit(l) => {
             let matching: Vec<Vec<DPat>> = rows
@@ -793,7 +899,7 @@ fn useful(p: &Program, rows: &[Vec<DPat>], row: &[DPat], tys: &[TyId]) -> bool {
                 .filter(|r| matches!(&r[0], DPat::Wild) || matches!(&r[0], DPat::Lit(x) if x == l))
                 .map(|r| r[1..].to_vec())
                 .collect();
-            useful(p, &matching, &row[1..], &tys[1..])
+            useful(p, &matching, &row[1..], &tys[1..], steps)
         }
         DPat::Wild => {
             let used: Vec<&Ctor> = rows
@@ -807,9 +913,9 @@ fn useful(p: &Program, rows: &[Vec<DPat>], row: &[DPat], tys: &[TyId]) -> bool {
                     ntys.extend_from_slice(&tys[1..]);
                     let mut nrow = vec![DPat::Wild; arity];
                     nrow.extend_from_slice(&row[1..]);
-                    useful(p, &specialize(&rows, k, arity), &nrow, &ntys)
+                    useful(p, &specialize(&rows, k, arity), &nrow, &ntys, steps)
                 }),
-                _ => useful(p, &default_rows(&rows), &row[1..], &tys[1..]),
+                _ => useful(p, &default_rows(&rows), &row[1..], &tys[1..], steps),
             }
         }
         DPat::Or(_) => unreachable!("or-patterns are expanded above"),
@@ -819,11 +925,15 @@ fn useful(p: &Program, rows: &[Vec<DPat>], row: &[DPat], tys: &[TyId]) -> bool {
 /// An example of a value the rows miss, for the message (one level deep).
 fn witness(p: &Program, rows: &[Vec<DPat>], ty: TyId) -> Option<String> {
     let rows = expand(rows);
+    let mut steps = Steps::new();
     for k in ctors(p, ty)? {
         let tys = ctor_fields(p, ty, &k);
         let arity = tys.len();
         let spec = specialize(&rows, &k, arity);
-        if useful(p, &spec, &vec![DPat::Wild; arity], &tys) {
+        if useful(p, &spec, &vec![DPat::Wild; arity], &tys, &mut steps) {
+            if steps.out {
+                return None;
+            }
             let text = match (&k, p.types.kind(ty)) {
                 (Ctor::Variant(v), TyKind::Bool) => {
                     (if *v == 1 { "true" } else { "false" }).to_string()

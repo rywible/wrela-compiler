@@ -46,6 +46,9 @@ pub struct Roots {
     /// checked where they're defined: non-generic entry points, and `@gpu` functions, each
     /// with the type arguments to check it with (a generic one's are [`stand_ins`]).
     pub gpu_checks: Vec<(FnId, Vec<TyId>)>,
+    /// Functions lowered for the CPU though nothing exports them: for tests, so code that
+    /// nothing calls still goes through lowering and the back ends.
+    pub also: Vec<FnId>,
 }
 
 impl Roots {
@@ -61,11 +64,11 @@ impl Roots {
                 continue;
             }
             let generic = !p.fn_all_generics(id).is_empty();
+            // A generic one too: it's reported (the host can't choose its types).
             if Some(f.module) == p.main
                 && f.public
                 && f.owner == wrela_sema::defs::FnOwner::Free
                 && f.attrs.entry.is_none()
-                && !generic
             {
                 exports.push(id);
             }
@@ -77,7 +80,30 @@ impl Roots {
                 gpu_checks.push((id, substs));
             }
         }
-        Roots { exports, gpu_checks }
+        Roots { exports, gpu_checks, also: Vec::new() }
+    }
+
+    /// [`Roots::of`], and every other function of the package that can be lowered on its own:
+    /// one that isn't generic, isn't GPU code, and takes no closure or function (lowered for
+    /// the one each call passes).
+    pub fn every_fn(checked: &Checked) -> Roots {
+        let p = &checked.program;
+        let mut roots = Roots::of(checked);
+        for (i, f) in p.fns.iter().enumerate() {
+            let id = FnId(i as u32);
+            if !p.is_std(f.module)
+                && checked.mir.contains_key(&id)
+                && p.fn_all_generics(id).is_empty()
+                && f.attrs.entry.is_none()
+                && f.attrs.gpu.is_none()
+                && !f.attrs.intrinsic
+                && !f.params.iter().any(|ps| wrela_sema::mir::is_callable(&p.types, ps.ty))
+                && !roots.exports.contains(&id)
+            {
+                roots.also.push(id);
+            }
+        }
+        roots
     }
 }
 
@@ -114,21 +140,37 @@ fn stand_ins(p: &Program, f: FnId) -> Option<Vec<TyId>> {
 
 /// Whether GPU code can hold a value of type `t`: no CPU-only scalars, runs or functions.
 fn on_gpu(p: &Program, t: TyId) -> bool {
-    match p.types.kind(t) {
+    on_gpu_in(p, t, &mut HashMap::new())
+}
+
+/// [`on_gpu`], each part a type shares decided once (`known`).
+fn on_gpu_in(p: &Program, t: TyId, known: &mut HashMap<TyId, bool>) -> bool {
+    if let Some(&k) = known.get(&t) {
+        return k;
+    }
+    let ok = match p.types.kind(t) {
         TyKind::Bool | TyKind::Vec(_) | TyKind::Mat(_) => true,
         TyKind::Int(i) => i.on_gpu(),
         TyKind::Float(f) => *f == wrela_sema::ty::FloatTy::F32,
-        TyKind::Array(e, n) => *n > 0 && on_gpu(p, *e),
-        TyKind::Tuple(ts) => ts.iter().all(|&e| on_gpu(p, e)),
+        TyKind::Array(e, n) => *n > 0 && on_gpu_in(p, *e, known),
+        TyKind::Tuple(ts) => ts.iter().all(|&e| on_gpu_in(p, e, known)),
         TyKind::Adt(a, args) => {
-            let variants = p.adt(*a).variants().len().max(1);
-            (0..variants).all(|v| {
-                let v = p.adt(*a).is_enum().then_some(v as u32);
-                p.fields_of(*a, args, v).into_iter().all(|ft| on_gpu(p, ft))
-            })
+            let adt = p.adt(*a);
+            // A struct's fields, or each variant's; an enum without variants has no values.
+            let variants: Vec<Option<u32>> = if adt.is_enum() {
+                (0..adt.variants().len() as u32).map(Some).collect()
+            } else {
+                vec![None]
+            };
+            !variants.is_empty()
+                && variants
+                    .into_iter()
+                    .all(|v| p.fields_of(*a, args, v).into_iter().all(|ft| on_gpu_in(p, ft, known)))
         }
         _ => false,
-    }
+    };
+    known.insert(t, ok);
+    ok
 }
 
 /// Shared state while lowering every module of one program.
@@ -199,7 +241,15 @@ pub fn lower(checked: &Checked, roots: &Roots, emit: bool) -> (Lowered, Vec<Diag
     let mut cx = Cx { checked, emit, diags: Vec::new(), pipelines: Vec::new() };
     let mut cpu = ModuleBuilder::default();
     let mut has_frame = false;
+    for &f in &roots.also {
+        cx.instance(&mut cpu, InstanceKey::plain(f, Vec::new()), None);
+    }
     for &f in &roots.exports {
+        if !checked.program.fn_all_generics(f).is_empty() {
+            // Reported; it has no types to be lowered with.
+            cx.check_export(f);
+            continue;
+        }
         let key = InstanceKey::plain(f, Vec::new());
         let id = cx.instance(&mut cpu, key, None);
         let name = cx.checked.program.func(f).name.clone();
@@ -395,6 +445,14 @@ impl<'a> Cx<'a> {
             );
             return false;
         }
+        if !self.checked.program.fn_all_generics(f).is_empty() {
+            self.err(
+                Diagnostic::new(wrela_diag::codes::E0703, def.sig_span, format!("`{}` is exported, so it can't be generic: the host calls it with numbers, and can't choose its types", def.name))
+                    .with_note("the entry module's `pub fn`s are the program's exports, called by the host")
+                    .with_help("make it private (drop `pub`), and export a function that calls it with the types the host needs"),
+            );
+            return false;
+        }
         let mut ok = true;
         let exportable = |t: &TyKind, ret: bool| match t {
             TyKind::Bool | TyKind::Int(_) | TyKind::Float(_) => true,
@@ -425,18 +483,32 @@ impl<'a> Cx<'a> {
         let rk = self.checked.program.types.kind(def.ret);
         if !exportable(rk, true) || def.ret_mode != wrela_sema::defs::RetMode::Owned {
             ok = false;
-            let shown = self.checked.program.display_ty(def.ret);
-            self.err(
-                Diagnostic::new(wrela_diag::codes::E0703, def.sig_span, format!("`{}` is exported, so it returns a number, a vector or nothing, not `{shown}`", def.name))
-                    .with_help("make it private (drop `pub`) if the host doesn't call it"),
+            let mode = match def.ret_mode {
+                wrela_sema::defs::RetMode::Owned => "",
+                wrela_sema::defs::RetMode::Borrow => "borrow ",
+                wrela_sema::defs::RetMode::Mut => "mut ",
+            };
+            let shown = format!("{mode}{}", self.checked.program.display_ty(def.ret));
+            let mut d = Diagnostic::new(
+                wrela_diag::codes::E0703,
+                def.sig_span,
+                format!(
+                    "`{}` is exported, so it returns a number, a `bool`, a vector or nothing, not `{shown}`",
+                    def.name
+                ),
             );
+            if !mode.is_empty() {
+                d = d.with_note(
+                    "a projection points into the program's memory, which the host can't hold",
+                );
+            }
+            self.err(d.with_help("make it private (drop `pub`) if the host doesn't call it"));
         }
         ok
     }
 
     /// E0703 for a program that doesn't export `frame`, which every host calls: at a private
-    /// `frame`, else at the start of main.wrela (found through any item in it; a main.wrela with
-    /// no items has nothing to point at, and nothing to run either).
+    /// `frame`, else at the start of main.wrela.
     fn no_frame(&mut self) {
         let p = &self.checked.program;
         let Some(main) = p.main else { return };
@@ -445,21 +517,16 @@ impl<'a> Cx<'a> {
                 && f.owner == wrela_sema::defs::FnOwner::Free
                 && f.name == wrela_abi::EXPORT_FRAME
         });
-        let any = p.fns.iter().filter(|f| f.module == main).map(|f| f.span);
-        let any = any
-            .chain(p.adts.iter().filter(|a| a.module == main).map(|a| a.span))
-            .chain(p.consts.iter().filter(|c| c.module == main).map(|c| c.span))
-            .next();
-        let (span, help) = match (private, any) {
+        let main_file = p.main_file.map(|f| Span::new(f, 0, 0));
+        let (span, help) = match (private, main_file) {
             (Some(f), _) if !f.public => (f.name_span, "make it public: `pub fn frame`"),
             (Some(f), _) => (
                 f.name_span,
                 "the host calls it directly, so it can't be generic or a GPU entry point",
             ),
-            (None, Some(s)) => (
-                Span::new(s.file, 0, 0),
-                "add `pub fn frame(time: f32, width: u32, height: u32) {}` to main.wrela",
-            ),
+            (None, Some(s)) => {
+                (s, "add `pub fn frame(time: f32, width: u32, height: u32) {}` to main.wrela")
+            }
             (None, None) => return,
         };
         self.err(

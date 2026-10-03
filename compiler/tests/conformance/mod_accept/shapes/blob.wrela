@@ -9,3 +9,5 @@ pub fn blob(r: f32) -> Blob {
 fn helper(r: f32) -> f32 {
     r
 }
+
+pub const SIDES: i32 = 4

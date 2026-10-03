@@ -39,6 +39,16 @@ fn direct() {
     fill(1.0) //~ E0606
 }
 
+// `draw`'s own counts have these names: a shader's parameter of either can't be passed.
+@vertex
+fn counted(v: VertexIndex, instances: P) -> ClipPosition {
+    ClipPosition { position: vec4(instances.s, 0.0, 0.0, 1.0) }
+}
+
+fn draw_counted() {
+    draw(counted, fs, vertices: 3, instances: 1, p: P { s: 1.0 }) //~ E0603
+}
+
 // An entry point runs on the GPU; one passed as a function would run on the CPU.
 
 fn call_fs(f: fn(FragCoord, P) -> vec4) -> f32 {

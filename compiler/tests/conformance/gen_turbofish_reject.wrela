@@ -14,5 +14,24 @@ fn f(s: S) -> i32 {
     let z: i32 = y //~ E0300
     let w = s.make::<f32, f32, bool>(7) //~ E0322
     let n = s.k.abs::<f32>() //~ E0322
+    let t = Pick::<f32>::pick(s, true) //~ E0300
+    let u = Pick::<f32, f32>::pick(s, 1.0) //~ E0322
     z
+}
+
+trait Pick<T> {
+    fn pick(self, x: T) -> T
+}
+
+impl Pick<f32> for S {
+    fn pick(self, x: f32) -> f32 {
+        x
+    }
+}
+
+// Nothing takes these: a built-in function, a built-in type's conversion.
+fn builtins(x: f32) -> f32 {
+    let a = sqrt::<u32>(x) //~ E0322
+    let b = f32::<i32>(2) //~ E0322
+    a + b
 }

@@ -1,6 +1,8 @@
 """Static server for the repository, plus PUT into any `results/` directory so a page can save
-its own JSON and screenshots. Local use only: binds 127.0.0.1. Pages are served at their path
-relative to the repo root, cross-origin isolated (COOP/COEP), as the browser runtime needs."""
+its own JSON and screenshots. Local use only: binds 127.0.0.1, answers only requests addressed
+to this machine by name (a page elsewhere can't reach it through DNS rebinding), and serves
+nothing under `.git`. Pages are served at their path relative to the repo root,
+cross-origin isolated (COOP/COEP), as the browser runtime needs."""
 
 import http.server
 import os
@@ -31,6 +33,29 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         self.send_header("Cross-Origin-Resource-Policy", "same-origin")
         super().end_headers()
 
+    LOCAL_HOSTS = ("127.0.0.1", "localhost", "[::1]")
+
+    def refused(self):
+        """Refuses (and answers) a request for another host, or for anything under `.git`."""
+        host = (self.headers.get("Host") or "").lower()
+        port = self.server.server_address[1]
+        if host not in self.LOCAL_HOSTS and host not in [f"{h}:{port}" for h in self.LOCAL_HOSTS]:
+            self.send_error(403, "this server answers only requests for this machine")
+            return True
+        path = urllib.parse.unquote(self.path.split("?", 1)[0].split("#", 1)[0])
+        if ".git" in path.split("/"):
+            self.send_error(404, "the repository's history isn't served")
+            return True
+        return False
+
+    def do_GET(self):
+        if not self.refused():
+            super().do_GET()
+
+    def do_HEAD(self):
+        if not self.refused():
+            super().do_HEAD()
+
     def results_path(self):
         """The file a PUT may write, or None. Only a file directly inside a `results/` directory
         under the repo root; never through a symlink that leads out of the repo. The path is
@@ -48,6 +73,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         return dest
 
     def do_PUT(self):
+        if self.refused():
+            return
         dest = self.results_path()
         if dest is None:
             self.send_error(403, "PUT is only allowed into a results/ directory")

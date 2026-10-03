@@ -15,7 +15,8 @@
 import { SCREEN_FORMAT } from "./abi.gen.ts";
 import { errorMessage } from "./errors.ts";
 import type { BufferBinding, Manifest, Pipeline, UniformBlock } from "./manifest.ts";
-import type { Bytes, Command } from "./stream.ts";
+import { CommandError } from "./check.ts";
+import type { Bytes, Command, OpcodeName } from "./stream.ts";
 
 const RING_START = 64 * 1024;
 
@@ -246,14 +247,14 @@ export class GpuExecutor {
 
   /** Makes room for `bytes` more uniform bytes (counted aligned) in this submission, flushing
    * first or growing the ring if it must. Call before recording the work that uses them. */
-  #reserve(bytes: number): void {
+  #reserve(op: OpcodeName, bytes: number): void {
     if (alignTo(this.#staged, this.#align) + bytes <= this.#staging.length) return;
     this.flush();
     if (bytes > this.#staging.length) {
       let capacity = this.#staging.length * 2;
       while (capacity < bytes) capacity *= 2;
       if (capacity > this.device.limits.maxBufferSize) {
-        throw new Error(`${bytes} uniform bytes in one submission is over the limit`);
+        throw new CommandError(op, `${bytes} uniform bytes in one submission is over the limit`);
       }
       this.#ring.destroy(); // the flush above submitted the last work that used it
       this.#ring = this.#createRing(capacity);
@@ -303,7 +304,7 @@ export class GpuExecutor {
   #dispatch(index: number, groups: [number, number, number], buffers: number[], uniforms: Bytes): void {
     const p = this.#pipeline(index);
     if (p.compute === null) throw new Error(`host bug: pipeline ${index} isn't a compute pipeline`);
-    this.#reserve(alignTo(uniforms.length, this.#align));
+    this.#reserve("Dispatch", alignTo(uniforms.length, this.#align));
     const offsets = this.#push(uniforms);
     const bindGroup = this.#bindGroup(index, buffers);
     const pass = this.#encoderNow().beginComputePass({ label: p.name });
@@ -318,7 +319,13 @@ export class GpuExecutor {
     this.#pass = null;
     if (pass === null) throw new Error("host bug: Present without a screen pass");
     // Everything that can flush happens before anything is recorded for this pass.
-    this.#reserve(pass.draws.reduce((n, d) => n + alignTo(d.uniforms.length, this.#align), 0));
+    this.#reserve("Present", pass.draws.reduce((n, d) => n + alignTo(d.uniforms.length, this.#align), 0));
+    // And everything that can throw: a pass begun is ended.
+    const draws = pass.draws.map((d) => {
+      const p = this.#pipeline(d.pipeline);
+      if (p.render === null) throw new Error(`host bug: pipeline ${d.pipeline} isn't a render pipeline`);
+      return { draw: d, pipeline: p.render, group: this.#bindGroup(d.pipeline, d.buffers) };
+    });
     const [r, g, b, a] = pass.clear;
     const encoder = this.#encoderNow();
     const rp = encoder.beginRenderPass({
@@ -327,12 +334,10 @@ export class GpuExecutor {
         { view: this.screen.texture().createView(), clearValue: { r, g, b, a }, loadOp: "clear", storeOp: "store" },
       ],
     });
-    for (const d of pass.draws) {
-      const p = this.#pipeline(d.pipeline);
-      if (p.render === null) throw new Error(`host bug: pipeline ${d.pipeline} isn't a render pipeline`);
+    for (const { draw: d, pipeline, group } of draws) {
       const offsets = this.#push(d.uniforms);
-      rp.setPipeline(p.render);
-      rp.setBindGroup(0, this.#bindGroup(d.pipeline, d.buffers), offsets);
+      rp.setPipeline(pipeline);
+      rp.setBindGroup(0, group, offsets);
       rp.draw(d.vertices, d.instances);
     }
     rp.end();

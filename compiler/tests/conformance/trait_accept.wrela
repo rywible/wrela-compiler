@@ -35,3 +35,37 @@ impl Doubled for f32 {
 fn f(s: Square) -> f32 {
     s.double() + s.area().doubled()
 }
+
+// A parameter stands for one type: `(T, T)` is never `(i32, f32)`, nor `Mix<T> for T` the
+// same impl as `Mix<i32> for f32`.
+trait Pairish {
+    fn tag(self) -> u32
+}
+
+impl<T> Pairish for (T, T) {
+    fn tag(self) -> u32 {
+        1
+    }
+}
+
+impl Pairish for (i32, f32) {
+    fn tag(self) -> u32 {
+        2
+    }
+}
+
+trait Mix<U> {
+    fn mix(self) -> u32
+}
+
+impl<T> Mix<T> for T {
+    fn mix(self) -> u32 {
+        3
+    }
+}
+
+impl Mix<i32> for f32 {
+    fn mix(self) -> u32 {
+        4
+    }
+}

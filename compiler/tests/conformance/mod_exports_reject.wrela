@@ -12,3 +12,12 @@ pub fn pair(a: f32) -> [f32; 2] { //~ E0703
 }
 
 pub fn frame(time: f32, width: u32, height: u32) {}
+
+// The host can't choose a generic function's types, nor hold a projection.
+pub fn same<T: Copy>(x: T) -> T { //~ E0703
+    x
+}
+
+pub fn view(x: f32) -> borrow f32 { //~ E0703
+    x
+}

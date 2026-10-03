@@ -80,6 +80,15 @@ pub fn validate(module: &naga::Module) -> R<naga::valid::ModuleInfo> {
 
 /// The struct member that holds field `k` of a value of type `t`: for an enum, its tag, or the
 /// payload of variant `k - 1` among the variants that have one.
+/// How many elements an index into a value of type `t` can reach, when the type says.
+fn static_len(types: &ir::Types, t: ir::TypeId) -> Option<u32> {
+    match types.get(t) {
+        ir::TypeDef::Array(_, n) => Some(*n),
+        ir::TypeDef::Vector(n) | ir::TypeDef::Matrix(n) => Some(u32::from(*n)),
+        _ => None,
+    }
+}
+
 fn member(types: &ir::Types, t: ir::TypeId, k: u32) -> u32 {
     match types.get(t) {
         ir::TypeDef::Enum { variants, .. } if k > 0 => {
@@ -348,9 +357,16 @@ impl<'m> Cx<'m> {
             param_base: 0,
             inputs: Vec::new(),
             consts: HashSet::new(),
+            floats: HashMap::new(),
+            ints: HashMap::new(),
         };
         fb.signature()?;
-        let body = fb.block(&f.body)?;
+        let mut body = fb.block(&f.body)?;
+        // A body that ends in a trap (a loop left only by `return`) still ends in a return, as
+        // WGSL wants a function with a result to.
+        if let Some(ir::Stmt::Trap) = f.body.last() {
+            fb.return_zero(&mut body);
+        }
         drop(fb);
         func.body = body;
         Ok(func)
@@ -389,6 +405,10 @@ struct Fb<'a, 'm> {
     inputs: Vec<Option<u32>>,
     /// Values that are WGSL const-expressions.
     consts: HashSet<ir::ValueId>,
+    /// The scalar float constants among them, by value.
+    floats: HashMap<ir::ValueId, f32>,
+    /// The scalar integer constants among them, by value.
+    ints: HashMap<ir::ValueId, i64>,
 }
 
 impl<'a, 'm> Fb<'a, 'm> {
@@ -505,6 +525,30 @@ impl<'a, 'm> Fb<'a, 'm> {
         self.expr(Expression::Load { pointer }, out)
     }
 
+    /// An index into a value of `len` elements (`None`: not known here). WGSL rejects a
+    /// const-expression index it can see is out of range, so one not known to be in range goes
+    /// through a variable: at run time, robust access gives a value from inside (§11).
+    fn index(
+        &mut self,
+        i: ir::ValueId,
+        len: Option<u32>,
+        out: &mut Block,
+    ) -> R<Handle<Expression>> {
+        let h = self.val(i)?;
+        if !self.consts.contains(&i) {
+            return Ok(h);
+        }
+        let inside = match (self.ints.get(&i), len) {
+            (Some(&k), Some(n)) => (0..i64::from(n)).contains(&k),
+            _ => false,
+        };
+        if inside {
+            return Ok(h);
+        }
+        let ty = self.cx.ty(self.f.value_ty(i))?;
+        Ok(self.through_variable(h, ty, out))
+    }
+
     /// The operands of an operation. When every one is a const-expression, the first goes
     /// through a variable, so the operation isn't one.
     fn operands<const N: usize>(
@@ -578,7 +622,8 @@ impl<'a, 'm> Fb<'a, 'm> {
                     self.expr(Expression::AccessIndex { base: h, index: *c as u32 }, block)
                 }
                 ir::Proj::Index(v) => {
-                    let index = self.val(*v)?;
+                    let len = t.filter(|_| i >= skip).and_then(|t| static_len(&m.types, t));
+                    let index = self.index(*v, len, block)?;
                     self.expr(Expression::Access { base: h, index }, block)
                 }
             };
@@ -640,18 +685,25 @@ impl<'a, 'm> Fb<'a, 'm> {
                 out.push(Statement::Return { value }, Span::UNDEFINED);
             }
             ir::Stmt::At(_) => {}
-            ir::Stmt::Trap => {
-                // GPU code can't trap; an unreachable point returns a zero.
-                let value = self
-                    .func
-                    .result
-                    .as_ref()
-                    .map(|r| r.ty)
-                    .map(|t| self.expr(Expression::ZeroValue(t), out));
-                out.push(Statement::Return { value }, Span::UNDEFINED);
-            }
+            // GPU code can't trap (its integers wrap, and its indexing is robust), so a trap is a
+            // point valid code never reaches: an exhaustive `match`'s last test, the end of a
+            // loop left only by `return`. Returning there would be a return under control flow
+            // that varies between invocations, inlined into the entry point, after which WGSL
+            // forbids derivatives (`fwidth` after a sphere-tracing loop).
+            ir::Stmt::Trap => {}
         }
         Ok(())
+    }
+
+    /// `return` with a zero of the function's result, or a bare `return`.
+    fn return_zero(&mut self, out: &mut Block) {
+        let value = self
+            .func
+            .result
+            .as_ref()
+            .map(|r| r.ty)
+            .map(|t| self.expr(Expression::ZeroValue(t), out));
+        out.push(Statement::Return { value }, Span::UNDEFINED);
     }
 
     /// A vertex shader's return value, rebuilt as the output struct.
@@ -677,8 +729,10 @@ impl<'a, 'm> Fb<'a, 'm> {
         let t = self.f.value_ty(v);
         let types = &self.cx.m.types;
         Ok(match e {
-            ir::Expr::Const(ir::Const::F32(x)) if !x.is_finite() => {
-                // Not a WGSL literal: its bits, made a float when the shader runs.
+            ir::Expr::Const(ir::Const::F32(x)) if !x.is_finite() || x.abs() == f32::MAX => {
+                // Not a WGSL literal: its bits, made a float when the shader runs. So is
+                // ±f32::MAX: the writer prints its shortest decimal in full, 3402823500…0, which
+                // is above the largest f32, and Tint rejects it.
                 let bits = self.lit(Literal::U32(x.to_bits()), out);
                 let u = self.cx.ty_inner(TypeInner::Scalar(Scalar::U32));
                 let bits = self.through_variable(bits, u, out);
@@ -690,9 +744,18 @@ impl<'a, 'm> Fb<'a, 'm> {
             ir::Expr::Const(c) => {
                 let l = match c {
                     ir::Const::Bool(b) => Literal::Bool(*b),
-                    ir::Const::I32(x) => Literal::I32(*x),
-                    ir::Const::U32(x) => Literal::U32(*x),
-                    ir::Const::F32(x) => Literal::F32(*x),
+                    ir::Const::I32(x) => {
+                        self.ints.insert(v, (*x).into());
+                        Literal::I32(*x)
+                    }
+                    ir::Const::U32(x) => {
+                        self.ints.insert(v, (*x).into());
+                        Literal::U32(*x)
+                    }
+                    ir::Const::F32(x) => {
+                        self.floats.insert(v, *x);
+                        Literal::F32(*x)
+                    }
                     other => return Err(format!("internal: the constant {other:?} in GPU code")),
                 };
                 self.consts.insert(v);
@@ -806,7 +869,8 @@ impl<'a, 'm> Fb<'a, 'm> {
                 self.expr(Expression::Compose { ty, components }, out)
             }
             ir::Expr::ExtractDyn(x, i) => {
-                let [base, index] = self.operands([*x, *i], out)?;
+                let [base, _] = self.operands([*x, *i], out)?;
+                let index = self.index(*i, static_len(types, self.f.value_ty(*x)), out)?;
                 self.expr(Expression::Access { base, index }, out)
             }
             ir::Expr::Splat(x, n) => {
@@ -959,7 +1023,29 @@ impl<'a, 'm> Fb<'a, 'm> {
         out: &mut Block,
     ) -> R<Handle<Expression>> {
         use ir::Builtin as B;
-        let hs = self.operands_of(args, out)?;
+        let mut hs = self.operands_of(args, out)?;
+        // WGSL rejects constant bounds that are the wrong way round, even with a varying `x`
+        // (`clamp(x, 1.0, 0.0)`, `smoothstep(0.5, 0.5, x)`): then the upper one goes through a
+        // variable, and the call computes what the CPU's does.
+        let bounds = match b {
+            B::Clamp => Some((1, 2, false)),
+            B::Smoothstep => Some((0, 1, true)),
+            _ => None,
+        };
+        if let Some((l, h, strict)) = bounds
+            && self.consts.contains(&args[l])
+            && self.consts.contains(&args[h])
+        {
+            let wrong = match (self.floats.get(&args[l]), self.floats.get(&args[h])) {
+                (Some(lo), Some(hi)) => lo > hi || (strict && lo == hi),
+                // Constant vectors: their components aren't kept, so assume the worst.
+                _ => true,
+            };
+            if wrong {
+                let ty = self.cx.ty(self.f.value_ty(args[h]))?;
+                hs[h] = self.through_variable(hs[h], ty, out);
+            }
+        }
         let deriv = |axis| Expression::Derivative {
             axis,
             ctrl: naga::DerivativeControl::None,
@@ -1079,6 +1165,118 @@ mod tests {
         let wgsl = emit(&kernel("k")).expect("valid").text;
         assert!(wgsl.contains("@compute @workgroup_size(64, 1, 1)"), "{wgsl}");
         naga::front::wgsl::parse_str(&wgsl).expect("parses back");
+    }
+
+    /// Every float literal in the shader is a finite f32: ±f32::MAX (an interval's unbounded end
+    /// on the GPU) goes through its bits, as infinities do, since its shortest decimal printed in
+    /// full is above the largest f32, which Tint rejects.
+    #[test]
+    fn float_literals_are_in_range() {
+        let mut m = kernel("k");
+        let f = &mut m.functions[0];
+        let f32t = f.value_ty(ir::ValueId(2));
+        let mut stores = Vec::new();
+        for c in [f32::MAX, -f32::MAX, f32::INFINITY, 1.5] {
+            let v = f.new_value(f32t);
+            stores.push(ir::Stmt::Let(v, ir::Expr::Const(ir::Const::F32(c))));
+            stores.push(ir::Stmt::Store(
+                ir::Place {
+                    root: ir::PlaceRoot::Resource(ir::ResourceId(0)),
+                    path: vec![ir::Proj::Index(ir::ValueId(1))],
+                },
+                v,
+            ));
+        }
+        let at = f.body.len() - 1;
+        f.body.splice(at..at, stores);
+        let wgsl = emit(&m).expect("valid").text;
+        let mut literals = 0;
+        for word in wgsl.split(|c: char| !(c.is_ascii_alphanumeric() || c == '.')) {
+            let Some(n) = word.strip_suffix('f') else { continue };
+            let Ok(n) = n.parse::<f64>() else { continue };
+            literals += 1;
+            assert!(n.abs() <= f32::MAX as f64, "{word} is out of range:\n{wgsl}");
+        }
+        assert!(literals > 0, "{wgsl}");
+    }
+
+    /// A trap is a point valid code never reaches: in a branch it's nothing (a return there would
+    /// be one under control flow that may vary, after which WGSL forbids derivatives), and only
+    /// a body that ends in one returns there.
+    #[test]
+    fn traps_return_only_at_the_end() {
+        let mut m = kernel("k");
+        let bt = m.types.bool();
+        let f = &mut m.functions[0];
+        let c = f.new_value(bt);
+        let at = f.body.len() - 1;
+        f.body.splice(
+            at..at,
+            [
+                ir::Stmt::Let(c, ir::Expr::Binary(ir::BinOp::Lt, ir::ValueId(1), ir::ValueId(1))),
+                ir::Stmt::If { cond: c, then: vec![ir::Stmt::Trap], else_: Vec::new() },
+            ],
+        );
+        let wgsl = emit(&m).expect("valid").text;
+        assert_eq!(wgsl.matches("return").count(), 1, "{wgsl}");
+        // A body ending in a trap (its last statement) still ends in a return.
+        let f = &mut m.functions[0];
+        let last = f.body.len() - 1;
+        f.body[last] = ir::Stmt::Trap;
+        let wgsl = emit(&m).expect("valid").text;
+        assert!(wgsl.trim_end().trim_end_matches('}').trim_end().ends_with("return;"), "{wgsl}");
+    }
+
+    /// WGSL rejects constant bounds the wrong way round even when `x` varies (Tint does; naga
+    /// doesn't): `clamp(x, 1.0, 0.0)` and `smoothstep(0.5, 0.5, x)` pass one through a variable.
+    #[test]
+    fn wrong_way_constant_bounds_are_not_both_literals() {
+        let mut m = kernel("k");
+        let f = &mut m.functions[0];
+        let f32t = f.value_ty(ir::ValueId(2));
+        let mut stmts = Vec::new();
+        let c = |f: &mut ir::Function, x: f32, stmts: &mut Vec<ir::Stmt>| {
+            let v = f.new_value(f32t);
+            stmts.push(ir::Stmt::Let(v, ir::Expr::Const(ir::Const::F32(x))));
+            v
+        };
+        let (one, zero, half) =
+            (c(f, 1.0, &mut stmts), c(f, 0.0, &mut stmts), c(f, 0.5, &mut stmts));
+        let x = ir::ValueId(2);
+        for (b, args) in [
+            (ir::Builtin::Clamp, vec![x, one, zero]),
+            (ir::Builtin::Smoothstep, vec![half, half, x]),
+            (ir::Builtin::Clamp, vec![x, zero, one]),
+        ] {
+            let r = f.new_value(f32t);
+            stmts.push(ir::Stmt::Let(r, ir::Expr::Builtin(b, args)));
+            stmts.push(ir::Stmt::Store(
+                ir::Place {
+                    root: ir::PlaceRoot::Resource(ir::ResourceId(0)),
+                    path: vec![ir::Proj::Index(ir::ValueId(1))],
+                },
+                r,
+            ));
+        }
+        let at = f.body.len() - 1;
+        f.body.splice(at..at, stmts);
+        let wgsl = emit(&m).expect("valid").text;
+        let calls = |name: &str| -> Vec<Vec<String>> {
+            wgsl.match_indices(&format!("{name}("))
+                .map(|(i, _)| {
+                    let rest = &wgsl[i + name.len() + 1..];
+                    rest[..rest.find(')').expect("a call")].split(", ").map(String::from).collect()
+                })
+                .collect()
+        };
+        let literal = |a: &str| a.ends_with('f') && a.starts_with(|c: char| c.is_ascii_digit());
+        let clamps = calls("clamp");
+        assert_eq!(clamps.len(), 2, "{wgsl}");
+        // clamp(x, 1, 0) has a variable bound; clamp(x, 0, 1), the right way round, keeps both.
+        assert!(clamps.iter().any(|a| !(literal(&a[1]) && literal(&a[2]))), "{wgsl}");
+        assert!(clamps.iter().any(|a| literal(&a[1]) && literal(&a[2])), "{wgsl}");
+        let steps = calls("smoothstep");
+        assert!(steps.iter().all(|a| !(literal(&a[0]) && literal(&a[1]))), "{wgsl}");
     }
 
     /// The WGSL writer renames an entry point that's a WGSL builtin's name or ends in a digit;

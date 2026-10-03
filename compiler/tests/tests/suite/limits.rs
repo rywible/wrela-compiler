@@ -4,7 +4,8 @@
 //! `MAX_TYPE_SIZE`. Types that share parts are worked on once per part, so a short program
 //! can't make the compiler take exponential time; a value too large for memory traps when the
 //! function holding it is entered, as a stack overflow does. A large constant is stored once,
-//! however many functions read it.
+//! however many functions read it, and a function may have more `let`s than an engine has
+//! locals.
 
 use crate::package;
 use std::path::{Path, PathBuf};
@@ -28,16 +29,16 @@ fn returns(build: &Path, name: &str, want: i32) {
     assert_eq!(host.call_export(name, &[]).expect("call"), [Value::I32(want)]);
 }
 
-/// `pub fn f() -> i32 { ((...(1)...)) }` with the body's expression nested `n` deep.
+/// `pub fn f() -> i32 { ((...(1)...)) }`, nested `n` deep in all.
 fn parens(n: u32) -> String {
-    // The body's statement is one level; each parenthesis is another.
-    let k = n as usize - 1;
+    // The body's block is one level and its statement another; each parenthesis is one more.
+    let k = n as usize - 2;
     format!("pub fn f() -> i32 {{ {}1{} }}", "(".repeat(k), ")".repeat(k))
 }
 
 #[test]
 fn nesting_at_the_limit_builds_and_past_it_is_an_error() {
-    let (codes, build) = compile("nest-ok", &parens(MAX_NESTING - 1));
+    let (codes, build) = compile("nest-ok", &parens(MAX_NESTING));
     assert!(codes.is_empty(), "{codes:?}");
     returns(&build, "f", 1);
     let (codes, _) = compile("nest-over", &parens(MAX_NESTING + 1));
@@ -61,11 +62,11 @@ fn nesting_at_the_limit_builds_and_past_it_is_an_error() {
 
 #[test]
 fn depth_at_the_limit_builds_and_past_it_is_an_error() {
-    // A chain of `n` additions is `n` deep, under the body's one level.
+    // A chain of `n` additions is `n + 1` deep: its first operand is under all of them.
     let chain = |n: u32| format!("pub fn f() -> i32 {{ 0{} }}", " + 1".repeat(n as usize));
-    let (codes, build) = compile("depth-ok", &chain(MAX_EXPR_DEPTH - 2));
+    let (codes, build) = compile("depth-ok", &chain(MAX_EXPR_DEPTH - 1));
     assert!(codes.is_empty(), "{codes:?}");
-    returns(&build, "f", (MAX_EXPR_DEPTH - 2) as i32);
+    returns(&build, "f", (MAX_EXPR_DEPTH - 1) as i32);
     let (codes, _) = compile("depth-over", &chain(MAX_EXPR_DEPTH));
     assert_eq!(codes, ["E0112"]);
     let (codes, _) = compile("depth-far", &chain(20_000));
@@ -116,6 +117,23 @@ fn a_long_chain_of_plain_calls_builds() {
 }
 
 #[test]
+fn more_lets_than_an_engine_has_locals_load() {
+    // Engines take 50,000 locals in a function; each `let` lives only until its last use, and
+    // one in a loop until the loop ends, so their locals are used again.
+    // (Floats: wasmtime takes time quadratic in a function's branches, and each checked
+    // integer `+` is one.)
+    let mut src = String::from("pub fn lets() -> i32 {\n    var s = 0.0\n");
+    for i in 0..50_100 {
+        src.push_str(&format!("    let a{i} = s + 1.0\n    s = a{i}\n"));
+    }
+    src.push_str("    for i in 0..3 {\n        var k = 0\n        k = k + 1\n        s = s + f32(k)\n    }\n");
+    src.push_str("    i32(s)\n}\n");
+    let (codes, build) = compile("many_lets", &src);
+    assert!(codes.is_empty(), "{codes:?}");
+    returns(&build, "lets", 50_103);
+}
+
+#[test]
 fn a_table_is_stored_once() {
     // 100 functions read one 1024-entry table: one copy of its 4 KiB, not one per reader.
     let values: Vec<String> = (0..1024).map(|i| format!("{i}.5")).collect();
@@ -160,6 +178,126 @@ fn a_type_that_doubles_is_an_error_quickly() {
     src.push_str("    1\n}");
     let started = std::time::Instant::now();
     let (codes, _) = compile("doubling", &src);
+    assert_eq!(codes, ["E0329"]);
+    assert!(started.elapsed().as_secs() < 10, "took {:?}", started.elapsed());
+}
+
+#[test]
+fn moves_on_many_paths_check_quickly() {
+    // 1,000 values, each moved on its own branch: every join meets a long list of values that
+    // may have moved (once quadratic in it, and the blocks visited again and again).
+    let n = 1000;
+    let mut src = String::from(
+        "struct Log {\n    count: i32,\n}\n\nfn eat(l: Log) -> i32 {\n    l.count\n}\n\npub fn moves() -> i32 {\n    let c = 500\n    var t = 0\n",
+    );
+    for i in 0..n {
+        src.push_str(&format!("    let a{i} = Log {{ count: {i} }}\n"));
+    }
+    for i in 0..n {
+        src.push_str(&format!("    if c == {i} {{\n        t += eat(take a{i})\n    }}\n"));
+    }
+    src.push_str("    t\n}");
+    let started = std::time::Instant::now();
+    let (codes, build) = compile("many_moves", &src);
+    assert!(codes.is_empty(), "{codes:?}");
+    assert!(started.elapsed().as_secs() < 10, "took {:?}", started.elapsed());
+    returns(&build, "moves", 500);
+}
+
+#[test]
+fn many_temporaries_given_places_lower_quickly() {
+    // Each call borrows a temporary vector, which so gets a local, stored where the vector is
+    // made: that once searched the block from its start each time.
+    let n = 60_000;
+    let mut src = String::from(
+        "fn g(v: vec3) -> f32 {\n    v.x + v.y\n}\n\npub fn f() -> i32 {\n    var s = 0.0\n",
+    );
+    for i in 0..n {
+        src.push_str(&format!("    s += g(vec3(1.0, {}.0, 0.0))\n", i % 2));
+    }
+    src.push_str("    i32(s)\n}");
+    let started = std::time::Instant::now();
+    let (codes, _) = compile("many_spills", &src);
+    assert!(codes.is_empty(), "{codes:?}");
+    assert!(started.elapsed().as_secs() < 10, "took {:?}", started.elapsed());
+}
+
+#[test]
+fn matches_hard_to_check_are_checked_quickly() {
+    // `n` bools, an arm with each one `true` and one with it `false`: the first two cover
+    // everything, and the checks of the rest once took time exponential in `n`.
+    let n = 40;
+    let mut arms = String::new();
+    for i in 0..n {
+        for v in ["true", "false"] {
+            let mut pat = vec!["_"; n];
+            pat[i] = v;
+            arms.push_str(&format!("        ({}) => 1,\n", pat.join(", ")));
+        }
+    }
+    let params: Vec<String> = (0..n).map(|i| format!("b{i}: bool")).collect();
+    let args: Vec<String> = (0..n).map(|i| format!("b{i}")).collect();
+    let wide = format!(
+        "pub fn f({}) -> u32 {{\n    match ({}) {{\n{arms}    }}\n}}",
+        params.join(", "),
+        args.join(", ")
+    );
+    let started = std::time::Instant::now();
+    let (codes, _) = compile("wide_match", &wide);
+    assert!(codes.is_empty(), "{codes:?}");
+    // Deciding coverage is NP-complete: no two of 8 pigeons share one of 7 holes, and none is
+    // in no hole, can't be checked in bounded steps. It's an error until a `_` arm ends it.
+    let (pigeons, holes) = (8, 7);
+    let at = |p: usize, h: usize| p * holes + h;
+    let mut arms = String::new();
+    for p in 0..pigeons {
+        let mut pat = vec!["_"; pigeons * holes];
+        for h in 0..holes {
+            pat[at(p, h)] = "false";
+        }
+        arms.push_str(&format!("        ({}) => 1,\n", pat.join(", ")));
+    }
+    for h in 0..holes {
+        for a in 0..pigeons {
+            for b in a + 1..pigeons {
+                let mut pat = vec!["_"; pigeons * holes];
+                pat[at(a, h)] = "true";
+                pat[at(b, h)] = "true";
+                arms.push_str(&format!("        ({}) => 2,\n", pat.join(", ")));
+            }
+        }
+    }
+    let params: Vec<String> = (0..pigeons * holes).map(|i| format!("b{i}: bool")).collect();
+    let args: Vec<String> = (0..pigeons * holes).map(|i| format!("b{i}")).collect();
+    let hard = |last: &str| {
+        format!(
+            "pub fn f({}) -> u32 {{\n    match ({}) {{\n{arms}{last}    }}\n}}",
+            params.join(", "),
+            args.join(", ")
+        )
+    };
+    let (codes, _) = compile("hard_match", &hard(""));
+    assert_eq!(codes, ["E0309"]);
+    let (codes, _) = compile("hard_match_wild", &hard("        _ => 0,\n"));
+    assert!(codes.is_empty(), "{codes:?}");
+    assert!(started.elapsed().as_secs() < 10, "took {:?}", started.elapsed());
+}
+
+#[test]
+fn a_type_that_doubles_through_later_bindings_is_an_error_quickly() {
+    // The same doubling, with each variable's type bound after the value that holds it was
+    // checked (assigned in reverse): the bound is checked once the body's types are known.
+    let n = 40;
+    let mut src = String::from("pub fn f() -> i32 {\n");
+    for i in 0..=n {
+        src.push_str(&format!("    var a{i} = None\n"));
+    }
+    for i in (1..=n).rev() {
+        src.push_str(&format!("    a{i} = Some((a{}, a{}))\n", i - 1, i - 1));
+    }
+    src.push_str("    a0 = Some(1)\n    1\n}");
+    let started = std::time::Instant::now();
+    let (codes, _) = compile("doubling_later", &src);
     assert_eq!(codes, ["E0329"]);
     assert!(started.elapsed().as_secs() < 10, "took {:?}", started.elapsed());
 }

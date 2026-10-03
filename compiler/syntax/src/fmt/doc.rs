@@ -143,8 +143,10 @@ pub fn print(doc: &Doc, width: usize) -> String {
             Doc::Group(x, fit) => {
                 let m = match (fit, mode) {
                     (Fit::Never | Fit::Block, _) => Mode::Break,
-                    (Fit::IfNeeded | Fit::Alone, Mode::Flat) => Mode::Flat,
-                    (Fit::IfNeeded | Fit::Alone, Mode::Break) => {
+                    (Fit::IfNeeded, Mode::Flat) => Mode::Flat,
+                    // The groups around it measured it as broken, so it decides for itself,
+                    // in a flat one too (a one-line block in a call's arguments).
+                    (Fit::IfNeeded, Mode::Break) | (Fit::Alone, _) => {
                         let room = width as isize - p.col as isize;
                         if fits(x, &stack, room) { Mode::Flat } else { Mode::Break }
                     }

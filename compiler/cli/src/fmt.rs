@@ -11,6 +11,11 @@ use wrela_diag::{FileId, SourceMap};
 fn collect(path: &Path, out: &mut Vec<PathBuf>) -> bool {
     if !path.is_dir() {
         if path.extension().is_some_and(|x| x == "wrela") {
+            // A pipe or a device would block or never end when read.
+            if !path.is_file() {
+                eprintln!("error: `{}` isn't a regular file", path.display());
+                return false;
+            }
             out.push(path.to_path_buf());
         }
         return true;
@@ -29,7 +34,14 @@ fn collect(path: &Path, out: &mut Vec<PathBuf>) -> bool {
             }
         };
     }
-    let Ok(entries) = std::fs::read_dir(path) else { return true };
+    let entries = match std::fs::read_dir(path) {
+        Ok(e) => e,
+        Err(e) => {
+            // Its files can't be checked: that's no pass.
+            eprintln!("error: can't read `{}`: {e}", path.display());
+            return false;
+        }
+    };
     let mut entries: Vec<PathBuf> = entries.filter_map(Result::ok).map(|e| e.path()).collect();
     entries.sort();
     let mut ok = true;

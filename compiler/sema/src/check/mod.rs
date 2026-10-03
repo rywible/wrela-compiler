@@ -99,7 +99,7 @@ pub(crate) struct Checker<'p> {
     /// Integer literals to range-check once their types are known.
     int_literals: Vec<(TyId, u64, bool, Span)>,
     /// Float literals to range-check once their types are known.
-    float_literals: Vec<(TyId, f64, Span)>,
+    float_literals: Vec<(TyId, f64, f32, Span)>,
     /// Negations of integers whose type wasn't known yet: they must turn out signed.
     negated_ints: Vec<(TyId, Span)>,
     /// `base ** exp` types, to check once the base's type is known: an integer's exponent is
@@ -114,6 +114,9 @@ pub(crate) struct Checker<'p> {
     /// Operands of integer-only operators (`<<`, `&`, `!`, ...) whose literal type wasn't
     /// settled yet: they must not turn out floats.
     int_ops: Vec<(TyId, &'static str, Span)>,
+    /// Indexes whose literal type wasn't settled yet: a `u32` or an `i32` will do, so they're
+    /// checked once it is.
+    indexes: Vec<(TyId, Span)>,
     /// Pattern bindings declared before their types were known, and whether each binds into a
     /// place: their kinds are decided at the end ([`Checker::binding_kinds`]).
     pending_bindings: Vec<(LocalId, bool)>,
@@ -153,6 +156,7 @@ impl<'p> Checker<'p> {
             builtin_calls: Vec::new(),
             projections: Vec::new(),
             int_ops: Vec::new(),
+            indexes: Vec::new(),
             pending_bindings: Vec::new(),
             saw_syntax_error: false,
             too_large: false,
@@ -186,6 +190,11 @@ impl<'p> Checker<'p> {
     /// Unifies `a` and `b` if they fit, leaving no trace if they don't.
     pub(crate) fn try_unify(&mut self, a: TyId, b: TyId) -> bool {
         self.infer.try_unify(&self.p.types, a, b)
+    }
+
+    /// Whether `a` and `b` would unify, leaving no trace either way.
+    pub(crate) fn fits(&mut self, a: TyId, b: TyId) -> bool {
+        self.infer.fits(&self.p.types, a, b)
     }
 
     pub(crate) fn new_var(&mut self, kind: VarKind, span: Span) -> TyId {
@@ -233,7 +242,15 @@ impl<'p> Checker<'p> {
         let id = LocalId(self.locals.len() as u32);
         let closure = self.closure_stack.last().map(|c| c.id);
         let name = "_".into();
-        self.locals.push(LocalDecl { name, ty, kind, span, keyword: None, closure });
+        self.locals.push(LocalDecl {
+            name,
+            ty,
+            kind,
+            span,
+            keyword: None,
+            shorthand: false,
+            closure,
+        });
         id
     }
 
@@ -569,6 +586,11 @@ impl<'p> Checker<'p> {
                         s.span,
                         format!("a range's bounds must be integers, not `{shown}`"),
                     ));
+                } else {
+                    // Literal bounds may still become floats from a later use (`let c: f32 = b`):
+                    // checked again once the body's types settle.
+                    let op = if *inclusive { "..=" } else { ".." };
+                    self.int_ops.push((s.ty, op, s.span));
                 }
                 let var =
                     self.declare_binder(name, s.ty, LocalKind::Owned { mutable: false }, pat.span);
@@ -621,6 +643,21 @@ impl<'p> Checker<'p> {
         let mut e = place;
         while let ExprKind::Field(b, _) | ExprKind::Swizzle(b, _) | ExprKind::Index(b, _) = &e.kind
         {
+            // `v.xx` reads well, but written its two components are one place: one write would
+            // be lost, or two added.
+            if let ExprKind::Swizzle(_, cs) = &e.kind
+                && cs.iter().enumerate().any(|(i, c)| cs[..i].contains(c))
+            {
+                self.err(
+                    Diagnostic::new(
+                        codes::E0317,
+                        e.span,
+                        "a swizzle that names a component twice can't be written",
+                    )
+                    .with_help("write each component once"),
+                );
+                break;
+            }
             if matches!(e.kind, ExprKind::Field(..)) && self.is_global_id(b.ty) {
                 self.err(
                     Diagnostic::new(codes::E0601, e.span, "a `GlobalId` can't be changed")
@@ -639,13 +676,15 @@ impl<'p> Checker<'p> {
     }
 
     pub(crate) fn resolve_type(&mut self, t: &ast::TypeExpr) -> TyId {
-        crate::resolve::resolve_type(
+        let ty = crate::resolve::resolve_type(
             self.p,
             &mut self.diags,
             &self.scope,
             t,
             crate::resolve::TyPos::Normal,
-        )
+        );
+        adt_bounds(self.p, ty, t.span, &mut self.diags);
+        ty
     }
 
     pub(crate) fn obligation(&mut self, ty: TyId, trait_ref: TraitRef, span: Span, why: String) {
@@ -782,6 +821,67 @@ pub struct FnCheck {
 
 /// Checks one function's body. `body` is `None` when there's no body to check (a required
 /// trait method, or a std intrinsic).
+/// E0400 for each struct or enum in `ty` whose arguments don't have its generics' bounds
+/// (`S<i32>` where `struct S<T: Tr>`): no such type can exist, and its fields' types (`T::K`)
+/// can't be found. Arguments not inferred yet are left to the obligations of the code that
+/// builds the value ([`Checker::adt_args`]).
+pub(crate) fn adt_bounds(p: &Program, ty: TyId, span: Span, out: &mut Vec<Diagnostic>) {
+    let mut adts = Vec::new();
+    p.types.any(ty, &mut |k| {
+        if let TyKind::Adt(a, args) = k {
+            adts.push((*a, args.clone()));
+        }
+        false
+    });
+    for (a, args) in adts {
+        let adt = p.adt(a);
+        let subst = Subst::from_pairs(&adt.generics, &args);
+        for (&g, &arg) in adt.generics.iter().zip(&args) {
+            if p.types.has_vars(arg) {
+                continue;
+            }
+            let param = p.param(g);
+            for b in &param.bounds {
+                let r = b.subst(&p.types, &subst);
+                if r.args.iter().any(|&t| p.types.has_vars(t))
+                    || crate::traits::implements(p, arg, &r)
+                {
+                    continue;
+                }
+                let (t, tr) = (p.display_ty(arg), p.display_trait_ref(&r));
+                out.push(Diagnostic::new(
+                    codes::E0400,
+                    span,
+                    format!(
+                        "`{t}` doesn't implement `{tr}`, which `{}` in `{}` needs",
+                        param.name, adt.name
+                    ),
+                ));
+            }
+        }
+    }
+}
+
+/// [`adt_bounds`] for the types every signature, field and impl header names.
+pub fn check_declared_types(p: &Program) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    for f in &p.fns {
+        for ps in &f.params {
+            adt_bounds(p, ps.ty, ps.span, &mut out);
+        }
+        adt_bounds(p, f.ret, f.sig_span, &mut out);
+    }
+    for adt in &p.adts {
+        for field in adt.all_fields() {
+            adt_bounds(p, field.ty, field.span, &mut out);
+        }
+    }
+    for imp in &p.impls {
+        adt_bounds(p, imp.self_ty, imp.span, &mut out);
+    }
+    out
+}
+
 pub fn check_fn(p: &Program, consts: &ConstTypes, f: FnId) -> FnCheck {
     let def = p.func(f);
     let none = FnCheck { body: None, diags: Vec::new(), incomplete: false };
@@ -839,6 +939,7 @@ pub fn check_fn(p: &Program, consts: &ConstTypes, f: FnId) -> FnCheck {
     let incomplete = c.saw_syntax_error;
     let (body, mut diags) = zonk::finish(c, params, value, hidden);
     zonk::check_opaque(p, f, body.hidden_ret, &mut diags);
+    zonk::stray_markers(p, &body, def.ret_mode == RetMode::Mut, &mut diags);
     FnCheck { body: Some(body), diags, incomplete }
 }
 

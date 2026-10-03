@@ -1,0 +1,8 @@
+// rejects: mod.names mod.use
+use shapes::round
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+
+pub fn area() -> f32 {
+    round(2.0)
+}

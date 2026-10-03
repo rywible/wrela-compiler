@@ -1,17 +1,22 @@
 // run: derived intervals at their edges: NaN bounds, `tan` far out, signed zeros, integer
 // `abs` over a whole range, a named function of a vector, enums joined across a branch,
-// returns in a loop, recursion, and a callee that counts its calls
+// returns in a loop, many returns in a row, recursion, and a callee that counts its calls
 // expect: nan_corner() = true
 // expect: nan_log() = true
 // expect: tan_far() = true
 // expect: signed_zero_lo() = 0.0
 // expect: signed_zero_hi() = 1.0
 // expect: int_abs_lo() = -2147483648.0
+// expect: zero_base_pow() = true
+// expect: zero_base_square() = true
+// expect: zero_inverse_sqrt() = true
+// expect: smoothstep_overflow() = true
 // expect: named_vector() = true
 // expect: option_join() = true
 // expect: enum_join() = true
 // expect: enum_select() = true
 // expect: return_in_loop() = true
+// expect: many_returns() = true
 // expect: recursive() = true
 // expect: counted() = true
 use std::derive::{Box2, Interval, interval}
@@ -65,6 +70,44 @@ pub fn signed_zero_lo() -> f32 {
 
 pub fn signed_zero_hi() -> f32 {
     interval(sign_bit, Interval { lo: -0.5, hi: 0.5 }).hi
+}
+
+fn recip_ceil(t: f32) -> f32 {
+    pow(ceil(t), -1.0)
+}
+
+/// `ceil` of [-0.5, 1.5] reaches -0, 1 and 2: `pow(_, -1)` is -∞ at -0, 1 at 1 and 0.5 at 2, so
+/// a range from the ends alone ([-∞, 0.5]) would miss 1.
+pub fn zero_base_pow() -> bool {
+    let r = interval(recip_ceil, Interval { lo: -0.5, hi: 1.5 })
+    r.lo <= recip_ceil(-0.25) && r.hi >= recip_ceil(0.5)
+}
+
+/// A base that reaches 0 under an exponent that isn't negative keeps its tight range.
+pub fn zero_base_square() -> bool {
+    let r = interval(|t: f32| pow(max(t, 0.0), 2.0), Interval { lo: -1.0, hi: 1.0 })
+    r.lo >= -0.001 && r.lo <= 0.0 && r.hi >= 1.0 && r.hi <= 1.001
+}
+
+fn inv_root_ceil(t: f32) -> f32 {
+    inverse_sqrt(ceil(t))
+}
+
+/// 1 / sqrt(-0) is -∞: `ceil` of [-0.5, 0.5] reaches -0 as well as 1.
+pub fn zero_inverse_sqrt() -> bool {
+    let r = interval(inv_root_ceil, Interval { lo: -0.5, hi: 0.5 })
+    r.lo <= inv_root_ceil(-0.25) && r.hi >= inv_root_ceil(0.25)
+}
+
+fn far_edge(t: f32) -> f32 {
+    smoothstep(t, 2.0e38, 0.0)
+}
+
+/// Where e1 - e0 overflows, smoothstep isn't monotone in its edges (t is 0 at ∞): the corners
+/// alone would give an empty range here.
+pub fn smoothstep_overflow() -> bool {
+    let r = interval(far_edge, Interval { lo: -2.0e38, hi: -1.0e38 })
+    r.lo <= far_edge(-2.0e38) && r.hi >= far_edge(-1.0e38)
 }
 
 /// `abs` of a range of `i32`s that isn't one value is the whole range, without trapping on
@@ -157,6 +200,81 @@ fn early(x: f32) -> f32 {
 pub fn return_in_loop() -> bool {
     let r = interval(early, Interval { lo: 0.0, hi: 1.0 })
     r.lo <= 0.0 && r.hi >= 1.0 && r.hi < 1.01
+}
+
+/// 20 returns in a row, and a value from before them used after them: the code after the 16th
+/// starts again at the function's level, and `base` gets there through a local.
+fn steps(x: f32) -> f32 {
+    let base = x * 2.0
+    if x < 0.5 {
+        return 0.0
+    }
+    if x < 1.5 {
+        return 1.0
+    }
+    if x < 2.5 {
+        return 2.0
+    }
+    if x < 3.5 {
+        return 3.0
+    }
+    if x < 4.5 {
+        return 4.0
+    }
+    if x < 5.5 {
+        return 5.0
+    }
+    if x < 6.5 {
+        return 6.0
+    }
+    if x < 7.5 {
+        return 7.0
+    }
+    if x < 8.5 {
+        return 8.0
+    }
+    if x < 9.5 {
+        return 9.0
+    }
+    if x < 10.5 {
+        return 10.0
+    }
+    if x < 11.5 {
+        return 11.0
+    }
+    if x < 12.5 {
+        return 12.0
+    }
+    if x < 13.5 {
+        return 13.0
+    }
+    if x < 14.5 {
+        return 14.0
+    }
+    if x < 15.5 {
+        return 15.0
+    }
+    if x < 16.5 {
+        return 16.0
+    }
+    if x < 17.5 {
+        return 17.0
+    }
+    if x < 18.5 {
+        return 18.0
+    }
+    if x < 19.5 {
+        return 19.0
+    }
+    base
+}
+
+pub fn many_returns() -> bool {
+    let a = interval(steps, Interval { lo: 3.2, hi: 3.4 })
+    let b = interval(steps, Interval { lo: 15.2, hi: 17.4 })
+    let c = interval(steps, Interval { lo: 20.0, hi: 21.0 })
+    let c_ok = c.lo <= 40.0 && c.lo > 39.99 && c.hi >= 42.0 && c.hi < 42.01
+    a.lo == 3.0 && a.hi == 3.0 && b.lo == 15.0 && b.hi == 17.0 && c_ok
 }
 
 fn power(x: f32, n: u32) -> f32 {

@@ -159,6 +159,13 @@ export function decode(batch: Bytes): Command[] {
 export class Sequencer {
   #inPass = false;
 
+  /** A copy, to go back to when a command it passed is rejected after it. */
+  copy(): Sequencer {
+    const s = new Sequencer();
+    s.#inPass = this.#inPass;
+    return s;
+  }
+
   step(cmd: Command): void {
     const err = (why: string) => new StreamError("Sequence", `${cmd.op} out of sequence: ${why}`);
     switch (cmd.op) {

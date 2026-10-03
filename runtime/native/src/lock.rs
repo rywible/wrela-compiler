@@ -30,7 +30,9 @@ const POLL: Duration = Duration::from_millis(500);
 
 /// The lock file, shared with tools/headless.py, which picks it by the same rule: in `$TMPDIR`
 /// (macOS sets it to a per-user directory) when that's set, else in the home directory. Never
-/// in world-writable /tmp, where Python's `tempfile.gettempdir()` falls back to.
+/// in world-writable /tmp, where Python's `tempfile.gettempdir()` falls back to. So the runs
+/// that queue are those that see the same `$TMPDIR` (normally all of one user's); a run with
+/// another one, or another user's, takes a lock of its own.
 fn lock_path() -> PathBuf {
     lock_path_in(std::env::var_os("TMPDIR"), std::env::home_dir())
 }

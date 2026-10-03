@@ -49,6 +49,7 @@ pub fn build(p: &Program, consts: &Consts, f: FnId, body: &thir::Body) -> (Body,
             kind: LocalKind::User(d.kind),
             span: d.span,
             keyword: d.keyword,
+            shorthand: d.shorthand,
             closure: d.closure,
         })
         .collect();
@@ -58,6 +59,7 @@ pub fn build(p: &Program, consts: &Consts, f: FnId, body: &thir::Body) -> (Body,
         locals,
         diags: Vec::new(),
         fs: FnState::new(def.ret_mode, None, body.value.span),
+        chained: None,
     };
     let mut fns = vec![b.build_fn(&body.params, &body.value, def.ret_mode, None, body.value.span)];
     for (i, c) in body.closures.iter().enumerate() {
@@ -110,6 +112,9 @@ struct Builder<'a> {
     locals: Vec<LocalDecl>,
     diags: Vec<Diagnostic>,
     fs: FnState,
+    /// A call that is the base of a field, index or swizzle, or another call's receiver: a
+    /// `take` written before it needs parentheses (`(take b.finish()).n`).
+    chained: Option<Span>,
 }
 
 impl<'a> Builder<'a> {
@@ -199,6 +204,7 @@ impl<'a> Builder<'a> {
             kind,
             span,
             keyword: None,
+            shorthand: false,
             closure: self.fs.closure,
         });
         id
@@ -287,14 +293,14 @@ impl<'a> Builder<'a> {
         match &e.kind {
             ExprKind::Lit(l) => Some(constant(*l, e.ty, span)),
             ExprKind::Unary(UnOp::Neg, x)
-                if matches!(x.kind, ExprKind::Lit(Lit::Int(_) | Lit::Float(_))) =>
+                if matches!(x.kind, ExprKind::Lit(Lit::Int(_) | Lit::Float(..))) =>
             {
                 // A negative literal is one constant: `-2147483648` is an i32 as written, not
                 // the negation of a number too large for one.
                 let l = match x.kind {
                     ExprKind::Lit(Lit::Int(v)) if self.p.types.is_int(e.ty) => Lit::Int(-v),
-                    ExprKind::Lit(Lit::Int(v)) => Lit::Float(-(v as f64)),
-                    ExprKind::Lit(Lit::Float(f)) => Lit::Float(-f),
+                    ExprKind::Lit(Lit::Int(v)) => Lit::Float(-(v as f64), -(v as f32)),
+                    ExprKind::Lit(Lit::Float(d, f)) => Lit::Float(-d, -f),
                     _ => unreachable!("matched above"),
                 };
                 Some(constant(l, e.ty, span))
@@ -398,9 +404,13 @@ impl<'a> Builder<'a> {
             } else {
                 self.why_not_owned(place.local)
             };
-            Diagnostic::new(codes::E0502, span, format!("can't move `{what}` here: {why}"))
-                .with_note(format!("`{shown}` isn't `Copy`, so using it here would move it"))
-                .with_fix(format!("copy it: `{what}.clone()`"), span.shrink_to_end(), ".clone()")
+            let d = Diagnostic::new(codes::E0502, span, format!("can't move `{what}` here: {why}"))
+                .with_note(format!("`{shown}` isn't `Copy`, so using it here would move it"));
+            if traits::implements_builtin(self.p, ty, Lang::Clone) {
+                d.with_fix(format!("copy it: `{what}.clone()`"), span.shrink_to_end(), ".clone()")
+            } else {
+                d
+            }
         };
         self.diags.push(d);
     }
@@ -452,15 +462,15 @@ impl<'a> Builder<'a> {
         match &e.kind {
             ExprKind::Local(l) => Some(Place::local(*l)),
             ExprKind::Field(b, i) => {
-                let p = self.place(b)?;
+                let p = self.chained_place(b)?;
                 Some(p.with(Proj::Field(*i)))
             }
             ExprKind::Swizzle(b, comps) => {
-                let p = self.place(b)?;
+                let p = self.chained_place(b)?;
                 Some(self.swizzle(p, comps))
             }
             ExprKind::Index(b, i) => {
-                let p = self.place(b)?;
+                let p = self.chained_place(b)?;
                 if let (TyKind::Vec(_), ExprKind::Lit(Lit::Int(c))) =
                     (self.p.types.kind(b.ty), &i.kind)
                 {
@@ -478,6 +488,12 @@ impl<'a> Builder<'a> {
                 Some(self.operand_place(v))
             }
         }
+    }
+
+    /// [`Self::place`] of what a field, index or swizzle is taken of.
+    fn chained_place(&mut self, b: &thir::Expr) -> Option<Place> {
+        self.chained = matches!(b.kind, ExprKind::Call(_)).then_some(b.span);
+        self.place(b)
     }
 
     /// `p.xyz`: components of a vector place. A swizzle of a swizzle is one swizzle.
@@ -630,6 +646,7 @@ impl<'a> Builder<'a> {
 
     /// A call's arguments, evaluated in the order written, and its callee.
     fn call(&mut self, c: &thir::Call, e: &thir::Expr, receiver_taken: bool) -> Option<Call> {
+        let chained = self.chained.take() == Some(e.span);
         if c.receiver
             && c.modes.first() == Some(&Mode::Take)
             && !receiver_taken
@@ -639,10 +656,22 @@ impl<'a> Builder<'a> {
         {
             // A consuming method on a named place must be marked `take x.m()`.
             let what = self.receiver_text(recv);
+            let mut edits = vec![wrela_diag::Edit {
+                span: e.span.shrink_to_start(),
+                replacement: "take ".into(),
+            }];
+            if chained {
+                // `take` marks everything after it up to an operator: the call alone, here.
+                edits[0].replacement = "(take ".into();
+                edits.push(wrela_diag::Edit {
+                    span: e.span.shrink_to_end(),
+                    replacement: ")".into(),
+                });
+            }
             self.diags.push(
                 Diagnostic::new(codes::E0501, e.span, format!("this method takes `{what}`, so the call is written `take {what}...`"))
                     .with_note("a consuming method moves its receiver; moving out of a named place is marked (§6.2)")
-                    .with_fix("mark the move", e.span.shrink_to_start(), "take "),
+                    .with_fix_edits("mark the move", edits),
             );
         }
         let callee = c.callee.clone();
@@ -651,6 +680,9 @@ impl<'a> Builder<'a> {
             let a = &c.args[i];
             let mode = c.modes.get(i).copied().unwrap_or(Mode::Borrow);
             let is_recv = c.receiver && i == 0;
+            if is_recv && matches!(a.kind, ExprKind::Call(_)) {
+                self.chained = Some(a.span);
+            }
             let arg = match mode {
                 Mode::Take => {
                     let v = if is_recv && Self::is_named_place(a) {
@@ -919,9 +951,19 @@ impl<'a> Builder<'a> {
     }
 
     /// The scrutinee's place: its own if it's a named place, else a temporary.
+    /// Checks `place`'s indices where it's evaluated, if it has any ([`StatementKind::Check`]).
+    fn check_indices(&mut self, place: &Place, span: Span) {
+        if place.proj.iter().any(|p| matches!(p, Proj::Index(_))) {
+            self.push(StatementKind::Check(place.clone()), span);
+        }
+    }
+
     fn scrutinee(&mut self, s: &thir::Expr) -> Option<Place> {
         if Self::is_named_place(s) {
-            self.place(s)
+            // Its patterns may read nothing (`_`): its indices are checked anyway.
+            let p = self.place(s)?;
+            self.check_indices(&p, s.span);
+            Some(p)
         } else {
             let v = self.value(s, Want::Move)?;
             Some(self.operand_place(v))
@@ -1184,10 +1226,18 @@ impl<'a> Builder<'a> {
                     );
                 }
                 if !Self::is_named_place(inner) {
-                    self.diags.push(
-                        Diagnostic::new(codes::E0508, inner.span, "a projection must come from a `borrow` or `mut` parameter, and this is a temporary")
-                            .with_help("return an owned value instead: `-> T`"),
-                    );
+                    let d = if let ExprKind::Const(c) = inner.place_root().kind {
+                        let name = &self.p.const_(c).name;
+                        Diagnostic::new(codes::E0508, inner.span, format!("a projection must come from a `borrow` or `mut` parameter, and this is part of the constant `{name}`"))
+                            .with_note("a projection from a constant is tier 1: in tier 0 a constant is a value, not a place")
+                    } else {
+                        Diagnostic::new(
+                            codes::E0508,
+                            inner.span,
+                            "a projection must come from a `borrow` or `mut` parameter, and this is a temporary",
+                        )
+                    };
+                    self.diags.push(d.with_help("return an owned value instead: `-> T`"));
                     let _ = self.value(inner, Want::Read);
                     self.terminate(TerminatorKind::Unreachable, e.span);
                     return;
@@ -1220,8 +1270,10 @@ impl<'a> Builder<'a> {
             StmtKind::Assign { place, op, value } => self.assign(place, *op, value, s.span),
             StmtKind::Expr(e) => {
                 if Self::is_named_place(e) && !matches!(e.kind, ExprKind::Call(_)) {
-                    // A place on its own: evaluate its indices, read nothing.
-                    let _ = self.place(e);
+                    // A place on its own: evaluate and check its indices, read nothing.
+                    if let Some(p) = self.place(e) {
+                        self.check_indices(&p, e.span);
+                    }
                 } else {
                     let _ = self.value(e, Want::Read);
                 }
@@ -1310,6 +1362,7 @@ impl<'a> Builder<'a> {
                     self.value(init, Want::Move).map(|v| self.operand_place(v))
                 };
                 let Some(p) = p else { return };
+                self.check_indices(&p, init.span);
                 self.push(StatementKind::Live(l), span);
                 self.push(StatementKind::Bind { local: l, place: p, mutable }, init.span);
             }
@@ -1319,21 +1372,27 @@ impl<'a> Builder<'a> {
                 // `var` owns its value: from a temporary, `take place`, or `.clone()`.
                 let Some(p) = self.place(init) else { return };
                 let what = self.describe(&p);
-                self.diags.push(
-                    Diagnostic::new(
-                        codes::E0517,
-                        init.span,
-                        format!("`var` owns its value, so it can't share `{what}`"),
-                    )
-                    .with_help(format!(
+                let d = Diagnostic::new(
+                    codes::E0517,
+                    init.span,
+                    format!("`var` owns its value, so it can't share `{what}`"),
+                );
+                self.diags.push(if traits::implements_builtin(self.p, init.ty, Lang::Clone) {
+                    d.with_help(format!(
                         "move it with `take {what}`, or copy it with `{what}.clone()`"
                     ))
                     .with_fix(
                         format!("copy it: `{what}.clone()`"),
                         init.span.shrink_to_end(),
                         ".clone()",
-                    ),
-                );
+                    )
+                } else {
+                    d.with_fix(
+                        format!("move it: `take {what}`"),
+                        init.span.shrink_to_start(),
+                        "take ",
+                    )
+                });
                 let v = self.materialize(OperandKind::Copy(p), init.ty, init.span);
                 self.push(StatementKind::Live(l), span);
                 self.set(l, v, span);

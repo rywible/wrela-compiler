@@ -18,6 +18,8 @@
 // expect: by_let_vector() = 345.0
 // expect: in_closure() = 7
 // expect: closure_rebound() = 2
+// expect: taken_closure() = 7
+// expect: taken_fn() = 12
 
 fn apply(f: fn(i32) -> i32, x: i32) -> i32 {
     f(x)
@@ -173,4 +175,23 @@ pub fn closure_rebound() -> i32 {
     let c = |x: i32| x + 1
     let d = c
     d(1)
+}
+
+fn apply_take(f: take fn(i32), x: i32) {
+    f(x)
+}
+
+// A callable moved with `take` is still called: through a `take` parameter, and through a local
+// it was moved into.
+pub fn taken_closure() -> i32 {
+    var n = 0
+    let c = |x: i32| { n += x }
+    apply_take(take c, 7)
+    n
+}
+
+pub fn taken_fn() -> i32 {
+    let g = triple
+    let h = take g
+    h(4)
 }

@@ -37,6 +37,16 @@ fn store_op(s: ir::Scalar, offset: u32) -> I<'static> {
     }
 }
 
+/// Zero, of WASM type `t`.
+fn zero(t: ValType) -> I<'static> {
+    match t {
+        ValType::I64 => I::I64Const(0),
+        ValType::F32 => I::F32Const(0.0.into()),
+        ValType::F64 => I::F64Const(0.0.into()),
+        _ => I::I32Const(0),
+    }
+}
+
 /// A WASM constant of scalar type `s`.
 fn konst(s: ir::Scalar, v: f64) -> I<'static> {
     match s {
@@ -98,6 +108,10 @@ struct Fe<'m> {
     scratch: Vec<Vec<u32>>,
     /// The values whose locals are free after each statement (see [`releases`]).
     release: HashMap<*const ir::Stmt, Vec<ir::ValueId>>,
+    /// The scalar IR locals that get a local before each statement, and those whose local is
+    /// free after it (see [`live_ranges`]).
+    local_starts: HashMap<*const ir::Stmt, Vec<ir::LocalId>>,
+    local_ends: HashMap<*const ir::Stmt, Vec<ir::LocalId>>,
     value_slots: Vec<Option<u32>>,
     ir_locals: Vec<LocalRepr>,
     frame: u32,
@@ -154,6 +168,8 @@ pub(crate) fn emit_function(
         free: HashMap::new(),
         scratch: Vec::new(),
         release: HashMap::new(),
+        local_starts: HashMap::new(),
+        local_ends: HashMap::new(),
         value_slots: vec![None; f.values.len()],
         ir_locals: Vec::new(),
         frame: 0,
@@ -180,10 +196,16 @@ pub(crate) fn emit_function(
             let off = fe.slot(l.ty);
             fe.ir_locals.push(LocalRepr::Slot(off));
         } else {
-            let w = fe.new_local(repr(&m.types, l.ty));
-            fe.ir_locals.push(LocalRepr::Scalar(w));
+            // Its local comes with its live range.
+            fe.ir_locals.push(LocalRepr::Scalar(u32::MAX));
         }
     }
+    let scalar: Vec<bool> =
+        fe.ir_locals.iter().map(|r| matches!(r, LocalRepr::Scalar(_))).collect();
+    let mut ranges = Ranges { scalar: &scalar, total: vec![0; scalar.len()], ..Ranges::default() };
+    ir::visit::walk(&f.body, &mut |s| mentions(s, &mut |l| ranges.total[l.index()] += 1));
+    ranges.block(&f.body, false);
+    (fe.local_starts, fe.local_ends) = (ranges.starts, ranges.ends);
     for v in in_memory {
         fe.value_slots[v.index()] = Some(fe.slot(f.value_ty(v)));
     }
@@ -261,6 +283,66 @@ fn releases(b: &ir::Block, out: &mut HashMap<*const ir::Stmt, Vec<ir::ValueId>>)
     last.sort_unstable_by_key(|&(v, _)| v.0);
     for (v, i) in last {
         out.entry(std::ptr::from_ref(&b[i])).or_default().push(v);
+    }
+}
+
+/// The locals a statement mentions itself (not in its nested blocks), once per mention.
+fn mentions(s: &ir::Stmt, f: &mut impl FnMut(ir::LocalId)) {
+    s.for_each_place(&mut |p| {
+        if let Some(l) = p.root_local() {
+            f(l);
+        }
+    });
+}
+
+/// Where each scalar IR local lives: from the first to the last statement that mentions it, of
+/// the innermost block that holds all its mentions. In a loop, a local keeps its value from
+/// one iteration to the next, so a block in a loop gives way to the outermost loop's block.
+/// Engines limit a function to 50,000 locals, and each `let` is an IR local.
+#[derive(Default)]
+struct Ranges<'a> {
+    scalar: &'a [bool],
+    /// How many statements mention each local.
+    total: Vec<u32>,
+    starts: HashMap<*const ir::Stmt, Vec<ir::LocalId>>,
+    ends: HashMap<*const ir::Stmt, Vec<ir::LocalId>>,
+}
+
+impl Ranges<'_> {
+    /// Places the ranges that fall in `b`, and returns the mentions of the other locals in it.
+    fn block(&mut self, b: &ir::Block, in_loop: bool) -> HashMap<ir::LocalId, u32> {
+        // Each local mentioned: how often, and the first and last statements that do.
+        let mut seen: HashMap<ir::LocalId, (u32, usize, usize)> = HashMap::new();
+        for (i, s) in b.iter().enumerate() {
+            let mut add = |l: ir::LocalId, n: u32| {
+                let e = seen.entry(l).or_insert((0, i, i));
+                e.0 += n;
+                e.2 = i;
+            };
+            mentions(s, &mut |l| add(l, 1));
+            let looped = in_loop || matches!(s, ir::Stmt::Loop { .. });
+            for inner in s.blocks() {
+                for (l, n) in self.block(inner, looped) {
+                    add(l, n);
+                }
+            }
+        }
+        if in_loop {
+            return seen.into_iter().map(|(l, (n, ..))| (l, n)).collect();
+        }
+        let mut open = HashMap::new();
+        // In local order, so the build is the same every time.
+        let mut seen: Vec<_> = seen.into_iter().collect();
+        seen.sort_unstable_by_key(|(l, _)| l.0);
+        for (l, (n, first, last)) in seen {
+            if n < self.total[l.index()] {
+                open.insert(l, n);
+            } else if self.scalar[l.index()] {
+                self.starts.entry(std::ptr::from_ref(&b[first])).or_default().push(l);
+                self.ends.entry(std::ptr::from_ref(&b[last])).or_default().push(l);
+            }
+        }
+        open
     }
 }
 
@@ -603,6 +685,16 @@ impl<'m> Fe<'m> {
     /// Emits a statement: a `let`'s value gets a local first; afterwards, the statement's
     /// scratch locals, and those of the values it last uses, are free.
     fn stmt(&mut self, s: &ir::Stmt) -> R<()> {
+        for l in self.local_starts.remove(&std::ptr::from_ref(s)).unwrap_or_default() {
+            // A local used before holds an old value; the IR local starts at zero.
+            let t = repr(&self.m.types, self.f.locals[l.index()].ty);
+            let used = self.free.get(&t).is_some_and(|free| !free.is_empty());
+            let w = self.reuse_local(t);
+            if used {
+                self.ins.extend([zero(t), I::LocalSet(w)]);
+            }
+            self.ir_locals[l.index()] = LocalRepr::Scalar(w);
+        }
         if let ir::Stmt::Let(v, _) = s {
             let t = repr(&self.m.types, self.vty(*v));
             self.values[v.index()] = self.reuse_local(t);
@@ -614,6 +706,11 @@ impl<'m> Fe<'m> {
         }
         for v in self.release.remove(&std::ptr::from_ref(s)).unwrap_or_default() {
             self.free_local(self.values[v.index()]);
+        }
+        for l in self.local_ends.remove(&std::ptr::from_ref(s)).unwrap_or_default() {
+            if let LocalRepr::Scalar(w) = self.ir_locals[l.index()] {
+                self.free_local(w);
+            }
         }
         r
     }
@@ -963,6 +1060,7 @@ pub(crate) fn export_wrapper(
     f: ir::FuncId,
     index: u32,
     h: &Helpers,
+    stack_top: u32,
 ) -> R<(Vec<ValType>, Vec<ValType>, Function)> {
     const VEC: i32 = 16;
     let func = &m.functions[f.index()];
@@ -1009,8 +1107,25 @@ pub(crate) fn export_wrapper(
         locals.push(results[0]);
     }
     let result = n + 1;
+    // A call starts afresh even after one that trapped (a host may go on calling, as tests
+    // do): the shadow stack empty, and the batch the trap left unsubmitted dropped. The buffers
+    // it made, the host never saw; the ones it destroyed, the host still has, and this call's
+    // release destroys them.
+    let mut ins: Vec<I<'static>> = vec![
+        I::I32Const(stack_top as i32),
+        I::GlobalSet(globals::SP),
+        I::GlobalGet(globals::CMD_LEN),
+        I::If(BlockType::Empty),
+        I::I32Const(0),
+        I::GlobalSet(globals::CMD_LEN),
+        I::GlobalGet(globals::SUBMITTED_TO),
+        I::GlobalSet(globals::NEXT_HANDLE),
+        I::GlobalGet(globals::RELEASED_TO),
+        I::GlobalSet(globals::LIVE_FROM),
+        I::End,
+    ];
     // The previous call's buffers go first.
-    let mut ins: Vec<I<'static>> = vec![I::Call(h.release)];
+    ins.push(I::Call(h.release));
     for (at, s) in normalize {
         let fix = match s {
             ir::Scalar::U8 => vec![I::I32Const(0xFF), I::I32And],

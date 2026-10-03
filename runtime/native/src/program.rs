@@ -9,7 +9,7 @@ use std::sync::{Arc, LazyLock};
 use wasmtime::{
     Engine, Extern, ExternType, Func, Instance, Linker, Module, Store, TypedFunc, Val, ValType,
 };
-use wrela_abi::check::Checker;
+use wrela_abi::check::{Checker, CommandError};
 use wrela_abi::hash::StateHash;
 use wrela_abi::lines::{self, Lines};
 use wrela_abi::stream::{self, Command, Sequencer};
@@ -87,6 +87,9 @@ struct State<E> {
     failure: Option<Error>,
     /// Copies of the submitted batches, when recording.
     batches: Option<Vec<Vec<u8>>>,
+    /// The first error the executor gave: what it holds isn't known after it, so every later
+    /// command fails. (A command the sequencer or the checker rejects leaves no trace.)
+    failed: Option<String>,
 }
 
 impl<E: Executor> State<E> {
@@ -97,9 +100,22 @@ impl<E: Executor> State<E> {
             b.push(batch.to_vec());
         }
         for cmd in stream::decode(batch)? {
+            if let Some(first) = &self.failed {
+                return Err(Error::Command(CommandError {
+                    opcode: cmd.opcode(),
+                    why: format!("the host failed to carry out an earlier command ({first})"),
+                }));
+            }
+            let before = self.sequencer.clone();
             self.sequencer.step(&cmd)?;
-            self.checker.check(&cmd)?;
-            self.executor.execute(&cmd)?;
+            if let Err(e) = self.checker.check(&cmd) {
+                self.sequencer = before;
+                return Err(e.into());
+            }
+            if let Err(e) = self.executor.execute(&cmd) {
+                self.failed = Some(e.to_string());
+                return Err(e);
+            }
         }
         Ok(())
     }
@@ -212,6 +228,7 @@ impl<E: Executor> Program<E> {
             sequencer: Sequencer::new(),
             failure: None,
             batches: None,
+            failed: None,
         };
         let mut store = Store::new(&ENGINE, state);
         let instance = linker

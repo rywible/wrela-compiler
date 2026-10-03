@@ -50,7 +50,14 @@ pub fn render(map: &SourceMap, d: &Diagnostic) -> String {
             let prefix: String =
                 text.chars().take(start).map(|c| if c == '\t' { "    " } else { " " }).collect();
             let mark = if i == 0 { "^" } else { "-" };
-            let marks = mark.repeat(end - start);
+            // A tab is shown as four spaces, so it's four marks wide too.
+            let wide: usize = text
+                .chars()
+                .skip(start)
+                .take(end - start)
+                .map(|c| if c == '\t' { 4 } else { 1 })
+                .sum();
+            let marks = mark.repeat(wide.max(1));
             match &label.message {
                 Some(m) => {
                     let _ = writeln!(out, "{pad} | {prefix}{marks} {m}");
@@ -121,5 +128,15 @@ mod tests {
             text,
             "error[E0500]: `log` was moved\n --> main.wrela:2:5\n  |\n2 |     log.push(edit)\n  |     ^^^ used here after the move\n  = help: write `log.clone()`\n"
         );
+    }
+
+    #[test]
+    fn carets_cover_tabs_as_shown() {
+        // A tab is shown as four spaces: before the span, and inside it.
+        let mut map = SourceMap::new();
+        let f = map.add("main.wrela", "\ta +\tb\n");
+        let d = Diagnostic::new(codes::E0500, Span::new(f, 1, 6), "here");
+        let text = render(&map, &d);
+        assert!(text.contains("1 |     a +    b\n  |     ^^^^^^^^\n"), "{text}");
     }
 }

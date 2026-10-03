@@ -52,3 +52,14 @@ fn sin_settles_f64() -> f64 {
     let k: f64 = y
     k
 }
+
+// A range's literal bounds are checked again once a later use settles their type: `b` becomes
+// 3.5, and an inclusive range of floats would never reach its end.
+fn range_settles_float() -> f32 {
+    let a = 0
+    let b = 7 / 2
+    for i in a..=b { //~ E0305
+    }
+    let c: f32 = b
+    c
+}

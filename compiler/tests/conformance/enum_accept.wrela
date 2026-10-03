@@ -19,3 +19,44 @@ fn first(x: Option<f32>) -> f32 {
         Option::None => 0.0,
     }
 }
+
+// An enum without variants has no values: GPU code can't hold one, and asking isn't an error.
+enum Never {}
+
+trait Weighed {
+    fn weight(self) -> f32
+}
+
+impl Weighed for Never {
+    fn weight(self) -> f32 {
+        1.0
+    }
+}
+
+@gpu
+fn weigh<T: Weighed>(x: T) -> f32 {
+    x.weight()
+}
+
+// In an impl, `Self::Variant` names the enum's variants in patterns and literals too.
+enum Piece {
+    Round { r: f32 },
+    Flat,
+}
+
+impl Piece {
+    fn unit() -> Piece {
+        Self::Round { r: 1.0 }
+    }
+
+    fn size(self) -> f32 {
+        match self {
+            Self::Round { r } => r,
+            Self::Flat => 0.0,
+        }
+    }
+}
+
+fn unit_size() -> f32 {
+    Piece::unit().size()
+}

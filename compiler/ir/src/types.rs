@@ -101,6 +101,17 @@ impl Types {
         if let Some(&t) = self.map.get(&d) {
             return t;
         }
+        // A matrix's columns and a vector's components are types too: projecting one (`m[c]`,
+        // `v[i]`) looks them up.
+        match d {
+            TypeDef::Matrix(n) => {
+                self.intern(TypeDef::Vector(n));
+            }
+            TypeDef::Vector(_) => {
+                self.intern(TypeDef::Scalar(Scalar::F32));
+            }
+            _ => {}
+        }
         let t = TypeId(self.defs.len() as u32);
         let (layout, offsets) = crate::layout::compute(self, &d);
         self.layouts.push(layout);

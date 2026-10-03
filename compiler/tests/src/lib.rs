@@ -62,9 +62,10 @@ pub fn header<'a>(text: &'a str, key: &str) -> impl Iterator<Item = &'a str> {
         .filter_map(move |l| l.strip_prefix(prefix.as_str()).map(str::trim))
 }
 
-/// Applies every edit of the first fix of each diagnostic to `text` (all in one file). Edits
-/// that overlap an earlier one are skipped. Used by tests that check a fix removes its
-/// diagnostic.
+/// Applies every edit of the first fix of each diagnostic to `text` (all in one file). An edit
+/// the same as the one before it (two diagnostics suggesting it) is made once; edits that
+/// overlap otherwise can't both be made, so that's a test failure. Used by tests that check a
+/// fix removes its diagnostic.
 pub fn apply_fixes(text: &str, file: FileId, diags: &[Diagnostic]) -> String {
     let mut edits: Vec<&Edit> = diags
         .iter()
@@ -73,13 +74,12 @@ pub fn apply_fixes(text: &str, file: FileId, diags: &[Diagnostic]) -> String {
         .filter(|e| e.span.file == file)
         .collect();
     edits.sort_by_key(|e| (e.span.start, e.span.end));
+    edits.dedup_by(|a, b| a.span == b.span && a.replacement == b.replacement);
     let mut out = String::with_capacity(text.len());
     let mut pos = 0usize;
     for e in edits {
         let (s, t) = (e.span.start as usize, e.span.end as usize);
-        if s < pos {
-            continue;
-        }
+        assert!(s >= pos, "fixes overlap at {s}..{t}: they can't both be made");
         out.push_str(&text[pos..s]);
         out.push_str(&e.replacement);
         pos = t;

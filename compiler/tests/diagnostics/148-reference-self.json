@@ -1,0 +1,40 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0106",
+      "file": "main.wrela",
+      "fixes": [
+        {
+          "edits": [
+            {
+              "end": 135,
+              "file": "main.wrela",
+              "replacement": "",
+              "start": 134
+            }
+          ],
+          "message": "remove the `&`"
+        }
+      ],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "`&` isn't a type in wrela",
+      "notes": [
+        "a method borrows `self` by default, and takes `mut self` to change it"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 15,
+        "end": 135,
+        "end_column": 16,
+        "end_line": 9,
+        "line": 9,
+        "start": 134
+      },
+      "title": "`&` isn't a type or an operator on places"
+    }
+  ],
+  "version": 2
+}

@@ -1,7 +1,13 @@
 // rejects: gpu.workgroup
-use std::gpu::{GlobalId, Slots}
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch}
 
 @compute(512) //~ E0605
 fn big(out: mut Slots<u32>, id: GlobalId) {
     out[id] = id.x
+}
+
+// The kernel is still one: its dispatch isn't an error too.
+fn run() {
+    let out: GpuBuffer<u32> = buffer(64)
+    dispatch(big, groups: 1, out: out)
 }

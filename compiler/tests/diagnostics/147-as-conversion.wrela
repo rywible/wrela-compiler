@@ -1,0 +1,7 @@
+// mistake: converting with `as`, which wrela doesn't have
+// expect: E0104
+// fix: no
+pub fn wide(n: i32) -> i32 {
+    let x = n as i64
+    x
+}

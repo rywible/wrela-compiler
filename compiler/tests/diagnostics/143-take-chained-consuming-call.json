@@ -1,0 +1,46 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0501",
+      "file": "main.wrela",
+      "fixes": [
+        {
+          "edits": [
+            {
+              "end": 341,
+              "file": "main.wrela",
+              "replacement": "(take ",
+              "start": 341
+            },
+            {
+              "end": 351,
+              "file": "main.wrela",
+              "replacement": ")",
+              "start": 351
+            }
+          ],
+          "message": "mark the move"
+        }
+      ],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "this method takes `b`, so the call is written `take b...`",
+      "notes": [
+        "a consuming method moves its receiver; moving out of a named place is marked (§6.2)"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 5,
+        "end": 351,
+        "end_column": 15,
+        "end_line": 20,
+        "line": 20,
+        "start": 341
+      },
+      "title": "a move out of a named place without `take`"
+    }
+  ],
+  "version": 2
+}

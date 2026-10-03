@@ -1,0 +1,31 @@
+// run: a call after one that trapped starts afresh: its shadow stack is empty, and the commands
+// the trapped call didn't submit are gone
+// expect: deep_call(3) = 4.0
+// expect: deep_call(300) traps
+// expect: deep_call(3) = 4.0
+// expect: made_then_trapped(0) traps
+// expect: made_after() = 1
+use std::gpu::{GpuBuffer, buffer}
+
+/// Each level takes 64 KiB of the shadow stack: 300 levels are more than it has.
+fn deep(n: u32) -> f32 {
+    let big = [1.0; 16384]
+    if n == 0 {
+        return big[0]
+    }
+    deep(n - 1) + big[n % 16384]
+}
+
+pub fn deep_call(n: u32) -> f32 {
+    deep(n)
+}
+
+pub fn made_then_trapped(x: i32) -> i32 {
+    let b: GpuBuffer<f32> = buffer(4)
+    100 / x
+}
+
+pub fn made_after() -> i32 {
+    let c: GpuBuffer<f32> = buffer(2)
+    1
+}

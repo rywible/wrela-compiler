@@ -116,6 +116,12 @@ pub(crate) enum ParamClass {
 /// fragment shader may take.
 fn classify(cx: &Cx, f: FnId, param: usize, ty: TyId, varyings: Option<TyId>) -> ParamClass {
     let p = &cx.checked.program;
+    // A parameter of a generic type is the caller's data whatever the type is, as the checker
+    // decided from the declaration: `k<T>(x: T)` given a `LocalId` for `x` takes that value, not
+    // the invocation's id.
+    if let TyKind::Param(_) = p.types.kind(p.func(f).params[param].ty) {
+        return ParamClass::Uniform;
+    }
     if let Some(b) = BuiltinInput::of(p, ty) {
         return ParamClass::Builtin(match b {
             BuiltinInput::GlobalId => ir::BuiltinInput::GlobalInvocationId,
@@ -392,7 +398,10 @@ pub(crate) fn intrinsic(
     }
     match lang {
         Some(Lang::Buffer) => {
-            let elem = fl.cx.lower_ty(fl.mb, substs[0], span)?;
+            let Some(elem) = fl.cx.lower_ty(fl.mb, substs[0], span) else {
+                fl.cx.holds_nothing("GPU buffer", substs[0], span);
+                return None;
+            };
             let elem_size = ir::layout::array_stride(&fl.mb.m.types, elem);
             let count = fl.arg_value(&c.args[0])?;
             let u = fl.mb.m.types.u32();
@@ -475,6 +484,11 @@ fn call_chain(fl: &Fl) -> Vec<String> {
 
 /// E0607 for a derivative outside a fragment shader. In one, where it is (`v`), for E0608.
 pub(crate) fn check_derivative(fl: &mut Fl, v: Option<ir::ValueId>, span: Span) {
+    // A `@gpu` function checked on its own has no stage: its callers' decide, and each
+    // pipeline that calls it checks it there.
+    if fl.is_gpu() && fl.mb.gpu.as_ref().is_some_and(|g| g.stage.is_none()) {
+        return;
+    }
     let ok = fl.is_gpu() && fl.mb.gpu.as_ref().is_some_and(|g| g.stage == Some(Entry::Fragment));
     if ok && let Some(v) = v {
         fl.mb.derivatives.insert((fl.id, v), span);
@@ -613,7 +627,10 @@ fn entry_module(cx: &mut Cx, iface: Rc<Interface>, stage: Entry) -> EntryModule 
         let entry = &iface.entries[e];
         let ParamClass::Buffer { elem, read_write } = entry.params[i].1 else { continue };
         let param = &program.func(entry.func).params[i];
-        let Some(ty) = cx.lower_ty(&mut mb, elem, param.span) else { continue };
+        let Some(ty) = cx.lower_ty(&mut mb, elem, param.span) else {
+            cx.holds_nothing("buffer", elem, param.span);
+            continue;
+        };
         let binding = 1 + buffers.len() as u32;
         let kind = if read_write {
             ir::ResourceKind::StorageReadWrite
@@ -863,6 +880,18 @@ fn varying_layout(
     for ((k, ft), decl) in cx.field_map(mb, vret, None, span).into_iter().zip(decls) {
         let Some(k) = k else { continue };
         if is_clip_position(cx, ft) {
+            if position.is_some() {
+                // A generic field made a `ClipPosition` (the checker counts the declared ones).
+                cx.err(
+                    Diagnostic::new(
+                        codes::E0602,
+                        decl.span,
+                        format!("`{}` is a second `ClipPosition` in the vertex output", decl.name),
+                    )
+                    .with_help("a vertex shader returns one `ClipPosition`, and the values to pass to the fragment shader"),
+                );
+                return None;
+            }
             position = Some(k);
         } else if !wrela_sema::gpu::is_varying(p, ft) {
             cx.err(wrela_sema::gpu::not_varying(p, &decl.name, ft, decl.span));

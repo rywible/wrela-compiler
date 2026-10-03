@@ -885,18 +885,15 @@ impl<'a> Builder<'a> {
             && !self.spans_lines(b.span)
             && !self.has_comment_before(b.span.end)
         {
-            let saved = (self.next, self.at);
             let open = self.tok("{");
             let s = self.stmt(&b.stmts[0]);
+            let close = self.tok("}");
             if !s.has_hard_line() {
-                return alone(concat([
-                    open,
-                    indent(concat([Doc::Line, s])),
-                    Doc::Line,
-                    self.tok("}"),
-                ]));
+                return alone(concat([open, indent(concat([Doc::Line, s])), Doc::Line, close]));
             }
-            (self.next, self.at) = saved;
+            // What `members` makes of it, with no comments to place, without formatting the
+            // statement again (for blocks nested on one line, that doubles at each level).
+            return block(concat([open, indent(concat([Doc::HardLine, s])), Doc::HardLine, close]));
         }
         self.members(&b.stmts, |s| s.span, b.span.end, Self::stmt)
     }

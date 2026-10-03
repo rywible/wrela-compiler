@@ -1,0 +1,25 @@
+// rejects: gpu.entry
+// A generic field made a `ClipPosition` is a second one: a vertex shader returns one.
+use std::gpu::{ClipPosition, FragCoord, VertexIndex, begin_screen_pass, draw, present}
+
+struct Out<T> {
+    pos: ClipPosition,
+    extra: T, //~ E0602
+}
+
+@vertex
+fn cover(v: VertexIndex) -> Out<ClipPosition> {
+    let p = ClipPosition { position: vec4(0.0, 0.0, 0.0, 1.0) }
+    Out { pos: p, extra: p }
+}
+
+@fragment
+fn paint(o: Out<ClipPosition>) -> vec4 {
+    vec4(1.0)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    begin_screen_pass(clear: vec4(0.0, 0.0, 0.0, 1.0))
+    draw(cover, paint, vertices: 3)
+    present()
+}

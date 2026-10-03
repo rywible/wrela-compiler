@@ -246,7 +246,7 @@ fn checks_dispatches() {
     }));
     assert_eq!(
         (op, why.as_str()),
-        (Opcode::Dispatch, "there's no pipeline 7 (the manifest has 4)")
+        (Opcode::Dispatch, "there's no pipeline 7 (the manifest has 5)")
     );
     let (_, why) = command_err(with_buffers(|e| {
         e.dispatch(0, [1; 3], &[1, 2], &U16);
@@ -330,6 +330,59 @@ fn checks_writable_aliases_and_clear_colours() {
         let (_, why) = command_err(Encoder::new().begin_screen_pass(clear).present().finish());
         assert_eq!(why, format!("the clear colour's {part} isn't a finite number"));
     }
+}
+
+#[test]
+fn a_rejected_command_leaves_no_trace() {
+    // The sequencer passes a `BeginScreenPass` the checker then rejects: no pass is open
+    // after it. (The frame traps before it ends, so the next one sends the same batch: it's
+    // rejected the same way, not as a second pass.)
+    let nan = Encoder::new().begin_screen_pass([f32::NAN, 0.0, 0.0, 1.0]).finish();
+    let mut program = load_wat(&wat_gen::program(&[vec![nan]])).expect("loads");
+    for i in 0..2 {
+        let e = program.frame(i as f32 / 60.0, 64, 64).expect_err("the clear colour is rejected");
+        assert!(matches!(e, Error::Command(_)), "{e}");
+    }
+    assert!(program.executor().log.is_empty(), "{:?}", program.executor().log);
+}
+
+/// Fails to carry out the first `Present`.
+#[derive(Default)]
+struct FailsOnce {
+    failed: bool,
+    log: Vec<&'static str>,
+}
+
+impl Executor for FailsOnce {
+    fn execute(&mut self, cmd: &Command<'_>) -> Result<()> {
+        if cmd.opcode() == Opcode::Present && !std::mem::replace(&mut self.failed, true) {
+            return Err(Error::Gpu("lost".into()));
+        }
+        self.log.push(cmd.opcode().name());
+        Ok(())
+    }
+
+    fn end_frame(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn nothing_runs_after_the_host_fails_a_command() {
+    // What the executor holds after it fails isn't known: every later command fails.
+    let pass = Encoder::new().begin_screen_pass([0.0; 4]).present().finish();
+    let wasm = wat::parse_str(wat_gen::program(&[vec![pass.clone()], vec![pass]])).expect("WAT");
+    let mut program =
+        Program::instantiate(&compile(&wasm).expect("compiles"), &manifest(), FailsOnce::default())
+            .expect("instantiates");
+    let first = program.frame(0.0, 64, 64).expect_err("the host fails");
+    assert!(matches!(first, Error::Gpu(_)), "{first}");
+    let next = program.frame(1.0 / 60.0, 64, 64).expect_err("the host failed before");
+    assert!(
+        matches!(&next, Error::Command(CommandError { why, .. }) if why.contains("failed to carry out an earlier command")),
+        "{next}"
+    );
+    assert_eq!(program.executor().log, ["BeginScreenPass"]);
 }
 
 #[test]

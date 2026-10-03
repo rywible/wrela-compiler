@@ -5,3 +5,5 @@ pub fn blob(r: f32) -> f32 {
 fn helper(r: f32) -> f32 {
     r
 }
+
+const SIDES: u32 = 4

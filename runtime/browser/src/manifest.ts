@@ -151,6 +151,22 @@ function pipeline(v: unknown, i: number): Pipeline {
   };
 }
 
+/** How deep serde_json, and so the native host, nests arrays and objects. */
+const MAX_NESTING = 127;
+
+/** How deep arrays and objects nest in a parsed JSON value. */
+function nesting(v: unknown): number {
+  let deepest = 0;
+  const stack: [unknown, number][] = [[v, 0]];
+  while (stack.length > 0) {
+    const [x, d] = stack.pop()!;
+    if (x === null || typeof x !== "object") continue;
+    deepest = Math.max(deepest, d + 1);
+    for (const y of Object.values(x)) stack.push([y, d + 1]);
+  }
+  return deepest;
+}
+
 /** Parses and validates a manifest; any other version is rejected. */
 export function parseManifest(json: string): Manifest {
   let v: unknown;
@@ -160,8 +176,14 @@ export function parseManifest(json: string): Manifest {
       if (LONE_SURROGATE.test(key) || (typeof value === "string" && LONE_SURROGATE.test(value))) {
         throw new Error("a string has a lone surrogate");
       }
+      // serde_json rejects a number past f64's range (`1e400`); JSON.parse makes it infinite.
+      if (typeof value === "number" && !Number.isFinite(value)) {
+        throw new Error("a number is out of range");
+      }
       return value;
     });
+    // serde_json reads arrays and objects nested at most 127 deep.
+    if (nesting(v) > MAX_NESTING) throw new Error(`arrays and objects nest more than ${MAX_NESTING} deep`);
   } catch (e) {
     throw new ManifestError(errorMessage(e));
   }
@@ -187,6 +209,12 @@ export function parseManifest(json: string): Manifest {
   return m;
 }
 
+/** Whether a file the manifest names is one in the build directory, as both hosts read it (the
+ * ABI's `plain_file_name`): letters, digits, `_`, `-` and `.`, not starting with `.`. */
+export function plainFileName(name: string): boolean {
+  return /^[A-Za-z0-9_.-]+$/.test(name) && !name.startsWith(".");
+}
+
 export function validateManifest(m: Manifest): void {
   const err = (why: string) => new ManifestError(why);
   if (m.manifest_version !== MANIFEST_VERSION) {
@@ -196,8 +224,12 @@ export function validateManifest(m: Manifest): void {
     throw err(`command stream version ${m.stream_version}, but this host reads ${STREAM_VERSION}`);
   }
   if (m.wasm === "") throw err("no WASM file");
+  if (!plainFileName(m.wasm)) throw err("the WASM file's name isn't a file name in the build directory");
   m.pipelines.forEach((p, i) => {
     if (p.shader === "") throw err(`pipeline ${i} has no shader`);
+    if (!plainFileName(p.shader)) {
+      throw err(`pipeline ${i}'s shader name isn't a file name in the build directory`);
+    }
     const bindings = p.buffers.map((b) => b.binding);
     const u = p.uniform;
     if (u !== null) {

@@ -109,28 +109,32 @@ pub fn round_cone(a: vec3, b: vec3, r_top: f32, r_bottom: f32) -> RoundCone {
 impl Surface for RoundCone {
     fn distance(self, p: vec3) -> f32 {
         let ba = self.b - self.a
-        let l2 = dot(ba, ba)
+        let l = length(ba)
         let rr = self.r1 - self.r2
-        let a2 = l2 - rr * rr
-        let il2 = 1.0 / l2
-        let pa = p - self.a
-        let y = dot(pa, ba)
-        let z = y - l2
-        let xv = pa * l2 - ba * y
-        let x2 = dot(xv, xv)
-        let y2 = y * y * l2
-        let z2 = z * z * l2
-        let k = sign(rr) * rr * rr * x2
-        // a2 <= 0 where |r1 - r2| >= |b - a| (a == b too): one sphere holds the other, and the
-        // hull is the larger one.
-        if a2 <= 0.0 {
+        // Where |r1 - r2| >= |b - a| (a == b too), one sphere holds the other, and the hull is
+        // the larger one.
+        if l <= abs(rr) {
             length(p - select(self.b, self.a, rr >= 0.0)) - max(self.r1, self.r2)
-        } else if sign(z) * a2 * z2 > k {
-            sqrt(x2 + z2) * il2 - self.r2
-        } else if sign(y) * a2 * y2 < k {
-            sqrt(x2 + y2) * il2 - self.r1
         } else {
-            (sqrt(x2 * a2 * il2) + y * rr) * il2 - self.r1
+            // Inigo Quilez's round cone, written with the axis's direction u and q, the radii's
+            // difference per unit of length: each term is about |p - a|². (The usual form's
+            // terms grow as |b - a|⁶, and leave f32's range for ends closer than about 10⁻⁷.)
+            let u = ba / l
+            let q = rr / l
+            let a2 = 1.0 - q * q
+            let pa = p - self.a
+            let y = dot(pa, u)
+            let z = y - l
+            let xv = pa - u * y
+            let x2 = dot(xv, xv)
+            let k = sign(q) * q * q * x2
+            if sign(z) * a2 * z * z > k {
+                sqrt(x2 + z * z) - self.r2
+            } else if sign(y) * a2 * y * y < k {
+                sqrt(x2 + y * y) - self.r1
+            } else {
+                sqrt(x2 * a2) + y * q - self.r1
+            }
         }
     }
 }
@@ -145,8 +149,11 @@ pub struct HalfSpace: Copy + Clone + GpuData {
 /// The half-space `dot(p, normal) < offset`, for a nonzero `normal` of any length: both are
 /// divided by its length, which leaves the same half-space.
 pub fn half_space(normal: vec3, offset: f32) -> HalfSpace {
-    let l = length(normal)
-    HalfSpace { normal: normal / l, offset: offset / l }
+    // Scaled by its largest component first, so its length neither overflows nor underflows.
+    let m = max(max(abs(normal.x), abs(normal.y)), abs(normal.z))
+    let n = normal / m
+    let l = length(n)
+    HalfSpace { normal: n / l, offset: offset / m / l }
 }
 
 impl Surface for HalfSpace {
@@ -165,9 +172,12 @@ impl Surface for HalfSpace {
 /// rounding) so that what the compiler derives from it is cheap: its gradient doesn't carry
 /// terms that cancel, and its interval is the smaller distance's, less at most `k / 4`.
 pub fn smin(a: f32, b: f32, k: f32) -> f32 {
-    let m = max(k - abs(a - b), 0.0)
-    // The smallest normal f32 keeps `0.25 / k` finite, and `m` is 0 for `k <= 0`.
-    min(a, b) - m * m * (0.25 / max(k, 1.1754944e-38))
+    // Equal distances are 0 apart, also two infinite ones (an empty surface's), whose
+    // difference is NaN.
+    let m = max(k - select(abs(a - b), 0.0, a == b), 0.0)
+    // The smallest normal f32 keeps `0.25 / k` finite, and `m` is 0 for `k <= 0`. `m` times
+    // at most a quarter doesn't overflow where `m * m` would.
+    min(a, b) - m * (m * (0.25 / max(k, 1.1754944e-38)))
 }
 
 pub struct Union<A, B>: Copy + Clone + GpuData {

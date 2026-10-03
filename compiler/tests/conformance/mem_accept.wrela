@@ -60,3 +60,34 @@ fn f(w: mut World) -> u32 {
     }
     total + seen + take backup.finish() + archive(take log)
 }
+
+struct Pair: Clone {
+    a: Log,
+    v: f32,
+}
+
+fn pick_from(p: mut Pair, q: Pair) -> mut f32 {
+    mut p.v
+}
+
+// A `mut` result points into the `mut` arguments only, so writing through it leaves a
+// `borrow` argument and what borrows it alone.
+fn result_writes(p: mut Pair, q: Pair) -> u32 {
+    let held = q.a
+    mut x = pick_from(mut p, q)
+    x += 1.0
+    held.count
+}
+
+fn bump_both(x: mut f32, y: mut f32) {
+    x += 1.0
+    y += 1.0
+}
+
+// `a.x` through `a = v.xy` is `v.x`, apart from `v.y`.
+fn swizzle_parts() -> f32 {
+    var v = vec2(1.0, 2.0)
+    mut a = v.xy
+    bump_both(mut a.x, mut v.y)
+    v.x + v.y
+}

@@ -1,0 +1,25 @@
+// accepts: gpu.dispatch
+// A generic vertex shader's output type, inferred from the draw's arguments, is the fragment
+// shader's input whatever it turns out to be.
+use std::gpu::{ClipPosition, FragCoord, VertexIndex, begin_screen_pass, draw, present}
+
+struct Out<T>: Copy + Clone {
+    pos: ClipPosition,
+    tint: T,
+}
+
+@vertex
+fn place<T: GpuData + Copy>(v: VertexIndex, tint: T) -> Out<T> {
+    Out { pos: ClipPosition { position: vec4(f32(v.index), 0.0, 0.0, 1.0) }, tint: tint }
+}
+
+@fragment
+fn paint<T: GpuData + Copy>(pixel: FragCoord, o: Out<T>) -> vec4 {
+    vec4(1.0, 0.0, 0.0, 1.0)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    begin_screen_pass(clear: vec4(0.0, 0.0, 0.0, 1.0))
+    draw(place, paint, vertices: 3, tint: 1.0)
+    present()
+}

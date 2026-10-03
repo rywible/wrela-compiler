@@ -35,6 +35,9 @@ pub struct LocalDecl {
     pub span: Span,
     /// The `let` that binds it alone (`let x = ...`), for fixes that change it to `var`.
     pub keyword: Option<Span>,
+    /// Bound by a struct pattern's field shorthand (`S { count }`): renaming it keeps the
+    /// field's name (`count: _count`).
+    pub shorthand: bool,
     /// The closure this local belongs to, if it's declared inside one.
     pub closure: Option<ClosureId>,
 }
@@ -72,7 +75,8 @@ pub enum Lit {
     /// Any integer or float type's literal: its exact value (negative only for a negated
     /// literal in a pattern; a negation in an expression is a `Unary`).
     Int(i128),
-    Float(f64),
+    /// Its value as an `f64` and as an `f32`, each rounded once from the literal.
+    Float(f64, f32),
     Bool(bool),
 }
 

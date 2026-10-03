@@ -1,0 +1,42 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0106",
+      "file": "main.wrela",
+      "fixes": [
+        {
+          "edits": [
+            {
+              "end": 97,
+              "file": "main.wrela",
+              "replacement": "",
+              "start": 96
+            }
+          ],
+          "message": "remove the `&`"
+        }
+      ],
+      "help": [
+        "pass the value itself: `f(x)` borrows, `f(mut x)` lends it mutably, `f(take x)` moves it"
+      ],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "`&` doesn't take a reference in wrela",
+      "notes": [
+        "there are no references; a parameter borrows its argument by default"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 12,
+        "end": 97,
+        "end_column": 13,
+        "end_line": 5,
+        "line": 5,
+        "start": 96
+      },
+      "title": "`&` isn't a type or an operator on places"
+    }
+  ],
+  "version": 2
+}

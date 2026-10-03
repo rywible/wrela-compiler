@@ -22,3 +22,15 @@ fn g() -> u32 {
 fn h() -> u32 {
     archive(take Log { count: 2 }) //~ E0511
 }
+
+impl Log {
+    fn total(self) -> u32 {
+        self.count
+    }
+}
+
+// `take` on a call marks a method that consumes its receiver; this one borrows it.
+fn k() -> u32 {
+    let log = Log { count: 3 }
+    take log.total() //~ E0511
+}

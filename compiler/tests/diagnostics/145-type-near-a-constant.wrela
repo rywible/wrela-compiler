@@ -1,0 +1,8 @@
+// mistake: a misspelled type whose nearest name is a constant, not a type
+// expect: E0200
+// fix: no
+const Radius: f32 = 1.0
+
+fn grow(r: Radiu) -> f32 {
+    2.0
+}

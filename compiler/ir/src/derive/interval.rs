@@ -926,8 +926,15 @@ impl<'a> Ivx<'a> {
                 let (lp, hp) = self.places(p)?;
                 (self.emit(out, ty, Expr::Addr(lp)), self.emit(out, ty, Expr::Addr(hp)))
             }
-            Expr::Host(..) | Expr::Run(_) => {
-                return Err(Error::not_derivable("an interval can't go through this"));
+            Expr::Run(_) => {
+                return Err(Error::not_derivable(
+                    "an interval can't go through a run (`[T]`) of values that depend on the input yet: pass the array itself (`[f32; N]`)",
+                ));
+            }
+            Expr::Host(..) => {
+                return Err(Error::not_derivable(
+                    "an interval can't go through GPU work (a buffer, a dispatch or a draw)",
+                ));
             }
         })
     }
@@ -1516,9 +1523,10 @@ impl<'a> Ivx<'a> {
         let h = self.builtin(out, Builtin::Max, vec![x.1, z], ty);
         let lo = self.builtin(out, Builtin::InverseSqrt, vec![h], ty);
         let hi = self.builtin(out, Builtin::InverseSqrt, vec![l], ty);
-        // At zero it's unbounded.
+        // At zero it's unbounded both ways: +∞ at +0, and -∞ at -0 (whose square root is -0).
         let pos = self.cmp(out, BinOp::Gt, x.0, z);
-        let (_, fh) = self.full(out, ty);
+        let (fl, fh) = self.full(out, ty);
+        let lo = self.select(out, pos, lo, fl);
         let hi = self.select(out, pos, hi, fh);
         let ulps = if self.gpu() { 4.0 } else { 2.0 };
         Ok(self.widen(out, (lo, hi), ty, ulps, 0.0))
@@ -1527,7 +1535,15 @@ impl<'a> Ivx<'a> {
     fn pow(&mut self, out: &mut Block, ty: TypeId, x: &[Iv]) -> R<Iv> {
         let (a, b) = (x[0], x[1]);
         let z = self.fc(out, ty, 0.0);
-        let pos = self.cmp(out, BinOp::Ge, a.0, z);
+        // The corners bound a base above zero, and one that reaches ±0 under an exponent that
+        // isn't negative. A base at ±0 under a negative exponent gives +∞ (at +0) and, for an
+        // odd one, -∞ (at -0), with every value between them at the bases between.
+        let above = self.cmp(out, BinOp::Gt, a.0, z);
+        let at_zero = self.cmp(out, BinOp::Eq, a.0, z);
+        let exp_up = self.cmp(out, BinOp::Ge, b.0, z);
+        let bt = self.bool_ty();
+        let zero_up = self.bin(out, BinOp::And, at_zero, exp_up, bt);
+        let pos = self.bin(out, BinOp::Or, above, zero_up, bt);
         let r = if self.gpu() {
             // WGSL: inherited from exp2(y log2(x)); bound each step.
             let l = self.log_ends(out, Builtin::Log2, a, ty);
@@ -1763,6 +1779,13 @@ impl<'a> Ivx<'a> {
         let lo = self.builtin(out, Builtin::Smoothstep, vec![e0.1, e1.1, v.0], ty);
         let hi = self.builtin(out, Builtin::Smoothstep, vec![e0.0, e1.0, v.1], ty);
         let ok = self.cmp(out, BinOp::Lt, e0.1, e1.0);
+        // Unless the widest e1 - e0 overflows: at ∞ its t is 0, so the result grows with e0
+        // there, and the corners don't bound it.
+        let w = self.bin(out, BinOp::Sub, e1.1, e0.0, ty);
+        let max = self.fc(out, ty, f32::MAX as f64);
+        let finite = self.cmp(out, BinOp::Le, w, max);
+        let bt = self.bool_ty();
+        let ok = self.bin(out, BinOp::And, ok, finite, bt);
         let z = self.fc(out, ty, 0.0);
         let one = self.fc(out, ty, 1.0);
         let lo = self.select(out, ok, lo, z);

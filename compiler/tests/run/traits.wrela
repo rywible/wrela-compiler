@@ -18,6 +18,10 @@
 // expect: variant_import() = 3
 // expect: later_bound() = 7
 // expect: blanket() = 1
+// expect: copied_projection() = 4.0
+// expect: projection_methods() = 60.0
+// expect: opaque_generic_trait() = 6.0
+// expect: projection_generic_trait() = 6.0
 
 use std::derive::{Interval, interval}
 use Pick::Second
@@ -336,4 +340,102 @@ fn need<X: Tr>(x: X) -> i32 {
 
 pub fn blanket() -> i32 {
     need(5)
+}
+
+trait Measure {
+    type Unit
+}
+
+struct Metres {}
+
+impl Measure for Metres {
+    type Unit = f32
+}
+
+/// A field of an associated type: `In<Metres>` is `Copy` because `Metres::Unit` is `f32`.
+struct In<M: Measure>: Copy + Clone {
+    v: M::Unit,
+}
+
+fn both<T: Copy>(x: T) -> (T, T) {
+    (x, x)
+}
+
+pub fn copied_projection() -> f32 {
+    let i: In<Metres> = In { v: 2.0 }
+    let (a, b) = both(i)
+    a.v + b.v
+}
+
+trait Shown {
+    fn shown(self) -> f32
+}
+
+impl Shown for f32 {
+    fn shown(self) -> f32 {
+        self * 10.0
+    }
+}
+
+fn shown_by<T: Shown>(x: T) -> f32 {
+    x.shown()
+}
+
+fn pass<M: Measure>(i: take In<M>) -> In<M> {
+    i
+}
+
+/// The field's type is `M::Unit` with `M` inferred from the call: still `f32`.
+pub fn projection_methods() -> f32 {
+    let i: In<Metres> = In { v: 3.0 }
+    let j = pass(i)
+    j.v.shown() + shown_by(j.v)
+}
+
+trait Stretch<T> {
+    fn stretch(self, by: T) -> f32
+}
+
+struct Rod: Copy + Clone {
+    w: f32,
+}
+
+impl Stretch<f32> for Rod {
+    fn stretch(self, by: f32) -> f32 {
+        self.w * by
+    }
+}
+
+fn some_rod() -> Stretch<f32> {
+    Rod { w: 2.0 }
+}
+
+/// A method of a generic trait on a value known only by its traits.
+pub fn opaque_generic_trait() -> f32 {
+    let r = some_rod()
+    r.stretch(3.0)
+}
+
+trait Holds {
+    type Part: Stretch<f32>
+    fn part(self) -> Self::Part
+}
+
+struct Bundle: Copy + Clone {
+    rod: Rod,
+}
+
+impl Holds for Bundle {
+    type Part = Rod
+    fn part(self) -> Rod {
+        self.rod
+    }
+}
+
+fn stretch_part<H: Holds>(h: H) -> f32 {
+    h.part().stretch(4.0)
+}
+
+pub fn projection_generic_trait() -> f32 {
+    stretch_part(Bundle { rod: Rod { w: 1.5 } })
 }

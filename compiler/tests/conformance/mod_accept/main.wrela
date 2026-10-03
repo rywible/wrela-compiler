@@ -6,3 +6,11 @@ fn f() -> f32 {
     let b: Blob = blob(2.0)
     b.r + sphere(1.0).radius
 }
+
+// A constant matched by its path, as by its name.
+fn kind(n: i32) -> u32 {
+    match n {
+        shapes::blob::SIDES => 1,
+        _ => 2,
+    }
+}

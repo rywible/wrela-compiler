@@ -49,3 +49,60 @@ struct Fine {
 fn f(a: A) -> i32 {
     0
 }
+
+trait Measured {
+    type Unit
+    type Other
+}
+
+struct Ruler {}
+
+struct Scale {}
+
+// An associated type defined in terms of itself never resolves to a type.
+impl Measured for Ruler { //~ E0318
+    type Unit = Self::Unit
+    type Other = f32
+}
+
+impl Measured for Scale { //~ E0318
+    type Unit = Self::Other
+    type Other = Self::Unit
+}
+
+trait KeyedBy {
+    type K
+}
+
+struct KeyOf {}
+
+// A cycle through a projection only an instance resolves: `ThroughKey<KeyOf>`'s `k` is a
+// `KeyOf::K`, which is a `ThroughKey<KeyOf>`.
+impl KeyedBy for KeyOf { //~ E0318
+    type K = ThroughKey<KeyOf>
+}
+
+struct ThroughKey<T: KeyedBy> {
+    k: T::K,
+}
+
+trait TaggedBy {
+    type Tag
+}
+
+impl<T: Copy> TaggedBy for T {
+    type Tag = f32
+}
+
+// Finding `TagHolder<Endless>`'s `T::Tag` asks whether `Endless` is `Copy`, which holds itself.
+struct Endless: Copy + Clone { //~ E0318
+    inner: Endless,
+}
+
+struct TagHolder<T: TaggedBy> {
+    tag: T::Tag,
+}
+
+struct TagOuter {
+    h: TagHolder<Endless>,
+}

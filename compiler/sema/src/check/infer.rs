@@ -1,7 +1,7 @@
 //! Type inference within one body: variables, unification, and resolving what's left.
 
 use crate::ty::*;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use wrela_diag::Span;
 
 #[derive(Clone, Debug)]
@@ -65,10 +65,21 @@ impl Infer {
         if !types.has_vars(t) {
             return t;
         }
+        self.resolve_in(types, t, &mut HashMap::new())
+    }
+
+    /// [`Infer::resolve`], each variable resolved once: a type whose variables share parts
+    /// (`(a, a)` where `a` is `(b, b)`, …) is a small graph, however large its tree is.
+    fn resolve_in(&self, types: &Types, t: TyId, done: &mut HashMap<VarId, TyId>) -> TyId {
         types.map(t, &mut |types, x| match types.kind(x) {
             TyKind::Var(v) => {
                 let b = self.vars[v.index()].bound?;
-                Some(self.resolve(types, b))
+                if let Some(&r) = done.get(v) {
+                    return Some(r);
+                }
+                let r = self.resolve_in(types, b, done);
+                done.insert(*v, r);
+                Some(r)
             }
             _ => None,
         })
@@ -106,6 +117,14 @@ impl Infer {
         } else {
             self.rollback();
         }
+        ok
+    }
+
+    /// Whether `a` and `b` would unify, leaving every variable as it was either way.
+    pub fn fits(&mut self, types: &Types, a: TyId, b: TyId) -> bool {
+        self.snapshot();
+        let ok = self.unify(types, a, b).is_ok();
+        self.rollback();
         ok
     }
 

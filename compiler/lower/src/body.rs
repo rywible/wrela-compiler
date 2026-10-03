@@ -62,13 +62,55 @@ pub(crate) struct Fl<'c, 'a> {
     pub subst: Subst,
     pub locals: Vec<Repr>,
     /// The block being emitted is the last; enclosing ones before it.
-    blocks: Vec<(ir::Block, bool)>,
+    blocks: Vec<Open>,
+    /// The open block each value was defined in, by [`Open::id`].
+    defined: HashMap<ir::ValueId, u32>,
+    /// The id of the next block opened.
+    next_block: u32,
     /// How many reachable blocks go to each block.
     preds: Vec<u32>,
     /// Each `Match` block's flag: whether an arm has matched.
     matched: HashMap<BlockId, ir::LocalId>,
     /// Each `Match` block whose last arm can fail: the block after it (no arm matched).
     unmatched: HashMap<BlockId, BlockId>,
+}
+
+/// A block being emitted.
+struct Open {
+    stmts: ir::Block,
+    /// It ended (a `return`, `break`, `continue` or trap): what follows is dead.
+    term: bool,
+    id: u32,
+    /// Stores of values into locals (see [`Fl::spill`]): each goes after its value's `Let`
+    /// once the block is done.
+    spills: Vec<(ir::ValueId, ir::Stmt)>,
+}
+
+impl Open {
+    fn new(id: u32) -> Open {
+        Open { stmts: Vec::new(), term: false, id, spills: Vec::new() }
+    }
+
+    /// The block's statements, each spill after its value's `Let`.
+    fn finish(self) -> ir::Block {
+        if self.spills.is_empty() {
+            return self.stmts;
+        }
+        let mut after: HashMap<ir::ValueId, Vec<ir::Stmt>> = HashMap::new();
+        for (v, s) in self.spills.into_iter().rev() {
+            after.entry(v).or_default().push(s);
+        }
+        let mut out = Vec::with_capacity(self.stmts.len() + after.len());
+        for s in self.stmts {
+            let spills = match &s {
+                ir::Stmt::Let(v, _) => after.remove(v),
+                _ => None,
+            };
+            out.push(s);
+            out.extend(spills.into_iter().flatten());
+        }
+        out
+    }
 }
 
 pub(crate) fn lower_body(cx: &mut Cx, mb: &mut ModuleBuilder, key: &InstanceKey, id: ir::FuncId) {
@@ -94,7 +136,9 @@ pub(crate) fn lower_body(cx: &mut Cx, mb: &mut ModuleBuilder, key: &InstanceKey,
         code,
         subst,
         locals: vec![Repr::Unbound; mir.locals.len()],
-        blocks: vec![(Vec::new(), false)],
+        blocks: vec![Open::new(0)],
+        defined: HashMap::new(),
+        next_block: 1,
         preds: reachable_preds(code),
         matched: HashMap::new(),
         unmatched: HashMap::new(),
@@ -151,43 +195,47 @@ impl<'c, 'a> Fl<'c, 'a> {
     // ---- emission --------------------------------------------------------------------------
 
     pub fn emit(&mut self, s: ir::Stmt) {
-        let (b, term) = self.blocks.last_mut().expect("a block is open");
-        if *term {
+        let b = self.blocks.last_mut().expect("a block is open");
+        if b.term {
             return;
         }
         let ends = matches!(
             s,
             ir::Stmt::Break | ir::Stmt::Continue | ir::Stmt::Return(_) | ir::Stmt::Trap
         );
-        b.push(s);
+        if let ir::Stmt::Let(v, _) = s {
+            self.defined.insert(v, b.id);
+        }
+        b.stmts.push(s);
         if ends {
-            *term = true;
+            b.term = true;
         }
     }
 
     pub fn terminated(&self) -> bool {
-        self.blocks.last().is_some_and(|b| b.1)
+        self.blocks.last().is_some_and(|b| b.term)
     }
 
     /// Marks where the code that follows comes from (`ir::Stmt::At`): a marker that nothing
     /// followed yet is replaced.
     fn at(&mut self, span: Span) {
-        let (b, term) = self.blocks.last_mut().expect("a block is open");
-        if *term {
+        let b = self.blocks.last_mut().expect("a block is open");
+        if b.term {
             return;
         }
-        match b.last_mut() {
+        match b.stmts.last_mut() {
             Some(ir::Stmt::At(s)) => *s = span,
-            _ => b.push(ir::Stmt::At(span)),
+            _ => b.stmts.push(ir::Stmt::At(span)),
         }
     }
 
     pub fn push_block(&mut self) {
-        self.blocks.push((Vec::new(), false));
+        self.blocks.push(Open::new(self.next_block));
+        self.next_block += 1;
     }
 
     pub fn pop_block(&mut self) -> ir::Block {
-        self.blocks.pop().map(|b| b.0).unwrap_or_default()
+        self.blocks.pop().map(Open::finish).unwrap_or_default()
     }
 
     pub fn value(&mut self, ty: ir::TypeId, e: ir::Expr) -> ir::ValueId {
@@ -527,6 +575,13 @@ impl<'c, 'a> Fl<'c, 'a> {
                 };
                 self.locals[local.index()] = repr;
             }
+            // On the CPU an index is checked where its address is made: a read makes it. (GPU
+            // code doesn't trap; its indexing is robust.)
+            StatementKind::Check(p) => {
+                if !self.is_gpu() {
+                    let _ = self.read(p);
+                }
+            }
             StatementKind::Live(_) | StatementKind::Dead(_) => {}
         }
     }
@@ -617,7 +672,8 @@ impl<'c, 'a> Fl<'c, 'a> {
         built.map_or(Repr::Erased, Repr::Value)
     }
 
-    /// The callable an rvalue makes: a closure, a named function, or a copy of a local's.
+    /// The callable an rvalue makes: a closure, a named function, or a local's, copied or moved
+    /// (`take f`).
     fn callable_rvalue(&mut self, r: &Rvalue) -> Option<Repr> {
         match r {
             Rvalue::Closure(id) => {
@@ -629,7 +685,10 @@ impl<'c, 'a> Fl<'c, 'a> {
                 let substs = args.iter().map(|&a| self.concrete(a)).collect();
                 Some(Repr::Callable(Callable::Func { func: *f, substs }, Vec::new()))
             }
-            Rvalue::Use(mir::Operand { kind: OperandKind::Copy(p), .. }) => self.callable_of(p),
+            Rvalue::Use(mir::Operand {
+                kind: OperandKind::Copy(p) | OperandKind::Move(p, _),
+                ..
+            }) => self.callable_of(p),
             _ => None,
         }
     }
@@ -692,12 +751,9 @@ impl<'c, 'a> Fl<'c, 'a> {
     fn spill(&mut self, l: Local, v: ir::ValueId) -> ir::Place {
         let var = self.new_local("tmp", self.f.value_ty(v));
         let store = ir::Stmt::Store(ir::Place::local(var), v);
-        let def = self.blocks.iter_mut().rev().find_map(|(b, _)| {
-            let i = b.iter().position(|s| matches!(s, ir::Stmt::Let(d, _) if *d == v))?;
-            Some((b, i))
-        });
-        match def {
-            Some((b, i)) => b.insert(i + 1, store),
+        let open = self.defined.get(&v).and_then(|id| self.blocks.iter_mut().find(|b| b.id == *id));
+        match open {
+            Some(b) => b.spills.push((v, store)),
             None => self.emit(store),
         }
         self.locals[l.index()] = Repr::Var(var);
@@ -1063,20 +1119,49 @@ impl<'c, 'a> Fl<'c, 'a> {
         }
     }
 
-    /// `base ** exp` for integers: `exp` multiplications (checked on the CPU).
+    /// `base ** exp` for integers, by squaring: a multiplication for each bit of `exp`, and a
+    /// squaring for each but the highest (checked on the CPU). Every product is a power of
+    /// `base` no higher than the result, so one overflows only when the result does.
     fn int_pow(
         &mut self,
         base: ir::ValueId,
         exp: ir::ValueId,
         ty: ir::TypeId,
     ) -> Option<ir::ValueId> {
+        let u = self.mb.m.types.u32();
+        let bool_ty = self.mb.m.types.bool();
         let one = self.lit(Lit::Int(1), ty)?;
         let acc = self.bind_local("pow", ty, ir::Expr::Const(one));
-        self.counted_loop(exp, |fl, _| {
-            let av = fl.load(ir::Place::local(acc), ty);
-            let prod = fl.value(ty, ir::Expr::Binary(ir::BinOp::Mul, av, base));
-            fl.emit(ir::Stmt::Store(ir::Place::local(acc), prod));
-        });
+        let b = self.new_local("pow_base", ty);
+        self.emit(ir::Stmt::Store(ir::Place::local(b), base));
+        let e = self.new_local("pow_exp", u);
+        self.emit(ir::Stmt::Store(ir::Place::local(e), exp));
+        let (zero, bit) = (self.u32c(0), self.u32c(1));
+        self.push_block();
+        // No bits left: done.
+        let ev = self.load(ir::Place::local(e), u);
+        let none = self.value(bool_ty, ir::Expr::Binary(ir::BinOp::Eq, ev, zero));
+        self.emit(ir::Stmt::If { cond: none, then: vec![ir::Stmt::Break], else_: Vec::new() });
+        // The lowest bit set: acc *= b.
+        let low = self.value(u, ir::Expr::Binary(ir::BinOp::BitAnd, ev, bit));
+        let set = self.value(bool_ty, ir::Expr::Binary(ir::BinOp::Ne, low, zero));
+        self.push_block();
+        let av = self.load(ir::Place::local(acc), ty);
+        let bv = self.load(ir::Place::local(b), ty);
+        let prod = self.value(ty, ir::Expr::Binary(ir::BinOp::Mul, av, bv));
+        self.emit(ir::Stmt::Store(ir::Place::local(acc), prod));
+        let then = self.pop_block();
+        self.emit(ir::Stmt::If { cond: set, then, else_: Vec::new() });
+        // The next bit; b *= b only if there is one.
+        let rest = self.value(u, ir::Expr::Binary(ir::BinOp::Shr, ev, bit));
+        self.emit(ir::Stmt::Store(ir::Place::local(e), rest));
+        let last = self.value(bool_ty, ir::Expr::Binary(ir::BinOp::Eq, rest, zero));
+        self.emit(ir::Stmt::If { cond: last, then: vec![ir::Stmt::Break], else_: Vec::new() });
+        let bv = self.load(ir::Place::local(b), ty);
+        let square = self.value(ty, ir::Expr::Binary(ir::BinOp::Mul, bv, bv));
+        self.emit(ir::Stmt::Store(ir::Place::local(b), square));
+        let body = self.pop_block();
+        self.emit(ir::Stmt::Loop { body, continuing: Vec::new() });
         Some(self.load(ir::Place::local(acc), ty))
     }
 
@@ -1160,7 +1245,7 @@ impl<'c, 'a> Fl<'c, 'a> {
         let t = self.ty(ty, span)?;
         let zero = match &x.kind {
             OperandKind::Const(Lit::Int(0) | Lit::Bool(false)) => true,
-            OperandKind::Const(Lit::Float(f)) => *f == 0.0 && f.is_sign_positive(),
+            OperandKind::Const(Lit::Float(f, _)) => *f == 0.0 && f.is_sign_positive(),
             _ => false,
         };
         if zero {
@@ -1170,8 +1255,12 @@ impl<'c, 'a> Fl<'c, 'a> {
         if n <= 64 {
             return Some(self.value(t, ir::Expr::Construct(t, vec![v; n as usize])));
         }
-        // A long repeat: fill a local in a loop.
+        // A long repeat: fill a local in a loop, zeroed first, so its padding (a `vec3`'s
+        // fourth float) is zeros, not what the stack held (§11: a value's bytes are a function
+        // of its fields).
         let l = self.new_local("repeat", t);
+        let z = self.value(t, ir::Expr::Zero(t));
+        self.emit(ir::Stmt::Store(ir::Place::local(l), z));
         let n = self.u32c(n);
         self.counted_loop(n, |fl, i| {
             fl.emit(ir::Stmt::Store(ir::Place::local(l).with(ir::Proj::Index(i)), v))
@@ -1257,6 +1346,13 @@ impl<'c, 'a> Fl<'c, 'a> {
             mir::Callee::Clone => self.arg_value(c.args.first()?),
             mir::Callee::Local(l) => {
                 let Repr::Callable(callable, srcs) = self.locals[l.index()].clone() else {
+                    // Its callable was given up on with an error (E0702); without one,
+                    // dropping the call would be a silent miscompile.
+                    if !wrela_diag::has_errors(&self.cx.diags) {
+                        self.cx.err(Diagnostic::internal(
+                            "a call through a local that holds no known closure or function",
+                        ));
+                    }
                     return None;
                 };
                 self.call_callable(&callable, &srcs, &c.args, span)
@@ -1548,8 +1644,8 @@ pub(crate) fn lit_const(types: &ir::Types, l: Lit, ty: ir::TypeId) -> Option<ir:
         (Lit::Int(v), ir::Scalar::F32) => ir::Const::F32(v as f32),
         (Lit::Int(v), ir::Scalar::F64) => ir::Const::F64(v as f64),
         (Lit::Int(v), s) => ir::Const::Small(s, v as i64),
-        (Lit::Float(v), ir::Scalar::F32) => ir::Const::F32(v as f32),
-        (Lit::Float(v), _) => ir::Const::F64(v),
+        (Lit::Float(_, f), ir::Scalar::F32) => ir::Const::F32(f),
+        (Lit::Float(v, _), _) => ir::Const::F64(v),
     })
 }
 
