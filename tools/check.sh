@@ -41,8 +41,8 @@ wrela=target/release/wrela
 step "wrela fmt --check"
 "$wrela" fmt --check "${WRELA_SOURCES[@]}"
 
-step "tests: unit, conformance, diagnostics goldens, grammar, derived interpretations, ABI goldens, reproducibility, fuzz smoke"
-cargo test -q --workspace
+step "tests at full size: unit, conformance, diagnostics goldens, grammar, derived interpretations, ABI goldens, reproducibility, fuzz"
+WRELA_FULL=1 cargo test -q --workspace
 
 step "tools: the dev server and the headless-Chrome driver (fake Chrome)"
 python3 -m unittest discover -q -s tools/tests
@@ -90,7 +90,7 @@ if [ "$long" = 1 ]; then
   step "GBNF: 200,000 sampled programs"
   cargo run -q --release -p wrela-grammar --bin gbnf-sample -- 200000
   step "fuzz: 50,000 mutated programs"
-  WRELA_FUZZ_ITERS=50000 cargo test -q --release -p wrela-tests --test fuzz
+  WRELA_FUZZ_ITERS=50000 cargo test -q --release -p wrela-tests --test suite fuzz::
 fi
 
 printf '\nall checks passed\n'

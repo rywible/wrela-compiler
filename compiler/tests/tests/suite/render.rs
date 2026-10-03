@@ -1,6 +1,6 @@
 //! GPU programs run by the native host: a draw whose shaders read buffers (bound in the order
 //! the pipeline declares them), and `len()` of a storage buffer. Need a GPU:
-//! `cargo test -p wrela-tests --test render -- --ignored`.
+//! `cargo test -p wrela-tests --test suite render:: -- --ignored`.
 
 use std::path::PathBuf;
 use wrela_host::{Host, Value};

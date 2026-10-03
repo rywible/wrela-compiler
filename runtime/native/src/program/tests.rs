@@ -7,7 +7,7 @@ use wrela_abi::Manifest;
 use wrela_abi::manifest::{Access, BufferBinding, Pipeline, Stage, UniformBlock, UniformSpace};
 use wrela_abi::stream::{Encoder, Opcode, StreamError, VERSION};
 
-#[path = "../../tests/common/wat.rs"]
+#[path = "../../tests/suite/common/wat.rs"]
 mod wat_gen;
 
 /// Records each command's opcode, and `end` at each frame's end.

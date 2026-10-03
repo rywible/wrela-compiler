@@ -50,5 +50,10 @@ large_enum_variant = "allow"
 [profile.release]
 overflow-checks = true
 
+# Tests are most of what runs in dev builds: opt-level 1 runs them several times faster and
+# rebuilds no slower than 0 (measured on the workspace). Dependencies are built once, at 2.
+[profile.dev]
+opt-level = 1
+
 [profile.dev.package."*"]
 opt-level = 2

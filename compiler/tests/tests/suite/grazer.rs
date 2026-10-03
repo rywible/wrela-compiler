@@ -11,7 +11,7 @@
 //! warm-up. (Through wrela-host the same compiled kernel times within a few percent of this
 //! when the GPU is warm, but timings there swing with whatever else the GPU did just before.)
 //!
-//! These need a GPU: `cargo test -p wrela-tests --test grazer -- --ignored --nocapture`.
+//! These need a GPU: `cargo test -p wrela-tests --test suite grazer:: -- --ignored --nocapture`.
 
 use std::path::PathBuf;
 use wrela_abi::Manifest;

@@ -2,7 +2,7 @@
 //! spec/grammar.ebnf, every program sampled from it parses, and it isn't so conservative that
 //! ordinary code falls outside it.
 
-mod common;
+use crate::common;
 
 use wrela_grammar::ebnf::Grammar;
 use wrela_grammar::gbnf::export;

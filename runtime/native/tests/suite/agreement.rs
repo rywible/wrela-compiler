@@ -4,12 +4,12 @@
 //!
 //! Ignored by default: it needs Chrome stable, python3 and the GPU. Run it with
 //!
-//!     cargo test -p wrela-host --test agreement -- --ignored --nocapture
+//!     cargo test -p wrela-host --test suite agreement:: -- --ignored --nocapture
 //!
 //! It stages the page from the checked-in runtime (runtime/browser/dist), so rebuild that first
 //! if the runtime's sources changed (`bun run build` in runtime/browser).
 
-mod common;
+use crate::common;
 
 use std::path::Path;
 use std::process::Command;

@@ -45,7 +45,7 @@ fn round_trip(src: &str) -> String {
 }
 
 /// A file using most of the syntax (compiler/grammar's tests read it too).
-const SAMPLE: &str = include_str!("sample.wrela");
+const SAMPLE: &str = include_str!("../sample.wrela");
 
 #[test]
 fn sample_round_trips() {
@@ -146,35 +146,57 @@ fn comments_anywhere_survive_formatting() {
         collect(&root.join(dir), &mut files);
     }
     assert!(files.len() > 10, "only {} files", files.len());
-    let mut rng = XorShift(0x9e37_79b9_7f4a_7c15);
-    for path in files {
-        let text = std::fs::read_to_string(&path).expect("read");
-        let tokens = wrela_syntax::lex(FileId(0), &text).tokens;
-        let spots: Vec<usize> = tokens
-            .iter()
-            .filter(|t| !t.kind.can_end_statement() && t.kind != wrela_syntax::TokenKind::Eof)
-            .map(|t| t.span.end as usize)
+    // A file per thread at a time; each file's comments come from its own seed.
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+    std::thread::scope(|s| {
+        let workers: Vec<_> = (0..threads)
+            .map(|_| {
+                s.spawn(|| {
+                    loop {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(path) = files.get(i) else { break };
+                        random_comments_survive(
+                            path,
+                            XorShift(0x9e37_79b9_7f4a_7c15 ^ (i as u64 + 1)),
+                        );
+                    }
+                })
+            })
             .collect();
-        for round in 0..4 {
-            let mut at: Vec<usize> = (0..6).map(|_| spots[rng.below(spots.len())]).collect();
-            at.sort();
-            at.dedup();
-            let mut src = String::new();
-            let mut last = 0;
-            for (i, &p) in at.iter().enumerate() {
-                src.push_str(&text[last..p]);
-                src.push_str(&format!(" // c{round}x{i}\n"));
-                last = p;
-            }
-            src.push_str(&text[last..]);
-            let name = path.display();
-            let p = parse(FileId(0), &src);
-            assert!(!p.has_errors(), "{name}: the comments broke the parse:\n{src}");
-            let out = round_trip(&src);
-            for i in 0..at.len() {
-                let c = format!("// c{round}x{i}");
-                assert_eq!(out.matches(&c).count(), 1, "{name}: {c} lost or doubled:\n{out}");
-            }
+        for w in workers {
+            w.join().unwrap_or_else(|p| std::panic::resume_unwind(p));
+        }
+    });
+}
+
+fn random_comments_survive(path: &std::path::Path, mut rng: XorShift) {
+    let text = std::fs::read_to_string(path).expect("read");
+    let tokens = wrela_syntax::lex(FileId(0), &text).tokens;
+    let spots: Vec<usize> = tokens
+        .iter()
+        .filter(|t| !t.kind.can_end_statement() && t.kind != wrela_syntax::TokenKind::Eof)
+        .map(|t| t.span.end as usize)
+        .collect();
+    for round in 0..4 {
+        let mut at: Vec<usize> = (0..6).map(|_| spots[rng.below(spots.len())]).collect();
+        at.sort();
+        at.dedup();
+        let mut src = String::new();
+        let mut last = 0;
+        for (i, &p) in at.iter().enumerate() {
+            src.push_str(&text[last..p]);
+            src.push_str(&format!(" // c{round}x{i}\n"));
+            last = p;
+        }
+        src.push_str(&text[last..]);
+        let name = path.display();
+        let p = parse(FileId(0), &src);
+        assert!(!p.has_errors(), "{name}: the comments broke the parse:\n{src}");
+        let out = round_trip(&src);
+        for i in 0..at.len() {
+            let c = format!("// c{round}x{i}");
+            assert_eq!(out.matches(&c).count(), 1, "{name}: {c} lost or doubled:\n{out}");
         }
     }
 }

@@ -9,7 +9,7 @@
 //! [`CASE_TIMEOUT`] fails the test, with the seed and the program; the worker is restarted
 //! after the case that killed it.
 //!
-//! `WRELA_FUZZ_ITERS` sets the cases (default 400: a smoke test, seconds) and
+//! `WRELA_FUZZ_ITERS` sets the cases (default 100, or 1000 with `WRELA_FULL`) and
 //! `WRELA_FUZZ_SEED` the run's seed (default 1).
 
 use std::io::{BufRead, BufReader, Write};
@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
-use wrela_tests::{Rng, root};
+use wrela_tests::{Rng, root, sized};
 
 /// How long one case may take. Generous: debug builds are slow, and the worker compiles std
 /// once per case.
@@ -215,15 +215,17 @@ fn worker() {
 
 #[test]
 fn mutated_programs_dont_crash_the_compiler() {
-    let iters: u64 =
-        std::env::var("WRELA_FUZZ_ITERS").ok().and_then(|v| v.parse().ok()).unwrap_or(400);
+    let iters: u64 = std::env::var("WRELA_FUZZ_ITERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(sized(100, 1000));
     let base: u64 = std::env::var("WRELA_FUZZ_SEED").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
     let exe = std::env::current_exe().expect("the test binary");
     let mut crashes: Vec<(u64, String)> = Vec::new();
     let mut next = 0;
     while next < iters && crashes.len() < 3 {
         let mut child = Command::new(&exe)
-            .args(["worker", "--exact", "--ignored", "--nocapture", "--test-threads", "1"])
+            .args(["fuzz::worker", "--exact", "--ignored", "--nocapture", "--test-threads", "1"])
             .env("WRELA_FUZZ_WORKER", format!("{base} {next} {iters}"))
             .stdout(Stdio::piped())
             .stderr(Stdio::null())

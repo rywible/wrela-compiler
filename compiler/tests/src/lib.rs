@@ -3,6 +3,9 @@
 //!
 //! The GPU tests are `#[ignore]`d: they need a GPU and take the GPU lock (`wrela_host::lock`).
 //! `tools/check.sh` runs them with `--ignored`.
+//!
+//! Sampled tests have two sizes: small by default, so `cargo test` stays fast, and the size the
+//! acceptance criteria name when `WRELA_FULL` is set ([`full`]), as `tools/check.sh` does.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -11,6 +14,39 @@ use wrela_host::map_read;
 
 /// SplitMix64, for tests' random inputs.
 pub use wrela_grammar::rng::Rng;
+
+/// Whether to run sampled tests at full size (`WRELA_FULL` is set).
+pub fn full() -> bool {
+    std::env::var_os("WRELA_FULL").is_some()
+}
+
+/// `small` normally, `full` when [`full`] is set.
+pub fn sized<T>(small: T, full_size: T) -> T {
+    if full() { full_size } else { small }
+}
+
+/// Calls `f` on each item, spread over the machine's threads; `init` makes each thread's
+/// state (a host, say).
+pub fn par_each<T: Sync, S>(
+    items: &[T],
+    init: impl Fn() -> S + Sync,
+    f: impl Fn(&mut S, &T) + Sync,
+) {
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(items.len());
+    std::thread::scope(|s| {
+        for _ in 0..threads {
+            s.spawn(|| {
+                let mut state = init();
+                loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(item) = items.get(i) else { break };
+                    f(&mut state, item);
+                }
+            });
+        }
+    });
+}
 
 /// The repository's root.
 pub fn root() -> PathBuf {

@@ -5,7 +5,7 @@
 //! evaluated on the CPU (`probe`, in WASM).
 //!
 //! These need a GPU, and the browser test Chrome stable and python3:
-//! `cargo test -p wrela-tests --test hello_field -- --ignored --nocapture`. `WRELA_BLESS=1`
+//! `cargo test -p wrela-tests --test suite hello_field:: -- --ignored --nocapture`. `WRELA_BLESS=1`
 //! rewrites the golden from the native host.
 
 use std::path::{Path, PathBuf};

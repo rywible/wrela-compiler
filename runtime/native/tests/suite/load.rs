@@ -1,6 +1,6 @@
 //! Loading a build: what's rejected before the GPU is touched (no GPU needed).
 
-mod common;
+use crate::common;
 
 use wrela_host::{Error, Host};
 

@@ -1,9 +1,9 @@
 //! End to end on the real GPU. Ignored by default: they take the GPU lock (shared with
 //! tools/headless.py) and need a GPU. Run them with
 //!
-//!     cargo test -p wrela-host --test gpu -- --ignored
+//!     cargo test -p wrela-host --test suite gpu:: -- --ignored
 
-mod common;
+use crate::common;
 
 use wrela_abi::hash::StateHash;
 use wrela_abi::stream::Encoder;

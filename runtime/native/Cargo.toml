@@ -9,6 +9,7 @@ publish.workspace = true
 [[bin]]
 name = "wrela-host"
 path = "src/main.rs"
+test = false
 
 [dependencies]
 wrela-abi.workspace = true

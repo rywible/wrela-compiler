@@ -3,23 +3,22 @@
 //! near-miss mutants of them, the conformance suite and the round-trip sample; and every
 //! accepted program survives parse → format → parse unchanged.
 //!
-//! These runs are sized for `cargo test` in a debug build. The full AC run is
+//! These runs are sized for `cargo test` (larger with `WRELA_FULL`). The full AC run is
 //! `cargo run -p wrela-grammar --release --bin differential -- 1000000`.
 
-mod common;
+use crate::common;
 
+use std::sync::Mutex;
 use wrela_grammar::agree::{Checker, round_trip};
 use wrela_grammar::differential::{RunConfig, run};
 use wrela_grammar::earley::Scratch;
 
 const SEED: u64 = 0xac5;
-const PROGRAMS: u64 = 3000;
-const ROUND_TRIPS: u64 = 10_000;
 
 #[test]
 fn generated_programs_agree() {
     let checker = Checker::default();
-    let mut cfg = RunConfig::new(PROGRAMS, SEED);
+    let mut cfg = RunConfig::new(common::sized(2000, 3000), SEED);
     cfg.round_trip = false;
     let stats = run(&checker, &cfg);
     let report = stats.report(&checker);
@@ -31,7 +30,11 @@ fn generated_programs_agree() {
         stats.accepted * 100 >= stats.programs * 95,
         "too few generated programs are valid:\n{report}"
     );
-    assert!(stats.mutants > 500 && stats.mutants_accepted > 20, "too few mutants:\n{report}");
+    // About one mutant per four programs, a tenth of them valid.
+    assert!(
+        stats.mutants * 6 > stats.programs && stats.mutants_accepted * 100 > stats.programs,
+        "too few mutants:\n{report}"
+    );
     let gaps = stats.coverage.gaps(&checker.grammar);
     assert!(gaps.is_empty(), "parts of the grammar were never generated:\n{report}");
     assert!(stats.oracle_rules.iter().all(|n| *n > 0), "a rule is in no accepted parse:\n{report}");
@@ -41,12 +44,13 @@ fn generated_programs_agree() {
 fn generated_programs_round_trip_through_the_formatter() {
     let checker = Checker::default();
     // The oracle is checked above; this run is about the formatter, so it can be bigger.
-    let mut cfg = RunConfig::new(ROUND_TRIPS, SEED + 1);
+    let programs = common::sized(3000, 10_000);
+    let mut cfg = RunConfig::new(programs, SEED + 1);
     cfg.oracle = false;
     let stats = run(&checker, &cfg);
     let report = stats.report(&checker);
     println!("{report}");
-    assert!(stats.round_trips > ROUND_TRIPS * 9 / 10);
+    assert!(stats.round_trips > programs * 9 / 10);
     assert_eq!(stats.round_trip_failures, 0, "formatting changed or broke programs:\n{report}");
 }
 
@@ -54,25 +58,24 @@ fn generated_programs_round_trip_through_the_formatter() {
 fn the_conformance_suite_and_the_standard_library_agree() {
     let files = common::wrela_files();
     println!("{} .wrela files under compiler/", files.len());
-    common::with_big_stack(|| {
-        let checker = Checker::default();
-        let mut scratch = Scratch::default();
-        let mut failures = Vec::new();
-        for path in &files {
-            let src =
-                std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-            let check = checker.check(&src, &mut scratch);
-            if let Some(d) = check.disagreement {
-                failures.push(format!("{}: {d}", path.display()));
-            } else if check.accepted
-                && !check.lexical_errors
-                && let Err(e) = round_trip(&src)
-            {
-                failures.push(format!("{}: {e}", path.display()));
-            }
-        }
-        assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+    let checker = Checker::default();
+    let failures = Mutex::new(Vec::new());
+    common::par_each(&files, Scratch::default, |scratch, path| {
+        let src =
+            std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        let check = checker.check(&src, scratch);
+        let failure = if let Some(d) = check.disagreement {
+            Some(format!("{}: {d}", path.display()))
+        } else if check.accepted && !check.lexical_errors {
+            round_trip(&src).err().map(|e| format!("{}: {e}", path.display()))
+        } else {
+            None
+        };
+        failures.lock().expect("failures").extend(failure);
     });
+    let mut failures = failures.into_inner().expect("failures");
+    failures.sort();
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
 }
 
 #[test]

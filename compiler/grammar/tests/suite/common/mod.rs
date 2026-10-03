@@ -1,4 +1,4 @@
-//! Helpers shared by the integration tests (each test file uses some of them).
+//! Helpers shared by the integration tests (each test module uses some of them).
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
@@ -35,6 +35,42 @@ pub fn wrela_files() -> Vec<PathBuf> {
 pub fn roundtrip_sample() -> String {
     let path = repo_root().join("compiler/syntax/tests/sample.wrela");
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("reading {}: {e}", path.display()))
+}
+
+/// `small` normally, `full` when `WRELA_FULL` is set (as `tools/check.sh` does).
+pub fn sized<T>(small: T, full: T) -> T {
+    if std::env::var_os("WRELA_FULL").is_some() { full } else { small }
+}
+
+/// Calls `f` on each item, spread over the machine's threads, each with a big stack (see
+/// [`with_big_stack`]) and its own state from `init`.
+pub fn par_each<T: Sync, S>(
+    items: &[T],
+    init: impl Fn() -> S + Sync,
+    f: impl Fn(&mut S, &T) + Sync,
+) {
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(items.len());
+    std::thread::scope(|s| {
+        let workers: Vec<_> = (0..threads)
+            .map(|_| {
+                std::thread::Builder::new()
+                    .stack_size(256 << 20)
+                    .spawn_scoped(s, || {
+                        let mut state = init();
+                        loop {
+                            let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let Some(item) = items.get(i) else { break };
+                            f(&mut state, item);
+                        }
+                    })
+                    .expect("spawning a test thread")
+            })
+            .collect();
+        for w in workers {
+            w.join().unwrap_or_else(|p| std::panic::resume_unwind(p));
+        }
+    });
 }
 
 /// Runs `f` on a thread with a big stack: the oracle's derivation counting recurses once per

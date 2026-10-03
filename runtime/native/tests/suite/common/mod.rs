@@ -1,4 +1,4 @@
-#![allow(dead_code)] // each test binary uses part of this
+#![allow(dead_code)] // each test module uses part of this
 
 pub mod wat;
 
