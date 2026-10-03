@@ -27,11 +27,11 @@ fn rejects_another_manifest_version() {
 
 #[test]
 fn rejects_another_stream_version() {
-    let err = load_with_manifest("stream-v2", |m| {
-        m.replace("\"stream_version\": 1", "\"stream_version\": 2")
+    let err = load_with_manifest("stream-v9", |m| {
+        m.replace("\"stream_version\": 2", "\"stream_version\": 9")
     });
     assert!(matches!(&err, Error::Manifest(_)), "{err}");
-    assert!(err.to_string().contains("command stream version 2"), "{err}");
+    assert!(err.to_string().contains("command stream version 9"), "{err}");
 }
 
 #[test]

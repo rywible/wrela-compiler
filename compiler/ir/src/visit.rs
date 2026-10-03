@@ -54,7 +54,9 @@ impl Expr {
             | Expr::Splat(x, _)
             | Expr::Swizzle(x, _)
             | Expr::Convert(x, _)
-            | Expr::Bitcast(x, _) => f(*x),
+            | Expr::Bitcast(x, _)
+            | Expr::Variant(_, _, Some(x)) => f(*x),
+            Expr::Variant(_, _, None) => {}
             Expr::Binary(_, a, b) | Expr::ExtractDyn(a, b) => {
                 f(*a);
                 f(*b);
@@ -89,7 +91,9 @@ impl Expr {
             | Expr::Splat(x, _)
             | Expr::Swizzle(x, _)
             | Expr::Convert(x, _)
-            | Expr::Bitcast(x, _) => f(x),
+            | Expr::Bitcast(x, _)
+            | Expr::Variant(_, _, Some(x)) => f(x),
+            Expr::Variant(_, _, None) => {}
             Expr::Binary(_, a, b) | Expr::ExtractDyn(a, b) => {
                 f(a);
                 f(b);
@@ -140,6 +144,7 @@ impl Expr {
             | Expr::ExtractDyn(..)
             | Expr::Builtin(..)
             | Expr::Construct(..)
+            | Expr::Variant(..)
             | Expr::Host(..)
             | Expr::Select { .. } => {}
         }
@@ -170,6 +175,7 @@ impl Expr {
             | Expr::ExtractDyn(..)
             | Expr::Builtin(..)
             | Expr::Construct(..)
+            | Expr::Variant(..)
             | Expr::Host(..)
             | Expr::Select { .. } => {}
         }
@@ -195,7 +201,8 @@ impl Stmt {
             | Stmt::Break
             | Stmt::Continue
             | Stmt::Return(_)
-            | Stmt::Trap => None,
+            | Stmt::Trap
+            | Stmt::At(_) => None,
         }
     }
 
@@ -208,7 +215,8 @@ impl Stmt {
             | Stmt::Break
             | Stmt::Continue
             | Stmt::Return(_)
-            | Stmt::Trap => None,
+            | Stmt::Trap
+            | Stmt::At(_) => None,
         }
     }
 
@@ -222,7 +230,12 @@ impl Stmt {
             }
             Stmt::If { cond, .. } => f(*cond),
             Stmt::Return(Some(v)) => f(*v),
-            Stmt::Loop { .. } | Stmt::Break | Stmt::Continue | Stmt::Return(None) | Stmt::Trap => {}
+            Stmt::Loop { .. }
+            | Stmt::Break
+            | Stmt::Continue
+            | Stmt::Return(None)
+            | Stmt::Trap
+            | Stmt::At(_) => {}
         }
     }
 
@@ -235,7 +248,12 @@ impl Stmt {
             }
             Stmt::If { cond, .. } => f(cond),
             Stmt::Return(Some(v)) => f(v),
-            Stmt::Loop { .. } | Stmt::Break | Stmt::Continue | Stmt::Return(None) | Stmt::Trap => {}
+            Stmt::Loop { .. }
+            | Stmt::Break
+            | Stmt::Continue
+            | Stmt::Return(None)
+            | Stmt::Trap
+            | Stmt::At(_) => {}
         }
     }
 
@@ -249,7 +267,8 @@ impl Stmt {
             | Stmt::Break
             | Stmt::Continue
             | Stmt::Return(_)
-            | Stmt::Trap => {}
+            | Stmt::Trap
+            | Stmt::At(_) => {}
         }
     }
 
@@ -262,7 +281,8 @@ impl Stmt {
             | Stmt::Break
             | Stmt::Continue
             | Stmt::Return(_)
-            | Stmt::Trap => {}
+            | Stmt::Trap
+            | Stmt::At(_) => {}
         }
     }
 
@@ -278,7 +298,8 @@ impl Stmt {
             | Stmt::Break
             | Stmt::Continue
             | Stmt::Return(_)
-            | Stmt::Trap => Vec::new(),
+            | Stmt::Trap
+            | Stmt::At(_) => Vec::new(),
         }
     }
 
@@ -292,7 +313,8 @@ impl Stmt {
             | Stmt::Break
             | Stmt::Continue
             | Stmt::Return(_)
-            | Stmt::Trap => Vec::new(),
+            | Stmt::Trap
+            | Stmt::At(_) => Vec::new(),
         }
     }
 }

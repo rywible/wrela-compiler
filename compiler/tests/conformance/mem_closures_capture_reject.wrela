@@ -1,0 +1,9 @@
+// rejects: mem.closures
+fn apply(f: fn(f32) -> f32, x: f32) -> f32 {
+    f(x)
+}
+
+pub fn twice_plus_one(x: f32) -> f32 {
+    let double = |y: f32| 2.0 * y //~ E0702
+    apply(|z| double(z) + 1.0, x)
+}

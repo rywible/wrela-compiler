@@ -262,31 +262,31 @@ impl<'a> Cx<'a> {
         }
     }
 
-    /// Whether an exported function's signature can cross the WASM boundary: scalars in, and a
-    /// scalar, a vector or nothing out.
+    /// Whether an exported function's signature can cross the WASM boundary: scalars and
+    /// vectors in, and a scalar, a vector or nothing out.
     fn check_export(&mut self, f: FnId) -> bool {
-        let def = self.checked.program.func(f).clone();
+        let def = self.checked.program.func(f);
         let mut ok = true;
         let exportable = |t: &TyKind, ret: bool| match t {
             TyKind::Bool | TyKind::Int(_) | TyKind::Float(_) => true,
-            TyKind::Vec(_) => ret,
+            TyKind::Vec(_) => true,
             TyKind::Tuple(ts) => ret && ts.is_empty(),
             _ => false,
         };
         for p in &def.params {
-            let k = self.checked.program.types.kind(p.ty).clone();
-            if !exportable(&k, false) || p.mode != wrela_sema::defs::Mode::Borrow {
+            let k = self.checked.program.types.kind(p.ty);
+            if !exportable(k, false) || p.mode != wrela_sema::defs::Mode::Borrow {
                 ok = false;
                 let shown = self.checked.program.display_ty(p.ty);
                 self.err(
-                    Diagnostic::new(wrela_diag::codes::E0703, p.span, format!("`{}` is exported from the program, so its parameters are numbers or bools; `{}` is a `{shown}`", def.name, p.name))
+                    Diagnostic::new(wrela_diag::codes::E0703, p.span, format!("`{}` is exported from the program, so its parameters are numbers, bools or vectors; `{}` is a `{shown}`", def.name, p.name))
                         .with_note("the entry module's `pub fn`s are the program's exports, called by the host")
                         .with_help("make it private (drop `pub`) if the host doesn't call it"),
                 );
             }
         }
-        let rk = self.checked.program.types.kind(def.ret).clone();
-        if !exportable(&rk, true) || def.ret_mode != wrela_sema::defs::RetMode::Owned {
+        let rk = self.checked.program.types.kind(def.ret);
+        if !exportable(rk, true) || def.ret_mode != wrela_sema::defs::RetMode::Owned {
             ok = false;
             let shown = self.checked.program.display_ty(def.ret);
             self.err(

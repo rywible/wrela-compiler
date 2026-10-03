@@ -70,6 +70,10 @@ export class Checker {
         this.#buffers.set(handle, size);
         return;
       }
+      case "DestroyBuffer":
+        this.#size(cmd.op, cmd.handle);
+        this.#buffers.delete(cmd.handle);
+        return;
       case "WriteBuffer": {
         const { handle, offset, data } = cmd;
         const size = this.#size(cmd.op, handle);

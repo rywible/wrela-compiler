@@ -3,3 +3,13 @@ fn f() -> u8 {
     let x: u8 = 256 //~ E0006
     x
 }
+
+fn g() -> u32 {
+    let hex = 0x //~ E0004
+    let small = 1e //~ E0004
+    1
+}
+
+fn h(t: (f32, f32)) -> f32 {
+    t.0x //~ E0004
+}

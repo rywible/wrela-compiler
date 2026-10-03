@@ -112,7 +112,7 @@ impl Infer {
         b: TyId,
         done: &mut HashSet<(TyId, TyId)>,
     ) -> Result<(), Mismatch> {
-        let (ka, kb) = (types.kind(a).clone(), types.kind(b).clone());
+        let (ka, kb) = (types.kind(a), types.kind(b));
         match (&ka, &kb) {
             (TyKind::Error, _) | (_, TyKind::Error) => Ok(()),
             (TyKind::Var(x), TyKind::Var(y)) => {

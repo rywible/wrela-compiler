@@ -5,7 +5,7 @@ use super::*;
 use crate::check::{Checker, Limits};
 use wrela_abi::Manifest;
 use wrela_abi::manifest::{Access, BufferBinding, Pipeline, Stage, UniformBlock, UniformSpace};
-use wrela_abi::stream::{Encoder, Opcode, StreamError};
+use wrela_abi::stream::{Encoder, Opcode, StreamError, VERSION};
 
 #[path = "../../tests/common/wat.rs"]
 mod wat_gen;
@@ -161,10 +161,10 @@ fn hashes_every_submitted_byte() {
 #[test]
 fn rejects_another_stream_version() {
     let mut batch = Encoder::new().present().finish();
-    batch[4] = 2;
+    batch[4] = 9;
     let err = run_err(&[vec![batch]]);
     assert!(
-        matches!(err, Error::Stream(StreamError::WrongVersion { expected: 1, got: 2 })),
+        matches!(err, Error::Stream(StreamError::WrongVersion { expected: VERSION, got: 9 })),
         "{err}"
     );
 }

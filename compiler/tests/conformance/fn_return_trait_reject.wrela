@@ -8,3 +8,7 @@ fn shape(round: bool) -> Surface {
         ellipsoid(vec3(1.0, 2.0, 1.0)) //~ E0300
     }
 }
+
+fn ball(r: f32) -> Surface { //~ E0409
+    ball(r)
+}

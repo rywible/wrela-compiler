@@ -1,0 +1,26 @@
+// run: exports take vectors as their components
+// expect: dot3(1.0, 2.0, 3.0, 4.0, 5.0, 6.0) = 32.0
+// expect: mixed(2.0, 1.0, 2.0, 3) = 9.0
+// expect: second(1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0) = 5.0
+// expect: nested(1.0, 2.0, 3.0, 4.0) = 10.0
+
+pub fn dot3(a: vec3, b: vec3) -> f32 {
+    dot(a, b)
+}
+
+pub fn mixed(s: f32, v: vec2, n: u32) -> f32 {
+    s * (v.x + v.y) + f32(n)
+}
+
+pub fn second(a: vec3, b: vec4) -> f32 {
+    b.y
+}
+
+pub fn nested(v: vec4) -> f32 {
+    let w = twice(v)
+    (w.x + w.y + w.z + w.w) / 2.0
+}
+
+fn twice(v: vec4) -> vec4 {
+    v * 2.0
+}

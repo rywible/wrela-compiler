@@ -365,7 +365,7 @@ pub(crate) fn intrinsic(
             let values = c.args[2].place()?;
             let vt = mir::place_ty(&fl.cx.checked.program, &fl.mir.locals, values);
             let vt = fl.concrete(vt);
-            let run = match fl.cx.checked.program.types.kind(vt).clone() {
+            let run = match fl.cx.checked.program.types.kind(vt) {
                 TyKind::Array(..) => {
                     let p = fl.place(values)?;
                     fl.value(run_t, ir::Expr::Run(p))
@@ -618,7 +618,7 @@ fn bind_uniform(
 }
 
 fn lower_compute(cx: &mut Cx, _index: u32, kernel: FnId, substs: &[TyId]) -> Option<PipelineOut> {
-    let def = cx.checked.program.func(kernel).clone();
+    let def = cx.checked.program.func(kernel);
     let Some(Entry::Compute(wg)) = def.attrs.entry.map(|e| e.0) else { return None };
     let mut mb = ModuleBuilder::new(ir::Target::Gpu);
     mb.gpu = Some(GpuCx::new(
@@ -684,8 +684,8 @@ fn lower_render(
     fragment: &(FnId, Vec<TyId>),
     key: &PipelineKey,
 ) -> Option<PipelineOut> {
-    let vdef = cx.checked.program.func(vertex.0).clone();
-    let fdef = cx.checked.program.func(fragment.0).clone();
+    let vdef = cx.checked.program.func(vertex.0);
+    let fdef = cx.checked.program.func(fragment.0);
     let mut mb = ModuleBuilder::new(ir::Target::Gpu);
     mb.gpu = Some(GpuCx::new(
         format!("the vertex shader `{}`", vdef.name),
@@ -778,8 +778,8 @@ fn varying_layout(
     if is_clip_position(cx, vret) {
         return Some((0, vec![false]));
     }
-    let TyKind::Adt(a, args) = cx.checked.program.types.kind(vret).clone() else { return None };
-    let fields = cx.checked.program.struct_fields(a, &args);
+    let TyKind::Adt(a, args) = cx.checked.program.types.kind(vret) else { return None };
+    let fields = cx.checked.program.struct_fields(*a, args);
     let map = cx.field_map(mb, vret, None, span);
     let mut position = None;
     let mut flat = Vec::new();
@@ -988,7 +988,7 @@ pub(crate) fn check_standalone(cx: &mut Cx, f: FnId, entry: Option<Entry>) {
             let _ = lower_compute(cx, u32::MAX, f, &[]);
         }
         Some(stage) => {
-            let def = cx.checked.program.func(f).clone();
+            let def = cx.checked.program.func(f);
             let mut mb = ModuleBuilder::new(ir::Target::Gpu);
             let kind = if stage == Entry::Vertex { "vertex" } else { "fragment" };
             mb.gpu =
@@ -1017,7 +1017,7 @@ pub(crate) fn check_standalone(cx: &mut Cx, f: FnId, entry: Option<Entry>) {
         }
         None => {
             // `@gpu`: an ordinary function, lowered for the GPU.
-            let def = cx.checked.program.func(f).clone();
+            let def = cx.checked.program.func(f);
             let mut mb = ModuleBuilder::new(ir::Target::Gpu);
             mb.gpu =
                 Some(GpuCx::new(format!("the `@gpu` function `{}`", def.name), Vec::new(), None));
@@ -1245,21 +1245,27 @@ pub(crate) fn lower_derived(
             }
         }
         Err(e) => {
-            // Reported where the interpretation is asked for: the `gradient(..)` or
-            // `interval(..)` call that made this instance.
-            let Some(&(_, span)) = mb.callers.get(&id) else {
+            // Reported at the code that can't be derived, if the IR says where, with the
+            // `gradient(..)` or `interval(..)` call that asked for it.
+            let Some(&(_, call)) = mb.callers.get(&id) else {
                 cx.err(Diagnostic::internal(format!("a derived function with no caller: {e}")));
                 return;
             };
             let code = match &e {
-                ir::Error::NotDerivable(_) => codes::E0700,
-                ir::Error::ActiveLoopExit(_) => codes::E0701,
+                ir::Error::NotDerivable(..) => codes::E0700,
+                ir::Error::ActiveLoopExit(..) => codes::E0701,
                 ir::Error::Internal(m) => {
                     cx.err(Diagnostic::internal(format!("deriving a function failed: {m}")));
                     return;
                 }
             };
-            cx.err(Diagnostic::new(code, span, format!("can't derive this function: {e}")));
+            let d = match e.span() {
+                Some(at) if at != call => {
+                    Diagnostic::new(code, at, e.to_string()).with_secondary(call, "derived here")
+                }
+                _ => Diagnostic::new(code, call, format!("can't derive this function: {e}")),
+            };
+            cx.err(d);
         }
     }
 }

@@ -1,0 +1,56 @@
+// run: enums whose variants carry payloads of different sizes, built, copied and matched
+// expect: total(0) = 0
+// expect: total(1) = 7
+// expect: total(2) = 39
+// expect: total(3) = 136
+// expect: mixed() = 182
+
+enum Item: Copy + Clone {
+    Empty,
+    Small { a: i32 },
+    Wide { a: i32, b: vec4, c: vec4 },
+    Big { xs: [i32; 16] },
+}
+
+fn make(k: i32) -> Item {
+    if k == 0 {
+        Item::Empty
+    } else if k == 1 {
+        Item::Small { a: 7 }
+    } else if k == 2 {
+        Item::Wide { a: 3, b: vec4(1.0, 2.0, 3.0, 4.0), c: vec4(5.0, 6.0, 7.0, 8.0) }
+    } else {
+        var xs: [i32; 16] = [0; 16]
+        for i in 0..16 {
+            xs[i] = i32(i)
+        }
+        Item::Big { xs: xs }
+    }
+}
+
+fn value(it: Item) -> i32 {
+    match it {
+        Item::Empty => 0,
+        Item::Small { a } => a,
+        Item::Wide { a, b, c } => a + i32(b.x + b.y + b.z + b.w + c.x + c.y + c.z + c.w),
+        Item::Big { xs } => {
+            var s = 16
+            for i in 0..16 {
+                s += xs[i]
+            }
+            s
+        }
+    }
+}
+
+pub fn total(k: i32) -> i32 {
+    value(make(k))
+}
+
+pub fn mixed() -> i32 {
+    // Copies of each variant side by side in an array, read back after being overwritten.
+    var items = [make(3), make(2), make(1), make(0)]
+    let first = items[0]
+    items[0] = make(1)
+    value(first) + value(items[0]) + value(items[1]) + value(items[2]) + value(items[3]) - 7
+}

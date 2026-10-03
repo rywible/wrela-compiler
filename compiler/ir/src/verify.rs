@@ -188,6 +188,22 @@ impl Verifier<'_> {
                 self.construct(*t, parts)?;
                 Some(*t)
             }
+            Expr::Variant(t, k, payload) => {
+                let TypeDef::Enum { variants, .. } = self.def(*t) else {
+                    return Err(bug(format!("a variant of `{}`", self.show(*t))));
+                };
+                let Some((name, want)) = variants.get(*k as usize) else {
+                    return Err(bug(format!("variant {k} of `{}`", self.show(*t))));
+                };
+                match (want, payload) {
+                    (Some(w), Some(p)) => {
+                        self.expect(&format!("`{name}`'s payload"), *w, self.ty(*p))?
+                    }
+                    (None, None) => {}
+                    _ => return Err(bug(format!("`{name}` built with the wrong payload"))),
+                }
+                Some(*t)
+            }
             Expr::Extract(x, k) => Some(self.extract(self.ty(*x), *k)?),
             Expr::ExtractDyn(x, i) => {
                 if !self.scalar(self.ty(*i)).is_some_and(|s| s.is_int()) {
@@ -386,7 +402,7 @@ impl Verifier<'_> {
     fn extract(&self, t: TypeId, k: u32) -> Result<TypeId> {
         let types = &self.m.types;
         let r = match self.def(t) {
-            TypeDef::Struct { fields, .. } => fields.get(k as usize).map(|f| f.1),
+            TypeDef::Struct { .. } | TypeDef::Enum { .. } => types.field(t, k),
             TypeDef::Vector(n) if k < u32::from(*n) => types.lookup(&TypeDef::Scalar(Scalar::F32)),
             TypeDef::Matrix(n) if k < u32::from(*n) => types.lookup(&TypeDef::Vector(*n)),
             TypeDef::Array(e, n) if k < *n => Some(*e),
@@ -446,7 +462,7 @@ impl Verifier<'_> {
                 Stmt::Break | Stmt::Continue if self.loops == 0 => {
                     return Err(bug("break or continue outside a loop".into()));
                 }
-                Stmt::Break | Stmt::Continue | Stmt::Trap => {}
+                Stmt::Break | Stmt::Continue | Stmt::Trap | Stmt::At(_) => {}
                 Stmt::Return(v) => match (v, self.f.ret) {
                     (Some(v), Some(r)) => {
                         self.visible(*v)?;

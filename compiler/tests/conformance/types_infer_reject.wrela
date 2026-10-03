@@ -1,0 +1,6 @@
+// rejects: ty.arrays
+fn f() -> i32 {
+    let empty = [] //~ E0306
+    let get = |p| p.x //~ E0306
+    1
+}

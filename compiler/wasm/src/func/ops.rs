@@ -1143,10 +1143,38 @@ pub(super) fn helper_bodies(h: &Helpers) -> Vec<(Vec<ValType>, Vec<ValType>, Fun
     write.extend([I::LocalGet(ptr), I::LocalGet(chunk), I::I32Add, I::LocalSet(ptr)]);
     write.extend([I::LocalGet(n), I::LocalGet(chunk), I::I32Sub, I::LocalSet(n)]);
     write.extend([I::Br(0), I::End, I::End, I::End]);
+    // release(): DestroyBuffer for each buffer made since the last release (handles
+    // LIVE_FROM..NEXT_HANDLE), then LIVE_FROM = NEXT_HANDLE.
+    let a = 0;
+    let mut release = vec![I::Block(BlockType::Empty), I::Loop(BlockType::Empty)];
+    release.extend([
+        I::GlobalGet(globals::LIVE_FROM),
+        I::GlobalGet(globals::NEXT_HANDLE),
+        I::I32GeU,
+        I::BrIf(1),
+        I::I32Const((CMD_HEADER + 4) as i32),
+        I::Call(h.reserve),
+        I::LocalSet(a),
+    ]);
+    let w = |x: I<'static>, off: u32| [I::LocalGet(a), x, I::I32Store(mem(off, 2))];
+    release.extend(w(I::I32Const(wrela_abi::stream::Opcode::DestroyBuffer as i32), 0));
+    release.extend(w(I::I32Const(4), 4));
+    release.extend(w(I::GlobalGet(globals::LIVE_FROM), CMD_HEADER));
+    release.extend([
+        I::GlobalGet(globals::LIVE_FROM),
+        I::I32Const(1),
+        I::I32Add,
+        I::GlobalSet(globals::LIVE_FROM),
+        I::Br(0),
+        I::End,
+        I::End,
+        I::End,
+    ]);
     let i32x = |k| vec![ValType::I32; k];
     vec![
         (vec![], vec![], finish(vec![], flush)),
         (i32x(1), i32x(1), finish(vec![], reserve)),
         (i32x(4), vec![], finish(i32x(2), write)),
+        (vec![], vec![], finish(i32x(1), release)),
     ]
 }

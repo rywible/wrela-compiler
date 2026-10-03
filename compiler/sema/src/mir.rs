@@ -479,7 +479,7 @@ pub fn describe(p: &crate::program::Program, locals: &[LocalDecl], place: &Place
         match proj {
             Proj::Field(i) => {
                 let base = place_ty(p, locals, &sub);
-                let name = match p.types.kind(base).clone() {
+                let name = match p.types.kind(base) {
                     TyKind::Adt(a, args) => {
                         let variant = sub.proj.iter().rev().find_map(|x| match x {
                             Proj::Downcast(v) => Some(*v),
@@ -487,9 +487,9 @@ pub fn describe(p: &crate::program::Program, locals: &[LocalDecl], place: &Place
                         });
                         let fields = match variant {
                             Some(v) if matches!(sub.proj.last(), Some(Proj::Downcast(_))) => {
-                                p.variant_fields(a, &args, v as usize)
+                                p.variant_fields(*a, args, v as usize)
                             }
-                            _ => p.struct_fields(a, &args),
+                            _ => p.struct_fields(*a, args),
                         };
                         fields.get(*i as usize).map_or_else(|| i.to_string(), |f| f.0.clone())
                     }

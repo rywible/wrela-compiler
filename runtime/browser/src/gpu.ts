@@ -143,6 +143,8 @@ export class GpuExecutor {
   readonly #align: number;
   readonly #buffers = new Map<number, GPUBuffer>();
   readonly #bindGroups = new Map<string, GPUBindGroup>();
+  /** Buffers destroyed by the program, released once the work recorded before is submitted. */
+  readonly #doomed: GPUBuffer[] = [];
   #ring: GPUBuffer;
   #ringCapacity = RING_START;
   #staging: Bytes = new Uint8Array(RING_START);
@@ -194,6 +196,16 @@ export class GpuExecutor {
       case "Present":
         this.#present();
         return;
+      case "DestroyBuffer": {
+        // Recorded work may still use it: it's destroyed once that work is submitted.
+        this.#doomed.push(this.#buffer(cmd.handle));
+        this.#buffers.delete(cmd.handle);
+        for (const key of [...this.#bindGroups.keys()]) {
+          const handles = key.slice(key.indexOf(":") + 1).split(",");
+          if (handles.includes(String(cmd.handle))) this.#bindGroups.delete(key);
+        }
+        return;
+      }
     }
   }
 
@@ -206,6 +218,7 @@ export class GpuExecutor {
     }
     this.device.queue.submit([this.#encoder.finish()]);
     this.#encoder = null;
+    for (const b of this.#doomed.splice(0)) b.destroy();
   }
 
   /** The GPU buffer behind a handle (for reading back in tests). */

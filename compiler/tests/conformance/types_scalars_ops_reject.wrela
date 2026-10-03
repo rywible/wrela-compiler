@@ -1,0 +1,12 @@
+// rejects: ty.scalars ty.vectors
+fn call(a: i32) -> i32 {
+    a(1) //~ E0310
+}
+
+fn field(a: i32) -> i32 {
+    a.x //~ E0311
+}
+
+fn convert(v: vec3) -> f32 {
+    f32(v) //~ E0319
+}

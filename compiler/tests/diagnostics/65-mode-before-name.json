@@ -1,0 +1,44 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0100",
+      "file": "main.wrela",
+      "fixes": [
+        {
+          "edits": [
+            {
+              "end": 135,
+              "file": "main.wrela",
+              "replacement": "",
+              "start": 131
+            },
+            {
+              "end": 142,
+              "file": "main.wrela",
+              "replacement": "mut ",
+              "start": 142
+            }
+          ],
+          "message": "write `total: mut ..`"
+        }
+      ],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "a parameter's mode is written with its type: `total: mut T`",
+      "notes": [],
+      "severity": "error",
+      "span": {
+        "column": 23,
+        "end": 134,
+        "end_column": 26,
+        "end_line": 4,
+        "line": 4,
+        "start": 131
+      },
+      "title": "unexpected token"
+    }
+  ],
+  "version": 2
+}

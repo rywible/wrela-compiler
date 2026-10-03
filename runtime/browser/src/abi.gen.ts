@@ -1,7 +1,7 @@
 // Generated from the wrela-abi crate (runtime/abi): the one definition of the
 // command stream and manifest. Don't edit; run `cargo run -p wrela-abi --bin gen-ts`.
 
-export const STREAM_VERSION = 1;
+export const STREAM_VERSION = 2;
 export const MANIFEST_VERSION = 1;
 /** The bytes `WRCS`, read as a little-endian u32. */
 export const STREAM_MAGIC = 0x53435257;
@@ -15,6 +15,7 @@ export const Opcode = {
   BeginScreenPass: 4,
   Draw: 5,
   Present: 6,
+  DestroyBuffer: 7,
 } as const;
 
 export const IMPORT_MODULE = "wrela";

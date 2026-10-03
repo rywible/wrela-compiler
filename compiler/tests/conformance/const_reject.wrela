@@ -4,3 +4,7 @@ fn twice(x: u32) -> u32 {
 }
 
 const SIZE: u32 = twice(32) //~ E0906
+
+const A: u32 = B //~ E0328
+const B: u32 = A
+const C: u32 = C //~ E0328

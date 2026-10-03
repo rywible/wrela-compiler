@@ -65,8 +65,9 @@ pub(crate) struct Activity {
     pub locals: Vec<bool>,
     pub params: Vec<bool>,
     pub returns: bool,
-    /// Interval mode: a loop whose exit depends on the input (unsupported).
-    pub active_loop_exit: bool,
+    /// Interval mode: a loop whose exit depends on the input (unsupported), and where its
+    /// exit's condition is in the source, if known.
+    pub active_loop_exit: Option<Option<wrela_diag::Span>>,
 }
 
 pub(crate) fn place_root_active(a: &Activity, p: &Place) -> bool {
@@ -102,7 +103,7 @@ pub(crate) fn activity(
         locals: vec![false; f.locals.len()],
         params: params.to_vec(),
         returns: false,
-        active_loop_exit: false,
+        active_loop_exit: None,
     };
     let mut uses = vec![0u32; f.locals.len()];
     count_local_uses(&f.body, &mut uses);
@@ -186,6 +187,7 @@ fn walk(
         (Some(inside), PlaceRoot::Local(l)) => !inside.contains(l),
         (Some(_), _) => true,
     };
+    let mut at = None;
     for s in b {
         match s {
             Stmt::Let(v, e) => {
@@ -223,8 +225,11 @@ fn walk(
             Stmt::Loop { body, continuing } => {
                 walk(cx, body, a, ctrl, callee_returns)?;
                 walk(cx, continuing, a, ctrl, callee_returns)?;
-                if mode == Mode::Interval && loop_exit_active(body, a) {
-                    a.active_loop_exit = true;
+                if mode == Mode::Interval
+                    && a.active_loop_exit.is_none()
+                    && let Some(exit) = loop_exit(body, a, at)
+                {
+                    a.active_loop_exit = Some(exit);
                 }
             }
             Stmt::Return(Some(v)) => {
@@ -232,6 +237,7 @@ fn walk(
                     a.returns = true;
                 }
             }
+            Stmt::At(span) => at = Some(*span),
             Stmt::Return(None) | Stmt::Break | Stmt::Continue | Stmt::Trap => {}
         }
     }
@@ -240,7 +246,13 @@ fn walk(
 
 /// Whether a loop's `break`, `continue` (or `return`) sits under a condition that depends on
 /// the input.
-fn loop_exit_active(b: &Block, a: &Activity) -> bool {
+/// If so, where the condition is in the source, if known (the last `At` before it; `at` before
+/// the block).
+fn loop_exit(
+    b: &Block,
+    a: &Activity,
+    mut at: Option<wrela_diag::Span>,
+) -> Option<Option<wrela_diag::Span>> {
     fn exits(b: &Block) -> bool {
         b.iter().any(|s| match s {
             Stmt::Break | Stmt::Continue | Stmt::Return(_) => true,
@@ -248,14 +260,21 @@ fn loop_exit_active(b: &Block, a: &Activity) -> bool {
             _ => false,
         })
     }
-    b.iter().any(|s| match s {
-        Stmt::If { cond, then, else_ } => {
-            (a.values[cond.index()] && (exits(then) || exits(else_)))
-                || loop_exit_active(then, a)
-                || loop_exit_active(else_, a)
+    for s in b {
+        match s {
+            Stmt::At(span) => at = Some(*span),
+            Stmt::If { cond, then, else_ } => {
+                if a.values[cond.index()] && (exits(then) || exits(else_)) {
+                    return Some(at);
+                }
+                if let Some(e) = loop_exit(then, a, at).or_else(|| loop_exit(else_, a, at)) {
+                    return Some(e);
+                }
+            }
+            _ => {}
         }
-        _ => false,
-    })
+    }
+    None
 }
 
 /// A callee given active arguments may write active values through its `mut` parameters, and
@@ -302,7 +321,9 @@ fn expr_active(
         | Expr::Splat(x, _)
         | Expr::Swizzle(x, _)
         | Expr::Convert(x, _)
-        | Expr::Bitcast(x, _) => v(x),
+        | Expr::Bitcast(x, _)
+        | Expr::Variant(_, _, Some(x)) => v(x),
+        Expr::Variant(_, _, None) => false,
         Expr::Binary(_, x, y) | Expr::ExtractDyn(x, y) => v(x) || v(y),
         Expr::Builtin(_, xs) | Expr::Construct(_, xs) | Expr::Host(_, xs) => xs.iter().any(v),
         Expr::Select { cond, if_true, if_false } => v(cond) || v(if_true) || v(if_false),
@@ -366,7 +387,12 @@ impl LoadTwins {
             | Stmt::Store(..)
             | Stmt::If { .. }
             | Stmt::Loop { .. } => self.loads.clear(),
-            Stmt::Let(..) | Stmt::Break | Stmt::Continue | Stmt::Return(_) | Stmt::Trap => {}
+            Stmt::Let(..)
+            | Stmt::Break
+            | Stmt::Continue
+            | Stmt::Return(_)
+            | Stmt::Trap
+            | Stmt::At(_) => {}
         }
     }
 
@@ -413,21 +439,28 @@ pub(super) fn pass_through(
     Ok(())
 }
 
-pub(crate) fn has_host_or_ptr(b: &Block) -> Option<&'static str> {
+pub(crate) fn has_host_or_ptr(
+    b: &Block,
+    mut at: Option<wrela_diag::Span>,
+) -> Option<(&'static str, Option<wrela_diag::Span>)> {
     for s in b {
         match s {
+            Stmt::At(span) => at = Some(*span),
             Stmt::Let(_, Expr::Host(..)) | Stmt::Eval(Expr::Host(..)) => {
-                return Some("records GPU work");
+                return Some(("records GPU work, which a derived function can't do", at));
             }
-            Stmt::Let(_, Expr::Addr(_)) => return Some("returns a projection"),
+            Stmt::Let(_, Expr::Addr(_)) => {
+                return Some(("returns a projection, which a derived function can't do", at));
+            }
             Stmt::If { then, else_, .. } => {
-                if let Some(r) = has_host_or_ptr(then).or_else(|| has_host_or_ptr(else_)) {
+                if let Some(r) = has_host_or_ptr(then, at).or_else(|| has_host_or_ptr(else_, at)) {
                     return Some(r);
                 }
             }
             Stmt::Loop { body, continuing } => {
-                if let Some(r) = has_host_or_ptr(body).or_else(|| has_host_or_ptr(continuing)) {
-                    return Some(r);
+                let r = has_host_or_ptr(body, at).or_else(|| has_host_or_ptr(continuing, at));
+                if r.is_some() {
+                    return r;
                 }
             }
             _ => {}

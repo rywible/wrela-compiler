@@ -14,3 +14,7 @@ fn d(x: dyn Shape) { //~ E0905
 trait Shape {
     fn area(self) -> f32
 }
+
+fn e() {
+    let s = "a\q" //~ E0901 E0005
+}

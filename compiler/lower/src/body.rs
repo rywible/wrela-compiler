@@ -150,6 +150,19 @@ impl<'c, 'a> Fl<'c, 'a> {
         self.blocks.last().is_some_and(|b| b.1)
     }
 
+    /// Marks where the code that follows comes from (`ir::Stmt::At`): a marker that nothing
+    /// followed yet is replaced.
+    fn at(&mut self, span: Span) {
+        let (b, term) = self.blocks.last_mut().expect("a block is open");
+        if *term {
+            return;
+        }
+        match b.last_mut() {
+            Some(ir::Stmt::At(s)) => *s = span,
+            _ => b.push(ir::Stmt::At(span)),
+        }
+    }
+
     pub fn push_block(&mut self) {
         self.blocks.push((Vec::new(), false));
     }
@@ -332,6 +345,7 @@ impl<'c, 'a> Fl<'c, 'a> {
             for s in &block.stmts {
                 self.statement(s);
             }
+            self.at(block.term.span);
             match &block.term.kind {
                 TerminatorKind::Goto(t) => b = *t,
                 TerminatorKind::If { cond, then, else_, merge } => {
@@ -438,6 +452,9 @@ impl<'c, 'a> Fl<'c, 'a> {
     fn statement(&mut self, s: &mir::Statement) {
         if self.terminated() {
             return;
+        }
+        if !matches!(s.kind, StatementKind::Live(_) | StatementKind::Dead(_)) {
+            self.at(s.span);
         }
         match &s.kind {
             StatementKind::Assign(place, r) => self.assign(place, r, s.span),
@@ -658,7 +675,7 @@ impl<'c, 'a> Fl<'c, 'a> {
                 }
                 mir::Proj::Index(t) => {
                     let iv = self.local_value(*t)?;
-                    let k = self.types().kind(ty).clone();
+                    let k = self.types().kind(ty);
                     if let TyKind::Adt(a, args) = &k
                         && self.cx.checked.program.is_lang_adt(*a, Lang::Slots)
                     {
@@ -669,9 +686,9 @@ impl<'c, 'a> Fl<'c, 'a> {
                     }
                     place = place.with(ir::Proj::Index(iv));
                     ty = match k {
-                        TyKind::Array(e, _) | TyKind::Slice(e) => e,
+                        TyKind::Array(e, _) | TyKind::Slice(e) => *e,
                         TyKind::Vec(_) => self.types().f32,
-                        TyKind::Mat(n) => self.types().vec(n),
+                        TyKind::Mat(n) => self.types().vec(*n),
                         _ => self.types().error,
                     };
                 }
@@ -682,11 +699,11 @@ impl<'c, 'a> Fl<'c, 'a> {
 
     fn field_ty(&self, ty: TyId, variant: Option<u32>, i: u32) -> TyId {
         let p = &self.cx.checked.program;
-        match p.types.kind(ty).clone() {
+        match p.types.kind(ty) {
             TyKind::Adt(a, args) => {
                 let fields = match variant {
-                    Some(v) => p.variant_fields(a, &args, v as usize),
-                    None => p.struct_fields(a, &args),
+                    Some(v) => p.variant_fields(*a, args, v as usize),
+                    None => p.struct_fields(*a, args),
                 };
                 fields.get(i as usize).map_or(p.types.error, |f| f.1)
             }
@@ -1020,8 +1037,8 @@ impl<'c, 'a> Fl<'c, 'a> {
         let mut comps = Vec::new();
         for (v, vt) in vals {
             let vt = self.concrete(vt);
-            match self.types().kind(vt).clone() {
-                TyKind::Vec(m) => {
+            match self.types().kind(vt) {
+                &TyKind::Vec(m) => {
                     for c in 0..m {
                         comps.push(self.value(f32, ir::Expr::Extract(v, c as u32)));
                     }
@@ -1055,21 +1072,13 @@ impl<'c, 'a> Fl<'c, 'a> {
         match variant {
             None => Some(self.value(it, ir::Expr::Construct(it, vals))),
             Some(v) => {
-                // { tag, payload of each variant that has one }: this variant's filled in.
-                let ir::TypeDef::Struct { fields: ir_fields, .. } = self.mb.m.types.get(it).clone()
-                else {
-                    return None;
-                };
-                let payload = self.cx.payload_field(self.mb, ct, v, span);
-                let mut parts = vec![self.u32c(v)];
-                for (fi, (_, ft)) in ir_fields.iter().enumerate().skip(1) {
-                    if Some(fi as u32) == payload {
-                        parts.push(self.value(*ft, ir::Expr::Construct(*ft, vals.clone())));
-                    } else {
-                        parts.push(self.value(*ft, ir::Expr::Zero(*ft)));
-                    }
-                }
-                Some(self.value(it, ir::Expr::Construct(it, parts)))
+                let payload = self
+                    .mb
+                    .m
+                    .types
+                    .field(it, 1 + v)
+                    .map(|pt| self.value(pt, ir::Expr::Construct(pt, vals)));
+                Some(self.value(it, ir::Expr::Variant(it, v, payload)))
             }
         }
     }

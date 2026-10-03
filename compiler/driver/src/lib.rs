@@ -72,7 +72,7 @@ fn compile(root: &Path, emit: bool) -> Output {
         let ok = !d.iter().any(|x| x.is_error());
         diagnostics.extend(d);
         if ok && emit {
-            let out = build::emit(&lowered);
+            let out = build::emit(&lowered, &sources);
             diagnostics.extend(out.diagnostics);
             files = out.files;
         }
@@ -96,12 +96,14 @@ fn load(root: &Path) -> (SourceMap, Vec<Diagnostic>, Option<Vec<SourceUnit>>) {
         let parsed = wrela_syntax::parse(file, text);
         let id = sources.add(format!("<{name}>"), text.to_string());
         debug_assert_eq!(id, file);
+        let syntax_errors = error_spans(&parsed.diagnostics);
         diags.extend(parsed.diagnostics);
         units.push(SourceUnit {
             path: name.split("::").map(String::from).collect(),
             file,
             ast: Rc::new(parsed.file),
             is_std: true,
+            syntax_errors,
         });
     }
     let files = match package::find_files(root) {
@@ -140,13 +142,50 @@ fn load(root: &Path) -> (SourceMap, Vec<Diagnostic>, Option<Vec<SourceUnit>>) {
         let parsed = wrela_syntax::parse(file, &text);
         let id = sources.add(pf.display.clone(), text);
         debug_assert_eq!(id, file);
+        let syntax_errors = error_spans(&parsed.diagnostics);
         diags.extend(parsed.diagnostics);
         units.push(SourceUnit {
             path: pf.module.clone(),
             file,
             ast: Rc::new(parsed.file),
             is_std: false,
+            syntax_errors,
         });
     }
     (sources, diags, Some(units))
+}
+
+/// Where the errors among a file's lexical and syntax diagnostics are.
+fn error_spans(diags: &[Diagnostic]) -> Vec<Span> {
+    diags
+        .iter()
+        .filter(|d| d.is_error())
+        .filter_map(|d| d.primary.as_ref().map(|l| l.span))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A module file that can't be read, or a file whose name can't be a module, is E0205.
+    #[test]
+    fn unreadable_module_files_are_e0205() {
+        let d = std::env::temp_dir().join(format!("wrela-driver-read-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).expect("temp dir");
+        std::fs::write(d.join("main.wrela"), "fn f() -> i32 {\n    1\n}\n").expect("write");
+        std::fs::write(d.join("bad.wrela"), [0x66, 0x6e, 0xff, 0xfe]).expect("write");
+        let out = check(&d);
+        let codes: Vec<&str> = out.diagnostics.iter().map(|x| x.code.as_str()).collect();
+        assert_eq!(codes, ["E0205"], "{:?}", out.diagnostics);
+        assert!(out.diagnostics[0].message.contains("isn't valid UTF-8"));
+
+        std::fs::remove_file(d.join("bad.wrela")).expect("remove");
+        std::fs::write(d.join("my-module.wrela"), "").expect("write");
+        let out = check(&d);
+        let codes: Vec<&str> = out.diagnostics.iter().map(|x| x.code.as_str()).collect();
+        assert_eq!(codes, ["E0205"], "{:?}", out.diagnostics);
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }

@@ -102,7 +102,7 @@ fn declared_bounds(p: &Program, ty: TyId) -> Option<Vec<TraitRef>> {
 pub fn find_impl(p: &Program, ty: TyId, r: &TraitRef) -> Option<(ImplId, Subst)> {
     let impls = p.impls_of_trait.get(&r.trait_).cloned().unwrap_or_default();
     for i in impls {
-        let imp = p.impl_(i).clone();
+        let imp = p.impl_(i);
         let mut subst = Subst::new();
         if !match_ty(p, imp.self_ty, ty, &imp.generics, &mut subst) {
             continue;
@@ -294,11 +294,11 @@ pub fn resolve_trait_method(
     method_args: &[TyId],
 ) -> Option<(FnId, Subst)> {
     let FnOwner::Trait(t) = p.func(method).owner else { return None };
-    let tr = p.trait_(t).clone();
+    let tr = p.trait_(t);
     let r = TraitRef { trait_: t, args: trait_args.to_vec() };
-    let mdef = p.func(method).clone();
+    let mdef = p.func(method);
     if let Some((i, mut subst)) = find_impl(p, self_ty, &r) {
-        let imp = p.impl_(i).clone();
+        let imp = p.impl_(i);
         if let Some(f) = imp.methods.iter().copied().find(|&f| p.func(f).name == mdef.name) {
             let own = p.func(f).generics.clone();
             for (g, &a) in own.iter().zip(method_args) {

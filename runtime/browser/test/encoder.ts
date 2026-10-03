@@ -49,6 +49,10 @@ export class Encoder {
     return this.#command(Opcode.Present, []);
   }
 
+  destroyBuffer(handle: number): this {
+    return this.#command(Opcode.DestroyBuffer, [handle]);
+  }
+
   finish(): Uint8Array<ArrayBuffer> {
     const out = new Uint8Array(HEADER_LEN + this.#body.length);
     out.set(words([STREAM_MAGIC, STREAM_VERSION, this.#body.length]));

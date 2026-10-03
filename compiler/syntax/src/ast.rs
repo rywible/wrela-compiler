@@ -518,19 +518,22 @@ pub enum FieldName {
     Ident(Ident),
     /// `.0`
     Index(u32, Span),
+    /// An index that isn't a `u32` (`t.0x`, `t.99999999999`): its error is reported.
+    BadIndex(Span),
 }
 
 impl FieldName {
     pub fn span(&self) -> Span {
         match self {
             FieldName::Ident(i) => i.span,
-            FieldName::Index(_, s) => *s,
+            FieldName::Index(_, s) | FieldName::BadIndex(s) => *s,
         }
     }
     pub fn text(&self) -> String {
         match self {
             FieldName::Ident(i) => i.name.clone(),
             FieldName::Index(n, _) => n.to_string(),
+            FieldName::BadIndex(_) => "<error>".into(),
         }
     }
 }

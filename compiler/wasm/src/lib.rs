@@ -41,6 +41,9 @@ pub(crate) struct Helpers {
     pub reserve: u32,
     /// `write(handle, offset, ptr, bytes)`: WriteBuffer commands, in chunks that fit.
     pub write: u32,
+    /// `release()`: DestroyBuffer for the buffers made since the last release. Each export
+    /// calls it first: a buffer lives until the program's next call (language.md §12).
+    pub release: u32,
 }
 
 /// Global indices.
@@ -48,6 +51,8 @@ pub(crate) mod globals {
     pub const SP: u32 = 0;
     pub const CMD_LEN: u32 = 1;
     pub const NEXT_HANDLE: u32 = 2;
+    /// The first handle not yet released.
+    pub const LIVE_FROM: u32 = 3;
 }
 
 pub(crate) fn valtype(s: ir::Scalar) -> ValType {
@@ -104,8 +109,16 @@ pub(crate) fn signature(m: &ir::Module, f: &ir::Function) -> (Vec<ValType>, Vec<
     (params, results, sret)
 }
 
+/// A program's WASM, and where its code's source locations start.
+pub struct Emitted {
+    pub wasm: Vec<u8>,
+    /// Module offsets, ascending, and the source location from each on: `None` where a
+    /// function with no source location starts (see `wrela_abi::lines`).
+    pub lines: Vec<(u32, Option<wrela_diag::Span>)>,
+}
+
 /// Emits the CPU module as WASM.
-pub fn emit(m: &ir::Module) -> Result<Vec<u8>, String> {
+pub fn emit(m: &ir::Module) -> Result<Emitted, String> {
     if !m.entry_points.is_empty() || !m.resources.is_empty() {
         return Err("internal: a GPU module reached the WASM back end".into());
     }
@@ -117,8 +130,8 @@ pub fn emit(m: &ir::Module) -> Result<Vec<u8>, String> {
         wrela_abi::IMPORT_SUBMIT,
         EntityType::Function(submit_ty),
     );
-    let helpers = Helpers { submit: 0, flush: 1, reserve: 2, write: 3 };
-    let nhelpers = 3;
+    let helpers = Helpers { submit: 0, flush: 1, reserve: 2, write: 3, release: 4 };
+    let nhelpers = 4;
     let first_fn = 1 + nhelpers;
     let mut functions = FunctionSection::new();
     let mut code = CodeSection::new();
@@ -128,15 +141,17 @@ pub fn emit(m: &ir::Module) -> Result<Vec<u8>, String> {
         functions.function(ty);
         code.function(&body);
     }
-    // The program's functions.
+    // The program's functions, and each one's locations, by its place in the code section.
     let indices: Vec<u32> = (0..m.functions.len() as u32).map(|i| first_fn + i).collect();
+    let mut body_lines = Vec::new();
     for (i, f) in m.functions.iter().enumerate() {
         let (params, results, _) = signature(m, f);
         let ty = types.get(params, results);
         functions.function(ty);
-        let body = func::emit_function(m, i, &indices, &helpers)
+        let (body, lines) = func::emit_function(m, i, &indices, &helpers)
             .map_err(|e| format!("{}: {e}", f.name))?;
         code.function(&body);
+        body_lines.push((nhelpers as usize + i, lines));
     }
     // Export wrappers: plain scalars in, scalars or a flattened vector out, then a flush.
     let mut exports = ExportSection::new();
@@ -162,6 +177,7 @@ pub fn emit(m: &ir::Module) -> Result<Vec<u8>, String> {
     globals.global(g(true), &ConstExpr::i32_const(memory::STACK_TOP as i32));
     globals.global(g(true), &ConstExpr::i32_const(0));
     globals.global(g(true), &ConstExpr::i32_const(0));
+    globals.global(g(true), &ConstExpr::i32_const(0));
     let mut module = Module::new();
     module.section(&types.section);
     module.section(&imports);
@@ -170,7 +186,34 @@ pub fn emit(m: &ir::Module) -> Result<Vec<u8>, String> {
     module.section(&globals);
     module.section(&exports);
     module.section(&code);
-    Ok(module.finish())
+    let wasm = module.finish();
+    // Where each function's body starts in the module, to make its offsets module offsets.
+    let mut starts = Vec::new();
+    for payload in wasmparser::Parser::new(0).parse_all(&wasm) {
+        if let wasmparser::Payload::CodeSectionEntry(body) = payload.map_err(|e| e.to_string())? {
+            starts.push(body.range().start as u32);
+        }
+    }
+    let mut lines = Vec::new();
+    for (k, &start) in starts.iter().enumerate() {
+        lines.push((start, None));
+        if let Some((_, ls)) = body_lines.iter().find(|(i, _)| *i == k) {
+            lines.extend(ls.iter().map(|&(off, span)| (start + off, Some(span))));
+        }
+    }
+    Ok(Emitted { wasm, lines })
+}
+
+/// `wasm` with a custom section `name` holding `payload` appended (which moves no code).
+pub fn with_custom_section(mut wasm: Vec<u8>, name: &str, payload: &[u8]) -> Vec<u8> {
+    use wasm_encoder::Encode;
+    let mut content = Vec::new();
+    name.encode(&mut content);
+    content.extend_from_slice(payload);
+    wasm.push(0);
+    content.len().encode(&mut wasm);
+    wasm.extend_from_slice(&content);
+    wasm
 }
 
 /// Fails if a WASM module uses any relaxed-SIMD instruction (AC7): those are the only WASM
@@ -256,7 +299,7 @@ mod tests {
         ];
         let id = m.add_function(f);
         m.exports.push(("double".into(), id));
-        let bytes = emit(&m).expect("emits");
-        assert_eq!(check_no_relaxed_simd(&bytes), Ok(()));
+        let out = emit(&m).expect("emits");
+        assert_eq!(check_no_relaxed_simd(&out.wasm), Ok(()));
     }
 }

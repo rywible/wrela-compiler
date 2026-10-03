@@ -1,0 +1,13 @@
+// mistake: a parameter's mode written before its name, as in Rust's `mut x: T`
+// expect: E0100
+// fix: yes
+fn accumulate(x: f32, mut total: f32) {
+    total += x
+}
+
+pub fn sum(a: f32, b: f32) -> f32 {
+    var total = 0.0
+    accumulate(a, mut total)
+    accumulate(b, mut total)
+    total
+}

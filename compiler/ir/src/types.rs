@@ -77,6 +77,14 @@ pub enum TypeDef {
         name: String,
         fields: Vec<(String, TypeId)>,
     },
+    /// A tag and one variant's payload. Field 0 is the tag (a `u32`, the variant's index) and
+    /// field `1 + v` variant `v`'s payload, if it has one. On the CPU the payloads share their
+    /// memory, so the size is the tag's and the largest payload's; WGSL has no unions, so on
+    /// the GPU each payload has its own member (an enum never crosses between them).
+    Enum {
+        name: String,
+        variants: Vec<(String, Option<TypeId>)>,
+    },
     Array(TypeId, u32),
     /// `array<T>` in a storage buffer (GPU only).
     RuntimeArray(TypeId),
@@ -167,6 +175,16 @@ impl Types {
         }
     }
 
+    /// The type of field `k` of a struct or an enum (see [`TypeDef::Enum`]).
+    pub fn field(&self, t: TypeId, k: u32) -> Option<TypeId> {
+        match self.get(t) {
+            TypeDef::Struct { fields, .. } => fields.get(k as usize).map(|f| f.1),
+            TypeDef::Enum { .. } if k == 0 => self.lookup(&TypeDef::Scalar(Scalar::U32)),
+            TypeDef::Enum { variants, .. } => variants.get(k as usize - 1)?.1,
+            _ => None,
+        }
+    }
+
     pub fn is_vector(&self, t: TypeId) -> bool {
         matches!(self.get(t), TypeDef::Vector(_))
     }
@@ -183,6 +201,9 @@ impl Types {
             TypeDef::Scalar(s) => s.is_float(),
             TypeDef::Vector(_) | TypeDef::Matrix(_) => true,
             TypeDef::Struct { fields, .. } => fields.iter().any(|(_, f)| self.has_float(*f)),
+            TypeDef::Enum { variants, .. } => {
+                variants.iter().any(|(_, p)| p.is_some_and(|p| self.has_float(p)))
+            }
             TypeDef::Array(e, _) | TypeDef::RuntimeArray(e) | TypeDef::Run(e) | TypeDef::Ptr(e) => {
                 self.has_float(*e)
             }
@@ -194,7 +215,7 @@ impl Types {
             TypeDef::Scalar(s) => s.name().to_string(),
             TypeDef::Vector(n) => format!("vec{n}"),
             TypeDef::Matrix(n) => format!("mat{n}"),
-            TypeDef::Struct { name, .. } => name.clone(),
+            TypeDef::Struct { name, .. } | TypeDef::Enum { name, .. } => name.clone(),
             TypeDef::Array(e, n) => format!("[{}; {n}]", self.display(*e)),
             TypeDef::RuntimeArray(e) => format!("[{}]", self.display(*e)),
             TypeDef::Run(e) => format!("run[{}]", self.display(*e)),

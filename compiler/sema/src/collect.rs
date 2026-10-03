@@ -17,6 +17,8 @@ pub struct SourceUnit {
     pub file: FileId,
     pub ast: Rc<ast::File>,
     pub is_std: bool,
+    /// Where its syntax errors are: code around them may be missing parts.
+    pub syntax_errors: Vec<Span>,
 }
 
 struct PendingUse {
@@ -38,6 +40,7 @@ enum PendingItem {
 
 pub fn collect(units: Vec<SourceUnit>, diags: &mut Vec<Diagnostic>) -> Program {
     let mut c = Collector { p: Program::default(), diags, pending: Vec::new(), uses: Vec::new() };
+    c.p.syntax_errors = units.iter().flat_map(|u| u.syntax_errors.iter().copied()).collect();
     c.build_modules(&units);
     c.declare_items(&units);
     c.resolve_imports();
@@ -516,42 +519,109 @@ impl<'d> Collector<'d> {
         let mut pending: Vec<PendingUse> = std::mem::take(&mut self.uses);
         loop {
             let before = pending.len();
+            // Each import still waiting, with the name it waits for and where.
             let mut still = Vec::new();
             for u in pending {
                 match resolve::resolve_module_path(&self.p, u.module, &u.path) {
                     resolve::PathLookup::Found(res) => {
                         self.bind(u.module, &u.alias, res, u.public);
                     }
-                    resolve::PathLookup::NotYet => still.push(u),
+                    resolve::PathLookup::NotYet(m, name) => still.push((u, m, name)),
                     resolve::PathLookup::Broken => {
                         self.p.modules[u.module.index()].broken.insert(u.alias.name.clone());
                     }
-                    resolve::PathLookup::Error(d) => self.err(*d),
+                    resolve::PathLookup::Error(d) => {
+                        // Reported once: uses of the name it would have bound stay quiet.
+                        self.err(*d);
+                        self.p.modules[u.module.index()].broken.insert(u.alias.name.clone());
+                    }
                 }
             }
             if still.is_empty() {
                 break;
             }
             if still.len() == before {
-                // No progress: report each with what's actually wrong.
-                for u in still {
-                    match resolve::resolve_module_path_in(&self.p, u.module, &u.path, true) {
-                        resolve::PathLookup::Error(d) => self.err(*d),
-                        resolve::PathLookup::Broken => {}
-                        _ => {
-                            let text = u
-                                .path
-                                .iter()
-                                .map(|i| i.name.as_str())
-                                .collect::<Vec<_>>()
-                                .join("::");
-                            self.err(Diagnostic::new(codes::E0209, u.span, format!("`{text}` can't be resolved: the imports refer to each other in a cycle")));
-                        }
-                    }
-                }
+                self.report_stuck_imports(still);
                 break;
             }
-            pending = still;
+            pending = still.into_iter().map(|(u, ..)| u).collect();
+        }
+    }
+
+    /// Imports that made no progress in a pass, each with the name it waits for. One that waits
+    /// for another of them is in a cycle of imports, or depends on one: each cycle is reported
+    /// once (E0209), and what depends on it stays quiet. The rest wait for names nothing
+    /// provides, and are reported as such.
+    fn report_stuck_imports(&mut self, stuck: Vec<(PendingUse, ModuleId, String)>) {
+        let provider = |m: ModuleId, name: &str| {
+            stuck.iter().position(|(v, ..)| v.module == m && v.alias.name == name)
+        };
+        let next: Vec<Option<usize>> = stuck.iter().map(|(_, m, n)| provider(*m, n)).collect();
+        let mut on_cycle = vec![false; stuck.len()];
+        for start in 0..stuck.len() {
+            // Floyd would do; the chains are short, so walk with a visited list.
+            let mut seen = vec![start];
+            let mut at = start;
+            while let Some(n) = next[at] {
+                if let Some(k) = seen.iter().position(|&s| s == n) {
+                    for &s in &seen[k..] {
+                        on_cycle[s] = true;
+                    }
+                    break;
+                }
+                seen.push(n);
+                at = n;
+            }
+        }
+        let path_text =
+            |u: &PendingUse| u.path.iter().map(|i| i.name.as_str()).collect::<Vec<_>>().join("::");
+        let mut reported = vec![false; stuck.len()];
+        for i in 0..stuck.len() {
+            let u = &stuck[i].0;
+            if on_cycle[i] {
+                if reported[i] {
+                    continue;
+                }
+                // The cycle through `i`, in order.
+                let mut cycle = vec![i];
+                let mut at = next[i].expect("on a cycle");
+                while at != i {
+                    cycle.push(at);
+                    at = next[at].expect("on a cycle");
+                }
+                let mut d = Diagnostic::new(
+                    codes::E0209,
+                    u.path.last().map_or(u.span, |s| s.span),
+                    format!(
+                        "`{}` can't be resolved: the imports refer to each other in a cycle",
+                        path_text(u)
+                    ),
+                );
+                for &k in &cycle {
+                    reported[k] = true;
+                    if k != i {
+                        let v = &stuck[k].0;
+                        d = d.with_secondary(
+                            v.path.last().map_or(v.span, |s| s.span),
+                            format!("`{}` is imported from `{}`", v.alias.name, path_text(v)),
+                        );
+                    }
+                }
+                self.err(d.with_help("import the item from the module that declares it"));
+            } else if next[i].is_some() {
+                // Waits on a cycle, which is reported.
+                self.p.modules[u.module.index()].broken.insert(u.alias.name.clone());
+            } else {
+                match resolve::resolve_module_path_in(&self.p, u.module, &u.path, true) {
+                    resolve::PathLookup::Error(d) => self.err(*d),
+                    resolve::PathLookup::Broken => {}
+                    _ => self.err(Diagnostic::internal(format!(
+                        "the import `{}` resolved only in its final pass",
+                        path_text(u)
+                    ))),
+                }
+                self.p.modules[u.module.index()].broken.insert(u.alias.name.clone());
+            }
         }
     }
 
@@ -599,15 +669,20 @@ impl<'d> Collector<'d> {
     fn resolve_signatures(&mut self) {
         let pending = std::mem::take(&mut self.pending);
         // Bounds and supertraits first, so later lookups (`T::Kind`) can see them.
+        let mut supertraits = Vec::new();
         for (m, item) in &pending {
             match item {
-                PendingItem::Trait(id, t, _) => self.trait_header(*m, *id, t),
+                PendingItem::Trait(id, t, _) => {
+                    let edges = self.trait_header(*m, *id, t);
+                    supertraits.extend(edges.into_iter().map(|(to, span)| (*id, to, span)));
+                }
                 PendingItem::Adt(id, item) => self.adt_bounds(*m, *id, item),
                 PendingItem::Impl(id, i, _) => self.impl_header(*m, *id, i),
                 PendingItem::Fn(id, f) => self.fn_bounds(*m, *id, f, &[]),
                 PendingItem::Const(..) => {}
             }
         }
+        self.supertrait_cycles(&supertraits);
         for (m, item) in &pending {
             match item {
                 PendingItem::Trait(id, _, methods) => {
@@ -668,7 +743,14 @@ impl<'d> Collector<'d> {
         }
     }
 
-    fn trait_header(&mut self, m: ModuleId, id: TraitId, t: &ast::TraitDecl) {
+    /// Resolves a trait's own parameters' bounds, its supertraits and its associated types;
+    /// returns each supertrait it names, with where.
+    fn trait_header(
+        &mut self,
+        m: ModuleId,
+        id: TraitId,
+        t: &ast::TraitDecl,
+    ) -> Vec<(TraitId, Span)> {
         let self_param = self.p.trait_(id).self_param;
         let gens = self.p.trait_(id).generics.clone();
         let mut scope = Scope::new(m);
@@ -676,14 +758,12 @@ impl<'d> Collector<'d> {
         scope.push_params(&self.p, &[self_param]);
         scope.push_params(&self.p, &gens);
         self.set_param_bounds(&scope, &gens, &t.generics);
-        let supers = self.bounds_of(&scope, &t.supertraits);
-        for s in &supers {
-            if s.trait_ == id {
-                self.err(Diagnostic::new(
-                    codes::E0411,
-                    t.name.span,
-                    format!("`{}` can't be its own supertrait", t.name.name),
-                ));
+        let mut supers = Vec::new();
+        let mut edges = Vec::new();
+        for b in &t.supertraits {
+            if let Some(r) = resolve::resolve_trait_ref(&self.p, self.diags, &scope, b) {
+                edges.push((r.trait_, b.span));
+                supers.push(r);
             }
         }
         self.p.traits[id.index()].supertraits = supers.clone();
@@ -709,6 +789,88 @@ impl<'d> Collector<'d> {
             }
         }
         self.p.traits[id.index()].assoc_types = assoc;
+        edges
+    }
+
+    /// Reports each cycle of supertraits once (E0411), at the bound that closes it, and cuts it:
+    /// what follows walks supertraits transitively, and would loop.
+    fn supertrait_cycles(&mut self, edges: &[(TraitId, TraitId, Span)]) {
+        let n = self.p.traits.len();
+        let mut out: Vec<Vec<(TraitId, Span)>> = vec![Vec::new(); n];
+        for &(from, to, span) in edges {
+            out[from.index()].push((to, span));
+        }
+        // Depth-first; an edge to a trait on the stack closes a cycle.
+        #[derive(Clone, Copy, PartialEq)]
+        enum State {
+            New,
+            OnStack,
+            Done,
+        }
+        let mut state = vec![State::New; n];
+        let mut cut: Vec<(TraitId, TraitId)> = Vec::new();
+        for root in 0..n {
+            if state[root] != State::New {
+                continue;
+            }
+            // (trait, next edge to follow), and the path of edges taken to it.
+            let mut stack: Vec<(usize, usize)> = vec![(root, 0)];
+            let mut path: Vec<(TraitId, Span)> = Vec::new();
+            state[root] = State::OnStack;
+            while let Some(&mut (t, ref mut k)) = stack.last_mut() {
+                let Some(&(to, span)) = out[t].get(*k) else {
+                    state[t] = State::Done;
+                    stack.pop();
+                    path.pop();
+                    continue;
+                };
+                *k += 1;
+                match state[to.index()] {
+                    State::New => {
+                        state[to.index()] = State::OnStack;
+                        stack.push((to.index(), 0));
+                        path.push((to, span));
+                    }
+                    State::OnStack => {
+                        let from = TraitId(t as u32);
+                        cut.push((from, to));
+                        let name = self.p.trait_(to).name.clone();
+                        let at = stack.iter().position(|&(s, _)| s == to.index()).unwrap_or(0);
+                        let mut d = if to == from {
+                            Diagnostic::new(
+                                codes::E0411,
+                                span,
+                                format!("`{name}` can't be its own supertrait"),
+                            )
+                        } else {
+                            let through: Vec<String> = stack[at + 1..]
+                                .iter()
+                                .map(|&(s, _)| format!("`{}`", self.p.traits[s].name))
+                                .collect();
+                            Diagnostic::new(
+                                codes::E0411,
+                                span,
+                                format!(
+                                    "`{name}` is its own supertrait, through {}",
+                                    and_list(&through)
+                                ),
+                            )
+                        };
+                        for &(_, s) in &path[at..] {
+                            d = d.with_secondary(s, "a supertrait in the cycle");
+                        }
+                        self.err(d);
+                    }
+                    State::Done => {}
+                }
+            }
+        }
+        for (from, to) in cut {
+            let t = &mut self.p.traits[from.index()];
+            t.supertraits.retain(|r| r.trait_ != to);
+            let sp = t.self_param;
+            self.p.params[sp.index()].bounds.retain(|r| r.trait_ != to || to == from);
+        }
     }
 
     fn adt_bounds(&mut self, m: ModuleId, id: AdtId, item: &ast::Item) {
@@ -1525,5 +1687,14 @@ impl<'d> Collector<'d> {
                 }
             }
         }
+    }
+}
+
+/// `a`, `a and b`, `a, b and c`.
+fn and_list(items: &[String]) -> String {
+    match items {
+        [] => String::new(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
     }
 }

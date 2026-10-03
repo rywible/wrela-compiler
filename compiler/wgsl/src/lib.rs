@@ -44,6 +44,17 @@ fn sanitize(name: &str) -> String {
     ir::ident(name)
 }
 
+/// The struct member that holds field `k` of a value of type `t`: for an enum, its tag, or the
+/// payload of variant `k - 1` among the variants that have one.
+fn member(types: &ir::Types, t: ir::TypeId, k: u32) -> u32 {
+    match types.get(t) {
+        ir::TypeDef::Enum { variants, .. } if k > 0 => {
+            1 + variants[..k as usize - 1].iter().filter(|(_, p)| p.is_some()).count() as u32
+        }
+        _ => k,
+    }
+}
+
 fn vsize(n: u8) -> VectorSize {
     match n {
         2 => VectorSize::Bi,
@@ -142,6 +153,33 @@ impl<'m> Cx<'m> {
                     Some(sanitize(&name)),
                     TypeInner::Struct { members, span: layout(&self.m.types, t).size },
                 )
+            }
+            // WGSL has no unions: each payload gets its own member, after the tag.
+            ir::TypeDef::Enum { name, variants } => {
+                let u32_ty = self.ty_inner(TypeInner::Scalar(Scalar::U32));
+                let mut members = vec![StructMember {
+                    name: Some("tag".into()),
+                    ty: u32_ty,
+                    binding: None,
+                    offset: 0,
+                }];
+                let mut end = 4u32;
+                let mut align = 4u32;
+                for (vname, payload) in &variants {
+                    let Some(p) = payload else { continue };
+                    let l = layout(&self.m.types, *p);
+                    let offset = ir::layout::round_up(l.align, end);
+                    members.push(StructMember {
+                        name: Some(sanitize(vname)),
+                        ty: self.ty(*p)?,
+                        binding: None,
+                        offset,
+                    });
+                    end = offset + l.size;
+                    align = align.max(l.align);
+                }
+                let span = ir::layout::round_up(align, end);
+                (Some(sanitize(&name)), TypeInner::Struct { members, span })
             }
             ir::TypeDef::Run(_) | ir::TypeDef::Ptr(_) => {
                 return Err("internal: a CPU-only type in GPU code".into());
@@ -452,10 +490,14 @@ impl<'a, 'm> Fb<'a, 'm> {
                 );
             }
         };
-        for proj in &p.path {
+        for (i, proj) in p.path.iter().enumerate() {
             h = match proj {
                 ir::Proj::Field(k) => {
-                    self.expr(Expression::AccessIndex { base: h, index: *k }, block)
+                    let prefix = ir::Place { root: p.root.clone(), path: p.path[..i].to_vec() };
+                    let t =
+                        self.cx.m.place_ty(self.f, &prefix).ok_or("internal: a place's type")?;
+                    let index = member(&self.cx.m.types, t, *k);
+                    self.expr(Expression::AccessIndex { base: h, index }, block)
                 }
                 ir::Proj::Comp(c) => {
                     self.expr(Expression::AccessIndex { base: h, index: *c as u32 }, block)
@@ -519,6 +561,7 @@ impl<'a, 'm> Fb<'a, 'm> {
                 };
                 out.push(Statement::Return { value }, Span::UNDEFINED);
             }
+            ir::Stmt::At(_) => {}
             ir::Stmt::Trap => {
                 // GPU code can't trap; an unreachable point returns a zero.
                 let value = self
@@ -637,7 +680,27 @@ impl<'a, 'm> Fb<'a, 'm> {
             }
             ir::Expr::Extract(x, i) => {
                 let base = self.val(*x)?;
-                self.expr(Expression::AccessIndex { base, index: *i }, out)
+                let index = member(types, self.f.value_ty(*x), *i);
+                self.expr(Expression::AccessIndex { base, index }, out)
+            }
+            ir::Expr::Variant(t, k, payload) => {
+                let ir::TypeDef::Enum { variants, .. } = types.get(*t).clone() else {
+                    return Err("internal: a variant of a type that isn't an enum".into());
+                };
+                let ty = self.cx.ty(*t)?;
+                let tag = self.lit(Literal::U32(*k), out);
+                let mut components = vec![tag];
+                for (v, (_, p)) in variants.iter().enumerate() {
+                    let Some(pt) = p else { continue };
+                    components.push(match payload {
+                        Some(x) if v == *k as usize => self.val(*x)?,
+                        _ => {
+                            let pty = self.cx.ty(*pt)?;
+                            self.expr(Expression::ZeroValue(pty), out)
+                        }
+                    });
+                }
+                self.expr(Expression::Compose { ty, components }, out)
             }
             ir::Expr::ExtractDyn(x, i) => {
                 let base = self.val(*x)?;

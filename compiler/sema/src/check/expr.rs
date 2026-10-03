@@ -223,6 +223,10 @@ impl<'p> Checker<'p> {
             }
             ast::LitKind::Int => {
                 let Some(v) = wrela_syntax::lexer::int_value(&lit.text) else {
+                    // A malformed number (`0x`, `1e`) has its error from the lexer (E0004).
+                    if self.p.syntax_errors.contains(&span) {
+                        return self.error_expr(span);
+                    }
                     self.err(Diagnostic::new(
                         codes::E0006,
                         span,
@@ -349,7 +353,7 @@ impl<'p> Checker<'p> {
         let idents: Vec<ast::Ident> = segs.iter().map(|s| s.ident.clone()).collect();
         match resolve::resolve_module_path_in(self.p, self.scope.module, &idents, true) {
             PathLookup::Found(r) => Some(ValueRes::Item(r)),
-            PathLookup::NotYet | PathLookup::Broken => None,
+            PathLookup::NotYet(..) | PathLookup::Broken => None,
             PathLookup::Error(d) => {
                 // Maybe `Type::assoc` or `Trait::method`.
                 let prefix = &idents[..idents.len() - 1];
@@ -523,7 +527,7 @@ impl<'p> Checker<'p> {
                     && self.p.adt(a).is_enum()
                     && !self.has_associated_fn(a, &name.name)
                 {
-                    let adt = self.p.adt(a).clone();
+                    let adt = self.p.adt(a);
                     let mut d = Diagnostic::new(
                         codes::E0211,
                         name.span,
@@ -959,7 +963,8 @@ impl<'p> Checker<'p> {
         let b = self.check_expr(base, None);
         let k = self.kind(b.ty);
         match (&k, name) {
-            (TyKind::Error, _) => self.error_expr(span),
+            // Its error is reported.
+            (TyKind::Error, _) | (_, ast::FieldName::BadIndex(_)) => self.error_expr(span),
             (TyKind::Adt(a, args), ast::FieldName::Ident(n)) if !self.p.adt(*a).is_enum() => {
                 let (a, args) = (*a, args.clone());
                 let fields = self.p.adt(a).fields().to_vec();
@@ -1077,7 +1082,9 @@ impl<'p> Checker<'p> {
                 let shown = self.display(b.ty);
                 let what = match name {
                     ast::FieldName::Ident(n) => format!("`.{}`", n.name),
-                    ast::FieldName::Index(i, _) => format!("`.{i}`"),
+                    ast::FieldName::Index(..) | ast::FieldName::BadIndex(_) => {
+                        format!("`.{}`", name.text())
+                    }
                 };
                 self.err(Diagnostic::new(
                     codes::E0311,
@@ -1191,7 +1198,7 @@ impl<'p> Checker<'p> {
                     self.err(*d);
                     return self.error_expr(span);
                 }
-                PathLookup::NotYet | PathLookup::Broken => None,
+                PathLookup::NotYet(..) | PathLookup::Broken => None,
             }
         };
         let (adt, variant) = match res {
@@ -1484,6 +1491,12 @@ impl<'p> Checker<'p> {
                     ),
                 ));
                 None
+            }
+            // Expected where a type failed (its error is reported): the closure's unannotated
+            // types are errors too, not left to infer.
+            Some(TyKind::Error) => {
+                let e = self.p.types.error;
+                Some((vec![e; params.len()], e))
             }
             _ => None,
         };

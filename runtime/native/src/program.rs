@@ -10,6 +10,7 @@ use wasmtime::{
     Engine, Extern, ExternType, Func, Instance, Linker, Module, Store, TypedFunc, Val, ValType,
 };
 use wrela_abi::hash::StateHash;
+use wrela_abi::lines::{self, Lines};
 use wrela_abi::stream::{self, Command, Sequencer};
 use wrela_abi::{EXPORT_FRAME, EXPORT_MEMORY, IMPORT_MODULE, IMPORT_SUBMIT};
 
@@ -92,6 +93,8 @@ pub(crate) struct Program<E: 'static> {
     store: Store<State<E>>,
     instance: Instance,
     frame: TypedFunc<(f32, u32, u32), ()>,
+    /// Where the code came from, for trap messages (`wrela_abi::lines`).
+    lines: Option<Lines>,
 }
 
 /// Checks a module against the program ABI before instantiating it: it may import only
@@ -166,6 +169,7 @@ fn describe(ty: &ExternType) -> String {
 pub(crate) struct Compiled {
     engine: Engine,
     module: Module,
+    lines: Option<Lines>,
 }
 
 /// Compiles a program and checks it against the ABI ([`check_abi`]).
@@ -173,7 +177,13 @@ pub(crate) fn compile(wasm: &[u8]) -> Result<Compiled> {
     let engine = Engine::default();
     let module = Module::new(&engine, wasm).map_err(|e| Error::Program(format!("{e:#}")))?;
     check_abi(&module)?;
-    Ok(Compiled { engine, module })
+    let lines = match lines::custom_section(wasm, lines::SECTION) {
+        Some(payload) => Some(Lines::decode(payload).map_err(|e| {
+            Error::Program(format!("its `{}` section is malformed: {e}", lines::SECTION))
+        })?),
+        None => None,
+    };
+    Ok(Compiled { engine, module, lines })
 }
 
 impl<E: Executor> Program<E> {
@@ -201,7 +211,7 @@ impl<E: Executor> Program<E> {
         let frame = instance
             .get_typed_func::<(f32, u32, u32), ()>(&mut store, EXPORT_FRAME)
             .map_err(|e| Error::Program(format!("{e:#}")))?;
-        Ok(Program { store, instance, frame })
+        Ok(Program { store, instance, frame, lines: compiled.lines.clone() })
     }
 
     /// Calls `frame(time, width, height)`, then ends the frame.
@@ -282,7 +292,24 @@ impl<E: Executor> Program<E> {
         match (result, failure) {
             (Ok(()), _) => Ok(()),
             (Err(_), Some(failure)) => Err(failure),
-            (Err(trap), None) => Err(Error::Trap(format!("{trap:#}"))),
+            (Err(trap), None) => Err(Error::Trap(self.describe_trap(&trap))),
+        }
+    }
+
+    /// What trapped, and where in the source if the program says: the location of the
+    /// innermost frame that has one.
+    fn describe_trap(&self, trap: &wasmtime::Error) -> String {
+        let what = match trap.downcast_ref::<wasmtime::Trap>() {
+            Some(t) => t.to_string(),
+            None => format!("{trap:#}"),
+        };
+        let at = self.lines.as_ref().and_then(|lines| {
+            let bt = trap.downcast_ref::<wasmtime::WasmBacktrace>()?;
+            bt.frames().iter().find_map(|f| lines.at(f.module_offset()? as u32))
+        });
+        match at {
+            Some(loc) => format!("{what} at {loc}"),
+            None => what,
         }
     }
 

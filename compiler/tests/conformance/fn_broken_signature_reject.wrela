@@ -1,0 +1,21 @@
+// rejects: mem.modes
+// A parameter that fails to parse is still declared: the body and the calls aren't checked
+// against a guess.
+fn apply(f: fn(f32) -> , x: f32) -> f32 { //~ E0100
+    f(x) + f(x).y
+}
+
+fn add(x: f32, mut total: f32) { //~ E0100
+    total += x
+}
+
+fn scale(x: f32, total: mut [) { //~ E0100
+    total += x
+}
+
+pub fn g(x: f32) -> f32 {
+    var t = 0.0
+    add(x, mut t)
+    scale(x, mut t)
+    apply(|y| y, t)
+}

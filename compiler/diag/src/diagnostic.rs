@@ -136,7 +136,8 @@ impl Diagnostic {
 }
 
 /// Sorts diagnostics into a stable order: by file, then position, then code. Duplicates (same
-/// code and primary span) are dropped.
+/// code and primary span) are dropped; one that says the same thing gives the first its
+/// secondary labels (one error in a function that two calls derive names both calls).
 pub fn sort_and_dedup(diags: &mut Vec<Diagnostic>) {
     // Internal errors first: they explain whatever else went wrong.
     let key = |d: &Diagnostic| {
@@ -145,6 +146,16 @@ pub fn sort_and_dedup(diags: &mut Vec<Diagnostic>) {
     };
     diags.sort_by(|a, b| key(a).cmp(&key(b)));
     diags.dedup_by(|a, b| {
-        a.code == b.code && a.span() == b.span() && (a.span().is_some() || a.message == b.message)
+        let same = a.code == b.code
+            && a.span() == b.span()
+            && (a.span().is_some() || a.message == b.message);
+        if same && a.message == b.message {
+            for l in a.secondary.drain(..) {
+                if !b.secondary.contains(&l) {
+                    b.secondary.push(l);
+                }
+            }
+        }
+        same
     });
 }

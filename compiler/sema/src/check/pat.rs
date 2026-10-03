@@ -108,7 +108,7 @@ impl<'p> Checker<'p> {
                             span,
                             format!("a tuple of {} doesn't match `{shown}`", ps.len()),
                         ));
-                        return Pat { ty, kind: PatKind::Wild, span };
+                        return self.unmatched(pat, ty);
                     }
                 };
                 PatKind::Tuple(
@@ -126,10 +126,10 @@ impl<'p> Checker<'p> {
                         PathLookup::Found(r) => r,
                         PathLookup::Error(d) => {
                             self.err(*d);
-                            return Pat { ty, kind: PatKind::Wild, span };
+                            return self.unmatched(pat, ty);
                         }
-                        PathLookup::NotYet | PathLookup::Broken => {
-                            return Pat { ty, kind: PatKind::Wild, span };
+                        PathLookup::NotYet(..) | PathLookup::Broken => {
+                            return self.unmatched(pat, ty);
                         }
                     };
                 match (&pat.kind, res) {
@@ -164,12 +164,65 @@ impl<'p> Checker<'p> {
                             span,
                             format!("`{}` can't be matched here", path.last().name),
                         ));
-                        PatKind::Wild
+                        return self.unmatched(pat, ty);
                     }
                 }
             }
         };
         Pat { ty, kind, span }
+    }
+
+    /// A pattern that can't match (its error is reported): it matches anything, and the names
+    /// it binds are declared, with the error type, so their uses aren't reported too.
+    fn unmatched(&mut self, pat: &ast::Pat, ty: TyId) -> Pat {
+        self.declare_unmatched(pat);
+        Pat { ty, kind: PatKind::Wild, span: pat.span }
+    }
+
+    fn declare_unmatched(&mut self, pat: &ast::Pat) {
+        let error = self.p.types.error;
+        let owned = LocalKind::Owned { mutable: false };
+        match &pat.kind {
+            ast::PatKind::Ident(name) => {
+                if !matches!(
+                    resolve::lookup_name(self.p, self.scope.module, &name.name),
+                    Some(Res::Variant(..) | Res::Const(_))
+                ) {
+                    self.declare_pattern_local(&name.name, error, owned, name.span);
+                }
+            }
+            ast::PatKind::TupleStruct(_, ps) | ast::PatKind::Tuple(ps) => {
+                for p in ps {
+                    self.declare_unmatched(p);
+                }
+            }
+            ast::PatKind::Struct { fields, .. } => {
+                for f in fields {
+                    self.declare_unmatched_field(f);
+                }
+            }
+            ast::PatKind::Wild
+            | ast::PatKind::Lit { .. }
+            | ast::PatKind::Path(_)
+            | ast::PatKind::Error => {}
+        }
+    }
+
+    fn declare_unmatched_field(&mut self, f: &ast::FieldPat) {
+        match &f.pat {
+            Some(p) => self.declare_unmatched(p),
+            None => {
+                let owned = LocalKind::Owned { mutable: false };
+                self.declare_pattern_local(&f.name.name, self.p.types.error, owned, f.name.span);
+            }
+        }
+    }
+
+    fn unmatched_subs(&mut self, subs: &[(u32, &ast::Pat)], ty: TyId, span: Span) -> Pat {
+        for (_, p) in subs {
+            self.declare_unmatched(p);
+        }
+        Pat { ty, kind: PatKind::Wild, span }
     }
 
     fn declare_pattern_local(
@@ -334,7 +387,7 @@ impl<'p> Checker<'p> {
     ) -> Pat {
         let variant = self.p.adt(a).variants()[v as usize].clone();
         let Some(args) = self.pat_adt_args(a, ty, span) else {
-            return Pat { ty, kind: PatKind::Wild, span };
+            return self.unmatched_subs(subs, ty, span);
         };
         if variant.shape != shape {
             self.err(Diagnostic::new(
@@ -342,7 +395,7 @@ impl<'p> Checker<'p> {
                 span,
                 format!("`{}` isn't a tuple variant", variant.name),
             ));
-            return Pat { ty, kind: PatKind::Wild, span };
+            return self.unmatched_subs(subs, ty, span);
         }
         if n != variant.fields.len() {
             self.err(Diagnostic::new(
@@ -355,7 +408,7 @@ impl<'p> Checker<'p> {
                     if variant.fields.len() == 1 { "" } else { "s" }
                 ),
             ));
-            return Pat { ty, kind: PatKind::Wild, span };
+            return self.unmatched_subs(subs, ty, span);
         }
         let ftys = self.p.variant_fields(a, &args, v as usize);
         let fields = subs
@@ -377,6 +430,9 @@ impl<'p> Checker<'p> {
         from_place: bool,
     ) -> Pat {
         let Some(args) = self.pat_adt_args(a, ty, span) else {
+            for f in fields {
+                self.declare_unmatched_field(f);
+            }
             return Pat { ty, kind: PatKind::Wild, span };
         };
         let (decls, ftys) = match v {
@@ -394,6 +450,7 @@ impl<'p> Checker<'p> {
                     f.name.span,
                     format!("`{}` has no field `{}`", self.p.adt(a).name, f.name.name),
                 ));
+                self.declare_unmatched_field(f);
                 continue;
             };
             if v.is_none() && !decls[i].public && self.p.adt(a).module != self.scope.module {

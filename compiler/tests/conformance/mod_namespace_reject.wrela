@@ -1,0 +1,9 @@
+// rejects: mod.names
+struct Point {
+    x: f32,
+}
+
+fn length(p: sqrt) -> f32 { //~ E0212
+    let q = Point //~ E0212
+    1.0
+}

@@ -1,0 +1,35 @@
+// accepts: enum.match gpu.entry
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch}
+
+// An enum in GPU code: WGSL has no unions, so each payload is its own member there.
+enum Hit: Copy + Clone {
+    Miss,
+    Near { d: f32 },
+    Far { d: f32, at: vec3, n: vec4 },
+}
+
+@gpu
+fn probe(x: f32) -> Hit {
+    if x < 0.0 {
+        Hit::Miss
+    } else if x < 1.0 {
+        Hit::Near { d: x }
+    } else {
+        Hit::Far { d: x, at: vec3(x, 2.0 * x, 0.0), n: vec4(1.0, 0.0, 0.0, 1.0) }
+    }
+}
+
+@compute(64)
+fn shade(out: mut Slots<f32>, id: GlobalId) {
+    let x = f32(id.x) - 2.0
+    out[id] = match probe(x) {
+        Hit::Miss => 0.0,
+        Hit::Near { d } => d,
+        Hit::Far { d, at, .. } => d + at.y,
+    }
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    let out: GpuBuffer<f32> = buffer(64)
+    dispatch(shade, groups: 1, out: out)
+}

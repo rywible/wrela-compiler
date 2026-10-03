@@ -183,6 +183,8 @@ impl<'p> Checker<'p> {
                     return self.error_expr(span);
                 }
             },
+            // Its type's error is reported.
+            TyKind::Error => return self.failed_call(args, span),
             _ => {
                 let shown = self.display(ty);
                 let name = self.locals[l.index()].name.clone();
@@ -233,7 +235,7 @@ impl<'p> Checker<'p> {
 
     /// The parameters of `f`, with its generics substituted by `gen_args`.
     fn fn_params(&mut self, f: FnId, gen_args: &[TyId]) -> (Vec<CallParam>, TyId, RetMode) {
-        let def = self.p.func(f).clone();
+        let def = self.p.func(f);
         let all = self.p.fn_all_generics(f);
         let subst = Subst::from_pairs(&all, gen_args);
         let params = def
@@ -946,7 +948,7 @@ impl<'p> Checker<'p> {
         if let [(t, trait_args)] = traits.as_slice()
             && let Some(m) = traits::trait_method(self.p, *t, &name.name)
         {
-            let def = self.p.func(m).clone();
+            let def = self.p.func(m);
             if def.has_self() {
                 self.err(Diagnostic::new(
                     codes::E0207,
@@ -995,7 +997,7 @@ impl<'p> Checker<'p> {
         let TyKind::Adt(a, _) = self.kind(ty) else { return None };
         let impls = self.p.inherent_impls.get(&a).cloned().unwrap_or_default();
         for i in impls {
-            let imp = self.p.impl_(i).clone();
+            let imp = self.p.impl_(i);
             let Some(f) = imp.methods.iter().copied().find(|&f| self.p.func(f).name == name) else {
                 continue;
             };
@@ -1056,7 +1058,7 @@ impl<'p> Checker<'p> {
                     }
                     let impls = self.p.impls_of_trait.get(&tid).cloned().unwrap_or_default();
                     for i in impls {
-                        let imp = self.p.impl_(i).clone();
+                        let imp = self.p.impl_(i);
                         let mut subst = Subst::new();
                         if !traits::match_ty(self.p, imp.self_ty, ty, &imp.generics, &mut subst) {
                             continue;
@@ -1091,9 +1093,9 @@ impl<'p> Checker<'p> {
         trait_args: &[TyId],
         method_args: &[TyId],
     ) -> (Vec<CallParam>, TyId) {
-        let def = self.p.func(m).clone();
+        let def = self.p.func(m);
         let FnOwner::Trait(t) = def.owner else { return (Vec::new(), self.p.types.error) };
-        let tr = self.p.trait_(t).clone();
+        let tr = self.p.trait_(t);
         let mut subst = Subst::from_pairs(&tr.generics, trait_args);
         subst.insert(tr.self_param, self_ty);
         for (g, &a) in def.generics.iter().zip(method_args) {
@@ -1184,7 +1186,7 @@ impl<'p> Checker<'p> {
                             name.name
                         )),
                     );
-                    None
+                    return self.failed_call(args, span);
                 }
             }
         };
@@ -1300,7 +1302,7 @@ impl<'p> Checker<'p> {
                 self.call_fn(f, gargs, Some(recv), args, expected, span)
             }
             Pick::Trait { method, trait_args } => {
-                let def = self.p.func(method).clone();
+                let def = self.p.func(method);
                 if !def.has_self() {
                     self.err(Diagnostic::new(
                         codes::E0207,

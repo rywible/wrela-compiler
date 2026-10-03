@@ -2,7 +2,7 @@
 //! `game.wasm`, one WGSL module per pipeline, `manifest.json`, and the standard browser
 //! runtime, pinned to this compiler's version (D-100).
 
-use wrela_diag::Diagnostic;
+use wrela_diag::{Diagnostic, SourceMap};
 use wrela_lower::{Lowered, PipelineKind};
 
 /// The standard browser runtime, embedded in the compiler so every build ships the version the
@@ -20,16 +20,31 @@ pub struct BuildOutput {
     pub diagnostics: Vec<Diagnostic>,
 }
 
-/// Runs the back ends over a lowered program.
-pub fn emit(l: &Lowered) -> BuildOutput {
+/// Runs the back ends over a lowered program. `sources` names the locations a trap reports.
+pub fn emit(l: &Lowered, sources: &SourceMap) -> BuildOutput {
     let mut diagnostics = Vec::new();
     let mut files = Vec::new();
     match wrela_wasm::emit(&l.cpu) {
-        Ok(bytes) => {
-            if let Err(e) = wrela_wasm::check_no_relaxed_simd(&bytes) {
+        Ok(out) => {
+            if let Err(e) = wrela_wasm::check_no_relaxed_simd(&out.wasm) {
                 diagnostics.push(Diagnostic::internal(e.to_string()));
             }
-            files.push(("game.wasm".to_string(), bytes));
+            // Where each part of the code came from, as `file:line:column`, for trap messages.
+            let entries: Vec<(u32, Option<String>)> = out
+                .lines
+                .iter()
+                .map(|&(offset, span)| {
+                    let loc = span.map(|s| {
+                        let f = sources.file(s.file);
+                        let lc = f.line_col(s.start);
+                        format!("{}:{}:{}", f.name, lc.line, lc.column)
+                    });
+                    (offset, loc)
+                })
+                .collect();
+            let lines = wrela_abi::lines::Lines::new(&entries).encode();
+            let wasm = wrela_wasm::with_custom_section(out.wasm, wrela_abi::lines::SECTION, &lines);
+            files.push(("game.wasm".to_string(), wasm));
         }
         Err(e) => diagnostics.push(Diagnostic::internal(format!("the WASM back end failed: {e}"))),
     }

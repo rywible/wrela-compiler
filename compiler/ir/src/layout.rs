@@ -68,13 +68,27 @@ pub(crate) fn compute(types: &Types, d: &TypeDef) -> Layout {
             }
             Layout { size: round_up(align, offset.max(1)), align }
         }
+        TypeDef::Enum { variants, .. } => {
+            let payloads = variants.iter().filter_map(|(_, p)| p.map(|p| types.layout(p)));
+            let (size, align) = payloads.fold((0, 4), |(s, a), l| (s.max(l.size), a.max(l.align)));
+            Layout { size: round_up(align, enum_payload_offset(align).saturating_add(size)), align }
+        }
         TypeDef::Run(_) => Layout { size: 8, align: 4 },
         TypeDef::Ptr(_) => Layout { size: 4, align: 4 },
     }
 }
 
-/// Each field's byte offset in a struct.
+/// Where an enum's payloads start: after its `u32` tag, aligned for the most aligned payload.
+fn enum_payload_offset(align: u32) -> u32 {
+    round_up(align, 4)
+}
+
+/// Each field's byte offset in a struct or an enum (whose payloads all start at one offset).
 pub fn field_offsets(types: &Types, t: TypeId) -> Vec<u32> {
+    if let TypeDef::Enum { variants, .. } = types.get(t) {
+        let at = enum_payload_offset(layout(types, t).align);
+        return std::iter::once(0).chain(variants.iter().map(|_| at)).collect();
+    }
     let TypeDef::Struct { fields, .. } = types.get(t) else { return Vec::new() };
     let mut out = Vec::with_capacity(fields.len());
     let mut offset = 0;
@@ -104,6 +118,8 @@ pub fn array_stride(types: &Types, elem: TypeId) -> u32 {
 /// struct starting at least a 16-byte-rounded size later).
 pub fn uniform_compatible(types: &Types, t: TypeId) -> bool {
     match types.get(t) {
+        // An enum never reaches the GPU.
+        TypeDef::Enum { .. } => false,
         TypeDef::Scalar(s) => s.on_gpu() && *s != Scalar::Bool,
         TypeDef::Vector(_) | TypeDef::Matrix(_) => true,
         TypeDef::Array(e, _) => {
@@ -165,5 +181,32 @@ mod tests {
         let arr4 = t.intern(TypeDef::Array(v4, 4));
         assert!(uniform_compatible(&t, arr4));
         assert!(uniform_compatible(&t, b));
+    }
+
+    #[test]
+    fn an_enum_is_its_tag_and_its_largest_payload() {
+        let mut t = Types::default();
+        let u32t = t.u32();
+        let v4 = t.vector(4);
+        let small =
+            t.intern(TypeDef::Struct { name: "S".into(), fields: vec![("a".into(), u32t)] });
+        let wide = t.intern(TypeDef::Struct {
+            name: "W".into(),
+            fields: vec![("b".into(), v4), ("c".into(), v4), ("d".into(), v4)],
+        });
+        let e = t.intern(TypeDef::Enum {
+            name: "E".into(),
+            variants: vec![
+                ("Empty".into(), None),
+                ("Small".into(), Some(small)),
+                ("Wide".into(), Some(wide)),
+            ],
+        });
+        // The payloads overlap after the tag, aligned for the most aligned one: 16 + 48.
+        assert_eq!(layout(&t, e), Layout { size: 64, align: 16 });
+        assert_eq!(field_offsets(&t, e), vec![0, 16, 16, 16]);
+        assert_eq!(t.field(e, 0), Some(u32t));
+        assert_eq!(t.field(e, 1), None);
+        assert_eq!(t.field(e, 3), Some(wide));
     }
 }

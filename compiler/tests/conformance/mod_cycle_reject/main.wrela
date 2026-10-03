@@ -1,0 +1,8 @@
+// rejects: mod.use
+use m::x
+use m::missing //~ E0200
+use q::z
+
+pub fn f() -> f32 {
+    x() + missing() + z()
+}

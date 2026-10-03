@@ -18,7 +18,7 @@
 
   ;; The setup batch: bytes 0..116.
   (data (i32.const 0)
-    "WRCS" "\01\00\00\00" "\68\00\00\00"            ;; magic, version 1, body length 104
+    "WRCS" "\02\00\00\00" "\68\00\00\00"            ;; magic, version 2, body length 104
     ;; CreateBuffer handle 1, 256 bytes
     "\01\00\00\00" "\08\00\00\00" "\01\00\00\00" "\00\01\00\00"
     ;; WriteBuffer handle 1, offset 0, 16 bytes: the seed colours (RGBA8, R in the low byte)
@@ -35,7 +35,7 @@
 
   ;; The frame batch: bytes 256..364. `frame` fills in the draw's uniform block (324..356).
   (data (i32.const 256)
-    "WRCS" "\01\00\00\00" "\60\00\00\00"            ;; magic, version 1, body length 96
+    "WRCS" "\02\00\00\00" "\60\00\00\00"            ;; magic, version 2, body length 96
     ;; BeginScreenPass, clear colour (0.02, 0.03, 0.06, 1.0)
     "\04\00\00\00" "\10\00\00\00"
     "\0a\d7\a3\3c" "\8f\c2\f5\3c" "\8f\c2\75\3d" "\00\00\80\3f"

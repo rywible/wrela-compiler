@@ -1,0 +1,458 @@
+{
+  "batches": [
+    {
+      "bytes": "5752435302000000a40000000100000008000000070000001000000002000000140000000700000004000000080000000102030405060708030000002000000000000000020000000100000001000000010000000700000004000000aabbccdd0400000010000000000000000000003f0000803f0000803f050000001c000000010000000300000001000000000000000800000001000000020000000600000000000000070000000400000007000000",
+      "name": "golden",
+      "outcome": {
+        "commands": [
+          {
+            "handle": 7,
+            "op": "CreateBuffer",
+            "size": 16
+          },
+          {
+            "data": [
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7,
+              8
+            ],
+            "handle": 7,
+            "offset": 4,
+            "op": "WriteBuffer"
+          },
+          {
+            "buffers": [
+              7
+            ],
+            "groups": [
+              2,
+              1,
+              1
+            ],
+            "op": "Dispatch",
+            "pipeline": 0,
+            "uniforms": [
+              170,
+              187,
+              204,
+              221
+            ]
+          },
+          {
+            "clear": [
+              0.0,
+              0.5,
+              1.0,
+              1.0
+            ],
+            "op": "BeginScreenPass"
+          },
+          {
+            "buffers": [],
+            "instances": 1,
+            "op": "Draw",
+            "pipeline": 1,
+            "uniforms": [
+              1,
+              0,
+              0,
+              0,
+              2,
+              0,
+              0,
+              0
+            ],
+            "vertices": 3
+          },
+          {
+            "op": "Present"
+          },
+          {
+            "handle": 7,
+            "op": "DestroyBuffer"
+          }
+        ]
+      }
+    },
+    {
+      "bytes": "57524353020000007c00000001000000080000000100000040000000030000002400000002000000040000000200000001000000020000000100000003000000040000000909090904000000100000000000803e0000003f0000403f0000803f05000000180000000000000003000000020000000100000001000000000000000600000000000000",
+      "name": "decodes what it encodes",
+      "outcome": {
+        "commands": [
+          {
+            "handle": 1,
+            "op": "CreateBuffer",
+            "size": 64
+          },
+          {
+            "buffers": [
+              1,
+              3
+            ],
+            "groups": [
+              4,
+              2,
+              1
+            ],
+            "op": "Dispatch",
+            "pipeline": 2,
+            "uniforms": [
+              9,
+              9,
+              9,
+              9
+            ]
+          },
+          {
+            "clear": [
+              0.25,
+              0.5,
+              0.75,
+              1.0
+            ],
+            "op": "BeginScreenPass"
+          },
+          {
+            "buffers": [
+              1
+            ],
+            "instances": 2,
+            "op": "Draw",
+            "pipeline": 0,
+            "uniforms": [],
+            "vertices": 3
+          },
+          {
+            "op": "Present"
+          }
+        ]
+      }
+    },
+    {
+      "bytes": "575243530200000000000000",
+      "name": "empty",
+      "outcome": {
+        "commands": []
+      }
+    },
+    {
+      "bytes": "575243",
+      "name": "too short",
+      "outcome": {
+        "error": {
+          "kind": "TooShort",
+          "message": "batch too short: needs 12 bytes, has 3"
+        }
+      }
+    },
+    {
+      "bytes": "5852435302000000080000000600000000000000",
+      "name": "bad magic",
+      "outcome": {
+        "error": {
+          "kind": "BadMagic",
+          "message": "not a command batch: magic is [88, 82, 67, 83], not `WRCS`"
+        }
+      }
+    },
+    {
+      "bytes": "5752435309000000080000000600000000000000",
+      "name": "another version",
+      "outcome": {
+        "error": {
+          "kind": "WrongVersion",
+          "message": "command stream version 9, but this host reads version 2"
+        }
+      }
+    },
+    {
+      "bytes": "5752435302000000630000000600000000000000",
+      "name": "body length",
+      "outcome": {
+        "error": {
+          "kind": "BodyLength",
+          "message": "batch declares 99 bytes of commands but has 8"
+        }
+      }
+    },
+    {
+      "bytes": "5752435302000000080000002a00000000000000",
+      "name": "unknown opcode",
+      "outcome": {
+        "error": {
+          "kind": "UnknownOpcode",
+          "message": "unknown opcode 42 at byte 12"
+        }
+      }
+    },
+    {
+      "bytes": "57524353010000000400000006000000",
+      "name": "a truncated command header",
+      "outcome": {
+        "error": {
+          "kind": "WrongVersion",
+          "message": "command stream version 1, but this host reads version 2"
+        }
+      }
+    },
+    {
+      "bytes": "57524353020000001000000001000000080000000100000000000000",
+      "name": "a zero-size buffer",
+      "outcome": {
+        "error": {
+          "kind": "BadPayload",
+          "message": "malformed CreateBuffer at byte 12: size must be a positive multiple of 4"
+        }
+      }
+    },
+    {
+      "bytes": "5752435302000000200000000500000018000000000000000300000001000000000000000800000001020304",
+      "name": "a uniform length that disagrees with the payload",
+      "outcome": {
+        "error": {
+          "kind": "BadPayload",
+          "message": "malformed Draw at byte 12: uniform length doesn't match the payload"
+        }
+      }
+    },
+    {
+      "bytes": "5752435302000000080000000600000004000000",
+      "name": "a payload running past the batch",
+      "outcome": {
+        "error": {
+          "kind": "BadPayload",
+          "message": "malformed Present at byte 12: payload runs past the end of the batch"
+        }
+      }
+    },
+    {
+      "bytes": "575243530200000020000000030000001800000000000000010000000100000001000000c800000000000000",
+      "name": "a buffer list running past the payload",
+      "outcome": {
+        "error": {
+          "kind": "BadPayload",
+          "message": "malformed Dispatch at byte 12: buffer list runs past the payload"
+        }
+      }
+    },
+    {
+      "bytes": "57524353020000001c00000002000000140000000100000000000000040000000000000000000000",
+      "name": "a write whose length disagrees with its data",
+      "outcome": {
+        "error": {
+          "kind": "BadPayload",
+          "message": "malformed WriteBuffer at byte 12: data length doesn't match the payload"
+        }
+      }
+    }
+  ],
+  "comment": "Generated by the wrela-abi crate (runtime/abi/src/vectors.rs); don't edit. Run `cargo run -p wrela-abi --bin gen-ts`.",
+  "hashes": [
+    {
+      "bytes": "",
+      "hash": "cbf29ce484222325"
+    },
+    {
+      "bytes": "61",
+      "hash": "af63dc4c8601ec8c"
+    },
+    {
+      "bytes": "666f6f626172",
+      "hash": "85944171f73967e8"
+    },
+    {
+      "bytes": "5752435302000000a40000000100000008000000070000001000000002000000140000000700000004000000080000000102030405060708030000002000000000000000020000000100000001000000010000000700000004000000aabbccdd0400000010000000000000000000003f0000803f0000803f050000001c000000010000000300000001000000000000000800000001000000020000000600000000000000070000000400000007000000",
+      "hash": "8299ddd10ca81332"
+    }
+  ],
+  "lines": [
+    {
+      "at": [
+        [
+          0,
+          null
+        ],
+        [
+          10,
+          null
+        ],
+        [
+          11,
+          null
+        ],
+        [
+          12,
+          "main.wrela:3:5"
+        ],
+        [
+          19,
+          "main.wrela:3:5"
+        ],
+        [
+          20,
+          "shapes/blob.wrela:40:9"
+        ],
+        [
+          299,
+          "shapes/blob.wrela:40:9"
+        ],
+        [
+          300,
+          null
+        ],
+        [
+          301,
+          "main.wrela:3:5"
+        ],
+        [
+          100000,
+          "main.wrela:3:5"
+        ]
+      ],
+      "bytes": "020e6d61696e2e7772656c613a333a35167368617065732f626c6f622e7772656c613a34303a39050a000c011402ac0200ad0201",
+      "error": null,
+      "name": "a table"
+    },
+    {
+      "at": [],
+      "bytes": "020e6d61696e2e7772656c613a333a35167368617065732f626c6f622e7772656c613a34303a39050a000c011402ac0200ad02",
+      "error": "the section ends early",
+      "name": "a truncated table"
+    }
+  ],
+  "manifests": [
+    {
+      "error": null,
+      "json": "{\n  \"manifest_version\": 1,\n  \"stream_version\": 2,\n  \"wasm\": \"game.wasm\",\n  \"pipelines\": [\n    {\n      \"name\": \"sample\",\n      \"shader\": \"pipeline_0.wgsl\",\n      \"kind\": \"compute\",\n      \"entry\": \"main\",\n      \"workgroup_size\": [\n        64,\n        1,\n        1\n      ],\n      \"uniform\": {\n        \"binding\": 0,\n        \"size\": 32,\n        \"space\": \"uniform\"\n      },\n      \"buffers\": [\n        {\n          \"binding\": 1,\n          \"access\": \"read_write\"\n        }\n      ]\n    },\n    {\n      \"name\": \"cover+shade\",\n      \"shader\": \"pipeline_1.wgsl\",\n      \"kind\": \"render\",\n      \"vertex_entry\": \"vs\",\n      \"fragment_entry\": \"fs\",\n      \"uniform\": null,\n      \"buffers\": []\n    }\n  ]\n}\n",
+      "name": "golden"
+    },
+    {
+      "error": "invalid manifest: manifest version 2, but this host reads version 1",
+      "json": "{\n  \"manifest_version\": 2,\n  \"stream_version\": 2,\n  \"wasm\": \"game.wasm\",\n  \"pipelines\": [\n    {\n      \"name\": \"sample\",\n      \"shader\": \"pipeline_0.wgsl\",\n      \"kind\": \"compute\",\n      \"entry\": \"main\",\n      \"workgroup_size\": [\n        64,\n        1,\n        1\n      ],\n      \"uniform\": {\n        \"binding\": 0,\n        \"size\": 32,\n        \"space\": \"uniform\"\n      },\n      \"buffers\": [\n        {\n          \"binding\": 1,\n          \"access\": \"read_write\"\n        }\n      ]\n    },\n    {\n      \"name\": \"cover+shade\",\n      \"shader\": \"pipeline_1.wgsl\",\n      \"kind\": \"render\",\n      \"vertex_entry\": \"vs\",\n      \"fragment_entry\": \"fs\",\n      \"uniform\": null,\n      \"buffers\": []\n    }\n  ]\n}\n",
+      "name": "another manifest version"
+    },
+    {
+      "error": "invalid manifest: command stream version 9, but this host reads 2",
+      "json": "{\n  \"manifest_version\": 1,\n  \"stream_version\": 9,\n  \"wasm\": \"game.wasm\",\n  \"pipelines\": [\n    {\n      \"name\": \"sample\",\n      \"shader\": \"pipeline_0.wgsl\",\n      \"kind\": \"compute\",\n      \"entry\": \"main\",\n      \"workgroup_size\": [\n        64,\n        1,\n        1\n      ],\n      \"uniform\": {\n        \"binding\": 0,\n        \"size\": 32,\n        \"space\": \"uniform\"\n      },\n      \"buffers\": [\n        {\n          \"binding\": 1,\n          \"access\": \"read_write\"\n        }\n      ]\n    },\n    {\n      \"name\": \"cover+shade\",\n      \"shader\": \"pipeline_1.wgsl\",\n      \"kind\": \"render\",\n      \"vertex_entry\": \"vs\",\n      \"fragment_entry\": \"fs\",\n      \"uniform\": null,\n      \"buffers\": []\n    }\n  ]\n}\n",
+      "name": "another stream version"
+    },
+    {
+      "error": "invalid manifest: pipeline 0's workgroup size [512, 1, 1] is outside WebGPU's limits",
+      "json": "{\n  \"manifest_version\": 1,\n  \"stream_version\": 2,\n  \"wasm\": \"game.wasm\",\n  \"pipelines\": [\n    {\n      \"name\": \"sample\",\n      \"shader\": \"pipeline_0.wgsl\",\n      \"kind\": \"compute\",\n      \"entry\": \"main\",\n      \"workgroup_size\": [\n        512,\n        1,\n        1\n      ],\n      \"uniform\": {\n        \"binding\": 0,\n        \"size\": 32,\n        \"space\": \"uniform\"\n      },\n      \"buffers\": [\n        {\n          \"binding\": 1,\n          \"access\": \"read_write\"\n        }\n      ]\n    },\n    {\n      \"name\": \"cover+shade\",\n      \"shader\": \"pipeline_1.wgsl\",\n      \"kind\": \"render\",\n      \"vertex_entry\": \"vs\",\n      \"fragment_entry\": \"fs\",\n      \"uniform\": null,\n      \"buffers\": []\n    }\n  ]\n}\n",
+      "name": "too wide a workgroup"
+    },
+    {
+      "error": "invalid manifest: pipeline 0's workgroup size [16, 16, 2] is outside WebGPU's limits",
+      "json": "{\n  \"manifest_version\": 1,\n  \"stream_version\": 2,\n  \"wasm\": \"game.wasm\",\n  \"pipelines\": [\n    {\n      \"name\": \"sample\",\n      \"shader\": \"pipeline_0.wgsl\",\n      \"kind\": \"compute\",\n      \"entry\": \"main\",\n      \"workgroup_size\": [\n        16,\n        16,\n        2\n      ],\n      \"uniform\": {\n        \"binding\": 0,\n        \"size\": 32,\n        \"space\": \"uniform\"\n      },\n      \"buffers\": [\n        {\n          \"binding\": 1,\n          \"access\": \"read_write\"\n        }\n      ]\n    },\n    {\n      \"name\": \"cover+shade\",\n      \"shader\": \"pipeline_1.wgsl\",\n      \"kind\": \"render\",\n      \"vertex_entry\": \"vs\",\n      \"fragment_entry\": \"fs\",\n      \"uniform\": null,\n      \"buffers\": []\n    }\n  ]\n}\n",
+      "name": "too many invocations"
+    },
+    {
+      "error": "invalid manifest: pipeline 0 uses a binding twice",
+      "json": "{\n  \"manifest_version\": 1,\n  \"stream_version\": 2,\n  \"wasm\": \"game.wasm\",\n  \"pipelines\": [\n    {\n      \"name\": \"sample\",\n      \"shader\": \"pipeline_0.wgsl\",\n      \"kind\": \"compute\",\n      \"entry\": \"main\",\n      \"workgroup_size\": [\n        64,\n        1,\n        1\n      ],\n      \"uniform\": {\n        \"binding\": 0,\n        \"size\": 32,\n        \"space\": \"uniform\"\n      },\n      \"buffers\": [\n        {\n          \"binding\": 0,\n          \"access\": \"read_write\"\n        }\n      ]\n    },\n    {\n      \"name\": \"cover+shade\",\n      \"shader\": \"pipeline_1.wgsl\",\n      \"kind\": \"render\",\n      \"vertex_entry\": \"vs\",\n      \"fragment_entry\": \"fs\",\n      \"uniform\": null,\n      \"buffers\": []\n    }\n  ]\n}\n",
+      "name": "a binding used twice"
+    },
+    {
+      "error": "invalid manifest: pipeline 0's uniform block of 20 bytes isn't a multiple of 16",
+      "json": "{\n  \"manifest_version\": 1,\n  \"stream_version\": 2,\n  \"wasm\": \"game.wasm\",\n  \"pipelines\": [\n    {\n      \"name\": \"sample\",\n      \"shader\": \"pipeline_0.wgsl\",\n      \"kind\": \"compute\",\n      \"entry\": \"main\",\n      \"workgroup_size\": [\n        64,\n        1,\n        1\n      ],\n      \"uniform\": {\n        \"binding\": 0,\n        \"size\": 20,\n        \"space\": \"uniform\"\n      },\n      \"buffers\": [\n        {\n          \"binding\": 1,\n          \"access\": \"read_write\"\n        }\n      ]\n    },\n    {\n      \"name\": \"cover+shade\",\n      \"shader\": \"pipeline_1.wgsl\",\n      \"kind\": \"render\",\n      \"vertex_entry\": \"vs\",\n      \"fragment_entry\": \"fs\",\n      \"uniform\": null,\n      \"buffers\": []\n    }\n  ]\n}\n",
+      "name": "a uniform block that isn't a multiple of 16"
+    },
+    {
+      "error": null,
+      "json": "{\n  \"manifest_version\": 1,\n  \"stream_version\": 2,\n  \"wasm\": \"game.wasm\",\n  \"pipelines\": [\n    {\n      \"name\": \"sample\",\n      \"shader\": \"pipeline_0.wgsl\",\n      \"kind\": \"compute\",\n      \"entry\": \"main\",\n      \"workgroup_size\": [\n        64,\n        1,\n        1\n      ],\n      \"uniform\": {\n        \"binding\": 0,\n        \"size\": 20,\n        \"space\": \"storage\"\n      },\n      \"buffers\": [\n        {\n          \"binding\": 1,\n          \"access\": \"read_write\"\n        }\n      ]\n    },\n    {\n      \"name\": \"cover+shade\",\n      \"shader\": \"pipeline_1.wgsl\",\n      \"kind\": \"render\",\n      \"vertex_entry\": \"vs\",\n      \"fragment_entry\": \"fs\",\n      \"uniform\": null,\n      \"buffers\": []\n    }\n  ]\n}\n",
+      "name": "a storage uniform block of 20 bytes"
+    },
+    {
+      "error": "invalid manifest: pipeline 0's uniform size 6 isn't a positive multiple of 4",
+      "json": "{\n  \"manifest_version\": 1,\n  \"stream_version\": 2,\n  \"wasm\": \"game.wasm\",\n  \"pipelines\": [\n    {\n      \"name\": \"sample\",\n      \"shader\": \"pipeline_0.wgsl\",\n      \"kind\": \"compute\",\n      \"entry\": \"main\",\n      \"workgroup_size\": [\n        64,\n        1,\n        1\n      ],\n      \"uniform\": {\n        \"binding\": 0,\n        \"size\": 6,\n        \"space\": \"storage\"\n      },\n      \"buffers\": [\n        {\n          \"binding\": 1,\n          \"access\": \"read_write\"\n        }\n      ]\n    },\n    {\n      \"name\": \"cover+shade\",\n      \"shader\": \"pipeline_1.wgsl\",\n      \"kind\": \"render\",\n      \"vertex_entry\": \"vs\",\n      \"fragment_entry\": \"fs\",\n      \"uniform\": null,\n      \"buffers\": []\n    }\n  ]\n}\n",
+      "name": "a uniform size that isn't a multiple of 4"
+    },
+    {
+      "error": "invalid manifest: pipeline 1 has 9 storage buffers; WebGPU's default limit is 8",
+      "json": "{\n  \"manifest_version\": 1,\n  \"stream_version\": 2,\n  \"wasm\": \"game.wasm\",\n  \"pipelines\": [\n    {\n      \"name\": \"sample\",\n      \"shader\": \"pipeline_0.wgsl\",\n      \"kind\": \"compute\",\n      \"entry\": \"main\",\n      \"workgroup_size\": [\n        64,\n        1,\n        1\n      ],\n      \"uniform\": {\n        \"binding\": 0,\n        \"size\": 32,\n        \"space\": \"uniform\"\n      },\n      \"buffers\": [\n        {\n          \"binding\": 1,\n          \"access\": \"read_write\"\n        }\n      ]\n    },\n    {\n      \"name\": \"cover+shade\",\n      \"shader\": \"pipeline_1.wgsl\",\n      \"kind\": \"render\",\n      \"vertex_entry\": \"vs\",\n      \"fragment_entry\": \"fs\",\n      \"uniform\": null,\n      \"buffers\": [\n        {\n          \"binding\": 0,\n          \"access\": \"read\"\n        },\n        {\n          \"binding\": 1,\n          \"access\": \"read\"\n        },\n        {\n          \"binding\": 2,\n          \"access\": \"read\"\n        },\n        {\n          \"binding\": 3,\n          \"access\": \"read\"\n        },\n        {\n          \"binding\": 4,\n          \"access\": \"read\"\n        },\n        {\n          \"binding\": 5,\n          \"access\": \"read\"\n        },\n        {\n          \"binding\": 6,\n          \"access\": \"read\"\n        },\n        {\n          \"binding\": 7,\n          \"access\": \"read\"\n        },\n        {\n          \"binding\": 8,\n          \"access\": \"read\"\n        }\n      ]\n    }\n  ]\n}\n",
+      "name": "too many storage buffers"
+    },
+    {
+      "error": "invalid manifest: pipeline 1 has no shader",
+      "json": "{\n  \"manifest_version\": 1,\n  \"stream_version\": 2,\n  \"wasm\": \"game.wasm\",\n  \"pipelines\": [\n    {\n      \"name\": \"sample\",\n      \"shader\": \"pipeline_0.wgsl\",\n      \"kind\": \"compute\",\n      \"entry\": \"main\",\n      \"workgroup_size\": [\n        64,\n        1,\n        1\n      ],\n      \"uniform\": {\n        \"binding\": 0,\n        \"size\": 32,\n        \"space\": \"uniform\"\n      },\n      \"buffers\": [\n        {\n          \"binding\": 1,\n          \"access\": \"read_write\"\n        }\n      ]\n    },\n    {\n      \"name\": \"cover+shade\",\n      \"shader\": \"\",\n      \"kind\": \"render\",\n      \"vertex_entry\": \"vs\",\n      \"fragment_entry\": \"fs\",\n      \"uniform\": null,\n      \"buffers\": []\n    }\n  ]\n}\n",
+      "name": "no shader"
+    },
+    {
+      "error": "invalid manifest: pipeline 1 is missing an entry point",
+      "json": "{\n  \"manifest_version\": 1,\n  \"stream_version\": 2,\n  \"wasm\": \"game.wasm\",\n  \"pipelines\": [\n    {\n      \"name\": \"sample\",\n      \"shader\": \"pipeline_0.wgsl\",\n      \"kind\": \"compute\",\n      \"entry\": \"main\",\n      \"workgroup_size\": [\n        64,\n        1,\n        1\n      ],\n      \"uniform\": {\n        \"binding\": 0,\n        \"size\": 32,\n        \"space\": \"uniform\"\n      },\n      \"buffers\": [\n        {\n          \"binding\": 1,\n          \"access\": \"read_write\"\n        }\n      ]\n    },\n    {\n      \"name\": \"cover+shade\",\n      \"shader\": \"pipeline_1.wgsl\",\n      \"kind\": \"render\",\n      \"vertex_entry\": \"vs\",\n      \"fragment_entry\": \"\",\n      \"uniform\": null,\n      \"buffers\": []\n    }\n  ]\n}\n",
+      "name": "a missing entry point"
+    },
+    {
+      "error": "invalid manifest: no WASM file",
+      "json": "{\n  \"manifest_version\": 1,\n  \"stream_version\": 2,\n  \"wasm\": \"\",\n  \"pipelines\": [\n    {\n      \"name\": \"sample\",\n      \"shader\": \"pipeline_0.wgsl\",\n      \"kind\": \"compute\",\n      \"entry\": \"main\",\n      \"workgroup_size\": [\n        64,\n        1,\n        1\n      ],\n      \"uniform\": {\n        \"binding\": 0,\n        \"size\": 32,\n        \"space\": \"uniform\"\n      },\n      \"buffers\": [\n        {\n          \"binding\": 1,\n          \"access\": \"read_write\"\n        }\n      ]\n    },\n    {\n      \"name\": \"cover+shade\",\n      \"shader\": \"pipeline_1.wgsl\",\n      \"kind\": \"render\",\n      \"vertex_entry\": \"vs\",\n      \"fragment_entry\": \"fs\",\n      \"uniform\": null,\n      \"buffers\": []\n    }\n  ]\n}\n",
+      "name": "no WASM file"
+    }
+  ],
+  "sequences": [
+    {
+      "bytes": "5752435302000000a40000000100000008000000070000001000000002000000140000000700000004000000080000000102030405060708030000002000000000000000020000000100000001000000010000000700000004000000aabbccdd0400000010000000000000000000003f0000803f0000803f050000001c000000010000000300000001000000000000000800000001000000020000000600000000000000070000000400000007000000",
+      "error": null,
+      "name": "in order"
+    },
+    {
+      "bytes": "57524353020000001c00000005000000140000000000000003000000010000000000000000000000",
+      "error": {
+        "kind": "Sequence",
+        "message": "Draw out of sequence: a draw must come after BeginScreenPass"
+      },
+      "name": "a draw outside a pass"
+    },
+    {
+      "bytes": "5752435302000000080000000600000000000000",
+      "error": {
+        "kind": "Sequence",
+        "message": "Present out of sequence: Present must close a screen pass"
+      },
+      "name": "a present outside a pass"
+    },
+    {
+      "bytes": "575243530200000030000000040000001000000000000000000000000000000000000000040000001000000000000000000000000000000000000000",
+      "error": {
+        "kind": "Sequence",
+        "message": "BeginScreenPass out of sequence: a screen pass is already open"
+      },
+      "name": "a pass inside a pass"
+    },
+    {
+      "bytes": "57524353020000002800000004000000100000000000000000000000000000000000000001000000080000000000000004000000",
+      "error": {
+        "kind": "Sequence",
+        "message": "CreateBuffer out of sequence: only draws can happen inside a screen pass"
+      },
+      "name": "a buffer made in a pass"
+    },
+    {
+      "bytes": "5752435302000000380000000400000010000000000000000000000000000000000000000300000018000000000000000100000001000000010000000000000000000000",
+      "error": {
+        "kind": "Sequence",
+        "message": "Dispatch out of sequence: only draws can happen inside a screen pass"
+      },
+      "name": "a dispatch in a pass"
+    },
+    {
+      "bytes": "575243530200000018000000040000001000000000000000000000000000000000000000",
+      "error": {
+        "kind": "UnclosedPass",
+        "message": "frame returned with a screen pass still open (no Present)"
+      },
+      "name": "a pass left open"
+    },
+    {
+      "bytes": "57524353020000003400000001000000080000000000000004000000040000001000000000000000000000000000000000000000070000000400000000000000",
+      "error": {
+        "kind": "Sequence",
+        "message": "DestroyBuffer out of sequence: only draws can happen inside a screen pass"
+      },
+      "name": "a buffer destroyed in a pass"
+    }
+  ]
+}

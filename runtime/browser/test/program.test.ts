@@ -6,6 +6,7 @@ import { parseManifest } from "../src/manifest.ts";
 import { checkAbi, Program, ProgramError, TrapError } from "../src/program.ts";
 import { StateHash } from "../src/hash.ts";
 import { StreamError } from "../src/stream.ts";
+import { wasmOffsets } from "../src/lines.ts";
 import { Encoder } from "./encoder.ts";
 import { checker, Recorder, readFixture } from "./fixtures.ts";
 import { batchProgram, buildModule, FRAME_TYPE, op, SUBMIT } from "./wasm-builder.ts";
@@ -102,7 +103,7 @@ test("hashes every submitted byte", async () => {
 
 test("rejects another stream version", async () => {
   const batch = new Encoder().present().finish();
-  batch[4] = 2;
+  batch[4] = 9;
   const e = await runError([[batch]]);
   expect(e).toBeInstanceOf(StreamError);
   expect((e as StreamError).kind).toBe("WrongVersion");
@@ -217,7 +218,7 @@ test("first-light's CPU side gives the native host's state hash", async () => {
   const manifest = parseManifest(new TextDecoder().decode(readFixture("manifest.json")));
   const program = await Program.load(readFixture("game.wasm"), checker(manifest), new Recorder(), { hash: true });
   for (let i = 0; i < 60; i++) program.frame(i / 60, 640, 360);
-  expect(program.hash!.hex()).toBe("72a286b95c5c7ecf");
+  expect(program.hash!.hex()).toBe("affac621a26ab564");
   const log = (program.executor as Recorder).log;
   expect(log.slice(0, 7)).toEqual(["CreateBuffer", "WriteBuffer", "Dispatch", "BeginScreenPass", "Draw", "Present", "end"]);
   expect(log.length).toBe(3 + 60 * 4);
@@ -226,4 +227,12 @@ test("first-light's CPU side gives the native host's state hash", async () => {
 test("runs without the state hash unless asked", async () => {
   const program = await Program.load(readFixture("game.wasm"), checker(), new Recorder());
   expect(program.hash).toBeNull();
+});
+
+test("reads the offsets of a stack trace's WASM frames", () => {
+  // V8's form (Chrome), then SpiderMonkey's (Firefox).
+  const v8 = "RuntimeError: divide by zero\n    at div (wasm://wasm/0a1b2c3d:wasm-function[7]:0x2f1)\n    at run (wasm://wasm/0a1b2c3d:wasm-function[9]:0x340)";
+  expect(wasmOffsets(v8)).toEqual([0x2f1, 0x340]);
+  expect(wasmOffsets("div@http://localhost/game.wasm:wasm-function[7]:0x2f1\n")).toEqual([0x2f1]);
+  expect(wasmOffsets("<?>.wasm-function[7]@[wasm code]")).toEqual([]);
 });

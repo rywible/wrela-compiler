@@ -1,4 +1,4 @@
-//! # The command stream, version 1
+//! # The command stream, version 2
 //!
 //! A program records GPU work as commands in its own memory and hands them to the host in
 //! batches through `wrela.submit(ptr, len)` (D-099). The host decodes each batch in bulk into
@@ -24,8 +24,11 @@
 //! | 4 | `BeginScreenPass` | the clear colour: `r`, `g`, `b`, `a` as f32 |
 //! | 5 | `Draw` | `pipeline`, `vertices`, `instances`, `buffer count`, the buffer handles, `uniform length`, then the uniform bytes |
 //! | 6 | `Present` | none |
+//! | 7 | `DestroyBuffer` | `handle`. Later commands can't use the buffer; work already recorded still can. |
 //!
-//! - **Handles** are chosen by the program: small integers, each created once.
+//! - **Handles** are chosen by the program: small integers, each naming one live buffer at a
+//!   time. A buffer lives until the program destroys it (a compiled wrela program destroys a
+//!   call's buffers when its next call begins: language.md §12).
 //! - **Pipelines** index [`crate::Manifest::pipelines`]. A dispatch names a compute pipeline and
 //!   a draw a render pipeline; the buffer handles bind to the pipeline's `buffers`, in order, and
 //!   the uniform bytes are its uniform block (exactly `uniform.size` bytes, or none when it has
@@ -33,7 +36,8 @@
 //! - **Order:** commands take effect in the order they're recorded. A host that batches GPU
 //!   work must flush recorded dispatches before applying a later `WriteBuffer`.
 //! - **Frames:** `BeginScreenPass`, then any number of `Draw`s, then `Present`. Draws happen
-//!   only inside a screen pass; dispatches, buffer creation and writes only outside one. A
+//!   only inside a screen pass; dispatches, buffer creation, destruction and writes only
+//!   outside one. A
 //!   screen pass closes in the same call of `frame` that opened it (a browser's canvas texture
 //!   lives only until the frame's task ends): [`Sequencer::end_frame`].
 //!
@@ -43,7 +47,7 @@
 use std::fmt;
 
 /// The stream format's version. Bumped by any change a host could notice.
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 pub const MAGIC: [u8; 4] = *b"WRCS";
 /// The batch header: magic, version, body length.
 pub const HEADER_LEN: usize = 12;
@@ -60,16 +64,18 @@ pub enum Opcode {
     BeginScreenPass = 4,
     Draw = 5,
     Present = 6,
+    DestroyBuffer = 7,
 }
 
 impl Opcode {
-    pub const ALL: [Opcode; 6] = [
+    pub const ALL: [Opcode; 7] = [
         Opcode::CreateBuffer,
         Opcode::WriteBuffer,
         Opcode::Dispatch,
         Opcode::BeginScreenPass,
         Opcode::Draw,
         Opcode::Present,
+        Opcode::DestroyBuffer,
     ];
 
     pub fn from_u32(v: u32) -> Option<Opcode> {
@@ -84,6 +90,7 @@ impl Opcode {
             Opcode::BeginScreenPass => "BeginScreenPass",
             Opcode::Draw => "Draw",
             Opcode::Present => "Present",
+            Opcode::DestroyBuffer => "DestroyBuffer",
         }
     }
 }
@@ -97,6 +104,7 @@ pub enum Command<'a> {
     BeginScreenPass { clear: [f32; 4] },
     Draw { pipeline: u32, vertices: u32, instances: u32, buffers: Vec<u32>, uniforms: &'a [u8] },
     Present,
+    DestroyBuffer { handle: u32 },
 }
 
 impl Command<'_> {
@@ -108,6 +116,7 @@ impl Command<'_> {
             Command::BeginScreenPass { .. } => Opcode::BeginScreenPass,
             Command::Draw { .. } => Opcode::Draw,
             Command::Present => Opcode::Present,
+            Command::DestroyBuffer { .. } => Opcode::DestroyBuffer,
         }
     }
 }
@@ -297,6 +306,12 @@ pub fn decode(batch: &[u8]) -> Result<Vec<Command<'_>>, StreamError> {
                 }
                 Command::Present
             }
+            Opcode::DestroyBuffer => {
+                if words != 1 {
+                    return Err(bad("expected 1 word"));
+                }
+                Command::DestroyBuffer { handle: w(0) }
+            }
         };
         out.push(cmd);
         at = start + len;
@@ -337,6 +352,7 @@ impl Sequencer {
             Command::Dispatch { .. }
             | Command::CreateBuffer { .. }
             | Command::WriteBuffer { .. }
+            | Command::DestroyBuffer { .. }
                 if self.in_pass =>
             {
                 err("only draws can happen inside a screen pass")
@@ -423,6 +439,11 @@ impl Encoder {
 
     pub fn present(&mut self) -> &mut Self {
         self.command(Opcode::Present, &[], &[]);
+        self
+    }
+
+    pub fn destroy_buffer(&mut self, handle: u32) -> &mut Self {
+        self.command(Opcode::DestroyBuffer, &[handle], &[]);
         self
     }
 

@@ -199,7 +199,7 @@ impl Inliner<'_> {
                 // Single exit: the one `return` is the body's last statement.
                 Stmt::Return(Some(x)) => *result = Some(val(values, *x)?),
                 Stmt::Return(None) => {}
-                Stmt::Break | Stmt::Continue | Stmt::Trap => out.push(s.clone()),
+                Stmt::Break | Stmt::Continue | Stmt::Trap | Stmt::At(_) => out.push(s.clone()),
             }
         }
         Ok(out)
@@ -407,7 +407,7 @@ fn forward_block(
                     },
                     Expr::Extract(x, k) => src.get(x).and_then(|base| {
                         let proj = match m.types.get(f.value_ty(*x)) {
-                            TypeDef::Struct { .. } => Some(Proj::Field(*k)),
+                            TypeDef::Struct { .. } | TypeDef::Enum { .. } => Some(Proj::Field(*k)),
                             TypeDef::Vector(_) => Some(Proj::Comp(*k as u8)),
                             _ => None,
                         };

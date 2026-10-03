@@ -1,0 +1,7 @@
+// rejects: lex.newline
+fn f() -> i32 {
+    1
+}
+
+fn g() -> i32 { //~ E0101
+    2

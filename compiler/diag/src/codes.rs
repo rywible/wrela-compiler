@@ -50,6 +50,13 @@ impl fmt::Display for Code {
     }
 }
 
+/// Codes retired before release, with why: never reused for anything else.
+pub const RETIRED: &[(&str, &str)] = &[
+    ("E0316", "a constant that isn't a literal value: E0906 reports it (a tier-1 feature)"),
+    ("E0509", "a projection that escapes: E0508 reports it (one not from a parameter)"),
+    ("E0907", "workgroup-shared memory: it has no syntax yet to report (milestone 2)"),
+];
+
 macro_rules! codes {
     ($($name:ident = $code:literal, $title:literal;)*) => {
         $(
@@ -95,7 +102,7 @@ codes! {
     E0206 = "E0206", "an unknown field";
     E0207 = "E0207", "an unknown method";
     E0208 = "E0208", "a symbolic link to a directory";
-    E0209 = "E0209", "an import cycle or ambiguous import";
+    E0209 = "E0209", "an import cycle";
     E0210 = "E0210", "a private field";
     E0211 = "E0211", "an unknown variant";
     E0212 = "E0212", "a type used as a value, or a value as a type";
@@ -118,7 +125,6 @@ codes! {
     E0313 = "E0313", "a condition that isn't `bool`";
     E0314 = "E0314", "a missing return value";
     E0315 = "E0315", "`break` or `continue` outside a loop";
-    E0316 = "E0316", "a constant that isn't a literal value";
     E0317 = "E0317", "an invalid swizzle";
     E0318 = "E0318", "a recursive type";
     E0319 = "E0319", "an invalid conversion";
@@ -157,7 +163,6 @@ codes! {
     E0506 = "E0506", "an access that overlaps a live `mut` access";
     E0507 = "E0507", "a write to a place that's borrowed";
     E0508 = "E0508", "a projection that doesn't come from a `borrow` or `mut` parameter";
-    E0509 = "E0509", "a projection that escapes";
     E0510 = "E0510", "a closure that escapes";
     E0511 = "E0511", "a `take` of a value that isn't a named place";
     E0512 = "E0512", "a `mut` projection of a read-only place";
@@ -191,7 +196,6 @@ codes! {
     E0904 = "E0904", "`unsafe` is tier 1";
     E0905 = "E0905", "`dyn` is tier 2";
     E0906 = "E0906", "an evaluated constant initializer is tier 1";
-    E0907 = "E0907", "workgroup-shared memory is milestone 2";
 
     // ---- W0xxx: warnings -------------------------------------------------------------------
     W0001 = "W0001", "an unused local";
@@ -216,6 +220,9 @@ mod tests {
             assert!(s.starts_with('E') || s.starts_with('W') || s.starts_with('I'), "{s}");
             assert!(s[1..].bytes().all(|b| b.is_ascii_digit()), "{s}");
             assert!(!c.title().is_empty());
+        }
+        for (r, _) in RETIRED {
+            assert!(Code::lookup(r).is_none(), "{r} is retired but still declared");
         }
     }
 

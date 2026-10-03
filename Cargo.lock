@@ -2004,6 +2004,9 @@ dependencies = [
 [[package]]
 name = "wrela-ir"
 version = "0.1.0"
+dependencies = [
+ "wrela-diag",
+]
 
 [[package]]
 name = "wrela-lower"
@@ -2054,6 +2057,7 @@ dependencies = [
  "wasmparser 0.261.0",
  "wat",
  "wrela-abi",
+ "wrela-diag",
  "wrela-ir",
 ]
 

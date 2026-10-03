@@ -1,0 +1,14 @@
+// rejects: mod.use
+struct Point {
+    x: f32,
+}
+
+pub fn first(p: Point) -> f32 { //~ E0703
+    p.x
+}
+
+pub fn pair(a: f32) -> [f32; 2] { //~ E0703
+    [a, a]
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

@@ -1,0 +1,21 @@
+// rejects: mem.take
+struct Log {
+    count: u32,
+}
+
+fn archive(log: take Log) -> u32 {
+    log.count
+}
+
+fn borrowed(log: Log) -> u32 {
+    archive(take log) //~ E0502
+}
+
+fn unmarked(log: Log) -> u32 {
+    archive(log) //~ E0502
+}
+
+fn element() -> u32 {
+    var logs = [Log { count: 1 }, Log { count: 2 }]
+    archive(take logs[0]) //~ E0502
+}

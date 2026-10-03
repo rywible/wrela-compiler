@@ -729,7 +729,7 @@ pub struct FnCheck {
 }
 
 pub fn check_fn(p: &Program, consts: &ConstTypes, f: FnId) -> FnCheck {
-    let def = p.func(f).clone();
+    let def = p.func(f);
     let none = FnCheck { body: None, diags: Vec::new(), incomplete: false };
     let Some(body) = def.body.clone() else { return none };
     if def.attrs.intrinsic {
@@ -740,6 +740,10 @@ pub fn check_fn(p: &Program, consts: &ConstTypes, f: FnId) -> FnCheck {
         scope.self_ty = Some(p.types.param(p.trait_(t).self_param));
     }
     let mut c = Checker::new(p, consts, scope, Some(f));
+    // A syntax error inside the body: it may be missing parts from the start.
+    c.saw_syntax_error = p.syntax_errors.iter().any(|e| {
+        e.file == body.span.file && body.span.start <= e.start && e.start <= body.span.end
+    });
     let mut params = Vec::new();
     for ps in &def.params {
         let id = c.declare_local(&ps.name, ps.ty, LocalKind::Param(ps.mode), ps.span);
@@ -803,7 +807,7 @@ pub fn check_fn(p: &Program, consts: &ConstTypes, f: FnId) -> FnCheck {
 
 /// Checks a struct's field defaults where they're declared: literal values of the field's type.
 pub fn check_field_defaults(p: &Program, consts: &ConstTypes, a: AdtId) -> Vec<Diagnostic> {
-    let def = p.adt(a).clone();
+    let def = p.adt(a);
     let mut out = Vec::new();
     for f in def.fields() {
         let Some(d) = &f.default else { continue };

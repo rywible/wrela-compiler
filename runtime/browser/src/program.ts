@@ -5,6 +5,7 @@
 import { EXPORT_FRAME, EXPORT_MEMORY, IMPORT_MODULE, IMPORT_SUBMIT } from "./abi.gen.ts";
 import type { Checker } from "./check.ts";
 import { StateHash } from "./hash.ts";
+import { Lines, LINES_SECTION, wasmOffsets } from "./lines.ts";
 import { type Bytes, type Command, decode, Sequencer } from "./stream.ts";
 import { functionTypes } from "./wasm.ts";
 
@@ -80,6 +81,8 @@ export class Program {
   readonly hash: StateHash | null;
   readonly #sequencer = new Sequencer();
   #memory: WebAssembly.Memory | null = null;
+  /** Where the code came from, for trap messages. */
+  #lines: Lines | null = null;
   #frame: FrameFn | null = null;
   #instance: WebAssembly.Instance | null = null;
   /** The error behind the most recent trap raised by `submit`, so the caller gets it rather
@@ -118,6 +121,11 @@ export class Program {
     options: ProgramOptions = {},
   ): Promise<Program> {
     const program = new Program(checker, executor, options);
+    try {
+      program.#lines = Lines.of(module);
+    } catch (e) {
+      throw new ProgramError(`its \`${LINES_SECTION}\` section is malformed: ${e instanceof Error ? e.message : String(e)}`);
+    }
     const imports = {
       [IMPORT_MODULE]: { [IMPORT_SUBMIT]: (ptr: number, len: number) => program.#submitImport(ptr, len) },
     };
@@ -169,6 +177,17 @@ export class Program {
     return this.#call(() => (f as (...a: number[]) => unknown)(...args));
   }
 
+  /** What trapped, and where in the source if the program says and the engine's stack trace
+   * gives offsets: the location of the innermost frame that has one. */
+  #describe(e: unknown): string {
+    const what = e instanceof Error ? e.message : String(e);
+    const stack = e instanceof Error ? (e.stack ?? "") : "";
+    const at = wasmOffsets(stack)
+      .map((offset) => this.#lines?.at(offset) ?? null)
+      .find((loc) => loc !== null);
+    return at ? `${what} at ${at}` : what;
+  }
+
   #call<T>(f: () => T): T {
     this.#failure = null;
     try {
@@ -177,7 +196,7 @@ export class Program {
       const failure = this.#failure;
       this.#failure = null;
       if (failure !== null) throw failure;
-      throw new TrapError(e instanceof Error ? e.message : String(e));
+      throw new TrapError(this.#describe(e));
     }
   }
 }

@@ -11,6 +11,16 @@ pub fn print(m: &Module) -> String {
                 fields.iter().map(|(n, t)| format!("{n}: {}", m.types.display(*t))).collect();
             let _ = writeln!(s, "type %{i} = struct {name} {{ {} }}", fs.join(", "));
         }
+        if let TypeDef::Enum { name, variants } = d {
+            let vs: Vec<String> = variants
+                .iter()
+                .map(|(n, p)| match p {
+                    Some(t) => format!("{n}({})", m.types.display(*t)),
+                    None => n.clone(),
+                })
+                .collect();
+            let _ = writeln!(s, "type %{i} = enum {name} {{ {} }}", vs.join(", "));
+        }
     }
     for r in &m.resources {
         let _ = writeln!(
@@ -111,6 +121,10 @@ fn expr(m: &Module, e: &Expr) -> String {
         }
         Expr::Builtin(b, args) => format!("{b:?}({})", vals(args)),
         Expr::Construct(t, args) => format!("{} {{ {} }}", m.types.display(*t), vals(args)),
+        Expr::Variant(t, k, payload) => match payload {
+            Some(p) => format!("{}#{k}(v{})", m.types.display(*t), p.0),
+            None => format!("{}#{k}", m.types.display(*t)),
+        },
         Expr::Extract(v, i) => format!("v{}.{i}", v.0),
         Expr::ExtractDyn(v, i) => format!("v{}[v{}]", v.0, i.0),
         Expr::Splat(v, n) => format!("splat{n} v{}", v.0),
@@ -155,6 +169,9 @@ fn block(m: &Module, f: &Function, b: &Block, depth: usize, s: &mut String) {
                     block(m, f, else_, depth + 1, s);
                 }
                 let _ = writeln!(s, "{pad}}}");
+            }
+            Stmt::At(span) => {
+                let _ = writeln!(s, "{pad}at {}:{}..{}", span.file.0, span.start, span.end);
             }
             Stmt::Loop { body, continuing } => {
                 let _ = writeln!(s, "{pad}loop {{");

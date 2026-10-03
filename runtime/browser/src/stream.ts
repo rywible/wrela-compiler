@@ -1,4 +1,4 @@
-// The command stream, version 1: decoding and sequencing. A line-for-line mirror of
+// The command stream, version 2: decoding and sequencing. A line-for-line mirror of
 // runtime/abi/src/stream.rs (`decode`, `Sequencer`, `StreamError`), with the same checks in the
 // same order and the same messages, so both hosts reject the same batches the same way. The
 // format's constants come from abi.gen.ts.
@@ -16,7 +16,8 @@ export type Command =
   | { op: "Dispatch"; pipeline: number; groups: [number, number, number]; buffers: number[]; uniforms: Bytes }
   | { op: "BeginScreenPass"; clear: [number, number, number, number] }
   | { op: "Draw"; pipeline: number; vertices: number; instances: number; buffers: number[]; uniforms: Bytes }
-  | { op: "Present" };
+  | { op: "Present" }
+  | { op: "DestroyBuffer"; handle: number };
 
 const NAMES = new Map<number, OpcodeName>(
   (Object.entries(Opcode) as [OpcodeName, number][]).map(([name, value]) => [value, name]),
@@ -142,6 +143,11 @@ export function decode(batch: Bytes): Command[] {
         cmd = { op: name };
         break;
       }
+      case "DestroyBuffer": {
+        if (words !== 1) throw bad("expected 1 word");
+        cmd = { op: name, handle: w(0) };
+        break;
+      }
     }
     out.push(cmd);
     at = start + len;
@@ -174,6 +180,7 @@ export class Sequencer {
       case "Dispatch":
       case "CreateBuffer":
       case "WriteBuffer":
+      case "DestroyBuffer":
         if (this.#inPass) throw err("only draws can happen inside a screen pass");
         return;
     }

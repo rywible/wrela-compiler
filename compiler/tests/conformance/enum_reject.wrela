@@ -15,3 +15,22 @@ fn size(e: Edit) -> f32 {
 fn other() -> Edit {
     Edit::Grow //~ E0211
 }
+
+fn tuple(x: i32) -> i32 {
+    let (a, b) = x //~ E0320
+    a + b
+}
+
+fn shape(x: i32) -> i32 {
+    match x {
+        Edit::Dig { radius } => i32(radius), //~ E0320
+        _ => 0,
+    }
+}
+
+fn kind(x: i32) -> f32 {
+    match x {
+        Edit::Clear => 0.0, //~ E0320
+        _ => 1.0,
+    }
+}

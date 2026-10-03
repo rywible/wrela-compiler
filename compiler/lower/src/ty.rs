@@ -58,14 +58,14 @@ impl<'a> Cx<'a> {
         if !self.checked.program.types.any(t, &mut |k| matches!(k, TyKind::Opaque(..))) {
             return t;
         }
-        let k = self.checked.program.types.kind(t).clone();
+        let k = self.checked.program.types.kind(t);
         match k {
             TyKind::Opaque(f, args) => {
-                let Some(hidden) = self.checked.mir.get(&f).and_then(|b| b.hidden_ret) else {
+                let Some(hidden) = self.checked.mir.get(f).and_then(|b| b.hidden_ret) else {
                     return self.checked.program.types.error;
                 };
-                let generics = self.checked.program.fn_all_generics(f);
-                let subst = Subst::from_pairs(&generics, &args);
+                let generics = self.checked.program.fn_all_generics(*f);
+                let subst = Subst::from_pairs(&generics, args);
                 self.concrete(hidden, &subst)
             }
             TyKind::Tuple(ts) => {
@@ -74,14 +74,14 @@ impl<'a> Cx<'a> {
             }
             TyKind::Adt(a, ts) => {
                 let ts = ts.iter().map(|&x| self.reveal(x)).collect();
-                self.checked.program.types.intern(TyKind::Adt(a, ts))
+                self.checked.program.types.intern(TyKind::Adt(*a, ts))
             }
             TyKind::Array(e, n) => {
-                let e = self.reveal(e);
-                self.checked.program.types.intern(TyKind::Array(e, n))
+                let e = self.reveal(*e);
+                self.checked.program.types.intern(TyKind::Array(e, *n))
             }
             TyKind::Slice(e) => {
-                let e = self.reveal(e);
+                let e = self.reveal(*e);
                 self.checked.program.types.intern(TyKind::Slice(e))
             }
             _ => t,
@@ -102,7 +102,7 @@ impl<'a> Cx<'a> {
         if let Some(&c) = mb.type_cache.get(&t) {
             return c;
         }
-        let k = self.checked.program.types.kind(t).clone();
+        let k = self.checked.program.types.kind(t);
         let gpu = mb.target == ir::Target::Gpu;
         let out = match k {
             TyKind::Bool => Some(mb.m.types.bool()),
@@ -123,14 +123,14 @@ impl<'a> Cx<'a> {
                 Some(mb.m.types.scalar(s))
             }
             TyKind::Float(f) => {
-                let s = if f == FloatTy::F32 { ir::Scalar::F32 } else { ir::Scalar::F64 };
+                let s = if *f == FloatTy::F32 { ir::Scalar::F32 } else { ir::Scalar::F64 };
                 if gpu && !s.on_gpu() {
                     self.cpu_only(mb, s.name(), span);
                 }
                 Some(mb.m.types.scalar(s))
             }
-            TyKind::Vec(n) => Some(mb.m.types.vector(n)),
-            TyKind::Mat(n) => Some(mb.m.types.intern(ir::TypeDef::Matrix(n))),
+            TyKind::Vec(n) => Some(mb.m.types.vector(*n)),
+            TyKind::Mat(n) => Some(mb.m.types.intern(ir::TypeDef::Matrix(*n))),
             TyKind::Tuple(ts) => {
                 if ts.is_empty() {
                     None
@@ -146,10 +146,10 @@ impl<'a> Cx<'a> {
                 }
             }
             TyKind::Array(e, n) => {
-                self.lower_ty(mb, e, span).map(|e| mb.m.types.intern(ir::TypeDef::Array(e, n)))
+                self.lower_ty(mb, *e, span).map(|e| mb.m.types.intern(ir::TypeDef::Array(e, *n)))
             }
             TyKind::Slice(e) => {
-                let e = self.lower_ty(mb, e, span)?;
+                let e = self.lower_ty(mb, *e, span)?;
                 Some(mb.m.types.intern(if gpu {
                     ir::TypeDef::RuntimeArray(e)
                 } else {
@@ -158,30 +158,31 @@ impl<'a> Cx<'a> {
             }
             TyKind::Adt(a, args) => {
                 let name = self.checked.program.display_ty(t);
-                if self.checked.program.adt(a).is_enum() {
-                    let u32_ty = mb.m.types.u32();
-                    let mut fields = vec![("tag".to_string(), u32_ty)];
-                    let nvar = self.checked.program.adt(a).variants().len();
+                if self.checked.program.adt(*a).is_enum() {
+                    // The tag is a `u32`, which field 0 has.
+                    mb.m.types.u32();
+                    let mut variants = Vec::new();
+                    let nvar = self.checked.program.adt(*a).variants().len();
                     for v in 0..nvar {
-                        let vfields = self.checked.program.variant_fields(a, &args, v);
-                        let vname = self.checked.program.adt(a).variants()[v].name.clone();
+                        let vfields = self.checked.program.variant_fields(*a, args, v);
+                        let vname = self.checked.program.adt(*a).variants()[v].name.clone();
                         let mut payload = Vec::new();
                         for (n, ft) in vfields {
                             if let Some(f) = self.lower_ty(mb, ft, span) {
                                 payload.push((n, f));
                             }
                         }
-                        if !payload.is_empty() {
-                            let pt = mb.m.types.intern(ir::TypeDef::Struct {
+                        let pt = (!payload.is_empty()).then(|| {
+                            mb.m.types.intern(ir::TypeDef::Struct {
                                 name: format!("{name}::{vname}"),
                                 fields: payload,
-                            });
-                            fields.push((vname, pt));
-                        }
+                            })
+                        });
+                        variants.push((vname, pt));
                     }
-                    Some(mb.m.types.intern(ir::TypeDef::Struct { name, fields }))
+                    Some(mb.m.types.intern(ir::TypeDef::Enum { name, variants }))
                 } else {
-                    let fs = self.checked.program.struct_fields(a, &args);
+                    let fs = self.checked.program.struct_fields(*a, args);
                     let mut fields = Vec::new();
                     for (n, ft) in fs {
                         let ft = self.reveal(ft);
@@ -234,7 +235,7 @@ impl<'a> Cx<'a> {
         variant: Option<u32>,
         span: Span,
     ) -> Vec<Option<u32>> {
-        let k = self.checked.program.types.kind(t).clone();
+        let k = self.checked.program.types.kind(t);
         let fields: Vec<TyId> = match (&k, variant) {
             (TyKind::Adt(a, args), None) => {
                 self.checked.program.struct_fields(*a, args).into_iter().map(|(_, t)| t).collect()
@@ -271,18 +272,11 @@ impl<'a> Cx<'a> {
         variant: u32,
         span: Span,
     ) -> Option<u32> {
-        let TyKind::Adt(a, args) = self.checked.program.types.kind(t).clone() else { return None };
-        let mut field = 1;
-        for v in 0..variant {
-            let vfields = self.checked.program.variant_fields(a, &args, v as usize);
-            let any = vfields.into_iter().any(|(_, ft)| self.lower_ty(mb, ft, span).is_some());
-            if any {
-                field += 1;
-            }
-        }
-        let vfields = self.checked.program.variant_fields(a, &args, variant as usize);
+        let TyKind::Adt(a, args) = self.checked.program.types.kind(t) else { return None };
+        let vfields = self.checked.program.variant_fields(*a, args, variant as usize);
         let any = vfields.into_iter().any(|(_, ft)| self.lower_ty(mb, ft, span).is_some());
-        any.then_some(field)
+        // Field 0 is the tag; field 1 + v variant v's payload (ir::TypeDef::Enum).
+        any.then_some(1 + variant)
     }
 
     /// The parameters a callable adds to a function it's passed to: its captures.
@@ -322,7 +316,7 @@ impl<'a> Cx<'a> {
     pub fn signature(&mut self, mb: &mut ModuleBuilder, key: &InstanceKey) -> ir::Function {
         match key {
             InstanceKey::Fn { func, callables, resources, .. } => {
-                let def = self.checked.program.func(*func).clone();
+                let def = self.checked.program.func(*func);
                 let subst = self.instance_subst(key);
                 let mut params = Vec::new();
                 for (i, p) in def.params.iter().enumerate() {

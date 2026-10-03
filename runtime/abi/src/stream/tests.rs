@@ -19,7 +19,7 @@ fn golden_bytes() {
         .finish();
     let mut expected = Vec::new();
     expected.extend_from_slice(b"WRCS");
-    expected.extend(words(&[1, 152]));
+    expected.extend(words(&[VERSION, 152]));
     expected.extend(words(&[1, 8, 7, 16])); // CreateBuffer
     expected.extend(words(&[2, 20, 7, 4, 8])); // WriteBuffer
     expected.extend([1, 2, 3, 4, 5, 6, 7, 8]);
@@ -72,8 +72,8 @@ fn decodes_what_it_encodes() {
 #[test]
 fn rejects_another_version() {
     let mut batch = Encoder::new().present().finish();
-    batch[4] = 2;
-    assert_eq!(decode(&batch), Err(StreamError::WrongVersion { expected: 1, got: 2 }));
+    batch[4] = 9;
+    assert_eq!(decode(&batch), Err(StreamError::WrongVersion { expected: VERSION, got: 9 }));
 }
 
 #[test]

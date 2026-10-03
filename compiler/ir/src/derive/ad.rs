@@ -126,8 +126,8 @@ pub(super) fn derive(
         return Ok(d);
     }
     let func = m.functions[f.index()].clone();
-    if let Some(why) = has_host_or_ptr(&func.body) {
-        return Err(Error::not_derivable(format!("`{}` {why}", func.name)));
+    if let Some((why, at)) = has_host_or_ptr(&func.body, None) {
+        return Err(Error::not_derivable(format!("this {why}")).at(at));
     }
     let returns = returns_active(m, cache, f, mask.clone(), Mode::Ad)?;
     let act = {
@@ -138,9 +138,10 @@ pub(super) fn derive(
     };
     for (i, p) in func.params.iter().enumerate() {
         if act.params[i] && !mask[i] && p.mutable {
+            // Placed by the caller's statement (the call), or at the `gradient(..)` call.
             return Err(Error::not_derivable(format!(
-                "`{}` writes a derivative through its `mut` parameter `{}`",
-                func.name, p.name
+                "this would write a derivative through the `mut` parameter `{}`",
+                p.name
             )));
         }
     }
@@ -198,6 +199,7 @@ pub(super) fn derive(
         recips: HashMap::new(),
         made: Vec::new(),
         twins: LoadTwins::default(),
+        at: None,
     };
     let body = b.block(&func.body)?;
     let mut nf = b.nf;
@@ -225,6 +227,8 @@ struct Ad<'a> {
     /// (`2v` for a square root, a clamp's masks) is made once.
     made: Vec<(TypeId, Expr, ValueId)>,
     twins: LoadTwins,
+    /// Where in the source the statement being derived is (`Stmt::At`), for errors.
+    at: Option<wrela_diag::Span>,
 }
 
 impl Ad<'_> {
@@ -377,7 +381,10 @@ impl Ad<'_> {
         self.made.clear();
         self.recips.clear();
         self.twins.before(s);
-        let r = self.stmt_inner(s, out);
+        if let Stmt::At(span) = s {
+            self.at = Some(*span);
+        }
+        let r = self.stmt_inner(s, out).map_err(|e| e.at(self.at));
         self.twins.after(s);
         r
     }
@@ -566,6 +573,10 @@ impl Ad<'_> {
                     Some(self.emit(out, *cty, Expr::Construct(*cty, comps)))
                 }
             }
+            // The payload's tangent, in the same variant.
+            Expr::Variant(et, k, payload) => payload
+                .and_then(|p| t(self, &p))
+                .map(|dp| self.emit(out, *et, Expr::Variant(*et, *k, Some(dp)))),
             Expr::Extract(x, i) => t(self, x).map(|dx| self.emit(out, ty, Expr::Extract(dx, *i))),
             Expr::ExtractDyn(x, i) => {
                 t(self, x).map(|dx| self.emit(out, ty, Expr::ExtractDyn(dx, *i)))

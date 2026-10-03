@@ -129,3 +129,23 @@ fn the_browser_matches_the_golden_and_the_native_host() {
     let diff = image::compare(&browser_frame, &run.frame).expect("same size");
     eprintln!("Chrome against the native host: mean {:.4}/255, max {}/255", diff.mean, diff.max);
 }
+
+/// How long loading the build may take: compiling its WASM and creating its pipelines (the
+/// shader compile dominates, and grows with the WGSL the compiler emits). Drivers cache compiled
+/// shaders, so after the first run this mostly measures a warm load.
+const LOAD_BUDGET_SECONDS: f64 = 1.0;
+
+#[test]
+#[ignore = "needs a GPU"]
+fn loading_creates_the_pipelines_within_budget() {
+    let (dir, _) = page("load");
+    let mut slowest = 0.0f64;
+    for _ in 0..3 {
+        let started = std::time::Instant::now();
+        let host = Host::load(&dir).expect("load");
+        slowest = slowest.max(started.elapsed().as_secs_f64());
+        drop(host);
+    }
+    eprintln!("hello-field loads in at most {slowest:.3} s (budget {LOAD_BUDGET_SECONDS} s)");
+    assert!(slowest <= LOAD_BUDGET_SECONDS, "loading took {slowest:.3} s");
+}

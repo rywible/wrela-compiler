@@ -9,3 +9,8 @@ fn f() -> f32 {
     let l = Look { tolerance: 0.5 } //~ E0307
     l.tolerance
 }
+
+fn g() -> f32 {
+    let l = Look { tolerance: 0.5, resolution: 1, soft: true, soft: false } //~ E0308
+    l.tolerance
+}

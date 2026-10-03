@@ -94,7 +94,7 @@ fn stage_name(e: Entry) -> &'static str {
 }
 
 fn check_entry(p: &Program, f: FnId, entry: Entry, out: &mut Vec<Diagnostic>) {
-    let def = p.func(f).clone();
+    let def = p.func(f);
     let stage = stage_name(entry);
     let unit = p.types.unit;
     // What it returns.

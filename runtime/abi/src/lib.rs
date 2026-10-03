@@ -32,9 +32,11 @@
 //! hash (AC7).
 
 pub mod hash;
+pub mod lines;
 pub mod manifest;
 pub mod stream;
 pub mod typescript;
+pub mod vectors;
 
 pub use manifest::Manifest;
 pub use typescript::typescript;

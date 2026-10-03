@@ -41,6 +41,7 @@ pub fn parse_tokens(file: FileId, text: &str, lexed: Lexed) -> Parsed {
         nesting: 0,
         recovered_at: None,
         closers: Vec::new(),
+        lost_breaks: None,
     };
     let f = p.parse_file();
     Parsed { file: f, comments: lexed.comments, diagnostics: p.diags }
@@ -67,6 +68,8 @@ pub(crate) struct Parser<'a> {
     /// The closers of the lists and blocks being parsed, innermost last. Recovery stops at one
     /// of these; any other closer closes nothing (L19) and is skipped.
     pub(crate) closers: Vec<T>,
+    /// After a mismatched closer (E0102): the depth of `closers` whose block it's in.
+    pub(crate) lost_breaks: Option<usize>,
 }
 
 /// After this many syntax errors in one file, later ones are dropped: they're usually noise
@@ -386,11 +389,57 @@ impl<'a> Parser<'a> {
         if self.at(close) {
             return self.bump().span;
         }
+        // A closer of another kind that closes nothing open (L19): most likely a typo for
+        // this one, so it's read as this one.
+        let k = self.kind();
+        if matches!(k, T::RParen | T::RBracket | T::RBrace)
+            && close != T::Pipe
+            && !self.closers.contains(&k)
+        {
+            let t = self.bump();
+            let (want, found) = (close.fixed_text().unwrap_or("?"), k.fixed_text().unwrap_or("?"));
+            let mut d = Diagnostic::new(
+                codes::E0102,
+                t.span,
+                format!("`{found}` doesn't close anything here: expected `{want}`"),
+            )
+            .with_fix(format!("close with `{want}`"), t.span, want);
+            if let Some(open) = self.opener_of(close) {
+                d = d.with_secondary(open, "opened here");
+            }
+            self.error(d);
+            // The block it's in: `closers` ends with this list's closer, after the block's.
+            self.lost_breaks = self.closers.iter().rposition(|&c| c == T::RBrace).map(|i| i + 1);
+            return t.span;
+        }
         if self.recovered_at != Some(self.pos) {
             self.expected(what);
         }
         self.skip_until(close, |_| false);
         if self.at(close) { self.bump().span } else { self.prev_span() }
+    }
+
+    /// The bracket that `close` would close: the nearest unclosed one of its kind before the
+    /// current token.
+    fn opener_of(&self, close: T) -> Option<Span> {
+        let open = match close {
+            T::RParen => T::LParen,
+            T::RBracket => T::LBracket,
+            T::RBrace => T::LBrace,
+            _ => return None,
+        };
+        let mut depth = 0u32;
+        for t in self.tokens[..self.pos.min(self.tokens.len())].iter().rev() {
+            if t.kind == close {
+                depth += 1;
+            } else if t.kind == open {
+                if depth == 0 {
+                    return Some(t.span);
+                }
+                depth -= 1;
+            }
+        }
+        None
     }
 
     /// The name of a broken list element that starts `pub? IDENT :`, for keeping the element.
@@ -609,14 +658,24 @@ impl<'a> Parser<'a> {
         let generics = if self.at(T::Lt) { self.parse_generic_params()? } else { Vec::new() };
         self.expect(T::LParen, "`(`")?;
         let params = self.list(T::RParen, Self::parse_param, |p, first, span| {
-            // `x: <broken type>`, or `x` with its type missing.
+            // `x: <broken type>`, or `x` with its type missing; `mut` or `take` may come first.
+            let mode_at = |i: usize| match p.tokens.get(i).map(|t| t.kind) {
+                Some(T::Mut) => Mode::Mut,
+                Some(T::Take) => Mode::Take,
+                _ => Mode::Borrow,
+            };
+            let mut mode = mode_at(first);
+            let first = first + usize::from(mode != Mode::Borrow);
+            if mode == Mode::Borrow && p.tokens.get(first + 1).is_some_and(|t| t.kind == T::Colon) {
+                mode = mode_at(first + 2);
+            }
             let t = p.tokens[first];
             let name = p.name_at(first).or_else(|| {
                 (t.kind == T::Ident)
                     .then(|| Ident { name: p.text_of(t.span).to_string(), span: t.span })
             })?;
             let ty = Self::error_type(span);
-            Some(Param::Named { name, mode: Mode::Borrow, ty, default: None, span })
+            Some(Param::Named { name, mode, ty, default: None, span })
         });
         self.close_list(T::RParen, "`,` or `)`");
         let ret = if self.eat(T::Arrow) {
@@ -676,6 +735,9 @@ impl<'a> Parser<'a> {
             return Ok(Param::SelfParam { mode, span: start.to(end) });
         }
         if mode != Mode::Borrow {
+            if self.at(T::Ident) && self.nth(1) == T::Colon {
+                return self.misplaced_mode(start, mode);
+            }
             return Err(self.expected("`self`"));
         }
         let name = self.ident("a parameter name")?;
@@ -692,6 +754,34 @@ impl<'a> Parser<'a> {
         }
         self.bump();
         let mode = self.parse_mode();
+        let ty = self.parse_type()?;
+        let default = if self.eat(T::Eq) { Some(self.parse_expr()?) } else { None };
+        Ok(Param::Named { name, mode, ty, default, span: start.to(self.prev_span()) })
+    }
+
+    /// `mut x: T`, which is `x: mut T`: reported with the fix, and parsed as meant.
+    fn misplaced_mode(&mut self, start: Span, mode: Mode) -> PResult<Param> {
+        let name = self.ident("a parameter name")?;
+        self.bump();
+        let ty_at = self.span().shrink_to_start();
+        let written = self.parse_mode();
+        let kw = if mode == Mode::Mut { "mut" } else { "take" };
+        let mut d = Diagnostic::new(
+            codes::E0100,
+            start,
+            format!("a parameter's mode is written with its type: `{}: {kw} T`", name.name),
+        );
+        if written == Mode::Borrow {
+            let remove = Span { end: name.span.start, ..start };
+            d = d.with_fix_edits(
+                format!("write `{}: {kw} ..`", name.name),
+                vec![
+                    wrela_diag::Edit { span: remove, replacement: String::new() },
+                    wrela_diag::Edit { span: ty_at, replacement: format!("{kw} ") },
+                ],
+            );
+        }
+        self.error(d);
         let ty = self.parse_type()?;
         let default = if self.eat(T::Eq) { Some(self.parse_expr()?) } else { None };
         Ok(Param::Named { name, mode, ty, default, span: start.to(self.prev_span()) })

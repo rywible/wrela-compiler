@@ -173,7 +173,7 @@ struct C { cell: vec2u, size: vec2u, colour: u32, _pad: u32, _pad2: vec2u }
 @fragment fn fs() -> @location(0) vec4f { return unpack4x8unorm(c.colour); }
 "#;
 const STORE_MANIFEST: &str = r#"{
-  "manifest_version": 1, "stream_version": 1, "wasm": "game.wasm",
+  "manifest_version": 1, "stream_version": 2, "wasm": "game.wasm",
   "pipelines": [
     { "name": "store", "shader": "store.wgsl", "kind": "compute", "entry": "store", "workgroup_size": [1, 1, 1],
       "uniform": { "binding": 0, "size": 16, "space": "uniform" },

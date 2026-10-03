@@ -259,13 +259,15 @@ pub enum Expr {
     Zero(TypeId),
     Load(Place),
     Unary(UnOp, ValueId),
-    /// Operands have the same type, except: vector op scalar (the scalar applies to each
-    /// component), matrix × vector and vector × matrix.
+    /// Operands have the same type, except: matrix op scalar (each element), matrix × vector
+    /// and vector × matrix. (A scalar with a vector is splatted first.)
     Binary(BinOp, ValueId, ValueId),
     Call(FuncId, Vec<Arg>),
     Builtin(Builtin, Vec<ValueId>),
     /// Builds a struct, vector, matrix (from columns) or array from its parts.
     Construct(TypeId, Vec<ValueId>),
+    /// Builds a value of an enum: its variant, and the payload if the variant has one.
+    Variant(TypeId, u32, Option<ValueId>),
     /// A field of a struct value, a component of a vector, or a column of a matrix.
     Extract(ValueId, u32),
     /// An element of an array value (or a vector's component) at a dynamic index.
@@ -319,6 +321,10 @@ pub enum Stmt {
     Return(Option<ValueId>),
     /// Unreachable: traps on the CPU.
     Trap,
+    /// Where in the source the statements after it come from, up to the next `At`: it does
+    /// nothing, and lets a trap say where it happened (and an error in a derived function
+    /// point at the code that caused it).
+    At(wrela_diag::Span),
 }
 
 pub type Block = Vec<Stmt>;
@@ -485,7 +491,9 @@ impl Module {
         };
         for proj in path {
             t = match (self.types.get(t), proj) {
-                (TypeDef::Struct { fields, .. }, Proj::Field(i)) => fields.get(*i as usize)?.1,
+                (TypeDef::Struct { .. } | TypeDef::Enum { .. }, Proj::Field(i)) => {
+                    self.types.field(t, *i)?
+                }
                 (TypeDef::Vector(_), Proj::Comp(_) | Proj::Index(_)) => {
                     self.types.lookup(&TypeDef::Scalar(Scalar::F32))?
                 }

@@ -1,0 +1,60 @@
+// rejects: trait.items
+trait Shape {
+    type Measure
+
+    fn area(self) -> f32
+}
+
+trait Plot {
+    type Measure
+
+    fn area(self) -> f32
+}
+
+trait Loop: Loop { //~ E0411
+    fn go(self) -> f32
+}
+
+trait Ring: Band {
+    fn ring(self) -> f32
+}
+
+trait Band: Ring { //~ E0411
+    fn band(self) -> f32
+}
+
+fn around<T: Ring>(t: T) -> f32 {
+    t.ring() + t.band()
+}
+
+struct Square {
+    side: f32,
+}
+
+impl Shape for Square {
+    type Measure = f32
+
+    fn area(self) -> f32 {
+        self.side * self.side
+    }
+}
+
+impl Plot for Square {
+    type Measure = u32
+
+    fn area(self) -> f32 {
+        self.side
+    }
+}
+
+fn unknown<T: Shape>(t: T) -> T::Missing { //~ E0408
+    t.area()
+}
+
+fn either<T: Shape + Plot>(t: T) -> T::Measure { //~ E0406
+    Shape::area(t)
+}
+
+fn which(s: Square) -> f32 {
+    s.area() //~ E0406
+}

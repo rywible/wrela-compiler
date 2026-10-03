@@ -19,7 +19,7 @@ export const DEFAULT_LIMITS: Limits = { maxBufferSize: 134_217_728, maxWorkgroup
 export function shapes(): Manifest {
   const m: Manifest = {
     manifest_version: 1,
-    stream_version: 1,
+    stream_version: 2,
     wasm: "game.wasm",
     pipelines: [
       {

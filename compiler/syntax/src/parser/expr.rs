@@ -29,6 +29,9 @@ impl<'a> Parser<'a> {
         let open = self.expect(T::LBrace, "`{`")?.span;
         self.closers.push(T::RBrace);
         let stmts = self.block_stmts();
+        if self.lost_breaks == Some(self.closers.len()) {
+            self.lost_breaks = None;
+        }
         self.closers.pop();
         if self.at(T::Eof) {
             self.error(
@@ -50,7 +53,12 @@ impl<'a> Parser<'a> {
             match self.parse_stmt() {
                 Ok(s) => {
                     stmts.push(s);
-                    if !self.at_sep() && !self.at(T::RBrace) {
+                    // After a mismatched closer (E0102), the lexer still counts the bracket it
+                    // didn't close as open, so a line break may have made no NEWLINE: it
+                    // separates statements all the same, to the end of this block (L19).
+                    let lost = self.lost_breaks == Some(self.closers.len())
+                        && self.tok().line_break_before;
+                    if !self.at_sep() && !self.at(T::RBrace) && !lost {
                         self.stmt_sep_error();
                         let rest = self.span();
                         self.recover_to_sep();
@@ -550,22 +558,23 @@ impl<'a> Parser<'a> {
                             // field_access ::= "." (IDENT | INT): any INT is a tuple index
                             // (`t.0x1` is `t.1`, `t.1_0` is `t.10`); only its value is checked.
                             let value = crate::lexer::int_value(text);
-                            let Some(n) = value.and_then(|v| u32::try_from(v).ok()) else {
-                                self.error(Diagnostic::new(
-                                    codes::E0006,
-                                    t.span,
-                                    format!("`{text}` is too large for a tuple index"),
-                                ));
-                                return Err(Failed);
+                            let name = match value.and_then(|v| u32::try_from(v).ok()) {
+                                Some(n) => FieldName::Index(n, t.span),
+                                None => {
+                                    // A malformed number (`0x`) has its error from the lexer.
+                                    let lexed = self.diags.iter().any(|d| d.span() == Some(t.span));
+                                    if !lexed {
+                                        self.error(Diagnostic::new(
+                                            codes::E0006,
+                                            t.span,
+                                            format!("`{text}` is too large for a tuple index"),
+                                        ));
+                                    }
+                                    FieldName::BadIndex(t.span)
+                                }
                             };
                             let span = e.span.to(t.span);
-                            e = self.expr_node(
-                                ExprKind::Field {
-                                    base: Box::new(e),
-                                    name: FieldName::Index(n, t.span),
-                                },
-                                span,
-                            );
+                            e = self.expr_node(ExprKind::Field { base: Box::new(e), name }, span);
                             after_field = true;
                         }
                         _ => return Err(self.expected("a field or method name after `.`")),

@@ -69,7 +69,9 @@ let total = base +                      // a continued line ends with the operat
 
 **Keywords** are listed in `spec/lexical.md` (L11), including those reserved for later tiers.
 
-**Control flow (T0)** is expressions and statements in the Rust family: `if`/`else` and `match` are expressions; `for i in 0..n` (and `0..=n`) counts over integers, `for x in xs` walks an array or a run, and `_` names an unused loop variable; `while`, `loop`, `break`, `continue` and `return` work as usual. A block's value is its last line when that's an expression.
+**Control flow (T0)** is expressions and statements in the Rust family: `if`/`else` and `match` are expressions; `for i in 0..n` (and `0..=n`) counts over integers, `for x in xs` walks an array or a run, and `_` names an unused loop variable; `while`, `loop`, `break`, `continue` and `return` work as usual. A block's value is its last line when that's an expression. A local that's bound and never used is a warning (W0001), unless its name starts with `_`.
+
+**Limits.** Expressions, blocks, types and patterns nest at most 128 deep, and an expression's tree is at most 512 deep (E0112). A generic function's instantiations go at most 256 calls deep, and their type arguments, like any value's type, have at most 4096 parts, counting a part each time it appears (E0412, E0329): a type that doubles with each step, like `(a, a)`, grows past any machine. A value larger than the CPU stack traps when the function holding it is entered, as a stack overflow does.
 
 ---
 
@@ -77,7 +79,7 @@ let total = base +                      // a continued line ends with the operat
 
 ### Functions (T0)
 
-- **Named arguments are optional, Kotlin-style** (D-039). Positional arguments come first, and once an argument is named, the rest must be named too. Parameters may have defaults, which are literal values in tier 0 (`fn.named-args`, `fn.defaults`). A lint suggesting names for bare literals such as `6cm` or `true` isn't built yet.
+- **Named arguments are optional, Kotlin-style** (D-039). Positional arguments come first, and once an argument is named, the rest must be named too. Parameters may have defaults, which are literal values in tier 0 (`fn.named-args`, `fn.defaults`). Arguments are evaluated in the order they're written, named ones too, whatever the order of the parameters they go to. A lint suggesting names for bare literals such as `6cm` or `true` isn't built yet.
 - **Parameters have modes** (§6): `x: T` (borrow), `x: mut T`, `x: take T`.
 - **Properties are attributes** (§9): `@deterministic fn step(...)`.
 - **A trait in return position** (`-> Surface`; `Field<K, C>` in tier 1) names one concrete, inferred type, like Rust's `impl Trait` (D-070, `fn.return-trait`).
@@ -221,7 +223,7 @@ let wrong = density + 2m        // error: can't add kg/m³ to m
 | **Moving out of a named place is written `take`.** Deep copies are `.clone()`; small `Copy` types copy implicitly. Temporaries and returned locals need no marker. | T0 |
 | **Bindings:** `let` projects a place read-only or owns a temporary; `var` owns mutably; `mut` projects a place mutably. | T0 |
 | **Projections:** a function may return `-> borrow T` or `-> mut T` of one of its parameters. Projections never outlive the caller's scope. | T0 |
-| **Exclusivity:** while a `mut` access is live, nothing may touch an overlapping place. Disjoint fields don't overlap; every element of a container overlaps every other (`pair_mut` and `split_at_mut` check at runtime). Checked within each function. | T0 |
+| **Exclusivity:** while a `mut` access is live, nothing may touch an overlapping place. Disjoint fields don't overlap; every element of a container overlaps every other (`pair_mut` and `split_at_mut` check at runtime). Checked within each function, over its control flow: a loan or a move reaches every path that can follow it, through branches, loops and `continue`. | T0 |
 | **No mutable globals, and no interior mutability** like `Cell` or `RefCell`. Shared mutable state lives in an arena. | T0 |
 | **A projection must come from a `borrow` or `mut` parameter,** and the caller treats the result as borrowing every such argument. | T0 |
 | **Non-escaping types:** any type containing a view (`Span<T>`, borrowing iterators, projections) follows the projection rules. That's how views and iterator chains work without lifetimes. | T1 (views and iterators, D-088) |
@@ -593,7 +595,7 @@ User-defined metadata, if it's ever needed, gets a different syntax, so `@` alwa
 
 **CPU code always uses strict IEEE floats** (D-074). There's no fast-math mode, no reassociation, no implicit FMA contraction and no relaxed SIMD. Transcendentals come from the stdlib, compiled to WASM, never from the host (D-015).
 
-**Tiers:** tier 0 emits WASM, whose float arithmetic is already IEEE-strict apart from NaN bits, and the integer rules in the table below. Its transcendentals are already the stdlib's (`std::math`, computed in f64 and rounded once: within an ulp). NaN canonicalization is tier 1, with `@deterministic` (D-088). Tier 0's checks: the emitted WASM has no relaxed SIMD (a pass over every module), and a program's state hash is the same in Chrome and in the native host.
+**Tiers:** tier 0 emits WASM, whose float arithmetic is already IEEE-strict apart from NaN bits, and the integer rules in the table below. Its transcendentals are already the stdlib's (`std::math`, computed in f64 and rounded once; within an ulp at every point the tests sample, 20,000 per function in the ranges they choose, which is evidence rather than proof). NaN canonicalization is tier 1, with `@deterministic` (D-088). Tier 0's checks: the emitted WASM has no relaxed SIMD (a pass over every module), and a program's state hash is the same in Chrome and in the native host.
 
 **GPU code follows WGSL semantics,** and its results are presentation-only: GPU results can't reach `@deterministic` code (§14).
 
@@ -630,8 +632,10 @@ User-defined metadata, if it's ever needed, gets a different syntax, so `@` alwa
 | **Workgroup-shared memory and barriers.** Spike 01's `place_vertices` needed them. **Open:** the design. | M2 (Q4 of #6) | D-093 |
 | **GPU interval arithmetic widens each result outward** by its operation's WGSL error bound, so it stays conservative (§13). | T0 | D-075 |
 | **GPU-resident data is a type.** `GpuBuffer<T: GpuData>` is an opaque `Copy` handle: CPU code can create one (`buffer(count)`), pass it to kernels and shaders, and write into it, but can't read through it. `GpuSpan<T>` and copies between buffers are later. Names are placeholders. | T0 | D-102 |
+| **A buffer lives until the program's next call.** Tier 0 has no state that outlives a call of `frame` (or of another export), so nothing can refer to a call's buffers once it returns; the program destroys them (a `DestroyBuffer` command) when its next call begins. A buffer that persists across frames comes with the state that would hold it (later). | T0 | D-102 |
+| **A dispatch or a screen pass can't both read and write one buffer:** passing the same buffer as a `[T]` and a `mut Slots<T>` is an error when the command runs, reported by the host (WebGPU's usage rule). `GpuBuffer` is a `Copy` handle, so the compiler can't see every alias; the hosts check every command. | T0 | D-102 |
 | **Transfers are explicit.** `write(buf, at, values)` copies. `dispatch(kernel, groups: n, arg: value, ...)` records a dispatch, and `draw(vertex, fragment, vertices: n, arg: value, ...)` a draw, between `begin_screen_pass(clear: ...)` and `present()`; `GpuData` arguments travel as one uniform block, `GpuBuffer`s as buffers. A kernel or shader can't be called directly (E0606). Writes and dispatches take effect in recorded order, with no barriers between dispatches. GPU calls carry the `host` effect (`gpu.dispatch`). | T0 | D-102 |
-| **A host program exports `frame(time: f32, width: u32, height: u32)`,** called once per frame. Its other `pub fn`s in `main.wrela` with scalar and vector parameters and results are exported too, for tests and tools. | T0 | D-102 |
+| **A host program exports `frame(time: f32, width: u32, height: u32)`,** called once per frame. Its other `pub fn`s in `main.wrela` with scalar and vector parameters and results are exported too, for tests and tools; a vector crosses as its components (a `vec3` parameter is three `f32`s). Other types can't cross (E0703). | T0 | D-102 |
 | **Readback is asynchronous:** `gpu.read(span)` returns a future and has the `nondet` effect, so `@deterministic` code can't call it. | T2 | D-102 |
 
 ```wrela
@@ -699,7 +703,7 @@ The sim/presentation split is an engine pattern built on this, not a language fe
 ## 15. Errors (T1)
 
 - **Recoverable failures are `Result<T, E>`, propagated with `?`** (D-061).
-- **Bugs panic.** On the CPU, a panic is a trap. GPU code can't panic; out-of-bounds access sets a debug flag or clamps (D-074).
+- **Bugs panic.** On the CPU, a panic is a trap, and its message says where in the source it happened (from the `wrela.lines` section of the program's WASM). GPU code can't panic; out-of-bounds access sets a debug flag or clamps (D-074).
 - **What happens after a trap** is the program's policy. The engine rewinds to the tick's checkpoint and writes a repro bundle (D-087).
 
 ---

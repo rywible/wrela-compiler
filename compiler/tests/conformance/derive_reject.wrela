@@ -3,22 +3,31 @@ use std::derive::{Interval, gradient, interval}
 use std::gpu::{GpuBuffer, buffer}
 
 fn recorded(x: f32) -> f32 {
-    let b: GpuBuffer<f32> = buffer(4)
+    let b: GpuBuffer<f32> = buffer(4) //~ E0700
     x
 }
 
 fn wobble(t: f32) -> f32 {
     var x = t
-    while x > 0.0 {
+    while x > 0.0 { //~ E0701
         x -= 1.0
     }
     x
 }
 
 pub fn a(x: f32) -> f32 {
-    gradient(recorded, x) //~ E0700
+    gradient(recorded, x)
 }
 
 pub fn b(x: f32) -> f32 {
-    interval(wobble, Interval { lo: x, hi: x + 1.0 }).lo //~ E0701
+    interval(wobble, Interval { lo: x, hi: x + 1.0 }).lo
+}
+
+fn outer(x: f32) -> f32 {
+    let y = x * 2.0
+    wobble(y) + y
+}
+
+pub fn c(x: f32) -> f32 {
+    interval(outer, Interval { lo: x, hi: x + 1.0 }).lo
 }

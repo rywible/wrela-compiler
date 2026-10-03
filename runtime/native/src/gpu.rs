@@ -710,6 +710,12 @@ impl Executor for Gpu {
                 Ok(())
             }
             Command::Present => self.present(),
+            Command::DestroyBuffer { handle } => {
+                // Work already recorded holds its own reference until the GPU is done.
+                self.buffers.remove(handle);
+                self.bind_groups.retain(|(_, handles), _| !handles.contains(handle));
+                Ok(())
+            }
         }
     }
 

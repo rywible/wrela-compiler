@@ -235,7 +235,7 @@ mod tests {
         let json = sample().to_json();
         let expected = r#"{
   "manifest_version": 1,
-  "stream_version": 1,
+  "stream_version": 2,
   "wasm": "game.wasm",
   "pipelines": [
     {
@@ -280,7 +280,7 @@ mod tests {
     fn rejects_other_versions() {
         let json = sample().to_json().replace("\"manifest_version\": 1", "\"manifest_version\": 2");
         assert!(Manifest::parse(&json).is_err());
-        let json = sample().to_json().replace("\"stream_version\": 1", "\"stream_version\": 9");
+        let json = sample().to_json().replace("\"stream_version\": 2", "\"stream_version\": 9");
         assert!(Manifest::parse(&json).is_err());
     }
 

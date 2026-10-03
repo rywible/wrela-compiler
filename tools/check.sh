@@ -50,9 +50,9 @@ python3 -m unittest discover -q -s tools/tests
 step "browser runtime: tests, types, dist is current, size budget"
 (cd runtime/browser && bun run checks)
 
-step "speed: check < 200 ms and build < 2 s, cold processes (examples/hello-field)"
+step "speed: check < 200 ms and build < 2 s, cold processes; WGSL size (examples/hello-field)"
 python3 - "$wrela" <<'PY'
-import subprocess, sys, tempfile, time
+import gzip, pathlib, subprocess, sys, tempfile, time
 wrela = sys.argv[1]
 def best(args, n=5):
     times = []
@@ -68,6 +68,15 @@ for name, args, budget in [("check", ["check", "examples/hello-field"], 0.2),
     print(f"  wrela {name}: {lo * 1000:.0f}-{hi * 1000:.0f} ms (budget {budget * 1000:.0f} ms)")
     if hi > budget:
         sys.exit(f"wrela {name} took {hi * 1000:.0f} ms, over its budget")
+# Each pipeline's WGSL: what the browser downloads and the driver compiles (pipeline creation
+# time is budgeted by the --gpu tests).
+RAW, GZIPPED = 128 * 1024, 24 * 1024
+for wgsl in sorted(pathlib.Path(out).glob("*.wgsl")):
+    text = wgsl.read_bytes()
+    raw, packed = len(text), len(gzip.compress(text))
+    print(f"  {wgsl.name}: {raw / 1024:.0f} KiB, {packed / 1024:.0f} KiB gzipped (budget {RAW // 1024}, {GZIPPED // 1024})")
+    if raw > RAW or packed > GZIPPED:
+        sys.exit(f"{wgsl.name} is over its size budget")
 PY
 
 if [ "$gpu" = 1 ]; then

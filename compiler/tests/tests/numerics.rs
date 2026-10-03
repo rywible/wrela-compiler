@@ -76,3 +76,17 @@ fn wrapping_and_conversions() {
     returns(&mut h, "index", &[i(2)], f(3.0));
     traps(&mut h, "index", &[i(3)]);
 }
+
+#[test]
+fn a_trap_says_where_it_happened() {
+    let mut h = load();
+    let mut at = |name: &str, args: &[Value]| match h.call_export(name, args) {
+        Err(Error::Trap(why)) => why,
+        other => panic!("{name}{args:?} should trap, got {other:?}"),
+    };
+    // `a + b` is line 7 of main.wrela, `a / b` line 27.
+    let overflow = at("add_i32", &[Value::I32(i32::MAX), Value::I32(1)]);
+    assert!(overflow.ends_with(" at main.wrela:7:5"), "{overflow}");
+    let zero = at("div_i32", &[Value::I32(1), Value::I32(0)]);
+    assert!(zero.ends_with(" at main.wrela:27:5"), "{zero}");
+}

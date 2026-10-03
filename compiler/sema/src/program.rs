@@ -28,6 +28,8 @@ pub struct Program {
     /// Whether a type implements a structural trait (`Copy`, `Clone`, `GpuData`): worked out
     /// once per type, since struct types share their fields' types.
     pub(crate) builtin_impls: std::cell::RefCell<HashMap<(TyId, Lang), bool>>,
+    /// Where the source's syntax errors are.
+    pub syntax_errors: Vec<wrela_diag::Span>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

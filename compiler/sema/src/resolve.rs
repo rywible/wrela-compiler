@@ -69,8 +69,9 @@ impl ImplicitParams {
 
 pub enum PathLookup {
     Found(Res),
-    /// Not found yet: an import that would provide it may still be pending.
-    NotYet,
+    /// Not found yet: an import that would provide it may still be pending. Says which name it
+    /// waits for, in which module's scope.
+    NotYet(ModuleId, String),
     /// Names an item that failed to parse: its error is reported.
     Broken,
     Error(Box<Diagnostic>),
@@ -214,7 +215,7 @@ pub fn resolve_module_path_in(
         return PathLookup::Broken;
     } else {
         if !final_pass {
-            return PathLookup::NotYet;
+            return PathLookup::NotYet(from, first.name.clone());
         }
         let mut d = Diagnostic::new(
             codes::E0202,
@@ -252,7 +253,7 @@ pub fn resolve_module_path_in(
                     return PathLookup::Broken;
                 } else {
                     if !final_pass {
-                        return PathLookup::NotYet;
+                        return PathLookup::NotYet(m, seg.name.clone());
                     }
                     let mut d = Diagnostic::new(
                         codes::E0200,
@@ -324,7 +325,7 @@ pub fn resolve_trait_ref(
             diags.push(*d);
             return None;
         }
-        PathLookup::NotYet | PathLookup::Broken => return None,
+        PathLookup::NotYet(..) | PathLookup::Broken => return None,
     };
     let Res::Trait(t) = res else {
         diags.push(
@@ -582,7 +583,7 @@ fn resolve_type_path(
                 diags.push(*d);
                 return p.types.error;
             }
-            PathLookup::NotYet | PathLookup::Broken => return p.types.error,
+            PathLookup::NotYet(..) | PathLookup::Broken => return p.types.error,
         }
     };
     let args: Vec<TyId> = last

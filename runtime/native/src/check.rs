@@ -7,6 +7,7 @@
 //!
 //! - `CreateBuffer`: the handle is new; the size is within WebGPU's default limits.
 //! - `WriteBuffer`: the buffer exists; the write fits inside it.
+//! - `DestroyBuffer`: the buffer exists; later commands can't use it.
 //! - `Dispatch`, `Draw`: the pipeline exists and is the right kind; the command lists as many
 //!   buffers as the pipeline binds, each one existing, and exactly its uniform block's size in
 //!   uniform bytes; a dispatch's group counts are within the limit.
@@ -83,6 +84,10 @@ impl Checker {
                     return err(format!("buffer {handle} is {size} bytes; the limit is {limit}"));
                 }
                 self.buffers.insert(*handle, *size);
+            }
+            Command::DestroyBuffer { handle } => {
+                self.size(op, *handle)?;
+                self.buffers.remove(handle);
             }
             Command::WriteBuffer { handle, offset, data } => {
                 let size = self.size(op, *handle)?;

@@ -136,8 +136,8 @@ fn derive(
         return Ok(d);
     }
     let orig = m.functions[f.index()].clone();
-    if let Some(why) = has_host_or_ptr(&orig.body) {
-        return Err(Error::not_derivable(format!("`{}` {why}", orig.name)));
+    if let Some((why, at)) = has_host_or_ptr(&orig.body, None) {
+        return Err(Error::not_derivable(format!("this {why}")).at(at));
     }
     let (func, result) = match single_exit(m, &orig) {
         Some((nf, r)) => (nf, r),
@@ -150,12 +150,13 @@ fn derive(
             returns_active(mm, cache, g, mk, Mode::Interval)
         })?
     };
-    if act.active_loop_exit {
-        return Err(Error::ActiveLoopExit(format!(
-            "`{}` has a loop whose exit depends on the input; an interval needs loops that run \
-             the same number of times for every point",
-            func.name
-        )));
+    if let Some(at) = act.active_loop_exit {
+        return Err(Error::ActiveLoopExit(
+            "a loop exits here depending on the input; an interval needs loops that run the \
+             same number of times for every point"
+                .to_string(),
+            at,
+        ));
     }
     for (i, p) in func.params.iter().enumerate() {
         if act.params[i] && !mask[i] && p.mutable {
@@ -202,6 +203,7 @@ fn derive(
         returns,
         speculative: 0,
         twins: LoadTwins::default(),
+        at: None,
     };
     let mut body = Vec::new();
     if let Some(r) = result.filter(|r| b.act.locals[r.index()]) {
@@ -237,6 +239,8 @@ struct Ivx<'a> {
     /// How many branches deep we are that run whether or not a point would take them.
     speculative: u32,
     twins: LoadTwins,
+    /// Where in the source the statement being derived is (`Stmt::At`), for errors.
+    at: Option<wrela_diag::Span>,
 }
 
 impl<'a> Ivx<'a> {
@@ -632,7 +636,10 @@ impl<'a> Ivx<'a> {
 
     fn stmt(&mut self, s: &Stmt, out: &mut Block) -> R<()> {
         self.twins.before(s);
-        let r = self.stmt_inner(s, out);
+        if let Stmt::At(span) = s {
+            self.at = Some(*span);
+        }
+        let r = self.stmt_inner(s, out).map_err(|e| e.at(self.at));
         self.twins.after(s);
         r
     }
@@ -774,6 +781,20 @@ impl<'a> Ivx<'a> {
                 let lo = self.emit(out, *t, Expr::Construct(*t, rs.iter().map(|r| r.0).collect()));
                 let hi = self.emit(out, *t, Expr::Construct(*t, rs.iter().map(|r| r.1).collect()));
                 (lo, hi)
+            }
+            // The payload's range, in the same variant.
+            Expr::Variant(t, k, payload) => {
+                let (lo, hi) = match payload {
+                    Some(p) => {
+                        let (lo, hi) = self.range(*p);
+                        (Some(lo), Some(hi))
+                    }
+                    None => (None, None),
+                };
+                (
+                    self.emit(out, *t, Expr::Variant(*t, *k, lo)),
+                    self.emit(out, *t, Expr::Variant(*t, *k, hi)),
+                )
             }
             Expr::Extract(x, i) => {
                 let (lo, hi) = self.range(*x);
