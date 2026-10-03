@@ -18,7 +18,7 @@ use wrela_abi::Manifest;
 use wrela_abi::manifest::Stage;
 use wrela_abi::stream::{Command, decode};
 use wrela_host::{Host, Options, Value};
-use wrela_tests::{Bind, RawGpu, bytes_of, f32s, median, one_f32, one_u32, repo_root, u32s};
+use wrela_tests::{Bind, RawGpu, bytes_of, f32s, median, one_f32, one_u32, repo_root, u32s, worse};
 
 /// 2²⁰ points ("1M").
 const POINTS: u32 = 1 << 20;
@@ -174,12 +174,12 @@ fn the_compiled_grazer_matches_the_hand_written_one() {
     for i in 0..POINTS as usize {
         let e = (f64::from(dist[i]) - f64::from(hd[i])).abs();
         let es = (f64::from(samp[4 * i]) - f64::from(hg[4 * i])).abs();
-        // NaN counts as over, and as the worst (`f64::max` would drop it).
+        // NaN counts as over, and as the worst.
         if !(e <= 1e-5 && es <= 1e-5) {
             over_d += 1;
         }
-        worst_d = if e.is_nan() { e } else { worst_d.max(e) };
-        worst_sd = if es.is_nan() { es } else { worst_sd.max(es) };
+        worst_d = worse(worst_d, e);
+        worst_sd = worse(worst_sd, es);
         let g = [samp[4 * i + 1], samp[4 * i + 2], samp[4 * i + 3]];
         let h = [hg[4 * i + 1], hg[4 * i + 2], hg[4 * i + 3]];
         let a = angle(g, h);

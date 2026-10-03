@@ -165,21 +165,21 @@ impl<'a> Cx<'a> {
                 }))
             }
             TyKind::Adt(a, args) => {
-                let name = self.checked.program.display_ty(t);
-                if self.checked.program.adt(*a).is_enum() {
+                let p = &self.checked.program;
+                let name = p.display_ty(t);
+                if p.adt(*a).is_enum() {
                     // The tag is a `u32`, which field 0 has.
                     mb.m.types.u32();
                     let mut variants = Vec::new();
-                    let nvar = self.checked.program.adt(*a).variants().len();
-                    for v in 0..nvar {
-                        let vfields = self.checked.program.fields_of(*a, args, Some(v as u32));
-                        let vname = self.checked.program.adt(*a).variants()[v].name.clone();
+                    for (v, variant) in p.adt(*a).variants().iter().enumerate() {
+                        let v = Some(v as u32);
                         let mut payload = Vec::new();
-                        for (n, ft) in vfields {
+                        for (d, ft) in p.adt_fields(*a, v).iter().zip(p.fields_of(*a, args, v)) {
                             if let Some(f) = self.lower_ty(mb, ft, span) {
-                                payload.push((n, f));
+                                payload.push((d.name.clone(), f));
                             }
                         }
+                        let vname = variant.name.clone();
                         let pt = (!payload.is_empty()).then(|| {
                             mb.m.types.intern(ir::TypeDef::Struct {
                                 name: format!("{name}::{vname}"),
@@ -190,12 +190,11 @@ impl<'a> Cx<'a> {
                     }
                     Some(mb.m.types.intern(ir::TypeDef::Enum { name, variants }))
                 } else {
-                    let fs = self.checked.program.fields_of(*a, args, None);
                     let mut fields = Vec::new();
-                    for (n, ft) in fs {
+                    for (d, ft) in p.adt_fields(*a, None).iter().zip(p.fields_of(*a, args, None)) {
                         let ft = self.reveal(ft);
                         if let Some(f) = self.lower_ty(mb, ft, span) {
-                            fields.push((n, f));
+                            fields.push((d.name.clone(), f));
                         }
                     }
                     if fields.is_empty() {
@@ -236,6 +235,9 @@ impl<'a> Cx<'a> {
     fn check_gpu_size(&mut self, mb: &ModuleBuilder, t: TyId, o: ir::TypeId, span: Span) {
         let types = &mb.m.types;
         let too_large = |x| ir::layout::wgsl_layout(types, x).size > ir::layout::WGSL_MAX_TYPE_SIZE;
+        if !too_large(o) {
+            return;
+        }
         let fields = |x| match types.get(x) {
             ir::TypeDef::Struct { fields, .. } => fields.iter().map(|f| f.1).collect(),
             _ => Vec::new(),
@@ -248,7 +250,7 @@ impl<'a> Cx<'a> {
             }
             _ => Vec::new(),
         };
-        if !too_large(o) || parts.into_iter().any(too_large) {
+        if parts.into_iter().any(too_large) {
             return;
         }
         let shown = self.checked.program.display_ty(t);
@@ -289,9 +291,7 @@ impl<'a> Cx<'a> {
     ) -> Vec<(Option<u32>, TyId)> {
         let p = &self.checked.program;
         let fields: Vec<TyId> = match p.types.kind(t) {
-            TyKind::Adt(a, args) => {
-                p.fields_of(*a, args, variant).into_iter().map(|f| f.1).collect()
-            }
+            TyKind::Adt(a, args) => p.fields_of(*a, args, variant),
             TyKind::Tuple(ts) => ts.clone(),
             _ => Vec::new(),
         };

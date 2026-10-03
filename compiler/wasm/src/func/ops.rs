@@ -1,6 +1,6 @@
 //! Operators, conversions, built-ins and host operations.
 
-use super::{Fe, R, konst, mem};
+use super::{Fe, R, function, konst, mem};
 use crate::{Helpers, globals, memory};
 use wasm_encoder::{BlockType, Function, Instruction as I, ValType};
 use wrela_abi::stream::Opcode;
@@ -361,6 +361,12 @@ fn mat_elem(n: u8, j: u32, i: u32) -> u32 {
     column_stride(n) * j + 4 * i
 }
 
+/// The byte offset of each f32 of a vector of `n` components, or of a `matN` column by column.
+fn components(is_mat: bool, n: u8) -> impl Iterator<Item = u32> {
+    let cols = if is_mat { u32::from(n) } else { 1 };
+    (0..cols).flat_map(move |j| (0..u32::from(n)).map(move |i| mat_elem(n, j, i)))
+}
+
 /// Pushes the sum of `n` products, each of the two f32s `factors(fe, k)` pushes, added in order:
 /// `((0 + p0) + p1) + ...` from zero, else `(p0 + p1) + ...`. (The two differ when every product
 /// is -0: 0 + -0 is 0.)
@@ -454,17 +460,12 @@ pub(super) fn binary(
         }
         // Elementwise: vector op vector, matrix ± matrix, matrix × scalar.
         (_, _, Some((is_mat, n))) => {
-            let stride = if is_mat { column_stride(n) } else { 0 };
-            let cols = if is_mat { n as u32 } else { 1 };
-            for j in 0..cols {
-                for i in 0..n as u32 {
-                    let off = stride * j + 4 * i;
-                    fe.ins.push(I::LocalGet(out));
-                    elem_or_scalar(fe, a, off);
-                    elem_or_scalar(fe, b, off);
-                    fe.ins.push(float_op(fe, op, Fw::of(ir::Scalar::F32))?);
-                    fe.ins.push(I::F32Store(mem(off, 2)));
-                }
+            for off in components(is_mat, n) {
+                fe.ins.push(I::LocalGet(out));
+                elem_or_scalar(fe, a, off);
+                elem_or_scalar(fe, b, off);
+                fe.ins.push(float_op(fe, op, Fw::of(ir::Scalar::F32))?);
+                fe.ins.push(I::F32Store(mem(off, 2)));
             }
         }
         _ => {
@@ -482,18 +483,14 @@ pub(super) fn unary(fe: &mut Fe, v: ir::ValueId, op: ir::UnOp, x: ir::ValueId) -
     let t = fe.vty(x);
     if let Some((is_mat, n)) = dims(fe, t) {
         let out = fe.fresh_slot(v, is_mat)?;
-        let stride = if is_mat { column_stride(n) } else { 0 };
-        for j in 0..if is_mat { n as u32 } else { 1 } {
-            for i in 0..n as u32 {
-                let off = stride * j + 4 * i;
-                fe.ins.extend([
-                    I::LocalGet(out),
-                    I::LocalGet(fe.v(x)),
-                    I::F32Load(mem(off, 2)),
-                    I::F32Neg,
-                    I::F32Store(mem(off, 2)),
-                ]);
-            }
+        for off in components(is_mat, n) {
+            fe.ins.extend([
+                I::LocalGet(out),
+                I::LocalGet(fe.v(x)),
+                I::F32Load(mem(off, 2)),
+                I::F32Neg,
+                I::F32Store(mem(off, 2)),
+            ]);
         }
         return Ok(());
     }
@@ -910,7 +907,6 @@ pub(super) fn host(
             off += 4;
             if let Some(t) = uniform {
                 let u = fe.v(args[fixed as usize - 1 + nb]);
-                let size = layout(&fe.m.types, *t).size;
                 fe.ins.extend([
                     I::LocalGet(a),
                     I::I32Const(off as i32),
@@ -919,14 +915,8 @@ pub(super) fn host(
                     I::I32Const(usize_ as i32),
                     I::MemoryFill(0),
                 ]);
-                fe.ins.extend([
-                    I::LocalGet(a),
-                    I::I32Const(off as i32),
-                    I::I32Add,
-                    I::LocalGet(u),
-                    I::I32Const(size as i32),
-                    I::MemoryCopy { src_mem: 0, dst_mem: 0 },
-                ]);
+                fe.ins.extend([I::LocalGet(a), I::I32Const(off as i32), I::I32Add, I::LocalGet(u)]);
+                fe.copy(*t);
             }
         }
         ir::HostOp::BeginScreenPass => {
@@ -1053,24 +1043,13 @@ fn fmod(f: Fw) -> Function {
     if !f.f64_ {
         locals.extend([ValType::F64; 2]);
     }
-    let mut func = Function::new_with_locals_types(locals);
-    for i in &ins {
-        func.instruction(i);
-    }
-    func
+    function(locals, &ins)
 }
 
 /// The helpers' bodies, in `Helpers` order after the import: flush, reserve, write, release and
 /// the two `fmod`s.
 pub(crate) fn helper_bodies(h: &Helpers) -> Vec<(Vec<ValType>, Vec<ValType>, Function)> {
     use memory::{CMD_BASE, CMD_CAP};
-    let finish = |locals: Vec<ValType>, ins: Vec<I<'static>>| {
-        let mut f = Function::new_with_locals_types(locals);
-        for i in &ins {
-            f.instruction(i);
-        }
-        f
-    };
     // flush(): header, then submit(CMD_BASE, 12 + len); len = 0.
     let magic = u32::from_le_bytes(wrela_abi::stream::MAGIC) as i32;
     let flush = vec![
@@ -1192,10 +1171,10 @@ pub(crate) fn helper_bodies(h: &Helpers) -> Vec<(Vec<ValType>, Vec<ValType>, Fun
     let i32x = |k| vec![ValType::I32; k];
     let (f32_, f64_) = (Fw { f64_: false }, Fw { f64_: true });
     vec![
-        (vec![], vec![], finish(vec![], flush)),
-        (i32x(1), i32x(1), finish(vec![], reserve)),
-        (i32x(4), vec![], finish(i32x(2), write)),
-        (vec![], vec![], finish(i32x(1), release)),
+        (vec![], vec![], function(vec![], &flush)),
+        (i32x(1), i32x(1), function(vec![], &reserve)),
+        (i32x(4), vec![], function(i32x(2), &write)),
+        (vec![], vec![], function(i32x(1), &release)),
         (vec![ValType::F32; 2], vec![ValType::F32], fmod(f32_)),
         (vec![ValType::F64; 2], vec![ValType::F64], fmod(f64_)),
     ]

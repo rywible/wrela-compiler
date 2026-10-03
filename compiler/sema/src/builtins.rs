@@ -188,10 +188,16 @@ impl BuiltinFn {
     pub fn result(self, p: &Program, args: &[TyId]) -> Result<TyId, String> {
         use BuiltinFn::*;
         let types = &p.types;
-        let float_like =
-            |types: &Types, t: TyId| matches!(types.kind(t), TyKind::Float(_) | TyKind::Vec(_));
-        let numeric = |types: &Types, t: TyId| {
-            matches!(types.kind(t), TyKind::Float(_) | TyKind::Vec(_) | TyKind::Int(_))
+        let float_like = |t: TyId| matches!(types.kind(t), TyKind::Float(_) | TyKind::Vec(_));
+        let numeric = |t: TyId| float_like(t) || types.is_int(t);
+        let is_vec = |t: TyId| matches!(types.kind(t), TyKind::Vec(_));
+        // `t` if `ok`; otherwise that this function takes `what`, not a `t`.
+        let takes = |ok: bool, what: &str, t: TyId| {
+            if ok {
+                Ok(t)
+            } else {
+                Err(format!("`{}` takes {what}, not `{}`", self.name(), p.display_ty(t)))
+            }
         };
         let same = |args: &[TyId]| -> Result<TyId, String> {
             if args.windows(2).all(|w| w[0] == w[1]) {
@@ -211,39 +217,15 @@ impl BuiltinFn {
             Sqrt | InverseSqrt | Sin | Cos | Tan | Asin | Acos | Atan | Exp | Exp2 | Log | Log2
             | Floor | Ceil | Round | Trunc | Fract | Saturate | Normalize | Dpdx | Dpdy
             | Fwidth => {
-                let t = args[0];
-                if !float_like(types, t) {
-                    return Err(format!(
-                        "`{}` takes a float or float vector, not `{}`",
-                        self.name(),
-                        p.display_ty(t)
-                    ));
-                }
-                if self == Normalize && !matches!(types.kind(t), TyKind::Vec(_)) {
-                    return Err(format!("`normalize` takes a vector, not `{}`", p.display_ty(t)));
-                }
-                Ok(t)
+                let t = takes(float_like(args[0]), "a float or float vector", args[0])?;
+                if self == Normalize { takes(is_vec(t), "a vector", t) } else { Ok(t) }
             }
             Atan2 | Pow | Step => {
                 let t = same(args)?;
-                if !float_like(types, t) {
-                    return Err(format!(
-                        "`{}` takes floats or float vectors, not `{}`",
-                        self.name(),
-                        p.display_ty(t)
-                    ));
-                }
-                Ok(t)
+                takes(float_like(t), "floats or float vectors", t)
             }
             Abs | Sign => {
-                let t = args[0];
-                if !numeric(types, t) {
-                    return Err(format!(
-                        "`{}` takes a number or vector, not `{}`",
-                        self.name(),
-                        p.display_ty(t)
-                    ));
-                }
+                let t = takes(numeric(args[0]), "a number or vector", args[0])?;
                 if self == Sign && matches!(types.kind(t), TyKind::Int(i) if !i.signed()) {
                     return Err(
                         "`sign` of an unsigned integer is always 0 or 1; compare with 0 instead"
@@ -254,75 +236,41 @@ impl BuiltinFn {
             }
             Min | Max | Clamp => {
                 let t = same(args)?;
-                if !numeric(types, t) {
-                    return Err(format!(
-                        "`{}` takes numbers or vectors, not `{}`",
-                        self.name(),
-                        p.display_ty(t)
-                    ));
-                }
-                Ok(t)
+                takes(numeric(t), "numbers or vectors", t)
             }
             Mix | Smoothstep => {
                 // mix(a, b, t) and smoothstep(e0, e1, x): the first two match; the third is the
                 // same type, or an f32 applied to every component (mix only).
                 let t = same(&args[..2])?;
-                if !float_like(types, t) {
-                    return Err(format!(
-                        "`{}` takes floats or float vectors, not `{}`",
-                        self.name(),
-                        p.display_ty(t)
-                    ));
-                }
+                takes(float_like(t), "floats or float vectors", t)?;
                 let third = args[2];
-                if third == t
-                    || (self == Mix
-                        && third == types.f32
-                        && matches!(types.kind(t), TyKind::Vec(_)))
-                {
+                let or_f32 = self == Mix && is_vec(t);
+                if third == t || (or_f32 && third == types.f32) {
                     Ok(t)
                 } else {
                     Err(format!(
                         "the last argument of `{}` must be `{}`{}",
                         self.name(),
                         p.display_ty(t),
-                        if self == Mix && matches!(types.kind(t), TyKind::Vec(_)) {
-                            " or `f32`"
-                        } else {
-                            ""
-                        }
+                        if or_f32 { " or `f32`" } else { "" }
                     ))
                 }
             }
             Length => {
-                if !float_like(types, args[0]) {
-                    return Err(format!(
-                        "`length` takes a float or vector, not `{}`",
-                        p.display_ty(args[0])
-                    ));
-                }
-                Ok(scalar_of(types, args[0]))
+                let t = takes(float_like(args[0]), "a float or vector", args[0])?;
+                Ok(scalar_of(types, t))
             }
             Distance | Dot => {
                 let t = same(args)?;
-                if !float_like(types, t) {
-                    return Err(format!(
-                        "`{}` takes float vectors, not `{}`",
-                        self.name(),
-                        p.display_ty(t)
-                    ));
-                }
-                if self == Dot && !matches!(types.kind(t), TyKind::Vec(_)) {
-                    return Err(format!("`dot` takes vectors, not `{}`", p.display_ty(t)));
+                takes(float_like(t), "float vectors", t)?;
+                if self == Dot {
+                    takes(is_vec(t), "vectors", t)?;
                 }
                 Ok(scalar_of(types, t))
             }
             Cross => {
                 let t = same(args)?;
-                if t != types.vec3 {
-                    return Err(format!("`cross` takes two `vec3`s, not `{}`", p.display_ty(t)));
-                }
-                Ok(t)
+                takes(t == types.vec3, "two `vec3`s", t)
             }
             Select => {
                 // Any type: per component on a vector, and whole on any other value (the GPU
@@ -337,41 +285,19 @@ impl BuiltinFn {
                 Ok(t)
             }
             BitcastU32 | BitcastI32 => {
-                if args[0] != types.f32 {
-                    return Err(format!(
-                        "`{}` takes an `f32`, not `{}`",
-                        self.name(),
-                        p.display_ty(args[0])
-                    ));
-                }
+                takes(args[0] == types.f32, "an `f32`", args[0])?;
                 Ok(if self == BitcastU32 { types.u32 } else { types.i32 })
             }
             BitcastF32 => {
-                if args[0] != types.u32 && args[0] != types.i32 {
-                    return Err(format!(
-                        "`bitcast_f32` takes a `u32` or `i32`, not `{}`",
-                        p.display_ty(args[0])
-                    ));
-                }
+                takes(args[0] == types.u32 || args[0] == types.i32, "a `u32` or `i32`", args[0])?;
                 Ok(types.f32)
             }
             BitcastU64 => {
-                if args[0] != types.f64 {
-                    return Err(format!(
-                        "`bitcast_u64` takes an `f64`, not `{}`",
-                        p.display_ty(args[0])
-                    ));
-                }
+                takes(args[0] == types.f64, "an `f64`", args[0])?;
                 Ok(types.int(IntTy::U64))
             }
             BitcastF64 => {
-                let u64_ty = types.int(IntTy::U64);
-                if args[0] != u64_ty {
-                    return Err(format!(
-                        "`bitcast_f64` takes a `u64`, not `{}`",
-                        p.display_ty(args[0])
-                    ));
-                }
+                takes(args[0] == types.int(IntTy::U64), "a `u64`", args[0])?;
                 Ok(types.f64)
             }
             Len => match types.kind(args[0]) {
@@ -383,14 +309,7 @@ impl BuiltinFn {
             },
             WrappingAdd | WrappingSub | WrappingMul => {
                 let t = same(args)?;
-                if !types.is_int(t) {
-                    return Err(format!(
-                        "`{}` takes integers, not `{}`",
-                        self.name(),
-                        p.display_ty(t)
-                    ));
-                }
-                Ok(t)
+                takes(types.is_int(t), "integers", t)
             }
         }
     }

@@ -134,6 +134,11 @@ pub fn bytes_of(xs: &[f32]) -> Vec<u8> {
     xs.iter().flat_map(|x| x.to_le_bytes()).collect()
 }
 
+/// The larger error; NaN if either is (`f64::max` drops a NaN, which would pass every check).
+pub fn worse(a: f64, b: f64) -> f64 {
+    if a.is_nan() || b.is_nan() { f64::NAN } else { a.max(b) }
+}
+
 /// The median of some durations.
 pub fn median(xs: &[f64]) -> f64 {
     let mut v = xs.to_vec();

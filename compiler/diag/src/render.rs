@@ -25,7 +25,6 @@ pub fn render(map: &SourceMap, d: &Diagnostic) -> String {
         return out;
     };
     let file = map.file(primary.span.file);
-    let lc = file.line_col(primary.span.start);
     // Each label in this file, with the 0-based line it starts on.
     let labels: Vec<(&Label, usize)> = std::iter::once(primary)
         .chain(d.secondary.iter().filter(|l| l.span.file == primary.span.file))
@@ -33,7 +32,7 @@ pub fn render(map: &SourceMap, d: &Diagnostic) -> String {
         .collect();
     let width = labels.iter().map(|(_, line)| (line + 1).to_string().len()).max().unwrap_or(1);
     let pad = " ".repeat(width);
-    let _ = writeln!(out, "{pad}--> {}:{}:{}", file.name, lc.line, lc.column);
+    let _ = writeln!(out, "{pad}--> {}", file.location(primary.span.start));
     let _ = writeln!(out, "{pad} |");
     let mut lines: Vec<usize> = labels.iter().map(|&(_, line)| line).collect();
     lines.sort_unstable();
@@ -63,10 +62,9 @@ pub fn render(map: &SourceMap, d: &Diagnostic) -> String {
         }
     }
     for label in d.secondary.iter().filter(|l| l.span.file != primary.span.file) {
-        let other = map.file(label.span.file);
-        let lc = other.line_col(label.span.start);
+        let at = map.file(label.span.file).location(label.span.start);
         let msg = label.message.as_deref().unwrap_or("");
-        let _ = writeln!(out, "{pad} = note: {}:{}:{}: {msg}", other.name, lc.line, lc.column);
+        let _ = writeln!(out, "{pad} = note: {at}: {msg}");
     }
     for note in &d.notes {
         let _ = writeln!(out, "{pad} = note: {note}");

@@ -11,7 +11,7 @@ pub mod ad;
 pub mod interval;
 
 use crate::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 /// Derived functions already built in a module, so each is built once.
 #[derive(Debug, Default)]
@@ -66,7 +66,7 @@ pub(crate) struct Effect {
 }
 
 /// How the activity analysis learns what a call does.
-pub(crate) type Callee<'c> = dyn FnMut(FuncId, Vec<bool>) -> Result<Effect> + 'c;
+pub(crate) type Callee<'c> = dyn FnMut(FuncId, Vec<bool>) -> Effect + 'c;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Mode {
@@ -115,7 +115,7 @@ pub(crate) fn activity(
     params: &[bool],
     mode: Mode,
     callee: &mut Callee<'_>,
-) -> Result<Activity> {
+) -> Activity {
     let mut a = Activity {
         values: vec![false; f.values.len()],
         locals: vec![false; f.locals.len()],
@@ -132,12 +132,11 @@ pub(crate) fn activity(
     };
     loop {
         let before = on(&a);
-        walk(&cx, &f.body, &mut a, None, callee)?;
+        walk(&cx, &f.body, &mut a, None, callee);
         if on(&a) == before {
-            break;
+            return a;
         }
     }
-    Ok(a)
 }
 
 fn carries(m: &Module, t: TypeId, mode: Mode) -> bool {
@@ -234,20 +233,14 @@ impl Pointers {
 }
 
 /// In interval mode, under a branch on the input, a store makes its place a range (both sides
-/// may run, and what they wrote is joined after the branch). `ctrl` is then the set of locals
-/// mentioned only inside the innermost such branch: their values never reach the join, so
-/// storing to them doesn't.
-fn walk(
-    cx: &Walk<'_>,
-    b: &Block,
-    a: &mut Activity,
-    ctrl: Option<&HashSet<LocalId>>,
-    callee: &mut Callee<'_>,
-) -> Result<()> {
+/// may run, and what they wrote is joined after the branch). `ctrl` then counts, by local, the
+/// places inside the innermost such branch that mention it. A local that only those places
+/// mention never reaches the join, so a store to it doesn't.
+fn walk(cx: &Walk<'_>, b: &Block, a: &mut Activity, ctrl: Option<&[u32]>, callee: &mut Callee<'_>) {
     let (m, f, mode) = (cx.m, cx.f, cx.mode);
     let joined = |p: &Place| match (ctrl, &p.root) {
         (None, _) => false,
-        (Some(inside), PlaceRoot::Local(l)) => !inside.contains(l),
+        (Some(inside), PlaceRoot::Local(l)) => inside[l.index()] != cx.uses[l.index()],
         (Some(_), _) => true,
     };
     let mut at = None;
@@ -255,7 +248,7 @@ fn walk(
         match s {
             Stmt::Let(v, e) => {
                 let active = match e {
-                    Expr::Call(g, args) => call(cx, a, *g, args, &joined, callee)?,
+                    Expr::Call(g, args) => call(cx, a, *g, args, &joined, callee),
                     e => expr_active(e, a),
                 };
                 if active && carries(m, f.value_ty(*v), mode) {
@@ -263,7 +256,7 @@ fn walk(
                 }
             }
             Stmt::Eval(Expr::Call(g, args)) => {
-                call(cx, a, *g, args, &joined, callee)?;
+                call(cx, a, *g, args, &joined, callee);
             }
             Stmt::Eval(_) => {}
             Stmt::Store(p, v) => {
@@ -276,20 +269,16 @@ fn walk(
                     let mut inside = vec![0u32; f.locals.len()];
                     visit::count_local_mentions(then, &mut inside);
                     visit::count_local_mentions(else_, &mut inside);
-                    let internal: HashSet<LocalId> = (0..f.locals.len())
-                        .filter(|&l| inside[l] > 0 && inside[l] == cx.uses[l])
-                        .map(|l| LocalId(l as u32))
-                        .collect();
-                    walk(cx, then, a, Some(&internal), callee)?;
-                    walk(cx, else_, a, Some(&internal), callee)?;
+                    walk(cx, then, a, Some(&inside), callee);
+                    walk(cx, else_, a, Some(&inside), callee);
                 } else {
-                    walk(cx, then, a, ctrl, callee)?;
-                    walk(cx, else_, a, ctrl, callee)?;
+                    walk(cx, then, a, ctrl, callee);
+                    walk(cx, else_, a, ctrl, callee);
                 }
             }
             Stmt::Loop { body, continuing } => {
-                walk(cx, body, a, ctrl, callee)?;
-                walk(cx, continuing, a, ctrl, callee)?;
+                walk(cx, body, a, ctrl, callee);
+                walk(cx, continuing, a, ctrl, callee);
                 if mode == Mode::Interval
                     && a.active_loop_exit.is_none()
                     && let Some(exit) = loop_exit(body, a, at)
@@ -306,7 +295,6 @@ fn walk(
             Stmt::Return(None) | Stmt::Break | Stmt::Continue | Stmt::Trap => {}
         }
     }
-    Ok(())
 }
 
 /// Whether a loop's `break`, `continue` (or `return`) sits under a condition that depends on
@@ -352,10 +340,10 @@ fn call(
     args: &[Arg],
     joined: &dyn Fn(&Place) -> bool,
     callee: &mut Callee<'_>,
-) -> Result<bool> {
+) -> bool {
     let mask: Vec<bool> = args.iter().map(|x| arg_active(a, x)).collect();
     // Arguments map to the callee's parameters one to one.
-    let effect = if mask.iter().any(|b| *b) { Some(callee(g, mask)?) } else { None };
+    let effect = mask.iter().any(|b| *b).then(|| callee(g, mask));
     for (i, (arg, p)) in args.iter().zip(&cx.m.functions[g.index()].params).enumerate() {
         let writes = effect.as_ref().is_some_and(|e| e.writes[i]);
         if let (Arg::Place(pl), true) = (arg, p.mutable)
@@ -364,7 +352,7 @@ fn call(
             cx.mark(a, pl);
         }
     }
-    Ok(effect.is_some_and(|e| e.returns))
+    effect.is_some_and(|e| e.returns)
 }
 
 fn mark_place(a: &mut Activity, p: &Place) {
@@ -406,8 +394,8 @@ pub(super) fn returns_active(
     f: FuncId,
     mask: Vec<bool>,
     mode: Mode,
-) -> Result<bool> {
-    Ok(effect(m, cache, f, mask, mode)?.returns)
+) -> bool {
+    effect(m, cache, f, mask, mode).returns
 }
 
 /// What a call of `f` with these active parameters does. Memoized; a recursive call still being
@@ -418,14 +406,14 @@ pub(super) fn effect(
     f: FuncId,
     mask: Vec<bool>,
     mode: Mode,
-) -> Result<Effect> {
+) -> Effect {
     let func = &m.functions[f.index()];
     let key = (mode, f, mask);
     match cache.effects.get(&key) {
-        Some(Some(e)) => return Ok(e.clone()),
+        Some(Some(e)) => return e.clone(),
         Some(None) => {
             let writes = func.params.iter().map(|p| p.mutable).collect();
-            return Ok(Effect { returns: true, writes });
+            return Effect { returns: true, writes };
         }
         None => {}
     }
@@ -434,7 +422,7 @@ pub(super) fn effect(
     let a = activity(m, func, &key.2, mode, &mut |g, mk| {
         assumed |= matches!(cache.effects.get(&(mode, g, mk.clone())), Some(None));
         effect(m, cache, g, mk, mode)
-    })?;
+    });
     let returns =
         a.returns && func.ret.is_some_and(|t| mode == Mode::Interval || m.types.has_float(t));
     let writes = func.params.iter().zip(&a.params).map(|(p, w)| p.mutable && *w).collect();
@@ -445,7 +433,7 @@ pub(super) fn effect(
     if !assumed {
         cache.activity.insert(key, a);
     }
-    Ok(e)
+    e
 }
 
 /// The activity of `f`'s body with active parameters `mask`: the one [`effect`] kept, if it
@@ -456,9 +444,9 @@ pub(super) fn body_activity(
     f: FuncId,
     mask: &[bool],
     mode: Mode,
-) -> Result<Activity> {
+) -> Activity {
     if let Some(a) = cache.activity.get(&(mode, f, mask.to_vec())) {
-        return Ok(a.clone());
+        return a.clone();
     }
     activity(m, &m.functions[f.index()], mask, mode, &mut |g, mk| effect(m, cache, g, mk, mode))
 }
@@ -560,6 +548,14 @@ pub(super) fn splat_size(types: &Types, from: TypeId, to: TypeId) -> Option<u8> 
     }
 }
 
+/// `v = e`, or `e` evaluated for its effect when there's no `v`.
+pub(super) fn let_or_eval(v: Option<ValueId>, e: Expr) -> Stmt {
+    match v {
+        Some(v) => Stmt::Let(v, e),
+        None => Stmt::Eval(e),
+    }
+}
+
 /// What both derivations do with a statement they leave as it is: rebuild an `if` or a loop
 /// from their versions of its blocks (`block`), and copy anything else.
 pub(super) fn pass_through(
@@ -579,32 +575,51 @@ pub(super) fn pass_through(
     Ok(())
 }
 
-/// Where a block records GPU work (a host operation), which a derived function can't do: the
-/// last `At` before it (`at` before the block).
-pub(crate) fn records_gpu_work(
-    b: &Block,
-    mut at: Option<wrela_diag::Span>,
-) -> Option<Option<wrela_diag::Span>> {
-    for s in b {
-        match s {
-            Stmt::At(span) => at = Some(*span),
-            Stmt::Let(_, Expr::Host(..)) | Stmt::Eval(Expr::Host(..)) => return Some(at),
-            Stmt::If { then, else_, .. } => {
-                if let Some(r) = records_gpu_work(then, at).or_else(|| records_gpu_work(else_, at))
-                {
-                    return Some(r);
+/// An error if a function's body records GPU work (a host operation), which a derived function
+/// can't do.
+pub(super) fn no_gpu_work(body: &Block) -> Result<()> {
+    // Where: the last `At` before it (`at` before the block).
+    fn find(b: &Block, mut at: Option<wrela_diag::Span>) -> Option<Option<wrela_diag::Span>> {
+        for s in b {
+            match s {
+                Stmt::At(span) => at = Some(*span),
+                Stmt::Let(_, Expr::Host(..)) | Stmt::Eval(Expr::Host(..)) => return Some(at),
+                _ => {
+                    if let Some(r) = s.blocks().find_map(|inner| find(inner, at)) {
+                        return Some(r);
+                    }
                 }
             }
-            Stmt::Loop { body, continuing } => {
-                let r = records_gpu_work(body, at).or_else(|| records_gpu_work(continuing, at));
-                if r.is_some() {
-                    return r;
-                }
-            }
-            _ => {}
+        }
+        None
+    }
+    match find(body, None) {
+        Some(at) => {
+            Err(Error::not_derivable("this records GPU work, which a derived function can't do")
+                .at(at))
+        }
+        None => Ok(()),
+    }
+}
+
+/// An error if deriving `func` would write `what` (a derivative, a range) through a `mut`
+/// parameter that isn't active itself. The caller's statement (the call) places it, or the
+/// call of the derivation does.
+pub(super) fn no_write_through_mut(
+    func: &Function,
+    act: &Activity,
+    mask: &[bool],
+    what: &str,
+) -> Result<()> {
+    for ((p, written), active) in func.params.iter().zip(&act.params).zip(mask) {
+        if *written && !active && p.mutable {
+            return Err(Error::not_derivable(format!(
+                "this would write {what} through the `mut` parameter `{}`",
+                p.name
+            )));
         }
     }
-    None
+    Ok(())
 }
 
 /// Whether a value of type `t` holds a pointer.

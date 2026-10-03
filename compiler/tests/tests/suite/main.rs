@@ -18,9 +18,9 @@ mod reproducible;
 mod run_pass;
 mod warnings;
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// An empty directory `name` (a relative path) for a test's files, under the binary's scratch
 /// directory.
@@ -51,13 +51,13 @@ fn with_frame(text: &str) -> String {
 /// Builds the test package `compiler/tests/<pkg>` once per test process (the suites share the
 /// build), and returns the build's directory. Panics with the errors if it doesn't build.
 fn built(pkg: &str) -> PathBuf {
-    static DONE: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+    static BUILDS: Mutex<BTreeMap<String, Arc<OnceLock<()>>>> = Mutex::new(BTreeMap::new());
+    let src = wrela_tests::repo_root().join("compiler/tests").join(pkg);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(pkg);
-    // Held while building, so a second test waits for the first's build rather than racing it.
-    let mut done = DONE.lock().unwrap_or_else(|p| p.into_inner());
-    if !done.contains(pkg) {
-        wrela_tests::must_build(&wrela_tests::repo_root().join("compiler/tests").join(pkg), &out);
-        done.insert(pkg.to_string());
-    }
+    // One build per package: a second test waits for the first's build rather than racing it,
+    // and other packages build at the same time.
+    let once =
+        BUILDS.lock().unwrap_or_else(|p| p.into_inner()).entry(pkg.into()).or_default().clone();
+    once.get_or_init(|| wrela_tests::must_build(&src, &out));
     out
 }

@@ -209,20 +209,6 @@ impl Stmt {
         }
     }
 
-    pub fn expr_mut(&mut self) -> Option<&mut Expr> {
-        match self {
-            Stmt::Let(_, e) | Stmt::Eval(e) => Some(e),
-            Stmt::Store(..)
-            | Stmt::If { .. }
-            | Stmt::Loop { .. }
-            | Stmt::Break
-            | Stmt::Continue
-            | Stmt::Return(_)
-            | Stmt::Trap
-            | Stmt::At(_) => None,
-        }
-    }
-
     /// The values the statement itself reads (not those of its nested blocks).
     pub fn for_each_value(&self, f: &mut impl FnMut(ValueId)) {
         match self {

@@ -267,14 +267,12 @@ impl Program {
         }
     }
 
-    /// The fields of a struct or of one of an enum's variants, with the type's arguments
-    /// substituted and projections on them resolved (`k: T::K` with `T = P` is `P`'s `K`).
-    pub fn fields_of(&self, a: AdtId, args: &[TyId], variant: Option<u32>) -> Vec<(String, TyId)> {
+    /// The field types of a struct or of one of an enum's variants, in [`Self::adt_fields`]
+    /// order, with the type's arguments substituted and projections on them resolved
+    /// (`k: T::K` with `T = P` is `P`'s `K`).
+    pub fn fields_of(&self, a: AdtId, args: &[TyId], variant: Option<u32>) -> Vec<TyId> {
         let subst = Subst::from_pairs(&self.adt(a).generics, args);
-        self.adt_fields(a, variant)
-            .iter()
-            .map(|f| (f.name.clone(), self.field_under(f.ty, &subst)))
-            .collect()
+        self.adt_fields(a, variant).iter().map(|f| self.field_under(f.ty, &subst)).collect()
     }
 
     /// The type of field `i` of a struct or of one of an enum's variants, as [`Self::fields_of`]
@@ -294,12 +292,7 @@ impl Program {
         let t = self.types.subst(ty, subst);
         // The declared type says whether there's a projection, cheaply: the arguments can be
         // large.
-        let is_projection = |k: &TyKind| matches!(k, TyKind::Projection { .. });
-        if self.types.any(ty, &mut { is_projection }) {
-            crate::traits::normalize(self, t, None)
-        } else {
-            t
-        }
+        if self.types.has_projections(ty) { crate::traits::normalize(self, t, None) } else { t }
     }
 
     /// A fix that opts a struct in to a trait in its declaration (`struct S: Trait`), for a

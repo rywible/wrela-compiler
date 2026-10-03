@@ -77,9 +77,6 @@ export class ByteReader {
   name(): string {
     return UTF8.decode(this.take(this.u32()));
   }
-}
-
-class Reader extends ByteReader {
 
   valtype(): string {
     const b = this.byte();
@@ -101,7 +98,7 @@ class Reader extends ByteReader {
 
 /** Reads a module's function types. Throws on a module it can't read (validate it first). */
 export function functionTypes(bytes: Uint8Array): FunctionTypes {
-  const r = new Reader(bytes);
+  const r = new ByteReader(bytes);
   r.at = 8; // magic and version
   const types: string[] = [];
   const funcs: string[] = []; // the type of each function index: imports first

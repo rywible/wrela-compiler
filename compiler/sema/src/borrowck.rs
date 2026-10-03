@@ -139,32 +139,31 @@ fn rvalue_uses(body: &Body, r: &Rvalue, out: &mut Vec<Local>) {
     }
 }
 
-/// A statement's uses and the local it defines (whose old value it's done with).
-fn stmt_uses_defs(p: &Program, body: &Body, s: &Statement) -> (Vec<Local>, Option<Local>) {
-    let mut uses = Vec::new();
-    let def = match &s.kind {
+/// Adds a statement's uses to `uses`; returns the local it defines (whose old value it's done
+/// with).
+fn stmt_uses_defs(p: &Program, body: &Body, s: &Statement, uses: &mut Vec<Local>) -> Option<Local> {
+    match &s.kind {
         StatementKind::Assign(place, r) => {
-            rvalue_uses(body, r, &mut uses);
+            rvalue_uses(body, r, uses);
             if place.proj.is_empty() && !is_bound_alias(p, body, place.local, r) {
                 // A whole local gets a new value (or a projection local, a call's place).
                 Some(place.local)
             } else {
                 // A write through a place: a use of its local.
-                place_uses(place, &mut uses);
+                place_uses(place, uses);
                 None
             }
         }
         StatementKind::Eval(r) => {
-            rvalue_uses(body, r, &mut uses);
+            rvalue_uses(body, r, uses);
             None
         }
         StatementKind::Bind { local, place, .. } => {
-            place_uses(place, &mut uses);
+            place_uses(place, uses);
             Some(*local)
         }
         StatementKind::Live(l) | StatementKind::Dead(l) => Some(*l),
-    };
-    (uses, def)
+    }
 }
 
 /// Whether assigning `r` to the whole local `l` writes through it: `l` aliases a place, and `r`
@@ -237,10 +236,9 @@ impl State {
         for m in &self.moves {
             match other.moves.iter().find(|n| n.place == m.place) {
                 Some(n) => out.push(Moved {
-                    place: m.place.clone(),
-                    span: m.span,
                     maybe: m.maybe || n.maybe,
                     back: m.back && n.back,
+                    ..m.clone()
                 }),
                 None => out.push(Moved { maybe: true, ..m.clone() }),
             }
@@ -390,13 +388,11 @@ impl<'a> FnCheck<'a> {
                 }
             }
         }
-        // Then once more over each block, reporting.
+        // Then once more over each block that has a state (each reachable one), reporting.
         self.emit = true;
-        for (i, e) in entry.iter().enumerate() {
-            if let Some(st) = e
-                && reachable[i]
-            {
-                self.transfer_block(BlockId(i as u32), st.clone());
+        for (i, st) in entry.into_iter().enumerate() {
+            if let Some(st) = st {
+                self.transfer_block(BlockId(i as u32), st);
             }
         }
         self.diags
@@ -477,7 +473,8 @@ impl<'a> FnCheck<'a> {
         term_uses(&block.term, &mut uses);
         at(block.stmts.len(), &uses, None, &mut live);
         for (i, s) in block.stmts.iter().enumerate().rev() {
-            let (uses, def) = stmt_uses_defs(self.p, self.body, s);
+            uses.clear();
+            let def = stmt_uses_defs(self.p, self.body, s, &mut uses);
             at(i, &uses, def, &mut live);
         }
         live
@@ -722,13 +719,25 @@ impl<'a> FnCheck<'a> {
         self.redefine(st, local);
         self.access(st, at, place, kind, span);
         for t in targets {
-            let mut via = vec![local];
-            via.extend(t.via);
-            // A `mut` projection of a projection writes only what that one may write.
-            let mutable = mutable && t.mutable;
-            let loan = Loan { place: t.place, mutable, holder: local, via, exact: t.exact, span };
-            self.new_loan(st, at, loan);
+            self.lend(st, at, local, t, mutable, span);
         }
+    }
+
+    /// `holder` gets a loan on target `t`, through `t`'s projections. A `mut` loan through a
+    /// projection writes only what that one may write.
+    fn lend(
+        &mut self,
+        st: &mut State,
+        at: Point,
+        holder: Local,
+        t: Target,
+        mutable: bool,
+        span: Span,
+    ) {
+        let mut via = vec![holder];
+        via.extend(t.via);
+        let mutable = mutable && t.mutable;
+        self.new_loan(st, at, Loan { place: t.place, mutable, holder, via, exact: t.exact, span });
     }
 
     /// What a projection-returning call returned: somewhere inside its `borrow` and `mut`
@@ -749,11 +758,7 @@ impl<'a> FnCheck<'a> {
             };
             let mutable = from_mut && c.ret_mode == RetMode::Mut;
             for t in self.resolve(st, p) {
-                let mut via = vec![holder];
-                via.extend(t.via);
-                let mutable = mutable && t.mutable;
-                let loan = Loan { place: t.place, mutable, holder, via, exact: false, span };
-                self.new_loan(st, at, loan);
+                self.lend(st, at, holder, Target { exact: false, ..t }, mutable, span);
             }
         }
     }
@@ -768,26 +773,26 @@ impl<'a> FnCheck<'a> {
         id: ClosureId,
         span: Span,
     ) {
-        let caps = self.body.closures[id.0 as usize].captures.clone();
-        for (l, written) in caps {
+        let body = self.body;
+        for &(l, written) in &body.closures[id.0 as usize].captures {
             let place = Place::local(l);
             let kind = if written { Access::MutBorrow } else { Access::Borrow };
             let targets = self.resolve(st, &place);
             self.access(st, at, &place, kind, span);
             for t in targets {
-                let mut via = vec![holder];
-                via.extend(t.via);
-                let mutable = written && t.mutable;
-                let loan = Loan { place: t.place, mutable, holder, via, exact: t.exact, span };
-                self.new_loan(st, at, loan);
+                self.lend(st, at, holder, t, written, span);
             }
         }
     }
 
     /// `to` holds what `from` holds (a closure copied to another local).
     fn inherit(&mut self, st: &mut State, at: Point, to: Local, from: Local, span: Span) {
-        let held: Vec<Loan> =
-            st.loans.iter().map(|i| self.loans[i].clone()).filter(|l| l.holder == from).collect();
+        let held: Vec<Loan> = st
+            .loans
+            .iter()
+            .filter(|&i| self.loans[i].holder == from)
+            .map(|i| self.loans[i].clone())
+            .collect();
         for l in held {
             let mut via = vec![to];
             via.extend(l.via.iter().copied());
@@ -804,29 +809,11 @@ impl<'a> FnCheck<'a> {
     /// Checks an access to `place`, then applies it (a move, or a reinitialization).
     fn access(&mut self, st: &mut State, at: Point, place: &Place, access: Access, span: Span) {
         let root = place.local;
-        // Through a projection: it must allow the access; then the access is to what it
-        // aliases.
-        if self.is_alias(root) {
-            match access {
-                Access::Write | Access::MutBorrow if !self.local(root).kind.writable() => {
-                    self.read_only(place, access, span);
-                    return;
-                }
-                Access::Move => {
-                    self.not_owned(place, span);
-                    return;
-                }
-                _ => {}
-            }
-            for t in self.resolve(st, place) {
-                self.check_target(st, at, &t.place, &t.via, access, span);
-            }
-            return;
-        }
+        let alias = self.is_alias(root);
         // A capture is the enclosing function's place: written only if captured mutably (the
         // checker of the enclosing function saw to that), and never moved. The closure's own
         // projections and arguments still mustn't overlap it.
-        if self.is_capture(root) {
+        if !alias && self.is_capture(root) {
             if access == Access::Move {
                 if self.emit {
                     let what = self.describe(place);
@@ -845,20 +832,19 @@ impl<'a> FnCheck<'a> {
             self.check_target(st, at, place, &[], access, span);
             return;
         }
+        // The root must allow the access (a projection never owns, so never moves).
+        let kind = self.local(root).kind;
         match access {
-            Access::Write | Access::MutBorrow if !self.local(root).kind.writable() => {
+            Access::Write | Access::MutBorrow if !kind.writable() => {
                 self.read_only(place, access, span);
                 return;
             }
-            Access::Move => {
-                if !self.local(root).kind.owns_value() {
-                    self.not_owned(place, span);
-                    return;
-                }
-                if place.proj.iter().any(|p| matches!(p, Proj::Index(_))) {
-                    if !self.emit {
-                        return;
-                    }
+            Access::Move if !kind.owns_value() => {
+                self.not_owned(place, span);
+                return;
+            }
+            Access::Move if place.proj.iter().any(|p| matches!(p, Proj::Index(_))) => {
+                if self.emit {
                     let what = self.describe(place);
                     self.err(
                         Diagnostic::new(
@@ -871,12 +857,19 @@ impl<'a> FnCheck<'a> {
                         )
                         .with_help(format!("use `{what}.clone()`")),
                     );
-                    return;
                 }
+                return;
             }
             _ => {}
         }
-        self.check_target(st, at, place, &[], access, span);
+        // Through a projection, the access is to what it aliases.
+        if alias {
+            for t in self.resolve(st, place) {
+                self.check_target(st, at, &t.place, &t.via, access, span);
+            }
+        } else {
+            self.check_target(st, at, place, &[], access, span);
+        }
     }
 
     /// The moves and loans an access to `target` (a place of a local holding its value) meets,
@@ -1126,6 +1119,9 @@ impl<'a> FnCheck<'a> {
         let access = if mode == RetMode::Mut { Access::MutBorrow } else { Access::Borrow };
         let ret_span = self.f.block(at.0).term.span;
         self.access(st, at, place, access, ret_span);
+        if !self.emit {
+            return;
+        }
         for t in self.resolve(st, place) {
             let decl = self.local(t.place.local);
             match decl.kind {
@@ -1158,20 +1154,17 @@ fn unused_locals(p: &Program, body: &Body) -> Vec<Diagnostic> {
     let n = body.locals.len();
     let mut used = vec![false; n];
     let mut bound = vec![false; n];
+    let mut uses = Vec::new();
     for f in &body.fns {
         for b in &f.blocks {
             for s in &b.stmts {
-                let (uses, _) = stmt_uses_defs(p, body, s);
-                for u in uses {
-                    used[u.index()] = true;
-                }
+                stmt_uses_defs(p, body, s, &mut uses);
                 if let StatementKind::Live(l) = &s.kind {
                     bound[l.index()] = true;
                 }
             }
-            let mut uses = Vec::new();
             term_uses(&b.term, &mut uses);
-            for u in uses {
+            for u in uses.drain(..) {
                 used[u.index()] = true;
             }
         }

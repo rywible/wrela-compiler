@@ -1,6 +1,6 @@
 //! Calls: functions, methods, built-ins, constructors, conversions, and the GPU intrinsics.
 
-use super::expr::ValueRes;
+use super::expr::{ValueRes, variant_expr};
 use super::{Checker, zonk};
 use crate::builtins::{self, BuiltinFn, BuiltinTy};
 use crate::defs::*;
@@ -130,12 +130,7 @@ impl<'p> Checker<'p> {
                 };
                 let recv = self.check_expr(&first.value, None);
                 let rt = self.shallow(recv.ty);
-                self.obligation(
-                    rt,
-                    own.clone(),
-                    recv.span,
-                    format!("calling `{}::{}`", self.p.trait_(t).name, name.name),
-                );
+                self.trait_obligation(rt, &own, recv.span, &name.name);
                 let Some((m, via)) = traits::trait_method_via(self.p, rt, own, &name.name) else {
                     unreachable!("the method was found above")
                 };
@@ -240,20 +235,7 @@ impl<'p> Checker<'p> {
             out.push(self.check_expect(&a.value, pt));
         }
         self.note_use(l, false);
-        let modes = vec![Mode::Borrow; out.len()];
-        let n_args = out.len();
-        Expr {
-            ty: ret,
-            span,
-            kind: ExprKind::Call(Call {
-                callee: Callee::Local(l),
-                args: out,
-                modes,
-                order: (0..n_args).collect(),
-                receiver: false,
-                ret_mode: RetMode::Owned,
-            }),
-        }
+        plain_call(Callee::Local(l), out, false, ret, span)
     }
 
     /// `f`'s parameters and return type, with `subst` applied.
@@ -288,14 +270,7 @@ impl<'p> Checker<'p> {
         // The declared signature says whether there are any, cheaply: the instantiated types
         // can be large.
         let def = p.func(f);
-        let is_projection = |k: &TyKind| matches!(k, TyKind::Projection { .. });
-        if !def
-            .params
-            .iter()
-            .map(|ps| ps.ty)
-            .chain([def.ret])
-            .any(|t| p.types.any(t, &mut { is_projection }))
-        {
+        if !def.params.iter().map(|ps| ps.ty).chain([def.ret]).any(|t| p.types.has_projections(t)) {
             return (params, ret);
         }
         let defer = |this: &mut Self, t: TyId| {
@@ -334,12 +309,9 @@ impl<'p> Checker<'p> {
                     false
                 });
                 for v in literals {
-                    let default = match self.infer.var_kind(&self.p.types, v) {
-                        Some(VarKind::Int) => self.p.types.i32,
-                        Some(VarKind::Float) => self.p.types.f32,
-                        _ => continue,
-                    };
-                    self.try_unify(v, default);
+                    if let Some(default) = self.infer.literal_default(&self.p.types, v) {
+                        self.try_unify(v, default);
+                    }
                 }
                 r = self.infer.resolve(&self.p.types, proj);
             }
@@ -601,14 +573,12 @@ impl<'p> Checker<'p> {
 
     /// Argument coercions: an array passes as a run (`[T; N]` to `[T]`); otherwise unify.
     fn coerce_arg(&mut self, e: &Expr, param_ty: TyId) {
-        if let (TyKind::Array(a, _), TyKind::Slice(b)) = (self.kind(e.ty), self.kind(param_ty)) {
-            self.expect(*a, *b, e.span);
-            return;
-        }
-        if let (TyKind::Closure(c, _), TyKind::FnPtr(ps, r)) =
-            (self.kind(e.ty), self.kind(param_ty))
-        {
-            if let Some(def) = self.closure_def(*c) {
+        match (self.kind(e.ty), self.kind(param_ty)) {
+            (TyKind::Array(a, _), TyKind::Slice(b)) => {
+                self.expect(*a, *b, e.span);
+            }
+            (TyKind::Closure(c, _), TyKind::FnPtr(ps, r)) => {
+                let Some(def) = self.closure_def(*c) else { return };
                 let (params, ret) = (def.params.clone(), def.ret);
                 if params.len() != ps.len() {
                     self.err(Diagnostic::new(
@@ -628,58 +598,56 @@ impl<'p> Checker<'p> {
                 }
                 self.expect(ret, *r, e.span);
             }
-            return;
-        }
-        if let (&TyKind::FnDef(f, ref args), TyKind::FnPtr(ps, r)) =
-            (self.kind(e.ty), self.kind(param_ty))
-        {
-            let (params, ret, ret_mode) = self.fn_params(f, args);
-            // A `fn(..)` type's parameters are borrowed and its result is owned.
-            if let Some(p) = params.iter().find(|p| p.mode != Mode::Borrow) {
-                let fname = &self.p.func(f).name;
-                self.err(
-                    Diagnostic::new(
+            (&TyKind::FnDef(f, ref args), TyKind::FnPtr(ps, r)) => {
+                let (params, ret, ret_mode) = self.fn_params(f, args);
+                // A `fn(..)` type's parameters are borrowed and its result is owned.
+                if let Some(p) = params.iter().find(|p| p.mode != Mode::Borrow) {
+                    let fname = &self.p.func(f).name;
+                    self.err(
+                        Diagnostic::new(
+                            codes::E0300,
+                            e.span,
+                            format!(
+                                "`{fname}` takes `{}` as `{}`, but a `fn(..)` passes its arguments by borrow",
+                                p.name,
+                                p.mode.keyword()
+                            ),
+                        )
+                        .with_help(format!("pass a closure that calls it: `|..| {fname}(..)`")),
+                    );
+                    return;
+                }
+                if ret_mode != RetMode::Owned {
+                    let fname = &self.p.func(f).name;
+                    self.err(Diagnostic::new(
+                        codes::E0300,
+                        e.span,
+                        format!("`{fname}` returns a projection, but a `fn(..)` returns a value"),
+                    ));
+                    return;
+                }
+                if params.len() != ps.len() {
+                    self.err(Diagnostic::new(
                         codes::E0300,
                         e.span,
                         format!(
-                            "`{fname}` takes `{}` as `{}`, but a `fn(..)` passes its arguments by borrow",
-                            p.name,
-                            p.mode.keyword()
+                            "`{}` takes {} arguments, but a function taking {} is expected",
+                            self.p.func(f).name,
+                            params.len(),
+                            ps.len()
                         ),
-                    )
-                    .with_help(format!("pass a closure that calls it: `|..| {fname}(..)`")),
-                );
-                return;
+                    ));
+                    return;
+                }
+                for (p, &pt) in params.iter().zip(ps) {
+                    self.expect(p.ty, pt, e.span);
+                }
+                self.expect(ret, *r, e.span);
             }
-            if ret_mode != RetMode::Owned {
-                let fname = &self.p.func(f).name;
-                self.err(Diagnostic::new(
-                    codes::E0300,
-                    e.span,
-                    format!("`{fname}` returns a projection, but a `fn(..)` returns a value"),
-                ));
-                return;
+            _ => {
+                self.expect(e.ty, param_ty, e.span);
             }
-            if params.len() != ps.len() {
-                self.err(Diagnostic::new(
-                    codes::E0300,
-                    e.span,
-                    format!(
-                        "`{}` takes {} arguments, but a function taking {} is expected",
-                        self.p.func(f).name,
-                        params.len(),
-                        ps.len()
-                    ),
-                ));
-                return;
-            }
-            for (p, &pt) in params.iter().zip(ps) {
-                self.expect(p.ty, pt, e.span);
-            }
-            self.expect(ret, *r, e.span);
-            return;
         }
-        self.expect(e.ty, param_ty, e.span);
     }
 
     fn call_variant(
@@ -724,7 +692,7 @@ impl<'p> Checker<'p> {
             ));
         }
         let mut fields = Vec::new();
-        for (i, (_, ft)) in ftys.iter().enumerate() {
+        for (i, ft) in ftys.iter().enumerate() {
             match args.get(i) {
                 Some(arg) => {
                     if let Some(n) = &arg.name {
@@ -742,19 +710,7 @@ impl<'p> Checker<'p> {
         for extra in args.iter().skip(ftys.len()) {
             self.check_expr(&extra.value, None);
         }
-        let order = (0..fields.len() as u32).collect();
-        Expr {
-            ty,
-            span,
-            kind: ExprKind::Adt {
-                adt: a,
-                args: gargs,
-                variant: Some(v),
-                fields,
-                order,
-                base: None,
-            },
-        }
+        variant_expr(ty, span, a, gargs, v, fields)
     }
 
     /// A built-in function. Arguments are checked first; then literals take the type the
@@ -854,18 +810,13 @@ impl<'p> Checker<'p> {
                 | BuiltinFn::Smoothstep
         ) && let Some(&v) = tys.iter().find(|&&t| matches!(self.p.types.kind(t), TyKind::Vec(_)))
         {
-            for (i, t) in tys.iter_mut().enumerate() {
-                if *t == self.p.types.f32 {
-                    // Splat the scalar argument.
-                    let n = match self.p.types.kind(v) {
-                        TyKind::Vec(n) => *n,
-                        _ => 4,
-                    };
-                    let x = xs[i].clone();
-                    let vt = self.p.types.vec(n);
-                    xs[i] = Expr { ty: vt, span: x.span, kind: ExprKind::Construct(vec![x]) };
-                    *t = vt;
-                }
+            let f32 = self.p.types.f32;
+            for (x, t) in xs.iter_mut().zip(&mut tys).filter(|(_, t)| **t == f32) {
+                // Splat the scalar argument.
+                let at = x.span;
+                let scalar = std::mem::replace(x, Expr { ty: v, span: at, kind: ExprKind::Error });
+                *x = Expr { ty: v, span: at, kind: ExprKind::Construct(vec![scalar]) };
+                *t = v;
             }
         }
         if tys.iter().any(|&t| matches!(self.p.types.kind(t), TyKind::Error)) {
@@ -887,20 +838,7 @@ impl<'p> Checker<'p> {
                 if b.cpu_impl().is_some() && ty == self.p.types.f64 {
                     self.err(crate::builtins::f64_math(b.name(), span));
                 }
-                let modes = vec![Mode::Borrow; xs.len()];
-                let n_args = xs.len();
-                Expr {
-                    ty,
-                    span,
-                    kind: ExprKind::Call(Call {
-                        callee: Callee::Builtin(b),
-                        args: xs,
-                        modes,
-                        order: (0..n_args).collect(),
-                        receiver: false,
-                        ret_mode: RetMode::Owned,
-                    }),
-                }
+                plain_call(Callee::Builtin(b), xs, false, ty, span)
             }
             Err(msg) => {
                 self.err(Diagnostic::new(codes::E0305, span, msg));
@@ -913,11 +851,7 @@ impl<'p> Checker<'p> {
     /// integer, `f32` for a float.
     pub(crate) fn literal_defaults(&self, t: TyId) -> TyId {
         let t = self.infer.resolve(&self.p.types, t);
-        self.p.types.map(t, &mut |types, x| match self.infer.var_kind(types, x) {
-            Some(VarKind::Int) => Some(types.i32),
-            Some(VarKind::Float) => Some(types.f32),
-            _ => None,
-        })
+        self.p.types.map(t, &mut |types, x| self.infer.literal_default(types, x))
     }
 
     /// `f32(x)` and friends convert; `vec3(...)` and `mat3(...)` construct.
@@ -1078,7 +1012,7 @@ impl<'p> Checker<'p> {
     fn construct_in_order(
         &mut self,
         ty: TyId,
-        comps: Vec<Option<Expr>>,
+        mut comps: Vec<Option<Expr>>,
         written: &[usize],
         span: Span,
     ) -> Expr {
@@ -1089,7 +1023,6 @@ impl<'p> Checker<'p> {
             let xs = comps.into_iter().map(|c| c.unwrap_or_else(|| zero.clone())).collect();
             return Expr { ty, span, kind: ExprKind::Construct(xs) };
         }
-        let mut comps: Vec<Option<Expr>> = comps;
         let mut stmts = Vec::new();
         for &i in written {
             let Some(e) = comps[i].take() else { continue };
@@ -1245,7 +1178,7 @@ impl<'p> Checker<'p> {
                     if traits::trait_method(self.p, b.trait_, name).is_some()
                         && !out.iter().any(|(t, ..)| *t == b.trait_)
                     {
-                        out.push((b.trait_, b.args.clone(), false));
+                        out.push((b.trait_, b.args, false));
                     }
                 }
             }
@@ -1341,27 +1274,18 @@ impl<'p> Checker<'p> {
             return self.call_builtin(b, Some(recv), args, span);
         }
         if matches!(self.p.types.kind(rt), TyKind::Var(_)) {
-            match self.infer.var_kind(&self.p.types, rt) {
-                Some(VarKind::Float) => {
-                    let f = self.p.types.f32;
-                    let _ = self.infer.unify(&self.p.types, rt, f);
-                }
-                Some(VarKind::Int) => {
-                    let i = self.p.types.i32;
-                    let _ = self.infer.unify(&self.p.types, rt, i);
-                }
-                _ => {
-                    self.err(
-                        Diagnostic::new(
-                            codes::E0306,
-                            recv.span,
-                            "the type of this must be known before calling a method on it",
-                        )
-                        .with_help("annotate its type: `let x: T = ...`"),
-                    );
-                    return self.failed_call(args, span);
-                }
-            }
+            let Some(default) = self.infer.literal_default(&self.p.types, rt) else {
+                self.err(
+                    Diagnostic::new(
+                        codes::E0306,
+                        recv.span,
+                        "the type of this must be known before calling a method on it",
+                    )
+                    .with_help("annotate its type: `let x: T = ...`"),
+                );
+                return self.failed_call(args, span);
+            };
+            let _ = self.infer.unify(&self.p.types, rt, default);
         }
         let rt = self.shallow(recv.ty);
         let pick = if let Some((f, impl_args)) = self.find_inherent(rt, &name.name, name.span) {
@@ -1453,25 +1377,7 @@ impl<'p> Checker<'p> {
         explicit: Option<&[ast::TypeExpr]>,
         span: Span,
     ) -> Vec<TyId> {
-        let own = &self.p.func(f).generics;
-        let fresh = |this: &mut Self| -> Vec<TyId> {
-            own.iter().map(|_| this.new_var(VarKind::General, span)).collect()
-        };
-        let Some(given) = explicit else { return fresh(self) };
-        // Implicit parameters (from `x: Trait`) can't be named; only declared ones count.
-        let declared: Vec<usize> =
-            (0..own.len()).filter(|&i| !self.p.param(own[i]).name.starts_with("impl ")).collect();
-        if given.len() != declared.len() {
-            let (name, want) = (&self.p.func(f).name, declared.len());
-            let s = wrela_diag::plural(want);
-            self.err(resolve::wrong_generic_count(span, name, want, given.len(), s));
-            return fresh(self);
-        }
-        let mut out: Vec<Option<TyId>> = vec![None; own.len()];
-        for (&i, t) in declared.iter().zip(given) {
-            out[i] = Some(self.resolve_type(t));
-        }
-        out.into_iter().map(|t| t.unwrap_or_else(|| self.new_var(VarKind::General, span))).collect()
+        self.generic_args(f, &self.p.func(f).generics, explicit, span)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1534,18 +1440,7 @@ impl<'p> Checker<'p> {
                         "`.clone()`".into(),
                     );
                 }
-                Expr {
-                    ty: rt,
-                    span,
-                    kind: ExprKind::Call(Call {
-                        callee: Callee::Clone,
-                        args: vec![recv],
-                        modes: vec![Mode::Borrow],
-                        order: vec![0],
-                        receiver: true,
-                        ret_mode: RetMode::Owned,
-                    }),
-                }
+                plain_call(Callee::Clone, vec![recv], true, rt, span)
             }
         }
     }
@@ -1798,22 +1693,19 @@ impl<'p> Checker<'p> {
             );
             return self.error_expr(span);
         };
-        let mut out = Vec::new();
         for (k, g) in given.iter().enumerate() {
-            match g {
-                Some(_) => {}
-                None => {
-                    self.err(Diagnostic::new(
-                        codes::E0603,
-                        span,
-                        format!(
-                            "this dispatch doesn't pass `{}`'s parameter `{}`",
-                            kname, user[k].1.name
-                        ),
-                    ));
-                }
+            if g.is_none() {
+                self.err(Diagnostic::new(
+                    codes::E0603,
+                    span,
+                    format!(
+                        "this dispatch doesn't pass `{}`'s parameter `{}`",
+                        kname, user[k].1.name
+                    ),
+                ));
             }
         }
+        let mut out = Vec::new();
         for k in written {
             if let Some(e) = given[k].take() {
                 out.push((user[k].0, e));
@@ -1949,6 +1841,15 @@ impl<'p> Checker<'p> {
         let d = Draw { vertex: vs, fragment: fs, vertices, instances, args: out, counts_at };
         Expr { ty: unit, span, kind: ExprKind::Draw(Box::new(d)) }
     }
+}
+
+/// A call that borrows each argument, evaluates them in order, and returns a value.
+fn plain_call(callee: Callee, args: Vec<Expr>, receiver: bool, ty: TyId, span: Span) -> Expr {
+    let n = args.len();
+    let modes = vec![Mode::Borrow; n];
+    let call =
+        Call { callee, args, modes, order: (0..n).collect(), receiver, ret_mode: RetMode::Owned };
+    Expr { ty, span, kind: ExprKind::Call(call) }
 }
 
 /// For a number literal, possibly negated or parenthesized: whether it's negative.

@@ -177,20 +177,17 @@ impl<'p> Checker<'p> {
             }
             ast::ExprKind::Return(value) => self.check_return(value.as_deref(), span),
             ast::ExprKind::Break | ast::ExprKind::Continue => {
+                let (what, kind) = match e.kind {
+                    ast::ExprKind::Break => ("break", ExprKind::Break),
+                    _ => ("continue", ExprKind::Continue),
+                };
                 if !self.in_loop() {
-                    let what =
-                        if matches!(e.kind, ast::ExprKind::Break) { "break" } else { "continue" };
                     self.err(Diagnostic::new(
                         codes::E0315,
                         span,
                         format!("`{what}` outside a loop"),
                     ));
                 }
-                let kind = if matches!(e.kind, ast::ExprKind::Break) {
-                    ExprKind::Break
-                } else {
-                    ExprKind::Continue
-                };
                 Expr { ty: self.p.types.never, span, kind }
             }
             ast::ExprKind::Error => {
@@ -224,9 +221,9 @@ impl<'p> Checker<'p> {
                         return self.error_expr(span);
                     }
                 };
-                let ty = match expected.map(|t| self.kind(t)) {
-                    Some(TyKind::Int(_) | TyKind::Float(_)) => {
-                        self.shallow(expected.unwrap_or(self.p.types.error))
+                let ty = match expected {
+                    Some(t) if matches!(self.kind(t), TyKind::Int(_) | TyKind::Float(_)) => {
+                        self.shallow(t)
                     }
                     _ => self.new_var(VarKind::Int, span),
                 };
@@ -234,8 +231,8 @@ impl<'p> Checker<'p> {
                 Expr { ty, span, kind: ExprKind::Lit(Lit::Int(i128::from(v))) }
             }
             ast::LitKind::Float(v) => {
-                let ty = match expected.map(|t| self.kind(t)) {
-                    Some(TyKind::Float(_)) => self.shallow(expected.unwrap_or(self.p.types.error)),
+                let ty = match expected {
+                    Some(t) if matches!(self.kind(t), TyKind::Float(_)) => self.shallow(t),
                     _ => self.new_var(VarKind::Float, span),
                 };
                 self.float_literals.push((ty, v, span));
@@ -383,29 +380,14 @@ impl<'p> Checker<'p> {
                 Expr { ty: self.locals[l.index()].ty, span, kind: ExprKind::Local(l) }
             }
             ValueRes::Item(Res::Const(c)) => {
-                let ty = match self.p.const_(c).ty {
-                    Some(t) => t,
-                    None => self.const_tys.get(&c).copied().unwrap_or(self.p.types.error),
-                };
-                Expr { ty, span, kind: ExprKind::Const(c) }
+                Expr { ty: self.const_ty(c), span, kind: ExprKind::Const(c) }
             }
             ValueRes::Item(Res::Variant(a, v)) => {
                 let variant = &self.p.adt(a).variants()[v as usize];
                 let args = self.adt_args(a, path, expected, span);
                 let ty = self.p.types.adt(a, args.clone());
                 match variant.shape {
-                    VariantShape::Unit => Expr {
-                        ty,
-                        span,
-                        kind: ExprKind::Adt {
-                            adt: a,
-                            args,
-                            variant: Some(v),
-                            fields: Vec::new(),
-                            order: Vec::new(),
-                            base: None,
-                        },
-                    },
+                    VariantShape::Unit => variant_expr(ty, span, a, args, v, Vec::new()),
                     VariantShape::Tuple => {
                         self.err(
                             Diagnostic::new(
@@ -523,18 +505,7 @@ impl<'p> Checker<'p> {
                         self.p.adt(a).variants().iter().position(|v| v.name == name.name)
                     && self.p.adt(a).variants()[v].shape == VariantShape::Unit
                 {
-                    return Expr {
-                        ty,
-                        span,
-                        kind: ExprKind::Adt {
-                            adt: a,
-                            args: args.clone(),
-                            variant: Some(v as u32),
-                            fields: Vec::new(),
-                            order: Vec::new(),
-                            base: None,
-                        },
-                    };
+                    return variant_expr(ty, span, a, args.clone(), v as u32, Vec::new());
                 }
                 // An enum without that variant or method: say so, rather than that it must be
                 // called.
@@ -597,42 +568,55 @@ impl<'p> Checker<'p> {
             Some(g) if g.len() == n => g.iter().map(|t| self.resolve_type(t)).collect(),
             Some(g) => {
                 let name = &self.p.adt(a).name;
-                self.err(resolve::wrong_generic_count(span, name, n, g.len(), "s"));
+                self.err(resolve::wrong_generic_count(span, name, n, g.len()));
                 (0..n).map(|_| self.p.types.error).collect()
             }
             None => (0..n).map(|_| self.new_var(VarKind::General, span)).collect(),
         };
-        if let Some(e) = expected {
+        if let Some(e) = expected
+            && let &TyKind::Adt(b, _) = self.kind(e)
+            && b == a
+        {
             let ty = self.p.types.adt(a, args.clone());
-            if let &TyKind::Adt(b, _) = self.kind(e)
-                && b == a
-            {
-                let _ = self.infer.unify(&self.p.types, ty, e);
-            }
+            let _ = self.infer.unify(&self.p.types, ty, e);
         }
         args
     }
 
     /// Fresh variables (or turbofish types) for all of a function's generics.
     pub(crate) fn fresh_fn_args(&mut self, f: FnId, path: &ast::Path, span: Span) -> Vec<TyId> {
-        let all = self.p.fn_all_generics(f);
-        let own = &self.p.func(f).generics;
         let explicit = path.segments.last().and_then(|s| s.generics.as_deref());
-        let mut given: Vec<Option<TyId>> = vec![None; all.len()];
+        self.generic_args(f, &self.p.fn_all_generics(f), explicit, span)
+    }
+
+    /// Arguments for `params`, which hold `f`'s own generics: the types given with `::<...>`
+    /// for its declared ones, in order, and fresh variables for the rest (all of them when no
+    /// types are given, or the wrong number).
+    pub(crate) fn generic_args(
+        &mut self,
+        f: FnId,
+        params: &[ParamId],
+        explicit: Option<&[ast::TypeExpr]>,
+        span: Span,
+    ) -> Vec<TyId> {
+        let p = self.p;
+        let mut given: Vec<Option<TyId>> = vec![None; params.len()];
         if let Some(g) = explicit {
             // Implicit parameters (from `x: Trait`) can't be named; only declared ones count.
-            let declared: Vec<ParamId> = own
+            let declared: Vec<ParamId> = p
+                .func(f)
+                .generics
                 .iter()
                 .copied()
-                .filter(|p| !self.p.param(*p).name.starts_with("impl "))
+                .filter(|&q| !p.param(q).name.starts_with("impl "))
                 .collect();
             if g.len() != declared.len() {
-                let name = &self.p.func(f).name;
-                self.err(resolve::wrong_generic_count(span, name, declared.len(), g.len(), "s"));
+                let name = &p.func(f).name;
+                self.err(resolve::wrong_generic_count(span, name, declared.len(), g.len()));
             } else {
-                for (p, t) in declared.iter().zip(g) {
+                for (q, t) in declared.iter().zip(g) {
                     let ty = self.resolve_type(t);
-                    if let Some(i) = all.iter().position(|q| q == p) {
+                    if let Some(i) = params.iter().position(|x| x == q) {
                         given[i] = Some(ty);
                     }
                 }
@@ -734,10 +718,7 @@ impl<'p> Checker<'p> {
             }
         };
         // Literals on the left take the right's type: `2 * x`.
-        let ty = match self.binary_result(op, ea.ty, eb.ty, span) {
-            Some(t) => t,
-            None => self.p.types.error,
-        };
+        let ty = self.binary_result(op, ea.ty, eb.ty, span).unwrap_or(self.p.types.error);
         Expr { ty, span, kind: ExprKind::Binary(op, Box::new(ea), Box::new(eb)) }
     }
 
@@ -1304,7 +1285,7 @@ impl<'p> Checker<'p> {
                 ));
                 continue;
             }
-            let fty = field_tys[i].1;
+            let fty = field_tys[i];
             let value = match &f.value {
                 Some(v) => self.check_expr(v, Some(fty)),
                 None => {
@@ -1327,13 +1308,13 @@ impl<'p> Checker<'p> {
                 Some(e) => out.push(e),
                 None => {
                     if let Some(b) = &base_expr {
-                        let fty = field_tys[i].1;
+                        let fty = field_tys[i];
                         out.push(Expr { ty: fty, span: b.span, kind: ExprKind::FromBase });
                     } else if let Some(d) = &decls[i].default {
-                        out.push(self.check_default(d, field_tys[i].1, adt_mod));
+                        out.push(self.check_default(d, field_tys[i], adt_mod));
                         order.push(i as u32);
                     } else {
-                        missing.push((decls[i].name.clone(), field_tys[i].1));
+                        missing.push((decls[i].name.clone(), field_tys[i]));
                         out.push(self.error_expr(span));
                     }
                 }
@@ -1561,5 +1542,22 @@ impl<'p> Checker<'p> {
             }
             None => Vec::new(),
         }
+    }
+}
+
+/// A value of variant `v` of the enum `adt`, with `fields` in declared order.
+pub(super) fn variant_expr(
+    ty: TyId,
+    span: Span,
+    adt: AdtId,
+    args: Vec<TyId>,
+    v: u32,
+    fields: Vec<Expr>,
+) -> Expr {
+    let order = (0..fields.len() as u32).collect();
+    Expr {
+        ty,
+        span,
+        kind: ExprKind::Adt { adt, args, variant: Some(v), fields, order, base: None },
     }
 }

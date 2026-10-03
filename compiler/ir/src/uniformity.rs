@@ -74,7 +74,7 @@ impl Analysis<'_> {
             return Summary { ret: true, params: vec![true; args.len()] };
         }
         path.push(g);
-        let state = State { locals: vec![cf; f.locals.len()], params: args };
+        let mut st = State { locals: vec![cf; f.locals.len()], params: args };
         let mut fa = Fa {
             an: self,
             id: g,
@@ -85,7 +85,6 @@ impl Analysis<'_> {
             ret: false,
             ret_state: None,
         };
-        let mut st = state;
         let (beh, _) = fa.block(&f.body, cf, &mut st);
         if beh & NEXT != 0 {
             join(&mut fa.ret_state, &st);
@@ -255,7 +254,7 @@ impl Fa<'_, '_> {
                 again.0 |= cfc;
                 again.1.join(&c);
             }
-            if again == (head_cf, head.clone()) {
+            if again.0 == head_cf && again.1 == head {
                 break bb;
             }
             (head_cf, head) = again;
@@ -309,7 +308,6 @@ impl Fa<'_, '_> {
         };
         match e {
             Expr::Load(p) => cf || self.place(p, st),
-            Expr::ArrayLength(_) => operands(self),
             Expr::EntryInput(i) => {
                 cf || !matches!(
                     self.an.inputs.get(*i as usize),

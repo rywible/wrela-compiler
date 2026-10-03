@@ -1,0 +1,10 @@
+// mistake: more types after `::<` than the function or type has generic parameters
+// expect: E0322 E0322
+fn first<T: Copy>(x: T) -> T {
+    x
+}
+
+fn f() -> f32 {
+    let none = Option::<f32, f32>::None
+    first::<f32, f32>(1.0)
+}

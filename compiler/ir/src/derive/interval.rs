@@ -69,7 +69,7 @@ pub(super) fn interval(
     let mut mask = vec![false; func.params.len()];
     mask[xi] = true;
     let d = derive(m, cache, f, mask.clone(), target, false)?;
-    let returns = returns_active(m, cache, f, mask, Mode::Interval)?;
+    let returns = returns_active(m, cache, f, mask, Mode::Interval);
 
     let mut params = func.params[..xi].to_vec();
     params.push(Param { name: "over".into(), ty: box_ty, by_ref: false, mutable: false });
@@ -154,21 +154,15 @@ fn derive(
         return Ok(d);
     }
     let orig = m.functions[f.index()].clone();
-    if let Some(at) = records_gpu_work(&orig.body, None) {
-        return Err(Error::not_derivable(
-            "this records GPU work, which a derived function can't do",
-        )
-        .at(at));
-    }
+    no_gpu_work(&orig.body)?;
     let exit = single_exit(m, &orig);
-    let returns = returns_active(m, cache, f, mask.clone(), Mode::Interval)?;
+    let returns = returns_active(m, cache, f, mask.clone(), Mode::Interval);
     let (func, result, act) = match exit {
-        None => (orig, None, body_activity(m, cache, f, &mask, Mode::Interval)?),
+        None => (orig, None, body_activity(m, cache, f, &mask, Mode::Interval)),
         Some((func, result)) => {
-            let mm: &Module = m;
-            let act = activity(mm, &func, &mask, Mode::Interval, &mut |g, mk| {
-                effect(mm, cache, g, mk, Mode::Interval)
-            })?;
+            let act = activity(m, &func, &mask, Mode::Interval, &mut |g, mk| {
+                effect(m, cache, g, mk, Mode::Interval)
+            });
             (func, result, act)
         }
     };
@@ -180,15 +174,7 @@ fn derive(
             at,
         ));
     }
-    for (i, p) in func.params.iter().enumerate() {
-        if act.params[i] && !mask[i] && p.mutable {
-            // Placed by the caller's statement (the call), or at the `interval(..)` call.
-            return Err(Error::not_derivable(format!(
-                "this would write a range through the `mut` parameter `{}`",
-                p.name
-            )));
-        }
-    }
+    no_write_through_mut(&func, &act, &mask, "a range")?;
     let mut nf = func.clone_signature();
     nf.name = format!("{}_iv", func.name);
     // A range's `lo` takes the original's slot, as a range type.
@@ -271,10 +257,6 @@ fn derive(
 
 /// What [`Ivx::leaves`] applies to each leaf.
 type LeafFn<'f, 'a> = dyn FnMut(&mut Ivx<'a>, &mut Block, TypeId, &[ValueId]) -> R<ValueId> + 'f;
-
-/// A bound rule for one scalar operation (or one vector operation, where it works
-/// componentwise).
-type Rule<'a> = fn(&mut Ivx<'a>, &mut Block, TypeId, &[Iv]) -> R<Iv>;
 
 struct Ivx<'a> {
     m: &'a mut Module,
@@ -825,14 +807,11 @@ impl<'a> Ivx<'a> {
     fn call_fn(&mut self, v: Option<ValueId>, g: FuncId, args: &[Arg], out: &mut Block) -> R<()> {
         let mask: Vec<bool> = args.iter().map(|a| arg_active(&self.act, a)).collect();
         if !mask.iter().any(|b| *b) {
-            out.push(match v {
-                Some(v) => Stmt::Let(v, Expr::Call(g, args.to_vec())),
-                None => Stmt::Eval(Expr::Call(g, args.to_vec())),
-            });
+            out.push(let_or_eval(v, Expr::Call(g, args.to_vec())));
             return Ok(());
         }
         let dg = derive(self.m, self.cache, g, mask.clone(), self.target, self.speculative > 0)?;
-        let returns = returns_active(self.m, self.cache, g, mask.clone(), Mode::Interval)?;
+        let returns = returns_active(self.m, self.cache, g, mask.clone(), Mode::Interval);
         let mut new_args = Vec::new();
         let mut his = Vec::new();
         for (a, active) in args.iter().zip(&mask) {
@@ -863,8 +842,7 @@ impl<'a> Ivx<'a> {
                 let hi = self.emit(out, ty, Expr::Extract(r, 1));
                 self.iv.insert(v, (lo, hi));
             }
-            (Some(v), false) => out.push(Stmt::Let(v, Expr::Call(dg, new_args))),
-            (None, _) => out.push(Stmt::Eval(Expr::Call(dg, new_args))),
+            (v, _) => out.push(let_or_eval(v, Expr::Call(dg, new_args))),
         }
         Ok(())
     }
@@ -984,11 +962,8 @@ impl<'a> Ivx<'a> {
         }
         let mut ranges = HashMap::new();
         e.for_each_value(&mut |x| {
-            ranges.insert(x, (x, x));
+            ranges.entry(x).or_insert_with(|| self.lifted(out, x));
         });
-        for (x, r) in ranges.iter_mut() {
-            *r = self.lifted(out, *x);
-        }
         let mut ends = [e.clone(), e.clone()];
         for (i, end) in ends.iter_mut().enumerate() {
             end.for_each_value_mut(&mut |x| *x = if i == 0 { ranges[x].0 } else { ranges[x].1 });
@@ -1053,17 +1028,16 @@ impl<'a> Ivx<'a> {
         let (lo, hi) = self.range(x);
         let s = self.elem(ty);
         Ok(match op {
-            // Negation and bitwise not reverse the order exactly.
-            UnOp::Neg if s.is_float() => {
+            UnOp::Neg if !s.is_float() => {
+                self.exact_or_full(out, ty, &[(lo, hi)], &mut |me, out, xs| {
+                    let z = me.emit(out, ty, Expr::Zero(ty));
+                    me.bin(out, BinOp::WrappingSub, z, xs[0], ty)
+                })
+            }
+            // Float negation and bitwise not reverse the order exactly.
+            UnOp::Neg | UnOp::Not => {
                 (self.emit(out, ty, Expr::Unary(op, hi)), self.emit(out, ty, Expr::Unary(op, lo)))
             }
-            UnOp::Not => {
-                (self.emit(out, ty, Expr::Unary(op, hi)), self.emit(out, ty, Expr::Unary(op, lo)))
-            }
-            UnOp::Neg => self.exact_or_full(out, ty, &[(lo, hi)], &mut |me, out, xs| {
-                let z = me.emit(out, ty, Expr::Zero(ty));
-                me.bin(out, BinOp::WrappingSub, z, xs[0], ty)
-            }),
         })
     }
 
@@ -1199,8 +1173,15 @@ impl<'a> Ivx<'a> {
         self.builtin(out, Builtin::Max, vec![l, h], ty)
     }
 
-    /// Applies a scalar rule to each component of a vector (scalar operands are shared).
-    fn per_comp(&mut self, out: &mut Block, ty: TypeId, args: &[Iv], rule: Rule<'a>) -> R<Iv> {
+    /// Applies a bound rule for one scalar operation to each component of a vector (scalar
+    /// operands are shared).
+    fn per_comp(
+        &mut self,
+        out: &mut Block,
+        ty: TypeId,
+        args: &[Iv],
+        mut rule: impl FnMut(&mut Self, &mut Block, TypeId, &[Iv]) -> R<Iv>,
+    ) -> R<Iv> {
         let TypeDef::Vector(n) = *self.m.types.get(ty) else {
             return rule(self, out, ty, args);
         };
@@ -1267,10 +1248,8 @@ impl<'a> Ivx<'a> {
     fn compare(&mut self, out: &mut Block, op: BinOp, a: Iv, b: Iv, s: Scalar) -> Iv {
         let ordered = s != Scalar::Bool;
         match op {
-            BinOp::Lt => (self.cmp(out, op, a.1, b.0), self.cmp(out, op, a.0, b.1)),
-            BinOp::Le => (self.cmp(out, op, a.1, b.0), self.cmp(out, op, a.0, b.1)),
-            BinOp::Gt => (self.cmp(out, op, a.0, b.1), self.cmp(out, op, a.1, b.0)),
-            BinOp::Ge => (self.cmp(out, op, a.0, b.1), self.cmp(out, op, a.1, b.0)),
+            BinOp::Lt | BinOp::Le => (self.cmp(out, op, a.1, b.0), self.cmp(out, op, a.0, b.1)),
+            BinOp::Gt | BinOp::Ge => (self.cmp(out, op, a.0, b.1), self.cmp(out, op, a.1, b.0)),
             BinOp::Eq | BinOp::Ne => {
                 let bt = self.bool_ty();
                 let sa = self.cmp(out, BinOp::Eq, a.0, a.1);
@@ -1383,10 +1362,12 @@ impl<'a> Ivx<'a> {
                     self.widen(out, x, ty, CPU_STD_ULPS, 0.0)
                 }
             }
-            B::Log => self.per_comp(out, ty, &r, Self::log)?,
-            B::Log2 => self.per_comp(out, ty, &r, Self::log2)?,
+            B::Log | B::Log2 => {
+                self.per_comp(out, ty, &r, |s, out, ty, x| Ok(s.log_ends(out, b, x[0], ty)))?
+            }
             B::Pow => self.per_comp(out, ty, &r, Self::pow)?,
-            B::Sin | B::Cos => self.per_comp(out, ty, &r, Self::sin_cos_rule(b))?,
+            B::Sin => self.per_comp(out, ty, &r, Self::sin)?,
+            B::Cos => self.per_comp(out, ty, &r, Self::cos)?,
             B::Tan => self.per_comp(out, ty, &r, Self::tan)?,
             B::Asin | B::Acos | B::Atan => {
                 let one = self.fc(out, ty, 1.0);
@@ -1543,14 +1524,6 @@ impl<'a> Ivx<'a> {
         Ok(self.widen(out, (lo, hi), ty, ulps, 0.0))
     }
 
-    fn log(&mut self, out: &mut Block, ty: TypeId, x: &[Iv]) -> R<Iv> {
-        Ok(self.log_ends(out, Builtin::Log, x[0], ty))
-    }
-
-    fn log2(&mut self, out: &mut Block, ty: TypeId, x: &[Iv]) -> R<Iv> {
-        Ok(self.log_ends(out, Builtin::Log2, x[0], ty))
-    }
-
     fn pow(&mut self, out: &mut Block, ty: TypeId, x: &[Iv]) -> R<Iv> {
         let (a, b) = (x[0], x[1]);
         let z = self.fc(out, ty, 0.0);
@@ -1607,10 +1580,6 @@ impl<'a> Ivx<'a> {
         self.widen_k(out, e, ty, (ml, mh), k, 0.0)
     }
 
-    fn sin_cos_rule(b: Builtin) -> Rule<'a> {
-        if b == Builtin::Sin { Self::sin } else { Self::cos }
-    }
-
     fn sin(&mut self, out: &mut Block, ty: TypeId, x: &[Iv]) -> R<Iv> {
         // Peaks at π/2 + 2πk, troughs at -π/2 + 2πk.
         let h = std::f64::consts::FRAC_PI_2;
@@ -1637,15 +1606,9 @@ impl<'a> Ivx<'a> {
         let e0 = self.builtin(out, b, vec![x.0], ty);
         let e1 = self.builtin(out, b, vec![x.1], ty);
         let (lo, hi) = self.extremes(out, &[e0, e1], ty);
-        // Slack for the test, so a near miss counts as inside (sound: ±1 is a bound).
-        let m = self.magnitude(out, x, ty);
-        let k = self.fc(out, ty, (2f64).powi(-18));
-        let c = self.fc(out, ty, (2f64).powi(-10));
-        let slack = self.bin(out, BinOp::Mul, m, k, ty);
-        let slack = self.bin(out, BinOp::Add, slack, c, ty);
-        let xl = self.bin(out, BinOp::Sub, x.0, slack, ty);
-        let xh = self.bin(out, BinOp::Add, x.1, slack, ty);
-        let hits = [peak, trough].map(|at| self.lattice_hit(out, ty, (xl, xh), at, tau));
+        // A near miss counts as inside (sound: ±1 is a bound).
+        let (m, near) = self.with_slack(out, x, ty);
+        let hits = [peak, trough].map(|at| self.lattice_hit(out, ty, near, at, tau));
         // Far out, or a whole period wide: everything.
         let wide = self.bin(out, BinOp::Sub, x.1, x.0, ty);
         let tc = self.fc(out, ty, tau);
@@ -1665,6 +1628,19 @@ impl<'a> Ivx<'a> {
         } else {
             self.widen(out, (lo, hi), ty, CPU_STD_ULPS, 0.0)
         })
+    }
+
+    /// The largest magnitude in `x`, and `x` widened by slack for a test that rounds in f32
+    /// ([`lattice_hit`](Self::lattice_hit)), so that a near miss counts as a hit.
+    fn with_slack(&mut self, out: &mut Block, x: Iv, ty: TypeId) -> (ValueId, Iv) {
+        let m = self.magnitude(out, x, ty);
+        let k = self.fc(out, ty, (2f64).powi(-18));
+        let c = self.fc(out, ty, (2f64).powi(-10));
+        let slack = self.bin(out, BinOp::Mul, m, k, ty);
+        let slack = self.bin(out, BinOp::Add, slack, c, ty);
+        let xl = self.bin(out, BinOp::Sub, x.0, slack, ty);
+        let xh = self.bin(out, BinOp::Add, x.1, slack, ty);
+        (m, (xl, xh))
     }
 
     /// Whether there's an integer `n` with `x.0 <= at + period n <= x.1`.
@@ -1696,16 +1672,9 @@ impl<'a> Ivx<'a> {
             self.builtin(out, Builtin::Tan, vec![x.1], ty),
         );
         let e = self.widen(out, e, ty, CPU_STD_ULPS, 0.0);
-        // Slack for the test, which rounds in f32, so a near miss counts as a pole (as in
-        // `periodic`); far out, everything.
-        let m = self.magnitude(out, x, ty);
-        let k = self.fc(out, ty, (2f64).powi(-18));
-        let c = self.fc(out, ty, (2f64).powi(-10));
-        let slack = self.bin(out, BinOp::Mul, m, k, ty);
-        let slack = self.bin(out, BinOp::Add, slack, c, ty);
-        let xl = self.bin(out, BinOp::Sub, x.0, slack, ty);
-        let xh = self.bin(out, BinOp::Add, x.1, slack, ty);
-        let pole = self.lattice_hit(out, ty, (xl, xh), pi / 2.0, pi);
+        // A near miss counts as a pole (as in `periodic`); far out, everything.
+        let (m, near) = self.with_slack(out, x, ty);
+        let pole = self.lattice_hit(out, ty, near, pi / 2.0, pi);
         let far_c = self.fc(out, ty, (2f64).powi(19));
         let far = self.cmp(out, BinOp::Gt, m, far_c);
         // Ends out of order can only straddle a pole.

@@ -14,8 +14,7 @@
 //! leave a program that compiles. `WRELA_BLESS=1` rewrites the goldens.
 
 use crate::package;
-use std::path::Path;
-use wrela_tests::{apply_fixes, cases, header, repo_root};
+use wrela_tests::{apply_fixes, cases, files_under, header, repo_root};
 
 struct Outcome {
     codes: Vec<String>,
@@ -103,20 +102,15 @@ fn diagnostics_meet_the_bar() {
 /// The goldens can only be what the compiler prints: they're its JSON, and parse as such.
 #[test]
 fn goldens_are_versioned_json() {
-    let dir: &Path = &repo_root().join("compiler/tests/diagnostics");
-    for e in std::fs::read_dir(dir).expect("dir") {
-        let p = e.expect("entry").path();
-        if p.extension().is_some_and(|x| x == "json") {
-            let text = std::fs::read_to_string(&p).expect("read");
-            // The top level's keys, two spaces in: `"version"` is one of them.
-            assert!(
-                text.lines()
-                    .any(|l| l == format!("  \"version\": {}", wrela_diag::json::JSON_VERSION)),
-                "{}: not version {} JSON",
-                p.display(),
-                wrela_diag::json::JSON_VERSION
-            );
-        }
+    for p in files_under(&repo_root().join("compiler/tests/diagnostics"), &["json"]) {
+        let text = std::fs::read_to_string(&p).expect("read");
+        // The top level's keys, two spaces in: `"version"` is one of them.
+        assert!(
+            text.lines().any(|l| l == format!("  \"version\": {}", wrela_diag::json::JSON_VERSION)),
+            "{}: not version {} JSON",
+            p.display(),
+            wrela_diag::json::JSON_VERSION
+        );
     }
 }
 

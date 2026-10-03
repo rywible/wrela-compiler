@@ -87,19 +87,14 @@ impl<'p> Checker<'p> {
                     {
                         return self.variant_pat(a, v, span, ty);
                     }
-                    Some(Res::Const(c)) => match self.const_pat(c, ty, name.span) {
-                        Some(l) => PatKind::Lit(l),
-                        None => PatKind::Wild,
-                    },
+                    Some(Res::Const(c)) => {
+                        self.const_pat(c, ty, name.span).map_or(PatKind::Wild, PatKind::Lit)
+                    }
                     _ => PatKind::Bind(self.declare_binding(name, ty, from_place)),
                 }
             }
             ast::PatKind::Lit { neg, lit } => {
-                let e = self.check_lit_pattern(*neg, lit, ty);
-                match e {
-                    Some(l) => PatKind::Lit(l),
-                    None => PatKind::Wild,
-                }
+                self.check_lit_pattern(*neg, lit, ty).map_or(PatKind::Wild, PatKind::Lit)
             }
             ast::PatKind::Tuple(ps) => {
                 let tys = match self.kind(ty) {
@@ -218,11 +213,14 @@ impl<'p> Checker<'p> {
 
     /// A constant used as a pattern: its value, which must be a number or a `bool`.
     fn const_pat(&mut self, c: ConstId, ty: TyId, span: Span) -> Option<Lit> {
-        let ct = match self.p.const_(c).ty {
-            Some(t) => t,
-            None => self.const_tys.get(&c).copied().unwrap_or(self.p.types.error),
-        };
+        let ct = self.const_ty(c);
         self.expect(ct, ty, span);
+        let p = self.p;
+        let not_a_number = || {
+            let name = &p.const_(c).name;
+            let msg = format!("`{name}` can't be a pattern: only a number or `bool` constant can");
+            Diagnostic::new(codes::E0320, span, msg)
+        };
         // Follow constants naming constants (cycles are reported where they're defined).
         let mut seen = vec![c];
         let mut cur = c;
@@ -252,17 +250,8 @@ impl<'p> Checker<'p> {
                         Some(Res::Variant(..)) => {
                             let names: Vec<&str> =
                                 path.segments.iter().map(|s| s.ident.name.as_str()).collect();
-                            self.err(
-                                Diagnostic::new(
-                                    codes::E0320,
-                                    span,
-                                    format!(
-                                        "`{}` can't be a pattern: only a number or `bool` constant can",
-                                        self.p.const_(c).name
-                                    ),
-                                )
-                                .with_help(format!("match the variant itself: `{}`", names.join("::"))),
-                            );
+                            let help = format!("match the variant itself: `{}`", names.join("::"));
+                            self.err(not_a_number().with_help(help));
                             return None;
                         }
                         // Its error is reported where the constant is defined.
@@ -270,17 +259,8 @@ impl<'p> Checker<'p> {
                     }
                 }
                 _ => {
-                    self.err(
-                        Diagnostic::new(
-                            codes::E0320,
-                            span,
-                            format!(
-                                "`{}` can't be a pattern: only a number or `bool` constant can",
-                                self.p.const_(c).name
-                            ),
-                        )
-                        .with_help("match its parts, or compare with `==` in a guard"),
-                    );
+                    let help = "match its parts, or compare with `==` in a guard";
+                    self.err(not_a_number().with_help(help));
                     return None;
                 }
             }
@@ -439,7 +419,7 @@ impl<'p> Checker<'p> {
             .iter()
             .zip(ftys)
             .enumerate()
-            .map(|(i, (p, (_, t)))| (i as u32, self.check_pat(p, t, from_place)))
+            .map(|(i, (p, t))| (i as u32, self.check_pat(p, t, from_place)))
             .collect();
         Pat { ty, kind: PatKind::Adt { adt: a, args, variant: Some(v), fields }, span }
     }
@@ -499,10 +479,10 @@ impl<'p> Checker<'p> {
                 );
             }
             let sub = match &f.pat {
-                Some(p) => self.check_pat(p, ftys[i].1, from_place),
+                Some(p) => self.check_pat(p, ftys[i], from_place),
                 None => {
-                    let id = self.declare_binding(&f.name, ftys[i].1, from_place);
-                    Pat { ty: ftys[i].1, kind: PatKind::Bind(id), span: f.name.span }
+                    let id = self.declare_binding(&f.name, ftys[i], from_place);
+                    Pat { ty: ftys[i], kind: PatKind::Bind(id), span: f.name.span }
                 }
             };
             out.push((i as u32, sub));
@@ -721,14 +701,11 @@ fn ctors(p: &Program, ty: TyId) -> Option<Vec<Ctor>> {
 
 /// The field types of constructor `k` of `ty`; none when `ty` has no such constructor.
 fn ctor_fields(p: &Program, ty: TyId, k: &Ctor) -> Vec<TyId> {
-    let fields = |a: AdtId, args: &[TyId], v| p.fields_of(a, args, v).into_iter().map(|(_, t)| t);
     match (p.types.kind(ty), k) {
         (TyKind::Tuple(ts), Ctor::Single) => ts.clone(),
-        (TyKind::Adt(a, args), Ctor::Single) if !p.adt(*a).is_enum() => {
-            fields(*a, args, None).collect()
-        }
+        (TyKind::Adt(a, args), Ctor::Single) if !p.adt(*a).is_enum() => p.fields_of(*a, args, None),
         (TyKind::Adt(a, args), Ctor::Variant(v)) if (*v as usize) < p.adt(*a).variants().len() => {
-            fields(*a, args, Some(*v)).collect()
+            p.fields_of(*a, args, Some(*v))
         }
         _ => Vec::new(),
     }

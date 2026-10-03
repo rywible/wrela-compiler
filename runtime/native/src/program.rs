@@ -123,15 +123,7 @@ pub(crate) fn check_abi(module: &Module) -> Result<()> {
                 "it imports `{m}.{n}`, but a wrela program may import only `{IMPORT_MODULE}.{IMPORT_SUBMIT}`"
             )));
         }
-        let ok = match import.ty() {
-            ExternType::Func(f) => {
-                f.params().all(|p| matches!(p, ValType::I32))
-                    && f.params().len() == 2
-                    && f.results().len() == 0
-            }
-            _ => false,
-        };
-        if !ok {
+        if !is_func(&import.ty(), &["i32", "i32"]) {
             return Err(Error::Program(format!(
                 "its import `{m}.{n}` must be a function (i32, i32) -> (), not {}",
                 describe(&import.ty())
@@ -146,23 +138,18 @@ pub(crate) fn check_abi(module: &Module) -> Result<()> {
             )));
         }
     }
-    let frame_ok = match module.get_export(EXPORT_FRAME) {
-        Some(ExternType::Func(f)) => {
-            let params: Vec<_> = f.params().collect();
-            params.len() == 3
-                && matches!(params[0], ValType::F32)
-                && matches!(params[1], ValType::I32)
-                && matches!(params[2], ValType::I32)
-                && f.results().len() == 0
-        }
-        _ => false,
-    };
-    if !frame_ok {
+    if !module.get_export(EXPORT_FRAME).is_some_and(|t| is_func(&t, &["f32", "i32", "i32"])) {
         return Err(Error::Program(format!(
             "it must export `{EXPORT_FRAME}(time: f32, width: i32, height: i32)` with no results"
         )));
     }
     Ok(())
+}
+
+/// Whether `ty` is a function with these parameter types (by [`type_name`]) and no results.
+fn is_func(ty: &ExternType, params: &[&str]) -> bool {
+    let ExternType::Func(f) = ty else { return false };
+    f.params().map(type_name).eq(params.iter().copied()) && f.results().len() == 0
 }
 
 /// What an import is, as both hosts word it: `a function (i32) -> ()`, `a memory`, ...

@@ -355,29 +355,23 @@ fn forward_block(
                         src.insert(*v, p.clone());
                         None
                     }
-                    Expr::Load(p) => match &p.root {
-                        PlaceRoot::Local(l) if local_src.contains_key(l) => {
-                            let mut q = local_src[l].clone();
-                            q.path.extend(p.path.iter().cloned());
-                            Some(q)
-                        }
-                        _ => None,
-                    },
+                    Expr::Load(p) => p.root_local().and_then(|l| local_src.get(&l)).map(|base| {
+                        let mut q = base.clone();
+                        q.path.extend(p.path.iter().cloned());
+                        q
+                    }),
                     Expr::Extract(x, k) => src.get(x).and_then(|base| {
                         let proj = match m.types.get(f.value_ty(*x)) {
-                            TypeDef::Struct { .. } | TypeDef::Enum { .. } => Some(Proj::Field(*k)),
-                            TypeDef::Vector(_) => Some(Proj::Comp(*k as u8)),
-                            _ => None,
+                            TypeDef::Struct { .. } | TypeDef::Enum { .. } => Proj::Field(*k),
+                            TypeDef::Vector(_) => Proj::Comp(*k as u8),
+                            _ => return None,
                         };
-                        proj.map(|p| base.with(p))
+                        Some(base.with(proj))
                     }),
-                    Expr::ExtractDyn(x, i) => src.get(x).and_then(|base| {
-                        let proj = match m.types.get(f.value_ty(*x)) {
-                            TypeDef::Array(..) => Some(Proj::Index(*i)),
-                            _ => None,
-                        };
-                        proj.map(|p| base.with(p))
-                    }),
+                    Expr::ExtractDyn(x, i) => src
+                        .get(x)
+                        .filter(|_| matches!(m.types.get(f.value_ty(*x)), TypeDef::Array(..)))
+                        .map(|base| base.with(Proj::Index(*i))),
                     _ => None,
                 };
                 if let Some(q) = from {
@@ -478,19 +472,11 @@ fn sweep(b: &mut Block, used: &[bool], read: &[bool]) {
 fn compact_locals(f: &mut Function) {
     let mut mentions = vec![0u32; f.locals.len()];
     visit::count_local_mentions(&f.body, &mut mentions);
-    let mut remap = vec![None; f.locals.len()];
-    let mut kept = Vec::new();
-    for (i, l) in std::mem::take(&mut f.locals).into_iter().enumerate() {
-        if mentions[i] > 0 {
-            remap[i] = Some(LocalId(kept.len() as u32));
-            kept.push(l);
-        }
-    }
-    f.locals = kept;
+    let remap = retain_by_index(&mut f.locals, |i| mentions[i] > 0);
     visit::walk_mut(&mut f.body, &mut |s| {
         s.for_each_place_mut(&mut |p| {
             if let PlaceRoot::Local(l) = &mut p.root {
-                *l = remap[l.index()].expect("a mentioned local is kept");
+                *l = LocalId(remap[l.index()].expect("a mentioned local is kept"));
             }
         })
     });
@@ -503,18 +489,24 @@ fn keep_entry_points(m: &mut Module) {
     for e in &m.entry_points {
         keep[e.function.index()] = true;
     }
-    let mut remap = vec![None; m.functions.len()];
+    let remap = retain_by_index(&mut m.functions, |i| keep[i]);
+    for e in &mut m.entry_points {
+        e.function = FuncId(remap[e.function.index()].expect("an entry point is kept"));
+    }
+}
+
+/// Keeps the items whose index `keep` holds for, in order: each one's new index, by its old one.
+fn retain_by_index<T>(items: &mut Vec<T>, keep: impl Fn(usize) -> bool) -> Vec<Option<u32>> {
+    let mut remap = vec![None; items.len()];
     let mut kept = Vec::new();
-    for (i, f) in std::mem::take(&mut m.functions).into_iter().enumerate() {
-        if keep[i] {
-            remap[i] = Some(FuncId(kept.len() as u32));
-            kept.push(f);
+    for (i, x) in std::mem::take(items).into_iter().enumerate() {
+        if keep(i) {
+            remap[i] = Some(kept.len() as u32);
+            kept.push(x);
         }
     }
-    m.functions = kept;
-    for e in &mut m.entry_points {
-        e.function = remap[e.function.index()].expect("an entry point is kept");
-    }
+    *items = kept;
+    remap
 }
 
 #[cfg(test)]

@@ -47,6 +47,15 @@ fn konst(s: ir::Scalar, v: f64) -> I<'static> {
     }
 }
 
+/// A function with these locals that starts with the instructions `ins`.
+fn function(locals: impl IntoIterator<Item = ValType>, ins: &[I]) -> Function {
+    let mut f = Function::new_with_locals_types(locals);
+    for i in ins {
+        f.instruction(i);
+    }
+    f
+}
+
 #[derive(Clone, Copy, Debug)]
 enum LocalRepr {
     /// A scalar in a WASM local.
@@ -76,7 +85,6 @@ struct Fe<'m> {
     locals: Vec<ValType>,
     nparams: u32,
     sret: Option<u32>,
-    params: Vec<u32>,
     fp: u32,
     /// The stack pointer on entry, restored on every exit.
     saved_sp: u32,
@@ -140,7 +148,6 @@ pub(crate) fn emit_function(
         locals: Vec::new(),
         nparams: u32::from(sret) + f.params.len() as u32,
         sret: sret.then_some(0),
-        params: Vec::new(),
         fp: 0,
         saved_sp: 0,
         values: vec![u32::MAX; f.values.len()],
@@ -153,8 +160,6 @@ pub(crate) fn emit_function(
         labels: Vec::new(),
         marks: Vec::new(),
     };
-    let first = u32::from(sret);
-    fe.params = (0..f.params.len() as u32).map(|i| first + i).collect();
     fe.fp = fe.new_local(ValType::I32);
     fe.saved_sp = fe.new_local(ValType::I32);
     // Frame slots: aggregate and address-taken locals, then each aggregate value made in
@@ -210,10 +215,7 @@ pub(crate) fn emit_function(
         I::LocalTee(fe.fp),
         I::GlobalSet(globals::SP),
     ];
-    let mut func = Function::new_with_locals_types(fe.locals.iter().copied());
-    for i in &prologue {
-        func.instruction(i);
-    }
+    let mut func = function(fe.locals.iter().copied(), &prologue);
     // Each location starts at the offset its first instruction is written at.
     let mut lines = Vec::new();
     let mut marks = fe.marks.iter().peekable();
@@ -357,10 +359,34 @@ impl<'m> Fe<'m> {
         self.f.value_ty(v)
     }
 
+    /// The WASM local of IR parameter `i`: after the result's pointer, if there is one.
+    fn param(&self, i: u32) -> u32 {
+        u32::from(self.sret.is_some()) + i
+    }
+
+    /// Pushes the address at offset `off` in the frame.
+    fn frame_addr(&mut self, off: u32) {
+        self.ins.extend([I::LocalGet(self.fp), I::I32Const(off as i32), I::I32Add]);
+    }
+
+    /// Adds `off` to the address on top of the stack.
+    fn add_offset(&mut self, off: u32) {
+        if off != 0 {
+            self.ins.extend([I::I32Const(off as i32), I::I32Add]);
+        }
+    }
+
+    /// Copies a value of aggregate type `t` from the address on top of the stack to the
+    /// address below it.
+    fn copy(&mut self, t: ir::TypeId) {
+        let size = layout(&self.m.types, t).size;
+        self.ins.extend([I::I32Const(size as i32), I::MemoryCopy { src_mem: 0, dst_mem: 0 }]);
+    }
+
     /// The address of a value's own frame slot.
     fn slot_addr(&mut self, v: ir::ValueId) -> R<()> {
         let off = self.value_slots[v.index()].ok_or("internal: a value without a slot")?;
-        self.ins.extend([I::LocalGet(self.fp), I::I32Const(off as i32), I::I32Add]);
+        self.frame_addr(off);
         Ok(())
     }
 
@@ -380,12 +406,12 @@ impl<'m> Fe<'m> {
             ir::PlaceRoot::Local(l) => match self.ir_locals[l.index()] {
                 LocalRepr::Scalar(_) => Err("internal: the address of a scalar local".into()),
                 LocalRepr::Slot(off) => {
-                    self.ins.extend([I::LocalGet(self.fp), I::I32Const(off as i32), I::I32Add]);
+                    self.frame_addr(off);
                     Ok(self.f.locals[l.index()].ty)
                 }
             },
             ir::PlaceRoot::Param(i) => {
-                self.ins.push(I::LocalGet(self.params[*i as usize]));
+                self.ins.push(I::LocalGet(self.param(*i)));
                 Ok(self.f.params[*i as usize].ty)
             }
             ir::PlaceRoot::Ptr(v) => {
@@ -418,16 +444,9 @@ impl<'m> Fe<'m> {
     fn project(&mut self, t: ir::TypeId, proj: &ir::Proj) -> R<ir::TypeId> {
         match (self.ty(t), proj) {
             (ir::TypeDef::Struct { .. } | ir::TypeDef::Enum { .. }, ir::Proj::Field(k)) => {
-                let off = field_offsets(&self.m.types, t)[*k as usize];
-                if off != 0 {
-                    self.ins.extend([I::I32Const(off as i32), I::I32Add]);
-                }
+                self.add_offset(field_offsets(&self.m.types, t)[*k as usize]);
             }
-            (ir::TypeDef::Vector(_), ir::Proj::Comp(c)) => {
-                if *c != 0 {
-                    self.ins.extend([I::I32Const(4 * *c as i32), I::I32Add]);
-                }
-            }
+            (ir::TypeDef::Vector(_), ir::Proj::Comp(c)) => self.add_offset(4 * u32::from(*c)),
             (ir::TypeDef::Vector(n), ir::Proj::Index(i)) => {
                 self.bounds_check(*i, *n as u32);
                 self.ins.extend([I::LocalGet(self.v(*i)), I::I32Const(4), I::I32Mul, I::I32Add]);
@@ -481,14 +500,6 @@ impl<'m> Fe<'m> {
         self.trap_if();
     }
 
-    fn f32_ty(&self) -> R<ir::TypeId> {
-        self.find_type(&ir::TypeDef::Scalar(ir::Scalar::F32))
-    }
-
-    fn vector_ty(&self, n: u8) -> R<ir::TypeId> {
-        self.find_type(&ir::TypeDef::Vector(n))
-    }
-
     /// A type the module must already have (a vector's component, a matrix's column).
     fn find_type(&self, d: &ir::TypeDef) -> R<ir::TypeId> {
         self.m.types.lookup(d).ok_or_else(|| format!("internal: the type {d:?} isn't interned"))
@@ -507,10 +518,7 @@ impl<'m> Fe<'m> {
             // Copy into the value's own slot.
             self.slot_addr(dst)?;
             self.addr(p)?;
-            self.ins.extend([
-                I::I32Const(layout(&self.m.types, t).size as i32),
-                I::MemoryCopy { src_mem: 0, dst_mem: 0 },
-            ]);
+            self.copy(t);
             self.set_to_slot(dst)
         } else {
             self.addr(p)?;
@@ -531,11 +539,8 @@ impl<'m> Fe<'m> {
         let t = self.vty(v);
         self.addr(p)?;
         if self.m.types.is_aggregate(t) {
-            self.ins.extend([
-                I::LocalGet(self.v(v)),
-                I::I32Const(layout(&self.m.types, t).size as i32),
-                I::MemoryCopy { src_mem: 0, dst_mem: 0 },
-            ]);
+            self.ins.push(I::LocalGet(self.v(v)));
+            self.copy(t);
         } else {
             let s = self.scalar(t)?;
             self.ins.extend([I::LocalGet(self.v(v)), store_op(s, 0)]);
@@ -552,9 +557,8 @@ impl<'m> Fe<'m> {
                 I::I32Const(offset as i32),
                 I::I32Add,
                 I::LocalGet(self.v(v)),
-                I::I32Const(layout(&self.m.types, t).size as i32),
-                I::MemoryCopy { src_mem: 0, dst_mem: 0 },
             ]);
+            self.copy(t);
         } else {
             let s = self.scalar(t)?;
             self.ins.extend([I::LocalGet(addr), I::LocalGet(self.v(v)), store_op(s, offset)]);
@@ -662,13 +666,8 @@ impl<'m> Fe<'m> {
             ir::Stmt::Return(v) => {
                 match (v, self.sret) {
                     (Some(v), Some(sret)) => {
-                        let t = self.vty(*v);
-                        self.ins.extend([
-                            I::LocalGet(sret),
-                            I::LocalGet(self.v(*v)),
-                            I::I32Const(layout(&self.m.types, t).size as i32),
-                            I::MemoryCopy { src_mem: 0, dst_mem: 0 },
-                        ]);
+                        self.ins.extend([I::LocalGet(sret), I::LocalGet(self.v(*v))]);
+                        self.copy(self.vty(*v));
                         self.epilogue();
                     }
                     (Some(v), None) => {
@@ -702,7 +701,7 @@ impl<'m> Fe<'m> {
                     && sret
                 {
                     let off = self.slot(t);
-                    self.ins.extend([I::LocalGet(self.fp), I::I32Const(off as i32), I::I32Add]);
+                    self.frame_addr(off);
                 }
                 self.call_args(args)?;
                 self.ins.push(I::Call(self.first_fn + f.0));
@@ -755,7 +754,7 @@ impl<'m> Fe<'m> {
                 }
             }
             ir::Expr::Param(i) => {
-                self.ins.extend([I::LocalGet(self.params[*i as usize]), I::LocalSet(self.v(v))])
+                self.ins.extend([I::LocalGet(self.param(*i)), I::LocalSet(self.v(v))])
             }
             ir::Expr::Load(p) => self.load_place(p, v)?,
             ir::Expr::Addr(p) => {
@@ -889,7 +888,7 @@ impl<'m> Fe<'m> {
     fn construct(&mut self, v: ir::ValueId, t: ir::TypeId, parts: &[ir::ValueId]) -> R<()> {
         // A vector's parts are its components; other types can have padding.
         let a = self.fresh_slot(v, !self.m.types.is_vector(t))?;
-        match self.ty(t).clone() {
+        match *self.ty(t) {
             ir::TypeDef::Struct { .. } => {
                 let offs = field_offsets(&self.m.types, t);
                 for (k, &p) in parts.iter().enumerate() {
@@ -915,34 +914,33 @@ impl<'m> Fe<'m> {
                     self.store_at(a, stride.saturating_mul(k as u32), p)?;
                 }
             }
-            d => return Err(format!("internal: construct {d:?}")),
+            ref d => return Err(format!("internal: construct {d:?}")),
         }
         Ok(())
     }
 
     fn extract(&mut self, v: ir::ValueId, x: ir::ValueId, i: u32) -> R<()> {
         let xt = self.vty(x);
-        let (off, et) = match self.ty(xt).clone() {
+        let (off, et) = match *self.ty(xt) {
             ir::TypeDef::Struct { .. } | ir::TypeDef::Enum { .. } => {
                 let ft = self.m.types.field(xt, i).ok_or("internal: a missing field")?;
                 (field_offsets(&self.m.types, xt)[i as usize], ft)
             }
-            ir::TypeDef::Vector(_) => (4 * i, self.f32_ty()?),
+            ir::TypeDef::Vector(_) => {
+                (4 * i, self.find_type(&ir::TypeDef::Scalar(ir::Scalar::F32))?)
+            }
             ir::TypeDef::Matrix(n) => {
-                let col = self.vector_ty(n)?;
-                (column_stride(n) * i, col)
+                (column_stride(n) * i, self.find_type(&ir::TypeDef::Vector(n))?)
             }
             // Saturating, as in `construct`.
             ir::TypeDef::Array(e, _) => (array_stride(&self.m.types, e).saturating_mul(i), e),
             ir::TypeDef::Run(_) => (4 * i, self.find_type(&ir::TypeDef::Scalar(ir::Scalar::U32))?),
-            d => return Err(format!("internal: extract from {d:?}")),
+            ref d => return Err(format!("internal: extract from {d:?}")),
         };
         self.ins.push(I::LocalGet(self.v(x)));
         if self.m.types.is_aggregate(et) {
             // An immutable view of part of an immutable value: no copy needed.
-            if off != 0 {
-                self.ins.extend([I::I32Const(off as i32), I::I32Add]);
-            }
+            self.add_offset(off);
         } else {
             let s = self.scalar(et)?;
             self.ins.push(load_op(s, off));
@@ -1071,9 +1069,5 @@ pub(crate) fn export_wrapper(
         ins.extend([I::LocalGet(frame), I::I32Const(size), I::I32Add, I::GlobalSet(globals::SP)]);
     }
     ins.push(I::End);
-    let mut fun = Function::new_with_locals_types(locals);
-    for i in &ins {
-        fun.instruction(i);
-    }
-    Ok((params, results, fun))
+    Ok((params, results, function(locals, &ins)))
 }

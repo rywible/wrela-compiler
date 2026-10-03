@@ -429,7 +429,10 @@ impl<'c, 'a> Fl<'c, 'a> {
                     self.matched.insert(b, flag);
                     let f = self.konst(ir::Const::Bool(false));
                     self.emit(ir::Stmt::Store(ir::Place::local(flag), f));
-                    for (i, &arm) in arms.iter().enumerate() {
+                    // No arm matched (unreachable: the match is exhaustive, and a guard can't
+                    // change what the arms test).
+                    let none = self.unmatched.get(&b).copied();
+                    for (i, arm) in arms.iter().copied().chain(none).enumerate() {
                         self.push_block();
                         self.region(arm, None);
                         let body = self.pop_block();
@@ -439,16 +442,6 @@ impl<'c, 'a> Fl<'c, 'a> {
                             }
                             continue;
                         }
-                        let m = self.load(ir::Place::local(flag), bool_ty);
-                        let not_m = self.value(bool_ty, ir::Expr::Unary(ir::UnOp::Not, m));
-                        self.emit(ir::Stmt::If { cond: not_m, then: body, else_: Vec::new() });
-                    }
-                    if let Some(&none) = self.unmatched.get(&b) {
-                        // No arm matched (unreachable: the match is exhaustive, and a guard
-                        // can't change what the arms test).
-                        self.push_block();
-                        self.region(none, None);
-                        let body = self.pop_block();
                         let m = self.load(ir::Place::local(flag), bool_ty);
                         let not_m = self.value(bool_ty, ir::Expr::Unary(ir::UnOp::Not, m));
                         self.emit(ir::Stmt::If { cond: not_m, then: body, else_: Vec::new() });
@@ -1289,11 +1282,12 @@ impl<'c, 'a> Fl<'c, 'a> {
                     )));
                     return None;
                 };
-                let generics = program.fn_all_generics(func);
-                let substs: Vec<TyId> =
-                    generics.iter().map(|g| subst.get(*g).unwrap_or(program.types.error)).collect();
-                let substs: Vec<TyId> = substs.into_iter().map(|t| self.cx.reveal(t)).collect();
-                if self.cx.checked.program.func(func).attrs.intrinsic {
+                let substs: Vec<TyId> = program
+                    .fn_all_generics(func)
+                    .iter()
+                    .map(|g| self.cx.reveal(subst.get(*g).unwrap_or(program.types.error)))
+                    .collect();
+                if program.func(func).attrs.intrinsic {
                     return crate::gpu::intrinsic(self, func, &substs, c, ty);
                 }
                 self.call_fn(func, substs, &c.args, span)

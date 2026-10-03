@@ -287,20 +287,16 @@ impl<'a> Parser<'a> {
 
     /// Skips to the next separator or closing `}` at this nesting depth (recovery).
     fn recover_to_sep(&mut self) {
-        let mut depth = 0i32;
+        let mut depth = 0u32;
         loop {
             match self.kind() {
                 T::Eof => break,
-                T::Newline | T::Semi if depth == 0 => break,
-                T::RBrace if depth == 0 => break,
+                T::Newline | T::Semi | T::RBrace if depth == 0 => break,
                 T::LParen | T::LBracket | T::LBrace => depth += 1,
-                T::RParen | T::RBracket | T::RBrace => depth -= 1,
+                T::RParen | T::RBracket | T::RBrace => depth = depth.saturating_sub(1),
                 _ => {}
             }
             self.bump();
-            if depth < 0 {
-                depth = 0;
-            }
         }
         self.recovered_at = Some(self.pos);
     }
@@ -418,16 +414,12 @@ impl<'a> Parser<'a> {
         if self.at(close) {
             return self.bump().span;
         }
+        let t = self.tok();
+        let (want, found) = (close.fixed_text().unwrap_or("?"), t.kind.fixed_text().unwrap_or("?"));
+        let at_closer = matches!(t.kind, T::RParen | T::RBracket | T::RBrace) && close != T::Pipe;
         // A closer of another kind that closes nothing open (L19): most likely a typo for
         // this one, so it's read as this one.
-        let k = self.kind();
-        let want = close.fixed_text().unwrap_or("?");
-        if matches!(k, T::RParen | T::RBracket | T::RBrace)
-            && close != T::Pipe
-            && !self.closers.contains(&k)
-        {
-            let t = self.tok();
-            let found = k.fixed_text().unwrap_or("?");
+        if at_closer && !self.closers.contains(&t.kind) {
             let mut d = Diagnostic::new(
                 codes::E0102,
                 t.span,
@@ -443,10 +435,8 @@ impl<'a> Parser<'a> {
             return t.span;
         }
         if self.recovered_at != Some(self.pos) {
-            let t = self.tok();
-            if matches!(k, T::RParen | T::RBracket | T::RBrace) && close != T::Pipe {
+            if at_closer {
                 // It closes a bracket opened before this list, and this list with it (L19).
-                let found = k.fixed_text().unwrap_or("?");
                 self.error(
                     Diagnostic::new(
                         codes::E0100,
@@ -1136,10 +1126,7 @@ impl<'a> Parser<'a> {
             return self.parse_type();
         }
         match self.kind() {
-            T::Ident | T::SelfType => {
-                let p = self.parse_path_type()?;
-                Ok(p)
-            }
+            T::Ident | T::SelfType => self.parse_path_type(),
             T::LBracket => {
                 self.bump();
                 let (elem, len) = self.within(T::RBracket, |p| -> PResult<_> {
@@ -1155,19 +1142,7 @@ impl<'a> Parser<'a> {
             }
             T::LParen => {
                 self.bump();
-                let (mut tys, trailing) = self.within(T::RParen, |p| -> PResult<_> {
-                    let mut tys = Vec::new();
-                    let mut trailing = false;
-                    while !p.at(T::RParen) {
-                        tys.push(p.parse_type()?);
-                        trailing = p.eat(T::Comma);
-                        if !trailing {
-                            break;
-                        }
-                    }
-                    Ok((tys, trailing))
-                })?;
-                self.expect(T::RParen, "`,` or `)`")?;
+                let (mut tys, trailing) = self.parse_paren_types()?;
                 let span = start.to(self.prev_span());
                 let kind = if tys.len() == 1 && !trailing {
                     TypeExprKind::Paren(Box::new(tys.pop().ok_or(Failed)?))
@@ -1179,17 +1154,7 @@ impl<'a> Parser<'a> {
             T::Fn => {
                 self.bump();
                 self.expect(T::LParen, "`(`")?;
-                let tys = self.within(T::RParen, |p| -> PResult<_> {
-                    let mut tys = Vec::new();
-                    while !p.at(T::RParen) {
-                        tys.push(p.parse_type()?);
-                        if !p.eat(T::Comma) {
-                            break;
-                        }
-                    }
-                    Ok(tys)
-                })?;
-                self.expect(T::RParen, "`,` or `)`")?;
+                let (tys, _) = self.parse_paren_types()?;
                 let ret =
                     if self.eat(T::Arrow) { Some(Box::new(self.parse_type()?)) } else { None };
                 Ok(TypeExpr { kind: TypeExprKind::Fn(tys, ret), span: start.to(self.prev_span()) })
@@ -1206,6 +1171,25 @@ impl<'a> Parser<'a> {
             }
             _ => Err(self.expected("a type")),
         }
+    }
+
+    /// The types of a tuple or function type, after its `(`: (type ("," type)* ","?)? ")".
+    /// Returns them, and whether a `,` came last.
+    fn parse_paren_types(&mut self) -> PResult<(Vec<TypeExpr>, bool)> {
+        let types = self.within(T::RParen, |p| -> PResult<_> {
+            let mut tys = Vec::new();
+            let mut trailing = false;
+            while !p.at(T::RParen) {
+                tys.push(p.parse_type()?);
+                trailing = p.eat(T::Comma);
+                if !trailing {
+                    break;
+                }
+            }
+            Ok((tys, trailing))
+        })?;
+        self.expect(T::RParen, "`,` or `)`")?;
+        Ok(types)
     }
 
     /// path_type ::= type_segment ("::" type_segment)*;  type_segment ::= (IDENT | "Self") generic_args?

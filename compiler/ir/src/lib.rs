@@ -373,15 +373,7 @@ pub struct Function {
 
 impl Function {
     pub fn new(name: impl Into<String>, params: Vec<Param>, ret: Option<TypeId>) -> Function {
-        Function {
-            name: name.into(),
-            params,
-            ret,
-            ret_ref: false,
-            locals: Vec::new(),
-            values: Vec::new(),
-            body: Vec::new(),
-        }
+        Function { name: name.into(), params, ret, ..Function::default() }
     }
 
     pub fn new_value(&mut self, ty: TypeId) -> ValueId {

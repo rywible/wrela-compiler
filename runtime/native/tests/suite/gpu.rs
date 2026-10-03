@@ -7,7 +7,7 @@ use crate::common::{self, TempDir};
 
 use wrela_abi::hash::StateHash;
 use wrela_abi::stream::Encoder;
-use wrela_host::{Error, Host, Options, Value, frame_time};
+use wrela_host::{Error, Host, Options, Value, frame_time, image};
 
 const SEEDS: [u32; 4] = [0xff30_1810, 0xff20_70e0, 0xff40_1030, 0xff60_c0f0];
 const STEP: u32 = 0x0002_0408;
@@ -111,12 +111,8 @@ fn first_light_runs_end_to_end() {
     let dir = common::temp_dir("png");
     let path = dir.join("frame.png");
     run.write_png(&path).expect("writes");
-    let decoder =
-        png::Decoder::new(std::io::BufReader::new(std::fs::File::open(&path).expect("open")));
-    let mut reader = decoder.read_info().expect("png header");
-    let mut decoded = vec![0; reader.output_buffer_size().expect("size")];
-    reader.next_frame(&mut decoded).expect("png data");
-    assert_eq!(decoded, run.frame);
+    let decoded = image::read_png(&path).expect("decodes");
+    assert!(decoded == (width, height, run.frame), "the PNG isn't the frame");
 }
 
 #[test]

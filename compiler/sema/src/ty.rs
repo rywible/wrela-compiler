@@ -2,6 +2,7 @@
 
 use elsa::FrozenVec;
 use std::cell::RefCell;
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 
 macro_rules! id_type {
@@ -216,15 +217,17 @@ impl Types {
     }
 
     pub fn intern(&self, kind: TyKind) -> TyId {
-        if let Some(&id) = self.map.borrow().get(&kind) {
-            return id;
-        }
+        let mut map = self.map.borrow_mut();
+        let new = match map.entry(kind) {
+            Entry::Occupied(e) => return *e.get(),
+            Entry::Vacant(e) => e,
+        };
         let id = TyId(self.kinds.len() as u32);
         let mut size = 1u32;
-        children(&kind, &mut |c| size = size.saturating_add(self.size(c)));
+        children(new.key(), &mut |c| size = size.saturating_add(self.size(c)));
         self.sizes.borrow_mut().push(size);
-        self.kinds.push(Box::new(kind.clone()));
-        self.map.borrow_mut().insert(kind, id);
+        self.kinds.push(Box::new(new.key().clone()));
+        new.insert(id);
         id
     }
 
@@ -296,6 +299,11 @@ impl Types {
     /// Whether a type mentions generic parameters or projections.
     pub fn has_params(&self, t: TyId) -> bool {
         self.any(t, &mut |k| matches!(k, TyKind::Param(_) | TyKind::Projection { .. }))
+    }
+
+    /// Whether a type mentions projections.
+    pub fn has_projections(&self, t: TyId) -> bool {
+        self.any(t, &mut |k| matches!(k, TyKind::Projection { .. }))
     }
 
     /// Whether any part of `t` satisfies `f`, a test of the part alone.

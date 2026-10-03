@@ -395,25 +395,24 @@ impl Oracle {
         l.pos.push(tokens.last().map_or(0, |t| t.span.end));
         let n = l.pos.len();
         l.edges.sort_by_key(|e| (e.from, e.to));
-        l.out_start.clear();
-        l.out_start.resize(n + 1, 0);
-        for e in &l.edges {
-            l.out_start[e.from as usize + 1] += 1;
-        }
-        for i in 0..n {
-            l.out_start[i + 1] += l.out_start[i];
-        }
+        bucket_starts(&mut l.out_start, n, l.edges.iter().map(|e| e.from));
         l.by_to.clear();
         l.by_to.extend(0..l.edges.len() as u32);
         l.by_to.sort_by_key(|&i| l.edges[i as usize].to);
-        l.in_start.clear();
-        l.in_start.resize(n + 1, 0);
-        for e in &l.edges {
-            l.in_start[e.to as usize + 1] += 1;
-        }
-        for i in 0..n {
-            l.in_start[i + 1] += l.in_start[i];
-        }
+        bucket_starts(&mut l.in_start, n, l.edges.iter().map(|e| e.to));
+    }
+}
+
+/// Fills `start` so that, in a list sorted by node, `start[u]..start[u + 1]` are the entries of
+/// node `u` (of `n`); `nodes` gives each entry's node.
+fn bucket_starts(start: &mut Vec<u32>, n: usize, nodes: impl Iterator<Item = u32>) {
+    start.clear();
+    start.resize(n + 1, 0);
+    for u in nodes {
+        start[u as usize + 1] += 1;
+    }
+    for i in 0..n {
+        start[i + 1] += start[i];
     }
 }
 
@@ -612,9 +611,18 @@ impl Node {
     /// The bytes from the first to the last token the node covers, ignoring NEWLINE and EOF
     /// (which cover nothing). `None` if it covers no such token.
     pub fn span(&self) -> Option<(u32, u32)> {
-        let first = self.children.iter().find_map(Child::span)?;
-        let last = self.children.iter().rev().find_map(Child::span)?;
-        Some((first.0, last.1))
+        Some((self.leaf(false)?.span.start, self.leaf(true)?.span.end))
+    }
+
+    /// The first (`rev`: the last) leaf that covers bytes. It goes down one side of the tree
+    /// only: a span made from the children's spans goes down both sides at each level, which
+    /// doubles the work per level.
+    fn leaf(&self, rev: bool) -> Option<&Leaf> {
+        if rev {
+            self.children.iter().rev().find_map(|c| c.leaf(rev))
+        } else {
+            self.children.iter().find_map(|c| c.leaf(rev))
+        }
     }
 
     /// Every node in the tree, parents first.
@@ -630,10 +638,13 @@ impl Node {
 
 impl Child {
     pub fn span(&self) -> Option<(u32, u32)> {
+        Some((self.leaf(false)?.span.start, self.leaf(true)?.span.end))
+    }
+
+    fn leaf(&self, rev: bool) -> Option<&Leaf> {
         match self {
-            Child::Node(n) => n.span(),
-            Child::Leaf(l) if l.span.start < l.span.end => Some((l.span.start, l.span.end)),
-            Child::Leaf(_) => None,
+            Child::Node(n) => n.leaf(rev),
+            Child::Leaf(l) => (l.span.start < l.span.end).then_some(l),
         }
     }
 }

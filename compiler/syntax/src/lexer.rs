@@ -117,10 +117,7 @@ impl<'a> Lexer<'a> {
                     line_has_token = true;
                 }
                 b'/' if self.peek(1) == Some(b'*') => {
-                    let had_break = self.block_comment(line_has_token);
-                    if had_break {
-                        line_break = true;
-                    }
+                    line_break |= self.block_comment(line_has_token);
                 }
                 _ => {
                     // A character that L3 skips makes no token, so the line break before it

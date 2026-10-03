@@ -30,9 +30,8 @@ pub(crate) fn single_exit(m: &mut Module, f: &Function) -> Option<(Function, Opt
     let mut out =
         vec![Stmt::Let(no, Expr::Const(Const::Bool(false))), Stmt::Store(Place::local(done), no)];
     out.extend(cx.block(&f.body));
-    match ret {
-        Some(r) => {
-            let t = ret_ty.unwrap_or(bool_ty);
+    match ret.zip(ret_ty) {
+        Some((r, t)) => {
             let v = cx.f.new_value(t);
             out.push(Stmt::Let(v, Expr::Load(Place::local(r))));
             out.push(Stmt::Return(Some(v)));

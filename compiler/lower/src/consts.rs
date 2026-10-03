@@ -134,15 +134,15 @@ impl<'a> Cx<'a> {
 impl<'c, 'a> Fl<'c, 'a> {
     /// A constant's value built in code (GPU code has no constant data).
     pub fn build_const(&mut self, t: ir::TypeId, v: &ir::ConstValue) -> Option<ir::ValueId> {
-        let types = &self.mb.m.types;
+        let types = &mut self.mb.m.types;
         match v {
             ir::ConstValue::Scalar(c) => Some(self.value(t, ir::Expr::Const(c.clone()))),
             ir::ConstValue::Parts(ps) => {
-                let part_ty: Vec<ir::TypeId> = match types.get(t).clone() {
-                    ir::TypeDef::Vector(_) => vec![self.mb.m.types.f32(); ps.len()],
-                    ir::TypeDef::Matrix(n) => vec![self.mb.m.types.vector(n); ps.len()],
+                let part_ty: Vec<ir::TypeId> = match *types.get(t) {
+                    ir::TypeDef::Vector(_) => vec![types.f32(); ps.len()],
+                    ir::TypeDef::Matrix(n) => vec![types.vector(n); ps.len()],
                     ir::TypeDef::Array(e, _) => vec![e; ps.len()],
-                    ir::TypeDef::Struct { fields, .. } => fields.iter().map(|f| f.1).collect(),
+                    ir::TypeDef::Struct { ref fields, .. } => fields.iter().map(|f| f.1).collect(),
                     _ => return None,
                 };
                 let mut vals = Vec::new();

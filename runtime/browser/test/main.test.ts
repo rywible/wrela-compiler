@@ -3,7 +3,6 @@
 import { afterEach, expect, test } from "bun:test";
 import type { ToWorker } from "../src/messages.ts";
 
-const g = globalThis as Record<string, unknown>;
 const saved = new Map<string, PropertyDescriptor | undefined>();
 
 /** Sets a global for one test. */

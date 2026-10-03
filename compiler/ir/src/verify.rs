@@ -42,7 +42,7 @@ struct Verifier<'a> {
     loops: u32,
 }
 
-fn bug(message: String) -> Error {
+fn bug(message: impl Into<String>) -> Error {
     Error::internal(message)
 }
 
@@ -143,7 +143,7 @@ impl Verifier<'_> {
             Expr::Load(p) => Some(self.place(p)?),
             Expr::Run(p) => match self.def(self.place(p)?) {
                 TypeDef::Array(e, _) => types.lookup(&TypeDef::Run(*e)),
-                _ => return Err(bug("a run of something that isn't an array".into())),
+                _ => return Err(bug("a run of something that isn't an array")),
             },
             Expr::Addr(p) => types.lookup(&TypeDef::Ptr(self.place(p)?)),
             Expr::ArrayLength(p) => {
@@ -151,7 +151,7 @@ impl Verifier<'_> {
                     if matches!(self.m.resources.get(r.index()).map(|r| r.kind),
                         Some(ResourceKind::StorageRead | ResourceKind::StorageReadWrite)));
                 if !storage || !p.path.is_empty() {
-                    return Err(bug("the length of something that isn't a storage buffer".into()));
+                    return Err(bug("the length of something that isn't a storage buffer"));
                 }
                 types.lookup(&TypeDef::Scalar(Scalar::U32))
             }
@@ -209,7 +209,7 @@ impl Verifier<'_> {
             Expr::Extract(x, k) => Some(self.extract(self.ty(*x), *k)?),
             Expr::ExtractDyn(x, i) => {
                 if !self.scalar(self.ty(*i)).is_some_and(|s| s.is_int()) {
-                    return Err(bug("a dynamic extract at an index that isn't an integer".into()));
+                    return Err(bug("a dynamic extract at an index that isn't an integer"));
                 }
                 match self.def(self.ty(*x)) {
                     TypeDef::Array(e, _) => Some(*e),
@@ -220,13 +220,13 @@ impl Verifier<'_> {
             }
             Expr::Splat(x, n) => {
                 if !self.is_f32(self.ty(*x)) {
-                    return Err(bug("a splat of something that isn't an `f32`".into()));
+                    return Err(bug("a splat of something that isn't an `f32`"));
                 }
                 types.lookup(&TypeDef::Vector(*n))
             }
             Expr::Swizzle(x, comps) => {
                 let TypeDef::Vector(n) = self.def(self.ty(*x)) else {
-                    return Err(bug("a swizzle of something that isn't a vector".into()));
+                    return Err(bug("a swizzle of something that isn't a vector"));
                 };
                 if comps.iter().any(|c| c >= n) || comps.len() < 2 || comps.len() > 4 {
                     return Err(bug(format!("a swizzle {comps:?} of a vec{n}")));
@@ -235,7 +235,7 @@ impl Verifier<'_> {
             }
             Expr::Convert(x, s) => {
                 if self.scalar(self.ty(*x)).is_none() {
-                    return Err(bug("a conversion of something that isn't a scalar".into()));
+                    return Err(bug("a conversion of something that isn't a scalar"));
                 }
                 types.lookup(&TypeDef::Scalar(*s))
             }
@@ -251,7 +251,7 @@ impl Verifier<'_> {
             }
             Expr::Select { cond, if_true, if_false } => {
                 if !self.is_bool(self.ty(*cond)) {
-                    return Err(bug("a select whose condition isn't a `bool`".into()));
+                    return Err(bug("a select whose condition isn't a `bool`"));
                 }
                 self.expect("a select's second branch", self.ty(*if_true), self.ty(*if_false))?;
                 Some(self.ty(*if_true))
@@ -272,7 +272,7 @@ impl Verifier<'_> {
             if ta != tb || self.scalar(ta).is_none() {
                 return Err(bug(format!("{op:?} of `{}` and `{}`", self.show(ta), self.show(tb))));
             }
-            return bool_t().ok_or_else(|| bug("a comparison with no `bool`".into()));
+            return bool_t().ok_or_else(|| bug("a comparison with no `bool`"));
         }
         if matches!(op, BinOp::And | BinOp::Or) {
             if !self.is_bool(ta) || !self.is_bool(tb) {
@@ -297,9 +297,7 @@ impl Verifier<'_> {
                     }
                 }
                 TypeDef::Scalar(_) | TypeDef::Vector(_) => Ok(ta),
-                TypeDef::Matrix(_) if op == BinOp::Mul || matches!(op, BinOp::Add | BinOp::Sub) => {
-                    Ok(ta)
-                }
+                TypeDef::Matrix(_) if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul) => Ok(ta),
                 d => Err(bug(format!("{op:?} of `{d:?}`"))),
             };
         }
@@ -359,7 +357,7 @@ impl Verifier<'_> {
                 self.m
                     .types
                     .lookup(&TypeDef::Ptr(t))
-                    .ok_or_else(|| bug("a projection call with no pointer type".into()))?,
+                    .ok_or_else(|| bug("a projection call with no pointer type"))?,
             ),
             (r, _) => r,
         })
@@ -442,7 +440,7 @@ impl Verifier<'_> {
                 }
                 Stmt::Store(p, v) => {
                     if matches!(p.root, PlaceRoot::Data(_)) {
-                        return Err(bug("a store into constant data".into()));
+                        return Err(bug("a store into constant data"));
                     }
                     self.all_visible(|f| p.for_each_value(&mut |v| f(v)))?;
                     let t = self.place(p)?;
@@ -452,7 +450,7 @@ impl Verifier<'_> {
                 Stmt::If { cond, then, else_ } => {
                     self.visible(*cond)?;
                     if !self.is_bool(self.ty(*cond)) {
-                        return Err(bug("an `if` whose condition isn't a `bool`".into()));
+                        return Err(bug("an `if` whose condition isn't a `bool`"));
                     }
                     self.block(then)?;
                     self.block(else_)?;
@@ -469,7 +467,7 @@ impl Verifier<'_> {
                     self.loops = saved;
                 }
                 Stmt::Break | Stmt::Continue if self.loops == 0 => {
-                    return Err(bug("break or continue outside a loop".into()));
+                    return Err(bug("break or continue outside a loop"));
                 }
                 Stmt::Break | Stmt::Continue | Stmt::Trap | Stmt::At(_) => {}
                 Stmt::Return(v) => match (v, self.f.ret) {
@@ -484,14 +482,10 @@ impl Verifier<'_> {
                     }
                     (None, None) => {}
                     (Some(_), None) => {
-                        return Err(bug(
-                            "a value returned from a function that returns nothing".into()
-                        ));
+                        return Err(bug("a value returned from a function that returns nothing"));
                     }
                     (None, Some(_)) => {
-                        return Err(bug(
-                            "nothing returned from a function that returns a value".into()
-                        ));
+                        return Err(bug("nothing returned from a function that returns a value"));
                     }
                 },
             }

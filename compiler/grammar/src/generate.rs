@@ -297,10 +297,7 @@ impl<'g> Generator<'g> {
     pub fn generate(&self, rng: &mut Rng, cov: &mut Coverage) -> Vec<Terminal> {
         let (lo, hi) = self.config.budget;
         let (rule, node) = *rng.pick(&self.goals);
-        let mut path = vec![node];
-        while let Some(p) = self.parent[*path.last().unwrap_or(&node)] {
-            path.push(p);
-        }
+        let path = std::iter::successors(Some(node), |&e| self.parent[e]).collect();
         let mut w = Walk {
             budget: lo + rng.below(hi - lo + 1),
             goal: Some(Goal { rule, node, path }),

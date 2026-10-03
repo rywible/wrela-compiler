@@ -125,8 +125,8 @@ pub fn not_gpu_data(p: &Program, param: &str, ty: TyId, span: wrela_diag::Span) 
     if let TyKind::Adt(a, args) = p.types.kind(ty)
         && !p.adt(*a).is_enum()
         && p.fields_of(*a, args, None)
-            .iter()
-            .all(|(_, ft)| crate::traits::implements_builtin(p, *ft, Lang::GpuData))
+            .into_iter()
+            .all(|ft| crate::traits::implements_builtin(p, ft, Lang::GpuData))
         && let Some((at, text)) = p.opt_in_fix(*a, "GpuData")
     {
         d = d.with_fix(format!("opt `{shown}` in to `GpuData`"), at, text);
@@ -144,13 +144,20 @@ fn check_entry(p: &Program, f: FnId, entry: Entry, out: &mut Vec<Diagnostic>) {
             Diagnostic::new(codes::E0602, def.sig_span, format!("{stage} doesn't return a value"))
                 .with_help("write results through a `mut Slots<T>` parameter"),
         ),
+        Entry::Vertex if p.lang_of_ty(def.ret) == Some(Lang::ClipPosition) => {}
+        Entry::Vertex if clip_position_fields(p, def.ret).count() != 1 => out.push(
+            Diagnostic::new(
+                codes::E0602,
+                def.sig_span,
+                format!("{stage} returns its clip position"),
+            )
+            .with_help(
+                "return a `ClipPosition`, or a struct with one `ClipPosition` field and the \
+                 values to pass to the fragment shader",
+            ),
+        ),
         Entry::Vertex => {
-            let ok = p.lang_of_ty(def.ret) == Some(Lang::ClipPosition)
-                || clip_position_fields(p, def.ret).count() == 1;
-            if ok
-                && p.lang_of_ty(def.ret) != Some(Lang::ClipPosition)
-                && let TyKind::Adt(a, _) = p.types.kind(def.ret)
-            {
+            if let TyKind::Adt(a, _) = p.types.kind(def.ret) {
                 // What it passes on (a generic field's type is checked where it's drawn).
                 let fields = p.adt(*a).fields();
                 let varyings =
@@ -170,19 +177,6 @@ fn check_entry(p: &Program, f: FnId, entry: Entry, out: &mut Vec<Diagnostic>) {
                         .with_note(format!("WebGPU's default limit is {MAX_VARYINGS} (`maxInterStageShaderVariables`)")),
                     );
                 }
-            }
-            if !ok {
-                out.push(
-                    Diagnostic::new(
-                        codes::E0602,
-                        def.sig_span,
-                        format!("{stage} returns its clip position"),
-                    )
-                    .with_help(
-                        "return a `ClipPosition`, or a struct with one `ClipPosition` field and the \
-                         values to pass to the fragment shader",
-                    ),
-                );
             }
         }
         Entry::Fragment if !matches!(p.types.kind(def.ret), TyKind::Vec(4)) => out.push(
@@ -247,7 +241,7 @@ fn check_entry(p: &Program, f: FnId, entry: Entry, out: &mut Vec<Diagnostic>) {
         let passed = builtin_stage.is_none()
             && !slots
             && !varyings
-            && !matches!(p.types.kind(ps.ty), TyKind::Slice(_) | TyKind::Param(_))
+            && !matches!(p.types.kind(ps.ty), TyKind::Slice(_))
             && !p.types.has_params(ps.ty);
         if passed && !crate::traits::implements_builtin(p, ps.ty, Lang::GpuData) {
             out.push(not_gpu_data(p, &ps.name, ps.ty, ps.span));

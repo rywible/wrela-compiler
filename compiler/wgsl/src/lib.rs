@@ -21,7 +21,7 @@ use naga::{
 };
 use std::collections::{HashMap, HashSet};
 use wrela_ir as ir;
-use wrela_ir::layout::{Layout, pack_layouts, round_up};
+use wrela_ir::layout::WgslLayouts;
 
 type R<T> = Result<T, String>;
 
@@ -111,8 +111,7 @@ struct Cx<'m> {
     m: &'m ir::Module,
     out: naga::Module,
     types: HashMap<ir::TypeId, Handle<Type>>,
-    /// Each type's layout in the WGSL, and its members' offsets.
-    layouts: HashMap<ir::TypeId, (Layout, Vec<u32>)>,
+    layouts: WgslLayouts,
     globals: Vec<Handle<GlobalVariable>>,
 }
 
@@ -121,7 +120,7 @@ pub fn to_naga(m: &ir::Module) -> R<naga::Module> {
         m,
         out: naga::Module::default(),
         types: HashMap::new(),
-        layouts: HashMap::new(),
+        layouts: WgslLayouts::default(),
         globals: Vec::new(),
     };
     for r in &m.resources {
@@ -155,7 +154,8 @@ impl<'m> Cx<'m> {
         if let Some(&h) = self.types.get(&t) {
             return Ok(h);
         }
-        let (name, inner) = match self.m.types.get(t).clone() {
+        let m = self.m;
+        let (name, inner) = match *m.types.get(t) {
             ir::TypeDef::Scalar(s) => (None, TypeInner::Scalar(scalar(s)?)),
             ir::TypeDef::Vector(n) => {
                 (None, TypeInner::Vector { size: vsize(n), scalar: Scalar::F32 })
@@ -169,18 +169,19 @@ impl<'m> Cx<'m> {
                 (None, self.array(e, ArraySize::Constant(n))?)
             }
             ir::TypeDef::RuntimeArray(e) => (None, self.array(e, ArraySize::Dynamic)?),
-            ir::TypeDef::Struct { name, .. } | ir::TypeDef::Enum { name, .. } => {
-                let (l, offsets) = self.layout(t);
+            ir::TypeDef::Struct { ref name, .. } | ir::TypeDef::Enum { ref name, .. } => {
+                let (l, offsets) = self.layouts.get(&self.m.types, t);
+                let offsets = offsets.to_vec();
                 let mut members = Vec::new();
                 for ((mname, mt), offset) in self.members(t)?.into_iter().zip(offsets) {
                     members.push(StructMember {
-                        name: Some(ir::ident(&mname)),
+                        name: Some(ir::ident(mname)),
                         ty: self.ty(mt)?,
                         binding: None,
                         offset,
                     });
                 }
-                (Some(ir::ident(&name)), TypeInner::Struct { members, span: l.size })
+                (Some(ir::ident(name)), TypeInner::Struct { members, span: l.size })
             }
             ir::TypeDef::Run(_) | ir::TypeDef::Ptr(_) => {
                 return Err("internal: a CPU-only type in GPU code".into());
@@ -231,7 +232,8 @@ impl<'m> Cx<'m> {
         position_field: u32,
         flat: &[bool],
     ) -> R<(Handle<Type>, IoMap)> {
-        let ir::TypeDef::Struct { fields, name } = self.m.types.get(vt).clone() else {
+        let m = self.m;
+        let ir::TypeDef::Struct { fields, name } = m.types.get(vt) else {
             return Err("internal: vertex output isn't a struct".into());
         };
         let v4 = self.ty_vec4();
@@ -247,7 +249,7 @@ impl<'m> Cx<'m> {
                 let is_flat = flat.get(i).copied().unwrap_or(false);
                 // A `Flat<T>` is a struct with one field.
                 let inner = if is_flat {
-                    match self.m.types.get(*ft) {
+                    match m.types.get(*ft) {
                         ir::TypeDef::Struct { fields, .. } => fields[0].1,
                         _ => *ft,
                     }
@@ -293,7 +295,7 @@ impl<'m> Cx<'m> {
         }
         let h = self.out.types.insert(
             Type {
-                name: Some(format!("{}_io", ir::ident(&name))),
+                name: Some(format!("{}_io", ir::ident(name))),
                 inner: TypeInner::Struct { members, span: offset.max(16) },
             },
             Span::UNDEFINED,
@@ -312,47 +314,24 @@ impl<'m> Cx<'m> {
     /// An array of `e`: of `size` elements, or a runtime-sized array (`ArraySize::Dynamic`).
     fn array(&mut self, e: ir::TypeId, size: ArraySize) -> R<TypeInner> {
         let base = self.ty(e)?;
-        let l = self.layout(e).0;
-        Ok(TypeInner::Array { base, size, stride: round_up(l.align, l.size) })
+        Ok(TypeInner::Array { base, size, stride: self.layouts.get(&self.m.types, e).0.stride() })
     }
 
     /// The members of a struct, or of an enum as WGSL holds it: its tag, then each payload.
-    fn members(&self, t: ir::TypeId) -> R<Vec<(String, ir::TypeId)>> {
-        match self.m.types.get(t) {
-            ir::TypeDef::Struct { fields, .. } => Ok(fields.clone()),
+    fn members(&self, t: ir::TypeId) -> R<Vec<(&'m str, ir::TypeId)>> {
+        let types = &self.m.types;
+        match types.get(t) {
+            ir::TypeDef::Struct { fields, .. } => {
+                Ok(fields.iter().map(|(n, f)| (n.as_str(), *f)).collect())
+            }
             ir::TypeDef::Enum { variants, .. } => {
-                let tag = self.m.types.field(t, 0).ok_or("internal: an enum's tag type")?;
-                Ok(std::iter::once(("tag".to_string(), tag))
-                    .chain(variants.iter().filter_map(|(v, p)| Some((v.clone(), (*p)?))))
+                let tag = types.field(t, 0).ok_or("internal: an enum's tag type")?;
+                Ok(std::iter::once(("tag", tag))
+                    .chain(variants.iter().filter_map(|(v, p)| Some((v.as_str(), (*p)?))))
                     .collect())
             }
             _ => Err("internal: members of a type that has none".into()),
         }
-    }
-
-    /// A type's layout in the WGSL, and its members' offsets: the IR's (WGSL's rules), but
-    /// with each enum laid out as the struct WGSL holds it in.
-    fn layout(&mut self, t: ir::TypeId) -> (Layout, Vec<u32>) {
-        if let Some(l) = self.layouts.get(&t) {
-            return l.clone();
-        }
-        let m = self.m;
-        let out = match m.types.get(t).clone() {
-            ir::TypeDef::Array(e, n) => {
-                let el = self.layout(e).0;
-                let size = n.saturating_mul(round_up(el.align, el.size));
-                (Layout { size, align: el.align }, Vec::new())
-            }
-            ir::TypeDef::Struct { .. } | ir::TypeDef::Enum { .. } => {
-                let members = self.members(t).unwrap_or_default();
-                let ls: Vec<Layout> = members.iter().map(|&(_, mt)| self.layout(mt).0).collect();
-                let (offsets, l) = pack_layouts(ls);
-                (l, offsets)
-            }
-            _ => (ir::layout::layout(&m.types, t), Vec::new()),
-        };
-        self.layouts.insert(t, out.clone());
-        out
     }
 
     fn function(&mut self, entry: &'m ir::EntryPoint) -> R<Function> {
@@ -730,7 +709,7 @@ impl<'a, 'm> Fb<'a, 'm> {
                     && let ir::Stage::Fragment { .. } = &self.entry.stage
                 {
                     let arg = self.expr(Expression::FunctionArgument(self.param_base + *i), out);
-                    let ir::TypeDef::Struct { fields, .. } = types.get(vt).clone() else {
+                    let ir::TypeDef::Struct { fields, .. } = types.get(vt) else {
                         return Err("internal: varyings".into());
                     };
                     let mut comps = Vec::new();
@@ -759,14 +738,14 @@ impl<'a, 'm> Fb<'a, 'm> {
                     Some(Some(k)) => self.expr(Expression::FunctionArgument(*k), out),
                     // The fragment's position, which the varyings hold.
                     Some(None) => {
-                        let Some((_, map, _)) = self.io.clone() else {
-                            return Err("internal: an input with no argument".into());
-                        };
-                        let ir::Stage::Fragment { position_field: Some(pf), .. } = self.entry.stage
+                        let (
+                            Some((_, map, _)),
+                            ir::Stage::Fragment { position_field: Some(pf), .. },
+                        ) = (&self.io, &self.entry.stage)
                         else {
                             return Err("internal: an input with no argument".into());
                         };
-                        let k = map.iter().position(|&(f, _)| f == pf).unwrap_or(0) as u32;
+                        let k = map.iter().position(|&(f, _)| f == *pf).unwrap_or(0) as u32;
                         let v = self.expr(Expression::FunctionArgument(self.param_base), out);
                         self.expr(Expression::AccessIndex { base: v, index: k }, out)
                     }
@@ -807,7 +786,7 @@ impl<'a, 'm> Fb<'a, 'm> {
                 self.expr(Expression::AccessIndex { base, index }, out)
             }
             ir::Expr::Variant(t, k, payload) => {
-                let ir::TypeDef::Enum { variants, .. } = types.get(*t).clone() else {
+                let ir::TypeDef::Enum { variants, .. } = types.get(*t) else {
                     return Err("internal: a variant of a type that isn't an enum".into());
                 };
                 let ty = self.cx.ty(*t)?;

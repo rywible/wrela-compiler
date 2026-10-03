@@ -23,6 +23,34 @@ impl Scope {
         Scope { module, params: Vec::new(), self_ty: None, impl_: None }
     }
 
+    /// What's in scope in the items of `owner` in `module`: an impl's parameters, and `Self`,
+    /// the type it's for; a trait's `Self` and parameters; nothing for a free function.
+    pub fn of_owner(p: &Program, module: ModuleId, owner: FnOwner) -> Scope {
+        let mut scope = Scope::new(module);
+        match owner {
+            FnOwner::Free => {}
+            FnOwner::Impl(i) => {
+                scope.self_ty = Some(p.impl_(i).self_ty);
+                scope.impl_ = Some(i);
+                scope.push_params(p, &p.impl_(i).generics);
+            }
+            FnOwner::Trait(t) => {
+                let tr = p.trait_(t);
+                scope.self_ty = Some(p.types.param(tr.self_param));
+                scope.push_params(p, &tr.generics);
+            }
+        }
+        scope
+    }
+
+    /// What a function's signature and body see: its owner's scope, then its own parameters.
+    pub fn of_fn(p: &Program, f: FnId) -> Scope {
+        let def = p.func(f);
+        let mut scope = Scope::of_owner(p, def.module, def.owner);
+        scope.push_params(p, &def.generics);
+        scope
+    }
+
     pub fn push_params(&mut self, p: &Program, params: &[ParamId]) {
         for &id in params {
             let def = p.param(id);
@@ -61,11 +89,6 @@ impl ImplicitParams {
     fn add(&mut self, def: ParamDef) -> ParamId {
         self.defs.push(def);
         ParamId(self.first + self.defs.len() as u32 - 1)
-    }
-
-    /// The ids of the parameters added so far.
-    pub fn ids(&self) -> Vec<ParamId> {
-        (0..self.defs.len() as u32).map(|i| ParamId(self.first + i)).collect()
     }
 }
 
@@ -197,11 +220,8 @@ impl PathSeg for ast::PathSegment {
 
 /// Resolves a path of plain names (a `use` path, or a path's module prefix) from module `from`.
 /// The first segment is `std`, a name in `from`'s scope, a top-level module of the package, or
-/// a prelude name.
-pub fn resolve_module_path(p: &Program, from: ModuleId, segs: &[impl PathSeg]) -> PathLookup {
-    resolve_module_path_in(p, from, segs, false)
-}
-
+/// a prelude name. Before the `final_pass`, a name that isn't found is `NotYet`: an import may
+/// still bind it.
 pub fn resolve_module_path_in(
     p: &Program,
     from: ModuleId,
@@ -348,15 +368,9 @@ pub fn lookup_or_report(
     }
 }
 
-/// E0322: `name` takes `want` generic arguments, but `given` are written. `s` ends the word
-/// "argument": `plural(want)`, or `"s"` where the message has always said "arguments".
-pub(crate) fn wrong_generic_count(
-    span: Span,
-    name: &str,
-    want: usize,
-    given: usize,
-    s: &str,
-) -> Diagnostic {
+/// E0322: `name` takes `want` generic arguments, but `given` are written.
+pub(crate) fn wrong_generic_count(span: Span, name: &str, want: usize, given: usize) -> Diagnostic {
+    let s = wrela_diag::plural(want);
     Diagnostic::new(
         codes::E0322,
         span,
@@ -396,8 +410,7 @@ pub fn resolve_trait_ref(
         .collect();
     let (name, want) = (&p.trait_(t).name, p.trait_(t).generics.len());
     if args.len() != want {
-        let s = wrela_diag::plural(want);
-        diags.push(wrong_generic_count(te.span, name, want, args.len(), s));
+        diags.push(wrong_generic_count(te.span, name, want, args.len()));
         return None;
     }
     Some(TraitRef { trait_: t, args })
@@ -662,8 +675,7 @@ fn resolve_type_path(
         Res::Adt(a) => {
             let want = p.adt(a).generics.len();
             if args.len() != want {
-                let s = wrela_diag::plural(want);
-                diags.push(wrong_generic_count(te.span, &p.adt(a).name, want, args.len(), s));
+                diags.push(wrong_generic_count(te.span, &p.adt(a).name, want, args.len()));
                 return p.types.error;
             }
             p.types.adt(a, args)
@@ -671,7 +683,7 @@ fn resolve_type_path(
         Res::Trait(t) => {
             let want = p.trait_(t).generics.len();
             if args.len() != want {
-                diags.push(wrong_generic_count(te.span, &p.trait_(t).name, want, args.len(), "s"));
+                diags.push(wrong_generic_count(te.span, &p.trait_(t).name, want, args.len()));
                 return p.types.error;
             }
             let r = TraitRef { trait_: t, args };

@@ -11,8 +11,8 @@
 use crate::built;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
-use wrela_host::{CpuHost, Host, Value};
-use wrela_tests::{Rng, one_f32, one_u32, par_each, sized, u32s};
+use wrela_host::{CpuBuild, CpuHost, Host, Value};
+use wrela_tests::{Rng, one_f32, one_u32, par_each, sized, u32s, worse};
 
 /// The corpus, in the order of `with_function` in compiler/tests/fields/main.wrela.
 const NAMES: [&str; 17] = [
@@ -46,38 +46,36 @@ fn value(host: &mut CpuHost, fi: u32, p: [f32; 3]) -> f64 {
     f64::from(one_f32(host, "value", &point_args(fi, p)))
 }
 
-/// The larger error; NaN if either is (`f64::max` drops a NaN, which would pass every check).
-fn worse(a: f64, b: f64) -> f64 {
-    if a.is_nan() || b.is_nan() { f64::NAN } else { a.max(b) }
-}
-
-/// A fourth-order central difference along `axis` with step `h` (the step actually taken,
-/// after rounding the points to f32).
-fn central(host: &mut CpuHost, fi: u32, p: [f32; 3], axis: usize, h: f32) -> f64 {
-    let at = |host: &mut CpuHost, k: f32| {
+/// Fourth-order central differences along `axis` with the steps h = 1.6e-2 / 2^i for i < 6
+/// (the steps actually taken, after rounding the points to f32). A step's 2h is the step
+/// before's h, so each point is evaluated once.
+fn centrals(host: &mut CpuHost, fi: u32, p: [f32; 3], axis: usize) -> [f64; 6] {
+    let mut at = |s: f32| {
         let mut q = p;
-        q[axis] = p[axis] + k * h;
+        q[axis] = p[axis] + s;
         (value(host, fi, q), f64::from(q[axis]) - f64::from(p[axis]))
     };
-    let (a, ha) = at(host, 1.0);
-    let (b, hb) = at(host, -1.0);
-    let (c, hc) = at(host, 2.0);
-    let (d, hd) = at(host, -2.0);
-    // Richardson: (8 (f(h) - f(-h)) - (f(2h) - f(-2h))) / 12h, with the steps as taken.
-    let first = (a - b) / (ha - hb);
-    let second = (c - d) / (hc - hd);
-    (4.0 * first - second) / 3.0
+    // The slope from p - s to p + s for s = 2h₀, h₀, h₁ ... h₅, with the steps as taken.
+    let slopes: Vec<f64> = (-1..6)
+        .map(|i| {
+            let s = 1.6e-2 / f32::powi(2.0, i);
+            let ((a, ha), (b, hb)) = (at(s), at(-s));
+            (a - b) / (ha - hb)
+        })
+        .collect();
+    // Richardson: (8 (f(h) - f(-h)) - (f(2h) - f(-2h))) / 12h.
+    std::array::from_fn(|i| (4.0 * slopes[i + 1] - slopes[i]) / 3.0)
 }
 
 #[test]
 fn gradients_agree_with_central_differences() {
-    let corpus = built("fields");
+    let corpus = CpuBuild::load(built("fields")).expect("load the corpus");
     let report = Mutex::new(Vec::new());
     let functions: Vec<usize> = (0..NAMES.len()).collect();
     // A function per thread at a time, each with its own points.
     par_each(
         &functions,
-        || CpuHost::load(&corpus).expect("load the corpus"),
+        || corpus.start().expect("start the corpus"),
         |host, &fi| {
             let name = NAMES[fi];
             let mut rng = Rng::new(0x5eed + fi as u64);
@@ -99,12 +97,8 @@ fn gradients_agree_with_central_differences() {
                 // a step, a branch's seam) and the point is skipped.
                 let norm = |v: [f64; 3]| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
                 let diff = |a: [f64; 3], b: [f64; 3]| norm([a[0] - b[0], a[1] - b[1], a[2] - b[2]]);
-                let est: Vec<[f64; 3]> = (0..6)
-                    .map(|i| {
-                        let h = 1.6e-2 / f32::powi(2.0, i);
-                        [0, 1, 2].map(|a| central(host, fi, p, a, h))
-                    })
-                    .collect();
+                let axes = [0, 1, 2].map(|a| centrals(host, fi, p, a));
+                let est: Vec<[f64; 3]> = (0..6).map(|i| axes.map(|c| c[i])).collect();
                 let tolerance = |v: [f64; 3]| 2.5e-4 * norm(v).max(1e-2);
                 let Some(fd) = (2..est.len())
                     .rev()
@@ -148,7 +142,7 @@ enum Job {
 
 #[test]
 fn intervals_enclose_every_sample_on_the_cpu() {
-    let corpus = built("fields");
+    let corpus = CpuBuild::load(built("fields")).expect("load the corpus");
     let (boxes, points) = (sized(20_000, BOXES), sized(10_000, 100_000));
     // Each function's point intervals, then the boxes, a chunk at a time.
     let jobs: Vec<Job> = (0..NAMES.len())
@@ -162,7 +156,7 @@ fn intervals_enclose_every_sample_on_the_cpu() {
     let started = std::time::Instant::now();
     par_each(
         &jobs,
-        || CpuHost::load(&corpus).expect("load the corpus"),
+        || corpus.start().expect("start the corpus"),
         |host, job| match *job {
             Job::Unwidened(fi) => {
                 let args = [fi as i32, 11, points].map(Value::I32);

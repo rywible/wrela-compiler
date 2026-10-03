@@ -6,7 +6,7 @@ use crate::graph::{Visit, dfs_cycles};
 use crate::program::{LangRes, Program};
 use crate::resolve::{self, Scope, TyPos};
 use crate::ty::*;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::rc::Rc;
 use wrela_diag::{Diagnostic, Span, codes};
 use wrela_syntax::ast;
@@ -560,28 +560,36 @@ impl<'d, 'u> Collector<'d, 'u> {
         let mut pending: Vec<PendingUse> = std::mem::take(&mut self.uses);
         loop {
             let before = pending.len();
-            // The names the imports still waiting will bind, and where.
-            let binds: Vec<(ModuleId, String)> =
-                pending.iter().map(|u| (u.module, u.alias.name.clone())).collect();
+            // How many of the imports still waiting bind each name, and where.
+            let mut binds: HashMap<(ModuleId, &str), usize> = HashMap::new();
+            for u in &pending {
+                *binds.entry((u.module, &u.alias.name)).or_default() += 1;
+            }
+            // Whether another of them binds each one's first segment.
+            let others_bind: Vec<bool> = pending
+                .iter()
+                .map(|u| {
+                    let first = u.path[0].name.as_str();
+                    let own = usize::from(u.alias.name == first);
+                    binds.get(&(u.module, first)).is_some_and(|&n| n > own)
+                })
+                .collect();
             // Each import still waiting, with the name it waits for and where.
             let mut still = Vec::new();
-            for (i, u) in pending.into_iter().enumerate() {
+            for (u, others_bind) in pending.into_iter().zip(others_bind) {
                 // A path's first segment is a name in the module's scope before a top-level
                 // module or a global: while another import may still bind it, wait for that
                 // one, so the order of the `use` lines doesn't matter.
                 let first = &u.path[0].name;
                 let bound_later = first != "std"
                     && !self.p.module(u.module).scope.contains_key(first)
-                    && binds
-                        .iter()
-                        .enumerate()
-                        .any(|(j, (m, n))| j != i && *m == u.module && n == first);
+                    && others_bind;
                 if bound_later {
                     let (m, name) = (u.module, first.clone());
                     still.push((u, m, name));
                     continue;
                 }
-                match resolve::resolve_module_path(&self.p, u.module, &u.path) {
+                match resolve::resolve_module_path_in(&self.p, u.module, &u.path, false) {
                     resolve::PathLookup::Found(res) => {
                         self.bind(u.module, &u.alias, res, u.public);
                     }
@@ -747,15 +755,13 @@ impl<'d, 'u> Collector<'d, 'u> {
         self.supertrait_cycles(&supertraits);
         for (m, item) in &pending {
             match item {
-                PendingItem::Trait(id, _, methods) => {
-                    let scope = self.trait_scope(*m, *id);
-                    self.method_signatures(&scope, methods);
+                PendingItem::Trait(_, _, methods) | PendingItem::Impl(_, _, methods) => {
+                    for &(fid, f) in methods {
+                        self.fn_bounds(fid, f);
+                        self.fn_signature(fid, f);
+                    }
                 }
-                PendingItem::Impl(id, _, methods) => {
-                    let scope = self.impl_scope(*m, *id);
-                    self.method_signatures(&scope, methods);
-                }
-                PendingItem::Fn(id, f) => self.fn_signature(&Scope::new(*m), *id, f),
+                PendingItem::Fn(id, f) => self.fn_signature(*id, f),
                 PendingItem::Adt(id, item) => self.adt_body(*m, *id, item),
                 PendingItem::Const(id, c) => {
                     if let Some(t) = &c.ty {
@@ -784,30 +790,11 @@ impl<'d, 'u> Collector<'d, 'u> {
                 }
                 PendingItem::Adt(id, item) => self.adt_bounds(*m, *id, item),
                 PendingItem::Impl(id, i, _) => self.impl_header(*m, *id, i),
-                PendingItem::Fn(id, f) => self.fn_bounds(&Scope::new(*m), *id, f),
+                PendingItem::Fn(id, f) => self.fn_bounds(*id, f),
                 PendingItem::Const(..) => {}
             }
         }
         supertraits
-    }
-
-    /// What's in scope in a trait's items: `Self` and the trait's parameters.
-    fn trait_scope(&self, m: ModuleId, id: TraitId) -> Scope {
-        let tr = self.p.trait_(id);
-        let mut scope = Scope::new(m);
-        scope.self_ty = Some(self.p.types.param(tr.self_param));
-        scope.push_params(&self.p, &tr.generics);
-        scope
-    }
-
-    /// What's in scope in an impl's items: its parameters, and `Self`, the type it's for.
-    fn impl_scope(&self, m: ModuleId, id: ImplId) -> Scope {
-        let imp = self.p.impl_(id);
-        let mut scope = Scope::new(m);
-        scope.self_ty = Some(imp.self_ty);
-        scope.impl_ = Some(id);
-        scope.push_params(&self.p, &imp.generics);
-        scope
     }
 
     /// What's in scope in a struct's or an enum's declaration: its parameters. Its fields and
@@ -816,14 +803,6 @@ impl<'d, 'u> Collector<'d, 'u> {
         let mut scope = Scope::new(m);
         scope.push_params(&self.p, &self.p.adt(id).generics);
         scope
-    }
-
-    /// The bounds and signatures of a trait's or an impl's methods, in the owner's scope.
-    fn method_signatures(&mut self, scope: &Scope, methods: &[(FnId, &ast::FnDecl)]) {
-        for &(fid, f) in methods {
-            self.fn_bounds(scope, fid, f);
-            self.fn_signature(scope, fid, f);
-        }
     }
 
     fn bounds_of(&mut self, scope: &Scope, bounds: &[ast::TypeExpr]) -> Vec<TraitRef> {
@@ -855,7 +834,7 @@ impl<'d, 'u> Collector<'d, 'u> {
     ) -> Vec<(TraitId, Span)> {
         let self_param = self.p.trait_(id).self_param;
         let gens = self.p.trait_(id).generics.clone();
-        let scope = self.trait_scope(m, id);
+        let scope = Scope::of_owner(&self.p, m, FnOwner::Trait(id));
         self.set_param_bounds(&scope, &gens, &t.generics);
         let mut supers = Vec::new();
         let mut edges = Vec::new();
@@ -1091,17 +1070,14 @@ impl<'d, 'u> Collector<'d, 'u> {
         self.p.impls[id.index()].assoc_types = assoc;
     }
 
-    fn fn_bounds(&mut self, outer: &Scope, id: FnId, f: &ast::FnDecl) {
+    fn fn_bounds(&mut self, id: FnId, f: &ast::FnDecl) {
+        let scope = Scope::of_fn(&self.p, id);
         let gens = self.p.func(id).generics.clone();
-        let mut scope = outer.clone();
-        scope.push_params(&self.p, &gens);
         self.set_param_bounds(&scope, &gens, &f.generics);
     }
 
-    fn fn_signature(&mut self, outer: &Scope, id: FnId, f: &ast::FnDecl) {
-        let mut scope = outer.clone();
-        let gens = self.p.func(id).generics.clone();
-        scope.push_params(&self.p, &gens);
+    fn fn_signature(&mut self, id: FnId, f: &ast::FnDecl) {
+        let scope = Scope::of_fn(&self.p, id);
         let mut implicit = resolve::ImplicitParams::new(&self.p);
         let mut params: Vec<ParamSig> = Vec::new();
         let owner = self.p.func(id).owner;
@@ -1161,12 +1137,10 @@ impl<'d, 'u> Collector<'d, 'u> {
                 }
             }
         }
-        // The parameters `x: Trait` introduced, numbered as `ImplicitParams` promised.
-        let implicit_ids = implicit.ids();
-        for def in implicit.defs {
-            self.p.new_param(def);
-        }
-        let implicit = implicit_ids;
+        // The parameters `x: Trait` introduced: added in order, they get the ids
+        // `ImplicitParams` promised.
+        let implicit: Vec<ParamId> =
+            implicit.defs.into_iter().map(|d| self.p.new_param(d)).collect();
         let mut opaque = None;
         let (ret, ret_mode) = match &f.ret {
             Some(r) => {
@@ -1184,8 +1158,7 @@ impl<'d, 'u> Collector<'d, 'u> {
         let ret = if opaque.is_some() {
             // The return type names traits: it's this function's hidden concrete type.
             let all = self.p.fn_all_generics(id);
-            let mut args: Vec<TyId> = all.iter().map(|&g| self.p.types.param(g)).collect();
-            args.extend(implicit.iter().map(|&g| self.p.types.param(g)));
+            let args = all.iter().chain(&implicit).map(|&g| self.p.types.param(g)).collect();
             self.p.types.intern(TyKind::Opaque(id, args))
         } else {
             ret
@@ -1230,9 +1203,8 @@ impl<'d, 'u> Collector<'d, 'u> {
                         return;
                     }
                     let subst = Subst::from_pairs(&adt.generics, args);
-                    let is_projection = |k: &TyKind| matches!(k, TyKind::Projection { .. });
                     for f in adt.all_fields() {
-                        if p.types.any(f.ty, &mut { is_projection }) {
+                        if p.types.has_projections(f.ty) {
                             let ty = crate::traits::normalize(p, p.types.subst(f.ty, &subst), None);
                             held_in(p, holds, ty, out, depth + 1);
                         }
@@ -1880,10 +1852,7 @@ fn check_overlap(p: &Program, diags: &mut Vec<Diagnostic>) {
         for (x, y) in pairs {
             let (a, b) = (p.impl_(x), p.impl_(y));
             let same_args = match (&a.trait_ref, &b.trait_ref) {
-                (Some(x), Some(y)) => {
-                    x.args.len() == y.args.len()
-                        && crate::traits::could_unify_all(p, &x.args, &y.args)
-                }
+                (Some(x), Some(y)) => crate::traits::could_unify_all(p, &x.args, &y.args),
                 _ => false,
             };
             if same_args && crate::traits::could_unify(p, a.self_ty, b.self_ty) {

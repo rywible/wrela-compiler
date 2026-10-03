@@ -12,8 +12,7 @@ use wrela_host::{CpuHost, Value};
 use wrela_syntax::{MAX_EXPR_DEPTH, MAX_NESTING};
 
 fn compile(name: &str, body: &str) -> (Vec<String>, PathBuf) {
-    let text = format!("{body}\npub fn frame(time: f32, width: u32, height: u32) {{}}\n");
-    let dir = package(&format!("limits/{name}"), &text);
+    let dir = package(&format!("limits/{name}"), body);
     let out = wrela_driver::build(&dir);
     let codes =
         out.diagnostics.iter().filter(|d| d.is_error()).map(|d| d.code.to_string()).collect();

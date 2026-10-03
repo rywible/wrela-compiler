@@ -36,13 +36,13 @@ struct Obligation {
 /// name, so a lookup doesn't walk every shadowed binding.
 #[derive(Default)]
 struct Env {
-    names: Vec<(String, LocalId)>,
+    names: Vec<String>,
     by_name: HashMap<String, Vec<LocalId>>,
 }
 
 impl Env {
     fn push(&mut self, name: &str, id: LocalId) {
-        self.names.push((name.into(), id));
+        self.names.push(name.into());
         self.by_name.entry(name.into()).or_default().push(id);
     }
 
@@ -52,8 +52,7 @@ impl Env {
 
     /// Forgets the names declared after the first `len`.
     fn truncate(&mut self, len: usize) {
-        while self.names.len() > len {
-            let Some((name, _)) = self.names.pop() else { break };
+        for name in self.names.drain(len..) {
             if let Some(ids) = self.by_name.get_mut(&name) {
                 ids.pop();
                 if ids.is_empty() {
@@ -69,7 +68,7 @@ impl Env {
     }
 
     fn names(&self) -> impl Iterator<Item = &str> {
-        self.names.iter().map(|(n, _)| n.as_str())
+        self.names.iter().map(String::as_str)
     }
 }
 
@@ -209,6 +208,19 @@ impl<'p> Checker<'p> {
         matches!(self.infer.var_kind(&self.p.types, t), Some(VarKind::Int | VarKind::Float))
     }
 
+    /// Whether a part of `t` (a resolved type) is the error type.
+    fn has_error(&self, t: TyId) -> bool {
+        self.p.types.any(t, &mut |k| matches!(k, TyKind::Error))
+    }
+
+    /// The type of constant `c`: its annotation, or the type its value was checked to have.
+    fn const_ty(&self, c: ConstId) -> TyId {
+        match self.p.const_(c).ty {
+            Some(t) => t,
+            None => self.const_tys.get(&c).copied().unwrap_or(self.p.types.error),
+        }
+    }
+
     fn declare_local(&mut self, name: &str, ty: TyId, kind: LocalKind, span: Span) -> LocalId {
         let id = self.declare_unnamed(ty, kind, span);
         self.locals[id.index()].name = name.into();
@@ -284,8 +296,7 @@ impl<'p> Checker<'p> {
             return true;
         }
         // A type made from one that already produced an error isn't reported again.
-        let is_error = |k: &TyKind| matches!(k, TyKind::Error);
-        if self.p.types.any(na, &mut { is_error }) || self.p.types.any(ne, &mut { is_error }) {
+        if self.has_error(na) || self.has_error(ne) {
             return false;
         }
         let (a, e) = (self.display(actual), self.display(expected));
@@ -351,7 +362,7 @@ impl<'p> Checker<'p> {
     /// Whether a statement never finishes normally: `return`, or a `loop` with no `break`.
     fn diverges(&self, s: &Stmt) -> bool {
         match &s.kind {
-            StmtKind::Expr(e) => matches!(self.p.types.kind(self.shallow(e.ty)), TyKind::Never),
+            StmtKind::Expr(e) => matches!(self.kind(e.ty), TyKind::Never),
             StmtKind::Loop { body } => !has_break(body),
             _ => false,
         }
@@ -638,7 +649,7 @@ impl<'p> Checker<'p> {
     }
 
     pub(crate) fn obligation(&mut self, ty: TyId, trait_ref: TraitRef, span: Span, why: String) {
-        self.obligations.push(Obligation { ty, trait_ref, span, code: codes::E0400, why });
+        self.obligation_coded(codes::E0400, ty, trait_ref, span, why);
     }
 
     /// An obligation reported with its own code when it isn't met.
@@ -761,27 +772,6 @@ pub fn root_local(e: &Expr) -> Option<LocalId> {
     }
 }
 
-/// The scope a function's signature and body see.
-fn fn_scope(p: &Program, f: FnId) -> Scope {
-    let def = p.func(f);
-    let mut scope = Scope::new(def.module);
-    match def.owner {
-        FnOwner::Free => {}
-        FnOwner::Impl(i) => {
-            scope.self_ty = Some(p.impl_(i).self_ty);
-            scope.impl_ = Some(i);
-            scope.push_params(p, &p.impl_(i).generics);
-        }
-        FnOwner::Trait(t) => {
-            let tr = p.trait_(t);
-            scope.self_ty = Some(p.types.param(tr.self_param));
-            scope.push_params(p, &tr.generics);
-        }
-    }
-    scope.push_params(p, &def.generics);
-    scope
-}
-
 /// What checking a function's body found.
 pub struct FnCheck {
     pub body: Option<Body>,
@@ -799,7 +789,7 @@ pub fn check_fn(p: &Program, consts: &ConstTypes, f: FnId) -> FnCheck {
     if def.attrs.intrinsic {
         return none;
     }
-    let mut c = Checker::new(p, consts, fn_scope(p, f), Some(f));
+    let mut c = Checker::new(p, consts, Scope::of_fn(p, f), Some(f));
     // A syntax error inside the body: it may be missing parts from the start.
     c.saw_syntax_error = p.syntax_errors.iter().any(|e| {
         e.file == body.span.file && body.span.start <= e.start && e.start <= body.span.end

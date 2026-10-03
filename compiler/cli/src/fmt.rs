@@ -43,16 +43,13 @@ fn collect(path: &Path, out: &mut Vec<PathBuf>) -> bool {
     ok
 }
 
-/// The stack of the thread that formats: the parser and the formatter recurse over syntax
-/// trees, and a file can hold the deepest tree the parser accepts (or rejects as too deep), as
-/// on the compiler's own thread.
-const STACK_SIZE: usize = 256 << 20;
-
+/// Formats on a thread with the compiler's stack: the parser and the formatter recurse over
+/// syntax trees, and a file can hold the deepest tree the parser accepts (or rejects as too deep).
 pub fn run(args: &[String]) -> ExitCode {
     std::thread::scope(|s| {
         std::thread::Builder::new()
             .name("wrela fmt".into())
-            .stack_size(STACK_SIZE)
+            .stack_size(wrela_driver::STACK_SIZE)
             .spawn_scoped(s, || format_files(args))
             .expect("can't start the formatter's thread")
             .join()

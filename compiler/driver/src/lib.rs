@@ -46,9 +46,9 @@ impl Output {
     }
 }
 
-/// The compiler thread's stack. Generous: it's reserved, not committed, and the deepest trees
-/// the parser accepts need far less.
-const STACK_SIZE: usize = 256 << 20;
+/// The compiler thread's stack, and the formatter's. Generous: it's reserved, not committed, and
+/// the deepest trees the parser accepts need far less.
+pub const STACK_SIZE: usize = 256 << 20;
 
 /// Checks the package at `root`: every diagnostic, including those lowering finds.
 pub fn check(root: &Path) -> Output {

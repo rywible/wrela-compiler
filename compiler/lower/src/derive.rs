@@ -226,42 +226,39 @@ fn build(
             let takes: Vec<bool> =
                 mb.m.functions[derived.index()].params.iter().map(|p| p.by_ref).collect();
             let f = &mut mb.m.functions[id.index()];
-            let ret = f.ret;
-            let nparams = f.params.len();
+            let mut body = Vec::new();
             let mut args = Vec::new();
-            for (i, &by_ref) in takes.iter().enumerate().take(nparams) {
-                let p = f.params[i].clone();
-                let own = ir::Place::root(ir::PlaceRoot::Param(i as u32));
-                let arg = match (p.by_ref, by_ref) {
-                    (true, true) => ir::Arg::Place(own),
-                    (false, false) => {
-                        let v = f.new_value(p.ty);
-                        f.body.push(ir::Stmt::Let(v, ir::Expr::Param(i as u32)));
-                        ir::Arg::Value(v)
-                    }
+            for (i, &by_ref) in takes.iter().enumerate().take(f.params.len()) {
+                let k = i as u32;
+                let ty = f.params[i].ty;
+                let arg = match (f.params[i].by_ref, by_ref) {
                     (false, true) => {
-                        let v = f.new_value(p.ty);
-                        f.body.push(ir::Stmt::Let(v, ir::Expr::Param(i as u32)));
-                        let l = f.new_local(&p.name, p.ty);
-                        f.body.push(ir::Stmt::Store(ir::Place::local(l), v));
+                        let v = f.new_value(ty);
+                        body.push(ir::Stmt::Let(v, ir::Expr::Param(k)));
+                        let l = f.new_local(f.params[i].name.clone(), ty);
+                        body.push(ir::Stmt::Store(ir::Place::local(l), v));
                         ir::Arg::Place(ir::Place::local(l))
                     }
                     (true, false) => {
-                        let v = f.new_value(p.ty);
-                        f.body.push(ir::Stmt::Let(v, ir::Expr::Load(own)));
+                        let v = f.new_value(ty);
+                        let own = ir::Place::root(ir::PlaceRoot::Param(k));
+                        body.push(ir::Stmt::Let(v, ir::Expr::Load(own)));
                         ir::Arg::Value(v)
                     }
+                    // Taken the way the instance takes it.
+                    _ => f.param_arg(k, &mut body),
                 };
                 args.push(arg);
             }
-            match ret {
+            match f.ret {
                 Some(t) => {
                     let v = f.new_value(t);
-                    f.body.push(ir::Stmt::Let(v, ir::Expr::Call(derived, args)));
-                    f.body.push(ir::Stmt::Return(Some(v)));
+                    body.push(ir::Stmt::Let(v, ir::Expr::Call(derived, args)));
+                    body.push(ir::Stmt::Return(Some(v)));
                 }
-                None => f.body.push(ir::Stmt::Return(None)),
+                None => body.push(ir::Stmt::Return(None)),
             }
+            f.body.extend(body);
         }
         Err(e) => {
             // Reported at the code that can't be derived, if the IR says where, with the

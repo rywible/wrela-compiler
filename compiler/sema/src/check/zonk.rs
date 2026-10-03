@@ -153,14 +153,13 @@ fn walk_pat(p: &mut Pat, f: &mut impl FnMut(&mut TyId)) {
 pub(super) fn finish_common(c: &mut Checker) {
     c.settle_projections(true);
     let unknown = c.infer.apply_defaults(&c.p.types);
-    let has_errors = wrela_diag::has_errors(&c.diags);
-    if !has_errors {
-        for span in unknown.into_iter().take(1) {
-            c.err(
-                Diagnostic::new(codes::E0306, span, "the type of this can't be inferred")
-                    .with_help("annotate it, as in `let x: f32 = ...`"),
-            );
-        }
+    if let Some(&span) = unknown.first()
+        && !wrela_diag::has_errors(&c.diags)
+    {
+        c.err(
+            Diagnostic::new(codes::E0306, span, "the type of this can't be inferred")
+                .with_help("annotate it, as in `let x: f32 = ...`"),
+        );
     }
     c.binding_kinds();
     // `-x` of an integer whose type inference settled later: it must be signed.
@@ -192,8 +191,7 @@ pub(super) fn finish_common(c: &mut Checker) {
     // Built-in calls whose literal arguments settled later.
     for (b, tys, span) in std::mem::take(&mut c.builtin_calls) {
         let tys: Vec<TyId> = tys.iter().map(|&t| c.infer.resolve(&c.p.types, t)).collect();
-        let is_error = |k: &TyKind| matches!(k, TyKind::Error);
-        if tys.iter().any(|&t| c.p.types.any(t, &mut { is_error })) {
+        if tys.iter().any(|&t| c.has_error(t)) {
             continue;
         }
         match b.result(c.p, &tys) {
@@ -294,6 +292,9 @@ pub(super) fn finish_common(c: &mut Checker) {
     let obligations = std::mem::take(&mut c.obligations);
     for o in obligations {
         let ty = c.infer.resolve(&c.p.types, o.ty);
+        if c.p.types.has_vars(ty) || matches!(c.p.types.kind(ty), TyKind::Error) {
+            continue;
+        }
         let args: Vec<TyId> = o
             .trait_ref
             .args
@@ -301,9 +302,6 @@ pub(super) fn finish_common(c: &mut Checker) {
             .map(|&a| traits::normalize(c.p, c.infer.resolve(&c.p.types, a), None))
             .collect();
         let r = TraitRef { trait_: o.trait_ref.trait_, args };
-        if c.p.types.has_vars(ty) || matches!(c.p.types.kind(ty), TyKind::Error) {
-            continue;
-        }
         let ty = traits::normalize(c.p, ty, None);
         if !traits::implements(c.p, ty, &r) {
             let (t, tr) = (c.p.display_ty(ty), c.p.display_trait_ref(&r));
@@ -358,11 +356,7 @@ pub(super) fn finish(
         resolve(&mut cl.ret);
         walk_tys(&mut cl.body, &mut resolve);
     }
-    let hidden_ret = hidden.map(|h| {
-        let mut h = h;
-        resolve(&mut h);
-        h
-    });
+    let hidden_ret = hidden.map(|h| infer.resolve(types, h));
     stored_callables(c.p, &value, &mut c.diags);
     for cl in &closures {
         stored_callables(c.p, &cl.body, &mut c.diags);
@@ -411,22 +405,17 @@ fn stored_callables(p: &Program, e: &Expr, out: &mut Vec<Diagnostic>) {
 
 fn stored_callables_block(p: &Program, b: &Block, out: &mut Vec<Diagnostic>) {
     for s in &b.stmts {
-        let exprs: Vec<&Expr> = match &s.kind {
-            StmtKind::Bind { init, .. } => vec![init],
-            StmtKind::Assign { place, value, .. } => vec![place, value],
-            StmtKind::Expr(e) => vec![e],
-            StmtKind::While { cond, .. } => vec![cond],
-            StmtKind::Loop { .. } => vec![],
-            StmtKind::ForRange { start, end, .. } => vec![start, end],
-            StmtKind::ForEach { array, .. } => vec![array],
+        let (exprs, body): (&[&Expr], _) = match &s.kind {
+            StmtKind::Bind { init: e, .. } | StmtKind::Expr(e) => (&[e], None),
+            StmtKind::Assign { place, value, .. } => (&[place, value], None),
+            StmtKind::While { cond, body } => (&[cond], Some(body)),
+            StmtKind::Loop { body } => (&[], Some(body)),
+            StmtKind::ForRange { start, end, body, .. } => (&[start, end], Some(body)),
+            StmtKind::ForEach { array, body, .. } => (&[array], Some(body)),
         };
-        exprs.into_iter().for_each(|e| stored_callables(p, e, out));
-        match &s.kind {
-            StmtKind::While { body, .. }
-            | StmtKind::Loop { body }
-            | StmtKind::ForRange { body, .. }
-            | StmtKind::ForEach { body, .. } => stored_callables_block(p, body, out),
-            _ => {}
+        exprs.iter().for_each(|e| stored_callables(p, e, out));
+        if let Some(body) = body {
+            stored_callables_block(p, body, out);
         }
     }
     if let Some(t) = &b.tail {

@@ -242,7 +242,7 @@ fn implements_builtin_uncached(p: &Program, ty: TyId, lang: Lang) -> bool {
 /// Replaces projections on concrete types by the impl's associated type. `in_impl` resolves
 /// `Self::Name` inside that impl.
 pub fn normalize(p: &Program, ty: TyId, in_impl: Option<&ImplDef>) -> TyId {
-    if !p.types.any(ty, &mut |k| matches!(k, TyKind::Projection { .. })) {
+    if !p.types.has_projections(ty) {
         return ty;
     }
     let ty = match in_impl {
@@ -264,48 +264,28 @@ pub fn normalize(p: &Program, ty: TyId, in_impl: Option<&ImplDef>) -> TyId {
 }
 
 fn resolve_projections(p: &Program, ty: TyId) -> TyId {
-    match p.types.kind(ty) {
+    p.types.map(ty, &mut |types, t| match types.kind(t) {
         TyKind::Projection { self_ty, trait_, trait_args, name } => {
             let self_ty = resolve_projections(p, *self_ty);
             let r = TraitRef { trait_: *trait_, args: trait_args.clone() };
-            if !p.types.has_params(self_ty)
-                && !matches!(p.types.kind(self_ty), TyKind::Opaque(..) | TyKind::Var(_))
+            if !types.has_params(self_ty)
+                && !matches!(types.kind(self_ty), TyKind::Opaque(..) | TyKind::Var(_))
                 && let Some((i, subst)) = find_impl(p, self_ty, &r)
                 && let Some(&a) = p.impl_(i).assoc_types.get(name)
             {
-                let a = p.types.subst(a, &subst);
-                return resolve_projections(p, a);
+                return Some(resolve_projections(p, types.subst(a, &subst)));
             }
-            p.types.intern(TyKind::Projection {
+            Some(types.intern(TyKind::Projection {
                 self_ty,
                 trait_: r.trait_,
                 trait_args: r.args,
                 name: name.clone(),
-            })
+            }))
         }
-        TyKind::Tuple(ts) => {
-            let ts = ts.iter().map(|&t| resolve_projections(p, t)).collect();
-            p.types.intern(TyKind::Tuple(ts))
-        }
-        TyKind::Adt(a, ts) => {
-            let ts = ts.iter().map(|&t| resolve_projections(p, t)).collect();
-            p.types.intern(TyKind::Adt(*a, ts))
-        }
-        TyKind::Array(e, n) => {
-            let e = resolve_projections(p, *e);
-            p.types.intern(TyKind::Array(e, *n))
-        }
-        TyKind::Slice(e) => {
-            let e = resolve_projections(p, *e);
-            p.types.intern(TyKind::Slice(e))
-        }
-        TyKind::FnPtr(ps, r) => {
-            let ps = ps.iter().map(|&t| resolve_projections(p, t)).collect();
-            let r = resolve_projections(p, *r);
-            p.types.intern(TyKind::FnPtr(ps, r))
-        }
-        _ => ty,
-    }
+        // Left as they are, arguments and all.
+        TyKind::Opaque(..) | TyKind::Closure(..) | TyKind::FnDef(..) => Some(t),
+        _ => None,
+    })
 }
 
 /// The method `name` declared in trait `t` itself, if it has one. Not its supertraits': the

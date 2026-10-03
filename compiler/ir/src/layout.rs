@@ -14,6 +14,18 @@ pub struct Layout {
     pub align: u32,
 }
 
+impl Layout {
+    /// The distance between consecutive elements of an array of this layout.
+    pub fn stride(self) -> u32 {
+        round_up(self.align, self.size)
+    }
+
+    /// An array of `n` elements of this layout.
+    pub fn array(self, n: u32) -> Layout {
+        Layout { size: n.saturating_mul(self.stride()), align: self.align }
+    }
+}
+
 /// Sizes saturate at `u32::MAX` rather than overflow: no value that large fits in memory, and a
 /// function with one traps on entry, as a stack overflow.
 pub fn round_up(align: u32, n: u32) -> u32 {
@@ -49,17 +61,10 @@ pub(crate) fn compute(types: &Types, d: &TypeDef) -> (Layout, Box<[u32]>) {
     let layout = match d {
         TypeDef::Scalar(s) => scalar_layout(*s),
         TypeDef::Vector(n) => vector_layout(*n),
-        TypeDef::Matrix(n) => {
-            Layout { size: *n as u32 * column_stride(*n), align: vector_layout(*n).align }
-        }
-        TypeDef::Array(e, n) => {
-            let el = types.layout(*e);
-            Layout { size: n.saturating_mul(round_up(el.align, el.size)), align: el.align }
-        }
-        TypeDef::RuntimeArray(e) => {
-            let el = types.layout(*e);
-            Layout { size: round_up(el.align, el.size), align: el.align }
-        }
+        // Its columns, as an array.
+        TypeDef::Matrix(n) => vector_layout(*n).array(u32::from(*n)),
+        TypeDef::Array(e, n) => types.layout(*e).array(*n),
+        TypeDef::RuntimeArray(e) => types.layout(*e).array(1),
         TypeDef::Struct { fields, .. } => {
             let (offsets, layout) = pack(types, fields.iter().map(|(_, f)| *f));
             return (layout, offsets.into());
@@ -81,35 +86,43 @@ pub(crate) fn compute(types: &Types, d: &TypeDef) -> (Layout, Box<[u32]>) {
 /// The largest type WGSL allows, in bytes (naga's limit, which the WebGPU hosts share).
 pub const WGSL_MAX_TYPE_SIZE: u32 = i32::MAX as u32;
 
-/// A type's layout in WGSL, which has no unions: [`layout`], but with each enum laid out as the
-/// struct the WGSL back end holds it in (its `u32` tag, then every payload). Each part is laid
-/// out once, however often it appears.
+/// A type's layout in WGSL: see [`WgslLayouts`].
 pub fn wgsl_layout(types: &Types, t: TypeId) -> Layout {
-    fn go(types: &Types, t: TypeId, done: &mut HashMap<TypeId, Layout>) -> Layout {
-        if let Some(&l) = done.get(&t) {
-            return l;
+    WgslLayouts::default().get(types, t).0
+}
+
+/// Types' layouts in WGSL, which has no unions: [`layout`], but with each enum laid out as the
+/// struct the WGSL back end holds it in (its `u32` tag, then every payload). Each type is laid
+/// out once, however often it appears.
+#[derive(Default)]
+pub struct WgslLayouts(HashMap<TypeId, (Layout, Vec<u32>)>);
+
+impl WgslLayouts {
+    /// `t`'s layout, and its members' offsets: a struct's fields, or an enum's tag then each
+    /// payload (none for other types).
+    pub fn get(&mut self, types: &Types, t: TypeId) -> (Layout, &[u32]) {
+        if !self.0.contains_key(&t) {
+            let out = match types.get(t) {
+                TypeDef::Array(e, n) => (self.get(types, *e).0.array(*n), Vec::new()),
+                TypeDef::Struct { fields, .. } => {
+                    let (offsets, l) =
+                        pack_layouts(fields.iter().map(|(_, f)| self.get(types, *f).0));
+                    (l, offsets)
+                }
+                TypeDef::Enum { variants, .. } => {
+                    let payloads =
+                        variants.iter().filter_map(|(_, p)| Some(self.get(types, (*p)?).0));
+                    let (offsets, l) =
+                        pack_layouts(std::iter::once(scalar_layout(Scalar::U32)).chain(payloads));
+                    (l, offsets)
+                }
+                _ => (types.layout(t), Vec::new()),
+            };
+            self.0.insert(t, out);
         }
-        let l = match types.get(t) {
-            TypeDef::Array(e, n) => {
-                let el = go(types, *e, done);
-                Layout { size: n.saturating_mul(round_up(el.align, el.size)), align: el.align }
-            }
-            TypeDef::Struct { fields, .. } => {
-                let ls: Vec<Layout> = fields.iter().map(|(_, f)| go(types, *f, done)).collect();
-                pack_layouts(ls).1
-            }
-            TypeDef::Enum { variants, .. } => {
-                let ls: Vec<Layout> = std::iter::once(scalar_layout(Scalar::U32))
-                    .chain(variants.iter().filter_map(|(_, p)| Some(go(types, (*p)?, done))))
-                    .collect();
-                pack_layouts(ls).1
-            }
-            _ => types.layout(t),
-        };
-        done.insert(t, l);
-        l
+        let (l, offsets) = &self.0[&t];
+        (*l, offsets)
     }
-    go(types, t, &mut HashMap::new())
 }
 
 /// Fields one after the other, each at the first offset its alignment allows (a struct's
@@ -139,14 +152,12 @@ pub fn field_offsets(types: &Types, t: TypeId) -> &[u32] {
 
 /// The distance between a `matN`'s columns.
 pub fn column_stride(n: u8) -> u32 {
-    let col = vector_layout(n);
-    round_up(col.align, col.size)
+    vector_layout(n).stride()
 }
 
 /// The distance between consecutive elements of an array of `elem`.
 pub fn array_stride(types: &Types, elem: TypeId) -> u32 {
-    let l = layout(types, elem);
-    round_up(l.align, l.size)
+    types.layout(elem).stride()
 }
 
 /// Whether a type's layout meets WGSL's extra rules for the uniform address space: arrays have

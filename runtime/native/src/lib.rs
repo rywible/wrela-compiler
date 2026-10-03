@@ -180,6 +180,28 @@ impl program::Executor for NoGpu {
     }
 }
 
+/// A build's WASM, compiled and checked once: each [`CpuBuild::start`] gives a new [`CpuHost`]
+/// without compiling it again (for tests that run a program on many threads).
+pub struct CpuBuild {
+    manifest: Manifest,
+    compiled: program::Compiled,
+}
+
+impl CpuBuild {
+    /// Loads the build in `dir`; its shaders must exist but aren't compiled.
+    pub fn load(dir: impl AsRef<Path>) -> Result<CpuBuild> {
+        let (manifest, wasm, _) = read_build(dir.as_ref())?;
+        Ok(CpuBuild { compiled: program::compile(&wasm)?, manifest })
+    }
+
+    /// A new instance of the program: its own memory, batches and hash.
+    pub fn start(&self) -> Result<CpuHost> {
+        let mut program = Program::instantiate(&self.compiled, &self.manifest, NoGpu)?;
+        program.record_batches();
+        Ok(CpuHost { program })
+    }
+}
+
 /// A program's WASM alone: exports run under wasmtime, and what they submit is decoded,
 /// sequenced and checked like a [`Host`]'s, then dropped. No GPU, no lock.
 pub struct CpuHost {
@@ -189,11 +211,7 @@ pub struct CpuHost {
 impl CpuHost {
     /// Loads the build in `dir`; its shaders must exist but aren't compiled.
     pub fn load(dir: impl AsRef<Path>) -> Result<CpuHost> {
-        let (manifest, wasm, _) = read_build(dir.as_ref())?;
-        let compiled = program::compile(&wasm)?;
-        let mut program = Program::instantiate(&compiled, &manifest, NoGpu)?;
-        program.record_batches();
-        Ok(CpuHost { program })
+        CpuBuild::load(dir)?.start()
     }
 
     /// Calls an export with numeric arguments.

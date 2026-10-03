@@ -34,7 +34,7 @@ pub(super) fn value_and_gradient(
     let mut mask = vec![false; func.params.len()];
     mask[xi] = true;
     let d = derive(m, cache, f, mask.clone(), n, target)?;
-    let returns = returns_active(m, cache, f, mask, Mode::Ad)?;
+    let returns = returns_active(m, cache, f, mask, Mode::Ad);
     let f32 = m.types.f32();
     let tuple = m.types.intern(TypeDef::Struct {
         name: format!("(f32, {})", m.types.display(x_ty)),
@@ -120,23 +120,10 @@ pub(super) fn derive(
         return Ok(d);
     }
     let func = m.functions[f.index()].clone();
-    if let Some(at) = records_gpu_work(&func.body, None) {
-        return Err(Error::not_derivable(
-            "this records GPU work, which a derived function can't do",
-        )
-        .at(at));
-    }
-    let returns = returns_active(m, cache, f, mask.clone(), Mode::Ad)?;
-    let act = body_activity(m, cache, f, &mask, Mode::Ad)?;
-    for (i, p) in func.params.iter().enumerate() {
-        if act.params[i] && !mask[i] && p.mutable {
-            // Placed by the caller's statement (the call), or at the `gradient(..)` call.
-            return Err(Error::not_derivable(format!(
-                "this would write a derivative through the `mut` parameter `{}`",
-                p.name
-            )));
-        }
-    }
+    no_gpu_work(&func.body)?;
+    let returns = returns_active(m, cache, f, mask.clone(), Mode::Ad);
+    let act = body_activity(m, cache, f, &mask, Mode::Ad);
+    no_write_through_mut(&func, &act, &mask, "a derivative")?;
     let mut nf = func.clone_signature();
     nf.name = format!("{}_d{}", func.name, n);
     // Tangent parameters, appended: n per active parameter.
@@ -274,6 +261,10 @@ impl Ad<'_> {
         self.tv.get(&v).and_then(|ts| ts[k])
     }
 
+    fn is_matrix(&self, v: ValueId) -> bool {
+        matches!(self.m.types.get(self.ty(v)), TypeDef::Matrix(_))
+    }
+
     /// The tangent `t` as an operand of type `ty`, or a zero for a structurally zero one.
     fn tangent_or_zero(&mut self, out: &mut Block, t: Option<ValueId>, ty: TypeId) -> ValueId {
         match t {
@@ -286,8 +277,7 @@ impl Ad<'_> {
     /// `b × g`, becomes `b × (g f)`, with `g f` made once for all directions: a chain of
     /// factors (`y y l2`, `sqrt(s) / l2`) costs one multiplication per direction, not one each.
     fn scale(&mut self, out: &mut Block, t: ValueId, f: ValueId, ty: TypeId) -> ValueId {
-        let matrix = |me: &Self, v: ValueId| matches!(me.m.types.get(me.ty(v)), TypeDef::Matrix(_));
-        if matrix(self, t) || matrix(self, f) {
+        if self.is_matrix(t) || self.is_matrix(f) {
             return self.bin(out, BinOp::Mul, t, f, ty);
         }
         if let Some(&(b, g)) = self.scaled.get(&t)
@@ -465,16 +455,12 @@ impl Ad<'_> {
     fn call(&mut self, v: Option<ValueId>, g: FuncId, args: &[Arg], out: &mut Block) -> Result<()> {
         let mask: Vec<bool> = args.iter().map(|a| arg_active(&self.act, a)).collect();
         if !mask.iter().any(|b| *b) {
-            out.push(match v {
-                Some(v) => Stmt::Let(v, Expr::Call(g, args.to_vec())),
-                None => Stmt::Eval(Expr::Call(g, args.to_vec())),
-            });
+            out.push(let_or_eval(v, Expr::Call(g, args.to_vec())));
             return Ok(());
         }
         let dg = derive(self.m, self.cache, g, mask.clone(), self.n, self.target)?;
-        let returns = returns_active(self.m, self.cache, g, mask.clone(), Mode::Ad)?;
+        let returns = returns_active(self.m, self.cache, g, mask.clone(), Mode::Ad);
         let mut new_args = args.to_vec();
-        let callee_params = self.m.functions[g.index()].params.clone();
         for (i, a) in args.iter().enumerate() {
             if !mask[i] {
                 continue;
@@ -482,7 +468,7 @@ impl Ad<'_> {
             for k in 0..self.n as usize {
                 new_args.push(match a {
                     Arg::Value(x) => {
-                        let ty = callee_params[i].ty;
+                        let ty = self.m.functions[g.index()].params[i].ty;
                         Arg::Value(self.tangent_or_zero(out, self.t(*x, k), ty))
                     }
                     Arg::Place(p) => Arg::Place(self.place(p, k)?),
@@ -503,8 +489,7 @@ impl Ad<'_> {
                 }
                 self.tv.insert(v, ts);
             }
-            (Some(v), false) => out.push(Stmt::Let(v, Expr::Call(dg, new_args))),
-            (None, _) => out.push(Stmt::Eval(Expr::Call(dg, new_args))),
+            (v, _) => out.push(let_or_eval(v, Expr::Call(dg, new_args))),
         }
         Ok(())
     }
@@ -548,10 +533,7 @@ impl Ad<'_> {
                 match op {
                     BinOp::Add => self.add(out, da, db, ty),
                     BinOp::Sub => self.sub(out, da, db, ty),
-                    BinOp::Mul
-                        if self.track.same_value(*a, *b)
-                            && !matches!(self.m.types.get(self.ty(*a)), TypeDef::Matrix(_)) =>
-                    {
+                    BinOp::Mul if self.track.same_value(*a, *b) && !self.is_matrix(*a) => {
                         // d(a²) = 2 a da (a matrix product doesn't commute: dM M + M dM)
                         da.map(|da| {
                             let two = self.fc(out, ty, 2.0);
@@ -563,7 +545,7 @@ impl Ad<'_> {
                         let x = self.mul(out, da, *b, ty);
                         // A matrix product keeps its order (`scale` sees to that).
                         let y = db.map(|db| {
-                            if matches!(self.m.types.get(self.ty(*a)), TypeDef::Matrix(_)) {
+                            if self.is_matrix(*a) {
                                 self.bin(out, BinOp::Mul, *a, db, ty)
                             } else {
                                 self.scale(out, db, *a, ty)

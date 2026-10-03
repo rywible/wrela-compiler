@@ -760,12 +760,9 @@ impl Expr {
                 f(a);
                 f(b);
             }
-            ExprKind::Call { callee, args, .. } => {
-                f(callee);
-                args.iter().for_each(|a| f(&a.value));
-            }
-            ExprKind::MethodCall { receiver, args, .. } => {
-                f(receiver);
+            ExprKind::Call { callee: x, args, .. }
+            | ExprKind::MethodCall { receiver: x, args, .. } => {
+                f(x);
                 args.iter().for_each(|a| f(&a.value));
             }
             ExprKind::StructLit { fields, base, .. } => {

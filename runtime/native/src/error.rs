@@ -29,10 +29,7 @@ pub enum Error {
     Stream(StreamError),
     /// A well-formed command the host can't carry out: an unknown handle, a pipeline of the wrong
     /// kind, the wrong number of buffers or uniform bytes, a write past a buffer's end.
-    Command {
-        opcode: Opcode,
-        why: String,
-    },
+    Command(CommandError),
     /// The program trapped, or called the host with arguments it can't use.
     Trap(String),
     /// The GPU, its adapter or device failed, or reported a validation error.
@@ -53,7 +50,7 @@ impl fmt::Display for Error {
                 write!(f, "pipeline `{pipeline}` (shader {shader}) failed to build:\n{message}")
             }
             Error::Stream(e) => write!(f, "{e}"),
-            Error::Command { opcode, why } => write!(f, "{} failed: {why}", opcode.name()),
+            Error::Command(e) => write!(f, "{e}"),
             Error::Trap(why) => write!(f, "the program trapped: {why}"),
             Error::Gpu(why) => write!(f, "GPU error: {why}"),
             Error::Lock(why) => write!(f, "GPU lock: {why}"),
@@ -80,7 +77,7 @@ impl From<StreamError> for Error {
 
 impl From<CommandError> for Error {
     fn from(e: CommandError) -> Error {
-        Error::Command { opcode: e.opcode, why: e.why }
+        Error::Command(e)
     }
 }
 
@@ -96,6 +93,6 @@ impl Error {
     }
 
     pub(crate) fn command(opcode: Opcode, why: impl Into<String>) -> Error {
-        Error::Command { opcode, why: why.into() }
+        Error::Command(CommandError { opcode, why: why.into() })
     }
 }

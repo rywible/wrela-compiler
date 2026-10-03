@@ -31,12 +31,7 @@ pub fn emit(l: &Lowered, sources: &SourceMap) -> BuildOutput {
                 .lines
                 .iter()
                 .map(|&(offset, span)| {
-                    let loc = span.map(|s| {
-                        let f = sources.file(s.file);
-                        let lc = f.line_col(s.start);
-                        format!("{}:{}:{}", f.name, lc.line, lc.column)
-                    });
-                    (offset, loc)
+                    (offset, span.map(|s| sources.file(s.file).location(s.start)))
                 })
                 .collect();
             let lines = wrela_abi::lines::Lines::new(entries).encode();

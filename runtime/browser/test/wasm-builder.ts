@@ -66,7 +66,6 @@ const section = (id: number, body: number[]) => (body.length ? [id, ...uleb(body
 export const op = {
   i32: (n: number) => [0x41, ...sleb(n | 0)],
   call: (f: number) => [0x10, ...uleb(f)],
-  localGet: (i: number) => [0x20, ...uleb(i)],
   unreachable: [0x00],
 };
 

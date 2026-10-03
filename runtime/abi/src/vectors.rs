@@ -175,9 +175,10 @@ fn sequences() -> Vec<Value> {
     ]
 }
 
-/// The manifest the check vectors run against: pipeline 0 renders and pipeline 1 computes;
-/// each takes 16 uniform bytes and binds a read-only buffer then a read-write one.
-fn check_manifest() -> Manifest {
+/// The manifest the check vectors (and the native host's tests) run against: pipelines 0 and 2
+/// render, 1 and 3 compute; each takes 16 uniform bytes; 0 and 1 bind a read-only buffer then a
+/// read-write one, 2 and 3 two read-write ones.
+pub fn check_manifest() -> Manifest {
     let mut m = Manifest::new("game.wasm");
     let shape = |name: &str, stage| Pipeline {
         name: name.into(),

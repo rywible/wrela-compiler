@@ -122,12 +122,13 @@ pub fn comment_places(src: &str) -> Vec<(String, usize, bool)> {
     let mut before = 0;
     lexed
         .comments
-        .iter()
+        .into_iter()
         .map(|c| {
             while let Some(t) = code.next_if(|t| t.span.end <= c.span.start) {
                 before += t.span.range().len();
             }
-            (c.text.clone(), before, on_own_line(src, c))
+            let own_line = on_own_line(src, &c);
+            (c.text, before, own_line)
         })
         .collect()
 }
@@ -210,17 +211,18 @@ impl<'a> Builder<'a> {
     /// placed yet: those are directly before it, and keep their line break.
     fn tok(&mut self, s: &str) -> Doc {
         let mut out = Vec::new();
-        let mut written = String::new();
-        for c in s.chars() {
+        // Where the text not yet in `out` starts.
+        let mut from = 0;
+        for (i, c) in s.char_indices() {
             if let Some(t) = self.code.get(self.at.0).copied() {
                 let expected = self.text[t.start as usize + self.at.1..].chars().next();
                 if expected == Some(c) {
                     if self.at.1 == 0 && self.has_comment_before(t.start) {
-                        let before = written.trim_end();
+                        let before = s[from..i].trim_end();
                         if !before.is_empty() {
                             out.push(text(before));
                         }
-                        written.clear();
+                        from = i;
                         out.push(self.inline_comments(t.start));
                     }
                     self.at.1 += c.len_utf8();
@@ -235,13 +237,13 @@ impl<'a> Builder<'a> {
                     );
                 }
             }
-            written.push(c);
         }
+        let rest = &s[from..];
         if out.is_empty() {
-            return text(written);
+            return text(rest);
         }
-        if !written.is_empty() {
-            out.push(text(written));
+        if !rest.is_empty() {
+            out.push(text(rest));
         }
         concat(out)
     }
@@ -530,16 +532,12 @@ impl<'a> Builder<'a> {
         let mut prev: Option<&Item> = None;
         for item in &f.items {
             if let Some(p) = prev {
-                let both_use =
-                    matches!(p.kind, ItemKind::Use(_)) && matches!(item.kind, ItemKind::Use(_));
-                let both_const =
-                    matches!(p.kind, ItemKind::Const(_)) && matches!(item.kind, ItemKind::Const(_));
-                let blank = if both_use {
-                    false
-                } else if both_const {
-                    self.blank_between(p.span.end, item.span.start)
-                } else {
-                    true
+                let blank = match (&p.kind, &item.kind) {
+                    (ItemKind::Use(_), ItemKind::Use(_)) => false,
+                    (ItemKind::Const(_), ItemKind::Const(_)) => {
+                        self.blank_between(p.span.end, item.span.start)
+                    }
+                    _ => true,
                 };
                 out.push(self.hard_break(item.span.start, blank));
             } else {
@@ -1219,7 +1217,8 @@ impl<'a> Builder<'a> {
     /// How many parentheses around pattern `p` the parser dropped: `(p)` parses as `p`, with
     /// the parentheses' span. The cursor is at the pattern.
     fn pattern_parens(&self, p: &Pat) -> usize {
-        // A tuple's own `(` is the last before its first element.
+        // A tuple's own `(` is the last before its first element, or, if it's empty, before
+        // its `)`.
         let (own, first) = match &p.kind {
             PatKind::Tuple(pats) => (1, pats.first().map(|x| x.span.start)),
             _ => (0, None),
@@ -1228,9 +1227,7 @@ impl<'a> Builder<'a> {
             .iter()
             .take_while(|t| &self.text[t.range()] == "(" && first.is_none_or(|f| t.start < f))
             .count();
-        // An empty tuple's own `(` is right before a `)`.
-        let empty = first.is_none() && own == 1;
-        opens.saturating_sub(if empty || first.is_some() { own } else { 0 })
+        opens.saturating_sub(own)
     }
 
     fn pat(&mut self, p: &Pat) -> Doc {

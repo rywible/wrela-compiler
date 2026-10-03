@@ -13,7 +13,7 @@
 //! export's WASM types (`u32` and `bool` are `i32`s). A program without a `frame` export gets
 //! an empty one.
 
-use crate::scratch;
+use crate::{scratch, with_frame};
 use std::path::Path;
 use wrela_host::{CpuHost, Error, Value};
 use wrela_tests::{build, cases, copy_dir, header, repo_root};
@@ -83,15 +83,12 @@ fn run_case(path: &Path) -> Result<usize, String> {
     } else {
         path.to_path_buf()
     };
-    let mut text = std::fs::read_to_string(&main).expect("read");
+    let text = std::fs::read_to_string(&main).expect("read");
     let expects: Vec<Expect> = header(&text, "expect").map(parse_expect).collect();
     if expects.is_empty() {
         return Err("no `// expect:` lines".into());
     }
-    if !text.contains("fn frame(") {
-        text.push_str("\npub fn frame(time: f32, width: u32, height: u32) {}\n");
-    }
-    std::fs::write(dir.join("main.wrela"), &text).expect("write");
+    std::fs::write(dir.join("main.wrela"), with_frame(&text)).expect("write");
     let out = dir.join("build");
     let built = build(&dir).map_err(|e| format!("doesn't build:\n{e}"))?;
     built.write_to(&out).expect("write the build");

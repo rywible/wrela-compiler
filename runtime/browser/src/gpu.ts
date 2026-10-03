@@ -14,7 +14,7 @@
 
 import { SCREEN_FORMAT } from "./abi.gen.ts";
 import { errorMessage } from "./errors.ts";
-import type { BufferBinding, Manifest, Pipeline } from "./manifest.ts";
+import type { BufferBinding, Manifest, Pipeline, UniformBlock } from "./manifest.ts";
 import type { Bytes, Command } from "./stream.ts";
 
 const RING_START = 64 * 1024;
@@ -36,7 +36,7 @@ export interface BuiltPipeline {
   layout: GPUBindGroupLayout;
   compute: GPUComputePipeline | null;
   render: GPURenderPipeline | null;
-  uniform: { binding: number; size: number } | null;
+  uniform: UniformBlock | null;
   buffers: BufferBinding[];
 }
 
@@ -122,7 +122,7 @@ async function buildPipeline(device: GPUDevice, p: Pipeline, source: string): Pr
     layout,
     compute,
     render,
-    uniform: p.uniform && { binding: p.uniform.binding, size: p.uniform.size },
+    uniform: p.uniform,
     buffers: p.buffers,
   };
 }
@@ -132,13 +132,7 @@ export function buildPipelines(device: GPUDevice, manifest: Manifest, shaders: s
   return Promise.all(manifest.pipelines.map((p, i) => buildPipeline(device, p, shaders[i]!)));
 }
 
-interface PendingDraw {
-  pipeline: number;
-  vertices: number;
-  instances: number;
-  buffers: number[];
-  uniforms: Bytes;
-}
+type Draw = Extract<Command, { op: "Draw" }>;
 
 /** `n` rounded up to a multiple of `align`. */
 export const alignTo = (n: number, align: number) => Math.ceil(n / align) * align;
@@ -156,7 +150,7 @@ export class GpuExecutor {
   #staging: Bytes = new Uint8Array(RING_START);
   #staged = 0;
   #encoder: GPUCommandEncoder | null = null;
-  #pass: { clear: [number, number, number, number]; draws: PendingDraw[] } | null = null;
+  #pass: { clear: [number, number, number, number]; draws: Draw[] } | null = null;
 
   constructor(
     readonly device: GPUDevice,
@@ -193,12 +187,10 @@ export class GpuExecutor {
       case "BeginScreenPass":
         this.#pass = { clear: cmd.clear, draws: [] };
         return;
-      case "Draw": {
+      case "Draw":
         // The uniform bytes are a view into the program's memory: copy them.
-        const { pipeline, vertices, instances, buffers } = cmd;
-        this.#pass?.draws.push({ pipeline, vertices, instances, buffers, uniforms: cmd.uniforms.slice() });
+        this.#pass?.draws.push({ ...cmd, uniforms: cmd.uniforms.slice() });
         return;
-      }
       case "Present":
         this.#present();
         return;
@@ -325,12 +317,8 @@ export class GpuExecutor {
     const pass = this.#pass;
     this.#pass = null;
     if (pass === null) throw new Error("host bug: Present without a screen pass");
+    // Everything that can flush happens before anything is recorded for this pass.
     this.#reserve(pass.draws.reduce((n, d) => n + alignTo(d.uniforms.length, this.#align), 0));
-    const recorded = pass.draws.map((d) => {
-      const p = this.#pipeline(d.pipeline);
-      if (p.render === null) throw new Error(`host bug: pipeline ${d.pipeline} isn't a render pipeline`);
-      return { d, render: p.render, offsets: this.#push(d.uniforms), bindGroup: this.#bindGroup(d.pipeline, d.buffers) };
-    });
     const [r, g, b, a] = pass.clear;
     const encoder = this.#encoderNow();
     const rp = encoder.beginRenderPass({
@@ -339,9 +327,12 @@ export class GpuExecutor {
         { view: this.screen.texture().createView(), clearValue: { r, g, b, a }, loadOp: "clear", storeOp: "store" },
       ],
     });
-    for (const { d, render, offsets, bindGroup } of recorded) {
-      rp.setPipeline(render);
-      rp.setBindGroup(0, bindGroup, offsets);
+    for (const d of pass.draws) {
+      const p = this.#pipeline(d.pipeline);
+      if (p.render === null) throw new Error(`host bug: pipeline ${d.pipeline} isn't a render pipeline`);
+      const offsets = this.#push(d.uniforms);
+      rp.setPipeline(p.render);
+      rp.setBindGroup(0, this.#bindGroup(d.pipeline, d.buffers), offsets);
       rp.draw(d.vertices, d.instances);
     }
     rp.end();

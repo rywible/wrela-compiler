@@ -60,15 +60,15 @@ impl Roots {
             if p.is_std(f.module) || !checked.mir.contains_key(&id) {
                 continue;
             }
+            let generic = !p.fn_all_generics(id).is_empty();
             if Some(f.module) == p.main
                 && f.public
                 && f.owner == wrela_sema::defs::FnOwner::Free
                 && f.attrs.entry.is_none()
-                && p.fn_all_generics(id).is_empty()
+                && !generic
             {
                 exports.push(id);
             }
-            let generic = !p.fn_all_generics(id).is_empty();
             if f.attrs.entry.is_some() && !generic {
                 gpu_checks.push((id, Vec::new()));
             } else if f.attrs.gpu.is_some()
@@ -124,7 +124,7 @@ fn on_gpu(p: &Program, t: TyId) -> bool {
             let variants = p.adt(*a).variants().len().max(1);
             (0..variants).all(|v| {
                 let v = p.adt(*a).is_enum().then_some(v as u32);
-                p.fields_of(*a, args, v).iter().all(|(_, ft)| on_gpu(p, *ft))
+                p.fields_of(*a, args, v).into_iter().all(|ft| on_gpu(p, ft))
             })
         }
         _ => false,
@@ -485,11 +485,6 @@ impl<'a> Cx<'a> {
         }
     }
 
-    /// The lang item function `l`.
-    pub fn lang_fn(&self, l: Lang) -> Option<FnId> {
-        self.checked.program.lang_fn(l)
-    }
-
     pub fn entry_of(&self, f: FnId) -> Option<Entry> {
         self.checked.program.func(f).attrs.entry.map(|e| e.0)
     }
@@ -531,7 +526,7 @@ fn rewrite_block(
     let mut out = Vec::with_capacity(b.len());
     for mut s in b {
         if let ir::Stmt::Let(v, ir::Expr::Builtin(op, args)) = &s
-            && let Some(func) = cpu_math_lang(*op).and_then(|l| cx.lang_fn(l))
+            && let Some(func) = cpu_math_lang(*op).and_then(|l| cx.checked.program.lang_fn(l))
         {
             let v = *v;
             let callee = cx.instance(mb, InstanceKey::plain(func, Vec::new()), None);

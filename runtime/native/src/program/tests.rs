@@ -2,8 +2,9 @@
 //! the state hash, and calling exports. Commands go to a [`Recorder`].
 
 use super::*;
-use wrela_abi::manifest::{Access, BufferBinding, Pipeline, Stage, UniformBlock, UniformSpace};
+use wrela_abi::check::CommandError;
 use wrela_abi::stream::{Encoder, Opcode, StreamError, VERSION};
+use wrela_abi::vectors::check_manifest as manifest;
 
 #[path = "../../tests/suite/common/wat.rs"]
 mod wat_gen;
@@ -26,32 +27,6 @@ impl Executor for Recorder {
     }
 }
 
-/// Pipeline 0 renders and pipeline 1 computes; each takes 16 uniform bytes and binds a
-/// read-only buffer then a read-write one.
-fn manifest() -> Manifest {
-    let mut m = Manifest::new("game.wasm");
-    let shape = |name: &str, stage| Pipeline {
-        name: name.into(),
-        shader: format!("{name}.wgsl"),
-        stage,
-        uniform: Some(UniformBlock { binding: 0, size: 16, space: UniformSpace::Uniform }),
-        buffers: vec![
-            BufferBinding { binding: 1, access: Access::Read },
-            BufferBinding { binding: 2, access: Access::ReadWrite },
-        ],
-    };
-    m.pipelines.push(shape(
-        "draw",
-        Stage::Render { vertex_entry: "vs".into(), fragment_entry: "fs".into() },
-    ));
-    m.pipelines.push(shape(
-        "compute",
-        Stage::Compute { entry: "main".into(), workgroup_size: [64, 1, 1] },
-    ));
-    m.validate().expect("valid");
-    m
-}
-
 fn load_wat(wat: &str) -> Result<Program<Recorder>> {
     let wasm = wat::parse_str(wat).expect("test WAT compiles");
     Program::instantiate(&compile(&wasm)?, &manifest(), Recorder::default())
@@ -70,7 +45,7 @@ fn run_err(frames: &[Vec<Vec<u8>>]) -> Error {
 
 fn command_err(batch: Vec<u8>) -> (Opcode, String) {
     match run_err(&[vec![batch]]) {
-        Error::Command { opcode, why } => (opcode, why),
+        Error::Command(CommandError { opcode, why }) => (opcode, why),
         e => panic!("expected a command error, got {e}"),
     }
 }
@@ -271,7 +246,7 @@ fn checks_dispatches() {
     }));
     assert_eq!(
         (op, why.as_str()),
-        (Opcode::Dispatch, "there's no pipeline 7 (the manifest has 2)")
+        (Opcode::Dispatch, "there's no pipeline 7 (the manifest has 4)")
     );
     let (_, why) = command_err(with_buffers(|e| {
         e.dispatch(0, [1; 3], &[1, 2], &U16);
@@ -331,70 +306,29 @@ fn checks_draws_across_the_pass() {
     .expect("separate passes");
 }
 
-/// Pipeline 0 renders and pipeline 1 computes, each binding two read-write buffers and no
-/// uniforms.
-fn writing_twice() -> Manifest {
-    let mut m = Manifest::new("game.wasm");
-    let shape = |name: &str, stage| Pipeline {
-        name: name.into(),
-        shader: format!("{name}.wgsl"),
-        stage,
-        uniform: None,
-        buffers: vec![
-            BufferBinding { binding: 1, access: Access::ReadWrite },
-            BufferBinding { binding: 2, access: Access::ReadWrite },
-        ],
-    };
-    m.pipelines.push(shape(
-        "draw",
-        Stage::Render { vertex_entry: "vs".into(), fragment_entry: "fs".into() },
-    ));
-    m.pipelines.push(shape(
-        "compute",
-        Stage::Compute { entry: "main".into(), workgroup_size: [64, 1, 1] },
-    ));
-    m.validate().expect("valid");
-    m
-}
-
 #[test]
 fn checks_writable_aliases_and_clear_colours() {
-    let why = |m: &Manifest, batch: Vec<u8>| {
-        let wasm = wat::parse_str(wat_gen::program(&[vec![batch]])).expect("test WAT compiles");
-        let mut program =
-            Program::instantiate(&compile(&wasm).expect("compiles"), m, Recorder::default())
-                .expect("loads");
-        match program.frame(0.0, 64, 64) {
-            Ok(()) => None,
-            Err(Error::Command { why, .. }) => Some(why),
-            Err(e) => panic!("expected a command error, got {e}"),
-        }
-    };
     // One buffer bound read-write twice by one dispatch or draw: WebGPU rejects it.
-    let m = writing_twice();
-    let twice = with_buffers(|e| {
-        e.dispatch(1, [1; 3], &[1, 1], &[]);
-    });
-    assert_eq!(
-        why(&m, twice).as_deref(),
-        Some("buffer 1 is bound read-write twice in one dispatch")
-    );
-    let twice = with_buffers(|e| {
-        e.begin_screen_pass([0.0; 4]).draw(0, 3, 1, &[2, 2], &[]).present();
-    });
-    assert_eq!(why(&m, twice).as_deref(), Some("buffer 2 is bound read-write twice in one draw"));
+    let (_, why) = command_err(with_buffers(|e| {
+        e.dispatch(3, [1; 3], &[1, 1], &U16);
+    }));
+    assert_eq!(why, "buffer 1 is bound read-write twice in one dispatch");
+    let (_, why) = command_err(with_buffers(|e| {
+        e.begin_screen_pass([0.0; 4]).draw(2, 3, 1, &[2, 2], &U16).present();
+    }));
+    assert_eq!(why, "buffer 2 is bound read-write twice in one draw");
     // Written by two draws of one pass is fine: both are writes.
-    let apart = with_buffers(|e| {
-        e.begin_screen_pass([0.0; 4]).draw(0, 3, 1, &[1, 2], &[]).draw(0, 3, 1, &[2, 1], &[]);
+    run(&[vec![with_buffers(|e| {
+        e.begin_screen_pass([0.0; 4]).draw(2, 3, 1, &[1, 2], &U16).draw(2, 3, 1, &[2, 1], &U16);
         e.present();
-    });
-    assert_eq!(why(&m, apart), None);
+    })]])
+    .1
+    .expect("both writes");
     // WebGPU's clear colour is finite.
     for (clear, part) in [([f32::NAN, 0.5, 0.25, 1.0], "r"), ([0.0, 0.0, 0.0, f32::INFINITY], "a")]
     {
-        let batch = Encoder::new().begin_screen_pass(clear).present().finish();
-        let want = format!("the clear colour's {part} isn't a finite number");
-        assert_eq!(why(&manifest(), batch), Some(want));
+        let (_, why) = command_err(Encoder::new().begin_screen_pass(clear).present().finish());
+        assert_eq!(why, format!("the clear colour's {part} isn't a finite number"));
     }
 }
 

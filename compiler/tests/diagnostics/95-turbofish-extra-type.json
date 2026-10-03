@@ -1,0 +1,47 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0322",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "`Option` takes 1 generic argument, not 2",
+      "notes": [],
+      "severity": "error",
+      "span": {
+        "column": 16,
+        "end": 202,
+        "end_column": 40,
+        "end_line": 8,
+        "line": 8,
+        "start": 178
+      },
+      "title": "a wrong number of generic arguments"
+    },
+    {
+      "code": "E0322",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "`first` takes 1 generic argument, not 2",
+      "notes": [],
+      "severity": "error",
+      "span": {
+        "column": 5,
+        "end": 229,
+        "end_column": 27,
+        "end_line": 9,
+        "line": 9,
+        "start": 207
+      },
+      "title": "a wrong number of generic arguments"
+    }
+  ],
+  "version": 2
+}

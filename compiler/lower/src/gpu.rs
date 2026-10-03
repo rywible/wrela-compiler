@@ -221,10 +221,9 @@ pub(crate) fn is_resource_param(fl: &Fl, t: TyId) -> bool {
 
 /// The concrete parameter types of an entry instance.
 fn param_types(cx: &mut Cx, f: FnId, substs: &[TyId]) -> Vec<TyId> {
-    let generics = cx.checked.program.fn_all_generics(f);
-    let subst = Subst::from_pairs(&generics, substs);
-    let tys: Vec<TyId> = cx.checked.program.func(f).params.iter().map(|p| p.ty).collect();
-    tys.into_iter().map(|t| cx.concrete(t, &subst)).collect()
+    let checked = cx.checked;
+    let subst = Subst::from_pairs(&checked.program.fn_all_generics(f), substs);
+    checked.program.func(f).params.iter().map(|p| cx.concrete(p.ty, &subst)).collect()
 }
 
 fn ret_type(cx: &mut Cx, f: FnId, substs: &[TyId]) -> TyId {
@@ -288,29 +287,25 @@ pub(crate) fn lower_dispatch(fl: &mut Fl, d: &mir::Dispatch, span: Span) {
             }
         }
     }
-    let uniform = uniform_block(fl, &uniform_fields, &uniform_vals, "dispatch", span);
+    let buffers = handles.len() as u32;
     let mut args = groups;
-    let nbuf = handles.len() as u32;
     args.extend(handles);
-    let uty = uniform.map(|(t, v)| {
-        args.push(v);
-        t
-    });
-    fl.emit(ir::Stmt::Eval(ir::Expr::Host(
-        ir::HostOp::Dispatch { pipeline: pindex, buffers: nbuf, uniform: uty },
-        args,
-    )));
+    let uniform = uniform_block(fl, &uniform_fields, &uniform_vals, &mut args, "dispatch", span);
+    let op = ir::HostOp::Dispatch { pipeline: pindex, buffers, uniform };
+    fl.emit(ir::Stmt::Eval(ir::Expr::Host(op, args)));
 }
 
-/// Packs uniform values into the block struct (same fields, same layout as the GPU side). E0702
-/// if the block is too large to travel in its command.
+/// Packs uniform values into the block struct (same fields, same layout as the GPU side), last
+/// in `args`: the block's type, if it has fields. E0702 if the block is too large to travel in
+/// its command.
 fn uniform_block(
     fl: &mut Fl,
     fields: &[(String, ir::TypeId)],
     vals: &[ir::ValueId],
+    args: &mut Vec<ir::ValueId>,
     what: &str,
     span: Span,
-) -> Option<(ir::TypeId, ir::ValueId)> {
+) -> Option<ir::TypeId> {
     if fields.is_empty() {
         return None;
     }
@@ -332,7 +327,8 @@ fn uniform_block(
             .with_help("put large data in a `GpuBuffer` (`buffer` and `write`) and pass that"),
         );
     }
-    Some((t, fl.value(t, ir::Expr::Construct(t, vals.to_vec()))))
+    args.push(fl.value(t, ir::Expr::Construct(t, vals.to_vec())));
+    Some(t)
 }
 
 pub(crate) fn lower_draw(fl: &mut Fl, d: &mir::Draw, span: Span) {
@@ -365,18 +361,12 @@ pub(crate) fn lower_draw(fl: &mut Fl, d: &mir::Draw, span: Span) {
         let Some(v) = fl.read(place) else { return };
         handles.push(handle(fl, v));
     }
-    let uniform = uniform_block(fl, &fields, &vals, "draw", span);
+    let buffers = handles.len() as u32;
     let mut args = vec![vertices, instances];
-    let nbuf = handles.len() as u32;
     args.extend(handles);
-    let uty = uniform.map(|(t, v)| {
-        args.push(v);
-        t
-    });
-    fl.emit(ir::Stmt::Eval(ir::Expr::Host(
-        ir::HostOp::Draw { pipeline: pindex, buffers: nbuf, uniform: uty },
-        args,
-    )));
+    let uniform = uniform_block(fl, &fields, &vals, &mut args, "draw", span);
+    let op = ir::HostOp::Draw { pipeline: pindex, buffers, uniform };
+    fl.emit(ir::Stmt::Eval(ir::Expr::Host(op, args)));
 }
 
 /// `std::gpu`'s and `std::derive`'s intrinsics.

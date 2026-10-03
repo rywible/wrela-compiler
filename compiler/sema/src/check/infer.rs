@@ -50,6 +50,16 @@ impl Infer {
         }
     }
 
+    /// The type `t` takes when it's a number literal's type not settled yet: `i32` for an
+    /// integer, `f32` for a float (as [`Infer::apply_defaults`] gives them).
+    pub fn literal_default(&self, types: &Types, t: TyId) -> Option<TyId> {
+        match self.var_kind(types, t)? {
+            VarKind::Int => Some(types.i32),
+            VarKind::Float => Some(types.f32),
+            VarKind::General => None,
+        }
+    }
+
     /// Substitutes every bound variable, deeply. Unbound ones stay.
     pub fn resolve(&self, types: &Types, t: TyId) -> TyId {
         if !types.has_vars(t) {
@@ -68,18 +78,15 @@ impl Infer {
     /// Returns the origins of general variables nothing determined.
     pub fn apply_defaults(&mut self, types: &Types) -> Vec<Span> {
         let mut unknown = Vec::new();
-        for i in 0..self.vars.len() {
-            if self.vars[i].bound.is_some() {
-                continue;
-            }
-            match self.vars[i].kind {
-                VarKind::Int => self.vars[i].bound = Some(types.i32),
-                VarKind::Float => self.vars[i].bound = Some(types.f32),
+        for v in self.vars.iter_mut().filter(|v| v.bound.is_none()) {
+            v.bound = Some(match v.kind {
+                VarKind::Int => types.i32,
+                VarKind::Float => types.f32,
                 VarKind::General => {
-                    unknown.push(self.vars[i].origin);
-                    self.vars[i].bound = Some(types.error);
+                    unknown.push(v.origin);
+                    types.error
                 }
-            }
+            });
         }
         unknown
     }

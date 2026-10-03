@@ -36,26 +36,31 @@ pub fn two() -> u32 {
 }
 ";
 
+/// Builds `src` as the one-file package `name` and loads it on the CPU.
+fn load(name: &str, src: &str) -> CpuHost {
+    let dir = package(name, src);
+    must_build(&dir, &dir.join("build"));
+    CpuHost::load(dir.join("build")).expect("load")
+}
+
+/// What `pick` takes from the commands of every batch submitted since the last look.
+fn commands<T>(host: &mut CpuHost, pick: impl FnMut(Command) -> Option<T>) -> Vec<T> {
+    let batches = host.take_batches();
+    batches.iter().flat_map(|b| decode(b).expect("a valid batch")).filter_map(pick).collect()
+}
+
 /// The buffer commands of every batch submitted since the last look: `+h` made, `-h` destroyed.
 fn buffer_commands(host: &mut CpuHost) -> Vec<String> {
-    let mut out = Vec::new();
-    for batch in host.take_batches() {
-        for c in decode(&batch).expect("a valid batch") {
-            match c {
-                Command::CreateBuffer { handle, .. } => out.push(format!("+{handle}")),
-                Command::DestroyBuffer { handle } => out.push(format!("-{handle}")),
-                _ => {}
-            }
-        }
-    }
-    out
+    commands(host, |c| match c {
+        Command::CreateBuffer { handle, .. } => Some(format!("+{handle}")),
+        Command::DestroyBuffer { handle } => Some(format!("-{handle}")),
+        _ => None,
+    })
 }
 
 #[test]
 fn each_call_destroys_the_buffers_of_the_call_before() {
-    let dir = package("buffers", SRC);
-    must_build(&dir, &dir.join("build"));
-    let mut host = CpuHost::load(dir.join("build")).expect("load");
+    let mut host = load("buffers", SRC);
     host.frame(0.0, 64, 64).expect("frame 0");
     assert_eq!(buffer_commands(&mut host), ["+0"]);
     for k in 1..4 {
@@ -70,18 +75,12 @@ fn each_call_destroys_the_buffers_of_the_call_before() {
 
 #[test]
 fn an_empty_buffer_has_room_for_one_element() {
-    let dir = package("empty-buffers", SRC);
-    must_build(&dir, &dir.join("build"));
-    let mut host = CpuHost::load(dir.join("build")).expect("load");
+    let mut host = load("empty-buffers", SRC);
     host.call_export("empty", &[]).expect("empty");
-    let mut sizes = Vec::new();
-    for batch in host.take_batches() {
-        for c in decode(&batch).expect("a valid batch") {
-            if let Command::CreateBuffer { size, .. } = c {
-                sizes.push(size);
-            }
-        }
-    }
+    let sizes = commands(&mut host, |c| match c {
+        Command::CreateBuffer { size, .. } => Some(size),
+        _ => None,
+    });
     assert_eq!(sizes, [16, 4, 48]);
 }
 
@@ -100,17 +99,11 @@ pub fn frame(time: f32, width: u32, height: u32) {
     dispatch(fill, groups: 1, out: out, nothing: ())
 }
 ";
-    let dir = package("unit_dispatch", src);
-    must_build(&dir, &dir.join("build"));
-    let mut host = CpuHost::load(dir.join("build")).expect("load");
+    let mut host = load("unit_dispatch", src);
     host.frame(0.0, 64, 64).expect("frame");
-    let mut dispatches = Vec::new();
-    for batch in host.take_batches() {
-        for c in decode(&batch).expect("a valid batch") {
-            if let Command::Dispatch { pipeline, .. } = c {
-                dispatches.push(pipeline);
-            }
-        }
-    }
+    let dispatches = commands(&mut host, |c| match c {
+        Command::Dispatch { pipeline, .. } => Some(pipeline),
+        _ => None,
+    });
     assert_eq!(dispatches, [0]);
 }

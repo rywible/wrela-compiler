@@ -38,9 +38,7 @@ impl<'a> Parser<'a> {
 
     fn parse_block_inner(&mut self) -> PResult<Block> {
         let open = self.expect(T::LBrace, "`{`")?.span;
-        self.closers.push(T::RBrace);
-        let stmts = self.block_stmts();
-        self.closers.pop();
+        let stmts = self.within(T::RBrace, Self::block_stmts);
         if self.at(T::Eof) {
             self.error(
                 Diagnostic::new(codes::E0101, open, "this `{` is never closed")
@@ -160,17 +158,12 @@ impl<'a> Parser<'a> {
                 .with_note("a line break ends a statement; an operator that continues an expression goes at the end of the line before (D-079)");
                 // The line before must end in an operand: a NEWLINE comes only after a token that
                 // can end a statement (L17), and those that aren't operands can't take one.
-                let before = self.tokens[..self.pos].iter().rev().nth(1).copied();
-                let after_operand = self.pos >= 2
-                    && self.tokens[self.pos - 1].kind == T::Newline
-                    && before.is_some_and(|b| {
-                        b.kind.can_end_statement()
-                            && !matches!(
-                                b.kind,
-                                T::Return | T::Break | T::Continue | T::Gt | T::Shr
-                            )
-                    });
-                if let Some(prev) = before.filter(|_| after_operand) {
+                let prev = self.pos.checked_sub(2).map(|i| self.tokens[i]).filter(|b| {
+                    self.tokens[self.pos - 1].kind == T::Newline
+                        && b.kind.can_end_statement()
+                        && !matches!(b.kind, T::Return | T::Break | T::Continue | T::Gt | T::Shr)
+                });
+                if let Some(prev) = prev {
                     let op = self.text_of(t.span).to_string();
                     if matches!(k, T::Gt | T::Shr) {
                         // `>` and `>>` can't end a line (L20): the two lines are joined.

@@ -97,6 +97,12 @@ impl SourceFile {
         LineCol { line: line as u32 + 1, column: column as u32 + 1 }
     }
 
+    /// Where byte `offset` is, as diagnostics show it: `name:line:column`.
+    pub fn location(&self, offset: u32) -> String {
+        let lc = self.line_col(offset);
+        format!("{}:{}:{}", self.name, lc.line, lc.column)
+    }
+
     /// The text of 0-based line `line`, without its line break.
     pub fn line_text(&self, line: usize) -> &str {
         let start = self.line_starts[line] as usize;

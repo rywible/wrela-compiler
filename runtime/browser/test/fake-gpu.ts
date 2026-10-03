@@ -26,16 +26,6 @@ export interface FakeBindGroup {
   buffers: FakeBuffer[];
 }
 
-export const DEFAULT_GPU_LIMITS = {
-  minUniformBufferOffsetAlignment: 256,
-  minStorageBufferOffsetAlignment: 256,
-  maxBufferSize: 268_435_456,
-  maxStorageBufferBindingSize: 134_217_728,
-  maxUniformBufferBindingSize: 65_536,
-  maxComputeWorkgroupsPerDimension: 65_535,
-  maxTextureDimension2D: 8192,
-};
-
 export class FakeDevice {
   readonly events: Event[] = [];
   readonly buffers: FakeBuffer[] = [];
@@ -45,7 +35,14 @@ export class FakeDevice {
   readonly layoutErrors = new Map<string, string>();
   /** Errors by label, which creating a pipeline rejects with. */
   readonly pipelineErrors = new Map<string, string>();
-  limits = DEFAULT_GPU_LIMITS;
+  /** WebGPU's default limits, those the runtime reads. */
+  readonly limits = {
+    minUniformBufferOffsetAlignment: 256,
+    minStorageBufferOffsetAlignment: 256,
+    maxBufferSize: 268_435_456,
+    maxStorageBufferBindingSize: 134_217_728,
+    maxUniformBufferBindingSize: 65_536,
+  };
   #bindGroups = 0;
   /** The error scope stack: each scope's first error. */
   readonly #scopes: (string | null)[] = [];

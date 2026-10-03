@@ -10,7 +10,7 @@
 
 use crate::agree::Checker;
 use crate::earley::Scratch;
-use crate::rng::{Rng, par_seeded};
+use crate::rng::{FxHashMap, FxHashSet, Rng, par_seeded};
 use std::collections::HashMap;
 use wrela_diag::FileId;
 
@@ -97,7 +97,12 @@ impl Reader<'_> {
         self.s.get(self.pos).copied()
     }
 
-    fn escaped(&mut self) -> Result<char, String> {
+    /// Reads `c`, the character at the current position, or the escape it starts (`\`).
+    fn char(&mut self, c: char) -> Result<char, String> {
+        self.pos += 1;
+        if c != '\\' {
+            return Ok(c);
+        }
         let c = self.peek().ok_or_else(|| self.err("unfinished escape"))?;
         self.pos += 1;
         Ok(match c {
@@ -131,14 +136,7 @@ impl Reader<'_> {
                         match self.peek() {
                             None => return Err(self.err("unterminated literal")),
                             Some('"') => break,
-                            Some('\\') => {
-                                self.pos += 1;
-                                lit.push(self.escaped()?);
-                            }
-                            Some(c) => {
-                                lit.push(c);
-                                self.pos += 1;
-                            }
+                            Some(c) => lit.push(self.char(c)?),
                         }
                     }
                     self.pos += 1;
@@ -155,27 +153,13 @@ impl Reader<'_> {
                         let lo = match self.peek() {
                             None => return Err(self.err("unterminated class")),
                             Some(']') => break,
-                            Some('\\') => {
-                                self.pos += 1;
-                                self.escaped()?
-                            }
-                            Some(c) => {
-                                self.pos += 1;
-                                c
-                            }
+                            Some(c) => self.char(c)?,
                         };
                         let hi =
                             if self.peek() == Some('-') && self.s.get(self.pos + 1) != Some(&']') {
                                 self.pos += 1;
                                 match self.peek() {
-                                    Some('\\') => {
-                                        self.pos += 1;
-                                        self.escaped()?
-                                    }
-                                    Some(c) => {
-                                        self.pos += 1;
-                                        c
-                                    }
+                                    Some(c) => self.char(c)?,
                                     None => return Err(self.err("unterminated range")),
                                 }
                             } else {
@@ -306,26 +290,28 @@ impl Gbnf {
     /// has no left recursion); fine for program-sized texts.
     pub fn recognizes(&self, rule: usize, text: &str) -> bool {
         let chars: Vec<char> = text.chars().collect();
-        let mut memo = HashMap::new();
-        self.rule_ends(rule, 0, &chars, &mut memo).contains(&chars.len())
+        let mut ends = Vec::new();
+        self.rule_ends(rule, 0, &chars, &mut Memo::default(), &mut ends);
+        ends.contains(&chars.len())
     }
 
-    fn rule_ends(
-        &self,
-        r: usize,
-        pos: usize,
-        s: &[char],
-        memo: &mut HashMap<(usize, usize), Vec<usize>>,
-    ) -> Vec<usize> {
+    // Each `*_ends` function appends to `out` the positions where its part, started at `pos`,
+    // can end (in any order, maybe more than once).
+
+    fn rule_ends(&self, r: usize, pos: usize, s: &[char], memo: &mut Memo, out: &mut Vec<usize>) {
         if let Some(e) = memo.get(&(r, pos)) {
-            return e.clone();
+            out.extend_from_slice(e);
+            return;
         }
         // A rule reached again at the same position before finishing would be left recursion,
         // which the export rules out; the placeholder makes such a cycle fail instead of loop.
         memo.insert((r, pos), Vec::new());
-        let ends = self.alts_ends(&self.rules[r].alts.seqs, pos, s, memo);
-        memo.insert((r, pos), ends.clone());
-        ends
+        let mut ends = Vec::new();
+        self.alts_ends(&self.rules[r].alts.seqs, pos, s, memo, &mut ends);
+        ends.sort_unstable();
+        ends.dedup();
+        out.extend_from_slice(&ends);
+        memo.insert((r, pos), ends);
     }
 
     fn alts_ends(
@@ -333,79 +319,85 @@ impl Gbnf {
         alts: &[Vec<Item>],
         pos: usize,
         s: &[char],
-        memo: &mut HashMap<(usize, usize), Vec<usize>>,
-    ) -> Vec<usize> {
-        let mut out = Vec::new();
+        memo: &mut Memo,
+        out: &mut Vec<usize>,
+    ) {
+        let (mut cur, mut next) = (Vec::new(), Vec::new());
         for a in alts {
-            let mut cur = vec![pos];
+            cur.clear();
+            cur.push(pos);
             for it in a {
-                let mut next = Vec::new();
+                next.clear();
                 for &p in &cur {
-                    next.extend(self.item_ends(it, p, s, memo));
+                    self.item_ends(it, p, s, memo, &mut next);
                 }
                 next.sort_unstable();
                 next.dedup();
-                cur = next;
+                std::mem::swap(&mut cur, &mut next);
                 if cur.is_empty() {
                     break;
                 }
             }
-            out.extend(cur);
+            out.extend_from_slice(&cur);
         }
-        out.sort_unstable();
-        out.dedup();
-        out
     }
 
-    fn item_ends(
-        &self,
-        it: &Item,
-        pos: usize,
-        s: &[char],
-        memo: &mut HashMap<(usize, usize), Vec<usize>>,
-    ) -> Vec<usize> {
-        let once = |p: usize, memo: &mut HashMap<(usize, usize), Vec<usize>>| -> Vec<usize> {
-            match &it.atom {
-                Atom::Lit(l) => {
-                    let l: Vec<char> = l.chars().collect();
-                    if s[p..].starts_with(&l) { vec![p + l.len()] } else { Vec::new() }
-                }
-                Atom::Class { negated, ranges, .. } => match s.get(p) {
-                    Some(c)
-                        if ranges.iter().any(|(lo, hi)| (*lo..=*hi).contains(c)) != *negated =>
-                    {
-                        vec![p + 1]
-                    }
-                    _ => Vec::new(),
-                },
-                Atom::Ref(r) => self.rule_ends(*r, p, s, memo),
-                Atom::Group(alts) => self.alts_ends(&alts.seqs, p, s, memo),
-            }
-        };
+    fn item_ends(&self, it: &Item, pos: usize, s: &[char], memo: &mut Memo, out: &mut Vec<usize>) {
         match it.rep {
-            Rep::One => once(pos, memo),
+            Rep::One => self.atom_ends(&it.atom, pos, s, memo, out),
             Rep::Opt => {
-                let mut v = once(pos, memo);
-                v.push(pos);
-                v
+                self.atom_ends(&it.atom, pos, s, memo, out);
+                out.push(pos);
             }
             Rep::Star | Rep::Plus => {
-                let mut all: Vec<usize> = if it.rep == Rep::Star { vec![pos] } else { Vec::new() };
-                let mut frontier = vec![pos];
-                let mut seen = std::collections::HashSet::new();
+                if it.rep == Rep::Star {
+                    out.push(pos);
+                }
+                let (mut frontier, mut once) = (vec![pos], Vec::new());
+                let mut seen = FxHashSet::default();
                 while let Some(p) = frontier.pop() {
-                    for e in once(p, memo) {
+                    once.clear();
+                    self.atom_ends(&it.atom, p, s, memo, &mut once);
+                    for &e in &once {
                         if e > p && seen.insert(e) {
-                            all.push(e);
+                            out.push(e);
                             frontier.push(e);
                         }
                     }
                 }
-                all
             }
         }
     }
+
+    fn atom_ends(
+        &self,
+        atom: &Atom,
+        pos: usize,
+        s: &[char],
+        memo: &mut Memo,
+        out: &mut Vec<usize>,
+    ) {
+        match atom {
+            Atom::Lit(l) => {
+                let n = l.chars().count();
+                if s.get(pos..pos + n).is_some_and(|w| w.iter().copied().eq(l.chars())) {
+                    out.push(pos + n);
+                }
+            }
+            Atom::Class { negated, ranges, .. } => {
+                let inside = |c: &char| ranges.iter().any(|(lo, hi)| (*lo..=*hi).contains(c));
+                if s.get(pos).is_some_and(|c| inside(c) != *negated) {
+                    out.push(pos + 1);
+                }
+            }
+            Atom::Ref(r) => self.rule_ends(*r, pos, s, memo, out),
+            Atom::Group(alts) => self.alts_ends(&alts.seqs, pos, s, memo, out),
+        }
+    }
 }
+
+/// The recognizer's memo: the ends of each (rule, start position).
+type Memo = FxHashMap<(usize, usize), Vec<usize>>;
 
 /// Fills in [`Alts::cheapest`] for `alts` and the groups inside it.
 fn mark_cheapest(alts: &mut Alts, cost: &[usize]) {
