@@ -1,0 +1,14 @@
+// rejects: mod.use
+use a::Account
+
+fn steal() -> i32 {
+    Account::forge(123).peek() //~ E0203 E0203
+}
+
+fn hidden(x: i32) -> i32 {
+    x.triple() //~ E0207
+}
+
+fn opened() -> i32 {
+    Account::open(5).balance()
+}

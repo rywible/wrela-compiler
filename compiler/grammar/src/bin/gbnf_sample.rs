@@ -4,6 +4,8 @@
 //!     cargo run -p wrela-grammar --release --bin gbnf-sample -- [PROGRAMS] [--seed N]
 
 use wrela_grammar::agree::Checker;
+use wrela_grammar::gbnf::spec_path;
+use wrela_grammar::rng::default_threads;
 use wrela_grammar::sampler::{Gbnf, check_samples};
 
 fn main() {
@@ -20,7 +22,7 @@ fn main() {
             std::process::exit(2);
         }
     }
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../spec/wrela.gbnf");
+    let path = spec_path();
     let text = std::fs::read_to_string(&path).unwrap_or_else(|e| {
         eprintln!("reading {}: {e}", path.display());
         std::process::exit(1)
@@ -29,9 +31,8 @@ fn main() {
         eprintln!("{e}");
         std::process::exit(1)
     });
-    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
     let start = std::time::Instant::now();
-    let stats = check_samples(&g, Some(&Checker::default()), n, seed, threads);
+    let stats = check_samples(&g, Some(&Checker::default()), n, seed, default_threads());
     println!("{}in {:.1?}", stats.report(), start.elapsed());
     if !stats.rejected.is_empty() || !stats.disagreements.is_empty() {
         std::process::exit(1);

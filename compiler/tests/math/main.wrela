@@ -1,6 +1,9 @@
-// std's CPU math (std/math.wrela), exported for compiler/tests/tests/math.rs: each function is
-// checked against a correctly rounded reference. The interval interpretation's CPU widening
-// relies on these being within an ulp.
+// std's CPU math (std/math.wrela), exported for compiler/tests/tests/suite/math.rs: each
+// function is checked against a correctly rounded reference. The interval interpretation's CPU
+// widening relies on these being within an ulp. Also std's fields (std/field.wrela), against
+// references at their edge cases.
+use std::field::{Noise, Surface, ellipsoid, fbm, half_space, round_cone, smin, sphere, value_noise}
+
 pub fn frame(time: f32, width: u32, height: u32) {}
 
 pub fn f_sin(x: f32) -> f32 {
@@ -49,4 +52,34 @@ pub fn f_asin(x: f32) -> f32 {
 
 pub fn f_acos(x: f32) -> f32 {
     acos(x)
+}
+
+pub fn f_smin(a: f32, b: f32, k: f32) -> f32 {
+    smin(a, b, k)
+}
+
+/// Two unit spheres at x = -1 and x = 1, blended over `k`: the plane x = 0 is the seam.
+pub fn f_blend(x: f32, y: f32, z: f32, k: f32) -> f32 {
+    sphere(1.0).translate(vec3(x: -1.0)).smooth_union(sphere(1.0).translate(vec3(x: 1.0)), k: k)
+        .distance(vec3(x, y, z))
+}
+
+pub fn f_round_cone(a: vec3, b: vec3, r1: f32, r2: f32, p: vec3) -> f32 {
+    round_cone(a, b, r1, r2).distance(p)
+}
+
+pub fn f_ellipsoid(radii: vec3, p: vec3) -> f32 {
+    ellipsoid(radii).distance(p)
+}
+
+pub fn f_half_space(normal: vec3, offset: f32, p: vec3) -> f32 {
+    half_space(normal, offset).distance(p)
+}
+
+pub fn f_value_noise(p: vec3) -> f32 {
+    value_noise(p)
+}
+
+pub fn f_fbm(p: vec3) -> f32 {
+    fbm(freq: 1.0, octaves: 4).value(p)
 }

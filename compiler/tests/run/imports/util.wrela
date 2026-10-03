@@ -1,0 +1,22 @@
+// Private traits: `main` can't see them, so their methods don't apply there.
+trait Weird {
+    fn abs(self) -> i32 {
+        999
+    }
+}
+
+impl Weird for i32 {}
+
+trait Internal {
+    fn area(self) -> f32
+}
+
+impl Internal for f32 {
+    fn area(self) -> f32 {
+        0.0
+    }
+}
+
+pub fn weird(x: i32) -> i32 {
+    x.abs()
+}

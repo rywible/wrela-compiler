@@ -1,0 +1,28 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0702",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "`[f32; 2000000000]` is too large for the `@compute` kernel `fill`",
+      "notes": [
+        "a WGSL type is at most 2147483647 bytes"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 14,
+        "end": 226,
+        "end_column": 31,
+        "end_line": 8,
+        "line": 8,
+        "start": 209
+      },
+      "title": "a construct not supported by a back end"
+    }
+  ],
+  "version": 2
+}

@@ -2,20 +2,20 @@
 //! imports, and every signature (generics, fields, variants, traits, impls, functions).
 
 use crate::defs::*;
+use crate::graph::{Visit, dfs_cycles};
 use crate::program::{LangRes, Program};
 use crate::resolve::{self, Scope, TyPos};
 use crate::ty::*;
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
-use wrela_diag::{Diagnostic, FileId, Span, codes};
+use wrela_diag::{Diagnostic, Span, codes};
 use wrela_syntax::ast;
 
 /// One parsed source file and the module it is.
 pub struct SourceUnit {
     /// The module path: `["shapes", "blob"]`, or `["std", "field"]`.
     pub path: Vec<String>,
-    pub file: FileId,
-    pub ast: Rc<ast::File>,
+    pub ast: ast::File,
     pub is_std: bool,
     /// Where its syntax errors are: code around them may be missing parts.
     pub syntax_errors: Vec<Span>,
@@ -30,60 +30,72 @@ struct PendingUse {
 }
 
 /// What `collect` remembers between its passes about each AST item.
-enum PendingItem {
-    Fn(FnId, Rc<ast::FnDecl>),
-    Adt(AdtId, Rc<ast::Item>),
-    Trait(TraitId, Rc<ast::TraitDecl>, Vec<(FnId, Rc<ast::FnDecl>)>),
-    Impl(ImplId, Rc<ast::ImplDecl>, Vec<(FnId, Rc<ast::FnDecl>)>),
-    Const(ConstId, Rc<ast::ConstDecl>),
+enum PendingItem<'u> {
+    Fn(FnId, &'u ast::FnDecl),
+    Adt(AdtId, &'u ast::Item),
+    Trait(TraitId, &'u ast::TraitDecl, Vec<(FnId, &'u ast::FnDecl)>),
+    Impl(ImplId, &'u ast::ImplDecl, Vec<(FnId, &'u ast::FnDecl)>),
+    Const(ConstId, &'u ast::ConstDecl),
 }
 
 pub fn collect(units: Vec<SourceUnit>, diags: &mut Vec<Diagnostic>) -> Program {
     let mut c = Collector { p: Program::default(), diags, pending: Vec::new(), uses: Vec::new() };
     c.p.syntax_errors = units.iter().flat_map(|u| u.syntax_errors.iter().copied()).collect();
-    c.build_modules(&units);
-    c.declare_items(&units);
+    let modules = c.build_modules(&units);
+    c.declare_items(&units, &modules);
     c.resolve_imports();
     c.find_lang_items();
     c.resolve_signatures();
+    c.index_impls();
     c.check_recursive_types();
     c.check_impls();
     c.p
 }
 
-struct Collector<'d> {
+struct Collector<'d, 'u> {
     p: Program,
     diags: &'d mut Vec<Diagnostic>,
-    pending: Vec<(ModuleId, PendingItem)>,
+    pending: Vec<(ModuleId, PendingItem<'u>)>,
     uses: Vec<PendingUse>,
 }
 
-impl<'d> Collector<'d> {
-    fn err(&mut self, d: Diagnostic) {
-        self.diags.push(d);
-    }
-
+impl<'d, 'u> Collector<'d, 'u> {
     // ---- modules ---------------------------------------------------------------------------
 
     fn new_module(&mut self, path: Vec<String>, is_std: bool) -> ModuleId {
         self.p.modules.push(Module {
             path,
-            file: None,
             children: BTreeMap::new(),
             scope: BTreeMap::new(),
             broken: BTreeSet::new(),
             is_std,
-            ast: None,
         });
         ModuleId(self.p.modules.len() as u32 - 1)
     }
 
-    fn build_modules(&mut self, units: &[SourceUnit]) {
+    /// Builds the module tree; returns the module each unit is.
+    fn build_modules(&mut self, units: &[SourceUnit]) -> Vec<ModuleId> {
         let pkg = self.new_module(Vec::new(), false);
         let std = self.new_module(vec!["std".into()], true);
         self.p.package_root = Some(pkg);
         self.p.std_root = Some(std);
+        let mut modules = Vec::new();
+        let mut named_std = false;
         for u in units {
+            if !u.is_std && u.path.first().is_some_and(|s| s == "std") && !named_std {
+                // A path's `std` is always the standard library, so this module couldn't be
+                // reached.
+                named_std = true;
+                self.diags.push(
+                    Diagnostic::new(
+                        codes::E0201,
+                        u.ast.span.shrink_to_start(),
+                        "the package has a module named `std`, which is the standard library's name",
+                    )
+                    .with_note("a path that starts with `std` names the standard library")
+                    .with_help("rename the file or directory"),
+                );
+            }
             let (mut m, rest) = if u.is_std { (std, &u.path[1..]) } else { (pkg, &u.path[..]) };
             for seg in rest {
                 m = match self.p.modules[m.index()].children.get(seg) {
@@ -97,20 +109,19 @@ impl<'d> Collector<'d> {
                     }
                 };
             }
-            let module = &mut self.p.modules[m.index()];
-            module.file = Some(u.file);
-            module.ast = Some(u.ast.clone());
             if !u.is_std && u.path == ["main"] {
                 self.p.main = Some(m);
             }
+            modules.push(m);
         }
+        modules
     }
 
     fn bind(&mut self, m: ModuleId, name: &ast::Ident, res: Res, public: bool) {
         let scope = &mut self.p.modules[m.index()].scope;
         if let Some(prev) = scope.get(&name.name) {
             let prev_span = prev.span;
-            self.err(
+            self.diags.push(
                 Diagnostic::new(
                     codes::E0201,
                     name.span,
@@ -126,15 +137,8 @@ impl<'d> Collector<'d> {
 
     // ---- items -----------------------------------------------------------------------------
 
-    fn declare_items(&mut self, units: &[SourceUnit]) {
-        let mut module_of_file = Vec::new();
-        for (i, m) in self.p.modules.iter().enumerate() {
-            if let Some(f) = m.file {
-                module_of_file.push((f, ModuleId(i as u32)));
-            }
-        }
-        for u in units {
-            let Some(&(_, m)) = module_of_file.iter().find(|(f, _)| *f == u.file) else { continue };
+    fn declare_items(&mut self, units: &'u [SourceUnit], modules: &[ModuleId]) {
+        for (u, &m) in units.iter().zip(modules) {
             for item in &u.ast.items {
                 self.declare_item(m, item, u.is_std);
             }
@@ -142,6 +146,18 @@ impl<'d> Collector<'d> {
     }
 
     fn declare_generics(&mut self, generics: &[ast::GenericParam]) -> Vec<ParamId> {
+        for (i, g) in generics.iter().enumerate() {
+            if let Some(prev) = generics[..i].iter().find(|p| p.name.name == g.name.name) {
+                self.diags.push(
+                    Diagnostic::new(
+                        codes::E0201,
+                        g.name.span,
+                        format!("the generic parameter `{}` is declared twice", g.name.name),
+                    )
+                    .with_secondary(prev.name.span, "first declared here"),
+                );
+            }
+        }
         generics
             .iter()
             .map(|g| {
@@ -186,19 +202,10 @@ impl<'d> Collector<'d> {
         FnId(self.p.fns.len() as u32 - 1)
     }
 
-    fn declare_item(&mut self, m: ModuleId, item: &ast::Item, is_std: bool) {
+    fn declare_item(&mut self, m: ModuleId, item: &'u ast::Item, is_std: bool) {
         let public = item.vis.is_some();
         if !matches!(item.kind, ast::ItemKind::Fn(_)) {
-            for a in &item.attrs {
-                self.err(
-                    Diagnostic::new(
-                        codes::E0108,
-                        a.span,
-                        format!("`@{}` only applies to functions", a.name.name),
-                    )
-                    .with_fix("remove it", a.span, ""),
-                );
-            }
+            self.attrs_not_on_fn(&item.attrs);
         }
         match &item.kind {
             ast::ItemKind::Error(name) => {
@@ -209,41 +216,30 @@ impl<'d> Collector<'d> {
             ast::ItemKind::Fn(f) => {
                 let id = self.new_fn(m, FnOwner::Free, f, public, &item.attrs, is_std);
                 self.bind(m, &f.name, Res::Fn(id), public);
-                self.pending.push((m, PendingItem::Fn(id, Rc::new(f.clone()))));
+                self.pending.push((m, PendingItem::Fn(id, f)));
             }
             ast::ItemKind::Struct(s) => {
-                let generics = self.declare_generics(&s.generics);
-                let id = AdtId(self.p.adts.len() as u32);
-                self.p.adts.push(AdtDef {
-                    name: s.name.name.clone(),
-                    module: m,
-                    generics,
-                    kind: AdtKind::Struct(Vec::new()),
-                    opt_in: Vec::new(),
-                    public,
-                    span: item.span,
-                    name_span: s.name.span,
-                    lang: None,
-                });
-                self.bind(m, &s.name, Res::Adt(id), public);
-                self.pending.push((m, PendingItem::Adt(id, Rc::new(item.clone()))));
+                let kind = AdtKind::Struct(Vec::new());
+                self.declare_adt(m, item, &s.name, &s.generics, kind, public);
             }
             ast::ItemKind::Enum(e) => {
-                let generics = self.declare_generics(&e.generics);
-                let id = AdtId(self.p.adts.len() as u32);
-                self.p.adts.push(AdtDef {
-                    name: e.name.name.clone(),
-                    module: m,
-                    generics,
-                    kind: AdtKind::Enum(Vec::new()),
-                    opt_in: Vec::new(),
-                    public,
-                    span: item.span,
-                    name_span: e.name.span,
-                    lang: None,
-                });
-                self.bind(m, &e.name, Res::Adt(id), public);
-                self.pending.push((m, PendingItem::Adt(id, Rc::new(item.clone()))));
+                // The variants' names now, for imports (`use E::B`); their fields come with
+                // the signatures. A name declared twice is reported then; the first one counts.
+                let mut variants: Vec<VariantDef> = Vec::new();
+                for v in &e.variants {
+                    if variants.iter().any(|p| p.name == v.name.name) {
+                        continue;
+                    }
+                    let shape = match &v.kind {
+                        ast::VariantKind::Unit => VariantShape::Unit,
+                        ast::VariantKind::Tuple(_) => VariantShape::Tuple,
+                        ast::VariantKind::Struct(_) => VariantShape::Struct,
+                    };
+                    let name = v.name.name.clone();
+                    variants.push(VariantDef { name, shape, fields: Vec::new(), span: v.span });
+                }
+                let kind = AdtKind::Enum(variants);
+                self.declare_adt(m, item, &e.name, &e.generics, kind, public);
             }
             ast::ItemKind::Trait(t) => {
                 let id = TraitId(self.p.traits.len() as u32);
@@ -268,13 +264,16 @@ impl<'d> Collector<'d> {
                 });
                 let mut methods = Vec::new();
                 for member in &t.members {
+                    if let ast::TraitMemberKind::Type { .. } = &member.kind {
+                        self.attrs_not_on_fn(&member.attrs);
+                    }
                     if let ast::TraitMemberKind::Fn(f) = &member.kind {
                         if let Some(prev) = methods
                             .iter()
-                            .find(|(_, g): &&(FnId, Rc<ast::FnDecl>)| g.name.name == f.name.name)
+                            .find(|(_, g): &&(FnId, &ast::FnDecl)| g.name.name == f.name.name)
                         {
                             let prev_span = prev.1.name.span;
-                            self.err(
+                            self.diags.push(
                                 Diagnostic::new(
                                     codes::E0201,
                                     f.name.span,
@@ -286,12 +285,12 @@ impl<'d> Collector<'d> {
                         }
                         let fid =
                             self.new_fn(m, FnOwner::Trait(id), f, true, &member.attrs, is_std);
-                        methods.push((fid, Rc::new(f.clone())));
+                        methods.push((fid, f));
                     }
                 }
                 self.p.traits[id.index()].methods = methods.iter().map(|(f, _)| *f).collect();
                 self.bind(m, &t.name, Res::Trait(id), public);
-                self.pending.push((m, PendingItem::Trait(id, Rc::new(t.clone()), methods)));
+                self.pending.push((m, PendingItem::Trait(id, t, methods)));
             }
             ast::ItemKind::Impl(i) => {
                 let id = ImplId(self.p.impls.len() as u32);
@@ -312,11 +311,11 @@ impl<'d> Collector<'d> {
                         let public = member.vis.is_some() || i.trait_.is_some();
                         let fid =
                             self.new_fn(m, FnOwner::Impl(id), f, public, &member.attrs, is_std);
-                        methods.push((fid, Rc::new(f.clone())));
+                        methods.push((fid, f));
                     }
                 }
                 self.p.impls[id.index()].methods = methods.iter().map(|(f, _)| *f).collect();
-                self.pending.push((m, PendingItem::Impl(id, Rc::new(i.clone()), methods)));
+                self.pending.push((m, PendingItem::Impl(id, i, methods)));
             }
             ast::ItemKind::Const(c) => {
                 let id = ConstId(self.p.consts.len() as u32);
@@ -329,10 +328,52 @@ impl<'d> Collector<'d> {
                     span: item.span,
                 });
                 self.bind(m, &c.name, Res::Const(id), public);
-                self.pending.push((m, PendingItem::Const(id, Rc::new(c.clone()))));
+                self.pending.push((m, PendingItem::Const(id, c)));
             }
             ast::ItemKind::Use(u) => self.flatten_use(m, u, Vec::new(), public),
         }
+    }
+
+    /// E0108 for each attribute on something that isn't a function: an item, or an associated
+    /// type.
+    fn attrs_not_on_fn(&mut self, attrs: &[ast::Attribute]) {
+        for a in attrs {
+            self.diags.push(
+                Diagnostic::new(
+                    codes::E0108,
+                    a.span,
+                    format!("`@{}` only applies to functions", a.name.name),
+                )
+                .with_fix("remove it", a.span, ""),
+            );
+        }
+    }
+
+    /// Declares a struct or enum; its fields or variants come with the signatures.
+    fn declare_adt(
+        &mut self,
+        m: ModuleId,
+        item: &'u ast::Item,
+        name: &ast::Ident,
+        generics: &[ast::GenericParam],
+        kind: AdtKind,
+        public: bool,
+    ) {
+        let generics = self.declare_generics(generics);
+        let id = AdtId(self.p.adts.len() as u32);
+        self.p.adts.push(AdtDef {
+            name: name.name.clone(),
+            module: m,
+            generics,
+            kind,
+            opt_in: Vec::new(),
+            public,
+            span: item.span,
+            name_span: name.span,
+            lang: None,
+        });
+        self.bind(m, name, Res::Adt(id), public);
+        self.pending.push((m, PendingItem::Adt(id, item)));
     }
 
     fn flatten_use(
@@ -364,7 +405,7 @@ impl<'d> Collector<'d> {
             match name {
                 "compute" | "vertex" | "fragment" => {
                     if let Some((_, prev)) = out.entry {
-                        self.err(
+                        self.diags.push(
                             Diagnostic::new(
                                 codes::E0602,
                                 a.span,
@@ -377,7 +418,7 @@ impl<'d> Collector<'d> {
                     let entry = match name {
                         "vertex" | "fragment" => {
                             if a.args.is_some() {
-                                self.err(
+                                self.diags.push(
                                     Diagnostic::new(
                                         codes::E0602,
                                         a.span,
@@ -402,14 +443,14 @@ impl<'d> Collector<'d> {
                 "gpu" => out.gpu = Some(a.span),
                 "intrinsic" if is_std => out.intrinsic = true,
                 "comptime" | "deterministic" | "assert" | "assume" | "escaping" | "diagnostic" => {
-                    self.err(
+                    self.diags.push(
                         Diagnostic::new(codes::E0903, a.span, format!("`@{name}` is tier 1; it comes in milestone 2 or 3"))
                             .with_note("tier 0 has `@compute`, `@vertex`, `@fragment` and `@gpu` (language.md §9)"),
                     );
                 }
                 "audio" => {
-                    self
-                        .err(Diagnostic::new(codes::E0903, a.span, "`@audio` is tier 2").with_note(
+                    self.diags
+                        .push(Diagnostic::new(codes::E0903, a.span, "`@audio` is tier 2").with_note(
                         "tier 0 has `@compute`, `@vertex`, `@fragment` and `@gpu` (language.md §9)",
                     ));
                 }
@@ -424,7 +465,7 @@ impl<'d> Collector<'d> {
                     if let Some(s) = resolve::closest(name, known.iter().copied()) {
                         d = d.with_fix(format!("did you mean `@{s}`?"), a.name.span, s);
                     }
-                    self.err(d);
+                    self.diags.push(d);
                 }
             }
         }
@@ -434,7 +475,7 @@ impl<'d> Collector<'d> {
     /// `@compute(x)`, `@compute(x, y)` or `@compute(x, y, z)`, within WebGPU's default limits.
     fn workgroup_size(&mut self, a: &ast::Attribute) -> Option<[u32; 3]> {
         let Some(args) = &a.args else {
-            self.err(
+            self.diags.push(
                 Diagnostic::new(codes::E0602, a.span, "`@compute` needs a workgroup size")
                     .with_help("write `@compute(64)` for 64 invocations per workgroup")
                     .with_fix("use a workgroup of 64", a.span, "@compute(64)"),
@@ -442,7 +483,7 @@ impl<'d> Collector<'d> {
             return None;
         };
         if args.is_empty() || args.len() > 3 {
-            self.err(Diagnostic::new(
+            self.diags.push(Diagnostic::new(
                 codes::E0602,
                 a.span,
                 "`@compute` takes one to three sizes: `@compute(x, y, z)`",
@@ -452,17 +493,17 @@ impl<'d> Collector<'d> {
         let mut size = [1u32; 3];
         for (i, arg) in args.iter().enumerate() {
             let v = match &arg.value.kind {
-                ast::ExprKind::Lit(ast::Lit { kind: ast::LitKind::Int, text, .. })
+                ast::ExprKind::Lit(ast::Lit { kind: ast::LitKind::Int(v), .. })
                     if arg.name.is_none() =>
                 {
-                    wrela_syntax::lexer::int_value(text)
+                    v.ok()
                 }
                 _ => None,
             };
             match v {
                 Some(v) if v >= 1 && v <= u32::MAX as u64 => size[i] = v as u32,
                 _ => {
-                    self.err(Diagnostic::new(
+                    self.diags.push(Diagnostic::new(
                         codes::E0605,
                         arg.span,
                         "a workgroup size is a positive integer literal",
@@ -477,7 +518,7 @@ impl<'d> Collector<'d> {
         for i in 0..3 {
             if size[i] > limits[i] {
                 let axis = ["x", "y", "z"][i];
-                self.err(
+                self.diags.push(
                     Diagnostic::new(
                         codes::E0605,
                         args[i].span,
@@ -496,7 +537,7 @@ impl<'d> Collector<'d> {
         }
         let total = size[0] as u64 * size[1] as u64 * size[2] as u64;
         if total > u64::from(MAX_WORKGROUP_INVOCATIONS) {
-            self.err(
+            self.diags.push(
                 Diagnostic::new(
                     codes::E0605,
                     a.span,
@@ -519,9 +560,27 @@ impl<'d> Collector<'d> {
         let mut pending: Vec<PendingUse> = std::mem::take(&mut self.uses);
         loop {
             let before = pending.len();
+            // The names the imports still waiting will bind, and where.
+            let binds: Vec<(ModuleId, String)> =
+                pending.iter().map(|u| (u.module, u.alias.name.clone())).collect();
             // Each import still waiting, with the name it waits for and where.
             let mut still = Vec::new();
-            for u in pending {
+            for (i, u) in pending.into_iter().enumerate() {
+                // A path's first segment is a name in the module's scope before a top-level
+                // module or a global: while another import may still bind it, wait for that
+                // one, so the order of the `use` lines doesn't matter.
+                let first = &u.path[0].name;
+                let bound_later = first != "std"
+                    && !self.p.module(u.module).scope.contains_key(first)
+                    && binds
+                        .iter()
+                        .enumerate()
+                        .any(|(j, (m, n))| j != i && *m == u.module && n == first);
+                if bound_later {
+                    let (m, name) = (u.module, first.clone());
+                    still.push((u, m, name));
+                    continue;
+                }
                 match resolve::resolve_module_path(&self.p, u.module, &u.path) {
                     resolve::PathLookup::Found(res) => {
                         self.bind(u.module, &u.alias, res, u.public);
@@ -532,7 +591,7 @@ impl<'d> Collector<'d> {
                     }
                     resolve::PathLookup::Error(d) => {
                         // Reported once: uses of the name it would have bound stay quiet.
-                        self.err(*d);
+                        self.diags.push(*d);
                         self.p.modules[u.module.index()].broken.insert(u.alias.name.clone());
                     }
                 }
@@ -607,15 +666,15 @@ impl<'d> Collector<'d> {
                         );
                     }
                 }
-                self.err(d.with_help("import the item from the module that declares it"));
+                self.diags.push(d.with_help("import the item from the module that declares it"));
             } else if next[i].is_some() {
                 // Waits on a cycle, which is reported.
                 self.p.modules[u.module.index()].broken.insert(u.alias.name.clone());
             } else {
                 match resolve::resolve_module_path_in(&self.p, u.module, &u.path, true) {
-                    resolve::PathLookup::Error(d) => self.err(*d),
+                    resolve::PathLookup::Error(d) => self.diags.push(*d),
                     resolve::PathLookup::Broken => {}
-                    _ => self.err(Diagnostic::internal(format!(
+                    _ => self.diags.push(Diagnostic::internal(format!(
                         "the import `{}` resolved only in its final pass",
                         path_text(u)
                     ))),
@@ -657,7 +716,7 @@ impl<'d> Collector<'d> {
                     self.p.fns[f.index()].lang = Some(lang);
                     self.p.lang.insert(lang, LangRes::Fn(f));
                 }
-                _ => self.err(Diagnostic::internal(format!(
+                _ => self.diags.push(Diagnostic::internal(format!(
                     "std has no `{path}`, which the compiler relies on"
                 ))),
             }
@@ -668,49 +727,35 @@ impl<'d> Collector<'d> {
 
     fn resolve_signatures(&mut self) {
         let pending = std::mem::take(&mut self.pending);
-        // Bounds and supertraits first, so later lookups (`T::Kind`) can see them.
-        let mut supertraits = Vec::new();
-        for (m, item) in &pending {
-            match item {
-                PendingItem::Trait(id, t, _) => {
-                    let edges = self.trait_header(*m, *id, t);
-                    supertraits.extend(edges.into_iter().map(|(to, span)| (*id, to, span)));
-                }
-                PendingItem::Adt(id, item) => self.adt_bounds(*m, *id, item),
-                PendingItem::Impl(id, i, _) => self.impl_header(*m, *id, i),
-                PendingItem::Fn(id, f) => self.fn_bounds(*m, *id, f, &[]),
-                PendingItem::Const(..) => {}
+        // Bounds, supertraits and impl headers first, so later lookups (`T::Kind`) can see
+        // them. A projection can name a trait declared later, or lean on a bound declared later
+        // in its list (`fn f<T: Conv<U::K>, U: Has>`), so these are resolved quietly until that
+        // stops helping, then once more to report.
+        let mut errors = usize::MAX;
+        loop {
+            let mut quiet = Vec::new();
+            std::mem::swap(self.diags, &mut quiet);
+            self.headers(&pending);
+            std::mem::swap(self.diags, &mut quiet);
+            let n = quiet.iter().filter(|d| d.is_error()).count();
+            if n == 0 || n >= errors {
+                break;
             }
+            errors = n;
         }
+        let supertraits = self.headers(&pending);
         self.supertrait_cycles(&supertraits);
         for (m, item) in &pending {
             match item {
                 PendingItem::Trait(id, _, methods) => {
-                    let self_ty = self.p.types.param(self.p.trait_(*id).self_param);
-                    let mut scope = Scope::new(*m);
-                    scope.self_ty = Some(self_ty);
-                    scope.push_params(&self.p, &[self.p.trait_(*id).self_param]);
-                    let gens = self.p.trait_(*id).generics.clone();
-                    scope.push_params(&self.p, &gens);
-                    for (fid, f) in methods {
-                        self.fn_bounds(*m, *fid, f, &scope.params);
-                        self.fn_signature(&scope, *fid, f);
-                    }
+                    let scope = self.trait_scope(*m, *id);
+                    self.method_signatures(&scope, methods);
                 }
                 PendingItem::Impl(id, _, methods) => {
-                    let mut scope = Scope::new(*m);
-                    scope.self_ty = Some(self.p.impl_(*id).self_ty);
-                    let gens = self.p.impl_(*id).generics.clone();
-                    scope.push_params(&self.p, &gens);
-                    for (fid, f) in methods {
-                        self.fn_bounds(*m, *fid, f, &scope.params);
-                        self.fn_signature(&scope, *fid, f);
-                    }
+                    let scope = self.impl_scope(*m, *id);
+                    self.method_signatures(&scope, methods);
                 }
-                PendingItem::Fn(id, f) => {
-                    let scope = Scope::new(*m);
-                    self.fn_signature(&scope, *id, f);
-                }
+                PendingItem::Fn(id, f) => self.fn_signature(&Scope::new(*m), *id, f),
                 PendingItem::Adt(id, item) => self.adt_body(*m, *id, item),
                 PendingItem::Const(id, c) => {
                     if let Some(t) = &c.ty {
@@ -721,6 +766,63 @@ impl<'d> Collector<'d> {
                     }
                 }
             }
+        }
+    }
+
+    /// Resolves the bounds, supertraits and impl headers of `pending`; returns each supertrait
+    /// edge, with where it's named.
+    fn headers(
+        &mut self,
+        pending: &[(ModuleId, PendingItem<'u>)],
+    ) -> Vec<(TraitId, TraitId, Span)> {
+        let mut supertraits = Vec::new();
+        for (m, item) in pending {
+            match item {
+                PendingItem::Trait(id, t, _) => {
+                    let edges = self.trait_header(*m, *id, t);
+                    supertraits.extend(edges.into_iter().map(|(to, span)| (*id, to, span)));
+                }
+                PendingItem::Adt(id, item) => self.adt_bounds(*m, *id, item),
+                PendingItem::Impl(id, i, _) => self.impl_header(*m, *id, i),
+                PendingItem::Fn(id, f) => self.fn_bounds(&Scope::new(*m), *id, f),
+                PendingItem::Const(..) => {}
+            }
+        }
+        supertraits
+    }
+
+    /// What's in scope in a trait's items: `Self` and the trait's parameters.
+    fn trait_scope(&self, m: ModuleId, id: TraitId) -> Scope {
+        let tr = self.p.trait_(id);
+        let mut scope = Scope::new(m);
+        scope.self_ty = Some(self.p.types.param(tr.self_param));
+        scope.push_params(&self.p, &tr.generics);
+        scope
+    }
+
+    /// What's in scope in an impl's items: its parameters, and `Self`, the type it's for.
+    fn impl_scope(&self, m: ModuleId, id: ImplId) -> Scope {
+        let imp = self.p.impl_(id);
+        let mut scope = Scope::new(m);
+        scope.self_ty = Some(imp.self_ty);
+        scope.impl_ = Some(id);
+        scope.push_params(&self.p, &imp.generics);
+        scope
+    }
+
+    /// What's in scope in a struct's or an enum's declaration: its parameters. Its fields and
+    /// variants also see `Self`.
+    fn adt_scope(&self, m: ModuleId, id: AdtId) -> Scope {
+        let mut scope = Scope::new(m);
+        scope.push_params(&self.p, &self.p.adt(id).generics);
+        scope
+    }
+
+    /// The bounds and signatures of a trait's or an impl's methods, in the owner's scope.
+    fn method_signatures(&mut self, scope: &Scope, methods: &[(FnId, &ast::FnDecl)]) {
+        for &(fid, f) in methods {
+            self.fn_bounds(scope, fid, f);
+            self.fn_signature(scope, fid, f);
         }
     }
 
@@ -753,10 +855,7 @@ impl<'d> Collector<'d> {
     ) -> Vec<(TraitId, Span)> {
         let self_param = self.p.trait_(id).self_param;
         let gens = self.p.trait_(id).generics.clone();
-        let mut scope = Scope::new(m);
-        scope.self_ty = Some(self.p.types.param(self_param));
-        scope.push_params(&self.p, &[self_param]);
-        scope.push_params(&self.p, &gens);
+        let scope = self.trait_scope(m, id);
         self.set_param_bounds(&scope, &gens, &t.generics);
         let mut supers = Vec::new();
         let mut edges = Vec::new();
@@ -777,7 +876,7 @@ impl<'d> Collector<'d> {
         for member in &t.members {
             if let ast::TraitMemberKind::Type { name, bounds } = &member.kind {
                 if assoc.iter().any(|a: &AssocTypeDef| a.name == name.name) {
-                    self.err(Diagnostic::new(
+                    self.diags.push(Diagnostic::new(
                         codes::E0201,
                         name.span,
                         format!("`{}` is declared twice in this trait", name.name),
@@ -795,76 +894,44 @@ impl<'d> Collector<'d> {
     /// Reports each cycle of supertraits once (E0411), at the bound that closes it, and cuts it:
     /// what follows walks supertraits transitively, and would loop.
     fn supertrait_cycles(&mut self, edges: &[(TraitId, TraitId, Span)]) {
-        let n = self.p.traits.len();
-        let mut out: Vec<Vec<(TraitId, Span)>> = vec![Vec::new(); n];
+        let mut out: Vec<Vec<(TraitId, Span)>> = vec![Vec::new(); self.p.traits.len()];
         for &(from, to, span) in edges {
             out[from.index()].push((to, span));
         }
-        // Depth-first; an edge to a trait on the stack closes a cycle.
-        #[derive(Clone, Copy, PartialEq)]
-        enum State {
-            New,
-            OnStack,
-            Done,
-        }
-        let mut state = vec![State::New; n];
+        let p = &self.p;
         let mut cut: Vec<(TraitId, TraitId)> = Vec::new();
-        for root in 0..n {
-            if state[root] != State::New {
-                continue;
-            }
-            // (trait, next edge to follow), and the path of edges taken to it.
-            let mut stack: Vec<(usize, usize)> = vec![(root, 0)];
-            let mut path: Vec<(TraitId, Span)> = Vec::new();
-            state[root] = State::OnStack;
-            while let Some(&mut (t, ref mut k)) = stack.last_mut() {
-                let Some(&(to, span)) = out[t].get(*k) else {
-                    state[t] = State::Done;
-                    stack.pop();
-                    path.pop();
-                    continue;
+        dfs_cycles(
+            &out,
+            |&(to, _)| to.index(),
+            |v| {
+                let Visit::Cycle(cycle) = v else { return };
+                let (from, &(to, span)) = cycle[cycle.len() - 1];
+                let from = TraitId(from as u32);
+                cut.push((from, to));
+                let name = &p.trait_(to).name;
+                let mut d = if to == from {
+                    Diagnostic::new(
+                        codes::E0411,
+                        span,
+                        format!("`{name}` can't be its own supertrait"),
+                    )
+                } else {
+                    let through: Vec<String> = cycle[1..]
+                        .iter()
+                        .map(|&(t, _)| format!("`{}`", p.traits[t].name))
+                        .collect();
+                    Diagnostic::new(
+                        codes::E0411,
+                        span,
+                        format!("`{name}` is its own supertrait, through {}", and_list(&through)),
+                    )
                 };
-                *k += 1;
-                match state[to.index()] {
-                    State::New => {
-                        state[to.index()] = State::OnStack;
-                        stack.push((to.index(), 0));
-                        path.push((to, span));
-                    }
-                    State::OnStack => {
-                        let from = TraitId(t as u32);
-                        cut.push((from, to));
-                        let name = self.p.trait_(to).name.clone();
-                        let at = stack.iter().position(|&(s, _)| s == to.index()).unwrap_or(0);
-                        let mut d = if to == from {
-                            Diagnostic::new(
-                                codes::E0411,
-                                span,
-                                format!("`{name}` can't be its own supertrait"),
-                            )
-                        } else {
-                            let through: Vec<String> = stack[at + 1..]
-                                .iter()
-                                .map(|&(s, _)| format!("`{}`", self.p.traits[s].name))
-                                .collect();
-                            Diagnostic::new(
-                                codes::E0411,
-                                span,
-                                format!(
-                                    "`{name}` is its own supertrait, through {}",
-                                    and_list(&through)
-                                ),
-                            )
-                        };
-                        for &(_, s) in &path[at..] {
-                            d = d.with_secondary(s, "a supertrait in the cycle");
-                        }
-                        self.err(d);
-                    }
-                    State::Done => {}
+                for &(_, &(_, s)) in &cycle[..cycle.len() - 1] {
+                    d = d.with_secondary(s, "a supertrait in the cycle");
                 }
-            }
-        }
+                self.diags.push(d);
+            },
+        );
         for (from, to) in cut {
             let t = &mut self.p.traits[from.index()];
             t.supertraits.retain(|r| r.trait_ != to);
@@ -875,8 +942,7 @@ impl<'d> Collector<'d> {
 
     fn adt_bounds(&mut self, m: ModuleId, id: AdtId, item: &ast::Item) {
         let gens = self.p.adt(id).generics.clone();
-        let mut scope = Scope::new(m);
-        scope.push_params(&self.p, &gens);
+        let scope = self.adt_scope(m, id);
         let ast_generics = match &item.kind {
             ast::ItemKind::Struct(s) => &s.generics,
             ast::ItemKind::Enum(e) => &e.generics,
@@ -886,10 +952,9 @@ impl<'d> Collector<'d> {
     }
 
     fn adt_body(&mut self, m: ModuleId, id: AdtId, item: &ast::Item) {
-        let gens = self.p.adt(id).generics.clone();
-        let mut scope = Scope::new(m);
-        scope.push_params(&self.p, &gens);
-        let self_args: Vec<TyId> = gens.iter().map(|&g| self.p.types.param(g)).collect();
+        let mut scope = self.adt_scope(m, id);
+        let self_args: Vec<TyId> =
+            self.p.adt(id).generics.iter().map(|&g| self.p.types.param(g)).collect();
         scope.self_ty = Some(self.p.types.adt(id, self_args));
         let (traits, kind) = match &item.kind {
             ast::ItemKind::Struct(s) => {
@@ -901,7 +966,7 @@ impl<'d> Collector<'d> {
                 for v in &e.variants {
                     if let Some(prev) = variants.iter().find(|p| p.name == v.name.name) {
                         let ps = prev.span;
-                        self.err(
+                        self.diags.push(
                             Diagnostic::new(
                                 codes::E0201,
                                 v.name.span,
@@ -967,7 +1032,7 @@ impl<'d> Collector<'d> {
         for f in fields {
             if let Some(prev) = out.iter().find(|p| p.name == f.name.name) {
                 let ps = prev.span;
-                self.err(
+                self.diags.push(
                     Diagnostic::new(
                         codes::E0201,
                         f.name.span,
@@ -980,7 +1045,7 @@ impl<'d> Collector<'d> {
             let ty = resolve::resolve_type(&self.p, self.diags, scope, &f.ty, TyPos::Normal);
             let default = if allow_default { f.default.clone() } else { None };
             if !allow_default && let Some(d) = &f.default {
-                self.err(Diagnostic::new(
+                self.diags.push(Diagnostic::new(
                     codes::E0324,
                     d.span,
                     "variant fields can't have defaults",
@@ -1005,6 +1070,7 @@ impl<'d> Collector<'d> {
         let self_ty = resolve::resolve_type(&self.p, self.diags, &scope, &i.self_ty, TyPos::Normal);
         self.p.impls[id.index()].self_ty = self_ty;
         scope.self_ty = Some(self_ty);
+        scope.impl_ = Some(id);
         if let Some(t) = &i.trait_ {
             let r = resolve::resolve_trait_ref(&self.p, self.diags, &scope, t);
             self.p.impls[id.index()].trait_ref = r;
@@ -1014,7 +1080,7 @@ impl<'d> Collector<'d> {
             if let ast::ImplMemberKind::Type { name, ty } = &member.kind {
                 let t = resolve::resolve_type(&self.p, self.diags, &scope, ty, TyPos::Normal);
                 if assoc.insert(name.name.clone(), t).is_some() {
-                    self.err(Diagnostic::new(
+                    self.diags.push(Diagnostic::new(
                         codes::E0201,
                         name.span,
                         format!("`{}` is defined twice in this impl", name.name),
@@ -1025,16 +1091,10 @@ impl<'d> Collector<'d> {
         self.p.impls[id.index()].assoc_types = assoc;
     }
 
-    fn fn_bounds(&mut self, m: ModuleId, id: FnId, f: &ast::FnDecl, outer: &[(String, ParamId)]) {
+    fn fn_bounds(&mut self, outer: &Scope, id: FnId, f: &ast::FnDecl) {
         let gens = self.p.func(id).generics.clone();
-        let mut scope = Scope::new(m);
-        scope.params = outer.to_vec();
+        let mut scope = outer.clone();
         scope.push_params(&self.p, &gens);
-        if let FnOwner::Impl(i) = self.p.func(id).owner {
-            scope.self_ty = Some(self.p.impl_(i).self_ty);
-        } else if let FnOwner::Trait(t) = self.p.func(id).owner {
-            scope.self_ty = Some(self.p.types.param(self.p.trait_(t).self_param));
-        }
         self.set_param_bounds(&scope, &gens, &f.generics);
     }
 
@@ -1049,7 +1109,7 @@ impl<'d> Collector<'d> {
             match p {
                 ast::Param::SelfParam { mode, span } => {
                     if owner == FnOwner::Free || i != 0 {
-                        self.err(Diagnostic::new(
+                        self.diags.push(Diagnostic::new(
                             codes::E0100,
                             *span,
                             if owner == FnOwner::Free {
@@ -1063,7 +1123,7 @@ impl<'d> Collector<'d> {
                     let ty = scope.self_ty.unwrap_or(self.p.types.error);
                     params.push(ParamSig {
                         name: "self".into(),
-                        mode: (*mode).into(),
+                        mode: *mode,
                         ty,
                         default: None,
                         span: *span,
@@ -1073,7 +1133,7 @@ impl<'d> Collector<'d> {
                 ast::Param::Named { name, mode, ty, default, span } => {
                     if let Some(prev) = params.iter().find(|q| q.name == name.name) {
                         let ps = prev.span;
-                        self.err(
+                        self.diags.push(
                             Diagnostic::new(
                                 codes::E0201,
                                 name.span,
@@ -1092,7 +1152,7 @@ impl<'d> Collector<'d> {
                     );
                     params.push(ParamSig {
                         name: name.name.clone(),
-                        mode: (*mode).into(),
+                        mode: *mode,
                         ty: t,
                         default: default.clone(),
                         span: *span,
@@ -1117,12 +1177,7 @@ impl<'d> Collector<'d> {
                     &r.ty,
                     TyPos::Return(&mut opaque),
                 );
-                let mode = match r.mode {
-                    ast::RetMode::Owned => RetMode::Owned,
-                    ast::RetMode::Borrow => RetMode::Borrow,
-                    ast::RetMode::Mut => RetMode::Mut,
-                };
-                (t, mode)
+                (t, r.mode)
             }
             None => (self.p.types.unit, RetMode::Owned),
         };
@@ -1149,44 +1204,61 @@ impl<'d> Collector<'d> {
     /// large: there's no indirection in tier 0. Each cycle is reported once (E0318), and the
     /// field that closes it gets the error type, so nothing later walks it forever.
     fn check_recursive_types(&mut self) {
-        let n = self.p.adts.len();
-        let field_tys = |p: &Program, a: usize| -> Vec<(TyId, Span)> {
-            match &p.adts[a].kind {
-                AdtKind::Struct(fs) => fs.iter().map(|f| (f.ty, f.span)).collect(),
-                AdtKind::Enum(vs) => {
-                    vs.iter().flat_map(|v| v.fields.iter().map(|f| (f.ty, f.span))).collect()
-                }
-            }
-        };
-        // The ADTs a type holds by value, given which generic parameters each ADT holds.
-        fn held(p: &Program, holds: &[Vec<bool>], t: TyId, out: &mut Vec<TyKind>) {
+        /// What a type holds by value.
+        enum Held {
+            Adt(usize),
+            Param(ParamId),
+        }
+        // What a type holds by value, given which generic parameters each ADT holds.
+        fn held(p: &Program, holds: &[Vec<bool>], t: TyId, out: &mut Vec<Held>) {
+            held_in(p, holds, t, out, 0)
+        }
+        fn held_in(p: &Program, holds: &[Vec<bool>], t: TyId, out: &mut Vec<Held>, depth: u32) {
             match p.types.kind(t) {
                 TyKind::Adt(b, args) => {
-                    out.push(TyKind::Adt(*b, Vec::new()));
+                    out.push(Held::Adt(b.index()));
                     for (i, &arg) in args.iter().enumerate() {
                         if holds[b.index()].get(i).copied().unwrap_or(true) {
-                            held(p, holds, arg, out);
+                            held_in(p, holds, arg, out, depth);
+                        }
+                    }
+                    // A field typed by a projection holds what the projection is for these
+                    // arguments: `k: T::K` with `T = S` and `type K = S` holds an `S`. The
+                    // depth bounds impls whose associated types grow.
+                    let adt = p.adt(*b);
+                    if args.is_empty() || depth >= MAX_PROJECTION_DEPTH {
+                        return;
+                    }
+                    let subst = Subst::from_pairs(&adt.generics, args);
+                    let is_projection = |k: &TyKind| matches!(k, TyKind::Projection { .. });
+                    for f in adt.all_fields() {
+                        if p.types.any(f.ty, &mut { is_projection }) {
+                            let ty = crate::traits::normalize(p, p.types.subst(f.ty, &subst), None);
+                            held_in(p, holds, ty, out, depth + 1);
                         }
                     }
                 }
-                TyKind::Param(q) => out.push(TyKind::Param(*q)),
-                TyKind::Tuple(ts) => ts.iter().for_each(|&x| held(p, holds, x, out)),
-                TyKind::Array(e, _) => held(p, holds, *e, out),
+                TyKind::Param(q) => out.push(Held::Param(*q)),
+                TyKind::Tuple(ts) => ts.iter().for_each(|&x| held_in(p, holds, x, out, depth)),
+                TyKind::Array(e, _) => held_in(p, holds, *e, out, depth),
                 _ => {}
             }
         }
+        const MAX_PROJECTION_DEPTH: u32 = 8;
+        let p = &self.p;
+        let mut out = Vec::new();
         // Which of its generic parameters each ADT holds by value: a fixpoint.
         let mut holds: Vec<Vec<bool>> =
-            self.p.adts.iter().map(|a| vec![false; a.generics.len()]).collect();
+            p.adts.iter().map(|a| vec![false; a.generics.len()]).collect();
         loop {
             let mut changed = false;
-            for a in 0..n {
-                for (t, _) in field_tys(&self.p, a) {
-                    let mut out = Vec::new();
-                    held(&self.p, &holds, t, &mut out);
-                    for k in out {
-                        if let TyKind::Param(q) = k
-                            && let Some(i) = self.p.adts[a].generics.iter().position(|&g| g == q)
+            for (a, adt) in p.adts.iter().enumerate() {
+                for f in adt.all_fields() {
+                    out.clear();
+                    held(p, &holds, f.ty, &mut out);
+                    for k in &out {
+                        if let Held::Param(q) = *k
+                            && let Some(i) = adt.generics.iter().position(|&g| g == q)
                             && !holds[a][i]
                         {
                             holds[a][i] = true;
@@ -1199,153 +1271,104 @@ impl<'d> Collector<'d> {
                 break;
             }
         }
-        // Edges: the ADTs each field holds, with the field.
-        let edges: Vec<Vec<(usize, usize)>> = (0..n)
-            .map(|a| {
-                let mut e = Vec::new();
-                for (fi, (t, _)) in field_tys(&self.p, a).into_iter().enumerate() {
-                    let mut out = Vec::new();
-                    held(&self.p, &holds, t, &mut out);
-                    for k in out {
-                        if let TyKind::Adt(b, _) = k {
-                            e.push((b.index(), fi));
-                        }
+        // Edges: the ADTs each field holds, with the field's index and span.
+        let mut edges: Vec<Vec<(usize, usize, Span)>> = Vec::new();
+        for adt in &p.adts {
+            let mut e = Vec::new();
+            for (fi, f) in adt.all_fields().enumerate() {
+                out.clear();
+                held(p, &holds, f.ty, &mut out);
+                for k in &out {
+                    if let Held::Adt(b) = *k {
+                        e.push((b, fi, f.span));
                     }
                 }
-                e
-            })
-            .collect();
-        #[derive(Clone, Copy, PartialEq)]
-        enum Mark {
-            New,
-            Active,
-            Done,
+            }
+            edges.push(e);
         }
-        let mut mark = vec![Mark::New; n];
         let mut broken: Vec<(usize, usize)> = Vec::new();
-        for root in 0..n {
-            if mark[root] != Mark::New {
-                continue;
-            }
-            // (adt, next edge to follow)
-            let mut stack: Vec<(usize, usize)> = vec![(root, 0)];
-            mark[root] = Mark::Active;
-            while let Some(&mut (a, ref mut next)) = stack.last_mut() {
-                let Some(&(b, fi)) = edges[a].get(*next) else {
-                    mark[a] = Mark::Done;
-                    stack.pop();
-                    continue;
-                };
-                *next += 1;
-                match mark[b] {
-                    Mark::New => {
-                        mark[b] = Mark::Active;
-                        stack.push((b, 0));
-                    }
-                    Mark::Active => {
-                        let at = stack.iter().position(|&(x, _)| x == b).unwrap_or(0);
-                        let cycle: Vec<usize> = stack[at..].iter().map(|&(x, _)| x).collect();
-                        self.report_recursive(&cycle, a, field_tys(&self.p, a)[fi].1);
-                        broken.push((a, fi));
-                    }
-                    Mark::Done => {}
-                }
-            }
-        }
+        dfs_cycles(
+            &edges,
+            |&(b, ..)| b,
+            |v| {
+                let Visit::Cycle(cycle) = v else { return };
+                let (a, &(_, fi, field_span)) = cycle[cycle.len() - 1];
+                let adts: Vec<usize> = cycle.iter().map(|&(x, _)| x).collect();
+                self.diags.push(recursive_type_error(p, &adts, a, field_span));
+                broken.push((a, fi));
+            },
+        );
         let error = self.p.types.error;
         for (a, fi) in broken {
-            match &mut self.p.adts[a].kind {
-                AdtKind::Struct(fs) => fs[fi].ty = error,
-                AdtKind::Enum(vs) => {
-                    if let Some(f) = vs.iter_mut().flat_map(|v| v.fields.iter_mut()).nth(fi) {
-                        f.ty = error;
-                    }
-                }
+            if let Some(f) = self.p.adts[a].all_fields_mut().nth(fi) {
+                f.ty = error;
             }
         }
     }
 
-    fn report_recursive(&mut self, cycle: &[usize], last: usize, field_span: Span) {
-        let first = &self.p.adts[cycle[0]];
-        let msg = if cycle.len() == 1 {
-            format!(
-                "`{}` holds a `{}` inside itself, so it would be infinitely large",
-                first.name, first.name
-            )
-        } else {
-            let names: Vec<String> =
-                cycle.iter().map(|&a| format!("`{}`", self.p.adts[a].name)).collect();
-            format!("{} hold each other, so they would be infinitely large", names.join(", "))
-        };
-        let d = Diagnostic::new(codes::E0318, first.name_span, msg)
-            .with_secondary(
-                field_span,
-                format!("this field of `{}` closes the cycle", self.p.adts[last].name),
-            )
-            .with_note("a value holds its fields directly; there are no pointers in tier 0")
-            .with_help("hold an index into an array instead");
-        self.err(d);
-    }
-
-    fn check_impls(&mut self) {
+    /// Adds the impls that opting in implies, and indexes every impl by its trait or type.
+    fn index_impls(&mut self) {
         // Opting in to a trait in a declaration implies an impl of it.
-        for a in 0..self.p.adts.len() {
-            let opt_in = self.p.adts[a].opt_in.clone();
-            for (r, span) in opt_in {
-                let gens = self.p.adts[a].generics.clone();
-                let args = gens.iter().map(|&g| self.p.types.param(g)).collect();
-                let self_ty = self.p.types.adt(AdtId(a as u32), args);
-                let tr = self.p.trait_(r.trait_).clone();
-                if !matches!(tr.lang, Some(Lang::Copy | Lang::Clone | Lang::GpuData)) {
+        let p = &self.p;
+        let mut implied = Vec::new();
+        for (a, adt) in p.adts.iter().enumerate() {
+            if adt.opt_in.is_empty() {
+                continue;
+            }
+            let args = adt.generics.iter().map(|&g| p.types.param(g)).collect();
+            let self_ty = p.types.adt(AdtId(a as u32), args);
+            for (r, span) in &adt.opt_in {
+                let tr = p.trait_(r.trait_);
+                if !tr.lang.is_some_and(Lang::is_structural) {
                     let required: Vec<String> = tr
                         .methods
                         .iter()
-                        .filter(|&&f| self.p.func(f).body.is_none())
-                        .map(|&f| format!("`fn {}`", self.p.func(f).name))
+                        .filter(|&&f| p.func(f).body.is_none())
+                        .map(|&f| format!("`fn {}`", p.func(f).name))
                         .chain(tr.assoc_types.iter().map(|t| format!("`type {}`", t.name)))
                         .collect();
                     if !required.is_empty() {
-                        self.err(
+                        self.diags.push(
                             Diagnostic::new(
                                 codes::E0401,
-                                span,
+                                *span,
                                 format!(
                                     "`{}` can't opt in to `{}`: the trait requires {}",
-                                    self.p.adts[a].name,
+                                    adt.name,
                                     tr.name,
                                     required.join(", ")
                                 ),
                             )
                             .with_help(format!(
                                 "write `impl {} for {} {{ ... }}` instead",
-                                tr.name, self.p.adts[a].name
+                                tr.name, adt.name
                             )),
                         );
                         continue;
                     }
                 }
-                self.p.impls.push(ImplDef {
-                    module: self.p.adts[a].module,
-                    generics: gens,
-                    trait_ref: Some(r),
+                implied.push(ImplDef {
+                    module: adt.module,
+                    generics: adt.generics.clone(),
+                    trait_ref: Some(r.clone()),
                     self_ty,
                     assoc_types: BTreeMap::new(),
                     methods: Vec::new(),
-                    span,
+                    span: *span,
                     from_opt_in: true,
                 });
             }
         }
-        for i in 0..self.p.impls.len() {
+        self.p.impls.extend(implied);
+        for (i, imp) in self.p.impls.iter().enumerate() {
             let id = ImplId(i as u32);
-            let imp = self.p.impls[i].clone();
             match &imp.trait_ref {
                 Some(r) => self.p.impls_of_trait.entry(r.trait_).or_default().push(id),
-                None => match self.p.types.kind(imp.self_ty).clone() {
+                None => match *self.p.types.kind(imp.self_ty) {
                     TyKind::Adt(a, _) => self.p.inherent_impls.entry(a).or_default().push(id),
                     TyKind::Error => {}
                     _ => {
-                        self.err(
+                        self.diags.push(
                             Diagnostic::new(
                                 codes::E0404,
                                 imp.span,
@@ -1360,328 +1383,271 @@ impl<'d> Collector<'d> {
                 },
             }
         }
-        for i in 0..self.p.impls.len() {
-            self.check_impl(ImplId(i as u32));
-        }
-        self.check_overlap();
     }
 
-    fn check_impl(&mut self, id: ImplId) {
-        let imp = self.p.impl_(id).clone();
-        let Some(r) = imp.trait_ref.clone() else {
-            // Inherent: methods must have distinct names, and the type must be local.
-            if let TyKind::Adt(a, _) = *self.p.types.kind(imp.self_ty) {
-                let adt_mod = self.p.adt(a).module;
-                if self.p.is_std(adt_mod) && !self.p.is_std(imp.module) {
-                    self.err(
-                        Diagnostic::new(
-                            codes::E0404,
-                            imp.span,
-                            format!(
-                                "`{}` is defined in std, so only std can add methods to it",
-                                self.p.adt(a).name
-                            ),
-                        )
-                        .with_help("define a trait with the methods and implement it for the type"),
-                    );
-                }
-            }
-            let mut seen: Vec<(String, Span)> = Vec::new();
-            for &f in &imp.methods {
-                let d = self.p.func(f);
-                if let Some((_, ps)) = seen.iter().find(|(n, _)| *n == d.name) {
-                    let (ps, ns, name) = (*ps, d.name_span, d.name.clone());
-                    self.err(
-                        Diagnostic::new(codes::E0201, ns, format!("`{name}` is defined twice"))
-                            .with_secondary(ps, "first defined here"),
-                    );
-                } else {
-                    seen.push((d.name.clone(), d.name_span));
-                }
-            }
-            return;
-        };
-        let tr = self.p.trait_(r.trait_).clone();
-        let structural = matches!(tr.lang, Some(Lang::Copy | Lang::Clone | Lang::GpuData));
-        // Builtin traits are structural: only by opting in.
-        if structural && !imp.from_opt_in {
-            self.err(
-                Diagnostic::new(
-                    codes::E0403,
-                    imp.span,
-                    format!("`{}` is implemented by opting in, not with an impl", tr.name),
-                )
-                .with_help(format!("declare the type as `struct Name: {} {{ ... }}`", tr.name)),
-            );
-            return;
+    fn check_impls(&mut self) {
+        for imp in &self.p.impls {
+            check_impl(&self.p, self.diags, imp);
         }
-        if structural {
-            self.check_structural_opt_in(id, &tr);
-            return;
-        }
-        // Orphan rule (D-071): the trait or the type must be this package's.
-        let trait_local = self.p.is_std(tr.module) == self.p.is_std(imp.module);
-        let type_local = match *self.p.types.kind(imp.self_ty) {
-            TyKind::Adt(a, _) => self.p.is_std(self.p.adt(a).module) == self.p.is_std(imp.module),
-            _ => false,
-        };
-        if !trait_local && !type_local {
-            self.err(
-                Diagnostic::new(
-                    codes::E0404,
-                    imp.span,
-                    format!(
-                        "this package can't implement std's `{}` for std's `{}`",
-                        tr.name,
-                        self.p.display_ty(imp.self_ty)
-                    ),
-                )
-                .with_note("an impl lives with its trait or with its type (D-071)")
-                .with_help("wrap the type in a struct of your own, or define your own trait"),
-            );
-        }
-        // Every required item, nothing extra, and matching signatures.
-        let trait_subst = {
-            let mut s = Subst::from_pairs(&tr.generics, &r.args);
-            s.insert(tr.self_param, imp.self_ty);
-            s
-        };
-        for at in &tr.assoc_types {
-            if !imp.assoc_types.contains_key(&at.name) && !imp.from_opt_in {
-                self.err(
+        check_inherent_names(&self.p, self.diags);
+        check_overlap(&self.p, self.diags);
+    }
+}
+
+/// The error for a cycle of structs and enums that hold each other (E0318): `cycle` in order,
+/// and `last`'s field that closes it.
+fn recursive_type_error(p: &Program, cycle: &[usize], last: usize, field_span: Span) -> Diagnostic {
+    let first = &p.adts[cycle[0]];
+    let msg = if cycle.len() == 1 {
+        format!(
+            "`{}` holds a `{}` inside itself, so it would be infinitely large",
+            first.name, first.name
+        )
+    } else {
+        let names: Vec<String> = cycle.iter().map(|&a| format!("`{}`", p.adts[a].name)).collect();
+        format!("{} hold each other, so they would be infinitely large", names.join(", "))
+    };
+    Diagnostic::new(codes::E0318, first.name_span, msg)
+        .with_secondary(
+            field_span,
+            format!("this field of `{}` closes the cycle", p.adts[last].name),
+        )
+        .with_note("a value holds its fields directly; there are no pointers in tier 0")
+        .with_help("hold an index into an array instead")
+}
+
+fn check_impl(p: &Program, diags: &mut Vec<Diagnostic>, imp: &ImplDef) {
+    let Some(r) = &imp.trait_ref else {
+        // Inherent: methods must have distinct names, and the type must be local.
+        if let TyKind::Adt(a, _) = *p.types.kind(imp.self_ty) {
+            let adt_mod = p.adt(a).module;
+            if p.is_std(adt_mod) && !p.is_std(imp.module) {
+                diags.push(
                     Diagnostic::new(
-                        codes::E0401,
+                        codes::E0404,
                         imp.span,
-                        format!("this impl of `{}` is missing `type {}`", tr.name, at.name),
+                        format!(
+                            "`{}` is defined in std, so only std can add methods to it",
+                            p.adt(a).name
+                        ),
                     )
-                    .with_help(format!("add `type {} = ...`", at.name)),
+                    .with_help("define a trait with the methods and implement it for the type"),
                 );
             }
         }
+        report_duplicate_methods(p, diags, &imp.methods);
         for name in imp.assoc_types.keys() {
-            if !tr.assoc_types.iter().any(|a| &a.name == name) {
-                self.err(Diagnostic::new(
+            diags.push(
+                Diagnostic::new(
                     codes::E0402,
                     imp.span,
-                    format!("`{}` has no associated type `{name}`", tr.name),
+                    format!("an inherent impl can't define the associated type `{name}`"),
+                )
+                .with_note("associated types belong to traits"),
+            );
+        }
+        return;
+    };
+    let tr = p.trait_(r.trait_);
+    let structural = tr.lang.is_some_and(Lang::is_structural);
+    // Builtin traits are structural: only by opting in.
+    if structural && !imp.from_opt_in {
+        diags.push(
+            Diagnostic::new(
+                codes::E0403,
+                imp.span,
+                format!("`{}` is implemented by opting in, not with an impl", tr.name),
+            )
+            .with_help(format!("declare the type as `struct Name: {} {{ ... }}`", tr.name)),
+        );
+        return;
+    }
+    if structural {
+        check_structural_opt_in(p, diags, imp, tr);
+        return;
+    }
+    // Orphan rule (D-071): the trait or the type must be this package's.
+    let trait_local = p.is_std(tr.module) == p.is_std(imp.module);
+    let type_local = match *p.types.kind(imp.self_ty) {
+        TyKind::Adt(a, _) => p.is_std(p.adt(a).module) == p.is_std(imp.module),
+        _ => false,
+    };
+    if !trait_local && !type_local {
+        diags.push(
+            Diagnostic::new(
+                codes::E0404,
+                imp.span,
+                format!(
+                    "this package can't implement std's `{}` for std's `{}`",
+                    tr.name,
+                    p.display_ty(imp.self_ty)
+                ),
+            )
+            .with_note("an impl lives with its trait or with its type (D-071)")
+            .with_help("wrap the type in a struct of your own, or define your own trait"),
+        );
+    }
+    // Every required item, nothing extra, and matching signatures.
+    let trait_subst = {
+        let mut s = Subst::from_pairs(&tr.generics, &r.args);
+        s.insert(tr.self_param, imp.self_ty);
+        s
+    };
+    for at in &tr.assoc_types {
+        if !imp.assoc_types.contains_key(&at.name) && !imp.from_opt_in {
+            diags.push(
+                Diagnostic::new(
+                    codes::E0401,
+                    imp.span,
+                    format!("this impl of `{}` is missing `type {}`", tr.name, at.name),
+                )
+                .with_help(format!("add `type {} = ...`", at.name)),
+            );
+        }
+    }
+    for name in imp.assoc_types.keys() {
+        if !tr.assoc_types.iter().any(|a| &a.name == name) {
+            diags.push(Diagnostic::new(
+                codes::E0402,
+                imp.span,
+                format!("`{}` has no associated type `{name}`", tr.name),
+            ));
+        }
+    }
+    // Each associated type has the traits the trait declares it with.
+    for at in &tr.assoc_types {
+        let Some(&ty) = imp.assoc_types.get(&at.name) else { continue };
+        let ty = crate::traits::normalize(p, ty, Some(imp));
+        for b in &at.bounds {
+            let b = b.subst(&p.types, &trait_subst);
+            let b = TraitRef {
+                trait_: b.trait_,
+                args: b.args.iter().map(|&a| crate::traits::normalize(p, a, Some(imp))).collect(),
+            };
+            if !crate::traits::implements(p, ty, &b) {
+                diags.push(Diagnostic::new(
+                    codes::E0400,
+                    imp.span,
+                    format!(
+                        "`type {} = {}` doesn't implement `{}`, which `{}` declares it with",
+                        at.name,
+                        p.display_ty(ty),
+                        p.display_trait_ref(&b),
+                        tr.name
+                    ),
                 ));
             }
         }
-        for &tm in &tr.methods {
-            let tdef = self.p.func(tm).clone();
-            let found = imp.methods.iter().copied().find(|&f| self.p.func(f).name == tdef.name);
-            match found {
-                None if tdef.body.is_none() && !imp.from_opt_in => {
-                    self.err(
-                        Diagnostic::new(
-                            codes::E0401,
-                            imp.span,
-                            format!("this impl of `{}` is missing `fn {}`", tr.name, tdef.name),
-                        )
-                        .with_secondary(tdef.sig_span, "declared here"),
-                    );
-                }
-                None => {}
-                Some(f) => self.compare_signatures(f, tm, &trait_subst, &imp),
-            }
-        }
-        for &f in &imp.methods {
-            let name = self.p.func(f).name.clone();
-            if !tr.methods.iter().any(|&m| self.p.func(m).name == name) {
-                let ns = self.p.func(f).name_span;
-                self.err(
-                    Diagnostic::new(
-                        codes::E0402,
-                        ns,
-                        format!("`{}` has no method `{name}`", tr.name),
-                    )
-                    .with_help("move it to an inherent `impl` block"),
-                );
-            }
-        }
     }
-
-    /// An impl method's signature must be the trait's, with `Self` and the trait's parameters
-    /// substituted.
-    fn compare_signatures(
-        &mut self,
-        impl_fn: FnId,
-        trait_fn: FnId,
-        trait_subst: &Subst,
-        imp: &ImplDef,
-    ) {
-        let a = self.p.func(impl_fn).clone();
-        let b = self.p.func(trait_fn).clone();
-        let mut subst = trait_subst.clone();
-        let mismatch = |this: &mut Self, what: String| {
-            this.err(
+    // The type has the trait's supertraits too.
+    for sup in &tr.supertraits {
+        let sup = sup.subst(&p.types, &trait_subst);
+        if !crate::traits::implements(p, imp.self_ty, &sup) {
+            diags.push(
                 Diagnostic::new(
-                    codes::E0405,
-                    a.sig_span,
-                    format!("`{}` doesn't match the trait's signature: {what}", a.name),
-                )
-                .with_secondary(b.sig_span, "the trait declares it here"),
-            );
-        };
-        if a.generics.len() != b.generics.len() {
-            return mismatch(
-                self,
-                format!(
-                    "it has {} generic parameters, the trait's has {}",
-                    a.generics.len(),
-                    b.generics.len()
-                ),
-            );
-        }
-        for (&tp, &ip) in b.generics.iter().zip(&a.generics) {
-            let t = self.p.types.param(ip);
-            subst.insert(tp, t);
-        }
-        if a.params.len() != b.params.len() {
-            return mismatch(
-                self,
-                format!(
-                    "it takes {} parameters, the trait's takes {}",
-                    a.params.len(),
-                    b.params.len()
-                ),
-            );
-        }
-        for (pa, pb) in a.params.iter().zip(&b.params) {
-            if pa.mode != pb.mode {
-                return mismatch(
-                    self,
+                    codes::E0400,
+                    imp.span,
                     format!(
-                        "`{}` is `{}` here but `{}` in the trait",
-                        pa.name,
-                        pa.mode.keyword(),
-                        pb.mode.keyword()
+                        "`{}` doesn't implement `{}`, which `{}` needs",
+                        p.display_ty(imp.self_ty),
+                        p.display_trait_ref(&sup),
+                        tr.name
                     ),
-                );
-            }
-            let expected = self.p.types.subst(pb.ty, &subst);
-            let expected = crate::traits::normalize(&self.p, expected, Some(imp));
-            if pa.ty != expected && !pa.is_self {
-                let (x, y) = (self.p.display_ty(pa.ty), self.p.display_ty(expected));
-                return mismatch(
-                    self,
-                    format!("`{}` has type `{x}`, but the trait says `{y}`", pa.name),
-                );
-            }
-        }
-        if a.ret_mode != b.ret_mode {
-            return mismatch(self, "the return mode differs".into());
-        }
-        if b.opaque.is_none() && a.opaque.is_none() {
-            let expected = self.p.types.subst(b.ret, &subst);
-            let expected = crate::traits::normalize(&self.p, expected, Some(imp));
-            if a.ret != expected {
-                let (x, y) = (self.p.display_ty(a.ret), self.p.display_ty(expected));
-                mismatch(self, format!("it returns `{x}`, but the trait says `{y}`"));
-            }
+                )
+                .with_note(format!(
+                    "`{}` is a supertrait of `{}`",
+                    p.display_trait_ref(&sup),
+                    tr.name
+                ))
+                .with_help(format!(
+                    "implement `{}` for `{}` too",
+                    p.display_trait_ref(&sup),
+                    p.display_ty(imp.self_ty)
+                )),
+            );
         }
     }
-
-    /// `Copy`, `Clone` and `GpuData` are implemented structurally: every field must have them
-    /// too (field types that use the type's parameters make the impl conditional).
-    fn check_structural_opt_in(&mut self, id: ImplId, tr: &TraitDef) {
-        let imp = self.p.impl_(id).clone();
-        let TyKind::Adt(a, _) = *self.p.types.kind(imp.self_ty) else { return };
-        let adt = self.p.adt(a).clone();
-        let lang = tr.lang;
-        let mut fields: Vec<&FieldDef> = adt.fields().iter().collect();
-        for v in adt.variants() {
-            fields.extend(v.fields.iter());
-        }
-        if lang == Some(Lang::Copy)
-            && !adt.opt_in.iter().any(|(r, _)| self.p.is_lang_trait(r.trait_, Lang::Clone))
-        {
-            self.err(
-                Diagnostic::new(
-                    codes::E0407,
-                    imp.span,
-                    format!("`{}` opts in to `Copy` but not `Clone`", adt.name),
-                )
-                .with_note("every `Copy` type is also `Clone`")
-                .with_fix(
-                    "opt in to `Clone` too",
-                    imp.span.shrink_to_end(),
-                    " + Clone",
-                ),
-            );
-        }
-        if lang == Some(Lang::GpuData) && adt.is_enum() {
-            self.err(
-                Diagnostic::new(
-                    codes::E0407,
-                    imp.span,
-                    format!("the enum `{}` can't be `GpuData`", adt.name),
-                )
-                .with_note("WGSL has no sum types; use a struct with a `u32` tag"),
-            );
-            return;
-        }
-        for f in fields {
-            if self.p.types.has_params(f.ty) {
-                continue; // conditional on the arguments; checked where it's used
-            }
-            let ok = crate::traits::implements_builtin(&self.p, f.ty, lang.unwrap_or(Lang::Clone));
-            if !ok {
-                let why = match lang {
-                    Some(Lang::GpuData) => {
-                        "WGSL can't hold it in a buffer (bool, 64-bit and 8/16-bit types can't cross to the GPU)"
-                    }
-                    _ => "it isn't",
-                };
-                self.err(
+    report_duplicate_methods(p, diags, &imp.methods);
+    for &tm in &tr.methods {
+        let tdef = p.func(tm);
+        let found = imp.methods.iter().copied().find(|&f| p.func(f).name == tdef.name);
+        match found {
+            None if tdef.body.is_none() && !imp.from_opt_in => {
+                diags.push(
                     Diagnostic::new(
-                        codes::E0407,
-                        f.span,
-                        format!(
-                            "`{}` can't be `{}`: the field `{}` has type `{}`, and {why}",
-                            adt.name,
-                            tr.name,
-                            f.name,
-                            self.p.display_ty(f.ty)
-                        ),
+                        codes::E0401,
+                        imp.span,
+                        format!("this impl of `{}` is missing `fn {}`", tr.name, tdef.name),
                     )
-                    .with_secondary(imp.span, format!("`{}` opted in here", tr.name)),
+                    .with_secondary(tdef.sig_span, "declared here"),
                 );
             }
+            None => {}
+            Some(f) => compare_signatures(p, diags, f, tm, &trait_subst, imp),
         }
     }
+    for &f in &imp.methods {
+        let def = p.func(f);
+        if !tr.methods.iter().any(|&m| p.func(m).name == def.name) {
+            diags.push(
+                Diagnostic::new(
+                    codes::E0402,
+                    def.name_span,
+                    format!("`{}` has no method `{}`", tr.name, def.name),
+                )
+                .with_help("move it to an inherent `impl` block"),
+            );
+        }
+    }
+}
 
-    /// Two impls of one trait whose self types could be the same type conflict (E0403).
-    fn check_overlap(&mut self) {
-        let by_trait: Vec<(TraitId, Vec<ImplId>)> =
-            self.p.impls_of_trait.iter().map(|(t, v)| (*t, v.clone())).collect();
-        for (_, impls) in by_trait {
-            for i in 0..impls.len() {
-                for j in i + 1..impls.len() {
-                    let (a, b) = (self.p.impl_(impls[i]).clone(), self.p.impl_(impls[j]).clone());
-                    let same_args = match (&a.trait_ref, &b.trait_ref) {
-                        (Some(x), Some(y)) => {
-                            x.args.len() == y.args.len()
-                                && crate::traits::could_unify_all(&self.p, &x.args, &y.args)
-                        }
-                        _ => false,
-                    };
-                    if same_args && crate::traits::could_unify(&self.p, a.self_ty, b.self_ty) {
-                        let name = a
-                            .trait_ref
-                            .as_ref()
-                            .map(|r| self.p.trait_(r.trait_).name.clone())
-                            .unwrap_or_default();
-                        self.err(
+/// E0201 for each method of one impl block whose name an earlier one has.
+fn report_duplicate_methods(p: &Program, diags: &mut Vec<Diagnostic>, methods: &[FnId]) {
+    let mut seen: Vec<(&str, Span)> = Vec::new();
+    for &f in methods {
+        let d = p.func(f);
+        if let Some(&(_, ps)) = seen.iter().find(|(n, _)| *n == d.name) {
+            diags.push(
+                Diagnostic::new(
+                    codes::E0201,
+                    d.name_span,
+                    format!("`{}` is defined twice", d.name),
+                )
+                .with_secondary(ps, "first defined here"),
+            );
+        } else {
+            seen.push((&d.name, d.name_span));
+        }
+    }
+}
+
+/// Two inherent impl blocks for one type can't both define a method: a call would take the
+/// first. Blocks for types that can't be the same (`W<i32>` and `W<f32>`) can.
+fn check_inherent_names(p: &Program, diags: &mut Vec<Diagnostic>) {
+    let mut adts: Vec<&AdtId> = p.inherent_impls.keys().collect();
+    adts.sort();
+    for a in adts {
+        let impls = &p.inherent_impls[a];
+        for (i, &x) in impls.iter().enumerate() {
+            for &y in &impls[i + 1..] {
+                let (a, b) = (p.impl_(x), p.impl_(y));
+                if !crate::traits::could_unify(p, a.self_ty, b.self_ty) {
+                    continue;
+                }
+                for &f in &b.methods {
+                    let d = p.func(f);
+                    if let Some(&g) = a.methods.iter().find(|&&g| p.func(g).name == d.name) {
+                        diags.push(
                             Diagnostic::new(
-                                codes::E0403,
-                                b.span,
+                                codes::E0201,
+                                d.name_span,
                                 format!(
-                                    "this impl of `{name}` for `{}` conflicts with another",
-                                    self.p.display_ty(b.self_ty)
+                                    "`{}` is defined twice for `{}`",
+                                    d.name,
+                                    p.display_ty(b.self_ty)
                                 ),
                             )
-                            .with_secondary(a.span, "the other impl"),
+                            .with_secondary(p.func(g).name_span, "first defined here"),
                         );
                     }
                 }
@@ -1690,8 +1656,256 @@ impl<'d> Collector<'d> {
     }
 }
 
+/// An impl method's signature must be the trait's, with `Self` and the trait's parameters
+/// substituted.
+fn compare_signatures(
+    p: &Program,
+    diags: &mut Vec<Diagnostic>,
+    impl_fn: FnId,
+    trait_fn: FnId,
+    trait_subst: &Subst,
+    imp: &ImplDef,
+) {
+    let (a, b) = (p.func(impl_fn), p.func(trait_fn));
+    let mut subst = trait_subst.clone();
+    let mismatch = |what: String| {
+        Diagnostic::new(
+            codes::E0405,
+            a.sig_span,
+            format!("`{}` doesn't match the trait's signature: {what}", a.name),
+        )
+        .with_secondary(b.sig_span, "the trait declares it here")
+    };
+    if a.generics.len() != b.generics.len() {
+        return diags.push(mismatch(format!(
+            "it has {} generic parameters, the trait's has {}",
+            a.generics.len(),
+            b.generics.len()
+        )));
+    }
+    for (&tp, &ip) in b.generics.iter().zip(&a.generics) {
+        subst.insert(tp, p.types.param(ip));
+    }
+    // A generic parameter can't need more than the trait's does: callers check the trait's.
+    for (&tp, &ip) in b.generics.iter().zip(&a.generics) {
+        let mut allowed = Vec::new();
+        for r in &p.param(tp).bounds {
+            resolve::add_with_supertraits(
+                p,
+                p.types.param(ip),
+                r.subst(&p.types, &subst),
+                &mut allowed,
+            );
+        }
+        if let Some(extra) = p.param(ip).bounds.iter().find(|r| !allowed.contains(r)) {
+            return diags.push(mismatch(format!(
+                "`{}` needs `{}` here, but not in the trait",
+                p.param(ip).name,
+                p.display_trait_ref(extra)
+            )));
+        }
+    }
+    if a.params.len() != b.params.len() {
+        return diags.push(mismatch(format!(
+            "it takes {} parameters, the trait's takes {}",
+            a.params.len(),
+            b.params.len()
+        )));
+    }
+    for (pa, pb) in a.params.iter().zip(&b.params) {
+        if pa.is_self != pb.is_self {
+            let (here, there) = if pa.is_self {
+                ("takes `self`", "takes a parameter there")
+            } else {
+                ("takes a parameter there", "takes `self`")
+            };
+            return diags.push(mismatch(format!("it {here}, but the trait's {there}")));
+        }
+        if pa.mode != pb.mode {
+            return diags.push(mismatch(format!(
+                "`{}` is `{}` here but `{}` in the trait",
+                pa.name,
+                pa.mode.keyword(),
+                pb.mode.keyword()
+            )));
+        }
+        let expected = p.types.subst(pb.ty, &subst);
+        let expected = crate::traits::normalize(p, expected, Some(imp));
+        if pa.ty != expected && !pa.is_self {
+            let (x, y) = (p.display_ty(pa.ty), p.display_ty(expected));
+            return diags
+                .push(mismatch(format!("`{}` has type `{x}`, but the trait says `{y}`", pa.name)));
+        }
+        // A call through the trait (or a generic) only knows the trait's defaults.
+        if let Some(d) = &pa.default {
+            return diags.push(
+                Diagnostic::new(
+                    codes::E0405,
+                    d.span,
+                    format!("`{}` has a default here; an impl's method takes the trait's", pa.name),
+                )
+                .with_secondary(b.sig_span, "the trait declares it here")
+                .with_help("give the default in the trait"),
+            );
+        }
+    }
+    if a.ret_mode != b.ret_mode {
+        return diags.push(mismatch("the return mode differs".into()));
+    }
+    match (&a.opaque, &b.opaque) {
+        (None, None) => {
+            let expected = p.types.subst(b.ret, &subst);
+            let expected = crate::traits::normalize(p, expected, Some(imp));
+            if a.ret != expected {
+                let (x, y) = (p.display_ty(a.ret), p.display_ty(expected));
+                diags.push(mismatch(format!("it returns `{x}`, but the trait says `{y}`")));
+            }
+        }
+        // Both name traits: the same ones.
+        (Some(x), Some(y)) => {
+            let y: Vec<TraitRef> = y.iter().map(|r| r.subst(&p.types, &subst)).collect();
+            if *x != y {
+                let (x, y) = (p.display_ty(a.ret), p.display_ty(b.ret));
+                diags.push(mismatch(format!("it returns `{x}`, but the trait says `{y}`")));
+            }
+        }
+        _ => {
+            let expected = p.types.subst(b.ret, &subst);
+            let (x, y) = (p.display_ty(a.ret), p.display_ty(expected));
+            diags.push(mismatch(format!("it returns `{x}`, but the trait says `{y}`")));
+        }
+    }
+}
+
+/// `Copy`, `Clone` and `GpuData` are implemented structurally: every field must have them too
+/// (field types that use the type's parameters make the impl conditional).
+fn check_structural_opt_in(p: &Program, diags: &mut Vec<Diagnostic>, imp: &ImplDef, tr: &TraitDef) {
+    let TyKind::Adt(a, _) = *p.types.kind(imp.self_ty) else { return };
+    let adt = p.adt(a);
+    let lang = tr.lang;
+    if lang == Some(Lang::Copy)
+        && !adt.opt_in.iter().any(|(r, _)| p.is_lang_trait(r.trait_, Lang::Clone))
+    {
+        diags.push(
+            Diagnostic::new(
+                codes::E0407,
+                imp.span,
+                format!("`{}` opts in to `Copy` but not `Clone`", adt.name),
+            )
+            .with_note("every `Copy` type is also `Clone`")
+            .with_fix("opt in to `Clone` too", imp.span.shrink_to_end(), " + Clone"),
+        );
+    }
+    if lang == Some(Lang::GpuData) && adt.is_enum() {
+        diags.push(
+            Diagnostic::new(
+                codes::E0407,
+                imp.span,
+                format!("the enum `{}` can't be `GpuData`", adt.name),
+            )
+            .with_note("WGSL has no sum types; use a struct with a `u32` tag"),
+        );
+        return;
+    }
+    for f in adt.all_fields() {
+        if p.types.has_params(f.ty) {
+            continue; // conditional on the arguments; checked where it's used
+        }
+        let ok = crate::traits::implements_builtin(p, f.ty, lang.unwrap_or(Lang::Clone));
+        if !ok {
+            let why = match lang {
+                Some(Lang::GpuData) => {
+                    "WGSL can't hold it in a buffer (bool, 64-bit and 8/16-bit types and empty arrays can't cross to the GPU)"
+                }
+                _ => "it isn't",
+            };
+            diags.push(
+                Diagnostic::new(
+                    codes::E0407,
+                    f.span,
+                    format!(
+                        "`{}` can't be `{}`: the field `{}` has type `{}`, and {why}",
+                        adt.name,
+                        tr.name,
+                        f.name,
+                        p.display_ty(f.ty)
+                    ),
+                )
+                .with_secondary(imp.span, format!("`{}` opted in here", tr.name)),
+            );
+        }
+    }
+}
+
+/// What a type is at its top, for grouping impls: two whose self types have different heads
+/// can't overlap. `None` for a generic parameter, which could be any type.
+fn ty_head(p: &Program, t: TyId) -> Option<(u8, u32)> {
+    Some(match p.types.kind(t) {
+        TyKind::Param(_) | TyKind::Projection { .. } | TyKind::Error => return None,
+        TyKind::Adt(a, _) => (0, a.0),
+        TyKind::Tuple(ts) => (1, ts.len() as u32),
+        TyKind::Array(_, n) => (2, *n),
+        TyKind::Slice(_) => (3, 0),
+        // Anything else unifies only with itself.
+        _ => (4, t.0),
+    })
+}
+
+/// Two impls of one trait whose self types could be the same type conflict (E0403). Only impls
+/// with the same head are compared, and those with a generic self type with every other.
+fn check_overlap(p: &Program, diags: &mut Vec<Diagnostic>) {
+    let mut traits: Vec<&TraitId> = p.impls_of_trait.keys().collect();
+    traits.sort();
+    for t in traits {
+        let impls = &p.impls_of_trait[t];
+        let mut by_head: BTreeMap<(u8, u32), Vec<ImplId>> = BTreeMap::new();
+        let mut generic = Vec::new();
+        for &i in impls {
+            match ty_head(p, p.impl_(i).self_ty) {
+                Some(h) => by_head.entry(h).or_default().push(i),
+                None => generic.push(i),
+            }
+        }
+        let mut pairs: Vec<(ImplId, ImplId)> = Vec::new();
+        for group in by_head.values() {
+            for (i, &x) in group.iter().enumerate() {
+                pairs.extend(group[i + 1..].iter().map(|&y| (x, y)));
+            }
+        }
+        for &g in &generic {
+            pairs.extend(impls.iter().filter(|&&i| i != g).map(|&i| (i.min(g), i.max(g))));
+        }
+        pairs.sort();
+        pairs.dedup();
+        for (x, y) in pairs {
+            let (a, b) = (p.impl_(x), p.impl_(y));
+            let same_args = match (&a.trait_ref, &b.trait_ref) {
+                (Some(x), Some(y)) => {
+                    x.args.len() == y.args.len()
+                        && crate::traits::could_unify_all(p, &x.args, &y.args)
+                }
+                _ => false,
+            };
+            if same_args && crate::traits::could_unify(p, a.self_ty, b.self_ty) {
+                let name = a.trait_ref.as_ref().map_or("", |r| p.trait_(r.trait_).name.as_str());
+                diags.push(
+                    Diagnostic::new(
+                        codes::E0403,
+                        b.span,
+                        format!(
+                            "this impl of `{name}` for `{}` conflicts with another",
+                            p.display_ty(b.self_ty)
+                        ),
+                    )
+                    .with_secondary(a.span, "the other impl"),
+                );
+            }
+        }
+    }
+}
+
 /// `a`, `a and b`, `a, b and c`.
-fn and_list(items: &[String]) -> String {
+pub(crate) fn and_list(items: &[String]) -> String {
     match items {
         [] => String::new(),
         [one] => one.clone(),

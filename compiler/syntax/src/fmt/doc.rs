@@ -123,7 +123,8 @@ impl Doc {
     }
 }
 
-const INDENT: usize = 4;
+/// The columns one level of indentation adds.
+pub const INDENT: usize = 4;
 
 /// Lays a document out in `width` columns.
 pub fn print(doc: &Doc, width: usize) -> String {
@@ -180,6 +181,12 @@ struct Printer<'d> {
 
 impl Printer<'_> {
     fn flush_suffix(&mut self) {
+        // A trailing comment comes one space after the code: each suffix starts with it.
+        if !self.suffix.is_empty() {
+            while self.out.ends_with(' ') {
+                self.out.pop();
+            }
+        }
         for s in self.suffix.drain(..) {
             self.out.push_str(s);
         }

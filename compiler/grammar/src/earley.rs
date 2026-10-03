@@ -20,7 +20,7 @@
 use crate::cfg::{Cfg, Recursion, Sym};
 use crate::ebnf::{Grammar, RuleId, Terminal};
 use crate::rng::{FxHashMap, FxHashSet};
-use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use wrela_diag::{FileId, Span};
 use wrela_syntax::{Token, TokenKind};
 
@@ -86,8 +86,9 @@ pub struct Oracle {
     /// value is a nonterminal id.
     rhs: Vec<Vec<u32>>,
     lhs: Vec<u32>,
-    /// Terminal ids: an index into `terms`.
-    term_of_kind: HashMap<TokenKind, u32>,
+    /// Each token kind's terminal id (an index into `terms`, with `TERM_BIT` set), by
+    /// `kind as usize`; `NO_TERM` for kinds the grammar never mentions.
+    term_of_kind: Vec<u32>,
     gt_close: u32,
     terms: Vec<Terminal>,
 }
@@ -200,13 +201,13 @@ impl Oracle {
         assert!(cfg.prods.len() < 1 << 24, "too many productions for the item encoding");
         assert!(rhs.iter().all(|r| r.len() < 256), "a production too long for the item encoding");
         let lhs = cfg.prods.iter().map(|p| p.lhs as u32).collect();
-        let term_of_kind = terms
-            .iter()
-            .filter_map(|t| match t {
-                Terminal::Token(k) => Some((*k, term_id(*t))),
-                Terminal::GtClose => None,
-            })
-            .collect();
+        let kinds = TokenKind::CLASSES.len() + TokenKind::KEYWORDS.len() + TokenKind::PUNCT.len();
+        let mut term_of_kind = vec![NO_TERM; kinds];
+        for t in &terms {
+            if let Terminal::Token(k) = t {
+                term_of_kind[*k as usize] = term_id(*t);
+            }
+        }
         let gt_close =
             if terms.contains(&Terminal::GtClose) { term_id(Terminal::GtClose) } else { NO_TERM };
         Oracle { cfg, nullable, rhs, lhs, term_of_kind, gt_close, terms }
@@ -343,7 +344,7 @@ impl Oracle {
     fn build_lattice(&self, tokens: &[Token], l: &mut Lattice) {
         l.edges.clear();
         l.pos.clear();
-        let term = |k: TokenKind| self.term_of_kind.get(&k).copied().unwrap_or(NO_TERM);
+        let term = |k: TokenKind| self.term_of_kind[k as usize];
         let mut node = 0u32;
         for t in tokens {
             let (s, e) = (t.span.start, t.span.end);
@@ -432,39 +433,39 @@ enum Step {
     Prod(u32),
 }
 
-impl Forest<'_> {
-    fn contains(&self, set: u32, item: u64) -> bool {
-        self.sets[set as usize].seen.contains(&item)
-    }
+/// The completed items of nonterminal `nt` in set `set`.
+fn completed(sets: &[EarleySet], set: u32, nt: u32) -> &[(u32, u32, u32)] {
+    let c = &sets[set as usize].completed;
+    let lo = c.partition_point(|x| x.0 < nt);
+    let hi = c.partition_point(|x| x.0 <= nt);
+    &c[lo..hi]
+}
 
-    fn completed(&self, set: u32, nt: u32) -> &[(u32, u32, u32)] {
-        let c = &self.sets[set as usize].completed;
-        let lo = c.partition_point(|x| x.0 < nt);
-        let hi = c.partition_point(|x| x.0 <= nt);
-        &c[lo..hi]
-    }
-
+impl<'a> Forest<'a> {
     /// The ways the prefix `rhs[..d]` of production `p`, started at `o`, splits at its last
     /// symbol when it ends at `e`: each is `(k, step)`, with `rhs[..d-1]` spanning `o..k`.
-    fn steps(&self, p: u32, d: u32, o: u32, e: u32) -> Vec<(u32, Step)> {
+    /// The iterator borrows the sets and the lattice, not `self`, so the memo can be updated
+    /// while it runs.
+    fn steps(&self, p: u32, d: u32, o: u32, e: u32) -> impl Iterator<Item = (u32, Step)> + use<'a> {
+        let (sets, lattice) = (self.sets, self.lattice);
         let sym = self.o.rhs[p as usize][d as usize - 1];
         // `rhs[..d-1]` must have been recognized from `o` to the split point.
         let prev = pack(p, d - 1, o);
-        let mut out = Vec::new();
-        if sym & TERM_BIT != 0 {
-            for edge in self.lattice.into(e) {
-                if edge.term == sym && edge.from >= o && self.contains(edge.from, prev) {
-                    out.push((edge.from, Step::Edge(*edge)));
-                }
-            }
-        } else {
-            for &(_, k, q) in self.completed(e, sym) {
-                if k >= o && self.contains(k, prev) {
-                    out.push((k, Step::Prod(q)));
-                }
-            }
-        }
-        out
+        let recognized = move |k: u32| k >= o && sets[k as usize].seen.contains(&prev);
+        let is_term = sym & TERM_BIT != 0;
+        let edges = is_term.then(|| {
+            lattice
+                .into(e)
+                .filter(move |edge| edge.term == sym && recognized(edge.from))
+                .map(|edge| (edge.from, Step::Edge(*edge)))
+        });
+        let prods = (!is_term).then(|| {
+            completed(sets, e, sym)
+                .iter()
+                .filter(move |&&(_, k, _)| recognized(k))
+                .map(|&(_, k, q)| (k, Step::Prod(q)))
+        });
+        edges.into_iter().flatten().chain(prods.into_iter().flatten())
     }
 
     fn count_prod(&mut self, q: u32, k: u32, e: u32) -> u8 {
@@ -478,14 +479,15 @@ impl Forest<'_> {
             return u8::from(o == e);
         }
         let key = (p, d, o, e);
-        match self.memo.get(&key) {
+        match self.memo.entry(key) {
             // A derivation cycle: infinitely many derivations. The grammar reader rejects
             // grammars that allow this, so it's reported as ambiguity if it ever happens.
-            Some(&IN_PROGRESS) => return 2,
-            Some(&c) => return c,
-            None => {}
+            Entry::Occupied(c) if *c.get() == IN_PROGRESS => return 2,
+            Entry::Occupied(c) => return *c.get(),
+            Entry::Vacant(v) => {
+                v.insert(IN_PROGRESS);
+            }
         }
-        self.memo.insert(key, IN_PROGRESS);
         let mut total = 0;
         for (k, step) in self.steps(p, d, o, e) {
             let left = self.count_item(p, d - 1, o, k);
@@ -555,12 +557,10 @@ impl Forest<'_> {
 
     /// Finds the innermost place where nonterminal `nt` over `k..e` has two derivations.
     fn explain_nt(&mut self, nt: u32, k: u32, e: u32) -> Ambiguity {
-        let prods: Vec<(u32, u8)> = self
-            .completed(e, nt)
-            .to_vec()
-            .into_iter()
-            .filter(|&(_, origin, _)| origin == k)
-            .map(|(_, _, q)| (q, self.count_prod(q, k, e)))
+        let prods: Vec<(u32, u8)> = completed(self.sets, e, nt)
+            .iter()
+            .filter(|&&(_, origin, _)| origin == k)
+            .map(|&(_, _, q)| (q, self.count_prod(q, k, e)))
             .filter(|&(_, c)| c > 0)
             .collect();
         match prods.as_slice() {
@@ -583,6 +583,15 @@ impl Forest<'_> {
             }
         }
         let lhs = self.o.lhs[p as usize];
+        // Several steps at one split point are several productions of the same nonterminal over
+        // the same tokens: the ambiguity is between that nonterminal's alternatives.
+        if let [(k, Step::Prod(q), ..), rest @ ..] = live.as_slice()
+            && !rest.is_empty()
+            && rest.iter().all(|(other, ..)| other == k)
+        {
+            let nt = self.o.lhs[*q as usize];
+            return self.explain_nt(nt, *k, e);
+        }
         match live.as_slice() {
             [(k, step, left, right)] => {
                 if *left > 1 {
@@ -675,6 +684,17 @@ mod tests {
         let o = oracle("file ::= a? IDENT? IDENT? EOF\na ::= IDENT\n");
         match o.parse_source("x") {
             Outcome::Ambiguous(a) => assert_eq!(a.span, (0, 1)),
+            other => panic!("{other:?}"),
+        }
+        // Two alternatives of an inner rule derive the same tokens: that rule is named, not
+        // the rule around it.
+        let o = oracle("file ::= s EOF\ns ::= \"let\" a\na ::= IDENT | b\nb ::= IDENT\n");
+        match o.parse_source("let x") {
+            Outcome::Ambiguous(a) => {
+                assert_eq!(a.rule, "a");
+                assert_eq!(a.span, (4, 5));
+                assert_eq!(a.how, "two alternatives derive the same tokens");
+            }
             other => panic!("{other:?}"),
         }
     }

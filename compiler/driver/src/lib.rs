@@ -12,8 +12,7 @@ pub mod build;
 pub mod package;
 
 use std::path::Path;
-use std::rc::Rc;
-use wrela_diag::{Diagnostic, FileId, SourceMap, Span, codes, sort_and_dedup};
+use wrela_diag::{Diagnostic, SourceMap, Span, codes, has_errors, sort_and_dedup};
 use wrela_sema::{STD_SOURCES, SourceUnit};
 
 /// What compiling a package produced.
@@ -30,7 +29,20 @@ pub struct Output {
 
 impl Output {
     pub fn has_errors(&self) -> bool {
-        self.diagnostics.iter().any(|d| d.is_error())
+        has_errors(&self.diagnostics)
+    }
+
+    /// Writes the build's files into `dir`, and makes the directories they need.
+    pub fn write_to(&self, dir: &Path) -> std::io::Result<()> {
+        std::fs::create_dir_all(dir)?;
+        for (path, bytes) in &self.files {
+            let p = dir.join(path);
+            if let Some(parent) = p.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(p, bytes)?;
+        }
+        Ok(())
     }
 }
 
@@ -66,10 +78,10 @@ fn compile(root: &Path, emit: bool) -> Output {
     };
     let checked = wrela_sema::check_program(units, &mut diagnostics);
     let mut files = Vec::new();
-    if !diagnostics.iter().any(|d| d.is_error()) {
+    if !has_errors(&diagnostics) {
         let roots = wrela_lower::Roots::of(&checked);
-        let (lowered, d) = wrela_lower::lower(&checked, &roots);
-        let ok = !d.iter().any(|x| x.is_error());
+        let (lowered, d) = wrela_lower::lower(&checked, &roots, emit);
+        let ok = !has_errors(&d);
         diagnostics.extend(d);
         if ok && emit {
             let out = build::emit(&lowered, &sources);
@@ -78,7 +90,7 @@ fn compile(root: &Path, emit: bool) -> Output {
         }
     }
     sort_and_dedup(&mut diagnostics);
-    if diagnostics.iter().any(|d| d.is_error()) {
+    if has_errors(&diagnostics) {
         files.clear();
     }
     Output { sources, diagnostics, files }
@@ -91,20 +103,10 @@ fn load(root: &Path) -> (SourceMap, Vec<Diagnostic>, Option<Vec<SourceUnit>>) {
     let mut sources = SourceMap::new();
     let mut diags = Vec::new();
     let mut units = Vec::new();
-    for (i, (name, text)) in STD_SOURCES.iter().enumerate() {
-        let file = FileId(i as u32);
-        let parsed = wrela_syntax::parse(file, text);
-        let id = sources.add(format!("<{name}>"), text.to_string());
-        debug_assert_eq!(id, file);
-        let syntax_errors = error_spans(&parsed.diagnostics);
-        diags.extend(parsed.diagnostics);
-        units.push(SourceUnit {
-            path: name.split("::").map(String::from).collect(),
-            file,
-            ast: Rc::new(parsed.file),
-            is_std: true,
-            syntax_errors,
-        });
+    for (name, text) in STD_SOURCES {
+        let path = name.split("::").map(String::from).collect();
+        let name = format!("<{name}>");
+        units.push(add_unit(&mut sources, &mut diags, name, text.to_string(), path, true));
     }
     let files = match package::find_files(root) {
         Ok(files) => files,
@@ -138,30 +140,28 @@ fn load(root: &Path) -> (SourceMap, Vec<Diagnostic>, Option<Vec<SourceUnit>>) {
                 continue;
             }
         };
-        let file = FileId(sources.len() as u32);
-        let parsed = wrela_syntax::parse(file, &text);
-        let id = sources.add(pf.display.clone(), text);
-        debug_assert_eq!(id, file);
-        let syntax_errors = error_spans(&parsed.diagnostics);
-        diags.extend(parsed.diagnostics);
-        units.push(SourceUnit {
-            path: pf.module.clone(),
-            file,
-            ast: Rc::new(parsed.file),
-            is_std: false,
-            syntax_errors,
-        });
+        let (name, path) = (pf.display.clone(), pf.module.clone());
+        units.push(add_unit(&mut sources, &mut diags, name, text, path, false));
     }
     (sources, diags, Some(units))
 }
 
-/// Where the errors among a file's lexical and syntax diagnostics are.
-fn error_spans(diags: &[Diagnostic]) -> Vec<Span> {
-    diags
-        .iter()
-        .filter(|d| d.is_error())
-        .filter_map(|d| d.primary.as_ref().map(|l| l.span))
-        .collect()
+/// Adds a file to `sources` and parses it as the module `path`. Its lexical and syntax
+/// diagnostics go to `diags`.
+fn add_unit(
+    sources: &mut SourceMap,
+    diags: &mut Vec<Diagnostic>,
+    name: String,
+    text: String,
+    path: Vec<String>,
+    is_std: bool,
+) -> SourceUnit {
+    let file = sources.add(name, text);
+    let parsed = wrela_syntax::parse(file, &sources.file(file).text);
+    let syntax_errors =
+        parsed.diagnostics.iter().filter(|d| d.is_error()).filter_map(Diagnostic::span).collect();
+    diags.extend(parsed.diagnostics);
+    SourceUnit { path, ast: parsed.file, is_std, syntax_errors }
 }
 
 #[cfg(test)]

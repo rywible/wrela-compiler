@@ -43,7 +43,24 @@ fn collect(path: &Path, out: &mut Vec<PathBuf>) -> bool {
     ok
 }
 
+/// The stack of the thread that formats: the parser and the formatter recurse over syntax
+/// trees, and a file can hold the deepest tree the parser accepts (or rejects as too deep), as
+/// on the compiler's own thread.
+const STACK_SIZE: usize = 256 << 20;
+
 pub fn run(args: &[String]) -> ExitCode {
+    std::thread::scope(|s| {
+        std::thread::Builder::new()
+            .name("wrela fmt".into())
+            .stack_size(STACK_SIZE)
+            .spawn_scoped(s, || format_files(args))
+            .expect("can't start the formatter's thread")
+            .join()
+            .unwrap_or_else(|p| std::panic::resume_unwind(p))
+    })
+}
+
+fn format_files(args: &[String]) -> ExitCode {
     let mut check_only = false;
     let mut files = Vec::new();
     let mut layout_ok = true;
@@ -70,20 +87,21 @@ pub fn run(args: &[String]) -> ExitCode {
         return ExitCode::from(2);
     }
     let mut unformatted = 0;
-    let mut failed = false;
+    // A file with syntax errors (exit 1), and a file that can't be read or written (exit 2).
+    let (mut failed, mut io_failed) = (false, false);
     for f in files {
         let text = match std::fs::read_to_string(&f) {
             Ok(t) => t,
             Err(e) => {
                 eprintln!("error: can't read `{}`: {e}", f.display());
-                failed = true;
+                io_failed = true;
                 continue;
             }
         };
         let parsed = wrela_syntax::parse(FileId(0), &text);
         if parsed.has_errors() {
             let mut map = SourceMap::new();
-            map.add(f.display().to_string(), text.clone());
+            map.add(f.display().to_string(), text);
             eprint!("{}", wrela_diag::render::render_all(&map, &parsed.diagnostics));
             eprintln!("`{}` has syntax errors, so it wasn't formatted", f.display());
             failed = true;
@@ -98,16 +116,15 @@ pub fn run(args: &[String]) -> ExitCode {
             println!("{}", f.display());
         } else if let Err(e) = std::fs::write(&f, formatted) {
             eprintln!("error: can't write `{}`: {e}", f.display());
-            failed = true;
+            io_failed = true;
         }
     }
-    if failed {
+    if io_failed {
+        ExitCode::from(2)
+    } else if failed {
         ExitCode::from(1)
     } else if check_only && unformatted > 0 {
-        eprintln!(
-            "{unformatted} file{} would be reformatted",
-            if unformatted == 1 { "" } else { "s" }
-        );
+        eprintln!("{unformatted} file{} would be reformatted", wrela_diag::plural(unformatted));
         ExitCode::from(1)
     } else {
         ExitCode::SUCCESS

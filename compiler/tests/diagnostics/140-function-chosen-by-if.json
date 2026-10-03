@@ -1,0 +1,43 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0300",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [
+        "call each one in its own branch"
+      ],
+      "internal": false,
+      "label": null,
+      "labels": [
+        {
+          "file": "main.wrela",
+          "message": "this is `fn triple`",
+          "span": {
+            "column": 21,
+            "end": 232,
+            "end_column": 27,
+            "end_line": 13,
+            "line": 13,
+            "start": 226
+          }
+        }
+      ],
+      "message": "the branches of this `if` have different types: `fn triple` and `fn double`",
+      "notes": [
+        "each closure and function has its own type; choosing between them at run time isn't supported yet"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 37,
+        "end": 248,
+        "end_column": 43,
+        "end_line": 13,
+        "line": 13,
+        "start": 242
+      },
+      "title": "mismatched types"
+    }
+  ],
+  "version": 2
+}

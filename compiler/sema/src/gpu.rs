@@ -2,9 +2,9 @@
 //! what each stage may take and return, and that a kernel's `mut` parameters are safe to share
 //! across invocations. Lowering then only sees signatures it can map to WGSL.
 
-use crate::defs::{Entry, Lang, Mode};
+use crate::defs::{Entry, FieldDef, Lang, Mode};
 use crate::program::Program;
-use crate::ty::{FnId, TyId, TyKind};
+use crate::ty::{FloatTy, FnId, IntTy, TyId, TyKind};
 use wrela_diag::{Diagnostic, codes};
 
 /// Every entry point's signature.
@@ -19,11 +19,55 @@ pub fn check_entries(p: &Program) -> Vec<Diagnostic> {
     out
 }
 
-fn lang_of(p: &Program, t: TyId) -> Option<Lang> {
+/// The `ClipPosition` fields of a struct type, as declared; none for any other type.
+fn clip_position_fields(p: &Program, t: TyId) -> impl Iterator<Item = &FieldDef> {
+    let fields = match p.types.kind(t) {
+        TyKind::Adt(a, _) => p.adt(*a).fields(),
+        _ => &[],
+    };
+    fields.iter().filter(|f| p.lang_of_ty(f.ty) == Some(Lang::ClipPosition))
+}
+
+/// Whether a type is a vertex shader's output: a `ClipPosition`, or a struct with one.
+pub fn is_vertex_output(p: &Program, t: TyId) -> bool {
+    p.lang_of_ty(t) == Some(Lang::ClipPosition) || clip_position_fields(p, t).next().is_some()
+}
+
+/// WebGPU's default limit on the values a vertex shader passes to a fragment shader
+/// (`maxInterStageShaderVariables`).
+pub const MAX_VARYINGS: usize = 16;
+
+/// Whether a vertex output's field of type `t` can pass to the fragment shader: WGSL passes
+/// numbers and float vectors, interpolated or (in a `Flat<T>`) not.
+pub fn is_varying(p: &Program, t: TyId) -> bool {
+    let number = |t: TyId| {
+        matches!(
+            p.types.kind(t),
+            TyKind::Float(FloatTy::F32) | TyKind::Vec(_) | TyKind::Int(IntTy::I32 | IntTy::U32)
+        )
+    };
     match p.types.kind(t) {
-        TyKind::Adt(a, _) => p.adt(*a).lang,
-        _ => None,
+        TyKind::Adt(_, args) if p.lang_of_ty(t) == Some(Lang::Flat) => {
+            args.first().is_some_and(|&a| number(a))
+        }
+        _ => number(t),
     }
+}
+
+/// E0602: a vertex output's field that can't pass to the fragment shader.
+pub fn not_varying(p: &Program, field: &str, ty: TyId, span: wrela_diag::Span) -> Diagnostic {
+    Diagnostic::new(
+        codes::E0602,
+        span,
+        format!(
+            "the vertex output's `{field}` is a `{}`, which can't pass to the fragment shader",
+            p.display_ty(ty)
+        ),
+    )
+    .with_note(
+        "WGSL passes numbers and float vectors between stages (`f32`, `i32`, `u32`, `vecN`), \
+         each interpolated or in a `Flat<T>`",
+    )
 }
 
 /// A GPU builtin input, named by the std type that carries it (language.md §12).
@@ -40,7 +84,7 @@ pub enum BuiltinInput {
 impl BuiltinInput {
     /// The input a parameter of type `t` receives, if `t` is one of the input types.
     pub fn of(p: &Program, t: TyId) -> Option<BuiltinInput> {
-        Some(match lang_of(p, t)? {
+        Some(match p.lang_of_ty(t)? {
             Lang::GlobalId => BuiltinInput::GlobalId,
             Lang::LocalId => BuiltinInput::LocalId,
             Lang::WorkgroupId => BuiltinInput::WorkgroupId,
@@ -77,7 +121,12 @@ pub fn not_gpu_data(p: &Program, param: &str, ty: TyId, span: wrela_diag::Span) 
         "data crossing to the GPU must be `GpuData`, so its layout is the same on both sides \
          (§6.13)",
     );
-    if let TyKind::Adt(a, _) = p.types.kind(ty)
+    // Opting in is the fix only if every field is `GpuData` (an enum never is).
+    if let TyKind::Adt(a, args) = p.types.kind(ty)
+        && !p.adt(*a).is_enum()
+        && p.fields_of(*a, args, None)
+            .iter()
+            .all(|(_, ft)| crate::traits::implements_builtin(p, *ft, Lang::GpuData))
         && let Some((at, text)) = p.opt_in_fix(*a, "GpuData")
     {
         d = d.with_fix(format!("opt `{shown}` in to `GpuData`"), at, text);
@@ -85,17 +134,9 @@ pub fn not_gpu_data(p: &Program, param: &str, ty: TyId, span: wrela_diag::Span) 
     d
 }
 
-fn stage_name(e: Entry) -> &'static str {
-    match e {
-        Entry::Compute(_) => "a `@compute` kernel",
-        Entry::Vertex => "a `@vertex` shader",
-        Entry::Fragment => "a `@fragment` shader",
-    }
-}
-
 fn check_entry(p: &Program, f: FnId, entry: Entry, out: &mut Vec<Diagnostic>) {
     let def = p.func(f);
-    let stage = stage_name(entry);
+    let stage = entry.describe();
     let unit = p.types.unit;
     // What it returns.
     match entry {
@@ -104,18 +145,32 @@ fn check_entry(p: &Program, f: FnId, entry: Entry, out: &mut Vec<Diagnostic>) {
                 .with_help("write results through a `mut Slots<T>` parameter"),
         ),
         Entry::Vertex => {
-            let ok = lang_of(p, def.ret) == Some(Lang::ClipPosition)
-                || match p.types.kind(def.ret) {
-                    TyKind::Adt(a, _) if !p.adt(*a).is_enum() => {
-                        p.adt(*a)
-                            .fields()
-                            .iter()
-                            .filter(|fd| lang_of(p, fd.ty) == Some(Lang::ClipPosition))
-                            .count()
-                            == 1
+            let ok = p.lang_of_ty(def.ret) == Some(Lang::ClipPosition)
+                || clip_position_fields(p, def.ret).count() == 1;
+            if ok
+                && p.lang_of_ty(def.ret) != Some(Lang::ClipPosition)
+                && let TyKind::Adt(a, _) = p.types.kind(def.ret)
+            {
+                // What it passes on (a generic field's type is checked where it's drawn).
+                let fields = p.adt(*a).fields();
+                let varyings =
+                    fields.iter().filter(|f| p.lang_of_ty(f.ty) != Some(Lang::ClipPosition));
+                for f in varyings.clone() {
+                    if !p.types.has_params(f.ty) && !is_varying(p, f.ty) {
+                        out.push(not_varying(p, &f.name, f.ty, f.span));
                     }
-                    _ => false,
-                };
+                }
+                if varyings.count() > MAX_VARYINGS {
+                    out.push(
+                        Diagnostic::new(
+                            codes::E0602,
+                            def.sig_span,
+                            format!("{stage} passes more than {MAX_VARYINGS} values to the fragment shader"),
+                        )
+                        .with_note(format!("WebGPU's default limit is {MAX_VARYINGS} (`maxInterStageShaderVariables`)")),
+                    );
+                }
+            }
             if !ok {
                 out.push(
                     Diagnostic::new(
@@ -138,7 +193,7 @@ fn check_entry(p: &Program, f: FnId, entry: Entry, out: &mut Vec<Diagnostic>) {
     }
     // What it takes.
     for ps in &def.params {
-        let lang = lang_of(p, ps.ty);
+        let lang = p.lang_of_ty(ps.ty);
         let builtin_stage = BuiltinInput::of(p, ps.ty).map(|b| b.available(entry));
         if builtin_stage == Some(false) {
             let ty = p.display_ty(ps.ty);
@@ -186,8 +241,9 @@ fn check_entry(p: &Program, f: FnId, entry: Entry, out: &mut Vec<Diagnostic>) {
             ),
             _ => {}
         }
-        // Data passed by value travels as a uniform, so its layout must be the GPU's.
-        let varyings = matches!(p.types.kind(ps.ty), TyKind::Adt(a, _) if p.adt(*a).fields().iter().any(|fd| lang_of(p, fd.ty) == Some(Lang::ClipPosition)));
+        // Data passed by value travels as a uniform, so its layout must be the GPU's. Only a
+        // fragment shader takes the vertex output.
+        let varyings = entry == Entry::Fragment && clip_position_fields(p, ps.ty).next().is_some();
         let passed = builtin_stage.is_none()
             && !slots
             && !varyings

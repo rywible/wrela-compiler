@@ -22,6 +22,8 @@ export interface FakeBindGroup {
   id: number;
   label: string;
   entries: { binding: number; buffer: string; offset: number | undefined; size: number | undefined }[];
+  /** Each entry's buffer itself (buffers can share a label). */
+  buffers: FakeBuffer[];
 }
 
 export const DEFAULT_GPU_LIMITS = {
@@ -38,10 +40,15 @@ export class FakeDevice {
   readonly events: Event[] = [];
   readonly buffers: FakeBuffer[] = [];
   readonly layouts: GPUBindGroupLayoutDescriptor[] = [];
-  /** The validation error the next popErrorScope reports, if any. */
-  scopeError: string | null = null;
+  /** Validation errors by label, which creating a bind group layout raises into the innermost
+   * error scope. */
+  readonly layoutErrors = new Map<string, string>();
+  /** Errors by label, which creating a pipeline rejects with. */
+  readonly pipelineErrors = new Map<string, string>();
   limits = DEFAULT_GPU_LIMITS;
   #bindGroups = 0;
+  /** The error scope stack: each scope's first error. */
+  readonly #scopes: (string | null)[] = [];
 
   queue = {
     writeBuffer: (buffer: FakeBuffer, offset: number, data: Uint8Array, dataOffset = 0, size?: number) => {
@@ -69,6 +76,9 @@ export class FakeDevice {
 
   createBindGroupLayout(desc: GPUBindGroupLayoutDescriptor) {
     this.layouts.push(desc);
+    const error = this.layoutErrors.get(desc.label ?? "");
+    const top = this.#scopes.length - 1;
+    if (error !== undefined && top >= 0) this.#scopes[top] ??= error;
     return { label: desc.label };
   }
 
@@ -88,29 +98,39 @@ export class FakeDevice {
   }
 
   async createComputePipelineAsync(desc: GPUComputePipelineDescriptor) {
+    this.#reject(desc.label);
     return { label: desc.label, kind: "compute" };
   }
 
   async createRenderPipelineAsync(desc: GPURenderPipelineDescriptor) {
+    this.#reject(desc.label);
     return { label: desc.label, kind: "render", desc };
   }
 
-  pushErrorScope(): void {}
+  #reject(label = "") {
+    const error = this.pipelineErrors.get(label);
+    if (error !== undefined) throw new Error(error);
+  }
 
-  async popErrorScope() {
-    const message = this.scopeError;
-    this.scopeError = null;
-    return message === null ? null : { message };
+  pushErrorScope(): void {
+    this.#scopes.push(null);
+  }
+
+  /** Pops the scope when called, as WebGPU does; the promise gives its error. */
+  popErrorScope(): Promise<{ message: string } | null> {
+    if (this.#scopes.length === 0) return Promise.reject(new Error("no error scope to pop"));
+    const message = this.#scopes.pop()!;
+    return Promise.resolve(message === null ? null : { message });
   }
 
   createBindGroup(desc: GPUBindGroupDescriptor): FakeBindGroup {
+    const entries = Array.from(desc.entries, (e) => ({ binding: e.binding, ...(e.resource as GPUBufferBinding) }));
+    const buffers = entries.map((e) => e.buffer as unknown as FakeBuffer);
     return {
       id: this.#bindGroups++,
       label: desc.label ?? "",
-      entries: Array.from(desc.entries, (e) => {
-        const r = e.resource as GPUBufferBinding;
-        return { binding: e.binding, buffer: (r.buffer as unknown as FakeBuffer).label, offset: r.offset, size: r.size };
-      }),
+      entries: entries.map((e, i) => ({ binding: e.binding, buffer: buffers[i]!.label, offset: e.offset, size: e.size })),
+      buffers,
     };
   }
 

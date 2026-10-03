@@ -16,3 +16,8 @@ struct P {
 }
 
 impl Copy for P {} //~ E0403
+
+struct Holder: GpuData {
+    xs: [f32; 0], //~ E0407
+    y: f32,
+}

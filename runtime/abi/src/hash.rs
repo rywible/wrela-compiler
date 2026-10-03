@@ -31,8 +31,13 @@ impl StateHash {
 
     /// Sixteen lowercase hex digits, as both hosts print it.
     pub fn hex(&self) -> String {
-        format!("{:016x}", self.0)
+        hex(self.0)
     }
+}
+
+/// A hash value as both hosts print it: sixteen lowercase hex digits.
+pub fn hex(value: u64) -> String {
+    format!("{value:016x}")
 }
 
 #[cfg(test)]

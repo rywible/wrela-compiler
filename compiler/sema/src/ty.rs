@@ -3,7 +3,6 @@
 use elsa::FrozenVec;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::fmt::Write;
 
 macro_rules! id_type {
     ($($(#[$m:meta])* $name:ident;)*) => {$(
@@ -15,6 +14,7 @@ macro_rules! id_type {
         }
     )*};
 }
+pub(crate) use id_type;
 
 id_type! {
     /// An interned type.
@@ -358,27 +358,40 @@ impl Types {
             return r;
         }
         let mut m = |x: TyId| self.map_in(x, f, done);
-        let new = match self.kind(t).clone() {
-            TyKind::Tuple(ts) => TyKind::Tuple(ts.into_iter().map(&mut m).collect()),
-            TyKind::Adt(a, ts) => TyKind::Adt(a, ts.into_iter().map(&mut m).collect()),
-            TyKind::Opaque(a, ts) => TyKind::Opaque(a, ts.into_iter().map(&mut m).collect()),
-            TyKind::Closure(a, ts) => TyKind::Closure(a, ts.into_iter().map(&mut m).collect()),
-            TyKind::FnDef(a, ts) => TyKind::FnDef(a, ts.into_iter().map(&mut m).collect()),
-            TyKind::Array(e, n) => TyKind::Array(m(e), n),
-            TyKind::Slice(e) => TyKind::Slice(m(e)),
-            TyKind::Projection { self_ty, trait_, trait_args, name } => TyKind::Projection {
-                self_ty: m(self_ty),
-                trait_,
-                trait_args: trait_args.into_iter().map(&mut m).collect(),
-                name,
-            },
-            TyKind::FnPtr(ps, r) => {
-                let ps = ps.into_iter().map(&mut m).collect();
-                TyKind::FnPtr(ps, m(r))
+        // The part rebuilt from its mapped children; `None` when none of them changed.
+        let new = match self.kind(t) {
+            TyKind::Tuple(ts) => map_list(ts, &mut m).map(TyKind::Tuple),
+            TyKind::Adt(a, ts) => map_list(ts, &mut m).map(|ts| TyKind::Adt(*a, ts)),
+            TyKind::Opaque(a, ts) => map_list(ts, &mut m).map(|ts| TyKind::Opaque(*a, ts)),
+            TyKind::Closure(a, ts) => map_list(ts, &mut m).map(|ts| TyKind::Closure(*a, ts)),
+            TyKind::FnDef(a, ts) => map_list(ts, &mut m).map(|ts| TyKind::FnDef(*a, ts)),
+            TyKind::Array(e, n) => {
+                let x = m(*e);
+                (x != *e).then_some(TyKind::Array(x, *n))
             }
-            other => return self.intern(other),
+            TyKind::Slice(e) => {
+                let x = m(*e);
+                (x != *e).then_some(TyKind::Slice(x))
+            }
+            TyKind::Projection { self_ty, trait_, trait_args, name } => {
+                let x = m(*self_ty);
+                let args = map_list(trait_args, &mut m);
+                (x != *self_ty || args.is_some()).then(|| TyKind::Projection {
+                    self_ty: x,
+                    trait_: *trait_,
+                    trait_args: args.unwrap_or_else(|| trait_args.clone()),
+                    name: name.clone(),
+                })
+            }
+            TyKind::FnPtr(ps, r) => {
+                let ps2 = map_list(ps, &mut m);
+                let r2 = m(*r);
+                (ps2.is_some() || r2 != *r)
+                    .then(|| TyKind::FnPtr(ps2.unwrap_or_else(|| ps.clone()), r2))
+            }
+            _ => None,
         };
-        self.intern(new)
+        new.map_or(t, |k| self.intern(k))
     }
 
     /// Replaces generic parameters by `subst`.
@@ -407,6 +420,12 @@ pub const MAX_TYPE_SIZE: u32 = 4096;
 
 /// Types larger than this are walked remembering the parts they share.
 const SHARING: u32 = 64;
+
+/// Each of `ts` mapped by `m`, in order; `None` when none of them changed.
+fn map_list(ts: &[TyId], m: &mut impl FnMut(TyId) -> TyId) -> Option<Vec<TyId>> {
+    let new: Vec<TyId> = ts.iter().map(|&x| m(x)).collect();
+    (new != ts).then_some(new)
+}
 
 /// Calls `f` on each type `kind` is made of.
 pub fn children(kind: &TyKind, f: &mut impl FnMut(TyId)) {
@@ -462,120 +481,5 @@ impl Subst {
     }
     pub fn is_empty(&self) -> bool {
         self.pairs.is_empty()
-    }
-    pub fn extend(&mut self, other: &Subst) {
-        for &(p, t) in &other.pairs {
-            self.insert(p, t);
-        }
-    }
-    pub fn pairs(&self) -> &[(ParamId, TyId)] {
-        &self.pairs
-    }
-}
-
-/// How a type is shown in diagnostics; names come from the program.
-pub trait TyNames {
-    fn adt_name(&self, a: AdtId) -> String;
-    fn param_name(&self, p: ParamId) -> String;
-    fn fn_name(&self, f: FnId) -> String;
-    fn trait_name(&self, t: TraitId) -> String;
-    /// The type a function returns that's named by its traits: `impl Surface`.
-    fn opaque_name(&self, f: FnId) -> String {
-        format!("the type `{}` returns", self.fn_name(f))
-    }
-}
-
-/// Longer type names are cut here, so diagnostics stay readable.
-const MAX_TYPE_TEXT: usize = 200;
-
-pub fn display(types: &Types, names: &dyn TyNames, t: TyId) -> String {
-    let mut s = String::new();
-    write_ty(types, names, t, &mut s);
-    if s.len() > MAX_TYPE_TEXT {
-        let mut cut = MAX_TYPE_TEXT;
-        while !s.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        s.truncate(cut);
-        s.push('…');
-    }
-    s
-}
-
-fn write_list(types: &Types, names: &dyn TyNames, ts: &[TyId], s: &mut String) {
-    for (i, &t) in ts.iter().enumerate() {
-        if i > 0 {
-            s.push_str(", ");
-        }
-        write_ty(types, names, t, s);
-        if s.len() > MAX_TYPE_TEXT {
-            return;
-        }
-    }
-}
-
-fn write_ty(types: &Types, names: &dyn TyNames, t: TyId, s: &mut String) {
-    if s.len() > MAX_TYPE_TEXT {
-        return;
-    }
-    match types.kind(t) {
-        TyKind::Bool => s.push_str("bool"),
-        TyKind::Int(i) => s.push_str(i.name()),
-        TyKind::Float(f) => s.push_str(f.name()),
-        TyKind::Vec(n) => {
-            let _ = write!(s, "vec{n}");
-        }
-        TyKind::Mat(n) => {
-            let _ = write!(s, "mat{n}");
-        }
-        TyKind::Tuple(ts) => {
-            s.push('(');
-            write_list(types, names, ts, s);
-            if ts.len() == 1 {
-                s.push(',');
-            }
-            s.push(')');
-        }
-        TyKind::Array(e, n) => {
-            s.push('[');
-            write_ty(types, names, *e, s);
-            let _ = write!(s, "; {n}]");
-        }
-        TyKind::Slice(e) => {
-            s.push('[');
-            write_ty(types, names, *e, s);
-            s.push(']');
-        }
-        TyKind::Adt(a, args) => {
-            s.push_str(&names.adt_name(*a));
-            if !args.is_empty() {
-                s.push('<');
-                write_list(types, names, args, s);
-                s.push('>');
-            }
-        }
-        TyKind::Param(p) => s.push_str(&names.param_name(*p)),
-        TyKind::Projection { self_ty, name, .. } => {
-            write_ty(types, names, *self_ty, s);
-            s.push_str("::");
-            s.push_str(name);
-        }
-        TyKind::Opaque(f, _) => s.push_str(&names.opaque_name(*f)),
-        TyKind::FnPtr(ps, r) => {
-            s.push_str("fn(");
-            write_list(types, names, ps, s);
-            s.push(')');
-            if *r != types.unit {
-                s.push_str(" -> ");
-                write_ty(types, names, *r, s);
-            }
-        }
-        TyKind::Closure(..) => s.push_str("<closure>"),
-        TyKind::FnDef(f, _) => {
-            let _ = write!(s, "fn {}", names.fn_name(*f));
-        }
-        TyKind::Var(_) => s.push('_'),
-        TyKind::Never => s.push('!'),
-        TyKind::Error => s.push_str("{error}"),
     }
 }

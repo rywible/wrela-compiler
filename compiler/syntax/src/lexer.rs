@@ -1,6 +1,7 @@
 //! The lexer: spec/lexical.md, rule for rule. Rule numbers (L1–L21) are cited where they're
 //! implemented.
 
+use crate::ast::IntValue;
 use crate::token::{Comment, Token, TokenKind};
 use wrela_diag::{Diagnostic, FileId, Span, codes};
 
@@ -19,7 +20,7 @@ pub fn lex(file: FileId, text: &str) -> Lexed {
     let mut lx = Lexer { file, src: text.as_bytes(), text, pos: 0, out: Lexed::default() };
     lx.run();
     let mut lexed = lx.out;
-    lexed.tokens = insert_newlines(lexed.tokens, file, text.len() as u32);
+    lexed.tokens = insert_newlines(lexed.tokens, file);
     lexed
 }
 
@@ -37,6 +38,15 @@ fn is_ident_start(b: u8) -> bool {
 
 fn is_ident_continue(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// Whether `s` is a name: an IDENT token (L10), so not `_` and not a keyword.
+pub fn is_name(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.first().is_some_and(|&c| is_ident_start(c))
+        && b[1..].iter().all(|&c| is_ident_continue(c))
+        && s != "_"
+        && TokenKind::keyword(s).is_none()
 }
 
 impl<'a> Lexer<'a> {
@@ -113,9 +123,12 @@ impl<'a> Lexer<'a> {
                     }
                 }
                 _ => {
-                    let lb = std::mem::take(&mut line_break);
-                    line_has_token = true;
-                    self.token(lb);
+                    // A character that L3 skips makes no token, so the line break before it
+                    // stays for the next one.
+                    if self.token(line_break) {
+                        line_break = false;
+                        line_has_token = true;
+                    }
                 }
             }
         }
@@ -176,17 +189,10 @@ impl<'a> Lexer<'a> {
             "wrela has no block comments",
         )
         .with_help("use `//` comments, one per line");
-        let rest_of_line_blank = {
-            let mut i = self.pos;
-            let mut blank = true;
-            while i < self.src.len() && self.src[i] != b'\n' && self.src[i] != b'\r' {
-                if self.src[i] != b' ' && self.src[i] != b'\t' {
-                    blank = false;
-                }
-                i += 1;
-            }
-            blank
-        };
+        let rest_of_line_blank = self.src[self.pos..]
+            .iter()
+            .take_while(|&&b| b != b'\n' && b != b'\r')
+            .all(|&b| b == b' ' || b == b'\t');
         if !had_break && rest_of_line_blank && depth == 0 {
             let inner = body[2..body.len() - 2].trim().trim_start_matches('*').trim();
             d = d.with_fix("rewrite it as a `//` comment", sp, format!("// {inner}"));
@@ -201,7 +207,9 @@ impl<'a> Lexer<'a> {
         had_break
     }
 
-    fn token(&mut self, line_break_before: bool) {
+    /// Lexes the token at the current position. Returns whether it made one: a run of
+    /// characters that can't appear here (L3) is reported and skipped.
+    fn token(&mut self, line_break_before: bool) -> bool {
         let start = self.pos;
         let b = self.src[self.pos];
         if b == b'_' && !self.peek(1).is_some_and(is_ident_continue) {
@@ -253,7 +261,9 @@ impl<'a> Lexer<'a> {
                 );
             }
             self.error(d);
+            return false;
         }
+        true
     }
 
     /// L15: the longest punctuation token at the current position.
@@ -367,7 +377,6 @@ impl<'a> Lexer<'a> {
             if !seen_dot
                 && self.peek(0) == Some(b'.')
                 && self.peek(1).is_some_and(|b| b.is_ascii_digit())
-                && !self.text[start..self.pos].contains(['e', 'E'])
             {
                 seen_dot = true;
                 self.pos += 1;
@@ -387,7 +396,7 @@ impl<'a> Lexer<'a> {
         let text = &self.text[start..self.pos];
         let kind = match classify_number(text) {
             Ok(k) => k,
-            Err(NumberError::TypeSuffix { suffix_at }) => {
+            Err(NumberError::TypeSuffix { suffix_at, kind }) => {
                 let suffix_span = self.span(start + suffix_at, self.pos);
                 let digits = text[..suffix_at].trim_end_matches('_');
                 self.error(
@@ -402,11 +411,7 @@ impl<'a> Lexer<'a> {
                     ))
                     .with_fix("remove the suffix", sp, digits),
                 );
-                if text[..suffix_at].contains(['.', 'e', 'E']) {
-                    TokenKind::Float
-                } else {
-                    TokenKind::Int
-                }
+                kind
             }
             Err(NumberError::Malformed(why)) => {
                 self.error(Diagnostic::new(
@@ -423,7 +428,11 @@ impl<'a> Lexer<'a> {
 
 #[derive(Debug, PartialEq, Eq)]
 enum NumberError {
-    TypeSuffix { suffix_at: usize },
+    /// The number before the suffix is fine: an INT or a FLOAT.
+    TypeSuffix {
+        suffix_at: usize,
+        kind: TokenKind,
+    },
     Malformed(&'static str),
 }
 
@@ -452,17 +461,11 @@ fn classify_number(text: &str) -> Result<TokenKind, NumberError> {
         return classify_suffix(suffix, 2 + end, TokenKind::Int);
     }
     // Decimal: digits, then an optional fraction and exponent.
-    let mut i = 0;
-    while i < b.len() && (b[i].is_ascii_digit() || b[i] == b'_') {
-        i += 1;
-    }
+    let mut i = digits_end(b, 0);
     let mut kind = TokenKind::Int;
     if i < b.len() && b[i] == b'.' {
         let f = i + 1;
-        let mut j = f;
-        while j < b.len() && (b[j].is_ascii_digit() || b[j] == b'_') {
-            j += 1;
-        }
+        let j = digits_end(b, f);
         if !has_digit(&text[f..j], 10) {
             return Err(NumberError::Malformed("a fraction needs at least one digit"));
         }
@@ -470,14 +473,11 @@ fn classify_number(text: &str) -> Result<TokenKind, NumberError> {
         kind = TokenKind::Float;
     }
     if i < b.len() && matches!(b[i], b'e' | b'E') {
-        let mut j = i + 1;
-        if j < b.len() && matches!(b[j], b'+' | b'-') {
-            j += 1;
+        let mut ds = i + 1;
+        if ds < b.len() && matches!(b[ds], b'+' | b'-') {
+            ds += 1;
         }
-        let ds = j;
-        while j < b.len() && (b[j].is_ascii_digit() || b[j] == b'_') {
-            j += 1;
-        }
+        let j = digits_end(b, ds);
         if has_digit(&text[ds..j], 10) {
             i = j;
             kind = TokenKind::Float;
@@ -488,11 +488,16 @@ fn classify_number(text: &str) -> Result<TokenKind, NumberError> {
     classify_suffix(&text[i..], i, kind)
 }
 
+/// Where the run of decimal digits and `_` that starts at `from` ends.
+fn digits_end(b: &[u8], from: usize) -> usize {
+    from + b[from..].iter().take_while(|&&c| c.is_ascii_digit() || c == b'_').count()
+}
+
 fn classify_suffix(suffix: &str, at: usize, kind: TokenKind) -> Result<TokenKind, NumberError> {
     if suffix.is_empty() {
         Ok(kind)
     } else if TYPE_SUFFIXES.contains(&suffix) {
-        Err(NumberError::TypeSuffix { suffix_at: at })
+        Err(NumberError::TypeSuffix { suffix_at: at, kind })
     } else if suffix.starts_with(['e', 'E']) {
         Err(NumberError::Malformed("an exponent needs at least one digit"))
     } else if suffix.starts_with(|c: char| c.is_ascii_alphabetic())
@@ -504,59 +509,101 @@ fn classify_suffix(suffix: &str, at: usize, kind: TokenKind) -> Result<TokenKind
     }
 }
 
-/// L17–L19: inserts NEWLINE tokens into the raw token stream.
-fn insert_newlines(raw: Vec<Token>, file: FileId, _len: u32) -> Vec<Token> {
-    let mut out = Vec::with_capacity(raw.len() + raw.len() / 4);
-    let mut stack: Vec<TokenKind> = Vec::new();
-    for tok in raw {
-        if tok.line_break_before
-            && let Some(prev) = out.last().copied()
+/// L17: whether a line break between a token of kind `prev` and one of kind `next` makes a
+/// NEWLINE. `in_brace`: the innermost open bracket is `{`, or none is open ([`Brackets`]). A
+/// NEWLINE can't end a statement, so no line break after one makes another (L18).
+pub fn line_break_is_newline(in_brace: bool, prev: TokenKind, next: TokenKind) -> bool {
+    in_brace && prev.can_end_statement() && next != TokenKind::Dot
+}
+
+/// The open brackets, as L19 tracks them.
+#[derive(Debug, Default)]
+pub struct Brackets {
+    open: Vec<TokenKind>,
+}
+
+impl Brackets {
+    /// Takes the next token into account: an opening bracket opens; a closing bracket closes
+    /// the innermost open bracket of its kind and every bracket opened after it, or nothing if
+    /// none of its kind is open.
+    pub fn track(&mut self, k: TokenKind) {
+        if matches!(k, TokenKind::LParen | TokenKind::LBracket | TokenKind::LBrace) {
+            self.open.push(k);
+        } else if let Some(open) = k.opener()
+            && let Some(i) = self.open.iter().rposition(|o| *o == open)
         {
-            let prev: Token = prev;
-            let in_brace = stack.last().is_none_or(|k| *k == TokenKind::LBrace);
-            if in_brace
-                && prev.kind != TokenKind::Newline
-                && prev.kind.can_end_statement()
-                && tok.kind != TokenKind::Dot
-            {
-                let at = prev.span.end;
-                out.push(Token {
-                    kind: TokenKind::Newline,
-                    span: Span::new(file, at, at),
-                    line_break_before: false,
-                });
-            }
+            self.open.truncate(i);
         }
-        match tok.kind {
-            TokenKind::LParen | TokenKind::LBracket | TokenKind::LBrace => stack.push(tok.kind),
-            TokenKind::RParen | TokenKind::RBracket | TokenKind::RBrace => {
-                let open = match tok.kind {
-                    TokenKind::RParen => TokenKind::LParen,
-                    TokenKind::RBracket => TokenKind::LBracket,
-                    _ => TokenKind::LBrace,
-                };
-                if let Some(i) = stack.iter().rposition(|k| *k == open) {
-                    stack.truncate(i);
-                }
-            }
-            _ => {}
-        }
-        out.push(tok);
     }
+
+    /// Whether the innermost open bracket is `{`, or none is open (L17 condition 1).
+    pub fn in_brace(&self) -> bool {
+        self.open.last().is_none_or(|k| *k == TokenKind::LBrace)
+    }
+
+    /// How many brackets are open.
+    pub fn depth(&self) -> usize {
+        self.open.len()
+    }
+}
+
+/// L17–L19: inserts NEWLINE tokens into the raw token stream.
+fn insert_newlines(raw: Vec<Token>, file: FileId) -> Vec<Token> {
+    let mut out = Vec::with_capacity(raw.len() + raw.len() / 4);
+    newlines_after(None, Brackets::default(), raw, file, &mut out);
     out
 }
 
-/// The value of an INT token's text (`_` ignored, radix prefixes read), or `None` if it
-/// doesn't fit in a `u64`.
-pub fn int_value(text: &str) -> Option<u64> {
-    // A type suffix is already an error (E0003); read the digits before it. (Hex digits
-    // include `f`, so `0x1f32` is a plain hex number.)
-    let text = if text.starts_with("0x") {
-        text
-    } else {
-        TYPE_SUFFIXES.iter().find_map(|s| text.strip_suffix(s)).unwrap_or(text)
-    };
-    let clean: String = text.chars().filter(|c| *c != '_').collect();
+/// [`insert_newlines`] for the raw tokens that follow `prev`, with `brackets` open before them:
+/// appends them to `out`, NEWLINEs inserted.
+pub(crate) fn newlines_after(
+    mut prev: Option<Token>,
+    mut brackets: Brackets,
+    raw: Vec<Token>,
+    file: FileId,
+    out: &mut Vec<Token>,
+) {
+    for tok in raw {
+        if tok.line_break_before
+            && let Some(p) = prev
+            && line_break_is_newline(brackets.in_brace(), p.kind, tok.kind)
+        {
+            let at = p.span.end;
+            out.push(Token {
+                kind: TokenKind::Newline,
+                span: Span::new(file, at, at),
+                line_break_before: false,
+            });
+        }
+        brackets.track(tok.kind);
+        out.push(tok);
+        prev = Some(tok);
+    }
+}
+
+/// The value of an INT token's text: `_` ignored, a radix prefix read.
+pub fn int_value(text: &str) -> IntValue {
+    match u64_value(text) {
+        Some(v) => IntValue::Ok(v),
+        None if matches!(classify_number(text), Err(NumberError::Malformed(_))) => {
+            IntValue::Malformed
+        }
+        None => IntValue::TooLarge,
+    }
+}
+
+/// A number token's text without its type suffix: the suffix is already an error (E0003), and
+/// the number before it has a value. (Hex digits include `f`, so `0x1f32` has no suffix.)
+fn without_type_suffix(text: &str) -> &str {
+    match classify_number(text) {
+        Err(NumberError::TypeSuffix { suffix_at, .. }) => &text[..suffix_at],
+        _ => text,
+    }
+}
+
+/// The value of an INT token's text, or `None` if it isn't a number that fits in a `u64`.
+fn u64_value(text: &str) -> Option<u64> {
+    let clean: String = without_type_suffix(text).chars().filter(|c| *c != '_').collect();
     let (digits, radix) = match clean.get(..2) {
         Some("0x") => (&clean[2..], 16),
         Some("0b") => (&clean[2..], 2),
@@ -568,8 +615,7 @@ pub fn int_value(text: &str) -> Option<u64> {
 
 /// The value of a FLOAT token's text, `_` ignored.
 pub fn float_value(text: &str) -> f64 {
-    let text = TYPE_SUFFIXES.iter().find_map(|s| text.strip_suffix(s)).unwrap_or(text);
-    let clean: String = text.chars().filter(|c| *c != '_').collect();
+    let clean: String = without_type_suffix(text).chars().filter(|c| *c != '_').collect();
     clean.parse().unwrap_or(f64::NAN)
 }
 

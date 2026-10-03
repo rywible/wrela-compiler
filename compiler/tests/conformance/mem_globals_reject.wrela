@@ -4,3 +4,35 @@ var counter: u32 = 0 //~ E0213
 fn f() -> u32 {
     1
 }
+
+// A constant is a value: lending it `mut` would lose the writes.
+const LIMIT: f32 = 3.0
+const TABLE: [f32; 3] = [1.0, 2.0, 3.0]
+
+struct Log {
+    count: u32,
+}
+
+impl Log {
+    fn push(mut self) {
+        self.count += 1
+    }
+}
+
+const ORIGIN: Log = Log { count: 4 }
+
+fn bump(x: mut f32) {
+    x += 1.0
+}
+
+fn g() -> f32 {
+    bump(mut LIMIT) //~ E0512
+    bump(mut TABLE[0]) //~ E0512
+    ORIGIN.push() //~ E0512
+    mut p = ORIGIN //~ E0512
+    p.count = 9
+    for mut x in TABLE { //~ E0512
+        x = 7.0
+    }
+    LIMIT
+}

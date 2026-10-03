@@ -1,0 +1,12 @@
+// mistake: returning a projection of several vector components
+// expect: E0702
+// fix: no
+fn xy(v: mut vec3) -> mut vec2 {
+    mut v.xy
+}
+
+pub fn flatten(h: f32) -> f32 {
+    var p = vec3(1.0, 2.0, 3.0)
+    xy(mut p) = vec2(h, h)
+    p.x + p.y + p.z
+}

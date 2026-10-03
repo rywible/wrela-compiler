@@ -2,27 +2,41 @@
 
 use super::Checker;
 use crate::defs::*;
-use crate::resolve::{self, PathLookup};
+use crate::program::Program;
+use crate::resolve;
 use crate::thir::*;
 use crate::ty::*;
+use std::borrow::Cow;
 use wrela_diag::{Diagnostic, Span, codes};
 use wrela_syntax::ast;
 
 impl<'p> Checker<'p> {
-    /// How a pattern binding of type `ty` holds its value: a `Copy` value is copied; anything
-    /// else projects into the scrutinee when it's a place, and owns it when it's a temporary.
-    fn binding_kind(&mut self, ty: TyId, from_place: bool) -> LocalKind {
+    /// Declares a pattern binding of type `ty`. A `Copy` value is copied; anything else
+    /// projects into the scrutinee when it's a place, and owns it when it's a temporary. While
+    /// `ty` isn't known, that's decided once it is ([`Checker::binding_kinds`]).
+    fn declare_binding(&mut self, name: &ast::Ident, ty: TyId, from_place: bool) -> LocalId {
         // Through any inference variables bound so far: `[In { .. }; 2]`'s elements are `Copy`
         // even before the array's type is written anywhere.
-        let ty = self.infer.resolve(&self.p.types, ty);
-        if crate::traits::implements_builtin(self.p, ty, Lang::Copy)
-            || matches!(self.kind(ty), TyKind::Var(_))
-        {
-            LocalKind::Owned { mutable: false }
-        } else if from_place {
-            LocalKind::Projection { mutable: false }
+        let resolved = self.infer.resolve(&self.p.types, ty);
+        let kind = if self.p.types.has_vars(resolved) {
+            None
         } else {
-            LocalKind::Owned { mutable: false }
+            Some(binding_kind(self.p, resolved, from_place))
+        };
+        let owned = LocalKind::Owned { mutable: false };
+        let id = self.declare_local(&name.name, ty, kind.unwrap_or(owned), name.span);
+        if kind.is_none() {
+            self.pending_bindings.push((id, from_place));
+        }
+        id
+    }
+
+    /// Decides the kinds of the pattern bindings whose types weren't known when they were
+    /// declared; `locals` have their types resolved.
+    pub(crate) fn binding_kinds(&mut self) {
+        for (id, from_place) in std::mem::take(&mut self.pending_bindings) {
+            let ty = self.infer.resolve(&self.p.types, self.locals[id.index()].ty);
+            self.locals[id.index()].kind = binding_kind(self.p, ty, from_place);
         }
     }
 
@@ -71,17 +85,13 @@ impl<'p> Checker<'p> {
                     Some(Res::Variant(a, v))
                         if self.p.adt(a).variants()[v as usize].shape == VariantShape::Unit =>
                     {
-                        return self.variant_pat(a, v, &[], span, ty);
+                        return self.variant_pat(a, v, span, ty);
                     }
                     Some(Res::Const(c)) => match self.const_pat(c, ty, name.span) {
                         Some(l) => PatKind::Lit(l),
                         None => PatKind::Wild,
                     },
-                    _ => {
-                        let kind = self.binding_kind(ty, from_place);
-                        let id = self.declare_pattern_local(&name.name, ty, kind, name.span);
-                        PatKind::Bind(id)
-                    }
+                    _ => PatKind::Bind(self.declare_binding(name, ty, from_place)),
                 }
             }
             ast::PatKind::Lit { neg, lit } => {
@@ -93,7 +103,7 @@ impl<'p> Checker<'p> {
             }
             ast::PatKind::Tuple(ps) => {
                 let tys = match self.kind(ty) {
-                    TyKind::Tuple(ts) if ts.len() == ps.len() => ts,
+                    TyKind::Tuple(ts) if ts.len() == ps.len() => ts.clone(),
                     TyKind::Var(_) => {
                         let ts: Vec<TyId> =
                             ps.iter().map(|p| self.new_var(VarKind::General, p.span)).collect();
@@ -118,37 +128,18 @@ impl<'p> Checker<'p> {
             ast::PatKind::Path(path)
             | ast::PatKind::TupleStruct(path, _)
             | ast::PatKind::Struct { path, .. } => {
-                let idents: Vec<ast::Ident> =
-                    path.segments.iter().map(|s| s.ident.clone()).collect();
-                let res =
-                    match resolve::resolve_module_path_in(self.p, self.scope.module, &idents, true)
-                    {
-                        PathLookup::Found(r) => r,
-                        PathLookup::Error(d) => {
-                            self.err(*d);
-                            return self.unmatched(pat, ty);
-                        }
-                        PathLookup::NotYet(..) | PathLookup::Broken => {
-                            return self.unmatched(pat, ty);
-                        }
-                    };
+                let module = self.scope.module;
+                let Some(res) =
+                    resolve::lookup_or_report(self.p, &mut self.diags, module, &path.segments)
+                else {
+                    return self.unmatched(pat, ty);
+                };
                 match (&pat.kind, res) {
                     (ast::PatKind::Path(_), Res::Variant(a, v)) => {
-                        return self.variant_pat(a, v, &[], span, ty);
+                        return self.variant_pat(a, v, span, ty);
                     }
                     (ast::PatKind::TupleStruct(_, subs), Res::Variant(a, v)) => {
-                        let subs: Vec<(u32, &ast::Pat)> =
-                            subs.iter().enumerate().map(|(i, p)| (i as u32, p)).collect();
-                        return self.variant_pat_checked(
-                            a,
-                            v,
-                            &subs,
-                            subs.len(),
-                            span,
-                            ty,
-                            from_place,
-                            VariantShape::Tuple,
-                        );
+                        return self.tuple_variant_pat(a, v, subs, span, ty, from_place);
                     }
                     (ast::PatKind::Struct { fields, rest, .. }, Res::Variant(a, v)) => {
                         return self.struct_pat(a, Some(v), fields, *rest, span, ty, from_place);
@@ -188,7 +179,7 @@ impl<'p> Checker<'p> {
                     resolve::lookup_name(self.p, self.scope.module, &name.name),
                     Some(Res::Variant(..) | Res::Const(_))
                 ) {
-                    self.declare_pattern_local(&name.name, error, owned, name.span);
+                    self.declare_local(&name.name, error, owned, name.span);
                 }
             }
             ast::PatKind::TupleStruct(_, ps) | ast::PatKind::Tuple(ps) => {
@@ -213,26 +204,16 @@ impl<'p> Checker<'p> {
             Some(p) => self.declare_unmatched(p),
             None => {
                 let owned = LocalKind::Owned { mutable: false };
-                self.declare_pattern_local(&f.name.name, self.p.types.error, owned, f.name.span);
+                self.declare_local(&f.name.name, self.p.types.error, owned, f.name.span);
             }
         }
     }
 
-    fn unmatched_subs(&mut self, subs: &[(u32, &ast::Pat)], ty: TyId, span: Span) -> Pat {
-        for (_, p) in subs {
+    fn unmatched_subs(&mut self, subs: &[ast::Pat], ty: TyId, span: Span) -> Pat {
+        for p in subs {
             self.declare_unmatched(p);
         }
         Pat { ty, kind: PatKind::Wild, span }
-    }
-
-    fn declare_pattern_local(
-        &mut self,
-        name: &str,
-        ty: TyId,
-        kind: LocalKind,
-        span: Span,
-    ) -> LocalId {
-        self.declare_local(name, ty, kind, span)
     }
 
     /// A constant used as a pattern: its value, which must be a number or a `bool`.
@@ -267,6 +248,24 @@ impl<'p> Checker<'p> {
                             seen.push(d);
                             cur = d;
                         }
+                        // A unit variant (`const NOTHING: Option<i32> = None`) isn't a number.
+                        Some(Res::Variant(..)) => {
+                            let names: Vec<&str> =
+                                path.segments.iter().map(|s| s.ident.name.as_str()).collect();
+                            self.err(
+                                Diagnostic::new(
+                                    codes::E0320,
+                                    span,
+                                    format!(
+                                        "`{}` can't be a pattern: only a number or `bool` constant can",
+                                        self.p.const_(c).name
+                                    ),
+                                )
+                                .with_help(format!("match the variant itself: `{}`", names.join("::"))),
+                            );
+                            return None;
+                        }
+                        // Its error is reported where the constant is defined.
                         _ => return None,
                     }
                 }
@@ -289,18 +288,15 @@ impl<'p> Checker<'p> {
         let resolved = self.infer.resolve(&self.p.types, ty);
         match lit.kind {
             ast::LitKind::Bool(b) => Some(Lit::Bool(b)),
-            ast::LitKind::Int if self.p.types.is_float(resolved) => {
-                let v = wrela_syntax::lexer::int_value(&lit.text)? as f64;
+            ast::LitKind::Int(v) if self.p.types.is_float(resolved) => {
+                let v = v.ok()? as f64;
                 Some(Lit::Float(if neg { -v } else { v }))
             }
-            ast::LitKind::Int => {
-                let v = wrela_syntax::lexer::int_value(&lit.text)?;
+            ast::LitKind::Int(v) => {
+                let v = v.ok()?;
                 Some(Lit::Int(if neg { -i128::from(v) } else { i128::from(v) }))
             }
-            ast::LitKind::Float => {
-                let v = wrela_syntax::lexer::float_value(&lit.text);
-                Some(Lit::Float(if neg { -v } else { v }))
-            }
+            ast::LitKind::Float(v) => Some(Lit::Float(if neg { -v } else { v })),
             _ => None,
         }
     }
@@ -312,17 +308,46 @@ impl<'p> Checker<'p> {
                 self.expect(bt, ty, lit.span);
                 Some(Lit::Bool(b))
             }
-            ast::LitKind::Int => {
-                let v = wrela_syntax::lexer::int_value(&lit.text)?;
+            ast::LitKind::Int(v) => {
+                let v = match v {
+                    ast::IntValue::Ok(v) => v,
+                    ast::IntValue::Malformed => return None,
+                    ast::IntValue::TooLarge => {
+                        self.err(Diagnostic::new(
+                            codes::E0006,
+                            lit.span,
+                            "this integer is too large for any integer type",
+                        ));
+                        return None;
+                    }
+                };
                 let var = self.new_var(VarKind::Int, lit.span);
                 self.expect(var, ty, lit.span);
                 self.int_literals.push((ty, v, neg, lit.span));
+                if neg {
+                    // As for `-x`: an unsigned value is never negative.
+                    match self.kind(ty) {
+                        TyKind::Int(it) if !it.signed() => {
+                            let shown = self.display(ty);
+                            self.err(
+                                Diagnostic::new(
+                                    codes::E0305,
+                                    lit.span,
+                                    format!("`-` doesn't apply to `{shown}`"),
+                                )
+                                .with_note("unsigned integers can't be negative"),
+                            );
+                            return None;
+                        }
+                        _ => self.negated_ints.push((ty, lit.span)),
+                    }
+                }
                 Some(Lit::Int(if neg { -i128::from(v) } else { i128::from(v) }))
             }
-            ast::LitKind::Float => {
-                let v = wrela_syntax::lexer::float_value(&lit.text);
+            ast::LitKind::Float(v) => {
                 let var = self.new_var(VarKind::Float, lit.span);
                 self.expect(var, ty, lit.span);
+                self.float_literals.push((ty, v, lit.span));
                 Some(Lit::Float(if neg { -v } else { v }))
             }
             _ => {
@@ -353,8 +378,8 @@ impl<'p> Checker<'p> {
         Some(args.iter().map(|&t| self.shallow(t)).collect())
     }
 
-    fn variant_pat(&mut self, a: AdtId, v: u32, _subs: &[ast::Pat], span: Span, ty: TyId) -> Pat {
-        let variant = self.p.adt(a).variants()[v as usize].clone();
+    fn variant_pat(&mut self, a: AdtId, v: u32, span: Span, ty: TyId) -> Pat {
+        let variant = &self.p.adt(a).variants()[v as usize];
         let Some(args) = self.pat_adt_args(a, ty, span) else {
             return Pat { ty, kind: PatKind::Wild, span };
         };
@@ -373,23 +398,21 @@ impl<'p> Checker<'p> {
         Pat { ty, kind: PatKind::Adt { adt: a, args, variant: Some(v), fields: Vec::new() }, span }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn variant_pat_checked(
+    /// `Variant(p, q, ...)`.
+    fn tuple_variant_pat(
         &mut self,
         a: AdtId,
         v: u32,
-        subs: &[(u32, &ast::Pat)],
-        n: usize,
+        subs: &[ast::Pat],
         span: Span,
         ty: TyId,
         from_place: bool,
-        shape: VariantShape,
     ) -> Pat {
-        let variant = self.p.adt(a).variants()[v as usize].clone();
+        let variant = &self.p.adt(a).variants()[v as usize];
         let Some(args) = self.pat_adt_args(a, ty, span) else {
             return self.unmatched_subs(subs, ty, span);
         };
-        if variant.shape != shape {
+        if variant.shape != VariantShape::Tuple {
             self.err(Diagnostic::new(
                 codes::E0320,
                 span,
@@ -397,6 +420,7 @@ impl<'p> Checker<'p> {
             ));
             return self.unmatched_subs(subs, ty, span);
         }
+        let n = subs.len();
         if n != variant.fields.len() {
             self.err(Diagnostic::new(
                 codes::E0320,
@@ -405,15 +429,17 @@ impl<'p> Checker<'p> {
                     "`{}` holds {} value{}, but this pattern has {n}",
                     variant.name,
                     variant.fields.len(),
-                    if variant.fields.len() == 1 { "" } else { "s" }
+                    wrela_diag::plural(variant.fields.len())
                 ),
             ));
             return self.unmatched_subs(subs, ty, span);
         }
-        let ftys = self.p.variant_fields(a, &args, v as usize);
+        let ftys = self.p.fields_of(a, &args, Some(v));
         let fields = subs
             .iter()
-            .map(|(i, p)| (*i, self.check_pat(p, ftys[*i as usize].1, from_place)))
+            .zip(ftys)
+            .enumerate()
+            .map(|(i, (p, (_, t)))| (i as u32, self.check_pat(p, t, from_place)))
             .collect();
         Pat { ty, kind: PatKind::Adt { adt: a, args, variant: Some(v), fields }, span }
     }
@@ -435,13 +461,7 @@ impl<'p> Checker<'p> {
             }
             return Pat { ty, kind: PatKind::Wild, span };
         };
-        let (decls, ftys) = match v {
-            Some(v) => (
-                self.p.adt(a).variants()[v as usize].fields.clone(),
-                self.p.variant_fields(a, &args, v as usize),
-            ),
-            None => (self.p.adt(a).fields().to_vec(), self.p.struct_fields(a, &args)),
-        };
+        let (decls, ftys) = (self.p.adt_fields(a, v), self.p.fields_of(a, &args, v));
         let mut out = Vec::new();
         for f in fields {
             let Some(i) = decls.iter().position(|d| d.name == f.name.name) else {
@@ -453,6 +473,16 @@ impl<'p> Checker<'p> {
                 self.declare_unmatched_field(f);
                 continue;
             };
+            // Exhaustiveness sees one pattern per field.
+            if out.iter().any(|(j, _)| *j as usize == i) {
+                self.err(Diagnostic::new(
+                    codes::E0308,
+                    f.name.span,
+                    format!("the field `{}` is matched twice", f.name.name),
+                ));
+                self.declare_unmatched_field(f);
+                continue;
+            }
             if v.is_none() && !decls[i].public && self.p.adt(a).module != self.scope.module {
                 self.err(
                     Diagnostic::new(
@@ -471,8 +501,7 @@ impl<'p> Checker<'p> {
             let sub = match &f.pat {
                 Some(p) => self.check_pat(p, ftys[i].1, from_place),
                 None => {
-                    let kind = self.binding_kind(ftys[i].1, from_place);
-                    let id = self.declare_pattern_local(&f.name.name, ftys[i].1, kind, f.name.span);
+                    let id = self.declare_binding(&f.name, ftys[i].1, from_place);
                     Pat { ty: ftys[i].1, kind: PatKind::Bind(id), span: f.name.span }
                 }
             };
@@ -508,12 +537,19 @@ impl<'p> Checker<'p> {
     ) -> Expr {
         let s = self.check_expr(scrutinee, None);
         let from_place = s.is_place();
-        let mut result = expected;
+        // The arms agree with each other; `expected` only guides them, as with `if`, so a
+        // match of arrays can still pass as a run.
+        let mut result = None;
         let mut out = Vec::new();
+        // A pattern with an error (reported) could have been meant to cover anything, or
+        // nothing: what the arms cover isn't known.
+        let mut bad_pattern = false;
         for arm in arms {
-            let env_len = self.env_len();
+            let env_len = self.env.len();
+            let errors = self.diags.len();
             let pats: Vec<Pat> =
                 arm.pats.iter().map(|p| self.check_pat(p, s.ty, from_place)).collect();
+            bad_pattern |= wrela_diag::has_errors(&self.diags[errors..]);
             if pats.len() > 1 && pats.iter().any(has_binding) {
                 self.err(
                     Diagnostic::new(
@@ -535,18 +571,19 @@ impl<'p> Checker<'p> {
                 self.expect_cond(&e);
                 e
             });
-            let body = self.check_expr(&arm.body, result);
+            let body = self.check_expr(&arm.body, result.or(expected));
             match result {
                 Some(r) => {
                     if !matches!(self.kind(body.ty), TyKind::Never)
                         && self.infer.unify(&self.p.types, body.ty, r).is_err()
                     {
                         let (a, b) = (self.display(r), self.display(body.ty));
-                        self.err(Diagnostic::new(
+                        let d = Diagnostic::new(
                             codes::E0300,
                             body.span,
                             format!("this arm is a `{b}`, but the match is a `{a}`"),
-                        ));
+                        );
+                        self.err(self.branch_mismatch(d, r, body.ty));
                     }
                 }
                 None => {
@@ -555,12 +592,16 @@ impl<'p> Checker<'p> {
                     }
                 }
             }
-            self.truncate_env(env_len);
+            self.env.truncate(env_len);
             out.push(Arm { pat, guard, body, span: arm.span });
         }
         let ty = result.unwrap_or(self.p.types.never);
-        // An arm that failed to parse could have covered anything.
-        if !arms.iter().any(|a| a.pats.iter().any(has_error_pat)) {
+        // An arm that failed to parse could have covered anything, too.
+        let scrutinee_error = matches!(self.kind(s.ty), TyKind::Error);
+        if !bad_pattern
+            && !scrutinee_error
+            && !arms.iter().any(|a| a.pats.iter().any(has_error_pat))
+        {
             self.check_exhaustive(&s, &out, span);
         }
         Expr { ty, span, kind: ExprKind::Match { scrutinee: Box::new(s), arms: out } }
@@ -571,7 +612,7 @@ impl<'p> Checker<'p> {
         let mut rows: Vec<Vec<DPat>> = Vec::new();
         for arm in arms {
             let d = self.dpat(&arm.pat);
-            if !useful(self, &rows, std::slice::from_ref(&d), &[ty]) {
+            if !useful(self.p, &rows, std::slice::from_ref(&d), &[ty]) {
                 self.err(
                     Diagnostic::new(
                         codes::W0002,
@@ -585,8 +626,8 @@ impl<'p> Checker<'p> {
                 rows.push(vec![d]);
             }
         }
-        if useful(self, &rows, &[DPat::Wild], &[ty]) {
-            let missing = witness(self, &rows, ty).unwrap_or_else(|| "_".into());
+        if useful(self.p, &rows, &[DPat::Wild], &[ty]) {
+            let missing = witness(self.p, &rows, ty).unwrap_or_else(|| "_".into());
             self.err(
                 Diagnostic::new(
                     codes::E0309,
@@ -626,13 +667,14 @@ impl<'p> Checker<'p> {
             PatKind::Or(ps) => DPat::Or(ps.iter().map(|x| self.dpat(x)).collect()),
         }
     }
+}
 
-    pub(crate) fn env_len(&self) -> usize {
-        self.env.len()
-    }
-
-    pub(crate) fn truncate_env(&mut self, n: usize) {
-        self.env.truncate(n);
+/// How a pattern binding of the known type `ty` holds its value.
+fn binding_kind(p: &Program, ty: TyId, from_place: bool) -> LocalKind {
+    if from_place && !crate::traits::implements_builtin(p, ty, Lang::Copy) {
+        LocalKind::Projection { mutable: false }
+    } else {
+        LocalKind::Owned { mutable: false }
     }
 }
 
@@ -664,54 +706,58 @@ enum DPat {
     Or(Vec<DPat>),
 }
 
-/// The constructors of a type, with their field types; `None` for infinite types.
-fn ctors(c: &mut Checker, ty: TyId) -> Option<Vec<(Ctor, Vec<TyId>)>> {
-    match c.p.types.kind(ty).clone() {
-        TyKind::Bool => Some(vec![(Ctor::Variant(0), Vec::new()), (Ctor::Variant(1), Vec::new())]),
-        TyKind::Tuple(ts) => Some(vec![(Ctor::Single, ts)]),
-        TyKind::Adt(a, args) => {
-            if c.p.adt(a).is_enum() {
-                let n = c.p.adt(a).variants().len();
-                Some(
-                    (0..n)
-                        .map(|v| {
-                            (
-                                Ctor::Variant(v as u32),
-                                c.p.variant_fields(a, &args, v)
-                                    .into_iter()
-                                    .map(|(_, t)| t)
-                                    .collect(),
-                            )
-                        })
-                        .collect(),
-                )
-            } else {
-                Some(vec![(
-                    Ctor::Single,
-                    c.p.struct_fields(a, &args).into_iter().map(|(_, t)| t).collect(),
-                )])
-            }
+/// The constructors of a type; `None` for infinite types.
+fn ctors(p: &Program, ty: TyId) -> Option<Vec<Ctor>> {
+    match p.types.kind(ty) {
+        TyKind::Bool => Some(vec![Ctor::Variant(0), Ctor::Variant(1)]),
+        TyKind::Tuple(_) => Some(vec![Ctor::Single]),
+        TyKind::Adt(a, _) if p.adt(*a).is_enum() => {
+            Some((0..p.adt(*a).variants().len() as u32).map(Ctor::Variant).collect())
         }
+        TyKind::Adt(..) => Some(vec![Ctor::Single]),
         _ => None,
     }
 }
 
-/// Expands or-patterns in the first column.
-fn expand(rows: &[Vec<DPat>]) -> Vec<Vec<DPat>> {
+/// The field types of constructor `k` of `ty`; none when `ty` has no such constructor.
+fn ctor_fields(p: &Program, ty: TyId, k: &Ctor) -> Vec<TyId> {
+    let fields = |a: AdtId, args: &[TyId], v| p.fields_of(a, args, v).into_iter().map(|(_, t)| t);
+    match (p.types.kind(ty), k) {
+        (TyKind::Tuple(ts), Ctor::Single) => ts.clone(),
+        (TyKind::Adt(a, args), Ctor::Single) if !p.adt(*a).is_enum() => {
+            fields(*a, args, None).collect()
+        }
+        (TyKind::Adt(a, args), Ctor::Variant(v)) if (*v as usize) < p.adt(*a).variants().len() => {
+            fields(*a, args, Some(*v)).collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Expands or-patterns in the first column (the rows themselves when there are none).
+fn expand(rows: &[Vec<DPat>]) -> Cow<'_, [Vec<DPat>]> {
+    if !rows.iter().any(|r| matches!(r.first(), Some(DPat::Or(_)))) {
+        return Cow::Borrowed(rows);
+    }
     let mut out = Vec::new();
     for r in rows {
-        match r.first() {
-            Some(DPat::Or(alts)) => {
-                for a in alts {
-                    let mut nr = vec![a.clone()];
-                    nr.extend_from_slice(&r[1..]);
-                    out.extend(expand(&[nr]));
-                }
-            }
-            _ => out.push(r.clone()),
-        }
+        push_expanded(r.clone(), &mut out);
     }
-    out
+    Cow::Owned(out)
+}
+
+/// Pushes `row`, or a row for each alternative of its first column's or-pattern, expanded.
+fn push_expanded(row: Vec<DPat>, out: &mut Vec<Vec<DPat>>) {
+    match row.first() {
+        Some(DPat::Or(alts)) => {
+            for a in alts {
+                let mut nr = vec![a.clone()];
+                nr.extend_from_slice(&row[1..]);
+                push_expanded(nr, out);
+            }
+        }
+        _ => out.push(row),
+    }
 }
 
 /// The rows that match constructor `k` (of `arity`), with its fields spliced in.
@@ -724,7 +770,8 @@ fn specialize(rows: &[Vec<DPat>], k: &Ctor, arity: usize) -> Vec<Vec<DPat>> {
                 nr.extend_from_slice(&r[1..]);
                 out.push(nr);
             }
-            DPat::Ctor(c, subs) if c == k => {
+            // A pattern of another type (its error is reported) matches none of this one's.
+            DPat::Ctor(c, subs) if c == k && subs.len() == arity => {
                 let mut nr = subs.clone();
                 nr.extend_from_slice(&r[1..]);
                 out.push(nr);
@@ -740,7 +787,7 @@ fn default_rows(rows: &[Vec<DPat>]) -> Vec<Vec<DPat>> {
 }
 
 /// Whether `row` matches some value no row of `rows` matches.
-fn useful(c: &mut Checker, rows: &[Vec<DPat>], row: &[DPat], tys: &[TyId]) -> bool {
+fn useful(p: &Program, rows: &[Vec<DPat>], row: &[DPat], tys: &[TyId]) -> bool {
     if row.is_empty() {
         return rows.is_empty();
     }
@@ -749,50 +796,43 @@ fn useful(c: &mut Checker, rows: &[Vec<DPat>], row: &[DPat], tys: &[TyId]) -> bo
         return alts.iter().any(|a| {
             let mut r = vec![a.clone()];
             r.extend_from_slice(&row[1..]);
-            useful(c, &rows, &r, tys)
+            useful(p, &rows, &r, tys)
         });
     }
     let ty = tys[0];
     match &row[0] {
         DPat::Ctor(k, subs) => {
             let arity = subs.len();
-            let field_tys = ctors(c, ty)
-                .and_then(|cs| cs.into_iter().find(|(x, _)| x == k))
-                .map(|(_, f)| f)
-                .unwrap_or_default();
-            let mut ntys = field_tys;
-            ntys.resize(arity, c.p.types.error);
+            let mut ntys = ctor_fields(p, ty, k);
+            ntys.resize(arity, p.types.error);
             ntys.extend_from_slice(&tys[1..]);
             let mut nrow = subs.clone();
             nrow.extend_from_slice(&row[1..]);
-            useful(c, &specialize(&rows, k, arity), &nrow, &ntys)
+            useful(p, &specialize(&rows, k, arity), &nrow, &ntys)
         }
         DPat::Lit(l) => {
-            let l = l.clone();
             let matching: Vec<Vec<DPat>> = rows
                 .iter()
-                .filter(|r| matches!(&r[0], DPat::Wild) || matches!(&r[0], DPat::Lit(x) if *x == l))
+                .filter(|r| matches!(&r[0], DPat::Wild) || matches!(&r[0], DPat::Lit(x) if x == l))
                 .map(|r| r[1..].to_vec())
                 .collect();
-            useful(c, &matching, &row[1..], &tys[1..])
+            useful(p, &matching, &row[1..], &tys[1..])
         }
         DPat::Wild => {
-            let used: Vec<Ctor> = rows
+            let used: Vec<&Ctor> = rows
                 .iter()
-                .filter_map(|r| if let DPat::Ctor(k, _) = &r[0] { Some(k.clone()) } else { None })
+                .filter_map(|r| if let DPat::Ctor(k, _) = &r[0] { Some(k) } else { None })
                 .collect();
-            match ctors(c, ty) {
-                Some(all) if all.iter().all(|(k, _)| used.contains(k)) => {
-                    all.into_iter().any(|(k, ftys)| {
-                        let arity = ftys.len();
-                        let mut ntys = ftys;
-                        ntys.extend_from_slice(&tys[1..]);
-                        let mut nrow = vec![DPat::Wild; arity];
-                        nrow.extend_from_slice(&row[1..]);
-                        useful(c, &specialize(&rows, &k, arity), &nrow, &ntys)
-                    })
-                }
-                _ => useful(c, &default_rows(&rows), &row[1..], &tys[1..]),
+            match ctors(p, ty) {
+                Some(all) if all.iter().all(|k| used.contains(&k)) => all.iter().any(|k| {
+                    let mut ntys = ctor_fields(p, ty, k);
+                    let arity = ntys.len();
+                    ntys.extend_from_slice(&tys[1..]);
+                    let mut nrow = vec![DPat::Wild; arity];
+                    nrow.extend_from_slice(&row[1..]);
+                    useful(p, &specialize(&rows, k, arity), &nrow, &ntys)
+                }),
+                _ => useful(p, &default_rows(&rows), &row[1..], &tys[1..]),
             }
         }
         DPat::Or(_) => unreachable!("or-patterns are expanded above"),
@@ -800,21 +840,19 @@ fn useful(c: &mut Checker, rows: &[Vec<DPat>], row: &[DPat], tys: &[TyId]) -> bo
 }
 
 /// An example of a value the rows miss, for the message (one level deep).
-fn witness(c: &mut Checker, rows: &[Vec<DPat>], ty: TyId) -> Option<String> {
+fn witness(p: &Program, rows: &[Vec<DPat>], ty: TyId) -> Option<String> {
     let rows = expand(rows);
-    let all = ctors(c, ty)?;
-    for (k, ftys) in all {
-        let arity = ftys.len();
+    for k in ctors(p, ty)? {
+        let tys = ctor_fields(p, ty, &k);
+        let arity = tys.len();
         let spec = specialize(&rows, &k, arity);
-        let mut tys = ftys.clone();
-        tys.resize(arity, c.p.types.error);
-        if useful(c, &spec, &vec![DPat::Wild; arity], &tys) {
-            let text = match (&k, c.p.types.kind(ty).clone()) {
+        if useful(p, &spec, &vec![DPat::Wild; arity], &tys) {
+            let text = match (&k, p.types.kind(ty)) {
                 (Ctor::Variant(v), TyKind::Bool) => {
                     (if *v == 1 { "true" } else { "false" }).to_string()
                 }
                 (Ctor::Variant(v), TyKind::Adt(a, _)) => {
-                    let var = &c.p.adt(a).variants()[*v as usize];
+                    let var = &p.adt(*a).variants()[*v as usize];
                     match var.shape {
                         VariantShape::Unit => var.name.clone(),
                         VariantShape::Tuple => {

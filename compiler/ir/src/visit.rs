@@ -36,7 +36,10 @@ impl Place {
     pub fn root_local(&self) -> Option<LocalId> {
         match self.root {
             PlaceRoot::Local(l) => Some(l),
-            PlaceRoot::Param(_) | PlaceRoot::Resource(_) | PlaceRoot::Ptr(_) => None,
+            PlaceRoot::Param(_)
+            | PlaceRoot::Resource(_)
+            | PlaceRoot::Ptr(_)
+            | PlaceRoot::Data(_) => None,
         }
     }
 }
@@ -287,11 +290,11 @@ impl Stmt {
     }
 
     /// The blocks nested in the statement: an `if`'s branches, a loop's body and continuing
-    /// block.
-    pub fn blocks(&self) -> Vec<&Block> {
-        match self {
-            Stmt::If { then, else_, .. } => vec![then, else_],
-            Stmt::Loop { body, continuing } => vec![body, continuing],
+    /// block, in that order.
+    pub fn blocks(&self) -> impl DoubleEndedIterator<Item = &Block> {
+        let (a, b) = match self {
+            Stmt::If { then, else_, .. } => (Some(then), Some(else_)),
+            Stmt::Loop { body, continuing } => (Some(body), Some(continuing)),
             Stmt::Let(..)
             | Stmt::Eval(_)
             | Stmt::Store(..)
@@ -299,14 +302,15 @@ impl Stmt {
             | Stmt::Continue
             | Stmt::Return(_)
             | Stmt::Trap
-            | Stmt::At(_) => Vec::new(),
-        }
+            | Stmt::At(_) => (None, None),
+        };
+        [a, b].into_iter().flatten()
     }
 
-    pub fn blocks_mut(&mut self) -> Vec<&mut Block> {
-        match self {
-            Stmt::If { then, else_, .. } => vec![then, else_],
-            Stmt::Loop { body, continuing } => vec![body, continuing],
+    pub fn blocks_mut(&mut self) -> impl DoubleEndedIterator<Item = &mut Block> {
+        let (a, b) = match self {
+            Stmt::If { then, else_, .. } => (Some(then), Some(else_)),
+            Stmt::Loop { body, continuing } => (Some(body), Some(continuing)),
             Stmt::Let(..)
             | Stmt::Eval(_)
             | Stmt::Store(..)
@@ -314,8 +318,9 @@ impl Stmt {
             | Stmt::Continue
             | Stmt::Return(_)
             | Stmt::Trap
-            | Stmt::At(_) => Vec::new(),
-        }
+            | Stmt::At(_) => (None, None),
+        };
+        [a, b].into_iter().flatten()
     }
 }
 
@@ -337,6 +342,22 @@ pub fn walk_mut(b: &mut Block, f: &mut impl FnMut(&mut Stmt)) {
             walk_mut(inner, f);
         }
     }
+}
+
+/// Whether `f` holds for a statement of `b` or of the blocks nested in it.
+pub fn any(b: &[Stmt], f: &mut impl FnMut(&Stmt) -> bool) -> bool {
+    b.iter().any(|s| f(s) || s.blocks().any(|inner| any(inner, f)))
+}
+
+/// Adds to `counts`, by local, how many places in `b` and the blocks nested in it mention it.
+pub fn count_local_mentions(b: &Block, counts: &mut [u32]) {
+    walk(b, &mut |s| {
+        s.for_each_place(&mut |p| {
+            if let Some(l) = p.root_local() {
+                counts[l.index()] += 1;
+            }
+        })
+    });
 }
 
 /// Every function a block calls, in order, with repeats.

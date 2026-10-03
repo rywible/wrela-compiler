@@ -1,0 +1,66 @@
+// rejects: trait.items
+trait Base {
+    fn base(self) -> i32
+}
+
+trait Sub: Base {
+    fn sub(self) -> i32
+}
+
+trait Shape {
+    fn area(self) -> f32
+}
+
+trait Has {
+    type K: Shape
+
+    fn get(self) -> Self::K
+}
+
+struct S: Copy + Clone {
+    x: i32,
+}
+
+// `S` doesn't implement `Base`.
+impl Sub for S { //~ E0400
+    fn sub(self) -> i32 {
+        self.x
+    }
+}
+
+// `i32` doesn't implement `Shape`.
+impl Has for S { //~ E0400
+    type K = i32
+
+    fn get(self) -> i32 {
+        self.x
+    }
+}
+
+struct T: Copy + Clone {
+    x: i32,
+}
+
+impl Base for T {
+    fn base(self) -> i32 {
+        self.x
+    }
+
+    fn base(self) -> i32 { //~ E0201
+        self.x + 1
+    }
+}
+
+impl T { //~ E0402
+    type Out = bool
+
+    fn a(self) -> i32 {
+        self.x
+    }
+}
+
+impl T {
+    fn a(self) -> i32 { //~ E0201
+        self.x + 100
+    }
+}

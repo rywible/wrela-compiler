@@ -5,7 +5,8 @@ use std::fmt::Write;
 
 pub fn print(m: &Module) -> String {
     let mut s = String::new();
-    for (i, (_, d)) in m.types.iter().enumerate() {
+    for (t, d) in m.types.iter() {
+        let i = t.0;
         if let TypeDef::Struct { name, fields } = d {
             let fs: Vec<String> =
                 fields.iter().map(|(n, t)| format!("{n}: {}", m.types.display(*t))).collect();
@@ -31,6 +32,9 @@ pub fn print(m: &Module) -> String {
             r.kind,
             m.types.display(r.ty)
         );
+    }
+    for (i, d) in m.data.iter().enumerate() {
+        let _ = writeln!(s, "data d{i} {}: {} = {:?}", d.name, m.types.display(d.ty), d.value);
     }
     for e in &m.entry_points {
         let _ = writeln!(
@@ -80,6 +84,7 @@ fn place(p: &Place) -> String {
         PlaceRoot::Param(i) => format!("p{i}"),
         PlaceRoot::Resource(r) => format!("r{}", r.0),
         PlaceRoot::Ptr(v) => format!("*v{}", v.0),
+        PlaceRoot::Data(d) => format!("d{}", d.0),
     };
     for proj in &p.path {
         match proj {

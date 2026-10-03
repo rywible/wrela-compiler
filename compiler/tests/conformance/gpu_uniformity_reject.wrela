@@ -1,0 +1,59 @@
+// rejects: gpu.uniformity
+// Derivatives where neighbouring pixels may have taken different branches: inside a branch on
+// a value that differs between pixels, after an early `return` (in a function the shader calls
+// too), and after a `break` in a loop.
+use std::gpu::{ClipPosition, FragCoord, VertexIndex, begin_screen_pass, draw, present}
+
+@vertex
+fn cover(v: VertexIndex) -> ClipPosition {
+    let x = if v.index == 1 { 3.0 } else { -1.0 }
+    let y = if v.index == 2 { 3.0 } else { -1.0 }
+    ClipPosition { position: vec4(x, y, 0.0, 1.0) }
+}
+
+fn edge(d: f32) -> vec4 {
+    if d > 0.0 {
+        return vec4(0.0)
+    }
+    vec4(fwidth(d)) //~ E0608
+}
+
+@fragment
+fn helper(pixel: FragCoord) -> vec4 {
+    edge(pixel.position.x - 8.0)
+}
+
+@fragment
+fn inside(pixel: FragCoord) -> vec4 {
+    let c = if pixel.position.x < 8.0 { dpdx(pixel.position.y) } else { 0.0 } //~ E0608
+    vec4(c)
+}
+
+@fragment
+fn early(pixel: FragCoord) -> vec4 {
+    let d = pixel.position.x - 8.0
+    if d > 0.0 {
+        return vec4(1.0)
+    }
+    vec4(dpdy(d)) //~ E0608
+}
+
+@fragment
+fn after_break(pixel: FragCoord) -> vec4 {
+    var x = pixel.position.x
+    var n: u32 = 0
+    while n < 4 {
+        if x > 8.0 {
+            break
+        }
+        x = x + fwidth(x) //~ E0608
+        n += 1
+    }
+    vec4(x)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    begin_screen_pass(clear: vec4(0.0, 0.0, 0.0, 1.0))
+    draw(cover, helper, vertices: 3)
+    present()
+}

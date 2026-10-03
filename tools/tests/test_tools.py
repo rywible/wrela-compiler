@@ -3,14 +3,13 @@
     python3 -m unittest discover -s tools/tests
 """
 
-import http.server
+import json
 import os
 import shutil
 import signal
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 import unittest
 import urllib.error
@@ -22,6 +21,7 @@ TOOLS = os.path.dirname(TESTS)
 ROOT = os.path.dirname(TOOLS)
 sys.path.insert(0, TOOLS)
 
+import headless  # noqa: E402
 import serve  # noqa: E402
 
 
@@ -33,16 +33,29 @@ def alive(pid):
         return False
 
 
-class HeadlessTest(unittest.TestCase):
+class PageDir:
+    """Mixin: each test gets a page directory in the repo, `page_dir` (`page` relative to the
+    repo root), removed afterwards."""
+
     def setUp(self):
-        self.tmp = tempfile.mkdtemp()  # the lock and the fake's notes; TMPDIR isolates the lock
+        super().setUp()
         self.page_dir = tempfile.mkdtemp(prefix=".test-page-", dir=TOOLS)
         self.page = os.path.relpath(self.page_dir, ROOT)
-        self.child_pid_file = os.path.join(self.tmp, "child.pid")
 
     def tearDown(self):
         shutil.rmtree(self.page_dir, ignore_errors=True)
+        super().tearDown()
+
+
+class HeadlessTest(PageDir, unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        self.tmp = tempfile.mkdtemp()  # the lock and the fake's notes; TMPDIR isolates the lock
+        self.child_pid_file = os.path.join(self.tmp, "child.pid")
+
+    def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
+        super().tearDown()
 
     def start(self, mode, timeout="20", **env):
         env = {
@@ -91,7 +104,10 @@ class HeadlessTest(unittest.TestCase):
         status, out, err = self.run_headless("ok")
         self.assertEqual(status, 0, err)
         with open(os.path.join(self.page_dir, "results", "console.log")) as f:
-            self.assertEqual(f.read(), '"hello from the page"\n')
+            self.assertEqual(
+                f.read(),
+                "hello from the page\npipeline `p` failed to build:\n3:5: unresolved identifier\n",
+            )
         self.assertIn("hello from the page", out)
         self.assert_chrome_gone()
 
@@ -168,28 +184,96 @@ class HeadlessTest(unittest.TestCase):
             self.assertIn(message, r.stderr)
 
 
-class ServeTest(unittest.TestCase):
+class LockPathTest(unittest.TestCase):
+    # runtime/native/src/lock.rs follows the same rule; its test checks the same three cases.
+    def test_the_lock_is_in_tmpdir_else_home(self):
+        home = os.path.expanduser("~")
+        self.assertEqual(headless.lock_path({"TMPDIR": "/t/x"}), "/t/x/wrela-gpu.lock")
+        self.assertEqual(headless.lock_path({"TMPDIR": ""}), os.path.join(home, ".wrela-gpu.lock"))
+        self.assertEqual(headless.lock_path({}), os.path.join(home, ".wrela-gpu.lock"))
+
+
+class ConsoleTest(unittest.TestCase):
+    def test_every_line_of_each_message_is_kept(self):
+        # As Chrome 141 writes them, with another record between.
+        chrome_log = (
+            '[84636:49385518:1002/224334.934267:INFO:CONSOLE:2] "first line\n'
+            "second line\n"
+            'third line", source: file:///p.html (2)\n'
+            '[84636:49385518:1002/224334.934420:INFO:CONSOLE:3] "Error: boom\n'
+            '    at file:///p.html:3:15", source: file:///p.html (3)\n'
+            "[84644:49385619:1002/224338.025990:ERROR:ui/display/mac/cv_display_link_mac.mm:188] "
+            "CVDisplayLinkCreateWithCGDisplay failed.\n"
+            '[84636:49385518:1002/224334.934461:INFO:CONSOLE:5] "trailing, source: fake (1)\n'
+            'last", source: file:///p.html (5)\n'
+            '[84636:49385518:1002/224334.934444:INFO:CONSOLE:4] "cut off\n'
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            log, out = os.path.join(tmp, "chrome.log"), os.path.join(tmp, "console.log")
+            with open(log, "w") as f:
+                f.write(chrome_log)
+            lines = headless.extract_console(log, out)
+            with open(out) as f:
+                written = f.read()
+        expected = [
+            "first line",
+            "second line",
+            "third line",
+            "Error: boom",
+            "    at file:///p.html:3:15",
+            "trailing, source: fake (1)",
+            "last",
+            "cut off",
+        ]
+        self.assertEqual(lines, expected)
+        self.assertEqual(written, "".join(line + "\n" for line in expected))
+
+
+class ScoreTest(unittest.TestCase):
+    def test_partial_attempts_and_stray_files(self):
+        with open(os.path.join(TOOLS, "agent-test", "tasks.json")) as f:
+            first = json.load(f)[0]["id"]
+        with tempfile.TemporaryDirectory() as run:
+            attempts = os.path.join(run, first, "attempts")
+
+            def write(n, name, text):
+                os.makedirs(os.path.join(attempts, n), exist_ok=True)
+                with open(os.path.join(attempts, n, name), "w") as f:
+                    f.write(text)
+
+            diags = {"diagnostics": [{"code": "E0301", "severity": "error"}]}
+            write("1", "status", "1\n")
+            write("1", "diagnostics.json", json.dumps(diags))
+            write("2", "diagnostics.json", "")  # stopped while the compiler ran
+            write("3", "status", "0\n")
+            write("3", "diagnostics.json", '{"diagnostics": []}')
+            with open(os.path.join(attempts, ".DS_Store"), "w") as f:
+                f.write("Finder")
+            out = subprocess.run(
+                [sys.executable, os.path.join(TOOLS, "agent-test", "score.py"), run],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout
+        report = json.loads(out)
+        task = next(p for p in report["per_task"] if p["task"] == first)
+        self.assertEqual(task["attempts"], 3)
+        self.assertEqual(task["built_at"], 3)
+        self.assertEqual(task["unfinished"], [2])
+        self.assertEqual(task["codes_per_attempt"], [["E0301"], [], []])
+        self.assertEqual(report["built_eventually"], 1)
+
+
+class ServeTest(PageDir, unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        class Quiet(serve.Handler):
-            def log_message(self, *args):
-                pass
-
-        cls.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Quiet)
-        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+        cls.server = serve.start(serve.QuietHandler)
         cls.base = f"http://127.0.0.1:{cls.server.server_address[1]}"
 
     @classmethod
     def tearDownClass(cls):
         cls.server.shutdown()
         cls.server.server_close()
-
-    def setUp(self):
-        self.page_dir = tempfile.mkdtemp(prefix=".test-page-", dir=TOOLS)
-        self.page = os.path.relpath(self.page_dir, ROOT)
-
-    def tearDown(self):
-        shutil.rmtree(self.page_dir, ignore_errors=True)
 
     def put(self, path, body=b"x"):
         req = urllib.request.Request(f"{self.base}/{path}", data=body, method="PUT")

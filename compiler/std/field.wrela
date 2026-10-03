@@ -84,13 +84,17 @@ pub fn ellipsoid(radii: vec3) -> Ellipsoid {
 impl Surface for Ellipsoid {
     fn distance(self, p: vec3) -> f32 {
         let k0 = length(p / self.radii)
-        let k1 = max(length(p / (self.radii * self.radii)), 0.000000001)
-        k0 * (k0 - 1.0) / k1
+        let k1 = length(p / (self.radii * self.radii))
+        // At the centre the bound is 0 / 0; the distance there is minus the smallest radius.
+        if k1 == 0.0 {
+            return -min(self.radii.x, min(self.radii.y, self.radii.z))
+        }
+        k0 * (k0 - 1.0) / max(k1, 0.000000001)
     }
 }
 
 /// The hull of two spheres, centred at `a` with radius `r1` and at `b` with radius `r2`.
-/// Exact.
+/// Exact, also where one sphere holds the other (the hull is then the larger sphere).
 pub struct RoundCone: Copy + Clone + GpuData {
     pub a: vec3,
     pub b: vec3,
@@ -117,24 +121,32 @@ impl Surface for RoundCone {
         let y2 = y * y * l2
         let z2 = z * z * l2
         let k = sign(rr) * rr * rr * x2
-        if sign(z) * a2 * z2 > k {
-            return sqrt(x2 + z2) * il2 - self.r2
+        // a2 <= 0 where |r1 - r2| >= |b - a| (a == b too): one sphere holds the other, and the
+        // hull is the larger one.
+        if a2 <= 0.0 {
+            length(p - select(self.b, self.a, rr >= 0.0)) - max(self.r1, self.r2)
+        } else if sign(z) * a2 * z2 > k {
+            sqrt(x2 + z2) * il2 - self.r2
+        } else if sign(y) * a2 * y2 < k {
+            sqrt(x2 + y2) * il2 - self.r1
+        } else {
+            (sqrt(x2 * a2 * il2) + y * rr) * il2 - self.r1
         }
-        if sign(y) * a2 * y2 < k {
-            return sqrt(x2 + y2) * il2 - self.r1
-        }
-        (sqrt(x2 * a2 * il2) + y * rr) * il2 - self.r1
     }
 }
 
-/// Everything on the negative side of a plane: `dot(p, normal) < offset`.
+/// Everything on the negative side of a plane: `dot(p, normal) < offset`. The distance is
+/// exact when `normal` is a unit vector, as `half_space` makes it.
 pub struct HalfSpace: Copy + Clone + GpuData {
     pub normal: vec3,
     pub offset: f32,
 }
 
+/// The half-space `dot(p, normal) < offset`, for a nonzero `normal` of any length: both are
+/// divided by its length, which leaves the same half-space.
 pub fn half_space(normal: vec3, offset: f32) -> HalfSpace {
-    HalfSpace { normal, offset }
+    let l = length(normal)
+    HalfSpace { normal: normal / l, offset: offset / l }
 }
 
 impl Surface for HalfSpace {
@@ -146,7 +158,7 @@ impl Surface for HalfSpace {
 // ---- combinators --------------------------------------------------------------------------------
 
 /// The smooth minimum of two distances: where they're `k` or more apart it's exactly the
-/// smaller.
+/// smaller. With `k <= 0` it's `min(a, b)`.
 ///
 /// This is the usual polynomial blend, `mix(b, a, h) - k h (1 - h)` with
 /// `h = clamp(0.5 + 0.5 (b - a) / k, 0, 1)`, rearranged (it's the same function, up to
@@ -154,7 +166,8 @@ impl Surface for HalfSpace {
 /// terms that cancel, and its interval is the smaller distance's, less at most `k / 4`.
 pub fn smin(a: f32, b: f32, k: f32) -> f32 {
     let m = max(k - abs(a - b), 0.0)
-    min(a, b) - m * m * (0.25 / k)
+    // The smallest normal f32 keeps `0.25 / k` finite, and `m` is 0 for `k <= 0`.
+    min(a, b) - m * m * (0.25 / max(k, 1.1754944e-38))
 }
 
 pub struct Union<A, B>: Copy + Clone + GpuData {
@@ -223,30 +236,47 @@ pub fn hash_u32(x: u32) -> u32 {
     (h >> 22) ^ h
 }
 
+/// `i32(x)` for a whole number `x`, wrapped to 32 bits as the lattice's hash wraps its
+/// coordinates: `x`'s low 32 bits beyond the i32 range, and 0 for inf or NaN.
+fn lattice_coord(x: f32) -> i32 {
+    if abs(x) < 2147483648.0 {
+        return i32(x)
+    }
+    // Exact: at |x| >= 2^31 an f32 is a multiple of 2^8, and so is this, which is below 2^32.
+    let low = x - 4294967296.0 * floor(x / 4294967296.0)
+    if low == low {
+        i32(u32(low))
+    } else {
+        0
+    }
+}
+
 /// A pseudo-random value in [-1, 1] for an integer lattice point.
 pub fn lattice(x: i32, y: i32, z: i32) -> f32 {
     let h = hash_u32(u32(x).wrapping_add(hash_u32(u32(y).wrapping_add(hash_u32(u32(z))))))
     f32(h) * (2.0 / 4294967295.0) - 1.0
 }
 
-/// Value noise with a quintic fade: in [-1, 1], smooth, one lattice cell per unit.
+/// Value noise with a quintic fade: in [-1, 1], smooth, one lattice cell per unit. NaN where a
+/// coordinate is infinite or NaN.
 pub fn value_noise(p: vec3) -> f32 {
     let fl = floor(p)
-    let ix = i32(fl.x)
-    let iy = i32(fl.y)
-    let iz = i32(fl.z)
+    let ix = lattice_coord(fl.x)
+    let iy = lattice_coord(fl.y)
+    let iz = lattice_coord(fl.z)
     let f = p - fl
     // `saturate` changes no value (the fade maps [0, 1] onto itself), but it tells an interval
     // the fade stays in [0, 1] even across a cell boundary, where `f` alone can't.
     let u = saturate(f * f * f * (f * (f * 6.0 - 15.0) + 10.0))
+    let (jx, jy, jz) = (ix.wrapping_add(1), iy.wrapping_add(1), iz.wrapping_add(1))
     let a = lattice(ix, iy, iz)
-    let b = lattice(ix + 1, iy, iz)
-    let c = lattice(ix, iy + 1, iz)
-    let d = lattice(ix + 1, iy + 1, iz)
-    let e = lattice(ix, iy, iz + 1)
-    let f1 = lattice(ix + 1, iy, iz + 1)
-    let g = lattice(ix, iy + 1, iz + 1)
-    let h = lattice(ix + 1, iy + 1, iz + 1)
+    let b = lattice(jx, iy, iz)
+    let c = lattice(ix, jy, iz)
+    let d = lattice(jx, jy, iz)
+    let e = lattice(ix, iy, jz)
+    let f1 = lattice(jx, iy, jz)
+    let g = lattice(ix, jy, jz)
+    let h = lattice(jx, jy, jz)
     mix(mix(mix(a, b, u.x), mix(c, d, u.x), u.y), mix(mix(e, f1, u.x), mix(g, h, u.x), u.y), u.z)
 }
 

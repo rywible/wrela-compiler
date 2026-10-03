@@ -2,7 +2,8 @@
 
 use super::{Failed, PResult, Parser, describe};
 use crate::ast::*;
-use crate::token::TokenKind as T;
+use crate::lexer::{float_value, int_value};
+use crate::token::{Token, TokenKind as T};
 use wrela_diag::{Diagnostic, Span, codes};
 
 /// Whether a struct literal may appear here (the `_ns` rules of the grammar exclude it, and
@@ -14,8 +15,18 @@ pub(crate) enum Ctx {
 }
 
 impl<'a> Parser<'a> {
-    fn expr_node(&mut self, kind: ExprKind, span: Span) -> Expr {
-        Expr { kind, span }
+    /// The literal a token is: a number, a string, `true` or `false`.
+    fn lit_of(&self, t: Token) -> Lit {
+        let text = self.text_of(t.span);
+        let kind = match t.kind {
+            T::Int => LitKind::Int(int_value(text)),
+            T::Float => LitKind::Float(float_value(text)),
+            T::Suffixed => LitKind::Suffixed,
+            T::Str => LitKind::Str,
+            T::True => LitKind::Bool(true),
+            _ => LitKind::Bool(false),
+        };
+        Lit { kind, text: text.to_string(), span: t.span }
     }
 
     // ---- blocks and statements -------------------------------------------------------------
@@ -29,9 +40,6 @@ impl<'a> Parser<'a> {
         let open = self.expect(T::LBrace, "`{`")?.span;
         self.closers.push(T::RBrace);
         let stmts = self.block_stmts();
-        if self.lost_breaks == Some(self.closers.len()) {
-            self.lost_breaks = None;
-        }
         self.closers.pop();
         if self.at(T::Eof) {
             self.error(
@@ -53,18 +61,12 @@ impl<'a> Parser<'a> {
             match self.parse_stmt() {
                 Ok(s) => {
                     stmts.push(s);
-                    // After a mismatched closer (E0102), the lexer still counts the bracket it
-                    // didn't close as open, so a line break may have made no NEWLINE: it
-                    // separates statements all the same, to the end of this block (L19).
-                    let lost = self.lost_breaks == Some(self.closers.len())
-                        && self.tok().line_break_before;
-                    if !self.at_sep() && !self.at(T::RBrace) && !lost {
+                    if !self.at_sep() && !self.at(T::RBrace) {
                         self.stmt_sep_error();
                         let rest = self.span();
                         self.recover_to_sep();
                         let span = self.since(rest);
-                        let e = Expr { kind: ExprKind::Error, span };
-                        stmts.push(Stmt { kind: StmtKind::Expr(e), span });
+                        stmts.push(Stmt { kind: StmtKind::Expr(Expr::error(span)), span });
                     }
                 }
                 Err(Failed) => {
@@ -72,8 +74,7 @@ impl<'a> Parser<'a> {
                     // there.
                     self.recover_to_sep();
                     let span = self.since(start);
-                    let e = Expr { kind: ExprKind::Error, span };
-                    stmts.push(Stmt { kind: StmtKind::Expr(e), span });
+                    stmts.push(Stmt { kind: StmtKind::Expr(Expr::error(span)), span });
                 }
             }
             self.skip_seps();
@@ -93,7 +94,7 @@ impl<'a> Parser<'a> {
             self.error(Diagnostic::new(codes::E0100, t.span, "`else` without an `if`"));
             return;
         }
-        if t.kind.is_binary_operator() || t.kind == T::Eq {
+        if BinOp::from_token(t.kind).is_some() || t.kind == T::Eq {
             self.error(Diagnostic::new(
                 codes::E0100,
                 t.span,
@@ -111,7 +112,7 @@ impl<'a> Parser<'a> {
             T::Let => {
                 self.bump();
                 let pat = self.parse_pattern()?;
-                let ty = if self.eat(T::Colon) { Some(self.parse_type()?) } else { None };
+                let ty = self.opt_colon_type()?;
                 self.expect_bind_eq()?;
                 // A value that fails to parse leaves the binding, so its uses still resolve.
                 let init = self.expr_or_error(Self::parse_expr);
@@ -147,7 +148,7 @@ impl<'a> Parser<'a> {
                 let body = self.parse_block()?;
                 StmtKind::For { mutable, pat, iter, body }
             }
-            k if k.is_binary_operator()
+            k if BinOp::from_token(k).is_some()
                 && !matches!(k, T::Minus | T::Pipe | T::OrOr | T::Amp | T::AndAnd) =>
             {
                 let t = self.tok();
@@ -157,24 +158,46 @@ impl<'a> Parser<'a> {
                     format!("a line can't start with the binary operator {}", describe(k)),
                 )
                 .with_note("a line break ends a statement; an operator that continues an expression goes at the end of the line before (D-079)");
-                if t.line_break_before && self.pos >= 2 {
-                    // Move the operator to the end of the previous line.
-                    let prev = self.tokens[self.pos - 2].span; // the token before the NEWLINE
+                // The line before must end in an operand: a NEWLINE comes only after a token that
+                // can end a statement (L17), and those that aren't operands can't take one.
+                let before = self.tokens[..self.pos].iter().rev().nth(1).copied();
+                let after_operand = self.pos >= 2
+                    && self.tokens[self.pos - 1].kind == T::Newline
+                    && before.is_some_and(|b| {
+                        b.kind.can_end_statement()
+                            && !matches!(
+                                b.kind,
+                                T::Return | T::Break | T::Continue | T::Gt | T::Shr
+                            )
+                    });
+                if let Some(prev) = before.filter(|_| after_operand) {
                     let op = self.text_of(t.span).to_string();
-                    let ws_end = self.tokens.get(self.pos + 1).map_or(t.span.end, |n| n.span.start);
-                    d = d.with_fix_edits(
-                        format!("put `{op}` at the end of the previous line"),
-                        vec![
-                            wrela_diag::Edit {
-                                span: prev.shrink_to_end(),
-                                replacement: format!(" {op}"),
-                            },
-                            wrela_diag::Edit {
-                                span: Span::new(self.file, t.span.start, ws_end),
-                                replacement: String::new(),
-                            },
-                        ],
-                    );
+                    if matches!(k, T::Gt | T::Shr) {
+                        // `>` and `>>` can't end a line (L20): the two lines are joined.
+                        d = d.with_fix_edits("join the lines", self.join_lines(prev.span, t.span));
+                    } else {
+                        // Move the operator to the end of the previous line. A comment after it
+                        // stays where it is.
+                        let rest = &self.text[t.span.end as usize..];
+                        let spaces = rest.len() - rest.trim_start_matches([' ', '\t']).len();
+                        d = d.with_fix_edits(
+                            format!("put `{op}` at the end of the previous line"),
+                            vec![
+                                wrela_diag::Edit {
+                                    span: prev.span.shrink_to_end(),
+                                    replacement: format!(" {op}"),
+                                },
+                                wrela_diag::Edit {
+                                    span: Span::new(
+                                        self.file,
+                                        t.span.start,
+                                        t.span.end + spaces as u32,
+                                    ),
+                                    replacement: String::new(),
+                                },
+                            ],
+                        );
+                    }
                 }
                 self.error(d);
                 return Err(Failed);
@@ -182,7 +205,7 @@ impl<'a> Parser<'a> {
             _ => {
                 // An expression, or an assignment whose target is a postfix expression.
                 let e = self.parse_expr()?;
-                if let Some(op) = self.assign_op() {
+                if let Some(op) = AssignOp::from_token(self.kind()) {
                     if !is_postfix_shaped(&e) {
                         let t = self.tok();
                         self.error(Diagnostic::new(
@@ -222,28 +245,10 @@ impl<'a> Parser<'a> {
     fn parse_named_bind(&mut self, kind: VarKind) -> PResult<StmtKind> {
         self.bump();
         let name = self.ident("a name")?;
-        let ty = if self.eat(T::Colon) { Some(self.parse_type()?) } else { None };
+        let ty = self.opt_colon_type()?;
         self.expect_bind_eq()?;
         let init = self.expr_or_error(Self::parse_expr);
         Ok(StmtKind::Var { kind, name, ty, init })
-    }
-
-    fn assign_op(&self) -> Option<AssignOp> {
-        Some(match self.kind() {
-            T::Eq => AssignOp::Assign,
-            T::PlusEq => AssignOp::Add,
-            T::MinusEq => AssignOp::Sub,
-            T::StarEq => AssignOp::Mul,
-            T::SlashEq => AssignOp::Div,
-            T::PercentEq => AssignOp::Rem,
-            T::StarStarEq => AssignOp::Pow,
-            T::AmpEq => AssignOp::BitAnd,
-            T::PipeEq => AssignOp::BitOr,
-            T::CaretEq => AssignOp::BitXor,
-            T::ShlEq => AssignOp::Shl,
-            T::ShrEq => AssignOp::Shr,
-            _ => return None,
-        })
     }
 
     // ---- expressions -----------------------------------------------------------------------
@@ -265,15 +270,15 @@ impl<'a> Parser<'a> {
                     let start = self.bump().span;
                     let value =
                         if self.starts_expr() { Some(Box::new(self.parse_expr()?)) } else { None };
-                    return Ok(self.expr_node(ExprKind::Return(value), start.to(self.prev_span())));
+                    return Ok(Expr::new(ExprKind::Return(value), start.to(self.prev_span())));
                 }
                 T::Break => {
                     let s = self.bump().span;
-                    return Ok(self.expr_node(ExprKind::Break, s));
+                    return Ok(Expr::new(ExprKind::Break, s));
                 }
                 T::Continue => {
                     let s = self.bump().span;
-                    return Ok(self.expr_node(ExprKind::Continue, s));
+                    return Ok(Expr::new(ExprKind::Continue, s));
                 }
                 _ => {}
             }
@@ -321,15 +326,12 @@ impl<'a> Parser<'a> {
                 T::Pipe,
                 |p| {
                     let name = p.ident("a closure parameter")?;
-                    let ty = if p.eat(T::Colon) { Some(p.parse_type()?) } else { None };
+                    let ty = p.opt_colon_type()?;
                     Ok(ClosureParam { name, ty })
                 },
                 |p, first, span| {
                     let name = p.name_at(first)?;
-                    Some(ClosureParam {
-                        name,
-                        ty: Some(TypeExpr { kind: TypeExprKind::Error, span }),
-                    })
+                    Some(ClosureParam { name, ty: Some(TypeExpr::error(span)) })
                 },
             );
             self.close_list(T::Pipe, "`,` or `|`");
@@ -338,53 +340,42 @@ impl<'a> Parser<'a> {
             let ty = self.parse_type()?;
             let b = self.parse_block()?;
             let span = b.span;
-            (Some(ty), self.expr_node(ExprKind::Block(b), span))
+            (Some(ty), Expr::new(ExprKind::Block(b), span))
         } else {
             (None, self.parse_expr()?)
         };
-        Ok(self.expr_node(
+        Ok(Expr::new(
             ExprKind::Closure { params, ret, body: Box::new(body) },
             start.to(self.prev_span()),
         ))
     }
 
-    /// Binary levels, loosest first: `||`, `&&`, comparisons (non-chaining), `|`, `^`, `&`,
-    /// shifts, `+ -`, `* / %`.
+    /// Binary levels ([`BinOp::precedence`]), loosest first: `||`, `&&`, comparisons
+    /// (non-chaining), `|`, `^`, `&`, shifts, `+ -`, `* / %`.
     fn parse_binary(&mut self, level: usize, ctx: Ctx) -> PResult<Expr> {
         const LEVELS: usize = 9;
         if level == LEVELS {
             return self.parse_unary(ctx);
         }
         let mut lhs = self.parse_binary(level + 1, ctx)?;
-        loop {
-            let op = match (level, self.kind()) {
-                (0, T::OrOr) => BinOp::Or,
-                (1, T::AndAnd) => BinOp::And,
-                (2, T::EqEq) => BinOp::Eq,
-                (2, T::Ne) => BinOp::Ne,
-                (2, T::Lt) => BinOp::Lt,
-                (2, T::Le) => BinOp::Le,
-                (2, T::Gt) => BinOp::Gt,
-                (2, T::Ge) => BinOp::Ge,
-                (3, T::Pipe) => BinOp::BitOr,
-                (4, T::Caret) => BinOp::BitXor,
-                (5, T::Amp) => BinOp::BitAnd,
-                (6, T::Shl) => BinOp::Shl,
-                (6, T::Shr) => BinOp::Shr,
-                (7, T::Plus) => BinOp::Add,
-                (7, T::Minus) => BinOp::Sub,
-                (8, T::Star) => BinOp::Mul,
-                (8, T::Slash) => BinOp::Div,
-                (8, T::Percent) => BinOp::Rem,
-                _ => break,
-            };
+        let mut links = 0;
+        while let Some(op) =
+            BinOp::from_token(self.kind()).filter(|op| usize::from(op.precedence()) == level)
+        {
+            // Each operator makes the tree a level deeper; a chain is built in a loop, not by
+            // recursion, so the nesting limit doesn't see it.
+            links += 1;
+            if links > super::MAX_EXPR_DEPTH {
+                self.too_deep_error(lhs.span.shrink_to_start());
+                return Err(Failed);
+            }
             self.bump();
             let rhs = self.parse_binary(level + 1, ctx)?;
             let span = lhs.span.to(rhs.span);
-            lhs = self.expr_node(ExprKind::Binary(op, Box::new(lhs), Box::new(rhs)), span);
+            lhs = Expr::new(ExprKind::Binary(op, Box::new(lhs), Box::new(rhs)), span);
             if level == 2 {
                 // cmp_expr ::= bitor_expr (cmp_op bitor_expr)?
-                if matches!(self.kind(), T::EqEq | T::Ne | T::Lt | T::Le | T::Gt | T::Ge) {
+                if BinOp::from_token(self.kind()).is_some_and(BinOp::is_comparison) {
                     let t = self.tok();
                     // `a < x < b` means `a < x && x < b`: repeat the middle operand.
                     let mid = match &lhs.kind {
@@ -435,7 +426,7 @@ impl<'a> Parser<'a> {
                 T::Take => ExprKind::Take(inner),
                 _ => ExprKind::MutArg(inner),
             };
-            return Ok(self.expr_node(k, span));
+            return Ok(Expr::new(k, span));
         }
         if matches!(kind, T::Amp | T::AndAnd) {
             self.error(
@@ -453,11 +444,12 @@ impl<'a> Parser<'a> {
     fn parse_power(&mut self, ctx: Ctx) -> PResult<Expr> {
         let base = self.parse_postfix(ctx)?;
         if self.eat(T::StarStar) {
-            let exp = self.parse_unary(ctx)?;
+            let exp = self.nested(|p| p.parse_unary(ctx))?;
             let span = base.span.to(exp.span);
-            return Ok(
-                self.expr_node(ExprKind::Binary(BinOp::Pow, Box::new(base), Box::new(exp)), span)
-            );
+            return Ok(Expr::new(
+                ExprKind::Binary(BinOp::Pow, Box::new(base), Box::new(exp)),
+                span,
+            ));
         }
         Ok(base)
     }
@@ -467,7 +459,16 @@ impl<'a> Parser<'a> {
     fn parse_postfix(&mut self, ctx: Ctx) -> PResult<Expr> {
         let mut e = self.parse_primary(ctx)?;
         let mut after_field = false;
+        let mut links = 0;
         loop {
+            // As in a chain of binary operators, each link makes the tree a level deeper.
+            if matches!(self.kind(), T::LParen | T::LBracket | T::Dot) {
+                links += 1;
+                if links > super::MAX_EXPR_DEPTH {
+                    self.too_deep_error(e.span.shrink_to_start());
+                    return Err(Failed);
+                }
+            }
             match self.kind() {
                 T::LParen => {
                     if after_field {
@@ -486,8 +487,7 @@ impl<'a> Parser<'a> {
                     }
                     let (args, multiline) = self.parse_call_args()?;
                     let span = e.span.to(self.prev_span());
-                    e = self
-                        .expr_node(ExprKind::Call { callee: Box::new(e), args, multiline }, span);
+                    e = Expr::new(ExprKind::Call { callee: Box::new(e), args, multiline }, span);
                     after_field = false;
                 }
                 T::Question => {
@@ -504,10 +504,10 @@ impl<'a> Parser<'a> {
                 }
                 T::LBracket => {
                     self.bump();
-                    let index = self.parse_expr()?;
+                    let index = self.within(T::RBracket, Self::parse_expr)?;
                     self.expect(T::RBracket, "`]`")?;
                     let span = e.span.to(self.prev_span());
-                    e = self.expr_node(
+                    e = Expr::new(
                         ExprKind::Index { base: Box::new(e), index: Box::new(index) },
                         span,
                     );
@@ -528,7 +528,7 @@ impl<'a> Parser<'a> {
                                 };
                                 let (args, multiline) = self.parse_call_args()?;
                                 let span = e.span.to(self.prev_span());
-                                e = self.expr_node(
+                                e = Expr::new(
                                     ExprKind::MethodCall {
                                         receiver: Box::new(e),
                                         name,
@@ -542,7 +542,7 @@ impl<'a> Parser<'a> {
                                 after_field = false;
                             } else {
                                 let span = e.span.to(name.span);
-                                e = self.expr_node(
+                                e = Expr::new(
                                     ExprKind::Field {
                                         base: Box::new(e),
                                         name: FieldName::Ident(name),
@@ -557,24 +557,22 @@ impl<'a> Parser<'a> {
                             let text = self.text_of(t.span);
                             // field_access ::= "." (IDENT | INT): any INT is a tuple index
                             // (`t.0x1` is `t.1`, `t.1_0` is `t.10`); only its value is checked.
-                            let value = crate::lexer::int_value(text);
-                            let name = match value.and_then(|v| u32::try_from(v).ok()) {
+                            let value = int_value(text);
+                            let name = match value.ok().and_then(|v| u32::try_from(v).ok()) {
                                 Some(n) => FieldName::Index(n, t.span),
+                                // A malformed number (`0x`) has its error from the lexer.
+                                None if value == IntValue::Malformed => FieldName::BadIndex(t.span),
                                 None => {
-                                    // A malformed number (`0x`) has its error from the lexer.
-                                    let lexed = self.diags.iter().any(|d| d.span() == Some(t.span));
-                                    if !lexed {
-                                        self.error(Diagnostic::new(
-                                            codes::E0006,
-                                            t.span,
-                                            format!("`{text}` is too large for a tuple index"),
-                                        ));
-                                    }
+                                    self.error(Diagnostic::new(
+                                        codes::E0006,
+                                        t.span,
+                                        format!("`{text}` is too large for a tuple index"),
+                                    ));
                                     FieldName::BadIndex(t.span)
                                 }
                             };
                             let span = e.span.to(t.span);
-                            e = self.expr_node(ExprKind::Field { base: Box::new(e), name }, span);
+                            e = Expr::new(ExprKind::Field { base: Box::new(e), name }, span);
                             after_field = true;
                         }
                         _ => return Err(self.expected("a field or method name after `.`")),
@@ -604,10 +602,7 @@ impl<'a> Parser<'a> {
                 let value = p.parse_expr()?;
                 Ok(Arg { name, value, span: start.to(p.prev_span()) })
             },
-            |p, first, span| {
-                let value = Expr { kind: ExprKind::Error, span };
-                Some(Arg { name: p.name_at(first), value, span })
-            },
+            |p, first, span| Some(Arg { name: p.name_at(first), value: Expr::error(span), span }),
         );
         self.close_list(T::RParen, "`,` or `)`");
         // Positional arguments come first (D-039); the call is an error otherwise.
@@ -641,16 +636,7 @@ impl<'a> Parser<'a> {
         match t.kind {
             T::Int | T::Float | T::Suffixed | T::Str | T::True | T::False => {
                 self.bump();
-                let kind = match t.kind {
-                    T::Int => LitKind::Int,
-                    T::Float => LitKind::Float,
-                    T::Suffixed => LitKind::Suffixed,
-                    T::Str => LitKind::Str,
-                    T::True => LitKind::Bool(true),
-                    _ => LitKind::Bool(false),
-                };
-                let lit = Lit { kind, text: self.text_of(t.span).to_string(), span: t.span };
-                Ok(self.expr_node(ExprKind::Lit(lit), t.span))
+                Ok(Expr::new(ExprKind::Lit(self.lit_of(t)), t.span))
             }
             T::Unsafe if self.nth(1) == T::LBrace => {
                 // `unsafe` is for the stdlib's core, in tier 1: say so, and read the block.
@@ -661,7 +647,7 @@ impl<'a> Parser<'a> {
                 );
                 let b = self.parse_block()?;
                 let span = u.span.to(b.span);
-                Ok(self.expr_node(ExprKind::Block(b), span))
+                Ok(Expr::new(ExprKind::Block(b), span))
             }
             T::Ident | T::SelfType | T::SelfValue => {
                 let path = self.parse_path_expr()?;
@@ -669,32 +655,32 @@ impl<'a> Parser<'a> {
                     return self.parse_struct_literal(path);
                 }
                 let span = path.span;
-                Ok(self.expr_node(ExprKind::Path(path), span))
+                Ok(Expr::new(ExprKind::Path(path), span))
             }
             T::LParen => {
                 self.bump();
                 let mut items =
-                    self.list(T::RParen, Self::parse_expr, |_, _, span| Some(error_expr(span)));
+                    self.list(T::RParen, Self::parse_expr, |_, _, span| Some(Expr::error(span)));
                 let trailing = self.tokens[self.pos - 1].kind == T::Comma;
                 self.close_list(T::RParen, "`,` or `)`");
                 let span = t.span.to(self.prev_span());
                 if items.len() == 1 && !trailing {
                     let inner = items.pop().ok_or(Failed)?;
-                    Ok(self.expr_node(ExprKind::Paren(Box::new(inner)), span))
+                    Ok(Expr::new(ExprKind::Paren(Box::new(inner)), span))
                 } else {
-                    Ok(self.expr_node(ExprKind::Tuple(items), span))
+                    Ok(Expr::new(ExprKind::Tuple(items), span))
                 }
             }
             T::LBracket => {
                 self.bump();
                 let mut items = Vec::new();
                 if !self.at(T::RBracket) {
-                    let first = self.parse_expr()?;
+                    let first = self.within(T::RBracket, Self::parse_expr)?;
                     if self.eat(T::Semi) {
-                        let count = self.parse_expr()?;
+                        let count = self.within(T::RBracket, Self::parse_expr)?;
                         self.expect(T::RBracket, "`]`")?;
                         let span = t.span.to(self.prev_span());
-                        return Ok(self.expr_node(
+                        return Ok(Expr::new(
                             ExprKind::ArrayRepeat {
                                 value: Box::new(first),
                                 count: Box::new(count),
@@ -705,18 +691,18 @@ impl<'a> Parser<'a> {
                     items.push(first);
                     if self.eat(T::Comma) {
                         items.extend(self.list(T::RBracket, Self::parse_expr, |_, _, span| {
-                            Some(error_expr(span))
+                            Some(Expr::error(span))
                         }));
                     }
                 }
                 self.close_list(T::RBracket, "`,` or `]`");
                 let span = t.span.to(self.prev_span());
-                Ok(self.expr_node(ExprKind::Array(items), span))
+                Ok(Expr::new(ExprKind::Array(items), span))
             }
             T::LBrace => {
                 let b = self.parse_block()?;
                 let span = b.span;
-                Ok(self.expr_node(ExprKind::Block(b), span))
+                Ok(Expr::new(ExprKind::Block(b), span))
             }
             T::If => self.parse_if(),
             T::Match => self.parse_match(),
@@ -743,7 +729,7 @@ impl<'a> Parser<'a> {
                 T::Ident => self.ident("a name")?,
                 T::SelfType | T::SelfValue => {
                     self.bump();
-                    Ident { name: self.text_of(t.span).to_string(), span: t.span }
+                    self.ident_of(t)
                 }
                 _ => return Err(self.expected("a name")),
             };
@@ -790,13 +776,13 @@ impl<'a> Parser<'a> {
             },
             |p, first, span| {
                 let name = p.name_at(first)?;
-                Some(Some(FieldInit { name, value: Some(error_expr(span)), span }))
+                Some(Some(FieldInit { name, value: Some(Expr::error(span)), span }))
             },
         );
         let fields: Vec<FieldInit> = fields.into_iter().flatten().collect();
         let close = self.close_list(T::RBrace, "`,` or `}`");
         let span = path.span.to(close);
-        Ok(self.expr_node(ExprKind::StructLit { path, fields, base, multiline }, span))
+        Ok(Expr::new(ExprKind::StructLit { path, fields, base, multiline }, span))
     }
 
     /// if_expr ::= "if" expr_ns block ("else" (if_expr | block))?
@@ -809,7 +795,7 @@ impl<'a> Parser<'a> {
         let then = self.parse_block()?;
         let misplaced = self.at(T::Newline) && self.nth(1) == T::Else;
         if misplaced {
-            let nl = self.tok().span;
+            let close = self.prev_span();
             let els = self.tokens[self.pos + 1].span;
             self.error(
                 Diagnostic::new(
@@ -818,27 +804,23 @@ impl<'a> Parser<'a> {
                     "`else` must be on the same line as the `}` before it",
                 )
                 .with_note("a line break after `}` ends the `if` statement (L20)")
-                .with_fix(
-                    "join the lines",
-                    Span::new(self.file, nl.start, els.start),
-                    " ",
-                ),
+                .with_fix_edits("join the lines", self.join_lines(close, els)),
             );
             // Read on as if the lines were joined, so nothing else is reported for it.
             self.bump();
         }
         let else_ = if self.eat(T::Else) {
             if self.at(T::If) {
-                Some(Box::new(self.parse_if()?))
+                Some(Box::new(self.nested(Self::parse_if)?))
             } else {
                 let b = self.parse_block()?;
                 let span = b.span;
-                Some(Box::new(self.expr_node(ExprKind::Block(b), span)))
+                Some(Box::new(Expr::new(ExprKind::Block(b), span)))
             }
         } else {
             None
         };
-        Ok(self.expr_node(
+        Ok(Expr::new(
             ExprKind::If { cond: Box::new(cond), then, else_ },
             start.to(self.prev_span()),
         ))
@@ -850,6 +832,7 @@ impl<'a> Parser<'a> {
         let scrutinee = self.parse_expr_ctx(Ctx::NoStruct)?;
         self.expect(T::LBrace, "`{`")?;
         let mut arms = Vec::new();
+        self.closers.push(T::RBrace);
         while !self.at(T::RBrace) && !self.at(T::Eof) {
             let arm_start = self.span();
             let arm = (|| -> PResult<Arm> {
@@ -870,16 +853,17 @@ impl<'a> Parser<'a> {
                     // the cases it covered.
                     self.recover_in_list(T::RBrace);
                     let span = self.since(arm_start);
-                    let pat = Pat { kind: PatKind::Error, span };
-                    arms.push(Arm { pats: vec![pat], guard: None, body: error_expr(span), span });
+                    let body = Expr::error(span);
+                    arms.push(Arm { pats: vec![Pat::error(span)], guard: None, body, span });
                 }
             }
             if !(self.eat(T::Comma) || self.eat(T::Newline)) {
                 break;
             }
         }
+        self.closers.pop();
         self.close_list(T::RBrace, "`,`, a line break or `}`");
-        Ok(self.expr_node(
+        Ok(Expr::new(
             ExprKind::Match { scrutinee: Box::new(scrutinee), arms },
             start.to(self.prev_span()),
         ))
@@ -903,31 +887,21 @@ impl<'a> Parser<'a> {
             T::Minus | T::Int | T::Float => {
                 let neg = self.eat(T::Minus);
                 let lt = self.tok();
-                let kind = match lt.kind {
-                    T::Int => LitKind::Int,
-                    T::Float => LitKind::Float,
-                    _ => return Err(self.expected("a number")),
-                };
-                self.bump();
-                PatKind::Lit {
-                    neg,
-                    lit: Lit { kind, text: self.text_of(lt.span).to_string(), span: lt.span },
+                if !matches!(lt.kind, T::Int | T::Float) {
+                    return Err(self.expected("a number"));
                 }
+                self.bump();
+                PatKind::Lit { neg, lit: self.lit_of(lt) }
             }
             T::True | T::False => {
                 self.bump();
-                let kind = LitKind::Bool(t.kind == T::True);
-                PatKind::Lit {
-                    neg: false,
-                    lit: Lit { kind, text: self.text_of(t.span).to_string(), span: t.span },
-                }
+                PatKind::Lit { neg: false, lit: self.lit_of(t) }
             }
             T::Ident | T::SelfType | T::SelfValue => {
                 let path = self.parse_path_expr()?;
                 if self.eat(T::LParen) {
-                    let pats = self.list(T::RParen, Self::parse_pattern, |_, _, span| {
-                        Some(Pat { kind: PatKind::Error, span })
-                    });
+                    let pats = self
+                        .list(T::RParen, Self::parse_pattern, |_, _, span| Some(Pat::error(span)));
                     self.close_list(T::RParen, "`,` or `)`");
                     PatKind::TupleStruct(path, pats)
                 } else if self.at(T::LBrace) {
@@ -950,10 +924,7 @@ impl<'a> Parser<'a> {
                         },
                         |p, first, span| {
                             let name = p.name_at(first)?;
-                            Some(Some(FieldPat {
-                                name,
-                                pat: Some(Pat { kind: PatKind::Error, span }),
-                            }))
+                            Some(Some(FieldPat { name, pat: Some(Pat::error(span)) }))
                         },
                     );
                     let fields = fields.into_iter().flatten().collect();
@@ -967,9 +938,8 @@ impl<'a> Parser<'a> {
             }
             T::LParen => {
                 self.bump();
-                let mut pats = self.list(T::RParen, Self::parse_pattern, |_, _, span| {
-                    Some(Pat { kind: PatKind::Error, span })
-                });
+                let mut pats =
+                    self.list(T::RParen, Self::parse_pattern, |_, _, span| Some(Pat::error(span)));
                 let trailing = self.tokens[self.pos - 1].kind == T::Comma;
                 self.close_list(T::RParen, "`,` or `)`");
                 if pats.len() == 1 && !trailing {
@@ -984,10 +954,6 @@ impl<'a> Parser<'a> {
         };
         Ok(Pat { kind, span: t.span.to(self.prev_span()) })
     }
-}
-
-fn error_expr(span: Span) -> Expr {
-    Expr { kind: ExprKind::Error, span }
 }
 
 /// The grammar's assignment target is a postfix_expr: a primary followed by postfixes.

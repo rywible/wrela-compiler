@@ -2012,6 +2012,7 @@ dependencies = [
 name = "wrela-lower"
 version = "0.1.0"
 dependencies = [
+ "wrela-abi",
  "wrela-diag",
  "wrela-ir",
  "wrela-sema",

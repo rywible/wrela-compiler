@@ -1,0 +1,14 @@
+// mistake: forwarding a projection from a call given a temporary argument
+// expect: E0508
+// fix: no
+struct Row {
+    cells: [f32; 4],
+}
+
+fn cell(r: Row, i: u32) -> borrow f32 {
+    r.cells[i]
+}
+
+fn first(r: Row) -> borrow f32 {
+    cell(r, 0)
+}

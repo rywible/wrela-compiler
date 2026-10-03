@@ -1,0 +1,8 @@
+// mistake: continuing a line with a leading `>`, which can't end a line either
+// expect: E0103
+// fix: yes
+pub fn count(a: i32, b: i32) -> i32 {
+    let more = a // the one we have
+        > b
+    1
+}

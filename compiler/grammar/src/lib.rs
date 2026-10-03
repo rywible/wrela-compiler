@@ -14,6 +14,8 @@
 //!
 //! The binaries: `differential` (the AC run, 10⁶ programs by default), `export-gbnf` (writes
 //! spec/wrela.gbnf) and `gbnf-sample` (checks programs sampled from it).
+//!
+//! [`testing`] holds helpers for tests, shared with the end-to-end tests (`wrela-tests`).
 
 pub mod agree;
 pub mod canon;
@@ -25,3 +27,4 @@ pub mod gbnf;
 pub mod generate;
 pub mod rng;
 pub mod sampler;
+pub mod testing;

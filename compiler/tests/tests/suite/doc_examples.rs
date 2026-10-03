@@ -3,19 +3,10 @@
 //! unchecked, so this fails if one appears: turn the crate's doctests back on.
 
 use std::path::Path;
-use wrela_tests::root;
+use wrela_tests::{files_under, repo_root};
 
 fn rust_examples(dir: &Path, out: &mut Vec<String>) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
-    for e in entries.flatten() {
-        let p = e.path();
-        if p.is_dir() {
-            rust_examples(&p, out);
-            continue;
-        }
-        if p.extension().is_none_or(|x| x != "rs") {
-            continue;
-        }
+    for p in files_under(dir, &["rs"]) {
         let text = std::fs::read_to_string(&p).unwrap_or_default();
         let mut open = false;
         for (i, line) in text.lines().enumerate() {
@@ -45,7 +36,7 @@ fn rust_examples(dir: &Path, out: &mut Vec<String>) {
 fn doc_examples_are_tested() {
     let mut found = Vec::new();
     for group in ["compiler", "runtime"] {
-        for e in std::fs::read_dir(root().join(group)).expect("read").flatten() {
+        for e in std::fs::read_dir(repo_root().join(group)).expect("read").flatten() {
             let manifest = std::fs::read_to_string(e.path().join("Cargo.toml")).unwrap_or_default();
             if manifest.contains("doctest = false") {
                 rust_examples(&e.path().join("src"), &mut found);

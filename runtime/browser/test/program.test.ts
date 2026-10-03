@@ -8,7 +8,7 @@ import { StateHash } from "../src/hash.ts";
 import { StreamError } from "../src/stream.ts";
 import { wasmOffsets } from "../src/lines.ts";
 import { Encoder } from "./encoder.ts";
-import { checker, Recorder, readFixture } from "./fixtures.ts";
+import { checker, Recorder, readFixture, readFixtureText, shapes } from "./fixtures.ts";
 import { batchProgram, buildModule, FRAME_TYPE, op, SUBMIT } from "./wasm-builder.ts";
 
 const U16 = new Uint8Array(16);
@@ -71,6 +71,24 @@ describe("the ABI check", () => {
       "it imports `wrela.memory`",
     );
     await load(buildModule({ memory: 1, funcs: [frameOnly] })); // no imports is fine
+  });
+
+  test("checks each import's own type, not the last one of its name", async () => {
+    const wrongType = { ...SUBMIT, type: { params: ["i64" as const], results: [] } };
+    await rejects(
+      buildModule({ imports: [wrongType, SUBMIT], memory: 1, funcs: [frameOnly] }),
+      "its import `wrela.submit` must be a function (i32, i32) -> (), not a function (i64) -> ()",
+    );
+  });
+
+  test("has no start function", async () => {
+    // It would submit before the host could read its memory.
+    const empty = new Encoder().finish();
+    const start = { type: { params: [], results: [] }, body: [...op.i32(16), ...op.i32(empty.length), ...op.call(0)] };
+    await rejects(
+      buildModule({ imports: [SUBMIT], memory: 1, funcs: [frameOnly, start], data: [{ offset: 16, bytes: empty }], start: 2 }),
+      "invalid program: it has a start function; a wrela program may run only when the host calls it",
+    );
   });
 
   test("needs memory and frame exports", async () => {
@@ -204,6 +222,45 @@ describe("the checks, with the native host's messages", () => {
   });
 });
 
+test("writable aliases and clear colours", async () => {
+  // Pipeline 0 renders and pipeline 1 computes, each binding two read-write buffers.
+  const m = shapes();
+  for (const p of m.pipelines) {
+    p.uniform = null;
+    p.buffers = [
+      { binding: 1, access: "read_write" },
+      { binding: 2, access: "read_write" },
+    ];
+  }
+  const why = async (manifest: typeof m, batch: Uint8Array) => {
+    const program = await Program.load(batchProgram([[batch]]), checker(manifest), new Recorder());
+    try {
+      program.frame(0, 64, 64);
+    } catch (e) {
+      expect(e).toBeInstanceOf(CommandError);
+      return (e as Error).message;
+    }
+    return null;
+  };
+  const none = new Uint8Array(0);
+  expect(await why(m, withBuffers((e) => e.dispatch(1, [1, 1, 1], [1, 1], none)))).toBe(
+    "Dispatch failed: buffer 1 is bound read-write twice in one dispatch",
+  );
+  expect(await why(m, withBuffers((e) => e.beginScreenPass([0, 0, 0, 0]).draw(0, 3, 1, [2, 2], none).present()))).toBe(
+    "Draw failed: buffer 2 is bound read-write twice in one draw",
+  );
+  const apart = withBuffers((e) =>
+    e.beginScreenPass([0, 0, 0, 0]).draw(0, 3, 1, [1, 2], none).draw(0, 3, 1, [2, 1], none).present(),
+  );
+  expect(await why(m, apart)).toBeNull();
+  expect(await why(shapes(), new Encoder().beginScreenPass([NaN, 0.5, 0.25, 1]).present().finish())).toBe(
+    "BeginScreenPass failed: the clear colour's r isn't a finite number",
+  );
+  expect(await why(shapes(), new Encoder().beginScreenPass([0, 0, 0, Infinity]).present().finish())).toBe(
+    "BeginScreenPass failed: the clear colour's a isn't a finite number",
+  );
+});
+
 test("calls other exports", async () => {
   const program = await load(readFixture("game.wasm"));
   for (const [x, want] of [[0, -1], [0.25, 0], [0.5, 1], [0.75, 0], [1.125, -0.5]] as const) {
@@ -213,9 +270,9 @@ test("calls other exports", async () => {
 });
 
 test("first-light's CPU side gives the native host's state hash", async () => {
-  // runtime/native/tests/gpu.rs derives this hash independently (with the Rust reference
-  // encoder) and checks the native host computes it; tests/agreement.rs checks Chrome does.
-  const manifest = parseManifest(new TextDecoder().decode(readFixture("manifest.json")));
+  // runtime/native/tests/suite/gpu.rs derives this hash independently (with the Rust reference
+  // encoder) and checks the native host computes it; suite/agreement.rs checks Chrome does.
+  const manifest = parseManifest(readFixtureText("manifest.json"));
   const program = await Program.load(readFixture("game.wasm"), checker(manifest), new Recorder(), { hash: true });
   for (let i = 0; i < 60; i++) program.frame(i / 60, 640, 360);
   expect(program.hash!.hex()).toBe("affac621a26ab564");

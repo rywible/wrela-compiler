@@ -3,6 +3,7 @@
 use super::{Fe, R, konst, mem};
 use crate::{Helpers, globals, memory};
 use wasm_encoder::{BlockType, Function, Instruction as I, ValType};
+use wrela_abi::stream::Opcode;
 use wrela_ir as ir;
 use wrela_ir::layout::{column_stride, layout, round_up};
 
@@ -90,6 +91,7 @@ float_ops! {
     min => F32Min, F64Min;
     max => F32Max, F64Max;
     neg => F32Neg, F64Neg;
+    copysign => F32Copysign, F64Copysign;
 }
 
 impl Fw {
@@ -181,34 +183,7 @@ fn scalar_bin(fe: &mut Fe, op: ir::BinOp, s: ir::Scalar, a: u32, b: u32) -> R<()
     use ir::BinOp as B;
     let (la, lb) = (I::LocalGet(a), I::LocalGet(b));
     if s.is_float() {
-        let f = Fw::of(s);
-        let i = match op {
-            B::Add => f.add(),
-            B::Sub => f.sub(),
-            B::Mul => f.mul(),
-            B::Div => f.div(),
-            B::Rem => {
-                // a - b * trunc(a / b), as WGSL defines it.
-                fe.ins.extend([
-                    la.clone(),
-                    lb.clone(),
-                    la,
-                    lb,
-                    f.div(),
-                    f.trunc(),
-                    f.mul(),
-                    f.sub(),
-                ]);
-                return Ok(());
-            }
-            B::Eq => f.eq(),
-            B::Ne => f.ne(),
-            B::Lt => f.lt(),
-            B::Le => f.le(),
-            B::Gt => f.gt(),
-            B::Ge => f.ge(),
-            _ => return Err(format!("internal: {op:?} on floats")),
-        };
+        let i = float_op(fe, op, Fw::of(s))?;
         fe.ins.extend([la, lb, i]);
         return Ok(());
     }
@@ -331,22 +306,89 @@ fn scalar_bin(fe: &mut Fe, op: ir::BinOp, s: ir::Scalar, a: u32, b: u32) -> R<()
     Ok(())
 }
 
-// ---- vectors and matrices ---------------------------------------------------------------------
+/// The instruction of float operator `op`: `%` is a call of the `fmod` helper.
+fn float_op(fe: &Fe, op: ir::BinOp, f: Fw) -> R<I<'static>> {
+    use ir::BinOp as B;
+    Ok(match op {
+        B::Add => f.add(),
+        B::Sub => f.sub(),
+        B::Mul => f.mul(),
+        B::Div => f.div(),
+        B::Rem => I::Call(if f.f64_ { fe.helpers.fmod_f64 } else { fe.helpers.fmod_f32 }),
+        B::Eq => f.eq(),
+        B::Ne => f.ne(),
+        B::Lt => f.lt(),
+        B::Le => f.le(),
+        B::Gt => f.gt(),
+        B::Ge => f.ge(),
+        _ => return Err(format!("internal: {op:?} on floats")),
+    })
+}
 
-/// Loads component `c` of vector value `x` into a new f32 local. (Elementwise operations take
-/// operands of one type: the IR splats a scalar next to a vector.)
-fn comp(fe: &mut Fe, x: ir::ValueId, c: u32) -> u32 {
+// ---- vectors and matrices ---------------------------------------------------------------------
+//
+// A component that is read once is loaded where it's used; one that is read more than once is
+// loaded into a local first.
+
+/// Pushes the f32 at byte `off` of aggregate value `x`.
+fn load_f32(fe: &mut Fe, x: ir::ValueId, off: u32) {
+    fe.ins.extend([I::LocalGet(fe.v(x)), I::F32Load(mem(off, 2))]);
+}
+
+/// Pushes the f32 at byte `off` of aggregate `x`, or scalar `x` itself.
+fn elem_or_scalar(fe: &mut Fe, x: ir::ValueId, off: u32) {
+    if fe.m.types.is_aggregate(fe.vty(x)) {
+        load_f32(fe, x, off);
+    } else {
+        fe.ins.push(I::LocalGet(fe.v(x)));
+    }
+}
+
+/// `elem_or_scalar`'s f32 in a local, for code that reads it more than once: a new local, or
+/// scalar `x`'s own.
+fn elem_local(fe: &mut Fe, x: ir::ValueId, off: u32) -> u32 {
+    if !fe.m.types.is_aggregate(fe.vty(x)) {
+        return fe.v(x);
+    }
     let l = fe.new_local(ValType::F32);
-    fe.ins.extend([I::LocalGet(fe.v(x)), I::F32Load(mem(4 * c, 2)), I::LocalSet(l)]);
+    load_f32(fe, x, off);
+    fe.ins.push(I::LocalSet(l));
     l
 }
 
-/// Loads element (column `j`, row `i`) of matrix value `m` of size `n` into a new local.
-fn mat_elem(fe: &mut Fe, m: ir::ValueId, n: u8, j: u32, i: u32) -> u32 {
-    let stride = column_stride(n);
-    let l = fe.new_local(ValType::F32);
-    fe.ins.extend([I::LocalGet(fe.v(m)), I::F32Load(mem(stride * j + 4 * i, 2)), I::LocalSet(l)]);
-    l
+/// The byte offset of the element at column `j`, row `i` of a `matN`.
+fn mat_elem(n: u8, j: u32, i: u32) -> u32 {
+    column_stride(n) * j + 4 * i
+}
+
+/// Pushes the sum of `n` products, each of the two f32s `factors(fe, k)` pushes, added in order:
+/// `((0 + p0) + p1) + ...` from zero, else `(p0 + p1) + ...`. (The two differ when every product
+/// is -0: 0 + -0 is 0.)
+fn sum_of_products(fe: &mut Fe, n: u32, from_zero: bool, mut factors: impl FnMut(&mut Fe, u32)) {
+    if from_zero {
+        fe.ins.push(I::F32Const(0.0f32.into()));
+    }
+    for k in 0..n {
+        factors(fe, k);
+        fe.ins.push(I::F32Mul);
+        if from_zero || k > 0 {
+            fe.ins.push(I::F32Add);
+        }
+    }
+}
+
+/// Pushes the sum of the squares of the `n` components of vector `x`, or of `x - y`, from the
+/// first square.
+fn sum_of_squares(fe: &mut Fe, x: ir::ValueId, minus: Option<ir::ValueId>, n: u32) {
+    let t = fe.new_local(ValType::F32);
+    sum_of_products(fe, n, false, |fe, c| {
+        load_f32(fe, x, 4 * c);
+        if let Some(y) = minus {
+            load_f32(fe, y, 4 * c);
+            fe.ins.push(I::F32Sub);
+        }
+        fe.ins.extend([I::LocalTee(t), I::LocalGet(t)]);
+    });
 }
 
 fn dims(fe: &Fe, t: ir::TypeId) -> Option<(bool, u8)> {
@@ -372,72 +414,41 @@ pub(super) fn binary(
         fe.ins.push(I::LocalSet(fe.v(v)));
         return Ok(());
     }
-    let out = fe.fresh_slot(v)?;
+    // A matrix's columns can have padding; a vector's components are every byte of it.
+    let out = fe.fresh_slot(v, !fe.m.types.is_vector(t))?;
     match (dims(fe, ta), dims(fe, tb), dims(fe, t)) {
         // matrix × vector: r_i = Σ_j m[j][i] v[j]
         (Some((true, n)), Some((false, _)), _) if op == ir::BinOp::Mul => {
             for i in 0..n as u32 {
-                let acc = fe.new_local(ValType::F32);
-                fe.ins.extend([I::F32Const(0.0f32.into()), I::LocalSet(acc)]);
-                for j in 0..n as u32 {
-                    let e = mat_elem(fe, a, n, j, i);
-                    let x = comp(fe, b, j);
-                    fe.ins.extend([
-                        I::LocalGet(acc),
-                        I::LocalGet(e),
-                        I::LocalGet(x),
-                        I::F32Mul,
-                        I::F32Add,
-                        I::LocalSet(acc),
-                    ]);
-                }
-                fe.ins.extend([I::LocalGet(out), I::LocalGet(acc), I::F32Store(mem(4 * i, 2))]);
+                fe.ins.push(I::LocalGet(out));
+                sum_of_products(fe, n as u32, true, |fe, j| {
+                    load_f32(fe, a, mat_elem(n, j, i));
+                    load_f32(fe, b, 4 * j);
+                });
+                fe.ins.push(I::F32Store(mem(4 * i, 2)));
             }
         }
         // vector × matrix: r_j = Σ_i v[i] m[j][i]
         (Some((false, _)), Some((true, n)), _) if op == ir::BinOp::Mul => {
             for j in 0..n as u32 {
-                let acc = fe.new_local(ValType::F32);
-                fe.ins.extend([I::F32Const(0.0f32.into()), I::LocalSet(acc)]);
-                for i in 0..n as u32 {
-                    let x = comp(fe, a, i);
-                    let e = mat_elem(fe, b, n, j, i);
-                    fe.ins.extend([
-                        I::LocalGet(acc),
-                        I::LocalGet(x),
-                        I::LocalGet(e),
-                        I::F32Mul,
-                        I::F32Add,
-                        I::LocalSet(acc),
-                    ]);
-                }
-                fe.ins.extend([I::LocalGet(out), I::LocalGet(acc), I::F32Store(mem(4 * j, 2))]);
+                fe.ins.push(I::LocalGet(out));
+                sum_of_products(fe, n as u32, true, |fe, i| {
+                    load_f32(fe, a, 4 * i);
+                    load_f32(fe, b, mat_elem(n, j, i));
+                });
+                fe.ins.push(I::F32Store(mem(4 * j, 2)));
             }
         }
         // matrix × matrix: column j of the result is a × b[j].
         (Some((true, n)), Some((true, _)), _) if op == ir::BinOp::Mul => {
-            let stride = column_stride(n);
             for j in 0..n as u32 {
                 for i in 0..n as u32 {
-                    let acc = fe.new_local(ValType::F32);
-                    fe.ins.extend([I::F32Const(0.0f32.into()), I::LocalSet(acc)]);
-                    for k in 0..n as u32 {
-                        let x = mat_elem(fe, a, n, k, i);
-                        let y = mat_elem(fe, b, n, j, k);
-                        fe.ins.extend([
-                            I::LocalGet(acc),
-                            I::LocalGet(x),
-                            I::LocalGet(y),
-                            I::F32Mul,
-                            I::F32Add,
-                            I::LocalSet(acc),
-                        ]);
-                    }
-                    fe.ins.extend([
-                        I::LocalGet(out),
-                        I::LocalGet(acc),
-                        I::F32Store(mem(stride * j + 4 * i, 2)),
-                    ]);
+                    fe.ins.push(I::LocalGet(out));
+                    sum_of_products(fe, n as u32, true, |fe, k| {
+                        load_f32(fe, a, mat_elem(n, k, i));
+                        load_f32(fe, b, mat_elem(n, j, k));
+                    });
+                    fe.ins.push(I::F32Store(mem(mat_elem(n, j, i), 2)));
                 }
             }
         }
@@ -448,16 +459,11 @@ pub(super) fn binary(
             for j in 0..cols {
                 for i in 0..n as u32 {
                     let off = stride * j + 4 * i;
-                    let x = elem_or_scalar(fe, a, off);
-                    let y = elem_or_scalar(fe, b, off);
-                    scalar_bin(fe, op, ir::Scalar::F32, x, y)?;
-                    let r = fe.new_local(ValType::F32);
-                    fe.ins.extend([
-                        I::LocalSet(r),
-                        I::LocalGet(out),
-                        I::LocalGet(r),
-                        I::F32Store(mem(off, 2)),
-                    ]);
+                    fe.ins.push(I::LocalGet(out));
+                    elem_or_scalar(fe, a, off);
+                    elem_or_scalar(fe, b, off);
+                    fe.ins.push(float_op(fe, op, Fw::of(ir::Scalar::F32))?);
+                    fe.ins.push(I::F32Store(mem(off, 2)));
                 }
             }
         }
@@ -472,21 +478,10 @@ pub(super) fn binary(
     Ok(())
 }
 
-/// The f32 at byte `off` of aggregate `x`, or scalar `x` itself.
-fn elem_or_scalar(fe: &mut Fe, x: ir::ValueId, off: u32) -> u32 {
-    if fe.m.types.is_aggregate(fe.vty(x)) {
-        let l = fe.new_local(ValType::F32);
-        fe.ins.extend([I::LocalGet(fe.v(x)), I::F32Load(mem(off, 2)), I::LocalSet(l)]);
-        l
-    } else {
-        fe.v(x)
-    }
-}
-
 pub(super) fn unary(fe: &mut Fe, v: ir::ValueId, op: ir::UnOp, x: ir::ValueId) -> R<()> {
     let t = fe.vty(x);
     if let Some((is_mat, n)) = dims(fe, t) {
-        let out = fe.fresh_slot(v)?;
+        let out = fe.fresh_slot(v, is_mat)?;
         let stride = if is_mat { column_stride(n) } else { 0 };
         for j in 0..if is_mat { n as u32 } else { 1 } {
             for i in 0..n as u32 {
@@ -509,7 +504,7 @@ pub(super) fn unary(fe: &mut Fe, v: ir::ValueId, op: ir::UnOp, x: ir::ValueId) -
         }
         (ir::UnOp::Neg, s) => {
             // 0 - x, checked: negating the minimum overflows.
-            let z = fe.new_local(super::super::valtype(s));
+            let z = fe.new_local(crate::valtype(s));
             fe.ins.extend([konst(s, 0.0), I::LocalSet(z)]);
             scalar_bin(fe, ir::BinOp::Sub, s, z, fe.v(x))?;
         }
@@ -710,82 +705,40 @@ pub(super) fn builtin(fe: &mut Fe, v: ir::ValueId, b: ir::Builtin, args: &[ir::V
     use ir::Builtin as B;
     let t = fe.vty(v);
     let arg0 = fe.vty(args[0]);
-    // Vector reductions.
+    // Vector reductions. A sum starts from its first product, as WGSL's do.
     if let Some((false, n)) = dims(fe, arg0) {
+        let n = n as u32;
         match b {
-            B::Dot | B::Length | B::Distance | B::AllEqual => {
-                let n = n as u32;
-                let acc = fe.new_local(if b == B::AllEqual { ValType::I32 } else { ValType::F32 });
-                // For distance: the difference first.
-                let diffs: Vec<u32> = if b == B::Distance {
-                    (0..n)
-                        .map(|c| {
-                            let x = comp(fe, args[0], c);
-                            let y = comp(fe, args[1], c);
-                            let d = fe.new_local(ValType::F32);
-                            fe.ins.extend([
-                                I::LocalGet(x),
-                                I::LocalGet(y),
-                                I::F32Sub,
-                                I::LocalSet(d),
-                            ]);
-                            d
-                        })
-                        .collect()
-                } else {
-                    Vec::new()
-                };
-                fe.ins.extend([
-                    if b == B::AllEqual { I::I32Const(1) } else { I::F32Const(0.0f32.into()) },
-                    I::LocalSet(acc),
-                ]);
+            B::Dot => {
+                sum_of_products(fe, n, false, |fe, c| {
+                    load_f32(fe, args[0], 4 * c);
+                    load_f32(fe, args[1], 4 * c);
+                });
+                fe.ins.push(I::LocalSet(fe.v(v)));
+                return Ok(());
+            }
+            B::Length | B::Distance => {
+                sum_of_squares(fe, args[0], (b == B::Distance).then(|| args[1]), n);
+                fe.ins.extend([I::F32Sqrt, I::LocalSet(fe.v(v))]);
+                return Ok(());
+            }
+            B::AllEqual => {
                 for c in 0..n {
-                    let (x, y) = match b {
-                        B::Dot | B::AllEqual => (comp(fe, args[0], c), comp(fe, args[1], c)),
-                        B::Length => {
-                            let x = comp(fe, args[0], c);
-                            (x, x)
-                        }
-                        _ => (diffs[c as usize], diffs[c as usize]),
-                    };
-                    if b == B::AllEqual {
-                        fe.ins.extend([
-                            I::LocalGet(acc),
-                            I::LocalGet(x),
-                            I::LocalGet(y),
-                            I::F32Eq,
-                            I::I32And,
-                            I::LocalSet(acc),
-                        ]);
-                    } else if c == 0 {
-                        fe.ins.extend([
-                            I::LocalGet(x),
-                            I::LocalGet(y),
-                            I::F32Mul,
-                            I::LocalSet(acc),
-                        ]);
-                    } else {
-                        fe.ins.extend([
-                            I::LocalGet(acc),
-                            I::LocalGet(x),
-                            I::LocalGet(y),
-                            I::F32Mul,
-                            I::F32Add,
-                            I::LocalSet(acc),
-                        ]);
+                    load_f32(fe, args[0], 4 * c);
+                    load_f32(fe, args[1], 4 * c);
+                    fe.ins.push(I::F32Eq);
+                    if c > 0 {
+                        fe.ins.push(I::I32And);
                     }
-                }
-                fe.ins.push(I::LocalGet(acc));
-                if matches!(b, B::Length | B::Distance) {
-                    fe.ins.push(I::F32Sqrt);
                 }
                 fe.ins.push(I::LocalSet(fe.v(v)));
                 return Ok(());
             }
             B::Cross => {
-                let out = fe.fresh_slot(v)?;
-                let a: Vec<u32> = (0..3).map(|c| comp(fe, args[0], c)).collect();
-                let bb: Vec<u32> = (0..3).map(|c| comp(fe, args[1], c)).collect();
+                let out = fe.fresh_slot(v, false)?;
+                // Each component is read twice.
+                let a: Vec<u32> = (0..3).map(|c| elem_local(fe, args[0], 4 * c)).collect();
+                let bb: Vec<u32> = (0..3).map(|c| elem_local(fe, args[1], 4 * c)).collect();
                 for (i, (j, k)) in [(1usize, 2usize), (2, 0), (0, 1)].into_iter().enumerate() {
                     fe.ins.extend([
                         I::LocalGet(out),
@@ -803,38 +756,13 @@ pub(super) fn builtin(fe: &mut Fe, v: ir::ValueId, b: ir::Builtin, args: &[ir::V
             }
             B::Normalize => {
                 let len = fe.new_local(ValType::F32);
-                fe.ins.extend([I::F32Const(0.0f32.into()), I::LocalSet(len)]);
-                for c in 0..n as u32 {
-                    let x = comp(fe, args[0], c);
-                    if c == 0 {
-                        fe.ins.extend([
-                            I::LocalGet(x),
-                            I::LocalGet(x),
-                            I::F32Mul,
-                            I::LocalSet(len),
-                        ]);
-                    } else {
-                        fe.ins.extend([
-                            I::LocalGet(len),
-                            I::LocalGet(x),
-                            I::LocalGet(x),
-                            I::F32Mul,
-                            I::F32Add,
-                            I::LocalSet(len),
-                        ]);
-                    }
-                }
-                fe.ins.extend([I::LocalGet(len), I::F32Sqrt, I::LocalSet(len)]);
-                let out = fe.fresh_slot(v)?;
-                for c in 0..n as u32 {
-                    let x = comp(fe, args[0], c);
-                    fe.ins.extend([
-                        I::LocalGet(out),
-                        I::LocalGet(x),
-                        I::LocalGet(len),
-                        I::F32Div,
-                        I::F32Store(mem(4 * c, 2)),
-                    ]);
+                sum_of_squares(fe, args[0], None, n);
+                fe.ins.extend([I::F32Sqrt, I::LocalSet(len)]);
+                let out = fe.fresh_slot(v, false)?;
+                for c in 0..n {
+                    fe.ins.push(I::LocalGet(out));
+                    load_f32(fe, args[0], 4 * c);
+                    fe.ins.extend([I::LocalGet(len), I::F32Div, I::F32Store(mem(4 * c, 2))]);
                 }
                 return Ok(());
             }
@@ -844,17 +772,13 @@ pub(super) fn builtin(fe: &mut Fe, v: ir::ValueId, b: ir::Builtin, args: &[ir::V
     // Componentwise on vectors (all the arguments are), or plain scalars.
     match dims(fe, t) {
         Some((false, n)) => {
-            let out = fe.fresh_slot(v)?;
+            let out = fe.fresh_slot(v, false)?;
             for c in 0..n as u32 {
-                let xs: Vec<u32> = args.iter().map(|&a| comp(fe, a, c)).collect();
+                // In locals: `scalar_builtin` reads locals, some more than once.
+                let xs: Vec<u32> = args.iter().map(|&a| elem_local(fe, a, 4 * c)).collect();
+                fe.ins.push(I::LocalGet(out));
                 scalar_builtin(fe, b, ir::Scalar::F32, &xs)?;
-                let r = fe.new_local(ValType::F32);
-                fe.ins.extend([
-                    I::LocalSet(r),
-                    I::LocalGet(out),
-                    I::LocalGet(r),
-                    I::F32Store(mem(4 * c, 2)),
-                ]);
+                fe.ins.push(I::F32Store(mem(4 * c, 2)));
             }
         }
         Some((true, _)) => return Err(format!("internal: {b:?} on a matrix")),
@@ -871,8 +795,42 @@ pub(super) fn builtin(fe: &mut Fe, v: ir::ValueId, b: ir::Builtin, args: &[ir::V
 // ---- host operations: the command stream ------------------------------------------------------
 
 /// Stores the i32 `x` at `[a] + off`.
-fn put(fe: &mut Fe, a: u32, off: u32, x: I<'static>) {
-    fe.ins.extend([I::LocalGet(a), x, I::I32Store(mem(off, 2))]);
+fn put(a: u32, off: u32, x: I<'static>) -> [I<'static>; 3] {
+    [I::LocalGet(a), x, I::I32Store(mem(off, 2))]
+}
+
+/// Reserves room for a command whose payload is `payload` bytes, sets local `a` to its address,
+/// and writes its header.
+fn command(h: &Helpers, a: u32, opcode: Opcode, payload: u32) -> impl Iterator<Item = I<'static>> {
+    [I::I32Const(CMD_HEADER.saturating_add(payload) as i32), I::Call(h.reserve), I::LocalSet(a)]
+        .into_iter()
+        .chain(put(a, 0, I::I32Const(opcode as i32)))
+        .chain(put(a, 4, I::I32Const(payload as i32)))
+}
+
+/// Starts a command whose payload is `payload` bytes: returns the local that holds its address.
+fn begin_command(fe: &mut Fe, opcode: Opcode, payload: u32) -> u32 {
+    let a = fe.new_local(ValType::I32);
+    let h = fe.helpers;
+    fe.ins.extend(command(h, a, opcode, payload));
+    a
+}
+
+/// Pushes the byte count of local `x` elements of `elem_size` bytes; traps if it doesn't fit in a
+/// u32.
+fn checked_bytes(fe: &mut Fe, x: u32, elem_size: u32) {
+    let wide = fe.new_local(ValType::I64);
+    fe.ins.extend([
+        I::LocalGet(x),
+        I::I64ExtendI32U,
+        I::I64Const(elem_size as i64),
+        I::I64Mul,
+        I::LocalTee(wide),
+        I::I64Const(u32::MAX as i64),
+        I::I64GtU,
+    ]);
+    fe.trap_if();
+    fe.ins.extend([I::LocalGet(wide), I::I32WrapI64]);
 }
 
 pub(super) fn host(
@@ -881,30 +839,18 @@ pub(super) fn host(
     args: &[ir::ValueId],
     result: Option<ir::ValueId>,
 ) -> R<()> {
-    use wrela_abi::stream::Opcode;
-    let h = *fe.helpers;
     match op {
         ir::HostOp::CreateBuffer { elem_size } => {
-            // size = max(count * elem_size, 4), checked; handle = next handle.
+            // size = count * elem_size, checked, or one element's for an empty buffer: WebGPU
+            // can't bind less (an array's minimum binding size is one element). handle = next
+            // handle.
             let size = fe.new_local(ValType::I32);
-            let wide = fe.new_local(ValType::I64);
+            checked_bytes(fe, fe.v(args[0]), *elem_size);
             fe.ins.extend([
-                I::LocalGet(fe.v(args[0])),
-                I::I64ExtendI32U,
-                I::I64Const(*elem_size as i64),
-                I::I64Mul,
-                I::LocalTee(wide),
-                I::I64Const(u32::MAX as i64),
-                I::I64GtU,
-            ]);
-            fe.trap_if();
-            fe.ins.extend([
-                I::LocalGet(wide),
-                I::I32WrapI64,
                 I::LocalTee(size),
                 I::I32Eqz,
                 I::If(BlockType::Empty),
-                I::I32Const(4),
+                I::I32Const((*elem_size).max(4) as i32),
                 I::LocalSet(size),
                 I::End,
             ]);
@@ -916,46 +862,24 @@ pub(super) fn host(
                 I::I32Add,
                 I::GlobalSet(globals::NEXT_HANDLE),
             ]);
-            let a = fe.new_local(ValType::I32);
             // Payload: the handle and the size.
-            let payload = 8;
-            fe.ins.extend([
-                I::I32Const((CMD_HEADER + payload) as i32),
-                I::Call(h.reserve),
-                I::LocalSet(a),
-            ]);
-            put(fe, a, 0, I::I32Const(Opcode::CreateBuffer as i32));
-            put(fe, a, 4, I::I32Const(payload as i32));
-            put(fe, a, CMD_HEADER, I::LocalGet(handle));
-            put(fe, a, CMD_HEADER + 4, I::LocalGet(size));
+            let a = begin_command(fe, Opcode::CreateBuffer, 8);
+            fe.ins.extend(put(a, CMD_HEADER, I::LocalGet(handle)));
+            fe.ins.extend(put(a, CMD_HEADER + 4, I::LocalGet(size)));
             if let Some(v) = result {
                 fe.ins.extend([I::LocalGet(handle), I::LocalSet(fe.v(v))]);
             }
         }
         ir::HostOp::WriteBuffer { elem_size } => {
             let (handle, at, run) = (fe.v(args[0]), fe.v(args[1]), fe.v(args[2]));
-            let check = |fe: &mut Fe, x: I<'static>| {
-                let w = fe.new_local(ValType::I64);
-                fe.ins.extend([
-                    x,
-                    I::I64ExtendI32U,
-                    I::I64Const(*elem_size as i64),
-                    I::I64Mul,
-                    I::LocalTee(w),
-                    I::I64Const(u32::MAX as i64),
-                    I::I64GtU,
-                ]);
-                fe.trap_if();
-                fe.ins.extend([I::LocalGet(w), I::I32WrapI64]);
-            };
             fe.ins.push(I::LocalGet(handle));
-            check(fe, I::LocalGet(at));
+            checked_bytes(fe, at, *elem_size);
             fe.ins.extend([I::LocalGet(run), I::I32Load(mem(0, 2))]);
             fe.ins.extend([I::LocalGet(run), I::I32Load(mem(4, 2))]);
             let n = fe.new_local(ValType::I32);
             fe.ins.push(I::LocalSet(n));
-            check(fe, I::LocalGet(n));
-            fe.ins.push(I::Call(h.write));
+            checked_bytes(fe, n, *elem_size);
+            fe.ins.push(I::Call(fe.helpers.write));
         }
         ir::HostOp::Dispatch { pipeline, buffers, uniform }
         | ir::HostOp::Draw { pipeline, buffers, uniform } => {
@@ -963,28 +887,26 @@ pub(super) fn host(
             let fixed = if dispatch { 4 } else { 3 };
             let nb = *buffers as usize;
             let usize_ = uniform.map_or(0, |t| round_up(16, layout(&fe.m.types, t).size));
-            let payload = 4 * (fixed + 1 + nb as u32 + 1) + usize_;
-            let a = fe.new_local(ValType::I32);
-            fe.ins.extend([
-                I::I32Const((CMD_HEADER + payload) as i32),
-                I::Call(h.reserve),
-                I::LocalSet(a),
-            ]);
+            // Lowering keeps the uniforms small enough (`ir::MAX_UNIFORM_BYTES`) for the
+            // command to fit in the command buffer.
+            let payload = (4 * (fixed + 1 + nb as u32 + 1)).saturating_add(usize_);
+            if CMD_HEADER.saturating_add(payload) > memory::CMD_CAP {
+                return Err(format!("internal: a {payload}-byte command overflows the buffer"));
+            }
             let opc = if dispatch { Opcode::Dispatch } else { Opcode::Draw };
-            put(fe, a, 0, I::I32Const(opc as i32));
-            put(fe, a, 4, I::I32Const(payload as i32));
-            put(fe, a, CMD_HEADER, I::I32Const(*pipeline as i32));
+            let a = begin_command(fe, opc, payload);
+            fe.ins.extend(put(a, CMD_HEADER, I::I32Const(*pipeline as i32)));
             for (k, x) in args.iter().take(fixed as usize - 1).enumerate() {
-                put(fe, a, CMD_HEADER + 4 + 4 * k as u32, I::LocalGet(fe.v(*x)));
+                fe.ins.extend(put(a, CMD_HEADER + 4 + 4 * k as u32, I::LocalGet(fe.v(*x))));
             }
             let mut off = CMD_HEADER + 4 * fixed;
-            put(fe, a, off, I::I32Const(nb as i32));
+            fe.ins.extend(put(a, off, I::I32Const(nb as i32)));
             off += 4;
             for k in 0..nb {
-                put(fe, a, off, I::LocalGet(fe.v(args[fixed as usize - 1 + k])));
+                fe.ins.extend(put(a, off, I::LocalGet(fe.v(args[fixed as usize - 1 + k]))));
                 off += 4;
             }
-            put(fe, a, off, I::I32Const(usize_ as i32));
+            fe.ins.extend(put(a, off, I::I32Const(usize_ as i32)));
             off += 4;
             if let Some(t) = uniform {
                 let u = fe.v(args[fixed as usize - 1 + nb]);
@@ -1008,16 +930,9 @@ pub(super) fn host(
             }
         }
         ir::HostOp::BeginScreenPass => {
-            let a = fe.new_local(ValType::I32);
             // Payload: the clear colour, four f32s.
             let payload = 16;
-            fe.ins.extend([
-                I::I32Const((CMD_HEADER + payload) as i32),
-                I::Call(h.reserve),
-                I::LocalSet(a),
-            ]);
-            put(fe, a, 0, I::I32Const(Opcode::BeginScreenPass as i32));
-            put(fe, a, 4, I::I32Const(payload as i32));
+            let a = begin_command(fe, Opcode::BeginScreenPass, payload);
             fe.ins.extend([
                 I::LocalGet(a),
                 I::I32Const(CMD_HEADER as i32),
@@ -1028,20 +943,129 @@ pub(super) fn host(
             ]);
         }
         ir::HostOp::Present => {
-            let a = fe.new_local(ValType::I32);
-            fe.ins.extend([I::I32Const(CMD_HEADER as i32), I::Call(h.reserve), I::LocalSet(a)]);
-            put(fe, a, 0, I::I32Const(Opcode::Present as i32));
-            put(fe, a, 4, I::I32Const(0));
+            begin_command(fe, Opcode::Present, 0);
         }
     }
     Ok(())
 }
 
-/// The helpers' bodies, in `Helpers` order after the import: flush, reserve, write.
-pub(super) fn helper_bodies(h: &Helpers) -> Vec<(Vec<ValType>, Vec<ValType>, Function)> {
+/// `fmod(x, y)` for floats of width `f`: `x - y * trunc(x / y)`, exactly, as C's `fmod`. The
+/// result has `x`'s sign and is less than `y` in magnitude; NaN if `x` is infinite or `y` is 0.
+///
+/// The remainder of two floats is a float, and each step below is exact. For f32s whose
+/// quotient is below 2^29, one step in f64 gives it: `q * y` takes at most 53 bits, and
+/// `x - q * y` is a multiple of `y`'s last place below `2 y`. Otherwise it's long division on
+/// `|x|`: subtract `t = |y| * 2^k`, from the largest `t <= |x|` down to `|y|`, wherever it fits
+/// (exact, since then `t <= |x| < 2 t`).
+fn fmod(f: Fw) -> Function {
+    let (x, y, r, d, t, q, w) = (0, 1, 2, 3, 4, 5, 6);
+    let g = I::LocalGet;
+    let s = I::LocalSet;
+    let mut ins = vec![
+        // NaN unless x is finite and y is a nonzero number: (x y) / (x y) is.
+        g(x),
+        f.abs(),
+        f.konst(f64::INFINITY),
+        f.lt(),
+        g(y),
+        g(y),
+        f.eq(),
+        I::I32And,
+        g(y),
+        f.konst(0.0),
+        f.ne(),
+        I::I32And,
+        I::I32Eqz,
+        I::If(BlockType::Empty),
+        g(x),
+        g(y),
+        f.mul(),
+        g(x),
+        g(y),
+        f.mul(),
+        f.div(),
+        I::Return,
+        I::End,
+        g(x),
+        f.abs(),
+        s(r),
+        g(y),
+        f.abs(),
+        s(d),
+        // |x| < |y| (y infinite, or x a zero, among others): x itself.
+        g(r),
+        g(d),
+        f.lt(),
+        I::If(BlockType::Empty),
+        g(x),
+        I::Return,
+        I::End,
+    ];
+    if !f.f64_ {
+        ins.extend([
+            g(r),
+            I::F64PromoteF32,
+            g(d),
+            I::F64PromoteF32,
+            I::F64Div,
+            I::F64Trunc,
+            I::LocalTee(q),
+            I::F64Const(536870912.0.into()),
+            I::F64Lt,
+            I::If(BlockType::Empty),
+            g(r),
+            I::F64PromoteF32,
+            g(q),
+            g(d),
+            I::F64PromoteF32,
+            I::F64Mul,
+            I::F64Sub,
+            I::LocalTee(w),
+            I::F64Const(0.0.into()),
+            I::F64Lt,
+            // The rounded quotient was one too many.
+            I::If(BlockType::Empty),
+            g(w),
+            g(d),
+            I::F64PromoteF32,
+            I::F64Add,
+            s(w),
+            I::End,
+            g(w),
+            I::F32DemoteF64,
+            g(x),
+            I::F32Copysign,
+            I::Return,
+            I::End,
+        ]);
+    }
+    // t = the largest |y| * 2^k <= |x| (t + t is exact, or infinite and so too large).
+    ins.extend([g(d), s(t), I::Block(BlockType::Empty), I::Loop(BlockType::Empty)]);
+    ins.extend([g(t), g(t), f.add(), g(r), f.le(), I::I32Eqz, I::BrIf(1)]);
+    ins.extend([g(t), g(t), f.add(), s(t), I::Br(0), I::End, I::End]);
+    // Then down to |y|, subtracting each t that fits.
+    ins.extend([I::Block(BlockType::Empty), I::Loop(BlockType::Empty)]);
+    ins.extend([g(r), g(t), f.ge(), I::If(BlockType::Empty), g(r), g(t), f.sub(), s(r), I::End]);
+    ins.extend([g(t), g(d), f.eq(), I::BrIf(1)]);
+    ins.extend([g(t), f.konst(0.5), f.mul(), s(t), I::Br(0), I::End, I::End]);
+    ins.extend([g(r), g(x), f.copysign(), I::End]);
+    let mut locals = vec![f.valtype(); 3];
+    if !f.f64_ {
+        locals.extend([ValType::F64; 2]);
+    }
+    let mut func = Function::new_with_locals_types(locals);
+    for i in &ins {
+        func.instruction(i);
+    }
+    func
+}
+
+/// The helpers' bodies, in `Helpers` order after the import: flush, reserve, write, release and
+/// the two `fmod`s.
+pub(crate) fn helper_bodies(h: &Helpers) -> Vec<(Vec<ValType>, Vec<ValType>, Function)> {
     use memory::{CMD_BASE, CMD_CAP};
     let finish = |locals: Vec<ValType>, ins: Vec<I<'static>>| {
-        let mut f = Function::new(locals.iter().map(|t| (1, *t)));
+        let mut f = Function::new_with_locals_types(locals);
         for i in &ins {
             f.instruction(i);
         }
@@ -1119,8 +1143,7 @@ pub(super) fn helper_bodies(h: &Helpers) -> Vec<(Vec<ValType>, Vec<ValType>, Fun
         I::Call(h.reserve),
         I::LocalSet(a),
     ]);
-    let w = |x: I<'static>, off: u32| [I::LocalGet(a), x, I::I32Store(mem(off, 2))];
-    write.extend(w(I::I32Const(wrela_abi::stream::Opcode::WriteBuffer as i32), 0));
+    write.extend(put(a, 0, I::I32Const(Opcode::WriteBuffer as i32)));
     write.extend([
         I::LocalGet(a),
         I::LocalGet(chunk),
@@ -1128,9 +1151,9 @@ pub(super) fn helper_bodies(h: &Helpers) -> Vec<(Vec<ValType>, Vec<ValType>, Fun
         I::I32Add,
         I::I32Store(mem(4, 2)),
     ]);
-    write.extend(w(I::LocalGet(handle), CMD_HEADER));
-    write.extend(w(I::LocalGet(offset), CMD_HEADER + 4));
-    write.extend(w(I::LocalGet(chunk), CMD_HEADER + 8));
+    write.extend(put(a, CMD_HEADER, I::LocalGet(handle)));
+    write.extend(put(a, CMD_HEADER + 4, I::LocalGet(offset)));
+    write.extend(put(a, CMD_HEADER + 8, I::LocalGet(chunk)));
     write.extend([
         I::LocalGet(a),
         I::I32Const((CMD_HEADER + words) as i32),
@@ -1152,14 +1175,10 @@ pub(super) fn helper_bodies(h: &Helpers) -> Vec<(Vec<ValType>, Vec<ValType>, Fun
         I::GlobalGet(globals::NEXT_HANDLE),
         I::I32GeU,
         I::BrIf(1),
-        I::I32Const((CMD_HEADER + 4) as i32),
-        I::Call(h.reserve),
-        I::LocalSet(a),
     ]);
-    let w = |x: I<'static>, off: u32| [I::LocalGet(a), x, I::I32Store(mem(off, 2))];
-    release.extend(w(I::I32Const(wrela_abi::stream::Opcode::DestroyBuffer as i32), 0));
-    release.extend(w(I::I32Const(4), 4));
-    release.extend(w(I::GlobalGet(globals::LIVE_FROM), CMD_HEADER));
+    // Payload: the handle.
+    release.extend(command(h, a, Opcode::DestroyBuffer, 4));
+    release.extend(put(a, CMD_HEADER, I::GlobalGet(globals::LIVE_FROM)));
     release.extend([
         I::GlobalGet(globals::LIVE_FROM),
         I::I32Const(1),
@@ -1171,10 +1190,13 @@ pub(super) fn helper_bodies(h: &Helpers) -> Vec<(Vec<ValType>, Vec<ValType>, Fun
         I::End,
     ]);
     let i32x = |k| vec![ValType::I32; k];
+    let (f32_, f64_) = (Fw { f64_: false }, Fw { f64_: true });
     vec![
         (vec![], vec![], finish(vec![], flush)),
         (i32x(1), i32x(1), finish(vec![], reserve)),
         (i32x(4), vec![], finish(i32x(2), write)),
         (vec![], vec![], finish(i32x(1), release)),
+        (vec![ValType::F32; 2], vec![ValType::F32], fmod(f32_)),
+        (vec![ValType::F64; 2], vec![ValType::F64], fmod(f64_)),
     ]
 }

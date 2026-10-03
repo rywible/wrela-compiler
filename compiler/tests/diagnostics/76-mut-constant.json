@@ -1,0 +1,30 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0512",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [
+        "copy it into a `var` to change it"
+      ],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "can't lend the constant `START` mutably",
+      "notes": [
+        "a constant is a value, not a place: a change to it would be lost"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 14,
+        "end": 192,
+        "end_column": 19,
+        "end_line": 11,
+        "line": 11,
+        "start": 187
+      },
+      "title": "a `mut` projection of a read-only place"
+    }
+  ],
+  "version": 2
+}

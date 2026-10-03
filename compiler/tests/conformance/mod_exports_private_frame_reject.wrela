@@ -1,0 +1,3 @@
+// rejects: mod.use
+// `frame` is exported: it's `pub`.
+fn frame(time: f32, width: u32, height: u32) {} //~ E0703

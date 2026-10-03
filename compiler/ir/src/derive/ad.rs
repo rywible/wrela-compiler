@@ -22,17 +22,18 @@ pub(super) fn value_and_gradient(
     cache: &mut DeriveCache,
     f: FuncId,
     ncap: u32,
+    target: Target,
 ) -> Result<FuncId> {
     let func = m.functions[f.index()].clone();
     let xi = ncap as usize;
     let x_ty = func.params.get(xi).ok_or_else(|| Error::internal("no input parameter"))?.ty;
     let n = dims(m, x_ty)?;
-    if func.ret != Some(m.types.f32()) {
+    if func.ret != Some(m.types.f32()) || func.ret_ref {
         return Err(Error::not_derivable("a gradient needs a function that returns an `f32`"));
     }
     let mut mask = vec![false; func.params.len()];
     mask[xi] = true;
-    let d = derive(m, cache, f, mask.clone(), n)?;
+    let d = derive(m, cache, f, mask.clone(), n, target)?;
     let returns = returns_active(m, cache, f, mask, Mode::Ad)?;
     let f32 = m.types.f32();
     let tuple = m.types.intern(TypeDef::Struct {
@@ -45,16 +46,8 @@ pub(super) fn value_and_gradient(
         Some(tuple),
     );
     let mut body = Vec::new();
-    let mut args = Vec::new();
-    for (i, p) in func.params.iter().enumerate() {
-        if p.by_ref {
-            args.push(Arg::Place(Place { root: PlaceRoot::Param(i as u32), path: Vec::new() }));
-        } else {
-            let v = g.new_value(p.ty);
-            body.push(Stmt::Let(v, Expr::Param(i as u32)));
-            args.push(Arg::Value(v));
-        }
-    }
+    let mut args: Vec<Arg> =
+        (0..func.params.len() as u32).map(|i| g.param_arg(i, &mut body)).collect();
     // Seeds: the unit vectors along each component of x, passed the way `x` is (a tangent
     // parameter is passed like its original).
     let x_by_ref = func.params[xi].by_ref;
@@ -121,21 +114,20 @@ pub(super) fn derive(
     f: FuncId,
     mask: Vec<bool>,
     n: u8,
+    target: Target,
 ) -> Result<FuncId> {
     if let Some(&d) = cache.ad.get(&(f, mask.clone(), n)) {
         return Ok(d);
     }
     let func = m.functions[f.index()].clone();
-    if let Some((why, at)) = has_host_or_ptr(&func.body, None) {
-        return Err(Error::not_derivable(format!("this {why}")).at(at));
+    if let Some(at) = records_gpu_work(&func.body, None) {
+        return Err(Error::not_derivable(
+            "this records GPU work, which a derived function can't do",
+        )
+        .at(at));
     }
     let returns = returns_active(m, cache, f, mask.clone(), Mode::Ad)?;
-    let act = {
-        let mm: &Module = m;
-        activity(mm, &func, &mask, Mode::Ad, &mut |g, mk| {
-            returns_active(mm, cache, g, mk, Mode::Ad)
-        })?
-    };
+    let act = body_activity(m, cache, f, &mask, Mode::Ad)?;
     for (i, p) in func.params.iter().enumerate() {
         if act.params[i] && !mask[i] && p.mutable {
             // Placed by the caller's statement (the call), or at the `gradient(..)` call.
@@ -145,7 +137,7 @@ pub(super) fn derive(
             )));
         }
     }
-    let mut nf = func.clone();
+    let mut nf = func.clone_signature();
     nf.name = format!("{}_d{}", func.name, n);
     // Tangent parameters, appended: n per active parameter.
     let mut tparam: Vec<Vec<u32>> = vec![Vec::new(); func.params.len()];
@@ -172,6 +164,9 @@ pub(super) fn derive(
     }
     if returns {
         let r = func.ret.ok_or_else(|| Error::internal("a missing result type"))?;
+        // A projection's: a pointer into the place, and one into each tangent's.
+        let r = if func.ret_ref { m.types.intern(TypeDef::Ptr(r)) } else { r };
+        nf.ret_ref = false;
         let mut fields = vec![("v".to_string(), r)];
         for k in 0..n {
             fields.push((format!("d{k}"), r));
@@ -182,8 +177,8 @@ pub(super) fn derive(
                 fields,
             }));
     }
-    nf.body = Vec::new();
-    let id = m.add_function(Function::new(nf.name.clone(), Vec::new(), None));
+    // With its signature, for a recursive call to read.
+    let id = m.add_function(Function::new(nf.name.clone(), nf.params.clone(), nf.ret));
     // Cached before its body is built, for calls back into it; removed again if building
     // fails, so a later request doesn't find the bodiless placeholder.
     let key = (f, mask, n);
@@ -195,14 +190,15 @@ pub(super) fn derive(
         nf,
         act,
         n,
+        target,
         tparam,
         tlocal,
         tv: HashMap::new(),
         returns,
         recips: HashMap::new(),
         made: Vec::new(),
-        twins: LoadTwins::default(),
-        at: None,
+        scaled: HashMap::new(),
+        track: Track::default(),
     };
     let body = match b.block(&func.body) {
         Ok(body) => body,
@@ -224,6 +220,7 @@ struct Ad<'a> {
     nf: Function,
     act: Activity,
     n: u8,
+    target: Target,
     tparam: Vec<Vec<u32>>,
     tlocal: Vec<Vec<LocalId>>,
     /// Each active value's tangents (`None`: structurally zero).
@@ -235,12 +232,12 @@ struct Ad<'a> {
     /// The expressions made while differentiating one statement, so what its directions share
     /// (`2v` for a square root, a clamp's masks) is made once.
     made: Vec<(TypeId, Expr, ValueId)>,
-    twins: LoadTwins,
-    /// Where in the source the statement being derived is (`Stmt::At`), for errors.
-    at: Option<wrela_diag::Span>,
+    /// Tangents made as another tangent times a factor every direction shares (see `scale`).
+    scaled: HashMap<ValueId, (ValueId, ValueId)>,
+    track: Track,
 }
 
-impl Ad<'_> {
+impl Builder for Ad<'_> {
     fn emit(&mut self, out: &mut Block, ty: TypeId, e: Expr) -> ValueId {
         if let Some((_, _, v)) = self.made.iter().find(|(t, x, _)| *t == ty && *x == e) {
             return *v;
@@ -253,32 +250,58 @@ impl Ad<'_> {
         v
     }
 
-    fn f32c(&mut self, out: &mut Block, x: f32) -> ValueId {
-        let t = self.m.types.f32();
-        self.emit(out, t, Expr::Const(Const::F32(x)))
+    fn types(&self) -> &Types {
+        &self.m.types
     }
 
     fn ty(&self, v: ValueId) -> TypeId {
         self.nf.value_ty(v)
+    }
+}
+
+impl Ad<'_> {
+    /// A float constant of `ty`'s element type (`f32` or `f64`), as a scalar: operations on
+    /// `ty` splat it.
+    fn fc(&mut self, out: &mut Block, ty: TypeId, x: f64) -> ValueId {
+        let (t, c) = match self.m.types.element_scalar(ty) {
+            Some(Scalar::F64) => (self.m.types.scalar(Scalar::F64), Const::F64(x)),
+            _ => (self.m.types.f32(), Const::F32(x as f32)),
+        };
+        self.emit(out, t, Expr::Const(c))
     }
 
     fn t(&self, v: ValueId, k: usize) -> Option<ValueId> {
         self.tv.get(&v).and_then(|ts| ts[k])
     }
 
-    /// `x` as an operand of type `to` (see [`splat_size`]).
-    fn coerce(&mut self, out: &mut Block, x: ValueId, to: TypeId) -> ValueId {
-        match splat_size(&self.m.types, self.ty(x), to) {
-            Some(n) => self.emit(out, to, Expr::Splat(x, n)),
-            None => x,
+    /// The tangent `t` as an operand of type `ty`, or a zero for a structurally zero one.
+    fn tangent_or_zero(&mut self, out: &mut Block, t: Option<ValueId>, ty: TypeId) -> ValueId {
+        match t {
+            Some(t) => self.coerce(out, t, ty),
+            None => self.zero(out, ty),
         }
     }
 
-    /// `a op b` of type `ty`, a scalar operand splatted to a vector `ty` (the IR's elementwise
-    /// operations take one type).
-    fn bin(&mut self, out: &mut Block, op: BinOp, a: ValueId, b: ValueId, ty: TypeId) -> ValueId {
-        let (a, b) = (self.coerce(out, a, ty), self.coerce(out, b, ty));
-        self.emit(out, ty, Expr::Binary(op, a, b))
+    /// The tangent `t` times `f`, a factor every direction shares. A tangent made that way,
+    /// `b × g`, becomes `b × (g f)`, with `g f` made once for all directions: a chain of
+    /// factors (`y y l2`, `sqrt(s) / l2`) costs one multiplication per direction, not one each.
+    fn scale(&mut self, out: &mut Block, t: ValueId, f: ValueId, ty: TypeId) -> ValueId {
+        let matrix = |me: &Self, v: ValueId| matches!(me.m.types.get(me.ty(v)), TypeDef::Matrix(_));
+        if matrix(self, t) || matrix(self, f) {
+            return self.bin(out, BinOp::Mul, t, f, ty);
+        }
+        if let Some(&(b, g)) = self.scaled.get(&t)
+            && self.ty(g) == self.ty(f)
+        {
+            let gt = self.ty(g);
+            let gf = self.bin(out, BinOp::Mul, g, f, gt);
+            let r = self.bin(out, BinOp::Mul, b, gf, ty);
+            self.scaled.insert(r, (b, gf));
+            return r;
+        }
+        let r = self.bin(out, BinOp::Mul, t, f, ty);
+        self.scaled.insert(r, (t, f));
+        r
     }
 
     /// `x / d` as `x × (1 / d)`, with `1 / d` made once per statement.
@@ -287,14 +310,14 @@ impl Ad<'_> {
             Some(&r) => r,
             None => {
                 let dt = self.ty(d);
-                let one = self.f32c(out, 1.0);
+                let one = self.fc(out, dt, 1.0);
                 let one = self.coerce(out, one, dt);
                 let r = self.bin(out, BinOp::Div, one, d, dt);
                 self.recips.insert(d, r);
                 r
             }
         };
-        self.bin(out, BinOp::Mul, x, r, ty)
+        self.scale(out, x, r, ty)
     }
 
     /// `x / d` for a vector's length `d`, with `d` raised to at least 10⁻³⁰. Where a length is
@@ -305,20 +328,9 @@ impl Ad<'_> {
     /// isolated points, such as a round cone's axis.)
     fn div_from_zero(&mut self, out: &mut Block, x: ValueId, d: ValueId, ty: TypeId) -> ValueId {
         let dt = self.ty(d);
-        let floor = self.f32c(out, 1e-30);
+        let floor = self.fc(out, dt, 1e-30);
         let d = self.builtin(out, Builtin::Max, vec![d, floor], dt);
         self.div(out, x, d, ty)
-    }
-
-    /// The builtin `b` of type `ty`; an elementwise one's scalar arguments are splatted to a
-    /// vector `ty`.
-    fn builtin(&mut self, out: &mut Block, b: Builtin, args: Vec<ValueId>, ty: TypeId) -> ValueId {
-        let args = if b.is_elementwise() {
-            args.into_iter().map(|x| self.coerce(out, x, ty)).collect()
-        } else {
-            args
-        };
-        self.emit(out, ty, Expr::Builtin(b, args))
     }
 
     /// `x + y` where either may be zero.
@@ -362,7 +374,7 @@ impl Ad<'_> {
         y: ValueId,
         ty: TypeId,
     ) -> Option<ValueId> {
-        x.map(|x| self.bin(out, BinOp::Mul, x, y, ty))
+        x.map(|x| self.scale(out, x, y, ty))
     }
 
     fn place(&self, p: &Place, k: usize) -> Result<Place> {
@@ -376,6 +388,10 @@ impl Ad<'_> {
                 *self.tparam[*i as usize]
                     .get(k)
                     .ok_or_else(|| Error::internal("an inactive parameter's tangent"))?,
+            ),
+            // A projection's tangent points into the place's tangent.
+            PlaceRoot::Ptr(v) => PlaceRoot::Ptr(
+                self.t(*v, k).ok_or_else(|| Error::internal("an inactive pointer's tangent"))?,
             ),
             _ => return Err(Error::not_derivable("can't differentiate through this place")),
         };
@@ -394,21 +410,13 @@ impl Ad<'_> {
         Ok(out)
     }
 
-    fn same_value(&self, a: ValueId, b: ValueId) -> bool {
-        self.twins.same_value(a, b)
-    }
-
     fn stmt(&mut self, s: &Stmt, out: &mut Block) -> Result<()> {
         // What one statement shares among its directions stays within it.
         self.made.clear();
         self.recips.clear();
-        self.twins.before(s);
-        if let Stmt::At(span) = s {
-            self.at = Some(*span);
-        }
-        let r = self.stmt_inner(s, out).map_err(|e| e.at(self.at));
-        self.twins.after(s);
-        r
+        self.track.before(s);
+        let r = self.stmt_inner(s, out);
+        self.track.after(s, r)
     }
 
     fn stmt_inner(&mut self, s: &Stmt, out: &mut Block) -> Result<()> {
@@ -432,23 +440,17 @@ impl Ad<'_> {
                     let ty = place_type(self.m, self.f, p)?;
                     for k in 0..self.n as usize {
                         let tp = self.place(p, k)?;
-                        let tv = match self.t(*v, k) {
-                            Some(t) => self.coerce(out, t, ty),
-                            None => self.zero(out, ty),
-                        };
+                        let tv = self.tangent_or_zero(out, self.t(*v, k), ty);
                         out.push(Stmt::Store(tp, tv));
                     }
                 }
                 Ok(())
             }
             Stmt::Return(Some(v)) if self.returns => {
-                let r = self.f.ret.ok_or_else(|| Error::internal("a missing result type"))?;
+                let r = self.ty(*v);
                 let mut parts = vec![*v];
                 for k in 0..self.n as usize {
-                    let t = match self.t(*v, k) {
-                        Some(t) => self.coerce(out, t, r),
-                        None => self.zero(out, r),
-                    };
+                    let t = self.tangent_or_zero(out, self.t(*v, k), r);
                     parts.push(t);
                 }
                 let dual = self.nf.ret.ok_or_else(|| Error::internal("a missing result type"))?;
@@ -469,7 +471,7 @@ impl Ad<'_> {
             });
             return Ok(());
         }
-        let dg = derive(self.m, self.cache, g, mask.clone(), self.n)?;
+        let dg = derive(self.m, self.cache, g, mask.clone(), self.n, self.target)?;
         let returns = returns_active(self.m, self.cache, g, mask.clone(), Mode::Ad)?;
         let mut new_args = args.to_vec();
         let callee_params = self.m.functions[g.index()].params.clone();
@@ -481,10 +483,7 @@ impl Ad<'_> {
                 new_args.push(match a {
                     Arg::Value(x) => {
                         let ty = callee_params[i].ty;
-                        Arg::Value(match self.t(*x, k) {
-                            Some(t) => self.coerce(out, t, ty),
-                            None => self.zero(out, ty),
-                        })
+                        Arg::Value(self.tangent_or_zero(out, self.t(*x, k), ty))
                     }
                     Arg::Place(p) => Arg::Place(self.place(p, k)?),
                 });
@@ -549,22 +548,32 @@ impl Ad<'_> {
                 match op {
                     BinOp::Add => self.add(out, da, db, ty),
                     BinOp::Sub => self.sub(out, da, db, ty),
-                    BinOp::Mul if self.same_value(*a, *b) => {
-                        // d(a²) = 2 a da
+                    BinOp::Mul
+                        if self.track.same_value(*a, *b)
+                            && !matches!(self.m.types.get(self.ty(*a)), TypeDef::Matrix(_)) =>
+                    {
+                        // d(a²) = 2 a da (a matrix product doesn't commute: dM M + M dM)
                         da.map(|da| {
-                            let two = self.f32c(out, 2.0);
+                            let two = self.fc(out, ty, 2.0);
                             let t = self.bin(out, BinOp::Mul, *a, two, ty);
-                            self.bin(out, BinOp::Mul, da, t, ty)
+                            self.scale(out, da, t, ty)
                         })
                     }
                     BinOp::Mul => {
                         let x = self.mul(out, da, *b, ty);
-                        let y = db.map(|db| self.bin(out, BinOp::Mul, *a, db, ty));
+                        // A matrix product keeps its order (`scale` sees to that).
+                        let y = db.map(|db| {
+                            if matches!(self.m.types.get(self.ty(*a)), TypeDef::Matrix(_)) {
+                                self.bin(out, BinOp::Mul, *a, db, ty)
+                            } else {
+                                self.scale(out, db, *a, ty)
+                            }
+                        });
                         self.add(out, x, y, ty)
                     }
                     BinOp::Div => {
                         // (da - v db) / b
-                        let vdb = db.map(|db| self.bin(out, BinOp::Mul, v, db, ty));
+                        let vdb = db.map(|db| self.scale(out, db, v, ty));
                         let num = self.sub(out, da, vdb, ty);
                         num.map(|n| self.div(out, n, *b, ty))
                     }
@@ -572,7 +581,7 @@ impl Ad<'_> {
                         // a - b trunc(a / b): da - db trunc(a / b)
                         let q = self.bin(out, BinOp::Div, *a, *b, ty);
                         let q = self.builtin(out, Builtin::Trunc, vec![q], ty);
-                        let dbq = db.map(|db| self.bin(out, BinOp::Mul, db, q, ty));
+                        let dbq = db.map(|db| self.scale(out, db, q, ty));
                         self.sub(out, da, dbq, ty)
                     }
                     _ => None,
@@ -587,10 +596,7 @@ impl Ad<'_> {
                     let mut comps = Vec::new();
                     for (p, tp) in parts.iter().zip(ts) {
                         let pty = self.ty(*p);
-                        comps.push(match tp {
-                            Some(x) => self.coerce(out, x, pty),
-                            None => self.zero(out, pty),
-                        });
+                        comps.push(self.tangent_or_zero(out, tp, pty));
                     }
                     Some(self.emit(out, *cty, Expr::Construct(*cty, comps)))
                 }
@@ -621,14 +627,8 @@ impl Ad<'_> {
                 if dt.is_none() && df.is_none() {
                     None
                 } else {
-                    let dt = match dt {
-                        Some(x) => self.coerce(out, x, ty),
-                        None => self.zero(out, ty),
-                    };
-                    let df = match df {
-                        Some(x) => self.coerce(out, x, ty),
-                        None => self.zero(out, ty),
-                    };
+                    let dt = self.tangent_or_zero(out, dt, ty);
+                    let df = self.tangent_or_zero(out, df, ty);
                     Some(self.emit(
                         out,
                         ty,
@@ -637,13 +637,20 @@ impl Ad<'_> {
                 }
             }
             Expr::Call(..) => unreachable!("calls are handled in `call`"),
-            Expr::Host(..) | Expr::Run(_) | Expr::Addr(_) => {
+            Expr::Addr(p) => {
+                if place_root_active(&self.act, p) {
+                    let tp = self.place(p, k)?;
+                    Some(self.emit(out, ty, Expr::Addr(tp)))
+                } else {
+                    None
+                }
+            }
+            Expr::Host(..) | Expr::Run(_) => {
                 return Err(Error::not_derivable("can't differentiate this"));
             }
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn builtin_tangent(
         &mut self,
         v: ValueId,
@@ -657,7 +664,7 @@ impl Ad<'_> {
         let d: Vec<Option<ValueId>> = args.iter().map(|a| self.t(*a, k)).collect();
         let a0 = args[0];
         let a0ty = self.ty(a0);
-        let ln2 = std::f32::consts::LN_2;
+        let ln2 = std::f64::consts::LN_2;
         Ok(match b {
             B::Floor | B::Ceil | B::Round | B::Trunc | B::Sign | B::Step | B::AllEqual => None,
             B::Dpdx | B::Dpdy | B::Fwidth => {
@@ -667,34 +674,34 @@ impl Ad<'_> {
             }
             B::Fract => d[0],
             B::Sqrt => d[0].map(|da| {
-                let two = self.f32c(out, 2.0);
+                let two = self.fc(out, ty, 2.0);
                 let den = self.bin(out, BinOp::Mul, v, two, ty);
                 self.div(out, da, den, ty)
             }),
             B::InverseSqrt => d[0].map(|da| {
-                let h = self.f32c(out, -0.5);
+                let h = self.fc(out, ty, -0.5);
                 let r2 = self.bin(out, BinOp::Mul, v, v, ty);
                 let r3 = self.bin(out, BinOp::Mul, r2, v, ty);
                 let f = self.bin(out, BinOp::Mul, r3, h, ty);
-                self.bin(out, BinOp::Mul, da, f, ty)
+                self.scale(out, da, f, ty)
             }),
             B::Sin => d[0].map(|da| {
                 let c = self.builtin(out, B::Cos, vec![a0], ty);
-                self.bin(out, BinOp::Mul, da, c, ty)
+                self.scale(out, da, c, ty)
             }),
             B::Cos => d[0].map(|da| {
                 let s = self.builtin(out, B::Sin, vec![a0], ty);
                 let ns = self.emit(out, ty, Expr::Unary(UnOp::Neg, s));
-                self.bin(out, BinOp::Mul, da, ns, ty)
+                self.scale(out, da, ns, ty)
             }),
             B::Tan => d[0].map(|da| {
-                let one = self.f32c(out, 1.0);
+                let one = self.fc(out, ty, 1.0);
                 let r2 = self.bin(out, BinOp::Mul, v, v, ty);
                 let f = self.bin(out, BinOp::Add, r2, one, ty);
-                self.bin(out, BinOp::Mul, da, f, ty)
+                self.scale(out, da, f, ty)
             }),
             B::Asin | B::Acos => d[0].map(|da| {
-                let one = self.f32c(out, 1.0);
+                let one = self.fc(out, ty, 1.0);
                 let a2 = self.bin(out, BinOp::Mul, a0, a0, ty);
                 let s = self.bin(out, BinOp::Sub, one, a2, ty);
                 let r = self.builtin(out, B::Sqrt, vec![s], ty);
@@ -702,7 +709,7 @@ impl Ad<'_> {
                 if b == B::Acos { self.emit(out, ty, Expr::Unary(UnOp::Neg, q)) } else { q }
             }),
             B::Atan => d[0].map(|da| {
-                let one = self.f32c(out, 1.0);
+                let one = self.fc(out, ty, 1.0);
                 let a2 = self.bin(out, BinOp::Mul, a0, a0, ty);
                 let s = self.bin(out, BinOp::Add, a2, one, ty);
                 self.div(out, da, s, ty)
@@ -710,8 +717,8 @@ impl Ad<'_> {
             B::Atan2 => {
                 // (x dy - y dx) / (x² + y²), with y = args[0], x = args[1].
                 let (y, x) = (args[0], args[1]);
-                let xdy = d[0].map(|dy| self.bin(out, BinOp::Mul, x, dy, ty));
-                let ydx = d[1].map(|dx| self.bin(out, BinOp::Mul, y, dx, ty));
+                let xdy = d[0].map(|dy| self.scale(out, dy, x, ty));
+                let ydx = d[1].map(|dx| self.scale(out, dx, y, ty));
                 let num = self.sub(out, xdy, ydx, ty);
                 num.map(|n| {
                     let x2 = self.bin(out, BinOp::Mul, x, x, ty);
@@ -720,65 +727,103 @@ impl Ad<'_> {
                     self.div(out, n, den, ty)
                 })
             }
-            B::Exp => d[0].map(|da| self.bin(out, BinOp::Mul, da, v, ty)),
+            B::Exp => d[0].map(|da| self.scale(out, da, v, ty)),
             B::Exp2 => d[0].map(|da| {
-                let c = self.f32c(out, ln2);
+                let c = self.fc(out, ty, ln2);
                 let f = self.bin(out, BinOp::Mul, v, c, ty);
-                self.bin(out, BinOp::Mul, da, f, ty)
+                self.scale(out, da, f, ty)
             }),
             B::Log => d[0].map(|da| self.div(out, da, a0, ty)),
             B::Log2 => d[0].map(|da| {
-                let c = self.f32c(out, ln2);
+                let c = self.fc(out, ty, ln2);
                 let den = self.bin(out, BinOp::Mul, a0, c, ty);
                 self.div(out, da, den, ty)
             }),
             B::Pow => {
-                // v (db log a + b da / a)
+                // b a^(b-1) da + a^b log(a) db. Each factor is made finite first: where a is 0
+                // and doesn't move (da = 0, as in `pow(max(x, 0), 0.5)`), the term is 0, not
+                // ∞ × 0.
                 let (a, bb) = (args[0], args[1]);
+                let big = self.fc(out, ty, f32::MAX as f64);
+                let small = self.fc(out, ty, -f32::MAX as f64);
                 let x = d[0].map(|da| {
-                    let t1 = self.bin(out, BinOp::Mul, da, bb, ty);
-                    let t2 = self.div(out, t1, a, ty);
-                    self.bin(out, BinOp::Mul, t2, v, ty)
+                    let one = self.fc(out, ty, 1.0);
+                    let bm1 = self.bin(out, BinOp::Sub, bb, one, ty);
+                    let p = self.builtin(out, B::Pow, vec![a, bm1], ty);
+                    let f = self.bin(out, BinOp::Mul, bb, p, ty);
+                    let f = self.builtin(out, B::Clamp, vec![f, small, big], ty);
+                    self.scale(out, da, f, ty)
                 });
                 let y = d[1].map(|db| {
                     let l = self.builtin(out, B::Log, vec![a], ty);
-                    let t1 = self.bin(out, BinOp::Mul, db, l, ty);
-                    self.bin(out, BinOp::Mul, t1, v, ty)
+                    let l = self.builtin(out, B::Clamp, vec![l, small, big], ty);
+                    let f = self.bin(out, BinOp::Mul, l, v, ty);
+                    self.scale(out, db, f, ty)
                 });
                 self.add(out, x, y, ty)
             }
             B::Abs => d[0].map(|da| {
                 let s = self.builtin(out, B::Sign, vec![a0], ty);
-                self.bin(out, BinOp::Mul, da, s, ty)
+                self.scale(out, da, s, ty)
             }),
+            // The taken argument's tangent; where the arguments are equal, the average of
+            // both. That's the symmetric choice (as `abs`'s, zero at zero, is), and the
+            // derivative of a smooth function written with kinks that cancel: std's `smin`,
+            // `min(a, b) - f(|a - b|)`, has 1/2 in each on its seam.
             B::Min | B::Max if self.m.types.as_scalar(ty).is_some() => {
-                // A scalar: pick the taken argument's tangent (the first's, on a tie).
                 if d[0].is_none() && d[1].is_none() {
                     return Ok(None);
                 }
                 let (a, bb) = (args[0], args[1]);
                 let bt = self.m.types.bool();
-                let op = if b == B::Min { BinOp::Le } else { BinOp::Ge };
+                let op = if b == B::Min { BinOp::Lt } else { BinOp::Gt };
                 let first = self.emit(out, bt, Expr::Binary(op, a, bb));
-                let x = match d[0] {
-                    Some(t) => t,
-                    None => self.zero(out, ty),
-                };
-                let y = match d[1] {
-                    Some(t) => t,
-                    None => self.zero(out, ty),
-                };
-                Some(self.emit(out, ty, Expr::Select { cond: first, if_true: x, if_false: y }))
+                let tie = self.emit(out, bt, Expr::Binary(BinOp::Eq, a, bb));
+                let half = self.fc(out, ty, 0.5);
+                if self.target == Target::Gpu {
+                    // A weight w (1, 1/2 or 0), shared by the directions: one `mix` each. A
+                    // `select` and an average each measured over the grazer's 1.25× (WGSL may
+                    // assume the tangent not taken is finite, which `mix` needs).
+                    let one = self.fc(out, ty, 1.0);
+                    let zero = self.fc(out, ty, 0.0);
+                    let w = self.emit(
+                        out,
+                        ty,
+                        Expr::Select { cond: first, if_true: one, if_false: zero },
+                    );
+                    let w =
+                        self.emit(out, ty, Expr::Select { cond: tie, if_true: half, if_false: w });
+                    return Ok(Some(match (d[0], d[1]) {
+                        (Some(x), Some(y)) => self.builtin(out, B::Mix, vec![y, x, w], ty),
+                        (Some(x), None) => self.scale(out, x, w, ty),
+                        (None, y) => {
+                            let y = self.tangent_or_zero(out, y, ty);
+                            let nw = self.bin(out, BinOp::Sub, one, w, ty);
+                            self.scale(out, y, nw, ty)
+                        }
+                    }));
+                }
+                // On the CPU, selects: a tangent not taken may be infinite (a square root's at 0).
+                let x = self.tangent_or_zero(out, d[0], ty);
+                let y = self.tangent_or_zero(out, d[1], ty);
+                let pick =
+                    self.emit(out, ty, Expr::Select { cond: first, if_true: x, if_false: y });
+                let sum = self.add(out, d[0], d[1], ty).unwrap_or(x);
+                let avg = self.bin(out, BinOp::Mul, sum, half, ty);
+                Some(self.emit(out, ty, Expr::Select { cond: tie, if_true: avg, if_false: pick }))
             }
             B::Min | B::Max => {
-                // m picks the argument that's taken (the first, on a tie).
+                // m is 1 where the first argument is taken, 0 where the second is, and 1/2 on a
+                // tie (as for a scalar): (step(a, b) - step(b, a) + 1) / 2 for `min`.
                 let (a, bb) = (args[0], args[1]);
-                let m = if b == B::Min {
-                    self.builtin(out, B::Step, vec![a, bb], ty)
-                } else {
-                    self.builtin(out, B::Step, vec![bb, a], ty)
-                };
-                let one = self.f32c(out, 1.0);
+                let (p, q) = if b == B::Min { (a, bb) } else { (bb, a) };
+                let s = self.builtin(out, B::Step, vec![p, q], ty);
+                let t = self.builtin(out, B::Step, vec![q, p], ty);
+                let diff = self.bin(out, BinOp::Sub, s, t, ty);
+                let half = self.fc(out, ty, 0.5);
+                let h = self.bin(out, BinOp::Mul, diff, half, ty);
+                let m = self.bin(out, BinOp::Add, h, half, ty);
+                let one = self.fc(out, ty, 1.0);
                 let not_m = self.bin(out, BinOp::Sub, one, m, ty);
                 let x = self.mul(out, d[0], m, ty);
                 let y = self.mul(out, d[1], not_m, ty);
@@ -790,7 +835,7 @@ impl Ad<'_> {
                 let above_lo = self.builtin(out, B::Step, vec![lo, x], ty);
                 let below_hi = self.builtin(out, B::Step, vec![x, hi], ty);
                 let inside = self.bin(out, BinOp::Mul, above_lo, below_hi, ty);
-                let one = self.f32c(out, 1.0);
+                let one = self.fc(out, ty, 1.0);
                 let not_lo = self.bin(out, BinOp::Sub, one, above_lo, ty);
                 let not_hi = self.bin(out, BinOp::Sub, one, below_hi, ty);
                 let t1 = self.mul(out, d[0], inside, ty);
@@ -801,24 +846,24 @@ impl Ad<'_> {
             }
             B::Saturate => d[0].map(|dx| {
                 let zero = self.zero(out, ty);
-                let one = self.f32c(out, 1.0);
+                let one = self.fc(out, ty, 1.0);
                 let onev = self.coerce(out, one, ty);
                 let a = self.builtin(out, B::Step, vec![zero, a0], ty);
                 let bb = self.builtin(out, B::Step, vec![a0, onev], ty);
                 let inside = self.bin(out, BinOp::Mul, a, bb, ty);
-                self.bin(out, BinOp::Mul, dx, inside, ty)
+                self.scale(out, dx, inside, ty)
             }),
             B::Mix => {
                 // da (1 - t) + db t + (b - a) dt
                 let (a, bb, tt) = (args[0], args[1], args[2]);
                 let ttype = self.ty(tt);
-                let one = self.f32c(out, 1.0);
+                let one = self.fc(out, ttype, 1.0);
                 let omt = self.bin(out, BinOp::Sub, one, tt, ttype);
                 let x = self.mul(out, d[0], omt, ty);
                 let y = self.mul(out, d[1], tt, ty);
                 let z = d[2].map(|dt| {
                     let ba = self.bin(out, BinOp::Sub, bb, a, ty);
-                    self.bin(out, BinOp::Mul, ba, dt, ty)
+                    self.scale(out, dt, ba, ty)
                 });
                 let s = self.add(out, x, y, ty);
                 self.add(out, s, z, ty)
@@ -831,49 +876,49 @@ impl Ad<'_> {
                 let xe = self.bin(out, BinOp::Sub, x, e0, ty);
                 let u = self.bin(out, BinOp::Div, xe, w, ty);
                 let de = self.sub(out, d[1], d[0], ty);
-                let ude = de.map(|de| self.bin(out, BinOp::Mul, u, de, ty));
+                let ude = de.map(|de| self.scale(out, de, u, ty));
                 let n1 = self.sub(out, d[2], d[0], ty);
                 let num = self.sub(out, n1, ude, ty);
                 num.map(|num| {
                     let du = self.div(out, num, w, ty);
                     let zero = self.zero(out, ty);
-                    let one = self.f32c(out, 1.0);
+                    let one = self.fc(out, ty, 1.0);
                     let onev = self.coerce(out, one, ty);
                     let t = self.builtin(out, B::Clamp, vec![u, zero, onev], ty);
                     let omt = self.bin(out, BinOp::Sub, onev, t, ty);
-                    let six = self.f32c(out, 6.0);
+                    let six = self.fc(out, ty, 6.0);
                     let tt = self.bin(out, BinOp::Mul, t, omt, ty);
                     let f = self.bin(out, BinOp::Mul, tt, six, ty);
-                    self.bin(out, BinOp::Mul, du, f, ty)
+                    self.scale(out, du, f, ty)
                 })
             }
             B::Length => d[0].map(|dx| {
-                if matches!(self.m.types.get(a0ty), TypeDef::Vector(_)) {
+                if self.m.types.is_vector(a0ty) {
                     let dot = self.builtin(out, B::Dot, vec![a0, dx], ty);
                     self.div_from_zero(out, dot, v, ty)
                 } else {
                     let s = self.builtin(out, B::Sign, vec![a0], ty);
-                    self.bin(out, BinOp::Mul, dx, s, ty)
+                    self.scale(out, dx, s, ty)
                 }
             }),
             B::Distance => {
                 let dd = self.sub(out, d[0], d[1], a0ty);
                 dd.map(|dd| {
                     let diff = self.bin(out, BinOp::Sub, args[0], args[1], a0ty);
-                    if matches!(self.m.types.get(a0ty), TypeDef::Vector(_)) {
+                    if self.m.types.is_vector(a0ty) {
                         let dot = self.builtin(out, B::Dot, vec![diff, dd], ty);
                         self.div_from_zero(out, dot, v, ty)
                     } else {
                         let s = self.builtin(out, B::Sign, vec![diff], ty);
-                        self.bin(out, BinOp::Mul, dd, s, ty)
+                        self.scale(out, dd, s, ty)
                     }
                 })
             }
-            B::Dot if self.same_value(args[0], args[1]) => d[0].map(|da| {
+            B::Dot if self.track.same_value(args[0], args[1]) => d[0].map(|da| {
                 // d(v·v) = 2 v·dv
                 let dot = self.builtin(out, B::Dot, vec![a0, da], ty);
-                let two = self.f32c(out, 2.0);
-                self.bin(out, BinOp::Mul, dot, two, ty)
+                let two = self.fc(out, ty, 2.0);
+                self.scale(out, dot, two, ty)
             }),
             B::Dot => {
                 let x = d[0].map(|da| self.builtin(out, B::Dot, vec![da, args[1]], ty));

@@ -1,7 +1,7 @@
 // accepts: gpu.entry gpu.kernel-mut gpu.data gpu.dispatch gpu.workgroup eff.gpu attr.gpu attr.closed
 use std::gpu::{
-    ClipPosition, FragCoord, GlobalId, GpuBuffer, Slots, VertexIndex, begin_screen_pass, buffer,
-    dispatch, draw, present, write,
+    ClipPosition, FragCoord, Flat, GlobalId, GpuBuffer, Slots, VertexIndex, begin_screen_pass,
+    buffer, dispatch, draw, present, write,
 }
 
 struct Params: Copy + Clone + GpuData {
@@ -21,6 +21,14 @@ fn fill(p: Params, input: [f32], out: mut Slots<f32>, id: GlobalId) {
     }
 }
 
+// A named function and a closure bound with `let` and called: both are resolved statically.
+@compute(64)
+fn named(out: mut Slots<f32>, id: GlobalId) {
+    let h = twice
+    let c = |v: f32| h(v) + 1.0
+    out[id] = h(c(f32(id.x)))
+}
+
 @compute(8, 8)
 fn grid(out: mut Slots<u32>, id: GlobalId) {
     out[id] = id.x + id.y
@@ -34,6 +42,28 @@ fn cover(v: VertexIndex) -> ClipPosition {
 @fragment
 fn paint(pixel: FragCoord, p: Params) -> vec4 {
     vec4(pixel.position.xy * p.scale, 0.0, 1.0)
+}
+
+// A vertex output's values pass to the fragment shader, which takes them whether or not
+// anything draws the two yet.
+struct Lit: Copy + Clone {
+    pos: ClipPosition,
+    tint: vec4,
+    id: Flat<u32>,
+}
+
+@vertex
+fn spot(v: VertexIndex) -> Lit {
+    Lit {
+        pos: ClipPosition { position: vec4(0.0, 0.0, 0.0, 1.0) },
+        tint: vec4(1.0),
+        id: Flat { value: v.index },
+    }
+}
+
+@fragment
+fn glow(o: Lit) -> vec4 {
+    o.tint * f32(o.id.value)
 }
 
 pub fn frame(time: f32, width: u32, height: u32) {

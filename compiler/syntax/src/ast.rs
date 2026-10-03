@@ -1,6 +1,7 @@
 //! The abstract syntax tree. It keeps enough of the source's shape (parentheses, multi-line
 //! lists, leading-dot chains) for the formatter to reproduce it.
 
+use crate::token::TokenKind;
 use wrela_diag::Span;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -93,11 +94,6 @@ impl Param {
             Param::SelfParam { span, .. } | Param::Named { span, .. } => *span,
         }
     }
-    pub fn mode(&self) -> Mode {
-        match self {
-            Param::SelfParam { mode, .. } | Param::Named { mode, .. } => *mode,
-        }
-    }
 }
 
 /// `-> T`, `-> borrow T` or `-> mut T`.
@@ -119,6 +115,8 @@ pub struct FnDecl {
     pub name: Ident,
     pub generics: Vec<GenericParam>,
     pub params: Vec<Param>,
+    /// The `)` that closes the parameters.
+    pub params_close: Span,
     pub ret: Option<RetType>,
     pub body: Option<Block>,
     /// The signature, from `fn` to the end of the return type.
@@ -129,6 +127,13 @@ pub struct FnDecl {
 pub struct TypeExpr {
     pub kind: TypeExprKind,
     pub span: Span,
+}
+
+impl TypeExpr {
+    /// Where a type failed to parse.
+    pub fn error(span: Span) -> TypeExpr {
+        TypeExpr { kind: TypeExprKind::Error, span }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -280,16 +285,6 @@ pub struct Block {
     pub span: Span,
 }
 
-impl Block {
-    /// The block's value: its last statement, when that's an expression.
-    pub fn tail(&self) -> Option<&Expr> {
-        match self.stmts.last().map(|s| &s.kind) {
-            Some(StmtKind::Expr(e)) => Some(e),
-            _ => None,
-        }
-    }
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub struct Stmt {
     pub kind: StmtKind,
@@ -329,6 +324,25 @@ pub enum AssignOp {
 }
 
 impl AssignOp {
+    /// The assignment a token is, if it's one.
+    pub fn from_token(k: TokenKind) -> Option<AssignOp> {
+        Some(match k {
+            TokenKind::Eq => AssignOp::Assign,
+            TokenKind::PlusEq => AssignOp::Add,
+            TokenKind::MinusEq => AssignOp::Sub,
+            TokenKind::StarEq => AssignOp::Mul,
+            TokenKind::SlashEq => AssignOp::Div,
+            TokenKind::PercentEq => AssignOp::Rem,
+            TokenKind::StarStarEq => AssignOp::Pow,
+            TokenKind::AmpEq => AssignOp::BitAnd,
+            TokenKind::PipeEq => AssignOp::BitOr,
+            TokenKind::CaretEq => AssignOp::BitXor,
+            TokenKind::ShlEq => AssignOp::Shl,
+            TokenKind::ShrEq => AssignOp::Shr,
+            _ => return None,
+        })
+    }
+
     pub fn text(self) -> &'static str {
         match self {
             AssignOp::Assign => "=",
@@ -437,6 +451,49 @@ pub enum BinOp {
 }
 
 impl BinOp {
+    /// The binary operator a token is, if it's one.
+    pub fn from_token(k: TokenKind) -> Option<BinOp> {
+        Some(match k {
+            TokenKind::OrOr => BinOp::Or,
+            TokenKind::AndAnd => BinOp::And,
+            TokenKind::EqEq => BinOp::Eq,
+            TokenKind::Ne => BinOp::Ne,
+            TokenKind::Lt => BinOp::Lt,
+            TokenKind::Le => BinOp::Le,
+            TokenKind::Gt => BinOp::Gt,
+            TokenKind::Ge => BinOp::Ge,
+            TokenKind::Pipe => BinOp::BitOr,
+            TokenKind::Caret => BinOp::BitXor,
+            TokenKind::Amp => BinOp::BitAnd,
+            TokenKind::Shl => BinOp::Shl,
+            TokenKind::Shr => BinOp::Shr,
+            TokenKind::Plus => BinOp::Add,
+            TokenKind::Minus => BinOp::Sub,
+            TokenKind::Star => BinOp::Mul,
+            TokenKind::Slash => BinOp::Div,
+            TokenKind::Percent => BinOp::Rem,
+            TokenKind::StarStar => BinOp::Pow,
+            _ => return None,
+        })
+    }
+
+    /// How tightly the operator binds, from 0 (`||`) to 9 (`**`). Each level is one level of
+    /// the grammar's binary expressions; `**` has its own rule (power_expr).
+    pub fn precedence(self) -> u8 {
+        match self {
+            BinOp::Or => 0,
+            BinOp::And => 1,
+            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => 2,
+            BinOp::BitOr => 3,
+            BinOp::BitXor => 4,
+            BinOp::BitAnd => 5,
+            BinOp::Shl | BinOp::Shr => 6,
+            BinOp::Add | BinOp::Sub => 7,
+            BinOp::Mul | BinOp::Div | BinOp::Rem => 8,
+            BinOp::Pow => 9,
+        }
+    }
+
     pub fn text(self) -> &'static str {
         match self {
             BinOp::Or => "||",
@@ -468,12 +525,32 @@ impl BinOp {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum LitKind {
-    Int,
-    Float,
+    Int(IntValue),
+    Float(f64),
     Bool(bool),
     Str,
     /// A number with a unit suffix (tier 1).
     Suffixed,
+}
+
+/// The value of an integer literal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IntValue {
+    Ok(u64),
+    /// It doesn't fit in a `u64`.
+    TooLarge,
+    /// It isn't a number (`0x`, `1e`): the lexer reported it (E0004).
+    Malformed,
+}
+
+impl IntValue {
+    /// The value, if it's a number that fits in a `u64`.
+    pub fn ok(self) -> Option<u64> {
+        match self {
+            IntValue::Ok(v) => Some(v),
+            IntValue::TooLarge | IntValue::Malformed => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -624,6 +701,13 @@ pub struct Pat {
     pub span: Span,
 }
 
+impl Pat {
+    /// Where a pattern failed to parse.
+    pub fn error(span: Span) -> Pat {
+        Pat { kind: PatKind::Error, span }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum PatKind {
     Wild,
@@ -647,6 +731,15 @@ pub enum PatKind {
 }
 
 impl Expr {
+    pub fn new(kind: ExprKind, span: Span) -> Expr {
+        Expr { kind, span }
+    }
+
+    /// A placeholder after a syntax error.
+    pub fn error(span: Span) -> Expr {
+        Expr { kind: ExprKind::Error, span }
+    }
+
     /// Calls `f` on each expression directly inside this one: operands, arguments, fields, the
     /// expressions of a block's statements, arms (guards and bodies) and a closure's body.
     pub fn for_each_child<'a>(&'a self, f: &mut impl FnMut(&'a Expr)) {

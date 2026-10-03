@@ -1,7 +1,28 @@
 // rejects: gpu.kernel-mut
-use std::gpu::GlobalId
+use std::gpu::{GlobalId, Slots}
 
 @compute(64)
 fn fill(out: mut [f32], id: GlobalId) { //~ E0601
     out[id.x] = 1.0
+}
+
+// A `Slots` index is the invocation's own `GlobalId`: one can't be built or changed.
+@gpu
+fn neighbour(id: GlobalId) -> GlobalId {
+    GlobalId { x: id.x + 1, ..id } //~ E0601
+}
+
+@gpu
+fn bump(g: mut GlobalId) {
+    g.x += 1 //~ E0601
+}
+
+@compute(64)
+fn others(out: mut Slots<u32>, id: GlobalId) {
+    out[GlobalId { x: 0, y: 0, z: 0 }] = id.x //~ E0601
+    var g = id
+    g.x = g.x + 1 //~ E0601
+    out[g] = id.x
+    out[neighbour(id)] = 1
+    out[id] = id.x + 7
 }

@@ -1,10 +1,9 @@
 // The main-thread shim: hands the canvas to the render worker, forwards its size (in device
 // pixels) and the page's visibility, and shows fatal errors on the page and in the console.
 
+import { errorMessage } from "./errors.ts";
 import type { FromWorker, ToWorker } from "./messages.ts";
-import { isLoopback, parseTestParams, putResult, type TestParams } from "./testmode.ts";
-
-const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
+import { asksForTest, isLoopback, parseTestParams, putResult } from "./testmode.ts";
 
 let shown = false;
 
@@ -20,10 +19,11 @@ function showFatal(text: string): void {
   document.body.append(box);
 }
 
-/** A failure before the worker could report it: show it, and in test mode, end the test. */
-function failEarly(e: unknown, test: TestParams | null): void {
-  showFatal(message(e));
-  if (test) putResult(document.baseURI, "DONE", message(e)).catch((err: unknown) => console.error(message(err)));
+/** A failure before the worker could report it: show it, and in test mode (even with bad
+ * parameters), end the test. */
+function failEarly(e: unknown, testing: boolean): void {
+  showFatal(errorMessage(e));
+  if (testing) putResult(document.baseURI, "DONE", errorMessage(e)).catch((err: unknown) => console.error(errorMessage(err)));
 }
 
 /** The canvas's size in device pixels. */
@@ -34,10 +34,23 @@ function devicePixels(canvas: HTMLCanvasElement, entry?: ResizeObserverEntry): {
   return { width: Math.round(canvas.clientWidth * dpr), height: Math.round(canvas.clientHeight * dpr) };
 }
 
+/** Calls `f` each time `window.devicePixelRatio` changes. */
+function onPixelRatioChange(f: () => void): void {
+  const query = matchMedia(`(resolution: ${window.devicePixelRatio}dppx)`);
+  query.addEventListener(
+    "change",
+    () => {
+      f();
+      onPixelRatioChange(f);
+    },
+    { once: true },
+  );
+}
+
 function start(): void {
-  let test: TestParams | null = null;
+  const testing = isLoopback(location.hostname) && asksForTest(location.hash);
   try {
-    test = isLoopback(location.hostname) ? parseTestParams(location.hash) : null;
+    const test = testing ? parseTestParams(location.hash) : null;
     const canvas = document.querySelector<HTMLCanvasElement>("canvas#screen");
     if (!canvas) throw new Error("the page has no <canvas id=\"screen\">");
     if (!("gpu" in navigator)) throw new Error("this browser doesn't support WebGPU");
@@ -46,30 +59,41 @@ function start(): void {
     }
     if (test) {
       // The canvas shows the test frame at its own size.
-      canvas.style.width = `${test.width / (window.devicePixelRatio || 1)}px`;
-      canvas.style.height = `${test.height / (window.devicePixelRatio || 1)}px`;
+      const dpr = window.devicePixelRatio || 1;
+      canvas.style.width = `${test.width / dpr}px`;
+      canvas.style.height = `${test.height / dpr}px`;
     }
     const workerUrl = "worker.js";
     const worker = new Worker(new URL(workerUrl, import.meta.url), { type: "module", name: "wrela render" });
     worker.onmessage = (event: MessageEvent<FromWorker>) => showFatal(event.data.message);
     worker.onerror = (event) => {
       event.preventDefault();
-      failEarly(new Error(`the render worker failed: ${event.message || "it couldn't start"}`), test);
+      failEarly(new Error(`the render worker failed: ${event.message || "it couldn't start"}`), testing);
     };
     const offscreen = canvas.transferControlToOffscreen();
     const { width, height } = devicePixels(canvas);
     const msg: ToWorker = { type: "start", canvas: offscreen, base: document.baseURI, width, height, test };
     worker.postMessage(msg, [offscreen]);
     if (!test) {
-      new ResizeObserver(([entry]) => {
+      const resize = (entry?: ResizeObserverEntry) =>
         worker.postMessage({ type: "resize", ...devicePixels(canvas, entry) } satisfies ToWorker);
-      }).observe(canvas);
-      document.addEventListener("visibilitychange", () => {
+      const observer = new ResizeObserver(([entry]) => resize(entry));
+      try {
+        // The size in device pixels also changes with the pixel ratio alone (a move to
+        // another screen, or zoom).
+        observer.observe(canvas, { box: "device-pixel-content-box" });
+      } catch {
+        // Not supported (Safari): watch the pixel ratio.
+        observer.observe(canvas);
+        onPixelRatioChange(() => resize());
+      }
+      const visibility = () =>
         worker.postMessage({ type: "visibility", visible: document.visibilityState === "visible" } satisfies ToWorker);
-      });
+      document.addEventListener("visibilitychange", visibility);
+      visibility(); // the page may open hidden, in a background tab
     }
   } catch (e) {
-    failEarly(e, test);
+    failEarly(e, testing);
   }
 }
 

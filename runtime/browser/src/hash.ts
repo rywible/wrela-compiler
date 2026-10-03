@@ -26,10 +26,6 @@ export class StateHash {
     this.#lo = lo;
   }
 
-  value(): bigint {
-    return (BigInt(this.#hi) << 32n) | BigInt(this.#lo);
-  }
-
   /** Sixteen lowercase hex digits, as both hosts print it. */
   hex(): string {
     return this.#hi.toString(16).padStart(8, "0") + this.#lo.toString(16).padStart(8, "0");

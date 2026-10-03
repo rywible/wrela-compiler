@@ -1,0 +1,49 @@
+// run: compound assignments: a shift amount and an integer's exponent are `u32`s
+// expect: shr_i32(9) = 4
+// expect: shl_i64(1) = 8
+// expect: shl_u8(1) = 16
+// expect: shr_by(64, 3) = 8
+// expect: pow_i32(3) = 9
+// expect: pow_f32(3.0) = 9.0
+// expect: quantized(3) = 768
+
+pub fn shr_i32(x: i32) -> i32 {
+    var v = x
+    v >>= 1
+    v
+}
+
+pub fn shl_i64(x: i64) -> i64 {
+    var v = x
+    v <<= 3
+    v
+}
+
+pub fn shl_u8(x: u8) -> u8 {
+    var v = x
+    v <<= 4
+    v
+}
+
+pub fn shr_by(x: i32, k: u32) -> i32 {
+    var v = x
+    v >>= k
+    v
+}
+
+pub fn pow_i32(x: i32) -> i32 {
+    var v = x
+    v **= 2
+    v
+}
+
+pub fn pow_f32(x: f32) -> f32 {
+    var v = x
+    v **= 2.0
+    v
+}
+
+pub fn quantized(x: u32) -> u32 {
+    let steps = 1 << 8
+    x * steps
+}

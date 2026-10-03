@@ -15,9 +15,10 @@
 //! errors the compiler reports, through lowering, must be exactly the marked ones; an
 //! accepting case must report none. Warnings aren't checked.
 
+use crate::scratch;
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
-use wrela_tests::root;
+use std::path::Path;
+use wrela_tests::{cases, files_under, header, repo_root};
 
 /// The tier-0 rules, by section of docs/language.md.
 const RULES: &[(&str, &str)] = &[
@@ -92,6 +93,7 @@ const RULES: &[(&str, &str)] = &[
     ("gpu.dispatch", "`dispatch` and `draw` match their entry points; entry points aren't called"),
     ("gpu.cpu", "GPU builtins and derivatives only in GPU code"),
     ("gpu.workgroup", "workgroup sizes within WebGPU's limits"),
+    ("gpu.uniformity", "derivatives only where every pixel reaches them (uniform control flow)"),
     // §13 derived interpretations
     ("derive.gradient", "`gradient` of a closure or function of an f32 or float vector"),
     (
@@ -110,36 +112,26 @@ struct Case {
     expected: BTreeMap<(String, usize), Vec<String>>,
 }
 
-fn parse_header(text: &str, key: &str) -> Vec<String> {
-    text.lines()
-        .take_while(|l| l.starts_with("//"))
-        .filter_map(|l| l.strip_prefix(&format!("// {key}:")))
-        .flat_map(|rest| rest.split_whitespace().map(String::from))
-        .collect()
+/// The rules a case's header names after `key`.
+fn rules(text: &str, key: &str) -> Vec<String> {
+    header(text, key).flat_map(str::split_whitespace).map(String::from).collect()
 }
 
 fn load_case(path: &Path) -> Case {
     let name = path.file_name().expect("name").to_string_lossy().into_owned();
-    let mut files = Vec::new();
-    if path.is_dir() {
-        let mut stack = vec![path.to_path_buf()];
-        while let Some(d) = stack.pop() {
-            for e in std::fs::read_dir(&d).expect("case dir") {
-                let p = e.expect("entry").path();
-                if p.is_dir() {
-                    stack.push(p);
-                    continue;
-                }
+    let files: Vec<(String, String)> = if path.is_dir() {
+        files_under(path, &[])
+            .iter()
+            .map(|p| {
                 let rel = p.strip_prefix(path).expect("inside").to_string_lossy().into_owned();
-                files.push((rel, std::fs::read_to_string(&p).expect("read")));
-            }
-        }
-        files.sort();
+                (rel, std::fs::read_to_string(p).expect("read"))
+            })
+            .collect()
     } else {
-        files.push(("main.wrela".into(), std::fs::read_to_string(path).expect("read")));
-    }
+        vec![("main.wrela".into(), std::fs::read_to_string(path).expect("read"))]
+    };
     let main = &files.iter().find(|f| f.0 == "main.wrela").expect("a main.wrela").1;
-    let (accepts, rejects) = (parse_header(main, "accepts"), parse_header(main, "rejects"));
+    let (accepts, rejects) = (rules(main, "accepts"), rules(main, "rejects"));
     let mut expected: BTreeMap<(String, usize), Vec<String>> = BTreeMap::new();
     for (file, text) in &files {
         for (i, line) in text.lines().enumerate() {
@@ -164,8 +156,7 @@ fn load_case(path: &Path) -> Case {
 
 /// The errors a case's package gets, through lowering: (file, line) -> codes.
 fn errors(case: &Case) -> BTreeMap<(String, usize), Vec<String>> {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("conformance").join(&case.name);
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = scratch(&format!("conformance/{}", case.name));
     for (file, text) in &case.files {
         let p = dir.join(file);
         std::fs::create_dir_all(p.parent().expect("parent")).expect("dir");
@@ -173,7 +164,12 @@ fn errors(case: &Case) -> BTreeMap<(String, usize), Vec<String>> {
     }
     let built = wrela_driver::build(&dir);
     let mut out: BTreeMap<(String, usize), Vec<String>> = BTreeMap::new();
-    for d in built.diagnostics.iter().filter(|d| d.is_error()) {
+    // A case is about something else than `frame`, which a program must export: a case
+    // without one isn't told so (`a_program_without_frame_is_rejected` is).
+    let no_frame = |d: &wrela_diag::Diagnostic| {
+        d.code == wrela_diag::codes::E0703 && d.span().is_some_and(|s| s.start == 0 && s.end == 0)
+    };
+    for d in built.diagnostics.iter().filter(|d| d.is_error() && !no_frame(d)) {
         let Some(span) = d.span() else {
             // An internal error: a case can't expect one.
             out.entry(("<internal>".into(), 0)).or_default().push(d.code.as_str().to_string());
@@ -193,23 +189,13 @@ fn errors(case: &Case) -> BTreeMap<(String, usize), Vec<String>> {
 
 #[test]
 fn conformance() {
-    let dir = root().join("compiler/tests/conformance");
-    let mut paths: Vec<PathBuf> = std::fs::read_dir(&dir)
-        .expect("conformance dir")
-        .map(|e| e.expect("entry").path())
-        .collect();
-    paths.sort();
+    let paths = cases(&repo_root().join("compiler/tests/conformance"));
     let known: BTreeSet<&str> = RULES.iter().map(|r| r.0).collect();
     let mut accepted: BTreeSet<String> = BTreeSet::new();
     let mut rejected: BTreeSet<String> = BTreeSet::new();
     let mut failures = Vec::new();
-    let mut count = 0;
-    for path in paths {
-        if !(path.is_dir() || path.extension().is_some_and(|e| e == "wrela")) {
-            continue;
-        }
-        count += 1;
-        let case = load_case(&path);
+    for path in &paths {
+        let case = load_case(path);
         for r in case.accepts.iter().chain(&case.rejects) {
             assert!(known.contains(r.as_str()), "{}: unknown rule `{r}`", case.name);
         }
@@ -252,7 +238,20 @@ fn conformance() {
             })
         })
         .collect();
-    println!("{count} conformance cases cover {} rules", RULES.len());
+    println!("{} conformance cases cover {} rules", paths.len(), RULES.len());
     assert!(failures.is_empty(), "{} cases failed:\n{}", failures.len(), failures.join("\n"));
     assert!(missing.is_empty(), "rules without cases:\n{}", missing.join("\n"));
+}
+
+/// A program without `frame` is an error (E0703) at the start of main.wrela, since no host can
+/// run it. (The cases aren't told: see `errors`.)
+#[test]
+fn a_program_without_frame_is_rejected() {
+    let dir = scratch("conformance-no-frame");
+    std::fs::write(dir.join("main.wrela"), "pub fn f() -> f32 {\n    1.0\n}\n").expect("write");
+    let built = wrela_driver::build(&dir);
+    let errors: Vec<_> = built.diagnostics.iter().filter(|d| d.is_error()).collect();
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(errors[0].code.as_str(), "E0703");
+    assert_eq!(errors[0].span().map(|s| (s.start, s.end)), Some((0, 0)));
 }

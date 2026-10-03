@@ -2,27 +2,12 @@
 // own encoders and decoders): this runtime must make the same of each, down to the messages.
 
 import { describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import { Checker, CommandError } from "../src/check.ts";
 import { StateHash } from "../src/hash.ts";
 import { Lines } from "../src/lines.ts";
 import { parseManifest } from "../src/manifest.ts";
 import { decode, Sequencer, StreamError } from "../src/stream.ts";
-
-interface ErrorVector {
-  kind: string;
-  message: string;
-}
-
-interface Vectors {
-  hashes: { bytes: string; hash: string }[];
-  batches: { name: string; bytes: string; outcome: { commands?: unknown[]; error?: ErrorVector } }[];
-  sequences: { name: string; bytes: string; error: ErrorVector | null }[];
-  manifests: { name: string; json: string; error: string | null }[];
-  lines: { name: string; bytes: string; at: [number, string | null][]; error: string | null }[];
-}
-
-const vectors: Vectors = JSON.parse(readFileSync(join(import.meta.dir, "../../abi/vectors.json"), "utf8"));
+import { type ErrorVector, vectors } from "./fixtures.ts";
 
 const bytes = (hex: string) => Uint8Array.from(hex.match(/../g) ?? [], (b) => Number.parseInt(b, 16));
 
@@ -79,6 +64,27 @@ describe("sequences", () => {
   }
 });
 
+describe("checks", () => {
+  const manifest = parseManifest(vectors.checks.manifest);
+  for (const v of vectors.checks.batches) {
+    test(v.name, () => {
+      const s = new Sequencer();
+      const checker = new Checker(manifest);
+      let error: { opcode: string; message: string } | null = null;
+      try {
+        for (const c of decode(bytes(v.bytes))) {
+          s.step(c);
+          checker.check(c);
+        }
+      } catch (e) {
+        expect(e).toBeInstanceOf(CommandError);
+        error = { opcode: (e as CommandError).opcode, message: (e as Error).message };
+      }
+      expect(error).toEqual(v.error);
+    });
+  }
+});
+
 describe("manifests", () => {
   for (const v of vectors.manifests) {
     test(v.name, () => {
@@ -88,7 +94,8 @@ describe("manifests", () => {
       } catch (e) {
         error = (e as Error).message;
       }
-      expect(error).toBe(v.error);
+      if (v.malformed) expect(error).toStartWith("invalid manifest: ");
+      else expect(error).toBe(v.error);
     });
   }
 });

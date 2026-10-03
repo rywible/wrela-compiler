@@ -1,7 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
 import { type Manifest, ManifestError, parseManifest } from "../src/manifest.ts";
+import { readFixtureText } from "./fixtures.ts";
 
 // Versions and the pipeline checks, with their messages, are in the ABI's vectors
 // (vectors.test.ts); these are what only this parser does.
@@ -69,8 +68,7 @@ test("parses the Rust crate's golden manifest", () => {
 });
 
 test("parses the first-light fixture", () => {
-  const json = readFileSync(join(import.meta.dir, "../../fixtures/first-light/manifest.json"), "utf8");
-  const m = parseManifest(json);
+  const m = parseManifest(readFixtureText("manifest.json"));
   expect(m.pipelines.map((p) => [p.name, p.kind])).toEqual([
     ["first-light", "render"],
     ["fill", "compute"],

@@ -6,3 +6,101 @@ struct Holder {
 fn make(k: f32) -> fn(f32) -> f32 { //~ E0510
     |x| x * k
 }
+
+struct Big {
+    a: i32,
+    b: i32,
+}
+
+enum E {
+    One { big: Big },
+    Two { f: f32 },
+}
+
+struct V {
+    x: f32,
+    y: f32,
+}
+
+struct Box<T> {
+    item: T,
+}
+
+fn run(f: fn()) {
+    f()
+}
+
+fn apply(f: fn(f32) -> f32, x: f32) -> f32 {
+    f(x)
+}
+
+fn pass<T>(v: take T) -> T {
+    v
+}
+
+fn pair(a: mut i32, b: mut i32) {
+    a += 1
+    b += 1
+}
+
+fn eat(v: take V) -> f32 {
+    v.x
+}
+
+// A `mut` projection inside a closure writes what it captured.
+fn through_let() -> f32 {
+    let v = V { x: 1.0, y: 2.0 }
+    run(|| { //~ E0512
+        mut p = v.x
+        p = 42.0
+    })
+    v.x
+}
+
+fn through_borrowed(a: V) -> f32 {
+    run(|| { //~ E0512
+        mut p = a
+        p.x = 99.0
+    })
+    a.x
+}
+
+// Inside a closure, its own projections and arguments still can't overlap what it captured.
+fn captured_overlap() -> i32 {
+    var x = 1
+    run(|| { pair(mut x, mut x) }) //~ E0513
+    x
+}
+
+fn captured_confusion() -> i32 {
+    var e = E::One { big: Big { a: 7, b: 8 } }
+    var out = 0
+    run(|| {
+        out = match e {
+            E::One { big } => {
+                e = E::Two { f: 1.5 } //~ E0507
+                big.a
+            }
+            E::Two { f: _f } => 0
+        }
+    })
+    out
+}
+
+// A closure isn't projected with `mut`.
+fn mut_closure() -> f32 {
+    var v = V { x: 1.0, y: 2.0 }
+    mut c = || { v.x = 5.0 } //~ E0512
+    let r = eat(take v) //~ E0506
+    c()
+    r
+}
+
+// A closure can't be stored, or go through a generic that could return or store it.
+fn stored(k: f32) -> f32 {
+    let t = (|x: f32| x * k, 9) //~ E0510
+    let o = Some(|x: f32| x * k) //~ E0510
+    let b = Box { item: |x: f32| x * k } //~ E0510
+    let f = pass(|x: f32| x * k) //~ E0510
+    apply(f, 1.0)
+}

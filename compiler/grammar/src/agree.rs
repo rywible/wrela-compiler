@@ -6,7 +6,9 @@
 //!    NEWLINEs included.
 //! 2. The oracle accepts exactly when the hand-written parser reports no error of its own.
 //!    Lexical diagnostics are left out on both sides: the lexer is shared, and the grammar is
-//!    about the tokens it produced.
+//!    about the tokens it produced. So are the parser's limits on what the grammar allows,
+//!    which aren't syntax: nesting and depth (E0112), and a tuple index too large for a `u32`
+//!    (E0006). A text that passes only because of these is [`Check::limited`].
 //! 3. When the oracle accepts, its derivation is unique: an ambiguous grammar is a bug even if
 //!    the parser happens to pick the intended reading.
 //! 4. When both accept, the oracle's parse tree and the parser's AST have the same
@@ -17,11 +19,11 @@
 //! Anything else is a disagreement, and a bug in the grammar or the parser.
 
 use crate::canon::{Roles, Shape, ast_shape};
-use crate::earley::{Oracle, Outcome, Scratch};
+use crate::earley::{Node, Oracle, Outcome, Scratch};
 use crate::ebnf::Grammar;
 use std::fmt::Write as _;
-use wrela_diag::FileId;
-use wrela_syntax::{fmt, parse, parser};
+use wrela_diag::{Diagnostic, FileId, codes};
+use wrela_syntax::{Parsed, parse, parser};
 
 pub struct Checker {
     pub grammar: Grammar,
@@ -34,12 +36,18 @@ pub struct Checker {
 pub struct Check {
     /// Both accepted it (and agree), or both rejected it.
     pub accepted: bool,
+    /// The parser reported only errors for its limits (E0112, E0006), which agreement leaves
+    /// out: the grammar accepts the text, but the compiler doesn't.
+    pub limited: bool,
     /// The lexer reported an error (the parsers were compared anyway).
     pub lexical_errors: bool,
     /// Why the two disagree, if they do.
     pub disagreement: Option<String>,
-    /// The rules the oracle's parse tree uses, when it accepted.
-    pub rules_used: Vec<usize>,
+    /// The oracle's parse tree, when both parsers accepted.
+    pub tree: Option<Node>,
+    /// The hand-written parser's result, for further checks on the same text (the formatter's
+    /// round trip: `wrela_syntax::fmt::check_round_trip`).
+    pub parsed: Parsed,
 }
 
 impl Default for Checker {
@@ -58,14 +66,23 @@ impl Checker {
     pub fn check(&self, src: &str, scratch: &mut Scratch) -> Check {
         let lexed = wrela_syntax::lex(FileId(0), src);
         let lex_diags = lexed.diagnostics.len();
-        let lexical_errors = lexed.diagnostics.iter().any(|d| d.is_error());
+        let lexical_errors = wrela_diag::has_errors(&lexed.diagnostics);
         let outcome = self.oracle.parse(&lexed.tokens, scratch);
         let parsed = parser::parse_tokens(FileId(0), src, lexed);
-        let parser_errors: Vec<_> =
-            parsed.diagnostics[lex_diags..].iter().filter(|d| d.is_error()).collect();
+        let mut check = Check {
+            accepted: false,
+            limited: false,
+            lexical_errors,
+            disagreement: None,
+            tree: None,
+            parsed,
+        };
+        let (limits, parser_errors): (Vec<_>, Vec<_>) = check.parsed.diagnostics[lex_diags..]
+            .iter()
+            .filter(|d| d.is_error())
+            .partition(|d| is_limit(d));
         let hand_accepts = parser_errors.is_empty();
-        let mut check =
-            Check { accepted: false, lexical_errors, disagreement: None, rules_used: Vec::new() };
+        check.limited = !limits.is_empty();
         match outcome {
             Outcome::Ambiguous(a) => {
                 check.disagreement = Some(format!(
@@ -97,12 +114,13 @@ impl Checker {
             }
             Outcome::Accepted(tree) => {
                 check.accepted = true;
-                tree.walk(&mut |n| check.rules_used.push(n.rule));
                 let grammar_shape = self.roles.shape(&tree);
-                let parser_shape = ast_shape(&parsed.file);
-                if grammar_shape != parser_shape {
+                let parser_shape = ast_shape(&check.parsed.file);
+                // Where the parser stopped at a limit, its tree holds an error node instead.
+                if !check.limited && grammar_shape != parser_shape {
                     check.disagreement = Some(shape_diff(src, &grammar_shape, &parser_shape));
                 }
+                check.tree = Some(tree);
             }
         }
         check
@@ -112,13 +130,21 @@ impl Checker {
     /// formatter) on programs known to be in the grammar: `accepted` is "no error at all".
     pub fn check_parser_only(&self, src: &str) -> Check {
         let parsed = parse(FileId(0), src);
+        let errors = || parsed.diagnostics.iter().filter(|d| d.is_error());
         Check {
-            accepted: !parsed.has_errors(),
+            accepted: errors().all(is_limit),
+            limited: errors().any(is_limit),
             lexical_errors: false,
             disagreement: None,
-            rules_used: Vec::new(),
+            tree: None,
+            parsed,
         }
     }
+}
+
+/// Whether a parser error is for one of its limits rather than for the syntax.
+fn is_limit(d: &Diagnostic) -> bool {
+    d.code == codes::E0112 || d.code == codes::E0006
 }
 
 fn snippet(src: &str, start: u32, end: u32) -> &str {
@@ -146,52 +172,6 @@ fn shape_diff(src: &str, grammar: &Shape, parser: &Shape) -> String {
     msg
 }
 
-/// The AST's Debug output with spans removed, and the flags that record layout (whether a list
-/// or a chain link was written on several lines), which formatting may change: two sources
-/// with equal skeletons parsed to the same tree.
-pub fn ast_skeleton(file: &wrela_syntax::ast::File) -> String {
-    let mut text = format!("{file:?}");
-    for flag in ["newline_before", "multiline"] {
-        for value in ["true", "false"] {
-            text = text.replace(&format!(", {flag}: {value}"), "");
-        }
-    }
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text.as_str();
-    while let Some(i) = rest.find("Span {") {
-        out.push_str(&rest[..i]);
-        let tail = &rest[i..];
-        let len = tail.find('}').map_or(tail.len(), |j| j + 1);
-        out.push('_');
-        rest = &tail[len..];
-    }
-    out.push_str(rest);
-    out
-}
-
-/// Parse → format → parse gives the same AST, and formatting is idempotent. For sources the
-/// parser accepts without any error.
-pub fn round_trip(src: &str) -> Result<(), String> {
-    let p1 = parse(FileId(0), src);
-    if p1.has_errors() {
-        return Err("round_trip on a source with errors".into());
-    }
-    let once = fmt::format(&p1, src);
-    let p2 = parse(FileId(0), &once);
-    if p2.has_errors() {
-        let d = p2.diagnostics.iter().find(|d| d.is_error()).map(|d| d.message.clone());
-        return Err(format!("the formatted source doesn't parse ({d:?}):\n{once}"));
-    }
-    if ast_skeleton(&p1.file) != ast_skeleton(&p2.file) {
-        return Err(format!("formatting changed the AST; formatted:\n{once}"));
-    }
-    let twice = fmt::format(&p2, &once);
-    if once != twice {
-        return Err(format!("formatting isn't idempotent; once:\n{once}\ntwice:\n{twice}"));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -214,6 +194,18 @@ mod tests {
         assert!(!agrees(&c, "fn f() { a.b(c }"));
     }
 
+    /// The parser's limits aren't the grammar's: the oracle accepts, and that's agreement.
+    #[test]
+    fn limits_are_left_out() {
+        let c = Checker::default();
+        let deep = format!("fn f() {{ {}1{} }}", "(".repeat(200), ")".repeat(200));
+        for src in ["fn f() { t.4294967296 }", deep.as_str()] {
+            let r = crate::testing::with_big_stack(|| c.check(src, &mut Scratch::default()));
+            assert_eq!(r.disagreement, None, "{src}");
+            assert!(r.accepted && r.limited, "{src}");
+        }
+    }
+
     #[test]
     fn a_wrong_shape_is_reported() {
         let g: Shape = [(0, 5, crate::canon::Cat::Expr)].into_iter().collect();
@@ -223,12 +215,14 @@ mod tests {
         assert!(d.contains("only in the parser's:\n    Expr 0..3 \"a -\""), "{d}");
     }
 
+    /// The formatter round trip compares skeletons: they must ignore layout, not structure.
     #[test]
     fn skeletons_ignore_spans() {
+        use wrela_syntax::fmt::skeleton;
         let a = parse(FileId(0), "fn f() { 1 + 2 }");
         let b = parse(FileId(0), "fn f() {\n    1 +\n        2\n}\n");
-        assert_eq!(ast_skeleton(&a.file), ast_skeleton(&b.file));
+        assert_eq!(skeleton(&a.file), skeleton(&b.file));
         let c = parse(FileId(0), "fn f() { 1 - 2 }");
-        assert_ne!(ast_skeleton(&a.file), ast_skeleton(&c.file));
+        assert_ne!(skeleton(&a.file), skeleton(&c.file));
     }
 }

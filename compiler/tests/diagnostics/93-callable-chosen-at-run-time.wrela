@@ -1,0 +1,22 @@
+// mistake: choosing which function to call at run time
+// expect: E0702
+// fix: no
+fn apply(f: fn(i32) -> i32, x: i32) -> i32 {
+    f(x)
+}
+
+fn inc(x: i32) -> i32 {
+    x + 1
+}
+
+fn double(x: i32) -> i32 {
+    x * 2
+}
+
+fn choose(up: bool, f: fn(i32) -> i32, g: fn(i32) -> i32) -> i32 {
+    apply(if up { f } else { g }, 10)
+}
+
+pub fn run(up: bool) -> i32 {
+    choose(up, inc, double)
+}

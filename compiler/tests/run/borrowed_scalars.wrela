@@ -1,0 +1,104 @@
+// run: a projection of a borrowed scalar parameter points at the caller's place, not into the callee's frame
+// expect: plain(5.0) = 5154.0
+// expect: ints(5) = 5154
+// expect: flag(true) = 1000.0
+// expect: generic(5.0) = 5154.0
+// expect: chosen(true) = 1154.0
+// expect: chosen(false) = 2154.0
+// expect: nested(5.0) = 5154.0
+// expect: receiver(5.0) = 5154.0
+// expect: builtin(5.0) = 5.0
+// expect: run_elem() = 2154.0
+
+// Fills the stack where a callee's frame was.
+fn scribble(a: f32) -> f32 {
+    var arr = [a, a, a, a, a, a, a, a, a, a, a, a, a, a, a, a]
+    arr[3] = a + 1.0
+    arr[0] + arr[15]
+}
+
+fn combine(a: f32, b: f32) -> f32 {
+    a * 1000.0 + b
+}
+
+fn id(x: f32) -> borrow f32 {
+    x
+}
+
+pub fn plain(v: f32) -> f32 {
+    combine(id(v), scribble(77.0))
+}
+
+fn id_u(x: u32) -> borrow u32 {
+    x
+}
+
+pub fn ints(v: u32) -> u32 {
+    let s = u32(scribble(77.0))
+    id_u(v) * 1000 + s
+}
+
+fn id_b(x: bool) -> borrow bool {
+    x
+}
+
+fn choose(c: bool, b: f32) -> f32 {
+    if c { 1000.0 + b } else { 2000.0 + b }
+}
+
+pub fn flag(c: bool) -> f32 {
+    choose(id_b(c), scribble(0.0))
+}
+
+fn id_g<T>(x: T) -> borrow T {
+    x
+}
+
+pub fn generic(v: f32) -> f32 {
+    combine(id_g(v), scribble(77.0))
+}
+
+fn pick(c: bool, a: f32, b: f32) -> borrow f32 {
+    if c { a } else { b }
+}
+
+pub fn chosen(c: bool) -> f32 {
+    let x = 1.0
+    let y = 2.0
+    combine(pick(c, x, y), scribble(77.0))
+}
+
+fn id2(x: f32) -> borrow f32 {
+    id(x)
+}
+
+pub fn nested(v: f32) -> f32 {
+    combine(id2(v), scribble(77.0))
+}
+
+trait Me {
+    fn me(self) -> borrow Self
+}
+
+impl Me for f32 {
+    fn me(self) -> borrow f32 {
+        self
+    }
+}
+
+pub fn receiver(v: f32) -> f32 {
+    combine(v.me(), scribble(77.0))
+}
+
+pub fn builtin(v: f32) -> f32 {
+    max(id(v), scribble(77.0) - 1000.0)
+}
+
+fn second(xs: [f32]) -> borrow f32 {
+    xs[1]
+}
+
+pub fn run_elem() -> f32 {
+    let xs = [1.0, 2.0, 3.0]
+    combine(second(xs), scribble(77.0))
+}

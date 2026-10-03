@@ -13,8 +13,9 @@
 //! blessed. A case marked `fix: yes` must get a suggested fix, and applying the fixes must
 //! leave a program that compiles. `WRELA_BLESS=1` rewrites the goldens.
 
-use std::path::{Path, PathBuf};
-use wrela_tests::root;
+use crate::package;
+use std::path::Path;
+use wrela_tests::{apply_fixes, cases, header, repo_root};
 
 struct Outcome {
     codes: Vec<String>,
@@ -26,15 +27,11 @@ struct Outcome {
 /// Builds `text` as a one-file package; returns its errors, JSON, rendering, and the text with
 /// every first fix applied.
 fn compile(name: &str, text: &str) -> Outcome {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("diagnostics").join(name);
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("dir");
-    std::fs::write(dir.join("main.wrela"), text).expect("write");
-    let built = wrela_driver::build(&dir);
+    let built = wrela_driver::build(&package(&format!("diagnostics/{name}"), text));
     let errors: Vec<_> = built.diagnostics.iter().filter(|d| d.is_error()).cloned().collect();
     let main =
         built.sources.files().find(|(_, f)| f.name.ends_with("main.wrela")).map(|(id, _)| id);
-    let fixed = main.map(|id| wrela_diag::apply_fixes(text, id, &errors));
+    let fixed = main.map(|id| apply_fixes(text, id, &errors));
     Outcome {
         codes: errors.iter().map(|d| d.code.as_str().to_string()).collect(),
         json: wrela_diag::json::to_json_string(&built.sources, &errors),
@@ -43,35 +40,23 @@ fn compile(name: &str, text: &str) -> Outcome {
     }
 }
 
-fn header<'a>(text: &'a str, key: &str) -> Option<&'a str> {
-    text.lines()
-        .take_while(|l| l.starts_with("//"))
-        .find_map(|l| l.strip_prefix(&format!("// {key}:")))
-        .map(str::trim)
-}
-
 #[test]
 fn diagnostics_meet_the_bar() {
-    let dir = root().join("compiler/tests/diagnostics");
     let bless = std::env::var_os("WRELA_BLESS").is_some();
-    let mut cases: Vec<PathBuf> = std::fs::read_dir(&dir)
-        .expect("diagnostics dir")
-        .map(|e| e.expect("entry").path())
-        .filter(|p| p.extension().is_some_and(|e| e == "wrela"))
-        .collect();
-    cases.sort();
+    let cases = cases(&repo_root().join("compiler/tests/diagnostics"));
     let mut failures = Vec::new();
     let mut with_fixes = 0;
     for path in &cases {
         let name = path.file_stem().expect("name").to_string_lossy().into_owned();
         let text = std::fs::read_to_string(path).expect("read");
-        let mistake = header(&text, "mistake").unwrap_or_else(|| panic!("{name}: no `mistake:`"));
-        let expect: Vec<String> = header(&text, "expect")
+        let first = |key| header(&text, key).next();
+        let mistake = first("mistake").unwrap_or_else(|| panic!("{name}: no `mistake:`"));
+        let expect: Vec<String> = first("expect")
             .unwrap_or_else(|| panic!("{name}: no `expect:`"))
             .split_whitespace()
             .map(String::from)
             .collect();
-        let wants_fix = header(&text, "fix") == Some("yes");
+        let wants_fix = first("fix") == Some("yes");
         let out = compile(&name, &text);
         let mut problems = Vec::new();
         if out.codes != expect {
@@ -118,7 +103,7 @@ fn diagnostics_meet_the_bar() {
 /// The goldens can only be what the compiler prints: they're its JSON, and parse as such.
 #[test]
 fn goldens_are_versioned_json() {
-    let dir: &Path = &root().join("compiler/tests/diagnostics");
+    let dir: &Path = &repo_root().join("compiler/tests/diagnostics");
     for e in std::fs::read_dir(dir).expect("dir") {
         let p = e.expect("entry").path();
         if p.extension().is_some_and(|x| x == "json") {
@@ -133,4 +118,19 @@ fn goldens_are_versioned_json() {
             );
         }
     }
+}
+
+/// A symbolic link to a directory isn't followed (E0208). No curated case can hold one: the
+/// package is made here.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_directory_is_e0208() {
+    let dir = package("diagnostics-symlink/game", "pub fn f() -> i32 {\n    1\n}\n");
+    let target = dir.with_file_name("shapes");
+    std::fs::create_dir_all(&target).expect("make the target");
+    std::fs::write(target.join("blob.wrela"), "pub fn g() -> i32 {\n    2\n}\n").expect("write");
+    std::os::unix::fs::symlink(&target, dir.join("shapes")).expect("make the link");
+    let built = wrela_driver::build(&dir);
+    let codes: Vec<&str> = built.diagnostics.iter().map(|d| d.code.as_str()).collect();
+    assert_eq!(codes, ["E0208"]);
 }

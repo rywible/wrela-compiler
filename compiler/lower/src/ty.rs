@@ -5,24 +5,27 @@ use crate::{Cx, ModuleBuilder};
 use wrela_diag::{Diagnostic, Span, codes};
 use wrela_ir as ir;
 use wrela_sema::defs::{Mode, RetMode};
+use wrela_sema::mir::Local;
 use wrela_sema::ty::*;
 
-/// How a parameter of type `ty` and `mode` is passed: `(by_ref, mutable)`. `mut` is by
-/// reference; on the CPU a borrowed aggregate is too (no copy); everything else is by value.
+/// How a parameter of type `ty` and `mode` is passed, in a function returning `ret_mode`:
+/// `(by_ref, mutable)`. `mut` is by reference; on the CPU a borrowed aggregate is too (no
+/// copy), and so is every borrowed parameter of a function returning a projection, which may
+/// point into it after the function's frame is gone; everything else is by value.
 pub(crate) fn param_passing(
     target: ir::Target,
     types: &ir::Types,
     ty: ir::TypeId,
     mode: Mode,
+    ret_mode: RetMode,
 ) -> (bool, bool) {
+    let cpu = target == ir::Target::Cpu;
     match mode {
         Mode::Mut => (true, true),
-        Mode::Borrow => (
-            target == ir::Target::Cpu
-                && types.is_aggregate(ty)
-                && !matches!(types.get(ty), ir::TypeDef::Run(_)),
-            false,
-        ),
+        Mode::Borrow if cpu && ret_mode != RetMode::Owned => (true, false),
+        Mode::Borrow => {
+            (cpu && types.is_aggregate(ty) && !matches!(types.get(ty), ir::TypeDef::Run(_)), false)
+        }
         Mode::Take => (false, false),
     }
 }
@@ -103,7 +106,7 @@ impl<'a> Cx<'a> {
             return c;
         }
         let k = self.checked.program.types.kind(t);
-        let gpu = mb.target == ir::Target::Gpu;
+        let gpu = mb.target() == ir::Target::Gpu;
         let out = match k {
             TyKind::Bool => Some(mb.m.types.bool()),
             TyKind::Int(i) => {
@@ -146,6 +149,11 @@ impl<'a> Cx<'a> {
                 }
             }
             TyKind::Array(e, n) => {
+                if gpu && *n == 0 {
+                    let shown = self.checked.program.display_ty(t);
+                    let note = "WGSL has no empty arrays: on the GPU an array has at least one element (language.md §4)";
+                    self.not_on_gpu(mb, &shown, note, span);
+                }
                 self.lower_ty(mb, *e, span).map(|e| mb.m.types.intern(ir::TypeDef::Array(e, *n)))
             }
             TyKind::Slice(e) => {
@@ -164,7 +172,7 @@ impl<'a> Cx<'a> {
                     let mut variants = Vec::new();
                     let nvar = self.checked.program.adt(*a).variants().len();
                     for v in 0..nvar {
-                        let vfields = self.checked.program.variant_fields(*a, args, v);
+                        let vfields = self.checked.program.fields_of(*a, args, Some(v as u32));
                         let vname = self.checked.program.adt(*a).variants()[v].name.clone();
                         let mut payload = Vec::new();
                         for (n, ft) in vfields {
@@ -182,7 +190,7 @@ impl<'a> Cx<'a> {
                     }
                     Some(mb.m.types.intern(ir::TypeDef::Enum { name, variants }))
                 } else {
-                    let fs = self.checked.program.struct_fields(*a, args);
+                    let fs = self.checked.program.fields_of(*a, args, None);
                     let mut fields = Vec::new();
                     for (n, ft) in fs {
                         let ft = self.reveal(ft);
@@ -214,54 +222,105 @@ impl<'a> Cx<'a> {
                 None
             }
         };
+        if let Some(o) = out
+            && gpu
+        {
+            self.check_gpu_size(mb, t, o, span);
+        }
         mb.type_cache.insert(t, out);
         out
     }
 
-    fn cpu_only(&mut self, mb: &ModuleBuilder, name: &str, span: Span) {
-        let what = mb.gpu.as_ref().map(|g| g.describe()).unwrap_or_else(|| "GPU code".into());
+    /// E0702: a type too large for WGSL, reported for the smallest type that is (its parts
+    /// fit), so a struct around a large array isn't reported again.
+    fn check_gpu_size(&mut self, mb: &ModuleBuilder, t: TyId, o: ir::TypeId, span: Span) {
+        let types = &mb.m.types;
+        let too_large = |x| ir::layout::wgsl_layout(types, x).size > ir::layout::WGSL_MAX_TYPE_SIZE;
+        let fields = |x| match types.get(x) {
+            ir::TypeDef::Struct { fields, .. } => fields.iter().map(|f| f.1).collect(),
+            _ => Vec::new(),
+        };
+        let parts: Vec<ir::TypeId> = match types.get(o) {
+            ir::TypeDef::Array(e, _) => vec![*e],
+            ir::TypeDef::Struct { .. } => fields(o),
+            ir::TypeDef::Enum { variants, .. } => {
+                variants.iter().filter_map(|v| v.1).flat_map(fields).collect()
+            }
+            _ => Vec::new(),
+        };
+        if !too_large(o) || parts.into_iter().any(too_large) {
+            return;
+        }
+        let shown = self.checked.program.display_ty(t);
+        let what = mb.gpu.as_ref().map_or("GPU code", |g| g.what.as_str());
+        let max = ir::layout::WGSL_MAX_TYPE_SIZE;
         self.err(
-            Diagnostic::new(codes::E0326, span, format!("`{name}` is CPU-only, and this is {what}"))
-                .with_note("WGSL has `bool`, `i32`, `u32` and `f32`; 64-bit and 8/16-bit types exist only on the CPU (language.md §4)"),
+            Diagnostic::new(codes::E0702, span, format!("`{shown}` is too large for {what}"))
+                .with_note(format!("a WGSL type is at most {max} bytes")),
         );
     }
 
-    /// For each THIR field of a struct (or variant), its IR field index; `None` when the field
-    /// has no runtime value.
+    fn cpu_only(&mut self, mb: &ModuleBuilder, name: &str, span: Span) {
+        let note = "WGSL has `bool`, `i32`, `u32` and `f32`; 64-bit and 8/16-bit types exist only on the CPU (language.md §4)";
+        self.not_on_gpu(mb, name, note, span);
+    }
+
+    /// E0326: a type GPU code can't hold.
+    fn not_on_gpu(&mut self, mb: &ModuleBuilder, name: &str, note: &str, span: Span) {
+        let what = mb.gpu.as_ref().map_or("GPU code", |g| g.what.as_str());
+        self.err(
+            Diagnostic::new(
+                codes::E0326,
+                span,
+                format!("`{name}` is CPU-only, and this is {what}"),
+            )
+            .with_note(note),
+        );
+    }
+
+    /// For each field of a struct, a tuple or (with `variant`) an enum variant: its IR field
+    /// index (`None` when the field has no runtime value) and its type.
     pub fn field_map(
         &mut self,
         mb: &mut ModuleBuilder,
         t: TyId,
         variant: Option<u32>,
         span: Span,
-    ) -> Vec<Option<u32>> {
-        let k = self.checked.program.types.kind(t);
-        let fields: Vec<TyId> = match (&k, variant) {
-            (TyKind::Adt(a, args), None) => {
-                self.checked.program.struct_fields(*a, args).into_iter().map(|(_, t)| t).collect()
+    ) -> Vec<(Option<u32>, TyId)> {
+        let p = &self.checked.program;
+        let fields: Vec<TyId> = match p.types.kind(t) {
+            TyKind::Adt(a, args) => {
+                p.fields_of(*a, args, variant).into_iter().map(|f| f.1).collect()
             }
-            (TyKind::Adt(a, args), Some(v)) => self
-                .checked
-                .program
-                .variant_fields(*a, args, v as usize)
-                .into_iter()
-                .map(|(_, t)| t)
-                .collect(),
-            (TyKind::Tuple(ts), _) => ts.clone(),
+            TyKind::Tuple(ts) => ts.clone(),
             _ => Vec::new(),
         };
         let mut out = Vec::new();
         let mut next = 0;
         for ft in fields {
-            let ft = self.reveal(ft);
-            if self.lower_ty(mb, ft, span).is_some() {
-                out.push(Some(next));
+            let revealed = self.reveal(ft);
+            if self.lower_ty(mb, revealed, span).is_some() {
+                out.push((Some(next), ft));
                 next += 1;
             } else {
-                out.push(None);
+                out.push((None, ft));
             }
         }
         out
+    }
+
+    /// Field `i` of a struct, a tuple or (with `variant`) an enum variant: its IR field index
+    /// and its type. `None` when it has no runtime value.
+    pub fn field(
+        &mut self,
+        mb: &mut ModuleBuilder,
+        t: TyId,
+        variant: Option<u32>,
+        i: u32,
+        span: Span,
+    ) -> Option<(u32, TyId)> {
+        let (k, ft) = *self.field_map(mb, t, variant, span).get(i as usize)?;
+        Some((k?, ft))
     }
 
     /// The IR field of an enum's variant payload, if it has one.
@@ -272,44 +331,65 @@ impl<'a> Cx<'a> {
         variant: u32,
         span: Span,
     ) -> Option<u32> {
-        let TyKind::Adt(a, args) = self.checked.program.types.kind(t) else { return None };
-        let vfields = self.checked.program.variant_fields(*a, args, variant as usize);
-        let any = vfields.into_iter().any(|(_, ft)| self.lower_ty(mb, ft, span).is_some());
+        let it = self.lower_ty(mb, t, span)?;
         // Field 0 is the tag; field 1 + v variant v's payload (ir::TypeDef::Enum).
-        any.then_some(1 + variant)
+        mb.m.types.field(it, 1 + variant).map(|_| 1 + variant)
+    }
+
+    /// The captures of closure `id` in `owner`'s body that its lifted function takes as
+    /// parameters, in order: each one's local, IR type, and whether the closure writes it. A
+    /// captured closure travels as its own instance, and a capture with no runtime value isn't
+    /// passed.
+    pub fn lowered_captures(
+        &mut self,
+        mb: &mut ModuleBuilder,
+        owner: &InstanceKey,
+        id: ClosureId,
+    ) -> Vec<(Local, ir::TypeId, bool)> {
+        let checked = self.checked;
+        let Some(body) = owner.source_fn().and_then(|f| checked.mir.get(&f)) else {
+            return Vec::new();
+        };
+        let subst = self.instance_subst(owner);
+        let mut out = Vec::new();
+        for &(l, written) in &body.closures[id.0 as usize].captures {
+            if self.capture_resource(owner, l).is_some() {
+                continue;
+            }
+            let decl = body.local(l);
+            let t = self.concrete(decl.ty, &subst);
+            if matches!(self.checked.program.types.kind(t), TyKind::Closure(..) | TyKind::FnPtr(..))
+            {
+                continue;
+            }
+            let Some(ty) = self.lower_ty(mb, t, decl.span) else { continue };
+            out.push((l, ty, written));
+        }
+        out
+    }
+
+    /// The resource a closure's capture `l` is, on the GPU: a buffer parameter of `owner`, which
+    /// the closure's instance names as its owner's does, rather than taking it.
+    pub fn capture_resource(&self, owner: &InstanceKey, l: Local) -> Option<ir::ResourceId> {
+        let body = self.checked.mir.get(&owner.source_fn()?)?;
+        let i = body.fns[0].params.iter().position(|&p| p == l)?;
+        owner.resources().get(i).copied().flatten()
     }
 
     /// The parameters a callable adds to a function it's passed to: its captures.
-    pub fn callable_params(
-        &mut self,
-        mb: &mut ModuleBuilder,
-        c: &Callable,
-        span: Span,
-    ) -> Vec<ir::Param> {
-        match c {
-            Callable::Func { .. } => Vec::new(),
-            Callable::Closure { owner, id } => {
-                let checked = self.checked;
-                let Some(f) = owner.source_fn() else { return Vec::new() };
-                let Some(body) = checked.mir.get(&f) else { return Vec::new() };
-                let subst = self.instance_subst(owner);
-                let mut out = Vec::new();
-                for &(l, written) in &body.closures[id.0 as usize].captures {
-                    let decl = body.local(l);
-                    let t = self.concrete(decl.ty, &subst);
-                    if matches!(
-                        self.checked.program.types.kind(t),
-                        TyKind::Closure(..) | TyKind::FnPtr(..)
-                    ) {
-                        continue; // a captured closure travels as its own instance
-                    }
-                    let Some(ty) = self.lower_ty(mb, t, span) else { continue };
-                    let (by_ref, mutable) = capture_passing(mb.target, &mb.m.types, ty, written);
-                    out.push(ir::Param { name: decl.name.clone(), ty, by_ref, mutable });
-                }
-                out
-            }
-        }
+    pub fn callable_params(&mut self, mb: &mut ModuleBuilder, c: &Callable) -> Vec<ir::Param> {
+        let Callable::Closure { owner, id } = c else { return Vec::new() };
+        let checked = self.checked;
+        let Some(body) = owner.source_fn().and_then(|f| checked.mir.get(&f)) else {
+            return Vec::new();
+        };
+        self.lowered_captures(mb, owner, *id)
+            .into_iter()
+            .map(|(l, ty, written)| {
+                let (by_ref, mutable) = capture_passing(mb.target(), &mb.m.types, ty, written);
+                ir::Param { name: body.local(l).name.clone(), ty, by_ref, mutable }
+            })
+            .collect()
     }
 
     /// An instance's IR signature (an empty body, filled in later).
@@ -323,8 +403,7 @@ impl<'a> Cx<'a> {
                     let t = self.concrete(p.ty, &subst);
                     if let TyKind::FnPtr(..) = self.checked.program.types.kind(t) {
                         if let Some(Some(c)) = callables.get(i) {
-                            let c = c.clone();
-                            params.extend(self.callable_params(mb, &c, p.span));
+                            params.extend(self.callable_params(mb, c));
                         }
                         continue;
                     }
@@ -332,14 +411,15 @@ impl<'a> Cx<'a> {
                         continue;
                     }
                     let Some(ty) = self.lower_ty(mb, t, p.span) else { continue };
-                    let (by_ref, mutable) = param_passing(mb.target, &mb.m.types, ty, p.mode);
+                    let (by_ref, mutable) =
+                        param_passing(mb.target(), &mb.m.types, ty, p.mode, def.ret_mode);
                     params.push(ir::Param { name: p.name.clone(), ty, by_ref, mutable });
                 }
                 let ret_t = self.concrete(def.ret, &subst);
                 let ret = self.lower_ty(mb, ret_t, def.sig_span);
                 let mut f = ir::Function::new(self.instance_name(mb, key), params, ret);
                 if def.ret_mode != RetMode::Owned {
-                    if mb.target == ir::Target::Gpu {
+                    if mb.target() == ir::Target::Gpu {
                         self.err(
                             Diagnostic::new(codes::E0702, def.sig_span, format!("`{}` returns a projection, which GPU code can't do yet", def.name))
                                 .with_note("WGSL functions can't return pointers; milestone 1 supports projections on the CPU only"),
@@ -359,7 +439,7 @@ impl<'a> Cx<'a> {
                 };
                 let info = &body.closures[id.0 as usize];
                 let c = Callable::Closure { owner: owner.clone(), id: *id };
-                let mut params = self.callable_params(mb, &c, info.span);
+                let mut params = self.callable_params(mb, &c);
                 let subst = self.instance_subst(owner);
                 for &l in &info.params {
                     let decl = body.local(l);
@@ -378,7 +458,7 @@ impl<'a> Cx<'a> {
                 let name = format!("{}_closure{}", self.checked.program.func(f).name, id.0);
                 ir::Function::new(name, params, ret)
             }
-            InstanceKey::Derived { .. } => crate::body::derived_signature(self, mb, key),
+            InstanceKey::Derived { .. } => crate::derive::signature(self, mb, key),
         }
     }
 

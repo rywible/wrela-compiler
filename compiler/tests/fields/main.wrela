@@ -1,12 +1,12 @@
-// The AC2 and AC3 harness for the grazer (compiler/tests/tests/grazer.rs drives it): GPU
+// The AC2 and AC3 harness for the grazer (compiler/tests/tests/suite/grazer.rs drives it): GPU
 // evaluation at scattered points, for comparison with spike 01's hand-written kernel, and
 // block culling on the spike's grid, with the derived interval and with the spike's
-// hand-written Lipschitz bound.
+// hand-written Lipschitz bound. Also AC3's corpus (compiler/tests/tests/suite/derive.rs).
 use corpus::{
-    Blend, Branchy, Cells, Logs, Noise, Pieces, Rational, Trig, Vectors, Waves, blob_, cone_,
-    creature, ellipsoid_, fbm_, grazer_, hoof_, sphere_,
+    Branchy, Cells, Logs, Noise, Pieces, Rational, Trig, Vectors, Waves, blob_, cone_, creature,
+    ellipsoid_, fbm_, grazer_, hoof_, sphere_,
 }
-use grazer::{Grazer, P3, bounds, grazer, grazer_from, p3, params}
+use grazer::{Grazer, P3, PARAM_FLOATS, bounds, grazer, grazer_from, p3, params}
 use std::derive::Box3
 use std::field::{Surface, hash_u32}
 use std::gpu::{
@@ -74,11 +74,6 @@ pub fn param(seed: u32, i: u32) -> f32 {
     params(seed)[i]
 }
 
-/// The distance at a point, on the CPU.
-pub fn distance(seed: u32, x: f32, y: f32, z: f32) -> f32 {
-    grazer(seed).distance(vec3(x, y, z))
-}
-
 // ---- evaluation at scattered points (AC2) -----------------------------------------------------
 struct Scatter: Copy + Clone + GpuData {
     lo: vec3,
@@ -116,7 +111,7 @@ fn v(p: P3) -> vec3 {
 }
 
 /// Scatters `n` points (a multiple of 64) over the individual's bounds into a new buffer.
-fn scattered(seed: u32, n: u32, a: [f32; 328]) -> GpuBuffer<vec4> {
+fn scattered(seed: u32, n: u32, a: [f32; PARAM_FLOATS]) -> GpuBuffer<vec4> {
     let b = bounds(a)
     let points: GpuBuffer<vec4> = buffer(n)
     let lo = v(b.lo)
@@ -136,25 +131,6 @@ pub fn evaluate(seed: u32, n: u32) {
     dispatch(samples, groups: n / 64, field: g, points: points, out: samp)
 }
 
-/// For timing: the distance (`gradient` 0) or the distance and gradient (1) at `n` scattered
-/// points, `reps` times into the same buffer (so the dispatches run one after another).
-pub fn repeat(seed: u32, n: u32, reps: u32, gradient: u32) {
-    let a = params(seed)
-    let g = grazer_from(a)
-    let points = scattered(seed, n, a)
-    if gradient == 0 {
-        let dist: GpuBuffer<f32> = buffer(n)
-        for _ in 0..reps {
-            dispatch(distances, groups: n / 64, field: g, points: points, out: dist)
-        }
-    } else {
-        let samp: GpuBuffer<vec4> = buffer(n)
-        for _ in 0..reps {
-            dispatch(samples, groups: n / 64, field: g, points: points, out: samp)
-        }
-    }
-}
-
 // ---- block culling on the spike's grid (AC3) -------------------------------------------------
 /// Spike 01's extraction grid: blocks of 4×4×4 cells over the individual's padded bounds.
 struct Grid: Copy + Clone + GpuData {
@@ -167,7 +143,7 @@ struct Grid: Copy + Clone + GpuData {
 }
 
 /// The spike's `gridFor`, in f64 as in JavaScript.
-fn grid_for(a: [f32; 328], cell: f64) -> Grid {
+fn grid_for(a: [f32; PARAM_FLOATS], cell: f64) -> Grid {
     let b = bounds(a)
     let pad = 2.0 * cell
     let o = p3(b.lo.x - pad, b.lo.y - pad, b.lo.z - pad)
@@ -262,26 +238,7 @@ pub fn cull(seed: u32, cell: f32, lipschitz: u32) -> u32 {
     grid.blocks
 }
 
-/// The derived interval over a box, on the CPU.
-pub fn interval_cpu(seed: u32, lx: f32, ly: f32, lz: f32, hx: f32, hy: f32, hz: f32) -> vec2 {
-    let r = grazer(seed).interval(Box3 { lo: vec3(lx, ly, lz), hi: vec3(hx, hy, hz) })
-    vec2(r.lo, r.hi)
-}
-
-pub fn torso_interval(seed: u32, lx: f32, ly: f32, lz: f32, hx: f32, hy: f32, hz: f32) -> vec2 {
-    let r = grazer(seed).torso.interval(Box3 { lo: vec3(lx, ly, lz), hi: vec3(hx, hy, hz) })
-    vec2(r.lo, r.hi)
-}
-
-pub fn neck_interval(seed: u32, lx: f32, ly: f32, lz: f32, hx: f32, hy: f32, hz: f32) -> vec2 {
-    let r = grazer(seed).neck.interval(Box3 { lo: vec3(lx, ly, lz), hi: vec3(hx, hy, hz) })
-    vec2(r.lo, r.hi)
-}
-
 // ---- AC3: the corpus ---------------------------------------------------------------------------
-/// The corpus, by number: the order the tests name them in.
-pub const FUNCTIONS: u32 = 17
-
 /// A float in [0, 1) for box `i`, draw `k`.
 fn rnd(seed: u32, i: u32, k: u32) -> f32 {
     unit(hash_u32(hash_u32(i.wrapping_mul(16).wrapping_add(k)) ^ seed))
@@ -340,47 +297,61 @@ fn unwidened<F: Surface>(f: F, b: Box3) -> u32 {
     if r.lo < d && d < r.hi { 0 } else { 1 }
 }
 
-fn misses_of(fi: u32, b: Box3, seed: u32, i: u32) -> u32 {
+/// Something done with one function of the corpus, whatever the function's type.
+trait Visit {
+    type Out
+
+    fn visit<F: Surface>(self, f: F) -> Self::Out
+}
+
+/// `v` done with corpus function `fi`. The order is the tests' (derive.rs, `NAMES`).
+fn with_function<V: Visit>(fi: u32, v: V) -> V::Out {
     match fi {
-        0 => misses(sphere_(), b, seed, i),
-        1 => misses(ellipsoid_(), b, seed, i),
-        2 => misses(cone_(), b, seed, i),
-        3 => misses(hoof_(), b, seed, i),
-        4 => misses(blob_(), b, seed, i),
-        5 => misses(Noise { freq: 2.5 }, b, seed, i),
-        6 => misses(fbm_(), b, seed, i),
-        7 => misses(creature(), b, seed, i),
-        8 => misses(grazer_(), b, seed, i),
-        9 => misses(Waves { s: 3.0 }, b, seed, i),
-        10 => misses(Logs { s: 2.3 }, b, seed, i),
-        11 => misses(Trig { s: 0.35 }, b, seed, i),
-        12 => misses(Rational { s: 0.2 }, b, seed, i),
-        13 => misses(Pieces { s: 2.0 }, b, seed, i),
-        14 => misses(Vectors { c: vec3(0.3, 0.3, 0.3) }, b, seed, i),
-        15 => misses(Branchy { n: 3 }, b, seed, i),
-        _ => misses(Cells { s: 3.0 }, b, seed, i),
+        0 => v.visit(sphere_()),
+        1 => v.visit(ellipsoid_()),
+        2 => v.visit(cone_()),
+        3 => v.visit(hoof_()),
+        4 => v.visit(blob_()),
+        5 => v.visit(Noise { freq: 2.5 }),
+        6 => v.visit(fbm_()),
+        7 => v.visit(creature()),
+        8 => v.visit(grazer_()),
+        9 => v.visit(Waves { s: 3.0 }),
+        10 => v.visit(Logs { s: 2.3 }),
+        11 => v.visit(Trig { s: 0.35 }),
+        12 => v.visit(Rational { s: 0.2 }),
+        13 => v.visit(Pieces { s: 2.0 }),
+        14 => v.visit(Vectors { c: vec3(0.3, 0.3, 0.3) }),
+        15 => v.visit(Branchy { n: 3 }),
+        _ => v.visit(Cells { s: 3.0 }),
     }
 }
 
-fn unwidened_of(fi: u32, b: Box3) -> u32 {
-    match fi {
-        0 => unwidened(sphere_(), b),
-        1 => unwidened(ellipsoid_(), b),
-        2 => unwidened(cone_(), b),
-        3 => unwidened(hoof_(), b),
-        4 => unwidened(blob_(), b),
-        5 => unwidened(Noise { freq: 2.5 }, b),
-        6 => unwidened(fbm_(), b),
-        7 => unwidened(creature(), b),
-        8 => unwidened(grazer_(), b),
-        9 => unwidened(Waves { s: 3.0 }, b),
-        10 => unwidened(Logs { s: 2.3 }, b),
-        11 => unwidened(Trig { s: 0.35 }, b),
-        12 => unwidened(Rational { s: 0.2 }, b),
-        13 => unwidened(Pieces { s: 2.0 }, b),
-        14 => unwidened(Vectors { c: vec3(0.3, 0.3, 0.3) }, b),
-        15 => unwidened(Branchy { n: 3 }, b),
-        _ => unwidened(Cells { s: 3.0 }, b),
+/// `misses` in box `i`.
+struct Misses: Copy + Clone {
+    b: Box3,
+    seed: u32,
+    i: u32,
+}
+
+impl Visit for Misses {
+    type Out = u32
+
+    fn visit<F: Surface>(self, f: F) -> u32 {
+        misses(f, self.b, self.seed, self.i)
+    }
+}
+
+/// `unwidened` at a box's low corner.
+struct Unwidened: Copy + Clone {
+    b: Box3,
+}
+
+impl Visit for Unwidened {
+    type Out = u32
+
+    fn visit<F: Surface>(self, f: F) -> u32 {
+        unwidened(f, self.b)
     }
 }
 
@@ -389,7 +360,9 @@ fn unwidened_of(fi: u32, b: Box3) -> u32 {
 pub fn misses_cpu(fi: u32, seed: u32, first: u32, count: u32) -> u32 {
     var total = 0
     for i in first..first + count {
-        total += misses_of(fi, random_box(seed, i), seed, i)
+        // Bound first, with its type: `+=` doesn't yet see that `Misses::Out` is `u32` (E0305).
+        let missed: u32 = with_function(fi, Misses { b: random_box(seed, i), seed, i })
+        total += missed
     }
     total
 }
@@ -399,7 +372,8 @@ pub fn misses_cpu(fi: u32, seed: u32, first: u32, count: u32) -> u32 {
 pub fn unwidened_cpu(fi: u32, seed: u32, n: u32) -> u32 {
     var total = 0
     for i in 0..n {
-        total += unwidened_of(fi, random_box(seed, i))
+        let failed: u32 = with_function(fi, Unwidened { b: random_box(seed, i) })
+        total += failed
     }
     total
 }
@@ -417,90 +391,61 @@ fn misses_gpu<F: Surface>(f: F, boxes: Boxes, out: mut Slots<u32>, id: GlobalId)
     }
 }
 
+/// A dispatch of `misses_gpu`.
+struct CheckGpu: Copy + Clone {
+    boxes: Boxes,
+    groups: u32,
+    out: GpuBuffer<u32>,
+}
+
+impl Visit for CheckGpu {
+    type Out = ()
+
+    fn visit<F: Surface>(self, f: F) {
+        dispatch(misses_gpu, groups: self.groups, f: f, boxes: self.boxes, out: self.out)
+    }
+}
+
 /// On the GPU: for each of `count` random boxes, into a new buffer, how many sampled values
 /// function `fi`'s interval misses, plus 256 if the interval over the box's low corner doesn't
 /// hold that point's value strictly inside.
 pub fn check_gpu(fi: u32, seed: u32, count: u32) {
     let out: GpuBuffer<u32> = buffer(count)
-    let boxes = Boxes { seed, count }
-    let groups = (count + 63) / 64
-    match fi {
-        0 => dispatch(misses_gpu, groups: groups, f: sphere_(), boxes: boxes, out: out),
-        1 => dispatch(misses_gpu, groups: groups, f: ellipsoid_(), boxes: boxes, out: out),
-        2 => dispatch(misses_gpu, groups: groups, f: cone_(), boxes: boxes, out: out),
-        3 => dispatch(misses_gpu, groups: groups, f: hoof_(), boxes: boxes, out: out),
-        4 => dispatch(misses_gpu, groups: groups, f: blob_(), boxes: boxes, out: out),
-        5 => dispatch(misses_gpu, groups: groups, f: Noise { freq: 2.5 }, boxes: boxes, out: out),
-        6 => dispatch(misses_gpu, groups: groups, f: fbm_(), boxes: boxes, out: out),
-        7 => dispatch(misses_gpu, groups: groups, f: creature(), boxes: boxes, out: out),
-        8 => dispatch(misses_gpu, groups: groups, f: grazer_(), boxes: boxes, out: out),
-        9 => dispatch(misses_gpu, groups: groups, f: Waves { s: 3.0 }, boxes: boxes, out: out),
-        10 => dispatch(misses_gpu, groups: groups, f: Logs { s: 2.3 }, boxes: boxes, out: out),
-        11 => dispatch(misses_gpu, groups: groups, f: Trig { s: 0.35 }, boxes: boxes, out: out),
-        12 => dispatch(misses_gpu, groups: groups, f: Rational { s: 0.2 }, boxes: boxes, out: out),
-        13 => dispatch(misses_gpu, groups: groups, f: Pieces { s: 2.0 }, boxes: boxes, out: out),
-        14 => dispatch(
-            misses_gpu,
-            groups: groups,
-            f: Vectors { c: vec3(0.3, 0.3, 0.3) },
-            boxes: boxes,
-            out: out,
-        ),
-        15 => dispatch(misses_gpu, groups: groups, f: Branchy { n: 3 }, boxes: boxes, out: out),
-        _ => dispatch(misses_gpu, groups: groups, f: Cells { s: 3.0 }, boxes: boxes, out: out),
+    with_function(fi, CheckGpu { boxes: Boxes { seed, count }, groups: (count + 63) / 64, out })
+}
+
+/// A function's value at a point.
+struct Distance: Copy + Clone {
+    p: vec3,
+}
+
+impl Visit for Distance {
+    type Out = f32
+
+    fn visit<F: Surface>(self, f: F) -> f32 {
+        f.distance(self.p)
     }
 }
 
-fn value_of(fi: u32, p: vec3) -> f32 {
-    match fi {
-        0 => sphere_().distance(p),
-        1 => ellipsoid_().distance(p),
-        2 => cone_().distance(p),
-        3 => hoof_().distance(p),
-        4 => blob_().distance(p),
-        5 => Noise { freq: 2.5 }.distance(p),
-        6 => fbm_().distance(p),
-        7 => creature().distance(p),
-        8 => grazer_().distance(p),
-        9 => Waves { s: 3.0 }.distance(p),
-        10 => Logs { s: 2.3 }.distance(p),
-        11 => Trig { s: 0.35 }.distance(p),
-        12 => Rational { s: 0.2 }.distance(p),
-        13 => Pieces { s: 2.0 }.distance(p),
-        14 => Vectors { c: vec3(0.3, 0.3, 0.3) }.distance(p),
-        15 => Branchy { n: 3 }.distance(p),
-        _ => Cells { s: 3.0 }.distance(p),
-    }
+/// A function's derived gradient at a point.
+struct Gradient: Copy + Clone {
+    p: vec3,
 }
 
-fn gradient_of(fi: u32, p: vec3) -> vec3 {
-    match fi {
-        0 => sphere_().gradient(p),
-        1 => ellipsoid_().gradient(p),
-        2 => cone_().gradient(p),
-        3 => hoof_().gradient(p),
-        4 => blob_().gradient(p),
-        5 => Noise { freq: 2.5 }.gradient(p),
-        6 => fbm_().gradient(p),
-        7 => creature().gradient(p),
-        8 => grazer_().gradient(p),
-        9 => Waves { s: 3.0 }.gradient(p),
-        10 => Logs { s: 2.3 }.gradient(p),
-        11 => Trig { s: 0.35 }.gradient(p),
-        12 => Rational { s: 0.2 }.gradient(p),
-        13 => Pieces { s: 2.0 }.gradient(p),
-        14 => Vectors { c: vec3(0.3, 0.3, 0.3) }.gradient(p),
-        15 => Branchy { n: 3 }.gradient(p),
-        _ => Cells { s: 3.0 }.gradient(p),
+impl Visit for Gradient {
+    type Out = vec3
+
+    fn visit<F: Surface>(self, f: F) -> vec3 {
+        f.gradient(self.p)
     }
 }
 
 /// Function `fi` at a point, on the CPU.
 pub fn value(fi: u32, x: f32, y: f32, z: f32) -> f32 {
-    value_of(fi, vec3(x, y, z))
+    with_function(fi, Distance { p: vec3(x, y, z) })
 }
 
 /// Function `fi`'s derived gradient at a point, on the CPU.
 pub fn gradient(fi: u32, x: f32, y: f32, z: f32) -> vec3 {
-    gradient_of(fi, vec3(x, y, z))
+    with_function(fi, Gradient { p: vec3(x, y, z) })
 }

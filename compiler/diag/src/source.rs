@@ -36,16 +36,9 @@ impl Span {
         Span { start: self.end, ..self }
     }
 
-    pub fn len(self) -> u32 {
-        self.end - self.start
-    }
-
-    pub fn is_empty(self) -> bool {
-        self.start == self.end
-    }
-
-    pub fn contains(self, other: Span) -> bool {
-        self.file == other.file && self.start <= other.start && other.end <= self.end
+    /// The byte range, for slicing the file's text.
+    pub fn range(self) -> std::ops::Range<usize> {
+        self.start as usize..self.end as usize
     }
 }
 
@@ -73,7 +66,8 @@ pub struct LineCol {
 impl SourceFile {
     pub fn new(name: impl Into<String>, text: impl Into<String>) -> SourceFile {
         let text = text.into();
-        let mut line_starts = vec![0];
+        // A byte-order mark isn't part of the first line (L2): columns count from after it.
+        let mut line_starts = vec![if text.starts_with('\u{feff}') { 3 } else { 0 }];
         let bytes = text.as_bytes();
         let mut i = 0;
         while i < bytes.len() {
@@ -91,14 +85,14 @@ impl SourceFile {
     pub fn line_index(&self, offset: u32) -> usize {
         match self.line_starts.binary_search(&offset) {
             Ok(i) => i,
-            Err(i) => i - 1,
+            Err(i) => i.saturating_sub(1),
         }
     }
 
     pub fn line_col(&self, offset: u32) -> LineCol {
         let line = self.line_index(offset);
         let start = self.line_starts[line] as usize;
-        let end = (offset as usize).min(self.text.len());
+        let end = (offset as usize).clamp(start, self.text.len().max(start));
         let column = self.text.get(start..end).map_or(end - start, |s| s.chars().count());
         LineCol { line: line as u32 + 1, column: column as u32 + 1 }
     }
@@ -107,18 +101,12 @@ impl SourceFile {
     pub fn line_text(&self, line: usize) -> &str {
         let start = self.line_starts[line] as usize;
         let end = self.line_starts.get(line + 1).map_or(self.text.len(), |&e| e as usize);
-        self.text[start..end].trim_end_matches(['\n', '\r'])
+        self.text.get(start..end).unwrap_or("").trim_end_matches(['\n', '\r'])
     }
 
-    /// The byte offset where 0-based line `line` starts, and where its text ends (before the
-    /// line break).
-    pub fn line_bounds(&self, line: usize) -> (u32, u32) {
-        let start = self.line_starts[line];
-        (start, start + self.line_text(line).len() as u32)
-    }
-
-    pub fn slice(&self, span: Span) -> &str {
-        &self.text[span.start as usize..span.end as usize]
+    /// The byte offset where the text of 0-based line `line` ends (before the line break).
+    pub fn line_end(&self, line: usize) -> u32 {
+        self.line_starts[line] + self.line_text(line).len() as u32
     }
 }
 
@@ -166,6 +154,19 @@ mod tests {
         assert_eq!(f.line_col(3), LineCol { line: 2, column: 1 });
         assert_eq!(f.line_col(7), LineCol { line: 2, column: 3 });
         assert_eq!(f.line_text(1), "αβc");
+    }
+
+    #[test]
+    fn a_byte_order_mark_is_no_column() {
+        let f = SourceFile::new("a", "\u{feff}fn f\nx");
+        assert_eq!(f.line_col(3), LineCol { line: 1, column: 1 });
+        assert_eq!(f.line_col(6), LineCol { line: 1, column: 4 });
+        assert_eq!(f.line_col(0), LineCol { line: 1, column: 1 });
+        assert_eq!(f.line_text(0), "fn f");
+        assert_eq!(f.line_col(8), LineCol { line: 2, column: 1 });
+        let empty = SourceFile::new("b", "\u{feff}");
+        assert_eq!(empty.line_col(3), LineCol { line: 1, column: 1 });
+        assert_eq!(empty.line_text(0), "");
     }
 
     #[test]

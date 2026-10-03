@@ -4,15 +4,20 @@
 //! rules (imports, exports, bounds, decoding, sequencing, the state hash) are tested here
 //! without a GPU; [`crate::gpu::Gpu`] is the real executor.
 
-use crate::check::Checker;
 use crate::error::{Error, Result};
+use std::sync::{Arc, LazyLock};
 use wasmtime::{
     Engine, Extern, ExternType, Func, Instance, Linker, Module, Store, TypedFunc, Val, ValType,
 };
+use wrela_abi::check::Checker;
 use wrela_abi::hash::StateHash;
 use wrela_abi::lines::{self, Lines};
 use wrela_abi::stream::{self, Command, Sequencer};
-use wrela_abi::{EXPORT_FRAME, EXPORT_MEMORY, IMPORT_MODULE, IMPORT_SUBMIT};
+use wrela_abi::{EXPORT_FRAME, EXPORT_MEMORY, IMPORT_MODULE, IMPORT_SUBMIT, Manifest};
+
+/// The process's one wasmtime engine: every program compiles and runs under it, as wasmtime
+/// intends (an engine is costly to make, and cheap to share).
+static ENGINE: LazyLock<Engine> = LazyLock::new(Engine::default);
 
 /// Carries out commands that have already been decoded, sequenced and checked.
 pub(crate) trait Executor: 'static {
@@ -50,13 +55,24 @@ impl Value {
         })
     }
 
-    fn ty(self) -> &'static str {
+    fn ty(self) -> ValType {
         match self {
-            Value::I32(_) => "i32",
-            Value::I64(_) => "i64",
-            Value::F32(_) => "f32",
-            Value::F64(_) => "f64",
+            Value::I32(_) => ValType::I32,
+            Value::I64(_) => ValType::I64,
+            Value::F32(_) => ValType::F32,
+            Value::F64(_) => ValType::F64,
         }
+    }
+}
+
+/// A WASM type's name, as in a signature: `i32`, `f64`, ... (`other` for a non-numeric type).
+fn type_name(ty: ValType) -> &'static str {
+    match ty {
+        ValType::I32 => "i32",
+        ValType::I64 => "i64",
+        ValType::F32 => "f32",
+        ValType::F64 => "f64",
+        _ => "other",
     }
 }
 
@@ -94,7 +110,7 @@ pub(crate) struct Program<E: 'static> {
     instance: Instance,
     frame: TypedFunc<(f32, u32, u32), ()>,
     /// Where the code came from, for trap messages (`wrela_abi::lines`).
-    lines: Option<Lines>,
+    lines: Option<Arc<Lines>>,
 }
 
 /// Checks a module against the program ABI before instantiating it: it may import only
@@ -165,46 +181,52 @@ fn describe(ty: &ExternType) -> String {
     }
 }
 
-/// A module that satisfies the program ABI, ready to instantiate.
+/// A module that satisfies the program ABI, ready to instantiate (any number of times).
 pub(crate) struct Compiled {
-    engine: Engine,
     module: Module,
-    lines: Option<Lines>,
+    lines: Option<Arc<Lines>>,
 }
 
 /// Compiles a program and checks it against the ABI ([`check_abi`]).
 pub(crate) fn compile(wasm: &[u8]) -> Result<Compiled> {
-    let engine = Engine::default();
-    let module = Module::new(&engine, wasm).map_err(|e| Error::Program(format!("{e:#}")))?;
+    let module = Module::new(&ENGINE, wasm).map_err(|e| Error::Program(format!("{e:#}")))?;
     check_abi(&module)?;
+    // wasmtime's `Module` doesn't say whether it has one.
+    if wrela_abi::has_start_function(wasm) {
+        return Err(Error::Program(
+            "it has a start function; a wrela program may run only when the host calls it".into(),
+        ));
+    }
     let lines = match lines::custom_section(wasm, lines::SECTION) {
-        Some(payload) => Some(Lines::decode(payload).map_err(|e| {
+        Some(payload) => Some(Arc::new(Lines::decode(payload).map_err(|e| {
             Error::Program(format!("its `{}` section is malformed: {e}", lines::SECTION))
-        })?),
+        })?)),
         None => None,
     };
-    Ok(Compiled { engine, module, lines })
+    Ok(Compiled { module, lines })
 }
 
 impl<E: Executor> Program<E> {
+    /// Instantiates a compiled program whose commands are checked against `manifest` and
+    /// carried out by `executor`.
     pub(crate) fn instantiate(
         compiled: &Compiled,
-        checker: Checker,
+        manifest: &Manifest,
         executor: E,
     ) -> Result<Program<E>> {
-        let mut linker = Linker::new(&compiled.engine);
+        let mut linker = Linker::new(&ENGINE);
         linker
             .func_wrap(IMPORT_MODULE, IMPORT_SUBMIT, submit::<E>)
             .map_err(|e| Error::Program(format!("{e:#}")))?;
         let state = State {
-            checker,
+            checker: Checker::new(manifest),
             executor,
             hash: StateHash::new(),
             sequencer: Sequencer::new(),
             failure: None,
             batches: None,
         };
-        let mut store = Store::new(&compiled.engine, state);
+        let mut store = Store::new(&ENGINE, state);
         let instance = linker
             .instantiate(&mut store, &compiled.module)
             .map_err(|e| Error::Program(format!("{e:#}")))?;
@@ -230,19 +252,9 @@ impl<E: Executor> Program<E> {
             .get_func(&mut self.store, name)
             .ok_or_else(|| Error::Program(format!("it has no exported function `{name}`")))?;
         let ty = func.ty(&self.store);
-        let params: Vec<ValType> = ty.params().collect();
-        let matches = params.len() == args.len()
-            && params.iter().zip(args).all(|(p, a)| {
-                matches!(
-                    (p, a),
-                    (ValType::I32, Value::I32(_))
-                        | (ValType::I64, Value::I64(_))
-                        | (ValType::F32, Value::F32(_))
-                        | (ValType::F64, Value::F64(_))
-                )
-            });
-        if !matches {
-            let given: Vec<&str> = args.iter().map(|a| a.ty()).collect();
+        let arg_types = || args.iter().map(|a| type_name(a.ty()));
+        if !ty.params().map(type_name).eq(arg_types()) {
+            let given: Vec<&str> = arg_types().collect();
             return Err(Error::Program(format!(
                 "`{name}` has type {ty}; it can't take ({})",
                 given.join(", ")
@@ -262,28 +274,19 @@ impl<E: Executor> Program<E> {
     }
 
     /// The exported functions' names and WASM signatures.
-    pub(crate) fn exports(&mut self) -> Vec<(String, Vec<&'static str>, Vec<&'static str>)> {
-        let names: Vec<String> =
-            self.instance.exports(&mut self.store).map(|e| e.name().to_string()).collect();
-        let name_of = |t: ValType| match t {
-            ValType::I32 => "i32",
-            ValType::I64 => "i64",
-            ValType::F32 => "f32",
-            ValType::F64 => "f64",
-            _ => "other",
-        };
-        let mut out = Vec::new();
-        for n in names {
-            if let Some(f) = self.instance.get_func(&mut self.store, &n) {
-                let ty = f.ty(&self.store);
-                out.push((
-                    n,
-                    ty.params().map(name_of).collect(),
-                    ty.results().map(name_of).collect(),
-                ));
-            }
-        }
-        out
+    pub(crate) fn exports(&self) -> Vec<(String, Vec<&'static str>, Vec<&'static str>)> {
+        self.instance
+            .module(&self.store)
+            .exports()
+            .filter_map(|e| match e.ty() {
+                ExternType::Func(f) => Some((
+                    e.name().to_string(),
+                    f.params().map(type_name).collect(),
+                    f.results().map(type_name).collect(),
+                )),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Turns a call's outcome into ours, preferring the typed error `submit` recorded.

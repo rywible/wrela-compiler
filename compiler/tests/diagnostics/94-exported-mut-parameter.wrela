@@ -1,0 +1,6 @@
+// mistake: an exported function that takes a parameter `mut`
+// expect: E0703
+// fix: no
+pub fn grow(x: mut f32) {
+    x *= 2.0
+}

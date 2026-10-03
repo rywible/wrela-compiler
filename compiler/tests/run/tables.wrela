@@ -1,0 +1,194 @@
+// run: tables: large constants are stored once, read in place, and keep every kind of part
+// expect: lookup(7) = 4
+// expect: lookup(39) = 15
+// expect: lookup(40) traps
+// expect: loop_sum() = 317
+// expect: negatives(1) = -2.5
+// expect: flags(2) = false
+// expect: flags(3) = true
+// expect: small(5) = 200
+// expect: rows(1, 2) = 12.0
+// expect: kind_of(0) = 0.0
+// expect: kind_of(1) = 7.5
+// expect: whole_copy(3) = 9
+// expect: as_run() = 317
+// expect: matched() = 3
+
+const TABLE: [u32; 40] = [
+    0,
+    3,
+    6,
+    9,
+    12,
+    15,
+    1,
+    4,
+    7,
+    10,
+    13,
+    16,
+    2,
+    5,
+    8,
+    11,
+    14,
+    0,
+    3,
+    6,
+    9,
+    12,
+    15,
+    1,
+    4,
+    7,
+    10,
+    13,
+    16,
+    2,
+    5,
+    8,
+    11,
+    14,
+    0,
+    3,
+    6,
+    9,
+    12,
+    15,
+]
+
+const ALIAS: [u32; 40] = TABLE
+
+const NEG: [f32; 20] = [
+    1.0,
+    -2.5,
+    3.0,
+    -4.0,
+    5.0,
+    6.0,
+    7.0,
+    8.0,
+    9.0,
+    10.0,
+    11.0,
+    12.0,
+    13.0,
+    14.0,
+    15.0,
+    16.0,
+    17.0,
+    18.0,
+    19.0,
+    -20,
+]
+
+const FLAGS: [bool; 20] = [
+    true,
+    true,
+    false,
+    true,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+    true,
+]
+
+const SMALL: [u8; 20] = [0, 1, 2, 3, 4, 200, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 255]
+
+const ROWS: [vec4; 5] = [
+    vec4(1.0),
+    vec4(10.0, 11.0, 12.0, 13.0),
+    vec4(2.0, 3.0, 4.0, 5.0),
+    vec4(0.0),
+    vec4(-1.0),
+]
+
+enum Kind: Copy + Clone {
+    Plain,
+    Scaled { by: f32 },
+}
+
+struct Entry: Copy + Clone {
+    kind: Kind,
+    weights: vec4,
+}
+
+const ENTRIES: [Entry; 5] = [
+    Entry { kind: Kind::Plain, weights: vec4(1.0) },
+    Entry { kind: Kind::Scaled { by: 7.5 }, weights: vec4(2.0) },
+    Entry { kind: Kind::Plain, weights: vec4(3.0) },
+    Entry { kind: Kind::Plain, weights: vec4(4.0) },
+    Entry { kind: Kind::Plain, weights: vec4(5.0) },
+]
+
+pub fn lookup(i: u32) -> u32 {
+    TABLE[i]
+}
+
+pub fn loop_sum() -> u32 {
+    var s = 0
+    for i in 0..40 {
+        s += ALIAS[i]
+    }
+    s
+}
+
+pub fn negatives(i: u32) -> f32 {
+    NEG[i]
+}
+
+pub fn flags(i: u32) -> bool {
+    FLAGS[i]
+}
+
+pub fn small(i: u32) -> u32 {
+    u32(SMALL[i])
+}
+
+pub fn rows(i: u32, c: u32) -> f32 {
+    ROWS[i][c]
+}
+
+pub fn kind_of(i: u32) -> f32 {
+    match ENTRIES[i].kind {
+        Kind::Plain => 0.0,
+        Kind::Scaled { by } => by,
+    }
+}
+
+pub fn whole_copy(i: u32) -> u32 {
+    var t = TABLE
+    t[0] = 100
+    t[i] + TABLE[0] * 0
+}
+
+fn total(xs: [u32]) -> u32 {
+    var s = 0
+    for x in xs {
+        s += x
+    }
+    s
+}
+
+pub fn as_run() -> u32 {
+    total(TABLE)
+}
+
+pub fn matched() -> u32 {
+    match TABLE[1] {
+        3 => 3,
+        _ => 0,
+    }
+}

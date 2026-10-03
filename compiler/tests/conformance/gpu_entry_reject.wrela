@@ -1,5 +1,5 @@
 // rejects: gpu.entry
-use std::gpu::{GlobalId, Slots}
+use std::gpu::{ClipPosition, Flat, GlobalId, Slots, VertexIndex}
 
 @compute(64)
 fn returns(id: GlobalId) -> f32 { //~ E0602
@@ -9,4 +9,20 @@ fn returns(id: GlobalId) -> f32 { //~ E0602
 @vertex
 fn nothing(x: f32) -> f32 { //~ E0602
     x
+}
+
+// A vertex shader passes numbers and vectors on, not matrices, bools, arrays or structs.
+struct Corner: Copy + Clone {
+    pos: ClipPosition,
+    m: mat2, //~ E0602
+    seen: Flat<bool>, //~ E0602
+}
+
+@vertex
+fn corner(v: VertexIndex) -> Corner {
+    Corner {
+        pos: ClipPosition { position: vec4(0.0) },
+        m: mat2(vec2(1.0, 0.0), vec2(0.0, 1.0)),
+        seen: Flat { value: true },
+    }
 }

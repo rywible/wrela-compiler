@@ -12,6 +12,8 @@
 //!   each GPU pipeline and reported with the call chain.
 
 mod body;
+mod consts;
+mod derive;
 mod gpu;
 mod instance;
 mod ty;
@@ -25,7 +27,8 @@ use wrela_diag::{Diagnostic, Span};
 use wrela_ir as ir;
 use wrela_sema::Checked;
 use wrela_sema::builtins::BuiltinFn;
-use wrela_sema::defs::{Entry, Lang};
+use wrela_sema::defs::{Entry, Lang, TraitRef};
+use wrela_sema::program::Program;
 use wrela_sema::ty::{FnId, TyId, TyKind};
 
 /// The program, lowered: the CPU module and one module per GPU pipeline.
@@ -39,14 +42,15 @@ pub struct Lowered {
 pub struct Roots {
     /// Functions exported from the CPU module: the entry module's `pub fn`s.
     pub exports: Vec<FnId>,
-    /// Non-generic functions to check on the GPU even if nothing dispatches them: entry points
-    /// and `@gpu` functions (so their effects are checked where they're defined).
-    pub gpu_checks: Vec<FnId>,
+    /// Functions to check on the GPU even if nothing dispatches them, so their effects are
+    /// checked where they're defined: non-generic entry points, and `@gpu` functions, each
+    /// with the type arguments to check it with (a generic one's are [`stand_ins`]).
+    pub gpu_checks: Vec<(FnId, Vec<TyId>)>,
 }
 
 impl Roots {
     /// The default roots: the entry module's public functions; every non-generic entry point
-    /// and `@gpu` function in the package.
+    /// and every `@gpu` function in the package.
     pub fn of(checked: &Checked) -> Roots {
         let p = &checked.program;
         let mut exports = Vec::new();
@@ -64,38 +68,95 @@ impl Roots {
             {
                 exports.push(id);
             }
-            if (f.attrs.entry.is_some() || f.attrs.gpu.is_some())
-                && p.fn_all_generics(id).is_empty()
+            let generic = !p.fn_all_generics(id).is_empty();
+            if f.attrs.entry.is_some() && !generic {
+                gpu_checks.push((id, Vec::new()));
+            } else if f.attrs.gpu.is_some()
+                && let Some(substs) = stand_ins(p, id)
             {
-                gpu_checks.push(id);
+                gpu_checks.push((id, substs));
             }
         }
         Roots { exports, gpu_checks }
     }
 }
 
+/// Type arguments to check a `@gpu` function with: for each generic parameter, a type GPU code
+/// can hold that has the parameter's bounds. `f32` has every structural trait (`Copy`, `Clone`,
+/// `GpuData`); a parameter bounded by a declared trait (a trait method's `Self`, say) takes
+/// the first type the program implements it for. `None` when some parameter has none: then no
+/// GPU code can call the function either.
+fn stand_ins(p: &Program, f: FnId) -> Option<Vec<TyId>> {
+    let mut out = Vec::new();
+    for g in p.fn_all_generics(f) {
+        let bounds = wrela_sema::resolve::param_bounds_closure(p, g);
+        if bounds.iter().any(|b| b.args.iter().any(|&a| p.types.has_params(a))) {
+            return None;
+        }
+        let structural = |b: &&TraitRef| p.trait_(b.trait_).lang.is_some_and(Lang::is_structural);
+        let candidates: Vec<TyId> = match bounds.iter().find(|b| !structural(b)) {
+            None => vec![p.types.f32],
+            Some(b) => p
+                .impls_of(b.trait_)
+                .iter()
+                .map(|&i| p.impl_(i))
+                .filter(|imp| imp.generics.is_empty())
+                .map(|imp| imp.self_ty)
+                .collect(),
+        };
+        let fits = |t: TyId| {
+            on_gpu(p, t) && bounds.iter().all(|b| wrela_sema::traits::implements(p, t, b))
+        };
+        out.push(candidates.into_iter().find(|&t| fits(t))?);
+    }
+    Some(out)
+}
+
+/// Whether GPU code can hold a value of type `t`: no CPU-only scalars, runs or functions.
+fn on_gpu(p: &Program, t: TyId) -> bool {
+    match p.types.kind(t) {
+        TyKind::Bool | TyKind::Vec(_) | TyKind::Mat(_) => true,
+        TyKind::Int(i) => i.on_gpu(),
+        TyKind::Float(f) => *f == wrela_sema::ty::FloatTy::F32,
+        TyKind::Array(e, n) => *n > 0 && on_gpu(p, *e),
+        TyKind::Tuple(ts) => ts.iter().all(|&e| on_gpu(p, e)),
+        TyKind::Adt(a, args) => {
+            let variants = p.adt(*a).variants().len().max(1);
+            (0..variants).all(|v| {
+                let v = p.adt(*a).is_enum().then_some(v as u32);
+                p.fields_of(*a, args, v).iter().all(|(_, ft)| on_gpu(p, *ft))
+            })
+        }
+        _ => false,
+    }
+}
+
 /// Shared state while lowering every module of one program.
 pub(crate) struct Cx<'a> {
     pub checked: &'a Checked,
+    /// Whether the modules will be emitted; only then are GPU modules flattened.
+    pub emit: bool,
     pub diags: Vec<Diagnostic>,
-    /// Pipelines discovered by CPU code, deduplicated, in discovery order.
-    pub pipelines: Vec<gpu::PipelineKey>,
+    /// Pipelines discovered by CPU code, deduplicated, in discovery order, with their
+    /// interfaces.
+    pub pipelines: Vec<(gpu::PipelineKey, Rc<gpu::Interface>)>,
 }
 
-/// One target module being built.
+/// One target module being built: the CPU module by default.
+#[derive(Default)]
 pub(crate) struct ModuleBuilder {
     pub m: ir::Module,
-    pub target: ir::Target,
     pub instances: HashMap<InstanceKey, ir::FuncId>,
     pub queue: VecDeque<(InstanceKey, ir::FuncId)>,
     pub type_cache: HashMap<TyId, Option<ir::TypeId>>,
-    /// GPU: what the module is for, to check effects with context.
+    /// A GPU module: what it's for, to check effects with context.
     pub gpu: Option<gpu::GpuCx>,
     /// The first caller of each instance, for call chains in diagnostics.
     pub callers: HashMap<ir::FuncId, (ir::FuncId, Span)>,
     /// Each instance's source name (`Sphere::distance`, `main`'s closure), for diagnostics.
     pub source_names: HashMap<ir::FuncId, String>,
-    /// How many instantiations each instance is from a root (an export or entry point).
+    /// How many instantiations each instance is from a root (an export or entry point),
+    /// counting only those that specialize a function ([`InstanceKey::specializes`]).
     pub depth: HashMap<ir::FuncId, u32>,
     /// Whether the instantiation limit has been reported in this module.
     pub too_deep: bool,
@@ -103,43 +164,57 @@ pub(crate) struct ModuleBuilder {
     pub edges: Vec<(ir::FuncId, ir::FuncId, Span)>,
     /// Derived functions built in this module.
     pub derived: ir::derive::DeriveCache,
+    /// Where each derivative (`dpdx`, `dpdy`, `fwidth`) is in the source, by the value it
+    /// defines, for E0608.
+    pub derivatives: HashMap<(ir::FuncId, ir::ValueId), Span>,
+    /// The constant data holding each table (CPU only).
+    pub data: HashMap<wrela_sema::ty::ConstId, Option<ir::DataId>>,
+    /// Derived instances waiting for what they derive from to be lowered.
+    pub deriving: Vec<derive::Pending>,
 }
 
 impl ModuleBuilder {
-    pub fn new(target: ir::Target) -> ModuleBuilder {
-        ModuleBuilder {
-            m: ir::Module::default(),
-            target,
-            instances: HashMap::new(),
-            queue: VecDeque::new(),
-            type_cache: HashMap::new(),
-            gpu: None,
-            callers: HashMap::new(),
-            source_names: HashMap::new(),
-            depth: HashMap::new(),
-            too_deep: false,
-            edges: Vec::new(),
-            derived: ir::derive::DeriveCache::default(),
+    /// A GPU module, for `g`.
+    pub fn gpu(g: gpu::GpuCx) -> ModuleBuilder {
+        ModuleBuilder { gpu: Some(g), ..ModuleBuilder::default() }
+    }
+
+    pub fn target(&self) -> ir::Target {
+        if self.gpu.is_some() { ir::Target::Gpu } else { ir::Target::Cpu }
+    }
+
+    /// How diagnostics name an instance: its source name, else its IR name.
+    pub fn display_name(&self, id: ir::FuncId) -> String {
+        match self.source_names.get(&id) {
+            Some(name) => name.clone(),
+            None => self.m.functions[id.index()].name.clone(),
         }
     }
 }
 
-/// Lowers a checked program (with no errors) to IR.
-pub fn lower(checked: &Checked, roots: &Roots) -> (Lowered, Vec<Diagnostic>) {
-    let mut cx = Cx { checked, diags: Vec::new(), pipelines: Vec::new() };
-    let mut cpu = ModuleBuilder::new(ir::Target::Cpu);
+/// Lowers a checked program (with no errors) to IR. With `emit`, its modules are ready for
+/// the back ends; without, lowering only checks (the GPU modules aren't flattened, which only
+/// the WGSL back end needs and which finds nothing wrong with a program).
+pub fn lower(checked: &Checked, roots: &Roots, emit: bool) -> (Lowered, Vec<Diagnostic>) {
+    let mut cx = Cx { checked, emit, diags: Vec::new(), pipelines: Vec::new() };
+    let mut cpu = ModuleBuilder::default();
+    let mut has_frame = false;
     for &f in &roots.exports {
         let key = InstanceKey::plain(f, Vec::new());
         let id = cx.instance(&mut cpu, key, None);
         let name = cx.checked.program.func(f).name.clone();
+        has_frame |= name == wrela_abi::EXPORT_FRAME;
         if cx.check_export(f) {
             cpu.m.exports.push((name, id));
         }
     }
+    if !has_frame {
+        cx.no_frame();
+    }
     cx.drain(&mut cpu);
     rewrite_cpu_math(&mut cx, &mut cpu);
     cx.drain(&mut cpu);
-    if !cx.diags.iter().any(|d| d.is_error())
+    if !wrela_diag::has_errors(&cx.diags)
         && let Err(e) = ir::verify(&cpu.m)
     {
         cx.err(Diagnostic::internal(format!("the CPU module's IR is malformed: {e}")));
@@ -148,17 +223,26 @@ pub fn lower(checked: &Checked, roots: &Roots) -> (Lowered, Vec<Diagnostic>) {
     let mut pipelines = Vec::new();
     let mut i = 0;
     while i < cx.pipelines.len() {
-        let key = cx.pipelines[i].clone();
-        if let Some(out) = gpu::lower_pipeline(&mut cx, i as u32, &key) {
+        let (key, iface) = cx.pipelines[i].clone();
+        if let Some(out) = gpu::lower_pipeline(&mut cx, &key, iface) {
             pipelines.push(out);
         }
         i += 1;
     }
-    for &f in &roots.gpu_checks {
-        let entry = cx.checked.program.func(f).attrs.entry.map(|e| e.0);
-        let already = cx.pipelines.iter().any(|k| k.mentions(f));
-        if !already {
-            gpu::check_standalone(&mut cx, f, entry);
+    for (f, substs) in &roots.gpu_checks {
+        let already = cx.pipelines.iter().any(|(k, _)| k.mentions(*f));
+        if already {
+            continue;
+        }
+        let entry = cx.entry_of(*f);
+        let before = cx.diags.len();
+        gpu::check_standalone(&mut cx, *f, entry, substs);
+        if !substs.is_empty() {
+            // With stand-in types, only what the function's own code does is its error.
+            let own = checked.program.func(*f).span;
+            let found = cx.diags.split_off(before);
+            let inside = |s: Span| s.file == own.file && s.start >= own.start && s.end <= own.end;
+            cx.diags.extend(found.into_iter().filter(|d| d.span().is_some_and(inside)));
         }
     }
     let lowered = Lowered { cpu: cpu.m, pipelines };
@@ -185,7 +269,10 @@ impl<'a> Cx<'a> {
             }
             return id;
         }
-        let depth = caller.map_or(0, |(from, _)| mb.depth.get(&from).copied().unwrap_or(0) + 1);
+        // Only an instance that specializes its function is a level deeper than its caller: a
+        // chain of plain calls can't go on without end.
+        let step = u32::from(key.specializes());
+        let depth = caller.map_or(0, |(from, _)| mb.depth.get(&from).copied().unwrap_or(0) + step);
         let types = &self.checked.program.types;
         let huge = key.substs().iter().any(|&t| types.size(t) > wrela_sema::ty::MAX_TYPE_SIZE);
         if huge {
@@ -255,17 +342,59 @@ impl<'a> Cx<'a> {
         );
     }
 
-    /// Lowers queued instance bodies until none are left.
+    /// Lowers queued instance bodies until none are left. Derived instances are built when
+    /// nothing else is, one at a time ([`derive::build_next`]).
     pub fn drain(&mut self, mb: &mut ModuleBuilder) {
-        while let Some((key, id)) = mb.queue.pop_front() {
-            body::lower_body(self, mb, &key, id);
+        loop {
+            while let Some((key, id)) = mb.queue.pop_front() {
+                body::lower_body(self, mb, &key, id);
+            }
+            if mb.deriving.is_empty() {
+                return;
+            }
+            derive::build_next(self, mb);
         }
     }
 
     /// Whether an exported function's signature can cross the WASM boundary: scalars and
-    /// vectors in, and a scalar, a vector or nothing out.
+    /// vectors in, and a scalar, a vector or nothing out. `frame` has the one signature the
+    /// host calls, and no export takes the name of the program's memory.
     fn check_export(&mut self, f: FnId) -> bool {
         let def = self.checked.program.func(f);
+        if def.name == wrela_abi::EXPORT_MEMORY {
+            self.err(
+                Diagnostic::new(
+                    wrela_diag::codes::E0703,
+                    def.name_span,
+                    format!(
+                        "`{}` can't be exported: the program exports its memory under that name",
+                        def.name
+                    ),
+                )
+                .with_help(
+                    "rename it, or make it private (drop `pub`) if the host doesn't call it",
+                ),
+            );
+            return false;
+        }
+        if def.name == wrela_abi::EXPORT_FRAME {
+            let t = &self.checked.program.types;
+            let want = [t.f32, t.u32, t.u32];
+            let params_ok = def.params.len() == want.len()
+                && def
+                    .params
+                    .iter()
+                    .zip(want)
+                    .all(|(p, w)| p.ty == w && p.mode == wrela_sema::defs::Mode::Borrow);
+            if params_ok && def.ret == t.unit && def.ret_mode == wrela_sema::defs::RetMode::Owned {
+                return true;
+            }
+            self.err(
+                Diagnostic::new(wrela_diag::codes::E0703, def.sig_span, "`frame`'s signature is `frame(time: f32, width: u32, height: u32)`, with no result: the host calls it each frame")
+                    .with_note("a host program exports `frame`: the time in seconds, and the screen's size in pixels"),
+            );
+            return false;
+        }
         let mut ok = true;
         let exportable = |t: &TyKind, ret: bool| match t {
             TyKind::Bool | TyKind::Int(_) | TyKind::Float(_) => true,
@@ -275,13 +404,21 @@ impl<'a> Cx<'a> {
         };
         for p in &def.params {
             let k = self.checked.program.types.kind(p.ty);
-            if !exportable(k, false) || p.mode != wrela_sema::defs::Mode::Borrow {
+            if !exportable(k, false) {
                 ok = false;
                 let shown = self.checked.program.display_ty(p.ty);
                 self.err(
                     Diagnostic::new(wrela_diag::codes::E0703, p.span, format!("`{}` is exported from the program, so its parameters are numbers, bools or vectors; `{}` is a `{shown}`", def.name, p.name))
                         .with_note("the entry module's `pub fn`s are the program's exports, called by the host")
                         .with_help("make it private (drop `pub`) if the host doesn't call it"),
+                );
+            } else if p.mode != wrela_sema::defs::Mode::Borrow {
+                ok = false;
+                let mode = p.mode.keyword();
+                self.err(
+                    Diagnostic::new(wrela_diag::codes::E0703, p.span, format!("`{}` is exported from the program, so its parameters are borrowed; `{}` is `{mode}`", def.name, p.name))
+                        .with_note("the host passes each argument as a value, which has no place to change or to move from")
+                        .with_help(format!("drop `{mode}`, or make the function private (drop `pub`) if the host doesn't call it")),
                 );
             }
         }
@@ -295,6 +432,44 @@ impl<'a> Cx<'a> {
             );
         }
         ok
+    }
+
+    /// E0703 for a program that doesn't export `frame`, which every host calls: at a private
+    /// `frame`, else at the start of main.wrela (found through any item in it; a main.wrela with
+    /// no items has nothing to point at, and nothing to run either).
+    fn no_frame(&mut self) {
+        let p = &self.checked.program;
+        let Some(main) = p.main else { return };
+        let private = p.fns.iter().find(|f| {
+            f.module == main
+                && f.owner == wrela_sema::defs::FnOwner::Free
+                && f.name == wrela_abi::EXPORT_FRAME
+        });
+        let any = p.fns.iter().filter(|f| f.module == main).map(|f| f.span);
+        let any = any
+            .chain(p.adts.iter().filter(|a| a.module == main).map(|a| a.span))
+            .chain(p.consts.iter().filter(|c| c.module == main).map(|c| c.span))
+            .next();
+        let (span, help) = match (private, any) {
+            (Some(f), _) if !f.public => (f.name_span, "make it public: `pub fn frame`"),
+            (Some(f), _) => (
+                f.name_span,
+                "the host calls it directly, so it can't be generic or a GPU entry point",
+            ),
+            (None, Some(s)) => (
+                Span::new(s.file, 0, 0),
+                "add `pub fn frame(time: f32, width: u32, height: u32) {}` to main.wrela",
+            ),
+            (None, None) => return,
+        };
+        self.err(
+            Diagnostic::new(
+                wrela_diag::codes::E0703,
+                span,
+                "the program doesn't export `frame`, which the host calls each frame",
+            )
+            .with_help(help),
+        );
     }
 
     /// An instance's function as the source names it: `Sphere::distance`, or `a closure in
@@ -320,14 +495,10 @@ impl<'a> Cx<'a> {
     }
 }
 
-/// How many instantiations deep a call chain may go from an export or entry point. Real
-/// programs are a few levels deep; only polymorphic recursion gets near.
+/// How many instantiations deep a call chain may go from an export or entry point, counting
+/// those with type arguments or callables. Real programs are a few levels deep; only
+/// polymorphic recursion gets near.
 const MAX_INSTANCE_DEPTH: u32 = 256;
-
-/// Rc helper so instance keys can nest.
-pub(crate) fn rc<T>(t: T) -> Rc<T> {
-    Rc::new(t)
-}
 
 /// The std function implementing a transcendental builtin on the CPU (language.md §11): the
 /// one the built-in function that lowers to it names.
@@ -343,8 +514,7 @@ pub(crate) fn cpu_math_lang(b: ir::Builtin) -> Option<Lang> {
 fn rewrite_cpu_math(cx: &mut Cx, mb: &mut ModuleBuilder) {
     let mut i = 0;
     while i < mb.m.functions.len() {
-        let mut f =
-            std::mem::replace(&mut mb.m.functions[i], ir::Function::new("", Vec::new(), None));
+        let mut f = std::mem::take(&mut mb.m.functions[i]);
         let body = std::mem::take(&mut f.body);
         f.body = rewrite_block(cx, mb, &mut f, body);
         mb.m.functions[i] = f;
@@ -359,50 +529,39 @@ fn rewrite_block(
     b: ir::Block,
 ) -> ir::Block {
     let mut out = Vec::with_capacity(b.len());
-    for s in b {
-        match s {
-            ir::Stmt::Let(v, ir::Expr::Builtin(op, args)) if cpu_math_lang(op).is_some() => {
-                let Some(func) = cpu_math_lang(op).and_then(|l| cx.lang_fn(l)) else {
-                    out.push(ir::Stmt::Let(v, ir::Expr::Builtin(op, args)));
-                    continue;
-                };
-                let callee = cx.instance(mb, InstanceKey::plain(func, Vec::new()), None);
-                let ty = f.value_ty(v);
-                let f32 = mb.m.types.f32();
-                match mb.m.types.get(ty).clone() {
-                    ir::TypeDef::Vector(n) => {
-                        let mut comps = Vec::new();
-                        for c in 0..n as u32 {
-                            let mut parts = Vec::new();
-                            for &a in &args {
-                                let x = f.new_value(f32);
-                                out.push(ir::Stmt::Let(x, ir::Expr::Extract(a, c)));
-                                parts.push(ir::Arg::Value(x));
-                            }
-                            let r = f.new_value(f32);
-                            out.push(ir::Stmt::Let(r, ir::Expr::Call(callee, parts)));
-                            comps.push(r);
-                        }
-                        out.push(ir::Stmt::Let(v, ir::Expr::Construct(ty, comps)));
+    for mut s in b {
+        if let ir::Stmt::Let(v, ir::Expr::Builtin(op, args)) = &s
+            && let Some(func) = cpu_math_lang(*op).and_then(|l| cx.lang_fn(l))
+        {
+            let v = *v;
+            let callee = cx.instance(mb, InstanceKey::plain(func, Vec::new()), None);
+            let ty = f.value_ty(v);
+            let f32 = mb.m.types.f32();
+            if let &ir::TypeDef::Vector(n) = mb.m.types.get(ty) {
+                let mut comps = Vec::new();
+                for c in 0..n as u32 {
+                    let mut parts = Vec::new();
+                    for &a in args {
+                        let x = f.new_value(f32);
+                        out.push(ir::Stmt::Let(x, ir::Expr::Extract(a, c)));
+                        parts.push(ir::Arg::Value(x));
                     }
-                    _ => out.push(ir::Stmt::Let(
-                        v,
-                        ir::Expr::Call(callee, args.into_iter().map(ir::Arg::Value).collect()),
-                    )),
+                    let r = f.new_value(f32);
+                    out.push(ir::Stmt::Let(r, ir::Expr::Call(callee, parts)));
+                    comps.push(r);
                 }
+                out.push(ir::Stmt::Let(v, ir::Expr::Construct(ty, comps)));
+            } else {
+                let args = args.iter().map(|&a| ir::Arg::Value(a)).collect();
+                out.push(ir::Stmt::Let(v, ir::Expr::Call(callee, args)));
             }
-            ir::Stmt::If { cond, then, else_ } => {
-                let then = rewrite_block(cx, mb, f, then);
-                let else_ = rewrite_block(cx, mb, f, else_);
-                out.push(ir::Stmt::If { cond, then, else_ });
-            }
-            ir::Stmt::Loop { body, continuing } => {
-                let body = rewrite_block(cx, mb, f, body);
-                let continuing = rewrite_block(cx, mb, f, continuing);
-                out.push(ir::Stmt::Loop { body, continuing });
-            }
-            other => out.push(other),
+            continue;
         }
+        for inner in s.blocks_mut() {
+            let b = std::mem::take(inner);
+            *inner = rewrite_block(cx, mb, f, b);
+        }
+        out.push(s);
     }
     out
 }

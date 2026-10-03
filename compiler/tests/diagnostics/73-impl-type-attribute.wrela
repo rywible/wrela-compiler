@@ -1,0 +1,12 @@
+// mistake: an attribute on an impl's associated type
+// expect: E0108
+// fix: yes
+trait Shape {
+    type Unit
+}
+
+struct Meters {}
+
+impl Shape for Meters {
+    @inline type Unit = f32
+}

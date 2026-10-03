@@ -6,8 +6,9 @@
 //! same state hash for the same frame times, and the same pixels up to GPU rounding.
 //!
 //! The contract both hosts implement is `wrela-abi` (runtime/abi). This crate never re-implements
-//! the format: batches go through [`wrela_abi::stream::decode`] and
-//! [`wrela_abi::stream::Sequencer`], manifests through [`wrela_abi::Manifest::parse`].
+//! the format: batches go through [`wrela_abi::stream::decode`],
+//! [`wrela_abi::stream::Sequencer`] and [`wrela_abi::check::Checker`], manifests through
+//! [`wrela_abi::Manifest::parse`].
 //!
 //! ```no_run
 //! let mut host = wrela_host::Host::load("runtime/fixtures/first-light")?;
@@ -22,7 +23,6 @@
 //! it checks what the program submits but executes none of it, so it needs neither a GPU nor
 //! the lock, for tests that call exports.
 
-mod check;
 mod error;
 mod gpu;
 pub mod image;
@@ -30,7 +30,7 @@ pub mod lock;
 mod program;
 
 pub use error::{Error, Result};
-pub use gpu::{GpuTiming, SCREEN_FORMAT, map_read, open_device};
+pub use gpu::{GpuTiming, map_read, open_device, read_timestamps};
 pub use program::Value;
 
 use gpu::Gpu;
@@ -66,7 +66,7 @@ pub struct RunResult {
 impl RunResult {
     /// The hash as both hosts print it: sixteen lowercase hex digits.
     pub fn hash_hex(&self) -> String {
-        format!("{:016x}", self.hash)
+        wrela_abi::hash::hex(self.hash)
     }
 
     pub fn write_png(&self, path: impl AsRef<Path>) -> Result<()> {
@@ -82,24 +82,21 @@ pub fn frame_time(i: u32, fps: f64) -> f32 {
 
 /// Reads a build's manifest, WASM and WGSL from `dir`.
 fn read_build(dir: &Path) -> Result<(Manifest, Vec<u8>, Vec<String>)> {
-    let read = |name: &str| {
-        let path = dir.join(name);
-        std::fs::read(&path).map_err(|e| Error::io(path, e))
-    };
-    let manifest_path = dir.join("manifest.json");
-    let manifest =
-        std::fs::read_to_string(&manifest_path).map_err(|e| Error::io(&manifest_path, e))?;
-    let manifest = Manifest::parse(&manifest)?;
-    let wasm = read(&manifest.wasm)?;
-    let shaders = manifest
-        .pipelines
-        .iter()
-        .map(|p| {
-            let path = dir.join(&p.shader);
-            std::fs::read_to_string(&path).map_err(|e| Error::io(path, e))
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let text = |name: &str| read_file(dir, name, |path| std::fs::read_to_string(path));
+    let manifest = Manifest::parse(&text("manifest.json")?)?;
+    let wasm = read_file(dir, &manifest.wasm, |path| std::fs::read(path))?;
+    let shaders = manifest.pipelines.iter().map(|p| text(&p.shader)).collect::<Result<Vec<_>>>()?;
     Ok((manifest, wasm, shaders))
+}
+
+/// Reads the file `name` in `dir` with `read` (`std::fs::read` or `std::fs::read_to_string`).
+fn read_file<T>(
+    dir: &Path,
+    name: &str,
+    read: impl FnOnce(&Path) -> std::io::Result<T>,
+) -> Result<T> {
+    let path = dir.join(name);
+    read(&path).map_err(|e| Error::io(path, e))
 }
 
 /// A loaded program, ready to run.
@@ -123,8 +120,7 @@ impl Host {
         let compiled = program::compile(&wasm)?;
         let lock = lock::GpuLock::acquire(&format!("wrela-host {}", dir.display()))?;
         let gpu = Gpu::new(&manifest, &shaders, options.timestamps)?;
-        let checker = check::Checker::new(&manifest, check::Limits::webgpu_defaults());
-        let mut program = Program::instantiate(&compiled, checker, gpu)?;
+        let mut program = Program::instantiate(&compiled, &manifest, gpu)?;
         if options.record {
             program.record_batches();
         }
@@ -195,8 +191,7 @@ impl CpuHost {
     pub fn load(dir: impl AsRef<Path>) -> Result<CpuHost> {
         let (manifest, wasm, _) = read_build(dir.as_ref())?;
         let compiled = program::compile(&wasm)?;
-        let checker = check::Checker::new(&manifest, check::Limits::webgpu_defaults());
-        let mut program = Program::instantiate(&compiled, checker, NoGpu)?;
+        let mut program = Program::instantiate(&compiled, &manifest, NoGpu)?;
         program.record_batches();
         Ok(CpuHost { program })
     }
@@ -222,7 +217,7 @@ impl CpuHost {
     }
 
     /// The names and WASM types of the module's exported functions: `(params, results)`.
-    pub fn exports(&mut self) -> Vec<(String, Vec<&'static str>, Vec<&'static str>)> {
+    pub fn exports(&self) -> Vec<(String, Vec<&'static str>, Vec<&'static str>)> {
         self.program.exports()
     }
 }

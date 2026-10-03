@@ -76,11 +76,7 @@ impl<'p> Checker<'p> {
                         )
                         .with_fix(
                             "remove `mut`",
-                            span.shrink_to_start().to(Span::new(
-                                span.file,
-                                span.start,
-                                i.span.start,
-                            )),
+                            Span::new(span.file, span.start, i.span.start),
                             "",
                         ),
                     );
@@ -102,7 +98,7 @@ impl<'p> Checker<'p> {
             ast::ExprKind::Tuple(items) => {
                 let exp: Vec<Option<TyId>> = match expected.map(|t| self.kind(t)) {
                     Some(TyKind::Tuple(ts)) if ts.len() == items.len() => {
-                        ts.into_iter().map(Some).collect()
+                        ts.iter().copied().map(Some).collect()
                     }
                     _ => vec![None; items.len()],
                 };
@@ -113,18 +109,11 @@ impl<'p> Checker<'p> {
             }
             ast::ExprKind::Array(items) => {
                 let elem_exp = match expected.map(|t| self.kind(t)) {
-                    Some(TyKind::Array(t, _)) | Some(TyKind::Slice(t)) => Some(t),
+                    Some(TyKind::Array(t, _)) | Some(TyKind::Slice(t)) => Some(*t),
                     _ => None,
                 };
                 let elem = elem_exp.unwrap_or_else(|| self.new_var(VarKind::General, span));
-                let xs: Vec<Expr> = items
-                    .iter()
-                    .map(|x| {
-                        let ex = self.check_expr(x, Some(elem));
-                        self.expect(ex.ty, elem, ex.span);
-                        ex
-                    })
-                    .collect();
+                let xs: Vec<Expr> = items.iter().map(|x| self.check_expect(x, elem)).collect();
                 if items.is_empty() {
                     self.err(
                         Diagnostic::new(
@@ -140,7 +129,7 @@ impl<'p> Checker<'p> {
             }
             ast::ExprKind::ArrayRepeat { value, count } => {
                 let elem_exp = match expected.map(|t| self.kind(t)) {
-                    Some(TyKind::Array(t, _)) => Some(t),
+                    Some(TyKind::Array(t, _)) => Some(*t),
                     _ => None,
                 };
                 let v = self.check_expr(value, elem_exp);
@@ -221,18 +210,19 @@ impl<'p> Checker<'p> {
             ast::LitKind::Bool(b) => {
                 Expr { ty: self.p.types.bool, span, kind: ExprKind::Lit(Lit::Bool(b)) }
             }
-            ast::LitKind::Int => {
-                let Some(v) = wrela_syntax::lexer::int_value(&lit.text) else {
+            ast::LitKind::Int(value) => {
+                let v = match value {
+                    ast::IntValue::Ok(v) => v,
                     // A malformed number (`0x`, `1e`) has its error from the lexer (E0004).
-                    if self.p.syntax_errors.contains(&span) {
+                    ast::IntValue::Malformed => return self.error_expr(span),
+                    ast::IntValue::TooLarge => {
+                        self.err(Diagnostic::new(
+                            codes::E0006,
+                            span,
+                            "this integer is too large for any integer type",
+                        ));
                         return self.error_expr(span);
                     }
-                    self.err(Diagnostic::new(
-                        codes::E0006,
-                        span,
-                        "this integer is too large for any integer type",
-                    ));
-                    return self.error_expr(span);
                 };
                 let ty = match expected.map(|t| self.kind(t)) {
                     Some(TyKind::Int(_) | TyKind::Float(_)) => {
@@ -243,12 +233,12 @@ impl<'p> Checker<'p> {
                 self.int_literals.push((ty, v, false, span));
                 Expr { ty, span, kind: ExprKind::Lit(Lit::Int(i128::from(v))) }
             }
-            ast::LitKind::Float => {
-                let v = wrela_syntax::lexer::float_value(&lit.text);
+            ast::LitKind::Float(v) => {
                 let ty = match expected.map(|t| self.kind(t)) {
                     Some(TyKind::Float(_)) => self.shallow(expected.unwrap_or(self.p.types.error)),
                     _ => self.new_var(VarKind::Float, span),
                 };
+                self.float_literals.push((ty, v, span));
                 Expr { ty, span, kind: ExprKind::Lit(Lit::Float(v)) }
             }
             ast::LitKind::Str => {
@@ -308,7 +298,7 @@ impl<'p> Checker<'p> {
             if self.saw_syntax_error || resolve::is_broken(self.p, self.scope.module, &first.name) {
                 return None;
             }
-            let mut names: Vec<String> = self.env.iter().map(|(n, _)| n.clone()).collect();
+            let mut names: Vec<String> = self.env.names().map(String::from).collect();
             names.extend(resolve::visible_names(self.p, self.scope.module));
             let mut d = Diagnostic::new(
                 codes::E0200,
@@ -350,24 +340,22 @@ impl<'p> Checker<'p> {
             };
             return Some(ValueRes::TypeRelative(base, segs[1].ident.clone()));
         }
-        let idents: Vec<ast::Ident> = segs.iter().map(|s| s.ident.clone()).collect();
-        match resolve::resolve_module_path_in(self.p, self.scope.module, &idents, true) {
+        match resolve::resolve_module_path_in(self.p, self.scope.module, segs, true) {
             PathLookup::Found(r) => Some(ValueRes::Item(r)),
             PathLookup::NotYet(..) | PathLookup::Broken => None,
             PathLookup::Error(d) => {
                 // Maybe `Type::assoc` or `Trait::method`.
-                let prefix = &idents[..idents.len() - 1];
-                let last = idents[idents.len() - 1].clone();
+                let prefix = &segs[..segs.len() - 1];
+                let last = segs[segs.len() - 1].ident.clone();
                 if let PathLookup::Found(r) =
                     resolve::resolve_module_path_in(self.p, self.scope.module, prefix, true)
                 {
                     match r {
                         Res::Adt(a) => {
-                            let gens = self.p.adt(a).generics.clone();
+                            let n = self.p.adt(a).generics.len();
                             let args: Vec<TyId> = match &segs[segs.len() - 2].generics {
                                 Some(g) => g.iter().map(|t| self.resolve_type(t)).collect(),
-                                None => gens
-                                    .iter()
+                                None => (0..n)
                                     .map(|_| self.new_var(VarKind::General, path.span))
                                     .collect(),
                             };
@@ -402,7 +390,7 @@ impl<'p> Checker<'p> {
                 Expr { ty, span, kind: ExprKind::Const(c) }
             }
             ValueRes::Item(Res::Variant(a, v)) => {
-                let variant = self.p.adt(a).variants()[v as usize].clone();
+                let variant = &self.p.adt(a).variants()[v as usize];
                 let args = self.adt_args(a, path, expected, span);
                 let ty = self.p.types.adt(a, args.clone());
                 match variant.shape {
@@ -427,7 +415,7 @@ impl<'p> Checker<'p> {
                                     "`{}` holds {} value{}",
                                     variant.name,
                                     variant.fields.len(),
-                                    if variant.fields.len() == 1 { "" } else { "s" }
+                                    wrela_diag::plural(variant.fields.len())
                                 ),
                             )
                             .with_help(format!("write `{}(...)`", variant.name)),
@@ -448,12 +436,39 @@ impl<'p> Checker<'p> {
                 }
             }
             ValueRes::Item(Res::Fn(f)) => {
+                let def = self.p.func(f);
+                // Only a call reaches what the compiler does for these, not the function's body.
+                if def.attrs.entry.is_some() {
+                    self.err(
+                        Diagnostic::new(
+                            codes::E0606,
+                            span,
+                            format!("`{}` is a GPU entry point, not a value", def.name),
+                        )
+                        .with_note("entry points run on the GPU and can't be called directly"),
+                    );
+                    return self.error_expr(span);
+                }
+                if def.attrs.intrinsic {
+                    self.err(
+                        Diagnostic::new(
+                            codes::E0212,
+                            span,
+                            format!(
+                                "`{}` is built into the compiler, so it can only be called",
+                                def.name
+                            ),
+                        )
+                        .with_help(format!("wrap it in a closure: `|..| {}(..)`", def.name)),
+                    );
+                    return self.error_expr(span);
+                }
                 let args = self.fresh_fn_args(f, path, span);
                 let ty = self.p.types.intern(TyKind::FnDef(f, args.clone()));
                 Expr { ty, span, kind: ExprKind::FnRef(f, args) }
             }
             ValueRes::Item(Res::Adt(a)) => {
-                let name = self.p.adt(a).name.clone();
+                let name = &self.p.adt(a).name;
                 let shape = if self.p.adt(a).is_enum() {
                     format!("one of its variants, like `{name}::...`")
                 } else {
@@ -466,7 +481,7 @@ impl<'p> Checker<'p> {
                 self.error_expr(span)
             }
             ValueRes::Item(Res::Trait(t)) => {
-                let name = self.p.trait_(t).name.clone();
+                let name = &self.p.trait_(t).name;
                 self.err(Diagnostic::new(
                     codes::E0212,
                     span,
@@ -503,7 +518,7 @@ impl<'p> Checker<'p> {
                 self.error_expr(span)
             }
             ValueRes::TypeRelative(ty, name) => {
-                if let TyKind::Adt(a, args) = self.kind(ty)
+                if let &TyKind::Adt(a, ref args) = self.kind(ty)
                     && let Some(v) =
                         self.p.adt(a).variants().iter().position(|v| v.name == name.name)
                     && self.p.adt(a).variants()[v].shape == VariantShape::Unit
@@ -513,7 +528,7 @@ impl<'p> Checker<'p> {
                         span,
                         kind: ExprKind::Adt {
                             adt: a,
-                            args,
+                            args: args.clone(),
                             variant: Some(v as u32),
                             fields: Vec::new(),
                             order: Vec::new(),
@@ -523,7 +538,7 @@ impl<'p> Checker<'p> {
                 }
                 // An enum without that variant or method: say so, rather than that it must be
                 // called.
-                if let TyKind::Adt(a, _) = self.kind(ty)
+                if let &TyKind::Adt(a, _) = self.kind(ty)
                     && self.p.adt(a).is_enum()
                     && !self.has_associated_fn(a, &name.name)
                 {
@@ -577,26 +592,19 @@ impl<'p> Checker<'p> {
         span: Span,
     ) -> Vec<TyId> {
         let n = self.p.adt(a).generics.len();
-        let explicit = path.segments.iter().rev().find_map(|s| s.generics.clone());
+        let explicit = path.segments.iter().rev().find_map(|s| s.generics.as_deref());
         let args: Vec<TyId> = match explicit {
             Some(g) if g.len() == n => g.iter().map(|t| self.resolve_type(t)).collect(),
             Some(g) => {
-                self.err(Diagnostic::new(
-                    codes::E0322,
-                    span,
-                    format!(
-                        "`{}` takes {n} generic arguments, not {}",
-                        self.p.adt(a).name,
-                        g.len()
-                    ),
-                ));
+                let name = &self.p.adt(a).name;
+                self.err(resolve::wrong_generic_count(span, name, n, g.len(), "s"));
                 (0..n).map(|_| self.p.types.error).collect()
             }
             None => (0..n).map(|_| self.new_var(VarKind::General, span)).collect(),
         };
         if let Some(e) = expected {
             let ty = self.p.types.adt(a, args.clone());
-            if let TyKind::Adt(b, _) = self.kind(e)
+            if let &TyKind::Adt(b, _) = self.kind(e)
                 && b == a
             {
                 let _ = self.infer.unify(&self.p.types, ty, e);
@@ -608,8 +616,8 @@ impl<'p> Checker<'p> {
     /// Fresh variables (or turbofish types) for all of a function's generics.
     pub(crate) fn fresh_fn_args(&mut self, f: FnId, path: &ast::Path, span: Span) -> Vec<TyId> {
         let all = self.p.fn_all_generics(f);
-        let own = self.p.func(f).generics.clone();
-        let explicit = path.segments.last().and_then(|s| s.generics.clone());
+        let own = &self.p.func(f).generics;
+        let explicit = path.segments.last().and_then(|s| s.generics.as_deref());
         let mut given: Vec<Option<TyId>> = vec![None; all.len()];
         if let Some(g) = explicit {
             // Implicit parameters (from `x: Trait`) can't be named; only declared ones count.
@@ -619,18 +627,10 @@ impl<'p> Checker<'p> {
                 .filter(|p| !self.p.param(*p).name.starts_with("impl "))
                 .collect();
             if g.len() != declared.len() {
-                self.err(Diagnostic::new(
-                    codes::E0322,
-                    span,
-                    format!(
-                        "`{}` takes {} generic arguments, not {}",
-                        self.p.func(f).name,
-                        declared.len(),
-                        g.len()
-                    ),
-                ));
+                let name = &self.p.func(f).name;
+                self.err(resolve::wrong_generic_count(span, name, declared.len(), g.len(), "s"));
             } else {
-                for (p, t) in declared.iter().zip(&g) {
+                for (p, t) in declared.iter().zip(g) {
                     let ty = self.resolve_type(t);
                     if let Some(i) = all.iter().position(|q| q == p) {
                         given[i] = Some(ty);
@@ -689,6 +689,9 @@ impl<'p> Checker<'p> {
         if op == UnOp::Neg && vk == Some(VarKind::Int) {
             self.negated_ints.push((i.ty, span));
         }
+        if op == UnOp::Not {
+            self.int_only(i.ty, "!", span);
+        }
         if op == UnOp::Neg
             && let ExprKind::Lit(Lit::Int(v)) = i.kind
             && let Some(last) = self.int_literals.last_mut()
@@ -716,21 +719,10 @@ impl<'p> Checker<'p> {
                 self.expect(y.ty, t, y.span);
                 return Expr { ty: t, span, kind: ExprKind::Binary(op, Box::new(x), Box::new(y)) };
             }
-            BinOp::Pow => {
-                // An integer base takes a `u32` exponent; anything else, its own type.
+            BinOp::Pow | BinOp::Shl | BinOp::Shr => {
                 let x = self.check_expr(a, expected);
-                let int_base = matches!(self.kind(x.ty), TyKind::Int(_))
-                    || self.infer.var_kind(&self.p.types, x.ty) == Some(VarKind::Int);
-                let hint = if int_base { self.p.types.u32 } else { x.ty };
+                let hint = self.right_hint(op, x.ty);
                 let y = self.check_expr(b, Some(hint));
-                self.pows.push((x.ty, y.ty, span));
-                (x, y)
-            }
-            BinOp::Shl | BinOp::Shr => {
-                let x = self.check_expr(a, if op.is_comparison() { None } else { expected });
-                let u = self.p.types.u32;
-                let y = self.check_expr(b, Some(u));
-                self.expect(y.ty, u, y.span);
                 (x, y)
             }
             _ => {
@@ -747,6 +739,24 @@ impl<'p> Checker<'p> {
             None => self.p.types.error,
         };
         Expr { ty, span, kind: ExprKind::Binary(op, Box::new(ea), Box::new(eb)) }
+    }
+
+    /// The type the right operand of `op` is checked against, when the left is an `a`: a shift
+    /// amount is a `u32`, so is an integer's exponent; anything else is `a`'s type.
+    pub(crate) fn right_hint(&self, op: BinOp, a: TyId) -> TyId {
+        match op {
+            BinOp::Shl | BinOp::Shr => self.p.types.u32,
+            BinOp::Pow if self.is_intlike(a) => self.p.types.u32,
+            _ => a,
+        }
+    }
+
+    /// An integer literal's type not settled yet, as an operand of an operator that only
+    /// applies to integers: it's checked once it's settled, in case it became a float.
+    pub(crate) fn int_only(&mut self, t: TyId, op: &'static str, span: Span) {
+        if self.infer.var_kind(&self.p.types, t) == Some(VarKind::Int) {
+            self.int_ops.push((t, op, span));
+        }
     }
 
     /// The type of `a op b`, unifying literal variables where the operator needs it.
@@ -795,11 +805,9 @@ impl<'p> Checker<'p> {
                 let ordered = matches!(op, BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge);
                 let ok = match k {
                     TyKind::Int(_) | TyKind::Float(_) => true,
-                    TyKind::Var(_) => {
-                        self.infer.var_kind(&self.p.types, a) != Some(VarKind::General)
-                    }
+                    TyKind::Var(_) => self.is_number_var(a),
                     TyKind::Bool | TyKind::Vec(_) => !ordered,
-                    TyKind::Adt(adt, _) => {
+                    &TyKind::Adt(adt, _) => {
                         !ordered
                             && self.p.adt(adt).is_enum()
                             && self.p.adt(adt).variants().iter().all(|v| v.fields.is_empty())
@@ -825,59 +833,59 @@ impl<'p> Checker<'p> {
                 if self.infer.unify(&self.p.types, a, b).is_err() {
                     return fail(self);
                 }
+                if self.is_intlike(a) || matches!(self.kind(a), TyKind::Bool) {
+                    self.int_only(a, op.text(), span);
+                    Some(a)
+                } else {
+                    fail(self)
+                }
+            }
+            BinOp::Shl | BinOp::Shr => {
+                let u = self.p.types.u32;
+                if !self.is_intlike(a) || self.infer.unify(&self.p.types, b, u).is_err() {
+                    return fail(self);
+                }
+                self.int_only(a, op.text(), span);
+                Some(a)
+            }
+            BinOp::Pow if self.is_intlike(a) => {
+                let u = self.p.types.u32;
+                if self.infer.unify(&self.p.types, b, u).is_err() {
+                    self.err(Diagnostic::new(
+                        codes::E0305,
+                        span,
+                        "an integer's exponent must be a `u32`",
+                    ));
+                }
+                self.pows.push((a, b, span));
+                Some(a)
+            }
+            BinOp::Pow => {
+                if self.infer.unify(&self.p.types, a, b).is_err() {
+                    return fail(self);
+                }
+                self.pows.push((a, b, span));
                 match self.kind(a) {
-                    TyKind::Int(_) | TyKind::Bool => Some(a),
-                    TyKind::Var(_)
-                        if self.infer.var_kind(&self.p.types, a) == Some(VarKind::Int) =>
-                    {
+                    TyKind::Float(_) | TyKind::Vec(_) => Some(a),
+                    // A literal is a float literal, still open: `2.0 ** 3.0` may be an `f64`.
+                    TyKind::Var(_) if self.is_number_var(a) => {
+                        let f = self.new_var(VarKind::Float, span);
+                        let _ = self.infer.unify(&self.p.types, a, f);
+                        Some(a)
+                    }
+                    TyKind::Var(_) => {
+                        let _ = self.infer.unify(&self.p.types, a, f32);
                         Some(a)
                     }
                     _ => fail(self),
                 }
             }
-            BinOp::Shl | BinOp::Shr => match self.kind(a) {
-                TyKind::Int(_) => Some(a),
-                TyKind::Var(_) if self.infer.var_kind(&self.p.types, a) == Some(VarKind::Int) => {
-                    Some(a)
-                }
-                _ => fail(self),
-            },
-            BinOp::Pow => match (self.kind(a), self.kind(b)) {
-                (TyKind::Int(_), _) | (TyKind::Var(_), _)
-                    if matches!(ka, TyKind::Int(_))
-                        || self.infer.var_kind(&self.p.types, a) == Some(VarKind::Int) =>
-                {
-                    let u = self.p.types.u32;
-                    if self.infer.unify(&self.p.types, b, u).is_err() {
-                        self.err(Diagnostic::new(
-                            codes::E0305,
-                            span,
-                            "an integer's exponent must be a `u32`",
-                        ));
-                    }
-                    Some(a)
-                }
-                _ => {
-                    if self.infer.unify(&self.p.types, a, b).is_err() {
-                        return fail(self);
-                    }
-                    match self.kind(a) {
-                        TyKind::Float(_) | TyKind::Vec(_) => Some(a),
-                        TyKind::Var(_) => {
-                            let _ = self.infer.unify(&self.p.types, a, f32);
-                            Some(a)
-                        }
-                        _ => fail(self),
-                    }
-                }
-            },
             BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
                 // Vector and scalar, matrix and vector.
                 match (&ka, &kb) {
                     (TyKind::Vec(_), TyKind::Float(_) | TyKind::Var(_))
                     | (TyKind::Mat(_), TyKind::Float(_) | TyKind::Var(_))
-                        if !matches!(kb, TyKind::Var(_))
-                            || self.infer.var_kind(&self.p.types, b) != Some(VarKind::General) =>
+                        if !matches!(kb, TyKind::Var(_)) || self.is_number_var(b) =>
                     {
                         if matches!(kb, TyKind::Var(_)) {
                             let _ = self.infer.unify(&self.p.types, b, f32);
@@ -891,8 +899,7 @@ impl<'p> Checker<'p> {
                         return Some(a);
                     }
                     (TyKind::Float(_) | TyKind::Var(_), TyKind::Vec(_) | TyKind::Mat(_))
-                        if !matches!(ka, TyKind::Var(_))
-                            || self.infer.var_kind(&self.p.types, a) != Some(VarKind::General) =>
+                        if !matches!(ka, TyKind::Var(_)) || self.is_number_var(a) =>
                     {
                         if matches!(ka, TyKind::Var(_)) {
                             let _ = self.infer.unify(&self.p.types, a, f32);
@@ -923,11 +930,7 @@ impl<'p> Checker<'p> {
                 match self.kind(a) {
                     TyKind::Int(_) | TyKind::Float(_) | TyKind::Vec(_) => Some(a),
                     TyKind::Mat(_) if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul) => Some(a),
-                    TyKind::Var(_)
-                        if self.infer.var_kind(&self.p.types, a) != Some(VarKind::General) =>
-                    {
-                        Some(a)
-                    }
+                    TyKind::Var(_) if self.is_number_var(a) => Some(a),
                     _ => fail(self),
                 }
             }
@@ -961,13 +964,11 @@ impl<'p> Checker<'p> {
 
     fn check_field(&mut self, base: &ast::Expr, name: &ast::FieldName, span: Span) -> Expr {
         let b = self.check_expr(base, None);
-        let k = self.kind(b.ty);
-        match (&k, name) {
+        match (self.kind(b.ty), name) {
             // Its error is reported.
             (TyKind::Error, _) | (_, ast::FieldName::BadIndex(_)) => self.error_expr(span),
-            (TyKind::Adt(a, args), ast::FieldName::Ident(n)) if !self.p.adt(*a).is_enum() => {
-                let (a, args) = (*a, args.clone());
-                let fields = self.p.adt(a).fields().to_vec();
+            (&TyKind::Adt(a, ref args), ast::FieldName::Ident(n)) if !self.p.adt(a).is_enum() => {
+                let fields = self.p.adt(a).fields();
                 match fields.iter().position(|f| f.name == n.name) {
                     Some(i) => {
                         let f = &fields[i];
@@ -986,8 +987,7 @@ impl<'p> Checker<'p> {
                                 .with_secondary(f.span, "declared here without `pub`"),
                             );
                         }
-                        let tys = self.p.struct_fields(a, &args);
-                        let ty = tys[i].1;
+                        let ty = self.p.field_ty(a, args, None, i).unwrap_or(self.p.types.error);
                         Expr { ty, span, kind: ExprKind::Field(Box::new(b), i as u32) }
                     }
                     None => {
@@ -1126,10 +1126,11 @@ impl<'p> Checker<'p> {
             return Expr { ty: elem, span, kind: ExprKind::Index(Box::new(b), Box::new(i)) };
         }
         let i = self.check_expr(index, None);
-        let ik = self.kind(i.ty);
-        let int_ok = matches!(ik, TyKind::Int(IntTy::I32 | IntTy::U32) | TyKind::Error)
-            || self.infer.var_kind(&self.p.types, i.ty) == Some(VarKind::Int);
-        if self.infer.var_kind(&self.p.types, i.ty) == Some(VarKind::Int) {
+        // An integer literal is a `u32` index.
+        let literal = self.infer.var_kind(&self.p.types, i.ty) == Some(VarKind::Int);
+        let int_ok = literal
+            || matches!(self.kind(i.ty), TyKind::Int(IntTy::I32 | IntTy::U32) | TyKind::Error);
+        if literal {
             let u = self.p.types.u32;
             let _ = self.infer.unify(&self.p.types, i.ty, u);
         }
@@ -1158,9 +1159,9 @@ impl<'p> Checker<'p> {
             ));
         }
         let elem = match k {
-            TyKind::Array(t, _) | TyKind::Slice(t) => t,
+            TyKind::Array(t, _) | TyKind::Slice(t) => *t,
             TyKind::Vec(_) => self.p.types.f32,
-            TyKind::Mat(n) => self.p.types.vec(n),
+            TyKind::Mat(n) => self.p.types.vec(*n),
             TyKind::Error => self.p.types.error,
             _ => {
                 let shown = self.display(b.ty);
@@ -1185,14 +1186,15 @@ impl<'p> Checker<'p> {
         expected: Option<TyId>,
         span: Span,
     ) -> Expr {
-        let idents: Vec<ast::Ident> = path.segments.iter().map(|s| s.ident.clone()).collect();
-        let res = if idents.len() == 1 && idents[0].name == "Self" {
+        let segs = &path.segments;
+        let is_self = segs.len() == 1 && segs[0].ident.name == "Self";
+        let res = if is_self {
             match self.scope.self_ty.map(|t| self.kind(t)) {
-                Some(TyKind::Adt(a, _)) => Some(Res::Adt(a)),
+                Some(TyKind::Adt(a, _)) => Some(Res::Adt(*a)),
                 _ => None,
             }
         } else {
-            match resolve::resolve_module_path_in(self.p, self.scope.module, &idents, true) {
+            match resolve::resolve_module_path_in(self.p, self.scope.module, segs, true) {
                 PathLookup::Found(r) => Some(r),
                 PathLookup::Error(d) => {
                     self.err(*d);
@@ -1230,28 +1232,38 @@ impl<'p> Checker<'p> {
                 return self.error_expr(span);
             }
         };
-        let args = if idents.len() == 1 && idents[0].name == "Self" {
+        let args = if is_self {
             match self.scope.self_ty.map(|t| self.kind(t)) {
-                Some(TyKind::Adt(_, args)) => args,
+                Some(TyKind::Adt(_, args)) => args.clone(),
                 _ => Vec::new(),
             }
         } else {
             self.adt_args(adt, path, expected, span)
         };
         let ty = self.p.types.adt(adt, args.clone());
-        let decls: Vec<FieldDef> = match variant {
-            None => self.p.adt(adt).fields().to_vec(),
-            Some(v) => self.p.adt(adt).variants()[v as usize].fields.clone(),
-        };
-        let field_tys: Vec<(String, TyId)> = match variant {
-            None => self.p.struct_fields(adt, &args),
-            Some(v) => self.p.variant_fields(adt, &args, v as usize),
-        };
-        let base_expr = base.map(|b| {
-            let e = self.check_expr(b, Some(ty));
-            self.expect(e.ty, ty, e.span);
-            e
-        });
+        if self.p.is_lang_adt(adt, Lang::GlobalId) {
+            self.err(
+                Diagnostic::new(codes::E0601, path.span, "a `GlobalId` can't be built")
+                    .with_note("each invocation gets its own from the GPU, and a `Slots` is indexed by it, so each invocation writes only its own slot (§6.13)")
+                    .with_help("take it as a kernel parameter: `id: GlobalId`"),
+            );
+        }
+        let decls = self.p.adt_fields(adt, variant);
+        let field_tys = self.p.fields_of(adt, &args, variant);
+        let base_expr = base.map(|b| self.check_expect(b, ty));
+        if let (Some(v), Some(b)) = (variant, &base_expr) {
+            // Its fields are a variant's: the base, an enum value, may hold another one.
+            let shown = self.display(ty);
+            let name = &self.p.adt(adt).variants()[v as usize].name;
+            self.err(
+                Diagnostic::new(
+                    codes::E0300,
+                    b.span,
+                    format!("`..base` fills a struct's fields, but this is an `{shown}`, which may hold a variant other than `{name}`"),
+                )
+                .with_help(format!("give every field of `{name}`, or `match` the base to take its fields")),
+            );
+        }
         let mut given: Vec<Option<Expr>> = vec![None; decls.len()];
         let mut order: Vec<u32> = Vec::new();
         let adt_mod = self.p.adt(adt).module;
@@ -1318,9 +1330,7 @@ impl<'p> Checker<'p> {
                         let fty = field_tys[i].1;
                         out.push(Expr { ty: fty, span: b.span, kind: ExprKind::FromBase });
                     } else if let Some(d) = &decls[i].default {
-                        let fty = field_tys[i].1;
-                        let e = self.check_default(d, fty);
-                        out.push(e);
+                        out.push(self.check_default(d, field_tys[i].1, adt_mod));
                         order.push(i as u32);
                     } else {
                         missing.push((decls[i].name.clone(), field_tys[i].1));
@@ -1372,11 +1382,22 @@ impl<'p> Checker<'p> {
         })
     }
 
-    /// A field or parameter default, checked where it's used (it's a literal value).
-    pub(crate) fn check_default(&mut self, d: &ast::Expr, ty: TyId) -> Expr {
-        let e = self.check_expr(d, Some(ty));
-        self.expect(e.ty, ty, e.span);
+    /// A parameter's or field's default where a call or literal leaves it out. It's checked
+    /// as where it's declared, in `module`: its names are that module's, never the caller's.
+    pub(crate) fn check_default(&mut self, d: &ast::Expr, ty: TyId, module: ModuleId) -> Expr {
+        let scope = std::mem::replace(&mut self.scope, resolve::Scope::new(module));
+        let env = std::mem::take(&mut self.env);
+        let e = self.check_expect(d, ty);
+        self.env = env;
+        self.scope = scope;
         e
+    }
+
+    /// `e`, checked with `ty` expected, then unified with `ty` (E0300 if they don't fit).
+    pub(crate) fn check_expect(&mut self, e: &ast::Expr, ty: TyId) -> Expr {
+        let x = self.check_expr(e, Some(ty));
+        self.expect(x.ty, ty, x.span);
+        x
     }
 
     // ---- control flow ----------------------------------------------------------------------
@@ -1409,14 +1430,15 @@ impl<'p> Checker<'p> {
                             _ => ex.span,
                         };
                         let then_at = t.tail.as_ref().map_or(t.span, |x| x.span);
-                        self.err(
-                            Diagnostic::new(
-                                codes::E0300,
-                                at,
-                                format!("the branches of this `if` have different types: `{a}` and `{b}`"),
-                            )
-                            .with_secondary(then_at, format!("this is `{a}`")),
-                        );
+                        let d = Diagnostic::new(
+                            codes::E0300,
+                            at,
+                            format!(
+                                "the branches of this `if` have different types: `{a}` and `{b}`"
+                            ),
+                        )
+                        .with_secondary(then_at, format!("this is `{a}`"));
+                        self.err(self.branch_mismatch(d, t.ty, ex.ty));
                     }
                     t.ty
                 };
@@ -1444,14 +1466,9 @@ impl<'p> Checker<'p> {
     }
 
     fn check_return(&mut self, value: Option<&ast::Expr>, span: Span) -> Expr {
-        let (ret, _mode) = self.ret();
-        let target = self.closure_ret().unwrap_or(ret);
+        let target = self.closure_ret().unwrap_or(self.ret_ty);
         let v = match value {
-            Some(v) => {
-                let e = self.check_expr(v, Some(target));
-                self.expect(e.ty, target, e.span);
-                Some(Box::new(e))
-            }
+            Some(v) => Some(Box::new(self.check_expect(v, target))),
             None => {
                 let unit = self.p.types.unit;
                 if !matches!(self.kind(target), TyKind::Var(_)) && self.shallow(target) != unit {
@@ -1479,7 +1496,7 @@ impl<'p> Checker<'p> {
         span: Span,
     ) -> Expr {
         let exp = match expected.map(|t| self.kind(t)) {
-            Some(TyKind::FnPtr(ps, r)) if ps.len() == params.len() => Some((ps, r)),
+            Some(TyKind::FnPtr(ps, r)) if ps.len() == params.len() => Some((ps.clone(), *r)),
             Some(TyKind::FnPtr(ps, _)) => {
                 self.err(Diagnostic::new(
                     codes::E0301,
@@ -1526,8 +1543,7 @@ impl<'p> Checker<'p> {
             };
             locals.push(self.declare_closure_param(&p.name, ty));
         }
-        let b = self.without_loops(|this| this.check_expr(body, Some(ret_ty)));
-        self.expect(b.ty, ret_ty, b.span);
+        let b = self.without_loops(|this| this.check_expect(body, ret_ty));
         self.env.truncate(env_len);
         let id2 = self.end_closure(locals, ret_ty, b, span);
         debug_assert_eq!(id, id2);

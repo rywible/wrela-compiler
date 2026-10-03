@@ -8,8 +8,11 @@
 //! Sampling expands `root` top-down, choosing uniformly among alternatives until the text
 //! reaches its length budget or a depth limit, then taking the shortest way to finish.
 
-use crate::rng::Rng;
+use crate::agree::Checker;
+use crate::earley::Scratch;
+use crate::rng::{Rng, par_seeded};
 use std::collections::HashMap;
+use wrela_diag::FileId;
 
 #[derive(Clone, Debug)]
 pub struct Gbnf {
@@ -22,7 +25,16 @@ pub struct Gbnf {
 #[derive(Clone, Debug)]
 pub struct RuleDef {
     pub name: String,
-    pub alts: Vec<Vec<Item>>,
+    pub alts: Alts,
+}
+
+/// Alternatives: a rule's body, or a group's.
+#[derive(Clone, Debug)]
+pub struct Alts {
+    pub seqs: Vec<Vec<Item>>,
+    /// The alternatives that derive the shortest strings, which sampling takes once the budget
+    /// is spent. Filled in when the rule costs are known.
+    cheapest: Vec<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -34,9 +46,15 @@ pub struct Item {
 #[derive(Clone, Debug)]
 pub enum Atom {
     Lit(String),
-    Class { negated: bool, ranges: Vec<(char, char)> },
+    Class {
+        negated: bool,
+        ranges: Vec<(char, char)>,
+        /// The characters sampling draws from: those in the ranges or, for a negated class,
+        /// those of `NEGATED_POOL` outside them.
+        pool: Vec<char>,
+    },
     Ref(usize),
-    Group(Vec<Vec<Item>>),
+    Group(Alts),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -91,13 +109,13 @@ impl Reader<'_> {
         })
     }
 
-    fn alts(&mut self) -> Result<Vec<Vec<Item>>, String> {
-        let mut alts = vec![self.seq()?];
+    fn alts(&mut self) -> Result<Alts, String> {
+        let mut seqs = vec![self.seq()?];
         while self.peek() == Some('|') {
             self.pos += 1;
-            alts.push(self.seq()?);
+            seqs.push(self.seq()?);
         }
-        Ok(alts)
+        Ok(Alts { seqs, cheapest: Vec::new() })
     }
 
     fn seq(&mut self) -> Result<Vec<Item>, String> {
@@ -166,7 +184,13 @@ impl Reader<'_> {
                         ranges.push((lo, hi));
                     }
                     self.pos += 1;
-                    Atom::Class { negated, ranges }
+                    let inside = |c: char| ranges.iter().any(|(lo, hi)| (*lo..=*hi).contains(&c));
+                    let pool = if negated {
+                        NEGATED_POOL.chars().filter(|c| !inside(*c)).collect()
+                    } else {
+                        ranges.iter().flat_map(|(lo, hi)| *lo..=*hi).collect()
+                    };
+                    Atom::Class { negated, ranges, pool }
                 }
                 Some('(') => {
                     self.pos += 1;
@@ -242,6 +266,9 @@ impl Gbnf {
         if let Some(r) = g.rules.iter().zip(&g.cost).find(|(_, c)| **c == usize::MAX) {
             return Err(format!("GBNF rule `{}` derives no finite string", r.0.name));
         }
+        for r in &mut g.rules {
+            mark_cheapest(&mut r.alts, &g.cost);
+        }
         Ok(g)
     }
 
@@ -250,7 +277,7 @@ impl Gbnf {
         loop {
             let mut changed = false;
             for (i, r) in self.rules.iter().enumerate() {
-                let c = alts_cost(&r.alts, &cost);
+                let c = alts_cost(&r.alts.seqs, &cost);
                 if c < cost[i] {
                     cost[i] = c;
                     changed = true;
@@ -296,7 +323,7 @@ impl Gbnf {
         // A rule reached again at the same position before finishing would be left recursion,
         // which the export rules out; the placeholder makes such a cycle fail instead of loop.
         memo.insert((r, pos), Vec::new());
-        let ends = self.alts_ends(&self.rules[r].alts, pos, s, memo);
+        let ends = self.alts_ends(&self.rules[r].alts.seqs, pos, s, memo);
         memo.insert((r, pos), ends.clone());
         ends
     }
@@ -343,7 +370,7 @@ impl Gbnf {
                     let l: Vec<char> = l.chars().collect();
                     if s[p..].starts_with(&l) { vec![p + l.len()] } else { Vec::new() }
                 }
-                Atom::Class { negated, ranges } => match s.get(p) {
+                Atom::Class { negated, ranges, .. } => match s.get(p) {
                     Some(c)
                         if ranges.iter().any(|(lo, hi)| (*lo..=*hi).contains(c)) != *negated =>
                     {
@@ -352,7 +379,7 @@ impl Gbnf {
                     _ => Vec::new(),
                 },
                 Atom::Ref(r) => self.rule_ends(*r, p, s, memo),
-                Atom::Group(alts) => self.alts_ends(alts, p, s, memo),
+                Atom::Group(alts) => self.alts_ends(&alts.seqs, p, s, memo),
             }
         };
         match it.rep {
@@ -380,11 +407,24 @@ impl Gbnf {
     }
 }
 
+/// Fills in [`Alts::cheapest`] for `alts` and the groups inside it.
+fn mark_cheapest(alts: &mut Alts, cost: &[usize]) {
+    let costs: Vec<usize> = alts.seqs.iter().map(|a| seq_cost(a, cost)).collect();
+    let min = costs.iter().copied().min().unwrap_or(0);
+    alts.cheapest = (0..costs.len()).filter(|&i| costs[i] == min).collect();
+    for it in alts.seqs.iter_mut().flatten() {
+        if let Atom::Group(inner) = &mut it.atom {
+            mark_cheapest(inner, cost);
+        }
+    }
+}
+
 fn alts_cost(alts: &[Vec<Item>], cost: &[usize]) -> usize {
-    alts.iter()
-        .map(|a| a.iter().fold(0usize, |acc, it| acc.saturating_add(item_cost(it, cost))))
-        .min()
-        .unwrap_or(usize::MAX)
+    alts.iter().map(|a| seq_cost(a, cost)).min().unwrap_or(usize::MAX)
+}
+
+fn seq_cost(seq: &[Item], cost: &[usize]) -> usize {
+    seq.iter().fold(0usize, |acc, it| acc.saturating_add(item_cost(it, cost)))
 }
 
 fn item_cost(it: &Item, cost: &[usize]) -> usize {
@@ -392,7 +432,7 @@ fn item_cost(it: &Item, cost: &[usize]) -> usize {
         Atom::Lit(s) => s.chars().count(),
         Atom::Class { .. } => 1,
         Atom::Ref(r) => cost[*r],
-        Atom::Group(alts) => alts_cost(alts, cost),
+        Atom::Group(alts) => alts_cost(&alts.seqs, cost),
     };
     match it.rep {
         Rep::Opt | Rep::Star => 0,
@@ -420,21 +460,10 @@ impl Sampler<'_> {
         self.alts(alts, depth + 1, rng);
     }
 
-    fn alts(&mut self, alts: &[Vec<Item>], depth: usize, rng: &mut Rng) {
-        let pick = if self.free(depth) {
-            rng.below(alts.len())
-        } else {
-            let costs: Vec<usize> = alts
-                .iter()
-                .map(|a| {
-                    a.iter().fold(0usize, |acc, it| acc.saturating_add(item_cost(it, &self.g.cost)))
-                })
-                .collect();
-            let min = costs.iter().copied().min().unwrap_or(0);
-            let cheapest: Vec<usize> = (0..alts.len()).filter(|&i| costs[i] == min).collect();
-            *rng.pick(&cheapest)
-        };
-        for it in &alts[pick] {
+    fn alts(&mut self, alts: &Alts, depth: usize, rng: &mut Rng) {
+        let pick =
+            if self.free(depth) { rng.below(alts.seqs.len()) } else { *rng.pick(&alts.cheapest) };
+        for it in &alts.seqs[pick] {
             self.item(it, depth, rng);
         }
     }
@@ -454,15 +483,7 @@ impl Sampler<'_> {
         for _ in 0..n {
             match &it.atom {
                 Atom::Lit(s) => self.out.push_str(s),
-                Atom::Class { negated, ranges } => {
-                    let inside = |c: char| ranges.iter().any(|(lo, hi)| (*lo..=*hi).contains(&c));
-                    let pool: Vec<char> = if *negated {
-                        NEGATED_POOL.chars().filter(|c| !inside(*c)).collect()
-                    } else {
-                        ranges.iter().flat_map(|(lo, hi)| *lo..=*hi).collect()
-                    };
-                    self.out.push(*rng.pick(&pool));
-                }
+                Atom::Class { pool, .. } => self.out.push(*rng.pick(pool)),
                 Atom::Ref(r) => self.rule(*r, depth, rng),
                 Atom::Group(alts) => self.alts(alts, depth + 1, rng),
             }
@@ -540,66 +561,51 @@ pub struct SampleStats {
 /// oracle agrees.
 pub fn check_samples(
     g: &Gbnf,
-    checker: Option<&crate::agree::Checker>,
+    checker: Option<&Checker>,
     n: u64,
     seed: u64,
     threads: usize,
 ) -> SampleStats {
-    let threads = threads.max(1) as u64;
+    let workers = par_seeded(
+        n,
+        seed,
+        threads,
+        256 << 20,
+        || (SampleStats::default(), vec![0u64; g.rules.len()], Scratch::default()),
+        |(stats, used, scratch), i, mut rng| {
+            let budget = 10 + rng.below(400);
+            let src = g.sample(&mut rng, budget, used);
+            stats.programs += 1;
+            stats.chars += src.len() as u64;
+            stats.multi_line += u64::from(src.trim_end().contains('\n'));
+            stats.with_comments += u64::from(src.contains("//"));
+            // The checker parses the source too; without one, it's parsed here.
+            let (parsed, disagreement) = match checker {
+                Some(c) => {
+                    let check = c.check(&src, scratch);
+                    (check.parsed, check.disagreement)
+                }
+                None => (wrela_syntax::parse(FileId(0), &src), None),
+            };
+            if let Some(d) = parsed.diagnostics.first() {
+                stats.rejected.push((i, src.clone(), format!("{} {}", d.code.as_str(), d.message)));
+            }
+            if let Some(d) = disagreement {
+                stats.disagreements.push((i, src, d));
+            }
+        },
+    );
     let mut total = SampleStats { seed, rules_total: g.rules.len(), ..SampleStats::default() };
     let mut used_all = vec![0u64; g.rules.len()];
-    std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..threads)
-            .map(|t| {
-                std::thread::Builder::new()
-                    .stack_size(256 << 20)
-                    .spawn_scoped(scope, move || {
-                        let mut stats = SampleStats::default();
-                        let mut used = vec![0u64; g.rules.len()];
-                        let mut scratch = crate::earley::Scratch::default();
-                        let mut i = t;
-                        while i < n {
-                            let mut rng = Rng::new(crate::rng::mix(seed, i));
-                            let budget = 10 + rng.below(400);
-                            let src = g.sample(&mut rng, budget, &mut used);
-                            stats.programs += 1;
-                            stats.chars += src.len() as u64;
-                            stats.multi_line += u64::from(src.trim_end().contains('\n'));
-                            stats.with_comments += u64::from(src.contains("//"));
-                            let parsed = wrela_syntax::parse(wrela_diag::FileId(0), &src);
-                            if let Some(d) = parsed.diagnostics.first() {
-                                stats.rejected.push((
-                                    i,
-                                    src.clone(),
-                                    format!("{} {}", d.code.as_str(), d.message),
-                                ));
-                            }
-                            if let Some(d) =
-                                checker.and_then(|c| c.check(&src, &mut scratch).disagreement)
-                            {
-                                stats.disagreements.push((i, src.clone(), d));
-                            }
-                            i += threads;
-                        }
-                        (stats, used)
-                    })
-                    .expect("spawning a sampler thread")
-            })
-            .collect();
-        for h in handles {
-            let (s, used) = match h.join() {
-                Ok(r) => r,
-                Err(p) => std::panic::resume_unwind(p),
-            };
-            total.programs += s.programs;
-            total.chars += s.chars;
-            total.multi_line += s.multi_line;
-            total.with_comments += s.with_comments;
-            total.rejected.extend(s.rejected);
-            total.disagreements.extend(s.disagreements);
-            used_all.iter_mut().zip(&used).for_each(|(a, b)| *a += b);
-        }
-    });
+    for (s, used, _) in workers {
+        total.programs += s.programs;
+        total.chars += s.chars;
+        total.multi_line += s.multi_line;
+        total.with_comments += s.with_comments;
+        total.rejected.extend(s.rejected);
+        total.disagreements.extend(s.disagreements);
+        used_all.iter_mut().zip(&used).for_each(|(a, b)| *a += b);
+    }
     total.rules_used = used_all.iter().filter(|u| **u > 0).count();
     total
 }

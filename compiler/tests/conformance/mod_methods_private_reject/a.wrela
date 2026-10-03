@@ -1,0 +1,32 @@
+pub struct Account {
+    amount: i32,
+}
+
+impl Account {
+    fn forge(amount: i32) -> Account {
+        Account { amount: amount }
+    }
+
+    fn peek(self) -> i32 {
+        self.amount
+    }
+
+    pub fn open(amount: i32) -> Account {
+        Account { amount: amount }
+    }
+
+    pub fn balance(self) -> i32 {
+        self.peek()
+    }
+}
+
+// Private: other modules don't get its methods.
+trait Tripler {
+    fn triple(self) -> i32
+}
+
+impl Tripler for i32 {
+    fn triple(self) -> i32 {
+        self * 3
+    }
+}

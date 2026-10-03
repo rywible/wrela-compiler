@@ -45,3 +45,62 @@ pub fn d(x: f32) -> f32 {
 pub fn e(x: f32) -> f32 {
     interval(|t: f32| doubled(t) + 1.0, Interval { lo: x, hi: x + 1.0 }).lo
 }
+
+/// How often this recurses depends on x: an interval runs both sides of the branch, so its
+/// recursion might not end.
+fn halve(x: f32) -> f32 {
+    if x > 1.0 {
+        return halve(x * 0.5) //~ E0701
+    }
+    x
+}
+
+pub fn f(x: f32) -> f32 {
+    interval(halve, Interval { lo: x, hi: x + 1.0 }).lo
+}
+
+/// Its gradient uses its own gradient, and that one the next, without end.
+fn tower(x: f32) -> f32 {
+    if x > 10.0 {
+        return x
+    }
+    gradient(tower, x + 1.0) //~ E0700
+}
+
+pub fn g(x: f32) -> f32 {
+    tower(x)
+}
+
+struct Cell: Copy + Clone {
+    a: f32,
+    b: f32,
+}
+
+/// Which place this is depends on x. An interval runs both sides of the branch, so a write
+/// through it would be to either place, which a range of one pointer can't say.
+fn either(c: mut Cell, x: f32) -> mut f32 {
+    if x > 0.5 { //~ E0700
+        return mut c.a
+    }
+    mut c.b
+}
+
+fn through(x: f32) -> f32 {
+    var c = Cell { a: 0.0, b: 0.0 }
+    either(mut c, x) = x
+    c.a + c.b
+}
+
+pub fn h(x: f32) -> f32 {
+    interval(through, Interval { lo: x, hi: x + 1.0 }).hi
+}
+
+/// A range can't be written to a captured variable.
+pub fn k(x: f32) -> f32 {
+    var last = 0.0
+    let r = interval(|t: f32| { //~ E0700
+        last = t
+        t * 2.0
+    }, Interval { lo: x, hi: x + 1.0 })
+    r.lo + last
+}

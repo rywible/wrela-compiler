@@ -1,0 +1,84 @@
+// rejects: enum.match
+// Patterns with errors don't make the match look exhaustive, and don't hide the arms after them.
+enum K {
+    A,
+    B(i32),
+    C,
+}
+
+struct S: Copy + Clone {
+    a: i32,
+    b: i32,
+}
+
+const NOTHING: Option<i32> = None
+const KA: K = K::A
+const YES: bool = true
+
+fn twice(s: S) -> i32 {
+    match s {
+        S { a: 1, a: _, b } => 10 + b, //~ E0308
+    }
+}
+
+fn unit_const(o: Option<i32>) -> i32 {
+    match o {
+        NOTHING => 0, //~ E0320
+        Some(x) => x,
+    }
+}
+
+fn variant_const(k: K) -> i32 {
+    match k {
+        KA => 100, //~ E0320
+        K::B(v) => v,
+        K::C => 300,
+    }
+}
+
+fn too_large(x: u64) -> i32 {
+    match x {
+        18446744073709551616 => 1, //~ E0006
+        _ => 0,
+    }
+}
+
+fn negative_unsigned(x: u32) -> i32 {
+    match x {
+        -1 => 1, //~ E0305
+        _ => 0,
+    }
+}
+
+fn negative_inferred(x: u32) -> i32 {
+    let y = x
+    match y {
+        -1 => 1, //~ E0305
+        _ => 0,
+    }
+}
+
+fn bool_on_enum(k: K) -> i32 {
+    match k {
+        true => 1, //~ E0300
+        K::B(x) => x,
+        _ => 0,
+    }
+}
+
+fn bool_const_on_enum(k: K) -> i32 {
+    match (k, 1) {
+        (YES, _) => 1, //~ E0300
+        (K::B(x), _) => x,
+        _ => 0,
+    }
+}
+
+fn wrong_enum(k: K) -> i32 {
+    match k {
+        Option::Some(x) => x, //~ E0320
+        K::A => 1,
+        K::B(x) => x,
+        K::C => 3,
+    }
+}

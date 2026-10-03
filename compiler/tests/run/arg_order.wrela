@@ -1,0 +1,76 @@
+// run: named vector components, and `dispatch` and `draw` arguments, run in the order written
+// expect: vec_order() = 321
+// expect: vec_value() = 123
+// expect: dispatch_order() = 21
+// expect: draw_order() = 432
+
+use std::gpu::{
+    ClipPosition, FragCoord, GlobalId, GpuBuffer, Slots, VertexIndex, begin_screen_pass, buffer,
+    dispatch, draw, present,
+}
+
+struct P: Copy + Clone + GpuData {
+    s: f32,
+}
+
+@compute(64)
+fn fill(out: mut Slots<f32>, id: GlobalId) {
+    out[id] = 1.0
+}
+
+@vertex
+fn vs(v: VertexIndex) -> ClipPosition {
+    ClipPosition { position: vec4(f32(v.index), 0.0, 0.0, 1.0) }
+}
+
+@fragment
+fn fs(pixel: FragCoord, p: P) -> vec4 {
+    vec4(p.s, 0.0, 0.0, 1.0)
+}
+
+fn note(log: mut u32, v: u32) -> u32 {
+    log = log * 10 + v
+    v
+}
+
+fn notef(log: mut u32, v: f32) -> f32 {
+    log = log * 10 + u32(v)
+    v
+}
+
+fn buf(log: mut u32, b: GpuBuffer<f32>) -> GpuBuffer<f32> {
+    log = log * 10 + 2
+    b
+}
+
+fn p(log: mut u32, s: f32) -> P {
+    log = log * 10 + 3
+    P { s: s }
+}
+
+pub fn vec_order() -> u32 {
+    var log = 0
+    let v = vec3(z: notef(mut log, 3.0), y: notef(mut log, 2.0), x: notef(mut log, 1.0))
+    log
+}
+
+pub fn vec_value() -> f32 {
+    var log = 0
+    let v = vec3(z: notef(mut log, 3.0), x: notef(mut log, 1.0), y: notef(mut log, 2.0))
+    v.x * 100.0 + v.y * 10.0 + v.z
+}
+
+pub fn dispatch_order() -> u32 {
+    var log = 0
+    let b: GpuBuffer<f32> = buffer(64)
+    dispatch(fill, out: buf(mut log, b), groups: note(mut log, 1))
+    log
+}
+
+pub fn draw_order() -> u32 {
+    var log = 0
+    begin_screen_pass(clear: vec4(0.0, 0.0, 0.0, 1.0))
+    draw(vs, fs, instances: note(mut log, 4), p: p(mut log, 1.0), vertices: note(mut log, 2))
+    present()
+    log
+}

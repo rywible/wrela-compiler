@@ -1,6 +1,7 @@
 //! The built-in types and functions: the part of the closed list of compiler-known items
 //! (language.md §17) that isn't written in wrela. They're in scope everywhere (the prelude).
 
+use crate::program::Program;
 use crate::ty::{FloatTy, IntTy, TyId, TyKind, Types};
 
 /// A type name in the prelude.
@@ -159,6 +160,17 @@ builtin_fns! {
     Len = "len", 1, Method, false, None;
 }
 
+/// E0702: a transcendental (`what`: `sin`, `**`) of an `f64`. std computes them on the CPU in
+/// `f32` (language.md §11), and GPU code has no `f64`.
+pub fn f64_math(what: &str, span: wrela_diag::Span) -> wrela_diag::Diagnostic {
+    wrela_diag::Diagnostic::new(
+        wrela_diag::codes::E0702,
+        span,
+        format!("`{what}` of an `f64` isn't supported yet"),
+    )
+    .with_note("std's CPU math works in `f32`; convert with `f32(x)`")
+}
+
 impl BuiltinFn {
     /// The free function of this name.
     pub fn lookup(name: &str) -> Option<BuiltinFn> {
@@ -173,22 +185,15 @@ impl BuiltinFn {
 
     /// Works out the result type from the argument types (all resolved, defaults applied), or
     /// says what's wrong.
-    pub fn result(self, types: &Types, args: &[TyId]) -> Result<TyId, String> {
+    pub fn result(self, p: &Program, args: &[TyId]) -> Result<TyId, String> {
         use BuiltinFn::*;
+        let types = &p.types;
         let float_like =
             |types: &Types, t: TyId| matches!(types.kind(t), TyKind::Float(_) | TyKind::Vec(_));
         let numeric = |types: &Types, t: TyId| {
             matches!(types.kind(t), TyKind::Float(_) | TyKind::Vec(_) | TyKind::Int(_))
         };
-        let show = |types: &Types, t: TyId| match types.kind(t) {
-            TyKind::Bool => "bool".to_string(),
-            TyKind::Int(i) => i.name().to_string(),
-            TyKind::Float(f) => f.name().to_string(),
-            TyKind::Vec(n) => format!("vec{n}"),
-            TyKind::Mat(n) => format!("mat{n}"),
-            _ => "this type".to_string(),
-        };
-        let same = |types: &Types, args: &[TyId]| -> Result<TyId, String> {
+        let same = |args: &[TyId]| -> Result<TyId, String> {
             if args.windows(2).all(|w| w[0] == w[1]) {
                 Ok(args[0])
             } else {
@@ -196,7 +201,7 @@ impl BuiltinFn {
                     "`{}` needs arguments of one type, not {}",
                     self.name(),
                     args.iter()
-                        .map(|&t| format!("`{}`", show(types, t)))
+                        .map(|&t| format!("`{}`", p.display_ty(t)))
                         .collect::<Vec<_>>()
                         .join(" and ")
                 ))
@@ -211,21 +216,21 @@ impl BuiltinFn {
                     return Err(format!(
                         "`{}` takes a float or float vector, not `{}`",
                         self.name(),
-                        show(types, t)
+                        p.display_ty(t)
                     ));
                 }
                 if self == Normalize && !matches!(types.kind(t), TyKind::Vec(_)) {
-                    return Err(format!("`normalize` takes a vector, not `{}`", show(types, t)));
+                    return Err(format!("`normalize` takes a vector, not `{}`", p.display_ty(t)));
                 }
                 Ok(t)
             }
             Atan2 | Pow | Step => {
-                let t = same(types, args)?;
+                let t = same(args)?;
                 if !float_like(types, t) {
                     return Err(format!(
                         "`{}` takes floats or float vectors, not `{}`",
                         self.name(),
-                        show(types, t)
+                        p.display_ty(t)
                     ));
                 }
                 Ok(t)
@@ -236,7 +241,7 @@ impl BuiltinFn {
                     return Err(format!(
                         "`{}` takes a number or vector, not `{}`",
                         self.name(),
-                        show(types, t)
+                        p.display_ty(t)
                     ));
                 }
                 if self == Sign && matches!(types.kind(t), TyKind::Int(i) if !i.signed()) {
@@ -248,12 +253,12 @@ impl BuiltinFn {
                 Ok(t)
             }
             Min | Max | Clamp => {
-                let t = same(types, args)?;
+                let t = same(args)?;
                 if !numeric(types, t) {
                     return Err(format!(
                         "`{}` takes numbers or vectors, not `{}`",
                         self.name(),
-                        show(types, t)
+                        p.display_ty(t)
                     ));
                 }
                 Ok(t)
@@ -261,12 +266,12 @@ impl BuiltinFn {
             Mix | Smoothstep => {
                 // mix(a, b, t) and smoothstep(e0, e1, x): the first two match; the third is the
                 // same type, or an f32 applied to every component (mix only).
-                let t = same(types, &args[..2])?;
+                let t = same(&args[..2])?;
                 if !float_like(types, t) {
                     return Err(format!(
                         "`{}` takes floats or float vectors, not `{}`",
                         self.name(),
-                        show(types, t)
+                        p.display_ty(t)
                     ));
                 }
                 let third = args[2];
@@ -280,7 +285,7 @@ impl BuiltinFn {
                     Err(format!(
                         "the last argument of `{}` must be `{}`{}",
                         self.name(),
-                        show(types, t),
+                        p.display_ty(t),
                         if self == Mix && matches!(types.kind(t), TyKind::Vec(_)) {
                             " or `f32`"
                         } else {
@@ -293,38 +298,40 @@ impl BuiltinFn {
                 if !float_like(types, args[0]) {
                     return Err(format!(
                         "`length` takes a float or vector, not `{}`",
-                        show(types, args[0])
+                        p.display_ty(args[0])
                     ));
                 }
                 Ok(scalar_of(types, args[0]))
             }
             Distance | Dot => {
-                let t = same(types, args)?;
+                let t = same(args)?;
                 if !float_like(types, t) {
                     return Err(format!(
                         "`{}` takes float vectors, not `{}`",
                         self.name(),
-                        show(types, t)
+                        p.display_ty(t)
                     ));
                 }
                 if self == Dot && !matches!(types.kind(t), TyKind::Vec(_)) {
-                    return Err(format!("`dot` takes vectors, not `{}`", show(types, t)));
+                    return Err(format!("`dot` takes vectors, not `{}`", p.display_ty(t)));
                 }
                 Ok(scalar_of(types, t))
             }
             Cross => {
-                let t = same(types, args)?;
+                let t = same(args)?;
                 if t != types.vec3 {
-                    return Err(format!("`cross` takes two `vec3`s, not `{}`", show(types, t)));
+                    return Err(format!("`cross` takes two `vec3`s, not `{}`", p.display_ty(t)));
                 }
                 Ok(t)
             }
             Select => {
-                let t = same(types, &args[..2])?;
+                // Any type: per component on a vector, and whole on any other value (the GPU
+                // back end uses a variable where WGSL's `select` takes only scalars and vectors).
+                let t = same(&args[..2])?;
                 if args[2] != types.bool {
                     return Err(format!(
                         "the condition of `select` must be `bool`, not `{}`",
-                        show(types, args[2])
+                        p.display_ty(args[2])
                     ));
                 }
                 Ok(t)
@@ -334,7 +341,7 @@ impl BuiltinFn {
                     return Err(format!(
                         "`{}` takes an `f32`, not `{}`",
                         self.name(),
-                        show(types, args[0])
+                        p.display_ty(args[0])
                     ));
                 }
                 Ok(if self == BitcastU32 { types.u32 } else { types.i32 })
@@ -343,7 +350,7 @@ impl BuiltinFn {
                 if args[0] != types.u32 && args[0] != types.i32 {
                     return Err(format!(
                         "`bitcast_f32` takes a `u32` or `i32`, not `{}`",
-                        show(types, args[0])
+                        p.display_ty(args[0])
                     ));
                 }
                 Ok(types.f32)
@@ -352,7 +359,7 @@ impl BuiltinFn {
                 if args[0] != types.f64 {
                     return Err(format!(
                         "`bitcast_u64` takes an `f64`, not `{}`",
-                        show(types, args[0])
+                        p.display_ty(args[0])
                     ));
                 }
                 Ok(types.int(IntTy::U64))
@@ -362,7 +369,7 @@ impl BuiltinFn {
                 if args[0] != u64_ty {
                     return Err(format!(
                         "`bitcast_f64` takes a `u64`, not `{}`",
-                        show(types, args[0])
+                        p.display_ty(args[0])
                     ));
                 }
                 Ok(types.f64)
@@ -371,16 +378,16 @@ impl BuiltinFn {
                 TyKind::Slice(_) | TyKind::Array(..) => Ok(types.u32),
                 _ => Err(format!(
                     "`len` is a method of runs and arrays, not of `{}`",
-                    show(types, args[0])
+                    p.display_ty(args[0])
                 )),
             },
             WrappingAdd | WrappingSub | WrappingMul => {
-                let t = same(types, args)?;
+                let t = same(args)?;
                 if !types.is_int(t) {
                     return Err(format!(
                         "`{}` takes integers, not `{}`",
                         self.name(),
-                        show(types, t)
+                        p.display_ty(t)
                     ));
                 }
                 Ok(t)

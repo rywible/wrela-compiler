@@ -151,8 +151,9 @@ fn walk_pat(p: &mut Pat, f: &mut impl FnMut(&mut TyId)) {
 
 /// Resolves every type, and checks what needed resolved types.
 pub(super) fn finish_common(c: &mut Checker) {
+    c.settle_projections(true);
     let unknown = c.infer.apply_defaults(&c.p.types);
-    let has_errors = c.diags.iter().any(|d| d.is_error());
+    let has_errors = wrela_diag::has_errors(&c.diags);
     if !has_errors {
         for span in unknown.into_iter().take(1) {
             c.err(
@@ -161,6 +162,7 @@ pub(super) fn finish_common(c: &mut Checker) {
             );
         }
     }
+    c.binding_kinds();
     // `-x` of an integer whose type inference settled later: it must be signed.
     for (ty, span) in std::mem::take(&mut c.negated_ints) {
         let ty = c.infer.resolve(&c.p.types, ty);
@@ -175,9 +177,42 @@ pub(super) fn finish_common(c: &mut Checker) {
             );
         }
     }
+    // Integer-only operators on a literal whose type settled later: not a float.
+    for (ty, op, span) in std::mem::take(&mut c.int_ops) {
+        let ty = c.infer.resolve(&c.p.types, ty);
+        if c.p.types.is_float(ty) {
+            let shown = c.p.display_ty(ty);
+            c.err(
+                Diagnostic::new(codes::E0305, span, format!("`{op}` doesn't apply to `{shown}`"))
+                    .with_note("it applies to integers; this one's type was inferred from how it's used later")
+                    .with_help("annotate it with an integer type, as in `let x: u32 = ...`"),
+            );
+        }
+    }
+    // Built-in calls whose literal arguments settled later.
+    for (b, tys, span) in std::mem::take(&mut c.builtin_calls) {
+        let tys: Vec<TyId> = tys.iter().map(|&t| c.infer.resolve(&c.p.types, t)).collect();
+        let is_error = |k: &TyKind| matches!(k, TyKind::Error);
+        if tys.iter().any(|&t| c.p.types.any(t, &mut { is_error })) {
+            continue;
+        }
+        match b.result(c.p, &tys) {
+            Ok(ty) if b.cpu_impl().is_some() && ty == c.p.types.f64 => {
+                c.err(crate::builtins::f64_math(b.name(), span));
+            }
+            Ok(_) => {}
+            Err(msg) => c.err(
+                Diagnostic::new(codes::E0305, span, msg)
+                    .with_note("a literal argument's type was inferred from how it's used later"),
+            ),
+        }
+    }
     // `**` whose base's type settled later.
     for (base, exp, span) in std::mem::take(&mut c.pows) {
         let (b, e) = (c.infer.resolve(&c.p.types, base), c.infer.resolve(&c.p.types, exp));
+        if b == c.p.types.f64 {
+            c.err(crate::builtins::f64_math("**", span));
+        }
         let ok = match c.p.types.kind(b) {
             TyKind::Int(_) => e == c.p.types.u32,
             TyKind::Float(_) | TyKind::Vec(_) => e == b,
@@ -199,7 +234,7 @@ pub(super) fn finish_common(c: &mut Checker) {
     let lits = std::mem::take(&mut c.int_literals);
     for (ty, v, neg, span) in lits {
         let t = c.infer.resolve(&c.p.types, ty);
-        match c.p.types.kind(t).clone() {
+        match *c.p.types.kind(t) {
             TyKind::Int(i) => {
                 let max = if neg && i.signed() { i.max() + 1 } else { i.max() };
                 if v > max {
@@ -218,21 +253,53 @@ pub(super) fn finish_common(c: &mut Checker) {
                     );
                 }
             }
-            TyKind::Float(FloatTy::F32) if v > (1 << 24) && (v as f32) as u64 != v => {
-                c.err(
-                    Diagnostic::new(codes::E0006, span, format!("`{v}` can't be an `f32` exactly"))
+            TyKind::Float(f) => {
+                let exact = match f {
+                    FloatTy::F32 => v <= (1 << 24) || (v as f32) as u64 == v,
+                    FloatTy::F64 => v <= (1 << 53) || (v as f64) as u64 == v,
+                };
+                if !exact {
+                    c.err(
+                        Diagnostic::new(
+                            codes::E0006,
+                            span,
+                            format!("`{v}` can't be an `{}` exactly", c.p.display_ty(t)),
+                        )
                         .with_help("write it as a float literal to accept the rounding"),
-                );
+                    );
+                }
             }
             _ => {}
         }
+    }
+    // Float literals must be finite in their types (rounding is accepted).
+    for (ty, v, span) in std::mem::take(&mut c.float_literals) {
+        let t = c.infer.resolve(&c.p.types, ty);
+        let largest = match c.p.types.kind(t) {
+            TyKind::Float(FloatTy::F32) if !(v as f32).is_finite() => "3.4e38",
+            TyKind::Float(FloatTy::F64) if !v.is_finite() => "1.8e308",
+            _ => continue,
+        };
+        let shown = c.p.display_ty(t);
+        c.err(
+            Diagnostic::new(
+                codes::E0006,
+                span,
+                format!("this number is too large for an `{shown}`"),
+            )
+            .with_note(format!("an `{shown}`'s largest value is about {largest}")),
+        );
     }
     // Bounds.
     let obligations = std::mem::take(&mut c.obligations);
     for o in obligations {
         let ty = c.infer.resolve(&c.p.types, o.ty);
-        let args: Vec<TyId> =
-            o.trait_ref.args.iter().map(|&a| c.infer.resolve(&c.p.types, a)).collect();
+        let args: Vec<TyId> = o
+            .trait_ref
+            .args
+            .iter()
+            .map(|&a| traits::normalize(c.p, c.infer.resolve(&c.p.types, a), None))
+            .collect();
         let r = TraitRef { trait_: o.trait_ref.trait_, args };
         if c.p.types.has_vars(ty) || matches!(c.p.types.kind(ty), TyKind::Error) {
             continue;
@@ -248,7 +315,7 @@ pub(super) fn finish_common(c: &mut Checker) {
             if let Some(l) = c.p.trait_(r.trait_).lang {
                 if let TyKind::Adt(a, _) = c.p.types.kind(ty) {
                     let a = *a;
-                    let name = c.p.adt(a).name.clone();
+                    let name = &c.p.adt(a).name;
                     d = d.with_help(format!(
                         "opt in where `{name}` is declared: `struct {name}: {tr} {{ ... }}`"
                     ));
@@ -262,7 +329,7 @@ pub(super) fn finish_common(c: &mut Checker) {
                     );
                 }
             } else if let TyKind::Param(p) = c.p.types.kind(ty) {
-                let pname = c.p.param(*p).name.clone();
+                let pname = &c.p.param(*p).name;
                 d = d.with_help(format!("add the bound: `{pname}: {tr}`"));
             }
             c.err(d);
@@ -275,9 +342,9 @@ pub(super) fn finish(
     params: Vec<LocalId>,
     mut value: Expr,
     hidden: Option<TyId>,
-) -> (Option<Body>, Vec<Diagnostic>) {
+) -> (Body, Vec<Diagnostic>) {
     finish_common(&mut c);
-    let infer = c.infer.clone();
+    let infer = &c.infer;
     let types = &c.p.types;
     let mut resolve = |t: &mut TyId| *t = infer.resolve(types, *t);
     walk_tys(&mut value, &mut resolve);
@@ -296,14 +363,90 @@ pub(super) fn finish(
         resolve(&mut h);
         h
     });
+    stored_callables(c.p, &value, &mut c.diags);
+    for cl in &closures {
+        stored_callables(c.p, &cl.body, &mut c.diags);
+    }
     let body = Body { params, locals, closures, value, hidden_ret };
-    let diags = c.diags;
-    (Some(body), diags)
+    (body, c.diags)
 }
 
-pub(super) fn finish_const(mut c: Checker, mut e: Expr) -> (Option<(TyId, Expr)>, Vec<Diagnostic>) {
+/// E0510 (§6.7): a function type is a parameter's type only, so a closure or function can't
+/// be put in a tuple, an array, a struct or an enum, or be a generic's type argument (generic
+/// code could return or keep it). `resolve_type` checks the types written; this checks the
+/// types inferred.
+fn stored_callables(p: &Program, e: &Expr, out: &mut Vec<Diagnostic>) {
+    let holds = |t: TyId| holds_callable(&p.types, t);
+    let what = match &e.kind {
+        ExprKind::Tuple(_) if holds(e.ty) => Some("stored in a tuple"),
+        ExprKind::Array(_) | ExprKind::ArrayRepeat(..) if holds(e.ty) => Some("stored in an array"),
+        ExprKind::Adt { .. } if holds(e.ty) => Some("stored in a struct or enum"),
+        ExprKind::Call(c) => {
+            let generic = match &c.callee {
+                Callee::Fn { args, .. } => args.iter().any(|&t| holds(t)),
+                Callee::TraitMethod { self_ty, trait_args, method_args, .. } => {
+                    holds(*self_ty) || trait_args.iter().chain(method_args).any(|&t| holds(t))
+                }
+                _ => false,
+            };
+            generic.then_some("a generic's type argument")
+        }
+        ExprKind::FnRef(_, args) if args.iter().any(|&t| holds(t)) => {
+            Some("a generic's type argument")
+        }
+        _ => None,
+    };
+    if let Some(what) = what {
+        out.push(
+            Diagnostic::new(codes::E0510, e.span, format!("a closure or function can't be {what}"))
+                .with_note("closures don't escape the call they're passed to (§6.7); storing or returning one is tier 1 (`@escaping`)")
+                .with_help("pass it straight to a parameter of type `fn(..)`"),
+        );
+    }
+    e.for_each_child(&mut |c| match c {
+        Child::Expr(x) => stored_callables(p, x, out),
+        Child::Block(b) => stored_callables_block(p, b, out),
+    });
+}
+
+fn stored_callables_block(p: &Program, b: &Block, out: &mut Vec<Diagnostic>) {
+    for s in &b.stmts {
+        let exprs: Vec<&Expr> = match &s.kind {
+            StmtKind::Bind { init, .. } => vec![init],
+            StmtKind::Assign { place, value, .. } => vec![place, value],
+            StmtKind::Expr(e) => vec![e],
+            StmtKind::While { cond, .. } => vec![cond],
+            StmtKind::Loop { .. } => vec![],
+            StmtKind::ForRange { start, end, .. } => vec![start, end],
+            StmtKind::ForEach { array, .. } => vec![array],
+        };
+        exprs.into_iter().for_each(|e| stored_callables(p, e, out));
+        match &s.kind {
+            StmtKind::While { body, .. }
+            | StmtKind::Loop { body }
+            | StmtKind::ForRange { body, .. }
+            | StmtKind::ForEach { body, .. } => stored_callables_block(p, body, out),
+            _ => {}
+        }
+    }
+    if let Some(t) = &b.tail {
+        stored_callables(p, t, out);
+    }
+}
+
+/// Whether a value of type `t` is or holds a closure or function.
+fn holds_callable(types: &Types, t: TyId) -> bool {
+    match types.kind(t) {
+        TyKind::Closure(..) | TyKind::FnPtr(..) | TyKind::FnDef(..) => true,
+        TyKind::Tuple(ts) | TyKind::Adt(_, ts) => ts.iter().any(|&t| holds_callable(types, t)),
+        TyKind::Array(e, _) | TyKind::Slice(e) => holds_callable(types, *e),
+        _ => false,
+    }
+}
+
+pub(super) fn finish_const(mut c: Checker, mut e: Expr) -> ((TyId, Expr), Vec<Diagnostic>) {
     finish_common(&mut c);
-    let infer = c.infer.clone();
+    let infer = &c.infer;
     let types = &c.p.types;
     walk_tys(&mut e, &mut |t| *t = infer.resolve(types, *t));
     if let Some(bad) = non_literal(&e) {
@@ -316,8 +459,7 @@ pub(super) fn finish_const(mut c: Checker, mut e: Expr) -> (Option<(TyId, Expr)>
             .with_note("evaluating calls and arithmetic at compile time is tier 1 (D-073)"),
         );
     }
-    let diags = c.diags;
-    (Some((e.ty, e)), diags)
+    ((e.ty, e), c.diags)
 }
 
 /// The first part of a typed constant that isn't a literal value.
@@ -327,7 +469,9 @@ pub fn non_literal(e: &Expr) -> Option<&Expr> {
         ExprKind::Unary(wrela_syntax::ast::UnOp::Neg, x) if matches!(x.kind, ExprKind::Lit(_)) => {
             None
         }
-        ExprKind::Adt { fields, .. } => fields.iter().find_map(non_literal),
+        ExprKind::Adt { fields, base, .. } => {
+            fields.iter().chain(base.as_deref()).find_map(non_literal)
+        }
         ExprKind::Tuple(xs) | ExprKind::Array(xs) | ExprKind::Construct(xs) => {
             xs.iter().find_map(non_literal)
         }
@@ -337,30 +481,24 @@ pub fn non_literal(e: &Expr) -> Option<&Expr> {
     }
 }
 
-/// A function whose return type names traits: its body's type must have them.
-pub(super) fn check_opaque(p: &Program, f: FnId, body: &mut Body, diags: &mut Vec<Diagnostic>) {
-    let Some(hidden) = body.hidden_ret else { return };
-    let Some(traits_) = p.func(f).opaque.clone() else { return };
+/// A function whose return type names traits: its body's type, `hidden`, must have them.
+pub(super) fn check_opaque(
+    p: &Program,
+    f: FnId,
+    hidden: Option<TyId>,
+    diags: &mut Vec<Diagnostic>,
+) {
+    let Some(hidden) = hidden else { return };
+    let Some(traits_) = &p.func(f).opaque else { return };
     let span = p.func(f).sig_span;
     if matches!(p.types.kind(hidden), TyKind::Error) {
         return;
     }
-    if let TyKind::Opaque(g, _) = p.types.kind(hidden)
-        && *g == f
-    {
-        diags.push(
-            Diagnostic::new(
-                codes::E0409,
-                span,
-                "this function's return type is defined by calling itself",
-            )
-            .with_help("name the concrete type in the signature"),
-        );
-        return;
-    }
+    // One defined by calling itself is reported with the program's other cycles
+    // (`opaque_cycles`).
     for r in traits_ {
-        if !traits::implements(p, hidden, &r) {
-            let (t, tr) = (p.display_ty(hidden), p.display_trait_ref(&r));
+        if !traits::implements(p, hidden, r) {
+            let (t, tr) = (p.display_ty(hidden), p.display_trait_ref(r));
             diags.push(Diagnostic::new(
                 codes::E0400,
                 span,
@@ -368,4 +506,53 @@ pub(super) fn check_opaque(p: &Program, f: FnId, body: &mut Body, diags: &mut Ve
             ));
         }
     }
+}
+
+/// E0409 for each cycle of functions whose return types name traits and are defined by calling
+/// each other (or by calling itself, perhaps through a combinator: `f(n).translate(..)`):
+/// no single type is the answer. `hidden` is each such function's body type.
+pub fn opaque_cycles(p: &Program, hidden: &[(FnId, TyId)]) -> Vec<Diagnostic> {
+    let mut edges: Vec<Vec<usize>> = vec![Vec::new(); p.fns.len()];
+    for &(f, h) in hidden {
+        p.types.any(h, &mut |k| {
+            if let TyKind::Opaque(g, _) = k
+                && !edges[f.index()].contains(&g.index())
+            {
+                edges[f.index()].push(g.index());
+            }
+            false
+        });
+    }
+    let mut out = Vec::new();
+    crate::graph::dfs_cycles(
+        &edges,
+        |&g| g,
+        |v| {
+            let crate::graph::Visit::Cycle(cycle) = v else { return };
+            let last = FnId(cycle[cycle.len() - 1].0 as u32);
+            let mut d = if cycle.len() == 1 {
+                Diagnostic::new(
+                    codes::E0409,
+                    p.func(last).sig_span,
+                    "this function's return type is defined by calling itself",
+                )
+            } else {
+                let names: Vec<String> =
+                    cycle.iter().map(|&(g, _)| format!("`{}`", p.fns[g].name)).collect();
+                Diagnostic::new(
+                    codes::E0409,
+                    p.func(last).sig_span,
+                    format!(
+                        "the return types of {} are defined by calling each other",
+                        crate::collect::and_list(&names)
+                    ),
+                )
+            };
+            for &(g, _) in &cycle[..cycle.len() - 1] {
+                d = d.with_secondary(p.fns[g].sig_span, "a return type in the cycle");
+            }
+            out.push(d.with_help("name the concrete type in one of the signatures"));
+        },
+    );
+    out
 }

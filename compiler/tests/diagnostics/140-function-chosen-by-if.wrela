@@ -1,0 +1,15 @@
+// mistake: choosing which named function a `let` holds at run time
+// expect: E0300
+// fix: no
+fn triple(x: i32) -> i32 {
+    x * 3
+}
+
+fn double(x: i32) -> i32 {
+    x * 2
+}
+
+pub fn run(up: bool) -> i32 {
+    let g = if up { triple } else { double }
+    g(2)
+}

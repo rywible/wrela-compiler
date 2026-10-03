@@ -5,6 +5,7 @@ relative to the repo root, cross-origin isolated (COOP/COEP), as the browser run
 import http.server
 import os
 import sys
+import threading
 import urllib.parse
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # the repo root
@@ -66,6 +67,21 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         """Hook for tools/headless.py."""
 
 
+class QuietHandler(Handler):
+    """`Handler` without the request log, for tools and tests."""
+
+    def log_message(self, *args):
+        pass
+
+
+def start(handler=Handler, port=0):
+    """Serves the repo with `handler` on 127.0.0.1:`port` (0: a free port) from a daemon thread.
+    Returns the server: `server.server_address[1]` is the port, `server.shutdown()` stops it."""
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", port), handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
+
+
 if __name__ == "__main__":
-    port = int(sys.argv[1]) if len(sys.argv) > 1 else 8417
-    http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
+    start(port=int(sys.argv[1]) if len(sys.argv) > 1 else 8417)
+    threading.Event().wait()  # until interrupted

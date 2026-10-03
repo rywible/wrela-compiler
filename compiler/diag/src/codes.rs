@@ -53,6 +53,7 @@ impl fmt::Display for Code {
 /// Codes retired before release, with why: never reused for anything else.
 pub const RETIRED: &[(&str, &str)] = &[
     ("E0316", "a constant that isn't a literal value: E0906 reports it (a tier-1 feature)"),
+    ("E0321", "an unreachable match arm: W0002 reports it (a warning, not an error)"),
     ("E0509", "a projection that escapes: E0508 reports it (one not from a parameter)"),
     ("E0907", "workgroup-shared memory: it has no syntax yet to report (milestone 2)"),
 ];
@@ -75,7 +76,7 @@ codes! {
     E0003 = "E0003", "a number with a type suffix";
     E0004 = "E0004", "a malformed number";
     E0005 = "E0005", "a malformed string literal";
-    E0006 = "E0006", "an integer literal too large for its type";
+    E0006 = "E0006", "a number literal that doesn't fit its type";
 
     // ---- E01xx: syntax (spec/grammar.ebnf) -------------------------------------------------
     E0100 = "E0100", "unexpected token";
@@ -181,10 +182,11 @@ codes! {
     E0605 = "E0605", "a workgroup size out of range";
     E0606 = "E0606", "an entry point called directly";
     E0607 = "E0607", "a GPU feature used in CPU code";
+    E0608 = "E0608", "a derivative in non-uniform control flow";
 
     // ---- E07xx: derived interpretations and back ends --------------------------------------
     E0700 = "E0700", "a function that can't be derived";
-    E0701 = "E0701", "an interval of a loop whose exit depends on the input";
+    E0701 = "E0701", "an interval of a loop or a recursion whose end depends on the input";
     E0702 = "E0702", "a construct not supported by a back end";
     E0703 = "E0703", "an exported function with an unsupported signature";
 
@@ -223,6 +225,26 @@ mod tests {
         }
         for (r, _) in RETIRED {
             assert!(Code::lookup(r).is_none(), "{r} is retired but still declared");
+        }
+    }
+
+    /// Codes are numbered without gaps in each range of a hundred: a number missing between
+    /// two declared ones was removed, and must be listed as retired so it isn't reused.
+    #[test]
+    fn removed_codes_are_retired() {
+        let taken: HashSet<&str> =
+            ALL.iter().map(|c| c.as_str()).chain(RETIRED.iter().map(|(r, _)| *r)).collect();
+        for c in ALL {
+            let (range, n) = c.as_str().split_at(3);
+            let lowest = ALL
+                .iter()
+                .filter_map(|c| c.as_str().strip_prefix(range))
+                .min()
+                .expect("this code's range");
+            for below in lowest.parse::<u32>().expect("digits")..n.parse().expect("digits") {
+                let code = format!("{range}{below:02}");
+                assert!(taken.contains(code.as_str()), "{code} is neither declared nor retired");
+            }
         }
     }
 

@@ -2,13 +2,11 @@
 // vectors (vectors.test.ts). Here: the test encoder the other tests build batches with.
 
 import { expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
 import { Encoder } from "./encoder.ts";
+import { vectors } from "./fixtures.ts";
 
 test("the test encoder writes the vectors' golden batch", () => {
-  const vectors = JSON.parse(readFileSync(join(import.meta.dir, "../../abi/vectors.json"), "utf8"));
-  const golden: string = vectors.batches.find((b: { name: string }) => b.name === "golden").bytes;
+  const golden = vectors.batches.find((b) => b.name === "golden")!.bytes;
   const batch = new Encoder()
     .createBuffer(7, 16)
     .writeBuffer(7, 4, Uint8Array.of(1, 2, 3, 4, 5, 6, 7, 8))

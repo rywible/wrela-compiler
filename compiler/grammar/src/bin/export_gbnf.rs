@@ -4,7 +4,7 @@
 //!     cargo run -p wrela-grammar --bin export-gbnf -- --check # exit 1 if it's out of date
 
 use wrela_grammar::ebnf::Grammar;
-use wrela_grammar::gbnf::export;
+use wrela_grammar::gbnf::{export, spec_path};
 
 fn main() {
     let check = std::env::args().any(|a| a == "--check");
@@ -12,7 +12,7 @@ fn main() {
         eprintln!("export-gbnf: {e}");
         std::process::exit(1)
     });
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../spec/wrela.gbnf");
+    let path = spec_path();
     if check {
         let current = std::fs::read_to_string(&path).unwrap_or_default();
         if current != text {

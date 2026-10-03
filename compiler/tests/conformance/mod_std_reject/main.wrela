@@ -1,0 +1,6 @@
+// rejects: mod.names
+use std::mine //~ E0200
+
+fn f() -> i32 {
+    mine()
+}

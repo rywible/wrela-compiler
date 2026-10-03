@@ -1,0 +1,339 @@
+// run: trait solving: associated types, supertraits, method lookup and generic calls
+// expect: own_out() = 4
+// expect: held(5) = 6
+// expect: held_field() = 9
+// expect: held_variant() = 2
+// expect: through_fn() = 5
+// expect: read_plus(5) = 16
+// expect: read_eq(5) = 1
+// expect: read_field() = 7
+// expect: interval_named(1.0, 2.0) = 4.0000005
+// expect: scale_u32() = 1006.0
+// expect: scale_f32() = 6.0
+// expect: literal_receiver() = 1.5
+// expect: sub_base() = 3
+// expect: same_self(2, 2) = 1
+// expect: same_self(1, 2) = 1
+// expect: same_self(3, 2) = 0
+// expect: variant_import() = 3
+// expect: later_bound() = 7
+// expect: blanket() = 1
+
+use std::derive::{Interval, interval}
+use Pick::Second
+
+// Each impl's `Self::Out` is its own trait's.
+trait A {
+    type Out
+    fn a(self) -> Self::Out
+}
+
+trait B {
+    type Out
+    fn b(self) -> Self::Out
+}
+
+struct S: Copy + Clone {
+    x: i32,
+}
+
+impl A for S {
+    type Out = i32
+    fn a(self) -> Self::Out {
+        self.x
+    }
+}
+
+impl B for S {
+    type Out = bool
+    fn b(self) -> Self::Out {
+        true
+    }
+}
+
+pub fn own_out() -> i32 {
+    S { x: 4 }.a()
+}
+
+// Fields and parameters typed by a projection.
+trait Has {
+    type K
+}
+
+struct P: Copy + Clone {
+    x: i32,
+}
+
+impl Has for P {
+    type K = i32
+}
+
+struct Holder<T: Has> {
+    k: T::K,
+}
+
+enum Maybe<T: Has> {
+    Some(T::K),
+    Nothing,
+}
+
+pub fn held(v: i32) -> i32 {
+    let h = Holder::<P> { k: v }
+    h.k + 1
+}
+
+pub fn held_field() -> i32 {
+    let h = Holder::<P> { k: 9 }
+    let k = h.k
+    k
+}
+
+fn make(n: i32) -> Maybe<P> {
+    if n > 0 { Maybe::Some(n) } else { Maybe::Nothing }
+}
+
+pub fn held_variant() -> i32 {
+    match make(2) {
+        Maybe::Some(x) => x,
+        Maybe::Nothing => 0,
+    }
+}
+
+fn apply<T: Has>(t: T, k: T::K, f: fn(T::K) -> i32) -> i32 {
+    f(k)
+}
+
+pub fn through_fn() -> i32 {
+    apply(P { x: 0 }, 4, |v| v + 1)
+}
+
+// A generic call's associated-type result, once its type argument is inferred.
+trait Counter {
+    type Out
+    fn get(self) -> Self::Out
+}
+
+struct C1: Copy + Clone {
+    v: i32,
+}
+
+impl Counter for C1 {
+    type Out = i32
+    fn get(self) -> i32 {
+        self.v * 3
+    }
+}
+
+struct Pt: Copy + Clone {
+    x: i32,
+    y: i32,
+}
+
+struct M: Copy + Clone {
+    k: i32,
+}
+
+impl Counter for M {
+    type Out = Pt
+    fn get(self) -> Pt {
+        Pt { x: self.k, y: 0 }
+    }
+}
+
+fn read<T: Counter>(t: T) -> T::Out {
+    t.get()
+}
+
+pub fn read_plus(v: i32) -> i32 {
+    read(C1 { v: v }) + 1
+}
+
+pub fn read_eq(v: i32) -> bool {
+    read(C1 { v: v }) == 15
+}
+
+pub fn read_field() -> i32 {
+    read(M { k: 7 }).x
+}
+
+// Named arguments in any order, one of them typed by the other's projection.
+pub fn interval_named(lo: f32, hi: f32) -> f32 {
+    interval(over: Interval { lo, hi }, f: |t: f32| t * t).hi
+}
+
+// Method syntax picks among impls of one trait for several arguments.
+trait Scale<T> {
+    fn scale(self, by: T) -> f32
+}
+
+struct V: Copy + Clone {
+    x: f32,
+}
+
+impl Scale<f32> for V {
+    fn scale(self, by: f32) -> f32 {
+        self.x * by
+    }
+}
+
+impl Scale<u32> for V {
+    fn scale(self, by: u32) -> f32 {
+        self.x * f32(by) + 1000.0
+    }
+}
+
+pub fn scale_u32() -> f32 {
+    let k: u32 = 3
+    V { x: 2.0 }.scale(k)
+}
+
+pub fn scale_f32() -> f32 {
+    V { x: 2.0 }.scale(3.0)
+}
+
+// A receiver whose type still holds a literal's.
+struct W<T> {
+    v: T,
+}
+
+trait Get {
+    fn get(self) -> f32
+}
+
+impl Get for W<f32> {
+    fn get(self) -> f32 {
+        self.v
+    }
+}
+
+pub fn literal_receiver() -> f32 {
+    W { v: 1.5 }.get()
+}
+
+// A supertrait's method through the subtrait, and a supertrait that names `Self`.
+trait Base {
+    fn base(self) -> i32
+}
+
+trait Sub: Base {
+    fn sub(self) -> i32
+}
+
+impl Base for S {
+    fn base(self) -> i32 {
+        self.x
+    }
+}
+
+impl Sub for S {
+    fn sub(self) -> i32 {
+        0
+    }
+}
+
+fn via_sub<T: Sub>(t: T) -> i32 {
+    Sub::base(t)
+}
+
+pub fn sub_base() -> i32 {
+    via_sub(S { x: 3 })
+}
+
+trait Same<Rhs> {
+    fn same(self, o: Rhs) -> bool
+}
+
+trait Order: Same<Self> {
+    fn less(self, o: Self) -> bool
+}
+
+impl Same<i32> for i32 {
+    fn same(self, o: i32) -> bool {
+        self == o
+    }
+}
+
+impl Order for i32 {
+    fn less(self, o: i32) -> bool {
+        self < o
+    }
+}
+
+fn le<T: Order + Copy>(a: T, b: T) -> bool {
+    a.less(b) || a.same(b)
+}
+
+pub fn same_self(a: i32, b: i32) -> bool {
+    le(a, b)
+}
+
+// An enum's variant imported by name.
+enum Pick {
+    First,
+    Second(i32),
+}
+
+pub fn variant_import() -> i32 {
+    match Second(3) {
+        Second(x) => x,
+        Pick::First => 0,
+    }
+}
+
+// A projection on a parameter declared later in the list, of a trait declared later.
+fn conv<T: Conv<U::Out>, U: Later>(t: T, u: U) -> i32 {
+    t.conv(u.out())
+}
+
+impl Conv<i32> for i32 {
+    fn conv(self, x: i32) -> i32 {
+        self + x
+    }
+}
+
+impl Later for C1 {
+    type Out = i32
+    fn out(self) -> i32 {
+        self.v
+    }
+}
+
+trait Conv<X> {
+    fn conv(self, x: X) -> i32
+}
+
+trait Later {
+    type Out
+    fn out(self) -> Self::Out
+}
+
+pub fn later_bound() -> i32 {
+    conv(5, C1 { v: 2 })
+}
+
+// A blanket impl bounded by another trait.
+trait Shape {
+    fn sides(self) -> i32
+}
+
+trait Tr {
+    fn t(self) -> i32 {
+        1
+    }
+}
+
+impl Shape for i32 {
+    fn sides(self) -> i32 {
+        self
+    }
+}
+
+impl<T: Shape> Tr for T {}
+
+fn need<X: Tr>(x: X) -> i32 {
+    x.t()
+}
+
+pub fn blanket() -> i32 {
+    need(5)
+}

@@ -1,0 +1,44 @@
+// run: runs: an array passes for a `[T]` or a `mut [T]` parameter, and a run passes on
+// expect: fill_array(2.5) = 10.0
+// expect: fill_field(2.0) = 6.0
+// expect: pass_on(1.5) = 6.0
+
+fn fill(xs: mut [f32], v: f32) {
+    for i in 0..xs.len() {
+        xs[i] = v
+    }
+}
+
+fn total(xs: [f32]) -> f32 {
+    var s = 0.0
+    for x in xs {
+        s = s + x
+    }
+    s
+}
+
+pub fn fill_array(v: f32) -> f32 {
+    var arr = [0.0, 0.0, 0.0, 0.0]
+    fill(mut arr, v)
+    total(arr)
+}
+
+struct Grid {
+    cells: [f32; 3],
+}
+
+pub fn fill_field(v: f32) -> f32 {
+    var g = Grid { cells: [0.0; 3] }
+    fill(mut g.cells, v)
+    total(g.cells)
+}
+
+fn fill_on(xs: mut [f32], v: f32) {
+    fill(mut xs, v)
+}
+
+pub fn pass_on(v: f32) -> f32 {
+    var arr = [0.0, 0.0, 0.0, 0.0]
+    fill_on(mut arr, v)
+    total(arr)
+}

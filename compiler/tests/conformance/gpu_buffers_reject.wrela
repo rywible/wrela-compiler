@@ -1,0 +1,40 @@
+// rejects: gpu.entry
+// A WebGPU stage has at most eight storage buffers: each `[T]` and `Slots<T>` is one, and so are
+// the uniform values when they're over 64 KiB.
+use std::gpu::{GlobalId, Slots}
+
+@compute(64)
+fn many(
+    a: [f32],
+    b: [f32],
+    c: [f32],
+    d: [f32],
+    e: [f32],
+    f: [f32],
+    g: [f32],
+    h: [f32],
+    out: mut Slots<f32>, //~ E0602
+    id: GlobalId,
+) {
+    out[id] = a[0] + b[0] + c[0] + d[0] + e[0] + f[0] + g[0] + h[0]
+}
+
+struct Table: Copy + Clone + GpuData {
+    rows: [vec4; 5000],
+}
+
+@compute(64)
+fn wide(
+    a: [f32],
+    b: [f32],
+    c: [f32],
+    d: [f32],
+    e: [f32],
+    f: [f32],
+    g: [f32],
+    out: mut Slots<f32>,
+    table: Table, //~ E0602
+    id: GlobalId,
+) {
+    out[id] = a[0] + b[0] + c[0] + d[0] + e[0] + f[0] + g[0] + table.rows[id.x].x
+}

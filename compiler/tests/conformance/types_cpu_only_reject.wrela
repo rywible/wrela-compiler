@@ -10,3 +10,10 @@ fn k(p: Params, out: mut Slots<f32>, id: GlobalId) {
     let wide: f64 = f64(p.scale) //~ E0326
     out[id] = f32(wide)
 }
+
+// WGSL has no empty arrays.
+@compute(64)
+fn none(out: mut Slots<f32>, id: GlobalId) {
+    let e = [1.0; 0] //~ E0326
+    out[id] = f32(e.len())
+}

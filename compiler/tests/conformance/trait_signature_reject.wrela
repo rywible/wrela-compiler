@@ -1,0 +1,48 @@
+// rejects: trait.items
+trait Shape {
+    fn area(self) -> f32
+}
+
+trait Marker {}
+
+impl Marker for bool {}
+
+trait Make {
+    fn make(x: i32) -> i32
+    fn get(self) -> i32
+    fn shape(self) -> Shape
+    fn use_it<T>(self, t: T) -> f32
+    fn scaled(self, k: f32 = 1.0) -> f32
+}
+
+struct S: Copy + Clone {
+    x: f32,
+}
+
+impl Shape for S {
+    fn area(self) -> f32 {
+        self.x
+    }
+}
+
+impl Make for S {
+    fn make(self) -> i32 { //~ E0405
+        1
+    }
+
+    fn get(self) -> Marker { //~ E0405
+        true
+    }
+
+    fn shape(self) -> S { //~ E0405
+        self
+    }
+
+    fn use_it<T: Shape>(self, t: T) -> f32 { //~ E0405
+        t.area()
+    }
+
+    fn scaled(self, k: f32 = 2.0) -> f32 { //~ E0405
+        self.x * k
+    }
+}

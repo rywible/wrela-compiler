@@ -1,0 +1,30 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0510",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [
+        "pass it straight to a parameter of type `fn(..)`"
+      ],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "a closure or function can't be stored in a struct or enum",
+      "notes": [
+        "closures don't escape the call they're passed to (§6.7); storing or returning one is tier 1 (`@escaping`)"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 13,
+        "end": 136,
+        "end_column": 33,
+        "end_line": 5,
+        "line": 5,
+        "start": 116
+      },
+      "title": "a closure that escapes"
+    }
+  ],
+  "version": 2
+}

@@ -7,9 +7,20 @@ fn f() -> u8 {
 fn g() -> u32 {
     let hex = 0x //~ E0004
     let small = 1e //~ E0004
+    let dotted = 1e5.5 //~ E0004
     1
 }
 
 fn h(t: (f32, f32)) -> f32 {
     t.0x //~ E0004
+}
+
+fn floats() -> f64 {
+    let a: f32 = 1e39 //~ E0006
+    let b = 1e39 //~ E0006
+    let c: f64 = 1e309 //~ E0006
+    let d: f64 = 9007199254740993 //~ E0006
+    let e: f32 = 16777217 //~ E0006
+    let rounds: f32 = 16777217.0
+    f64(a + b + e + rounds) + c + d
 }

@@ -129,14 +129,7 @@ impl Lowerer<'_> {
 
     fn sequence(&mut self, e: &Expr, rule: RuleId) -> Vec<Sym> {
         let mut out = Vec::new();
-        match &e.kind {
-            ExprKind::Seq(xs) => {
-                for x in xs {
-                    self.append(x, rule, &mut out);
-                }
-            }
-            _ => self.append(e, rule, &mut out),
-        }
+        self.append(e, rule, &mut out);
         out
     }
 

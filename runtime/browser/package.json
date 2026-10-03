@@ -9,7 +9,6 @@
     "check-dist": "bun scripts/check-dist.ts",
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.worker.json",
     "size": "bun scripts/size.ts",
-    "stage": "bun scripts/stage.ts",
     "checks": "bun test && bun run typecheck && bun run check-dist && bun run size"
   },
   "devDependencies": {

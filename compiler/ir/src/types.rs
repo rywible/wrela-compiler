@@ -1,15 +1,7 @@
 //! IR types, interned per module.
 
+use crate::TypeId;
 use std::collections::HashMap;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct TypeId(pub u32);
-
-impl TypeId {
-    pub fn index(self) -> usize {
-        self.0 as usize
-    }
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Scalar {
@@ -98,9 +90,10 @@ pub enum TypeDef {
 pub struct Types {
     defs: Vec<TypeDef>,
     map: HashMap<TypeDef, TypeId>,
-    /// Each type's layout, worked out when it's interned from its parts' (so a type that
-    /// repeats a part is laid out once, not once per repetition).
+    /// Each type's layout and its fields' offsets, worked out when it's interned from its
+    /// parts' layouts (so a type that repeats a part is laid out once, not once per repetition).
     layouts: Vec<crate::layout::Layout>,
+    offsets: Vec<Box<[u32]>>,
 }
 
 impl Types {
@@ -109,7 +102,9 @@ impl Types {
             return t;
         }
         let t = TypeId(self.defs.len() as u32);
-        self.layouts.push(crate::layout::compute(self, &d));
+        let (layout, offsets) = crate::layout::compute(self, &d);
+        self.layouts.push(layout);
+        self.offsets.push(offsets);
         self.defs.push(d.clone());
         self.map.insert(d, t);
         t
@@ -119,6 +114,10 @@ impl Types {
         self.layouts[t.index()]
     }
 
+    pub(crate) fn field_offsets(&self, t: TypeId) -> &[u32] {
+        &self.offsets[t.index()]
+    }
+
     pub fn get(&self, t: TypeId) -> &TypeDef {
         &self.defs[t.index()]
     }
@@ -126,14 +125,6 @@ impl Types {
     /// The type `d`, if it's been interned.
     pub fn lookup(&self, d: &TypeDef) -> Option<TypeId> {
         self.map.get(d).copied()
-    }
-
-    pub fn len(&self) -> usize {
-        self.defs.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.defs.is_empty()
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (TypeId, &TypeDef)> {
@@ -151,9 +142,6 @@ impl Types {
     }
     pub fn u32(&mut self) -> TypeId {
         self.scalar(Scalar::U32)
-    }
-    pub fn i32(&mut self) -> TypeId {
-        self.scalar(Scalar::I32)
     }
     pub fn vector(&mut self, n: u8) -> TypeId {
         self.intern(TypeDef::Vector(n))

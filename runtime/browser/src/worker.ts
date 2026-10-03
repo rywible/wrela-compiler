@@ -4,7 +4,10 @@
 /// <reference lib="webworker" />
 
 import { SCREEN_FORMAT } from "./abi.gen.ts";
-import { type Build, loadBuild, startProgram, type Host } from "./loader.ts";
+import { errorMessage } from "./errors.ts";
+import { fitSize, GameClock } from "./frame.ts";
+import { alignTo } from "./gpu.ts";
+import { type Build, loadBuild, startProgram } from "./loader.ts";
 import type { FromWorker, ToWorker } from "./messages.ts";
 import { encodePng } from "./png.ts";
 import { frameTime, putResult, type TestParams } from "./testmode.ts";
@@ -19,8 +22,6 @@ class GpuError extends Error {
   }
 }
 
-const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
-
 let base = "";
 let testing = false;
 let failed = false;
@@ -29,10 +30,10 @@ let failed = false;
 function fatal(e: unknown): void {
   if (failed) return;
   failed = true;
-  const text = message(e);
+  const text = errorMessage(e);
   self.postMessage({ type: "fatal", message: text } satisfies FromWorker);
   if (testing) {
-    putResult(base, "DONE", text).catch((err: unknown) => console.error(`can't report the failure: ${message(err)}`));
+    putResult(base, "DONE", text).catch((err: unknown) => console.error(`can't report the failure: ${errorMessage(err)}`));
   }
 }
 
@@ -58,30 +59,23 @@ function context(canvas: OffscreenCanvas, device: GPUDevice, usage: number): GPU
 // ---- Running normally ----
 
 let size = { width: 1, height: 1 };
-let visible = true;
+const clock = new GameClock();
 
 async function run(canvas: OffscreenCanvas, device: GPUDevice, build: Build): Promise<void> {
   const ctx = context(canvas, device, GPUTextureUsage.RENDER_ATTACHMENT);
-  const host: Host = await startProgram(device, build, { texture: () => ctx.getCurrentTexture() });
+  const program = await startProgram(device, build, { texture: () => ctx.getCurrentTexture() });
   const max = device.limits.maxTextureDimension2D;
-  // Time is seconds of visible running: it pauses while the page is hidden.
-  let elapsed = 0;
-  let last: number | null = null;
   const tick = (now: number) => {
     if (failed) return;
     try {
-      if (!visible) {
-        last = null;
-      } else {
-        if (last !== null) elapsed += now - last;
-        last = now;
-        const width = Math.min(Math.max(size.width, 1), max);
-        const height = Math.min(Math.max(size.height, 1), max);
+      const time = clock.tick(now);
+      if (time !== null) {
+        const { width, height } = fitSize(size.width, size.height, max);
         if (canvas.width !== width || canvas.height !== height) {
           canvas.width = width;
           canvas.height = height;
         }
-        host.program.frame(elapsed / 1000, width, height);
+        program.frame(time, width, height);
       }
       self.requestAnimationFrame(tick);
     } catch (e) {
@@ -113,7 +107,7 @@ async function scoped(device: GPUDevice, f: () => void): Promise<void> {
 async function readTexture(device: GPUDevice, texture: GPUTexture): Promise<Uint8Array<ArrayBuffer>> {
   const { width, height } = texture;
   const row = width * 4;
-  const padded = Math.ceil(row / 256) * 256;
+  const padded = alignTo(row, 256);
   const staging = device.createBuffer({ size: padded * height, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
   const encoder = device.createCommandEncoder();
   encoder.copyTextureToBuffer({ texture }, { buffer: staging, bytesPerRow: padded, rowsPerImage: height }, [width, height]);
@@ -140,7 +134,7 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
     format: SCREEN_FORMAT,
     usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
   });
-  const host = await startProgram(
+  const program = await startProgram(
     device,
     build,
     {
@@ -150,15 +144,17 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
     },
     { hash: true },
   );
-  const hash = host.program.hash!;
+  const hash = program.hash!;
   for (let i = 0; i < frames; i++) {
-    await scoped(device, () => host.program.frame(frameTime(i, fps), width, height));
+    await scoped(device, () => program.frame(frameTime(i, fps), width, height));
     await device.queue.onSubmittedWorkDone();
   }
   const rgba = await readTexture(device, screen);
-  await putResult(base, "frame.rgba", rgba);
-  await putResult(base, "frame.png", encodePng(width, height, rgba));
-  await putResult(base, "hash.txt", `${hash.hex()}\n`);
+  await Promise.all([
+    putResult(base, "frame.rgba", rgba),
+    putResult(base, "frame.png", encodePng(width, height, rgba)),
+    putResult(base, "hash.txt", `${hash.hex()}\n`),
+  ]);
   console.log(`wrela test: ${frames} frames at ${width}x${height}, state hash ${hash.hex()}`);
   await putResult(base, "DONE", "ok");
 }
@@ -181,7 +177,7 @@ self.onmessage = (event: MessageEvent<ToWorker>) => {
       size = { width: msg.width, height: msg.height };
       return;
     case "visibility":
-      visible = msg.visible;
+      clock.setVisible(msg.visible);
       return;
   }
 };

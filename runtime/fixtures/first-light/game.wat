@@ -1,5 +1,5 @@
 ;; first-light: a hand-written wrela program, for developing and testing the hosts before the
-;; compiler can emit programs. It speaks the program ABI and command stream v1 (runtime/abi).
+;; compiler can emit programs. It speaks the program ABI and command stream v2 (runtime/abi).
 ;;
 ;; On its first frame it creates buffer 1 (a 64-entry RGBA8 palette), writes four seed colours
 ;; into it, and dispatches the `fill` compute pipeline (1), which derives the other 60 entries.
@@ -7,8 +7,8 @@
 ;; pass: one full-screen triangle drawn by the `first-light` render pipeline (0), which reads the
 ;; palette and colours each pixel by its distance to the circle.
 ;;
-;; `game.wasm` is this file compiled by the `wat` crate; runtime/native/tests/fixture.rs checks
-;; it's current (WRELA_BLESS=1 rewrites it).
+;; `game.wasm` is this file compiled by the `wat` crate; runtime/native/tests/suite/fixture.rs
+;; checks it's current (WRELA_BLESS=1 rewrites it).
 (module
   (import "wrela" "submit" (func $submit (param i32 i32)))
   (memory (export "memory") 1)

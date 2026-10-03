@@ -61,6 +61,17 @@ impl Verifier<'_> {
         Ok(())
     }
 
+    /// Checks that each value `each` passes on is visible here.
+    fn all_visible(&self, each: impl FnOnce(&mut dyn FnMut(ValueId))) -> Result<()> {
+        let mut err = Ok(());
+        each(&mut |v| {
+            if err.is_ok() {
+                err = self.visible(v);
+            }
+        });
+        err
+    }
+
     fn ty(&self, v: ValueId) -> TypeId {
         self.f.value_ty(v)
     }
@@ -89,6 +100,7 @@ impl Verifier<'_> {
         }
     }
 
+    /// The type of a place (whose values the caller has checked are visible).
     fn place(&self, p: &Place) -> Result<TypeId> {
         match &p.root {
             PlaceRoot::Local(l) if l.index() >= self.f.locals.len() => {
@@ -100,15 +112,11 @@ impl Verifier<'_> {
             PlaceRoot::Resource(r) if r.index() >= self.m.resources.len() => {
                 return Err(bug(format!("r{} doesn't exist", r.0)));
             }
+            PlaceRoot::Data(d) if d.index() >= self.m.data.len() => {
+                return Err(bug(format!("d{} doesn't exist", d.0)));
+            }
             _ => {}
         }
-        let mut err = Ok(());
-        p.for_each_value(&mut |v| {
-            if err.is_ok() {
-                err = self.visible(v);
-            }
-        });
-        err?;
         for proj in &p.path {
             if let Proj::Index(i) = proj
                 && !self.scalar(self.ty(*i)).is_some_and(|s| s.is_int())
@@ -122,13 +130,7 @@ impl Verifier<'_> {
     /// The type `e` makes; `None` for an expression evaluated only for its effect that makes
     /// nothing (a call to a function with no result, a host op with none).
     fn expr(&self, e: &Expr) -> Result<Option<TypeId>> {
-        let mut err = Ok(());
-        e.for_each_value(&mut |v| {
-            if err.is_ok() {
-                err = self.visible(v);
-            }
-        });
-        err?;
+        self.all_visible(|f| e.for_each_value(&mut |v| f(v)))?;
         let types = &self.m.types;
         let t = match e {
             Expr::Const(c) => types.lookup(&TypeDef::Scalar(c.scalar())),
@@ -335,6 +337,12 @@ impl Verifier<'_> {
                     self.ty(*v),
                 )?,
                 (Arg::Place(pl), true) => {
+                    if p.mutable && matches!(pl.root, PlaceRoot::Data(_)) {
+                        return Err(bug(format!(
+                            "constant data passed for `{}`, which may be written",
+                            p.name
+                        )));
+                    }
                     let t = self.place(pl)?;
                     self.expect(&format!("`{}`'s argument `{}`", callee.name, p.name), p.ty, t)?
                 }
@@ -417,10 +425,7 @@ impl Verifier<'_> {
         for s in b {
             match s {
                 Stmt::Let(v, e) => {
-                    let t = self.expr(e)?;
-                    if let Some(t) = t
-                        && !matches!(e, Expr::Builtin(..) | Expr::EntryInput(_) | Expr::Host(..))
-                    {
+                    if let Some(t) = self.expr(e)? {
                         self.expect(&format!("v{}", v.0), self.ty(*v), t)?;
                     }
                     if self.defined[v.index()] {
@@ -436,6 +441,10 @@ impl Verifier<'_> {
                     self.expr(e)?;
                 }
                 Stmt::Store(p, v) => {
+                    if matches!(p.root, PlaceRoot::Data(_)) {
+                        return Err(bug("a store into constant data".into()));
+                    }
+                    self.all_visible(|f| p.for_each_value(&mut |v| f(v)))?;
                     let t = self.place(p)?;
                     self.visible(*v)?;
                     self.expect("a stored value", t, self.ty(*v))?;

@@ -4,6 +4,7 @@
 
 import { EXPORT_FRAME, EXPORT_MEMORY, IMPORT_MODULE, IMPORT_SUBMIT } from "./abi.gen.ts";
 import type { Checker } from "./check.ts";
+import { errorMessage } from "./errors.ts";
 import { StateHash } from "./hash.ts";
 import { Lines, LINES_SECTION, wasmOffsets } from "./lines.ts";
 import { type Bytes, type Command, decode, Sequencer } from "./stream.ts";
@@ -34,29 +35,29 @@ export interface Executor {
 
 /**
  * Checks a module against the program ABI before instantiating it: it may import only
- * `wrela.submit(i32, i32)`, and must export `memory` and `frame(f32, i32, i32)`. `bytes` is the
- * module's binary, for the function types JavaScript can't otherwise see.
+ * `wrela.submit(i32, i32)`, must export `memory` and `frame(f32, i32, i32)`, and may have no
+ * start function. `bytes` is the module's binary, for what JavaScript can't otherwise see.
  */
 export function checkAbi(module: WebAssembly.Module, bytes: Uint8Array): void {
   let types: ReturnType<typeof functionTypes>;
   try {
     types = functionTypes(bytes);
   } catch (e) {
-    throw new ProgramError(`can't read its function types: ${e instanceof Error ? e.message : String(e)}`);
+    throw new ProgramError(`can't read its function types: ${errorMessage(e)}`);
   }
-  for (const imp of WebAssembly.Module.imports(module)) {
+  WebAssembly.Module.imports(module).forEach((imp, i) => {
     const name = `${imp.module}.${imp.name}`;
     if (imp.module !== IMPORT_MODULE || imp.name !== IMPORT_SUBMIT) {
       throw new ProgramError(
         `it imports \`${name}\`, but a wrela program may import only \`${IMPORT_MODULE}.${IMPORT_SUBMIT}\``,
       );
     }
-    const ty = types.imports.get(name);
+    const ty = types.imports[i];
     if (imp.kind !== "function" || ty !== "(i32, i32) -> ()") {
       const what = imp.kind === "function" ? `a function ${ty}` : `a ${imp.kind}`;
       throw new ProgramError(`its import \`${name}\` must be a function (i32, i32) -> (), not ${what}`);
     }
-  }
+  });
   const exports = new Map(WebAssembly.Module.exports(module).map((e) => [e.name, e.kind]));
   if (exports.get(EXPORT_MEMORY) !== "memory") {
     throw new ProgramError(`it doesn't export its memory as \`${EXPORT_MEMORY}\``);
@@ -64,6 +65,8 @@ export function checkAbi(module: WebAssembly.Module, bytes: Uint8Array): void {
   if (exports.get(EXPORT_FRAME) !== "function" || types.exports.get(EXPORT_FRAME) !== "(f32, i32, i32) -> ()") {
     throw new ProgramError(`it must export \`${EXPORT_FRAME}(time: f32, width: i32, height: i32)\` with no results`);
   }
+  // It would run during instantiation, before the host can read the program's memory.
+  if (types.start) throw new ProgramError("it has a start function; a wrela program may run only when the host calls it");
 }
 
 type FrameFn = (time: number, width: number, height: number) => void;
@@ -107,7 +110,7 @@ export class Program {
     try {
       module = await WebAssembly.compile(wasm);
     } catch (e) {
-      throw new ProgramError(e instanceof Error ? e.message : String(e));
+      throw new ProgramError(errorMessage(e));
     }
     checkAbi(module, wasm);
     return module;
@@ -124,7 +127,7 @@ export class Program {
     try {
       program.#lines = Lines.of(module);
     } catch (e) {
-      throw new ProgramError(`its \`${LINES_SECTION}\` section is malformed: ${e instanceof Error ? e.message : String(e)}`);
+      throw new ProgramError(`its \`${LINES_SECTION}\` section is malformed: ${errorMessage(e)}`);
     }
     const imports = {
       [IMPORT_MODULE]: { [IMPORT_SUBMIT]: (ptr: number, len: number) => program.#submitImport(ptr, len) },
@@ -180,7 +183,7 @@ export class Program {
   /** What trapped, and where in the source if the program says and the engine's stack trace
    * gives offsets: the location of the innermost frame that has one. */
   #describe(e: unknown): string {
-    const what = e instanceof Error ? e.message : String(e);
+    const what = errorMessage(e);
     const stack = e instanceof Error ? (e.stack ?? "") : "";
     const at = wasmOffsets(stack)
       .map((offset) => this.#lines?.at(offset) ?? null)

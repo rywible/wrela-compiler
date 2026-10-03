@@ -4,9 +4,7 @@
 // branches on the input, early returns, loops and integer arithmetic. Each is a `Surface`, so
 // `gradient` and `interval` come from the trait's defaults.
 use grazer::{Grazer, grazer}
-use std::field::{
-    Surface, ellipsoid, fbm, half_space, hash_u32, round_cone, smin, sphere, value_noise,
-}
+use std::field::{Surface, ellipsoid, fbm, half_space, hash_u32, round_cone, sphere, value_noise}
 
 /// The creature from examples/hello-field (shape.wrela), mid-breath.
 pub fn creature() -> Surface {
@@ -153,17 +151,6 @@ impl Surface for Cells {
         let j = i32(floor(self.s * p.y)) * 3 + i
         let h = hash_u32(u32(j + 1000))
         0.1 * f32(h % 7) + 0.05 * f32(i) - p.z + f32(j >> 1) * 0.01
-    }
-}
-
-/// smin of two shapes, alone: the combinator every creature is folded with.
-pub struct Blend: Copy + Clone + GpuData {
-    pub k: f32,
-}
-
-impl Surface for Blend {
-    fn distance(self, p: vec3) -> f32 {
-        smin(length(p) - 0.5, length(p - vec3(0.6, 0.2, 0.0)) - 0.3, self.k)
     }
 }
 

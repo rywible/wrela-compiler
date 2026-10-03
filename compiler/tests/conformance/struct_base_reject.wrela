@@ -12,3 +12,13 @@ struct B {
 fn f(b: B) -> A {
     A { x: 1.0, ..b } //~ E0300
 }
+
+enum E: Copy + Clone {
+    V { x: f32, y: f32 },
+    W { z: f32 },
+}
+
+// An enum value may hold another variant, so it can't fill a variant's fields.
+fn g(e: E) -> E {
+    E::V { x: 1.0, ..e } //~ E0300
+}

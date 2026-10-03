@@ -1,0 +1,14 @@
+// mistake: a derivative after an early `return` on a value that differs between pixels
+// expect: E0608
+// fix: no
+use std::gpu::FragCoord
+
+@fragment
+fn ring(pixel: FragCoord) -> vec4 {
+    let d = length(pixel.position.xy - vec2(32.0)) - 16.0
+    if d > 1.0 {
+        return vec4(0.0)
+    }
+    let aa = fwidth(d)
+    vec4(smoothstep(aa, -aa, d))
+}

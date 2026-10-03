@@ -149,7 +149,7 @@ arm_sep          ::= "," | NEWLINE
 pattern          ::= "_" | "-"? (INT | FLOAT) | "true" | "false"
                    | path_expr ("(" (pattern ("," pattern)* ","?)? ")" | pattern_fields)?
                    | "(" (pattern ("," pattern)* ","?)? ")"
-pattern_fields   ::= "{" (field_pattern ("," field_pattern)* ("," "..")? ","? | "..")? NEWLINE? "}"
+pattern_fields   ::= "{" (field_pattern ("," field_pattern)* ("," "..")? ","? | ".." ","?)? NEWLINE? "}"
 field_pattern    ::= IDENT (":" pattern)?
 
 # ---------------------------------------------------------------------------------------------

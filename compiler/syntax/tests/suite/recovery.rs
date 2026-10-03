@@ -2,6 +2,7 @@
 //! argument, field, parameter, arm or item becomes an error node in its place, so the tree
 //! still holds every token and later passes can check the rest.
 
+use crate::collect;
 use wrela_diag::FileId;
 use wrela_syntax::ast::*;
 use wrela_syntax::{TokenKind, lex, parse};
@@ -102,19 +103,13 @@ fn assert_tokens_covered(name: &str, text: &str) {
 fn no_token_is_dropped() {
     assert_tokens_covered("BROKEN", BROKEN);
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests");
-    let mut checked = 0;
+    let mut paths = Vec::new();
     for dir in ["conformance", "diagnostics"] {
-        let mut paths: Vec<_> = std::fs::read_dir(root.join(dir))
-            .expect("the cases")
-            .map(|e| e.expect("an entry").path())
-            .filter(|p| p.extension().is_some_and(|e| e == "wrela"))
-            .collect();
-        paths.sort();
-        for path in paths {
-            let text = std::fs::read_to_string(&path).expect("read");
-            assert_tokens_covered(&path.display().to_string(), &text);
-            checked += 1;
-        }
+        collect(&root.join(dir), &mut paths);
     }
-    assert!(checked > 100, "only {checked} files");
+    assert!(paths.len() > 100, "only {} files", paths.len());
+    for path in paths {
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert_tokens_covered(&path.display().to_string(), &text);
+    }
 }

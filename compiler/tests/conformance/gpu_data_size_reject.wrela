@@ -1,0 +1,23 @@
+// rejects: gpu.data
+// A dispatch's or draw's `GpuData` arguments travel inside its command, which has to fit in the
+// program's 1 MiB command buffer.
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch}
+
+struct Big: Copy + Clone + GpuData {
+    xs: [f32; 300000],
+}
+
+struct Fits: Copy + Clone + GpuData {
+    xs: [f32; 200000],
+}
+
+@compute(64)
+fn sum<T: GpuData>(big: T, out: mut Slots<f32>, id: GlobalId) {
+    out[id] = 1.0
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    let out: GpuBuffer<f32> = buffer(64)
+    dispatch(sum, groups: 1, big: Big { xs: [1.0; 300000] }, out: out) //~ E0702
+    dispatch(sum, groups: 1, big: Fits { xs: [1.0; 200000] }, out: out)
+}

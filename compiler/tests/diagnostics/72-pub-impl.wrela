@@ -1,0 +1,17 @@
+// mistake: `pub` on an `impl`, whose members carry their own visibility
+// expect: E0100
+// fix: yes
+struct P {
+    x: f32,
+}
+
+pub impl P {
+    pub fn twice(self) -> f32 {
+        self.x * 2.0
+    }
+}
+
+pub fn f(a: f32) -> f32 {
+    let p = P { x: a }
+    p.twice()
+}

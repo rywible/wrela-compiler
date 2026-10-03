@@ -13,9 +13,10 @@
 //! export's WASM types (`u32` and `bool` are `i32`s). A program without a `frame` export gets
 //! an empty one.
 
-use std::path::PathBuf;
+use crate::scratch;
+use std::path::Path;
 use wrela_host::{CpuHost, Error, Value};
-use wrela_tests::{build, root};
+use wrela_tests::{build, cases, copy_dir, header, repo_root};
 
 #[derive(Debug)]
 enum Want {
@@ -24,27 +25,28 @@ enum Want {
 }
 
 struct Expect {
-    line: usize,
+    /// The expectation as written, for messages.
+    text: String,
     call: String,
     args: Vec<String>,
     want: Want,
 }
 
-fn parse_expect(line: usize, text: &str) -> Expect {
+fn parse_expect(text: &str) -> Expect {
     let (call, want) = match text.strip_suffix(" traps") {
         Some(c) => (c, Want::Traps),
         None => {
-            let (c, v) = text.rsplit_once(" = ").unwrap_or_else(|| {
-                panic!("line {line}: `{text}` isn't `f(..) = v` or `f(..) traps`")
-            });
+            let (c, v) = text
+                .rsplit_once(" = ")
+                .unwrap_or_else(|| panic!("`{text}` isn't `f(..) = v` or `f(..) traps`"));
             (c, Want::Returns(v.trim().to_string()))
         }
     };
-    let (name, rest) = call.split_once('(').unwrap_or_else(|| panic!("line {line}: no `(`"));
-    let inner = rest.trim().strip_suffix(')').unwrap_or_else(|| panic!("line {line}: no `)`"));
+    let (name, rest) = call.split_once('(').unwrap_or_else(|| panic!("`{text}`: no `(`"));
+    let inner = rest.trim().strip_suffix(')').unwrap_or_else(|| panic!("`{text}`: no `)`"));
     let args =
         inner.split(',').map(str::trim).filter(|a| !a.is_empty()).map(String::from).collect();
-    Expect { line, call: name.trim().to_string(), args, want }
+    Expect { text: text.to_string(), call: name.trim().to_string(), args, want }
 }
 
 fn value(text: &str, ty: &str) -> Value {
@@ -72,11 +74,9 @@ fn same(a: &Value, b: &Value) -> bool {
     }
 }
 
-fn run_case(path: &std::path::Path) -> Result<usize, String> {
+fn run_case(path: &Path) -> Result<usize, String> {
     let name = path.file_stem().expect("name").to_string_lossy().into_owned();
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("run-pass").join(&name);
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("dir");
+    let dir = scratch(&format!("run-pass/{name}"));
     let main = if path.is_dir() {
         copy_dir(path, &dir);
         dir.join("main.wrela")
@@ -84,11 +84,7 @@ fn run_case(path: &std::path::Path) -> Result<usize, String> {
         path.to_path_buf()
     };
     let mut text = std::fs::read_to_string(&main).expect("read");
-    let expects: Vec<Expect> = text
-        .lines()
-        .enumerate()
-        .filter_map(|(i, l)| l.strip_prefix("// expect:").map(|e| parse_expect(i + 1, e.trim())))
-        .collect();
+    let expects: Vec<Expect> = header(&text, "expect").map(parse_expect).collect();
     if expects.is_empty() {
         return Err("no `// expect:` lines".into());
     }
@@ -97,22 +93,18 @@ fn run_case(path: &std::path::Path) -> Result<usize, String> {
     }
     std::fs::write(dir.join("main.wrela"), &text).expect("write");
     let out = dir.join("build");
-    build(&dir, &out).map_err(|e| format!("doesn't build:\n{e}"))?;
+    let built = build(&dir).map_err(|e| format!("doesn't build:\n{e}"))?;
+    built.write_to(&out).expect("write the build");
     let mut host = CpuHost::load(&out).map_err(|e| format!("doesn't load: {e}"))?;
     let exports = host.exports();
     let mut problems = Vec::new();
     for e in &expects {
         let Some((_, params, results)) = exports.iter().find(|(n, ..)| *n == e.call) else {
-            problems.push(format!("line {}: no export `{}`", e.line, e.call));
+            problems.push(format!("`{}`: no export `{}`", e.text, e.call));
             continue;
         };
         if params.len() != e.args.len() {
-            problems.push(format!(
-                "line {}: `{}` takes {} arguments",
-                e.line,
-                e.call,
-                params.len()
-            ));
+            problems.push(format!("`{}`: `{}` takes {} arguments", e.text, e.call, params.len()));
             continue;
         }
         let args: Vec<Value> = e.args.iter().zip(params).map(|(a, t)| value(a, t)).collect();
@@ -125,47 +117,18 @@ fn run_case(path: &std::path::Path) -> Result<usize, String> {
                     None => Vec::new(),
                 };
                 if want.len() != vals.len() || !want.iter().zip(&vals).all(|(a, b)| same(a, b)) {
-                    problems.push(format!(
-                        "line {}: {}({}) returned {vals:?}, expected {want:?}",
-                        e.line,
-                        e.call,
-                        e.args.join(", ")
-                    ));
+                    problems.push(format!("`{}`: returned {vals:?}, expected {want:?}", e.text));
                 }
             }
-            (want, got) => problems.push(format!(
-                "line {}: {}({}) gave {got:?}, expected {want:?}",
-                e.line,
-                e.call,
-                e.args.join(", ")
-            )),
+            (want, got) => problems.push(format!("`{}`: gave {got:?}, expected {want:?}", e.text)),
         }
     }
     if problems.is_empty() { Ok(expects.len()) } else { Err(problems.join("\n")) }
 }
 
-fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
-    for e in std::fs::read_dir(from).expect("read case dir") {
-        let p = e.expect("entry").path();
-        let dest = to.join(p.file_name().expect("name"));
-        if p.is_dir() {
-            std::fs::create_dir_all(&dest).expect("dir");
-            copy_dir(&p, &dest);
-        } else {
-            std::fs::copy(&p, &dest).expect("copy");
-        }
-    }
-}
-
 #[test]
 fn run_pass() {
-    let dir = root().join("compiler/tests/run");
-    let mut cases: Vec<PathBuf> = std::fs::read_dir(&dir)
-        .expect("run dir")
-        .map(|e| e.expect("entry").path())
-        .filter(|p| p.is_dir() || p.extension().is_some_and(|e| e == "wrela"))
-        .collect();
-    cases.sort();
+    let cases = cases(&repo_root().join("compiler/tests/run"));
     let only = std::env::var("WRELA_RUN_ONLY").ok();
     let mut failures = Vec::new();
     let mut checked = 0;

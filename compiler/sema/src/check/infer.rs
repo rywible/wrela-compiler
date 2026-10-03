@@ -9,6 +9,9 @@ struct VarInfo {
     kind: VarKind,
     bound: Option<TyId>,
     origin: Span,
+    /// How many variables are bound, through others, to this one (itself included): when two
+    /// unbound variables unify, the smaller set joins the larger, so chains stay short.
+    size: u32,
 }
 
 /// Two types that can't be made the same; the caller reports it with context.
@@ -18,11 +21,14 @@ pub struct Mismatch;
 #[derive(Clone, Debug, Default)]
 pub struct Infer {
     vars: Vec<VarInfo>,
+    /// While a snapshot is open: the variables bound since it was taken, so a rollback can
+    /// unbind them. Unification only binds variables; it never makes new ones.
+    trail: Option<Vec<usize>>,
 }
 
 impl Infer {
     pub fn new_var(&mut self, types: &Types, kind: VarKind, origin: Span) -> TyId {
-        self.vars.push(VarInfo { kind, bound: None, origin });
+        self.vars.push(VarInfo { kind, bound: None, origin, size: 1 });
         types.var(VarId(self.vars.len() as u32 - 1))
     }
 
@@ -46,6 +52,9 @@ impl Infer {
 
     /// Substitutes every bound variable, deeply. Unbound ones stay.
     pub fn resolve(&self, types: &Types, t: TyId) -> TyId {
+        if !types.has_vars(t) {
+            return t;
+        }
         types.map(t, &mut |types, x| match types.kind(x) {
             TyKind::Var(v) => {
                 let b = self.vars[v.index()].bound?;
@@ -75,9 +84,49 @@ impl Infer {
         unknown
     }
 
-    /// Makes `a` and `b` the same type, or reports that they can't be.
+    /// Makes `a` and `b` the same type, or reports that they can't be. On a mismatch, the
+    /// parts unified before it stay unified.
     pub fn unify(&mut self, types: &Types, a: TyId, b: TyId) -> Result<(), Mismatch> {
         self.unify_in(types, a, b, &mut HashSet::new())
+    }
+
+    /// Unifies `a` and `b` if they fit, leaving every variable as it was if they don't.
+    pub fn try_unify(&mut self, types: &Types, a: TyId, b: TyId) -> bool {
+        self.snapshot();
+        let ok = self.unify(types, a, b).is_ok();
+        if ok {
+            self.commit();
+        } else {
+            self.rollback();
+        }
+        ok
+    }
+
+    /// Starts recording bindings, for [`Infer::rollback`]. Snapshots don't nest.
+    fn snapshot(&mut self) {
+        debug_assert!(self.trail.is_none(), "a snapshot is already open");
+        self.trail = Some(Vec::new());
+    }
+
+    /// Keeps the bindings made since the snapshot.
+    fn commit(&mut self) {
+        self.trail = None;
+    }
+
+    /// Unbinds the variables bound since the snapshot.
+    fn rollback(&mut self) {
+        for i in self.trail.take().unwrap_or_default() {
+            self.vars[i].bound = None;
+        }
+    }
+
+    /// Binds the unbound variable `v` to `t`.
+    fn set(&mut self, v: VarId, t: TyId) {
+        debug_assert!(self.vars[v.index()].bound.is_none());
+        if let Some(trail) = &mut self.trail {
+            trail.push(v.index());
+        }
+        self.vars[v.index()].bound = Some(t);
     }
 
     /// `done` holds the pairs of large types already made the same: types share parts, and
@@ -117,56 +166,43 @@ impl Infer {
             (TyKind::Error, _) | (_, TyKind::Error) => Ok(()),
             (TyKind::Var(x), TyKind::Var(y)) => {
                 let (kx, ky) = (self.vars[x.index()].kind, self.vars[y.index()].kind);
-                // Keep the more specific kind: Float beats Int beats General.
+                // Keep the more specific kind: Float beats Int beats General. Between equals, the
+                // smaller set joins the larger (each element of `[0.0, 1.0, ...]` would
+                // otherwise make one chain longer).
                 let rank = |k: VarKind| match k {
                     VarKind::General => 0,
                     VarKind::Int => 1,
                     VarKind::Float => 2,
                 };
-                if rank(kx) >= rank(ky) {
-                    self.vars[y.index()].bound = Some(a);
-                } else {
-                    self.vars[x.index()].bound = Some(b);
-                }
+                let (sx, sy) = (self.vars[x.index()].size, self.vars[y.index()].size);
+                let y_joins_x = if rank(kx) != rank(ky) { rank(kx) > rank(ky) } else { sx >= sy };
+                let (from, to, to_ty) = if y_joins_x { (*y, *x, a) } else { (*x, *y, b) };
+                let joined = self.vars[from.index()].size;
+                self.vars[to.index()].size = self.vars[to.index()].size.saturating_add(joined);
+                self.set(from, to_ty);
                 Ok(())
             }
             (TyKind::Var(x), _) => self.bind(types, *x, b),
             (_, TyKind::Var(y)) => self.bind(types, *y, a),
-            (TyKind::Tuple(xs), TyKind::Tuple(ys)) if xs.len() == ys.len() => {
-                for (&x, &y) in xs.iter().zip(ys) {
-                    self.unify_in(types, x, y, done)?;
-                }
-                Ok(())
-            }
-            (TyKind::Adt(x, xs), TyKind::Adt(y, ys)) if x == y && xs.len() == ys.len() => {
-                for (&x, &y) in xs.iter().zip(ys) {
-                    self.unify_in(types, x, y, done)?;
-                }
-                Ok(())
+            (TyKind::Tuple(xs), TyKind::Tuple(ys)) => self.unify_all(types, xs, ys, done),
+            (TyKind::Adt(x, xs), TyKind::Adt(y, ys)) if x == y => {
+                self.unify_all(types, xs, ys, done)
             }
             (TyKind::Opaque(x, xs), TyKind::Opaque(y, ys))
             | (TyKind::FnDef(x, xs), TyKind::FnDef(y, ys))
-                if x == y && xs.len() == ys.len() =>
+                if x == y =>
             {
-                for (&x, &y) in xs.iter().zip(ys) {
-                    self.unify_in(types, x, y, done)?;
-                }
-                Ok(())
+                self.unify_all(types, xs, ys, done)
             }
             (TyKind::Closure(x, xs), TyKind::Closure(y, ys)) if x == y => {
-                for (&x, &y) in xs.iter().zip(ys) {
-                    self.unify_in(types, x, y, done)?;
-                }
-                Ok(())
+                self.unify_all(types, xs, ys, done)
             }
             (TyKind::Array(x, n), TyKind::Array(y, m)) if n == m => {
                 self.unify_in(types, *x, *y, done)
             }
             (TyKind::Slice(x), TyKind::Slice(y)) => self.unify_in(types, *x, *y, done),
-            (TyKind::FnPtr(xp, xr), TyKind::FnPtr(yp, yr)) if xp.len() == yp.len() => {
-                for (&x, &y) in xp.iter().zip(yp) {
-                    self.unify_in(types, x, y, done)?;
-                }
+            (TyKind::FnPtr(xp, xr), TyKind::FnPtr(yp, yr)) => {
+                self.unify_all(types, xp, yp, done)?;
                 self.unify_in(types, *xr, *yr, done)
             }
             (
@@ -174,13 +210,27 @@ impl Infer {
                 TyKind::Projection { self_ty: s2, trait_: t2, trait_args: a2, name: n2 },
             ) if t1 == t2 && n1 == n2 && a1.len() == a2.len() => {
                 self.unify_in(types, *s1, *s2, done)?;
-                for (&x, &y) in a1.iter().zip(a2) {
-                    self.unify_in(types, x, y, done)?;
-                }
-                Ok(())
+                self.unify_all(types, a1, a2, done)
             }
             _ => Err(Mismatch),
         }
+    }
+
+    /// Unifies two lists pairwise, in order; lists of different lengths don't unify.
+    fn unify_all(
+        &mut self,
+        types: &Types,
+        xs: &[TyId],
+        ys: &[TyId],
+        done: &mut HashSet<(TyId, TyId)>,
+    ) -> Result<(), Mismatch> {
+        if xs.len() != ys.len() {
+            return Err(Mismatch);
+        }
+        for (&x, &y) in xs.iter().zip(ys) {
+            self.unify_in(types, x, y, done)?;
+        }
+        Ok(())
     }
 
     fn bind(&mut self, types: &Types, v: VarId, t: TyId) -> Result<(), Mismatch> {
@@ -193,11 +243,22 @@ impl Infer {
             return Err(Mismatch);
         }
         // The occurs check: a type can't contain itself.
-        let resolved = self.resolve(types, t);
-        if types.any(resolved, &mut |k| matches!(k, TyKind::Var(x) if *x == v)) {
+        if self.occurs(types, v, t) {
             return Err(Mismatch);
         }
-        self.vars[v.index()].bound = Some(t);
+        self.set(v, t);
         Ok(())
+    }
+
+    /// Whether the variable `v` is part of `t`, through the variables bound so far.
+    fn occurs(&self, types: &Types, v: VarId, t: TyId) -> bool {
+        match types.kind(self.shallow(types, t)) {
+            TyKind::Var(x) => *x == v,
+            k => {
+                let mut found = false;
+                children(k, &mut |c| found = found || self.occurs(types, v, c));
+                found
+            }
+        }
     }
 }

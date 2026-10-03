@@ -10,3 +10,45 @@ fn field(a: i32) -> i32 {
 fn convert(v: vec3) -> f32 {
     f32(v) //~ E0319
 }
+
+fn shift_by_float(y: f32) -> i32 {
+    var x: i32 = 1
+    x <<= y //~ E0305
+    x
+}
+
+fn shift_by_signed(k: i32) -> i32 {
+    var x: i32 = 1
+    x <<= k //~ E0305
+    1 << k //~ E0305
+}
+
+// An integer literal under an integer-only operator stays an integer.
+fn shifted_float(x: f32) -> f32 {
+    let steps = 1 << 8 //~ E0305
+    floor(x * steps) / steps
+}
+
+fn masked_float() -> f32 {
+    let a = 6 & 3 //~ E0305
+    let b = !1 //~ E0305
+    let c: f32 = a
+    let d: f32 = b
+    c + d
+}
+
+// A built-in's literal argument is checked again once a later use settles its type.
+fn sign_unsigned() -> u32 {
+    let n = 7
+    let s = sign(n) //~ E0305
+    let k: u32 = n
+    k
+}
+
+// A built-in on a literal that later settles as `f64` is still checked: std's math is `f32`.
+fn sin_settles_f64() -> f64 {
+    let x = 2.0
+    let y = sin(x) //~ E0702
+    let k: f64 = y
+    k
+}

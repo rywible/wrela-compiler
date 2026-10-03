@@ -1,7 +1,7 @@
 //! Calls: functions, methods, built-ins, constructors, conversions, and the GPU intrinsics.
 
-use super::Checker;
 use super::expr::ValueRes;
+use super::{Checker, zonk};
 use crate::builtins::{self, BuiltinFn, BuiltinTy};
 use crate::defs::*;
 use crate::resolve;
@@ -12,12 +12,14 @@ use wrela_diag::{Diagnostic, Span, codes};
 use wrela_syntax::ast;
 
 /// A parameter as call checking sees it.
-#[derive(Clone)]
-pub(crate) struct CallParam {
-    pub name: String,
+#[derive(Clone, Copy)]
+pub(crate) struct CallParam<'p> {
+    pub name: &'p str,
     pub mode: Mode,
     pub ty: TyId,
-    pub default: Option<ast::Expr>,
+    pub default: Option<&'p ast::Expr>,
+    /// The module the function is declared in: its default's names are that module's.
+    pub module: ModuleId,
 }
 
 /// What a method call resolved to.
@@ -65,7 +67,7 @@ impl<'p> Checker<'p> {
             return self.failed_call(args, span);
         };
         match res {
-            ValueRes::Local(l) => self.call_local(l, args, span),
+            ValueRes::Local(l) => self.call_local(l, args, expected, span),
             ValueRes::Item(Res::Fn(f)) => {
                 match self.p.func(f).lang {
                     Some(Lang::Dispatch) => return self.check_dispatch(args, span),
@@ -103,14 +105,20 @@ impl<'p> Checker<'p> {
                 self.call_type_relative(ty, &name, generics, args, expected, span)
             }
             ValueRes::TraitRelative(t, name) => {
-                let Some(m) = traits::trait_method(self.p, t, &name.name) else {
+                let ntraits = self.p.trait_(t).generics.len();
+                let trait_args: Vec<TyId> =
+                    (0..ntraits).map(|_| self.new_var(VarKind::General, span)).collect();
+                let own = TraitRef { trait_: t, args: trait_args };
+                // The method is the trait's own or a supertrait's (`Sub::base(x)`).
+                let error = self.p.types.error;
+                if traits::trait_method_via(self.p, error, own.clone(), &name.name).is_none() {
                     self.err(Diagnostic::new(
                         codes::E0207,
                         name.span,
                         format!("`{}` has no method `{}`", self.p.trait_(t).name, name.name),
                     ));
                     return self.error_expr(span);
-                };
+                }
                 // `Trait::method(x, ...)`: the first argument is the receiver.
                 let Some(first) = args.first() else {
                     self.err(Diagnostic::new(
@@ -122,18 +130,18 @@ impl<'p> Checker<'p> {
                 };
                 let recv = self.check_expr(&first.value, None);
                 let rt = self.shallow(recv.ty);
-                let ntraits = self.p.trait_(t).generics.len();
-                let trait_args: Vec<TyId> =
-                    (0..ntraits).map(|_| self.new_var(VarKind::General, span)).collect();
                 self.obligation(
                     rt,
-                    TraitRef { trait_: t, args: trait_args.clone() },
+                    own.clone(),
                     recv.span,
                     format!("calling `{}::{}`", self.p.trait_(t).name, name.name),
                 );
+                let Some((m, via)) = traits::trait_method_via(self.p, rt, own, &name.name) else {
+                    unreachable!("the method was found above")
+                };
                 let generics = path.segments.last().and_then(|s| s.generics.as_deref());
                 self.finish_method(
-                    Pick::Trait { method: m, trait_args },
+                    Pick::Trait { method: m, trait_args: via.args },
                     recv,
                     generics,
                     &args[1..],
@@ -169,11 +177,28 @@ impl<'p> Checker<'p> {
         }
     }
 
-    fn call_local(&mut self, l: LocalId, args: &[ast::Arg], span: Span) -> Expr {
+    fn call_local(
+        &mut self,
+        l: LocalId,
+        args: &[ast::Arg],
+        expected: Option<TyId>,
+        span: Span,
+    ) -> Expr {
         let ty = self.locals[l.index()].ty;
         let (params, ret) = match self.kind(ty) {
-            TyKind::FnPtr(ps, r) => (ps, r),
-            TyKind::Closure(c, _) => match self.closure_def(c) {
+            TyKind::FnPtr(ps, r) => (ps.clone(), *r),
+            // A named function: its arguments are matched as a direct call matches them (names,
+            // defaults, modes), and the local stands for the function.
+            &TyKind::FnDef(f, ref gen_args) => {
+                let gen_args = gen_args.clone();
+                let mut call = self.call_fn(f, gen_args, None, args, expected, span);
+                if let ExprKind::Call(c) = &mut call.kind {
+                    c.callee = Callee::Local(l);
+                }
+                self.note_use(l, false);
+                return call;
+            }
+            TyKind::Closure(c, _) => match self.closure_def(*c) {
                 Some(def) => {
                     let ps = def.params.iter().map(|p| self.locals[p.index()].ty).collect();
                     (ps, def.ret)
@@ -212,9 +237,7 @@ impl<'p> Checker<'p> {
                     "a closure's arguments are positional",
                 ));
             }
-            let e = self.check_expr(&a.value, Some(pt));
-            self.expect(e.ty, pt, e.span);
-            out.push(e);
+            out.push(self.check_expect(&a.value, pt));
         }
         self.note_use(l, false);
         let modes = vec![Mode::Borrow; out.len()];
@@ -233,50 +256,138 @@ impl<'p> Checker<'p> {
         }
     }
 
-    /// The parameters of `f`, with its generics substituted by `gen_args`.
-    fn fn_params(&mut self, f: FnId, gen_args: &[TyId]) -> (Vec<CallParam>, TyId, RetMode) {
-        let def = self.p.func(f);
-        let all = self.p.fn_all_generics(f);
-        let subst = Subst::from_pairs(&all, gen_args);
+    /// `f`'s parameters and return type, with `subst` applied.
+    fn sig_under(&self, f: FnId, subst: &Subst) -> (Vec<CallParam<'p>>, TyId) {
+        let p = self.p;
+        let def = p.func(f);
+        let module = def.module;
         let params = def
             .params
             .iter()
-            .map(|p| {
-                let ty = self.p.types.subst(p.ty, &subst);
-                let ty = traits::normalize(self.p, ty, None);
-                CallParam { name: p.name.clone(), mode: p.mode, ty, default: p.default.clone() }
+            .map(|ps| {
+                let ty = traits::normalize(p, p.types.subst(ps.ty, subst), None);
+                let default = ps.default.as_ref();
+                CallParam { name: &ps.name, mode: ps.mode, ty, default, module }
             })
             .collect();
-        let ret = self.p.types.subst(def.ret, &subst);
-        let ret = traits::normalize(self.p, ret, None);
-        (params, ret, def.ret_mode)
+        let ret = traits::normalize(p, p.types.subst(def.ret, subst), None);
+        (params, ret)
+    }
+
+    /// A call's signature with each projection on a type not inferred yet (`T::Out` while `T`
+    /// is a variable) replaced by a variable, which [`Self::settle_projections`] binds once
+    /// the type is known.
+    fn defer_projections(
+        &mut self,
+        f: FnId,
+        params: Vec<CallParam<'p>>,
+        ret: TyId,
+        span: Span,
+    ) -> (Vec<CallParam<'p>>, TyId) {
+        let p = self.p;
+        // The declared signature says whether there are any, cheaply: the instantiated types
+        // can be large.
+        let def = p.func(f);
+        let is_projection = |k: &TyKind| matches!(k, TyKind::Projection { .. });
+        if !def
+            .params
+            .iter()
+            .map(|ps| ps.ty)
+            .chain([def.ret])
+            .any(|t| p.types.any(t, &mut { is_projection }))
+        {
+            return (params, ret);
+        }
+        let defer = |this: &mut Self, t: TyId| {
+            p.types.map(t, &mut |types, x| match types.kind(x) {
+                TyKind::Projection { self_ty, trait_args, .. }
+                    if types.has_vars(*self_ty)
+                        || trait_args.iter().any(|&a| types.has_vars(a)) =>
+                {
+                    let v = this.new_var(VarKind::General, span);
+                    this.projections.push((v, x, span));
+                    Some(v)
+                }
+                _ => None,
+            })
+        };
+        let params =
+            params.into_iter().map(|cp| CallParam { ty: defer(self, cp.ty), ..cp }).collect();
+        let ret = defer(self, ret);
+        (params, ret)
+    }
+
+    /// Binds the variable of each deferred projection whose types are known by now to what it
+    /// normalizes to: an impl's associated type, or the projection itself on a generic
+    /// parameter. `last`: the body is done, so a literal it waits for takes its default type.
+    pub(crate) fn settle_projections(&mut self, last: bool) {
+        let mut i = 0;
+        while i < self.projections.len() {
+            let (var, proj, span) = self.projections[i];
+            let mut r = self.infer.resolve(&self.p.types, proj);
+            if last && self.p.types.has_vars(r) {
+                let mut literals = Vec::new();
+                self.p.types.any(r, &mut |k| {
+                    if let TyKind::Var(v) = k {
+                        literals.push(self.p.types.var(*v));
+                    }
+                    false
+                });
+                for v in literals {
+                    let default = match self.infer.var_kind(&self.p.types, v) {
+                        Some(VarKind::Int) => self.p.types.i32,
+                        Some(VarKind::Float) => self.p.types.f32,
+                        _ => continue,
+                    };
+                    self.try_unify(v, default);
+                }
+                r = self.infer.resolve(&self.p.types, proj);
+            }
+            if self.p.types.has_vars(r) {
+                i += 1;
+                continue;
+            }
+            self.projections.remove(i);
+            let n = traits::normalize(self.p, r, None);
+            self.expect(var, n, span);
+        }
+    }
+
+    /// The parameters of `f`, with its generics substituted by `gen_args`.
+    fn fn_params(&self, f: FnId, gen_args: &[TyId]) -> (Vec<CallParam<'p>>, TyId, RetMode) {
+        let subst = Subst::from_pairs(&self.p.fn_all_generics(f), gen_args);
+        let (params, ret) = self.sig_under(f, &subst);
+        (params, ret, self.p.func(f).ret_mode)
     }
 
     /// Bounds on `f`'s generics become obligations.
     fn fn_obligations(&mut self, f: FnId, gen_args: &[TyId], span: Span) {
-        let n = self.p.fn_all_generics(f).len();
-        self.fn_obligations_at(f, gen_args, &vec![span; n]);
-    }
-
-    /// Bounds on `f`'s generics become obligations, each reported at its own span.
-    fn fn_obligations_at(&mut self, f: FnId, gen_args: &[TyId], spans: &[Span]) {
         let all = self.p.fn_all_generics(f);
         let subst = Subst::from_pairs(&all, gen_args);
         let name = self.p.fn_display_name(f);
-        for (i, &g) in all.iter().enumerate() {
-            if self.p.param(g).is_self {
+        self.bound_obligations(&all, gen_args, &subst, &vec![span; all.len()], &name);
+    }
+
+    /// Bounds on the generic parameters `params` become obligations on their arguments `args`:
+    /// each bound with `subst` applied, reported at the parameter's span in `spans`, as needed
+    /// by `` `P` in `name` ``.
+    fn bound_obligations(
+        &mut self,
+        params: &[ParamId],
+        args: &[TyId],
+        subst: &Subst,
+        spans: &[Span],
+        name: &str,
+    ) {
+        let p = self.p;
+        for ((&g, &a), &span) in params.iter().zip(args).zip(spans) {
+            let param = p.param(g);
+            if param.is_self {
                 continue; // the receiver's own trait: the method was found through it
             }
-            let bounds = self.p.param(g).bounds.clone();
-            for b in bounds {
-                let args = b.args.iter().map(|&a| self.p.types.subst(a, &subst)).collect();
-                let pname = self.p.param(g).name.clone();
-                self.obligation(
-                    gen_args[i],
-                    TraitRef { trait_: b.trait_, args },
-                    spans[i],
-                    format!("`{pname}` in `{name}`"),
-                );
+            for b in &param.bounds {
+                let r = b.subst(&p.types, subst);
+                self.obligation(a, r, span, format!("`{}` in `{name}`", param.name));
             }
         }
     }
@@ -290,7 +401,10 @@ impl<'p> Checker<'p> {
         expected: Option<TyId>,
         span: Span,
     ) -> Expr {
-        let (params, ret, ret_mode) = self.fn_params(f, &gen_args);
+        let all = self.p.fn_all_generics(f);
+        let subst = Subst::from_pairs(&all, &gen_args);
+        let (params, ret) = self.sig_under(f, &subst);
+        let (params, ret) = self.defer_projections(f, params, ret, span);
         if let Some(e) = expected
             && !matches!(self.kind(ret), TyKind::Opaque(..))
         {
@@ -302,12 +416,10 @@ impl<'p> Checker<'p> {
         let has_receiver = receiver.is_some();
         let (call_args, modes, order) = self.match_args(&name, &params, receiver, args, span, f);
         // A bound on a generic that's a parameter's whole type is reported at that argument.
-        let spans: Vec<Span> = self
-            .p
-            .fn_all_generics(f)
+        let def = self.p.func(f);
+        let spans: Vec<Span> = all
             .iter()
             .map(|&g| {
-                let def = self.p.func(f);
                 def.params
                     .iter()
                     .position(|ps| matches!(self.p.types.kind(ps.ty), TyKind::Param(q) if *q == g))
@@ -315,7 +427,8 @@ impl<'p> Checker<'p> {
                     .map_or(span, |a| a.span)
             })
             .collect();
-        self.fn_obligations_at(f, &gen_args, &spans);
+        self.bound_obligations(&all, &gen_args, &subst, &spans, &name);
+        self.settle_projections(false);
         Expr {
             ty: ret,
             span,
@@ -325,7 +438,7 @@ impl<'p> Checker<'p> {
                 modes,
                 order,
                 receiver: has_receiver,
-                ret_mode,
+                ret_mode: def.ret_mode,
             }),
         }
     }
@@ -342,7 +455,7 @@ impl<'p> Checker<'p> {
     ) -> (Vec<Expr>, Vec<Mode>, Vec<usize>) {
         let offset = usize::from(receiver.is_some());
         let mut slots: Vec<Option<Expr>> = vec![None; params.len()];
-        let mut suggested: Vec<String> = Vec::new();
+        let mut suggested: Vec<&str> = Vec::new();
         // The order the arguments are written in: evaluation order (language.md §3).
         let mut order: Vec<usize> = Vec::new();
         if let Some(r) = receiver {
@@ -362,7 +475,7 @@ impl<'p> Checker<'p> {
                                 a.span,
                                 format!(
                                     "`{name}` takes {takes} argument{}, but {given} were given",
-                                    if takes == 1 { "" } else { "s" }
+                                    wrela_diag::plural(takes)
                                 ),
                             )
                             .with_secondary(self.p.func(f).sig_span, "declared here"),
@@ -381,13 +494,12 @@ impl<'p> Checker<'p> {
                             n.span,
                             format!("`{name}` has no parameter `{}`", n.name),
                         );
-                        if let Some(s) = resolve::closest(
-                            &n.name,
-                            params[offset..].iter().map(|p| p.name.as_str()),
-                        ) {
+                        if let Some(s) =
+                            resolve::closest(&n.name, params[offset..].iter().map(|p| p.name))
+                        {
                             d = d.with_fix(format!("did you mean `{s}`?"), n.span, s);
                             // The misspelling is that argument: don't also call it missing.
-                            suggested.push(s.to_string());
+                            suggested.push(s);
                         } else {
                             let names: Vec<String> =
                                 params[offset..].iter().map(|p| format!("`{}`", p.name)).collect();
@@ -400,7 +512,7 @@ impl<'p> Checker<'p> {
                 },
             };
             if slots[idx].is_some() {
-                let pname = params[idx].name.clone();
+                let pname = params[idx].name;
                 self.err(Diagnostic::new(
                     codes::E0304,
                     a.span,
@@ -420,14 +532,12 @@ impl<'p> Checker<'p> {
                 Some(e) => out.push(e),
                 None => match &params[i].default {
                     Some(d) => {
-                        let ty = params[i].ty;
-                        let e = self.check_default(d, ty);
-                        out.push(e);
+                        out.push(self.check_default(d, params[i].ty, params[i].module));
                         order.push(i);
                     }
                     None => {
                         if !suggested.contains(&params[i].name) {
-                            missing.push(params[i].name.clone());
+                            missing.push(params[i].name);
                         }
                         out.push(self.error_expr(span));
                     }
@@ -456,6 +566,8 @@ impl<'p> Checker<'p> {
 
     /// One argument against its parameter: type, and the call-site marker for its mode.
     fn check_arg(&mut self, p: &CallParam, value: &ast::Expr) -> Expr {
+        // The arguments before it may have settled its type (`T::K` once `T` is known).
+        self.settle_projections(false);
         let e = self.check_expr(value, Some(p.ty));
         self.coerce_arg(&e, p.ty);
         let marked_mut = matches!(e.kind, ExprKind::MutArg(_));
@@ -490,28 +602,41 @@ impl<'p> Checker<'p> {
     /// Argument coercions: an array passes as a run (`[T; N]` to `[T]`); otherwise unify.
     fn coerce_arg(&mut self, e: &Expr, param_ty: TyId) {
         if let (TyKind::Array(a, _), TyKind::Slice(b)) = (self.kind(e.ty), self.kind(param_ty)) {
-            self.expect(a, b, e.span);
+            self.expect(*a, *b, e.span);
             return;
         }
         if let (TyKind::Closure(c, _), TyKind::FnPtr(ps, r)) =
             (self.kind(e.ty), self.kind(param_ty))
         {
-            if let Some(def) = self.closure_def(c).cloned() {
-                for (l, &pt) in def.params.iter().zip(&ps) {
+            if let Some(def) = self.closure_def(*c) {
+                let (params, ret) = (def.params.clone(), def.ret);
+                if params.len() != ps.len() {
+                    self.err(Diagnostic::new(
+                        codes::E0301,
+                        e.span,
+                        format!(
+                            "this closure takes {} parameters, but {} are expected",
+                            params.len(),
+                            ps.len()
+                        ),
+                    ));
+                    return;
+                }
+                for (l, &pt) in params.iter().zip(ps) {
                     let lt = self.locals[l.index()].ty;
                     self.expect(lt, pt, e.span);
                 }
-                self.expect(def.ret, r, e.span);
+                self.expect(ret, *r, e.span);
             }
             return;
         }
-        if let (TyKind::FnDef(f, args), TyKind::FnPtr(ps, r)) =
+        if let (&TyKind::FnDef(f, ref args), TyKind::FnPtr(ps, r)) =
             (self.kind(e.ty), self.kind(param_ty))
         {
-            let (params, ret, ret_mode) = self.fn_params(f, &args);
+            let (params, ret, ret_mode) = self.fn_params(f, args);
             // A `fn(..)` type's parameters are borrowed and its result is owned.
             if let Some(p) = params.iter().find(|p| p.mode != Mode::Borrow) {
-                let fname = self.p.func(f).name.clone();
+                let fname = &self.p.func(f).name;
                 self.err(
                     Diagnostic::new(
                         codes::E0300,
@@ -527,7 +652,7 @@ impl<'p> Checker<'p> {
                 return;
             }
             if ret_mode != RetMode::Owned {
-                let fname = self.p.func(f).name.clone();
+                let fname = &self.p.func(f).name;
                 self.err(Diagnostic::new(
                     codes::E0300,
                     e.span,
@@ -548,10 +673,10 @@ impl<'p> Checker<'p> {
                 ));
                 return;
             }
-            for (p, &pt) in params.iter().zip(&ps) {
+            for (p, &pt) in params.iter().zip(ps) {
                 self.expect(p.ty, pt, e.span);
             }
-            self.expect(ret, r, e.span);
+            self.expect(ret, *r, e.span);
             return;
         }
         self.expect(e.ty, param_ty, e.span);
@@ -566,7 +691,7 @@ impl<'p> Checker<'p> {
         expected: Option<TyId>,
         span: Span,
     ) -> Expr {
-        let variant = self.p.adt(a).variants()[v as usize].clone();
+        let variant = &self.p.adt(a).variants()[v as usize];
         let gargs = self.adt_args(a, path, expected, span);
         let ty = self.p.types.adt(a, gargs.clone());
         if variant.shape != VariantShape::Tuple {
@@ -584,7 +709,7 @@ impl<'p> Checker<'p> {
             );
             return self.error_expr(span);
         }
-        let ftys = self.p.variant_fields(a, &gargs, v as usize);
+        let ftys = self.p.fields_of(a, &gargs, Some(v));
         if args.len() != ftys.len() {
             self.err(Diagnostic::new(
                 codes::E0301,
@@ -593,7 +718,7 @@ impl<'p> Checker<'p> {
                     "`{}` holds {} value{}, but {} were given",
                     variant.name,
                     ftys.len(),
-                    if ftys.len() == 1 { "" } else { "s" },
+                    wrela_diag::plural(ftys.len()),
                     args.len()
                 ),
             ));
@@ -609,9 +734,7 @@ impl<'p> Checker<'p> {
                             "a variant's values are positional",
                         ));
                     }
-                    let e = self.check_expr(&arg.value, Some(*ft));
-                    self.expect(e.ty, *ft, e.span);
-                    fields.push(e);
+                    fields.push(self.check_expect(&arg.value, *ft));
                 }
                 None => fields.push(self.error_expr(span)),
             }
@@ -663,54 +786,60 @@ impl<'p> Checker<'p> {
                     "`{}` takes {} argument{}, not {}",
                     b.name(),
                     b.arity(),
-                    if b.arity() == 1 { "" } else { "s" },
+                    wrela_diag::plural(b.arity()),
                     xs.len()
                 ),
             ));
             return self.error_expr(span);
         }
-        // Literals: unify each literal with the first concrete argument of the same role.
+        // Literals take the type of the first concrete argument of the same role (all but
+        // `select`'s condition): a vector's own type, unless the built-in broadcasts a scalar
+        // across it; else that argument's scalar type.
         let concrete = xs.iter().map(|x| x.ty).find(|&t| !matches!(self.kind(t), TyKind::Var(_)));
-        let same_role = |i: usize| match b {
-            BuiltinFn::Select => i < 2,
-            BuiltinFn::Mix | BuiltinFn::Smoothstep => true,
-            _ => true,
-        };
-        for (i, x) in xs.iter().enumerate() {
-            if !same_role(i) {
-                continue;
-            }
-            if let TyKind::Var(_) = self.kind(x.ty) {
-                let target = match concrete {
-                    Some(t) => builtins::scalar_of(&self.p.types, t),
-                    None => continue,
-                };
-                let t = if matches!(self.kind(concrete.unwrap_or(target)), TyKind::Vec(_))
-                    && !matches!(
-                        b,
-                        BuiltinFn::Mix
-                            | BuiltinFn::Smoothstep
-                            | BuiltinFn::Step
-                            | BuiltinFn::Clamp
-                            | BuiltinFn::Min
-                            | BuiltinFn::Max
-                    ) {
-                    concrete.unwrap_or(target)
-                } else {
-                    target
-                };
-                let _ = self.infer.unify(&self.p.types, x.ty, t);
+        if let Some(c) = concrete {
+            let broadcasts = matches!(
+                b,
+                BuiltinFn::Mix
+                    | BuiltinFn::Smoothstep
+                    | BuiltinFn::Step
+                    | BuiltinFn::Clamp
+                    | BuiltinFn::Min
+                    | BuiltinFn::Max
+            );
+            let target = if matches!(self.kind(c), TyKind::Vec(_)) && !broadcasts {
+                c
+            } else {
+                builtins::scalar_of(&self.p.types, c)
+            };
+            for (i, x) in xs.iter().enumerate() {
+                let same_role = b != BuiltinFn::Select || i < 2;
+                if same_role && matches!(self.kind(x.ty), TyKind::Var(_)) {
+                    let _ = self.infer.unify(&self.p.types, x.ty, target);
+                }
             }
         }
-        // Remaining literals default: float builtins want f32.
-        for x in &xs {
-            if let Some(k) = self.infer.var_kind(&self.p.types, x.ty) {
-                let t = if b.wants_float() || k == VarKind::Float {
-                    self.p.types.f32
-                } else {
-                    self.p.types.i32
-                };
-                let _ = self.infer.unify(&self.p.types, x.ty, t);
+        // Literals of the same role agree with each other, as they do under `+`: `max(0, 0.5)`
+        // is a float.
+        let mut first: Option<TyId> = None;
+        for (i, x) in xs.iter().enumerate() {
+            if (b == BuiltinFn::Select && i >= 2) || !self.is_number_var(x.ty) {
+                continue;
+            }
+            match first {
+                Some(f) => {
+                    let _ = self.try_unify(f, x.ty);
+                }
+                None => first = Some(x.ty),
+            }
+        }
+        // A float built-in makes an integer literal a float one (`sqrt(4)`). Otherwise literals
+        // stay open, as under operators: `let n = 7; min(n, 3); let k: u32 = n` is fine.
+        if b.wants_float() {
+            for x in &xs {
+                if self.infer.var_kind(&self.p.types, x.ty) == Some(VarKind::Int) {
+                    let f = self.new_var(VarKind::Float, x.span);
+                    let _ = self.infer.unify(&self.p.types, x.ty, f);
+                }
             }
         }
         // A scalar literal next to a vector broadcasts for min/max/clamp/step/smoothstep.
@@ -742,8 +871,22 @@ impl<'p> Checker<'p> {
         if tys.iter().any(|&t| matches!(self.p.types.kind(t), TyKind::Error)) {
             return self.error_expr(span);
         }
-        match b.result(&self.p.types, &tys) {
-            Ok(ty) => {
+        // Open literals are checked as their default types now, and as the types they settle
+        // on once the body is checked. A result that is an open argument's type stays open.
+        let shown: Vec<TyId> = tys.iter().map(|&t| self.literal_defaults(t)).collect();
+        let open = shown != tys;
+        match b.result(self.p, &shown) {
+            Ok(r) => {
+                let ty = if open {
+                    self.builtin_calls.push((b, tys.clone(), span));
+                    let same = tys.iter().zip(&shown).find(|&(&t, &d)| d == r && t != d);
+                    same.map_or(r, |(&t, _)| t)
+                } else {
+                    r
+                };
+                if b.cpu_impl().is_some() && ty == self.p.types.f64 {
+                    self.err(crate::builtins::f64_math(b.name(), span));
+                }
                 let modes = vec![Mode::Borrow; xs.len()];
                 let n_args = xs.len();
                 Expr {
@@ -766,6 +909,17 @@ impl<'p> Checker<'p> {
         }
     }
 
+    /// `t` with each number literal type not settled yet replaced by its default: `i32` for an
+    /// integer, `f32` for a float.
+    pub(crate) fn literal_defaults(&self, t: TyId) -> TyId {
+        let t = self.infer.resolve(&self.p.types, t);
+        self.p.types.map(t, &mut |types, x| match self.infer.var_kind(types, x) {
+            Some(VarKind::Int) => Some(types.i32),
+            Some(VarKind::Float) => Some(types.f32),
+            _ => None,
+        })
+    }
+
     /// `f32(x)` and friends convert; `vec3(...)` and `mat3(...)` construct.
     fn call_type(&mut self, t: BuiltinTy, args: &[ast::Arg], span: Span) -> Expr {
         let ty = t.ty(&self.p.types);
@@ -783,9 +937,7 @@ impl<'p> Checker<'p> {
                 }
                 let mut cols = Vec::new();
                 for a in args {
-                    let e = self.check_expr(&a.value, Some(col));
-                    self.expect(e.ty, col, e.span);
-                    cols.push(e);
+                    cols.push(self.check_expect(&a.value, col));
                 }
                 Expr { ty, span, kind: ExprKind::Construct(cols) }
             }
@@ -815,11 +967,7 @@ impl<'p> Checker<'p> {
                     }
                 }
                 // A number whose type isn't settled yet defaults like any other.
-                let number_var = matches!(
-                    self.infer.var_kind(&self.p.types, x.ty),
-                    Some(VarKind::Int | VarKind::Float)
-                );
-                let ok = number_var
+                let ok = self.is_number_var(x.ty)
                     || matches!(
                         self.kind(x.ty),
                         TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Error
@@ -848,6 +996,7 @@ impl<'p> Checker<'p> {
         if args.iter().any(|a| a.name.is_some()) {
             let names = ["x", "y", "z", "w"];
             let mut comps: Vec<Option<Expr>> = vec![None; n as usize];
+            let mut written = Vec::new();
             for a in args {
                 let Some(name) = &a.name else {
                     self.err(Diagnostic::new(
@@ -865,15 +1014,19 @@ impl<'p> Checker<'p> {
                     ));
                     continue;
                 };
-                let e = self.check_expr(&a.value, Some(f32));
-                self.expect(e.ty, f32, e.span);
+                let e = self.check_expect(&a.value, f32);
+                if comps[i].is_some() {
+                    self.err(Diagnostic::new(
+                        codes::E0304,
+                        name.span,
+                        format!("`{}` is given twice", name.name),
+                    ));
+                    continue;
+                }
                 comps[i] = Some(e);
+                written.push(i);
             }
-            let xs = comps
-                .into_iter()
-                .map(|c| c.unwrap_or(Expr { ty: f32, span, kind: ExprKind::Lit(Lit::Float(0.0)) }))
-                .collect();
-            return Expr { ty, span, kind: ExprKind::Construct(xs) };
+            return self.construct_in_order(ty, comps, &written, span);
         }
         if args.is_empty() {
             let xs = (0..n)
@@ -886,7 +1039,7 @@ impl<'p> Checker<'p> {
         for a in args {
             let e = self.check_expr(&a.value, if args.len() == 1 { None } else { Some(f32) });
             match self.kind(e.ty) {
-                TyKind::Vec(m) => count += m as u32,
+                TyKind::Vec(m) => count += u32::from(*m),
                 TyKind::Float(FloatTy::F32) => count += 1,
                 TyKind::Var(_) => {
                     let _ = self.infer.unify(&self.p.types, e.ty, f32);
@@ -918,6 +1071,40 @@ impl<'p> Checker<'p> {
         Expr { ty, span, kind: ExprKind::Construct(xs) }
     }
 
+    /// A vector from named components, evaluated in the order written (`written`, by index
+    /// into `comps`); a component not given is zero. Components written out of their order
+    /// that aren't literal values are bound first, in a block: `{ let a = z; let b = x;
+    /// vec3(b, 0.0, a) }`.
+    fn construct_in_order(
+        &mut self,
+        ty: TyId,
+        comps: Vec<Option<Expr>>,
+        written: &[usize],
+        span: Span,
+    ) -> Expr {
+        let f32 = self.p.types.f32;
+        let zero = Expr { ty: f32, span, kind: ExprKind::Lit(Lit::Float(0.0)) };
+        let pure = |e: &Option<Expr>| e.as_ref().is_none_or(|e| zonk::non_literal(e).is_none());
+        if written.is_sorted() || comps.iter().filter(|c| !pure(c)).count() < 2 {
+            let xs = comps.into_iter().map(|c| c.unwrap_or_else(|| zero.clone())).collect();
+            return Expr { ty, span, kind: ExprKind::Construct(xs) };
+        }
+        let mut comps: Vec<Option<Expr>> = comps;
+        let mut stmts = Vec::new();
+        for &i in written {
+            let Some(e) = comps[i].take() else { continue };
+            let at = e.span;
+            let l = self.declare_unnamed(f32, LocalKind::Owned { mutable: false }, at);
+            let pat = Pat { ty: f32, kind: PatKind::Bind(l), span: at };
+            stmts.push(Stmt { kind: StmtKind::Bind { pat, init: e }, span: at });
+            comps[i] = Some(Expr { ty: f32, span: at, kind: ExprKind::Local(l) });
+        }
+        let xs = comps.into_iter().map(|c| c.unwrap_or_else(|| zero.clone())).collect();
+        let tail = Expr { ty, span, kind: ExprKind::Construct(xs) };
+        let block = Block { stmts, tail: Some(Box::new(tail)), ty, span };
+        Expr { ty, span, kind: ExprKind::Block(block) }
+    }
+
     /// `Type::name(...)`: an associated function (inherent or from a trait the type has), or a
     /// variant of an enum named through a type parameter.
     fn call_type_relative(
@@ -929,7 +1116,7 @@ impl<'p> Checker<'p> {
         expected: Option<TyId>,
         span: Span,
     ) -> Expr {
-        if let TyKind::Adt(a, _) = self.kind(ty)
+        if let &TyKind::Adt(a, _) = self.kind(ty)
             && let Some(v) = self.p.adt(a).variants().iter().position(|v| v.name == name.name)
         {
             let path = ast::Path {
@@ -944,12 +1131,11 @@ impl<'p> Checker<'p> {
             return self.call_fn(f, gargs, None, args, expected, span);
         }
         // A trait's function, through a type that has the trait.
-        let traits = self.traits_with_method(ty, &name.name);
-        if let [(t, trait_args)] = traits.as_slice()
+        let traits = self.traits_with_method(ty, &name.name, name.span);
+        if let [(t, trait_args, unsure)] = traits.as_slice()
             && let Some(m) = traits::trait_method(self.p, *t, &name.name)
         {
-            let def = self.p.func(m);
-            if def.has_self() {
+            if self.p.func(m).has_self() {
                 self.err(Diagnostic::new(
                     codes::E0207,
                     name.span,
@@ -960,28 +1146,11 @@ impl<'p> Checker<'p> {
                 ));
                 return self.error_expr(span);
             }
-            let method_args = self.method_generic_args(m, generics, span);
-            let (params, ret) = self.trait_method_sig(m, ty, trait_args, &method_args);
-            let fname = format!("{}::{}", self.p.display_ty(ty), name.name);
-            let (call_args, modes, order) = self.match_args(&fname, &params, None, args, span, m);
-            let callee = Callee::TraitMethod {
-                method: m,
-                self_ty: ty,
-                trait_args: trait_args.clone(),
-                method_args,
-            };
-            return Expr {
-                ty: ret,
-                span,
-                kind: ExprKind::Call(Call {
-                    callee,
-                    args: call_args,
-                    modes,
-                    order,
-                    receiver: false,
-                    ret_mode: def.ret_mode,
-                }),
-            };
+            let r = TraitRef { trait_: *t, args: trait_args.clone() };
+            if *unsure {
+                self.trait_obligation(ty, &r, span, &name.name);
+            }
+            return self.call_trait_method(m, ty, r.args, generics, None, args, span);
         }
         let shown = self.display(ty);
         self.err(Diagnostic::new(
@@ -994,30 +1163,63 @@ impl<'p> Checker<'p> {
 
     /// An inherent method of `ty` named `name`, and the impl's arguments for `ty`.
     fn find_inherent(&mut self, ty: TyId, name: &str, span: Span) -> Option<(FnId, Vec<TyId>)> {
+        let p = self.p;
         let TyKind::Adt(a, _) = self.kind(ty) else { return None };
-        let impls = self.p.inherent_impls.get(&a).cloned().unwrap_or_default();
-        for i in impls {
-            let imp = self.p.impl_(i);
-            let Some(f) = imp.methods.iter().copied().find(|&f| self.p.func(f).name == name) else {
+        for &i in p.inherent_impls.get(a).into_iter().flatten() {
+            let imp = p.impl_(i);
+            let Some(f) = imp.methods.iter().copied().find(|&f| p.func(f).name == name) else {
                 continue;
             };
             let vars: Vec<TyId> =
                 imp.generics.iter().map(|_| self.new_var(VarKind::General, span)).collect();
             let subst = Subst::from_pairs(&imp.generics, &vars);
-            let self_ty = self.p.types.subst(imp.self_ty, &subst);
+            let self_ty = p.types.subst(imp.self_ty, &subst);
             if self.try_unify(self_ty, ty) {
+                let def = p.func(f);
+                if !def.public && def.module != self.scope.module {
+                    let m = p.module(def.module).name();
+                    self.err(
+                        Diagnostic::new(
+                            codes::E0203,
+                            span,
+                            format!("`{name}` is private to `{m}`"),
+                        )
+                        .with_secondary(def.name_span, "declared here without `pub`")
+                        .with_help(format!("mark it `pub` in `{m}` to use it here")),
+                    );
+                }
                 return Some((f, vars));
             }
         }
         None
     }
 
-    /// The traits (with arguments) through which `ty` has a method `name`.
-    fn traits_with_method(&mut self, ty: TyId, name: &str) -> Vec<(TraitId, Vec<TyId>)> {
+    /// Whether code being checked can see trait `t`: it's `pub`, or this module's own.
+    fn trait_visible(&self, t: TraitId) -> bool {
+        let tr = self.p.trait_(t);
+        tr.public || tr.module == self.scope.module
+    }
+
+    /// `ty` must implement `r`, the trait a call of its method `name` was found through, when
+    /// lookup couldn't tell (see [`Self::traits_with_method`]).
+    fn trait_obligation(&mut self, ty: TyId, r: &TraitRef, span: Span, name: &str) {
+        let why = format!("calling `{}::{name}`", self.p.trait_(r.trait_).name);
+        self.obligation(ty, r.clone(), span, why);
+    }
+
+    /// The traits (with arguments) through which `ty` has a method `name`; and for each,
+    /// whether that's still unsure: its arguments are variables, or `ty` holds a literal's, so
+    /// whether `ty` has the trait is checked once the body's types are known.
+    fn traits_with_method(
+        &mut self,
+        ty: TyId,
+        name: &str,
+        span: Span,
+    ) -> Vec<(TraitId, Vec<TyId>, bool)> {
         let ty = self.infer.resolve(&self.p.types, ty);
-        let mut out = Vec::new();
-        let declared = match self.p.types.kind(ty).clone() {
-            TyKind::Param(id) => Some(resolve::param_bounds_closure(self.p, id)),
+        let mut out: Vec<(TraitId, Vec<TyId>, bool)> = Vec::new();
+        let declared = match self.p.types.kind(ty) {
+            TyKind::Param(id) => Some(resolve::param_bounds_closure(self.p, *id)),
             TyKind::Opaque(..) | TyKind::Projection { .. } => {
                 // Reuse the solver's view of declared bounds by probing each trait.
                 let mut v = Vec::new();
@@ -1041,78 +1243,74 @@ impl<'p> Checker<'p> {
             Some(bounds) => {
                 for b in bounds {
                     if traits::trait_method(self.p, b.trait_, name).is_some()
-                        && !out.iter().any(|(t, _)| *t == b.trait_)
+                        && !out.iter().any(|(t, ..)| *t == b.trait_)
                     {
-                        out.push((b.trait_, b.args.clone()));
+                        out.push((b.trait_, b.args.clone(), false));
                     }
                 }
             }
             None => {
-                if self.p.types.has_vars(ty) {
-                    return out;
-                }
+                let has_vars = self.p.types.has_vars(ty);
                 for t in 0..self.p.traits.len() {
                     let tid = TraitId(t as u32);
-                    if traits::trait_method(self.p, tid, name).is_none() {
+                    if !self.trait_visible(tid) || traits::trait_method(self.p, tid, name).is_none()
+                    {
                         continue;
                     }
-                    let impls = self.p.impls_of_trait.get(&tid).cloned().unwrap_or_default();
-                    for i in impls {
-                        let imp = self.p.impl_(i);
-                        let mut subst = Subst::new();
-                        if !traits::match_ty(self.p, imp.self_ty, ty, &imp.generics, &mut subst) {
+                    // The trait's arguments: an impl's, when one applies. A type that still
+                    // holds a literal's variable (`W<{float}>`) has the trait if an impl could
+                    // be for it, and impls for several arguments (`Scale<f32>`, `Scale<u32>`)
+                    // leave the choice to inference: then they're variables.
+                    let known = if has_vars {
+                        let could = self
+                            .p
+                            .impls_of(tid)
+                            .iter()
+                            .any(|&i| traits::could_unify(self.p, self.p.impl_(i).self_ty, ty));
+                        if !could {
                             continue;
                         }
-                        let args: Vec<TyId> = imp
-                            .trait_ref
-                            .as_ref()
-                            .map(|r| {
-                                r.args.iter().map(|&a| self.p.types.subst(a, &subst)).collect()
-                            })
-                            .unwrap_or_default();
-                        if traits::implements(
-                            self.p,
-                            ty,
-                            &TraitRef { trait_: tid, args: args.clone() },
-                        ) && !out.iter().any(|(x, _)| *x == tid)
-                        {
-                            out.push((tid, args));
+                        None
+                    } else {
+                        match traits::impl_args(self.p, ty, tid).as_slice() {
+                            [] => continue,
+                            [args] => Some(args.clone()),
+                            _ => None,
                         }
-                    }
+                    };
+                    let unsure = known.is_none();
+                    let args = known.unwrap_or_else(|| {
+                        let n = self.p.trait_(tid).generics.len();
+                        (0..n).map(|_| self.new_var(VarKind::General, span)).collect()
+                    });
+                    out.push((tid, args, unsure));
                 }
             }
         }
         out
     }
 
-    /// A trait method's parameters and return type for a given `Self`, trait and method args.
+    /// A trait method's parameters and return type for a given `Self`, trait and method args;
+    /// and the substitution that gives them.
     fn trait_method_sig(
-        &mut self,
+        &self,
         m: FnId,
         self_ty: TyId,
         trait_args: &[TyId],
         method_args: &[TyId],
-    ) -> (Vec<CallParam>, TyId) {
+    ) -> (Vec<CallParam<'p>>, TyId, Subst) {
         let def = self.p.func(m);
-        let FnOwner::Trait(t) = def.owner else { return (Vec::new(), self.p.types.error) };
+        let FnOwner::Trait(t) = def.owner else {
+            return (Vec::new(), self.p.types.error, Subst::new());
+        };
         let tr = self.p.trait_(t);
         let mut subst = Subst::from_pairs(&tr.generics, trait_args);
         subst.insert(tr.self_param, self_ty);
         for (g, &a) in def.generics.iter().zip(method_args) {
             subst.insert(*g, a);
         }
-        let params = def
-            .params
-            .iter()
-            .map(|p| {
-                let ty = self.p.types.subst(p.ty, &subst);
-                let ty = traits::normalize(self.p, ty, None);
-                CallParam { name: p.name.clone(), mode: p.mode, ty, default: p.default.clone() }
-            })
-            .collect();
-        let ret = self.p.types.subst(def.ret, &subst);
-        let ret = traits::normalize(self.p, ret, None);
-        (params, ret)
+        let (params, ret) = self.sig_under(m, &subst);
+        (params, ret, subst)
     }
 
     // ---- methods ---------------------------------------------------------------------------
@@ -1130,6 +1328,17 @@ impl<'p> Checker<'p> {
         let rt = self.shallow(recv.ty);
         if matches!(self.p.types.kind(rt), TyKind::Error) {
             return self.failed_call(args, span);
+        }
+        // A built-in method on a literal (`x.sqrt()` after `let x = 2.0`) leaves its type open,
+        // as `sqrt(x)` does, unless a trait has a method of that name.
+        if self.is_number_var(rt)
+            && generics.is_none()
+            && let Some(b) = BuiltinFn::lookup_method(&name.name)
+            && b != BuiltinFn::Len
+            && !(0..self.p.traits.len())
+                .any(|t| traits::trait_method(self.p, TraitId(t as u32), &name.name).is_some())
+        {
+            return self.call_builtin(b, Some(recv), args, span);
         }
         if matches!(self.p.types.kind(rt), TyKind::Var(_)) {
             match self.infer.var_kind(&self.p.types, rt) {
@@ -1158,18 +1367,22 @@ impl<'p> Checker<'p> {
         let pick = if let Some((f, impl_args)) = self.find_inherent(rt, &name.name, name.span) {
             Some(Pick::Inherent(f, impl_args))
         } else {
-            let mut traits = self.traits_with_method(rt, &name.name);
+            let mut traits = self.traits_with_method(rt, &name.name, name.span);
             match traits.len() {
                 0 => None,
                 1 => {
-                    let (t, trait_args) = traits.remove(0);
+                    let (t, trait_args, unsure) = traits.remove(0);
+                    let r = TraitRef { trait_: t, args: trait_args };
+                    if unsure {
+                        self.trait_obligation(rt, &r, recv.span, &name.name);
+                    }
                     traits::trait_method(self.p, t, &name.name)
-                        .map(|method| Pick::Trait { method, trait_args })
+                        .map(|method| Pick::Trait { method, trait_args: r.args })
                 }
                 _ => {
                     let names: Vec<String> = traits
                         .iter()
-                        .map(|(t, _)| format!("`{}`", self.p.trait_(*t).name))
+                        .map(|(t, ..)| format!("`{}`", self.p.trait_(*t).name))
                         .collect();
                     self.err(
                         Diagnostic::new(
@@ -1214,12 +1427,12 @@ impl<'p> Checker<'p> {
                 name.span,
                 format!("`{shown}` has no method `{}`", name.name),
             );
-            if let TyKind::Adt(a, _) = self.kind(rt)
+            if let &TyKind::Adt(a, _) = self.kind(rt)
                 && self.p.adt(a).fields().iter().any(|f| f.name == name.name)
             {
                 d = d.with_note(format!("`{}` is a field; a field can't be called", name.name));
-            } else if let TyKind::Param(p) = self.kind(rt) {
-                let pname = self.p.param(p).name.clone();
+            } else if let &TyKind::Param(p) = self.kind(rt) {
+                let pname = &self.p.param(p).name;
                 d = d.with_help(format!("add a bound that has `{}`: `{pname}: Trait`", name.name));
             }
             let names = self.method_names(rt);
@@ -1240,7 +1453,7 @@ impl<'p> Checker<'p> {
         explicit: Option<&[ast::TypeExpr]>,
         span: Span,
     ) -> Vec<TyId> {
-        let own = self.p.func(f).generics.clone();
+        let own = &self.p.func(f).generics;
         let fresh = |this: &mut Self| -> Vec<TyId> {
             own.iter().map(|_| this.new_var(VarKind::General, span)).collect()
         };
@@ -1249,17 +1462,9 @@ impl<'p> Checker<'p> {
         let declared: Vec<usize> =
             (0..own.len()).filter(|&i| !self.p.param(own[i]).name.starts_with("impl ")).collect();
         if given.len() != declared.len() {
-            self.err(Diagnostic::new(
-                codes::E0322,
-                span,
-                format!(
-                    "`{}` takes {} generic argument{}, not {}",
-                    self.p.func(f).name,
-                    declared.len(),
-                    if declared.len() == 1 { "" } else { "s" },
-                    given.len()
-                ),
-            ));
+            let (name, want) = (&self.p.func(f).name, declared.len());
+            let s = wrela_diag::plural(want);
+            self.err(resolve::wrong_generic_count(span, name, want, given.len(), s));
             return fresh(self);
         }
         let mut out: Vec<Option<TyId>> = vec![None; own.len()];
@@ -1287,7 +1492,7 @@ impl<'p> Checker<'p> {
         match pick {
             Pick::Inherent(f, impl_args) => {
                 if !self.p.func(f).has_self() {
-                    let n = self.p.func(f).name.clone();
+                    let n = &self.p.func(f).name;
                     let shown = self.display(rt);
                     self.err(Diagnostic::new(
                         codes::E0207,
@@ -1311,47 +1516,8 @@ impl<'p> Checker<'p> {
                     ));
                     return self.error_expr(span);
                 }
-                let method_args = self.method_generic_args(method, generics, span);
-                let (params, ret) = self.trait_method_sig(method, rt, &trait_args, &method_args);
-                // Bounds on the method's own generics.
-                let FnOwner::Trait(tr) = def.owner else {
-                    unreachable!("a trait pick is a trait's method")
-                };
-                let mut subst = Subst::from_pairs(&self.p.trait_(tr).generics.clone(), &trait_args);
-                subst.insert(self.p.trait_(tr).self_param, rt);
-                for (g, &a) in def.generics.iter().zip(&method_args) {
-                    subst.insert(*g, a);
-                }
-                for (g, &a) in def.generics.iter().zip(&method_args) {
-                    let bounds = self.p.param(*g).bounds.clone();
-                    for b in bounds {
-                        let bargs = b.args.iter().map(|&x| self.p.types.subst(x, &subst)).collect();
-                        let pname = self.p.param(*g).name.clone();
-                        self.obligation(
-                            a,
-                            TraitRef { trait_: b.trait_, args: bargs },
-                            span,
-                            format!("`{pname}` in `{}`", def.name),
-                        );
-                    }
-                }
                 self.receiver_mode_check(method, &recv);
-                let fname = format!("{}::{}", self.p.trait_(tr).name, def.name);
-                let (call_args, modes, order) =
-                    self.match_args(&fname, &params, Some(recv), args, span, method);
-                let callee = Callee::TraitMethod { method, self_ty: rt, trait_args, method_args };
-                Expr {
-                    ty: ret,
-                    span,
-                    kind: ExprKind::Call(Call {
-                        callee,
-                        args: call_args,
-                        modes,
-                        order,
-                        receiver: true,
-                        ret_mode: def.ret_mode,
-                    }),
-                }
+                self.call_trait_method(method, rt, trait_args, generics, Some(recv), args, span)
             }
             Pick::Builtin(b) => self.call_builtin(b, Some(recv), args, span),
             Pick::Clone => {
@@ -1384,6 +1550,49 @@ impl<'p> Checker<'p> {
         }
     }
 
+    /// A call of trait method `method` for `Self = self_ty`, as a method on `recv` or as
+    /// `Type::method(...)`: its arguments matched, and its own generics' bounds obligations.
+    #[allow(clippy::too_many_arguments)]
+    fn call_trait_method(
+        &mut self,
+        method: FnId,
+        self_ty: TyId,
+        trait_args: Vec<TyId>,
+        generics: Option<&[ast::TypeExpr]>,
+        recv: Option<Expr>,
+        args: &[ast::Arg],
+        span: Span,
+    ) -> Expr {
+        let def = self.p.func(method);
+        let FnOwner::Trait(tr) = def.owner else { unreachable!("a trait method is a trait's") };
+        let method_args = self.method_generic_args(method, generics, span);
+        let (params, ret, subst) =
+            self.trait_method_sig(method, self_ty, &trait_args, &method_args);
+        let (params, ret) = self.defer_projections(method, params, ret, span);
+        let spans = vec![span; def.generics.len()];
+        self.bound_obligations(&def.generics, &method_args, &subst, &spans, &def.name);
+        let fname = match recv {
+            Some(_) => format!("{}::{}", self.p.trait_(tr).name, def.name),
+            None => format!("{}::{}", self.p.display_ty(self_ty), def.name),
+        };
+        let receiver = recv.is_some();
+        let (call_args, modes, order) = self.match_args(&fname, &params, recv, args, span, method);
+        self.settle_projections(false);
+        let callee = Callee::TraitMethod { method, self_ty, trait_args, method_args };
+        Expr {
+            ty: ret,
+            span,
+            kind: ExprKind::Call(Call {
+                callee,
+                args: call_args,
+                modes,
+                order,
+                receiver,
+                ret_mode: def.ret_mode,
+            }),
+        }
+    }
+
     /// A `mut self` method needs a mutable receiver; that's the memory checker's job, but
     /// marking the receiver as written here records the closure capture correctly.
     fn receiver_mode_check(&mut self, f: FnId, recv: &Expr) {
@@ -1394,8 +1603,9 @@ impl<'p> Checker<'p> {
 
     // ---- GPU intrinsics --------------------------------------------------------------------
 
-    /// The entry point a `dispatch`/`draw` argument names.
-    fn entry_arg(&mut self, a: &ast::Arg, want: &[Entry], what: &str) -> Option<(FnId, Vec<TyId>)> {
+    /// The entry point of stage `want` that a `dispatch`/`draw` argument names.
+    fn entry_arg(&mut self, a: &ast::Arg, want: Entry) -> Option<(FnId, Vec<TyId>)> {
+        let what = want.describe();
         let ast::ExprKind::Path(path) = &a.value.kind else {
             self.err(Diagnostic::new(
                 codes::E0603,
@@ -1407,11 +1617,10 @@ impl<'p> Checker<'p> {
         match self.resolve_value_path(path) {
             Some(ValueRes::Item(Res::Fn(f))) => {
                 let entry = self.p.func(f).attrs.entry.map(|e| e.0);
-                let ok = entry.is_some_and(|e| {
-                    want.iter().any(|w| std::mem::discriminant(w) == std::mem::discriminant(&e))
-                });
+                let ok = entry
+                    .is_some_and(|e| std::mem::discriminant(&want) == std::mem::discriminant(&e));
                 if !ok {
-                    let n = self.p.func(f).name.clone();
+                    let n = &self.p.func(f).name;
                     self.err(
                         Diagnostic::new(codes::E0603, a.value.span, format!("`{n}` isn't {what}"))
                             .with_secondary(self.p.func(f).sig_span, "declared here"),
@@ -1440,32 +1649,34 @@ impl<'p> Checker<'p> {
 
     /// The methods a value of type `t` has: its inherent ones, and those of every trait it
     /// implements (or, for a generic parameter, of its bounds). For suggestions.
-    fn method_names(&mut self, t: TyId) -> Vec<String> {
+    fn method_names(&self, t: TyId) -> Vec<String> {
+        let p = self.p;
         let mut out = Vec::new();
         if let TyKind::Adt(a, _) = self.kind(t)
-            && let Some(impls) = self.p.inherent_impls.get(&a).cloned()
+            && let Some(impls) = p.inherent_impls.get(a)
         {
-            for i in impls {
-                for f in self.p.impl_(i).methods.clone() {
-                    out.push(self.p.func(f).name.clone());
+            for &i in impls {
+                for &f in &p.impl_(i).methods {
+                    out.push(p.func(f).name.clone());
                 }
             }
         }
         let traits: Vec<TraitId> = match self.kind(t) {
-            TyKind::Param(p) => {
-                resolve::param_bounds_closure(self.p, p).into_iter().map(|r| r.trait_).collect()
+            TyKind::Param(param) => {
+                resolve::param_bounds_closure(p, *param).into_iter().map(|r| r.trait_).collect()
             }
-            _ => (0..self.p.traits.len() as u32)
+            _ => (0..p.traits.len() as u32)
                 .map(TraitId)
                 .filter(|&tr| {
-                    self.p.trait_(tr).generics.is_empty()
-                        && traits::implements(self.p, t, &TraitRef { trait_: tr, args: Vec::new() })
+                    self.trait_visible(tr)
+                        && p.trait_(tr).generics.is_empty()
+                        && traits::implements(p, t, &TraitRef { trait_: tr, args: Vec::new() })
                 })
                 .collect(),
         };
         for tr in traits {
-            for f in self.p.trait_(tr).methods.clone() {
-                out.push(self.p.func(f).name.clone());
+            for &f in &p.trait_(tr).methods {
+                out.push(p.func(f).name.clone());
             }
         }
         out
@@ -1477,10 +1688,10 @@ impl<'p> Checker<'p> {
         let gpu_buffer = self.p.lang_adt(Lang::GpuBuffer);
         match self.kind(param_ty) {
             TyKind::Slice(t) => {
-                gpu_buffer.map_or(self.p.types.error, |g| self.p.types.adt(g, vec![t]))
+                gpu_buffer.map_or(self.p.types.error, |g| self.p.types.adt(g, vec![*t]))
             }
-            TyKind::Adt(a, args) if self.p.is_lang_adt(a, Lang::Slots) => {
-                gpu_buffer.map_or(self.p.types.error, |g| self.p.types.adt(g, args))
+            TyKind::Adt(a, args) if self.p.is_lang_adt(*a, Lang::Slots) => {
+                gpu_buffer.map_or(self.p.types.error, |g| self.p.types.adt(g, args.clone()))
             }
             _ => param_ty,
         }
@@ -1496,9 +1707,7 @@ impl<'p> Checker<'p> {
             ));
             return self.error_expr(span);
         };
-        let Some((kernel, kernel_args)) =
-            self.entry_arg(first, &[Entry::Compute([1, 1, 1])], "a `@compute` kernel")
-        else {
+        let Some((kernel, kernel_args)) = self.entry_arg(first, Entry::Compute([1, 1, 1])) else {
             for a in &args[1..] {
                 self.check_expr(&a.value, None);
             }
@@ -1506,26 +1715,32 @@ impl<'p> Checker<'p> {
         };
         let (params, _, _) = self.fn_params(kernel, &kernel_args);
         self.fn_obligations(kernel, &kernel_args, span);
-        let kname = self.p.func(kernel).name.clone();
+        let kname = &self.p.func(kernel).name;
         let u32_ty = self.p.types.u32;
         let mut groups: Option<Expr> = None;
         let user: Vec<(usize, CallParam)> = params
             .iter()
-            .cloned()
+            .copied()
             .enumerate()
             .filter(|(_, p)| !self.is_gpu_builtin(p.ty))
             .collect();
         let mut given: Vec<Option<Expr>> = vec![None; user.len()];
         let mut written: Vec<usize> = Vec::new();
+        let mut groups_at = 0;
         let mut next = 0usize;
         for (i, a) in args.iter().enumerate().skip(1) {
             let is_groups =
                 a.name.as_ref().is_some_and(|n| n.name == "groups") || (a.name.is_none() && i == 1);
             if is_groups {
                 let e = self.check_expr(&a.value, None);
+                if groups.is_some() {
+                    self.err(Diagnostic::new(codes::E0304, a.span, "`groups` is given twice"));
+                    continue;
+                }
+                groups_at = written.len();
                 match self.kind(e.ty) {
                     TyKind::Tuple(ts) if ts.len() == 3 => {
-                        for &t in &ts {
+                        for &t in ts {
                             self.expect(t, u32_ty, e.span);
                         }
                     }
@@ -1560,18 +1775,16 @@ impl<'p> Checker<'p> {
                 continue;
             };
             let want = self.cpu_side_type(user[k].1.ty);
-            let e = self.check_expr(&a.value, Some(want));
-            self.expect(e.ty, want, e.span);
+            let e = self.check_expect(&a.value, want);
             if given[k].is_some() {
                 self.err(Diagnostic::new(
                     codes::E0304,
                     a.span,
                     format!("`{}` is given twice", user[k].1.name),
                 ));
+                continue;
             }
-            if given[k].is_none() {
-                written.push(k);
-            }
+            written.push(k);
             given[k] = Some(e);
         }
         let Some(groups) = groups else {
@@ -1606,7 +1819,7 @@ impl<'p> Checker<'p> {
                 out.push((user[k].0, e));
             }
         }
-        let d = Dispatch { kernel, kernel_args, groups: Box::new(groups), args: out };
+        let d = Dispatch { kernel, kernel_args, groups: Box::new(groups), args: out, groups_at };
         Expr { ty: unit, span, kind: ExprKind::Dispatch(Box::new(d)) }
     }
 
@@ -1617,8 +1830,8 @@ impl<'p> Checker<'p> {
             self.err(Diagnostic::new(codes::E0603, span, "`draw` takes the vertex and fragment shaders first: `draw(vs, fs, vertices: n, ...)`"));
             return self.error_expr(span);
         }
-        let vs = self.entry_arg(&args[0], &[Entry::Vertex], "a `@vertex` shader");
-        let fs = self.entry_arg(&args[1], &[Entry::Fragment], "a `@fragment` shader");
+        let vs = self.entry_arg(&args[0], Entry::Vertex);
+        let fs = self.entry_arg(&args[1], Entry::Fragment);
         let (Some(vs), Some(fs)) = (vs, fs) else {
             for a in &args[2..] {
                 self.check_expr(&a.value, None);
@@ -1630,7 +1843,7 @@ impl<'p> Checker<'p> {
         self.fn_obligations(vs.0, &vs.1, span);
         self.fn_obligations(fs.0, &fs.1, span);
         // The uniforms: both shaders' parameters that aren't builtins or the vertex output.
-        let mut wanted: Vec<(String, TyId)> = Vec::new();
+        let mut wanted: Vec<(&str, TyId)> = Vec::new();
         for p in vparams.iter().chain(&fparams) {
             if self.is_gpu_builtin(p.ty) || self.shallow(p.ty) == self.shallow(vret) {
                 continue;
@@ -1646,12 +1859,14 @@ impl<'p> Checker<'p> {
                         ));
                     }
                 }
-                None => wanted.push((p.name.clone(), p.ty)),
+                None => wanted.push((p.name, p.ty)),
             }
         }
         let mut vertices = None;
         let mut instances = None;
+        let mut counts_at = [0; 2];
         let mut given: Vec<Option<Expr>> = vec![None; wanted.len()];
+        let mut written: Vec<usize> = Vec::new();
         for a in &args[2..] {
             let Some(n) = &a.name else {
                 self.err(
@@ -1664,19 +1879,36 @@ impl<'p> Checker<'p> {
                 );
                 continue;
             };
+            let twice = |this: &mut Self| {
+                this.err(Diagnostic::new(
+                    codes::E0304,
+                    a.span,
+                    format!("`{}` is given twice", n.name),
+                ));
+            };
             match n.name.as_str() {
                 "vertices" | "instances" => {
-                    let e = self.check_expr(&a.value, Some(u32_ty));
-                    self.expect(e.ty, u32_ty, e.span);
-                    if n.name == "vertices" { vertices = Some(e) } else { instances = Some(e) }
+                    let e = self.check_expect(&a.value, u32_ty);
+                    let (slot, at) =
+                        if n.name == "vertices" { (&mut vertices, 0) } else { (&mut instances, 1) };
+                    if slot.is_some() {
+                        twice(self);
+                        continue;
+                    }
+                    *slot = Some(e);
+                    counts_at[at] = written.len();
                 }
-                other => match wanted.iter().position(|(w, _)| w == other) {
+                other => match wanted.iter().position(|(w, _)| *w == other) {
                     Some(k) => {
                         // A buffer parameter (`[T]`) is passed a `GpuBuffer<T>`.
                         let want = self.cpu_side_type(wanted[k].1);
-                        let e = self.check_expr(&a.value, Some(want));
-                        self.expect(e.ty, want, e.span);
+                        let e = self.check_expect(&a.value, want);
+                        if given[k].is_some() {
+                            twice(self);
+                            continue;
+                        }
                         given[k] = Some(e);
+                        written.push(k);
                     }
                     None => {
                         self.err(Diagnostic::new(
@@ -1699,18 +1931,22 @@ impl<'p> Checker<'p> {
         };
         let instances =
             instances.unwrap_or(Expr { ty: u32_ty, span, kind: ExprKind::Lit(Lit::Int(1)) });
-        let mut out = Vec::new();
-        for (k, g) in given.into_iter().enumerate() {
-            match g {
-                Some(e) => out.push((wanted[k].0.clone(), e)),
-                None => self.err(Diagnostic::new(
+        for (k, g) in given.iter().enumerate() {
+            if g.is_none() {
+                self.err(Diagnostic::new(
                     codes::E0603,
                     span,
                     format!("this draw doesn't pass the shaders' `{}`", wanted[k].0),
-                )),
+                ));
             }
         }
-        let d = Draw { vertex: vs, fragment: fs, vertices, instances, args: out };
+        let mut out = Vec::new();
+        for k in written {
+            if let Some(e) = given[k].take() {
+                out.push((wanted[k].0.to_string(), e));
+            }
+        }
+        let d = Draw { vertex: vs, fragment: fs, vertices, instances, args: out, counts_at };
         Expr { ty: unit, span, kind: ExprKind::Draw(Box::new(d)) }
     }
 }
@@ -1718,9 +1954,10 @@ impl<'p> Checker<'p> {
 /// For a number literal, possibly negated or parenthesized: whether it's negative.
 fn literal_sign(e: &ast::Expr) -> Option<bool> {
     match &e.kind {
-        ast::ExprKind::Lit(ast::Lit { kind: ast::LitKind::Int | ast::LitKind::Float, .. }) => {
-            Some(false)
-        }
+        ast::ExprKind::Lit(ast::Lit {
+            kind: ast::LitKind::Int(_) | ast::LitKind::Float(_),
+            ..
+        }) => Some(false),
         ast::ExprKind::Unary(ast::UnOp::Neg, x) => literal_sign(x).map(|n| !n),
         ast::ExprKind::Paren(x) => literal_sign(x),
         _ => None,

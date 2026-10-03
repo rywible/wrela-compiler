@@ -1,0 +1,28 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0702",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [
+        "call each one in its own branch"
+      ],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "choosing between closures or functions at run time isn't supported yet",
+      "notes": [],
+      "severity": "error",
+      "span": {
+        "column": 28,
+        "end": 317,
+        "end_column": 33,
+        "end_line": 17,
+        "line": 17,
+        "start": 312
+      },
+      "title": "a construct not supported by a back end"
+    }
+  ],
+  "version": 2
+}

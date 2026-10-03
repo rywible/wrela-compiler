@@ -8,3 +8,15 @@ const SIZE: u32 = twice(32) //~ E0906
 const A: u32 = B //~ E0328
 const B: u32 = A
 const C: u32 = C //~ E0328
+
+struct P: Copy + Clone {
+    a: f32,
+    b: f32,
+}
+
+fn make() -> P {
+    P { a: 7.0, b: 8.0 }
+}
+
+// `..base` is part of the value even when every field is given.
+const D: P = P { a: 1.0, b: 2.0, ..make() } //~ E0906

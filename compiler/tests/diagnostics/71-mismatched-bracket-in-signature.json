@@ -1,0 +1,51 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0102",
+      "file": "main.wrela",
+      "fixes": [
+        {
+          "edits": [
+            {
+              "end": 120,
+              "file": "main.wrela",
+              "replacement": ")",
+              "start": 119
+            }
+          ],
+          "message": "close with `)`"
+        }
+      ],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [
+        {
+          "file": "main.wrela",
+          "message": "opened here",
+          "span": {
+            "column": 9,
+            "end": 113,
+            "end_column": 10,
+            "end_line": 4,
+            "line": 4,
+            "start": 112
+          }
+        }
+      ],
+      "message": "`]` doesn't close anything here: expected `)`",
+      "notes": [],
+      "severity": "error",
+      "span": {
+        "column": 16,
+        "end": 120,
+        "end_column": 17,
+        "end_line": 4,
+        "line": 4,
+        "start": 119
+      },
+      "title": "mismatched closing bracket"
+    }
+  ],
+  "version": 2
+}

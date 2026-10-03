@@ -1,87 +1,124 @@
-//! Shared pieces of the end-to-end tests: building a package with the compiler, and running
-//! hand-written WGSL (the spike's kernels) on the same GPU for comparison.
+//! Shared pieces of the end-to-end tests: building a package with the compiler, calling a
+//! program's exports, reading case files, and running hand-written WGSL (the spike's kernels) on
+//! the same GPU for comparison.
 //!
 //! The GPU tests are `#[ignore]`d: they need a GPU and take the GPU lock (`wrela_host::lock`).
 //! `tools/check.sh` runs them with `--ignored`.
 //!
 //! Sampled tests have two sizes: small by default, so `cargo test` stays fast, and the size the
-//! acceptance criteria name when `WRELA_FULL` is set ([`full`]), as `tools/check.sh` does.
+//! acceptance criteria name when `WRELA_FULL` is set ([`sized`]), as `tools/check.sh` does.
 
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-use wrela_host::map_read;
+use wrela_diag::{Diagnostic, Edit, FileId};
+use wrela_host::{CpuHost, Host, Value, map_read};
 
 /// SplitMix64, for tests' random inputs.
 pub use wrela_grammar::rng::Rng;
+pub use wrela_grammar::testing::{files_under, par_each, repo_root, sized};
 
-/// Whether to run sampled tests at full size (`WRELA_FULL` is set).
-pub fn full() -> bool {
-    std::env::var_os("WRELA_FULL").is_some()
-}
-
-/// `small` normally, `full` when [`full`] is set.
-pub fn sized<T>(small: T, full_size: T) -> T {
-    if full() { full_size } else { small }
-}
-
-/// Calls `f` on each item, spread over the machine's threads; `init` makes each thread's
-/// state (a host, say).
-pub fn par_each<T: Sync, S>(
-    items: &[T],
-    init: impl Fn() -> S + Sync,
-    f: impl Fn(&mut S, &T) + Sync,
-) {
-    let next = std::sync::atomic::AtomicUsize::new(0);
-    let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(items.len());
-    std::thread::scope(|s| {
-        for _ in 0..threads {
-            s.spawn(|| {
-                let mut state = init();
-                loop {
-                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let Some(item) = items.get(i) else { break };
-                    f(&mut state, item);
-                }
-            });
-        }
-    });
-}
-
-/// The repository's root.
-pub fn root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
-
-/// Builds the package in `pkg` into `out`, as `wrela build` does. On errors, returns them
-/// rendered.
-pub fn build(pkg: &Path, out: &Path) -> Result<(), String> {
+/// Builds the package in `pkg` as `wrela build` does, without writing its files: the output,
+/// or the errors rendered.
+pub fn build(pkg: &Path) -> Result<wrela_driver::Output, String> {
     let built = wrela_driver::build(pkg);
     if built.has_errors() {
         return Err(wrela_diag::render::render_all(&built.sources, &built.diagnostics));
     }
-    std::fs::create_dir_all(out).map_err(|e| e.to_string())?;
-    for (path, bytes) in &built.files {
-        std::fs::write(out.join(path), bytes).map_err(|e| e.to_string())?;
-    }
-    Ok(())
+    Ok(built)
 }
 
-/// Builds the test package `compiler/tests/<pkg>` into `out` once per test process (the
-/// tests of one binary share it), and returns `out`. Panics with the errors if it doesn't
-/// build.
-pub fn built(pkg: &str, out: PathBuf) -> PathBuf {
-    static DONE: Mutex<Option<HashSet<PathBuf>>> = Mutex::new(None);
-    // Held while building, so a second test waits for the first's build rather than racing it.
-    let mut done = DONE.lock().unwrap_or_else(|p| p.into_inner());
-    let done = done.get_or_insert_with(HashSet::new);
-    if !done.contains(&out) {
-        if let Err(e) = build(&root().join("compiler/tests").join(pkg), &out) {
-            panic!("compiler/tests/{pkg} doesn't build:\n{e}");
-        }
-        done.insert(out.clone());
+/// Builds the package in `pkg` into `out`, as `wrela build` does. Panics with the errors if it
+/// doesn't build.
+pub fn must_build(pkg: &Path, out: &Path) {
+    let built = build(pkg).unwrap_or_else(|e| panic!("{} doesn't build:\n{e}", pkg.display()));
+    built.write_to(out).expect("write the build");
+}
+
+/// Copies the files under `from` (as [`files_under`] finds them) to the same paths under `to`.
+pub fn copy_dir(from: &Path, to: &Path) {
+    for file in files_under(from, &[]) {
+        let dest = to.join(file.strip_prefix(from).expect("a file under `from`"));
+        std::fs::create_dir_all(dest.parent().expect("a parent")).expect("make a directory");
+        std::fs::copy(&file, &dest).expect("copy a file");
     }
+}
+
+/// The cases of a case-file suite: the `.wrela` files and the directories in `dir`, sorted.
+pub fn cases(dir: &Path) -> Vec<PathBuf> {
+    let mut cases: Vec<PathBuf> = std::fs::read_dir(dir)
+        .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
+        .map(|e| e.expect("a directory entry").path())
+        .filter(|p| p.is_dir() || p.extension().is_some_and(|x| x == "wrela"))
+        .collect();
+    cases.sort();
+    cases
+}
+
+/// The values of a case file's `// <key>: <value>` lines, trimmed. Only the comment block at
+/// the start of `text` is read.
+pub fn header<'a>(text: &'a str, key: &str) -> impl Iterator<Item = &'a str> {
+    let prefix = format!("// {key}:");
+    text.lines()
+        .take_while(|l| l.starts_with("//"))
+        .filter_map(move |l| l.strip_prefix(prefix.as_str()).map(str::trim))
+}
+
+/// Applies every edit of the first fix of each diagnostic to `text` (all in one file). Edits
+/// that overlap an earlier one are skipped. Used by tests that check a fix removes its
+/// diagnostic.
+pub fn apply_fixes(text: &str, file: FileId, diags: &[Diagnostic]) -> String {
+    let mut edits: Vec<&Edit> = diags
+        .iter()
+        .filter_map(|d| d.fixes.first())
+        .flat_map(|f| f.edits.iter())
+        .filter(|e| e.span.file == file)
+        .collect();
+    edits.sort_by_key(|e| (e.span.start, e.span.end));
+    let mut out = String::with_capacity(text.len());
+    let mut pos = 0usize;
+    for e in edits {
+        let (s, t) = (e.span.start as usize, e.span.end as usize);
+        if s < pos {
+            continue;
+        }
+        out.push_str(&text[pos..s]);
+        out.push_str(&e.replacement);
+        pos = t;
+    }
+    out.push_str(&text[pos..]);
     out
+}
+
+/// A loaded program whose exports a test calls: a [`CpuHost`] or a [`Host`].
+pub trait Exports {
+    fn call(&mut self, name: &str, args: &[Value]) -> wrela_host::Result<Vec<Value>>;
+}
+
+impl Exports for CpuHost {
+    fn call(&mut self, name: &str, args: &[Value]) -> wrela_host::Result<Vec<Value>> {
+        self.call_export(name, args)
+    }
+}
+
+impl Exports for Host {
+    fn call(&mut self, name: &str, args: &[Value]) -> wrela_host::Result<Vec<Value>> {
+        self.call_export(name, args)
+    }
+}
+
+/// Calls the export `name`, which must return one `f32`.
+pub fn one_f32(host: &mut impl Exports, name: &str, args: &[Value]) -> f32 {
+    match host.call(name, args).expect(name).as_slice() {
+        [Value::F32(x)] => *x,
+        other => panic!("{name} returned {other:?}"),
+    }
+}
+
+/// Calls the export `name`, which must return one `u32` (an `i32` in WASM).
+pub fn one_u32(host: &mut impl Exports, name: &str, args: &[Value]) -> u32 {
+    match host.call(name, args).expect(name).as_slice() {
+        [Value::I32(x)] => *x as u32,
+        other => panic!("{name} returned {other:?}"),
+    }
 }
 
 /// A little-endian `f32` array from bytes.
@@ -113,7 +150,7 @@ pub enum Bind<'a> {
 }
 
 /// A GPU device for running WGSL directly, with timestamps. It holds the GPU lock, like a
-/// `wrela_host::Host`, so don't make one while a host is loaded.
+/// `wrela_host::Host` (one thread can hold both; other threads wait).
 pub struct RawGpu {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -216,26 +253,10 @@ impl RawGpu {
         if let Some(e) = pollster::block_on(scope.pop()) {
             return Err(e.to_string());
         }
-        device.poll(wgpu::PollType::wait_indefinitely()).map_err(|e| e.to_string())?;
-        // Resolved in a later submission: on Metal, a resolve in the same command buffer as the
-        // passes it times can read stale values (as in wrela-host).
-        let size = u64::from(2 * reps) * 8;
-        let resolve = device.create_buffer(&wgpu::BufferDescriptor {
-            label: None,
-            size,
-            usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
+        let times = wrela_host::read_timestamps(device, queue, &queries, reps)
+            .map_err(|e| e.to_string())?;
         let mut encoder = device.create_command_encoder(&Default::default());
-        encoder.resolve_query_set(&queries, 0..2 * reps, &resolve, 0);
         let mut readbacks = Vec::new();
-        let ts = device.create_buffer(&wgpu::BufferDescriptor {
-            label: None,
-            size,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        encoder.copy_buffer_to_buffer(&resolve, 0, &ts, 0, size);
         for (b, buf) in binds.iter().zip(&buffers) {
             if let Bind::Write(n) = b {
                 let rb = device.create_buffer(&wgpu::BufferDescriptor {
@@ -249,15 +270,6 @@ impl RawGpu {
             }
         }
         queue.submit([encoder.finish()]);
-        let ticks: Vec<u64> = map_read(device, &ts)
-            .map_err(|e| e.to_string())?
-            .chunks_exact(8)
-            .map(|c| u64::from_le_bytes(c.try_into().expect("8 bytes")))
-            .collect();
-        let period = f64::from(queue.get_timestamp_period());
-        let times = (0..reps as usize)
-            .map(|r| (ticks[2 * r + 1].saturating_sub(ticks[2 * r])) as f64 * period)
-            .collect();
         let mut outs = Vec::new();
         for rb in &readbacks {
             outs.push(map_read(device, rb).map_err(|e| e.to_string())?);

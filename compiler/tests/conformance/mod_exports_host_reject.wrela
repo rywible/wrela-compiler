@@ -1,0 +1,8 @@
+// rejects: mod.use
+// The host calls `frame(time: f32, width: u32, height: u32)`, and finds the program's memory
+// under the export name `memory`.
+pub fn memory() -> f32 { //~ E0703
+    1.0
+}
+
+pub fn frame(time: f32, width: i32) {} //~ E0703

@@ -1,0 +1,30 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0703",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [
+        "drop `mut`, or make the function private (drop `pub`) if the host doesn't call it"
+      ],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "`grow` is exported from the program, so its parameters are borrowed; `x` is `mut`",
+      "notes": [
+        "the host passes each argument as a value, which has no place to change or to move from"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 13,
+        "end": 112,
+        "end_column": 23,
+        "end_line": 4,
+        "line": 4,
+        "start": 102
+      },
+      "title": "an exported function with an unsupported signature"
+    }
+  ],
+  "version": 2
+}

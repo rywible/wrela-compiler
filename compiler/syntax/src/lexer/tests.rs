@@ -10,11 +10,7 @@ fn codes_of(src: &str) -> Vec<&'static str> {
 }
 
 fn texts(src: &str) -> Vec<String> {
-    lex(FileId(0), src)
-        .tokens
-        .iter()
-        .map(|t| src[t.span.start as usize..t.span.end as usize].to_string())
-        .collect()
+    lex(FileId(0), src).tokens.iter().map(|t| src[t.span.range()].to_string()).collect()
 }
 
 #[test]
@@ -39,6 +35,34 @@ fn l3_bad_characters_are_one_error_per_run() {
     assert_eq!(codes_of("a $$ b # c"), ["E0001", "E0001"]);
     assert_eq!(codes_of("'x'"), ["E0001", "E0001"]);
     assert_eq!(kinds("a ~ b"), [T::Ident, T::Ident, T::Eof]);
+}
+
+#[test]
+fn l3_skipped_characters_keep_the_line_break() {
+    // Indented with no-break spaces, as text pasted from the web often is.
+    let src = "{\n\u{a0}\u{a0}let a = 1\n\u{a0}\u{a0}let b = a\n}";
+    assert_eq!(
+        kinds(src),
+        [
+            T::LBrace,
+            T::Let,
+            T::Ident,
+            T::Eq,
+            T::Int,
+            T::Newline,
+            T::Let,
+            T::Ident,
+            T::Eq,
+            T::Ident,
+            T::Newline,
+            T::RBrace,
+            T::Eof
+        ]
+    );
+    assert_eq!(codes_of(src), ["E0001", "E0001"]);
+    assert_eq!(kinds("a\n# b"), [T::Ident, T::Newline, T::Ident, T::Eof]);
+    // A comment after skipped characters only is on its own line.
+    assert!(lex(FileId(0), "a\n\u{a0}// c\nb").comments[0].own_line);
 }
 
 #[test]
@@ -90,6 +114,13 @@ fn l12_l13_numbers() {
     assert_eq!(texts("1. 5"), ["1", ".", "5", ""]);
     assert_eq!(kinds("15cm 2m"), [T::Suffixed, T::Suffixed, T::Eof]);
     assert_eq!(kinds("1e+5"), [T::Float, T::Eof]);
+    // An exponent or a unit takes a `.` and a digit like any decimal number: the rest of the
+    // text is then malformed (E0004), not a field access.
+    for bad in ["1e5.5", "1E5.0", "1kelvin.5", "1cm.5"] {
+        assert_eq!(texts(bad), [bad, ""], "{bad}");
+        assert_eq!(codes_of(bad), ["E0004"], "{bad}");
+    }
+    assert_eq!(texts("1e5.max(x)"), ["1e5", ".", "max", "(", "x", ")", ""]);
 }
 
 #[test]
@@ -99,6 +130,17 @@ fn l13_type_suffixes_are_e0003_with_a_fix() {
     assert_eq!(l.diagnostics[0].fixes[0].edits[0].replacement, "1.0");
     assert_eq!(l.tokens[0].kind, T::Float);
     assert_eq!(codes_of("7_u32"), ["E0003"]);
+    // `e` and `f` are hex digits: these are INTs with a type suffix, and they have values.
+    for (src, value) in [("0x1eu32", 0x1e), ("0xEu8", 0xe), ("0xffu32", 0xff), ("0x1f_i64", 0x1f)] {
+        let l = lex(FileId(0), src);
+        assert_eq!(l.tokens[0].kind, T::Int, "{src}");
+        assert_eq!(codes_of(src), ["E0003"], "{src}");
+        assert_eq!(int_value(src), IntValue::Ok(value), "{src}");
+    }
+    assert_eq!(int_value("0x1f32"), IntValue::Ok(0x1f32));
+    assert_eq!(int_value("255u32"), IntValue::Ok(255));
+    assert_eq!(float_value("1.5f32"), 1.5);
+    assert_eq!(float_value("1e2f64"), 100.0);
 }
 
 #[test]
@@ -158,8 +200,8 @@ fn l18_one_newline_per_gap_none_at_start() {
 
 #[test]
 fn l19_brackets_close_innermost_of_their_kind() {
-    // `)` closes the `(` and the `{` opened after it; the line break is then inside `(`... no:
-    // after `)` the stack is empty, so the break produces a NEWLINE.
+    // `)` closes the `(` and the `{` opened after it, so no bracket is open at the line break,
+    // and it makes a NEWLINE.
     assert_eq!(
         kinds("(a{b)\nc"),
         [T::LParen, T::Ident, T::LBrace, T::Ident, T::RParen, T::Newline, T::Ident, T::Eof]
@@ -170,10 +212,12 @@ fn l19_brackets_close_innermost_of_their_kind() {
 
 #[test]
 fn int_and_float_values() {
-    assert_eq!(int_value("1_000"), Some(1000));
-    assert_eq!(int_value("0xff"), Some(255));
-    assert_eq!(int_value("0b101"), Some(5));
-    assert_eq!(int_value("0o17"), Some(15));
-    assert_eq!(int_value("99999999999999999999999"), None);
+    assert_eq!(int_value("1_000"), IntValue::Ok(1000));
+    assert_eq!(int_value("0xff"), IntValue::Ok(255));
+    assert_eq!(int_value("0b101"), IntValue::Ok(5));
+    assert_eq!(int_value("0o17"), IntValue::Ok(15));
+    assert_eq!(int_value("7_u32"), IntValue::Ok(7));
+    assert_eq!(int_value("99999999999999999999999"), IntValue::TooLarge);
+    assert_eq!(int_value("0x"), IntValue::Malformed);
     assert_eq!(float_value("1.5e-3"), 1.5e-3);
 }

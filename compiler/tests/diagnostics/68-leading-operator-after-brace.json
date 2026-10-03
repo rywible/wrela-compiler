@@ -1,0 +1,28 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0103",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "a line can't start with the binary operator `*`",
+      "notes": [
+        "a line break ends a statement; an operator that continues an expression goes at the end of the line before (D-079)"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 5,
+        "end": 141,
+        "end_column": 6,
+        "end_line": 5,
+        "line": 5,
+        "start": 140
+      },
+      "title": "a binary operator at the start of a line"
+    }
+  ],
+  "version": 2
+}

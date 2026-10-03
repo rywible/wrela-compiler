@@ -1,0 +1,6 @@
+// mistake: a line that starts with an operator and has nothing before it to continue
+// expect: E0103
+// fix: no
+fn f(x: i32) -> i32 {
+    * x
+}

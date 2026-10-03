@@ -21,6 +21,10 @@
 //! what each wrote (the hull); `return`s are first turned into stores ([`single_exit`]) so both
 //! sides reach the join. Loops must have exits that don't depend on the input.
 //!
+//! An enum's range is a struct ([`range_ty`]): its tag's range, and each variant's payload in
+//! a field of its own, so the hull of two variants keeps both payloads (an enum's payloads
+//! share their memory on the CPU).
+//!
 //! Known limits: NaN results (from `0 × ∞`, `∞ − ∞`, or a point outside a function's domain,
 //! like `sqrt` of a negative) can't be bounded, and on the CPU a NaN bound is replaced by an
 //! infinite one at the end; on the GPU, which may assume NaNs away, they aren't. WGSL bounds
@@ -29,8 +33,8 @@
 //! traps on the CPU even if no point in the box would have taken it (a `Trap` statement itself
 //! is skipped).
 
-use super::single_exit::single_exit;
 use super::*;
+use crate::single_exit::single_exit;
 use std::collections::HashMap;
 
 type R<T> = Result<T>;
@@ -59,37 +63,36 @@ pub(super) fn interval(
         )));
     }
     let f32 = m.types.f32();
-    if func.ret != Some(f32) {
+    if func.ret != Some(f32) || func.ret_ref {
         return Err(Error::not_derivable("an interval needs a function that returns an `f32`"));
     }
     let mut mask = vec![false; func.params.len()];
     mask[xi] = true;
-    let d = derive(m, cache, f, mask.clone(), target)?;
+    let d = derive(m, cache, f, mask.clone(), target, false)?;
     let returns = returns_active(m, cache, f, mask, Mode::Interval)?;
 
     let mut params = func.params[..xi].to_vec();
     params.push(Param { name: "over".into(), ty: box_ty, by_ref: false, mutable: false });
     let mut g = Function::new(format!("{}_interval", func.name), params, Some(interval_ty));
     let mut body = Vec::new();
-    let mut args = Vec::new();
-    for (i, p) in func.params[..xi].iter().enumerate() {
-        if p.by_ref {
-            args.push(Arg::Place(Place { root: PlaceRoot::Param(i as u32), path: Vec::new() }));
-        } else {
-            let v = g.new_value(p.ty);
-            body.push(Stmt::Let(v, Expr::Param(i as u32)));
-            args.push(Arg::Value(v));
-        }
-    }
+    let mut args: Vec<Arg> = (0..xi as u32).map(|i| g.param_arg(i, &mut body)).collect();
     let over = g.new_value(box_ty);
     body.push(Stmt::Let(over, Expr::Param(xi as u32)));
     let lo = g.new_value(x_ty);
     body.push(Stmt::Let(lo, Expr::Extract(over, 0)));
     let hi = g.new_value(x_ty);
     body.push(Stmt::Let(hi, Expr::Extract(over, 1)));
-    // The input's `lo` takes its own slot; its `hi` is appended after the originals.
-    args.push(Arg::Value(lo));
-    args.push(Arg::Value(hi));
+    // The input's `lo` takes its own slot; its `hi` is appended after the originals. Each is
+    // passed the way `x` is (a borrowed vector by reference on the CPU).
+    for (v, name) in [(lo, "lo"), (hi, "hi")] {
+        if func.params[xi].by_ref {
+            let l = g.new_local(name, x_ty);
+            body.push(Stmt::Store(Place::local(l), v));
+            args.push(Arg::Place(Place::local(l)));
+        } else {
+            args.push(Arg::Value(v));
+        }
+    }
     let rty = m.functions[d.index()]
         .ret
         .ok_or_else(|| Error::internal("a derived function returns nothing"))?;
@@ -124,31 +127,50 @@ pub(super) fn interval(
 
 /// The interval version of `f` with active parameters `mask`. It takes `f`'s parameters, the
 /// active ones as their `lo`, followed by a `hi` for each active one; it returns
-/// `range<T> { lo, hi }` when its result is active.
+/// `range<T> { lo, hi }` when its result is active. `speculative`: the call runs under a branch
+/// on the input.
 fn derive(
     m: &mut Module,
     cache: &mut DeriveCache,
     f: FuncId,
     mask: Vec<bool>,
     target: Target,
+    speculative: bool,
 ) -> R<FuncId> {
     if let Some(&d) = cache.interval.get(&(f, mask.clone())) {
+        // A call back into one being built recurses. If a call on the way runs under a branch
+        // on the input, so does the recursion, and running both sides may never end.
+        let open = cache.building.iter().position(|(g, mk, _)| *g == f && *mk == mask);
+        if let Some(i) = open
+            && (speculative || cache.building[i + 1..].iter().any(|b| b.2))
+        {
+            return Err(Error::ActiveLoopExit(
+                "this recursion runs under a branch on the input; an interval runs both sides \
+                 of such a branch, so the recursion might not end"
+                    .to_string(),
+                None,
+            ));
+        }
         return Ok(d);
     }
     let orig = m.functions[f.index()].clone();
-    if let Some((why, at)) = has_host_or_ptr(&orig.body, None) {
-        return Err(Error::not_derivable(format!("this {why}")).at(at));
+    if let Some(at) = records_gpu_work(&orig.body, None) {
+        return Err(Error::not_derivable(
+            "this records GPU work, which a derived function can't do",
+        )
+        .at(at));
     }
-    let (func, result) = match single_exit(m, &orig) {
-        Some((nf, r)) => (nf, r),
-        None => (orig, None),
-    };
+    let exit = single_exit(m, &orig);
     let returns = returns_active(m, cache, f, mask.clone(), Mode::Interval)?;
-    let act = {
-        let mm: &Module = m;
-        activity(mm, &func, &mask, Mode::Interval, &mut |g, mk| {
-            returns_active(mm, cache, g, mk, Mode::Interval)
-        })?
+    let (func, result, act) = match exit {
+        None => (orig, None, body_activity(m, cache, f, &mask, Mode::Interval)?),
+        Some((func, result)) => {
+            let mm: &Module = m;
+            let act = activity(mm, &func, &mask, Mode::Interval, &mut |g, mk| {
+                effect(mm, cache, g, mk, Mode::Interval)
+            })?;
+            (func, result, act)
+        }
     };
     if let Some(at) = act.active_loop_exit {
         return Err(Error::ActiveLoopExit(
@@ -160,44 +182,59 @@ fn derive(
     }
     for (i, p) in func.params.iter().enumerate() {
         if act.params[i] && !mask[i] && p.mutable {
-            return Err(Error::internal(format!(
-                "`{}` writes a range through its `mut` parameter `{}`",
-                func.name, p.name
+            // Placed by the caller's statement (the call), or at the `interval(..)` call.
+            return Err(Error::not_derivable(format!(
+                "this would write a range through the `mut` parameter `{}`",
+                p.name
             )));
         }
     }
-    let mut nf = func.clone();
+    let mut nf = func.clone_signature();
     nf.name = format!("{}_iv", func.name);
+    // A range's `lo` takes the original's slot, as a range type.
     let mut hparam = vec![None; func.params.len()];
     for (i, p) in func.params.iter().enumerate() {
         if mask[i] {
+            let ty = range_ty(&mut m.types, p.ty);
+            nf.params[i].ty = ty;
             hparam[i] = Some(nf.params.len() as u32);
-            nf.params.push(Param { name: format!("{}_hi", p.name), ..p.clone() });
+            nf.params.push(Param { name: format!("{}_hi", p.name), ty, ..p.clone() });
         }
     }
     let mut hlocal = vec![None; func.locals.len()];
     for (l, decl) in func.locals.iter().enumerate() {
         if act.locals[l] {
-            hlocal[l] = Some(nf.new_local(format!("{}_hi", decl.name), decl.ty));
+            let ty = range_ty(&mut m.types, decl.ty);
+            nf.locals[l].ty = ty;
+            hlocal[l] = Some(nf.new_local(format!("{}_hi", decl.name), ty));
         }
     }
     if returns {
         let r = func.ret.ok_or_else(|| Error::internal("an active result of nothing"))?;
+        let mut r = range_ty(&mut m.types, r);
+        if func.ret_ref {
+            // A projection's: pointers into the place's `lo` and its `hi`.
+            r = m.types.intern(TypeDef::Ptr(r));
+            nf.ret_ref = false;
+        }
         nf.ret = Some(m.types.intern(TypeDef::Struct {
             name: format!("range<{}>", m.types.display(r)),
             fields: vec![("lo".into(), r), ("hi".into(), r)],
         }));
     }
-    nf.body = Vec::new();
-    let id = m.add_function(Function::new(nf.name.clone(), Vec::new(), None));
+    // With its signature, for a recursive call to read.
+    let id = m.add_function(Function::new(nf.name.clone(), nf.params.clone(), nf.ret));
     // Cached before its body is built, for calls back into it; removed again if building
     // fails, so a later request doesn't find the bodiless placeholder.
     let key = (f, mask);
     cache.interval.insert(key.clone(), id);
+    cache.building.push((f, key.1.clone(), speculative));
+    let ptrs = Pointers::of(m, &func);
     let mut b = Ivx {
         m,
         cache,
         act,
+        ptrs,
         target,
         nf,
         hparam,
@@ -205,19 +242,23 @@ fn derive(
         iv: HashMap::new(),
         returns,
         speculative: 0,
-        twins: LoadTwins::default(),
-        at: None,
+        track: Track::default(),
     };
     let mut body = Vec::new();
     let built = (|| -> R<()> {
         if let Some(r) = result.filter(|r| b.act.locals[r.index()]) {
             // The result starts empty, so a side that never returns adds nothing to the hull.
+            // (A projection's pointers have no hull: every side that runs returns one.)
             let ty = b.nf.locals[r.index()].ty;
+            if matches!(b.m.types.get(ty), TypeDef::Ptr(_)) {
+                return b.block_into(&func.body, &mut body);
+            }
             let e = b.empty(&mut body, ty)?;
             b.store_root(&mut body, &PlaceRoot::Local(r), e)?;
         }
         b.block_into(&func.body, &mut body)
     })();
+    b.cache.building.pop();
     if let Err(e) = built {
         b.cache.interval.remove(&key);
         return Err(e);
@@ -239,6 +280,8 @@ struct Ivx<'a> {
     m: &'a mut Module,
     cache: &'a mut DeriveCache,
     act: Activity,
+    /// What the function's pointers point into.
+    ptrs: Pointers,
     target: Target,
     nf: Function,
     hparam: Vec<Option<u32>>,
@@ -247,65 +290,99 @@ struct Ivx<'a> {
     returns: bool,
     /// How many branches deep we are that run whether or not a point would take them.
     speculative: u32,
-    twins: LoadTwins,
-    /// Where in the source the statement being derived is (`Stmt::At`), for errors.
-    at: Option<wrela_diag::Span>,
+    track: Track,
 }
 
-impl<'a> Ivx<'a> {
-    // ---- emission helpers --------------------------------------------------------------------
-
+impl Builder for Ivx<'_> {
     fn emit(&mut self, out: &mut Block, ty: TypeId, e: Expr) -> ValueId {
         let v = self.nf.new_value(ty);
         out.push(Stmt::Let(v, e));
         v
     }
 
+    fn types(&self) -> &Types {
+        &self.m.types
+    }
+
     fn ty(&self, v: ValueId) -> TypeId {
         self.nf.value_ty(v)
     }
+}
 
-    fn same_value(&self, a: ValueId, b: ValueId) -> bool {
-        self.twins.same_value(a, b)
-    }
+impl<'a> Ivx<'a> {
+    // ---- emission helpers --------------------------------------------------------------------
 
     fn range(&self, v: ValueId) -> Iv {
         self.iv.get(&v).copied().unwrap_or((v, v))
+    }
+
+    /// [`range`](Self::range) as a range type: a value that isn't active, of a type with an
+    /// enum in it, is rebuilt as its range type (see [`range_ty`]).
+    fn lifted(&mut self, out: &mut Block, v: ValueId) -> Iv {
+        if let Some(r) = self.iv.get(&v) {
+            return *r;
+        }
+        let x = self.lift(out, v);
+        (x, x)
+    }
+
+    /// A value as its range type: each enum's tag, and its payload in its variant's field
+    /// (the other variants' fields zero).
+    fn lift(&mut self, out: &mut Block, v: ValueId) -> ValueId {
+        let ty = self.ty(v);
+        let rt = range_ty(&mut self.m.types, ty);
+        if rt == ty {
+            return v;
+        }
+        let u32t = self.m.types.u32();
+        let parts = match self.m.types.get(ty).clone() {
+            TypeDef::Enum { variants, .. } => {
+                let tag = self.emit(out, u32t, Expr::Extract(v, 0));
+                let mut parts = vec![tag];
+                for (k, (_, payload)) in variants.iter().enumerate() {
+                    let Some(pt) = *payload else {
+                        parts.push(self.emit(out, u32t, Expr::Const(Const::U32(0))));
+                        continue;
+                    };
+                    let raw = self.emit(out, pt, Expr::Extract(v, 1 + k as u32));
+                    let x = self.lift(out, raw);
+                    let xt = self.ty(x);
+                    let zero = self.emit(out, xt, Expr::Zero(xt));
+                    let kc = self.emit(out, u32t, Expr::Const(Const::U32(k as u32)));
+                    let is_k = self.cmp(out, BinOp::Eq, tag, kc);
+                    parts.push(self.select(out, is_k, x, zero));
+                }
+                parts
+            }
+            TypeDef::Struct { fields, .. } => (0..fields.len() as u32)
+                .map(|i| {
+                    let x = self.emit(out, fields[i as usize].1, Expr::Extract(v, i));
+                    self.lift(out, x)
+                })
+                .collect(),
+            TypeDef::Array(e, n) => (0..n)
+                .map(|i| {
+                    let ic = self.emit(out, u32t, Expr::Const(Const::U32(i)));
+                    let x = self.emit(out, e, Expr::ExtractDyn(v, ic));
+                    self.lift(out, x)
+                })
+                .collect(),
+            _ => return v,
+        };
+        self.emit(out, rt, Expr::Construct(rt, parts))
     }
 
     fn elem(&self, ty: TypeId) -> Scalar {
         self.m.types.element_scalar(ty).unwrap_or(Scalar::F32)
     }
 
-    fn is_vector(&self, ty: TypeId) -> bool {
-        matches!(self.m.types.get(ty), TypeDef::Vector(_))
-    }
-
     fn bool_ty(&mut self) -> TypeId {
         self.m.types.bool()
-    }
-
-    /// `a op b` of type `ty`, a scalar operand splatted to a vector `ty` (the IR's elementwise
-    /// operations take one type).
-    fn bin(&mut self, out: &mut Block, op: BinOp, a: ValueId, b: ValueId, ty: TypeId) -> ValueId {
-        let (a, b) = (self.coerce(out, a, ty), self.coerce(out, b, ty));
-        self.emit(out, ty, Expr::Binary(op, a, b))
     }
 
     fn cmp(&mut self, out: &mut Block, op: BinOp, a: ValueId, b: ValueId) -> ValueId {
         let bt = self.bool_ty();
         self.emit(out, bt, Expr::Binary(op, a, b))
-    }
-
-    /// The builtin `b` of type `ty`; an elementwise one's scalar arguments are splatted to a
-    /// vector `ty`.
-    fn call(&mut self, out: &mut Block, b: Builtin, args: Vec<ValueId>, ty: TypeId) -> ValueId {
-        let args = if b.is_elementwise() {
-            args.into_iter().map(|x| self.coerce(out, x, ty)).collect()
-        } else {
-            args
-        };
-        self.emit(out, ty, Expr::Builtin(b, args))
     }
 
     fn select(&mut self, out: &mut Block, c: ValueId, t: ValueId, f: ValueId) -> ValueId {
@@ -327,24 +404,16 @@ impl<'a> Ivx<'a> {
         self.coerce(out, v, ty)
     }
 
-    /// `x` as an operand of type `ty` (see [`splat_size`]).
-    fn coerce(&mut self, out: &mut Block, x: ValueId, ty: TypeId) -> ValueId {
-        match splat_size(&self.m.types, self.ty(x), ty) {
-            Some(n) => self.emit(out, ty, Expr::Splat(x, n)),
-            None => x,
-        }
-    }
-
     fn coerce_iv(&mut self, out: &mut Block, x: Iv, ty: TypeId) -> Iv {
         (self.coerce(out, x.0, ty), self.coerce(out, x.1, ty))
     }
 
     /// The largest magnitude a float of this type takes here: infinity on the CPU, `MAX` on the
     /// GPU (which may assume infinities away).
-    fn inf(&self, ty: TypeId) -> f64 {
-        match (self.target, self.elem(ty)) {
-            (Target::Gpu, _) => f32::MAX as f64,
-            (Target::Cpu, _) => f64::INFINITY,
+    fn inf(&self) -> f64 {
+        match self.target {
+            Target::Gpu => f32::MAX as f64,
+            Target::Cpu => f64::INFINITY,
         }
     }
 
@@ -370,8 +439,8 @@ impl<'a> Ivx<'a> {
     /// `[lo - (|lo| k ε + tiny + abs), hi + (|hi| k ε + tiny + abs)]`: outward by `ulps` ulps of
     /// each bound and `abs` absolutely.
     fn widen(&mut self, out: &mut Block, x: Iv, ty: TypeId, ulps: f64, abs: f64) -> Iv {
-        let ml = self.call(out, Builtin::Abs, vec![x.0], ty);
-        let mh = self.call(out, Builtin::Abs, vec![x.1], ty);
+        let ml = self.builtin(out, Builtin::Abs, vec![x.0], ty);
+        let mh = self.builtin(out, Builtin::Abs, vec![x.1], ty);
         self.widen_mag(out, x, ty, (ml, mh), ulps, abs)
     }
 
@@ -408,7 +477,30 @@ impl<'a> Ivx<'a> {
         let dh = self.bin(out, BinOp::Mul, mag.1, k, ty);
         let dh = self.bin(out, BinOp::Add, dh, t, ty);
         let hi = self.bin(out, BinOp::Add, x.1, dh, ty);
-        (lo, hi)
+        if self.gpu() {
+            return (lo, hi);
+        }
+        // On the CPU a NaN bound (from ∞ − ∞, or 0 × ∞ at a corner) means "unknown": it becomes
+        // infinite here, so that no comparison or rule after it reads it as a decided answer.
+        let inf = self.inf();
+        (self.unless_nan(out, lo, ty, -inf), self.unless_nan(out, hi, ty, inf))
+    }
+
+    /// `x`, or `to` in each component that's NaN.
+    fn unless_nan(&mut self, out: &mut Block, x: ValueId, ty: TypeId, to: f64) -> ValueId {
+        if let TypeDef::Vector(n) = *self.m.types.get(ty) {
+            let f32t = self.m.types.f32();
+            let comps = (0..n as u32)
+                .map(|c| {
+                    let xc = self.emit(out, f32t, Expr::Extract(x, c));
+                    self.unless_nan(out, xc, f32t, to)
+                })
+                .collect();
+            return self.emit(out, ty, Expr::Construct(ty, comps));
+        }
+        let ok = self.cmp(out, BinOp::Eq, x, x);
+        let c = self.fc(out, ty, to);
+        self.select(out, ok, x, c)
     }
 
     /// One correctly rounded operation (+, −, ×; WASM's ÷ and √): one ulp. Rounding to nearest
@@ -443,6 +535,14 @@ impl<'a> Ivx<'a> {
             TypeDef::Array(e, n) if n <= 256 => {
                 arrays = true;
                 parts = vec![e; n as usize];
+            }
+            TypeDef::Ptr(_) => {
+                // Both sides of a branch on the input run: which place a store through the
+                // join would write isn't one place.
+                return Err(Error::not_derivable(
+                    "an interval through a projection chosen by a branch on the input isn't \
+                     supported",
+                ));
             }
             _ => {
                 return Err(Error::not_derivable(format!(
@@ -483,7 +583,7 @@ impl<'a> Ivx<'a> {
             return self.bin(out, op, a, b, ty);
         }
         let op = if upper { Builtin::Max } else { Builtin::Min };
-        self.call(out, op, vec![a, b], ty)
+        self.builtin(out, op, vec![a, b], ty)
     }
 
     /// The join of two ranges of type `ty`, picked by a condition's range `c`: the first when
@@ -507,7 +607,7 @@ impl<'a> Ivx<'a> {
         let (lo, hi) = match s {
             Scalar::Bool => (Const::Bool(false), Const::Bool(true)),
             Scalar::F32 | Scalar::F64 => {
-                let inf = self.inf(ty);
+                let inf = self.inf();
                 let lo = self.fc(out, ty, -inf);
                 let hi = self.fc(out, ty, inf);
                 return (lo, hi);
@@ -561,6 +661,12 @@ impl<'a> Ivx<'a> {
                 "an interval through an array index that depends on the input isn't supported",
             ));
         }
+        if let PlaceRoot::Ptr(v) = p.root {
+            // A projection's range: pointers into the place's `lo` and its `hi`.
+            let (lo, hi) = self.range(v);
+            let at = |r: ValueId| Place { root: PlaceRoot::Ptr(r), path: p.path.clone() };
+            return Ok((at(lo), at(hi)));
+        }
         let hi = Place { root: self.hi_root(&p.root)?, path: p.path.clone() };
         Ok((p.clone(), hi))
     }
@@ -569,8 +675,8 @@ impl<'a> Ivx<'a> {
         match r {
             PlaceRoot::Local(l) => Ok(self.nf.locals[l.index()].ty),
             PlaceRoot::Param(i) => Ok(self.nf.params[*i as usize].ty),
-            PlaceRoot::Resource(_) | PlaceRoot::Ptr(_) => {
-                Err(Error::internal("the range of a resource or pointer as a whole"))
+            PlaceRoot::Resource(_) | PlaceRoot::Ptr(_) | PlaceRoot::Data(_) => {
+                Err(Error::internal("the range of a resource, pointer or constant as a whole"))
             }
         }
     }
@@ -578,51 +684,53 @@ impl<'a> Ivx<'a> {
     fn load_root(&mut self, out: &mut Block, r: &PlaceRoot) -> R<Iv> {
         let ty = self.root_ty(r)?;
         let h = self.hi_root(r)?;
-        let lo = self.emit(out, ty, Expr::Load(Place { root: r.clone(), path: Vec::new() }));
-        let hi = self.emit(out, ty, Expr::Load(Place { root: h, path: Vec::new() }));
+        let lo = self.emit(out, ty, Expr::Load(Place::root(r.clone())));
+        let hi = self.emit(out, ty, Expr::Load(Place::root(h)));
         Ok((lo, hi))
     }
 
     fn store_root(&mut self, out: &mut Block, r: &PlaceRoot, x: Iv) -> R<()> {
         let h = self.hi_root(r)?;
-        out.push(Stmt::Store(Place { root: r.clone(), path: Vec::new() }, x.0));
-        out.push(Stmt::Store(Place { root: h, path: Vec::new() }, x.1));
+        out.push(Stmt::Store(Place::root(r.clone()), x.0));
+        out.push(Stmt::Store(Place::root(h), x.1));
         Ok(())
     }
 
-    /// The active locals and parameters a block may write.
+    /// The active locals and parameters a block may write, through a projection too.
     fn written(&self, b: &Block, into: &mut Vec<PlaceRoot>) {
-        let add = |r: &PlaceRoot, into: &mut Vec<PlaceRoot>| {
-            let active = match r {
-                PlaceRoot::Local(l) => self.act.locals[l.index()],
-                PlaceRoot::Param(i) => self.act.params[*i as usize],
-                _ => false,
-            };
-            if active && !into.contains(r) {
-                into.push(r.clone());
+        let active = |r: &PlaceRoot| match r {
+            PlaceRoot::Local(l) => self.act.locals[l.index()],
+            PlaceRoot::Param(i) => self.act.params[*i as usize],
+            _ => false,
+        };
+        let mut add = |r: &PlaceRoot| {
+            let mut roots = vec![r.clone()];
+            if let PlaceRoot::Ptr(v) = r {
+                roots.clear();
+                if self.ptrs.roots(*v, &mut roots).is_none() {
+                    // Anywhere.
+                    let n = (self.act.locals.len(), self.act.params.len());
+                    roots.extend((0..n.0).map(|l| PlaceRoot::Local(LocalId(l as u32))));
+                    roots.extend((0..n.1).map(|i| PlaceRoot::Param(i as u32)));
+                }
+            }
+            for r in roots {
+                if active(&r) && !into.contains(&r) {
+                    into.push(r);
+                }
             }
         };
-        for s in b {
-            match s {
-                Stmt::Store(p, _) => add(&p.root, into),
-                Stmt::Let(_, Expr::Call(g, args)) | Stmt::Eval(Expr::Call(g, args)) => {
-                    for (a, p) in args.iter().zip(&self.m.functions[g.index()].params) {
-                        if let (Arg::Place(pl), true) = (a, p.mutable) {
-                            add(&pl.root, into);
-                        }
+        visit::walk(b, &mut |s| match s {
+            Stmt::Store(p, _) => add(&p.root),
+            Stmt::Let(_, Expr::Call(g, args)) | Stmt::Eval(Expr::Call(g, args)) => {
+                for (a, p) in args.iter().zip(&self.m.functions[g.index()].params) {
+                    if let (Arg::Place(pl), true) = (a, p.mutable) {
+                        add(&pl.root);
                     }
                 }
-                Stmt::If { then, else_, .. } => {
-                    self.written(then, into);
-                    self.written(else_, into);
-                }
-                Stmt::Loop { body, continuing } => {
-                    self.written(body, into);
-                    self.written(continuing, into);
-                }
-                _ => {}
             }
-        }
+            _ => {}
+        });
     }
 
     // ---- statements --------------------------------------------------------------------------
@@ -641,13 +749,9 @@ impl<'a> Ivx<'a> {
     }
 
     fn stmt(&mut self, s: &Stmt, out: &mut Block) -> R<()> {
-        self.twins.before(s);
-        if let Stmt::At(span) = s {
-            self.at = Some(*span);
-        }
-        let r = self.stmt_inner(s, out).map_err(|e| e.at(self.at));
-        self.twins.after(s);
-        r
+        self.track.before(s);
+        let r = self.stmt_inner(s, out);
+        self.track.after(s, r)
     }
 
     fn let_(&mut self, s: &Stmt, v: ValueId, e: &Expr, out: &mut Block) -> R<()> {
@@ -670,7 +774,7 @@ impl<'a> Ivx<'a> {
             Stmt::Store(p, v) => {
                 if place_root_active(&self.act, p) {
                     let (lp, hp) = self.places(p)?;
-                    let (lo, hi) = self.range(*v);
+                    let (lo, hi) = self.lifted(out, *v);
                     out.push(Stmt::Store(lp, lo));
                     out.push(Stmt::Store(hp, hi));
                 } else {
@@ -707,7 +811,7 @@ impl<'a> Ivx<'a> {
                 Ok(())
             }
             Stmt::Return(Some(v)) if self.returns => {
-                let (lo, hi) = self.range(*v);
+                let (lo, hi) = self.lifted(out, *v);
                 let rt = self.nf.ret.ok_or_else(|| Error::internal("no range type"))?;
                 let r = self.emit(out, rt, Expr::Construct(rt, vec![lo, hi]));
                 out.push(Stmt::Return(Some(r)));
@@ -727,7 +831,7 @@ impl<'a> Ivx<'a> {
             });
             return Ok(());
         }
-        let dg = derive(self.m, self.cache, g, mask.clone(), self.target)?;
+        let dg = derive(self.m, self.cache, g, mask.clone(), self.target, self.speculative > 0)?;
         let returns = returns_active(self.m, self.cache, g, mask.clone(), Mode::Interval)?;
         let mut new_args = Vec::new();
         let mut his = Vec::new();
@@ -754,6 +858,7 @@ impl<'a> Ivx<'a> {
                     .ok_or_else(|| Error::internal("no range type"))?;
                 let r = self.emit(out, rt, Expr::Call(dg, new_args));
                 let ty = self.ty(v);
+                let ty = range_ty(&mut self.m.types, ty);
                 let lo = self.emit(out, ty, Expr::Extract(r, 0));
                 let hi = self.emit(out, ty, Expr::Extract(r, 1));
                 self.iv.insert(v, (lo, hi));
@@ -769,6 +874,7 @@ impl<'a> Ivx<'a> {
     /// The range of an active value `v = e`.
     fn expr(&mut self, v: ValueId, e: &Expr, out: &mut Block) -> R<Iv> {
         let ty = self.ty(v);
+        let ty = range_ty(&mut self.m.types, ty);
         Ok(match e {
             Expr::Param(i) => {
                 let h = self.hparam[*i as usize]
@@ -781,42 +887,8 @@ impl<'a> Ivx<'a> {
             }
             Expr::Unary(op, x) => self.unary(out, *op, *x, ty)?,
             Expr::Binary(op, a, b) => self.binary(out, *op, *a, *b, ty)?,
-            Expr::Builtin(b, args) => self.builtin(out, *b, args, ty)?,
-            Expr::Construct(t, parts) => {
-                let rs: Vec<Iv> = parts.iter().map(|p| self.range(*p)).collect();
-                let lo = self.emit(out, *t, Expr::Construct(*t, rs.iter().map(|r| r.0).collect()));
-                let hi = self.emit(out, *t, Expr::Construct(*t, rs.iter().map(|r| r.1).collect()));
-                (lo, hi)
-            }
-            // The payload's range, in the same variant.
-            Expr::Variant(t, k, payload) => {
-                let (lo, hi) = match payload {
-                    Some(p) => {
-                        let (lo, hi) = self.range(*p);
-                        (Some(lo), Some(hi))
-                    }
-                    None => (None, None),
-                };
-                (
-                    self.emit(out, *t, Expr::Variant(*t, *k, lo)),
-                    self.emit(out, *t, Expr::Variant(*t, *k, hi)),
-                )
-            }
-            Expr::Extract(x, i) => {
-                let (lo, hi) = self.range(*x);
-                (
-                    self.emit(out, ty, Expr::Extract(lo, *i)),
-                    self.emit(out, ty, Expr::Extract(hi, *i)),
-                )
-            }
-            Expr::ExtractDyn(x, i) if !self.act.values[i.index()] => {
-                let (lo, hi) = self.range(*x);
-                (
-                    self.emit(out, ty, Expr::ExtractDyn(lo, *i)),
-                    self.emit(out, ty, Expr::ExtractDyn(hi, *i)),
-                )
-            }
-            Expr::ExtractDyn(x, _) => {
+            Expr::Builtin(b, args) => self.builtin_range(out, *b, args, ty)?,
+            Expr::ExtractDyn(x, i) if self.act.values[i.index()] => {
                 // Any element: the hull of them all.
                 let n = match self.m.types.get(self.ty(*x)) {
                     TypeDef::Array(_, n) => *n,
@@ -846,17 +918,12 @@ impl<'a> Ivx<'a> {
                 }
                 acc.ok_or_else(|| Error::internal("an empty array"))?
             }
-            Expr::Splat(x, n) => {
-                let (lo, hi) = self.range(*x);
-                (self.emit(out, ty, Expr::Splat(lo, *n)), self.emit(out, ty, Expr::Splat(hi, *n)))
-            }
-            Expr::Swizzle(x, c) => {
-                let (lo, hi) = self.range(*x);
-                (
-                    self.emit(out, ty, Expr::Swizzle(lo, c.clone())),
-                    self.emit(out, ty, Expr::Swizzle(hi, c.clone())),
-                )
-            }
+            Expr::Construct(..)
+            | Expr::Variant(..)
+            | Expr::Extract(..)
+            | Expr::ExtractDyn(..)
+            | Expr::Splat(..)
+            | Expr::Swizzle(..) => self.structural(out, ty, e),
             Expr::Convert(x, s) => self.convert(out, *x, *s, ty)?,
             Expr::Bitcast(x, s) => {
                 let s = *s;
@@ -865,7 +932,7 @@ impl<'a> Ivx<'a> {
                 })
             }
             Expr::Select { cond, if_true, if_false } => {
-                let (t, f) = (self.range(*if_true), self.range(*if_false));
+                let (t, f) = (self.lifted(out, *if_true), self.lifted(out, *if_false));
                 if self.act.values[cond.index()] {
                     let c = self.range(*cond);
                     self.merge(out, ty, c, t, f)?
@@ -877,14 +944,66 @@ impl<'a> Ivx<'a> {
                 return Err(Error::internal("a constant marked active"));
             }
             Expr::Call(..) => unreachable!("calls are handled in `call_fn`"),
-            Expr::Host(..) | Expr::Run(_) | Expr::Addr(_) => {
+            Expr::Addr(p) => {
+                let (lp, hp) = self.places(p)?;
+                (self.emit(out, ty, Expr::Addr(lp)), self.emit(out, ty, Expr::Addr(hp)))
+            }
+            Expr::Host(..) | Expr::Run(_) => {
                 return Err(Error::not_derivable("an interval can't go through this"));
             }
         })
     }
 
+    /// The range of an expression that moves parts about but computes nothing (a construct, a
+    /// variant, an extract at an index that doesn't depend on the input, a splat or a swizzle):
+    /// the same expression on the operands' `lo`s, and on their `hi`s.
+    fn structural(&mut self, out: &mut Block, ty: TypeId, e: &Expr) -> Iv {
+        if let &Expr::Variant(et, k, Some(payload)) = e {
+            // Its range type's struct: the tag, and the payload in its variant's field.
+            let TypeDef::Enum { variants, .. } = self.m.types.get(et).clone() else {
+                return (payload, payload);
+            };
+            let u32t = self.m.types.u32();
+            let p = self.range(payload);
+            let mut ends = [p.0, p.1];
+            for end in &mut ends {
+                let mut parts = vec![self.emit(out, u32t, Expr::Const(Const::U32(k)))];
+                for (j, (_, pt)) in variants.iter().enumerate() {
+                    parts.push(match pt {
+                        _ if j == k as usize => *end,
+                        Some(pt) => {
+                            let rt = range_ty(&mut self.m.types, *pt);
+                            self.emit(out, rt, Expr::Zero(rt))
+                        }
+                        None => self.emit(out, u32t, Expr::Const(Const::U32(0))),
+                    });
+                }
+                *end = self.emit(out, ty, Expr::Construct(ty, parts));
+            }
+            return (ends[0], ends[1]);
+        }
+        let mut ranges = HashMap::new();
+        e.for_each_value(&mut |x| {
+            ranges.insert(x, (x, x));
+        });
+        for (x, r) in ranges.iter_mut() {
+            *r = self.lifted(out, *x);
+        }
+        let mut ends = [e.clone(), e.clone()];
+        for (i, end) in ends.iter_mut().enumerate() {
+            end.for_each_value_mut(&mut |x| *x = if i == 0 { ranges[x].0 } else { ranges[x].1 });
+            if let Expr::Construct(t, _) = end {
+                *t = ty;
+            }
+        }
+        let [lo, hi] = ends;
+        (self.emit(out, ty, lo), self.emit(out, ty, hi))
+    }
+
     /// For integers and bit patterns: exact when every operand is a single value, else the
-    /// type's whole range. `compute` gets the operands' `lo`s and must not trap.
+    /// type's whole range. A float operand is single only when its bounds have the same bits
+    /// (`-0.0` and `0.0` differ to a bitcast). `compute` gets the operands' `lo`s; on the CPU,
+    /// where it could trap (`abs` of `i32::MIN`), it gets zeros when they aren't all single.
     fn exact_or_full(
         &mut self,
         out: &mut Block,
@@ -894,7 +1013,16 @@ impl<'a> Ivx<'a> {
     ) -> Iv {
         let mut single: Option<ValueId> = None;
         for x in xs {
-            let eq = self.cmp(out, BinOp::Eq, x.0, x.1);
+            let eq = match self.m.types.as_scalar(self.ty(x.0)) {
+                Some(s @ (Scalar::F32 | Scalar::F64)) => {
+                    let bits = if s == Scalar::F64 { Scalar::U64 } else { Scalar::U32 };
+                    let bt = self.m.types.scalar(bits);
+                    let l = self.emit(out, bt, Expr::Bitcast(x.0, bits));
+                    let h = self.emit(out, bt, Expr::Bitcast(x.1, bits));
+                    self.cmp(out, BinOp::Eq, l, h)
+                }
+                _ => self.cmp(out, BinOp::Eq, x.0, x.1),
+            };
             single = Some(match single {
                 None => eq,
                 Some(s) => {
@@ -903,7 +1031,16 @@ impl<'a> Ivx<'a> {
                 }
             });
         }
-        let los: Vec<ValueId> = xs.iter().map(|x| x.0).collect();
+        let mut los: Vec<ValueId> = xs.iter().map(|x| x.0).collect();
+        if let Some(s) = single
+            && !self.gpu()
+        {
+            for l in &mut los {
+                let lt = self.ty(*l);
+                let z = self.emit(out, lt, Expr::Zero(lt));
+                *l = self.select(out, s, *l, z);
+            }
+        }
         let r = compute(self, out, &los);
         let (fl, fh) = self.full(out, ty);
         match single {
@@ -938,7 +1075,7 @@ impl<'a> Ivx<'a> {
         let (ra, rb) = (self.range(a), self.range(b));
         let os = self.elem(ta);
         if op.is_comparison() {
-            if self.is_vector(ta) {
+            if self.m.types.is_vector(ta) {
                 return Err(Error::internal("a vector comparison"));
             }
             return Ok(self.compare(out, op, ra, rb, os));
@@ -993,7 +1130,7 @@ impl<'a> Ivx<'a> {
                 let r = (self.bin(out, op, ra.0, rb.1, ty), self.bin(out, op, ra.1, rb.0, ty));
                 self.widen1(out, r, ty)
             }
-            BinOp::Mul if self.same_value(a, b) => {
+            BinOp::Mul if self.track.same_value(a, b) => {
                 let r = self.sqr(out, ra, ty);
                 self.widen1(out, r, ty)
             }
@@ -1009,21 +1146,33 @@ impl<'a> Ivx<'a> {
 
     /// The four corner products' extremes (unwidened).
     fn mul(&mut self, out: &mut Block, a: Iv, b: Iv, ty: TypeId) -> Iv {
-        let p = [
-            self.bin(out, BinOp::Mul, a.0, b.0, ty),
-            self.bin(out, BinOp::Mul, a.0, b.1, ty),
-            self.bin(out, BinOp::Mul, a.1, b.0, ty),
-            self.bin(out, BinOp::Mul, a.1, b.1, ty),
+        self.corners(out, ty, a, b, |s, out, x, y| s.bin(out, BinOp::Mul, x, y, ty))
+    }
+
+    /// The extremes of `op` at the four corners of `a` × `b` (unwidened).
+    fn corners(
+        &mut self,
+        out: &mut Block,
+        ty: TypeId,
+        a: Iv,
+        b: Iv,
+        mut op: impl FnMut(&mut Self, &mut Block, ValueId, ValueId) -> ValueId,
+    ) -> Iv {
+        let c = [
+            op(self, out, a.0, b.0),
+            op(self, out, a.0, b.1),
+            op(self, out, a.1, b.0),
+            op(self, out, a.1, b.1),
         ];
-        self.extremes(out, &p, ty)
+        self.extremes(out, &c, ty)
     }
 
     fn extremes(&mut self, out: &mut Block, p: &[ValueId], ty: TypeId) -> Iv {
         let mut lo = p[0];
         let mut hi = p[0];
         for &x in &p[1..] {
-            lo = self.call(out, Builtin::Min, vec![lo, x], ty);
-            hi = self.call(out, Builtin::Max, vec![hi, x], ty);
+            lo = self.builtin(out, Builtin::Min, vec![lo, x], ty);
+            hi = self.builtin(out, Builtin::Max, vec![hi, x], ty);
         }
         (lo, hi)
     }
@@ -1037,13 +1186,17 @@ impl<'a> Ivx<'a> {
     /// `|x|`, exactly: `[max(lo, -hi, 0), max(|lo|, |hi|)]`.
     fn abs(&mut self, out: &mut Block, x: Iv, ty: TypeId) -> Iv {
         let nh = self.emit(out, ty, Expr::Unary(UnOp::Neg, x.1));
-        let m = self.call(out, Builtin::Max, vec![x.0, nh], ty);
+        let m = self.builtin(out, Builtin::Max, vec![x.0, nh], ty);
         let z = self.fc(out, ty, 0.0);
-        let lo = self.call(out, Builtin::Max, vec![m, z], ty);
-        let al = self.call(out, Builtin::Abs, vec![x.0], ty);
-        let ah = self.call(out, Builtin::Abs, vec![x.1], ty);
-        let hi = self.call(out, Builtin::Max, vec![al, ah], ty);
-        (lo, hi)
+        let lo = self.builtin(out, Builtin::Max, vec![m, z], ty);
+        (lo, self.magnitude(out, x, ty))
+    }
+
+    /// The largest magnitude in a range: `max(|lo|, |hi|)`.
+    fn magnitude(&mut self, out: &mut Block, x: Iv, ty: TypeId) -> ValueId {
+        let l = self.builtin(out, Builtin::Abs, vec![x.0], ty);
+        let h = self.builtin(out, Builtin::Abs, vec![x.1], ty);
+        self.builtin(out, Builtin::Max, vec![l, h], ty)
     }
 
     /// Applies a scalar rule to each component of a vector (scalar operands are shared).
@@ -1056,7 +1209,7 @@ impl<'a> Ivx<'a> {
         for c in 0..n as u32 {
             let mut comps = Vec::new();
             for a in args {
-                comps.push(if self.is_vector(self.ty(a.0)) {
+                comps.push(if self.m.types.is_vector(self.ty(a.0)) {
                     (
                         self.emit(out, f32t, Expr::Extract(a.0, c)),
                         self.emit(out, f32t, Expr::Extract(a.1, c)),
@@ -1077,13 +1230,7 @@ impl<'a> Ivx<'a> {
 
     fn div(&mut self, out: &mut Block, ty: TypeId, x: &[Iv]) -> R<Iv> {
         let (a, b) = (x[0], x[1]);
-        let q = [
-            self.bin(out, BinOp::Div, a.0, b.0, ty),
-            self.bin(out, BinOp::Div, a.0, b.1, ty),
-            self.bin(out, BinOp::Div, a.1, b.0, ty),
-            self.bin(out, BinOp::Div, a.1, b.1, ty),
-        ];
-        let r = self.extremes(out, &q, ty);
+        let r = self.corners(out, ty, a, b, |s, out, x, y| s.bin(out, BinOp::Div, x, y, ty));
         // WGSL: 2.5 ulp; WASM: correctly rounded.
         let ulps = if self.gpu() { 6.0 } else { 1.0 };
         let r = self.widen(out, r, ty, ulps, 0.0);
@@ -1100,22 +1247,18 @@ impl<'a> Ivx<'a> {
     /// `a - b trunc(a / b)`: the sign of `a`, smaller than `|b|`, and within rounding of that.
     fn rem(&mut self, out: &mut Block, ty: TypeId, x: &[Iv]) -> R<Iv> {
         let (a, b) = (x[0], x[1]);
-        let bl = self.call(out, Builtin::Abs, vec![b.0], ty);
-        let bh = self.call(out, Builtin::Abs, vec![b.1], ty);
-        let bm = self.call(out, Builtin::Max, vec![bl, bh], ty);
+        let bm = self.magnitude(out, b, ty);
         let nbm = self.emit(out, ty, Expr::Unary(UnOp::Neg, bm));
         let z = self.fc(out, ty, 0.0);
-        let lo_any = self.call(out, Builtin::Max, vec![a.0, nbm], ty);
-        let hi_any = self.call(out, Builtin::Min, vec![a.1, bm], ty);
+        let lo_any = self.builtin(out, Builtin::Max, vec![a.0, nbm], ty);
+        let hi_any = self.builtin(out, Builtin::Min, vec![a.1, bm], ty);
         let nonneg = self.cmp(out, BinOp::Ge, a.0, z);
         let nonpos = self.cmp(out, BinOp::Le, a.1, z);
         let lo = self.select(out, nonneg, z, lo_any);
         let hi = self.select(out, nonpos, z, hi_any);
         // Rounding in `trunc(a / b)` can put the result just past either end, by about an ulp
         // of `a`.
-        let al = self.call(out, Builtin::Abs, vec![a.0], ty);
-        let ah = self.call(out, Builtin::Abs, vec![a.1], ty);
-        let am = self.call(out, Builtin::Max, vec![al, ah], ty);
+        let am = self.magnitude(out, a, ty);
         let mag = self.bin(out, BinOp::Add, am, bm, ty);
         let ulps = if self.gpu() { 16.0 } else { 4.0 };
         Ok(self.widen_mag(out, (lo, hi), ty, (mag, mag), ulps, 0.0))
@@ -1180,7 +1323,7 @@ impl<'a> Ivx<'a> {
             for (v, nan_to) in [(r.0, cl), (r.1, ch)] {
                 let ok = self.cmp(out, BinOp::Eq, v, v);
                 let v = self.select(out, ok, v, nan_to);
-                let v = self.call(out, Builtin::Clamp, vec![v, cl, ch], xt);
+                let v = self.builtin(out, Builtin::Clamp, vec![v, cl, ch], xt);
                 ends.push(conv(self, out, v));
             }
             return Ok((ends[0], ends[1]));
@@ -1188,19 +1331,22 @@ impl<'a> Ivx<'a> {
         Ok(self.exact_or_full(out, ty, &[r], &mut |me, out, xs| conv(me, out, xs[0])))
     }
 
-    fn builtin(&mut self, out: &mut Block, b: Builtin, args: &[ValueId], ty: TypeId) -> R<Iv> {
+    fn builtin_range(
+        &mut self,
+        out: &mut Block,
+        b: Builtin,
+        args: &[ValueId],
+        ty: TypeId,
+    ) -> R<Iv> {
         use Builtin as B;
         let r: Vec<Iv> = args.iter().map(|a| self.range(*a)).collect();
         let s = self.elem(ty);
         if s.is_int() {
             return Ok(match b {
                 B::Min | B::Max | B::Clamp => self.monotone(out, b, &r, ty),
-                _ => {
-                    let args = r.clone();
-                    self.exact_or_full(out, ty, &args, &mut |me, out, xs| {
-                        me.call(out, b, xs.to_vec(), ty)
-                    })
-                }
+                _ => self.exact_or_full(out, ty, &r, &mut |me, out, xs| {
+                    me.builtin(out, b, xs.to_vec(), ty)
+                }),
             });
         }
         let gpu = self.gpu();
@@ -1211,17 +1357,19 @@ impl<'a> Ivx<'a> {
             B::Min | B::Max | B::Clamp => self.monotone(out, b, &r, ty),
             B::Step => {
                 // 1 where edge <= x: up in x, down in the edge.
-                let lo = self.call(out, B::Step, vec![r[0].1, r[1].0], ty);
-                let hi = self.call(out, B::Step, vec![r[0].0, r[1].1], ty);
+                let lo = self.builtin(out, B::Step, vec![r[0].1, r[1].0], ty);
+                let hi = self.builtin(out, B::Step, vec![r[0].0, r[1].1], ty);
                 (lo, hi)
             }
             B::Abs => self.abs(out, r[0], ty),
             B::Sqrt => {
                 let z = self.fc(out, ty, 0.0);
-                let l = self.call(out, B::Max, vec![r[0].0, z], ty);
-                let h = self.call(out, B::Max, vec![r[0].1, z], ty);
-                let x =
-                    (self.call(out, B::Sqrt, vec![l], ty), self.call(out, B::Sqrt, vec![h], ty));
+                let l = self.builtin(out, B::Max, vec![r[0].0, z], ty);
+                let h = self.builtin(out, B::Max, vec![r[0].1, z], ty);
+                let x = (
+                    self.builtin(out, B::Sqrt, vec![l], ty),
+                    self.builtin(out, B::Sqrt, vec![h], ty),
+                );
                 // WGSL: inherited from 1 / inverseSqrt (2 + 2.5 ulp).
                 let ulps = if gpu { 10.0 } else { 1.0 };
                 self.widen(out, x, ty, ulps, 0.0)
@@ -1247,12 +1395,12 @@ impl<'a> Ivx<'a> {
                     r[0]
                 } else {
                     (
-                        self.call(out, B::Clamp, vec![r[0].0, neg, one], ty),
-                        self.call(out, B::Clamp, vec![r[0].1, neg, one], ty),
+                        self.builtin(out, B::Clamp, vec![r[0].0, neg, one], ty),
+                        self.builtin(out, B::Clamp, vec![r[0].1, neg, one], ty),
                     )
                 };
-                let fl = self.call(out, b, vec![x.0], ty);
-                let fh = self.call(out, b, vec![x.1], ty);
+                let fl = self.builtin(out, b, vec![x.0], ty);
+                let fh = self.builtin(out, b, vec![x.1], ty);
                 let x = if b == B::Acos { (fh, fl) } else { (fl, fh) };
                 self.inverse_trig_widen(out, x, ty)
             }
@@ -1284,16 +1432,14 @@ impl<'a> Ivx<'a> {
                     return Err(Error::internal("a dot of non-vectors"));
                 };
                 // dot(v, v) is a sum of squares.
-                let p = if self.same_value(args[0], args[1]) {
+                let p = if self.track.same_value(args[0], args[1]) {
                     self.sqr(out, r[0], at)
                 } else {
                     self.mul(out, r[0], r[1], at)
                 };
                 let lo = self.sum(out, p.0, n, ty);
                 let hi = self.sum(out, p.1, n, ty);
-                let ml = self.call(out, B::Abs, vec![p.0], at);
-                let mh = self.call(out, B::Abs, vec![p.1], at);
-                let m = self.call(out, B::Max, vec![ml, mh], at);
+                let m = self.magnitude(out, p, at);
                 let mag = self.sum(out, m, n, ty);
                 // n products and n - 1 sums, in whatever order the target picks.
                 let ulps = if gpu { 4.0 * n as f64 } else { 2.0 * n as f64 };
@@ -1331,9 +1477,9 @@ impl<'a> Ivx<'a> {
             B::AllEqual => {
                 let bt = self.bool_ty();
                 let (a, bb) = (r[0], r[1]);
-                let sa = self.call(out, B::AllEqual, vec![a.0, a.1], bt);
-                let sb = self.call(out, B::AllEqual, vec![bb.0, bb.1], bt);
-                let same = self.call(out, B::AllEqual, vec![a.0, bb.0], bt);
+                let sa = self.builtin(out, B::AllEqual, vec![a.0, a.1], bt);
+                let sb = self.builtin(out, B::AllEqual, vec![bb.0, bb.1], bt);
+                let same = self.builtin(out, B::AllEqual, vec![a.0, bb.0], bt);
                 let x = self.bin(out, BinOp::And, sa, sb, bt);
                 let lo = self.bin(out, BinOp::And, x, same, bt);
                 let hi = self.emit(out, bt, Expr::Const(Const::Bool(true)));
@@ -1350,8 +1496,8 @@ impl<'a> Ivx<'a> {
     /// A builtin that's non-decreasing in every argument and exact: applied to the `lo`s and
     /// to the `hi`s.
     fn monotone(&mut self, out: &mut Block, b: Builtin, r: &[Iv], ty: TypeId) -> Iv {
-        let lo = self.call(out, b, r.iter().map(|x| x.0).collect(), ty);
-        let hi = self.call(out, b, r.iter().map(|x| x.1).collect(), ty);
+        let lo = self.builtin(out, b, r.iter().map(|x| x.0).collect(), ty);
+        let hi = self.builtin(out, b, r.iter().map(|x| x.1).collect(), ty);
         (lo, hi)
     }
 
@@ -1374,8 +1520,8 @@ impl<'a> Ivx<'a> {
         let lo = self.sum(out, sq.0, n, ty);
         let hi = self.sum(out, sq.1, n, ty);
         let r = (
-            self.call(out, Builtin::Sqrt, vec![lo], ty),
-            self.call(out, Builtin::Sqrt, vec![hi], ty),
+            self.builtin(out, Builtin::Sqrt, vec![lo], ty),
+            self.builtin(out, Builtin::Sqrt, vec![hi], ty),
         );
         // Sums of squares don't cancel; the error is relative. WGSL: sqrt(dot(e, e)).
         let ulps = if self.gpu() { 16.0 } else { 4.0 };
@@ -1385,10 +1531,10 @@ impl<'a> Ivx<'a> {
     fn inverse_sqrt(&mut self, out: &mut Block, ty: TypeId, x: &[Iv]) -> R<Iv> {
         let x = x[0];
         let z = self.fc(out, ty, 0.0);
-        let l = self.call(out, Builtin::Max, vec![x.0, z], ty);
-        let h = self.call(out, Builtin::Max, vec![x.1, z], ty);
-        let lo = self.call(out, Builtin::InverseSqrt, vec![h], ty);
-        let hi = self.call(out, Builtin::InverseSqrt, vec![l], ty);
+        let l = self.builtin(out, Builtin::Max, vec![x.0, z], ty);
+        let h = self.builtin(out, Builtin::Max, vec![x.1, z], ty);
+        let lo = self.builtin(out, Builtin::InverseSqrt, vec![h], ty);
+        let hi = self.builtin(out, Builtin::InverseSqrt, vec![l], ty);
         // At zero it's unbounded.
         let pos = self.cmp(out, BinOp::Gt, x.0, z);
         let (_, fh) = self.full(out, ty);
@@ -1415,19 +1561,15 @@ impl<'a> Ivx<'a> {
             let p = self.mul(out, b, l, ty);
             let p = self.widen1(out, p, ty);
             let e = (
-                self.call(out, Builtin::Exp2, vec![p.0], ty),
-                self.call(out, Builtin::Exp2, vec![p.1], ty),
+                self.builtin(out, Builtin::Exp2, vec![p.0], ty),
+                self.builtin(out, Builtin::Exp2, vec![p.1], ty),
             );
             self.exp_gpu_widen(out, e, p, ty)
         } else {
             // `y log x` is bilinear in (y, log x), so the extremes are at the corners.
-            let c = [
-                self.call(out, Builtin::Pow, vec![a.0, b.0], ty),
-                self.call(out, Builtin::Pow, vec![a.0, b.1], ty),
-                self.call(out, Builtin::Pow, vec![a.1, b.0], ty),
-                self.call(out, Builtin::Pow, vec![a.1, b.1], ty),
-            ];
-            let e = self.extremes(out, &c, ty);
+            let e = self.corners(out, ty, a, b, |s, out, x, y| {
+                s.builtin(out, Builtin::Pow, vec![x, y], ty)
+            });
             self.widen(out, e, ty, CPU_STD_ULPS, 0.0)
         };
         let (fl, fh) = self.full(out, ty);
@@ -1441,7 +1583,7 @@ impl<'a> Ivx<'a> {
         let mut ends = Vec::new();
         for v in [x.0, x.1] {
             let pos = self.cmp(out, BinOp::Gt, v, z);
-            let l = self.call(out, b, vec![v], ty);
+            let l = self.builtin(out, b, vec![v], ty);
             ends.push(self.select(out, pos, l, fl));
         }
         let r = (ends[0], ends[1]);
@@ -1455,15 +1597,13 @@ impl<'a> Ivx<'a> {
 
     /// Widening for `exp` and `exp2` on the GPU (WGSL: 3 + 2|x| ulp), `x` the argument's range.
     fn exp_gpu_widen(&mut self, out: &mut Block, e: Iv, x: Iv, ty: TypeId) -> Iv {
-        let al = self.call(out, Builtin::Abs, vec![x.0], ty);
-        let ah = self.call(out, Builtin::Abs, vec![x.1], ty);
-        let m = self.call(out, Builtin::Max, vec![al, ah], ty);
+        let m = self.magnitude(out, x, ty);
         let four = self.fc(out, ty, 4.0 * F32_EPS);
         let six = self.fc(out, ty, 6.0 * F32_EPS);
         let k = self.bin(out, BinOp::Mul, m, four, ty);
         let k = self.bin(out, BinOp::Add, k, six, ty);
-        let ml = self.call(out, Builtin::Abs, vec![e.0], ty);
-        let mh = self.call(out, Builtin::Abs, vec![e.1], ty);
+        let ml = self.builtin(out, Builtin::Abs, vec![e.0], ty);
+        let mh = self.builtin(out, Builtin::Abs, vec![e.1], ty);
         self.widen_k(out, e, ty, (ml, mh), k, 0.0)
     }
 
@@ -1494,32 +1634,18 @@ impl<'a> Ivx<'a> {
     ) -> R<Iv> {
         let tau = std::f64::consts::TAU;
         let bt = self.bool_ty();
-        let e0 = self.call(out, b, vec![x.0], ty);
-        let e1 = self.call(out, b, vec![x.1], ty);
+        let e0 = self.builtin(out, b, vec![x.0], ty);
+        let e1 = self.builtin(out, b, vec![x.1], ty);
         let (lo, hi) = self.extremes(out, &[e0, e1], ty);
         // Slack for the test, so a near miss counts as inside (sound: ±1 is a bound).
-        let al = self.call(out, Builtin::Abs, vec![x.0], ty);
-        let ah = self.call(out, Builtin::Abs, vec![x.1], ty);
-        let m = self.call(out, Builtin::Max, vec![al, ah], ty);
+        let m = self.magnitude(out, x, ty);
         let k = self.fc(out, ty, (2f64).powi(-18));
         let c = self.fc(out, ty, (2f64).powi(-10));
         let slack = self.bin(out, BinOp::Mul, m, k, ty);
         let slack = self.bin(out, BinOp::Add, slack, c, ty);
         let xl = self.bin(out, BinOp::Sub, x.0, slack, ty);
         let xh = self.bin(out, BinOp::Add, x.1, slack, ty);
-        let mut hits = Vec::new();
-        for at in [peak, trough] {
-            // Is there an integer n with xl <= at + τn <= xh?
-            let a = self.fc(out, ty, at);
-            let inv = self.fc(out, ty, 1.0 / tau);
-            let dl = self.bin(out, BinOp::Sub, xl, a, ty);
-            let dl = self.bin(out, BinOp::Mul, dl, inv, ty);
-            let nl = self.call(out, Builtin::Ceil, vec![dl], ty);
-            let dh = self.bin(out, BinOp::Sub, xh, a, ty);
-            let dh = self.bin(out, BinOp::Mul, dh, inv, ty);
-            let nh = self.call(out, Builtin::Floor, vec![dh], ty);
-            hits.push(self.cmp(out, BinOp::Le, nl, nh));
-        }
+        let hits = [peak, trough].map(|at| self.lattice_hit(out, ty, (xl, xh), at, tau));
         // Far out, or a whole period wide: everything.
         let wide = self.bin(out, BinOp::Sub, x.1, x.0, ty);
         let tc = self.fc(out, ty, tau);
@@ -1541,6 +1667,19 @@ impl<'a> Ivx<'a> {
         })
     }
 
+    /// Whether there's an integer `n` with `x.0 <= at + period n <= x.1`.
+    fn lattice_hit(&mut self, out: &mut Block, ty: TypeId, x: Iv, at: f64, period: f64) -> ValueId {
+        let a = self.fc(out, ty, at);
+        let inv = self.fc(out, ty, 1.0 / period);
+        let dl = self.bin(out, BinOp::Sub, x.0, a, ty);
+        let dl = self.bin(out, BinOp::Mul, dl, inv, ty);
+        let nl = self.builtin(out, Builtin::Ceil, vec![dl], ty);
+        let dh = self.bin(out, BinOp::Sub, x.1, a, ty);
+        let dh = self.bin(out, BinOp::Mul, dh, inv, ty);
+        let nh = self.builtin(out, Builtin::Floor, vec![dh], ty);
+        self.cmp(out, BinOp::Le, nl, nh)
+    }
+
     fn tan(&mut self, out: &mut Block, ty: TypeId, x: &[Iv]) -> R<Iv> {
         let x = x[0];
         if self.gpu() {
@@ -1551,23 +1690,28 @@ impl<'a> Ivx<'a> {
         }
         // Increasing between asymptotes at π/2 + πk.
         let pi = std::f64::consts::PI;
+        let bt = self.bool_ty();
         let e = (
-            self.call(out, Builtin::Tan, vec![x.0], ty),
-            self.call(out, Builtin::Tan, vec![x.1], ty),
+            self.builtin(out, Builtin::Tan, vec![x.0], ty),
+            self.builtin(out, Builtin::Tan, vec![x.1], ty),
         );
         let e = self.widen(out, e, ty, CPU_STD_ULPS, 0.0);
-        let k = self.fc(out, ty, (2f64).powi(-10));
-        let xl = self.bin(out, BinOp::Sub, x.0, k, ty);
-        let xh = self.bin(out, BinOp::Add, x.1, k, ty);
-        let a = self.fc(out, ty, pi / 2.0);
-        let inv = self.fc(out, ty, 1.0 / pi);
-        let dl = self.bin(out, BinOp::Sub, xl, a, ty);
-        let dl = self.bin(out, BinOp::Mul, dl, inv, ty);
-        let nl = self.call(out, Builtin::Ceil, vec![dl], ty);
-        let dh = self.bin(out, BinOp::Sub, xh, a, ty);
-        let dh = self.bin(out, BinOp::Mul, dh, inv, ty);
-        let nh = self.call(out, Builtin::Floor, vec![dh], ty);
-        let pole = self.cmp(out, BinOp::Le, nl, nh);
+        // Slack for the test, which rounds in f32, so a near miss counts as a pole (as in
+        // `periodic`); far out, everything.
+        let m = self.magnitude(out, x, ty);
+        let k = self.fc(out, ty, (2f64).powi(-18));
+        let c = self.fc(out, ty, (2f64).powi(-10));
+        let slack = self.bin(out, BinOp::Mul, m, k, ty);
+        let slack = self.bin(out, BinOp::Add, slack, c, ty);
+        let xl = self.bin(out, BinOp::Sub, x.0, slack, ty);
+        let xh = self.bin(out, BinOp::Add, x.1, slack, ty);
+        let pole = self.lattice_hit(out, ty, (xl, xh), pi / 2.0, pi);
+        let far_c = self.fc(out, ty, (2f64).powi(19));
+        let far = self.cmp(out, BinOp::Gt, m, far_c);
+        // Ends out of order can only straddle a pole.
+        let inverted = self.cmp(out, BinOp::Gt, e.0, e.1);
+        let pole = self.bin(out, BinOp::Or, pole, far, bt);
+        let pole = self.bin(out, BinOp::Or, pole, inverted, bt);
         let (fl, fh) = self.full(out, ty);
         Ok((self.select(out, pole, fl, e.0), self.select(out, pole, fh, e.1)))
     }
@@ -1585,8 +1729,8 @@ impl<'a> Ivx<'a> {
     fn fract(&mut self, out: &mut Block, ty: TypeId, x: &[Iv]) -> R<Iv> {
         // Within one unit cell, `x - floor(x)` is increasing; across cells, anything in [0, 1].
         let x = x[0];
-        let fl = self.call(out, Builtin::Floor, vec![x.0], ty);
-        let fh = self.call(out, Builtin::Floor, vec![x.1], ty);
+        let fl = self.builtin(out, Builtin::Floor, vec![x.0], ty);
+        let fh = self.builtin(out, Builtin::Floor, vec![x.1], ty);
         let same = self.cmp(out, BinOp::Eq, fl, fh);
         let l = self.bin(out, BinOp::Sub, x.0, fl, ty);
         let h = self.bin(out, BinOp::Sub, x.1, fh, ty);
@@ -1603,20 +1747,19 @@ impl<'a> Ivx<'a> {
         // For t in [0, 1], mix is non-decreasing in a and b and linear in t: the extremes are
         // at (a.lo, b.lo) and (a.hi, b.hi), each at one end of t.
         let c = [
-            self.call(out, Builtin::Mix, vec![a.0, b.0, t.0], ty),
-            self.call(out, Builtin::Mix, vec![a.0, b.0, t.1], ty),
-            self.call(out, Builtin::Mix, vec![a.1, b.1, t.0], ty),
-            self.call(out, Builtin::Mix, vec![a.1, b.1, t.1], ty),
+            self.builtin(out, Builtin::Mix, vec![a.0, b.0, t.0], ty),
+            self.builtin(out, Builtin::Mix, vec![a.0, b.0, t.1], ty),
+            self.builtin(out, Builtin::Mix, vec![a.1, b.1, t.0], ty),
+            self.builtin(out, Builtin::Mix, vec![a.1, b.1, t.1], ty),
         ];
-        let lo = self.call(out, Builtin::Min, vec![c[0], c[1]], ty);
-        let hi = self.call(out, Builtin::Max, vec![c[2], c[3]], ty);
+        let lo = self.builtin(out, Builtin::Min, vec![c[0], c[1]], ty);
+        let hi = self.builtin(out, Builtin::Max, vec![c[2], c[3]], ty);
         // a (1 - t) + b t rounds three times, relative to the terms it adds; a GPU may compute
         // a + t (b - a) instead, whose error also grows with |b - a| t. So the magnitude is
         // |a| (1 - t) + (|a| + |b|) t: just |a| at t = 0, where `smin` against a huge value
         // starts its fold.
-        let m = [a.0, a.1, b.0, b.1].map(|v| self.call(out, Builtin::Abs, vec![v], ty));
-        let ma = self.call(out, Builtin::Max, vec![m[0], m[1]], ty);
-        let mb = self.call(out, Builtin::Max, vec![m[2], m[3]], ty);
+        let ma = self.magnitude(out, a, ty);
+        let mb = self.magnitude(out, b, ty);
         let one = self.fc(out, ty, 1.0);
         let omt = self.bin(out, BinOp::Sub, one, t.0, ty);
         let x = self.bin(out, BinOp::Mul, ma, omt, ty);
@@ -1648,8 +1791,8 @@ impl<'a> Ivx<'a> {
     fn smoothstep(&mut self, out: &mut Block, ty: TypeId, x: &[Iv]) -> R<Iv> {
         // With e0 < e1 it's non-decreasing in x and non-increasing in both edges.
         let (e0, e1, v) = (x[0], x[1], x[2]);
-        let lo = self.call(out, Builtin::Smoothstep, vec![e0.1, e1.1, v.0], ty);
-        let hi = self.call(out, Builtin::Smoothstep, vec![e0.0, e1.0, v.1], ty);
+        let lo = self.builtin(out, Builtin::Smoothstep, vec![e0.1, e1.1, v.0], ty);
+        let hi = self.builtin(out, Builtin::Smoothstep, vec![e0.0, e1.0, v.1], ty);
         let ok = self.cmp(out, BinOp::Lt, e0.1, e1.0);
         let z = self.fc(out, ty, 0.0);
         let one = self.fc(out, ty, 1.0);
@@ -1683,5 +1826,37 @@ fn float_int_range(from: Scalar, to: Scalar) -> (f64, f64) {
         Scalar::I16 => (-32768.0, 32767.0),
         Scalar::U16 => (0.0, 65535.0),
         Scalar::Bool | Scalar::F32 | Scalar::F64 => (0.0, 0.0),
+    }
+}
+
+/// The type of a range's bounds: `ty`, with each enum in it a struct of its tag and a field for
+/// each variant's payload (a `u32` zero for none), in the enum's field order.
+fn range_ty(types: &mut Types, ty: TypeId) -> TypeId {
+    match types.get(ty).clone() {
+        TypeDef::Enum { name, variants } => {
+            let u32t = types.u32();
+            let mut fields = vec![("tag".to_string(), u32t)];
+            for (v, p) in variants {
+                fields.push((v, p.map_or(u32t, |p| range_ty(types, p))));
+            }
+            types.intern(TypeDef::Struct { name: format!("range<{name}>"), fields })
+        }
+        TypeDef::Struct { name, fields } => {
+            let ranged: Vec<(String, TypeId)> =
+                fields.iter().map(|(n, t)| (n.clone(), range_ty(types, *t))).collect();
+            if ranged == fields {
+                return ty;
+            }
+            types.intern(TypeDef::Struct { name: format!("range<{name}>"), fields: ranged })
+        }
+        TypeDef::Array(e, n) => {
+            let r = range_ty(types, e);
+            if r == e { ty } else { types.intern(TypeDef::Array(r, n)) }
+        }
+        TypeDef::Ptr(e) => {
+            let r = range_ty(types, e);
+            if r == e { ty } else { types.intern(TypeDef::Ptr(r)) }
+        }
+        _ => ty,
     }
 }

@@ -5,19 +5,19 @@
 //! building.
 //!
 //! The cases run in a worker process: this test binary again, running `worker`. A panic, an
-//! abort (a stack overflow can't be caught in-process) or a case that takes longer than
-//! [`CASE_TIMEOUT`] fails the test, with the seed and the program; the worker is restarted
-//! after the case that killed it.
+//! abort (a stack overflow can't be caught in-process), an internal compiler error (I0001: the
+//! compiler caught its own bug) or a case that takes longer than [`CASE_TIMEOUT`] fails the
+//! test, with the seed and the program; the worker is restarted after the case that killed it.
 //!
 //! `WRELA_FUZZ_ITERS` sets the cases (default 100, or 1000 with `WRELA_FULL`) and
 //! `WRELA_FUZZ_SEED` the run's seed (default 1).
 
+use crate::scratch;
 use std::io::{BufRead, BufReader, Write};
-use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
-use wrela_tests::{Rng, root, sized};
+use wrela_tests::{Rng, files_under, repo_root, sized};
 
 /// How long one case may take. Generous: debug builds are slow, and the worker compiles std
 /// once per case.
@@ -78,22 +78,6 @@ const TOKENS: &[&str] = &[
     "_",
     "..",
 ];
-
-fn seeds(dir: &Path, out: &mut Vec<String>) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
-    for e in entries.flatten() {
-        let p = e.path();
-        let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        if name == "build" || name == "target" || name.starts_with('.') || name == "node_modules" {
-            continue;
-        }
-        if p.is_dir() {
-            seeds(&p, out);
-        } else if p.extension().is_some_and(|x| x == "wrela") {
-            out.push(std::fs::read_to_string(&p).expect("read"));
-        }
-    }
-}
 
 /// A char boundary at or before `i`.
 fn boundary(s: &str, mut i: usize) -> usize {
@@ -166,10 +150,13 @@ fn case(corpus: &[String], seed: u64) -> String {
     mutate(&mut rng, corpus[pick].clone())
 }
 
+/// The seeds: every `.wrela` file under compiler/ and examples/.
 fn corpus() -> Vec<String> {
-    let mut corpus = Vec::new();
-    seeds(&root().join("compiler"), &mut corpus);
-    seeds(&root().join("examples"), &mut corpus);
+    let corpus: Vec<String> = ["compiler", "examples"]
+        .iter()
+        .flat_map(|dir| files_under(&repo_root().join(dir), &["wrela"]))
+        .map(|p| std::fs::read_to_string(p).expect("read"))
+        .collect();
     assert!(corpus.len() > 50, "only {} seeds", corpus.len());
     corpus
 }
@@ -178,8 +165,52 @@ fn seed_of(base: u64, i: u64) -> u64 {
     base.wrapping_mul(1_000_003).wrapping_add(i)
 }
 
-/// What the worker reports on stdout: `start <i>` before case `i`, `panic <i> <message>` if
-/// it panicked, and `done` at the end.
+/// Starts each of the worker's reports. The test harness writes on the same stdout, and not
+/// always whole lines (`test fuzz::worker ... ` comes just before the first report), so a
+/// report is found by this mark, anywhere in a line.
+const MARK: &str = "wrela-fuzz:";
+
+/// A report from the worker.
+#[derive(Debug, PartialEq)]
+enum Report<'a> {
+    Start(u64),
+    Panic(u64, &'a str),
+    Internal(u64, &'a str),
+    Done,
+}
+
+/// The report in a line of the worker's stdout, if it has one.
+fn report(line: &str) -> Option<Report<'_>> {
+    let (_, report) = line.split_once(MARK)?;
+    let mut w = report.trim_start().splitn(3, ' ');
+    let (kind, i, rest) = (w.next()?, w.next().and_then(|i| i.parse().ok()), w.next());
+    Some(match (kind, i) {
+        ("done", _) => Report::Done,
+        ("start", Some(i)) => Report::Start(i),
+        ("panic", Some(i)) => Report::Panic(i, rest.unwrap_or("")),
+        ("internal", Some(i)) => Report::Internal(i, rest.unwrap_or("")),
+        _ => panic!("the worker reported `{report}`"),
+    })
+}
+
+#[test]
+fn reports_are_found_in_the_harness_output() {
+    assert_eq!(report("running 1 test"), None);
+    assert_eq!(report("test fuzz::worker ... wrela-fuzz: start 0"), Some(Report::Start(0)));
+    assert_eq!(
+        report("wrela-fuzz: panic 3 index out of bounds"),
+        Some(Report::Panic(3, "index out of bounds"))
+    );
+    assert_eq!(
+        report("wrela-fuzz: internal 4 I0001: no type"),
+        Some(Report::Internal(4, "I0001: no type"))
+    );
+    assert_eq!(report("wrela-fuzz: done"), Some(Report::Done));
+}
+
+/// What the worker reports on stdout, each after [`MARK`]: `start <i>` before case `i`,
+/// `panic <i> <message>` if it panicked, `internal <i> <message>` if it reported an internal
+/// compiler error, and `done` at the end.
 #[test]
 #[ignore = "run by mutated_programs_dont_crash_the_compiler, in its own process"]
 fn worker() {
@@ -188,28 +219,33 @@ fn worker() {
     let (base, from, to) = (parts.next(), parts.next(), parts.next());
     let (Some(base), Some(from), Some(to)) = (base, from, to) else { panic!("bad spec {spec}") };
     let corpus = corpus();
-    let dir =
-        PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("fuzz-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("dir");
+    let dir = scratch(&format!("fuzz-{}", std::process::id()));
     std::panic::set_hook(Box::new(|_| {}));
     let mut out = std::io::stdout().lock();
     for i in from..to {
         let text = case(&corpus, seed_of(base, i));
         std::fs::write(dir.join("main.wrela"), &text).expect("write");
-        writeln!(out, "start {i}").and_then(|()| out.flush()).expect("stdout");
-        let r = std::panic::catch_unwind(|| {
-            let _ = wrela_driver::build(&dir);
-        });
-        if let Err(e) = r {
-            let msg = e
-                .downcast_ref::<String>()
-                .cloned()
-                .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
-                .unwrap_or_default();
-            writeln!(out, "panic {i} {}", msg.replace('\n', " ")).expect("stdout");
+        writeln!(out, "{MARK} start {i}").and_then(|()| out.flush()).expect("stdout");
+        let r = std::panic::catch_unwind(|| wrela_driver::build(&dir));
+        match r {
+            Ok(built) => {
+                if let Some(d) = built.diagnostics.iter().find(|d| d.code.is_internal()) {
+                    let msg = format!("{}: {}", d.code, d.message);
+                    writeln!(out, "{MARK} internal {i} {}", msg.replace('\n', " "))
+                        .expect("stdout");
+                }
+            }
+            Err(e) => {
+                let msg = e
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
+                    .unwrap_or_default();
+                writeln!(out, "{MARK} panic {i} {}", msg.replace('\n', " ")).expect("stdout");
+            }
         }
     }
-    writeln!(out, "done").and_then(|()| out.flush()).expect("stdout");
+    writeln!(out, "{MARK} done").and_then(|()| out.flush()).expect("stdout");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -244,21 +280,19 @@ fn mutated_programs_dont_crash_the_compiler() {
         let mut finished = false;
         loop {
             match rx.recv_timeout(CASE_TIMEOUT) {
-                Ok(line) if line == "done" => {
-                    finished = true;
-                    break;
-                }
-                Ok(line) => {
-                    let mut w = line.splitn(3, ' ');
-                    match (w.next(), w.next().and_then(|i| i.parse::<u64>().ok())) {
-                        (Some("start"), Some(i)) => current = Some(i),
-                        (Some("panic"), Some(i)) => {
-                            crashes.push((i, format!("panicked: {}", w.next().unwrap_or(""))));
-                        }
-                        // The test harness's own output.
-                        _ => {}
+                // Lines without a report are the test harness's own output.
+                Ok(line) => match report(&line) {
+                    None => {}
+                    Some(Report::Done) => {
+                        finished = true;
+                        break;
                     }
-                }
+                    Some(Report::Start(i)) => current = Some(i),
+                    Some(Report::Panic(i, why)) => crashes.push((i, format!("panicked: {why}"))),
+                    Some(Report::Internal(i, why)) => {
+                        crashes.push((i, format!("an internal compiler error: {why}")));
+                    }
+                },
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     let _ = child.kill();
                     if let Some(i) = current {
@@ -281,7 +315,7 @@ fn mutated_programs_dont_crash_the_compiler() {
                 }
                 next = i + 1;
             }
-            None => panic!("the worker didn't start ({status})"),
+            None => panic!("the worker didn't start ({status}); crashes before it: {crashes:?}"),
         }
     }
     if crashes.is_empty() {

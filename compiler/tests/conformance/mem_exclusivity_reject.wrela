@@ -25,3 +25,26 @@ fn f(w: mut World) -> u32 {
     w.log = Log { count: 0 } //~ E0507
     c + l.count
 }
+
+enum Phase: Copy + Clone {
+    Start,
+    Done,
+}
+
+struct Job {
+    phase: Phase,
+}
+
+fn finish(j: mut Job) -> bool {
+    j.phase = Phase::Done
+    false
+}
+
+// A guard can't change what a later arm tests: the `match` borrows it until an arm is chosen.
+fn stage(j: mut Job) -> u32 {
+    match j.phase {
+        Phase::Start if finish(mut j) => 1, //~ E0507
+        Phase::Start => 2,
+        Phase::Done => 3,
+    }
+}

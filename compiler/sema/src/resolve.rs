@@ -4,7 +4,7 @@ use crate::builtins::{BuiltinFn, BuiltinTy};
 use crate::defs::*;
 use crate::program::Program;
 use crate::ty::*;
-use wrela_diag::{Diagnostic, codes};
+use wrela_diag::{Diagnostic, Span, codes};
 use wrela_syntax::ast;
 
 /// What's in scope where a type or path is resolved, besides the module's items.
@@ -14,11 +14,13 @@ pub struct Scope {
     /// Generic parameters, innermost last.
     pub params: Vec<(String, ParamId)>,
     pub self_ty: Option<TyId>,
+    /// The impl whose items these are: `Self::Name` names its associated type.
+    pub impl_: Option<ImplId>,
 }
 
 impl Scope {
     pub fn new(module: ModuleId) -> Scope {
-        Scope { module, params: Vec::new(), self_ty: None }
+        Scope { module, params: Vec::new(), self_ty: None, impl_: None }
     }
 
     pub fn push_params(&mut self, p: &Program, params: &[ParamId]) {
@@ -107,16 +109,20 @@ fn edit_distance(a: &str, b: &str) -> usize {
     prev[b.len()]
 }
 
+/// The std prelude's module, once std is loaded.
+fn prelude(p: &Program) -> Option<ModuleId> {
+    p.module(p.std_root?).children.get("prelude").copied()
+}
+
 /// The std prelude's names: its public items and the variants of its enums (`Some`, `None`).
 pub fn prelude_lookup(p: &Program, name: &str) -> Option<Res> {
-    let std = p.std_root?;
-    let prelude = *p.module(std).children.get("prelude")?;
-    if let Some(b) = p.module(prelude).scope.get(name)
+    let scope = &p.module(prelude(p)?).scope;
+    if let Some(b) = scope.get(name)
         && b.public
     {
         return Some(b.res);
     }
-    for b in p.module(prelude).scope.values() {
+    for b in scope.values() {
         if let Res::Adt(a) = b.res
             && let Some(i) = p.adt(a).variants().iter().position(|v| v.name == name)
         {
@@ -126,30 +132,33 @@ pub fn prelude_lookup(p: &Program, name: &str) -> Option<Res> {
     None
 }
 
+/// A name every module sees after its own: the prelude's, then the built-ins'.
+fn lookup_global(p: &Program, name: &str) -> Option<Res> {
+    prelude_lookup(p, name)
+        .or_else(|| BuiltinTy::lookup(name).map(Res::BuiltinTy))
+        .or_else(|| BuiltinFn::lookup(name).map(Res::BuiltinFn))
+}
+
 /// A name as an item or module path's first segment sees it: the module's own scope, then the
 /// prelude, then the built-ins.
 pub fn lookup_name(p: &Program, m: ModuleId, name: &str) -> Option<Res> {
-    if let Some(b) = p.module(m).scope.get(name) {
-        return Some(b.res);
+    match p.module(m).scope.get(name) {
+        Some(b) => Some(b.res),
+        None => lookup_global(p, name),
     }
-    if let Some(r) = prelude_lookup(p, name) {
-        return Some(r);
-    }
-    if let Some(t) = BuiltinTy::lookup(name) {
-        return Some(Res::BuiltinTy(t));
-    }
-    BuiltinFn::lookup(name).map(Res::BuiltinFn)
 }
 
 /// Every name visible in a module, for suggestions.
 pub fn visible_names(p: &Program, m: ModuleId) -> Vec<String> {
     let mut out: Vec<String> = p.module(m).scope.keys().cloned().collect();
-    if let Some(std) = p.std_root
-        && let Some(&prelude) = p.module(std).children.get("prelude")
-    {
-        out.extend(p.module(prelude).scope.keys().cloned());
-        out.push("Some".into());
-        out.push("None".into());
+    if let Some(prelude) = prelude(p) {
+        let scope = &p.module(prelude).scope;
+        out.extend(scope.keys().cloned());
+        for b in scope.values() {
+            if let Res::Adt(a) = b.res {
+                out.extend(p.adt(a).variants().iter().map(|v| v.name.clone()));
+            }
+        }
     }
     out
 }
@@ -169,20 +178,37 @@ fn describe_res(p: &Program, r: Res) -> String {
     }
 }
 
+/// A segment of a path as module path resolution reads it: a name, without generic arguments.
+pub trait PathSeg {
+    fn ident(&self) -> &ast::Ident;
+}
+
+impl PathSeg for ast::Ident {
+    fn ident(&self) -> &ast::Ident {
+        self
+    }
+}
+
+impl PathSeg for ast::PathSegment {
+    fn ident(&self) -> &ast::Ident {
+        &self.ident
+    }
+}
+
 /// Resolves a path of plain names (a `use` path, or a path's module prefix) from module `from`.
 /// The first segment is `std`, a name in `from`'s scope, a top-level module of the package, or
 /// a prelude name.
-pub fn resolve_module_path(p: &Program, from: ModuleId, segs: &[ast::Ident]) -> PathLookup {
+pub fn resolve_module_path(p: &Program, from: ModuleId, segs: &[impl PathSeg]) -> PathLookup {
     resolve_module_path_in(p, from, segs, false)
 }
 
 pub fn resolve_module_path_in(
     p: &Program,
     from: ModuleId,
-    segs: &[ast::Ident],
+    segs: &[impl PathSeg],
     final_pass: bool,
 ) -> PathLookup {
-    let first = &segs[0];
+    let first = segs[0].ident();
     let mut res = if first.name == "std" {
         match p.std_root {
             Some(s) => Res::Module(s),
@@ -205,12 +231,8 @@ pub fn resolve_module_path_in(
         b.res
     } else if let Some(&m) = p.package_root.and_then(|r| p.module(r).children.get(&first.name)) {
         Res::Module(m)
-    } else if let Some(r) = prelude_lookup(p, &first.name) {
+    } else if let Some(r) = lookup_global(p, &first.name) {
         r
-    } else if let Some(t) = BuiltinTy::lookup(&first.name) {
-        Res::BuiltinTy(t)
-    } else if let Some(f) = BuiltinFn::lookup(&first.name) {
-        Res::BuiltinFn(f)
     } else if is_broken(p, from, &first.name) {
         return PathLookup::Broken;
     } else {
@@ -232,6 +254,7 @@ pub fn resolve_module_path_in(
         return PathLookup::Error(Box::new(d));
     };
     for seg in &segs[1..] {
+        let seg = seg.ident();
         res = match res {
             Res::Module(m) => {
                 let module = p.module(m);
@@ -307,6 +330,40 @@ pub fn resolve_module_path_in(
     PathLookup::Found(res)
 }
 
+/// What a path names, in the final pass: `None` if it names nothing, with its error (if it has
+/// one) added to `diags`.
+pub fn lookup_or_report(
+    p: &Program,
+    diags: &mut Vec<Diagnostic>,
+    from: ModuleId,
+    segs: &[impl PathSeg],
+) -> Option<Res> {
+    match resolve_module_path_in(p, from, segs, true) {
+        PathLookup::Found(r) => Some(r),
+        PathLookup::Error(d) => {
+            diags.push(*d);
+            None
+        }
+        PathLookup::NotYet(..) | PathLookup::Broken => None,
+    }
+}
+
+/// E0322: `name` takes `want` generic arguments, but `given` are written. `s` ends the word
+/// "argument": `plural(want)`, or `"s"` where the message has always said "arguments".
+pub(crate) fn wrong_generic_count(
+    span: Span,
+    name: &str,
+    want: usize,
+    given: usize,
+    s: &str,
+) -> Diagnostic {
+    Diagnostic::new(
+        codes::E0322,
+        span,
+        format!("`{name}` takes {want} generic argument{s}, not {given}"),
+    )
+}
+
 /// Resolves a bound or supertrait: a path naming a trait, with its generic arguments.
 pub fn resolve_trait_ref(
     p: &Program,
@@ -318,15 +375,7 @@ pub fn resolve_trait_ref(
         diags.push(Diagnostic::new(codes::E0400, te.span, "expected a trait"));
         return None;
     };
-    let idents: Vec<ast::Ident> = path.segments.iter().map(|s| s.ident.clone()).collect();
-    let res = match resolve_module_path_in(p, scope.module, &idents, true) {
-        PathLookup::Found(r) => r,
-        PathLookup::Error(d) => {
-            diags.push(*d);
-            return None;
-        }
-        PathLookup::NotYet(..) | PathLookup::Broken => return None,
-    };
+    let res = lookup_or_report(p, diags, scope.module, &path.segments)?;
     let Res::Trait(t) = res else {
         diags.push(
             Diagnostic::new(
@@ -345,18 +394,10 @@ pub fn resolve_trait_ref(
         .flatten()
         .map(|a| resolve_type(p, diags, scope, a, TyPos::Normal))
         .collect();
-    let want = p.trait_(t).generics.len();
+    let (name, want) = (&p.trait_(t).name, p.trait_(t).generics.len());
     if args.len() != want {
-        diags.push(Diagnostic::new(
-            codes::E0322,
-            te.span,
-            format!(
-                "`{}` takes {want} generic argument{}, not {}",
-                p.trait_(t).name,
-                if want == 1 { "" } else { "s" },
-                args.len()
-            ),
-        ));
+        let s = wrela_diag::plural(want);
+        diags.push(wrong_generic_count(te.span, name, want, args.len(), s));
         return None;
     }
     Some(TraitRef { trait_: t, args })
@@ -364,26 +405,40 @@ pub fn resolve_trait_ref(
 
 /// Every trait a generic parameter is bounded by, including supertraits, with arguments.
 pub fn param_bounds_closure(p: &Program, param: ParamId) -> Vec<TraitRef> {
-    let bounds = p.param(param).bounds.clone();
     let mut out: Vec<TraitRef> = Vec::new();
-    for b in bounds {
-        add_with_supertraits(p, b, &mut out);
+    let self_ty = p.types.param(param);
+    for b in &p.param(param).bounds {
+        add_with_supertraits(p, self_ty, b.clone(), &mut out);
     }
     out
 }
 
-/// Adds `r` and, transitively, its supertraits (with `Self` and arguments substituted).
-pub fn add_with_supertraits(p: &Program, r: TraitRef, out: &mut Vec<TraitRef>) {
-    if out.contains(&r) {
-        return;
+/// Adds `r`, a trait `self_ty` has, and, transitively, its supertraits (with `Self` and
+/// arguments substituted). A cycle of supertraits (E0411) is followed once around: bounds are
+/// resolved before the cycles are found and cut, and a cycle whose arguments grow
+/// (`trait A<T>: B<W<T>>`, `trait B<T>: A<T>`) would never repeat a bound.
+pub fn add_with_supertraits(p: &Program, self_ty: TyId, r: TraitRef, out: &mut Vec<TraitRef>) {
+    fn go(
+        p: &Program,
+        self_ty: TyId,
+        r: TraitRef,
+        out: &mut Vec<TraitRef>,
+        path: &mut Vec<TraitId>,
+    ) {
+        if out.contains(&r) || path.contains(&r.trait_) {
+            return;
+        }
+        let tr = p.trait_(r.trait_);
+        let mut subst = Subst::from_pairs(&tr.generics, &r.args);
+        subst.insert(tr.self_param, self_ty);
+        path.push(r.trait_);
+        out.push(r);
+        for s in &tr.supertraits {
+            go(p, self_ty, s.subst(&p.types, &subst), out, path);
+        }
+        path.pop();
     }
-    out.push(r.clone());
-    let tr = p.trait_(r.trait_).clone();
-    let subst = Subst::from_pairs(&tr.generics, &r.args);
-    for s in tr.supertraits {
-        let args = s.args.iter().map(|&a| p.types.subst(a, &subst)).collect();
-        add_with_supertraits(p, TraitRef { trait_: s.trait_, args }, out);
-    }
+    go(p, self_ty, r, out, &mut Vec::new());
 }
 
 /// Resolves a type expression.
@@ -432,6 +487,7 @@ pub fn resolve_type(
             }
         }
         ast::TypeExprKind::Fn(params, ret) => {
+            // Only a written type; a body's inferred types are checked once it's finished.
             if !matches!(pos, TyPos::Param(_)) {
                 diags.push(
                     Diagnostic::new(codes::E0510, te.span, "a function type can only be a parameter's type")
@@ -462,8 +518,8 @@ pub fn const_u32(p: &Program, module: ModuleId, e: &ast::Expr) -> Option<u32> {
         visiting: &mut Vec<ConstId>,
     ) -> Option<u32> {
         match &e.kind {
-            ast::ExprKind::Lit(ast::Lit { kind: ast::LitKind::Int, text, .. }) => {
-                wrela_syntax::lexer::int_value(text).and_then(|v| u32::try_from(v).ok())
+            ast::ExprKind::Lit(ast::Lit { kind: ast::LitKind::Int(v), .. }) => {
+                v.ok().and_then(|v| u32::try_from(v).ok())
             }
             ast::ExprKind::Paren(inner) => go(p, module, inner, visiting),
             ast::ExprKind::Path(path) => {
@@ -489,8 +545,7 @@ pub fn resolve_value_item(p: &Program, module: ModuleId, path: &ast::Path) -> Op
     if path.is_single() {
         return lookup_name(p, module, &path.segments[0].ident.name);
     }
-    let idents: Vec<ast::Ident> = path.segments.iter().map(|s| s.ident.clone()).collect();
-    match resolve_module_path_in(p, module, &idents, true) {
+    match resolve_module_path_in(p, module, &path.segments, true) {
         PathLookup::Found(r) => Some(r),
         _ => None,
     }
@@ -544,7 +599,6 @@ fn resolve_type_path(
         ));
         return p.types.error;
     }
-    let idents: Vec<ast::Ident> = segs.iter().map(|s| s.ident.clone()).collect();
     let res = if segs.len() == 1 {
         match lookup_name(p, scope.module, first) {
             Some(r) => r,
@@ -577,13 +631,9 @@ fn resolve_type_path(
             }
         }
     } else {
-        match resolve_module_path_in(p, scope.module, &idents, true) {
-            PathLookup::Found(r) => r,
-            PathLookup::Error(d) => {
-                diags.push(*d);
-                return p.types.error;
-            }
-            PathLookup::NotYet(..) | PathLookup::Broken => return p.types.error,
+        match lookup_or_report(p, diags, scope.module, segs) {
+            Some(r) => r,
+            None => return p.types.error,
         }
     };
     let args: Vec<TyId> = last
@@ -612,16 +662,8 @@ fn resolve_type_path(
         Res::Adt(a) => {
             let want = p.adt(a).generics.len();
             if args.len() != want {
-                diags.push(Diagnostic::new(
-                    codes::E0322,
-                    te.span,
-                    format!(
-                        "`{}` takes {want} generic argument{}, not {}",
-                        p.adt(a).name,
-                        if want == 1 { "" } else { "s" },
-                        args.len()
-                    ),
-                ));
+                let s = wrela_diag::plural(want);
+                diags.push(wrong_generic_count(te.span, &p.adt(a).name, want, args.len(), s));
                 return p.types.error;
             }
             p.types.adt(a, args)
@@ -629,15 +671,7 @@ fn resolve_type_path(
         Res::Trait(t) => {
             let want = p.trait_(t).generics.len();
             if args.len() != want {
-                diags.push(Diagnostic::new(
-                    codes::E0322,
-                    te.span,
-                    format!(
-                        "`{}` takes {want} generic arguments, not {}",
-                        p.trait_(t).name,
-                        args.len()
-                    ),
-                ));
+                diags.push(wrong_generic_count(te.span, &p.trait_(t).name, want, args.len(), "s"));
                 return p.types.error;
             }
             let r = TraitRef { trait_: t, args };
@@ -680,26 +714,24 @@ fn resolve_type_path(
 fn projection(
     p: &Program,
     diags: &mut Vec<Diagnostic>,
-    _scope: &Scope,
+    scope: &Scope,
     base: TyId,
     name: &ast::Ident,
 ) -> TyId {
-    let candidates: Vec<TraitRef> = match p.types.kind(base).clone() {
-        TyKind::Param(id) => param_bounds_closure(p, id),
-        _ => {
-            // A concrete type in an impl: look for an impl with this associated type.
-            let mut found = None;
-            for (i, imp) in p.impls.iter().enumerate() {
-                if imp.self_ty == base && imp.assoc_types.contains_key(&name.name) {
-                    found = Some(ImplId(i as u32));
-                }
-            }
-            if let Some(i) = found {
-                return p.impl_(i).assoc_types[&name.name];
-            }
-            Vec::new()
-        }
+    let mut candidates: Vec<TraitRef> = match p.types.kind(base) {
+        TyKind::Param(id) => param_bounds_closure(p, *id),
+        _ => Vec::new(),
     };
+    // `Self::Name` in an impl of a trait: the trait's (or a supertrait's) associated type, for
+    // the impl's type; this impl's own, once it's known.
+    let imp = scope.impl_.map(|i| p.impl_(i)).filter(|imp| imp.self_ty == base);
+    if let Some((imp, r)) = imp.and_then(|imp| Some((imp, imp.trait_ref.as_ref()?))) {
+        let own = p.trait_(r.trait_).assoc_types.iter().any(|a| a.name == name.name);
+        if own && let Some(&t) = imp.assoc_types.get(&name.name) {
+            return t;
+        }
+        add_with_supertraits(p, base, r.clone(), &mut candidates);
+    }
     let hits: Vec<TraitRef> = candidates
         .into_iter()
         .filter(|r| p.trait_(r.trait_).assoc_types.iter().any(|a| a.name == name.name))

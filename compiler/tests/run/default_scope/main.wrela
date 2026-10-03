@@ -1,0 +1,28 @@
+// run: a default's names are resolved where it's declared, never in the caller's scope
+// expect: param(50) = 2
+// expect: shadowed(60) = 2
+// expect: field() = 3
+// expect: private_type() = 5
+
+use lib::{Look, deep, make}
+
+const SCALE: f32 = 100.0
+
+pub fn param(scale: f32) -> f32 {
+    make()
+}
+
+pub fn shadowed(k: f32) -> f32 {
+    var scale = k
+    scale += 1.0
+    make()
+}
+
+pub fn field() -> f32 {
+    let l = Look { inner: 0.0 }
+    l.size + l.inner
+}
+
+pub fn private_type() -> f32 {
+    deep(1.0)
+}

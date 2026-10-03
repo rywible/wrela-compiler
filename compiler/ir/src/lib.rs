@@ -9,15 +9,17 @@
 //!
 //! The IR knows nothing about the language's traits, generics or modes: lowering has
 //! monomorphized and resolved all of it. It knows the two targets only where they differ:
-//! integer arithmetic is checked (traps) on the CPU and wraps on the GPU, and only GPU code has
-//! resources and entry points.
+//! integer arithmetic is checked (traps) on the CPU and wraps on the GPU, only GPU code has
+//! resources and entry points, and only CPU code has constant data.
 
 pub mod derive;
 mod error;
 pub mod layout;
 pub mod opt;
 pub mod print;
+mod single_exit;
 mod types;
+pub mod uniformity;
 mod verify;
 pub mod visit;
 
@@ -37,7 +39,7 @@ macro_rules! ids {
     )*};
 }
 
-ids!(FuncId, ValueId, LocalId, ResourceId);
+ids!(FuncId, ValueId, LocalId, ResourceId, DataId, TypeId);
 
 /// Which processor a module's code runs on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -188,6 +190,8 @@ pub enum PlaceRoot {
     Resource(ResourceId),
     /// A pointer value (a projection returned by a call; CPU only).
     Ptr(ValueId),
+    /// Constant data: read, never written (CPU only).
+    Data(DataId),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -207,8 +211,12 @@ pub struct Place {
 }
 
 impl Place {
+    /// All of `root`, with no projection.
+    pub fn root(root: PlaceRoot) -> Place {
+        Place { root, path: Vec::new() }
+    }
     pub fn local(l: LocalId) -> Place {
-        Place { root: PlaceRoot::Local(l), path: Vec::new() }
+        Place::root(PlaceRoot::Local(l))
     }
     pub fn with(&self, p: Proj) -> Place {
         let mut path = self.path.clone();
@@ -223,6 +231,11 @@ pub enum Arg {
     /// A pointer to a place, for a by-reference parameter.
     Place(Place),
 }
+
+/// The most bytes a dispatch's or draw's uniform block can have: the block travels inside its
+/// command, and a command fits in the CPU program's command buffer (1 MiB), with room to spare
+/// for the rest of the command. Lowering rejects a larger one (E0702).
+pub const MAX_UNIFORM_BYTES: u32 = (1 << 20) - 256;
 
 /// Recording GPU work (CPU only); the WASM back end writes these as commands (wrela-abi).
 #[derive(Clone, Debug, PartialEq)]
@@ -344,7 +357,7 @@ pub struct LocalDecl {
     pub ty: TypeId,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Function {
     pub name: String,
     pub params: Vec<Param>,
@@ -383,6 +396,31 @@ impl Function {
 
     pub fn value_ty(&self, v: ValueId) -> TypeId {
         self.values[v.index()]
+    }
+
+    /// A copy of all but the body, for a transform to build a new body in.
+    pub fn clone_signature(&self) -> Function {
+        Function {
+            name: self.name.clone(),
+            params: self.params.clone(),
+            ret: self.ret,
+            ret_ref: self.ret_ref,
+            locals: self.locals.clone(),
+            values: self.values.clone(),
+            body: Vec::new(),
+        }
+    }
+
+    /// Parameter `i` passed on as a call's argument: its place if it's by reference, else its
+    /// value, read in `body`.
+    pub fn param_arg(&mut self, i: u32, body: &mut Block) -> Arg {
+        let p = &self.params[i as usize];
+        if p.by_ref {
+            return Arg::Place(Place::root(PlaceRoot::Param(i)));
+        }
+        let v = self.new_value(p.ty);
+        body.push(Stmt::Let(v, Expr::Param(i)));
+        Arg::Value(v)
     }
 }
 
@@ -448,6 +486,25 @@ pub struct EntryPoint {
     pub inputs: Vec<BuiltinInput>,
 }
 
+/// A constant's value, part by part as its type has them.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ConstValue {
+    Scalar(Const),
+    /// A struct's fields, a vector's components, a matrix's columns or an array's elements.
+    Parts(Vec<ConstValue>),
+    /// An enum's value: its variant, and the payload if the variant has one.
+    Variant(u32, Option<Box<ConstValue>>),
+}
+
+/// A constant in memory, which code reads through [`PlaceRoot::Data`] (CPU only): one copy
+/// however many functions read it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Data {
+    pub name: String,
+    pub ty: TypeId,
+    pub value: ConstValue,
+}
+
 /// A compiled unit for one target: the CPU program, or one GPU pipeline's shader module.
 #[derive(Clone, Debug, Default)]
 pub struct Module {
@@ -457,6 +514,8 @@ pub struct Module {
     pub entry_points: Vec<EntryPoint>,
     /// CPU only: functions exported from the WASM, by name.
     pub exports: Vec<(String, FuncId)>,
+    /// CPU only: constant data.
+    pub data: Vec<Data>,
 }
 
 impl Module {
@@ -465,47 +524,54 @@ impl Module {
     /// type of a vector in a module that names no `f32`), which a well-formed place never
     /// needs.
     pub fn place_ty(&self, f: &Function, p: &Place) -> Option<TypeId> {
-        let mut path = p.path.as_slice();
-        let mut t = match &p.root {
+        let (t, path) = self.place_start(f, p)?;
+        path.iter().try_fold(t, |t, proj| self.proj_ty(t, proj))
+    }
+
+    /// Where [`Module::place_ty`] starts: the type of a place's root, and the projections to
+    /// apply to it. A storage buffer's place is its array of elements, whose type may never
+    /// have been interned: a place that indexes the array starts at the element, past the index.
+    pub fn place_start<'p>(&self, f: &Function, p: &'p Place) -> Option<(TypeId, &'p [Proj])> {
+        let t = match &p.root {
             PlaceRoot::Local(l) => f.locals.get(l.index())?.ty,
             PlaceRoot::Param(i) => f.params.get(*i as usize)?.ty,
             PlaceRoot::Ptr(v) => match self.types.get(f.value_ty(*v)) {
                 TypeDef::Ptr(t) => *t,
                 _ => return None,
             },
+            PlaceRoot::Data(d) => self.data.get(d.index())?.ty,
             PlaceRoot::Resource(r) => {
                 let res = self.resources.get(r.index())?;
                 match res.kind {
                     ResourceKind::Uniform { .. } | ResourceKind::Private => res.ty,
-                    // A storage buffer's place is its array of elements: an element's type is
-                    // the resource's.
-                    ResourceKind::StorageRead | ResourceKind::StorageReadWrite => match path {
-                        [Proj::Index(_), rest @ ..] => {
-                            path = rest;
-                            res.ty
+                    ResourceKind::StorageRead | ResourceKind::StorageReadWrite => {
+                        match p.path.as_slice() {
+                            [Proj::Index(_), rest @ ..] => return Some((res.ty, rest)),
+                            _ => self.types.lookup(&TypeDef::RuntimeArray(res.ty))?,
                         }
-                        _ => self.types.lookup(&TypeDef::RuntimeArray(res.ty))?,
-                    },
+                    }
                 }
             }
         };
-        for proj in path {
-            t = match (self.types.get(t), proj) {
-                (TypeDef::Struct { .. } | TypeDef::Enum { .. }, Proj::Field(i)) => {
-                    self.types.field(t, *i)?
-                }
-                (TypeDef::Vector(_), Proj::Comp(_) | Proj::Index(_)) => {
-                    self.types.lookup(&TypeDef::Scalar(Scalar::F32))?
-                }
-                (TypeDef::Matrix(n), Proj::Index(_)) => self.types.lookup(&TypeDef::Vector(*n))?,
-                (
-                    TypeDef::Array(e, _) | TypeDef::RuntimeArray(e) | TypeDef::Run(e),
-                    Proj::Index(_),
-                ) => *e,
-                _ => return None,
-            };
+        Some((t, &p.path))
+    }
+
+    /// The type of one projection of a value of type `t`: `None` when the projection doesn't
+    /// apply to `t`, or its type was never interned.
+    pub fn proj_ty(&self, t: TypeId, proj: &Proj) -> Option<TypeId> {
+        match (self.types.get(t), proj) {
+            (TypeDef::Struct { .. } | TypeDef::Enum { .. }, Proj::Field(i)) => {
+                self.types.field(t, *i)
+            }
+            (TypeDef::Vector(_), Proj::Comp(_) | Proj::Index(_)) => {
+                self.types.lookup(&TypeDef::Scalar(Scalar::F32))
+            }
+            (TypeDef::Matrix(n), Proj::Index(_)) => self.types.lookup(&TypeDef::Vector(*n)),
+            (TypeDef::Array(e, _) | TypeDef::RuntimeArray(e) | TypeDef::Run(e), Proj::Index(_)) => {
+                Some(*e)
+            }
+            _ => None,
         }
-        Some(t)
     }
 
     pub fn add_function(&mut self, f: Function) -> FuncId {
@@ -513,15 +579,21 @@ impl Module {
         FuncId(self.functions.len() as u32 - 1)
     }
 
-    pub fn func(&self, f: FuncId) -> &Function {
-        &self.functions[f.index()]
+    pub fn add_resource(&mut self, r: Resource) -> ResourceId {
+        self.resources.push(r);
+        ResourceId(self.resources.len() as u32 - 1)
+    }
+
+    pub fn add_data(&mut self, d: Data) -> DataId {
+        self.data.push(d);
+        DataId(self.data.len() as u32 - 1)
     }
 }
 
 /// A name as an identifier both back ends accept: letters, digits and single underscores, not
-/// starting with a digit or an underscore (WGSL reserves names starting with `__`). The one
-/// place names are made identifiers, so an entry point's name in the manifest is its name in
-/// the shader.
+/// starting with a digit or an underscore (WGSL reserves names starting with `__`). The WGSL
+/// writer may still rename one (a WGSL keyword, a name ending in a digit, a name used twice),
+/// so the manifest takes entry points' names from the written shader (`wrela_wgsl::emit`).
 pub fn ident(name: &str) -> String {
     let mut s = String::with_capacity(name.len());
     for c in name.chars() {

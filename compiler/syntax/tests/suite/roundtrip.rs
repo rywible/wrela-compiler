@@ -1,47 +1,17 @@
 //! Parse → format → parse gives the same AST, and formatting is idempotent, on hand-written
 //! samples. (The grammar-generated round trips live in wrela-grammar's tests.)
 
+use crate::collect;
 use wrela_diag::FileId;
-use wrela_syntax::{fmt, parse};
+use wrela_syntax::lexer::{Brackets, line_break_is_newline};
+use wrela_syntax::{TokenKind, fmt, parse};
 
-/// The AST's Debug output without spans, and without the flags that record layout (whether a
-/// list or a chain link was written on several lines), which formatting may change.
-fn shape(src: &str) -> String {
-    let p = parse(FileId(0), src);
-    assert!(!p.has_errors(), "parse errors in:\n{src}\n{:#?}", p.diagnostics);
-    let debug = format!("{:#?}", p.file);
-    let kept: Vec<&str> = debug
-        .lines()
-        .filter(|l| {
-            let l = l.trim_start();
-            !l.starts_with("multiline:") && !l.starts_with("newline_before:")
-        })
-        .collect();
-    strip(&kept.join("\n"))
-}
-
-fn strip(s: &str) -> String {
-    let mut out = String::new();
-    let mut rest = s;
-    while let Some(i) = rest.find("Span {") {
-        out.push_str(&rest[..i]);
-        let j = rest[i..].find('}').map_or(rest.len(), |j| i + j + 1);
-        out.push('S');
-        rest = &rest[j..];
-    }
-    out.push_str(rest);
-    out
-}
-
+/// Formats `src`, and checks that the result parses to the same AST and that formatting it
+/// again changes nothing ([`fmt::check_round_trip`]).
 fn round_trip(src: &str) -> String {
     let p = parse(FileId(0), src);
     assert!(!p.has_errors(), "parse errors:\n{:#?}", p.diagnostics);
-    let once = fmt::format(&p, src);
-    assert_eq!(shape(src), shape(&once), "format changed the AST:\n{once}");
-    let p2 = parse(FileId(0), &once);
-    let twice = fmt::format(&p2, &once);
-    assert_eq!(once, twice, "formatting isn't idempotent");
-    once
+    fmt::check_round_trip(&p, src).unwrap_or_else(|e| panic!("{e}"))
 }
 
 /// A file using most of the syntax (compiler/grammar's tests read it too).
@@ -123,6 +93,56 @@ fn comments_inside_expressions_stay_put() {
     );
 }
 
+/// Comments stay between the same tokens, each on its own line or at the end of its line: none
+/// merges into another, moves to another item or becomes a doc comment of something else.
+#[test]
+fn comments_keep_their_places() {
+    let cases = [
+        // A doc comment after `{` stays the field's; a comment after `pub` stays there.
+        (
+            "pub // a\nstruct S { /// the field\n    x: f32,\n}\n",
+            "pub // a\n    struct S { /// the field\n    x: f32,\n}\n",
+        ),
+        // Comments in a struct pattern break it, like those in any list.
+        (
+            "fn f(e: E) -> u32 {\n    match e {\n        E::Key {\n            code, // the key\n            down, // pressed?\n        } => 1,\n    }\n}\n",
+            "fn f(e: E) -> u32 {\n    match e {\n        E::Key {\n            code, // the key\n            down, // pressed?\n        } => 1,\n    }\n}\n",
+        ),
+        (
+            "fn g(c: C) {\n    let C { width, // in pixels\n        height, .. } = c\n    let (lo, // inclusive\n        hi) = r\n}\n",
+            "fn g(c: C) {\n    let C {\n        width, // in pixels\n        height,\n        ..\n    } = c\n    let (\n        lo, // inclusive\n        hi,\n    ) = r\n}\n",
+        ),
+        // Comments after an attribute stay before the item, not in its parameters; a comment
+        // in the parameters stays there.
+        (
+            "@compute(64)\n// One invocation per cell.\nfn step(id: GlobalId) {}\n\nimpl G {\n    @inline\n    /// The area.\n    pub fn area(self) -> f32 {\n        1.0\n    }\n}\n\n@inline fn f(a: i32, // the a\n    b: i32) {}\n",
+            "@compute(64)\n// One invocation per cell.\nfn step(id: GlobalId) {}\n\nimpl G {\n    @inline\n    /// The area.\n    pub fn area(self) -> f32 {\n        1.0\n    }\n}\n\n@inline\nfn f(\n    a: i32, // the a\n    b: i32,\n) {}\n",
+        ),
+        // Comments in a `use` group stay in it.
+        (
+            "use std::gpu::{\n    // The thread index.\n    GlobalId, // trailing\n    Slots,\n}\n\nfn f() {}\n",
+            "use std::gpu::{\n    // The thread index.\n    GlobalId, // trailing\n    Slots,\n}\n\nfn f() {}\n",
+        ),
+        // A `)` in a comment, or in a generic bound, doesn't end the parameters.
+        (
+            "fn f(\n    a: i32, // see g(x)\n    // second\n) -> i32 {\n    a\n}\n",
+            "fn f(\n    a: i32, // see g(x)\n    // second\n) -> i32 {\n    a\n}\n",
+        ),
+        (
+            "fn f<T: Foo<fn(i32)>>(\n    // none\n) {}\n",
+            "fn f<T: Foo<fn(i32)>>(\n    // none\n) {}\n",
+        ),
+        // A blank line after a section's comment stays, in a list as between statements.
+        (
+            "fn h() {\n    g(\n        // section one\n\n        a,\n        b,\n    )\n    let s = S { // header\n\n        x: 1,\n    }\n}\n",
+            "fn h() {\n    g(\n        // section one\n\n        a,\n        b,\n    )\n    let s = S { // header\n\n        x: 1,\n    }\n}\n",
+        ),
+    ];
+    for (src, want) in cases {
+        assert_eq!(round_trip(src), want, "from:\n{src}");
+    }
+}
+
 /// A tiny deterministic generator, for the comment positions.
 struct XorShift(u64);
 
@@ -135,9 +155,9 @@ impl XorShift {
     }
 }
 
-/// Every repository source the formatter owns, with comments put after random tokens that
-/// can't end a statement (where a line break is whitespace, L17): formatting keeps every
-/// comment, doesn't change the AST and is idempotent.
+/// Every repository source the formatter owns, with comments put after random tokens where a
+/// line break changes no token (L17), at the end of the line or on a line of their own:
+/// formatting keeps every comment in its place, doesn't change the AST and is idempotent.
 #[test]
 fn comments_anywhere_survive_formatting() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -173,11 +193,19 @@ fn comments_anywhere_survive_formatting() {
 fn random_comments_survive(path: &std::path::Path, mut rng: XorShift) {
     let text = std::fs::read_to_string(path).expect("read");
     let tokens = wrela_syntax::lex(FileId(0), &text).tokens;
-    let spots: Vec<usize> = tokens
-        .iter()
-        .filter(|t| !t.kind.can_end_statement() && t.kind != wrela_syntax::TokenKind::Eof)
-        .map(|t| t.span.end as usize)
-        .collect();
+    let mut brackets = Brackets::default();
+    let mut spots = Vec::new();
+    for w in tokens.windows(2) {
+        brackets.track(w[0].kind);
+        let (a, b) = (w[0].kind, w[1].kind);
+        if a == TokenKind::Newline || b == TokenKind::Eof {
+            continue;
+        }
+        // A NEWLINE is already there, or a line break would be whitespace.
+        if b == TokenKind::Newline || !line_break_is_newline(brackets.in_brace(), a, b) {
+            spots.push(w[0].span.end as usize);
+        }
+    }
     for round in 0..4 {
         let mut at: Vec<usize> = (0..6).map(|_| spots[rng.below(spots.len())]).collect();
         at.sort();
@@ -186,30 +214,18 @@ fn random_comments_survive(path: &std::path::Path, mut rng: XorShift) {
         let mut last = 0;
         for (i, &p) in at.iter().enumerate() {
             src.push_str(&text[last..p]);
-            src.push_str(&format!(" // c{round}x{i}\n"));
+            let own_line = if rng.below(2) == 0 { "\n" } else { " " };
+            src.push_str(&format!("{own_line}// c{round}x{i}\n"));
             last = p;
         }
         src.push_str(&text[last..]);
         let name = path.display();
         let p = parse(FileId(0), &src);
         assert!(!p.has_errors(), "{name}: the comments broke the parse:\n{src}");
-        let out = round_trip(&src);
+        let out = fmt::check_round_trip(&p, &src).unwrap_or_else(|e| panic!("{name}: {e}"));
         for i in 0..at.len() {
             let c = format!("// c{round}x{i}");
             assert_eq!(out.matches(&c).count(), 1, "{name}: {c} lost or doubled:\n{out}");
-        }
-    }
-}
-
-fn collect(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
-    let mut paths: Vec<_> = entries.flatten().map(|e| e.path()).collect();
-    paths.sort();
-    for p in paths {
-        if p.is_dir() {
-            collect(&p, out);
-        } else if p.extension().is_some_and(|e| e == "wrela") {
-            out.push(p);
         }
     }
 }

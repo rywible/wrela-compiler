@@ -1,0 +1,83 @@
+// rejects: gen.bounds
+// A blanket impl bounded by its own trait implements it for nothing.
+trait Tr {
+    fn t(self) -> i32 {
+        1
+    }
+}
+
+impl<T: Tr> Tr for T {}
+
+fn need<X: Tr>(x: X) -> i32 {
+    x.t()
+}
+
+fn f() -> i32 {
+    need(5) //~ E0400
+}
+
+// Two blanket impls bounded by each other's trait.
+trait A {
+    fn a(self) -> i32 {
+        1
+    }
+}
+
+trait B {
+    fn b(self) -> i32 {
+        2
+    }
+}
+
+impl<T: A> B for T {}
+
+impl<T: B> A for T {}
+
+fn g() -> i32 {
+    let x: i32 = 3
+    x.a() //~ E0207
+}
+
+// A method's own bounds hold however it's called.
+trait Make {
+    fn make<U: Copy>(u: U) -> Self
+}
+
+struct Loose {
+    x: f32,
+}
+
+struct Tight: Copy + Clone {
+    x: f32,
+}
+
+impl Make for Tight {
+    fn make<U: Copy>(u: U) -> Tight {
+        Tight { x: 1.0 }
+    }
+}
+
+fn through_param<T: Make>() -> T {
+    T::make(Loose { x: 1.0 }) //~ E0400
+}
+
+fn through_type() -> Tight {
+    Tight::make(Loose { x: 1.0 }) //~ E0400
+}
+
+// A cycle of supertraits whose arguments grow.
+struct Wrap<T> {
+    x: T,
+}
+
+trait C<T>: D<Wrap<T>> {
+    type K
+}
+
+trait D<T>: C<T> {} //~ E0411
+
+fn h<U: C<i32>, V: D<U::K>>(u: U, v: V) {}
+
+fn twice<T, T>(x: i32) -> i32 { //~ E0201
+    x
+}

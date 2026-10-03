@@ -13,7 +13,8 @@
 //! - A render pipeline draws a triangle list into the screen, whose format is [`SCREEN_FORMAT`]
 //!   without sRGB encoding, so hosts produce the same bytes.
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
+use serde_json::{Map, Value};
 use std::fmt;
 
 pub const VERSION: u32 = 1;
@@ -23,8 +24,9 @@ pub const SCREEN_FORMAT: &str = "rgba8unorm";
 pub const MAX_WORKGROUP_SIZE: [u32; 3] = [256, 256, 64];
 pub const MAX_WORKGROUP_INVOCATIONS: u32 = 256;
 pub const MAX_STORAGE_BUFFERS_PER_STAGE: usize = 8;
+pub const MAX_UNIFORM_BUFFER_BINDING_SIZE: u32 = 65536;
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Manifest {
     pub manifest_version: u32,
     pub stream_version: u32,
@@ -33,7 +35,7 @@ pub struct Manifest {
     pub pipelines: Vec<Pipeline>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Pipeline {
     /// For diagnostics: the entry points' names.
     pub name: String,
@@ -45,21 +47,21 @@ pub struct Pipeline {
     pub buffers: Vec<BufferBinding>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Stage {
     Compute { entry: String, workgroup_size: [u32; 3] },
     Render { vertex_entry: String, fragment_entry: String },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UniformSpace {
     Uniform,
     Storage,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct UniformBlock {
     pub binding: u32,
     /// Bytes; the uniform bytes of every dispatch or draw of this pipeline have this length.
@@ -67,14 +69,14 @@ pub struct UniformBlock {
     pub space: UniformSpace,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Access {
     Read,
     ReadWrite,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct BufferBinding {
     pub binding: u32,
     pub access: Access,
@@ -103,13 +105,13 @@ impl Manifest {
 
     /// Parses and validates a manifest; any other version is rejected.
     pub fn parse(json: &str) -> Result<Manifest, ManifestError> {
-        let v: serde_json::Value =
-            serde_json::from_str(json).map_err(|e| ManifestError(e.to_string()))?;
+        let v: Value = serde_json::from_str(json).map_err(|e| ManifestError(e.to_string()))?;
         match v.get("manifest_version") {
-            Some(got) if got.as_u64() == Some(VERSION as u64) => {}
+            Some(got) if got.as_f64() == Some(f64::from(VERSION)) => {}
             Some(got) => {
                 return Err(ManifestError(format!(
-                    "manifest version {got}, but this host reads version {VERSION}"
+                    "manifest version {}, but this host reads version {VERSION}",
+                    read::show(got)
                 )));
             }
             None => {
@@ -118,7 +120,7 @@ impl Manifest {
                 )));
             }
         }
-        let m: Manifest = serde_json::from_value(v).map_err(|e| ManifestError(e.to_string()))?;
+        let m = read::manifest(&v)?;
         m.validate()?;
         Ok(m)
     }
@@ -153,6 +155,13 @@ impl Manifest {
                 if u.space == UniformSpace::Uniform && u.size % 16 != 0 {
                     return err(format!(
                         "pipeline {i}'s uniform block of {} bytes isn't a multiple of 16",
+                        u.size
+                    ));
+                }
+                if u.space == UniformSpace::Uniform && u.size > MAX_UNIFORM_BUFFER_BINDING_SIZE {
+                    return err(format!(
+                        "pipeline {i}'s uniform block of {} bytes is over WebGPU's default \
+                         limit of {MAX_UNIFORM_BUFFER_BINDING_SIZE}",
                         u.size
                     ));
                 }
@@ -206,28 +215,168 @@ impl Manifest {
     }
 }
 
+/// Reads a manifest from JSON one field at a time, in the order and words of the browser
+/// runtime's `src/manifest.ts`, so both hosts accept the same files. (serde's derive would also
+/// accept other shapes: a struct as an array, an enum tag as a number.)
+mod read {
+    use super::*;
+
+    type Result<T> = std::result::Result<T, ManifestError>;
+    type Json = Map<String, Value>;
+
+    fn fail<T>(why: String) -> Result<T> {
+        Err(ManifestError(why))
+    }
+
+    /// A JSON value as both hosts show it: a scalar as JavaScript writes it, else its kind.
+    pub(super) fn show(v: &Value) -> String {
+        match v {
+            Value::Array(_) => "an array".into(),
+            Value::Object(_) => "an object".into(),
+            Value::Number(n) => js_number(n.as_f64().unwrap_or(f64::NAN)),
+            _ => v.to_string(),
+        }
+    }
+
+    /// `String(x)` in JavaScript: the shortest digits that read back as `x`, with an exponent
+    /// below 1e-6 and from 1e21.
+    fn js_number(x: f64) -> String {
+        if x == 0.0 {
+            return "0".into();
+        }
+        if (1e-6..1e21).contains(&x.abs()) {
+            return format!("{x}");
+        }
+        let s = format!("{x:e}");
+        match s.split_once('e') {
+            Some((m, e)) if !e.starts_with('-') => format!("{m}e+{e}"),
+            _ => s,
+        }
+    }
+
+    fn field<'a>(o: &'a Json, key: &str, place: &str) -> Result<&'a Value> {
+        match o.get(key) {
+            Some(v) => Ok(v),
+            None => fail(format!("missing field `{key}` in {place}")),
+        }
+    }
+
+    /// A whole number in range. JSON can't tell `1` from `1.0`, so neither does this.
+    fn as_u32(v: &Value, what: &str) -> Result<u32> {
+        match v.as_f64() {
+            Some(x) if x.fract() == 0.0 && (0.0..=f64::from(u32::MAX)).contains(&x) => Ok(x as u32),
+            _ => fail(format!("{what} must be a u32, not {}", show(v))),
+        }
+    }
+
+    fn u32(o: &Json, key: &str, place: &str) -> Result<u32> {
+        as_u32(field(o, key, place)?, &format!("{place}.{key}"))
+    }
+
+    fn string(o: &Json, key: &str, place: &str) -> Result<String> {
+        match field(o, key, place)? {
+            Value::String(s) => Ok(s.clone()),
+            _ => fail(format!("{place}.{key} must be a string")),
+        }
+    }
+
+    fn object<'a>(v: &'a Value, place: &str) -> Result<&'a Json> {
+        match v {
+            Value::Object(o) => Ok(o),
+            _ => fail(format!("{place} must be an object")),
+        }
+    }
+
+    fn one_of<T: Copy>(o: &Json, key: &str, place: &str, options: &[(&str, T)]) -> Result<T> {
+        let v = field(o, key, place)?;
+        match options.iter().find(|(name, _)| v.as_str() == Some(name)) {
+            Some(&(_, t)) => Ok(t),
+            None => {
+                let names: Vec<&str> = options.iter().map(|(n, _)| *n).collect();
+                fail(format!("{place}.{key} must be one of {}, not {}", names.join(", "), show(v)))
+            }
+        }
+    }
+
+    fn pipeline(v: &Value, i: usize) -> Result<Pipeline> {
+        let place = format!("pipelines[{i}]");
+        let o = object(v, &place)?;
+        let name = string(o, "name", &place)?;
+        let shader = string(o, "shader", &place)?;
+        // A missing `uniform` is read as null.
+        let uniform = match o.get("uniform").unwrap_or(&Value::Null) {
+            Value::Null => None,
+            u => {
+                let up = format!("{place}.uniform");
+                let uo = object(u, &up)?;
+                let spaces =
+                    [("uniform", UniformSpace::Uniform), ("storage", UniformSpace::Storage)];
+                Some(UniformBlock {
+                    binding: u32(uo, "binding", &up)?,
+                    size: u32(uo, "size", &up)?,
+                    space: one_of(uo, "space", &up, &spaces)?,
+                })
+            }
+        };
+        let Value::Array(bufs) = field(o, "buffers", &place)? else {
+            return fail(format!("{place}.buffers must be an array"));
+        };
+        let buffers = bufs
+            .iter()
+            .enumerate()
+            .map(|(j, b)| {
+                let bp = format!("{place}.buffers[{j}]");
+                let bo = object(b, &bp)?;
+                let accesses = [("read", Access::Read), ("read_write", Access::ReadWrite)];
+                Ok(BufferBinding {
+                    binding: u32(bo, "binding", &bp)?,
+                    access: one_of(bo, "access", &bp, &accesses)?,
+                })
+            })
+            .collect::<Result<_>>()?;
+        let stage = match one_of(o, "kind", &place, &[("compute", true), ("render", false)])? {
+            true => {
+                let sizes = match field(o, "workgroup_size", &place)? {
+                    Value::Array(ws) if ws.len() == 3 => ws,
+                    _ => return fail(format!("{place}.workgroup_size must be an array of 3 u32s")),
+                };
+                let mut workgroup_size = [0; 3];
+                for (k, s) in sizes.iter().enumerate() {
+                    workgroup_size[k] = as_u32(s, &format!("{place}.workgroup_size[{k}]"))?;
+                }
+                Stage::Compute { entry: string(o, "entry", &place)?, workgroup_size }
+            }
+            false => Stage::Render {
+                vertex_entry: string(o, "vertex_entry", &place)?,
+                fragment_entry: string(o, "fragment_entry", &place)?,
+            },
+        };
+        Ok(Pipeline { name, shader, stage, uniform, buffers })
+    }
+
+    /// A manifest whose version has been checked.
+    pub(super) fn manifest(v: &Value) -> Result<Manifest> {
+        let o = object(v, "the manifest")?;
+        let Value::Array(pipelines) = field(o, "pipelines", "the manifest")? else {
+            return fail("pipelines must be an array".into());
+        };
+        Ok(Manifest {
+            manifest_version: u32(o, "manifest_version", "the manifest")?,
+            stream_version: u32(o, "stream_version", "the manifest")?,
+            wasm: string(o, "wasm", "the manifest")?,
+            pipelines: pipelines
+                .iter()
+                .enumerate()
+                .map(|(i, p)| pipeline(p, i))
+                .collect::<Result<_>>()?,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn sample() -> Manifest {
-        let mut m = Manifest::new("game.wasm");
-        m.pipelines.push(Pipeline {
-            name: "sample".into(),
-            shader: "pipeline_0.wgsl".into(),
-            stage: Stage::Compute { entry: "main".into(), workgroup_size: [64, 1, 1] },
-            uniform: Some(UniformBlock { binding: 0, size: 32, space: UniformSpace::Uniform }),
-            buffers: vec![BufferBinding { binding: 1, access: Access::ReadWrite }],
-        });
-        m.pipelines.push(Pipeline {
-            name: "cover+shade".into(),
-            shader: "pipeline_1.wgsl".into(),
-            stage: Stage::Render { vertex_entry: "vs".into(), fragment_entry: "fs".into() },
-            uniform: None,
-            buffers: vec![],
-        });
-        m
-    }
+    use crate::vectors::sample_manifest as sample;
 
     /// Golden JSON: the manifest's format is part of the contract.
     #[test]

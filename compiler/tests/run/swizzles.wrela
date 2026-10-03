@@ -1,0 +1,93 @@
+// run: swizzles as places: projections of several components, and indexes into them
+// expect: bind_assign(10.0) = 23.0
+// expect: bind_comp(10.0) = 15.0
+// expect: bind_compound(10.0) = 26.0
+// expect: index_read(0) = 3.0
+// expect: index_read(2) = 1.0
+// expect: index_read(3) traps
+// expect: index_write(0) = 129.0
+// expect: index_compound(1) = 173.0
+// expect: index_compound(2) traps
+// expect: bind_index_read(0) = 4.0
+// expect: bind_index_write(1) = 193.0
+// expect: bind_index_mut_arg(0) = 124.0
+// expect: index_select(0, false) = 3.0
+// expect: index_select(2, true) = 9.0
+// expect: arg_copy(1) = 2.0
+
+pub fn bind_assign(a: f32) -> f32 {
+    var v = vec3(1.0, 2.0, 3.0)
+    mut b = v.xy
+    b = vec2(a, a)
+    v.x + v.y + v.z
+}
+
+pub fn bind_comp(a: f32) -> f32 {
+    var v = vec3(1.0, 2.0, 3.0)
+    mut b = v.xy
+    b.x = a
+    v.x + v.y + v.z
+}
+
+pub fn bind_compound(a: f32) -> f32 {
+    var v = vec3(1.0, 2.0, 3.0)
+    mut b = v.zx
+    b += vec2(a, a)
+    v.x + v.y + v.z
+}
+
+pub fn index_read(i: u32) -> f32 {
+    let v = vec3(1.0, 2.0, 3.0)
+    v.zyx[i]
+}
+
+pub fn index_write(i: u32) -> f32 {
+    var v = vec3(1.0, 2.0, 3.0)
+    v.zyx[i] = 9.0
+    v.x * 100.0 + v.y * 10.0 + v.z
+}
+
+pub fn index_compound(i: u32) -> f32 {
+    var v = vec3(1.0, 2.0, 3.0)
+    v.zy[i] += 5.0
+    v.x * 100.0 + v.y * 10.0 + v.z
+}
+
+pub fn bind_index_read(i: u32) -> f32 {
+    var v = vec3(1.0, 2.0, 3.0)
+    mut s = v.zy
+    s.x = 4.0
+    s[i]
+}
+
+pub fn bind_index_write(i: u32) -> f32 {
+    var v = vec3(1.0, 2.0, 3.0)
+    mut s = v.zy
+    s[i] = 9.0
+    v.x * 100.0 + v.y * 10.0 + v.z
+}
+
+fn bump(x: mut f32) {
+    x += 1.0
+}
+
+pub fn bind_index_mut_arg(i: u32) -> f32 {
+    var v = vec3(1.0, 2.0, 3.0)
+    mut s = v.zy
+    bump(mut s[i])
+    v.x * 100.0 + v.y * 10.0 + v.z
+}
+
+pub fn index_select(i: u32, c: bool) -> f32 {
+    let v = vec3(1.0, 2.0, 3.0)
+    select(v.zyx[i], 9.0, c)
+}
+
+fn get(v: vec3, i: u32) -> f32 {
+    v[i]
+}
+
+pub fn arg_copy(i: u32) -> f32 {
+    let v = vec3(1.0, 2.0, 3.0)
+    get(v.zyx, i)
+}

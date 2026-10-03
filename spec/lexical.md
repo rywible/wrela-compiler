@@ -44,7 +44,7 @@ Error codes come from the lexical range E0001–E0099, or the tier range E0900�
   ```
 
   Type names (`f32`, `u32`, `vec3`, `bool`, …) and attribute names (`compute` in `@compute`) are
-  ordinary identifiers. `dyn`, `unsafe` and `where` are reserved for later tiers.
+  ordinary identifiers. `unsafe` and `where` are reserved for later tiers. `dyn` is reserved, but wrela has no `dyn` (language.md §18): the word stays reserved so the compiler can say what to use instead.
 
 ## Number literals
 
@@ -79,6 +79,9 @@ Error codes come from the lexical range E0001–E0099, or the tier range E0900�
 
   A float has digits on both sides of its `.`: `1.` is `1` then `.`, and `.5` is `.` then `5`.
   There are no negative literals: `-1` is unary minus applied to `1`.
+  A literal must fit the type it takes (E0006): an integer is in its type's range, a float is
+  finite (it may round), and an integer that becomes a float is exact (`16777217` isn't an
+  `f32`; `16777217.0` rounds).
 
 ## String literals (tier 1)
 

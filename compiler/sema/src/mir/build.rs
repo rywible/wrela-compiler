@@ -8,9 +8,9 @@
 //! until the call, across anything evaluated in between.
 //!
 //! The memory rules that depend only on how code is written are checked here: a move out of a
-//! named place needs `take` (E0501, E0502), `var` can't share a place (E0517), `mut x = ...`
-//! needs a place (E0512), and a `mut` projection is returned as `mut place` (E0503). The rest,
-//! which depend on control flow, are the borrow checker's.
+//! named place needs `take` (E0501, E0502), `var` can't share a place (E0517), `mut` needs a
+//! place, not a temporary, a constant or a closure (E0512), and a `mut` projection is returned
+//! as `mut place` (E0503). The rest, which depend on control flow, are the borrow checker's.
 
 use super::*;
 use crate::defs::{Lang, Mode, RetMode};
@@ -22,6 +22,9 @@ use wrela_diag::{Diagnostic, codes};
 
 /// The checked constants: their types and values.
 pub type Consts = BTreeMap<ConstId, (TyId, thir::Expr)>;
+
+/// A constant with more numbers than this is a table ([`Builder::is_table`]).
+const TABLE_SCALARS: u64 = 16;
 
 /// How an expression's value is used.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,7 +55,6 @@ pub fn build(p: &Program, consts: &Consts, f: FnId, body: &thir::Body) -> (Body,
     let mut b = Builder {
         p,
         consts,
-        thir: body,
         locals,
         diags: Vec::new(),
         fs: FnState::new(def.ret_mode, None, body.value.span),
@@ -96,7 +98,6 @@ impl FnState {
 struct Builder<'a> {
     p: &'a Program,
     consts: &'a Consts,
-    thir: &'a thir::Body,
     locals: Vec<LocalDecl>,
     diags: Vec<Diagnostic>,
     fs: FnState,
@@ -154,6 +155,26 @@ impl<'a> Builder<'a> {
         self.terminate(TerminatorKind::Goto(target), span);
     }
 
+    /// `if cond { then } else { else_ }`, each branch going on to the block where they join;
+    /// `cur` is that block after.
+    fn diamond(
+        &mut self,
+        cond: Operand,
+        span: Span,
+        then: impl FnOnce(&mut Self),
+        else_: impl FnOnce(&mut Self),
+    ) {
+        let (t, el, m) = (self.new_block(), self.new_block(), self.new_block());
+        self.terminate(TerminatorKind::If { cond, then: t, else_: el, merge: m }, span);
+        self.fs.cur = t;
+        then(self);
+        self.goto(m, span);
+        self.fs.cur = el;
+        else_(self);
+        self.goto(m, span);
+        self.fs.cur = m;
+    }
+
     // ---- locals ----------------------------------------------------------------------------
 
     fn temp(&mut self, ty: TyId, kind: LocalKind, name: impl Into<String>, span: Span) -> Local {
@@ -175,28 +196,26 @@ impl<'a> Builder<'a> {
 
     /// Whether a value of this type is nothing at run time: `()` or `!`.
     fn is_unit(&self, t: TyId) -> bool {
-        matches!(self.p.types.kind(t), TyKind::Never | TyKind::Error)
-            || matches!(self.p.types.kind(t), TyKind::Tuple(ts) if ts.is_empty())
+        matches!(self.p.types.kind(t), TyKind::Never | TyKind::Error) || self.is_empty_tuple(t)
+    }
+
+    /// Whether `t` is `()`: a value that is nothing at run time, but still a value.
+    fn is_empty_tuple(&self, t: TyId) -> bool {
+        matches!(self.p.types.kind(t), TyKind::Tuple(ts) if ts.is_empty())
     }
 
     /// Whether `l` is outside the closure being built (a capture).
     fn is_capture(&self, l: Local) -> bool {
-        match self.fs.closure {
-            Some(c) => {
-                self.locals[l.index()].closure != Some(c)
-                    && !self.thir.closures[c.0 as usize].params.contains(&l)
-            }
-            None => false,
-        }
+        is_capture(&self.locals, self.fs.closure, l)
     }
 
     fn describe(&self, place: &Place) -> String {
         describe(self.p, &self.locals, place)
     }
 
-    /// `t = value`, returning a copy of `t`. `None` for a value that is nothing.
+    /// `t = value`, returning a copy of `t`. `None` for a value of `!` (or after an error).
     fn temp_of(&mut self, rv: Rvalue, ty: TyId, span: Span) -> Option<Operand> {
-        if self.is_unit(ty) {
+        if self.is_unit(ty) && !self.is_empty_tuple(ty) {
             self.push(StatementKind::Eval(rv), span);
             return None;
         }
@@ -237,18 +256,25 @@ impl<'a> Builder<'a> {
     /// Whether `e` names a place the memory rules see: rooted at a local, or what a
     /// projection-returning call returned.
     fn is_named_place(e: &thir::Expr) -> bool {
-        match &e.kind {
+        match &e.place_root().kind {
             ExprKind::Local(_) => true,
-            ExprKind::Field(b, _) | ExprKind::Swizzle(b, _) | ExprKind::Index(b, _) => {
-                Self::is_named_place(b)
-            }
             ExprKind::Call(c) => c.ret_mode != RetMode::Owned,
             _ => false,
         }
     }
 
-    /// Evaluates `e` for its value. `None` when it has none: `()`, `!`, or after an error.
+    /// Evaluates `e` for its value. `None` when it has none: `!`, or after an error. A `()` is
+    /// a value too (nothing at run time), so a tuple, struct or call it's part of is whole.
     fn value(&mut self, e: &thir::Expr, want: Want) -> Option<Operand> {
+        let v = self.eval(e, want);
+        if v.is_none() && self.is_empty_tuple(e.ty) {
+            return self.temp_of(Rvalue::Tuple(Vec::new()), e.ty, e.span);
+        }
+        v
+    }
+
+    /// [`Self::value`], except that a `()` may have no operand.
+    fn eval(&mut self, e: &thir::Expr, want: Want) -> Option<Operand> {
         let span = e.span;
         match &e.kind {
             ExprKind::Lit(l) => Some(Operand { kind: OperandKind::Const(*l), ty: e.ty, span }),
@@ -280,6 +306,9 @@ impl<'a> Builder<'a> {
             }
             ExprKind::Const(c) => {
                 let (_, v) = self.consts.get(c)?;
+                if self.is_table(v) {
+                    return self.temp_of(Rvalue::Const(*c), e.ty, span);
+                }
                 self.value(v, Want::Read)
             }
             ExprKind::Take(inner) => self.take(inner),
@@ -325,7 +354,7 @@ impl<'a> Builder<'a> {
                 OperandKind::Move(place, MoveKind::Return)
             }
             Want::Move | Want::Return => {
-                self.unmarked_move(&place, e);
+                self.unmarked_move(&place, e.ty, e.span);
                 OperandKind::Move(place, MoveKind::Unmarked)
             }
         };
@@ -334,29 +363,25 @@ impl<'a> Builder<'a> {
 
     /// Whether the function owns `l` outright (so it can move out of it).
     fn owned(&self, l: Local) -> bool {
-        matches!(
-            self.locals[l.index()].kind,
-            LocalKind::User(thir::LocalKind::Owned { .. } | thir::LocalKind::Param(Mode::Take))
-                | LocalKind::Temp
-                | LocalKind::TempVar
-        ) && !self.is_capture(l)
+        self.locals[l.index()].kind.owns_value() && !self.is_capture(l)
     }
 
-    /// E0501 or E0502: a non-`Copy` named place used where its value is consumed, unmarked.
-    fn unmarked_move(&mut self, place: &Place, e: &thir::Expr) {
+    /// E0501 or E0502: a non-`Copy` named place, of type `ty`, used at `span` where its value is
+    /// consumed, unmarked.
+    fn unmarked_move(&mut self, place: &Place, ty: TyId, span: Span) {
         let what = self.describe(place);
-        let shown = self.p.display_ty(e.ty);
+        let shown = self.p.display_ty(ty);
         let indexed = place.proj.iter().any(|p| matches!(p, Proj::Index(_)));
         let d = if self.owned(place.local) && !indexed {
             Diagnostic::new(
                 codes::E0501,
-                e.span,
+                span,
                 format!("moving `{what}` out of a named place is written `take {what}`"),
             )
             .with_note(format!("`{shown}` isn't `Copy`, so using it here moves it (§6.1)"))
             .with_fix(
                 format!("move it: `take {what}`"),
-                e.span.shrink_to_start(),
+                span.shrink_to_start(),
                 "take ",
             )
         } else {
@@ -365,9 +390,9 @@ impl<'a> Builder<'a> {
             } else {
                 self.why_not_owned(place.local)
             };
-            Diagnostic::new(codes::E0502, e.span, format!("can't move `{what}` here: {why}"))
+            Diagnostic::new(codes::E0502, span, format!("can't move `{what}` here: {why}"))
                 .with_note(format!("`{shown}` isn't `Copy`, so using it here would move it"))
-                .with_fix(format!("copy it: `{what}.clone()`"), e.span.shrink_to_end(), ".clone()")
+                .with_fix(format!("copy it: `{what}.clone()`"), span.shrink_to_end(), ".clone()")
         };
         self.diags.push(d);
     }
@@ -498,9 +523,7 @@ impl<'a> Builder<'a> {
                             let base_expr = base.as_deref().expect("a base");
                             let named = Self::is_named_place(base_expr);
                             let kind = if named && !self.is_copy(f.ty) {
-                                let probe =
-                                    thir::Expr { ty: f.ty, kind: ExprKind::Error, span: f.span };
-                                self.unmarked_move(&fp, &probe);
+                                self.unmarked_move(&fp, f.ty, f.span);
                                 OperandKind::Move(fp, MoveKind::Unmarked)
                             } else {
                                 OperandKind::Copy(fp)
@@ -525,6 +548,51 @@ impl<'a> Builder<'a> {
         })
     }
 
+    /// Whether a constant's value is a table: more than [`TABLE_SCALARS`] numbers, in parts
+    /// that are all literal values (no conversions). It's kept in one place, not built at each
+    /// use.
+    fn is_table(&self, v: &thir::Expr) -> bool {
+        fn literal(consts: &Consts, e: &thir::Expr) -> bool {
+            match &e.kind {
+                ExprKind::Lit(_) => true,
+                ExprKind::Unary(UnOp::Neg, x) => matches!(x.kind, ExprKind::Lit(_)),
+                ExprKind::Const(c) => consts.get(c).is_some_and(|(_, v)| literal(consts, v)),
+                ExprKind::Adt { fields, base: None, .. } => {
+                    fields.iter().all(|f| literal(consts, f))
+                }
+                ExprKind::Tuple(xs) | ExprKind::Array(xs) | ExprKind::Construct(xs) => {
+                    xs.iter().all(|x| literal(consts, x))
+                }
+                ExprKind::ArrayRepeat(x, _) => literal(consts, x),
+                _ => false,
+            }
+        }
+        self.scalars(v.ty) > TABLE_SCALARS && literal(self.consts, v)
+    }
+
+    /// How many numbers a value of type `t` holds (an enum: its tag and largest payload).
+    fn scalars(&self, t: TyId) -> u64 {
+        let p = self.p;
+        let sum = |ts: &mut dyn Iterator<Item = TyId>| {
+            ts.map(|t| self.scalars(t)).fold(0u64, u64::saturating_add)
+        };
+        match p.types.kind(t) {
+            TyKind::Vec(n) => u64::from(*n),
+            TyKind::Mat(n) => u64::from(*n) * u64::from(*n),
+            TyKind::Array(e, n) => self.scalars(*e).saturating_mul(u64::from(*n)),
+            TyKind::Tuple(ts) => sum(&mut ts.iter().copied()),
+            TyKind::Adt(a, args) if p.adt(*a).is_enum() => {
+                let n = p.adt(*a).variants().len() as u32;
+                let payload = (0..n)
+                    .map(|v| sum(&mut p.fields_of(*a, args, Some(v)).into_iter().map(|f| f.1)))
+                    .max();
+                1 + payload.unwrap_or(0)
+            }
+            TyKind::Adt(a, args) => sum(&mut p.fields_of(*a, args, None).into_iter().map(|f| f.1)),
+            _ => 1,
+        }
+    }
+
     fn values(&mut self, xs: &[thir::Expr], want: Want) -> Option<Vec<Operand>> {
         xs.iter().map(|x| self.value(x, want)).collect()
     }
@@ -544,16 +612,16 @@ impl<'a> Builder<'a> {
             BinOp::And => av,
             _ => self.temp_of(Rvalue::Unary(UnOp::Not, av), e.ty, e.span)?,
         };
-        let (t, el, m) = (self.new_block(), self.new_block(), self.new_block());
-        self.terminate(TerminatorKind::If { cond, then: t, else_: el, merge: m }, e.span);
-        self.fs.cur = t;
-        if let Some(bv) = self.value(b, Want::Read) {
-            self.push(StatementKind::Assign(Place::local(r), Rvalue::Use(bv)), e.span);
-        }
-        self.goto(m, e.span);
-        self.fs.cur = el;
-        self.goto(m, e.span);
-        self.fs.cur = m;
+        self.diamond(
+            cond,
+            e.span,
+            |this| {
+                if let Some(bv) = this.value(b, Want::Read) {
+                    this.push(StatementKind::Assign(Place::local(r), Rvalue::Use(bv)), e.span);
+                }
+            },
+            |_| {},
+        );
         Some(Operand { kind: OperandKind::Copy(Place::local(r)), ty: e.ty, span: e.span })
     }
 
@@ -576,20 +644,7 @@ impl<'a> Builder<'a> {
                     .with_fix("mark the move", e.span.shrink_to_start(), "take "),
             );
         }
-        let callee = match &c.callee {
-            thir::Callee::Fn { func, args } => Callee::Fn { func: *func, args: args.clone() },
-            thir::Callee::TraitMethod { method, self_ty, trait_args, method_args } => {
-                Callee::TraitMethod {
-                    method: *method,
-                    self_ty: *self_ty,
-                    trait_args: trait_args.clone(),
-                    method_args: method_args.clone(),
-                }
-            }
-            thir::Callee::Builtin(b) => Callee::Builtin(*b),
-            thir::Callee::Local(l) => Callee::Local(*l),
-            thir::Callee::Clone => Callee::Clone,
-        };
+        let callee = c.callee.clone();
         let mut args: Vec<Option<Arg>> = vec![None; c.args.len()];
         for &i in &c.order {
             let a = &c.args[i];
@@ -618,19 +673,18 @@ impl<'a> Builder<'a> {
                         ExprKind::MutArg(x) => x.as_ref(),
                         _ => a,
                     };
+                    self.const_lent_mut(inner);
                     let p = self.place(inner)?;
                     Arg::Mut(self.arg_local(p, true, inner.span), a.span)
                 }
                 Mode::Borrow => {
-                    if self.is_callable(a.ty) {
+                    if is_callable(&self.p.types, a.ty) {
                         // A closure or function: a value whose captures are its loans.
                         let p = match &a.kind {
                             ExprKind::Local(l) => Place::local(*l),
                             _ => {
-                                let rv = self.rvalue(a)?;
-                                let t = self.temp(a.ty, LocalKind::Temp, "closure", a.span);
-                                self.push(StatementKind::Assign(Place::local(t), rv), a.span);
-                                Place::local(t)
+                                let v = self.value(a, Want::Read)?;
+                                self.operand_place(v)
                             }
                         };
                         Arg::Borrow(p, a.span)
@@ -663,15 +717,7 @@ impl<'a> Builder<'a> {
                     break;
                 }
                 ExprKind::Field(b, i) => {
-                    let name = match self.p.types.kind(b.ty).clone() {
-                        TyKind::Adt(a, args) => self
-                            .p
-                            .struct_fields(a, &args)
-                            .get(*i as usize)
-                            .map_or_else(|| i.to_string(), |f| f.0.clone()),
-                        _ => i.to_string(),
-                    };
-                    parts.push(format!(".{name}"));
+                    parts.push(format!(".{}", field_name(self.p, b.ty, None, *i)));
                     e = b;
                 }
                 ExprKind::Index(b, _) => {
@@ -679,8 +725,7 @@ impl<'a> Builder<'a> {
                     e = b;
                 }
                 ExprKind::Swizzle(b, cs) => {
-                    let s: String =
-                        cs.iter().map(|&c| ['x', 'y', 'z', 'w'][c as usize % 4]).collect();
+                    let s: String = cs.iter().map(|&c| comp_char(c)).collect();
                     parts.push(format!(".{s}"));
                     e = b;
                 }
@@ -689,10 +734,6 @@ impl<'a> Builder<'a> {
         }
         parts.reverse();
         parts.concat()
-    }
-
-    fn is_callable(&self, t: TyId) -> bool {
-        matches!(self.p.types.kind(t), TyKind::Closure(..) | TyKind::FnPtr(..) | TyKind::FnDef(..))
     }
 
     /// Binds a call's `borrow` or `mut` argument where it's evaluated. A temporary needs no
@@ -708,6 +749,22 @@ impl<'a> Builder<'a> {
         Place::local(a)
     }
 
+    /// E0512 for a constant (or a part of one) lent `mut`: it's a value, so writes would be
+    /// lost.
+    fn const_lent_mut(&mut self, e: &thir::Expr) {
+        let ExprKind::Const(c) = e.place_root().kind else { return };
+        let name = &self.p.const_(c).name;
+        self.diags.push(
+            Diagnostic::new(
+                codes::E0512,
+                e.span,
+                format!("can't lend the constant `{name}` mutably"),
+            )
+            .with_note("a constant is a value, not a place: a change to it would be lost")
+            .with_help("copy it into a `var` to change it"),
+        );
+    }
+
     fn call_value(
         &mut self,
         c: &thir::Call,
@@ -719,8 +776,7 @@ impl<'a> Builder<'a> {
             let p = self.call_place(c, e, receiver_taken)?;
             let kind = match want {
                 Want::Move | Want::Return if !self.is_copy(e.ty) => {
-                    let probe = thir::Expr { ty: e.ty, kind: ExprKind::Error, span: e.span };
-                    self.unmarked_move(&p, &probe);
+                    self.unmarked_move(&p, e.ty, e.span);
                     OperandKind::Move(p, MoveKind::Unmarked)
                 }
                 _ => OperandKind::Copy(p),
@@ -757,6 +813,12 @@ impl<'a> Builder<'a> {
     }
 
     fn dispatch(&mut self, d: &thir::Dispatch) -> Option<Rvalue> {
+        // In the order written: the arguments before `groups`, `groups`, the rest.
+        let mut args = Vec::new();
+        for (i, a) in &d.args[..d.groups_at] {
+            let p = self.borrowed_place(a)?;
+            args.push((*i, p, a.span));
+        }
         let g = self.value(&d.groups, Want::Read)?;
         let u32_ty = self.p.types.u32;
         let groups = if matches!(self.p.types.kind(d.groups.ty), TyKind::Tuple(_)) {
@@ -770,8 +832,7 @@ impl<'a> Builder<'a> {
                 Operand { kind: OperandKind::Const(Lit::Int(1)), ty: u32_ty, span: d.groups.span };
             [g, one.clone(), one]
         };
-        let mut args = Vec::new();
-        for (i, a) in &d.args {
+        for (i, a) in &d.args[d.groups_at..] {
             let p = self.borrowed_place(a)?;
             args.push((*i, p, a.span));
         }
@@ -784,18 +845,26 @@ impl<'a> Builder<'a> {
     }
 
     fn draw(&mut self, d: &thir::Draw) -> Option<Rvalue> {
-        let vertices = self.value(&d.vertices, Want::Read)?;
-        let instances = self.value(&d.instances, Want::Read)?;
+        // In the order written: each count after the arguments written before it.
+        let (mut vertices, mut instances) = (None, None);
         let mut args = Vec::new();
-        for (n, a) in &d.args {
-            let p = self.borrowed_place(a)?;
-            args.push((n.clone(), p, a.span));
+        for k in 0..=d.args.len() {
+            if k == d.counts_at[0] {
+                vertices = Some(self.value(&d.vertices, Want::Read)?);
+            }
+            if k == d.counts_at[1] {
+                instances = Some(self.value(&d.instances, Want::Read)?);
+            }
+            if let Some((n, a)) = d.args.get(k) {
+                let p = self.borrowed_place(a)?;
+                args.push((n.clone(), p, a.span));
+            }
         }
         Some(Rvalue::Draw(Box::new(Draw {
             vertex: d.vertex.clone(),
             fragment: d.fragment.clone(),
-            vertices,
-            instances,
+            vertices: vertices?,
+            instances: instances?,
             args,
         })))
     }
@@ -835,23 +904,24 @@ impl<'a> Builder<'a> {
     ) -> Option<Operand> {
         let c = self.value(cond, Want::Read)?;
         let r = (!self.is_unit(e.ty)).then(|| self.temp(e.ty, LocalKind::TempVar, "if", e.span));
-        let (t, el, m) = (self.new_block(), self.new_block(), self.new_block());
-        self.terminate(TerminatorKind::If { cond: c, then: t, else_: el, merge: m }, e.span);
-        self.fs.cur = t;
-        let v = self.block(then, want);
-        if let (Some(r), Some(v)) = (r, v) {
-            self.push(StatementKind::Assign(Place::local(r), Rvalue::Use(v)), then.span);
-        }
-        self.goto(m, e.span);
-        self.fs.cur = el;
-        if let Some(x) = else_ {
-            let v = self.value(x, want);
-            if let (Some(r), Some(v)) = (r, v) {
-                self.push(StatementKind::Assign(Place::local(r), Rvalue::Use(v)), x.span);
-            }
-        }
-        self.goto(m, e.span);
-        self.fs.cur = m;
+        self.diamond(
+            c,
+            e.span,
+            |this| {
+                let v = this.block(then, want);
+                if let (Some(r), Some(v)) = (r, v) {
+                    this.push(StatementKind::Assign(Place::local(r), Rvalue::Use(v)), then.span);
+                }
+            },
+            |this| {
+                if let Some(x) = else_ {
+                    let v = this.value(x, want);
+                    if let (Some(r), Some(v)) = (r, v) {
+                        this.push(StatementKind::Assign(Place::local(r), Rvalue::Use(v)), x.span);
+                    }
+                }
+            },
+        );
         r.map(|r| Operand { kind: OperandKind::Copy(Place::local(r)), ty: e.ty, span: e.span })
     }
 
@@ -865,6 +935,20 @@ impl<'a> Builder<'a> {
         }
     }
 
+    /// A `match`'s scrutinee: a named place is borrowed until an arm is chosen, by a
+    /// projection the arms' tests read through, so a guard can't change what a later arm
+    /// tests (E0507).
+    fn match_scrutinee(&mut self, s: &thir::Expr) -> Option<Place> {
+        let p = self.scrutinee(s)?;
+        if !Self::is_named_place(s) {
+            return Some(p);
+        }
+        let ty = place_ty(self.p, &self.locals, &p);
+        let h = self.temp(ty, LocalKind::TempProjection { mutable: false }, "match", s.span);
+        self.push(StatementKind::Bind { local: h, place: p, mutable: false }, s.span);
+        Some(Place::local(h))
+    }
+
     fn match_(
         &mut self,
         scrutinee: &thir::Expr,
@@ -872,7 +956,7 @@ impl<'a> Builder<'a> {
         e: &thir::Expr,
         want: Want,
     ) -> Option<Operand> {
-        let sp = self.scrutinee(scrutinee)?;
+        let sp = self.match_scrutinee(scrutinee)?;
         let r = (!self.is_unit(e.ty)).then(|| self.temp(e.ty, LocalKind::TempVar, "match", e.span));
         self.arms(&sp, arms, e.span, |b, arm| {
             let v = b.value(&arm.body, want);
@@ -1063,16 +1147,7 @@ impl<'a> Builder<'a> {
     /// by control flow if need be. Each path ends returning its place.
     fn place_tail(&mut self, e: &thir::Expr) {
         match &e.kind {
-            ExprKind::Block(b) => {
-                let mut declared = Vec::new();
-                for s in &b.stmts {
-                    self.stmt(s, &mut declared);
-                }
-                match &b.tail {
-                    Some(t) => self.place_tail(t),
-                    None => self.terminate(TerminatorKind::Unreachable, b.span),
-                }
-            }
+            ExprKind::Block(b) => self.place_tail_block(b),
             ExprKind::If { cond, then, else_ } => {
                 let Some(c) = self.value(cond, Want::Read) else { return };
                 let (t, el, m) = (self.new_block(), self.new_block(), self.new_block());
@@ -1081,11 +1156,7 @@ impl<'a> Builder<'a> {
                     e.span,
                 );
                 self.fs.cur = t;
-                self.place_tail(&thir::Expr {
-                    ty: then.ty,
-                    kind: ExprKind::Block(then.clone()),
-                    span: then.span,
-                });
+                self.place_tail_block(then);
                 self.fs.cur = el;
                 match else_ {
                     Some(x) => self.place_tail(x),
@@ -1095,7 +1166,7 @@ impl<'a> Builder<'a> {
                 self.terminate(TerminatorKind::Unreachable, e.span);
             }
             ExprKind::Match { scrutinee, arms } => {
-                let Some(sp) = self.scrutinee(scrutinee) else { return };
+                let Some(sp) = self.match_scrutinee(scrutinee) else { return };
                 self.arms(&sp, arms, e.span, |b, arm| {
                     b.place_tail(&arm.body);
                     false
@@ -1147,6 +1218,18 @@ impl<'a> Builder<'a> {
         }
     }
 
+    /// [`Self::place_tail`] of a block: its statements, then its value's place.
+    fn place_tail_block(&mut self, b: &thir::Block) {
+        let mut declared = Vec::new();
+        for s in &b.stmts {
+            self.stmt(s, &mut declared);
+        }
+        match &b.tail {
+            Some(t) => self.place_tail(t),
+            None => self.terminate(TerminatorKind::Unreachable, b.span),
+        }
+    }
+
     // ---- statements ------------------------------------------------------------------------
 
     fn stmt(&mut self, s: &thir::Stmt, declared: &mut Vec<Local>) {
@@ -1181,16 +1264,35 @@ impl<'a> Builder<'a> {
         };
         declared.push(l);
         let kind = self.locals[l.index()].kind;
-        if self.is_callable(init.ty) {
+        if is_callable(&self.p.types, init.ty) {
             // A closure or function bound to a name: the local holds it (and its loans).
+            if kind == LocalKind::User(thir::LocalKind::Projection { mutable: true }) {
+                let name = &self.locals[l.index()].name;
+                self.diags.push(
+                    Diagnostic::new(
+                        codes::E0512,
+                        init.span,
+                        "a closure or function can't be projected with `mut`",
+                    )
+                    .with_note(
+                        "calling it doesn't change it; it borrows mutably what it changes (§6.7)",
+                    )
+                    .with_help(format!("bind it with `let {name} = ...`")),
+                );
+            }
             let rv = match &init.kind {
                 ExprKind::Local(src) => Rvalue::Use(Operand {
                     kind: OperandKind::Copy(Place::local(*src)),
                     ty: init.ty,
                     span: init.span,
                 }),
-                _ => match self.rvalue(init) {
+                ExprKind::Closure(_) | ExprKind::FnRef(..) => match self.rvalue(init) {
                     Some(rv) => rv,
+                    None => return,
+                },
+                // Chosen by `if`, `match` or a block.
+                _ => match self.value(init, Want::Read) {
+                    Some(v) => Rvalue::Use(v),
                     None => return,
                 },
             };
@@ -1210,7 +1312,10 @@ impl<'a> Builder<'a> {
                     self.push(StatementKind::Bind { local: l, place: p, mutable }, init.span);
                     return;
                 }
-                if matches!(inner.kind, ExprKind::Const(_)) {
+                if matches!(inner.place_root().kind, ExprKind::Const(_)) {
+                    if mutable {
+                        self.const_lent_mut(inner);
+                    }
                     // A constant is a value: the projection aliases a copy of it.
                     let Some(v) = self.value(inner, Want::Read) else { return };
                     let p = self.operand_place(v);
@@ -1396,22 +1501,19 @@ impl<'a> Builder<'a> {
                     else {
                         return;
                     };
-                    let (t, el, m) = (b.new_block(), b.new_block(), b.new_block());
-                    b.terminate(
-                        TerminatorKind::If { cond: last, then: t, else_: el, merge: m },
-                        span,
-                    );
-                    b.fs.cur = t;
                     let yes =
                         Operand { kind: OperandKind::Const(Lit::Bool(true)), ty: bool_ty, span };
-                    b.push(StatementKind::Assign(Place::local(d), Rvalue::Use(yes)), span);
-                    b.goto(m, span);
-                    b.fs.cur = el;
-                    if let Some(n) = b.temp_of(Rvalue::Binary(BinOp::Add, c, one), ty, span) {
-                        b.push(StatementKind::Assign(cplace.clone(), Rvalue::Use(n)), span);
-                    }
-                    b.goto(m, span);
-                    b.fs.cur = m;
+                    b.diamond(
+                        last,
+                        span,
+                        |b| b.push(StatementKind::Assign(Place::local(d), Rvalue::Use(yes)), span),
+                        |b| {
+                            let add = Rvalue::Binary(BinOp::Add, c, one);
+                            if let Some(n) = b.temp_of(add, ty, span) {
+                                b.push(StatementKind::Assign(cplace.clone(), Rvalue::Use(n)), span);
+                            }
+                        },
+                    );
                 }
             }
         });
@@ -1425,6 +1527,9 @@ impl<'a> Builder<'a> {
         body: &thir::Block,
         span: Span,
     ) {
+        if mutable {
+            self.const_lent_mut(array);
+        }
         let Some(ap) = self.scrutinee(array) else { return };
         let u32_ty = self.p.types.u32;
         let bool_ty = self.p.types.bool;

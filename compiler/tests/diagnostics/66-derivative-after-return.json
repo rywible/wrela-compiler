@@ -1,0 +1,30 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0608",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [
+        "compute it before the branch or the early `return`, and use the result after it"
+      ],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "`fwidth` is called where neighbouring pixels may have taken different branches",
+      "notes": [
+        "a derivative compares a pixel with its neighbours, so WGSL requires all of them to reach it together (language.md §11)"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 14,
+        "end": 315,
+        "end_column": 23,
+        "end_line": 12,
+        "line": 12,
+        "start": 306
+      },
+      "title": "a derivative in non-uniform control flow"
+    }
+  ],
+  "version": 2
+}

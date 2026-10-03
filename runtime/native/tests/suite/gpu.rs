@@ -3,7 +3,7 @@
 //!
 //!     cargo test -p wrela-host --test suite gpu:: -- --ignored
 
-use crate::common;
+use crate::common::{self, TempDir};
 
 use wrela_abi::hash::StateHash;
 use wrela_abi::stream::Encoder;
@@ -19,7 +19,6 @@ fn tri(x: f32) -> f32 {
 
 /// first-light's batches, rebuilt independently with the reference encoder.
 fn first_light_hash(times: &[f32], width: u32, height: u32) -> u64 {
-    let words = |ws: &[u32]| ws.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>();
     let mut hash = StateHash::new();
     hash.update(
         &Encoder::new()
@@ -51,6 +50,10 @@ fn first_light_hash(times: &[f32], width: u32, height: u32) -> u64 {
         );
     }
     hash.value()
+}
+
+fn words(ws: &[u32]) -> Vec<u8> {
+    ws.iter().flat_map(|w| w.to_le_bytes()).collect()
 }
 
 fn pixel(frame: &[u8], width: u32, x: u32, y: u32) -> [u8; 4] {
@@ -114,7 +117,6 @@ fn first_light_runs_end_to_end() {
     let mut decoded = vec![0; reader.output_buffer_size().expect("size")];
     reader.next_frame(&mut decoded).expect("png data");
     assert_eq!(decoded, run.frame);
-    std::fs::remove_dir_all(&dir).expect("cleanup");
 }
 
 #[test]
@@ -136,8 +138,7 @@ fn runs_are_deterministic() {
 #[test]
 #[ignore = "needs the GPU"]
 fn shader_errors_name_the_pipeline_and_shader() {
-    let wasm = std::fs::read(common::first_light().join("game.wasm")).expect("wasm");
-    let dir = common::first_light_with("bad-shader", &wasm);
+    let dir = common::first_light_copy("bad-shader");
     std::fs::write(
         dir.join("fill.wgsl"),
         "@compute @workgroup_size(64) fn fill() { let x: u32 = 1.5; }",
@@ -151,7 +152,6 @@ fn shader_errors_name_the_pipeline_and_shader() {
         }
         e => panic!("expected a shader error, got {e}"),
     }
-    std::fs::remove_dir_all(&dir).expect("cleanup");
 }
 
 /// A compute pipeline that stores `value` at `index`, and a render pipeline that fills the
@@ -183,11 +183,9 @@ const STORE_MANIFEST: &str = r#"{
   ]
 }"#;
 
-fn words(ws: &[u32]) -> Vec<u8> {
-    ws.iter().flat_map(|w| w.to_le_bytes()).collect()
-}
-
-fn store_host(name: &str, frames: &[Vec<Vec<u8>>], options: &Options) -> Host {
+/// A program submitting `frames`, loaded with the store and cell pipelines. The build's
+/// directory comes first, so `let (_dir, host) = ...` drops the host before the directory.
+fn store_host(name: &str, frames: &[Vec<Vec<u8>>], options: &Options) -> (TempDir, Host) {
     let wasm = wat::parse_str(common::wat::program(frames)).expect("compiles");
     let dir = common::build(
         name,
@@ -195,7 +193,8 @@ fn store_host(name: &str, frames: &[Vec<Vec<u8>>], options: &Options) -> Host {
         &[("store.wgsl", STORE_WGSL), ("cell.wgsl", CELL_WGSL)],
         &wasm,
     );
-    Host::load_with(&dir, options).expect("loads")
+    let host = Host::load_with(&dir, options).expect("loads");
+    (dir, host)
 }
 
 /// More dispatches and draws in one submission than the uniform ring starts with room for
@@ -215,7 +214,7 @@ fn every_command_gets_its_own_uniforms() {
         e.draw(1, 6, 1, &[], &words(&[i % w, i / w, w, h, 0xff00_0000 | i, 0, 0, 0]));
     }
     e.present();
-    let mut host = store_host("uniforms", &[vec![e.finish()]], &Options::default());
+    let (_dir, mut host) = store_host("uniforms", &[vec![e.finish()]], &Options::default());
     let run = host.run_frames(&[0.0], w, h).expect("runs");
     let out = host.read_buffer(1).expect("reads back");
     assert_eq!(out, words(&(0..n).map(|i| i * 7 + 1).collect::<Vec<_>>()));
@@ -236,7 +235,7 @@ fn writes_apply_in_recorded_order() {
         .write_buffer(1, 8, &words(&[30]))
         .dispatch(0, [1, 1, 1], &[1], &words(&[3, 40, 0, 0]))
         .write_buffer(1, 0, &words(&[10]));
-    let mut host = store_host("order", &[vec![e.finish()]], &Options::default());
+    let (_dir, mut host) = store_host("order", &[vec![e.finish()]], &Options::default());
     host.run_frames(&[0.0], 4, 4).expect("runs");
     assert_eq!(host.read_buffer(1).expect("reads back"), words(&[10, 20, 30, 40]));
 }
@@ -261,7 +260,7 @@ fn times_dispatches_and_passes_with_timestamps() {
         vec![e.finish()]
     };
     let frames: Vec<_> = (0..5).map(frame).collect();
-    let mut host =
+    let (_dir, mut host) =
         store_host("timestamps", &frames, &Options { timestamps: true, ..Options::default() });
     let run = host.run_frames(&[0.0; 5], 64, 64).expect("runs");
     assert_eq!(run.timings.len(), 15, "{:?}", run.timings);
@@ -282,7 +281,7 @@ fn times_more_passes_than_one_query_set_holds() {
     for i in 0..300 {
         e.dispatch(0, [1, 1, 1], &[1], &words(&[i, i, 0, 0]));
     }
-    let mut host = store_host(
+    let (_dir, mut host) = store_host(
         "many-timestamps",
         &[vec![e.finish()]],
         &Options { timestamps: true, ..Options::default() },

@@ -5,15 +5,10 @@ use crate::common;
 use wrela_host::{Error, Host};
 
 fn load_with_manifest(name: &str, edit: impl Fn(&str) -> String) -> Error {
-    let dir = common::first_light_with(
-        name,
-        &std::fs::read(common::first_light().join("game.wasm")).expect("wasm"),
-    );
+    let dir = common::first_light_copy(name);
     let manifest = std::fs::read_to_string(dir.join("manifest.json")).expect("manifest");
     std::fs::write(dir.join("manifest.json"), edit(&manifest)).expect("write");
-    let err = Host::load(&dir).err().expect("rejected");
-    std::fs::remove_dir_all(&dir).expect("cleanup");
-    err
+    Host::load(&dir).err().expect("rejected")
 }
 
 #[test]
@@ -55,5 +50,4 @@ fn rejects_a_program_with_other_imports() {
         err.to_string(),
         "invalid program: it imports `env.now`, but a wrela program may import only `wrela.submit`"
     );
-    std::fs::remove_dir_all(&dir).expect("cleanup");
 }

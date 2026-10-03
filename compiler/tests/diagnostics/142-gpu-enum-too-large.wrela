@@ -1,0 +1,26 @@
+// mistake: a GPU enum whose payloads together are larger than WGSL allows (WGSL has no unions)
+// expect: E0702
+// fix: no
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch}
+
+enum Pick {
+    A([vec4; 100000000]),
+    B([vec4; 100000000]),
+}
+
+fn pick(i: u32) -> Pick {
+    if i == 0 { Pick::A([vec4(1.0); 100000000]) } else { Pick::B([vec4(2.0); 100000000]) }
+}
+
+@compute(64)
+fn fill(out: mut Slots<f32>, id: GlobalId) {
+    out[id] = match pick(id.x) {
+        Pick::A(xs) => xs[0].x,
+        Pick::B(xs) => xs[1].x,
+    }
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    let out: GpuBuffer<f32> = buffer(64)
+    dispatch(fill, groups: 1, out: out)
+}

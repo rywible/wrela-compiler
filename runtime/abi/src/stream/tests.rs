@@ -9,17 +9,10 @@ fn words(ws: &[u32]) -> Vec<u8> {
 /// `VERSION`, and update both hosts and this test together.
 #[test]
 fn golden_bytes() {
-    let batch = Encoder::new()
-        .create_buffer(7, 16)
-        .write_buffer(7, 4, &[1, 2, 3, 4, 5, 6, 7, 8])
-        .dispatch(0, [2, 1, 1], &[7], &[0xAA, 0xBB, 0xCC, 0xDD])
-        .begin_screen_pass([0.0, 0.5, 1.0, 1.0])
-        .draw(1, 3, 1, &[], &[1, 0, 0, 0, 2, 0, 0, 0])
-        .present()
-        .finish();
+    let batch = crate::vectors::golden_batch();
     let mut expected = Vec::new();
     expected.extend_from_slice(b"WRCS");
-    expected.extend(words(&[VERSION, 152]));
+    expected.extend(words(&[VERSION, 164]));
     expected.extend(words(&[1, 8, 7, 16])); // CreateBuffer
     expected.extend(words(&[2, 20, 7, 4, 8])); // WriteBuffer
     expected.extend([1, 2, 3, 4, 5, 6, 7, 8]);
@@ -28,8 +21,9 @@ fn golden_bytes() {
     expected.extend(words(&[4, 16, 0, 0x3F00_0000, 0x3F80_0000, 0x3F80_0000])); // BeginScreenPass
     expected.extend(words(&[5, 28, 1, 3, 1, 0, 8, 1, 2])); // Draw
     expected.extend(words(&[6, 0])); // Present
+    expected.extend(words(&[7, 4, 7])); // DestroyBuffer
     assert_eq!(batch, expected);
-    assert_eq!(batch.len(), HEADER_LEN + 152);
+    assert_eq!(batch.len(), HEADER_LEN + 164);
 }
 
 #[test]

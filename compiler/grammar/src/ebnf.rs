@@ -28,6 +28,9 @@ pub enum Terminal {
     Token(TokenKind),
     /// A `>` that closes a generic list; also the first `>` of `>>`, `>=` or `>>=` (L16).
     GtClose,
+    /// An INT right after `.`: a tuple index. grammar.ebnf has no such terminal; the GBNF export
+    /// tells these INTs apart, because nothing joins one to a `.` after it (L12).
+    TupleIndex,
 }
 
 impl Terminal {
@@ -37,6 +40,7 @@ impl Terminal {
         match self {
             Terminal::Token(k) => k.grammar_name(),
             Terminal::GtClose => "GT_CLOSE",
+            Terminal::TupleIndex => "INT",
         }
     }
 
@@ -45,6 +49,16 @@ impl Terminal {
         match self {
             Terminal::Token(k) => k.fixed_text(),
             Terminal::GtClose => Some(">"),
+            Terminal::TupleIndex => None,
+        }
+    }
+
+    /// The lexer's kind for this terminal (GT_CLOSE is a `>`).
+    pub fn lexer_kind(self) -> TokenKind {
+        match self {
+            Terminal::Token(k) => k,
+            Terminal::GtClose => TokenKind::Gt,
+            Terminal::TupleIndex => TokenKind::Int,
         }
     }
 }
@@ -108,17 +122,11 @@ impl std::error::Error for GrammarError {}
 /// The text of spec/grammar.ebnf, compiled in (so a change to it rebuilds this crate).
 pub const SPEC_SOURCE: &str = include_str!("../../../spec/grammar.ebnf");
 
-/// The token classes of L21, by their grammar names.
-const CLASSES: &[(&str, Terminal)] = &[
-    ("IDENT", Terminal::Token(TokenKind::Ident)),
-    ("INT", Terminal::Token(TokenKind::Int)),
-    ("FLOAT", Terminal::Token(TokenKind::Float)),
-    ("SUFFIXED", Terminal::Token(TokenKind::Suffixed)),
-    ("STRING", Terminal::Token(TokenKind::Str)),
-    ("NEWLINE", Terminal::Token(TokenKind::Newline)),
-    ("EOF", Terminal::Token(TokenKind::Eof)),
-    ("GT_CLOSE", Terminal::GtClose),
-];
+/// The terminal a class name stands for: a token class of L21, or GT_CLOSE.
+fn class_terminal(name: &str) -> Option<Terminal> {
+    let classes = TokenKind::CLASSES.iter().map(|k| Terminal::Token(*k));
+    classes.chain([Terminal::GtClose]).find(|t| t.name() == name)
+}
 
 impl Grammar {
     /// spec/grammar.ebnf. It's validated by this crate's tests, so a failure here is a bug in
@@ -139,10 +147,6 @@ impl Grammar {
 
     pub fn rule_id(&self, name: &str) -> Option<RuleId> {
         self.rules.iter().position(|r| r.name == name)
-    }
-
-    pub fn rule(&self, id: RuleId) -> &Rule {
-        &self.rules[id]
     }
 
     /// How many expression nodes the grammar has; [`ExprId`]s are `0..expr_count()`.
@@ -229,16 +233,16 @@ impl Grammar {
         }
         let nullable = self.nullable_rules();
         for r in &self.rules {
-            let mut bad = None;
+            let mut bad = false;
             visit(&r.body, &mut |e| {
                 if let ExprKind::Opt(x) | ExprKind::Star(x) | ExprKind::Plus(x) = &e.kind
-                    && bad.is_none()
+                    && !bad
                     && expr_nullable(x, &nullable)
                 {
-                    bad = Some(());
+                    bad = true;
                 }
             });
-            if bad.is_some() {
+            if bad {
                 return Err(GrammarError {
                     line: r.line,
                     message: format!(
@@ -378,28 +382,16 @@ fn tokenize(src: &str) -> Result<Vec<(Tok, u32)>, GrammarError> {
                     out.push((Tok::Define, line_no));
                     p += 3;
                 }
-                b'|' => {
-                    out.push((Tok::Bar, line_no));
-                    p += 1;
-                }
-                b'(' => {
-                    out.push((Tok::LParen, line_no));
-                    p += 1;
-                }
-                b')' => {
-                    out.push((Tok::RParen, line_no));
-                    p += 1;
-                }
-                b'?' => {
-                    out.push((Tok::Question, line_no));
-                    p += 1;
-                }
-                b'*' => {
-                    out.push((Tok::Star, line_no));
-                    p += 1;
-                }
-                b'+' => {
-                    out.push((Tok::Plus, line_no));
+                b'|' | b'(' | b')' | b'?' | b'*' | b'+' => {
+                    let tok = match c {
+                        b'|' => Tok::Bar,
+                        b'(' => Tok::LParen,
+                        b')' => Tok::RParen,
+                        b'?' => Tok::Question,
+                        b'*' => Tok::Star,
+                        _ => Tok::Plus,
+                    };
+                    out.push((tok, line_no));
                     p += 1;
                 }
                 c if c.is_ascii_alphabetic() || c == b'_' => {
@@ -591,13 +583,10 @@ impl<'a> Reader<'a> {
             Some(Tok::Name(n)) => {
                 self.pos += 1;
                 if is_class_name(&n) {
-                    let t =
-                        CLASSES.iter().find(|(c, _)| *c == n).map(|c| c.1).ok_or_else(|| {
-                            GrammarError {
-                                line,
-                                message: format!("`{n}` isn't a token class (spec/lexical.md L21)"),
-                            }
-                        })?;
+                    let t = class_terminal(&n).ok_or_else(|| GrammarError {
+                        line,
+                        message: format!("`{n}` isn't a token class (spec/lexical.md L21)"),
+                    })?;
                     Ok(self.node(ExprKind::Term(t)))
                 } else if is_rule_name(&n) {
                     let id = self.names.get(&n).copied().ok_or_else(|| GrammarError {

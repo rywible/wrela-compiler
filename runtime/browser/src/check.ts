@@ -1,8 +1,9 @@
 // Checks each command against the manifest and the program's buffers before it runs. Mirrors
-// runtime/native/src/check.rs (same rules, same messages), so both hosts reject the same
-// programs at the command that's wrong, rather than with an asynchronous WebGPU error that names
-// no command.
+// runtime/abi/src/check.rs (same rules, same messages, checked by the ABI's test vectors), so
+// both hosts reject the same programs at the command that's wrong, rather than with an
+// asynchronous WebGPU error that names no command.
 
+import { MAX_BUFFER_SIZE, MAX_WORKGROUPS_PER_DIMENSION } from "./abi.gen.ts";
 import type { Access, Manifest } from "./manifest.ts";
 import type { Command, OpcodeName } from "./stream.ts";
 
@@ -17,20 +18,6 @@ export class CommandError extends Error {
   }
 }
 
-export interface Limits {
-  /** The lesser of `maxBufferSize` and `maxStorageBufferBindingSize`. */
-  maxBufferSize: number;
-  maxWorkgroupsPerDimension: number;
-}
-
-/** The limits of a device requested without `requiredLimits`, as both hosts request it. */
-export function limitsOf(limits: GPUSupportedLimits): Limits {
-  return {
-    maxBufferSize: Math.min(limits.maxBufferSize, limits.maxStorageBufferBindingSize),
-    maxWorkgroupsPerDimension: limits.maxComputeWorkgroupsPerDimension,
-  };
-}
-
 interface Shape {
   name: string;
   compute: boolean;
@@ -38,18 +25,19 @@ interface Shape {
   buffers: Access[];
 }
 
-/** Each bound buffer's access so far in a usage scope. */
-type Usage = Map<number, { read: boolean; write: boolean }>;
+/** Each bound buffer's access so far in a usage scope: `READ`, `WRITE` or both. */
+type Usage = Map<number, number>;
+const READ = 1;
+const WRITE = 2;
 
 export class Checker {
   readonly #pipelines: Shape[];
   readonly #buffers = new Map<number, number>();
-  #pass: Usage | null = null;
+  /** The current usage scope, a dispatch or the open screen pass. Dispatches happen only
+   * outside a screen pass (the `Sequencer` checks), so the two kinds never overlap and share it. */
+  readonly #scope: Usage = new Map();
 
-  constructor(
-    manifest: Manifest,
-    readonly limits: Limits,
-  ) {
+  constructor(manifest: Manifest) {
     this.#pipelines = manifest.pipelines.map((p) => ({
       name: p.name,
       compute: p.kind === "compute",
@@ -65,8 +53,7 @@ export class Checker {
       case "CreateBuffer": {
         const { handle, size } = cmd;
         if (this.#buffers.has(handle)) throw err(`buffer ${handle} already exists`);
-        const limit = this.limits.maxBufferSize;
-        if (size > limit) throw err(`buffer ${handle} is ${size} bytes; the limit is ${limit}`);
+        if (size > MAX_BUFFER_SIZE) throw err(`buffer ${handle} is ${size} bytes; the limit is ${MAX_BUFFER_SIZE}`);
         this.#buffers.set(handle, size);
         return;
       }
@@ -83,22 +70,24 @@ export class Checker {
         return;
       }
       case "Dispatch": {
-        this.#binding(cmd.op, cmd.pipeline, cmd.buffers, cmd.uniforms.length, new Map());
-        const max = this.limits.maxWorkgroupsPerDimension;
+        this.#scope.clear();
+        this.#binding(cmd.op, cmd.pipeline, cmd.buffers, cmd.uniforms.length);
+        const max = MAX_WORKGROUPS_PER_DIMENSION;
         if (cmd.groups.some((g) => g > max)) {
           throw err(`${cmd.groups.join("x")} workgroups is over the limit of ${max} per dimension`);
         }
         return;
       }
-      case "BeginScreenPass":
-        this.#pass = new Map();
+      case "BeginScreenPass": {
+        const i = cmd.clear.findIndex((c) => !Number.isFinite(c));
+        if (i >= 0) throw err(`the clear colour's ${"rgba"[i]} isn't a finite number`);
+        this.#scope.clear();
         return;
+      }
       case "Draw":
-        this.#pass ??= new Map();
-        this.#binding(cmd.op, cmd.pipeline, cmd.buffers, cmd.uniforms.length, this.#pass);
+        this.#binding(cmd.op, cmd.pipeline, cmd.buffers, cmd.uniforms.length);
         return;
       case "Present":
-        this.#pass = null;
         return;
     }
   }
@@ -109,7 +98,7 @@ export class Checker {
     return size;
   }
 
-  #binding(op: OpcodeName, pipeline: number, buffers: number[], uniformLen: number, usage: Usage): void {
+  #binding(op: OpcodeName, pipeline: number, buffers: number[], uniformLen: number): void {
     const err = (why: string) => new CommandError(op, why);
     const p = this.#pipelines[pipeline];
     if (p === undefined) {
@@ -133,13 +122,17 @@ export class Checker {
       );
     }
     const scope = op === "Dispatch" ? "dispatch" : "screen pass";
+    const one = op === "Dispatch" ? "dispatch" : "draw";
+    const written = new Set<number>();
     buffers.forEach((handle, i) => {
       this.#size(op, handle);
-      const seen = usage.get(handle) ?? { read: false, write: false };
-      if (p.buffers[i] === "read") seen.read = true;
-      else seen.write = true;
-      usage.set(handle, seen);
-      if (seen.read && seen.write) {
+      if (p.buffers[i] === "read_write") {
+        if (written.has(handle)) throw err(`buffer ${handle} is bound read-write twice in one ${one}`);
+        written.add(handle);
+      }
+      const seen = (this.#scope.get(handle) ?? 0) | (p.buffers[i] === "read" ? READ : WRITE);
+      this.#scope.set(handle, seen);
+      if (seen === (READ | WRITE)) {
         throw err(`buffer ${handle} is bound both read-only and read-write in one ${scope}`);
       }
     });

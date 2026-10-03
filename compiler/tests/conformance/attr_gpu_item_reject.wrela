@@ -3,3 +3,11 @@
 struct Point {
     x: f32,
 }
+
+trait Shape {
+    @gpu //~ E0108
+    type Measure
+
+    @gpu
+    fn area(self) -> f32
+}

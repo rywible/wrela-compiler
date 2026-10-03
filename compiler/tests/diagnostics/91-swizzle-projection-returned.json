@@ -1,0 +1,28 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0702",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [
+        "return a projection of the whole vector, and pick the components at the call site"
+      ],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "a function can't return a projection of several vector components yet",
+      "notes": [],
+      "severity": "error",
+      "span": {
+        "column": 9,
+        "end": 137,
+        "end_column": 13,
+        "end_line": 5,
+        "line": 5,
+        "start": 133
+      },
+      "title": "a construct not supported by a back end"
+    }
+  ],
+  "version": 2
+}

@@ -1,0 +1,47 @@
+// run: a `use` path means what it means in a body, whatever the order of the `use` lines
+// expect: via_import() = 2
+// expect: via_path() = 2
+// expect: builtin_name() = 3
+// expect: abs_of(-5) = 5
+// expect: area_of(2.0) = 4.0
+// expect: in_its_module(-5) = 999
+
+use shapes::f
+use other::shapes
+use sqrt::g
+use other::sqrt
+use util::weird
+
+pub fn via_import() -> i32 {
+    f()
+}
+
+pub fn via_path() -> i32 {
+    shapes::f()
+}
+
+pub fn builtin_name() -> i32 {
+    g()
+}
+
+pub fn abs_of(x: i32) -> i32 {
+    x.abs()
+}
+
+trait Shape {
+    fn area(self) -> f32
+}
+
+impl Shape for f32 {
+    fn area(self) -> f32 {
+        self * self
+    }
+}
+
+pub fn area_of(x: f32) -> f32 {
+    x.area()
+}
+
+pub fn in_its_module(x: i32) -> i32 {
+    weird(x)
+}

@@ -1,0 +1,20 @@
+// mistake: a kernel with more storage buffers than WebGPU allows
+// expect: E0602
+// fix: no
+use std::gpu::{GlobalId, Slots}
+
+@compute(64)
+fn sum(
+    a: [f32],
+    b: [f32],
+    c: [f32],
+    d: [f32],
+    e: [f32],
+    f: [f32],
+    g: [f32],
+    h: [f32],
+    out: mut Slots<f32>,
+    id: GlobalId,
+) {
+    out[id] = a[id.x] + b[id.x] + c[id.x] + d[id.x] + e[id.x] + f[id.x] + g[id.x] + h[id.x]
+}

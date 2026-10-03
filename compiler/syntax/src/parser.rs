@@ -21,7 +21,7 @@ pub struct Parsed {
 
 impl Parsed {
     pub fn has_errors(&self) -> bool {
-        self.diagnostics.iter().any(|d| d.is_error())
+        wrela_diag::has_errors(&self.diagnostics)
     }
 }
 
@@ -41,7 +41,6 @@ pub fn parse_tokens(file: FileId, text: &str, lexed: Lexed) -> Parsed {
         nesting: 0,
         recovered_at: None,
         closers: Vec::new(),
-        lost_breaks: None,
     };
     let f = p.parse_file();
     Parsed { file: f, comments: lexed.comments, diagnostics: p.diags }
@@ -61,15 +60,14 @@ pub(crate) struct Parser<'a> {
     diags: Vec<Diagnostic>,
     syntax_errors: u32,
     /// How deeply the rule being parsed is nested in others that nest (expressions, blocks,
-    /// types, patterns).
+    /// types, patterns, `use` groups).
     nesting: u32,
     /// The token position recovery last stopped at: an error there is already reported.
     pub(crate) recovered_at: Option<usize>,
-    /// The closers of the lists and blocks being parsed, innermost last. Recovery stops at one
-    /// of these; any other closer closes nothing (L19) and is skipped.
+    /// The closers of the brackets open around the rule being parsed, innermost last: the
+    /// brackets L19 counts as open. Recovery stops at one of these; any other closer closes
+    /// nothing (L19) and is skipped.
     pub(crate) closers: Vec<T>,
-    /// After a mismatched closer (E0102): the depth of `closers` whose block it's in.
-    pub(crate) lost_breaks: Option<usize>,
 }
 
 /// After this many syntax errors in one file, later ones are dropped: they're usually noise
@@ -133,16 +131,21 @@ impl<'a> Parser<'a> {
     }
 
     fn eat(&mut self, kind: T) -> bool {
-        if self.at(kind) {
-            self.bump();
-            true
-        } else {
-            false
-        }
+        self.eat_span(kind).is_some()
+    }
+
+    /// Consumes a token of this kind if it's next, and returns its span.
+    fn eat_span(&mut self, kind: T) -> Option<Span> {
+        self.at(kind).then(|| self.bump().span)
     }
 
     fn text_of(&self, span: Span) -> &'a str {
-        &self.text[span.start as usize..span.end as usize]
+        &self.text[span.range()]
+    }
+
+    /// The name a token spells.
+    fn ident_of(&self, t: Token) -> Ident {
+        Ident { name: self.text_of(t.span).to_string(), span: t.span }
     }
 
     /// Runs a rule that nests, unless the nesting is already at [`MAX_NESTING`].
@@ -162,6 +165,27 @@ impl<'a> Parser<'a> {
         self.nesting += 1;
         let r = f(self);
         self.nesting -= 1;
+        r
+    }
+
+    /// E0112 for an expression tree deeper than [`MAX_EXPR_DEPTH`], starting at `span`.
+    pub(crate) fn too_deep_error(&mut self, span: Span) {
+        self.error(
+            Diagnostic::new(
+                codes::E0112,
+                span,
+                format!("this expression is more than {MAX_EXPR_DEPTH} levels deep"),
+            )
+            .with_help("split it into `let` bindings"),
+        );
+    }
+
+    /// Runs `f` inside a bracket that `close` ends, which L19 counts as open: recovery in it
+    /// stops at `close`.
+    pub(crate) fn within<R>(&mut self, close: T, f: impl FnOnce(&mut Self) -> R) -> R {
+        self.closers.push(close);
+        let r = f(self);
+        self.closers.pop();
         r
     }
 
@@ -193,7 +217,7 @@ impl<'a> Parser<'a> {
     fn ident(&mut self, what: &str) -> PResult<Ident> {
         if self.at(T::Ident) {
             let t = self.bump();
-            Ok(Ident { name: self.text_of(t.span).to_string(), span: t.span })
+            Ok(self.ident_of(t))
         } else if self.kind().is_keyword() && !matches!(self.kind(), T::SelfValue | T::SelfType) {
             let t = self.tok();
             let kw = t.kind.fixed_text().unwrap_or("");
@@ -209,6 +233,11 @@ impl<'a> Parser<'a> {
         } else {
             Err(self.expected(what))
         }
+    }
+
+    /// Whether the next token starts with GT_CLOSE (L16).
+    fn at_gt_close(&self) -> bool {
+        matches!(self.kind(), T::Gt | T::Shr | T::Ge | T::ShrEq)
     }
 
     /// GT_CLOSE (L16): a `>`, or the first `>` of `>>`, `>=` or `>>=`.
@@ -282,7 +311,7 @@ impl<'a> Parser<'a> {
         let start = self.span();
         f(self).unwrap_or_else(|Failed| {
             self.recover_to_sep();
-            Expr { kind: ExprKind::Error, span: self.since(start) }
+            Expr::error(self.since(start))
         })
     }
 
@@ -392,12 +421,13 @@ impl<'a> Parser<'a> {
         // A closer of another kind that closes nothing open (L19): most likely a typo for
         // this one, so it's read as this one.
         let k = self.kind();
+        let want = close.fixed_text().unwrap_or("?");
         if matches!(k, T::RParen | T::RBracket | T::RBrace)
             && close != T::Pipe
             && !self.closers.contains(&k)
         {
-            let t = self.bump();
-            let (want, found) = (close.fixed_text().unwrap_or("?"), k.fixed_text().unwrap_or("?"));
+            let t = self.tok();
+            let found = k.fixed_text().unwrap_or("?");
             let mut d = Diagnostic::new(
                 codes::E0102,
                 t.span,
@@ -408,26 +438,77 @@ impl<'a> Parser<'a> {
                 d = d.with_secondary(open, "opened here");
             }
             self.error(d);
-            // The block it's in: `closers` ends with this list's closer, after the block's.
-            self.lost_breaks = self.closers.iter().rposition(|&c| c == T::RBrace).map(|i| i + 1);
+            self.read_as(close);
+            self.bump();
             return t.span;
         }
         if self.recovered_at != Some(self.pos) {
-            self.expected(what);
+            let t = self.tok();
+            if matches!(k, T::RParen | T::RBracket | T::RBrace) && close != T::Pipe {
+                // It closes a bracket opened before this list, and this list with it (L19).
+                let found = k.fixed_text().unwrap_or("?");
+                self.error(
+                    Diagnostic::new(
+                        codes::E0100,
+                        t.span,
+                        format!("expected {what}, found `{found}`"),
+                    )
+                    .with_fix(
+                        format!("close with `{want}` first"),
+                        t.span.shrink_to_start(),
+                        want,
+                    ),
+                );
+            } else {
+                self.expected(what);
+            }
         }
         self.skip_until(close, |_| false);
         if self.at(close) { self.bump().span } else { self.prev_span() }
     }
 
+    /// The edits that join the line of the token at `a` to that of the token at `b` with one
+    /// space. The comments between them can't stay there, so they move to lines of their own
+    /// before `a`'s line.
+    fn join_lines(&self, a: Span, b: Span) -> Vec<wrela_diag::Edit> {
+        let between = &self.text[a.end as usize..b.start as usize];
+        let line_start = self.text[..a.start as usize].rfind('\n').map_or(0, |i| i + 1);
+        let line = &self.text[line_start..a.start as usize];
+        let indent = &line[..line.len() - line.trim_start_matches([' ', '\t']).len()];
+        // Only space and comments lie between two tokens, so each `//` starts a comment.
+        let moved: String = between
+            .lines()
+            .filter_map(|l| l.find("//").map(|i| format!("{indent}{}\n", l[i..].trim_end())))
+            .collect();
+        let mut edits = Vec::new();
+        if !moved.is_empty() {
+            let at = Span::new(self.file, line_start as u32, line_start as u32);
+            edits.push(wrela_diag::Edit { span: at, replacement: moved });
+        }
+        let gap = Span::new(self.file, a.end, b.start);
+        edits.push(wrela_diag::Edit { span: gap, replacement: " ".into() });
+        edits
+    }
+
+    /// Reads the current token, a closer that closes nothing (L19), as `close`. The lexer's
+    /// NEWLINEs after it are redone to match: they depend on which brackets are open (L17).
+    fn read_as(&mut self, close: T) {
+        let at = self.pos;
+        self.tokens[at].kind = close;
+        let mut brackets = crate::lexer::Brackets::default();
+        for t in &self.tokens[..=at] {
+            brackets.track(t.kind);
+        }
+        let rest: Vec<Token> =
+            self.tokens.drain(at + 1..).filter(|t| t.kind != T::Newline).collect();
+        let prev = Some(self.tokens[at]);
+        crate::lexer::newlines_after(prev, brackets, rest, self.file, &mut self.tokens);
+    }
+
     /// The bracket that `close` would close: the nearest unclosed one of its kind before the
     /// current token.
     fn opener_of(&self, close: T) -> Option<Span> {
-        let open = match close {
-            T::RParen => T::LParen,
-            T::RBracket => T::LBracket,
-            T::RBrace => T::LBrace,
-            _ => return None,
-        };
+        let open = close.opener()?;
         let mut depth = 0u32;
         for t in self.tokens[..self.pos.min(self.tokens.len())].iter().rev() {
             if t.kind == close {
@@ -450,12 +531,7 @@ impl<'a> Parser<'a> {
             first
         };
         let (t, colon) = (self.tokens.get(i)?, self.tokens.get(i + 1)?);
-        (t.kind == T::Ident && colon.kind == T::Colon)
-            .then(|| Ident { name: self.text_of(t.span).to_string(), span: t.span })
-    }
-
-    fn error_type(span: Span) -> TypeExpr {
-        TypeExpr { kind: TypeExprKind::Error, span }
+        (t.kind == T::Ident && colon.kind == T::Colon).then(|| self.ident_of(*t))
     }
 
     // ---- file and items --------------------------------------------------------------------
@@ -476,16 +552,7 @@ impl<'a> Parser<'a> {
             match self.parse_item() {
                 Ok(item) => {
                     if let Some(span) = too_deep(&item) {
-                        self.error(
-                            Diagnostic::new(
-                                codes::E0112,
-                                span,
-                                format!(
-                                    "this expression is more than {MAX_EXPR_DEPTH} levels deep"
-                                ),
-                            )
-                            .with_help("split it into `let` bindings"),
-                        );
+                        self.too_deep_error(span);
                         items.push(Item {
                             kind: ItemKind::Error(item.kind.name().cloned()),
                             ..item
@@ -535,8 +602,7 @@ impl<'a> Parser<'a> {
                 }
                 T::Fn | T::Struct | T::Enum | T::Trait | T::Const => {
                     let n = self.tokens.get(i + 1)?;
-                    return (n.kind == T::Ident)
-                        .then(|| Ident { name: self.text_of(n.span).to_string(), span: n.span });
+                    return (n.kind == T::Ident).then(|| self.ident_of(*n));
                 }
                 _ => return None,
             }
@@ -612,7 +678,7 @@ impl<'a> Parser<'a> {
     fn parse_item(&mut self) -> PResult<Item> {
         let start = self.span();
         let attrs = self.parse_attrs()?;
-        let vis = if self.at(T::Pub) { Some(self.bump().span) } else { None };
+        let mut vis = self.eat_span(T::Pub);
         let kind = match self.kind() {
             T::Fn => ItemKind::Fn(self.parse_fn(true)?),
             T::Struct => ItemKind::Struct(self.parse_struct()?),
@@ -623,15 +689,20 @@ impl<'a> Parser<'a> {
                 self.bump();
                 ItemKind::Use(self.parse_use_tree()?)
             }
-            T::Impl if vis.is_none() => ItemKind::Impl(self.parse_impl()?),
             T::Impl => {
-                let pub_span = vis.unwrap_or(start);
-                self.error(
-                    Diagnostic::new(codes::E0100, pub_span, "an `impl` can't be `pub`")
-                        .with_help("its items carry their own visibility")
-                        .with_fix("remove `pub`", pub_span.to(self.span().shrink_to_start()), ""),
-                );
-                return Err(Failed);
+                if let Some(pub_span) = vis.take() {
+                    // Reported, and read without the `pub`, so its members are still there.
+                    self.error(
+                        Diagnostic::new(codes::E0100, pub_span, "an `impl` can't be `pub`")
+                            .with_help("its items carry their own visibility")
+                            .with_fix(
+                                "remove `pub`",
+                                pub_span.to(self.span().shrink_to_start()),
+                                "",
+                            ),
+                    );
+                }
+                ItemKind::Impl(self.parse_impl()?)
             }
             T::Let | T::Var => {
                 let t = self.tok();
@@ -655,7 +726,7 @@ impl<'a> Parser<'a> {
     fn parse_fn(&mut self, body_required: bool) -> PResult<FnDecl> {
         let start = self.expect(T::Fn, "`fn`")?.span;
         let name = self.ident("a function name")?;
-        let generics = if self.at(T::Lt) { self.parse_generic_params()? } else { Vec::new() };
+        let generics = self.opt_generic_params()?;
         self.expect(T::LParen, "`(`")?;
         let params = self.list(T::RParen, Self::parse_param, |p, first, span| {
             // `x: <broken type>`, or `x` with its type missing; `mut` or `take` may come first.
@@ -670,14 +741,11 @@ impl<'a> Parser<'a> {
                 mode = mode_at(first + 2);
             }
             let t = p.tokens[first];
-            let name = p.name_at(first).or_else(|| {
-                (t.kind == T::Ident)
-                    .then(|| Ident { name: p.text_of(t.span).to_string(), span: t.span })
-            })?;
-            let ty = Self::error_type(span);
+            let name = p.name_at(first).or_else(|| (t.kind == T::Ident).then(|| p.ident_of(t)))?;
+            let ty = TypeExpr::error(span);
             Some(Param::Named { name, mode, ty, default: None, span })
         });
-        self.close_list(T::RParen, "`,` or `)`");
+        let params_close = self.close_list(T::RParen, "`,` or `)`");
         let ret = if self.eat(T::Arrow) {
             let mode = if self.eat(T::Borrow) {
                 RetMode::Borrow
@@ -698,16 +766,21 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        Ok(FnDecl { name, generics, params, ret, body, sig_span })
+        Ok(FnDecl { name, generics, params, params_close, ret, body, sig_span })
+    }
+
+    /// generic_params?
+    fn opt_generic_params(&mut self) -> PResult<Vec<GenericParam>> {
+        if self.at(T::Lt) { self.parse_generic_params() } else { Ok(Vec::new()) }
     }
 
     /// generic_params ::= "<" (generic_param ("," generic_param)* ","?)? GT_CLOSE
     fn parse_generic_params(&mut self) -> PResult<Vec<GenericParam>> {
         self.expect(T::Lt, "`<`")?;
         let mut out = Vec::new();
-        while !matches!(self.kind(), T::Gt | T::Shr | T::Ge | T::ShrEq) {
+        while !self.at_gt_close() {
             let name = self.ident("a generic parameter name")?;
-            let bounds = if self.eat(T::Colon) { self.parse_bounds()? } else { Vec::new() };
+            let bounds = self.opt_bounds()?;
             out.push(GenericParam { name, bounds });
             if !self.eat(T::Comma) {
                 break;
@@ -715,6 +788,11 @@ impl<'a> Parser<'a> {
         }
         self.expect_gt_close()?;
         Ok(out)
+    }
+
+    /// (":" bounds)?
+    fn opt_bounds(&mut self) -> PResult<Vec<TypeExpr>> {
+        if self.eat(T::Colon) { self.parse_bounds() } else { Ok(Vec::new()) }
     }
 
     /// bounds ::= path_type ("+" path_type)*
@@ -755,8 +833,18 @@ impl<'a> Parser<'a> {
         self.bump();
         let mode = self.parse_mode();
         let ty = self.parse_type()?;
-        let default = if self.eat(T::Eq) { Some(self.parse_expr()?) } else { None };
+        let default = self.opt_default()?;
         Ok(Param::Named { name, mode, ty, default, span: start.to(self.prev_span()) })
+    }
+
+    /// ("=" expr)?: a parameter's or a field's default.
+    fn opt_default(&mut self) -> PResult<Option<Expr>> {
+        if self.eat(T::Eq) { self.parse_expr().map(Some) } else { Ok(None) }
+    }
+
+    /// (":" type)?
+    fn opt_colon_type(&mut self) -> PResult<Option<TypeExpr>> {
+        if self.eat(T::Colon) { self.parse_type().map(Some) } else { Ok(None) }
     }
 
     /// `mut x: T`, which is `x: mut T`: reported with the fix, and parsed as meant.
@@ -765,7 +853,7 @@ impl<'a> Parser<'a> {
         self.bump();
         let ty_at = self.span().shrink_to_start();
         let written = self.parse_mode();
-        let kw = if mode == Mode::Mut { "mut" } else { "take" };
+        let kw = mode.keyword();
         let mut d = Diagnostic::new(
             codes::E0100,
             start,
@@ -783,7 +871,7 @@ impl<'a> Parser<'a> {
         }
         self.error(d);
         let ty = self.parse_type()?;
-        let default = if self.eat(T::Eq) { Some(self.parse_expr()?) } else { None };
+        let default = self.opt_default()?;
         Ok(Param::Named { name, mode, ty, default, span: start.to(self.prev_span()) })
     }
 
@@ -802,8 +890,8 @@ impl<'a> Parser<'a> {
     fn parse_struct(&mut self) -> PResult<StructDecl> {
         self.expect(T::Struct, "`struct`")?;
         let name = self.ident("a struct name")?;
-        let generics = if self.at(T::Lt) { self.parse_generic_params()? } else { Vec::new() };
-        let traits = if self.eat(T::Colon) { self.parse_bounds()? } else { Vec::new() };
+        let generics = self.opt_generic_params()?;
+        let traits = self.opt_bounds()?;
         let (fields, multiline) = self.parse_field_block()?;
         Ok(StructDecl { name, generics, traits, fields, multiline })
     }
@@ -816,17 +904,17 @@ impl<'a> Parser<'a> {
             T::RBrace,
             |p| {
                 let start = p.span();
-                let vis = if p.at(T::Pub) { Some(p.bump().span) } else { None };
+                let vis = p.eat_span(T::Pub);
                 let name = p.ident("a field name")?;
                 p.expect(T::Colon, "`:` and the field's type")?;
                 let ty = p.parse_type()?;
-                let default = if p.eat(T::Eq) { Some(p.parse_expr()?) } else { None };
+                let default = p.opt_default()?;
                 Ok(FieldDecl { vis, name, ty, default, span: start.to(p.prev_span()) })
             },
             |p, first, span| {
                 let vis = (p.tokens[first].kind == T::Pub).then_some(p.tokens[first].span);
                 let name = p.name_at(first)?;
-                Some(FieldDecl { vis, name, ty: Self::error_type(span), default: None, span })
+                Some(FieldDecl { vis, name, ty: TypeExpr::error(span), default: None, span })
             },
         );
         self.close_list(T::RBrace, "`,` or `}`");
@@ -837,8 +925,8 @@ impl<'a> Parser<'a> {
     fn parse_enum(&mut self) -> PResult<EnumDecl> {
         self.expect(T::Enum, "`enum`")?;
         let name = self.ident("an enum name")?;
-        let generics = if self.at(T::Lt) { self.parse_generic_params()? } else { Vec::new() };
-        let traits = if self.eat(T::Colon) { self.parse_bounds()? } else { Vec::new() };
+        let generics = self.opt_generic_params()?;
+        let traits = self.opt_bounds()?;
         self.expect(T::LBrace, "`{`")?;
         let multiline = self.tok().line_break_before && !self.at(T::RBrace);
         let variants = self.list(
@@ -848,7 +936,7 @@ impl<'a> Parser<'a> {
                 let name = p.ident("a variant name")?;
                 let kind = if p.eat(T::LParen) {
                     let tys = p.list(T::RParen, Self::parse_type, |_, _, span| {
-                        Some(Self::error_type(span))
+                        Some(TypeExpr::error(span))
                     });
                     p.close_list(T::RParen, "`,` or `)`");
                     VariantKind::Tuple(tys)
@@ -865,9 +953,9 @@ impl<'a> Parser<'a> {
                 if t.kind != T::Ident {
                     return None;
                 }
-                let name = Ident { name: p.text_of(t.span).to_string(), span: t.span };
+                let name = p.ident_of(t);
                 let kind = match p.tokens.get(first + 1).map(|t| t.kind) {
-                    Some(T::LParen) => VariantKind::Tuple(vec![Self::error_type(span)]),
+                    Some(T::LParen) => VariantKind::Tuple(vec![TypeExpr::error(span)]),
                     Some(T::LBrace) => VariantKind::Struct(Vec::new()),
                     _ => VariantKind::Unit,
                 };
@@ -882,84 +970,101 @@ impl<'a> Parser<'a> {
     fn parse_trait(&mut self) -> PResult<TraitDecl> {
         self.expect(T::Trait, "`trait`")?;
         let name = self.ident("a trait name")?;
-        let generics = if self.at(T::Lt) { self.parse_generic_params()? } else { Vec::new() };
-        let supertraits = if self.eat(T::Colon) { self.parse_bounds()? } else { Vec::new() };
-        self.expect(T::LBrace, "`{`")?;
-        let mut members = Vec::new();
-        self.skip_seps();
-        while !self.at(T::RBrace) && !self.at(T::Eof) {
-            let start = self.span();
-            let r = (|| -> PResult<TraitMember> {
-                let attrs = self.parse_attrs()?;
-                let kind = if self.eat(T::Type) {
-                    let name = self.ident("an associated type name")?;
-                    let bounds = if self.eat(T::Colon) { self.parse_bounds()? } else { Vec::new() };
-                    TraitMemberKind::Type { name, bounds }
-                } else if self.at(T::Fn) {
-                    TraitMemberKind::Fn(self.parse_fn(false)?)
-                } else {
-                    return Err(self.expected("`fn` or `type`"));
-                };
-                Ok(TraitMember { attrs, kind, span: start.to(self.prev_span()) })
-            })();
-            match r {
-                Ok(m) => {
-                    members.push(m);
-                    if !self.at_sep() && !self.at(T::RBrace) {
-                        self.missing_sep("a trait member");
-                        self.recover_to_sep();
-                    }
-                }
-                Err(Failed) => self.recover_to_sep(),
-            }
-            self.skip_seps();
-        }
-        self.expect(T::RBrace, "`}`")?;
+        let generics = self.opt_generic_params()?;
+        let supertraits = self.opt_bounds()?;
+        let members = self.member_block("a trait member", Self::parse_trait_member)?;
         Ok(TraitDecl { name, generics, supertraits, members })
+    }
+
+    /// trait_member ::= attribute* (fn_sig block? | "type" IDENT (":" bounds)?)
+    fn parse_trait_member(&mut self) -> PResult<TraitMember> {
+        let start = self.span();
+        let attrs = self.parse_attrs()?;
+        let kind = if self.eat(T::Type) {
+            let name = self.ident("an associated type name")?;
+            let bounds = self.opt_bounds()?;
+            TraitMemberKind::Type { name, bounds }
+        } else if self.at(T::Fn) {
+            TraitMemberKind::Fn(self.parse_fn(false)?)
+        } else {
+            return Err(self.expected("`fn` or `type`"));
+        };
+        Ok(TraitMember { attrs, kind, span: start.to(self.prev_span()) })
     }
 
     /// impl_item ::= "impl" generic_params? type ("for" type)? "{" sep* (impl_member (sep+ impl_member)* sep*)? "}"
     fn parse_impl(&mut self) -> PResult<ImplDecl> {
         self.expect(T::Impl, "`impl`")?;
-        let generics = if self.at(T::Lt) { self.parse_generic_params()? } else { Vec::new() };
+        let generics = self.opt_generic_params()?;
         let first = self.parse_type()?;
         let (trait_, self_ty) =
             if self.eat(T::For) { (Some(first), self.parse_type()?) } else { (None, first) };
+        let members = self.member_block("an impl member", Self::parse_impl_member)?;
+        Ok(ImplDecl { generics, trait_, self_ty, members })
+    }
+
+    /// impl_member ::= attribute* "pub"? fn_item | "type" IDENT "=" type
+    fn parse_impl_member(&mut self) -> PResult<ImplMember> {
+        let start = self.span();
+        if self.eat(T::Type) {
+            let name = self.ident("an associated type name")?;
+            self.expect(T::Eq, "`=`")?;
+            let ty = self.parse_type()?;
+            return Ok(ImplMember {
+                attrs: Vec::new(),
+                vis: None,
+                kind: ImplMemberKind::Type { name, ty },
+                span: start.to(self.prev_span()),
+            });
+        }
+        let attrs = self.parse_attrs()?;
+        let vis = self.eat_span(T::Pub);
+        if self.at(T::Type) {
+            // impl_member allows neither before `type`: reported, then read without them.
+            for a in &attrs {
+                self.error(
+                    Diagnostic::new(
+                        codes::E0108,
+                        a.span,
+                        format!("`@{}` can't be on an associated type", a.name.name),
+                    )
+                    .with_help("attributes apply to functions")
+                    .with_fix("remove it", a.span, ""),
+                );
+            }
+            if let Some(p) = vis {
+                self.error(
+                    Diagnostic::new(codes::E0100, p, "an associated type can't be `pub`")
+                        .with_help("an impl's associated types have no visibility of their own")
+                        .with_fix("remove `pub`", p.to(self.span().shrink_to_start()), ""),
+                );
+            }
+            return self.parse_impl_member();
+        }
+        if !self.at(T::Fn) {
+            return Err(self.expected("`fn` or `type`"));
+        }
+        let f = self.parse_fn(true)?;
+        Ok(ImplMember { attrs, vis, kind: ImplMemberKind::Fn(f), span: start.to(self.prev_span()) })
+    }
+
+    /// The members of a trait or an impl: "{" sep* (member (sep+ member)* sep*)? "}". A member
+    /// that fails to parse is skipped up to the next separator. `what` names a member in errors.
+    fn member_block<M>(
+        &mut self,
+        what: &str,
+        mut member: impl FnMut(&mut Self) -> PResult<M>,
+    ) -> PResult<Vec<M>> {
         self.expect(T::LBrace, "`{`")?;
         let mut members = Vec::new();
+        self.closers.push(T::RBrace);
         self.skip_seps();
         while !self.at(T::RBrace) && !self.at(T::Eof) {
-            let start = self.span();
-            let r = (|| -> PResult<ImplMember> {
-                if self.eat(T::Type) {
-                    let name = self.ident("an associated type name")?;
-                    self.expect(T::Eq, "`=`")?;
-                    let ty = self.parse_type()?;
-                    return Ok(ImplMember {
-                        attrs: Vec::new(),
-                        vis: None,
-                        kind: ImplMemberKind::Type { name, ty },
-                        span: start.to(self.prev_span()),
-                    });
-                }
-                let attrs = self.parse_attrs()?;
-                let vis = if self.at(T::Pub) { Some(self.bump().span) } else { None };
-                if !self.at(T::Fn) {
-                    return Err(self.expected("`fn` or `type`"));
-                }
-                let f = self.parse_fn(true)?;
-                Ok(ImplMember {
-                    attrs,
-                    vis,
-                    kind: ImplMemberKind::Fn(f),
-                    span: start.to(self.prev_span()),
-                })
-            })();
-            match r {
+            match member(self) {
                 Ok(m) => {
                     members.push(m);
                     if !self.at_sep() && !self.at(T::RBrace) {
-                        self.missing_sep("an impl member");
+                        self.missing_sep(what);
                         self.recover_to_sep();
                     }
                 }
@@ -967,15 +1072,16 @@ impl<'a> Parser<'a> {
             }
             self.skip_seps();
         }
+        self.closers.pop();
         self.expect(T::RBrace, "`}`")?;
-        Ok(ImplDecl { generics, trait_, self_ty, members })
+        Ok(members)
     }
 
     /// const_item ::= "const" IDENT (":" type)? "=" expr
     fn parse_const(&mut self) -> PResult<ConstDecl> {
         self.expect(T::Const, "`const`")?;
         let name = self.ident("a constant name")?;
-        let ty = if self.eat(T::Colon) { Some(self.parse_type()?) } else { None };
+        let ty = self.opt_colon_type()?;
         self.expect(T::Eq, "`=` and the constant's value")?;
         let value = self.expr_or_error(Self::parse_expr);
         Ok(ConstDecl { name, ty, value })
@@ -992,7 +1098,8 @@ impl<'a> Parser<'a> {
             } else if self.at(T::ColonColon) && self.nth(1) == T::LBrace {
                 self.bump();
                 self.bump();
-                let trees = self.list(T::RBrace, Self::parse_use_tree, |_, _, _| None);
+                let trees =
+                    self.list(T::RBrace, |p| p.nested(Self::parse_use_tree), |_, _, _| None);
                 self.close_list(T::RBrace, "`,` or `}`");
                 return Ok(UseTree {
                     path,
@@ -1035,8 +1142,11 @@ impl<'a> Parser<'a> {
             }
             T::LBracket => {
                 self.bump();
-                let elem = self.parse_type()?;
-                let len = if self.eat(T::Semi) { Some(Box::new(self.parse_expr()?)) } else { None };
+                let (elem, len) = self.within(T::RBracket, |p| -> PResult<_> {
+                    let elem = p.parse_type()?;
+                    let len = if p.eat(T::Semi) { Some(Box::new(p.parse_expr()?)) } else { None };
+                    Ok((elem, len))
+                })?;
                 self.expect(T::RBracket, "`]`")?;
                 Ok(TypeExpr {
                     kind: TypeExprKind::Array(Box::new(elem), len),
@@ -1045,15 +1155,18 @@ impl<'a> Parser<'a> {
             }
             T::LParen => {
                 self.bump();
-                let mut tys = Vec::new();
-                let mut trailing = false;
-                while !self.at(T::RParen) {
-                    tys.push(self.parse_type()?);
-                    trailing = self.eat(T::Comma);
-                    if !trailing {
-                        break;
+                let (mut tys, trailing) = self.within(T::RParen, |p| -> PResult<_> {
+                    let mut tys = Vec::new();
+                    let mut trailing = false;
+                    while !p.at(T::RParen) {
+                        tys.push(p.parse_type()?);
+                        trailing = p.eat(T::Comma);
+                        if !trailing {
+                            break;
+                        }
                     }
-                }
+                    Ok((tys, trailing))
+                })?;
                 self.expect(T::RParen, "`,` or `)`")?;
                 let span = start.to(self.prev_span());
                 let kind = if tys.len() == 1 && !trailing {
@@ -1066,13 +1179,16 @@ impl<'a> Parser<'a> {
             T::Fn => {
                 self.bump();
                 self.expect(T::LParen, "`(`")?;
-                let mut tys = Vec::new();
-                while !self.at(T::RParen) {
-                    tys.push(self.parse_type()?);
-                    if !self.eat(T::Comma) {
-                        break;
+                let tys = self.within(T::RParen, |p| -> PResult<_> {
+                    let mut tys = Vec::new();
+                    while !p.at(T::RParen) {
+                        tys.push(p.parse_type()?);
+                        if !p.eat(T::Comma) {
+                            break;
+                        }
                     }
-                }
+                    Ok(tys)
+                })?;
                 self.expect(T::RParen, "`,` or `)`")?;
                 let ret =
                     if self.eat(T::Arrow) { Some(Box::new(self.parse_type()?)) } else { None };
@@ -1099,7 +1215,7 @@ impl<'a> Parser<'a> {
         loop {
             let ident = if self.at(T::SelfType) {
                 let t = self.bump();
-                Ident { name: "Self".into(), span: t.span }
+                self.ident_of(t)
             } else {
                 self.ident("a type name")?
             };
@@ -1118,7 +1234,7 @@ impl<'a> Parser<'a> {
         self.expect(T::Lt, "`<`")?;
         let mut out = vec![self.parse_type()?];
         while self.eat(T::Comma) {
-            if matches!(self.kind(), T::Gt | T::Shr | T::Ge | T::ShrEq) {
+            if self.at_gt_close() {
                 break;
             }
             out.push(self.parse_type()?);

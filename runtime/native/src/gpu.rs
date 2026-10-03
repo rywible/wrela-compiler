@@ -13,14 +13,15 @@
 //!   each flush, so every command in a submission has its own slice. It grows (after a flush)
 //!   when one submission needs more than it holds.
 //! - Bind group 0 of each pipeline is created from the manifest: the uniform block (dynamic
-//!   offset) and the buffers, in order. Bind groups are cached per (pipeline, buffer handles).
+//!   offset) and the buffers, in order. Bind groups are cached per (pipeline, buffer handles),
+//!   until one of their buffers is destroyed.
 //!
-//! Commands arrive decoded, sequenced and checked ([`crate::check`]); a wgpu validation error
+//! Commands arrive decoded, sequenced and checked ([`wrela_abi::check`]); a wgpu validation error
 //! here is a host bug, reported as [`Error::Gpu`].
 
 use crate::error::{Error, Result};
 use crate::program::Executor;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex};
 use wgpu::util::align_to;
@@ -28,7 +29,7 @@ use wrela_abi::manifest::{Access, BufferBinding, Manifest, Stage, UniformSpace};
 use wrela_abi::stream::{Command, Opcode};
 
 /// The screen's format: `SCREEN_FORMAT` (rgba8unorm) in wgpu's spelling.
-pub const SCREEN_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+const SCREEN_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 /// The uniform ring's starting size.
 const RING_START: u64 = 64 * 1024;
 /// Timestamp queries per submission (two per timed pass).
@@ -58,10 +59,8 @@ enum Kind {
     Render(wgpu::RenderPipeline),
 }
 
-struct Buffer {
-    buffer: wgpu::Buffer,
-    size: u32,
-}
+/// A cached bind group: its pipeline, and the buffer handles it binds.
+type BindGroupKey = (u32, Box<[u32]>);
 
 struct PendingDraw {
     pipeline: u32,
@@ -93,11 +92,8 @@ struct UniformRing {
 
 struct Timer {
     queries: wgpu::QuerySet,
-    resolve: wgpu::Buffer,
-    readback: wgpu::Buffer,
     /// What each pair of queries in this submission times: (frame, label).
     pending: Vec<(usize, String)>,
-    period: f32,
     results: Vec<GpuTiming>,
 }
 
@@ -107,8 +103,12 @@ pub(crate) struct Gpu {
     limits: wgpu::Limits,
     align: u64,
     pipelines: Vec<Pipeline>,
-    buffers: HashMap<u32, Buffer>,
-    bind_groups: HashMap<(u32, Vec<u32>), wgpu::BindGroup>,
+    buffers: HashMap<u32, wgpu::Buffer>,
+    /// Each pipeline's cached bind groups, by the buffer handles they bind.
+    bind_groups: Vec<HashMap<Box<[u32]>, wgpu::BindGroup>>,
+    /// For each buffer, the cached bind groups it's in: destroying the buffer drops them (a
+    /// compiled program never reuses a handle, so they'd never be used again).
+    bound_in: HashMap<u32, HashSet<BindGroupKey>>,
     ring: UniformRing,
     encoder: Option<wgpu::CommandEncoder>,
     pass: Option<ScreenPass>,
@@ -177,7 +177,7 @@ impl Gpu {
             capacity: RING_START,
             staging: Vec::new(),
         };
-        let timer = timestamps.then(|| Timer::new(&device, &queue));
+        let timer = timestamps.then(|| Timer::new(&device));
         let mut gpu = Gpu {
             device,
             queue,
@@ -185,7 +185,8 @@ impl Gpu {
             align,
             pipelines: Vec::new(),
             buffers: HashMap::new(),
-            bind_groups: HashMap::new(),
+            bind_groups: vec![HashMap::new(); manifest.pipelines.len()],
+            bound_in: HashMap::new(),
             ring,
             encoder: None,
             pass: None,
@@ -369,9 +370,9 @@ impl Gpu {
         Err(Error::Gpu(all))
     }
 
+    /// Bind group 0 of `pipeline` with these buffers, from the cache or made now.
     fn bind_group(&mut self, pipeline: u32, handles: &[u32]) -> wgpu::BindGroup {
-        let key = (pipeline, handles.to_vec());
-        if let Some(bg) = self.bind_groups.get(&key) {
+        if let Some(bg) = self.bind_groups[pipeline as usize].get(handles) {
             return bg.clone();
         }
         let p = &self.pipelines[pipeline as usize];
@@ -389,7 +390,7 @@ impl Gpu {
         for (handle, b) in handles.iter().zip(&p.buffers) {
             entries.push(wgpu::BindGroupEntry {
                 binding: b.binding,
-                resource: self.buffers[handle].buffer.as_entire_binding(),
+                resource: self.buffers[handle].as_entire_binding(),
             });
         }
         let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -397,8 +398,26 @@ impl Gpu {
             layout: &p.layout,
             entries: &entries,
         });
-        self.bind_groups.insert(key, bg.clone());
+        let key: Box<[u32]> = handles.into();
+        for &handle in handles {
+            self.bound_in.entry(handle).or_default().insert((pipeline, key.clone()));
+        }
+        self.bind_groups[pipeline as usize].insert(key, bg.clone());
         bg
+    }
+
+    /// Forgets a destroyed buffer, and the cached bind groups it's in. Work already recorded
+    /// holds its own references until the GPU is done.
+    fn destroy_buffer(&mut self, handle: u32) {
+        self.buffers.remove(&handle);
+        for group in self.bound_in.remove(&handle).unwrap_or_default() {
+            for other in group.1.iter().filter(|&&h| h != handle) {
+                if let Some(groups) = self.bound_in.get_mut(other) {
+                    groups.remove(&group);
+                }
+            }
+            self.bind_groups[group.0 as usize].remove(&group.1);
+        }
     }
 
     /// Makes room for `bytes` more uniform bytes (counted with alignment) in this submission,
@@ -424,7 +443,8 @@ impl Gpu {
                 staging: Vec::new(),
             };
             // Cached bind groups point at the old ring.
-            self.bind_groups.clear();
+            self.bind_groups.iter_mut().for_each(HashMap::clear);
+            self.bound_in.clear();
         }
         Ok(())
     }
@@ -446,8 +466,10 @@ impl Gpu {
         align_to(len as u64, self.align)
     }
 
-    fn encoder(&mut self) -> &mut wgpu::CommandEncoder {
-        self.encoder.get_or_insert_with(|| {
+    /// The pending command encoder, taken out so a pass can record into it while `self` is
+    /// borrowed. Put it back (`self.encoder = Some(..)`) before anything can flush.
+    fn take_encoder(&mut self) -> wgpu::CommandEncoder {
+        self.encoder.take().unwrap_or_else(|| {
             self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default())
         })
     }
@@ -480,16 +502,6 @@ impl Gpu {
         Ok(())
     }
 
-    /// The first of two timestamp query indices for the pass about to be recorded, when timing.
-    /// [`Gpu::reserve_timestamps`] must have made room.
-    fn next_timestamps(&mut self, label: &str) -> Option<u32> {
-        let frame = self.frame;
-        self.timer.as_mut().map(|t| {
-            t.pending.push((frame, label.to_string()));
-            (t.pending.len() as u32 - 1) * 2
-        })
-    }
-
     fn create_buffer(&mut self, handle: u32, size: u32) {
         let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(&format!("buffer {handle}")),
@@ -499,7 +511,7 @@ impl Gpu {
                 | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
-        self.buffers.insert(handle, Buffer { buffer, size });
+        self.buffers.insert(handle, buffer);
     }
 
     fn write_buffer(&mut self, handle: u32, offset: u32, data: &[u8]) -> Result<()> {
@@ -508,7 +520,7 @@ impl Gpu {
         }
         // Dispatches recorded before this write must see the old contents.
         self.flush()?;
-        self.queue.write_buffer(&self.buffers[&handle].buffer, u64::from(offset), data);
+        self.queue.write_buffer(&self.buffers[&handle], u64::from(offset), data);
         Ok(())
     }
 
@@ -519,33 +531,32 @@ impl Gpu {
         buffers: &[u32],
         uniforms: &[u8],
     ) -> Result<()> {
-        let op = Opcode::Dispatch;
-        let name = self.pipelines[pipeline as usize].name.clone();
         // Everything that can flush happens before anything is recorded for this dispatch.
-        self.reserve_uniforms(op, self.aligned(uniforms.len()))?;
+        self.reserve_uniforms(Opcode::Dispatch, self.aligned(uniforms.len()))?;
         self.reserve_timestamps()?;
-        let timestamps = self.next_timestamps(&name);
-        let offsets: Vec<u32> = self.push_uniforms(uniforms).into_iter().collect();
+        let offset = self.push_uniforms(uniforms);
         let bind_group = self.bind_group(pipeline, buffers);
-        let query_set = self.timer.as_ref().map(|t| t.queries.clone());
-        let Kind::Compute(compute) = &self.pipelines[pipeline as usize].kind else {
+        let mut encoder = self.take_encoder();
+        let p = &self.pipelines[pipeline as usize];
+        let timestamps = self.timer.as_mut().map(|t| t.next(self.frame, &p.name));
+        let Kind::Compute(compute) = &p.kind else {
             unreachable!("the checker checked the kind");
         };
-        let compute = compute.clone();
-        let encoder = self.encoder();
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some(&name),
-            timestamp_writes: timestamps.zip(query_set.as_ref()).map(|(i, query_set)| {
+            label: Some(&p.name),
+            timestamp_writes: timestamps.zip(self.timer.as_ref()).map(|(i, t)| {
                 wgpu::ComputePassTimestampWrites {
-                    query_set,
+                    query_set: &t.queries,
                     beginning_of_pass_write_index: Some(i),
                     end_of_pass_write_index: Some(i + 1),
                 }
             }),
         });
-        pass.set_pipeline(&compute);
-        pass.set_bind_group(0, &bind_group, &offsets);
+        pass.set_pipeline(compute);
+        pass.set_bind_group(0, &bind_group, offset.as_slice());
         pass.dispatch_workgroups(groups[0], groups[1], groups[2]);
+        drop(pass);
+        self.encoder = Some(encoder);
         Ok(())
     }
 
@@ -564,10 +575,7 @@ impl Gpu {
             buffers: buffers.to_vec(),
             uniforms: uniforms.to_vec(),
         };
-        self.pass
-            .get_or_insert_with(|| ScreenPass { clear: [0.0; 4], draws: Vec::new() })
-            .draws
-            .push(draw);
+        self.pass.as_mut().expect("the sequencer checked a screen pass is open").draws.push(draw);
     }
 
     fn present(&mut self) -> Result<()> {
@@ -585,64 +593,57 @@ impl Gpu {
         let total = pass.draws.iter().map(|d| self.aligned(d.uniforms.len())).sum();
         self.reserve_uniforms(op, total)?;
         self.reserve_timestamps()?;
-        let timestamps = self.next_timestamps("screen pass");
-        let mut recorded = Vec::with_capacity(pass.draws.len());
+        let timestamps = self.timer.as_mut().map(|t| t.next(self.frame, "screen pass"));
+        let [r, g, b, a] = pass.clear.map(f64::from);
+        let mut encoder = self.take_encoder();
+        let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("screen pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &self.screen.as_ref().expect("checked above").view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color { r, g, b, a }),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: timestamps.zip(self.timer.as_ref()).map(|(i, t)| {
+                wgpu::RenderPassTimestampWrites {
+                    query_set: &t.queries,
+                    beginning_of_pass_write_index: Some(i),
+                    end_of_pass_write_index: Some(i + 1),
+                }
+            }),
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
         for d in &pass.draws {
-            let offsets: Vec<u32> = self.push_uniforms(&d.uniforms).into_iter().collect();
+            let offset = self.push_uniforms(&d.uniforms);
             let bind_group = self.bind_group(d.pipeline, &d.buffers);
             let Kind::Render(render) = &self.pipelines[d.pipeline as usize].kind else {
                 unreachable!("the checker checked the kind");
             };
-            recorded.push((render.clone(), bind_group, offsets, d.vertices, d.instances));
+            rp.set_pipeline(render);
+            rp.set_bind_group(0, &bind_group, offset.as_slice());
+            rp.draw(0..d.vertices, 0..d.instances);
         }
-        let query_set = self.timer.as_ref().map(|t| t.queries.clone());
-        let screen = self.screen.as_ref().map(|s| s.view.clone()).expect("checked above");
-        let [r, g, b, a] = pass.clear.map(f64::from);
-        let encoder = self.encoder();
-        {
-            let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("screen pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &screen,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color { r, g, b, a }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: timestamps.zip(query_set.as_ref()).map(|(i, query_set)| {
-                    wgpu::RenderPassTimestampWrites {
-                        query_set,
-                        beginning_of_pass_write_index: Some(i),
-                        end_of_pass_write_index: Some(i + 1),
-                    }
-                }),
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            for (pipeline, bind_group, offsets, vertices, instances) in &recorded {
-                rp.set_pipeline(pipeline);
-                rp.set_bind_group(0, bind_group, offsets);
-                rp.draw(0..*vertices, 0..*instances);
-            }
-        }
+        drop(rp);
+        self.encoder = Some(encoder);
         self.flush()
     }
 
     /// Copies a buffer back to the CPU (waits for the GPU).
     pub(crate) fn read_buffer(&mut self, handle: u32) -> Result<Vec<u8>> {
         self.flush()?;
-        let size = self
+        let buffer = self
             .buffers
             .get(&handle)
-            .map(|b| u64::from(b.size))
             .ok_or_else(|| Error::Gpu(format!("there's no buffer {handle}")))?;
-        let staging = self.readback_buffer(size);
+        let staging = self.readback_buffer(buffer.size());
         let mut encoder =
             self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-        encoder.copy_buffer_to_buffer(&self.buffers[&handle].buffer, 0, &staging, 0, size);
+        encoder.copy_buffer_to_buffer(buffer, 0, &staging, 0, buffer.size());
         self.queue.submit([encoder.finish()]);
         let bytes = map_read(&self.device, &staging)?;
         self.check_errors()?;
@@ -675,7 +676,14 @@ impl Gpu {
         self.queue.submit([encoder.finish()]);
         let bytes = map_read(&self.device, &staging)?;
         self.check_errors()?;
-        Ok(bytes.chunks_exact(padded as usize).flat_map(|r| &r[..row as usize]).copied().collect())
+        if padded == row {
+            return Ok(bytes);
+        }
+        let mut frame = Vec::with_capacity((row * u64::from(height)) as usize);
+        for padded_row in bytes.chunks_exact(padded as usize) {
+            frame.extend_from_slice(&padded_row[..row as usize]);
+        }
+        Ok(frame)
     }
 
     fn readback_buffer(&self, size: u64) -> wgpu::Buffer {
@@ -711,9 +719,7 @@ impl Executor for Gpu {
             }
             Command::Present => self.present(),
             Command::DestroyBuffer { handle } => {
-                // Work already recorded holds its own reference until the GPU is done.
-                self.buffers.remove(handle);
-                self.bind_groups.retain(|(_, handles), _| !handles.contains(handle));
+                self.destroy_buffer(*handle);
                 Ok(())
             }
         }
@@ -751,58 +757,75 @@ pub fn map_read(device: &wgpu::Device, buffer: &wgpu::Buffer) -> Result<Vec<u8>>
 }
 
 impl Timer {
-    fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Timer {
-        let size = u64::from(TIMESTAMP_QUERIES) * 8;
+    fn new(device: &wgpu::Device) -> Timer {
         Timer {
             queries: device.create_query_set(&wgpu::QuerySetDescriptor {
                 label: Some("timestamps"),
                 ty: wgpu::QueryType::Timestamp,
                 count: TIMESTAMP_QUERIES,
             }),
-            resolve: device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("timestamps"),
-                size,
-                usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
-                mapped_at_creation: false,
-            }),
-            readback: device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("timestamps readback"),
-                size,
-                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            }),
             pending: Vec::new(),
-            period: queue.get_timestamp_period(),
             results: Vec::new(),
         }
     }
 
+    /// Notes a pass about to be timed; returns the first of its two query indices.
+    /// [`Gpu::reserve_timestamps`] must have made room.
+    fn next(&mut self, frame: usize, label: &str) -> u32 {
+        self.pending.push((frame, label.to_string()));
+        (self.pending.len() as u32 - 1) * 2
+    }
+
     /// Reads back the timestamps of the submission just made. This waits for the GPU at every
     /// flush, so the timing mode measures GPU durations, not throughput.
-    ///
-    /// The queries are resolved in a later submission, after the timed one completes: on
-    /// Apple GPUs (wgpu's Metal backend) a resolve in the same command buffer as the passes it
-    /// times can read the previous submission's values.
     fn collect(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
-        device.poll(wgpu::PollType::wait_indefinitely()).map_err(gpu_err)?;
-        let n = self.pending.len() as u32 * 2;
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-        encoder.resolve_query_set(&self.queries, 0..n, &self.resolve, 0);
-        encoder.copy_buffer_to_buffer(&self.resolve, 0, &self.readback, 0, u64::from(n) * 8);
-        queue.submit([encoder.finish()]);
-        let bytes = map_read(device, &self.readback)?;
-        let ticks: Vec<u64> = bytes
-            .chunks_exact(8)
-            .map(|c| u64::from_le_bytes(c.try_into().expect("8 bytes")))
-            .collect();
-        for (i, (frame, label)) in self.pending.drain(..).enumerate() {
-            let elapsed = ticks[2 * i + 1].saturating_sub(ticks[2 * i]);
-            self.results.push(GpuTiming {
-                frame,
-                label,
-                nanos: elapsed as f64 * f64::from(self.period),
-            });
+        let nanos = read_timestamps(device, queue, &self.queries, self.pending.len() as u32)?;
+        for ((frame, label), nanos) in self.pending.drain(..).zip(nanos) {
+            self.results.push(GpuTiming { frame, label, nanos });
         }
         Ok(())
     }
+}
+
+/// The GPU durations of `passes` timed passes, in nanoseconds. Pass `i` wrote queries `2i`
+/// (start) and `2i + 1` (end) of `queries`, in a submission already made. Waits for the GPU.
+///
+/// The queries are resolved in a later submission, after the timed one completes: on Apple GPUs
+/// (wgpu's Metal backend) a resolve in the same command buffer as the passes it times can read
+/// the previous submission's values.
+pub fn read_timestamps(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    queries: &wgpu::QuerySet,
+    passes: u32,
+) -> Result<Vec<f64>> {
+    if passes == 0 {
+        return Ok(Vec::new());
+    }
+    device.poll(wgpu::PollType::wait_indefinitely()).map_err(gpu_err)?;
+    let n = passes * 2;
+    let size = u64::from(n) * 8;
+    let buffer = |label, usage| {
+        device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size,
+            usage,
+            mapped_at_creation: false,
+        })
+    };
+    let resolve =
+        buffer("timestamps", wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC);
+    let readback =
+        buffer("timestamps readback", wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST);
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+    encoder.resolve_query_set(queries, 0..n, &resolve, 0);
+    encoder.copy_buffer_to_buffer(&resolve, 0, &readback, 0, size);
+    queue.submit([encoder.finish()]);
+    let bytes = map_read(device, &readback)?;
+    let tick = |b: &[u8]| u64::from_le_bytes(b.try_into().expect("8 bytes"));
+    let period = f64::from(queue.get_timestamp_period());
+    Ok(bytes
+        .chunks_exact(16)
+        .map(|pair| tick(&pair[8..]).saturating_sub(tick(&pair[..8])) as f64 * period)
+        .collect())
 }

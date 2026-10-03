@@ -1,0 +1,40 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0108",
+      "file": "main.wrela",
+      "fixes": [
+        {
+          "edits": [
+            {
+              "end": 167,
+              "file": "main.wrela",
+              "replacement": "",
+              "start": 160
+            }
+          ],
+          "message": "remove it"
+        }
+      ],
+      "help": [
+        "attributes apply to functions"
+      ],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "`@inline` can't be on an associated type",
+      "notes": [],
+      "severity": "error",
+      "span": {
+        "column": 5,
+        "end": 167,
+        "end_column": 12,
+        "end_line": 11,
+        "line": 11,
+        "start": 160
+      },
+      "title": "an attribute in the wrong place"
+    }
+  ],
+  "version": 2
+}

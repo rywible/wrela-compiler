@@ -1,0 +1,6 @@
+// mistake: a transcendental of an `f64`, in a function nothing calls yet
+// expect: E0702
+// fix: no
+fn wave(t: f64) -> f64 {
+    sin(t)
+}

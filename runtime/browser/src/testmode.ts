@@ -18,10 +18,13 @@ export function isLoopback(hostname: string): boolean {
   return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]" || hostname === "::1";
 }
 
+/** Whether a URL fragment asks for test mode, whether or not its parameters are valid. */
+export const asksForTest = (hash: string) => hash.replace(/^#/, "").split("&")[0] === "test";
+
 /** Test mode's parameters from a URL fragment, or null if the fragment doesn't ask for it. */
 export function parseTestParams(hash: string): TestParams | null {
-  const [mode, ...pairs] = hash.replace(/^#/, "").split("&");
-  if (mode !== "test") return null;
+  if (!asksForTest(hash)) return null;
+  const [, ...pairs] = hash.replace(/^#/, "").split("&");
   const params = { ...TEST_DEFAULTS };
   for (const pair of pairs) {
     const [key, value = ""] = pair.split("=", 2);

@@ -9,13 +9,8 @@ use crate::ty::*;
 use wrela_diag::Span;
 use wrela_syntax::ast::{BinOp, UnOp};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct LocalId(pub u32);
-
-impl LocalId {
-    pub fn index(self) -> usize {
-        self.0 as usize
-    }
+id_type! {
+    LocalId;
 }
 
 /// How a local holds its value (§6.3).
@@ -194,6 +189,8 @@ pub struct Dispatch {
     /// One per kernel parameter that isn't a builtin, as (parameter index, argument), in the
     /// order written.
     pub args: Vec<(usize, Expr)>,
+    /// How many of `args` are written before `groups`: it's evaluated after them.
+    pub groups_at: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -202,8 +199,12 @@ pub struct Draw {
     pub fragment: (FnId, Vec<TyId>),
     pub vertices: Expr,
     pub instances: Expr,
-    /// The shaders' arguments by name (shared by both when they have the same name).
+    /// The shaders' arguments by name (shared by both when they have the same name), in the
+    /// order written.
     pub args: Vec<(String, Expr)>,
+    /// How many of `args` are written before `vertices` and before `instances`: each is
+    /// evaluated after them.
+    pub counts_at: [usize; 2],
 }
 
 #[derive(Clone, Debug)]
@@ -286,15 +287,99 @@ pub enum PatKind {
     Or(Vec<Pat>),
 }
 
+/// Code directly inside an expression: an expression, or a block.
+pub enum Child<'a> {
+    Expr(&'a Expr),
+    Block(&'a Block),
+}
+
 impl Expr {
     /// Whether this expression names a place: a local, a field or element of one, or a
     /// projection returned from a call.
     pub fn is_place(&self) -> bool {
-        match &self.kind {
+        match &self.place_root().kind {
             ExprKind::Local(_) | ExprKind::Const(_) => true,
-            ExprKind::Field(b, _) | ExprKind::Swizzle(b, _) | ExprKind::Index(b, _) => b.is_place(),
             ExprKind::Call(c) => c.ret_mode != RetMode::Owned,
             _ => false,
+        }
+    }
+
+    /// What a place expression is a part of: this expression without its fields, components
+    /// and elements.
+    pub fn place_root(&self) -> &Expr {
+        let mut e = self;
+        while let ExprKind::Field(b, _) | ExprKind::Swizzle(b, _) | ExprKind::Index(b, _) = &e.kind
+        {
+            e = b;
+        }
+        e
+    }
+
+    /// Calls `f` on each expression and block directly inside this one. (A closure's body is
+    /// a body of its own, not inside the closure expression.)
+    pub fn for_each_child<'a>(&'a self, f: &mut impl FnMut(Child<'a>)) {
+        match &self.kind {
+            ExprKind::Lit(_)
+            | ExprKind::Local(_)
+            | ExprKind::Const(_)
+            | ExprKind::Closure(_)
+            | ExprKind::FnRef(..)
+            | ExprKind::Break
+            | ExprKind::Continue
+            | ExprKind::FromBase
+            | ExprKind::Error => {}
+            ExprKind::Unary(_, x)
+            | ExprKind::Field(x, _)
+            | ExprKind::Swizzle(x, _)
+            | ExprKind::ArrayRepeat(x, _)
+            | ExprKind::Convert(x)
+            | ExprKind::Take(x)
+            | ExprKind::MutArg(x) => f(Child::Expr(x)),
+            ExprKind::Binary(_, a, b) | ExprKind::Index(a, b) => {
+                f(Child::Expr(a));
+                f(Child::Expr(b));
+            }
+            ExprKind::Call(c) => c.args.iter().for_each(|a| f(Child::Expr(a))),
+            ExprKind::Adt { fields, base, .. } => {
+                fields.iter().for_each(|x| f(Child::Expr(x)));
+                if let Some(b) = base {
+                    f(Child::Expr(b));
+                }
+            }
+            ExprKind::Tuple(xs) | ExprKind::Array(xs) | ExprKind::Construct(xs) => {
+                xs.iter().for_each(|x| f(Child::Expr(x)))
+            }
+            ExprKind::Block(b) => f(Child::Block(b)),
+            ExprKind::If { cond, then, else_ } => {
+                f(Child::Expr(cond));
+                f(Child::Block(then));
+                if let Some(e) = else_ {
+                    f(Child::Expr(e));
+                }
+            }
+            ExprKind::Match { scrutinee, arms } => {
+                f(Child::Expr(scrutinee));
+                for a in arms {
+                    if let Some(g) = &a.guard {
+                        f(Child::Expr(g));
+                    }
+                    f(Child::Expr(&a.body));
+                }
+            }
+            ExprKind::Return(v) => {
+                if let Some(v) = v {
+                    f(Child::Expr(v));
+                }
+            }
+            ExprKind::Dispatch(d) => {
+                f(Child::Expr(&d.groups));
+                d.args.iter().for_each(|(_, a)| f(Child::Expr(a)));
+            }
+            ExprKind::Draw(d) => {
+                f(Child::Expr(&d.vertices));
+                f(Child::Expr(&d.instances));
+                d.args.iter().for_each(|(_, a)| f(Child::Expr(a)));
+            }
         }
     }
 }

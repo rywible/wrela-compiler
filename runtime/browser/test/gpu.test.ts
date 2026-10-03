@@ -1,5 +1,5 @@
-// The decoder's mapping to WebGPU, on a fake device (see runtime/native/tests/gpu.rs for the
-// same behaviour on a real GPU).
+// The decoder's mapping to WebGPU, on a fake device (see runtime/native/tests/suite/gpu.rs for
+// the same behaviour on a real GPU).
 
 import { describe, expect, test } from "bun:test";
 import { buildPipelines, GpuExecutor, ShaderError } from "../src/gpu.ts";
@@ -8,13 +8,14 @@ import { decode } from "../src/stream.ts";
 import { Encoder, words } from "./encoder.ts";
 import { type Event, FakeDevice, fakeTexture } from "./fake-gpu.ts";
 import { shapes } from "./fixtures.ts";
+import type { ScreenTarget } from "../src/gpu.ts";
 
 const SHADER = "// fine\n";
 
-async function setup(manifest: Manifest = shapes()) {
+async function setup(manifest: Manifest = shapes(), screen: ScreenTarget = { texture: () => fakeTexture("screen") }) {
   const device = new FakeDevice();
   const pipelines = await buildPipelines(device.gpu, manifest, manifest.pipelines.map(() => SHADER));
-  const executor = new GpuExecutor(device.gpu, pipelines, { texture: () => fakeTexture("screen") });
+  const executor = new GpuExecutor(device.gpu, pipelines, screen);
   /** Runs a batch's commands (already valid: these tests are about the mapping). */
   const run = (e: Encoder) => {
     for (const cmd of decode(e.finish())) executor.execute(cmd);
@@ -51,8 +52,17 @@ describe("pipelines", () => {
 
   test("report validation errors from building", async () => {
     const device = new FakeDevice();
-    device.scopeError = "entry point `vs` not found";
-    await expect(buildPipelines(device.gpu, shapes(), [SHADER, SHADER])).rejects.toThrow("entry point `vs` not found");
+    device.pipelineErrors.set("compute", "entry point `main` not found");
+    await expect(buildPipelines(device.gpu, shapes(), [SHADER, SHADER])).rejects.toThrow(
+      "pipeline `compute` (shader compute.wgsl) failed to build:\nentry point `main` not found",
+    );
+  });
+
+  test("report each layout's validation error against its own pipeline, though they build at once", async () => {
+    const device = new FakeDevice();
+    device.layoutErrors.set("draw", "binding 1 is used twice");
+    const build = buildPipelines(device.gpu, shapes(), [SHADER, SHADER]);
+    await expect(build).rejects.toThrow("pipeline `draw` (shader draw.wgsl) failed to build:\nbinding 1 is used twice");
   });
 
   test("reject uniform blocks over the device's limit", async () => {
@@ -128,6 +138,38 @@ test("bind groups are cached per pipeline and buffers", async () => {
   ]);
 });
 
+test("destroying a buffer drops just the bind groups that use it", async () => {
+  const { device, run } = await setup();
+  const e = new Encoder().createBuffer(1, 64).createBuffer(2, 64).createBuffer(3, 64);
+  e.dispatch(1, [1, 1, 1], [1, 2], u(0)).dispatch(1, [1, 1, 1], [2, 3], u(1));
+  e.destroyBuffer(1).createBuffer(1, 64);
+  run(e.dispatch(1, [1, 1, 1], [1, 2], u(2)).dispatch(1, [1, 1, 1], [2, 3], u(3)));
+  const groups = device.events.flatMap((ev) => (ev.kind === "dispatch" ? [ev.bindGroup] : []));
+  expect(groups.map((g) => g.id)).toEqual([0, 1, 2, 1]);
+  const [first, second] = device.buffers.filter((b) => b.label === "buffer 1");
+  expect(groups[0]!.buffers[1]).toBe(first!);
+  expect(groups[2]!.buffers[1]).toBe(second!);
+});
+
+test("a destroyed buffer is released once the work recorded before it is submitted", async () => {
+  const { device, run, executor } = await setup();
+  run(new Encoder().createBuffer(1, 64).createBuffer(2, 64).dispatch(1, [1, 1, 1], [1, 2], u(0)).destroyBuffer(1));
+  const buffer = device.buffers.find((b) => b.label === "buffer 1")!;
+  expect(buffer.destroyed).toBe(false);
+  executor.flush();
+  expect(buffer.destroyed).toBe(true);
+});
+
+test("a destroyed buffer is released in a frame with no GPU work", async () => {
+  const { device, run, executor } = await setup();
+  for (let frame = 0; frame < 3; frame++) {
+    run(new Encoder().createBuffer(1, 1 << 20).writeBuffer(1, 0, words([7])).destroyBuffer(1));
+    executor.flush(); // the end of the frame
+  }
+  const buffers = device.buffers.filter((b) => b.label === "buffer 1");
+  expect(buffers.map((b) => b.destroyed)).toEqual([true, true, true]);
+});
+
 test("the ring grows when one pass needs more than it holds", async () => {
   const { device, run } = await setup();
   const e = new Encoder().createBuffer(1, 64).createBuffer(2, 64).beginScreenPass([0, 0, 0, 1]);
@@ -147,6 +189,21 @@ test("the ring grows when one pass needs more than it holds", async () => {
   expect(Array.from(write.data.subarray(299 * 256, 299 * 256 + 4))).toEqual([43, 1, 0, 0]);
 });
 
+test("growing the ring drops the bind groups that point at the old one", async () => {
+  const { device, run, executor } = await setup();
+  run(new Encoder().createBuffer(1, 64).createBuffer(2, 64).dispatch(1, [1, 1, 1], [1, 2], u(0)));
+  executor.flush();
+  const e = new Encoder().beginScreenPass([0, 0, 0, 1]);
+  for (let i = 0; i < 300; i++) e.draw(0, 3, 1, [1, 2], u(i)); // 300 x 256 bytes > the 64 KiB ring
+  run(e.present().dispatch(1, [1, 1, 1], [1, 2], u(1)));
+  const [small, large] = device.buffers.filter((b) => b.label === "uniform ring");
+  const groups = device.events.flatMap((ev) => (ev.kind === "dispatch" || ev.kind === "draw" ? [ev.bindGroup] : []));
+  expect(groups[0]!.buffers[0]).toBe(small!);
+  // The last dispatch's pipeline and buffers are the first's, but its group is new.
+  expect(groups.slice(1).every((g) => g.buffers[0] === large)).toBe(true);
+  expect(groups.at(-1)!.id).not.toBe(groups[0]!.id);
+});
+
 test("dispatches flush when the ring is full, then reuse it", async () => {
   const { device, run } = await setup();
   const e = new Encoder().createBuffer(1, 64).createBuffer(2, 64);
@@ -161,15 +218,12 @@ test("dispatches flush when the ring is full, then reuse it", async () => {
 });
 
 test("a screen target can copy each pass out (test mode)", async () => {
-  const device = new FakeDevice();
-  const m = shapes();
-  const pipelines = await buildPipelines(device.gpu, m, [SHADER, SHADER]);
   const screen = fakeTexture("readable");
-  const executor = new GpuExecutor(device.gpu, pipelines, {
+  const { device, run } = await setup(shapes(), {
     texture: () => screen,
     afterPass: (encoder) => encoder.copyTextureToTexture({ texture: screen }, { texture: fakeTexture("canvas") }, [1, 1]),
   });
-  for (const cmd of decode(new Encoder().beginScreenPass([0, 0, 0, 1]).present().finish())) executor.execute(cmd);
+  run(new Encoder().beginScreenPass([0, 0, 0, 1]).present());
   expect(device.events).toEqual([
     { kind: "renderPass", clear: { r: 0, g: 0, b: 0, a: 1 }, view: "readable" },
     { kind: "copy", from: "readable", to: "canvas" },

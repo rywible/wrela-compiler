@@ -3,10 +3,13 @@
 // kinds). The native host gets them from wasmtime; both check them against the program ABI.
 
 export interface FunctionTypes {
-  /** `module.name` of each imported function, to its type, e.g. `(i32, i32) -> ()`. */
-  imports: Map<string, string>;
+  /** Each import's type in import order, e.g. `(i32, i32) -> ()`; null if it isn't a function.
+   * In order, not by name: a module may import one name twice with different types. */
+  imports: (string | null)[];
   /** Each exported function's name, to its type. */
   exports: Map<string, string>;
+  /** Whether it has a start function. */
+  start: boolean;
 }
 
 const VALTYPES: Record<number, string> = {
@@ -19,13 +22,20 @@ const VALTYPES: Record<number, string> = {
   0x6f: "externref",
 };
 
-class Reader {
+/** Strict UTF-8 that keeps a leading byte-order mark, as Rust's `str::from_utf8` does. */
+export const UTF8 = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+
+/** Reads WASM's encodings in order; `eof` is the message when the bytes run out. */
+export class ByteReader {
   at = 0;
-  constructor(readonly bytes: Uint8Array) {}
+  constructor(
+    readonly bytes: Uint8Array,
+    readonly eof = "unexpected end of the module",
+  ) {}
 
   byte(): number {
     const b = this.bytes[this.at++];
-    if (b === undefined) throw new Error("unexpected end of the module");
+    if (b === undefined) throw new Error(this.eof);
     return b;
   }
 
@@ -41,12 +51,35 @@ class Reader {
     }
   }
 
-  name(): string {
-    const len = this.uleb();
-    const s = new TextDecoder().decode(this.bytes.subarray(this.at, this.at + len));
-    this.at += len;
-    return s;
+  /** An unsigned LEB128 that fits in 32 bits, in at most 5 bytes. */
+  u32(): number {
+    let x = 0;
+    for (let shift = 0; shift < 35; shift += 7) {
+      const b = this.byte();
+      x += (b & 0x7f) * 2 ** shift;
+      if ((b & 0x80) === 0) {
+        if (x > 0xffffffff) throw new Error("a number is too large");
+        return x;
+      }
+    }
+    throw new Error("a number is too long");
   }
+
+  /** The next `n` bytes. */
+  take(n: number): Uint8Array {
+    if (this.at + n > this.bytes.length) throw new Error(this.eof);
+    const out = this.bytes.subarray(this.at, this.at + n);
+    this.at += n;
+    return out;
+  }
+
+  /** A length-prefixed UTF-8 string. */
+  name(): string {
+    return UTF8.decode(this.take(this.u32()));
+  }
+}
+
+class Reader extends ByteReader {
 
   valtype(): string {
     const b = this.byte();
@@ -72,7 +105,7 @@ export function functionTypes(bytes: Uint8Array): FunctionTypes {
   r.at = 8; // magic and version
   const types: string[] = [];
   const funcs: string[] = []; // the type of each function index: imports first
-  const out: FunctionTypes = { imports: new Map(), exports: new Map() };
+  const out: FunctionTypes = { imports: [], exports: new Map(), start: false };
   while (r.at < bytes.length) {
     const id = r.byte();
     const size = r.uleb();
@@ -87,13 +120,17 @@ export function functionTypes(bytes: Uint8Array): FunctionTypes {
       }
     } else if (id === 2) {
       for (let n = r.uleb(); n > 0; n--) {
-        const name = `${r.name()}.${r.name()}`;
+        r.name(); // module
+        r.name(); // name
         const kind = r.byte();
         if (kind === 0) {
           const ty = types[r.uleb()] ?? "(?)";
           funcs.push(ty);
-          out.imports.set(name, ty);
-        } else if (kind === 1) {
+          out.imports.push(ty);
+          continue;
+        }
+        out.imports.push(null);
+        if (kind === 1) {
           r.valtype();
           r.limits();
         } else if (kind === 2) {
@@ -117,6 +154,8 @@ export function functionTypes(bytes: Uint8Array): FunctionTypes {
         const index = r.uleb();
         if (kind === 0) out.exports.set(name, funcs[index] ?? "(?)");
       }
+    } else if (id === 8) {
+      out.start = true;
     }
     r.at = end;
   }

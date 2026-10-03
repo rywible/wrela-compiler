@@ -1,17 +1,64 @@
 // rejects: gpu.dispatch
-use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch}
+use std::gpu::{
+    ClipPosition, FragCoord, GlobalId, GpuBuffer, Slots, VertexIndex, begin_screen_pass, buffer,
+    dispatch, draw, present,
+}
+
+struct P: Copy + Clone + GpuData {
+    s: f32,
+}
 
 @compute(64)
 fn fill(scale: f32, out: mut Slots<f32>, id: GlobalId) {
     out[id] = scale
 }
 
+@vertex
+fn vs(v: VertexIndex) -> ClipPosition {
+    ClipPosition { position: vec4(f32(v.index), 0.0, 0.0, 1.0) }
+}
+
+@fragment
+fn fs(pixel: FragCoord, p: P) -> vec4 {
+    vec4(p.s, 0.0, 0.0, 1.0)
+}
+
 pub fn frame(time: f32, width: u32, height: u32) {
     let out: GpuBuffer<f32> = buffer(64)
     dispatch(fill, groups: 1, out: out) //~ E0603
     dispatch(fill, groups: 1, scale: 1.0, out: out, extra: 2.0) //~ E0603
+    dispatch(fill, groups: 1, groups: 2, scale: 1.0, out: out) //~ E0304
+    begin_screen_pass(clear: vec4(0.0, 0.0, 0.0, 1.0))
+    draw(vs, fs, vertices: 3, vertices: 6, p: P { s: 1.0 }) //~ E0304
+    draw(vs, fs, vertices: 3, instances: 1, instances: 2, p: P { s: 1.0 }) //~ E0304
+    draw(vs, fs, vertices: 3, p: P { s: 1.0 }, p: P { s: 2.0 }) //~ E0304
+    present()
 }
 
 fn direct() {
     fill(1.0) //~ E0606
+}
+
+// An entry point runs on the GPU; one passed as a function would run on the CPU.
+
+fn call_fs(f: fn(FragCoord, P) -> vec4) -> f32 {
+    1.0
+}
+
+fn as_value() -> f32 {
+    call_fs(fs) //~ E0606
+}
+
+// The compiler implements these calls, not their bodies in std.
+fn run(f: fn()) {
+    f()
+}
+
+fn make(f: fn(u32) -> GpuBuffer<f32>) -> u32 {
+    1
+}
+
+fn intrinsics() -> u32 {
+    run(present) //~ E0212
+    make(buffer) //~ E0212
 }

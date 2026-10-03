@@ -2,6 +2,8 @@
 // expect: sum_to(4) = 10
 // expect: scaled(3.0) = 12.0
 // expect: fnref() = 9
+// expect: rebound(3.0) = 12.0
+// expect: projected() = 42.0
 
 fn each(n: u32, f: fn(u32)) {
     for i in 0..n {
@@ -34,4 +36,28 @@ fn call_with(f: fn(i32) -> i32, v: i32) -> i32 {
 
 pub fn fnref() -> i32 {
     call_with(add4, 5)
+}
+
+fn pass_on(f: fn(f32) -> f32, x: f32) -> f32 {
+    let g = f
+    g(x)
+}
+
+// A closure or function bound again to another name.
+pub fn rebound(k: f32) -> f32 {
+    let c = |x: f32| x * k
+    let d = c
+    let h = add4
+    let h2 = h
+    pass_on(d, 2.0) + f32(call_with(h2, -4)) + d(2.0)
+}
+
+// A `mut` projection inside a closure writes the captured place.
+pub fn projected() -> f32 {
+    var v = vec2(1.0, 2.0)
+    each(1, |_i: u32| {
+        mut p = v.x
+        p = 42.0
+    })
+    v.x
 }

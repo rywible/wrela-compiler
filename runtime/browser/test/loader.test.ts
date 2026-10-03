@@ -3,7 +3,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { type Fetch, loadBuild } from "../src/loader.ts";
 import { ManifestError } from "../src/manifest.ts";
-import { FIRST_LIGHT } from "./fixtures.ts";
+import { FIRST_LIGHT, readFixture, readFixtureText } from "./fixtures.ts";
 
 const BASE = "http://localhost/game/index.html";
 
@@ -25,9 +25,9 @@ test("loads a build's manifest, WASM and shaders", async () => {
   const { fetch, requested } = server();
   const build = await loadBuild(BASE, fetch);
   expect(build.manifest.pipelines.length).toBe(2);
-  expect(build.wasm).toEqual(new Uint8Array(readFileSync(join(FIRST_LIGHT, "game.wasm"))));
+  expect(build.wasm).toEqual(readFixture("game.wasm"));
   expect(build.shaders).toEqual(
-    ["first-light.wgsl", "fill.wgsl"].map((f) => readFileSync(join(FIRST_LIGHT, f), "utf8")),
+    ["first-light.wgsl", "fill.wgsl"].map(readFixtureText),
   );
   expect(requested.sort()).toEqual(
     ["/game/fill.wgsl", "/game/first-light.wgsl", "/game/game.wasm", "/game/manifest.json"].sort(),
@@ -35,10 +35,7 @@ test("loads a build's manifest, WASM and shaders", async () => {
 });
 
 test("rejects a manifest of another version, loudly", async () => {
-  const manifest = readFileSync(join(FIRST_LIGHT, "manifest.json"), "utf8").replace(
-    '"manifest_version": 1',
-    '"manifest_version": 2',
-  );
+  const manifest = readFixtureText("manifest.json").replace('"manifest_version": 1', '"manifest_version": 2');
   const load = loadBuild(BASE, server({ "manifest.json": manifest }).fetch);
   await expect(load).rejects.toThrow(ManifestError);
   await expect(loadBuild(BASE, server({ "manifest.json": manifest }).fetch)).rejects.toThrow(
@@ -46,8 +43,16 @@ test("rejects a manifest of another version, loudly", async () => {
   );
 });
 
+test("reads text files as strict UTF-8 that keeps a byte-order mark, as the native host does", async () => {
+  const manifest = readFixtureText("manifest.json");
+  await expect(loadBuild(BASE, server({ "manifest.json": `\uFEFF${manifest}` }).fetch)).rejects.toThrow(ManifestError);
+  const bad = new Uint8Array([...new TextEncoder().encode(manifest), 0xff]);
+  const files: Fetch = async (url) => (url.pathname.endsWith("manifest.json") ? new Response(bad) : server().fetch(url));
+  await expect(loadBuild(BASE, files)).rejects.toThrow("http://localhost/game/manifest.json isn't UTF-8");
+});
+
 test("names a file it can't fetch", async () => {
-  const manifest = readFileSync(join(FIRST_LIGHT, "manifest.json"), "utf8").replace("fill.wgsl", "missing.wgsl");
+  const manifest = readFixtureText("manifest.json").replace("fill.wgsl", "missing.wgsl");
   await expect(loadBuild(BASE, server({ "manifest.json": manifest }).fetch)).rejects.toThrow(
     "can't fetch http://localhost/game/missing.wgsl: 404 Not Found",
   );

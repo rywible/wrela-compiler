@@ -100,22 +100,17 @@ const UNITS: &[(&str, Cat)] = &[
     ("arm", Cat::Arm),
     ("type", Cat::Type),
     ("path_type", Cat::Type),
-    ("expr", Cat::Expr),
     ("closure", Cat::Expr),
     ("jump", Cat::Expr),
-    ("cmp_expr", Cat::Expr),
-    ("unary_expr", Cat::Expr),
-    ("power_expr", Cat::Expr),
-    ("primary_expr", Cat::Expr),
     ("if_expr", Cat::Expr),
-    ("expr_ns", Cat::Expr),
-    ("cmp_expr_ns", Cat::Expr),
-    ("unary_expr_ns", Cat::Expr),
-    ("power_expr_ns", Cat::Expr),
-    ("primary_expr_ns", Cat::Expr),
 ];
 
-const LEFT_CHAINS: &[&str] = &[
+/// Expression rules with an `_ns` twin (the rule again, for the head of an `if`, `while`,
+/// `for` or `match`), which has the same role.
+const TWINNED_UNITS: &[&str] = &["expr", "cmp_expr", "unary_expr", "power_expr", "primary_expr"];
+
+/// The `x ::= y (op y)*` rules, each with an `_ns` twin.
+const TWINNED_LEFT_CHAINS: &[&str] = &[
     "or_expr",
     "and_expr",
     "bitor_expr",
@@ -124,14 +119,6 @@ const LEFT_CHAINS: &[&str] = &[
     "shift_expr",
     "add_expr",
     "mul_expr",
-    "or_expr_ns",
-    "and_expr_ns",
-    "bitor_expr_ns",
-    "bitxor_expr_ns",
-    "bitand_expr_ns",
-    "shift_expr_ns",
-    "add_expr_ns",
-    "mul_expr_ns",
 ];
 
 impl Roles {
@@ -143,14 +130,20 @@ impl Roles {
                 .unwrap_or_else(|| panic!("canon: spec/grammar.ebnf has no rule `{name}`"));
             roles[id] = role;
         };
+        let mut set_twins = |name: &str, role: Role| {
+            set(name, role);
+            set(&format!("{name}_ns"), role);
+        };
+        for name in TWINNED_UNITS {
+            set_twins(name, Role::Unit(Cat::Expr));
+        }
+        for name in TWINNED_LEFT_CHAINS {
+            set_twins(name, Role::LeftChain);
+        }
+        set_twins("postfix_expr", Role::Postfix);
         for (name, cat) in UNITS {
             set(name, Role::Unit(*cat));
         }
-        for name in LEFT_CHAINS {
-            set(name, Role::LeftChain);
-        }
-        set("postfix_expr", Role::Postfix);
-        set("postfix_expr_ns", Role::Postfix);
         set("pattern", Role::Pattern);
         Roles { roles }
     }

@@ -10,8 +10,9 @@
 //! it), or callables (closures and functions, inlined per instance).
 
 use crate::instance::{Callable, InstanceKey};
-use crate::{Cx, ModuleBuilder, rc};
+use crate::{Cx, ModuleBuilder};
 use std::collections::HashMap;
+use std::rc::Rc;
 use wrela_diag::{Diagnostic, Span, codes};
 use wrela_ir as ir;
 use wrela_sema::builtins::BuiltinFn;
@@ -66,11 +67,13 @@ pub(crate) struct Fl<'c, 'a> {
     preds: Vec<u32>,
     /// Each `Match` block's flag: whether an arm has matched.
     matched: HashMap<BlockId, ir::LocalId>,
+    /// Each `Match` block whose last arm can fail: the block after it (no arm matched).
+    unmatched: HashMap<BlockId, BlockId>,
 }
 
 pub(crate) fn lower_body(cx: &mut Cx, mb: &mut ModuleBuilder, key: &InstanceKey, id: ir::FuncId) {
     if let InstanceKey::Derived { .. } = key {
-        crate::gpu::lower_derived(cx, mb, key, id);
+        crate::derive::lower(cx, mb, key, id);
         return;
     }
     let checked = cx.checked;
@@ -80,8 +83,7 @@ pub(crate) fn lower_body(cx: &mut Cx, mb: &mut ModuleBuilder, key: &InstanceKey,
         _ => &mir.fns[0],
     };
     let subst = cx.instance_subst(key);
-    let f =
-        std::mem::replace(&mut mb.m.functions[id.index()], ir::Function::new("", Vec::new(), None));
+    let f = std::mem::take(&mut mb.m.functions[id.index()]);
     let mut fl = Fl {
         cx,
         mb,
@@ -95,7 +97,9 @@ pub(crate) fn lower_body(cx: &mut Cx, mb: &mut ModuleBuilder, key: &InstanceKey,
         blocks: vec![(Vec::new(), false)],
         preds: reachable_preds(code),
         matched: HashMap::new(),
+        unmatched: HashMap::new(),
     };
+    fl.unmatched = unmatched(code, &fl.preds);
     match key {
         InstanceKey::Fn { .. } => fl.bind_fn_params(),
         InstanceKey::Closure { id: cid, .. } => fl.bind_closure_params(*cid),
@@ -126,6 +130,21 @@ fn reachable_preds(code: &mir::FnBody) -> Vec<u32> {
         }
     }
     preds
+}
+
+/// For each `Match` whose last arm can fail (reachably), the block control goes to then.
+fn unmatched(code: &mir::FnBody, preds: &[u32]) -> HashMap<BlockId, BlockId> {
+    let mut out = HashMap::new();
+    for (i, b) in code.blocks.iter().enumerate() {
+        let reachable = i == mir::FnBody::ENTRY.index() || preds[i] > 0;
+        if let (true, TerminatorKind::ArmFailed { match_, next }) = (reachable, &b.term.kind)
+            && let TerminatorKind::Match { arms, .. } = &code.block(*match_).term.kind
+            && !arms.contains(next)
+        {
+            out.insert(*match_, *next);
+        }
+    }
+    out
 }
 
 impl<'c, 'a> Fl<'c, 'a> {
@@ -190,6 +209,24 @@ impl<'c, 'a> Fl<'c, 'a> {
         self.f.new_local(name, ty)
     }
 
+    /// A new IR local named `name`, holding the value of `e`.
+    pub fn bind_local(&mut self, name: &str, ty: ir::TypeId, e: ir::Expr) -> ir::LocalId {
+        let v = self.value(ty, e);
+        self.local_of(name, v)
+    }
+
+    /// A new IR local holding `v`.
+    fn local_of(&mut self, name: &str, v: ir::ValueId) -> ir::LocalId {
+        let l = self.new_local(name, self.f.value_ty(v));
+        self.emit(ir::Stmt::Store(ir::Place::local(l), v));
+        l
+    }
+
+    /// A temporary copy of `v`, so it has a place.
+    fn temp_place(&mut self, v: ir::ValueId) -> ir::Place {
+        ir::Place::local(self.local_of("tmp", v))
+    }
+
     fn finish(mut self) {
         let body = self.pop_block();
         self.f.body = body;
@@ -202,8 +239,7 @@ impl<'c, 'a> Fl<'c, 'a> {
     }
 
     pub fn concrete(&mut self, t: TyId) -> TyId {
-        let subst = self.subst.clone();
-        self.cx.concrete(t, &subst)
+        self.cx.concrete(t, &self.subst)
     }
 
     pub fn types(&self) -> &'a Types {
@@ -211,7 +247,7 @@ impl<'c, 'a> Fl<'c, 'a> {
     }
 
     pub fn is_gpu(&self) -> bool {
-        self.mb.target == ir::Target::Gpu
+        self.mb.target() == ir::Target::Gpu
     }
 
     fn local_ty(&self, l: Local) -> TyId {
@@ -225,8 +261,7 @@ impl<'c, 'a> Fl<'c, 'a> {
         let program = &self.cx.checked.program;
         let def = program.func(func);
         if let Some(entry) = self.cx.entry_of(func)
-            && self.is_gpu()
-            && self.mb.gpu.as_ref().is_some_and(|g| g.entry_fns.contains(&func))
+            && self.mb.gpu.as_ref().is_some_and(|g| g.entry_index(func).is_some())
         {
             crate::gpu::bind_entry_params(self, func, entry);
             return;
@@ -238,18 +273,16 @@ impl<'c, 'a> Fl<'c, 'a> {
             if let TyKind::FnPtr(..) = self.types().kind(t) {
                 match callables.get(i).cloned().flatten() {
                     Some(c) => {
-                        let caps = self.cx.callable_params(self.mb, &c, p.span);
+                        // The callable's captures, in the order `callable_params` declares them.
                         let mut srcs = Vec::new();
-                        for cp in caps {
-                            let place = if cp.by_ref {
-                                ir::Place { root: ir::PlaceRoot::Param(k), path: Vec::new() }
+                        for _ in 0..self.cx.callable_params(self.mb, &c).len() {
+                            let by_ref = self.f.params[k as usize].by_ref;
+                            let place = if by_ref {
+                                ir::Place::root(ir::PlaceRoot::Param(k))
                             } else {
-                                let l = self.new_local(&cp.name, cp.ty);
-                                let v = self.value(cp.ty, ir::Expr::Param(k));
-                                self.emit(ir::Stmt::Store(ir::Place::local(l), v));
-                                ir::Place::local(l)
+                                ir::Place::local(self.param_local(k))
                             };
-                            srcs.push(CaptureSrc { place, by_ref: cp.by_ref });
+                            srcs.push(CaptureSrc { place, by_ref });
                             k += 1;
                         }
                         self.locals[local.index()] = Repr::Callable(c, srcs);
@@ -260,32 +293,22 @@ impl<'c, 'a> Fl<'c, 'a> {
             }
             if let Some(Some(r)) = resources.get(i) {
                 self.locals[local.index()] =
-                    Repr::Place(ir::Place { root: ir::PlaceRoot::Resource(*r), path: Vec::new() });
+                    Repr::Place(ir::Place::root(ir::PlaceRoot::Resource(*r)));
                 continue;
             }
-            let Some(ty) = self.cx.lower_ty(self.mb, t, p.span) else {
+            if self.cx.lower_ty(self.mb, t, p.span).is_none() {
                 self.locals[local.index()] = Repr::Erased;
                 continue;
-            };
-            let param = self.f.params[k as usize].clone();
-            if param.by_ref {
-                self.locals[local.index()] =
-                    Repr::Place(ir::Place { root: ir::PlaceRoot::Param(k), path: Vec::new() });
-            } else {
-                let l = self.new_local(&p.name, ty);
-                let v = self.value(ty, ir::Expr::Param(k));
-                self.emit(ir::Stmt::Store(ir::Place::local(l), v));
-                self.locals[local.index()] = Repr::Var(l);
             }
+            self.bind_param(local, k);
             k += 1;
         }
     }
 
     fn bind_closure_params(&mut self, cid: ClosureId) {
         let info = &self.mir.closures[cid.0 as usize];
-        let mut k = 0u32;
-        // Captures first, in the order `callable_params` declared them.
-        for &(l, _written) in &info.captures {
+        let owner = self.owner_key();
+        for &(l, _) in &info.captures {
             let decl = self.mir.local(l);
             let t = self.concrete(decl.ty);
             if matches!(self.types().kind(t), TyKind::Closure(..) | TyKind::FnPtr(..)) {
@@ -298,38 +321,52 @@ impl<'c, 'a> Fl<'c, 'a> {
                     )
                     .with_help("pass the inner closure to the function directly"),
                 );
-                self.locals[l.index()] = Repr::Erased;
-                continue;
             }
-            let Some(ty) = self.cx.lower_ty(self.mb, t, decl.span) else {
-                self.locals[l.index()] = Repr::Erased;
-                continue;
-            };
-            let param = self.f.params[k as usize].clone();
-            if param.by_ref {
-                self.locals[l.index()] =
-                    Repr::Place(ir::Place { root: ir::PlaceRoot::Param(k), path: Vec::new() });
-            } else {
-                let lv = self.new_local(&decl.name, ty);
-                let v = self.value(ty, ir::Expr::Param(k));
-                self.emit(ir::Stmt::Store(ir::Place::local(lv), v));
-                self.locals[l.index()] = Repr::Var(lv);
-            }
+            // Bound below if the closure takes it as a parameter; a buffer is its resource; a
+            // named function is its type, so it isn't passed.
+            self.locals[l.index()] =
+                match (self.types().kind(t), self.cx.capture_resource(&owner, l)) {
+                    (TyKind::FnDef(func, substs), _) => Repr::Callable(
+                        Callable::Func { func: *func, substs: substs.clone() },
+                        Vec::new(),
+                    ),
+                    (_, Some(r)) => Repr::Place(ir::Place::root(ir::PlaceRoot::Resource(r))),
+                    (_, None) => Repr::Erased,
+                };
+        }
+        // The captures it takes first, then the closure's own parameters.
+        let mut k = 0u32;
+        for (l, ..) in self.cx.lowered_captures(self.mb, &owner, cid) {
+            self.bind_param(l, k);
             k += 1;
         }
         for &l in &info.params {
             let decl = self.mir.local(l);
             let t = self.concrete(decl.ty);
-            let Some(ty) = self.cx.lower_ty(self.mb, t, decl.span) else {
+            if self.cx.lower_ty(self.mb, t, decl.span).is_none() {
                 self.locals[l.index()] = Repr::Erased;
                 continue;
-            };
-            let lv = self.new_local(&decl.name, ty);
-            let v = self.value(ty, ir::Expr::Param(k));
-            self.emit(ir::Stmt::Store(ir::Place::local(lv), v));
-            self.locals[l.index()] = Repr::Var(lv);
+            }
+            self.bind_param(l, k);
             k += 1;
         }
+    }
+
+    /// Binds MIR local `l` to IR parameter `k`: a by-reference parameter is its place; a value
+    /// is copied into a new local, which can be assigned.
+    fn bind_param(&mut self, l: Local, k: u32) {
+        self.locals[l.index()] = if self.f.params[k as usize].by_ref {
+            Repr::Place(ir::Place::root(ir::PlaceRoot::Param(k)))
+        } else {
+            Repr::Var(self.param_local(k))
+        };
+    }
+
+    /// A new local holding the value of IR parameter `k`.
+    fn param_local(&mut self, k: u32) -> ir::LocalId {
+        let p = &self.f.params[k as usize];
+        let (name, ty) = (p.name.clone(), p.ty);
+        self.bind_local(&name, ty, ir::Expr::Param(k))
     }
 
     // ---- control flow ----------------------------------------------------------------------
@@ -406,6 +443,16 @@ impl<'c, 'a> Fl<'c, 'a> {
                         let not_m = self.value(bool_ty, ir::Expr::Unary(ir::UnOp::Not, m));
                         self.emit(ir::Stmt::If { cond: not_m, then: body, else_: Vec::new() });
                     }
+                    if let Some(&none) = self.unmatched.get(&b) {
+                        // No arm matched (unreachable: the match is exhaustive, and a guard
+                        // can't change what the arms test).
+                        self.push_block();
+                        self.region(none, None);
+                        let body = self.pop_block();
+                        let m = self.load(ir::Place::local(flag), bool_ty);
+                        let not_m = self.value(bool_ty, ir::Expr::Unary(ir::UnOp::Not, m));
+                        self.emit(ir::Stmt::If { cond: not_m, then: body, else_: Vec::new() });
+                    }
                     if self.preds[merge.index()] == 0 {
                         return;
                     }
@@ -430,7 +477,22 @@ impl<'c, 'a> Fl<'c, 'a> {
                 }
                 TerminatorKind::ReturnPlace(p) => {
                     let pt = self.f.ret.map(|t| self.mb.m.types.intern(ir::TypeDef::Ptr(t)));
-                    match (self.place(p), pt) {
+                    let place = match self.place_parts(p) {
+                        Some((_, _, Some(_))) => {
+                            // A pointer is to one place, and the components are several.
+                            self.cx.err(
+                                Diagnostic::new(
+                                    codes::E0702,
+                                    block.term.span,
+                                    "a function can't return a projection of several vector components yet",
+                                )
+                                .with_help("return a projection of the whole vector, and pick the components at the call site"),
+                            );
+                            None
+                        }
+                        parts => parts.map(|(place, ..)| place),
+                    };
+                    match (place, pt) {
                         (Some(p), Some(pt)) => {
                             let a = self.value(pt, ir::Expr::Addr(p));
                             self.emit(ir::Stmt::Return(Some(a)));
@@ -462,9 +524,9 @@ impl<'c, 'a> Fl<'c, 'a> {
                 let _ = self.rvalue(r, None, s.span);
             }
             StatementKind::Bind { local, place, .. } => {
-                let repr = match &self.locals[place.local.index()] {
-                    r @ Repr::Callable(..) if place.proj.is_empty() => r.clone(),
-                    _ => match self.place_parts(place) {
+                let repr = match self.callable_of(place) {
+                    Some(r) => r,
+                    None => match self.place_parts(place) {
                         Some((p, _, None)) => Repr::Place(p),
                         Some((p, _, Some(cs))) => Repr::Swizzle(p, cs),
                         None => Repr::Erased,
@@ -478,15 +540,34 @@ impl<'c, 'a> Fl<'c, 'a> {
 
     fn assign(&mut self, place: &mir::Place, r: &Rvalue, span: Span) {
         let l = place.local;
+        if let (true, Rvalue::Const(c)) = (place.proj.is_empty(), r) {
+            self.locals[l.index()] = self.table(*c);
+            return;
+        }
         if place.proj.is_empty() {
             // A callable: no IR value; the local stands for it.
             if let Some(c) = self.callable_rvalue(r) {
+                if let (Repr::Callable(old, _), Repr::Callable(new, _)) =
+                    (&self.locals[l.index()], &c)
+                    && old != new
+                {
+                    // Branches chose different functions: each is its own instance here.
+                    self.cx.err(
+                        Diagnostic::new(
+                            codes::E0702,
+                            span,
+                            "choosing between closures or functions at run time isn't supported yet",
+                        )
+                        .with_help("call each one in its own branch"),
+                    );
+                }
                 self.locals[l.index()] = c;
                 return;
             }
             let kind = self.mir.local(l).kind;
-            let through_alias = matches!(self.locals[l.index()], Repr::Place(_))
-                && !matches!(r, Rvalue::Call(c) if c.ret_mode != RetMode::Owned);
+            let through_alias =
+                matches!(self.locals[l.index()], Repr::Place(_) | Repr::Swizzle(..))
+                    && !matches!(r, Rvalue::Call(c) if c.ret_mode != RetMode::Owned);
             if !through_alias {
                 let ty = self.local_ty(l);
                 let v = self.rvalue(r, Some(ty), span);
@@ -497,10 +578,7 @@ impl<'c, 'a> Fl<'c, 'a> {
                     LocalKind::TempProjection { .. } => {
                         // What a projection-returning call returned: a pointer to its place.
                         self.locals[l.index()] = match v {
-                            Some(p) => Repr::Place(ir::Place {
-                                root: ir::PlaceRoot::Ptr(p),
-                                path: Vec::new(),
-                            }),
+                            Some(p) => Repr::Place(ir::Place::root(ir::PlaceRoot::Ptr(p))),
                             None => Repr::Erased,
                         };
                     }
@@ -533,25 +611,40 @@ impl<'c, 'a> Fl<'c, 'a> {
         self.store(place, v);
     }
 
+    /// A table's value (`mir::Rvalue::Const`): on the CPU its constant data, read in place; GPU
+    /// code builds it.
+    fn table(&mut self, c: ConstId) -> Repr {
+        if !self.is_gpu() {
+            return match self.cx.const_data(self.mb, c) {
+                Some(d) => Repr::Place(ir::Place::root(ir::PlaceRoot::Data(d))),
+                None => Repr::Erased,
+            };
+        }
+        let built = self.cx.const_value(self.mb, c).and_then(|(t, v)| self.build_const(t, &v));
+        built.map_or(Repr::Erased, Repr::Value)
+    }
+
     /// The callable an rvalue makes: a closure, a named function, or a copy of a local's.
     fn callable_rvalue(&mut self, r: &Rvalue) -> Option<Repr> {
         match r {
             Rvalue::Closure(id) => {
-                let owner = rc(self.owner_key());
-                let c = Callable::Closure { owner, id: *id };
-                let srcs = self.capture_sources(*id);
-                Some(Repr::Callable(c, srcs))
+                let owner = self.owner_key();
+                let srcs = self.capture_sources(&owner, *id);
+                Some(Repr::Callable(Callable::Closure { owner: Rc::new(owner), id: *id }, srcs))
             }
             Rvalue::FnRef(f, args) => {
                 let substs = args.iter().map(|&a| self.concrete(a)).collect();
                 Some(Repr::Callable(Callable::Func { func: *f, substs }, Vec::new()))
             }
-            Rvalue::Use(mir::Operand { kind: OperandKind::Copy(p), .. }) if p.proj.is_empty() => {
-                match &self.locals[p.local.index()] {
-                    r @ Repr::Callable(..) => Some(r.clone()),
-                    _ => None,
-                }
-            }
+            Rvalue::Use(mir::Operand { kind: OperandKind::Copy(p), .. }) => self.callable_of(p),
+            _ => None,
+        }
+    }
+
+    /// The callable a place holds: a closure or function in a local.
+    fn callable_of(&self, p: &mir::Place) -> Option<Repr> {
+        match &self.locals[p.local.index()] {
+            r @ Repr::Callable(..) if p.proj.is_empty() => Some(r.clone()),
             _ => None,
         }
     }
@@ -565,18 +658,12 @@ impl<'c, 'a> Fl<'c, 'a> {
         }
     }
 
-    /// Where a new closure's captures are in this function.
-    fn capture_sources(&mut self, id: ClosureId) -> Vec<CaptureSrc> {
+    /// Where the captures of a new closure, `id` of `owner`, are in this function.
+    fn capture_sources(&mut self, owner: &InstanceKey, id: ClosureId) -> Vec<CaptureSrc> {
         let mut out = Vec::new();
-        for &(l, written) in &self.mir.closures[id.0 as usize].captures {
-            let decl = self.mir.local(l);
-            let t = self.concrete(decl.ty);
-            if matches!(self.types().kind(t), TyKind::Closure(..) | TyKind::FnPtr(..)) {
-                continue;
-            }
-            let Some(ty) = self.cx.lower_ty(self.mb, t, decl.span) else { continue };
+        for (l, ty, written) in self.cx.lowered_captures(self.mb, owner, id) {
             let (by_ref, _) =
-                crate::ty::capture_passing(self.mb.target, &self.mb.m.types, ty, written);
+                crate::ty::capture_passing(self.mb.target(), &self.mb.m.types, ty, written);
             let place = match self.locals[l.index()].clone() {
                 Repr::Var(v) => ir::Place::local(v),
                 Repr::Place(p) => p,
@@ -585,20 +672,17 @@ impl<'c, 'a> Fl<'c, 'a> {
                     self.cx.err(
                         Diagnostic::new(
                             codes::E0702,
-                            decl.span,
+                            self.mir.local(l).span,
                             "a closure can't change a projection of several vector components yet",
                         )
                         .with_help("change the components through the vector itself"),
                     );
                     continue;
                 }
+                // Components alias no single place; the closure only reads them.
                 Repr::Swizzle(..) => {
-                    // Components alias no single place; the closure only reads them.
-                    let Some(v) = self.read(&mir::Place::local(l)) else { continue };
-                    let ty = self.f.value_ty(v);
-                    let copy = self.new_local("tmp", ty);
-                    self.emit(ir::Stmt::Store(ir::Place::local(copy), v));
-                    ir::Place::local(copy)
+                    let Some(p) = self.place_or_copy(&mir::Place::local(l)) else { continue };
+                    p
                 }
                 _ => continue,
             };
@@ -609,11 +693,20 @@ impl<'c, 'a> Fl<'c, 'a> {
 
     // ---- places ----------------------------------------------------------------------------
 
-    /// Moves a temporary's value into an IR local, so it has a place.
+    /// Moves a temporary's value into an IR local, so it has a place. The local is stored
+    /// where the value is defined, which encloses every use of the temporary: the first use
+    /// that needs a place may be in a branch (a `match` arm), and later uses outside it.
     fn spill(&mut self, l: Local, v: ir::ValueId) -> ir::Place {
-        let ty = self.f.value_ty(v);
-        let var = self.new_local("tmp", ty);
-        self.emit(ir::Stmt::Store(ir::Place::local(var), v));
+        let var = self.new_local("tmp", self.f.value_ty(v));
+        let store = ir::Stmt::Store(ir::Place::local(var), v);
+        let def = self.blocks.iter_mut().rev().find_map(|(b, _)| {
+            let i = b.iter().position(|s| matches!(s, ir::Stmt::Let(d, _) if *d == v))?;
+            Some((b, i))
+        });
+        match def {
+            Some((b, i)) => b.insert(i + 1, store),
+            None => self.emit(store),
+        }
         self.locals[l.index()] = Repr::Var(var);
         ir::Place::local(var)
     }
@@ -623,7 +716,7 @@ impl<'c, 'a> Fl<'c, 'a> {
     fn place_parts(&mut self, p: &mir::Place) -> Option<(ir::Place, TyId, Option<Vec<u8>>)> {
         let mut ty = self.concrete(self.local_ty(p.local));
         let mut swizzle = None;
-        let mut place = match self.locals[p.local.index()].clone() {
+        let ir::Place { root, mut path } = match self.locals[p.local.index()].clone() {
             Repr::Var(v) => ir::Place::local(v),
             Repr::Place(ip) => ip,
             Repr::Swizzle(ip, cs) => {
@@ -639,7 +732,7 @@ impl<'c, 'a> Fl<'c, 'a> {
                 // Through an alias of components: they pick from its vector.
                 match proj {
                     mir::Proj::Comp(c) => {
-                        place = place.with(ir::Proj::Comp(cs[*c as usize]));
+                        path.push(ir::Proj::Comp(cs[*c as usize]));
                         swizzle = None;
                         ty = self.types().f32;
                     }
@@ -648,6 +741,12 @@ impl<'c, 'a> Fl<'c, 'a> {
                         ty = self.types().vec(picked.len() as u8);
                         swizzle = Some(picked);
                     }
+                    mir::Proj::Index(t) => {
+                        let iv = self.local_value(*t)?;
+                        path.push(ir::Proj::Index(self.swizzle_index(cs, iv)));
+                        swizzle = None;
+                        ty = self.types().f32;
+                    }
                     _ => return None,
                 }
                 continue;
@@ -655,18 +754,17 @@ impl<'c, 'a> Fl<'c, 'a> {
             match proj {
                 mir::Proj::Downcast(v) => {
                     let payload = self.cx.payload_field(self.mb, ty, *v, self.code.span)?;
-                    place = place.with(ir::Proj::Field(payload));
+                    path.push(ir::Proj::Field(payload));
                     variant = Some(*v);
                 }
                 mir::Proj::Field(i) => {
-                    let map = self.cx.field_map(self.mb, ty, variant, self.code.span);
-                    let fi = map.get(*i as usize).copied().flatten()?;
-                    ty = self.field_ty(ty, variant, *i);
+                    let (fi, ft) = self.cx.field(self.mb, ty, variant, *i, self.code.span)?;
+                    ty = ft;
                     variant = None;
-                    place = place.with(ir::Proj::Field(fi));
+                    path.push(ir::Proj::Field(fi));
                 }
                 mir::Proj::Comp(c) => {
-                    place = place.with(ir::Proj::Comp(*c));
+                    path.push(ir::Proj::Comp(*c));
                     ty = self.types().f32;
                 }
                 mir::Proj::Swizzle(cs) => {
@@ -676,15 +774,15 @@ impl<'c, 'a> Fl<'c, 'a> {
                 mir::Proj::Index(t) => {
                     let iv = self.local_value(*t)?;
                     let k = self.types().kind(ty);
-                    if let TyKind::Adt(a, args) = &k
-                        && self.cx.checked.program.is_lang_adt(*a, Lang::Slots)
+                    if let TyKind::Adt(_, args) = k
+                        && self.cx.checked.program.lang_of_ty(ty) == Some(Lang::Slots)
                     {
                         let idx = crate::gpu::slot_index(self, iv)?;
-                        place = place.with(ir::Proj::Index(idx));
+                        path.push(ir::Proj::Index(idx));
                         ty = args[0];
                         continue;
                     }
-                    place = place.with(ir::Proj::Index(iv));
+                    path.push(ir::Proj::Index(iv));
                     ty = match k {
                         TyKind::Array(e, _) | TyKind::Slice(e) => *e,
                         TyKind::Vec(_) => self.types().f32,
@@ -694,22 +792,17 @@ impl<'c, 'a> Fl<'c, 'a> {
                 }
             }
         }
-        Some((place, ty, swizzle))
+        Some((ir::Place { root, path }, ty, swizzle))
     }
 
-    fn field_ty(&self, ty: TyId, variant: Option<u32>, i: u32) -> TyId {
-        let p = &self.cx.checked.program;
-        match p.types.kind(ty) {
-            TyKind::Adt(a, args) => {
-                let fields = match variant {
-                    Some(v) => p.variant_fields(*a, args, v as usize),
-                    None => p.struct_fields(*a, args),
-                };
-                fields.get(i as usize).map_or(p.types.error, |f| f.1)
-            }
-            TyKind::Tuple(ts) => ts.get(i as usize).copied().unwrap_or(p.types.error),
-            _ => p.types.error,
-        }
+    /// The component of a vector that element `i` of its swizzle `cs` is: `cs[i]`, read from a
+    /// table, so an index past the swizzle is out of range as any other is.
+    fn swizzle_index(&mut self, cs: &[u8], i: ir::ValueId) -> ir::ValueId {
+        let u = self.mb.m.types.u32();
+        let t = self.mb.m.types.intern(ir::TypeDef::Array(u, cs.len() as u32));
+        let comps = cs.iter().map(|&c| self.u32c(u32::from(c))).collect();
+        let table = self.bind_local("swizzle", t, ir::Expr::Construct(t, comps));
+        self.load(ir::Place::local(table).with(ir::Proj::Index(i)), u)
     }
 
     /// The IR place of a MIR place without a trailing swizzle.
@@ -725,10 +818,13 @@ impl<'c, 'a> Fl<'c, 'a> {
             return Some(place);
         }
         let v = self.read(p)?;
-        let ty = self.f.value_ty(v);
-        let l = self.new_local("tmp", ty);
-        self.emit(ir::Stmt::Store(ir::Place::local(l), v));
-        Some(ir::Place::local(l))
+        Some(self.temp_place(v))
+    }
+
+    /// A MIR place's type, concrete.
+    fn place_src_ty(&mut self, p: &mir::Place) -> TyId {
+        let t = mir::place_ty(&self.cx.checked.program, &self.mir.locals, p);
+        self.concrete(t)
     }
 
     /// A local's value: a temporary's, or a load of a variable.
@@ -775,9 +871,8 @@ impl<'c, 'a> Fl<'c, 'a> {
         for proj in &p.proj {
             match proj {
                 mir::Proj::Field(i) => {
-                    let map = self.cx.field_map(self.mb, ty, None, self.code.span);
-                    let fi = map.get(*i as usize).copied().flatten()?;
-                    ty = self.field_ty(ty, None, *i);
+                    let (fi, ft) = self.cx.field(self.mb, ty, None, *i, self.code.span)?;
+                    ty = ft;
                     let it = self.cx.lower_ty(self.mb, ty, self.code.span)?;
                     v = self.value(it, ir::Expr::Extract(v, fi));
                 }
@@ -839,19 +934,7 @@ impl<'c, 'a> Fl<'c, 'a> {
     }
 
     fn lit(&mut self, l: Lit, ty: ir::TypeId) -> Option<ir::Const> {
-        let s = self.mb.m.types.as_scalar(ty)?;
-        Some(match (l, s) {
-            (Lit::Bool(b), _) => ir::Const::Bool(b),
-            (Lit::Int(v), ir::Scalar::I32) => ir::Const::I32(v as i32),
-            (Lit::Int(v), ir::Scalar::U32) => ir::Const::U32(v as u32),
-            (Lit::Int(v), ir::Scalar::I64) => ir::Const::I64(v as i64),
-            (Lit::Int(v), ir::Scalar::U64) => ir::Const::U64(v as u64),
-            (Lit::Int(v), ir::Scalar::F32) => ir::Const::F32(v as f32),
-            (Lit::Int(v), ir::Scalar::F64) => ir::Const::F64(v as f64),
-            (Lit::Int(v), s) => ir::Const::Small(s, v as i64),
-            (Lit::Float(v), ir::Scalar::F32) => ir::Const::F32(v as f32),
-            (Lit::Float(v), _) => ir::Const::F64(v),
-        })
+        lit_const(&self.mb.m.types, l, ty)
     }
 
     /// An rvalue's value; `ty` is its type, when it has one.
@@ -890,6 +973,14 @@ impl<'c, 'a> Fl<'c, 'a> {
             Rvalue::Len(p) => self.len(p),
             Rvalue::Call(c) => self.call(c, ty),
             Rvalue::Closure(_) | Rvalue::FnRef(..) => None,
+            Rvalue::Const(c) => match self.table(*c) {
+                Repr::Value(v) => Some(v),
+                Repr::Place(p) => {
+                    let t = self.ty(ty?, span)?;
+                    Some(self.load(p, t))
+                }
+                _ => None,
+            },
             Rvalue::Dispatch(d) => {
                 crate::gpu::lower_dispatch(self, d, span);
                 None
@@ -935,9 +1026,9 @@ impl<'c, 'a> Fl<'c, 'a> {
         }
         if op == BinOp::Pow {
             if self.mb.m.types.as_scalar(rty).is_some_and(|s| s.is_int()) {
-                return Some(self.int_pow(av, bv, rty));
+                return self.int_pow(av, bv, rty);
             }
-            return self.math(ir::Builtin::Pow, vec![av, bv], rty, span, "**");
+            return self.math(ir::Builtin::Pow, vec![av, bv], rty);
         }
         let iop = match op {
             BinOp::Add => ir::BinOp::Add,
@@ -979,38 +1070,21 @@ impl<'c, 'a> Fl<'c, 'a> {
         }
     }
 
-    /// `base ** exp` for integers: repeated multiplication (checked on the CPU).
-    fn int_pow(&mut self, base: ir::ValueId, exp: ir::ValueId, ty: ir::TypeId) -> ir::ValueId {
-        let s = self.mb.m.types.as_scalar(ty).unwrap_or(ir::Scalar::I32);
-        let one = match s {
-            ir::Scalar::I32 => ir::Const::I32(1),
-            ir::Scalar::U32 => ir::Const::U32(1),
-            ir::Scalar::I64 => ir::Const::I64(1),
-            ir::Scalar::U64 => ir::Const::U64(1),
-            other => ir::Const::Small(other, 1),
-        };
-        let acc = self.new_local("pow", ty);
-        let onev = self.konst(one);
-        self.emit(ir::Stmt::Store(ir::Place::local(acc), onev));
-        let u = self.mb.m.types.u32();
-        let n = self.new_local("pow_n", u);
-        self.emit(ir::Stmt::Store(ir::Place::local(n), exp));
-        let bool_ty = self.mb.m.types.bool();
-        self.push_block();
-        let nv = self.load(ir::Place::local(n), u);
-        let zero = self.u32c(0);
-        let done = self.value(bool_ty, ir::Expr::Binary(ir::BinOp::Eq, nv, zero));
-        self.emit(ir::Stmt::If { cond: done, then: vec![ir::Stmt::Break], else_: Vec::new() });
-        let av = self.load(ir::Place::local(acc), ty);
-        let prod = self.value(ty, ir::Expr::Binary(ir::BinOp::Mul, av, base));
-        self.emit(ir::Stmt::Store(ir::Place::local(acc), prod));
-        let one_u = self.u32c(1);
-        let nv2 = self.load(ir::Place::local(n), u);
-        let dec = self.value(u, ir::Expr::Binary(ir::BinOp::Sub, nv2, one_u));
-        self.emit(ir::Stmt::Store(ir::Place::local(n), dec));
-        let body = self.pop_block();
-        self.emit(ir::Stmt::Loop { body, continuing: Vec::new() });
-        self.load(ir::Place::local(acc), ty)
+    /// `base ** exp` for integers: `exp` multiplications (checked on the CPU).
+    fn int_pow(
+        &mut self,
+        base: ir::ValueId,
+        exp: ir::ValueId,
+        ty: ir::TypeId,
+    ) -> Option<ir::ValueId> {
+        let one = self.lit(Lit::Int(1), ty)?;
+        let acc = self.bind_local("pow", ty, ir::Expr::Const(one));
+        self.counted_loop(exp, |fl, _| {
+            let av = fl.load(ir::Place::local(acc), ty);
+            let prod = fl.value(ty, ir::Expr::Binary(ir::BinOp::Mul, av, base));
+            fl.emit(ir::Stmt::Store(ir::Place::local(acc), prod));
+        });
+        Some(self.load(ir::Place::local(acc), ty))
     }
 
     fn construct(&mut self, xs: &[mir::Operand], ty: TyId, span: Span) -> Option<ir::ValueId> {
@@ -1062,7 +1136,7 @@ impl<'c, 'a> Fl<'c, 'a> {
         let mut vals = Vec::new();
         for (i, x) in fields.iter().enumerate() {
             let v = self.operand(x);
-            if map.get(i).copied().flatten().is_some()
+            if map.get(i).is_some_and(|f| f.0.is_some())
                 && let Some(v) = v
             {
                 vals.push(v);
@@ -1105,14 +1179,15 @@ impl<'c, 'a> Fl<'c, 'a> {
         }
         // A long repeat: fill a local in a loop.
         let l = self.new_local("repeat", t);
+        let n = self.u32c(n);
         self.counted_loop(n, |fl, i| {
             fl.emit(ir::Stmt::Store(ir::Place::local(l).with(ir::Proj::Index(i)), v))
         });
         Some(self.load(ir::Place::local(l), t))
     }
 
-    /// `for i in 0..n` with a compile-time `n`, for internal loops.
-    pub fn counted_loop(&mut self, n: u32, mut body: impl FnMut(&mut Self, ir::ValueId)) {
+    /// `for i in 0..n` (`n` a `u32`), for internal loops.
+    pub fn counted_loop(&mut self, n: ir::ValueId, mut body: impl FnMut(&mut Self, ir::ValueId)) {
         let u = self.mb.m.types.u32();
         let bool_ty = self.mb.m.types.bool();
         let i = self.new_local("i", u);
@@ -1120,8 +1195,7 @@ impl<'c, 'a> Fl<'c, 'a> {
         self.emit(ir::Stmt::Store(ir::Place::local(i), zero));
         self.push_block();
         let iv = self.load(ir::Place::local(i), u);
-        let nv = self.u32c(n);
-        let lt = self.value(bool_ty, ir::Expr::Binary(ir::BinOp::Lt, iv, nv));
+        let lt = self.value(bool_ty, ir::Expr::Binary(ir::BinOp::Lt, iv, n));
         let notlt = self.value(bool_ty, ir::Expr::Unary(ir::UnOp::Not, lt));
         self.emit(ir::Stmt::If { cond: notlt, then: vec![ir::Stmt::Break], else_: Vec::new() });
         body(self, iv);
@@ -1139,8 +1213,7 @@ impl<'c, 'a> Fl<'c, 'a> {
     /// buffer's (GPU).
     fn len(&mut self, p: &mir::Place) -> Option<ir::ValueId> {
         let u = self.mb.m.types.u32();
-        let t = mir::place_ty(&self.cx.checked.program, &self.mir.locals, p);
-        let t = self.concrete(t);
+        let t = self.place_src_ty(p);
         if let TyKind::Array(_, n) = self.types().kind(t) {
             let n = *n;
             return Some(self.value(u, ir::Expr::Const(ir::Const::U32(n))));
@@ -1164,21 +1237,27 @@ impl<'c, 'a> Fl<'c, 'a> {
     }
 
     /// The callable an argument passes: a closure or function a local holds.
-    pub fn callable_arg(&mut self, a: &mir::Arg) -> Option<Repr> {
-        let p = a.place()?;
-        match &self.locals[p.local.index()] {
-            r @ Repr::Callable(..) if p.proj.is_empty() => Some(r.clone()),
-            _ => None,
+    pub fn callable_arg(&self, a: &mir::Arg) -> Option<Repr> {
+        self.callable_of(a.place()?)
+    }
+
+    /// A place passed for a `[T]` parameter (`run_t`): a run of it if it's a fixed array, else
+    /// its value (a run already).
+    pub fn run_arg(&mut self, p: &mir::Place, run_t: ir::TypeId) -> Option<ir::ValueId> {
+        if let TyKind::Array(..) = self.types().kind(self.place_src_ty(p)) {
+            let place = self.place_or_copy(p)?;
+            return Some(self.value(run_t, ir::Expr::Run(place)));
         }
+        self.read(p)
     }
 
     fn call(&mut self, c: &mir::Call, ty: Option<TyId>) -> Option<ir::ValueId> {
         let span = c.span;
         match &c.callee {
             mir::Callee::Builtin(b) => {
-                let args: Vec<ir::ValueId> =
-                    c.args.iter().filter_map(|a| self.arg_value(a)).collect();
-
+                let args: Option<Vec<ir::ValueId>> =
+                    c.args.iter().map(|a| self.arg_value(a)).collect();
+                let args = args?;
                 let t = self.ty(ty?, span)?;
                 self.builtin(*b, args, t, span)
             }
@@ -1194,7 +1273,7 @@ impl<'c, 'a> Fl<'c, 'a> {
                 if self.cx.checked.program.func(*func).attrs.intrinsic {
                     return crate::gpu::intrinsic(self, *func, &substs, c, ty);
                 }
-                self.call_fn(*func, substs, c)
+                self.call_fn(*func, substs, &c.args, span)
             }
             mir::Callee::TraitMethod { method, self_ty, trait_args, method_args } => {
                 let st = self.concrete(*self_ty);
@@ -1217,7 +1296,7 @@ impl<'c, 'a> Fl<'c, 'a> {
                 if self.cx.checked.program.func(func).attrs.intrinsic {
                     return crate::gpu::intrinsic(self, func, &substs, c, ty);
                 }
-                self.call_fn(func, substs, c)
+                self.call_fn(func, substs, &c.args, span)
             }
         }
     }
@@ -1235,7 +1314,13 @@ impl<'c, 'a> Fl<'c, 'a> {
 
     /// A call to a monomorphized function: arguments by its parameter modes, callables and
     /// resources becoming part of the instance.
-    fn call_fn(&mut self, func: FnId, substs: Vec<TyId>, c: &mir::Call) -> Option<ir::ValueId> {
+    fn call_fn(
+        &mut self,
+        func: FnId,
+        substs: Vec<TyId>,
+        args: &[mir::Arg],
+        span: Span,
+    ) -> Option<ir::ValueId> {
         let program = &self.cx.checked.program;
         let def = program.func(func);
         let generics = program.fn_all_generics(func);
@@ -1245,14 +1330,12 @@ impl<'c, 'a> Fl<'c, 'a> {
         let mut out: Vec<ir::Arg> = Vec::new();
         // `mut` arguments passed through a copy (components of a vector), written back after.
         let mut write_back: Vec<(&mir::Place, ir::Place)> = Vec::new();
-        for (p, a) in def.params.iter().zip(&c.args) {
+        for (p, a) in def.params.iter().zip(args) {
             let pt = self.cx.concrete(p.ty, &subst);
             if let TyKind::FnPtr(..) = self.types().kind(pt) {
                 match self.callable_arg(a) {
                     Some(Repr::Callable(callable, srcs)) => {
-                        for s in &srcs {
-                            out.push(self.capture_arg(s)?);
-                        }
+                        out.extend(self.capture_args(&srcs)?);
                         callables.push(Some(callable));
                     }
                     _ => callables.push(None),
@@ -1280,15 +1363,44 @@ impl<'c, 'a> Fl<'c, 'a> {
             }
             resources.push(None);
             let Some(ty) = self.cx.lower_ty(self.mb, pt, p.span) else { continue };
-            let (by_ref, _) =
-                crate::ty::param_passing(self.mb.target, &self.mb.m.types, ty, p.mode);
+            let (by_ref, _) = crate::ty::param_passing(
+                self.mb.target(),
+                &self.mb.m.types,
+                ty,
+                p.mode,
+                def.ret_mode,
+            );
+            let run = matches!(self.mb.m.types.get(ty), ir::TypeDef::Run(_));
             if by_ref {
                 let place = match a {
+                    // An array passed for a run: a run of it, in a place of its own.
+                    mir::Arg::Mut(pl, _) | mir::Arg::Borrow(pl, _)
+                        if run
+                            && matches!(
+                                self.types().kind(self.place_src_ty(pl)),
+                                TyKind::Array(..)
+                            ) =>
+                    {
+                        let v = self.run_arg(pl, ty)?;
+                        Some(self.temp_place(v))
+                    }
                     mir::Arg::Mut(pl, _) => {
                         let own = self.place(pl);
                         if own.is_none()
                             && let Some(copy) = self.place_or_copy(pl)
                         {
+                            if def.ret_mode == RetMode::Mut {
+                                // The result may point into the copy, and writes through it
+                                // would never reach the components.
+                                self.cx.err(
+                                    Diagnostic::new(
+                                        codes::E0702,
+                                        a.span(),
+                                        format!("`{}` returns a `mut` projection, so it can't take several vector components as a `mut` argument yet", def.name),
+                                    )
+                                    .with_help("pass the whole vector, and pick the components in the function"),
+                                );
+                            }
                             write_back.push((pl, copy.clone()));
                             Some(copy)
                         } else {
@@ -1298,42 +1410,27 @@ impl<'c, 'a> Fl<'c, 'a> {
                     mir::Arg::Borrow(pl, _) => self.place_or_copy(pl),
                     mir::Arg::Take(o) => {
                         let v = self.operand(o)?;
-                        let vt = self.f.value_ty(v);
-                        let l = self.new_local("tmp", vt);
-                        self.emit(ir::Stmt::Store(ir::Place::local(l), v));
-                        Some(ir::Place::local(l))
+                        Some(self.temp_place(v))
                     }
                 };
                 out.push(ir::Arg::Place(place?));
                 continue;
             }
-            let array_for_run = matches!(self.mb.m.types.get(ty), ir::TypeDef::Run(_))
-                && a.place().is_some_and(|pl| {
-                    let at = mir::place_ty(&self.cx.checked.program, &self.mir.locals, pl);
-                    let at = self.concrete(at);
-                    matches!(self.types().kind(at), TyKind::Array(..))
-                });
-            if array_for_run {
-                // A fixed array passed for a run.
-                let place = self.place_or_copy(a.place()?)?;
-                out.push(ir::Arg::Value(self.value(ty, ir::Expr::Run(place))));
-            } else {
-                out.push(ir::Arg::Value(self.arg_value(a)?));
-            }
+            let v = match a.place() {
+                Some(pl) if run => self.run_arg(pl, ty)?,
+                _ => self.arg_value(a)?,
+            };
+            out.push(ir::Arg::Value(v));
+        }
+        // With no callables or resources, the instance is the function's plain one (shared with
+        // its export, and with calls through a `fn` value).
+        if callables.iter().all(Option::is_none) && resources.iter().all(Option::is_none) {
+            callables.clear();
+            resources.clear();
         }
         let key = InstanceKey::Fn { func, substs, callables, resources };
-        let callee = self.cx.instance(self.mb, key, Some((self.id, c.span)));
-        let result = match self.callee_ret(callee) {
-            (Some(t), true) => {
-                let pt = self.mb.m.types.intern(ir::TypeDef::Ptr(t));
-                Some(self.value(pt, ir::Expr::Call(callee, out)))
-            }
-            (Some(t), false) => Some(self.value(t, ir::Expr::Call(callee, out))),
-            (None, _) => {
-                self.emit(ir::Stmt::Eval(ir::Expr::Call(callee, out)));
-                None
-            }
-        };
+        let callee = self.cx.instance(self.mb, key, Some((self.id, span)));
+        let result = self.emit_call(callee, out);
         for (original, copy) in write_back {
             let Some(ty) = self.place_ty(&copy) else { continue };
             let v = self.load(copy, ty);
@@ -1342,13 +1439,35 @@ impl<'c, 'a> Fl<'c, 'a> {
         result
     }
 
-    pub fn capture_arg(&mut self, s: &CaptureSrc) -> Option<ir::Arg> {
-        if s.by_ref {
-            Some(ir::Arg::Place(s.place.clone()))
-        } else {
-            let ty = self.place_ty(&s.place)?;
-            Some(ir::Arg::Value(self.load(s.place.clone(), ty)))
+    /// Calls `callee`: its result (a pointer to a place, if it returns a projection), or `None`
+    /// if it returns nothing.
+    fn emit_call(&mut self, callee: ir::FuncId, args: Vec<ir::Arg>) -> Option<ir::ValueId> {
+        let call = ir::Expr::Call(callee, args);
+        match self.callee_ret(callee) {
+            (Some(t), true) => {
+                let pt = self.mb.m.types.intern(ir::TypeDef::Ptr(t));
+                Some(self.value(pt, call))
+            }
+            (Some(t), false) => Some(self.value(t, call)),
+            (None, _) => {
+                self.emit(ir::Stmt::Eval(call));
+                None
+            }
         }
+    }
+
+    /// The arguments passing a callable's captures: the place by reference, else its value.
+    pub fn capture_args(&mut self, srcs: &[CaptureSrc]) -> Option<Vec<ir::Arg>> {
+        let mut out = Vec::new();
+        for s in srcs {
+            out.push(if s.by_ref {
+                ir::Arg::Place(s.place.clone())
+            } else {
+                let ty = self.place_ty(&s.place)?;
+                ir::Arg::Value(self.load(s.place.clone(), ty))
+            });
+        }
+        Some(out)
     }
 
     /// Calls a closure or function value with `args`.
@@ -1359,27 +1478,20 @@ impl<'c, 'a> Fl<'c, 'a> {
         args: &[mir::Arg],
         span: Span,
     ) -> Option<ir::ValueId> {
-        let mut out: Vec<ir::Arg> =
-            srcs.iter().map(|s| self.capture_arg(s)).collect::<Option<_>>()?;
-        let key = match callable {
-            Callable::Closure { owner, id } => {
-                InstanceKey::Closure { owner: owner.clone(), id: *id }
-            }
-            Callable::Func { func, substs } => InstanceKey::plain(*func, substs.clone()),
-        };
+        if let Callable::Func { func, substs } = callable {
+            // Its parameters are passed as a direct call passes them (borrowed aggregates by
+            // reference on the CPU).
+            return self.call_fn(*func, substs.clone(), args, span);
+        }
+        // A closure takes its parameters by value.
+        let mut out = self.capture_args(srcs)?;
         for a in args {
             if let Some(v) = self.arg_value(a) {
                 out.push(ir::Arg::Value(v));
             }
         }
-        let callee = self.cx.instance(self.mb, key, Some((self.id, span)));
-        match self.callee_ret(callee).0 {
-            Some(t) => Some(self.value(t, ir::Expr::Call(callee, out))),
-            None => {
-                self.emit(ir::Stmt::Eval(ir::Expr::Call(callee, out)));
-                None
-            }
-        }
+        let callee = self.cx.instance(self.mb, callable.instance_key(), Some((self.id, span)));
+        self.emit_call(callee, out)
     }
 
     // ---- built-ins -------------------------------------------------------------------------
@@ -1393,10 +1505,11 @@ impl<'c, 'a> Fl<'c, 'a> {
     ) -> Option<ir::ValueId> {
         let e = match builtin_ir(b) {
             BuiltinIr::Math(ib) => {
+                let v = self.math(ib, args, ty);
                 if matches!(ib, ir::Builtin::Dpdx | ir::Builtin::Dpdy | ir::Builtin::Fwidth) {
-                    crate::gpu::check_derivative(self, span);
+                    crate::gpu::check_derivative(self, v, span);
                 }
-                return self.math(ib, args, ty, span, b.name());
+                return v;
             }
             BuiltinIr::Select => {
                 ir::Expr::Select { cond: args[2], if_true: args[1], if_false: args[0] }
@@ -1408,31 +1521,16 @@ impl<'c, 'a> Fl<'c, 'a> {
         Some(self.value(ty, e))
     }
 
-    /// A math builtin (`what` as the source wrote it). On the CPU the transcendentals become
-    /// calls to std's wrela functions (§11), but only after derived interpretations are built
-    /// (`rewrite_cpu_math`), so gradients and intervals see the builtins themselves.
+    /// A math builtin. On the CPU the transcendentals become calls to std's wrela functions
+    /// (§11), but only after derived interpretations are built (`rewrite_cpu_math`), so
+    /// gradients and intervals see the builtins themselves. (Of an `f64`, they're E0702 in the
+    /// checker: std's CPU math is `f32`.)
     pub fn math(
         &mut self,
         b: ir::Builtin,
         args: Vec<ir::ValueId>,
         ty: ir::TypeId,
-        span: Span,
-        what: &str,
     ) -> Option<ir::ValueId> {
-        if !self.is_gpu()
-            && crate::cpu_math_lang(b).is_some()
-            && self.mb.m.types.element_scalar(ty) == Some(ir::Scalar::F64)
-        {
-            self.cx.err(
-                Diagnostic::new(
-                    codes::E0702,
-                    span,
-                    format!("`{what}` of an `f64` isn't supported yet"),
-                )
-                .with_note("std's CPU math works in `f32`; convert with `f32(x)`"),
-            );
-            return None;
-        }
         // An elementwise builtin's scalar arguments next to vectors are splatted.
         let args = match args.iter().find(|&&a| self.mb.m.types.is_vector(self.f.value_ty(a))) {
             Some(&like) if b.is_elementwise() => {
@@ -1444,13 +1542,21 @@ impl<'c, 'a> Fl<'c, 'a> {
     }
 }
 
-/// The signature of a derived function (gradient or interval).
-pub(crate) fn derived_signature(
-    cx: &mut Cx,
-    mb: &mut ModuleBuilder,
-    key: &InstanceKey,
-) -> ir::Function {
-    crate::gpu::derived_signature(cx, mb, key)
+/// A literal as a constant of the IR type `ty` (a scalar).
+pub(crate) fn lit_const(types: &ir::Types, l: Lit, ty: ir::TypeId) -> Option<ir::Const> {
+    let s = types.as_scalar(ty)?;
+    Some(match (l, s) {
+        (Lit::Bool(b), _) => ir::Const::Bool(b),
+        (Lit::Int(v), ir::Scalar::I32) => ir::Const::I32(v as i32),
+        (Lit::Int(v), ir::Scalar::U32) => ir::Const::U32(v as u32),
+        (Lit::Int(v), ir::Scalar::I64) => ir::Const::I64(v as i64),
+        (Lit::Int(v), ir::Scalar::U64) => ir::Const::U64(v as u64),
+        (Lit::Int(v), ir::Scalar::F32) => ir::Const::F32(v as f32),
+        (Lit::Int(v), ir::Scalar::F64) => ir::Const::F64(v as f64),
+        (Lit::Int(v), s) => ir::Const::Small(s, v as i64),
+        (Lit::Float(v), ir::Scalar::F32) => ir::Const::F32(v as f32),
+        (Lit::Float(v), _) => ir::Const::F64(v),
+    })
 }
 
 /// What a built-in function lowers to.

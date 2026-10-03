@@ -1,0 +1,12 @@
+// mistake: lending several vector components to a function that returns a `mut` projection
+// expect: E0702
+// fix: no
+fn first(v: mut vec2) -> mut f32 {
+    mut v.x
+}
+
+pub fn nudge() -> f32 {
+    var p = vec3(1.0, 2.0, 3.0)
+    first(mut p.zy) += 5.0
+    p.z
+}

@@ -1,8 +1,9 @@
-// Shared test fixtures: the first-light build, and a manifest of known shapes.
+// Shared test fixtures: the first-light build, the ABI's vectors, and a manifest of known shapes.
 
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { Checker, type Limits } from "../src/check.ts";
+import { MANIFEST_VERSION, STREAM_VERSION } from "../src/abi.gen.ts";
+import { Checker } from "../src/check.ts";
 import { type Manifest, validateManifest } from "../src/manifest.ts";
 import type { Executor } from "../src/program.ts";
 import type { Command } from "../src/stream.ts";
@@ -10,16 +11,32 @@ import type { Command } from "../src/stream.ts";
 export const FIRST_LIGHT = join(import.meta.dir, "../../fixtures/first-light");
 
 export const readFixture = (name: string) => new Uint8Array(readFileSync(join(FIRST_LIGHT, name)));
+export const readFixtureText = (name: string) => readFileSync(join(FIRST_LIGHT, name), "utf8");
 
-/** WebGPU's default limits, as both hosts use them. */
-export const DEFAULT_LIMITS: Limits = { maxBufferSize: 134_217_728, maxWorkgroupsPerDimension: 65_535 };
+export interface ErrorVector {
+  kind: string;
+  message: string;
+}
+
+export interface Vectors {
+  hashes: { bytes: string; hash: string }[];
+  batches: { name: string; bytes: string; outcome: { commands?: unknown[]; error?: ErrorVector } }[];
+  sequences: { name: string; bytes: string; error: ErrorVector | null }[];
+  checks: { manifest: string; batches: { name: string; bytes: string; error: { opcode: string; message: string } | null }[] };
+  /** `malformed`: JSON that doesn't parse, which each host rejects in its own words. */
+  manifests: { name: string; json: string; error: string | null; malformed?: boolean }[];
+  lines: { name: string; bytes: string; at: [number, string | null][]; error: string | null }[];
+}
+
+/** The ABI's test vectors (runtime/abi/vectors.json). */
+export const vectors: Vectors = JSON.parse(readFileSync(join(import.meta.dir, "../../abi/vectors.json"), "utf8"));
 
 /** Pipeline 0 renders and pipeline 1 computes; each takes 16 uniform bytes and binds a read-only
  * buffer then a read-write one (runtime/native/src/program/tests.rs uses the same shapes). */
 export function shapes(): Manifest {
   const m: Manifest = {
-    manifest_version: 1,
-    stream_version: 2,
+    manifest_version: MANIFEST_VERSION,
+    stream_version: STREAM_VERSION,
     wasm: "game.wasm",
     pipelines: [
       {
@@ -52,7 +69,7 @@ export function shapes(): Manifest {
   return m;
 }
 
-export const checker = (m: Manifest = shapes()) => new Checker(m, DEFAULT_LIMITS);
+export const checker = (m: Manifest = shapes()) => new Checker(m);
 
 /** Records each command's opcode, and `end` at each frame's end. */
 export class Recorder implements Executor {

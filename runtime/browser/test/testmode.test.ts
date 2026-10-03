@@ -1,11 +1,14 @@
 import { expect, test } from "bun:test";
-import { frameTime, isLoopback, parseTestParams, TEST_DEFAULTS } from "../src/testmode.ts";
+import { asksForTest, frameTime, isLoopback, parseTestParams, TEST_DEFAULTS } from "../src/testmode.ts";
 
 test("only #test fragments ask for test mode", () => {
   expect(parseTestParams("")).toBeNull();
   expect(parseTestParams("#run")).toBeNull();
   expect(parseTestParams("#testing")).toBeNull();
   expect(parseTestParams("#test")).toEqual(TEST_DEFAULTS);
+  // A bad parameter still asks for test mode, so the failure ends the test.
+  expect(asksForTest("#test&frame=3")).toBe(true);
+  expect(asksForTest("#testing")).toBe(false);
 });
 
 test("reads every parameter", () => {

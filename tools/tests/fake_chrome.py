@@ -24,6 +24,12 @@ with open(os.environ["FAKE_CHILD_PID"], "w") as f:
     f.write(f"{os.getpid()} {child.pid}")
 
 print('[1:2:INFO:CONSOLE:7] "hello from the page", source: http://x/main.js (7)', file=sys.stderr, flush=True)
+print(
+    '[1:2:1002/224334.934420:INFO:CONSOLE:9] "pipeline `p` failed to build:\n'
+    '3:5: unresolved identifier", source: http://x/worker.js (9)',
+    file=sys.stderr,
+    flush=True,
+)
 start = time.time()
 time.sleep(float(os.environ.get("FAKE_HOLD", "0")))
 if spans:  # the time this run held the GPU, written before DONE ends it

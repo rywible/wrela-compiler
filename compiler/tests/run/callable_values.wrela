@@ -1,0 +1,176 @@
+// run: closures and functions as values: chosen by `if`, `match` or a block, named with `let`, called, and passed with their parameters' own modes
+// expect: via_if(true, 3.0) = 106.0
+// expect: via_if(false, 3.0) = 106.0
+// expect: via_block(3.0) = 106.0
+// expect: via_match(2) = 12
+// expect: arg_if(true) = 11
+// expect: arg_block() = 11
+// expect: arg_match(0) = 11
+// expect: vector_param() = 345.0
+// expect: struct_param() = 12.0
+// expect: by_let() = 30
+// expect: by_if(true) = 6
+// expect: by_match(3) = 9
+// expect: by_block() = 12
+// expect: rebound() = 18
+// expect: modes() = 12
+// expect: generic() = 7
+// expect: by_let_vector() = 345.0
+// expect: in_closure() = 7
+// expect: closure_rebound() = 2
+
+fn apply(f: fn(i32) -> i32, x: i32) -> i32 {
+    f(x)
+}
+
+fn inc(x: i32) -> i32 {
+    x + 1
+}
+
+pub fn via_if(c: bool, k: f32) -> f32 {
+    let f = |x: f32| x * k
+    let g = if c { f } else { f }
+    g(2.0) + 100.0
+}
+
+pub fn via_block(k: f32) -> f32 {
+    let f = |x: f32| x * k
+    let g = { f }
+    g(2.0) + 100.0
+}
+
+pub fn via_match(k: i32) -> i32 {
+    let f = |x: i32| x + k
+    let g = match k {
+        0 => f,
+        _ => f,
+    }
+    apply(g, 10)
+}
+
+fn same(c: bool, f: fn(i32) -> i32) -> i32 {
+    apply(if c { f } else { f }, 10)
+}
+
+pub fn arg_if(c: bool) -> i32 {
+    same(c, inc)
+}
+
+pub fn arg_block() -> i32 {
+    apply({ inc }, 10)
+}
+
+fn same_match(k: i32, f: fn(i32) -> i32) -> i32 {
+    apply(match k {
+        0 => f,
+        _ => f,
+    }, 10)
+}
+
+pub fn arg_match(k: i32) -> i32 {
+    same_match(k, inc)
+}
+
+// A named function's borrowed vector or struct parameter is passed by reference, as in a
+// direct call.
+fn digits(v: vec3) -> f32 {
+    v.x * 100.0 + v.y * 10.0 + v.z
+}
+
+fn apply_v(f: fn(vec3) -> f32, x: vec3) -> f32 {
+    f(x)
+}
+
+pub fn vector_param() -> f32 {
+    apply_v(digits, vec3(3.0, 4.0, 5.0))
+}
+
+struct P: Copy + Clone {
+    a: f32,
+    b: f32,
+}
+
+fn sum(p: P) -> f32 {
+    p.a * 10.0 + p.b
+}
+
+fn apply_p(f: fn(P) -> f32, x: P) -> f32 {
+    f(x)
+}
+
+pub fn struct_param() -> f32 {
+    apply_p(sum, P { a: 1.0, b: 2.0 })
+}
+
+// A named function bound with `let` is called as the function itself: with its own parameter
+// names, defaults and modes.
+fn triple(x: i32) -> i32 {
+    x * 3
+}
+
+pub fn by_let() -> i32 {
+    let h = triple
+    h(10)
+}
+
+pub fn by_if(c: bool) -> i32 {
+    let g = if c { triple } else { triple }
+    g(2)
+}
+
+pub fn by_match(k: i32) -> i32 {
+    let g = match k {
+        0 => triple,
+        _ => triple,
+    }
+    g(k)
+}
+
+pub fn by_block() -> i32 {
+    let g = { triple }
+    g(4)
+}
+
+pub fn rebound() -> i32 {
+    let h = triple
+    let h2 = h
+    h2(5) + apply(h2, 1)
+}
+
+fn bump(x: mut i32, by: i32 = 1) {
+    x += by
+}
+
+pub fn modes() -> i32 {
+    let b = bump
+    var n = 1
+    b(mut n)
+    b(mut n, by: 10)
+    n
+}
+
+fn id<T: Copy>(x: T) -> T {
+    x
+}
+
+pub fn generic() -> i32 {
+    let i = id
+    i(7)
+}
+
+pub fn by_let_vector() -> f32 {
+    let d = digits
+    d(vec3(3.0, 4.0, 5.0))
+}
+
+// A closure can use a named function from its surroundings: the function is its type.
+pub fn in_closure() -> i32 {
+    let h = triple
+    apply(|x: i32| h(x) + 1, 2)
+}
+
+pub fn closure_rebound() -> i32 {
+    let c = |x: i32| x + 1
+    let d = c
+    d(1)
+}

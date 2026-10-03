@@ -1,0 +1,40 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0100",
+      "file": "main.wrela",
+      "fixes": [
+        {
+          "edits": [
+            {
+              "end": 132,
+              "file": "main.wrela",
+              "replacement": "",
+              "start": 128
+            }
+          ],
+          "message": "remove `pub`"
+        }
+      ],
+      "help": [
+        "its items carry their own visibility"
+      ],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "an `impl` can't be `pub`",
+      "notes": [],
+      "severity": "error",
+      "span": {
+        "column": 1,
+        "end": 131,
+        "end_column": 4,
+        "end_line": 8,
+        "line": 8,
+        "start": 128
+      },
+      "title": "unexpected token"
+    }
+  ],
+  "version": 2
+}

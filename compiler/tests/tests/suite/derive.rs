@@ -8,12 +8,13 @@
 //! (about 90 s of work, spread over the machine's threads). The GPU one needs a GPU and always
 //! runs 10⁶: `cargo test -p wrela-tests --test suite derive:: -- --ignored --nocapture`.
 
-use std::path::PathBuf;
+use crate::built;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use wrela_host::{CpuHost, Host, Value};
-use wrela_tests::{Rng, built, par_each, sized, u32s};
+use wrela_tests::{Rng, one_f32, one_u32, par_each, sized, u32s};
 
+/// The corpus, in the order of `with_function` in compiler/tests/fields/main.wrela.
 const NAMES: [&str; 17] = [
     "sphere",
     "ellipsoid",
@@ -36,23 +37,18 @@ const NAMES: [&str; 17] = [
 /// Boxes per function on the GPU, and on the CPU at full size.
 const BOXES: u32 = 1_000_000;
 
-fn corpus() -> PathBuf {
-    built("fields", PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("fields-derive"))
-}
-
-fn u32_of(v: &[Value]) -> u32 {
-    match v {
-        [Value::I32(x)] => *x as u32,
-        other => panic!("expected a u32, got {other:?}"),
-    }
+/// The arguments of `value` and `gradient`: function `fi` at `p`.
+fn point_args(fi: u32, p: [f32; 3]) -> [Value; 4] {
+    [Value::I32(fi as i32), Value::F32(p[0]), Value::F32(p[1]), Value::F32(p[2])]
 }
 
 fn value(host: &mut CpuHost, fi: u32, p: [f32; 3]) -> f64 {
-    let args = [Value::I32(fi as i32), Value::F32(p[0]), Value::F32(p[1]), Value::F32(p[2])];
-    match host.call_export("value", &args).expect("value").as_slice() {
-        [Value::F32(x)] => f64::from(*x),
-        other => panic!("value returned {other:?}"),
-    }
+    f64::from(one_f32(host, "value", &point_args(fi, p)))
+}
+
+/// The larger error; NaN if either is (`f64::max` drops a NaN, which would pass every check).
+fn worse(a: f64, b: f64) -> f64 {
+    if a.is_nan() || b.is_nan() { f64::NAN } else { a.max(b) }
 }
 
 /// A fourth-order central difference along `axis` with step `h` (the step actually taken,
@@ -75,7 +71,7 @@ fn central(host: &mut CpuHost, fi: u32, p: [f32; 3], axis: usize, h: f32) -> f64
 
 #[test]
 fn gradients_agree_with_central_differences() {
-    let corpus = corpus();
+    let corpus = built("fields");
     let report = Mutex::new(Vec::new());
     let functions: Vec<usize> = (0..NAMES.len()).collect();
     // A function per thread at a time, each with its own points.
@@ -89,12 +85,13 @@ fn gradients_agree_with_central_differences() {
             let (mut checked, mut skipped, mut worst) = (0, 0, 0.0f64);
             for _ in 0..400 {
                 let p = [0, 1, 2].map(|_| (rng.unit() * 4.0 - 2.0) as f32);
-                let args =
-                    [Value::I32(fi as i32), Value::F32(p[0]), Value::F32(p[1]), Value::F32(p[2])];
+                let args = point_args(fi, p);
                 let g = match host.call_export("gradient", &args).expect("gradient").as_slice() {
                     [Value::F32(x), Value::F32(y), Value::F32(z)] => [*x, *y, *z].map(f64::from),
                     other => panic!("gradient returned {other:?}"),
                 };
+                // Even where the function isn't smooth, the gradient is a number.
+                assert!(g.iter().all(|x| x.is_finite()), "{name}: gradient {g:?} at {p:?}");
                 // Richardson estimates at halving steps. The reference is the middle of the finest
                 // three consecutive steps that agree: larger steps can straddle a kink or a noise
                 // cell (a pair of them can agree while both are off), smaller ones drown in f32
@@ -112,7 +109,9 @@ fn gradients_agree_with_central_differences() {
                 let Some(fd) = (2..est.len())
                     .rev()
                     .map(|i| (est[i - 2], est[i - 1], est[i]))
-                    .find(|&(a, b, c)| diff(a, b).max(diff(b, c)).max(diff(a, c)) <= tolerance(b))
+                    .find(|&(a, b, c)| {
+                        worse(worse(diff(a, b), diff(b, c)), diff(a, c)) <= tolerance(b)
+                    })
                     .map(|(_, b, _)| b)
                 else {
                     skipped += 1;
@@ -120,7 +119,7 @@ fn gradients_agree_with_central_differences() {
                 };
                 let scale = norm(fd).max(1e-2);
                 checked += 1;
-                worst = worst.max(diff(g, fd) / scale);
+                worst = worse(worst, diff(g, fd) / scale);
             }
             assert!(checked >= 100, "{name}: only {checked} smooth points");
             assert!(worst <= 1e-3, "{name}: gradient relative error {worst:.2e}");
@@ -139,44 +138,43 @@ fn gradients_agree_with_central_differences() {
 /// threads, each with its own host.
 const CHUNK: u32 = 50_000;
 
+/// A call into the corpus on the CPU.
+enum Job {
+    /// `unwidened_cpu` of a function.
+    Unwidened(usize),
+    /// `misses_cpu` of a function, over a chunk of boxes from the first given.
+    Misses(usize, u32),
+}
+
 #[test]
 fn intervals_enclose_every_sample_on_the_cpu() {
-    let corpus = corpus();
+    let corpus = built("fields");
     let (boxes, points) = (sized(20_000, BOXES), sized(10_000, 100_000));
-    let calls: Vec<(usize, u32)> = (0..NAMES.len())
-        .flat_map(|fi| (0..boxes).step_by(CHUNK as usize).map(move |b| (fi, b)))
+    // Each function's point intervals, then the boxes, a chunk at a time.
+    let jobs: Vec<Job> = (0..NAMES.len())
+        .map(Job::Unwidened)
+        .chain((0..NAMES.len()).flat_map(|fi| {
+            (0..boxes).step_by(CHUNK as usize).map(move |first| Job::Misses(fi, first))
+        }))
         .collect();
-    let next = AtomicUsize::new(0);
     let misses: Vec<AtomicU32> = NAMES.iter().map(|_| AtomicU32::new(0)).collect();
     let unwidened: Vec<AtomicU32> = NAMES.iter().map(|_| AtomicU32::new(0)).collect();
-    let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
     let started = std::time::Instant::now();
-    std::thread::scope(|s| {
-        for _ in 0..threads {
-            s.spawn(|| {
-                let mut host = CpuHost::load(&corpus).expect("load the corpus");
-                let call = |host: &mut CpuHost, name: &str, args: &[i32]| {
-                    let args: Vec<Value> = args.iter().map(|&x| Value::I32(x)).collect();
-                    u32_of(&host.call_export(name, &args).expect(name))
-                };
-                // Each function's point intervals, then the boxes, a chunk at a time.
-                loop {
-                    let i = next.fetch_add(1, Ordering::Relaxed);
-                    if i < NAMES.len() {
-                        let n = call(&mut host, "unwidened_cpu", &[i as i32, 11, points]);
-                        unwidened[i].store(n, Ordering::Relaxed);
-                    } else if let Some(&(fi, first)) = calls.get(i - NAMES.len()) {
-                        let count = CHUNK.min(boxes - first);
-                        let args = [fi as i32, 7, first as i32, count as i32];
-                        misses[fi]
-                            .fetch_add(call(&mut host, "misses_cpu", &args), Ordering::Relaxed);
-                    } else {
-                        break;
-                    }
-                }
-            });
-        }
-    });
+    par_each(
+        &jobs,
+        || CpuHost::load(&corpus).expect("load the corpus"),
+        |host, job| match *job {
+            Job::Unwidened(fi) => {
+                let args = [fi as i32, 11, points].map(Value::I32);
+                unwidened[fi].store(one_u32(host, "unwidened_cpu", &args), Ordering::Relaxed);
+            }
+            Job::Misses(fi, first) => {
+                let count = CHUNK.min(boxes - first);
+                let args = [fi as i32, 7, first as i32, count as i32].map(Value::I32);
+                misses[fi].fetch_add(one_u32(host, "misses_cpu", &args), Ordering::Relaxed);
+            }
+        },
+    );
     let mut report = Vec::new();
     for (fi, name) in NAMES.iter().enumerate() {
         let (misses, unwidened) =
@@ -190,7 +188,8 @@ fn intervals_enclose_every_sample_on_the_cpu() {
         assert_eq!(unwidened, 0, "{name}: an interval over a point wasn't widened");
     }
     println!(
-        "AC3 intervals on the CPU ({threads} threads, {:.1} s):\n{}",
+        "AC3 intervals on the CPU ({} threads, {:.1} s):\n{}",
+        std::thread::available_parallelism().map_or(4, |n| n.get()),
         started.elapsed().as_secs_f64(),
         report.join("\n")
     );
@@ -199,7 +198,7 @@ fn intervals_enclose_every_sample_on_the_cpu() {
 #[test]
 #[ignore = "needs a GPU"]
 fn intervals_enclose_every_sample_on_the_gpu() {
-    let mut host = Host::load(corpus()).expect("load the corpus");
+    let mut host = Host::load(built("fields")).expect("load the corpus");
     let mut report = Vec::new();
     for (fi, name) in NAMES.iter().enumerate() {
         let args = [Value::I32(fi as i32), Value::I32(13), Value::I32(BOXES as i32)];

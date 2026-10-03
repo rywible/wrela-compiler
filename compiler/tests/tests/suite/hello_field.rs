@@ -11,7 +11,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use wrela_host::{Host, RunResult, Value, frame_time, image};
-use wrela_tests::{build, root};
+use wrela_tests::{must_build, repo_root};
 
 const WIDTH: u32 = 1280;
 const HEIGHT: u32 = 720;
@@ -26,17 +26,15 @@ const PROBE_LIMIT: f64 = 2.0;
 /// also the browser's page.
 fn page(name: &str) -> (PathBuf, String) {
     let rel = format!("target/tmp/hello-field-{name}");
-    let dir = root().join(&rel);
+    let dir = repo_root().join(&rel);
     let _ = std::fs::remove_dir_all(&dir);
-    if let Err(e) = build(&root().join("examples/hello-field"), &dir) {
-        panic!("hello-field doesn't build:\n{e}");
-    }
+    must_build(&repo_root().join("examples/hello-field"), &dir);
     std::fs::create_dir_all(dir.join("results")).expect("results dir");
     (dir, rel)
 }
 
 fn golden() -> PathBuf {
-    root().join("compiler/tests/fixtures/hello-field.png")
+    repo_root().join("compiler/tests/fixtures/hello-field.png")
 }
 
 fn times() -> Vec<f32> {
@@ -109,12 +107,13 @@ fn the_native_frame_matches_the_golden_and_the_cpu() {
 #[ignore = "needs Chrome, python3 and a GPU"]
 fn the_browser_matches_the_golden_and_the_native_host() {
     let (dir, rel) = page("browser");
-    // The browser first: this process holds no GPU lock while Chrome runs.
+    // The browser first: this thread holds no GPU lock while Chrome runs (Chrome waits for
+    // another thread's).
     let fragment = format!("#test&frames={FRAMES}&width={WIDTH}&height={HEIGHT}&fps={FPS}");
     let status = Command::new("python3")
-        .arg(root().join("tools/headless.py"))
+        .arg(repo_root().join("tools/headless.py"))
         .args([rel.as_str(), &fragment, "300"])
-        .current_dir(root())
+        .current_dir(repo_root())
         .status()
         .expect("python3 runs tools/headless.py");
     assert!(status.success(), "the browser run failed; see {rel}/results/console.log");
@@ -139,6 +138,8 @@ const LOAD_BUDGET_SECONDS: f64 = 1.0;
 #[ignore = "needs a GPU"]
 fn loading_creates_the_pipelines_within_budget() {
     let (dir, _) = page("load");
+    // Held across the loads (each takes it again), so the time doesn't count a wait for it.
+    let _gpu = wrela_host::lock::GpuLock::acquire("wrela-tests: load budget").expect("lock");
     let mut slowest = 0.0f64;
     for _ in 0..3 {
         let started = std::time::Instant::now();

@@ -12,6 +12,7 @@ publish.workspace = true
 doctest = false
 
 [dependencies]
+wrela-abi.workspace = true
 wrela-diag.workspace = true
 wrela-syntax.workspace = true
 wrela-sema.workspace = true

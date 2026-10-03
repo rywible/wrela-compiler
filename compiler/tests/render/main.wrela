@@ -1,5 +1,5 @@
-// A draw whose shaders read buffers (compiler/tests/tests/render.rs): the vertex shader places
-// a full-screen triangle from one buffer, the fragment shader colours it from another.
+// A draw whose shaders read buffers (compiler/tests/tests/suite/render.rs): the vertex shader
+// places a full-screen triangle from one buffer, the fragment shader colours it from another.
 use std::gpu::{
     ClipPosition, FragCoord, GpuBuffer, VertexIndex, begin_screen_pass, buffer, draw, present,
     write,

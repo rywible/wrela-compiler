@@ -26,9 +26,6 @@ pub fn emit(l: &Lowered, sources: &SourceMap) -> BuildOutput {
     let mut files = Vec::new();
     match wrela_wasm::emit(&l.cpu) {
         Ok(out) => {
-            if let Err(e) = wrela_wasm::check_no_relaxed_simd(&out.wasm) {
-                diagnostics.push(Diagnostic::internal(e.to_string()));
-            }
             // Where each part of the code came from, as `file:line:column`, for trap messages.
             let entries: Vec<(u32, Option<String>)> = out
                 .lines
@@ -42,7 +39,7 @@ pub fn emit(l: &Lowered, sources: &SourceMap) -> BuildOutput {
                     (offset, loc)
                 })
                 .collect();
-            let lines = wrela_abi::lines::Lines::new(&entries).encode();
+            let lines = wrela_abi::lines::Lines::new(entries).encode();
             let wasm = wrela_wasm::with_custom_section(out.wasm, wrela_abi::lines::SECTION, &lines);
             files.push(("game.wasm".to_string(), wasm));
         }
@@ -51,27 +48,37 @@ pub fn emit(l: &Lowered, sources: &SourceMap) -> BuildOutput {
     let mut manifest = wrela_abi::Manifest::new("game.wasm");
     for (i, p) in l.pipelines.iter().enumerate() {
         let shader = format!("pipeline_{i}.wgsl");
-        match wrela_wgsl::emit(&p.module) {
-            Ok(text) => files.push((shader.clone(), text.into_bytes())),
-            Err(e) => diagnostics.push(Diagnostic::internal(format!(
-                "the WGSL back end failed for `{}`: {e}",
-                p.name
-            ))),
-        }
-        let stage = match &p.kind {
-            PipelineKind::Compute { entry, workgroup_size } => {
+        let wgsl = match wrela_wgsl::emit(&p.module) {
+            Ok(w) => w,
+            Err(e) => {
+                diagnostics.push(Diagnostic::internal(format!(
+                    "the WGSL back end failed for `{}`: {e}",
+                    p.name
+                )));
+                continue;
+            }
+        };
+        // The entry points by the names the shader has (the WGSL writer may rename them).
+        let stage = match (&p.kind, wgsl.entry_points.as_slice()) {
+            (PipelineKind::Compute { workgroup_size }, [entry]) => {
                 wrela_abi::manifest::Stage::Compute {
                     entry: entry.clone(),
                     workgroup_size: *workgroup_size,
                 }
             }
-            PipelineKind::Render { vertex_entry, fragment_entry } => {
-                wrela_abi::manifest::Stage::Render {
-                    vertex_entry: vertex_entry.clone(),
-                    fragment_entry: fragment_entry.clone(),
-                }
+            (PipelineKind::Render, [vertex, fragment]) => wrela_abi::manifest::Stage::Render {
+                vertex_entry: vertex.clone(),
+                fragment_entry: fragment.clone(),
+            },
+            _ => {
+                diagnostics.push(Diagnostic::internal(format!(
+                    "the shader for `{}` has the wrong entry points",
+                    p.name
+                )));
+                continue;
             }
         };
+        files.push((shader.clone(), wgsl.text.into_bytes()));
         manifest.pipelines.push(wrela_abi::manifest::Pipeline {
             name: p.name.clone(),
             shader,

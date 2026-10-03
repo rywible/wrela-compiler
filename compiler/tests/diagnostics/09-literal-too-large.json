@@ -21,7 +21,7 @@
         "line": 5,
         "start": 113
       },
-      "title": "an integer literal too large for its type"
+      "title": "a number literal that doesn't fit its type"
     }
   ],
   "version": 2

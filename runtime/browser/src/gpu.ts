@@ -13,6 +13,7 @@
 //   offset), then the buffers in order. Bind groups are cached per (pipeline, buffer handles).
 
 import { SCREEN_FORMAT } from "./abi.gen.ts";
+import { errorMessage } from "./errors.ts";
 import type { BufferBinding, Manifest, Pipeline } from "./manifest.ts";
 import type { Bytes, Command } from "./stream.ts";
 
@@ -83,15 +84,20 @@ async function buildPipeline(device: GPUDevice, p: Pipeline, source: string): Pr
     });
   }
 
+  // Pipelines build at the same time and share the device's error scope stack, so the scope is
+  // popped before anything awaits. The async creations below report through their promises.
   device.pushErrorScope("validation");
   const layout = device.createBindGroupLayout({ label: p.name, entries });
   const pipelineLayout = device.createPipelineLayout({ label: p.name, bindGroupLayouts: [layout] });
   const module = device.createShaderModule({ label: p.shader, code: source });
+  const scope = device.popErrorScope();
   const compiled = compilationMessages(await module.getCompilationInfo());
+  if (compiled !== null) throw fail(compiled);
+  const error = await scope;
+  if (error !== null) throw fail(error.message);
   let compute: GPUComputePipeline | null = null;
   let render: GPURenderPipeline | null = null;
   try {
-    if (compiled !== null) throw fail(compiled);
     if (p.kind === "compute") {
       compute = await device.createComputePipelineAsync({
         label: p.name,
@@ -109,11 +115,8 @@ async function buildPipeline(device: GPUDevice, p: Pipeline, source: string): Pr
       });
     }
   } catch (e) {
-    await device.popErrorScope();
-    throw e instanceof ShaderError ? e : fail(e instanceof Error ? e.message : String(e));
+    throw fail(errorMessage(e));
   }
-  const error = await device.popErrorScope();
-  if (error !== null) throw fail(error.message);
   return {
     name: p.name,
     layout,
@@ -137,16 +140,19 @@ interface PendingDraw {
   uniforms: Bytes;
 }
 
-const alignTo = (n: number, align: number) => Math.ceil(n / align) * align;
+/** `n` rounded up to a multiple of `align`. */
+export const alignTo = (n: number, align: number) => Math.ceil(n / align) * align;
 
 export class GpuExecutor {
   readonly #align: number;
   readonly #buffers = new Map<number, GPUBuffer>();
-  readonly #bindGroups = new Map<string, GPUBindGroup>();
+  /** By pipeline and buffer handles. */
+  readonly #bindGroups = new Map<string, { group: GPUBindGroup; handles: number[] }>();
+  /** The keys of the bind groups that use each buffer, so DestroyBuffer drops only those. */
+  readonly #groupsOf = new Map<number, Set<string>>();
   /** Buffers destroyed by the program, released once the work recorded before is submitted. */
   readonly #doomed: GPUBuffer[] = [];
   #ring: GPUBuffer;
-  #ringCapacity = RING_START;
   #staging: Bytes = new Uint8Array(RING_START);
   #staged = 0;
   #encoder: GPUCommandEncoder | null = null;
@@ -200,30 +206,25 @@ export class GpuExecutor {
         // Recorded work may still use it: it's destroyed once that work is submitted.
         this.#doomed.push(this.#buffer(cmd.handle));
         this.#buffers.delete(cmd.handle);
-        for (const key of [...this.#bindGroups.keys()]) {
-          const handles = key.slice(key.indexOf(":") + 1).split(",");
-          if (handles.includes(String(cmd.handle))) this.#bindGroups.delete(key);
-        }
+        for (const key of this.#groupsOf.get(cmd.handle) ?? []) this.#dropBindGroup(key);
+        this.#groupsOf.delete(cmd.handle);
         return;
       }
     }
   }
 
-  /** Submits everything recorded so far, after writing its uniform bytes. */
+  /** Submits everything recorded so far, after writing its uniform bytes, then destroys the
+   * buffers the program destroyed (WebGPU waits for submitted work that uses them). */
   flush(): void {
-    if (this.#encoder === null) return;
-    if (this.#staged > 0) {
-      this.device.queue.writeBuffer(this.#ring, 0, this.#staging, 0, this.#staged);
-      this.#staged = 0;
+    if (this.#encoder !== null) {
+      if (this.#staged > 0) {
+        this.device.queue.writeBuffer(this.#ring, 0, this.#staging, 0, this.#staged);
+        this.#staged = 0;
+      }
+      this.device.queue.submit([this.#encoder.finish()]);
+      this.#encoder = null;
     }
-    this.device.queue.submit([this.#encoder.finish()]);
-    this.#encoder = null;
     for (const b of this.#doomed.splice(0)) b.destroy();
-  }
-
-  /** The GPU buffer behind a handle (for reading back in tests). */
-  buffer(handle: number): GPUBuffer | undefined {
-    return this.#buffers.get(handle);
   }
 
   #buffer(handle: number): GPUBuffer {
@@ -254,19 +255,19 @@ export class GpuExecutor {
   /** Makes room for `bytes` more uniform bytes (counted aligned) in this submission, flushing
    * first or growing the ring if it must. Call before recording the work that uses them. */
   #reserve(bytes: number): void {
-    if (alignTo(this.#staged, this.#align) + bytes <= this.#ringCapacity) return;
+    if (alignTo(this.#staged, this.#align) + bytes <= this.#staging.length) return;
     this.flush();
-    if (bytes > this.#ringCapacity) {
-      let capacity = this.#ringCapacity * 2;
+    if (bytes > this.#staging.length) {
+      let capacity = this.#staging.length * 2;
       while (capacity < bytes) capacity *= 2;
       if (capacity > this.device.limits.maxBufferSize) {
         throw new Error(`${bytes} uniform bytes in one submission is over the limit`);
       }
       this.#ring.destroy(); // the flush above submitted the last work that used it
       this.#ring = this.#createRing(capacity);
-      this.#ringCapacity = capacity;
       this.#staging = new Uint8Array(capacity);
       this.#bindGroups.clear(); // they point at the old ring
+      this.#groupsOf.clear();
     }
   }
 
@@ -283,16 +284,28 @@ export class GpuExecutor {
   #bindGroup(index: number, handles: number[]): GPUBindGroup {
     const key = `${index}:${handles.join(",")}`;
     const cached = this.#bindGroups.get(key);
-    if (cached !== undefined) return cached;
+    if (cached !== undefined) return cached.group;
     const p = this.#pipeline(index);
     const entries: GPUBindGroupEntry[] = [];
     if (p.uniform !== null) {
       entries.push({ binding: p.uniform.binding, resource: { buffer: this.#ring, offset: 0, size: p.uniform.size } });
     }
     handles.forEach((h, i) => entries.push({ binding: p.buffers[i]!.binding, resource: { buffer: this.#buffer(h) } }));
-    const bg = this.device.createBindGroup({ label: p.name, layout: p.layout, entries });
-    this.#bindGroups.set(key, bg);
-    return bg;
+    const group = this.device.createBindGroup({ label: p.name, layout: p.layout, entries });
+    this.#bindGroups.set(key, { group, handles });
+    for (const h of handles) {
+      let keys = this.#groupsOf.get(h);
+      if (keys === undefined) this.#groupsOf.set(h, (keys = new Set()));
+      keys.add(key);
+    }
+    return group;
+  }
+
+  #dropBindGroup(key: string): void {
+    const cached = this.#bindGroups.get(key);
+    if (cached === undefined) return;
+    this.#bindGroups.delete(key);
+    for (const h of cached.handles) this.#groupsOf.get(h)?.delete(key);
   }
 
   #dispatch(index: number, groups: [number, number, number], buffers: number[], uniforms: Bytes): void {

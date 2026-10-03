@@ -3,3 +3,9 @@ fn f() -> i32 {
     let a$ = 1 //~ E0001
     1
 }
+
+// Indented with no-break spaces: each line's are skipped, and its line break still ends it.
+fn g() -> i32 {
+    let a = 1 //~ E0001
+    a + 1 //~ E0001
+}

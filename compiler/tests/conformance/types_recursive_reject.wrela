@@ -24,6 +24,23 @@ struct W { //~ E0318
     inner: Wrap<W>,
 }
 
+// Through an associated type: `Holder<Loop>` holds a `Loop::K`, which is a `Loop`.
+trait Keyed {
+    type K
+}
+
+struct Holder<T: Keyed> {
+    k: T::K,
+}
+
+struct Loop { //~ E0318
+    h: Holder<Loop>,
+}
+
+impl Keyed for Loop {
+    type K = Loop
+}
+
 // Not recursive: a parameter the type doesn't hold.
 struct Fine {
     w: Wrap<i32>,

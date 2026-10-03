@@ -16,24 +16,20 @@
 //!   local a closure body uses is a capture.
 
 pub mod build;
-pub mod print;
 
 use crate::builtins::BuiltinFn;
 use crate::defs::{Mode, RetMode};
+use crate::program::Program;
 use crate::thir::{self, Lit};
 use crate::ty::*;
 use wrela_diag::Span;
 use wrela_syntax::ast::{BinOp, UnOp};
 
+pub use crate::thir::Callee;
 pub use crate::thir::LocalId as Local;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct BlockId(pub u32);
-
-impl BlockId {
-    pub fn index(self) -> usize {
-        self.0 as usize
-    }
+id_type! {
+    BlockId;
 }
 
 /// A function's MIR: its locals, and the code of the function and of each of its closures.
@@ -110,6 +106,17 @@ impl LocalKind {
             LocalKind::User(thir::LocalKind::Projection { .. })
                 | LocalKind::TempProjection { .. }
                 | LocalKind::Arg { .. }
+        )
+    }
+
+    /// Whether the local owns its value outright, so a move out of it is allowed (unless it's a
+    /// closure's capture).
+    pub fn owns_value(self) -> bool {
+        matches!(
+            self,
+            LocalKind::User(thir::LocalKind::Owned { .. } | thir::LocalKind::Param(Mode::Take))
+                | LocalKind::Temp
+                | LocalKind::TempVar
         )
     }
 
@@ -238,25 +245,6 @@ impl Arg {
 }
 
 #[derive(Clone, Debug)]
-pub enum Callee {
-    Fn {
-        func: FnId,
-        args: Vec<TyId>,
-    },
-    TraitMethod {
-        method: FnId,
-        self_ty: TyId,
-        trait_args: Vec<TyId>,
-        method_args: Vec<TyId>,
-    },
-    Builtin(BuiltinFn),
-    /// A closure or function held by a local (a closure binding or a `fn(..)` parameter).
-    Local(Local),
-    /// `.clone()`: a structural copy of the argument.
-    Clone,
-}
-
-#[derive(Clone, Debug)]
 pub struct Call {
     pub callee: Callee,
     /// In parameter order.
@@ -317,6 +305,9 @@ pub enum Rvalue {
     Closure(ClosureId),
     /// A named function as a value.
     FnRef(FnId, Vec<TyId>),
+    /// A large constant's value, kept in one place rather than built at each use (a table):
+    /// a local assigned it is a read-only view of it.
+    Const(ConstId),
     Dispatch(Box<Dispatch>),
     Draw(Box<Draw>),
 }
@@ -401,34 +392,36 @@ pub struct BlockData {
 }
 
 impl FnBody {
-    /// The blocks control can go to from `b`'s end.
-    pub fn successors(&self, b: BlockId) -> Vec<BlockId> {
-        match &self.block(b).term.kind {
-            TerminatorKind::Goto(t) => vec![*t],
-            TerminatorKind::If { then, else_, .. } => vec![*then, *else_],
-            TerminatorKind::Loop { body, .. } => vec![*body],
+    /// The blocks control can go to from `b`'s end (at most two).
+    pub fn successors(&self, b: BlockId) -> impl Iterator<Item = BlockId> {
+        let one = |t: BlockId| [Some(t), None];
+        let succ = match &self.block(b).term.kind {
+            TerminatorKind::Goto(t) => one(*t),
+            TerminatorKind::If { then, else_, .. } => [Some(*then), Some(*else_)],
+            TerminatorKind::Loop { body, .. } => one(*body),
             TerminatorKind::LoopBack(l) => match &self.block(*l).term.kind {
-                TerminatorKind::Loop { body, .. } => vec![*body],
-                _ => Vec::new(),
+                TerminatorKind::Loop { body, .. } => one(*body),
+                _ => [None, None],
             },
             TerminatorKind::Break(l) => match &self.block(*l).term.kind {
-                TerminatorKind::Loop { merge, .. } => vec![*merge],
-                _ => Vec::new(),
+                TerminatorKind::Loop { merge, .. } => one(*merge),
+                _ => [None, None],
             },
             TerminatorKind::Continue(l) => match &self.block(*l).term.kind {
-                TerminatorKind::Loop { continuing, .. } => vec![*continuing],
-                _ => Vec::new(),
+                TerminatorKind::Loop { continuing, .. } => one(*continuing),
+                _ => [None, None],
             },
-            TerminatorKind::Match { arms, merge } => vec![*arms.first().unwrap_or(merge)],
+            TerminatorKind::Match { arms, merge } => one(*arms.first().unwrap_or(merge)),
             TerminatorKind::ArmMatched(m) => match &self.block(*m).term.kind {
-                TerminatorKind::Match { merge, .. } => vec![*merge],
-                _ => Vec::new(),
+                TerminatorKind::Match { merge, .. } => one(*merge),
+                _ => [None, None],
             },
-            TerminatorKind::ArmFailed { next, .. } => vec![*next],
+            TerminatorKind::ArmFailed { next, .. } => one(*next),
             TerminatorKind::Return(_)
             | TerminatorKind::ReturnPlace(_)
-            | TerminatorKind::Unreachable => Vec::new(),
-        }
+            | TerminatorKind::Unreachable => [None, None],
+        };
+        succ.into_iter().flatten()
     }
 
     /// Whether `b` is the back edge's source: a `LoopBack`.
@@ -437,81 +430,93 @@ impl FnBody {
     }
 }
 
+/// Whether `l` is outside the body of `closure` (a capture). Nothing is outside the function's
+/// own body (`closure` is `None`).
+pub(crate) fn is_capture(locals: &[LocalDecl], closure: Option<ClosureId>, l: Local) -> bool {
+    // A closure's parameters and the locals its body declares are its own.
+    closure.is_some_and(|c| locals[l.index()].closure != Some(c))
+}
+
+/// Whether a value of type `t` can be called: a closure, or a function.
+pub(crate) fn is_callable(types: &Types, t: TyId) -> bool {
+    matches!(types.kind(t), TyKind::Closure(..) | TyKind::FnPtr(..) | TyKind::FnDef(..))
+}
+
 /// The type of a place, from its local's type through each projection. Types may mention the
 /// function's generic parameters.
-pub fn place_ty(p: &crate::program::Program, locals: &[LocalDecl], place: &Place) -> TyId {
+pub fn place_ty(p: &Program, locals: &[LocalDecl], place: &Place) -> TyId {
     let mut t = locals[place.local.index()].ty;
     let mut variant: Option<u32> = None;
     for proj in &place.proj {
-        let k = p.types.kind(t).clone();
-        t = match (proj, k) {
-            (Proj::Downcast(v), _) => {
-                variant = Some(*v);
-                continue;
-            }
-            (Proj::Field(i), TyKind::Adt(a, args)) => {
-                let fields = match variant.take() {
-                    Some(v) => p.variant_fields(a, &args, v as usize),
-                    None => p.struct_fields(a, &args),
-                };
-                fields.get(*i as usize).map_or(p.types.error, |f| f.1)
-            }
-            (Proj::Field(i), TyKind::Tuple(ts)) => {
-                ts.get(*i as usize).copied().unwrap_or(p.types.error)
-            }
-            (Proj::Comp(_), _) => p.types.f32,
-            (Proj::Swizzle(cs), _) => p.types.vec(cs.len() as u8),
-            (Proj::Index(_), TyKind::Array(e, _) | TyKind::Slice(e)) => e,
-            (Proj::Index(_), TyKind::Vec(_)) => p.types.f32,
-            (Proj::Index(_), TyKind::Mat(n)) => p.types.vec(n),
-            (Proj::Index(_), TyKind::Adt(_, args)) if !args.is_empty() => args[0], // `Slots<T>`
-            _ => p.types.error,
-        };
+        t = proj_ty(p, t, &mut variant, proj);
     }
     t
 }
 
+/// The type of projection `proj` of a place of type `t`. `variant` is the variant a `Downcast`
+/// chose, for the `Field` after it.
+fn proj_ty(p: &Program, t: TyId, variant: &mut Option<u32>, proj: &Proj) -> TyId {
+    match (proj, p.types.kind(t)) {
+        (Proj::Downcast(v), _) => {
+            *variant = Some(*v);
+            t
+        }
+        (Proj::Field(i), TyKind::Adt(a, args)) => {
+            p.field_ty(*a, args, variant.take(), *i as usize).unwrap_or(p.types.error)
+        }
+        (Proj::Field(i), TyKind::Tuple(ts)) => {
+            ts.get(*i as usize).copied().unwrap_or(p.types.error)
+        }
+        (Proj::Comp(_), _) => p.types.f32,
+        (Proj::Swizzle(cs), _) => p.types.vec(cs.len() as u8),
+        (Proj::Index(_), TyKind::Array(e, _) | TyKind::Slice(e)) => *e,
+        (Proj::Index(_), TyKind::Vec(_)) => p.types.f32,
+        (Proj::Index(_), TyKind::Mat(n)) => p.types.vec(*n),
+        (Proj::Index(_), TyKind::Adt(_, args)) if !args.is_empty() => args[0], // `Slots<T>`
+        _ => p.types.error,
+    }
+}
+
 /// A place as the source would write it, for diagnostics: `w.log.count`, `xs[_]`, `v.x`.
-pub fn describe(p: &crate::program::Program, locals: &[LocalDecl], place: &Place) -> String {
+pub fn describe(p: &Program, locals: &[LocalDecl], place: &Place) -> String {
     let mut s = locals[place.local.index()].name.clone();
-    let mut sub = Place::local(place.local);
+    let mut t = locals[place.local.index()].ty;
+    let mut variant: Option<u32> = None;
     for proj in &place.proj {
         match proj {
             Proj::Field(i) => {
-                let base = place_ty(p, locals, &sub);
-                let name = match p.types.kind(base) {
-                    TyKind::Adt(a, args) => {
-                        let variant = sub.proj.iter().rev().find_map(|x| match x {
-                            Proj::Downcast(v) => Some(*v),
-                            _ => None,
-                        });
-                        let fields = match variant {
-                            Some(v) if matches!(sub.proj.last(), Some(Proj::Downcast(_))) => {
-                                p.variant_fields(*a, args, v as usize)
-                            }
-                            _ => p.struct_fields(*a, args),
-                        };
-                        fields.get(*i as usize).map_or_else(|| i.to_string(), |f| f.0.clone())
-                    }
-                    _ => i.to_string(),
-                };
                 s.push('.');
-                s.push_str(&name);
+                s.push_str(&field_name(p, t, variant, *i));
             }
             Proj::Downcast(_) => {}
             Proj::Comp(c) => {
                 s.push('.');
-                s.push(['x', 'y', 'z', 'w'][*c as usize % 4]);
+                s.push(comp_char(*c));
             }
             Proj::Swizzle(cs) => {
                 s.push('.');
-                for c in cs {
-                    s.push(['x', 'y', 'z', 'w'][*c as usize % 4]);
-                }
+                s.extend(cs.iter().map(|&c| comp_char(c)));
             }
             Proj::Index(_) => s.push_str("[_]"),
         }
-        sub = sub.with(proj.clone());
+        t = proj_ty(p, t, &mut variant, proj);
     }
     s
+}
+
+/// The name of field `i` of a value of type `t` (of `variant`, for an enum): its index when it
+/// has no name (a tuple's).
+pub(crate) fn field_name(p: &Program, t: TyId, variant: Option<u32>, i: u32) -> String {
+    match p.types.kind(t) {
+        TyKind::Adt(a, _) => p
+            .adt_fields(*a, variant)
+            .get(i as usize)
+            .map_or_else(|| i.to_string(), |f| f.name.clone()),
+        _ => i.to_string(),
+    }
+}
+
+/// A vector component's name: `x`, `y`, `z` or `w`.
+pub(crate) fn comp_char(c: u8) -> char {
+    ['x', 'y', 'z', 'w'][c as usize % 4]
 }

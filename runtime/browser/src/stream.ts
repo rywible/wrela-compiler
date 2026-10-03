@@ -159,10 +159,6 @@ export function decode(batch: Bytes): Command[] {
 export class Sequencer {
   #inPass = false;
 
-  get inPass(): boolean {
-    return this.#inPass;
-  }
-
   step(cmd: Command): void {
     const err = (why: string) => new StreamError("Sequence", `${cmd.op} out of sequence: ${why}`);
     switch (cmd.op) {

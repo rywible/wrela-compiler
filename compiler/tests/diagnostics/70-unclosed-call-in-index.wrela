@@ -1,0 +1,10 @@
+// mistake: a call left open inside an index
+// expect: E0100
+// fix: yes
+fn g(i: i32) -> i32 {
+    i
+}
+
+fn f(xs: [i32; 4], j: i32) -> i32 {
+    xs[g(j]
+}

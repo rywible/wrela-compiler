@@ -1,0 +1,184 @@
+// run: derived intervals at their edges: NaN bounds, `tan` far out, signed zeros, integer
+// `abs` over a whole range, a named function of a vector, enums joined across a branch,
+// returns in a loop, recursion, and a callee that counts its calls
+// expect: nan_corner() = true
+// expect: nan_log() = true
+// expect: tan_far() = true
+// expect: signed_zero_lo() = 0.0
+// expect: signed_zero_hi() = 1.0
+// expect: int_abs_lo() = -2147483648.0
+// expect: named_vector() = true
+// expect: option_join() = true
+// expect: enum_join() = true
+// expect: enum_select() = true
+// expect: return_in_loop() = true
+// expect: recursive() = true
+// expect: counted() = true
+use std::derive::{Box2, Interval, interval}
+
+/// No point in [1, 2] makes a NaN, but a corner of `c × (1 / d)` is 0 × ∞: the bound is
+/// unknown, so both sides of the test are in the range.
+fn corner(x: f32) -> f32 {
+    let c = max(x - 1.5, 0.0)
+    let d = x - 0.5 * x
+    let p = c * (1.0 / d)
+    if p < 0.1 {
+        return 10.0
+    }
+    20.0
+}
+
+pub fn nan_corner() -> bool {
+    let r = interval(corner, Interval { lo: 1.0, hi: 2.0 })
+    r.lo <= 10.0 && r.hi >= 20.0
+}
+
+/// x log x is -0.1 at about x = 0.11 and x = 0.89: both values happen over [0, 1].
+fn log_test(x: f32) -> f32 {
+    if x * log(x) > -0.1 {
+        return 1.0
+    }
+    0.0
+}
+
+pub fn nan_log() -> bool {
+    let r = interval(log_test, Interval { lo: 0.0, hi: 1.0 })
+    r.lo <= 0.0 && r.hi >= 1.0
+}
+
+/// A pole of `tan` near 50106.83, where its test rounds in f32.
+pub fn tan_far() -> bool {
+    let (lo, hi) = (50106.7, 50106.832)
+    let r = interval(|x: f32| tan(x), Interval { lo, hi })
+    r.lo <= r.hi && r.lo <= tan(50106.83) && r.hi >= tan(50106.83)
+}
+
+/// trunc over [-0.5, 0.5] is -0.0 or 0.0: their sign bits differ.
+fn sign_bit(t: f32) -> f32 {
+    let z = trunc(t)
+    if (bitcast_u32(z) >> 31) == 1 { 1.0 } else { 0.0 }
+}
+
+pub fn signed_zero_lo() -> f32 {
+    interval(sign_bit, Interval { lo: -0.5, hi: 0.5 }).lo
+}
+
+pub fn signed_zero_hi() -> f32 {
+    interval(sign_bit, Interval { lo: -0.5, hi: 0.5 }).hi
+}
+
+/// `abs` of a range of `i32`s that isn't one value is the whole range, without trapping on
+/// `abs(i32::MIN)`.
+pub fn int_abs_lo() -> f32 {
+    interval(|x: f32| f32(abs(i32(x * 10.0) * 3)), Interval { lo: 0.0, hi: 1.0 }).lo
+}
+
+fn area(p: vec2) -> f32 {
+    p.x * p.y
+}
+
+pub fn named_vector() -> bool {
+    let r = interval(area, Box2 { lo: vec2(1.0, 2.0), hi: vec2(3.0, 4.0) })
+    r.lo <= 2.0 && r.lo > 1.99 && r.hi >= 12.0 && r.hi < 12.01
+}
+
+fn hit(x: f32) -> Option<f32> {
+    if x > 0.0 { Some(x) } else { None }
+}
+
+/// (0, 0.5] or 1.
+pub fn option_join() -> bool {
+    let r = interval(|x: f32| match hit(x) {
+        Some(t) => t,
+        None => 1.0,
+    }, Interval { lo: -1.0, hi: 0.5 })
+    r.lo <= 0.0 && r.hi >= 1.0 && r.hi < 1.01
+}
+
+enum Shape: Copy + Clone {
+    Ball { r: f32 },
+    Gap,
+    Slab { h: f32 },
+}
+
+struct Held: Copy + Clone {
+    s: Shape,
+    k: f32,
+}
+
+fn pick(x: f32) -> Shape {
+    if x > 0.5 {
+        return Shape::Slab { h: x * 2.0 }
+    }
+    if x < -0.5 {
+        return Shape::Gap
+    }
+    Shape::Ball { r: x }
+}
+
+fn held(x: f32) -> f32 {
+    let h = Held { s: pick(x), k: 3.0 }
+    match h.s {
+        Shape::Ball { r } => r + h.k,
+        Shape::Gap => 10.0,
+        Shape::Slab { h } => h - 1.0,
+    }
+}
+
+/// Over [-1, 1]: a slab's h - 1 in (0, 1], a ball's r + 3 in [2.5, 3.5], or 10.
+pub fn enum_join() -> bool {
+    let r = interval(held, Interval { lo: -1.0, hi: 1.0 })
+    let s = interval(held, Interval { lo: 0.6, hi: 0.8 })
+    r.lo <= 0.2 && r.hi >= 10.0 && s.lo <= 0.2 && s.hi >= 0.6 && s.hi < 0.61
+}
+
+/// `Gap` where x > 0, else a ball of radius x.
+pub fn enum_select() -> bool {
+    let r = interval(|x: f32| match select(Shape::Ball { r: x }, Shape::Gap, x > 0.0) {
+        Shape::Ball { r } => r,
+        Shape::Gap => -5.0,
+        Shape::Slab { h } => h,
+    }, Interval { lo: -1.0, hi: 1.0 })
+    r.lo <= -5.0 && r.hi >= 0.0
+}
+
+/// The loop's exit doesn't depend on x; only whether it runs does.
+fn early(x: f32) -> f32 {
+    if x > 0.5 {
+        for i in 0..4 {
+            if i == 2 {
+                return x
+            }
+        }
+    }
+    0.0
+}
+
+pub fn return_in_loop() -> bool {
+    let r = interval(early, Interval { lo: 0.0, hi: 1.0 })
+    r.lo <= 0.0 && r.hi >= 1.0 && r.hi < 1.01
+}
+
+fn power(x: f32, n: u32) -> f32 {
+    if n == 0 {
+        return 1.0
+    }
+    x * power(x, n - 1)
+}
+
+pub fn recursive() -> bool {
+    let r = interval(|x: f32| power(x, 3), Interval { lo: 1.0, hi: 2.0 })
+    r.lo <= 1.0 && r.hi >= 8.0 && r.hi < 8.01
+}
+
+fn bump(x: f32, n: mut i32) -> f32 {
+    n += 1
+    x * 2.0
+}
+
+/// A callee counting through an `i32` `mut` parameter: the count isn't a range.
+pub fn counted() -> bool {
+    var calls = 0
+    let r = interval(|x: f32| bump(x, mut calls), Interval { lo: 1.0, hi: 2.0 })
+    r.hi >= 4.0 && calls == 1
+}

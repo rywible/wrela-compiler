@@ -1,15 +1,10 @@
 //! Warnings: W0001 (a local bound and never used) and W0002 (an arm that can't match). The
 //! conformance suite checks errors only.
 
-use std::path::PathBuf;
+use crate::package;
 
 fn warnings(name: &str, text: &str) -> Vec<(String, usize)> {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("warnings").join(name);
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("dir");
-    let text = format!("{text}\npub fn frame(time: f32, width: u32, height: u32) {{}}\n");
-    std::fs::write(dir.join("main.wrela"), &text).expect("write");
-    let out = wrela_driver::check(&dir);
+    let out = wrela_driver::check(&package(&format!("warnings/{name}"), text));
     assert!(!out.has_errors(), "{:?}", out.diagnostics);
     out.diagnostics
         .iter()
@@ -55,4 +50,24 @@ fn unreachable_arms_are_reported() {
 }";
     let w = warnings("unreachable", src);
     assert_eq!(w, [("W0002".to_string(), 4)]);
+}
+
+#[test]
+fn a_pattern_with_an_error_hides_no_arm() {
+    // The wrong-enum pattern is an error (E0320); the arms after it aren't unreachable.
+    let src = "enum K {
+    A,
+    B(i32),
+}
+
+fn f(k: K) -> i32 {
+    match k {
+        Option::Some(x) => x,
+        K::A => 1,
+        K::B(x) => x,
+    }
+}";
+    let out = wrela_driver::check(&package("warnings/wrong_pattern", src));
+    let codes: Vec<String> = out.diagnostics.iter().map(|d| d.code.to_string()).collect();
+    assert_eq!(codes, ["E0320"], "{:?}", out.diagnostics);
 }

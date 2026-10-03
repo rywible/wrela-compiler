@@ -1,0 +1,190 @@
+// run: derivations through stores and loads via a returned `mut` projection: assignments and
+// compound assignments, a projection of a projection, an index, a choice by a value that
+// doesn't depend on the input, a gradient of a gradient, and an interval under a branch
+// expect: common(3.0) = 6.0
+// expect: g_common(3.0) = 2.0
+// expect: g_compound(1.0) = 3.0
+// expect: g_cube(2.0) = 12.0
+// expect: h_cube(2.0) = 12.0
+// expect: g_indexed(1.0) = 4.0
+// expect: g_picked(1.0) = 4.0
+// expect: g_reads(3.0) = 6.0
+// expect: g_chosen(1.0) = 3.0
+// expect: g_chosen(0.0) = 1.0
+// expect: i_common() = true
+// expect: i_cube() = true
+// expect: i_gcube() = true
+// expect: i_indexed() = true
+// expect: i_picked() = true
+// expect: i_stepped() = true
+// expect: i_reads() = true
+use std::derive::{Interval, gradient, interval}
+
+struct S: Copy + Clone {
+    a: f32,
+    b: f32,
+}
+
+struct T: Copy + Clone {
+    s: S,
+    k: f32,
+}
+
+fn at(s: mut S) -> mut f32 {
+    mut s.a
+}
+
+fn nested(t: mut T) -> mut f32 {
+    mut at(mut t.s)
+}
+
+fn item(xs: mut [f32; 4], i: u32) -> mut f32 {
+    mut xs[i]
+}
+
+fn pick(s: mut S, first: bool) -> mut f32 {
+    if first {
+        return mut s.a
+    }
+    mut s.b
+}
+
+fn chosen(s: mut S, x: f32) -> mut f32 {
+    if x > 0.5 {
+        return mut s.a
+    }
+    mut s.b
+}
+
+/// 2x, written through a projection.
+pub fn common(x: f32) -> f32 {
+    var s = S { a: 0.0, b: 0.0 }
+    at(mut s) = x * 2.0
+    s.a
+}
+
+/// 2x, then + x: 3x.
+fn compound(x: f32) -> f32 {
+    var s = S { a: 0.0, b: 0.0 }
+    at(mut s) = x * 2.0
+    at(mut s) += x
+    s.a
+}
+
+/// x³, through a projection of a projection.
+fn cube(x: f32) -> f32 {
+    var t = T { s: S { a: 1.0, b: 0.0 }, k: 0.0 }
+    nested(mut t) *= x
+    nested(mut t) *= x
+    nested(mut t) *= x
+    t.s.a
+}
+
+/// 3x + x.
+fn indexed(x: f32) -> f32 {
+    var xs = [0.0; 4]
+    for i in 0..4 {
+        item(mut xs, i) = x * f32(i)
+    }
+    xs[3] + xs[1]
+}
+
+/// 5x - x.
+fn picked(x: f32) -> f32 {
+    var s = S { a: 0.0, b: 0.0 }
+    pick(mut s, true) = x * 5.0
+    pick(mut s, false) = x
+    s.a - s.b
+}
+
+fn reads(x: f32) -> f32 {
+    var s = S { a: x, b: 0.0 }
+    let y = at(mut s)
+    y * y
+}
+
+/// 3x where x > 0.5, else x: a gradient follows the place the point picks.
+fn choose(x: f32) -> f32 {
+    var s = S { a: 0.0, b: 0.0 }
+    chosen(mut s, x) = x
+    s.a * 3.0 + s.b
+}
+
+/// 1 where x > 0.5, else 0, added through a projection.
+fn stepped(x: f32) -> f32 {
+    var s = S { a: 0.0, b: 0.0 }
+    if x > 0.5 {
+        at(mut s) += 1.0
+    }
+    s.a
+}
+
+pub fn g_common(x: f32) -> f32 {
+    gradient(common, x)
+}
+
+pub fn g_compound(x: f32) -> f32 {
+    gradient(compound, x)
+}
+
+pub fn g_cube(x: f32) -> f32 {
+    gradient(cube, x)
+}
+
+/// 6x.
+pub fn h_cube(x: f32) -> f32 {
+    gradient(|t: f32| gradient(cube, t), x)
+}
+
+pub fn g_indexed(x: f32) -> f32 {
+    gradient(indexed, x)
+}
+
+pub fn g_picked(x: f32) -> f32 {
+    gradient(picked, x)
+}
+
+pub fn g_reads(x: f32) -> f32 {
+    gradient(reads, x)
+}
+
+pub fn g_chosen(x: f32) -> f32 {
+    gradient(choose, x)
+}
+
+fn holds(f: Interval, lo: f32, hi: f32) -> bool {
+    f.lo <= lo && f.hi >= hi && f.lo > lo - 0.001 && f.hi < hi + 0.001
+}
+
+pub fn i_common() -> bool {
+    holds(interval(compound, Interval { lo: 1.0, hi: 2.0 }), 3.0, 6.0)
+}
+
+pub fn i_cube() -> bool {
+    holds(interval(cube, Interval { lo: 1.0, hi: 2.0 }), 1.0, 8.0)
+}
+
+/// 3x² over [1, 2].
+pub fn i_gcube() -> bool {
+    holds(interval(|t: f32| gradient(cube, t), Interval { lo: 1.0, hi: 2.0 }), 3.0, 12.0)
+}
+
+pub fn i_indexed() -> bool {
+    holds(interval(indexed, Interval { lo: 1.0, hi: 2.0 }), 4.0, 8.0)
+}
+
+/// 5x - x, each side bounded on its own: [5 - 2, 10 - 1].
+pub fn i_picked() -> bool {
+    holds(interval(picked, Interval { lo: 1.0, hi: 2.0 }), 3.0, 9.0)
+}
+
+/// Both sides of the branch: 0 and 1.
+pub fn i_stepped() -> bool {
+    let both = interval(stepped, Interval { lo: 0.0, hi: 1.0 })
+    let low = interval(stepped, Interval { lo: 0.0, hi: 0.4 })
+    holds(both, 0.0, 1.0) && holds(low, 0.0, 0.0)
+}
+
+pub fn i_reads() -> bool {
+    holds(interval(reads, Interval { lo: -1.0, hi: 2.0 }), 0.0, 4.0)
+}

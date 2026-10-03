@@ -1,0 +1,38 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0100",
+      "file": "main.wrela",
+      "fixes": [
+        {
+          "edits": [
+            {
+              "end": 151,
+              "file": "main.wrela",
+              "replacement": ")",
+              "start": 151
+            }
+          ],
+          "message": "close with `)` first"
+        }
+      ],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "expected `,` or `)`, found `]`",
+      "notes": [],
+      "severity": "error",
+      "span": {
+        "column": 11,
+        "end": 152,
+        "end_column": 12,
+        "end_line": 9,
+        "line": 9,
+        "start": 151
+      },
+      "title": "unexpected token"
+    }
+  ],
+  "version": 2
+}

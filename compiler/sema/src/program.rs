@@ -3,7 +3,8 @@
 
 use crate::defs::*;
 use crate::ty::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::fmt::Write;
 
 #[derive(Debug, Default)]
 pub struct Program {
@@ -28,9 +29,15 @@ pub struct Program {
     /// Whether a type implements a structural trait (`Copy`, `Clone`, `GpuData`): worked out
     /// once per type, since struct types share their fields' types.
     pub(crate) builtin_impls: std::cell::RefCell<HashMap<(TyId, Lang), bool>>,
+    /// The goals the trait solver is working on: an impl's bounds can lead back to one of
+    /// them. The first one's size, while there are any.
+    pub(crate) solving: std::cell::RefCell<(HashSet<(TyId, TraitRef)>, u32)>,
     /// Where the source's syntax errors are.
     pub syntax_errors: Vec<wrela_diag::Span>,
 }
+
+/// Longer type names are cut here, so diagnostics stay readable.
+const MAX_TYPE_TEXT: usize = 200;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LangRes {
@@ -90,6 +97,19 @@ impl Program {
         self.traits[t.index()].lang == Some(l)
     }
 
+    /// The lang item a type is, if it's a lang struct or enum (with any arguments).
+    pub fn lang_of_ty(&self, t: TyId) -> Option<Lang> {
+        match self.types.kind(t) {
+            TyKind::Adt(a, _) => self.adt(*a).lang,
+            _ => None,
+        }
+    }
+
+    /// The impls of a trait.
+    pub fn impls_of(&self, t: TraitId) -> &[ImplId] {
+        self.impls_of_trait.get(&t).map_or(&[], Vec::as_slice)
+    }
+
     pub fn new_param(&mut self, def: ParamDef) -> ParamId {
         self.params.push(def);
         ParamId(self.params.len() as u32 - 1)
@@ -125,8 +145,107 @@ impl Program {
         }
     }
 
+    /// A type as diagnostics show it; a long one is cut short.
     pub fn display_ty(&self, t: TyId) -> String {
-        display(&self.types, self, t)
+        let mut s = String::new();
+        self.write_ty(t, &mut s);
+        if s.len() > MAX_TYPE_TEXT {
+            let mut cut = MAX_TYPE_TEXT;
+            while !s.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            s.truncate(cut);
+            s.push('…');
+        }
+        s
+    }
+
+    fn write_list(&self, ts: &[TyId], s: &mut String) {
+        for (i, &t) in ts.iter().enumerate() {
+            if i > 0 {
+                s.push_str(", ");
+            }
+            self.write_ty(t, s);
+            if s.len() > MAX_TYPE_TEXT {
+                return;
+            }
+        }
+    }
+
+    fn write_ty(&self, t: TyId, s: &mut String) {
+        if s.len() > MAX_TYPE_TEXT {
+            return;
+        }
+        match self.types.kind(t) {
+            TyKind::Bool => s.push_str("bool"),
+            TyKind::Int(i) => s.push_str(i.name()),
+            TyKind::Float(f) => s.push_str(f.name()),
+            TyKind::Vec(n) => {
+                let _ = write!(s, "vec{n}");
+            }
+            TyKind::Mat(n) => {
+                let _ = write!(s, "mat{n}");
+            }
+            TyKind::Tuple(ts) => {
+                s.push('(');
+                self.write_list(ts, s);
+                if ts.len() == 1 {
+                    s.push(',');
+                }
+                s.push(')');
+            }
+            TyKind::Array(e, n) => {
+                s.push('[');
+                self.write_ty(*e, s);
+                let _ = write!(s, "; {n}]");
+            }
+            TyKind::Slice(e) => {
+                s.push('[');
+                self.write_ty(*e, s);
+                s.push(']');
+            }
+            TyKind::Adt(a, args) => {
+                s.push_str(&self.adt(*a).name);
+                if !args.is_empty() {
+                    s.push('<');
+                    self.write_list(args, s);
+                    s.push('>');
+                }
+            }
+            TyKind::Param(p) => s.push_str(&self.param(*p).name),
+            TyKind::Projection { self_ty, name, .. } => {
+                self.write_ty(*self_ty, s);
+                s.push_str("::");
+                s.push_str(name);
+            }
+            // The type a function returns that's named by its traits: `impl Surface`.
+            TyKind::Opaque(f, _) => match &self.func(*f).opaque {
+                Some(traits) if !traits.is_empty() => {
+                    let names: Vec<String> =
+                        traits.iter().map(|r| self.display_trait_ref(r)).collect();
+                    let _ = write!(s, "impl {}", names.join(" + "));
+                }
+                _ => {
+                    let _ = write!(s, "the type `{}` returns", self.func(*f).name);
+                }
+            },
+            TyKind::FnPtr(ps, r) => {
+                s.push_str("fn(");
+                self.write_list(ps, s);
+                s.push(')');
+                if *r != self.types.unit {
+                    s.push_str(" -> ");
+                    self.write_ty(*r, s);
+                }
+            }
+            TyKind::Closure(..) => s.push_str("<closure>"),
+            TyKind::FnDef(f, _) => {
+                let _ = write!(s, "fn {}", self.func(*f).name);
+            }
+            TyKind::Var(_) => s.push('_'),
+            TyKind::Never => s.push('!'),
+            TyKind::Error => s.push_str("{error}"),
+        }
     }
 
     pub fn display_trait_ref(&self, r: &TraitRef) -> String {
@@ -139,22 +258,48 @@ impl Program {
         s
     }
 
-    /// The fields of a struct type, with the type's arguments substituted.
-    pub fn struct_fields(&self, adt: AdtId, args: &[TyId]) -> Vec<(String, TyId)> {
-        let def = &self.adts[adt.index()];
-        let subst = Subst::from_pairs(&def.generics, args);
-        let fields: Vec<(String, TyId)> =
-            def.fields().iter().map(|f| (f.name.clone(), f.ty)).collect();
-        fields.into_iter().map(|(n, t)| (n, self.types.subst(t, &subst))).collect()
+    /// The declared fields of a struct (`variant` is `None`) or of one of an enum's variants.
+    pub fn adt_fields(&self, a: AdtId, variant: Option<u32>) -> &[FieldDef] {
+        let def = self.adt(a);
+        match variant {
+            Some(v) => &def.variants()[v as usize].fields,
+            None => def.fields(),
+        }
     }
 
-    /// A variant's fields, substituted.
-    pub fn variant_fields(&self, adt: AdtId, args: &[TyId], variant: usize) -> Vec<(String, TyId)> {
-        let def = &self.adts[adt.index()];
-        let subst = Subst::from_pairs(&def.generics, args);
-        let fields: Vec<(String, TyId)> =
-            def.variants()[variant].fields.iter().map(|f| (f.name.clone(), f.ty)).collect();
-        fields.into_iter().map(|(n, t)| (n, self.types.subst(t, &subst))).collect()
+    /// The fields of a struct or of one of an enum's variants, with the type's arguments
+    /// substituted and projections on them resolved (`k: T::K` with `T = P` is `P`'s `K`).
+    pub fn fields_of(&self, a: AdtId, args: &[TyId], variant: Option<u32>) -> Vec<(String, TyId)> {
+        let subst = Subst::from_pairs(&self.adt(a).generics, args);
+        self.adt_fields(a, variant)
+            .iter()
+            .map(|f| (f.name.clone(), self.field_under(f.ty, &subst)))
+            .collect()
+    }
+
+    /// The type of field `i` of a struct or of one of an enum's variants, as [`Self::fields_of`]
+    /// gives it; `None` if there's no such field.
+    pub fn field_ty(
+        &self,
+        a: AdtId,
+        args: &[TyId],
+        variant: Option<u32>,
+        i: usize,
+    ) -> Option<TyId> {
+        let f = self.adt_fields(a, variant).get(i)?;
+        Some(self.field_under(f.ty, &Subst::from_pairs(&self.adt(a).generics, args)))
+    }
+
+    fn field_under(&self, ty: TyId, subst: &Subst) -> TyId {
+        let t = self.types.subst(ty, subst);
+        // The declared type says whether there's a projection, cheaply: the arguments can be
+        // large.
+        let is_projection = |k: &TyKind| matches!(k, TyKind::Projection { .. });
+        if self.types.any(ty, &mut { is_projection }) {
+            crate::traits::normalize(self, t, None)
+        } else {
+            t
+        }
     }
 
     /// A fix that opts a struct in to a trait in its declaration (`struct S: Trait`), for a
@@ -174,29 +319,5 @@ impl Program {
     /// Whether a module is part of std.
     pub fn is_std(&self, m: ModuleId) -> bool {
         self.modules[m.index()].is_std
-    }
-}
-
-impl TyNames for Program {
-    fn adt_name(&self, a: AdtId) -> String {
-        self.adts[a.index()].name.clone()
-    }
-    fn param_name(&self, p: ParamId) -> String {
-        self.params[p.index()].name.clone()
-    }
-    fn fn_name(&self, f: FnId) -> String {
-        self.fns[f.index()].name.clone()
-    }
-    fn trait_name(&self, t: TraitId) -> String {
-        self.traits[t.index()].name.clone()
-    }
-    fn opaque_name(&self, f: FnId) -> String {
-        match &self.fns[f.index()].opaque {
-            Some(traits) if !traits.is_empty() => {
-                let names: Vec<String> = traits.iter().map(|r| self.display_trait_ref(r)).collect();
-                format!("impl {}", names.join(" + "))
-            }
-            _ => format!("the type `{}` returns", self.fns[f.index()].name),
-        }
     }
 }

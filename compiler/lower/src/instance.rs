@@ -51,19 +51,21 @@ impl InstanceKey {
         }
     }
 
+    /// Whether the instance specializes its function by type arguments or callables, the
+    /// parts that polymorphic recursion makes larger at each level.
+    pub fn specializes(&self) -> bool {
+        match self {
+            InstanceKey::Fn { substs, callables, .. } => {
+                !substs.is_empty() || callables.iter().any(Option::is_some)
+            }
+            InstanceKey::Closure { .. } | InstanceKey::Derived { .. } => false,
+        }
+    }
+
     pub fn substs(&self) -> &[TyId] {
         match self {
             InstanceKey::Fn { substs, .. } => substs,
             InstanceKey::Closure { owner, .. } => owner.substs(),
-            InstanceKey::Derived { .. } => &[],
-        }
-    }
-
-    /// The function-typed arguments in scope in this instance's body.
-    pub fn callables(&self) -> &[Option<Callable>] {
-        match self {
-            InstanceKey::Fn { callables, .. } => callables,
-            InstanceKey::Closure { owner, .. } => owner.callables(),
             InstanceKey::Derived { .. } => &[],
         }
     }
@@ -73,6 +75,18 @@ impl InstanceKey {
             InstanceKey::Fn { resources, .. } => resources,
             InstanceKey::Closure { owner, .. } => owner.resources(),
             InstanceKey::Derived { .. } => &[],
+        }
+    }
+}
+
+impl Callable {
+    /// The instance that a call of it runs.
+    pub fn instance_key(&self) -> InstanceKey {
+        match self {
+            Callable::Closure { owner, id } => {
+                InstanceKey::Closure { owner: owner.clone(), id: *id }
+            }
+            Callable::Func { func, substs } => InstanceKey::plain(*func, substs.clone()),
         }
     }
 }

@@ -29,7 +29,10 @@
 //!
 //! IDENT excludes the keywords (through a trie: a regular grammar for the complement) and `_`.
 //! Tier-1 tokens (STRING, SUFFIXED) are left out: the checker rejects them in tier 0. An INT
-//! after `.` (a tuple index) is limited to four digits so it always fits in `u32`.
+//! after `.` (a tuple index) is limited to four digits so it always fits in `u32`. It's a
+//! terminal of its own here, written right after its `.`, since another `.` may then touch it
+//! (`t.0.1`); a number takes a `.` only when a digit follows it (L12), so before `.` and a name
+//! no number needs a space (`2.0.sqrt()`).
 //!
 //! The result is meant to be sound, not complete: every string it generates should parse, which
 //! the tests check by sampling (see [`crate::sampler`]); and it accepts the formatter's layout
@@ -37,9 +40,10 @@
 
 use crate::cfg::{Cfg, Recursion, Sym};
 use crate::ebnf::{Grammar, Terminal};
-use crate::generate::{lexer_kind, no_glue_pairs};
+use crate::generate::{glued_gt, is_number, is_word, no_glue_pairs};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
+use std::path::{Path, PathBuf};
 use wrela_syntax::TokenKind;
 
 /// The innermost open bracket.
@@ -52,13 +56,16 @@ enum Ctx {
 }
 
 /// The class of the previous token: a number, another word, or punctuation; and whether it can
-/// end a statement (L17). Numbers are their own class because `.` can't follow them directly
-/// (`1.0` is a FLOAT), while it can follow any other word.
+/// end a statement (L17). Numbers are their own class because `.` and a digit can't follow them
+/// directly (`1.0` is a FLOAT), while they can follow any other word; a tuple index is a class
+/// of its own because they can follow it (`t.0.1`, L12).
 /// `|` and `||` are a class of their own because a closure can start right after one (a closure
 /// whose body is a closure), and `|` `|` would lex as `||`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 enum Prev {
     Nc,
+    /// A tuple index.
+    Ti,
     Wc,
     Wn,
     Pc,
@@ -66,7 +73,7 @@ enum Prev {
     Bar,
 }
 
-const PREVS: [Prev; 6] = [Prev::Nc, Prev::Wc, Prev::Wn, Prev::Pc, Prev::Pn, Prev::Bar];
+const PREVS: [Prev; 7] = [Prev::Nc, Prev::Ti, Prev::Wc, Prev::Wn, Prev::Pc, Prev::Pn, Prev::Bar];
 
 impl Prev {
     fn bit(self) -> u8 {
@@ -74,12 +81,13 @@ impl Prev {
     }
 
     fn can_end(self) -> bool {
-        matches!(self, Prev::Nc | Prev::Wc | Prev::Pc)
+        matches!(self, Prev::Nc | Prev::Ti | Prev::Wc | Prev::Pc)
     }
 
     fn code(self) -> &'static str {
         match self {
             Prev::Nc => "nc",
+            Prev::Ti => "ti",
             Prev::Wc => "wc",
             Prev::Wn => "wn",
             Prev::Pc => "pc",
@@ -90,21 +98,17 @@ impl Prev {
 }
 
 fn class(t: Terminal) -> Prev {
-    let k = lexer_kind(t);
-    match k {
-        TokenKind::Int | TokenKind::Float | TokenKind::Suffixed => return Prev::Nc,
-        TokenKind::Pipe | TokenKind::OrOr => return Prev::Bar,
-        _ => {}
+    let k = t.lexer_kind();
+    if t == Terminal::TupleIndex {
+        return Prev::Ti;
     }
-    let word = matches!(
-        k,
-        TokenKind::Ident
-            | TokenKind::Int
-            | TokenKind::Float
-            | TokenKind::Suffixed
-            | TokenKind::Underscore
-    ) || k.is_keyword();
-    match (word, k.can_end_statement()) {
+    if is_number(k) {
+        return Prev::Nc;
+    }
+    if matches!(k, TokenKind::Pipe | TokenKind::OrOr) {
+        return Prev::Bar;
+    }
+    match (is_word(k), k.can_end_statement()) {
         (true, true) => Prev::Wc,
         (true, false) => Prev::Wn,
         (false, true) => Prev::Pc,
@@ -114,6 +118,9 @@ fn class(t: Terminal) -> Prev {
 
 const NEWLINE: Terminal = Terminal::Token(TokenKind::Newline);
 const EOF: Terminal = Terminal::Token(TokenKind::Eof);
+const DOT: Terminal = Terminal::Token(TokenKind::Dot);
+const IDENT: Terminal = Terminal::Token(TokenKind::Ident);
+const INT: Terminal = Terminal::Token(TokenKind::Int);
 
 /// What can't be exported faithfully.
 #[derive(Debug)]
@@ -149,18 +156,9 @@ struct Specializer<'a> {
 }
 
 fn opener(t: Terminal) -> Option<Ctx> {
-    match lexer_kind(t) {
+    match t.lexer_kind() {
         TokenKind::LBrace => Some(Ctx::Brace),
         TokenKind::LParen | TokenKind::LBracket => Some(Ctx::Paren),
-        _ => None,
-    }
-}
-
-fn closer_of(t: Terminal) -> Option<TokenKind> {
-    match lexer_kind(t) {
-        TokenKind::RBrace => Some(TokenKind::LBrace),
-        TokenKind::RParen => Some(TokenKind::LParen),
-        TokenKind::RBracket => Some(TokenKind::LBracket),
         _ => None,
     }
 }
@@ -177,8 +175,8 @@ fn bracket_contexts(cfg: &Cfg) -> Result<Vec<Vec<Option<Ctx>>>, ExportError> {
             ctxs.push(here);
             if let Sym::T(t) = s {
                 if opener(*t).is_some() {
-                    stack.push(lexer_kind(*t));
-                } else if let Some(open) = closer_of(*t)
+                    stack.push(t.lexer_kind());
+                } else if let Some(open) = t.lexer_kind().opener()
                     && stack.pop() != Some(open)
                 {
                     return Err(ExportError(format!(
@@ -216,8 +214,9 @@ impl Specializer<'_> {
 
     /// The classes production `p`, started after a `prev` token in `ctx`, can end in.
     fn production_outs(&mut self, p: usize, ctx: Ctx, prev: Prev) -> u8 {
+        let cfg = self.cfg;
         let mut cur = prev.bit();
-        for (i, s) in self.cfg.prods[p].rhs.clone().iter().enumerate() {
+        for (i, s) in cfg.prods[p].rhs.iter().enumerate() {
             let c = self.inner[p][i].unwrap_or(ctx);
             let mut next = 0;
             for s_prev in PREVS {
@@ -242,13 +241,14 @@ impl Specializer<'_> {
     }
 
     fn solve(&mut self) {
-        self.outs.insert((self.cfg.start, Ctx::Brace, Prev::Pn), 0);
+        let cfg = self.cfg;
+        self.outs.insert((cfg.start, Ctx::Brace, Prev::Pn), 0);
         loop {
             let keys: Vec<_> = self.outs.keys().copied().collect();
             let mut changed = false;
             for &(nt, ctx, prev) in &keys {
                 let mut mask = 0;
-                for &p in &self.cfg.nts[nt].prods.clone() {
+                for &p in &cfg.nts[nt].prods {
                     mask |= self.production_outs(p, ctx, prev);
                 }
                 let old = self.outs[&(nt, ctx, prev)];
@@ -321,17 +321,21 @@ impl Specializer<'_> {
 /// the file".
 struct TermSet {
     terms: Vec<Terminal>,
+    /// Each terminal's bit.
+    index: HashMap<Terminal, u32>,
 }
 
 impl TermSet {
     const START: u128 = 1 << 127;
 
+    fn new(terms: Vec<Terminal>) -> TermSet {
+        assert!(terms.len() < 127, "too many terminals for the bitmask");
+        let index = terms.iter().enumerate().map(|(i, t)| (*t, i as u32)).collect();
+        TermSet { terms, index }
+    }
+
     fn bit(&self, t: Terminal) -> u128 {
-        1 << self
-            .terms
-            .iter()
-            .position(|x| *x == t)
-            .unwrap_or_else(|| unreachable!("unknown terminal"))
+        1 << self.index.get(&t).unwrap_or_else(|| unreachable!("unknown terminal"))
     }
 
     fn members(&self, mask: u128) -> impl Iterator<Item = Terminal> + '_ {
@@ -389,15 +393,18 @@ impl Specialized {
 
     /// For each variant, the terminals it can end with; and for each, the terminals (and the
     /// file start) that can come right before it.
-    fn last_and_precede(&self, ts: &TermSet) -> (HashMap<Key, u128>, HashMap<Key, u128>) {
-        let nullable = self.nullable();
+    fn last_and_precede(
+        &self,
+        ts: &TermSet,
+        nullable: &HashSet<Key>,
+    ) -> (HashMap<Key, u128>, HashMap<Key, u128>) {
         let mut last: HashMap<Key, u128> = self.rules.keys().map(|k| (*k, 0)).collect();
         loop {
             let mut changed = false;
             for (k, alts) in &self.rules {
                 let mut m = 0;
                 for a in alts {
-                    m |= Self::scan_back(a, a.len(), &last, &nullable, ts).0;
+                    m |= Self::scan_back(a, a.len(), &last, nullable, ts).0;
                 }
                 if last[k] | m != last[k] {
                     last.insert(*k, last[k] | m);
@@ -416,7 +423,7 @@ impl Specialized {
                 for a in alts {
                     for (i, s) in a.iter().enumerate() {
                         if let SSym::N(n) = s {
-                            let (m, reached_start) = Self::scan_back(a, i, &last, &nullable, ts);
+                            let (m, reached_start) = Self::scan_back(a, i, &last, nullable, ts);
                             let m = if reached_start { m | precede[k] } else { m };
                             if precede[n] | m != precede[n] {
                                 precede.insert(*n, precede[n] | m);
@@ -455,8 +462,11 @@ impl Specialized {
         (m, true)
     }
 
-    fn check_no_left_recursion(&self, names: &impl Fn(Key) -> String) -> Result<(), ExportError> {
-        let nullable = self.nullable();
+    fn check_no_left_recursion(
+        &self,
+        nullable: &HashSet<Key>,
+        names: &impl Fn(Key) -> String,
+    ) -> Result<(), ExportError> {
         let left: HashMap<Key, Vec<Key>> = self
             .rules
             .iter()
@@ -497,9 +507,61 @@ impl Specialized {
     }
 }
 
+/// Makes each INT right after a `.` a [`Terminal::TupleIndex`]. A group of single terminals
+/// right after a `.` (`"." (IDENT | INT)`) is first spread into one production per terminal, so
+/// the `.` in each knows what follows it.
+fn mark_tuple_indexes(cfg: &mut Cfg) {
+    let single = |cfg: &Cfg, n: usize| -> Option<Vec<Sym>> {
+        let nt = &cfg.nts[n];
+        let alts: Vec<Sym> = nt
+            .prods
+            .iter()
+            .map(|&q| match cfg.prods[q].rhs.as_slice() {
+                [s @ Sym::T(_)] => Some(*s),
+                _ => None,
+            })
+            .collect::<Option<_>>()?;
+        nt.synthetic.then_some(alts)
+    };
+    let mut p = 0;
+    while p < cfg.prods.len() {
+        let rhs = cfg.prods[p].rhs.clone();
+        let spread = rhs.windows(2).enumerate().find_map(|(i, w)| match w {
+            [Sym::T(DOT), Sym::N(n)] => single(cfg, *n).map(|alts| (i + 1, alts)),
+            _ => None,
+        });
+        if let Some((at, alts)) = spread {
+            let lhs = cfg.prods[p].lhs;
+            for (j, s) in alts.into_iter().enumerate() {
+                let mut r = rhs.clone();
+                r[at] = s;
+                if j == 0 {
+                    cfg.prods[p].rhs = r;
+                } else {
+                    cfg.nts[lhs].prods.push(cfg.prods.len());
+                    cfg.prods.push(crate::cfg::Prod { lhs, rhs: r });
+                }
+            }
+            continue;
+        }
+        for i in 1..rhs.len() {
+            if rhs[i - 1] == Sym::T(DOT) && rhs[i] == Sym::T(INT) {
+                cfg.prods[p].rhs[i] = Sym::T(Terminal::TupleIndex);
+            }
+        }
+        p += 1;
+    }
+}
+
+/// Where the export of spec/grammar.ebnf is checked in: spec/wrela.gbnf.
+pub fn spec_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../spec/wrela.gbnf")
+}
+
 /// The GBNF text for spec/grammar.ebnf.
 pub fn export(g: &Grammar) -> Result<String, ExportError> {
-    let cfg = Cfg::lower(g, Recursion::Right);
+    let mut cfg = Cfg::lower(g, Recursion::Right);
+    mark_tuple_indexes(&mut cfg);
     let inner = bracket_contexts(&cfg)?;
     let excluded: HashSet<Terminal> =
         [Terminal::Token(TokenKind::Str), Terminal::Token(TokenKind::Suffixed)]
@@ -535,6 +597,7 @@ pub fn export(g: &Grammar) -> Result<String, ExportError> {
     }
     let mut spec = Specialized { rules, root };
     spec.remove_empty();
+    let nullable = spec.nullable();
 
     let names = |k: Key| -> String {
         let (nt, ctx, prev, last) = k;
@@ -542,7 +605,7 @@ pub fn export(g: &Grammar) -> Result<String, ExportError> {
         let c = if ctx == Ctx::Brace { "b" } else { "p" };
         format!("{base}-{c}-{}-{}", prev.code(), last.code())
     };
-    spec.check_no_left_recursion(&names)?;
+    spec.check_no_left_recursion(&nullable, &names)?;
     let mut seen_names = HashSet::new();
     for k in spec.rules.keys() {
         if !seen_names.insert(names(*k)) {
@@ -550,35 +613,37 @@ pub fn export(g: &Grammar) -> Result<String, ExportError> {
         }
     }
 
-    let ts = TermSet { terms: g.terminals() };
-    assert!(ts.terms.len() < 127, "too many terminals for the bitmask");
-    let (last, precede) = spec.last_and_precede(&ts);
+    let mut terminals = g.terminals();
+    terminals.push(Terminal::TupleIndex);
+    let ts = TermSet::new(terminals);
+    let (last, precede) = spec.last_and_precede(&ts, &nullable);
     let no_glue = no_glue_pairs();
     let merges = |a: Terminal, b: Terminal| {
         // L16: a GT_CLOSE written right before `>`, `=`, `>=` or another GT_CLOSE makes a
         // `>>`, `>=` or `>>=` token, which the parser splits back where it expects GT_CLOSE.
-        if a == Terminal::GtClose
-            && matches!(
-                b,
-                Terminal::GtClose | Terminal::Token(TokenKind::Gt | TokenKind::Eq | TokenKind::Ge)
-            )
-        {
+        if a == Terminal::GtClose && glued_gt(TokenKind::Gt, b.lexer_kind()).is_some() {
             return false;
         }
-        no_glue.contains(&(lexer_kind(a), lexer_kind(b)))
+        // L12: a number directly after a `.` takes no `.`.
+        if a == Terminal::TupleIndex && b == DOT {
+            return false;
+        }
+        no_glue.contains(&(a.lexer_kind(), b.lexer_kind()))
     };
-    let nullable = spec.nullable();
 
+    // Each rule's body, as the words of its GBNF text.
     let mut rules: Vec<(String, Vec<String>)> = Vec::new();
     for (k, alts) in &spec.rules {
-        let mut rendered = Vec::new();
+        let mut parts: Vec<String> = Vec::new();
         let mut has_empty = false;
         for a in alts {
             if a.is_empty() {
                 has_empty = true;
                 continue;
             }
-            let mut parts = Vec::new();
+            if !parts.is_empty() {
+                parts.push("|".into());
+            }
             for (i, s) in a.iter().enumerate() {
                 match *s {
                     SSym::N(n) => parts.push(names(n)),
@@ -597,9 +662,15 @@ pub fn export(g: &Grammar) -> Result<String, ExportError> {
                             ));
                         }
                         let preds: Vec<Terminal> = ts.members(before).collect();
-                        let mandatory = preds.iter().any(|p| merges(*p, t));
-                        let line_breaks =
-                            ctx == Ctx::Paren || !prev.can_end() || lexer_kind(t) == TokenKind::Dot;
+                        // L12: a number takes a `.` only when a digit follows the `.`.
+                        let dot_then_name =
+                            t == DOT && matches!(a.get(i + 1), Some(SSym::T(n, ..)) if *n == IDENT);
+                        let mandatory = preds.iter().any(|p| {
+                            merges(*p, t) && !(dot_then_name && is_number(p.lexer_kind()))
+                        });
+                        let line_breaks = ctx == Ctx::Paren
+                            || !prev.can_end()
+                            || t.lexer_kind() == TokenKind::Dot;
                         // A gap may start with a comment unless a `/` can come before it.
                         let slash = preds.contains(&Terminal::Token(TokenKind::Slash));
                         let gap = if line_breaks {
@@ -613,25 +684,24 @@ pub fn export(g: &Grammar) -> Result<String, ExportError> {
                         } else {
                             "sp"
                         };
-                        parts.push(gap.into());
+                        // L12 keeps a `.` out of a number only when it's directly after a `.`
+                        // token: a tuple index touches its `.`.
+                        if t != Terminal::TupleIndex {
+                            parts.push(gap.into());
+                        }
                         if t != EOF {
-                            parts.push(terminal_text(
-                                t,
-                                preds.iter().any(|p| lexer_kind(*p) == TokenKind::Dot),
-                            ));
+                            parts.push(terminal_text(t));
                         }
                     }
                 }
             }
-            rendered.push(parts.join(" "));
         }
-        let body = rendered.join(" | ");
-        let body = match (has_empty, rendered.len()) {
-            (false, _) => body,
-            (true, 0) => unreachable!("an empty-only variant survived"),
-            (true, _) => format!("( {body} )?"),
-        };
-        rules.push((names(*k), body.split(' ').map(str::to_string).collect()));
+        if has_empty {
+            assert!(!parts.is_empty(), "an empty-only variant survived");
+            parts.insert(0, "(".into());
+            parts.push(")?".into());
+        }
+        rules.push((names(*k), parts));
     }
     let root_name = merge_identical_rules(&mut rules, &names(spec.root));
 
@@ -680,10 +750,10 @@ fn merge_identical_rules(rules: &mut Vec<(String, Vec<String>)>, root: &str) -> 
     }
 }
 
-fn terminal_text(t: Terminal, after_dot: bool) -> String {
+fn terminal_text(t: Terminal) -> String {
     match t {
         Terminal::Token(TokenKind::Ident) => "ident".into(),
-        Terminal::Token(TokenKind::Int) if after_dot => "tuple-index".into(),
+        Terminal::TupleIndex => "tuple-index".into(),
         Terminal::Token(TokenKind::Int) => "int".into(),
         Terminal::Token(TokenKind::Float) => "float".into(),
         t => {
@@ -699,8 +769,8 @@ const HEADER: &str = "\
 #
 # The rules are the grammar's, specialized on context. `name-B-X-Y` is `name` inside bracket B
 # (b: `{` or none, p: `(` or `[`), after a token of class X, ending with a token of class Y.
-# Classes (spec/lexical.md L17): nc a number; wc, wn another word; pc, pn punctuation (c: can end
-# a statement, n: can't); bar `|` or `||`. NEWLINE is `nl`, a real line break. The gaps between
+# Classes (spec/lexical.md L17): nc a number; ti a tuple index; wc, wn another word; pc, pn
+# punctuation (c: can end a statement, n: can't); bar `|` or `||`. NEWLINE is `nl`, a real line break. The gaps between
 # tokens are `sp` (spaces and tabs), `ws` (also line breaks and comments), `lead` (`ws` that may
 # start with a comment), and `sp1`/`ws1` (nonempty, where the tokens would otherwise merge).
 # Strings and unit suffixes (tier 1) are left out.

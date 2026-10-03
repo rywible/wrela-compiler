@@ -1,5 +1,5 @@
-// `len()` of runs and arrays (compiler/tests/tests/render.rs): on the CPU, and of a storage
-// buffer on the GPU.
+// `len()` of runs and arrays (compiler/tests/tests/suite/render.rs): on the CPU, and of a
+// storage buffer on the GPU.
 use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch, write}
 
 fn sum(xs: [f32]) -> f32 {

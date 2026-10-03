@@ -1,0 +1,46 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0103",
+      "file": "main.wrela",
+      "fixes": [
+        {
+          "edits": [
+            {
+              "end": 147,
+              "file": "main.wrela",
+              "replacement": "    // the one we have\n",
+              "start": 147
+            },
+            {
+              "end": 191,
+              "file": "main.wrela",
+              "replacement": " ",
+              "start": 163
+            }
+          ],
+          "message": "join the lines"
+        }
+      ],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "a line can't start with the binary operator `>`",
+      "notes": [
+        "a line break ends a statement; an operator that continues an expression goes at the end of the line before (D-079)"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 9,
+        "end": 192,
+        "end_column": 10,
+        "end_line": 6,
+        "line": 6,
+        "start": 191
+      },
+      "title": "a binary operator at the start of a line"
+    }
+  ],
+  "version": 2
+}

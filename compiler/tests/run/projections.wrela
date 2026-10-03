@@ -4,6 +4,7 @@
 // expect: proj_if(1) = 5.0
 // expect: proj_if(0) = 6.0
 // expect: proj_chain() = 7.0
+// expect: proj_mixed() = 4.0
 
 struct World {
     a: [f32; 2],
@@ -47,4 +48,18 @@ pub fn proj_chain() -> f32 {
     mut b = a
     b[1] = 7.0
     w.a[1]
+}
+
+fn pick_from(a: mut World, b: World) -> mut f32 {
+    mut a.b
+}
+
+// The result may point into `b` too, but only `a` was lent `mut`: `b` can still be read.
+pub fn proj_mixed() -> f32 {
+    var a = mk()
+    let b = mk()
+    mut x = pick_from(mut a, b)
+    let y = b.b
+    x += y - 2.0
+    a.b
 }

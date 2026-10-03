@@ -1,0 +1,68 @@
+// run: a `()` is a value: a tuple, struct, variant, array or call it's part of is whole, and runs its effects
+// expect: in_tuple(2.5) = 2.5
+// expect: in_struct(2.5) = 2.5
+// expect: in_variant(2.5) = 2.5
+// expect: generic_variant() = 1
+// expect: unit_arg(2.5) = 2.5
+// expect: call_arg(2.5) = 2.5
+// expect: effects() = 4
+
+struct W<T> {
+    a: f32,
+    t: T,
+}
+
+fn bump(c: mut u32) {
+    c += 1
+}
+
+fn nothing() {}
+
+fn second(u: (), x: f32) -> f32 {
+    x
+}
+
+fn some<T>(o: Option<T>) -> u32 {
+    match o {
+        Some(_) => 1,
+        None => 0,
+    }
+}
+
+pub fn in_tuple(x: f32) -> f32 {
+    let t = (x, ())
+    t.0
+}
+
+pub fn in_struct(x: f32) -> f32 {
+    let w = W { a: x, t: () }
+    w.a
+}
+
+pub fn in_variant(x: f32) -> f32 {
+    let o = Some(())
+    match o {
+        Some(_) => x,
+        None => 0.0,
+    }
+}
+
+pub fn generic_variant() -> u32 {
+    some(Some(()))
+}
+
+pub fn unit_arg(x: f32) -> f32 {
+    second((), x)
+}
+
+pub fn call_arg(x: f32) -> f32 {
+    second(nothing(), x)
+}
+
+pub fn effects() -> u32 {
+    var c = 0
+    let _t = ((), bump(mut c))
+    let _a = [bump(mut c), bump(mut c)]
+    let _w = W { a: 1.0, t: bump(mut c) }
+    c
+}

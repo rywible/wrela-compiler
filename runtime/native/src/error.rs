@@ -2,6 +2,7 @@
 
 use std::fmt;
 use std::path::PathBuf;
+use wrela_abi::check::CommandError;
 use wrela_abi::manifest::ManifestError;
 use wrela_abi::stream::{Opcode, StreamError};
 
@@ -74,6 +75,12 @@ impl std::error::Error for Error {
 impl From<StreamError> for Error {
     fn from(e: StreamError) -> Error {
         Error::Stream(e)
+    }
+}
+
+impl From<CommandError> for Error {
+    fn from(e: CommandError) -> Error {
+        Error::Command { opcode: e.opcode, why: e.why }
     }
 }
 

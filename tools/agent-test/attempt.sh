@@ -8,8 +8,11 @@ set -euo pipefail
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 task="$(cd "$1" && pwd)"
 pkg="$task/pkg"
-wrela="$root/target/release/wrela"
-[ -x "$wrela" ] || (cd "$root" && cargo build -q --release -p wrela)
+# Brought up to date every time: an old binary would test an old compiler.
+(cd "$root" && cargo build -q --release -p wrela)
+target="${CARGO_TARGET_DIR:-target}"
+case "$target" in /*) ;; *) target="$root/$target" ;; esac
+wrela="$target/release/wrela"
 n=1
 while [ -d "$task/attempts/$n" ]; do n=$((n + 1)); done
 log="$task/attempts/$n"

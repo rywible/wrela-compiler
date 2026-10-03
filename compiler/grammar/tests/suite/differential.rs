@@ -9,23 +9,27 @@
 use crate::common;
 
 use std::sync::Mutex;
-use wrela_grammar::agree::{Checker, round_trip};
+use wrela_grammar::agree::Checker;
 use wrela_grammar::differential::{RunConfig, run};
 use wrela_grammar::earley::Scratch;
+use wrela_grammar::testing::{par_each, sized, with_big_stack};
+use wrela_syntax::fmt::check_round_trip;
 
 const SEED: u64 = 0xac5;
 
 #[test]
 fn generated_programs_agree() {
     let checker = Checker::default();
-    let mut cfg = RunConfig::new(common::sized(2000, 3000), SEED);
+    let mut cfg = RunConfig::new(sized(2000, 3000), SEED);
     cfg.round_trip = false;
     let stats = run(&checker, &cfg);
     let report = stats.report(&checker);
     println!("{report}");
     assert_eq!(stats.disagreements, 0, "the oracle and the parser disagree:\n{report}");
     // Generated programs are rejected only when the lexer drops a NEWLINE the derivation
-    // needed; if that became common, the test would be checking little.
+    // needed: any other rejection is a failure. If that became common, the test would be
+    // checking little.
+    assert_eq!(stats.wrongly_rejected, 0, "valid programs were rejected:\n{report}");
     assert!(
         stats.accepted * 100 >= stats.programs * 95,
         "too few generated programs are valid:\n{report}"
@@ -44,7 +48,7 @@ fn generated_programs_agree() {
 fn generated_programs_round_trip_through_the_formatter() {
     let checker = Checker::default();
     // The oracle is checked above; this run is about the formatter, so it can be bigger.
-    let programs = common::sized(3000, 10_000);
+    let programs = sized(3000, 10_000);
     let mut cfg = RunConfig::new(programs, SEED + 1);
     cfg.oracle = false;
     let stats = run(&checker, &cfg);
@@ -60,14 +64,14 @@ fn the_conformance_suite_and_the_standard_library_agree() {
     println!("{} .wrela files under compiler/", files.len());
     let checker = Checker::default();
     let failures = Mutex::new(Vec::new());
-    common::par_each(&files, Scratch::default, |scratch, path| {
+    par_each(&files, Scratch::default, |scratch, path| {
         let src =
             std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
         let check = checker.check(&src, scratch);
         let failure = if let Some(d) = check.disagreement {
             Some(format!("{}: {d}", path.display()))
-        } else if check.accepted && !check.lexical_errors {
-            round_trip(&src).err().map(|e| format!("{}: {e}", path.display()))
+        } else if check.accepted && !check.limited && !check.lexical_errors {
+            check_round_trip(&check.parsed, &src).err().map(|e| format!("{}: {e}", path.display()))
         } else {
             None
         };
@@ -81,7 +85,7 @@ fn the_conformance_suite_and_the_standard_library_agree() {
 #[test]
 fn the_round_trip_sample_agrees() {
     let src = common::roundtrip_sample();
-    common::with_big_stack(|| {
+    with_big_stack(|| {
         let check = Checker::default().check(&src, &mut Scratch::default());
         assert_eq!(check.disagreement, None);
         assert!(check.accepted && !check.lexical_errors);
@@ -114,6 +118,7 @@ fn edge_cases_agree() {
         "struct S {\n    a: f32 = 1.0\n}",
         "const N: (u32, [f32]) = (1, [2.0; 3])",
         "fn f() { return return }",
+        "fn f() { match s { S { .., } => 1, T { a, .., } => 2 } }",
     ];
     let invalid = [
         "fn f() { a < b < c }",
@@ -129,6 +134,8 @@ fn edge_cases_agree() {
         "fn f() -> A<B>>> {}",
         "fn f() { 1 + return }",
         "struct S { a: f32\n b: f32 }",
+        "impl X { @a type Y = Z }",
+        "impl X { pub type Y = Z }",
     ];
     let checker = Checker::default();
     let mut scratch = Scratch::default();

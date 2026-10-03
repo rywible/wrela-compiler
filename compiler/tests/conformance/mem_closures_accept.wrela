@@ -7,3 +7,15 @@ fn f(scale: f32) -> f32 {
     let k = 2.0
     apply(|x| x * k * scale, 3.0) + apply(|x| x + 1.0, 1.0)
 }
+
+fn triple(x: f32) -> f32 {
+    x * 3.0
+}
+
+// A closure or a named function bound with `let`, bound again, and called.
+fn named(x: f32) -> f32 {
+    let h = triple
+    let c = |v: f32| h(v) + 1.0
+    let d = c
+    h(x) + d(x) + apply(h, x)
+}

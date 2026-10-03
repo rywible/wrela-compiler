@@ -3,8 +3,13 @@
 //! compiler bugs, reported as such.
 //!
 //! - Types keep the IR's layout (`wrela_ir::layout`), so struct member offsets in the WGSL are
-//!   the offsets the CPU wrote uniforms with.
+//!   the offsets the CPU wrote uniforms with. An enum is the one exception: WGSL has no unions,
+//!   so it's a struct of its tag and every payload, and types that hold one are laid out
+//!   around that struct. An enum is never `GpuData`, so those types never cross to the CPU.
 //! - Every IR value becomes a named WGSL `let`, so evaluation order is the IR's exactly.
+//! - No operation is a WGSL const-expression: WGSL evaluates those when the shader is created,
+//!   and rejects `1.0 / 0.0` or a shift by 40 there, where language.md §11 promises the values
+//!   WGSL defines at run time. A constant operand that would make one goes through a variable.
 //! - Only entry points are written: GPU modules arrive flattened (`wrela_ir::opt` inlines
 //!   every call), so a call here is a compiler bug.
 
@@ -14,20 +19,53 @@ use naga::{
     LocalVariable, MathFunction, ResourceBinding, Sampling, Scalar, ScalarKind, ShaderStage, Span,
     Statement, StorageAccess, StructMember, Type, TypeInner, UnaryOperator, VectorSize,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use wrela_ir as ir;
-use wrela_ir::layout::{array_stride, field_offsets, layout};
+use wrela_ir::layout::{Layout, pack_layouts, round_up};
 
 type R<T> = Result<T, String>;
 
 const CALL: &str = "internal: a call in a GPU module, which should have been flattened";
 
+/// A GPU module written as WGSL.
+#[derive(Clone, Debug)]
+pub struct Wgsl {
+    pub text: String,
+    /// Each entry point's name in `text`, in the module's order. The WGSL writer renames
+    /// identifiers that are WGSL keywords or builtins, end in a digit, or are used twice.
+    pub entry_points: Vec<String>,
+}
+
 /// Writes a GPU module as validated WGSL.
-pub fn emit(m: &ir::Module) -> R<String> {
+pub fn emit(m: &ir::Module) -> R<Wgsl> {
     let module = to_naga(m)?;
     let info = validate(&module)?;
-    naga::back::wgsl::write_string(&module, &info, naga::back::wgsl::WriterFlags::empty())
-        .map_err(|e| format!("internal: writing WGSL failed: {e}"))
+    let text =
+        naga::back::wgsl::write_string(&module, &info, naga::back::wgsl::WriterFlags::empty())
+            .map_err(|e| format!("internal: writing WGSL failed: {e}"))?;
+    let entry_points = entry_point_names(&module);
+    if let Some(n) = entry_points.iter().find(|n| !text.contains(&format!("fn {n}("))) {
+        return Err(format!("internal: the WGSL writer didn't name an entry point `{n}`"));
+    }
+    Ok(Wgsl { text, entry_points })
+}
+
+/// The names naga's WGSL writer gives a module's entry points: its namer, set up as the writer
+/// sets it up (naga 30's `back::wgsl::Writer::reset`). `emit` checks them against the text.
+fn entry_point_names(module: &naga::Module) -> Vec<String> {
+    use naga::keywords::wgsl::{BUILTIN_IDENTIFIER_SET, RESERVED_SET};
+    let mut names = naga::FastHashMap::default();
+    naga::proc::Namer::default().reset(
+        module,
+        &RESERVED_SET,
+        &BUILTIN_IDENTIFIER_SET,
+        naga::proc::CaseInsensitiveKeywordSet::empty(),
+        &["__", "_naga"],
+        &mut names,
+    );
+    (0..module.entry_points.len())
+        .map(|i| names.get(&naga::proc::NameKey::EntryPoint(i as _)).cloned().unwrap_or_default())
+        .collect()
 }
 
 /// Validates a naga module as WebGPU will.
@@ -38,10 +76,6 @@ pub fn validate(module: &naga::Module) -> R<naga::valid::ModuleInfo> {
     );
     v.validate(module)
         .map_err(|e| format!("internal: the generated shader is invalid: {}", e.emit_to_string("")))
-}
-
-fn sanitize(name: &str) -> String {
-    ir::ident(name)
 }
 
 /// The struct member that holds field `k` of a value of type `t`: for an enum, its tag, or the
@@ -77,14 +111,22 @@ struct Cx<'m> {
     m: &'m ir::Module,
     out: naga::Module,
     types: HashMap<ir::TypeId, Handle<Type>>,
-    globals: Vec<Option<Handle<GlobalVariable>>>,
+    /// Each type's layout in the WGSL, and its members' offsets.
+    layouts: HashMap<ir::TypeId, (Layout, Vec<u32>)>,
+    globals: Vec<Handle<GlobalVariable>>,
 }
 
 pub fn to_naga(m: &ir::Module) -> R<naga::Module> {
-    let mut cx = Cx { m, out: naga::Module::default(), types: HashMap::new(), globals: Vec::new() };
+    let mut cx = Cx {
+        m,
+        out: naga::Module::default(),
+        types: HashMap::new(),
+        layouts: HashMap::new(),
+        globals: Vec::new(),
+    };
     for r in &m.resources {
         let g = cx.global(r)?;
-        cx.globals.push(Some(g));
+        cx.globals.push(g);
     }
     for e in m.entry_points.iter() {
         let func = cx.function(e)?;
@@ -94,7 +136,7 @@ pub fn to_naga(m: &ir::Module) -> R<naga::Module> {
             ir::Stage::Fragment { .. } => (ShaderStage::Fragment, [0; 3]),
         };
         cx.out.entry_points.push(naga::EntryPoint {
-            name: sanitize(&e.name),
+            name: ir::ident(&e.name),
             stage,
             early_depth_test: None,
             workgroup_size: wg,
@@ -122,64 +164,23 @@ impl<'m> Cx<'m> {
                 (None, TypeInner::Matrix { columns: vsize(n), rows: vsize(n), scalar: Scalar::F32 })
             }
             ir::TypeDef::Array(e, n) => {
-                let base = self.ty(e)?;
-                let size =
-                    std::num::NonZeroU32::new(n).map_or(ArraySize::Dynamic, ArraySize::Constant);
-                (None, TypeInner::Array { base, size, stride: array_stride(&self.m.types, e) })
+                let n = std::num::NonZeroU32::new(n)
+                    .ok_or("internal: a zero-length array in GPU code")?;
+                (None, self.array(e, ArraySize::Constant(n))?)
             }
-            ir::TypeDef::RuntimeArray(e) => {
-                let base = self.ty(e)?;
-                (
-                    None,
-                    TypeInner::Array {
-                        base,
-                        size: ArraySize::Dynamic,
-                        stride: array_stride(&self.m.types, e),
-                    },
-                )
-            }
-            ir::TypeDef::Struct { name, fields } => {
-                let offsets = field_offsets(&self.m.types, t);
+            ir::TypeDef::RuntimeArray(e) => (None, self.array(e, ArraySize::Dynamic)?),
+            ir::TypeDef::Struct { name, .. } | ir::TypeDef::Enum { name, .. } => {
+                let (l, offsets) = self.layout(t);
                 let mut members = Vec::new();
-                for (i, (fname, ft)) in fields.iter().enumerate() {
+                for ((mname, mt), offset) in self.members(t)?.into_iter().zip(offsets) {
                     members.push(StructMember {
-                        name: Some(sanitize(fname)),
-                        ty: self.ty(*ft)?,
-                        binding: None,
-                        offset: offsets[i],
-                    });
-                }
-                (
-                    Some(sanitize(&name)),
-                    TypeInner::Struct { members, span: layout(&self.m.types, t).size },
-                )
-            }
-            // WGSL has no unions: each payload gets its own member, after the tag.
-            ir::TypeDef::Enum { name, variants } => {
-                let u32_ty = self.ty_inner(TypeInner::Scalar(Scalar::U32));
-                let mut members = vec![StructMember {
-                    name: Some("tag".into()),
-                    ty: u32_ty,
-                    binding: None,
-                    offset: 0,
-                }];
-                let mut end = 4u32;
-                let mut align = 4u32;
-                for (vname, payload) in &variants {
-                    let Some(p) = payload else { continue };
-                    let l = layout(&self.m.types, *p);
-                    let offset = ir::layout::round_up(l.align, end);
-                    members.push(StructMember {
-                        name: Some(sanitize(vname)),
-                        ty: self.ty(*p)?,
+                        name: Some(ir::ident(&mname)),
+                        ty: self.ty(mt)?,
                         binding: None,
                         offset,
                     });
-                    end = offset + l.size;
-                    align = align.max(l.align);
                 }
-                let span = ir::layout::round_up(align, end);
-                (Some(sanitize(&name)), TypeInner::Struct { members, span })
+                (Some(ir::ident(&name)), TypeInner::Struct { members, span: l.size })
             }
             ir::TypeDef::Run(_) | ir::TypeDef::Ptr(_) => {
                 return Err("internal: a CPU-only type in GPU code".into());
@@ -197,18 +198,8 @@ impl<'m> Cx<'m> {
                 (AddressSpace::Storage { access: StorageAccess::LOAD }, self.ty(r.ty)?)
             }
             ir::ResourceKind::StorageRead | ir::ResourceKind::StorageReadWrite => {
-                let base = self.ty(r.ty)?;
-                let arr = self.out.types.insert(
-                    Type {
-                        name: None,
-                        inner: TypeInner::Array {
-                            base,
-                            size: ArraySize::Dynamic,
-                            stride: array_stride(&self.m.types, r.ty),
-                        },
-                    },
-                    Span::UNDEFINED,
-                );
+                let inner = self.array(r.ty, ArraySize::Dynamic)?;
+                let arr = self.ty_inner(inner);
                 let access = if r.kind == ir::ResourceKind::StorageRead {
                     StorageAccess::LOAD
                 } else {
@@ -222,7 +213,7 @@ impl<'m> Cx<'m> {
             .then_some(ResourceBinding { group: 0, binding: r.binding });
         Ok(self.out.global_variables.append(
             GlobalVariable {
-                name: Some(sanitize(&r.name)),
+                name: Some(ir::ident(&r.name)),
                 space,
                 binding,
                 ty,
@@ -292,7 +283,7 @@ impl<'m> Cx<'m> {
                 b
             };
             members.push(StructMember {
-                name: Some(sanitize(fname)),
+                name: Some(ir::ident(fname)),
                 ty,
                 binding: Some(binding),
                 offset,
@@ -302,7 +293,7 @@ impl<'m> Cx<'m> {
         }
         let h = self.out.types.insert(
             Type {
-                name: Some(format!("{}_io", sanitize(&name))),
+                name: Some(format!("{}_io", ir::ident(&name))),
                 inner: TypeInner::Struct { members, span: offset.max(16) },
             },
             Span::UNDEFINED,
@@ -311,22 +302,62 @@ impl<'m> Cx<'m> {
     }
 
     fn ty_vec4(&mut self) -> Handle<Type> {
-        self.out.types.insert(
-            Type {
-                name: None,
-                inner: TypeInner::Vector { size: VectorSize::Quad, scalar: Scalar::F32 },
-            },
-            Span::UNDEFINED,
-        )
+        self.ty_inner(TypeInner::Vector { size: VectorSize::Quad, scalar: Scalar::F32 })
     }
 
     fn ty_inner(&mut self, inner: TypeInner) -> Handle<Type> {
         self.out.types.insert(Type { name: None, inner }, Span::UNDEFINED)
     }
 
+    /// An array of `e`: of `size` elements, or a runtime-sized array (`ArraySize::Dynamic`).
+    fn array(&mut self, e: ir::TypeId, size: ArraySize) -> R<TypeInner> {
+        let base = self.ty(e)?;
+        let l = self.layout(e).0;
+        Ok(TypeInner::Array { base, size, stride: round_up(l.align, l.size) })
+    }
+
+    /// The members of a struct, or of an enum as WGSL holds it: its tag, then each payload.
+    fn members(&self, t: ir::TypeId) -> R<Vec<(String, ir::TypeId)>> {
+        match self.m.types.get(t) {
+            ir::TypeDef::Struct { fields, .. } => Ok(fields.clone()),
+            ir::TypeDef::Enum { variants, .. } => {
+                let tag = self.m.types.field(t, 0).ok_or("internal: an enum's tag type")?;
+                Ok(std::iter::once(("tag".to_string(), tag))
+                    .chain(variants.iter().filter_map(|(v, p)| Some((v.clone(), (*p)?))))
+                    .collect())
+            }
+            _ => Err("internal: members of a type that has none".into()),
+        }
+    }
+
+    /// A type's layout in the WGSL, and its members' offsets: the IR's (WGSL's rules), but
+    /// with each enum laid out as the struct WGSL holds it in.
+    fn layout(&mut self, t: ir::TypeId) -> (Layout, Vec<u32>) {
+        if let Some(l) = self.layouts.get(&t) {
+            return l.clone();
+        }
+        let m = self.m;
+        let out = match m.types.get(t).clone() {
+            ir::TypeDef::Array(e, n) => {
+                let el = self.layout(e).0;
+                let size = n.saturating_mul(round_up(el.align, el.size));
+                (Layout { size, align: el.align }, Vec::new())
+            }
+            ir::TypeDef::Struct { .. } | ir::TypeDef::Enum { .. } => {
+                let members = self.members(t).unwrap_or_default();
+                let ls: Vec<Layout> = members.iter().map(|&(_, mt)| self.layout(mt).0).collect();
+                let (offsets, l) = pack_layouts(ls);
+                (l, offsets)
+            }
+            _ => (ir::layout::layout(&m.types, t), Vec::new()),
+        };
+        self.layouts.insert(t, out.clone());
+        out
+    }
+
     fn function(&mut self, entry: &'m ir::EntryPoint) -> R<Function> {
         let f = &self.m.functions[entry.function.index()];
-        let mut func = Function { name: Some(sanitize(&f.name)), ..Function::default() };
+        let mut func = Function { name: Some(ir::ident(&f.name)), ..Function::default() };
         let mut fb = Fb {
             cx: self,
             f,
@@ -335,14 +366,26 @@ impl<'m> Cx<'m> {
             locals: Vec::new(),
             entry,
             io: None,
-            inputs: Vec::new(),
             param_base: 0,
+            inputs: Vec::new(),
+            consts: HashSet::new(),
         };
         fb.signature()?;
         let body = fb.block(&f.body)?;
         drop(fb);
         func.body = body;
         Ok(func)
+    }
+}
+
+/// Whether field `i` of the vertex output type `t` is a struct of one field (a `Flat<T>` or a
+/// `ClipPosition`) that the WGSL passes as that field.
+fn wrapped(types: &ir::Types, t: ir::TypeId, i: u32) -> R<bool> {
+    let ft = types.field(t, i).ok_or("internal: a varying's type")?;
+    match types.get(ft) {
+        ir::TypeDef::Struct { fields, .. } if fields.len() == 1 => Ok(true),
+        ir::TypeDef::Struct { .. } => Err("internal: a varying that's a struct".into()),
+        _ => Ok(false),
     }
 }
 
@@ -360,10 +403,13 @@ struct Fb<'a, 'm> {
     entry: &'m ir::EntryPoint,
     /// For a vertex entry: the output struct and how its members map to the IR struct's.
     io: Option<(Handle<Type>, IoMap, ir::TypeId)>,
-    /// The entry's builtin inputs, as argument indices.
-    inputs: Vec<u32>,
-    /// Where the IR's parameters start among the naga arguments.
+    /// Where the IR's parameters start among the naga arguments: after the builtin inputs.
     param_base: u32,
+    /// For each builtin input, its naga argument; `None` for a fragment's position when it
+    /// takes the varyings, which hold it (WGSL takes each builtin once).
+    inputs: Vec<Option<u32>>,
+    /// Values that are WGSL const-expressions.
+    consts: HashSet<ir::ValueId>,
 }
 
 impl<'a, 'm> Fb<'a, 'm> {
@@ -371,41 +417,42 @@ impl<'a, 'm> Fb<'a, 'm> {
         for l in &self.f.locals {
             let ty = self.cx.ty(l.ty)?;
             let h = self.func.local_variables.append(
-                LocalVariable { name: Some(sanitize(&l.name)), ty, init: None },
+                LocalVariable { name: Some(ir::ident(&l.name)), ty, init: None },
                 Span::UNDEFINED,
             );
             self.locals.push(h);
         }
         let e = self.entry;
-        // Builtin inputs first.
+        let in_varyings = |b: &ir::BuiltinInput| {
+            *b == ir::BuiltinInput::Position
+                && matches!(e.stage, ir::Stage::Fragment { varyings: Some(_), .. })
+        };
+        // Builtin inputs first, in order.
         for (i, b) in e.inputs.iter().enumerate() {
-            let (builtin, inner) = match b {
-                ir::BuiltinInput::GlobalInvocationId => (
-                    BuiltIn::GlobalInvocationId,
-                    TypeInner::Vector { size: VectorSize::Tri, scalar: Scalar::U32 },
-                ),
-                ir::BuiltinInput::LocalInvocationId => (
-                    BuiltIn::LocalInvocationId,
-                    TypeInner::Vector { size: VectorSize::Tri, scalar: Scalar::U32 },
-                ),
-                ir::BuiltinInput::WorkgroupId => (
-                    BuiltIn::WorkGroupId,
-                    TypeInner::Vector { size: VectorSize::Tri, scalar: Scalar::U32 },
-                ),
-                ir::BuiltinInput::NumWorkgroups => (
-                    BuiltIn::NumWorkGroups,
-                    TypeInner::Vector { size: VectorSize::Tri, scalar: Scalar::U32 },
-                ),
-                ir::BuiltinInput::VertexIndex => {
-                    (BuiltIn::VertexIndex, TypeInner::Scalar(Scalar::U32))
+            use ir::BuiltinInput as B;
+            if in_varyings(b) {
+                self.inputs.push(None);
+                continue;
+            }
+            self.inputs.push(Some(self.func.arguments.len() as u32));
+            let builtin = match b {
+                B::GlobalInvocationId => BuiltIn::GlobalInvocationId,
+                B::LocalInvocationId => BuiltIn::LocalInvocationId,
+                B::WorkgroupId => BuiltIn::WorkGroupId,
+                B::NumWorkgroups => BuiltIn::NumWorkGroups,
+                B::VertexIndex => BuiltIn::VertexIndex,
+                B::InstanceIndex => BuiltIn::InstanceIndex,
+                B::Position => BuiltIn::Position { invariant: false },
+            };
+            let inner = match b {
+                B::GlobalInvocationId
+                | B::LocalInvocationId
+                | B::WorkgroupId
+                | B::NumWorkgroups => {
+                    TypeInner::Vector { size: VectorSize::Tri, scalar: Scalar::U32 }
                 }
-                ir::BuiltinInput::InstanceIndex => {
-                    (BuiltIn::InstanceIndex, TypeInner::Scalar(Scalar::U32))
-                }
-                ir::BuiltinInput::Position => (
-                    BuiltIn::Position { invariant: false },
-                    TypeInner::Vector { size: VectorSize::Quad, scalar: Scalar::F32 },
-                ),
+                B::VertexIndex | B::InstanceIndex => TypeInner::Scalar(Scalar::U32),
+                B::Position => TypeInner::Vector { size: VectorSize::Quad, scalar: Scalar::F32 },
             };
             let ty = self.cx.ty_inner(inner);
             self.func.arguments.push(FunctionArgument {
@@ -413,9 +460,8 @@ impl<'a, 'm> Fb<'a, 'm> {
                 ty,
                 binding: Some(Binding::BuiltIn(builtin)),
             });
-            self.inputs.push(i as u32);
         }
-        self.param_base = e.inputs.len() as u32;
+        self.param_base = self.func.arguments.len() as u32;
         match &e.stage {
             ir::Stage::Compute { .. } => {}
             ir::Stage::Vertex { position_field, flat } => {
@@ -464,6 +510,51 @@ impl<'a, 'm> Fb<'a, 'm> {
         self.expr(Expression::Literal(l), block)
     }
 
+    /// `h`'s value, read back from a new variable: never a const-expression.
+    fn through_variable(
+        &mut self,
+        h: Handle<Expression>,
+        ty: Handle<Type>,
+        out: &mut Block,
+    ) -> Handle<Expression> {
+        let var = self
+            .func
+            .local_variables
+            .append(LocalVariable { name: None, ty, init: None }, Span::UNDEFINED);
+        let pointer = self.expr(Expression::LocalVariable(var), out);
+        out.push(Statement::Store { pointer, value: h }, Span::UNDEFINED);
+        self.expr(Expression::Load { pointer }, out)
+    }
+
+    /// The operands of an operation. When every one is a const-expression, the first goes
+    /// through a variable, so the operation isn't one.
+    fn operands<const N: usize>(
+        &mut self,
+        vs: [ir::ValueId; N],
+        out: &mut Block,
+    ) -> R<[Handle<Expression>; N]> {
+        let hs = self.operands_of(&vs, out)?;
+        hs.try_into().map_err(|_| "internal: operands".to_string())
+    }
+
+    fn operands_of(&mut self, vs: &[ir::ValueId], out: &mut Block) -> R<Vec<Handle<Expression>>> {
+        let mut hs = vs.iter().map(|&v| self.val(v)).collect::<R<Vec<_>>>()?;
+        if let Some(&first) = vs.first()
+            && vs.iter().all(|v| self.consts.contains(v))
+        {
+            let ty = self.cx.ty(self.f.value_ty(first))?;
+            hs[0] = self.through_variable(hs[0], ty, out);
+        }
+        Ok(hs)
+    }
+
+    /// Marks `v` a const-expression if all its `parts` are: it only gathers them.
+    fn const_if_all(&mut self, v: ir::ValueId, parts: &[ir::ValueId]) {
+        if parts.iter().all(|p| self.consts.contains(p)) {
+            self.consts.insert(v);
+        }
+    }
+
     fn val(&self, v: ir::ValueId) -> R<Handle<Expression>> {
         self.values
             .get(&v)
@@ -473,6 +564,7 @@ impl<'a, 'm> Fb<'a, 'm> {
 
     /// A pointer to a place.
     fn place(&mut self, p: &ir::Place, block: &mut Block) -> R<Handle<Expression>> {
+        let m = self.cx.m;
         let mut h = match &p.root {
             ir::PlaceRoot::Local(l) => {
                 self.expr(Expression::LocalVariable(self.locals[l.index()]), block)
@@ -481,7 +573,7 @@ impl<'a, 'm> Fb<'a, 'm> {
                 self.expr(Expression::FunctionArgument(self.param_base + *i), block)
             }
             ir::PlaceRoot::Resource(r) => {
-                let g = self.cx.globals[r.index()].ok_or("internal: a missing resource")?;
+                let g = *self.cx.globals.get(r.index()).ok_or("internal: a missing resource")?;
                 self.expr(Expression::GlobalVariable(g), block)
             }
             ir::PlaceRoot::Ptr(_) => {
@@ -489,14 +581,18 @@ impl<'a, 'm> Fb<'a, 'm> {
                     "projections returned from functions aren't supported on the GPU".into()
                 );
             }
+            ir::PlaceRoot::Data(_) => return Err("internal: constant data in GPU code".into()),
         };
+        // The type each projection applies to, from where `place_ty` starts (past a storage
+        // buffer's index): a field's member depends on it.
+        let start = m.place_start(self.f, p);
+        let skip = start.map_or(0, |(_, rest)| p.path.len() - rest.len());
+        let mut t = start.map(|(t, _)| t);
         for (i, proj) in p.path.iter().enumerate() {
             h = match proj {
                 ir::Proj::Field(k) => {
-                    let prefix = ir::Place { root: p.root.clone(), path: p.path[..i].to_vec() };
-                    let t =
-                        self.cx.m.place_ty(self.f, &prefix).ok_or("internal: a place's type")?;
-                    let index = member(&self.cx.m.types, t, *k);
+                    let t = t.ok_or("internal: a place's type")?;
+                    let index = member(&m.types, t, *k);
                     self.expr(Expression::AccessIndex { base: h, index }, block)
                 }
                 ir::Proj::Comp(c) => {
@@ -507,6 +603,9 @@ impl<'a, 'm> Fb<'a, 'm> {
                     self.expr(Expression::Access { base: h, index }, block)
                 }
             };
+            if i >= skip {
+                t = t.and_then(|t| m.proj_ty(t, proj));
+            }
         }
         Ok(h)
     }
@@ -578,19 +677,14 @@ impl<'a, 'm> Fb<'a, 'm> {
 
     /// A vertex shader's return value, rebuilt as the output struct.
     fn output(&mut self, h: Handle<Expression>, out: &mut Block) -> R<Handle<Expression>> {
-        let Some((io, map, _)) = self.io.clone() else { return Ok(h) };
-        let ir::Stage::Vertex { position_field: position, .. } = self.entry.stage else {
-            return Ok(h);
-        };
+        let Some((io, map, rt)) = self.io.clone() else { return Ok(h) };
+        let ir::Stage::Vertex { .. } = self.entry.stage else { return Ok(h) };
         let mut comps = Vec::new();
-        let single = map.len() == 1
-            && !self.f.ret.is_some_and(|r| matches!(self.cx.m.types.get(r), ir::TypeDef::Struct { fields, .. } if fields.len() > 1));
-        for (i, is_flat) in map {
+        for (i, _) in map {
             let field = self.expr(Expression::AccessIndex { base: h, index: i }, out);
-            let v = if i == position && !single {
-                // The field is a `ClipPosition` struct: its `position`.
-                self.expr(Expression::AccessIndex { base: field, index: 0 }, out)
-            } else if is_flat {
+            // A `Flat<T>`'s value, or a `ClipPosition` field's `position`: the one field of a
+            // struct. (A bare `ClipPosition` output's field is the position itself.)
+            let v = if wrapped(&self.cx.m.types, rt, i)? {
                 self.expr(Expression::AccessIndex { base: field, index: 0 }, out)
             } else {
                 field
@@ -604,6 +698,16 @@ impl<'a, 'm> Fb<'a, 'm> {
         let t = self.f.value_ty(v);
         let types = &self.cx.m.types;
         Ok(match e {
+            ir::Expr::Const(ir::Const::F32(x)) if !x.is_finite() => {
+                // Not a WGSL literal: its bits, made a float when the shader runs.
+                let bits = self.lit(Literal::U32(x.to_bits()), out);
+                let u = self.cx.ty_inner(TypeInner::Scalar(Scalar::U32));
+                let bits = self.through_variable(bits, u, out);
+                self.expr(
+                    Expression::As { expr: bits, kind: ScalarKind::Float, convert: None },
+                    out,
+                )
+            }
             ir::Expr::Const(c) => {
                 let l = match c {
                     ir::Const::Bool(b) => Literal::Bool(*b),
@@ -612,29 +716,30 @@ impl<'a, 'm> Fb<'a, 'm> {
                     ir::Const::F32(x) => Literal::F32(*x),
                     other => return Err(format!("internal: the constant {other:?} in GPU code")),
                 };
+                self.consts.insert(v);
                 self.lit(l, out)
             }
             ir::Expr::Zero(t) => {
                 let ty = self.cx.ty(*t)?;
+                self.consts.insert(v);
                 self.expr(Expression::ZeroValue(ty), out)
             }
             ir::Expr::Param(i) => {
                 // In a fragment shader, parameter 0 is the varyings: rebuild the IR struct.
                 if let Some((_, map, vt)) = self.io.clone()
-                    && let ir::Stage::Fragment { position_field, .. } = &self.entry.stage
+                    && let ir::Stage::Fragment { .. } = &self.entry.stage
                 {
                     let arg = self.expr(Expression::FunctionArgument(self.param_base + *i), out);
                     let ir::TypeDef::Struct { fields, .. } = types.get(vt).clone() else {
                         return Err("internal: varyings".into());
                     };
-                    let position = position_field.unwrap_or(u32::MAX);
                     let mut comps = Vec::new();
-                    for (k, (i, is_flat)) in map.into_iter().enumerate() {
+                    for (k, (i, _)) in map.into_iter().enumerate() {
                         let member =
                             self.expr(Expression::AccessIndex { base: arg, index: k as u32 }, out);
                         let ft = fields[i as usize].1;
-                        let fty = self.cx.ty(ft)?;
-                        comps.push(if i == position || is_flat {
+                        comps.push(if wrapped(types, vt, i)? {
+                            let fty = self.cx.ty(ft)?;
                             self.expr(
                                 Expression::Compose { ty: fty, components: vec![member] },
                                 out,
@@ -650,7 +755,23 @@ impl<'a, 'm> Fb<'a, 'm> {
                 }
             }
             ir::Expr::EntryInput(i) => {
-                let arg = self.expr(Expression::FunctionArgument(self.inputs[*i as usize]), out);
+                let arg = match self.inputs.get(*i as usize) {
+                    Some(Some(k)) => self.expr(Expression::FunctionArgument(*k), out),
+                    // The fragment's position, which the varyings hold.
+                    Some(None) => {
+                        let Some((_, map, _)) = self.io.clone() else {
+                            return Err("internal: an input with no argument".into());
+                        };
+                        let ir::Stage::Fragment { position_field: Some(pf), .. } = self.entry.stage
+                        else {
+                            return Err("internal: an input with no argument".into());
+                        };
+                        let k = map.iter().position(|&(f, _)| f == pf).unwrap_or(0) as u32;
+                        let v = self.expr(Expression::FunctionArgument(self.param_base), out);
+                        self.expr(Expression::AccessIndex { base: v, index: k }, out)
+                    }
+                    None => return Err("internal: a missing entry input".into()),
+                };
                 let ty = self.cx.ty(t)?;
                 match types.get(t) {
                     ir::TypeDef::Struct { fields, .. } if fields.len() == 3 => {
@@ -676,11 +797,13 @@ impl<'a, 'm> Fb<'a, 'm> {
             ir::Expr::Construct(ty, parts) => {
                 let components = parts.iter().map(|p| self.val(*p)).collect::<R<Vec<_>>>()?;
                 let ty = self.cx.ty(*ty)?;
+                self.const_if_all(v, parts);
                 self.expr(Expression::Compose { ty, components }, out)
             }
             ir::Expr::Extract(x, i) => {
                 let base = self.val(*x)?;
                 let index = member(types, self.f.value_ty(*x), *i);
+                self.const_if_all(v, &[*x]);
                 self.expr(Expression::AccessIndex { base, index }, out)
             }
             ir::Expr::Variant(t, k, payload) => {
@@ -689,6 +812,7 @@ impl<'a, 'm> Fb<'a, 'm> {
                 };
                 let ty = self.cx.ty(*t)?;
                 let tag = self.lit(Literal::U32(*k), out);
+                self.const_if_all(v, payload.as_slice());
                 let mut components = vec![tag];
                 for (v, (_, p)) in variants.iter().enumerate() {
                     let Some(pt) = p else { continue };
@@ -703,16 +827,17 @@ impl<'a, 'm> Fb<'a, 'm> {
                 self.expr(Expression::Compose { ty, components }, out)
             }
             ir::Expr::ExtractDyn(x, i) => {
-                let base = self.val(*x)?;
-                let index = self.val(*i)?;
+                let [base, index] = self.operands([*x, *i], out)?;
                 self.expr(Expression::Access { base, index }, out)
             }
             ir::Expr::Splat(x, n) => {
                 let value = self.val(*x)?;
+                self.const_if_all(v, &[*x]);
                 self.expr(Expression::Splat { size: vsize(*n), value }, out)
             }
             ir::Expr::Swizzle(x, comps) => {
                 let vector = self.val(*x)?;
+                self.const_if_all(v, &[*x]);
                 let mut pattern = [naga::SwizzleComponent::X; 4];
                 for (k, c) in comps.iter().enumerate() {
                     pattern[k] = match c {
@@ -728,22 +853,24 @@ impl<'a, 'm> Fb<'a, 'm> {
                 )
             }
             ir::Expr::Convert(x, s) => {
-                let expr = self.val(*x)?;
+                let [expr] = self.operands([*x], out)?;
                 let sc = scalar(*s)?;
                 self.expr(Expression::As { expr, kind: sc.kind, convert: Some(sc.width) }, out)
             }
             ir::Expr::Bitcast(x, s) => {
-                let expr = self.val(*x)?;
+                let [expr] = self.operands([*x], out)?;
                 let sc = scalar(*s)?;
                 self.expr(Expression::As { expr, kind: sc.kind, convert: None }, out)
             }
             ir::Expr::Select { cond, if_true, if_false } => {
-                let condition = self.val(*cond)?;
-                let accept = self.val(*if_true)?;
-                let reject = self.val(*if_false)?;
+                let [condition, accept, reject] =
+                    self.operands([*cond, *if_true, *if_false], out)?;
                 if matches!(
                     types.get(t),
-                    ir::TypeDef::Struct { .. } | ir::TypeDef::Array(..) | ir::TypeDef::Matrix(_)
+                    ir::TypeDef::Struct { .. }
+                        | ir::TypeDef::Enum { .. }
+                        | ir::TypeDef::Array(..)
+                        | ir::TypeDef::Matrix(_)
                 ) {
                     // WGSL's select is for scalars and vectors: use a variable.
                     let ty = self.cx.ty(t)?;
@@ -763,8 +890,19 @@ impl<'a, 'm> Fb<'a, 'm> {
                 }
             }
             ir::Expr::Unary(op, x) => {
-                let expr = self.val(*x)?;
+                let [expr] = self.operands([*x], out)?;
                 let op = match (op, types.get(self.f.value_ty(*x))) {
+                    // WGSL negates no matrix: scale it by -1, which flips every sign as `-`
+                    // does (zeros included).
+                    (ir::UnOp::Neg, ir::TypeDef::Matrix(_)) => {
+                        let m1 = self.lit(Literal::F32(-1.0), out);
+                        let e = Expression::Binary {
+                            op: BinaryOperator::Multiply,
+                            left: expr,
+                            right: m1,
+                        };
+                        return Ok(self.expr(e, out));
+                    }
                     (ir::UnOp::Neg, _) => UnaryOperator::Negate,
                     (ir::UnOp::Not, ir::TypeDef::Scalar(ir::Scalar::Bool)) => {
                         UnaryOperator::LogicalNot
@@ -775,9 +913,22 @@ impl<'a, 'm> Fb<'a, 'm> {
             }
             ir::Expr::Binary(op, a, b) => {
                 let ta = self.f.value_ty(*a);
-                let left = self.val(*a)?;
-                let right = self.val(*b)?;
+                let [left, mut right] = self.operands([*a, *b], out)?;
                 let is_bool = matches!(types.get(ta), ir::TypeDef::Scalar(ir::Scalar::Bool));
+                let is_int =
+                    matches!(types.get(ta), ir::TypeDef::Scalar(ir::Scalar::I32 | ir::Scalar::U32));
+                // WGSL rejects a constant zero divisor or a constant shift past the width even
+                // when the other operand isn't constant.
+                if is_int
+                    && matches!(
+                        op,
+                        ir::BinOp::Div | ir::BinOp::Rem | ir::BinOp::Shl | ir::BinOp::Shr
+                    )
+                    && self.consts.contains(b)
+                {
+                    let ty = self.cx.ty(self.f.value_ty(*b))?;
+                    right = self.through_variable(right, ty, out);
+                }
                 let bop = match op {
                     ir::BinOp::Add | ir::BinOp::WrappingAdd => BinaryOperator::Add,
                     ir::BinOp::Sub | ir::BinOp::WrappingSub => BinaryOperator::Subtract,
@@ -788,6 +939,8 @@ impl<'a, 'm> Fb<'a, 'm> {
                     ir::BinOp::Shr => BinaryOperator::ShiftRight,
                     ir::BinOp::BitAnd => BinaryOperator::And,
                     ir::BinOp::BitOr => BinaryOperator::InclusiveOr,
+                    // WGSL's `^` is for integers; on bools it's `!=`.
+                    ir::BinOp::BitXor if is_bool => BinaryOperator::NotEqual,
                     ir::BinOp::BitXor => BinaryOperator::ExclusiveOr,
                     ir::BinOp::And => {
                         if is_bool {
@@ -827,7 +980,7 @@ impl<'a, 'm> Fb<'a, 'm> {
         out: &mut Block,
     ) -> R<Handle<Expression>> {
         use ir::Builtin as B;
-        let hs = args.iter().map(|a| self.val(*a)).collect::<R<Vec<_>>>()?;
+        let hs = self.operands_of(args, out)?;
         let deriv = |axis| Expression::Derivative {
             axis,
             ctrl: naga::DerivativeControl::None,
@@ -898,10 +1051,8 @@ impl<'a, 'm> Fb<'a, 'm> {
 mod tests {
     use super::*;
 
-    /// A tiny compute module round-trips through naga's validator and back through its WGSL
-    /// parser.
-    #[test]
-    fn a_minimal_kernel_is_valid_wgsl() {
+    /// A tiny compute module named `name`, which writes each invocation's index as a float.
+    fn kernel(name: &str) -> ir::Module {
         let mut m = ir::Module::default();
         let u = m.types.u32();
         let f32t = m.types.f32();
@@ -915,7 +1066,7 @@ mod tests {
             kind: ir::ResourceKind::StorageReadWrite,
             ty: f32t,
         });
-        let mut f = ir::Function::new("k", Vec::new(), None);
+        let mut f = ir::Function::new(name, Vec::new(), None);
         let id = f.new_value(gid);
         let x = f.new_value(u);
         let xf = f.new_value(f32t);
@@ -934,13 +1085,33 @@ mod tests {
         ];
         let fid = m.add_function(f);
         m.entry_points.push(ir::EntryPoint {
-            name: "k".into(),
+            name: name.into(),
             stage: ir::Stage::Compute { workgroup_size: [64, 1, 1] },
             function: fid,
             inputs: vec![ir::BuiltinInput::GlobalInvocationId],
         });
-        let wgsl = emit(&m).expect("valid");
+        m
+    }
+
+    /// A tiny compute module round-trips through naga's validator and back through its WGSL
+    /// parser.
+    #[test]
+    fn a_minimal_kernel_is_valid_wgsl() {
+        let wgsl = emit(&kernel("k")).expect("valid").text;
         assert!(wgsl.contains("@compute @workgroup_size(64, 1, 1)"), "{wgsl}");
         naga::front::wgsl::parse_str(&wgsl).expect("parses back");
+    }
+
+    /// The WGSL writer renames an entry point that's a WGSL builtin's name or ends in a digit;
+    /// the names `emit` gives are the shader's.
+    #[test]
+    fn entry_point_names_are_the_shaders() {
+        for (name, written) in [("fill", "fill"), ("step", "step_"), ("blur2", "blur2_")] {
+            let w = emit(&kernel(name)).expect("valid");
+            assert_eq!(w.entry_points, [written]);
+            assert!(w.text.contains(&format!("fn {written}(")), "{}", w.text);
+        }
+        // A name a type already has (an entry point's local or another entry point's would do).
+        assert_eq!(emit(&kernel("GlobalId")).expect("valid").entry_points, ["GlobalId_1"]);
     }
 }

@@ -1,0 +1,19 @@
+const scale: f32 = 2.0
+const SCALE: f32 = 3.0
+
+struct Inner: Copy + Clone {
+    a: f32,
+}
+
+pub struct Look {
+    pub size: f32 = SCALE,
+    pub inner: f32 = 1.0,
+}
+
+pub fn make(size: f32 = scale) -> f32 {
+    size
+}
+
+pub fn deep(x: f32, i: Inner = Inner { a: 4.0 }) -> f32 {
+    x + i.a
+}

@@ -1,0 +1,118 @@
+// run: derived gradients at their edges: a power at a zero base, a matrix square, f64
+// arithmetic, recursion, ties of `min` and `max`, and a callee that counts its calls
+// expect: pow_sq(0.0) = 0.0
+// expect: pow_sq(3.0) = 6.0
+// expect: pow_ramp(0.5) = 0.0
+// expect: pow_ramp(3.0) = 4.0
+// expect: pow_lin(0.0) = 1.0
+// expect: pow_root(-1.0) = 0.0
+// expect: mat_square(3.0) = 1.0
+// expect: f64_square(3.0) = 6.0
+// expect: f64_ratio(1.0) = 0.25
+// expect: f64_root(4.0) = 0.25
+// expect: recursive(2.0) = 12.0
+// expect: min_tie(1.0) = 0.5
+// expect: max_tie(1.0) = 0.0
+// expect: vector_min_tie(1.0) = 0.5
+// expect: smin_seam(1.0) = 0.5
+// expect: union_seam(0.0) = 0.0
+// expect: counted(1.0) = 3.0
+use std::derive::gradient
+use std::field::{Surface, smin, sphere}
+
+/// `x²` as a power: 2x, also at 0 (not 0 × ∞).
+pub fn pow_sq(x: f32) -> f32 {
+    gradient(|t: f32| pow(t, 2.0), x)
+}
+
+/// 0 where the base is clamped to 0, and doesn't move.
+pub fn pow_ramp(x: f32) -> f32 {
+    gradient(|t: f32| pow(max(t - 1.0, 0.0), 2.0), x)
+}
+
+pub fn pow_lin(x: f32) -> f32 {
+    gradient(|t: f32| pow(t, 1.0), x)
+}
+
+/// A root of a base clamped to 0: its derivative there is ∞, but the base doesn't move.
+pub fn pow_root(x: f32) -> f32 {
+    gradient(|t: f32| pow(max(t, 0.0), 0.5), x)
+}
+
+/// M = [[t, 1], [0, 0]] (columns (t, 0) and (1, 0)): (M² (0, 1)).x = t, whose derivative is 1
+/// (a matrix product doesn't commute, so d(M²) isn't 2 M dM).
+pub fn mat_square(x: f32) -> f32 {
+    gradient(|t: f32| {
+        let m = mat2(vec2(t, 0.0), vec2(1.0, 0.0))
+        (m * m * vec2(0.0, 1.0)).x
+    }, x)
+}
+
+pub fn f64_square(x: f32) -> f32 {
+    gradient(|t: f32| {
+        let d = f64(t)
+        f32(d * d)
+    }, x)
+}
+
+pub fn f64_ratio(x: f32) -> f32 {
+    gradient(|t: f32| {
+        let d = f64(t)
+        f32(d / (d + 1.0))
+    }, x)
+}
+
+pub fn f64_root(x: f32) -> f32 {
+    gradient(|t: f32| f32(sqrt(f64(t))), x)
+}
+
+/// x to the n, recursively.
+fn power(x: f32, n: u32) -> f32 {
+    if n == 0 {
+        return 1.0
+    }
+    x * power(x, n - 1)
+}
+
+pub fn recursive(x: f32) -> f32 {
+    gradient(|t: f32| power(t, 3), x)
+}
+
+/// On a tie, the average of both arguments' tangents.
+pub fn min_tie(a: f32) -> f32 {
+    gradient(|t: f32| min(t, a), a)
+}
+
+/// max(t, 2a - t) is |t - a| + a: 0 at t = a, from 1 and -1.
+pub fn max_tie(a: f32) -> f32 {
+    gradient(|t: f32| max(t, 2.0 * a - t), a)
+}
+
+pub fn vector_min_tie(a: f32) -> f32 {
+    gradient(|t: f32| min(vec2(t, 1.0), vec2(a, 1.0)).x, a)
+}
+
+/// smin is smooth: on its seam, 1/2 in each argument.
+pub fn smin_seam(a: f32) -> f32 {
+    gradient(|t: f32| smin(t, a, 0.5), a)
+}
+
+/// Two mirrored spheres, blended: on the plane between them the gradient has no x.
+pub fn union_seam(x: f32) -> f32 {
+    let left = sphere(0.4).translate(vec3(-0.5, 0.0, 0.0))
+    let right = sphere(0.4).translate(vec3(0.5, 0.0, 0.0))
+    left.smooth_union(right, k: 0.3).gradient(vec3(x, 0.3, 0.0)).x
+}
+
+fn bump(x: f32, n: mut i32) -> f32 {
+    n += 1
+    x * 2.0
+}
+
+/// A callee writing an `i32` through a `mut` parameter carries no derivative there: 2, and
+/// the one call.
+pub fn counted(a: f32) -> f32 {
+    var calls = 0
+    let g = gradient(|x: f32| bump(x, mut calls), a)
+    g + f32(calls)
+}

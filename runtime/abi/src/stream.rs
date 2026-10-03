@@ -144,11 +144,11 @@ pub enum StreamError {
     BadPayload {
         opcode: Opcode,
         at: usize,
-        why: String,
+        why: &'static str,
     },
     Sequence {
         opcode: Opcode,
-        why: String,
+        why: &'static str,
     },
     /// `frame` returned with a screen pass still open.
     UnclosedPass,
@@ -227,7 +227,7 @@ pub fn decode(batch: &[u8]) -> Result<Vec<Command<'_>>, StreamError> {
             return Err(StreamError::UnknownOpcode { opcode: op, at });
         };
         let start = at + COMMAND_HEADER_LEN;
-        let bad = |why: &str| StreamError::BadPayload { opcode, at, why: why.to_string() };
+        let bad = |why| StreamError::BadPayload { opcode, at, why };
         if !len.is_multiple_of(4) {
             return Err(bad("payload length isn't a multiple of 4"));
         }
@@ -330,13 +330,9 @@ impl Sequencer {
         Sequencer::default()
     }
 
-    pub fn in_pass(&self) -> bool {
-        self.in_pass
-    }
-
     pub fn step(&mut self, cmd: &Command) -> Result<(), StreamError> {
         let op = cmd.opcode();
-        let err = |why: &str| Err(StreamError::Sequence { opcode: op, why: why.to_string() });
+        let err = |why| Err(StreamError::Sequence { opcode: op, why });
         match cmd {
             Command::BeginScreenPass { .. } if self.in_pass => err("a screen pass is already open"),
             Command::BeginScreenPass { .. } => {

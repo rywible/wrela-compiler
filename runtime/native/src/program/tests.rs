@@ -2,8 +2,6 @@
 //! the state hash, and calling exports. Commands go to a [`Recorder`].
 
 use super::*;
-use crate::check::{Checker, Limits};
-use wrela_abi::Manifest;
 use wrela_abi::manifest::{Access, BufferBinding, Pipeline, Stage, UniformBlock, UniformSpace};
 use wrela_abi::stream::{Encoder, Opcode, StreamError, VERSION};
 
@@ -56,9 +54,7 @@ fn manifest() -> Manifest {
 
 fn load_wat(wat: &str) -> Result<Program<Recorder>> {
     let wasm = wat::parse_str(wat).expect("test WAT compiles");
-    let compiled = compile(&wasm)?;
-    let checker = Checker::new(&manifest(), Limits::webgpu_defaults());
-    Program::instantiate(&compiled, checker, Recorder::default())
+    Program::instantiate(&compile(&wasm)?, &manifest(), Recorder::default())
 }
 
 /// A program submitting `frames`; runs every frame and returns the first error.
@@ -137,6 +133,35 @@ fn needs_memory_and_frame_exports() {
         load_wat(r#"(module (memory (export "memory") 1) (func (export "frame") (param f64)))"#);
     assert!(matches!(wrong_frame.err(), Some(Error::Program(m)) if m.contains("`frame(")));
     assert!(matches!(compile(b"not wasm").err(), Some(Error::Program(_))));
+}
+
+/// The checks' limits are the ones the GPU side requests (`wrela_abi::check` can't see wgpu).
+#[test]
+fn checks_use_webgpus_default_limits() {
+    let l = wgpu::Limits::default();
+    let max_buffer = l.max_buffer_size.min(l.max_storage_buffer_binding_size);
+    assert_eq!(u64::from(wrela_abi::check::MAX_BUFFER_SIZE), max_buffer);
+    assert_eq!(
+        wrela_abi::check::MAX_WORKGROUPS_PER_DIMENSION,
+        l.max_compute_workgroups_per_dimension
+    );
+}
+
+#[test]
+fn has_no_start_function() {
+    let err = load_wat(
+        r#"(module (import "wrela" "submit" (func $submit (param i32 i32)))
+             (memory (export "memory") 1)
+             (func (export "frame") (param f32 i32 i32))
+             (func $start (call $submit (i32.const 0) (i32.const 0)))
+             (start $start))"#,
+    )
+    .err()
+    .expect("rejected");
+    assert_eq!(
+        err.to_string(),
+        "invalid program: it has a start function; a wrela program may run only when the host calls it"
+    );
 }
 
 #[test]
@@ -306,16 +331,79 @@ fn checks_draws_across_the_pass() {
     .expect("separate passes");
 }
 
+/// Pipeline 0 renders and pipeline 1 computes, each binding two read-write buffers and no
+/// uniforms.
+fn writing_twice() -> Manifest {
+    let mut m = Manifest::new("game.wasm");
+    let shape = |name: &str, stage| Pipeline {
+        name: name.into(),
+        shader: format!("{name}.wgsl"),
+        stage,
+        uniform: None,
+        buffers: vec![
+            BufferBinding { binding: 1, access: Access::ReadWrite },
+            BufferBinding { binding: 2, access: Access::ReadWrite },
+        ],
+    };
+    m.pipelines.push(shape(
+        "draw",
+        Stage::Render { vertex_entry: "vs".into(), fragment_entry: "fs".into() },
+    ));
+    m.pipelines.push(shape(
+        "compute",
+        Stage::Compute { entry: "main".into(), workgroup_size: [64, 1, 1] },
+    ));
+    m.validate().expect("valid");
+    m
+}
+
+#[test]
+fn checks_writable_aliases_and_clear_colours() {
+    let why = |m: &Manifest, batch: Vec<u8>| {
+        let wasm = wat::parse_str(wat_gen::program(&[vec![batch]])).expect("test WAT compiles");
+        let mut program =
+            Program::instantiate(&compile(&wasm).expect("compiles"), m, Recorder::default())
+                .expect("loads");
+        match program.frame(0.0, 64, 64) {
+            Ok(()) => None,
+            Err(Error::Command { why, .. }) => Some(why),
+            Err(e) => panic!("expected a command error, got {e}"),
+        }
+    };
+    // One buffer bound read-write twice by one dispatch or draw: WebGPU rejects it.
+    let m = writing_twice();
+    let twice = with_buffers(|e| {
+        e.dispatch(1, [1; 3], &[1, 1], &[]);
+    });
+    assert_eq!(
+        why(&m, twice).as_deref(),
+        Some("buffer 1 is bound read-write twice in one dispatch")
+    );
+    let twice = with_buffers(|e| {
+        e.begin_screen_pass([0.0; 4]).draw(0, 3, 1, &[2, 2], &[]).present();
+    });
+    assert_eq!(why(&m, twice).as_deref(), Some("buffer 2 is bound read-write twice in one draw"));
+    // Written by two draws of one pass is fine: both are writes.
+    let apart = with_buffers(|e| {
+        e.begin_screen_pass([0.0; 4]).draw(0, 3, 1, &[1, 2], &[]).draw(0, 3, 1, &[2, 1], &[]);
+        e.present();
+    });
+    assert_eq!(why(&m, apart), None);
+    // WebGPU's clear colour is finite.
+    for (clear, part) in [([f32::NAN, 0.5, 0.25, 1.0], "r"), ([0.0, 0.0, 0.0, f32::INFINITY], "a")]
+    {
+        let batch = Encoder::new().begin_screen_pass(clear).present().finish();
+        let want = format!("the clear colour's {part} isn't a finite number");
+        assert_eq!(why(&manifest(), batch), Some(want));
+    }
+}
+
 #[test]
 fn calls_other_exports() {
     let wasm = include_bytes!("../../../fixtures/first-light/game.wasm");
     let compiled = compile(wasm).expect("the fixture is a valid program");
-    let mut program = Program::instantiate(
-        &compiled,
-        Checker::new(&manifest(), Limits::webgpu_defaults()),
-        Recorder::default(),
-    )
-    .expect("instantiates");
+    let mut program =
+        Program::instantiate(&compiled, &manifest(), Recorder::default()).expect("instantiates");
     for (x, expected) in [(0.0, -1.0), (0.25, 0.0), (0.5, 1.0), (0.75, 0.0), (1.125, -0.5)] {
         assert_eq!(
             program.call("tri", &[Value::F32(x)]).expect("calls"),

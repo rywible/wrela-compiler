@@ -27,6 +27,8 @@ export interface ModuleSpec {
   memory?: number;
   exportMemory?: boolean;
   data?: { offset: number; bytes: Uint8Array }[];
+  /** The start function's index (imports first). */
+  start?: number;
 }
 
 const uleb = (n: number): number[] => {
@@ -105,6 +107,7 @@ export function buildModule(spec: ModuleSpec): Uint8Array<ArrayBuffer> {
     ...section(3, funcEntries.length ? vec(funcEntries) : []),
     ...section(5, spec.memory !== undefined ? vec([[0x00, ...uleb(spec.memory)]]) : []),
     ...section(7, exports.length ? vec(exports) : []),
+    ...section(8, spec.start !== undefined ? uleb(spec.start) : []),
     ...section(10, code.length ? vec(code) : []),
     ...section(11, data.length ? vec(data) : []),
   ]);
@@ -115,7 +118,7 @@ export const FRAME_TYPE: FuncType = { params: ["f32", "i32", "i32"], results: []
 
 /**
  * A program whose `n`th call of `frame` submits `frames[n]`'s batches in order (nothing once
- * `frames` runs out), like runtime/native/tests/common/wat.rs. Frame n is told apart by a
+ * `frames` runs out), like runtime/native/tests/suite/common/wat.rs. Frame n is told apart by a
  * counter in memory word 0.
  */
 export function batchProgram(frames: Uint8Array[][]): Uint8Array<ArrayBuffer> {

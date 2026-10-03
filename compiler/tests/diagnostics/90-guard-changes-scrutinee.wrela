@@ -1,0 +1,25 @@
+// mistake: a match guard changing what a later arm tests
+// expect: E0507
+// fix: no
+enum State: Copy + Clone {
+    Idle,
+    Busy,
+}
+
+struct Machine {
+    state: State,
+}
+
+fn finish(m: mut Machine) -> bool {
+    m.state = State::Idle
+    false
+}
+
+pub fn step() -> u32 {
+    var m = Machine { state: State::Busy }
+    match m.state {
+        State::Idle => 0,
+        State::Busy if finish(mut m) => 1,
+        State::Busy => 2,
+    }
+}

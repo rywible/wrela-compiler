@@ -7,6 +7,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use wrela_syntax::lexer::is_name;
 
 /// A source file of the package and the module it is.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -38,14 +39,6 @@ pub fn find_files(root: &Path) -> Result<Vec<PackageFile>, Vec<LayoutError>> {
     if errors.is_empty() { Ok(files) } else { Err(errors) }
 }
 
-fn is_ident(s: &str) -> bool {
-    let mut chars = s.chars();
-    chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
-        && s != "_"
-        && wrela_syntax::TokenKind::keyword(s).is_none()
-}
-
 fn walk(
     root: &Path,
     dir: &Path,
@@ -74,6 +67,10 @@ fn walk(
         if name.starts_with('.') {
             continue;
         }
+        // Skipped whatever they are: a link to an output directory elsewhere is no module.
+        if prefix.is_empty() && SKIPPED_DIRS.contains(&name.as_str()) {
+            continue;
+        }
         let Ok(meta) = fs::symlink_metadata(&path) else { continue };
         if meta.file_type().is_symlink() {
             if fs::metadata(&path).is_ok_and(|m| m.is_dir()) {
@@ -91,10 +88,7 @@ fn walk(
                 continue;
             }
         } else if meta.is_dir() {
-            if prefix.is_empty() && SKIPPED_DIRS.contains(&name.as_str()) {
-                continue;
-            }
-            if !is_ident(&name) {
+            if !is_name(&name) {
                 if has_wrela_files(&path) {
                     errors.push(LayoutError {
                         path: display(&path),
@@ -113,7 +107,7 @@ fn walk(
             continue;
         }
         let Some(stem) = name.strip_suffix(".wrela") else { continue };
-        if !is_ident(stem) {
+        if !is_name(stem) {
             errors.push(LayoutError {
                 path: display(&path),
                 message: format!("`{name}` can't be a module: `{stem}` isn't a wrela name"),
@@ -130,11 +124,17 @@ fn walk(
     }
 }
 
+/// Whether `dir` holds a `.wrela` file, in it or below it, as [`walk`] would find one: hidden
+/// entries are skipped and symbolic links aren't followed (so a cycle of links ends).
 fn has_wrela_files(dir: &Path) -> bool {
     fs::read_dir(dir).is_ok_and(|entries| {
         entries.filter_map(Result::ok).any(|e| {
             let p = e.path();
-            p.extension().is_some_and(|x| x == "wrela") || (p.is_dir() && has_wrela_files(&p))
+            if e.file_name().to_string_lossy().starts_with('.') {
+                return false;
+            }
+            p.extension().is_some_and(|x| x == "wrela")
+                || (e.file_type().is_ok_and(|t| t.is_dir()) && has_wrela_files(&p))
         })
     })
 }
@@ -184,6 +184,39 @@ mod tests {
         let errs = find_files(&d).expect_err("refused");
         assert!(errs[0].message.contains("symbolic link to a directory"));
         assert!(errs[0].symlink, "reported as E0208");
+        let _ = fs::remove_dir_all(&d);
+        let _ = fs::remove_dir_all(&target);
+    }
+
+    /// Links under a directory that isn't a module aren't followed: two links that make a
+    /// cycle used to make the search for modules there run for hours.
+    #[cfg(unix)]
+    #[test]
+    fn links_under_other_directories_are_not_followed() {
+        let d = tmp("cycle");
+        fs::write(d.join("main.wrela"), "").expect("write");
+        fs::create_dir_all(d.join("web-assets/up")).expect("mkdir");
+        for name in ["a", "b", "c"] {
+            std::os::unix::fs::symlink("..", d.join("web-assets/up").join(name)).expect("link");
+        }
+        let start = std::time::Instant::now();
+        let files = find_files(&d).expect("ok");
+        assert_eq!(files.len(), 1);
+        assert!(start.elapsed() < std::time::Duration::from_secs(5), "{:?}", start.elapsed());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// A link to an output directory is skipped like the directory itself.
+    #[cfg(unix)]
+    #[test]
+    fn linked_output_directories_are_skipped() {
+        let d = tmp("outlink");
+        let target = tmp("outlink-target");
+        fs::write(d.join("main.wrela"), "").expect("write");
+        for name in SKIPPED_DIRS {
+            std::os::unix::fs::symlink(&target, d.join(name)).expect("symlink");
+        }
+        assert_eq!(find_files(&d).expect("ok").len(), 1);
         let _ = fs::remove_dir_all(&d);
         let _ = fs::remove_dir_all(&target);
     }

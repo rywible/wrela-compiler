@@ -7,6 +7,7 @@ pub mod check;
 pub mod collect;
 pub mod defs;
 pub mod gpu;
+mod graph;
 pub mod mir;
 pub mod program;
 pub mod resolve;
@@ -46,12 +47,16 @@ pub fn check_program(units: Vec<SourceUnit>, diags: &mut Vec<Diagnostic>) -> Che
     diags.extend(gpu::check_entries(p));
     let (const_tys, consts) = check::check_consts(p, diags);
     let mut mir = BTreeMap::new();
+    let mut hidden = Vec::new();
     for i in 0..p.fns.len() {
         let f = ty::FnId(i as u32);
         let check::FnCheck { body, diags: d, incomplete } = check::check_fn(p, &const_tys, f);
-        let typed = !d.iter().any(|x| x.is_error());
+        let typed = !wrela_diag::has_errors(&d);
         diags.extend(d);
         if let Some(b) = body {
+            if let Some(h) = b.hidden_ret {
+                hidden.push((f, h));
+            }
             // The memory checker needs a well-typed, whole body; it would only add noise
             // otherwise.
             if typed && !incomplete {
@@ -62,6 +67,7 @@ pub fn check_program(units: Vec<SourceUnit>, diags: &mut Vec<Diagnostic>) -> Che
             }
         }
     }
+    diags.extend(check::opaque_cycles(p, &hidden));
     for i in 0..p.adts.len() {
         diags.extend(check::check_field_defaults(p, &const_tys, ty::AdtId(i as u32)));
     }

@@ -13,8 +13,25 @@
 // expect: const_pat(3) = 0
 // expect: opt(1) = 11
 // expect: opt(0) = 0
+// expect: const_scrutinee() = 107
+// expect: const_scrutinee_late() = 5
+// expect: temp_scrutinee(1) = 107
+// expect: temp_scrutinee(3) = 5
+// expect: guard_reads(2) = 20
+// expect: arm_writes() = 2
 
 const LIMIT: u32 = 255
+
+struct Inner {
+    v: u32,
+}
+
+struct Nest {
+    a: u32,
+    inner: Inner,
+}
+
+const NEST: Nest = Nest { a: 1, inner: Inner { v: 7 } }
 
 enum Shape {
     Circle { r: f32 },
@@ -88,4 +105,58 @@ pub fn opt(n: i32) -> i32 {
         Some(v) => v + 10,
         None => 0,
     }
+}
+
+// A constant is matched as a value; its parts bind in every arm, not only the first.
+pub fn const_scrutinee() -> u32 {
+    match NEST {
+        Nest { a: 0, inner } => inner.v,
+        Nest { a: 1, inner } => inner.v + 100,
+        _ => 5,
+    }
+}
+
+pub fn const_scrutinee_late() -> u32 {
+    match NEST {
+        Nest { a: 2, inner } => inner.v,
+        Nest { a: 0, inner } => inner.v + 100,
+        _ => 5,
+    }
+}
+
+fn nest(a: u32) -> Nest {
+    Nest { a, inner: Inner { v: 7 } }
+}
+
+pub fn temp_scrutinee(a: u32) -> u32 {
+    match Some(nest(a)) {
+        Some(Nest { a: 0, inner }) => inner.v,
+        Some(Nest { a: 1, inner }) => inner.v + 100,
+        _ => 5,
+    }
+}
+
+struct Counter {
+    n: u32,
+}
+
+// A guard reads what the `match` borrows; an arm's body may change it.
+pub fn guard_reads(n: u32) -> u32 {
+    let c = Counter { n }
+    match c.n {
+        k if c.n > 5 => k,
+        2 => 20,
+        _ => 0,
+    }
+}
+
+pub fn arm_writes() -> u32 {
+    var c = Counter { n: 1 }
+    match c.n {
+        1 => {
+            c.n = 2
+        },
+        _ => {},
+    }
+    c.n
 }

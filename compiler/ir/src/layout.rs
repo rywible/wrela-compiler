@@ -5,7 +5,8 @@
 //! bytes on the CPU are its bytes on the GPU. Types WGSL doesn't have (64-bit and small
 //! integers, runs, pointers) get their natural size and alignment; they never cross to the GPU.
 
-use crate::types::{Scalar, TypeDef, TypeId, Types};
+use crate::{Scalar, TypeDef, TypeId, Types};
+use std::collections::HashMap;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Layout {
@@ -30,7 +31,7 @@ fn scalar_layout(s: Scalar) -> Layout {
     Layout { size: n, align: n }
 }
 
-pub fn vector_layout(n: u8) -> Layout {
+fn vector_layout(n: u8) -> Layout {
     match n {
         2 => Layout { size: 8, align: 8 },
         3 => Layout { size: 12, align: 16 },
@@ -42,9 +43,10 @@ pub fn layout(types: &Types, t: TypeId) -> Layout {
     types.layout(t)
 }
 
-/// The layout of a type being interned, from its parts' layouts.
-pub(crate) fn compute(types: &Types, d: &TypeDef) -> Layout {
-    match d {
+/// The layout of a type being interned and its fields' offsets (see [`field_offsets`]), from
+/// its parts' layouts.
+pub(crate) fn compute(types: &Types, d: &TypeDef) -> (Layout, Box<[u32]>) {
+    let layout = match d {
         TypeDef::Scalar(s) => scalar_layout(*s),
         TypeDef::Vector(n) => vector_layout(*n),
         TypeDef::Matrix(n) => {
@@ -59,55 +61,89 @@ pub(crate) fn compute(types: &Types, d: &TypeDef) -> Layout {
             Layout { size: round_up(el.align, el.size), align: el.align }
         }
         TypeDef::Struct { fields, .. } => {
-            let mut offset = 0u32;
-            let mut align = 1;
-            for (_, f) in fields {
-                let l = types.layout(*f);
-                offset = round_up(l.align, offset).saturating_add(l.size);
-                align = align.max(l.align);
-            }
-            Layout { size: round_up(align, offset.max(1)), align }
+            let (offsets, layout) = pack(types, fields.iter().map(|(_, f)| *f));
+            return (layout, offsets.into());
         }
         TypeDef::Enum { variants, .. } => {
             let payloads = variants.iter().filter_map(|(_, p)| p.map(|p| types.layout(p)));
             let (size, align) = payloads.fold((0, 4), |(s, a), l| (s.max(l.size), a.max(l.align)));
-            Layout { size: round_up(align, enum_payload_offset(align).saturating_add(size)), align }
+            // After its `u32` tag, aligned for the most aligned payload.
+            let at = round_up(align, 4);
+            let offsets = std::iter::once(0).chain(variants.iter().map(|_| at)).collect();
+            return (Layout { size: round_up(align, at.saturating_add(size)), align }, offsets);
         }
         TypeDef::Run(_) => Layout { size: 8, align: 4 },
         TypeDef::Ptr(_) => Layout { size: 4, align: 4 },
-    }
+    };
+    (layout, Box::default())
 }
 
-/// Where an enum's payloads start: after its `u32` tag, aligned for the most aligned payload.
-fn enum_payload_offset(align: u32) -> u32 {
-    round_up(align, 4)
+/// The largest type WGSL allows, in bytes (naga's limit, which the WebGPU hosts share).
+pub const WGSL_MAX_TYPE_SIZE: u32 = i32::MAX as u32;
+
+/// A type's layout in WGSL, which has no unions: [`layout`], but with each enum laid out as the
+/// struct the WGSL back end holds it in (its `u32` tag, then every payload). Each part is laid
+/// out once, however often it appears.
+pub fn wgsl_layout(types: &Types, t: TypeId) -> Layout {
+    fn go(types: &Types, t: TypeId, done: &mut HashMap<TypeId, Layout>) -> Layout {
+        if let Some(&l) = done.get(&t) {
+            return l;
+        }
+        let l = match types.get(t) {
+            TypeDef::Array(e, n) => {
+                let el = go(types, *e, done);
+                Layout { size: n.saturating_mul(round_up(el.align, el.size)), align: el.align }
+            }
+            TypeDef::Struct { fields, .. } => {
+                let ls: Vec<Layout> = fields.iter().map(|(_, f)| go(types, *f, done)).collect();
+                pack_layouts(ls).1
+            }
+            TypeDef::Enum { variants, .. } => {
+                let ls: Vec<Layout> = std::iter::once(scalar_layout(Scalar::U32))
+                    .chain(variants.iter().filter_map(|(_, p)| Some(go(types, (*p)?, done))))
+                    .collect();
+                pack_layouts(ls).1
+            }
+            _ => types.layout(t),
+        };
+        done.insert(t, l);
+        l
+    }
+    go(types, t, &mut HashMap::new())
+}
+
+/// Fields one after the other, each at the first offset its alignment allows (a struct's
+/// layout): each field's offset, and the layout of the whole.
+pub fn pack(types: &Types, fields: impl IntoIterator<Item = TypeId>) -> (Vec<u32>, Layout) {
+    pack_layouts(fields.into_iter().map(|f| types.layout(f)))
+}
+
+/// [`pack`], from the fields' layouts.
+pub fn pack_layouts(fields: impl IntoIterator<Item = Layout>) -> (Vec<u32>, Layout) {
+    let mut offsets = Vec::new();
+    let mut end = 0u32;
+    let mut align = 1;
+    for l in fields {
+        let at = round_up(l.align, end);
+        offsets.push(at);
+        end = at.saturating_add(l.size);
+        align = align.max(l.align);
+    }
+    (offsets, Layout { size: round_up(align, end.max(1)), align })
 }
 
 /// Each field's byte offset in a struct or an enum (whose payloads all start at one offset).
-pub fn field_offsets(types: &Types, t: TypeId) -> Vec<u32> {
-    if let TypeDef::Enum { variants, .. } = types.get(t) {
-        let at = enum_payload_offset(layout(types, t).align);
-        return std::iter::once(0).chain(variants.iter().map(|_| at)).collect();
-    }
-    let TypeDef::Struct { fields, .. } = types.get(t) else { return Vec::new() };
-    let mut out = Vec::with_capacity(fields.len());
-    let mut offset = 0;
-    for (_, f) in fields {
-        let l = layout(types, *f);
-        let at = round_up(l.align, offset);
-        out.push(at);
-        offset = at.saturating_add(l.size);
-    }
-    out
+pub fn field_offsets(types: &Types, t: TypeId) -> &[u32] {
+    types.field_offsets(t)
 }
 
-/// The distance between consecutive elements of an array of `elem`.
 /// The distance between a `matN`'s columns.
 pub fn column_stride(n: u8) -> u32 {
     let col = vector_layout(n);
     round_up(col.align, col.size)
 }
 
+/// The distance between consecutive elements of an array of `elem`.
 pub fn array_stride(types: &Types, elem: TypeId) -> u32 {
     let l = layout(types, elem);
     round_up(l.align, l.size)
@@ -164,13 +200,13 @@ mod tests {
             fields: vec![("u".into(), f32), ("v".into(), f32), ("w".into(), v2), ("x".into(), f32)],
         });
         assert_eq!(layout(&t, a), Layout { size: 24, align: 8 });
-        assert_eq!(field_offsets(&t, a), vec![0, 4, 8, 16]);
+        assert_eq!(field_offsets(&t, a), [0, 4, 8, 16]);
         // vec3 is 12 bytes with 16-byte alignment: a following f32 packs into its tail.
         let b = t.intern(TypeDef::Struct {
             name: "B".into(),
             fields: vec![("p".into(), v3), ("r".into(), f32)],
         });
-        assert_eq!(field_offsets(&t, b), vec![0, 12]);
+        assert_eq!(field_offsets(&t, b), [0, 12]);
         assert_eq!(layout(&t, b).size, 16);
         let m3 = t.intern(TypeDef::Matrix(3));
         assert_eq!(layout(&t, m3), Layout { size: 48, align: 16 });
@@ -204,7 +240,7 @@ mod tests {
         });
         // The payloads overlap after the tag, aligned for the most aligned one: 16 + 48.
         assert_eq!(layout(&t, e), Layout { size: 64, align: 16 });
-        assert_eq!(field_offsets(&t, e), vec![0, 16, 16, 16]);
+        assert_eq!(field_offsets(&t, e), [0, 16, 16, 16]);
         assert_eq!(t.field(e, 0), Some(u32t));
         assert_eq!(t.field(e, 1), None);
         assert_eq!(t.field(e, 3), Some(wide));

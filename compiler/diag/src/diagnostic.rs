@@ -135,6 +135,11 @@ impl Diagnostic {
     }
 }
 
+/// Whether any of the diagnostics is an error.
+pub fn has_errors(diags: &[Diagnostic]) -> bool {
+    diags.iter().any(Diagnostic::is_error)
+}
+
 /// Sorts diagnostics into a stable order: by file, then position, then code. Duplicates (same
 /// code and primary span) are dropped; one that says the same thing gives the first its
 /// secondary labels (one error in a function that two calls derive names both calls).

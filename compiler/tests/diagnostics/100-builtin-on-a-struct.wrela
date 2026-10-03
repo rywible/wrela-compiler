@@ -1,0 +1,12 @@
+// mistake: calling a math built-in on a struct rather than on one of its numbers
+// expect: E0305
+// fix: no
+struct Pair: Copy + Clone {
+    a: f32,
+    b: f32,
+}
+
+pub fn root(a: f32) -> f32 {
+    let p = Pair { a: a, b: 2.0 }
+    sqrt(p)
+}

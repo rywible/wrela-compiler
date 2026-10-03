@@ -2,6 +2,8 @@
 // code came from, so a trap can say where it happened. Mirrors runtime/abi/src/lines.rs (the
 // format is described there).
 
+import { ByteReader, UTF8 } from "./wasm.ts";
+
 export const LINES_SECTION = "wrela.lines";
 
 /** A decoded table: module offsets, ascending, each with a location or none. */
@@ -27,39 +29,27 @@ export class Lines {
 
   /** Reads a section's payload. */
   static decode(payload: Uint8Array): Lines {
-    let at = 0;
-    const leb = (): number => {
-      let x = 0;
-      for (let shift = 0; shift < 35; shift += 7) {
-        const b = payload[at++];
-        if (b === undefined) throw new Error("the section ends early");
-        x += (b & 0x7f) * 2 ** shift;
-        if ((b & 0x80) === 0) {
-          if (x > 0xffffffff) throw new Error("a number is too large");
-          return x;
-        }
-      }
-      throw new Error("a number is too long");
-    };
+    const r = new ByteReader(payload, "the section ends early");
     const locations: string[] = [];
-    const decoder = new TextDecoder("utf-8", { fatal: true });
-    for (let i = leb(); i > 0; i--) {
-      const n = leb();
-      if (at + n > payload.length) throw new Error("the section ends early");
-      locations.push(decoder.decode(payload.subarray(at, at + n)));
-      at += n;
+    for (let i = r.u32(); i > 0; i--) {
+      const bytes = r.take(r.u32());
+      try {
+        locations.push(UTF8.decode(bytes));
+      } catch {
+        throw new Error("a location isn't UTF-8");
+      }
     }
     const entries: [number, number][] = [];
     let last = -1;
-    for (let i = leb(); i > 0; i--) {
-      const offset = leb();
-      const k = leb();
+    for (let i = r.u32(); i > 0; i--) {
+      const offset = r.u32();
+      const k = r.u32();
       if (k > locations.length) throw new Error(`entry at ${offset} names location ${k}, of ${locations.length}`);
       if (offset < last) throw new Error(`the entries aren't in order at ${offset}`);
       last = offset;
       entries.push([offset, k]);
     }
-    if (at !== payload.length) throw new Error("bytes after the entries");
+    if (r.at !== payload.length) throw new Error("bytes after the entries");
     return new Lines(locations, entries);
   }
 

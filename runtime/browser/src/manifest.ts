@@ -1,16 +1,17 @@
 // The manifest, version 1: parsing and validation. Mirrors `Manifest::parse` and
-// `Manifest::validate` in runtime/abi/src/manifest.rs: the same version rules, the same checks
-// in the same order, the same messages. (Malformed JSON and wrong field types are reported in
-// this file's own words, not serde's. JSON can't tell `1` from `1.0`, so a whole number written
-// with a fraction is accepted here where serde rejects it.)
+// `Manifest::validate` in runtime/abi/src/manifest.rs: the same version rules, the same reading
+// of each field, the same checks in the same order, the same messages. (Only JSON that doesn't
+// parse is reported in each host's own words.)
 
 import {
   MANIFEST_VERSION,
   MAX_STORAGE_BUFFERS_PER_STAGE,
+  MAX_UNIFORM_BUFFER_BINDING_SIZE,
   MAX_WORKGROUP_INVOCATIONS,
   MAX_WORKGROUP_SIZE,
   STREAM_VERSION,
 } from "./abi.gen.ts";
+import { errorMessage } from "./errors.ts";
 
 export type UniformSpace = "uniform" | "storage";
 export type Access = "read" | "read_write";
@@ -54,7 +55,17 @@ export class ManifestError extends Error {
 
 type Json = Record<string, unknown>;
 
+/** In a `u` regex a surrogate pair is one code point, so this finds only unpaired ones. */
+const LONE_SURROGATE = /\p{Cs}/u;
+
 const isObject = (v: unknown): v is Json => typeof v === "object" && v !== null && !Array.isArray(v);
+
+/** A JSON value as both hosts show it: a scalar as JavaScript writes it, else its kind. */
+function show(v: unknown): string {
+  if (Array.isArray(v)) return "an array";
+  if (isObject(v)) return "an object";
+  return typeof v === "string" ? JSON.stringify(v) : String(v);
+}
 
 function field(o: Json, key: string, where: string): unknown {
   if (!(key in o)) throw new ManifestError(`missing field \`${key}\` in ${where}`);
@@ -63,7 +74,7 @@ function field(o: Json, key: string, where: string): unknown {
 
 function asU32(v: unknown, what: string): number {
   if (typeof v !== "number" || !Number.isInteger(v) || v < 0 || v > 0xffff_ffff) {
-    throw new ManifestError(`${what} must be a u32, not ${JSON.stringify(v)}`);
+    throw new ManifestError(`${what} must be a u32, not ${show(v)}`);
   }
   return v;
 }
@@ -84,7 +95,7 @@ function object(v: unknown, where: string): Json {
 function oneOf<T extends string>(o: Json, key: string, where: string, options: readonly T[]): T {
   const v = field(o, key, where);
   if (!options.includes(v as T)) {
-    throw new ManifestError(`${where}.${key} must be one of ${options.join(", ")}, not ${JSON.stringify(v)}`);
+    throw new ManifestError(`${where}.${key} must be one of ${options.join(", ")}, not ${show(v)}`);
   }
   return v as T;
 }
@@ -94,7 +105,7 @@ function pipeline(v: unknown, i: number): Pipeline {
   const o = object(v, where);
   const name = str(o, "name", where);
   const shader = str(o, "shader", where);
-  // serde reads a missing `uniform` as None, like null.
+  // A missing `uniform` is read as null.
   const u = o["uniform"] ?? null;
   let uniform: UniformBlock | null = null;
   if (u !== null) {
@@ -144,9 +155,15 @@ function pipeline(v: unknown, i: number): Pipeline {
 export function parseManifest(json: string): Manifest {
   let v: unknown;
   try {
-    v = JSON.parse(json);
+    // serde_json, and so the native host, rejects a lone UTF-16 surrogate anywhere.
+    v = JSON.parse(json, (key, value: unknown) => {
+      if (LONE_SURROGATE.test(key) || (typeof value === "string" && LONE_SURROGATE.test(value))) {
+        throw new Error("a string has a lone surrogate");
+      }
+      return value;
+    });
   } catch (e) {
-    throw new ManifestError(e instanceof Error ? e.message : String(e));
+    throw new ManifestError(errorMessage(e));
   }
   const version = isObject(v) ? v["manifest_version"] : undefined;
   if (version === undefined) {
@@ -154,7 +171,7 @@ export function parseManifest(json: string): Manifest {
   }
   if (version !== MANIFEST_VERSION) {
     throw new ManifestError(
-      `manifest version ${JSON.stringify(version)}, but this host reads version ${MANIFEST_VERSION}`,
+      `manifest version ${show(version)}, but this host reads version ${MANIFEST_VERSION}`,
     );
   }
   const o = v as Json;
@@ -189,6 +206,11 @@ export function validateManifest(m: Manifest): void {
       }
       if (u.space === "uniform" && u.size % 16 !== 0) {
         throw err(`pipeline ${i}'s uniform block of ${u.size} bytes isn't a multiple of 16`);
+      }
+      if (u.space === "uniform" && u.size > MAX_UNIFORM_BUFFER_BINDING_SIZE) {
+        throw err(
+          `pipeline ${i}'s uniform block of ${u.size} bytes is over WebGPU's default limit of ${MAX_UNIFORM_BUFFER_BINDING_SIZE}`,
+        );
       }
       bindings.push(u.binding);
     }

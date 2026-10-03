@@ -13,12 +13,12 @@
 //!
 //! These need a GPU: `cargo test -p wrela-tests --test suite grazer:: -- --ignored --nocapture`.
 
-use std::path::PathBuf;
+use crate::built;
 use wrela_abi::Manifest;
 use wrela_abi::manifest::Stage;
 use wrela_abi::stream::{Command, decode};
 use wrela_host::{Host, Options, Value};
-use wrela_tests::{Bind, RawGpu, built, bytes_of, f32s, median, root, u32s};
+use wrela_tests::{Bind, RawGpu, bytes_of, f32s, median, one_f32, one_u32, repo_root, u32s};
 
 /// 2²⁰ points ("1M").
 const POINTS: u32 = 1 << 20;
@@ -48,19 +48,16 @@ fn eval_g(@builtin(global_invocation_id) id: vec3u) {
 }
 ";
 
-fn out_dir() -> PathBuf {
-    built("fields", PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("fields"))
-}
-
 fn load() -> Host {
-    Host::load_with(out_dir(), &Options { record: true, ..Options::default() })
+    Host::load_with(built("fields"), &Options { record: true, ..Options::default() })
         .expect("load the grazer")
 }
 
 /// A compute pipeline of the build: its WGSL and entry point, and the uniform bytes of its
 /// first dispatch in `batches`.
 fn compiled_kernel(name: &str, batches: &[Vec<u8>]) -> (String, String, Vec<u8>) {
-    let manifest = std::fs::read_to_string(out_dir().join("manifest.json")).expect("manifest");
+    let dir = built("fields");
+    let manifest = std::fs::read_to_string(dir.join("manifest.json")).expect("manifest");
     let manifest = Manifest::parse(&manifest).expect("a valid manifest");
     let (index, p) = manifest
         .pipelines
@@ -69,7 +66,7 @@ fn compiled_kernel(name: &str, batches: &[Vec<u8>]) -> (String, String, Vec<u8>)
         .find(|(_, p)| p.name == name)
         .unwrap_or_else(|| panic!("no pipeline `{name}`"));
     let Stage::Compute { entry, .. } = &p.stage else { panic!("`{name}` isn't a kernel") };
-    let wgsl = std::fs::read_to_string(out_dir().join(&p.shader)).expect("the shader");
+    let wgsl = std::fs::read_to_string(dir.join(&p.shader)).expect("the shader");
     for batch in batches {
         for cmd in decode(batch).expect("a valid batch") {
             if let Command::Dispatch { pipeline, uniforms, .. } = cmd
@@ -82,19 +79,21 @@ fn compiled_kernel(name: &str, batches: &[Vec<u8>]) -> (String, String, Vec<u8>)
     panic!("nothing dispatched `{name}`")
 }
 
-fn call_f32(host: &mut Host, name: &str, args: &[Value]) -> f32 {
-    match host.call_export(name, args).expect(name).as_slice() {
-        [Value::F32(x)] => *x,
-        other => panic!("{name} returned {other:?}"),
-    }
-}
-
 fn spike_params(host: &mut Host, seed: u32) -> Vec<f32> {
-    (0..328).map(|i| call_f32(host, "param", &[Value::I32(seed as i32), Value::I32(i)])).collect()
+    (0..328).map(|i| one_f32(host, "param", &[Value::I32(seed as i32), Value::I32(i)])).collect()
 }
 
+/// The angle between two gradients; NaN (which fails) where it isn't defined: a gradient that
+/// is zero or not a number, unless the two are the same.
 fn angle(a: [f32; 3], b: [f32; 3]) -> f64 {
+    if a == b {
+        return 0.0;
+    }
     let (a, b) = (a.map(f64::from), b.map(f64::from));
+    let norm = |v: [f64; 3]| v[0].hypot(v[1]).hypot(v[2]);
+    if !(norm(a) > 0.0 && norm(b) > 0.0) {
+        return f64::NAN;
+    }
     let dot = a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
     let cross = [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
     (cross[0].hypot(cross[1]).hypot(cross[2])).atan2(dot)
@@ -106,11 +105,12 @@ fn the_compiled_grazer_matches_the_hand_written_one() {
     let mut host = load();
 
     // The same numbers: wrela's `params` is grazer.js's `makeGrazer`, bit for bit.
-    let fixture = std::fs::read(root().join("compiler/tests/fixtures/spike01/params-seed1.f32"))
-        .expect("read params-seed1.f32");
-    let params = spike_params(&mut host, 1);
+    let fixture =
+        std::fs::read(repo_root().join("compiler/tests/fixtures/spike01/params-seed1.f32"))
+            .expect("read params-seed1.f32");
+    let (fixture, params) = (f32s(&fixture), spike_params(&mut host, 1));
     let mismatched: Vec<usize> =
-        (0..328).filter(|&i| params[i].to_bits() != f32s(&fixture)[i].to_bits()).collect();
+        (0..328).filter(|&i| params[i].to_bits() != fixture[i].to_bits()).collect();
     assert!(mismatched.is_empty(), "parameters differ from the spike's at {mismatched:?}");
 
     // The compiled field: points over the grazer's bounds (buffer 0), the distance (1), and the
@@ -123,8 +123,9 @@ fn the_compiled_grazer_matches_the_hand_written_one() {
     drop(host);
 
     // The hand-written field, on the same points.
-    let field = std::fs::read_to_string(root().join("compiler/tests/fixtures/spike01/field.wgsl"))
-        .expect("read field.wgsl");
+    let field =
+        std::fs::read_to_string(repo_root().join("compiler/tests/fixtures/spike01/field.wgsl"))
+            .expect("read field.wgsl");
     let gpu = RawGpu::new().expect("a GPU");
     let spike_uniform = bytes_of(&params);
     let n = u64::from(POINTS);
@@ -172,12 +173,13 @@ fn the_compiled_grazer_matches_the_hand_written_one() {
     let mut over_angle = Vec::new();
     for i in 0..POINTS as usize {
         let e = (f64::from(dist[i]) - f64::from(hd[i])).abs();
-        worst_d = worst_d.max(e);
         let es = (f64::from(samp[4 * i]) - f64::from(hg[4 * i])).abs();
-        worst_sd = worst_sd.max(es);
-        if e > 1e-5 || es > 1e-5 {
+        // NaN counts as over, and as the worst (`f64::max` would drop it).
+        if !(e <= 1e-5 && es <= 1e-5) {
             over_d += 1;
         }
+        worst_d = if e.is_nan() { e } else { worst_d.max(e) };
+        worst_sd = if es.is_nan() { es } else { worst_sd.max(es) };
         let g = [samp[4 * i + 1], samp[4 * i + 2], samp[4 * i + 3]];
         let h = [hg[4 * i + 1], hg[4 * i + 2], hg[4 * i + 3]];
         let a = angle(g, h);
@@ -215,6 +217,15 @@ fn the_compiled_grazer_matches_the_hand_written_one() {
             &hg[4 * i..4 * i + 4]
         );
     }
+    // A GPU without timestamps gives zeros, which would pass the time gates.
+    for (what, t) in
+        [("ours", &ours_d), ("theirs", &theirs_d), ("ours", &ours_g), ("theirs", &theirs_g)]
+    {
+        assert!(
+            t.iter().all(|&x| x > 0.0 && x.is_finite()),
+            "{what}: GPU times {t:?} aren't all positive"
+        );
+    }
     assert_eq!(over_d, 0, "distances differ by more than 1e-5 m");
     assert!(over_angle.is_empty(), "gradients differ by more than 0.01 rad");
     assert!(md <= 1.25 * hmd, "the distance kernel is {:.2}x the hand-written one", md / hmd);
@@ -234,15 +245,12 @@ fn block_culling_on_the_spikes_grid() {
     for seed in 1..=40 {
         for (rule, k) in kept.iter_mut().enumerate() {
             let args = [Value::I32(seed), Value::F32(0.015), Value::I32(rule as i32)];
-            let n = match host.call_export("cull", &args).expect("cull").as_slice() {
-                [Value::I32(n)] => *n as u64,
-                other => panic!("cull returned {other:?}"),
-            };
+            let n = one_u32(&mut host, "cull", &args);
             let live = u32s(&host.read_buffer(handle).expect("live blocks"));
             handle += 1;
             *k += live.iter().map(|&x| u64::from(x)).sum::<u64>();
             if rule == 0 {
-                blocks += n;
+                blocks += u64::from(n);
             }
         }
     }

@@ -1,0 +1,30 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0602",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [
+        "pass fewer buffers: put data that's read together in one buffer"
+      ],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "`sum` binds 9 storage buffers, and a WebGPU stage can have at most 8",
+      "notes": [
+        "each `[T]` and `Slots<T>` parameter is a storage buffer"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 5,
+        "end": 283,
+        "end_column": 24,
+        "end_line": 16,
+        "line": 16,
+        "start": 264
+      },
+      "title": "a GPU entry point with an invalid signature"
+    }
+  ],
+  "version": 2
+}

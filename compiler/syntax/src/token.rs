@@ -46,6 +46,9 @@ macro_rules! token_kinds {
                 }
             }
 
+            /// Every token class (the tokens whose text varies, and NEWLINE and EOF), in spec
+            /// order.
+            pub const CLASSES: &'static [TokenKind] = &[$(TokenKind::$cname),*];
             /// Every keyword, in spec order.
             pub const KEYWORDS: &'static [TokenKind] = &[$(TokenKind::$kname),*];
             /// Every punctuation token, longest first (the order L15 matches in).
@@ -179,31 +182,14 @@ impl TokenKind {
         )
     }
 
-    /// Binary operators, for diagnostics about a line that starts with one (E0103).
-    pub fn is_binary_operator(self) -> bool {
-        use TokenKind::*;
-        matches!(
-            self,
-            StarStar
-                | EqEq
-                | Ne
-                | Le
-                | Ge
-                | AndAnd
-                | OrOr
-                | Shl
-                | Shr
-                | Plus
-                | Minus
-                | Star
-                | Slash
-                | Percent
-                | Caret
-                | Amp
-                | Pipe
-                | Lt
-                | Gt
-        )
+    /// The opening bracket that this closing bracket closes.
+    pub fn opener(self) -> Option<TokenKind> {
+        match self {
+            TokenKind::RParen => Some(TokenKind::LParen),
+            TokenKind::RBracket => Some(TokenKind::LBracket),
+            TokenKind::RBrace => Some(TokenKind::LBrace),
+            _ => None,
+        }
     }
 }
 

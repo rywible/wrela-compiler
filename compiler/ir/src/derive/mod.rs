@@ -9,7 +9,6 @@
 
 pub mod ad;
 pub mod interval;
-pub(crate) mod single_exit;
 
 use crate::*;
 use std::collections::{HashMap, HashSet};
@@ -19,19 +18,26 @@ use std::collections::{HashMap, HashSet};
 pub struct DeriveCache {
     ad: HashMap<(FuncId, Vec<bool>, u8), FuncId>,
     interval: HashMap<(FuncId, Vec<bool>), FuncId>,
-    /// Whether a function returns an active value, by derivation and active parameters.
-    returns: HashMap<(Mode, FuncId, Vec<bool>), bool>,
+    /// What a call does with active arguments, by derivation and active parameters: `None`
+    /// while the callee is still being analyzed.
+    effects: HashMap<(Mode, FuncId, Vec<bool>), Option<Effect>>,
+    /// The activity [`effect`] found, kept for deriving the function when it's final.
+    activity: HashMap<(Mode, FuncId, Vec<bool>), Activity>,
+    /// The intervals being built, outermost first, and whether the call that asked for each
+    /// runs under a branch on the input.
+    building: Vec<(FuncId, Vec<bool>, bool)>,
 }
 
 /// A function of `f`'s captures and `x` (its last parameter) returning `(f32, X)`: `f(x)` and
-/// its gradient with respect to `x`.
+/// its gradient with respect to `x`, for `target`.
 pub fn value_and_gradient(
     m: &mut Module,
     cache: &mut DeriveCache,
     f: FuncId,
     ncap: u32,
+    target: Target,
 ) -> Result<FuncId> {
-    ad::value_and_gradient(m, cache, f, ncap)
+    ad::value_and_gradient(m, cache, f, ncap, target)
 }
 
 /// A function of `f`'s captures and a box (`box_ty`, with fields `lo` and `hi`) returning an
@@ -49,6 +55,18 @@ pub fn interval(
 ) -> Result<FuncId> {
     interval::interval(m, cache, f, ncap, target, box_ty, interval_ty)
 }
+
+/// What a call does, given which of its arguments are active.
+#[derive(Clone, Debug)]
+pub(crate) struct Effect {
+    /// Whether its result is active.
+    pub returns: bool,
+    /// By parameter: whether it may write an active value through it (a `mut` one).
+    pub writes: Vec<bool>,
+}
+
+/// How the activity analysis learns what a call does.
+pub(crate) type Callee<'c> = dyn FnMut(FuncId, Vec<bool>) -> Result<Effect> + 'c;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Mode {
@@ -75,7 +93,7 @@ pub(crate) fn place_root_active(a: &Activity, p: &Place) -> bool {
         PlaceRoot::Local(l) => a.locals[l.index()],
         PlaceRoot::Param(i) => a.params[*i as usize],
         PlaceRoot::Ptr(v) => a.values[v.index()],
-        PlaceRoot::Resource(_) => false,
+        PlaceRoot::Resource(_) | PlaceRoot::Data(_) => false,
     };
     root || p.path.iter().any(|x| matches!(x, Proj::Index(v) if a.values[v.index()]))
 }
@@ -89,14 +107,14 @@ pub(crate) fn arg_active(a: &Activity, arg: &Arg) -> bool {
 }
 
 /// The activity analysis: a fixpoint over the whole body (flow-insensitive per local, which is
-/// sound and simple). `callee_returns` answers whether a call's result is active given which of
-/// its arguments are.
+/// sound and simple). `callee` answers what a call does given which of its arguments are
+/// active.
 pub(crate) fn activity(
     m: &Module,
     f: &Function,
     params: &[bool],
     mode: Mode,
-    callee_returns: &mut dyn FnMut(FuncId, Vec<bool>) -> Result<bool>,
+    callee: &mut Callee<'_>,
 ) -> Result<Activity> {
     let mut a = Activity {
         values: vec![false; f.values.len()],
@@ -106,12 +124,16 @@ pub(crate) fn activity(
         active_loop_exit: None,
     };
     let mut uses = vec![0u32; f.locals.len()];
-    count_local_uses(&f.body, &mut uses);
-    let cx = Walk { m, f, mode, uses };
+    visit::count_local_mentions(&f.body, &mut uses);
+    let cx = Walk { m, f, mode, uses, ptrs: Pointers::of(m, f) };
+    // Bits only turn on, so a round changed something when it turned more on.
+    let on = |a: &Activity| {
+        a.values.iter().chain(&a.locals).filter(|x| **x).count() + a.returns as usize
+    };
     loop {
-        let before = (a.values.clone(), a.locals.clone(), a.returns);
-        walk(&cx, &f.body, &mut a, None, callee_returns)?;
-        if before == (a.values.clone(), a.locals.clone(), a.returns) {
+        let before = on(&a);
+        walk(&cx, &f.body, &mut a, None, callee)?;
+        if on(&a) == before {
             break;
         }
     }
@@ -121,7 +143,7 @@ pub(crate) fn activity(
 fn carries(m: &Module, t: TypeId, mode: Mode) -> bool {
     match mode {
         Mode::Ad => m.types.has_float(t),
-        Mode::Interval => !matches!(m.types.get(t), TypeDef::Ptr(_)),
+        Mode::Interval => true,
     }
 }
 
@@ -131,42 +153,83 @@ struct Walk<'a> {
     mode: Mode,
     /// How many places mention each local, in the whole function.
     uses: Vec<u32>,
+    ptrs: Pointers,
 }
 
-/// Counts the places that mention each local.
-fn count_local_uses(b: &Block, uses: &mut [u32]) {
-    let mut place = |p: &Place| {
-        if let PlaceRoot::Local(l) = p.root {
-            uses[l.index()] += 1;
+impl Walk<'_> {
+    /// Marks a written place active: its root, or what a pointer root may point into (every
+    /// local and parameter, if that isn't known).
+    fn mark(&self, a: &mut Activity, p: &Place) {
+        let PlaceRoot::Ptr(v) = p.root else {
+            return mark_place(a, p);
+        };
+        let mut roots = Vec::new();
+        if self.ptrs.roots(v, &mut roots).is_none() {
+            a.locals.iter_mut().chain(a.params.iter_mut()).for_each(|x| *x = true);
         }
-    };
-    let mut stack = vec![b];
-    while let Some(b) = stack.pop() {
-        for s in b {
-            match s {
-                Stmt::Let(_, e) | Stmt::Eval(e) => match e {
-                    Expr::Load(p) | Expr::Run(p) | Expr::Addr(p) | Expr::ArrayLength(p) => place(p),
-                    Expr::Call(_, args) => {
-                        for a in args {
-                            if let Arg::Place(p) = a {
-                                place(p);
-                            }
-                        }
+        for r in roots {
+            mark_place(a, &Place::root(r));
+        }
+    }
+}
+
+/// Where a function's pointer values may point: into the place an address is of, or into a
+/// place a projection's call gave it to write (a `mut` projection is of a `mut` parameter).
+/// A derived projection returns its pointers in a struct, so the parts of a value are followed
+/// too.
+pub(crate) struct Pointers {
+    into: HashMap<ValueId, Vec<Place>>,
+}
+
+impl Pointers {
+    pub(crate) fn of(m: &Module, f: &Function) -> Pointers {
+        let mut into: HashMap<ValueId, Vec<Place>> = HashMap::new();
+        visit::walk(&f.body, &mut |s| {
+            let Stmt::Let(v, e) = s else { return };
+            if !has_ptr(&m.types, f.value_ty(*v)) {
+                return;
+            }
+            let places = match e {
+                Expr::Addr(p) => vec![p.clone()],
+                Expr::Call(g, args) => {
+                    let params = &m.functions[g.index()].params;
+                    let places = args.iter().zip(params).filter_map(|(a, p)| match a {
+                        Arg::Place(pl) if p.mutable => Some(pl.clone()),
+                        _ => None,
+                    });
+                    places.collect()
+                }
+                Expr::Extract(..)
+                | Expr::ExtractDyn(..)
+                | Expr::Construct(..)
+                | Expr::Select { .. } => {
+                    let mut places = Vec::new();
+                    let mut known = true;
+                    e.for_each_value(&mut |x| match into.get(&x) {
+                        Some(ps) => places.extend(ps.iter().cloned()),
+                        None => known &= !has_ptr(&m.types, f.value_ty(x)),
+                    });
+                    if !known {
+                        return;
                     }
-                    _ => {}
-                },
-                Stmt::Store(p, _) => place(p),
-                Stmt::If { then, else_, .. } => {
-                    stack.push(then);
-                    stack.push(else_);
+                    places
                 }
-                Stmt::Loop { body, continuing } => {
-                    stack.push(body);
-                    stack.push(continuing);
-                }
-                _ => {}
+                _ => return,
+            };
+            into.insert(*v, places);
+        });
+        Pointers { into }
+    }
+
+    /// The locals and parameters the pointer `v` may point into. `None` when it can't tell.
+    pub(crate) fn roots(&self, v: ValueId, into: &mut Vec<PlaceRoot>) -> Option<()> {
+        for p in self.into.get(&v)? {
+            match &p.root {
+                PlaceRoot::Ptr(w) => self.roots(*w, into)?,
+                r => into.push(r.clone()),
             }
         }
+        Some(())
     }
 }
 
@@ -179,7 +242,7 @@ fn walk(
     b: &Block,
     a: &mut Activity,
     ctrl: Option<&HashSet<LocalId>>,
-    callee_returns: &mut dyn FnMut(FuncId, Vec<bool>) -> Result<bool>,
+    callee: &mut Callee<'_>,
 ) -> Result<()> {
     let (m, f, mode) = (cx.m, cx.f, cx.mode);
     let joined = |p: &Place| match (ctrl, &p.root) {
@@ -191,40 +254,42 @@ fn walk(
     for s in b {
         match s {
             Stmt::Let(v, e) => {
-                if let Expr::Call(g, args) = e {
-                    call_writes(m, a, *g, args, &joined);
-                }
-                let active = expr_active(e, a, callee_returns)? && carries(m, f.value_ty(*v), mode);
-                if active {
+                let active = match e {
+                    Expr::Call(g, args) => call(cx, a, *g, args, &joined, callee)?,
+                    e => expr_active(e, a),
+                };
+                if active && carries(m, f.value_ty(*v), mode) {
                     a.values[v.index()] = true;
                 }
             }
-            Stmt::Eval(Expr::Call(g, args)) => call_writes(m, a, *g, args, &joined),
+            Stmt::Eval(Expr::Call(g, args)) => {
+                call(cx, a, *g, args, &joined, callee)?;
+            }
             Stmt::Eval(_) => {}
             Stmt::Store(p, v) => {
                 if a.values[v.index()] || joined(p) {
-                    mark_place(a, p);
+                    cx.mark(a, p);
                 }
             }
             Stmt::If { cond, then, else_ } => {
                 if mode == Mode::Interval && a.values[cond.index()] {
                     let mut inside = vec![0u32; f.locals.len()];
-                    count_local_uses(then, &mut inside);
-                    count_local_uses(else_, &mut inside);
+                    visit::count_local_mentions(then, &mut inside);
+                    visit::count_local_mentions(else_, &mut inside);
                     let internal: HashSet<LocalId> = (0..f.locals.len())
                         .filter(|&l| inside[l] > 0 && inside[l] == cx.uses[l])
                         .map(|l| LocalId(l as u32))
                         .collect();
-                    walk(cx, then, a, Some(&internal), callee_returns)?;
-                    walk(cx, else_, a, Some(&internal), callee_returns)?;
+                    walk(cx, then, a, Some(&internal), callee)?;
+                    walk(cx, else_, a, Some(&internal), callee)?;
                 } else {
-                    walk(cx, then, a, ctrl, callee_returns)?;
-                    walk(cx, else_, a, ctrl, callee_returns)?;
+                    walk(cx, then, a, ctrl, callee)?;
+                    walk(cx, else_, a, ctrl, callee)?;
                 }
             }
             Stmt::Loop { body, continuing } => {
-                walk(cx, body, a, ctrl, callee_returns)?;
-                walk(cx, continuing, a, ctrl, callee_returns)?;
+                walk(cx, body, a, ctrl, callee)?;
+                walk(cx, continuing, a, ctrl, callee)?;
                 if mode == Mode::Interval
                     && a.active_loop_exit.is_none()
                     && let Some(exit) = loop_exit(body, a, at)
@@ -277,23 +342,29 @@ fn loop_exit(
     None
 }
 
-/// A callee given active arguments may write active values through its `mut` parameters, and
-/// in interval mode, so may one that runs under a condition on the input (`joined`).
-fn call_writes(
-    m: &Module,
+/// A call: whether its result is active. A callee given active arguments may write active
+/// values through its `mut` parameters (those its own activity marks), and in interval mode,
+/// so may one that runs under a condition on the input (`joined`).
+fn call(
+    cx: &Walk<'_>,
     a: &mut Activity,
     g: FuncId,
     args: &[Arg],
     joined: &dyn Fn(&Place) -> bool,
-) {
-    let any = args.iter().any(|x| arg_active(a, x));
-    for (arg, p) in args.iter().zip(&m.functions[g.index()].params) {
+    callee: &mut Callee<'_>,
+) -> Result<bool> {
+    let mask: Vec<bool> = args.iter().map(|x| arg_active(a, x)).collect();
+    // Arguments map to the callee's parameters one to one.
+    let effect = if mask.iter().any(|b| *b) { Some(callee(g, mask)?) } else { None };
+    for (i, (arg, p)) in args.iter().zip(&cx.m.functions[g.index()].params).enumerate() {
+        let writes = effect.as_ref().is_some_and(|e| e.writes[i]);
         if let (Arg::Place(pl), true) = (arg, p.mutable)
-            && (any || joined(pl))
+            && (writes || joined(pl))
         {
-            mark_place(a, pl);
+            cx.mark(a, pl);
         }
     }
+    Ok(effect.is_some_and(|e| e.returns))
 }
 
 fn mark_place(a: &mut Activity, p: &Place) {
@@ -304,13 +375,9 @@ fn mark_place(a: &mut Activity, p: &Place) {
     }
 }
 
-fn expr_active(
-    e: &Expr,
-    a: &Activity,
-    callee_returns: &mut dyn FnMut(FuncId, Vec<bool>) -> Result<bool>,
-) -> Result<bool> {
+fn expr_active(e: &Expr, a: &Activity) -> bool {
     let v = |x: &ValueId| a.values[x.index()];
-    Ok(match e {
+    match e {
         Expr::Const(_) | Expr::Zero(_) | Expr::EntryInput(_) => false,
         Expr::Param(i) => a.params[*i as usize],
         Expr::Load(p) | Expr::Run(p) | Expr::Addr(p) | Expr::ArrayLength(p) => {
@@ -327,22 +394,12 @@ fn expr_active(
         Expr::Binary(_, x, y) | Expr::ExtractDyn(x, y) => v(x) || v(y),
         Expr::Builtin(_, xs) | Expr::Construct(_, xs) | Expr::Host(_, xs) => xs.iter().any(v),
         Expr::Select { cond, if_true, if_false } => v(cond) || v(if_true) || v(if_false),
-        Expr::Call(g, args) => {
-            let mask: Vec<bool> = args.iter().map(|x| arg_active(a, x)).collect();
-            if !mask.iter().any(|b| *b) {
-                false
-            } else {
-                // Arguments map to the callee's parameters one to one.
-                callee_returns(*g, mask)?
-            }
-        }
-    })
+        Expr::Call(..) => unreachable!("calls are handled in `call`"),
+    }
 }
 
-/// Every statement's block, recursively: for `Let`s, gather their types.
 /// Whether `f` with these active parameters returns an active value: a derivative (for
-/// [`Mode::Ad`], of a float result) or a range. Memoized; a recursive call still being analyzed
-/// is assumed active.
+/// [`Mode::Ad`], of a float result) or a range.
 pub(super) fn returns_active(
     m: &Module,
     cache: &mut DeriveCache,
@@ -350,30 +407,115 @@ pub(super) fn returns_active(
     mask: Vec<bool>,
     mode: Mode,
 ) -> Result<bool> {
-    let key = (mode, f, mask);
-    if let Some(&r) = cache.returns.get(&key) {
-        return Ok(r);
-    }
-    cache.returns.insert(key.clone(), true);
-    let func = &m.functions[f.index()];
-    let a = activity(m, func, &key.2, mode, &mut |g, mk| returns_active(m, cache, g, mk, mode))?;
-    let r = a.returns && func.ret.is_some_and(|t| mode == Mode::Interval || m.types.has_float(t));
-    cache.returns.insert(key, r);
-    Ok(r)
+    Ok(effect(m, cache, f, mask, mode)?.returns)
 }
 
-/// Loads of a place that nothing wrote between are the same value, so `x * x` and `dot(v, v)`
-/// can get the rules for squares. Tracked within a straight run of statements.
+/// What a call of `f` with these active parameters does. Memoized; a recursive call still being
+/// analyzed is assumed to return an active value and to write through every `mut` parameter.
+pub(super) fn effect(
+    m: &Module,
+    cache: &mut DeriveCache,
+    f: FuncId,
+    mask: Vec<bool>,
+    mode: Mode,
+) -> Result<Effect> {
+    let func = &m.functions[f.index()];
+    let key = (mode, f, mask);
+    match cache.effects.get(&key) {
+        Some(Some(e)) => return Ok(e.clone()),
+        Some(None) => {
+            let writes = func.params.iter().map(|p| p.mutable).collect();
+            return Ok(Effect { returns: true, writes });
+        }
+        None => {}
+    }
+    cache.effects.insert(key.clone(), None);
+    let mut assumed = false;
+    let a = activity(m, func, &key.2, mode, &mut |g, mk| {
+        assumed |= matches!(cache.effects.get(&(mode, g, mk.clone())), Some(None));
+        effect(m, cache, g, mk, mode)
+    })?;
+    let returns =
+        a.returns && func.ret.is_some_and(|t| mode == Mode::Interval || m.types.has_float(t));
+    let writes = func.params.iter().zip(&a.params).map(|(p, w)| p.mutable && *w).collect();
+    let e = Effect { returns, writes };
+    cache.effects.insert(key.clone(), Some(e.clone()));
+    // An activity that took no answer from a function still being analyzed is final: deriving
+    // `f` would find it again.
+    if !assumed {
+        cache.activity.insert(key, a);
+    }
+    Ok(e)
+}
+
+/// The activity of `f`'s body with active parameters `mask`: the one [`effect`] kept, if it
+/// did.
+pub(super) fn body_activity(
+    m: &Module,
+    cache: &mut DeriveCache,
+    f: FuncId,
+    mask: &[bool],
+    mode: Mode,
+) -> Result<Activity> {
+    if let Some(a) = cache.activity.get(&(mode, f, mask.to_vec())) {
+        return Ok(a.clone());
+    }
+    activity(m, &m.functions[f.index()], mask, mode, &mut |g, mk| effect(m, cache, g, mk, mode))
+}
+
+/// What both derivations build code with. Each emits a value its own way; the rest is the same.
+pub(super) trait Builder {
+    /// A new value of type `ty`, defined as `e` in `out`.
+    fn emit(&mut self, out: &mut Block, ty: TypeId, e: Expr) -> ValueId;
+
+    fn types(&self) -> &Types;
+
+    /// The type of a value of the function being built.
+    fn ty(&self, v: ValueId) -> TypeId;
+
+    /// `x` as an operand of type `to` (see [`splat_size`]).
+    fn coerce(&mut self, out: &mut Block, x: ValueId, to: TypeId) -> ValueId {
+        match splat_size(self.types(), self.ty(x), to) {
+            Some(n) => self.emit(out, to, Expr::Splat(x, n)),
+            None => x,
+        }
+    }
+
+    /// `a op b` of type `ty`, a scalar operand splatted to a vector `ty` (the IR's elementwise
+    /// operations take one type).
+    fn bin(&mut self, out: &mut Block, op: BinOp, a: ValueId, b: ValueId, ty: TypeId) -> ValueId {
+        let (a, b) = (self.coerce(out, a, ty), self.coerce(out, b, ty));
+        self.emit(out, ty, Expr::Binary(op, a, b))
+    }
+
+    /// The builtin `b` of type `ty`; an elementwise one's scalar arguments are splatted to a
+    /// vector `ty`.
+    fn builtin(&mut self, out: &mut Block, b: Builtin, args: Vec<ValueId>, ty: TypeId) -> ValueId {
+        let args = if b.is_elementwise() {
+            args.into_iter().map(|x| self.coerce(out, x, ty)).collect()
+        } else {
+            args
+        };
+        self.emit(out, ty, Expr::Builtin(b, args))
+    }
+}
+
+/// What both derivations keep track of from one statement to the next: where in the source the
+/// statement is, and which loads are the same value. Two loads of a place that nothing wrote
+/// between are the same value, so `x * x` and `dot(v, v)` can get the rules for squares; this is
+/// tracked within a straight run of statements.
 #[derive(Default)]
-pub(super) struct LoadTwins {
+pub(super) struct Track {
     loads: Vec<(Place, ValueId)>,
     /// A load's earlier twin.
     same: HashMap<ValueId, ValueId>,
+    /// Where in the source the statement being derived is (the last `Stmt::At`), for errors.
+    at: Option<wrela_diag::Span>,
 }
 
-impl LoadTwins {
-    /// Before a statement: notes a load, and forgets the loads a write, a call or a branch may
-    /// change.
+impl Track {
+    /// Before deriving a statement: notes where it is and a load, and forgets the loads a write,
+    /// a call or a branch may change.
     pub(super) fn before(&mut self, s: &Stmt) {
         match s {
             Stmt::Let(v, Expr::Load(p)) => match self.loads.iter().find(|(q, _)| q == p) {
@@ -387,20 +529,18 @@ impl LoadTwins {
             | Stmt::Store(..)
             | Stmt::If { .. }
             | Stmt::Loop { .. } => self.loads.clear(),
-            Stmt::Let(..)
-            | Stmt::Break
-            | Stmt::Continue
-            | Stmt::Return(_)
-            | Stmt::Trap
-            | Stmt::At(_) => {}
+            Stmt::At(span) => self.at = Some(*span),
+            Stmt::Let(..) | Stmt::Break | Stmt::Continue | Stmt::Return(_) | Stmt::Trap => {}
         }
     }
 
-    /// After a statement: forgets the loads made in its blocks.
-    pub(super) fn after(&mut self, s: &Stmt) {
-        if s.blocks().iter().any(|b| !b.is_empty()) {
+    /// After deriving a statement, with result `r`: forgets the loads made in its blocks, and
+    /// places an error at the statement.
+    pub(super) fn after(&mut self, s: &Stmt, r: Result<()>) -> Result<()> {
+        if s.blocks().any(|b| !b.is_empty()) {
             self.loads.clear();
         }
+        r.map_err(|e| e.at(self.at))
     }
 
     /// Whether two values are surely equal: the same value, or loads of an unchanged place.
@@ -439,26 +579,24 @@ pub(super) fn pass_through(
     Ok(())
 }
 
-pub(crate) fn has_host_or_ptr(
+/// Where a block records GPU work (a host operation), which a derived function can't do: the
+/// last `At` before it (`at` before the block).
+pub(crate) fn records_gpu_work(
     b: &Block,
     mut at: Option<wrela_diag::Span>,
-) -> Option<(&'static str, Option<wrela_diag::Span>)> {
+) -> Option<Option<wrela_diag::Span>> {
     for s in b {
         match s {
             Stmt::At(span) => at = Some(*span),
-            Stmt::Let(_, Expr::Host(..)) | Stmt::Eval(Expr::Host(..)) => {
-                return Some(("records GPU work, which a derived function can't do", at));
-            }
-            Stmt::Let(_, Expr::Addr(_)) => {
-                return Some(("returns a projection, which a derived function can't do", at));
-            }
+            Stmt::Let(_, Expr::Host(..)) | Stmt::Eval(Expr::Host(..)) => return Some(at),
             Stmt::If { then, else_, .. } => {
-                if let Some(r) = has_host_or_ptr(then, at).or_else(|| has_host_or_ptr(else_, at)) {
+                if let Some(r) = records_gpu_work(then, at).or_else(|| records_gpu_work(else_, at))
+                {
                     return Some(r);
                 }
             }
             Stmt::Loop { body, continuing } => {
-                let r = has_host_or_ptr(body, at).or_else(|| has_host_or_ptr(continuing, at));
+                let r = records_gpu_work(body, at).or_else(|| records_gpu_work(continuing, at));
                 if r.is_some() {
                     return r;
                 }
@@ -467,6 +605,19 @@ pub(crate) fn has_host_or_ptr(
         }
     }
     None
+}
+
+/// Whether a value of type `t` holds a pointer.
+fn has_ptr(types: &Types, t: TypeId) -> bool {
+    match types.get(t) {
+        TypeDef::Ptr(_) => true,
+        TypeDef::Struct { fields, .. } => fields.iter().any(|(_, f)| has_ptr(types, *f)),
+        TypeDef::Enum { variants, .. } => {
+            variants.iter().any(|(_, p)| p.is_some_and(|p| has_ptr(types, p)))
+        }
+        TypeDef::Array(e, _) => has_ptr(types, *e),
+        _ => false,
+    }
 }
 
 /// The type of a place.

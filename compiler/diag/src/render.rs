@@ -10,6 +10,7 @@
 //! ```
 
 use crate::diagnostic::{Diagnostic, Label};
+use crate::plural;
 use crate::source::SourceMap;
 use std::fmt::Write;
 
@@ -25,35 +26,30 @@ pub fn render(map: &SourceMap, d: &Diagnostic) -> String {
     };
     let file = map.file(primary.span.file);
     let lc = file.line_col(primary.span.start);
-    let mut labels: Vec<&Label> = vec![primary];
-    labels.extend(d.secondary.iter().filter(|l| l.span.file == primary.span.file));
-    let width = labels
-        .iter()
-        .map(|l| (file.line_index(l.span.start) + 1).to_string().len())
-        .max()
-        .unwrap_or(1);
+    // Each label in this file, with the 0-based line it starts on.
+    let labels: Vec<(&Label, usize)> = std::iter::once(primary)
+        .chain(d.secondary.iter().filter(|l| l.span.file == primary.span.file))
+        .map(|l| (l, file.line_index(l.span.start)))
+        .collect();
+    let width = labels.iter().map(|(_, line)| (line + 1).to_string().len()).max().unwrap_or(1);
     let pad = " ".repeat(width);
     let _ = writeln!(out, "{pad}--> {}:{}:{}", file.name, lc.line, lc.column);
     let _ = writeln!(out, "{pad} |");
-    let mut lines: Vec<usize> = labels.iter().map(|l| file.line_index(l.span.start)).collect();
+    let mut lines: Vec<usize> = labels.iter().map(|&(_, line)| line).collect();
     lines.sort_unstable();
     lines.dedup();
     for line in lines {
         let text = file.line_text(line);
         let _ = writeln!(out, "{:>width$} | {}", line + 1, text.replace('\t', "    "));
-        for (i, label) in labels.iter().enumerate() {
-            if file.line_index(label.span.start) != line {
+        for (i, &(label, at)) in labels.iter().enumerate() {
+            if at != line {
                 continue;
             }
             let start = file.line_col(label.span.start).column as usize - 1;
-            let end_offset = label.span.end.min(line_end(file, line));
+            let end_offset = label.span.end.min(file.line_end(line));
             let end = (file.line_col(end_offset).column as usize - 1).max(start + 1);
-            let prefix: String = text
-                .chars()
-                .take(start)
-                .map(|c| if c == '\t' { "    " } else { " " })
-                .collect::<Vec<_>>()
-                .concat();
+            let prefix: String =
+                text.chars().take(start).map(|c| if c == '\t' { "    " } else { " " }).collect();
             let mark = if i == 0 { "^" } else { "-" };
             let marks = mark.repeat(end - start);
             match &label.message {
@@ -84,10 +80,6 @@ pub fn render(map: &SourceMap, d: &Diagnostic) -> String {
     out
 }
 
-fn line_end(file: &crate::source::SourceFile, line: usize) -> u32 {
-    file.line_bounds(line).1
-}
-
 /// Renders every diagnostic, then a summary line when there are errors.
 pub fn render_all(map: &SourceMap, diags: &[Diagnostic]) -> String {
     let mut out = String::new();
@@ -102,9 +94,9 @@ pub fn render_all(map: &SourceMap, diags: &[Diagnostic]) -> String {
             out,
             "{} error{}{}",
             errors,
-            if errors == 1 { "" } else { "s" },
+            plural(errors),
             if warnings > 0 {
-                format!(", {} warning{}", warnings, if warnings == 1 { "" } else { "s" })
+                format!(", {} warning{}", warnings, plural(warnings))
             } else {
                 String::new()
             }

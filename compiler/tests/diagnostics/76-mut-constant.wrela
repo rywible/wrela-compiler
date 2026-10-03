@@ -1,0 +1,13 @@
+// mistake: lending a constant `mut`, as if it were a place
+// expect: E0512
+// fix: no
+const START: f32 = 1.0
+
+fn grow(x: mut f32) {
+    x *= 2.0
+}
+
+pub fn twice() -> f32 {
+    grow(mut START)
+    START
+}

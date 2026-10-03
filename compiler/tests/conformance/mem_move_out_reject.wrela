@@ -19,3 +19,28 @@ fn element() -> u32 {
     var logs = [Log { count: 1 }, Log { count: 2 }]
     archive(take logs[0]) //~ E0502
 }
+
+// A binding whose type is inferred after the pattern is still a projection: one `Log`, not two.
+fn inferred_later() -> u32 {
+    let o = Some(Log { count: 7 })
+    let f = |p| match p {
+        Some(x) => archive(take x), //~ E0502
+        None => 0,
+    }
+    f(o)
+}
+
+fn loop_carried() -> u32 {
+    var o = None
+    var total = 0
+    for i in 0..2 {
+        match o {
+            Some(x) => { total += archive(take x) } //~ E0502
+            None => {}
+        }
+        if i == 0 {
+            o = Some(Log { count: 7 })
+        }
+    }
+    total
+}

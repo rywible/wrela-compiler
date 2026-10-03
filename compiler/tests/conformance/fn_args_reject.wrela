@@ -10,3 +10,19 @@ fn f() -> f32 {
     let e = area(1.0, 2.0, 3.0) //~ E0301
     b + c + d + e
 }
+
+fn apply(f: fn(i32) -> i32, x: i32) -> i32 {
+    f(x)
+}
+
+// A closure passes to a `fn(..)` parameter only with as many parameters, wherever it's written.
+fn closures(k: i32) -> i32 {
+    let two = |a: i32, b: i32| a * 10 + b
+    let none = || 5
+    apply(two, k) + apply(none, k) //~ E0301 E0301
+}
+
+fn components() -> f32 {
+    let v = vec3(x: 1.0, x: 2.0) //~ E0304
+    v.x
+}

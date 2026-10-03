@@ -1,0 +1,18 @@
+// rejects: fn.return-trait
+use std::field::Surface
+
+fn a(n: u32) -> Surface {
+    b(n)
+}
+
+fn b(n: u32) -> Surface { //~ E0409
+    a(n)
+}
+
+fn moved(n: u32) -> Surface { //~ E0409
+    moved(n).translate(vec3(1.0, 0.0, 0.0))
+}
+
+pub fn g(x: f32) -> f32 {
+    a(3).distance(vec3(x, 0.0, 0.0)) + moved(1).distance(vec3())
+}

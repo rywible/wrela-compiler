@@ -1,0 +1,9 @@
+// mistake: a leading operator with a comment after it on its line
+// expect: E0103
+// fix: yes
+fn f(a: f32, b: f32) -> f32 {
+    let x = a
+        + // scaled by b on purpose
+        b
+    x
+}

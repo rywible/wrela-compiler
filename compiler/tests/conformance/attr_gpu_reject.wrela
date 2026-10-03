@@ -1,5 +1,34 @@
 // rejects: attr.gpu
+// A generic `@gpu` function is checked with a stand-in for each type parameter: what its own
+// code does is wrong for every type.
+use std::gpu::{GpuBuffer, buffer}
+
 @gpu
 fn wide(x: f32) -> f32 {
     f32(f64(x) * 2.0) //~ E0326
 }
+
+@gpu
+fn widen<T: Copy>(x: T) -> f32 {
+    let y: f64 = 2.0 //~ E0326
+    f32(y)
+}
+
+@gpu
+fn record(s: Copy) -> f32 {
+    let b: GpuBuffer<f32> = buffer(4) //~ E0600
+    1.0
+}
+
+trait Depth {
+    @gpu
+    fn depth(self, k: u32) -> u32 {
+        if k == 0 { 0 } else { self.depth(k - 1) } //~ E0600
+    }
+}
+
+struct Probe: Copy + Clone {
+    x: f32,
+}
+
+impl Depth for Probe {}

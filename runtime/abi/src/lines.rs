@@ -9,6 +9,8 @@
 //! UTF-8 bytes; then the number of entries, then each as an offset and a location number (0 for
 //! none, `k` for the `k`-th location).
 
+use std::collections::HashMap;
+
 /// The custom section's name.
 pub const SECTION: &str = "wrela.lines";
 
@@ -21,21 +23,25 @@ pub struct Lines {
 }
 
 impl Lines {
-    /// A table from `(offset, location)` entries in ascending offset order.
-    pub fn new(entries: &[(u32, Option<String>)]) -> Lines {
+    /// A table from `(offset, location)` entries in ascending offset order. Locations are
+    /// numbered in the order they first appear.
+    pub fn new(entries: impl IntoIterator<Item = (u32, Option<String>)>) -> Lines {
         let mut lines = Lines::default();
+        let mut numbers: HashMap<String, u32> = HashMap::new();
         for (offset, loc) in entries {
             let k = match loc {
                 None => 0,
-                Some(l) => match lines.locations.iter().position(|x| x == l) {
-                    Some(i) => i as u32 + 1,
+                Some(l) => match numbers.get(&l) {
+                    Some(&k) => k,
                     None => {
                         lines.locations.push(l.clone());
-                        lines.locations.len() as u32
+                        let k = lines.locations.len() as u32;
+                        numbers.insert(l, k);
+                        k
                     }
                 },
             };
-            lines.entries.push((*offset, k));
+            lines.entries.push((offset, k));
         }
         lines
     }
@@ -113,13 +119,18 @@ struct Reader<'a> {
 }
 
 impl<'a> Reader<'a> {
+    /// An unsigned LEB128 that fits in 32 bits, in at most 5 bytes.
     fn leb(&mut self) -> Result<u32, String> {
         let mut x = 0u32;
         for shift in (0..35).step_by(7) {
             let b = *self.bytes.get(self.at).ok_or("the section ends early")?;
             self.at += 1;
-            x |= u32::from(b & 0x7f).checked_shl(shift).ok_or("a number is too large")?;
+            x |= u32::from(b & 0x7f) << shift;
             if b & 0x80 == 0 {
+                // The fifth byte holds bits 28 to 34: past 31 is too large.
+                if shift == 28 && b > 0x0f {
+                    return Err("a number is too large".into());
+                }
                 return Ok(x);
             }
         }
@@ -135,21 +146,22 @@ impl<'a> Reader<'a> {
 
 /// The payload of the custom section `name` in a WASM module, if it has one.
 pub fn custom_section<'a>(module: &'a [u8], name: &str) -> Option<&'a [u8]> {
+    sections(module).filter(|&(id, _)| id == 0).find_map(|(_, body)| {
+        let mut b = Reader { bytes: body, at: 0 };
+        let n = b.leb().ok()? as usize;
+        (b.take(n).ok()? == name.as_bytes()).then(|| &body[b.at..])
+    })
+}
+
+/// A WASM module's sections, as (id, body), up to the first one it can't read.
+pub(crate) fn sections(module: &[u8]) -> impl Iterator<Item = (u8, &[u8])> {
     let mut r = Reader { bytes: module, at: 8 };
-    while r.at < module.len() {
-        let id = *module.get(r.at)?;
+    std::iter::from_fn(move || {
+        let id = *r.bytes.get(r.at)?;
         r.at += 1;
         let size = r.leb().ok()? as usize;
-        let body = r.take(size).ok()?;
-        if id == 0 {
-            let mut b = Reader { bytes: body, at: 0 };
-            let n = b.leb().ok()? as usize;
-            if b.take(n).ok()? == name.as_bytes() {
-                return Some(&body[b.at..]);
-            }
-        }
-    }
-    None
+        Some((id, r.take(size).ok()?))
+    })
 }
 
 #[cfg(test)]
@@ -158,7 +170,7 @@ mod tests {
 
     #[test]
     fn locations_by_offset() {
-        let lines = Lines::new(&[
+        let lines = Lines::new([
             (10, None),
             (12, Some("main.wrela:3:5".into())),
             (20, Some("main.wrela:4:5".into())),

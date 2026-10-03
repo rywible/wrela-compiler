@@ -4,8 +4,10 @@ use crate::builtins::{BuiltinFn, BuiltinTy};
 use crate::ty::*;
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
-use wrela_diag::{FileId, Span};
+use wrela_diag::Span;
 use wrela_syntax::ast;
+
+pub use wrela_syntax::ast::{Mode, RetMode};
 
 /// What a name refers to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -34,14 +36,12 @@ pub struct Binding {
 pub struct Module {
     /// `["shapes", "blob"]`; std modules start with `"std"`.
     pub path: Vec<String>,
-    pub file: Option<FileId>,
     pub children: BTreeMap<String, ModuleId>,
     pub scope: BTreeMap<String, Binding>,
     /// The names of items that failed to parse (and of imports of them). Their errors are
     /// reported, so uses of them aren't.
     pub broken: BTreeSet<String>,
     pub is_std: bool,
-    pub ast: Option<Rc<ast::File>>,
 }
 
 impl Module {
@@ -55,6 +55,16 @@ impl Module {
 pub struct TraitRef {
     pub trait_: TraitId,
     pub args: Vec<TyId>,
+}
+
+impl TraitRef {
+    /// The same trait, with `s` applied to its arguments.
+    pub fn subst(&self, types: &Types, s: &Subst) -> TraitRef {
+        TraitRef {
+            trait_: self.trait_,
+            args: self.args.iter().map(|&a| types.subst(a, s)).collect(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -97,89 +107,67 @@ pub enum AdtKind {
     Enum(Vec<VariantDef>),
 }
 
-/// Compiler-known std items, found by path when the std library loads.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Lang {
-    Option,
-    Copy,
-    Clone,
-    GpuData,
-    GpuBuffer,
-    Slots,
-    GlobalId,
-    LocalId,
-    WorkgroupId,
-    VertexIndex,
-    InstanceIndex,
-    FragCoord,
-    ClipPosition,
-    Flat,
-    Interval,
-    Domain,
-    Dispatch,
-    Draw,
-    Gradient,
-    ValueAndGradient,
-    IntervalOf,
-    Buffer,
-    Write,
-    BeginScreenPass,
-    Present,
-    CpuSin,
-    CpuCos,
-    CpuTan,
-    CpuAsin,
-    CpuAcos,
-    CpuAtan,
-    CpuAtan2,
-    CpuExp,
-    CpuExp2,
-    CpuLog,
-    CpuLog2,
-    CpuPow,
+/// The compiler-known std items, one row each: the variant and where it lives in std.
+macro_rules! lang_items {
+    ($( $v:ident = $path:literal, )*) => {
+        /// Compiler-known std items, found by path when the std library loads.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+        pub enum Lang {
+            $( $v, )*
+        }
+
+        impl Lang {
+            /// Where each lang item lives in std.
+            pub const PATHS: &'static [(Lang, &'static str)] = &[$( (Lang::$v, $path), )*];
+        }
+    };
+}
+
+lang_items! {
+    Option = "std::prelude::Option",
+    Copy = "std::prelude::Copy",
+    Clone = "std::prelude::Clone",
+    GpuData = "std::prelude::GpuData",
+    GpuBuffer = "std::gpu::GpuBuffer",
+    Slots = "std::gpu::Slots",
+    GlobalId = "std::gpu::GlobalId",
+    LocalId = "std::gpu::LocalId",
+    WorkgroupId = "std::gpu::WorkgroupId",
+    VertexIndex = "std::gpu::VertexIndex",
+    InstanceIndex = "std::gpu::InstanceIndex",
+    FragCoord = "std::gpu::FragCoord",
+    ClipPosition = "std::gpu::ClipPosition",
+    Flat = "std::gpu::Flat",
+    Dispatch = "std::gpu::dispatch",
+    Draw = "std::gpu::draw",
+    Buffer = "std::gpu::buffer",
+    Write = "std::gpu::write",
+    BeginScreenPass = "std::gpu::begin_screen_pass",
+    Present = "std::gpu::present",
+    Interval = "std::derive::Interval",
+    Domain = "std::derive::Domain",
+    Gradient = "std::derive::gradient",
+    ValueAndGradient = "std::derive::value_and_gradient",
+    IntervalOf = "std::derive::interval",
+    CpuSin = "std::math::sin",
+    CpuCos = "std::math::cos",
+    CpuTan = "std::math::tan",
+    CpuAsin = "std::math::asin",
+    CpuAcos = "std::math::acos",
+    CpuAtan = "std::math::atan",
+    CpuAtan2 = "std::math::atan2",
+    CpuExp = "std::math::exp",
+    CpuExp2 = "std::math::exp2",
+    CpuLog = "std::math::log",
+    CpuLog2 = "std::math::log2",
+    CpuPow = "std::math::pow",
 }
 
 impl Lang {
-    /// Where each lang item lives in std.
-    pub const PATHS: &'static [(Lang, &'static str)] = &[
-        (Lang::Option, "std::prelude::Option"),
-        (Lang::Copy, "std::prelude::Copy"),
-        (Lang::Clone, "std::prelude::Clone"),
-        (Lang::GpuData, "std::prelude::GpuData"),
-        (Lang::GpuBuffer, "std::gpu::GpuBuffer"),
-        (Lang::Slots, "std::gpu::Slots"),
-        (Lang::GlobalId, "std::gpu::GlobalId"),
-        (Lang::LocalId, "std::gpu::LocalId"),
-        (Lang::WorkgroupId, "std::gpu::WorkgroupId"),
-        (Lang::VertexIndex, "std::gpu::VertexIndex"),
-        (Lang::InstanceIndex, "std::gpu::InstanceIndex"),
-        (Lang::FragCoord, "std::gpu::FragCoord"),
-        (Lang::ClipPosition, "std::gpu::ClipPosition"),
-        (Lang::Flat, "std::gpu::Flat"),
-        (Lang::Dispatch, "std::gpu::dispatch"),
-        (Lang::Draw, "std::gpu::draw"),
-        (Lang::Buffer, "std::gpu::buffer"),
-        (Lang::Write, "std::gpu::write"),
-        (Lang::BeginScreenPass, "std::gpu::begin_screen_pass"),
-        (Lang::Present, "std::gpu::present"),
-        (Lang::Interval, "std::derive::Interval"),
-        (Lang::Domain, "std::derive::Domain"),
-        (Lang::Gradient, "std::derive::gradient"),
-        (Lang::ValueAndGradient, "std::derive::value_and_gradient"),
-        (Lang::IntervalOf, "std::derive::interval"),
-        (Lang::CpuSin, "std::math::sin"),
-        (Lang::CpuCos, "std::math::cos"),
-        (Lang::CpuTan, "std::math::tan"),
-        (Lang::CpuAsin, "std::math::asin"),
-        (Lang::CpuAcos, "std::math::acos"),
-        (Lang::CpuAtan, "std::math::atan"),
-        (Lang::CpuAtan2, "std::math::atan2"),
-        (Lang::CpuExp, "std::math::exp"),
-        (Lang::CpuExp2, "std::math::exp2"),
-        (Lang::CpuLog, "std::math::log"),
-        (Lang::CpuLog2, "std::math::log2"),
-        (Lang::CpuPow, "std::math::pow"),
-    ];
+    /// `Copy`, `Clone` and `GpuData`: traits a type has through its fields, by opting in.
+    pub fn is_structural(self) -> bool {
+        matches!(self, Lang::Copy | Lang::Clone | Lang::GpuData)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -211,6 +199,19 @@ impl AdtDef {
             AdtKind::Struct(_) => &[],
             AdtKind::Enum(v) => v,
         }
+    }
+    /// Every field of a struct, or of every variant of an enum, in order.
+    pub fn all_fields(&self) -> impl Iterator<Item = &FieldDef> {
+        let variants = self.variants().iter().flat_map(|v| &v.fields);
+        self.fields().iter().chain(variants)
+    }
+    /// [`AdtDef::all_fields`], to change.
+    pub fn all_fields_mut(&mut self) -> impl Iterator<Item = &mut FieldDef> {
+        let (fields, variants): (&mut [FieldDef], &mut [VariantDef]) = match &mut self.kind {
+            AdtKind::Struct(f) => (f, &mut []),
+            AdtKind::Enum(v) => (&mut [], v),
+        };
+        fields.iter_mut().chain(variants.iter_mut().flat_map(|v| &mut v.fields))
     }
 }
 
@@ -256,40 +257,6 @@ pub enum FnOwner {
     Trait(TraitId),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Mode {
-    Borrow,
-    Mut,
-    Take,
-}
-
-impl From<ast::Mode> for Mode {
-    fn from(m: ast::Mode) -> Mode {
-        match m {
-            ast::Mode::Borrow => Mode::Borrow,
-            ast::Mode::Mut => Mode::Mut,
-            ast::Mode::Take => Mode::Take,
-        }
-    }
-}
-
-impl Mode {
-    pub fn keyword(self) -> &'static str {
-        match self {
-            Mode::Borrow => "borrow",
-            Mode::Mut => "mut",
-            Mode::Take => "take",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum RetMode {
-    Owned,
-    Borrow,
-    Mut,
-}
-
 #[derive(Clone, Debug)]
 pub struct ParamSig {
     pub name: String,
@@ -307,6 +274,17 @@ pub enum Entry {
     Compute([u32; 3]),
     Vertex,
     Fragment,
+}
+
+impl Entry {
+    /// The stage, as diagnostics name it: "a `@vertex` shader".
+    pub fn describe(self) -> &'static str {
+        match self {
+            Entry::Compute(_) => "a `@compute` kernel",
+            Entry::Vertex => "a `@vertex` shader",
+            Entry::Fragment => "a `@fragment` shader",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]

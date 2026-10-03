@@ -1,0 +1,46 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0103",
+      "file": "main.wrela",
+      "fixes": [
+        {
+          "edits": [
+            {
+              "end": 139,
+              "file": "main.wrela",
+              "replacement": " +",
+              "start": 139
+            },
+            {
+              "end": 150,
+              "file": "main.wrela",
+              "replacement": "",
+              "start": 148
+            }
+          ],
+          "message": "put `+` at the end of the previous line"
+        }
+      ],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "a line can't start with the binary operator `+`",
+      "notes": [
+        "a line break ends a statement; an operator that continues an expression goes at the end of the line before (D-079)"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 9,
+        "end": 149,
+        "end_column": 10,
+        "end_line": 6,
+        "line": 6,
+        "start": 148
+      },
+      "title": "a binary operator at the start of a line"
+    }
+  ],
+  "version": 2
+}

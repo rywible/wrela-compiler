@@ -5,11 +5,13 @@
 use crate::common;
 
 use wrela_grammar::ebnf::Grammar;
-use wrela_grammar::gbnf::export;
+use wrela_grammar::gbnf::{export, spec_path};
+use wrela_grammar::rng::default_threads;
 use wrela_grammar::sampler::{Gbnf, check_samples};
+use wrela_grammar::testing::{sized, with_big_stack};
 
 fn checked_in() -> String {
-    let path = common::repo_root().join("spec/wrela.gbnf");
+    let path = spec_path();
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("reading {}: {e}", path.display()))
 }
 
@@ -25,9 +27,8 @@ fn the_checked_in_gbnf_is_current() {
 #[test]
 fn every_sampled_program_parses() {
     let g = Gbnf::parse(&checked_in()).expect("reading spec/wrela.gbnf");
-    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
     // The oracle check is left to `gbnf-sample`: at opt-level 0 it would dominate the run.
-    let stats = check_samples(&g, None, 10_000, 0x6b6e, threads);
+    let stats = check_samples(&g, None, 10_000, 0x6b6e, default_threads());
     let report = stats.report();
     println!("{report}");
     assert!(stats.rejected.is_empty() && stats.disagreements.is_empty(), "{report}");
@@ -77,9 +78,10 @@ fn ordinary_layouts_are_in_the_language() {
         "struct S {\n    a: f32\n}\n\nenum E { A, B }\n",
         "fn f() { match x {\n    A => 1\n    B => 2,\n} }\n",
         "fn f() { let x: Option<Option<u32>> = y; t.0 .1 }",
+        "fn f() { t.0.1 + pair.0.x + 2.0.sqrt() + 1.max(2) + 1e5.abs() + 1 .0 }",
         "@compute(64)\nfn f() {}\n",
     ];
-    common::with_big_stack(|| {
+    with_big_stack(|| {
         for src in layouts {
             assert!(g.recognizes(g.root, src), "not in the GBNF language:\n{src}");
         }
@@ -91,9 +93,50 @@ fn ordinary_layouts_are_in_the_language() {
             "fn f() { if a {}\n else {} }",
             "fn f() { a b }",
             "fn f() { match x { a => 1 b => 2 } }",
+            // A number takes a `.` and a digit (L12): this is one malformed number.
+            "fn f() { 1e5.5 }",
         ];
         for src in invalid {
             assert!(!g.recognizes(g.root, src), "should not be in the GBNF language:\n{src}");
         }
+    });
+}
+
+/// The formatter's layout is in the GBNF: grammar-generated programs (tier 0, with tuple
+/// indexes the GBNF can write: up to four decimal digits), formatted.
+#[test]
+fn formatted_programs_are_in_the_language() {
+    use wrela_grammar::generate::{Coverage, GenConfig, Generator};
+    use wrela_grammar::rng::Rng;
+    use wrela_syntax::TokenKind as T;
+    let g = Gbnf::parse(&checked_in()).unwrap();
+    let grammar = Grammar::spec();
+    let generator = Generator::new(&grammar, GenConfig::default());
+    let mut cov = Coverage::new(&grammar);
+    with_big_stack(|| {
+        let mut formatted = 0;
+        for seed in 0..sized(2000, 5000) {
+            let mut rng = Rng::new(seed);
+            let terms = generator.generate(&mut rng, &mut cov);
+            let src = generator.render(&terms, &mut rng).text;
+            let p = wrela_syntax::parse(wrela_diag::FileId(0), &src);
+            let tokens = wrela_syntax::lex(wrela_diag::FileId(0), &src).tokens;
+            let odd_index = |w: &[wrela_syntax::Token]| {
+                let index = &src[w[1].span.range()];
+                w[0].kind == T::Dot
+                    && w[1].kind == T::Int
+                    && (index.len() > 4 || !index.bytes().all(|b| b.is_ascii_digit()))
+            };
+            if p.has_errors()
+                || tokens.iter().any(|t| matches!(t.kind, T::Str | T::Suffixed))
+                || tokens.windows(2).any(odd_index)
+            {
+                continue;
+            }
+            let out = wrela_syntax::fmt::format(&p, &src);
+            assert!(g.recognizes(g.root, &out), "not in the GBNF language:\n{out}");
+            formatted += 1;
+        }
+        assert!(formatted > 1000, "only {formatted} programs");
     });
 }

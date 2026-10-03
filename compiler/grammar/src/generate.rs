@@ -21,8 +21,9 @@
 //! the parser split them again (`>>`, `>=`, `>>=`). A NEWLINE the lexer can't produce where the
 //! grammar put it (after `{` or `,`, say) is still rendered as a line break, which is then just
 //! whitespace; [`Rendered::dropped_newlines`] counts those, because the program then differs
-//! from the derivation. The renderer checks its output by lexing it and panics if the tokens
-//! differ from the ones it meant to write: that would be a bug here, not in the compiler.
+//! from the derivation. The renderer checks its output by lexing it and panics if the tokens,
+//! NEWLINEs included, differ from the ones it meant to write (a NEWLINE for each line break L17
+//! keeps): that would be a bug here, or in the lexer, not in the derivation.
 
 use crate::ebnf::{Expr, ExprId, expr_min_len};
 use crate::ebnf::{ExprKind, Grammar, RuleId, Terminal};
@@ -30,6 +31,7 @@ use crate::rng::Rng;
 use std::collections::HashSet;
 use wrela_diag::FileId;
 use wrela_syntax::TokenKind;
+use wrela_syntax::lexer::{Brackets, line_break_is_newline};
 
 #[derive(Clone, Debug)]
 pub struct GenConfig {
@@ -84,7 +86,9 @@ impl Coverage {
         }
     }
 
-    /// What the generator never did: each line names a rule and the part of it.
+    /// What the generator never did, where it got to: each line names a rule and the part of
+    /// it. (A part inside one never generated isn't listed: generating the outer part first
+    /// is what's missing.) Empty exactly when [`Coverage::hits`] is [`Coverage::branches`].
     pub fn gaps(&self, g: &Grammar) -> Vec<String> {
         let mut out = Vec::new();
         for (r, rule) in g.rules.iter().enumerate() {
@@ -93,47 +97,63 @@ impl Coverage {
                 continue;
             }
             crate::ebnf::visit(&rule.body, &mut |e| {
-                let what = match &e.kind {
-                    ExprKind::Alt(xs) => xs
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, x)| self.nodes[x.id] == 0)
-                        .map(|(i, _)| format!("alternative {} never taken", i + 1))
-                        .collect(),
-                    ExprKind::Opt(_) if self.nodes[e.id] > 0 && self.skipped[e.id] == 0 => {
-                        vec!["an optional part never left out".to_string()]
+                if self.nodes[e.id] == 0 {
+                    return;
+                }
+                for (i, (what, hit)) in self.branches_of(e).into_iter().enumerate() {
+                    if !hit {
+                        let what = what.replace("{}", &(i + 1).to_string());
+                        out.push(format!("{} (line {}): {what}", rule.name, rule.line));
                     }
-                    ExprKind::Star(_) if self.skipped[e.id] == 0 => {
-                        vec!["a `*` never empty".to_string()]
-                    }
-                    ExprKind::Star(_) | ExprKind::Plus(_) if self.repeated[e.id] == 0 => {
-                        vec!["a repetition never repeated".to_string()]
-                    }
-                    _ if self.nodes[e.id] == 0 => vec!["a part never generated".to_string()],
-                    _ => Vec::new(),
-                };
-                for w in what {
-                    out.push(format!("{} (line {}): {w}", rule.name, rule.line));
                 }
             });
         }
         out
     }
 
-    /// (alternatives, optional parts and repetitions exercised, of all of them).
-    pub fn branch_counts(&self, g: &Grammar) -> (usize, usize) {
-        let total = self.branch_total(g);
-        (total - self.gaps(g).len(), total)
+    /// The branches of node `e`, each with whether the generator took it.
+    fn branches_of(&self, e: &Expr) -> Vec<(&'static str, bool)> {
+        let taken = |x: &Expr| self.nodes[x.id] > 0;
+        match &e.kind {
+            ExprKind::Alt(xs) => {
+                xs.iter().map(|x| ("alternative {} never taken", taken(x))).collect()
+            }
+            ExprKind::Opt(x) => vec![
+                ("an optional part never taken", taken(x)),
+                ("an optional part never left out", self.skipped[e.id] > 0),
+            ],
+            ExprKind::Star(_) => vec![
+                ("a `*` never empty", self.skipped[e.id] > 0),
+                ("a repetition never repeated", self.repeated[e.id] > 0),
+            ],
+            ExprKind::Plus(_) => vec![("a repetition never repeated", self.repeated[e.id] > 0)],
+            ExprKind::Term(_) | ExprKind::Rule(_) | ExprKind::Seq(_) => Vec::new(),
+        }
     }
 
-    fn branch_total(&self, g: &Grammar) -> usize {
+    /// How many of the [`Coverage::branches`] the generator took.
+    pub fn hits(&self, g: &Grammar) -> usize {
+        let mut n = 0;
+        for (r, rule) in g.rules.iter().enumerate() {
+            n += usize::from(self.rules[r] > 0);
+            crate::ebnf::visit(&rule.body, &mut |e| {
+                n += self.branches_of(e).iter().filter(|(_, hit)| *hit).count();
+            });
+        }
+        n
+    }
+
+    /// How many rules, alternatives, optional parts and repetitions the grammar has, for the
+    /// coverage report (a `?` counts twice, taken and left out, and so does a `*`, left out and
+    /// repeated).
+    pub fn branches(g: &Grammar) -> usize {
         let mut n = g.rules.len();
         for rule in &g.rules {
             crate::ebnf::visit(&rule.body, &mut |e| {
                 n += match &e.kind {
                     ExprKind::Alt(xs) => xs.len(),
-                    ExprKind::Opt(_) | ExprKind::Plus(_) => 1,
-                    ExprKind::Star(_) => 2,
+                    ExprKind::Opt(_) | ExprKind::Star(_) => 2,
+                    ExprKind::Plus(_) => 1,
                     _ => 0,
                 };
             });
@@ -176,7 +196,8 @@ const IDENTS: &[&str] = &[
 const SUFFIXES: &[&str] = &["cm", "m", "kg", "deg", "px", "ms"];
 const STRINGS: &[&str] = &["\"hi\"", "\"\"", "\"a \\\"q\\\" b\"", "\"tab\\t\\n\"", "\"\\\\\""];
 
-fn is_word(k: TokenKind) -> bool {
+/// A name, keyword, number or `_`: two of them written together lex as one token.
+pub(crate) fn is_word(k: TokenKind) -> bool {
     matches!(
         k,
         TokenKind::Ident
@@ -187,20 +208,12 @@ fn is_word(k: TokenKind) -> bool {
     ) || k.is_keyword()
 }
 
-fn is_number(k: TokenKind) -> bool {
+pub(crate) fn is_number(k: TokenKind) -> bool {
     matches!(k, TokenKind::Int | TokenKind::Float | TokenKind::Suffixed)
 }
 
-/// The lexer's kind for a grammar terminal (GT_CLOSE is a `>`).
-pub fn lexer_kind(t: Terminal) -> TokenKind {
-    match t {
-        Terminal::Token(k) => k,
-        Terminal::GtClose => TokenKind::Gt,
-    }
-}
-
 /// Whether `a` then `b`, written with nothing between them, lex as exactly those two tokens.
-pub fn lexes_apart(a: TokenKind, a_text: &str, b: TokenKind, b_text: &str) -> bool {
+fn lexes_apart(a: TokenKind, a_text: &str, b: TokenKind, b_text: &str) -> bool {
     let src = format!("{a_text}{b_text}");
     let lexed = wrela_syntax::lex(FileId(0), &src);
     let kinds: Vec<TokenKind> =
@@ -210,7 +223,7 @@ pub fn lexes_apart(a: TokenKind, a_text: &str, b: TokenKind, b_text: &str) -> bo
 
 /// Representative texts of a token kind: for the classes, one of each form that lexes
 /// differently next to a neighbour (a `.` in a FLOAT or SUFFIXED, a radix prefix, an exponent).
-pub fn sample_texts(k: TokenKind) -> &'static [&'static str] {
+fn sample_texts(k: TokenKind) -> &'static [&'static str] {
     match k {
         TokenKind::Ident => &["a", "_a", "e1"],
         TokenKind::Int => &["1", "0x1F", "1_0", "0b1"],
@@ -222,28 +235,27 @@ pub fn sample_texts(k: TokenKind) -> &'static [&'static str] {
 }
 
 /// Every token kind but NEWLINE and EOF.
-pub fn all_kinds() -> Vec<TokenKind> {
-    let classes =
-        [TokenKind::Ident, TokenKind::Int, TokenKind::Float, TokenKind::Suffixed, TokenKind::Str];
-    classes.iter().chain(TokenKind::KEYWORDS).chain(TokenKind::PUNCT).copied().collect()
+fn all_kinds() -> impl Iterator<Item = TokenKind> {
+    let all = TokenKind::CLASSES.iter().chain(TokenKind::KEYWORDS).chain(TokenKind::PUNCT);
+    all.copied().filter(|k| !matches!(k, TokenKind::Newline | TokenKind::Eof))
 }
 
 /// The pairs of token kinds that can't be written next to each other without a space: two words
 /// (names, keywords, numbers, `_`), a number then `.` (`1.5` is one FLOAT), and every pair the
 /// lexer reads differently when joined (`-` `>`, `/` `/`, `.` `.`, …).
 pub fn no_glue_pairs() -> HashSet<(TokenKind, TokenKind)> {
-    let kinds = all_kinds();
+    let kinds: Vec<(TokenKind, Vec<&str>)> = all_kinds()
+        .map(|k| (k, k.fixed_text().map_or_else(|| sample_texts(k).to_vec(), |t| vec![t])))
+        .collect();
     let mut out = HashSet::new();
-    for &a in &kinds {
-        for &b in &kinds {
-            let texts = |k: TokenKind| match k.fixed_text() {
-                Some(t) => vec![t],
-                None => sample_texts(k).to_vec(),
-            };
-            let joins_badly =
-                texts(a).iter().any(|x| texts(b).iter().any(|y| !lexes_apart(a, x, b, y)));
-            if (is_word(a) && is_word(b)) || (is_number(a) && b == TokenKind::Dot) || joins_badly {
-                out.insert((a, b));
+    for (a, a_texts) in &kinds {
+        for (b, b_texts) in &kinds {
+            // The cheap tests first: the last one lexes every pair of texts.
+            if (is_word(*a) && is_word(*b))
+                || (is_number(*a) && *b == TokenKind::Dot)
+                || a_texts.iter().any(|x| b_texts.iter().any(|y| !lexes_apart(*a, x, *b, y)))
+            {
+                out.insert((*a, *b));
             }
         }
     }
@@ -487,11 +499,12 @@ impl<'g> Generator<'g> {
                     }
                 }
             }
-            // Values stay below 2^31, so any INT is also a valid tuple index.
+            // Any value: a tuple index too large for a `u32` is the parser's limit (E0006),
+            // which agreement leaves out.
             TokenKind::Int => match rng.below(7) {
                 0 => rng.below(10).to_string(),
                 1 => rng.below(1000).to_string(),
-                2 => (rng.next_u64() % (1 << 31)).to_string(),
+                2 => rng.next_u64().to_string(),
                 3 => format!("{}_{:03}", 1 + rng.below(999), rng.below(1000)),
                 4 => format!("0x{:X}", rng.below(1 << 16)),
                 5 => format!("0b{:b}", rng.below(64)),
@@ -524,7 +537,8 @@ impl<'g> Generator<'g> {
             text: String::new(),
             tokens: Vec::new(),
             dropped: 0,
-            stack: Vec::new(),
+            expected: Vec::new(),
+            brackets: Brackets::default(),
             gt_run: None,
             newline_pending: false,
         };
@@ -534,26 +548,23 @@ impl<'g> Generator<'g> {
                 Terminal::Token(TokenKind::Newline) => {
                     let next = terms[i + 1..]
                         .iter()
-                        .copied()
-                        .find(|t| *t != Terminal::Token(TokenKind::Newline));
+                        .map(|t| t.lexer_kind())
+                        .find(|k| *k != TokenKind::Newline)
+                        .unwrap_or(TokenKind::Eof);
                     r.newline(next, rng);
                 }
                 t => r.token(t, rng),
             }
         }
+        let expected = r.expected;
         let rendered = Rendered { text: r.text, tokens: r.tokens, dropped_newlines: r.dropped };
         let lexed = wrela_syntax::lex(FileId(0), &rendered.text);
-        let got: Vec<TokenKind> = lexed
-            .tokens
-            .iter()
-            .map(|t| t.kind)
-            .filter(|k| !matches!(k, TokenKind::Newline | TokenKind::Eof))
-            .collect();
+        let got: Vec<TokenKind> =
+            lexed.tokens.iter().map(|t| t.kind).filter(|k| *k != TokenKind::Eof).collect();
         assert!(
-            got == rendered.tokens && lexed.diagnostics.is_empty(),
-            "the renderer wrote text that doesn't lex to the tokens it meant:\n{}\nmeant: {:?}\ngot:   {got:?}\n{:?}",
+            got == expected && lexed.diagnostics.is_empty(),
+            "the renderer wrote text that doesn't lex to the tokens it meant:\n{}\nmeant: {expected:?}\ngot:   {got:?}\n{:?}",
             rendered.text,
-            rendered.tokens,
             lexed.diagnostics
         );
         rendered
@@ -625,11 +636,13 @@ struct Renderer<'a, 'g> {
     text: String,
     tokens: Vec<TokenKind>,
     dropped: u32,
+    /// The tokens the text must lex to: `tokens`, with the NEWLINEs the lexer must make.
+    expected: Vec<TokenKind>,
     /// Open brackets, as the lexer tracks them (L19).
-    stack: Vec<TokenKind>,
-    /// The text of the last token when it ends with a GT_CLOSE that nothing follows yet, so the
-    /// next `>`, `=`, `>=` or GT_CLOSE may be glued to it as L16 allows.
-    gt_run: Option<&'static str>,
+    brackets: Brackets,
+    /// The kind of the last token (`>` or `>>`) when it ends with a GT_CLOSE that nothing
+    /// follows yet, so the next `>`, `=`, `>=` or GT_CLOSE may be glued to it as L16 allows.
+    gt_run: Option<TokenKind>,
     /// A line break has been written since the last token.
     newline_pending: bool,
 }
@@ -639,15 +652,9 @@ impl Renderer<'_, '_> {
         self.tokens.last().copied()
     }
 
-    fn in_brace(&self) -> bool {
-        self.stack.last().is_none_or(|k| *k == TokenKind::LBrace)
-    }
-
     /// Whether a line break before a token of kind `next` would be plain whitespace (L17).
     fn break_is_whitespace(&self, next: TokenKind) -> bool {
-        !self.in_brace()
-            || !self.prev().is_some_and(TokenKind::can_end_statement)
-            || next == TokenKind::Dot
+        self.prev().is_none_or(|prev| !line_break_is_newline(self.brackets.in_brace(), prev, next))
     }
 
     fn line_break(&mut self, rng: &mut Rng) {
@@ -658,43 +665,41 @@ impl Renderer<'_, '_> {
         if rng.chance(0.1) {
             self.text.push_str(if rng.chance(0.5) { "\n" } else { "    // own line\n" });
         }
-        for _ in 0..self.stack.len() {
+        for _ in 0..self.brackets.depth() {
             self.text.push_str("    ");
         }
         self.newline_pending = true;
         self.gt_run = None;
     }
 
-    fn newline(&mut self, next: Option<Terminal>, rng: &mut Rng) {
-        let next_is_dot = next == Some(Terminal::Token(TokenKind::Dot));
+    /// Writes a grammar NEWLINE as a line break. `next` is the kind of the next token that
+    /// isn't a NEWLINE (EOF if there is none).
+    fn newline(&mut self, next: TokenKind, rng: &mut Rng) {
         if self.newline_pending {
             // L18: line breaks with no token between them make at most one NEWLINE.
-        } else if !(self.in_brace()
-            && self.prev().is_some_and(TokenKind::can_end_statement)
-            && !next_is_dot)
-        {
+        } else if self.break_is_whitespace(next) {
             self.dropped += 1;
+        } else {
+            self.expected.push(TokenKind::Newline);
         }
         self.line_break(rng);
     }
 
     fn token(&mut self, t: Terminal, rng: &mut Rng) {
-        let kind = lexer_kind(t);
+        let kind = t.lexer_kind();
         let text = self.g.invent(kind, rng);
         if let Some(run) = self.gt_run.take()
             && !self.newline_pending
-            && let Some(joined) = glued_gt(run, &text)
+            && let Some(joined) = glued_gt(run, kind)
             && rng.chance(0.5)
         {
             // L16: the parser splits `joined` again.
             self.text.push_str(&text);
-            let merged = TokenKind::PUNCT
-                .iter()
-                .copied()
-                .find(|k| k.fixed_text() == Some(joined))
-                .unwrap_or(TokenKind::Gt);
             if let Some(last) = self.tokens.last_mut() {
-                *last = merged;
+                *last = joined;
+            }
+            if let Some(last) = self.expected.last_mut() {
+                *last = joined;
             }
             self.gt_run = (t == Terminal::GtClose).then_some(joined);
             return;
@@ -713,32 +718,22 @@ impl Renderer<'_, '_> {
         }
         self.text.push_str(&text);
         self.tokens.push(kind);
+        self.expected.push(kind);
         self.newline_pending = false;
-        self.gt_run = (t == Terminal::GtClose).then_some(">");
-        match kind {
-            TokenKind::LParen | TokenKind::LBracket | TokenKind::LBrace => self.stack.push(kind),
-            TokenKind::RParen | TokenKind::RBracket | TokenKind::RBrace => {
-                let open = match kind {
-                    TokenKind::RParen => TokenKind::LParen,
-                    TokenKind::RBracket => TokenKind::LBracket,
-                    _ => TokenKind::LBrace,
-                };
-                if let Some(i) = self.stack.iter().rposition(|k| *k == open) {
-                    self.stack.truncate(i);
-                }
-            }
-            _ => {}
-        }
+        self.gt_run = (t == Terminal::GtClose).then_some(TokenKind::Gt);
+        self.brackets.track(kind);
     }
 }
 
-/// `run` (text ending in a GT_CLOSE) joined with `next`, when the result is one token that L16
-/// splits back into them: `>` `>` → `>>`, `>` `=` → `>=`, `>` `>=` and `>>` `=` → `>>=`.
-fn glued_gt(run: &str, next: &str) -> Option<&'static str> {
+/// A token `run` that ends with a GT_CLOSE (`>` or `>>`) joined with a following token `next`,
+/// when the result is one token that L16 splits back into them: `>` `>` → `>>`, `>` `=` → `>=`,
+/// `>` `>=` and `>>` `=` → `>>=`.
+pub(crate) fn glued_gt(run: TokenKind, next: TokenKind) -> Option<TokenKind> {
+    use TokenKind::{Eq, Ge, Gt, Shr, ShrEq};
     match (run, next) {
-        (">", ">") => Some(">>"),
-        (">", "=") => Some(">="),
-        (">", ">=") | (">>", "=") => Some(">>="),
+        (Gt, Gt) => Some(Shr),
+        (Gt, Eq) => Some(Ge),
+        (Gt, Ge) | (Shr, Eq) => Some(ShrEq),
         _ => None,
     }
 }

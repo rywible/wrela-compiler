@@ -3,7 +3,7 @@
 //! WebGPU reports most misuse asynchronously, or as a device error that names no command; wgpu
 //! reports it as a validation error. Checking up front means both hosts reject the same
 //! programs, at the command that's wrong, with the same messages (the browser runtime's
-//! `src/check.ts` mirrors this file):
+//! `src/check.ts` mirrors this file, and the test vectors hold both to it):
 //!
 //! - `CreateBuffer`: the handle is new; the size is within WebGPU's default limits.
 //! - `WriteBuffer`: the buffer exists; the write fits inside it.
@@ -12,31 +12,38 @@
 //!   buffers as the pipeline binds, each one existing, and exactly its uniform block's size in
 //!   uniform bytes; a dispatch's group counts are within the limit.
 //! - No buffer is bound both read-only and read-write in one usage scope: a dispatch, or a whole
-//!   screen pass (WebGPU's rule).
+//!   screen pass (WebGPU's rule); and none is bound read-write twice by one dispatch or draw
+//!   (WebGPU's rule against aliased writable bindings, which wgpu doesn't check).
+//! - `BeginScreenPass`: the clear colour is finite (WebGPU's `GPUColor` is; wgpu takes any).
 
-use crate::error::{Error, Result};
+use crate::Manifest;
+use crate::manifest::{Access, Stage};
+use crate::stream::{Command, Opcode};
 use std::collections::HashMap;
-use wrela_abi::Manifest;
-use wrela_abi::manifest::{Access, Stage};
-use wrela_abi::stream::{Command, Opcode};
+use std::fmt;
 
-/// The device limits the checks use: WebGPU's defaults, which both hosts request.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct Limits {
-    /// The largest buffer: the lesser of `maxBufferSize` and `maxStorageBufferBindingSize`.
-    pub max_buffer_size: u64,
-    pub max_workgroups_per_dimension: u32,
+/// WebGPU's default limits that commands are checked against (both hosts request a device with
+/// the defaults). The largest buffer is the lesser of `maxBufferSize` (256 MiB) and
+/// `maxStorageBufferBindingSize` (128 MiB): every buffer is bound as storage.
+pub const MAX_BUFFER_SIZE: u32 = 134_217_728;
+pub const MAX_WORKGROUPS_PER_DIMENSION: u32 = 65_535;
+
+/// A well-formed command the host can't carry out.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommandError {
+    pub opcode: Opcode,
+    pub why: String,
 }
 
-impl Limits {
-    pub(crate) fn webgpu_defaults() -> Limits {
-        let l = wgpu::Limits::default();
-        Limits {
-            max_buffer_size: l.max_buffer_size.min(l.max_storage_buffer_binding_size),
-            max_workgroups_per_dimension: l.max_compute_workgroups_per_dimension,
-        }
+impl fmt::Display for CommandError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} failed: {}", self.opcode.name(), self.why)
     }
 }
+
+impl std::error::Error for CommandError {}
+
+type Result<T> = std::result::Result<T, CommandError>;
 
 struct Shape {
     name: String,
@@ -45,17 +52,18 @@ struct Shape {
     buffers: Vec<Access>,
 }
 
-pub(crate) struct Checker {
+pub struct Checker {
     pipelines: Vec<Shape>,
     /// Each buffer's size.
     buffers: HashMap<u32, u32>,
-    /// In a screen pass: each bound buffer's access so far, (read-only, read-write).
-    pass: Option<HashMap<u32, (bool, bool)>>,
-    limits: Limits,
+    /// The current usage scope, a dispatch or the open screen pass: each bound buffer's access
+    /// so far, (read-only, read-write). Dispatches happen only outside a screen pass (the
+    /// sequencer checks), so the two kinds of scope never overlap and share this map.
+    scope: HashMap<u32, (bool, bool)>,
 }
 
 impl Checker {
-    pub(crate) fn new(manifest: &Manifest, limits: Limits) -> Checker {
+    pub fn new(manifest: &Manifest) -> Checker {
         let pipelines = manifest
             .pipelines
             .iter()
@@ -66,22 +74,23 @@ impl Checker {
                 buffers: p.buffers.iter().map(|b| b.access).collect(),
             })
             .collect();
-        Checker { pipelines, buffers: HashMap::new(), pass: None, limits }
+        Checker { pipelines, buffers: HashMap::new(), scope: HashMap::new() }
     }
 
-    /// Checks a command that has passed the [`wrela_abi::stream::Sequencer`], and records its
+    /// Checks a command that has passed the [`crate::stream::Sequencer`], and records its
     /// effect on what later commands may do.
-    pub(crate) fn check(&mut self, cmd: &Command<'_>) -> Result<()> {
+    pub fn check(&mut self, cmd: &Command<'_>) -> Result<()> {
         let op = cmd.opcode();
-        let err = |why: String| Err(Error::command(op, why));
+        let err = |why: String| Err(CommandError { opcode: op, why });
         match cmd {
             Command::CreateBuffer { handle, size } => {
                 if self.buffers.contains_key(handle) {
                     return err(format!("buffer {handle} already exists"));
                 }
-                let limit = self.limits.max_buffer_size;
-                if u64::from(*size) > limit {
-                    return err(format!("buffer {handle} is {size} bytes; the limit is {limit}"));
+                if *size > MAX_BUFFER_SIZE {
+                    return err(format!(
+                        "buffer {handle} is {size} bytes; the limit is {MAX_BUFFER_SIZE}"
+                    ));
                 }
                 self.buffers.insert(*handle, *size);
             }
@@ -99,8 +108,9 @@ impl Checker {
                 }
             }
             Command::Dispatch { pipeline, groups, buffers, uniforms } => {
-                self.binding(op, *pipeline, buffers, uniforms.len(), &mut HashMap::new())?;
-                let max = self.limits.max_workgroups_per_dimension;
+                self.scope.clear();
+                self.binding(op, *pipeline, buffers, uniforms.len())?;
+                let max = MAX_WORKGROUPS_PER_DIMENSION;
                 if groups.iter().any(|&g| g > max) {
                     let [x, y, z] = groups;
                     return err(format!(
@@ -108,14 +118,17 @@ impl Checker {
                     ));
                 }
             }
-            Command::BeginScreenPass { .. } => self.pass = Some(HashMap::new()),
-            Command::Draw { pipeline, buffers, uniforms, .. } => {
-                let mut usage = self.pass.take().unwrap_or_default();
-                let checked = self.binding(op, *pipeline, buffers, uniforms.len(), &mut usage);
-                self.pass = Some(usage);
-                checked?;
+            Command::BeginScreenPass { clear } => {
+                let names = ["r", "g", "b", "a"];
+                if let Some(i) = clear.iter().position(|c| !c.is_finite()) {
+                    return err(format!("the clear colour's {} isn't a finite number", names[i]));
+                }
+                self.scope.clear();
             }
-            Command::Present => self.pass = None,
+            Command::Draw { pipeline, buffers, uniforms, .. } => {
+                self.binding(op, *pipeline, buffers, uniforms.len())?;
+            }
+            Command::Present => {}
         }
         Ok(())
     }
@@ -124,18 +137,18 @@ impl Checker {
         self.buffers
             .get(&handle)
             .copied()
-            .ok_or_else(|| Error::command(op, format!("there's no buffer {handle}")))
+            .ok_or_else(|| CommandError { opcode: op, why: format!("there's no buffer {handle}") })
     }
 
+    /// Checks a dispatch's or draw's bindings, and adds its buffers to the usage scope.
     fn binding(
-        &self,
+        &mut self,
         op: Opcode,
         pipeline: u32,
         buffers: &[u32],
         uniform_len: usize,
-        usage: &mut HashMap<u32, (bool, bool)>,
     ) -> Result<()> {
-        let err = |why: String| Err(Error::command(op, why));
+        let err = |why: String| Err(CommandError { opcode: op, why });
         let Some(p) = self.pipelines.get(pipeline as usize) else {
             return err(format!(
                 "there's no pipeline {pipeline} (the manifest has {})",
@@ -168,10 +181,18 @@ impl Checker {
                 "pipeline {pipeline} ({name}) takes {want} uniform bytes, but the command has {uniform_len}"
             ));
         }
-        let scope = if op == Opcode::Dispatch { "dispatch" } else { "screen pass" };
+        let (scope, one) =
+            if op == Opcode::Dispatch { ("dispatch", "dispatch") } else { ("screen pass", "draw") };
+        let mut written = Vec::new();
         for (&handle, &access) in buffers.iter().zip(&p.buffers) {
             self.size(op, handle)?;
-            let seen = usage.entry(handle).or_default();
+            if access == Access::ReadWrite {
+                if written.contains(&handle) {
+                    return err(format!("buffer {handle} is bound read-write twice in one {one}"));
+                }
+                written.push(handle);
+            }
+            let seen = self.scope.entry(handle).or_default();
             match access {
                 Access::Read => seen.0 = true,
                 Access::ReadWrite => seen.1 = true,
