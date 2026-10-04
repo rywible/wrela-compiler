@@ -10,8 +10,8 @@
 //! - No operation is a WGSL const-expression: WGSL evaluates those when the shader is created,
 //!   and rejects `1.0 / 0.0` or a shift by 40 there, where language.md §11 promises the values
 //!   WGSL defines at run time. A constant operand that would make one goes through a variable.
-//! - Only entry points are written: GPU modules arrive flattened (`wrela_ir::opt` inlines
-//!   every call), so a call here is a compiler bug.
+//! - GPU modules arrive flattened (`wrela_ir::opt`): every call is inlined but those to the
+//!   big functions that take only values, which are written as WGSL functions, callees first.
 
 use naga::{
     AddressSpace, ArraySize, BinaryOperator, Binding, Block, BuiltIn, Expression, Function,
@@ -24,8 +24,6 @@ use wrela_ir as ir;
 use wrela_ir::layout::WgslLayouts;
 
 type R<T> = Result<T, String>;
-
-const CALL: &str = "internal: a call in a GPU module, which should have been flattened";
 
 /// A GPU module written as WGSL.
 #[derive(Clone, Debug)]
@@ -122,6 +120,10 @@ struct Cx<'m> {
     types: HashMap<ir::TypeId, Handle<Type>>,
     layouts: WgslLayouts,
     globals: Vec<Handle<GlobalVariable>>,
+    /// The functions that stay calls, written so far.
+    fns: HashMap<ir::FuncId, Handle<Function>>,
+    /// Module constants for long float literals, by their bits.
+    float_consts: HashMap<u32, Handle<naga::Constant>>,
 }
 
 pub fn to_naga(m: &ir::Module) -> R<naga::Module> {
@@ -131,10 +133,37 @@ pub fn to_naga(m: &ir::Module) -> R<naga::Module> {
         types: HashMap::new(),
         layouts: WgslLayouts::default(),
         globals: Vec::new(),
+        fns: HashMap::new(),
+        float_consts: HashMap::new(),
     };
     for r in &m.resources {
         let g = cx.global(r)?;
         cx.globals.push(g);
+    }
+    // The functions that stay calls, callees first.
+    let entries: HashSet<ir::FuncId> = m.entry_points.iter().map(|e| e.function).collect();
+    let mut done = HashSet::new();
+    fn helpers_of(
+        cx: &mut Cx<'_>,
+        f: ir::FuncId,
+        entries: &HashSet<ir::FuncId>,
+        done: &mut HashSet<ir::FuncId>,
+    ) -> R<()> {
+        if !done.insert(f) {
+            return Ok(());
+        }
+        for g in ir::visit::calls(&cx.m.functions[f.index()].body) {
+            helpers_of(cx, g, entries, done)?;
+        }
+        if !entries.contains(&f) {
+            let func = cx.helper(f)?;
+            let h = cx.out.functions.append(func, Span::UNDEFINED);
+            cx.fns.insert(f, h);
+        }
+        Ok(())
+    }
+    for e in &m.entry_points {
+        helpers_of(&mut cx, e.function, &entries, &mut done)?;
     }
     for e in m.entry_points.iter() {
         let func = cx.function(e)?;
@@ -159,6 +188,25 @@ pub fn to_naga(m: &ir::Module) -> R<naga::Module> {
 }
 
 impl<'m> Cx<'m> {
+    /// The module constant holding `x` (made once).
+    fn float_const(&mut self, x: f32) -> Handle<naga::Constant> {
+        if let Some(&k) = self.float_consts.get(&x.to_bits()) {
+            return k;
+        }
+        let ty = self.ty_inner(TypeInner::Scalar(Scalar::F32));
+        let init = self
+            .out
+            .global_expressions
+            .append(Expression::Literal(Literal::F32(x)), Span::UNDEFINED);
+        let name = format!("K{}", self.float_consts.len());
+        let k = self
+            .out
+            .constants
+            .append(naga::Constant { name: Some(name), ty, init }, Span::UNDEFINED);
+        self.float_consts.insert(x.to_bits(), k);
+        k
+    }
+
     fn ty(&mut self, t: ir::TypeId) -> R<Handle<Type>> {
         if let Some(&h) = self.types.get(&t) {
             return Ok(h);
@@ -166,6 +214,7 @@ impl<'m> Cx<'m> {
         let m = self.m;
         let (name, inner) = match *m.types.get(t) {
             ir::TypeDef::Scalar(s) => (None, TypeInner::Scalar(scalar(s)?)),
+            ir::TypeDef::Atomic(s) => (None, TypeInner::Atomic(scalar(s)?)),
             ir::TypeDef::Vector(n) => {
                 (None, TypeInner::Vector { size: vsize(n), scalar: Scalar::F32 })
             }
@@ -218,9 +267,23 @@ impl<'m> Cx<'m> {
                 (AddressSpace::Storage { access }, arr)
             }
             ir::ResourceKind::Private => (AddressSpace::Private, self.ty(r.ty)?),
+            ir::ResourceKind::Workgroup => (AddressSpace::WorkGroup, self.ty(r.ty)?),
+            ir::ResourceKind::Texture { depth } => {
+                let class = if depth {
+                    naga::ImageClass::Depth { multi: false }
+                } else {
+                    naga::ImageClass::Sampled { kind: ScalarKind::Float, multi: false }
+                };
+                let inner =
+                    TypeInner::Image { dim: naga::ImageDimension::D2, arrayed: false, class };
+                (AddressSpace::Handle, self.ty_inner(inner))
+            }
+            ir::ResourceKind::Sampler { comparison } => {
+                (AddressSpace::Handle, self.ty_inner(TypeInner::Sampler { comparison }))
+            }
         };
-        let binding = (r.kind != ir::ResourceKind::Private)
-            .then_some(ResourceBinding { group: 0, binding: r.binding });
+        let binding = !matches!(r.kind, ir::ResourceKind::Private | ir::ResourceKind::Workgroup);
+        let binding = binding.then_some(ResourceBinding { group: 0, binding: r.binding });
         Ok(self.out.global_variables.append(
             GlobalVariable {
                 name: Some(ir::ident(&r.name)),
@@ -344,7 +407,16 @@ impl<'m> Cx<'m> {
     }
 
     fn function(&mut self, entry: &'m ir::EntryPoint) -> R<Function> {
-        let f = &self.m.functions[entry.function.index()];
+        self.build(entry.function, Some(entry))
+    }
+
+    /// A function that stays a call: its parameters, its result, and its body.
+    fn helper(&mut self, f: ir::FuncId) -> R<Function> {
+        self.build(f, None)
+    }
+
+    fn build(&mut self, id: ir::FuncId, entry: Option<&'m ir::EntryPoint>) -> R<Function> {
+        let f = &self.m.functions[id.index()];
         let mut func = Function { name: Some(ir::ident(&f.name)), ..Function::default() };
         let mut fb = Fb {
             cx: self,
@@ -373,6 +445,25 @@ impl<'m> Cx<'m> {
     }
 }
 
+/// An expression that only computes from values: written where it's used.
+fn pure(e: &ir::Expr) -> bool {
+    match e {
+        ir::Expr::Builtin(b, _) => {
+            !matches!(b, ir::Builtin::Dpdx | ir::Builtin::Dpdy | ir::Builtin::Fwidth)
+        }
+        ir::Expr::Unary(..)
+        | ir::Expr::Binary(..)
+        | ir::Expr::Construct(..)
+        | ir::Expr::Extract(..)
+        | ir::Expr::Splat(..)
+        | ir::Expr::Swizzle(..)
+        | ir::Expr::Convert(..)
+        | ir::Expr::Bitcast(..)
+        | ir::Expr::Select { .. } => true,
+        _ => false,
+    }
+}
+
 /// Whether field `i` of the vertex output type `t` is a struct of one field (a `Flat<T>` or a
 /// `ClipPosition`) that the WGSL passes as that field.
 fn wrapped(types: &ir::Types, t: ir::TypeId, i: u32) -> R<bool> {
@@ -395,7 +486,8 @@ struct Fb<'a, 'm> {
     func: &'a mut Function,
     values: HashMap<ir::ValueId, Handle<Expression>>,
     locals: Vec<Handle<LocalVariable>>,
-    entry: &'m ir::EntryPoint,
+    /// The entry point being written, or `None` for a function that stays a call.
+    entry: Option<&'m ir::EntryPoint>,
     /// For a vertex entry: the output struct and how its members map to the IR struct's.
     io: Option<(Handle<Type>, IoMap, ir::TypeId)>,
     /// Where the IR's parameters start among the naga arguments: after the builtin inputs.
@@ -421,7 +513,22 @@ impl<'a, 'm> Fb<'a, 'm> {
             );
             self.locals.push(h);
         }
-        let e = self.entry;
+        let Some(e) = self.entry else {
+            // A function that stays a call: its parameters by value, and its result.
+            for p in &self.f.params {
+                let ty = self.cx.ty(p.ty)?;
+                self.func.arguments.push(FunctionArgument {
+                    name: Some(ir::ident(&p.name)),
+                    ty,
+                    binding: None,
+                });
+            }
+            if let Some(r) = self.f.ret {
+                let ty = self.cx.ty(r)?;
+                self.func.result = Some(FunctionResult { ty, binding: None });
+            }
+            return Ok(());
+        };
         let in_varyings = |b: &ir::BuiltinInput| {
             *b == ir::BuiltinInput::Position
                 && matches!(e.stage, ir::Stage::Fragment { varyings: Some(_), .. })
@@ -647,13 +754,25 @@ impl<'a, 'm> Fb<'a, 'm> {
             ir::Stmt::Let(v, e) => {
                 let h = self.value(*v, e, out)?;
                 self.values.insert(*v, h);
-                if !self.func.expressions[h].needs_pre_emit() {
+                // Arithmetic is written where it's used (naga binds what's used twice to a
+                // `let` of its own); what reads memory, calls or has an effect is bound where
+                // it is, so it runs in the IR's order.
+                if !self.func.expressions[h].needs_pre_emit() && !pure(e) {
                     self.func.named_expressions.insert(h, format!("v{}", v.0));
                 }
             }
             ir::Stmt::Eval(e) => match e {
-                ir::Expr::Call(..) => return Err(CALL.into()),
+                ir::Expr::Call(g, args) => {
+                    self.call(*g, args, out)?;
+                }
                 ir::Expr::Host(..) => return Err("GPU code can't record GPU work".into()),
+                ir::Expr::Mem(..) => return Err("GPU code can't use raw memory".into()),
+                ir::Expr::Barrier => {
+                    out.push(Statement::ControlBarrier(naga::Barrier::WORK_GROUP), Span::UNDEFINED);
+                }
+                ir::Expr::Atomic(op, p, args) => {
+                    self.atomic(*op, p, args, None, out)?;
+                }
                 _ => {}
             },
             ir::Stmt::Store(p, v) => {
@@ -695,6 +814,32 @@ impl<'a, 'm> Fb<'a, 'm> {
         Ok(())
     }
 
+    /// A call to a function that stays one: its result, if it has one. (A call result is
+    /// defined by the call statement, so it isn't emitted.)
+    fn call(
+        &mut self,
+        g: ir::FuncId,
+        args: &[ir::Arg],
+        out: &mut Block,
+    ) -> R<Option<Handle<Expression>>> {
+        let function =
+            *self.cx.fns.get(&g).ok_or("internal: a call to a function that was inlined")?;
+        let mut arguments = Vec::new();
+        for a in args {
+            match a {
+                ir::Arg::Value(v) => arguments.push(self.val(*v)?),
+                ir::Arg::Place(_) => {
+                    return Err("internal: a place passed to a called GPU function".into());
+                }
+            }
+        }
+        let result = self.cx.m.functions[g.index()].ret.map(|_| {
+            self.func.expressions.append(Expression::CallResult(function), Span::UNDEFINED)
+        });
+        out.push(Statement::Call { function, arguments, result }, Span::UNDEFINED);
+        Ok(result)
+    }
+
     /// `return` with a zero of the function's result, or a bare `return`.
     fn return_zero(&mut self, out: &mut Block) {
         let value = self
@@ -709,7 +854,9 @@ impl<'a, 'm> Fb<'a, 'm> {
     /// A vertex shader's return value, rebuilt as the output struct.
     fn output(&mut self, h: Handle<Expression>, out: &mut Block) -> R<Handle<Expression>> {
         let Some((io, map, rt)) = self.io.clone() else { return Ok(h) };
-        let ir::Stage::Vertex { .. } = self.entry.stage else { return Ok(h) };
+        let Some(ir::EntryPoint { stage: ir::Stage::Vertex { .. }, .. }) = self.entry else {
+            return Ok(h);
+        };
         let mut comps = Vec::new();
         for (i, _) in map {
             let field = self.expr(Expression::AccessIndex { base: h, index: i }, out);
@@ -754,6 +901,14 @@ impl<'a, 'm> Fb<'a, 'm> {
                     }
                     ir::Const::F32(x) => {
                         self.floats.insert(v, *x);
+                        // A float naga would write in many digits (it writes no exponents) is a
+                        // module constant, written once: interval code widens by 2⁻²³ and by
+                        // the smallest normal float at every step.
+                        if format!("{x}").len() > 14 {
+                            self.consts.insert(v);
+                            let k = self.cx.float_const(*x);
+                            return Ok(self.expr(Expression::Constant(k), out));
+                        }
                         Literal::F32(*x)
                     }
                     other => return Err(format!("internal: the constant {other:?} in GPU code")),
@@ -769,7 +924,8 @@ impl<'a, 'm> Fb<'a, 'm> {
             ir::Expr::Param(i) => {
                 // In a fragment shader, parameter 0 is the varyings: rebuild the IR struct.
                 if let Some((_, map, vt)) = self.io.clone()
-                    && let ir::Stage::Fragment { .. } = &self.entry.stage
+                    && let Some(ir::EntryPoint { stage: ir::Stage::Fragment { .. }, .. }) =
+                        self.entry
                 {
                     let arg = self.expr(Expression::FunctionArgument(self.param_base + *i), out);
                     let ir::TypeDef::Struct { fields, .. } = types.get(vt) else {
@@ -803,8 +959,11 @@ impl<'a, 'm> Fb<'a, 'm> {
                     Some(None) => {
                         let (
                             Some((_, map, _)),
-                            ir::Stage::Fragment { position_field: Some(pf), .. },
-                        ) = (&self.io, &self.entry.stage)
+                            Some(ir::EntryPoint {
+                                stage: ir::Stage::Fragment { position_field: Some(pf), .. },
+                                ..
+                            }),
+                        ) = (&self.io, self.entry)
                         else {
                             return Err("internal: an input with no argument".into());
                         };
@@ -835,7 +994,17 @@ impl<'a, 'm> Fb<'a, 'm> {
                 let pointer = self.place(p, out)?;
                 self.expr(Expression::ArrayLength(pointer), out)
             }
-            ir::Expr::Call(..) => return Err(CALL.into()),
+            ir::Expr::Texture(op, tex, sampler, args) => {
+                self.texture(*op, *tex, *sampler, args, out)?
+            }
+            ir::Expr::Atomic(op, p, args) => {
+                let t = self.f.value_ty(v);
+                self.atomic(*op, p, args, Some(t), out)?.ok_or("internal: an atomic's value")?
+            }
+            ir::Expr::Barrier => return Err("internal: a barrier's value".into()),
+            ir::Expr::Call(g, args) => self
+                .call(*g, args, out)?
+                .ok_or("internal: a call's value from a function that returns nothing")?,
             ir::Expr::Construct(ty, parts) => {
                 let components = parts.iter().map(|p| self.val(*p)).collect::<R<Vec<_>>>()?;
                 let ty = self.cx.ty(*ty)?;
@@ -1010,8 +1179,158 @@ impl<'a, 'm> Fb<'a, 'm> {
             }
             ir::Expr::Builtin(b, args) => self.builtin(*b, args, out)?,
             ir::Expr::Host(..) => return Err("GPU code can't record GPU work".into()),
+            ir::Expr::Mem(..) => return Err("GPU code can't use raw memory".into()),
             ir::Expr::Run(_) | ir::Expr::Addr(_) => {
                 return Err("internal: a CPU-only expression in GPU code".into());
+            }
+        })
+    }
+
+    /// An atomic read-modify-write (`ir::Expr::Atomic`): the value that was there, if it's
+    /// wanted, as type `want` (a compare-exchange's: a struct of it and whether it stored).
+    fn atomic(
+        &mut self,
+        op: ir::AtomicOp,
+        p: &ir::Place,
+        args: &[ir::ValueId],
+        want: Option<ir::TypeId>,
+        out: &mut Block,
+    ) -> R<Option<Handle<Expression>>> {
+        use ir::AtomicOp as A;
+        let m = self.cx.m;
+        let pt = m.place_ty(self.f, p).ok_or("internal: an atomic place's type")?;
+        let ir::TypeDef::Atomic(s) = *m.types.get(pt) else {
+            return Err("internal: an atomic operation on something that isn't atomic".into());
+        };
+        let s = scalar(s)?;
+        let pointer = self.place(p, out)?;
+        // `atomicLoad` and `atomicStore` are a load and a store through an atomic's pointer.
+        if op == A::Load {
+            return Ok(Some(self.expr(Expression::Load { pointer }, out)));
+        }
+        let first = self.val(*args.first().ok_or("internal: an atomic without an operand")?)?;
+        if op == A::Store {
+            out.push(Statement::Store { pointer, value: first }, Span::UNDEFINED);
+            return Ok(None);
+        }
+        let fun = match op {
+            A::Add => naga::AtomicFunction::Add,
+            A::Sub => naga::AtomicFunction::Subtract,
+            A::Min => naga::AtomicFunction::Min,
+            A::Max => naga::AtomicFunction::Max,
+            A::And => naga::AtomicFunction::And,
+            A::Or => naga::AtomicFunction::InclusiveOr,
+            A::Xor => naga::AtomicFunction::ExclusiveOr,
+            A::Exchange => naga::AtomicFunction::Exchange { compare: None },
+            A::CompareExchange => naga::AtomicFunction::Exchange { compare: Some(first) },
+            A::Load | A::Store => unreachable!("handled above"),
+        };
+        // A compare-exchange's new value is its second operand; the others' is their first.
+        let comparison = op == A::CompareExchange;
+        let value = if comparison {
+            self.val(*args.get(1).ok_or("internal: a compare-exchange without its new value")?)?
+        } else {
+            first
+        };
+        let result = if want.is_some() || comparison {
+            let ty = if comparison {
+                let special = naga::PredeclaredType::AtomicCompareExchangeWeakResult(s);
+                self.cx.out.generate_predeclared_type(special)
+            } else {
+                self.cx.ty_inner(TypeInner::Scalar(s))
+            };
+            let r = Expression::AtomicResult { ty, comparison };
+            Some(self.func.expressions.append(r, Span::UNDEFINED))
+        } else {
+            None
+        };
+        out.push(Statement::Atomic { pointer, fun, value, result }, Span::UNDEFINED);
+        Ok(match (result, comparison, want) {
+            // The old value and whether it stored: the result struct's members, as the IR's
+            // struct.
+            (Some(r), true, Some(t)) => {
+                let old = self.expr(Expression::AccessIndex { base: r, index: 0 }, out);
+                let stored = self.expr(Expression::AccessIndex { base: r, index: 1 }, out);
+                let ty = self.cx.ty(t)?;
+                Some(self.expr(Expression::Compose { ty, components: vec![old, stored] }, out))
+            }
+            (r, _, _) => r,
+        })
+    }
+
+    /// A texture read (`ir::Expr::Texture`). Images and samplers are their globals' handles.
+    fn texture(
+        &mut self,
+        op: ir::TextureOp,
+        tex: ir::ResourceId,
+        sampler: Option<ir::ResourceId>,
+        args: &[ir::ValueId],
+        out: &mut Block,
+    ) -> R<Handle<Expression>> {
+        use ir::TextureOp as T;
+        let global = |fb: &mut Self, r: ir::ResourceId, out: &mut Block| -> R<Handle<Expression>> {
+            let g = *fb.cx.globals.get(r.index()).ok_or("internal: a missing resource")?;
+            Ok(fb.expr(Expression::GlobalVariable(g), out))
+        };
+        let image = global(self, tex, out)?;
+        let arg = |fb: &Self, i: usize| -> R<Handle<Expression>> {
+            fb.val(*args.get(i).ok_or("internal: a texture read without its arguments")?)
+        };
+        Ok(match op {
+            T::Sample | T::SampleLevel | T::SampleCompare | T::SampleCompareLevel => {
+                let s = sampler.ok_or("internal: sampling without a sampler")?;
+                let sampler = global(self, s, out)?;
+                let coordinate = arg(self, 0)?;
+                let (level, depth_ref) = match op {
+                    T::Sample => (naga::SampleLevel::Auto, None),
+                    T::SampleLevel => (naga::SampleLevel::Exact(arg(self, 1)?), None),
+                    T::SampleCompare => (naga::SampleLevel::Auto, Some(arg(self, 1)?)),
+                    _ => (naga::SampleLevel::Zero, Some(arg(self, 1)?)),
+                };
+                self.expr(
+                    Expression::ImageSample {
+                        image,
+                        sampler,
+                        gather: None,
+                        coordinate,
+                        array_index: None,
+                        offset: None,
+                        level,
+                        depth_ref,
+                        clamp_to_edge: false,
+                    },
+                    out,
+                )
+            }
+            T::Load => {
+                // A texel's coordinates are signed in naga's IR.
+                let mut signed = Vec::new();
+                for i in 0..2 {
+                    let x = arg(self, i)?;
+                    let kind = ScalarKind::Sint;
+                    signed.push(self.expr(Expression::As { expr: x, kind, convert: Some(4) }, out));
+                }
+                let ty = self
+                    .cx
+                    .ty_inner(TypeInner::Vector { size: VectorSize::Bi, scalar: Scalar::I32 });
+                let coordinate = self.expr(Expression::Compose { ty, components: signed }, out);
+                let level = self.lit(Literal::I32(0), out);
+                self.expr(
+                    Expression::ImageLoad {
+                        image,
+                        coordinate,
+                        array_index: None,
+                        sample: None,
+                        level: Some(level),
+                    },
+                    out,
+                )
+            }
+            T::Width | T::Height => {
+                let query = naga::ImageQuery::Size { level: None };
+                let size = self.expr(Expression::ImageQuery { image, query }, out);
+                let index = u32::from(op == T::Height);
+                self.expr(Expression::AccessIndex { base: size, index }, out)
             }
         })
     }

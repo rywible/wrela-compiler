@@ -1,0 +1,7 @@
+// rejects: fn.return-trait
+// Each type joined with `+` in a trait position must be a trait.
+use std::field::{Surface, sphere}
+
+fn bad(r: f32) -> Surface + f32 { //~ E0400
+    sphere(r)
+}

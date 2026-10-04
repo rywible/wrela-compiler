@@ -1,0 +1,33 @@
+// accepts: gpu.atomics
+// Atomics, an append and an atomic map as kernels' `mut` parameters, with CPU code passing
+// their buffers `mut`.
+use std::gpu::{
+    Append, AppendBuffer, AtomicMap, Atomics, GlobalId, append_buffer, atomic_map_buffer, buffer,
+    dispatch,
+}
+
+@compute(64)
+fn count(values: [u32], bins: mut Atomics<u32>, evens: mut Append<u32>, map: mut AtomicMap, id: GlobalId) {
+    if id.x < values.len() {
+        let v = values[id.x]
+        let _ = bins.add(v % bins.len(), 1)
+        let _ = bins.max(0, v)
+        let _ = bins.compare_exchange(i: 1, expected: 0, new: v)
+        if v % 2 == 0 {
+            evens.push(v)
+        }
+        let _ = map.add(v % 7, 1)
+        if let Some(n) = map.get(3) {
+            bins.store(2, n)
+        }
+    }
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    var values = buffer(64)
+    var bins = buffer(16)
+    var evens: AppendBuffer<u32> = append_buffer(64)
+    var map = atomic_map_buffer(16)
+    dispatch(count.bind(values: values, bins: mut bins, evens: mut evens, map: mut map), groups: 1)
+    evens.clear()
+}

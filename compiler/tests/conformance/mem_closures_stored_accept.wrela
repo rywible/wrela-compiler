@@ -1,0 +1,20 @@
+// accepts: mem.closures
+// A closure that captures only `Copy` values holds copies of them: it can be stored, put in an
+// `Option`, returned inside a value, and called where it's stored.
+struct Keep<F> {
+    f: F,
+}
+
+fn keep<F: fn(f32) -> f32>(f: F) -> Keep<F> {
+    Keep { f }
+}
+
+fn g(k: f32) -> f32 {
+    let o = Some(|x: f32| x * k)
+    let held = keep(|x: f32| x + k)
+    let a = match o {
+        Some(f) => f(2.0),
+        None => 0.0,
+    }
+    a + (held.f)(1.0)
+}

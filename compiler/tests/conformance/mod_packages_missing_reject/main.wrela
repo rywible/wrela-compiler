@@ -1,0 +1,5 @@
+// rejects: mod.packages
+// A dependency's path must be a directory.
+fn f() -> u32 {
+    1
+}

@@ -1,0 +1,16 @@
+// mistake: polling a request in `@deterministic` code
+// expect: E0600
+// fix: no
+use std::io::Pending
+
+struct Sim {
+    turn: u32,
+    level: Pending<u8>,
+}
+
+@deterministic
+fn tick(s: mut Sim) {
+    if let Some(Ok(bytes)) = s.level.poll() {
+        s.turn += bytes.len()
+    }
+}

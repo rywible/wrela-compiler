@@ -56,7 +56,7 @@ fn bump(x: mut i32, f: fn()) {
 fn selected(c: bool) -> i32 {
     var count = 0
     let inc = || { count += 10 }
-    let g = select(inc, inc, c) //~ E0702
+    let g = select(if_false: inc, if_true: inc, cond: c) //~ E0702
     bump(mut count, g)
     count
 }
@@ -147,13 +147,19 @@ fn mut_closure() -> f32 {
     r
 }
 
-// A closure can't be stored, or go through a generic that could return or store it.
-fn stored(k: f32) -> f32 {
-    let t = (|x: f32| x * k, 9) //~ E0510
-    let o = Some(|x: f32| x * k) //~ E0510
-    let b = Box { item: |x: f32| x * k } //~ E0510
-    let f = pass(|x: f32| x * k) //~ E0510
+// A closure that captures a projection (here `log`, which isn't `Copy`) can't be stored, or go
+// through a generic that could return or store it.
+fn stored(log: Log) -> f32 {
+    let t = (|x: f32| x * log.k, 9) //~ E0510
+    let o = Some(|x: f32| x * log.k) //~ E0510
+    let b = Box { item: |x: f32| x * log.k } //~ E0510
+    let f = pass(|x: f32| x * log.k) //~ E0510
     apply(f, 1.0)
+}
+
+struct Log {
+    k: f32,
+    entries: [u32; 2],
 }
 
 // The body uses `v.x`, which `p` already projects mutably.

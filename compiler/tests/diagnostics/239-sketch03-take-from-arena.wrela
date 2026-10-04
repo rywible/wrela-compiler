@@ -1,0 +1,10 @@
+// mistake: sketch 03 §7: `take` of an arena's element, which would leave a hole
+// expect: E0502
+// fix: no
+struct GrazerSim: Clone {
+    root: vec3,
+}
+
+fn retire(grazers: mut Arena<GrazerSim>, h: Handle<GrazerSim>) -> GrazerSim {
+    take grazers[h]
+}

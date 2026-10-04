@@ -9,13 +9,16 @@
 //! compiler caught its own bug) or a case that takes longer than [`CASE_TIMEOUT`] fails the
 //! test, with the seed and the program; the worker is restarted after the case that killed it.
 //!
-//! `WRELA_FUZZ_ITERS` sets the cases (default 100, or 1000 with `WRELA_FULL`) and
-//! `WRELA_FUZZ_SEED` the run's seed (default 1).
+//! `WRELA_FUZZ_ITERS` sets the cases (default 100, or 1000 with `WRELA_FULL`),
+//! `WRELA_FUZZ_SEED` the run's seed (default 1), and `WRELA_FUZZ_JOBS` how many workers run at
+//! once (default one per core). `tools/check.sh --long` runs 10^6 cases. The seeds include
+//! every tier 1 and 2 program in the repository (the run-pass suite, the sketches, the
+//! conformance suite), so most cases use tiers 1 and 2.
 
 use crate::scratch;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{Mutex, mpsc};
 use std::time::Duration;
 use wrela_tests::{Rng, files_under, repo_root, sized};
 
@@ -150,15 +153,82 @@ fn case(corpus: &[String], seed: u64) -> String {
     mutate(&mut rng, corpus[pick].clone())
 }
 
-/// The seeds: every `.wrela` file under compiler/ and examples/.
+/// What a tier 1 or 2 program uses that a tier-0 one can't (language.md §20): any of these.
+const TIER_1_2: &[&str] = &[
+    "f\"",
+    "if let ",
+    "match mut",
+    "borrow ",
+    "Arena<",
+    "SortedMap",
+    "Vec<",
+    "String",
+    "Text",
+    "Result<",
+    "?\n",
+    "@deterministic",
+    "par_each",
+    "par_map",
+    "@audio",
+    "Pending",
+    "embed(",
+    "<const ",
+    "Eq",
+    "Ord",
+    "StateHash",
+    "Serialize",
+    "Plain",
+    "\ntype ",
+    "unsafe",
+    "Atomics",
+    "Shared<",
+    "texture(",
+    "Box<",
+    "@fieldwise",
+    "with_at",
+    ".clone()",
+    "take ",
+];
+
+/// Whether a program uses tier 1 or 2: one of [`TIER_1_2`], or a unit suffix.
+fn uses_tiers_1_2(text: &str) -> bool {
+    let suffix = |u: &str| {
+        text.match_indices(u).any(|(i, _)| {
+            let before = text[..i].chars().next_back();
+            let after = text[i + u.len()..].chars().next();
+            before.is_some_and(|c| c.is_ascii_digit())
+                && !after.is_some_and(|c| c.is_alphanumeric())
+        })
+    };
+    TIER_1_2.iter().any(|k| text.contains(k))
+        || ["cm", "mm", "km", "kg", "ms"].iter().any(|u| suffix(u))
+}
+
+/// The seeds: every `.wrela` file under compiler/ and examples/, or with `WRELA_FUZZ_TIERS=12`
+/// only those that use tiers 1 and 2.
 fn corpus() -> Vec<String> {
     let corpus: Vec<String> = ["compiler", "examples"]
         .iter()
         .flat_map(|dir| files_under(&repo_root().join(dir), &["wrela"]))
         .map(|p| std::fs::read_to_string(p).expect("read"))
+        .filter(|t| std::env::var("WRELA_FUZZ_TIERS").as_deref() != Ok("12") || uses_tiers_1_2(t))
         .collect();
     assert!(corpus.len() > 50, "only {} seeds", corpus.len());
     corpus
+}
+
+#[test]
+fn the_long_runs_seeds_use_tiers_1_and_2() {
+    let all: Vec<String> = ["compiler", "examples"]
+        .iter()
+        .flat_map(|dir| files_under(&repo_root().join(dir), &["wrela"]))
+        .map(|p| std::fs::read_to_string(p).expect("read"))
+        .collect();
+    let t12: Vec<&String> = all.iter().filter(|t| uses_tiers_1_2(t)).collect();
+    assert!(t12.len() > 200, "only {} of {} seeds use tiers 1 and 2", t12.len(), all.len());
+    assert!(!uses_tiers_1_2("fn f(x: f32) -> f32 {\n    x * 2.0\n}\n"));
+    assert!(uses_tiers_1_2("let d = 15cm\n"));
+    assert!(!uses_tiers_1_2("let x = vec3(1.0)\n"));
 }
 
 fn seed_of(base: u64, i: u64) -> u64 {
@@ -251,20 +321,15 @@ fn worker() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[test]
-fn mutated_programs_dont_crash_the_compiler() {
-    let iters: u64 = std::env::var("WRELA_FUZZ_ITERS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(sized(100, 1000));
-    let base: u64 = std::env::var("WRELA_FUZZ_SEED").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+/// Runs cases `from..to` in worker processes, one at a time, restarting the worker after a
+/// case that kills it; adds each crash to `crashes`, and stops once it holds 3.
+fn run_range(base: u64, from: u64, to: u64, crashes: &Mutex<Vec<(u64, String)>>) {
     let exe = std::env::current_exe().expect("the test binary");
-    let mut crashes: Vec<(u64, String)> = Vec::new();
-    let mut next = 0;
-    while next < iters && crashes.len() < 3 {
+    let mut next = from;
+    while next < to && crashes.lock().expect("crashes").len() < 3 {
         let mut child = Command::new(&exe)
             .args(["fuzz::worker", "--exact", "--ignored", "--nocapture", "--test-threads", "1"])
-            .env("WRELA_FUZZ_WORKER", format!("{base} {next} {iters}"))
+            .env("WRELA_FUZZ_WORKER", format!("{base} {next} {to}"))
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
@@ -280,6 +345,7 @@ fn mutated_programs_dont_crash_the_compiler() {
         });
         let mut current = None;
         let mut finished = false;
+        let mut found: Vec<(u64, String)> = Vec::new();
         loop {
             match rx.recv_timeout(CASE_TIMEOUT) {
                 // Lines without a report are the test harness's own output.
@@ -290,15 +356,15 @@ fn mutated_programs_dont_crash_the_compiler() {
                         break;
                     }
                     Some(Report::Start(i)) => current = Some(i),
-                    Some(Report::Panic(i, why)) => crashes.push((i, format!("panicked: {why}"))),
+                    Some(Report::Panic(i, why)) => found.push((i, format!("panicked: {why}"))),
                     Some(Report::Internal(i, why)) => {
-                        crashes.push((i, format!("an internal compiler error: {why}")));
+                        found.push((i, format!("an internal compiler error: {why}")));
                     }
                 },
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     let _ = child.kill();
                     if let Some(i) = current {
-                        crashes.push((i, format!("took longer than {CASE_TIMEOUT:?}")));
+                        found.push((i, format!("took longer than {CASE_TIMEOUT:?}")));
                     }
                     break;
                 }
@@ -307,19 +373,48 @@ fn mutated_programs_dont_crash_the_compiler() {
             }
         }
         let status = child.wait().expect("wait for the worker");
+        if !finished {
+            match current {
+                Some(i) => {
+                    if !found.iter().any(|(c, _)| *c == i) {
+                        found.push((i, format!("killed the compiler ({status})")));
+                    }
+                    next = i + 1;
+                }
+                None => found.push((next, format!("the worker didn't start ({status})"))),
+            }
+        }
+        crashes.lock().expect("crashes").extend(found);
         if finished {
             break;
         }
-        match current {
-            Some(i) => {
-                if !crashes.iter().any(|(c, _)| *c == i) {
-                    crashes.push((i, format!("killed the compiler ({status})")));
-                }
-                next = i + 1;
-            }
-            None => panic!("the worker didn't start ({status}); crashes before it: {crashes:?}"),
-        }
     }
+}
+
+#[test]
+fn mutated_programs_dont_crash_the_compiler() {
+    let iters: u64 = std::env::var("WRELA_FUZZ_ITERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(sized(100, 1000));
+    let base: u64 = std::env::var("WRELA_FUZZ_SEED").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+    // One worker per core (`WRELA_FUZZ_JOBS` to choose), each on its own share of the cases:
+    // a case is the same program whichever worker runs it.
+    let jobs: u64 = std::env::var("WRELA_FUZZ_JOBS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get() as u64))
+        .clamp(1, iters.max(1));
+    let crashes = Mutex::new(Vec::new());
+    std::thread::scope(|s| {
+        for j in 0..jobs {
+            let (from, to) = (iters * j / jobs, iters * (j + 1) / jobs);
+            let crashes = &crashes;
+            s.spawn(move || run_range(base, from, to, crashes));
+        }
+    });
+    let mut crashes = crashes.into_inner().expect("crashes");
+    crashes.sort();
     if crashes.is_empty() {
         return;
     }

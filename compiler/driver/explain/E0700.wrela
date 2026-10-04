@@ -1,0 +1,26 @@
+// A function that can't be derived (a gradient or an interval): it takes its own gradient
+// without end, writes through a place that depends on its input, or calls something that has no
+// derivation (a host call, an atomic). The message says which.
+// ---- wrong
+use std::derive::gradient
+
+pub fn tower(x: f32) -> f32 {
+    if x > 10.0 {
+        return x
+    }
+    gradient(tower, x + 1.0)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+use std::derive::gradient
+
+fn square(x: f32) -> f32 {
+    x * x
+}
+
+pub fn slope(x: f32) -> f32 {
+    gradient(square, x)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

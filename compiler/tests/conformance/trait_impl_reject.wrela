@@ -17,7 +17,7 @@ trait Has {
     fn get(self) -> Self::K
 }
 
-struct S: Copy + Clone {
+struct S: Copy {
     x: i32,
 }
 
@@ -37,7 +37,7 @@ impl Has for S { //~ E0400
     }
 }
 
-struct T: Copy + Clone {
+struct T: Copy {
     x: i32,
 }
 

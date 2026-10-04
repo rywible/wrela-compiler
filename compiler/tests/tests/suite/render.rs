@@ -27,7 +27,8 @@ fn lengths_of_runs_and_buffers() {
     }
     // On the GPU: a buffer of 10 elements has length 10, whatever the host rounds its size to.
     host.run_frames(&[0.0], 4, 4).expect("run");
-    let counts = wrela_tests::u32s(&host.read_buffer(1).expect("out"));
+    let out = host.buffers()[0];
+    let counts = wrela_tests::u32s(&host.read_buffer(out).expect("out"));
     assert_eq!(&counts[..4], &[10, 11, 12, 13]);
 }
 
@@ -66,7 +67,7 @@ fn gpu_code_at_its_edges_builds() {
         let src = format!(
             "use std::gpu::{{GlobalId, GpuBuffer, Slots, buffer, dispatch}}
 
-struct U: Copy + Clone + GpuData {{
+struct U: Copy + GpuData {{
     m: mat2,
 }}
 
@@ -78,9 +79,9 @@ fn k(u: U, out: mut Slots<f32>, id: GlobalId) {{
 }}
 
 pub fn frame(time: f32, width: u32, height: u32) {{
-    let out: GpuBuffer<f32> = buffer(64)
+    var out: GpuBuffer<f32> = buffer(64)
     let u = U {{ m: mat2(vec2(1.0, 2.0), vec2(3.0, 4.0)) }}
-    dispatch(k, groups: 1, u: u, out: out)
+    dispatch(k.bind(u: u, out: mut out), groups: 1)
 }}
 "
         );
@@ -109,8 +110,8 @@ fn k(out: mut Slots<f32>, id: GlobalId) {{
 }}
 
 pub fn frame(time: f32, width: u32, height: u32) {{
-    let out: GpuBuffer<f32> = buffer(64)
-    dispatch(k, groups: 1, out: out)
+    var out: GpuBuffer<f32> = buffer(64)
+    dispatch(k.bind(out: mut out), groups: 1)
 }}
 "
     );
@@ -149,11 +150,33 @@ fn shaders_get_the_values_the_program_means() {
     assert_eq!(px(3, 0), [0, 0, 255, 255]);
     assert_eq!(px(3, 3), [255, 0, 0, 255]);
     assert_eq!(px(12, 3), [0, 255, 0, 255]);
-    let got = wrela_tests::f32s(&host.read_buffer(0).expect("out"));
+    let out = host.buffers()[0];
+    let got = wrela_tests::f32s(&host.read_buffer(out).expect("out"));
     // Integer `/ 0` gives the dividend, a shift takes its amount modulo 32, and `1.0 / 0.0` and
     // `3e38 * 10.0` are infinite; then `^` of bools, `-` of a matrix, `select` of enums, an enum
     // in a struct, a uniform after one with no value, the last row of a 80 KB table, a buffer's
-    // length through a closure, and a second `GlobalId`.
-    let want = [7.0, 2.0, 5.0, 6.0, 1.0, -5.0, 6.0, 7.5, 3.0, 9.0, 3.0, 11.0];
+    // length through a closure, a second `GlobalId`, and constants the build computed.
+    let want = [7.0, 2.0, 5.0, 6.0, 1.0, -5.0, 6.0, 7.5, 3.0, 9.0, 3.0, 11.0, 9.5];
     assert_eq!(&got[..want.len()], &want);
+}
+
+/// The pipeline-count query (§7): each pipeline's entry points with their type arguments, and
+/// where CPU code dispatches or draws it. Without a GPU.
+#[test]
+fn the_pipeline_count_query_reports_each_instantiation() {
+    let out = wrela_driver::check(&wrela_tests::repo_root().join("compiler/tests/shaders"));
+    assert!(!out.has_errors());
+    let shown: Vec<(String, Vec<String>)> =
+        out.pipelines.iter().map(|p| (p.entries.join(" + "), p.sites.clone())).collect();
+    let want = [
+        ("step", "main.wrela:183:5"),
+        ("cover + blue", "main.wrela:188:5"),
+        ("half::<f32> + shade::<f32>", "main.wrela:189:5"),
+        ("half::<vec4> + shade::<vec4>", "main.wrela:195:5"),
+    ];
+    let want: Vec<(String, Vec<String>)> =
+        want.iter().map(|(e, s)| (e.to_string(), vec![s.to_string()])).collect();
+    assert_eq!(shown, want);
+    let shade = out.pipelines.iter().filter(|p| p.names.contains(&"shade".to_string())).count();
+    assert_eq!(shade, 2, "`shade` is instantiated twice: with f32 and with vec4");
 }

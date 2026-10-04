@@ -37,7 +37,7 @@ pub fn min_mixed() -> f32 {
 }
 
 pub fn select_mixed(s: f32) -> f32 {
-    select(0, 1.5, s > 0.0)
+    select(if_false: 0, if_true: 1.5, cond: s > 0.0)
 }
 
 pub fn max_ints() -> i32 {
@@ -73,7 +73,7 @@ pub fn sqrt_int() -> f32 {
 pub fn select_ints(c: i32) -> u32 {
     let a = 5
     let b = 9
-    let r = select(a, b, c > 0)
+    let r = select(if_false: a, if_true: b, cond: c > 0)
     let k: u32 = a
     r
 }
@@ -82,7 +82,7 @@ pub fn select_ints(c: i32) -> u32 {
 pub fn select_arrays(c: i32) -> f32 {
     let x = [1.0, 2.0]
     let y = [3.0, 4.0]
-    let z = select(x, y, c > 0)
+    let z = select(if_false: x, if_true: y, cond: c > 0)
     z[0]
 }
 

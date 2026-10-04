@@ -1,0 +1,28 @@
+// run: `select` names its arguments, which run in the order written (§3)
+// expect: order() = 321
+// expect: picked(1.0) = 2
+// expect: picked(-1.0) = 1
+// expect: mixed(1.0) = 2
+
+fn note(log: mut u32, v: f32) -> f32 {
+    log = log * 10 + u32(v)
+    v
+}
+
+pub fn order() -> u32 {
+    var log = 0
+    let _v = select(
+        cond: note(mut log, 3.0) > 0.0,
+        if_true: note(mut log, 2.0),
+        if_false: note(mut log, 1.0),
+    )
+    log
+}
+
+pub fn picked(c: f32) -> f32 {
+    select(if_true: 2.0, if_false: 1.0, cond: c > 0.0)
+}
+
+pub fn mixed(c: f32) -> f32 {
+    select(if_false: 1.0, if_true: 2.0, cond: c > 0.0)
+}

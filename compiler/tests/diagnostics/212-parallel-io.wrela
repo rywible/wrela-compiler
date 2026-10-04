@@ -1,0 +1,8 @@
+// mistake: a request made from a parallel closure
+// expect: E0600
+// fix: no
+use std::io::load
+
+fn warm(xs: mut Vec<f32>) {
+    xs.par_each_mut(|x| { let _ = load("cache") })
+}

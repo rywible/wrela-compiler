@@ -1,0 +1,32 @@
+// A `match` that doesn't cover every value. Add the missing variants, or `_ =>` for the rest.
+// ---- wrong
+enum Mood {
+    Calm,
+    Alert,
+    Fleeing,
+}
+
+fn speed(m: Mood) -> f32 {
+    match m {
+        Mood::Calm => 1.0,
+        Mood::Alert => 2.0,
+    }
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+enum Mood {
+    Calm,
+    Alert,
+    Fleeing,
+}
+
+fn speed(m: Mood) -> f32 {
+    match m {
+        Mood::Calm => 1.0,
+        Mood::Alert => 2.0,
+        Mood::Fleeing => 6.0,
+    }
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

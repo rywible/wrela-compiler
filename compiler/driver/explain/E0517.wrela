@@ -1,0 +1,26 @@
+// `var x = place` of a value that isn't `Copy`: a `var` owns its value, so it would move out
+// of the place. Write `var x = take place` to move it, or `var x = place.clone()` to copy it.
+// ---- wrong
+struct Log: Clone {
+    lines: Vec<Text>,
+}
+
+fn edit(log: Log) -> u32 {
+    var mine = log
+    mine.lines.push("edited")
+    mine.lines.len()
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+struct Log: Clone {
+    lines: Vec<Text>,
+}
+
+fn edit(log: Log) -> u32 {
+    var mine = log.clone()
+    mine.lines.push("edited")
+    mine.lines.len()
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

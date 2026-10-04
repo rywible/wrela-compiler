@@ -3,10 +3,10 @@
 use std::path::PathBuf;
 use wrela_grammar::testing::{files_under, repo_root};
 
-/// Every `*.wrela` file under `compiler/` (the conformance suite in compiler/tests, and the
-/// standard library), sorted, skipping build output.
+/// Every `*.wrela` file in the repository (std, the test suites, the sketches, the examples,
+/// the explanations and the agent tests' attempts), sorted, skipping build output.
 pub fn wrela_files() -> Vec<PathBuf> {
-    files_under(&repo_root().join("compiler"), &["wrela"])
+    files_under(&repo_root(), &["wrela"])
 }
 
 /// The sample program of compiler/syntax/tests/suite/roundtrip.rs.

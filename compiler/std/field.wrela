@@ -2,12 +2,28 @@
 // numbers are data (D-070): `sphere(1.0).smooth_union(round_cone(...), k: 0.1)` has the type
 // `SmoothUnion<Sphere, RoundCone>`, whose value is a few floats that reach the GPU as a uniform.
 //
-// Kinds (`Exact`, `Bound`, `Lipschitz`) and channels come with facts in tier 1; in tier 0 a
-// surface is just its distance.
+// A `Surface` is a signed distance. A `Field<C>` is a surface whose points also carry channels
+// `C` (D-002), which the combinators blend where surfaces blend (`Blend`). A `Lipschitz`
+// surface states a bound on its gradient, near the surface (D-092), so sphere tracing can step
+// by it (`to_bound`). A `Noise` states its range, its gradient's bound and its bandlimit.
 
 use std::derive::{Box3, Interval, gradient, interval, value_and_gradient}
+use std::hash::StateHash
+use std::mem::debug_build
 
 /// A signed distance over 3D space: negative inside, positive outside.
+///
+/// ```wrela
+/// use std::field::{Surface, round_cone, sphere}
+///
+/// fn blob() -> Surface {
+///     let cone = round_cone(vec3(), vec3(y: 1.0), r_top: 0.3, r_bottom: 0.1)
+///     sphere(0.5).smooth_union(cone, k: 0.1)
+/// }
+///
+/// assert(blob().distance(vec3(0.0, 0.5, 0.0)) < 0.0)    // inside
+/// assert(blob().distance(vec3(2.0, 0.0, 0.0)) > 0.0)    // outside
+/// ```
 pub trait Surface: Copy + GpuData {
     /// The signed distance from `p` to the surface.
     fn distance(self, p: vec3) -> f32
@@ -28,6 +44,7 @@ pub trait Surface: Copy + GpuData {
         interval(|q| self.distance(q), over)
     }
 
+    /// Every point inside either surface: the smaller distance.
     fn union<B: Surface>(self, b: B) -> Union<Self, B> {
         Union { a: self, b }
     }
@@ -37,10 +54,12 @@ pub trait Surface: Copy + GpuData {
         SmoothUnion { a: self, b, k }
     }
 
+    /// Every point inside both surfaces: the larger distance.
     fn intersect<B: Surface>(self, b: B) -> Intersect<Self, B> {
         Intersect { a: self, b }
     }
 
+    /// The same surface, moved by `by`.
     fn translate(self, by: vec3) -> Translate<Self> {
         Translate { inner: self, by }
     }
@@ -49,19 +68,61 @@ pub trait Surface: Copy + GpuData {
     fn displace<N: Noise>(self, noise: N, amp: f32) -> Displace<Self, N> {
         Displace { inner: self, noise, amp }
     }
+
+    /// The same surface, every point of which carries the channels `value`.
+    fn with<C: Copy + GpuData>(self, value: C) -> With<Self, C> {
+        With { inner: self, value }
+    }
+
+    /// The same surface, whose channels at `p` are `at(p)`: `.with_at(|p| Tissue { albedo:
+    /// dapple(p, seed), ..HIDE })`. The closure is stored in the field, so it captures values
+    /// only (§6.7).
+    fn with_at<C, F: Copy + GpuData + fn(vec3) -> C>(self, at: F) -> WithAt<Self, F> {
+        WithAt { inner: self, at }
+    }
 }
 
 /// A scalar function over 3D space, used to displace surfaces.
 pub trait Noise: Copy + GpuData {
+    /// The noise's value at `p`.
     fn value(self, p: vec3) -> f32
+
+    /// Every value it takes.
+    fn range(self) -> Interval
+
+    /// A bound on its gradient's length, everywhere.
+    fn lipschitz(self) -> f32
+
+    /// Its highest frequency, in cycles per unit: detail finer than `1 / bandlimit()` is all
+    /// there is above it (D-077).
+    fn bandlimit(self) -> f32
+
+    /// Its value averaged over the box `p ± footprint / 2`, each component a width (0 samples
+    /// that axis): what a pixel whose footprint spans that box sees. Detail finer than the
+    /// footprint fades to its mean instead of aliasing (D-077). The default is the value itself,
+    /// which is right for a noise with no detail finer than the footprints it's seen at.
+    fn filtered(self, p: vec3, footprint: vec3) -> f32 {
+        self.value(p)
+    }
 }
 
 // ---- primitives ---------------------------------------------------------------------------------
 
-pub struct Sphere: Copy + Clone + GpuData {
+/// A closure or function of a point is a surface too, its value the distance: `|p| length(p)
+/// - r`, written where it's used (§6.7). Its gradient and interval are derived as any
+/// surface's are; it has no Lipschitz bound of its own (§13).
+impl<F: Copy + GpuData + fn(vec3) -> f32> Surface for F {
+    fn distance(self, p: vec3) -> f32 {
+        self(p)
+    }
+}
+
+/// A sphere centred at the origin. Exact.
+pub struct Sphere: Copy + GpuData {
     pub radius: f32,
 }
 
+/// A sphere of radius `radius`, centred at the origin.
 pub fn sphere(radius: f32) -> Sphere {
     Sphere { radius }
 }
@@ -73,10 +134,11 @@ impl Surface for Sphere {
 }
 
 /// An ellipsoid centred at the origin. No exact distance exists; this is the usual bound.
-pub struct Ellipsoid: Copy + Clone + GpuData {
+pub struct Ellipsoid: Copy + GpuData {
     pub radii: vec3,
 }
 
+/// An ellipsoid with half-axes `radii`, centred at the origin.
 pub fn ellipsoid(radii: vec3) -> Ellipsoid {
     Ellipsoid { radii }
 }
@@ -95,13 +157,14 @@ impl Surface for Ellipsoid {
 
 /// The hull of two spheres, centred at `a` with radius `r1` and at `b` with radius `r2`.
 /// Exact, also where one sphere holds the other (the hull is then the larger sphere).
-pub struct RoundCone: Copy + Clone + GpuData {
+pub struct RoundCone: Copy + GpuData {
     pub a: vec3,
     pub b: vec3,
     pub r1: f32,
     pub r2: f32,
 }
 
+/// The hull of a sphere of radius `r_top` at `a` and one of radius `r_bottom` at `b`.
 pub fn round_cone(a: vec3, b: vec3, r_top: f32, r_bottom: f32) -> RoundCone {
     RoundCone { a, b, r1: r_top, r2: r_bottom }
 }
@@ -114,7 +177,8 @@ impl Surface for RoundCone {
         // Where |r1 - r2| >= |b - a| (a == b too), one sphere holds the other, and the hull is
         // the larger one.
         if l <= abs(rr) {
-            length(p - select(self.b, self.a, rr >= 0.0)) - max(self.r1, self.r2)
+            length(p - select(if_false: self.b, if_true: self.a, cond: rr >= 0.0)) -
+                max(self.r1, self.r2)
         } else {
             // Inigo Quilez's round cone, written with the axis's direction u and q, the radii's
             // difference per unit of length: each term is about |p - a|². (The usual form's
@@ -139,9 +203,30 @@ impl Surface for RoundCone {
     }
 }
 
+/// A box centred at the origin, with half-extents `half`. Exact.
+pub struct Cuboid: Copy + GpuData {
+    pub half: vec3,
+}
+
+/// A box with half-extents `half`, centred at the origin.
+pub fn cuboid(half: vec3) -> Cuboid {
+    Cuboid { half }
+}
+
+impl Surface for Cuboid {
+    /// Outside, the distance to the nearest point of the box; inside, minus the distance to
+    /// the nearest face. One branch on which, so what's derived from it knows the side: on a
+    /// face, the interval of the gradient is the face's normal (spike 13).
+    fn distance(self, p: vec3) -> f32 {
+        let q = abs(p) - self.half
+        let m = max(q.x, max(q.y, q.z))
+        if m > 0.0 { length(max(q, vec3(0.0))) } else { m }
+    }
+}
+
 /// Everything on the negative side of a plane: `dot(p, normal) < offset`. The distance is
 /// exact when `normal` is a unit vector, as `half_space` makes it.
-pub struct HalfSpace: Copy + Clone + GpuData {
+pub struct HalfSpace: Copy + GpuData {
     pub normal: vec3,
     pub offset: f32,
 }
@@ -170,17 +255,29 @@ impl Surface for HalfSpace {
 /// This is the usual polynomial blend, `mix(b, a, h) - k h (1 - h)` with
 /// `h = clamp(0.5 + 0.5 (b - a) / k, 0, 1)`, rearranged (it's the same function, up to
 /// rounding) so that what the compiler derives from it is cheap: its gradient doesn't carry
-/// terms that cancel, and its interval is the smaller distance's, less at most `k / 4`.
+/// terms that cancel, and its interval is the smaller distance's, less at most `k / 4`. It
+/// chooses the smaller distance once, with one branch, so an interval that can't decide which
+/// runs each side knowing it, and the interval of its gradient stays between its parts' on a
+/// blend's seam (spike 13).
 pub fn smin(a: f32, b: f32, k: f32) -> f32 {
-    // Equal distances are 0 apart, also two infinite ones (an empty surface's), whose
-    // difference is NaN.
-    let m = max(k - select(abs(a - b), 0.0, a == b), 0.0)
     // The smallest normal f32 keeps `0.25 / k` finite, and `m` is 0 for `k <= 0`. `m` times
     // at most a quarter doesn't overflow where `m * m` would.
-    min(a, b) - m * (m * (0.25 / max(k, 1.1754944e-38)))
+    let s = 0.25 / max(k, 1.1754944e-38)
+    let d = b - a
+    if d > 0.0 {
+        let m = max(k - d, 0.0)
+        a - m * (m * s)
+    } else {
+        // `k + d` is `k - |a - b|` here, and at a tie it still carries `d`'s derivative, so
+        // the seam's gradient is half each side's. Two equal infinite distances (an empty
+        // surface's) are 0 apart, though their difference is NaN; a NaN still makes a NaN.
+        let m = max(k + select(if_false: d, if_true: 0.0, cond: a == b && d != d), 0.0)
+        b - m * (m * s)
+    }
 }
 
-pub struct Union<A, B>: Copy + Clone + GpuData {
+/// Two surfaces joined: `a.union(b)`.
+pub struct Union<A, B>: Copy + GpuData {
     pub a: A,
     pub b: B,
 }
@@ -191,7 +288,8 @@ impl<A: Surface, B: Surface> Surface for Union<A, B> {
     }
 }
 
-pub struct SmoothUnion<A, B>: Copy + Clone + GpuData {
+/// Two surfaces joined by a rounded seam: `a.smooth_union(b, k)`.
+pub struct SmoothUnion<A, B>: Copy + GpuData {
     pub a: A,
     pub b: B,
     pub k: f32,
@@ -203,7 +301,61 @@ impl<A: Surface, B: Surface> Surface for SmoothUnion<A, B> {
     }
 }
 
-pub struct Intersect<A, B>: Copy + Clone + GpuData {
+/// The parts of a fixed array of surfaces of one type, joined (§17): `legs.union()`,
+/// `legs.smooth_union(k: 6cm)`. Each folds the parts in order, so `[a, b, c].union()` is
+/// `a.union(b).union(c)`.
+impl<S: Surface, const N: u32> [S; N] {
+    /// The parts joined.
+    pub fn union(self) -> UnionAll<S, N> {
+        UnionAll { parts: self }
+    }
+
+    /// A union whose seams are rounded over a width of about `k`.
+    pub fn smooth_union(self, k: f32) -> SmoothUnionAll<S, N> {
+        SmoothUnionAll { parts: self, k }
+    }
+}
+
+/// A fixed array of surfaces joined: `parts.union()`.
+pub struct UnionAll<S, const N: u32>: Copy + GpuData {
+    pub parts: [S; N],
+}
+
+impl<S: Surface, const N: u32> Surface for UnionAll<S, N> {
+    /// The nearest part's distance; with no parts, nowhere near (`EMPTY`).
+    fn distance(self, p: vec3) -> f32 {
+        var d = EMPTY
+        for i in 0..N {
+            d = min(d, self.parts[i].distance(p))
+        }
+        d
+    }
+}
+
+/// A fixed array of surfaces joined by rounded seams: `parts.smooth_union(k)`.
+pub struct SmoothUnionAll<S, const N: u32>: Copy + GpuData {
+    pub parts: [S; N],
+    pub k: f32,
+}
+
+impl<S: Surface, const N: u32> Surface for SmoothUnionAll<S, N> {
+    fn distance(self, p: vec3) -> f32 {
+        if N == 0 {
+            return EMPTY
+        }
+        var d = self.parts[0].distance(p)
+        for i in 1..N {
+            d = smin(d, self.parts[i].distance(p), self.k)
+        }
+        d
+    }
+}
+
+/// The distance of a union of no parts: farther than anything a scene holds.
+pub const EMPTY: f32 = 1.0e30
+
+/// What two surfaces hold in common: `a.intersect(b)`.
+pub struct Intersect<A, B>: Copy + GpuData {
     pub a: A,
     pub b: B,
 }
@@ -214,7 +366,8 @@ impl<A: Surface, B: Surface> Surface for Intersect<A, B> {
     }
 }
 
-pub struct Translate<S>: Copy + Clone + GpuData {
+/// A surface moved: `s.translate(by)`.
+pub struct Translate<S>: Copy + GpuData {
     pub inner: S,
     pub by: vec3,
 }
@@ -225,7 +378,8 @@ impl<S: Surface> Surface for Translate<S> {
     }
 }
 
-pub struct Displace<S, N>: Copy + Clone + GpuData {
+/// A surface with noise added to its distance: `s.displace(noise, amp)`.
+pub struct Displace<S, N>: Copy + GpuData {
     pub inner: S,
     pub noise: N,
     pub amp: f32,
@@ -290,14 +444,69 @@ pub fn value_noise(p: vec3) -> f32 {
     mix(mix(mix(a, b, u.x), mix(c, d, u.x), u.y), mix(mix(e, f1, u.x), mix(g, h, u.x), u.y), u.z)
 }
 
+/// The integral of value noise's interpolation kernel, K(t) = fade(1 − |t|), from 0 to t: odd,
+/// and ±1/2 from |t| = 1 on. With U(v) = v⁶ − 3v⁵ + 5/2 v⁴, the quintic fade's antiderivative,
+/// it's U(1) − U(1 − |t|).
+fn kernel_integral(t: f32) -> f32 {
+    let v = 1.0 - min(abs(t), 1.0)
+    let g = 0.5 - v * v * v * v * (v * (v - 3.0) + 2.5)
+    if t < 0.0 { -g } else { g }
+}
+
+/// The weight lattice coordinate `i` gives the average of value noise over `[x − h, x + h]` on
+/// one axis: its kernel's integral over the interval, divided by its width; for `h` = 0, the
+/// kernel's value at `x`.
+fn box_weight(x: f32, h: f32, i: f32) -> f32 {
+    if h <= 0.0 {
+        let t = 1.0 - min(abs(x - i), 1.0)
+        t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
+    } else {
+        (kernel_integral(x + h - i) - kernel_integral(x - h - i)) / (2.0 * h)
+    }
+}
+
+/// Value noise averaged over the box `p ± half`, exactly (up to rounding): each axis's half
+/// width may be 0, which samples it. Value noise is a sum of lattice values, each times a
+/// kernel that's a product over the axes, so its average is a sum over the lattice points the
+/// box reaches, each times its kernel's average on each axis.
+pub fn value_noise_box(p: vec3, half: vec3) -> f32 {
+    let h = abs(half)
+    let lo = floor(p - h)
+    let n = floor(p + h) - lo + 2.0
+    let (nx, ny, nz) = (u32(n.x), u32(n.y), u32(n.z))
+    let (ix, iy, iz) = (lattice_coord(lo.x), lattice_coord(lo.y), lattice_coord(lo.z))
+    var s = 0.0
+    for k in 0..nz {
+        let wz = box_weight(p.z, h.z, lo.z + f32(k))
+        if wz != 0.0 {
+            for j in 0..ny {
+                let wyz = wz * box_weight(p.y, h.y, lo.y + f32(j))
+                if wyz != 0.0 {
+                    for i in 0..nx {
+                        let w = wyz * box_weight(p.x, h.x, lo.x + f32(i))
+                        let v = lattice(
+                            ix.wrapping_add(i32(i)),
+                            iy.wrapping_add(i32(j)),
+                            iz.wrapping_add(i32(k)),
+                        )
+                        s += w * v
+                    }
+                }
+            }
+        }
+    }
+    s
+}
+
 /// Fractal noise: `octaves` layers of value noise, each at twice the frequency and half the
 /// amplitude of the last, sampled at `p + offset`.
-pub struct Fbm: Copy + Clone + GpuData {
+pub struct Fbm: Copy + GpuData {
     pub freq: f32,
     pub octaves: u32,
     pub offset: vec3,
 }
 
+/// Fractal noise at base frequency `freq`, with `octaves` layers, sampled at `p + offset`.
 pub fn fbm(freq: f32, octaves: u32, offset: vec3 = vec3()) -> Fbm {
     Fbm { freq, octaves, offset }
 }
@@ -315,4 +524,597 @@ impl Noise for Fbm {
         }
         s
     }
+
+    /// The sum of the octaves' amplitudes, each way: 2 − 2^(1 − octaves).
+    fn range(self) -> Interval {
+        var r = 0.0
+        var a = 1.0
+        for _o in 0..self.octaves {
+            r += a
+            a *= 0.5
+        }
+        Interval { lo: -r, hi: r }
+    }
+
+    /// Each octave's gradient is at most its amplitude times its frequency (which is `freq`
+    /// for every octave) times value noise's bound.
+    fn lipschitz(self) -> f32 {
+        f32(self.octaves) * abs(self.freq) * VALUE_NOISE_LIPSCHITZ
+    }
+
+    /// The finest octave's lattice frequency.
+    fn bandlimit(self) -> f32 {
+        if self.octaves == 0 { 0.0 } else { abs(self.freq) * exp2(f32(self.octaves - 1)) }
+    }
+
+    /// Each octave by its size against the footprint: sampled where its cells are 16 or more
+    /// footprints across, averaged over the footprint exactly (`value_noise_box`) where they're
+    /// down to a quarter of one, and its mean, 0, where they're finer still.
+    fn filtered(self, p: vec3, footprint: vec3) -> f32 {
+        let q = p + self.offset
+        var s = 0.0
+        var a = 1.0
+        var fr = self.freq
+        for o in 0..self.octaves {
+            let half = abs(footprint) * (0.5 * abs(fr))
+            let r = 2.0 * max(half.x, max(half.y, half.z))
+            let at = q * fr + f32(o) * 17.0
+            if r < 0.0625 {
+                s += a * value_noise(at)
+            } else if r <= 4.0 {
+                s += a * value_noise_box(at, half)
+            }
+            a *= 0.5
+            fr *= 2.0
+        }
+        s
+    }
+}
+
+/// A bound on value noise's gradient: the quintic fade's slope is at most 30/16, the lattice
+/// values differ by at most 2, so each component is at most 3.75, and the length at most
+/// 3.75 √3 (with room for rounding).
+pub const VALUE_NOISE_LIPSCHITZ: f32 = 6.5
+
+// ---- Lipschitz bounds ---------------------------------------------------------------------------
+
+/// A surface that bounds its own gradient near itself, so sphere tracing can step by it (§17,
+/// D-092). Primitives state their bound; combinators compose their parts' in ordinary code, and
+/// pass the scope on.
+pub trait Lipschitz: Surface {
+    /// A bound on the length of `distance`'s gradient wherever |distance| < `near`. A consumer
+    /// passes the scope it needs: a step of at most `near` (`to_bound`), or an interval test
+    /// over a block that straddles the surface, at least the block's radius.
+    fn lipschitz(self, near: f32) -> f32
+
+    /// The distance, held within ±`near` and divided by `lipschitz(near)`: never more than the
+    /// distance to the surface, so sphere tracing can step by it. A debug build checks the
+    /// bound against the derived gradient first (`check_lipschitz`).
+    fn to_bound(self, near: f32) -> ToBound<Self> {
+        let l = self.lipschitz(near)
+        if debug_build() {
+            check_lipschitz(self, near, l)
+        }
+        ToBound { inner: self, near, scale: 1.0 / l }
+    }
+}
+
+/// A surface divided by its Lipschitz bound: `.to_bound(near)`.
+pub struct ToBound<S>: Copy + GpuData {
+    pub inner: S,
+    pub near: f32,
+    pub scale: f32,
+}
+
+impl<S: Surface> Surface for ToBound<S> {
+    fn distance(self, p: vec3) -> f32 {
+        clamp(self.inner.distance(p), -self.near, self.near) * self.scale
+    }
+}
+
+impl<S: Surface> Lipschitz for ToBound<S> {
+    fn lipschitz(self, near: f32) -> f32 {
+        1.0
+    }
+}
+
+impl<C, S: Field<C>> Field<C> for ToBound<S> {
+    fn channels(self, p: vec3) -> C {
+        self.inner.channels(p)
+    }
+
+    fn distance_and_channels(self, p: vec3) -> (f32, C) {
+        let (d, c) = self.inner.distance_and_channels(p)
+        (clamp(d, -self.near, self.near) * self.scale, c)
+    }
+}
+
+impl Lipschitz for Sphere {
+    /// Exact: its gradient is a unit vector.
+    fn lipschitz(self, near: f32) -> f32 {
+        1.0
+    }
+}
+
+impl Lipschitz for RoundCone {
+    /// Exact.
+    fn lipschitz(self, near: f32) -> f32 {
+        1.0
+    }
+}
+
+impl Lipschitz for Cuboid {
+    /// Exact.
+    fn lipschitz(self, near: f32) -> f32 {
+        1.0
+    }
+}
+
+impl Lipschitz for HalfSpace {
+    /// Exact: `half_space` makes its normal a unit vector.
+    fn lipschitz(self, near: f32) -> f32 {
+        1.0
+    }
+}
+
+impl Lipschitz for Ellipsoid {
+    /// The bound k0 (k0 − 1) / k1, with k0 = |p / r| and k1 = |p / r²|, has a gradient that
+    /// grows without bound at the centre. Where |distance| < near, |k0 − 1| < e = near /
+    /// min(r), and its gradient is at most max(2 − 1 / (1 + e), 1 / (1 − e) − 2) +
+    /// e (max(r) / min(r))² / (1 − e). Infinite from e = 1 on, where the centre is in scope.
+    fn lipschitz(self, near: f32) -> f32 {
+        let lo = min(self.radii.x, min(self.radii.y, self.radii.z))
+        let hi = max(self.radii.x, max(self.radii.y, self.radii.z))
+        let e = max(near, 0.0) / lo
+        if e >= 1.0 {
+            return 1.0 / 0.0
+        }
+        let first = max(2.0 - 1.0 / (1.0 + e), 1.0 / (1.0 - e) - 2.0)
+        let r = hi / lo
+        (first + e * r * r / (1.0 - e)) * 1.001
+    }
+}
+
+impl<A: Lipschitz, B: Lipschitz> Lipschitz for Union<A, B> {
+    /// The smaller distance's: where it's within `near`, so is the part's.
+    fn lipschitz(self, near: f32) -> f32 {
+        max(self.a.lipschitz(near), self.b.lipschitz(near))
+    }
+}
+
+impl<S: Lipschitz, const N: u32> Lipschitz for UnionAll<S, N> {
+    fn lipschitz(self, near: f32) -> f32 {
+        var l = 0.0
+        for i in 0..N {
+            l = max(l, self.parts[i].lipschitz(near))
+        }
+        l
+    }
+}
+
+impl<S: Lipschitz, const N: u32> Lipschitz for SmoothUnionAll<S, N> {
+    /// As `SmoothUnion`'s, with the scope widened by `1.25 k` for each `smin` a part goes
+    /// through: at most `N - 1`.
+    fn lipschitz(self, near: f32) -> f32 {
+        let scope = near + 1.25 * max(self.k, 0.0) * f32(max(N, 1) - 1)
+        var l = 0.0
+        for i in 0..N {
+            l = max(l, self.parts[i].lipschitz(scope))
+        }
+        l
+    }
+}
+
+impl<A: Lipschitz, B: Lipschitz> Lipschitz for Intersect<A, B> {
+    fn lipschitz(self, near: f32) -> f32 {
+        max(self.a.lipschitz(near), self.b.lipschitz(near))
+    }
+}
+
+impl<A: Lipschitz, B: Lipschitz> Lipschitz for SmoothUnion<A, B> {
+    /// `smin`'s gradient mixes its parts' with weights that add up to 1. Where it's within
+    /// `near`, the parts are within `near + 1.25 k`: the smaller is at most `k / 4` above it,
+    /// and they blend only where they're less than `k` apart.
+    fn lipschitz(self, near: f32) -> f32 {
+        let scope = near + 1.25 * max(self.k, 0.0)
+        max(self.a.lipschitz(scope), self.b.lipschitz(scope))
+    }
+}
+
+impl<S: Lipschitz> Lipschitz for Translate<S> {
+    fn lipschitz(self, near: f32) -> f32 {
+        self.inner.lipschitz(near)
+    }
+}
+
+impl<S: Lipschitz, N: Noise> Lipschitz for Displace<S, N> {
+    /// The inner surface's bound, where it's within `near` plus the displacement's reach, and
+    /// the noise's, scaled by the amplitude.
+    fn lipschitz(self, near: f32) -> f32 {
+        let r = self.noise.range()
+        let reach = abs(self.amp) * max(abs(r.lo), abs(r.hi))
+        self.inner.lipschitz(near + reach) + abs(self.amp) * self.noise.lipschitz()
+    }
+}
+
+impl<S: Lipschitz, C: Copy + GpuData> Lipschitz for With<S, C> {
+    fn lipschitz(self, near: f32) -> f32 {
+        self.inner.lipschitz(near)
+    }
+}
+
+impl<S: Lipschitz, F: Copy + GpuData> Lipschitz for WithAt<S, F> {
+    fn lipschitz(self, near: f32) -> f32 {
+        self.inner.lipschitz(near)
+    }
+}
+
+/// A debug build's check of a stated bound (§13): over the boxes in [-16, 16]³ where the
+/// distance can be within ±`near`, refined to boxes about `near` wide, the derived gradient's
+/// interval must allow a gradient no longer than `l`. A box whose every gradient is longer
+/// panics: `l` understates the gradient there. (A box can only prove a bound wrong, not right,
+/// so a bound that's wrong only between the boxes' samples can pass.)
+pub fn check_lipschitz<S: Surface>(s: S, near: f32, l: f32) {
+    var stack: Vec<Box3> = Vec::new()
+    stack.push(Box3 { lo: vec3(-16.0), hi: vec3(16.0) })
+    var visited = 0
+    while stack.len() > 0 && visited < 20000 {
+        visited += 1
+        let b = stack.pop().unwrap()
+        let d = interval(|q| s.distance(q), b)
+        if d.lo >= near || d.hi <= -near {
+            continue
+        }
+        let size = b.hi.x - b.lo.x
+        if size > max(near, 1.0 / 64.0) {
+            let mid = (b.lo + b.hi) * 0.5
+            for i in 0..8 {
+                let lo = vec3(
+                    if i & 1 == 0 { b.lo.x } else { mid.x },
+                    if i & 2 == 0 { b.lo.y } else { mid.y },
+                    if i & 4 == 0 { b.lo.z } else { mid.z },
+                )
+                stack.push(Box3 { lo, hi: lo + (mid - b.lo) })
+            }
+            continue
+        }
+        let gx = interval(|q| gradient(|r| s.distance(r), q).x, b)
+        let gy = interval(|q| gradient(|r| s.distance(r), q).y, b)
+        let gz = interval(|q| gradient(|r| s.distance(r), q).z, b)
+        let least = vec3(least_abs(gx), least_abs(gy), least_abs(gz))
+        let g = length(least)
+        if g > l * 1.001 + 1.0e-6 {
+            panic(
+                f"a Lipschitz bound of {l} for |distance| < {near} is too small: the derived gradient is at least {g} over the box from ({b.lo.x}, {b.lo.y}, {b.lo.z}) to ({b.hi.x}, {b.hi.y}, {b.hi.z})",
+            )
+        }
+    }
+}
+
+/// The least |x| for x in `i`.
+fn least_abs(i: Interval) -> f32 {
+    if i.lo > 0.0 { i.lo } else if i.hi < 0.0 { -i.hi } else { 0.0 }
+}
+
+// ---- channels -----------------------------------------------------------------------------------
+
+/// A surface whose points carry channels `C` besides their distance (D-002): what a point knows
+/// about itself, such as its colour or its density. `.with(...)` and `.with_at(...)` give a
+/// surface channels, and the combinators blend them where they blend the surfaces.
+pub trait Field<C>: Surface {
+    /// The channels at `p`.
+    fn channels(self, p: vec3) -> C
+
+    /// The distance and the channels at `p` together, with each part of the field evaluated
+    /// once: std's combinators blend their parts' channels by their distances, so they compute
+    /// both here, and their `channels` is this one's second half. The distance is the same as
+    /// `distance(p)`, bit for bit.
+    fn distance_and_channels(self, p: vec3) -> (f32, C) {
+        (self.distance(p), self.channels(p))
+    }
+}
+
+/// How channels mix where surfaces blend. A channel struct declares it and gets it field by
+/// field, so each member's type decides how it mixes (D-026).
+@fieldwise
+pub trait Blend {
+    /// `self` where `t` is 0, `other` where it's 1, and a mix between.
+    fn blend(self, other: Self, t: f32) -> Self
+}
+
+impl Blend for f32 {
+    fn blend(self, other: f32, t: f32) -> f32 {
+        mix(self, other, t)
+    }
+}
+
+impl Blend for vec2 {
+    fn blend(self, other: vec2, t: f32) -> vec2 {
+        mix(self, other, vec2(t))
+    }
+}
+
+impl Blend for vec3 {
+    fn blend(self, other: vec3, t: f32) -> vec3 {
+        mix(self, other, vec3(t))
+    }
+}
+
+impl Blend for vec4 {
+    fn blend(self, other: vec4, t: f32) -> vec4 {
+        mix(self, other, vec4(t))
+    }
+}
+
+impl Blend for Quat {
+    fn blend(self, other: Quat, t: f32) -> Quat {
+        self.nlerp(other, t)
+    }
+}
+
+/// A colour in linear RGB, which blends linearly.
+pub struct Color: Copy + GpuData + Blend + StateHash {
+    pub r: f32,
+    pub g: f32,
+    pub b: f32,
+}
+
+/// A colour from linear RGB.
+pub fn rgb(r: f32, g: f32, b: f32) -> Color {
+    Color { r, g, b }
+}
+
+/// A direction, which blends along the sphere: mixed, then made unit length again.
+pub struct UnitVec3: Copy + GpuData + StateHash {
+    pub v: vec3,
+}
+
+/// `v`'s direction.
+pub fn unit_vec3(v: vec3) -> UnitVec3 {
+    UnitVec3 { v: normalize(v) }
+}
+
+impl Blend for UnitVec3 {
+    fn blend(self, other: UnitVec3, t: f32) -> UnitVec3 {
+        let m = mix(self.v, other.v, vec3(t))
+        // Opposite directions mixed half and half cancel: keep the nearer one.
+        if dot(m, m) < 1.0e-12 {
+            if t < 0.5 { self } else { other }
+        } else {
+            UnitVec3 { v: normalize(m) }
+        }
+    }
+}
+
+/// A categorical channel, such as a material: never averaged, but taken whole from whichever
+/// surface weighs more where two blend (D-026).
+pub struct Cat<T>: Copy + GpuData + StateHash {
+    pub value: T,
+}
+
+/// `value` as a categorical channel.
+pub fn cat<T: Copy>(value: T) -> Cat<T> {
+    Cat { value }
+}
+
+impl<T: Copy> Blend for Cat<T> {
+    fn blend(self, other: Cat<T>, t: f32) -> Cat<T> {
+        if t <= 0.5 { self } else { other }
+    }
+}
+
+/// A surface whose points all carry the channels `value`: `.with(...)`.
+pub struct With<S, C>: Copy + GpuData {
+    pub inner: S,
+    pub value: C,
+}
+
+impl<S: Surface, C: Copy + GpuData> Surface for With<S, C> {
+    fn distance(self, p: vec3) -> f32 {
+        self.inner.distance(p)
+    }
+}
+
+impl<S: Surface, C: Copy + GpuData> Field<C> for With<S, C> {
+    fn channels(self, p: vec3) -> C {
+        self.value
+    }
+
+    fn distance_and_channels(self, p: vec3) -> (f32, C) {
+        (self.inner.distance(p), self.value)
+    }
+}
+
+/// A surface whose channels a function computes at each point: `.with_at(...)`.
+pub struct WithAt<S, F>: Copy + GpuData {
+    pub inner: S,
+    pub at: F,
+}
+
+impl<S: Surface, F: Copy + GpuData> Surface for WithAt<S, F> {
+    fn distance(self, p: vec3) -> f32 {
+        self.inner.distance(p)
+    }
+}
+
+impl<S: Surface, C, F: Copy + GpuData + fn(vec3) -> C> Field<C> for WithAt<S, F> {
+    fn channels(self, p: vec3) -> C {
+        (self.at)(p)
+    }
+}
+
+/// How much of `b` a smooth union of distances `a` and `b` takes, from 0 to 1: the weight
+/// `smin`'s gradient gives `b`'s, which a field's channels blend by too.
+pub fn smin_weight(a: f32, b: f32, k: f32) -> f32 {
+    let m = max(k - select(if_false: abs(a - b), if_true: 0.0, cond: a == b), 0.0)
+    let w = m * (0.5 / max(k, 1.1754944e-38))
+    if a < b { w } else { 1.0 - w }
+}
+
+// The combinators evaluate each part once, for its distance and its channels together: asking
+// each part for its channels after its distance would evaluate a chain of n blended parts
+// O(n²) times.
+
+impl<C: Blend, A: Field<C>, B: Field<C>> Field<C> for Union<A, B> {
+    fn channels(self, p: vec3) -> C {
+        self.distance_and_channels(p).1
+    }
+
+    /// The nearer part's channels; a tie takes `a`'s.
+    fn distance_and_channels(self, p: vec3) -> (f32, C) {
+        let (da, ca) = self.a.distance_and_channels(p)
+        let (db, cb) = self.b.distance_and_channels(p)
+        (min(da, db), if da <= db { ca } else { cb })
+    }
+}
+
+impl<C: Blend, A: Field<C>, B: Field<C>> Field<C> for SmoothUnion<A, B> {
+    fn channels(self, p: vec3) -> C {
+        self.distance_and_channels(p).1
+    }
+
+    /// The parts' channels blended by `smin_weight`.
+    fn distance_and_channels(self, p: vec3) -> (f32, C) {
+        let (da, ca) = self.a.distance_and_channels(p)
+        let (db, cb) = self.b.distance_and_channels(p)
+        (smin(da, db, self.k), ca.blend(cb, smin_weight(da, db, self.k)))
+    }
+}
+
+impl<C: Blend, A: Field<C>, B: Field<C>> Field<C> for Intersect<A, B> {
+    fn channels(self, p: vec3) -> C {
+        self.distance_and_channels(p).1
+    }
+
+    /// The farther part's channels; a tie takes `a`'s.
+    fn distance_and_channels(self, p: vec3) -> (f32, C) {
+        let (da, ca) = self.a.distance_and_channels(p)
+        let (db, cb) = self.b.distance_and_channels(p)
+        (max(da, db), if da >= db { ca } else { cb })
+    }
+}
+
+impl<C, S: Field<C>> Field<C> for Translate<S> {
+    fn channels(self, p: vec3) -> C {
+        self.inner.channels(p - self.by)
+    }
+
+    fn distance_and_channels(self, p: vec3) -> (f32, C) {
+        self.inner.distance_and_channels(p - self.by)
+    }
+}
+
+impl<C, S: Field<C>, N: Noise> Field<C> for Displace<S, N> {
+    fn channels(self, p: vec3) -> C {
+        self.inner.channels(p)
+    }
+
+    fn distance_and_channels(self, p: vec3) -> (f32, C) {
+        let (d, c) = self.inner.distance_and_channels(p)
+        (d + self.amp * self.noise.value(p), c)
+    }
+}
+
+/// The nearest part's channels; a tie takes the earlier part's, as `a.union(b)` does. A union
+/// of no parts has no channels: asking for them indexes past the end (§11).
+impl<C: Blend, S: Field<C>, const N: u32> Field<C> for UnionAll<S, N> {
+    fn channels(self, p: vec3) -> C {
+        self.distance_and_channels(p).1
+    }
+
+    fn distance_and_channels(self, p: vec3) -> (f32, C) {
+        let (d0, c0) = self.parts[0].distance_and_channels(p)
+        // The same `min`s, in the same order, as `distance`.
+        var d = min(EMPTY, d0)
+        var c = take c0
+        for i in 1..N {
+            let (di, ci) = self.parts[i].distance_and_channels(p)
+            if di < d {
+                c = take ci
+            }
+            d = min(d, di)
+        }
+        (d, c)
+    }
+}
+
+/// The parts' channels blended in order, each by `smin_weight`, as `a.smooth_union(b, k)
+/// .smooth_union(c, k)` blends them. A union of no parts has no channels: asking for them
+/// indexes past the end (§11).
+impl<C: Blend, S: Field<C>, const N: u32> Field<C> for SmoothUnionAll<S, N> {
+    fn channels(self, p: vec3) -> C {
+        self.distance_and_channels(p).1
+    }
+
+    fn distance_and_channels(self, p: vec3) -> (f32, C) {
+        let (d0, c0) = self.parts[0].distance_and_channels(p)
+        var d = d0
+        var c = take c0
+        for i in 1..N {
+            let (di, ci) = self.parts[i].distance_and_channels(p)
+            c = c.blend(ci, smin_weight(d, di, self.k))
+            d = smin(d, di, self.k)
+        }
+        (d, c)
+    }
+}
+
+// ---- tests (the suite runs std's: `std_tests_pass`) --------------------------------------------
+
+/// A blob of every primitive, smooth-unioned, and displaced by noise: what std's field tests
+/// check.
+fn test_blob() -> Lipschitz {
+    let body = ellipsoid(vec3(1.0, 0.6, 0.8))
+    let limb = round_cone(vec3(0.5, -0.2, 0.0), vec3(1.4, 0.6, 0.2), r_top: 0.15, r_bottom: 0.3)
+    let block = cuboid(vec3(0.3)).translate(vec3(-0.9, 0.4, 0.1))
+    body.smooth_union(limb, k: 0.2).smooth_union(block, k: 0.1).displace(fbm(4.0, 3), amp: 0.01)
+}
+
+@test
+fn derived_gradients_agree_with_finite_differences() {
+    let f = test_blob()
+    let b = Box3 { lo: vec3(-2.0), hi: vec3(2.0) }
+    let h = 1.0e-3
+    for i in 0..256 {
+        let p = b.sample(1, i)
+        let g = gradient(|q: vec3| f.distance(q), p)
+        let dx = f.distance(p + vec3(x: h)) - f.distance(p - vec3(x: h))
+        let dy = f.distance(p + vec3(y: h)) - f.distance(p - vec3(y: h))
+        let dz = f.distance(p + vec3(z: h)) - f.distance(p - vec3(z: h))
+        let off = length(g - vec3(dx, dy, dz) / (2.0 * h))
+        assert(off < 0.02, f"at ({p.x}, {p.y}, {p.z})")
+    }
+}
+
+@test
+fn derived_intervals_enclose_the_distances_in_their_boxes() {
+    let f = test_blob()
+    let space = Box3 { lo: vec3(-2.0), hi: vec3(2.0) }
+    for i in 0..64 {
+        let c = space.sample(2, i)
+        let b = Box3 { lo: c - vec3(0.1), hi: c + vec3(0.1) }
+        let r = interval(|q: vec3| f.distance(q), b)
+        for j in 0..16 {
+            let d = f.distance(b.sample(3, j))
+            assert(r.lo <= d && d <= r.hi, f"a box at ({c.x}, {c.y}, {c.z})")
+        }
+    }
+}
+
+@test
+fn stated_bounds_hold_near_the_surface() {
+    let f = test_blob()
+    let near = 0.1
+    let l = f.lipschitz(near)
+    let b = Box3 { lo: vec3(-2.0), hi: vec3(2.0) }
+    var checked = 0
+    for i in 0..4096 {
+        let p = b.sample(4, i)
+        if abs(f.distance(p)) < near {
+            checked += 1
+            let g = length(gradient(|q: vec3| f.distance(q), p))
+            assert(g <= l, f"at ({p.x}, {p.y}, {p.z})")
+        }
+    }
+    assert(checked > 50, "too few samples near the surface")
 }

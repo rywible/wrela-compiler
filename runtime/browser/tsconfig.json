@@ -6,5 +6,5 @@
     "types": ["@webgpu/types", "bun"]
   },
   "include": ["src", "test", "scripts"],
-  "exclude": ["src/worker.ts"]
+  "exclude": ["src/worker.ts", "src/worklet.ts"]
 }

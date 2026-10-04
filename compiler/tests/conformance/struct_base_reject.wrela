@@ -13,7 +13,7 @@ fn f(b: B) -> A {
     A { x: 1.0, ..b } //~ E0300
 }
 
-enum E: Copy + Clone {
+enum E: Copy {
     V { x: f32, y: f32 },
     W { z: f32 },
 }

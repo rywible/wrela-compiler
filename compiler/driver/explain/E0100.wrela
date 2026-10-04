@@ -1,0 +1,14 @@
+// The parser found a token it didn't expect here. The message says what it expected; often a
+// bracket, a comma or a name is missing just before.
+// ---- wrong
+fn add(a: i32 b: i32) -> i32 {
+    a + b
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+fn add(a: i32, b: i32) -> i32 {
+    a + b
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

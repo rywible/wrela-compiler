@@ -80,6 +80,8 @@ fn ordinary_layouts_are_in_the_language() {
         "fn f() { let x: Option<Option<u32>> = y; t.0 .1 }",
         "fn f() { t.0.1 + pair.0.x + 2.0.sqrt() + 1.max(2) + 1e5.abs() + 1 .0 }",
         "@compute(64)\nfn f() {}\n",
+        "fn f() { let s = \"a \\\"q\\\" b\"\n    let d = 15cm + 1.5e-3mm\n    let t = f\"{w:.1} kg, {{x}}, {f\"{a}\"}\" }",
+        "fn f() { match w { \"weapon\" => 1, _ => 2 } }",
     ];
     with_big_stack(|| {
         for src in layouts {
@@ -121,16 +123,24 @@ fn formatted_programs_are_in_the_language() {
             let src = generator.render(&terms, &mut rng).text;
             let p = wrela_syntax::parse(wrela_diag::FileId(0), &src);
             let tokens = wrela_syntax::lex(wrela_diag::FileId(0), &src).tokens;
+            // The GBNF writes a tuple index touching its `.`: not after a comment between them.
             let odd_index = |w: &[wrela_syntax::Token]| {
                 let index = &src[w[1].span.range()];
                 w[0].kind == T::Dot
                     && w[1].kind == T::Int
-                    && (index.len() > 4 || !index.bytes().all(|b| b.is_ascii_digit()))
+                    && (index.len() > 4
+                        || !index.bytes().all(|b| b.is_ascii_digit())
+                        || w[0].span.end != w[1].span.start)
             };
-            if p.has_errors()
-                || tokens.iter().any(|t| matches!(t.kind, T::Str | T::Suffixed))
-                || tokens.windows(2).any(odd_index)
-            {
+            // A unit suffix the GBNF leaves out: one starting with `x`, `b` or `o`, which
+            // after a `0` reads as a radix prefix.
+            let odd_unit = |t: &wrela_syntax::Token| {
+                t.kind == T::Suffixed
+                    && wrela_syntax::lexer::split_suffix(&src[t.span.range()])
+                        .1
+                        .starts_with(['x', 'X', 'b', 'B', 'o', 'O'])
+            };
+            if p.has_errors() || tokens.iter().any(odd_unit) || tokens.windows(2).any(odd_index) {
                 continue;
             }
             let out = wrela_syntax::fmt::format(&p, &src);

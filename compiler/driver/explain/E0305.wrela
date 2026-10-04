@@ -1,0 +1,14 @@
+// An operator that doesn't apply to these types: `+` of an `i32` and a `u32`, `<` of two
+// vectors. Both sides of an arithmetic operator have one type: convert one.
+// ---- wrong
+fn total(a: i32, b: u32) -> i32 {
+    a + b
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+fn total(a: i32, b: u32) -> i32 {
+    a + i32(b)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

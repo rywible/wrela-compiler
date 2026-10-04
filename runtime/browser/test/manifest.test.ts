@@ -7,8 +7,8 @@ import { readFixtureText } from "./fixtures.ts";
 
 /** The Rust crate's golden manifest (runtime/abi/src/manifest.rs, `golden_json`). */
 const GOLDEN = `{
-  "manifest_version": 1,
-  "stream_version": 2,
+  "manifest_version": 2,
+  "stream_version": 4,
   "wasm": "game.wasm",
   "pipelines": [
     {
@@ -18,7 +18,7 @@ const GOLDEN = `{
       "entry": "main",
       "workgroup_size": [64, 1, 1],
       "uniform": { "binding": 0, "size": 32, "space": "uniform" },
-      "buffers": [{ "binding": 1, "access": "read_write" }]
+      "bindings": [{ "binding": 1, "kind": "read_write" }]
     },
     {
       "name": "cover+shade",
@@ -27,7 +27,7 @@ const GOLDEN = `{
       "vertex_entry": "vs",
       "fragment_entry": "fs",
       "uniform": null,
-      "buffers": []
+      "bindings": [{ "binding": 0, "kind": "texture" }, { "binding": 1, "kind": "sampler" }]
     }
   ]
 }`;
@@ -41,8 +41,8 @@ function expectInvalid(f: () => unknown, text: string): void {
 
 test("parses the Rust crate's golden manifest", () => {
   expect(sample()).toEqual({
-    manifest_version: 1,
-    stream_version: 2,
+    manifest_version: 2,
+    stream_version: 4,
     wasm: "game.wasm",
     pipelines: [
       {
@@ -52,7 +52,8 @@ test("parses the Rust crate's golden manifest", () => {
         entry: "main",
         workgroup_size: [64, 1, 1],
         uniform: { binding: 0, size: 32, space: "uniform" },
-        buffers: [{ binding: 1, access: "read_write" }],
+        bindings: [{ binding: 1, kind: "read_write" }],
+        debug_flag: null,
       },
       {
         kind: "render",
@@ -61,7 +62,11 @@ test("parses the Rust crate's golden manifest", () => {
         vertex_entry: "vs",
         fragment_entry: "fs",
         uniform: null,
-        buffers: [],
+        bindings: [
+          { binding: 0, kind: "texture" },
+          { binding: 1, kind: "sampler" },
+        ],
+        debug_flag: null,
       },
     ],
   });
@@ -77,7 +82,7 @@ test("parses the first-light fixture", () => {
 
 test("rejects malformed JSON and wrong field types", () => {
   expect(() => parseManifest("{")).toThrow(ManifestError);
-  expectInvalid(() => parseManifest(GOLDEN.replace('"binding": 1', '"binding": -1')), "pipelines[0].buffers[0].binding must be a u32, not -1");
+  expectInvalid(() => parseManifest(GOLDEN.replace('"binding": 1', '"binding": -1')), "pipelines[0].bindings[0].binding must be a u32, not -1");
   expectInvalid(() => parseManifest(GOLDEN.replace('"kind": "render"', '"kind": "raster"')), "pipelines[1].kind must be one of compute, render");
   expectInvalid(() => parseManifest(GOLDEN.replace('"wasm": "game.wasm",', "")), "missing field `wasm` in the manifest");
 });

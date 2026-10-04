@@ -1,0 +1,29 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0600",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "this `buffer` records GPU work, and `SIZE` is a constant, which the build computes, which can't `host`",
+      "notes": [
+        "the call chain: SIZE → make",
+        "recording GPU work is the `host` effect; see language.md §8 for what each context forbids"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 29,
+        "end": 207,
+        "end_column": 38,
+        "end_line": 9,
+        "line": 9,
+        "start": 198
+      },
+      "title": "an effect a context forbids"
+    }
+  ],
+  "version": 2
+}

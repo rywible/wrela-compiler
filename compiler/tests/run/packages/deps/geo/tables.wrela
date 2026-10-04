@@ -1,0 +1,10 @@
+// A dependency's modules are named under it: this is `geo::tables`.
+pub const TABLE: Vec<u32> = table()
+
+fn table() -> Vec<u32> {
+    var v = Vec::new()
+    for i in 0..4 {
+        v.push(units2::lib::ten() * i)
+    }
+    v
+}

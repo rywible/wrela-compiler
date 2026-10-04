@@ -1,0 +1,34 @@
+// accepts: const.places
+// A constant is a place that lives as long as the program: it's read and projected, a function
+// can return a projection of it, and `.clone()` gives an owned copy (§10).
+const NAMES: Vec<Text> = names()
+const VALUES: [f32; 2] = [1.0, 2.0]
+
+fn names() -> Vec<Text> {
+    var v = Vec::new()
+    v.push("hip")
+    v.push("chest")
+    v
+}
+
+fn second() -> borrow Text {
+    NAMES[1]
+}
+
+fn value(i: u32) -> borrow f32 {
+    VALUES[i]
+}
+
+fn count(names: Vec<Text>) -> u32 {
+    names.len()
+}
+
+fn f() -> u32 {
+    var mine = NAMES.clone()
+    mine.push("tail")
+    let first = NAMES[0]
+    for n in NAMES {
+        let _ = n.len()
+    }
+    count(NAMES) + mine.len() + second().len() + first.len() + u32(value(1))
+}

@@ -1,0 +1,301 @@
+// A dialogue tree (paper test §2), read from data/dialogue.dlg when the game is built.
+//
+// Changed from the paper test:
+// - A condition is a tree (`Not(Box<Cond>)`, `All(Vec<Cond>)`), walked by recursion: in
+//   `@deterministic` code the compiler counts it to 256 calls (F2). The paper test flattened it
+//   to postfix and walked that with a stack.
+// - The dialogue is one constant of nested `Vec`s and `String`s (F5); the paper test needed four
+//   tables of row ranges, each running the parser again.
+
+use engine::sim::{SimState, SimValue}
+use flags::{FlagId, Flags, flag}
+use inventory::Player
+use items::{ItemId, item}
+use std::hash::StateHash
+use std::serialize::Serialize
+use text::{Words, file_text, indent, rows}
+use world::{Event, World}
+
+pub enum Cond: Clone + StateHash {
+    Has { item: ItemId, count: u32 },
+    Flag(FlagId),
+    Not(Box<Cond>),
+    All(Vec<Cond>),
+    Any(Vec<Cond>),
+}
+
+pub enum Effect: SimValue {
+    Give { item: ItemId, count: u32 },
+    Take { item: ItemId, count: u32 },
+    Set(FlagId),
+    Clear(FlagId),
+}
+
+pub enum Next: Copy + Eq {
+    Goto(u32), // a node's index in DIALOGUE
+    End,
+}
+
+pub struct Choice: Clone {
+    pub text: String,
+    pub cond: Option<Cond>,
+    pub effects: Vec<Effect>,
+    pub next: Next,
+}
+
+pub struct Node: Clone {
+    pub name: String,
+    pub speaker: String,
+    pub line: String,
+    pub choices: Vec<Choice>,
+}
+
+pub const DIALOGUE: Vec<Node> = parse_dialogue(
+    file_text(embed("data/dialogue.dlg"), "data/dialogue.dlg"),
+)
+pub const MIRA_START = node_named("mira.start") // a misspelled name fails the build
+
+/// The conversation in progress: one `u32` of sim state, which saves, hashes and rolls back
+/// with no work.
+pub struct Conversation: SimValue {
+    pub node: u32,
+}
+
+/// Whether a condition holds.
+@deterministic
+pub fn holds(c: Cond, p: Player, flags: Flags) -> bool {
+    match c {
+        Cond::Has { item, count } => p.bag.count(item) >= count,
+        Cond::Flag(f) => flags.get(f),
+        Cond::Not(inner) => !holds(inner.get(), p, flags), // recursion: counted (F2)
+        Cond::All(cs) => {
+            for x in cs {
+                if !holds(x, p, flags) {
+                    return false
+                }
+            }
+            true
+        },
+        Cond::Any(cs) => {
+            for x in cs {
+                if holds(x, p, flags) {
+                    return true
+                }
+            }
+            false
+        },
+    }
+}
+
+/// The choices on offer now, by index in the node. Presentation calls this to draw them.
+@deterministic
+pub fn offered(c: Conversation, p: Player, flags: Flags) -> Vec<u32> {
+    borrow node = DIALOGUE[c.node]
+    var out: Vec<u32> = Vec::new()
+    for i in 0..node.choices.len() {
+        let ok = match node.choices[i].cond {
+            Some(cond) => holds(cond, p, flags),
+            None => true,
+        }
+        if ok {
+            out.push(i)
+        }
+    }
+    out
+}
+
+// ---- reading the file, when the game is built ------------------------------------------------------
+
+/// `has(ring) and not flag(x)`: `or` binds loosest, then `and`, then `not`. Recursion is fine
+/// here, when the game is built.
+pub fn cond(w: mut Words) -> Cond {
+    let first = conj(mut w)
+    if w.peek() != "or" {
+        return first
+    }
+    var any: Vec<Cond> = Vec::new()
+    any.push(take first)
+    while w.eat("or") {
+        any.push(conj(mut w))
+    }
+    Cond::Any(any)
+}
+
+fn conj(w: mut Words) -> Cond {
+    let first = atom(mut w)
+    if w.peek() != "and" {
+        return first
+    }
+    var all: Vec<Cond> = Vec::new()
+    all.push(take first)
+    while w.eat("and") {
+        all.push(atom(mut w))
+    }
+    Cond::All(all)
+}
+
+fn atom(w: mut Words) -> Cond {
+    if w.eat("not") {
+        return Cond::Not(Box::new(atom(mut w)))
+    }
+    if w.eat("(") {
+        let c = cond(mut w)
+        w.expect(")")
+        return c
+    }
+    if w.eat("has") {
+        let (name, count) = w.call_args()
+        return Cond::Has { item: item(name), count } // a key that isn't an item fails the build
+    }
+    if w.eat("flag") {
+        let (name, _) = w.call_args()
+        return Cond::Flag(flag(name))
+    }
+    w.fail("expected `has`, `flag`, `not` or `(`")
+}
+
+/// `give(item, n)`, `take(item, n)`, `set(flag)` or `clear(flag)`: quests' rewards too.
+pub fn effect(w: mut Words) -> Effect {
+    let verb = w.next()
+    let (name, count) = w.call_args()
+    match verb {
+        "give" => Effect::Give { item: item(name), count },
+        "take" => Effect::Take { item: item(name), count },
+        "set" => Effect::Set(flag(name)),
+        "clear" => Effect::Clear(flag(name)),
+        _ => w.fail(f"unknown effect `{verb}`"),
+    }
+}
+
+/// The last of `len` things, which a `what` line needs one of before it.
+fn last(len: u32, row: u32, what: Text) -> u32 {
+    if len == 0 {
+        panic(f"data/dialogue.dlg, line {row}: `{what}` with nothing before it to belong to")
+    }
+    len - 1
+}
+
+/// Reads the file; then resolves each `-> node` to its index, which fails the build for a node
+/// that isn't there.
+fn parse_dialogue(file: String) -> Vec<Node> {
+    var nodes: Vec<Node> = Vec::new()
+    var targets: Vec<(u32, u32, String, u32)> = Vec::new() // node, choice, target, row
+    for r in rows(file) {
+        let row = r.0
+        borrow line = r.1
+        var w = Words::new(line, row, "data/dialogue.dlg")
+        let keyword = w.next()
+        match keyword {
+            "node" => nodes.push(
+                Node {
+                    name: w.next(),
+                    speaker: String::new(),
+                    line: String::new(),
+                    choices: Vec::new(),
+                },
+            ),
+            "say" => {
+                let n = last(nodes.len(), row, "say")
+                nodes[n].speaker = w.next()
+                nodes[n].line = w.quoted()
+            },
+            "choice" => {
+                let text = w.quoted()
+                let c = if w.eat("if") { Some(cond(mut w)) } else { None }
+                w.expect("->")
+                let target = w.next()
+                let n = last(nodes.len(), row, "choice")
+                targets.push((n, nodes[n].choices.len(), target.clone(), row))
+                nodes[n].choices.push(
+                    Choice { text: take text, cond: take c, effects: Vec::new(), next: Next::End },
+                )
+            },
+            "do" => {
+                let n = last(nodes.len(), row, "do")
+                let c = last(nodes[n].choices.len(), row, "do")
+                while !w.done() {
+                    nodes[n].choices[c].effects.push(effect(mut w))
+                }
+            },
+            _ => panic(f"data/dialogue.dlg, line {row}: unknown line `{keyword}`"),
+        }
+        if indent(line) > 4 && keyword != "do" {
+            panic(f"data/dialogue.dlg, line {row}: only `do` lines are indented under a choice")
+        }
+    }
+    for t in targets {
+        let (n, c, row) = (t.0, t.1, t.3)
+        borrow target = t.2
+        if target == "end" {
+            continue
+        }
+        var found = false
+        for i in 0..nodes.len() {
+            if nodes[i].name == target {
+                nodes[n].choices[c].next = Next::Goto(i)
+                found = true
+            }
+        }
+        if !found {
+            panic(f"data/dialogue.dlg, line {row}: no node `{target}`")
+        }
+    }
+    nodes
+}
+
+/// A node by name, when the game is built.
+pub fn node_named(name: str) -> u32 {
+    for i in 0..DIALOGUE.len() {
+        if DIALOGUE[i].name == name {
+            return i
+        }
+    }
+    panic(f"no dialogue node `{name}`")
+}
+
+// ---- acting on a choice ----------------------------------------------------------------------------
+
+/// The player picked choice `choice` of the node in progress: a tick input. Checked again,
+/// because input can be stale.
+@deterministic
+pub fn choose(w: mut World, choice: u32) {
+    let Some(talk) = w.talk else { return } // F8
+    borrow node = DIALOGUE[talk.node]
+    if choice >= node.choices.len() {
+        return
+    }
+    borrow ch = node.choices[choice]
+    if let Some(c) = ch.cond {
+        if !holds(c, w.player, w.flags) {
+            return
+        }
+    }
+    for e in ch.effects {
+        apply(mut w, e)
+    }
+    w.talk = match ch.next {
+        Next::Goto(n) => Some(Conversation { node: n }),
+        Next::End => None,
+    }
+}
+
+/// Quest rewards use this too (§4).
+@deterministic
+pub fn apply(w: mut World, e: Effect) {
+    match e {
+        Effect::Give { item, count } => {
+            let left = w.player.bag.add(item, count)
+            w.events.push(Event::ItemGained { item, count: count - left })
+        },
+        Effect::Take { item, count } => {
+            if w.player.bag.remove(item, count) {
+                w.events.push(Event::ItemLost { item, count })
+            }
+        },
+        Effect::Set(f) => {
+            w.flags.set(f, value: true)
+            w.events.push(Event::FlagSet(f))
+        },
+        Effect::Clear(f) => w.flags.set(f, value: false),
+    }
+}

@@ -1,0 +1,10 @@
+// mistake: storing a closure in a struct field
+// expect: E0510
+// fix: no
+struct Button {
+    on_click: fn(),
+}
+
+fn make(count: mut u32) -> Button {
+    Button { on_click: || { count += 1 } }
+}

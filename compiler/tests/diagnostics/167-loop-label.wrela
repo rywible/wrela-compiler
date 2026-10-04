@@ -1,0 +1,15 @@
+// mistake: a labelled `break`, as in Rust
+// expect: E0114 E0114
+// fix: no
+fn find(grid: [[u32; 4]; 4], want: u32) -> bool {
+    var found = false
+    'rows: for r in 0..4 {
+        for c in 0..4 {
+            if grid[r][c] == want {
+                found = true
+                break 'rows
+            }
+        }
+    }
+    found
+}

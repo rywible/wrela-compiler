@@ -1,0 +1,199 @@
+// run: build-time constants (§10): the build runs the program's own code, and each constant
+// equals what the same call returns at run time, bit for bit
+// expect: same_as_run_time() = true
+// expect: sum() = 285
+// expect: chest() = 5
+// expect: counts() = 316
+// expect: cloned() = 11
+// expect: shapes() = 7
+// expect: tree_depth() = 3
+// expect: table() = 25
+// expect: greeting_len() = 14
+// expect: literal_place() = 5
+
+use std::hash::{StateHash, state_hash}
+
+fn square(x: f32) -> f32 {
+    x * x
+}
+
+fn squares(n: u32) -> Vec<u32> {
+    var v = Vec::new()
+    for i in 0..n {
+        v.push(i * i)
+    }
+    v
+}
+
+fn names() -> Vec<Text> {
+    var v = Vec::new()
+    v.push("hip")
+    v.push("chest")
+    v.push("tail")
+    v
+}
+
+fn total(xs: Vec<u32>) -> u32 {
+    var s = 0
+    for x in xs {
+        s += x
+    }
+    s
+}
+
+enum Shape: Clone + Eq + StateHash {
+    Circle(f32),
+    Poly(Vec<vec2>),
+    Empty,
+}
+
+fn shapes_of() -> Vec<Shape> {
+    var out = Vec::new()
+    out.push(Shape::Circle(sin(0.5) * 2.0))
+    var pts = Vec::new()
+    for i in 0..4 {
+        pts.push(vec2(cos(f32(i)), sin(f32(i))))
+    }
+    out.push(Shape::Poly(take pts))
+    out.push(Shape::Empty)
+    out
+}
+
+struct Node: Clone + StateHash {
+    value: u32,
+    next: Option<Box<Node>>,
+}
+
+fn chain(n: u32) -> Node {
+    var node = Node { value: 0, next: None }
+    for i in 1..n {
+        node = Node { value: i, next: Some(Box::new(take node)) }
+    }
+    node
+}
+
+fn depth(n: Node) -> u32 {
+    match n.next {
+        Some(b) => 1 + depth(b.get()),
+        None => 1,
+    }
+}
+
+fn table_of() -> SortedMap<u32, u32> {
+    var m = SortedMap::new()
+    for i in 0..10 {
+        let _ = m.insert(9 - i, (9 - i) * (9 - i))
+    }
+    m
+}
+
+struct Look {
+    tolerance: f32,
+    names: [Text; 2],
+}
+
+const NINE = square(3.0)
+const WAVE: f32 = sin(0.5) + cos(0.25) * exp(0.1)
+const SQUARES = squares(10)
+const SUM = total(SQUARES)
+const NAMES: Vec<Text> = names()
+const NESTED: Vec<Vec<u32>> = nested()
+const SHAPES = shapes_of()
+const TREE = chain(3)
+const TABLE = table_of()
+const GREETING: String = f"hello, {NAMES[1]}!!"
+const LOOK = Look { tolerance: 0.25, names: ["fine", "rough"] }
+const EMPTY: Vec<u32> = Vec::new()
+
+fn nested() -> Vec<Vec<u32>> {
+    var out = Vec::new()
+    for i in 0..4 {
+        out.push(squares(i))
+    }
+    out
+}
+
+/// A part of a constant, returned as a projection.
+fn second_name() -> borrow Text {
+    NAMES[1]
+}
+
+pub fn same_as_run_time() -> bool {
+    bitcast_u32(NINE) == bitcast_u32(square(3.0)) &&
+        bitcast_u32(WAVE) == bitcast_u32(sin(0.5) + cos(0.25) * exp(0.1)) &&
+        SQUARES == squares(10) &&
+        state_hash(SHAPES) == state_hash(shapes_of()) &&
+        state_hash(TREE) == state_hash(chain(3)) &&
+        NESTED == nested() &&
+        GREETING == f"hello, {names()[1]}!!" &&
+        SUM == total(squares(10))
+}
+
+pub fn sum() -> u32 {
+    var s = 0
+    for x in SQUARES {
+        s += x
+    }
+    s
+}
+
+pub fn chest() -> u32 {
+    second_name().len()
+}
+
+pub fn counts() -> u32 {
+    // 10 + 3 + 4 + 0 + 285 + (0 + 1 + 2 + 3) + (0 + 1 + 4) + 3: the lengths, the sum, the
+    // nested lengths and the last nested `Vec`'s sum.
+    var nested = 0
+    for v in NESTED {
+        nested += v.len()
+    }
+    var last = 0
+    for x in NESTED[3] {
+        last += x
+    }
+    SQUARES.len() + NAMES.len() + NESTED.len() + EMPTY.len() + SUM + nested + last + 3
+}
+
+pub fn cloned() -> u32 {
+    var v = SQUARES.clone()
+    v.push(100)
+    if SQUARES.len() != 10 {
+        return 0
+    }
+    v.len()
+}
+
+pub fn shapes() -> u32 {
+    var n = 0
+    for s in SHAPES {
+        n += match s {
+            Shape::Circle(r) => if r > 0.9 && r < 1.0 { 1 } else { 100 },
+            Shape::Poly(pts) => pts.len() + 1,
+            Shape::Empty => 1,
+        }
+    }
+    n
+}
+
+pub fn tree_depth() -> u32 {
+    depth(TREE)
+}
+
+pub fn table() -> u32 {
+    let five = match TABLE.get(5) {
+        Some(x) => x,
+        None => 0,
+    }
+    five + TABLE.len() - 10
+}
+
+pub fn greeting_len() -> u32 {
+    GREETING.len()
+}
+
+pub fn literal_place() -> u32 {
+    LOOK.names[1].len() + u32(LOOK.tolerance * 0.0)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

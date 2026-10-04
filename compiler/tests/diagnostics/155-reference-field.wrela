@@ -1,0 +1,11 @@
+// mistake: a reference stored in an ordinary struct
+// expect: E0106
+// fix: yes
+struct Grazer {
+    speed: f32,
+}
+
+struct Herd {
+    leader: &Grazer,
+    size: u32,
+}

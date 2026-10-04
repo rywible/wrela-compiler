@@ -1,0 +1,15 @@
+// rejects: attr.gpu
+// A trait's default method that calls itself through the trait recurses for every type that
+// takes the default: found when it's instantiated.
+trait Depth {
+    @gpu
+    fn depth(self, k: u32) -> u32 {
+        if k == 0 { 0 } else { self.depth(k - 1) } //~ E0600
+    }
+}
+
+struct Probe: Copy {
+    x: f32,
+}
+
+impl Depth for Probe {}

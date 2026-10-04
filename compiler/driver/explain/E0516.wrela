@@ -1,0 +1,43 @@
+// A use of a value that's moved on some paths to here: one branch moved it and another didn't.
+// After the `if`, it may hold nothing. Move it in every branch, or in none.
+// ---- wrong
+struct Log {
+    lines: Vec<Text>,
+}
+
+fn archive(log: take Log) -> u32 {
+    log.lines.len()
+}
+
+fn maybe(c: bool) -> u32 {
+    var log = Log { lines: Vec::new() }
+    if c {
+        archive(take log)
+    } else {
+        0
+    }
+    log.lines.len()
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+struct Log {
+    lines: Vec<Text>,
+}
+
+fn archive(log: take Log) -> u32 {
+    log.lines.len()
+}
+
+fn maybe(c: bool) -> u32 {
+    var log = Log { lines: Vec::new() }
+    let n = log.lines.len()
+    if c {
+        archive(take log)
+    } else {
+        0
+    }
+    n
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

@@ -1,0 +1,14 @@
+// A conversion that wrela doesn't have: `f32(v)` of a vector, or a number from a `bool`
+// through a type that doesn't take one. Conversions are between scalar number types.
+// ---- wrong
+fn size(v: vec3) -> f32 {
+    f32(v)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+fn size(v: vec3) -> f32 {
+    length(v)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

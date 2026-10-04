@@ -1,0 +1,19 @@
+// rejects: gpu.workgroup-memory
+// A chunk is the invocation's own because its `LocalId` is: code can't build or change one,
+// and workgroup memory is a kernel's.
+use std::gpu::{ClipPosition, LocalId, Shared, VertexIndex}
+
+@compute(64)
+fn forged(row: mut Shared<f32, 64>, lid: LocalId) {
+    var other = lid
+    other.x = 0 //~ E0601
+    let made = LocalId { x: 0, y: 0, z: 0 } //~ E0601
+}
+
+@vertex
+fn wrong_stage(v: VertexIndex, row: mut Shared<f32, 4>) -> ClipPosition { //~ E0602
+    ClipPosition { position: vec4(0.0) }
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+}

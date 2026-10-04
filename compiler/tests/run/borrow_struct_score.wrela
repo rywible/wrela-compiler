@@ -1,0 +1,30 @@
+// run: a borrow struct reads the world and writes the score
+// expect: run() = 21
+
+struct World: Clone {
+    bonus: u32,
+}
+
+struct Score: Clone {
+    points: u32,
+}
+
+borrow struct Ctx {
+    world: borrow World,
+    score: mut Score,
+}
+
+fn reward(ctx: Ctx, n: u32) {
+    ctx.score.points += n * ctx.world.bonus
+}
+
+pub fn run() -> u32 {
+    let world = World { bonus: 3 }
+    var score = Score { points: 0 }
+    let ctx = Ctx { world, score: mut score }
+    reward(ctx, 2)
+    reward(ctx, 5)
+    score.points
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

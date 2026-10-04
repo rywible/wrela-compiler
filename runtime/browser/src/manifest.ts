@@ -1,9 +1,10 @@
-// The manifest, version 1: parsing and validation. Mirrors `Manifest::parse` and
+// The manifest, version 2: parsing and validation. Mirrors `Manifest::parse` and
 // `Manifest::validate` in runtime/abi/src/manifest.rs: the same version rules, the same reading
 // of each field, the same checks in the same order, the same messages. (Only JSON that doesn't
 // parse is reported in each host's own words.)
 
 import {
+  BINDING_KINDS,
   MANIFEST_VERSION,
   MAX_STORAGE_BUFFERS_PER_STAGE,
   MAX_UNIFORM_BUFFER_BINDING_SIZE,
@@ -14,7 +15,11 @@ import {
 import { errorMessage } from "./errors.ts";
 
 export type UniformSpace = "uniform" | "storage";
-export type Access = "read" | "read_write";
+/** What a binding binds: a storage buffer read or read-write, a texture, or a sampler. */
+export type BindingKind = (typeof BINDING_KINDS)[number];
+
+/** Whether a binding is a storage buffer. */
+export const isBuffer = (k: BindingKind) => k === "read" || k === "read_write";
 
 export interface UniformBlock {
   binding: number;
@@ -23,9 +28,9 @@ export interface UniformBlock {
   space: UniformSpace;
 }
 
-export interface BufferBinding {
+export interface ResourceBinding {
   binding: number;
-  access: Access;
+  kind: BindingKind;
 }
 
 export type Stage =
@@ -36,7 +41,10 @@ export type Pipeline = Stage & {
   name: string;
   shader: string;
   uniform: UniformBlock | null;
-  buffers: BufferBinding[];
+  bindings: ResourceBinding[];
+  /** A debug build's: the binding of the flag its bounds checks set (the native host's
+   * runtime/abi/src/manifest.rs says what it holds). */
+  debug_flag: number | null;
 };
 
 export interface Manifest {
@@ -116,39 +124,29 @@ function pipeline(v: unknown, i: number): Pipeline {
       space: oneOf(uo, "space", `${where}.uniform`, ["uniform", "storage"] as const),
     };
   }
-  const bufs = field(o, "buffers", where);
-  if (!Array.isArray(bufs)) throw new ManifestError(`${where}.buffers must be an array`);
-  const buffers = bufs.map((b, j) => {
-    const bw = `${where}.buffers[${j}]`;
+  const list = field(o, "bindings", where);
+  if (!Array.isArray(list)) throw new ManifestError(`${where}.bindings must be an array`);
+  const bindings = list.map((b, j) => {
+    const bw = `${where}.bindings[${j}]`;
     const bo = object(b, bw);
-    return { binding: u32(bo, "binding", bw), access: oneOf(bo, "access", bw, ["read", "read_write"] as const) };
+    return { binding: u32(bo, "binding", bw), kind: oneOf(bo, "kind", bw, BINDING_KINDS) };
   });
   const kind = oneOf(o, "kind", where, ["compute", "render"] as const);
+  let stage: Stage;
   if (kind === "compute") {
     const ws = field(o, "workgroup_size", where);
     if (!Array.isArray(ws) || ws.length !== 3) {
       throw new ManifestError(`${where}.workgroup_size must be an array of 3 u32s`);
     }
     const sizes = ws.map((s: unknown, k) => asU32(s, `${where}.workgroup_size[${k}]`));
-    return {
-      kind,
-      name,
-      shader,
-      entry: str(o, "entry", where),
-      workgroup_size: [sizes[0]!, sizes[1]!, sizes[2]!],
-      uniform,
-      buffers,
-    };
+    stage = { kind, entry: str(o, "entry", where), workgroup_size: [sizes[0]!, sizes[1]!, sizes[2]!] };
+  } else {
+    stage = { kind, vertex_entry: str(o, "vertex_entry", where), fragment_entry: str(o, "fragment_entry", where) };
   }
-  return {
-    kind,
-    name,
-    shader,
-    vertex_entry: str(o, "vertex_entry", where),
-    fragment_entry: str(o, "fragment_entry", where),
-    uniform,
-    buffers,
-  };
+  // A missing `debug_flag` is read as null.
+  const d = o["debug_flag"] ?? null;
+  const debug_flag = d === null ? null : asU32(d, `${where}.debug_flag`);
+  return { ...stage, name, shader, uniform, bindings, debug_flag };
 }
 
 /** How deep serde_json, and so the native host, nests arrays and objects. */
@@ -230,7 +228,7 @@ export function validateManifest(m: Manifest): void {
     if (!plainFileName(p.shader)) {
       throw err(`pipeline ${i}'s shader name isn't a file name in the build directory`);
     }
-    const bindings = p.buffers.map((b) => b.binding);
+    const bindings = p.bindings.map((b) => b.binding);
     const u = p.uniform;
     if (u !== null) {
       if (u.size === 0 || u.size % 4 !== 0) {
@@ -246,8 +244,10 @@ export function validateManifest(m: Manifest): void {
       }
       bindings.push(u.binding);
     }
+    if (p.debug_flag !== null) bindings.push(p.debug_flag);
     if (new Set(bindings).size !== bindings.length) throw err(`pipeline ${i} uses a binding twice`);
-    const storage = p.buffers.length + (u?.space === "storage" ? 1 : 0);
+    const storage =
+      p.bindings.filter((b) => isBuffer(b.kind)).length + (u?.space === "storage" ? 1 : 0) + (p.debug_flag !== null ? 1 : 0);
     if (storage > MAX_STORAGE_BUFFERS_PER_STAGE) {
       throw err(
         `pipeline ${i} has ${storage} storage buffers; WebGPU's default limit is ${MAX_STORAGE_BUFFERS_PER_STAGE}`,

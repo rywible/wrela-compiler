@@ -1,0 +1,14 @@
+// An f-string's format spec that isn't valid. `{x:.2}` prints two decimal places; a spec is a
+// `.` and a number of digits.
+// ---- wrong
+fn label(score: f32) -> String {
+    f"score: {score:2f}"
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+fn label(score: f32) -> String {
+    f"score: {score:.2}"
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

@@ -1,0 +1,455 @@
+// Collections (language.md §6.9, §17): `Vec`, and moving values out of places with `swap` and
+// `replace`. A collection owns its elements, frees them when it's dropped, and iterates in an
+// order that doesn't depend on addresses (D-015).
+
+use std::alloc::{alloc, free, realloc}
+use std::par::{chunks_for, par_each}
+use std::mem::{
+    Drop, align_of, at, at_mut, at_mut_pair, copy, drop_at, read, size_of, take_answer, write,
+}
+pub use std::mem::Pair
+
+/// A growable array of `T`s on the heap. `v[i]` projects element `i`, and an index past the end
+/// panics; `for x in v` walks the elements in order. Dropping it drops its elements and frees
+/// its memory. To avoid allocating every frame, keep one and `clear()` it: it keeps its
+/// capacity.
+///
+/// ```wrela
+/// var v: Vec<f32> = Vec::new()
+/// v.push(1.5)
+/// v.push(2.5)
+/// var sum = 0.0
+/// for x in v {
+///     sum += x
+/// }
+/// assert(sum == 4.0 && v.len() == 2)
+/// ```
+pub struct Vec<T>: Clone {
+    // The compiler indexes `Vec` in place: these three fields, in this order.
+    data: u32,
+    len: u32,
+    cap: u32,
+}
+
+impl<T: Plain> Vec<T> {
+    /// For std's requests: the `bytes` bytes of request `request`'s answer, as `T`s. Any bytes
+    /// are a `Plain` value; a partial last element is dropped.
+    pub(package) fn from_answer(request: u32, bytes: u32) -> Vec<T> {
+        let n = bytes / size_of::<T>()
+        var v: Vec<T> = Vec::with_capacity(max(n, 1))
+        unsafe {
+            if n * size_of::<T>() == bytes {
+                take_answer(request, v.data)
+            } else {
+                // Room for the whole answer, then only whole elements kept.
+                let raw: Vec<u8> = Vec::with_capacity(bytes)
+                take_answer(request, raw.data)
+                copy(v.data, raw.data, n * size_of::<T>())
+            }
+        }
+        v.len = n
+        v
+    }
+}
+
+impl<T> Vec<T> {
+    /// An empty `Vec`, which allocates nothing until an element is pushed.
+    pub fn new() -> Vec<T> {
+        Vec { data: 0, len: 0, cap: 0 }
+    }
+
+    /// An empty `Vec` with room for `n` elements.
+    pub fn with_capacity(n: u32) -> Vec<T> {
+        var v = Vec::new()
+        v.reserve(n)
+        v
+    }
+
+    /// How many elements it holds.
+    pub fn len(self) -> u32 {
+        self.len
+    }
+
+    /// Whether it holds no elements.
+    pub fn is_empty(self) -> bool {
+        self.len == 0
+    }
+
+    /// How many elements it has room for before it grows.
+    pub fn capacity(self) -> u32 {
+        self.cap
+    }
+
+    /// Adds `value` at the end.
+    pub fn push(mut self, value: take T) {
+        if self.len == self.cap {
+            self.grow(self.len + 1)
+        }
+        unsafe {
+            write::<T>(self.slot(self.len), take value)
+        }
+        self.len += 1
+    }
+
+    /// Removes the last element and returns it; `None` when it's empty.
+    pub fn pop(mut self) -> Option<T> {
+        if self.len == 0 {
+            return None
+        }
+        self.len -= 1
+        unsafe { Some(read::<T>(self.slot(self.len))) }
+    }
+
+    /// Drops every element. The capacity stays.
+    pub fn clear(mut self) {
+        self.truncate(0)
+    }
+
+    /// Drops the elements from `n` on, if there are more than `n`.
+    pub fn truncate(mut self, n: u32) {
+        while self.len > n {
+            self.len -= 1
+            unsafe {
+                drop_at::<T>(self.slot(self.len))
+            }
+        }
+    }
+
+    /// Makes room for at least `more` more elements.
+    pub fn reserve(mut self, more: u32) {
+        if self.cap - self.len < more {
+            self.grow(self.len + more)
+        }
+    }
+
+    /// Puts `value` at `i`, moving the elements from `i` on one place up. `i` may be the length.
+    pub fn insert(mut self, i: u32, value: take T) {
+        if i > self.len {
+            panic("insert: the index is past the end")
+        }
+        if self.len == self.cap {
+            self.grow(self.len + 1)
+        }
+        unsafe {
+            copy(self.slot(i + 1), self.slot(i), (self.len - i) * size_of::<T>())
+            write::<T>(self.slot(i), take value)
+        }
+        self.len += 1
+    }
+
+    /// Takes the element at `i` out, moving the ones after it down.
+    pub fn remove(mut self, i: u32) -> T {
+        if i >= self.len {
+            panic("remove: the index is past the end")
+        }
+        unsafe {
+            let value = read::<T>(self.slot(i))
+            copy(self.slot(i), self.slot(i + 1), (self.len - i - 1) * size_of::<T>())
+            self.len -= 1
+            value
+        }
+    }
+
+    /// Takes the element at `i` out, putting the last element in its place: no moving, but the
+    /// order changes.
+    pub fn swap_remove(mut self, i: u32) -> T {
+        if i >= self.len {
+            panic("swap_remove: the index is past the end")
+        }
+        unsafe {
+            let value = read::<T>(self.slot(i))
+            self.len -= 1
+            copy(self.slot(i), self.slot(self.len), size_of::<T>())
+            value
+        }
+    }
+
+    /// Exchanges the elements at `a` and `b`.
+    pub fn swap(mut self, a: u32, b: u32) {
+        if a >= self.len || b >= self.len {
+            panic("swap: an index is past the end")
+        }
+        if a != b {
+            unsafe {
+                let x = read::<T>(self.slot(a))
+                copy(self.slot(a), self.slot(b), size_of::<T>())
+                write::<T>(self.slot(b), take x)
+            }
+        }
+    }
+
+    /// Removes the first `n` elements and returns them, in order, as a `Vec` of their own.
+    pub fn drain_front(mut self, n: u32) -> Vec<T> {
+        let n = min(n, self.len)
+        var out = Vec::with_capacity(n)
+        unsafe {
+            copy(out.data, self.data, n * size_of::<T>())
+            copy(self.data, self.slot(n), (self.len - n) * size_of::<T>())
+        }
+        out.len = n
+        self.len -= n
+        out
+    }
+
+    /// Moves every element of `other` to the end of this one, leaving `other` empty.
+    pub fn append(mut self, other: mut Vec<T>) {
+        self.reserve(other.len)
+        unsafe {
+            copy(self.slot(self.len), other.data, other.len * size_of::<T>())
+        }
+        self.len += other.len
+        other.len = 0
+    }
+
+    /// Keeps the elements for which `keep` is true, in order, and drops the rest.
+    pub fn retain(mut self, keep: fn(T) -> bool) {
+        var kept = 0
+        for i in 0..self.len {
+            if keep(self[i]) {
+                if kept != i {
+                    unsafe {
+                        copy(self.slot(kept), self.slot(i), size_of::<T>())
+                    }
+                }
+                kept += 1
+            } else {
+                unsafe {
+                    drop_at::<T>(self.slot(i))
+                }
+            }
+        }
+        self.len = kept
+    }
+
+    /// Sorts the elements by `before`, which says whether its first argument goes before its
+    /// second. Stable: equal elements keep their order. (Insertion sort: for the small lists
+    /// gameplay code keeps.)
+    pub fn sort_by(mut self, before: fn(T, T) -> bool) {
+        for i in 1..self.len {
+            var j = i
+            while j > 0 && before(self[j], self[j - 1]) {
+                self.swap(j, j - 1)
+                j -= 1
+            }
+        }
+    }
+
+    /// The address of element `i`.
+    fn slot(self, i: u32) -> u32 {
+        self.data + i * size_of::<T>()
+    }
+
+    /// Calls `f` on each element, which it may change, in parallel: on this thread and the
+    /// program's workers (§6.12). The elements are split into chunks by their number alone, so
+    /// what `f` does doesn't depend on how many workers there are. `f` sees its element and
+    /// reads what it captures: it can't write captured data (E0520), or do IO, record GPU work
+    /// or be non-deterministic (E0600).
+    pub fn par_each_mut(mut self, f: @parallel fn(mut T)) {
+        let chunks = chunks_for(self.len)
+        if chunks > 0 {
+            par_each(chunks, mut self, f)
+        }
+    }
+
+    /// `map`s each element and `reduce`s the results, in parallel: on this thread and the
+    /// program's workers (§6.12). The elements are split into chunks by their number alone, each
+    /// chunk folds its elements from `init` in order, and the chunks' results are folded from
+    /// `init` in order, so the result doesn't depend on how many workers there are (for a
+    /// `reduce` that `init` is an identity of, it's the sequential fold's when `reduce` is
+    /// associative). Like `par_each_mut`'s, the functions only read what they capture.
+    pub fn par_map_reduce<R: Clone>(
+        self,
+        init: R,
+        map: @parallel fn(T) -> R,
+        reduce: @parallel fn(R, R) -> R,
+    ) -> R {
+        let chunks = chunks_for(self.len)
+        var partial: Vec<R> = Vec::with_capacity(chunks)
+        for _ in 0..chunks {
+            partial.push(init.clone())
+        }
+        if chunks > 0 {
+            std::par::par_map_reduce(chunks, self, init, map, reduce, mut partial)
+        }
+        var out = init.clone()
+        for c in 0..chunks {
+            out = reduce(out, partial[c].clone())
+        }
+        out
+    }
+
+    /// Elements `i` and `j`, both to change at once. Exclusivity is checked here, at run time
+    /// (§6.5): `i == j` panics, and so does an index past the end.
+    pub fn pair_mut(mut self, i: u32, j: u32) -> Pair<T> {
+        if i == j {
+            panic("pair_mut: both indices name one element")
+        }
+        if i >= self.len || j >= self.len {
+            panic("pair_mut: an index is past the end")
+        }
+        unsafe { at_mut_pair::<T, Vec<T>>(mut self, self.slot(i), self.slot(j)) }
+    }
+
+    /// Grows the capacity to at least `need`: doubling, so pushes take constant time on
+    /// average.
+    fn grow(mut self, need: u32) {
+        let cap = max(need, max(4, self.cap * 2))
+        unsafe {
+            let size = size_of::<T>()
+            self.data = realloc(self.data, self.cap * size, cap * size, align_of::<T>())
+        }
+        self.cap = cap
+    }
+}
+
+impl<T> Drop for Vec<T> {
+    fn drop(mut self) {
+        self.clear()
+        unsafe {
+            free(self.data, self.cap * size_of::<T>())
+        }
+    }
+}
+
+impl<T: Clone> Vec<T> {
+    /// A `Vec` of a copy of each of `xs`: `Vec::from([1.0, 2.0])`.
+    pub fn from(xs: [T]) -> Vec<T> {
+        var out = Vec::with_capacity(xs.len())
+        for x in xs {
+            out.push(x.clone())
+        }
+        out
+    }
+}
+
+impl<T: Clone> Clone for Vec<T> {
+    fn clone(self) -> Vec<T> {
+        var out = Vec::with_capacity(self.len)
+        for x in self {
+            out.push(x.clone())
+        }
+        out
+    }
+
+    /// Reuses `into`'s buffer: no allocation once it has grown to size.
+    fn clone_into(self, into: mut Vec<T>) {
+        into.truncate(self.len)
+        for i in 0..into.len {
+            self[i].clone_into(mut into[i])
+        }
+        for i in into.len..self.len {
+            into.push(self[i].clone())
+        }
+    }
+}
+
+impl<T: Eq> Eq for Vec<T> {
+    fn eq(self, other: Vec<T>) -> bool {
+        if self.len != other.len {
+            return false
+        }
+        for i in 0..self.len {
+            if self[i] != other[i] {
+                return false
+            }
+        }
+        true
+    }
+}
+
+/// Element by element, then the shorter first.
+impl<T: Ord> Ord for Vec<T> {
+    fn cmp(self, other: Vec<T>) -> Ordering {
+        let n = min(self.len, other.len)
+        for i in 0..n {
+            let o = self[i].cmp(other[i])
+            if o != Ordering::Equal {
+                return o
+            }
+        }
+        self.len.cmp(other.len)
+    }
+}
+
+/// Exchanges the values of two places, which mustn't overlap.
+@intrinsic
+pub fn swap<T>(a: mut T, b: mut T) {}
+
+/// Puts `value` in `place` and returns what was there: how to move a value out of a place you
+/// can only borrow, as `replace(mut slot, None)` empties an `Option` slot.
+@intrinsic
+pub fn replace<T>(place: mut T, value: take T) -> T {}
+
+/// A value on the heap: how a type holds itself (a tree's children), which it can't inline.
+/// `b.get()` reads the value in place and `b.get_mut()` changes it; dropping the box drops the
+/// value and frees its memory.
+pub struct Box<T>: Clone {
+    // The value's address.
+    addr: u32,
+}
+
+impl<T> Box<T> {
+    /// Moves `value` to the heap.
+    pub fn new(value: take T) -> Box<T> {
+        unsafe {
+            let a = alloc(size_of::<T>(), align_of::<T>())
+            write::<T>(a, take value)
+            Box { addr: a }
+        }
+    }
+
+    /// The value, in place.
+    pub fn get(self) -> borrow T {
+        unsafe { at::<T, Box<T>>(self, self.addr) }
+    }
+
+    /// The value, to change in place.
+    pub fn get_mut(mut self) -> mut T {
+        unsafe { mut at_mut::<T, Box<T>>(mut self, self.addr) }
+    }
+
+    /// The value, moved off the heap.
+    pub fn into_inner(take self) -> T {
+        var b = take self
+        unsafe {
+            let value = read::<T>(b.addr)
+            free(b.addr, size_of::<T>())
+            b.addr = 0
+            value
+        }
+    }
+}
+
+impl<T> Drop for Box<T> {
+    fn drop(mut self) {
+        if self.addr != 0 {
+            unsafe {
+                drop_at::<T>(self.addr)
+                free(self.addr, size_of::<T>())
+            }
+        }
+    }
+}
+
+impl<T: Clone> Clone for Box<T> {
+    fn clone(self) -> Box<T> {
+        Box::new(self.get().clone())
+    }
+
+    /// Reuses `into`'s block, and what its value owns.
+    fn clone_into(self, into: mut Box<T>) {
+        self.get().clone_into(mut into.get_mut())
+    }
+}
+
+impl<T: Eq> Eq for Box<T> {
+    fn eq(self, other: Box<T>) -> bool {
+        self.get() == other.get()
+    }
+}
+
+impl<T: Ord> Ord for Box<T> {
+    fn cmp(self, other: Box<T>) -> Ordering {
+        self.get().cmp(other.get())
+    }
+}

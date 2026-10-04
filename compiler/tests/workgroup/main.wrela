@@ -1,0 +1,194 @@
+// Kernels that share (compiler/tests/tests/suite/workgroup.rs): spike 01's `place_vertices`
+// pattern (125 corners of a 4×4×4 block computed once each, shared by its 64 cells, one
+// barrier), an atomic histogram, an append of the even values, and an atomic map of counts.
+// Each result is read back and summarized; frame 30 writes the summaries into a buffer, so the
+// hosts' state hashes agree only if their results do.
+use std::gpu::{
+    AppendBuffer, AtomicMap, AtomicMapBuffer, Atomics, Append, GlobalId, GpuBuffer, LocalId, Shared,
+    Slots, WorkgroupId, append_buffer, atomic_map_buffer, barrier, buffer, dispatch, read, write,
+}
+use std::io::Pending
+
+/// Each cell's 8 corners' sum, the corners computed once per block and shared.
+@compute(4, 4, 4)
+fn cells(
+    out: mut Slots<f32>,
+    corners: mut Shared<f32, 125>,
+    lid: LocalId,
+    wid: WorkgroupId,
+    id: GlobalId,
+) {
+    let chunk = corners.chunk(lid)
+    for k in 0..chunk.len() {
+        let i = chunk.index(k)
+        let value = f32(i % 5) + 10.0 * f32((i / 5) % 5) + 100.0 * f32(i / 25) + 1000.0 * f32(wid.x)
+        corners.write(chunk, k, value)
+    }
+    barrier(mut corners)
+    var sum = 0.0
+    for j in 0..8 {
+        let x = lid.x + (j & 1)
+        let y = lid.y + ((j >> 1) & 1)
+        let z = lid.z + ((j >> 2) & 1)
+        sum += corners.get(x + 5 * y + 25 * z)
+    }
+    out[id] = sum
+}
+
+@compute(64)
+fn histogram(values: [u32], bins: mut Atomics<u32>, id: GlobalId) {
+    if id.x < values.len() {
+        let _ = bins.add(values[id.x] % bins.len(), 1)
+    }
+}
+
+@compute(64)
+fn evens(values: [u32], out: mut Append<u32>, id: GlobalId) {
+    if id.x < values.len() && values[id.x] % 2 == 0 {
+        out.push(values[id.x])
+    }
+}
+
+@compute(64)
+fn count_keys(values: [u32], map: mut AtomicMap, id: GlobalId) {
+    if id.x < values.len() {
+        let _ = map.add(values[id.x] % 7, 1)
+    }
+}
+
+pub struct Work {
+    frame: u32,
+    cells: GpuBuffer<f32>,
+    bins: GpuBuffer<u32>,
+    evens: AppendBuffer<u32>,
+    map: AtomicMapBuffer,
+    report: GpuBuffer<u32>,
+    cells_back: Pending<f32>,
+    bins_back: Pending<u32>,
+    evens_back: Pending<u32>,
+    count_back: Pending<u32>,
+    map_back: Pending<u32>,
+    // The summaries: 0 until each arrives.
+    cells_sum: u32,
+    bins_sum: u32,
+    evens_sum: u32,
+    evens_count: u32,
+    map_sum: u32,
+    map_keys: u32,
+}
+
+const N: u32 = 1000
+
+fn values() -> Vec<u32> {
+    var out: Vec<u32> = Vec::new()
+    for i in 0..N {
+        out.push(i * 7919 % 1009)
+    }
+    out
+}
+
+pub fn init() -> Work {
+    var input: GpuBuffer<u32> = buffer(N)
+    write(mut input, 0, values())
+    var corner_sums: GpuBuffer<f32> = buffer(64 * 2)
+    dispatch(cells.bind(out: mut corner_sums), groups: (2, 1, 1))
+    var bins: GpuBuffer<u32> = buffer(16)
+    dispatch(histogram.bind(values: input, bins: mut bins), groups: (N + 63) / 64)
+    var evens_out: AppendBuffer<u32> = append_buffer(N)
+    dispatch(evens.bind(values: input, out: mut evens_out), groups: (N + 63) / 64)
+    var map = atomic_map_buffer(16)
+    dispatch(count_keys.bind(values: input, map: mut map), groups: (N + 63) / 64)
+    let cells_back = read(corner_sums.span(start: 0, count: 128))
+    let bins_back = read(bins.span(start: 0, count: 16))
+    let evens_back = read(evens_out.items())
+    let count_back = read(evens_out.count())
+    let map_back = read(map.entries())
+    Work {
+        frame: 0,
+        cells: corner_sums,
+        bins,
+        evens: evens_out,
+        map,
+        report: buffer(6),
+        cells_back,
+        bins_back,
+        evens_back,
+        count_back,
+        map_back,
+        cells_sum: 0,
+        bins_sum: 0,
+        evens_sum: 0,
+        evens_count: 0,
+        map_sum: 0,
+        map_keys: 0,
+    }
+}
+
+pub fn frame(state: mut Work, time: f32, width: u32, height: u32) {
+    state.frame += 1
+    if let Some(Ok(xs)) = state.cells_back.poll() {
+        var s = 0.0
+        for x in xs {
+            s += x
+        }
+        state.cells_sum = u32(s)
+    }
+    if let Some(Ok(xs)) = state.bins_back.poll() {
+        for x in xs {
+            state.bins_sum += x
+        }
+    }
+    if let Some(Ok(xs)) = state.count_back.poll() {
+        state.evens_count = xs[0]
+    }
+    if let Some(Ok(xs)) = state.evens_back.poll() {
+        // Only the pushed ones: the count's, which arrives in the same call.
+        for i in 0..state.evens_count {
+            state.evens_sum += xs[i]
+        }
+    }
+    if let Some(Ok(xs)) = state.map_back.poll() {
+        for i in 0..xs.len() / 2 {
+            if xs[2 * i] != 4294967295 {
+                state.map_keys += 1
+                state.map_sum += xs[2 * i + 1]
+            }
+        }
+    }
+    if state.frame == 30 {
+        let summary = [
+            state.cells_sum,
+            state.bins_sum,
+            state.evens_sum,
+            state.evens_count,
+            state.map_sum,
+            state.map_keys,
+        ]
+        write(mut state.report, 0, summary)
+    }
+}
+
+/// The summaries: cells, bins, evens' sum, evens' count, the map's counts, its keys.
+pub fn cells_sum(state: Work) -> u32 {
+    state.cells_sum
+}
+
+pub fn bins_sum(state: Work) -> u32 {
+    state.bins_sum
+}
+
+pub fn evens_sum(state: Work) -> u32 {
+    state.evens_sum
+}
+
+pub fn evens_count(state: Work) -> u32 {
+    state.evens_count
+}
+
+pub fn map_sum(state: Work) -> u32 {
+    state.map_sum
+}
+
+pub fn map_keys(state: Work) -> u32 {
+    state.map_keys
+}

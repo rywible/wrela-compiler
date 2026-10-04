@@ -1,0 +1,20 @@
+// rejects: eff.parallel
+// A `@parallel fn` runs on several workers at once: it writes only its own element, never
+// data it captures, and does no IO, GPU work or non-deterministic work.
+use std::io::load
+
+fn bump(x: mut f32) {
+    x += 1.0
+}
+
+fn sums(xs: mut Vec<f32>) -> f32 {
+    var total = 0.0
+    xs.par_each_mut(|x| { total += x }) //~ E0520
+    var count = 0.0
+    xs.par_each_mut(|x| { bump(mut count) }) //~ E0520
+    xs.par_each_mut(|x| { let _ = load("a") }) //~ E0600
+    total + count
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+}

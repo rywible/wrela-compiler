@@ -5,7 +5,7 @@
 // expect: total(3) = 136
 // expect: mixed() = 182
 
-enum Item: Copy + Clone {
+enum Item: Copy {
     Empty,
     Small { a: i32 },
     Wide { a: i32, b: vec4, c: vec4 },

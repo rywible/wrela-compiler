@@ -1,0 +1,10 @@
+// mistake: `?` in a function that returns nothing
+// expect: E0300
+// fix: no
+
+fn h(x: Option<f32>) -> f32 {
+    let y = x?
+    y
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

@@ -1,0 +1,45 @@
+// accepts: stmt.if-let stmt.let-else
+enum Shape: Copy {
+    Circle { r: f32 },
+    Square(f32),
+    Empty,
+}
+
+fn radius(s: Shape) -> f32 {
+    if let Shape::Circle { r } = s {
+        r
+    } else {
+        0.0
+    }
+}
+
+fn side_or_zero(s: Option<Shape>) -> f32 {
+    if let Some(Shape::Square(a)) = s { a } else if let Some(_) = s { 1.0 } else { 0.0 }
+}
+
+fn count_circles(xs: [Shape; 3]) -> u32 {
+    var n = 0
+    for x in xs {
+        if let Shape::Circle { .. } = x {
+            n += 1
+        }
+    }
+    n
+}
+
+fn first_side(xs: [Option<f32>; 2]) -> f32 {
+    let Some(a) = xs[0] else { return -1.0 }
+    let Some(b) = xs[1] else {
+        return a
+    }
+    a + b
+}
+
+fn sum_until_none(xs: [Option<u32>; 4]) -> u32 {
+    var total = 0
+    for x in xs {
+        let Some(v) = x else { break }
+        total += v
+    }
+    total
+}

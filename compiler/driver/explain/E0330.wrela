@@ -1,0 +1,16 @@
+// A `let ... else` whose `else` block doesn't leave the scope. When the pattern doesn't match,
+// there's no value to bind, so `else` must `return`, `break`, `continue` or panic.
+// ---- wrong
+fn first_or_zero(x: Option<f32>) -> f32 {
+    let Some(v) = x else { 0.0 }
+    v
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+fn first_or_zero(x: Option<f32>) -> f32 {
+    let Some(v) = x else { return 0.0 }
+    v
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

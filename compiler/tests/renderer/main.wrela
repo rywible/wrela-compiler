@@ -1,0 +1,170 @@
+// std::gpu as a renderer (compiler/tests/tests/suite/renderer.rs): textures written from the
+// CPU and sampled, an offscreen pass sampled by a later pass, depth testing, a shadow map read
+// with a comparison sampler, and indirect work: a kernel dispatched with counts from a buffer
+// writes the counts the offscreen pass's far quad is drawn with. Each capability fills one
+// quarter of the screen, so both hosts' frames show every one.
+use std::gpu::{
+    Address, ClipPosition, Compare, ComparisonSampler, DepthTexture, Filter, FragCoord, GlobalId,
+    GpuBuffer, Sampler, Slots, Texture, TextureFormat, VertexIndex, begin_depth_pass, begin_pass,
+    begin_pass_with_depth, begin_screen_pass, buffer, comparison_sampler, depth_texture, dispatch,
+    draw, present, sampler, texture, write,
+}
+
+/// A draw's counts for a quad: 6 vertices, 1 instance, from vertex 0 and instance 0.
+@compute(64)
+fn quad_counts(args: mut Slots<u32>, id: GlobalId) {
+    if id.x < 4 {
+        args[id] = if id.x == 0 { 6 } else if id.x == 1 { 1 } else { 0 }
+    }
+}
+
+/// A rectangle of the screen in clip space: its lower left corner and its size.
+struct Rect: Copy + GpuData {
+    lo: vec2,
+    size: vec2,
+}
+
+struct Quad: Copy {
+    pos: ClipPosition,
+    uv: vec2,
+}
+
+/// Two triangles covering `rect`, at depth `z`.
+@vertex
+fn quad(v: VertexIndex, rect: Rect, z: f32) -> Quad {
+    let corners = [
+        vec2(0.0, 0.0),
+        vec2(1.0, 0.0),
+        vec2(0.0, 1.0),
+        vec2(0.0, 1.0),
+        vec2(1.0, 0.0),
+        vec2(1.0, 1.0),
+    ]
+    let c = corners[v.index % 6]
+    let p = rect.lo + c * rect.size
+    Quad { pos: ClipPosition { position: vec4(p, z, 1.0) }, uv: vec2(c.x, 1.0 - c.y) }
+}
+
+/// A texture's texels, nearest or blended.
+@fragment
+fn textured(q: Quad, image: Texture, s: Sampler) -> vec4 {
+    image.sample(s, q.uv)
+}
+
+/// A flat colour.
+@fragment
+fn flat(q: Quad, colour: vec4) -> vec4 {
+    colour
+}
+
+/// Shadowed where the shadow map holds something nearer the light than `depth`.
+@fragment
+fn shadowed(q: Quad, shadow: DepthTexture, cmp: ComparisonSampler, depth: f32) -> vec4 {
+    let lit = shadow.sample_compare(cmp, q.uv, depth)
+    let texel = shadow.load(x: 0, y: 0)
+    vec4(lit, lit * 0.5 + 0.25 * texel, 0.2, 1.0)
+}
+
+const CHECKER: [u8; 64] = checker()
+
+/// A 4×4 checkerboard of red and white, 4 bytes a texel.
+fn checker() -> [u8; 64] {
+    var out: [u8; 64] = [0; 64]
+    for i in 0..16 {
+        let red = (i / 4 + i % 4) % 2 == 0
+        out[4 * i] = 255
+        out[4 * i + 1] = if red { 0 } else { 255 }
+        out[4 * i + 2] = if red { 0 } else { 255 }
+        out[4 * i + 3] = 255
+    }
+    out
+}
+
+pub struct Scene {
+    groups: GpuBuffer<u32>,
+    counts: GpuBuffer<u32>,
+    board: Texture,
+    target: Texture,
+    depth: DepthTexture,
+    shadow: DepthTexture,
+    nearest: Sampler,
+    linear: Sampler,
+    cmp: ComparisonSampler,
+}
+
+pub fn init() -> Scene {
+    var board = texture(width: 4, height: 4)
+    board.write(x: 0, y: 0, width: 4, height: 4, bytes: CHECKER)
+    var groups: GpuBuffer<u32> = buffer(3)
+    write(mut groups, 0, [1, 1, 1])
+    Scene {
+        groups,
+        counts: buffer(64),
+        board,
+        target: texture(width: 64, height: 64, format: TextureFormat::Rgba16Float),
+        depth: depth_texture(width: 64, height: 64),
+        shadow: depth_texture(width: 32, height: 32),
+        nearest: sampler(Filter::Nearest, Address::Repeat),
+        linear: sampler(),
+        cmp: comparison_sampler(Compare::LessEqual),
+    }
+}
+
+const WHOLE: Rect = Rect { lo: vec2(-1.0, -1.0), size: vec2(2.0, 2.0) }
+
+pub fn frame(state: mut Scene, time: f32, width: u32, height: u32) {
+    // The far quad's counts, written by a kernel whose group counts are in a buffer.
+    dispatch(quad_counts.bind(args: mut state.counts), groups: state.groups)
+    // An offscreen pass with depth: a far green quad (drawn indirectly), then a near blue one
+    // over half of it, then a red one behind both, which depth hides.
+    let pass = begin_pass_with_depth(
+        mut state.target,
+        mut state.depth,
+        clear: vec4(0.0, 0.0, 0.0, 1.0),
+    )
+    draw(
+        quad.bind(rect: WHOLE, z: 0.8),
+        flat.bind(colour: vec4(0.0, 1.0, 0.0, 1.0)),
+        indirect: state.counts.span(start: 0, count: 4),
+    )
+    draw(
+        quad.bind(rect: Rect { lo: vec2(-1.0, -1.0), size: vec2(1.0, 2.0) }, z: 0.2),
+        flat.bind(colour: vec4(0.0, 0.0, 1.0, 1.0)),
+        vertices: 6,
+    )
+    draw(quad.bind(rect: WHOLE, z: 0.9), flat.bind(colour: vec4(1.0, 0.0, 0.0, 1.0)), vertices: 6)
+    pass.end()
+    // A shadow map: the left half of it near the light.
+    let shadow = begin_depth_pass(mut state.shadow)
+    draw(
+        quad.bind(rect: Rect { lo: vec2(-1.0, -1.0), size: vec2(1.0, 2.0) }, z: 0.25),
+        flat.bind(colour: vec4(0.0)),
+        vertices: 6,
+    )
+    shadow.end()
+    begin_screen_pass(clear: vec4(0.1, 0.1, 0.1, 1.0))
+    // Top left: the checkerboard, nearest. Top right: blended.
+    draw(
+        quad.bind(rect: Rect { lo: vec2(-1.0, 0.0), size: vec2(1.0, 1.0) }, z: 0.5),
+        textured.bind(image: state.board, s: state.nearest),
+        vertices: 6,
+    )
+    draw(
+        quad.bind(rect: Rect { lo: vec2(0.0, 0.0), size: vec2(1.0, 1.0) }, z: 0.5),
+        textured.bind(image: state.board, s: state.linear),
+        vertices: 6,
+    )
+    // Bottom left: the offscreen pass's colours.
+    draw(
+        quad.bind(rect: Rect { lo: vec2(-1.0, -1.0), size: vec2(1.0, 1.0) }, z: 0.5),
+        textured.bind(image: state.target, s: state.linear),
+        vertices: 6,
+    )
+    // Bottom right: the shadow map's test at depth 0.5.
+    draw(
+        quad.bind(rect: Rect { lo: vec2(0.0, -1.0), size: vec2(1.0, 1.0) }, z: 0.5),
+        shadowed.bind(shadow: state.shadow, cmp: state.cmp, depth: 0.5),
+        vertices: 6,
+    )
+    present()
+}

@@ -10,8 +10,8 @@
 // - `Grazer` is the field (spike 01's field.wgsl, `grazer_d`): twenty parts smooth-unioned in a
 //   fixed order, built from those numbers. Its structure is its type; the numbers are data.
 use std::field::{
-    Displace, Ellipsoid, Fbm, HalfSpace, Intersect, RoundCone, SmoothUnion, Surface, Translate,
-    ellipsoid, fbm, half_space, round_cone, smin,
+    Displace, Ellipsoid, Fbm, HalfSpace, Intersect, Lipschitz, RoundCone, SmoothUnion, Surface,
+    Translate, ellipsoid, fbm, half_space, round_cone, smin,
 }
 
 /// The spike's `Grazer` uniform: 8 header floats, then 20 parts of 16.
@@ -33,7 +33,7 @@ fn slot(part: u32, k: u32) -> u32 {
 
 // ---- the spike's makeGrazer, in f64 ------------------------------------------------------------
 /// A point in f64 (vectors are f32), for the same bits as JavaScript's numbers.
-pub struct P3: Copy + Clone {
+pub struct P3: Copy {
     pub x: f64,
     pub y: f64,
     pub z: f64,
@@ -68,27 +68,35 @@ impl Rng {
 
 /// The rest skeleton at scale 1, in metres: +y up, +z forward. 29 joints.
 fn rest_skeleton() -> [P3; 29] {
-    var j = [p3(0.0, 0.0, 0.0); 29]
-    j[0] = p3(0.0, 1.30, 0.0)
-    j[1] = p3(0.0, 1.30, 1.0)
-    let neck_base = p3(0.0, 1.50, 1.55)
-    let neck_span = p3(0.0, 0.55, 0.45)
+    var j = [p3(x: 0.0, y: 0.0, z: 0.0); 29]
+    j[0] = p3(x: 0.0, y: 1.30, z: 0.0)
+    j[1] = p3(x: 0.0, y: 1.30, z: 1.0)
+    let neck_base = p3(x: 0.0, y: 1.50, z: 1.55)
+    let neck_span = p3(x: 0.0, y: 0.55, z: 0.45)
     for i in 0..4 {
         j[2 + i] = add(neck_base, scl(neck_span, f64(i) / 4.0))
     }
-    j[6] = add(add(neck_base, neck_span), p3(0.0, 0.0, 0.12))
-    let tail_base = p3(0.0, 1.45, -0.40)
-    let tail_span = p3(0.0, -0.55, -0.45)
+    j[6] = add(add(neck_base, neck_span), p3(x: 0.0, y: 0.0, z: 0.12))
+    let tail_base = p3(x: 0.0, y: 1.45, z: -0.40)
+    let tail_span = p3(x: 0.0, y: -0.55, z: -0.45)
     for i in 0..6 {
         j[7 + i] = add(tail_base, scl(tail_span, f64(i) / 6.0))
     }
-    let fore = [p3(0.0, -0.45, -0.04), p3(0.0, -0.42, 0.03), p3(0.0, -0.20, 0.02)]
-    let hind = [p3(0.0, -0.50, 0.10), p3(0.0, -0.45, -0.12), p3(0.0, -0.22, 0.0)]
+    let fore = [
+        p3(x: 0.0, y: -0.45, z: -0.04),
+        p3(x: 0.0, y: -0.42, z: 0.03),
+        p3(x: 0.0, y: -0.20, z: 0.02),
+    ]
+    let hind = [
+        p3(x: 0.0, y: -0.50, z: 0.10),
+        p3(x: 0.0, y: -0.45, z: -0.12),
+        p3(x: 0.0, y: -0.22, z: 0.0),
+    ]
     let hips = [
-        p3(0.25, 1.15, 1.25),
-        p3(-0.25, 1.15, 1.25),
-        p3(0.25, 1.25, 0.05),
-        p3(-0.25, 1.25, 0.05),
+        p3(x: 0.25, y: 1.15, z: 1.25),
+        p3(x: -0.25, y: 1.15, z: 1.25),
+        p3(x: 0.25, y: 1.25, z: 0.05),
+        p3(x: -0.25, y: 1.25, z: 0.05),
     ]
     for l in 0..4 {
         var p = hips[l]
@@ -114,7 +122,7 @@ pub fn params(seed: u32) -> [f32; PARAM_FLOATS] {
     let bulk = 0.9 + 0.25 * rng.next()
     let s = 0.92 + 0.16 * rng.next()
     let rest = rest_skeleton()
-    var j = [p3(0.0, 0.0, 0.0); 29]
+    var j = [p3(x: 0.0, y: 0.0, z: 0.0); 29]
     for i in 0..29 {
         j[i] = scl(rest[i], s)
     }
@@ -133,23 +141,23 @@ pub fn params(seed: u32) -> [f32; PARAM_FLOATS] {
     let c = j[1]
     let pelvis = j[0]
     let sb = s * bulk
-    set3(mut a, slot(TORSO, 0), add(c, scl(p3(0.0, 0.05, -0.15), s)), 0.15 * s)
-    set3(mut a, slot(TORSO, 1), scl(p3(0.42, 0.48, 0.80), sb), pelvis.z)
-    set3(mut a, slot(TORSO, 2), add(c, scl(p3(0.0, 0.05, -0.85), s)), 0.0)
-    set3(mut a, slot(TORSO, 3), scl(p3(0.38, 0.44, 0.50), sb), c.z)
+    set3(mut a, slot(TORSO, 0), add(c, scl(p3(x: 0.0, y: 0.05, z: -0.15), s)), 0.15 * s)
+    set3(mut a, slot(TORSO, 1), scl(p3(x: 0.42, y: 0.48, z: 0.80), sb), pelvis.z)
+    set3(mut a, slot(TORSO, 2), add(c, scl(p3(x: 0.0, y: 0.05, z: -0.85), s)), 0.0)
+    set3(mut a, slot(TORSO, 3), scl(p3(x: 0.38, y: 0.44, z: 0.50), sb), c.z)
 
-    let neck_end = add(j[2], scl(p3(0.0, 0.55, 0.45), s))
+    let neck_end = add(j[2], scl(p3(x: 0.0, y: 0.55, z: 0.45), s))
     set3(mut a, slot(NECK, 0), j[2], 0.22 * s * bulk)
     set3(mut a, slot(NECK, 1), neck_end, 0.12 * s)
 
     let h = j[6]
-    set3(mut a, slot(HEAD, 0), add(h, scl(p3(0.0, -0.04, 0.10), s)), 0.05 * s)
-    set3(mut a, slot(HEAD, 1), scl(p3(0.12, 0.15, 0.24), s), 0.0)
-    set3(mut a, slot(HEAD, 2), add(h, scl(p3(0.0, -0.05, 0.15), s)), 0.10 * s)
-    set3(mut a, slot(HEAD, 3), add(h, scl(p3(0.0, -0.16, 0.42), s)), 0.065 * s)
+    set3(mut a, slot(HEAD, 0), add(h, scl(p3(x: 0.0, y: -0.04, z: 0.10), s)), 0.05 * s)
+    set3(mut a, slot(HEAD, 1), scl(p3(x: 0.12, y: 0.15, z: 0.24), s), 0.0)
+    set3(mut a, slot(HEAD, 2), add(h, scl(p3(x: 0.0, y: -0.05, z: 0.15), s)), 0.10 * s)
+    set3(mut a, slot(HEAD, 3), add(h, scl(p3(x: 0.0, y: -0.16, z: 0.42), s)), 0.065 * s)
 
     set3(mut a, slot(TAIL, 0), j[7], 0.07 * s)
-    set3(mut a, slot(TAIL, 1), add(j[7], scl(p3(0.0, -0.55, -0.45), s)), 0.025 * s)
+    set3(mut a, slot(TAIL, 1), add(j[7], scl(p3(x: 0.0, y: -0.55, z: -0.45), s)), 0.025 * s)
 
     let top = [0.10 * bulk, 0.065, 0.048]
     let bottom = [0.065, 0.048, 0.042]
@@ -163,13 +171,13 @@ pub fn params(seed: u32) -> [f32; PARAM_FLOATS] {
         let foot = j[b + 3]
         set3(mut a, slot(HOOF0 + l, 0), foot, 0.06 * s)
         set3(mut a, slot(HOOF0 + l, 1), add(foot, p3(0.0, -0.08 * s, 0.0)), 0.07 * s)
-        set3(mut a, slot(HOOF0 + l, 2), p3(foot.y - 0.07 * s, 0.0, 0.0), 0.0)
+        set3(mut a, slot(HOOF0 + l, 2), p3(foot.y - 0.07 * s, y: 0.0, z: 0.0), 0.0)
     }
     a
 }
 
 /// A box in f64.
-pub struct Bounds: Copy + Clone {
+pub struct Bounds: Copy {
     pub lo: P3,
     pub hi: P3,
 }
@@ -197,7 +205,7 @@ fn grow_cone(b: mut Bounds, a: [f32; PARAM_FLOATS], part: u32, k: u32) {
 /// The spike's conservative rest-space bounds (grazer.js `bounds`): each part's own bounds,
 /// padded for the blend. In f64, from the f32 numbers.
 pub fn bounds(a: [f32; PARAM_FLOATS]) -> Bounds {
-    var b = Bounds { lo: p3(1e300, 1e300, 1e300), hi: p3(-1e300, -1e300, -1e300) }
+    var b = Bounds { lo: p3(x: 1e300, y: 1e300, z: 1e300), hi: p3(x: -1e300, y: -1e300, z: -1e300) }
     let amp = f64(a[1]) * 1.875
     grow(mut b, pt(a, TORSO, 0), pad3(pt(a, TORSO, 1), amp))
     grow(mut b, pt(a, TORSO, 2), pad3(pt(a, TORSO, 3), amp))
@@ -215,7 +223,7 @@ pub fn bounds(a: [f32; PARAM_FLOATS]) -> Bounds {
 // ---- the field ---------------------------------------------------------------------------------
 /// The grazer: `.blend(k)` over all twenty parts, folded in the spike's order (torso, neck, head,
 /// tail, twelve leg segments, four hooves), starting from the spike's `BIG`.
-pub struct Grazer: Copy + Clone + GpuData {
+pub struct Grazer: Copy + GpuData {
     pub k: f32,
     pub torso: Displace<SmoothUnion<Translate<Ellipsoid>, Translate<Ellipsoid>>, Fbm>,
     pub neck: RoundCone,
@@ -238,6 +246,29 @@ impl Surface for Grazer {
             d = smin(d, self.hooves[i].distance(p), self.k)
         }
         d
+    }
+}
+
+impl Lipschitz for Grazer {
+    /// The fold's gradient mixes its parts' with weights that add up to 1. A part keeps a
+    /// weight only while each later blend lowers the running value by at most 1.25 k, so where
+    /// the grazer is within `near`, part `i` of the fold's twenty is within `near + 1.25 k (21
+    /// - i)`. Sound, and loose: the torso, first, gets a scope its ellipsoids can't bound
+    /// (language.md §17's scopes).
+    fn lipschitz(self, near: f32) -> f32 {
+        let step = 1.25 * max(self.k, 0.0)
+        let scope = |i: u32| near + step * f32(21 - i)
+        var l = self.torso.lipschitz(scope(1))
+        l = max(l, self.neck.lipschitz(scope(2)))
+        l = max(l, self.head.lipschitz(scope(3)))
+        l = max(l, self.tail.lipschitz(scope(4)))
+        for i in 0..12 {
+            l = max(l, self.legs[i].lipschitz(scope(5 + i)))
+        }
+        for i in 0..4 {
+            l = max(l, self.hooves[i].lipschitz(scope(17 + i)))
+        }
+        l
     }
 }
 

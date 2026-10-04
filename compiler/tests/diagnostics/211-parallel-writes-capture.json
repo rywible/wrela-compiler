@@ -1,0 +1,29 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0520",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "this closure writes `total`, which it captures, and `par_each_mut` runs it on several workers at once",
+      "notes": [
+        "workers that write `total` at the same time would race; a parallel closure writes only its own element (§6.12)",
+        "to combine a value from each element, compute it in the closure and combine them with `par_map_reduce`"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 21,
+        "end": 188,
+        "end_column": 43,
+        "end_line": 6,
+        "line": 6,
+        "start": 166
+      },
+      "title": "a parallel closure that writes data it captures"
+    }
+  ],
+  "version": 2
+}

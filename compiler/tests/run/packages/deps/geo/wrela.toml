@@ -1,0 +1,3 @@
+# A dependency with a dependency of its own.
+[dependencies]
+units2 = { path = "../units2" }

@@ -47,7 +47,7 @@ struct Loose {
     x: f32,
 }
 
-struct Tight: Copy + Clone {
+struct Tight: Copy {
     x: f32,
 }
 

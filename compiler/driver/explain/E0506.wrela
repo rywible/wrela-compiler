@@ -1,0 +1,27 @@
+// An access to a place while a `mut` access to it (or to a place that overlaps it) is still
+// in use: two names for one value, one of which changes it. Finish with one before using the
+// other.
+// ---- wrong
+struct Lever {
+    pulled: bool,
+}
+
+fn overlap(levers: mut Vec<Lever>) {
+    mut a = levers[0]
+    levers[0].pulled = false
+    a.pulled = true
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+struct Lever {
+    pulled: bool,
+}
+
+fn overlap(levers: mut Vec<Lever>) {
+    levers[0].pulled = false
+    mut a = levers[0]
+    a.pulled = true
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

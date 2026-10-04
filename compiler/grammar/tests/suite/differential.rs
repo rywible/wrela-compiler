@@ -20,7 +20,7 @@ const SEED: u64 = 0xac5;
 #[test]
 fn generated_programs_agree() {
     let checker = Checker::default();
-    let mut cfg = RunConfig::new(sized(2000, 3000), SEED);
+    let mut cfg = RunConfig::new(sized(4000, 4000), SEED);
     cfg.round_trip = false;
     let stats = run(&checker, &cfg);
     let report = stats.report(&checker);
@@ -59,9 +59,9 @@ fn generated_programs_round_trip_through_the_formatter() {
 }
 
 #[test]
-fn the_conformance_suite_and_the_standard_library_agree() {
+fn every_wrela_file_in_the_repository_agrees() {
     let files = common::wrela_files();
-    println!("{} .wrela files under compiler/", files.len());
+    println!("{} .wrela files in the repository", files.len());
     let checker = Checker::default();
     let failures = Mutex::new(Vec::new());
     par_each(&files, Scratch::default, |scratch, path| {

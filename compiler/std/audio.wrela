@@ -1,0 +1,120 @@
+// Audio (language.md §6.13, D-004, D-072): a program has one voice, which the audio thread
+// renders a quantum at a time, and rings that carry events to it. The voice's state moves to
+// the audio thread when it starts, so only that thread changes it; a ring is the one value both
+// threads use, and each end belongs to one of them.
+//
+// The audio thread runs its own instance of the program's module on the same memory
+// (wrela_abi's `__audio`): `start_voice` makes `render_quantum` a task, as `std::par` does a
+// job's chunks, with the voice's address as its context.
+
+use std::alloc::alloc
+use std::mem::{align_of, atomic_load, atomic_store, read, size_of, store_u32, write}
+
+/// The audio thread's sample rate, in hertz.
+pub const SAMPLE_RATE: u32 = 48000
+
+/// How many samples a voice renders per call: one Web Audio render quantum.
+pub const QUANTUM: u32 = 128
+
+/// Where a quantum's samples go for the host: wrela_abi::memory::AUDIO_OUT. (This and the rate
+/// and quantum above are copies of wrela_abi's, and a test there checks them.)
+const OUT: u32 = 18874368
+
+/// A voice's state, and its quantum's samples: what the audio thread owns.
+pub(package) struct Voice<S> {
+    state: S,
+    out: [f32; 128],
+}
+
+/// Starts the program's voice. From now on the audio thread calls `render(mut state, mut out)`
+/// for each quantum: `out` holds `QUANTUM` samples at `SAMPLE_RATE`, mono, to fill. `state`
+/// moves to the audio thread for good; send the voice events through a `ring`, whose reader it
+/// holds. A program has one voice: a second `play` traps.
+pub fn play<S>(state: take S, render: @audio fn(mut S, mut [f32])) {
+    unsafe {
+        let voice = alloc(size_of::<Voice<S>>(), align_of::<Voice<S>>())
+        write(voice, Voice { state: take state, out: [0.0; QUANTUM] })
+        start_voice(voice, render)
+    }
+}
+
+/// Makes the voice at `voice` (a `Voice<S>`) the audio thread's task (`wrela.audio`).
+@intrinsic
+pub(package) fn start_voice<S>(voice: u32, render: @audio fn(mut S, mut [f32])) {}
+
+/// One quantum of the voice: its samples, rendered and left at `OUT`. (`quantum` is the task's
+/// chunk, unused.)
+pub(package) fn render_quantum<S>(
+    quantum: u32,
+    voice: mut Voice<S>,
+    render: @audio fn(mut S, mut [f32]),
+) {
+    render(mut voice.state, mut voice.out)
+    unsafe {
+        for i in 0..QUANTUM {
+            write(OUT + 4 * i, voice.out[i])
+        }
+    }
+}
+
+/// The program thread's end of a ring: it pushes events for the voice.
+pub struct RingWriter<T: Copy> {
+    block: u32,
+    mask: u32,
+}
+
+/// The voice's end of a ring: it pops the events, oldest first.
+pub struct RingReader<T: Copy> {
+    block: u32,
+    mask: u32,
+}
+
+/// A ring of at least `capacity` `T`s (a power of two), from the program's thread to the voice:
+/// one end for each. Neither end can be copied, so one thread pushes and one pops, and the ring
+/// needs no lock. Its memory is never freed: make rings once, at startup.
+pub fn ring<T: Copy>(capacity: u32) -> (RingWriter<T>, RingReader<T>) {
+    var n = 1
+    while n < capacity {
+        n = n * 2
+    }
+    unsafe {
+        // The head (the next to pop, which the reader writes), the tail (the next to push,
+        // which the writer writes), then the slots.
+        let block = alloc(16 + n * size_of::<T>(), 16)
+        store_u32(block, 0)
+        store_u32(block + 4, 0)
+        (RingWriter { block, mask: n - 1 }, RingReader { block, mask: n - 1 })
+    }
+}
+
+impl<T: Copy> RingWriter<T> {
+    /// Adds `x` at the end: false, and nothing added, if the ring is full because the voice
+    /// hasn't caught up.
+    pub fn push(mut self, x: T) -> bool {
+        unsafe {
+            let tail = atomic_load(self.block + 4)
+            if tail.wrapping_sub(atomic_load(self.block)) > self.mask {
+                return false
+            }
+            write(self.block + 16 + (tail & self.mask) * size_of::<T>(), x)
+            // The slot first: the reader sees the new tail only after it.
+            atomic_store(self.block + 4, tail.wrapping_add(1))
+        }
+        true
+    }
+}
+
+impl<T: Copy> RingReader<T> {
+    /// The oldest event, if there is one.
+    pub fn pop(mut self) -> Option<T> {
+        unsafe {
+            let head = atomic_load(self.block)
+            if head == atomic_load(self.block + 4) {
+                return None
+            }
+            let x = read::<T>(self.block + 16 + (head & self.mask) * size_of::<T>())
+            atomic_store(self.block, head.wrapping_add(1))
+            Some(x)
+        }
+    }
+}

@@ -1,0 +1,53 @@
+// A type declares a `@fieldwise` trait, but a field's type doesn't implement it: the derived
+// method has nothing to call for that field. Implement the trait for the field's type, or
+// declare it on that type too.
+// ---- wrong
+@fieldwise
+trait Visit {
+    fn visit(self, count: mut u32)
+}
+
+impl Visit for f32 {
+    fn visit(self, count: mut u32) {
+        count += 1
+    }
+}
+
+struct Opaque {
+    handle: u32,
+}
+
+struct Thing: Visit {
+    a: f32,
+    b: Opaque,
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+@fieldwise
+trait Visit {
+    fn visit(self, count: mut u32)
+}
+
+impl Visit for f32 {
+    fn visit(self, count: mut u32) {
+        count += 1
+    }
+}
+
+impl Visit for u32 {
+    fn visit(self, count: mut u32) {
+        count += 1
+    }
+}
+
+struct Opaque: Visit {
+    handle: u32,
+}
+
+struct Thing: Visit {
+    a: f32,
+    b: Opaque,
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

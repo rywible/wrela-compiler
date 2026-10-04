@@ -1,0 +1,17 @@
+// mistake: implementing `Clone` with an `impl`, as in Rust
+// expect: E0415
+// fix: yes
+struct Point {
+    x: f32,
+    y: f32,
+}
+
+impl Clone for Point {
+    fn clone(self) -> Point {
+        Point { x: self.x, y: self.y }
+    }
+}
+
+fn copy(p: Point) -> Point {
+    p.clone()
+}

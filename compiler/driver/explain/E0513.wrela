@@ -1,0 +1,35 @@
+// Two arguments of one call name overlapping places, and one of them is `mut`: the callee
+// would see one value through two names while changing it.
+// ---- wrong
+struct Log: Clone {
+    lines: Vec<Text>,
+}
+
+fn append(to: mut Log, from: Log) {
+    for line in from.lines {
+        to.lines.push(line)
+    }
+}
+
+fn twice(log: mut Log) {
+    append(mut log, log)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+struct Log: Clone {
+    lines: Vec<Text>,
+}
+
+fn append(to: mut Log, from: Log) {
+    for line in from.lines {
+        to.lines.push(line)
+    }
+}
+
+fn twice(log: mut Log) {
+    let copy = log.clone()
+    append(mut log, copy)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

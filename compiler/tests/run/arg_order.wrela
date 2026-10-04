@@ -2,14 +2,14 @@
 // expect: vec_order() = 321
 // expect: vec_value() = 123
 // expect: dispatch_order() = 21
-// expect: draw_order() = 432
+// expect: draw_order() = 342
 
 use std::gpu::{
     ClipPosition, FragCoord, GlobalId, GpuBuffer, Slots, VertexIndex, begin_screen_pass, buffer,
     dispatch, draw, present,
 }
 
-struct P: Copy + Clone + GpuData {
+struct P: Copy + GpuData {
     s: f32,
 }
 
@@ -38,7 +38,7 @@ fn notef(log: mut u32, v: f32) -> f32 {
     v
 }
 
-fn buf(log: mut u32, b: GpuBuffer<f32>) -> GpuBuffer<f32> {
+fn buf(log: mut u32, b: take GpuBuffer<f32>) -> GpuBuffer<f32> {
     log = log * 10 + 2
     b
 }
@@ -63,14 +63,14 @@ pub fn vec_value() -> f32 {
 pub fn dispatch_order() -> u32 {
     var log = 0
     let b: GpuBuffer<f32> = buffer(64)
-    dispatch(fill, out: buf(mut log, b), groups: note(mut log, 1))
+    dispatch(fill.bind(out: buf(mut log, take b)), groups: note(mut log, 1))
     log
 }
 
 pub fn draw_order() -> u32 {
     var log = 0
     begin_screen_pass(clear: vec4(0.0, 0.0, 0.0, 1.0))
-    draw(vs, fs, instances: note(mut log, 4), p: p(mut log, 1.0), vertices: note(mut log, 2))
+    draw(vs, fs.bind(p: p(mut log, 1.0)), instances: note(mut log, 4), vertices: note(mut log, 2))
     present()
     log
 }

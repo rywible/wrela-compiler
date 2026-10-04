@@ -198,7 +198,7 @@ fn check_entry(p: &Program, f: FnId, entry: Entry, out: &mut Vec<Diagnostic>) {
             ));
             continue;
         }
-        let slots = lang == Some(Lang::Slots);
+        let slots = lang.is_some_and(Lang::is_invocation_safe);
         match ps.mode {
             Mode::Take => out.push(
                 Diagnostic::new(
@@ -228,7 +228,11 @@ fn check_entry(p: &Program, f: FnId, entry: Entry, out: &mut Vec<Diagnostic>) {
                 Diagnostic::new(
                     codes::E0602,
                     ps.span,
-                    format!("`{}` is written through, so it's `mut Slots<T>`", ps.name),
+                    format!(
+                        "`{}` is written through, so it's `mut {}`",
+                        ps.name,
+                        p.display_ty(ps.ty)
+                    ),
                 )
                 .with_help("write `mut` before its type")
                 .with_note("to read a buffer, take a run `[T]`"),
@@ -238,21 +242,39 @@ fn check_entry(p: &Program, f: FnId, entry: Entry, out: &mut Vec<Diagnostic>) {
         // Data passed by value travels as a uniform, so its layout must be the GPU's. Only a
         // fragment shader takes the vertex output.
         let varyings = entry == Entry::Fragment && clip_position_fields(p, ps.ty).next().is_some();
+        let resource = lang.is_some_and(Lang::is_texture_or_sampler);
         let passed = builtin_stage.is_none()
             && !slots
+            && !resource
             && !varyings
             && !matches!(p.types.kind(ps.ty), TyKind::Slice(_))
             && !p.types.has_params(ps.ty);
         if passed && !crate::traits::implements_builtin(p, ps.ty, Lang::GpuData) {
             out.push(not_gpu_data(p, &ps.name, ps.ty, ps.span));
         }
+        // A run is a buffer's elements, which cross to the GPU too.
+        if let TyKind::Slice(elem) = *p.types.kind(ps.ty)
+            && !p.types.has_params(elem)
+            && !crate::traits::implements_builtin(p, elem, Lang::GpuData)
+        {
+            let mut d = not_gpu_data(p, &ps.name, elem, ps.span);
+            d.message = format!(
+                "`{}` is a run of `{}`, which isn't `GpuData`, so its elements can't go to the GPU",
+                ps.name,
+                p.display_ty(elem)
+            );
+            out.push(d);
+        }
         if slots && !matches!(entry, Entry::Compute(_)) {
+            let why = match lang {
+                Some(Lang::Slots) => "slots are indexed by a kernel's `GlobalId`",
+                Some(Lang::Shared) => "workgroup memory is a kernel's",
+                _ => "a draw's shaders don't write buffers yet",
+            };
             out.push(Diagnostic::new(
                 codes::E0602,
                 ps.span,
-                format!(
-                    "{stage} can't take `Slots<T>`: slots are indexed by a kernel's `GlobalId`"
-                ),
+                format!("{stage} can't take `{}`: {why}", p.display_ty(ps.ty)),
             ));
         }
     }

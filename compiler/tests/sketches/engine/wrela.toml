@@ -1,0 +1,5 @@
+# The engine the sketches are written against (language.md's layers: D-050). Ordinary wrela,
+# with no compiler support: creatures, simulation, rendering and acoustics. It's test code,
+# kept as small as the sketches allow.
+[package]
+name = "engine"

@@ -1,0 +1,22 @@
+// rejects: eff.deterministic-fn
+// A function passed as a `@deterministic fn` is deterministic: no IO, no GPU work, nothing
+// non-deterministic. The error is where the effect is: in the closure, or in the named
+// function's body.
+use std::io::load
+
+fn apply(f: @deterministic fn(u32) -> u32, x: u32) -> u32 {
+    f(x)
+}
+
+fn read_len(x: u32) -> u32 {
+    let _ = load("a") //~ E0600
+    x
+}
+
+pub fn run() -> u32 {
+    let a = apply(|x| { let _ = load("b"); x }, 1) //~ E0600
+    a + apply(read_len, 2)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+}

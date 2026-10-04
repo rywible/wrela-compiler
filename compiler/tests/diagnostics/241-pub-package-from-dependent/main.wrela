@@ -1,0 +1,8 @@
+// mistake: using a dependency's `pub(package)` item
+// expect: E0203
+// fix: no
+use geometry::shapes::unit_area
+
+fn coin() -> f32 {
+    unit_area()
+}

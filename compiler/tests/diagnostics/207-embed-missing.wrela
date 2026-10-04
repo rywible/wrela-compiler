@@ -1,0 +1,4 @@
+// mistake: embedding a file the package doesn't have
+// expect: E0218
+// fix: no
+const LEVEL: Bytes = embed("levels/one.bin")

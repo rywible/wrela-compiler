@@ -1,0 +1,26 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0312",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "index 3 is out of range: a `vec3` has 3 components",
+      "notes": [],
+      "severity": "error",
+      "span": {
+        "column": 7,
+        "end": 117,
+        "end_column": 8,
+        "end_line": 5,
+        "line": 5,
+        "start": 116
+      },
+      "title": "an index into a value that isn't indexable"
+    }
+  ],
+  "version": 2
+}

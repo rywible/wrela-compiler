@@ -87,6 +87,18 @@ impl<'a> Cx<'a> {
                 let e = self.reveal(*e);
                 self.checked.program.types.intern(TyKind::Slice(e))
             }
+            // An associated type of a return-position trait type (`<impl Creature<C>>::Shape`):
+            // revealed, it names an impl's type, which normalizing finds.
+            TyKind::Projection { self_ty, trait_, trait_args, name } => {
+                let (trait_, name) = (*trait_, name.clone());
+                let args: Vec<TyId> = trait_args.clone();
+                let self_ty = self.reveal(*self_ty);
+                let trait_args = args.iter().map(|&x| self.reveal(x)).collect();
+                let p = &self.checked.program;
+                let t = p.types.intern(TyKind::Projection { self_ty, trait_, trait_args, name });
+                let t = wrela_sema::traits::normalize(p, t, None);
+                self.reveal(t)
+            }
             _ => t,
         }
     }
@@ -134,6 +146,16 @@ impl<'a> Cx<'a> {
             }
             TyKind::Vec(n) => Some(mb.m.types.vector(*n)),
             TyKind::Mat(n) => Some(mb.m.types.intern(ir::TypeDef::Matrix(*n))),
+            // A run of UTF-8: a run of bytes, on the CPU.
+            TyKind::Str => {
+                if gpu {
+                    let note = "text lives on the CPU: GPU code has no strings (language.md §4)";
+                    self.not_on_gpu(mb, "str", note, span);
+                    return None;
+                }
+                let u8 = mb.m.types.scalar(ir::Scalar::U8);
+                Some(mb.m.types.intern(ir::TypeDef::Run(u8)))
+            }
             TyKind::Tuple(ts) => {
                 let mut fields = Vec::new();
                 for (i, &e) in ts.iter().enumerate() {
@@ -194,10 +216,22 @@ impl<'a> Cx<'a> {
                     }
                     Some(mb.m.types.intern(ir::TypeDef::Enum { name, variants }))
                 } else {
+                    let borrow = p.adt(*a).borrow;
+                    if borrow && gpu {
+                        let note = "a borrow struct's fields point into the CPU's memory";
+                        self.not_on_gpu(mb, &name, note, span);
+                        return None;
+                    }
                     let mut fields = Vec::new();
                     for (d, ft) in p.adt_fields(*a, None).iter().zip(p.fields_of(*a, args, None)) {
                         let ft = self.reveal(ft);
                         if let Some(f) = self.lower_ty(mb, ft, span) {
+                            // A borrow struct's projection field points at its place.
+                            let f = if borrow && d.mode != RetMode::Owned {
+                                mb.m.types.intern(ir::TypeDef::Ptr(f))
+                            } else {
+                                f
+                            };
                             fields.push((d.name.clone(), f));
                         }
                     }
@@ -212,12 +246,29 @@ impl<'a> Cx<'a> {
                 let r = self.reveal(t);
                 self.lower_ty(mb, r, span)
             }
-            TyKind::Never
-            | TyKind::Closure(..)
-            | TyKind::FnPtr(..)
-            | TyKind::FnDef(..)
-            | TyKind::Error => None,
-            TyKind::Param(_) | TyKind::Projection { .. } | TyKind::Var(_) => {
+            // A closure that captures only `Copy` values it reads is a value: copies of them
+            // (§6.7). Any other has no value of its own (it's inlined where it's passed).
+            &TyKind::Closure(c, ref env) => {
+                let env = env.clone();
+                let fields = self.closure_fields(mb, c, &env)?;
+                let parts: Vec<(String, ir::TypeId)> = fields
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, (_, t))| (format!("_{i}"), t))
+                    .collect();
+                if parts.is_empty() {
+                    None
+                } else {
+                    let name = format!("closure{}", c.id.0);
+                    Some(mb.m.types.intern(ir::TypeDef::Struct { name, fields: parts }))
+                }
+            }
+            TyKind::Never | TyKind::FnPtr(..) | TyKind::FnDef(..) | TyKind::Error => None,
+            TyKind::Param(_)
+            | TyKind::Projection { .. }
+            | TyKind::Var(_)
+            | TyKind::ArrayN(..)
+            | TyKind::ConstU32(_) => {
                 let shown = self.checked.program.display_ty(t);
                 self.err(Diagnostic::internal(format!(
                     "a type that should be concrete reached lowering: `{shown}`"
@@ -357,7 +408,7 @@ impl<'a> Cx<'a> {
 
     /// The captures of closure `id` in `owner`'s body that its lifted function takes as
     /// parameters, in order: each one's local, IR type, and whether the closure writes it. A
-    /// captured closure travels as its own instance, and a capture with no runtime value isn't
+    /// captured closure travels as its value, and a capture with no runtime value isn't
     /// passed.
     pub fn lowered_captures(
         &mut self,
@@ -377,14 +428,50 @@ impl<'a> Cx<'a> {
             }
             let decl = body.local(l);
             let t = self.concrete(decl.ty, &subst);
-            if matches!(self.checked.program.types.kind(t), TyKind::Closure(..) | TyKind::FnPtr(..))
-            {
+            // A captured closure travels as its value, copies of its own captures (§6.7); one
+            // that captures nothing has no value, and its type says which it is.
+            if matches!(self.checked.program.types.kind(t), TyKind::FnPtr(..)) {
                 continue;
             }
             let Some(ty) = self.lower_ty(mb, t, decl.span) else { continue };
             out.push((l, ty, written));
         }
         out
+    }
+
+    /// The instance that owns closure `c` made with generic arguments `env`, when it's called
+    /// from where it was stored.
+    pub fn stored_closure_owner(&self, c: ClosureRef, env: &[TyId]) -> Option<InstanceKey> {
+        Some(InstanceKey::plain(c.owner?, env.to_vec()))
+    }
+
+    /// A storable closure's captures, as its value holds them: each capture's local and IR
+    /// type. `None` if it isn't storable: it writes a capture, or captures one that isn't
+    /// `Copy`.
+    pub fn closure_fields(
+        &mut self,
+        mb: &mut ModuleBuilder,
+        c: ClosureRef,
+        env: &[TyId],
+    ) -> Option<Vec<(Local, ir::TypeId)>> {
+        let owner = self.stored_closure_owner(c, env)?;
+        let checked = self.checked;
+        let body = checked.mir.get(&owner.source_fn()?)?;
+        let subst = self.instance_subst(&owner);
+        let info = body.closures.get(c.id.0 as usize)?;
+        for &(l, written) in &info.captures {
+            let t = self.concrete(body.local(l).ty, &subst);
+            if written
+                || !wrela_sema::traits::implements_builtin(
+                    &checked.program,
+                    t,
+                    wrela_sema::defs::Lang::Copy,
+                )
+            {
+                return None;
+            }
+        }
+        Some(self.lowered_captures(mb, &owner, c.id).into_iter().map(|(l, t, _)| (l, t)).collect())
     }
 
     /// The resource a closure's capture `l` is, on the GPU: a buffer parameter of `owner`, which
@@ -437,7 +524,9 @@ impl<'a> Cx<'a> {
                 let ret_t = self.concrete(def.ret, &subst);
                 let ret = self.lower_ty(mb, ret_t, def.sig_span);
                 let mut f = ir::Function::new(self.instance_name(mb, key), params, ret);
-                if def.ret_mode != RetMode::Owned {
+                // A run result is a view already: it's returned as one, not by a pointer.
+                let run = ret.is_some_and(|t| matches!(mb.m.types.get(t), ir::TypeDef::Run(_)));
+                if def.ret_mode != RetMode::Owned && !run {
                     if mb.target() == ir::Target::Gpu {
                         self.err(
                             Diagnostic::new(codes::E0702, def.sig_span, format!("`{}` returns a projection, which GPU code can't do yet", def.name))
@@ -464,11 +553,19 @@ impl<'a> Cx<'a> {
                     let decl = body.local(l);
                     let t = self.concrete(decl.ty, &subst);
                     if let Some(ty) = self.lower_ty(mb, t, decl.span) {
+                        // A `mut` parameter (its mode from the function type the closure is
+                        // passed as, §6.7) is the caller's place; the others are values.
+                        let by_ref = matches!(
+                            decl.kind,
+                            wrela_sema::mir::LocalKind::User(wrela_sema::thir::LocalKind::Param(
+                                Mode::Mut
+                            ))
+                        );
                         params.push(ir::Param {
                             name: decl.name.clone(),
                             ty,
-                            by_ref: false,
-                            mutable: false,
+                            by_ref,
+                            mutable: by_ref,
                         });
                     }
                 }
@@ -478,6 +575,7 @@ impl<'a> Cx<'a> {
                 ir::Function::new(name, params, ret)
             }
             InstanceKey::Derived { .. } => crate::derive::signature(self, mb, key),
+            InstanceKey::Glue { kind, ty } => self.glue_signature(mb, *kind, *ty),
         }
     }
 

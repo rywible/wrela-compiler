@@ -1,0 +1,23 @@
+// A struct literal leaves out a field that has no default.
+// ---- wrong
+struct Ball {
+    pos: vec2,
+    radius: f32,
+}
+
+fn ball() -> Ball {
+    Ball { pos: vec2(0.0) }
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+struct Ball {
+    pos: vec2,
+    radius: f32,
+}
+
+fn ball() -> Ball {
+    Ball { pos: vec2(0.0), radius: 1.0 }
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

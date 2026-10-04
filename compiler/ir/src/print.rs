@@ -112,6 +112,12 @@ fn expr(m: &Module, e: &Expr) -> String {
         Expr::Zero(t) => format!("zero {}", m.types.display(*t)),
         Expr::Load(p) => format!("load {}", place(p)),
         Expr::ArrayLength(p) => format!("array_length {}", place(p)),
+        Expr::Atomic(op, p, xs) => format!("atomic {op:?} {}, {}", place(p), vals(xs)),
+        Expr::Barrier => "barrier".to_string(),
+        Expr::Texture(op, t, s, xs) => match s {
+            Some(s) => format!("texture {op:?} r{}, r{}, {}", t.0, s.0, vals(xs)),
+            None => format!("texture {op:?} r{}, {}", t.0, vals(xs)),
+        },
         Expr::Unary(op, v) => format!("{op:?} v{}", v.0),
         Expr::Binary(op, a, b) => format!("{op:?} v{}, v{}", a.0, b.0),
         Expr::Call(f, args) => {
@@ -142,6 +148,7 @@ fn expr(m: &Module, e: &Expr) -> String {
         Expr::Run(p) => format!("run {}", place(p)),
         Expr::Addr(p) => format!("&{}", place(p)),
         Expr::Host(op, args) => format!("host {op:?}({})", vals(args)),
+        Expr::Mem(op, args) => format!("mem {op:?}({})", vals(args)),
         Expr::EntryInput(i) => format!("input {i}"),
         Expr::Param(i) => format!("param {i}"),
     }

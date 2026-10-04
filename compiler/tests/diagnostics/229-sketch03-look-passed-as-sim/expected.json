@@ -1,0 +1,28 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0400",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "`GrazerLook` isn't sim state: sim state is rolled back and hashed, so it must be the same on every client. Presentation data (poses for drawing, springs, sounds) lives outside it",
+      "notes": [
+        "`GrazerLook` doesn't implement `SimState`, which `S` in `simulate` needs"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 14,
+        "end": 234,
+        "end_column": 22,
+        "end_line": 11,
+        "line": 11,
+        "start": 226
+      },
+      "title": "a type that doesn't implement a trait"
+    }
+  ],
+  "version": 2
+}

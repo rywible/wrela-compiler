@@ -34,6 +34,24 @@ pub struct Edit {
     pub replacement: String,
 }
 
+/// `text` with `edits` made, all in its file: each replaces its span. Edits that overlap can't
+/// both be made: that's a bug in what chose them.
+pub fn apply_edits<'e>(text: &str, edits: impl IntoIterator<Item = &'e Edit>) -> String {
+    let mut edits: Vec<&Edit> = edits.into_iter().collect();
+    edits.sort_by_key(|e| (e.span.start, e.span.end));
+    let mut out = String::with_capacity(text.len());
+    let mut pos = 0usize;
+    for e in edits {
+        let (s, t) = (e.span.start as usize, e.span.end as usize);
+        assert!(s >= pos, "edits overlap at {s}..{t}: they can't both be made");
+        out.push_str(&text[pos..s]);
+        out.push_str(&e.replacement);
+        pos = t;
+    }
+    out.push_str(&text[pos..]);
+    out
+}
+
 /// A suggested fix: a description and the edits that make it. Applying every edit of one fix
 /// must leave the program free of this diagnostic.
 #[derive(Clone, Debug, PartialEq, Eq)]

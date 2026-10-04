@@ -1,0 +1,18 @@
+// accepts: eff.deterministic-fn
+// A function passed as a `@deterministic fn` may allocate, panic and recurse (to 256 calls).
+fn apply(f: @deterministic fn(u32) -> u32, x: u32) -> u32 {
+    f(x)
+}
+
+fn twice(x: u32) -> u32 {
+    assert(x < 1000)
+    x * 2
+}
+
+pub fn run() -> u32 {
+    let base = 3
+    apply(|x| { let v: Vec<u32> = Vec::with_capacity(x); v.capacity() + base }, 4) + apply(twice, 5)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+}

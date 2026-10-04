@@ -1,0 +1,26 @@
+// rejects: const.tests
+// A frame test takes nothing, or the program's state borrowed: the frames change the state,
+// and the test reads it (§10).
+pub struct Game {
+    ticks: u32,
+}
+
+pub fn init() -> Game {
+    Game { ticks: 0 }
+}
+
+pub fn frame(state: mut Game, time: f32, width: u32, height: u32) {
+    state.ticks += 1
+}
+
+@test(frames: 10)
+fn changes_it(game: mut Game) { //~ E0222
+}
+
+@test(frames: 10)
+fn takes_more(game: Game, n: u32) { //~ E0222
+}
+
+@test(frames: 10)
+fn takes_another_type(n: u32) { //~ E0222
+}

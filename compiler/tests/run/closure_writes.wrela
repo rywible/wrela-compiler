@@ -1,0 +1,54 @@
+// run: a closure passed down writes the variables it captures, which the caller then reads
+// (`spatial.wrela`'s `closest` keeps the nearest so)
+// expect: count(4) = 6
+// expect: best(5) = 4004
+// expect: through_mut_param(3) = 303
+
+fn each(n: u32, f: fn(u32)) {
+    for i in 0..n {
+        f(i)
+    }
+}
+
+pub fn count(n: u32) -> u32 {
+    var c = 0
+    each(n, |i| { c += i })
+    c
+}
+
+pub fn best(n: u32) -> u32 {
+    var b: Option<u32> = None
+    var top = 0
+    each(n, |i| {
+        if i >= top {
+            top = i
+            b = Some(i)
+        }
+    })
+    match b {
+        Some(x) => x + 1000 * top,
+        None => 7,
+    }
+}
+
+
+struct Cell: Clone {
+    n: u32,
+}
+
+fn each_mut(xs: mut Vec<Cell>, f: fn(mut Cell)) {
+    for i in 0..xs.len() {
+        f(mut xs[i])
+    }
+}
+
+/// A closure's parameter takes its mode from the function type: `fn(mut Cell)` makes `c` the
+/// element itself, which the closure changes (it was once a copy).
+pub fn through_mut_param(k: u32) -> u32 {
+    var v: Vec<Cell> = Vec::new()
+    for i in 0..3 {
+        v.push(Cell { n: i })
+    }
+    each_mut(mut v, |c| { c.n += 100 * k / 3 })
+    v[0].n + v[1].n + v[2].n
+}

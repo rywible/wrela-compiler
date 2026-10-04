@@ -1,0 +1,14 @@
+// mistake: a voice's render closure that captures a local
+// expect: E0510
+// fix: no
+use std::audio::play
+
+struct Synth {
+    phase: f32,
+}
+
+pub fn init() -> u32 {
+    let gain = 0.5
+    play(Synth { phase: 0.0 }, |s, out| { out[0] = gain * s.phase })
+    0
+}

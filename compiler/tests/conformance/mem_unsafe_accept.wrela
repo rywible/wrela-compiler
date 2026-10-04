@@ -1,0 +1,11 @@
+// accepts: mem.unsafe
+// std's safe types are built on its unsafe core; using them needs no `unsafe`.
+use std::mem::size_of
+
+fn f() -> u32 {
+    var v = Vec::new()
+    v.push(1)
+    v.push(2)
+    let b = Box::new(v.len())
+    b.get() + size_of::<u32>()
+}

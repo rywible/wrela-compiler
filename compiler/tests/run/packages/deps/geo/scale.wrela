@@ -1,0 +1,3 @@
+pub fn by_ten(x: u32) -> u32 {
+    x * units2::lib::ten()
+}

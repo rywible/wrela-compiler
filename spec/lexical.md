@@ -1,11 +1,11 @@
-# wrela lexical structure, tier 0
+# wrela lexical structure
 
 Normative (D-104). `spec/grammar.ebnf` is written over the tokens defined here, and the compiler's
 lexer (`compiler/syntax/src/lexer.rs`) implements exactly these rules; the oracle parser in
 `compiler/grammar` uses that same lexer. Rules are numbered (L1, L2, …) so tests and diagnostics
 can cite them. A number is never reused; new rules are appended.
 
-Error codes come from the lexical range E0001–E0099, or the tier range E0900–E0999.
+Error codes come from the lexical range E0001–E0099.
 
 ## Source text
 
@@ -39,12 +39,15 @@ Error codes come from the lexical range E0001–E0099, or the tier range E0900�
 - **L11.** These identifiers are keywords, reserved everywhere:
 
   ```
-  as borrow break const continue dyn else enum false fn for if impl in let loop match mut pub
-  return self Self struct take trait true type unsafe use var where while
+  as borrow break const continue dyn else enum false fn for if impl in let loop match mut package
+  pub return self Self struct take trait true type unsafe use var while
   ```
 
-  Type names (`f32`, `u32`, `vec3`, `bool`, …) and attribute names (`compute` in `@compute`) are
-  ordinary identifiers. `unsafe` and `where` are reserved for later tiers. `dyn` is reserved, but wrela has no `dyn` (language.md §18): the word stays reserved so the compiler can say what to use instead.
+  This is the final list: each word has a use. Type names (`f32`, `u32`, `vec3`, `bool`, …) and
+  attribute names (`compute` in `@compute`) are ordinary identifiers. `package` is only in
+  `pub(package)` (language.md §3). wrela has no `dyn`
+  (language.md §18): the word stays reserved so the compiler can say what to use instead. `where`
+  isn't a keyword: bounds go on the parameters.
 
 ## Number literals
 
@@ -74,7 +77,7 @@ Error codes come from the lexical range E0001–E0099, or the tier range E0900�
   - **A suffix starting with `e` or `E`** is a malformed exponent, E0004. No unit is named `e`
     (D-025), so `1e5` is always a float.
   - **Any other suffix that is an identifier** makes the token SUFFIXED: a unit suffix, as in
-    `15cm`. Units are tier 1, so using one is E0900.
+    `15cm`, which means `15 * cm` (language.md §5).
   - **Anything else** (`0x`, `0b2`, `0X1F`, `1.5e`) is E0004.
 
   A float has digits on both sides of its `.`: `1.` is `1` then `.`, and `.5` is `.` then `5`.
@@ -83,11 +86,11 @@ Error codes come from the lexical range E0001–E0099, or the tier range E0900�
   finite (it may round), and an integer that becomes a float is exact (`16777217` isn't an
   `f32`; `16777217.0` rounds).
 
-## String literals (tier 1)
+## String literals
 
 - **L14.** A string literal is `"` … `"` on one line, with the escapes `\\ \" \n \r \t \0`. It
-  lexes as a STRING token; using one is E0901. An unterminated string, or an unknown escape, is
-  E0005. There are no character literals: `'` is E0001.
+  lexes as a STRING token. An unterminated string, or an unknown escape, is E0005. There are no
+  character literals: `'` is E0001.
 
 ## Operators and punctuation
 
@@ -99,7 +102,7 @@ Error codes come from the lexical range E0001–E0099, or the tier range E0900�
   (  )  [  ]  {  }  ,  ;  :  .  @  =  +  -  *  /  %  ^  &  |  !  <  >  ?  _
   ```
 
-  `**` is exponentiation and `^` is XOR (D-076). `?` is tier 1: it lexes, and using it is E0902.
+  `**` is exponentiation and `^` is XOR (D-076). `?` propagates an error (language.md §15).
   `#`, `$`, `~` and `` ` `` are E0001.
 - **L16.** Where the grammar expects a `>` that closes a generic argument list (`GT_CLOSE` in
   the grammar), a `>>`, `>=` or `>>=` token is split: its first `>` closes the list, and the rest
@@ -134,5 +137,30 @@ Error codes come from the lexical range E0001–E0099, or the tier range E0900�
 ## Tokens the grammar sees
 
 - **L21.** `spec/grammar.ebnf` uses the token classes IDENT (L10), INT and FLOAT (L13), SUFFIXED
-  (L13), STRING (L14), NEWLINE (L17, L18), EOF (L18) and GT_CLOSE (L16). Keywords (L11) and
-  punctuation, `_` included (L15), appear in the grammar as quoted text, such as `"fn"` and `"+="`.
+  (L13), STRING (L14), FSTRING, FSTRING_HEAD, FSTRING_MID and FSTRING_TAIL (L22), NEWLINE (L17,
+  L18), EOF (L18) and GT_CLOSE (L16). Keywords (L11) and punctuation, `_` included (L15), appear in
+  the grammar as quoted text, such as `"fn"` and `"+="`.
+
+## F-strings
+
+- **L22.** `f"` (an `f` directly before `"`) starts an f-string: text, with holes in `{ }` that hold
+  expressions, on one line. The text has L14's escapes, and `{{` and `}}` for literal braces; a
+  lone `}` in it is E0005. The lexer splits an f-string at its holes:
+  - `f"` … `"` without a hole is one FSTRING token.
+  - `f"` … `{` is an FSTRING_HEAD, which opens a hole. The hole's contents are ordinary tokens.
+  - Inside a hole, outside any bracket opened in it, `}` ends the hole, and so does `:` (not
+    `::`), which starts a **format spec** running to the next `}`. From there the text goes on:
+    up to the next hole's `{` it's an FSTRING_MID (`}` … `{` or `:spec}` … `{`), and up to the
+    closing `"` an FSTRING_TAIL (`}` … `"` or `:spec}` … `"`).
+
+  Brackets inside a hole nest as anywhere else (L19), and an f-string can hold another. A line
+  break or the file's end inside an f-string or a hole is E0005. A hole's expression is checked
+  by the grammar (`fstring`); its format spec by the checker (language.md §4).
+
+## `let … else`
+
+- **L23.** Not a lexical rule, but one the lexer's layout rules make necessary: in
+  `let PATTERN = VALUE else { … }`, the value can't end with `}`, or be an operator's result, since
+  the `else` would then belong to it. It's a literal, a path, or a parenthesized or bracketed
+  expression, with any postfixes (calls, fields, indexes, `?`) and prefix operators
+  (`let_else_init` in the grammar). The parser's error (E0100) offers to wrap it in parentheses.

@@ -1,0 +1,6 @@
+// mistake: joining text with `+`
+// expect: E0305
+// fix: yes
+fn greet(name: Text) -> String {
+    "hello, " + name
+}

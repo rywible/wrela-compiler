@@ -58,15 +58,14 @@ fn collect(path: &Path, out: &mut Vec<PathBuf>) -> bool {
 /// Formats on a thread with the compiler's stack: the parser and the formatter recurse over
 /// syntax trees, and a file can hold the deepest tree the parser accepts (or rejects as too deep).
 pub fn run(args: &[String]) -> ExitCode {
-    std::thread::scope(|s| {
-        std::thread::Builder::new()
-            .name("wrela fmt".into())
-            .stack_size(wrela_driver::STACK_SIZE)
-            .spawn_scoped(s, || format_files(args))
-            .expect("can't start the formatter's thread")
-            .join()
-            .unwrap_or_else(|p| std::panic::resume_unwind(p))
-    })
+    wrela_driver::on_compiler_thread(|| format_files(args))
+}
+
+/// `text` formatted, or `None` when it has syntax errors. Call it on a thread with the
+/// compiler's stack, as [`run`] does.
+pub(crate) fn format_text(text: &str) -> Option<String> {
+    let parsed = wrela_syntax::parse(FileId(0), text);
+    (!parsed.has_errors()).then(|| wrela_syntax::fmt::format(&parsed, text))
 }
 
 fn format_files(args: &[String]) -> ExitCode {

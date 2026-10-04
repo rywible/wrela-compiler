@@ -1,7 +1,7 @@
 // mistake: a method taking `&self`
 // expect: E0106
 // fix: yes
-struct Ball: Copy + Clone {
+struct Ball: Copy {
     r: f32,
 }
 

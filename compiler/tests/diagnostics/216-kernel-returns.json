@@ -1,0 +1,28 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0602",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [
+        "write results through a `mut Slots<T>` parameter"
+      ],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "a `@compute` kernel doesn't return a value",
+      "notes": [],
+      "severity": "error",
+      "span": {
+        "column": 1,
+        "end": 194,
+        "end_column": 39,
+        "end_line": 7,
+        "line": 7,
+        "start": 156
+      },
+      "title": "a GPU entry point with an invalid signature"
+    }
+  ],
+  "version": 2
+}

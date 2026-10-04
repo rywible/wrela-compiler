@@ -1,0 +1,27 @@
+// A closure that outlives what it captures: stored in a struct, returned, or passed where it's
+// kept. A closure is called where it's made; it can't be stored. Store the data, and pass a
+// function, or make the closure capture nothing (a plain `fn`).
+// ---- wrong
+struct Holder {
+    f: fn(f32) -> f32,
+}
+
+fn make(k: f32) -> Holder {
+    Holder { f: |x| x * k }
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+struct Holder {
+    k: f32,
+}
+
+fn make(k: f32) -> Holder {
+    Holder { k }
+}
+
+fn apply(h: Holder, x: f32) -> f32 {
+    x * h.k
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

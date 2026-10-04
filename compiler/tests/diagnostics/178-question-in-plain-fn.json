@@ -1,0 +1,28 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0300",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "`?` returns its `None` from the function, which returns `u32`",
+      "notes": [
+        "so the function must return an `Option`: `Option<_>`"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 13,
+        "end": 152,
+        "end_column": 15,
+        "end_line": 5,
+        "line": 5,
+        "start": 150
+      },
+      "title": "mismatched types"
+    }
+  ],
+  "version": 2
+}

@@ -1,0 +1,29 @@
+// rejects: const.places
+// A constant can't be moved out of or changed: every use reads the same place.
+const NAMES: Vec<Text> = names()
+const START: f32 = 1.0
+
+fn names() -> Vec<Text> {
+    var v = Vec::new()
+    v.push("hip")
+    v
+}
+
+fn keep(v: take Vec<Text>) -> u32 {
+    v.len()
+}
+
+fn grow(x: mut f32) {
+    x *= 2.0
+}
+
+fn f() -> u32 {
+    let a = keep(take NAMES) //~ E0502
+    var b = NAMES //~ E0517
+    grow(mut START) //~ E0512
+    a + b.len()
+}
+
+fn g() -> mut f32 {
+    mut START //~ E0512
+}

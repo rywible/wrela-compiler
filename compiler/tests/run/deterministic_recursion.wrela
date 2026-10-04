@@ -1,0 +1,66 @@
+// run: recursion that `@deterministic` code reaches goes 256 calls deep, and the 257th panics
+// the same way on every engine (§8); other recursion isn't counted. The derived `Clone` and
+// `StateHash` of a tree work in `@deterministic` code.
+// expect: depth(255) = 256
+// expect: depth(256) panics "recursion deeper than 256 calls"
+// expect: twice(255) = 257
+// expect: twice(256) panics "recursion deeper than 256 calls"
+// expect: uncounted(1000) = 1001
+// expect: tree_hashes_match() = true
+
+use std::hash::{StateHash, state_hash}
+
+@deterministic
+pub fn depth(n: u32) -> u32 {
+    down(n)
+}
+
+fn down(n: u32) -> u32 {
+    if n == 0 { 1 } else { 1 + down(n - 1) }
+}
+
+// Two functions in one cycle: each call counts.
+@deterministic
+pub fn twice(n: u32) -> u32 {
+    ping(n) + 1
+}
+
+fn ping(n: u32) -> u32 {
+    if n == 0 { 1 } else { 1 + pong(n - 1) }
+}
+
+fn pong(n: u32) -> u32 {
+    if n == 0 { 1 } else { 1 + ping(n - 1) }
+}
+
+// Only what `@deterministic` code reaches is counted.
+pub fn uncounted(n: u32) -> u32 {
+    plain(n)
+}
+
+fn plain(n: u32) -> u32 {
+    if n == 0 { 1 } else { 1 + plain(n - 1) }
+}
+
+struct Node: Clone + StateHash {
+    value: u32,
+    children: Vec<Node>,
+}
+
+fn grow(depth: u32) -> Node {
+    var children = Vec::new()
+    if depth > 0 {
+        children.push(grow(depth - 1))
+        children.push(grow(depth - 1))
+    }
+    Node { value: depth, children }
+}
+
+@deterministic
+pub fn tree_hashes_match() -> bool {
+    let tree = grow(6)
+    let copy = tree.clone()
+    state_hash(tree) == state_hash(copy)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

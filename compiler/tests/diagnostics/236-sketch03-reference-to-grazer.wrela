@@ -1,0 +1,11 @@
+// mistake: sketch 03 §7: a `&GrazerSim` field to point at a grazer
+// expect: E0106
+// fix: yes
+struct GrazerSim {
+    root: vec3,
+}
+
+struct Target {
+    grazer: &GrazerSim,
+    since: f32,
+}

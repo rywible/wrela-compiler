@@ -11,10 +11,3 @@ fn local() -> borrow f32 {
 fn owned(w: take World) -> borrow f32 {
     w.values[1] //~ E0508
 }
-
-// A constant is a value in tier 0, not a place (§6.4).
-const VALUES: [f32; 2] = [1.0, 2.0]
-
-fn from_constant(i: u32) -> borrow f32 {
-    VALUES[i] //~ E0508
-}

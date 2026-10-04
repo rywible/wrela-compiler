@@ -1,0 +1,9 @@
+// mistake: `println!` where `std::io::print` is imported already
+// expect: E0115
+// fix: yes
+use std::io::{print, load}
+
+fn step(speed: f32) -> f32 {
+    println!("speed is {}", speed)
+    speed * 2.0
+}

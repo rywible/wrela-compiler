@@ -1,4 +1,4 @@
-# wrela grammar, tier 0. Normative (D-104).
+# wrela grammar. Normative (D-104): it covers all of the language's syntax.
 #
 # This grammar is written over the token stream spec/lexical.md defines, not over characters.
 # The newline rules (L17-L19) are context-dependent, so the lexer applies them and hands the
@@ -14,18 +14,19 @@
 #   ( a )             grouping
 #   a?  a*  a+        optional, zero or more, one or more (postfix, binds tightest)
 #   "fn"  "+="        a terminal: a keyword, `_`, or a punctuation token, by its text
-#   IDENT INT FLOAT   token classes (UPPERCASE), defined in spec/lexical.md (L21):
-#   SUFFIXED STRING   IDENT, INT, FLOAT, SUFFIXED, STRING, NEWLINE, EOF and GT_CLOSE.
-#   NEWLINE EOF       GT_CLOSE is a `>` that closes a generic list; it also matches the first
-#   GT_CLOSE          `>` of a `>>`, `>=` or `>>=` token, whose rest is the next token (L16).
+#   IDENT INT FLOAT   token classes (UPPERCASE), defined in spec/lexical.md (L21): IDENT, INT,
+#   SUFFIXED STRING   FLOAT, SUFFIXED, STRING, the f-string tokens FSTRING, FSTRING_HEAD,
+#   NEWLINE EOF       FSTRING_MID and FSTRING_TAIL (L22), NEWLINE, EOF and GT_CLOSE.
+#   GT_CLOSE ...      GT_CLOSE is a `>` that closes a generic list; it also matches the first
+#                     `>` of a `>>`, `>=` or `>>=` token, whose rest is the next token (L16).
 #   # ...             a comment, to the end of the line
 # Rule names are lowercase_with_underscores; each is defined once. The start rule is `file`.
 #
 # A repeated binary operator, `a ("+" a)*`, associates to the left; `**` associates to the right.
 # The grammar is unambiguous: one parse per accepted token sequence (the oracle checks this).
 #
-# What the grammar accepts is syntax only. Which attributes exist, which names resolve, and what
-# is tier 1 (units, strings, `?`) are the checker's rules, with their own diagnostics.
+# What the grammar accepts is syntax only. Which attributes exist and which names resolve are the
+# checker's rules, with their own diagnostics.
 
 # ---------------------------------------------------------------------------------------------
 # Files and items
@@ -34,34 +35,46 @@ file             ::= sep* (item (sep+ item)* sep*)? EOF
 sep              ::= NEWLINE | ";"
 
 item             ::= attribute* (pub_item | impl_item)
-pub_item         ::= "pub"? (fn_item | struct_item | enum_item | trait_item | const_item | use_item)
+pub_item         ::= vis? (fn_item | struct_item | borrow_struct | enum_item | trait_item
+                            | const_item | use_item | type_item)
 attribute        ::= "@" IDENT call_args? NEWLINE?
+# `pub` makes an item visible outside its module; `pub(package)`, only inside its package.
+vis              ::= "pub" ("(" "package" ")")?
 
 fn_item          ::= fn_sig block
 fn_sig           ::= "fn" IDENT generic_params? "(" params? ")" ret_type?
 generic_params   ::= "<" (generic_param ("," generic_param)* ","?)? GT_CLOSE
-generic_param    ::= IDENT (":" bounds)?
-bounds           ::= path_type ("+" path_type)*
+generic_param    ::= IDENT (":" bounds)? | "const" IDENT ":" type
+bounds           ::= bound ("+" bound)*
+bound            ::= path_type | fn_type
 params           ::= param ("," param)* ","?
-param            ::= mode? "self" | IDENT ":" mode? type ("=" expr)?
+param            ::= mode? "self" | IDENT ":" mode? trait_type ("=" expr)?
 mode             ::= "mut" | "take"
-ret_type         ::= "->" ("borrow" | "mut")? type
+ret_type         ::= "->" ("borrow" | "mut")? trait_type
+# Where a trait names a type (a parameter's or a return type), traits can be joined with `+`.
+trait_type       ::= type ("+" path_type)*
 
 # `struct S: A + B { ... }` opts S in to the traits A and B.
 struct_item      ::= "struct" IDENT generic_params? (":" bounds)? field_block
 field_block      ::= "{" (field_decl ("," field_decl)* ","?)? NEWLINE? "}"
-field_decl       ::= "pub"? IDENT ":" type ("=" expr)?
+field_decl       ::= vis? IDENT ":" type ("=" expr)?
+
+# A borrow struct groups projections (language.md §6.6): its fields may be `borrow T` or `mut T`.
+borrow_struct    ::= "borrow" "struct" IDENT generic_params? "{" (borrow_field ("," borrow_field)* ","?)? NEWLINE? "}"
+borrow_field     ::= vis? IDENT ":" ("borrow" | "mut")? type
 
 enum_item        ::= "enum" IDENT generic_params? (":" bounds)? "{" (variant ("," variant)* ","?)? NEWLINE? "}"
 variant          ::= IDENT ("(" (type ("," type)* ","?)? ")" | field_block)?
 
-trait_item       ::= "trait" IDENT generic_params? (":" bounds)? "{" sep* (trait_member (sep+ trait_member)* sep*)? "}"
+# `trait Sim = Clone + StateHash` names a set of traits (language.md §7).
+trait_item       ::= "trait" IDENT generic_params? ((":" bounds)? "{" sep* (trait_member (sep+ trait_member)* sep*)? "}" | "=" bounds)
 trait_member     ::= attribute* (fn_sig block? | "type" IDENT (":" bounds)?)
 
 impl_item        ::= "impl" generic_params? type ("for" type)? "{" sep* (impl_member (sep+ impl_member)* sep*)? "}"
-impl_member      ::= attribute* "pub"? fn_item | "type" IDENT "=" type
+impl_member      ::= attribute* vis? fn_item | "type" IDENT "=" type
 
 const_item       ::= "const" IDENT (":" type)? "=" expr
+type_item        ::= "type" IDENT generic_params? "=" type
 
 use_item         ::= "use" use_tree
 use_tree         ::= IDENT ("::" IDENT)* ("::" "{" (use_tree ("," use_tree)* ","?)? NEWLINE? "}" | "as" IDENT)?
@@ -72,10 +85,14 @@ use_tree         ::= IDENT ("::" IDENT)* ("::" "{" (use_tree ("," use_tree)* ","
 type             ::= path_type
                    | "[" type (";" expr)? "]"
                    | "(" (type ("," type)* ","?)? ")"
-                   | "fn" "(" (type ("," type)* ","?)? ")" ("->" type)?
+                   | fn_type
+# `@deterministic fn(mut W, TickInput)`: attributes, and a mode for each parameter.
+fn_type          ::= ("@" IDENT)* "fn" "(" (fn_type_param ("," fn_type_param)* ","?)? ")" ("->" type)?
+fn_type_param    ::= mode? type
 path_type        ::= type_segment ("::" type_segment)*
 type_segment     ::= (IDENT | "Self") generic_args?
-generic_args     ::= "<" type ("," type)* ","? GT_CLOSE
+generic_args     ::= "<" generic_arg ("," generic_arg)* ","? GT_CLOSE
+generic_arg      ::= type | INT
 
 # ---------------------------------------------------------------------------------------------
 # Blocks and statements. A block's value is its last statement when that is an expression.
@@ -83,7 +100,14 @@ generic_args     ::= "<" type ("," type)* ","? GT_CLOSE
 block            ::= "{" sep* (stmt (sep+ stmt)* sep*)? "}"
 stmt             ::= bind_stmt | assign_stmt | while_stmt | loop_stmt | for_stmt | expr
 bind_stmt        ::= "let" pattern (":" type)? "=" expr
-                   | ("var" | "mut") IDENT (":" type)? "=" expr
+                   | "let" pattern (":" type)? "=" let_else_init "else" block
+                   | ("var" | "mut" | "borrow") IDENT (":" type)? "=" expr
+
+# The value of a `let ... else` can't end with `}` (or the `else` would be its own), so it's a
+# primary without blocks, with postfixes and prefix operators (L23).
+let_else_init    ::= ("-" | "!" | "take" | "mut") let_else_init | let_else_postfix
+let_else_postfix ::= let_else_primary postfixes
+let_else_primary ::= literal | path_expr | paren_expr | array_expr
 assign_stmt      ::= postfix_expr assign_op expr
 assign_op        ::= "=" | "+=" | "-=" | "*=" | "/=" | "%=" | "**=" | "&=" | "|=" | "^=" | "<<=" | ">>="
 while_stmt       ::= "while" expr_ns block
@@ -115,8 +139,8 @@ power_expr       ::= postfix_expr ("**" unary_expr)?          # -x ** 2 is -(x *
 # A field access is never directly followed by call arguments: `.name(` is always a method call.
 # To call a function stored in a field, write `(a.f)(x)`.
 postfix_expr     ::= primary_expr postfixes
-postfixes        ::= (postfix | field_access+ (index | method_call))* field_access*
-postfix          ::= call_args | index | method_call
+postfixes        ::= (postfix | field_access+ (index | method_call | "?"))* field_access*
+postfix          ::= call_args | index | method_call | "?"
 index            ::= "[" expr "]"
 method_call      ::= "." IDENT ("::" generic_args)? call_args
 field_access     ::= "." (IDENT | INT)
@@ -127,8 +151,12 @@ args             ::= expr ("," expr)* ("," named_arg)* ","? | named_arg ("," nam
 named_arg        ::= IDENT ":" expr
 
 primary_expr     ::= literal | path_expr | struct_literal | paren_expr | array_expr | block
-                   | if_expr | match_expr
-literal          ::= INT | FLOAT | SUFFIXED | STRING | "true" | "false"
+                   | if_expr | match_expr | unsafe_block
+literal          ::= INT | FLOAT | SUFFIXED | STRING | fstring | "true" | "false"
+# `f"Weight: {w:.1} kg"`: the lexer splits it at its holes (L22).
+fstring          ::= FSTRING | FSTRING_HEAD hole (FSTRING_MID hole)* FSTRING_TAIL
+hole             ::= expr
+unsafe_block     ::= "unsafe" block
 path_expr        ::= expr_segment ("::" expr_segment)*
 expr_segment     ::= IDENT ("::" generic_args)? | "Self" | "self"
 paren_expr       ::= "(" (expr ("," expr)* ","?)? ")"
@@ -138,15 +166,16 @@ array_expr       ::= "[" (expr (";" expr | ("," expr)* ","?))? "]"
 struct_literal   ::= path_expr "{" (field_init ("," field_init)* ("," ".." expr)? ","? | ".." expr ","?)? NEWLINE? "}"
 field_init       ::= IDENT (":" expr)?
 
-if_expr          ::= "if" expr_ns block ("else" (if_expr | block))?
-match_expr       ::= "match" expr_ns "{" (arm (arm_sep arm)* arm_sep?)? "}"
-arm              ::= pattern ("|" pattern)* ("if" expr_ns)? "=>" expr
+if_expr          ::= "if" ("let" pattern "=")? expr_ns block ("else" (if_expr | block))?
+match_expr       ::= "match" "mut"? expr_ns "{" (arm (arm_sep arm)* arm_sep?)? "}"
+# An arm's body may be an assignment: `Some(s) => s.count += 1`.
+arm              ::= pattern ("|" pattern)* ("if" expr_ns)? "=>" (expr | postfix_expr assign_op expr)
 arm_sep          ::= "," | NEWLINE
 
 # ---------------------------------------------------------------------------------------------
 # Patterns
 
-pattern          ::= "_" | "-"? (INT | FLOAT) | "true" | "false"
+pattern          ::= "_" | "-"? (INT | FLOAT) | "true" | "false" | STRING
                    | path_expr ("(" (pattern ("," pattern)* ","?)? ")" | pattern_fields)?
                    | "(" (pattern ("," pattern)* ","?)? ")"
 pattern_fields   ::= "{" (field_pattern ("," field_pattern)* ("," "..")? ","? | ".." ","?)? NEWLINE? "}"
@@ -155,7 +184,8 @@ field_pattern    ::= IDENT (":" pattern)?
 # ---------------------------------------------------------------------------------------------
 # The head of an `if`, `while`, `for` or `match` can't hold a struct literal or a closure outside
 # brackets, as in Rust: in `if a == S { }` the `{` starts the block. These rules repeat the chain
-# above without them; inside ( ), [ ] or call arguments the full `expr` is back.
+# above without them; inside ( ), [ ], call arguments or an f-string's holes the full `expr` is
+# back. `mut` isn't a prefix here, so `match mut x` has one reading.
 
 expr_ns          ::= or_expr_ns
 or_expr_ns       ::= and_expr_ns ("||" and_expr_ns)*
@@ -167,7 +197,8 @@ bitand_expr_ns   ::= shift_expr_ns ("&" shift_expr_ns)*
 shift_expr_ns    ::= add_expr_ns (("<<" | ">>") add_expr_ns)*
 add_expr_ns      ::= mul_expr_ns (("+" | "-") mul_expr_ns)*
 mul_expr_ns      ::= unary_expr_ns (("*" | "/" | "%") unary_expr_ns)*
-unary_expr_ns    ::= ("-" | "!" | "take" | "mut") unary_expr_ns | power_expr_ns
+unary_expr_ns    ::= ("-" | "!" | "take") unary_expr_ns | power_expr_ns
 power_expr_ns    ::= postfix_expr_ns ("**" unary_expr_ns)?
 postfix_expr_ns  ::= primary_expr_ns postfixes
 primary_expr_ns  ::= literal | path_expr | paren_expr | array_expr | block | if_expr | match_expr
+                   | unsafe_block

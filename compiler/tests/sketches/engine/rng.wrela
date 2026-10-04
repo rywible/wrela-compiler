@@ -1,0 +1,50 @@
+// Seeds and random streams. A grazer's numbers come from its seed, so a herd's variation costs
+// no bytes; each sim entity has its own stream, so results don't depend on which worker ran it.
+
+use std::hash::StateHash
+use std::serialize::Serialize
+
+/// What an individual is made from: a definition plus this number.
+pub struct Seed: Copy + Eq + StateHash + Serialize {
+    pub value: u32,
+}
+
+pub fn seed(value: u32) -> Seed {
+    Seed { value }
+}
+
+/// mulberry32, as spike 01's `rng` (grazer.js): its draws are f64s in [0, 1), so a creature
+/// built from a seed has the spike's numbers, bit for bit before they're rounded to f32.
+pub struct Rng: Copy + StateHash + Serialize {
+    state: u32,
+}
+
+impl Rng {
+    pub fn new(seed: Seed) -> Rng {
+        Rng { state: seed.value.wrapping_mul(7919).wrapping_add(17) }
+    }
+
+    /// The next draw, in [0, 1).
+    pub fn next(mut self) -> f64 {
+        self.state = self.state.wrapping_add(0x6d2b79f5)
+        var t = self.state
+        t = (t ^ (t >> 15)).wrapping_mul(t | 1)
+        t = t ^ t.wrapping_add((t ^ (t >> 7)).wrapping_mul(t | 61))
+        f64(t ^ (t >> 14)) / 4294967296.0
+    }
+
+    /// A draw in [lo, hi), computed in f64 and rounded once.
+    pub fn range(mut self, lo: f64, hi: f64) -> f32 {
+        f32(lo + (hi - lo) * self.next())
+    }
+
+    /// A draw in [0, 1), as an f32.
+    pub fn unit(mut self) -> f32 {
+        f32(self.next())
+    }
+
+    /// A stream of its own for entity `n`: the same whatever order entities draw in.
+    pub fn split(self, n: u32) -> Rng {
+        Rng { state: self.state ^ n.wrapping_mul(0x9e3779b9) }
+    }
+}

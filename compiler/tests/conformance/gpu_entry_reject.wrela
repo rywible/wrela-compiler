@@ -12,7 +12,7 @@ fn nothing(x: f32) -> f32 { //~ E0602
 }
 
 // A vertex shader passes numbers and vectors on, not matrices, bools, arrays or structs.
-struct Corner: Copy + Clone {
+struct Corner: Copy {
     pos: ClipPosition,
     m: mat2, //~ E0602
     seen: Flat<bool>, //~ E0602

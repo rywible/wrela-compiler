@@ -1,0 +1,15 @@
+// A GPU-only feature in CPU code: `dpdx`, `fwidth`, sampling a texture, an entry point's
+// inputs. They exist where the GPU runs the code.
+// ---- wrong
+pub fn frame(time: f32, width: u32, height: u32) {
+    let rate = dpdx(time)
+}
+// ---- fixed
+use std::gpu::FragCoord
+
+@fragment
+fn edge(pixel: FragCoord) -> vec4 {
+    vec4(fwidth(pixel.position.x))
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

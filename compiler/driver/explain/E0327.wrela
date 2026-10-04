@@ -1,0 +1,14 @@
+// A run type `[T]` where it can't be: a run is a view of elements in place, so it's only a
+// parameter's type (or a projection's). To hold elements, use a `Vec<T>` or an array `[T; N]`.
+// ---- wrong
+struct Holder {
+    xs: [f32],
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+struct Holder {
+    xs: Vec<f32>,
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

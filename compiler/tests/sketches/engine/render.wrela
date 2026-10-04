@@ -1,0 +1,633 @@
+// Drawing creatures (sketch 02): extraction on the GPU, when the engine realizes an individual,
+// then skinning and shading every frame. Engine code, generic over any creature's field: the
+// kernels are monomorphized for its type, and its numbers arrive as uniforms (D-070).
+//
+//   1. cull_blocks: which 4³-cell blocks the surface passes through (the derived interval), and
+//      which parts matter in each (each part's own interval): `Append<LiveBlock>`.
+//   2. place_vertices: a vertex in each cell the surface crosses, from the crossings on the
+//      cell's edges (dual contouring's QEF), with skin weights from the parts' distances.
+//   3. emit_quads: a quad for each crossed edge, joining the four cells around it.
+//   4. skin (@vertex) and shade (@fragment): the mesh moved by the bone palette, shaded by the
+//      field's channels and gradient per pixel, in rest space.
+
+use creature::{Creature, CreatureField, FAR, Nearest4, PartList}
+use look::{CreatureLook, Shading, Skin}
+use std::derive::{Box3, Interval, interval}
+use std::field::{Field, Surface}
+use std::gpu::{
+    Append, AppendBuffer, AtomicMap, AtomicMapBuffer, ClipPosition, Flat, GlobalId, GpuBuffer,
+    LocalId, Oct32, Slots, Unorm8x4, VertexIndex, WorkgroupId, append_buffer, atomic_map_buffer,
+    buffer, dispatch,
+}
+
+/// The most bones a palette holds.
+pub const MAX_BONES: u32 = 32
+
+/// Cells per block edge: a block is a 4×4×4 workgroup in `place_vertices`.
+pub const BLOCK: u32 = 4
+
+/// Which of a creature's parts can matter somewhere: a bit per part, in its fold's order
+/// (engine data, D-080).
+pub struct PartMask: Copy + GpuData + Eq {
+    pub bits: u32,
+}
+
+/// A field made of parts, as the renderer sees it (D-080). The compiler knows nothing of
+/// parts: this is ordinary code over each part's derived interval.
+pub trait Parts: Surface {
+    /// The parts that can change the field anywhere in `b`.
+    fn parts_near(self, b: Box3) -> PartMask
+
+    /// The field's distance from only the parts in `mask`: the whole field's, wherever the
+    /// others can't change it.
+    fn distance_masked(self, p: vec3, mask: PartMask) -> f32
+
+    /// Skin weights at `p`: the bones of the four parts in `mask` nearest it, a byte each, and
+    /// their weights, which fall off over `falloff` from each part's surface (D-023).
+    fn weights_at(self, p: vec3, falloff: f32, mask: PartMask) -> (u32, vec4)
+
+    /// The field with only the parts in `mask`.
+    fn with_parts(self, mask: PartMask) -> Masked<Self> {
+        Masked { field: self, mask }
+    }
+}
+
+/// A field evaluated with only some of its parts.
+pub struct Masked<F>: Copy + GpuData {
+    pub field: F,
+    pub mask: PartMask,
+}
+
+impl<F: Parts + GpuData> Surface for Masked<F> {
+    fn distance(self, p: vec3) -> f32 {
+        self.field.distance_masked(p, self.mask)
+    }
+}
+
+impl<P: PartList> Parts for CreatureField<P> {
+    fn parts_near(self, b: Box3) -> PartMask {
+        // A part changes `smin`'s fold only where it's within `k` of what the fold gives.
+        let whole = interval(|q: vec3| self.distance(q), b)
+        PartMask { bits: self.parts.near_mask(b, whole.hi + max(self.k, 0.0)) }
+    }
+
+    fn distance_masked(self, p: vec3, mask: PartMask) -> f32 {
+        self.parts.fold_masked(p, FAR, self.k, mask.bits)
+    }
+
+    fn weights_at(self, p: vec3, falloff: f32, mask: PartMask) -> (u32, vec4) {
+        let n = self.parts.weigh(p, mask.bits, Nearest4::new())
+        var w = [0.0; 4]
+        var total = 0.0
+        for i in 0..4 {
+            w[i] = if n.d[i] < FAR { clamp(1.0 - n.d[i] / max(falloff, 1.0e-6), 0.0, 1.0) } else {
+                0.0
+            }
+            total += w[i]
+        }
+        let weights = if total > 0.0 { vec4(w[0], w[1], w[2], w[3]) / total } else {
+            vec4(1.0, 0.0, 0.0, 0.0)
+        }
+        let bones = n.bones[0] | (n.bones[1] << 8) | (n.bones[2] << 16) | (n.bones[3] << 24)
+        (bones, weights)
+    }
+}
+
+// ---- GPU data (sketch 02 §2) -------------------------------------------------------------------
+
+/// One vertex of an extracted, skinnable mesh. `GpuData` fixes its layout to WGSL's rules
+/// (D-084), and the compiler does the padding (D-009); lossy encodings are explicit types
+/// (D-049).
+///
+/// Changed: the normal is octahedral (`Oct32`, std's lossy encoding), not a `UnitVec3`; and
+/// the bones and weights are in a buffer of their own (`SkinWeights`), which a pass of its own
+/// writes: computed in `place_vertices`, the parts' distances took a fifth of its code, and
+/// put it over the 256 KiB of WGSL a pipeline may have (AC12).
+pub struct SkinVertex: Copy + GpuData {
+    pub rest_pos: vec3,
+    pub normal: Oct32,
+    /// Which parts matter near this vertex (D-080).
+    pub parts: PartMask,
+}
+
+/// A vertex's four bones, a byte each (there are no `u8`s on the GPU), and their weights in
+/// 8 bits each (the sketch's `[Unorm8; 4]`).
+pub struct SkinWeights: Copy + GpuData {
+    pub bones: u32,
+    pub weights: Unorm8x4,
+}
+
+/// A quad of the mesh: four vertices, around a crossed edge.
+pub struct Quad: Copy + GpuData {
+    pub a: u32,
+    pub b: u32,
+    pub c: u32,
+    pub d: u32,
+}
+
+/// Per-frame data for one creature: bone matrices for its current pose (rest space to world).
+pub struct Palette: Copy + GpuData {
+    pub bones: [mat4; 32],
+}
+
+/// The camera.
+pub struct View: Copy + GpuData {
+    pub view_proj: mat4,
+}
+
+impl View {
+    pub fn project(self, p: vec3) -> vec4 {
+        self.view_proj * vec4(p, 1.0)
+    }
+}
+
+/// A sun and a sky.
+pub struct Lights: Copy + GpuData {
+    pub sun: vec3,
+    pub sun_colour: vec3,
+    pub sky: vec3,
+}
+
+/// What shading reads from a field's channels.
+pub trait Shaded {
+    fn albedo(self) -> vec3
+    fn roughness(self) -> f32
+}
+
+impl Lights {
+    pub fn shade(self, albedo: vec3, roughness: f32, n: vec3) -> vec4 {
+        let l = max(dot(n, -self.sun), 0.0)
+        let h = normalize(-self.sun + vec3(0.0, 0.0, 1.0))
+        let spec = pow(max(dot(n, h), 0.0), mix(64.0, 4.0, roughness)) * (1.0 - roughness) * 0.3
+        let c = albedo * (self.sun_colour * l + self.sky * (0.5 + 0.5 * n.y)) + vec3(spec)
+        vec4(c, 1.0)
+    }
+}
+
+// ---- the grid ------------------------------------------------------------------------------------
+
+/// The extraction grid: cells of `cell` metres from `origin`, in blocks of 4³ cells.
+pub struct Grid: Copy + GpuData {
+    pub origin: vec3,
+    pub cell: f32,
+    pub blocks_x: u32,
+    pub blocks_y: u32,
+    pub blocks_z: u32,
+}
+
+/// A block the surface passes through, and the parts that matter there.
+pub struct LiveBlock: Copy + GpuData {
+    pub block: u32,
+    pub parts: PartMask,
+}
+
+impl Grid {
+    /// A grid of `cell`-sized cells covering `b`.
+    pub fn covering(b: Box3, cell: f32) -> Grid {
+        let span = (b.hi - b.lo) / (cell * f32(BLOCK))
+        Grid {
+            origin: b.lo,
+            cell,
+            blocks_x: u32(ceil(span.x)),
+            blocks_y: u32(ceil(span.y)),
+            blocks_z: u32(ceil(span.z)),
+        }
+    }
+
+    pub fn block_count(self) -> u32 {
+        self.blocks_x * self.blocks_y * self.blocks_z
+    }
+
+    pub fn cell_count(self) -> u32 {
+        self.block_count() * BLOCK * BLOCK * BLOCK
+    }
+
+    /// Cells along each axis.
+    pub fn cells(self) -> vec3 {
+        vec3(f32(self.blocks_x), f32(self.blocks_y), f32(self.blocks_z)) * f32(BLOCK)
+    }
+
+    /// Block `i`'s first cell's coordinates.
+    pub fn block_cell(self, i: u32) -> (u32, u32, u32) {
+        let x = i % self.blocks_x
+        let y = (i / self.blocks_x) % self.blocks_y
+        let z = i / (self.blocks_x * self.blocks_y)
+        (x * BLOCK, y * BLOCK, z * BLOCK)
+    }
+
+    pub fn block_bounds(self, i: u32) -> Box3 {
+        let (x, y, z) = self.block_cell(i)
+        let lo = self.origin + vec3(f32(x), f32(y), f32(z)) * self.cell
+        Box3 { lo, hi: lo + vec3(self.cell * f32(BLOCK)) }
+    }
+
+    /// A cell's corner nearest the origin.
+    pub fn corner(self, x: u32, y: u32, z: u32) -> vec3 {
+        self.origin + vec3(f32(x), f32(y), f32(z)) * self.cell
+    }
+
+    /// A cell's key in the cell map.
+    pub fn key(self, x: u32, y: u32, z: u32) -> u32 {
+        let nx = self.blocks_x * BLOCK
+        let ny = self.blocks_y * BLOCK
+        x + nx * (y + ny * z)
+    }
+}
+
+/// `b` grown by `by` on every side.
+pub fn grow(b: Box3, by: f32) -> Box3 {
+    Box3 { lo: b.lo - by, hi: b.hi + by }
+}
+
+// ---- extraction, pass 1: which blocks matter (sketch 02 §3) -----------------------------------
+
+/// Which blocks does the surface pass through, and which parts matter in each?
+@compute(64)
+pub fn cull_blocks<F: Surface + Parts>(
+    field: F,
+    grid: Grid,
+    live: mut Append<LiveBlock>,
+    id: GlobalId,
+) {
+    if id.x >= grid.block_count() {
+        return
+    }
+    let bounds = grid.block_bounds(id.x)
+    let d = field.interval(bounds) // conservative range of distances in this block
+    if !d.contains(0.0) {
+        return // no surface here; never evaluated again
+    }
+    // Parts that can matter here, plus a cell's margin: a triangle can straddle two blocks.
+    let _ = live.push(LiveBlock { block: id.x, parts: field.parts_near(grow(bounds, grid.cell)) })
+}
+
+// ---- extraction, pass 2: placing vertices (sketch 02 §4) --------------------------------------
+
+/// A cube's corners, by bit: x is bit 0, y bit 1, z bit 2.
+fn corner_offset(i: u32) -> vec3 {
+    vec3(f32(i & 1), f32((i >> 1) & 1), f32((i >> 2) & 1))
+}
+
+/// A cube's twelve edges, as pairs of corners.
+const EDGES: [u32; 24] = [0, 1, 2, 3, 4, 5, 6, 7, 0, 2, 1, 3, 4, 6, 5, 7, 0, 4, 1, 5, 2, 6, 3, 7]
+
+/// Where `f` crosses zero between `a` (value `da`) and `b` (value `db`), whose signs differ:
+/// regula falsi, `iters` steps.
+pub fn root<F: Surface>(f: F, a: vec3, b: vec3, da: f32, db: f32, iters: u32) -> vec3 {
+    var pa = a
+    var pb = b
+    var fa = da
+    var fb = db
+    var p = a
+    for _ in 0..iters {
+        let t = clamp(fa / (fa - fb), 0.0, 1.0)
+        p = mix(pa, pb, vec3(t))
+        let fp = f.distance(p)
+        if (fp < 0.0) == (fa < 0.0) {
+            pa = p
+            fa = fp
+        } else {
+            pb = p
+            fb = fp
+        }
+    }
+    p
+}
+
+/// A quadratic error function: the point nearest the planes through each crossing with its
+/// normal (dual contouring), pulled towards the crossings' mean where the planes don't decide.
+pub struct Qef: Copy {
+    ata: mat3,
+    atb: vec3,
+    sum: vec3,
+    count: f32,
+}
+
+impl Qef {
+    pub fn new() -> Qef {
+        Qef {
+            ata: mat3(vec3(0.0), vec3(0.0), vec3(0.0)),
+            atb: vec3(0.0),
+            sum: vec3(0.0),
+            count: 0.0,
+        }
+    }
+
+    pub fn add(mut self, p: vec3, n: vec3) {
+        self.ata = mat3(self.ata[0] + n * n.x, self.ata[1] + n * n.y, self.ata[2] + n * n.z)
+        self.atb += n * dot(n, p)
+        self.sum += p
+        self.count += 1.0
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.count == 0.0
+    }
+
+    /// The point, within `lo`..`hi`.
+    pub fn solve(self, lo: vec3, hi: vec3) -> vec3 {
+        let mean = self.sum / max(self.count, 1.0)
+        // (AᵀA + λI) x = Aᵀb + λ mean, by Cramer's rule.
+        let l = 0.05
+        let m = mat3(
+            self.ata[0] + vec3(l, 0.0, 0.0),
+            self.ata[1] + vec3(0.0, l, 0.0),
+            self.ata[2] + vec3(0.0, 0.0, l),
+        )
+        let r = self.atb + l * mean
+        let det = dot(m[0], cross(m[1], m[2]))
+        if abs(det) < 1.0e-12 {
+            return mean
+        }
+        let x = vec3(
+            dot(r, cross(m[1], m[2])),
+            dot(m[0], cross(r, m[2])),
+            dot(m[0], cross(m[1], r)),
+        ) /
+            det
+        clamp(x, lo, hi)
+    }
+}
+
+impl Skin {
+    /// Skin weights at `pos`, from each part's own distance (D-023).
+    pub fn weights_at<F: Parts>(self, field: F, pos: vec3, parts: PartMask) -> (u32, vec4) {
+        field.weights_at(pos, self.weights.falloff, parts)
+    }
+}
+
+/// In each live block, gives every cell the surface crosses one vertex: the point that best fits
+/// the surface's crossings on the cell's edges.
+@compute(4, 4, 4)
+pub fn place_vertices<F: Surface + Parts>(
+    field: F,
+    skin: Skin,
+    grid: Grid,
+    blocks: [LiveBlock],
+    verts: mut Append<SkinVertex>,
+    cell_map: mut AtomicMap,
+    block_id: WorkgroupId,
+    cell_id: LocalId,
+) {
+    let block = blocks[block_id.x]
+    let (bx, by, bz) = grid.block_cell(block.block)
+    let (x, y, z) = (bx + cell_id.x, by + cell_id.y, bz + cell_id.z)
+    let lo = grid.corner(x, y, z)
+    let f = field.with_parts(block.parts) // evaluate only the parts that matter here
+    var d = [0.0; 8]
+    for i in 0..8 {
+        d[i] = f.distance(lo + corner_offset(i) * grid.cell)
+    }
+    var qef = Qef::new()
+    var normal = vec3(0.0)
+    for e in 0..12 {
+        let (a, b) = (EDGES[2 * e], EDGES[2 * e + 1])
+        if (d[a] < 0.0) == (d[b] < 0.0) {
+            continue
+        }
+        let pa = lo + corner_offset(a) * grid.cell
+        let pb = lo + corner_offset(b) * grid.cell
+        let p = root(f, pa, pb, d[a], d[b], 4) // where the surface crosses this edge
+        let n = normalize(f.gradient(p)) // gradient: compiler-derived (D-012)
+        qef.add(p, n)
+        normal += n
+    }
+    if qef.is_empty() {
+        return
+    }
+    let pos = qef.solve(lo, lo + vec3(grid.cell))
+    // Changed: the vertex's normal is its crossings' mean, not the gradient at the vertex
+    // again: a second derived gradient doubled the kernel's code (358 KB of WGSL).
+    let i = verts.push(
+        SkinVertex { rest_pos: pos, normal: Oct32::encode(normalize(normal)), parts: block.parts },
+    )
+    let _ = cell_map.insert(grid.key(x, y, z), i)
+}
+
+// ---- extraction, pass 3: quads ---------------------------------------------------------------------
+
+/// For each crossed edge from a cell's lowest corner along +x, +y and +z, a quad joining the
+/// four cells around the edge.
+@compute(4, 4, 4)
+pub fn emit_quads<F: Surface + Parts>(
+    field: F,
+    grid: Grid,
+    blocks: [LiveBlock],
+    cell_map: mut AtomicMap,
+    quads: mut Append<Quad>,
+    block_id: WorkgroupId,
+    cell_id: LocalId,
+) {
+    let block = blocks[block_id.x]
+    let (bx, by, bz) = grid.block_cell(block.block)
+    let (x, y, z) = (bx + cell_id.x, by + cell_id.y, bz + cell_id.z)
+    let f = field.with_parts(block.parts)
+    let lo = grid.corner(x, y, z)
+    let d0 = f.distance(lo)
+    for axis in 0..3 {
+        let c = grid.cell
+        let step = if axis == 0 { vec3(c, 0.0, 0.0) } else if axis == 1 { vec3(0.0, c, 0.0) } else {
+            vec3(0.0, 0.0, c)
+        }
+        let d1 = f.distance(lo + step)
+        if (d0 < 0.0) == (d1 < 0.0) {
+            continue
+        }
+        // The other two axes, u then w; the four cells share the edge.
+        let (du, dw) = if axis == 0 { ((0, 1, 0), (0, 0, 1)) } else if axis == 1 {
+            ((0, 0, 1), (1, 0, 0))
+        } else { ((1, 0, 0), (0, 1, 0)) }
+        if (x < du.0 + dw.0) || (y < du.1 + dw.1) || (z < du.2 + dw.2) {
+            continue
+        }
+        let Some(a) = cell_map.get(grid.key(x, y, z)) else { continue }
+        let Some(b) = cell_map.get(grid.key(x - du.0, y - du.1, z - du.2)) else { continue }
+        let Some(c) = cell_map.get(
+            grid.key(x - du.0 - dw.0, y - du.1 - dw.1, z - du.2 - dw.2),
+        ) else { continue }
+        let Some(e) = cell_map.get(grid.key(x - dw.0, y - dw.1, z - dw.2)) else { continue }
+        // Facing outwards: from inside to outside along the edge.
+        let _ = quads.push(if d0 < 0.0 { Quad { a, b, c, d: e } } else {
+            Quad { a, b: e, c, d: b }
+        })
+    }
+}
+
+/// Each vertex's skin weights, from the parts near it (D-023).
+@compute(64)
+pub fn weigh_vertices<F: Surface + Parts>(
+    field: F,
+    skin: Skin,
+    count: [u32],
+    verts: [SkinVertex],
+    weights: mut Slots<SkinWeights>,
+    id: GlobalId,
+) {
+    if id.x >= min(count[0], verts.len()) {
+        return
+    }
+    let v = verts[id.x]
+    let (bones, w) = skin.weights_at(field, v.rest_pos, v.parts)
+    weights[id] = SkinWeights { bones, weights: Unorm8x4::encode(w) }
+}
+
+/// A dispatch's group counts for one invocation per pushed item, 64 a group.
+@compute(64)
+pub fn groups_for(count: [u32], capacity: u32, args: mut Slots<u32>, id: GlobalId) {
+    if id.x < 3 {
+        args[id] = if id.x == 0 { (min(count[0], capacity) + 63) / 64 } else { 1 }
+    }
+}
+
+/// A draw's counts for `quads` quads: 6 vertices each, 1 instance, from vertex and instance 0.
+@compute(64)
+pub fn quad_draw_args(count: [u32], capacity: u32, args: mut Slots<u32>, id: GlobalId) {
+    if id.x < 4 {
+        args[id] = if id.x == 0 { 6 * min(count[0], capacity) } else if id.x == 1 { 1 } else { 0 }
+    }
+}
+
+// ---- realization, end to end (sketch 02 §6) ------------------------------------------------------
+
+/// A creature's mesh on the GPU, and the counts to draw it with.
+pub struct SkinnedMesh {
+    pub verts: AppendBuffer<SkinVertex>,
+    pub weights: GpuBuffer<SkinWeights>,
+    pub quads: AppendBuffer<Quad>,
+    pub draw: GpuBuffer<u32>,
+}
+
+/// Turns one creature into a skinned mesh on the GPU. Ordinary engine code: the engine decides
+/// when to call it (at spawn) and caches the result; the counts stay on the GPU.
+///
+/// Changed: no `gpu: mut Gpu` parameter, since std's `dispatch` records into the frame's
+/// commands; the cell size comes from the look's tolerance alone (a bend radius of 5 cm), as
+/// no curvature bound is derived.
+pub fn realize_mesh<C, K: Creature<C>>(creature: K, look: CreatureLook) -> SkinnedMesh {
+    let field = creature.field()
+    let grid = Grid::covering(
+        grow(creature.bounds(), look.surface.tolerance),
+        look.surface.cell_size(0.05),
+    )
+    var live = append_buffer::<LiveBlock>(grid.block_count())
+    var verts = append_buffer::<SkinVertex>(grid.cell_count() / 8)
+    var cells = atomic_map_buffer(grid.cell_count() / 4)
+    var quads = append_buffer::<Quad>(grid.cell_count() / 4)
+    var weights: GpuBuffer<SkinWeights> = buffer(verts.capacity())
+    var groups: GpuBuffer<u32> = buffer(3)
+    var draw: GpuBuffer<u32> = buffer(4)
+    dispatch(
+        cull_blocks.bind(field: field, grid: grid, live: mut live),
+        groups: (grid.block_count() + 63) / 64,
+    )
+    dispatch(
+        place_vertices.bind(
+            field: field,
+            skin: look.deform,
+            grid: grid,
+            blocks: live.items(),
+            verts: mut verts,
+            cell_map: mut cells,
+        ),
+        groups: live.count(),
+    )
+    dispatch(
+        emit_quads.bind(
+            field: field,
+            grid: grid,
+            blocks: live.items(),
+            cell_map: mut cells,
+            quads: mut quads,
+        ),
+        groups: live.count(),
+    )
+    dispatch(
+        groups_for.bind(count: verts.count(), capacity: verts.capacity(), args: mut groups),
+        groups: 1,
+    )
+    dispatch(
+        weigh_vertices.bind(
+            field: field,
+            skin: look.deform,
+            count: verts.count(),
+            verts: verts.items(),
+            weights: mut weights,
+        ),
+        groups: groups.span(start: 0, count: 3),
+    )
+    dispatch(
+        quad_draw_args.bind(count: quads.count(), capacity: quads.capacity(), args: mut draw),
+        groups: 1,
+    )
+    SkinnedMesh { verts: take verts, weights: take weights, quads: take quads, draw: take draw }
+}
+
+// ---- drawing: skin and shade (sketch 02 §7) --------------------------------------------------------
+
+/// What the vertex shader passes on. The rotation travels as its quaternion's components
+/// (varyings are numbers and vectors).
+pub struct Skinned: Copy {
+    pub clip: ClipPosition,
+    pub rest_pos: vec3,
+    pub rot: vec4,
+    pub normal: vec3,
+    pub parts: Flat<u32>,
+}
+
+/// Which corner of its quad each of a quad's six vertices is.
+const CORNERS: [u32; 6] = [0, 1, 2, 0, 2, 3]
+
+@vertex
+pub fn skin(
+    v: VertexIndex,
+    verts: [SkinVertex],
+    weights: [SkinWeights],
+    quads: [Quad],
+    palette: Palette,
+    view: View,
+) -> Skinned {
+    let q = quads[v.index / 6]
+    let k = CORNERS[v.index % 6]
+    let i = if k == 0 { q.a } else if k == 1 { q.b } else if k == 2 { q.c } else { q.d }
+    let sv = verts[i]
+    let sw = weights[i]
+    let w = sw.weights.decode()
+    var pos = vec3(0.0)
+    var n = vec3(0.0)
+    var col = [vec3(0.0); 3]
+    for j in 0..4 {
+        let m = palette.bones[(sw.bones >> (8 * j)) & 255]
+        let wj = if j == 0 { w.x } else if j == 1 { w.y } else if j == 2 { w.z } else { w.w }
+        pos += wj * (m * vec4(sv.rest_pos, 1.0)).xyz
+        n += wj * (m * vec4(sv.normal.decode(), 0.0)).xyz
+        for c in 0..3 {
+            col[c] += wj * m[c].xyz
+        }
+    }
+    Skinned {
+        clip: ClipPosition { position: view.project(pos) },
+        rest_pos: sv.rest_pos,
+        rot: Quat::from_mat3(mat3(col[0], col[1], col[2])).v,
+        normal: normalize(n),
+        parts: Flat { value: sv.parts.bits },
+    }
+}
+
+@fragment
+pub fn shade<C: Shaded, F: Field<C> + Parts>(
+    field: F,
+    shading: Shading,
+    s: Skinned,
+    lights: Lights,
+) -> vec4 {
+    let f = field.with_parts(PartMask { bits: s.parts.value }) // 2–3 parts per pixel, not 20
+    // Changed: the channels are the whole field's, blended by every part (a masked field's
+    // channels would need each part's, which `Field<C>` doesn't give a mask), and they take no
+    // pixel footprint: std's noise filters for a footprint (`Noise::filtered`), its fields don't.
+    let t = field.channels(s.rest_pos)
+    let n = match shading { // a uniform branch
+        Shading::PerPixel => Quat { v: s.rot }.rotate(normalize(f.gradient(s.rest_pos))), // wrinkles finer than the mesh
+        Shading::PerVertex => s.normal,
+    }
+    lights.shade(t.albedo(), t.roughness(), n)
+}

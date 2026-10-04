@@ -1,0 +1,40 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0603",
+      "file": "main.wrela",
+      "fixes": [
+        {
+          "edits": [
+            {
+              "end": 415,
+              "file": "main.wrela",
+              "replacement": "fill.bind(value: time, out: mut out), groups: 1",
+              "start": 373
+            }
+          ],
+          "message": "bind the arguments"
+        }
+      ],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "`dispatch` takes its entry points bound to their arguments: `dispatch(kernel.bind(...), groups: n)`",
+      "notes": [
+        "a kernel's arguments go in its `.bind(...)`, matched as a call's are (§12)"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 5,
+        "end": 416,
+        "end_column": 57,
+        "end_line": 13,
+        "line": 13,
+        "start": 364
+      },
+      "title": "a dispatch or draw whose entry points, binding or counts are wrong"
+    }
+  ],
+  "version": 2
+}

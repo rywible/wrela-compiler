@@ -1,0 +1,11 @@
+// mistake: a `Vec` built in a kernel, which can't allocate
+// expect: E0600
+// fix: no
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch}
+
+@compute(64)
+fn collect(out: mut Slots<u32>, id: GlobalId) {
+    var xs: Vec<u32> = Vec::new()
+    xs.push(id.x)
+    out[id] = xs.len()
+}

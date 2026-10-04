@@ -1,0 +1,16 @@
+// mistake: a `borrow` binding that picks one of two places with `if`
+// expect: E0502
+// fix: no
+struct Log: Clone {
+    lines: Vec<Text>,
+}
+
+struct World {
+    day: Log,
+    night: Log,
+}
+
+fn count(w: World, dark: bool) -> u32 {
+    borrow log = if dark { w.night } else { w.day }
+    log.lines.len()
+}

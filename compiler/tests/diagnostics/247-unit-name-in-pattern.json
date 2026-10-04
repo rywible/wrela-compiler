@@ -1,0 +1,43 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0309",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [
+        "give the binding another name than `s`"
+      ],
+      "internal": false,
+      "label": null,
+      "labels": [
+        {
+          "file": "main.wrela",
+          "message": "`s` is a constant in scope, so this compares with it",
+          "span": {
+            "column": 13,
+            "end": 156,
+            "end_column": 14,
+            "end_line": 7,
+            "line": 7,
+            "start": 155
+          }
+        }
+      ],
+      "message": "this pattern might not match, so `let` can't use it",
+      "notes": [
+        "a name in a pattern that a constant or a unit variant has (here `s`) matches that value rather than binding a new name"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 9,
+        "end": 157,
+        "end_column": 15,
+        "end_line": 7,
+        "line": 7,
+        "start": 151
+      },
+      "title": "a non-exhaustive match"
+    }
+  ],
+  "version": 2
+}

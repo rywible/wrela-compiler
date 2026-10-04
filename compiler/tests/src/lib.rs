@@ -75,17 +75,7 @@ pub fn apply_fixes(text: &str, file: FileId, diags: &[Diagnostic]) -> String {
         .collect();
     edits.sort_by_key(|e| (e.span.start, e.span.end));
     edits.dedup_by(|a, b| a.span == b.span && a.replacement == b.replacement);
-    let mut out = String::with_capacity(text.len());
-    let mut pos = 0usize;
-    for e in edits {
-        let (s, t) = (e.span.start as usize, e.span.end as usize);
-        assert!(s >= pos, "fixes overlap at {s}..{t}: they can't both be made");
-        out.push_str(&text[pos..s]);
-        out.push_str(&e.replacement);
-        pos = t;
-    }
-    out.push_str(&text[pos..]);
-    out
+    wrela_diag::apply_edits(text, edits)
 }
 
 /// A loaded program whose exports a test calls: a [`CpuHost`] or a [`Host`].
@@ -280,5 +270,152 @@ impl RawGpu {
             outs.push(map_read(device, rb).map_err(|e| e.to_string())?);
         }
         Ok((times, outs))
+    }
+}
+
+/// Builds the package at `pkg` (a path from the repo root) into `target/tmp/<name>`, where
+/// tools/headless.py can serve it as a page, with an empty `results/`. Returns the directory
+/// and its path from the repo root.
+pub fn page(pkg: &str, name: &str) -> (PathBuf, String) {
+    let rel = format!("target/tmp/{name}");
+    let dir = repo_root().join(&rel);
+    let _ = std::fs::remove_dir_all(&dir);
+    must_build(&repo_root().join(pkg), &dir);
+    std::fs::create_dir_all(dir.join("results")).expect("results dir");
+    (dir, rel)
+}
+
+/// [`page`] with a debug build (language.md §11's checks).
+pub fn debug_page(pkg: &str, name: &str) -> (PathBuf, String) {
+    page_built_by(pkg, name, wrela_driver::build_debug)
+}
+
+/// [`page`] with a build whose WASM uses no SIMD (language.md §11).
+pub fn scalar_page(pkg: &str, name: &str) -> (PathBuf, String) {
+    page_built_by(pkg, name, wrela_driver::build_without_simd)
+}
+
+fn page_built_by(
+    pkg: &str,
+    name: &str,
+    build: fn(&Path) -> wrela_driver::Output,
+) -> (PathBuf, String) {
+    let rel = format!("target/tmp/{name}");
+    let dir = repo_root().join(&rel);
+    let _ = std::fs::remove_dir_all(&dir);
+    let built = build(&repo_root().join(pkg));
+    if built.has_errors() {
+        panic!(
+            "{pkg} doesn't build:\n{}",
+            wrela_diag::render::render_all(&built.sources, &built.diagnostics)
+        );
+    }
+    built.write_to(&dir).expect("write the build");
+    std::fs::create_dir_all(dir.join("results")).expect("results dir");
+    (dir, rel)
+}
+
+/// A test-mode run in headless Chrome that must fail: the message the page failed with.
+pub fn chrome_failure(rel: &str, run: ChromeRun) -> String {
+    let ChromeRun { frames, width, height, fps, workers, .. } = run;
+    let fragment =
+        format!("#test&frames={frames}&width={width}&height={height}&fps={fps}&workers={workers}");
+    let status = std::process::Command::new("python3")
+        .arg(repo_root().join("tools/headless.py"))
+        .args([rel, fragment.as_str(), "300"])
+        .current_dir(repo_root())
+        .status()
+        .expect("python3 runs tools/headless.py");
+    assert!(!status.success(), "the browser run passed; it should have failed");
+    let done = repo_root().join(rel).join("results/DONE");
+    std::fs::read_to_string(done).expect("results/DONE")
+}
+
+/// What a page's test-mode run in headless Chrome gave: its state hash, and its last frame
+/// (RGBA8, rows top to bottom).
+pub struct BrowserRun {
+    pub hash: String,
+    pub frame: Vec<u8>,
+    /// How many chunks of parallel jobs the workers ran.
+    pub worker_chunks: u32,
+    /// The voice's samples, when [`ChromeRun::audio`] asked for them.
+    pub audio: Vec<f32>,
+    /// Each pass's GPU time, when [`ChromeRun::timestamps`] asked for them: its frame, its
+    /// label (as the native host's `GpuTiming`) and nanoseconds.
+    pub timings: Vec<(usize, String, f64)>,
+}
+
+/// How [`run_in_chrome_with`] runs a page: test mode's parameters (runtime/browser's
+/// testmode.ts).
+#[derive(Clone, Copy, Debug)]
+pub struct ChromeRun {
+    pub frames: u32,
+    pub width: u32,
+    pub height: u32,
+    pub fps: f64,
+    /// Threads for parallel jobs, the program's own included.
+    pub workers: u32,
+    /// Quanta of the program's voice to render offline (0: none).
+    pub audio: u32,
+    /// Time each pass on the GPU.
+    pub timestamps: bool,
+}
+
+impl ChromeRun {
+    pub fn new(frames: u32, width: u32, height: u32, fps: f64) -> ChromeRun {
+        ChromeRun { frames, width, height, fps, workers: 1, audio: 0, timestamps: false }
+    }
+}
+
+/// Runs the page at `rel` (from [`page`]) in headless Chrome's test mode for `frames` frames at
+/// `fps`, `width` × `height`. Panics, pointing at the console log, if the run fails.
+pub fn run_in_chrome(rel: &str, frames: u32, width: u32, height: u32, fps: f64) -> BrowserRun {
+    run_in_chrome_with(rel, ChromeRun::new(frames, width, height, fps))
+}
+
+/// [`run_in_chrome`], with all of test mode's parameters.
+pub fn run_in_chrome_with(rel: &str, run: ChromeRun) -> BrowserRun {
+    let ChromeRun { frames, width, height, fps, workers, audio, timestamps } = run;
+    let fragment = format!(
+        "#test&frames={frames}&width={width}&height={height}&fps={fps}&workers={workers}{}{}",
+        if audio > 0 { format!("&audio={audio}") } else { String::new() },
+        if timestamps { "&timestamps=1" } else { "" },
+    );
+    let status = std::process::Command::new("python3")
+        .arg(repo_root().join("tools/headless.py"))
+        .args([rel, fragment.as_str(), "300"])
+        .current_dir(repo_root())
+        .status()
+        .expect("python3 runs tools/headless.py");
+    assert!(status.success(), "the browser run failed; see {rel}/results/console.log");
+    let results = repo_root().join(rel).join("results");
+    BrowserRun {
+        hash: std::fs::read_to_string(results.join("hash.txt")).expect("hash.txt").trim().into(),
+        frame: std::fs::read(results.join("frame.rgba")).expect("frame.rgba"),
+        worker_chunks: std::fs::read_to_string(results.join("workers.txt"))
+            .expect("workers.txt")
+            .trim()
+            .parse()
+            .expect("a count"),
+        audio: if audio > 0 {
+            let bytes = std::fs::read(results.join("audio.f32")).expect("audio.f32");
+            bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect()
+        } else {
+            Vec::new()
+        },
+        timings: if timestamps {
+            let text = std::fs::read_to_string(results.join("timings.json")).expect("timings.json");
+            let v: serde_json::Value = serde_json::from_str(&text).expect("timings.json is JSON");
+            let entries = v.as_array().expect("an array").iter();
+            entries
+                .map(|t| {
+                    let frame = t["frame"].as_u64().expect("a frame") as usize;
+                    let label = t["label"].as_str().expect("a label").to_string();
+                    (frame, label, t["nanos"].as_f64().expect("nanoseconds"))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        },
     }
 }

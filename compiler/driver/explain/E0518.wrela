@@ -1,0 +1,33 @@
+// `let x = place` of a value that isn't `Copy`. A `let` owns its value, so it would move out of
+// the place. To read it in place, write `borrow x = place`; to copy it, `.clone()`; to move it,
+// `take place`.
+// ---- wrong
+struct Log: Clone {
+    lines: Vec<Text>,
+}
+
+struct World {
+    log: Log,
+}
+
+fn lines(w: World) -> u32 {
+    let log = w.log
+    log.lines.len()
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+struct Log: Clone {
+    lines: Vec<Text>,
+}
+
+struct World {
+    log: Log,
+}
+
+fn lines(w: World) -> u32 {
+    borrow log = w.log
+    log.lines.len()
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

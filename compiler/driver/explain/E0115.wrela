@@ -1,0 +1,21 @@
+// A macro call, `name!(...)`, as in Rust. wrela has no macros: `format!` is an f-string,
+// `println!` is `std::io::print` of one (a line on the host's console), `panic!` and `assert!`
+// are the functions `panic` and `assert`, and `vec![...]` is `Vec::from([...])`.
+// ---- wrong
+fn label(score: u32, name: Text) -> String {
+    format!("{} scored {}", name, score)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    println!("frame {}", time)
+}
+// ---- fixed
+use std::io::print
+
+fn label(score: u32, name: Text) -> String {
+    f"{name} scored {score}"
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    print(f"frame {time}")
+}

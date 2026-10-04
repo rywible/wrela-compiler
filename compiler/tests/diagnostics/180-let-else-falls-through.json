@@ -1,0 +1,42 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0330",
+      "file": "main.wrela",
+      "fixes": [
+        {
+          "edits": [
+            {
+              "end": 187,
+              "file": "main.wrela",
+              "replacement": "return ",
+              "start": 187
+            }
+          ],
+          "message": "return it"
+        }
+      ],
+      "help": [
+        "end it with `return`, `break`, `continue` or a panic"
+      ],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "the `else` of a `let … else` must leave the scope",
+      "notes": [
+        "it runs when the pattern doesn't match, so the names it binds have no value after it"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 33,
+        "end": 194,
+        "end_column": 6,
+        "end_line": 7,
+        "line": 5,
+        "start": 177
+      },
+      "title": "a `let … else` whose `else` doesn't leave the scope"
+    }
+  ],
+  "version": 2
+}

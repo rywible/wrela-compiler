@@ -1,9 +1,21 @@
 // rejects: mem.closures
+// A closure captures another closure as its value, copies of its captures: one that captures
+// a projection has none. A function-typed parameter is its caller's, so it isn't captured.
 fn apply(f: fn(f32) -> f32, x: f32) -> f32 {
     f(x)
 }
 
-pub fn twice_plus_one(x: f32) -> f32 {
-    let double = |y: f32| 2.0 * y //~ E0702
-    apply(|z| double(z) + 1.0, x)
+fn twice_first(xs: [f32]) -> f32 {
+    let at = |i: u32| xs[i] //~ E0702
+    let twice = |i: u32| at(i) * 2.0
+    twice(0)
+}
+
+fn plus_one(f: fn(f32) -> f32, x: f32) -> f32 { //~ E0702
+    apply(|y| f(y) + 1.0, x)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    let _a = twice_first([1.0, 2.0])
+    let _b = plus_one(|y| y * 3.0, time)
 }

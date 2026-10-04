@@ -1,0 +1,18 @@
+// rejects: mem.arenas
+struct Lever: Clone {
+    pulled: bool,
+}
+
+struct Gate: Clone {
+    open: bool,
+}
+
+fn wrong_handle(levers: mut Arena<Lever>, g: Handle<Gate>) {
+    levers[g].pulled = true //~ E0312
+}
+
+fn overlap(levers: mut Arena<Lever>, l: Handle<Lever>) {
+    mut a = levers[l]
+    levers[l].pulled = false //~ E0506
+    a.pulled = true
+}

@@ -3,7 +3,7 @@
 // fix: no
 use std::field::Surface
 
-struct Rock: Copy + Clone + GpuData {
+struct Rock: Copy + GpuData {
     size: f32,
 }
 

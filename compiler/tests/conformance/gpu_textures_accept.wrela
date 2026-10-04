@@ -1,0 +1,51 @@
+// accepts: gpu.textures
+// Textures and samplers: made and written on the CPU, sampled in fragment shaders, read at a
+// level or by texel anywhere on the GPU, drawn into in passes.
+use std::gpu::{
+    ClipPosition, ComparisonSampler, DepthTexture, FragCoord, GlobalId, Sampler, Slots, Texture,
+    VertexIndex, begin_depth_pass, begin_pass, begin_screen_pass, buffer, comparison_sampler,
+    depth_texture, dispatch, draw, present, sampler, texture,
+}
+
+@vertex
+fn cover(v: VertexIndex, heights: Texture, s: Sampler) -> ClipPosition {
+    let h = heights.sample_level(s, vec2(0.5, 0.5)).x
+    ClipPosition { position: vec4(f32(v.index % 2) * 4.0 - 1.0, f32(v.index / 2) * 4.0 - 1.0, h, 1.0) }
+}
+
+@fragment
+fn paint(pixel: FragCoord, image: Texture, s: Sampler, shadow: DepthTexture, cmp: ComparisonSampler) -> vec4 {
+    let uv = pixel.position.xy / vec2(f32(image.width()), f32(image.height()))
+    image.sample(s, uv) * shadow.sample_compare(cmp, uv, 0.5)
+}
+
+@compute(64)
+fn texels(image: Texture, out: mut Slots<vec4>, id: GlobalId) {
+    out[id] = image.load(id.x % image.width(), 0)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    var image = texture(width: 4, height: 4)
+    image.write(x: 0, y: 0, width: 1, height: 1, bytes: [255, 0, 0, 255])
+    var shadow = depth_texture(width: 16, height: 16)
+    let s = sampler()
+    let cmp = comparison_sampler()
+    let pass = begin_depth_pass(mut shadow)
+    draw(cover.bind(heights: image, s: s), paint_depth, vertices: 3)
+    pass.end()
+    var target = texture(width: 16, height: 16)
+    let p = begin_pass(mut target)
+    draw(cover.bind(heights: image, s: s), paint.bind(s: s, image: image, shadow: shadow, cmp: cmp), vertices: 3)
+    p.end()
+    begin_screen_pass(clear: vec4(0.0))
+    draw(cover.bind(heights: target, s: s), paint.bind(s: s, image: target, shadow: shadow, cmp: cmp), vertices: 3)
+    present()
+    var out = buffer(64)
+    dispatch(texels.bind(image: image, out: mut out), groups: 1)
+    let _n = image.width() + shadow.height()
+}
+
+@fragment
+fn paint_depth(pixel: FragCoord) -> vec4 {
+    vec4(0.0)
+}

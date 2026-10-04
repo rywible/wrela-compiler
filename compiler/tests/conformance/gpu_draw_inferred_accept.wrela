@@ -3,7 +3,7 @@
 // shader's input whatever it turns out to be.
 use std::gpu::{ClipPosition, FragCoord, VertexIndex, begin_screen_pass, draw, present}
 
-struct Out<T>: Copy + Clone {
+struct Out<T>: Copy {
     pos: ClipPosition,
     tint: T,
 }
@@ -20,6 +20,6 @@ fn paint<T: GpuData + Copy>(pixel: FragCoord, o: Out<T>) -> vec4 {
 
 pub fn frame(time: f32, width: u32, height: u32) {
     begin_screen_pass(clear: vec4(0.0, 0.0, 0.0, 1.0))
-    draw(place, paint, vertices: 3, tint: 1.0)
+    draw(place.bind(tint: 1.0), paint, vertices: 3)
     present()
 }

@@ -138,13 +138,13 @@ pub fn option_join() -> bool {
     r.lo <= 0.0 && r.hi >= 1.0 && r.hi < 1.01
 }
 
-enum Shape: Copy + Clone {
+enum Shape: Copy {
     Ball { r: f32 },
     Gap,
     Slab { h: f32 },
 }
 
-struct Held: Copy + Clone {
+struct Held: Copy {
     s: Shape,
     k: f32,
 }
@@ -177,11 +177,14 @@ pub fn enum_join() -> bool {
 
 /// `Gap` where x > 0, else a ball of radius x.
 pub fn enum_select() -> bool {
-    let r = interval(|x: f32| match select(Shape::Ball { r: x }, Shape::Gap, x > 0.0) {
-        Shape::Ball { r } => r,
-        Shape::Gap => -5.0,
-        Shape::Slab { h } => h,
-    }, Interval { lo: -1.0, hi: 1.0 })
+    let r = interval(
+        |x: f32| match select(if_false: Shape::Ball { r: x }, if_true: Shape::Gap, cond: x > 0.0) {
+            Shape::Ball { r } => r,
+            Shape::Gap => -5.0,
+            Shape::Slab { h } => h,
+        },
+        Interval { lo: -1.0, hi: 1.0 },
+    )
     r.lo <= -5.0 && r.hi >= 0.0
 }
 

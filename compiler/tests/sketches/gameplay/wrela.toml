@@ -1,0 +1,8 @@
+# The gameplay paper test's four systems (#41, paper test 2 of 2): an inventory, a dialogue tree,
+# a menu and HUD, and timers with events, in the language as built
+# (compiler/tests/tests/suite/sketches.rs).
+[package]
+name = "gameplay"
+
+[dependencies]
+engine = { path = "../engine" }

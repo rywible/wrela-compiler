@@ -1,7 +1,7 @@
 use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch, write}
 
 /// The uniform block: one factor for the whole dispatch.
-struct Params: Copy + Clone + GpuData {
+struct Params: Copy + GpuData {
     factor: f32,
 }
 

@@ -1,0 +1,722 @@
+// Creatures (sketch 01 §3): a skeleton, and parts, which are fields in their bones' spaces,
+// smooth-unioned across the joints. A creature's structure is its type, so every individual of
+// a kind has one type and shares one set of pipelines; its numbers are data (D-070).
+//
+// Bones have positions, not rotations, at rest: a part is placed by its bone's rest position,
+// and skinning (sketch 02) moves it with the bone's pose.
+
+use physique
+use physique::{Capsule, Mass, Per}
+use render::Parts
+use std::derive::{Box3, interval}
+use std::field::{Blend, Field, Lipschitz, Surface, smin, smin_weight}
+use std::hash::StateHash
+use std::serialize::Serialize
+
+/// A bone of a skeleton: its index there.
+pub struct Bone: Copy + Eq + StateHash + Serialize + GpuData {
+    pub index: u32,
+}
+
+/// A chain of evenly spaced bones, such as a neck or a tail.
+pub struct Chain: Copy + Eq + StateHash + Serialize {
+    first: u32,
+    joints: u32,
+    step: vec3,
+}
+
+impl Chain {
+    /// The bone at its base.
+    pub fn first(self) -> Bone {
+        Bone { index: self.first }
+    }
+
+    /// The bone at its tip.
+    pub fn last(self) -> Bone {
+        Bone { index: self.first + self.joints - 1 }
+    }
+
+    /// Joint `i`, from the base.
+    pub fn joint(self, i: u32) -> Bone {
+        assert(i < self.joints, "a chain's joint past its end")
+        Bone { index: self.first + i }
+    }
+
+    pub fn len(self) -> u32 {
+        self.joints
+    }
+
+    /// From one joint to the next, at rest, before the skeleton's scale.
+    pub fn step(self) -> vec3 {
+        self.step
+    }
+
+    /// From its base to one step past its tip: the whole chain.
+    pub fn span(self) -> vec3 {
+        self.step * f32(self.joints)
+    }
+}
+
+/// A leg: four joints (hip, knee, ankle and foot), and three segments between them.
+pub struct Leg: Copy + Eq + StateHash + Serialize {
+    pub joints: [Bone; 4],
+}
+
+/// A named chain, as a skeleton keeps it.
+struct NamedChain: Clone {
+    name: Text,
+    chain: Chain,
+}
+
+/// Bones in a tree, with names for tools and agents, at rest. It's built in a constant, so a
+/// name that doesn't exist fails the build (`find`), and each individual scales a copy.
+pub struct Skeleton: Clone {
+    names: Vec<Text>,
+    /// Each bone's parent's index; a root's is its own.
+    parents: Vec<u32>,
+    /// From the parent, at rest, at the skeleton's scale.
+    offsets: Vec<vec3>,
+    chains: Vec<NamedChain>,
+    legs: Vec<Leg>,
+    scale: f32,
+}
+
+impl Skeleton {
+    pub fn new() -> Skeleton {
+        Skeleton {
+            names: Vec::new(),
+            parents: Vec::new(),
+            offsets: Vec::new(),
+            chains: Vec::new(),
+            legs: Vec::new(),
+            scale: 1.0,
+        }
+    }
+
+    fn add(mut self, name: Text, parent: u32, at: vec3) -> Bone {
+        let index = self.names.len()
+        self.names.push(name)
+        self.parents.push(parent)
+        self.offsets.push(at)
+        Bone { index }
+    }
+
+    /// A bone with no parent, at `at`.
+    pub fn root(mut self, name: Text, at: vec3) -> Bone {
+        let i = self.names.len()
+        self.add(name, i, at)
+    }
+
+    /// A bone at `at` from `parent`.
+    pub fn bone(mut self, name: Text, parent: Bone, at: vec3) -> Bone {
+        self.add(name, parent.index, at)
+    }
+
+    /// `joints` bones, the first at `at` from `parent`, each next one `span / joints` from the
+    /// one before, so the chain reaches `span` one step past its last joint.
+    pub fn chain(mut self, name: Text, parent: Bone, at: vec3, joints: u32, span: vec3) -> Chain {
+        assert(joints > 0, "a chain needs a joint")
+        let step = span / f32(joints)
+        let first = self.add(name, parent.index, at)
+        var prev = first
+        for _ in 1..joints {
+            prev = self.add(name, prev.index, step)
+        }
+        let chain = Chain { first: first.index, joints, step }
+        self.chains.push(NamedChain { name, chain })
+        chain
+    }
+
+    /// A leg whose hip is at `at` from `parent`, with segments `segments` (each from one joint
+    /// to the next).
+    pub fn leg(mut self, name: Text, parent: Bone, at: vec3, segments: [vec3; 3]) -> Leg {
+        let hip = self.add(name, parent.index, at)
+        let knee = self.add(name, hip.index, segments[0])
+        let ankle = self.add(name, knee.index, segments[1])
+        let foot = self.add(name, ankle.index, segments[2])
+        let leg = Leg { joints: [hip, knee, ankle, foot] }
+        self.legs.push(leg)
+        leg
+    }
+
+    /// The bone named `name`; in a constant, a name that doesn't exist fails the build.
+    pub fn find(self, name: Text) -> Bone {
+        for i in 0..self.names.len() {
+            if self.names[i] == name {
+                return Bone { index: i }
+            }
+        }
+        panic("no bone has that name")
+    }
+
+    /// The chain named `name`.
+    pub fn find_chain(self, name: Text) -> Chain {
+        for c in self.chains {
+            if c.name == name {
+                return c.chain
+            }
+        }
+        panic("no chain has that name")
+    }
+
+    /// A copy `k` times the size.
+    pub fn scaled(self, k: f32) -> Skeleton {
+        var out = self.clone()
+        for i in 0..out.offsets.len() {
+            out.offsets[i] = out.offsets[i] * k
+        }
+        out.scale = self.scale * k
+        out
+    }
+
+    pub fn scale(self) -> f32 {
+        self.scale
+    }
+
+    pub fn len(self) -> u32 {
+        self.names.len()
+    }
+
+    pub fn name(self, b: Bone) -> Text {
+        self.names[b.index]
+    }
+
+    pub fn parent(self, b: Bone) -> Bone {
+        Bone { index: self.parents[b.index] }
+    }
+
+    /// From the parent, at rest.
+    pub fn offset(self, b: Bone) -> vec3 {
+        self.offsets[b.index]
+    }
+
+    /// Where a bone is, at rest: its offsets summed from its root.
+    pub fn rest(self, b: Bone) -> vec3 {
+        var i = b.index
+        var at = self.offsets[i]
+        while self.parents[i] != i {
+            i = self.parents[i]
+            at = self.offsets[i] + at
+        }
+        at
+    }
+
+    pub fn legs(self) -> borrow Vec<Leg> {
+        self.legs
+    }
+}
+
+// ---- parts -------------------------------------------------------------------------------------
+
+/// A field placed at its bone's rest position.
+pub struct Placed<F>: Copy + GpuData {
+    pub field: F,
+    pub at: vec3,
+    pub bone: u32,
+}
+
+/// What visits a creature's parts, in the order they fold, with each part's index: one visitor
+/// for each thing computed over the parts (below), one traversal for each kind of part.
+pub trait PartVisitor {
+    fn visit<F: Lipschitz>(mut self, part: Placed<F>, index: u32)
+}
+
+/// A creature's parts, folded in order with `smin` (`.blend(k)`): `fold(p, d, k)` is
+/// `smin(...smin(smin(d, first(p), k), second(p), k)..., last(p), k)`.
+pub trait PartList: Copy + GpuData {
+    fn count(self) -> u32
+
+    /// Visits each part in the order they fold; the first is index `first`.
+    fn each<V: PartVisitor>(self, v: mut V, first: u32)
+
+    /// Folds each part's distance at `p` into `d`.
+    fn fold(self, p: vec3, d: f32, k: f32) -> f32 {
+        var v = Fold { p: p, d: d, k: k }
+        self.each(mut v, 0)
+        v.d
+    }
+
+    /// A bound on the fold's gradient wherever it's within `near`: a part keeps a weight only
+    /// while each later blend lowers the running value by at most `step`, so part `i` of `n`
+    /// (from 1) counts within `near + step (n + 1 - i)`.
+    fn lipschitz(self, near: f32, step: f32) -> f32 {
+        var v = Bound { near: near, step: step, count: self.count(), most: 0.0 }
+        self.each(mut v, 0)
+        v.most
+    }
+
+    /// The part nearest `p`, if nearer than `best`: its distance and its bone.
+    fn nearest(self, p: vec3, best: (f32, u32)) -> (f32, u32) {
+        var v = Nearest { p: p, best: best }
+        self.each(mut v, 0)
+        v.best
+    }
+
+    /// `fold`, with only the parts whose bits are in `mask`: equal to the whole fold wherever
+    /// the others can't change it.
+    fn fold_masked(self, p: vec3, d: f32, k: f32, mask: u32) -> f32 {
+        var v = FoldMasked { fold: Fold { p: p, d: d, k: k }, mask: mask }
+        self.each(mut v, 0)
+        v.fold.d
+    }
+
+    /// The bits of the parts whose derived interval over `b` reaches below `limit`: the parts
+    /// that can change the fold where it's below `limit - k`.
+    fn near_mask(self, b: Box3, limit: f32) -> u32 {
+        var v = NearMask { b: b, limit: limit, bits: 0 }
+        self.each(mut v, 0)
+        v.bits
+    }
+
+    /// The four parts in `mask` nearest `p`, if nearer than those in `best`.
+    fn weigh(self, p: vec3, mask: u32, best: Nearest4) -> Nearest4 {
+        var v = Weigh { p: p, mask: mask, best: best }
+        self.each(mut v, 0)
+        v.best
+    }
+}
+
+/// Folds each part into `d`.
+struct Fold: Copy {
+    p: vec3,
+    d: f32,
+    k: f32,
+}
+
+impl PartVisitor for Fold {
+    fn visit<F: Lipschitz>(mut self, part: Placed<F>, index: u32) {
+        self.d = smin(self.d, part.field.distance(self.p - part.at), self.k)
+    }
+}
+
+/// Folds the parts whose bits are in `mask`.
+struct FoldMasked: Copy {
+    fold: Fold,
+    mask: u32,
+}
+
+impl PartVisitor for FoldMasked {
+    fn visit<F: Lipschitz>(mut self, part: Placed<F>, index: u32) {
+        if (self.mask >> index) & 1 == 1 {
+            self.fold.visit(part, index)
+        }
+    }
+}
+
+/// The largest bound of any part, each within its scope (`PartList::lipschitz`).
+struct Bound: Copy {
+    near: f32,
+    step: f32,
+    count: u32,
+    most: f32,
+}
+
+impl PartVisitor for Bound {
+    fn visit<F: Lipschitz>(mut self, part: Placed<F>, index: u32) {
+        let near = self.near + self.step * f32(self.count - index)
+        self.most = max(self.most, part.field.lipschitz(near))
+    }
+}
+
+struct Nearest: Copy {
+    p: vec3,
+    best: (f32, u32),
+}
+
+impl PartVisitor for Nearest {
+    fn visit<F: Lipschitz>(mut self, part: Placed<F>, index: u32) {
+        let d = part.field.distance(self.p - part.at)
+        if d < self.best.0 {
+            self.best = (d, part.bone)
+        }
+    }
+}
+
+struct NearMask: Copy {
+    b: Box3,
+    limit: f32,
+    bits: u32,
+}
+
+impl PartVisitor for NearMask {
+    fn visit<F: Lipschitz>(mut self, part: Placed<F>, index: u32) {
+        let r = interval(|q: vec3| part.field.distance(q - part.at), self.b)
+        if r.lo < self.limit {
+            self.bits = self.bits | (1 << index)
+        }
+    }
+}
+
+struct Weigh: Copy {
+    p: vec3,
+    mask: u32,
+    best: Nearest4,
+}
+
+impl PartVisitor for Weigh {
+    fn visit<F: Lipschitz>(mut self, part: Placed<F>, index: u32) {
+        if (self.mask >> index) & 1 == 1 {
+            self.best = self.best.with(part.field.distance(self.p - part.at), part.bone)
+        }
+    }
+}
+
+/// The four parts nearest a point: their distances, nearest first, and their bones.
+pub struct Nearest4: Copy {
+    pub d: [f32; 4],
+    pub bones: [u32; 4],
+}
+
+impl Nearest4 {
+    pub fn new() -> Nearest4 {
+        Nearest4 { d: [FAR; 4], bones: [0; 4] }
+    }
+
+    /// With a part at distance `d`, on bone `bone`, if it's among the four nearest.
+    pub fn with(self, d: f32, bone: u32) -> Nearest4 {
+        var out = self
+        var i = 4
+        while i > 0 && d < out.d[i - 1] {
+            if i < 4 {
+                out.d[i] = out.d[i - 1]
+                out.bones[i] = out.bones[i - 1]
+            }
+            i -= 1
+        }
+        if i < 4 {
+            out.d[i] = d
+            out.bones[i] = bone
+        }
+        out
+    }
+}
+
+/// What visits parts whose fields carry channels `C`.
+pub trait ChannelVisitor<C> {
+    fn visit<F: Field<C> + Lipschitz>(mut self, part: Placed<F>, index: u32)
+}
+
+/// Parts whose fields carry channels `C`.
+pub trait PartChannels<C>: PartList {
+    /// The first part's distance and channels.
+    fn first(self, p: vec3) -> (f32, C)
+
+    /// `each`, for a visitor that reads channels.
+    fn each_channel<V: ChannelVisitor<C>>(self, v: mut V, first: u32)
+}
+
+/// Folds each part after the first into `(d, c)`, which starts as the first's: channels
+/// blended by `smin`'s weights.
+struct BlendChannels<C>: Copy {
+    p: vec3,
+    k: f32,
+    d: f32,
+    c: C,
+}
+
+impl<C: Blend + Copy> ChannelVisitor<C> for BlendChannels<C> {
+    fn visit<F: Field<C> + Lipschitz>(mut self, part: Placed<F>, index: u32) {
+        if index > 0 {
+            let q = self.p - part.at
+            let d = part.field.distance(q)
+            let w = smin_weight(self.d, d, self.k)
+            self.c = self.c.blend(part.field.channels(q), w)
+            self.d = smin(self.d, d, self.k)
+        }
+    }
+}
+
+impl<F: Lipschitz> PartList for Placed<F> {
+    fn count(self) -> u32 {
+        1
+    }
+
+    fn each<V: PartVisitor>(self, v: mut V, first: u32) {
+        v.visit(self, first)
+    }
+}
+
+impl<C: Blend + Copy, F: Field<C> + Lipschitz> PartChannels<C> for Placed<F> {
+    fn first(self, p: vec3) -> (f32, C) {
+        (self.field.distance(p - self.at), self.field.channels(p - self.at))
+    }
+
+    fn each_channel<V: ChannelVisitor<C>>(self, v: mut V, first: u32) {
+        v.visit(self, first)
+    }
+}
+
+/// Parts `a`, then parts `b`.
+pub struct Then<A, B>: Copy + GpuData {
+    pub a: A,
+    pub b: B,
+}
+
+impl<A: PartList, B: PartList> PartList for Then<A, B> {
+    fn count(self) -> u32 {
+        self.a.count() + self.b.count()
+    }
+
+    fn each<V: PartVisitor>(self, v: mut V, first: u32) {
+        self.a.each(mut v, first)
+        self.b.each(mut v, first + self.a.count())
+    }
+}
+
+impl<C, A: PartChannels<C>, B: PartChannels<C>> PartChannels<C> for Then<A, B> {
+    fn first(self, p: vec3) -> (f32, C) {
+        self.a.first(p)
+    }
+
+    fn each_channel<V: ChannelVisitor<C>>(self, v: mut V, first: u32) {
+        self.a.each_channel(mut v, first)
+        self.b.each_channel(mut v, first + self.a.count())
+    }
+}
+
+/// One leg's parts: a field for each segment, in the segment's bone's space, and the foot's.
+pub struct LegParts<S, F>: Copy + GpuData {
+    pub segments: [Placed<S>; 3],
+    pub foot: Placed<F>,
+}
+
+/// Four legs' parts, folded segments first (leg by leg), then the feet.
+pub struct Legs<S, F>: Copy + GpuData {
+    pub legs: [LegParts<S, F>; 4],
+}
+
+impl<S: Lipschitz, F: Lipschitz> PartList for Legs<S, F> {
+    fn count(self) -> u32 {
+        16
+    }
+
+    fn each<V: PartVisitor>(self, v: mut V, first: u32) {
+        for l in 0..4 {
+            for s in 0..3 {
+                v.visit(self.legs[l].segments[s], first + l * 3 + s)
+            }
+        }
+        for l in 0..4 {
+            v.visit(self.legs[l].foot, first + 12 + l)
+        }
+    }
+}
+
+impl<C: Blend + Copy, S: Field<C> + Lipschitz, F: Field<C> + Lipschitz> PartChannels<C> for Legs<S, F> {
+    fn first(self, p: vec3) -> (f32, C) {
+        self.legs[0].segments[0].first(p)
+    }
+
+    fn each_channel<V: ChannelVisitor<C>>(self, v: mut V, first: u32) {
+        for l in 0..4 {
+            for s in 0..3 {
+                v.visit(self.legs[l].segments[s], first + l * 3 + s)
+            }
+        }
+        for l in 0..4 {
+            v.visit(self.legs[l].foot, first + 12 + l)
+        }
+    }
+}
+
+// ---- building a creature -----------------------------------------------------------------------
+
+/// One segment of a leg, as `LegBuilder::fill`'s closure sees it.
+pub struct Segment: Copy {
+    /// 0 at the hip, 2 at the ankle.
+    pub index: u32,
+    pub bone: Bone,
+    /// From this segment's joint to the next, at rest: where the segment ends, in its space.
+    pub end: vec3,
+}
+
+/// A leg being given its parts (`Body::each_leg`).
+pub struct LegBuilder: Copy {
+    pub leg: Leg,
+    /// Its joints' rest positions.
+    pub joints: [vec3; 4],
+}
+
+/// A leg whose segments have their fields; `.foot(...)` gives the foot its own.
+pub struct FilledLeg<S>: Copy {
+    segments: [Placed<S>; 3],
+    foot_at: vec3,
+    foot: u32,
+}
+
+impl LegBuilder {
+    /// Segment `i`.
+    pub fn segment(self, i: u32) -> Segment {
+        Segment { index: i, bone: self.leg.joints[i], end: self.joints[i + 1] - self.joints[i] }
+    }
+
+    /// Each segment's field, from `make`.
+    pub fn fill<S: Surface>(self, make: fn(Segment) -> S) -> FilledLeg<S> {
+        let bone = |i: u32| self.leg.joints[i].index
+        let segments = [
+            Placed { field: make(self.segment(0)), at: self.joints[0], bone: bone(0) },
+            Placed { field: make(self.segment(1)), at: self.joints[1], bone: bone(1) },
+            Placed { field: make(self.segment(2)), at: self.joints[2], bone: bone(2) },
+        ]
+        FilledLeg { segments, foot_at: self.joints[3], foot: bone(3) }
+    }
+}
+
+impl<S: Surface> FilledLeg<S> {
+    pub fn foot<F: Surface>(self, field: F) -> LegParts<S, F> {
+        LegParts {
+            segments: self.segments,
+            foot: Placed { field, at: self.foot_at, bone: self.foot },
+        }
+    }
+}
+
+/// What a creature offers its engine: its field (a distance and channels `C`), and its
+/// skeleton.
+pub trait Creature<C> {
+    type Shape: Field<C> + Lipschitz + Parts
+
+    /// The creature's field, at rest: a `Copy` value that goes to the GPU as data.
+    fn field(self) -> Self::Shape
+
+    fn skeleton(self) -> borrow Skeleton
+
+    /// The bone whose part is nearest `p`.
+    fn nearest_bone(self, p: vec3) -> Bone
+
+    fn distance(self, p: vec3) -> f32 {
+        self.field().distance(p)
+    }
+
+    /// A box that holds the creature's surface (engine::physique).
+    fn bounds(self) -> Box3 {
+        physique::bounds(self)
+    }
+
+    /// The integral of `density(channels)` over the creature's inside: its mass, per bone or
+    /// whole, refining cells the surface crosses down to `finest` (engine::physique).
+    @deterministic
+    fn integrate(self, density: fn(C) -> f32, per: Per, finest: f32) -> Mass {
+        physique::integrate(self, density, per, finest)
+    }
+
+    /// Capsules holding the creature's inside within `tolerance`, per bone or whole.
+    @deterministic
+    fn fit_capsules(self, per: Per, tolerance: f32) -> Vec<Capsule> {
+        physique::fit_capsules(self, per, tolerance)
+    }
+}
+
+/// A creature's field: its parts smooth-unioned with `k`, starting from a distance far outside
+/// (as spike 01's `BIG`), which the first part's `smin` gives back exactly.
+pub struct CreatureField<P>: Copy + GpuData {
+    pub parts: P,
+    pub k: f32,
+}
+
+/// Far outside any creature.
+pub const FAR: f32 = 1000000.0
+
+impl<P: PartList> Surface for CreatureField<P> {
+    fn distance(self, p: vec3) -> f32 {
+        self.parts.fold(p, FAR, self.k)
+    }
+}
+
+impl<C: Blend + Copy, P: PartChannels<C>> Field<C> for CreatureField<P> {
+    fn channels(self, p: vec3) -> C {
+        let (d, c) = self.parts.first(p)
+        var v = BlendChannels { p: p, k: self.k, d: d, c: c }
+        self.parts.each_channel(mut v, 0)
+        v.c
+    }
+}
+
+impl<P: PartList> Lipschitz for CreatureField<P> {
+    fn lipschitz(self, near: f32) -> f32 {
+        self.parts.lipschitz(near, 1.25 * max(self.k, 0.0))
+    }
+}
+
+/// A skeleton waiting for its first part (`creature`).
+pub struct Bare {
+    skeleton: Skeleton,
+}
+
+/// A skeleton and its parts.
+pub struct Body<P> {
+    skeleton: Skeleton,
+    parts: P,
+    k: f32,
+}
+
+/// A creature with this skeleton, to give parts to: `.part(bone, field)`, `.each_leg(...)`, and
+/// `.blend(k)` across the joints.
+pub fn creature(skeleton: take Skeleton) -> Bare {
+    Bare { skeleton }
+}
+
+fn leg_builder(sk: Skeleton, i: u32) -> LegBuilder {
+    let l = sk.legs[i]
+    let at = |j: u32| sk.rest(l.joints[j])
+    LegBuilder { leg: l, joints: [at(0), at(1), at(2), at(3)] }
+}
+
+impl Bare {
+    pub fn part<F: Surface>(take self, bone: Bone, field: F) -> Body<Placed<F>> {
+        let at = self.skeleton.rest(bone)
+        Body { skeleton: take self.skeleton, parts: Placed { field, at, bone: bone.index }, k: 0.0 }
+    }
+}
+
+impl<P> Body<P> {
+    /// Another part, folded after those before.
+    pub fn part<F: Surface>(take self, bone: Bone, field: F) -> Body<Then<P, Placed<F>>> {
+        let at = self.skeleton.rest(bone)
+        let parts = Then { a: take self.parts, b: Placed { field, at, bone: bone.index } }
+        Body { skeleton: take self.skeleton, parts, k: self.k }
+    }
+
+    /// Each of the skeleton's four legs, given its parts by `build`.
+    pub fn each_leg<S, F>(
+        take self,
+        build: fn(LegBuilder) -> LegParts<S, F>,
+    ) -> Body<Then<P, Legs<S, F>>> {
+        assert(self.skeleton.legs.len() == 4, "`each_leg` takes a skeleton with four legs")
+        borrow sk = self.skeleton
+        let legs = Legs {
+            legs: [
+                build(leg_builder(sk, 0)),
+                build(leg_builder(sk, 1)),
+                build(leg_builder(sk, 2)),
+                build(leg_builder(sk, 3)),
+            ],
+        }
+        Body {
+            skeleton: take self.skeleton,
+            parts: Then { a: take self.parts, b: legs },
+            k: self.k,
+        }
+    }
+
+    /// Smooth-unions the parts with `k`: organic joints, for free.
+    pub fn blend(take self, k: f32) -> Body<P> {
+        Body { skeleton: take self.skeleton, parts: take self.parts, k }
+    }
+}
+
+impl<C: Blend + Copy, P: PartChannels<C>> Creature<C> for Body<P> {
+    type Shape = CreatureField<P>
+
+    fn field(self) -> CreatureField<P> {
+        CreatureField { parts: self.parts, k: self.k }
+    }
+
+    fn skeleton(self) -> borrow Skeleton {
+        self.skeleton
+    }
+
+    fn nearest_bone(self, p: vec3) -> Bone {
+        Bone { index: self.parts.nearest(p, (FAR, 0)).1 }
+    }
+}

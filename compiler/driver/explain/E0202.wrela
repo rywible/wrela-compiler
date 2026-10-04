@@ -1,0 +1,26 @@
+// A path names a module that doesn't exist. A module is a file: `shapes.wrela` is the module
+// `shapes`, and `a/b.wrela` is `a::b`. A dependency's name comes from `wrela.toml`.
+// ---- wrong
+use shape::circle_area
+
+fn coin() -> f32 {
+    circle_area(0.01)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- file shapes.wrela
+pub fn circle_area(r: f32) -> f32 {
+    3.14159 * r * r
+}
+// ---- fixed
+use shapes::circle_area
+
+fn coin() -> f32 {
+    circle_area(0.01)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- file shapes.wrela
+pub fn circle_area(r: f32) -> f32 {
+    3.14159 * r * r
+}

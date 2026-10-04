@@ -1,0 +1,30 @@
+// accepts: gpu.buffer-drop
+// A buffer is owned: it moves, is returned, and lasts in the program's state.
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch}
+
+@compute(64)
+fn fill(out: mut Slots<f32>, id: GlobalId) {
+    out[id] = 1.0
+}
+
+pub struct World {
+    kept: GpuBuffer<f32>,
+    more: Vec<GpuBuffer<u32>>,
+}
+
+fn filled(n: u32) -> GpuBuffer<f32> {
+    var b: GpuBuffer<f32> = buffer(n)
+    dispatch(fill.bind(out: mut b), groups: (n + 63) / 64)
+    b
+}
+
+pub fn init() -> World {
+    World { kept: filled(64), more: Vec::new() }
+}
+
+pub fn frame(state: mut World, time: f32, width: u32, height: u32) {
+    let a = filled(128)
+    state.kept = take a
+    state.more.push(buffer(4))
+    dispatch(fill.bind(out: mut state.kept), groups: 1)
+}

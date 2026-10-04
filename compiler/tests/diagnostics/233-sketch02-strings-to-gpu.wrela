@@ -1,0 +1,9 @@
+// mistake: sketch 02 §8: names as `String`s in a GPU entry point's parameter
+// expect: E0604
+// fix: no
+use std::gpu::{GlobalId, Slots}
+
+@compute(64)
+fn tag(names: [String], out: mut Slots<u32>, id: GlobalId) {
+    out[id] = names[id.x].len()
+}

@@ -1,0 +1,12 @@
+// rejects: ty.runs
+// A run binding borrows what it views: its source can't change while it's live.
+fn conflict(m: mut SortedMap<u32, u32>) -> u32 {
+    borrow ks = m.keys()
+    let _ = m.insert(key: 5, value: 50) //~ E0507
+    ks.len()
+}
+
+// It's a projection: never a type argument.
+fn wrap(xs: [u32]) -> Option<[u32]> { //~ E0327
+    None
+}

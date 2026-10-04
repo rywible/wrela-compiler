@@ -1,0 +1,28 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0219",
+      "file": "wrela.toml",
+      "fixes": [],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "`version` isn't a key of `[package]`, or its value has the wrong type",
+      "notes": [
+        "`[package]` has `name = \"...\"` and `unsafe = true`; `[dependencies]` has `name = { path = \"...\" }`"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 1,
+        "end": 41,
+        "end_column": 18,
+        "end_line": 3,
+        "line": 3,
+        "start": 24
+      },
+      "title": "a `wrela.toml` that isn't valid"
+    }
+  ],
+  "version": 2
+}

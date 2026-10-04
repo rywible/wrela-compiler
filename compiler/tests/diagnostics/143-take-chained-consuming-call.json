@@ -7,16 +7,16 @@
         {
           "edits": [
             {
-              "end": 341,
+              "end": 333,
               "file": "main.wrela",
               "replacement": "(take ",
-              "start": 341
+              "start": 333
             },
             {
-              "end": 351,
+              "end": 343,
               "file": "main.wrela",
               "replacement": ")",
-              "start": 351
+              "start": 343
             }
           ],
           "message": "mark the move"
@@ -33,11 +33,11 @@
       "severity": "error",
       "span": {
         "column": 5,
-        "end": 351,
+        "end": 343,
         "end_column": 15,
         "end_line": 20,
         "line": 20,
-        "start": 341
+        "start": 333
       },
       "title": "a move out of a named place without `take`"
     }

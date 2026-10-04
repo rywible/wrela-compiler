@@ -1,0 +1,23 @@
+// A variant that the enum doesn't have.
+// ---- wrong
+enum Mood {
+    Calm,
+    Alert,
+}
+
+fn start() -> Mood {
+    Mood::Angry
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+enum Mood {
+    Calm,
+    Alert,
+}
+
+fn start() -> Mood {
+    Mood::Alert
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

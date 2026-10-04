@@ -1,0 +1,14 @@
+// A name that isn't defined where it's used: a local, a function, a type or a constant. Check
+// the spelling, and that a name from another module is imported with `use`.
+// ---- wrong
+fn area(width: f32, height: f32) -> f32 {
+    widht * height
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+fn area(width: f32, height: f32) -> f32 {
+    width * height
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

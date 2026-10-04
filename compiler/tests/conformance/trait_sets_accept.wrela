@@ -1,0 +1,47 @@
+// accepts: trait.sets
+use std::hash::{Hasher, StateHash}
+use std::serialize::Serialize
+
+trait Saved = StateHash + Serialize
+
+trait Sim = Clone + Saved
+
+pub struct Gate: Sim {
+    pub open: bool,
+}
+
+trait Scale<T> {
+    fn scale(self, by: T) -> Self
+}
+
+trait Scalable<T> = Copy + Scale<T>
+
+struct Len: Copy {
+    m: f32,
+}
+
+impl Scale<f32> for Len {
+    fn scale(self, by: f32) -> Len {
+        Len { m: self.m * by }
+    }
+}
+
+fn hash_of<T: Sim>(x: T) -> u64 {
+    var h = Hasher::new()
+    x.state_hash(mut h)
+    h.finish()
+}
+
+fn twice<T: Scalable<f32>>(x: T) -> T {
+    x.scale(2.0)
+}
+
+fn thrice(x: Scalable<f32>) -> Scalable<f32> {
+    x.scale(3.0)
+}
+
+fn f() -> u64 {
+    let g = Gate { open: true }
+    let _grown = thrice(Len { m: 1.0 })
+    hash_of(g.clone()) + u64(twice(Len { m: 1.0 }).m)
+}

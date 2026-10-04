@@ -1,8 +1,13 @@
-// mistake: storing a closure in an `Option`
+// mistake: storing a closure that captures a projection in an `Option`
 // expect: E0510
 // fix: no
-pub fn scaled(k: f32) -> f32 {
-    let f = Some(|x: f32| x * k)
+struct Settings {
+    k: f32,
+    names: [u32; 4],
+}
+
+fn scaled(s: Settings) -> f32 {
+    let f = Some(|x: f32| x * s.k)
     match f {
         Some(g) => g(2.0),
         None => 0.0,

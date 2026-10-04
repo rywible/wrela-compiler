@@ -1,0 +1,155 @@
+// The engine's rollback driver (sketch 03 §4), generic over any game's world and inputs. Sim
+// state is ordinary values (§6.11): a keyframe is a clone, every `KEYFRAME_TICKS` ticks; a
+// correction for an earlier tick restores the last keyframe at or before it, fixes the input,
+// and replays to the present. The checksum is the derived `StateHash` of the whole world.
+
+use sim::Tick
+use std::hash::{StateHash, state_hash}
+
+/// How often a keyframe is kept.
+pub const KEYFRAME_TICKS: u32 = 16
+
+/// The last `capacity` values pushed, by the tick they were pushed at.
+pub struct Ring<T> {
+    items: Vec<T>,
+    /// The tick of `items[0]`'s slot's value: values are at `tick % capacity`.
+    first: Tick,
+    next: Tick,
+    capacity: u32,
+}
+
+impl<T: Clone> Ring<T> {
+    pub fn new(capacity: u32) -> Ring<T> {
+        Ring { items: Vec::with_capacity(capacity), first: 0, next: 0, capacity }
+    }
+
+    /// The value for the next tick; the oldest falls out when the ring is full.
+    pub fn push(mut self, value: take T) {
+        if self.items.len() < self.capacity {
+            self.items.push(take value)
+        } else {
+            let at = self.next % self.capacity
+            self.items[at] = take value
+            self.first += 1
+        }
+        self.next += 1
+    }
+
+    /// Whether the ring still holds tick `t`'s value.
+    pub fn holds(self, t: Tick) -> bool {
+        t >= self.first && t < self.next
+    }
+
+    /// Tick `t`'s value. A tick the ring no longer holds panics.
+    pub fn at(self, t: Tick) -> borrow T {
+        assert(self.holds(t), "the ring no longer holds that tick")
+        self.items[t % self.capacity]
+    }
+
+    /// Replaces tick `t`'s value.
+    pub fn replace(mut self, t: Tick, value: take T) {
+        assert(self.holds(t), "the ring no longer holds that tick")
+        self.items[t % self.capacity] = take value
+    }
+
+    /// The ticks it holds, oldest first: `first()..end()`.
+    pub fn first(self) -> Tick {
+        self.first
+    }
+
+    pub fn end(self) -> Tick {
+        self.next
+    }
+}
+
+/// A keyframe: a whole world, and the tick it was taken before.
+pub struct Saved<W>: Clone {
+    pub tick: Tick,
+    pub world: W,
+}
+
+impl<W: Clone> Ring<Saved<W>> {
+    /// The newest keyframe taken at or before tick `t`.
+    pub fn last_at_or_before(self, t: Tick) -> borrow Saved<W> {
+        var i = self.next
+        while i > self.first {
+            i -= 1
+            if self.items[i % self.capacity].tick <= t {
+                return self.items[i % self.capacity]
+            }
+        }
+        panic("no keyframe that early: the correction is too late to replay")
+    }
+}
+
+/// A world, its tick, its last inputs, its keyframes, and each tick's checksum.
+pub struct Timeline<W, I> {
+    world: W,
+    tick: Tick,
+    inputs: Ring<I>,
+    saved: Ring<Saved<W>>,
+    hashes: Ring<u64>,
+}
+
+impl<W: Clone + StateHash, I: Copy + Clone> Timeline<W, I> {
+    /// A timeline from `world`, keeping `history` ticks of inputs (and keyframes enough to
+    /// replay them).
+    pub fn new(world: take W, history: u32) -> Timeline<W, I> {
+        Timeline {
+            world: take world,
+            tick: 0,
+            inputs: Ring::new(history),
+            saved: Ring::new(history / KEYFRAME_TICKS + 2),
+            hashes: Ring::new(history),
+        }
+    }
+
+    pub fn tick(self) -> Tick {
+        self.tick
+    }
+
+    pub fn world(self) -> borrow W {
+        self.world
+    }
+
+    /// Steps the world with `input`.
+    pub fn advance(mut self, input: I, step: @deterministic fn(mut W, I)) {
+        if self.tick % KEYFRAME_TICKS == 0 {
+            self.saved.push(Saved { tick: self.tick, world: self.world.clone() }) // the copy's cost is visible
+        }
+        self.inputs.push(input)
+        step(mut self.world, input)
+        self.hashes.push(state_hash(self.world))
+        self.tick += 1
+    }
+
+    /// A correction arrived for tick `t`, for example from the server (D-042): restore the last
+    /// copy at or before `t`, fix the input, and replay to the present. The replayed ticks'
+    /// checksums replace the ones recorded; how many of them changed.
+    pub fn correct(mut self, t: Tick, input: I, step: @deterministic fn(mut W, I)) -> u32 {
+        borrow s = self.saved.last_at_or_before(t)
+        self.world = s.world.clone()
+        let from = s.tick
+        self.inputs.replace(t, input)
+        var changed = 0
+        for tick in from..self.tick {
+            step(mut self.world, self.inputs.at(tick))
+            let h = state_hash(self.world)
+            if h != self.hashes.at(tick) {
+                changed += 1
+                self.hashes.replace(tick, h)
+            }
+        }
+        changed
+    }
+
+    /// The whole world's checksum.
+    pub fn checksum(self) -> u64 {
+        state_hash(self.world)
+    }
+
+    /// The checksum recorded after tick `t`.
+    pub fn checksum_at(self, t: Tick) -> u64 {
+        self.hashes.at(t)
+    }
+}

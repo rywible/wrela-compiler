@@ -1,0 +1,30 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0601",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [
+        "take a `mut Slots<T>`: each invocation writes only its own slot"
+      ],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "every invocation of a `@compute` kernel would hold `mut out` at once, so it can't be a plain `mut` parameter",
+      "notes": [
+        "a kernel's `mut` parameters must be safe to share across invocations (§6.13)"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 9,
+        "end": 174,
+        "end_column": 23,
+        "end_line": 7,
+        "line": 7,
+        "start": 160
+      },
+      "title": "a kernel `mut` parameter that isn't safe to share across invocations"
+    }
+  ],
+  "version": 2
+}

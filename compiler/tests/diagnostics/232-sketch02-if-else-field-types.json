@@ -1,0 +1,43 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0300",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [
+        "to choose between them at run time, make an enum with a variant for each, and `match` on it where it's used"
+      ],
+      "internal": false,
+      "label": null,
+      "labels": [
+        {
+          "file": "main.wrela",
+          "message": "this is `Sphere`",
+          "span": {
+            "column": 24,
+            "end": 200,
+            "end_column": 35,
+            "end_line": 7,
+            "line": 7,
+            "start": 189
+          }
+        }
+      ],
+      "message": "the branches of this `if` have different types: `Sphere` and `Cuboid`",
+      "notes": [
+        "an `if` gives one type; each struct is its own type (a field's structure is its type, §17)"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 45,
+        "end": 227,
+        "end_column": 62,
+        "end_line": 7,
+        "line": 7,
+        "start": 210
+      },
+      "title": "mismatched types"
+    }
+  ],
+  "version": 2
+}

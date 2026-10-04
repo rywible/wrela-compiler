@@ -1,0 +1,17 @@
+// accepts: ty.alias
+type Tick = u64
+type Pair<T> = (T, T)
+type Grid = [Row; 2]
+type Row = [f32; 3]
+
+fn next(t: Tick) -> Tick {
+    t + 1
+}
+
+fn swap(p: Pair<f32>) -> Pair<f32> {
+    (p.1, p.0)
+}
+
+fn corner(g: Grid) -> f32 {
+    g[1][2]
+}

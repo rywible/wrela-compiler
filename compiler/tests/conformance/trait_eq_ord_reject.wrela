@@ -1,0 +1,15 @@
+// rejects: trait.eq-ord
+struct Point {
+    x: f32,
+    y: f32,
+}
+
+struct Named: Eq {
+    id: u32,
+}
+
+fn f(a: Point, b: Point, c: Named, d: Named) -> bool {
+    let same = a == b //~ E0305
+    let before = c < d //~ E0305
+    same || before
+}

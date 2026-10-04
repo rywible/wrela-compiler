@@ -1,0 +1,14 @@
+// A `const` generic parameter whose type isn't `u32`. Constant parameters are lengths and
+// counts: `const N: u32`.
+// ---- wrong
+fn scale<const K: f32>(x: f32) -> f32 {
+    x * K
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+fn repeat<const N: u32>(x: f32) -> [f32; N] {
+    [x; N]
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

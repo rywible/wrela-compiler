@@ -1,0 +1,8 @@
+// mistake: a parallel closure that adds to a captured total
+// expect: E0520
+// fix: no
+fn energy(xs: mut Vec<f32>) -> f32 {
+    var total = 0.0
+    xs.par_each_mut(|x| { total += x * x })
+    total
+}

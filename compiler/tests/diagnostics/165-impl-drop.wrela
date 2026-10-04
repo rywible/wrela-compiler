@@ -1,0 +1,12 @@
+// mistake: a destructor with `impl Drop`, as in Rust
+// expect: E0413
+// fix: no
+struct Socket {
+    handle: u32,
+}
+
+impl Drop for Socket {
+    fn drop(mut self) {
+        self.handle = 0
+    }
+}

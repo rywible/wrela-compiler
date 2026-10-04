@@ -1,0 +1,7 @@
+// mistake: a unit suffix that isn't a unit
+// expect: E0216
+// fix: yes
+fn f() -> f32 {
+    let mass = 5kgs
+    mass
+}

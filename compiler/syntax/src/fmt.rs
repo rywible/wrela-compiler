@@ -52,6 +52,33 @@ pub fn format(parsed: &Parsed, text: &str) -> String {
     out
 }
 
+/// Moves each of `offsets`, a place in `before`, to the same place in `after`, which is
+/// `before` formatted. Formatting keeps the tokens and their order, but `,`, `;` and line
+/// breaks, so a place is found by the token it's in or before: the n-th of the others.
+pub fn move_offsets(before: &str, after: &str, offsets: &mut [u32]) {
+    let kept = |text: &str| -> Vec<Span> {
+        crate::lexer::lex(FileId(0), text)
+            .tokens
+            .into_iter()
+            .filter(|t| {
+                !matches!(
+                    t.kind,
+                    TokenKind::Comma | TokenKind::Semi | TokenKind::Newline | TokenKind::Eof
+                )
+            })
+            .map(|t| t.span)
+            .collect()
+    };
+    let (a, b) = (kept(before), kept(after));
+    for at in offsets {
+        let i = a.partition_point(|s| s.end <= *at);
+        *at = match (a.get(i), b.get(i)) {
+            (Some(x), Some(y)) => y.start + at.saturating_sub(x.start).min(y.end - y.start),
+            _ => after.len() as u32,
+        };
+    }
+}
+
 /// The AST's Debug output without spans, and without the flags that record layout (whether a
 /// list or a chain link was written on several lines), which formatting may change: two
 /// sources with equal skeletons parse to the same tree. For tests.
@@ -246,6 +273,33 @@ impl<'a> Builder<'a> {
             out.push(text(rest));
         }
         concat(out)
+    }
+
+    /// The next code token, as the source spells it.
+    fn code_token(&mut self) -> Doc {
+        match self.code.get(self.at.0) {
+            Some(t) => {
+                let s = self.text[t.start as usize + self.at.1..t.end as usize].to_string();
+                self.tok(&s)
+            }
+            None => nil(),
+        }
+    }
+
+    /// An f-string hole's expression laid out on one line: formatted, or as written if it
+    /// can't be (a block of several statements). One that starts with `{` gets a space before
+    /// it, which keeps the hole's `{` from reading as `{{` (L22).
+    fn flat_expr(&mut self, e: &Expr) -> Doc {
+        let space = if self.text[e.span.range()].starts_with('{') { text(" ") } else { nil() };
+        let saved = (self.at, self.next);
+        let d = self.expr(e);
+        let flat = doc::print(&d, 1 << 30);
+        if !flat.contains('\n') {
+            return concat([space, text(flat.trim_end())]);
+        }
+        (self.at, self.next) = saved;
+        let written = self.text[e.span.range()].to_string();
+        concat([space, self.tok(&written)])
     }
 
     /// Where the next code token to write starts.
@@ -574,9 +628,13 @@ impl<'a> Builder<'a> {
         concat(out)
     }
 
-    /// `pub `, if the item or member has it.
-    fn vis(&mut self, vis: Option<Span>) -> Doc {
-        if vis.is_some() { self.tok("pub ") } else { nil() }
+    /// `pub ` or `pub(package) `, if the item or member has it.
+    fn vis(&mut self, vis: Option<Vis>) -> Doc {
+        match vis {
+            Some(Vis { package: true, .. }) => self.tok("pub(package) "),
+            Some(_) => self.tok("pub "),
+            None => nil(),
+        }
     }
 
     fn item(&mut self, item: &Item) -> Doc {
@@ -585,7 +643,11 @@ impl<'a> Builder<'a> {
         let kind = match &item.kind {
             ItemKind::Fn(f) => self.fn_decl(f),
             ItemKind::Struct(s) => concat([
-                self.tok(&format!("struct {}", s.name.name)),
+                self.tok(&format!(
+                    "{}struct {}",
+                    if s.borrow { "borrow " } else { "" },
+                    s.name.name
+                )),
                 self.generic_params(&s.generics),
                 self.trait_list(&s.traits),
                 text(" "),
@@ -633,6 +695,12 @@ impl<'a> Builder<'a> {
                 );
                 concat([head, body])
             }
+            ItemKind::TraitSet(t) => concat([
+                self.tok(&format!("trait {}", t.name.name)),
+                self.generic_params(&t.generics),
+                self.tok(" = "),
+                self.bounds(&t.traits),
+            ]),
             ItemKind::Impl(i) => {
                 let mut head = vec![self.tok("impl"), self.generic_params(&i.generics), text(" ")];
                 if let Some(t) = &i.trait_ {
@@ -666,9 +734,19 @@ impl<'a> Builder<'a> {
                 self.expr(&c.value),
             ]),
             ItemKind::Use(u) => {
-                let column = if item.vis.is_some() { "pub use ".len() } else { "use ".len() };
+                let column = match item.vis {
+                    Some(Vis { package: true, .. }) => "pub(package) use ".len(),
+                    Some(_) => "pub use ".len(),
+                    None => "use ".len(),
+                };
                 concat([self.tok("use "), self.use_tree(u, column)])
             }
+            ItemKind::TypeAlias(t) => concat([
+                self.tok(&format!("type {}", t.name.name)),
+                self.generic_params(&t.generics),
+                self.tok(" = "),
+                self.ty(&t.ty),
+            ]),
             ItemKind::Error(_) => text("<error>"),
         };
         concat([attrs, vis, kind])
@@ -722,8 +800,10 @@ impl<'a> Builder<'a> {
             return if written { self.tok("<>") } else { nil() };
         }
         let open = self.tok("<");
-        let params =
-            self.flat_list(g, |b, p| concat([b.tok(&p.name.name), b.trait_list(&p.bounds)]));
+        let params = self.flat_list(g, |b, p| match &p.const_ty {
+            Some(t) => concat([b.tok(&format!("const {}: ", p.name.name)), b.ty(t)]),
+            None => concat([b.tok(&p.name.name), b.trait_list(&p.bounds)]),
+        });
         concat([open, params, self.close_before('>'), self.tok(">")])
     }
 
@@ -735,7 +815,12 @@ impl<'a> Builder<'a> {
     fn field_decl(&mut self, f: &FieldDecl) -> Doc {
         let vis = self.vis(f.vis);
         let name = self.tok(&format!("{}: ", f.name.name));
-        let ty = self.ty(&f.ty);
+        let mode = match f.mode {
+            RetMode::Owned => nil(),
+            RetMode::Borrow => self.tok("borrow "),
+            RetMode::Mut => self.tok("mut "),
+        };
+        let ty = concat([mode, self.ty(&f.ty)]);
         let default = match &f.default {
             Some(d) => concat([self.tok(" = "), self.expr(d)]),
             None => nil(),
@@ -830,14 +915,32 @@ impl<'a> Builder<'a> {
                 let close = self.inline_close(t.span.end - 1);
                 concat([open, list, lone, close, self.tok(")")])
             }
+            TypeExprKind::Traits(tys) => {
+                let mut parts = Vec::new();
+                for (i, t) in tys.iter().enumerate() {
+                    if i > 0 {
+                        parts.push(self.tok(" + "));
+                    }
+                    parts.push(self.ty(t));
+                }
+                concat(parts)
+            }
             TypeExprKind::Paren(inner) => {
                 let open = self.tok("(");
                 let inner = self.ty(inner);
                 concat([open, inner, self.inline_close(t.span.end - 1), self.tok(")")])
             }
-            TypeExprKind::Fn(params, ret) => {
-                let open = self.tok("fn(");
-                let list = self.flat_list(params, |b, t| b.ty(t));
+            TypeExprKind::Fn(FnType { attrs, params, ret }) => {
+                let attrs: Vec<Doc> =
+                    attrs.iter().map(|a| self.tok(&format!("@{} ", a.name))).collect();
+                let open = concat([concat(attrs), self.tok("fn(")]);
+                let list = self.flat_list(params, |b, p| {
+                    let mode = match p.mode {
+                        Mode::Borrow => nil(),
+                        m => b.tok(&format!("{} ", m.keyword())),
+                    };
+                    concat([mode, b.ty(&p.ty)])
+                });
                 let close = concat([self.close_before(')'), self.tok(")")]);
                 let ret = match ret {
                     Some(r) => concat([self.tok(" -> "), self.ty(r)]),
@@ -845,6 +948,7 @@ impl<'a> Builder<'a> {
                 };
                 concat([open, list, close, ret])
             }
+            TypeExprKind::Int(l) => self.tok(&l.text),
             TypeExprKind::Error => text("<error>"),
         };
         concat([pre, d])
@@ -904,13 +1008,20 @@ impl<'a> Builder<'a> {
 
     fn stmt(&mut self, s: &Stmt) -> Doc {
         match &s.kind {
-            StmtKind::Let { pat, ty, init } => concat([
-                self.tok("let "),
-                self.pat(pat),
-                self.opt_ty(ty.as_ref()),
-                self.tok(" = "),
-                self.expr(init),
-            ]),
+            StmtKind::Let { pat, ty, init, else_ } => {
+                let mut out = vec![
+                    self.tok("let "),
+                    self.pat(pat),
+                    self.opt_ty(ty.as_ref()),
+                    self.tok(" = "),
+                    self.expr(init),
+                ];
+                if let Some(b) = else_ {
+                    out.push(self.tok(" else "));
+                    out.push(self.block(b, true));
+                }
+                concat(out)
+            }
             StmtKind::Var { kind, name, ty, init } => concat([
                 self.tok(&format!("{} {}", kind.keyword(), name.name)),
                 self.opt_ty(ty.as_ref()),
@@ -1036,17 +1147,23 @@ impl<'a> Builder<'a> {
                 self.tok(")"),
             ]),
             ExprKind::Block(b) => self.block(b, true),
-            ExprKind::If { cond, then, else_ } => {
-                let mut out =
-                    vec![self.tok("if "), self.expr(cond), text(" "), self.block(then, true)];
+            ExprKind::If { pat, cond, then, else_ } => {
+                let mut out = vec![self.tok("if ")];
+                if let Some(p) = pat {
+                    out.push(self.tok("let "));
+                    out.push(self.pat(p));
+                    out.push(self.tok(" = "));
+                }
+                out.extend([self.expr(cond), text(" "), self.block(then, true)]);
                 if let Some(x) = else_ {
                     out.push(self.tok(" else "));
                     out.push(self.expr(x));
                 }
                 concat(out)
             }
-            ExprKind::Match { scrutinee, arms } => {
-                let head = concat([self.tok("match "), self.expr(scrutinee), text(" ")]);
+            ExprKind::Match { mutable, scrutinee, arms } => {
+                let kw = self.tok(if *mutable { "match mut " } else { "match " });
+                let head = concat([kw, self.expr(scrutinee), text(" ")]);
                 let open = self.tok("{");
                 let mut inner = Vec::new();
                 for arm in arms {
@@ -1094,6 +1211,23 @@ impl<'a> Builder<'a> {
             },
             ExprKind::Break => self.tok("break"),
             ExprKind::Continue => self.tok("continue"),
+            ExprKind::Try(inner) => concat([self.expr(inner), self.tok("?")]),
+            ExprKind::Assign { target, op, value } => {
+                concat([self.expr(target), self.tok(&format!(" {} ", op.text())), self.expr(value)])
+            }
+            ExprKind::Unsafe(b) => concat([self.tok("unsafe "), self.block(b, true)]),
+            // Its pieces as written, and each hole's expression formatted on one line: an
+            // f-string is on one line (L22), and its holes can't hold comments.
+            ExprKind::FString(parts) => {
+                let mut out = vec![self.code_token()];
+                for p in parts {
+                    if let FPart::Hole { expr, .. } = p {
+                        out.push(self.flat_expr(expr));
+                        out.push(self.code_token());
+                    }
+                }
+                concat(out)
+            }
             ExprKind::Error => text("<error>"),
         }
     }

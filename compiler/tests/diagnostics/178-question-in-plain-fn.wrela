@@ -1,0 +1,7 @@
+// mistake: `?` in a function that doesn't return a `Result` or an `Option`
+// expect: E0300
+// fix: no
+fn parse(x: Option<u32>) -> u32 {
+    let n = x?
+    n + 1
+}

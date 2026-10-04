@@ -1,0 +1,40 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0216",
+      "file": "main.wrela",
+      "fixes": [
+        {
+          "edits": [
+            {
+              "end": 108,
+              "file": "main.wrela",
+              "replacement": "kg",
+              "start": 105
+            }
+          ],
+          "message": "did you mean `kg`?"
+        }
+      ],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "`kgs` isn't a unit",
+      "notes": [
+        "units are the constants in `std::units`, in SI: `m`, `cm`, `kg`, `s`, `deg`, ..."
+      ],
+      "severity": "error",
+      "span": {
+        "column": 16,
+        "end": 108,
+        "end_column": 20,
+        "end_line": 5,
+        "line": 5,
+        "start": 104
+      },
+      "title": "an unknown unit suffix"
+    }
+  ],
+  "version": 2
+}

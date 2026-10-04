@@ -1,0 +1,5 @@
+// rejects: mod.packages
+// Packages can't depend on each other: here `a` depends back on this package.
+fn f() -> u32 {
+    1
+}

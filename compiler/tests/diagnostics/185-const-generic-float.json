@@ -1,0 +1,38 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0331",
+      "file": "main.wrela",
+      "fixes": [
+        {
+          "edits": [
+            {
+              "end": 107,
+              "file": "main.wrela",
+              "replacement": "u32",
+              "start": 104
+            }
+          ],
+          "message": "make it a `u32`"
+        }
+      ],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "a `const` generic parameter is a `u32`: an array's length",
+      "notes": [],
+      "severity": "error",
+      "span": {
+        "column": 22,
+        "end": 107,
+        "end_column": 25,
+        "end_line": 4,
+        "line": 4,
+        "start": 104
+      },
+      "title": "a `const` generic parameter that isn't a `u32`"
+    }
+  ],
+  "version": 2
+}

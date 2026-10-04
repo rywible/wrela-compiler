@@ -1,0 +1,19 @@
+// A default whose type is generic, and that isn't a literal value. Any other default is a
+// constant expression, which the build computes once (§10); a constant has one type, and a
+// generic one has many. Pass the value, or give the default a type that isn't generic.
+// ---- wrong
+fn first<T: Copy>(x: T, fallback: T = zero()) -> T {
+    fallback
+}
+
+fn zero<T>() -> T {
+    panic("no zero")
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+fn first<T: Copy>(x: T, fallback: T) -> T {
+    fallback
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

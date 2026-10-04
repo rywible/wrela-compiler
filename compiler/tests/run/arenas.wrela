@@ -1,0 +1,67 @@
+// run: arenas and handles: insert, look up, change, remove (a stale handle panics), iterate;
+// a sorted map
+// expect: basics() = 50
+// expect: stale() traps
+// expect: removed_order() = 7
+// expect: sorted() = 123
+// expect: contains_after_remove() = true
+
+struct Grazer: Clone {
+    hunger: u32,
+}
+
+pub fn basics() -> u32 {
+    var herd = Arena::new()
+    let a = herd.insert(Grazer { hunger: 10 })
+    let b = herd.insert(Grazer { hunger: 20 })
+    herd[b].hunger += 10
+    var total = 0
+    for g in herd {
+        total += g.hunger
+    }
+    total + herd[a].hunger + herd.len() * 5 - 10
+}
+
+pub fn stale() -> u32 {
+    var herd = Arena::new()
+    let a = herd.insert(Grazer { hunger: 10 })
+    let _ = herd.remove(a)
+    herd[a].hunger
+}
+
+pub fn removed_order() -> u32 {
+    var xs: Arena<u32> = Arena::new()
+    let a = xs.insert(1)
+    let _b = xs.insert(2)
+    let _c = xs.insert(3)
+    let removed = xs.remove(a)
+    let d = xs.insert(7)
+    // Removing `a` moved the last value into its place: 3, 2, then 7.
+    var digits = 0
+    for x in xs {
+        digits = digits * 10 + x
+    }
+    digits - 320 + removed + xs[d] - 7 - 1
+}
+
+pub fn sorted() -> u32 {
+    var m: SortedMap<u32, u32> = SortedMap::new()
+    let _ = m.insert(key: 3, value: 30)
+    let _ = m.insert(key: 1, value: 10)
+    let _ = m.insert(key: 2, value: 20)
+    let _ = m.insert(key: 2, value: 21)
+    var keys = 0
+    for k in m.keys() {
+        keys = keys * 10 + k
+    }
+    keys + m.at(2) - 21
+}
+
+pub fn contains_after_remove() -> bool {
+    var xs: Arena<u32> = Arena::new()
+    let a = xs.insert(1)
+    let b = xs.insert(2)
+    let _ = xs.remove(a)
+    let c = xs.insert(3)
+    !xs.contains(a) && xs.contains(b) && xs.contains(c) && xs[c] == 3 && xs[b] == 2
+}

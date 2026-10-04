@@ -1,0 +1,10 @@
+// mistake: ordering two structs that don't declare `Ord`
+// expect: E0305
+// fix: no
+struct Score: Eq {
+    points: u32,
+}
+
+fn better(a: Score, b: Score) -> bool {
+    a > b
+}

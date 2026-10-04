@@ -1,11 +1,83 @@
 // GPU resources, entry-point builtins, and the CPU calls that record GPU work (language.md
-// §12, D-102). Every function here that CPU code calls carries the `host` effect.
+// §12, §6.13, D-102). Every function here that CPU code calls carries the `host` effect.
 
-/// A buffer of `T`s on the GPU, named by a handle. CPU code can create it, write into it and
-/// pass it to kernels, but can't read through it (D-102).
-pub struct GpuBuffer<T>: Copy + Clone {
+use std::io::{Pending, next_request}
+use std::mem::{Drop, size_of}
+
+/// A buffer of `T`s on the GPU: an owned value, which CPU code creates, writes into and passes
+/// to kernels and shaders, but can't read through (D-102). Dropping it releases it; the host
+/// waits for work already recorded with it. A buffer in the program's state lasts with it.
+pub struct GpuBuffer<T> {
+    // The compiler binds a buffer by these two fields, in this order.
     handle: u32,
+    count: u32,
 }
+
+impl<T> Drop for GpuBuffer<T> {
+    fn drop(mut self) {
+        if self.handle != 0 {
+            destroy_buffer(self.handle)
+        }
+    }
+}
+
+impl<T: GpuData> GpuBuffer<T> {
+    /// How many elements it holds.
+    pub fn len(self) -> u32 {
+        self.count
+    }
+
+    /// Elements `start` to `start + count`, read-only: to bind for a `[T]` parameter, or to
+    /// copy from. A range past the end panics.
+    pub fn span(self, start: u32, count: u32) -> GpuSpan<T> {
+        if start > self.count || count > self.count - start {
+            panic("span: the range is past the end of the buffer")
+        }
+        GpuSpan { buffer: self, start, count }
+    }
+
+    /// Elements `start` to `start + count`, to change: to bind for a `mut Slots<T>`
+    /// parameter, or to copy into. A range past the end panics.
+    pub fn span_mut(mut self, start: u32, count: u32) -> GpuSpanMut<T> {
+        if start > self.count || count > self.count - start {
+            panic("span_mut: the range is past the end of the buffer")
+        }
+        GpuSpanMut { buffer: mut self, start, count }
+    }
+}
+
+/// A run of a GPU buffer's elements, read-only: a projection of the buffer, as `[T]` is of an
+/// array (§6.13). Two spans of one buffer bound together count as overlapping, even if their
+/// ranges don't. Bound to a kernel, a span starts at a multiple of 256 bytes (WebGPU's rule),
+/// which the host checks.
+pub borrow struct GpuSpan<T> {
+    pub buffer: borrow GpuBuffer<T>,
+    pub start: u32,
+    pub count: u32,
+}
+
+/// A run of a GPU buffer's elements, to change.
+pub borrow struct GpuSpanMut<T> {
+    pub buffer: mut GpuBuffer<T>,
+    pub start: u32,
+    pub count: u32,
+}
+
+/// Copies `from`'s elements into `to`, in recorded order with dispatches and draws. The spans
+/// must be the same length, and in different buffers.
+pub fn copy<T: GpuData>(from: GpuSpan<T>, to: GpuSpanMut<T>) {
+    if from.count != to.count {
+        panic("copy: the spans' lengths differ")
+    }
+    let n = size_of::<T>()
+    copy_buffer(from.buffer.handle, from.start * n, to.buffer.handle, to.start * n, from.count * n)
+}
+
+@intrinsic
+fn destroy_buffer(handle: u32) {}
+
+@intrinsic
+fn copy_buffer(from: u32, from_offset: u32, to: u32, to_offset: u32, size: u32) {}
 
 /// A kernel parameter where each invocation writes only its own slot, indexed by its
 /// `GlobalId` (§6.13). The CPU passes a `GpuBuffer<T>` for it.
@@ -14,48 +86,48 @@ pub struct Slots<T> {
 }
 
 /// The invocation's position in the whole dispatch.
-pub struct GlobalId: Copy + Clone {
+pub struct GlobalId: Copy {
     pub x: u32,
     pub y: u32,
     pub z: u32,
 }
 
 /// The invocation's position within its workgroup.
-pub struct LocalId: Copy + Clone {
+pub struct LocalId: Copy {
     pub x: u32,
     pub y: u32,
     pub z: u32,
 }
 
 /// The workgroup's position in the dispatch.
-pub struct WorkgroupId: Copy + Clone {
+pub struct WorkgroupId: Copy {
     pub x: u32,
     pub y: u32,
     pub z: u32,
 }
 
 /// A vertex shader's vertex number.
-pub struct VertexIndex: Copy + Clone {
+pub struct VertexIndex: Copy {
     pub index: u32,
 }
 
 /// A vertex shader's instance number.
-pub struct InstanceIndex: Copy + Clone {
+pub struct InstanceIndex: Copy {
     pub index: u32,
 }
 
 /// A fragment's window position: pixel centres are at half-integers.
-pub struct FragCoord: Copy + Clone {
+pub struct FragCoord: Copy {
     pub position: vec4,
 }
 
 /// A vertex shader's clip-space output position.
-pub struct ClipPosition: Copy + Clone {
+pub struct ClipPosition: Copy {
     pub position: vec4,
 }
 
 /// A vertex output that isn't interpolated.
-pub struct Flat<T>: Copy + Clone {
+pub struct Flat<T>: Copy {
     pub value: T,
 }
 
@@ -64,19 +136,41 @@ pub struct Flat<T>: Copy + Clone {
 pub fn buffer<T: GpuData>(count: u32) -> GpuBuffer<T> {}
 
 /// Copies `values` into `buf`, starting at element `at`. The copy happens in recorded order
-/// with dispatches and draws.
-@intrinsic
-pub fn write<T: GpuData>(buf: GpuBuffer<T>, at: u32, values: [T]) {}
+/// with dispatches and draws. Writing past the end panics.
+pub fn write<T: GpuData>(buf: mut GpuBuffer<T>, at: u32, values: [T]) {
+    if at > buf.count || values.len() > buf.count - at {
+        panic("write: the values run past the end of the buffer")
+    }
+    write_buffer(buf.handle, at, values)
+}
 
-/// Records a dispatch of a `@compute` kernel: `dispatch(kernel, groups: n, arg: value, ...)`.
-/// `groups` is a `u32` or a `(u32, u32, u32)`; the other arguments are the kernel's, by name or
-/// position, without its builtins. Small `GpuData` arguments travel as uniforms; a
-/// `GpuBuffer<T>` goes where the kernel takes `[T]` or `mut Slots<T>`.
+@intrinsic
+fn write_buffer<T: GpuData>(handle: u32, at: u32, values: [T]) {}
+
+/// Records a dispatch of a `@compute` kernel bound to its arguments: `dispatch(kernel.bind(a,
+/// b), groups: n)`. The arguments are the kernel's, without its builtins, matched as a call's
+/// are; a kernel that takes nothing is named alone. `groups` is a `u32`, a `(u32, u32, u32)`, or
+/// a buffer holding them (indirect). Small `GpuData` arguments travel as uniforms. A
+/// `GpuBuffer<T>` or a `GpuSpan<T>` goes where the kernel takes `[T]`, and `mut buf` or a
+/// `GpuSpanMut<T>` where it takes `mut Slots<T>`.
+///
+/// ```wrela
+/// use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch}
+///
+/// @compute(64)
+/// fn fill(value: f32, out: mut Slots<f32>, id: GlobalId) {
+///     out[id] = value
+/// }
+///
+/// var out: GpuBuffer<f32> = buffer(64)
+/// dispatch(fill.bind(0.5, mut out), groups: 1)
+/// ```
 @intrinsic
 pub fn dispatch() {}
 
-/// Records a draw into the current screen pass: `draw(vertex_fn, fragment_fn, vertices: n,
-/// instances: m, arg: value, ...)`, with the two shaders' arguments by name.
+/// Records a draw into the current pass: `draw(vs.bind(...), fs.bind(...), vertices: n)`, with
+/// `instances: m`, or `indirect: buf` for both counts. Each shader is bound to its own
+/// arguments, as `dispatch`'s kernel is; one that takes nothing is named alone.
 @intrinsic
 pub fn draw() {}
 
@@ -87,3 +181,997 @@ pub fn begin_screen_pass(clear: vec4) {}
 /// Ends the screen pass and shows it.
 @intrinsic
 pub fn present() {}
+
+// ---- textures, samplers and passes (§12) ------------------------------------------------------
+
+/// How a colour texture stores its texels.
+pub enum TextureFormat: Copy {
+    /// Four 8-bit channels, read as floats in [0, 1]: 4 bytes a texel. The screen's format.
+    Rgba8,
+    /// Four 16-bit floats: 8 bytes a texel.
+    Rgba16Float,
+}
+
+/// A 2D colour texture on the GPU: an owned value, like a `GpuBuffer`. CPU code makes one,
+/// writes texels into it, draws into it in a pass and passes it to shaders, which sample it.
+/// Dropping it releases it.
+pub struct Texture {
+    // The compiler binds a texture by its handle, the first field.
+    handle: u32,
+    width: u32,
+    height: u32,
+    format: TextureFormat,
+}
+
+impl Drop for Texture {
+    fn drop(mut self) {
+        if self.handle != 0 {
+            destroy_texture(self.handle)
+        }
+    }
+}
+
+/// A 2D texture of depths (32-bit floats): a pass's depth target, which shaders read with a
+/// `ComparisonSampler` or `load`.
+pub struct DepthTexture {
+    handle: u32,
+    width: u32,
+    height: u32,
+}
+
+impl Drop for DepthTexture {
+    fn drop(mut self) {
+        if self.handle != 0 {
+            destroy_texture(self.handle)
+        }
+    }
+}
+
+/// How a `Sampler` filters.
+pub enum Filter: Copy {
+    /// The nearest texel.
+    Nearest,
+    /// A blend of the four nearest texels.
+    Linear,
+}
+
+/// What a `Sampler` does with coordinates outside [0, 1].
+pub enum Address: Copy {
+    /// The edge texels continue.
+    Clamp,
+    /// The texture tiles.
+    Repeat,
+}
+
+/// A comparison sampler's test: a texel passes when the reference depth is less than it, and
+/// so on.
+pub enum Compare: Copy {
+    Less,
+    LessEqual,
+    Greater,
+    GreaterEqual,
+}
+
+/// How shaders read a `Texture` between its texels.
+pub struct Sampler {
+    handle: u32,
+}
+
+impl Drop for Sampler {
+    fn drop(mut self) {
+        if self.handle != 0 {
+            destroy_sampler(self.handle)
+        }
+    }
+}
+
+/// How shaders compare a reference depth with a `DepthTexture`'s texels (shadow maps).
+pub struct ComparisonSampler {
+    handle: u32,
+}
+
+impl Drop for ComparisonSampler {
+    fn drop(mut self) {
+        if self.handle != 0 {
+            destroy_sampler(self.handle)
+        }
+    }
+}
+
+/// A side is 1 texel to the GPU's limit (`limits().max_texture_size`, at least 8192).
+fn check_texture_size(width: u32, height: u32) {
+    let max = limit(0)
+    if width == 0 || height == 0 || width > max || height > max {
+        panic(f"texture: a side is 1 to {max} texels")
+    }
+}
+
+/// A new colour texture, zeroed.
+pub fn texture(width: u32, height: u32, format: TextureFormat = TextureFormat::Rgba8) -> Texture {
+    check_texture_size(width, height)
+    let code: u32 = match format {
+        TextureFormat::Rgba8 => 0,
+        TextureFormat::Rgba16Float => 1,
+    }
+    Texture { handle: create_texture(width, height, code), width, height, format }
+}
+
+/// A new depth texture, zeroed.
+pub fn depth_texture(width: u32, height: u32) -> DepthTexture {
+    check_texture_size(width, height)
+    DepthTexture { handle: create_texture(width, height, 2), width, height }
+}
+
+/// A new sampler.
+pub fn sampler(filter: Filter = Filter::Linear, address: Address = Address::Clamp) -> Sampler {
+    let linear: u32 = match filter {
+        Filter::Nearest => 0,
+        Filter::Linear => 1,
+    }
+    let repeat: u32 = match address {
+        Address::Clamp => 0,
+        Address::Repeat => 1,
+    }
+    Sampler { handle: create_sampler(linear, repeat, 0) }
+}
+
+/// A new comparison sampler: linear, so each comparison blends four texels' results.
+pub fn comparison_sampler(compare: Compare = Compare::LessEqual) -> ComparisonSampler {
+    let code: u32 = match compare {
+        Compare::Less => 1,
+        Compare::LessEqual => 2,
+        Compare::Greater => 3,
+        Compare::GreaterEqual => 4,
+    }
+    ComparisonSampler { handle: create_sampler(linear: 1, repeat: 0, compare: code) }
+}
+
+/// The most bytes one texture write command carries: writes are split into rows that fit.
+const TEXTURE_WRITE_BYTES: u32 = 512 * 1024
+
+impl Texture {
+    /// Its width in texels. In GPU code too.
+    pub fn width(self) -> u32 {
+        texture_width(self)
+    }
+
+    /// Its height in texels. In GPU code too.
+    pub fn height(self) -> u32 {
+        texture_height(self)
+    }
+
+    /// Copies texels into the rectangle at (`x`, `y`) of `width` by `height` texels: `bytes`
+    /// holds its rows, top to bottom, 4 bytes a texel for `Rgba8` and 8 for `Rgba16Float`. It
+    /// happens in recorded order with dispatches and draws. A rectangle past the edge, or the
+    /// wrong number of bytes, panics.
+    pub fn write(mut self, x: u32, y: u32, width: u32, height: u32, bytes: [u8]) {
+        if x > self.width || width > self.width - x || y > self.height || height > self.height - y {
+            panic("write: the rectangle runs past the texture's edge")
+        }
+        let texel: u32 = match self.format {
+            TextureFormat::Rgba8 => 4,
+            TextureFormat::Rgba16Float => 8,
+        }
+        let row = width * texel
+        if bytes.len() != row * height {
+            panic("write: the bytes aren't `width * height` texels")
+        }
+        if row == 0 || height == 0 {
+            return
+        }
+        let rows = max(1, TEXTURE_WRITE_BYTES / row)
+        var done = 0
+        while done < height {
+            let n = min(rows, height - done)
+            write_texture_rows(self.handle, x, y + done, width, n, bytes, done * row, n * row)
+            done += n
+        }
+    }
+
+    /// The texel at (`u`, `v`) in [0, 1], filtered by `s`: fragment shaders only, since it picks
+    /// the detail from neighbouring pixels (as `dpdx` does).
+    pub fn sample(self, s: Sampler, uv: vec2) -> vec4 {
+        texture_sample(self, s, uv)
+    }
+
+    /// The texel at (`u`, `v`) in [0, 1] of mip level `level`, filtered by `s`: any GPU code.
+    /// Textures have one level, 0.
+    pub fn sample_level(self, s: Sampler, uv: vec2, level: f32 = 0.0) -> vec4 {
+        texture_sample_level(self, s, uv, level)
+    }
+
+    /// The texel at (`x`, `y`), unfiltered: any GPU code.
+    pub fn load(self, x: u32, y: u32) -> vec4 {
+        texture_load(self, x, y)
+    }
+}
+
+impl DepthTexture {
+    /// Its width in texels. In GPU code too.
+    pub fn width(self) -> u32 {
+        texture_width(self)
+    }
+
+    /// Its height in texels. In GPU code too.
+    pub fn height(self) -> u32 {
+        texture_height(self)
+    }
+
+    /// The fraction of the texels around (`u`, `v`) in [0, 1] that pass `s`'s test against
+    /// `reference`: fragment shaders only.
+    pub fn sample_compare(self, s: ComparisonSampler, uv: vec2, reference: f32) -> f32 {
+        texture_sample_compare(self, s, uv, reference)
+    }
+
+    /// As `sample_compare`, at level 0: any GPU code.
+    pub fn sample_compare_level(self, s: ComparisonSampler, uv: vec2, reference: f32) -> f32 {
+        texture_sample_compare_level(self, s, uv, reference)
+    }
+
+    /// The depth at (`x`, `y`): any GPU code.
+    pub fn load(self, x: u32, y: u32) -> f32 {
+        depth_load(self, x, y)
+    }
+}
+
+/// An open pass that draws into a texture: what `begin_pass` gives. It borrows its target until
+/// `end()`, so the pass's draws can't bind it.
+pub borrow struct Pass {
+    pub target: mut Texture,
+}
+
+impl Pass {
+    /// Ends the pass.
+    pub fn end(self) {
+        end_pass_command()
+    }
+}
+
+/// An open pass with a colour target and a depth target.
+pub borrow struct DepthPass {
+    pub target: mut Texture,
+    pub depth: mut DepthTexture,
+}
+
+impl DepthPass {
+    /// Ends the pass.
+    pub fn end(self) {
+        end_pass_command()
+    }
+}
+
+/// An open pass that draws only depths, into its depth target (a shadow map).
+pub borrow struct DepthOnlyPass {
+    pub depth: mut DepthTexture,
+}
+
+impl DepthOnlyPass {
+    /// Ends the pass.
+    pub fn end(self) {
+        end_pass_command()
+    }
+}
+
+/// An open pass on the screen with a depth target.
+pub borrow struct ScreenDepthPass {
+    pub depth: mut DepthTexture,
+}
+
+impl ScreenDepthPass {
+    /// Ends the pass and shows it.
+    pub fn present(self) {
+        present()
+    }
+}
+
+/// The pass attachment that isn't there, and the one that's the screen (stream v3).
+const NO_TARGET: u32 = 4294967295
+const SCREEN_TARGET: u32 = 4294967294
+
+/// Starts a pass that draws into `target`: cleared to `clear`, or keeping what's there.
+pub fn begin_pass(
+    target: mut Texture,
+    clear: vec4 = vec4(0.0, 0.0, 0.0, 1.0),
+    keep: bool = false,
+) -> Pass {
+    begin_pass_command(
+        target.handle,
+        u32(keep),
+        clear.x,
+        clear.y,
+        clear.z,
+        clear.w,
+        NO_TARGET,
+        0,
+        1.0,
+    )
+    Pass { target: mut target }
+}
+
+/// Starts a pass that draws into `target`, keeping each fragment nearer than what `depth`
+/// holds. The two must be the same size. Depths are cleared to `clear_depth`, or kept.
+pub fn begin_pass_with_depth(
+    target: mut Texture,
+    depth: mut DepthTexture,
+    clear: vec4 = vec4(0.0, 0.0, 0.0, 1.0),
+    keep: bool = false,
+    clear_depth: f32 = 1.0,
+    keep_depth: bool = false,
+) -> DepthPass {
+    let (c, d) = (target.handle, depth.handle)
+    begin_pass_command(
+        c,
+        u32(keep),
+        clear.x,
+        clear.y,
+        clear.z,
+        clear.w,
+        d,
+        u32(keep_depth),
+        clear_depth,
+    )
+    DepthPass { target: mut target, depth: mut depth }
+}
+
+/// Starts a pass that draws only depths into `depth` (its draws' fragment colours go nowhere).
+pub fn begin_depth_pass(
+    depth: mut DepthTexture,
+    clear_depth: f32 = 1.0,
+    keep_depth: bool = false,
+) -> DepthOnlyPass {
+    begin_pass_command(
+        NO_TARGET,
+        0,
+        r: 0.0,
+        g: 0.0,
+        b: 0.0,
+        a: 0.0,
+        depth: depth.handle,
+        keep_depth: u32(keep_depth),
+        clear_depth: clear_depth,
+    )
+    DepthOnlyPass { depth: mut depth }
+}
+
+/// Starts drawing to the screen, cleared to `clear`, with `depth` as its depth target (the
+/// screen's size).
+pub fn begin_screen_pass_with_depth(
+    depth: mut DepthTexture,
+    clear: vec4 = vec4(0.0, 0.0, 0.0, 1.0),
+    clear_depth: f32 = 1.0,
+) -> ScreenDepthPass {
+    begin_pass_command(
+        SCREEN_TARGET,
+        0,
+        clear.x,
+        clear.y,
+        clear.z,
+        clear.w,
+        depth.handle,
+        0,
+        clear_depth,
+    )
+    ScreenDepthPass { depth: mut depth }
+}
+
+@intrinsic
+fn create_texture(width: u32, height: u32, format: u32) -> u32 {}
+
+@intrinsic
+fn write_texture_rows(
+    handle: u32,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+    bytes: [u8],
+    from: u32,
+    count: u32,
+) {}
+
+@intrinsic
+fn destroy_texture(handle: u32) {}
+
+@intrinsic
+fn create_sampler(linear: u32, repeat: u32, compare: u32) -> u32 {}
+
+@intrinsic
+fn destroy_sampler(handle: u32) {}
+
+@intrinsic
+fn begin_pass_command(
+    color: u32,
+    keep: u32,
+    r: f32,
+    g: f32,
+    b: f32,
+    a: f32,
+    depth: u32,
+    keep_depth: u32,
+    clear_depth: f32,
+) {}
+
+@intrinsic
+fn end_pass_command() {}
+
+@intrinsic
+fn texture_sample(t: Texture, s: Sampler, uv: vec2) -> vec4 {}
+
+@intrinsic
+fn texture_sample_level(t: Texture, s: Sampler, uv: vec2, level: f32) -> vec4 {}
+
+@intrinsic
+fn texture_sample_compare(t: DepthTexture, s: ComparisonSampler, uv: vec2, reference: f32) -> f32 {}
+
+@intrinsic
+fn texture_sample_compare_level(
+    t: DepthTexture,
+    s: ComparisonSampler,
+    uv: vec2,
+    reference: f32,
+) -> f32 {}
+
+@intrinsic
+fn texture_load(t: Texture, x: u32, y: u32) -> vec4 {}
+
+@intrinsic
+fn depth_load(t: DepthTexture, x: u32, y: u32) -> f32 {}
+
+@intrinsic
+fn texture_width<T>(t: T) -> u32 {}
+
+@intrinsic
+fn texture_height<T>(t: T) -> u32 {}
+
+// ---- readback, indirect work and limits -------------------------------------------------------
+
+/// Reads a span of a buffer back to the CPU, once the GPU work recorded before it is done: a
+/// request, answered on a later call (§6.15). It's `nondet`: when the answer arrives depends on
+/// the GPU.
+pub fn read<T: GpuData + Plain>(span: GpuSpan<T>) -> Pending<T> {
+    let n = size_of::<T>()
+    let request = next_request()
+    read_buffer_command(request, span.buffer.handle, span.start * n, span.count * n)
+    Pending::new(request)
+}
+
+@intrinsic
+fn read_buffer_command(request: u32, handle: u32, offset: u32, size: u32) {}
+
+/// The GPU's limits: the hosts open the device with the adapter's own, which are at least
+/// WebGPU's defaults (8192-texel textures, 128 MiB buffers, and so on). A program that wants
+/// more than the defaults asks, and adapts. It's `nondet`: another GPU gives other numbers.
+/// (Pipelines are compiled for the defaults: a kernel's bindings and workgroup stay within
+/// them.)
+pub struct Limits: Copy {
+    /// The widest and tallest texture.
+    pub max_texture_size: u32,
+    /// The largest buffer, in bytes: every buffer can be bound as storage.
+    pub max_buffer_size: u32,
+    pub max_storage_buffers_per_stage: u32,
+    pub max_uniform_buffer_binding_size: u32,
+    /// Workgroup-shared memory, in bytes.
+    pub max_workgroup_storage_size: u32,
+    pub max_workgroup_invocations: u32,
+    pub max_workgroup_size: (u32, u32, u32),
+    pub max_workgroups_per_dimension: u32,
+}
+
+/// The GPU's limits.
+pub fn limits() -> Limits {
+    Limits {
+        max_texture_size: limit(0),
+        max_buffer_size: limit(1),
+        max_storage_buffers_per_stage: limit(2),
+        max_uniform_buffer_binding_size: limit(3),
+        max_workgroup_storage_size: limit(4),
+        max_workgroup_invocations: limit(5),
+        max_workgroup_size: (limit(6), limit(7), limit(8)),
+        max_workgroups_per_dimension: limit(9),
+    }
+}
+
+@intrinsic
+fn limit(index: u32) -> u32 {}
+
+// ---- workgroup memory, atomics, appending and maps (§6.13, §12) -------------------------------
+
+/// Workgroup memory: `N` `T`s that all of a workgroup's invocations share, as a kernel's
+/// `mut` parameter (CPU code doesn't pass it). Between barriers, each invocation writes only
+/// its own chunk: `shared.write(shared.chunk(lid), k, value)`. Any invocation reads any element
+/// with `shared.get(i)`. `barrier(mut shared)` separates a phase of writes from a phase of
+/// reads; the compiler rejects a read of what another invocation may still be writing, or a
+/// write of what another may still be reading, with no barrier between (E0609). Its elements
+/// start zeroed.
+pub struct Shared<T, const N: u32> {
+    unused: u32,
+}
+
+/// The elements an invocation writes: element `first + k * stride`, for `k` below `len()`. Each
+/// invocation's are its own, as its `LocalId` is.
+pub struct Chunk: Copy {
+    first: u32,
+    stride: u32,
+    count: u32,
+}
+
+impl Chunk {
+    /// How many elements it has.
+    pub fn len(self) -> u32 {
+        self.count
+    }
+
+    /// Which element its `k`th is.
+    pub fn index(self, k: u32) -> u32 {
+        self.first + k * self.stride
+    }
+}
+
+impl<T, const N: u32> Shared<T, N> {
+    /// The chunk invocation `lid` writes: every `W`th element from its index in the workgroup,
+    /// where `W` is the workgroup's size.
+    pub fn chunk(self, lid: LocalId) -> Chunk {
+        let first = local_index(lid)
+        let stride = workgroup_invocations()
+        let count = if first < N { (N - first + stride - 1) / stride } else { 0 }
+        Chunk { first, stride, count }
+    }
+
+    /// Writes `value` to the `k`th element of `chunk`, this invocation's. A `k` past the chunk's
+    /// end writes nothing.
+    pub fn write(mut self, chunk: Chunk, k: u32, value: T) {
+        if k < chunk.count {
+            shared_set(mut self, chunk.first + k * chunk.stride, value)
+        }
+    }
+
+    /// Element `i`, which any invocation may have written before the last barrier.
+    pub fn get(self, i: u32) -> T {
+        shared_get(self, i)
+    }
+
+    /// `N`.
+    pub fn len(self) -> u32 {
+        N
+    }
+}
+
+/// Waits until every invocation of the workgroup has reached it: their writes to workgroup
+/// memory before it are visible to every read after it. It must be reached by all of the
+/// workgroup's invocations together, so it's in uniform control flow (E0608).
+pub fn barrier<T, const N: u32>(shared: mut Shared<T, N>) {
+    workgroup_barrier(mut shared)
+}
+
+/// Integers that every invocation of a dispatch may change at once: a kernel's `mut
+/// Atomics<u32>` or `mut Atomics<i32>` parameter, for which CPU code passes `mut buf` of a
+/// `GpuBuffer<u32>` (or `<i32>`). Each operation on an element happens whole, before or after
+/// every other invocation's on it, and gives the element's old value.
+pub struct Atomics<T> {
+    unused: u32,
+}
+
+impl<T> Atomics<T> {
+    /// How many elements it holds.
+    pub fn len(self) -> u32 {
+        atomic_len(self)
+    }
+
+    /// Element `i`.
+    pub fn load(self, i: u32) -> T {
+        atomic_load(self, i)
+    }
+
+    /// Sets element `i` to `value`.
+    pub fn store(mut self, i: u32, value: T) {
+        atomic_store(mut self, i, value)
+    }
+
+    /// Adds `value` to element `i`; the element's old value.
+    pub fn add(mut self, i: u32, value: T) -> T {
+        atomic_add(mut self, i, value)
+    }
+
+    /// Subtracts `value` from element `i`; the element's old value.
+    pub fn sub(mut self, i: u32, value: T) -> T {
+        atomic_sub(mut self, i, value)
+    }
+
+    /// Sets element `i` to the smaller of it and `value`; the element's old value.
+    pub fn min(mut self, i: u32, value: T) -> T {
+        atomic_min(mut self, i, value)
+    }
+
+    /// Sets element `i` to the larger of it and `value`; the element's old value.
+    pub fn max(mut self, i: u32, value: T) -> T {
+        atomic_max(mut self, i, value)
+    }
+
+    /// Sets element `i` to its bitwise and with `value`; the element's old value.
+    pub fn and(mut self, i: u32, value: T) -> T {
+        atomic_and(mut self, i, value)
+    }
+
+    /// Sets element `i` to its bitwise or with `value`; the element's old value.
+    pub fn or(mut self, i: u32, value: T) -> T {
+        atomic_or(mut self, i, value)
+    }
+
+    /// Sets element `i` to its bitwise exclusive or with `value`; the element's old value.
+    pub fn xor(mut self, i: u32, value: T) -> T {
+        atomic_xor(mut self, i, value)
+    }
+
+    /// Sets element `i` to `value`; the element's old value.
+    pub fn exchange(mut self, i: u32, value: T) -> T {
+        atomic_exchange(mut self, i, value)
+    }
+}
+
+impl<T: Eq + Copy> Atomics<T> {
+    /// Stores `new` if element `i` is `expected`: the old value, which is `expected` exactly
+    /// when it stored.
+    pub fn compare_exchange(mut self, i: u32, expected: T, new: T) -> T {
+        strong_compare_exchange(mut self, i, expected, new)
+    }
+}
+
+/// A kernel's output of any number of `T`s, in no particular order: its `mut Append<T>`
+/// parameter, for which CPU code passes `mut` an `AppendBuffer<T>`. `out.push(value)` takes
+/// the next free place; a push past the buffer's capacity is counted but kept nowhere.
+pub struct Append<T> {
+    unused: u32,
+}
+
+impl<T> Append<T> {
+    /// Takes the next free place for `value`, and returns its index. An index at or past the
+    /// buffer's capacity was counted but kept nowhere.
+    pub fn push(mut self, value: T) -> u32 {
+        append_push(mut self, value)
+    }
+}
+
+/// What a kernel appends to (`Append<T>`): room for `capacity` `T`s, and how many were pushed.
+pub struct AppendBuffer<T> {
+    items: GpuBuffer<T>,
+    // The count: one `u32`, then 1 and 1, so it's an indirect dispatch's group counts too.
+    count: GpuBuffer<u32>,
+}
+
+/// An `AppendBuffer` with room for `capacity` `T`s, empty.
+pub fn append_buffer<T: GpuData>(capacity: u32) -> AppendBuffer<T> {
+    var count: GpuBuffer<u32> = buffer(3)
+    write(mut count, 0, [0, 1, 1])
+    AppendBuffer { items: buffer(capacity), count }
+}
+
+impl<T: GpuData> AppendBuffer<T> {
+    /// Empties it: what's pushed after starts at the start again.
+    pub fn clear(mut self) {
+        write(mut self.count, 0, [0])
+    }
+
+    /// Room for how many.
+    pub fn capacity(self) -> u32 {
+        self.items.len()
+    }
+
+    /// The items: the first `count` of them were pushed (to read back, or pass on).
+    pub fn items(self) -> GpuSpan<T> {
+        self.items.span(0, self.items.len())
+    }
+
+    /// How many were pushed, the first of three `u32`s (then 1 and 1): to read back, or as an
+    /// indirect dispatch's group counts.
+    pub fn count(self) -> GpuSpan<u32> {
+        self.count.span(start: 0, count: 3)
+    }
+}
+
+/// A map from `u32` keys to `u32` values that every invocation of a dispatch may change at once:
+/// a kernel's `mut AtomicMap` parameter, for which CPU code passes `mut` an `AtomicMapBuffer`.
+/// It holds at most its capacity of keys; the key `EMPTY` can't be stored.
+pub struct AtomicMap {
+    unused: u32,
+}
+
+/// The key no entry has.
+pub const EMPTY: u32 = 4294967295
+
+impl AtomicMap {
+    /// Where key `key` is, or would go: its slot, or `EMPTY` if the map is full of other keys.
+    fn slot(mut self, key: u32, claim: bool) -> u32 {
+        let cap = atomic_len(self) / 2
+        var at = hash_key(key) % cap
+        for _ in 0..cap {
+            let there = atomic_load(self, 2 * at)
+            if there == key {
+                return at
+            }
+            if there == EMPTY {
+                if !claim {
+                    return EMPTY
+                }
+                let old = strong_compare_exchange(mut self, 2 * at, EMPTY, key)
+                if old == EMPTY || old == key {
+                    return at
+                }
+            }
+            at = (at + 1) % cap
+        }
+        EMPTY
+    }
+
+    /// Sets `key`'s value if it has none yet: whether it had none (and the map had room).
+    pub fn insert(mut self, key: u32, value: u32) -> bool {
+        if key == EMPTY {
+            return false
+        }
+        let at = self.slot(key, claim: true)
+        if at == EMPTY {
+            return false
+        }
+        strong_compare_exchange(mut self, 2 * at + 1, EMPTY, value) == EMPTY
+    }
+
+    /// Adds `delta` to `key`'s value (from 0 if it had none): whether the map had room.
+    pub fn add(mut self, key: u32, delta: u32) -> bool {
+        if key == EMPTY {
+            return false
+        }
+        let at = self.slot(key, claim: true)
+        if at == EMPTY {
+            return false
+        }
+        // A new key's value is `EMPTY` until its first add makes it 0.
+        let _ = strong_compare_exchange(mut self, 2 * at + 1, EMPTY, 0)
+        atomic_add(mut self, 2 * at + 1, delta)
+        true
+    }
+
+    /// `key`'s value, if it has one.
+    pub fn get(mut self, key: u32) -> Option<u32> {
+        if key == EMPTY {
+            return None
+        }
+        let at = self.slot(key, claim: false)
+        if at == EMPTY {
+            return None
+        }
+        let v = atomic_load(self, 2 * at + 1)
+        if v == EMPTY { None } else { Some(v) }
+    }
+}
+
+/// A key's first slot: its bits mixed, so near keys spread out.
+fn hash_key(key: u32) -> u32 {
+    var h = key.wrapping_mul(2654435761)
+    h ^ (h >> 16)
+}
+
+/// What a kernel's `AtomicMap` lives in: room for `capacity` keys, each with its value.
+pub struct AtomicMapBuffer {
+    entries: GpuBuffer<u32>,
+}
+
+/// An empty `AtomicMapBuffer` with room for `capacity` keys.
+pub fn atomic_map_buffer(capacity: u32) -> AtomicMapBuffer {
+    var entries: GpuBuffer<u32> = buffer(2 * capacity)
+    var empty: Vec<u32> = Vec::with_capacity(2 * capacity)
+    for _ in 0..2 * capacity {
+        empty.push(EMPTY)
+    }
+    write(mut entries, 0, empty)
+    AtomicMapBuffer { entries }
+}
+
+impl AtomicMapBuffer {
+    /// Its entries, key then value, `EMPTY` where none is: to read back.
+    pub fn entries(self) -> GpuSpan<u32> {
+        self.entries.span(0, self.entries.len())
+    }
+}
+
+/// The invocation's index in its workgroup: `x`, then `y` rows, then `z` layers.
+@intrinsic
+fn local_index(lid: LocalId) -> u32 {}
+
+/// The workgroup's size: how many invocations it has.
+@intrinsic
+fn workgroup_invocations() -> u32 {}
+
+@intrinsic
+fn shared_get<T, const N: u32>(shared: Shared<T, N>, i: u32) -> T {}
+
+@intrinsic
+fn shared_set<T, const N: u32>(shared: mut Shared<T, N>, i: u32, value: T) {}
+
+@intrinsic
+fn workgroup_barrier<T, const N: u32>(shared: mut Shared<T, N>) {}
+
+@intrinsic
+fn atomic_len<A>(a: A) -> u32 {}
+
+@intrinsic
+fn atomic_load<A, T>(a: A, i: u32) -> T {}
+
+@intrinsic
+fn atomic_store<A, T>(a: mut A, i: u32, value: T) {}
+
+@intrinsic
+fn atomic_add<A, T>(a: mut A, i: u32, value: T) -> T {}
+
+@intrinsic
+fn atomic_sub<A, T>(a: mut A, i: u32, value: T) -> T {}
+
+@intrinsic
+fn atomic_min<A, T>(a: mut A, i: u32, value: T) -> T {}
+
+@intrinsic
+fn atomic_max<A, T>(a: mut A, i: u32, value: T) -> T {}
+
+@intrinsic
+fn atomic_and<A, T>(a: mut A, i: u32, value: T) -> T {}
+
+@intrinsic
+fn atomic_or<A, T>(a: mut A, i: u32, value: T) -> T {}
+
+@intrinsic
+fn atomic_xor<A, T>(a: mut A, i: u32, value: T) -> T {}
+
+@intrinsic
+fn atomic_exchange<A, T>(a: mut A, i: u32, value: T) -> T {}
+
+/// Stores `new` at element `i` if it's `expected`: the old value, and whether it stored. It may
+/// not store though they're equal (WGSL's `atomicCompareExchangeWeak`).
+@intrinsic
+fn atomic_compare_exchange<A, T>(a: mut A, i: u32, expected: T, new: T) -> (T, bool) {}
+
+/// As `atomic_compare_exchange`, but trying again when it didn't store though it could have:
+/// the old value, `expected` exactly when it stored.
+fn strong_compare_exchange<A, T: Eq + Copy>(a: mut A, i: u32, expected: T, new: T) -> T {
+    loop {
+        let (old, stored) = atomic_compare_exchange(mut a, i, expected, new)
+        if stored || old != expected {
+            return old
+        }
+    }
+}
+
+@intrinsic
+fn append_push<T>(a: mut Append<T>, value: T) -> u32 {}
+
+// ---- lossy encodings (D-049) --------------------------------------------------------------------
+// A layout never loses precision on its own: a type that does says so in its name. Each packs
+// into one `u32`, which every GPU buffer can hold, and decodes with the same code on both
+// targets.
+
+/// Four values in [0, 1], 8 bits each: colours. Each decodes to the nearest of 256 steps, so
+/// within 0.5/255 of what was encoded, once that's clamped to [0, 1].
+pub struct Unorm8x4: Copy + GpuData + Eq {
+    pub bits: u32,
+}
+
+impl Unorm8x4 {
+    /// `v`, clamped to [0, 1] and rounded to the nearest of 256 steps.
+    pub fn encode(v: vec4) -> Unorm8x4 {
+        let q = clamp(v, vec4(0.0), vec4(1.0)) * 255.0 + vec4(0.5)
+        Unorm8x4 { bits: u32(q.x) | (u32(q.y) << 8) | (u32(q.z) << 16) | (u32(q.w) << 24) }
+    }
+
+    /// The four values, each in [0, 1].
+    pub fn decode(self) -> vec4 {
+        let b = self.bits
+        vec4(f32(b & 255), f32((b >> 8) & 255), f32((b >> 16) & 255), f32(b >> 24)) / 255.0
+    }
+}
+
+/// Two `f32`s as IEEE half floats, rounded to nearest, ties to even: within 2⁻¹¹ of the value
+/// relatively where |x| is in [2⁻¹⁴, 65504], and within 2⁻²⁵ absolutely below that. Larger
+/// values become infinite; a NaN stays a NaN.
+pub struct Half2: Copy + GpuData + Eq {
+    pub bits: u32,
+}
+
+/// `x` as a half float's 16 bits, rounded to nearest, ties to even.
+fn to_half(x: f32) -> u32 {
+    let b = bitcast_u32(x)
+    let sign = (b >> 16) & 32768
+    let e = i32((b >> 23) & 255)
+    let m = b & 8388607
+    if e == 255 {
+        // Infinity, or a NaN (kept a NaN: a mantissa bit set).
+        return sign | 31744 | (if m != 0 { 512 } else { 0 })
+    }
+    let he = e - 112
+    if he >= 31 {
+        return sign | 31744
+    }
+    if he <= 0 {
+        // A subnormal half, or zero: the mantissa with its implicit bit, shifted into place.
+        if he < -10 {
+            return sign
+        }
+        let full = m | 8388608
+        let shift = u32(14 - he)
+        var h = full >> shift
+        let rest = full & ((1 << shift) - 1)
+        let halfway = 1 << (shift - 1)
+        if rest > halfway || (rest == halfway && (h & 1) == 1) {
+            h += 1
+        }
+        return sign | h
+    }
+    var h = (u32(he) << 10) | (m >> 13)
+    let rest = m & 8191
+    if rest > 4096 || (rest == 4096 && (h & 1) == 1) {
+        // A carry into the exponent is right: the next binade, or infinity.
+        h += 1
+    }
+    sign | h
+}
+
+/// A half float's 16 bits as an `f32`, exactly.
+fn from_half(h: u32) -> f32 {
+    let sign = (h & 32768) << 16
+    let e = (h >> 10) & 31
+    let m = h & 1023
+    if e == 0 {
+        // Zero or subnormal: m × 2⁻²⁴, exact in an f32.
+        let v = f32(m) * 5.9604645e-8
+        return if sign != 0 { -v } else { v }
+    }
+    if e == 31 {
+        return bitcast_f32(sign | 2139095040 | (m << 13))
+    }
+    bitcast_f32(sign | ((e + 112) << 23) | (m << 13))
+}
+
+impl Half2 {
+    /// `v`, each value rounded to the nearest half float.
+    pub fn encode(v: vec2) -> Half2 {
+        Half2 { bits: to_half(v.x) | (to_half(v.y) << 16) }
+    }
+
+    /// The two values, as `f32`s.
+    pub fn decode(self) -> vec2 {
+        vec2(from_half(self.bits & 65535), from_half(self.bits >> 16))
+    }
+}
+
+/// A unit vector, octahedral, 16 bits a coordinate: normals. It decodes within 1.5 × 10⁻⁴
+/// radians of the direction encoded (`encodings.rs` measures the worst case).
+pub struct Oct32: Copy + GpuData + Eq {
+    pub bits: u32,
+}
+
+impl Oct32 {
+    /// `n`'s direction; `n` needn't be unit length, but mustn't be zero.
+    pub fn encode(n: vec3) -> Oct32 {
+        let s = abs(n.x) + abs(n.y) + abs(n.z)
+        var p = vec2(n.x, n.y) / s
+        if n.z < 0.0 {
+            p = vec2((1.0 - abs(p.y)) * sign_of(p.x), (1.0 - abs(p.x)) * sign_of(p.y))
+        }
+        let q = clamp(p, vec2(-1.0), vec2(1.0)) * 32767.0
+        let x = u32(i32(round(q.x)) + 32768)
+        let y = u32(i32(round(q.y)) + 32768)
+        Oct32 { bits: x | (y << 16) }
+    }
+
+    /// The unit vector it holds.
+    pub fn decode(self) -> vec3 {
+        let p = vec2(f32(i32(self.bits & 65535) - 32768), f32(i32(self.bits >> 16) - 32768)) /
+            32767.0
+        var n = vec3(p.x, p.y, 1.0 - abs(p.x) - abs(p.y))
+        if n.z < 0.0 {
+            n = vec3((1.0 - abs(n.y)) * sign_of(n.x), (1.0 - abs(n.x)) * sign_of(n.y), n.z)
+        }
+        normalize(n)
+    }
+}
+
+/// 1 for x ≥ 0, else -1: the octahedral fold's sign, which `sign` would make 0 at 0.
+fn sign_of(x: f32) -> f32 {
+    if x >= 0.0 { 1.0 } else { -1.0 }
+}

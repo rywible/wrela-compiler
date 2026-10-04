@@ -1,0 +1,28 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0505",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [
+        "make the parameter `mut`: `g: mut ...`, and pass `mut` at the call site"
+      ],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "can't assign to `g.phase`: `g` is borrowed, not `mut`",
+      "notes": [],
+      "severity": "error",
+      "span": {
+        "column": 5,
+        "end": 294,
+        "end_column": 12,
+        "end_line": 15,
+        "line": 15,
+        "start": 287
+      },
+      "title": "an assignment through a read-only place"
+    }
+  ],
+  "version": 2
+}

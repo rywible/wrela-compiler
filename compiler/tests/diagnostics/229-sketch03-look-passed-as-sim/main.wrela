@@ -1,0 +1,12 @@
+// mistake: sketch 03 §7: passing presentation state where the engine wants sim state
+// expect: E0400
+// fix: no
+use engine::sim::simulate
+
+struct GrazerLook {
+    ears: vec3,
+}
+
+fn tick(look: mut GrazerLook) {
+    simulate(mut look)
+}

@@ -1,0 +1,28 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0605",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "a workgroup's x size can be at most 256, not 512",
+      "notes": [
+        "WebGPU's default limits: 256, 256 and 64, and 256 invocations in all"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 10,
+        "end": 145,
+        "end_column": 13,
+        "end_line": 6,
+        "line": 6,
+        "start": 142
+      },
+      "title": "a workgroup size out of range"
+    }
+  ],
+  "version": 2
+}

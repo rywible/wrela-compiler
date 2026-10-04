@@ -1,0 +1,14 @@
+// A struct declares `Copy` (or `GpuData`) but a field's type isn't `Copy` (or `GpuData`): a
+// `String`, a `Vec`, a GPU buffer. Drop the declaration, or change the field.
+// ---- wrong
+struct Tag: Copy {
+    name: String,
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+struct Tag: Clone {
+    name: String,
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

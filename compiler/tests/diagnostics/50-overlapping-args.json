@@ -10,29 +10,29 @@
       "labels": [
         {
           "file": "main.wrela",
-          "message": "`w.speed` is passed here",
+          "message": "`w.log` is passed here",
           "span": {
-            "column": 13,
-            "end": 211,
-            "end_column": 20,
-            "end_line": 13,
-            "line": 13,
-            "start": 204
+            "column": 22,
+            "end": 301,
+            "end_column": 27,
+            "end_line": 19,
+            "line": 19,
+            "start": 296
           }
         }
       ],
-      "message": "`w.speed` is already passed `mut` in this call",
+      "message": "`w.log` is already passed in this call",
       "notes": [
         "in one call, arguments can't overlap when one of them is `mut` (§6.5)"
       ],
       "severity": "error",
       "span": {
-        "column": 22,
-        "end": 220,
-        "end_column": 29,
-        "end_line": 13,
-        "line": 13,
-        "start": 213
+        "column": 11,
+        "end": 294,
+        "end_column": 20,
+        "end_line": 19,
+        "line": 19,
+        "start": 285
       },
       "title": "overlapping arguments where one is `mut`"
     }

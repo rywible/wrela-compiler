@@ -11,6 +11,7 @@ pub const RUNTIME_FILES: &[(&str, &[u8])] = &[
     ("index.html", include_bytes!("../../../runtime/browser/dist/index.html")),
     ("main.js", include_bytes!("../../../runtime/browser/dist/main.js")),
     ("worker.js", include_bytes!("../../../runtime/browser/dist/worker.js")),
+    ("worklet.js", include_bytes!("../../../runtime/browser/dist/worklet.js")),
 ];
 
 #[derive(Debug)]
@@ -18,14 +19,19 @@ pub struct BuildOutput {
     /// Each file of the build, by its path relative to the output directory, in a fixed order.
     pub files: Vec<(String, Vec<u8>)>,
     pub diagnostics: Vec<Diagnostic>,
+    /// Where each WASM offset is in the source: for a frame test's failure (`frames`).
+    pub lines: Vec<(u32, Option<wrela_diag::Span>)>,
 }
 
 /// Runs the back ends over a lowered program. `sources` names the locations a trap reports.
-pub fn emit(l: &Lowered, sources: &SourceMap) -> BuildOutput {
+pub fn emit(l: &Lowered, sources: &SourceMap, simd: bool) -> BuildOutput {
     let mut diagnostics = Vec::new();
     let mut files = Vec::new();
-    match wrela_wasm::emit(&l.cpu) {
+    let mut code_lines = Vec::new();
+    let options = wrela_wasm::Options { simd, ..wrela_wasm::Options::default() };
+    match wrela_wasm::emit_with(&l.cpu, options) {
         Ok(out) => {
+            code_lines = out.lines.clone();
             // Where each part of the code came from, as `file:line:column`, for trap messages.
             let entries: Vec<(u32, Option<String>)> = out
                 .lines
@@ -87,18 +93,8 @@ pub fn emit(l: &Lowered, sources: &SourceMap) -> BuildOutput {
                     wrela_abi::manifest::UniformSpace::Uniform
                 },
             }),
-            buffers: p
-                .buffers
-                .iter()
-                .map(|&(binding, rw)| wrela_abi::manifest::BufferBinding {
-                    binding,
-                    access: if rw {
-                        wrela_abi::manifest::Access::ReadWrite
-                    } else {
-                        wrela_abi::manifest::Access::Read
-                    },
-                })
-                .collect(),
+            bindings: p.bindings.clone(),
+            debug_flag: p.debug_flag,
         });
     }
     if let Err(e) = manifest.validate() {
@@ -108,5 +104,5 @@ pub fn emit(l: &Lowered, sources: &SourceMap) -> BuildOutput {
     for (path, bytes) in RUNTIME_FILES {
         files.push((path.to_string(), bytes.to_vec()));
     }
-    BuildOutput { files, diagnostics }
+    BuildOutput { files, diagnostics, lines: code_lines }
 }

@@ -1,6 +1,6 @@
 // The program ABI without a GPU, mirroring runtime/native/src/program/tests.rs.
 
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { CommandError } from "../src/check.ts";
 import { parseManifest } from "../src/manifest.ts";
 import { checkAbi, Program, ProgramError, TrapError } from "../src/program.ts";
@@ -55,20 +55,25 @@ describe("the ABI check", () => {
     await expect(load(wasm)).rejects.toThrow(text);
   };
 
-  test("imports only wrela.submit", async () => {
+  test("imports only the host's functions", async () => {
     const log = { module: "env", name: "log", kind: "func" as const, type: { params: ["i32" as const], results: [] } };
     await rejects(
       buildModule({ imports: [log], memory: 1, funcs: [frameOnly] }),
-      "invalid program: it imports `env.log`, but a wrela program may import only `wrela.submit`",
+            "invalid program: it imports `env.log`, which isn't one of the host's: `wrela.memory`, `wrela.submit`, `wrela.request_status`, `wrela.request_take`, `wrela.limit`, `wrela.audio`",
     );
     const wrongType = { ...SUBMIT, type: { params: ["i32" as const], results: [] } };
     await rejects(
       buildModule({ imports: [wrongType], memory: 1, funcs: [frameOnly] }),
       "its import `wrela.submit` must be a function (i32, i32) -> (), not a function (i32) -> ()",
     );
-    await rejects(
+        await rejects(
       buildModule({ imports: [{ module: "wrela", name: "memory", kind: "memory" }], funcs: [frameOnly] }),
-      "it imports `wrela.memory`",
+      "its import `wrela.memory` must be a shared memory, not a memory",
+    );
+    // Its own memory, rather than the shared one the host gives it.
+    await rejects(
+      buildModule({ memory: 1, ownMemory: true, funcs: [frameOnly] }),
+      "it doesn't import its memory, shared, as `wrela.memory`",
     );
     await load(buildModule({ memory: 1, funcs: [frameOnly] })); // no imports is fine
   });
@@ -81,13 +86,13 @@ describe("the ABI check", () => {
     );
   });
 
-  test("has no start function", async () => {
-    // It would submit before the host could read its memory.
+  test("has a start function that doesn't call the host", async () => {
+    // It runs while the module is instantiated, outside any call the host makes.
     const empty = new Encoder().finish();
     const start = { type: { params: [], results: [] }, body: [...op.i32(16), ...op.i32(empty.length), ...op.call(0)] };
     await rejects(
       buildModule({ imports: [SUBMIT], memory: 1, funcs: [frameOnly, start], data: [{ offset: 16, bytes: empty }], start: 2 }),
-      "invalid program: it has a start function; a wrela program may run only when the host calls it",
+      "invalid program: its start function called the host; a wrela program calls the host only from an export",
     );
   });
 
@@ -220,7 +225,7 @@ describe("the checks, with the native host's messages", () => {
   test("buffers", async () => {
     expect(await commandError(new Encoder().createBuffer(1, 16).createBuffer(1, 16).finish())).toEqual([
       "CreateBuffer",
-      "CreateBuffer failed: buffer 1 already exists",
+      "CreateBuffer failed: handle 1 already names a buffer",
     ]);
     expect((await commandError(new Encoder().createBuffer(1, 1 << 30).finish()))[1]).toBe(
       "CreateBuffer failed: buffer 1 is 1073741824 bytes; the limit is 134217728",
@@ -243,14 +248,14 @@ describe("the checks, with the native host's messages", () => {
       "Dispatch failed: pipeline 0 (draw) is a render pipeline; Dispatch needs a compute pipeline",
     );
     expect(await dispatchError((e) => e.dispatch(1, [1, 1, 1], [1], U16))).toBe(
-      "Dispatch failed: pipeline 1 (compute) binds 2 buffers, but the command lists 1",
+      "Dispatch failed: pipeline 1 (compute) binds 2 resources, but the command lists 1",
     );
     expect(await dispatchError((e) => e.dispatch(1, [1, 1, 1], [1, 2], new Uint8Array(8)))).toBe(
       "Dispatch failed: pipeline 1 (compute) takes 16 uniform bytes, but the command has 8",
     );
     expect(await dispatchError((e) => e.dispatch(1, [1, 1, 1], [1, 9], U16))).toBe("Dispatch failed: there's no buffer 9");
     expect(await dispatchError((e) => e.dispatch(1, [1, 1, 1], [1, 1], U16))).toBe(
-      "Dispatch failed: buffer 1 is bound both read-only and read-write in one dispatch",
+      "Dispatch failed: buffer 1 is used both read-only and read-write in one dispatch",
     );
     expect(await dispatchError((e) => e.dispatch(1, [65536, 1, 1], [1, 2], U16))).toBe(
       "Dispatch failed: 65536x1x1 workgroups is over the limit of 65535 per dimension",
@@ -268,7 +273,7 @@ describe("the checks, with the native host's messages", () => {
       e.beginScreenPass([0, 0, 0, 0]).draw(0, 3, 1, [1, 2], U16).draw(0, 3, 1, [2, 1], U16).present(),
     );
     expect((await commandError(aliased))[1]).toBe(
-      "Draw failed: buffer 2 is bound both read-only and read-write in one screen pass",
+      "Draw failed: buffer 2 is used both read-only and read-write in one pass",
     );
     const twoPasses = withBuffers((e) => {
       e.beginScreenPass([0, 0, 0, 0]).draw(0, 3, 1, [1, 2], U16).present();
@@ -283,9 +288,9 @@ test("writable aliases and clear colours", async () => {
   const m = shapes();
   for (const p of m.pipelines) {
     p.uniform = null;
-    p.buffers = [
-      { binding: 1, access: "read_write" },
-      { binding: 2, access: "read_write" },
+    p.bindings = [
+      { binding: 1, kind: "read_write" },
+      { binding: 2, kind: "read_write" },
     ];
   }
   const why = async (manifest: typeof m, batch: Uint8Array) => {
@@ -331,7 +336,7 @@ test("first-light's CPU side gives the native host's state hash", async () => {
   const manifest = parseManifest(readFixtureText("manifest.json"));
   const program = await Program.load(readFixture("game.wasm"), checker(manifest), new Recorder(), { hash: true });
   for (let i = 0; i < 60; i++) program.frame(i / 60, 640, 360);
-  expect(program.hash!.hex()).toBe("affac621a26ab564");
+  expect(program.hash!.hex()).toBe("82cb694bcab728bd");
   const log = (program.executor as Recorder).log;
   expect(log.slice(0, 7)).toEqual(["CreateBuffer", "WriteBuffer", "Dispatch", "BeginScreenPass", "Draw", "Present", "end"]);
   expect(log.length).toBe(3 + 60 * 4);
@@ -348,4 +353,107 @@ test("reads the offsets of a stack trace's WASM frames", () => {
   expect(wasmOffsets(v8)).toEqual([0x2f1, 0x340]);
   expect(wasmOffsets("div@http://localhost/game.wasm:wasm-function[7]:0x2f1\n")).toEqual([0x2f1]);
   expect(wasmOffsets("<?>.wasm-function[7]@[wasm code]")).toEqual([]);
+});
+
+describe("requests", () => {
+  const STATUS = { module: "wrela", name: "request_status", kind: "func" as const, type: { params: ["i32" as const], results: ["i32" as const] } };
+  const TAKE = { module: "wrela", name: "request_take", kind: "func" as const, type: { params: ["i32" as const, "i32" as const], results: [] } };
+  const I32 = { params: [], results: ["i32" as const] };
+  const NONE_TYPE = { params: [], results: [] };
+
+  /** A program whose `ask` submits `batch`, `status` is request 4's status, and `take` takes
+   * its answer into memory and returns the answer's first word. */
+  const program = (batch: Uint8Array, io?: Parameters<typeof Program.load>[3]) =>
+    Program.load(
+      buildModule({
+        imports: [SUBMIT, STATUS, TAKE],
+        memory: 1,
+        funcs: [
+          { type: FRAME_TYPE, body: [], export: "frame" },
+          { type: NONE_TYPE, body: [...op.i32(16), ...op.i32(batch.length), ...op.call(0)], export: "ask" },
+          { type: I32, body: [...op.i32(4), ...op.call(1)], export: "status" },
+          { type: I32, body: [...op.i32(4), ...op.i32(1024), ...op.call(2), ...op.i32(1024), 0x28, 0x02, 0x00], export: "take" },
+        ],
+        data: [{ offset: 16, bytes: batch }],
+      }),
+      checker(),
+      new Recorder(),
+      io,
+    );
+  const later = () => new Promise((r) => setTimeout(r, 0));
+
+  test("are answered from a later call, then taken once", async () => {
+    const io = {
+      fetch: async (url: string) => (url === "data/level.bin" ? Uint8Array.of(1, 2, 3, 4, 5) : Promise.reject(new Error("no such file"))),
+      storageRead: async () => new Uint8Array(0),
+      storageWrite: async () => {},
+    };
+    const p = await program(new Encoder().fetch(4, "data/level.bin").finish(), { io });
+    p.call("ask");
+    expect(p.call("status")).toBe(-1);
+    await later();
+    expect(p.call("status")).toBe(5);
+    expect(p.call("take")).toBe(0x04030201);
+    expect(p.call("status")).toBe(-1);
+  });
+
+  test("fail without a place to go, and a request number is used once at a time", async () => {
+    const p = await program(new Encoder().storageRead(4, "saves/slot1").finish());
+    p.call("ask");
+    expect(() => p.call("ask")).toThrow("StorageRead failed: request 4 is already in use");
+    await later();
+    expect(p.call("status")).toBe(-2);
+    expect(p.call("take")).toBe(0);
+    expect(() => p.call("take")).toThrow("request_take(4): the request isn't answered");
+  });
+
+  test("a readback without a GPU fails", async () => {
+    const batch = new Encoder().createBuffer(1, 16).readBuffer(4, 1, 0, 8).destroyBuffer(1).finish();
+    const p = await program(batch);
+    p.call("ask");
+    await later();
+    expect(p.call("status")).toBe(-2);
+  });
+
+  test("storage paths stay inside the program's storage", async () => {
+    const p = await program(new Encoder().storageWrite(4, "../escape", Uint8Array.of(1)).finish());
+    expect(() => p.call("ask")).toThrow("StorageWrite failed: the storage path `../escape` has an empty, `.` or `..` part");
+  });
+});
+
+describe("the voice", () => {
+  const AUDIO = { module: "wrela", name: "audio", kind: "func" as const, type: { params: ["i32" as const, "i32" as const], results: [] } };
+  // `init` starts the voice (task 3, context 100); `again` starts another.
+  const start = [...op.i32(3), ...op.i32(100), ...op.call(0)];
+  const wasm = buildModule({
+    imports: [AUDIO],
+    memory: 1,
+    funcs: [
+      frameOnly,
+      { type: { params: [], results: [] }, body: start, export: "init" },
+      { type: { params: [], results: [] }, body: start, export: "again" },
+      { type: { params: ["i32", "i32"], results: [] }, body: [], export: "__audio" },
+    ],
+  });
+
+  test("is handed to the audio thread once", async () => {
+    const voices: { task: number; context: number }[] = [];
+    const p = await Program.load(wasm, checker(), new Recorder(), {
+      startVoice: (v) => voices.push({ task: v.task, context: v.context }),
+    });
+    expect(voices).toEqual([{ task: 3, context: 100 }]);
+    expect(p.hasVoice).toBe(true);
+    expect(() => p.call("again")).toThrow("a program starts one voice, and this one started a second");
+  });
+});
+
+test("a logged line goes to the console, prefixed", async () => {
+  const log = spyOn(console, "log").mockImplementation(() => {});
+  try {
+    const { error } = await run([[new Encoder().log("frame 1 é").finish()]]);
+    expect(error).toBeNull();
+    expect(log).toHaveBeenCalledWith("wrela: frame 1 é");
+  } finally {
+    log.mockRestore();
+  }
 });

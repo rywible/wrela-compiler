@@ -1,0 +1,9 @@
+// mistake: a `let` pattern binding a name a unit constant has
+// expect: E0309
+// fix: no
+use std::units::{m, s}
+
+fn rotate(a: f32) -> vec2 {
+    let (c, s) = (cos(a), sin(a))
+    vec2(c, s)
+}

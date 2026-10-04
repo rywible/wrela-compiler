@@ -4,7 +4,7 @@ use std::gpu::{
     dispatch, draw, present,
 }
 
-struct P: Copy + Clone + GpuData {
+struct P: Copy + GpuData {
     s: f32,
 }
 
@@ -25,13 +25,19 @@ fn fs(pixel: FragCoord, p: P) -> vec4 {
 
 pub fn frame(time: f32, width: u32, height: u32) {
     let out: GpuBuffer<f32> = buffer(64)
-    dispatch(fill, groups: 1, out: out) //~ E0603
-    dispatch(fill, groups: 1, scale: 1.0, out: out, extra: 2.0) //~ E0603
-    dispatch(fill, groups: 1, groups: 2, scale: 1.0, out: out) //~ E0304
+    // A bound kernel's arguments are matched as a call's are.
+    dispatch(fill.bind(out: mut out), groups: 1) //~ E0303
+    dispatch(fill.bind(scale: 1.0, out: mut out, extra: 2.0), groups: 1) //~ E0302
+    dispatch(fill.bind(1.0, mut out), groups: 1, groups: 2) //~ E0304
+    // Named alone, an entry point takes nothing.
+    dispatch(fill, groups: 1) //~ E0303
+    // The form before binding: the fix binds the arguments.
+    dispatch(fill, groups: 1, scale: 1.0, out: mut out) //~ E0603
     begin_screen_pass(clear: vec4(0.0, 0.0, 0.0, 1.0))
-    draw(vs, fs, vertices: 3, vertices: 6, p: P { s: 1.0 }) //~ E0304
-    draw(vs, fs, vertices: 3, instances: 1, instances: 2, p: P { s: 1.0 }) //~ E0304
-    draw(vs, fs, vertices: 3, p: P { s: 1.0 }, p: P { s: 2.0 }) //~ E0304
+    draw(vs, fs.bind(p: P { s: 1.0 }), vertices: 3, vertices: 6) //~ E0304
+    draw(vs, fs.bind(p: P { s: 1.0 }), vertices: 3, instances: 1, instances: 2) //~ E0304
+    draw(vs, fs.bind(p: P { s: 1.0 }, p: P { s: 2.0 }), vertices: 3) //~ E0304
+    draw(vs, fs, vertices: 3, p: P { s: 1.0 }) //~ E0603
     present()
 }
 
@@ -39,14 +45,9 @@ fn direct() {
     fill(1.0) //~ E0606
 }
 
-// `draw`'s own counts have these names: a shader's parameter of either can't be passed.
-@vertex
-fn counted(v: VertexIndex, instances: P) -> ClipPosition {
-    ClipPosition { position: vec4(instances.s, 0.0, 0.0, 1.0) }
-}
-
-fn draw_counted() {
-    draw(counted, fs, vertices: 3, instances: 1, p: P { s: 1.0 }) //~ E0603
+// A bound entry point is recorded where it's bound; it isn't a value to keep.
+fn kept(out: mut GpuBuffer<f32>) {
+    let job = fill.bind(1.0, mut out) //~ E0603
 }
 
 // An entry point runs on the GPU; one passed as a function would run on the CPU.

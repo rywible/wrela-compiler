@@ -1,0 +1,23 @@
+// A projection (`borrow T` or `mut T`) as a field of an ordinary struct, as a reference would
+// be in Rust. A projection lives only as long as the call that made it, so only a `borrow struct`
+// (itself a projection) can hold one. Otherwise store a handle or an owned copy.
+// ---- wrong
+struct Log {
+    lines: Vec<Text>,
+}
+
+struct Ctx {
+    log: mut Log,
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+struct Log {
+    lines: Vec<Text>,
+}
+
+borrow struct Ctx {
+    log: mut Log,
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

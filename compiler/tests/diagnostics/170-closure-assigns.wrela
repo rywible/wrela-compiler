@@ -1,0 +1,14 @@
+// mistake: a closure whose body is an assignment, without braces
+// expect: E0110
+// fix: yes
+fn each(xs: Vec<f32>, f: fn(f32)) {
+    for x in xs {
+        f(x)
+    }
+}
+
+fn total(xs: Vec<f32>) -> f32 {
+    var sum = 0.0
+    each(xs, |x| sum += x)
+    sum
+}

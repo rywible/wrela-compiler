@@ -1,0 +1,35 @@
+// The interval of a loop, or a recursion, whose end depends on the input. An interval runs
+// every path the input's range allows, so such a loop might not end. Loop a fixed number of
+// times (a `for` over constants), or bound the input.
+// ---- wrong
+use std::derive::{Interval, interval}
+
+fn wobble(t: f32) -> f32 {
+    var x = t
+    while x > 0.0 {
+        x -= 1.0
+    }
+    x
+}
+
+pub fn range(x: f32) -> f32 {
+    interval(wobble, Interval { lo: x, hi: x + 1.0 }).lo
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+use std::derive::{Interval, interval}
+
+fn wobble(t: f32) -> f32 {
+    var x = t
+    for _ in 0..4 {
+        x = x * 0.5
+    }
+    x
+}
+
+pub fn range(x: f32) -> f32 {
+    interval(wobble, Interval { lo: x, hi: x + 1.0 }).lo
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

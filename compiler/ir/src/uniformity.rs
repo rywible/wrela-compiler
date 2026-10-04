@@ -1,13 +1,14 @@
-//! WGSL's uniformity rule for derivatives (WGSL §15.2), checked on a fragment shader's module
-//! before it's flattened.
+//! WGSL's uniformity rule for derivatives and barriers (WGSL §15.2), checked on a fragment
+//! shader's or a kernel's module before it's flattened.
 //!
-//! `dpdx`, `dpdy` and `fwidth` compare a pixel with its neighbours, so WGSL requires every
-//! invocation to reach them together: in uniform control flow. Control flow stops being
-//! uniform inside a branch on a value that may differ between invocations (a varying, the
-//! fragment's position, a value computed from one, a variable assigned in such a branch).
-//! Branches that only fall through meet again after the `if`, and a loop's iterations meet
-//! again after the loop; but after a branch that may `return`, `break` or `continue`, the flow
-//! stays non-uniform until the function (or the loop) ends.
+//! `dpdx`, `dpdy` and `fwidth` compare a pixel with its neighbours, and a barrier waits for
+//! every invocation of the workgroup, so WGSL requires every invocation to reach them together:
+//! in uniform control flow. Control flow stops being uniform inside a branch on a value that
+//! may differ between invocations (a varying, the fragment's position, a value computed from
+//! one, a variable assigned in such a branch). Branches that only fall through meet again after
+//! the `if`, and a loop's iterations meet again after the loop; but after a branch that may
+//! `return`, `break` or `continue`, the flow stays non-uniform until the function (or the loop)
+//! ends.
 //!
 //! The analysis follows calls into their callees with the caller's flow, as flattening will
 //! inline them (`opt`), so it sees the code WGSL will see.
@@ -16,11 +17,39 @@ use crate::*;
 use std::collections::{HashMap, HashSet};
 use wrela_diag::Span;
 
-/// A derivative in non-uniform control flow.
+/// A collective operation (WGSL's term): the invocations that run it must all reach it
+/// together.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Collective {
+    Dpdx,
+    Dpdy,
+    Fwidth,
+    /// `textureSample`, and `textureSampleCompare`: they take derivatives to pick the detail.
+    Sample,
+    SampleCompare,
+    /// `workgroupBarrier`: for all the invocations of a workgroup.
+    Barrier,
+}
+
+impl Collective {
+    /// The operation, as WGSL names it: `dpdx`, `textureSample`, ...
+    pub fn wgsl_name(self) -> &'static str {
+        match self {
+            Collective::Dpdx => "dpdx",
+            Collective::Dpdy => "dpdy",
+            Collective::Fwidth => "fwidth",
+            Collective::Sample => "textureSample",
+            Collective::SampleCompare => "textureSampleCompare",
+            Collective::Barrier => "workgroupBarrier",
+        }
+    }
+}
+
+/// A collective operation in non-uniform control flow.
 #[derive(Clone, Debug, PartialEq)]
 pub struct NonUniform {
-    pub builtin: Builtin,
-    /// The function and the value the derivative defines.
+    pub op: Collective,
+    /// The function and the value the operation defines.
     pub func: FuncId,
     pub value: ValueId,
     /// Where the statement it's in comes from (the function's last `Stmt::At`).
@@ -30,9 +59,10 @@ pub struct NonUniform {
     pub path: Vec<FuncId>,
 }
 
-/// The derivatives the fragment shader `entry` reaches in non-uniform control flow. Its
-/// parameters (the varyings) differ between invocations, as do its builtin `inputs`.
-pub fn derivatives_in_non_uniform_flow(
+/// The collective operations (derivatives, samples, barriers) the entry point `entry` reaches
+/// in non-uniform control flow. Its parameters (a fragment shader's varyings) differ between
+/// invocations, as do its builtin `inputs`.
+pub fn collectives_in_non_uniform_flow(
     m: &Module,
     entry: FuncId,
     inputs: &[BuiltinInput],
@@ -57,7 +87,8 @@ struct Analysis<'m> {
     inputs: &'m [BuiltinInput],
     /// Each function's summary by its parameters' uniformity and its caller's flow.
     memo: HashMap<(FuncId, Vec<bool>, bool), Summary>,
-    seen: HashSet<(FuncId, ValueId)>,
+    /// Each finding once: by function, value and statement (a barrier defines no value).
+    seen: HashSet<(FuncId, ValueId, Option<Span>)>,
     out: Vec<NonUniform>,
 }
 
@@ -271,8 +302,14 @@ impl Fa<'_, '_> {
             PlaceRoot::Param(i) => st.params[i as usize],
             PlaceRoot::Resource(r) => match self.an.m.resources[r.index()].kind {
                 // Every invocation reads the same block, or buffer element at the same index.
-                ResourceKind::Uniform { .. } | ResourceKind::StorageRead => false,
-                ResourceKind::StorageReadWrite | ResourceKind::Private => true,
+                ResourceKind::Uniform { .. }
+                | ResourceKind::StorageRead
+                | ResourceKind::Texture { .. }
+                | ResourceKind::Sampler { .. } => false,
+                // Workgroup memory is written by other invocations (WGSL: non-uniform loads).
+                ResourceKind::StorageReadWrite
+                | ResourceKind::Private
+                | ResourceKind::Workgroup => true,
             },
             PlaceRoot::Ptr(v) => self.values[v.index()],
             // Constant data is the same for every invocation (and CPU only).
@@ -295,6 +332,17 @@ impl Fa<'_, '_> {
         *slot = if p.path.is_empty() { t } else { *slot || t };
     }
 
+    /// Notes a collective operation `op` defining `v`, if it's reached in non-uniform control
+    /// flow.
+    fn collective(&mut self, op: Collective, v: ValueId, cf: bool) {
+        if cf && self.an.seen.insert((self.id, v, self.at)) {
+            let mut path = self.path.clone();
+            path.pop();
+            let (func, at) = (self.id, self.at);
+            self.an.out.push(NonUniform { op, func, value: v, at, path });
+        }
+    }
+
     /// Whether the value `e` computes may differ between invocations; `v` is the value it
     /// defines.
     fn expr(&mut self, v: ValueId, e: &Expr, cf: bool, st: &mut State) -> bool {
@@ -313,14 +361,30 @@ impl Fa<'_, '_> {
             }
             Expr::Param(i) => cf || st.params[*i as usize],
             Expr::Builtin(b @ (Builtin::Dpdx | Builtin::Dpdy | Builtin::Fwidth), _) => {
-                if cf && self.an.seen.insert((self.id, v)) {
-                    let mut path = self.path.clone();
-                    path.pop();
-                    let (builtin, func, at) = (*b, self.id, self.at);
-                    self.an.out.push(NonUniform { builtin, func, value: v, at, path });
-                }
+                let op = match b {
+                    Builtin::Dpdx => Collective::Dpdx,
+                    Builtin::Dpdy => Collective::Dpdy,
+                    _ => Collective::Fwidth,
+                };
+                self.collective(op, v, cf);
                 // Neighbouring pixels' values differ.
                 true
+            }
+            // A barrier: every invocation of the workgroup must reach it together.
+            Expr::Barrier => {
+                self.collective(Collective::Barrier, v, cf);
+                false
+            }
+            // Another invocation may have changed what's there.
+            Expr::Atomic(..) => true,
+            Expr::Texture(op, ..) if op.uses_derivatives() => {
+                let op = if *op == TextureOp::Sample {
+                    Collective::Sample
+                } else {
+                    Collective::SampleCompare
+                };
+                self.collective(op, v, cf);
+                operands(self)
             }
             Expr::Call(g, args) => {
                 let ins: Vec<bool> = args

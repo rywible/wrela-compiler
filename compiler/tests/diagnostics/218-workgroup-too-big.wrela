@@ -1,0 +1,9 @@
+// mistake: a workgroup of 512 invocations
+// expect: E0605
+// fix: no
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch}
+
+@compute(512)
+fn fill(out: mut Slots<u32>, id: GlobalId) {
+    out[id] = id.x
+}

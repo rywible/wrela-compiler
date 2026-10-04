@@ -1,0 +1,16 @@
+// mistake: `match mut` on a `let` binding
+// expect: E0512
+// fix: yes
+enum Shape {
+    Circle(f32),
+    Square(f32),
+}
+
+fn grow() -> f32 {
+    let s = Shape::Circle(1.0)
+    match mut s {
+        Shape::Circle(r) => r *= 2.0,
+        Shape::Square(a) => a *= 2.0,
+    }
+    1.0
+}

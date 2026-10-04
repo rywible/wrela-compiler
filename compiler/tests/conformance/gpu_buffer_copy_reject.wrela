@@ -1,0 +1,12 @@
+// rejects: gpu.buffer-drop
+// A buffer isn't `Copy`.
+use std::gpu::{GpuBuffer, buffer}
+
+struct Handle: Copy {
+    b: GpuBuffer<f32>, //~ E0407
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    let a: GpuBuffer<f32> = buffer(64)
+    let c = a //~ E0518
+}

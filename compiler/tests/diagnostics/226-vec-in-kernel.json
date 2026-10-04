@@ -1,0 +1,29 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0600",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "`Vec<T>::push` allocates, and `collect` is a compute kernel, GPU code, which can't `alloc`",
+      "notes": [
+        "the call chain: collect → Vec<T>::push",
+        "using the heap (a `Vec`, a `String`, a `Box`, an f-string) is the `alloc` effect; see language.md §8 for what each context forbids"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 5,
+        "end": 262,
+        "end_column": 18,
+        "end_line": 9,
+        "line": 9,
+        "start": 249
+      },
+      "title": "an effect a context forbids"
+    }
+  ],
+  "version": 2
+}

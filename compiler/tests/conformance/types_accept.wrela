@@ -1,4 +1,4 @@
-// accepts: ty.scalars ty.cpu-only ty.vectors ty.arrays ty.runs ty.tuples ty.no-ref ty.tiers
+// accepts: ty.scalars ty.cpu-only ty.vectors ty.arrays ty.runs ty.tuples ty.no-ref ty.no-dyn
 // Tier 0: unitless numbers, no strings; another value is referred to by index, not `&`.
 struct Herd {
     leader: u32,

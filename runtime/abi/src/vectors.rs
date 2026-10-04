@@ -4,13 +4,16 @@
 //! `runtime/abi/vectors.json`; the browser runtime's tests run each one through its decoders
 //! and must get the same results and the same messages, so the two hosts can't drift apart.
 
-use crate::check::{self, Checker};
+use crate::check::Checker;
 use crate::hash::StateHash;
 use crate::lines::Lines;
 use crate::manifest::{
-    Access, BufferBinding, Manifest, Pipeline, Stage, UniformBlock, UniformSpace,
+    BindingKind, Manifest, Pipeline, ResourceBinding, Stage, UniformBlock, UniformSpace,
 };
-use crate::stream::{self, Command, Encoder, Sequencer, StreamError};
+use crate::stream::{
+    self, Binding, Command, Compare, Encoder, NONE, Pass, SCREEN, Sequencer, StreamError,
+    TextureFormat,
+};
 use serde_json::{Value, json};
 
 /// The checked-in vectors, relative to the repository root.
@@ -37,6 +40,10 @@ fn error(e: &StreamError) -> Value {
     json!({ "kind": kind(e), "message": e.to_string() })
 }
 
+fn bindings(bs: &[Binding]) -> Value {
+    bs.iter().map(|b| json!({ "handle": b.handle, "offset": b.offset, "size": b.size })).collect()
+}
+
 /// A command as the browser runtime decodes it.
 fn command(c: &Command) -> Value {
     match c {
@@ -46,17 +53,67 @@ fn command(c: &Command) -> Value {
         Command::WriteBuffer { handle, offset, data } => {
             json!({ "op": "WriteBuffer", "handle": handle, "offset": offset, "data": data })
         }
-        Command::Dispatch { pipeline, groups, buffers, uniforms } => json!({
-            "op": "Dispatch", "pipeline": pipeline, "groups": groups, "buffers": buffers,
+        Command::Dispatch { pipeline, groups, bindings: bs, uniforms } => json!({
+            "op": "Dispatch", "pipeline": pipeline, "groups": groups, "bindings": bindings(bs),
             "uniforms": uniforms,
         }),
         Command::BeginScreenPass { clear } => json!({ "op": "BeginScreenPass", "clear": clear }),
-        Command::Draw { pipeline, vertices, instances, buffers, uniforms } => json!({
+        Command::Draw { pipeline, vertices, instances, bindings: bs, uniforms } => json!({
             "op": "Draw", "pipeline": pipeline, "vertices": vertices, "instances": instances,
-            "buffers": buffers, "uniforms": uniforms,
+            "bindings": bindings(bs), "uniforms": uniforms,
         }),
         Command::Present => json!({ "op": "Present" }),
         Command::DestroyBuffer { handle } => json!({ "op": "DestroyBuffer", "handle": handle }),
+        Command::CopyBuffer { source, source_offset, destination, destination_offset, size } => {
+            json!({
+                "op": "CopyBuffer", "source": source, "sourceOffset": source_offset,
+                "destination": destination, "destinationOffset": destination_offset, "size": size,
+            })
+        }
+        Command::CreateTexture { handle, width, height, format } => json!({
+            "op": "CreateTexture", "handle": handle, "width": width, "height": height,
+            "format": format.name(),
+        }),
+        Command::WriteTexture { handle, x, y, width, height, data } => json!({
+            "op": "WriteTexture", "handle": handle, "x": x, "y": y, "width": width,
+            "height": height, "data": data,
+        }),
+        Command::DestroyTexture { handle } => json!({ "op": "DestroyTexture", "handle": handle }),
+        Command::CreateSampler { handle, linear, repeat, compare } => json!({
+            "op": "CreateSampler", "handle": handle, "linear": linear, "repeat": repeat,
+            "compare": compare.map(Compare::name),
+        }),
+        Command::DestroySampler { handle } => json!({ "op": "DestroySampler", "handle": handle }),
+        Command::BeginPass(p) => json!({
+            "op": "BeginPass",
+            "pass": {
+                "color": p.color, "keepColor": p.keep_color, "clear": p.clear, "depth": p.depth,
+                "keepDepth": p.keep_depth, "clearDepth": p.clear_depth,
+            },
+        }),
+        Command::EndPass => json!({ "op": "EndPass" }),
+        Command::DispatchIndirect { pipeline, arguments, offset, bindings: bs, uniforms } => {
+            json!({
+                "op": "DispatchIndirect", "pipeline": pipeline, "arguments": arguments,
+                "offset": offset, "bindings": bindings(bs), "uniforms": uniforms,
+            })
+        }
+        Command::DrawIndirect { pipeline, arguments, offset, bindings: bs, uniforms } => json!({
+            "op": "DrawIndirect", "pipeline": pipeline, "arguments": arguments,
+            "offset": offset, "bindings": bindings(bs), "uniforms": uniforms,
+        }),
+        Command::ReadBuffer { request, handle, offset, size } => json!({
+            "op": "ReadBuffer", "request": request, "handle": handle, "offset": offset,
+            "size": size,
+        }),
+        Command::StorageRead { request, path } => {
+            json!({ "op": "StorageRead", "request": request, "path": path })
+        }
+        Command::StorageWrite { request, path, data } => {
+            json!({ "op": "StorageWrite", "request": request, "path": path, "data": data })
+        }
+        Command::Fetch { request, url } => json!({ "op": "Fetch", "request": request, "url": url }),
+        Command::Log { text } => json!({ "op": "Log", "text": text }),
     }
 }
 
@@ -69,16 +126,43 @@ fn batch(name: &str, bytes: &[u8]) -> Value {
     json!({ "name": name, "bytes": hex(bytes), "outcome": outcome })
 }
 
+/// An offscreen pass into texture 8, with depth texture 9.
+fn offscreen() -> Pass {
+    Pass {
+        color: 8,
+        keep_color: false,
+        clear: [0.0, 0.0, 0.0, 1.0],
+        depth: 9,
+        keep_depth: false,
+        clear_depth: 1.0,
+    }
+}
+
 /// The golden batch: every command once.
 pub(crate) fn golden_batch() -> Vec<u8> {
     Encoder::new()
         .create_buffer(7, 16)
         .write_buffer(7, 4, &[1, 2, 3, 4, 5, 6, 7, 8])
-        .dispatch(0, [2, 1, 1], &[7], &[0xAA, 0xBB, 0xCC, 0xDD])
+        .dispatch(0, [2, 1, 1], &[Binding::range(7, 0, 16)], &[0xAA, 0xBB, 0xCC, 0xDD])
         .begin_screen_pass([0.0, 0.5, 1.0, 1.0])
         .draw(1, 3, 1, &[], &[1, 0, 0, 0, 2, 0, 0, 0])
         .present()
         .destroy_buffer(7)
+        .copy_buffer(1, 4, 2, 8, 12)
+        .create_texture(8, 2, 1, TextureFormat::Rgba8)
+        .write_texture(8, [0, 0], [2, 1], &[1, 2, 3, 4, 5, 6, 7, 8])
+        .destroy_texture(8)
+        .create_sampler(10, true, false, Some(Compare::Less))
+        .destroy_sampler(10)
+        .begin_pass(offscreen())
+        .end_pass()
+        .dispatch_indirect(0, 3, 4, &[Binding::of(5)], &[])
+        .draw_indirect(1, 3, 16, &[], &[])
+        .read_buffer(1, 3, 0, 8)
+        .storage_read(2, "saves/slot1")
+        .storage_write(3, "saves/a", &[1, 2, 3, 4, 5])
+        .fetch(4, "data/level.bin")
+        .log("frame 3: 2 grazers, é")
         .finish()
 }
 
@@ -90,15 +174,16 @@ fn batches() -> Vec<Value> {
         b
     };
     let present = || Encoder::new().present().finish();
+    let b = |h: u32| Binding::range(h, 0, 64);
     vec![
         batch("golden", &golden_batch()),
         batch(
             "decodes what it encodes",
             &Encoder::new()
                 .create_buffer(1, 64)
-                .dispatch(2, [4, 2, 1], &[1, 3], &[9, 9, 9, 9])
+                .dispatch(2, [4, 2, 1], &[b(1), b(3)], &[9, 9, 9, 9])
                 .begin_screen_pass([0.25, 0.5, 0.75, 1.0])
-                .draw(0, 3, 2, &[1], &[])
+                .draw(0, 3, 2, &[b(1)], &[])
                 .present()
                 .finish(),
         ),
@@ -127,12 +212,57 @@ fn batches() -> Vec<Value> {
             b
         }),
         batch(
-            "a buffer list running past the payload",
+            "a binding list running past the payload",
             &edit(Encoder::new().dispatch(0, [1, 1, 1], &[], &[]).finish(), h + 8 + 16, 200),
         ),
         batch(
             "a write whose length disagrees with its data",
             &edit(Encoder::new().write_buffer(1, 0, &[0; 8]).finish(), h + 8 + 8, 4),
+        ),
+        batch(
+            "an unknown texture format",
+            &edit(
+                Encoder::new().create_texture(1, 4, 4, TextureFormat::Rgba8).finish(),
+                h + 8 + 12,
+                9,
+            ),
+        ),
+        batch(
+            "a zero-width texture",
+            &edit(
+                Encoder::new().create_texture(1, 4, 4, TextureFormat::Rgba8).finish(),
+                h + 8 + 4,
+                0,
+            ),
+        ),
+        batch(
+            "an unknown comparison",
+            &edit(Encoder::new().create_sampler(1, true, false, None).finish(), h + 8 + 12, 9),
+        ),
+        batch(
+            "a load that isn't 0 or 1",
+            &edit(Encoder::new().begin_pass(offscreen()).finish(), h + 8 + 4, 2),
+        ),
+        batch(
+            "an unaligned copy",
+            &edit(Encoder::new().copy_buffer(1, 0, 2, 0, 8).finish(), h + 8 + 16, 6),
+        ),
+        batch("a path that isn't UTF-8", &{
+            let mut b = Encoder::new().storage_read(1, "ab").finish();
+            b[h + 16] = 0xFF;
+            b
+        }),
+        batch(
+            "a path length that disagrees with the payload",
+            &edit(Encoder::new().fetch(1, "data").finish(), h + 12, 9),
+        ),
+        batch(
+            "a log line that isn't UTF-8",
+            &edit(Encoder::new().log("ok").finish(), h + 12, 0xFF),
+        ),
+        batch(
+            "an unaligned indirect offset",
+            &edit(Encoder::new().draw_indirect(0, 1, 0, &[], &[]).finish(), h + 8 + 8, 2),
         ),
     ]
 }
@@ -151,13 +281,14 @@ fn sequence(name: &str, bytes: &[u8]) -> Value {
 
 fn sequences() -> Vec<Value> {
     let e = Encoder::new;
+    let screen = Pass { color: SCREEN, depth: NONE, ..offscreen() };
     vec![
         sequence("in order", &golden_batch()),
         sequence("a draw outside a pass", &e().draw(0, 3, 1, &[], &[]).finish()),
         sequence("a present outside a pass", &e().present().finish()),
         sequence(
             "a pass inside a pass",
-            &e().begin_screen_pass([0.0; 4]).begin_screen_pass([0.0; 4]).finish(),
+            &e().begin_screen_pass([0.0; 4]).begin_pass(offscreen()).finish(),
         ),
         sequence(
             "a buffer made in a pass",
@@ -165,30 +296,53 @@ fn sequences() -> Vec<Value> {
         ),
         sequence(
             "a dispatch in a pass",
-            &e().begin_screen_pass([0.0; 4]).dispatch(0, [1; 3], &[], &[]).finish(),
+            &e().begin_pass(offscreen()).dispatch(0, [1; 3], &[], &[]).finish(),
         ),
-        sequence("a pass left open", &e().begin_screen_pass([0.0; 4]).finish()),
+        sequence("a pass left open", &e().begin_pass(offscreen()).finish()),
         sequence(
             "a buffer destroyed in a pass",
             &e().create_buffer(0, 4).begin_screen_pass([0.0; 4]).destroy_buffer(0).finish(),
+        ),
+        sequence(
+            "an offscreen pass ended by Present",
+            &e().begin_pass(offscreen()).present().finish(),
+        ),
+        sequence(
+            "a screen pass ended by EndPass",
+            &e().begin_screen_pass([0.0; 4]).end_pass().finish(),
+        ),
+        sequence(
+            "a pass on the screen with depth",
+            &e().begin_pass(Pass { depth: 9, ..screen })
+                .draw_indirect(0, 1, 0, &[], &[])
+                .present()
+                .finish(),
+        ),
+        sequence(
+            "a copy in a pass",
+            &e().begin_pass(offscreen()).copy_buffer(1, 0, 2, 0, 4).finish(),
+        ),
+        sequence(
+            "a readback in a pass",
+            &e().begin_screen_pass([0.0; 4]).read_buffer(0, 1, 0, 4).finish(),
         ),
     ]
 }
 
 /// The manifest the check vectors (and the native host's tests) run against: pipelines 0 and 2
 /// render, 1, 3 and 4 compute; 0 to 3 take 16 uniform bytes, 0 and 1 bind a read-only buffer
-/// then a read-write one, 2 and 3 two read-write ones; 4 takes nothing.
+/// then a read-write one, 2 and 3 two read-write ones; 4 takes nothing; 5 renders with a
+/// texture, a sampler, a depth texture and a comparison sampler.
 pub fn check_manifest() -> Manifest {
     let mut m = Manifest::new("game.wasm");
+    let bind = |binding, kind| ResourceBinding { binding, kind };
     let shape = |name: &str, stage| Pipeline {
         name: name.into(),
         shader: format!("{name}.wgsl"),
         stage,
         uniform: Some(UniformBlock { binding: 0, size: 16, space: UniformSpace::Uniform }),
-        buffers: vec![
-            BufferBinding { binding: 1, access: Access::Read },
-            BufferBinding { binding: 2, access: Access::ReadWrite },
-        ],
+        bindings: vec![bind(1, BindingKind::Read), bind(2, BindingKind::ReadWrite)],
+        debug_flag: None,
     };
     let render = Stage::Render { vertex_entry: "vs".into(), fragment_entry: "fs".into() };
     m.pipelines.push(shape("draw", render.clone()));
@@ -196,13 +350,23 @@ pub fn check_manifest() -> Manifest {
     m.pipelines.push(shape("compute", compute.clone()));
     // Two writable bindings, which one command may not give the same buffer.
     let write_twice = |mut p: Pipeline| {
-        p.buffers[0].access = Access::ReadWrite;
+        p.bindings[0].kind = BindingKind::ReadWrite;
         p
     };
-    m.pipelines.push(write_twice(shape("draw2", render)));
+    m.pipelines.push(write_twice(shape("draw2", render.clone())));
     m.pipelines.push(write_twice(shape("compute2", compute.clone())));
-    // A kernel with no uniform block and no buffers.
-    m.pipelines.push(Pipeline { uniform: None, buffers: Vec::new(), ..shape("bare", compute) });
+    // A kernel with no uniform block and no bindings.
+    m.pipelines.push(Pipeline { uniform: None, bindings: Vec::new(), ..shape("bare", compute) });
+    m.pipelines.push(Pipeline {
+        uniform: None,
+        bindings: vec![
+            bind(0, BindingKind::Texture),
+            bind(1, BindingKind::Sampler),
+            bind(2, BindingKind::DepthTexture),
+            bind(3, BindingKind::ComparisonSampler),
+        ],
+        ..shape("textured", render)
+    });
     m
 }
 
@@ -225,43 +389,80 @@ fn check(name: &str, manifest: &Manifest, bytes: &[u8]) -> Value {
 fn checks() -> Value {
     let m = check_manifest();
     let u = [0u8; 16];
-    // Buffers 1 and 2, 64 bytes each, then `f`'s commands.
+    // Buffers 1 and 2, 512 bytes each, then `f`'s commands.
     let with_buffers = |f: &dyn Fn(&mut Encoder)| {
         let mut e = Encoder::new();
-        e.create_buffer(1, 64).create_buffer(2, 64);
+        e.create_buffer(1, 512).create_buffer(2, 512);
         f(&mut e);
         e.finish()
     };
-    let max = check::MAX_BUFFER_SIZE;
+    // Also texture 8 (4x4, rgba8), depth texture 9 (4x4), sampler 10 and comparison sampler 11.
+    let with_textures = |f: &dyn Fn(&mut Encoder)| {
+        with_buffers(&|e| {
+            e.create_texture(8, 4, 4, TextureFormat::Rgba8)
+                .create_texture(9, 4, 4, TextureFormat::Depth32Float)
+                .create_sampler(10, true, false, None)
+                .create_sampler(11, false, false, Some(Compare::Less));
+            f(e);
+        })
+    };
+    let b = |h: u32| Binding::range(h, 0, 512);
+    let ab = [b(1), b(2)];
+    let tex = [Binding::of(8), Binding::of(10), Binding::of(9), Binding::of(11)];
+    let pass = Pass {
+        color: 8,
+        keep_color: false,
+        clear: [0.0; 4],
+        depth: 9,
+        keep_depth: false,
+        clear_depth: 1.0,
+    };
+    let max = crate::Limits::DEFAULT.max_buffer_size;
     let cases = vec![
         check(
             "every command, used rightly",
             &m,
-            &with_buffers(&|e| {
-                e.write_buffer(1, 56, &[7; 8])
-                    .dispatch(1, [65_535, 1, 1], &[1, 2], &u)
+            &with_textures(&|e| {
+                e.write_buffer(1, 504, &[7; 8])
+                    .dispatch(1, [65_535, 1, 1], &ab, &u)
+                    .copy_buffer(1, 0, 2, 256, 256)
+                    .dispatch_indirect(1, 2, 500, &[b(1), Binding::range(2, 256, 256)], &u)
+                    .write_texture(8, [1, 1], [2, 2], &[0; 16])
                     .begin_screen_pass([0.0; 4])
-                    .draw(0, 3, 1, &[1, 2], &u)
+                    .draw(0, 3, 1, &ab, &u)
+                    .draw(5, 3, 1, &tex, &[])
                     .present()
+                    .begin_pass(Pass { color: stream::NONE, ..pass })
+                    .draw_indirect(0, 1, 496, &[Binding::range(2, 256, 4), b(1)], &u)
+                    .end_pass()
+                    .read_buffer(1, 1, 8, 16)
                     .destroy_buffer(1)
-                    .destroy_buffer(2);
+                    .destroy_buffer(2)
+                    .destroy_texture(8)
+                    .destroy_sampler(10);
             }),
         ),
         check("a handle used twice", &m, &with_buffers(&|e| _ = e.create_buffer(1, 4))),
+        check(
+            "a handle used twice by different kinds",
+            &m,
+            &with_buffers(&|e| _ = e.create_sampler(2, true, true, None)),
+        ),
         check(
             "a buffer over the size limit",
             &m,
             &Encoder::new().create_buffer(1, max).create_buffer(2, max + 4).finish(),
         ),
         check("a write to no buffer", &m, &Encoder::new().write_buffer(3, 0, &[1; 4]).finish()),
-        check("a write past the end", &m, &with_buffers(&|e| _ = e.write_buffer(1, 60, &[1; 8]))),
+        check("a write past the end", &m, &with_buffers(&|e| _ = e.write_buffer(1, 508, &[1; 8]))),
         check("destroying no buffer", &m, &Encoder::new().destroy_buffer(5).finish()),
+        check("destroying a texture as a buffer", &m, &with_textures(&|e| _ = e.destroy_buffer(8))),
         check(
             "a buffer used after it's destroyed",
             &m,
-            &with_buffers(&|e| _ = e.destroy_buffer(1).dispatch(1, [1; 3], &[1, 2], &u)),
+            &with_buffers(&|e| _ = e.destroy_buffer(1).dispatch(1, [1; 3], &ab, &u)),
         ),
-        check("no such pipeline", &m, &with_buffers(&|e| _ = e.dispatch(7, [1; 3], &[1, 2], &u))),
+        check("no such pipeline", &m, &with_buffers(&|e| _ = e.dispatch(7, [1; 3], &ab, &u))),
         check(
             "a pipeline without uniforms",
             &m,
@@ -275,51 +476,69 @@ fn checks() -> Value {
         check(
             "a draw with a compute pipeline",
             &m,
-            &with_buffers(&|e| _ = e.begin_screen_pass([0.0; 4]).draw(1, 3, 1, &[1, 2], &u)),
+            &with_buffers(&|e| _ = e.begin_screen_pass([0.0; 4]).draw(1, 3, 1, &ab, &u)),
         ),
         check(
             "a dispatch with a render pipeline",
             &m,
-            &with_buffers(&|e| _ = e.dispatch(0, [1; 3], &[1, 2], &u)),
+            &with_buffers(&|e| _ = e.dispatch(0, [1; 3], &ab, &u)),
         ),
-        check("too few buffers", &m, &with_buffers(&|e| _ = e.dispatch(1, [1; 3], &[1], &u))),
+        check("too few bindings", &m, &with_buffers(&|e| _ = e.dispatch(1, [1; 3], &[b(1)], &u))),
         check(
             "the wrong number of uniform bytes",
             &m,
-            &with_buffers(&|e| _ = e.dispatch(1, [1; 3], &[1, 2], &[0; 8])),
+            &with_buffers(&|e| _ = e.dispatch(1, [1; 3], &ab, &[0; 8])),
         ),
         check(
             "too many workgroups",
             &m,
-            &with_buffers(&|e| _ = e.dispatch(1, [1, 65_536, 1], &[1, 2], &u)),
+            &with_buffers(&|e| _ = e.dispatch(1, [1, 65_536, 1], &ab, &u)),
         ),
         check(
             "one buffer read and written in a dispatch",
             &m,
-            &with_buffers(&|e| _ = e.dispatch(1, [1; 3], &[1, 1], &u)),
+            &with_buffers(&|e| _ = e.dispatch(1, [1; 3], &[b(1), b(1)], &u)),
+        ),
+        check(
+            "two ranges of one buffer read and written in a dispatch",
+            &m,
+            &with_buffers(&|e| {
+                e.dispatch(
+                    1,
+                    [1; 3],
+                    &[Binding::range(1, 0, 256), Binding::range(1, 256, 256)],
+                    &u,
+                );
+            }),
         ),
         check(
             "one buffer read and written across a screen pass",
             &m,
             &with_buffers(&|e| {
-                e.begin_screen_pass([0.0; 4]).draw(0, 3, 1, &[1, 2], &u).draw(0, 3, 1, &[2, 1], &u);
+                e.begin_screen_pass([0.0; 4]).draw(0, 3, 1, &ab, &u).draw(
+                    0,
+                    3,
+                    1,
+                    &[b(2), b(1)],
+                    &u,
+                );
             }),
         ),
         check(
             "one buffer written twice in a dispatch",
             &m,
-            &with_buffers(&|e| _ = e.dispatch(3, [1; 3], &[1, 1], &u)),
+            &with_buffers(&|e| _ = e.dispatch(3, [1; 3], &[b(1), b(1)], &u)),
         ),
         check(
             "one buffer written twice in a draw",
             &m,
-            &with_buffers(&|e| _ = e.begin_screen_pass([0.0; 4]).draw(2, 3, 1, &[2, 2], &u)),
+            &with_buffers(&|e| _ = e.begin_screen_pass([0.0; 4]).draw(2, 3, 1, &[b(2), b(2)], &u)),
         ),
         check(
             "two draws in one screen pass may write one buffer",
             &m,
             &with_buffers(&|e| {
-                e.begin_screen_pass([0.0; 4]).draw(2, 3, 1, &[1, 2], &u).draw(2, 3, 1, &[1, 2], &u);
+                e.begin_screen_pass([0.0; 4]).draw(2, 3, 1, &ab, &u).draw(2, 3, 1, &ab, &u);
             }),
         ),
         check(
@@ -331,14 +550,161 @@ fn checks() -> Value {
             "each dispatch is its own scope",
             &m,
             &with_buffers(&|e| {
-                e.dispatch(1, [1; 3], &[1, 2], &u).dispatch(1, [1; 3], &[2, 1], &u);
+                e.dispatch(1, [1; 3], &ab, &u).dispatch(1, [1; 3], &[b(2), b(1)], &u);
             }),
+        ),
+        check(
+            "a binding past the end of its buffer",
+            &m,
+            &with_buffers(&|e| _ = e.dispatch(1, [1; 3], &[Binding::range(1, 256, 512), b(2)], &u)),
+        ),
+        check(
+            "a binding that doesn't start on 256 bytes",
+            &m,
+            &with_buffers(&|e| _ = e.dispatch(1, [1; 3], &[Binding::range(1, 4, 8), b(2)], &u)),
+        ),
+        check(
+            "an empty binding",
+            &m,
+            &with_buffers(&|e| _ = e.dispatch(1, [1; 3], &[Binding::range(1, 0, 0), b(2)], &u)),
+        ),
+        check(
+            "a copy within one buffer",
+            &m,
+            &with_buffers(&|e| _ = e.copy_buffer(1, 0, 1, 256, 4)),
+        ),
+        check("a copy past the end", &m, &with_buffers(&|e| _ = e.copy_buffer(1, 0, 2, 256, 260))),
+        check(
+            "indirect arguments past the end",
+            &m,
+            &with_buffers(&|e| _ = e.dispatch_indirect(1, 2, 504, &ab, &u)),
+        ),
+        check(
+            "indirect arguments written by the same dispatch",
+            &m,
+            &with_buffers(&|e| _ = e.dispatch_indirect(1, 2, 0, &ab, &u)),
+        ),
+        check(
+            "a texture over the size limit",
+            &m,
+            &Encoder::new().create_texture(1, 8193, 1, TextureFormat::Rgba8).finish(),
+        ),
+        check(
+            "a texture write past the edge",
+            &m,
+            &with_textures(&|e| _ = e.write_texture(8, [3, 0], [2, 1], &[0; 8])),
+        ),
+        check(
+            "a texture write of the wrong length",
+            &m,
+            &with_textures(&|e| _ = e.write_texture(8, [0, 0], [2, 1], &[0; 4])),
+        ),
+        check(
+            "a write to a depth texture",
+            &m,
+            &with_textures(&|e| _ = e.write_texture(9, [0, 0], [1, 1], &[0; 4])),
+        ),
+        check(
+            "a depth texture where a colour one goes",
+            &m,
+            &with_textures(&|e| {
+                e.begin_screen_pass([0.0; 4]).draw(
+                    5,
+                    3,
+                    1,
+                    &[Binding::of(9), Binding::of(10), Binding::of(9), Binding::of(11)],
+                    &[],
+                );
+            }),
+        ),
+        check(
+            "a comparison sampler where a filtering one goes",
+            &m,
+            &with_textures(&|e| {
+                e.begin_screen_pass([0.0; 4]).draw(
+                    5,
+                    3,
+                    1,
+                    &[Binding::of(8), Binding::of(11), Binding::of(9), Binding::of(11)],
+                    &[],
+                );
+            }),
+        ),
+        check(
+            "a buffer where a texture goes",
+            &m,
+            &with_textures(&|e| {
+                e.begin_screen_pass([0.0; 4]).draw(
+                    5,
+                    3,
+                    1,
+                    &[Binding::of(1), Binding::of(10), Binding::of(9), Binding::of(11)],
+                    &[],
+                );
+            }),
+        ),
+        check(
+            "a pass's target bound by its draw",
+            &m,
+            &with_textures(&|e| {
+                _ = e.begin_pass(Pass { depth: stream::NONE, ..pass }).draw(5, 3, 1, &tex, &[])
+            }),
+        ),
+        check(
+            "a depth texture as a colour target",
+            &m,
+            &with_textures(&|e| _ = e.begin_pass(Pass { color: 9, depth: stream::NONE, ..pass })),
+        ),
+        check(
+            "a colour texture as a depth target",
+            &m,
+            &with_textures(&|e| _ = e.begin_pass(Pass { depth: 8, ..pass })),
+        ),
+        check(
+            "targets of different sizes",
+            &m,
+            &with_textures(&|e| {
+                e.create_texture(12, 2, 2, TextureFormat::Rgba8)
+                    .begin_pass(Pass { color: 12, ..pass });
+            }),
+        ),
+        check(
+            "a pass with no target",
+            &m,
+            &with_textures(&|e| {
+                _ = e.begin_pass(Pass { color: stream::NONE, depth: stream::NONE, ..pass })
+            }),
+        ),
+        check(
+            "a clear depth that isn't finite",
+            &m,
+            &with_textures(&|e| _ = e.begin_pass(Pass { clear_depth: f32::NAN, ..pass })),
+        ),
+        check("a readback past the end", &m, &with_buffers(&|e| _ = e.read_buffer(0, 1, 256, 260))),
+        check(
+            "a storage path out of storage",
+            &m,
+            &Encoder::new().storage_read(1, "../etc").finish(),
+        ),
+        check(
+            "an absolute storage path",
+            &m,
+            &Encoder::new().storage_write(1, "/x", &[1]).finish(),
+        ),
+        check(
+            "a URL to another site",
+            &m,
+            &Encoder::new().fetch(1, "https://example.com/x").finish(),
+        ),
+        check(
+            "requests, made rightly",
+            &m,
+            &Encoder::new().storage_write(1, "a/b", &[1]).fetch(2, "c.bin").finish(),
         ),
     ];
     json!({ "manifest": m.to_json(), "batches": cases })
 }
 
-/// A manifest with one pipeline of each kind.
 pub(crate) fn sample_manifest() -> Manifest {
     let mut m = Manifest::new("game.wasm");
     m.pipelines.push(Pipeline {
@@ -346,14 +712,19 @@ pub(crate) fn sample_manifest() -> Manifest {
         shader: "pipeline_0.wgsl".into(),
         stage: Stage::Compute { entry: "main".into(), workgroup_size: [64, 1, 1] },
         uniform: Some(UniformBlock { binding: 0, size: 32, space: UniformSpace::Uniform }),
-        buffers: vec![BufferBinding { binding: 1, access: Access::ReadWrite }],
+        bindings: vec![ResourceBinding { binding: 1, kind: BindingKind::ReadWrite }],
+        debug_flag: None,
     });
     m.pipelines.push(Pipeline {
         name: "cover+shade".into(),
         shader: "pipeline_1.wgsl".into(),
         stage: Stage::Render { vertex_entry: "vs".into(), fragment_entry: "fs".into() },
         uniform: None,
-        buffers: vec![],
+        bindings: vec![
+            ResourceBinding { binding: 0, kind: BindingKind::Texture },
+            ResourceBinding { binding: 1, kind: BindingKind::Sampler },
+        ],
+        debug_flag: None,
     });
     m
 }
@@ -388,15 +759,18 @@ fn manifests() -> Vec<Value> {
         manifest("golden", golden.clone()),
         manifest(
             "another manifest version",
-            golden.replace("\"manifest_version\": 1", "\"manifest_version\": 2"),
+            golden.replace("\"manifest_version\": 2", "\"manifest_version\": 1"),
         ),
         manifest(
             "another stream version",
-            golden.replace("\"stream_version\": 2", "\"stream_version\": 9"),
+            golden.replace("\"stream_version\": 4", "\"stream_version\": 9"),
         ),
         manifest("too wide a workgroup", edited(&|m| compute(m, [512, 1, 1]))),
         manifest("too many invocations", edited(&|m| compute(m, [16, 16, 2]))),
-        manifest("a binding used twice", edited(&|m| m.pipelines[0].buffers[0].binding = 0)),
+        manifest("a binding used twice", edited(&|m| m.pipelines[0].bindings[0].binding = 0)),
+        manifest("a debug build's flag", edited(&|m| m.pipelines[0].debug_flag = Some(2))),
+        manifest("a debug flag on a binding", edited(&|m| m.pipelines[0].debug_flag = Some(1))),
+        manifest("a debug flag as a string", golden.replace("\"bindings\": [", "\"debug_flag\": \"2\",\n      \"bindings\": [")),
         manifest(
             "a uniform block that isn't a multiple of 16",
             edited(&|m| {
@@ -435,8 +809,18 @@ fn manifests() -> Vec<Value> {
         manifest(
             "too many storage buffers",
             edited(&|m| {
-                m.pipelines[1].buffers =
-                    (0..9).map(|i| BufferBinding { binding: i, access: Access::Read }).collect()
+                m.pipelines[1].bindings = (0..9)
+                    .map(|i| ResourceBinding { binding: i, kind: BindingKind::Read })
+                    .collect()
+            }),
+        ),
+        manifest(
+            "too many storage buffers with a debug flag",
+            edited(&|m| {
+                m.pipelines[1].bindings = (0..8)
+                    .map(|i| ResourceBinding { binding: i, kind: BindingKind::Read })
+                    .collect();
+                m.pipelines[1].debug_flag = Some(8);
             }),
         ),
         manifest("no shader", edited(&|m| m.pipelines[1].shader = String::new())),
@@ -465,9 +849,9 @@ fn manifests() -> Vec<Value> {
             ),
         ),
         manifest(
-            "a buffer binding as an array",
+            "a binding as an array",
             golden.replace(
-                "{\n          \"binding\": 1,\n          \"access\": \"read_write\"\n        }",
+                "{\n          \"binding\": 1,\n          \"kind\": \"read_write\"\n        }",
                 "[1, \"read_write\"]",
             ),
         ),
@@ -479,7 +863,7 @@ fn manifests() -> Vec<Value> {
         manifest("not an object", "[1]".into()),
         manifest(
             "a version as a string",
-            golden.replace("\"manifest_version\": 1", "\"manifest_version\": \"1\""),
+            golden.replace("\"manifest_version\": 2", "\"manifest_version\": \"2\""),
         ),
         manifest("pipelines not in an array", golden.replace("\"pipelines\": [", "\"pipelines\": {\"x\": [").replace("  ]\n}", "  ]}\n}")),
         manifest("a string for a number", golden.replace("\"size\": 32", "\"size\": \"32\"")),
@@ -487,7 +871,7 @@ fn manifests() -> Vec<Value> {
         // JSON can't tell 1 from 1.0, so neither host does.
         manifest(
             "whole numbers written with fractions",
-            golden.replace("\"manifest_version\": 1", "\"manifest_version\": 1.0").replace("\"size\": 32", "\"size\": 3.2e1"),
+            golden.replace("\"manifest_version\": 2", "\"manifest_version\": 2.0").replace("\"size\": 32", "\"size\": 3.2e1"),
         ),
         manifest("a negative number", golden.replace("\"binding\": 1", "\"binding\": -1")),
         manifest("a number past 32 bits", golden.replace("\"size\": 32", "\"size\": 4294967296")),
@@ -496,13 +880,14 @@ fn manifests() -> Vec<Value> {
         manifest("a small number", golden.replace("\"size\": 32", "\"size\": 1.5e-7")),
         manifest("a negative zero", golden.replace("\"binding\": 0", "\"binding\": -0.0")),
         manifest("a wrong kind", golden.replace("\"kind\": \"render\"", "\"kind\": \"draw\\n\"")),
+        manifest("an unknown binding kind", golden.replace("\"kind\": \"sampler\"", "\"kind\": \"storage_texture\"")),
         malformed("not JSON", golden.replace("}\n", "")),
         malformed("a byte-order mark", format!("\u{feff}{golden}")),
         malformed("a lone surrogate", golden.replace("\"sample\"", "\"\\ud800\"")),
         // Numbers are read as JavaScript reads them, correctly rounded: this one is `1`.
         manifest(
             "a fraction that rounds to a whole number",
-            golden.replace("\"manifest_version\": 1", "\"manifest_version\": 1.0000000000000001110"),
+            golden.replace("\"manifest_version\": 2", "\"manifest_version\": 2.0000000000000001110"),
         ),
         malformed(
             "a number past f64",

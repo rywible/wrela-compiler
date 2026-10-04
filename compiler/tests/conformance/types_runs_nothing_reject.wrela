@@ -3,7 +3,7 @@
 // back end has a form for yet.
 use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch}
 
-struct Tag: Copy + Clone + GpuData {}
+struct Tag: Copy + GpuData {}
 
 fn count<T: Copy>(xs: [T]) -> u32 { //~ E0702
     xs.len()
@@ -20,6 +20,6 @@ pub fn tags() -> u32 {
 
 pub fn frame(time: f32, width: u32, height: u32) {
     let tags: GpuBuffer<Tag> = buffer(3) //~ E0702
-    let out: GpuBuffer<f32> = buffer(64)
-    dispatch(k, groups: 1, tags: tags, out: out)
+    var out: GpuBuffer<f32> = buffer(64)
+    dispatch(k.bind(tags: tags, out: mut out), groups: 1)
 }

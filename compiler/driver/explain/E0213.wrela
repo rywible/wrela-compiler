@@ -1,0 +1,18 @@
+// A `var` at module level: wrela has no mutable global state. A program's state is the value
+// its `init` export returns, which the other exports take as their first parameter.
+// ---- wrong
+var SCORE: u32 = 0
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+struct Game {
+    score: u32,
+}
+
+pub fn init() -> Game {
+    Game { score: 0 }
+}
+
+pub fn frame(game: mut Game, time: f32, width: u32, height: u32) {
+    game.score += 1
+}

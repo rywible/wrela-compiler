@@ -1,0 +1,173 @@
+// Lossy encodings (AC5, D-049; compiler/tests/tests/suite/encodings.rs): each round-trips within
+// its documented error, and the GPU decodes what the CPU encoded as the CPU does.
+use std::field::hash_u32
+use std::gpu::{GlobalId, GpuBuffer, Half2, Oct32, Slots, Unorm8x4, buffer, dispatch, write}
+
+fn unit(h: u32) -> f32 {
+    f32(h >> 8) * (1.0 / 16777216.0)
+}
+
+/// A value from a seed and an index, in [lo, hi).
+fn rnd(seed: u32, i: u32, lo: f32, hi: f32) -> f32 {
+    lo + (hi - lo) * unit(hash_u32(hash_u32(i) ^ seed))
+}
+
+/// The largest |decode(encode(v)) − clamp(v, 0, 1)| over `n` random vectors in [-0.2, 1.2)⁴.
+pub fn unorm_error(seed: u32, n: u32) -> f32 {
+    var worst = 0.0
+    for i in 0..n {
+        let v = vec4(
+            rnd(seed, 4 * i, lo: -0.2, hi: 1.2),
+            rnd(seed, 4 * i + 1, lo: -0.2, hi: 1.2),
+            rnd(seed, 4 * i + 2, lo: -0.2, hi: 1.2),
+            rnd(seed, 4 * i + 3, lo: -0.2, hi: 1.2),
+        )
+        let d = abs(Unorm8x4::encode(v).decode() - clamp(v, vec4(0.0), vec4(1.0)))
+        worst = max(worst, max(max(d.x, d.y), max(d.z, d.w)))
+    }
+    worst
+}
+
+/// Over `n` values spread over f16's normal range by exponent, the largest relative error.
+pub fn half_error(seed: u32, n: u32) -> f32 {
+    var worst = 0.0
+    for i in 0..n {
+        let x = exp2(rnd(seed, i, lo: -14.0, hi: 15.9)) * (if i % 2 == 0 { 1.0 } else { -1.0 })
+        let y = Half2::encode(vec2(x, 0.0)).decode().x
+        worst = max(worst, abs(y - x) / abs(x))
+    }
+    worst
+}
+
+/// Every half float that isn't a NaN survives `decode` then `encode`, and every value halfway
+/// between two neighbours encodes to the one whose last bit is 0: how many don't.
+pub fn half_exhaustive() -> u32 {
+    var failures = 0
+    for h in 0..65535 {
+        let bits = h | (h << 16)
+        let v = Half2 { bits }.decode()
+        if v.x != v.x {
+            continue
+        }
+        if Half2::encode(v).bits != bits {
+            failures += 1
+        }
+        // The next half up in magnitude, unless this is the largest finite one.
+        let e = (h >> 10) & 31
+        if (h & 32767) < 31743 && e < 31 {
+            let next = Half2 { bits: h + 1 }.decode().x
+            if next == next && abs(next) < 1.0 / 0.0 {
+                let mid = (v.x + next) * 0.5
+                let want = if h % 2 == 0 { h } else { h + 1 }
+                if (Half2::encode(vec2(mid, 0.0)).bits & 65535) != want {
+                    failures += 1
+                }
+            }
+        }
+    }
+    failures
+}
+
+/// The largest angle, in radians, between a random direction and its decoded `Oct32`, over `n`.
+pub fn oct_error(seed: u32, n: u32) -> f32 {
+    var worst = 0.0
+    for i in 0..n {
+        let v = normalize(
+            vec3(
+                rnd(seed, 3 * i, lo: -1.0, hi: 1.0),
+                rnd(seed, 3 * i + 1, lo: -1.0, hi: 1.0),
+                rnd(seed, 3 * i + 2, lo: -1.0, hi: 1.0),
+            ),
+        )
+        let d = Oct32::encode(v).decode()
+        // The angle from its sine (|v × d|) and cosine, accurate for small angles.
+        worst = max(worst, atan2(length(cross(v, d)), dot(v, d)))
+    }
+    worst
+}
+
+struct Encoded: Copy + GpuData {
+    color: Unorm8x4,
+    half: Half2,
+    normal: Oct32,
+}
+
+struct Decoded: Copy + GpuData {
+    color: vec4,
+    normal: vec3,
+    half: vec2,
+}
+
+const N: u32 = 1024
+
+fn encoded(i: u32) -> Encoded {
+    let s = 77
+    Encoded {
+        color: Unorm8x4::encode(
+            vec4(
+                rnd(s, i, lo: 0.0, hi: 1.0),
+                rnd(s, i + N, lo: 0.0, hi: 1.0),
+                rnd(s, i + 2 * N, lo: 0.0, hi: 1.0),
+                0.5,
+            ),
+        ),
+        half: Half2::encode(
+            vec2(
+                rnd(s, i + 3 * N, lo: -1000.0, hi: 1000.0),
+                rnd(s, i + 4 * N, lo: -0.001, hi: 0.001),
+            ),
+        ),
+        normal: Oct32::encode(
+            vec3(
+                rnd(s, i + 5 * N, lo: -1.0, hi: 1.0),
+                rnd(s, i + 6 * N, lo: -1.0, hi: 1.0),
+                rnd(s, i + 7 * N, lo: -1.0, hi: 1.0),
+            ),
+        ),
+    }
+}
+
+fn decoded(e: Encoded) -> Decoded {
+    Decoded { color: e.color.decode(), normal: e.normal.decode(), half: e.half.decode() }
+}
+
+@compute(64)
+fn decode_all(input: [Encoded], out: mut Slots<Decoded>, id: GlobalId) {
+    out[id] = decoded(input[id.x])
+}
+
+pub struct Out {
+    gpu: GpuBuffer<Decoded>,
+}
+
+pub fn init() -> Out {
+    var input: Vec<Encoded> = Vec::new()
+    for i in 0..N {
+        input.push(encoded(i))
+    }
+    var buf: GpuBuffer<Encoded> = buffer(N)
+    write(mut buf, 0, input)
+    var gpu: GpuBuffer<Decoded> = buffer(N)
+    dispatch(decode_all.bind(input: buf, out: mut gpu), groups: N / 64)
+    Out { gpu }
+}
+
+/// The CPU's decoding of value `i`, flattened as the GPU's buffer holds it.
+pub fn cpu_decoded(i: u32, k: u32) -> f32 {
+    let d = decoded(encoded(i))
+    let all = [
+        d.color.x,
+        d.color.y,
+        d.color.z,
+        d.color.w,
+        d.normal.x,
+        d.normal.y,
+        d.normal.z,
+        0.0,
+        d.half.x,
+        d.half.y,
+    ]
+    all[k]
+}
+
+pub fn frame(state: mut Out, time: f32, width: u32, height: u32) {}

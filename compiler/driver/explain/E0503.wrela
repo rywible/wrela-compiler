@@ -1,0 +1,26 @@
+// An argument for a `mut` parameter without `mut` at the call. A call that changes a value
+// says so where it's made: `grow(mut x)`.
+// ---- wrong
+fn grow(x: mut f32) {
+    x *= 2.0
+}
+
+fn twice() -> f32 {
+    var x = 1.0
+    grow(x)
+    x
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+fn grow(x: mut f32) {
+    x *= 2.0
+}
+
+fn twice() -> f32 {
+    var x = 1.0
+    grow(mut x)
+    x
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

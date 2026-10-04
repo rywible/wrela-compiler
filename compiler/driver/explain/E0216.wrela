@@ -1,0 +1,10 @@
+// A unit suffix that wrela doesn't know: `2.0metres`. The suffixes are std::units' names
+// (`m`, `cm`, `km`, `s`, `ms`, `deg`, `rad`, `kg`, `Hz` and the others it declares).
+// ---- wrong
+const REACH: f32 = 2.0metres
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+const REACH: f32 = 2.0m
+
+pub fn frame(time: f32, width: u32, height: u32) {}

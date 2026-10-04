@@ -1,0 +1,44 @@
+// A type that doesn't implement a trait that a bound, an operator or a derive needs: `T: Shape`
+// called with a type that has no `impl Shape`.
+// ---- wrong
+trait Shape {
+    fn area(self) -> f32
+}
+
+struct Square {
+    side: f32,
+}
+
+fn total<S: Shape>(s: S) -> f32 {
+    s.area()
+}
+
+fn square_area() -> f32 {
+    total(Square { side: 2.0 })
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+trait Shape {
+    fn area(self) -> f32
+}
+
+struct Square {
+    side: f32,
+}
+
+impl Shape for Square {
+    fn area(self) -> f32 {
+        self.side * self.side
+    }
+}
+
+fn total<S: Shape>(s: S) -> f32 {
+    s.area()
+}
+
+fn square_area() -> f32 {
+    total(Square { side: 2.0 })
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

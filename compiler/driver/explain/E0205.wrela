@@ -1,0 +1,15 @@
+// A file in the package that can't be a module: it can't be read, it isn't UTF-8, or its name
+// isn't a valid module name. A module's file is named like a wrela name, `shapes.wrela`, with
+// no `-` or spaces.
+// ---- wrong
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- file my-shapes.wrela
+pub fn one() -> i32 {
+    1
+}
+// ---- fixed
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- file my_shapes.wrela
+pub fn one() -> i32 {
+    1
+}

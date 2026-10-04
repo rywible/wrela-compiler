@@ -1,0 +1,150 @@
+// The item table, built from a data file when the game is built (paper test §1).
+//
+// Changed from the paper test (Q13 and Q12 made these possible):
+// - A row's key and name are `String`s in a constant `Vec<ItemDef>`: a constant holds any owned
+//   value. The paper test cut byte ranges into the embedded file (F4, F5).
+// - Keywords are string patterns in `match` (F17), and `fail` returns `!`'s stand-in no more:
+//   `panic` diverges.
+// - `item_def(id)` returns a borrow of the constant (F12), so nothing passes the file around.
+
+use engine::sim::SimState
+use std::hash::{Hasher, StateHash}
+use std::serialize::{LoadError, Reader, Serialize, Writer}
+use std::units::kg
+use text::{columns, file_text, rows}
+
+pub enum ItemKind: Copy + Eq + Ord {
+    Weapon,
+    Armor,
+    Food,
+    Material,
+    Quest,
+}
+
+/// Where an item is worn. `Nowhere` for items that aren't.
+pub enum EquipSlot: Copy + Eq {
+    Nowhere,
+    Head,
+    Body,
+    Hands,
+    Feet,
+    MainHand,
+    OffHand,
+}
+
+/// One row of data/items.txt.
+pub struct ItemDef: Clone {
+    pub key: String, // "iron_sword": saves store this, so rows can move
+    pub name: String, // "Iron Sword"
+    pub kind: ItemKind,
+    pub weight: f32, // kg
+    pub max_stack: u32,
+    pub value: u32, // gold
+    pub equip: EquipSlot,
+}
+
+/// An item: its row in ITEMS.
+///
+/// Changed: `Eq` and `Ord` are declared, so ids compare with `==` (F6); there are still no
+/// tuple structs, so the row is a named field.
+pub struct ItemId: Copy + Eq + Ord + StateHash + SimState {
+    pub index: u32,
+}
+
+pub const ITEMS: Vec<ItemDef> = parse_items(file_text(embed("data/items.txt"), "data/items.txt"))
+pub const GOLD = item("gold_coin") // a misspelled key fails the build
+pub const SILVER_RING = item("silver_ring")
+pub const SWORD = item("iron_sword")
+pub const ARROW = item("arrow")
+pub const PELT = item("wolf_pelt")
+pub const BREAD = item("bread")
+
+fn parse_items(file: String) -> Vec<ItemDef> {
+    var items: Vec<ItemDef> = Vec::new()
+    for r in rows(file) {
+        let row = r.0
+        let c = columns(r.1, "|")
+        if c.len() != 7 {
+            panic(f"data/items.txt, line {row}: expected 7 columns, found {c.len()}")
+        }
+        items.push(
+            ItemDef {
+                key: c[0].clone(),
+                name: c[1].clone(),
+                kind: parse_kind(c[2], row),
+                weight: number(c[3], row) * kg,
+                max_stack: count(c[4], row),
+                value: count(c[5], row),
+                equip: parse_slot(c[6], row),
+            },
+        )
+    }
+    items
+}
+
+fn parse_kind(word: str, row: u32) -> ItemKind {
+    match word {
+        "weapon" => ItemKind::Weapon,
+        "armor" => ItemKind::Armor,
+        "food" => ItemKind::Food,
+        "material" => ItemKind::Material,
+        "quest" => ItemKind::Quest,
+        _ => panic(f"data/items.txt, line {row}: unknown kind `{word}`"),
+    }
+}
+
+fn parse_slot(word: str, row: u32) -> EquipSlot {
+    match word {
+        "none" => EquipSlot::Nowhere,
+        "head" => EquipSlot::Head,
+        "body" => EquipSlot::Body,
+        "hands" => EquipSlot::Hands,
+        "feet" => EquipSlot::Feet,
+        "main_hand" => EquipSlot::MainHand,
+        "off_hand" => EquipSlot::OffHand,
+        _ => panic(f"data/items.txt, line {row}: unknown slot `{word}`"),
+    }
+}
+
+fn number(s: str, row: u32) -> f32 {
+    let Some(x) = s.parse_f32() else { panic(f"data/items.txt, line {row}: `{s}` isn't a number") }
+    x
+}
+
+fn count(s: str, row: u32) -> u32 {
+    let Some(n) = s.parse_u32() else { panic(f"data/items.txt, line {row}: `{s}` isn't a count") }
+    n
+}
+
+/// An item by key, when the game is built.
+pub fn item(key: str) -> ItemId {
+    for i in 0..ITEMS.len() {
+        if ITEMS[i].key == key {
+            return ItemId { index: i }
+        }
+    }
+    panic(f"no item `{key}` in data/items.txt")
+}
+
+/// An item's row: a borrow of the constant (F12).
+pub fn item_def(id: ItemId) -> borrow ItemDef {
+    ITEMS[id.index]
+}
+
+/// A save stores an item's key, not its row, so a later build can add or reorder items. The
+/// leaves of a fieldwise trait are written by hand (§3).
+impl Serialize for ItemId {
+    fn serialize(self, w: mut Writer) {
+        w.write_str(ITEMS[self.index].key)
+    }
+
+    fn deserialize(r: mut Reader) -> Result<ItemId, LoadError> {
+        let key = r.read_string()? // owned: no `Result<borrow str, _>` (F14)
+        for i in 0..ITEMS.len() {
+            if ITEMS[i].key == key {
+                return Ok(ItemId { index: i })
+            }
+        }
+        Err(r.fail("an item this build doesn't have")) // removed since: migrate
+    }
+}

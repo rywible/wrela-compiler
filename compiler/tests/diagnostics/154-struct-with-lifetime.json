@@ -1,0 +1,118 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0114",
+      "file": "main.wrela",
+      "fixes": [
+        {
+          "edits": [
+            {
+              "end": 153,
+              "file": "main.wrela",
+              "replacement": "borrow struct",
+              "start": 147
+            },
+            {
+              "end": 164,
+              "file": "main.wrela",
+              "replacement": "",
+              "start": 160
+            }
+          ],
+          "message": "make it a `borrow struct`"
+        }
+      ],
+      "help": [
+        "a struct that holds projections is a `borrow struct` (§6.6)"
+      ],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "`'a` is a lifetime, which wrela doesn't have",
+      "notes": [
+        "wrela has no references, so nothing needs a lifetime: a parameter reads its argument in place, and a projection lives as long as the call that made it (§6.4)"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 15,
+        "end": 163,
+        "end_column": 17,
+        "end_line": 8,
+        "line": 8,
+        "start": 161
+      },
+      "title": "a lifetime or a loop label, which wrela doesn't have"
+    },
+    {
+      "code": "E0106",
+      "file": "main.wrela",
+      "fixes": [
+        {
+          "edits": [
+            {
+              "end": 177,
+              "file": "main.wrela",
+              "replacement": "",
+              "start": 176
+            }
+          ],
+          "message": "make it a `mut` projection"
+        }
+      ],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "`&` isn't a type in wrela",
+      "notes": [
+        "a `borrow struct`'s fields are projections: `borrow T` reads a place, `mut T` changes it (§6.6)"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 10,
+        "end": 177,
+        "end_column": 11,
+        "end_line": 9,
+        "line": 9,
+        "start": 176
+      },
+      "title": "`&` isn't a type or an operator on places"
+    },
+    {
+      "code": "E0114",
+      "file": "main.wrela",
+      "fixes": [
+        {
+          "edits": [
+            {
+              "end": 180,
+              "file": "main.wrela",
+              "replacement": "",
+              "start": 177
+            }
+          ],
+          "message": "remove it"
+        }
+      ],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "`'a` is a lifetime, which wrela doesn't have",
+      "notes": [
+        "wrela has no references, so nothing needs a lifetime: a parameter reads its argument in place, and a projection lives as long as the call that made it (§6.4)"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 11,
+        "end": 179,
+        "end_column": 13,
+        "end_line": 9,
+        "line": 9,
+        "start": 177
+      },
+      "title": "a lifetime or a loop label, which wrela doesn't have"
+    }
+  ],
+  "version": 2
+}

@@ -1,0 +1,52 @@
+// run: a default that isn't a literal is a constant expression, computed once by the build
+// (language.md §3, §10): arithmetic, units, constants and calls, for parameters and fields. A
+// default that isn't `Copy` is cloned where it's owned, and a borrowed parameter reads it in place.
+// expect: reach() = 2.15
+// expect: tolerance() = 0.001
+// expect: bags() = 3
+use std::units::cm
+
+const BASE: f32 = 0.5 * 2.0
+
+fn reach_of(len: f32 = BASE * 2.0 + 15cm) -> f32 {
+    len
+}
+
+pub fn reach() -> f32 {
+    reach_of()
+}
+
+struct Look {
+    tolerance: f32 = BASE / 1000.0,
+    resolution: u32 = 1024,
+}
+
+pub fn tolerance() -> f32 {
+    let l = Look { resolution: 8 }
+    l.tolerance
+}
+
+struct Bag: Clone {
+    items: Vec<u32>,
+}
+
+fn make() -> Bag {
+    var b = Bag { items: Vec::new() }
+    b.items.push(3)
+    b
+}
+
+fn count(b: Bag = make()) -> u32 {
+    b.items.len()
+}
+
+fn keep(b: take Bag = make()) -> u32 {
+    var b = take b
+    b.items.push(4)
+    b.items.len()
+}
+
+pub fn bags() -> u32 {
+    // `keep` changes its own copy, so the default is the same each time.
+    count() + keep() - keep() + count() + count()
+}

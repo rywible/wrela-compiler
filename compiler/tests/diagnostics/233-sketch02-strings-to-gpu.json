@@ -1,0 +1,28 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0604",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "`names` is a run of `String`, which isn't `GpuData`, so its elements can't go to the GPU",
+      "notes": [
+        "data crossing to the GPU must be `GpuData`, so its layout is the same on both sides (§6.13)"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 8,
+        "end": 175,
+        "end_column": 23,
+        "end_line": 7,
+        "line": 7,
+        "start": 160
+      },
+      "title": "data crossing to the GPU that isn't `GpuData`"
+    }
+  ],
+  "version": 2
+}

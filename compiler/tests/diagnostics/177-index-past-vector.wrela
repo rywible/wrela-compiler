@@ -1,0 +1,6 @@
+// mistake: indexing a `vec3` past its last component
+// expect: E0312
+// fix: no
+fn fourth(v: vec3) -> f32 {
+    v[3]
+}

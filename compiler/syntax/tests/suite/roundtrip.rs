@@ -28,6 +28,19 @@ fn formatting_normalizes() {
     assert_eq!(out, "fn f() {\n    let a = 1\n    let b = a + 2\n\n    let c = b\n}\n");
 }
 
+/// A place in a file goes to the same place in its token once the file is formatted, though
+/// `;`, `,` and line breaks come and go (`wrela fix` reports its fixes there).
+#[test]
+fn places_move_with_formatting() {
+    let src = "fn f(){let count=1;let b=count+2\n\n\n  let c = [b,count,]}\n";
+    let out = round_trip(src);
+    let at = |text: &str, s: &str| text.find(s).expect(s) as u32;
+    let mut places = [at(src, "b=c"), at(src, "unt="), at(src, "2\n"), at(src, "]}"), 0];
+    fmt::move_offsets(src, &out, &mut places);
+    let want = [at(&out, "b = c"), at(&out, "unt ="), at(&out, "2\n"), at(&out, "]\n}"), 0];
+    assert_eq!(places, want, "in:\n{out}");
+}
+
 #[test]
 fn comments_survive() {
     let src = "// top\n\n/// doc\nfn f() { // after brace\n    let a = 1 // trailing\n    // own line\n    let b = 2\n    // before close\n}\n// end\n";
@@ -209,9 +222,19 @@ fn random_comments_survive(path: &std::path::Path, mut rng: XorShift) {
     let tokens = wrela_syntax::lex(FileId(0), &text).tokens;
     let mut brackets = Brackets::default();
     let mut spots = Vec::new();
+    // Inside an f-string's hole nothing breaks a line (L22), so no comment goes there.
+    let mut in_hole = false;
     for w in tokens.windows(2) {
         brackets.track(w[0].kind);
         let (a, b) = (w[0].kind, w[1].kind);
+        match a {
+            TokenKind::FStringHead | TokenKind::FStringMid => in_hole = true,
+            TokenKind::FStringTail => in_hole = false,
+            _ => {}
+        }
+        if in_hole {
+            continue;
+        }
         if a == TokenKind::Newline || b == TokenKind::Eof {
             continue;
         }

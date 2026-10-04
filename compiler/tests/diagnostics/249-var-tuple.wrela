@@ -1,0 +1,8 @@
+// mistake: `var` with a tuple pattern
+// expect: E0100
+// fix: yes
+fn sum() -> f32 {
+    var (a, b) = (1.0, 2.0)
+    a += b
+    a
+}

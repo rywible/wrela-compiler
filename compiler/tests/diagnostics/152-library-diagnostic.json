@@ -1,0 +1,28 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0400",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "`Camera` can't be simulated: declare `SimState` on it, and give its fields `SimState` too",
+      "notes": [
+        "`Camera` doesn't implement `SimState`, which `S` in `tick` needs"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 10,
+        "end": 355,
+        "end_column": 11,
+        "end_line": 16,
+        "line": 16,
+        "start": 354
+      },
+      "title": "a type that doesn't implement a trait"
+    }
+  ],
+  "version": 2
+}

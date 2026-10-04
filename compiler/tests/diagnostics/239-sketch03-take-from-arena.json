@@ -1,0 +1,28 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0502",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [
+        "use `grazers[_].clone()` for a copy you own"
+      ],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "can't move out of `grazers[_]`: `grazers` is borrowed by this function, not owned",
+      "notes": [],
+      "severity": "error",
+      "span": {
+        "column": 10,
+        "end": 252,
+        "end_column": 20,
+        "end_line": 9,
+        "line": 9,
+        "start": 242
+      },
+      "title": "a move out of a projection"
+    }
+  ],
+  "version": 2
+}

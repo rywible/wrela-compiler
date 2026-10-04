@@ -1,0 +1,342 @@
+// SIMD against no SIMD (AC12, language.md §11): every vector operation the CPU computes in
+// SIMD, on vectors whose components are special values (zeros of both signs, extremes, a
+// subnormal, infinities, NaN) or random ones. compiler/tests/tests/suite/simd.rs builds this
+// with SIMD and without, and checks that each case gives the same bits for every seed.
+// `vec4_math` is the loop whose speed-up the test prints.
+
+use std::hash::canonical_bits
+
+pub fn frame(state: mut Shorts, time: f32, width: u32, height: u32) {}
+
+fn hash(x: u32) -> u32 {
+    var z = x.wrapping_mul(0x9e3779b9)
+    z = (z ^ (z >> 16)).wrapping_mul(0x85ebca6b)
+    z = (z ^ (z >> 13)).wrapping_mul(0xc2b2ae35)
+    z ^ (z >> 16)
+}
+
+const SPECIAL: [f32; 16] = [
+    0.0,
+    -0.0,
+    1.0,
+    -1.0,
+    0.5,
+    -2.5,
+    3.0e38,
+    -3.0e38,
+    1.0e-40,
+    -1.0e-40,
+    1.0e-30,
+    7.0,
+    0.1,
+    -0.75,
+    100.0,
+    0.333,
+]
+
+/// Component `k` of case `seed`: special (1 in 4), any bits at all (1 in 8: NaNs and
+/// infinities among them), or a moderate number.
+fn comp(seed: u32, k: u32) -> f32 {
+    let h = hash(seed.wrapping_mul(8).wrapping_add(k))
+    if h % 4 == 0 {
+        let s = SPECIAL[(h >> 8) % 16]
+        if (h >> 20) % 7 == 0 { s / 0.0 } else { s }
+    } else if h % 8 == 1 {
+        bitcast_f32(hash(h))
+    } else {
+        f32(h % 20000) / 1000.0 - 10.0
+    }
+}
+
+fn v2(seed: u32, at: u32) -> vec2 {
+    vec2(comp(seed, at), comp(seed, at + 1))
+}
+
+fn v3(seed: u32, at: u32) -> vec3 {
+    vec3(comp(seed, at), comp(seed, at + 1), comp(seed, at + 2))
+}
+
+fn v4(seed: u32, at: u32) -> vec4 {
+    vec4(comp(seed, at), comp(seed, at + 1), comp(seed, at + 2), comp(seed, at + 3))
+}
+
+fn mix_in(h: u32, x: f32) -> u32 {
+    (h ^ canonical_bits(x)).wrapping_mul(16777619)
+}
+
+fn h2(h: u32, v: vec2) -> u32 {
+    mix_in(mix_in(h, v.x), v.y)
+}
+
+fn h3(h: u32, v: vec3) -> u32 {
+    mix_in(mix_in(mix_in(h, v.x), v.y), v.z)
+}
+
+fn h4(h: u32, v: vec4) -> u32 {
+    mix_in(mix_in(mix_in(mix_in(h, v.x), v.y), v.z), v.w)
+}
+
+fn hb(h: u32, b: bool) -> u32 {
+    (h ^ if b { 1 } else { 0 }).wrapping_mul(16777619)
+}
+
+/// What the case count is: `case(op, seed)` for `op` below it.
+pub fn cases() -> u32 {
+    40
+}
+
+struct Holder: Copy {
+    a: f32,
+    v: vec3,
+    w: vec2,
+    vs: [vec4; 3],
+}
+
+/// Case `op` on the vectors of `seed`: the bits of its results, hashed.
+pub fn case(op: u32, seed: u32) -> u32 {
+    let (a2, b2, c2) = (v2(seed, 0), v2(seed, 2), v2(seed, 4))
+    let (a3, b3, c3) = (v3(seed, 0), v3(seed, 3), v3(seed, 6))
+    let (a4, b4, c4) = (v4(seed, 0), v4(seed, 4), v4(seed, 8))
+    let s = comp(seed, 12)
+    let h = 2166136261
+    match op {
+        0 => h4(h3(h2(h, a2 + b2), a3 + b3), a4 + b4),
+        1 => h4(h3(h2(h, a2 - b2), a3 - b3), a4 - b4),
+        2 => h4(h3(h2(h, a2 * b2), a3 * b3), a4 * b4),
+        3 => h4(h3(h2(h, a2 / b2), a3 / b3), a4 / b4),
+        4 => h4(h3(h2(h, a2 % b2), a3 % b3), a4 % b4),
+        5 => h4(h3(h2(h, -a2), -a3), -a4),
+        6 => h4(h3(h2(h, s * a2), a3 * s), s * a4 + s),
+        7 => h4(h3(h2(h, a2 / s), s / a3), a4 - s),
+        8 => mix_in(mix_in(mix_in(h, dot(a2, b2)), dot(a3, b3)), dot(a4, b4)),
+        9 => mix_in(mix_in(mix_in(h, length(a2)), length(a3)), length(a4)),
+        10 => mix_in(mix_in(mix_in(h, distance(a2, b2)), distance(a3, b3)), distance(a4, b4)),
+        11 => h4(h3(h2(h, normalize(a2)), normalize(a3)), normalize(a4)),
+        12 => h3(h3(h, cross(a3, b3)), cross(b3, c3)),
+        13 => h4(h3(h2(h, min(a2, b2)), min(a3, b3)), min(a4, b4)),
+        14 => h4(h3(h2(h, max(a2, b2)), max(a3, b3)), max(a4, b4)),
+        15 => h4(h3(h2(h, clamp(a2, b2, c2)), clamp(a3, b3, c3)), clamp(a4, b4, c4)),
+        16 => h4(h3(h2(h, abs(a2)), abs(a3)), abs(a4)),
+        17 => h4(h3(h2(h, floor(a2)), ceil(a3)), trunc(a4)),
+        18 => h4(h3(h2(h, round(a2)), fract(a3)), round(a4)),
+        19 => h4(h3(h2(h, sqrt(a2)), sqrt(a3)), inverse_sqrt(a4)),
+        20 => h4(h3(h2(h, sign(a2)), sign(a3)), sign(a4)),
+        21 => h4(h3(h2(h, mix(a2, b2, c2)), mix(a3, b3, s)), mix(a4, b4, c4)),
+        22 => h4(h3(h2(h, step(a2, b2)), step(a3, b3)), step(a4, b4)),
+        23 => h4(h3(h2(h, smoothstep(a2, b2, c2)), smoothstep(a3, b3, c3)), smoothstep(a4, b4, c4)),
+        24 => h4(h3(h2(h, saturate(a2)), saturate(a3)), saturate(a4)),
+        25 => hb(hb(hb(hb(h, a2 == b2), a3 == a3), a4 != b4), vec2(s) == vec2(s, s)),
+        26 => h4(h3(h2(h, a4.zx), a4.wyx), a3.zzxy),
+        27 => {
+            let i = seed % 3
+            mix_in(mix_in(mix_in(h, a2[i % 2]), a3[i]), a4[i + 1])
+        },
+        28 => {
+            var v = a3
+            v.y = s
+            var w = a4
+            w.x = w.z + s
+            w.w = -w.x
+            var u = a2
+            u.y += 1.0
+            h4(h3(h2(h, u), v), w)
+        },
+        29 => {
+            let m = mat3(a3, b3, c3)
+            h3(h3(h, m * a4.xyz), a4.yzw * m)
+        },
+        30 => {
+            let m = mat4(a4, b4, c4, a4 + b4)
+            let n = mat2(a2, b2)
+            h2(h4(h4(h, m * c4), b4 * m), n * c2)
+        },
+        31 => {
+            let m = mat3(a3, b3, c3)
+            let n = mat3(c3, a3, b3)
+            let p = m * n
+            h3(h3(h3(h, p[0]), p[1]), (m + n)[2] * s)
+        },
+        32 => {
+            var x = Holder { a: s, v: a3, w: b2, vs: [a4, b4, c4] }
+            x.v = x.v + b3
+            x.vs[seed % 3] = x.vs[(seed + 1) % 3] * s
+            x.w.x = x.a
+            let y = x
+            h2(h4(h4(h4(h3(h, y.v), y.vs[0]), y.vs[1]), y.vs[2]), y.w)
+        },
+        33 => h4(h3(h2(h, sin(a2)), exp(a3 * 0.01)), pow(abs(a4), b4 * 0.1)),
+        34 => h4(
+            h3(
+                h2(h, select(if_false: a2, if_true: b2, cond: s > 0.0)),
+                select(if_false: a3, if_true: b3, cond: s < 0.0),
+            ),
+            select(if_false: a4, if_true: b4, cond: s == s),
+        ),
+        35 => {
+            var acc = vec4(0.0)
+            for i in 0..8 {
+                acc = acc * 0.5 + v4(seed, i) * s
+            }
+            h4(h, acc)
+        },
+        36 => h4(h3(h2(h, vec2(s)), vec3(a2, s)), vec4(a2, b2)),
+        37 => h4(h3(h2(h, a2 * a2 - b2 * c2), (a3 + b3) * (c3 - a3) / s), (a4 * b4 + c4) * 0.5),
+        38 => mix_in(h, dot(a4 * 2.0, normalize(b4)) + length(cross(a3, b3))),
+        _ => {
+            let q = Quat::axis_angle(normalize(a3), s)
+            h4(h3(h, q.rotate(b3)), q.mul(Quat::axis_angle(vec3(0.0, 1.0, 0.0), 0.3)).v)
+        },
+    }
+}
+
+/// Every case of `seeds` seeds, from `from`, hashed: one call for many.
+pub fn all(from: u32, seeds: u32) -> u32 {
+    var h = 2166136261
+    for seed in from..from + seeds {
+        for op in 0..cases() {
+            h = (h ^ case(op, seed)).wrapping_mul(16777619)
+        }
+    }
+    h
+}
+
+/// A loop of `vec4` math: particles' positions stepped `steps` times, their positions summed.
+pub fn vec4_math(steps: u32) -> f32 {
+    var pos: [vec4; 256] = [vec4(0.0); 256]
+    var vel: [vec4; 256] = [vec4(0.0); 256]
+    for i in 0..256 {
+        let h = hash(i)
+        vel[i] = vec4(f32(h % 1000), f32((h >> 10) % 1000), f32((h >> 20) % 1000), 0.0) * 0.01
+    }
+    let g = vec4(0.0, -9.8, 0.0, 0.0)
+    for _ in 0..steps {
+        for i in 0..256 {
+            let v = vel[i] + g * 0.016
+            let p = pos[i] + v * 0.016
+            vel[i] = mix(v, -v * 0.5, step(vec4(10.0), abs(p)))
+            pos[i] = clamp(p, vec4(-10.0), vec4(10.0))
+        }
+    }
+    var sum = vec4(0.0)
+    for i in 0..256 {
+        sum += pos[i]
+    }
+    dot(sum, vec4(1.0))
+}
+
+// ---- loops four iterations at a time --------------------------------------------------------
+
+/// `a[i] * s + b[i]`, then a select, a built-in and the counter as an `f32`.
+fn kernel(out: mut [f32], a: [f32], b: [f32], s: f32, n: u32) {
+    for i in 0..n {
+        let x = a[i] * s + b[i]
+        let y = select(if_false: -x, if_true: sqrt(x), cond: x > 0.0)
+        out[i] = min(x, y) + f32(i) * 0.5
+    }
+}
+
+/// A local written before it's read, each iteration; and the elements read where they're
+/// written.
+fn in_place(xs: mut [f32], b: [f32], n: u32) {
+    for i in 0..n {
+        var t = xs[i]
+        t = t * t - b[i]
+        xs[i] = clamp(t, -4.0, 1.0e30) / 3.0
+    }
+}
+
+/// The componentwise built-ins.
+fn shapes(out: mut [f32], a: [f32], b: [f32], n: u32) {
+    for i in 0..n {
+        let t = fract(a[i]) * abs(b[i])
+        out[i] = mix(a[i], b[i], saturate(t)) +
+            smoothstep(-1.0, 1.0, a[i]) * step(0.0, b[i]) -
+            floor(b[i]) +
+            sign(a[i]) * max(t, inverse_sqrt(abs(a[i])))
+    }
+}
+
+/// A sum, which keeps a value from one iteration to the next: one at a time.
+fn total(xs: [f32], n: u32) -> f32 {
+    var s = 0.0
+    for i in 0..n {
+        s = s + xs[i]
+    }
+    s
+}
+
+/// Each loop above on `n` elements (at most 64) of case `seed`'s components, hashed.
+pub fn loops(seed: u32, n: u32) -> u32 {
+    var a: [f32; 64] = [0.0; 64]
+    var b: [f32; 64] = [0.0; 64]
+    var out: [f32; 64] = [0.0; 64]
+    for i in 0..64 {
+        a[i] = comp(seed, i)
+        b[i] = comp(seed, i + 64)
+    }
+    let s = comp(seed, 200)
+    var h = 2166136261
+    kernel(mut out, a, b, s, n)
+    for i in 0..64 {
+        h = mix_in(h, out[i])
+    }
+    in_place(mut a, b, n)
+    shapes(mut out, a, b, n)
+    for i in 0..64 {
+        h = mix_in(mix_in(h, out[i]), a[i])
+    }
+    mix_in(h, total(out, n))
+}
+
+/// `kernel` with a run of 40 for `b`: past 40 elements, it traps where it would one at a time,
+/// with the elements before it written.
+pub fn short(n: u32) -> u32 {
+    var a: [f32; 64] = [1.5; 64]
+    var b: [f32; 40] = [0.25; 40]
+    var out: [f32; 64] = [0.0; 64]
+    kernel(mut out, a, b, 2.0, n)
+    var h = 2166136261
+    for i in 0..64 {
+        h = mix_in(h, out[i])
+    }
+    h
+}
+
+/// The same, but `out` holds what was written when a trap stops it: read it after.
+pub struct Shorts {
+    out: [f32; 64],
+}
+
+pub fn init() -> Shorts {
+    Shorts { out: [0.0; 64] }
+}
+
+pub fn short_into(state: mut Shorts, n: u32) {
+    let a: [f32; 64] = [1.5; 64]
+    let b: [f32; 40] = [0.25; 40]
+    kernel(mut state.out, a, b, 2.0, n)
+}
+
+pub fn short_written(state: Shorts) -> u32 {
+    var h = 2166136261
+    for i in 0..64 {
+        h = mix_in(h, state.out[i])
+    }
+    h
+}
+
+/// A loop four iterations at a time: `steps` passes of `kernel` over 4096 elements.
+pub fn f32_loop(steps: u32) -> f32 {
+    var a: [f32; 4096] = [0.0; 4096]
+    var b: [f32; 4096] = [0.0; 4096]
+    var out: [f32; 4096] = [0.0; 4096]
+    for i in 0..4096 {
+        a[i] = f32(i % 100) * 0.01
+        b[i] = f32(i % 7) - 3.0
+    }
+    for _ in 0..steps {
+        kernel(mut out, a, b, 0.5, 4096)
+        in_place(mut a, out, 4096)
+    }
+    total(a, 4096)
+}

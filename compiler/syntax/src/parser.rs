@@ -34,6 +34,8 @@ pub fn parse_tokens(file: FileId, text: &str, lexed: Lexed) -> Parsed {
     let mut p = Parser {
         file,
         text,
+        lifetimes: lexed.lifetimes,
+        field_of: None,
         tokens: Tokens::new(file, lexed.tokens),
         brackets: (0, Brackets::default()),
         pos: 0,
@@ -41,10 +43,13 @@ pub fn parse_tokens(file: FileId, text: &str, lexed: Lexed) -> Parsed {
         syntax_errors: 0,
         nesting: 0,
         recovered_at: None,
+        trait_type_here: false,
         closers: Vec::new(),
+        print_fixes: Vec::new(),
     };
     p.tokens.reach(AHEAD);
     let f = p.parse_file();
+    p.settle_print_fixes(&f);
     Parsed { file: f, comments: lexed.comments, diagnostics: p.diags }
 }
 
@@ -72,6 +77,17 @@ pub(crate) struct Parser<'a> {
     /// brackets L19 counts as open. Recovery stops at one of these; any other closer closes
     /// nothing (L19) and is skipped.
     pub(crate) closers: Vec<T>,
+    /// Whether the type about to be parsed is a whole parameter or return type, where a trait
+    /// names a type: there `dyn Trait` reads as the trait, and removing `dyn` fixes it.
+    trait_type_here: bool,
+    /// Where in `diags` the fixes of `println!` and its kin are: each needs `std::io::print`,
+    /// which only the whole module shows how to name (`settle_print_fixes`).
+    print_fixes: Vec<usize>,
+    /// Where the lexer found lifetimes (E0114).
+    lifetimes: Vec<Span>,
+    /// While a struct's fields are parsed: whether it had a lifetime, which makes it a
+    /// `borrow struct` once fixed. A `&` in a field's type is fixed to fit.
+    field_of: Option<bool>,
 }
 
 /// The tokens. The parser changes them as it reads: it splits a `>>` in two (L16), and reads
@@ -223,6 +239,11 @@ impl<'a> Parser<'a> {
         self.tokens.get(self.pos + k).map_or(T::Eof, |t| t.kind)
     }
 
+    /// The token `k` ahead (the last one, EOF, past the end).
+    pub(crate) fn token_at(&self, k: usize) -> Token {
+        self.tokens.get(self.pos + k).unwrap_or_else(|| self.tokens[self.pos])
+    }
+
     fn at(&self, kind: T) -> bool {
         self.kind() == kind
     }
@@ -246,6 +267,19 @@ impl<'a> Parser<'a> {
 
     fn eat(&mut self, kind: T) -> bool {
         self.eat_span(kind).is_some()
+    }
+
+    /// `pub` or `pub(package)`, if it's next. `package` isn't a keyword: it's a name here.
+    fn vis(&mut self) -> Option<Vis> {
+        let span = self.eat_span(T::Pub)?;
+        let package = self.at(T::LParen) && self.nth(1) == T::Package && self.nth(2) == T::RParen;
+        if !package {
+            return Some(Vis { span, package: false });
+        }
+        for _ in 0..3 {
+            self.bump();
+        }
+        Some(Vis { span: span.to(self.prev_span()), package: true })
     }
 
     /// Consumes a token of this kind if it's next, and returns its span.
@@ -704,6 +738,40 @@ impl<'a> Parser<'a> {
         File { items, span: start.to(self.span()) }
     }
 
+    /// Completes each fix of `println!` and its kin, which calls `print`, from the module's
+    /// names. A module that imports `std::io::print` already needs nothing more. In one that
+    /// declares or imports another `print`, the call names `std::io::print` in full. Any other
+    /// module gets the import.
+    fn settle_print_fixes(&mut self, file: &File) {
+        if self.print_fixes.is_empty() {
+            return;
+        }
+        let (mut imported, mut taken) = (false, false);
+        let mut name = |path: &[&str], name: &str| {
+            if name == "print" {
+                if path == ["std", "io", "print"] { imported = true } else { taken = true }
+            }
+        };
+        for item in &file.items {
+            match &item.kind {
+                ItemKind::Use(u) => use_bindings(u, &mut Vec::new(), &mut name),
+                k => k.name().into_iter().for_each(|n| name(&[], &n.name)),
+            }
+        }
+        let import = wrela_diag::Edit {
+            span: Span::new(self.file, 0, 0),
+            replacement: "use std::io::print\n\n".into(),
+        };
+        for &i in &self.print_fixes {
+            let fix = &mut self.diags[i].fixes[0];
+            if taken {
+                fix.edits[0].replacement.insert_str(0, "std::io::");
+            } else if !imported {
+                fix.edits.insert(0, import.clone());
+            }
+        }
+    }
+
     /// The name of the item whose first token is at `first`, if it got that far: after its
     /// attributes and `pub`, a keyword and an identifier.
     fn item_name_at(&self, first: usize) -> Option<Ident> {
@@ -718,7 +786,8 @@ impl<'a> Parser<'a> {
                 T::At | T::Pub | T::Newline => {}
                 T::Ident if self.tokens.get(i.wrapping_sub(1)).is_some_and(|p| p.kind == T::At) => {
                 }
-                T::Fn | T::Struct | T::Enum | T::Trait | T::Const => {
+                T::Borrow => {}
+                T::Fn | T::Struct | T::Enum | T::Trait | T::Const | T::Type => {
                     let n = self.tokens.get(i + 1)?;
                     return (n.kind == T::Ident).then(|| self.ident_of(n));
                 }
@@ -754,6 +823,7 @@ impl<'a> Parser<'a> {
                     | T::Impl
                     | T::Const
                     | T::Use
+                    | T::Type
                     | T::Pub
                     | T::At
             );
@@ -786,6 +856,8 @@ impl<'a> Parser<'a> {
                             | T::Impl
                             | T::Const
                             | T::Use
+                            | T::Type
+                            | T::Borrow
                             | T::Pub
                             | T::At
                     ) {
@@ -821,19 +893,24 @@ impl<'a> Parser<'a> {
     fn parse_item(&mut self) -> PResult<Item> {
         let start = self.span();
         let attrs = self.parse_attrs()?;
-        let mut vis = self.eat_span(T::Pub);
+        let mut vis = self.vis();
         let kind = match self.kind() {
             T::Fn => ItemKind::Fn(self.parse_fn(true)?),
-            T::Struct => ItemKind::Struct(self.parse_struct()?),
+            T::Struct => ItemKind::Struct(self.parse_struct(false)?),
+            T::Borrow if self.nth(1) == T::Struct => {
+                self.bump();
+                ItemKind::Struct(self.parse_struct(true)?)
+            }
+            T::Type => ItemKind::TypeAlias(self.parse_type_alias()?),
             T::Enum => ItemKind::Enum(self.parse_enum()?),
-            T::Trait => ItemKind::Trait(self.parse_trait()?),
+            T::Trait => self.parse_trait()?,
             T::Const => ItemKind::Const(self.parse_const()?),
             T::Use => {
                 self.bump();
                 ItemKind::Use(self.parse_use_tree()?)
             }
             T::Impl => {
-                if let Some(pub_span) = vis.take() {
+                if let Some(Vis { span: pub_span, .. }) = vis.take() {
                     // Reported, and read without the `pub`, so its members are still there.
                     self.error(
                         Diagnostic::new(codes::E0100, pub_span, "an `impl` can't be `pub`")
@@ -857,7 +934,7 @@ impl<'a> Parser<'a> {
             }
             _ => {
                 return Err(self.expected(
-                    "an item (`fn`, `struct`, `enum`, `trait`, `impl`, `const` or `use`)",
+                    "an item (`fn`, `struct`, `enum`, `trait`, `impl`, `const`, `type` or `use`)",
                 ));
             }
         };
@@ -897,7 +974,7 @@ impl<'a> Parser<'a> {
             } else {
                 RetMode::Owned
             };
-            Some(RetType { mode, ty: self.parse_type()? })
+            Some(RetType { mode, ty: self.parse_trait_position_type()? })
         } else {
             None
         };
@@ -917,14 +994,25 @@ impl<'a> Parser<'a> {
         if self.at(T::Lt) { self.parse_generic_params() } else { Ok(Vec::new()) }
     }
 
-    /// generic_params ::= "<" (generic_param ("," generic_param)* ","?)? GT_CLOSE
+    /// generic_params ::= "<" (generic_param ("," generic_param)* ","?)? GT_CLOSE;
+    /// generic_param ::= IDENT (":" bounds)? | "const" IDENT ":" type
     fn parse_generic_params(&mut self) -> PResult<Vec<GenericParam>> {
         self.expect(T::Lt, "`<`")?;
         let mut out = Vec::new();
         while !self.at_gt_close() {
+            if self.eat(T::Const) {
+                let name = self.ident("a constant parameter name")?;
+                self.expect(T::Colon, "`:` and the constant's type")?;
+                let ty = self.parse_type()?;
+                out.push(GenericParam { name, bounds: Vec::new(), const_ty: Some(ty) });
+                if !self.eat(T::Comma) {
+                    break;
+                }
+                continue;
+            }
             let name = self.ident("a generic parameter name")?;
             let bounds = self.opt_bounds()?;
-            out.push(GenericParam { name, bounds });
+            out.push(GenericParam { name, bounds, const_ty: None });
             if !self.eat(T::Comma) {
                 break;
             }
@@ -938,13 +1026,19 @@ impl<'a> Parser<'a> {
         if self.eat(T::Colon) { self.parse_bounds() } else { Ok(Vec::new()) }
     }
 
-    /// bounds ::= path_type ("+" path_type)*
+    /// bounds ::= bound ("+" bound)*
     fn parse_bounds(&mut self) -> PResult<Vec<TypeExpr>> {
-        let mut out = vec![self.parse_path_type()?];
+        let mut out = vec![self.parse_bound()?];
         while self.eat(T::Plus) {
-            out.push(self.parse_path_type()?);
+            out.push(self.parse_bound()?);
         }
         Ok(out)
+    }
+
+    /// bound ::= path_type | fn_type: a trait, or a function type a parameter's values are
+    /// called as (`F: fn(vec3) -> f32`).
+    fn parse_bound(&mut self) -> PResult<TypeExpr> {
+        if self.at(T::Fn) || self.at(T::At) { self.parse_fn_type() } else { self.parse_path_type() }
     }
 
     /// param ::= mode? "self" | IDENT ":" mode? type ("=" expr)?
@@ -989,7 +1083,7 @@ impl<'a> Parser<'a> {
         }
         self.bump();
         let mode = self.parse_mode();
-        let ty = self.parse_type()?;
+        let ty = self.parse_trait_position_type()?;
         let default = self.opt_default()?;
         Ok(Param::Named { name, mode, ty, default, span: start.to(self.prev_span()) })
     }
@@ -1043,35 +1137,111 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// struct_item ::= "struct" IDENT generic_params? (":" bounds)? field_block
-    fn parse_struct(&mut self) -> PResult<StructDecl> {
+    /// struct_item ::= "struct" IDENT generic_params? (":" bounds)? field_block;
+    /// borrow_struct_item ::= "borrow" "struct" IDENT generic_params? borrow_fields (`borrow`
+    /// already read)
+    fn parse_struct(&mut self, borrow: bool) -> PResult<StructDecl> {
         self.expect(T::Struct, "`struct`")?;
         let name = self.ident("a struct name")?;
         let generics = self.opt_generic_params()?;
-        let traits = self.opt_bounds()?;
-        let (fields, multiline) = self.parse_field_block()?;
-        Ok(StructDecl { name, generics, traits, fields, multiline })
+        // `struct P(f32, f32)`, a Rust tuple struct.
+        if self.at(T::LParen) {
+            let open = self.span();
+            self.error(
+                Diagnostic::new(codes::E0100, open, "wrela has no tuple structs: a struct names its fields")
+                    .with_help(format!("name them, as in `struct {} {{ x: f32, y: f32 }}`; or, for a plain pair, use a tuple type: `type {} = (f32, f32)`", name.name, name.name)),
+            );
+            self.recovered_at = Some(self.pos);
+            return Err(Failed);
+        }
+        let traits = if borrow && self.at(T::Colon) {
+            // A borrow struct is a projection: it has no traits (it's never copied or kept).
+            let colon = self.span();
+            let bounds = self.opt_bounds()?;
+            let end = self.span().start;
+            let at =
+                Span::new(colon.file, colon.start, bounds.last().map_or(colon.end, |b| b.span.end));
+            self.error(
+                Diagnostic::new(codes::E0519, at, format!("the borrow struct `{}` can't declare traits: it's a projection", name.name))
+                    .with_note("a borrow struct lives only as long as the call that made it, so it's never copied, cloned or kept (§6.6)")
+                    .with_fix("remove them", Span::new(colon.file, colon.start, end), " "),
+            );
+            Vec::new()
+        } else if borrow {
+            Vec::new()
+        } else {
+            self.opt_bounds()?
+        };
+        // A lifetime between the name and the fields (the lexer took it out): Rust's way of
+        // holding references, which is a `borrow struct`'s projections.
+        let (from, to) = (name.span.end, self.span().start);
+        let had_lifetime = self.lifetimes.iter().any(|l| l.start >= from && l.end <= to);
+        let outer = self.field_of.replace(had_lifetime);
+        let block = self.parse_field_block(borrow);
+        self.field_of = outer;
+        let (fields, multiline) = block?;
+        Ok(StructDecl { borrow, name, generics, traits, fields, multiline })
     }
 
-    /// field_block ::= "{" (field_decl ("," field_decl)* ","?)? NEWLINE? "}"
-    fn parse_field_block(&mut self) -> PResult<(Vec<FieldDecl>, bool)> {
+    /// type_item ::= "type" IDENT generic_params? "=" type
+    fn parse_type_alias(&mut self) -> PResult<TypeAliasDecl> {
+        self.expect(T::Type, "`type`")?;
+        let name = self.ident("a type name")?;
+        let generics = self.opt_generic_params()?;
+        self.expect(T::Eq, "`=` and the type")?;
+        let ty = self.parse_type()?;
+        Ok(TypeAliasDecl { name, generics, ty })
+    }
+
+    /// field_block ::= "{" (field_decl ("," field_decl)* ","?)? NEWLINE? "}"; a borrow struct's
+    /// fields (`projections`) may be `borrow T` or `mut T`:
+    /// borrow_fields ::= "{" (borrow_field ("," borrow_field)* ","?)? NEWLINE? "}";
+    /// borrow_field ::= "pub"? IDENT ":" ("borrow" | "mut")? type
+    fn parse_field_block(&mut self, projections: bool) -> PResult<(Vec<FieldDecl>, bool)> {
         self.expect(T::LBrace, "`{`")?;
         let multiline = self.tok().line_break_before && !self.at(T::RBrace);
         let fields = self.list(
             T::RBrace,
             |p| {
                 let start = p.span();
-                let vis = p.eat_span(T::Pub);
+                let vis = p.vis();
                 let name = p.ident("a field name")?;
                 p.expect(T::Colon, "`:` and the field's type")?;
+                let mode = if !projections {
+                    // A projection in an ordinary struct, as a reference would be in Rust: said
+                    // so, and parsed on as the type after it.
+                    if p.at(T::Borrow) || p.at(T::Mut) {
+                        let kw = p.span();
+                        let mode = if p.at(T::Mut) { "mut" } else { "borrow" };
+                        p.error(
+                            Diagnostic::new(
+                                codes::E0519,
+                                kw,
+                                format!("a `{mode}` field is a projection, so it can't be a field of an ordinary struct"),
+                            )
+                            .with_note("a projection lives only as long as the call that made it (§6.6)")
+                            .with_help("store a handle (`Handle<T>`) or an owned copy, make the type a `borrow struct`, or pass a closure that does the work where the place is"),
+                        );
+                        p.bump();
+                    }
+                    RetMode::Owned
+                } else if p.eat(T::Borrow) {
+                    RetMode::Borrow
+                } else if p.eat(T::Mut) {
+                    RetMode::Mut
+                } else {
+                    RetMode::Owned
+                };
                 let ty = p.parse_type()?;
-                let default = p.opt_default()?;
-                Ok(FieldDecl { vis, name, ty, default, span: start.to(p.prev_span()) })
+                let default = if projections { None } else { p.opt_default()? };
+                Ok(FieldDecl { vis, name, mode, ty, default, span: start.to(p.prev_span()) })
             },
             |p, first, span| {
-                let vis = (p.tokens[first].kind == T::Pub).then_some(p.tokens[first].span);
+                let vis = (p.tokens[first].kind == T::Pub)
+                    .then_some(Vis { span: p.tokens[first].span, package: false });
                 let name = p.name_at(first)?;
-                Some(FieldDecl { vis, name, ty: TypeExpr::error(span), default: None, span })
+                let ty = TypeExpr::error(span);
+                Some(FieldDecl { vis, name, mode: RetMode::Owned, ty, default: None, span })
             },
         );
         self.close_list(T::RBrace, "`,` or `}`");
@@ -1098,7 +1268,7 @@ impl<'a> Parser<'a> {
                     p.close_list(T::RParen, "`,` or `)`");
                     VariantKind::Tuple(tys)
                 } else if p.at(T::LBrace) {
-                    VariantKind::Struct(p.parse_field_block()?.0)
+                    VariantKind::Struct(p.parse_field_block(false)?.0)
                 } else {
                     VariantKind::Unit
                 };
@@ -1123,14 +1293,19 @@ impl<'a> Parser<'a> {
         Ok(EnumDecl { name, generics, traits, variants, multiline })
     }
 
-    /// trait_item ::= "trait" IDENT generic_params? (":" bounds)? "{" sep* (trait_member (sep+ trait_member)* sep*)? "}"
-    fn parse_trait(&mut self) -> PResult<TraitDecl> {
+    /// trait_item ::= "trait" IDENT generic_params? ((":" bounds)? "{" sep* (trait_member (sep+
+    /// trait_member)* sep*)? "}" | "=" bounds): a trait, or a trait set
+    fn parse_trait(&mut self) -> PResult<ItemKind> {
         self.expect(T::Trait, "`trait`")?;
         let name = self.ident("a trait name")?;
         let generics = self.opt_generic_params()?;
+        if self.eat(T::Eq) {
+            let traits = self.parse_bounds()?;
+            return Ok(ItemKind::TraitSet(TraitSetDecl { name, generics, traits }));
+        }
         let supertraits = self.opt_bounds()?;
         let members = self.member_block("a trait member", Self::parse_trait_member)?;
-        Ok(TraitDecl { name, generics, supertraits, members })
+        Ok(ItemKind::Trait(TraitDecl { name, generics, supertraits, members }))
     }
 
     /// trait_member ::= attribute* (fn_sig block? | "type" IDENT (":" bounds)?)
@@ -1175,7 +1350,7 @@ impl<'a> Parser<'a> {
             });
         }
         let attrs = self.parse_attrs()?;
-        let vis = self.eat_span(T::Pub);
+        let vis = self.vis();
         if self.at(T::Type) {
             // impl_member allows neither before `type`: reported, then read without them.
             for a in &attrs {
@@ -1189,7 +1364,7 @@ impl<'a> Parser<'a> {
                     .with_fix("remove it", a.span, ""),
                 );
             }
-            if let Some(p) = vis {
+            if let Some(Vis { span: p, .. }) = vis {
                 self.error(
                     Diagnostic::new(codes::E0100, p, "an associated type can't be `pub`")
                         .with_help("an impl's associated types have no visibility of their own")
@@ -1276,21 +1451,50 @@ impl<'a> Parser<'a> {
 
     // ---- types -----------------------------------------------------------------------------
 
-    /// type ::= path_type | "[" type (";" expr)? "]" | "(" types ")" | "fn" "(" types ")" ("->" type)?
+    /// type ::= path_type | "[" type (";" expr)? "]" | "(" types ")" | fn_type
     pub(crate) fn parse_type(&mut self) -> PResult<TypeExpr> {
         self.nested(Self::parse_type_inner)
     }
 
+    /// A parameter's or a function's return type, where a trait names a type.
+    fn parse_trait_position_type(&mut self) -> PResult<TypeExpr> {
+        self.trait_type_here = true;
+        let ty = self.parse_type();
+        self.trait_type_here = false;
+        let ty = ty?;
+        if !self.at(T::Plus) {
+            return Ok(ty);
+        }
+        // Traits joined with `+`: any type with them all, or the one type that has them.
+        let start = ty.span;
+        let mut tys = vec![ty];
+        while self.eat(T::Plus) {
+            tys.push(self.parse_path_type()?);
+        }
+        Ok(TypeExpr { kind: TypeExprKind::Traits(tys), span: start.to(self.prev_span()) })
+    }
+
     fn parse_type_inner(&mut self) -> PResult<TypeExpr> {
         let start = self.span();
+        let trait_type_here = std::mem::take(&mut self.trait_type_here);
         if self.at(T::Dyn) {
-            // `dyn Trait` is tier 2: say so, and read the trait as the type.
+            // wrela has no `dyn` (language.md §18): say what to use. Where a trait names a type,
+            // read the trait as the type, which removing `dyn` makes valid; elsewhere the type
+            // is an error, so nothing else is reported about it.
             let d = self.bump();
-            self.error(
-                Diagnostic::new(codes::E0905, d.span, "`dyn` is tier 2")
-                    .with_help("take the trait as a generic parameter: `x: Trait` (§7)"),
-            );
-            return self.parse_type();
+            let mut e = Diagnostic::new(codes::E0113, d.span, "wrela has no `dyn`")
+                .with_note("`dyn` is reserved so this error can say what to use instead (§18)");
+            if trait_type_here {
+                e = e
+                    .with_help("for any type with the trait, take it as a parameter of the trait's type, `x: Trait`, which makes the function generic; for one of a closed set of types, use an enum")
+                    .with_fix("remove `dyn`", d.span.to(self.span().shrink_to_start()), "");
+                self.error(e);
+                return self.parse_type();
+            }
+            e = e.with_help("for one of a closed set of types, use an enum of them; for any type with the trait, add a generic parameter, as in `struct S<T: Trait> { x: T }`");
+            self.error(e);
+            let inner = self.parse_type()?;
+            return Ok(TypeExpr::error(start.to(inner.span)));
         }
         match self.kind() {
             T::Ident | T::SelfType => self.parse_path_type(),
@@ -1318,29 +1522,75 @@ impl<'a> Parser<'a> {
                 };
                 Ok(TypeExpr { kind, span })
             }
-            T::Fn => {
-                self.bump();
-                self.expect(T::LParen, "`(`")?;
-                let (tys, _) = self.parse_paren_types()?;
-                let ret =
-                    if self.eat(T::Arrow) { Some(Box::new(self.parse_type()?)) } else { None };
-                Ok(TypeExpr { kind: TypeExprKind::Fn(tys, ret), span: start.to(self.prev_span()) })
-            }
+            T::Fn | T::At => self.parse_fn_type(),
             T::Amp | T::AndAnd => {
                 let amp = self.tok().span;
-                self.error(
-                    Diagnostic::new(codes::E0106, amp, "`&` isn't a type in wrela")
+                let then_mut = self.nth(1) == T::Mut;
+                let d = Diagnostic::new(codes::E0106, amp, "`&` isn't a type in wrela");
+                let d = match self.field_of {
+                    // A lifetime struct's field, about to be a `borrow struct`'s: a projection.
+                    Some(true) => {
+                        let d = d.with_note("a `borrow struct`'s fields are projections: `borrow T` reads a place, `mut T` changes it (§6.6)");
+                        if then_mut {
+                            d.with_fix("make it a `mut` projection", amp, "")
+                        } else {
+                            d.with_fix("make it a `borrow` projection", amp, "borrow ")
+                        }
+                    }
+                    // An ordinary struct's field: a reference stored in a struct.
+                    Some(false) => {
+                        // Up to the type: `&mut Log` and `&Log` are both `Log`.
+                        let k = if then_mut { 2 } else { 1 };
+                        let end = self.tokens.get(self.pos + k).map_or(amp.end, |t| t.span.start);
+                        let whole = Span::new(amp.file, amp.start, end);
+                        d.with_note("a struct can't hold a reference: wrela has none, and a projection lives only as long as the call that made it (§6.6)")
+                            .with_help("hold an owned copy (the fix), a handle (`Handle<T>`) into an arena, or make the struct a `borrow struct`")
+                            .with_fix("hold an owned value", whole, "")
+                    }
+                    None => d
                         .with_note("wrela has no references; parameters have modes instead (language.md §6.2)")
                         .with_help("for a parameter, write `x: T` to borrow it or `x: mut T` to change it; to refer to another value long-term, store a `Handle<T>`")
                         .with_fix("remove the `&`", amp, ""),
-                );
+                };
+                self.error(d);
                 Err(Failed)
             }
             _ => Err(self.expected("a type")),
         }
     }
 
-    /// The types of a tuple or function type, after its `(`: (type ("," type)* ","?)? ")".
+    /// fn_type ::= ("@" IDENT)* "fn" "(" (fn_type_param ("," fn_type_param)* ","?)? ")" ("->" type)?;
+    /// fn_type_param ::= mode? type
+    fn parse_fn_type(&mut self) -> PResult<TypeExpr> {
+        let start = self.span();
+        let mut attrs = Vec::new();
+        while self.eat(T::At) {
+            attrs.push(self.ident("an attribute name")?);
+        }
+        self.expect(T::Fn, "`fn`")?;
+        self.expect(T::LParen, "`(`")?;
+        let params = self.within(T::RParen, |p| -> PResult<_> {
+            let mut params = Vec::new();
+            while !p.at(T::RParen) {
+                let s = p.span();
+                let mode = p.parse_mode();
+                let ty = p.parse_type()?;
+                params.push(FnTypeParam { mode, ty, span: s.to(p.prev_span()) });
+                if !p.eat(T::Comma) {
+                    break;
+                }
+            }
+            Ok(params)
+        })?;
+        self.expect(T::RParen, "`,` or `)`")?;
+        let ret = if self.eat(T::Arrow) { Some(Box::new(self.parse_type()?)) } else { None };
+        Ok(TypeExpr {
+            kind: TypeExprKind::Fn(FnType { attrs, params, ret }),
+            span: start.to(self.prev_span()),
+        })
+    }
+
+    /// The types of a tuple type, after its `(`: (type ("," type)* ","?)? ")".
     /// Returns them, and whether a `,` came last.
     fn parse_paren_types(&mut self) -> PResult<(Vec<TypeExpr>, bool)> {
         let types = self.within(T::RParen, |p| -> PResult<_> {
@@ -1380,19 +1630,44 @@ impl<'a> Parser<'a> {
         Ok(TypeExpr { kind: TypeExprKind::Path(Path { segments, span }), span })
     }
 
-    /// generic_args ::= "<" type ("," type)* ","? GT_CLOSE
+    /// generic_args ::= "<" generic_arg ("," generic_arg)* ","? GT_CLOSE
     fn parse_generic_args(&mut self) -> PResult<Vec<TypeExpr>> {
         self.expect(T::Lt, "`<`")?;
-        let mut out = vec![self.parse_type()?];
+        let mut out = vec![self.parse_generic_arg()?];
         while self.eat(T::Comma) {
             if self.at_gt_close() {
                 break;
             }
-            out.push(self.parse_type()?);
+            out.push(self.parse_generic_arg()?);
         }
         self.expect_gt_close()?;
         Ok(out)
     }
+
+    /// generic_arg ::= type | INT
+    fn parse_generic_arg(&mut self) -> PResult<TypeExpr> {
+        if self.at(T::Int) {
+            let t = self.bump();
+            let lit = self.lit_of(t);
+            return Ok(TypeExpr { kind: TypeExprKind::Int(lit), span: t.span });
+        }
+        self.parse_type()
+    }
+}
+
+/// Calls `f` with each name a `use` binds and the path it binds the name to (`prefix` is the
+/// path of the groups around `u`).
+fn use_bindings<'a>(u: &'a UseTree, prefix: &mut Vec<&'a str>, f: &mut impl FnMut(&[&str], &str)) {
+    let depth = prefix.len();
+    prefix.extend(u.path.iter().map(|i| i.name.as_str()));
+    match &u.kind {
+        UseKind::Simple(alias) => {
+            let last = prefix.last().copied().unwrap_or_default();
+            f(prefix, alias.as_ref().map_or(last, |a| a.name.as_str()));
+        }
+        UseKind::Group(trees) => trees.iter().for_each(|t| use_bindings(t, prefix, f)),
+    }
+    prefix.truncate(depth);
 }
 
 /// Where an item's expressions are deeper than [`MAX_EXPR_DEPTH`], if anywhere. Iterative, so

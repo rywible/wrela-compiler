@@ -1,0 +1,6 @@
+// mistake: a `const` generic parameter of type `f32`
+// expect: E0331
+// fix: yes
+struct Ring<const R: f32> {
+    radius: f32,
+}

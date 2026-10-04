@@ -1,0 +1,34 @@
+// accepts: eff.requests
+// Program state holds pending requests, polled each frame: a store, then a load of what it stored.
+
+use std::io::{Pending, load, store}
+
+pub struct Game {
+    saved: Pending<u8>,
+    loaded: Option<Pending<u8>>,
+    length: u32,
+}
+
+pub fn init() -> Game {
+    Game { saved: store("saves/slot", [1, 2, 3, 4, 5]), loaded: None, length: 0 }
+}
+
+pub fn frame(state: mut Game, time: f32, width: u32, height: u32) {
+    if state.loaded.is_none() {
+        if let Some(Ok(_)) = state.saved.poll() {
+            state.loaded = Some(load("saves/slot"))
+        }
+    }
+    match mut state.loaded {
+        Some(p) => {
+            if let Some(Ok(bytes)) = p.poll() {
+                state.length = bytes.len()
+            }
+        },
+        None => {},
+    }
+}
+
+pub fn loaded_len(state: Game) -> u32 {
+    state.length
+}

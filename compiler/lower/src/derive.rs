@@ -32,7 +32,8 @@ pub(crate) fn call(
         return None;
     };
     let input = substs[0];
-    let key = InstanceKey::Derived { of: callable, kind, input };
+    let output = (kind == DeriveKind::Interval).then(|| substs.get(1).copied()).flatten();
+    let key = InstanceKey::Derived { of: callable, kind, input, output };
     let callee = fl.cx.instance(fl.mb, key, Some((fl.id, c.span)));
     let mut args = fl.capture_args(&srcs)?;
     let x = fl.arg_value(&c.args[1])?;
@@ -67,7 +68,7 @@ fn callable_span(cx: &Cx, c: &Callable) -> Span {
 /// A derived instance's signature: the callable's captures, then its input (a point, or a box),
 /// returning `(f32, X)` or an `Interval`.
 pub(crate) fn signature(cx: &mut Cx, mb: &mut ModuleBuilder, key: &InstanceKey) -> ir::Function {
-    let InstanceKey::Derived { of, kind, input } = key else {
+    let InstanceKey::Derived { of, kind, input, output } = key else {
         return ir::Function::new("derived", Vec::new(), None);
     };
     let span = callable_span(cx, of);
@@ -87,11 +88,15 @@ pub(crate) fn signature(cx: &mut Cx, mb: &mut ModuleBuilder, key: &InstanceKey) 
             ir::Function::new("value_and_gradient", params, None)
         }
         DeriveKind::Interval => {
-            let interval = cx
-                .checked
-                .program
-                .lang_adt(Lang::Interval)
-                .map(|a| cx.checked.program.types.adt(a, Vec::new()));
+            // The range of the result: an `Interval` for an `f32`, a box for a vector.
+            let interval = match output {
+                Some(y) => box_type(cx, *y),
+                None => cx
+                    .checked
+                    .program
+                    .lang_adt(Lang::Interval)
+                    .map(|a| cx.checked.program.types.adt(a, Vec::new())),
+            };
             let box_ty = box_type(cx, *input);
             let bt = box_ty.and_then(|b| cx.lower_ty(mb, b, span));
             let it = interval.and_then(|i| cx.lower_ty(mb, i, span));

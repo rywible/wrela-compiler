@@ -1,0 +1,38 @@
+// rejects: ty.no-dyn
+// `dyn` is rejected in every type position; the diagnostic offers an enum or a generic.
+trait Shape {
+    fn area(self) -> f32
+}
+
+struct Circle {
+    r: f32,
+}
+
+impl Shape for Circle {
+    fn area(self) -> f32 {
+        3.0 * self.r * self.r
+    }
+}
+
+struct Scene {
+    shapes: Vec<dyn Shape>, //~ E0113
+}
+
+fn d(x: dyn Shape) -> f32 { //~ E0113
+    x.area()
+}
+
+fn make() -> dyn Shape { //~ E0113
+    Circle { r: 1.0 }
+}
+
+fn local() -> f32 {
+    let c: dyn Shape = Circle { r: 2.0 } //~ E0113
+    c.area()
+}
+
+impl dyn Shape { //~ E0113
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+}

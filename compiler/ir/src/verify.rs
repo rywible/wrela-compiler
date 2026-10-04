@@ -101,6 +101,11 @@ impl Verifier<'_> {
     }
 
     /// The type of a place (whose values the caller has checked are visible).
+    /// Whether a place is in constant data: everything but the program's state.
+    fn constant(&self, p: &Place) -> bool {
+        matches!(p.root, PlaceRoot::Data(d) if self.m.state != Some(d))
+    }
+
     fn place(&self, p: &Place) -> Result<TypeId> {
         match &p.root {
             PlaceRoot::Local(l) if l.index() >= self.f.locals.len() => {
@@ -146,6 +151,69 @@ impl Verifier<'_> {
                 _ => return Err(bug("a run of something that isn't an array")),
             },
             Expr::Addr(p) => types.lookup(&TypeDef::Ptr(self.place(p)?)),
+            Expr::Barrier => return Ok(None),
+            Expr::Atomic(op, p, xs) => {
+                let t = self.place(p)?;
+                let TypeDef::Atomic(s) = *self.def(t) else {
+                    return Err(bug("an atomic operation on something that isn't atomic"));
+                };
+                let n = match op {
+                    AtomicOp::Load => 0,
+                    AtomicOp::CompareExchange => 2,
+                    _ => 1,
+                };
+                if xs.len() != n || xs.iter().any(|x| self.scalar(self.ty(*x)) != Some(s)) {
+                    return Err(bug(format!("{op:?} with the wrong arguments")));
+                }
+                match op {
+                    // A struct of the old value and whether it stored.
+                    AtomicOp::CompareExchange => return Ok(None),
+                    AtomicOp::Store => return Ok(None),
+                    _ => types.lookup(&TypeDef::Scalar(s)),
+                }
+            }
+            Expr::Texture(op, t, s, xs) => {
+                let kind = |r: &ResourceId| self.m.resources.get(r.index()).map(|r| r.kind);
+                let Some(ResourceKind::Texture { depth }) = kind(t) else {
+                    return Err(bug("a texture read of something that isn't a texture"));
+                };
+                let comparison =
+                    matches!(op, TextureOp::SampleCompare | TextureOp::SampleCompareLevel);
+                let sampled = !matches!(op, TextureOp::Load | TextureOp::Width | TextureOp::Height);
+                match (sampled, s.as_ref().map(kind)) {
+                    (false, None) => {}
+                    (true, Some(Some(ResourceKind::Sampler { comparison: c })))
+                        if c == comparison => {}
+                    _ => return Err(bug(format!("{op:?} with the wrong sampler"))),
+                }
+                if comparison != (depth && sampled) {
+                    return Err(bug(format!("{op:?} of a texture that's depth: {depth}")));
+                }
+                let (f32_, u32_) = (TypeDef::Scalar(Scalar::F32), TypeDef::Scalar(Scalar::U32));
+                let want: Vec<TypeDef> = match op {
+                    TextureOp::Sample => vec![TypeDef::Vector(2)],
+                    // The level, or the reference depth.
+                    TextureOp::SampleLevel
+                    | TextureOp::SampleCompare
+                    | TextureOp::SampleCompareLevel => vec![TypeDef::Vector(2), f32_],
+                    TextureOp::Load => vec![u32_.clone(), u32_],
+                    TextureOp::Width | TextureOp::Height => Vec::new(),
+                };
+                if xs.len() != want.len()
+                    || xs.iter().zip(&want).any(|(x, w)| self.def(self.ty(*x)) != w)
+                {
+                    return Err(bug(format!("{op:?} with the wrong arguments")));
+                }
+                let out = match op {
+                    TextureOp::Width | TextureOp::Height => TypeDef::Scalar(Scalar::U32),
+                    TextureOp::SampleCompare | TextureOp::SampleCompareLevel => {
+                        TypeDef::Scalar(Scalar::F32)
+                    }
+                    TextureOp::Load if depth => TypeDef::Scalar(Scalar::F32),
+                    _ => TypeDef::Vector(4),
+                };
+                types.lookup(&out)
+            }
             Expr::ArrayLength(p) => {
                 let storage = matches!(&p.root, PlaceRoot::Resource(r)
                     if matches!(self.m.resources.get(r.index()).map(|r| r.kind),
@@ -256,7 +324,7 @@ impl Verifier<'_> {
                 self.expect("a select's second branch", self.ty(*if_true), self.ty(*if_false))?;
                 Some(self.ty(*if_true))
             }
-            Expr::Host(_, _) => return Ok(None),
+            Expr::Host(_, _) | Expr::Mem(..) => return Ok(None),
         };
         match t {
             Some(t) => Ok(Some(t)),
@@ -335,7 +403,7 @@ impl Verifier<'_> {
                     self.ty(*v),
                 )?,
                 (Arg::Place(pl), true) => {
-                    if p.mutable && matches!(pl.root, PlaceRoot::Data(_)) {
+                    if p.mutable && self.constant(pl) {
                         return Err(bug(format!(
                             "constant data passed for `{}`, which may be written",
                             p.name
@@ -400,6 +468,13 @@ impl Verifier<'_> {
                     self.expect("an array element", *e, self.ty(*p))?;
                 }
             }
+            // A run from its first element's address and its length, both `u32`s (CPU only).
+            TypeDef::Run(_) => {
+                let u = self.m.types.lookup(&TypeDef::Scalar(Scalar::U32));
+                if parts.len() != 2 || !parts.iter().all(|p| Some(self.ty(*p)) == u) {
+                    return Err(bug("a run built from something but an address and a length"));
+                }
+            }
             d => return Err(bug(format!("a construct of `{d:?}`"))),
         }
         Ok(())
@@ -439,7 +514,7 @@ impl Verifier<'_> {
                     self.expr(e)?;
                 }
                 Stmt::Store(p, v) => {
-                    if matches!(p.root, PlaceRoot::Data(_)) {
+                    if self.constant(p) {
                         return Err(bug("a store into constant data"));
                     }
                     self.all_visible(|f| p.for_each_value(&mut |v| f(v)))?;

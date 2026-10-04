@@ -1,0 +1,9 @@
+// mistake: sketch 02 §8: a kernel taking a `mut [u32]` to write counts into
+// expect: E0601
+// fix: no
+use std::gpu::{GlobalId, Slots}
+
+@compute(64)
+fn count(cells: [vec3], counts: mut [u32], id: GlobalId) {
+    counts[id.x] = u32(cells[id.x].x)
+}

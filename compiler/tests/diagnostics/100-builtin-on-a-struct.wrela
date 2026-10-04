@@ -1,7 +1,7 @@
 // mistake: calling a math built-in on a struct rather than on one of its numbers
 // expect: E0305
 // fix: no
-struct Pair: Copy + Clone {
+struct Pair: Copy {
     a: f32,
     b: f32,
 }

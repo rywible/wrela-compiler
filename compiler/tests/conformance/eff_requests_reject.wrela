@@ -1,0 +1,19 @@
+// rejects: eff.requests
+// `@deterministic` code neither makes requests (`io`) nor polls them (`nondet`).
+use std::io::{Pending, load}
+
+@deterministic
+fn reload() -> Pending<u8> {
+    load("saves/slot") //~ E0600
+}
+
+@deterministic
+fn level(save: mut Pending<u8>) -> u32 {
+    match save.poll() { //~ E0600
+        Some(Ok(bytes)) => bytes.len(),
+        _ => 0,
+    }
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+}

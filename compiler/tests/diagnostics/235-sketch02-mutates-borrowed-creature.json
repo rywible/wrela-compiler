@@ -1,0 +1,28 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0505",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [
+        "make the parameter `mut`: `c: mut ...`, and pass `mut` at the call site"
+      ],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "can't assign to `c.scale`: `c` is borrowed, not `mut`",
+      "notes": [],
+      "severity": "error",
+      "span": {
+        "column": 5,
+        "end": 201,
+        "end_column": 12,
+        "end_line": 10,
+        "line": 10,
+        "start": 194
+      },
+      "title": "an assignment through a read-only place"
+    }
+  ],
+  "version": 2
+}

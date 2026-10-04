@@ -1,0 +1,62 @@
+// A method call that two traits could answer: the type implements both, and both declare the
+// method. Call it through the trait: `Shape::area(s)`.
+// ---- wrong
+trait Shape {
+    fn area(self) -> f32
+}
+
+struct Square {
+    side: f32,
+}
+
+trait Plot {
+    fn area(self) -> f32
+}
+
+impl Shape for Square {
+    fn area(self) -> f32 {
+        self.side * self.side
+    }
+}
+
+impl Plot for Square {
+    fn area(self) -> f32 {
+        0.0
+    }
+}
+
+fn which(s: Square) -> f32 {
+    s.area()
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+trait Shape {
+    fn area(self) -> f32
+}
+
+struct Square {
+    side: f32,
+}
+
+trait Plot {
+    fn area(self) -> f32
+}
+
+impl Shape for Square {
+    fn area(self) -> f32 {
+        self.side * self.side
+    }
+}
+
+impl Plot for Square {
+    fn area(self) -> f32 {
+        0.0
+    }
+}
+
+fn which(s: Square) -> f32 {
+    Shape::area(s)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

@@ -1,0 +1,13 @@
+// mistake: `fwidth` after an early return that varies by pixel
+// expect: E0608
+// fix: no
+use std::gpu::FragCoord
+
+@fragment
+fn edge(pixel: FragCoord) -> vec4 {
+    let d = pixel.position.x - 8.0
+    if d > 0.0 {
+        return vec4(0.0)
+    }
+    vec4(fwidth(d))
+}

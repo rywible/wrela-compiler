@@ -1,0 +1,18 @@
+// rejects: gpu.atomics
+// Atomics are written through, so they're `mut`, passed `mut`, and GPU code's.
+use std::gpu::{AtomicMap, Atomics, GlobalId, atomic_map_buffer, buffer, dispatch}
+
+@compute(64)
+fn read_only(bins: Atomics<u32>, id: GlobalId) { //~ E0602
+}
+
+@compute(64)
+fn count(bins: mut Atomics<u32>, map: mut AtomicMap, id: GlobalId) {
+    let _ = bins.add(i: 0, value: 1)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    var bins = buffer(16)
+    var map = atomic_map_buffer(16)
+    dispatch(count.bind(bins: bins, map: map), groups: 1) //~ E0503 E0503
+}

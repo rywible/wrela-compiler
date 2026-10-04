@@ -1,0 +1,29 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0600",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "`load` does IO, and `tick` is `@deterministic`, which can't `io`",
+      "notes": [
+        "the call chain: tick → load",
+        "reading or writing outside the program is the `io` effect; see language.md §8 for what each context forbids"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 13,
+        "end": 167,
+        "end_column": 25,
+        "end_line": 8,
+        "line": 8,
+        "start": 155
+      },
+      "title": "an effect a context forbids"
+    }
+  ],
+  "version": 2
+}

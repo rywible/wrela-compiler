@@ -1,0 +1,6 @@
+// mistake: a format spec with a type letter, as in Python and Rust
+// expect: E0217
+// fix: no
+fn label(x: f32) -> String {
+    f"x = {x:.2f}"
+}

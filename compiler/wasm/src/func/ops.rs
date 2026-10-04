@@ -314,7 +314,7 @@ fn float_op(fe: &Fe, op: ir::BinOp, f: Fw) -> R<I<'static>> {
         B::Sub => f.sub(),
         B::Mul => f.mul(),
         B::Div => f.div(),
-        B::Rem => I::Call(if f.f64_ { fe.helpers.fmod_f64 } else { fe.helpers.fmod_f32 }),
+        B::Rem => I::Call(if f.f64_ { fe.at.helpers.fmod_f64 } else { fe.at.helpers.fmod_f32 }),
         B::Eq => f.eq(),
         B::Ne => f.ne(),
         B::Lt => f.lt(),
@@ -330,9 +330,13 @@ fn float_op(fe: &Fe, op: ir::BinOp, f: Fw) -> R<I<'static>> {
 // A component that is read once is loaded where it's used; one that is read more than once is
 // loaded into a local first.
 
-/// Pushes the f32 at byte `off` of aggregate value `x`.
+/// Pushes the f32 at byte `off` of aggregate value `x`: from memory, or a `v128`'s lane.
 fn load_f32(fe: &mut Fe, x: ir::ValueId, off: u32) {
-    fe.ins.extend([I::LocalGet(fe.v(x)), I::F32Load(mem(off, 2))]);
+    if fe.vec_n(fe.vty(x)).is_some() {
+        fe.ins.extend([I::LocalGet(fe.v(x)), I::F32x4ExtractLane((off / 4) as u8)]);
+    } else {
+        fe.ins.extend([I::LocalGet(fe.v(x)), I::F32Load(mem(off, 2))]);
+    }
 }
 
 /// Pushes the f32 at byte `off` of aggregate `x`, or scalar `x` itself.
@@ -405,6 +409,256 @@ fn dims(fe: &Fe, t: ir::TypeId) -> Option<(bool, u8)> {
     }
 }
 
+// ---- vectors in `v128`s (SIMD) ------------------------------------------------------------------
+//
+// Each lane is computed by the instruction the scalar code uses for that component, and sums
+// of lanes are added one lane at a time in the scalar code's order: the bits are the same.
+
+/// Pushes `x` as a `v128`: a vector, or a scalar in every lane.
+fn vec_operand(fe: &mut Fe, x: ir::ValueId) {
+    fe.ins.push(I::LocalGet(fe.v(x)));
+    if fe.vec_n(fe.vty(x)).is_none() {
+        fe.ins.push(I::F32x4Splat);
+    }
+}
+
+/// Sets `v128` value `v` to the vector of `n` components that `comp(fe, c)` pushes, one at a
+/// time.
+fn assemble(
+    fe: &mut Fe,
+    v: ir::ValueId,
+    n: u8,
+    mut comp: impl FnMut(&mut Fe, u8) -> R<()>,
+) -> R<()> {
+    comp(fe, 0)?;
+    fe.ins.extend([I::F32x4Splat, I::LocalSet(fe.v(v))]);
+    for c in 1..n {
+        fe.ins.push(I::LocalGet(fe.v(v)));
+        comp(fe, c)?;
+        fe.ins.extend([I::F32x4ReplaceLane(c), I::LocalSet(fe.v(v))]);
+    }
+    Ok(())
+}
+
+/// Pushes the sum of lanes `0..n` of the `v128` on the stack, from the first: `(l0 + l1) + l2`.
+fn sum_lanes(fe: &mut Fe, n: u8) {
+    let q = fe.new_local(ValType::V128);
+    fe.ins.extend([I::LocalTee(q), I::F32x4ExtractLane(0)]);
+    for c in 1..n {
+        fe.ins.extend([I::LocalGet(q), I::F32x4ExtractLane(c), I::F32Add]);
+    }
+}
+
+/// Pushes the sum of lanes `0..n` of the `v128` on the stack, from zero: `((0 + l0) + l1)`.
+fn sum_lanes_from_zero(fe: &mut Fe, n: u8) {
+    let q = fe.new_local(ValType::V128);
+    fe.ins.extend([I::LocalSet(q), I::F32Const(0.0f32.into())]);
+    for c in 0..n {
+        fe.ins.extend([I::LocalGet(q), I::F32x4ExtractLane(c), I::F32Add]);
+    }
+}
+
+/// A binary operator whose result is a `v128` vector of `n` components.
+fn vec_binary(
+    fe: &mut Fe,
+    v: ir::ValueId,
+    n: u8,
+    op: ir::BinOp,
+    a: ir::ValueId,
+    b: ir::ValueId,
+) -> R<()> {
+    use ir::BinOp as B;
+    match (dims(fe, fe.vty(a)), dims(fe, fe.vty(b))) {
+        // matrix × vector: r = Σ_j m[j] b[j], from zero, which is each component's sum.
+        (Some((true, m)), Some((false, _))) if op == B::Mul => {
+            fe.ins.push(I::V128Const(0));
+            for j in 0..m {
+                fe.ins.push(I::LocalGet(fe.v(a)));
+                fe.vec_load(m, column_stride(m) * u32::from(j));
+                fe.ins.extend([
+                    I::LocalGet(fe.v(b)),
+                    I::F32x4ExtractLane(j),
+                    I::F32x4Splat,
+                    I::F32x4Mul,
+                    I::F32x4Add,
+                ]);
+            }
+            fe.ins.push(I::LocalSet(fe.v(v)));
+        }
+        // vector × matrix: r_j = Σ_i a[i] m[j][i], from zero.
+        (Some((false, _)), Some((true, m))) if op == B::Mul => {
+            assemble(fe, v, m, |fe, j| {
+                fe.ins.extend([I::LocalGet(fe.v(a)), I::LocalGet(fe.v(b))]);
+                fe.vec_load(m, column_stride(m) * u32::from(j));
+                fe.ins.push(I::F32x4Mul);
+                sum_lanes_from_zero(fe, m);
+                Ok(())
+            })?;
+        }
+        (Some((true, _)), _) | (_, Some((true, _))) => {
+            return Err(format!("internal: {op:?} of a matrix to a vector"));
+        }
+        // `%` calls the `fmod` helper for each component.
+        _ if op == B::Rem => {
+            assemble(fe, v, n, |fe, c| {
+                elem_or_scalar(fe, a, 4 * u32::from(c));
+                elem_or_scalar(fe, b, 4 * u32::from(c));
+                fe.ins.push(I::Call(fe.at.helpers.fmod_f32));
+                Ok(())
+            })?;
+        }
+        _ => {
+            vec_operand(fe, a);
+            vec_operand(fe, b);
+            fe.ins.push(match op {
+                B::Add => I::F32x4Add,
+                B::Sub => I::F32x4Sub,
+                B::Mul => I::F32x4Mul,
+                B::Div => I::F32x4Div,
+                _ => return Err(format!("internal: {op:?} on vectors")),
+            });
+            fe.ins.push(I::LocalSet(fe.v(v)));
+        }
+    }
+    Ok(())
+}
+
+/// A componentwise built-in on `v128` vectors (a scalar argument is in every lane): pushes the
+/// result.
+fn vec_builtin(fe: &mut Fe, b: ir::Builtin, xs: &[ir::ValueId]) -> R<()> {
+    lanes_builtin(fe, b, &mut |fe, i| vec_operand(fe, xs[i]))
+}
+
+/// Whether [`lanes_builtin`] computes built-in `b`.
+pub(super) fn lanes_builtin_ok(b: ir::Builtin) -> bool {
+    use ir::Builtin as B;
+    matches!(
+        b,
+        B::Sqrt
+            | B::InverseSqrt
+            | B::Floor
+            | B::Ceil
+            | B::Trunc
+            | B::Round
+            | B::Abs
+            | B::Fract
+            | B::Sign
+            | B::Min
+            | B::Max
+            | B::Clamp
+            | B::Saturate
+            | B::Mix
+            | B::Step
+            | B::Smoothstep
+    )
+}
+
+/// A componentwise built-in, lane by lane, of the `v128`s `arg(fe, i)` pushes: pushes the
+/// result.
+pub(super) fn lanes_builtin(
+    fe: &mut Fe,
+    b: ir::Builtin,
+    arg: &mut dyn FnMut(&mut Fe, usize),
+) -> R<()> {
+    use ir::Builtin as B;
+    let splat = |x: f32| [I::F32Const(x.into()), I::F32x4Splat];
+    match b {
+        B::Sqrt => {
+            arg(fe, 0);
+            fe.ins.push(I::F32x4Sqrt);
+        }
+        B::InverseSqrt => {
+            fe.ins.extend(splat(1.0));
+            arg(fe, 0);
+            fe.ins.extend([I::F32x4Sqrt, I::F32x4Div]);
+        }
+        B::Floor | B::Ceil | B::Trunc | B::Round | B::Abs => {
+            arg(fe, 0);
+            fe.ins.push(match b {
+                B::Floor => I::F32x4Floor,
+                B::Ceil => I::F32x4Ceil,
+                B::Trunc => I::F32x4Trunc,
+                B::Round => I::F32x4Nearest,
+                _ => I::F32x4Abs,
+            });
+        }
+        B::Fract => {
+            arg(fe, 0);
+            arg(fe, 0);
+            fe.ins.extend([I::F32x4Floor, I::F32x4Sub]);
+        }
+        B::Sign => {
+            // 1 where x > 0, -1 where x < 0, else x (0, -0 and NaN).
+            let x = fe.new_local(ValType::V128);
+            arg(fe, 0);
+            fe.ins.push(I::LocalSet(x));
+            fe.ins.extend(splat(1.0));
+            fe.ins.extend(splat(-1.0));
+            fe.ins.extend([I::LocalGet(x), I::LocalGet(x)]);
+            fe.ins.extend(splat(0.0));
+            fe.ins.extend([I::F32x4Lt, I::V128Bitselect, I::LocalGet(x)]);
+            fe.ins.extend(splat(0.0));
+            fe.ins.extend([I::F32x4Gt, I::V128Bitselect]);
+        }
+        B::Min | B::Max => {
+            arg(fe, 0);
+            arg(fe, 1);
+            fe.ins.push(if b == B::Min { I::F32x4Min } else { I::F32x4Max });
+        }
+        B::Clamp => {
+            arg(fe, 0);
+            arg(fe, 1);
+            fe.ins.push(I::F32x4Max);
+            arg(fe, 2);
+            fe.ins.push(I::F32x4Min);
+        }
+        B::Saturate => {
+            arg(fe, 0);
+            fe.ins.extend(splat(0.0));
+            fe.ins.push(I::F32x4Max);
+            fe.ins.extend(splat(1.0));
+            fe.ins.push(I::F32x4Min);
+        }
+        B::Mix => {
+            // WGSL: e1 * (1 - e3) + e2 * e3.
+            arg(fe, 0);
+            fe.ins.extend(splat(1.0));
+            arg(fe, 2);
+            fe.ins.extend([I::F32x4Sub, I::F32x4Mul]);
+            arg(fe, 1);
+            arg(fe, 2);
+            fe.ins.extend([I::F32x4Mul, I::F32x4Add]);
+        }
+        B::Step => {
+            // 1 where edge <= x.
+            fe.ins.extend(splat(1.0));
+            fe.ins.extend(splat(0.0));
+            arg(fe, 0);
+            arg(fe, 1);
+            fe.ins.extend([I::F32x4Le, I::V128Bitselect]);
+        }
+        B::Smoothstep => {
+            // t = clamp((x - e0) / (e1 - e0), 0, 1); t * t * (3 - 2t)
+            let t = fe.new_local(ValType::V128);
+            arg(fe, 2);
+            arg(fe, 0);
+            fe.ins.push(I::F32x4Sub);
+            arg(fe, 1);
+            arg(fe, 0);
+            fe.ins.extend([I::F32x4Sub, I::F32x4Div]);
+            fe.ins.extend(splat(0.0));
+            fe.ins.push(I::F32x4Max);
+            fe.ins.extend(splat(1.0));
+            fe.ins.extend([I::F32x4Min, I::LocalTee(t), I::LocalGet(t), I::F32x4Mul]);
+            fe.ins.extend(splat(3.0));
+            fe.ins.extend(splat(2.0));
+            fe.ins.extend([I::LocalGet(t), I::F32x4Mul, I::F32x4Sub, I::F32x4Mul]);
+        }
+        _ => return Err(format!("internal: the built-in {b:?} on vectors in the WASM back end")),
+    }
+    Ok(())
+}
+
 pub(super) fn binary(
     fe: &mut Fe,
     v: ir::ValueId,
@@ -413,6 +667,9 @@ pub(super) fn binary(
     b: ir::ValueId,
 ) -> R<()> {
     let t = fe.vty(v);
+    if let Some(n) = fe.vec_n(t) {
+        return vec_binary(fe, v, n, op, a, b);
+    }
     let (ta, tb) = (fe.vty(a), fe.vty(b));
     if !fe.m.types.is_aggregate(t) && !fe.m.types.is_aggregate(ta) {
         let s = fe.scalar(ta)?;
@@ -481,6 +738,10 @@ pub(super) fn binary(
 
 pub(super) fn unary(fe: &mut Fe, v: ir::ValueId, op: ir::UnOp, x: ir::ValueId) -> R<()> {
     let t = fe.vty(x);
+    if fe.vec_n(t).is_some() {
+        fe.ins.extend([I::LocalGet(fe.v(x)), I::F32x4Neg, I::LocalSet(fe.v(v))]);
+        return Ok(());
+    }
     if let Some((is_mat, n)) = dims(fe, t) {
         let out = fe.fresh_slot(v, is_mat)?;
         for off in components(is_mat, n) {
@@ -702,6 +963,83 @@ pub(super) fn builtin(fe: &mut Fe, v: ir::ValueId, b: ir::Builtin, args: &[ir::V
     use ir::Builtin as B;
     let t = fe.vty(v);
     let arg0 = fe.vty(args[0]);
+    // Vector reductions in `v128`s.
+    if let Some(n) = fe.vec_n(arg0) {
+        match b {
+            B::Dot => {
+                fe.ins.extend([
+                    I::LocalGet(fe.v(args[0])),
+                    I::LocalGet(fe.v(args[1])),
+                    I::F32x4Mul,
+                ]);
+                sum_lanes(fe, n);
+                fe.ins.push(I::LocalSet(fe.v(v)));
+                return Ok(());
+            }
+            B::Length | B::Distance | B::Normalize => {
+                let d = fe.new_local(ValType::V128);
+                fe.ins.push(I::LocalGet(fe.v(args[0])));
+                if b == B::Distance {
+                    fe.ins.extend([I::LocalGet(fe.v(args[1])), I::F32x4Sub]);
+                }
+                fe.ins.extend([I::LocalTee(d), I::LocalGet(d), I::F32x4Mul]);
+                sum_lanes(fe, n);
+                fe.ins.push(I::F32Sqrt);
+                if b == B::Normalize {
+                    fe.ins.extend([I::F32x4Splat, I::LocalSet(d)]);
+                    fe.ins.extend([I::LocalGet(fe.v(args[0])), I::LocalGet(d), I::F32x4Div]);
+                }
+                fe.ins.push(I::LocalSet(fe.v(v)));
+                return Ok(());
+            }
+            B::AllEqual => {
+                let all = (1 << n) - 1;
+                fe.ins.extend([
+                    I::LocalGet(fe.v(args[0])),
+                    I::LocalGet(fe.v(args[1])),
+                    I::F32x4Eq,
+                    I::I32x4Bitmask,
+                    I::I32Const(all),
+                    I::I32And,
+                    I::I32Const(all),
+                    I::I32Eq,
+                    I::LocalSet(fe.v(v)),
+                ]);
+                return Ok(());
+            }
+            B::Cross => {
+                // a.yzx * b.zxy - a.zxy * b.yzx: lane i is a[j] b[k] - a[k] b[j], as without.
+                let yzx = shuffle([1, 2, 0, 0]);
+                let zxy = shuffle([2, 0, 1, 0]);
+                let (a, bb) = (fe.v(args[0]), fe.v(args[1]));
+                fe.ins.extend([
+                    I::LocalGet(a),
+                    I::LocalGet(a),
+                    I::I8x16Shuffle(yzx),
+                    I::LocalGet(bb),
+                    I::LocalGet(bb),
+                    I::I8x16Shuffle(zxy),
+                    I::F32x4Mul,
+                    I::LocalGet(a),
+                    I::LocalGet(a),
+                    I::I8x16Shuffle(zxy),
+                    I::LocalGet(bb),
+                    I::LocalGet(bb),
+                    I::I8x16Shuffle(yzx),
+                    I::F32x4Mul,
+                    I::F32x4Sub,
+                    I::LocalSet(fe.v(v)),
+                ]);
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
+    if fe.vec_n(t).is_some() {
+        vec_builtin(fe, b, args)?;
+        fe.ins.push(I::LocalSet(fe.v(v)));
+        return Ok(());
+    }
     // Vector reductions. A sum starts from its first product, as WGSL's do.
     if let Some((false, n)) = dims(fe, arg0) {
         let n = n as u32;
@@ -789,6 +1127,17 @@ pub(super) fn builtin(fe: &mut Fe, v: ir::ValueId, b: ir::Builtin, args: &[ir::V
     Ok(())
 }
 
+/// The bytes of an `i8x16.shuffle` that puts lanes `lanes` of its first operand in lanes 0..4.
+pub(super) fn shuffle(lanes: [u8; 4]) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    for (k, lane) in lanes.iter().enumerate() {
+        for b in 0..4 {
+            out[4 * k + b] = 4 * lane + b as u8;
+        }
+    }
+    out
+}
+
 // ---- host operations: the command stream ------------------------------------------------------
 
 /// Stores the i32 `x` at `[a] + off`.
@@ -808,7 +1157,7 @@ fn command(h: &Helpers, a: u32, opcode: Opcode, payload: u32) -> impl Iterator<I
 /// Starts a command whose payload is `payload` bytes: returns the local that holds its address.
 fn begin_command(fe: &mut Fe, opcode: Opcode, payload: u32) -> u32 {
     let a = fe.new_local(ValType::I32);
-    let h = fe.helpers;
+    let h = fe.at.helpers;
     fe.ins.extend(command(h, a, opcode, payload));
     a
 }
@@ -867,8 +1216,9 @@ pub(super) fn host(
                 fe.ins.extend([I::LocalGet(handle), I::LocalSet(fe.v(v))]);
             }
         }
-        ir::HostOp::WriteBuffer { elem_size } => {
+        ir::HostOp::WriteBuffer { elem, elem_size } => {
             let (handle, at, run) = (fe.v(args[0]), fe.v(args[1]), fe.v(args[2]));
+            canonicalize_run(fe, *elem, run);
             fe.ins.push(I::LocalGet(handle));
             checked_bytes(fe, at, *elem_size);
             fe.ins.extend([I::LocalGet(run), I::I32Load(mem(0, 2))]);
@@ -876,21 +1226,27 @@ pub(super) fn host(
             let n = fe.new_local(ValType::I32);
             fe.ins.push(I::LocalSet(n));
             checked_bytes(fe, n, *elem_size);
-            fe.ins.push(I::Call(fe.helpers.write));
+            fe.ins.push(I::Call(fe.at.helpers.write));
         }
-        ir::HostOp::Dispatch { pipeline, buffers, uniform }
-        | ir::HostOp::Draw { pipeline, buffers, uniform } => {
+        ir::HostOp::Dispatch { pipeline, bindings, uniform, indirect }
+        | ir::HostOp::Draw { pipeline, bindings, uniform, indirect } => {
             let dispatch = matches!(op, ir::HostOp::Dispatch { .. });
-            let fixed = if dispatch { 4 } else { 3 };
-            let nb = *buffers as usize;
+            // The pipeline, then the counts: three groups, two counts, or a buffer and offset.
+            let fixed = if dispatch && !*indirect { 4 } else { 3 };
+            let nb = *bindings as usize;
             let usize_ = uniform.map_or(0, |t| round_up(16, layout(&fe.m.types, t).size));
             // Lowering keeps the uniforms small enough (`ir::MAX_UNIFORM_BYTES`) for the
             // command to fit in the command buffer.
-            let payload = (4 * (fixed + 1 + nb as u32 + 1)).saturating_add(usize_);
+            let payload = (4 * (fixed + 1 + 3 * nb as u32 + 1)).saturating_add(usize_);
             if CMD_HEADER.saturating_add(payload) > memory::CMD_CAP {
                 return Err(format!("internal: a {payload}-byte command overflows the buffer"));
             }
-            let opc = if dispatch { Opcode::Dispatch } else { Opcode::Draw };
+            let opc = match (dispatch, *indirect) {
+                (true, false) => Opcode::Dispatch,
+                (true, true) => Opcode::DispatchIndirect,
+                (false, false) => Opcode::Draw,
+                (false, true) => Opcode::DrawIndirect,
+            };
             let a = begin_command(fe, opc, payload);
             fe.ins.extend(put(a, CMD_HEADER, I::I32Const(*pipeline as i32)));
             for (k, x) in args.iter().take(fixed as usize - 1).enumerate() {
@@ -899,14 +1255,15 @@ pub(super) fn host(
             let mut off = CMD_HEADER + 4 * fixed;
             fe.ins.extend(put(a, off, I::I32Const(nb as i32)));
             off += 4;
-            for k in 0..nb {
+            // Each binding: handle, offset, size.
+            for k in 0..3 * nb {
                 fe.ins.extend(put(a, off, I::LocalGet(fe.v(args[fixed as usize - 1 + k]))));
                 off += 4;
             }
             fe.ins.extend(put(a, off, I::I32Const(usize_ as i32)));
             off += 4;
             if let Some(t) = uniform {
-                let u = fe.v(args[fixed as usize - 1 + nb]);
+                let u = fe.v(args[fixed as usize - 1 + 3 * nb]);
                 fe.ins.extend([
                     I::LocalGet(a),
                     I::I32Const(off as i32),
@@ -916,27 +1273,417 @@ pub(super) fn host(
                     I::MemoryFill(0),
                 ]);
                 fe.ins.extend([I::LocalGet(a), I::I32Const(off as i32), I::I32Add, I::LocalGet(u)]);
-                fe.copy(*t);
+                match fe.vec_n(*t) {
+                    Some(n) => fe.vec_store(n, 0),
+                    None => fe.copy(*t),
+                }
+                let at = fe.new_local(ValType::I32);
+                fe.ins.extend([
+                    I::LocalGet(a),
+                    I::I32Const(off as i32),
+                    I::I32Add,
+                    I::LocalSet(at),
+                ]);
+                canonicalize(fe, *t, at, 0);
+            }
+        }
+        ir::HostOp::DestroyBuffer => {
+            let a = begin_command(fe, Opcode::DestroyBuffer, 4);
+            fe.ins.extend(put(a, CMD_HEADER, I::LocalGet(fe.v(args[0]))));
+        }
+        ir::HostOp::CopyBuffer => {
+            let a = begin_command(fe, Opcode::CopyBuffer, 20);
+            for (k, x) in args.iter().enumerate() {
+                fe.ins.extend(put(a, CMD_HEADER + 4 * k as u32, I::LocalGet(fe.v(*x))));
             }
         }
         ir::HostOp::BeginScreenPass => {
             // Payload: the clear colour, four f32s.
             let payload = 16;
             let a = begin_command(fe, Opcode::BeginScreenPass, payload);
-            fe.ins.extend([
-                I::LocalGet(a),
-                I::I32Const(CMD_HEADER as i32),
-                I::I32Add,
-                I::LocalGet(fe.v(args[0])),
-                I::I32Const(payload as i32),
-                I::MemoryCopy { src_mem: 0, dst_mem: 0 },
-            ]);
+            if fe.vec_n(fe.vty(args[0])).is_some() {
+                fe.ins.extend([
+                    I::LocalGet(a),
+                    I::LocalGet(fe.v(args[0])),
+                    I::V128Store(mem(CMD_HEADER, 2)),
+                ]);
+            } else {
+                fe.ins.extend([
+                    I::LocalGet(a),
+                    I::I32Const(CMD_HEADER as i32),
+                    I::I32Add,
+                    I::LocalGet(fe.v(args[0])),
+                    I::I32Const(payload as i32),
+                    I::MemoryCopy { src_mem: 0, dst_mem: 0 },
+                ]);
+            }
         }
         ir::HostOp::Present => {
             begin_command(fe, Opcode::Present, 0);
         }
+        ir::HostOp::Command { opcode, words, runs, handle } => {
+            command_op(fe, *opcode, *words, *runs, *handle, args, result)?;
+        }
+        ir::HostOp::NextRequest => {
+            let r = result.ok_or("internal: a request number nothing uses")?;
+            fe.ins.extend([
+                I::GlobalGet(globals::NEXT_REQUEST),
+                I::LocalTee(fe.v(r)),
+                I::I32Const(1),
+                I::I32Add,
+                I::GlobalSet(globals::NEXT_REQUEST),
+            ]);
+        }
+        ir::HostOp::RequestStatus | ir::HostOp::Limit => {
+            // A request made in this call is pending until the next one, so its command
+            // needn't reach the host before its status is read.
+            let h = fe.at.helpers;
+            let helper = if matches!(op, ir::HostOp::Limit) { h.limit } else { h.request_status };
+            fe.ins.extend([I::LocalGet(fe.v(args[0])), I::Call(helper)]);
+            match result {
+                Some(r) => fe.ins.push(I::LocalSet(fe.v(r))),
+                None => fe.ins.push(I::Drop),
+            }
+        }
+        ir::HostOp::Audio | ir::HostOp::RequestTake => {
+            let h = fe.at.helpers;
+            let helper = if matches!(op, ir::HostOp::Audio) { h.audio } else { h.request_take };
+            fe.ins.extend([I::LocalGet(fe.v(args[0])), I::LocalGet(fe.v(args[1]))]);
+            fe.ins.push(I::Call(helper));
+        }
     }
     Ok(())
+}
+
+/// [`ir::HostOp::Command`]: the words, each run's length, then each run's bytes padded to a
+/// multiple of 4.
+fn command_op(
+    fe: &mut Fe,
+    opcode: u32,
+    words: u32,
+    runs: u32,
+    handle: bool,
+    args: &[ir::ValueId],
+    result: Option<ir::ValueId>,
+) -> R<()> {
+    let given = (words - u32::from(handle)) as usize;
+    let (scalars, run_args) = args.split_at(given);
+    if run_args.len() != runs as usize {
+        return Err("internal: a command's arguments don't match its shape".into());
+    }
+    // The payload's size: the words, the lengths, and each run padded.
+    let size = fe.new_local(ValType::I32);
+    fe.ins.extend([I::I32Const((4 * (words + runs)) as i32), I::LocalSet(size)]);
+    for r in run_args {
+        fe.ins.extend([
+            I::LocalGet(size),
+            I::LocalGet(fe.v(*r)),
+            I::I32Load(mem(4, 2)),
+            I::I32Const(3),
+            I::I32Add,
+            I::I32Const(-4),
+            I::I32And,
+            I::I32Add,
+            I::LocalSet(size),
+        ]);
+    }
+    let a = fe.new_local(ValType::I32);
+    let h = fe.at.helpers;
+    fe.ins.extend([
+        I::LocalGet(size),
+        I::I32Const(CMD_HEADER as i32),
+        I::I32Add,
+        I::Call(h.reserve),
+        I::LocalSet(a),
+    ]);
+    fe.ins.extend(put(a, 0, I::I32Const(opcode as i32)));
+    fe.ins.extend(put(a, 4, I::LocalGet(size)));
+    let mut off = CMD_HEADER;
+    if handle {
+        let new = fe.new_local(ValType::I32);
+        fe.ins.extend([
+            I::GlobalGet(globals::NEXT_HANDLE),
+            I::LocalTee(new),
+            I::I32Const(1),
+            I::I32Add,
+            I::GlobalSet(globals::NEXT_HANDLE),
+        ]);
+        fe.ins.extend(put(a, off, I::LocalGet(new)));
+        off += 4;
+        if let Some(v) = result {
+            fe.ins.extend([I::LocalGet(new), I::LocalSet(fe.v(v))]);
+        }
+    }
+    for x in scalars {
+        let local = fe.v(*x);
+        let word = match fe.scalar(fe.vty(*x))? {
+            ir::Scalar::F32 => vec![I::LocalGet(a), I::LocalGet(local), I::F32Store(mem(off, 2))],
+            ir::Scalar::I64 | ir::Scalar::U64 | ir::Scalar::F64 => {
+                return Err("internal: a 64-bit word in a command".into());
+            }
+            _ => put(a, off, I::LocalGet(local)).to_vec(),
+        };
+        fe.ins.extend(word);
+        off += 4;
+    }
+    for r in run_args {
+        fe.ins.extend([I::LocalGet(a), I::LocalGet(fe.v(*r)), I::I32Load(mem(4, 2))]);
+        fe.ins.push(I::I32Store(mem(off, 2)));
+        off += 4;
+    }
+    // The bytes, through a cursor: their lengths aren't known here.
+    let at = fe.new_local(ValType::I32);
+    fe.ins.extend([I::LocalGet(a), I::I32Const(off as i32), I::I32Add, I::LocalSet(at)]);
+    for r in run_args {
+        let run = fe.v(*r);
+        let padded = fe.new_local(ValType::I32);
+        fe.ins.extend([
+            I::LocalGet(run),
+            I::I32Load(mem(4, 2)),
+            I::I32Const(3),
+            I::I32Add,
+            I::I32Const(-4),
+            I::I32And,
+            I::LocalSet(padded),
+            // Zeros first, for the padding.
+            I::LocalGet(at),
+            I::I32Const(0),
+            I::LocalGet(padded),
+            I::MemoryFill(0),
+            I::LocalGet(at),
+            I::LocalGet(run),
+            I::I32Load(mem(0, 2)),
+            I::LocalGet(run),
+            I::I32Load(mem(4, 2)),
+            I::MemoryCopy { src_mem: 0, dst_mem: 0 },
+            I::LocalGet(at),
+            I::LocalGet(padded),
+            I::I32Add,
+            I::LocalSet(at),
+        ]);
+    }
+    Ok(())
+}
+
+// ---- panics the back end writes ----------------------------------------------------------------
+
+/// A panic with the message in constant data `msg` (its id and length): the message where hosts
+/// read it, then a trap (as `ir::MemOp::Panic`).
+pub(crate) fn panic_with(data: &[u32], msg: (ir::DataId, u32)) -> R<Vec<I<'static>>> {
+    let (d, n) = msg;
+    let at = *data.get(d.index()).ok_or("internal: a missing message")?;
+    let n = n.min(memory::PANIC_CAP);
+    Ok(vec![
+        I::I32Const(memory::PANIC_MESSAGE as i32),
+        I::I32Const(n as i32),
+        I::I32Store(mem(0, 2)),
+        I::I32Const(memory::PANIC_MESSAGE as i32 + 4),
+        I::I32Const(at as i32),
+        I::I32Const(n as i32),
+        I::MemoryCopy { src_mem: 0, dst_mem: 0 },
+        I::Unreachable,
+    ])
+}
+
+/// The offsets of the f32s of a value of type `t` that holds floats as a vector or matrix
+/// does, or `None` for a scalar (an f32 or f64, `Some(true)` for f64) or a type that holds none.
+fn float_parts(types: &ir::Types, t: ir::TypeId) -> Option<(Option<bool>, Vec<u32>)> {
+    match types.get(t) {
+        ir::TypeDef::Scalar(ir::Scalar::F32) => Some((Some(false), Vec::new())),
+        ir::TypeDef::Scalar(ir::Scalar::F64) => Some((Some(true), Vec::new())),
+        ir::TypeDef::Vector(n) => Some((None, components(false, *n).collect())),
+        ir::TypeDef::Matrix(n) => Some((None, components(true, *n).collect())),
+        _ => None,
+    }
+}
+
+/// Pushes whether float value `x` (a scalar, vector or matrix) is or holds a NaN, an i32.
+fn any_nan(fe: &mut Fe, x: ir::ValueId, parts: &(Option<bool>, Vec<u32>)) {
+    if let Some(n) = fe.vec_n(fe.vty(x)) {
+        // Its own lanes only: the others hold anything.
+        fe.ins.extend([
+            I::LocalGet(fe.v(x)),
+            I::LocalGet(fe.v(x)),
+            I::F32x4Ne,
+            I::I32x4Bitmask,
+            I::I32Const((1 << n) - 1),
+            I::I32And,
+            I::I32Const(0),
+            I::I32Ne,
+        ]);
+        return;
+    }
+    match parts {
+        (Some(f64_), _) => {
+            let ne = if *f64_ { I::F64Ne } else { I::F32Ne };
+            fe.ins.extend([I::LocalGet(fe.v(x)), I::LocalGet(fe.v(x)), ne]);
+        }
+        (None, offs) => {
+            for (k, &off) in offs.iter().enumerate() {
+                load_f32(fe, x, off);
+                load_f32(fe, x, off);
+                fe.ins.push(I::F32Ne);
+                if k > 0 {
+                    fe.ins.push(I::I32Or);
+                }
+            }
+        }
+    }
+}
+
+/// In a debug build (`ir::Module::nan_message`), panics when float value `v` is or holds a NaN
+/// that none of `operands` held: a NaN was created, not passed on (language.md §11).
+pub(crate) fn nan_check(fe: &mut Fe, v: ir::ValueId, operands: &[ir::ValueId]) {
+    let Some(msg) = fe.m.nan_message else { return };
+    let Some(parts) = float_parts(&fe.m.types, fe.vty(v)) else { return };
+    any_nan(fe, v, &parts);
+    for &o in operands {
+        if let Some(p) = float_parts(&fe.m.types, fe.vty(o)) {
+            any_nan(fe, o, &p);
+            fe.ins.extend([I::I32Eqz, I::I32And]);
+        }
+    }
+    fe.ins.push(I::If(BlockType::Empty));
+    match panic_with(fe.at.data, msg) {
+        Ok(p) => fe.ins.extend(p),
+        Err(_) => fe.ins.push(I::Unreachable),
+    }
+    fe.ins.push(I::End);
+}
+
+// ---- canonical NaNs (language.md §11) ---------------------------------------------------------
+
+/// The NaNs a value's bytes hold where they're observed: one bit pattern each.
+const CANONICAL_F32: u32 = 0x7fc0_0000;
+const CANONICAL_F64: u64 = 0x7ff8_0000_0000_0000;
+
+/// Pushes the f32 or f64 on the stack's top (`f64_`), with any NaN made the canonical one.
+pub(crate) fn canonical_on_stack(fe: &mut Fe, f64_: bool) {
+    let (t, nan, ne) = if f64_ {
+        (ValType::F64, I::F64Const(f64::from_bits(CANONICAL_F64).into()), I::F64Ne)
+    } else {
+        (ValType::F32, I::F32Const(f32::from_bits(CANONICAL_F32).into()), I::F32Ne)
+    };
+    let x = fe.new_local(t);
+    fe.ins.extend([I::LocalSet(x), nan, I::LocalGet(x), I::LocalGet(x), I::LocalGet(x), ne]);
+    fe.ins.push(I::Select);
+}
+
+/// Makes every NaN in the value of type `t` at `addr + off` (`addr` a local) the canonical one,
+/// in place, so the value's bytes depend only on its fields where they're seen: uploads to the
+/// GPU (language.md §11). A NaN's bits can't be told apart in the language otherwise.
+pub(crate) fn canonicalize(fe: &mut Fe, t: ir::TypeId, addr: u32, off: u32) {
+    let types = &fe.m.types;
+    if !types.has_float(t) {
+        return;
+    }
+    let float = |fe: &mut Fe, f64_: bool, off: u32| {
+        let (load, store) = if f64_ {
+            (I::F64Load(mem(off, 3)), I::F64Store(mem(off, 3)))
+        } else {
+            (I::F32Load(mem(off, 2)), I::F32Store(mem(off, 2)))
+        };
+        fe.ins.extend([I::LocalGet(addr), I::LocalGet(addr), load]);
+        canonical_on_stack(fe, f64_);
+        fe.ins.push(store);
+    };
+    match types.get(t).clone() {
+        ir::TypeDef::Scalar(s) => float(fe, s == ir::Scalar::F64, off),
+        ir::TypeDef::Vector(n) => {
+            for k in 0..u32::from(n) {
+                float(fe, false, off + 4 * k);
+            }
+        }
+        ir::TypeDef::Matrix(n) => {
+            for c in 0..u32::from(n) {
+                for k in 0..u32::from(n) {
+                    float(fe, false, off + column_stride(n) * c + 4 * k);
+                }
+            }
+        }
+        ir::TypeDef::Array(e, n) => {
+            let stride = ir::layout::array_stride(&fe.m.types, e);
+            if n <= 8 {
+                for i in 0..n {
+                    canonicalize(fe, e, addr, off + stride * i);
+                }
+                return;
+            }
+            let start = [I::LocalGet(addr), I::I32Const(off as i32), I::I32Add];
+            canonicalize_loop(fe, e, stride, start, [I::I32Const((stride * n) as i32)]);
+        }
+        ir::TypeDef::Struct { fields, .. } => {
+            let offsets = ir::layout::field_offsets(&fe.m.types, t).to_vec();
+            for (&(_, f), o) in fields.iter().zip(offsets) {
+                canonicalize(fe, f, addr, off + o);
+            }
+        }
+        ir::TypeDef::Enum { variants, .. } => {
+            let offsets = ir::layout::field_offsets(&fe.m.types, t).to_vec();
+            for (v, (_, p)) in variants.iter().enumerate() {
+                let Some(p) = *p else { continue };
+                fe.ins.extend([
+                    I::LocalGet(addr),
+                    I::I32Load(mem(off, 2)),
+                    I::I32Const(v as i32),
+                    I::I32Eq,
+                    I::If(BlockType::Empty),
+                ]);
+                canonicalize(fe, p, addr, off + offsets[1 + v]);
+                fe.ins.push(I::End);
+            }
+        }
+        ir::TypeDef::Run(_) | ir::TypeDef::RuntimeArray(_) | ir::TypeDef::Ptr(_) => {}
+        ir::TypeDef::Atomic(_) => {}
+    }
+}
+
+/// [`canonicalize`] for each element of the run (a local: its pointer, then its count) of
+/// elements of type `elem`.
+fn canonicalize_run(fe: &mut Fe, elem: ir::TypeId, run: u32) {
+    if !fe.m.types.has_float(elem) {
+        return;
+    }
+    let stride = ir::layout::array_stride(&fe.m.types, elem);
+    let start = [I::LocalGet(run), I::I32Load(mem(0, 2))];
+    let size = [I::LocalGet(run), I::I32Load(mem(4, 2)), I::I32Const(stride as i32), I::I32Mul];
+    canonicalize_loop(fe, elem, stride, start, size);
+}
+
+/// [`canonicalize`] for each element of type `elem`, `stride` bytes apart, from the address
+/// `start` pushes to the end of the `size` bytes that `size` pushes: a loop, in which a local
+/// walks the elements.
+fn canonicalize_loop(
+    fe: &mut Fe,
+    elem: ir::TypeId,
+    stride: u32,
+    start: impl IntoIterator<Item = I<'static>>,
+    size: impl IntoIterator<Item = I<'static>>,
+) {
+    let (at, end) = (fe.new_local(ValType::I32), fe.new_local(ValType::I32));
+    fe.ins.extend(start);
+    fe.ins.push(I::LocalTee(at));
+    fe.ins.extend(size);
+    fe.ins.extend([
+        I::I32Add,
+        I::LocalSet(end),
+        I::Block(BlockType::Empty),
+        I::Loop(BlockType::Empty),
+        I::LocalGet(at),
+        I::LocalGet(end),
+        I::I32GeU,
+        I::BrIf(1),
+    ]);
+    canonicalize(fe, elem, at, 0);
+    fe.ins.extend([
+        I::LocalGet(at),
+        I::I32Const(stride as i32),
+        I::I32Add,
+        I::LocalSet(at),
+        I::Br(0),
+        I::End,
+        I::End,
+    ]);
 }
 
 /// `fmod(x, y)` for floats of width `f`: `x - y * trunc(x / y)`, exactly, as C's `fmod`. The
@@ -1046,8 +1793,8 @@ fn fmod(f: Fw) -> Function {
     function(locals, &ins)
 }
 
-/// The helpers' bodies, in `Helpers` order after the import: flush, reserve, write, release and
-/// the two `fmod`s.
+/// The helpers' bodies, in `Helpers` order after the import: flush, reserve, write and the two
+/// `fmod`s.
 pub(crate) fn helper_bodies(h: &Helpers) -> Vec<(Vec<ValType>, Vec<ValType>, Function)> {
     use memory::{CMD_BASE, CMD_CAP};
     // flush(): header, then submit(CMD_BASE, 12 + len); len = 0.
@@ -1071,8 +1818,6 @@ pub(crate) fn helper_bodies(h: &Helpers) -> Vec<(Vec<ValType>, Vec<ValType>, Fun
         I::Call(h.submit),
         I::GlobalGet(globals::NEXT_HANDLE),
         I::GlobalSet(globals::SUBMITTED_TO),
-        I::GlobalGet(globals::LIVE_FROM),
-        I::GlobalSet(globals::RELEASED_TO),
         I::I32Const(0),
         I::GlobalSet(globals::CMD_LEN),
         I::End,
@@ -1149,36 +1894,12 @@ pub(crate) fn helper_bodies(h: &Helpers) -> Vec<(Vec<ValType>, Vec<ValType>, Fun
     write.extend([I::LocalGet(ptr), I::LocalGet(chunk), I::I32Add, I::LocalSet(ptr)]);
     write.extend([I::LocalGet(n), I::LocalGet(chunk), I::I32Sub, I::LocalSet(n)]);
     write.extend([I::Br(0), I::End, I::End, I::End]);
-    // release(): DestroyBuffer for each buffer made since the last release (handles
-    // LIVE_FROM..NEXT_HANDLE), then LIVE_FROM = NEXT_HANDLE.
-    let a = 0;
-    let mut release = vec![I::Block(BlockType::Empty), I::Loop(BlockType::Empty)];
-    release.extend([
-        I::GlobalGet(globals::LIVE_FROM),
-        I::GlobalGet(globals::NEXT_HANDLE),
-        I::I32GeU,
-        I::BrIf(1),
-    ]);
-    // Payload: the handle.
-    release.extend(command(h, a, Opcode::DestroyBuffer, 4));
-    release.extend(put(a, CMD_HEADER, I::GlobalGet(globals::LIVE_FROM)));
-    release.extend([
-        I::GlobalGet(globals::LIVE_FROM),
-        I::I32Const(1),
-        I::I32Add,
-        I::GlobalSet(globals::LIVE_FROM),
-        I::Br(0),
-        I::End,
-        I::End,
-        I::End,
-    ]);
     let i32x = |k| vec![ValType::I32; k];
     let (f32_, f64_) = (Fw { f64_: false }, Fw { f64_: true });
     vec![
         (vec![], vec![], function(vec![], &flush)),
         (i32x(1), i32x(1), function(vec![], &reserve)),
         (i32x(4), vec![], function(i32x(2), &write)),
-        (vec![], vec![], function(i32x(1), &release)),
         (vec![ValType::F32; 2], vec![ValType::F32], fmod(f32_)),
         (vec![ValType::F64; 2], vec![ValType::F64], fmod(f64_)),
     ]

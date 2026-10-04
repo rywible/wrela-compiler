@@ -56,6 +56,17 @@ pub const RETIRED: &[(&str, &str)] = &[
     ("E0321", "an unreachable match arm: W0002 reports it (a warning, not an error)"),
     ("E0509", "a projection that escapes: E0508 reports it (one not from a parameter)"),
     ("E0907", "workgroup-shared memory: it has no syntax yet to report (milestone 2)"),
+    ("E0902", "`?` and `Result` were tier 1: milestone 2 built them"),
+    (
+        "E0904",
+        "`unsafe` was tier 1: milestone 2 built it (E0214 reports it outside a package that declares it)",
+    ),
+    ("E0905", "`dyn` was tier 2: wrela has no `dyn`, which E0113 reports"),
+    ("E0908", "`match mut` was tier 1: milestone 2 built it"),
+    ("E0900", "unit suffixes were tier 1: milestone 2 built them (E0216 reports an unknown unit)"),
+    ("E0901", "strings were tier 1: milestone 2 built them"),
+    ("E0903", "tier-1 attributes: milestone 2 built them all (E0204 reports an unknown one)"),
+    ("E0906", "constants computed by the build were tier 1: milestone 2 built them"),
 ];
 
 macro_rules! codes {
@@ -92,6 +103,9 @@ codes! {
     E0110 = "E0110", "an assignment where an expression is expected";
     E0111 = "E0111", "`else` on a new line";
     E0112 = "E0112", "an expression, block, type or pattern nested too deeply";
+    E0113 = "E0113", "`dyn`, which wrela doesn't have";
+    E0114 = "E0114", "a lifetime or a loop label, which wrela doesn't have";
+    E0115 = "E0115", "a macro call, which wrela doesn't have";
 
     // ---- E02xx: names and modules ----------------------------------------------------------
     E0200 = "E0200", "an unknown name";
@@ -108,6 +122,15 @@ codes! {
     E0211 = "E0211", "an unknown variant";
     E0212 = "E0212", "a type used as a value, or a value as a type";
     E0213 = "E0213", "mutable global state";
+    E0214 = "E0214", "`unsafe` in a package that doesn't declare it";
+    E0215 = "E0215", "a call into std's unsafe core outside `unsafe`";
+    E0216 = "E0216", "an unknown unit suffix";
+    E0217 = "E0217", "an f-string's format spec that isn't valid";
+    E0218 = "E0218", "an `embed` whose file can't be read";
+    E0219 = "E0219", "a `wrela.toml` that isn't valid";
+    E0220 = "E0220", "a dependency that isn't there";
+    E0221 = "E0221", "packages that depend on each other";
+    E0222 = "E0222", "a `@test` that `wrela test` can't run";
 
     // ---- E03xx: types ----------------------------------------------------------------------
     E0300 = "E0300", "mismatched types";
@@ -132,12 +155,15 @@ codes! {
     E0320 = "E0320", "a pattern that doesn't match the type";
     E0322 = "E0322", "a wrong number of generic arguments";
     E0323 = "E0323", "a vector constructor with the wrong components";
-    E0324 = "E0324", "a struct default that isn't a constant";
+    E0324 = "E0324", "a generic default that isn't a literal";
     E0325 = "E0325", "an array length that isn't a constant";
     E0326 = "E0326", "a CPU-only type in GPU code";
     E0327 = "E0327", "a run type `[T]` outside a parameter";
     E0328 = "E0328", "a constant whose value refers to itself";
     E0329 = "E0329", "a type too large to compile";
+    E0330 = "E0330", "a `let … else` whose `else` doesn't leave the scope";
+    E0331 = "E0331", "a `const` generic parameter that isn't a `u32`";
+    E0332 = "E0332", "a constant of a type that can't live as long as the program";
 
     // ---- E04xx: traits and generics --------------------------------------------------------
     E0400 = "E0400", "a type that doesn't implement a trait";
@@ -153,6 +179,13 @@ codes! {
     E0410 = "E0410", "a trait used as a value type";
     E0411 = "E0411", "a cyclic supertrait";
     E0412 = "E0412", "a generic function whose instantiations never end";
+    E0413 = "E0413", "a destructor outside std's core";
+    E0414 = "E0414", "a trait method's `@fieldwise` hook that doesn't fit";
+    E0415 = "E0415", "an `impl` of `Copy` or `Clone`, which a type declares instead";
+    E0416 = "E0416", "a `@fieldwise` trait method that can't be derived";
+    E0417 = "E0417", "a type that can't derive a `@fieldwise` trait it declares";
+    E0418 = "E0418", "a trait set that names itself";
+    E0419 = "E0419", "a trait set where one trait is needed";
 
     // ---- E05xx: modes, moves, projections, exclusivity, closures -------------------------
     E0500 = "E0500", "a use of a moved value";
@@ -172,38 +205,40 @@ codes! {
     E0515 = "E0515", "a move inside a loop of a value from outside it";
     E0516 = "E0516", "a use of a possibly moved value";
     E0517 = "E0517", "`var` binding of a named place without `take` or `.clone()`";
+    E0518 = "E0518", "`let` of a place whose type isn't `Copy`";
+    E0519 = "E0519", "a projection as a field of an ordinary type";
+    E0520 = "E0520", "a parallel closure that writes data it captures";
 
     // ---- E06xx: effects and GPU rules ------------------------------------------------------
     E0600 = "E0600", "an effect a context forbids";
     E0601 = "E0601", "a kernel `mut` parameter that isn't safe to share across invocations";
     E0602 = "E0602", "a GPU entry point with an invalid signature";
-    E0603 = "E0603", "a dispatch or draw that doesn't match its entry points";
+    E0603 = "E0603", "a dispatch or draw whose entry points, binding or counts are wrong";
     E0604 = "E0604", "data crossing to the GPU that isn't `GpuData`";
     E0605 = "E0605", "a workgroup size out of range";
     E0606 = "E0606", "an entry point called directly";
     E0607 = "E0607", "a GPU feature used in CPU code";
-    E0608 = "E0608", "a derivative in non-uniform control flow";
+        E0608 = "E0608", "a derivative in non-uniform control flow";
+    E0609 = "E0609", "workgroup memory read and written with no barrier between";
+    E0610 = "E0610", "a barrier in non-uniform control flow";
 
     // ---- E07xx: derived interpretations and back ends --------------------------------------
     E0700 = "E0700", "a function that can't be derived";
     E0701 = "E0701", "an interval of a loop or a recursion whose end depends on the input";
     E0702 = "E0702", "a construct not supported by a back end";
     E0703 = "E0703", "an exported function with an unsupported signature";
+    E0704 = "E0704", "a constant whose computation panicked or trapped";
+    E0705 = "E0705", "a constant whose computation ran past the build's fuel limit";
+    E0706 = "E0706", "a `@test` that fails";
 
     // ---- E09xx: not in tier 0 --------------------------------------------------------------
-    E0900 = "E0900", "units are tier 1";
-    E0901 = "E0901", "strings are tier 1";
-    E0902 = "E0902", "`?` and `Result` are tier 1";
-    E0903 = "E0903", "an attribute that is tier 1 or later";
-    E0904 = "E0904", "`unsafe` is tier 1";
-    E0905 = "E0905", "`dyn` is tier 2";
-    E0906 = "E0906", "an evaluated constant initializer is tier 1";
-    E0908 = "E0908", "`match mut` is tier 1";
 
     // ---- W0xxx: warnings -------------------------------------------------------------------
     W0001 = "W0001", "an unused local";
     W0002 = "W0002", "unreachable code";
     W0003 = "W0003", "a file named like the entry module, in another case";
+    W0004 = "W0004", "`Clone` declared beside `Copy`, which implies it";
+    W0005 = "W0005", "an argument passed by position where a swap would compile";
 
     // ---- I0xxx: bugs in the compiler -------------------------------------------------------
     I0001 = "I0001", "an internal compiler error";

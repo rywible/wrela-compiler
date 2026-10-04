@@ -1,0 +1,47 @@
+// accepts: gpu.textures
+// A pass draws into a texture, which a screen pass then samples.
+
+use std::gpu::{
+    ClipPosition, FragCoord, Sampler, Texture, VertexIndex, begin_pass, begin_screen_pass, draw,
+    present, sampler, texture,
+}
+
+pub struct Scene {
+    target: Texture,
+    linear: Sampler,
+}
+
+pub fn init() -> Scene {
+    Scene { target: texture(width: 256, height: 256), linear: sampler() }
+}
+
+pub struct Out: Copy {
+    position: ClipPosition,
+    uv: vec2,
+}
+
+@vertex
+fn cover(v: VertexIndex) -> Out {
+    let x = f32(v.index % 2) * 4.0 - 1.0
+    let y = f32(v.index / 2) * 4.0 - 1.0
+    Out { position: ClipPosition { position: vec4(x, y, 0.0, 1.0) }, uv: vec2(x, y) * 0.5 + 0.5 }
+}
+
+@fragment
+fn gradient(pixel: FragCoord, input: Out) -> vec4 {
+    vec4(input.uv, 0.5, 1.0)
+}
+
+@fragment
+fn copy(pixel: FragCoord, input: Out, image: Texture, s: Sampler) -> vec4 {
+    image.sample(s, input.uv)
+}
+
+pub fn frame(state: mut Scene, time: f32, width: u32, height: u32) {
+    let pass = begin_pass(mut state.target, clear: vec4(0.0, 0.0, 0.0, 1.0))
+    draw(cover, gradient, vertices: 3)
+    pass.end()
+    begin_screen_pass(clear: vec4(0.0, 0.0, 0.0, 1.0))
+    draw(cover, copy.bind(image: state.target, s: state.linear), vertices: 3)
+    present()
+}

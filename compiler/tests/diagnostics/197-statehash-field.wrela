@@ -1,0 +1,13 @@
+// mistake: a `StateHash` struct with a field that isn't `StateHash`
+// expect: E0417
+// fix: no
+use std::hash::StateHash
+
+struct Camera {
+    fov: f32,
+}
+
+struct World: StateHash {
+    seed: u32,
+    camera: Camera,
+}

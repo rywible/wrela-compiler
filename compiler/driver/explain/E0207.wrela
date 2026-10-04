@@ -1,0 +1,34 @@
+// A method that the type doesn't have: no `impl` of the type, and no trait it implements,
+// declares it.
+// ---- wrong
+struct Ball {
+    radius: f32,
+}
+
+impl Ball {
+    fn area(self) -> f32 {
+        3.14159 * self.radius * self.radius
+    }
+}
+
+fn size(b: Ball) -> f32 {
+    b.surface()
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+struct Ball {
+    radius: f32,
+}
+
+impl Ball {
+    fn area(self) -> f32 {
+        3.14159 * self.radius * self.radius
+    }
+}
+
+fn size(b: Ball) -> f32 {
+    b.area()
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

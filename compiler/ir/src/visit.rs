@@ -48,9 +48,17 @@ impl Expr {
     /// Every value the expression reads, its places' included.
     pub fn for_each_value(&self, f: &mut impl FnMut(ValueId)) {
         match self {
-            Expr::Const(_) | Expr::Zero(_) | Expr::EntryInput(_) | Expr::Param(_) => {}
+            Expr::Const(_)
+            | Expr::Zero(_)
+            | Expr::EntryInput(_)
+            | Expr::Param(_)
+            | Expr::Barrier => {}
             Expr::Load(p) | Expr::Run(p) | Expr::Addr(p) | Expr::ArrayLength(p) => {
                 p.for_each_value(f)
+            }
+            Expr::Atomic(_, p, xs) => {
+                p.for_each_value(f);
+                xs.iter().for_each(|x| f(*x));
             }
             Expr::Unary(_, x)
             | Expr::Extract(x, _)
@@ -64,9 +72,11 @@ impl Expr {
                 f(*a);
                 f(*b);
             }
-            Expr::Builtin(_, xs) | Expr::Construct(_, xs) | Expr::Host(_, xs) => {
-                xs.iter().for_each(|x| f(*x))
-            }
+            Expr::Builtin(_, xs)
+            | Expr::Construct(_, xs)
+            | Expr::Host(_, xs)
+            | Expr::Mem(_, xs)
+            | Expr::Texture(_, _, _, xs) => xs.iter().for_each(|x| f(*x)),
             Expr::Select { cond, if_true, if_false } => {
                 f(*cond);
                 f(*if_true);
@@ -85,9 +95,17 @@ impl Expr {
 
     pub fn for_each_value_mut(&mut self, f: &mut impl FnMut(&mut ValueId)) {
         match self {
-            Expr::Const(_) | Expr::Zero(_) | Expr::EntryInput(_) | Expr::Param(_) => {}
+            Expr::Const(_)
+            | Expr::Zero(_)
+            | Expr::EntryInput(_)
+            | Expr::Param(_)
+            | Expr::Barrier => {}
             Expr::Load(p) | Expr::Run(p) | Expr::Addr(p) | Expr::ArrayLength(p) => {
                 p.for_each_value_mut(f)
+            }
+            Expr::Atomic(_, p, xs) => {
+                p.for_each_value_mut(f);
+                xs.iter_mut().for_each(f);
             }
             Expr::Unary(_, x)
             | Expr::Extract(x, _)
@@ -101,9 +119,11 @@ impl Expr {
                 f(a);
                 f(b);
             }
-            Expr::Builtin(_, xs) | Expr::Construct(_, xs) | Expr::Host(_, xs) => {
-                xs.iter_mut().for_each(f)
-            }
+            Expr::Builtin(_, xs)
+            | Expr::Construct(_, xs)
+            | Expr::Host(_, xs)
+            | Expr::Mem(_, xs)
+            | Expr::Texture(_, _, _, xs) => xs.iter_mut().for_each(f),
             Expr::Select { cond, if_true, if_false } => {
                 f(cond);
                 f(if_true);
@@ -124,7 +144,11 @@ impl Expr {
     /// buffer's length, and a call's by-reference arguments.
     pub fn for_each_place(&self, f: &mut impl FnMut(&Place)) {
         match self {
-            Expr::Load(p) | Expr::Run(p) | Expr::Addr(p) | Expr::ArrayLength(p) => f(p),
+            Expr::Load(p)
+            | Expr::Run(p)
+            | Expr::Addr(p)
+            | Expr::ArrayLength(p)
+            | Expr::Atomic(_, p, _) => f(p),
             Expr::Call(_, args) => {
                 for a in args {
                     match a {
@@ -149,13 +173,20 @@ impl Expr {
             | Expr::Construct(..)
             | Expr::Variant(..)
             | Expr::Host(..)
+            | Expr::Mem(..)
+            | Expr::Texture(..)
+            | Expr::Barrier
             | Expr::Select { .. } => {}
         }
     }
 
     pub fn for_each_place_mut(&mut self, f: &mut impl FnMut(&mut Place)) {
         match self {
-            Expr::Load(p) | Expr::Run(p) | Expr::Addr(p) | Expr::ArrayLength(p) => f(p),
+            Expr::Load(p)
+            | Expr::Run(p)
+            | Expr::Addr(p)
+            | Expr::ArrayLength(p)
+            | Expr::Atomic(_, p, _) => f(p),
             Expr::Call(_, args) => {
                 for a in args {
                     match a {
@@ -180,8 +211,20 @@ impl Expr {
             | Expr::Construct(..)
             | Expr::Variant(..)
             | Expr::Host(..)
+            | Expr::Mem(..)
+            | Expr::Texture(..)
+            | Expr::Barrier
             | Expr::Select { .. } => {}
         }
+    }
+
+    /// Whether evaluating it does something besides give its value: a call, a host or memory
+    /// operation, an atomic, a barrier. Those stay even when their value isn't used.
+    pub fn has_effect(&self) -> bool {
+        matches!(
+            self,
+            Expr::Call(..) | Expr::Host(..) | Expr::Mem(..) | Expr::Atomic(..) | Expr::Barrier
+        )
     }
 
     /// The function a call calls.

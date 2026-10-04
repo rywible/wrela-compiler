@@ -1,0 +1,29 @@
+// A value that crosses to the GPU (an entry point's parameter, a buffer's element) whose type
+// doesn't declare `GpuData`: `struct Params: Copy + GpuData`. `GpuData` fixes its layout
+// to what WGSL reads.
+// ---- wrong
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch}
+
+struct Params: Copy {
+    scale: f32,
+}
+
+@compute(64)
+fn fill(p: Params, out: mut Slots<f32>, id: GlobalId) {
+    out[id] = p.scale
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch}
+
+struct Params: Copy + GpuData {
+    scale: f32,
+}
+
+@compute(64)
+fn fill(p: Params, out: mut Slots<f32>, id: GlobalId) {
+    out[id] = p.scale
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

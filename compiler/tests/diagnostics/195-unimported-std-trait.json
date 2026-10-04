@@ -1,0 +1,40 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0202",
+      "file": "main.wrela",
+      "fixes": [
+        {
+          "edits": [
+            {
+              "end": 0,
+              "file": "main.wrela",
+              "replacement": "use std::hash::StateHash\n",
+              "start": 0
+            }
+          ],
+          "message": "import it: `use std::hash::StateHash`"
+        }
+      ],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "there's no module or item `StateHash` here",
+      "notes": [
+        "`StateHash` is in `std::hash`, which this module doesn't import"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 15,
+        "end": 102,
+        "end_column": 24,
+        "end_line": 4,
+        "line": 4,
+        "start": 93
+      },
+      "title": "an unknown module"
+    }
+  ],
+  "version": 2
+}

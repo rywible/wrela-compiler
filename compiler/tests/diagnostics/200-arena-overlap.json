@@ -1,0 +1,41 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0506",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [
+        {
+          "file": "main.wrela",
+          "message": "`a` borrows `levers[_]` here",
+          "span": {
+            "column": 13,
+            "end": 218,
+            "end_column": 22,
+            "end_line": 9,
+            "line": 9,
+            "start": 209
+          }
+        }
+      ],
+      "message": "`levers[_].pulled` overlaps `levers[_]`, which `a` is borrowing mutably",
+      "notes": [
+        "`a` is used later, so the borrow is still live"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 5,
+        "end": 239,
+        "end_column": 21,
+        "end_line": 10,
+        "line": 10,
+        "start": 223
+      },
+      "title": "an access that overlaps a live `mut` access"
+    }
+  ],
+  "version": 2
+}

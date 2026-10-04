@@ -1,0 +1,15 @@
+// run: declared `Eq` and `Ord` compare fields in order
+// expect: newer() = true
+
+struct Version: Copy + Eq + Ord {
+    major: u32,
+    minor: u32,
+}
+
+pub fn newer() -> bool {
+    let a = Version { major: 1, minor: 4 }
+    let b = Version { major: 1, minor: 12 }
+    b > a && a != b && a == Version { major: 1, minor: 4 }
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

@@ -6,6 +6,8 @@ pub mod builtins;
 pub mod check;
 pub mod collect;
 pub mod defs;
+pub mod effects;
+pub mod fieldwise;
 pub mod gpu;
 mod graph;
 pub mod mir;
@@ -28,10 +30,25 @@ pub use program::Program;
 /// The std library's sources, embedded in the compiler: (module path, text).
 pub const STD_SOURCES: &[(&str, &str)] = &[
     ("std::prelude", include_str!("../../std/prelude.wrela")),
+    ("std::mem", include_str!("../../std/mem.wrela")),
+    ("std::alloc", include_str!("../../std/alloc.wrela")),
+    ("std::collections", include_str!("../../std/collections.wrela")),
+    ("std::string", include_str!("../../std/string.wrela")),
+    ("std::cmp", include_str!("../../std/cmp.wrela")),
+    ("std::fmt", include_str!("../../std/fmt.wrela")),
+    ("std::arena", include_str!("../../std/arena.wrela")),
+    ("std::units", include_str!("../../std/units.wrela")),
+    ("std::hash", include_str!("../../std/hash.wrela")),
+    ("std::serialize", include_str!("../../std/serialize.wrela")),
+    ("std::par", include_str!("../../std/par.wrela")),
+    ("std::audio", include_str!("../../std/audio.wrela")),
+    ("std::io", include_str!("../../std/io.wrela")),
     ("std::gpu", include_str!("../../std/gpu.wrela")),
     ("std::derive", include_str!("../../std/derive.wrela")),
     ("std::field", include_str!("../../std/field.wrela")),
+    ("std::stage", include_str!("../../std/stage.wrela")),
     ("std::math", include_str!("../../std/math.wrela")),
+    ("std::quat", include_str!("../../std/quat.wrela")),
 ];
 
 /// A checked program: its definitions, every function body's MIR, and every constant.
@@ -43,15 +60,89 @@ pub struct Checked {
     pub consts: BTreeMap<ty::ConstId, (ty::TyId, thir::Expr)>,
 }
 
-/// Collects and type-checks a whole program.
+/// Every file `embed` reads, with where it's read: from the bodies' MIR and the constants'
+/// values (§10). A path may appear more than once.
+/// How an `embed` names its file: the package that embeds it (its index, std's 0 and the
+/// program's 1) and its path in that package, as `index:path`.
+pub fn embed_key(package: usize, path: &str) -> String {
+    format!("{package}:{path}")
+}
+
+/// An embed key's package index and path.
+pub fn split_embed_key(key: &str) -> Option<(usize, &str)> {
+    let (package, path) = key.split_once(':')?;
+    Some((package.parse().ok()?, path))
+}
+
+/// Every `embed` in the program: its key (`embed_key`), and where it's written.
+pub fn embeds(checked: &Checked) -> Vec<(std::sync::Arc<str>, wrela_diag::Span)> {
+    let mut out = Vec::new();
+    for body in checked.mir.values() {
+        for b in body.fns.iter().flat_map(|f| &f.blocks) {
+            for s in &b.stmts {
+                if let mir::StatementKind::Assign(_, mir::Rvalue::Embed(p))
+                | mir::StatementKind::Eval(mir::Rvalue::Embed(p)) = &s.kind
+                {
+                    out.push((p.clone(), s.span));
+                }
+            }
+        }
+    }
+    // A literal constant has no MIR, and no blocks.
+    fn walk(e: &thir::Expr, out: &mut Vec<(std::sync::Arc<str>, wrela_diag::Span)>) {
+        if let thir::ExprKind::Embed(p) = &e.kind {
+            out.push((p.clone(), e.span));
+        }
+        e.for_each_child(&mut |c| {
+            if let thir::Child::Expr(x) = c {
+                walk(x, out);
+            }
+        });
+    }
+    for (_, e) in checked.consts.values() {
+        walk(e, &mut out);
+    }
+    out
+}
+
+/// Collects and type-checks a whole program of one package and std (each unit's `package` is
+/// 0 for std, 1 for the program's).
 pub fn check_program(units: Vec<SourceUnit>, diags: &mut Vec<Diagnostic>) -> Checked {
-    let program = collect::collect(units, diags);
+    check_packages(units, &collect::PackageInfo::std_and_program(), diags)
+}
+
+/// Collects and type-checks a whole program, made of `packages` (language.md §3).
+pub fn check_packages(
+    units: Vec<SourceUnit>,
+    packages: &[collect::PackageInfo],
+    diags: &mut Vec<Diagnostic>,
+) -> Checked {
+    let mut program = collect::collect(units, packages, diags);
+    let consts = {
+        let p = &program;
+        diags.extend(gpu::check_entries(p));
+        for t in 0..p.traits.len() {
+            diags.extend(fieldwise::check_trait(p, ty::TraitId(t as u32)));
+        }
+        diags.extend(check::check_declared_types(p));
+        check::check_consts(p, diags)
+    };
+    // A constant's type is the result of the function the build runs to compute it.
+    for (&c, &t) in &consts.tys {
+        let f = program.const_(c).eval;
+        program.fns[f.index()].ret = t;
+    }
     // From here on the definitions are read-only.
     let p = &program;
-    diags.extend(gpu::check_entries(p));
-    diags.extend(check::check_declared_types(p));
-    let (const_tys, consts) = check::check_consts(p, diags);
+    let check::CheckedConsts { tys: const_tys, values: consts, bodies: const_bodies } = consts;
     let mut mir = BTreeMap::new();
+    for (c, body) in &const_bodies {
+        let f = p.const_(*c).eval;
+        let (m, d) = mir::build::build(p, &consts, f, body);
+        diags.extend(d);
+        diags.extend(borrowck::check(p, &m));
+        mir.insert(f, m);
+    }
     let mut hidden = Vec::new();
     for i in 0..p.fns.len() {
         let f = ty::FnId(i as u32);
@@ -73,6 +164,7 @@ pub fn check_program(units: Vec<SourceUnit>, diags: &mut Vec<Diagnostic>) -> Che
         }
     }
     diags.extend(check::opaque_cycles(p, &hidden));
+    diags.extend(effects::check(p, &mir));
     for i in 0..p.adts.len() {
         diags.extend(check::check_field_defaults(p, &const_tys, ty::AdtId(i as u32)));
     }

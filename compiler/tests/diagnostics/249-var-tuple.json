@@ -1,0 +1,40 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0100",
+      "file": "main.wrela",
+      "fixes": [
+        {
+          "edits": [
+            {
+              "end": 113,
+              "file": "main.wrela",
+              "replacement": "var a = 1.0\n    var b = 2.0",
+              "start": 90
+            }
+          ],
+          "message": "a `var` for each"
+        }
+      ],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "`var` binds one name, not a tuple's parts",
+      "notes": [
+        "`let (a, b) = t` binds each part to read; a variable is one name"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 9,
+        "end": 100,
+        "end_column": 15,
+        "end_line": 5,
+        "line": 5,
+        "start": 94
+      },
+      "title": "unexpected token"
+    }
+  ],
+  "version": 2
+}

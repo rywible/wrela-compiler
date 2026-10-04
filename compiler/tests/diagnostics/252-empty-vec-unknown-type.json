@@ -1,0 +1,28 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0306",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [
+        "annotate it, as in `let x: f32 = ...`"
+      ],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "the type of this can't be inferred",
+      "notes": [],
+      "severity": "error",
+      "span": {
+        "column": 19,
+        "end": 128,
+        "end_column": 22,
+        "end_line": 5,
+        "line": 5,
+        "start": 125
+      },
+      "title": "a type that can't be inferred"
+    }
+  ],
+  "version": 2
+}

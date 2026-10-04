@@ -1,0 +1,27 @@
+// accepts: gpu.buffer-modes
+// A buffer the GPU writes is passed `mut`, one it reads is borrowed, and a span binds part of
+// one. Buffers bound together are different buffers.
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, copy, dispatch, write}
+
+@compute(64)
+fn twice(input: [f32], out: mut Slots<f32>, id: GlobalId) {
+    out[id] = input[id.x] * 2.0
+}
+
+fn made() -> GpuBuffer<f32> {
+    buffer(64)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    var a: GpuBuffer<f32> = buffer(256)
+    var b: GpuBuffer<f32> = buffer(256)
+    write(mut a, 0, [1.0, 2.0])
+    dispatch(twice.bind(input: a, out: mut b), groups: 1)
+    dispatch(twice.bind(input: b, out: mut a), groups: 1)
+    dispatch(twice.bind(input: a.span(start: 64, count: 64), out: b.span_mut(start: 0, count: 64)), groups: 1)
+    let s = a.span(start: 0, count: 64)
+    dispatch(twice.bind(input: s, out: mut b), groups: 1)
+    // A new buffer nothing else can reach needs no `mut`.
+    dispatch(twice.bind(input: a, out: made()), groups: 1)
+    copy(from: a.span(start: 0, count: 64), to: b.span_mut(start: 64, count: 64))
+}

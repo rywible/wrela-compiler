@@ -1,0 +1,11 @@
+// mistake: sketch 03 §7: returning a borrow of a world made inside the function
+// expect: E0508
+// fix: no
+struct World {
+    seeds: Vec<u32>,
+}
+
+fn first_seed() -> borrow u32 {
+    let w = World { seeds: Vec::new() }
+    w.seeds[0]
+}

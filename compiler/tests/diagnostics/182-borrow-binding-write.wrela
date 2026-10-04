@@ -1,0 +1,12 @@
+// mistake: writing a place while a `borrow` binding reads it
+// expect: E0507
+// fix: no
+struct Stats {
+    best: Vec<u32>,
+}
+
+fn reset(s: mut Stats) -> u32 {
+    borrow top = s.best
+    s.best.clear()
+    top.len()
+}

@@ -14,10 +14,13 @@ doctest = false
 [dependencies]
 wrela-diag.workspace = true
 wrela-driver.workspace = true
+wrela-wasm.workspace = true
+wrela-sema.workspace = true
 wrela-syntax.workspace = true
 wrela-grammar.workspace = true
 wrela-host.workspace = true
 wrela-abi.workspace = true
+serde_json.workspace = true
 wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "metal", "vulkan", "dx12", "wgsl"] }
 pollster = "0.4"
 

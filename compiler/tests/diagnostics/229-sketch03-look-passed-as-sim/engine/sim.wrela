@@ -1,0 +1,20 @@
+// The sketches' engine, cut down: `SimState` is a declared trait with a structural check, and
+// the engine writes its message.
+
+/// Data the simulation rolls back and hashes: the same on every client.
+@diagnostic(
+    "`{Self}` isn't sim state: sim state is rolled back and hashed, so it must be the same on every client. Presentation data (poses for drawing, springs, sounds) lives outside it",
+)
+@fieldwise
+pub trait SimState {}
+
+impl SimState for f32 {}
+
+impl SimState for u32 {}
+
+impl SimState for vec3 {}
+
+impl<T: SimState> SimState for Vec<T> {}
+
+/// Runs a tick of `state`.
+pub fn simulate<S: SimState>(state: mut S) {}

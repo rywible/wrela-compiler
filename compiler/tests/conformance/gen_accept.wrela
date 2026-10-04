@@ -3,7 +3,7 @@ trait Shape {
     fn area(self) -> f32
 }
 
-struct Square: Copy + Clone {
+struct Square: Copy {
     side: f32,
 }
 
@@ -27,5 +27,5 @@ fn pick<T: Copy>(c: bool, a: T, b: T) -> T {
 
 fn f() -> f32 {
     let s = Square { side: 2.0 }
-    total(s, s) + one(s) + pick(true, 1.0, 2.0) + f32(pick(false, 1, 2))
+    total(s, s) + one(s) + pick(c: true, a: 1.0, b: 2.0) + f32(pick(c: false, a: 1, b: 2))
 }

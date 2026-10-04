@@ -1,0 +1,11 @@
+// mistake: a constant computed by code that records GPU work
+// expect: E0600
+// fix: no
+use std::gpu::{GpuBuffer, buffer}
+
+const SIZE: u32 = make()
+
+fn make() -> u32 {
+    let b: GpuBuffer<f32> = buffer(4)
+    4
+}

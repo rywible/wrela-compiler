@@ -1,0 +1,42 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0106",
+      "file": "main.wrela",
+      "fixes": [
+        {
+          "edits": [
+            {
+              "end": 165,
+              "file": "main.wrela",
+              "replacement": "",
+              "start": 164
+            }
+          ],
+          "message": "hold an owned value"
+        }
+      ],
+      "help": [
+        "hold an owned copy (the fix), a handle (`Handle<T>`) into an arena, or make the struct a `borrow struct`"
+      ],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "`&` isn't a type in wrela",
+      "notes": [
+        "a struct can't hold a reference: wrela has none, and a projection lives only as long as the call that made it (§6.6)"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 13,
+        "end": 165,
+        "end_column": 14,
+        "end_line": 9,
+        "line": 9,
+        "start": 164
+      },
+      "title": "`&` isn't a type or an operator on places"
+    }
+  ],
+  "version": 2
+}

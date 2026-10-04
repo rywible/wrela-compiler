@@ -1,0 +1,29 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0600",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "`limits` is non-deterministic, and `step` is `@deterministic`, which can't `nondet`",
+      "notes": [
+        "the call chain: step → limits",
+        "depending on something besides the inputs (the clock, randomness, readback) is the `nondet` effect; see language.md §8 for what each context forbids"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 16,
+        "end": 227,
+        "end_column": 24,
+        "end_line": 8,
+        "line": 8,
+        "start": 219
+      },
+      "title": "an effect a context forbids"
+    }
+  ],
+  "version": 2
+}

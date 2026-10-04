@@ -1,0 +1,20 @@
+// accepts: mod.packages
+// A package depends on another by path (its `wrela.toml`), and uses its `pub` items by the
+// dependency's name. `pub(package)` items stay inside their package.
+use geo::shapes::{Circle, area}
+
+trait Describe {
+    fn describe(self) -> u32
+}
+
+// The trait is this package's, so it can be implemented for a dependency's type.
+impl Describe for Circle {
+    fn describe(self) -> u32 {
+        u32(self.r)
+    }
+}
+
+fn f() -> f32 {
+    let c = Circle { r: 2.0 }
+    area(c) + f32(c.describe()) + geo::shapes::double(1.0)
+}

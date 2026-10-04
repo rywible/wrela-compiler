@@ -1,0 +1,23 @@
+// accepts: err.try
+enum Fail: Copy {
+    Empty,
+    Negative,
+}
+
+fn first(xs: [Option<f32>; 2]) -> Option<f32> {
+    let a = xs[0]?
+    let b = xs[1]?
+    Some(a + b)
+}
+
+fn checked(x: f32) -> Result<f32, Fail> {
+    if x < 0.0 {
+        return Err(Fail::Negative)
+    }
+    Ok(x)
+}
+
+fn both(a: f32, b: f32) -> Result<f32, Fail> {
+    let x = checked(a)?
+    Ok(x + checked(b)?)
+}

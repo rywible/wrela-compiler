@@ -1,0 +1,30 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0416",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [
+        "give it a default body, or change its signature"
+      ],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "`weight` can't be derived field by field: it returns `f32`; a derived method returns `()`, `bool`, `Ordering`, `Self`, `Result<Self, E>` or `Result<(), E>`",
+      "notes": [
+        "a `@fieldwise` trait's methods are derived for each type that declares it, unless they have a default (§3)"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 5,
+        "end": 136,
+        "end_column": 27,
+        "end_line": 6,
+        "line": 6,
+        "start": 114
+      },
+      "title": "a `@fieldwise` trait method that can't be derived"
+    }
+  ],
+  "version": 2
+}

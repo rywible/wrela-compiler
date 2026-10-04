@@ -1,0 +1,50 @@
+// rejects: eff.audio
+// `@audio` code runs on the audio thread: it doesn't allocate, do IO, recurse or record GPU
+// work, and what's passed as an `@audio fn` is checked the same way. A voice's closure
+// captures nothing: the audio thread keeps it after `play` returns.
+use std::audio::play
+use std::gpu::{GpuBuffer, buffer}
+use std::io::load
+
+struct Synth {
+    phase: f32,
+    names: Vec<f32>,
+}
+
+@audio
+fn allocates(s: mut Synth, out: mut [f32]) {
+    s.names.push(1.0) //~ E0600
+}
+
+@audio
+fn reads(s: mut Synth, out: mut [f32]) {
+    let _ = load("a.wav") //~ E0600
+}
+
+fn ring_down(n: u32) -> u32 {
+    if n == 0 { 0 } else { ring_down(n - 1) } //~ E0600
+}
+
+@audio
+fn recurses(s: mut Synth, out: mut [f32]) {
+    s.phase += f32(ring_down(3))
+}
+
+@audio
+fn records(s: mut Synth, out: mut [f32]) {
+    let b: GpuBuffer<f32> = buffer(4) //~ E0600
+}
+
+fn plain(s: mut Synth, out: mut [f32]) {
+    var label = f"phase {s.phase}" //~ E0600
+}
+
+pub fn init() -> u32 {
+    let gain = 0.5
+    play(Synth { phase: 0.0, names: Vec::new() }, plain)
+    play(Synth { phase: 0.0, names: Vec::new() }, |s, out| { out[0] = gain * s.phase }) //~ E0510
+    0
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+}

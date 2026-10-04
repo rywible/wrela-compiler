@@ -1,0 +1,29 @@
+// run: a `@deterministic` step over particles
+// expect: height_after(60) = 0.44962457
+
+struct Particle: Copy {
+    pos: vec3,
+    vel: vec3,
+}
+
+@deterministic
+fn step(ps: mut [Particle], dt: f32) {
+    for mut p in ps {
+        p.vel.y -= 9.81 * dt
+        p.pos += p.vel * dt
+        if p.pos.y < 0.0 {
+            p.pos.y = 0.0
+            p.vel.y = -p.vel.y * 0.5
+        }
+    }
+}
+
+pub fn height_after(steps: u32) -> f32 {
+    var ps = [Particle { pos: vec3(0.0, 2.0, 0.0), vel: vec3(1.0, 0.0, 0.0) }; 8]
+    for _ in 0..steps {
+        step(mut ps, 1.0 / 60.0)
+    }
+    ps[0].pos.y
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

@@ -1,0 +1,28 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0510",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [
+        "pass what the voice needs in its state, the argument after it, or pass a named function"
+      ],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "this closure captures `gain`, but `play` keeps it on the audio thread after this call returns",
+      "notes": [],
+      "severity": "error",
+      "span": {
+        "column": 32,
+        "end": 252,
+        "end_column": 68,
+        "end_line": 12,
+        "line": 12,
+        "start": 216
+      },
+      "title": "a closure that escapes"
+    }
+  ],
+  "version": 2
+}

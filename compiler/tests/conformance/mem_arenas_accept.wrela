@@ -1,0 +1,26 @@
+// accepts: mem.arenas
+struct Lever: Clone {
+    pulled: bool,
+}
+
+struct Gate: Clone {
+    open: bool,
+    lever: Handle<Lever>,
+}
+
+struct World {
+    levers: Arena<Lever>,
+    gates: Arena<Gate>,
+}
+
+fn pull(w: mut World, l: Handle<Lever>) {
+    if !w.levers.contains(l) {
+        return
+    }
+    w.levers[l].pulled = true
+    for mut g in w.gates {
+        if g.lever == l {
+            g.open = true
+        }
+    }
+}

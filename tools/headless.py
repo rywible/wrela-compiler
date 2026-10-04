@@ -201,6 +201,8 @@ def main(argv):
                     "--disable-extensions",
                     "--disable-background-timer-throttling",
                     "--disable-renderer-backgrounding",
+                    # Timestamp queries at full resolution, not quantized to 100 µs.
+                    "--enable-webgpu-developer-features",
                     "--enable-logging=stderr",
                     "--v=0",
                     "--window-size=1920,1080",

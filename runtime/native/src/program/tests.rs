@@ -3,7 +3,7 @@
 
 use super::*;
 use wrela_abi::check::CommandError;
-use wrela_abi::stream::{Encoder, Opcode, StreamError, VERSION};
+use wrela_abi::stream::{Binding, Encoder, Opcode, StreamError, VERSION};
 use wrela_abi::vectors::check_manifest as manifest;
 
 #[path = "../../tests/suite/common/wat.rs"]
@@ -25,11 +25,22 @@ impl Executor for Recorder {
         self.log.push("end");
         Ok(())
     }
+
+    fn read_back(&mut self, _handle: u32, _offset: u32, size: u32) -> Result<Vec<u8>> {
+        Ok(vec![7; size as usize])
+    }
 }
 
 fn load_wat(wat: &str) -> Result<Program<Recorder>> {
     let wasm = wat::parse_str(wat).expect("test WAT compiles");
-    Program::instantiate(&compile(&wasm)?, &manifest(), Recorder::default())
+    Program::instantiate(
+        &compile_with(&wasm, None)?,
+        &manifest(),
+        Recorder::default(),
+        Io::default(),
+        false,
+        1,
+    )
 }
 
 /// A program submitting `frames`; runs every frame and returns the first error.
@@ -50,6 +61,11 @@ fn command_err(batch: Vec<u8>) -> (Opcode, String) {
     }
 }
 
+/// All of buffer `h`, as the buffers [`with_buffers`] makes are: 64 bytes.
+fn b(h: u32) -> Binding {
+    Binding::range(h, 0, 64)
+}
+
 /// Buffers 1 and 2, 64 bytes each.
 fn with_buffers(f: impl FnOnce(&mut Encoder)) -> Vec<u8> {
     let mut e = Encoder::new();
@@ -61,20 +77,20 @@ fn with_buffers(f: impl FnOnce(&mut Encoder)) -> Vec<u8> {
 const U16: [u8; 16] = [0; 16];
 
 #[test]
-fn imports_only_wrela_submit() {
+fn imports_only_the_hosts_functions() {
     let err = load_wat(
-        r#"(module (import "env" "log" (func (param i32))) (memory (export "memory") 1)
+        r#"(module (import "env" "log" (func (param i32))) (import "wrela" "memory" (memory 1 16384 shared)) (export "memory" (memory 0))
              (func (export "frame") (param f32 i32 i32)))"#,
     )
     .err()
     .expect("rejected");
     assert!(
-        matches!(&err, Error::Program(m) if m.contains("`env.log`") && m.contains("only `wrela.submit`")),
+        matches!(&err, Error::Program(m) if m.contains("`env.log`") && m.contains("isn't one of the host's")),
         "{err}"
     );
 
     let err = load_wat(
-        r#"(module (import "wrela" "submit" (func (param i32))) (memory (export "memory") 1)
+        r#"(module (import "wrela" "submit" (func (param i32))) (import "wrela" "memory" (memory 1 16384 shared)) (export "memory" (memory 0))
              (func (export "frame") (param f32 i32 i32)))"#,
     )
     .err()
@@ -93,40 +109,44 @@ fn imports_only_wrela_submit() {
 
     // No imports at all is fine (if useless).
     load_wat(
-        r#"(module (memory (export "memory") 1) (func (export "frame") (param f32 i32 i32)))"#,
+        r#"(module (import "wrela" "memory" (memory 1 16384 shared)) (export "memory" (memory 0)) (func (export "frame") (param f32 i32 i32)))"#,
     )
     .expect("loads");
 }
 
 #[test]
 fn needs_memory_and_frame_exports() {
-    let no_memory = load_wat(r#"(module (memory 1) (func (export "frame") (param f32 i32 i32)))"#);
-    assert!(matches!(no_memory.err(), Some(Error::Program(m)) if m.contains("`memory`")));
-    let no_frame = load_wat(r#"(module (memory (export "memory") 1))"#);
-    assert!(matches!(no_frame.err(), Some(Error::Program(m)) if m.contains("`frame(")));
-    let wrong_frame =
-        load_wat(r#"(module (memory (export "memory") 1) (func (export "frame") (param f64)))"#);
-    assert!(matches!(wrong_frame.err(), Some(Error::Program(m)) if m.contains("`frame(")));
-    assert!(matches!(compile(b"not wasm").err(), Some(Error::Program(_))));
-}
-
-/// The checks' limits are the ones the GPU side requests (`wrela_abi::check` can't see wgpu).
-#[test]
-fn checks_use_webgpus_default_limits() {
-    let l = wgpu::Limits::default();
-    let max_buffer = l.max_buffer_size.min(l.max_storage_buffer_binding_size);
-    assert_eq!(u64::from(wrela_abi::check::MAX_BUFFER_SIZE), max_buffer);
-    assert_eq!(
-        wrela_abi::check::MAX_WORKGROUPS_PER_DIMENSION,
-        l.max_compute_workgroups_per_dimension
+    // Its own memory, rather than the shared one the host gives it.
+    let own = load_wat(
+        r#"(module (memory (export "memory") 1) (func (export "frame") (param f32 i32 i32)))"#,
     );
+    assert!(matches!(own.err(), Some(Error::Program(m)) if m.contains("`wrela.memory`")));
+    let unexported = load_wat(
+        r#"(module (import "wrela" "memory" (memory 1 16384 shared)) (func (export "frame") (param f32 i32 i32)))"#,
+    );
+    assert!(matches!(unexported.err(), Some(Error::Program(m)) if m.contains("as `memory`")));
+    let no_frame = load_wat(
+        r#"(module (import "wrela" "memory" (memory 1 16384 shared)) (export "memory" (memory 0)))"#,
+    );
+    assert!(matches!(no_frame.err(), Some(Error::Program(m)) if m.contains("`frame(")));
+    let wrong_frame = load_wat(
+        r#"(module (import "wrela" "memory" (memory 1 16384 shared)) (export "memory" (memory 0)) (func (export "frame") (param f64)))"#,
+    );
+    assert!(matches!(wrong_frame.err(), Some(Error::Program(m)) if m.contains("`frame(")));
+    assert!(matches!(compile_with(b"not wasm", None).err(), Some(Error::Program(_))));
+}
+
+/// The ABI's default limits are WebGPU's, as wgpu has them (`wrela_abi` can't see wgpu).
+#[test]
+fn the_default_limits_are_webgpus() {
+    assert_eq!(crate::gpu::limits_of(&wgpu::Limits::default()), wrela_abi::Limits::DEFAULT);
 }
 
 #[test]
-fn has_no_start_function() {
+fn a_start_function_cant_call_the_host() {
     let err = load_wat(
         r#"(module (import "wrela" "submit" (func $submit (param i32 i32)))
-             (memory (export "memory") 1)
+             (import "wrela" "memory" (memory 1 16384 shared)) (export "memory" (memory 0))
              (func (export "frame") (param f32 i32 i32))
              (func $start (call $submit (i32.const 0) (i32.const 0)))
              (start $start))"#,
@@ -135,7 +155,7 @@ fn has_no_start_function() {
     .expect("rejected");
     assert_eq!(
         err.to_string(),
-        "invalid program: it has a start function; a wrela program may run only when the host calls it"
+        "invalid program: its start function called the host; a wrela program calls the host only from an export"
     );
 }
 
@@ -187,7 +207,7 @@ fn rejects_malformed_batches_before_running_any_command() {
 
 #[test]
 fn rejects_out_of_order_commands() {
-    let draw = Encoder::new().draw(0, 3, 1, &[1, 2], &U16).finish();
+    let draw = Encoder::new().draw(0, 3, 1, &[b(1), b(2)], &U16).finish();
     assert!(matches!(
         run_err(&[vec![draw]]),
         Error::Stream(StreamError::Sequence { opcode: Opcode::Draw, .. })
@@ -203,7 +223,7 @@ fn rejects_out_of_order_commands() {
 #[test]
 fn rejects_submits_outside_memory() {
     let wat = r#"(module (import "wrela" "submit" (func $submit (param i32 i32)))
-        (memory (export "memory") 1)
+        (import "wrela" "memory" (memory 1 16384 shared)) (export "memory" (memory 0))
         (func (export "frame") (param f32 i32 i32) (call $submit (i32.const 65530) (i32.const 100))))"#;
     let err = load_wat(wat).expect("loads").frame(0.0, 1, 1).expect_err("fails");
     assert!(matches!(&err, Error::Trap(m) if m.contains("submit(65530, 100)")), "{err}");
@@ -211,7 +231,7 @@ fn rejects_submits_outside_memory() {
 
 #[test]
 fn reports_program_traps() {
-    let wat = r#"(module (memory (export "memory") 1) (func (export "frame") (param f32 i32 i32) unreachable))"#;
+    let wat = r#"(module (import "wrela" "memory" (memory 1 16384 shared)) (export "memory" (memory 0)) (func (export "frame") (param f32 i32 i32) unreachable))"#;
     let err = load_wat(wat).expect("loads").frame(0.0, 1, 1).expect_err("traps");
     assert!(matches!(&err, Error::Trap(m) if m.contains("unreachable")), "{err}");
 }
@@ -219,7 +239,7 @@ fn reports_program_traps() {
 #[test]
 fn checks_buffers() {
     let (op, why) = command_err(Encoder::new().create_buffer(1, 16).create_buffer(1, 16).finish());
-    assert_eq!((op, why.as_str()), (Opcode::CreateBuffer, "buffer 1 already exists"));
+    assert_eq!((op, why.as_str()), (Opcode::CreateBuffer, "handle 1 already names a buffer"));
     let (op, why) = command_err(Encoder::new().create_buffer(1, 1 << 30).finish());
     assert_eq!(
         (op, why.as_str()),
@@ -242,39 +262,39 @@ fn checks_buffers() {
 #[test]
 fn checks_dispatches() {
     let (op, why) = command_err(with_buffers(|e| {
-        e.dispatch(7, [1; 3], &[1, 2], &U16);
+        e.dispatch(7, [1; 3], &[b(1), b(2)], &U16);
     }));
     assert_eq!(
         (op, why.as_str()),
-        (Opcode::Dispatch, "there's no pipeline 7 (the manifest has 5)")
+        (Opcode::Dispatch, "there's no pipeline 7 (the manifest has 6)")
     );
     let (_, why) = command_err(with_buffers(|e| {
-        e.dispatch(0, [1; 3], &[1, 2], &U16);
+        e.dispatch(0, [1; 3], &[b(1), b(2)], &U16);
     }));
     assert_eq!(why, "pipeline 0 (draw) is a render pipeline; Dispatch needs a compute pipeline");
     let (_, why) = command_err(with_buffers(|e| {
-        e.dispatch(1, [1; 3], &[1], &U16);
+        e.dispatch(1, [1; 3], &[b(1)], &U16);
     }));
-    assert_eq!(why, "pipeline 1 (compute) binds 2 buffers, but the command lists 1");
+    assert_eq!(why, "pipeline 1 (compute) binds 2 resources, but the command lists 1");
     let (_, why) = command_err(with_buffers(|e| {
-        e.dispatch(1, [1; 3], &[1, 2], &[0; 8]);
+        e.dispatch(1, [1; 3], &[b(1), b(2)], &[0; 8]);
     }));
     assert_eq!(why, "pipeline 1 (compute) takes 16 uniform bytes, but the command has 8");
     let (_, why) = command_err(with_buffers(|e| {
-        e.dispatch(1, [1; 3], &[1, 9], &U16);
+        e.dispatch(1, [1; 3], &[b(1), b(9)], &U16);
     }));
     assert_eq!(why, "there's no buffer 9");
     let (_, why) = command_err(with_buffers(|e| {
-        e.dispatch(1, [1; 3], &[1, 1], &U16);
+        e.dispatch(1, [1; 3], &[b(1), b(1)], &U16);
     }));
-    assert_eq!(why, "buffer 1 is bound both read-only and read-write in one dispatch");
+    assert_eq!(why, "buffer 1 is used both read-only and read-write in one dispatch");
     let (_, why) = command_err(with_buffers(|e| {
-        e.dispatch(1, [65536, 1, 1], &[1, 2], &U16);
+        e.dispatch(1, [65536, 1, 1], &[b(1), b(2)], &U16);
     }));
     assert_eq!(why, "65536x1x1 workgroups is over the limit of 65535 per dimension");
     // Usage scopes are per dispatch: reading then writing a buffer in two dispatches is fine.
     run(&[vec![with_buffers(|e| {
-        e.dispatch(1, [1; 3], &[1, 2], &U16).dispatch(1, [1; 3], &[2, 1], &U16);
+        e.dispatch(1, [1; 3], &[b(1), b(2)], &U16).dispatch(1, [1; 3], &[b(2), b(1)], &U16);
     })]])
     .1
     .expect("separate scopes");
@@ -283,7 +303,7 @@ fn checks_dispatches() {
 #[test]
 fn checks_draws_across_the_pass() {
     let (op, why) = command_err(with_buffers(|e| {
-        e.begin_screen_pass([0.0; 4]).draw(1, 3, 1, &[1, 2], &U16).present();
+        e.begin_screen_pass([0.0; 4]).draw(1, 3, 1, &[b(1), b(2)], &U16).present();
     }));
     assert_eq!(
         (op, why.as_str()),
@@ -292,15 +312,15 @@ fn checks_draws_across_the_pass() {
     // Buffer 1 read by one draw and written by another in the same pass.
     let (_, why) = command_err(with_buffers(|e| {
         e.begin_screen_pass([0.0; 4])
-            .draw(0, 3, 1, &[1, 2], &U16)
-            .draw(0, 3, 1, &[2, 1], &U16)
+            .draw(0, 3, 1, &[b(1), b(2)], &U16)
+            .draw(0, 3, 1, &[b(2), b(1)], &U16)
             .present();
     }));
-    assert_eq!(why, "buffer 2 is bound both read-only and read-write in one screen pass");
+    assert_eq!(why, "buffer 2 is used both read-only and read-write in one pass");
     // The same in two passes is fine.
     run(&[vec![with_buffers(|e| {
-        e.begin_screen_pass([0.0; 4]).draw(0, 3, 1, &[1, 2], &U16).present();
-        e.begin_screen_pass([0.0; 4]).draw(0, 3, 1, &[2, 1], &U16).present();
+        e.begin_screen_pass([0.0; 4]).draw(0, 3, 1, &[b(1), b(2)], &U16).present();
+        e.begin_screen_pass([0.0; 4]).draw(0, 3, 1, &[b(2), b(1)], &U16).present();
     })]])
     .1
     .expect("separate passes");
@@ -310,16 +330,22 @@ fn checks_draws_across_the_pass() {
 fn checks_writable_aliases_and_clear_colours() {
     // One buffer bound read-write twice by one dispatch or draw: WebGPU rejects it.
     let (_, why) = command_err(with_buffers(|e| {
-        e.dispatch(3, [1; 3], &[1, 1], &U16);
+        e.dispatch(3, [1; 3], &[b(1), b(1)], &U16);
     }));
     assert_eq!(why, "buffer 1 is bound read-write twice in one dispatch");
     let (_, why) = command_err(with_buffers(|e| {
-        e.begin_screen_pass([0.0; 4]).draw(2, 3, 1, &[2, 2], &U16).present();
+        e.begin_screen_pass([0.0; 4]).draw(2, 3, 1, &[b(2), b(2)], &U16).present();
     }));
     assert_eq!(why, "buffer 2 is bound read-write twice in one draw");
     // Written by two draws of one pass is fine: both are writes.
     run(&[vec![with_buffers(|e| {
-        e.begin_screen_pass([0.0; 4]).draw(2, 3, 1, &[1, 2], &U16).draw(2, 3, 1, &[2, 1], &U16);
+        e.begin_screen_pass([0.0; 4]).draw(2, 3, 1, &[b(1), b(2)], &U16).draw(
+            2,
+            3,
+            1,
+            &[b(2), b(1)],
+            &U16,
+        );
         e.present();
     })]])
     .1
@@ -365,6 +391,10 @@ impl Executor for FailsOnce {
     fn end_frame(&mut self) -> Result<()> {
         Ok(())
     }
+
+    fn read_back(&mut self, _handle: u32, _offset: u32, size: u32) -> Result<Vec<u8>> {
+        Ok(vec![0; size as usize])
+    }
 }
 
 #[test]
@@ -372,9 +402,15 @@ fn nothing_runs_after_the_host_fails_a_command() {
     // What the executor holds after it fails isn't known: every later command fails.
     let pass = Encoder::new().begin_screen_pass([0.0; 4]).present().finish();
     let wasm = wat::parse_str(wat_gen::program(&[vec![pass.clone()], vec![pass]])).expect("WAT");
-    let mut program =
-        Program::instantiate(&compile(&wasm).expect("compiles"), &manifest(), FailsOnce::default())
-            .expect("instantiates");
+    let mut program = Program::instantiate(
+        &compile_with(&wasm, None).expect("compiles"),
+        &manifest(),
+        FailsOnce::default(),
+        Io::default(),
+        false,
+        1,
+    )
+    .expect("instantiates");
     let first = program.frame(0.0, 64, 64).expect_err("the host fails");
     assert!(matches!(first, Error::Gpu(_)), "{first}");
     let next = program.frame(1.0 / 60.0, 64, 64).expect_err("the host failed before");
@@ -388,9 +424,10 @@ fn nothing_runs_after_the_host_fails_a_command() {
 #[test]
 fn calls_other_exports() {
     let wasm = include_bytes!("../../../fixtures/first-light/game.wasm");
-    let compiled = compile(wasm).expect("the fixture is a valid program");
+    let compiled = compile_with(wasm, None).expect("the fixture is a valid program");
     let mut program =
-        Program::instantiate(&compiled, &manifest(), Recorder::default()).expect("instantiates");
+        Program::instantiate(&compiled, &manifest(), Recorder::default(), Io::default(), false, 1)
+            .expect("instantiates");
     for (x, expected) in [(0.0, -1.0), (0.25, 0.0), (0.5, 1.0), (0.75, 0.0), (1.125, -0.5)] {
         assert_eq!(
             program.call("tri", &[Value::F32(x)]).expect("calls"),
@@ -401,4 +438,114 @@ fn calls_other_exports() {
     let err = program.call("tri", &[Value::I32(1)]).expect_err("wrong type");
     assert!(matches!(&err, Error::Program(m) if m.contains("can't take (i32)")), "{err}");
     assert!(program.call("nope", &[]).is_err());
+}
+
+/// A program whose `ask` submits `batch`, `status` is request 4's status, and `take` takes its
+/// answer into memory and returns the answer's first word.
+fn requester(batch: &[u8], io: Io) -> Program<Recorder> {
+    let wat = format!(
+        r#"(module
+  (import "wrela" "submit" (func $submit (param i32 i32)))
+  (import "wrela" "request_status" (func $status (param i32) (result i32)))
+  (import "wrela" "request_take" (func $take (param i32 i32)))
+  (import "wrela" "memory" (memory 1 16384 shared)) (export "memory" (memory 0))
+  (data (i32.const 16) "{}")
+  (func (export "frame") (param f32 i32 i32))
+  (func (export "ask") (call $submit (i32.const 16) (i32.const {})))
+  (func (export "status") (result i32) (call $status (i32.const 4)))
+  (func (export "take") (result i32)
+    (call $take (i32.const 4) (i32.const 1024))
+    (i32.load (i32.const 1024))))"#,
+        wat_gen::escape(batch),
+        batch.len()
+    );
+    let wasm = wat::parse_str(&wat).expect("test WAT compiles");
+    Program::instantiate(
+        &compile_with(&wasm, None).expect("compiles"),
+        &manifest(),
+        Recorder::default(),
+        io,
+        false,
+        1,
+    )
+    .expect("instantiates")
+}
+
+fn call_i32(p: &mut Program<Recorder>, name: &str) -> i32 {
+    match p.call(name, &[]).expect(name).as_slice() {
+        [Value::I32(v)] => *v,
+        other => panic!("{name} returned {other:?}"),
+    }
+}
+
+/// A new, empty directory for a test's files.
+fn scratch_dir(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("wrela-requests-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    dir
+}
+
+#[test]
+fn requests_are_answered_from_the_next_call_then_taken_once() {
+    let build = scratch_dir("fetch");
+    std::fs::create_dir_all(build.join("data")).expect("dir");
+    std::fs::write(build.join("data/level.bin"), [1, 2, 3, 4, 5]).expect("write");
+    let batch = Encoder::new().fetch(4, "data/level.bin").finish();
+    let mut p = requester(&batch, Io { build: Some(build), storage: None });
+    p.call("ask", &[]).expect("ask");
+    assert_eq!(call_i32(&mut p, "status"), 5);
+    assert_eq!(call_i32(&mut p, "take"), 0x0403_0201);
+    assert_eq!(call_i32(&mut p, "status"), REQUEST_PENDING);
+}
+
+#[test]
+fn storage_keeps_bytes_at_paths() {
+    let storage = scratch_dir("storage");
+    let io = Io { build: None, storage: Some(storage.clone()) };
+    let write = Encoder::new().storage_write(4, "saves/a", &[9, 8, 7, 6]).finish();
+    let mut p = requester(&write, io.clone());
+    p.call("ask", &[]).expect("ask");
+    assert_eq!(call_i32(&mut p, "status"), 0);
+    let read = Encoder::new().storage_read(4, "saves/a").finish();
+    let mut p = requester(&read, io);
+    p.call("ask", &[]).expect("ask");
+    assert_eq!(call_i32(&mut p, "status"), 4);
+    assert_eq!(call_i32(&mut p, "take"), 0x0607_0809);
+    assert_eq!(std::fs::read(storage.join("saves/a")).expect("stored"), [9, 8, 7, 6]);
+}
+
+#[test]
+fn requests_fail_without_a_place_to_go_and_each_number_is_used_once_at_a_time() {
+    let batch = Encoder::new().storage_read(4, "saves/slot1").finish();
+    let mut p = requester(&batch, Io::default());
+    p.call("ask", &[]).expect("ask");
+    let err = p.call("ask", &[]).expect_err("in use");
+    assert_eq!(err.to_string(), "StorageRead failed: request 4 is already in use");
+    assert_eq!(call_i32(&mut p, "status"), REQUEST_FAILED);
+    assert_eq!(call_i32(&mut p, "take"), 0);
+    assert!(
+        p.call("take", &[]).expect_err("taken").to_string().contains("the request isn't answered")
+    );
+}
+
+#[test]
+fn a_readback_is_the_executors() {
+    let batch =
+        Encoder::new().create_buffer(1, 16).read_buffer(4, 1, 0, 8).destroy_buffer(1).finish();
+    let mut p = requester(&batch, Io::default());
+    p.call("ask", &[]).expect("ask");
+    assert_eq!(call_i32(&mut p, "status"), 8);
+    assert_eq!(call_i32(&mut p, "take"), 0x0707_0707);
+}
+
+#[test]
+fn storage_paths_stay_inside_the_programs_storage() {
+    let batch = Encoder::new().storage_write(4, "../escape", &[1]).finish();
+    let mut p = requester(&batch, Io::default());
+    let err = p.call("ask", &[]).expect_err("rejected");
+    assert_eq!(
+        err.to_string(),
+        "StorageWrite failed: the storage path `../escape` has an empty, `.` or `..` part"
+    );
 }

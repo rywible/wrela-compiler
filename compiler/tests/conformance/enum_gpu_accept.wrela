@@ -2,7 +2,7 @@
 use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch}
 
 // An enum in GPU code: WGSL has no unions, so each payload is its own member there.
-enum Hit: Copy + Clone {
+enum Hit: Copy {
     Miss,
     Near { d: f32 },
     Far { d: f32, at: vec3, n: vec4 },
@@ -30,6 +30,6 @@ fn shade(out: mut Slots<f32>, id: GlobalId) {
 }
 
 pub fn frame(time: f32, width: u32, height: u32) {
-    let out: GpuBuffer<f32> = buffer(64)
-    dispatch(shade, groups: 1, out: out)
+    var out: GpuBuffer<f32> = buffer(64)
+    dispatch(shade.bind(out: mut out), groups: 1)
 }

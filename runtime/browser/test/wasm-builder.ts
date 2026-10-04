@@ -23,8 +23,10 @@ export interface Func {
 export interface ModuleSpec {
   imports?: Import[];
   funcs?: Func[];
-  /** Pages of memory, exported as `memory` unless `exportMemory` is false. */
+    /** Pages of memory, imported shared as `wrela.memory` (or, with `ownMemory`, defined
+   * unshared), and exported as `memory` unless `exportMemory` is false. */
   memory?: number;
+  ownMemory?: boolean;
   exportMemory?: boolean;
   data?: { offset: number; bytes: Uint8Array }[];
   /** The start function's index (imports first). */
@@ -78,11 +80,14 @@ export function buildModule(spec: ModuleSpec): Uint8Array<ArrayBuffer> {
     if (!types.includes(key)) types.push(key);
     return types.indexOf(key);
   };
-  const importEntries = imports.map((i) =>
+    const importEntries = imports.map((i) =>
     i.kind === "func"
       ? [...name(i.module), ...name(i.name), 0x00, ...uleb(typeIndex(i.type))]
       : [...name(i.module), ...name(i.name), 0x02, 0x00, 0x01],
   );
+  // The program ABI's memory: shared, its maximum 1 GiB.
+  const shared = spec.memory !== undefined && !spec.ownMemory;
+  if (shared) importEntries.push([...name("wrela"), ...name("memory"), 0x02, 0x03, ...uleb(spec.memory!), ...uleb(16384)]);
   const funcEntries = funcs.map((f) => uleb(typeIndex(f.type)));
   const importedFuncs = imports.filter((i) => i.kind === "func").length;
   const exports: number[][] = [];
@@ -104,7 +109,7 @@ export function buildModule(spec: ModuleSpec): Uint8Array<ArrayBuffer> {
     ...section(1, typeEntries.length ? vec(typeEntries) : []),
     ...section(2, importEntries.length ? vec(importEntries) : []),
     ...section(3, funcEntries.length ? vec(funcEntries) : []),
-    ...section(5, spec.memory !== undefined ? vec([[0x00, ...uleb(spec.memory)]]) : []),
+        ...section(5, spec.memory !== undefined && spec.ownMemory ? vec([[0x00, ...uleb(spec.memory)]]) : []),
     ...section(7, exports.length ? vec(exports) : []),
     ...section(8, spec.start !== undefined ? uleb(spec.start) : []),
     ...section(10, code.length ? vec(code) : []),

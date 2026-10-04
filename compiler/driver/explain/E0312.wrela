@@ -1,0 +1,14 @@
+// An index into a value that can't be indexed by it: a number, an index past a vector's or a
+// matrix's end, or an arena indexed by another arena's handle.
+// ---- wrong
+fn third(v: vec2) -> f32 {
+    v[2]
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+fn third(v: vec3) -> f32 {
+    v[2]
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

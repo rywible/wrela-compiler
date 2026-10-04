@@ -85,6 +85,10 @@ fn walk(
                 continue;
             }
         } else if meta.is_dir() {
+            // A directory with a manifest is another package, not part of this one's tree.
+            if path.join("wrela.toml").is_file() {
+                continue;
+            }
             if !is_name(&name) {
                 if has_wrela_files(&path) {
                     errors.push(LayoutError {

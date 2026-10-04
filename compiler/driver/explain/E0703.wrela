@@ -1,0 +1,13 @@
+// An exported function whose signature the host can't call: the host passes and receives
+// numbers and vectors (and the program's state, first). And every program exports
+// `frame(time: f32, width: u32, height: u32)`.
+// ---- wrong
+fn step(dt: f32) -> f32 {
+    dt * 2.0
+}
+// ---- fixed
+fn step(dt: f32) -> f32 {
+    dt * 2.0
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

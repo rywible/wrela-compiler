@@ -1,0 +1,12 @@
+// wrela has only `//` line comments. `/* ... */` isn't a comment: write each line with
+// `//`.
+// ---- wrong
+/* The player's speed, in m/s. */
+const SPEED: f32 = 4.0
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+// The player's speed, in m/s.
+const SPEED: f32 = 4.0
+
+pub fn frame(time: f32, width: u32, height: u32) {}

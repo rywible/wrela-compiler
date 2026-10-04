@@ -28,11 +28,23 @@ use crate::ty::ClosureId;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use wrela_diag::{Diagnostic, Span, codes};
 
+/// Whether a borrow struct has a `mut` field, in it or in a borrow struct inside it.
+fn has_mut_field(p: &Program, t: crate::ty::TyId) -> bool {
+    let crate::ty::TyKind::Adt(a, args) = p.types.kind(t) else { return false };
+    p.adt_fields(*a, None)
+        .iter()
+        .zip(p.fields_of(*a, args, None))
+        .any(|(f, ft)| f.mode == RetMode::Mut || (p.is_borrow_struct(ft) && has_mut_field(p, ft)))
+}
+
 /// Checks every function and closure body of `body`. A body is checked before the closures it
 /// makes, so a closure's body knows what the projections it captures alias.
 pub fn check(p: &Program, body: &Body) -> Vec<Diagnostic> {
-    let holders: Vec<bool> =
-        body.locals.iter().map(|d| d.kind.is_projection() || is_callable(&p.types, d.ty)).collect();
+    let holders: Vec<bool> = body
+        .locals
+        .iter()
+        .map(|d| d.kind.is_projection() || is_callable(&p.types, d.ty) || p.is_borrow_struct(d.ty))
+        .collect();
     let mut out = Vec::new();
     let mut captured = Captured::new();
     for (i, f) in body.fns.iter().enumerate() {
@@ -143,15 +155,29 @@ fn rvalue_uses(body: &Body, r: &Rvalue, out: &mut Vec<Local>) {
         Rvalue::Closure(id) => {
             out.extend(body.closures[id.0 as usize].captures.iter().map(|c| c.0))
         }
-        Rvalue::FnRef(..) | Rvalue::Const(_) => {}
+        Rvalue::FnRef(..)
+        | Rvalue::Const(_)
+        | Rvalue::Text(_)
+        | Rvalue::Embed(_)
+        | Rvalue::ConstParam(_) => {}
+        Rvalue::BorrowStruct { fields, .. } => {
+            for a in fields {
+                match a {
+                    Arg::Borrow(p, _) | Arg::Mut(p, _) => place_uses(p, out),
+                    Arg::Take(o) => operand_uses(o, out),
+                }
+            }
+        }
         Rvalue::Dispatch(d) => {
             d.groups.iter().for_each(|g| operand_uses(g, out));
             d.args.iter().for_each(|(_, p, _)| place_uses(p, out));
+            d.indirect.iter().for_each(|(p, _)| place_uses(p, out));
         }
         Rvalue::Draw(d) => {
             operand_uses(&d.vertices, out);
             operand_uses(&d.instances, out);
-            d.args.iter().for_each(|(_, p, _)| place_uses(p, out));
+            d.args.iter().for_each(|(_, _, p, _)| place_uses(p, out));
+            d.indirect.iter().for_each(|(p, _)| place_uses(p, out));
         }
     }
 }
@@ -184,6 +210,8 @@ fn stmt_uses_defs(p: &Program, body: &Body, s: &Statement, uses: &mut Vec<Local>
             None
         }
         StatementKind::Live(l) | StatementKind::Dead(l) => Some(*l),
+        // A drop at the end of a scope: not a use, as the local's own end isn't.
+        StatementKind::Drop(_) => None,
     }
 }
 
@@ -212,6 +240,9 @@ fn term_uses(t: &Terminator, out: &mut Vec<Local>) {
 struct Loan {
     place: Place,
     mutable: bool,
+    /// A call's `mut` argument before the call: shared until the call begins its `mut`
+    /// access, so the arguments after it may read the place (§6.5).
+    reserved: bool,
     holder: Local,
     /// The projections the loan was reached through, `holder` first: accesses through any of
     /// them are the loan's own.
@@ -219,6 +250,9 @@ struct Loan {
     /// Whether `place` is exactly what the holder aliases (so a path through the holder
     /// extends it), or only somewhere it points into (a call's result).
     exact: bool,
+    /// For a borrow struct holder: the fields (a path, for a borrow struct inside one) whose
+    /// projection this loan is. Empty otherwise.
+    field: Vec<u32>,
     span: Span,
 }
 
@@ -376,6 +410,9 @@ struct FnCheck<'a> {
     /// Loans already reported in a conflict: one error per loan, at its first conflict (later
     /// ones are usually its consequences).
     reported: Vec<usize>,
+    /// Where conflicts were reported: an argument already reported doesn't get a second error
+    /// for overlapping another argument of its call.
+    reported_at: Vec<Span>,
     /// What the projections this closure captures alias (see [`Captured`]).
     captured: &'a Captured,
     /// What the projections captured by the closures this body makes alias.
@@ -404,6 +441,7 @@ impl<'a> FnCheck<'a> {
             diags: Vec::new(),
             emit: false,
             reported: Vec::new(),
+            reported_at: Vec::new(),
             captured,
             made: Vec::new(),
         }
@@ -593,6 +631,31 @@ impl<'a> FnCheck<'a> {
         self.local(l).kind.is_projection()
     }
 
+    /// For a place through a borrow struct's projection field: that field's mode, from the
+    /// last such field it crosses (a run field is `borrow`). `None` for a place that crosses
+    /// none.
+    fn borrow_field_mode(&self, place: &Place) -> Option<RetMode> {
+        let mut t = self.local(place.local).ty;
+        let mut variant = None;
+        let mut out = None;
+        for proj in &place.proj {
+            if let (Proj::Field(i), crate::ty::TyKind::Adt(a, _)) = (proj, self.p.types.kind(t))
+                && self.p.adt(*a).borrow
+                && let Some(f) = self.p.adt_fields(*a, None).get(*i as usize)
+            {
+                let run = matches!(
+                    self.p.types.kind(f.ty),
+                    crate::ty::TyKind::Slice(_) | crate::ty::TyKind::Str
+                );
+                if f.mode != RetMode::Owned || run {
+                    out = Some(if run { RetMode::Borrow } else { f.mode });
+                }
+            }
+            t = crate::mir::proj_ty_pub(self.p, t, &mut variant, proj);
+        }
+        out
+    }
+
     /// Whether `l` is outside the closure being checked (a capture).
     fn is_capture(&self, l: Local) -> bool {
         is_capture(&self.body.locals, self.closure, l)
@@ -619,7 +682,10 @@ impl<'a> FnCheck<'a> {
         let at = (b, block.stmts.len());
         match &block.term.kind {
             TerminatorKind::If { cond, .. } => self.operand(&mut st, at, cond),
-            TerminatorKind::Return(Some(o)) => self.operand(&mut st, at, o),
+            TerminatorKind::Return(Some(o)) => {
+                self.operand(&mut st, at, o);
+                self.returned_borrow_struct(&st, o);
+            }
             TerminatorKind::ReturnPlace(place) => self.return_place(&mut st, at, place),
             _ => {}
         }
@@ -653,12 +719,21 @@ impl<'a> FnCheck<'a> {
                         Rvalue::Call(c) if c.ret_mode != RetMode::Owned => {
                             self.call_result_loans(st, at, place.local, c, s.span)
                         }
+                        Rvalue::Call(c) if self.p.is_borrow_struct(self.local(place.local).ty) => {
+                            self.borrow_struct_result_loans(st, at, place.local, c, s.span)
+                        }
                         Rvalue::Closure(id) => self.closure_loans(st, at, place.local, *id, s.span),
+                        Rvalue::BorrowStruct { fields, .. } => {
+                            self.borrow_struct_loans(st, at, place.local, fields, s.span)
+                        }
                         Rvalue::Use(Operand {
                             kind: OperandKind::Copy(src) | OperandKind::Move(src, _),
                             ty,
                             ..
-                        }) if src.proj.is_empty() && is_callable(&self.p.types, *ty) => {
+                        }) if src.proj.is_empty()
+                            && (is_callable(&self.p.types, *ty)
+                                || self.p.is_borrow_struct(*ty)) =>
+                        {
                             // A closure held by another local, copied or moved (`take f`): its
                             // loans travel with it.
                             self.inherit(st, at, place.local, src.local, s.span)
@@ -683,6 +758,9 @@ impl<'a> FnCheck<'a> {
                 self.redefine(st, *l);
                 st.uninit.remove(l.index());
             }
+            // The owner is done with the value (its scope ends, or it's overwritten next): what
+            // still borrows it is caught where the scope ends (`Dead`) or by the write.
+            StatementKind::Drop(_) => {}
         }
     }
 
@@ -694,12 +772,21 @@ impl<'a> FnCheck<'a> {
         }
         let kept = st.loans.iter().find(|&i| {
             let loan = &self.loans[i];
-            loan.place.local == l && loan.holder != l && self.live_after(at, loan.holder)
+            loan.place.local == l
+                && loan.holder != l
+                && self.live_after(at, loan.holder)
+                && !self.returned(loan.holder)
         });
         if let Some(i) = kept {
             let borrowed = self.loans[i].span;
+            let holder_ty = self.local(self.loans[i].holder).ty;
             let what = self.describe(&Place::local(l));
             let end = Span::new(span.file, span.end.saturating_sub(1), span.end);
+            let note = if self.p.is_borrow_struct(holder_ty) {
+                "a borrow struct borrows its fields' places for as long as it's kept (§6.6)"
+            } else {
+                "a closure borrows what it uses for as long as it's kept (§6.7)"
+            };
             self.err(
                 Diagnostic::new(
                     codes::E0510,
@@ -707,10 +794,22 @@ impl<'a> FnCheck<'a> {
                     format!("`{what}` goes out of scope while this still borrows it"),
                 )
                 .with_secondary(end, format!("`{what}`'s scope ends here"))
-                .with_note("a closure borrows what it uses for as long as it's kept (§6.7)")
+                .with_note(note)
                 .with_help(format!("declare `{what}` outside the block, so it lives as long")),
             );
         }
+    }
+
+    /// Whether the code returns local `l`'s value (a borrow struct it returns is checked at the
+    /// return instead, E0508).
+    fn returned(&self, l: Local) -> bool {
+        self.f.blocks.iter().any(|b| match &b.term.kind {
+            TerminatorKind::Return(Some(Operand {
+                kind: OperandKind::Copy(p) | OperandKind::Move(p, _),
+                ..
+            })) => p.local == l && self.p.is_borrow_struct(self.local(l).ty),
+            _ => false,
+        })
     }
 
     /// `l` gets a new value (or goes out of scope): its loans end, and what was moved out of
@@ -771,13 +870,35 @@ impl<'a> FnCheck<'a> {
                         Arg::Mut(p, span) => {
                             if !self.is_alias(p.local) {
                                 self.access(st, at, p, Access::MutBorrow, *span);
+                            } else if self.local(p.local).kind == (LocalKind::Arg { mutable: true })
+                            {
+                                let args: Vec<Local> = c
+                                    .args
+                                    .iter()
+                                    .filter_map(|a| a.place().map(|p| p.local))
+                                    .collect();
+                                self.activate(st, at, p.local, &args, *span);
                             }
                         }
                         Arg::Take(o) => self.operand(st, at, o),
                     }
                 }
             }
-            Rvalue::Closure(_) | Rvalue::FnRef(..) | Rvalue::Const(_) => {}
+            Rvalue::Closure(_)
+            | Rvalue::FnRef(..)
+            | Rvalue::Const(_)
+            | Rvalue::Text(_)
+            | Rvalue::Embed(_)
+            | Rvalue::ConstParam(_) => {}
+            Rvalue::BorrowStruct { fields, .. } => {
+                for a in fields {
+                    match a {
+                        Arg::Borrow(p, span) => self.access(st, at, p, Access::Borrow, *span),
+                        Arg::Mut(p, span) => self.access(st, at, p, Access::MutBorrow, *span),
+                        Arg::Take(o) => self.operand(st, at, o),
+                    }
+                }
+            }
             Rvalue::Dispatch(d) => d.groups.iter().for_each(|g| self.operand(st, at, g)),
             Rvalue::Draw(d) => {
                 self.operand(st, at, &d.vertices);
@@ -791,6 +912,48 @@ impl<'a> FnCheck<'a> {
     /// projection aliases, and whether it may be written through it.
     fn resolve(&self, st: &State, place: &Place) -> Vec<Target> {
         let own = || Target { place: place.clone(), via: Vec::new(), exact: true, mutable: true };
+        // Through a borrow struct's projection field: what the field projects, from the loans
+        // under it; with none (a parameter's), the place itself.
+        if !self.is_alias(place.local) && self.p.is_borrow_struct(self.local(place.local).ty) {
+            if self.borrow_field_mode(place).is_none() && !place.proj.is_empty() {
+                return vec![own()];
+            }
+            let path: Vec<Option<u32>> = place
+                .proj
+                .iter()
+                .map(|x| match x {
+                    Proj::Field(i) => Some(*i),
+                    _ => None,
+                })
+                .collect();
+            let mut out: Vec<Target> = Vec::new();
+            for i in st.loans.iter() {
+                let l = &self.loans[i];
+                if l.holder != place.local || l.field.is_empty() {
+                    continue;
+                }
+                // The loan's field path and the place's agree as far as both go: the rest of a
+                // longer place extends the loan's place; a shorter one covers the loan whole.
+                let n = l.field.len().min(path.len());
+                if l.field[..n].iter().zip(&path[..n]).any(|(&f, &p)| Some(f) != p) {
+                    continue;
+                }
+                let mut target = l.place.clone();
+                if path.len() > l.field.len() && l.exact {
+                    extend_path(&mut target, &place.proj[l.field.len()..]);
+                }
+                out.push(Target {
+                    place: target,
+                    via: l.via.clone(),
+                    exact: l.exact,
+                    mutable: l.mutable,
+                });
+            }
+            if out.is_empty() {
+                return vec![own()];
+            }
+            return out;
+        }
         if !self.is_alias(place.local) {
             return vec![own()];
         }
@@ -853,8 +1016,64 @@ impl<'a> FnCheck<'a> {
         // access is checked against the others.
         self.redefine(st, local);
         self.access(st, at, place, kind, span);
+        // A call's `mut` argument is only reserved until the call (§6.5).
+        let reserve = mutable && self.local(local).kind == LocalKind::Arg { mutable: true };
         for t in targets {
-            self.lend(st, at, local, t, mutable, span);
+            if reserve {
+                let reserved = t.mutable;
+                let mut via = vec![local];
+                via.extend(t.via);
+                let loan = Loan {
+                    place: t.place,
+                    mutable: false,
+                    reserved,
+                    holder: local,
+                    via,
+                    exact: t.exact,
+                    field: Vec::new(),
+                    span,
+                };
+                self.new_loan(st, at, loan);
+            } else {
+                self.lend(st, at, local, t, mutable, span);
+            }
+        }
+    }
+
+    /// A call begins the `mut` access its argument `holder` reserved: it now conflicts with
+    /// every other live loan on the place, and holds a `mut` loan on it.
+    /// The call's other arguments (`args`) are used by the call itself, so their loans count
+    /// even though their holders die there.
+    fn activate(&mut self, st: &mut State, at: Point, holder: Local, args: &[Local], span: Span) {
+        let reserved: Vec<Loan> = st
+            .loans
+            .iter()
+            .map(|i| &self.loans[i])
+            .filter(|l| l.holder == holder && l.reserved)
+            .cloned()
+            .collect();
+        for l in reserved {
+            // Two `mut` arguments that overlap were reported where the second was evaluated.
+            let conflict = st.loans.iter().find(|&i| {
+                let o = &self.loans[i];
+                let other_mut_arg = args.contains(&o.holder)
+                    && self.local(o.holder).kind == (LocalKind::Arg { mutable: true });
+                !l.via.contains(&o.holder)
+                    && !other_mut_arg
+                    && (args.contains(&o.holder) || self.live_after(at, o.holder))
+                    && overlaps(&o.place, &l.place)
+            });
+            if let Some(i) = conflict
+                && !(self.emit
+                    && (self.reported.contains(&i)
+                        || self.reported_at.contains(&self.loans[i].span)))
+            {
+                if self.emit {
+                    self.reported.push(i);
+                }
+                self.conflict(&l.place, i, Access::MutBorrow, span);
+            }
+            self.new_loan(st, at, Loan { mutable: true, reserved: false, ..l });
         }
     }
 
@@ -872,7 +1091,84 @@ impl<'a> FnCheck<'a> {
         let mut via = vec![holder];
         via.extend(t.via);
         let mutable = mutable && t.mutable;
-        self.new_loan(st, at, Loan { place: t.place, mutable, holder, via, exact: t.exact, span });
+        let reserved = false;
+        let field = Vec::new();
+        self.new_loan(
+            st,
+            at,
+            Loan { place: t.place, mutable, reserved, holder, via, exact: t.exact, field, span },
+        );
+    }
+
+    /// A borrow struct's loans (§6.6): each projection field's on its place, in the field's
+    /// mode, and a borrow struct field's own loans, under that field.
+    fn borrow_struct_loans(
+        &mut self,
+        st: &mut State,
+        at: Point,
+        holder: Local,
+        fields: &[Arg],
+        span: Span,
+    ) {
+        for (i, a) in fields.iter().enumerate() {
+            let (p, mutable) = match a {
+                Arg::Borrow(p, _) => (p, false),
+                Arg::Mut(p, _) => (p, true),
+                Arg::Take(_) => continue,
+            };
+            let ty = place_ty(self.p, &self.body.locals, p);
+            if self.p.is_borrow_struct(ty) {
+                // A borrow struct inside this one: its loans, under this field.
+                let inner: Vec<Loan> = self
+                    .resolve_loans(st, p)
+                    .into_iter()
+                    .map(|(l, rest)| {
+                        let mut field = vec![i as u32];
+                        field.extend(rest);
+                        Loan { holder, via: vec![holder], field, span, ..l }
+                    })
+                    .collect();
+                for l in inner {
+                    self.new_loan(st, at, l);
+                }
+                continue;
+            }
+            for t in self.resolve(st, p) {
+                let mut via = vec![holder];
+                via.extend(t.via);
+                let loan = Loan {
+                    place: t.place,
+                    mutable: mutable && t.mutable,
+                    reserved: false,
+                    holder,
+                    via,
+                    exact: t.exact,
+                    field: vec![i as u32],
+                    span,
+                };
+                self.new_loan(st, at, loan);
+            }
+        }
+    }
+
+    /// The loans of the borrow struct at `p` (a holder, or a borrow struct field of one), each
+    /// with the rest of its field path below `p`.
+    fn resolve_loans(&self, st: &State, p: &Place) -> Vec<(Loan, Vec<u32>)> {
+        let fields: Option<Vec<u32>> = p
+            .proj
+            .iter()
+            .map(|x| match x {
+                Proj::Field(i) => Some(*i),
+                _ => None,
+            })
+            .collect();
+        let Some(fields) = fields else { return Vec::new() };
+        st.loans
+            .iter()
+            .map(|i| &self.loans[i])
+            .filter(|l| l.holder == p.local && l.field.starts_with(&fields))
+            .map(|l| (l.clone(), l.field[fields.len()..].to_vec()))
+            .collect()
     }
 
     /// What a projection-returning call returned: somewhere inside its `borrow` and `mut`
@@ -885,8 +1181,26 @@ impl<'a> FnCheck<'a> {
         c: &Call,
         span: Span,
     ) {
-        for a in &c.args {
+        // The callee's parameter types and result type, to see which arguments the result can
+        // point into.
+        let sig = match &c.callee {
+            Callee::Fn { func, .. } | Callee::TraitMethod { method: func, .. } => {
+                let def = self.p.func(*func);
+                Some((def.params.iter().map(|ps| ps.ty).collect::<Vec<_>>(), def.ret))
+            }
+            _ => None,
+        };
+        for (k, a) in c.args.iter().enumerate() {
+            if let Some((params, ret)) = &sig
+                && let Some(&pt) = params.get(k)
+                && !crate::traits::can_hold(self.p, pt, *ret)
+            {
+                continue;
+            }
             let (p, from_mut) = match a {
+                // A `mut` projection can't come from a read-only place, so a `-> mut T` result
+                // borrows only the `mut` arguments (§6.4).
+                Arg::Borrow(..) if c.ret_mode == RetMode::Mut => continue,
                 Arg::Borrow(p, _) => (p, false),
                 Arg::Mut(p, _) => (p, true),
                 Arg::Take(_) => continue,
@@ -894,6 +1208,102 @@ impl<'a> FnCheck<'a> {
             let mutable = from_mut && c.ret_mode == RetMode::Mut;
             for t in self.resolve(st, p) {
                 self.lend(st, at, holder, Target { exact: false, ..t }, mutable, span);
+            }
+        }
+    }
+
+    /// What a call that returns a borrow struct returned (§6.6): each field borrows what the
+    /// call's arguments could give it, as a projection-returning call's result does (§6.4). A
+    /// `mut` field borrows the `mut` arguments, mutably; any other projection or run field
+    /// borrows every `borrow` and `mut` argument. Only arguments whose type can hold the field's
+    /// are borrowed.
+    fn borrow_struct_result_loans(
+        &mut self,
+        st: &mut State,
+        at: Point,
+        holder: Local,
+        c: &Call,
+        span: Span,
+    ) {
+        let ty = self.local(holder).ty;
+        let crate::ty::TyKind::Adt(a, args) = self.p.types.kind(ty) else { return };
+        let (a, args) = (*a, args.clone());
+        let params: Option<Vec<crate::ty::TyId>> = match &c.callee {
+            Callee::Fn { func, .. } | Callee::TraitMethod { method: func, .. } => {
+                Some(self.p.func(*func).params.iter().map(|ps| ps.ty).collect())
+            }
+            _ => None,
+        };
+        let modes: Vec<RetMode> = self.p.adt_fields(a, None).iter().map(|f| f.mode).collect();
+        let tys = self.p.fields_of(a, &args, None);
+        for (i, (mode, fty)) in modes.into_iter().zip(tys).enumerate() {
+            let run = matches!(
+                self.p.types.kind(fty),
+                crate::ty::TyKind::Slice(_) | crate::ty::TyKind::Str
+            );
+            let nested = self.p.is_borrow_struct(fty);
+            if mode == RetMode::Owned && !run && !nested {
+                continue; // a `Copy` value
+            }
+            let mutable = mode == RetMode::Mut || (nested && has_mut_field(self.p, fty));
+            for (k, arg) in c.args.iter().enumerate() {
+                if let Some(pt) = params.as_ref().and_then(|ps| ps.get(k))
+                    && !crate::traits::can_hold(self.p, *pt, fty)
+                {
+                    continue;
+                }
+                let p = match arg {
+                    Arg::Borrow(_, _) if mutable => continue,
+                    Arg::Borrow(p, _) | Arg::Mut(p, _) => p,
+                    Arg::Take(_) => continue,
+                };
+                let from_mut = matches!(arg, Arg::Mut(..));
+                for t in self.resolve(st, p) {
+                    let mut via = vec![holder];
+                    via.extend(t.via);
+                    let loan = Loan {
+                        place: t.place,
+                        mutable: mutable && from_mut && t.mutable,
+                        reserved: false,
+                        holder,
+                        via,
+                        exact: false,
+                        field: vec![i as u32],
+                        span,
+                    };
+                    self.new_loan(st, at, loan);
+                }
+            }
+        }
+    }
+
+    /// E0508 when a borrow struct a function returns borrows anything but its parameters (or a
+    /// constant): what it borrows must outlive the call (§6.4, §6.6).
+    fn returned_borrow_struct(&mut self, st: &State, o: &Operand) {
+        if !self.emit || !self.p.is_borrow_struct(o.ty) {
+            return;
+        }
+        let (OperandKind::Copy(p) | OperandKind::Move(p, _)) = &o.kind else { return };
+        for (loan, _) in self.resolve_loans(st, p) {
+            let decl = self.local(loan.place.local);
+            // A `mut` loan on a read-only place is E0512 where it's taken.
+            let ok = matches!(
+                decl.kind,
+                LocalKind::User(thir::LocalKind::Param(Mode::Mut | Mode::Borrow))
+                    | LocalKind::Const(_)
+            );
+            if !ok {
+                let what = self.describe(&loan.place);
+                self.err(
+                    Diagnostic::new(
+                        codes::E0508,
+                        loan.span,
+                        format!("a returned borrow struct must borrow the function's parameters, and this borrows `{what}`"),
+                    )
+                    .with_note("what a borrow struct borrows must outlive the call that returns it; this function's locals end when it returns (§6.6)")
+                    .with_help("borrow a `borrow` or `mut` parameter's place instead, or return an owned value"),
+                );
+                return;
             }
         }
     }
@@ -912,6 +1322,18 @@ impl<'a> FnCheck<'a> {
         let used = captured_places(body, id);
         for &(l, written) in &body.closures[id.0 as usize].captures {
             let whole = Place::local(l);
+            // A `Copy` value the closure only reads is copied when it's made (§6.7): read now,
+            // and not lent.
+            if !written
+                && crate::traits::implements_builtin(
+                    self.p,
+                    self.local(l).ty,
+                    crate::defs::Lang::Copy,
+                )
+            {
+                self.access(st, at, &whole, Access::Read, span);
+                continue;
+            }
             if self.emit && self.is_alias(l) {
                 let targets = self.resolve(st, &whole);
                 self.made.extend(targets.iter().map(|t| ((id, l), t.clone())));
@@ -996,6 +1418,24 @@ impl<'a> FnCheck<'a> {
                 return;
             }
             self.check_target(st, at, place, &[], access, span);
+            return;
+        }
+        // Through a borrow struct's projection field, the field's mode decides, not the root's.
+        if let Some(mode) = self.borrow_field_mode(place) {
+            match access {
+                Access::Write | Access::MutBorrow if mode != RetMode::Mut => {
+                    self.read_only(place, access, span);
+                    return;
+                }
+                Access::Move => {
+                    self.not_owned(place, span);
+                    return;
+                }
+                _ => {}
+            }
+            for t in self.resolve(st, place) {
+                self.check_target(st, at, &t.place, &t.via, access, span);
+            }
             return;
         }
         // The root must allow the access (a projection never owns, so never moves).
@@ -1130,7 +1570,7 @@ impl<'a> FnCheck<'a> {
     fn holder_text(&self, h: Local) -> String {
         let d = self.local(h);
         match d.kind {
-            LocalKind::TempProjection { .. } if d.name.ends_with("(..)") => {
+            LocalKind::TempProjection { role: TempRole::CallResult, .. } => {
                 format!("the result of `{}`", d.name)
             }
             _ if self.is_match_holder(h) => "the `match`".into(),
@@ -1141,7 +1581,7 @@ impl<'a> FnCheck<'a> {
     /// Whether `h` is a `match`'s scrutinee, borrowed while the arms test it (mir::build).
     fn is_match_holder(&self, h: Local) -> bool {
         let d = self.local(h);
-        d.kind == LocalKind::TempProjection { mutable: false } && d.name == "match"
+        d.kind == LocalKind::TempProjection { mutable: false, role: TempRole::Match }
     }
 
     /// `target` overlaps loan `i`.
@@ -1149,6 +1589,7 @@ impl<'a> FnCheck<'a> {
         if !self.emit {
             return;
         }
+        self.reported_at.push(span);
         let l = &self.loans[i];
         let what = self.describe(target);
         let other = self.describe(&l.place);
@@ -1225,9 +1666,10 @@ impl<'a> FnCheck<'a> {
             LocalKind::User(thir::LocalKind::ClosureParam) => {
                 format!("`{}` is a closure parameter", decl.name)
             }
-            LocalKind::TempProjection { .. } if decl.name.ends_with("(..)") => {
+            LocalKind::TempProjection { role: TempRole::CallResult, .. } => {
                 format!("`{}` returns `borrow`, not `mut`", decl.name.trim_end_matches("(..)"))
             }
+            LocalKind::Const(_) => format!("`{}` is a constant", decl.name),
             _ => format!("`{}` is read-only", decl.name),
         };
         let mut d = Diagnostic::new(code, span, format!("can't {verb} `{what}`: {why}"));
@@ -1245,15 +1687,26 @@ impl<'a> FnCheck<'a> {
                     None => d,
                 }
             }
-            LocalKind::User(thir::LocalKind::Projection { .. }) => d
-                .with_help(format!("project it with `mut {} = ...` to change it", decl.name))
-                .with_secondary(decl.span, "declared here"),
+            // A `borrow` binding: project with `mut` instead. A pattern's or a loop's name: match
+            // or loop with `mut`.
+            LocalKind::User(thir::LocalKind::Projection { .. }) => match decl.keyword {
+                Some(k) => d
+                    .with_help(format!("project it with `mut {} = ...` to change it", decl.name))
+                    .with_secondary(decl.span, "declared here")
+                    .with_fix("make it `mut`", k, "mut"),
+                None => d
+                    .with_help("bind it with `match mut place { ... }` or `for mut x in ...` to change it (§6.3)")
+                    .with_secondary(decl.span, "declared here"),
+            },
             LocalKind::User(thir::LocalKind::ClosureParam) => {
                 d.with_help("copy it into a `var` first")
             }
             LocalKind::TempProjection { .. } => {
                 d.with_help("call a function that returns `mut` to change it")
             }
+            LocalKind::Const(_) => d
+                .with_note("a constant lives as long as the program, and every use of it reads the same place (§10)")
+                .with_help(format!("copy it into a `var` to change the copy: `var x = {}.clone()`", decl.name)),
             _ => d,
         };
         self.err(d);
@@ -1271,6 +1724,9 @@ impl<'a> FnCheck<'a> {
             }
             LocalKind::User(thir::LocalKind::ClosureParam) => {
                 format!("`{}` is a closure parameter", decl.name)
+            }
+            LocalKind::Const(_) => {
+                format!("`{}` is a constant, which lives as long as the program", decl.name)
             }
             _ => format!("`{}` is a projection of another place", decl.name),
         };
@@ -1300,6 +1756,9 @@ impl<'a> FnCheck<'a> {
             match decl.kind {
                 LocalKind::User(thir::LocalKind::Param(Mode::Mut)) => {}
                 LocalKind::User(thir::LocalKind::Param(Mode::Borrow)) if mode == RetMode::Borrow => {}
+                // A constant lives as long as the program; a `mut` projection of it is
+                // reported where it's taken (it's read-only).
+                LocalKind::Const(_) => {}
                 LocalKind::User(thir::LocalKind::Param(Mode::Borrow)) => self.err(
                     Diagnostic::new(codes::E0512, ret_span, format!("can't return a `mut` projection of `{}`: it's borrowed, not `mut`", decl.name))
                         .with_help(format!("make the parameter `{}: mut ...`", decl.name)),
@@ -1343,7 +1802,7 @@ fn captured_places(body: &Body, id: ClosureId) -> HashMap<Local, Vec<(Place, boo
                 StatementKind::Eval(r) => rvalue_places(body, r, &mut add),
                 StatementKind::Bind { place, mutable, .. } => add(place, *mutable),
                 StatementKind::Check(p) => add(p, false),
-                StatementKind::Live(_) | StatementKind::Dead(_) => {}
+                StatementKind::Live(_) | StatementKind::Dead(_) | StatementKind::Drop(_) => {}
             }
         }
         match &b.term.kind {
@@ -1404,15 +1863,34 @@ fn rvalue_places(body: &Body, r: &Rvalue, add: &mut dyn FnMut(&Place, bool)) {
             for (_, p, _) in &d.args {
                 add(p, false);
             }
+            if let Some((p, _)) = &d.indirect {
+                add(p, false);
+            }
         }
         Rvalue::Draw(d) => {
             operand(&d.vertices, add);
             operand(&d.instances, add);
-            for (_, p, _) in &d.args {
+            for (_, _, p, _) in &d.args {
+                add(p, false);
+            }
+            if let Some((p, _)) = &d.indirect {
                 add(p, false);
             }
         }
-        Rvalue::FnRef(..) | Rvalue::Const(_) => {}
+        Rvalue::FnRef(..)
+        | Rvalue::Const(_)
+        | Rvalue::Text(_)
+        | Rvalue::Embed(_)
+        | Rvalue::ConstParam(_) => {}
+        Rvalue::BorrowStruct { fields, .. } => {
+            for a in fields {
+                match a {
+                    Arg::Borrow(p, _) => add(p, false),
+                    Arg::Mut(p, _) => add(p, true),
+                    Arg::Take(o) => operand(o, add),
+                }
+            }
+        }
     }
 }
 

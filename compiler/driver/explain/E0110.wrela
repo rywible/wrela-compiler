@@ -1,0 +1,22 @@
+// An assignment where a value is expected: `if a = 1`. Assignment is a statement, not an
+// expression. To compare, write `==`.
+// ---- wrong
+fn is_one(a: i32) -> bool {
+    if a = 1 {
+        true
+    } else {
+        false
+    }
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+fn is_one(a: i32) -> bool {
+    if a == 1 {
+        true
+    } else {
+        false
+    }
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

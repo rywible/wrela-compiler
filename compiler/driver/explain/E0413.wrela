@@ -1,0 +1,26 @@
+// An `impl Drop`, as in Rust: only std's core has destructors (a `Vec` frees its memory). A program's
+// types release what they hold through std's types; there's no code that runs when a value goes.
+// ---- wrong
+struct File {
+    handle: u32,
+}
+
+impl Drop for File {
+    fn drop(mut self) {
+        self.handle = 0
+    }
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+struct File {
+    handle: u32,
+}
+
+impl File {
+    fn close(mut self) {
+        self.handle = 0
+    }
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

@@ -1,0 +1,47 @@
+// run: an impl's parameter that only a bound mentions is inferred from it, as a function's is
+// (language.md §7): `impl<C, F: Field<C>> Field<C> for Masked<F>` finds `C` from `F`'s one impl
+// expect: at(2.0) = 2.0
+// expect: at(0.25) = 0.5
+
+trait Field<C> {
+    fn value(self, p: vec3) -> f32
+    fn channels(self, p: vec3) -> C
+}
+
+struct Tint: Copy {
+    r: f32,
+}
+
+struct Ball: Copy {
+    radius: f32,
+}
+
+impl Field<Tint> for Ball {
+    fn value(self, p: vec3) -> f32 {
+        length(p) - self.radius
+    }
+
+    fn channels(self, p: vec3) -> Tint {
+        Tint { r: 1.0 }
+    }
+}
+
+struct Masked<F>: Copy {
+    inner: F,
+    cut: f32,
+}
+
+impl<C, F: Field<C>> Field<C> for Masked<F> {
+    fn value(self, p: vec3) -> f32 {
+        max(self.inner.value(p), p.y - self.cut)
+    }
+
+    fn channels(self, p: vec3) -> C {
+        self.inner.channels(p)
+    }
+}
+
+pub fn at(x: f32) -> f32 {
+    let m = Masked { inner: Ball { radius: 1.0 }, cut: 0.5 }
+    m.value(vec3(x, 0.0, 0.0)) + m.channels(vec3()).r
+}

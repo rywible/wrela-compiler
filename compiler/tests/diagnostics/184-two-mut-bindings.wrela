@@ -1,0 +1,14 @@
+// mistake: two `mut` bindings of one place, both in use
+// expect: E0506 E0506
+// fix: no
+struct Body {
+    pos: vec3,
+    vel: vec3,
+}
+
+fn step(b: mut Body) {
+    mut p = b.pos
+    mut q = b.pos
+    p += vec3(1.0)
+    q += vec3(1.0)
+}

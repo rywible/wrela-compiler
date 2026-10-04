@@ -115,12 +115,12 @@ const ROWS: [vec4; 5] = [
     vec4(-1.0),
 ]
 
-enum Kind: Copy + Clone {
+enum Kind: Copy {
     Plain,
     Scaled { by: f32 },
 }
 
-struct Entry: Copy + Clone {
+struct Entry: Copy {
     kind: Kind,
     weights: vec4,
 }

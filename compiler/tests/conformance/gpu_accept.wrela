@@ -4,7 +4,7 @@ use std::gpu::{
     buffer, dispatch, draw, present, write,
 }
 
-struct Params: Copy + Clone + GpuData {
+struct Params: Copy + GpuData {
     scale: f32,
     count: u32,
 }
@@ -46,7 +46,7 @@ fn paint(pixel: FragCoord, p: Params) -> vec4 {
 
 // A vertex output's values pass to the fragment shader, which takes them whether or not
 // anything draws the two yet.
-struct Lit: Copy + Clone {
+struct Lit: Copy {
     pos: ClipPosition,
     tint: vec4,
     id: Flat<u32>,
@@ -67,14 +67,14 @@ fn glow(o: Lit) -> vec4 {
 }
 
 pub fn frame(time: f32, width: u32, height: u32) {
-    let input: GpuBuffer<f32> = buffer(64)
-    write(input, 0, [1.0, 2.0, 3.0])
-    let out: GpuBuffer<f32> = buffer(64)
+    var input: GpuBuffer<f32> = buffer(64)
+    write(mut input, 0, [1.0, 2.0, 3.0])
+    var out: GpuBuffer<f32> = buffer(64)
     let p = Params { scale: time, count: 3 }
-    dispatch(fill, groups: 1, p: p, input: input, out: out)
-    let cells: GpuBuffer<u32> = buffer(64)
-    dispatch(grid, groups: (1, 1, 1), out: cells)
+    dispatch(fill.bind(p: p, input: input, out: mut out), groups: 1)
+    var cells: GpuBuffer<u32> = buffer(64)
+    dispatch(grid.bind(out: mut cells), groups: (1, 1, 1))
     begin_screen_pass(clear: vec4(0.0, 0.0, 0.0, 1.0))
-    draw(cover, paint, vertices: 3, p: p)
+    draw(cover, paint.bind(p: p), vertices: 3)
     present()
 }

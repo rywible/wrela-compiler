@@ -27,7 +27,13 @@ id_type! {
     TraitId;
     ImplId;
     ConstId;
+    /// A type alias: `type Tick = u64`.
+    AliasId;
+    /// A trait set: `trait Sim = Clone + StateHash`.
+    TraitSetId;
     ModuleId;
+    /// A package: std, the program's own, or a dependency (language.md §3).
+    PackageId;
     /// A generic parameter of some definition, including a trait's `Self`.
     ParamId;
     /// A closure expression in some function body.
@@ -103,6 +109,52 @@ impl FloatTy {
     }
 }
 
+/// What a function type says besides its types: each parameter's mode, and whether it's
+/// `@deterministic`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct FnFlags {
+    /// Two bits per parameter, the first parameter's lowest: 0 borrow, 1 `mut`, 2 `take`.
+    pub modes: u64,
+    /// `@deterministic fn(...)`: only a function that's deterministic can be passed (§14).
+    pub deterministic: bool,
+    /// `@parallel fn(...)`: a function that runs on several workers at once (§6.12), so it
+    /// writes no captured data and does no IO, GPU work or non-deterministic work.
+    pub parallel: bool,
+    /// `@audio fn(...)`: a function the audio thread runs (§6.13), so it doesn't allocate, do
+    /// IO, recurse or record GPU work, and captures nothing (it outlives the call).
+    pub audio: bool,
+}
+
+impl FnFlags {
+    /// The most parameters a function type can give a mode.
+    pub const MAX_MODES: usize = 32;
+
+    pub fn mode(self, i: usize) -> wrela_syntax::ast::Mode {
+        use wrela_syntax::ast::Mode;
+        if i >= Self::MAX_MODES {
+            return Mode::Borrow;
+        }
+        match (self.modes >> (2 * i)) & 3 {
+            1 => Mode::Mut,
+            2 => Mode::Take,
+            _ => Mode::Borrow,
+        }
+    }
+
+    pub fn with_mode(mut self, i: usize, m: wrela_syntax::ast::Mode) -> FnFlags {
+        use wrela_syntax::ast::Mode;
+        if i < Self::MAX_MODES {
+            let bits = match m {
+                Mode::Borrow => 0,
+                Mode::Mut => 1,
+                Mode::Take => 2,
+            };
+            self.modes = (self.modes & !(3 << (2 * i))) | (bits << (2 * i));
+        }
+        self
+    }
+}
+
 /// What an unresolved inference variable may become.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum VarKind {
@@ -113,6 +165,14 @@ pub enum VarKind {
     Int,
     /// A float literal: any float type. Defaults to `f32`.
     Float,
+}
+
+/// A closure expression: the function whose body it's in (none for a constant's), and its
+/// index there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ClosureRef {
+    pub owner: Option<FnId>,
+    pub id: ClosureId,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -127,8 +187,15 @@ pub enum TyKind {
     /// `()` is the empty tuple.
     Tuple(Vec<TyId>),
     Array(TyId, u32),
+    /// `[T; N]` whose length is a type: a `const N: u32` parameter, or an inference variable.
+    /// Once the length is a [`TyKind::ConstU32`], the interner makes it an `Array`.
+    ArrayN(TyId, TyId),
+    /// A `const` generic argument: a `u32` value, as a type (§4).
+    ConstU32(u32),
     /// `[T]`: a borrowed run of `T`.
     Slice(TyId),
+    /// `str`: a borrowed run of UTF-8.
+    Str,
     Adt(AdtId, Vec<TyId>),
     Param(ParamId),
     /// `<T as Trait<..>>::Name`, not yet resolved to a type.
@@ -142,9 +209,9 @@ pub enum TyKind {
     Opaque(FnId, Vec<TyId>),
     /// `fn(A, B) -> R`: a parameter that accepts a closure or a function. Functions with such
     /// parameters are monomorphized per argument, like generics.
-    FnPtr(Vec<TyId>, TyId),
+    FnPtr(Vec<TyId>, TyId, FnFlags),
     /// The type of a closure expression; `env` is its enclosing function's generic arguments.
-    Closure(ClosureId, Vec<TyId>),
+    Closure(ClosureRef, Vec<TyId>),
     /// A named function used as a value.
     FnDef(FnId, Vec<TyId>),
     Var(VarId),
@@ -217,6 +284,14 @@ impl Types {
     }
 
     pub fn intern(&self, kind: TyKind) -> TyId {
+        // An array whose length is known is an array of that length.
+        let kind = match kind {
+            TyKind::ArrayN(e, n) => match *self.kind(n) {
+                TyKind::ConstU32(len) => TyKind::Array(e, len),
+                _ => TyKind::ArrayN(e, n),
+            },
+            k => k,
+        };
         let mut map = self.map.borrow_mut();
         let new = match map.entry(kind) {
             Entry::Occupied(e) => return *e.get(),
@@ -377,6 +452,10 @@ impl Types {
                 let x = m(*e);
                 (x != *e).then_some(TyKind::Array(x, *n))
             }
+            TyKind::ArrayN(e, n) => {
+                let (x, y) = (m(*e), m(*n));
+                (x != *e || y != *n).then_some(TyKind::ArrayN(x, y))
+            }
             TyKind::Slice(e) => {
                 let x = m(*e);
                 (x != *e).then_some(TyKind::Slice(x))
@@ -391,11 +470,11 @@ impl Types {
                     name: name.clone(),
                 })
             }
-            TyKind::FnPtr(ps, r) => {
+            TyKind::FnPtr(ps, r, flags) => {
                 let ps2 = map_list(ps, &mut m);
                 let r2 = m(*r);
                 (ps2.is_some() || r2 != *r)
-                    .then(|| TyKind::FnPtr(ps2.unwrap_or_else(|| ps.clone()), r2))
+                    .then(|| TyKind::FnPtr(ps2.unwrap_or_else(|| ps.clone()), r2, *flags))
             }
             _ => None,
         };
@@ -444,11 +523,15 @@ pub fn children(kind: &TyKind, f: &mut impl FnMut(TyId)) {
         | TyKind::Closure(_, ts)
         | TyKind::FnDef(_, ts) => ts.iter().for_each(|&t| f(t)),
         TyKind::Array(e, _) | TyKind::Slice(e) => f(*e),
+        TyKind::ArrayN(e, n) => {
+            f(*e);
+            f(*n);
+        }
         TyKind::Projection { self_ty, trait_args, .. } => {
             f(*self_ty);
             trait_args.iter().for_each(|&t| f(t));
         }
-        TyKind::FnPtr(ps, r) => {
+        TyKind::FnPtr(ps, r, _) => {
             ps.iter().for_each(|&t| f(t));
             f(*r);
         }
@@ -457,6 +540,8 @@ pub fn children(kind: &TyKind, f: &mut impl FnMut(TyId)) {
         | TyKind::Float(_)
         | TyKind::Vec(_)
         | TyKind::Mat(_)
+        | TyKind::Str
+        | TyKind::ConstU32(_)
         | TyKind::Param(_)
         | TyKind::Var(_)
         | TyKind::Never

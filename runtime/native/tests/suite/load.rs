@@ -13,17 +13,17 @@ fn load_with_manifest(name: &str, edit: impl Fn(&str) -> String) -> Error {
 
 #[test]
 fn rejects_another_manifest_version() {
-    let err = load_with_manifest("manifest-v2", |m| {
-        m.replace("\"manifest_version\": 1", "\"manifest_version\": 2")
+    let err = load_with_manifest("manifest-v1", |m| {
+        m.replace("\"manifest_version\": 2", "\"manifest_version\": 1")
     });
     assert!(matches!(&err, Error::Manifest(_)), "{err}");
-    assert!(err.to_string().contains("manifest version 2, but this host reads version 1"), "{err}");
+    assert!(err.to_string().contains("manifest version 1, but this host reads version 2"), "{err}");
 }
 
 #[test]
 fn rejects_another_stream_version() {
     let err = load_with_manifest("stream-v9", |m| {
-        m.replace("\"stream_version\": 2", "\"stream_version\": 9")
+        m.replace("\"stream_version\": 4", "\"stream_version\": 9")
     });
     assert!(matches!(&err, Error::Manifest(_)), "{err}");
     assert!(err.to_string().contains("command stream version 9"), "{err}");
@@ -40,7 +40,7 @@ fn reports_missing_files() {
 #[test]
 fn rejects_a_program_with_other_imports() {
     let wasm = wat::parse_str(
-        r#"(module (import "env" "now" (func (result f64))) (memory (export "memory") 1)
+        r#"(module (import "env" "now" (func (result f64))) (import "wrela" "memory" (memory 1 16384 shared)) (export "memory" (memory 0))
              (func (export "frame") (param f32 i32 i32)))"#,
     )
     .expect("compiles");
@@ -48,6 +48,6 @@ fn rejects_a_program_with_other_imports() {
     let err = Host::load(&dir).err().expect("rejected");
     assert_eq!(
         err.to_string(),
-        "invalid program: it imports `env.now`, but a wrela program may import only `wrela.submit`"
+        "invalid program: it imports `env.now`, which isn't one of the host's: `wrela.memory`, `wrela.submit`, `wrela.request_status`, `wrela.request_take`, `wrela.limit`, `wrela.audio`"
     );
 }

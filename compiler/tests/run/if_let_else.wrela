@@ -1,0 +1,29 @@
+// run: `if let` and `let ... else` over an `Option`
+// expect: demo() = 15
+
+fn first_even(xs: [u32]) -> Option<u32> {
+    for x in xs {
+        if x % 2 == 0 {
+            return Some(x)
+        }
+    }
+    None
+}
+
+fn half_of_first_even(xs: [u32]) -> u32 {
+    let Some(e) = first_even(xs) else {
+        return 0
+    }
+    e / 2
+}
+
+pub fn demo() -> u32 {
+    let xs = [3, 7, 10, 12]
+    var total = 0
+    if let Some(e) = first_even(xs) {
+        total += e
+    }
+    total + half_of_first_even(xs) + half_of_first_even([1, 3])
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

@@ -1,0 +1,34 @@
+// run: parsing digits with `Result` and `?`
+// expect: parsed() = 4071
+// expect: rejected() = true
+
+fn digit(b: u8) -> Result<u32, Text> {
+    if b < 48 || b > 57 {
+        return Err("not a digit")
+    }
+    Ok(u32(b) - 48)
+}
+
+fn number(s: str) -> Result<u32, Text> {
+    var n = 0
+    for i in 0..s.len() {
+        n = n * 10 + digit(s.byte(i))?
+    }
+    Ok(n)
+}
+
+pub fn parsed() -> u32 {
+    match number("4071") {
+        Ok(n) => n,
+        Err(_) => 0,
+    }
+}
+
+pub fn rejected() -> bool {
+    match number("40x1") {
+        Ok(_) => false,
+        Err(_) => true,
+    }
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

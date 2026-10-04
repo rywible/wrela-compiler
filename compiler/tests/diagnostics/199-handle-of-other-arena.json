@@ -1,0 +1,28 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0312",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "an arena is indexed by a `Handle<Lever>`, not `Handle<Gate>`",
+      "notes": [
+        "an arena's values are named by their handles (§6.8)"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 12,
+        "end": 234,
+        "end_column": 13,
+        "end_line": 13,
+        "line": 13,
+        "start": 233
+      },
+      "title": "an index into a value that isn't indexable"
+    }
+  ],
+  "version": 2
+}

@@ -1,0 +1,13 @@
+// mistake: blending a type that doesn't implement `Blend`
+// expect: E0207
+// fix: no
+use std::field::Blend
+
+struct Gait {
+    phase: f32,
+    stride: f32,
+}
+
+fn halfway(a: Gait, b: Gait) -> Gait {
+    a.blend(b, 0.5)
+}

@@ -1,0 +1,17 @@
+// mistake: passing a type that lacks a library's trait, which has its own message
+// expect: E0400
+// fix: no
+@diagnostic("`{Self}` can't be simulated: declare `SimState` on it, and give its fields `SimState` too")
+trait SimState {}
+
+impl SimState for f32 {}
+
+fn tick<S: SimState>(s: S) {}
+
+struct Camera {
+    fov: f32,
+}
+
+fn run(c: Camera) {
+    tick(c)
+}

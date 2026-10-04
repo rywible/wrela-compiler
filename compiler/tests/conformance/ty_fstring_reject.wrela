@@ -1,0 +1,10 @@
+// rejects: ty.fstrings
+struct Opaque {
+    id: u32,
+}
+
+fn label(o: Opaque, w: f32) -> String {
+    let a = f"{o}" //~ E0400
+    let b = f"{w:.}" //~ E0217
+    f"{a}{b}"
+}

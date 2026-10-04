@@ -1,0 +1,10 @@
+// mistake: implementing a dependency's trait for a std type
+// expect: E0404
+// fix: no
+use geometry::shapes::Area
+
+impl Area for vec2 {
+    fn area(self) -> f32 {
+        self.x * self.y
+    }
+}

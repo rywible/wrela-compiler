@@ -104,6 +104,9 @@ pub enum Callee {
     Builtin(BuiltinFn),
     /// A closure in a local, or a function-typed parameter.
     Local(LocalId),
+    /// A closure or function stored in a place (`(self.f)(p)`): a value of a type bounded by
+    /// a function type (§6.7). The memory IR reads it into a local first ([`Callee::Local`]).
+    Value(Box<Expr>),
     /// `.clone()`: structural.
     Clone,
 }
@@ -127,6 +130,13 @@ pub struct Call {
 #[derive(Clone, Debug)]
 pub enum ExprKind {
     Lit(Lit),
+    /// A string literal: a `Text` holding this UTF-8, laid out in the build.
+    Text(std::sync::Arc<str>),
+    /// `embed("path")`: `Bytes` holding the file at this path in the package, which the build
+    /// reads and lays out (§10).
+    Embed(std::sync::Arc<str>),
+    /// A `const N: u32` generic parameter's value (§4).
+    ConstParam(ParamId),
     Local(LocalId),
     Const(ConstId),
     Unary(UnOp, Box<Expr>),
@@ -159,15 +169,19 @@ pub enum ExprKind {
     Construct(Vec<Expr>),
     /// A scalar conversion to this expression's type.
     Convert(Box<Expr>),
+    /// The variant an enum place holds, by index: a `u32` (derived code only).
+    Discriminant(Box<Expr>),
     Block(Block),
     If {
         cond: Box<Expr>,
         then: Block,
         else_: Option<Box<Expr>>,
     },
+    /// `match`; `mutable` for `match mut`, whose bindings project the scrutinee mutably.
     Match {
         scrutinee: Box<Expr>,
         arms: Vec<Arm>,
+        mutable: bool,
     },
     Closure(ClosureId),
     /// A named function as a value.
@@ -188,13 +202,23 @@ pub enum ExprKind {
 pub struct Dispatch {
     pub kernel: FnId,
     pub kernel_args: Vec<TyId>,
-    /// The workgroup count: a `u32` (in x; y and z are 1), or a `(u32, u32, u32)`.
+    /// The workgroup count: a `u32` (in x; y and z are 1), or a `(u32, u32, u32)`; or, when
+    /// `indirect`, a `GpuBuffer<u32>` or `GpuSpan<u32>` whose first three elements hold it.
     pub groups: Box<Expr>,
+    pub indirect: bool,
     /// One per kernel parameter that isn't a builtin, as (parameter index, argument), in the
     /// order written.
     pub args: Vec<(usize, Expr)>,
     /// How many of `args` are written before `groups`: it's evaluated after them.
     pub groups_at: usize,
+}
+
+/// One of `draw`'s own arguments.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DrawCount {
+    Vertices,
+    Instances,
+    Indirect,
 }
 
 #[derive(Clone, Debug)]
@@ -203,12 +227,15 @@ pub struct Draw {
     pub fragment: (FnId, Vec<TyId>),
     pub vertices: Expr,
     pub instances: Expr,
-    /// The shaders' arguments by name (shared by both when they have the same name), in the
-    /// order written.
-    pub args: Vec<(String, Expr)>,
-    /// How many of `args` are written before `vertices` and before `instances`: each is
-    /// evaluated after them.
-    pub counts_at: [usize; 2],
+    /// Instead of the counts: a `GpuBuffer<u32>` or `GpuSpan<u32>` holding the vertex count,
+    /// the instance count, the first vertex and the first instance.
+    pub indirect: Option<Box<Expr>>,
+    /// Each shader's arguments, bound to it (§12), as (entry point: 0 the vertex shader, 1 the
+    /// fragment shader; parameter index; argument), in the order written.
+    pub args: Vec<(usize, usize, Expr)>,
+    /// The counts in the order written, after the bound arguments; one not written (a
+    /// default) isn't here.
+    pub counts: Vec<DrawCount>,
 }
 
 #[derive(Clone, Debug)]
@@ -227,9 +254,12 @@ pub struct Stmt {
 
 #[derive(Clone, Debug)]
 pub enum StmtKind {
+    /// `let pat = init`; with `else_`, `let pat = init else { ... }`, whose block leaves the
+    /// scope when the pattern doesn't match.
     Bind {
         pat: Pat,
         init: Expr,
+        else_: Option<Block>,
     },
     Assign {
         place: Expr,
@@ -280,6 +310,8 @@ pub enum PatKind {
     Wild,
     Bind(LocalId),
     Lit(Lit),
+    /// A string literal: matches a `str`, `Text` or `String` with the same text.
+    Text(std::sync::Arc<str>),
     /// A struct (`variant: None`) or variant, with sub-patterns by field index.
     Adt {
         adt: AdtId,
@@ -324,6 +356,9 @@ impl Expr {
     pub fn for_each_child<'a>(&'a self, f: &mut impl FnMut(Child<'a>)) {
         match &self.kind {
             ExprKind::Lit(_)
+            | ExprKind::Text(_)
+            | ExprKind::Embed(_)
+            | ExprKind::ConstParam(_)
             | ExprKind::Local(_)
             | ExprKind::Const(_)
             | ExprKind::Closure(_)
@@ -337,13 +372,19 @@ impl Expr {
             | ExprKind::Swizzle(x, _)
             | ExprKind::ArrayRepeat(x, _)
             | ExprKind::Convert(x)
+            | ExprKind::Discriminant(x)
             | ExprKind::Take(x)
             | ExprKind::MutArg(x) => f(Child::Expr(x)),
             ExprKind::Binary(_, a, b) | ExprKind::Index(a, b) => {
                 f(Child::Expr(a));
                 f(Child::Expr(b));
             }
-            ExprKind::Call(c) => c.args.iter().for_each(|a| f(Child::Expr(a))),
+            ExprKind::Call(c) => {
+                if let Callee::Value(v) = &c.callee {
+                    f(Child::Expr(v));
+                }
+                c.args.iter().for_each(|a| f(Child::Expr(a)))
+            }
             ExprKind::Adt { fields, base, .. } => {
                 fields.iter().for_each(|x| f(Child::Expr(x)));
                 if let Some(b) = base {
@@ -361,7 +402,7 @@ impl Expr {
                     f(Child::Expr(e));
                 }
             }
-            ExprKind::Match { scrutinee, arms } => {
+            ExprKind::Match { scrutinee, arms, .. } => {
                 f(Child::Expr(scrutinee));
                 for a in arms {
                     if let Some(g) = &a.guard {
@@ -382,7 +423,10 @@ impl Expr {
             ExprKind::Draw(d) => {
                 f(Child::Expr(&d.vertices));
                 f(Child::Expr(&d.instances));
-                d.args.iter().for_each(|(_, a)| f(Child::Expr(a)));
+                if let Some(i) = &d.indirect {
+                    f(Child::Expr(i));
+                }
+                d.args.iter().for_each(|(_, _, a)| f(Child::Expr(a)));
             }
         }
     }

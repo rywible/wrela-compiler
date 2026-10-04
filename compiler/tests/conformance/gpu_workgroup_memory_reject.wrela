@@ -1,0 +1,36 @@
+// rejects: gpu.workgroup-memory
+// A read of what another invocation may still be writing, a write of what another may still be
+// reading, and a barrier that not every invocation reaches.
+use std::gpu::{GlobalId, LocalId, Shared, Slots, barrier, buffer, dispatch}
+
+@compute(64)
+fn no_barrier(out: mut Slots<f32>, row: mut Shared<f32, 64>, lid: LocalId, id: GlobalId) {
+    let mine = row.chunk(lid)
+    row.write(mine, 0, 1.0)
+    out[id] = row.get(0) //~ E0609
+}
+
+@compute(64)
+fn loop_without_second_barrier(out: mut Slots<f32>, row: mut Shared<f32, 64>, lid: LocalId, id: GlobalId) {
+    let mine = row.chunk(lid)
+    for round in 0..4 {
+        row.write(mine, 0, f32(round)) //~ E0609
+        barrier(mut row)
+        out[id] = row.get(0)
+    }
+}
+
+@compute(64)
+fn divergent(out: mut Slots<f32>, row: mut Shared<f32, 64>, lid: LocalId, id: GlobalId) {
+    if lid.x < 32 {
+        barrier(mut row) //~ E0610
+    }
+    out[id] = 0.0
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    var out = buffer(64)
+    dispatch(no_barrier.bind(out: mut out), groups: 1)
+    dispatch(loop_without_second_barrier.bind(out: mut out), groups: 1)
+    dispatch(divergent.bind(out: mut out), groups: 1)
+}

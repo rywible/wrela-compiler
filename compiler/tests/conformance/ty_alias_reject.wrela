@@ -1,0 +1,9 @@
+// rejects: ty.alias
+type A = (B, f32) //~ E0318
+type B = [A; 2]
+
+type Pair<T> = (T, T)
+
+fn f(p: Pair) -> f32 { //~ E0322
+    0.0
+}

@@ -1,0 +1,22 @@
+// Two items in one module, or two parameters of one function, have the same name. wrela has
+// no overloading: give each its own name.
+// ---- wrong
+fn speed() -> f32 {
+    2.0
+}
+
+fn speed() -> f32 {
+    3.0
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+fn walk_speed() -> f32 {
+    2.0
+}
+
+fn run_speed() -> f32 {
+    3.0
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

@@ -1,0 +1,38 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0115",
+      "file": "main.wrela",
+      "fixes": [
+        {
+          "edits": [
+            {
+              "end": 117,
+              "file": "main.wrela",
+              "replacement": "Vec::from([0.25, 0.5, 0.25])",
+              "start": 96
+            }
+          ],
+          "message": "make a `Vec` from an array"
+        }
+      ],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "`vec!` is a macro, and wrela has no macros",
+      "notes": [],
+      "severity": "error",
+      "span": {
+        "column": 5,
+        "end": 100,
+        "end_column": 9,
+        "end_line": 5,
+        "line": 5,
+        "start": 96
+      },
+      "title": "a macro call, which wrela doesn't have"
+    }
+  ],
+  "version": 2
+}

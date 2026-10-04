@@ -1,0 +1,29 @@
+// accepts: mem.drop
+// Values that own memory are dropped where their owner's scope ends: on every path out of it.
+struct Bag {
+    items: Vec<u32>,
+    name: String,
+}
+
+fn fill(n: u32) -> Bag {
+    var b = Bag { items: Vec::new(), name: String::from("bag") }
+    for i in 0..n {
+        if i == 7 {
+            break
+        }
+        let spare: Vec<u32> = Vec::with_capacity(4)
+        if spare.capacity() == 0 {
+            return b
+        }
+        b.items.push(i)
+    }
+    b
+}
+
+fn count(n: u32) -> u32 {
+    let b = fill(n)
+    var total = b.items.len()
+    let other = b.items.clone()
+    total += other.len()
+    total
+}

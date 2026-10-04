@@ -166,3 +166,65 @@ fn small_export_parameters_are_brought_into_range() {
     returns(&mut h, "is_true", &[i(5)], i(1));
     returns(&mut h, "is_true", &[i(0)], i(0));
 }
+
+/// A debug build traps where a float operation creates a NaN, and a release build doesn't pay
+/// for the check (§11). A NaN passed on isn't created: it doesn't trap.
+#[test]
+fn a_debug_build_traps_where_a_nan_is_created() {
+    let src = "pub fn divide(a: f32, b: f32) -> f32 {
+    a / b
+}
+
+pub fn root(x: f32) -> f32 {
+    sqrt(x)
+}
+
+pub fn spread(x: f32) -> f32 {
+    let v = vec3(x, 1.0, 2.0) * 0.0
+    v.y
+}
+
+pub fn passed_on() -> f32 {
+    let nan = bitcast_f32(0x7fc00000)
+    nan + 1.0
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+";
+    let dir = crate::package("debug_nans", src);
+    let load = |debug: bool, out: &str| {
+        let built = if debug { wrela_driver::build_debug(&dir) } else { wrela_driver::build(&dir) };
+        assert!(!built.has_errors(), "doesn't build");
+        built.write_to(&dir.join(out)).expect("write");
+        CpuHost::load(dir.join(out)).expect("load")
+    };
+    let mut release = load(false, "release");
+    let mut debug = load(true, "debug");
+    let nan = |host: &mut CpuHost, name: &str, args: &[Value]| match host.call_export(name, args) {
+        Ok(v) => matches!(v.as_slice(), [Value::F32(x)] if x.is_nan()),
+        Err(_) => false,
+    };
+    let zero = [Value::F32(0.0), Value::F32(0.0)];
+    assert!(nan(&mut release, "divide", &zero));
+    assert!(nan(&mut release, "root", &[Value::F32(-1.0)]));
+    // The NaN is in a component the function doesn't return.
+    returns(&mut release, "spread", &[Value::F32(f32::INFINITY)], Value::F32(0.0));
+    for (name, args) in [
+        ("divide", &zero[..]),
+        ("root", &[Value::F32(-1.0)][..]),
+        ("spread", &[Value::F32(f32::INFINITY)][..]),
+    ] {
+        match debug.call_export(name, args) {
+            Err(Error::Trap(t)) => assert!(
+                t.starts_with("panic: debug build: a float operation created a NaN"),
+                "{name}: {t}"
+            ),
+            other => panic!("{name} should trap in a debug build, got {other:?}"),
+        }
+    }
+    returns(&mut debug, "divide", &[Value::F32(1.0), Value::F32(2.0)], Value::F32(0.5));
+    assert!(nan(&mut debug, "passed_on", &[]));
+    // Release builds don't pay: the debug module is larger.
+    let size = |out: &str| std::fs::metadata(dir.join(out).join("game.wasm")).expect("wasm").len();
+    assert!(size("debug") > size("release"));
+}

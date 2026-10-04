@@ -1,7 +1,7 @@
 use std::field::{Surface, sphere}
 
 /// A box centred at the origin, given by its half-extents along each axis.
-struct Cuboid: Copy + Clone + GpuData {
+struct Cuboid: Copy + GpuData {
     half: vec3,
 }
 

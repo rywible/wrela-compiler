@@ -1,0 +1,32 @@
+// run: a union of an array of parts has channels, the same bits as the chained binary unions'
+// (std::field's `UnionAll` and `SmoothUnionAll`), and its distance and channels together are
+// its distance and its channels
+// expect: same(0.3) = true
+// expect: same(0.5) = true
+// expect: same(1.1) = true
+// expect: same(-0.4) = true
+use std::field::{Blend, Field, Surface, sphere}
+
+struct Tint: Copy + GpuData + Blend {
+    r: f32,
+}
+
+fn ball(x: f32, r: f32) -> Field<Tint> {
+    sphere(radius: 0.4).translate(by: vec3(x: x)).with(Tint { r })
+}
+
+pub fn same(x: f32) -> bool {
+    let p = vec3(x, 0.1, 0.0)
+    let (a, b, c) = (ball(x: 0.0, r: 0.2), ball(x: 0.5, r: 0.6), ball(x: 1.0, r: 0.9))
+    let smooth = [a, b, c].smooth_union(k: 0.2)
+    let chained = a.smooth_union(b, k: 0.2).smooth_union(c, k: 0.2)
+    let hard = [a, b, c].union()
+    let hard_chained = a.union(b).union(c)
+    let (d, t) = smooth.distance_and_channels(p)
+    smooth.channels(p).r == chained.channels(p).r &&
+        smooth.distance(p) == chained.distance(p) &&
+        d == smooth.distance(p) &&
+        t.r == smooth.channels(p).r &&
+        hard.channels(p).r == hard_chained.channels(p).r &&
+        hard.distance(p) == hard_chained.distance(p)
+}

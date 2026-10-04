@@ -1,9 +1,10 @@
 // The main-thread shim: hands the canvas to the render worker, forwards its size (in device
 // pixels) and the page's visibility, and shows fatal errors on the page and in the console.
 
+import { AUDIO_QUANTUM, AUDIO_SAMPLE_RATE } from "./abi.gen.ts";
 import { errorMessage } from "./errors.ts";
-import type { FromWorker, ToWorker } from "./messages.ts";
-import { asksForTest, isLoopback, parseTestParams, putResult } from "./testmode.ts";
+import { type FromWorker, type ToWorker, VOICE_PROCESSOR, type VoiceOptions } from "./messages.ts";
+import { asksForTest, isLoopback, parseTestParams, putResult, type TestParams } from "./testmode.ts";
 
 let shown = false;
 
@@ -47,6 +48,45 @@ function onPixelRatioChange(f: () => void): void {
   );
 }
 
+/** Plays the program's voice in an AudioWorklet (worklet.js), at the ABI's sample rate (the
+ * browser resamples to the device's). In test mode it renders `test.audio` quanta offline
+ * instead, saves the samples to `results/audio.f32`, and tells the worker. */
+async function playVoice(voice: VoiceOptions, test: TestParams | null, worker: Worker): Promise<void> {
+  const url = new URL("worklet.js", import.meta.url);
+  const node = (ctx: BaseAudioContext) => {
+    const n = new AudioWorkletNode(ctx, VOICE_PROCESSOR, {
+      numberOfInputs: 0,
+      numberOfOutputs: 1,
+      outputChannelCount: [1],
+      processorOptions: voice,
+    });
+    n.port.onmessage = (e: MessageEvent<{ message: string }>) => {
+      const why = new Error(`the voice trapped: ${e.data.message}`);
+      failEarly(why, test !== null);
+    };
+    n.connect(ctx.destination);
+  };
+  if (test) {
+    if (test.audio === 0) return;
+    const ctx = new OfflineAudioContext({ numberOfChannels: 1, length: test.audio * AUDIO_QUANTUM, sampleRate: AUDIO_SAMPLE_RATE });
+    await ctx.audioWorklet.addModule(url);
+    node(ctx);
+    const samples = (await ctx.startRendering()).getChannelData(0);
+    await putResult(document.baseURI, "audio.f32", samples.slice().buffer);
+    worker.postMessage({ type: "audio-rendered" } satisfies ToWorker);
+    return;
+  }
+  const ctx = new AudioContext({ sampleRate: AUDIO_SAMPLE_RATE, latencyHint: "interactive" });
+  await ctx.audioWorklet.addModule(url);
+  node(ctx);
+  // A browser starts audio only after the person interacts with the page.
+  if (ctx.state !== "running") {
+    const resume = () => void ctx.resume();
+    window.addEventListener("pointerdown", resume, { once: true });
+    window.addEventListener("keydown", resume, { once: true });
+  }
+}
+
 function start(): void {
   const testing = isLoopback(location.hostname) && asksForTest(location.hash);
   try {
@@ -65,7 +105,14 @@ function start(): void {
     }
     const workerUrl = "worker.js";
     const worker = new Worker(new URL(workerUrl, import.meta.url), { type: "module", name: "wrela render" });
-    worker.onmessage = (event: MessageEvent<FromWorker>) => showFatal(event.data.message);
+    worker.onmessage = (event: MessageEvent<FromWorker>) => {
+      const msg = event.data;
+      if (msg.type === "audio") {
+        playVoice(msg.voice, test, worker).catch((e: unknown) => failEarly(e, testing));
+      } else {
+        showFatal(msg.message);
+      }
+    };
     worker.onerror = (event) => {
       event.preventDefault();
       failEarly(new Error(`the render worker failed: ${event.message || "it couldn't start"}`), testing);

@@ -95,7 +95,7 @@ impl<T: Copy> TaggedBy for T {
 }
 
 // Finding `TagHolder<Endless>`'s `T::Tag` asks whether `Endless` is `Copy`, which holds itself.
-struct Endless: Copy + Clone { //~ E0318
+struct Endless: Copy { //~ E0318
     inner: Endless,
 }
 

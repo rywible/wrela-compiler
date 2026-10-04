@@ -26,11 +26,11 @@
       "severity": "error",
       "span": {
         "column": 5,
-        "end": 156,
+        "end": 148,
         "end_column": 13,
         "end_line": 9,
         "line": 9,
-        "start": 148
+        "start": 140
       },
       "title": "a struct can't be `Copy` or `GpuData` because of a field"
     }

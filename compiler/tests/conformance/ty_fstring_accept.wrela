@@ -1,0 +1,9 @@
+// accepts: ty.fstrings
+struct Item {
+    name: String,
+    weight: f32,
+}
+
+fn label(it: Item, count: u32) -> String {
+    f"{it.name} x{count}: {it.weight:.1} kg ({count * 2:>4}) {{done}}"
+}

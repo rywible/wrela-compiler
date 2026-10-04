@@ -1,0 +1,8 @@
+// rejects: mod.use
+// `init` makes the state: it takes nothing.
+pub fn init(seed: u32) -> u32 { //~ E0703
+    seed
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+}

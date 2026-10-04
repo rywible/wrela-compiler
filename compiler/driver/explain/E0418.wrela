@@ -1,0 +1,16 @@
+// A trait set that names itself, directly or through other sets. A set stands for the traits
+// it lists, so it must end in traits.
+// ---- wrong
+trait Sim = Clone + Saved
+
+trait Saved = Sim
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+use std::serialize::Serialize
+
+trait Sim = Clone + Saved
+
+trait Saved = Serialize
+
+pub fn frame(time: f32, width: u32, height: u32) {}

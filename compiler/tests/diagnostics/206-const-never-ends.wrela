@@ -1,0 +1,12 @@
+// mistake: a constant whose computation never ends
+// expect: E0705
+// fix: no
+const STEPS: u32 = settle()
+
+fn settle() -> u32 {
+    var n: u32 = 1
+    while n != 0 {
+        n = n.wrapping_mul(3)
+    }
+    n
+}

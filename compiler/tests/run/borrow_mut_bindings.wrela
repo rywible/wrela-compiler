@@ -1,0 +1,36 @@
+// run: `borrow` and `mut` bindings to parts of a struct
+// expect: run() = 15.0
+
+struct Herd: Clone {
+    names: Vec<String>,
+    ages: Vec<f32>,
+}
+
+fn oldest(herd: Herd) -> f32 {
+    borrow ages = herd.ages
+    var best = 0.0
+    for a in ages {
+        best = max(best, a)
+    }
+    best
+}
+
+fn age_all(herd: mut Herd, dt: f32) {
+    mut ages = herd.ages
+    for mut a in ages {
+        a += dt
+    }
+}
+
+pub fn run() -> f32 {
+    var herd = Herd { names: Vec::new(), ages: Vec::new() }
+    herd.names.push(String::from("Ash"))
+    herd.ages.push(3.0)
+    herd.names.push(String::from("Birch"))
+    herd.ages.push(7.0)
+    age_all(mut herd, 0.5)
+    let copy = herd.clone()
+    oldest(herd) + oldest(copy)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

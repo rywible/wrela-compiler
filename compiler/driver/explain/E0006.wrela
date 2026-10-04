@@ -1,0 +1,14 @@
+// A number literal that doesn't fit the type it's used as: `300` as a `u8`, or a float too
+// large for `f32`.
+// ---- wrong
+fn level() -> u8 {
+    300
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+fn level() -> u8 {
+    255
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

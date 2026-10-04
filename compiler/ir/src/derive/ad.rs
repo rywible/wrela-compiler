@@ -31,10 +31,10 @@ pub(super) fn value_and_gradient(
     if func.ret != Some(m.types.f32()) || func.ret_ref {
         return Err(Error::not_derivable("a gradient needs a function that returns an `f32`"));
     }
-    let mut mask = vec![false; func.params.len()];
-    mask[xi] = true;
+    let mut mask = vec![0; func.params.len()];
+    mask[xi] = all_bits(&m.types, x_ty);
     let d = derive(m, cache, f, mask.clone(), n, target)?;
-    let returns = returns_active(m, cache, f, mask, Mode::Ad);
+    let returns = returns_active(m, cache, f, mask, Mode::Ad) != 0;
     let f32 = m.types.f32();
     let tuple = m.types.intern(TypeDef::Struct {
         name: format!("(f32, {})", m.types.display(x_ty)),
@@ -112,7 +112,7 @@ pub(super) fn derive(
     m: &mut Module,
     cache: &mut DeriveCache,
     f: FuncId,
-    mask: Vec<bool>,
+    mask: Vec<Bits>,
     n: u8,
     target: Target,
 ) -> Result<FuncId> {
@@ -121,7 +121,7 @@ pub(super) fn derive(
     }
     let func = m.functions[f.index()].clone();
     no_gpu_work(&func.body)?;
-    let returns = returns_active(m, cache, f, mask.clone(), Mode::Ad);
+    let returns = returns_active(m, cache, f, mask.clone(), Mode::Ad) != 0;
     let act = body_activity(m, cache, f, &mask, Mode::Ad);
     no_write_through_mut(&func, &act, &mask, "a derivative")?;
     let mut nf = func.clone_signature();
@@ -129,7 +129,7 @@ pub(super) fn derive(
     // Tangent parameters, appended: n per active parameter.
     let mut tparam: Vec<Vec<u32>> = vec![Vec::new(); func.params.len()];
     for (i, p) in func.params.iter().enumerate() {
-        if mask[i] {
+        if mask[i] != 0 {
             for k in 0..n {
                 tparam[i].push(nf.params.len() as u32);
                 nf.params.push(Param {
@@ -143,7 +143,7 @@ pub(super) fn derive(
     }
     let mut tlocal: Vec<Vec<LocalId>> = vec![Vec::new(); func.locals.len()];
     for (l, decl) in func.locals.iter().enumerate() {
-        if act.locals[l] {
+        if act.locals[l] != 0 {
             for k in 0..n {
                 tlocal[l].push(nf.new_local(format!("{}_d{k}", decl.name), decl.ty));
             }
@@ -415,7 +415,7 @@ impl Ad<'_> {
             Stmt::Eval(Expr::Call(g, args)) => self.call(None, *g, args, out),
             Stmt::Let(v, e) => {
                 out.push(s.clone());
-                if self.act.values[v.index()] {
+                if self.act.value(*v) {
                     let mut ts = Vec::new();
                     for k in 0..self.n as usize {
                         ts.push(self.tangent(*v, e, k, out)?);
@@ -426,7 +426,7 @@ impl Ad<'_> {
             }
             Stmt::Store(p, v) => {
                 out.push(s.clone());
-                if place_root_active(&self.act, p) && !matches!(p.root, PlaceRoot::Resource(_)) {
+                if self.act.place(self.m, self.f, p) && !matches!(p.root, PlaceRoot::Resource(_)) {
                     let ty = place_type(self.m, self.f, p)?;
                     for k in 0..self.n as usize {
                         let tp = self.place(p, k)?;
@@ -453,16 +453,16 @@ impl Ad<'_> {
     }
 
     fn call(&mut self, v: Option<ValueId>, g: FuncId, args: &[Arg], out: &mut Block) -> Result<()> {
-        let mask: Vec<bool> = args.iter().map(|a| arg_active(&self.act, a)).collect();
-        if !mask.iter().any(|b| *b) {
+        let mask: Vec<Bits> = args.iter().map(|a| arg_bits(self.m, self.f, &self.act, a)).collect();
+        if mask.iter().all(|b| *b == 0) {
             out.push(let_or_eval(v, Expr::Call(g, args.to_vec())));
             return Ok(());
         }
         let dg = derive(self.m, self.cache, g, mask.clone(), self.n, self.target)?;
-        let returns = returns_active(self.m, self.cache, g, mask.clone(), Mode::Ad);
+        let returns = returns_active(self.m, self.cache, g, mask.clone(), Mode::Ad) != 0;
         let mut new_args = args.to_vec();
         for (i, a) in args.iter().enumerate() {
-            if !mask[i] {
+            if mask[i] == 0 {
                 continue;
             }
             for k in 0..self.n as usize {
@@ -517,7 +517,7 @@ impl Ad<'_> {
                 self.tparam[*i as usize].get(k).copied().map(|p| self.emit(out, ty, Expr::Param(p)))
             }
             Expr::Load(p) => {
-                if place_root_active(&self.act, p) && !matches!(p.root, PlaceRoot::Resource(_)) {
+                if self.act.place(self.m, self.f, p) && !matches!(p.root, PlaceRoot::Resource(_)) {
                     let tp = self.place(p, k)?;
                     Some(self.emit(out, ty, Expr::Load(tp)))
                 } else {
@@ -621,7 +621,7 @@ impl Ad<'_> {
             }
             Expr::Call(..) => unreachable!("calls are handled in `call`"),
             Expr::Addr(p) => {
-                if place_root_active(&self.act, p) {
+                if self.act.root(&p.root) || self.act.index_active(p) {
                     let tp = self.place(p, k)?;
                     Some(self.emit(out, ty, Expr::Addr(tp)))
                 } else {
@@ -633,9 +633,24 @@ impl Ad<'_> {
                     "can't differentiate through a run (`[T]`) of values that depend on the input yet: pass the array itself (`[f32; N]`)",
                 ));
             }
+            Expr::Texture(..) => {
+                return Err(Error::not_derivable(
+                    "can't differentiate through a texture read: its texels are data, not code",
+                ));
+            }
+            Expr::Atomic(..) | Expr::Barrier => {
+                return Err(Error::not_derivable(
+                    "can't differentiate through an atomic or a barrier: derived code is pure",
+                ));
+            }
             Expr::Host(..) => {
                 return Err(Error::not_derivable(
                     "can't differentiate GPU work (a buffer, a dispatch or a draw)",
+                ));
+            }
+            Expr::Mem(..) => {
+                return Err(Error::not_derivable(
+                    "can't differentiate code that allocates or reads raw memory",
                 ));
             }
         })
@@ -887,8 +902,34 @@ impl Ad<'_> {
             }
             B::Length => d[0].map(|dx| {
                 if self.m.types.is_vector(a0ty) {
-                    let dot = self.builtin(out, B::Dot, vec![a0, dx], ty);
-                    self.div_from_zero(out, dot, v, ty)
+                    // dot(normalize(x), dx), and 0 where |x| is 0. Written with `normalize` so
+                    // that its interval is tight where x has one nonzero component (a box's
+                    // face): there `x / |x|` is ±1, which dividing intervals can't see. The
+                    // zero vector never reaches `normalize`, which would make a NaN.
+                    let zero = self.fc(out, ty, 0.0);
+                    let b = self.m.types.bool();
+                    let pos = self.emit(out, b, Expr::Binary(BinOp::Gt, v, zero));
+                    let n = match self.m.types.get(a0ty) {
+                        TypeDef::Vector(n) => *n,
+                        _ => 3,
+                    };
+                    let one = self.fc(out, ty, 1.0);
+                    let mut axis = vec![one];
+                    axis.extend((1..n).map(|_| zero));
+                    let axis = self.emit(out, a0ty, Expr::Construct(a0ty, axis));
+                    let safe = self.emit(
+                        out,
+                        a0ty,
+                        Expr::Select { cond: pos, if_true: a0, if_false: axis },
+                    );
+                    let unit = self.builtin(out, B::Normalize, vec![safe], a0ty);
+                    let none = self.emit(out, a0ty, Expr::Zero(a0ty));
+                    let dir = self.emit(
+                        out,
+                        a0ty,
+                        Expr::Select { cond: pos, if_true: unit, if_false: none },
+                    );
+                    self.builtin(out, B::Dot, vec![dir, dx], ty)
                 } else {
                     let s = self.builtin(out, B::Sign, vec![a0], ty);
                     self.scale(out, dx, s, ty)

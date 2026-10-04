@@ -5,6 +5,7 @@ mod call;
 mod expr;
 pub mod infer;
 mod pat;
+mod units;
 mod zonk;
 
 pub use zonk::opaque_cycles;
@@ -18,7 +19,7 @@ use crate::thir::*;
 use crate::ty::*;
 use infer::Infer;
 use std::collections::HashMap;
-use wrela_diag::{Diagnostic, Span, codes};
+use wrela_diag::{Diagnostic, Edit, Span, codes};
 use wrela_syntax::ast;
 
 /// A trait bound to check once the body's types are known.
@@ -108,6 +109,8 @@ pub(crate) struct Checker<'p> {
     /// Built-in calls whose argument types held literal types not settled yet: checked again
     /// once they are.
     builtin_calls: Vec<(crate::builtins::BuiltinFn, Vec<TyId>, Span)>,
+    /// How many `unsafe` blocks enclose the code being checked.
+    pub(crate) unsafe_depth: u32,
     /// Projections in a call's signature on types not inferred yet (`T::Out` while `T` is a
     /// variable), each with the variable that stands for it until it can be normalized.
     projections: Vec<(TyId, TyId, Span)>,
@@ -120,6 +123,11 @@ pub(crate) struct Checker<'p> {
     /// Pattern bindings declared before their types were known, and whether each binds into a
     /// place: their kinds are decided at the end ([`Checker::binding_kinds`]).
     pending_bindings: Vec<(LocalId, bool)>,
+    /// `let x = place`: an error unless `x`'s type turns out `Copy` (E0518). The local, the
+    /// place's span, and the `let` keyword's.
+    pub(crate) owned_lets: Vec<(LocalId, Span, Span)>,
+    /// In a `match mut`'s patterns: bindings into the place project it mutably.
+    pub(crate) binding_mut: bool,
     /// A syntax error's node has been checked. Names that don't resolve after it aren't
     /// reported (the broken code may have declared them), nor is a missing return value.
     pub(crate) saw_syntax_error: bool,
@@ -154,10 +162,13 @@ impl<'p> Checker<'p> {
             negated_ints: Vec::new(),
             pows: Vec::new(),
             builtin_calls: Vec::new(),
+            unsafe_depth: 0,
             projections: Vec::new(),
             int_ops: Vec::new(),
             indexes: Vec::new(),
             pending_bindings: Vec::new(),
+            owned_lets: Vec::new(),
+            binding_mut: false,
             saw_syntax_error: false,
             too_large: false,
         }
@@ -292,6 +303,13 @@ impl<'p> Checker<'p> {
     pub(crate) fn branch_mismatch(&self, d: Diagnostic, a: TyId, b: TyId) -> Diagnostic {
         let callable = |t| crate::mir::is_callable(&self.p.types, self.shallow(t));
         let fn_ptr = |t| matches!(self.kind(t), TyKind::FnPtr(..));
+        // Two structs: one value of either kind is an enum's (a field's structure is its type).
+        let is_struct = |t| matches!(self.kind(t), TyKind::Adt(x, _) if !self.p.adt(*x).is_enum());
+        if is_struct(a) && is_struct(b) {
+            return d
+                .with_note("an `if` gives one type; each struct is its own type (a field's structure is its type, §17)")
+                .with_help("to choose between them at run time, make an enum with a variant for each, and `match` on it where it's used");
+        }
         if !(callable(a) && callable(b)) || (fn_ptr(a) && fn_ptr(b)) {
             return d;
         }
@@ -397,17 +415,105 @@ impl<'p> Checker<'p> {
 
     fn check_stmt(&mut self, s: &ast::Stmt) -> Option<Stmt> {
         let kind = match &s.kind {
-            ast::StmtKind::Let { pat, ty, init } => {
+            ast::StmtKind::Let { pat, ty, init, else_ } => {
                 let (ty, init) = self.check_init(ty.as_ref(), init);
-                let p = self.check_let_pattern(pat, ty, &init);
-                if let PatKind::Bind(id) = p.kind {
-                    let k = Span::new(s.span.file, s.span.start, s.span.start + 3);
-                    self.locals[id.index()].keyword = Some(k);
+                let keyword = Span::new(s.span.file, s.span.start, s.span.start + 3);
+                let Some(else_) = else_ else {
+                    let p = self.check_let_pattern(pat, ty, &init);
+                    if let PatKind::Bind(id) = p.kind {
+                        self.locals[id.index()].keyword = Some(keyword);
+                        // `let` owns its value (§6.3): a place it would share is an error,
+                        // unless its type is `Copy` (decided once its type is known).
+                        if init.is_place() {
+                            self.owned_lets.push((id, init.span, keyword));
+                        }
+                    }
+                    return Some(Stmt {
+                        kind: StmtKind::Bind { pat: p, init, else_: None },
+                        span: s.span,
+                    });
+                };
+                // `let pat = init else { ... }`: the block runs when the pattern doesn't match,
+                // and must leave the scope. The pattern's names are bound after it.
+                let from_place = init.is_place();
+                let env_len = self.env.len();
+                let p = self.check_pat(pat, ty, from_place);
+                self.bound_once(&p);
+                // The `else` block can't see the pattern's names.
+                let bound: Vec<(String, LocalId)> = self
+                    .env
+                    .names()
+                    .skip(env_len)
+                    .map(String::from)
+                    .zip(self.env_ids_after(env_len))
+                    .collect();
+                self.env.truncate(env_len);
+                let eb = self.check_block(else_, None);
+                if !matches!(self.kind(eb.ty), TyKind::Never | TyKind::Error) {
+                    let mut d = Diagnostic::new(
+                        codes::E0330,
+                        else_.span,
+                        "the `else` of a `let … else` must leave the scope",
+                    )
+                    .with_note("it runs when the pattern doesn't match, so the names it binds have no value after it")
+                    .with_help("end it with `return`, `break`, `continue` or a panic");
+                    // `else { 0 }`: the value was meant to be returned.
+                    if let Some(last) = else_.stmts.last()
+                        && let ast::StmtKind::Expr(e) = &last.kind
+                        && !matches!(
+                            e.kind,
+                            ast::ExprKind::Block(_)
+                                | ast::ExprKind::If { .. }
+                                | ast::ExprKind::Match { .. }
+                        )
+                    {
+                        let at = Span::new(e.span.file, e.span.start, e.span.start);
+                        d = d.with_fix("return it", at, "return ");
+                    }
+                    self.err(d);
                 }
-                StmtKind::Bind { pat: p, init }
+                for (name, id) in bound {
+                    self.env.push(&name, id);
+                }
+                StmtKind::Bind { pat: p, init, else_: Some(eb) }
             }
             ast::StmtKind::Var { kind, name, ty, init } => {
-                let (ty, init) = self.check_init(ty.as_ref(), init);
+                // `borrow x = if c { a.p } else { a.q }`: a projection names one place, and an
+                // `if` or a `match` gives a value, which would move out of the place it picks.
+                let chooses = matches!(kind, ast::VarKind::Borrow | ast::VarKind::Mut)
+                    && matches!(init.kind, ast::ExprKind::If { .. } | ast::ExprKind::Match { .. });
+                let (ty, checked) = self.check_init(ty.as_ref(), init);
+                let copy = crate::traits::implements_builtin(
+                    self.p,
+                    self.infer.resolve(&self.p.types, ty),
+                    Lang::Copy,
+                );
+                if chooses && !copy && !self.has_error(ty) {
+                    let kw = if *kind == ast::VarKind::Mut { "mut" } else { "borrow" };
+                    self.err(
+                        Diagnostic::new(
+                            codes::E0502,
+                            init.span,
+                            format!("a `{kw}` binding names one place, and this chooses between places"),
+                        )
+                        .with_note("an `if` or a `match` gives a value, which would move out of the place it picks")
+                        .with_help(format!("choose in a function that returns `-> {kw} T`, whose `if` picks the place it returns, and bind its result: `{kw} x = pick(...)`")),
+                    );
+                    let err = self.p.types.error;
+                    let id = self.declare_local(
+                        &name.name,
+                        err,
+                        LocalKind::Owned { mutable: false },
+                        name.span,
+                    );
+                    let pat = Pat { ty: err, kind: PatKind::Bind(id), span: name.span };
+                    let init = self.error_expr(init.span);
+                    return Some(Stmt {
+                        kind: StmtKind::Bind { pat, init, else_: None },
+                        span: s.span,
+                    });
+                }
+                let init = checked;
                 let lk = match kind {
                     ast::VarKind::Var => LocalKind::Owned { mutable: true },
                     ast::VarKind::Mut => {
@@ -415,29 +521,14 @@ impl<'p> Checker<'p> {
                         self.mark_written(&init);
                         LocalKind::Projection { mutable: true }
                     }
+                    ast::VarKind::Borrow => LocalKind::Projection { mutable: false },
                 };
                 let id = self.declare_local(&name.name, ty, lk, name.span);
-                StmtKind::Bind { pat: Pat { ty, kind: PatKind::Bind(id), span: name.span }, init }
+                let pat = Pat { ty, kind: PatKind::Bind(id), span: name.span };
+                StmtKind::Bind { pat, init, else_: None }
             }
             ast::StmtKind::Assign { target, op, value } => {
-                let place = self.check_expr(target, None);
-                self.check_assign_target(&place);
-                self.mark_written(&place);
-                let bin = op.binop();
-                let value = match bin {
-                    None => self.check_expect(value, place.ty),
-                    Some(b) => {
-                        // As the right operand of `place op value`.
-                        let hint = self.right_hint(b, place.ty);
-                        let v = self.check_expr(value, Some(hint));
-                        let result = self.binary_result(b, place.ty, v.ty, s.span);
-                        if let Some(r) = result {
-                            self.expect(r, place.ty, s.span);
-                        }
-                        v
-                    }
-                };
-                StmtKind::Assign { place, op: bin, value }
+                return Some(self.check_assign(target, *op, value, s.span));
             }
             ast::StmtKind::Expr(e) => {
                 let ex = self.check_expr(e, None);
@@ -456,6 +547,50 @@ impl<'p> Checker<'p> {
             }
         };
         Some(Stmt { kind, span: s.span })
+    }
+
+    /// `target op value`, a statement (or a match arm's body).
+    pub(crate) fn check_assign(
+        &mut self,
+        target: &ast::Expr,
+        op: ast::AssignOp,
+        value: &ast::Expr,
+        span: Span,
+    ) -> Stmt {
+        let place = self.check_expr(target, None);
+        self.check_assign_target(&place);
+        self.mark_written(&place);
+        let bin = op.binop();
+        let value = match bin {
+            None => self.check_expect(value, place.ty),
+            Some(b) => {
+                // As the right operand of `place op value`.
+                let hint = self.right_hint(b, place.ty);
+                let v = self.check_expr(value, Some(hint));
+                let result = self.binary_result(b, place.ty, v.ty, span);
+                if let Some(r) = result {
+                    self.expect(r, place.ty, span);
+                }
+                v
+            }
+        };
+        Stmt { kind: StmtKind::Assign { place, op: bin, value }, span }
+    }
+
+    /// The locals the environment has bound after its first `len` names, in order.
+    fn env_ids_after(&self, len: usize) -> Vec<LocalId> {
+        let names: Vec<&str> = self.env.names().skip(len).collect();
+        // Each name's innermost binding is the one declared last: walk them in reverse.
+        let mut seen: HashMap<&str, usize> = HashMap::new();
+        let mut out = Vec::new();
+        for n in names.iter().rev() {
+            let depth = seen.entry(n).or_insert(0);
+            let ids = &self.env.by_name[*n];
+            out.push(ids[ids.len() - 1 - *depth]);
+            *depth += 1;
+        }
+        out.reverse();
+        out
     }
 
     /// An assignment writes a place: a local, a field, component or element of one, or what a
@@ -549,6 +684,51 @@ impl<'p> Checker<'p> {
         self.err(d);
     }
 
+    /// `xs.iter()`, `xs.iter_mut()` or `xs.into_iter()` as a `for` loop's sequence, where `xs`
+    /// is one a loop goes over itself: E0207, fixed by looping over `xs` (`for mut x` for
+    /// `iter_mut`). Returns `xs` checked, and whether its elements change.
+    fn rust_iteration(
+        &mut self,
+        e: &ast::Expr,
+        pat: &ast::Pat,
+        mutable: bool,
+    ) -> Option<(Expr, bool)> {
+        let ast::ExprKind::MethodCall { receiver, name, args, generics: None, .. } = &e.kind else {
+            return None;
+        };
+        if !args.is_empty() || !matches!(name.name.as_str(), "iter" | "iter_mut" | "into_iter") {
+            return None;
+        }
+        let arr = self.check_expr(receiver, None);
+        let rt = self.infer.resolve(&self.p.types, arr.ty);
+        let sequence =
+            matches!(self.kind(rt), TyKind::Array(..) | TyKind::ArrayN(..) | TyKind::Slice(_))
+                || self.walked_elem(rt).is_some();
+        if !sequence {
+            // Reported as an unknown method, with the note on iterators.
+            let _ = self.check_expr(e, None);
+            return None;
+        }
+        let changes = name.name == "iter_mut";
+        let call = Span::new(receiver.span.file, receiver.span.end, e.span.end);
+        let mut edits = vec![Edit { span: call, replacement: String::new() }];
+        let fix = if changes && !mutable {
+            edits.push(Edit {
+                span: Span::new(pat.span.file, pat.span.start, pat.span.start),
+                replacement: "mut ".into(),
+            });
+            "loop over it with `for mut`"
+        } else {
+            "loop over it"
+        };
+        self.err(
+            Diagnostic::new(codes::E0207, name.span, format!("`.{}()` isn't needed: wrela has no iterators", name.name))
+                .with_note("a `for` loop goes over a range, an array, a run, a `Vec` or an arena itself; `for mut x in xs` changes each element")
+                .with_fix_edits(fix, edits),
+        );
+        Some((arr, changes))
+    }
+
     fn check_for(
         &mut self,
         mutable: bool,
@@ -598,10 +778,19 @@ impl<'p> Checker<'p> {
                 StmtKind::ForRange { var, start: s, end: e, inclusive: *inclusive, body: b }
             }
             ast::ForIter::Expr(e) => {
-                let arr = self.check_expr(e, None);
+                // `for x in xs.iter()` (or `.iter_mut()`), as in Rust: the loop goes over `xs`.
+                let mut mutable = mutable;
+                let arr = match self.rust_iteration(e, pat, mutable) {
+                    Some((arr, m)) => {
+                        mutable |= m;
+                        arr
+                    }
+                    None => self.check_expr(e, None),
+                };
                 let elem = match self.kind(arr.ty) {
-                    TyKind::Array(t, _) | TyKind::Slice(t) => *t,
+                    TyKind::Array(t, _) | TyKind::ArrayN(t, _) | TyKind::Slice(t) => *t,
                     TyKind::Error => self.p.types.error,
+                    _ if let Some(t) = self.walked_elem(arr.ty) => t,
                     _ => {
                         let shown = self.display(arr.ty);
                         self.err(
@@ -610,7 +799,7 @@ impl<'p> Checker<'p> {
                                 arr.span,
                                 format!("`for` loops over a range or an array, not `{shown}`"),
                             )
-                            .with_note("iterators are tier 1"),
+                            .with_note("a `for` loop goes over a range, an array, a run, a `Vec` or an arena: wrela has no iterators"),
                         );
                         self.p.types.error
                     }
@@ -632,6 +821,68 @@ impl<'p> Checker<'p> {
         };
         self.env.truncate(env_len);
         Some(Stmt { kind, span })
+    }
+
+    /// Whether field `f` of a type declared in module `adt_mod` is hidden from this code: it
+    /// isn't `pub` and this is another module, or it's `pub(package)` and this is another
+    /// package (§3).
+    pub(crate) fn field_hidden(&self, adt_mod: ModuleId, f: &crate::defs::FieldDef) -> bool {
+        (!f.public && adt_mod != self.scope.module)
+            || (f.package_only && !self.p.same_package(adt_mod, self.scope.module))
+    }
+
+    /// Whether a value of type `t` passes as a `str`: a `str`, a `Text` or a `String`.
+    pub(crate) fn is_stringy(&self, t: TyId) -> bool {
+        let t = self.infer.resolve(&self.p.types, t);
+        match self.p.types.kind(t) {
+            TyKind::Str => true,
+            TyKind::Adt(a, _) => {
+                let l = self.p.adt(*a).lang;
+                l == Some(Lang::Text) || l == Some(Lang::String)
+            }
+            _ => false,
+        }
+    }
+
+    /// The element type of a `Vec<T>`: `T`.
+    pub(crate) fn vec_elem(&self, t: TyId) -> Option<TyId> {
+        let t = self.infer.resolve(&self.p.types, t);
+        match self.p.types.kind(t) {
+            TyKind::Adt(a, args) if self.p.adt(*a).lang == Some(Lang::Vec) => args.first().copied(),
+            _ => None,
+        }
+    }
+
+    /// Whether a value of type `from` passes as the run `to`: an array, a `Vec` or a string
+    /// as a run (a run result, a run field).
+    pub(crate) fn run_coerces(&mut self, from: TyId, to: TyId) -> bool {
+        match *self.kind(to) {
+            TyKind::Str => self.is_stringy(from),
+            TyKind::Slice(e) => match *self.kind(from) {
+                TyKind::Array(a, _) | TyKind::ArrayN(a, _) => self.try_unify(a, e),
+                // `Bytes` passes as a `[u8]`.
+                TyKind::Adt(a, _) if self.p.adt(a).lang == Some(Lang::Bytes) => {
+                    let u8 = self.p.types.int(IntTy::U8);
+                    self.try_unify(u8, e)
+                }
+                _ => self.vec_elem(from).is_some_and(|a| self.try_unify(a, e)),
+            },
+            _ => false,
+        }
+    }
+
+    /// The element type of what a `for` loop walks besides arrays and runs: a `Vec<T>`'s or an
+    /// `Arena<T>`'s (§6.6).
+    pub(crate) fn walked_elem(&self, t: TyId) -> Option<TyId> {
+        let t = self.infer.resolve(&self.p.types, t);
+        match self.p.types.kind(t) {
+            TyKind::Adt(a, args)
+                if matches!(self.p.adt(*a).lang, Some(Lang::Vec | Lang::Arena)) =>
+            {
+                args.first().copied()
+            }
+            _ => None,
+        }
     }
 
     /// Notes that an assignment or `mut` use writes through `place`'s root local.
@@ -660,8 +911,8 @@ impl<'p> Checker<'p> {
             }
             if matches!(e.kind, ExprKind::Field(..)) && self.is_global_id(b.ty) {
                 self.err(
-                    Diagnostic::new(codes::E0601, e.span, "a `GlobalId` can't be changed")
-                        .with_note("a `Slots` is indexed by the invocation's own `GlobalId`, so each invocation writes only its own slot (§6.13)")
+                    Diagnostic::new(codes::E0601, e.span, format!("a `{}` can't be changed", self.display(b.ty)))
+                        .with_note("a `Slots` is indexed by the invocation's own `GlobalId`, and workgroup memory's chunks by its `LocalId`, so each invocation writes only its own (§6.13)")
                         .with_help("compute an index of your own from its fields: `let i = id.x + 1`"),
                 );
                 break;
@@ -670,9 +921,11 @@ impl<'p> Checker<'p> {
         }
     }
 
-    /// Whether `t` is `std::gpu::GlobalId`.
+    /// Whether `t` is `std::gpu::GlobalId` or `LocalId`: the invocation's own, which `Slots`
+    /// and workgroup memory's chunks are indexed by, so code can't build or change one.
     pub(crate) fn is_global_id(&self, t: TyId) -> bool {
-        matches!(self.kind(t), &TyKind::Adt(a, _) if self.p.is_lang_adt(a, Lang::GlobalId))
+        matches!(self.kind(t), &TyKind::Adt(a, _)
+            if self.p.is_lang_adt(a, Lang::GlobalId) || self.p.is_lang_adt(a, Lang::LocalId))
     }
 
     pub(crate) fn resolve_type(&mut self, t: &ast::TypeExpr) -> TyId {
@@ -681,7 +934,7 @@ impl<'p> Checker<'p> {
             &mut self.diags,
             &self.scope,
             t,
-            crate::resolve::TyPos::Normal,
+            crate::resolve::TyPos::Local,
         );
         adt_bounds(self.p, ty, t.span, &mut self.diags);
         ty
@@ -703,7 +956,8 @@ impl<'p> Checker<'p> {
         self.obligations.push(Obligation { ty, trait_ref, span, code, why });
     }
 
-    /// A parameter's or field's default where it's declared: a literal value of its type.
+    /// A parameter's or field's default where it's declared. Any other than a literal value
+    /// is a constant by now (`collect`), unless its type is generic.
     fn check_literal_default(&mut self, d: &ast::Expr, ty: TyId, owner: &str) {
         let e = self.check_expect(d, ty);
         if let Some(bad) = zonk::non_literal(&e) {
@@ -711,9 +965,9 @@ impl<'p> Checker<'p> {
                 Diagnostic::new(
                     codes::E0324,
                     bad.span,
-                    format!("a {owner}'s default must be a literal value"),
+                    format!("a {owner}'s default of a generic type must be a literal value"),
                 )
-                .with_note("evaluating calls and arithmetic at compile time is tier 1 (D-073)"),
+                .with_note("a constant expression has one type, which a generic type isn't (§10)"),
             );
         }
     }
@@ -732,8 +986,17 @@ impl<'p> Checker<'p> {
         id
     }
 
-    pub(crate) fn declare_closure_param(&mut self, name: &ast::Ident, ty: TyId) -> LocalId {
-        self.declare_local(&name.name, ty, LocalKind::ClosureParam, name.span)
+    pub(crate) fn declare_closure_param(
+        &mut self,
+        name: &ast::Ident,
+        ty: TyId,
+        mode: Mode,
+    ) -> LocalId {
+        let kind = match mode {
+            Mode::Borrow => LocalKind::ClosureParam,
+            m => LocalKind::Param(m),
+        };
+        self.declare_local(&name.name, ty, kind, name.span)
     }
 
     pub(crate) fn end_closure(
@@ -747,6 +1010,12 @@ impl<'p> Checker<'p> {
             unreachable!("end_closure without begin_closure")
         };
         let id = frame.id;
+        let sig: Vec<TyId> = params
+            .iter()
+            .map(|p| self.infer.resolve(&self.p.types, self.locals[p.index()].ty))
+            .collect();
+        let r = self.infer.resolve(&self.p.types, ret);
+        self.p.closure_sigs.borrow_mut().insert(ClosureRef { owner: self.fn_id, id }, (sig, r));
         self.closures[id.0 as usize] =
             Some(ClosureDef { params, ret, body, captures: frame.captures, span });
         id
@@ -792,7 +1061,10 @@ fn has_break(b: &Block) -> bool {
         found
     }
     b.stmts.iter().any(|s| match &s.kind {
-        StmtKind::Expr(e) | StmtKind::Bind { init: e, .. } => in_expr(e),
+        StmtKind::Expr(e) => in_expr(e),
+        StmtKind::Bind { init, else_, .. } => {
+            in_expr(init) || else_.as_ref().is_some_and(has_break)
+        }
         StmtKind::Assign { place, value, .. } => in_expr(place) || in_expr(value),
         // A nested loop's `break`s end it (a `while` condition is part of the loop); a `for`
         // loop's range or array is evaluated before it starts.
@@ -849,14 +1121,14 @@ pub(crate) fn adt_bounds(p: &Program, ty: TyId, span: Span, out: &mut Vec<Diagno
                     continue;
                 }
                 let (t, tr) = (p.display_ty(arg), p.display_trait_ref(&r));
-                out.push(Diagnostic::new(
-                    codes::E0400,
-                    span,
-                    format!(
-                        "`{t}` doesn't implement `{tr}`, which `{}` in `{}` needs",
-                        param.name, adt.name
-                    ),
-                ));
+                let default = format!(
+                    "`{t}` doesn't implement `{tr}`, which `{}` in `{}` needs",
+                    param.name, adt.name
+                );
+                out.push(match p.custom_message(arg, &r) {
+                    Some(msg) => Diagnostic::new(codes::E0400, span, msg).with_note(default),
+                    None => Diagnostic::new(codes::E0400, span, default),
+                });
             }
         }
     }
@@ -879,11 +1151,98 @@ pub fn check_declared_types(p: &Program) -> Vec<Diagnostic> {
     for imp in &p.impls {
         adt_bounds(p, imp.self_ty, imp.span, &mut out);
     }
+    out.extend(check_borrow_structs(p));
+    out
+}
+
+/// Borrow structs (§6.6) hold projections, runs, `Copy` values and other borrow structs, and
+/// are projections themselves: never a field of an ordinary type, nor a type argument.
+fn check_borrow_structs(p: &Program) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    let holds_borrow =
+        |t: TyId| p.types.any(t, &mut |k| matches!(k, TyKind::Adt(a, _) if p.adt(*a).borrow));
+    for adt in &p.adts {
+        for f in adt.all_fields() {
+            if adt.borrow {
+                let ok = f.mode != RetMode::Owned
+                    || matches!(p.types.kind(f.ty), TyKind::Slice(_) | TyKind::Str | TyKind::Error)
+                    || p.is_borrow_struct(f.ty)
+                    || crate::traits::implements_builtin(p, f.ty, Lang::Copy);
+                if !ok {
+                    out.push(
+                        Diagnostic::new(
+                            codes::E0519,
+                            f.span,
+                            format!(
+                                "a borrow struct's field `{}` holds a `{}`, which isn't `Copy`",
+                                f.name,
+                                p.display_ty(f.ty)
+                            ),
+                        )
+                        .with_note("a borrow struct's fields are projections, runs, `Copy` values and other borrow structs (§6.6)")
+                        .with_help(format!("make it a projection: `{}: borrow {}`", f.name, p.display_ty(f.ty))),
+                    );
+                }
+            } else if holds_borrow(f.ty) {
+                out.push(
+                    Diagnostic::new(
+                        codes::E0327,
+                        f.span,
+                        format!("`{}` is a borrow struct, a projection, so it can't be a field of an ordinary type", p.display_ty(f.ty)),
+                    )
+                    .with_note("a borrow struct lives only as long as the places it borrows (§6.6)"),
+                );
+            }
+        }
+        if adt.borrow && !adt.opt_in.is_empty() {
+            out.push(
+                Diagnostic::new(
+                    codes::E0519,
+                    adt.opt_in[0].1,
+                    format!(
+                        "the borrow struct `{}` can't declare traits: it's a projection",
+                        adt.name
+                    ),
+                )
+                .with_help("pass it down; to copy what it holds, copy its fields"),
+            );
+        }
+    }
+    // As a type argument: `Vec<Ctx>`, `Option<Ctx>`.
+    let mut seen = std::collections::HashSet::new();
+    let mut check_ty = |t: TyId, span: Span, out: &mut Vec<Diagnostic>| {
+        p.types.any(t, &mut |k| {
+            if let TyKind::Adt(_, args) = k
+                && args.iter().any(|&a| holds_borrow(a))
+                && seen.insert(span)
+            {
+                out.push(
+                    Diagnostic::new(
+                        codes::E0327,
+                        span,
+                        "a borrow struct can't be a type argument: it's a projection",
+                    )
+                    .with_note("a projection lives only as long as the places it borrows (§6.6)"),
+                );
+            }
+            false
+        });
+    };
+    for f in &p.fns {
+        for ps in &f.params {
+            check_ty(ps.ty, ps.span, &mut out);
+        }
+        check_ty(f.ret, f.sig_span, &mut out);
+    }
     out
 }
 
 pub fn check_fn(p: &Program, consts: &ConstTypes, f: FnId) -> FnCheck {
     let def = p.func(f);
+    if def.derived.is_some() {
+        let (body, diags) = crate::fieldwise::derive(p, f);
+        return FnCheck { body, diags, incomplete: false };
+    }
     let none = FnCheck { body: None, diags: Vec::new(), incomplete: false };
     let Some(body) = &def.body else { return none };
     if def.attrs.intrinsic {
@@ -931,7 +1290,7 @@ pub fn check_fn(p: &Program, consts: &ConstTypes, f: FnId) -> FnCheck {
                 .with_secondary(at, "the body ends here")
                 .with_help("end the body with an expression of that type, or `return` one"),
             );
-        } else {
+        } else if !c.run_coerces(block.ty, ret) {
             c.expect(block.ty, ret, block.tail.as_ref().map_or(block.span, |t| t.span));
         }
     }
@@ -960,10 +1319,19 @@ pub fn check_field_defaults(p: &Program, consts: &ConstTypes, a: AdtId) -> Vec<D
 /// The types of the program's constants, by id.
 pub type ConstTypes = HashMap<ConstId, TyId>;
 
+/// The program's checked constants.
+pub struct CheckedConsts {
+    pub tys: ConstTypes,
+    pub values: Consts,
+    /// The typed body of each constant the build computes: one whose value isn't literal
+    /// (`crate::mir::build::is_literal`'s parts, other constants aside).
+    pub bodies: Vec<(ConstId, Body)>,
+}
+
 /// Checks every `const` item, each after the constants its value names, so an unannotated
 /// constant's type is known wherever it's used. A constant whose value refers back to itself,
 /// directly or through others, is an error (E0328), and so is a constant naming one.
-pub fn check_consts(p: &Program, diags: &mut Vec<Diagnostic>) -> (ConstTypes, Consts) {
+pub fn check_consts(p: &Program, diags: &mut Vec<Diagnostic>) -> CheckedConsts {
     let n = p.consts.len();
     let deps: Vec<Vec<ConstId>> = (0..n).map(|i| const_deps(p, ConstId(i as u32))).collect();
     // Depth-first, so each constant comes after its dependencies; a back edge is a cycle.
@@ -989,19 +1357,24 @@ pub fn check_consts(p: &Program, diags: &mut Vec<Diagnostic>) -> (ConstTypes, Co
         },
     );
     let mut tys = ConstTypes::new();
-    let mut out = Consts::new();
+    let mut values = Consts::new();
+    let mut bodies = Vec::new();
     for c in order {
         let id = ConstId(c as u32);
         if bad[c] {
             tys.insert(id, p.types.error);
             continue;
         }
-        let ((ty, value), d) = check_const(p, &tys, id);
+        let (ty, body, d) = check_const(p, &tys, id);
+        let ok = !wrela_diag::has_errors(&d);
         diags.extend(d);
         tys.insert(id, ty);
-        out.insert(id, (ty, value));
+        values.insert(id, (ty, body.value.clone()));
+        if ok && zonk::non_literal(&body.value).is_some() {
+            bodies.push((id, body));
+        }
     }
-    (tys, out)
+    CheckedConsts { tys, values, bodies }
 }
 
 /// The constants a constant's value names, resolved where it's defined.
@@ -1038,49 +1411,17 @@ fn report_const_cycle(p: &Program, cycle: &[usize], diags: &mut Vec<Diagnostic>)
     diags.push(d.with_help("give one of them a literal value"));
 }
 
-/// Checks a `const` item's value: tier 0 allows literal values only (D-073).
-fn check_const(p: &Program, consts: &ConstTypes, id: ConstId) -> ((TyId, Expr), Vec<Diagnostic>) {
+/// Checks a `const` item's value: any expression, checked as the body of the function that
+/// computes it (§10), which a `return` in it returns from.
+fn check_const(p: &Program, consts: &ConstTypes, id: ConstId) -> (TyId, Body, Vec<Diagnostic>) {
     let def = p.const_(id);
     let scope = Scope::new(def.module);
-    let mut c = Checker::new(p, consts, scope, None);
-    if let Some(bad) = non_constant(&def.value) {
-        c.err(
-            Diagnostic::new(codes::E0906, bad.span, "a constant's value must be a literal value in tier 0")
-                .with_note("literals, struct and array literals, vector constructors and other constants are allowed; evaluating calls and arithmetic at compile time is tier 1 (D-073)"),
-        );
-    }
+    let mut c = Checker::new(p, consts, scope, Some(def.eval));
+    c.ret_ty = def.ty.unwrap_or_else(|| c.new_var(VarKind::General, def.span));
+    let ret = c.ret_ty;
     let e = c.check_expr(&def.value, def.ty);
-    if let Some(t) = def.ty {
-        c.expect(e.ty, t, e.span);
+    if !matches!(c.kind(e.ty), TyKind::Never) {
+        c.expect(e.ty, ret, e.span);
     }
-    zonk::finish_const(c, e)
-}
-
-/// The first part of `e` that isn't a literal value (D-073's tier-0 constants), if any.
-pub fn non_constant(e: &ast::Expr) -> Option<&ast::Expr> {
-    match &e.kind {
-        ast::ExprKind::Lit(_) | ast::ExprKind::Path(_) => None,
-        ast::ExprKind::Unary(ast::UnOp::Neg, inner)
-            if matches!(inner.kind, ast::ExprKind::Lit(_)) =>
-        {
-            None
-        }
-        ast::ExprKind::Paren(inner) => non_constant(inner),
-        ast::ExprKind::Tuple(xs) | ast::ExprKind::Array(xs) => xs.iter().find_map(non_constant),
-        ast::ExprKind::ArrayRepeat { value, count } => {
-            non_constant(value).or_else(|| non_constant(count))
-        }
-        ast::ExprKind::StructLit { fields, base, .. } => fields
-            .iter()
-            .filter_map(|f| f.value.as_ref())
-            .find_map(non_constant)
-            .or_else(|| base.as_deref().and_then(non_constant)),
-        // A constructor: a built-in vector type, or an enum's tuple variant.
-        ast::ExprKind::Call { callee, args, .. }
-            if matches!(callee.kind, ast::ExprKind::Path(_)) =>
-        {
-            args.iter().find_map(|a| non_constant(&a.value))
-        }
-        _ => Some(e),
-    }
+    zonk::finish_const(c, e, ret)
 }

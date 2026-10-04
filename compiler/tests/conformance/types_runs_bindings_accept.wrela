@@ -1,0 +1,31 @@
+// accepts: ty.runs
+// A run is a parameter, a function's result, or a local binding (§4, §6.6).
+fn total(xs: [u32]) -> u32 {
+    var s = 0
+    for x in xs {
+        s += x
+    }
+    s
+}
+
+fn evens(xs: [u32]) -> [u32] {
+    xs
+}
+
+fn sum_keys(m: SortedMap<u32, u32>) -> u32 {
+    borrow ks = m.keys()
+    total(ks) + ks.len() + ks[0]
+}
+
+fn bump(m: mut SortedMap<u32, u32>) {
+    mut vs = m.values_mut()
+    for mut v in vs {
+        v += 1
+    }
+    vs[0] = 7
+}
+
+fn f(a: [u32; 4]) -> u32 {
+    borrow r = evens(a)
+    total(r)
+}

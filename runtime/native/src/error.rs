@@ -92,6 +92,7 @@ impl Error {
         Error::Io { path: path.into(), source }
     }
 
+    #[cfg_attr(not(feature = "gpu"), expect(dead_code, reason = "the GPU's executor makes these"))]
     pub(crate) fn command(opcode: Opcode, why: impl Into<String>) -> Error {
         Error::Command(CommandError { opcode, why: why.into() })
     }

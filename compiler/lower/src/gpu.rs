@@ -6,8 +6,11 @@ use crate::body::{Fl, Repr};
 use crate::instance::InstanceKey;
 use crate::{Cx, ModuleBuilder};
 use std::rc::Rc;
+use wrela_abi::manifest::{BindingKind, ResourceBinding};
+use wrela_abi::stream::Opcode;
 use wrela_diag::{Diagnostic, Span, codes};
 use wrela_ir as ir;
+use wrela_ir::uniformity::{Collective, NonUniform};
 use wrela_sema::defs::{Entry, Lang, Mode};
 use wrela_sema::gpu::BuiltinInput;
 use wrela_sema::mir;
@@ -52,8 +55,14 @@ pub struct PipelineOut {
     pub module: ir::Module,
     pub kind: PipelineKind,
     pub uniform: Option<UniformOut>,
-    /// (binding, read-write) for each buffer, in the order commands list their handles.
-    pub buffers: Vec<(u32, bool)>,
+    /// Each buffer, texture and sampler binding, in the order commands list them.
+    pub bindings: Vec<ResourceBinding>,
+    /// Which instantiation of its entry points it is.
+    pub key: PipelineKey,
+    /// Where CPU code dispatches or draws it, first seen first (the pipeline-count query, §7).
+    pub sites: Vec<Span>,
+    /// A debug build's: the binding of the flag its bounds checks set (`ir::bounds`).
+    pub debug_flag: Option<u32>,
 }
 
 /// What a GPU module is for, while it's lowered.
@@ -102,14 +111,46 @@ impl GpuCx {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum ParamClass {
     Builtin(ir::BuiltinInput),
-    /// A `[T]` (read) or `Slots<T>` (read-write) parameter, bound to a buffer of `T`.
+    /// A `[T]` (read) or `Slots<T>` (read-write) parameter, bound to a buffer of `T`; or an
+    /// `Atomics<T>` or `AtomicMap` (`atomic`), bound to a buffer of `atomic<T>`.
     Buffer {
         elem: TyId,
         read_write: bool,
+        atomic: bool,
+    },
+    /// An `Append<T>`: bound to two buffers, the items and the count (an atomic).
+    Append {
+        elem: TyId,
+    },
+    /// A `Shared<T, N>`: workgroup memory, not bound.
+    Workgroup {
+        elem: TyId,
+        len: u32,
+    },
+    /// A `Texture` or a `DepthTexture`, bound by its handle.
+    Texture {
+        depth: bool,
+    },
+    /// A `Sampler` or a `ComparisonSampler`, bound by its handle.
+    Sampler {
+        comparison: bool,
     },
     /// The vertex shader's output, read by the fragment shader.
     Varyings,
     Uniform,
+}
+
+impl ParamClass {
+    /// Whether it's bound to a resource: a buffer, a texture or a sampler.
+    pub fn is_bound(&self) -> bool {
+        matches!(
+            self,
+            ParamClass::Buffer { .. }
+                | ParamClass::Append { .. }
+                | ParamClass::Texture { .. }
+                | ParamClass::Sampler { .. }
+        )
+    }
 }
 
 /// How parameter `param` of `f`, of type `ty`, is supplied. `varyings` is the vertex output a
@@ -132,14 +173,37 @@ fn classify(cx: &Cx, f: FnId, param: usize, ty: TyId, varyings: Option<TyId>) ->
             BuiltinInput::FragCoord => ir::BuiltinInput::Position,
         });
     }
+    match p.lang_of_ty(ty) {
+        Some(Lang::Texture) => return ParamClass::Texture { depth: false },
+        Some(Lang::DepthTexture) => return ParamClass::Texture { depth: true },
+        Some(Lang::Sampler) => return ParamClass::Sampler { comparison: false },
+        Some(Lang::ComparisonSampler) => return ParamClass::Sampler { comparison: true },
+        _ => {}
+    }
     match p.types.kind(ty) {
         TyKind::Adt(_, args) if p.lang_of_ty(ty) == Some(Lang::Slots) => {
-            ParamClass::Buffer { elem: args[0], read_write: true }
+            ParamClass::Buffer { elem: args[0], read_write: true, atomic: false }
+        }
+        TyKind::Adt(_, args) if p.lang_of_ty(ty) == Some(Lang::Atomics) => {
+            ParamClass::Buffer { elem: args[0], read_write: true, atomic: true }
+        }
+        TyKind::Adt(..) if p.lang_of_ty(ty) == Some(Lang::AtomicMap) => {
+            ParamClass::Buffer { elem: p.types.u32, read_write: true, atomic: true }
+        }
+        TyKind::Adt(_, args) if p.lang_of_ty(ty) == Some(Lang::Append) => {
+            ParamClass::Append { elem: args[0] }
+        }
+        TyKind::Adt(_, args) if p.lang_of_ty(ty) == Some(Lang::Shared) => {
+            let len = match p.types.kind(args[1]) {
+                TyKind::ConstU32(n) => *n,
+                _ => 0,
+            };
+            ParamClass::Workgroup { elem: args[0], len }
         }
         TyKind::Adt(..) if Some(ty) == varyings => ParamClass::Varyings,
         TyKind::Slice(e) => {
             let mode = p.func(f).params[param].mode;
-            ParamClass::Buffer { elem: *e, read_write: mode == Mode::Mut }
+            ParamClass::Buffer { elem: *e, read_write: mode == Mode::Mut, atomic: false }
         }
         _ => ParamClass::Uniform,
     }
@@ -163,11 +227,13 @@ pub(crate) struct EntryParams {
 pub(crate) struct Interface {
     /// The entry points: a kernel, or a vertex shader then a fragment shader.
     pub entries: Vec<EntryParams>,
-    /// The buffer parameters in binding order, as (entry point, parameter) indices.
-    pub buffers: Vec<(usize, usize)>,
-    /// The uniform block's fields: each uniform parameter's name and type. Entry points share
-    /// a uniform by name.
-    pub uniforms: Vec<(String, TyId)>,
+    /// The parameters bound to resources (buffers, textures, samplers) in binding order, as
+    /// (entry point, parameter) indices. Each shader's parameters are its own (§12).
+    pub bound: Vec<(usize, usize)>,
+    /// The uniform block's fields: each uniform parameter, as (entry point, parameter), with its
+    /// field's name (the parameter's, or the entry point's and the parameter's when both
+    /// shaders have one of that name) and type.
+    pub uniforms: Vec<(usize, usize, String, TyId)>,
     /// A render pipeline's vertex output: what the fragment shader's varyings are.
     pub vertex_ret: Option<TyId>,
 }
@@ -188,18 +254,29 @@ impl Interface {
             for (i, t) in param_types(cx, func, substs).into_iter().enumerate() {
                 let class = classify(cx, func, i, t, varyings);
                 match class {
-                    ParamClass::Buffer { .. } => iface.buffers.push((e, i)),
+                    ParamClass::Buffer { .. }
+                    | ParamClass::Append { .. }
+                    | ParamClass::Texture { .. }
+                    | ParamClass::Sampler { .. } => iface.bound.push((e, i)),
                     ParamClass::Uniform => {
-                        let name = &cx.checked.program.func(func).params[i].name;
-                        if !iface.uniforms.iter().any(|(n, _)| n == name) {
-                            iface.uniforms.push((name.clone(), t));
-                        }
+                        let name = cx.checked.program.func(func).params[i].name.clone();
+                        iface.uniforms.push((e, i, name, t));
                     }
-                    ParamClass::Builtin(_) | ParamClass::Varyings => {}
+                    ParamClass::Builtin(_)
+                    | ParamClass::Varyings
+                    | ParamClass::Workgroup { .. } => {}
                 }
                 params.push((t, class));
             }
             iface.entries.push(EntryParams { func, substs: substs.to_vec(), params });
+        }
+        // A field name both shaders have is told apart by the shader's.
+        let program = &cx.checked.program;
+        let names: Vec<String> = iface.uniforms.iter().map(|u| u.2.clone()).collect();
+        for u in &mut iface.uniforms {
+            if names.iter().filter(|n| **n == u.2).count() > 1 {
+                u.2 = format!("{}_{}", ir::ident(&program.func(iface.entries[u.0].func).name), u.2);
+            }
         }
         iface
     }
@@ -222,7 +299,64 @@ fn interface(cx: &mut Cx, key: &PipelineKey) -> Interface {
 /// Whether a parameter type is bound to a resource on the GPU (rather than passed).
 pub(crate) fn is_resource_param(fl: &Fl, t: TyId) -> bool {
     let p = &fl.cx.checked.program;
-    matches!(p.types.kind(t), TyKind::Slice(_)) || p.lang_of_ty(t) == Some(Lang::Slots)
+    matches!(p.types.kind(t), TyKind::Slice(_))
+        || p.lang_of_ty(t).is_some_and(|l| l.is_invocation_safe() || l.is_texture_or_sampler())
+}
+
+/// The bindings of a buffer-like argument for a parameter of type `pt`: a `GpuBuffer` or span
+/// for `[T]`, `Slots<T>` and `Atomics<T>`; an `AppendBuffer<T>`'s items and count for an
+/// `Append<T>`; an `AtomicMapBuffer`'s entries for an `AtomicMap`.
+fn resource_bindings(
+    fl: &mut Fl,
+    pt: TyId,
+    arg: &mir::Place,
+    span: Span,
+) -> Option<Vec<ir::ValueId>> {
+    let p = &fl.cx.checked.program;
+    let u32_ty = p.types.u32;
+    let field = |k: u32| {
+        let mut f = arg.clone();
+        f.proj.push(mir::Proj::Field(k));
+        f
+    };
+    Some(match (p.lang_of_ty(pt), p.types.kind(pt)) {
+        (Some(Lang::Append), TyKind::Adt(_, args)) => {
+            let elem = args[0];
+            let mut b = buffer_binding(fl, &field(0), elem, span)?.to_vec();
+            b.extend(buffer_binding(fl, &field(1), u32_ty, span)?);
+            b
+        }
+        (Some(Lang::AtomicMap), _) => buffer_binding(fl, &field(0), u32_ty, span)?.to_vec(),
+        (_, TyKind::Slice(e)) => buffer_binding(fl, arg, *e, span)?.to_vec(),
+        (_, TyKind::Adt(_, args)) => buffer_binding(fl, arg, args[0], span)?.to_vec(),
+        _ => return None,
+    })
+}
+
+/// The binding of a texture or sampler argument: its handle, and no range.
+fn handle_binding(fl: &mut Fl, arg: &mir::Place) -> Option<[ir::ValueId; 3]> {
+    let u = fl.mb.m.types.u32();
+    let v = fl.read(arg)?;
+    let handle = fl.value(u, ir::Expr::Extract(v, 0));
+    let zero = fl.u32c(0);
+    Some([handle, zero, zero])
+}
+
+/// The bindings of argument `arg` for an entry point's parameter of type `pt` that `class`
+/// binds to a resource: a buffer's, or a texture's or sampler's.
+fn bindings_for(
+    fl: &mut Fl,
+    pt: TyId,
+    class: &ParamClass,
+    arg: &mir::Place,
+    span: Span,
+) -> Option<Vec<ir::ValueId>> {
+    match class {
+        ParamClass::Buffer { .. } | ParamClass::Append { .. } => {
+            resource_bindings(fl, pt, arg, span)
+        }
+        _ => handle_binding(fl, arg).map(Vec::from),
+    }
 }
 
 /// The concrete parameter types of an entry instance.
@@ -242,19 +376,66 @@ fn ret_type(cx: &mut Cx, f: FnId, substs: &[TyId]) -> TyId {
 // ---- CPU side: recording ------------------------------------------------------------------------
 
 /// A pipeline CPU code records: its index, and its interface (worked out the first time).
-fn pipeline(cx: &mut Cx, key: PipelineKey) -> (u32, Rc<Interface>) {
+fn pipeline(cx: &mut Cx, key: PipelineKey, site: Span) -> (u32, Rc<Interface>) {
     if let Some(i) = cx.pipelines.iter().position(|(k, _)| *k == key) {
+        if !cx.pipeline_sites[i].contains(&site) {
+            cx.pipeline_sites[i].push(site);
+        }
         return (i as u32, cx.pipelines[i].1.clone());
     }
     let iface = Rc::new(interface(cx, &key));
     cx.pipelines.push((key, iface.clone()));
+    cx.pipeline_sites.push(vec![site]);
     (cx.pipelines.len() as u32 - 1, iface)
 }
 
-/// The handle inside a `GpuBuffer<T>` value.
-fn handle(fl: &mut Fl, buf: ir::ValueId) -> ir::ValueId {
+/// A buffer binding of a dispatch or draw (stream v3): the handle, and the offset and size in
+/// bytes, of the `GpuBuffer<T>`, `GpuSpan<T>` or `GpuSpanMut<T>` at `arg`, whose elements are
+/// `elem`s. A whole buffer of no elements still binds one, as it has room for one.
+fn buffer_binding(
+    fl: &mut Fl,
+    arg: &mir::Place,
+    elem: TyId,
+    span: Span,
+) -> Option<[ir::ValueId; 3]> {
+    let elem = fl.concrete(elem);
+    let et = fl.cx.lower_ty(fl.mb, elem, span)?;
+    let stride = ir::layout::array_stride(&fl.mb.m.types, et);
+    let t = fl.place_src_ty(arg);
+    let lang = fl.cx.checked.program.lang_of_ty(t);
     let u = fl.mb.m.types.u32();
-    fl.value(u, ir::Expr::Extract(buf, 0))
+    let v = fl.read(arg)?;
+    let stride_v = fl.u32c(stride);
+    let mul =
+        |fl: &mut Fl, a: ir::ValueId| fl.value(u, ir::Expr::Binary(ir::BinOp::Mul, a, stride_v));
+    if matches!(lang, Some(Lang::GpuSpan | Lang::GpuSpanMut)) {
+        // Through the span's projection of its buffer.
+        let pt = fl.mb.m.types.field(fl.f.value_ty(v), 0)?;
+        let ptr = fl.value(pt, ir::Expr::Extract(v, 0));
+        let at = ir::Place { root: ir::PlaceRoot::Ptr(ptr), path: vec![ir::Proj::Field(0)] };
+        let handle = fl.value(u, ir::Expr::Load(at));
+        let start = fl.value(u, ir::Expr::Extract(v, 1));
+        let count = fl.value(u, ir::Expr::Extract(v, 2));
+        let offset = mul(fl, start);
+        let size = mul(fl, count);
+        return Some([handle, offset, size]);
+    }
+    let handle = fl.value(u, ir::Expr::Extract(v, 0));
+    let count = fl.value(u, ir::Expr::Extract(v, 1));
+    let size = mul(fl, count);
+    let zero = fl.u32c(0);
+    let b = fl.mb.m.types.bool();
+    let empty = fl.value(b, ir::Expr::Binary(ir::BinOp::Eq, count, zero));
+    let size = fl.value(u, ir::Expr::Select { cond: empty, if_true: stride_v, if_false: size });
+    Some([handle, zero, size])
+}
+
+/// An indirect dispatch's or draw's counts: their buffer's handle, and the byte offset where
+/// they start.
+fn indirect_binding(fl: &mut Fl, place: &mir::Place, span: Span) -> Option<[ir::ValueId; 2]> {
+    let u32_ty = fl.cx.checked.program.types.u32;
+    let [handle, offset, _] = buffer_binding(fl, place, u32_ty, span)?;
+    Some([handle, offset])
 }
 
 pub(crate) fn lower_dispatch(fl: &mut Fl, d: &mir::Dispatch, span: Span) {
@@ -263,12 +444,21 @@ pub(crate) fn lower_dispatch(fl: &mut Fl, d: &mir::Dispatch, span: Span) {
         return;
     }
     let substs: Vec<TyId> = d.kernel_args.iter().map(|&a| fl.concrete(a)).collect();
-    let (pindex, iface) = pipeline(fl.cx, PipelineKey::Compute { kernel: d.kernel, substs });
+    let key = PipelineKey::Compute { kernel: d.kernel, substs };
+    let (pindex, iface) = pipeline(fl.cx, key, span);
     let mut groups = Vec::new();
-    for g in &d.groups {
-        match fl.operand(g) {
-            Some(v) => groups.push(v),
-            None => return,
+    match &d.indirect {
+        Some((place, at)) => {
+            let Some(b) = indirect_binding(fl, place, *at) else { return };
+            groups.extend(b);
+        }
+        None => {
+            for g in &d.groups {
+                match fl.operand(g) {
+                    Some(v) => groups.push(v),
+                    None => return,
+                }
+            }
         }
     }
     let checked = fl.cx.checked;
@@ -279,25 +469,35 @@ pub(crate) fn lower_dispatch(fl: &mut Fl, d: &mir::Dispatch, span: Span) {
     for (i, (pt, class)) in iface.entries[0].params.iter().enumerate() {
         let Some((_, arg, arg_span)) = d.args.iter().find(|(j, ..)| *j == i) else { continue };
         match class {
-            ParamClass::Builtin(_) | ParamClass::Varyings => {}
-            ParamClass::Buffer { .. } => {
-                let Some(v) = fl.read(arg) else { return };
-                handles.push(handle(fl, v));
+            ParamClass::Builtin(_) | ParamClass::Varyings | ParamClass::Workgroup { .. } => {}
+            ParamClass::Buffer { .. }
+            | ParamClass::Append { .. }
+            | ParamClass::Texture { .. }
+            | ParamClass::Sampler { .. } => {
+                let Some(b) = bindings_for(fl, *pt, class, arg, *arg_span) else { return };
+                handles.extend(b);
             }
             ParamClass::Uniform => {
                 // A value with no runtime value isn't in the block (`bind_uniform`).
                 let Some(t) = fl.cx.lower_ty(fl.mb, *pt, *arg_span) else { continue };
                 let Some(v) = fl.read(arg) else { return };
-                uniform_fields.push((params[i].name.clone(), t));
+                let field =
+                    iface.uniforms.iter().find(|u| u.1 == i).map_or(&params[i].name, |u| &u.2);
+                uniform_fields.push((field.clone(), t));
                 uniform_vals.push(v);
             }
         }
     }
-    let buffers = handles.len() as u32;
+    let bindings = handles.len() as u32 / 3;
     let mut args = groups;
     args.extend(handles);
     let uniform = uniform_block(fl, &uniform_fields, &uniform_vals, &mut args, "dispatch", span);
-    let op = ir::HostOp::Dispatch { pipeline: pindex, buffers, uniform };
+    let op = ir::HostOp::Dispatch {
+        pipeline: pindex,
+        bindings,
+        uniform,
+        indirect: d.indirect.is_some(),
+    };
     fl.emit(ir::Stmt::Eval(ir::Expr::Host(op, args)));
 }
 
@@ -344,34 +544,44 @@ pub(crate) fn lower_draw(fl: &mut Fl, d: &mir::Draw, span: Span) {
     }
     let vs = (d.vertex.0, d.vertex.1.iter().map(|&a| fl.concrete(a)).collect::<Vec<_>>());
     let fs = (d.fragment.0, d.fragment.1.iter().map(|&a| fl.concrete(a)).collect::<Vec<_>>());
-    let (pindex, iface) = pipeline(fl.cx, PipelineKey::Render { vertex: vs, fragment: fs });
-    let Some(vertices) = fl.operand(&d.vertices) else { return };
-    let Some(instances) = fl.operand(&d.instances) else { return };
-    let arg = |name: &str| d.args.iter().find(|(n, ..)| n == name);
+    let (pindex, iface) = pipeline(fl.cx, PipelineKey::Render { vertex: vs, fragment: fs }, span);
+    // The counts, or where their buffer holds them.
+    let (vertices, instances) = match &d.indirect {
+        Some((place, at)) => {
+            let Some([handle, offset]) = indirect_binding(fl, place, *at) else { return };
+            (handle, offset)
+        }
+        None => {
+            let Some(vertices) = fl.operand(&d.vertices) else { return };
+            let Some(instances) = fl.operand(&d.instances) else { return };
+            (vertices, instances)
+        }
+    };
+    let arg = |e: usize, i: usize| d.args.iter().find(|a| a.0 == e && a.1 == i);
     let mut fields = Vec::new();
     let mut vals = Vec::new();
-    for (name, t) in &iface.uniforms {
-        let Some((_, place, arg_span)) = arg(name) else { continue };
+    for (e, i, name, t) in &iface.uniforms {
+        let Some((.., place, arg_span)) = arg(*e, *i) else { continue };
         // A value with no runtime value isn't in the block (`bind_uniform`).
         let Some(it) = fl.cx.lower_ty(fl.mb, *t, *arg_span) else { continue };
         let Some(v) = fl.read(place) else { return };
         fields.push((name.clone(), it));
         vals.push(v);
     }
-    // Buffers, in the order the pipeline binds them, each by its parameter's name.
-    let checked = fl.cx.checked;
+    // Buffers, textures and samplers, in the order the pipeline binds them.
     let mut handles = Vec::new();
-    for &(e, i) in &iface.buffers {
-        let name = &checked.program.func(iface.entries[e].func).params[i].name;
-        let Some((_, place, _)) = arg(name) else { return };
-        let Some(v) = fl.read(place) else { return };
-        handles.push(handle(fl, v));
+    for &(e, i) in &iface.bound {
+        let Some((.., place, arg_span)) = arg(e, i) else { return };
+        let (pt, class) = &iface.entries[e].params[i];
+        let Some(b) = bindings_for(fl, *pt, class, place, *arg_span) else { return };
+        handles.extend(b);
     }
-    let buffers = handles.len() as u32;
+    let bindings = handles.len() as u32 / 3;
     let mut args = vec![vertices, instances];
     args.extend(handles);
     let uniform = uniform_block(fl, &fields, &vals, &mut args, "draw", span);
-    let op = ir::HostOp::Draw { pipeline: pindex, buffers, uniform };
+    let op =
+        ir::HostOp::Draw { pipeline: pindex, bindings, uniform, indirect: d.indirect.is_some() };
     fl.emit(ir::Stmt::Eval(ir::Expr::Host(op, args)));
 }
 
@@ -389,7 +599,7 @@ pub(crate) fn intrinsic(
         Some(l @ (Lang::Gradient | Lang::ValueAndGradient | Lang::IntervalOf)) => {
             return crate::derive::call(fl, l, substs, c, ty);
         }
-        Some(Lang::Buffer | Lang::Write | Lang::BeginScreenPass | Lang::Present) if fl.is_gpu() => {
+        Some(l) if l.records_gpu_work() && fl.is_gpu() => {
             let name = fl.cx.checked.program.func(func).name.clone();
             host_effect(fl, &format!("`{name}`"), span);
             return None;
@@ -408,20 +618,32 @@ pub(crate) fn intrinsic(
             let h =
                 fl.value(u, ir::Expr::Host(ir::HostOp::CreateBuffer { elem_size }, vec![count]));
             let bt = fl.ty(ty?, span)?;
-            Some(fl.value(bt, ir::Expr::Construct(bt, vec![h])))
+            Some(fl.value(bt, ir::Expr::Construct(bt, vec![h, count])))
         }
         Some(Lang::Write) => {
             let elem = fl.cx.lower_ty(fl.mb, substs[0], span)?;
             let elem_size = ir::layout::array_stride(&fl.mb.m.types, elem);
-            let buf = fl.arg_value(&c.args[0])?;
-            let h = handle(fl, buf);
+            let h = fl.arg_value(&c.args[0])?;
             let at = fl.arg_value(&c.args[1])?;
             let run_t = fl.mb.m.types.intern(ir::TypeDef::Run(elem));
             let run = fl.run_arg(c.args[2].place()?, run_t)?;
             fl.emit(ir::Stmt::Eval(ir::Expr::Host(
-                ir::HostOp::WriteBuffer { elem_size },
+                ir::HostOp::WriteBuffer { elem, elem_size },
                 vec![h, at, run],
             )));
+            None
+        }
+        Some(Lang::DestroyBuffer) => {
+            let h = fl.arg_value(&c.args[0])?;
+            fl.emit(ir::Stmt::Eval(ir::Expr::Host(ir::HostOp::DestroyBuffer, vec![h])));
+            None
+        }
+        Some(Lang::CopyBuffer) => {
+            let mut args = Vec::new();
+            for a in &c.args {
+                args.push(fl.arg_value(a)?);
+            }
+            fl.emit(ir::Stmt::Eval(ir::Expr::Host(ir::HostOp::CopyBuffer, args)));
             None
         }
         Some(Lang::BeginScreenPass) => {
@@ -433,6 +655,148 @@ pub(crate) fn intrinsic(
             fl.emit(ir::Stmt::Eval(ir::Expr::Host(ir::HostOp::Present, Vec::new())));
             None
         }
+        Some(
+            l @ (Lang::CreateTexture
+            | Lang::DestroyTexture
+            | Lang::CreateSampler
+            | Lang::DestroySampler
+            | Lang::BeginPass
+            | Lang::EndPass),
+        ) => {
+            // (opcode, payload words, whether the first is a new handle)
+            let (opcode, words, handle) = match l {
+                Lang::CreateTexture => (Opcode::CreateTexture, 4, true),
+                Lang::DestroyTexture => (Opcode::DestroyTexture, 1, false),
+                Lang::CreateSampler => (Opcode::CreateSampler, 4, true),
+                Lang::DestroySampler => (Opcode::DestroySampler, 1, false),
+                Lang::BeginPass => (Opcode::BeginPass, 9, false),
+                _ => (Opcode::EndPass, 0, false),
+            };
+            let mut args = Vec::new();
+            for a in &c.args {
+                args.push(fl.arg_value(a)?);
+            }
+            let op = ir::HostOp::Command { opcode: opcode as u32, words, runs: 0, handle };
+            if handle {
+                let u = fl.mb.m.types.u32();
+                return Some(fl.value(u, ir::Expr::Host(op, args)));
+            }
+            fl.emit(ir::Stmt::Eval(ir::Expr::Host(op, args)));
+            None
+        }
+        Some(l @ (Lang::NextRequest | Lang::RequestStatus | Lang::RequestTake | Lang::Limit))
+            if fl.is_gpu() =>
+        {
+            let name = fl.cx.checked.program.func(func).name.clone();
+            fl.cx.err(Diagnostic::new(
+                codes::E0600,
+                span,
+                format!("`{name}` asks the host, and GPU code can't ({l:?})"),
+            ));
+            None
+        }
+        Some(Lang::Limit) if !fl.is_gpu() => {
+            let i = fl.arg_value(&c.args[0])?;
+            let u = fl.mb.m.types.u32();
+            Some(fl.value(u, ir::Expr::Host(ir::HostOp::Limit, vec![i])))
+        }
+        Some(Lang::NextRequest) => {
+            let u = fl.mb.m.types.u32();
+            Some(fl.value(u, ir::Expr::Host(ir::HostOp::NextRequest, Vec::new())))
+        }
+        Some(Lang::RequestStatus) => {
+            let r = fl.arg_value(&c.args[0])?;
+            let i = fl.mb.m.types.scalar(ir::Scalar::I32);
+            Some(fl.value(i, ir::Expr::Host(ir::HostOp::RequestStatus, vec![r])))
+        }
+        Some(Lang::RequestTake) => {
+            let r = fl.arg_value(&c.args[0])?;
+            let at = fl.arg_value(&c.args[1])?;
+            fl.emit(ir::Stmt::Eval(ir::Expr::Host(ir::HostOp::RequestTake, vec![r, at])));
+            None
+        }
+        Some(
+            l @ (Lang::ReadBufferCommand
+            | Lang::StorageReadCommand
+            | Lang::StorageWriteCommand
+            | Lang::FetchCommand
+            | Lang::PrintCommand),
+        ) => {
+            // The request number and (a readback) the buffer's range, then the runs: a path or
+            // URL, the bytes to store, a line to print.
+            let (opcode, words) = match l {
+                Lang::ReadBufferCommand => (Opcode::ReadBuffer, 4),
+                Lang::StorageReadCommand => (Opcode::StorageRead, 1),
+                Lang::StorageWriteCommand => (Opcode::StorageWrite, 1),
+                Lang::PrintCommand => (Opcode::Log, 0),
+                _ => (Opcode::Fetch, 1),
+            };
+            let mut args = Vec::new();
+            for a in &c.args[..words as usize] {
+                args.push(fl.arg_value(a)?);
+            }
+            for a in &c.args[words as usize..] {
+                args.push(fl.str_arg(a)?);
+            }
+            let runs = (c.args.len() - words as usize) as u32;
+            let op = ir::HostOp::Command { opcode: opcode as u32, words, runs, handle: false };
+            fl.emit(ir::Stmt::Eval(ir::Expr::Host(op, args)));
+            None
+        }
+        Some(Lang::WriteTexture) => {
+            // handle, x, y, width, height, then bytes `from..from + count` of the run.
+            let mut args = Vec::new();
+            for a in &c.args[..5] {
+                args.push(fl.arg_value(a)?);
+            }
+            let u8_ = fl.mb.m.types.intern(ir::TypeDef::Scalar(ir::Scalar::U8));
+            let run_t = fl.mb.m.types.intern(ir::TypeDef::Run(u8_));
+            let run = fl.run_arg(c.args[5].place()?, run_t)?;
+            let from = fl.arg_value(&c.args[6])?;
+            let count = fl.arg_value(&c.args[7])?;
+            let u = fl.mb.m.types.u32();
+            let addr = fl.value(u, ir::Expr::Extract(run, 0));
+            let start = fl.value(u, ir::Expr::Binary(ir::BinOp::Add, addr, from));
+            args.push(fl.value(run_t, ir::Expr::Construct(run_t, vec![start, count])));
+            let op = ir::HostOp::Command {
+                opcode: Opcode::WriteTexture as u32,
+                words: 5,
+                runs: 1,
+                handle: false,
+            };
+            fl.emit(ir::Stmt::Eval(ir::Expr::Host(op, args)));
+            None
+        }
+        Some(
+            l @ (Lang::LocalIndex
+            | Lang::WorkgroupInvocations
+            | Lang::SharedGet
+            | Lang::SharedSet
+            | Lang::WorkgroupBarrier
+            | Lang::AtomicLen
+            | Lang::AtomicLoad
+            | Lang::AtomicStore
+            | Lang::AtomicAdd
+            | Lang::AtomicSub
+            | Lang::AtomicMin
+            | Lang::AtomicMax
+            | Lang::AtomicAnd
+            | Lang::AtomicOr
+            | Lang::AtomicXor
+            | Lang::AtomicExchange
+            | Lang::AtomicCompareExchange
+            | Lang::AppendPush),
+        ) => shared_op(fl, l, c, ty),
+        Some(
+            l @ (Lang::TextureSample
+            | Lang::TextureSampleLevel
+            | Lang::TextureSampleCompare
+            | Lang::TextureSampleCompareLevel
+            | Lang::TextureLoad
+            | Lang::DepthLoad
+            | Lang::TextureWidth
+            | Lang::TextureHeight),
+        ) => texture_read(fl, l, c, ty),
         _ => {
             let name = fl.cx.checked.program.func(func).name.clone();
             fl.cx.err(Diagnostic::internal(format!("the intrinsic `{name}` has no lowering")));
@@ -444,7 +808,7 @@ pub(crate) fn intrinsic(
 /// GPU code recorded GPU work: the `host` effect, which every GPU context forbids (§8).
 fn host_effect(fl: &mut Fl, what: &str, span: Span) {
     let ctx = fl.mb.gpu.as_ref().map_or("GPU code", |g| g.what.as_str());
-    let mut d = Diagnostic::new(
+    let d = Diagnostic::new(
         codes::E0600,
         span,
         format!("{what} records GPU work, which {ctx} can't do"),
@@ -452,15 +816,12 @@ fn host_effect(fl: &mut Fl, what: &str, span: Span) {
     .with_note(
         "recording GPU work is the `host` effect; GPU entry points forbid it (language.md §8)",
     );
-    for note in call_chain(fl) {
-        d = d.with_note(note);
-    }
-    fl.cx.err(d);
+    fl.cx.err(with_call_chain(fl, d));
 }
 
-/// The call chain from the entry point down to the current function, as one note
-/// (`fill → helper → scratch`), when the current function isn't the entry point itself.
-fn call_chain(fl: &Fl) -> Vec<String> {
+/// `d`, with a note naming the call chain from the entry point down to the current function
+/// (`fill → helper → scratch`) when the current function isn't the entry point itself.
+fn with_call_chain(fl: &Fl, d: Diagnostic) -> Diagnostic {
     let mut names = vec![fl.mb.display_name(fl.id)];
     let mut at = fl.id;
     while let Some(&(caller, _)) = fl.mb.callers.get(&at) {
@@ -475,36 +836,317 @@ fn call_chain(fl: &Fl) -> Vec<String> {
         }
     }
     if names.len() < 2 {
-        return Vec::new();
+        return d;
     }
     names.reverse();
+    d.with_note(called_through(&names))
+}
+
+/// `d`, with a note naming the calls from the entry point down to the function of `n`, when
+/// that isn't the entry point itself.
+fn with_path(mb: &ModuleBuilder, n: &NonUniform, d: Diagnostic) -> Diagnostic {
+    if n.path.is_empty() {
+        return d;
+    }
+    let names: Vec<String> = n.path.iter().chain([&n.func]).map(|&f| mb.display_name(f)).collect();
+    d.with_note(called_through(&names))
+}
+
+/// The note that names a call chain, callers first.
+fn called_through(names: &[String]) -> String {
     let chain: Vec<String> = names.iter().map(|n| format!("`{n}`")).collect();
-    vec![format!("called through {}", chain.join(" → "))]
+    format!("called through {}", chain.join(" → "))
+}
+
+/// The resource GPU code passes as call `c`'s argument `i`: a parameter bound to one, passed
+/// on as it was received (E0702 with `msg` otherwise).
+fn resource_arg(fl: &mut Fl, c: &mir::Call, i: usize, msg: &str) -> Option<ir::ResourceId> {
+    let place = c.args.get(i)?.place()?;
+    let pl = fl.place(place)?;
+    match (pl.root, pl.path.is_empty()) {
+        (ir::PlaceRoot::Resource(r), true) => Some(r),
+        _ => {
+            fl.cx.err(Diagnostic::new(codes::E0702, c.args[i].span(), msg));
+            None
+        }
+    }
+}
+
+/// Workgroup memory, barriers, atomics and appends (`std::gpu`'s kernel `mut` parameters):
+/// GPU code only (E0607).
+fn shared_op(fl: &mut Fl, l: Lang, c: &mir::Call, ty: Option<TyId>) -> Option<ir::ValueId> {
+    let span = c.span;
+    if !fl.is_gpu() {
+        let name = fl.cx.checked.program.func(match &c.callee {
+            mir::Callee::Fn { func, .. } => *func,
+            _ => return None,
+        });
+        let d = Diagnostic::new(
+            codes::E0607,
+            user_span(fl, span),
+            format!("`{}` is for kernels, and this is CPU code", name.name),
+        )
+        .with_note("workgroup memory, atomics and appends are a kernel's `mut` parameters");
+        fl.cx.err(with_call_chain(fl, d));
+        return None;
+    }
+    let msg = "GPU code can pass a resource on only as the kernel received it";
+    let u = fl.mb.m.types.u32();
+    match l {
+        Lang::LocalIndex | Lang::WorkgroupInvocations => {
+            let g = fl.mb.gpu.as_ref()?;
+            let [wx, wy, wz] = g.workgroup_size;
+            if l == Lang::WorkgroupInvocations {
+                return Some(fl.u32c(wx * wy * wz));
+            }
+            let lid = fl.arg_value(&c.args[0])?;
+            let x = fl.value(u, ir::Expr::Extract(lid, 0));
+            let y = fl.value(u, ir::Expr::Extract(lid, 1));
+            let z = fl.value(u, ir::Expr::Extract(lid, 2));
+            let (cx_, cxy) = (fl.u32c(wx), fl.u32c(wx * wy));
+            let yx = fl.value(u, ir::Expr::Binary(ir::BinOp::Mul, y, cx_));
+            let zxy = fl.value(u, ir::Expr::Binary(ir::BinOp::Mul, z, cxy));
+            let s = fl.value(u, ir::Expr::Binary(ir::BinOp::Add, x, yx));
+            Some(fl.value(u, ir::Expr::Binary(ir::BinOp::Add, s, zxy)))
+        }
+        Lang::WorkgroupBarrier => {
+            resource_arg(fl, c, 0, msg)?;
+            fl.emit(ir::Stmt::Eval(ir::Expr::Barrier));
+            None
+        }
+        Lang::SharedGet | Lang::SharedSet | Lang::AtomicLoad | Lang::AtomicStore => {
+            let r = resource_arg(fl, c, 0, msg)?;
+            let i = fl.arg_value(&c.args[1])?;
+            let place =
+                ir::Place { root: ir::PlaceRoot::Resource(r), path: vec![ir::Proj::Index(i)] };
+            match l {
+                Lang::SharedGet => {
+                    let t = fl.ty(ty?, span)?;
+                    Some(fl.value(t, ir::Expr::Load(place)))
+                }
+                Lang::SharedSet => {
+                    let v = fl.arg_value(&c.args[2])?;
+                    fl.emit(ir::Stmt::Store(place, v));
+                    None
+                }
+                Lang::AtomicLoad => {
+                    let t = fl.ty(ty?, span)?;
+                    Some(fl.value(t, ir::Expr::Atomic(ir::AtomicOp::Load, place, Vec::new())))
+                }
+                _ => {
+                    let v = fl.arg_value(&c.args[2])?;
+                    let e = ir::Expr::Atomic(ir::AtomicOp::Store, place, vec![v]);
+                    fl.emit(ir::Stmt::Eval(e));
+                    None
+                }
+            }
+        }
+        Lang::AtomicLen => {
+            let r = resource_arg(fl, c, 0, msg)?;
+            Some(fl.value(u, ir::Expr::ArrayLength(ir::Place::root(ir::PlaceRoot::Resource(r)))))
+        }
+        Lang::AppendPush => {
+            // count[0] += 1; if the old count is below the capacity, the item goes there.
+            let r = resource_arg(fl, c, 0, msg)?;
+            let count = ir::ResourceId(r.0 + 1);
+            let v = fl.arg_value(&c.args[1])?;
+            let zero = fl.u32c(0);
+            let one = fl.u32c(1);
+            let at = ir::Place {
+                root: ir::PlaceRoot::Resource(count),
+                path: vec![ir::Proj::Index(zero)],
+            };
+            let old = fl.value(u, ir::Expr::Atomic(ir::AtomicOp::Add, at, vec![one]));
+            let cap =
+                fl.value(u, ir::Expr::ArrayLength(ir::Place::root(ir::PlaceRoot::Resource(r))));
+            let b = fl.mb.m.types.bool();
+            let room = fl.value(b, ir::Expr::Binary(ir::BinOp::Lt, old, cap));
+            let slot =
+                ir::Place { root: ir::PlaceRoot::Resource(r), path: vec![ir::Proj::Index(old)] };
+            fl.emit(ir::Stmt::If {
+                cond: room,
+                then: vec![ir::Stmt::Store(slot, v)],
+                else_: Vec::new(),
+            });
+            Some(old)
+        }
+        _ => {
+            let op = match l {
+                Lang::AtomicAdd => ir::AtomicOp::Add,
+                Lang::AtomicSub => ir::AtomicOp::Sub,
+                Lang::AtomicMin => ir::AtomicOp::Min,
+                Lang::AtomicMax => ir::AtomicOp::Max,
+                Lang::AtomicAnd => ir::AtomicOp::And,
+                Lang::AtomicOr => ir::AtomicOp::Or,
+                Lang::AtomicXor => ir::AtomicOp::Xor,
+                Lang::AtomicExchange => ir::AtomicOp::Exchange,
+                _ => ir::AtomicOp::CompareExchange,
+            };
+            let r = resource_arg(fl, c, 0, msg)?;
+            let i = fl.arg_value(&c.args[1])?;
+            let mut vals = Vec::new();
+            for a in &c.args[2..] {
+                vals.push(fl.arg_value(a)?);
+            }
+            let place =
+                ir::Place { root: ir::PlaceRoot::Resource(r), path: vec![ir::Proj::Index(i)] };
+            let t = fl.ty(ty?, span)?;
+            Some(fl.value(t, ir::Expr::Atomic(op, place, vals)))
+        }
+    }
+}
+
+/// Where to report an error found at `span` in the function being lowered: there, or, when
+/// that's std's code (a texture method's body), at the first call to it from outside std.
+fn user_span(fl: &Fl, span: Span) -> Span {
+    user_span_in(fl.cx, fl.mb, fl.id, span)
+}
+
+/// [`user_span`] for a span in function `id` of `mb`.
+fn user_span_in(cx: &Cx, mb: &ModuleBuilder, id: ir::FuncId, span: Span) -> Span {
+    let p = &cx.checked.program;
+    let in_std = |id: ir::FuncId| {
+        let key = mb.instances.iter().find(|(_, v)| **v == id).map(|(k, _)| k);
+        key.and_then(InstanceKey::source_fn).is_some_and(|f| p.is_std(p.func(f).module))
+    };
+    let (mut at, mut span) = (id, span);
+    while in_std(at) {
+        let Some(&(caller, s)) = mb.callers.get(&at) else { break };
+        (at, span) = (caller, s);
+    }
+    span
+}
+
+/// A texture read (`Texture::sample` and the rest), in GPU code. On the CPU a texture's size
+/// is its fields; its texels are E0607.
+fn texture_read(fl: &mut Fl, l: Lang, c: &mir::Call, ty: Option<TyId>) -> Option<ir::ValueId> {
+    use ir::TextureOp as T;
+    let span = c.span;
+    let u = fl.mb.m.types.u32();
+    let op = match l {
+        Lang::TextureSample => T::Sample,
+        Lang::TextureSampleLevel => T::SampleLevel,
+        Lang::TextureSampleCompare => T::SampleCompare,
+        Lang::TextureSampleCompareLevel => T::SampleCompareLevel,
+        Lang::TextureLoad | Lang::DepthLoad => T::Load,
+        Lang::TextureWidth => T::Width,
+        _ => T::Height,
+    };
+    if !fl.is_gpu() {
+        if matches!(op, T::Width | T::Height) {
+            // `Texture` and `DepthTexture` hold their handle, width and height first.
+            let v = fl.arg_value(&c.args[0])?;
+            return Some(fl.value(u, ir::Expr::Extract(v, if op == T::Width { 1 } else { 2 })));
+        }
+        let d = Diagnostic::new(
+            codes::E0607,
+            user_span(fl, span),
+            "a texture's texels are read in GPU code, and this is CPU code",
+        )
+        .with_note("CPU code can write a texture and pass it to shaders, but not read it");
+        fl.cx.err(with_call_chain(fl, d));
+        return None;
+    }
+    let msg = "GPU code can pass a texture or sampler on only as the shader received it";
+    let texture = resource_arg(fl, c, 0, msg)?;
+    let sampled = !matches!(op, T::Load | T::Width | T::Height);
+    let sampler = if sampled { Some(resource_arg(fl, c, 1, msg)?) } else { None };
+    let mut vals = Vec::new();
+    for a in &c.args[1 + usize::from(sampled)..] {
+        vals.push(fl.arg_value(a)?);
+    }
+    let t = fl.ty(ty?, span)?;
+    let v = fl.value(t, ir::Expr::Texture(op, texture, sampler, vals));
+    if op.uses_derivatives() {
+        // `sample` and `sample_compare` pick a texture's detail from neighbouring pixels, as
+        // derivatives do.
+        let at = user_span(fl, span);
+        fragment_only(fl, Some(v), at, |ctx| {
+            Diagnostic::new(
+                codes::E0607,
+                at,
+                format!("sampling picks its detail from neighbouring pixels, so it's in fragment shaders only, and this is {ctx}"),
+            )
+            .with_help("use `sample_level` (or `sample_compare_level`), which any GPU code can call")
+        });
+    }
+    Some(v)
 }
 
 /// E0607 for a derivative outside a fragment shader. In one, where it is (`v`), for E0608.
 pub(crate) fn check_derivative(fl: &mut Fl, v: Option<ir::ValueId>, span: Span) {
-    // A `@gpu` function checked on its own has no stage: its callers' decide, and each
-    // pipeline that calls it checks it there.
-    if fl.is_gpu() && fl.mb.gpu.as_ref().is_some_and(|g| g.stage.is_none()) {
-        return;
-    }
-    let ok = fl.is_gpu() && fl.mb.gpu.as_ref().is_some_and(|g| g.stage == Some(Entry::Fragment));
-    if ok && let Some(v) = v {
-        fl.mb.derivatives.insert((fl.id, v), span);
-    }
-    if !ok {
-        let ctx = fl.mb.gpu.as_ref().map_or("CPU code", |g| g.what.as_str());
-        let mut d = Diagnostic::new(
+    fragment_only(fl, v, span, |ctx| {
+        Diagnostic::new(
             codes::E0607,
             span,
             format!("derivatives exist only in fragment shaders, and this is {ctx}"),
         )
-        .with_note("`dpdx`, `dpdy` and `fwidth` compare neighbouring pixels");
-        for note in call_chain(fl) {
-            d = d.with_note(note);
+        .with_note("`dpdx`, `dpdy` and `fwidth` compare neighbouring pixels")
+    });
+}
+
+/// An operation that compares neighbouring pixels, defining `v`, at `span`: in a fragment
+/// shader, noted for E0608; elsewhere, the error `err` makes from what the code is.
+fn fragment_only(
+    fl: &mut Fl,
+    v: Option<ir::ValueId>,
+    span: Span,
+    err: impl FnOnce(&str) -> Diagnostic,
+) {
+    // A `@gpu` function checked on its own has no stage: its callers' decide, and each
+    // pipeline that calls it checks it there.
+    if fl.mb.gpu.as_ref().is_some_and(|g| g.stage.is_none()) {
+        return;
+    }
+    if fl.mb.gpu.as_ref().is_some_and(|g| g.stage == Some(Entry::Fragment)) {
+        if let Some(v) = v {
+            fl.mb.derivatives.insert((fl.id, v), span);
         }
-        fl.cx.err(d);
+        return;
+    }
+    let d = err(fl.mb.gpu.as_ref().map_or("CPU code", |g| g.what.as_str()));
+    fl.cx.err(with_call_chain(fl, d));
+}
+
+/// A kernel's workgroup memory: E0610 for a barrier that its workgroup's invocations may not
+/// all reach together, E0609 for a read or write of workgroup memory with no barrier since an
+/// access of the other kind (§6.13).
+fn check_workgroup(
+    cx: &mut Cx,
+    mb: &ModuleBuilder,
+    entry: ir::FuncId,
+    inputs: &[ir::BuiltinInput],
+) {
+    let found = ir::uniformity::collectives_in_non_uniform_flow(&mb.m, entry, inputs);
+    for n in found.into_iter().filter(|n| n.op == Collective::Barrier) {
+        let Some(at) = n.at else { continue };
+        let d = Diagnostic::new(
+            codes::E0610,
+            user_span_in(cx, mb, n.func, at),
+            "`barrier` is called where the workgroup's invocations may have taken different branches",
+        )
+        .with_note("a barrier waits for every invocation of the workgroup, so all of them must reach it together (WGSL's uniformity rule)");
+        cx.err(with_path(mb, &n, d).with_help(
+            "call it outside the branch, or make the branch's condition the same for the whole workgroup (from `WorkgroupId` or uniforms)",
+        ));
+    }
+    for h in ir::workgroup::hazards(&mb.m, entry) {
+        let Some(at) = h.at else { continue };
+        let name = mb.m.resources[h.resource.index()].name.clone();
+        let (what, other) = if h.write {
+            ("written", "another invocation may still be reading it")
+        } else {
+            ("read", "another invocation may still be writing it")
+        };
+        cx.err(
+            Diagnostic::new(
+                codes::E0609,
+                user_span_in(cx, mb, h.func, at),
+                format!("`{name}` is {what} here, and {other}: there's no barrier since"),
+            )
+            .with_note("between barriers, workgroup memory is written (each invocation its own chunk) or read, not both (§6.13)")
+            .with_help(format!("call `barrier(mut {name})` between the writes and the reads")),
+        );
     }
 }
 
@@ -519,15 +1161,17 @@ fn check_uniformity(
     if mb.derivatives.is_empty() {
         return;
     }
-    for n in ir::uniformity::derivatives_in_non_uniform_flow(&mb.m, entry, inputs) {
+    for n in ir::uniformity::collectives_in_non_uniform_flow(&mb.m, entry, inputs) {
         let at = mb.derivatives.get(&(n.func, n.value)).copied().or(n.at);
         let Some(span) = at else { continue };
-        let name = match n.builtin {
-            ir::Builtin::Dpdx => "dpdx",
-            ir::Builtin::Dpdy => "dpdy",
-            _ => "fwidth",
+        let span = user_span_in(cx, mb, n.func, span);
+        // The texture methods by their names in the language.
+        let name = match n.op {
+            Collective::Sample => "sample",
+            Collective::SampleCompare => "sample_compare",
+            op => op.wgsl_name(),
         };
-        let mut d = Diagnostic::new(
+        let d = Diagnostic::new(
             codes::E0608,
             span,
             format!(
@@ -538,16 +1182,7 @@ fn check_uniformity(
             "a derivative compares a pixel with its neighbours, so WGSL requires all of them to \
              reach it together (language.md §11)",
         );
-        if !n.path.is_empty() {
-            let chain: Vec<String> = n
-                .path
-                .iter()
-                .chain([&n.func])
-                .map(|&f| format!("`{}`", mb.display_name(f)))
-                .collect();
-            d = d.with_note(format!("called through {}", chain.join(" → ")));
-        }
-        cx.err(d.with_help(
+        cx.err(with_path(mb, &n, d).with_help(
             "compute it before the branch or the early `return`, and use the result after it",
         ));
     }
@@ -586,11 +1221,15 @@ pub(crate) fn lower_pipeline(
     cx: &mut Cx,
     key: &PipelineKey,
     iface: Rc<Interface>,
+    sites: Vec<Span>,
 ) -> Option<PipelineOut> {
-    match key {
+    let mut out = match key {
         PipelineKey::Compute { .. } => lower_compute(cx, iface),
         PipelineKey::Render { .. } => lower_render(cx, iface),
-    }
+    }?;
+    out.key = key.clone();
+    out.sites = sites;
+    Some(out)
 }
 
 /// How diagnostics name the entry point `name` of a module: "the `@compute` kernel `fill`".
@@ -605,10 +1244,9 @@ fn describe_entry(stage: Entry, name: &str) -> String {
 /// A GPU module for some entry points, before their functions are lowered.
 struct EntryModule {
     mb: ModuleBuilder,
-    /// Each entry point's instance key, with the buffer bound to each parameter.
+    /// Each entry point's instance key, with the resource bound to each parameter.
     keys: Vec<InstanceKey>,
-    /// (binding, read-write) for each buffer.
-    buffers: Vec<(u32, bool)>,
+    bindings: Vec<ResourceBinding>,
     uniform: Option<UniformOut>,
 }
 
@@ -619,27 +1257,121 @@ fn entry_module(cx: &mut Cx, iface: Rc<Interface>, stage: Entry) -> EntryModule 
     let checked = cx.checked;
     let program = &checked.program;
     let what = describe_entry(stage, &program.func(iface.entries[0].func).name);
-    let mut mb = ModuleBuilder::gpu(GpuCx::new(what, iface.clone(), Some(stage)));
+    let mut mb = ModuleBuilder::gpu(GpuCx::new(what.clone(), iface.clone(), Some(stage)));
     let mut resources: Vec<Vec<Option<ir::ResourceId>>> =
         iface.entries.iter().map(|e| vec![None; e.params.len()]).collect();
-    let mut buffers = Vec::new();
-    for &(e, i) in &iface.buffers {
+    let mut bindings = Vec::new();
+    for &(e, i) in &iface.bound {
         let entry = &iface.entries[e];
-        let ParamClass::Buffer { elem, read_write } = entry.params[i].1 else { continue };
         let param = &program.func(entry.func).params[i];
-        let Some(ty) = cx.lower_ty(&mut mb, elem, param.span) else {
-            cx.holds_nothing("buffer", elem, param.span);
-            continue;
-        };
-        let binding = 1 + buffers.len() as u32;
-        let kind = if read_write {
-            ir::ResourceKind::StorageReadWrite
-        } else {
-            ir::ResourceKind::StorageRead
+        let binding = 1 + bindings.len() as u32;
+        let (kind, ty, bk) = match entry.params[i].1 {
+            ParamClass::Append { elem } => {
+                // The items, then the count: two bindings, the count's resource just after.
+                let Some(ty) = cx.lower_ty(&mut mb, elem, param.span) else {
+                    cx.holds_nothing("buffer", elem, param.span);
+                    continue;
+                };
+                let kind = ir::ResourceKind::StorageReadWrite;
+                let res = ir::Resource { name: param.name.clone(), binding, kind, ty };
+                let id = mb.m.add_resource(res);
+                let count = mb.m.types.intern(ir::TypeDef::Atomic(ir::Scalar::U32));
+                let name = format!("{}_count", param.name);
+                mb.m.add_resource(ir::Resource { name, binding: binding + 1, kind, ty: count });
+                bindings.push(ResourceBinding { binding, kind: BindingKind::ReadWrite });
+                bindings
+                    .push(ResourceBinding { binding: binding + 1, kind: BindingKind::ReadWrite });
+                resources[e][i] = Some(id);
+                continue;
+            }
+            ParamClass::Buffer { elem, read_write, atomic } => {
+                let Some(ty) = cx.lower_ty(&mut mb, elem, param.span) else {
+                    cx.holds_nothing("buffer", elem, param.span);
+                    continue;
+                };
+                let ty = if atomic {
+                    match mb.m.types.get(ty) {
+                        &ir::TypeDef::Scalar(s @ (ir::Scalar::U32 | ir::Scalar::I32)) => {
+                            mb.m.types.intern(ir::TypeDef::Atomic(s))
+                        }
+                        _ => {
+                            cx.err(Diagnostic::new(
+                                codes::E0602,
+                                param.span,
+                                "atomics are `u32`s or `i32`s",
+                            ));
+                            continue;
+                        }
+                    }
+                } else {
+                    ty
+                };
+                if read_write {
+                    (ir::ResourceKind::StorageReadWrite, ty, BindingKind::ReadWrite)
+                } else {
+                    (ir::ResourceKind::StorageRead, ty, BindingKind::Read)
+                }
+            }
+            ParamClass::Texture { depth } => {
+                let bk = if depth { BindingKind::DepthTexture } else { BindingKind::Texture };
+                (ir::ResourceKind::Texture { depth }, mb.m.types.u32(), bk)
+            }
+            ParamClass::Sampler { comparison } => {
+                let bk =
+                    if comparison { BindingKind::ComparisonSampler } else { BindingKind::Sampler };
+                (ir::ResourceKind::Sampler { comparison }, mb.m.types.u32(), bk)
+            }
+            _ => continue,
         };
         let id = mb.m.add_resource(ir::Resource { name: param.name.clone(), binding, kind, ty });
-        buffers.push((binding, read_write));
-        resources[e][i] = Some(id);
+        bindings.push(ResourceBinding { binding, kind: bk });
+        // Every entry point's parameter of this name is this binding.
+        for (e2, other) in iface.entries.iter().enumerate() {
+            for (i2, _) in other.params.iter().enumerate() {
+                if program.func(other.func).params[i2].name == param.name
+                    && other.params[i2].1.is_bound()
+                {
+                    resources[e2][i2] = Some(id);
+                }
+            }
+        }
+    }
+    // Workgroup memory: one array per `Shared` parameter.
+    let mut workgroup_bytes = 0u32;
+    for (e, entry) in iface.entries.iter().enumerate() {
+        for (i, (_, class)) in entry.params.iter().enumerate() {
+            let ParamClass::Workgroup { elem, len } = *class else { continue };
+            let param = &program.func(entry.func).params[i];
+            let Some(et) = cx.lower_ty(&mut mb, elem, param.span) else {
+                cx.holds_nothing("workgroup memory", elem, param.span);
+                continue;
+            };
+            if len == 0 {
+                let d =
+                    Diagnostic::new(codes::E0602, param.span, "workgroup memory of no elements");
+                cx.err(d);
+                continue;
+            }
+            let ty = mb.m.types.intern(ir::TypeDef::Array(et, len));
+            workgroup_bytes += ir::layout::layout(&mb.m.types, ty).size;
+            let kind = ir::ResourceKind::Workgroup;
+            let res = ir::Resource { name: param.name.clone(), binding: u32::MAX, kind, ty };
+            resources[e][i] = Some(mb.m.add_resource(res));
+        }
+    }
+    let max = wrela_abi::Limits::DEFAULT.max_workgroup_storage_size;
+    if workgroup_bytes > max {
+        let at = program.func(iface.entries[0].func).sig_span;
+        cx.err(
+            Diagnostic::new(
+                codes::E0602,
+                at,
+                format!(
+                    "{what} has {workgroup_bytes} bytes of workgroup memory; WebGPU's default limit is {max}"
+                ),
+            )
+            .with_help("share fewer elements, or smaller ones"),
+        );
     }
     let uniform = bind_uniform(cx, &mut mb, &iface);
     check_storage_buffers(cx, &iface, uniform.as_ref());
@@ -671,7 +1403,7 @@ fn entry_module(cx: &mut Cx, iface: Rc<Interface>, stage: Entry) -> EntryModule 
             resources,
         })
         .collect();
-    EntryModule { mb, keys, buffers, uniform }
+    EntryModule { mb, keys, bindings, uniform }
 }
 
 /// The uniform block resource (binding 0), from the interface's uniforms: those with a runtime
@@ -681,13 +1413,8 @@ fn bind_uniform(cx: &mut Cx, mb: &mut ModuleBuilder, iface: &Interface) -> Optio
     let program = &checked.program;
     let mut fields = Vec::new();
     let mut map = Vec::new();
-    for (name, t) in &iface.uniforms {
-        // The parameter, in the first entry point that has it.
-        let span = iface
-            .entries
-            .iter()
-            .find_map(|e| program.func(e.func).params.iter().find(|p| p.name == *name))
-            .map(|p| p.span)?;
+    for (e, i, name, t) in &iface.uniforms {
+        let span = program.func(iface.entries[*e].func).params[*i].span;
         if !wrela_sema::traits::implements_builtin(program, *t, Lang::GpuData) {
             cx.err(wrela_sema::gpu::not_gpu_data(program, name, *t, span));
             return None;
@@ -733,7 +1460,18 @@ fn bind_uniform(cx: &mut Cx, mb: &mut ModuleBuilder, iface: &Interface) -> Optio
 fn check_storage_buffers(cx: &mut Cx, iface: &Interface, uniform: Option<&UniformOut>) {
     let max = wrela_abi::manifest::MAX_STORAGE_BUFFERS_PER_STAGE;
     let in_storage = uniform.is_some_and(|u| u.storage);
-    let n = iface.buffers.len() + usize::from(in_storage);
+    // An `Append` is two buffers.
+    let buffers: Vec<(usize, usize)> = iface
+        .bound
+        .iter()
+        .copied()
+        .flat_map(|(e, i)| match iface.entries[e].params[i].1 {
+            ParamClass::Buffer { .. } => vec![(e, i)],
+            ParamClass::Append { .. } => vec![(e, i), (e, i)],
+            _ => Vec::new(),
+        })
+        .collect();
+    let n = buffers.len() + usize::from(in_storage);
     if n <= max {
         return;
     }
@@ -741,16 +1479,11 @@ fn check_storage_buffers(cx: &mut Cx, iface: &Interface, uniform: Option<&Unifor
     let program = &checked.program;
     let param = |(e, i): (usize, usize)| &program.func(iface.entries[e].func).params[i];
     // Where it goes over: the first buffer past the limit, else the uniform block's first value.
-    let span = match iface.buffers.get(max) {
+    let span = match buffers.get(max) {
         Some(&at) => param(at).span,
-        None => iface
-            .entries
-            .iter()
-            .find_map(|e| {
-                let f = program.func(e.func);
-                f.params.iter().find(|p| p.name == iface.uniforms[0].0)
-            })
-            .map_or(program.func(iface.entries[0].func).sig_span, |p| p.span),
+        None => iface.uniforms.first().map_or(program.func(iface.entries[0].func).sig_span, |u| {
+            program.func(iface.entries[u.0].func).params[u.1].span
+        }),
     };
     let names: Vec<String> =
         iface.entries.iter().map(|e| format!("`{}`", program.func(e.func).name)).collect();
@@ -777,11 +1510,12 @@ fn lower_compute(cx: &mut Cx, iface: Rc<Interface>) -> Option<PipelineOut> {
     let Some(Entry::Compute(wg)) = cx.entry_of(kernel) else { return None };
     let checked = cx.checked;
     let name = &checked.program.func(kernel).name;
-    let EntryModule { mut mb, keys, buffers, uniform } =
+    let EntryModule { mut mb, keys, bindings, uniform } =
         entry_module(cx, iface.clone(), Entry::Compute(wg));
     let entry = entry_function(&mut mb, &keys[0], name, None, None);
     cx.drain(&mut mb);
     check_recursion(cx, &mb);
+    check_workgroup(cx, &mb, entry, &entry_inputs(&iface.entries[0], true));
     mb.m.entry_points.push(ir::EntryPoint {
         name: ir::ident(name),
         stage: ir::Stage::Compute { workgroup_size: wg },
@@ -794,7 +1528,10 @@ fn lower_compute(cx: &mut Cx, iface: Rc<Interface>) -> Option<PipelineOut> {
         module: mb.m,
         kind: PipelineKind::Compute { workgroup_size: wg },
         uniform,
-        buffers,
+        bindings,
+        key: PipelineKey::Compute { kernel: FnId(0), substs: Vec::new() },
+        sites: Vec::new(),
+        debug_flag: None,
     })
 }
 
@@ -804,7 +1541,7 @@ fn lower_render(cx: &mut Cx, iface: Rc<Interface>) -> Option<PipelineOut> {
     let vret = iface.vertex_ret?;
     let vdef = checked.program.func(vertex.func);
     let fdef = checked.program.func(fragment.func);
-    let EntryModule { mut mb, keys, buffers, uniform } =
+    let EntryModule { mut mb, keys, bindings, uniform } =
         entry_module(cx, iface.clone(), Entry::Vertex);
     let vret_ir = cx.lower_ty(&mut mb, vret, vdef.sig_span)?;
     let ventry = entry_function(&mut mb, &keys[0], &vdef.name, Some(vret_ir), None);
@@ -851,7 +1588,10 @@ fn lower_render(cx: &mut Cx, iface: Rc<Interface>) -> Option<PipelineOut> {
         module: mb.m,
         kind: PipelineKind::Render,
         uniform,
-        buffers,
+        bindings,
+        key: PipelineKey::Compute { kernel: FnId(0), substs: Vec::new() },
+        sites: Vec::new(),
+        debug_flag: None,
     })
 }
 
@@ -956,12 +1696,16 @@ pub(crate) fn bind_entry_params(fl: &mut Fl, func: FnId, entry: Entry) {
                 let Some(it) = fl.cx.lower_ty(fl.mb, *t, p.span) else { continue };
                 Repr::Var(fl.bind_local(&p.name, it, ir::Expr::EntryInput(input(*b))))
             }
-            ParamClass::Buffer { .. } => match fl.key.resources().get(i).copied().flatten() {
+            ParamClass::Buffer { .. }
+            | ParamClass::Append { .. }
+            | ParamClass::Workgroup { .. }
+            | ParamClass::Texture { .. }
+            | ParamClass::Sampler { .. } => match fl.key.resources().get(i).copied().flatten() {
                 Some(r) => Repr::Place(ir::Place::root(ir::PlaceRoot::Resource(r))),
                 None => Repr::Erased,
             },
             ParamClass::Uniform => {
-                let k = iface.uniforms.iter().position(|(n, _)| *n == p.name);
+                let k = iface.uniforms.iter().position(|u| u.0 == e && u.1 == i);
                 match (uniform, k.and_then(|k| fields.get(k).copied().flatten())) {
                     (Some(u), Some(field)) => Repr::Place(ir::Place {
                         root: ir::PlaceRoot::Resource(u),
@@ -1034,6 +1778,29 @@ fn check_recursion(cx: &mut Cx, mb: &ModuleBuilder) {
                 return;
             }
         }
+    }
+}
+
+/// A debug build's bounds checks (`ir::bounds`), whose flag is pipeline number `code` (from
+/// 1). A pipeline that already has WebGPU's default limit of storage buffers isn't checked.
+pub(crate) fn debug_checks(cx: &mut Cx, out: &mut PipelineOut, code: u32) {
+    let storage = out.bindings.iter().filter(|b| b.kind.is_buffer()).count()
+        + usize::from(out.uniform.as_ref().is_some_and(|u| u.storage));
+    if storage >= wrela_abi::manifest::MAX_STORAGE_BUFFERS_PER_STAGE {
+        return;
+    }
+    let used =
+        out.bindings.iter().map(|b| b.binding).chain(out.uniform.as_ref().map(|u| u.binding));
+    let binding = used.max().map_or(0, |b| b + 1);
+    if ir::bounds::add_checks(&mut out.module, binding, code).is_none() {
+        return;
+    }
+    match ir::verify(&out.module) {
+        Ok(()) => out.debug_flag = Some(binding),
+        Err(e) => cx.err(Diagnostic::internal(format!(
+            "the bounds checks for `{}` made malformed IR: {e}",
+            out.name
+        ))),
     }
 }
 

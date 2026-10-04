@@ -1,0 +1,17 @@
+// Two statements on one line with nothing between them. A statement ends at a line break;
+// wrela has no `;`. Put the second statement on its own line.
+// ---- wrong
+fn twice(x: i32) -> i32 {
+    let a = x let b = x
+    a + b
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+fn twice(x: i32) -> i32 {
+    let a = x
+    let b = x
+    a + b
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

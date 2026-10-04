@@ -2,7 +2,7 @@
 use std::field::{Surface, sphere}
 use std::gpu::{ClipPosition, FragCoord, VertexIndex, begin_screen_pass, draw, present}
 
-struct Scene: Copy + Clone + GpuData {
+struct Scene: Copy + GpuData {
     resolution: vec2,
     eye: vec3,
 }

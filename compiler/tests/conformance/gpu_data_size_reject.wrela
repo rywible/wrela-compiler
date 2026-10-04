@@ -3,11 +3,11 @@
 // program's 1 MiB command buffer.
 use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch}
 
-struct Big: Copy + Clone + GpuData {
+struct Big: Copy + GpuData {
     xs: [f32; 300000],
 }
 
-struct Fits: Copy + Clone + GpuData {
+struct Fits: Copy + GpuData {
     xs: [f32; 200000],
 }
 
@@ -17,7 +17,7 @@ fn sum<T: GpuData>(big: T, out: mut Slots<f32>, id: GlobalId) {
 }
 
 pub fn frame(time: f32, width: u32, height: u32) {
-    let out: GpuBuffer<f32> = buffer(64)
-    dispatch(sum, groups: 1, big: Big { xs: [1.0; 300000] }, out: out) //~ E0702
-    dispatch(sum, groups: 1, big: Fits { xs: [1.0; 200000] }, out: out)
+    var out: GpuBuffer<f32> = buffer(64)
+    dispatch(sum.bind(big: Big { xs: [1.0; 300000] }, out: mut out), groups: 1) //~ E0702
+    dispatch(sum.bind(big: Fits { xs: [1.0; 200000] }, out: mut out), groups: 1)
 }

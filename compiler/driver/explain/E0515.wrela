@@ -1,0 +1,40 @@
+// A move, inside a loop, of a value from outside the loop: the second time round there'd be
+// nothing to move. Move a `.clone()`, or move it after the loop.
+// ---- wrong
+struct Log {
+    lines: Vec<Text>,
+}
+
+fn archive(log: take Log) -> u32 {
+    log.lines.len()
+}
+
+fn each(n: u32) -> u32 {
+    var log = Log { lines: Vec::new() }
+    var total = 0
+    for _ in 0..n {
+        total += archive(take log)
+    }
+    total
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+struct Log: Clone {
+    lines: Vec<Text>,
+}
+
+fn archive(log: take Log) -> u32 {
+    log.lines.len()
+}
+
+fn each(n: u32) -> u32 {
+    let log = Log { lines: Vec::new() }
+    var total = 0
+    for _ in 0..n {
+        total += archive(log.clone())
+    }
+    total
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

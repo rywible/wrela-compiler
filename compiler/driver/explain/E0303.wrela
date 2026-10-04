@@ -1,0 +1,21 @@
+// A call leaves out a parameter that has no default.
+// ---- wrong
+fn area(width: f32, height: f32) -> f32 {
+    width * height
+}
+
+fn wall() -> f32 {
+    area(width: 3.0)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+fn area(width: f32, height: f32) -> f32 {
+    width * height
+}
+
+fn wall() -> f32 {
+    area(width: 3.0, height: 2.0)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

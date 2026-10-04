@@ -1,0 +1,22 @@
+// rejects: gpu.buffer-drop
+// A moved buffer is gone.
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch}
+
+@compute(64)
+fn fill(out: mut Slots<f32>, id: GlobalId) {
+    out[id] = 1.0
+}
+
+pub struct World {
+    kept: GpuBuffer<f32>,
+}
+
+pub fn init() -> World {
+    World { kept: buffer(1) }
+}
+
+pub fn frame(state: mut World, time: f32, width: u32, height: u32) {
+    var a: GpuBuffer<f32> = buffer(64)
+    state.kept = take a
+    dispatch(fill.bind(out: mut a), groups: 1) //~ E0500
+}

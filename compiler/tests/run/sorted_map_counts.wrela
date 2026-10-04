@@ -1,0 +1,27 @@
+// run: counting values in a `SortedMap`
+// expect: most_common() = 3
+
+pub fn most_common() -> u32 {
+    let values = [3, 1, 3, 2, 3, 2]
+    var counts: SortedMap<u32, u32> = SortedMap::new()
+    for v in values {
+        let n = match counts.get(v) {
+            Some(n) => n,
+            None => 0,
+        }
+        let _ = counts.insert(v, n + 1)
+    }
+    var best = 0
+    var best_count = 0
+    borrow keys = counts.keys()
+    borrow found = counts.values()
+    for i in 0..keys.len() {
+        if found[i] > best_count {
+            best = keys[i]
+            best_count = found[i]
+        }
+    }
+    best
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

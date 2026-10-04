@@ -20,9 +20,17 @@ fn count(input: [f32], out: mut Slots<u32>, id: GlobalId) {
     out[id] = input.len() + id.x
 }
 
-pub fn frame(time: f32, width: u32, height: u32) {
-    let input: GpuBuffer<f32> = buffer(10)
-    write(input, 0, [1.0, 2.0, 3.0])
-    let out: GpuBuffer<u32> = buffer(64)
-    dispatch(count, groups: 1, input: input, out: out)
+/// The counts, kept for the test to read back.
+pub struct Counts {
+    out: GpuBuffer<u32>,
+}
+
+pub fn init() -> Counts {
+    Counts { out: buffer(64) }
+}
+
+pub fn frame(state: mut Counts, time: f32, width: u32, height: u32) {
+    var input: GpuBuffer<f32> = buffer(10)
+    write(mut input, 0, [1.0, 2.0, 3.0])
+    dispatch(count.bind(input: input, out: mut state.out), groups: 1)
 }

@@ -1,0 +1,28 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0217",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "this format spec isn't valid: `f` isn't part of a spec",
+      "notes": [
+        "a spec is `[<^>][0][width][.precision][x]`, as in `{x:>8.2}` (§4)"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 12,
+        "end": 137,
+        "end_column": 13,
+        "end_line": 5,
+        "line": 5,
+        "start": 136
+      },
+      "title": "an f-string's format spec that isn't valid"
+    }
+  ],
+  "version": 2
+}

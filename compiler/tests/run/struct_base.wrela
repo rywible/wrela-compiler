@@ -2,7 +2,7 @@
 // expect: base_once() = 10110
 // expect: base_fields() = 723
 
-struct P: Copy + Clone {
+struct P: Copy {
     x: i32,
     y: i32,
     z: i32,

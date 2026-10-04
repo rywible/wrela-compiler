@@ -1,0 +1,7 @@
+// mistake: `assert!`, as in Rust
+// expect: E0115
+// fix: yes
+fn halve(n: u32) -> u32 {
+    assert!(n % 2 == 0, "{} is odd", n)
+    n / 2
+}

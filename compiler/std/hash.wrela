@@ -1,0 +1,255 @@
+// Hashing (language.md §6.11): `StateHash`, a whole value's checksum, derived field by field.
+// It hashes what a value holds, never where it's stored: a value's bytes are a function of its
+// fields (§6.10), with NaNs canonical, so equal states hash equally on every client.
+
+/// A 64-bit hash being computed. Each word is mixed in by a multiply and a shift; `finish`
+/// mixes the state once more, so every input bit reaches every output bit.
+pub struct Hasher: Copy {
+    state: u64,
+}
+
+impl Hasher {
+    /// A hasher that has had nothing written to it.
+    pub fn new() -> Hasher {
+        Hasher { state: 0x243f6a8885a308d3 }
+    }
+
+    /// Mixes in `x`.
+    pub fn write_u64(mut self, x: u64) {
+        let s = (self.state ^ x).wrapping_mul(0x9e3779b97f4a7c15)
+        self.state = s ^ (s >> 29)
+    }
+
+    /// Mixes in `x`, widened to 64 bits.
+    pub fn write_u32(mut self, x: u32) {
+        self.write_u64(u64(x))
+    }
+
+    /// A run of UTF-8: its length, then its bytes, eight to a word.
+    pub fn write_str(mut self, s: str) {
+        let n = s.len()
+        self.write_u32(n)
+        var word: u64 = 0
+        var k = 0
+        for i in 0..n {
+            word = word | (u64(s.byte(i)) << (8 * k))
+            k += 1
+            if k == 8 {
+                self.write_u64(word)
+                word = 0
+                k = 0
+            }
+        }
+        if k > 0 {
+            self.write_u64(word)
+        }
+    }
+
+    /// The hash.
+    pub fn finish(self) -> u64 {
+        var z = self.state
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9)
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb)
+        z ^ (z >> 31)
+    }
+}
+
+/// A value's checksum, field by field: `world.state_hash(mut h)`. Declare it on a type, `struct
+/// World: StateHash { ... }`, and it's derived; an enum's variant is hashed before its fields.
+///
+/// ```wrela
+/// use std::hash::{Hasher, StateHash}
+///
+/// struct Herd: StateHash {
+///     count: u32,
+///     centre: vec3,
+/// }
+///
+/// var h = Hasher::new()
+/// Herd { count: 3, centre: vec3() }.state_hash(mut h)
+/// let checksum = h.finish()
+/// ```
+@fieldwise
+pub trait StateHash {
+    /// Writes the value's fields into `h`, in order.
+    fn state_hash(self, h: mut Hasher)
+
+    /// Writes which variant an enum value is: by default, its index. The derived `state_hash`
+    /// calls it before the variant's fields.
+    fn state_hash_variant(index: u32, name: Text, h: mut Hasher) {
+        h.write_u32(index)
+    }
+}
+
+/// The checksum of `x`.
+pub fn state_hash<T: StateHash>(x: T) -> u64 {
+    var h = Hasher::new()
+    x.state_hash(mut h)
+    h.finish()
+}
+
+/// An `f32`'s bits, with every NaN the same one (§11).
+pub fn canonical_bits(x: f32) -> u32 {
+    if x != x {
+        0x7fc00000
+    } else {
+        bitcast_u32(x)
+    }
+}
+
+/// An `f64`'s bits, with every NaN the same one (§11).
+pub fn canonical_bits64(x: f64) -> u64 {
+    if x != x {
+        0x7ff8000000000000
+    } else {
+        bitcast_u64(x)
+    }
+}
+
+// The leaves.
+
+impl StateHash for bool {
+    fn state_hash(self, h: mut Hasher) {
+        h.write_u32(if self { 1 } else { 0 })
+    }
+}
+
+impl StateHash for u8 {
+    fn state_hash(self, h: mut Hasher) {
+        h.write_u32(u32(self))
+    }
+}
+
+impl StateHash for i8 {
+    fn state_hash(self, h: mut Hasher) {
+        h.write_u32(u32(self))
+    }
+}
+
+impl StateHash for u16 {
+    fn state_hash(self, h: mut Hasher) {
+        h.write_u32(u32(self))
+    }
+}
+
+impl StateHash for i16 {
+    fn state_hash(self, h: mut Hasher) {
+        h.write_u32(u32(self))
+    }
+}
+
+impl StateHash for u32 {
+    fn state_hash(self, h: mut Hasher) {
+        h.write_u32(self)
+    }
+}
+
+impl StateHash for i32 {
+    fn state_hash(self, h: mut Hasher) {
+        h.write_u32(u32(self))
+    }
+}
+
+impl StateHash for u64 {
+    fn state_hash(self, h: mut Hasher) {
+        h.write_u64(self)
+    }
+}
+
+impl StateHash for i64 {
+    fn state_hash(self, h: mut Hasher) {
+        h.write_u64(u64(self))
+    }
+}
+
+impl StateHash for f32 {
+    fn state_hash(self, h: mut Hasher) {
+        h.write_u32(canonical_bits(self))
+    }
+}
+
+impl StateHash for f64 {
+    fn state_hash(self, h: mut Hasher) {
+        h.write_u64(canonical_bits64(self))
+    }
+}
+
+impl StateHash for vec2 {
+    fn state_hash(self, h: mut Hasher) {
+        h.write_u32(canonical_bits(self.x))
+        h.write_u32(canonical_bits(self.y))
+    }
+}
+
+impl StateHash for vec3 {
+    fn state_hash(self, h: mut Hasher) {
+        h.write_u32(canonical_bits(self.x))
+        h.write_u32(canonical_bits(self.y))
+        h.write_u32(canonical_bits(self.z))
+    }
+}
+
+impl StateHash for vec4 {
+    fn state_hash(self, h: mut Hasher) {
+        h.write_u32(canonical_bits(self.x))
+        h.write_u32(canonical_bits(self.y))
+        h.write_u32(canonical_bits(self.z))
+        h.write_u32(canonical_bits(self.w))
+    }
+}
+
+impl StateHash for str {
+    fn state_hash(self, h: mut Hasher) {
+        h.write_str(self)
+    }
+}
+
+impl StateHash for Text {
+    fn state_hash(self, h: mut Hasher) {
+        h.write_str(self)
+    }
+}
+
+impl StateHash for String {
+    fn state_hash(self, h: mut Hasher) {
+        h.write_str(self)
+    }
+}
+
+impl<T: StateHash> StateHash for Vec<T> {
+    fn state_hash(self, h: mut Hasher) {
+        h.write_u32(self.len())
+        for x in self {
+            x.state_hash(mut h)
+        }
+    }
+}
+
+impl<T: StateHash> StateHash for Box<T> {
+    fn state_hash(self, h: mut Hasher) {
+        self.get().state_hash(mut h)
+    }
+}
+
+impl<T: StateHash, const N: u32> StateHash for [T; N] {
+    fn state_hash(self, h: mut Hasher) {
+        for x in self {
+            x.state_hash(mut h)
+        }
+    }
+}
+
+impl<A: StateHash, B: StateHash> StateHash for (A, B) {
+    fn state_hash(self, h: mut Hasher) {
+        self.0.state_hash(mut h)
+        self.1.state_hash(mut h)
+    }
+}
+
+impl<A: StateHash, B: StateHash, C: StateHash> StateHash for (A, B, C) {
+    fn state_hash(self, h: mut Hasher) {
+        self.0.state_hash(mut h)
+        self.1.state_hash(mut h)
+        self.2.state_hash(mut h)
+    }
+}

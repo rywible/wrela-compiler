@@ -1,0 +1,14 @@
+// A `wrela.toml` that isn't valid: a key wrela doesn't know, or a value of the wrong kind. A
+// package's manifest has `[package]` (`name`, `unsafe`) and `[dependencies]`, whose entries are
+// `name = { path = "..." }`.
+// ---- wrong
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- file wrela.toml
+[package]
+name = "game"
+version = "1.0"
+// ---- fixed
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- file wrela.toml
+[package]
+name = "game"

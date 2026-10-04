@@ -1,0 +1,35 @@
+// A `barrier` that some invocations of a workgroup might not reach: inside a branch on a
+// value that varies by invocation. Every invocation must reach each barrier, or the GPU waits
+// for good. Put the barrier where they all go.
+// ---- wrong
+use std::gpu::{GlobalId, GpuBuffer, LocalId, Shared, Slots, barrier, buffer, dispatch}
+
+@compute(64)
+fn half(out: mut Slots<f32>, row: mut Shared<f32, 64>, lid: LocalId, id: GlobalId) {
+    let mine = row.chunk(lid)
+    row.write(mine, 0, 1.0)
+    if lid.x < 32 {
+        barrier(mut row)
+    }
+    out[id] = row.get(0)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    var out: GpuBuffer<f32> = buffer(64)
+    dispatch(half.bind(mut out), groups: 1)
+}
+// ---- fixed
+use std::gpu::{GlobalId, GpuBuffer, LocalId, Shared, Slots, barrier, buffer, dispatch}
+
+@compute(64)
+fn half(out: mut Slots<f32>, row: mut Shared<f32, 64>, lid: LocalId, id: GlobalId) {
+    let mine = row.chunk(lid)
+    row.write(mine, 0, 1.0)
+    barrier(mut row)
+    out[id] = row.get(0)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    var out: GpuBuffer<f32> = buffer(64)
+    dispatch(half.bind(mut out), groups: 1)
+}

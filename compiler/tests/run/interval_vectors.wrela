@@ -1,0 +1,30 @@
+// run: the interval of a vector result is one derived function, the same as each component's
+// expect: same(0.0) = true
+// expect: same(1.0) = true
+// expect: encloses() = true
+use std::derive::{Box3, gradient, interval}
+
+fn f(p: vec3) -> f32 {
+    length(p) - 1.0 + 0.1 * sin(3.0 * p.x)
+}
+
+/// The box of the gradient over a box, against its three components' intervals.
+pub fn same(shift: f32) -> bool {
+    let b = Box3 { lo: vec3(0.5 + shift, 0.2, -0.1), hi: vec3(0.7 + shift, 0.4, 0.1) }
+    let all = interval(|q: vec3| gradient(|s: vec3| f(s), q), b)
+    let x = interval(|q: vec3| gradient(|s: vec3| f(s), q).x, b)
+    let y = interval(|q: vec3| gradient(|s: vec3| f(s), q).y, b)
+    let z = interval(|q: vec3| gradient(|s: vec3| f(s), q).z, b)
+    all.lo == vec3(x.lo, y.lo, z.lo) && all.hi == vec3(x.hi, y.hi, z.hi)
+}
+
+/// A vector function's box holds its value at a point inside.
+pub fn encloses() -> bool {
+    let b = Box3 { lo: vec3(0.1, 0.2, 0.3), hi: vec3(0.2, 0.3, 0.4) }
+    let r = interval(|q: vec3| vec3(sin(q.x), q.y * q.z, exp(q.z)), b)
+    let v = vec3(sin(0.15), 0.25 * 0.35, exp(0.35))
+    r.lo.x <= v.x && r.lo.y <= v.y && r.lo.z <= v.z && v.x <= r.hi.x && v.y <= r.hi.y && v.z <= r.hi.z
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+}

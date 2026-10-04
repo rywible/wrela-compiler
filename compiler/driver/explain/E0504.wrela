@@ -1,0 +1,24 @@
+// `mut` at a call for a parameter that isn't `mut`. Only a `mut` parameter changes its
+// argument: drop the marker, or make the parameter `mut`.
+// ---- wrong
+fn double(x: f32) -> f32 {
+    x * 2.0
+}
+
+fn twice() -> f32 {
+    var x = 1.0
+    double(mut x)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+fn double(x: f32) -> f32 {
+    x * 2.0
+}
+
+fn twice() -> f32 {
+    var x = 1.0
+    double(x)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

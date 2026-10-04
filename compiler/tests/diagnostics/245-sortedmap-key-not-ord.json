@@ -1,0 +1,75 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0400",
+      "file": "main.wrela",
+      "fixes": [
+        {
+          "edits": [
+            {
+              "end": 156,
+              "file": "main.wrela",
+              "replacement": " + Ord",
+              "start": 156
+            }
+          ],
+          "message": "opt `Cell` in to `Ord`"
+        }
+      ],
+      "help": [
+        "opt in where `Cell` is declared: `struct Cell: Ord { ... }`"
+      ],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "`Cell` doesn't implement `Ord`, which `K` in `SortedMap<K, V>::new` needs",
+      "notes": [],
+      "severity": "error",
+      "span": {
+        "column": 35,
+        "end": 258,
+        "end_column": 51,
+        "end_line": 12,
+        "line": 12,
+        "start": 242
+      },
+      "title": "a type that doesn't implement a trait"
+    },
+    {
+      "code": "E0400",
+      "file": "main.wrela",
+      "fixes": [
+        {
+          "edits": [
+            {
+              "end": 156,
+              "file": "main.wrela",
+              "replacement": " + Ord",
+              "start": 156
+            }
+          ],
+          "message": "opt `Cell` in to `Ord`"
+        }
+      ],
+      "help": [
+        "opt in where `Cell` is declared: `struct Cell: Ord { ... }`"
+      ],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "`Cell` doesn't implement `Ord`, which `K` in `SortedMap<K, V>::len` needs",
+      "notes": [],
+      "severity": "error",
+      "span": {
+        "column": 5,
+        "end": 270,
+        "end_column": 12,
+        "end_line": 13,
+        "line": 13,
+        "start": 263
+      },
+      "title": "a type that doesn't implement a trait"
+    }
+  ],
+  "version": 2
+}

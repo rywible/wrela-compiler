@@ -1,0 +1,112 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0114",
+      "file": "main.wrela",
+      "fixes": [
+        {
+          "edits": [
+            {
+              "end": 98,
+              "file": "main.wrela",
+              "replacement": "",
+              "start": 94
+            }
+          ],
+          "message": "remove it"
+        }
+      ],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "`'a` is a lifetime, which wrela doesn't have",
+      "notes": [
+        "wrela has no references, so nothing needs a lifetime: a parameter reads its argument in place, and a projection lives as long as the call that made it (§6.4)"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 10,
+        "end": 97,
+        "end_column": 12,
+        "end_line": 4,
+        "line": 4,
+        "start": 95
+      },
+      "title": "a lifetime or a loop label, which wrela doesn't have"
+    },
+    {
+      "code": "E0106",
+      "file": "main.wrela",
+      "fixes": [
+        {
+          "edits": [
+            {
+              "end": 104,
+              "file": "main.wrela",
+              "replacement": "",
+              "start": 103
+            }
+          ],
+          "message": "remove the `&`"
+        }
+      ],
+      "help": [
+        "for a parameter, write `x: T` to borrow it or `x: mut T` to change it; to refer to another value long-term, store a `Handle<T>`"
+      ],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "`&` isn't a type in wrela",
+      "notes": [
+        "wrela has no references; parameters have modes instead (language.md §6.2)"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 18,
+        "end": 104,
+        "end_column": 19,
+        "end_line": 4,
+        "line": 4,
+        "start": 103
+      },
+      "title": "`&` isn't a type or an operator on places"
+    },
+    {
+      "code": "E0114",
+      "file": "main.wrela",
+      "fixes": [
+        {
+          "edits": [
+            {
+              "end": 107,
+              "file": "main.wrela",
+              "replacement": "",
+              "start": 104
+            }
+          ],
+          "message": "remove it"
+        }
+      ],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "`'a` is a lifetime, which wrela doesn't have",
+      "notes": [
+        "wrela has no references, so nothing needs a lifetime: a parameter reads its argument in place, and a projection lives as long as the call that made it (§6.4)"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 19,
+        "end": 106,
+        "end_column": 21,
+        "end_line": 4,
+        "line": 4,
+        "start": 104
+      },
+      "title": "a lifetime or a loop label, which wrela doesn't have"
+    }
+  ],
+  "version": 2
+}

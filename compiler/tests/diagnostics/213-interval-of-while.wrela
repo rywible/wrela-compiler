@@ -1,0 +1,16 @@
+// mistake: the interval of a function with a `while` loop on its input
+// expect: E0701
+// fix: no
+use std::derive::{Interval, interval}
+
+fn settle(t: f32) -> f32 {
+    var x = t
+    while x > 1.0 {
+        x = x * 0.5
+    }
+    x
+}
+
+pub fn bound(lo: f32) -> f32 {
+    interval(settle, Interval { lo, hi: lo + 1.0 }).hi
+}

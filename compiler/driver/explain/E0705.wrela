@@ -1,0 +1,25 @@
+// A constant whose computation didn't finish within the build's fuel limit: a loop that
+// doesn't end, or far more work than a constant should do.
+// ---- wrong
+const COUNT: u32 = forever()
+
+fn forever() -> u32 {
+    var n: u32 = 0
+    loop {
+        n = n.wrapping_add(1)
+    }
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+const COUNT: u32 = count()
+
+fn count() -> u32 {
+    var n: u32 = 0
+    for _ in 0..1000 {
+        n += 1
+    }
+    n
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

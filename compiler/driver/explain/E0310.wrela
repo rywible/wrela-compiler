@@ -1,0 +1,13 @@
+// A call of a value that isn't a function or a closure.
+// ---- wrong
+fn scale(factor: f32, x: f32) -> f32 {
+    factor(x)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+fn scale(factor: f32, x: f32) -> f32 {
+    factor * x
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

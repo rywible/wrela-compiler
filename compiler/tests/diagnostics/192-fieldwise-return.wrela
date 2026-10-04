@@ -1,0 +1,7 @@
+// mistake: a `@fieldwise` method that returns a number
+// expect: E0416
+// fix: no
+@fieldwise
+trait Weight {
+    fn weight(self) -> f32
+}

@@ -1,0 +1,20 @@
+// run: `par_each_mut` and `par_map_reduce` over a `Vec`
+// expect: total_x(2) = 4500.0
+
+struct Particle: Copy {
+    x: f32,
+    v: f32,
+}
+
+pub fn total_x(steps: u32) -> f32 {
+    var ps: Vec<Particle> = Vec::new()
+    for i in 0..1000 {
+        ps.push(Particle { x: 0.0, v: f32(i % 10) })
+    }
+    for _ in 0..steps {
+        ps.par_each_mut(|p| { p.x += p.v * 0.5 })
+    }
+    ps.par_map_reduce(0.0, |p| p.x, |a, b| a + b)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

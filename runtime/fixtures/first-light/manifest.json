@@ -1,6 +1,6 @@
 {
-  "manifest_version": 1,
-  "stream_version": 2,
+  "manifest_version": 2,
+  "stream_version": 4,
   "wasm": "game.wasm",
   "pipelines": [
     {
@@ -14,10 +14,10 @@
         "size": 32,
         "space": "uniform"
       },
-      "buffers": [
+      "bindings": [
         {
           "binding": 1,
-          "access": "read"
+          "kind": "read"
         }
       ]
     },
@@ -36,10 +36,10 @@
         "size": 16,
         "space": "uniform"
       },
-      "buffers": [
+      "bindings": [
         {
           "binding": 1,
-          "access": "read_write"
+          "kind": "read_write"
         }
       ]
     }

@@ -1,0 +1,22 @@
+// A positional argument comes after a named one. Positional arguments come first, then named
+// ones in any order.
+// ---- wrong
+fn clamp_to(x: f32, lo: f32, hi: f32) -> f32 {
+    min(max(x, lo), hi)
+}
+
+fn f() -> f32 {
+    clamp_to(lo: 0.0, 2.0, hi: 1.0)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+fn clamp_to(x: f32, lo: f32, hi: f32) -> f32 {
+    min(max(x, lo), hi)
+}
+
+fn f() -> f32 {
+    clamp_to(2.0, lo: 0.0, hi: 1.0)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

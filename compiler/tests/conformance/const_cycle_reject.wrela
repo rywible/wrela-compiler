@@ -1,0 +1,8 @@
+// rejects: const.build
+// The code that computes a constant can't read the constant itself, through the functions it
+// calls.
+const COUNT: u32 = count() //~ E0328
+
+fn count() -> u32 {
+    COUNT + 1
+}

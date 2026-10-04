@@ -2,22 +2,38 @@
 //!
 //! ```text
 //! wrela check <package-dir> [--json]      check a package; exit 1 if it has errors
-//! wrela build <package-dir> [-o <dir>]    check and build; writes <dir> (default <package>/build)
+//! wrela build <package-dir> [-o <dir>] [--debug]
+//!                                         check and build; writes <dir> (default
+//!                                         <package>/build); --debug adds checks (§11)
 //! wrela fmt <file-or-dir>... [--check]    format in place; --check only reports
+//! wrela fix <package-dir> [--json]        make every fix a tool can make, and report each
+//! wrela explain <code>                    what a diagnostic code means, with a program that
+//!                                         has it and the program fixed
+//! wrela doc <item> [<package-dir>]        an item's signature, doc comment and examples
+//! wrela pipelines <package-dir> [--json]  each GPU entry point's instantiations (§7)
+//! wrela test <package-dir> [<filter>] [--json]
+//!                                         run the package's `@test` functions (§10), or
+//!                                         those whose names contain `filter`; exit 1 if one
+//!                                         fails
 //! ```
 //!
 //! Exit status: 0 success, 1 the program has errors (or `fmt --check` found unformatted
-//! files), 2 a usage or I/O error.
+//! files, or a test failed), 2 a usage or I/O error.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 mod build;
+mod doc;
+mod explain;
+mod fix;
 mod fmt;
+mod pipelines;
+mod test;
 
 pub(crate) fn usage() -> ExitCode {
     eprintln!(
-        "usage:\n  wrela check <package-dir> [--json]\n  wrela build <package-dir> [-o <out-dir>] [--json]\n  wrela fmt <file-or-dir>... [--check]"
+        "usage:\n  wrela check <package-dir> [--json]\n  wrela build <package-dir> [-o <out-dir>] [--debug] [--json]\n  wrela fmt <file-or-dir>... [--check]\n  wrela fix <package-dir> [--json]\n  wrela explain <code>\n  wrela doc <item> [<package-dir>]\n  wrela pipelines <package-dir> [--json]\n  wrela test <package-dir> [<filter>] [--json]"
     );
     ExitCode::from(2)
 }
@@ -33,6 +49,11 @@ fn main() -> ExitCode {
         },
         "build" => build::run(rest),
         "fmt" => fmt::run(rest),
+        "fix" => fix::run(rest),
+        "explain" => explain::run(rest),
+        "doc" => doc::run(rest),
+        "pipelines" => pipelines::run(rest),
+        "test" => test::run(rest),
         "--help" | "-h" | "help" => {
             usage();
             ExitCode::SUCCESS
@@ -58,13 +79,15 @@ pub(crate) struct PackageArgs {
     pub json: bool,
     /// `-o <dir>`, which only `build` takes.
     pub out: Option<PathBuf>,
+    /// `--debug`, which only `build` takes.
+    pub debug: bool,
 }
 
 /// Reads the arguments of `check`, or of `build` (`takes_out`), and checks that the package is
 /// a directory with a `main.wrela`. On an error, the message is printed and the exit status
 /// returned.
 pub(crate) fn package_args(args: &[String], takes_out: bool) -> Result<PackageArgs, ExitCode> {
-    let (mut dir, mut out, mut json) = (None, None, false);
+    let (mut dir, mut out, mut json, mut debug) = (None, None, false, false);
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -73,6 +96,7 @@ pub(crate) fn package_args(args: &[String], takes_out: bool) -> Result<PackageAr
                 None => return Err(usage()),
             },
             "--json" => json = true,
+            "--debug" if takes_out => debug = true,
             _ if dir.is_none() && !a.starts_with('-') => dir = Some(PathBuf::from(a)),
             _ => return Err(unknown(a)),
         }
@@ -89,7 +113,7 @@ pub(crate) fn package_args(args: &[String], takes_out: bool) -> Result<PackageAr
         eprintln!("error: `{}` has no main.wrela, so it isn't a package", dir.display());
         return Err(ExitCode::from(2));
     }
-    Ok(PackageArgs { dir, json, out })
+    Ok(PackageArgs { dir, json, out, debug })
 }
 
 /// Prints diagnostics, as JSON or for people. Returns whether there were errors.

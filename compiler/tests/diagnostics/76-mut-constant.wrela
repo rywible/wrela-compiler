@@ -1,4 +1,4 @@
-// mistake: lending a constant `mut`, as if it were a place
+// mistake: lending a constant `mut`, to change it in place
 // expect: E0512
 // fix: no
 const START: f32 = 1.0

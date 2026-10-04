@@ -1,0 +1,24 @@
+// A hook of a `@fieldwise` trait's method (`m_field`, `m_variant`) that doesn't fit: it has no
+// default body, or its parameters aren't what the derivation passes (`m_field` takes the field's
+// `name: Text`, then the method's other parameters).
+// ---- wrong
+@fieldwise
+trait Show {
+    fn show(self, out: mut String)
+
+    fn show_field(name: u32, out: mut String) {}
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+@fieldwise
+trait Show {
+    fn show(self, out: mut String)
+
+    fn show_field(name: Text, out: mut String) {
+        out.push_str(name)
+        out.push_str(": ")
+    }
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

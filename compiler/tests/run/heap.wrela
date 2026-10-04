@@ -1,0 +1,137 @@
+// run: the heap: `Vec`, `String` and `Box` allocate, grow, and free their memory when dropped
+// expect: sum_vec(10) = 45
+// expect: sum_vec(1000) = 499500
+// expect: pop_all(5) = 10
+// expect: index_past_end(3) traps
+// expect: text_len() = 5
+// expect: string_len() = 11
+// expect: boxed(7) = 49
+// expect: cloned() = 3
+// expect: nested(4) = 10
+// expect: reuse(100) = 100
+// expect: no_leak(2048) = 2048
+// expect: drop_on_exits(1000) = 1000
+
+pub fn sum_vec(n: u32) -> u32 {
+    var v = Vec::new()
+    for i in 0..n {
+        v.push(i)
+    }
+    var total = 0
+    for x in v {
+        total += x
+    }
+    total
+}
+
+pub fn pop_all(n: u32) -> u32 {
+    var v = Vec::new()
+    for i in 0..n {
+        v.push(i)
+    }
+    var total = 0
+    loop {
+        let Some(x) = v.pop() else { break }
+        total += x
+    }
+    total
+}
+
+pub fn index_past_end(n: u32) -> u32 {
+    var v = Vec::new()
+    for i in 0..n {
+        v.push(i)
+    }
+    v[n]
+}
+
+pub fn text_len() -> u32 {
+    let t = "hello"
+    t.len()
+}
+
+pub fn string_len() -> u32 {
+    var s = String::new()
+    s.push_str("hello")
+    s.push_str(" world")
+    s.len()
+}
+
+pub fn boxed(x: u32) -> u32 {
+    let b = Box::new(x * x)
+    b.get()
+}
+
+pub fn cloned() -> u32 {
+    var a = Vec::new()
+    a.push(1)
+    a.push(2)
+    let b = a.clone()
+    a.push(3)
+    a.len() + b.len() - 2
+}
+
+/// A `Vec` of `Vec`s: each inner one dropped with the outer.
+pub fn nested(n: u32) -> u32 {
+    var outer = Vec::new()
+    for i in 0..n {
+        var inner = Vec::new()
+        for j in 0..i + 1 {
+            inner.push(j)
+        }
+        outer.push(take inner)
+    }
+    var total = 0
+    for v in outer {
+        total += v.len()
+    }
+    total
+}
+
+/// Allocating and dropping in a loop reuses the freed blocks.
+pub fn reuse(n: u32) -> u32 {
+    var count = 0
+    for i in 0..n {
+        var v = Vec::with_capacity(64)
+        v.push(i)
+        count += v.len()
+    }
+    count
+}
+
+/// 2 GiB if nothing were freed; the memory stops at 1 GiB.
+pub fn no_leak(n: u32) -> u32 {
+    var count = 0
+    for _ in 0..n {
+        var v: Vec<u8> = Vec::with_capacity(1048576)
+        v.push(1)
+        count += v.len()
+    }
+    count
+}
+
+fn early(n: u32) -> u32 {
+    var v: Vec<u8> = Vec::with_capacity(1048576)
+    v.push(1)
+    if n % 2 == 0 {
+        return 1
+    }
+    var w: Vec<u8> = Vec::with_capacity(1048576)
+    w.push(2)
+    loop {
+        let big: Vec<u8> = Vec::with_capacity(1048576)
+        if big.capacity() > 0 {
+            break
+        }
+    }
+    v.len()
+}
+
+/// Values are dropped on `return` and `break` too.
+pub fn drop_on_exits(n: u32) -> u32 {
+    var count = 0
+    for i in 0..n {
+        count += early(i)
+    }
+    count
+}

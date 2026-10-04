@@ -1,0 +1,45 @@
+// accepts: gpu.dispatch
+// Entry points bound to their arguments: positional, named and defaults, as a call's; each
+// shader's arguments its own, so both may take a `scale`, and one may be named `instances`.
+use std::gpu::{
+    ClipPosition, FragCoord, GlobalId, GpuBuffer, Slots, VertexIndex, begin_screen_pass, buffer,
+    dispatch, draw, present,
+}
+
+struct P: Copy + GpuData {
+    s: f32,
+}
+
+@compute(64)
+fn fill(scale: f32, out: mut Slots<f32>, bias: f32 = 0.5, id: GlobalId) {
+    out[id] = scale + bias
+}
+
+@compute(64)
+fn clear(id: GlobalId) {}
+
+@vertex
+fn vs(v: VertexIndex, scale: f32, instances: P) -> ClipPosition {
+    ClipPosition { position: vec4(f32(v.index) * scale * instances.s, 0.0, 0.0, 1.0) }
+}
+
+@fragment
+fn fs(pixel: FragCoord, scale: f32) -> vec4 {
+    vec4(scale, 0.0, 0.0, 1.0)
+}
+
+@vertex
+fn cover(v: VertexIndex) -> ClipPosition {
+    ClipPosition { position: vec4(f32(v.index % 2), f32(v.index / 2), 0.0, 1.0) }
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    var out: GpuBuffer<f32> = buffer(64)
+    dispatch(fill.bind(1.0, mut out), groups: 1)
+    dispatch(fill.bind(out: mut out, scale: 2.0, bias: 0.0), groups: (1, 1, 1))
+    dispatch(clear, groups: 1)
+    begin_screen_pass(clear: vec4(0.0, 0.0, 0.0, 1.0))
+    draw(vs.bind(0.5, P { s: 2.0 }), fs.bind(scale: 0.25), vertices: 3, instances: 2)
+    draw(cover, fs.bind(1.0), vertices: 3)
+    present()
+}

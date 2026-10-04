@@ -1,0 +1,12 @@
+// mistake: `&mut x` at a call, as in Rust
+// expect: E0106
+// fix: yes
+fn grow(x: mut f32) {
+    x *= 2.0
+}
+
+fn twice() -> f32 {
+    var x = 1.0
+    grow(&mut x)
+    x
+}

@@ -10,5 +10,5 @@ fn cell(r: Row, i: u32) -> borrow f32 {
 }
 
 fn first(r: Row) -> borrow f32 {
-    cell(r, 0)
+    cell(Row { cells: r.cells }, 0)
 }

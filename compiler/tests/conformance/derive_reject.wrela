@@ -1,11 +1,6 @@
 // rejects: derive.gradient derive.interval eff.derived
 use std::derive::{Interval, gradient, interval}
-use std::gpu::{GpuBuffer, buffer}
 
-fn recorded(x: f32) -> f32 {
-    let b: GpuBuffer<f32> = buffer(4) //~ E0700
-    x
-}
 
 fn wobble(t: f32) -> f32 {
     var x = t
@@ -13,10 +8,6 @@ fn wobble(t: f32) -> f32 {
         x -= 1.0
     }
     x
-}
-
-pub fn a(x: f32) -> f32 {
-    gradient(recorded, x)
 }
 
 pub fn b(x: f32) -> f32 {
@@ -71,7 +62,7 @@ pub fn g(x: f32) -> f32 {
     tower(x)
 }
 
-struct Cell: Copy + Clone {
+struct Cell: Copy {
     a: f32,
     b: f32,
 }

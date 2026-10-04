@@ -195,6 +195,10 @@ const IDENTS: &[&str] = &[
 ];
 const SUFFIXES: &[&str] = &["cm", "m", "kg", "deg", "px", "ms"];
 const STRINGS: &[&str] = &["\"hi\"", "\"\"", "\"a \\\"q\\\" b\"", "\"tab\\t\\n\"", "\"\\\\\""];
+const FSTRINGS: &[&str] = &["f\"hi\"", "f\"\"", "f\"{{x}}\"", "f\"a\\tb\""];
+const FSTRING_HEADS: &[&str] = &["f\"{", "f\"w: {", "f\"{{{"];
+const FSTRING_MIDS: &[&str] = &["}{", "} and {", ":.1}, {", ":>4}{"];
+const FSTRING_TAILS: &[&str] = &["}\"", "} kg\"", ":.2}\"", ":08}}}\""];
 
 /// A name, keyword, number or `_`: two of them written together lex as one token.
 pub(crate) fn is_word(k: TokenKind) -> bool {
@@ -213,23 +217,78 @@ pub(crate) fn is_number(k: TokenKind) -> bool {
 }
 
 /// Whether `a` then `b`, written with nothing between them, lex as exactly those two tokens.
+/// An f-string's pieces are lexed where they'd be (L22): what's around them opens and closes
+/// the holes they need.
 fn lexes_apart(a: TokenKind, a_text: &str, b: TokenKind, b_text: &str) -> bool {
-    let src = format!("{a_text}{b_text}");
+    use TokenKind as T;
+    let opens = |k: TokenKind| matches!(k, T::FStringHead | T::FStringMid);
+    let closes = |k: TokenKind| matches!(k, T::FStringMid | T::FStringTail);
+    // The holes the pair closes without opening (`need`), and those it leaves open.
+    let (mut need, mut open) = (0usize, 0usize);
+    for k in [a, b] {
+        if closes(k) {
+            if open == 0 {
+                need += 1;
+            } else {
+                open -= 1;
+            }
+        }
+        if opens(k) {
+            open += 1;
+        }
+    }
+    let mut pre = "f\"{".repeat(need);
+    let mut pre_k = vec![T::FStringHead; need];
+    if closes(a) {
+        pre.push('x');
+        pre_k.push(T::Ident);
+    } else if need > 0 && a == T::RBrace {
+        // In a hole, a `}` closes a `{` opened there (a space keeps it from reading `{{`).
+        pre.push_str(" {");
+        pre_k.push(T::LBrace);
+    }
+    let (mut post, mut post_k): (String, Vec<TokenKind>) = (String::new(), Vec::new());
+    if opens(b) {
+        post.push('x');
+        post_k.push(T::Ident);
+    } else if open > 0 {
+        // A bracket `b` opens in a hole closes before it.
+        let close = match b {
+            T::LParen => Some((")", T::RParen)),
+            T::LBracket => Some(("]", T::RBracket)),
+            T::LBrace => Some(("}", T::RBrace)),
+            _ => None,
+        };
+        if let Some((text, k)) = close {
+            post.push_str(text);
+            post_k.push(k);
+        }
+    }
+    for _ in 0..open {
+        post.push_str("}\"");
+        post_k.push(T::FStringTail);
+    }
+    let src = format!("{pre}{a_text}{b_text}{post}");
     let lexed = wrela_syntax::lex(FileId(0), &src);
     let kinds: Vec<TokenKind> =
         lexed.tokens.iter().map(|t| t.kind).filter(|k| *k != TokenKind::Eof).collect();
-    lexed.diagnostics.is_empty() && kinds == [a, b] && lexed.comments.is_empty()
+    let expected: Vec<TokenKind> = pre_k.into_iter().chain([a, b]).chain(post_k).collect();
+    lexed.diagnostics.is_empty() && kinds == expected && lexed.comments.is_empty()
 }
 
 /// Representative texts of a token kind: for the classes, one of each form that lexes
 /// differently next to a neighbour (a `.` in a FLOAT or SUFFIXED, a radix prefix, an exponent).
 fn sample_texts(k: TokenKind) -> &'static [&'static str] {
     match k {
-        TokenKind::Ident => &["a", "_a", "e1"],
+        TokenKind::Ident => &["a", "_a", "e1", "f"],
         TokenKind::Int => &["1", "0x1F", "1_0", "0b1"],
         TokenKind::Float => &["1.5", "1e5", "1.5e-3"],
         TokenKind::Suffixed => &["1cm", "1.5cm"],
         TokenKind::Str => &["\"s\""],
+        TokenKind::FString => &["f\"s\""],
+        TokenKind::FStringHead => &["f\"{"],
+        TokenKind::FStringMid => &["}{", ":.1}{"],
+        TokenKind::FStringTail => &["}\"", ":.1}\""],
         _ => &[],
     }
 }
@@ -293,8 +352,21 @@ impl<'g> Generator<'g> {
         Generator { g, config, cost, toward, goals, parent, no_glue: no_glue_pairs(), terminals }
     }
 
-    /// A random derivation of `file`: the grammar's terminals, EOF last.
+    /// A random derivation of `file`: the grammar's terminals, EOF last. A derivation that no
+    /// text can spell ([`renderable`]: a `:` or `}` where an f-string's hole would end) is
+    /// drawn again, and only the one kept counts toward `cov`.
     pub fn generate(&self, rng: &mut Rng, cov: &mut Coverage) -> Vec<Terminal> {
+        loop {
+            let mut c = Coverage::new(self.g);
+            let terms = self.generate_once(rng, &mut c);
+            if renderable(&terms) {
+                cov.merge(&c);
+                return terms;
+            }
+        }
+    }
+
+    fn generate_once(&self, rng: &mut Rng, cov: &mut Coverage) -> Vec<Terminal> {
         let (lo, hi) = self.config.budget;
         let (rule, node) = *rng.pick(&self.goals);
         let path = std::iter::successors(Some(node), |&e| self.parent[e]).collect();
@@ -441,7 +513,17 @@ impl<'g> Generator<'g> {
 
     /// A random small edit of a derivation (delete, insert, replace or swap a token), for
     /// checking that the two parsers also agree on near-miss programs, most of them invalid.
+    /// Only edits that a text can spell ([`renderable`]) are made.
     pub fn mutate(&self, terms: &[Terminal], rng: &mut Rng) -> Vec<Terminal> {
+        loop {
+            let t = self.mutate_once(terms, rng);
+            if renderable(&t) {
+                return t;
+            }
+        }
+    }
+
+    fn mutate_once(&self, terms: &[Terminal], rng: &mut Rng) -> Vec<Terminal> {
         let mut t = terms.to_vec();
         let body = t.len() - 1; // EOF stays last
         let random = |rng: &mut Rng| loop {
@@ -523,6 +605,10 @@ impl<'g> Generator<'g> {
                 format!("{n}{}", rng.pick(SUFFIXES))
             }
             TokenKind::Str => rng.pick(STRINGS).to_string(),
+            TokenKind::FString => rng.pick(FSTRINGS).to_string(),
+            TokenKind::FStringHead => rng.pick(FSTRING_HEADS).to_string(),
+            TokenKind::FStringMid => rng.pick(FSTRING_MIDS).to_string(),
+            TokenKind::FStringTail => rng.pick(FSTRING_TAILS).to_string(),
             k => k.fixed_text().unwrap_or_default().to_string(),
         }
     }
@@ -538,6 +624,7 @@ impl<'g> Generator<'g> {
             brackets: Brackets::default(),
             gt_run: None,
             newline_pending: false,
+            holes: Vec::new(),
         };
         for (i, &t) in terms.iter().enumerate() {
             match t {
@@ -642,6 +729,9 @@ struct Renderer<'a, 'g> {
     gt_run: Option<TokenKind>,
     /// A line break has been written since the last token.
     newline_pending: bool,
+    /// The f-string holes open, innermost last, each with the brackets open in it: a hole is
+    /// on one line, so nothing in it breaks a line (L22).
+    holes: Vec<u32>,
 }
 
 impl Renderer<'_, '_> {
@@ -670,8 +760,13 @@ impl Renderer<'_, '_> {
     }
 
     /// Writes a grammar NEWLINE as a line break. `next` is the kind of the next token that
-    /// isn't a NEWLINE (EOF if there is none).
+    /// isn't a NEWLINE (EOF if there is none). In an f-string's hole there's no line break to
+    /// write: the NEWLINE is dropped.
     fn newline(&mut self, next: TokenKind, rng: &mut Rng) {
+        if !self.holes.is_empty() {
+            self.dropped += 1;
+            return;
+        }
         if self.newline_pending {
             // L18: line breaks with no token between them make at most one NEWLINE.
         } else if self.break_is_whitespace(next) {
@@ -706,7 +801,7 @@ impl Renderer<'_, '_> {
         {
             let glue = !self.g.no_glue.contains(&(prev, kind)) && rng.chance(0.5);
             if !glue {
-                if self.break_is_whitespace(kind) && rng.chance(0.06) {
+                if self.holes.is_empty() && self.break_is_whitespace(kind) && rng.chance(0.06) {
                     self.line_break(rng);
                 } else {
                     self.text.push(' ');
@@ -719,7 +814,53 @@ impl Renderer<'_, '_> {
         self.newline_pending = false;
         self.gt_run = (t == Terminal::GtClose).then_some(TokenKind::Gt);
         self.brackets.track(kind);
+        track_hole(&mut self.holes, kind);
     }
+}
+
+/// Follows f-string holes through a token (L22): returns false where the lexer would read the
+/// token otherwise, a `:` or `}` outside brackets in a hole (which end it), or an FSTRING_MID
+/// or FSTRING_TAIL outside one.
+fn track_hole(holes: &mut Vec<u32>, k: TokenKind) -> bool {
+    use TokenKind as T;
+    match k {
+        T::FStringHead => holes.push(0),
+        T::FStringMid | T::FStringTail => {
+            if holes.last() != Some(&0) {
+                return false;
+            }
+            if k == T::FStringTail {
+                holes.pop();
+            }
+        }
+        _ => {
+            if let Some(d) = holes.last_mut() {
+                match k {
+                    T::LParen | T::LBracket | T::LBrace => *d += 1,
+                    T::RBrace | T::Colon if *d == 0 => return false,
+                    T::RParen | T::RBracket | T::RBrace => *d = d.saturating_sub(1),
+                    _ => {}
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Whether a text can spell this sequence of terminals: every f-string's hole closes, and
+/// nothing in one would end it early ([`track_hole`]).
+pub fn renderable(terms: &[Terminal]) -> bool {
+    let mut holes = Vec::new();
+    for t in terms {
+        let k = t.lexer_kind();
+        if k == TokenKind::Eof {
+            break;
+        }
+        if !track_hole(&mut holes, k) {
+            return false;
+        }
+    }
+    holes.is_empty()
 }
 
 /// A token `run` that ends with a GT_CLOSE (`>` or `>>`) joined with a following token `next`,

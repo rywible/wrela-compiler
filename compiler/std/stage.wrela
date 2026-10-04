@@ -1,0 +1,296 @@
+// Fields built at runtime (language.md §7, D-029, D-053): a tape of operations, which
+// `interpret` evaluates. A field the program assembles while it runs, from an edit log or a
+// sculpting tool, has no code of its own to compile; its tape is data. A `Tape` is a `Surface`
+// like any compiled field, on the CPU and the GPU, and its gradient and interval are derived
+// from `interpret`'s own code, as any function's are (§13).
+//
+// Each operation writes its own register, the one at its index, from earlier registers or a
+// constant; the last register is the field's value. A tape is fixed-size, so it's `GpuData`
+// and passes to a kernel as a uniform.
+
+use std::derive::{Box3, Interval, interval}
+use std::field::{Surface, smin}
+
+/// The most operations a tape holds.
+pub const TAPE_LEN: u32 = 128
+
+// The operations.
+const X: u32 = 0
+const Y: u32 = 1
+const Z: u32 = 2
+const CONST: u32 = 3
+const ADD: u32 = 4
+const SUB: u32 = 5
+const MUL: u32 = 6
+const DIV: u32 = 7
+const MIN: u32 = 8
+const MAX: u32 = 9
+const SMIN: u32 = 10
+const NEG: u32 = 11
+const ABS: u32 = 12
+const SQRT: u32 = 13
+const SIN: u32 = 14
+const COS: u32 = 15
+const EXP: u32 = 16
+const COPY: u32 = 17
+
+/// One operation: its register gets `code` of registers `a` and `b`, or of the constant `c`
+/// (a coordinate's offset, a constant's value, a smooth minimum's width).
+pub struct Op: Copy + GpuData {
+    code: u32,
+    a: u32,
+    b: u32,
+    c: f32,
+}
+
+/// A value on a tape: the register an operation writes.
+pub struct Reg: Copy {
+    index: u32,
+}
+
+/// A field built at runtime: up to `TAPE_LEN` operations over the point. Build one with its
+/// methods, each of which adds an operation and returns its register; the last one added is
+/// the field's value.
+pub struct Tape: Copy + GpuData {
+    ops: [Op; 128],
+    len: u32,
+}
+
+/// The value of `tape`'s field at `p`: its last register.
+pub fn interpret(tape: Tape, p: vec3) -> f32 {
+    var r = [0.0; 128]
+    for i in 0..tape.len {
+        let op = tape.ops[i]
+        r[i] = match op.code {
+            X => p.x - op.c,
+            Y => p.y - op.c,
+            Z => p.z - op.c,
+            CONST => op.c,
+            ADD => r[op.a] + r[op.b],
+            SUB => r[op.a] - r[op.b],
+            MUL => r[op.a] * r[op.b],
+            DIV => r[op.a] / r[op.b],
+            MIN => min(r[op.a], r[op.b]),
+            MAX => max(r[op.a], r[op.b]),
+            SMIN => smin(r[op.a], r[op.b], op.c),
+            NEG => -r[op.a],
+            ABS => abs(r[op.a]),
+            SQRT => sqrt(r[op.a]),
+            SIN => sin(r[op.a]),
+            COS => cos(r[op.a]),
+            EXP => exp(r[op.a]),
+            _ => r[op.a],
+        }
+    }
+    if tape.len == 0 { 0.0 } else { r[tape.len - 1] }
+}
+
+impl Surface for Tape {
+    fn distance(self, p: vec3) -> f32 {
+        interpret(self, p)
+    }
+}
+
+impl Tape {
+    /// An empty tape, whose value is 0 until an operation is added.
+    pub fn new() -> Tape {
+        Tape { ops: [Op { code: CONST, a: 0, b: 0, c: 0.0 }; 128], len: 0 }
+    }
+
+    /// How many operations it holds.
+    pub fn len(self) -> u32 {
+        self.len
+    }
+
+    fn op(mut self, code: u32, a: Reg, b: Reg, c: f32) -> Reg {
+        if self.len == TAPE_LEN {
+            panic("a tape holds at most 128 operations")
+        }
+        if a.index >= self.len && code != X && code != Y && code != Z && code != CONST {
+            panic("a register from another tape, or from after this operation")
+        }
+        if b.index >= self.len && code >= ADD && code <= SMIN {
+            panic("a register from another tape, or from after this operation")
+        }
+        self.ops[self.len] = Op { code, a: a.index, b: b.index, c }
+        self.len += 1
+        Reg { index: self.len - 1 }
+    }
+
+    /// The point's x coordinate.
+    pub fn x(mut self) -> Reg {
+        self.op(X, Reg { index: 0 }, Reg { index: 0 }, 0.0)
+    }
+
+    /// The point's y coordinate.
+    pub fn y(mut self) -> Reg {
+        self.op(Y, Reg { index: 0 }, Reg { index: 0 }, 0.0)
+    }
+
+    /// The point's z coordinate.
+    pub fn z(mut self) -> Reg {
+        self.op(Z, Reg { index: 0 }, Reg { index: 0 }, 0.0)
+    }
+
+    /// The value `c`.
+    pub fn constant(mut self, c: f32) -> Reg {
+        self.op(CONST, Reg { index: 0 }, Reg { index: 0 }, c)
+    }
+
+    /// `a + b`.
+    pub fn add(mut self, a: Reg, b: Reg) -> Reg {
+        self.op(ADD, a, b, 0.0)
+    }
+
+    /// `a - b`.
+    pub fn sub(mut self, a: Reg, b: Reg) -> Reg {
+        self.op(SUB, a, b, 0.0)
+    }
+
+    /// `a * b`.
+    pub fn mul(mut self, a: Reg, b: Reg) -> Reg {
+        self.op(MUL, a, b, 0.0)
+    }
+
+    /// `a / b`.
+    pub fn div(mut self, a: Reg, b: Reg) -> Reg {
+        self.op(DIV, a, b, 0.0)
+    }
+
+    /// `min(a, b)`.
+    pub fn min(mut self, a: Reg, b: Reg) -> Reg {
+        self.op(MIN, a, b, 0.0)
+    }
+
+    /// `max(a, b)`.
+    pub fn max(mut self, a: Reg, b: Reg) -> Reg {
+        self.op(MAX, a, b, 0.0)
+    }
+
+    /// std::field's `smin(a, b, k)`: a minimum whose seam is rounded over a width of about `k`.
+    pub fn smooth_min(mut self, a: Reg, b: Reg, k: f32) -> Reg {
+        self.op(SMIN, a, b, k)
+    }
+
+    /// `-a`.
+    pub fn neg(mut self, a: Reg) -> Reg {
+        self.op(NEG, a, a, 0.0)
+    }
+
+    /// `abs(a)`.
+    pub fn abs(mut self, a: Reg) -> Reg {
+        self.op(ABS, a, a, 0.0)
+    }
+
+    /// `sqrt(a)`.
+    pub fn sqrt(mut self, a: Reg) -> Reg {
+        self.op(SQRT, a, a, 0.0)
+    }
+
+    /// `sin(a)`.
+    pub fn sin(mut self, a: Reg) -> Reg {
+        self.op(SIN, a, a, 0.0)
+    }
+
+    /// `cos(a)`.
+    pub fn cos(mut self, a: Reg) -> Reg {
+        self.op(COS, a, a, 0.0)
+    }
+
+    /// `exp(a)`.
+    pub fn exp(mut self, a: Reg) -> Reg {
+        self.op(EXP, a, a, 0.0)
+    }
+
+    /// The length of `(a, b, c)`, as `length` computes it: the squares summed in order, then
+    /// the root.
+    pub fn length(mut self, a: Reg, b: Reg, c: Reg) -> Reg {
+        let aa = self.mul(a, a)
+        let bb = self.mul(b, b)
+        let cc = self.mul(c, c)
+        let ab = self.add(aa, bb)
+        let s = self.add(ab, cc)
+        self.sqrt(s)
+    }
+
+    /// A sphere's distance: `sphere(radius).translate(center)`, as std::field computes it.
+    pub fn sphere(mut self, center: vec3, radius: f32) -> Reg {
+        let x = self.op(X, Reg { index: 0 }, Reg { index: 0 }, center.x)
+        let y = self.op(Y, Reg { index: 0 }, Reg { index: 0 }, center.y)
+        let z = self.op(Z, Reg { index: 0 }, Reg { index: 0 }, center.z)
+        let d = self.length(x, y, z)
+        let r = self.constant(radius)
+        self.sub(d, r)
+    }
+
+    /// The register `k`'s value over `over`, as `interval` derives it from `interpret`.
+    fn register_interval(self, k: u32, over: Box3) -> Interval {
+        var upto = self
+        upto.len = k + 1
+        interval(|q| interpret(upto, q), over)
+    }
+
+    /// The same field within `over`, with less work: each minimum or maximum whose operands'
+    /// intervals over `over` don't overlap (by the smooth minimum's width, for one) becomes the
+    /// operand it always picks, then the operations the value no longer uses are dropped (D-029:
+    /// Keeter's interval pruning). Inside `over`, the result is the same as the original at
+    /// every point; outside, it may not be.
+    pub fn prune(self, over: Box3) -> Tape {
+        var ops = self.ops
+        for i in 0..self.len {
+            let op = ops[i]
+            if op.code == MIN || op.code == MAX || op.code == SMIN {
+                let a = self.register_interval(op.a, over)
+                let b = self.register_interval(op.b, over)
+                // The width a smooth minimum blends over; 0 for the others.
+                let k = if op.code == SMIN { max(op.c, 0.0) } else { 0.0 }
+                let a_low = a.hi + k <= b.lo
+                let b_low = b.hi + k <= a.lo
+                let keep_a = if op.code == MAX { b_low } else { a_low }
+                let keep_b = if op.code == MAX { a_low } else { b_low }
+                if keep_a {
+                    ops[i] = Op { code: COPY, a: op.a, b: op.a, c: 0.0 }
+                } else if keep_b {
+                    ops[i] = Op { code: COPY, a: op.b, b: op.b, c: 0.0 }
+                }
+            }
+        }
+        if self.len == 0 {
+            return self
+        }
+        // The registers the value uses, from the last back.
+        var used = [false; 128]
+        used[self.len - 1] = true
+        var i = self.len
+        while i > 0 {
+            i -= 1
+            if used[i] {
+                let op = ops[i]
+                if op.code >= ADD {
+                    used[op.a] = true
+                    if op.code <= SMIN {
+                        used[op.b] = true
+                    }
+                }
+            }
+        }
+        // Those operations, in order, renumbered; a copy reads through to what it copies.
+        var out = Tape::new()
+        var at = [0; 128]
+        for j in 0..self.len {
+            if used[j] {
+                let op = ops[j]
+                if op.code == COPY && j + 1 < self.len {
+                    at[j] = at[op.a]
+                } else {
+                    at[j] = out.len
+                    let a = if op.code >= ADD { at[op.a] } else { op.a }
+                    let b = if op.code >= ADD && op.code <= SMIN { at[op.b] } else { op.b }
+                    out.ops[out.len] = Op { code: op.code, a, b, c: op.c }
+                    out.len += 1
+                }
+            }
+        }
+        out
+    }
+}

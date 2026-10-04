@@ -1,0 +1,6 @@
+// mistake: a `version` in `wrela.toml`, as in Cargo
+// expect: E0219
+// fix: no
+fn one() -> u32 {
+    1
+}

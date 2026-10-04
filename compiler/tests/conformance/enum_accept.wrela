@@ -1,5 +1,5 @@
 // accepts: enum.match ty.option
-enum Edit: Copy + Clone {
+enum Edit: Copy {
     Dig { at: vec3, radius: f32 },
     Fill { at: vec3, radius: f32 },
     Clear,

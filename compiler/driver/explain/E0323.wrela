@@ -1,0 +1,14 @@
+// A vector constructor whose arguments don't add up to its components: `vec3` takes three
+// `f32`s, or a `vec2` and an `f32`, or one `f32` for every component.
+// ---- wrong
+fn up() -> vec3 {
+    vec3(0.0, 1.0)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+fn up() -> vec3 {
+    vec3(0.0, 1.0, 0.0)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

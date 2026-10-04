@@ -1,0 +1,54 @@
+// rejects: const.tests
+// A `@test` is a free function of no parameters and no result, which runs on the CPU as the
+// build runs constants (§10).
+use std::gpu::{GpuBuffer, buffer}
+
+struct Meter {
+    value: f32,
+}
+
+impl Meter {
+    @test
+    fn reads(self) { //~ E0222
+        assert(self.value >= 0.0)
+    }
+}
+
+@test
+fn scaled(by: f32) { //~ E0222
+    assert(by * 2.0 == by + by)
+}
+
+@test
+fn computed() -> bool { //~ E0222
+    1 + 1 == 2
+}
+
+@test
+fn generic<T: Copy>() { //~ E0222
+}
+
+@test
+@compute(64)
+fn kernel() { //~ E0222
+}
+
+// Its effects are a constant's: it can't record GPU work.
+@test
+fn records() {
+    let _b: GpuBuffer<f32> = buffer(4) //~ E0600
+}
+
+// `@test(frames: n)` runs the program's frames first: from 1 to 36000 of them.
+@test(frames: 0) //~ E0222
+fn no_frames() {
+}
+
+@test(frame: 10) //~ E0222
+fn misspelt() {
+}
+
+// This program has no state (`init` makes one), so a frame test takes nothing.
+@test(frames: 10)
+fn wants_state(n: u32) { //~ E0222
+}

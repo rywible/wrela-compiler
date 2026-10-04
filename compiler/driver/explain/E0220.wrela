@@ -1,0 +1,44 @@
+// A dependency whose `path` isn't a directory. A path is relative to the `wrela.toml` that
+// declares it.
+// ---- wrong
+use geometry::shapes::area
+
+fn coin() -> f32 {
+    area(0.01)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- file wrela.toml
+[package]
+name = "game"
+
+[dependencies]
+geometry = { path = "geometri" }
+// ---- file geometry/wrela.toml
+[package]
+name = "geometry"
+// ---- file geometry/shapes.wrela
+pub fn area(r: f32) -> f32 {
+    3.14159 * r * r
+}
+// ---- fixed
+use geometry::shapes::area
+
+fn coin() -> f32 {
+    area(0.01)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- file wrela.toml
+[package]
+name = "game"
+
+[dependencies]
+geometry = { path = "geometry" }
+// ---- file geometry/wrela.toml
+[package]
+name = "geometry"
+// ---- file geometry/shapes.wrela
+pub fn area(r: f32) -> f32 {
+    3.14159 * r * r
+}

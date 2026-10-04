@@ -13,11 +13,11 @@
       "severity": "error",
       "span": {
         "column": 5,
-        "end": 239,
+        "end": 231,
         "end_column": 12,
         "end_line": 11,
         "line": 11,
-        "start": 232
+        "start": 224
       },
       "title": "an operator that doesn't apply to these types"
     }

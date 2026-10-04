@@ -1,14 +1,115 @@
 // The prelude: in scope in every module, with the built-in types and functions.
 
+pub use std::cmp::{Eq, Ord, Ordering}
+pub use std::collections::{Box, Vec, replace, swap}
+pub use std::string::{Bytes, String, Text}
+pub use std::arena::{Arena, Handle, SortedMap}
+pub use std::quat::Quat
+use std::hash::StateHash
+use std::serialize::Serialize
+
 /// A value that may be absent. There's no null (language.md §6.1).
-pub enum Option<T>: Copy + Clone {
+pub enum Option<T>: Copy + Eq + Ord + StateHash + Serialize + Plain {
     None,
     Some(T),
 }
 
-/// Deep-copied with `.clone()` (§6.1). The compiler implements it structurally for types that
-/// opt in: `struct S: Clone { ... }`.
-pub trait Clone {}
+/// The outcome of something that can fail: its value, or an error (§15). `x?` is `x`'s value,
+/// or returns its `Err` from the function.
+pub enum Result<T, E>: Copy + Eq + Ord + StateHash + Serialize {
+    Ok(T),
+    Err(E),
+}
+
+impl<T> Option<T> {
+    /// Whether it holds a value.
+    pub fn is_some(self) -> bool {
+        match self {
+            Some(_) => true,
+            None => false,
+        }
+    }
+
+    /// Whether it's `None`.
+    pub fn is_none(self) -> bool {
+        match self {
+            Some(_) => false,
+            None => true,
+        }
+    }
+
+    /// Its value; panics if it's `None`.
+    pub fn unwrap(take self) -> T {
+        match take self {
+            Some(x) => x,
+            None => panic("unwrap of `None`"),
+        }
+    }
+
+    /// Its value; panics with `message` if it's `None`.
+    pub fn expect(take self, message: str) -> T {
+        match take self {
+            Some(x) => x,
+            None => panic(message),
+        }
+    }
+
+    /// Its value, or `default` if it's `None`.
+    pub fn unwrap_or(take self, default: take T) -> T {
+        match take self {
+            Some(x) => x,
+            None => take default,
+        }
+    }
+}
+
+impl<T, E> Result<T, E> {
+    /// Whether it's `Ok`.
+    pub fn is_ok(self) -> bool {
+        match self {
+            Ok(_) => true,
+            Err(_) => false,
+        }
+    }
+
+    /// Whether it's `Err`.
+    pub fn is_err(self) -> bool {
+        match self {
+            Ok(_) => false,
+            Err(_) => true,
+        }
+    }
+
+    /// Its value; panics if it's an `Err`.
+    pub fn unwrap(take self) -> T {
+        match take self {
+            Ok(x) => x,
+            Err(_) => panic("unwrap of an `Err`"),
+        }
+    }
+
+    /// Its value, or `None` if it's an `Err`.
+    pub fn ok(take self) -> Option<T> {
+        match take self {
+            Ok(x) => Some(x),
+            Err(_) => None,
+        }
+    }
+}
+
+/// Deep-copied with `.clone()` (§6.1). A type declares it, `struct S: Clone { ... }`, and the
+/// compiler derives it field by field; declaring `Copy` declares it too.
+@fieldwise
+pub trait Clone {
+    /// A deep copy.
+    fn clone(self) -> Self
+
+    /// Copies this into `into`, reusing what `into` owns: a `Vec` keeps its buffer, so once
+    /// `into` has grown to size, nothing is allocated (§6.11).
+    fn clone_into(self, into: mut Self) {
+        into = self.clone()
+    }
+}
 
 /// Copied implicitly (§6.1). Opted in like `Clone`; every field must be `Copy`.
 pub trait Copy: Clone {}
@@ -16,3 +117,55 @@ pub trait Copy: Clone {}
 /// Laid out by WGSL's rules everywhere, so its bytes are the same on the CPU and the GPU
 /// (§6.10). Opted in; every field must be `GpuData`.
 pub trait GpuData {}
+
+/// Data that can be handled as raw bytes: no pointers, padding zeroed, NaNs canonical, so a
+/// value's bytes are a function of its fields (§6.10). Declared like `Copy`, and checked: every
+/// field must be `Plain`. `Vec`, `String` and `Box` aren't.
+@fieldwise
+pub trait Plain {}
+
+impl Plain for bool {}
+
+impl Plain for u8 {}
+
+impl Plain for i8 {}
+
+impl Plain for u16 {}
+
+impl Plain for i16 {}
+
+impl Plain for u32 {}
+
+impl Plain for i32 {}
+
+impl Plain for u64 {}
+
+impl Plain for i64 {}
+
+impl Plain for f32 {}
+
+impl Plain for f64 {}
+
+impl Plain for vec2 {}
+
+impl Plain for vec3 {}
+
+impl Plain for vec4 {}
+
+impl Plain for mat2 {}
+
+impl Plain for mat3 {}
+
+impl Plain for mat4 {}
+
+impl Plain for Text {}
+
+impl Plain for Bytes {}
+
+impl<T: Plain, const N: u32> Plain for [T; N] {}
+
+impl<A: Plain, B: Plain> Plain for (A, B) {}
+
+impl<A: Plain, B: Plain, C: Plain> Plain for (A, B, C) {}
+
+impl<A: Plain, B: Plain, C: Plain, D: Plain> Plain for (A, B, C, D) {}

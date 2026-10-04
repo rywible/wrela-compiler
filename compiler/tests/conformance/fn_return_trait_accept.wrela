@@ -1,10 +1,26 @@
 // accepts: fn.return-trait
-use std::field::{Surface, sphere}
+// A trait names a type in return position (the one type the body returns), or several joined
+// with `+`, which the type has every one of; in parameter position, `x: A + B` is any type
+// with them all. A generic parameter that only a bound mentions (`C` in `F: Field<C>`) is
+// inferred from the one way the argument has that trait.
+use std::field::{Color, Field, Lipschitz, Surface, rgb, sphere}
 
 fn ball(r: f32) -> Surface {
     sphere(r).translate(vec3(y: r))
 }
 
+fn red_ball(r: f32) -> Field<Color> + Lipschitz {
+    sphere(r).with(rgb(r: 1.0, g: 0.0, b: 0.0))
+}
+
+fn reach(f: Field<Color> + Lipschitz) -> f32 {
+    f.lipschitz(0.1) + f.channels(vec3()).r
+}
+
+fn red<C, F: Field<C>>(f: F, p: vec3) -> C {
+    f.channels(p)
+}
+
 fn f() -> f32 {
-    ball(1.0).distance(vec3())
+    ball(1.0).distance(vec3()) + reach(red_ball(0.5)) + red(red_ball(0.5), vec3()).g
 }

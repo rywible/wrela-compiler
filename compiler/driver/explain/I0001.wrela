@@ -1,0 +1,3 @@
+// A bug in the compiler, not in your program: the compiler reached a state it shouldn't. The
+// message says where. Please report it, with the program that shows it.
+// ---- untested: no correct program should give it

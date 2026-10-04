@@ -1,0 +1,14 @@
+// Comparisons don't chain: `a < b < c` isn't "b is between a and c". Join two comparisons with
+// `&&`.
+// ---- wrong
+fn inside(lo: f32, x: f32, hi: f32) -> bool {
+    lo < x < hi
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+fn inside(lo: f32, x: f32, hi: f32) -> bool {
+    lo < x && x < hi
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

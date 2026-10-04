@@ -1,0 +1,30 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0305",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [
+        "check which unit was meant"
+      ],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "`1.5km` is a length and `30deg` is an angle or a ratio: one can't be compared with the other",
+      "notes": [
+        "units are constants in SI (§5): both are numbers, but their units say they measure different things"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 5,
+        "end": 118,
+        "end_column": 18,
+        "end_line": 5,
+        "line": 5,
+        "start": 105
+      },
+      "title": "an operator that doesn't apply to these types"
+    }
+  ],
+  "version": 2
+}

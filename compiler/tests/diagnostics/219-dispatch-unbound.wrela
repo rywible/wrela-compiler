@@ -1,0 +1,14 @@
+// mistake: a dispatch with the kernel's arguments among its own, as before binding
+// expect: E0603
+// fix: yes
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch}
+
+@compute(64)
+fn fill(value: f32, out: mut Slots<f32>, id: GlobalId) {
+    out[id] = value
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    var out: GpuBuffer<f32> = buffer(64)
+    dispatch(fill, groups: 1, value: time, out: mut out)
+}

@@ -2,35 +2,122 @@
 // function that qualifies. Nothing here is specific to fields.
 
 /// A closed range `[lo, hi]` of `f32` values.
-pub struct Interval: Copy + Clone + GpuData {
+pub struct Interval: Copy + GpuData {
     pub lo: f32,
     pub hi: f32,
 }
 
 impl Interval {
+    /// Whether `x` is in the range, ends included.
     pub fn contains(self, x: f32) -> bool {
         self.lo <= x && x <= self.hi
     }
 
+    /// `hi - lo`.
     pub fn width(self) -> f32 {
         self.hi - self.lo
+    }
+
+    /// Point `i` of a sequence that spreads evenly through the range: `seed` chooses the
+    /// sequence. For checking a property at many points: `for i in 0..n { let x =
+    /// range.sample(seed, i) ... }`. The same `seed` and `i` give the same point everywhere.
+    /// The first 2ⁿ points split evenly when the range is halved, and halved again, up to n
+    /// times (`sobol`).
+    pub fn sample(self, seed: u32, i: u32) -> f32 {
+        self.lo + (self.hi - self.lo) * sobol(seed, 0, i)
     }
 }
 
 /// An axis-aligned box in 2D.
-pub struct Box2: Copy + Clone + GpuData {
+pub struct Box2: Copy + GpuData {
     pub lo: vec2,
     pub hi: vec2,
 }
 
 /// An axis-aligned box in 3D.
-pub struct Box3: Copy + Clone + GpuData {
+pub struct Box3: Copy + GpuData {
     pub lo: vec3,
     pub hi: vec3,
 }
 
+impl Box2 {
+    /// Point `i` of a sequence that spreads evenly through the box: `seed` chooses the sequence
+    /// (`Interval::sample`).
+    pub fn sample(self, seed: u32, i: u32) -> vec2 {
+        let t = vec2(sobol(seed, 0, i), sobol(seed, 1, i))
+        self.lo + (self.hi - self.lo) * t
+    }
+}
+
+impl Box3 {
+    /// Point `i` of a sequence that spreads evenly through the box: `seed` chooses the sequence
+    /// (`Interval::sample`). For checking a field at many points:
+    ///
+    /// ```wrela
+    /// use std::derive::{Box3, gradient}
+    /// use std::field::{Surface, sphere}
+    ///
+    /// fn gradients_are_unit() -> bool {
+    ///     let ball = sphere(1.0)
+    ///     let b = Box3 { lo: vec3(-2.0), hi: vec3(2.0) }
+    ///     for i in 0..64 {
+    ///         let p = b.sample(7, i)
+    ///         if abs(length(gradient(|q: vec3| ball.distance(q), p)) - 1.0) > 1.0e-4 {
+    ///             return false
+    ///         }
+    ///     }
+    ///     true
+    /// }
+    /// ```
+    pub fn sample(self, seed: u32, i: u32) -> vec3 {
+        let t = vec3(sobol(seed, 0, i), sobol(seed, 1, i), sobol(seed, 2, i))
+        self.lo + (self.hi - self.lo) * t
+    }
+}
+
+/// Point `i` of Sobol's sequence on `axis` (0, 1 or 2), in [0, 1), with the axis shifted by
+/// XOR with a hash of `seed` (a digital shift, which keeps how evenly the points spread). The
+/// first 2ⁿ points split evenly among the cells of a box cut in halves along each axis, as
+/// many times as the sequence allows: 4096 points put 8 in each of 8 × 8 × 8 cells
+/// (`samples_spread_evenly_through_their_box`). The same bits on the CPU and the GPU.
+fn sobol(seed: u32, axis: u32, i: u32) -> f32 {
+    var x: u32 = 0
+    // Direction number b is m(b) << (31 - b), m from the axis's primitive polynomial: none
+    // (axis 0), x + 1 and x² + x + 1, with m(0) = 1 and m(1) = 3.
+    var m1: u32 = 1
+    var m2: u32 = 0
+    for b in 0..32 {
+        if i >> b == 0 {
+            break
+        }
+        var m: u32 = 1
+        if axis == 1 && b > 0 {
+            m = (m1 << 1) ^ m1
+        } else if axis == 2 && b == 1 {
+            m = 3
+        } else if axis == 2 && b > 1 {
+            m = (m1 << 1) ^ (m2 << 2) ^ m2
+        }
+        m2 = m1
+        m1 = m
+        if (i >> b) & 1 == 1 {
+            x = x ^ (if axis == 0 { 1 } else { m }) << (31 - b)
+        }
+    }
+    f32((x ^ scramble(seed.wrapping_mul(4).wrapping_add(axis))) >> 8) * (1.0 / 16777216.0)
+}
+
+/// A 32-bit hash (Chris Wellons's `lowbias32`).
+fn scramble(x: u32) -> u32 {
+    var h = x ^ (x >> 16)
+    h = h.wrapping_mul(2146121005)
+    h = h ^ (h >> 15)
+    h = h.wrapping_mul(2221713035)
+    h ^ (h >> 16)
+}
+
 /// An axis-aligned box in 4D.
-pub struct Box4: Copy + Clone + GpuData {
+pub struct Box4: Copy + GpuData {
     pub lo: vec4,
     pub hi: vec4,
 }
@@ -65,6 +152,41 @@ pub fn gradient<X: Domain>(f: fn(X) -> f32, at: X) -> X {}
 pub fn value_and_gradient<X: Domain>(f: fn(X) -> f32, at: X) -> (f32, X) {}
 
 /// A range that contains `f(x)` for every `x` in `over`, by interval arithmetic over `f`'s
-/// body. On the GPU each operation widens its result outward by its error bound (D-075).
+/// body: an `Interval` for an `f32`, and a box for a vector, each component's range from one
+/// derived function. On the GPU each operation widens its result outward by its error bound
+/// (D-075).
 @intrinsic
-pub fn interval<X: Domain>(f: fn(X) -> f32, over: X::Box) -> Interval {}
+pub fn interval<X: Domain, Y: Domain>(f: fn(X) -> Y, over: X::Box) -> Y::Box {}
+
+// ---- tests (the suite runs std's: `std_tests_pass`) --------------------------------------------
+
+@test
+fn samples_spread_evenly_through_their_box() {
+    let b = Box3 { lo: vec3(-1.0, 2.0, 0.0), hi: vec3(3.0, 2.5, 10.0) }
+    // 4096 points over 8 × 8 × 8 cells: exactly 8 in each (random points would vary by ±3).
+    var cells = [0; 512]
+    for i in 0..4096 {
+        let p = b.sample(11, i)
+        assert(p.x >= b.lo.x && p.y >= b.lo.y && p.z >= b.lo.z, "a sample is below the box")
+        assert(p.x < b.hi.x && p.y < b.hi.y && p.z < b.hi.z, "a sample is above the box")
+        let c = (p - b.lo) / (b.hi - b.lo) * 8.0
+        cells[u32(c.x) + 8 * u32(c.y) + 64 * u32(c.z)] += 1
+    }
+    for k in 0..512 {
+        assert(cells[k] == 8, f"cell {k}")
+    }
+    let (a, c) = (b.sample(seed: 11, i: 5), b.sample(seed: 12, i: 5))
+    assert(a != c, "the seed doesn't change the sequence")
+}
+
+@test
+fn samples_of_a_range_and_a_rectangle_stay_in_them() {
+    let r = Interval { lo: -2.0, hi: 6.0 }
+    let b = Box2 { lo: vec2(0.0, -1.0), hi: vec2(1.0, 1.0) }
+    for i in 0..1024 {
+        let x = r.sample(3, i)
+        assert(r.lo <= x && x < r.hi, "a sample is outside its range")
+        let p = b.sample(3, i)
+        assert(p.x >= b.lo.x && p.y >= b.lo.y && p.x < b.hi.x && p.y < b.hi.y)
+    }
+}

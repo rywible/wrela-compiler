@@ -1,0 +1,7 @@
+// mistake: a std trait used without importing it
+// expect: E0202
+// fix: yes
+struct World: StateHash {
+    seed: u32,
+    turn: u32,
+}

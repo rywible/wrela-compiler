@@ -9,7 +9,10 @@
 //!
 //! - **Brackets (L19).** A variant is specialized on its innermost open bracket: `b` for `{` or
 //!   the top level, `p` for `(` or `[`. Brackets always open and close within one sequence of a
-//!   rule (the export checks this), so each position's bracket is known statically.
+//!   rule (the export checks this), so each position's bracket is known statically. An f-string's
+//!   hole (L22, the rule `hole`) is a context of its own, `h`, and a bracket inside one is `hn`:
+//!   a hole is on one line, so nothing in it breaks a line, and at its top a `:` or `}` would
+//!   end it, so neither is generated there.
 //! - **The previous token (L17).** A variant is specialized on the class of the token before it
 //!   and the class of its own last token: a number, another word (name, keyword, `_`) or
 //!   punctuation, that can or can't end a statement (`nc`, `wc`, `wn`, `pc`, `pn`; the file
@@ -28,7 +31,7 @@
 //!   so some layouts that would be fine are forbidden; none that would merge is allowed.
 //!
 //! IDENT excludes the keywords (through a trie: a regular grammar for the complement) and `_`.
-//! Tier-1 tokens (STRING, SUFFIXED) are left out: the checker rejects them in tier 0. An INT
+//! A SUFFIXED number's unit is letters only, so it's never a type suffix (L13). An INT
 //! after `.` (a tuple index) is limited to four digits so it always fits in `u32`. It's a
 //! terminal of its own here, written right after its `.`, since another `.` may then touch it
 //! (`t.0.1`); a number takes a `.` only when a digit follows it (L12), so before `.` and a name
@@ -53,6 +56,44 @@ enum Ctx {
     Brace,
     /// `(` or `[`.
     Paren,
+    /// The top of an f-string's hole.
+    Hole,
+    /// A bracket inside an f-string's hole.
+    HoleNested,
+}
+
+impl Ctx {
+    fn in_hole(self) -> bool {
+        matches!(self, Ctx::Hole | Ctx::HoleNested)
+    }
+
+    fn code(self) -> &'static str {
+        match self {
+            Ctx::Brace => "b",
+            Ctx::Paren => "p",
+            Ctx::Hole => "h",
+            Ctx::HoleNested => "hn",
+        }
+    }
+}
+
+/// What a production itself opens at a position: a bracket, or an f-string's hole.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Inner {
+    Brace,
+    Paren,
+    Hole,
+}
+
+/// The context at a position that's `inner` of the production, which is in `outer`.
+fn resolve(inner: Option<Inner>, outer: Ctx) -> Ctx {
+    match inner {
+        None => outer,
+        Some(Inner::Hole) => Ctx::Hole,
+        Some(_) if outer.in_hole() => Ctx::HoleNested,
+        Some(Inner::Brace) => Ctx::Brace,
+        Some(Inner::Paren) => Ctx::Paren,
+    }
 }
 
 /// The class of the previous token: a number, another word, or punctuation; and whether it can
@@ -71,9 +112,13 @@ enum Prev {
     Pc,
     Pn,
     Bar,
+    /// An f-string piece that opens a hole (FSTRING_HEAD, FSTRING_MID): a `{` right after it
+    /// would read as `{{` (L22), which no other token minds.
+    Hole,
 }
 
-const PREVS: [Prev; 7] = [Prev::Nc, Prev::Ti, Prev::Wc, Prev::Wn, Prev::Pc, Prev::Pn, Prev::Bar];
+const PREVS: [Prev; 8] =
+    [Prev::Nc, Prev::Ti, Prev::Wc, Prev::Wn, Prev::Pc, Prev::Pn, Prev::Bar, Prev::Hole];
 
 impl Prev {
     fn bit(self) -> u8 {
@@ -93,6 +138,7 @@ impl Prev {
             Prev::Pc => "pc",
             Prev::Pn => "pn",
             Prev::Bar => "bar",
+            Prev::Hole => "ho",
         }
     }
 }
@@ -107,6 +153,9 @@ fn class(t: Terminal) -> Prev {
     }
     if matches!(k, TokenKind::Pipe | TokenKind::OrOr) {
         return Prev::Bar;
+    }
+    if matches!(k, TokenKind::FStringHead | TokenKind::FStringMid) {
+        return Prev::Hole;
     }
     match (is_word(k), k.can_end_statement()) {
         (true, true) => Prev::Wc,
@@ -147,31 +196,38 @@ enum SSym {
 
 struct Specializer<'a> {
     cfg: &'a Cfg,
-    /// Per production and position: the bracket the position is inside, if the production
-    /// itself opened it.
-    inner: Vec<Vec<Option<Ctx>>>,
+    /// Per production and position: the bracket (or hole) the position is inside, if the
+    /// production itself opened it.
+    inner: Vec<Vec<Option<Inner>>>,
     excluded: HashSet<Terminal>,
     /// For each (nonterminal, bracket, class before): the classes it can end in.
     outs: BTreeMap<(usize, Ctx, Prev), u8>,
 }
 
-fn opener(t: Terminal) -> Option<Ctx> {
+fn opener(t: Terminal) -> Option<Inner> {
     match t.lexer_kind() {
-        TokenKind::LBrace => Some(Ctx::Brace),
-        TokenKind::LParen | TokenKind::LBracket => Some(Ctx::Paren),
+        TokenKind::LBrace => Some(Inner::Brace),
+        TokenKind::LParen | TokenKind::LBracket => Some(Inner::Paren),
         _ => None,
     }
 }
 
-/// The bracket each position of each production is inside, when the production opened it.
-fn bracket_contexts(cfg: &Cfg) -> Result<Vec<Vec<Option<Ctx>>>, ExportError> {
+/// The bracket each position of each production is inside, when the production opened it; the
+/// rule `hole` is an f-string's hole wherever it's used.
+fn bracket_contexts(cfg: &Cfg) -> Result<Vec<Vec<Option<Inner>>>, ExportError> {
+    let hole = cfg.nts.iter().position(|n| n.name == "hole");
     let mut out = Vec::new();
     for p in &cfg.prods {
         let mut stack: Vec<TokenKind> = Vec::new();
         let mut ctxs = Vec::new();
         for s in &p.rhs {
-            let here =
-                stack.last().map(|k| if *k == TokenKind::LBrace { Ctx::Brace } else { Ctx::Paren });
+            let here = if hole.is_some() && *s == Sym::N(hole.unwrap_or(usize::MAX)) {
+                Some(Inner::Hole)
+            } else {
+                stack
+                    .last()
+                    .map(|k| if *k == TokenKind::LBrace { Inner::Brace } else { Inner::Paren })
+            };
             ctxs.push(here);
             if let Sym::T(t) = s {
                 if opener(*t).is_some() {
@@ -205,6 +261,10 @@ impl Specializer<'_> {
         if t == NEWLINE {
             return ctx == Ctx::Brace && prev.can_end();
         }
+        // At the top of a hole, `:` starts the format spec and `}` ends the hole (L22).
+        if ctx == Ctx::Hole && matches!(t.lexer_kind(), TokenKind::Colon | TokenKind::RBrace) {
+            return false;
+        }
         true
     }
 
@@ -217,7 +277,7 @@ impl Specializer<'_> {
         let cfg = self.cfg;
         let mut cur = prev.bit();
         for (i, s) in cfg.prods[p].rhs.iter().enumerate() {
-            let c = self.inner[p][i].unwrap_or(ctx);
+            let c = resolve(self.inner[p][i], ctx);
             let mut next = 0;
             for s_prev in PREVS {
                 if cur & s_prev.bit() == 0 {
@@ -294,7 +354,7 @@ impl Specializer<'_> {
             }
             return;
         }
-        let c = self.inner[p][i].unwrap_or(ctx);
+        let c = resolve(self.inner[p][i], ctx);
         match rhs[i] {
             Sym::T(t) => {
                 if self.allowed(t, cur, c) {
@@ -563,10 +623,7 @@ pub fn export(g: &Grammar) -> Result<String, ExportError> {
     let mut cfg = Cfg::lower(g, Recursion::Right);
     mark_tuple_indexes(&mut cfg);
     let inner = bracket_contexts(&cfg)?;
-    let excluded: HashSet<Terminal> =
-        [Terminal::Token(TokenKind::Str), Terminal::Token(TokenKind::Suffixed)]
-            .into_iter()
-            .collect();
+    let excluded: HashSet<Terminal> = HashSet::new();
     let mut sp = Specializer { cfg: &cfg, inner, excluded, outs: BTreeMap::new() };
     sp.solve();
 
@@ -602,8 +659,7 @@ pub fn export(g: &Grammar) -> Result<String, ExportError> {
     let names = |k: Key| -> String {
         let (nt, ctx, prev, last) = k;
         let base = cfg.nts[nt].name.replace(['_', '#'], "-");
-        let c = if ctx == Ctx::Brace { "b" } else { "p" };
-        format!("{base}-{c}-{}-{}", prev.code(), last.code())
+        format!("{base}-{}-{}-{}", ctx.code(), prev.code(), last.code())
     };
     spec.check_no_left_recursion(&nullable, &names)?;
     let mut seen_names = HashSet::new();
@@ -668,9 +724,17 @@ pub fn export(g: &Grammar) -> Result<String, ExportError> {
                         let mandatory = preds.iter().any(|p| {
                             merges(*p, t) && !(dot_then_name && is_number(p.lexer_kind()))
                         });
-                        let line_breaks = ctx == Ctx::Paren
-                            || !prev.can_end()
-                            || t.lexer_kind() == TokenKind::Dot;
+                        // Nothing breaks a line in an f-string's hole, which ends at an
+                        // FSTRING_MID or FSTRING_TAIL (L22).
+                        let closes_hole = matches!(
+                            t.lexer_kind(),
+                            TokenKind::FStringMid | TokenKind::FStringTail
+                        );
+                        let line_breaks = !ctx.in_hole()
+                            && !closes_hole
+                            && (ctx == Ctx::Paren
+                                || !prev.can_end()
+                                || t.lexer_kind() == TokenKind::Dot);
                         // A gap may start with a comment unless a `/` can come before it.
                         let slash = preds.contains(&Terminal::Token(TokenKind::Slash));
                         let gap = if line_breaks {
@@ -756,6 +820,12 @@ fn terminal_text(t: Terminal) -> String {
         Terminal::TupleIndex => "tuple-index".into(),
         Terminal::Token(TokenKind::Int) => "int".into(),
         Terminal::Token(TokenKind::Float) => "float".into(),
+        Terminal::Token(TokenKind::Suffixed) => "suffixed".into(),
+        Terminal::Token(TokenKind::Str) => "string".into(),
+        Terminal::Token(TokenKind::FString) => "fstring".into(),
+        Terminal::Token(TokenKind::FStringHead) => "fstring-head".into(),
+        Terminal::Token(TokenKind::FStringMid) => "fstring-mid".into(),
+        Terminal::Token(TokenKind::FStringTail) => "fstring-tail".into(),
         t => {
             let text = t.fixed_text().unwrap_or_else(|| unreachable!("{t:?} has no text"));
             format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\""))
@@ -764,16 +834,17 @@ fn terminal_text(t: Terminal) -> String {
 }
 
 const HEADER: &str = "\
-# wrela tier 0 source, as a GBNF grammar (llama.cpp) over characters.
+# wrela source, as a GBNF grammar (llama.cpp) over characters.
 # GENERATED from spec/grammar.ebnf by `cargo run -p wrela-grammar --bin export-gbnf`; do not edit.
 #
 # The rules are the grammar's, specialized on context. `name-B-X-Y` is `name` inside bracket B
-# (b: `{` or none, p: `(` or `[`), after a token of class X, ending with a token of class Y.
+# (b: `{` or none, p: `(` or `[`, h: an f-string's hole, hn: a bracket in one), after a token of
+# class X, ending with a token of class Y.
 # Classes (spec/lexical.md L17): nc a number; ti a tuple index; wc, wn another word; pc, pn
-# punctuation (c: can end a statement, n: can't); bar `|` or `||`. NEWLINE is `nl`, a real line break. The gaps between
+# punctuation (c: can end a statement, n: can't); bar `|` or `||`; ho an f-string piece that
+# opens a hole. NEWLINE is `nl`, a real line break. The gaps between
 # tokens are `sp` (spaces and tabs), `ws` (also line breaks and comments), `lead` (`ws` that may
 # start with a comment), and `sp1`/`ws1` (nonempty, where the tokens would otherwise merge).
-# Strings and unit suffixes (tier 1) are left out.
 #
 # It is meant to be sound, not complete: every string it generates parses (checked by sampling:
 # `cargo run -p wrela-grammar --bin gbnf-sample`), while some valid layouts are left out.
@@ -840,6 +911,19 @@ int ::= [0-9] [0-9_]* | \"0x\" [0-9a-fA-F] [0-9a-fA-F_]* | \"0b\" [01] [01_]* | 
 tuple-index ::= [0-9] [0-9]? [0-9]? [0-9]?
 float ::= [0-9] [0-9_]* \".\" [0-9] [0-9_]* exponent? | [0-9] [0-9_]* exponent
 exponent ::= [eE] [+-]? [0-9] [0-9_]*
+# SUFFIXED (L13): a decimal number and a unit of letters, not starting with `e` (never a type
+# suffix, which has digits; nor `x`, `b` or `o`, which after a `0` read as a radix prefix).
+suffixed ::= ( [0-9] [0-9_]* ( \".\" [0-9] [0-9_]* )? exponent? ) [acdf-np-wyzACDF-NP-WYZ] [a-zA-Z]*
+
+# STRING (L14), and the f-string tokens (L22).
+string ::= \"\\\"\" string-char* \"\\\"\"
+string-char ::= [^\"\\\\\\r\\n] | \"\\\\\" [\\\\\"nrt0]
+fstring-char ::= [^\"\\\\{}\\r\\n] | \"\\\\\" [\\\\\"nrt0] | \"{{\" | \"}}\"
+fstring-spec ::= \":\" ( [^:}\"\\r\\n] [^}\"\\r\\n]* )?
+fstring ::= \"f\\\"\" fstring-char* \"\\\"\"
+fstring-head ::= \"f\\\"\" fstring-char* \"{\"
+fstring-mid ::= fstring-spec? \"}\" fstring-char* \"{\"
+fstring-tail ::= fstring-spec? \"}\" fstring-char* \"\\\"\"
 
 # Gaps between tokens, and NEWLINE (L5, L6, L17, L18). In `ws` and `ws1` a comment follows a
 # space or line break, so it can't join a `/` before it into `//`; `lead` is for gaps no `/`

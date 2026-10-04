@@ -1,0 +1,23 @@
+// A field that the struct doesn't have. Check the spelling, and the struct's declaration.
+// ---- wrong
+struct Ball {
+    pos: vec2,
+    radius: f32,
+}
+
+fn top(b: Ball) -> f32 {
+    b.pos.y + b.radious
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+struct Ball {
+    pos: vec2,
+    radius: f32,
+}
+
+fn top(b: Ball) -> f32 {
+    b.pos.y + b.radius
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

@@ -1,0 +1,28 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0207",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "`Gait` has no method `blend`",
+      "notes": [
+        "`blend` is a method of `Blend`, which `Gait` doesn't implement"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 7,
+        "end": 210,
+        "end_column": 12,
+        "end_line": 12,
+        "line": 12,
+        "start": 205
+      },
+      "title": "an unknown method"
+    }
+  ],
+  "version": 2
+}

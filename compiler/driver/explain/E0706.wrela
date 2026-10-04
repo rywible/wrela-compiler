@@ -1,0 +1,38 @@
+// A `@test` that fails: `wrela test` ran it, and it panicked or trapped (a frame test, in
+// `init`, a frame or the test). A failed `assert` panics, and shows the values it compared:
+// ``assertion failed: `clamp01(2.0)` is 2``. The message has the call chain. Only `wrela test`
+// reports this.
+// ---- wrong
+fn clamp01(x: f32) -> f32 {
+    if x < 0.0 {
+        0.0
+    } else if x > 1.0 {
+        x
+    } else {
+        x
+    }
+}
+
+@test
+fn clamps_above_one() {
+    assert(clamp01(2.0) == 1.0)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+fn clamp01(x: f32) -> f32 {
+    if x < 0.0 {
+        0.0
+    } else if x > 1.0 {
+        1.0
+    } else {
+        x
+    }
+}
+
+@test
+fn clamps_above_one() {
+    assert(clamp01(2.0) == 1.0)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

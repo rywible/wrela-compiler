@@ -1,0 +1,14 @@
+// A type or a call with the wrong number of generic arguments: `Vec<f32, u32>`, or
+// `::<A, B>` on a function with one type parameter.
+// ---- wrong
+fn sizes() -> Vec<f32, u32> {
+    Vec::new()
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+fn sizes() -> Vec<f32> {
+    Vec::new()
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

@@ -1,0 +1,10 @@
+// mistake: `.iter()` in a `for` loop, as in Rust
+// expect: E0207
+// fix: yes
+fn total(xs: Vec<f32>) -> f32 {
+    var t = 0.0
+    for x in xs.iter() {
+        t += x
+    }
+    t
+}

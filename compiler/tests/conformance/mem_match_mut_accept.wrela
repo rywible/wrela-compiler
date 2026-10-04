@@ -1,0 +1,29 @@
+// accepts: mem.match-mut
+struct Stack: Copy {
+    item: u32,
+    count: u32,
+}
+
+fn top_up(slots: mut [Option<Stack>; 3], item: u32, n: u32) {
+    for mut slot in slots {
+        match mut slot {
+            Some(s) => if s.item == item { s.count += n },
+            None => {}
+        }
+    }
+}
+
+enum Timer: Copy {
+    Idle,
+    Running { left: f32 },
+}
+
+fn tick(t: mut Timer, dt: f32) -> bool {
+    match mut t {
+        Timer::Running { left } => {
+            left -= dt
+            left <= 0.0
+        }
+        Timer::Idle => false,
+    }
+}

@@ -1,0 +1,7 @@
+// mistake: an empty `Vec` whose element type nothing says
+// expect: E0306
+// fix: no
+fn count() -> u32 {
+    let xs = Vec::new()
+    xs.len()
+}

@@ -1,0 +1,16 @@
+// A character that wrela doesn't use appeared outside a comment or a string: `$`, `#`, a
+// backtick, a no-break space. Names are letters, digits and `_`.
+// ---- wrong
+fn total(a: i32, b: i32) -> i32 {
+    let sum$ = a + b
+    sum$
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+fn total(a: i32, b: i32) -> i32 {
+    let sum = a + b
+    sum
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

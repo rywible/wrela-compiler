@@ -8,10 +8,10 @@
       "internal": false,
       "label": null,
       "labels": [],
-      "message": "`buffer` records GPU work, which the `@compute` kernel `fill` can't do",
+      "message": "this `buffer` records GPU work, and `fill` is a compute kernel, GPU code, which can't `host`",
       "notes": [
-        "recording GPU work is the `host` effect; GPU entry points forbid it (language.md §8)",
-        "called through `fill` → `scratch`"
+        "the call chain: fill → scratch",
+        "recording GPU work is the `host` effect; see language.md §8 for what each context forbids"
       ],
       "severity": "error",
       "span": {

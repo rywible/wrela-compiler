@@ -1,25 +1,38 @@
 {
   "diagnostics": [
     {
-      "code": "E0603",
+      "code": "E0303",
       "file": "main.wrela",
       "fixes": [],
       "help": [],
       "internal": false,
       "label": null,
-      "labels": [],
-      "message": "this dispatch doesn't pass `fill`'s parameter `scale`",
+      "labels": [
+        {
+          "file": "main.wrela",
+          "message": "declared here",
+          "span": {
+            "column": 1,
+            "end": 217,
+            "end_column": 55,
+            "end_line": 7,
+            "line": 7,
+            "start": 163
+          }
+        }
+      ],
+      "message": "this call to `fill.bind` is missing `scale`",
       "notes": [],
       "severity": "error",
       "span": {
-        "column": 5,
-        "end": 374,
-        "end_column": 40,
+        "column": 14,
+        "end": 371,
+        "end_column": 37,
         "end_line": 13,
         "line": 13,
-        "start": 339
+        "start": 348
       },
-      "title": "a dispatch or draw that doesn't match its entry points"
+      "title": "a missing argument"
     }
   ],
   "version": 2

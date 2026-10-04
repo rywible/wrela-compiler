@@ -1,0 +1,32 @@
+// accepts: gpu.workgroup-memory
+// Spike 01's `place_vertices` pattern: each invocation writes its chunk of the block's 125
+// corners, one barrier, then every invocation reads any corner. A loop that writes again after
+// reading needs a second barrier, and has one.
+use std::gpu::{GlobalId, LocalId, Shared, Slots, WorkgroupId, barrier, buffer, dispatch}
+
+@compute(4, 4, 4)
+fn cells(out: mut Slots<f32>, corners: mut Shared<f32, 125>, lid: LocalId, wid: WorkgroupId, id: GlobalId) {
+    let chunk = corners.chunk(lid)
+    for k in 0..chunk.len() {
+        corners.write(chunk, k, f32(chunk.index(k)) + f32(wid.x))
+    }
+    barrier(mut corners)
+    out[id] = corners.get(lid.x + 5 * lid.y + 25 * lid.z) + corners.get(124)
+}
+
+@compute(64)
+fn passes(out: mut Slots<f32>, row: mut Shared<f32, 64>, lid: LocalId, id: GlobalId) {
+    let mine = row.chunk(lid)
+    for round in 0..4 {
+        row.write(mine, 0, f32(round))
+        barrier(mut row)
+        out[id] = row.get((lid.x + 1) % 64)
+        barrier(mut row)
+    }
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    var out = buffer(128)
+    dispatch(cells.bind(out: mut out), groups: (2, 1, 1))
+    dispatch(passes.bind(out: mut out), groups: 2)
+}

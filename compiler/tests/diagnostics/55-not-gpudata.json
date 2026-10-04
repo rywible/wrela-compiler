@@ -7,10 +7,10 @@
         {
           "edits": [
             {
-              "end": 141,
+              "end": 133,
               "file": "main.wrela",
               "replacement": " + GpuData",
-              "start": 141
+              "start": 133
             }
           ],
           "message": "opt `Params` in to `GpuData`"
@@ -27,11 +27,11 @@
       "severity": "error",
       "span": {
         "column": 9,
-        "end": 193,
+        "end": 185,
         "end_column": 18,
         "end_line": 11,
         "line": 11,
-        "start": 184
+        "start": 176
       },
       "title": "data crossing to the GPU that isn't `GpuData`"
     }

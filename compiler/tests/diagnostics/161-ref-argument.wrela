@@ -1,0 +1,10 @@
+// mistake: `&x` at a call, as in Rust
+// expect: E0106
+// fix: yes
+fn length(v: vec3) -> f32 {
+    sqrt(dot(v, v))
+}
+
+fn reach(p: vec3) -> f32 {
+    length(&p)
+}

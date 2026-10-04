@@ -5,14 +5,14 @@
       "file": "main.wrela",
       "fixes": [],
       "help": [
-        "copy it into a `var` to change it"
+        "copy it into a `var` to change the copy: `var x = START.clone()`"
       ],
       "internal": false,
       "label": null,
       "labels": [],
-      "message": "can't lend the constant `START` mutably",
+      "message": "can't lend mutably `START`: `START` is a constant",
       "notes": [
-        "a constant is a value, not a place: a change to it would be lost"
+        "a constant lives as long as the program, and every use of it reads the same place (§10)"
       ],
       "severity": "error",
       "span": {

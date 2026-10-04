@@ -1,0 +1,5 @@
+[package]
+name = "app"
+
+[dependencies]
+geo = { path = "deps/geo" }

@@ -1,0 +1,17 @@
+// A line starts with a binary operator. A line break ends a statement, so the operator would
+// start a new one. Put the operator at the end of the line before, where it says the line goes
+// on.
+// ---- wrong
+fn total(a: i32, b: i32) -> i32 {
+    a
+        + b
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+fn total(a: i32, b: i32) -> i32 {
+    a +
+        b
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

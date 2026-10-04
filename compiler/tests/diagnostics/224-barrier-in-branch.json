@@ -1,0 +1,56 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0610",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [
+        "call it outside the branch, or make the branch's condition the same for the whole workgroup (from `WorkgroupId` or uniforms)"
+      ],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "`barrier` is called where the workgroup's invocations may have taken different branches",
+      "notes": [
+        "a barrier waits for every invocation of the workgroup, so all of them must reach it together (WGSL's uniformity rule)",
+        "called through `half` → `barrier`"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 9,
+        "end": 376,
+        "end_column": 25,
+        "end_line": 11,
+        "line": 11,
+        "start": 360
+      },
+      "title": "a barrier in non-uniform control flow"
+    },
+    {
+      "code": "E0609",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [
+        "call `barrier(mut row)` between the writes and the reads"
+      ],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "`row` is read here, and another invocation may still be writing it: there's no barrier since",
+      "notes": [
+        "between barriers, workgroup memory is written (each invocation its own chunk) or read, not both (§6.13)"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 15,
+        "end": 407,
+        "end_column": 25,
+        "end_line": 13,
+        "line": 13,
+        "start": 397
+      },
+      "title": "workgroup memory read and written with no barrier between"
+    }
+  ],
+  "version": 2
+}

@@ -1,0 +1,74 @@
+// Flags: named facts about the world, which dialogue and quests set and test (paper test §2).
+//
+// Changed from the paper test: a constant holds the names as `String`s (F5), and flags are a
+// `SortedMap` (F10), which iterates in key order, so `@deterministic` code may use it; a save
+// stores each flag's name (its id's hand-written `Serialize`), so a later build can add flags.
+
+use engine::sim::{Sim, SimState}
+use std::arena::SortedMap
+use std::hash::StateHash
+use std::serialize::{LoadError, Reader, Serialize, Writer}
+use text::{file_text, rows}
+
+pub struct FlagId: Copy + Eq + Ord + StateHash + SimState {
+    pub index: u32,
+}
+
+pub const FLAG_NAMES: Vec<String> = names(file_text(embed("data/flags.txt"), "data/flags.txt"))
+
+fn names(file: String) -> Vec<String> {
+    var out: Vec<String> = Vec::new()
+    for r in rows(file) {
+        out.push(r.1.trim().to_string())
+    }
+    out
+}
+
+/// A flag by name, when the game is built: a misspelling fails the build.
+pub fn flag(name: str) -> FlagId {
+    for i in 0..FLAG_NAMES.len() {
+        if FLAG_NAMES[i] == name {
+            return FlagId { index: i }
+        }
+    }
+    panic(f"no flag `{name}` in data/flags.txt")
+}
+
+pub const RING_RETURNED = flag("ring_returned")
+pub const GATE_OPENED = flag("gate_opened")
+
+impl Serialize for FlagId {
+    fn serialize(self, w: mut Writer) {
+        w.write_str(FLAG_NAMES[self.index])
+    }
+
+    fn deserialize(r: mut Reader) -> Result<FlagId, LoadError> {
+        let name = r.read_string()?
+        for i in 0..FLAG_NAMES.len() {
+            if FLAG_NAMES[i] == name {
+                return Ok(FlagId { index: i })
+            }
+        }
+        Err(r.fail("a flag this build doesn't have"))
+    }
+}
+
+/// The flags that are set.
+pub struct Flags: Sim {
+    set: SortedMap<FlagId, bool>,
+}
+
+impl Flags {
+    pub fn new() -> Flags {
+        Flags { set: SortedMap::new() }
+    }
+
+    pub fn get(self, f: FlagId) -> bool {
+        self.set.get(f).unwrap_or(false)
+    }
+
+    @deterministic
+    pub fn set(mut self, f: FlagId, value: bool) {
+        let _ = self.set.insert(f, value)
+    }
+}

@@ -1,0 +1,40 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0207",
+      "file": "main.wrela",
+      "fixes": [
+        {
+          "edits": [
+            {
+              "end": 149,
+              "file": "main.wrela",
+              "replacement": "",
+              "start": 142
+            }
+          ],
+          "message": "loop over it"
+        }
+      ],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "`.iter()` isn't needed: wrela has no iterators",
+      "notes": [
+        "a `for` loop goes over a range, an array, a run, a `Vec` or an arena itself; `for mut x in xs` changes each element"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 17,
+        "end": 147,
+        "end_column": 21,
+        "end_line": 6,
+        "line": 6,
+        "start": 143
+      },
+      "title": "an unknown method"
+    }
+  ],
+  "version": 2
+}

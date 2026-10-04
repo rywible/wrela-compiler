@@ -80,7 +80,7 @@ pub fn bind_index_mut_arg(i: u32) -> f32 {
 
 pub fn index_select(i: u32, c: bool) -> f32 {
     let v = vec3(1.0, 2.0, 3.0)
-    select(v.zyx[i], 9.0, c)
+    select(if_false: v.zyx[i], if_true: 9.0, cond: c)
 }
 
 fn get(v: vec3, i: u32) -> f32 {

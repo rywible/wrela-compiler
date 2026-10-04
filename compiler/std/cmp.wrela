@@ -1,0 +1,330 @@
+// Comparison (language.md §3): `==` and `!=` for types that declare `Eq`, and `<`, `<=`, `>`
+// and `>=` for types that declare `Ord`. Both are fieldwise: fields compare in order, and an
+// enum's variants compare in the order they're declared. Numbers, `bool`, vectors and enums
+// whose variants hold nothing compare without declaring them.
+
+/// How two values compare.
+pub enum Ordering: Copy + Eq + Ord {
+    Less,
+    Equal,
+    Greater,
+}
+
+impl Ordering {
+    /// This, or `next` when this is `Equal`: for comparing by one key, then another.
+    pub fn then(self, next: Ordering) -> Ordering {
+        match self {
+            Ordering::Equal => next,
+            o => o,
+        }
+    }
+
+    /// The opposite order.
+    pub fn reverse(self) -> Ordering {
+        match self {
+            Ordering::Less => Ordering::Greater,
+            Ordering::Equal => Ordering::Equal,
+            Ordering::Greater => Ordering::Less,
+        }
+    }
+}
+
+/// Equality: `a == b` calls `a.eq(b)`, and `a != b` is its opposite. Derived field by field.
+@fieldwise
+pub trait Eq {
+    /// Whether `self` and `other` are equal.
+    fn eq(self, other: Self) -> bool
+}
+
+/// Order: `a < b` is `a.cmp(b) == Ordering::Less`, and so on. Derived field by field: the first
+/// field that differs decides, and an enum's earlier variant comes first.
+@fieldwise
+pub trait Ord: Eq {
+    /// How `self` compares with `other`.
+    fn cmp(self, other: Self) -> Ordering
+}
+
+// The leaves: numbers and `bool` compare as the operators do.
+
+impl Eq for bool {
+    fn eq(self, other: bool) -> bool {
+        self == other
+    }
+}
+
+impl Eq for i8 {
+    fn eq(self, other: i8) -> bool {
+        self == other
+    }
+}
+
+impl Eq for u8 {
+    fn eq(self, other: u8) -> bool {
+        self == other
+    }
+}
+
+impl Eq for i16 {
+    fn eq(self, other: i16) -> bool {
+        self == other
+    }
+}
+
+impl Eq for u16 {
+    fn eq(self, other: u16) -> bool {
+        self == other
+    }
+}
+
+impl Eq for i32 {
+    fn eq(self, other: i32) -> bool {
+        self == other
+    }
+}
+
+impl Eq for u32 {
+    fn eq(self, other: u32) -> bool {
+        self == other
+    }
+}
+
+impl Eq for i64 {
+    fn eq(self, other: i64) -> bool {
+        self == other
+    }
+}
+
+impl Eq for u64 {
+    fn eq(self, other: u64) -> bool {
+        self == other
+    }
+}
+
+impl Eq for f32 {
+    fn eq(self, other: f32) -> bool {
+        self == other
+    }
+}
+
+impl Eq for f64 {
+    fn eq(self, other: f64) -> bool {
+        self == other
+    }
+}
+
+impl Ord for bool {
+    fn cmp(self, other: bool) -> Ordering {
+        if self == other {
+            Ordering::Equal
+        } else if other {
+            Ordering::Less
+        } else {
+            Ordering::Greater
+        }
+    }
+}
+
+impl Ord for i8 {
+    fn cmp(self, other: i8) -> Ordering {
+        if self < other {
+            Ordering::Less
+        } else if self > other {
+            Ordering::Greater
+        } else {
+            Ordering::Equal
+        }
+    }
+}
+
+impl Ord for u8 {
+    fn cmp(self, other: u8) -> Ordering {
+        if self < other {
+            Ordering::Less
+        } else if self > other {
+            Ordering::Greater
+        } else {
+            Ordering::Equal
+        }
+    }
+}
+
+impl Ord for i16 {
+    fn cmp(self, other: i16) -> Ordering {
+        if self < other {
+            Ordering::Less
+        } else if self > other {
+            Ordering::Greater
+        } else {
+            Ordering::Equal
+        }
+    }
+}
+
+impl Ord for u16 {
+    fn cmp(self, other: u16) -> Ordering {
+        if self < other {
+            Ordering::Less
+        } else if self > other {
+            Ordering::Greater
+        } else {
+            Ordering::Equal
+        }
+    }
+}
+
+impl Ord for i32 {
+    fn cmp(self, other: i32) -> Ordering {
+        if self < other {
+            Ordering::Less
+        } else if self > other {
+            Ordering::Greater
+        } else {
+            Ordering::Equal
+        }
+    }
+}
+
+impl Ord for u32 {
+    fn cmp(self, other: u32) -> Ordering {
+        if self < other {
+            Ordering::Less
+        } else if self > other {
+            Ordering::Greater
+        } else {
+            Ordering::Equal
+        }
+    }
+}
+
+impl Ord for i64 {
+    fn cmp(self, other: i64) -> Ordering {
+        if self < other {
+            Ordering::Less
+        } else if self > other {
+            Ordering::Greater
+        } else {
+            Ordering::Equal
+        }
+    }
+}
+
+impl Ord for u64 {
+    fn cmp(self, other: u64) -> Ordering {
+        if self < other {
+            Ordering::Less
+        } else if self > other {
+            Ordering::Greater
+        } else {
+            Ordering::Equal
+        }
+    }
+}
+
+impl Ord for f32 {
+    /// NaN compares equal to everything, as no `<` or `>` holds with it.
+    fn cmp(self, other: f32) -> Ordering {
+        if self < other {
+            Ordering::Less
+        } else if self > other {
+            Ordering::Greater
+        } else {
+            Ordering::Equal
+        }
+    }
+}
+
+impl Ord for f64 {
+    /// NaN compares equal to everything, as no `<` or `>` holds with it.
+    fn cmp(self, other: f64) -> Ordering {
+        if self < other {
+            Ordering::Less
+        } else if self > other {
+            Ordering::Greater
+        } else {
+            Ordering::Equal
+        }
+    }
+}
+
+impl Eq for vec2 {
+    fn eq(self, other: vec2) -> bool {
+        self == other
+    }
+}
+
+impl Eq for vec3 {
+    fn eq(self, other: vec3) -> bool {
+        self == other
+    }
+}
+
+impl Eq for vec4 {
+    fn eq(self, other: vec4) -> bool {
+        self == other
+    }
+}
+
+// Arrays and tuples compare element by element, in order.
+
+impl<T: Eq, const N: u32> Eq for [T; N] {
+    fn eq(self, other: [T; N]) -> bool {
+        for i in 0..N {
+            if self[i] != other[i] {
+                return false
+            }
+        }
+        true
+    }
+}
+
+impl<T: Ord, const N: u32> Ord for [T; N] {
+    fn cmp(self, other: [T; N]) -> Ordering {
+        for i in 0..N {
+            let o = self[i].cmp(other[i])
+            if o != Ordering::Equal {
+                return o
+            }
+        }
+        Ordering::Equal
+    }
+}
+
+impl<A: Eq, B: Eq> Eq for (A, B) {
+    fn eq(self, other: (A, B)) -> bool {
+        self.0 == other.0 && self.1 == other.1
+    }
+}
+
+impl<A: Ord, B: Ord> Ord for (A, B) {
+    fn cmp(self, other: (A, B)) -> Ordering {
+        self.0.cmp(other.0).then(self.1.cmp(other.1))
+    }
+}
+
+impl<A: Eq, B: Eq, C: Eq> Eq for (A, B, C) {
+    fn eq(self, other: (A, B, C)) -> bool {
+        self.0 == other.0 && self.1 == other.1 && self.2 == other.2
+    }
+}
+
+impl<A: Ord, B: Ord, C: Ord> Ord for (A, B, C) {
+    fn cmp(self, other: (A, B, C)) -> Ordering {
+        self.0.cmp(other.0).then(self.1.cmp(other.1)).then(self.2.cmp(other.2))
+    }
+}
+
+impl<A: Eq, B: Eq, C: Eq, D: Eq> Eq for (A, B, C, D) {
+    fn eq(self, other: (A, B, C, D)) -> bool {
+        self.0 == other.0 && self.1 == other.1 && self.2 == other.2 && self.3 == other.3
+    }
+}
+
+impl<A: Ord, B: Ord, C: Ord, D: Ord> Ord for (A, B, C, D) {
+    fn cmp(self, other: (A, B, C, D)) -> Ordering {
+        self.0
+            .cmp(other.0)
+            .then(self.1.cmp(other.1))
+            .then(self.2.cmp(other.2))
+            .then(self.3.cmp(other.3))
+    }
+}

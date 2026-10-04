@@ -1,0 +1,23 @@
+// wrela has no `dyn`: there are no trait objects. Use a generic parameter (`T: Shape`) for one
+// type at a time, or an enum with a variant for each kind for values of several kinds in one
+// collection.
+// ---- wrong
+trait Shape {
+    fn area(self) -> f32
+}
+
+fn total(s: dyn Shape) -> f32 {
+    s.area()
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+trait Shape {
+    fn area(self) -> f32
+}
+
+fn total<S: Shape>(s: S) -> f32 {
+    s.area()
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

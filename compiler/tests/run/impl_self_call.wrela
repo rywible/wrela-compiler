@@ -1,0 +1,40 @@
+// run: inside a generic impl, `self` has the impl's trait even when only the bounds fix its
+// arguments: `impl<C, A: Has<C>, B: Has<C>> Has<C> for Pair<A, B>` calls its own `both`
+// expect: run() = 1.0
+trait Has<C> {
+    fn get(self) -> C
+    fn both(self) -> (u32, C)
+}
+
+struct Leaf: Copy {
+    v: f32,
+}
+
+impl Has<f32> for Leaf {
+    fn get(self) -> f32 {
+        self.v
+    }
+
+    fn both(self) -> (u32, f32) {
+        (1, self.v)
+    }
+}
+
+struct Pair<A, B>: Copy {
+    a: A,
+    b: B,
+}
+
+impl<C, A: Has<C>, B: Has<C>> Has<C> for Pair<A, B> {
+    fn get(self) -> C {
+        self.both().1
+    }
+
+    fn both(self) -> (u32, C) {
+        (2, self.a.get())
+    }
+}
+
+pub fn run() -> f32 {
+    Pair { a: Leaf { v: 1.0 }, b: Leaf { v: 2.0 } }.get()
+}

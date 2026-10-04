@@ -1,0 +1,77 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0506",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [
+        {
+          "file": "main.wrela",
+          "message": "`p` borrows `b.pos` here",
+          "span": {
+            "column": 13,
+            "end": 178,
+            "end_column": 18,
+            "end_line": 10,
+            "line": 10,
+            "start": 173
+          }
+        }
+      ],
+      "message": "`b.pos` overlaps `b.pos`, which `p` is borrowing mutably",
+      "notes": [
+        "`p` is used later, so the borrow is still live"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 13,
+        "end": 196,
+        "end_column": 18,
+        "end_line": 11,
+        "line": 11,
+        "start": 191
+      },
+      "title": "an access that overlaps a live `mut` access"
+    },
+    {
+      "code": "E0506",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [
+        {
+          "file": "main.wrela",
+          "message": "`q` borrows `b.pos` here",
+          "span": {
+            "column": 13,
+            "end": 196,
+            "end_column": 18,
+            "end_line": 11,
+            "line": 11,
+            "start": 191
+          }
+        }
+      ],
+      "message": "`b.pos` overlaps `b.pos`, which `q` is borrowing mutably",
+      "notes": [
+        "`q` is used later, so the borrow is still live"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 5,
+        "end": 202,
+        "end_column": 6,
+        "end_line": 12,
+        "line": 12,
+        "start": 201
+      },
+      "title": "an access that overlaps a live `mut` access"
+    }
+  ],
+  "version": 2
+}

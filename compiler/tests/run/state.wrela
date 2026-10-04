@@ -1,0 +1,99 @@
+// run: `StateHash` and `Serialize`, derived field by field: equal states hash equally, a save
+// loads back to the same hash, and a corrupt save is an error, not a trap
+// expect: same_hash() = true
+// expect: different_hash() = true
+// expect: round_trip() = true
+// expect: truncated() = true
+// expect: renamed_field() = true
+// expect: nan_canonical() = true
+use std::hash::{StateHash, state_hash}
+use std::serialize::{LoadError, Serialize, load, save}
+
+enum Kind: Copy + Eq + StateHash + Serialize {
+    Grazer,
+    Hunter { speed: f32 },
+}
+
+struct Animal: Clone + StateHash + Serialize {
+    name: String,
+    pos: vec3,
+    kind: Kind,
+    tags: Vec<u32>,
+    mate: Option<u32>,
+}
+
+struct World: Clone + StateHash + Serialize {
+    tick: u64,
+    animals: Vec<Animal>,
+}
+
+fn world() -> World {
+    var animals = Vec::new()
+    for i in 0..3 {
+        var tags = Vec::new()
+        tags.push(i)
+        tags.push(i * 2)
+        animals.push(Animal {
+            name: String::from("grazer"),
+            pos: vec3(f32(i), 0.0, 1.5),
+            kind: if i == 1 { Kind::Hunter { speed: 2.5 } } else { Kind::Grazer },
+            tags: take tags,
+            mate: if i == 2 { Some(0) } else { None },
+        })
+    }
+    World { tick: 42, animals: take animals }
+}
+
+pub fn same_hash() -> bool {
+    let a = world()
+    let b = a.clone()
+    state_hash(a) == state_hash(b)
+}
+
+pub fn different_hash() -> bool {
+    let a = world()
+    var b = a.clone()
+    b.tick += 1
+    state_hash(a) != state_hash(b)
+}
+
+pub fn round_trip() -> bool {
+    let a = world()
+    let bytes = save(a)
+    match load::<World>(take bytes) {
+        Ok(b) => state_hash(a) == state_hash(b),
+        Err(_) => false,
+    }
+}
+
+pub fn truncated() -> bool {
+    let a = world()
+    var bytes = save(a)
+    bytes.truncate(bytes.len() - 3)
+    match load::<World>(take bytes) {
+        Ok(_) => false,
+        Err(e) => e.at > 0,
+    }
+}
+
+struct Old: Serialize {
+    count: u32,
+}
+
+struct New: Serialize {
+    total: u32,
+}
+
+pub fn renamed_field() -> bool {
+    let bytes = save(Old { count: 3 })
+    match load::<New>(take bytes) {
+        Ok(_) => false,
+        Err(e) => e.what == "a field's name isn't the one expected",
+    }
+}
+
+pub fn nan_canonical() -> bool {
+    let a = 0.0 / 0.0
+    let b = -(0.0 / 0.0)
+    state_hash(a) == state_hash(b)
+}

@@ -1,0 +1,26 @@
+// A write to a place while something reads it in place: a `borrow` binding, or a projection
+// a call returned, is still in use.
+// ---- wrong
+struct World {
+    values: Vec<f32>,
+}
+
+fn reset(w: mut World) -> f32 {
+    borrow first = w.values[0]
+    w.values[0] = 0.0
+    first
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+struct World {
+    values: Vec<f32>,
+}
+
+fn reset(w: mut World) -> f32 {
+    let first = w.values[0]
+    w.values[0] = 0.0
+    first
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

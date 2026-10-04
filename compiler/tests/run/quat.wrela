@@ -1,0 +1,40 @@
+// run: `Quat` (language.md §4), in scope everywhere: a quarter turn about +y takes +x to -z;
+// a rotation survives the trip through its matrix; composing and inverting; nlerp halfway
+// expect: quarter_turn() = 1.0
+// expect: through_matrix(0.7) = 1.0
+// expect: undo(1.3) = 1.0
+// expect: halfway() = 1.0
+
+fn near(a: vec3, b: vec3) -> bool {
+    length(a - b) < 1e-5
+}
+
+fn yes(b: bool) -> f32 {
+    if b { 1.0 } else { 0.0 }
+}
+
+pub fn quarter_turn() -> f32 {
+    let q = Quat::axis_angle(vec3(0.0, 1.0, 0.0), 1.5707964)
+    yes(near(q.rotate(vec3(1.0, 0.0, 0.0)), vec3(0.0, 0.0, -1.0)))
+}
+
+pub fn through_matrix(angle: f32) -> f32 {
+    let q = Quat::axis_angle(vec3(1.0, 2.0, 3.0), angle)
+    let r = Quat::from_mat3(q.to_mat3())
+    let p = vec3(0.3, -1.0, 2.0)
+    yes(near(q.rotate(p), r.rotate(p)))
+}
+
+pub fn undo(angle: f32) -> f32 {
+    let q = Quat::axis_angle(vec3(-1.0, 0.5, 0.25), angle)
+    let p = vec3(2.0, 1.0, -1.0)
+    yes(near(q.mul(q.inverse()).rotate(p), p) && near(q.inverse().rotate(q.rotate(p)), p))
+}
+
+pub fn halfway() -> f32 {
+    let a = Quat::identity()
+    let b = Quat::axis_angle(vec3(0.0, 0.0, 1.0), 1.0)
+    let h = a.nlerp(b, 0.5)
+    let want = Quat::axis_angle(vec3(0.0, 0.0, 1.0), 0.5)
+    yes(near(h.rotate(vec3(1.0, 0.0, 0.0)), want.rotate(vec3(1.0, 0.0, 0.0))))
+}

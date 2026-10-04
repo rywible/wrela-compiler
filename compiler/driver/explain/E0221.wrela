@@ -1,0 +1,36 @@
+// Packages that depend on each other: a dependency's own dependencies lead back to the package.
+// A package's dependencies are built before it, so they can't need it. Move what both need into
+// a package of its own.
+// ---- wrong
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- file wrela.toml
+[package]
+name = "game"
+
+[dependencies]
+lib = { path = "lib" }
+// ---- file lib/wrela.toml
+[package]
+name = "lib"
+
+[dependencies]
+game = { path = ".." }
+// ---- file lib/lib.wrela
+pub fn one() -> u32 {
+    1
+}
+// ---- fixed
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- file wrela.toml
+[package]
+name = "game"
+
+[dependencies]
+lib = { path = "lib" }
+// ---- file lib/wrela.toml
+[package]
+name = "lib"
+// ---- file lib/lib.wrela
+pub fn one() -> u32 {
+    1
+}

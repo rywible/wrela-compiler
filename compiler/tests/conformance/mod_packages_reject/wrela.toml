@@ -1,0 +1,2 @@
+[dependencies]
+geo = { path = "deps/geo" }

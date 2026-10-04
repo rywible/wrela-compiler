@@ -1,0 +1,14 @@
+// A swizzle that isn't valid: a component the vector doesn't have (`.z` of a `vec2`), letters
+// from both `xyzw` and `rgba`, or, where it's written to, a component named twice.
+// ---- wrong
+fn flat(v: vec2) -> vec3 {
+    v.xyz
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+fn flat(v: vec2) -> vec3 {
+    vec3(v.x, v.y, 0.0)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

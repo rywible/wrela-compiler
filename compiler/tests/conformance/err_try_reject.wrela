@@ -1,0 +1,26 @@
+// rejects: err.try
+enum Fail: Copy {
+    Empty,
+}
+
+enum Other: Copy {
+    Bad,
+}
+
+fn checked(x: f32) -> Result<f32, Fail> {
+    Ok(x)
+}
+
+fn not_an_option(x: f32) -> Option<f32> {
+    Some(x?) //~ E0300
+}
+
+fn wrong_error(x: f32) -> Result<f32, Other> {
+    let v = checked(x)? //~ E0300
+    Ok(v)
+}
+
+fn in_option(x: f32) -> Option<f32> {
+    let v = checked(x)? //~ E0300
+    Some(v)
+}

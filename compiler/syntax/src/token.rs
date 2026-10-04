@@ -64,6 +64,10 @@ token_kinds! {
         Float = "FLOAT",
         Suffixed = "SUFFIXED",
         Str = "STRING",
+        FString = "FSTRING",
+        FStringHead = "FSTRING_HEAD",
+        FStringMid = "FSTRING_MID",
+        FStringTail = "FSTRING_TAIL",
         Newline = "NEWLINE",
         Eof = "EOF",
     }
@@ -86,6 +90,7 @@ token_kinds! {
         Loop = "loop",
         Match = "match",
         Mut = "mut",
+        Package = "package",
         Pub = "pub",
         Return = "return",
         SelfValue = "self",
@@ -98,7 +103,6 @@ token_kinds! {
         Unsafe = "unsafe",
         Use = "use",
         Var = "var",
-        Where = "where",
         While = "while",
     }
     punct {
@@ -166,6 +170,8 @@ impl TokenKind {
                 | Float
                 | Suffixed
                 | Str
+                | FString
+                | FStringTail
                 | True
                 | False
                 | SelfValue

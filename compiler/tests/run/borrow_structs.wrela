@@ -1,0 +1,62 @@
+// run: borrow structs group projections: built from places, passed down, read and written
+// through their fields
+// expect: draw(3) = 66
+// expect: nested() = 11
+
+struct World {
+    heights: [f32; 4],
+    scale: f32,
+}
+
+struct Frame {
+    total: f32,
+    count: u32,
+}
+
+borrow struct DrawCtx {
+    world: borrow World,
+    frame: mut Frame,
+    extra: [f32],
+    dt: f32,
+}
+
+fn draw_one(ctx: DrawCtx, i: u32) {
+    ctx.frame.total += ctx.world.heights[i] * ctx.world.scale + ctx.extra[i] + ctx.dt
+    ctx.frame.count += 1
+}
+
+fn draw_all(ctx: DrawCtx, n: u32) {
+    for i in 0..n {
+        draw_one(ctx, i)
+    }
+}
+
+pub fn draw(n: u32) -> u32 {
+    let world = World { heights: [1.0, 2.0, 3.0, 4.0], scale: 10.0 }
+    var frame = Frame { total: 0.0, count: 0 }
+    let extra = [0.0, 1.0, 2.0, 3.0]
+    let ctx = DrawCtx { world, frame: mut frame, extra, dt: 0.0 }
+    draw_all(ctx, n)
+    u32(frame.total) + frame.count
+}
+
+borrow struct Outer {
+    inner: DrawCtx,
+    bonus: mut u32,
+}
+
+fn add_bonus(o: Outer) {
+    o.bonus += u32(o.inner.world.scale)
+    draw_one(o.inner, 0)
+}
+
+pub fn nested() -> u32 {
+    let world = World { heights: [1.0, 2.0, 3.0, 4.0], scale: 4.0 }
+    var frame = Frame { total: 0.0, count: 0 }
+    var bonus = 1
+    let extra = [0.0, 0.0, 0.0, 0.0]
+    let ctx = DrawCtx { world, frame: mut frame, extra, dt: 1.0 }
+    let o = Outer { inner: ctx, bonus: mut bonus }
+    add_bonus(o)
+    bonus + u32(frame.total) + frame.count
+}

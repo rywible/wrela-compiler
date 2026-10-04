@@ -1,0 +1,38 @@
+// run: a package with dependencies by path (§3): their `pub` items, a dependency of a
+// dependency, `embed` and build-time constants in a dependency, and a trait of this package
+// implemented for a dependency's type
+// expect: area_of(2.0) = 12
+// expect: scaled() = 30
+// expect: described() = 7
+// expect: table_len() = 4
+
+use geo::shapes::circle::{Circle, area}
+use geo::scale
+
+trait Describe {
+    fn describe(self) -> u32
+}
+
+impl Describe for Circle {
+    fn describe(self) -> u32 {
+        u32(self.r) + 5
+    }
+}
+
+pub fn area_of(r: f32) -> f32 {
+    area(Circle { r })
+}
+
+pub fn scaled() -> u32 {
+    scale::by_ten(3)
+}
+
+pub fn described() -> u32 {
+    Circle { r: 2.0 }.describe()
+}
+
+pub fn table_len() -> u32 {
+    geo::tables::TABLE.len()
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

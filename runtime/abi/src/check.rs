@@ -1,32 +1,37 @@
-//! Checks each command against the manifest and the program's buffers before it runs.
+//! Checks each command against the manifest and the program's resources before it runs.
 //!
 //! WebGPU reports most misuse asynchronously, or as a device error that names no command; wgpu
 //! reports it as a validation error. Checking up front means both hosts reject the same
 //! programs, at the command that's wrong, with the same messages (the browser runtime's
 //! `src/check.ts` mirrors this file, and the test vectors hold both to it):
 //!
-//! - `CreateBuffer`: the handle is new; the size is within WebGPU's default limits.
-//! - `WriteBuffer`: the buffer exists; the write fits inside it.
-//! - `DestroyBuffer`: the buffer exists; later commands can't use it.
-//! - `Dispatch`, `Draw`: the pipeline exists and is the right kind; the command lists as many
-//!   buffers as the pipeline binds, each one existing, and exactly its uniform block's size in
-//!   uniform bytes; a dispatch's group counts are within the limit.
-//! - No buffer is bound both read-only and read-write in one usage scope: a dispatch, or a whole
-//!   screen pass (WebGPU's rule); and none is bound read-write twice by one dispatch or draw
-//!   (WebGPU's rule against aliased writable bindings, which wgpu doesn't check).
-//! - `BeginScreenPass`: the clear colour is finite (WebGPU's `GPUColor` is; wgpu takes any).
+//! - **Creating** a buffer, texture or sampler: the handle names no live resource; a buffer's
+//!   size and a texture's are within the device's limits ([`crate::Limits`]).
+//! - **Writing, copying, reading back, destroying:** the resource exists and is the right kind;
+//!   every range fits inside it; a copy's source and destination are different buffers.
+//! - **`Dispatch`, `Draw` and their indirect forms:** the pipeline exists and is the right kind;
+//!   the command lists one binding for each of the pipeline's, of the kind it binds, each
+//!   existing, a buffer's range inside the buffer and starting at a multiple of 256 bytes
+//!   (WebGPU's default `minStorageBufferOffsetAlignment`), and exactly the uniform block's size
+//!   in uniform bytes; a dispatch's group counts are within the limit; an indirect command's
+//!   arguments fit in their buffer.
+//! - **Usage scopes** (WebGPU's rule): no buffer or texture is used both read-only and
+//!   read-write in one dispatch or one pass, none is bound read-write twice by one command, and
+//!   a pass's attachments aren't bound by its draws. An indirect command's arguments buffer is
+//!   read-only use.
+//! - **Passes:** the clear colour and depth are finite; a pass's attachments exist, the colour
+//!   one isn't a depth texture and the depth one is, and they're the same size.
+//! - **Requests:** a storage path or a URL is relative, `/`-separated, with no empty, `.` or
+//!   `..` parts ([`path_problem`]).
 
 use crate::Manifest;
-use crate::manifest::{Access, Stage};
-use crate::stream::{Command, Opcode};
+use crate::manifest::{BindingKind, Stage};
+use crate::stream::{Binding, Command, NONE, Opcode, SCREEN, TextureFormat};
 use std::collections::HashMap;
 use std::fmt;
 
-/// WebGPU's default limits that commands are checked against (both hosts request a device with
-/// the defaults). The largest buffer is the lesser of `maxBufferSize` (256 MiB) and
-/// `maxStorageBufferBindingSize` (128 MiB): every buffer is bound as storage.
-pub const MAX_BUFFER_SIZE: u32 = 134_217_728;
-pub const MAX_WORKGROUPS_PER_DIMENSION: u32 = 65_535;
+/// `minStorageBufferOffsetAlignment`: where a bound range of a buffer may start.
+pub const BINDING_OFFSET_ALIGNMENT: u32 = 256;
 
 /// A well-formed command the host can't carry out.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -45,25 +50,66 @@ impl std::error::Error for CommandError {}
 
 type Result<T> = std::result::Result<T, CommandError>;
 
+/// What's wrong with a storage path or a fetched URL, if anything: it's relative to the program's
+/// storage (or its build), with `/` between its parts, and none of them empty, `.` or `..`.
+pub fn path_problem(path: &str) -> Option<&'static str> {
+    if path.is_empty() {
+        return Some("is empty");
+    }
+    if path.starts_with('/') || path.contains(['\\', ':', '?', '#']) {
+        return Some("must be relative, with `/` between its parts");
+    }
+    if path.split('/').any(|part| part.is_empty() || part == "." || part == "..") {
+        return Some("has an empty, `.` or `..` part");
+    }
+    None
+}
+
 struct Shape {
     name: String,
     compute: bool,
     uniform_size: usize,
-    buffers: Vec<Access>,
+    bindings: Vec<BindingKind>,
+}
+
+/// A live resource.
+#[derive(Clone, Copy, Debug)]
+enum Resource {
+    Buffer { size: u32 },
+    Texture { width: u32, height: u32, format: TextureFormat },
+    Sampler { comparison: bool },
+}
+
+impl Resource {
+    fn kind(self) -> &'static str {
+        match self {
+            Resource::Buffer { .. } => "a buffer",
+            Resource::Texture { .. } => "a texture",
+            Resource::Sampler { .. } => "a sampler",
+        }
+    }
 }
 
 pub struct Checker {
+    limits: crate::Limits,
     pipelines: Vec<Shape>,
-    /// Each buffer's size.
-    buffers: HashMap<u32, u32>,
-    /// The current usage scope, a dispatch or the open screen pass: each bound buffer's access
-    /// so far, (read-only, read-write). Dispatches happen only outside a screen pass (the
-    /// sequencer checks), so the two kinds of scope never overlap and share this map.
+    resources: HashMap<u32, Resource>,
+    /// The current usage scope, a dispatch or the open pass: each buffer's or texture's use
+    /// so far, (read-only, read-write). Dispatches happen only outside a pass (the sequencer
+    /// checks), so the two kinds of scope never overlap and share this map.
     scope: HashMap<u32, (bool, bool)>,
+    /// The open pass's attachments.
+    attachments: Vec<u32>,
 }
 
 impl Checker {
+    /// A checker for a device with WebGPU's default limits.
     pub fn new(manifest: &Manifest) -> Checker {
+        Checker::with_limits(manifest, crate::Limits::DEFAULT)
+    }
+
+    /// A checker for a device with these limits.
+    pub fn with_limits(manifest: &Manifest, limits: crate::Limits) -> Checker {
         let pipelines = manifest
             .pipelines
             .iter()
@@ -71,10 +117,16 @@ impl Checker {
                 name: p.name.clone(),
                 compute: matches!(p.stage, Stage::Compute { .. }),
                 uniform_size: p.uniform.as_ref().map_or(0, |u| u.size as usize),
-                buffers: p.buffers.iter().map(|b| b.access).collect(),
+                bindings: p.bindings.iter().map(|b| b.kind).collect(),
             })
             .collect();
-        Checker { pipelines, buffers: HashMap::new(), scope: HashMap::new() }
+        Checker {
+            limits,
+            pipelines,
+            resources: HashMap::new(),
+            scope: HashMap::new(),
+            attachments: Vec::new(),
+        }
     }
 
     /// Checks a command that has passed the [`crate::stream::Sequencer`], and records its
@@ -84,33 +136,86 @@ impl Checker {
         let err = |why: String| Err(CommandError { opcode: op, why });
         match cmd {
             Command::CreateBuffer { handle, size } => {
-                if self.buffers.contains_key(handle) {
-                    return err(format!("buffer {handle} already exists"));
+                let max = self.limits.max_buffer_size;
+                if *size > max {
+                    return err(format!("buffer {handle} is {size} bytes; the limit is {max}"));
                 }
-                if *size > MAX_BUFFER_SIZE {
+                self.create(op, *handle, Resource::Buffer { size: *size })?;
+            }
+            Command::CreateTexture { handle, width, height, format } => {
+                let max = self.limits.max_texture_size;
+                if *width > max || *height > max {
                     return err(format!(
-                        "buffer {handle} is {size} bytes; the limit is {MAX_BUFFER_SIZE}"
+                        "texture {handle} is {width}x{height}; the limit is {max} a side"
                     ));
                 }
-                self.buffers.insert(*handle, *size);
+                let t = Resource::Texture { width: *width, height: *height, format: *format };
+                self.create(op, *handle, t)?;
+            }
+            Command::CreateSampler { handle, compare, .. } => {
+                self.create(op, *handle, Resource::Sampler { comparison: compare.is_some() })?;
             }
             Command::DestroyBuffer { handle } => {
-                self.size(op, *handle)?;
-                self.buffers.remove(handle);
+                self.buffer(op, *handle)?;
+                self.resources.remove(handle);
+            }
+            Command::DestroyTexture { handle } => {
+                self.texture(op, *handle)?;
+                self.resources.remove(handle);
+            }
+            Command::DestroySampler { handle } => {
+                self.sampler(op, *handle)?;
+                self.resources.remove(handle);
             }
             Command::WriteBuffer { handle, offset, data } => {
-                let size = self.size(op, *handle)?;
-                if u64::from(*offset) + data.len() as u64 > u64::from(size) {
+                self.range(op, *handle, *offset, data.len() as u32, "writing")?;
+            }
+            Command::ReadBuffer { handle, offset, size, .. } => {
+                self.range(op, *handle, *offset, *size, "reading")?;
+            }
+            Command::CopyBuffer {
+                source,
+                source_offset,
+                destination,
+                destination_offset,
+                size,
+            } => {
+                if source == destination {
                     return err(format!(
-                        "writing {} bytes at offset {offset} overruns buffer {handle} ({size} bytes)",
+                        "buffer {source} is both the copy's source and its destination"
+                    ));
+                }
+                self.range(op, *source, *source_offset, *size, "copying")?;
+                self.range(op, *destination, *destination_offset, *size, "copying")?;
+            }
+            Command::WriteTexture { handle, x, y, width, height, data } => {
+                let (w, h, format) = self.texture(op, *handle)?;
+                if u64::from(*x) + u64::from(*width) > u64::from(w)
+                    || u64::from(*y) + u64::from(*height) > u64::from(h)
+                {
+                    return err(format!(
+                        "writing {width}x{height} texels at ({x}, {y}) overruns texture {handle} ({w}x{h})"
+                    ));
+                }
+                if format.is_depth() {
+                    return err(format!(
+                        "texture {handle} is a depth texture, which only a pass can write"
+                    ));
+                }
+                let want =
+                    u64::from(*width) * u64::from(*height) * u64::from(format.bytes_per_texel());
+                if data.len() as u64 != want {
+                    return err(format!(
+                        "{width}x{height} texels of {} are {want} bytes, not {}",
+                        format.name(),
                         data.len()
                     ));
                 }
             }
-            Command::Dispatch { pipeline, groups, buffers, uniforms } => {
+            Command::Dispatch { pipeline, groups, bindings, uniforms } => {
                 self.scope.clear();
-                self.binding(op, *pipeline, buffers, uniforms.len())?;
-                let max = MAX_WORKGROUPS_PER_DIMENSION;
+                self.bindings(op, *pipeline, bindings, uniforms.len())?;
+                let max = self.limits.max_workgroups_per_dimension;
                 if groups.iter().any(|&g| g > max) {
                     let [x, y, z] = groups;
                     return err(format!(
@@ -118,34 +223,174 @@ impl Checker {
                     ));
                 }
             }
+            Command::DispatchIndirect { pipeline, arguments, offset, bindings, uniforms } => {
+                self.scope.clear();
+                self.bindings(op, *pipeline, bindings, uniforms.len())?;
+                self.arguments(op, *arguments, *offset, 12)?;
+            }
             Command::BeginScreenPass { clear } => {
-                let names = ["r", "g", "b", "a"];
-                if let Some(i) = clear.iter().position(|c| !c.is_finite()) {
-                    return err(format!("the clear colour's {} isn't a finite number", names[i]));
+                self.clear_colour(op, clear)?;
+                self.scope.clear();
+                self.attachments.clear();
+            }
+            Command::BeginPass(pass) => {
+                self.clear_colour(op, &pass.clear)?;
+                if !pass.clear_depth.is_finite() {
+                    return err("the clear depth isn't a finite number".into());
                 }
                 self.scope.clear();
+                self.attachments.clear();
+                let mut size = None;
+                if pass.color != SCREEN && pass.color != NONE {
+                    let (w, h, f) = self.texture(op, pass.color)?;
+                    if f.is_depth() {
+                        return err(format!(
+                            "texture {} is a depth texture, so it can't be a colour target",
+                            pass.color
+                        ));
+                    }
+                    size = Some((w, h));
+                    self.attachments.push(pass.color);
+                }
+                if pass.depth != NONE {
+                    let (w, h, f) = self.texture(op, pass.depth)?;
+                    if !f.is_depth() {
+                        return err(format!("texture {} isn't a depth texture", pass.depth));
+                    }
+                    if size.is_some_and(|s| s != (w, h)) {
+                        return err("the pass's colour and depth targets differ in size".into());
+                    }
+                    self.attachments.push(pass.depth);
+                }
+                if pass.color == NONE && pass.depth == NONE {
+                    return err("a pass needs a colour target or a depth target".into());
+                }
             }
-            Command::Draw { pipeline, buffers, uniforms, .. } => {
-                self.binding(op, *pipeline, buffers, uniforms.len())?;
+            Command::Draw { pipeline, bindings, uniforms, .. } => {
+                self.bindings(op, *pipeline, bindings, uniforms.len())?;
             }
-            Command::Present => {}
+            Command::DrawIndirect { pipeline, arguments, offset, bindings, uniforms } => {
+                self.bindings(op, *pipeline, bindings, uniforms.len())?;
+                self.arguments(op, *arguments, *offset, 16)?;
+            }
+            Command::Present | Command::EndPass => self.attachments.clear(),
+            Command::StorageRead { path, .. } | Command::StorageWrite { path, .. } => {
+                if let Some(why) = path_problem(path) {
+                    return err(format!("the storage path `{path}` {why}"));
+                }
+            }
+            Command::Fetch { url, .. } => {
+                if let Some(why) = path_problem(url) {
+                    return err(format!("the URL `{url}` {why}"));
+                }
+            }
+            Command::Log { .. } => {}
         }
         Ok(())
     }
 
-    fn size(&self, op: Opcode, handle: u32) -> Result<u32> {
-        self.buffers
-            .get(&handle)
-            .copied()
-            .ok_or_else(|| CommandError { opcode: op, why: format!("there's no buffer {handle}") })
+    fn clear_colour(&self, op: Opcode, clear: &[f32; 4]) -> Result<()> {
+        let names = ["r", "g", "b", "a"];
+        match clear.iter().position(|c| !c.is_finite()) {
+            Some(i) => Err(CommandError {
+                opcode: op,
+                why: format!("the clear colour's {} isn't a finite number", names[i]),
+            }),
+            None => Ok(()),
+        }
     }
 
-    /// Checks a dispatch's or draw's bindings, and adds its buffers to the usage scope.
-    fn binding(
+    fn create(&mut self, op: Opcode, handle: u32, r: Resource) -> Result<()> {
+        if let Some(old) = self.resources.get(&handle) {
+            return Err(CommandError {
+                opcode: op,
+                why: format!("handle {handle} already names {}", old.kind()),
+            });
+        }
+        self.resources.insert(handle, r);
+        Ok(())
+    }
+
+    fn missing(op: Opcode, what: &str, handle: u32) -> CommandError {
+        CommandError { opcode: op, why: format!("there's no {what} {handle}") }
+    }
+
+    fn buffer(&self, op: Opcode, handle: u32) -> Result<u32> {
+        match self.resources.get(&handle) {
+            Some(Resource::Buffer { size }) => Ok(*size),
+            _ => Err(Self::missing(op, "buffer", handle)),
+        }
+    }
+
+    fn texture(&self, op: Opcode, handle: u32) -> Result<(u32, u32, TextureFormat)> {
+        match self.resources.get(&handle) {
+            Some(Resource::Texture { width, height, format }) => Ok((*width, *height, *format)),
+            _ => Err(Self::missing(op, "texture", handle)),
+        }
+    }
+
+    fn sampler(&self, op: Opcode, handle: u32) -> Result<bool> {
+        match self.resources.get(&handle) {
+            Some(Resource::Sampler { comparison }) => Ok(*comparison),
+            _ => Err(Self::missing(op, "sampler", handle)),
+        }
+    }
+
+    /// Checks that `size` bytes at `offset` fit in buffer `handle`.
+    fn range(&self, op: Opcode, handle: u32, offset: u32, size: u32, doing: &str) -> Result<()> {
+        let total = self.buffer(op, handle)?;
+        if u64::from(offset) + u64::from(size) > u64::from(total) {
+            return Err(CommandError {
+                opcode: op,
+                why: format!(
+                    "{doing} {size} bytes at offset {offset} overruns buffer {handle} ({total} bytes)"
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// An indirect command's arguments: `size` bytes at `offset` in buffer `handle`, read.
+    fn arguments(&mut self, op: Opcode, handle: u32, offset: u32, size: u32) -> Result<()> {
+        self.range(op, handle, offset, size, "reading arguments:")?;
+        Self::used(&mut self.scope, op, "buffer", handle, false)
+    }
+
+    /// Adds a use of a buffer or texture (`what`) to the usage scope. (A function of the scope
+    /// alone, so a caller can hold a pipeline's shape meanwhile.)
+    fn used(
+        scope: &mut HashMap<u32, (bool, bool)>,
+        op: Opcode,
+        what: &str,
+        handle: u32,
+        write: bool,
+    ) -> Result<()> {
+        let seen = scope.entry(handle).or_default();
+        if write {
+            seen.1 = true
+        } else {
+            seen.0 = true
+        }
+        if seen.0 && seen.1 {
+            let one = if matches!(op, Opcode::Dispatch | Opcode::DispatchIndirect) {
+                "dispatch"
+            } else {
+                "pass"
+            };
+            return Err(CommandError {
+                opcode: op,
+                why: format!("{what} {handle} is used both read-only and read-write in one {one}"),
+            });
+        }
+        Ok(())
+    }
+
+    /// Checks a dispatch's or draw's bindings, and adds what they use to the usage scope.
+    fn bindings(
         &mut self,
         op: Opcode,
         pipeline: u32,
-        buffers: &[u32],
+        bindings: &[Binding],
         uniform_len: usize,
     ) -> Result<()> {
         let err = |why: String| Err(CommandError { opcode: op, why });
@@ -156,23 +401,18 @@ impl Checker {
             ));
         };
         let name = &p.name;
-        match (p.compute, op) {
-            (true, Opcode::Draw) => {
-                return err(format!(
-                    "pipeline {pipeline} ({name}) is a compute pipeline; Draw needs a render pipeline"
-                ));
-            }
-            (false, Opcode::Dispatch) => {
-                return err(format!(
-                    "pipeline {pipeline} ({name}) is a render pipeline; Dispatch needs a compute pipeline"
-                ));
-            }
-            _ => {}
-        }
-        if buffers.len() != p.buffers.len() {
-            let (want, got) = (p.buffers.len(), buffers.len());
+        let dispatch = matches!(op, Opcode::Dispatch | Opcode::DispatchIndirect);
+        if p.compute != dispatch {
+            let (is, needs) = if p.compute { ("compute", "render") } else { ("render", "compute") };
             return err(format!(
-                "pipeline {pipeline} ({name}) binds {want} buffers, but the command lists {got}"
+                "pipeline {pipeline} ({name}) is a {is} pipeline; {} needs a {needs} pipeline",
+                op.name()
+            ));
+        }
+        if bindings.len() != p.bindings.len() {
+            let (want, got) = (p.bindings.len(), bindings.len());
+            return err(format!(
+                "pipeline {pipeline} ({name}) binds {want} resources, but the command lists {got}"
             ));
         }
         if uniform_len != p.uniform_size {
@@ -181,26 +421,61 @@ impl Checker {
                 "pipeline {pipeline} ({name}) takes {want} uniform bytes, but the command has {uniform_len}"
             ));
         }
-        let (scope, one) =
-            if op == Opcode::Dispatch { ("dispatch", "dispatch") } else { ("screen pass", "draw") };
         let mut written = Vec::new();
-        for (&handle, &access) in buffers.iter().zip(&p.buffers) {
-            self.size(op, handle)?;
-            if access == Access::ReadWrite {
-                if written.contains(&handle) {
-                    return err(format!("buffer {handle} is bound read-write twice in one {one}"));
-                }
-                written.push(handle);
-            }
-            let seen = self.scope.entry(handle).or_default();
-            match access {
-                Access::Read => seen.0 = true,
-                Access::ReadWrite => seen.1 = true,
-            }
-            if seen.0 && seen.1 {
+        for (b, &kind) in bindings.iter().zip(&p.bindings) {
+            if self.attachments.contains(&b.handle) {
                 return err(format!(
-                    "buffer {handle} is bound both read-only and read-write in one {scope}"
+                    "texture {} is the pass's target, so its draws can't bind it",
+                    b.handle
                 ));
+            }
+            match kind {
+                BindingKind::Read | BindingKind::ReadWrite => {
+                    self.range(op, b.handle, b.offset, b.size, "binding")?;
+                    if b.size == 0 || b.size % 4 != 0 {
+                        return err(format!(
+                            "a bound range of buffer {} is {} bytes: a positive multiple of 4",
+                            b.handle, b.size
+                        ));
+                    }
+                    if b.offset % BINDING_OFFSET_ALIGNMENT != 0 {
+                        return err(format!(
+                            "a bound range of buffer {} starts at {}, not a multiple of {BINDING_OFFSET_ALIGNMENT} bytes",
+                            b.handle, b.offset
+                        ));
+                    }
+                    let write = kind == BindingKind::ReadWrite;
+                    if write {
+                        if written.contains(&b.handle) {
+                            let one = if dispatch { "dispatch" } else { "draw" };
+                            return err(format!(
+                                "buffer {} is bound read-write twice in one {one}",
+                                b.handle
+                            ));
+                        }
+                        written.push(b.handle);
+                    }
+                    Self::used(&mut self.scope, op, "buffer", b.handle, write)?;
+                }
+                BindingKind::Texture | BindingKind::DepthTexture => {
+                    let (_, _, f) = self.texture(op, b.handle)?;
+                    let depth = kind == BindingKind::DepthTexture;
+                    if f.is_depth() != depth {
+                        let want = if depth { "a depth texture" } else { "a colour texture" };
+                        return err(format!("texture {} is bound where {want} goes", b.handle));
+                    }
+                    Self::used(&mut self.scope, op, "texture", b.handle, false)?;
+                }
+                BindingKind::Sampler | BindingKind::ComparisonSampler => {
+                    let comparison = self.sampler(op, b.handle)?;
+                    if comparison != (kind == BindingKind::ComparisonSampler) {
+                        let want = if comparison { "a filtering" } else { "a comparison" };
+                        return err(format!(
+                            "sampler {} is bound where {want} sampler goes",
+                            b.handle
+                        ));
+                    }
+                }
             }
         }
         Ok(())

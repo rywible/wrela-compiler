@@ -11,14 +11,23 @@
 //!   CPU-only types; derivatives only exist in fragment shaders. These are found while lowering
 //!   each GPU pipeline and reported with the call chain.
 
+mod audio;
 mod body;
 mod consts;
 mod derive;
+mod eval;
+mod glue;
 mod gpu;
 mod instance;
+mod mem;
+mod par;
 mod ty;
 
-pub use gpu::{PipelineKind, PipelineOut};
+pub use eval::{
+    BuildData, ConstLowering, ConstModule, Embeds, Memory, TestModule, Value, Values, is_computed,
+    lower_consts, lower_tests, read_value,
+};
+pub use gpu::{PipelineKey, PipelineKind, PipelineOut};
 pub use instance::{Callable, InstanceKey};
 
 use std::collections::{HashMap, VecDeque};
@@ -49,6 +58,9 @@ pub struct Roots {
     /// Functions lowered for the CPU though nothing exports them: for tests, so code that
     /// nothing calls still goes through lowering and the back ends.
     pub also: Vec<FnId>,
+    /// Frame tests (§10), each exported as `test.<index>`, with the program's state when it
+    /// takes it: a name no wrela function has.
+    pub tests: Vec<FnId>,
 }
 
 impl Roots {
@@ -80,7 +92,7 @@ impl Roots {
                 gpu_checks.push((id, substs));
             }
         }
-        Roots { exports, gpu_checks, also: Vec::new() }
+        Roots { exports, gpu_checks, also: Vec::new(), tests: Vec::new() }
     }
 
     /// [`Roots::of`], and every other function of the package that can be lowered on its own:
@@ -93,6 +105,7 @@ impl Roots {
             let id = FnId(i as u32);
             if !p.is_std(f.module)
                 && checked.mir.contains_key(&id)
+                && !matches!(f.owner, wrela_sema::defs::FnOwner::Const(_))
                 && p.fn_all_generics(id).is_empty()
                 && f.attrs.entry.is_none()
                 && f.attrs.gpu.is_none()
@@ -155,13 +168,8 @@ fn on_gpu_in(p: &Program, t: TyId, known: &mut HashMap<TyId, bool>) -> bool {
         TyKind::Array(e, n) => *n > 0 && on_gpu_in(p, *e, known),
         TyKind::Tuple(ts) => ts.iter().all(|&e| on_gpu_in(p, e, known)),
         TyKind::Adt(a, args) => {
-            let adt = p.adt(*a);
             // A struct's fields, or each variant's; an enum without variants has no values.
-            let variants: Vec<Option<u32>> = if adt.is_enum() {
-                (0..adt.variants().len() as u32).map(Some).collect()
-            } else {
-                vec![None]
-            };
+            let variants = p.field_lists(*a);
             !variants.is_empty()
                 && variants
                     .into_iter()
@@ -174,14 +182,26 @@ fn on_gpu_in(p: &Program, t: TyId, known: &mut HashMap<TyId, bool>) -> bool {
 }
 
 /// Shared state while lowering every module of one program.
+/// What a debug build's NaN check panics with (§11).
+pub(crate) const NAN_MESSAGE: &str = "debug build: a float operation created a NaN";
+
 pub(crate) struct Cx<'a> {
     pub checked: &'a Checked,
+    /// The values of the constants the build has computed, and the files `embed` reads.
+    pub data: &'a BuildData,
+    /// Whether a failure is explained: a failed `assert` shows its operands' values. In a
+    /// debug build, and in the modules that compute constants and run tests (§10).
+    pub explain: bool,
+    /// Computed constants whose values were needed but aren't in `values` yet.
+    pub missing: std::collections::BTreeSet<wrela_sema::ty::ConstId>,
     /// Whether the modules will be emitted; only then are GPU modules flattened.
     pub emit: bool,
     pub diags: Vec<Diagnostic>,
     /// Pipelines discovered by CPU code, deduplicated, in discovery order, with their
     /// interfaces.
     pub pipelines: Vec<(gpu::PipelineKey, Rc<gpu::Interface>)>,
+    /// Where CPU code dispatches or draws each of `pipelines`.
+    pub pipeline_sites: Vec<Vec<Span>>,
 }
 
 /// One target module being built: the CPU module by default.
@@ -213,6 +233,8 @@ pub(crate) struct ModuleBuilder {
     pub data: HashMap<wrela_sema::ty::ConstId, Option<ir::DataId>>,
     /// Derived instances waiting for what they derive from to be lowered.
     pub deriving: Vec<derive::Pending>,
+    /// The constant data holding each text (CPU only).
+    pub texts: HashMap<String, ir::DataId>,
 }
 
 impl ModuleBuilder {
@@ -237,26 +259,57 @@ impl ModuleBuilder {
 /// Lowers a checked program (with no errors) to IR. With `emit`, its modules are ready for
 /// the back ends; without, lowering only checks (the GPU modules aren't flattened, which only
 /// the WGSL back end needs and which finds nothing wrong with a program).
-pub fn lower(checked: &Checked, roots: &Roots, emit: bool) -> (Lowered, Vec<Diagnostic>) {
-    let mut cx = Cx { checked, emit, diags: Vec::new(), pipelines: Vec::new() };
+pub fn lower(
+    checked: &Checked,
+    roots: &Roots,
+    data: &BuildData,
+    emit: bool,
+) -> (Lowered, Vec<Diagnostic>) {
+    let mut cx = Cx::new(checked, data, emit);
     let mut cpu = ModuleBuilder::default();
     let mut has_frame = false;
     for &f in &roots.also {
         cx.instance(&mut cpu, InstanceKey::plain(f, Vec::new()), None);
     }
+    // The program's state (§12): what `init` returns, which the other exports take first.
+    let state = state_type(checked);
+    if let Some((init, s)) = state {
+        let span = checked.program.func(init).sig_span;
+        if let Some(t) = cx.lower_ty(&mut cpu, s, span) {
+            let value = eval::zero(&cpu.m.types, t);
+            cpu.m.state = Some(cpu.m.add_data(ir::Data { name: "state".into(), ty: t, value }));
+        }
+    }
     for &f in &roots.exports {
         if !checked.program.fn_all_generics(f).is_empty() {
             // Reported; it has no types to be lowered with.
-            cx.check_export(f);
+            cx.check_export(f, state.map(|s| s.1));
             continue;
         }
         let key = InstanceKey::plain(f, Vec::new());
         let id = cx.instance(&mut cpu, key, None);
         let name = cx.checked.program.func(f).name.clone();
         has_frame |= name == wrela_abi::EXPORT_FRAME;
-        if cx.check_export(f) {
+        if cx.check_export(f, state.map(|s| s.1)) {
+            let id = match (cpu.m.state, state) {
+                (Some(d), Some((init, _))) if f == init => state_wrapper(&mut cpu, id, d, true),
+                (Some(d), Some((_, s)))
+                    if checked.program.func(f).params.first().is_some_and(|p| p.ty == s) =>
+                {
+                    state_wrapper(&mut cpu, id, d, false)
+                }
+                _ => id,
+            };
             cpu.m.exports.push((name, id));
         }
+    }
+    for (i, &f) in roots.tests.iter().enumerate() {
+        let id = cx.instance(&mut cpu, InstanceKey::plain(f, Vec::new()), None);
+        let id = match (cpu.m.state, checked.program.func(f).params.is_empty()) {
+            (Some(d), false) => state_wrapper(&mut cpu, id, d, false),
+            _ => id,
+        };
+        cpu.m.exports.push((format!("test.{i}"), id));
     }
     if !has_frame {
         cx.no_frame();
@@ -264,9 +317,28 @@ pub fn lower(checked: &Checked, roots: &Roots, emit: bool) -> (Lowered, Vec<Diag
     cx.drain(&mut cpu);
     rewrite_cpu_math(&mut cx, &mut cpu);
     cx.drain(&mut cpu);
+    mark_counted(&mut cx, &mut cpu);
+    if data.debug {
+        // Checked where floats are computed, by the back end.
+        cpu.m.nan_message = Some(cx.text_data(&mut cpu, NAN_MESSAGE));
+    }
+    if !wrela_diag::has_errors(&cx.diags)
+        && let Err(e) = ir::opt::inline_cpu(&mut cpu.m)
+    {
+        cx.err(Diagnostic::internal(format!("inlining the CPU module: {e}")));
+    }
+    // For the compiler's own debugging: `WRELA_DUMP_IR=cpu` prints the CPU module; set to
+    // anything else, it's printed when it's malformed.
+    let dump = std::env::var("WRELA_DUMP_IR").ok();
+    if dump.as_deref() == Some("cpu") {
+        eprintln!("{}", ir::print::print(&cpu.m));
+    }
     if !wrela_diag::has_errors(&cx.diags)
         && let Err(e) = ir::verify(&cpu.m)
     {
+        if dump.is_some_and(|d| d != "cpu") {
+            eprintln!("{}", ir::print::print(&cpu.m));
+        }
         cx.err(Diagnostic::internal(format!("the CPU module's IR is malformed: {e}")));
     }
     // Pipelines: those CPU code records, then the standalone GPU checks.
@@ -274,7 +346,11 @@ pub fn lower(checked: &Checked, roots: &Roots, emit: bool) -> (Lowered, Vec<Diag
     let mut i = 0;
     while i < cx.pipelines.len() {
         let (key, iface) = cx.pipelines[i].clone();
-        if let Some(out) = gpu::lower_pipeline(&mut cx, &key, iface) {
+        let sites = cx.pipeline_sites[i].clone();
+        if let Some(mut out) = gpu::lower_pipeline(&mut cx, &key, iface, sites) {
+            if data.debug && cx.emit {
+                gpu::debug_checks(&mut cx, &mut out, pipelines.len() as u32 + 1);
+            }
             pipelines.push(out);
         }
         i += 1;
@@ -302,6 +378,19 @@ pub fn lower(checked: &Checked, roots: &Roots, emit: bool) -> (Lowered, Vec<Diag
 }
 
 impl<'a> Cx<'a> {
+    pub fn new(checked: &'a Checked, data: &'a BuildData, emit: bool) -> Cx<'a> {
+        Cx {
+            checked,
+            data,
+            explain: data.debug,
+            missing: Default::default(),
+            emit,
+            diags: Vec::new(),
+            pipelines: Vec::new(),
+            pipeline_sites: Vec::new(),
+        }
+    }
+
     pub fn err(&mut self, d: Diagnostic) {
         self.diags.push(d);
     }
@@ -409,7 +498,7 @@ impl<'a> Cx<'a> {
     /// Whether an exported function's signature can cross the WASM boundary: scalars and
     /// vectors in, and a scalar, a vector or nothing out. `frame` has the one signature the
     /// host calls, and no export takes the name of the program's memory.
-    fn check_export(&mut self, f: FnId) -> bool {
+    fn check_export(&mut self, f: FnId, state: Option<TyId>) -> bool {
         let def = self.checked.program.func(f);
         if def.name == wrela_abi::EXPORT_MEMORY {
             self.err(
@@ -427,21 +516,44 @@ impl<'a> Cx<'a> {
             );
             return false;
         }
+        use wrela_sema::defs::{Mode, RetMode};
+        if def.name == wrela_abi::EXPORT_INIT {
+            let t = &self.checked.program.types;
+            let ok = def.params.is_empty()
+                && !t.is_unit(def.ret)
+                && def.ret_mode == RetMode::Owned
+                && self.checked.program.fn_all_generics(f).is_empty();
+            if !ok {
+                self.err(
+                    Diagnostic::new(wrela_diag::codes::E0703, def.sig_span, "`init`'s signature is `init() -> State`: it makes the program's state, which the host keeps")
+                        .with_note("the host calls `init` once, then passes its result to `frame` and the other exports that take the state first (§12)"),
+                );
+            }
+            return ok;
+        }
+        // An export may take the program's state first, as `mut` or borrowed.
+        let takes_state = state.is_some_and(|s| def.params.first().is_some_and(|p| p.ty == s));
         if def.name == wrela_abi::EXPORT_FRAME {
             let t = &self.checked.program.types;
             let want = [t.f32, t.u32, t.u32];
-            let params_ok = def.params.len() == want.len()
-                && def
-                    .params
-                    .iter()
-                    .zip(want)
-                    .all(|(p, w)| p.ty == w && p.mode == wrela_sema::defs::Mode::Borrow);
-            if params_ok && def.ret == t.unit && def.ret_mode == wrela_sema::defs::RetMode::Owned {
+            let rest = if takes_state { &def.params[1..] } else { &def.params[..] };
+            let params_ok = rest.len() == want.len()
+                && rest.iter().zip(want).all(|(p, w)| p.ty == w && p.mode == Mode::Borrow)
+                && (takes_state || state.is_none())
+                && (!takes_state || def.params[0].mode == Mode::Mut);
+            if params_ok && def.ret == t.unit && def.ret_mode == RetMode::Owned {
                 return true;
             }
+            let msg = match state {
+                Some(s) => format!(
+                    "`frame`'s signature is `frame(state: mut {}, time: f32, width: u32, height: u32)`, with no result: the host calls it each frame",
+                    self.checked.program.display_ty(s)
+                ),
+                None => "`frame`'s signature is `frame(time: f32, width: u32, height: u32)`, with no result: the host calls it each frame".into(),
+            };
             self.err(
-                Diagnostic::new(wrela_diag::codes::E0703, def.sig_span, "`frame`'s signature is `frame(time: f32, width: u32, height: u32)`, with no result: the host calls it each frame")
-                    .with_note("a host program exports `frame`: the time in seconds, and the screen's size in pixels"),
+                Diagnostic::new(wrela_diag::codes::E0703, def.sig_span, msg)
+                    .with_note("a host program exports `frame`: the time in seconds, and the screen's size in pixels; a program with `init` gets its state first (§12)"),
             );
             return false;
         }
@@ -460,7 +572,8 @@ impl<'a> Cx<'a> {
             TyKind::Tuple(ts) => ret && ts.is_empty(),
             _ => false,
         };
-        for p in &def.params {
+        let skip = usize::from(takes_state);
+        for p in &def.params[skip..] {
             let k = self.checked.program.types.kind(p.ty);
             if !exportable(k, false) {
                 ok = false;
@@ -548,7 +661,7 @@ impl<'a> Cx<'a> {
             InstanceKey::Closure { owner, .. } => {
                 owner.source_fn().map(|f| format!("a closure in {}", p.fn_display_name(f)))
             }
-            InstanceKey::Derived { .. } => None,
+            InstanceKey::Derived { .. } | InstanceKey::Glue { .. } => None,
         }
     }
 
@@ -564,6 +677,119 @@ const MAX_INSTANCE_DEPTH: u32 = 256;
 
 /// The std function implementing a transcendental builtin on the CPU (language.md §11): the
 /// one the built-in function that lowers to it names.
+/// The program's `init` (§12): `pub fn init() -> S` in main.wrela, and its state type `S`.
+fn state_type(checked: &Checked) -> Option<(FnId, TyId)> {
+    let p = &checked.program;
+    let main = p.main?;
+    p.fns.iter().enumerate().find_map(|(i, f)| {
+        (f.module == main
+            && f.public
+            && f.owner == wrela_sema::defs::FnOwner::Free
+            && f.name == wrela_abi::EXPORT_INIT
+            && f.params.is_empty()
+            && f.generics.is_empty()
+            && !p.types.is_unit(f.ret))
+        .then_some((FnId(i as u32), f.ret))
+    })
+}
+
+/// An export that runs `inner` on the program's state, in data `state`: with `init`, it stores
+/// what `inner` returns there; otherwise it passes the state for `inner`'s first parameter.
+fn state_wrapper(
+    mb: &mut ModuleBuilder,
+    inner: ir::FuncId,
+    state: ir::DataId,
+    init: bool,
+) -> ir::FuncId {
+    let f = &mb.m.functions[inner.index()];
+    let name = format!("{}_export", f.name);
+    let at = ir::Place::root(ir::PlaceRoot::Data(state));
+    if init {
+        let ret = f.ret;
+        let mut w = ir::Function::new(name, Vec::new(), None);
+        if let Some(t) = ret {
+            let v = w.new_value(t);
+            w.body = vec![
+                ir::Stmt::Let(v, ir::Expr::Call(inner, Vec::new())),
+                ir::Stmt::Store(at, v),
+                ir::Stmt::Return(None),
+            ];
+        }
+        return mb.m.add_function(w);
+    }
+    let (params, ret, first) = (f.params[1..].to_vec(), f.ret, f.params[0].clone());
+    let mut w = ir::Function::new(name, params.clone(), ret);
+    w.ret_ref = f.ret_ref;
+    let mut body = Vec::new();
+    let mut args = Vec::new();
+    if first.by_ref {
+        args.push(ir::Arg::Place(at));
+    } else {
+        let v = w.new_value(first.ty);
+        body.push(ir::Stmt::Let(v, ir::Expr::Load(at)));
+        args.push(ir::Arg::Value(v));
+    }
+    for i in 0..params.len() {
+        args.push(w.param_arg(i as u32, &mut body));
+    }
+    match ret {
+        Some(t) => {
+            let r = w.new_value(t);
+            body.push(ir::Stmt::Let(r, ir::Expr::Call(inner, args)));
+            body.push(ir::Stmt::Return(Some(r)));
+        }
+        None => {
+            body.push(ir::Stmt::Eval(ir::Expr::Call(inner, args)));
+            body.push(ir::Stmt::Return(None));
+        }
+    }
+    w.body = body;
+    mb.m.add_function(w)
+}
+
+/// Marks the recursive functions `@deterministic` code reaches (language.md §8): their depth is
+/// counted, and a call past [`ir::RECURSION_LIMIT`] of them in progress panics, the same way on
+/// every engine, before engines' different stack limits could matter. A function in a cycle of
+/// calls is counted wherever it's called from. Drop and clone glue isn't: it follows the data.
+fn mark_counted(cx: &mut Cx, mb: &mut ModuleBuilder) {
+    let p = &cx.checked.program;
+    let n = mb.m.functions.len();
+    let mut adj = vec![Vec::new(); n];
+    for &(a, b, _) in &mb.edges {
+        adj[a.index()].push(b.index());
+    }
+    let mut glue = vec![false; n];
+    let mut work = Vec::new();
+    for (key, id) in &mb.instances {
+        match key {
+            InstanceKey::Fn { func, .. } if p.func(*func).attrs.deterministic.is_some() => {
+                work.push(id.index());
+            }
+            InstanceKey::Glue { .. } => glue[id.index()] = true,
+            _ => {}
+        }
+    }
+    let mut reached = vec![false; n];
+    while let Some(i) = work.pop() {
+        if !std::mem::replace(&mut reached[i], true) {
+            work.extend(&adj[i]);
+        }
+    }
+    let mut any = false;
+    for comp in wrela_sema::effects::sccs(&adj) {
+        let cyclic = comp.len() > 1 || adj[comp[0]].contains(&comp[0]);
+        for &f in comp.iter().filter(|&&f| cyclic && reached[f] && !glue[f]) {
+            mb.m.functions[f].counted = true;
+            any = true;
+        }
+    }
+    if any {
+        let msg = format!("recursion deeper than {} calls", ir::RECURSION_LIMIT);
+        let (d, len) = cx.text_data(mb, &msg);
+        mb.m.depth_message = Some((d, len));
+    }
+}
+
 pub(crate) fn cpu_math_lang(b: ir::Builtin) -> Option<Lang> {
     BuiltinFn::ALL.iter().find_map(|&f| match body::builtin_ir(f) {
         body::BuiltinIr::Math(m) if m == b => f.cpu_impl(),

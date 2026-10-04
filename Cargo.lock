@@ -1970,8 +1970,10 @@ dependencies = [
 name = "wrela-driver"
 version = "0.1.0"
 dependencies = [
+ "wasmtime",
  "wrela-abi",
  "wrela-diag",
+ "wrela-host",
  "wrela-ir",
  "wrela-lower",
  "wrela-sema",
@@ -2041,13 +2043,16 @@ name = "wrela-tests"
 version = "0.1.0"
 dependencies = [
  "pollster",
+ "serde_json",
  "wgpu",
  "wrela-abi",
  "wrela-diag",
  "wrela-driver",
  "wrela-grammar",
  "wrela-host",
+ "wrela-sema",
  "wrela-syntax",
+ "wrela-wasm",
 ]
 
 [[package]]

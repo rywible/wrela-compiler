@@ -1,0 +1,44 @@
+// run: a program with state (§12): the host calls `init` once, keeps what it returns, and
+// passes it first to `frame` and to the other exports that take it
+// expect: frames() = 0
+// expect: bump(2) = 2
+// expect: bump(3) = 5
+// expect: frames() = 5
+// expect: logged() = 7
+// expect: names() = 2
+
+struct Game {
+    frames: u32,
+    log: Vec<u32>,
+    names: SortedMap<u32, String>,
+}
+
+pub fn init() -> Game {
+    var names = SortedMap::new()
+    let _ = names.insert(1, String::from("grazer"))
+    Game { frames: 0, log: Vec::new(), names }
+}
+
+pub fn frame(game: mut Game, time: f32, width: u32, height: u32) {
+    game.frames += 1
+}
+
+pub fn frames(game: Game) -> u32 {
+    game.frames
+}
+
+pub fn bump(game: mut Game, k: u32) -> u32 {
+    game.frames += k
+    game.log.push(k)
+    game.frames
+}
+
+pub fn logged() -> u32 {
+    // An export without the state is still an export.
+    7
+}
+
+pub fn names(game: mut Game) -> u32 {
+    let _ = game.names.insert(2, f"{game.frames}")
+    game.names.len()
+}

@@ -13,11 +13,11 @@
           "message": "the `match` borrows `m.state` here",
           "span": {
             "column": 11,
-            "end": 332,
+            "end": 324,
             "end_column": 18,
             "end_line": 20,
             "line": 20,
-            "start": 325
+            "start": 317
           }
         }
       ],
@@ -28,11 +28,11 @@
       "severity": "error",
       "span": {
         "column": 35,
-        "end": 396,
+        "end": 388,
         "end_column": 36,
         "end_line": 22,
         "line": 22,
-        "start": 395
+        "start": 387
       },
       "title": "a write to a place that's borrowed"
     }

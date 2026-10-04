@@ -24,15 +24,20 @@
 //! the lock, for tests that call exports.
 
 mod error;
+#[cfg(feature = "gpu")]
 mod gpu;
+#[cfg(feature = "gpu")]
 pub mod image;
 pub mod lock;
 mod program;
+mod shared;
 
 pub use error::{Error, Result};
+#[cfg(feature = "gpu")]
 pub use gpu::{GpuTiming, map_read, open_device, read_timestamps};
-pub use program::Value;
+pub use program::{Failure, Value};
 
+#[cfg(feature = "gpu")]
 use gpu::Gpu;
 use program::Program;
 use std::path::Path;
@@ -48,9 +53,35 @@ pub struct Options {
     /// Keep a copy of every batch the program submits ([`Host::take_batches`]): for tests
     /// that look at what a program recorded, such as a dispatch's uniform bytes.
     pub record: bool,
+    /// Where the program's storage requests read and write; by default, `storage/` in the
+    /// build's directory.
+    pub storage: Option<std::path::PathBuf>,
+    /// How many threads run a parallel job's chunks, the program's own included (at most
+    /// `wrela_abi::memory::MAX_WORKERS + 1`); 0 for [`default_workers`].
+    pub workers: u32,
+}
+
+/// The threads a program's parallel jobs run on by default: one per core, at most
+/// `wrela_abi::memory::MAX_WORKERS + 1`.
+pub fn default_workers() -> u32 {
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get() as u32);
+    cores.min(wrela_abi::memory::MAX_WORKERS + 1)
+}
+
+fn workers(n: u32) -> u32 {
+    if n == 0 { default_workers() } else { n }
+}
+
+/// Where a build in `dir` reads and writes, with `storage` overriding its storage directory.
+fn io(dir: &Path, storage: Option<&Path>) -> program::Io {
+    program::Io {
+        build: Some(dir.to_path_buf()),
+        storage: Some(storage.map_or_else(|| dir.join("storage"), Path::to_path_buf)),
+    }
 }
 
 /// The outcome of [`Host::run_frames`].
+#[cfg(feature = "gpu")]
 #[derive(Clone, Debug)]
 pub struct RunResult {
     /// FNV-1a 64 over every byte the program has submitted since it loaded.
@@ -63,6 +94,7 @@ pub struct RunResult {
     pub timings: Vec<GpuTiming>,
 }
 
+#[cfg(feature = "gpu")]
 impl RunResult {
     /// The hash as both hosts print it: sixteen lowercase hex digits.
     pub fn hash_hex(&self) -> String {
@@ -100,12 +132,14 @@ fn read_file<T>(
 }
 
 /// A loaded program, ready to run.
+#[cfg(feature = "gpu")]
 pub struct Host {
     program: Program<Gpu>,
     // Declared last: dropped after the GPU.
     _lock: lock::GpuLock,
 }
 
+#[cfg(feature = "gpu")]
 impl Host {
     /// Loads the build in `dir` (manifest.json, the WASM, the WGSL), opens the GPU and builds
     /// every pipeline.
@@ -117,13 +151,12 @@ impl Host {
         let dir = dir.as_ref();
         let (manifest, wasm, shaders) = read_build(dir)?;
         // Everything that can be checked without the GPU is, before taking it.
-        let compiled = program::compile(&wasm)?;
+        let compiled = program::compile_with(&wasm, None)?;
         let lock = lock::GpuLock::acquire(&format!("wrela-host {}", dir.display()))?;
         let gpu = Gpu::new(&manifest, &shaders, options.timestamps)?;
-        let mut program = Program::instantiate(&compiled, &manifest, gpu)?;
-        if options.record {
-            program.record_batches();
-        }
+        let io = io(dir, options.storage.as_deref());
+        let n = workers(options.workers);
+        let program = Program::instantiate(&compiled, &manifest, gpu, io, options.record, n)?;
         Ok(Host { program, _lock: lock })
     }
 
@@ -145,6 +178,17 @@ impl Host {
     /// tests. Anything it submits runs (and counts toward the hash).
     pub fn call_export(&mut self, name: &str, args: &[Value]) -> Result<Vec<Value>> {
         self.program.call(name, args)
+    }
+
+    /// Renders `quanta` quanta of the program's voice offline (as [`CpuHost::render_audio`]).
+    pub fn render_audio(&mut self, quanta: u32) -> Result<Vec<f32>> {
+        self.program.render_audio(quanta)
+    }
+
+    /// The handles of the GPU buffers the program holds, oldest first: for tests, to find a
+    /// buffer to read back. A buffer the program dropped is gone.
+    pub fn buffers(&mut self) -> Vec<u32> {
+        self.program.executor().buffers()
     }
 
     /// Reads a GPU buffer back after a run. For tests: it waits for the GPU.
@@ -178,6 +222,10 @@ impl program::Executor for NoGpu {
     fn end_frame(&mut self) -> Result<()> {
         Ok(())
     }
+
+    fn read_back(&mut self, _handle: u32, _offset: u32, _size: u32) -> Result<Vec<u8>> {
+        Err(Error::Gpu("a CPU host has no GPU to read back from".into()))
+    }
 }
 
 /// A build's WASM, compiled and checked once: each [`CpuBuild::start`] gives a new [`CpuHost`]
@@ -185,19 +233,50 @@ impl program::Executor for NoGpu {
 pub struct CpuBuild {
     manifest: Manifest,
     compiled: program::Compiled,
+    dir: std::path::PathBuf,
 }
 
 impl CpuBuild {
     /// Loads the build in `dir`; its shaders must exist but aren't compiled.
     pub fn load(dir: impl AsRef<Path>) -> Result<CpuBuild> {
-        let (manifest, wasm, _) = read_build(dir.as_ref())?;
-        Ok(CpuBuild { compiled: program::compile(&wasm)?, manifest })
+        CpuBuild::load_compiled(dir.as_ref(), None)
     }
 
-    /// A new instance of the program: its own memory, batches and hash.
+    /// [`CpuBuild::load`], with each call (`init`, a frame, an export) given `fuel` units of
+    /// work (about one per WASM instruction): a call that does more traps, after the same work
+    /// on every machine. For tests that run a program's frames.
+    pub fn load_metered(dir: impl AsRef<Path>, fuel: u64) -> Result<CpuBuild> {
+        CpuBuild::load_compiled(dir.as_ref(), Some(fuel))
+    }
+
+    fn load_compiled(dir: &Path, fuel: Option<u64>) -> Result<CpuBuild> {
+        let (manifest, wasm, _) = read_build(dir)?;
+        let compiled = program::compile_with(&wasm, fuel)?;
+        Ok(CpuBuild { compiled, manifest, dir: dir.to_path_buf() })
+    }
+
+    /// A new instance of the program: its own memory, batches and hash, and its parallel jobs
+    /// on [`default_workers`] threads.
     pub fn start(&self) -> Result<CpuHost> {
-        let mut program = Program::instantiate(&self.compiled, &self.manifest, NoGpu)?;
-        program.record_batches();
+        self.start_with(0)
+    }
+
+    /// [`CpuBuild::start`], with parallel jobs on `workers` threads (the caller's included; 0
+    /// for the default).
+    pub fn start_with(&self, workers: u32) -> Result<CpuHost> {
+        let mut host = self.instantiate_in(workers, None)?;
+        host.init()?;
+        Ok(host)
+    }
+
+    /// [`CpuBuild::start_with`], with the program's storage requests reading and writing
+    /// `storage` (by default, `storage/` in the build's directory), and without running
+    /// `init`: call [`CpuHost::init`] next, which says why it failed if it does.
+    pub fn instantiate_in(&self, workers: u32, storage: Option<&Path>) -> Result<CpuHost> {
+        let io = io(&self.dir, storage);
+        let n = self::workers(workers);
+        let (compiled, manifest) = (&self.compiled, &self.manifest);
+        let program = Program::instantiate_with(compiled, manifest, NoGpu, io, true, n, false)?;
         Ok(CpuHost { program })
     }
 }
@@ -232,6 +311,32 @@ impl CpuHost {
     /// FNV-1a 64 of every byte submitted since the program loaded.
     pub fn hash(&self) -> u64 {
         self.program.hash().value()
+    }
+
+    /// Why the last call failed, if it trapped: where, by WASM offset, and how.
+    pub fn last_failure(&self) -> Option<&Failure> {
+        self.program.last_failure()
+    }
+
+    /// Runs the program's `init`, for a host [`CpuBuild::instantiate_in`] made.
+    pub fn init(&mut self) -> Result<()> {
+        self.program.run_init()
+    }
+
+    /// The lines the program printed (`std::io::print`) since the last call.
+    pub fn take_logs(&mut self) -> Vec<String> {
+        self.program.take_logs()
+    }
+
+    /// How many chunks of parallel jobs the workers (not the program's own thread) have run.
+    pub fn worker_chunks(&self) -> u32 {
+        self.program.helped()
+    }
+
+    /// Renders `quanta` quanta of the program's voice offline: `wrela_abi::AUDIO_QUANTUM`
+    /// samples each, mono, at `wrela_abi::AUDIO_SAMPLE_RATE`. Each call goes on from the last.
+    pub fn render_audio(&mut self, quanta: u32) -> Result<Vec<f32>> {
+        self.program.render_audio(quanta)
     }
 
     /// The names and WASM types of the module's exported functions: `(params, results)`.

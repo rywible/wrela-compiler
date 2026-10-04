@@ -1,0 +1,297 @@
+// Sketch 03, "the simulation" (design-archive-2026-10: docs/design/sketches/
+// 03-the-simulation.md): the code that mutates. The world, one gameplay system, the fixed tick,
+// snapshots and rollback, saves. As the paper test rewrote it (#41, Q11): sim state is ordinary
+// values, a snapshot is a clone, the checksum is the derived `StateHash`, and a save is the
+// derived `Serialize`. Each change from the sketch is noted where it's made ("Changed:");
+// the engine's parts (the spatial grid and the timeline) are in engine/spatial.wrela and
+// engine/timeline.wrela.
+
+use engine::rng::{Rng, Seed}
+use engine::sim::{Ground, Intent, Mode, Sim, SimState, Tick, Transform}
+use engine::spatial::{Found, SpatialGrid}
+use grazer::sketch::{GrazerSim, step}
+use std::arena::{Arena, Handle}
+use std::field::Surface
+use std::hash::StateHash
+use std::serialize::{LoadError, Reader, Serialize, Writer}
+use std::units::m
+
+// ---- §1 The world -----------------------------------------------------------------------------
+
+/// Everything the simulation knows: ordinary values.
+pub struct World: Sim {
+    pub tick: Tick,
+    pub seed: Seed,
+    pub terrain: Terrain,
+    pub grazers: Arena<GrazerSim>,
+    pub players: Arena<PlayerSim>,
+}
+
+/// Terrain is sim state: a base field plus an edit log (D-015).
+pub struct Terrain: Sim {
+    pub base: TerrainField,
+    pub edits: Vec<Edit>, // an ordinary Vec: no region, no region-bound rule
+}
+
+pub enum Edit: SimState + Copy + StateHash + Serialize { // `Copy` implies `Clone`
+    Dig { at: vec3, radius: f32 },
+    Fill { at: vec3, radius: f32 },
+}
+
+/// The authored base field: rolling ground.
+///
+/// Changed: the sketch's `TerrainField` came from the game's IR, which isn't written; this is
+/// a field of its own. Its distance is the height difference scaled by the steepest slope, so
+/// it never overestimates (a raycast steps by it).
+pub struct TerrainField: Copy + GpuData + SimState + StateHash + Serialize {
+    pub height: f32,
+    pub roll: f32,
+    pub wavelength: f32,
+}
+
+impl Surface for TerrainField {
+    fn distance(self, p: vec3) -> f32 {
+        let w = self.wavelength
+        (p.y - self.height - self.roll * sin(p.x / w) * sin(p.z / w)) * 0.7
+    }
+}
+
+/// A player: where they are.
+pub struct PlayerSim: Sim {
+    pub root: Transform,
+}
+
+/// What a tick's input is: how the player walks (metres, x and z), and whether they dig or
+/// fill where they stand.
+pub struct TickInput: Copy + Eq + StateHash + Serialize {
+    pub walk: vec2,
+    pub dig: bool,
+    pub fill: bool,
+}
+
+// ---- §2 Modes and projections in practice -----------------------------------------------------
+
+/// Borrowed by default.
+pub fn nearest(players: Arena<PlayerSim>, at: vec3) -> Option<Handle<PlayerSim>> {
+    var best: Option<Handle<PlayerSim>> = None
+    var d = 1.0e30
+    var i = 0
+    for p in players {
+        let e = length(p.root.pos - at)
+        if e < d {
+            d = e
+            best = Some(players.handle_at(i))
+        }
+        i += 1
+    }
+    best
+}
+
+/// A projection of a `mut` parameter.
+pub fn grazer(world: mut World, h: Handle<GrazerSim>) -> mut GrazerSim {
+    mut world.grazers[h]
+}
+
+/// `world` stays mutably borrowed while `g` is live.
+pub fn spook(world: mut World, h: Handle<GrazerSim>) {
+    mut g = grazer(mut world, h)
+    g.gait.mode = Mode::Flee
+}
+
+// ---- §3 One tick ------------------------------------------------------------------------------
+
+/// The player walks, and digs or fills where they stand.
+///
+/// Changed: the sketch called `apply_input` without writing it.
+@deterministic
+fn apply_input(players: mut Arena<PlayerSim>, terrain: mut Terrain, input: TickInput) {
+    for mut p in players {
+        p.root.pos += vec3(input.walk.x, 0.0, input.walk.y)
+        if input.dig {
+            terrain.edits.push(Edit::Dig { at: p.root.pos, radius: 1m })
+        }
+        if input.fill {
+            terrain.edits.push(Edit::Fill { at: p.root.pos, radius: 1m })
+        }
+    }
+}
+
+/// The angle to turn from `heading` to face along `dir`, in (-π, π].
+fn turn_towards(heading: f32, dir: vec3) -> f32 {
+    var a = atan2(dir.x, dir.z) - heading
+    while a > 3.14159265 {
+        a -= 6.2831853
+    }
+    while a <= -3.14159265 {
+        a += 6.2831853
+    }
+    a
+}
+
+/// A grazer's wish this tick: away from a near player; otherwise towards its herd's middle,
+/// wandering a little, by its own stream (so results don't depend on which thread ran it).
+///
+/// Changed: the sketch called `herd_intent` without writing it. A threat and the mates are
+/// what the grids found, with the positions the grids hold: `world.grazers` is being changed.
+@deterministic
+pub fn herd_intent(
+    g: mut GrazerSim,
+    threat: Option<Found<PlayerSim>>,
+    mates: Vec<Found<GrazerSim>>,
+) -> Intent {
+    let wander = 0.4 * (g.rng.unit() - 0.5)
+    match threat {
+        Some(t) => {
+            let away = g.root.pos - t.pos
+            Intent { turn: turn_towards(g.root.heading, away), speed: 2.0, flee: true }
+        },
+        None => {
+            var centre = vec3(0.0)
+            for mate in mates {
+                centre += mate.pos
+            }
+            let n = f32(mates.len())
+            let toward = if n > 1.0 { centre / n - g.root.pos } else { g.root.forward() }
+            Intent {
+                turn: 0.5 * turn_towards(g.root.heading, toward) + wander,
+                speed: 0.6,
+                flee: false,
+            }
+        },
+    }
+}
+
+/// Grazers drift with the herd and flee nearby players. Players can dig.
+///
+/// Changed: `SpatialGrid::build` takes the arena and a closure giving each item's position (the
+/// paper test's), and `within` returns what it found with the positions it holds (the sketch's
+/// returned handles, whose positions the herd couldn't read: `world.grazers` is being changed).
+@deterministic
+pub fn tick(world: mut World, input: TickInput) {
+    apply_input(mut world.players, mut world.terrain, input) // disjoint fields: fine
+
+    let near = SpatialGrid::build(world.players, |p| p.root.pos, cell: 10m) // copies, built in order:
+    let herd = SpatialGrid::build(world.grazers, |g| g.root.pos, cell: 10m) //   deterministic (D-085)
+    world.grazers.par_each_mut(|g| { // `g`: a mutable projection of one grazer
+        let threat = near.closest(g.root.pos, within: 25m)
+        let mates = herd.within(g.root.pos, radius: 15m) // other grazers, as of the start of the tick
+        let intent = herd_intent(mut g, threat, mates) // uses g.rng: a per-grazer stream
+        step(mut g, world.terrain, intent) // sketch 01's step
+    })
+    world.tick += 1
+}
+
+impl Terrain {
+    /// Collision queries in the sim evaluate this on the CPU, with strict floats.
+    @deterministic
+    pub fn distance(self, p: vec3) -> f32 {
+        var d = self.base.distance(p)
+        for e in self.edits { // a runtime-length loop over data
+            d = match e {
+                Edit::Dig { at, radius } => max(d, radius - (p - at).length()),
+                Edit::Fill { at, radius } => min(d, (p - at).length() - radius),
+            }
+        }
+        d
+    }
+}
+
+impl Ground for Terrain {
+    fn ground(self, p: vec3) -> f32 {
+        self.distance(p)
+    }
+}
+
+// ---- §6 Errors and panics ---------------------------------------------------------------------
+
+/// Why a save can't be loaded.
+pub enum SaveError: Clone {
+    /// It isn't a save: no header, or the wrong one.
+    NotASave,
+    /// From a version this build can't migrate.
+    Version(u32),
+    /// Its fields don't read: where, and what was wrong.
+    Corrupt(LoadError),
+}
+
+/// A save's header: what it is, and the layout's version.
+pub struct SaveHeader: Copy {
+    pub version: u32,
+}
+
+/// "WRLA", little-endian.
+const MAGIC: u32 = 0x414c5257
+
+/// The save layout this build writes.
+pub const SAVE_VERSION: u32 = 2
+
+fn u32_at(bytes: [u8], i: u32) -> u32 {
+    u32(bytes[i]) | (u32(bytes[i + 1]) << 8) | (u32(bytes[i + 2]) << 16) | (u32(bytes[i + 3]) << 24)
+}
+
+impl SaveHeader {
+    pub fn parse(bytes: [u8]) -> Result<SaveHeader, SaveError> {
+        if bytes.len() < 8 || u32_at(bytes, 0) != MAGIC {
+            return Err(SaveError::NotASave)
+        }
+        Ok(SaveHeader { version: u32_at(bytes, 4) })
+    }
+
+    /// Its length in bytes.
+    pub fn len(self) -> u32 {
+        8
+    }
+}
+
+/// The bytes of a save after its header.
+///
+/// Changed: the sketch's `bytes.after(header)`; a run can't be sliced from a byte count yet, so
+/// this copies.
+fn after(bytes: [u8], header: SaveHeader) -> Vec<u8> {
+    var out: Vec<u8> = Vec::with_capacity(bytes.len() - header.len())
+    for i in header.len()..bytes.len() {
+        out.push(bytes[i])
+    }
+    out
+}
+
+/// A save's fields, brought from version `from` to this build's layout. Version 1 had the same
+/// fields (it only lacked the header's version, which `parse` reads as 1's).
+fn migrate(data: take Vec<u8>, from: u32) -> Result<Vec<u8>, SaveError> {
+    if from == SAVE_VERSION || from == 1 {
+        Ok(take data)
+    } else {
+        Err(SaveError::Version(from))
+    }
+}
+
+/// Recoverable failures are values. A save is structural data with stable field names, so it
+/// survives layout changes and can be migrated (D-084).
+///
+/// Changed: `World::deserialize` reads from a `Reader`, and its error (`LoadError`) becomes a
+/// `SaveError` (`?` doesn't convert errors); the data must be all read.
+pub fn load_save(bytes: [u8]) -> Result<World, SaveError> {
+    let header = SaveHeader::parse(bytes)?
+    let data = migrate(after(bytes, header), from: header.version)?
+    var r = Reader::new(take data)
+    match World::deserialize(mut r) { // derived; validates each field as it reads it
+        Ok(w) if r.at_end() => Ok(w),
+        Ok(_) => Err(SaveError::NotASave),
+        Err(e) => Err(SaveError::Corrupt(e)),
+    }
+}
+
+/// A save: the header, then the world's fields (derived `Serialize`).
+pub fn save_game(world: World) -> Vec<u8> {
+    var w = Writer::new()
+    w.write_u32(MAGIC)
+    w.write_u32(SAVE_VERSION)
+    world.serialize(mut w)
+    take w.into_bytes()
+}
+
+/// Bugs panic.
+@deterministic
+pub fn scare(world: mut World, h: Handle<GrazerSim>) {
+    world.grazers[h].gait.mode = Mode::Flee // a stale handle panics: a bug, not an error
+}

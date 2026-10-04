@@ -1,0 +1,32 @@
+// A lifetime (`'a`), as in Rust, or a loop label (`'outer`). wrela has neither: there are no
+// references, so nothing needs a lifetime (a parameter reads its argument in place, and a
+// projection lives as long as the call that made it), and `break` leaves the innermost loop.
+// A struct whose parameters were lifetimes holds projections: it's a `borrow struct`.
+// ---- wrong
+struct Log {
+    lines: Vec<Text>,
+}
+
+struct View<'a> {
+    log: &'a mut Log,
+}
+
+fn first<'a>(xs: &'a Vec<f32>) -> f32 {
+    xs[0]
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+struct Log {
+    lines: Vec<Text>,
+}
+
+borrow struct View {
+    log: mut Log,
+}
+
+fn first(xs: Vec<f32>) -> f32 {
+    xs[0]
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

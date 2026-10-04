@@ -1,0 +1,26 @@
+// accepts: eff.requests
+// Requests are made and polled outside `@deterministic` code; an answer enters the simulation
+// as a tick's input.
+use std::io::{Pending, load}
+
+pub struct Game {
+    save: Pending<u8>,
+    level: u32,
+}
+
+@deterministic
+fn tick(level: u32, input: u32) -> u32 {
+    level + input
+}
+
+pub fn init() -> Game {
+    Game { save: load("saves/slot"), level: 0 }
+}
+
+pub fn frame(state: mut Game, time: f32, width: u32, height: u32) {
+    var input = 0
+    if let Some(Ok(bytes)) = state.save.poll() {
+        input = bytes.len()
+    }
+    state.level = tick(state.level, input)
+}

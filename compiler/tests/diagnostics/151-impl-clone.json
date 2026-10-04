@@ -1,0 +1,46 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0415",
+      "file": "main.wrela",
+      "fixes": [
+        {
+          "edits": [
+            {
+              "end": 101,
+              "file": "main.wrela",
+              "replacement": ": Clone",
+              "start": 101
+            },
+            {
+              "end": 230,
+              "file": "main.wrela",
+              "replacement": "",
+              "start": 131
+            }
+          ],
+          "message": "declare `Clone` on `Point` and remove this `impl`"
+        }
+      ],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "`Clone` isn't implemented with an `impl`: a type declares it",
+      "notes": [
+        "its implementation is the compiler's, field by field (§3)"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 1,
+        "end": 230,
+        "end_column": 2,
+        "end_line": 13,
+        "line": 9,
+        "start": 131
+      },
+      "title": "an `impl` of `Copy` or `Clone`, which a type declares instead"
+    }
+  ],
+  "version": 2
+}

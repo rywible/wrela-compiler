@@ -1,0 +1,70 @@
+// Bandlimited noise (AC5, D-077; compiler/tests/tests/suite/noise.rs): fbm seen through pixels
+// half a unit wide, so all but its first octave are smaller than a pixel. Three images, each value
+// mapped to [0, 1]: the average of 16 samples in each pixel (the reference), one sample of the
+// noise filtered for the pixel's footprint, and one sample of the noise as it is.
+use std::field::{Fbm, Noise, fbm}
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch}
+
+const SIZE: u32 = 256
+
+/// The view: units per pixel, and the noise.
+struct View: Copy + GpuData {
+    pixel: f32,
+    noise: Fbm,
+}
+
+/// A noise value mapped from its range to [0, 1].
+fn shade(v: View, n: f32) -> f32 {
+    let r = v.noise.range()
+    (n - r.lo) / (r.hi - r.lo)
+}
+
+fn at(v: View, x: f32, y: f32) -> vec3 {
+    vec3(x * v.pixel, y * v.pixel, 0.37)
+}
+
+@compute(64)
+fn reference(v: View, out: mut Slots<f32>, id: GlobalId) {
+    let (px, py) = (f32(id.x % SIZE), f32(id.x / SIZE))
+    var s = 0.0
+    for j in 0..4 {
+        for i in 0..4 {
+            let x = px + (f32(i) + 0.5) / 4.0
+            let y = py + (f32(j) + 0.5) / 4.0
+            s += shade(v, v.noise.value(at(v, x, y)))
+        }
+    }
+    out[id] = s / 16.0
+}
+
+@compute(64)
+fn filtered(v: View, out: mut Slots<f32>, id: GlobalId) {
+    let p = at(v, f32(id.x % SIZE) + 0.5, f32(id.x / SIZE) + 0.5)
+    out[id] = shade(v, v.noise.filtered(p, vec3(v.pixel, v.pixel, 0.0)))
+}
+
+@compute(64)
+fn plain(v: View, out: mut Slots<f32>, id: GlobalId) {
+    let p = at(v, f32(id.x % SIZE) + 0.5, f32(id.x / SIZE) + 0.5)
+    out[id] = shade(v, v.noise.value(p))
+}
+
+pub struct Images {
+    reference: GpuBuffer<f32>,
+    filtered: GpuBuffer<f32>,
+    plain: GpuBuffer<f32>,
+}
+
+pub fn init() -> Images {
+    let v = View { pixel: 0.5, noise: fbm(freq: 1.0, octaves: 8) }
+    let groups = SIZE * SIZE / 64
+    var reference_out: GpuBuffer<f32> = buffer(SIZE * SIZE)
+    dispatch(reference.bind(v: v, out: mut reference_out), groups: groups)
+    var filtered_out: GpuBuffer<f32> = buffer(SIZE * SIZE)
+    dispatch(filtered.bind(v: v, out: mut filtered_out), groups: groups)
+    var plain_out: GpuBuffer<f32> = buffer(SIZE * SIZE)
+    dispatch(plain.bind(v: v, out: mut plain_out), groups: groups)
+    Images { reference: reference_out, filtered: filtered_out, plain: plain_out }
+}
+
+pub fn frame(state: mut Images, time: f32, width: u32, height: u32) {}

@@ -1,0 +1,41 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0203",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [
+        {
+          "file": "[geometry] shapes.wrela",
+          "message": "declared `pub(package)` here",
+          "span": {
+            "column": 17,
+            "end": 25,
+            "end_column": 26,
+            "end_line": 1,
+            "line": 1,
+            "start": 16
+          }
+        }
+      ],
+      "message": "`unit_area` is visible only inside the package `geometry`",
+      "notes": [
+        "only a package's `pub` items cross to the packages that depend on it (§3)"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 23,
+        "end": 112,
+        "end_column": 32,
+        "end_line": 4,
+        "line": 4,
+        "start": 103
+      },
+      "title": "a private item"
+    }
+  ],
+  "version": 2
+}

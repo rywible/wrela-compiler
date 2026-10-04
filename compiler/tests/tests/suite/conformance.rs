@@ -1,6 +1,6 @@
-//! AC4: the conformance suite (compiler/tests/conformance). Every tier-0 rule of
-//! docs/language.md, the memory model (§6) included, has at least one program that's accepted
-//! and one that's rejected with the rule's diagnostic code.
+//! AC3: the conformance suite (compiler/tests/conformance). Every rule of docs/language.md,
+//! the memory model (§6) included, has at least one program that's accepted and one that's
+//! rejected with the rule's diagnostic code, and the table of rules is the spec's.
 //!
 //! A case is a `.wrela` file, built as a one-file package (its `main.wrela`), or a directory,
 //! built as a package. Its first lines say which rules it covers:
@@ -20,7 +20,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use wrela_tests::{cases, files_under, header, repo_root};
 
-/// The tier-0 rules, by section of docs/language.md.
+/// The rules, by section of docs/language.md, which names each one where it's written
+/// (`the_rule_table_is_the_specs`).
 const RULES: &[(&str, &str)] = &[
     // §2 lexical structure and statements
     (
@@ -46,19 +47,58 @@ const RULES: &[(&str, &str)] = &[
     ("enum.match", "enums with payloads, matched exhaustively"),
     ("trait.items", "traits with associated types and default methods; impls provide the rest"),
     ("trait.orphan", "an impl lives with its trait or its type"),
-    ("const.literal", "a `const` holds a literal value in tier 0"),
+    (
+        "trait.diagnostic",
+        "`@diagnostic(\"…\")` on a trait or type replaces the message when a bound isn't met",
+    ),
+    (
+        "trait.fieldwise",
+        "a `@fieldwise` trait is derived field by field for each type that declares it",
+    ),
+    ("trait.eq-ord", "`==` and `<` come from declared `Eq` and `Ord`"),
+    (
+        "trait.sets",
+        "`trait Sim = A + B` names a set of traits, which stands for them wherever traits are listed",
+    ),
+    (
+        "const.build",
+        "the build computes a `const`; a panic, a trap or running past its fuel is an error",
+    ),
+    ("const.places", "a constant is a place: read and projected, never moved out of or changed"),
+    (
+        "const.tests",
+        "a `@test` is a free function of no parameters and no result, run as constants are",
+    ),
     ("mod.use", "a file is a module; `use` imports; `pub` exports"),
+    (
+        "mod.packages",
+        "a package depends on others by path; only their `pub` items cross, and never in a cycle",
+    ),
     ("mod.names", "one namespace per module; names are defined once"),
     // §4 types
     ("ty.scalars", "the scalar types, checked without implicit conversion"),
     ("ty.cpu-only", "f64, i64, u64 and the small integers are CPU only"),
     ("ty.vectors", "vectors and matrices: constructors and swizzles"),
     ("ty.arrays", "fixed-size arrays `[T; N]` with constant lengths"),
-    ("ty.runs", "a run `[T]` is a parameter type only"),
+    (
+        "ty.const-generics",
+        "`const N: u32` parameters range over array lengths; a length makes no calls",
+    ),
+    ("ty.fstrings", "`f\"…\"` builds a `String` from text and values that implement `Format`"),
+    (
+        "ty.runs",
+        "a run `[T]` is a parameter, a result or a binding; never a field or type argument",
+    ),
     ("ty.tuples", "tuples"),
     ("ty.option", "`Option<T>`; there's no null"),
     ("ty.no-ref", "`&T` isn't a type"),
-    ("ty.tiers", "units, strings, `?`, `unsafe` and `dyn` aren't tier 0"),
+    ("ty.no-dyn", "wrela has no `dyn`: an enum or a generic instead"),
+    ("ty.alias", "`type Name<T> = Type` names a type; an alias can't name itself"),
+    ("stmt.if-let", "`if let pat = x { } else { }` tests a pattern; its value needs an `else`"),
+    ("stmt.let-else", "`let pat = x else { }`, whose `else` leaves the scope"),
+    ("err.try", "`x?` returns a `None` or an `Err` from a function returning the same kind"),
+    ("mem.match-mut", "`match mut place` binds mutable projections of a place"),
+    ("mem.let-owns", "`let` owns: a place whose type isn't `Copy` is borrowed, cloned or taken"),
     // §6 memory
     ("mem.copy", "Copy types copy implicitly; other values move only with `take`"),
     ("mem.take", "moving out of a named place is `take`; a moved value can't be used"),
@@ -74,6 +114,23 @@ const RULES: &[(&str, &str)] = &[
     ("mem.loops", "a value from outside a loop can't be moved inside it"),
     ("mem.no-globals", "no mutable globals"),
     ("mem.closures", "closures are non-escaping: passed down, never returned or stored"),
+    (
+        "mem.arenas",
+        "an arena's values are named by handles: `arena[h]` projects, a stale handle panics",
+    ),
+    (
+        "mem.plain",
+        "`Plain` data has no pointers; every field of a type that declares it is `Plain`",
+    ),
+    (
+        "mem.borrow-structs",
+        "a borrow struct borrows its fields' places as separate parameters would",
+    ),
+    (
+        "mem.drop",
+        "values are dropped at the end of their owner's scope; only std's core has destructors",
+    ),
+    ("mem.unsafe", "`unsafe`, and std's unsafe core, only in packages that declare it"),
     // §7 generics and traits
     ("gen.bounds", "generic code is checked against its bounds and monomorphized"),
     ("gen.impl-trait", "a trait-shaped parameter makes a function implicitly generic"),
@@ -83,6 +140,19 @@ const RULES: &[(&str, &str)] = &[
         "GPU entry points forbid host calls and recursion, through every call, per instantiation",
     ),
     ("eff.derived", "a derived interpretation needs a function with no host effect"),
+    (
+        "eff.requests",
+        "`@deterministic` code neither makes requests (`io`) nor polls them (`nondet`)",
+    ),
+    (
+        "eff.parallel",
+        "a `@parallel fn` writes no data it captures, and does no IO, GPU or non-deterministic work",
+    ),
+    ("eff.deterministic-fn", "a function passed as a `@deterministic fn` is deterministic"),
+    (
+        "eff.audio",
+        "`@audio` code doesn't allocate, do IO, recurse or record GPU work, and captures nothing",
+    ),
     // §9 attributes
     ("attr.closed", "attributes are a closed set; tier-1 ones aren't available"),
     ("attr.gpu", "`@gpu` asserts a function is GPU-safe, checked at its definition"),
@@ -91,6 +161,20 @@ const RULES: &[(&str, &str)] = &[
     ("gpu.kernel-mut", "a kernel's `mut` parameters are invocation-safe (`Slots<T>`)"),
     ("gpu.data", "data that crosses to the GPU is `GpuData`"),
     ("gpu.dispatch", "`dispatch` and `draw` match their entry points; entry points aren't called"),
+    (
+        "gpu.buffer-modes",
+        "a buffer the GPU writes is passed `mut`; buffers and spans bound together don't overlap",
+    ),
+    ("gpu.buffer-drop", "a GPU buffer is owned: it moves, drops, and lasts in program state"),
+    (
+        "gpu.workgroup-memory",
+        "workgroup memory: each invocation writes its own chunk, and barriers separate writes from reads",
+    ),
+    ("gpu.atomics", "atomics, appends and atomic maps are kernels' `mut` parameters, passed `mut`"),
+    (
+        "gpu.textures",
+        "textures are sampled in fragment shaders, read anywhere on the GPU, drawn into in passes",
+    ),
     ("gpu.cpu", "GPU builtins and derivatives only in GPU code"),
     ("gpu.workgroup", "workgroup sizes within WebGPU's limits"),
     ("gpu.uniformity", "derivatives only where every pixel reaches them (uniform control flow)"),
@@ -247,6 +331,30 @@ fn conformance() {
     println!("{} conformance cases cover {} rules", paths.len(), RULES.len());
     assert!(failures.is_empty(), "{} cases failed:\n{}", failures.len(), failures.join("\n"));
     assert!(missing.is_empty(), "rules without cases:\n{}", missing.join("\n"));
+}
+
+/// The rule table is language.md's, in both directions: every rule the spec names (as
+/// `` `area.rule` ``, with one of the table's areas) has a row here, and every row is named in the
+/// spec, where the rule is written.
+#[test]
+fn the_rule_table_is_the_specs() {
+    let spec = std::fs::read_to_string(repo_root().join("docs/language.md")).expect("language.md");
+    let areas: BTreeSet<&str> = RULES.iter().filter_map(|(id, _)| id.split('.').next()).collect();
+    let mut named = BTreeSet::new();
+    for piece in spec.split('`').skip(1).step_by(2) {
+        if let Some((area, rule)) = piece.split_once('.')
+            && areas.contains(area)
+            && !rule.is_empty()
+            && rule.bytes().all(|b| b.is_ascii_lowercase() || b == b'-')
+        {
+            named.insert(piece.to_string());
+        }
+    }
+    let table: BTreeSet<String> = RULES.iter().map(|(id, _)| id.to_string()).collect();
+    let unwritten: Vec<&String> = table.difference(&named).collect();
+    let untabled: Vec<&String> = named.difference(&table).collect();
+    assert!(unwritten.is_empty(), "rules language.md doesn't name: {unwritten:?}");
+    assert!(untabled.is_empty(), "rules language.md names that the table lacks: {untabled:?}");
 }
 
 /// A program without `frame` is an error (E0703) at the start of main.wrela, since no host can

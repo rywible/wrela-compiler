@@ -1,0 +1,663 @@
+// Formatting (language.md §4): `Format`, which `f"…"` calls for each `{value}` or
+// `{value:spec}`. Numbers, `bool`, vectors and text implement it.
+//
+// A spec is `[align][0][width][.precision][x]`: `align` is `<`, `>` or `^`; `0` pads a number
+// with zeros after its sign; `width` is the least number of characters; `.precision` is how
+// many digits a float has after its point; `x` writes an integer in hexadecimal.
+//
+// Floats are exact. Without a precision, a float is written with the fewest digits that read
+// back as the same float (the nearer of two, the higher if both are as near), never with an
+// exponent: `0.1`, `1.5`, `100`, `0.000001`. With one, it's the exact value rounded to that
+// many places, ties to even: `{0.125:.2}` is `0.12`. Both agree with Rust's `{}` and `{:.p}`,
+// which the tests check.
+// NaN is `NaN`, infinities are `inf` and `-inf`.
+
+/// How a value is to be written: what `{value:spec}`'s spec says.
+pub struct Spec: Copy {
+    /// The least number of characters; 0 for none.
+    pub width: u32,
+    /// Digits after a float's point, when `has_precision`.
+    pub precision: u32,
+    pub has_precision: bool,
+    /// 0: the value's own (numbers right, text left); 1: left (`<`); 2: right (`>`); 3: centre
+    /// (`^`).
+    pub align: u32,
+    /// Pad a number with zeros after its sign.
+    pub zero: bool,
+    /// Write an integer in hexadecimal.
+    pub hex: bool,
+}
+
+impl Spec {
+    /// `{value}`: nothing asked for.
+    pub fn none() -> Spec {
+        Spec { width: 0, precision: 0, has_precision: false, align: 0, zero: false, hex: false }
+    }
+}
+
+/// Writing a value as text: `f"{x}"` calls `x.format(mut out, spec)`.
+pub trait Format {
+    /// Writes `self` at the end of `out`, as `spec` asks.
+    fn format(self, out: mut String, spec: Spec)
+}
+
+/// `s`, padded to `spec`'s width. `number` says it's a number: right-aligned by default, and
+/// `0` pads after its sign.
+fn pad(out: mut String, s: str, spec: Spec, number: bool) {
+    let n = char_count(s)
+    if n >= spec.width {
+        out.push_str(s)
+        return
+    }
+    let fill = spec.width - n
+    if number && spec.zero && spec.align == 0 {
+        // Zeros go after the sign.
+        var start = 0
+        if s.len() > 0 && (s.byte(0) == 45 || s.byte(0) == 43) {
+            out.push_byte(s.byte(0))
+            start = 1
+        }
+        for _ in 0..fill {
+            out.push_byte(48)
+        }
+        out.push_str(s.slice(start, s.len()))
+        return
+    }
+    let align = if spec.align == 0 { if number { 2 } else { 1 } } else { spec.align }
+    let (before, after) = match align {
+        1 => (0, fill),
+        2 => (fill, 0),
+        _ => (fill / 2, fill - fill / 2),
+    }
+    for _ in 0..before {
+        out.push_byte(32)
+    }
+    out.push_str(s)
+    for _ in 0..after {
+        out.push_byte(32)
+    }
+}
+
+/// How many characters (code points) `s` has: its bytes that don't continue one.
+fn char_count(s: str) -> u32 {
+    var n = 0
+    for i in 0..s.len() {
+        let b = s.byte(i)
+        if b < 128 || b >= 192 {
+            n += 1
+        }
+    }
+    n
+}
+
+/// `x` in decimal, or hexadecimal, into `out`, after `-` if `negative`.
+fn write_u64(out: mut String, x: u64, negative: bool, hex: bool) {
+    if negative {
+        out.push_byte(45)
+    }
+    if x == 0 {
+        out.push_byte(48)
+        return
+    }
+    let base: u64 = if hex { 16 } else { 10 }
+    var digits: [u8; 20] = [0; 20]
+    var n = 0
+    var v = x
+    while v != 0 {
+        let d = u8(v % base)
+        digits[n] = if d < 10 { 48 + d } else { 87 + d }
+        n += 1
+        v = v / base
+    }
+    while n > 0 {
+        n -= 1
+        out.push_byte(digits[n])
+    }
+}
+
+fn format_int(out: mut String, magnitude: u64, negative: bool, spec: Spec) {
+    if spec.width == 0 {
+        write_u64(mut out, magnitude, negative, spec.hex)
+        return
+    }
+    var s = String::new()
+    write_u64(mut s, magnitude, negative, spec.hex)
+    pad(mut out, s, spec, number: true)
+}
+
+impl Format for u8 {
+    fn format(self, out: mut String, spec: Spec) {
+        format_int(mut out, u64(self), negative: false, spec: spec)
+    }
+}
+
+impl Format for u16 {
+    fn format(self, out: mut String, spec: Spec) {
+        format_int(mut out, u64(self), negative: false, spec: spec)
+    }
+}
+
+impl Format for u32 {
+    fn format(self, out: mut String, spec: Spec) {
+        format_int(mut out, u64(self), negative: false, spec: spec)
+    }
+}
+
+impl Format for u64 {
+    fn format(self, out: mut String, spec: Spec) {
+        format_int(mut out, self, negative: false, spec: spec)
+    }
+}
+
+impl Format for i8 {
+    fn format(self, out: mut String, spec: Spec) {
+        i64(self).format(mut out, spec)
+    }
+}
+
+impl Format for i16 {
+    fn format(self, out: mut String, spec: Spec) {
+        i64(self).format(mut out, spec)
+    }
+}
+
+impl Format for i32 {
+    fn format(self, out: mut String, spec: Spec) {
+        i64(self).format(mut out, spec)
+    }
+}
+
+impl Format for i64 {
+    fn format(self, out: mut String, spec: Spec) {
+        // The magnitude of `i64::MIN` is past `i64`: its bits as a `u64`, negated.
+        let negative = self < 0
+        let magnitude = if negative { u64(0).wrapping_sub(u64(self)) } else { u64(self) }
+        format_int(mut out, magnitude, negative, spec)
+    }
+}
+
+impl Format for bool {
+    fn format(self, out: mut String, spec: Spec) {
+        pad(mut out, if self { "true" } else { "false" }, spec, number: false)
+    }
+}
+
+impl Format for str {
+    fn format(self, out: mut String, spec: Spec) {
+        pad(mut out, self, spec, number: false)
+    }
+}
+
+impl Format for Text {
+    fn format(self, out: mut String, spec: Spec) {
+        pad(mut out, self, spec, number: false)
+    }
+}
+
+impl Format for String {
+    fn format(self, out: mut String, spec: Spec) {
+        pad(mut out, self, spec, number: false)
+    }
+}
+
+impl Format for f32 {
+    fn format(self, out: mut String, spec: Spec) {
+        let bits = bitcast_u32(self)
+        let negative = (bits >> 31) == 1
+        let exp = (bits >> 23) & 255
+        let frac = u64(bits & 8388607)
+        if exp == 255 {
+            special(mut out, frac != 0, negative, spec)
+            return
+        }
+        let (f, e) = if exp == 0 { (frac, -149) } else { (frac | 8388608, i32(exp) - 150) }
+        format_float(mut out, f, e, 24, -149, negative, spec)
+    }
+}
+
+impl Format for f64 {
+    fn format(self, out: mut String, spec: Spec) {
+        let bits = bitcast_u64(self)
+        let negative = (bits >> 63) == 1
+        let exp = u32((bits >> 52) & 2047)
+        let frac = bits & 4503599627370495
+        if exp == 2047 {
+            special(mut out, frac != 0, negative, spec)
+            return
+        }
+        let (f, e) = if exp == 0 { (frac, -1074) } else {
+            (frac | 4503599627370496, i32(exp) - 1075)
+        }
+        format_float(mut out, f, e, 53, -1074, negative, spec)
+    }
+}
+
+impl Format for vec2 {
+    fn format(self, out: mut String, spec: Spec) {
+        components(mut out, [self.x, self.y, 0.0, 0.0], 2, spec)
+    }
+}
+
+impl Format for vec3 {
+    fn format(self, out: mut String, spec: Spec) {
+        components(mut out, [self.x, self.y, self.z, 0.0], 3, spec)
+    }
+}
+
+impl Format for vec4 {
+    fn format(self, out: mut String, spec: Spec) {
+        components(mut out, [self.x, self.y, self.z, self.w], 4, spec)
+    }
+}
+
+/// A vector: `(x, y, z)`, each component with the spec's precision.
+fn components(out: mut String, c: [f32; 4], n: u32, spec: Spec) {
+    var each = spec
+    each.width = 0
+    var s = String::new()
+    s.push_byte(40)
+    for i in 0..n {
+        if i > 0 {
+            s.push_str(", ")
+        }
+        c[i].format(mut s, each)
+    }
+    s.push_byte(41)
+    pad(mut out, s, spec, number: false)
+}
+
+/// NaN or an infinity.
+fn special(out: mut String, nan: bool, negative: bool, spec: Spec) {
+    let s = if nan { "NaN" } else if negative { "-inf" } else { "inf" }
+    var plain = spec
+    plain.zero = false
+    pad(mut out, s, plain, number: true)
+}
+
+/// A finite float, `f × 2^e`, of a type with `p` bits of precision whose least exponent is
+/// `min_e`.
+fn format_float(out: mut String, f: u64, e: i32, p: u32, min_e: i32, negative: bool, spec: Spec) {
+    var s = String::new()
+    if negative {
+        s.push_byte(45)
+    }
+    if spec.has_precision {
+        let (digits, k) = fixed(f, e, spec.precision)
+        positional(mut s, digits, k, spec.precision)
+    } else if f == 0 {
+        s.push_byte(48)
+    } else {
+        let (digits, k) = shortest(f, e, p, min_e)
+        positional(mut s, digits, k, 0)
+    }
+    if spec.width == 0 {
+        out.push_str(s)
+    } else {
+        pad(mut out, s, spec, number: true)
+    }
+}
+
+/// Digits `d` (`0.d × 10^k`) without an exponent, with at least `places` digits after the
+/// point (and a point only if some follow it).
+fn positional(out: mut String, d: Vec<u8>, k: i32, places: u32) {
+    let n = i32(d.len())
+    if k <= 0 {
+        out.push_byte(48)
+    } else {
+        for i in 0..k {
+            out.push_byte(if i < n { 48 + d[u32(i)] } else { 48 })
+        }
+    }
+    // The digits after the point: those past k, at least `places` of them.
+    var after = n - k
+    if after < i32(places) {
+        after = i32(places)
+    }
+    if after <= 0 {
+        return
+    }
+    out.push_byte(46)
+    for i in 0..after {
+        let at = k + i
+        out.push_byte(if at >= 0 && at < n { 48 + d[u32(at)] } else { 48 })
+    }
+}
+
+/// The fewest digits that read back as the float `f × 2^e` (Steele and White's free-format
+/// algorithm, with Burger and Dybvig's fixes): `(digits, k)` meaning `0.digits × 10^k`.
+fn shortest(f: u64, e: i32, p: u32, min_e: i32) -> (Vec<u8>, i32) {
+    // `value = r / s`, and the halfway points to the neighbouring floats are `(r ± m) / s`.
+    let even = f % 2 == 0
+    let smallest = f == (1 << (p - 1))
+    var r = Big::of(f)
+    var s = Big::of(1)
+    var m_plus = Big::of(1)
+    var m_minus = Big::of(1)
+    if e >= 0 {
+        if smallest {
+            r.shl(u32(e) + 2)
+            s.shl(2)
+            m_plus.shl(u32(e) + 1)
+            m_minus.shl(u32(e))
+        } else {
+            r.shl(u32(e) + 1)
+            s.shl(1)
+            m_plus.shl(u32(e))
+            m_minus.shl(u32(e))
+        }
+    } else if e == min_e || !smallest {
+        r.shl(1)
+        s.shl(u32(1 - e))
+    } else {
+        r.shl(2)
+        s.shl(u32(2 - e))
+        m_plus.shl(1)
+    }
+    // The decimal exponent: estimated from the bit length, then fixed up.
+    let bits = i32(64 - leading_zeros64(f)) + e
+    var k = ((bits - 1) * 78913) >> 18
+    if k >= 0 {
+        s.mul_pow10(u32(k))
+    } else {
+        r.mul_pow10(u32(-k))
+        m_plus.mul_pow10(u32(-k))
+        m_minus.mul_pow10(u32(-k))
+    }
+    // Now `r + m_plus` must be below `s` (or equal, for an even float), and at least `s / 10`.
+    loop {
+        var high = r.clone()
+        high.add(m_plus)
+        let c = high.cmp(s)
+        if c == Ordering::Greater || (even && c == Ordering::Equal) {
+            s.mul_small(10)
+            k += 1
+        } else {
+            break
+        }
+    }
+    loop {
+        var high = r.clone()
+        high.add(m_plus)
+        high.mul_small(10)
+        let c = high.cmp(s)
+        if c == Ordering::Less || (!even && c == Ordering::Equal) {
+            r.mul_small(10)
+            m_plus.mul_small(10)
+            m_minus.mul_small(10)
+            k -= 1
+        } else {
+            break
+        }
+    }
+    var digits = Vec::new()
+    loop {
+        r.mul_small(10)
+        m_plus.mul_small(10)
+        m_minus.mul_small(10)
+        var d: u8 = 0
+        while r.cmp(s) != Ordering::Less {
+            r.sub(s)
+            d += 1
+        }
+        let low_c = r.cmp(m_minus)
+        let low = low_c == Ordering::Less || (even && low_c == Ordering::Equal)
+        var high = r.clone()
+        high.add(m_plus)
+        let high_c = high.cmp(s)
+        let up = high_c == Ordering::Greater || (even && high_c == Ordering::Equal)
+        if !low && !up {
+            digits.push(d)
+            continue
+        }
+        if low && !up {
+            digits.push(d)
+        } else if up && !low {
+            digits.push(d + 1)
+        } else {
+            // Either digit reads back as the float: the nearer one, the higher on a tie.
+            var twice = r.clone()
+            twice.shl(1)
+            if twice.cmp(s) == Ordering::Less {
+                digits.push(d)
+            } else {
+                digits.push(d + 1)
+            }
+        }
+        break
+    }
+    (take digits, k)
+}
+
+/// The float `f × 2^e` rounded to `places` digits after the point, ties to even: `(digits, k)`
+/// meaning `0.digits × 10^k`, with every digit down to that place.
+fn fixed(f: u64, e: i32, places: u32) -> (Vec<u8>, i32) {
+    var digits = Vec::new()
+    if f == 0 {
+        return (take digits, -i32(places))
+    }
+    // value = r / s, exactly.
+    var r = Big::of(f)
+    var s = Big::of(1)
+    if e >= 0 {
+        r.shl(u32(e))
+    } else {
+        s.shl(u32(-e))
+    }
+    // k: the least with value < 10^k.
+    let bits = i32(64 - leading_zeros64(f)) + e
+    var k = ((bits - 1) * 78913) >> 18
+    if k >= 0 {
+        s.mul_pow10(u32(k))
+    } else {
+        r.mul_pow10(u32(-k))
+    }
+    while r.cmp(s) != Ordering::Less {
+        s.mul_small(10)
+        k += 1
+    }
+    // How many digits reach the last place: those before the point, and `places` after.
+    let count = k + i32(places)
+    if count < 0 {
+        // Below half the last place's unit: it rounds to zero.
+        return (take digits, -i32(places))
+    }
+    for _ in 0..count {
+        r.mul_small(10)
+        var d: u8 = 0
+        while r.cmp(s) != Ordering::Less {
+            r.sub(s)
+            d += 1
+        }
+        digits.push(d)
+    }
+    // Round on what's left: above half up, half to even.
+    var twice = r.clone()
+    twice.shl(1)
+    let c = twice.cmp(s)
+    let last_odd = digits.len() > 0 && digits[digits.len() - 1] % 2 == 1
+    if c == Ordering::Greater || (c == Ordering::Equal && last_odd) {
+        // Carry up through the nines.
+        var i = digits.len()
+        var carry = true
+        while carry && i > 0 {
+            i -= 1
+            if digits[i] == 9 {
+                digits[i] = 0
+            } else {
+                digits[i] += 1
+                carry = false
+            }
+        }
+        if carry {
+            digits.insert(0, 1)
+            k += 1
+        }
+    }
+    (take digits, k)
+}
+
+/// The leading zero bits of `x`.
+fn leading_zeros64(x: u64) -> u32 {
+    var n = 0
+    var v = x
+    if v == 0 {
+        return 64
+    }
+    while v & 0x8000000000000000 == 0 {
+        v = v << 1
+        n += 1
+    }
+    n
+}
+
+/// An unsigned integer of any size: `u32` limbs, least significant first, none of them zero at
+/// the top.
+struct Big: Clone {
+    limbs: Vec<u32>,
+}
+
+impl Big {
+    fn of(x: u64) -> Big {
+        var b = Big { limbs: Vec::new() }
+        if x != 0 {
+            b.limbs.push(u32(x & 4294967295))
+            if x >> 32 != 0 {
+                b.limbs.push(u32(x >> 32))
+            }
+        }
+        b
+    }
+
+    fn mul_small(mut self, k: u32) {
+        var carry: u64 = 0
+        for i in 0..self.limbs.len() {
+            let t = u64(self.limbs[i]) * u64(k) + carry
+            self.limbs[i] = u32(t & 4294967295)
+            carry = t >> 32
+        }
+        if carry != 0 {
+            self.limbs.push(u32(carry))
+        }
+    }
+
+    fn mul_pow10(mut self, n: u32) {
+        var left = n
+        while left >= 9 {
+            self.mul_small(1000000000)
+            left -= 9
+        }
+        var k: u32 = 1
+        for _ in 0..left {
+            k *= 10
+        }
+        if k > 1 {
+            self.mul_small(k)
+        }
+    }
+
+    /// `self *= 2^bits`.
+    fn shl(mut self, bits: u32) {
+        if self.limbs.len() == 0 {
+            return
+        }
+        let rest = bits % 32
+        if rest != 0 {
+            var carry: u32 = 0
+            for i in 0..self.limbs.len() {
+                let x = self.limbs[i]
+                self.limbs[i] = (x << rest) | carry
+                carry = x >> (32 - rest)
+            }
+            if carry != 0 {
+                self.limbs.push(carry)
+            }
+        }
+        for _ in 0..bits / 32 {
+            self.limbs.insert(i: 0, value: 0)
+        }
+    }
+
+    fn add(mut self, other: Big) {
+        var carry: u64 = 0
+        let n = max(self.limbs.len(), other.limbs.len())
+        for i in 0..n {
+            if i == self.limbs.len() {
+                self.limbs.push(0)
+            }
+            let b = if i < other.limbs.len() { u64(other.limbs[i]) } else { 0 }
+            let t = u64(self.limbs[i]) + b + carry
+            self.limbs[i] = u32(t & 4294967295)
+            carry = t >> 32
+        }
+        if carry != 0 {
+            self.limbs.push(u32(carry))
+        }
+    }
+
+    /// `self -= other`, which is at most `self`.
+    fn sub(mut self, other: Big) {
+        var owed: u64 = 0
+        for i in 0..self.limbs.len() {
+            let b = if i < other.limbs.len() { u64(other.limbs[i]) } else { 0 }
+            let a = u64(self.limbs[i])
+            let need = b + owed
+            if a >= need {
+                self.limbs[i] = u32(a - need)
+                owed = 0
+            } else {
+                self.limbs[i] = u32(a + 4294967296 - need)
+                owed = 1
+            }
+        }
+        while self.limbs.len() > 0 && self.limbs[self.limbs.len() - 1] == 0 {
+            let _ = self.limbs.pop()
+        }
+    }
+
+    fn cmp(self, other: Big) -> Ordering {
+        let (m, n) = (self.limbs.len(), other.limbs.len())
+        if m != n {
+            return m.cmp(n)
+        }
+        var i = m
+        while i > 0 {
+            i -= 1
+            let (a, b) = (self.limbs[i], other.limbs[i])
+            if a != b {
+                return a.cmp(b)
+            }
+        }
+        Ordering::Equal
+    }
+}
+
+/// What a failed `assert` panics with where its failure is explained (§10): its message, then
+/// the value of each operand of its comparison that isn't a literal: ``assertion failed: `got`
+/// is 0.5``. Text is quoted (bit 0 of `quoted` for `a`, bit 1 for `b`). The compiler calls these
+/// in a debug build, a test and a constant; elsewhere the message is all a failed `assert` says.
+fn assert_failed1<A: Format>(message: str, a_source: str, a: A, quoted: u32) {
+    var s = f"{message}: "
+    shown(mut s, a_source, a, quoted & 1 != 0)
+    panic(s)
+}
+
+fn assert_failed2<A: Format, B: Format>(
+    message: str,
+    a_source: str,
+    a: A,
+    b_source: str,
+    b: B,
+    quoted: u32,
+) {
+    var s = f"{message}: "
+    shown(mut s, a_source, a, quoted & 1 != 0)
+    s.push_str(", ")
+    shown(mut s, b_source, b, quoted & 2 != 0)
+    panic(s)
+}
+
+/// `` `source` is value ``.
+fn shown<T: Format>(out: mut String, source: str, value: T, quoted: bool) {
+    let q = if quoted { "\"" } else { "" }
+    out.push_str(f"`{source}` is {q}{value}{q}")
+}

@@ -1,0 +1,10 @@
+// mistake: declaring traits on a `borrow struct`
+// expect: E0519
+// fix: yes
+struct Log {
+    lines: Vec<Text>,
+}
+
+borrow struct View: Clone {
+    log: borrow Log,
+}

@@ -1,0 +1,30 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0207",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [
+        "write the loop: `for x in xs { ... }`, or `for mut x in xs` to change each element"
+      ],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "`Vec<f32>` has no method `iter`",
+      "notes": [
+        "wrela has no iterators: a `for` loop goes over a range, an array, a run, a `Vec` or an arena itself"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 8,
+        "end": 116,
+        "end_column": 12,
+        "end_line": 5,
+        "line": 5,
+        "start": 112
+      },
+      "title": "an unknown method"
+    }
+  ],
+  "version": 2
+}

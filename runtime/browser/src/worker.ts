@@ -3,12 +3,14 @@
 
 /// <reference lib="webworker" />
 
-import { SCREEN_FORMAT } from "./abi.gen.ts";
+import { MAX_WORKERS, SCREEN_FORMAT } from "./abi.gen.ts";
+import { LIMIT_SOURCES } from "./check.ts";
 import { errorMessage } from "./errors.ts";
 import { fitSize, GameClock } from "./frame.ts";
-import { alignTo } from "./gpu.ts";
-import { type Build, loadBuild, startProgram } from "./loader.ts";
-import type { FromWorker, ToWorker } from "./messages.ts";
+import { alignTo, type GpuExecutor } from "./gpu.ts";
+import { browserIo, type Build, loadBuild, startProgram } from "./loader.ts";
+import { runWorker, type SpawnWorker } from "./program.ts";
+import type { FromWorker, ToWorker, VoiceOptions } from "./messages.ts";
 import { encodePng } from "./png.ts";
 import { frameTime, putResult, type TestParams } from "./testmode.ts";
 
@@ -37,11 +39,18 @@ function fatal(e: unknown): void {
   }
 }
 
-async function openDevice(): Promise<GPUDevice> {
+/** The device, with timestamp queries when `timestamps` asks for them and the adapter has
+ * them. */
+async function openDevice(timestamps: boolean): Promise<GPUDevice> {
   const adapter = await navigator.gpu?.requestAdapter({ powerPreference: "high-performance" });
   if (!adapter) throw new GpuError("WebGPU isn't available here (no adapter)");
-  // WebGPU's default limits, as the native host requests: both accept the same programs.
-  const device = await adapter.requestDevice();
+  // The adapter's own limits, as the native host requests them: a program asks for them
+  // (`wrela.limit`), both hosts check its commands against them, and WebGPU checks what they
+  // bound against them.
+  const requiredLimits: Record<string, number> = {};
+  for (const name of LIMIT_SOURCES.flat()) requiredLimits[name] = adapter.limits[name];
+  const requiredFeatures: GPUFeatureName[] = timestamps && adapter.features.has("timestamp-query") ? ["timestamp-query"] : [];
+  const device = await adapter.requestDevice({ requiredLimits, requiredFeatures });
   device.addEventListener("uncapturederror", (e) => fatal(new GpuError(e.error.message)));
   device.lost.then((info) => {
     if (info.reason !== "destroyed") fatal(new GpuError(`device lost: ${info.message}`));
@@ -61,10 +70,23 @@ function context(canvas: OffscreenCanvas, device: GPUDevice, usage: number): GPU
 let size = { width: 1, height: 1 };
 const clock = new GameClock();
 
+/** Hands the program's voice to the main thread, which plays it in an AudioWorklet: an
+ * AudioContext exists only there. */
+const startVoice = (voice: VoiceOptions) => self.postMessage({ type: "audio", voice } satisfies FromWorker);
+
 async function run(canvas: OffscreenCanvas, device: GPUDevice, build: Build): Promise<void> {
   const ctx = context(canvas, device, GPUTextureUsage.RENDER_ATTACHMENT);
-  const program = await startProgram(device, build, { texture: () => ctx.getCurrentTexture() });
+  const workers = Math.min(navigator.hardwareConcurrency || 1, MAX_WORKERS + 1);
+  const program = await startProgram(
+    device,
+    build,
+    { texture: () => ctx.getCurrentTexture() },
+    { io: browserIo(base), workers, spawnWorker, startVoice },
+  );
   const max = device.limits.maxTextureDimension2D;
+  const executor = program.executor as GpuExecutor;
+  // A debug build's bounds checks: the flag is read after a frame, one read at a time.
+  let checking = false;
   const tick = (now: number) => {
     if (failed) return;
     try {
@@ -76,6 +98,10 @@ async function run(canvas: OffscreenCanvas, device: GPUDevice, build: Build): Pr
           canvas.height = height;
         }
         program.frame(time, width, height);
+        if (!checking) {
+          checking = true;
+          executor.checkDebugFlag().then(() => (checking = false), fatal);
+        }
       }
       self.requestAnimationFrame(tick);
     } catch (e) {
@@ -142,33 +168,68 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
       afterPass: (encoder) =>
         encoder.copyTextureToTexture({ texture: screen }, { texture: ctx.getCurrentTexture() }, [width, height]),
     },
-    { hash: true },
+    { hash: true, io: browserIo(base), workers: params.workers, spawnWorker, startVoice },
+    params.timestamps > 0,
   );
+  const executor = program.executor as GpuExecutor;
+  if (params.timestamps > 0 && !executor.timed) throw new GpuError("the test asks for timestamps, but this device has no timestamp queries");
   const hash = program.hash!;
+  const start = performance.now();
   for (let i = 0; i < frames; i++) {
+    // Paced at `fps`, as a display paces frames: requests are answered in real time between
+    // them, as when the game runs.
+    const wait = start + (i * 1000) / fps - performance.now();
+    if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
+    executor.frame = i;
     await scoped(device, () => program.frame(frameTime(i, fps), width, height));
     await device.queue.onSubmittedWorkDone();
+    await executor.checkDebugFlag();
   }
   const rgba = await readTexture(device, screen);
   await Promise.all([
     putResult(base, "frame.rgba", rgba),
     putResult(base, "frame.png", encodePng(width, height, rgba)),
     putResult(base, "hash.txt", `${hash.hex()}\n`),
+    putResult(base, "workers.txt", `${program.workerChunks()}\n`),
+    params.timestamps > 0 ? executor.timings().then((t) => putResult(base, "timings.json", JSON.stringify(t))) : null,
   ]);
+  if (params.audio > 0) {
+    if (!program.hasVoice) throw new Error("the test asks for audio, but the program started no voice");
+    await audioRendered;
+  }
   console.log(`wrela test: ${frames} frames at ${width}x${height}, state hash ${hash.hex()}`);
   await putResult(base, "DONE", "ok");
 }
 
+/** Starts a worker thread for the program's parallel jobs: this script again, told to run them. */
+const spawnWorker: SpawnWorker = (module, memory, index) => {
+  const thread = new Worker(self.location.href, { type: "module", name: `wrela thread ${index}` });
+  thread.postMessage({ type: "thread", module, memory, index } satisfies ToWorker);
+};
+
+/** Test mode: resolved when the main thread has rendered the voice and saved its samples. */
+let renderedAudio = () => {};
+const audioRendered = new Promise<void>((resolve) => {
+  renderedAudio = resolve;
+});
+
 self.onmessage = (event: MessageEvent<ToWorker>) => {
   const msg = event.data;
   switch (msg.type) {
+    case "audio-rendered":
+      renderedAudio();
+      return;
+    case "thread":
+      // It runs until the program shuts it down, or the page goes away.
+      void runWorker(msg.module, msg.memory, msg.index);
+      return;
     case "start": {
       base = msg.base;
       testing = msg.test !== null;
       size = { width: msg.width, height: msg.height };
       const test = msg.test;
       // The device and the build are fetched at once.
-      Promise.all([openDevice(), loadBuild(base)])
+      Promise.all([openDevice((test?.timestamps ?? 0) > 0), loadBuild(base)])
         .then(([device, build]) => (test ? runTest(msg.canvas, device, build, test) : run(msg.canvas, device, build)))
         .catch(fatal);
       return;

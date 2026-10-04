@@ -1,0 +1,30 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0413",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [
+        "to run code when something ends, call it where it ends"
+      ],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "wrela has no destructors for a program's types",
+      "notes": [
+        "a value's fields are dropped when it is; only std's core defines destructors (§18)"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 6,
+        "end": 127,
+        "end_column": 10,
+        "end_line": 8,
+        "line": 8,
+        "start": 123
+      },
+      "title": "a destructor outside std's core"
+    }
+  ],
+  "version": 2
+}

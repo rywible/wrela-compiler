@@ -1,0 +1,20 @@
+// A GPU entry point whose signature its stage doesn't allow: a compute kernel that returns a
+// value, a vertex shader without a `ClipPosition`, workgroup memory outside a kernel.
+// ---- wrong
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch}
+
+@compute(64)
+fn double(x: f32, id: GlobalId) -> f32 {
+    x * 2.0
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch}
+
+@compute(64)
+fn double(x: f32, out: mut Slots<f32>, id: GlobalId) {
+    out[id] = x * 2.0
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

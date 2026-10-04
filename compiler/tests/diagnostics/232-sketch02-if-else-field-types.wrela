@@ -1,0 +1,9 @@
+// mistake: sketch 02 §8: choosing between two kinds of field with `if`
+// expect: E0300
+// fix: no
+use std::field::{cuboid, sphere}
+
+fn shape(round: bool) -> f32 {
+    let s = if round { sphere(1.0) } else { cuboid(vec3(1.0)) }
+    s.distance(vec3(0.0))
+}

@@ -1,0 +1,9 @@
+// mistake: a trait as a struct field's type
+// expect: E0410
+// fix: no
+use std::field::Surface
+
+struct Prop {
+    shape: Surface,
+    tint: vec3,
+}

@@ -1,0 +1,605 @@
+// Spike: certified field math from nested derived interpretations.
+//
+// Every bound here is the compiler's: `interval` of a `gradient` (a box that holds every
+// gradient in a space box), `gradient` of a `gradient` (Hessian rows), and both over a 4D box
+// whose last axis is time. Nothing is declared by hand. The Rust side
+// (spikes/field-math/src) drives the subdivisions and checks each claim by sampling.
+//
+// grazer.wrela is a copy of compiler/tests/fields/grazer.wrela (a package can't import another).
+//
+// Brought into the repo in M2 as a fixture (compiler/tests/tests/suite/spike13.rs), from the tag
+// spike-13-field-math, with what M2's revised rules require: a GPU buffer is passed `mut` when
+// the kernel writes it, so it's a `var`; and since a buffer lives as long as its owner,
+// `gpu_classify` keeps its result in the program's state for the harness to read. One change
+// uses what M2 added: `pv` and `pv_of` bound the gradient with one interval of the vector
+// (AC12), where the spike, which had only intervals of `f32`s, bounded each component with a
+// derived function of its own; the box is the same, and it's computed once, not three times.
+use grazer::{bounds, grazer, params}
+use std::derive::{Box3, Box4, Interval, gradient, interval}
+use std::field::{Surface, cuboid, ellipsoid, fbm, round_cone, sphere}
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch}
+
+// ---- fields ------------------------------------------------------------------------------------
+/// examples/hello-field's creature, at a breath in [-1, 1].
+fn creature(breath: f32) -> Surface {
+    let body = ellipsoid(vec3(0.62, 0.42 + 0.03 * breath, 0.42))
+    let neck = round_cone(vec3(0.35, 0.15, 0.0), vec3(0.75, 0.62, 0.0), r_top: 0.16, r_bottom: 0.1)
+    let head = sphere(radius: 0.2).translate(vec3(0.82, 0.72, 0.0))
+    body
+        .smooth_union(neck, k: 0.12)
+        .smooth_union(head, k: 0.08)
+        .displace(fbm(freq: 6.0, octaves: 3, offset: vec3(3.0, 1.0, 7.0)), amp: 0.015)
+}
+
+/// The same creature without its bark.
+fn smooth_creature(breath: f32) -> Surface {
+    let body = ellipsoid(vec3(0.62, 0.42 + 0.03 * breath, 0.42))
+    let neck = round_cone(vec3(0.35, 0.15, 0.0), vec3(0.75, 0.62, 0.0), r_top: 0.16, r_bottom: 0.1)
+    let head = sphere(radius: 0.2).translate(vec3(0.82, 0.72, 0.0))
+    body.smooth_union(neck, k: 0.12).smooth_union(head, k: 0.08)
+}
+
+/// A box, exact (language.md §17's example).
+struct Cuboid: Copy + GpuData {
+    half: vec3,
+}
+
+impl Surface for Cuboid {
+    fn distance(self, p: vec3) -> f32 {
+        let q = abs(p) - self.half
+        length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0)
+    }
+}
+
+/// `smin` with one branch on which distance is smaller. The same function as std's, but
+/// `min(a, b)` and `abs(a - b)` no longer choose separately: an interval that can't decide
+/// the branch runs each side under one assumption and joins the two.
+///
+/// `m` is clamped to k as well: inside each branch it can't exceed k, but an interval doesn't
+/// narrow `b - a` by the branch's condition, so without the clamp it would.
+fn smin_if(a: f32, b: f32, k: f32) -> f32 {
+    if a < b {
+        let m = clamp(k - (b - a), 0.0, k)
+        a - m * m * (0.25 / k)
+    } else {
+        let m = clamp(k - (a - b), 0.0, k)
+        b - m * m * (0.25 / k)
+    }
+}
+
+struct Blend<A, B>: Copy + GpuData {
+    a: A,
+    b: B,
+    k: f32,
+}
+
+impl<A: Surface, B: Surface> Surface for Blend<A, B> {
+    fn distance(self, p: vec3) -> f32 {
+        smin_if(self.a.distance(p), self.b.distance(p), self.k)
+    }
+}
+
+/// The smooth creature with `smin_if`.
+fn blended_creature(breath: f32) -> Surface {
+    let body = ellipsoid(vec3(0.62, 0.42 + 0.03 * breath, 0.42))
+    let neck = round_cone(vec3(0.35, 0.15, 0.0), vec3(0.75, 0.62, 0.0), r_top: 0.16, r_bottom: 0.1)
+    let head = sphere(radius: 0.2).translate(vec3(0.82, 0.72, 0.0))
+    Blend { a: Blend { a: body, b: neck, k: 0.12 }, b: head, k: 0.08 }
+}
+
+/// std's ellipsoid bound without its spurious zero: at the centre k0 = 0 makes
+/// k0 (k0 - 1) / k1 = -0, a point of the zero set inside the body. Within k0 < 1/2 this uses
+/// (k0 - 1) min(r) instead, also a bound: k0 E grown by (1 - k0) min(r) stays inside E.
+struct SafeEllipsoid: Copy + GpuData {
+    radii: vec3,
+}
+
+impl Surface for SafeEllipsoid {
+    fn distance(self, p: vec3) -> f32 {
+        let k0 = length(p / self.radii)
+        if k0 < 0.5 {
+            (k0 - 1.0) * min(self.radii.x, min(self.radii.y, self.radii.z))
+        } else {
+            let k1 = length(p / (self.radii * self.radii))
+            k0 * (k0 - 1.0) / k1
+        }
+    }
+}
+
+/// The smooth creature with `smin_if` and `SafeEllipsoid`.
+fn safe_creature(breath: f32) -> Surface {
+    let body = SafeEllipsoid { radii: vec3(0.62, 0.42 + 0.03 * breath, 0.42) }
+    let neck = round_cone(vec3(0.35, 0.15, 0.0), vec3(0.75, 0.62, 0.0), r_top: 0.16, r_bottom: 0.1)
+    let head = sphere(radius: 0.2).translate(vec3(0.82, 0.72, 0.0))
+    Blend { a: Blend { a: body, b: neck, k: 0.12 }, b: head, k: 0.08 }
+}
+
+/// The box with one branch on inside or outside, so the two terms don't add independently.
+struct IfCuboid: Copy + GpuData {
+    half: vec3,
+}
+
+impl Surface for IfCuboid {
+    fn distance(self, p: vec3) -> f32 {
+        let q = abs(p) - self.half
+        let m = max(q.x, max(q.y, q.z))
+        if m > 0.0 { length(max(q, 0.0)) } else { m }
+    }
+}
+
+/// A ball with a pebble beside it, smaller than a 1/32 grid cell, off the grid's corners.
+fn pebble() -> Surface {
+    sphere(0.5).union(sphere(0.012).translate(vec3(0.7313, 0.2171, -0.4129)))
+}
+
+/// A plate 6 mm thick.
+fn plate() -> Surface {
+    Cuboid { half: vec3(0.6, 0.003, 0.4) }
+}
+
+/// Two boxes, hard-unioned: concave creases where faces meet at 90°.
+fn crease() -> Surface {
+    Cuboid { half: vec3(0.5, 0.2, 0.3) }.union(
+        Cuboid { half: vec3(0.2, 0.5, 0.25) }.translate(vec3(0.1, 0.2, 0.0)),
+    )
+}
+
+/// Two balls drawing together over t in [0, 1]. Their smooth union's surface joins at
+/// t = 0.625 (at the midpoint, where a = b, smin = a - k/4 = 0.15 - 0.2 t - 0.025).
+fn merge(t: f32) -> Surface {
+    let c = 0.45 - 0.2 * t
+    sphere(0.3)
+        .translate(vec3(-c, 0.0, 0.0))
+        .smooth_union(sphere(0.3).translate(vec3(c, 0.0, 0.0)), k: 0.1)
+}
+
+/// The fields, by number: 0 creature, 1 grazer, 2 pebble, 3 plate, 4 crease, 5 smooth
+/// creature, 6 merge at t = 0, 7 smooth creature with `smin_if`, 8 and 9 the plate and the
+/// crease with `IfCuboid`, 10 the creature with `smin_if` and its bark, 11 the bark alone,
+/// 12 merge at t = 0.5, 13 the smooth creature with `smin_if` and `SafeEllipsoid`, 14 std's
+/// `cuboid` (added in M2: a box written with one branch, as `IfCuboid` is), 15 the crease with
+/// `IfCuboid`.
+fn value_of(fi: u32, p: vec3) -> f32 {
+    match fi {
+        0 => creature(0.0).distance(p),
+        1 => grazer(1).distance(p),
+        2 => pebble().distance(p),
+        3 => plate().distance(p),
+        4 => crease().distance(p),
+        5 => smooth_creature(0.0).distance(p),
+        6 => merge(0.0).distance(p),
+        7 => blended_creature(0.0).distance(p),
+        8 => IfCuboid { half: vec3(0.6, 0.003, 0.4) }.distance(p),
+        10 => {
+            blended_creature(0.0).distance(p) +
+                0.015 * fbm(freq: 6.0, octaves: 3, offset: vec3(3.0, 1.0, 7.0)).value(p)
+        },
+        11 => 0.015 * fbm(freq: 6.0, octaves: 3, offset: vec3(3.0, 1.0, 7.0)).value(p),
+        12 => merge(0.5).distance(p),
+        13 => safe_creature(0.0).distance(p),
+        14 => cuboid(vec3(0.5, 0.3, 0.4)).distance(p),
+        _ => {
+            IfCuboid { half: vec3(0.5, 0.2, 0.3) }
+                .union(IfCuboid { half: vec3(0.2, 0.5, 0.25) }.translate(vec3(0.1, 0.2, 0.0)))
+                .distance(p)
+        },
+    }
+}
+
+/// The animated fields, by number: 0 creature (t is the breath), 1 merge, 2 smooth creature,
+/// 3 the smooth creature with `smin_if`, 4 that with `SafeEllipsoid`.
+///
+/// (The spike spelled the creature out here: `creature(t).distance(p)` didn't derive over t,
+/// because its displacement was active as a whole, fbm's `octaves` with it, so fbm's loop
+/// looked as if it ran a number of times that depends on t. M2 tracks activity by field.)
+fn timed(ti: u32, p: vec3, t: f32) -> f32 {
+    match ti {
+        0 => creature(t).distance(p),
+        1 => merge(t).distance(p),
+        2 => smooth_creature(t).distance(p),
+        3 => blended_creature(t).distance(p),
+        _ => safe_creature(t).distance(p),
+    }
+}
+
+fn bx(lx: f32, ly: f32, lz: f32, hx: f32, hy: f32, hz: f32) -> Box3 {
+    Box3 { lo: vec3(lx, ly, lz), hi: vec3(hx, hy, hz) }
+}
+
+/// The operands of fields whose top is a min or smin, by field and number: the pebble's two
+/// balls (union), the crease's two boxes (union), and the two balls of merge at t = 0.5
+/// (smin, k = 0.1).
+fn operand(fi: u32, k: u32, p: vec3) -> f32 {
+    if fi == 2 {
+        if k == 0 { sphere(0.5).distance(p) } else {
+            sphere(0.012).distance(p - vec3(0.7313, 0.2171, -0.4129))
+        }
+    } else if fi == 4 {
+        if k == 0 {
+            Cuboid { half: vec3(0.5, 0.2, 0.3) }.distance(p)
+        } else {
+            Cuboid { half: vec3(0.2, 0.5, 0.25) }.distance(p - vec3(0.1, 0.2, 0.0))
+        }
+    } else {
+        if k == 0 { sphere(0.3).distance(p + vec3(0.35, 0.0, 0.0)) } else {
+            sphere(0.3).distance(p - vec3(0.35, 0.0, 0.0))
+        }
+    }
+}
+
+pub fn op_value(fi: u32, k: u32, x: f32, y: f32, z: f32) -> f32 {
+    operand(fi, k, vec3(x, y, z))
+}
+
+pub fn op_grad(fi: u32, k: u32, x: f32, y: f32, z: f32) -> vec3 {
+    gradient(|q: vec3| operand(fi, k, q), vec3(x, y, z))
+}
+
+pub fn op_hess_row(fi: u32, k: u32, axis: u32, x: f32, y: f32, z: f32) -> vec3 {
+    gradient(|q: vec3| gradient(|s: vec3| operand(fi, k, s), q)[axis], vec3(x, y, z))
+}
+
+// ---- point values (for checking) ---------------------------------------------------------------
+pub fn value(fi: u32, x: f32, y: f32, z: f32) -> f32 {
+    value_of(fi, vec3(x, y, z))
+}
+
+pub fn grad(fi: u32, x: f32, y: f32, z: f32) -> vec3 {
+    gradient(|q: vec3| value_of(fi, q), vec3(x, y, z))
+}
+
+/// Row `axis` of the Hessian: the gradient of the gradient's `axis` component.
+pub fn hess_row(fi: u32, axis: u32, x: f32, y: f32, z: f32) -> vec3 {
+    gradient(|q: vec3| gradient(|s: vec3| value_of(fi, s), q)[axis], vec3(x, y, z))
+}
+
+/// A third derivative: the gradient of the Hessian entry (i, j).
+pub fn third_row(fi: u32, i: u32, j: u32, x: f32, y: f32, z: f32) -> vec3 {
+    gradient(
+        |q: vec3| gradient(|r: vec3| gradient(|s: vec3| value_of(fi, s), r)[i], q)[j],
+        vec3(x, y, z),
+    )
+}
+
+pub fn timed_value(ti: u32, x: f32, y: f32, z: f32, t: f32) -> f32 {
+    timed(ti, vec3(x, y, z), t)
+}
+
+/// The derived range of an animated field over a space box and a time range.
+pub fn timed_ival(
+    ti: u32,
+    lx: f32,
+    ly: f32,
+    lz: f32,
+    t0: f32,
+    hx: f32,
+    hy: f32,
+    hz: f32,
+    t1: f32,
+) -> vec2 {
+    let b = Box4 { lo: vec4(lx, ly, lz, t0), hi: vec4(hx, hy, hz, t1) }
+    let r = interval(|q: vec4| timed(ti, q.xyz, q.w), b)
+    vec2(r.lo, r.hi)
+}
+
+/// The spatial gradient of an animated field.
+pub fn timed_grad(ti: u32, x: f32, y: f32, z: f32, t: f32) -> vec3 {
+    gradient(|q: vec3| timed(ti, q, t), vec3(x, y, z))
+}
+
+/// An animated field's derivative over time.
+pub fn timed_dt(ti: u32, x: f32, y: f32, z: f32, t: f32) -> f32 {
+    gradient(|s: f32| timed(ti, vec3(x, y, z), s), t)
+}
+
+// ---- bounds over boxes -------------------------------------------------------------------------
+pub fn ival(fi: u32, lx: f32, ly: f32, lz: f32, hx: f32, hy: f32, hz: f32) -> vec2 {
+    let r = interval(|q: vec3| value_of(fi, q), bx(lx, ly, lz, hx, hy, hz))
+    vec2(r.lo, r.hi)
+}
+
+/// A range holding the gradient's `axis` component everywhere in the box.
+pub fn igrad(fi: u32, axis: u32, lx: f32, ly: f32, lz: f32, hx: f32, hy: f32, hz: f32) -> vec2 {
+    let b = bx(lx, ly, lz, hx, hy, hz)
+    let r = interval(|q: vec3| gradient(|s: vec3| value_of(fi, s), q)[axis], b)
+    vec2(r.lo, r.hi)
+}
+
+/// The least value of `u v` over u and v in `g`: a lower bound of the gradient's
+/// self-products, one axis.
+fn self_dot_lo(g: Interval) -> f64 {
+    if g.lo < 0.0 && g.hi > 0.0 {
+        f64(g.lo) * f64(g.hi)
+    } else {
+        min(f64(g.lo) * f64(g.lo), f64(g.hi) * f64(g.hi))
+    }
+}
+
+/// Plantinga & Vegter's box classes, from the derived bounds: 0 when the box holds no
+/// surface (0 ∉ □f), 1 when any two gradients in it are less than 90° apart
+/// (0 ∉ ⟨□∇f, □∇f⟩), else 2 (subdivide).
+fn pv(fi: u32, b: Box3) -> u32 {
+    let r = interval(|q: vec3| value_of(fi, q), b)
+    if r.lo > 0.0 || r.hi < 0.0 {
+        return 0
+    }
+    // The gradient's box, from one derived function (M2: the interval of a vector).
+    let g = interval(|q: vec3| gradient(|s: vec3| value_of(fi, s), q), b)
+    let gx = Interval { lo: g.lo.x, hi: g.hi.x }
+    let gy = Interval { lo: g.lo.y, hi: g.hi.y }
+    let gz = Interval { lo: g.lo.z, hi: g.hi.z }
+    if self_dot_lo(gx) + self_dot_lo(gy) + self_dot_lo(gz) > 0.0 { 1 } else { 2 }
+}
+
+pub fn pv_class(fi: u32, lx: f32, ly: f32, lz: f32, hx: f32, hy: f32, hz: f32) -> u32 {
+    pv(fi, bx(lx, ly, lz, hx, hy, hz))
+}
+
+/// Over a space box and a time range: 0 when no surface passes through the box at any time
+/// in the range; 1 when the field has no critical point there (0 is outside the box holding
+/// one of the spatial gradient's components), so the surface's topology can't change inside
+/// it; else 2 (subdivide in space or time).
+pub fn topo_class(
+    ti: u32,
+    lx: f32,
+    ly: f32,
+    lz: f32,
+    t0: f32,
+    hx: f32,
+    hy: f32,
+    hz: f32,
+    t1: f32,
+) -> u32 {
+    let b = Box4 { lo: vec4(lx, ly, lz, t0), hi: vec4(hx, hy, hz, t1) }
+    let r = interval(|q: vec4| timed(ti, q.xyz, q.w), b)
+    if r.lo > 0.0 || r.hi < 0.0 {
+        return 0
+    }
+    let gx = interval(|q: vec4| gradient(|s: vec3| timed(ti, s, q.w), q.xyz).x, b)
+    if gx.lo > 0.0 || gx.hi < 0.0 {
+        return 1
+    }
+    let gy = interval(|q: vec4| gradient(|s: vec3| timed(ti, s, q.w), q.xyz).y, b)
+    if gy.lo > 0.0 || gy.hi < 0.0 {
+        return 1
+    }
+    let gz = interval(|q: vec4| gradient(|s: vec3| timed(ti, s, q.w), q.xyz).z, b)
+    if gz.lo > 0.0 || gz.hi < 0.0 { 1 } else { 2 }
+}
+
+/// A derived local Lipschitz constant over the box: the largest gradient length the box's
+/// interval gradient allows.
+pub fn lipschitz(fi: u32, lx: f32, ly: f32, lz: f32, hx: f32, hy: f32, hz: f32) -> f32 {
+    let b = bx(lx, ly, lz, hx, hy, hz)
+    let gx = interval(|q: vec3| gradient(|s: vec3| value_of(fi, s), q).x, b)
+    let gy = interval(|q: vec3| gradient(|s: vec3| value_of(fi, s), q).y, b)
+    let gz = interval(|q: vec3| gradient(|s: vec3| value_of(fi, s), q).z, b)
+    let m = vec3(
+        max(abs(gx.lo), abs(gx.hi)),
+        max(abs(gy.lo), abs(gy.hi)),
+        max(abs(gz.lo), abs(gz.hi)),
+    )
+    length(m)
+}
+
+// ---- ray tracing ---------------------------------------------------------------------------------
+/// A pinhole camera looking at `target` from `eye`; the ray for pixel (i, j) of an n × n image.
+fn ray_dir(eye: vec3, target: vec3, i: u32, j: u32, n: u32) -> vec3 {
+    let uv = (vec2(f32(i), f32(j)) + 0.5) * (2.0 / f32(n)) - 1.0
+    let forward = normalize(target - eye)
+    let right = normalize(cross(forward, vec3(y: 1.0)))
+    let up = cross(right, forward)
+    normalize(forward * 1.6 + right * uv.x - up * uv.y)
+}
+
+/// Sphere tracing, stepping `scale` times the distance (hello-field steps 0.9). Returns the
+/// hit distance (or -1) and the number of field evaluations.
+fn sphere_trace(fi: u32, o: vec3, dir: vec3, scale: f32) -> vec2 {
+    var t = 0.0
+    var n = 0
+    while n < 512 && t < 8.0 {
+        let d = value_of(fi, o + dir * t)
+        n += 1
+        if d < 0.0005 {
+            return vec2(t, f32(n))
+        }
+        t += d * scale
+    }
+    vec2(-1.0, f32(n))
+}
+
+/// The largest |∇f · dir| along the segment from `a` to `b`, from the interval of the
+/// directional derivative over the segment's bounding box.
+fn segment_lipschitz(fi: u32, a: vec3, b: vec3, dir: vec3) -> f32 {
+    let r = interval(
+        |q: vec3| dot(gradient(|s: vec3| value_of(fi, s), q), dir),
+        Box3 { lo: min(a, b), hi: max(a, b) },
+    )
+    max(abs(r.lo), abs(r.hi))
+}
+
+/// Segment tracing (Galin et al. 2020) with the derived bound: over a candidate segment of
+/// length s ahead, the field can fall at most L s, so a step of min(d / L, s) can't cross the
+/// surface. Returns the hit distance (or -1), field evaluations, and bound evaluations.
+fn segment_trace(fi: u32, o: vec3, dir: vec3) -> vec3 {
+    var t = 0.0
+    var n = 0
+    var nb = 0
+    var s = 0.05
+    while n < 512 && t < 8.0 {
+        let p = o + dir * t
+        let d = value_of(fi, p)
+        n += 1
+        if d < 0.0005 {
+            return vec3(t, f32(n), f32(nb))
+        }
+        let l = segment_lipschitz(fi, p, p + dir * s, dir)
+        nb += 1
+        let step = min(d / max(l, 0.000001), s)
+        t += step
+        s = 2.0 * step + 0.0005
+    }
+    vec3(-1.0, f32(n), f32(nb))
+}
+
+/// The reference: sphere tracing at a quarter step, up to 4096 evaluations.
+fn reference_trace(fi: u32, o: vec3, dir: vec3) -> vec3 {
+    var t = 0.0
+    var n = 0
+    while n < 4096 && t < 8.0 {
+        let d = value_of(fi, o + dir * t)
+        n += 1
+        if d < 0.0005 {
+            return vec3(t, f32(n), 0.0)
+        }
+        t += d * 0.25
+    }
+    vec3(-1.0, f32(n), 0.0)
+}
+
+/// One ray of an n × n image of field `fi` from `eye` towards `target`: (hit distance or -1,
+/// evaluations, bound evaluations). `mode` 0 traces spheres at 0.9, 1 at 1.0, 2 segments, 3
+/// the reference.
+pub fn trace(
+    fi: u32,
+    mode: u32,
+    i: u32,
+    j: u32,
+    n: u32,
+    ex: f32,
+    ey: f32,
+    ez: f32,
+    tx: f32,
+    ty: f32,
+    tz: f32,
+) -> vec3 {
+    let eye = vec3(ex, ey, ez)
+    let dir = ray_dir(eye, vec3(tx, ty, tz), i, j, n)
+    if mode == 0 {
+        let r = sphere_trace(fi, eye, dir, 0.9)
+        vec3(r.x, r.y, 0.0)
+    } else if mode == 1 {
+        let r = sphere_trace(fi, eye, dir, 1.0)
+        vec3(r.x, r.y, 0.0)
+    } else if mode == 2 {
+        segment_trace(fi, eye, dir)
+    } else {
+        reference_trace(fi, eye, dir)
+    }
+}
+
+/// A whole image's totals, for timing in one call: (hits, evaluations, bound evaluations).
+pub fn trace_image(
+    fi: u32,
+    mode: u32,
+    n: u32,
+    ex: f32,
+    ey: f32,
+    ez: f32,
+    tx: f32,
+    ty: f32,
+    tz: f32,
+) -> vec3 {
+    var hits = 0.0
+    var evals = 0.0
+    var bounds = 0.0
+    for j in 0..n {
+        for i in 0..n {
+            let r = trace(fi, mode, i, j, n, ex, ey, ez, tx, ty, tz)
+            if r.x >= 0.0 {
+                hits += 1.0
+            }
+            evals += r.y
+            bounds += r.z
+        }
+    }
+    vec3(hits, evals, bounds)
+}
+
+// ---- the same certificate on the GPU -----------------------------------------------------------
+/// An n × n × n grid of cubes.
+struct Grid: Copy + GpuData {
+    origin: vec3,
+    cell: f32,
+    n: u32,
+}
+
+fn grid_box(g: Grid, i: u32) -> Box3 {
+    let c = vec3(f32(i % g.n), f32((i / g.n) % g.n), f32(i / (g.n * g.n)))
+    let lo = g.origin + c * g.cell
+    Box3 { lo, hi: lo + g.cell }
+}
+
+/// `pv`, for any surface. On the GPU the bounds widen by WGSL's error bounds (f32 here: the
+/// GPU has no f64).
+fn pv_of<F: Surface>(f: F, b: Box3) -> u32 {
+    let r = f.interval(b)
+    if r.lo > 0.0 || r.hi < 0.0 {
+        return 0
+    }
+    // The gradient's box, from one derived function (M2: the interval of a vector).
+    let g = interval(|q: vec3| f.gradient(q), b)
+    let gx = Interval { lo: g.lo.x, hi: g.hi.x }
+    let gy = Interval { lo: g.lo.y, hi: g.hi.y }
+    let gz = Interval { lo: g.lo.z, hi: g.hi.z }
+    let s = self_dot_lo32(gx) + self_dot_lo32(gy) + self_dot_lo32(gz)
+    if s > 0.0 { 1 } else { 2 }
+}
+
+/// `self_dot_lo` in f32, rounded down by a relative 2⁻²⁰ so the test stays conservative.
+fn self_dot_lo32(g: Interval) -> f32 {
+    let v = if g.lo < 0.0 && g.hi > 0.0 {
+        g.lo * g.hi
+    } else {
+        min(g.lo * g.lo, g.hi * g.hi)
+    }
+    v - abs(v) * 0.000001
+}
+
+@compute(64)
+fn classify<F: Surface>(field: F, grid: Grid, out: mut Slots<u32>, id: GlobalId) {
+    if id.x < grid.n * grid.n * grid.n {
+        out[id] = pv_of(field, grid_box(grid, id.x))
+    }
+}
+
+/// The classes `gpu_classify` wrote, kept for the harness to read back (M2: a GPU buffer is an
+/// owned value, which lives as long as the state that holds it).
+pub struct Classes {
+    out: GpuBuffer<u32>,
+}
+
+pub fn init() -> Classes {
+    Classes { out: buffer(1) }
+}
+
+/// Classifies an n³ grid on the GPU into the state's buffer: the smooth creature with
+/// `smin_if` (`which` 0) or the creature with its bark (1).
+pub fn gpu_classify(state: mut Classes, which: u32, n: u32, ox: f32, oy: f32, oz: f32, cell: f32) {
+    let grid = Grid { origin: vec3(ox, oy, oz), cell, n }
+    let count = n * n * n
+    var out: GpuBuffer<u32> = buffer(count)
+    let groups = (count + 63) / 64
+    if which == 0 {
+        dispatch(
+            classify.bind(field: blended_creature(0.0), grid: grid, out: mut out),
+            groups: groups,
+        )
+    } else {
+        dispatch(classify.bind(field: creature(0.0), grid: grid, out: mut out), groups: groups)
+    }
+    state.out = take out
+}
+
+/// The grazer's conservative bounds (spike 01's), as two corners.
+pub fn grazer_lo() -> vec3 {
+    let b = bounds(params(1))
+    vec3(f32(b.lo.x), f32(b.lo.y), f32(b.lo.z))
+}
+
+pub fn grazer_hi() -> vec3 {
+    let b = bounds(params(1))
+    vec3(f32(b.hi.x), f32(b.hi.y), f32(b.hi.z))
+}
+
+pub fn frame(state: mut Classes, time: f32, width: u32, height: u32) {}

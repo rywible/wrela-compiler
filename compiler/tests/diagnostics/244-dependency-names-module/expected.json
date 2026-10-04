@@ -1,0 +1,30 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0201",
+      "file": "wrela.toml",
+      "fixes": [],
+      "help": [
+        "rename the dependency here, or the module"
+      ],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "the dependency `shapes` has the name of a module of this package",
+      "notes": [
+        "a path's first name is a module of the package or a dependency, so one name can't be both (§3)"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 1,
+        "end": 65,
+        "end_column": 26,
+        "end_line": 5,
+        "line": 5,
+        "start": 40
+      },
+      "title": "a name defined twice"
+    }
+  ],
+  "version": 2
+}

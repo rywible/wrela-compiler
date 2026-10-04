@@ -1,0 +1,21 @@
+// A type GPU code can't have, in GPU code: `f64`, `String`, `Vec`, an empty array. GPU code
+// has `f32`, `i32`, `u32`, `bool`, vectors, matrices, and structs and fixed arrays of them.
+// ---- wrong
+use std::gpu::{GlobalId, Slots}
+
+@compute(64)
+fn double(out: mut Slots<f32>, id: GlobalId) {
+    let wide: f64 = f64(out[id])
+    out[id] = f32(wide * 2.0)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+use std::gpu::{GlobalId, Slots}
+
+@compute(64)
+fn double(out: mut Slots<f32>, id: GlobalId) {
+    out[id] = out[id] * 2.0
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

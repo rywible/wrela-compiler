@@ -1,0 +1,14 @@
+// A local that's never read. Remove it, or name it `_name` to say that's on purpose.
+// ---- wrong
+fn area(w: f32, h: f32) -> f32 {
+    let half = w / 2.0
+    w * h
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+fn area(w: f32, h: f32) -> f32 {
+    w * h
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

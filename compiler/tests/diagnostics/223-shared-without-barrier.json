@@ -1,0 +1,30 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0609",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [
+        "call `barrier(mut row)` between the writes and the reads"
+      ],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "`row` is read here, and another invocation may still be writing it: there's no barrier since",
+      "notes": [
+        "between barriers, workgroup memory is written (each invocation its own chunk) or read, not both (§6.13)"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 15,
+        "end": 376,
+        "end_column": 25,
+        "end_line": 10,
+        "line": 10,
+        "start": 366
+      },
+      "title": "workgroup memory read and written with no barrier between"
+    }
+  ],
+  "version": 2
+}

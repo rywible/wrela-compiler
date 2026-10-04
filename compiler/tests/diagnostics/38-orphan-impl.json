@@ -10,7 +10,7 @@
       "internal": false,
       "label": null,
       "labels": [],
-      "message": "this package can't implement std's `Surface` for std's `vec3`",
+      "message": "this package can't implement `std`'s `Surface` for a built-in `vec3`",
       "notes": [
         "an impl lives with its trait or with its type (D-071)"
       ],

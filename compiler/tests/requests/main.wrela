@@ -1,0 +1,118 @@
+// Requests (compiler/tests/tests/suite/requests.rs): a readback of what a kernel wrote, a store
+// then a load of the program's storage, a fetch of a file of the build, and a fetch of one
+// that isn't there. Each is made on a fixed frame and polled on every frame after, so the
+// commands the program submits don't depend on when answers arrive. Frame 40 writes the
+// answers into a buffer.
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch, read, write}
+use std::io::{Pending, fetch, load, store}
+
+@compute(64)
+fn squares(out: mut Slots<u32>, id: GlobalId) {
+    out[id] = id.x * id.x
+}
+
+/// What each answer was: 0 while it hasn't come, 1 + what it held when it has, and 1 for
+/// failed.
+pub struct Requests {
+    frame: u32,
+    out: GpuBuffer<u32>,
+    report: GpuBuffer<u32>,
+    readback: Pending<u32>,
+    saved: Pending<u8>,
+    loaded: Option<Pending<u8>>,
+    fetched: Pending<u8>,
+    missing: Pending<u8>,
+    readback_sum: u32,
+    saved_ok: u32,
+    loaded_sum: u32,
+    fetched_sum: u32,
+    missing_failed: u32,
+}
+
+pub fn init() -> Requests {
+    var out: GpuBuffer<u32> = buffer(64)
+    dispatch(squares.bind(out: mut out), groups: 1)
+    let readback = read(out.span(start: 0, count: 64))
+    Requests {
+        frame: 0,
+        out,
+        report: buffer(5),
+        readback,
+        saved: store("saves/slot", [1, 2, 3, 4, 5]),
+        loaded: None,
+        fetched: fetch("data/level.bin"),
+        missing: fetch("data/missing.bin"),
+        readback_sum: 0,
+        saved_ok: 0,
+        loaded_sum: 0,
+        fetched_sum: 0,
+        missing_failed: 0,
+    }
+}
+
+fn sum32(xs: [u32]) -> u32 {
+    var s = 0
+    for x in xs {
+        s += x
+    }
+    s
+}
+
+fn sum8(xs: [u8]) -> u32 {
+    var s = 0
+    for x in xs {
+        s += u32(x)
+    }
+    s
+}
+
+pub fn frame(state: mut Requests, time: f32, width: u32, height: u32) {
+    state.frame += 1
+    // The store has finished by frame 20 in both hosts (frames are a 60th of a second apart):
+    // then the slot is loaded back.
+    if state.frame == 20 && state.saved_ok == 1 {
+        state.loaded = Some(load("saves/slot"))
+    }
+    if let Some(Ok(values)) = state.readback.poll() {
+        state.readback_sum = 1 + sum32(values)
+    }
+    if let Some(Ok(_)) = state.saved.poll() {
+        state.saved_ok = 1
+    }
+    match mut state.loaded {
+        Some(loaded) => {
+            if let Some(Ok(bytes)) = loaded.poll() {
+                state.loaded_sum = 1 + sum8(bytes)
+            }
+        },
+        None => {},
+    }
+    if let Some(Ok(bytes)) = state.fetched.poll() {
+        state.fetched_sum = 1 + sum8(bytes)
+    }
+    if let Some(Err(_)) = state.missing.poll() {
+        state.missing_failed = 1
+    }
+    // The answers, into a buffer on the last frame: the hosts' state hashes agree only if their
+    // answers do.
+    if state.frame == 40 {
+        let answers = [
+            state.readback_sum,
+            state.saved_ok,
+            state.loaded_sum,
+            state.fetched_sum,
+            state.missing_failed,
+        ]
+        write(mut state.report, 0, answers)
+    }
+}
+
+/// The answers, packed: readback, saved, loaded, fetched, missing.
+pub fn answers(state: Requests) -> vec4 {
+    vec4(
+        f32(state.readback_sum),
+        f32(state.saved_ok * 10 + state.missing_failed),
+        f32(state.loaded_sum),
+        f32(state.fetched_sum),
+    )
+}

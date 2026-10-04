@@ -1,0 +1,13 @@
+// rejects: mem.let-owns
+struct Log: Clone {
+    count: u32,
+}
+
+struct World: Clone {
+    log: Log,
+}
+
+fn f(w: World) -> u32 {
+    let l = w.log //~ E0518
+    l.count
+}

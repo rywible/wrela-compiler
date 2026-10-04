@@ -1,0 +1,10 @@
+// rejects: stmt.let-else
+fn f(x: Option<f32>) -> f32 {
+    let Some(v) = x else { 0.0 } //~ E0330
+    v
+}
+
+fn g(x: Option<f32>) -> f32 {
+    let Some(v) = if true { x } else { None } else { return 0.0 } //~ E0100
+    v
+}

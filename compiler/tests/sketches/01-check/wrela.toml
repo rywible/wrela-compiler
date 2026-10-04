@@ -1,0 +1,9 @@
+# Sketch 01's creature against M1's tier-0 grazer (compiler/tests/fields), which it must equal
+# within 1e-5 m (AC11): a program of its own, so sketch 01 doesn't depend on M1's.
+[package]
+name = "check"
+
+[dependencies]
+engine = { path = "../engine" }
+grazer = { path = "../01-creature" }
+m1 = { path = "../../fields" }

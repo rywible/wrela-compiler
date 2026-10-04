@@ -8,8 +8,14 @@ export interface FunctionTypes {
   imports: (string | null)[];
   /** Each exported function's name, to its type. */
   exports: Map<string, string>;
-  /** Whether it has a start function. */
-  start: boolean;
+  /** Each imported memory, by import index: its limits in pages, and whether it's shared. */
+  memories: Map<number, MemoryLimits>;
+}
+
+export interface MemoryLimits {
+  initial: number;
+  maximum: number | null;
+  shared: boolean;
 }
 
 const VALTYPES: Record<number, string> = {
@@ -89,10 +95,12 @@ export class ByteReader {
     return t;
   }
 
-  limits(): void {
+    /** Limits: 0x01 has a maximum, 0x02 shared. */
+  limits(): MemoryLimits {
     const flags = this.byte();
-    this.uleb();
-    if (flags & 1) this.uleb();
+    const initial = this.uleb();
+    const maximum = flags & 1 ? this.uleb() : null;
+    return { initial, maximum, shared: (flags & 2) !== 0 };
   }
 }
 
@@ -102,7 +110,7 @@ export function functionTypes(bytes: Uint8Array): FunctionTypes {
   r.at = 8; // magic and version
   const types: string[] = [];
   const funcs: string[] = []; // the type of each function index: imports first
-  const out: FunctionTypes = { imports: [], exports: new Map(), start: false };
+    const out: FunctionTypes = { imports: [], exports: new Map(), memories: new Map() };
   while (r.at < bytes.length) {
     const id = r.byte();
     const size = r.uleb();
@@ -126,12 +134,12 @@ export function functionTypes(bytes: Uint8Array): FunctionTypes {
           out.imports.push(ty);
           continue;
         }
-        out.imports.push(null);
+                out.imports.push(null);
         if (kind === 1) {
           r.valtype();
           r.limits();
         } else if (kind === 2) {
-          r.limits();
+          out.memories.set(out.imports.length - 1, r.limits());
         } else if (kind === 3) {
           r.valtype();
           r.byte();
@@ -151,8 +159,6 @@ export function functionTypes(bytes: Uint8Array): FunctionTypes {
         const index = r.uleb();
         if (kind === 0) out.exports.set(name, funcs[index] ?? "(?)");
       }
-    } else if (id === 8) {
-      out.start = true;
     }
     r.at = end;
   }

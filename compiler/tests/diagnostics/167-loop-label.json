@@ -1,0 +1,55 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0114",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [
+        "move the inner loop into a function that returns, or set a flag the outer loop checks"
+      ],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "`'rows` is a loop label, which wrela doesn't have",
+      "notes": [
+        "`break` and `continue` leave the innermost loop"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 5,
+        "end": 158,
+        "end_column": 10,
+        "end_line": 6,
+        "line": 6,
+        "start": 153
+      },
+      "title": "a lifetime or a loop label, which wrela doesn't have"
+    },
+    {
+      "code": "E0114",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [
+        "move the inner loop into a function that returns, or set a flag the outer loop checks"
+      ],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "`'rows` is a loop label, which wrela doesn't have",
+      "notes": [
+        "`break` and `continue` leave the innermost loop"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 23,
+        "end": 292,
+        "end_column": 28,
+        "end_line": 10,
+        "line": 10,
+        "start": 287
+      },
+      "title": "a lifetime or a loop label, which wrela doesn't have"
+    }
+  ],
+  "version": 2
+}

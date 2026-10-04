@@ -1,0 +1,36 @@
+// rejects: mem.borrow-structs
+// It rejects what passing its fields one by one would.
+struct World {
+    terrain: [f32; 4],
+    herd: [u32; 4],
+}
+
+borrow struct Ctx {
+    terrain: borrow [f32; 4],
+    herd: mut [u32; 4],
+}
+
+fn step(c: Ctx, herd: [u32; 4]) {}
+
+fn read(c: Ctx) {
+    c.terrain[0] = 1.0 //~ E0505
+}
+
+fn f(w: mut World) {
+    let c = Ctx { terrain: w.terrain, herd: mut w.herd }
+    step(c, w.herd) //~ E0506
+}
+
+fn g(w: mut World) {
+    let c = Ctx { terrain: w.terrain, herd: mut w.herd }
+    w.herd[0] = 1 //~ E0506
+    step(c, [0; 4])
+}
+
+struct Holder {
+    c: Ctx, //~ E0327
+}
+
+borrow struct Bad {
+    log: Vec<u32>, //~ E0519
+}

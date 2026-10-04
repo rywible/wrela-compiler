@@ -1,0 +1,49 @@
+// rejects: mem.borrow-structs
+// A returned borrow struct borrows what the call's arguments could give it, in each field's
+// mode, for as long as it's kept; and it can only borrow the function's parameters.
+struct World {
+    count: u32,
+}
+
+struct Frame {
+    n: u32,
+}
+
+borrow struct Ctx {
+    world: borrow World,
+    frame: mut Frame,
+}
+
+fn make(world: World, frame: mut Frame) -> Ctx {
+    Ctx { world, frame: mut frame }
+}
+
+fn step(c: Ctx) {
+    c.frame.n += c.world.count
+}
+
+fn conflict() -> u32 {
+    let w = World { count: 3 }
+    var f = Frame { n: 1 }
+    let c = make(w, mut f)
+    let x = f.n //~ E0506
+    step(c)
+    x
+}
+
+fn local_world(frame: mut Frame) -> Ctx {
+    let w = World { count: 3 }
+    Ctx { world: w, frame: mut frame } //~ E0508
+}
+
+struct G: Clone {
+    hunger: u32,
+}
+
+// `pair_mut` borrows the whole arena mutably while its result is live.
+fn pair(herd: mut Arena<G>, x: Handle<G>, y: Handle<G>) -> u32 {
+    let both = herd.pair_mut(x, y)
+    let n = herd.len() //~ E0506
+    both.a.hunger += 1
+    n
+}

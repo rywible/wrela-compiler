@@ -1,0 +1,65 @@
+// Timers (the gameplay paper test §4): work due at a later tick, as data. Generic over the
+// game's action type, so pending timers are cloned, hashed and saved with the world, which a
+// closure couldn't be: each closure has its own type, there's no `dyn` to put two in one `Vec`,
+// and a closure has no `Serialize` (§6.7).
+
+use sim::{Sim, SimState, Tick}
+use std::hash::StateHash
+use std::serialize::Serialize
+
+/// Ticks a second.
+pub const TICKS_PER_SECOND: f32 = 60.0
+
+pub struct Timers<A>: Sim {
+    /// Sorted by when they're due, then by the order they were set.
+    pending: Vec<Timer<A>>,
+    next: u64,
+}
+
+pub struct Timer<A>: Sim {
+    /// A tick, not a time: a loaded game fires on the same tick.
+    pub due: Tick,
+    /// Timers due on one tick fire in the order they were set.
+    pub seq: u64,
+    pub action: A,
+}
+
+impl<A: Clone> Timers<A> {
+    pub fn new() -> Timers<A> {
+        Timers { pending: Vec::new(), next: 0 }
+    }
+
+    /// Runs `action` `delay` seconds after tick `now`. An id for `cancel`.
+    @deterministic
+    pub fn after(mut self, now: Tick, delay: f32, action: take A) -> u64 {
+        let due = now + u32(ceil(delay * TICKS_PER_SECOND))
+        var at = self.pending.len()
+        while at > 0 && self.pending[at - 1].due > due {
+            at -= 1
+        }
+        let seq = self.next
+        self.pending.insert(at, Timer { due, seq, action: take action })
+        self.next += 1
+        seq
+    }
+
+    @deterministic
+    pub fn cancel(mut self, seq: u64) {
+        self.pending.retain(|t| t.seq != seq)
+    }
+
+    /// Removes the timers due by `now`, and returns them in order. The caller owns them, so
+    /// an action that runs can set new timers.
+    @deterministic
+    pub fn take_due(mut self, now: Tick) -> Vec<Timer<A>> {
+        var n = 0
+        while n < self.pending.len() && self.pending[n].due <= now {
+            n += 1
+        }
+        self.pending.drain_front(n)
+    }
+
+    pub fn len(self) -> u32 {
+        self.pending.len()
+    }
+}

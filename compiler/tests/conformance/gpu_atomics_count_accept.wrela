@@ -1,0 +1,18 @@
+// accepts: gpu.atomics
+// A kernel counts the grid points inside a sphere with an atomic add, dispatched with its arguments bound.
+
+use std::gpu::{Atomics, GlobalId, GpuBuffer, buffer, dispatch}
+
+@compute(64)
+fn inside(radius: f32, count: mut Atomics<u32>, id: GlobalId) {
+    let i = id.x
+    let p = vec3(f32(i % 16), f32((i / 16) % 16), f32(i / 256)) * 0.125 - vec3(1.0)
+    if length(p) < radius {
+        let _ = count.add(i: 0, value: 1)
+    }
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    var count: GpuBuffer<u32> = buffer(1)
+    dispatch(inside.bind(radius: 0.75, count: mut count), groups: 64)
+}

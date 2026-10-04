@@ -1,0 +1,30 @@
+// `take` of something that isn't a named place: a literal or a call's result. A temporary is
+// moved anyway, so `take` isn't needed.
+// ---- wrong
+struct Log {
+    lines: Vec<Text>,
+}
+
+fn archive(log: take Log) -> u32 {
+    log.lines.len()
+}
+
+fn fresh() -> u32 {
+    archive(take Log { lines: Vec::new() })
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+struct Log {
+    lines: Vec<Text>,
+}
+
+fn archive(log: take Log) -> u32 {
+    log.lines.len()
+}
+
+fn fresh() -> u32 {
+    archive(Log { lines: Vec::new() })
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

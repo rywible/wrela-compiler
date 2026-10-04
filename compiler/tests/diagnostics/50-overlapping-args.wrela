@@ -1,14 +1,20 @@
 // mistake: passing overlapping places, one of them `mut`
 // expect: E0513
 // fix: no
-fn add(to: mut f32, from: f32) {
-    to += from
+struct Log {
+    items: Vec<f32>,
+}
+
+fn merge(into: mut Log, from: Log) {
+    for x in from.items {
+        into.items.push(x)
+    }
 }
 
 struct World {
-    speed: f32,
+    log: Log,
 }
 
 fn f(w: mut World) {
-    add(mut w.speed, w.speed)
+    merge(mut w.log, w.log)
 }

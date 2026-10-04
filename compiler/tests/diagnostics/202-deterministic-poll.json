@@ -1,0 +1,29 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0600",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "`Pending<T>::poll` is non-deterministic, and `tick` is `@deterministic`, which can't `nondet`",
+      "notes": [
+        "the call chain: tick → Pending<T>::poll",
+        "depending on something besides the inputs (the clock, randomness, readback) is the `nondet` effect; see language.md §8 for what each context forbids"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 30,
+        "end": 240,
+        "end_column": 44,
+        "end_line": 13,
+        "line": 13,
+        "start": 226
+      },
+      "title": "an effect a context forbids"
+    }
+  ],
+  "version": 2
+}

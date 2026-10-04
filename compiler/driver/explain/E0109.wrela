@@ -1,0 +1,14 @@
+// A function parameter has no type. Every parameter is written `name: Type`: types aren't
+// inferred across function boundaries.
+// ---- wrong
+fn double(x) -> f32 {
+    x * 2.0
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+fn double(x: f32) -> f32 {
+    x * 2.0
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

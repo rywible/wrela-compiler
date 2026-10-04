@@ -59,7 +59,7 @@ pub fn layout(types: &Types, t: TypeId) -> Layout {
 /// its parts' layouts.
 pub(crate) fn compute(types: &Types, d: &TypeDef) -> (Layout, Box<[u32]>) {
     let layout = match d {
-        TypeDef::Scalar(s) => scalar_layout(*s),
+        TypeDef::Scalar(s) | TypeDef::Atomic(s) => scalar_layout(*s),
         TypeDef::Vector(n) => vector_layout(*n),
         // Its columns, as an array.
         TypeDef::Matrix(n) => vector_layout(*n).array(u32::from(*n)),
@@ -191,7 +191,7 @@ pub fn uniform_compatible(types: &Types, t: TypeId) -> bool {
             }
             true
         }
-        TypeDef::RuntimeArray(_) | TypeDef::Run(_) | TypeDef::Ptr(_) => false,
+        TypeDef::RuntimeArray(_) | TypeDef::Run(_) | TypeDef::Ptr(_) | TypeDef::Atomic(_) => false,
     }
 }
 

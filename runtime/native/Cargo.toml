@@ -10,13 +10,20 @@ publish.workspace = true
 name = "wrela-host"
 path = "src/main.rs"
 test = false
+required-features = ["gpu"]
+
+[features]
+default = ["gpu"]
+# The GPU: `Host`, which runs the command stream under wgpu. Without it, the crate is
+# `CpuHost` alone, which the compiler uses to run a program's frames for its tests.
+gpu = ["dep:wgpu", "dep:pollster", "dep:png"]
 
 [dependencies]
 wrela-abi.workspace = true
-wasmtime = { version = "49", default-features = false, features = ["cranelift", "runtime", "std"] }
-wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "metal", "vulkan", "dx12", "wgsl"] }
-pollster = "0.4"
-png = "0.18"
+wasmtime.workspace = true
+wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "metal", "vulkan", "dx12", "wgsl"], optional = true }
+pollster = { version = "0.4", optional = true }
+png = { version = "0.18", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

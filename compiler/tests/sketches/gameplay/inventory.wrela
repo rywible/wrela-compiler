@@ -1,0 +1,247 @@
+// Stacks, slots and equipment (paper test §1).
+//
+// Changed from the paper test:
+// - A stack changes in place, `match mut slot { Some(s) => s.count += n }` (F3); the paper test
+//   rebuilt it, `slot = Some(ItemStack { count: s.count + n, ..s })`.
+// - Ids compare with `==` (F6); `let … else` and `if let` replace `match`es with an empty arm
+//   (F8); kinds order with `<` (`Ord`), not a `kind_rank` match.
+// - Still a `match` for an enum's integer value, and a `while` for a reverse range (§21's
+//   small conveniences, left out).
+
+use engine::sim::{Sim, SimState, SimValue}
+use items::{EquipSlot, ItemId, item_def}
+use std::hash::StateHash
+use std::serialize::Serialize
+
+pub struct ItemStack: SimValue {
+    pub item: ItemId,
+    pub count: u32,
+}
+
+pub struct Inventory: Sim {
+    pub slots: [Option<ItemStack>; 24],
+    pub gold: u32,
+}
+
+pub struct Player: Sim {
+    pub pos: vec3,
+    pub health: f32,
+    pub max_carry: f32, // kg
+    pub bag: Inventory,
+    pub worn: [Option<ItemStack>; 6], // indexed by `slot_index`
+}
+
+pub enum EquipError: Copy + Eq {
+    NoSuchSlot,
+    Empty,
+    NotWearable,
+    BagFull,
+}
+
+impl Inventory {
+    pub fn new() -> Inventory {
+        Inventory { slots: [None; 24], gold: 0 }
+    }
+
+    /// Adds `count` of `item`: tops up stacks with room, then fills empty slots. How many
+    /// didn't fit.
+    @deterministic
+    pub fn add(mut self, item: ItemId, count: u32) -> u32 {
+        let max = item_def(item).max_stack
+        var left = count
+        for mut slot in self.slots { // first pass: top up
+            if left == 0 {
+                break
+            }
+            match mut slot {
+                Some(s) if s.item == item && s.count < max => {
+                    let n = min(left, max - s.count)
+                    s.count += n // in place (F3)
+                    left -= n
+                },
+                _ => {},
+            }
+        }
+        for mut slot in self.slots { // second pass: empty slots
+            if left == 0 {
+                break
+            }
+            if slot.is_none() {
+                let n = min(left, max)
+                slot = Some(ItemStack { item, count: n })
+                left -= n
+            }
+        }
+        left
+    }
+
+    /// Takes `count` of `item`, from the last slots first. False, and no change, if there
+    /// aren't enough.
+    @deterministic
+    pub fn remove(mut self, item: ItemId, count: u32) -> bool {
+        if self.count(item) < count {
+            return false
+        }
+        var left = count
+        var i = self.slots.len()
+        while left > 0 && i > 0 {
+            i -= 1
+            var emptied = false
+            match mut self.slots[i] {
+                Some(s) if s.item == item => {
+                    let n = min(left, s.count)
+                    s.count -= n
+                    left -= n
+                    emptied = s.count == 0
+                },
+                _ => {},
+            }
+            if emptied {
+                self.slots[i] = None
+            }
+        }
+        true
+    }
+
+    pub fn count(self, item: ItemId) -> u32 {
+        var n = 0
+        for slot in self.slots {
+            if let Some(s) = slot {
+                if s.item == item {
+                    n += s.count
+                }
+            }
+        }
+        n
+    }
+
+    pub fn first_empty(self) -> Option<u32> {
+        for i in 0..self.slots.len() {
+            if self.slots[i].is_none() {
+                return Some(i)
+            }
+        }
+        None
+    }
+
+    /// Drag and drop inside the bag: merge into a stack of the same item, or swap. `from` and
+    /// `to` come from a client's command, so they're checked.
+    @deterministic
+    pub fn move_slot(mut self, from: u32, to: u32) {
+        let n = self.slots.len()
+        if from == to || from >= n || to >= n {
+            return
+        }
+        if let (Some(a), Some(b)) = (self.slots[from], self.slots[to]) {
+            if a.item == b.item {
+                let moved = min(a.count, item_def(a.item).max_stack - b.count)
+                self.slots[to] = Some(ItemStack { count: b.count + moved, ..b })
+                self.slots[from] = if moved == a.count { None } else {
+                    Some(ItemStack { count: a.count - moved, ..a })
+                }
+                return
+            }
+        }
+        // Two elements of one array overlap, so they're swapped through a copy (`Copy`).
+        let t = self.slots[from]
+        self.slots[from] = self.slots[to]
+        self.slots[to] = t
+    }
+
+    /// Total weight, in kg.
+    pub fn weight(self) -> f32 {
+        var total = 0.0
+        for slot in self.slots {
+            if let Some(s) = slot {
+                total += item_def(s.item).weight * f32(s.count)
+            }
+        }
+        total
+    }
+
+    /// By kind, then by name, bigger stacks first; empty slots last. (Insertion sort: 24 slots.)
+    @deterministic
+    pub fn sort(mut self) {
+        for i in 1..self.slots.len() {
+            var j = i
+            while j > 0 && goes_before(self.slots[j], self.slots[j - 1]) {
+                let t = self.slots[j]
+                self.slots[j] = self.slots[j - 1]
+                self.slots[j - 1] = t
+                j -= 1
+            }
+        }
+    }
+}
+
+fn goes_before(a: Option<ItemStack>, b: Option<ItemStack>) -> bool {
+    match (a, b) {
+        (Some(x), Some(y)) => {
+            borrow dx = item_def(x.item)
+            borrow dy = item_def(y.item)
+            if dx.kind != dy.kind {
+                dx.kind < dy.kind
+            } else if dx.name != dy.name {
+                dx.name < dy.name
+            } else {
+                x.count > y.count
+            }
+        },
+        (Some(_), None) => true,
+        _ => false,
+    }
+}
+
+/// Equips the stack in bag slot `from`. What was worn there goes back to that slot.
+@deterministic
+pub fn equip(p: mut Player, from: u32) -> Result<(), EquipError> {
+    if from >= p.bag.slots.len() {
+        return Err(EquipError::NoSuchSlot)
+    }
+    let Some(stack) = p.bag.slots[from] else { return Err(EquipError::Empty) } // F8
+    let at = match item_def(stack.item).equip {
+        EquipSlot::Nowhere => return Err(EquipError::NotWearable),
+        slot => slot_index(slot),
+    }
+    p.bag.slots[from] = p.worn[at] // `bag` and `worn` are disjoint, so both can change
+    p.worn[at] = Some(stack)
+    Ok(())
+}
+
+/// Takes off what's worn at `at`, into the first empty bag slot.
+@deterministic
+pub fn unequip(p: mut Player, at: u32) -> Result<(), EquipError> {
+    if at >= p.worn.len() {
+        return Err(EquipError::NoSuchSlot)
+    }
+    let Some(stack) = p.worn[at] else { return Err(EquipError::Empty) }
+    let Some(i) = p.bag.first_empty() else { return Err(EquipError::BagFull) }
+    p.bag.slots[i] = Some(stack)
+    p.worn[at] = None
+    Ok(())
+}
+
+/// An enum has no integer value (§21), so each conversion is a `match`.
+pub fn slot_index(s: EquipSlot) -> u32 {
+    match s {
+        EquipSlot::Head => 0,
+        EquipSlot::Body => 1,
+        EquipSlot::Hands => 2,
+        EquipSlot::Feet => 3,
+        EquipSlot::MainHand => 4,
+        EquipSlot::OffHand => 5,
+        EquipSlot::Nowhere => panic("not a slot"),
+    }
+}
+
+/// A worn slot's name: text known when the game is built (`Text`, F4).
+pub fn slot_name(at: u32) -> Text {
+    match at {
+        0 => "Head",
+        1 => "Body",
+        2 => "Hands",
+        3 => "Feet",
+        4 => "Main hand",
+        _ => "Off hand",
+    }
+}

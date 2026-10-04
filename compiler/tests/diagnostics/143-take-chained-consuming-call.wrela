@@ -5,7 +5,7 @@ struct Builder {
     n: u32,
 }
 
-struct Built: Copy + Clone {
+struct Built: Copy {
     n: u32,
 }
 

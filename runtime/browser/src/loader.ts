@@ -1,11 +1,11 @@
 // Loads a build (manifest.json, the WASM, each pipeline's WGSL) and assembles a running program:
 // pipelines built up front, then the WASM instantiated against the decoder.
 
-import { Checker } from "./check.ts";
+import { Checker, limitsOf } from "./check.ts";
 import { errorMessage } from "./errors.ts";
 import { buildPipelines, GpuExecutor, type ScreenTarget } from "./gpu.ts";
 import { type Manifest, parseManifest } from "./manifest.ts";
-import { Program, type ProgramOptions } from "./program.ts";
+import { type Io, Program, type ProgramOptions } from "./program.ts";
 import type { Bytes } from "./stream.ts";
 import { UTF8 } from "./wasm.ts";
 
@@ -50,6 +50,41 @@ export async function loadBuild(base: string, fetchFn: Fetch = (url) => fetch(ur
   return { manifest, wasm, shaders };
 }
 
+/**
+ * Where a program in this browser keeps its requests' bytes: `Fetch` reads a file of the build
+ * at `base`, and storage is the origin's private file system, under `wrela/` and the build's
+ * path (so two games on one origin don't share it). Paths are checked before they get here
+ * (`pathProblem`).
+ */
+export function browserIo(base: string, fetchFn: Fetch = (url) => fetch(url)): Io {
+  const root = ["wrela", ...new URL(base).pathname.split("/").filter((p) => p !== "")];
+  const dir = async (parts: string[], create: boolean) => {
+    let d = await navigator.storage.getDirectory();
+    for (const p of parts) d = await d.getDirectoryHandle(p, { create });
+    return d;
+  };
+  const file = async (path: string, create: boolean) => {
+    const parts = [...root, ...path.split("/")];
+    const name = parts.pop()!;
+    return (await dir(parts, create)).getFileHandle(name, { create });
+  };
+  return {
+    async fetch(url) {
+      const response = await get(fetchFn, new URL(url, base));
+      return new Uint8Array(await response.arrayBuffer());
+    },
+    async storageRead(path) {
+      const f = await (await file(path, false)).getFile();
+      return new Uint8Array(await f.arrayBuffer());
+    },
+    async storageWrite(path, data) {
+      const w = await (await file(path, true)).createWritable();
+      await w.write(data);
+      await w.close();
+    },
+  };
+}
+
 /** Builds every pipeline while the WASM compiles, then instantiates the program with the
  * decoder behind its import. */
 export async function startProgram(
@@ -57,12 +92,13 @@ export async function startProgram(
   build: Build,
   screen: ScreenTarget,
   options: ProgramOptions = {},
+  timestamps = false,
 ): Promise<Program> {
-  const [pipelines, module] = await Promise.all([
+    const [pipelines, compiled] = await Promise.all([
     buildPipelines(device, build.manifest, build.shaders),
     Program.compile(build.wasm),
   ]);
-  const executor = new GpuExecutor(device, pipelines, screen);
-  const checker = new Checker(build.manifest);
-  return Program.instantiate(module, checker, executor, options);
+  const executor = new GpuExecutor(device, pipelines, screen, timestamps);
+  const checker = new Checker(build.manifest, limitsOf(device.limits));
+    return Program.instantiate(compiled, checker, executor, options);
 }

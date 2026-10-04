@@ -1,0 +1,12 @@
+// run: `let … else` whose `else` panics with an `f"…"` message, which allocates
+// expect: first(3) = 4
+// expect: first(0) panics "nothing at 0"
+
+fn found(n: u32) -> Option<u32> {
+    if n > 0 { Some(n + 1) } else { None }
+}
+
+pub fn first(n: u32) -> u32 {
+    let Some(x) = found(n) else { panic(f"nothing at {n}") }
+    x
+}

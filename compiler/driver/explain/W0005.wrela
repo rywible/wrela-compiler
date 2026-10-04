@@ -1,0 +1,20 @@
+// An argument passed by position where a swap would still compile: two neighbouring
+// parameters of one type both given bare numbers, a bare `true` or `false` to a function that
+// takes more than one argument, or `select`'s two values (the value for `false` comes first).
+// Name them; `wrela fix` does.
+// ---- wrong
+use std::field::{Surface, round_cone}
+
+fn leg() -> Surface {
+    round_cone(vec3(), vec3(y: -0.45), 0.09, 0.06)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+use std::field::{Surface, round_cone}
+
+fn leg() -> Surface {
+    round_cone(vec3(), vec3(y: -0.45), r_top: 0.09, r_bottom: 0.06)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

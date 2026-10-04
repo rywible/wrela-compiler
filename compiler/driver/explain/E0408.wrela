@@ -1,0 +1,23 @@
+// An associated type that the trait doesn't declare: `T::Missing`.
+// ---- wrong
+trait Shape {
+    type Measure
+    fn area(self) -> f32
+}
+
+fn unit<T: Shape>(t: T) -> T::Missing {
+    t.area()
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+trait Shape {
+    type Measure
+    fn area(self) -> f32
+}
+
+fn unit<T: Shape>(t: T) -> f32 {
+    t.area()
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

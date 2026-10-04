@@ -1,0 +1,30 @@
+// A pattern that can't match the value's type: a variant of another enum, a tuple pattern of
+// a struct, or a constant whose type is different.
+// ---- wrong
+enum Mood {
+    Calm,
+    Alert,
+}
+
+fn calm(m: Mood) -> bool {
+    match m {
+        Some(_) => false,
+        _ => true,
+    }
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+enum Mood {
+    Calm,
+    Alert,
+}
+
+fn calm(m: Mood) -> bool {
+    match m {
+        Mood::Calm => true,
+        _ => false,
+    }
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

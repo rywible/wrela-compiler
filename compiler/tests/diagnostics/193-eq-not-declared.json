@@ -1,0 +1,28 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0305",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [
+        "declare it where `Cell` is declared: `struct Cell: Eq { ... }`"
+      ],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "`Cell` can't be compared with `==`: it doesn't declare `Eq`",
+      "notes": [],
+      "severity": "error",
+      "span": {
+        "column": 5,
+        "end": 173,
+        "end_column": 11,
+        "end_line": 10,
+        "line": 10,
+        "start": 167
+      },
+      "title": "an operator that doesn't apply to these types"
+    }
+  ],
+  "version": 2
+}

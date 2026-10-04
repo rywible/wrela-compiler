@@ -1,0 +1,24 @@
+# node <name>, then say <speaker> "<line>", then choices:
+#   choice "<text>" [if <condition>] -> <node> | end
+#     do <effect> <effect> ...
+node mira.start
+  say Mira "Traveler. You look like you've walked a long way."
+  choice "Any work around here?" -> mira.work
+    do set(met_mira)
+  choice "I found this ring." if has(silver_ring) and not flag(ring_returned) -> mira.thanks
+    do take(silver_ring) give(gold_coin, 50) set(ring_returned)
+  choice "Goodbye." -> end
+
+node mira.work
+  say Mira "Wolves took our sheep. Bring me three pelts and I'll pay."
+  choice "I have them." if has(wolf_pelt, 3) or (flag(gate_opened) and has(wolf_pelt, 4)) -> mira.paid
+    do take(wolf_pelt, 3) set(pelts_delivered)
+  choice "I'll be back." -> end
+
+node mira.thanks
+  say Mira "My mother's ring! Please, take this."
+  choice "Glad to help." -> end
+
+node mira.paid
+  say Mira "Good work. The village thanks you."
+  choice "Goodbye." -> end

@@ -1,0 +1,11 @@
+// rejects: const.build
+// A computation that doesn't end stops at the build's fuel limit, as a compile error (§10).
+fn forever() -> u32 {
+    var n: u32 = 0
+    loop { //~ E0705
+        n += 1
+    }
+    n
+}
+
+const N = forever()

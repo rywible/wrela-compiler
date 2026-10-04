@@ -1,7 +1,7 @@
 const scale: f32 = 2.0
 const SCALE: f32 = 3.0
 
-struct Inner: Copy + Clone {
+struct Inner: Copy {
     a: f32,
 }
 

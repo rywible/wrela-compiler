@@ -1,0 +1,16 @@
+// mistake: reading workgroup memory another invocation wrote, with no barrier
+// expect: E0609
+// fix: no
+use std::gpu::{GlobalId, GpuBuffer, LocalId, Shared, Slots, barrier, buffer, dispatch}
+
+@compute(64)
+fn share(out: mut Slots<f32>, row: mut Shared<f32, 64>, lid: LocalId, id: GlobalId) {
+    let mine = row.chunk(lid)
+    row.write(mine, 0, 1.0)
+    out[id] = row.get(0)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    var out: GpuBuffer<f32> = buffer(64)
+    dispatch(share.bind(out: mut out), groups: 1)
+}

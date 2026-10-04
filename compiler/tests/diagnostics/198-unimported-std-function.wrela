@@ -1,0 +1,6 @@
+// mistake: a std function used without importing it
+// expect: E0200
+// fix: yes
+fn save_game(bytes: [u8]) {
+    let _ = store("save", bytes)
+}

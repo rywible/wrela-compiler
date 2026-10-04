@@ -1,0 +1,28 @@
+// Imports that go round in a circle: module `a` re-exports a name from `b`, which re-exports
+// it from `a`. A name must come from somewhere: import it from the module that defines it.
+// ---- wrong
+use a::x
+
+fn one() -> i32 {
+    x()
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- file a.wrela
+pub use b::x
+// ---- file b.wrela
+pub use a::x
+// ---- fixed
+use a::x
+
+fn one() -> i32 {
+    x()
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- file a.wrela
+pub use b::x
+// ---- file b.wrela
+pub fn x() -> i32 {
+    1
+}

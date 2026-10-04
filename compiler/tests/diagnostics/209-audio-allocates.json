@@ -1,0 +1,29 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0600",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "`Vec<T>::push` allocates, and `render` is `@audio` code, on the audio thread, which can't `alloc`",
+      "notes": [
+        "the call chain: render → Vec<T>::push",
+        "using the heap (a `Vec`, a `String`, a `Box`, an f-string) is the `alloc` effect; see language.md §8 for what each context forbids"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 5,
+        "end": 231,
+        "end_column": 26,
+        "end_line": 13,
+        "line": 13,
+        "start": 210
+      },
+      "title": "an effect a context forbids"
+    }
+  ],
+  "version": 2
+}

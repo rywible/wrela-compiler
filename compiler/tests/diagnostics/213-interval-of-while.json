@@ -1,0 +1,39 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0701",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [
+        {
+          "file": "main.wrela",
+          "message": "derived here",
+          "span": {
+            "column": 5,
+            "end": 317,
+            "end_column": 52,
+            "end_line": 15,
+            "line": 15,
+            "start": 270
+          }
+        }
+      ],
+      "message": "a loop exits here depending on the input; an interval needs loops that run the same number of times for every point",
+      "notes": [],
+      "severity": "error",
+      "span": {
+        "column": 11,
+        "end": 197,
+        "end_column": 18,
+        "end_line": 8,
+        "line": 8,
+        "start": 190
+      },
+      "title": "an interval of a loop or a recursion whose end depends on the input"
+    }
+  ],
+  "version": 2
+}

@@ -1,0 +1,32 @@
+// A constant whose computation, run by the build, panicked or trapped: an index out of
+// range, a failed lookup. The message has the panic's and its call chain.
+// ---- wrong
+const NAMES: [Text; 2] = ["hip", "knee"]
+const HIP: u32 = find("hip")
+const CHEST: u32 = find("chets")
+
+fn find(name: Text) -> u32 {
+    for i in 0..2 {
+        if NAMES[i] == name {
+            return i
+        }
+    }
+    panic(f"no bone is named `{name}`")
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+const NAMES: [Text; 2] = ["hip", "knee"]
+const HIP: u32 = find("hip")
+const KNEE: u32 = find("knee")
+
+fn find(name: Text) -> u32 {
+    for i in 0..2 {
+        if NAMES[i] == name {
+            return i
+        }
+    }
+    panic(f"no bone is named `{name}`")
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

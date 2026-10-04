@@ -1,0 +1,17 @@
+// A number can't carry a type suffix such as `1u32` or `2.0f32`. A literal takes its type from
+// where it's used; to choose one, convert (`u32(1)`) or annotate the binding. A unit suffix
+// (`2.0m`, `90deg`) is a different thing, and is allowed.
+// ---- wrong
+fn count() -> u32 {
+    let n = 10u32
+    n
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+fn count() -> u32 {
+    let n: u32 = 10
+    n
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

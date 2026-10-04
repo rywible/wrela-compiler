@@ -1,0 +1,14 @@
+// mistake: a kernel parameter whose struct doesn't declare `GpuData`
+// expect: E0604
+// fix: yes
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch}
+
+struct Wind: Copy {
+    dir: vec2,
+    speed: f32,
+}
+
+@compute(64)
+fn sway(w: Wind, out: mut Slots<f32>, id: GlobalId) {
+    out[id] = w.speed
+}

@@ -1,0 +1,30 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0410",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [
+        "add a generic parameter, as in `struct S<T: Trait> { x: T }`"
+      ],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "`Surface` is a trait, so it isn't a type here",
+      "notes": [
+        "a trait names a type only as a parameter's type (any type with it) or a return type (the one type the body returns)"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 12,
+        "end": 130,
+        "end_column": 19,
+        "end_line": 7,
+        "line": 7,
+        "start": 123
+      },
+      "title": "a trait used as a value type"
+    }
+  ],
+  "version": 2
+}

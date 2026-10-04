@@ -1,0 +1,17 @@
+// A closure run in parallel (`par_each_mut`'s, `par_map_reduce`'s) writes something it
+// captures: the workers would write one place at once. Each call may change only its own element.
+// Compute per-element results, and combine them with `par_map_reduce`.
+// ---- wrong
+fn sum(xs: mut Vec<f32>) -> f32 {
+    var total = 0.0
+    xs.par_each_mut(|x| { total += x })
+    total
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+fn sum(xs: mut Vec<f32>) -> f32 {
+    xs.par_map_reduce(0.0, |x| x, |a, b| a + b)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

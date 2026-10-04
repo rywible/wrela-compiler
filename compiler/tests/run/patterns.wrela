@@ -39,7 +39,7 @@ enum Shape {
     Dot,
 }
 
-struct Pair: Copy + Clone {
+struct Pair: Copy {
     a: i32,
     b: i32,
 }

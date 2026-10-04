@@ -1,0 +1,30 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0305",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [
+        "check which unit was meant"
+      ],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "`2.0m` is a length and `3.0s` is a time: one can't be added to the other",
+      "notes": [
+        "units are constants in SI (§5): both are numbers, but their units say they measure different things"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 20,
+        "end": 96,
+        "end_column": 31,
+        "end_line": 4,
+        "line": 4,
+        "start": 85
+      },
+      "title": "an operator that doesn't apply to these types"
+    }
+  ],
+  "version": 2
+}

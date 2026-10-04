@@ -1,0 +1,201 @@
+// Sketch 03's program (compiler/tests/tests/suite/sketches.rs): the sketch is `sketch.wrela`;
+// this module is the program's interface to the host. A herd of 40 grazers and a player who
+// walks in a circle and digs now and then, ticked through the engine's `Timeline` one tick per
+// frame.
+
+use engine::rng::{Rng, seed}
+use engine::sim::{CreatureKey, GaitState, Mode, SimTier, Tick, Transform}
+use engine::timeline::Timeline
+use grazer::sketch::GrazerSim
+use sketch::{
+    Edit, PlayerSim, SaveError, Terrain, TerrainField, TickInput, World, load_save, save_game,
+    scare, spook, tick,
+}
+use std::arena::Arena
+use std::hash::state_hash
+
+pub struct Game {
+    timeline: Timeline<World, TickInput>,
+}
+
+const HERD: u32 = 40
+
+/// The world at tick 0: grazers in a ring of 20 m, the player in its middle.
+fn world() -> World {
+    var grazers: Arena<GrazerSim> = Arena::new()
+    let rng = Rng::new(seed(3))
+    for i in 0..HERD {
+        let a = 6.2831853 * f32(i) / f32(HERD)
+        let gait = GaitState { phase: f32(i % 7) / 7.0, speed: 0.5, turn: 0.0, mode: Mode::Walk }
+        let _ = grazers.insert(
+            GrazerSim {
+                kind: CreatureKey { kind: 1, seed: seed(i + 1) },
+                tier: if i % 4 == 0 { SimTier::Full } else { SimTier::Ambient },
+                rng: rng.split(i),
+                root: Transform {
+                    pos: vec3(20.0 * cos(a), 0.0, 20.0 * sin(a)),
+                    heading: a + 1.5707964,
+                },
+                gait,
+                pose: gait.pose(),
+            },
+        )
+    }
+    var players: Arena<PlayerSim> = Arena::new()
+    let _ = players.insert(PlayerSim { root: Transform { pos: vec3(0.0, 0.0, 0.0), heading: 0.0 } })
+    World {
+        tick: 0,
+        seed: seed(3),
+        terrain: Terrain {
+            base: TerrainField { height: 0.0, roll: 0.5, wavelength: 8.0 },
+            edits: Vec::new(),
+        },
+        grazers,
+        players,
+    }
+}
+
+/// The input for tick `t`: the player walks a circle of 25 m, and digs every 30 ticks.
+fn input(t: Tick) -> TickInput {
+    let a = 0.02 * f32(t)
+    TickInput { walk: 0.5 * vec2(-sin(a), cos(a)), dig: t % 30 == 29, fill: false }
+}
+
+pub fn init() -> Game {
+    Game { timeline: Timeline::new(world(), 256) }
+}
+
+pub fn frame(state: mut Game, time: f32, width: u32, height: u32) {
+    let t = state.timeline.tick()
+    state.timeline.advance(input(t), tick)
+}
+
+/// Runs `n` more ticks.
+pub fn run(state: mut Game, n: u32) {
+    for _ in 0..n {
+        let t = state.timeline.tick()
+        state.timeline.advance(input(t), tick)
+    }
+}
+
+pub fn ticks(state: Game) -> u32 {
+    state.timeline.tick()
+}
+
+/// The whole world's checksum now, and the one recorded after tick `t`.
+pub fn checksum(state: Game) -> u64 {
+    state.timeline.checksum()
+}
+
+pub fn checksum_at(state: Game, t: u32) -> u64 {
+    state.timeline.checksum_at(t)
+}
+
+/// A correction for tick `t`: the player digs then, or (`dig` false) the input it had. How
+/// many replayed ticks' checksums changed.
+fn correct(state: mut Game, t: u32, dig: bool) -> u32 {
+    var i = input(t)
+    if dig {
+        i.dig = true
+    }
+    state.timeline.correct(t, i, tick)
+}
+
+/// Saves the world and loads it back: 1 if the loaded world's hash is the saved one's.
+fn save_and_load(state: Game) -> u32 {
+    let bytes = save_game(state.timeline.world())
+    match load_save(bytes) {
+        Ok(w) => if state_hash(w) == state.timeline.checksum() { 1 } else { 0 },
+        Err(_) => 2,
+    }
+}
+
+/// Loads a save with byte `at` changed: 0 if it loads, 1 if it isn't a save, 2 if it's from a
+/// version this build can't read, 3 if its fields don't read. Never a trap.
+fn load_corrupt(state: Game, at: u32) -> u32 {
+    var bytes = save_game(state.timeline.world())
+    if at < bytes.len() {
+        bytes[at] = bytes[at] ^ 0x5a
+    } else {
+        bytes.truncate(bytes.len() / 2)
+    }
+    match load_save(bytes) {
+        Ok(_) => 0,
+        Err(SaveError::NotASave) => 1,
+        Err(SaveError::Version(_)) => 2,
+        Err(SaveError::Corrupt(_)) => 3,
+    }
+}
+
+/// How many grazers flee, and how many edits the terrain has.
+fn census(state: Game) -> vec2 {
+    borrow w = state.timeline.world()
+    var fleeing = 0
+    for g in w.grazers {
+        if g.gait.mode == Mode::Flee {
+            fleeing += 1
+        }
+    }
+    vec2(f32(fleeing), f32(w.terrain.edits.len()))
+}
+
+/// §2 and §6 run: the first grazer spooked through a projection, the second scared through its
+/// handle. Their modes after (1 for `Flee`).
+fn projections(state: Game) -> vec2 {
+    var w = state.timeline.world().clone()
+    let a = w.grazers.handle_at(0)
+    let b = w.grazers.handle_at(1)
+    spook(mut w, a)
+    scare(mut w, b)
+    let flee = |h| if w.grazers[h].gait.mode == Mode::Flee { 1.0 } else { 0.0 }
+    vec2(flee(a), flee(b))
+}
+
+// ---- tests (`wrela test`) ---------------------------------------------------------------------
+
+/// §3 and §4: the engine's `Timeline` advances the world a tick at a time (40 grazers in a
+/// `par_each_mut`, reading spatial grids built at the tick's start), keeping a keyframe every
+/// 16 ticks and each tick's checksum. A correction restores a keyframe and replays: with the
+/// input the tick had, every replayed tick gives the checksum it gave the first time; with
+/// another, the world changes; and correcting back gives the first checksums again.
+@test
+fn the_timeline_rewinds_and_replays() {
+    var g = init()
+    // The player starts in the herd's middle, within 25 m of every grazer: they flee.
+    run(mut g, 10)
+    assert(census(g).x >= 30.0, "too few grazers flee")
+    run(mut g, 190)
+    var first: Vec<u64> = Vec::new()
+    for t in 0..200 {
+        first.push(checksum_at(g, t))
+    }
+    let end = checksum(g)
+    assert(end == first[199])
+    assert(correct(mut g, 150, dig: false) == 0, "replaying with the same input changed a checksum")
+    assert(checksum(g) == end)
+    assert(correct(mut g, 150, dig: true) >= 49, "too few replayed ticks changed")
+    assert(checksum(g) != end)
+    assert(correct(mut g, 150, dig: false) >= 49, "correcting back changed too few ticks")
+    for t in 0..200 {
+        assert(checksum_at(g, t) == first[t], "correcting back didn't give the first checksums")
+    }
+    assert(census(g).y == 6.0)
+}
+
+/// §6: a save written with the derived `Serialize` loads back to the same hash, and a corrupt
+/// one is an error, never a trap. And §2's projection and §6's `scare` work.
+@test
+fn saves_load_back_and_corrupt_ones_are_errors() {
+    var g = init()
+    run(mut g, 40)
+    assert(save_and_load(g) == 1)
+    var fields = 0
+    for k in 0..109 {
+        if load_corrupt(g, k * 37) == 3 {
+            fields += 1
+        }
+    }
+    assert(fields > 10)
+    assert(load_corrupt(g, 4294967295) != 0, "half a save loaded")
+    assert(projections(g) == vec2(1.0, 1.0))
+}

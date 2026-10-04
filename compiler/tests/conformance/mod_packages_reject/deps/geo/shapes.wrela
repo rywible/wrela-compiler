@@ -1,0 +1,15 @@
+pub struct Circle: Copy {
+    pub r: f32,
+}
+
+pub trait Area {
+    fn area(self) -> f32
+}
+
+fn secret(x: f32) -> f32 {
+    x
+}
+
+pub(package) fn squared(x: f32) -> f32 {
+    x * x
+}

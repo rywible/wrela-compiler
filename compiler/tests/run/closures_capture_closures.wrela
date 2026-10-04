@@ -1,0 +1,60 @@
+// run: a closure can capture another closure, which travels as its value, copies of its own
+// captures (language.md §6.7); derived gradients go through them
+// expect: twice_plus(3.0) = 7.0
+// expect: captured_values(2.0) = 7.0
+// expect: nested(1.0) = 1.5
+// expect: shape_union(2.0) = 0.25
+// expect: shape_union(0.0) = -0.5
+// expect: slope(2.0) = 1.0
+use std::derive::gradient
+
+trait Shape {
+    fn at(self, p: vec3) -> f32
+}
+
+impl<F: Copy + GpuData + fn(vec3) -> f32> Shape for F {
+    fn at(self, p: vec3) -> f32 {
+        self(p)
+    }
+}
+
+fn apply(f: fn(f32) -> f32, x: f32) -> f32 {
+    f(x)
+}
+
+pub fn twice_plus(x: f32) -> f32 {
+    let a = |y: f32| y * 2.0
+    let b = |y: f32| a(y) + 1.0
+    b(x)
+}
+
+pub fn captured_values(x: f32) -> f32 {
+    let k = 3.0
+    let a = |y: f32| y * k
+    let b = |y: f32| a(y) + 1.0
+    apply(b, x)
+}
+
+pub fn nested(x: f32) -> f32 {
+    let k = 0.5
+    let a = |y: f32| y + k
+    let b = |y: f32| a(y) * 2.0
+    let c = |y: f32| b(y) - a(y)
+    c(x)
+}
+
+pub fn shape_union(x: f32) -> f32 {
+    let r = 1.0
+    let ball = |p: vec3| length(p) - r
+    let slab = |p: vec3| abs(p.y) - 0.25
+    let both = |p: vec3| min(ball(p), slab(p))
+    both.at(vec3(x, 0.5, 0.0))
+}
+
+pub fn slope(x: f32) -> f32 {
+    let r = 1.0
+    let ball = |p: vec3| length(p) - r
+    let slab = |p: vec3| abs(p.y) - 0.25
+    let both = |p: vec3| min(ball(p), slab(p))
+    gradient(both, vec3(x, 0.5, 0.0)).y
+}

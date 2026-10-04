@@ -1,8 +1,46 @@
-// accepts: const.literal
+// accepts: const.build
+// A constant's value is any expression its effects allow: the build computes it (§10).
 const SIZE: u32 = 64
 const ORIGIN: vec3 = vec3(1.0, 2.0, 3.0)
 const TABLE: [f32; 3] = [0.5, 0.25, -0.125]
+const TWICE: u32 = twice(SIZE)
+const SINE = sin(0.5)
+const STEPS: Vec<f32> = steps(8)
+const NAME: Text = "grazer"
+const LONG = f"{NAME}s"
+const CHECKED: () = assert(SIZE > 0, "the size must be positive")
+const BLOCK: u32 = {
+    var n = 0
+    for i in 0..4 {
+        n += i
+    }
+    n
+}
+
+struct P: Copy {
+    a: f32,
+    b: f32,
+}
+
+fn make() -> P {
+    P { a: 7.0, b: 8.0 }
+}
+
+// `..base` and other expressions are part of the value.
+const D: P = P { a: 1.0, b: 2.0, ..make() }
+
+fn twice(x: u32) -> u32 {
+    2 * x
+}
+
+fn steps(n: u32) -> Vec<f32> {
+    var out = Vec::new()
+    for i in 0..n {
+        out.push(f32(i) / f32(n))
+    }
+    out
+}
 
 fn f() -> f32 {
-    f32(SIZE) + ORIGIN.y + TABLE[2]
+    f32(SIZE + TWICE + BLOCK) + ORIGIN.y + TABLE[2] + SINE + STEPS[3] + D.b + f32(LONG.len())
 }

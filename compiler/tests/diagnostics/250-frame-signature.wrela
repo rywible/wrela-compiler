@@ -1,0 +1,4 @@
+// mistake: an exported `frame` that leaves out the screen's size
+// expect: E0703
+// fix: no
+pub fn frame(time: f32) {}

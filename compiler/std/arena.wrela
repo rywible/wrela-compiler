@@ -1,0 +1,296 @@
+// Arenas and handles (language.md §6.8): how long-lived relationships are written. An
+// `Arena<T>` owns values; a `Handle<T>` names one of them by index and generation, is `Copy`
+// and `Plain`, and can be stored anywhere, saved and hashed. `arena[h]` projects the value
+// (borrow or `mut`, by context), and a handle whose value was removed panics there;
+// `arena.contains(h)` checks first.
+//
+// The values are kept one after another, so `for x in arena` walks them in a deterministic
+// order: the order they were inserted, except that removing one moves the last into its place.
+// Nothing depends on an address.
+
+use std::hash::StateHash
+use std::serialize::Serialize
+use std::collections::Pair
+
+/// A value in an `Arena<T>`: which slot, and which use of that slot.
+pub struct Handle<T>: Copy + Eq + Ord + StateHash + Serialize + Plain {
+    index: u32,
+    gen: u32,
+}
+
+impl<T> Handle<T> {
+    /// The slot's number, for display and debugging.
+    pub fn index(self) -> u32 {
+        self.index
+    }
+}
+
+/// A slot: its generation (odd while a value is in it), and where its value is (or, when it's
+/// free, the next free slot plus one).
+struct Slot: Copy + Eq + StateHash + Serialize {
+    gen: u32,
+    at: u32,
+}
+
+/// Values with handles. Iterates in a deterministic order (D-015).
+///
+/// ```wrela
+/// struct Grazer: Clone {
+///     age: f32,
+/// }
+///
+/// var herd: Arena<Grazer> = Arena::new()
+/// let h = herd.insert(Grazer { age: 0.0 })
+/// herd[h].age += 1.0
+/// for mut g in herd {
+///     g.age += 1.0
+/// }
+/// let gone = herd.remove(h)
+/// assert(gone.age == 2.0 && herd.is_empty())
+/// ```
+pub struct Arena<T>: Clone + StateHash + Serialize {
+    // The compiler indexes an arena in place: these fields, in this order.
+    values: Vec<T>,
+    slots: Vec<Slot>,
+    /// Each value's slot, by position.
+    owners: Vec<u32>,
+    /// The first free slot plus one; 0 when there's none.
+    free: u32,
+}
+
+impl<T> Arena<T> {
+    /// An empty arena.
+    pub fn new() -> Arena<T> {
+        Arena { values: Vec::new(), slots: Vec::new(), owners: Vec::new(), free: 0 }
+    }
+
+    /// How many values it holds.
+    pub fn len(self) -> u32 {
+        self.values.len()
+    }
+
+    /// Whether it holds no values.
+    pub fn is_empty(self) -> bool {
+        self.values.len() == 0
+    }
+
+    /// Adds `value`; its handle.
+    pub fn insert(mut self, value: take T) -> Handle<T> {
+        let at = self.values.len()
+        self.values.push(take value)
+        let index = if self.free != 0 {
+            let i = self.free - 1
+            self.free = self.slots[i].at
+            i
+        } else {
+            self.slots.push(Slot { gen: 0, at: 0 })
+            self.slots.len() - 1
+        }
+        let gen = self.slots[index].gen + 1
+        self.slots[index] = Slot { gen, at }
+        self.owners.push(index)
+        Handle { index, gen }
+    }
+
+    /// Whether `h`'s value is still here.
+    pub fn contains(self, h: Handle<T>) -> bool {
+        h.index < self.slots.len() && self.slots[h.index].gen == h.gen
+    }
+
+    /// Takes `h`'s value out. A handle whose value is gone panics.
+    pub fn remove(mut self, h: Handle<T>) -> T {
+        if !self.contains(h) {
+            panic("remove: the handle's value was removed")
+        }
+        let at = self.slots[h.index].at
+        // The last value moves into the hole.
+        let last = self.values.len() - 1
+        let moved = self.owners[last]
+        self.slots[moved].at = at
+        self.owners[at] = moved
+        let _ = self.owners.pop()
+        self.slots[h.index] = Slot { gen: h.gen + 1, at: self.free }
+        self.free = h.index + 1
+        self.values.swap_remove(at)
+    }
+
+    /// Removes every value. Every handle goes stale.
+    pub fn clear(mut self) {
+        while self.values.len() > 0 {
+            let h = self.handle_at(0)
+            let _ = self.remove(h)
+        }
+    }
+
+    /// The values of `a` and `b`, both to change at once. Exclusivity is checked here, at run
+    /// time (§6.5): two handles of one value panic, and so does a handle whose value was removed.
+    pub fn pair_mut(mut self, a: Handle<T>, b: Handle<T>) -> Pair<T> {
+        if !self.contains(a) || !self.contains(b) {
+            panic("pair_mut: a handle's value was removed")
+        }
+        if a.index == b.index {
+            panic("pair_mut: both handles name one value")
+        }
+        self.values.pair_mut(self.slots[a.index].at, self.slots[b.index].at)
+    }
+
+    /// The handle of the value at `position` in iteration order.
+    pub fn handle_at(self, position: u32) -> Handle<T> {
+        let index = self.owners[position]
+        Handle { index, gen: self.slots[index].gen }
+    }
+
+    /// Calls `f` on each value, which it may change, in parallel: `Vec::par_each_mut` over the
+    /// values in iteration order (§6.12).
+    pub fn par_each_mut(mut self, f: @parallel fn(mut T)) {
+        self.values.par_each_mut(f)
+    }
+
+    /// `map`s each value and `reduce`s the results, in parallel: `Vec::par_map_reduce` over the
+    /// values in iteration order (§6.12).
+    pub fn par_map_reduce<R: Clone>(
+        self,
+        init: R,
+        map: @parallel fn(T) -> R,
+        reduce: @parallel fn(R, R) -> R,
+    ) -> R {
+        self.values.par_map_reduce(init, map, reduce)
+    }
+
+    /// Every value's handle, in iteration order.
+    pub fn handles(self) -> Vec<Handle<T>> {
+        var out = Vec::with_capacity(self.values.len())
+        for i in 0..self.values.len() {
+            out.push(self.handle_at(i))
+        }
+        out
+    }
+}
+
+/// A map that keeps its keys sorted: it iterates in key order, whatever order the keys came
+/// in, so `@deterministic` code may use it. Lookups are a binary search.
+///
+/// ```wrela
+/// var scores: SortedMap<u32, f32> = SortedMap::new()
+/// let _ = scores.insert(3, 0.5)
+/// let _ = scores.insert(1, 0.25)
+/// assert(scores.keys()[0] == 1 && scores.at(3) == 0.5)
+/// ```
+pub struct SortedMap<K, V>: Clone + StateHash + Serialize {
+    keys: Vec<K>,
+    values: Vec<V>,
+}
+
+impl<K: Ord, V> SortedMap<K, V> {
+    /// An empty map.
+    pub fn new() -> SortedMap<K, V> {
+        SortedMap { keys: Vec::new(), values: Vec::new() }
+    }
+
+    /// How many keys it holds.
+    pub fn len(self) -> u32 {
+        self.keys.len()
+    }
+
+    /// Whether it holds no keys.
+    pub fn is_empty(self) -> bool {
+        self.keys.len() == 0
+    }
+
+    /// Where `key` is, or where it would go: `(position, found)`.
+    fn search(self, key: K) -> (u32, bool) {
+        var lo = 0
+        var hi = self.keys.len()
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2
+            let o = self.keys[mid].cmp(key)
+            if o == Ordering::Less {
+                lo = mid + 1
+            } else if o == Ordering::Greater {
+                hi = mid
+            } else {
+                return (mid, true)
+            }
+        }
+        (lo, false)
+    }
+
+    /// Puts `value` under `key`: what was there before, if anything.
+    pub fn insert(mut self, key: take K, value: take V) -> Option<V> {
+        let (at, found) = self.search(key)
+        if found {
+            return Some(replace(mut self.values[at], take value))
+        }
+        self.keys.insert(at, take key)
+        self.values.insert(at, take value)
+        None
+    }
+
+    /// Takes `key`'s value out, if it has one.
+    pub fn remove(mut self, key: K) -> Option<V> {
+        let (at, found) = self.search(key)
+        if !found {
+            return None
+        }
+        let _ = self.keys.remove(at)
+        Some(self.values.remove(at))
+    }
+
+    /// Whether `key` has a value.
+    pub fn contains(self, key: K) -> bool {
+        self.search(key).1
+    }
+
+    /// Where `key` is in key order, if it's there.
+    pub fn find(self, key: K) -> Option<u32> {
+        let (at, found) = self.search(key)
+        if found { Some(at) } else { None }
+    }
+
+    /// `key`'s value; a key that isn't there panics (`contains` checks first).
+    pub fn at(self, key: K) -> borrow V {
+        let (i, found) = self.search(key)
+        if !found {
+            panic("at: the key isn't in the map")
+        }
+        self.values[i]
+    }
+
+    /// `key`'s value, to change; a key that isn't there panics.
+    pub fn at_mut(mut self, key: K) -> mut V {
+        let (i, found) = self.search(key)
+        if !found {
+            panic("at_mut: the key isn't in the map")
+        }
+        mut self.values[i]
+    }
+
+    /// The keys, in order.
+    pub fn keys(self) -> [K] {
+        self.keys
+    }
+
+    /// The values, in their keys' order.
+    pub fn values(self) -> [V] {
+        self.values
+    }
+
+    /// The values, in their keys' order, to change.
+    pub fn values_mut(mut self) -> mut [V] {
+        mut self.values
+    }
+
+    /// Removes every key and its value.
+    pub fn clear(mut self) {
+        self.keys.clear()
+        self.values.clear()
+    }
+}
+
+impl<K: Ord, V: Clone> SortedMap<K, V> {
+    /// A copy of `key`'s value, if it has one.
+    pub fn get(self, key: K) -> Option<V> {
+        let (i, found) = self.search(key)
+        if found { Some(self.values[i].clone()) } else { None }
+    }
+}

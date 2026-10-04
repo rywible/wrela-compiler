@@ -1,0 +1,7 @@
+// mistake: a negative literal for a `u32`
+// expect: E0305
+// fix: no
+fn below() -> u32 {
+    let x: u32 = -1
+    x
+}

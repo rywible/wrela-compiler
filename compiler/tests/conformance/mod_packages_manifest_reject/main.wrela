@@ -1,0 +1,5 @@
+// rejects: mod.packages
+// A manifest has `[package]` and `[dependencies]`, with the keys they define.
+fn f() -> u32 {
+    1
+}

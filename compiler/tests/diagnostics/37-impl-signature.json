@@ -13,11 +13,11 @@
           "message": "the trait declares it here",
           "span": {
             "column": 5,
-            "end": 687,
+            "end": 1364,
             "end_column": 38,
-            "end_line": 13,
-            "line": 13,
-            "start": 654
+            "end_line": 29,
+            "line": 29,
+            "start": 1331
           }
         }
       ],
@@ -26,11 +26,11 @@
       "severity": "error",
       "span": {
         "column": 5,
-        "end": 238,
+        "end": 230,
         "end_column": 38,
         "end_line": 11,
         "line": 11,
-        "start": 205
+        "start": 197
       },
       "title": "an impl method whose signature differs from the trait's"
     }

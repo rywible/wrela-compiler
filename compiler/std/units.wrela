@@ -1,0 +1,61 @@
+// Units (language.md §5): constants in SI. A number with a unit suffix is the number times the
+// unit's constant, folded when the program is built: `15cm` is `15 * cm`, which is 0.15. Every
+// physical quantity is SI: metres, kilograms, seconds and radians. Compound units are
+// arithmetic on these: `1050 * kg/m**3`. A suffix finds its unit here whatever is in scope; to
+// use a unit as a value, import it: `use std::units::{kg, m}`.
+
+// Length, in metres.
+/// A kilometre: 1000 m.
+pub const km: f32 = 1000.0
+/// A metre: the SI unit of length.
+pub const m: f32 = 1.0
+/// A centimetre: 0.01 m.
+pub const cm: f32 = 0.01
+/// A millimetre: 0.001 m.
+pub const mm: f32 = 0.001
+/// A micrometre: 0.000001 m.
+pub const um: f32 = 0.000001
+
+// Mass, in kilograms.
+/// A tonne: 1000 kg.
+pub const t: f32 = 1000.0
+/// A kilogram: the SI unit of mass.
+pub const kg: f32 = 1.0
+/// A gram: 0.001 kg.
+pub const g: f32 = 0.001
+/// A milligram: 0.000001 kg.
+pub const mg: f32 = 0.000001
+
+// Time, in seconds.
+/// An hour: 3600 s.
+pub const h: f32 = 3600.0
+/// A second: the SI unit of time.
+pub const s: f32 = 1.0
+/// A millisecond: 0.001 s.
+pub const ms: f32 = 0.001
+/// A microsecond: 0.000001 s.
+pub const us: f32 = 0.000001
+
+// Angle, in radians (dimensionless, as in SI).
+/// A radian: the SI unit of angle.
+pub const rad: f32 = 1.0
+/// A degree: π/180 rad.
+pub const deg: f32 = 0.017453292519943295
+
+// Frequency, in hertz.
+/// A hertz: one cycle each second.
+pub const Hz: f32 = 1.0
+/// A kilohertz: 1000 Hz.
+pub const kHz: f32 = 1000.0
+
+// Derived units.
+/// A newton: the force that gives 1 kg an acceleration of 1 m/s².
+pub const N: f32 = 1.0
+/// A joule: the work of 1 N over 1 m.
+pub const J: f32 = 1.0
+/// A watt: 1 J each second.
+pub const W: f32 = 1.0
+/// A pascal: 1 N on each square metre.
+pub const Pa: f32 = 1.0
+/// A kilopascal: 1000 Pa.
+pub const kPa: f32 = 1000.0

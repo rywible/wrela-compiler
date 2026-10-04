@@ -1,4 +1,5 @@
-// Builds the runtime into a directory (default: dist/): main.js, worker.js and index.html.
+// Builds the runtime into a directory (default: dist/): main.js, worker.js, worklet.js and
+// index.html.
 // dist/ is checked in, so the compiler can embed the runtime without bun; `bun run check-dist`
 // fails when it's stale.
 //
@@ -14,7 +15,7 @@ export async function build(outDir: string): Promise<string[]> {
   rmSync(outDir, { recursive: true, force: true });
   mkdirSync(outDir, { recursive: true });
   const result = await Bun.build({
-    entrypoints: [join(ROOT, "src/main.ts"), join(ROOT, "src/worker.ts")],
+    entrypoints: [join(ROOT, "src/main.ts"), join(ROOT, "src/worker.ts"), join(ROOT, "src/worklet.ts")],
     outdir: outDir,
     target: "browser",
     format: "esm",

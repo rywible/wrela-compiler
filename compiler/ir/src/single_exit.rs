@@ -190,7 +190,9 @@ impl Cx<'_> {
                 variants.iter().all(|(_, p)| p.is_none_or(|p| self.holdable(p)))
             }
             TypeDef::Array(e, _) => self.holdable(*e),
-            TypeDef::RuntimeArray(_) | TypeDef::Run(_) | TypeDef::Ptr(_) => false,
+            TypeDef::RuntimeArray(_) | TypeDef::Run(_) | TypeDef::Ptr(_) | TypeDef::Atomic(_) => {
+                false
+            }
         }
     }
 

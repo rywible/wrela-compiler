@@ -1,0 +1,109 @@
+// Channels (AC5, language.md §17, D-002, D-026; compiler/tests/tests/suite/channels.rs): a
+// field's points carry a `Tissue`, whose `Blend` is derived field by field. Where two parts
+// blend, the colour and the roughness mix, the normal bias turns along the sphere, and the
+// material is taken whole from the part that weighs more.
+use std::field::{
+    Blend, Cat, Color, Field, Surface, UnitVec3, cat, rgb, round_cone, sphere, unit_vec3,
+}
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch}
+
+enum Material: Copy + GpuData {
+    Hide,
+    Keratin,
+}
+
+struct Tissue: Copy + GpuData + Blend {
+    albedo: Color,
+    roughness: f32,
+    bias: UnitVec3,
+    material: Cat<Material>,
+}
+
+const HIDE: Tissue = Tissue {
+    albedo: rgb(r: 0.42, g: 0.33, b: 0.24),
+    roughness: 0.7,
+    bias: UnitVec3 { v: vec3(0.0, 1.0, 0.0) },
+    material: Cat { value: Material::Hide },
+}
+
+const HOOF: Tissue = Tissue {
+    albedo: rgb(r: 0.12, g: 0.10, b: 0.09),
+    roughness: 0.35,
+    bias: UnitVec3 { v: vec3(1.0, 0.0, 0.0) },
+    material: Cat { value: Material::Keratin },
+}
+
+/// A body and a hoof, smoothly joined; the body's colour darkens with height.
+fn leg(seed: f32) -> Field<Tissue> {
+    let body = sphere(0.5).with_at(
+        |p| Tissue { albedo: rgb(0.42 - 0.1 * p.y * seed, g: 0.33, b: 0.24), ..HIDE },
+    )
+    let hoof = round_cone(
+        vec3(0.6, 0.0, 0.0),
+        vec3(0.9, 0.0, 0.0),
+        r_top: 0.2,
+        r_bottom: 0.15,
+    ).with(HOOF)
+    body.smooth_union(hoof, k: 0.2)
+}
+
+/// A point's channels, flattened: albedo, roughness, bias, material (0 hide, 1 keratin).
+struct Flat: Copy + GpuData {
+    albedo: vec3,
+    roughness: f32,
+    bias: vec3,
+    material: u32,
+}
+
+fn flat(t: Tissue) -> Flat {
+    let m = match t.material.value {
+        Material::Hide => 0,
+        Material::Keratin => 1,
+    }
+    Flat {
+        albedo: vec3(t.albedo.r, t.albedo.g, t.albedo.b),
+        roughness: t.roughness,
+        bias: t.bias.v,
+        material: m,
+    }
+}
+
+pub fn albedo_r(x: f32, y: f32, z: f32) -> f32 {
+    leg(1.0).channels(vec3(x, y, z)).albedo.r
+}
+
+pub fn roughness(x: f32, y: f32, z: f32) -> f32 {
+    leg(1.0).channels(vec3(x, y, z)).roughness
+}
+
+pub fn bias(x: f32, y: f32, z: f32) -> vec3 {
+    leg(1.0).channels(vec3(x, y, z)).bias.v
+}
+
+pub fn material(x: f32, y: f32, z: f32) -> u32 {
+    flat(leg(1.0).channels(vec3(x, y, z))).material
+}
+
+/// The same channels on the GPU, at points along the x axis, for comparison with the CPU's.
+@compute(64)
+fn channels_at<F: Field<Tissue>>(f: F, out: mut Slots<Flat>, id: GlobalId) {
+    out[id] = flat(f.channels(vec3(-0.6 + 1.6 * f32(id.x) / 64.0, 0.1, 0.0)))
+}
+
+pub struct Out {
+    gpu: GpuBuffer<Flat>,
+}
+
+pub fn init() -> Out {
+    var gpu: GpuBuffer<Flat> = buffer(64)
+    dispatch(channels_at.bind(f: leg(1.0), out: mut gpu), groups: 1)
+    Out { gpu }
+}
+
+/// The CPU's, at point `i` of the GPU's 64.
+pub fn cpu_at(i: u32) -> vec4 {
+    let c = flat(leg(1.0).channels(vec3(-0.6 + 1.6 * f32(i) / 64.0, 0.1, 0.0)))
+    vec4(c.albedo.x, c.roughness, c.bias.x, f32(c.material))
+}
+
+pub fn frame(state: mut Out, time: f32, width: u32, height: u32) {}

@@ -1,0 +1,288 @@
+// The gameplay paper test's four systems running together (compiler/tests/tests/suite/
+// sketches.rs). A scripted player drives the menus as a player would, clicking widgets found by
+// their text: equips a sword, moves and sorts stacks, changes a setting (saved by a storage
+// request), returns a ring through the dialogue, pulls a lever (a timer opens a gate two
+// seconds later), picks up wolf pelts (a quest stage completes, its reward given) and hands them
+// in. Each frame runs the UI, then one tick with the commands it made, and draws the UI.
+
+use dialogue::MIRA_START
+use engine::ui::{Pointer, Ui, render}
+use flags::{FLAG_NAMES, Flags, flag}
+use inventory::{Inventory, ItemStack, Player}
+use items::{ARROW, BREAD, GOLD, PELT, SILVER_RING, SWORD, item}
+use menus::{Command, Input, MenuCtx, Menus, Screen, Settings, draw_ui}
+use quests::{QUESTS, fresh}
+use std::arena::{Arena, Handle}
+use std::hash::state_hash
+use std::serialize::{load, save}
+use world::{Gate, Lever, Pickup, TickInput, World, tick}
+
+/// What the scripted player does next.
+enum Step: Clone {
+    /// Presses Escape.
+    Escape,
+    /// Clicks the widget showing this text.
+    Click(Text),
+    /// Drags from one widget to another.
+    Drag(Text, Text),
+    /// Does something in the world: walks to Mira, pulls the lever, walks over a pelt.
+    Do(Command),
+    /// Waits this many frames.
+    Wait(u32),
+}
+
+struct Script {
+    steps: Vec<Step>,
+    at: u32,
+    phase: u32,
+    waited: u32,
+    /// Steps given up on: a widget that never appeared.
+    stuck: u32,
+}
+
+const IDLE: Pointer = Pointer {
+    pos: vec2(-1.0, -1.0),
+    down: false,
+    pressed: false,
+    released: false,
+}
+
+impl Script {
+    fn done(self) -> bool {
+        self.at >= self.steps.len()
+    }
+
+    fn advance(mut self) {
+        self.at += 1
+        self.phase = 0
+        self.waited = 0
+    }
+
+    /// Where `text` is, or, after 20 frames without it, gives the step up.
+    fn locate(mut self, ui: Ui, text: Text) -> Option<vec2> {
+        let at = ui.find(text)
+        if at.is_none() {
+            self.waited += 1
+            if self.waited > 20 {
+                self.stuck += 1
+                self.advance()
+            }
+        }
+        at
+    }
+
+    /// This frame's pointer, keys and command.
+    fn next(mut self, ui: Ui) -> (Pointer, Input, Option<Command>) {
+        var input = Input { escape: false }
+        if self.done() {
+            return (IDLE, input, None)
+        }
+        match self.steps[self.at] {
+            Step::Escape => {
+                input.escape = true
+                self.advance()
+                (IDLE, input, None)
+            },
+            Step::Click(text) => {
+                let Some(at) = self.locate(ui, text) else { return (IDLE, input, None) }
+                if self.phase == 0 {
+                    self.phase = 1
+                    (Pointer { pos: at, down: true, pressed: true, released: false }, input, None)
+                } else {
+                    self.advance()
+                    (Pointer { pos: at, down: false, pressed: false, released: true }, input, None)
+                }
+            },
+            Step::Drag(from, to) => {
+                let target = if self.phase == 0 { from } else { to }
+                let Some(at) = self.locate(ui, target) else { return (IDLE, input, None) }
+                if self.phase == 0 {
+                    self.phase = 1
+                    (Pointer { pos: at, down: true, pressed: true, released: false }, input, None)
+                } else if self.phase == 1 {
+                    self.phase = 2
+                    (Pointer { pos: at, down: true, pressed: false, released: false }, input, None)
+                } else {
+                    self.advance()
+                    (Pointer { pos: at, down: false, pressed: false, released: true }, input, None)
+                }
+            },
+            Step::Do(c) => {
+                self.advance()
+                (IDLE, input, Some(c))
+            },
+            Step::Wait(n) => {
+                self.waited += 1
+                if self.waited >= n {
+                    self.advance()
+                }
+                (IDLE, input, None)
+            },
+        }
+    }
+}
+
+pub struct Game {
+    world: World,
+    menus: Menus,
+    ui: Ui,
+    script: Script,
+}
+
+fn stack(item: items::ItemId, count: u32) -> Option<ItemStack> {
+    Some(ItemStack { item, count })
+}
+
+pub fn init() -> Game {
+    var bag = Inventory::new()
+    bag.slots[0] = stack(ARROW, 20)
+    bag.slots[1] = stack(SWORD, 1)
+    bag.slots[2] = stack(BREAD, 3)
+    bag.slots[3] = stack(SILVER_RING, 1)
+    bag.slots[5] = stack(item("leather_cap"), 1)
+    var gates: Arena<Gate> = Arena::new()
+    let gate = gates.insert(Gate { open: false })
+    var levers: Arena<Lever> = Arena::new()
+    let lever = levers.insert(Lever { gate })
+    var pickups: Arena<Pickup> = Arena::new()
+    var pelts: Vec<Handle<Pickup>> = Vec::new()
+    for i in 0..3 {
+        pelts.push(pickups.insert(Pickup { item: PELT, count: 1, pos: vec3(f32(i), 0.0, 5.0) }))
+    }
+    let world = World {
+        tick: 0,
+        player: Player {
+            pos: vec3(0.0),
+            health: 80.0,
+            max_carry: 40.0,
+            bag: take bag,
+            worn: [None; 6],
+        },
+        flags: Flags::new(),
+        talk: None,
+        quests: fresh(),
+        timers: engine::timers::Timers::new(),
+        events: Vec::new(),
+        gates: take gates,
+        levers: take levers,
+        pickups: take pickups,
+    }
+    var steps: Vec<Step> = Vec::new()
+    steps.push(Step::Escape)
+    steps.push(Step::Click("Inventory"))
+    steps.push(Step::Click("Iron Sword")) // equips it
+    steps.push(Step::Drag("Arrow x20", "Bread x3")) // swaps two stacks
+    steps.push(Step::Click("Sort"))
+    steps.push(Step::Click("Back"))
+    steps.push(Step::Click("Settings"))
+    steps.push(Step::Click("Subtitles")) // off
+    steps.push(Step::Click("Back")) // saves the settings: a storage request
+    steps.push(Step::Click("Resume"))
+    steps.push(Step::Do(Command::Talk))
+    steps.push(Step::Click("I found this ring."))
+    steps.push(Step::Click("Glad to help."))
+    steps.push(Step::Do(Command::PullLever(lever)))
+    for p in pelts {
+        steps.push(Step::Do(Command::PickUp(p)))
+        steps.push(Step::Wait(3))
+    }
+    steps.push(Step::Wait(130)) // the gate opens two seconds after the lever
+    steps.push(Step::Do(Command::Talk))
+    steps.push(Step::Click("Any work around here?"))
+    steps.push(Step::Click("I have them."))
+    steps.push(Step::Click("Goodbye."))
+    let menus = Menus {
+        screen: Screen::Playing,
+        settings: Settings {},
+        saving: None,
+        saved: 0,
+        error: None,
+    }
+    Game {
+        world,
+        menus,
+        ui: Ui::new(),
+        script: Script { steps, at: 0, phase: 0, waited: 0, stuck: 0 },
+    }
+}
+
+pub fn frame(state: mut Game, time: f32, width: u32, height: u32) {
+    let (pointer, input, command) = state.script.next(state.ui)
+    state.ui.begin(vec2(f32(width), f32(height)), pointer)
+    var cmds: Vec<Command> = Vec::new()
+    if let Some(c) = command {
+        cmds.push(c)
+    }
+    draw_ui(
+        MenuCtx { ui: mut state.ui, menus: mut state.menus, world: state.world, cmds: mut cmds },
+        input,
+    )
+    tick(mut state.world, TickInput { commands: take cmds })
+    render(state.ui, clear: vec4(0.2, 0.25, 0.2, 1.0))
+}
+
+// ---- tests (`wrela test`) ------------------------------------------------------------------------
+
+/// Whether the script is done, and how many of its steps were given up on.
+fn script(state: Game) -> vec2 {
+    vec2(if state.script.done() { 1.0 } else { 0.0 }, f32(state.script.stuck))
+}
+
+/// Gold, pelts, bread, and the sword's place (4: worn in the main hand).
+fn bag(state: Game) -> vec4 {
+    borrow p = state.world.player
+    let sword_worn = if let Some(s) = p.worn[4] { if s.item == SWORD { 4.0 } else { 0.0 } } else {
+        0.0
+    }
+    vec4(f32(p.bag.count(GOLD)), f32(p.bag.count(PELT)), f32(p.bag.count(BREAD)), sword_worn)
+}
+
+/// How many flags are set, how many quests are done (of how many), and whether the gate is
+/// open.
+fn progress(state: Game) -> vec4 {
+    borrow w = state.world
+    var set = 0
+    for i in 0..FLAG_NAMES.len() {
+        if w.flags.get(flags::FlagId { index: i }) {
+            set += 1
+        }
+    }
+    var done = 0
+    for q in w.quests {
+        if q.done {
+            done += 1
+        }
+    }
+    var open = 0.0
+    for g in w.gates {
+        if g.open {
+            open = 1.0
+        }
+    }
+    vec4(f32(set), f32(done), f32(QUESTS.len()), open)
+}
+
+/// Settings saves finished, and whether subtitles are on.
+fn settings(state: Game) -> vec2 {
+    vec2(f32(state.menus.saved), if state.menus.settings.subtitles { 1.0 } else { 0.0 })
+}
+
+/// The paper test's four systems (an inventory, a dialogue tree, a menu and HUD, and timers
+/// with events), each change from the paper test noted beside its code. A scripted player
+/// clicks through the menus by the widgets' text: equips the sword, swaps and sorts stacks,
+/// turns subtitles off (saved by a storage request), returns the ring to Mira (50 gold), pulls
+/// a lever (a timer opens the gate two seconds later), picks up three wolf pelts (a quest
+/// stage: 20 gold) and hands them in (the next: 2 bread). The world ends as the script says,
+/// and a save of it loads back to the same hash.
+@test(frames: 360)
+fn the_script_plays_through(game: Game) {
+    assert(script(game) == vec2(1.0, 0.0), "the script didn't finish, or gave steps up")
+    assert(bag(game) == vec4(70.0, 0.0, 5.0, 4.0), "gold, pelts, bread and the sword")
+    assert(progress(game) == vec4(4.0, 2.0, 2.0, 1.0), "flags, quests and the gate")
+    assert(settings(game) == vec2(1.0, 0.0), "the settings' save and subtitles")
+    let back = match load::<World>(save(game.world)) {
+        Ok(w) => state_hash(w),
+        Err(_) => 0,
+    }
+    assert(state_hash(game.world) == back, "a save didn't load back to the same world")
+}

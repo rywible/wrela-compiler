@@ -1,0 +1,8 @@
+# key | name | kind | kg | stack | gold | slot
+iron_sword  | Iron Sword  | weapon   | 3.2  | 1   | 40 | main_hand
+leather_cap | Leather Cap | armor    | 0.4  | 1   | 12 | head
+silver_ring | Silver Ring | quest    | 0.01 | 1   | 0  | none
+arrow       | Arrow       | material | 0.02 | 99  | 1  | none
+gold_coin   | Gold Coin   | material | 0.01 | 999 | 1  | none
+wolf_pelt   | Wolf Pelt   | material | 1.5  | 10  | 6  | none
+bread       | Bread       | food     | 0.3  | 20  | 2  | none

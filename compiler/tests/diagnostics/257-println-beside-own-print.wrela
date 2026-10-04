@@ -1,0 +1,11 @@
+// mistake: `println!` in a module that has a `print` of its own
+// expect: E0115
+// fix: yes
+fn print(x: f32) -> f32 {
+    x
+}
+
+fn step(speed: f32) -> f32 {
+    println!("speed is {}", speed)
+    speed * 2.0
+}

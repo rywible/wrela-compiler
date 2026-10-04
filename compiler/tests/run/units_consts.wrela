@@ -1,0 +1,13 @@
+// run: unit literals in constants: a ramp's slope
+// expect: slope() = 0.29166666
+
+use std::units::{cm, m}
+
+const RAMP_LENGTH = 1.2m
+const RAMP_HEIGHT = 35cm
+
+pub fn slope() -> f32 {
+    RAMP_HEIGHT / RAMP_LENGTH
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

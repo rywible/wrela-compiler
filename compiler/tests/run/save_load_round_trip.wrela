@@ -1,0 +1,32 @@
+// run: a derived `Serialize` saves a value, and what it loads back has the same hash
+// expect: round_trip() = true
+
+use std::hash::{Hasher, StateHash}
+use std::serialize::{LoadError, Serialize, load, save}
+
+struct Save: Clone + Serialize + StateHash {
+    day: u32,
+    gold: f32,
+    items: Vec<u32>,
+}
+
+fn hash_of(s: Save) -> u64 {
+    var h = Hasher::new()
+    s.state_hash(mut h)
+    h.finish()
+}
+
+pub fn round_trip() -> bool {
+    var items: Vec<u32> = Vec::new()
+    items.push(4)
+    items.push(9)
+    let s = Save { day: 12, gold: 30.5, items: take items }
+    let bytes = save(s.clone())
+    let back: Result<Save, LoadError> = load(take bytes)
+    match back {
+        Ok(b) => hash_of(b) == hash_of(s),
+        Err(_) => false,
+    }
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

@@ -3,7 +3,7 @@
 // fix: yes
 use std::gpu::{GlobalId, Slots}
 
-struct Params: Copy + Clone {
+struct Params: Copy {
     scale: f32,
 }
 

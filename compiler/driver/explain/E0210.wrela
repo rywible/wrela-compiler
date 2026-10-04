@@ -1,0 +1,26 @@
+// A field that isn't `pub` is read or written from another module. A struct's fields are
+// private to its module unless they're declared `pub`.
+// ---- wrong
+use shapes::Ball
+
+fn unit_ball() -> Ball {
+    Ball { radius: 1.0 }
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- file shapes.wrela
+pub struct Ball {
+    radius: f32,
+}
+// ---- fixed
+use shapes::Ball
+
+fn unit_ball() -> Ball {
+    Ball { radius: 1.0 }
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- file shapes.wrela
+pub struct Ball {
+    pub radius: f32,
+}

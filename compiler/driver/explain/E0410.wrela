@@ -1,0 +1,30 @@
+// A trait used as the type of a value: a field, a local, an element. A trait isn't a type
+// (wrela has no trait objects): make the struct generic over it, or use an enum.
+// ---- wrong
+trait Shape {
+    fn area(self) -> f32
+}
+
+struct Square {
+    side: f32,
+}
+
+struct Holder {
+    s: Shape,
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+trait Shape {
+    fn area(self) -> f32
+}
+
+struct Square {
+    side: f32,
+}
+
+struct Holder<S: Shape> {
+    s: S,
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

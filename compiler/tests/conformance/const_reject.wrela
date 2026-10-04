@@ -1,30 +1,22 @@
-// rejects: const.literal
-fn twice(x: u32) -> u32 {
-    2 * x
-}
-
-const SIZE: u32 = twice(32) //~ E0906
+// rejects: const.build
+use std::gpu::{GpuBuffer, buffer}
 
 const A: u32 = B //~ E0328
 const B: u32 = A
 const C: u32 = C //~ E0328
 
-struct P: Copy + Clone {
-    a: f32,
-    b: f32,
-}
-
-fn make() -> P {
-    P { a: 7.0, b: 8.0 }
-}
-
-// `..base` is part of the value even when every field is given.
-const D: P = P { a: 1.0, b: 2.0, ..make() } //~ E0906
-
-// A closure isn't a literal: the constant is rejected, and its uses add nothing to that.
-const PICK = || 1 //~ E0906
+// A constant is an owned value that lives as long as the program: not a closure.
+const PICK = || 1 //~ E0332
 
 fn picked() -> i32 {
     let p = PICK
     p()
+}
+
+// Its effects can't record GPU work (`host`): the error is where the program's own code does.
+const RECORDED: u32 = recorded()
+
+fn recorded() -> u32 {
+    let b: GpuBuffer<f32> = buffer(4) //~ E0600
+    4
 }

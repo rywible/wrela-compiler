@@ -1,6 +1,3 @@
 // rejects: attr.closed
 @inline //~ E0204
 fn a() {}
-
-@deterministic //~ E0903
-fn b() {}

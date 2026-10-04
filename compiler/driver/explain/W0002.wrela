@@ -1,0 +1,22 @@
+// A `match` arm that can't run: an arm before it already matches everything it would. Remove
+// it, or move it before the arm that covers it.
+// ---- wrong
+fn speed(mood: u32) -> f32 {
+    match mood {
+        0 => 1.0,
+        _ => 2.0,
+        1 => 6.0,
+    }
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+fn speed(mood: u32) -> f32 {
+    match mood {
+        0 => 1.0,
+        1 => 6.0,
+        _ => 2.0,
+    }
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

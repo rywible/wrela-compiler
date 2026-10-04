@@ -10,29 +10,56 @@ fn words(ws: &[u32]) -> Vec<u8> {
 #[test]
 fn golden_bytes() {
     let batch = crate::vectors::golden_batch();
+    let f = |x: f32| x.to_bits();
     let mut expected = Vec::new();
     expected.extend_from_slice(b"WRCS");
-    expected.extend(words(&[VERSION, 164]));
-    expected.extend(words(&[1, 8, 7, 16])); // CreateBuffer
-    expected.extend(words(&[2, 20, 7, 4, 8])); // WriteBuffer
-    expected.extend([1, 2, 3, 4, 5, 6, 7, 8]);
-    expected.extend(words(&[3, 32, 0, 2, 1, 1, 1, 7, 4])); // Dispatch
-    expected.extend([0xAA, 0xBB, 0xCC, 0xDD]);
-    expected.extend(words(&[4, 16, 0, 0x3F00_0000, 0x3F80_0000, 0x3F80_0000])); // BeginScreenPass
-    expected.extend(words(&[5, 28, 1, 3, 1, 0, 8, 1, 2])); // Draw
-    expected.extend(words(&[6, 0])); // Present
-    expected.extend(words(&[7, 4, 7])); // DestroyBuffer
+    let body: Vec<u8> = [
+        words(&[1, 8, 7, 16]),    // CreateBuffer
+        words(&[2, 20, 7, 4, 8]), // WriteBuffer
+        vec![1, 2, 3, 4, 5, 6, 7, 8],
+        words(&[3, 40, 0, 2, 1, 1, 1, 7, 0, 16, 4]), // Dispatch
+        vec![0xAA, 0xBB, 0xCC, 0xDD],
+        words(&[4, 16, 0, f(0.5), f(1.0), f(1.0)]), // BeginScreenPass
+        words(&[5, 28, 1, 3, 1, 0, 8]),             // Draw
+        vec![1, 0, 0, 0, 2, 0, 0, 0],
+        words(&[6, 0]),                     // Present
+        words(&[7, 4, 7]),                  // DestroyBuffer
+        words(&[8, 20, 1, 4, 2, 8, 12]),    // CopyBuffer
+        words(&[9, 16, 8, 2, 1, 0]),        // CreateTexture
+        words(&[10, 32, 8, 0, 0, 2, 1, 8]), // WriteTexture
+        vec![1, 2, 3, 4, 5, 6, 7, 8],
+        words(&[11, 4, 8]),                                    // DestroyTexture
+        words(&[12, 16, 10, 1, 0, 1]),                         // CreateSampler
+        words(&[13, 4, 10]),                                   // DestroySampler
+        words(&[14, 36, 8, 0, 0, 0, 0, f(1.0), 9, 0, f(1.0)]), // BeginPass
+        words(&[15, 0]),                                       // EndPass
+        words(&[16, 32, 0, 3, 4, 1, 5, 0, 0, 0]),              // DispatchIndirect
+        words(&[17, 20, 1, 3, 16, 0, 0]),                      // DrawIndirect
+        words(&[18, 16, 1, 3, 0, 8]),                          // ReadBuffer
+        words(&[19, 20, 2, 11]),                               // StorageRead
+        b"saves/slot1\0".to_vec(),
+        words(&[20, 28, 3, 7, 5]), // StorageWrite
+        b"saves/a\0".to_vec(),
+        vec![1, 2, 3, 4, 5, 0, 0, 0],
+        words(&[21, 24, 4, 14]), // Fetch
+        b"data/level.bin\0\0".to_vec(),
+        words(&[22, 28, 22]), // Log
+        "frame 3: 2 grazers, é\0\0".as_bytes().to_vec(),
+    ]
+    .concat();
+    expected.extend(words(&[VERSION, body.len() as u32]));
+    expected.extend(&body);
     assert_eq!(batch, expected);
-    assert_eq!(batch.len(), HEADER_LEN + 164);
 }
 
 #[test]
 fn decodes_what_it_encodes() {
+    let b = |h| Binding::range(h, 0, 64);
     let batch = Encoder::new()
         .create_buffer(1, 64)
-        .dispatch(2, [4, 2, 1], &[1, 3], &[9, 9, 9, 9])
+        .dispatch(2, [4, 2, 1], &[b(1), b(3)], &[9, 9, 9, 9])
         .begin_screen_pass([0.25, 0.5, 0.75, 1.0])
-        .draw(0, 3, 2, &[1], &[])
+        .draw(0, 3, 2, &[b(1)], &[])
         .present()
         .finish();
     let cmds = decode(&batch).expect("valid");
@@ -43,7 +70,7 @@ fn decodes_what_it_encodes() {
             Command::Dispatch {
                 pipeline: 2,
                 groups: [4, 2, 1],
-                buffers: vec![1, 3],
+                bindings: vec![b(1), b(3)],
                 uniforms: &[9, 9, 9, 9]
             },
             Command::BeginScreenPass { clear: [0.25, 0.5, 0.75, 1.0] },
@@ -51,7 +78,7 @@ fn decodes_what_it_encodes() {
                 pipeline: 0,
                 vertices: 3,
                 instances: 2,
-                buffers: vec![1],
+                bindings: vec![b(1)],
                 uniforms: &[]
             },
             Command::Present,
@@ -60,6 +87,17 @@ fn decodes_what_it_encodes() {
     let mut seq = Sequencer::new();
     for c in &cmds {
         seq.step(c).expect("in order");
+    }
+}
+
+/// Every command the golden batch holds decodes to what was encoded.
+#[test]
+fn the_golden_batch_round_trips() {
+    let batch = crate::vectors::golden_batch();
+    let cmds = decode(&batch).expect("valid");
+    assert_eq!(cmds.len(), Opcode::ALL.len());
+    for (c, op) in cmds.iter().zip(Opcode::ALL) {
+        assert_eq!(c.opcode(), op);
     }
 }
 
@@ -100,7 +138,7 @@ fn sequencing_rules() {
             pipeline: 0,
             vertices: 3,
             instances: 1,
-            buffers: vec![],
+            bindings: vec![],
             uniforms: &[]
         })
         .is_err()
@@ -109,7 +147,7 @@ fn sequencing_rules() {
     s.step(&Command::BeginScreenPass { clear: [0.0; 4] }).expect("open");
     assert!(s.step(&Command::BeginScreenPass { clear: [0.0; 4] }).is_err());
     assert!(
-        s.step(&Command::Dispatch { pipeline: 0, groups: [1; 3], buffers: vec![], uniforms: &[] })
+        s.step(&Command::Dispatch { pipeline: 0, groups: [1; 3], bindings: vec![], uniforms: &[] })
             .is_err()
     );
     assert!(s.step(&Command::CreateBuffer { handle: 0, size: 4 }).is_err());

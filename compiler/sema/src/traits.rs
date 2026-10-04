@@ -10,6 +10,24 @@ use std::collections::HashMap;
 /// Matches `pattern` (which may mention `vars`) against `ty`, binding `vars` in `subst`.
 pub fn match_ty(p: &Program, pattern: TyId, ty: TyId, vars: &[ParamId], subst: &mut Subst) -> bool {
     if pattern == ty {
+        // The same type: each of `vars` in it stands for itself. (Inside an impl, `Self` is
+        // the impl's own type, which matches it this way.)
+        let mut found = Vec::new();
+        p.types.any(pattern, &mut |k| {
+            if let TyKind::Param(v) = k
+                && vars.contains(v)
+            {
+                found.push(*v);
+            }
+            false
+        });
+        for v in found {
+            match subst.get(v) {
+                Some(bound) if bound != p.types.param(v) => return false,
+                Some(_) => {}
+                None => subst.insert(v, p.types.param(v)),
+            }
+        }
         return true;
     }
     let (pk, tk) = (p.types.kind(pattern), p.types.kind(ty));
@@ -37,6 +55,14 @@ pub fn match_ty(p: &Program, pattern: TyId, ty: TyId, vars: &[ParamId], subst: &
             a.iter().zip(b).all(|(&x, &y)| match_ty(p, x, y, vars, subst))
         }
         (TyKind::Array(a, n), TyKind::Array(b, m)) if n == m => match_ty(p, *a, *b, vars, subst),
+        // `[T; N]` with `const N` matches any length.
+        (TyKind::ArrayN(a, n), TyKind::Array(b, m)) => {
+            let len = p.types.intern(TyKind::ConstU32(*m));
+            match_ty(p, *a, *b, vars, subst) && match_ty(p, *n, len, vars, subst)
+        }
+        (TyKind::ArrayN(a, n), TyKind::ArrayN(b, m)) => {
+            match_ty(p, *a, *b, vars, subst) && match_ty(p, *n, *m, vars, subst)
+        }
         (TyKind::Slice(a), TyKind::Slice(b)) => match_ty(p, *a, *b, vars, subst),
         _ => false,
     }
@@ -58,6 +84,8 @@ pub fn could_unify(p: &Program, a: TyId, b: TyId) -> bool {
         (TyKind::Adt(x, xs), TyKind::Adt(y, ys)) => x == y && could_unify_all(p, xs, ys),
         (TyKind::Tuple(xs), TyKind::Tuple(ys)) => could_unify_all(p, xs, ys),
         (TyKind::Array(x, n), TyKind::Array(y, m)) => n == m && could_unify(p, *x, *y),
+        (TyKind::ArrayN(x, _), TyKind::Array(y, _) | TyKind::ArrayN(y, _))
+        | (TyKind::Array(x, _), TyKind::ArrayN(y, _)) => could_unify(p, *x, *y),
         (TyKind::Slice(x), TyKind::Slice(y)) => could_unify(p, *x, *y),
         _ => false,
     }
@@ -103,6 +131,14 @@ fn meet(p: &Program, a: TyId, b: TyId, bound: &mut HashMap<ParamId, TyId>, depth
                 && xs.iter().zip(ys).all(|(&s, &t)| meet(p, s, t, bound, depth + 1))
         }
         (TyKind::Array(x, n), TyKind::Array(y, m)) => n == m && meet(p, *x, *y, bound, depth + 1),
+        (TyKind::ArrayN(x, n), TyKind::ArrayN(y, m)) => {
+            meet(p, *x, *y, bound, depth + 1) && meet(p, *n, *m, bound, depth + 1)
+        }
+        (TyKind::ArrayN(x, n), &TyKind::Array(y, m))
+        | (&TyKind::Array(y, m), TyKind::ArrayN(x, n)) => {
+            let len = p.types.intern(TyKind::ConstU32(m));
+            meet(p, *x, y, bound, depth + 1) && meet(p, *n, len, bound, depth + 1)
+        }
         (TyKind::Slice(x), TyKind::Slice(y)) => meet(p, *x, *y, bound, depth + 1),
         _ => false,
     }
@@ -167,22 +203,63 @@ fn impl_for(p: &Program, i: ImplId, ty: TyId, r: &TraitRef) -> Option<Subst> {
     let bounds_ok = imp.generics.iter().all(|&g| {
         let arg = subst.get(g).unwrap_or(p.types.error);
         p.param(g).bounds.iter().all(|b| implements(p, arg, &b.subst(&p.types, &subst)))
+            && p.param(g).fn_bound.is_none_or(|b| fits_fn_bound(p, arg, p.types.subst(b, &subst)))
     });
-    // An opted-in builtin trait is conditional on the fields.
+    // An opted-in builtin trait is conditional on the fields, and so is a `@fieldwise` one.
     let structural_ok = if imp.from_opt_in
-        && let Some(l) = p.trait_(r.trait_).lang
+        && let Some(l) = p.trait_(r.trait_).lang.filter(|l| l.is_structural())
     {
         implements_builtin(p, ty, l)
+    } else if imp.from_opt_in && p.trait_(r.trait_).fieldwise {
+        implements_fieldwise(p, ty, r)
     } else {
         true
     };
     (bounds_ok && structural_ok).then_some(subst)
 }
 
+/// Whether `ty` can be called as function type `bound` (`F: fn(vec3) -> f32`): a closure,
+/// function or function type of that many parameters, of types that could be the bound's, or
+/// a parameter with the same bound. A closure not checked yet fits (its call is checked where
+/// it's made).
+pub fn fits_fn_bound(p: &Program, ty: TyId, bound: TyId) -> bool {
+    let TyKind::FnPtr(want, want_ret, _) = p.types.kind(bound) else { return false };
+    let (params, ret) = match p.types.kind(ty) {
+        TyKind::FnPtr(ps, r, _) => (ps.clone(), *r),
+        TyKind::FnDef(f, args) => {
+            let subst = Subst::from_pairs(&p.fn_all_generics(*f), args);
+            let def = p.func(*f);
+            let ps = def.params.iter().map(|q| p.types.subst(q.ty, &subst)).collect();
+            (ps, p.types.subst(def.ret, &subst))
+        }
+        TyKind::Closure(c, env) => {
+            let Some((ps, r)) = p.closure_sigs.borrow().get(c).cloned() else { return true };
+            let generics = c.owner.map(|f| p.fn_all_generics(f)).unwrap_or_default();
+            let subst = Subst::from_pairs(&generics, env);
+            (ps.iter().map(|&t| p.types.subst(t, &subst)).collect(), p.types.subst(r, &subst))
+        }
+        TyKind::Param(g) => {
+            return p.param(*g).fn_bound.is_some_and(|b| could_unify(p, b, bound));
+        }
+        TyKind::Error => return true,
+        _ => return false,
+    };
+    params.len() == want.len()
+        && params.iter().zip(want).all(|(&a, &b)| could_unify(p, a, b))
+        && could_unify(p, ret, *want_ret)
+}
+
 /// The arguments with which `ty` implements trait `t`: one list for each impl of `t` whose
 /// self type matches `ty` and that applies (or whose arguments another impl gives). `ty` is
 /// concrete: it has no declared bounds.
 pub fn impl_args(p: &Program, ty: TyId, t: TraitId) -> Vec<Vec<TyId>> {
+    impl_args_at(p, ty, t, 0)
+}
+
+/// How deep [`impl_args`] goes through bounds that solve an impl's parameters.
+const IMPL_ARGS_DEPTH: u32 = 16;
+
+fn impl_args_at(p: &Program, ty: TyId, t: TraitId, depth: u32) -> Vec<Vec<TyId>> {
     let structural = p.trait_(t).lang.is_some_and(|l| l.is_structural());
     let mut out: Vec<Vec<TyId>> = Vec::new();
     for &i in p.impls_of(t) {
@@ -190,6 +267,9 @@ pub fn impl_args(p: &Program, ty: TyId, t: TraitId) -> Vec<Vec<TyId>> {
         let mut subst = Subst::new();
         if !match_ty(p, imp.self_ty, ty, &imp.generics, &mut subst) {
             continue;
+        }
+        if depth < IMPL_ARGS_DEPTH {
+            solve_from_bounds(p, &imp.generics, &mut subst, depth);
         }
         let args =
             imp.trait_ref.as_ref().map(|r| r.subst(&p.types, &subst).args).unwrap_or_default();
@@ -202,6 +282,54 @@ pub fn impl_args(p: &Program, ty: TyId, t: TraitId) -> Vec<Vec<TyId>> {
         }
     }
     out
+}
+
+/// Solves the parameters of an impl (`generics`) that its self type leaves open from their
+/// bounds, as a function's are (language.md §7): in `impl<C, F: Field<C>> Field<C> for
+/// Masked<F>`, `F` is known from the self type, and when it implements `Field` one way, that
+/// gives `C`.
+fn solve_from_bounds(p: &Program, generics: &[ParamId], subst: &mut Subst, depth: u32) {
+    let open = |subst: &Subst, t: TyId| {
+        p.types.any(t, &mut |k| matches!(k, TyKind::Param(g) if generics.contains(g) && subst.get(*g).is_none()))
+    };
+    loop {
+        let mut progress = false;
+        for &g in generics {
+            let Some(arg) = subst.get(g) else { continue };
+            for b in &p.param(g).bounds {
+                if !b.args.iter().any(|&a| open(subst, a)) {
+                    continue;
+                }
+                // How `arg` has the trait: as declared (a generic parameter's bound, an opaque
+                // type's traits), or by its impls when it's concrete.
+                let mut ways: Vec<Vec<TyId>> = match declared_bounds(p, arg) {
+                    Some(bounds) => bounds
+                        .into_iter()
+                        .filter(|r| r.trait_ == b.trait_)
+                        .map(|r| r.args)
+                        .collect(),
+                    None if p.types.has_params(arg) => continue,
+                    None => impl_args_at(p, arg, b.trait_, depth + 1),
+                };
+                ways.dedup();
+                if let [only] = ways.as_slice() {
+                    let mut solved = subst.clone();
+                    let fits = b.args.len() == only.len()
+                        && b.args
+                            .iter()
+                            .zip(only)
+                            .all(|(&pat, &t)| match_ty(p, pat, t, generics, &mut solved));
+                    if fits {
+                        *subst = solved;
+                        progress = true;
+                    }
+                }
+            }
+        }
+        if !progress {
+            break;
+        }
+    }
 }
 
 /// How much deeper than its first goal's size the solver goes through impls' bounds before it
@@ -225,6 +353,14 @@ pub fn implements(p: &Program, ty: TyId, r: &TraitRef) -> bool {
     if let Some(bounds) = declared_bounds(p, ty) {
         return bounds.iter().any(|b| b == r);
     }
+    // A type that declares a `@fieldwise` trait has it when its fields do: decided before the
+    // goals below, since a type that holds itself (through a `Box`) leads back to its own goal.
+    if let TyKind::Adt(a, _) = p.types.kind(ty)
+        && p.trait_(r.trait_).fieldwise
+        && p.adt(*a).opt_in.iter().any(|(o, _)| o == r)
+    {
+        return implements_fieldwise(p, ty, r);
+    }
     // A goal that an impl's bounds lead back to isn't met through that impl: alone,
     // `impl<T: Tr> Tr for T` implements `Tr` for nothing.
     let goal = (ty, r.clone());
@@ -235,13 +371,41 @@ pub fn implements(p: &Program, ty: TyId, r: &TraitRef) -> bool {
                 r.args.iter().fold(p.types.size(ty), |n, &a| n.saturating_add(p.types.size(a)));
             *first = size.min(MAX_TYPE_SIZE);
         }
-        if goals.len() >= *first as usize + SOLVE_DEPTH_SLACK || !goals.insert(goal.clone()) {
+        if goals.len() >= *first as usize + SOLVE_DEPTH_SLACK {
             return false;
         }
+        if !goals.insert(goal.clone()) {
+            // Met again: through a derivation in progress, it's met (coinductively); through
+            // impls' bounds alone, it isn't.
+            let (order, marks) = &*p.goal_order.borrow();
+            let at = order.iter().position(|g| *g == goal);
+            return at.is_some_and(|at| marks.iter().any(|&m| m > at));
+        }
     }
+    p.goal_order.borrow_mut().0.push(goal.clone());
     let found = find_impl(p, ty, r).is_some();
     p.solving.borrow_mut().0.remove(&goal);
+    p.goal_order.borrow_mut().0.pop();
     found
+}
+
+/// Whether `ty`, an ADT that declares the `@fieldwise` trait `r`, has it: every field does
+/// (§3). A type that holds itself has it if the rest of its fields do.
+pub fn implements_fieldwise(p: &Program, ty: TyId, r: &TraitRef) -> bool {
+    let key = (ty, r.clone());
+    if let Some(&known) = p.fieldwise_impls.borrow().get(&key) {
+        return known;
+    }
+    p.fieldwise_impls.borrow_mut().insert(key.clone(), true);
+    let TyKind::Adt(a, args) = p.types.kind(ty) else { return false };
+    let mark = p.goal_order.borrow().0.len();
+    p.goal_order.borrow_mut().1.push(mark);
+    let ok = p.field_lists(*a).into_iter().all(|v| {
+        p.fields_of(*a, args, v).into_iter().all(|f| implements(p, normalize(p, f, None), r))
+    });
+    p.goal_order.borrow_mut().1.pop();
+    p.fieldwise_impls.borrow_mut().insert(key, ok);
+    ok
 }
 
 /// `Copy`, `Clone` and `GpuData`, which are structural.
@@ -267,11 +431,32 @@ fn implements_builtin_uncached(p: &Program, ty: TyId, lang: Lang) -> bool {
         TyKind::Tuple(ts) => ts.iter().all(|&t| implements_builtin(p, t, lang)),
         // WGSL has no empty arrays.
         TyKind::Array(e, n) => (lang != Lang::GpuData || *n > 0) && implements_builtin(p, *e, lang),
+        TyKind::ArrayN(e, _) => implements_builtin(p, *e, lang),
+        // A borrow struct is its fields' projections: copying it copies them, and the copy
+        // holds the same loans, which the memory checker tracks per holder (§6.6). It never
+        // crosses to the GPU.
+        TyKind::Adt(a, _) if p.adt(*a).borrow => lang != Lang::GpuData,
         TyKind::Adt(a, args) => {
             let Some(want) = p.lang_trait(lang) else { return false };
             let adt = p.adt(*a);
-            if !adt.opt_in.iter().any(|(r, _)| r.trait_ == want) {
+            // Declaring `Copy` declares `Clone` too (§3).
+            let copy = p.lang_trait(Lang::Copy);
+            let declared = adt
+                .opt_in
+                .iter()
+                .any(|(r, _)| r.trait_ == want || (lang == Lang::Clone && Some(r.trait_) == copy));
+            // An `impl Clone` written outside std's core is an error already (E0415): taken as
+            // declared, so its uses aren't reported again.
+            let written_clone = lang == Lang::Clone && explicit_clone(p, *a).is_some();
+            if !declared && !written_clone {
                 return false;
+            }
+            // A `Clone` std's core writes by hand (`Vec`'s) holds where its impl does.
+            if lang == Lang::Clone
+                && let Some(imp) = explicit_clone(p, *a)
+            {
+                return impl_for(p, imp, ty, &TraitRef { trait_: want, args: Vec::new() })
+                    .is_some();
             }
             let subst = Subst::from_pairs(&adt.generics, args);
             // A field `T::Out` is, with `T` known, the type the impl gives it.
@@ -282,16 +467,149 @@ fn implements_builtin_uncached(p: &Program, ty: TyId, lang: Lang) -> bool {
         TyKind::Projection { .. } if normalize(p, ty, None) != ty => {
             implements_builtin(p, normalize(p, ty, None), lang)
         }
+        // A parameter bounded by a function type holds a closure or a function: `Copy`.
+        TyKind::Param(g) if p.param(*g).fn_bound.is_some() && lang != Lang::GpuData => true,
         TyKind::Param(_) | TyKind::Opaque(..) | TyKind::Projection { .. } => {
             let Some(want) = p.lang_trait(lang) else { return false };
             declared_bounds(p, ty).is_some_and(|bs| bs.iter().any(|b| b.trait_ == want))
         }
+        // A closure that can be stored holds copies of `Copy` values (§6.7), and a named
+        // function holds nothing; whether GPU code can hold one is lowering's to check.
+        TyKind::Closure(..) | TyKind::FnDef(..) => true,
         TyKind::Slice(_)
+        | TyKind::Str
+        | TyKind::ConstU32(_)
         | TyKind::FnPtr(..)
-        | TyKind::Closure(..)
-        | TyKind::FnDef(..)
         | TyKind::Var(_) => false,
     }
+}
+
+/// Whether ADT `a` declares the structural trait `lang` (`Copy` declares `Clone` too).
+pub fn implements_builtin_declared(p: &Program, a: AdtId, lang: Lang) -> bool {
+    let (Some(want), copy) = (p.lang_trait(lang), p.lang_trait(Lang::Copy)) else { return false };
+    p.adt(a)
+        .opt_in
+        .iter()
+        .any(|(r, _)| r.trait_ == want || (lang == Lang::Clone && Some(r.trait_) == copy))
+}
+
+/// The impl of `Clone` std's core writes for ADT `a` by hand, if it has one (`Vec`'s,
+/// `Box`'s): a leaf that clones what a derivation can't.
+pub fn explicit_clone(p: &Program, a: AdtId) -> Option<ImplId> {
+    let clone = p.lang_trait(Lang::Clone)?;
+    p.impls_of(clone).iter().copied().find(|&i| {
+        let imp = p.impl_(i);
+        !imp.from_opt_in && matches!(p.types.kind(imp.self_ty), TyKind::Adt(b, _) if *b == a)
+    })
+}
+
+/// The impl of `Drop` for ADT `a`, if it has one: std's core writes them (`Vec`'s, `Box`'s).
+pub fn explicit_drop(p: &Program, a: AdtId) -> Option<ImplId> {
+    let drop = p.lang_trait(Lang::Drop)?;
+    p.impls_of(drop)
+        .iter()
+        .copied()
+        .find(|&i| matches!(p.types.kind(p.impl_(i).self_ty), TyKind::Adt(b, _) if *b == a))
+}
+
+/// Whether dropping a value of type `ty` may do something: it holds something with a
+/// destructor (`Vec`, `Box`), or a type that's not known yet (a generic parameter), which may.
+/// Lowering asks again of concrete types.
+pub fn may_need_drop(p: &Program, ty: TyId) -> bool {
+    if let Some(&known) = p.drop_cache.borrow().get(&ty) {
+        return known;
+    }
+    // Assumed false while it's found: a type that holds itself (E0318) doesn't loop.
+    p.drop_cache.borrow_mut().insert(ty, false);
+    let r = match p.types.kind(ty) {
+        TyKind::Tuple(ts) => ts.iter().any(|&t| may_need_drop(p, t)),
+        TyKind::Array(e, n) => *n > 0 && may_need_drop(p, *e),
+        TyKind::ArrayN(e, _) => may_need_drop(p, *e),
+        // A borrow struct owns nothing: its fields are borrows, or `Copy` (§6.4).
+        TyKind::Adt(a, _) if p.adt(*a).borrow => false,
+        TyKind::Adt(a, args) => {
+            explicit_drop(p, *a).is_some()
+                || p.field_lists(*a)
+                    .into_iter()
+                    .any(|v| p.fields_of(*a, args, v).into_iter().any(|t| may_need_drop(p, t)))
+        }
+        // Unknown here, unless it's declared `Copy` (a `Surface`, say): a `Copy` value owns
+        // nothing to free.
+        TyKind::Param(_) | TyKind::Opaque(..) | TyKind::Projection { .. } => {
+            let copy = p.lang_trait(Lang::Copy);
+            !declared_bounds(p, ty).is_some_and(|bs| bs.iter().any(|b| Some(b.trait_) == copy))
+        }
+        _ => false,
+    };
+    p.drop_cache.borrow_mut().insert(ty, r);
+    r
+}
+
+/// Whether a value of type `holder` can hold a `T` (`target`), by value or through what it owns
+/// on the heap: so whether a projection of type `T` can point into it. A `-> borrow T` result
+/// borrows only the arguments that can (§6.4): `s.slice(i, j)` borrows `s`, not `i` and `j`. A
+/// run points into its elements, so `[T]` and `str` look for `T` and `u8`. A type not known yet
+/// (a generic parameter) can hold anything.
+pub fn can_hold(p: &Program, holder: TyId, target: TyId) -> bool {
+    fn opaque(p: &Program, t: TyId) -> bool {
+        matches!(
+            p.types.kind(t),
+            TyKind::Param(_)
+                | TyKind::Opaque(..)
+                | TyKind::Projection { .. }
+                | TyKind::Var(_)
+                | TyKind::Error
+        )
+    }
+    fn go(p: &Program, holder: TyId, target: TyId, seen: &mut Vec<TyId>) -> bool {
+        if holder == target || opaque(p, holder) {
+            return true;
+        }
+        if seen.contains(&holder) {
+            return false;
+        }
+        seen.push(holder);
+        match p.types.kind(holder) {
+            TyKind::Array(e, _) | TyKind::ArrayN(e, _) | TyKind::Slice(e) => {
+                go(p, *e, target, seen)
+            }
+            TyKind::Str => target == p.types.int(IntTy::U8),
+            TyKind::Vec(_) | TyKind::Mat(_) => {
+                target == p.types.f32 || matches!(p.types.kind(target), TyKind::Vec(_))
+            }
+            TyKind::Tuple(ts) => ts.iter().any(|&t| go(p, t, target, seen)),
+            TyKind::Adt(a, args) => {
+                // What it owns on the heap is in its type arguments.
+                if args.iter().any(|&t| go(p, t, target, seen)) {
+                    return true;
+                }
+                p.field_lists(*a)
+                    .into_iter()
+                    .any(|v| p.fields_of(*a, args, v).into_iter().any(|t| go(p, t, target, seen)))
+            }
+            // A closure's captures: whatever it captured.
+            TyKind::Closure(..) => true,
+            _ => false,
+        }
+    }
+    // A scalar or a vector holds only itself (and a vector its floats), whatever the target's
+    // type arguments turn out to be.
+    if matches!(
+        p.types.kind(holder),
+        TyKind::Bool | TyKind::Int(_) | TyKind::Float(_) | TyKind::Vec(_) | TyKind::Mat(_)
+    ) && !opaque(p, target)
+    {
+        return go(p, holder, target, &mut Vec::new());
+    }
+    if opaque(p, target) || p.types.has_params(target) {
+        return true;
+    }
+    let target = match p.types.kind(target) {
+        TyKind::Slice(e) => *e,
+        TyKind::Str => p.types.int(IntTy::U8),
+        _ => target,
+    };
+    go(p, holder, target, &mut Vec::new())
 }
 
 /// Replaces projections on concrete types by the impl's associated type. `in_impl` resolves

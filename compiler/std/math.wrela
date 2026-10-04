@@ -166,6 +166,7 @@ fn sin_quadrant(y: f64, q: i32) -> f32 {
     f32(r)
 }
 
+/// The sine of `x`, in radians.
 pub fn sin(x: f32) -> f32 {
     if is_nan(x) || is_inf(x) {
         return x - x
@@ -188,6 +189,7 @@ pub fn cos(x: f32) -> f32 {
     sin_quadrant(y, (n & 3) + 1)
 }
 
+/// The tangent of `x`, in radians.
 pub fn tan(x: f32) -> f32 {
     if is_nan(x) || is_inf(x) {
         return x - x
@@ -245,6 +247,7 @@ fn exp2_f64(x: f64) -> f64 {
     exp_poly((x - n) * LN2) * pow2(i32(n))
 }
 
+/// e to the power `x`.
 pub fn exp(x: f32) -> f32 {
     if is_nan(x) {
         return x
@@ -260,6 +263,7 @@ pub fn exp(x: f32) -> f32 {
     f32(exp_poly(xd - n * LN2) * pow2(i32(n)))
 }
 
+/// 2 to the power `x`.
 pub fn exp2(x: f32) -> f32 {
     if is_nan(x) {
         return x
@@ -304,10 +308,12 @@ fn log2_scaled(x: f32, scale: f64) -> f32 {
     f32(log2_f64(f64(x)) * scale)
 }
 
+/// The base-2 logarithm of `x`: minus infinity at 0, and NaN below 0.
 pub fn log2(x: f32) -> f32 {
     log2_scaled(x, 1.0)
 }
 
+/// The natural logarithm of `x`: minus infinity at 0, and NaN below 0.
 pub fn log(x: f32) -> f32 {
     log2_scaled(x, LN2)
 }
@@ -428,6 +434,7 @@ fn atan2_f64(y: f64, x: f64) -> f64 {
     }
 }
 
+/// The angle whose tangent is `x`, in [-π/2, π/2].
 pub fn atan(x: f32) -> f32 {
     // Keeps -0's sign.
     if x == 0.0 {
@@ -436,15 +443,18 @@ pub fn atan(x: f32) -> f32 {
     f32(atan_f64(f64(x)))
 }
 
+/// The angle from the positive x axis to the point `(x, y)`, in [-π, π].
 pub fn atan2(y: f32, x: f32) -> f32 {
     f32(atan2_f64(f64(y), f64(x)))
 }
 
+/// The angle whose sine is `x`, in [-π/2, π/2]; NaN outside [-1, 1].
 pub fn asin(x: f32) -> f32 {
     let xd = f64(x)
     f32(atan2_f64(xd, sqrt((1.0 - xd) * (1.0 + xd))))
 }
 
+/// The angle whose cosine is `x`, in [0, π]; NaN outside [-1, 1].
 pub fn acos(x: f32) -> f32 {
     let xd = f64(x)
     f32(atan2_f64(sqrt((1.0 - xd) * (1.0 + xd)), xd))

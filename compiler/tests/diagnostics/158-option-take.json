@@ -1,0 +1,40 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0207",
+      "file": "main.wrela",
+      "fixes": [
+        {
+          "edits": [
+            {
+              "end": 166,
+              "file": "main.wrela",
+              "replacement": "replace(mut s.item, None)",
+              "start": 153
+            }
+          ],
+          "message": "write `replace(mut s.item, None)`"
+        }
+      ],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "`.take()` isn't a method in wrela: `take` moves a value out of a place",
+      "notes": [
+        "to take an `Option`'s value and leave `None`, swap `None` in"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 12,
+        "end": 164,
+        "end_column": 16,
+        "end_line": 9,
+        "line": 9,
+        "start": 160
+      },
+      "title": "an unknown method"
+    }
+  ],
+  "version": 2
+}

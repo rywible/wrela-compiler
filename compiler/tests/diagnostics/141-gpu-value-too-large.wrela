@@ -10,6 +10,6 @@ fn fill(out: mut Slots<f32>, id: GlobalId) {
 }
 
 pub fn frame(time: f32, width: u32, height: u32) {
-    let out: GpuBuffer<f32> = buffer(64)
-    dispatch(fill, groups: 1, out: out)
+    var out: GpuBuffer<f32> = buffer(64)
+    dispatch(fill.bind(out: mut out), groups: 1)
 }

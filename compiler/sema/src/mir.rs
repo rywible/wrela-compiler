@@ -90,12 +90,26 @@ pub enum LocalKind {
     Temp,
     /// A value assigned on several paths: the result of an `if`, a `match` or `&&`.
     TempVar,
-    /// The place a projection-returning call returned (writable if it returned `mut`), or the
-    /// array a `for` loop walks.
-    TempProjection { mutable: bool },
+    /// The place a projection-returning call returned (writable if it returned `mut`), a
+    /// `match`'s scrutinee, or the array a `for` loop walks.
+    TempProjection { mutable: bool, role: TempRole },
     /// A call's `borrow` or `mut` argument, bound where it's evaluated and used by the call:
     /// so nothing evaluated in between (a later argument) can change it.
     Arg { mutable: bool },
+    /// A constant, a place that lives as long as the program (language.md §10): read and
+    /// projected, never written or moved out of.
+    Const(ConstId),
+}
+
+/// What a [`LocalKind::TempProjection`] holds, as diagnostics name it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TempRole {
+    /// The place a named function's call returned: the local is named `f(..)`.
+    CallResult,
+    /// A `match`'s scrutinee, borrowed while the arms test it.
+    Match,
+    /// Anything else: another call's result, or the array a `for` loop walks.
+    Other,
 }
 
 impl LocalKind {
@@ -132,7 +146,8 @@ impl LocalKind {
                 thir::LocalKind::ClosureParam => false,
             },
             LocalKind::Temp | LocalKind::TempVar => true,
-            LocalKind::TempProjection { mutable } | LocalKind::Arg { mutable } => mutable,
+            LocalKind::TempProjection { mutable, .. } | LocalKind::Arg { mutable } => mutable,
+            LocalKind::Const(_) => false,
         }
     }
 }
@@ -194,6 +209,8 @@ pub enum MoveKind {
     /// A use of a non-`Copy` place that needs `take` (or `.clone()`): an error, checked as a
     /// read.
     Unmarked,
+    /// A temporary's value (or part of it) passed on to what consumes it: its new owner.
+    Temp,
 }
 
 #[derive(Clone, Debug)]
@@ -265,6 +282,8 @@ pub struct Dispatch {
     pub groups: [Operand; 3],
     /// One per kernel parameter that isn't a builtin, in parameter order: borrowed.
     pub args: Vec<(usize, Place, Span)>,
+    /// The buffer (or span) holding the group counts, in place of `groups`: borrowed.
+    pub indirect: Option<(Place, Span)>,
 }
 
 #[derive(Clone, Debug)]
@@ -273,7 +292,10 @@ pub struct Draw {
     pub fragment: (FnId, Vec<TyId>),
     pub vertices: Operand,
     pub instances: Operand,
-    pub args: Vec<(String, Place, Span)>,
+    /// (entry point: 0 the vertex shader, 1 the fragment shader; parameter index; argument).
+    pub args: Vec<(usize, usize, Place, Span)>,
+    /// The buffer (or span) holding the counts, in place of `vertices` and `instances`.
+    pub indirect: Option<(Place, Span)>,
 }
 
 #[derive(Clone, Debug)]
@@ -310,6 +332,20 @@ pub enum Rvalue {
     /// A large constant's value, kept in one place rather than built at each use (a table):
     /// a local assigned it is a read-only view of it.
     Const(ConstId),
+    /// A string literal: a `Text` of this UTF-8, laid out in the build.
+    Text(std::sync::Arc<str>),
+    /// `embed("path")`: `Bytes` of the file at this path in the package (§10).
+    Embed(std::sync::Arc<str>),
+    /// A `const N: u32` generic parameter's value: known once the function is instantiated.
+    ConstParam(ParamId),
+    /// A borrow struct (§6.6): each field in declaration order, a place it projects (`Borrow`
+    /// or `Mut`; a run or another borrow struct is `Borrow`) or a `Copy` value (`Take`). The
+    /// local it's assigned to holds a loan on each field's place.
+    BorrowStruct {
+        adt: AdtId,
+        args: Vec<TyId>,
+        fields: Vec<Arg>,
+    },
     Dispatch(Box<Dispatch>),
     Draw(Box<Draw>),
 }
@@ -332,6 +368,10 @@ pub enum StatementKind {
     Live(Local),
     /// A local's scope ends.
     Dead(Local),
+    /// Drops the value at `place`, which its owner is done with: runs its destructors, then
+    /// leaves zeros there. A value moved out is zeros already, so dropping it does nothing
+    /// (language.md §6.1).
+    Drop(Place),
 }
 
 #[derive(Clone, Debug)]
@@ -459,6 +499,11 @@ pub fn place_ty(p: &Program, locals: &[LocalDecl], place: &Place) -> TyId {
     t
 }
 
+/// [`proj_ty`], for the memory checker.
+pub(crate) fn proj_ty_pub(p: &Program, t: TyId, variant: &mut Option<u32>, proj: &Proj) -> TyId {
+    proj_ty(p, t, variant, proj)
+}
+
 /// The type of projection `proj` of a place of type `t`. `variant` is the variant a `Downcast`
 /// chose, for the `Field` after it.
 fn proj_ty(p: &Program, t: TyId, variant: &mut Option<u32>, proj: &Proj) -> TyId {
@@ -475,7 +520,7 @@ fn proj_ty(p: &Program, t: TyId, variant: &mut Option<u32>, proj: &Proj) -> TyId
         }
         (Proj::Comp(_), _) => p.types.f32,
         (Proj::Swizzle(cs), _) => p.types.vec(cs.len() as u8),
-        (Proj::Index(_), TyKind::Array(e, _) | TyKind::Slice(e)) => *e,
+        (Proj::Index(_), TyKind::Array(e, _) | TyKind::ArrayN(e, _) | TyKind::Slice(e)) => *e,
         (Proj::Index(_), TyKind::Vec(_)) => p.types.f32,
         (Proj::Index(_), TyKind::Mat(n)) => p.types.vec(*n),
         (Proj::Index(_), TyKind::Adt(_, args)) if !args.is_empty() => args[0], // `Slots<T>`

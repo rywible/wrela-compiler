@@ -1,0 +1,11 @@
+pub struct Circle: Copy {
+    pub r: f32,
+}
+
+pub fn area(c: Circle) -> f32 {
+    3.0 * squared(c.r)
+}
+
+pub(package) fn squared(x: f32) -> f32 {
+    x * x
+}

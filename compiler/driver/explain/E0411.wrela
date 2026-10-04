@@ -1,0 +1,21 @@
+// A trait that is its own supertrait, directly or through others.
+// ---- wrong
+trait Ring: Band {
+    fn ring(self) -> f32
+}
+
+trait Band: Ring {
+    fn band(self) -> f32
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+trait Ring: Band {
+    fn ring(self) -> f32
+}
+
+trait Band {
+    fn band(self) -> f32
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

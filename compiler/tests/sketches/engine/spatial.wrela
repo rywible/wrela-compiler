@@ -1,0 +1,162 @@
+// Spatial queries (sketch 03 §3): a grid of positions copied at the start of a tick (D-085),
+// so a system reads them while the entities themselves change. Built in iteration order and
+// sorted by cell, ties kept in that order, so its answers depend on nothing but the positions.
+// There are no iterator types: a query takes a closure (`each_within`) or returns an owned
+// `Vec` (`within`), language.md §6.6.
+
+use std::arena::{Arena, Handle}
+
+/// What a query found: an entity's handle, and where it was when the grid was built.
+pub struct Found<T>: Copy {
+    pub handle: Handle<T>,
+    pub pos: vec3,
+}
+
+/// A grid entry: its cell's key, its order in the arena, and what it holds.
+struct Entry<T>: Copy {
+    key: u32,
+    order: u32,
+    handle: Handle<T>,
+    pos: vec3,
+}
+
+/// Positions in cells `cell` metres wide, sorted by cell.
+pub struct SpatialGrid<T> {
+    cell: f32,
+    entries: Vec<Entry<T>>,
+}
+
+/// A cell's key: its coordinates, hashed. Two cells may share one, so queries check distances.
+fn key_of(x: i32, y: i32, z: i32) -> u32 {
+    let h = u32(x).wrapping_mul(73856093) ^
+        u32(y).wrapping_mul(19349663) ^
+        u32(z).wrapping_mul(83492791)
+    h ^ (h >> 16)
+}
+
+fn cell_of(p: vec3, cell: f32) -> (i32, i32, i32) {
+    (i32(floor(p.x / cell)), i32(floor(p.y / cell)), i32(floor(p.z / cell)))
+}
+
+/// Whether `a` goes before `b`: by key, then by order.
+fn before<T>(a: Entry<T>, b: Entry<T>) -> bool {
+    a.key < b.key || (a.key == b.key && a.order < b.order)
+}
+
+/// A stable merge sort, bottom up.
+fn sort<T>(v: mut Vec<Entry<T>>) {
+    let n = v.len()
+    if n < 2 {
+        return
+    }
+    var scratch: Vec<Entry<T>> = Vec::with_capacity(n)
+    for i in 0..n {
+        scratch.push(v[i])
+    }
+    var width = 1
+    while width < n {
+        var lo = 0
+        while lo < n {
+            let mid = min(lo + width, n)
+            let hi = min(lo + 2 * width, n)
+            var i = lo
+            var j = mid
+            for k in lo..hi {
+                if i < mid && (j >= hi || !before(v[j], v[i])) {
+                    scratch[k] = v[i]
+                    i += 1
+                } else {
+                    scratch[k] = v[j]
+                    j += 1
+                }
+            }
+            lo = hi
+        }
+        for k in 0..n {
+            v[k] = scratch[k]
+        }
+        width = 2 * width
+    }
+}
+
+impl<T> SpatialGrid<T> {
+    /// A grid of `items`' positions, `pos(item)`, in cells `cell` metres wide.
+    pub fn build(items: Arena<T>, pos: fn(T) -> vec3, cell: f32) -> SpatialGrid<T> {
+        var entries: Vec<Entry<T>> = Vec::with_capacity(items.len())
+        var order = 0
+        for x in items {
+            let p = pos(x)
+            let (cx, cy, cz) = cell_of(p, cell)
+            entries.push(
+                Entry { key: key_of(cx, cy, cz), order, handle: items.handle_at(order), pos: p },
+            )
+            order += 1
+        }
+        sort(mut entries)
+        SpatialGrid { cell, entries }
+    }
+
+    pub fn len(self) -> u32 {
+        self.entries.len()
+    }
+
+    /// The first entry whose key isn't below `key`.
+    fn first_at(self, key: u32) -> u32 {
+        var lo = 0
+        var hi = self.entries.len()
+        while lo < hi {
+            let mid = (lo + hi) / 2
+            if self.entries[mid].key < key {
+                lo = mid + 1
+            } else {
+                hi = mid
+            }
+        }
+        lo
+    }
+
+    /// Calls `f` with each entity within `radius` of `p`, cell by cell.
+    pub fn each_within(self, p: vec3, radius: f32, f: fn(Found<T>)) {
+        let r = i32(ceil(radius / self.cell))
+        let (cx, cy, cz) = cell_of(p, self.cell)
+        let r2 = radius * radius
+        for dz in -r..r + 1 {
+            for dy in -r..r + 1 {
+                for dx in -r..r + 1 {
+                    let key = key_of(cx + dx, cy + dy, cz + dz)
+                    var i = self.first_at(key)
+                    while i < self.entries.len() && self.entries[i].key == key {
+                        let e = self.entries[i]
+                        let d = e.pos - p
+                        if dot(d, d) <= r2 {
+                            f(Found { handle: e.handle, pos: e.pos })
+                        }
+                        i += 1
+                    }
+                }
+            }
+        }
+    }
+
+    /// The entities within `radius` of `p`: a small owned `Vec`.
+    pub fn within(self, p: vec3, radius: f32) -> Vec<Found<T>> {
+        var out: Vec<Found<T>> = Vec::new()
+        self.each_within(p, radius, |x| out.push(x))
+        out
+    }
+
+    /// The entity nearest `p`, if one is within `within`. Of equally near ones, the first in
+    /// the grid's order.
+    pub fn closest(self, p: vec3, within: f32) -> Option<Found<T>> {
+        var best: Option<Found<T>> = None
+        var nearest = within * within
+        self.each_within(p, within, |x| {
+            let d = dot(x.pos - p, x.pos - p)
+            if d < nearest || (d == nearest && best.is_none()) {
+                nearest = d
+                best = Some(x)
+            }
+        })
+        best
+    }
+}

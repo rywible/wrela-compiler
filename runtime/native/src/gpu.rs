@@ -3,18 +3,24 @@
 //! The "screen" is an offscreen [`wrela_abi::manifest::SCREEN_FORMAT`] texture that can be read
 //! back. How commands map to wgpu (the browser runtime's decoder does the same with WebGPU):
 //!
-//! - Work is recorded into one pending command encoder and submitted ("flushed") at `Present`,
-//!   before a `WriteBuffer` (so earlier dispatches see the old contents), and at the end of each
-//!   frame. Each dispatch gets its own compute pass.
-//! - A screen pass's draws are collected and recorded into one render pass at `Present`, since a
-//!   pass can span batches.
+//! - Work is recorded into one pending command encoder and submitted ("flushed") at the end of
+//!   a pass on the screen, before a `WriteBuffer` or `WriteTexture` (so earlier work sees the old
+//!   contents), before a readback, and at the end of each call. Each dispatch gets its own
+//!   compute pass.
+//! - A pass's draws are collected and recorded into one render pass when it ends (`Present` or
+//!   `EndPass`), since a pass can span batches.
+//! - A render pipeline is made for each combination of target formats it's drawn with: the
+//!   screen's or a texture's colour format, and a depth format or none. With depth, a fragment
+//!   is kept where its depth is less than what's there, which it replaces.
 //! - Uniform bytes go into a ring buffer bound with dynamic offsets (aligned to the device's
 //!   offset alignment, 256 by default). The ring is staged on the CPU and written just before
 //!   each flush, so every command in a submission has its own slice. It grows (after a flush)
 //!   when one submission needs more than it holds.
-//! - Bind group 0 of each pipeline is created from the manifest: the uniform block (dynamic
-//!   offset) and the buffers, in order. Bind groups are cached per (pipeline, buffer handles),
-//!   until one of their buffers is destroyed.
+//! - Bind group 0 of each pipeline is made from the manifest: the uniform block (dynamic offset)
+//!   and the bindings, in order. Bind groups are cached per (pipeline, bindings), until one of
+//!   their resources is destroyed.
+//! - Destroying a resource drops this host's reference to it; wgpu keeps it alive for work
+//!   already recorded.
 //!
 //! Commands arrive decoded, sequenced and checked ([`wrela_abi::check`]); a wgpu validation error
 //! here is a host bug, reported as [`Error::Gpu`].
@@ -25,8 +31,8 @@ use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex};
 use wgpu::util::align_to;
-use wrela_abi::manifest::{Access, BufferBinding, Manifest, Stage, UniformSpace};
-use wrela_abi::stream::{Command, Opcode};
+use wrela_abi::manifest::{BindingKind, Manifest, ResourceBinding, Stage, UniformSpace};
+use wrela_abi::stream::{self, Binding, Command, Compare, Opcode, Pass, TextureFormat};
 
 /// The screen's format: `SCREEN_FORMAT` (rgba8unorm) in wgpu's spelling.
 const SCREEN_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
@@ -40,10 +46,39 @@ const TIMESTAMP_QUERIES: u32 = 512;
 pub struct GpuTiming {
     /// Index of the frame in the run.
     pub frame: usize,
-    /// The dispatch's pipeline name, or `screen pass`.
+    /// The dispatch's pipeline name, or `screen pass` or `pass`.
     pub label: String,
     pub nanos: f64,
 }
+
+/// A texture format in wgpu's spelling.
+fn wgpu_format(f: TextureFormat) -> wgpu::TextureFormat {
+    match f {
+        TextureFormat::Rgba8 => wgpu::TextureFormat::Rgba8Unorm,
+        TextureFormat::Rgba16Float => wgpu::TextureFormat::Rgba16Float,
+        TextureFormat::Depth32Float => wgpu::TextureFormat::Depth32Float,
+    }
+}
+
+fn wgpu_compare(c: Compare) -> wgpu::CompareFunction {
+    match c {
+        Compare::Less => wgpu::CompareFunction::Less,
+        Compare::LessEqual => wgpu::CompareFunction::LessEqual,
+        Compare::Greater => wgpu::CompareFunction::Greater,
+        Compare::GreaterEqual => wgpu::CompareFunction::GreaterEqual,
+    }
+}
+
+/// A live resource the program made.
+enum Resource {
+    Buffer(wgpu::Buffer),
+    Texture { view: wgpu::TextureView, texture: wgpu::Texture, format: TextureFormat },
+    Sampler(wgpu::Sampler),
+}
+
+/// The target formats a render pipeline is made for: a colour format (or none), and a depth
+/// format (or none).
+type Targets = (Option<wgpu::TextureFormat>, Option<wgpu::TextureFormat>);
 
 struct Pipeline {
     name: String,
@@ -51,28 +86,40 @@ struct Pipeline {
     layout: wgpu::BindGroupLayout,
     /// The uniform block's binding and size, if it has one.
     uniform: Option<(u32, u32)>,
-    buffers: Vec<BufferBinding>,
+    bindings: Vec<ResourceBinding>,
+    /// A debug build's: where its bounds checks' flag is bound.
+    debug_flag: Option<u32>,
 }
 
 enum Kind {
     Compute(wgpu::ComputePipeline),
-    Render(wgpu::RenderPipeline),
+    Render {
+        module: wgpu::ShaderModule,
+        pipeline_layout: wgpu::PipelineLayout,
+        vertex: String,
+        fragment: String,
+        variants: HashMap<Targets, wgpu::RenderPipeline>,
+    },
 }
 
-/// A cached bind group: its pipeline, and the buffer handles it binds.
-type BindGroupKey = (u32, Box<[u32]>);
+/// A cached bind group: its pipeline, and the bindings it holds.
+type BindGroupKey = (u32, Box<[Binding]>);
+
+enum DrawHow {
+    Direct { vertices: u32, instances: u32 },
+    Indirect { buffer: u32, offset: u32 },
+}
 
 struct PendingDraw {
     pipeline: u32,
-    vertices: u32,
-    instances: u32,
-    buffers: Vec<u32>,
+    how: DrawHow,
+    bindings: Vec<Binding>,
     uniforms: Vec<u8>,
 }
 
-/// A screen pass between `BeginScreenPass` and `Present`.
-struct ScreenPass {
-    clear: [f32; 4],
+/// A pass between its beginning and `Present` or `EndPass`.
+struct OpenPass {
+    pass: Pass,
     draws: Vec<PendingDraw>,
 }
 
@@ -103,27 +150,55 @@ pub(crate) struct Gpu {
     limits: wgpu::Limits,
     align: u64,
     pipelines: Vec<Pipeline>,
-    buffers: HashMap<u32, wgpu::Buffer>,
-    /// Each pipeline's cached bind groups, by the buffer handles they bind.
-    bind_groups: Vec<HashMap<Box<[u32]>, wgpu::BindGroup>>,
-    /// For each buffer, the cached bind groups it's in: destroying the buffer drops them (a
-    /// compiled program never reuses a handle, so they'd never be used again).
+    resources: HashMap<u32, Resource>,
+    /// Each pipeline's cached bind groups, by the bindings they hold.
+    bind_groups: Vec<HashMap<Box<[Binding]>, wgpu::BindGroup>>,
+    /// For each resource, the cached bind groups it's in: destroying it drops them.
     bound_in: HashMap<u32, HashSet<BindGroupKey>>,
     ring: UniformRing,
     encoder: Option<wgpu::CommandEncoder>,
-    pass: Option<ScreenPass>,
+    pass: Option<OpenPass>,
     screen: Option<Screen>,
     timer: Option<Timer>,
     errors: Arc<Mutex<Vec<String>>>,
     frame: usize,
+    /// A debug build's: the flag its pipelines' bounds checks set (the manifest's
+    /// `debug_flag`), read after each frame.
+    debug_flag: Option<DebugFlag>,
+}
+
+/// The flag a debug build's bounds checks set, and the buffer it's read back through, made
+/// once.
+struct DebugFlag {
+    buffer: wgpu::Buffer,
+    readback: wgpu::Buffer,
+}
+
+/// The limits a program sees, from wgpu's.
+pub(crate) fn limits_of(l: &wgpu::Limits) -> wrela_abi::Limits {
+    let clamp = |x: u64| u32::try_from(x).unwrap_or(u32::MAX);
+    wrela_abi::Limits {
+        max_texture_size: l.max_texture_dimension_2d,
+        max_buffer_size: clamp(l.max_buffer_size.min(l.max_storage_buffer_binding_size)),
+        max_storage_buffers_per_stage: l.max_storage_buffers_per_shader_stage,
+        max_uniform_buffer_binding_size: clamp(l.max_uniform_buffer_binding_size),
+        max_workgroup_storage_size: l.max_compute_workgroup_storage_size,
+        max_workgroup_invocations: l.max_compute_invocations_per_workgroup,
+        max_workgroup_size: [
+            l.max_compute_workgroup_size_x,
+            l.max_compute_workgroup_size_y,
+            l.max_compute_workgroup_size_z,
+        ],
+        max_workgroups_per_dimension: l.max_compute_workgroups_per_dimension,
+    }
 }
 
 fn gpu_err(e: impl std::fmt::Display) -> Error {
     Error::Gpu(e.to_string())
 }
 
-/// Opens the high-performance adapter's device with `features` and WebGPU's default limits, as
-/// a browser's `requestDevice()` gives: both hosts accept the same programs.
+/// Opens the high-performance adapter's device with `features` and the adapter's limits, as the
+/// browser runtime asks for them: the program sees the GPU's real limits (`wrela.limit`).
 pub fn open_device(label: &str, features: wgpu::Features) -> Result<(wgpu::Device, wgpu::Queue)> {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: wgpu::Backends::PRIMARY,
@@ -141,7 +216,8 @@ pub fn open_device(label: &str, features: wgpu::Features) -> Result<(wgpu::Devic
     pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some(label),
         required_features: features,
-        required_limits: wgpu::Limits::default(),
+        // The adapter's own limits: a program asks for them (`wrela_abi::Limits`).
+        required_limits: adapter.limits(),
         ..Default::default()
     }))
     .map_err(|e| Error::Gpu(format!("can't open the device: {e}")))
@@ -184,7 +260,7 @@ impl Gpu {
             limits,
             align,
             pipelines: Vec::new(),
-            buffers: HashMap::new(),
+            resources: HashMap::new(),
             bind_groups: vec![HashMap::new(); manifest.pipelines.len()],
             bound_in: HashMap::new(),
             ring,
@@ -194,7 +270,19 @@ impl Gpu {
             timer,
             errors,
             frame: 0,
+            debug_flag: None,
         };
+        if manifest.pipelines.iter().any(|p| p.debug_flag.is_some()) {
+            gpu.debug_flag = Some(DebugFlag {
+                buffer: gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("debug flag"),
+                    size: 4,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                    mapped_at_creation: false,
+                }),
+                readback: gpu.readback_buffer(4),
+            });
+        }
         for (p, source) in manifest.pipelines.iter().zip(shaders) {
             let pipeline = gpu.build_pipeline(p, source)?;
             gpu.pipelines.push(pipeline);
@@ -242,19 +330,57 @@ impl Gpu {
                 count: None,
             });
         }
-        for b in &p.buffers {
-            let read_only = b.access == Access::Read;
-            // WebGPU forbids writable storage in vertex shaders.
-            let visibility =
-                if read_only || is_compute { all } else { wgpu::ShaderStages::FRAGMENT };
+        if let Some(binding) = p.debug_flag {
             entries.push(wgpu::BindGroupLayoutEntry {
-                binding: b.binding,
-                visibility,
+                binding,
+                // WebGPU forbids writable storage in vertex shaders (which aren't checked).
+                visibility: if is_compute { all } else { wgpu::ShaderStages::FRAGMENT },
                 ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only },
+                    ty: wgpu::BufferBindingType::Storage { read_only: false },
                     has_dynamic_offset: false,
                     min_binding_size: None,
                 },
+                count: None,
+            });
+        }
+        for b in &p.bindings {
+            let (ty, visibility) = match b.kind {
+                BindingKind::Read | BindingKind::ReadWrite => {
+                    let read_only = b.kind == BindingKind::Read;
+                    // WebGPU forbids writable storage in vertex shaders.
+                    let visibility =
+                        if read_only || is_compute { all } else { wgpu::ShaderStages::FRAGMENT };
+                    let ty = wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    };
+                    (ty, visibility)
+                }
+                BindingKind::Texture | BindingKind::DepthTexture => {
+                    let sample_type = if b.kind == BindingKind::Texture {
+                        wgpu::TextureSampleType::Float { filterable: true }
+                    } else {
+                        wgpu::TextureSampleType::Depth
+                    };
+                    let ty = wgpu::BindingType::Texture {
+                        sample_type,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    };
+                    (ty, all)
+                }
+                BindingKind::Sampler => {
+                    (wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), all)
+                }
+                BindingKind::ComparisonSampler => {
+                    (wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison), all)
+                }
+            };
+            entries.push(wgpu::BindGroupLayoutEntry {
+                binding: b.binding,
+                visibility,
+                ty,
                 count: None,
             });
         }
@@ -285,32 +411,16 @@ impl Gpu {
                 },
             )),
             Stage::Render { vertex_entry, fragment_entry } => {
-                Kind::Render(self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                    label: Some(&p.name),
-                    layout: Some(&pipeline_layout),
-                    vertex: wgpu::VertexState {
-                        module: &module,
-                        entry_point: Some(vertex_entry),
-                        compilation_options: Default::default(),
-                        buffers: &[],
-                    },
-                    // Triangle list, counter-clockwise front faces, no culling: WebGPU's defaults.
-                    primitive: wgpu::PrimitiveState::default(),
-                    depth_stencil: None,
-                    multisample: wgpu::MultisampleState::default(),
-                    fragment: Some(wgpu::FragmentState {
-                        module: &module,
-                        entry_point: Some(fragment_entry),
-                        compilation_options: Default::default(),
-                        targets: &[Some(wgpu::ColorTargetState {
-                            format: SCREEN_FORMAT,
-                            blend: None,
-                            write_mask: wgpu::ColorWrites::ALL,
-                        })],
-                    }),
-                    multiview_mask: None,
-                    cache: None,
-                }))
+                let mut kind = Kind::Render {
+                    module,
+                    pipeline_layout,
+                    vertex: vertex_entry.clone(),
+                    fragment: fragment_entry.clone(),
+                    variants: HashMap::new(),
+                };
+                // The screen's variant now, so a shader's errors come at load.
+                render_variant(&self.device, &p.name, &mut kind, (Some(SCREEN_FORMAT), None));
+                kind
             }
         };
         if let Some(e) = pollster::block_on(scope.pop()) {
@@ -321,7 +431,8 @@ impl Gpu {
             kind,
             layout,
             uniform: p.uniform.as_ref().map(|u| (u.binding, u.size)),
-            buffers: p.buffers.clone(),
+            bindings: p.bindings.clone(),
+            debug_flag: p.debug_flag,
         })
     }
 
@@ -370,9 +481,16 @@ impl Gpu {
         Err(Error::Gpu(all))
     }
 
-    /// Bind group 0 of `pipeline` with these buffers, from the cache or made now.
-    fn bind_group(&mut self, pipeline: u32, handles: &[u32]) -> wgpu::BindGroup {
-        if let Some(bg) = self.bind_groups[pipeline as usize].get(handles) {
+    fn buffer(&self, handle: u32) -> &wgpu::Buffer {
+        match &self.resources[&handle] {
+            Resource::Buffer(b) => b,
+            _ => unreachable!("the checker checked {handle} is a buffer"),
+        }
+    }
+
+    /// Bind group 0 of `pipeline` with these bindings, from the cache or made now.
+    fn bind_group(&mut self, pipeline: u32, bindings: &[Binding]) -> wgpu::BindGroup {
+        if let Some(bg) = self.bind_groups[pipeline as usize].get(bindings) {
             return bg.clone();
         }
         let p = &self.pipelines[pipeline as usize];
@@ -387,32 +505,42 @@ impl Gpu {
                 }),
             });
         }
-        for (handle, b) in handles.iter().zip(&p.buffers) {
-            entries.push(wgpu::BindGroupEntry {
-                binding: b.binding,
-                resource: self.buffers[handle].as_entire_binding(),
-            });
+        for (b, slot) in bindings.iter().zip(&p.bindings) {
+            let resource = match &self.resources[&b.handle] {
+                Resource::Buffer(buffer) => wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer,
+                    offset: u64::from(b.offset),
+                    size: NonZeroU64::new(u64::from(b.size)),
+                }),
+                Resource::Texture { view, .. } => wgpu::BindingResource::TextureView(view),
+                Resource::Sampler(s) => wgpu::BindingResource::Sampler(s),
+            };
+            entries.push(wgpu::BindGroupEntry { binding: slot.binding, resource });
+        }
+        if let (Some(binding), Some(flag)) = (p.debug_flag, &self.debug_flag) {
+            let resource = flag.buffer.as_entire_binding();
+            entries.push(wgpu::BindGroupEntry { binding, resource });
         }
         let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some(&p.name),
             layout: &p.layout,
             entries: &entries,
         });
-        let key: Box<[u32]> = handles.into();
-        for &handle in handles {
-            self.bound_in.entry(handle).or_default().insert((pipeline, key.clone()));
+        let key: Box<[Binding]> = bindings.into();
+        for b in bindings {
+            self.bound_in.entry(b.handle).or_default().insert((pipeline, key.clone()));
         }
         self.bind_groups[pipeline as usize].insert(key, bg.clone());
         bg
     }
 
-    /// Forgets a destroyed buffer, and the cached bind groups it's in. Work already recorded
+    /// Forgets a destroyed resource, and the cached bind groups it's in. Work already recorded
     /// holds its own references until the GPU is done.
-    fn destroy_buffer(&mut self, handle: u32) {
-        self.buffers.remove(&handle);
+    fn destroy(&mut self, handle: u32) {
+        self.resources.remove(&handle);
         for group in self.bound_in.remove(&handle).unwrap_or_default() {
-            for other in group.1.iter().filter(|&&h| h != handle) {
-                if let Some(groups) = self.bound_in.get_mut(other) {
+            for other in group.1.iter().filter(|b| b.handle != handle) {
+                if let Some(groups) = self.bound_in.get_mut(&other.handle) {
                     groups.remove(&group);
                 }
             }
@@ -508,34 +636,124 @@ impl Gpu {
             size: u64::from(size),
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::INDIRECT,
             mapped_at_creation: false,
         });
-        self.buffers.insert(handle, buffer);
+        self.resources.insert(handle, Resource::Buffer(buffer));
+    }
+
+    fn create_texture(&mut self, handle: u32, width: u32, height: u32, format: TextureFormat) {
+        let mut usage = wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::COPY_SRC;
+        if !format.is_depth() {
+            usage |= wgpu::TextureUsages::COPY_DST;
+        }
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(&format!("texture {handle}")),
+            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu_format(format),
+            usage,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        self.resources.insert(handle, Resource::Texture { view, texture, format });
+    }
+
+    fn create_sampler(
+        &mut self,
+        handle: u32,
+        linear: bool,
+        repeat: bool,
+        compare: Option<Compare>,
+    ) {
+        let filter = if linear { wgpu::FilterMode::Linear } else { wgpu::FilterMode::Nearest };
+        let address =
+            if repeat { wgpu::AddressMode::Repeat } else { wgpu::AddressMode::ClampToEdge };
+        let sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some(&format!("sampler {handle}")),
+            address_mode_u: address,
+            address_mode_v: address,
+            address_mode_w: address,
+            mag_filter: filter,
+            min_filter: filter,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            compare: compare.map(wgpu_compare),
+            ..Default::default()
+        });
+        self.resources.insert(handle, Resource::Sampler(sampler));
     }
 
     fn write_buffer(&mut self, handle: u32, offset: u32, data: &[u8]) -> Result<()> {
         if data.is_empty() {
             return Ok(());
         }
-        // Dispatches recorded before this write must see the old contents.
+        // Work recorded before this write must see the old contents.
         self.flush()?;
-        self.queue.write_buffer(&self.buffers[&handle], u64::from(offset), data);
+        self.queue.write_buffer(self.buffer(handle), u64::from(offset), data);
         Ok(())
+    }
+
+    fn write_texture(
+        &mut self,
+        handle: u32,
+        origin: [u32; 2],
+        size: [u32; 2],
+        data: &[u8],
+    ) -> Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        self.flush()?;
+        let Resource::Texture { texture, format, .. } = &self.resources[&handle] else {
+            unreachable!("the checker checked {handle} is a texture");
+        };
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x: origin[0], y: origin[1], z: 0 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            data,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(size[0] * format.bytes_per_texel()),
+                rows_per_image: Some(size[1]),
+            },
+            wgpu::Extent3d { width: size[0], height: size[1], depth_or_array_layers: 1 },
+        );
+        Ok(())
+    }
+
+    fn copy_buffer(&mut self, from: u32, from_offset: u32, to: u32, to_offset: u32, size: u32) {
+        let mut encoder = self.take_encoder();
+        encoder.copy_buffer_to_buffer(
+            self.buffer(from),
+            u64::from(from_offset),
+            self.buffer(to),
+            u64::from(to_offset),
+            u64::from(size),
+        );
+        self.encoder = Some(encoder);
     }
 
     fn dispatch(
         &mut self,
         pipeline: u32,
-        groups: [u32; 3],
-        buffers: &[u32],
+        groups: Result<[u32; 3], (u32, u32)>,
+        bindings: &[Binding],
         uniforms: &[u8],
     ) -> Result<()> {
         // Everything that can flush happens before anything is recorded for this dispatch.
         self.reserve_uniforms(Opcode::Dispatch, self.aligned(uniforms.len()))?;
         self.reserve_timestamps()?;
         let offset = self.push_uniforms(uniforms);
-        let bind_group = self.bind_group(pipeline, buffers);
+        let bind_group = self.bind_group(pipeline, bindings);
         let mut encoder = self.take_encoder();
         let p = &self.pipelines[pipeline as usize];
         let timestamps = self.timer.as_mut().map(|t| t.next(self.frame, &p.name));
@@ -554,60 +772,111 @@ impl Gpu {
         });
         pass.set_pipeline(compute);
         pass.set_bind_group(0, &bind_group, offset.as_slice());
-        pass.dispatch_workgroups(groups[0], groups[1], groups[2]);
+        match groups {
+            Ok([x, y, z]) => pass.dispatch_workgroups(x, y, z),
+            Err((buffer, at)) => {
+                let Resource::Buffer(args) = &self.resources[&buffer] else {
+                    unreachable!("the checker checked {buffer} is a buffer");
+                };
+                pass.dispatch_workgroups_indirect(args, u64::from(at));
+            }
+        }
         drop(pass);
         self.encoder = Some(encoder);
         Ok(())
     }
 
-    fn draw(
-        &mut self,
-        pipeline: u32,
-        vertices: u32,
-        instances: u32,
-        buffers: &[u32],
-        uniforms: &[u8],
-    ) {
-        let draw = PendingDraw {
-            pipeline,
-            vertices,
-            instances,
-            buffers: buffers.to_vec(),
-            uniforms: uniforms.to_vec(),
-        };
-        self.pass.as_mut().expect("the sequencer checked a screen pass is open").draws.push(draw);
+    fn draw(&mut self, pipeline: u32, how: DrawHow, bindings: &[Binding], uniforms: &[u8]) {
+        let draw =
+            PendingDraw { pipeline, how, bindings: bindings.to_vec(), uniforms: uniforms.to_vec() };
+        self.pass.as_mut().expect("the sequencer checked a pass is open").draws.push(draw);
     }
 
-    fn present(&mut self) -> Result<()> {
-        let op = Opcode::Present;
-        let Some(pass) = self.pass.take() else {
-            unreachable!("the sequencer checked a screen pass is open");
+    /// Records the open pass's draws: on the screen (`Present`) or into textures (`EndPass`).
+    fn end_pass(&mut self, op: Opcode) -> Result<()> {
+        let Some(open) = self.pass.take() else {
+            unreachable!("the sequencer checked a pass is open");
         };
-        if self.screen.is_none() {
+        let pass = open.pass;
+        let on_screen = pass.color == stream::SCREEN;
+        if on_screen && self.screen.is_none() {
             return Err(Error::command(
                 op,
                 "there's no screen: the host draws only while running frames",
             ));
         }
+        let format_of = |gpu: &Gpu, h: u32| match &gpu.resources[&h] {
+            Resource::Texture { format, .. } => wgpu_format(*format),
+            _ => unreachable!("the checker checked {h} is a texture"),
+        };
+        let color_format = match pass.color {
+            stream::SCREEN => Some(SCREEN_FORMAT),
+            stream::NONE => None,
+            h => Some(format_of(self, h)),
+        };
+        let depth_format = (pass.depth != stream::NONE).then(|| format_of(self, pass.depth));
+        let targets = (color_format, depth_format);
+        // Every pipeline variant the pass needs, made before anything is recorded.
+        for d in &open.draws {
+            let Pipeline { name, kind, .. } = &mut self.pipelines[d.pipeline as usize];
+            render_variant(&self.device, name, kind, targets);
+        }
         // Everything that can flush happens before anything is recorded for this pass.
-        let total = pass.draws.iter().map(|d| self.aligned(d.uniforms.len())).sum();
+        let total = open.draws.iter().map(|d| self.aligned(d.uniforms.len())).sum();
         self.reserve_uniforms(op, total)?;
         self.reserve_timestamps()?;
-        let timestamps = self.timer.as_mut().map(|t| t.next(self.frame, "screen pass"));
+        let label = if on_screen { "screen pass" } else { "pass" };
+        let timestamps = self.timer.as_mut().map(|t| t.next(self.frame, label));
         let [r, g, b, a] = pass.clear.map(f64::from);
+        let mut bind_groups = Vec::new();
+        let mut offsets = Vec::new();
+        for d in &open.draws {
+            offsets.push(self.push_uniforms(&d.uniforms));
+            bind_groups.push(self.bind_group(d.pipeline, &d.bindings));
+        }
         let mut encoder = self.take_encoder();
-        let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("screen pass"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &self.screen.as_ref().expect("checked above").view,
-                depth_slice: None,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color { r, g, b, a }),
-                    store: wgpu::StoreOp::Store,
+        let view_of = |gpu: &'_ Gpu, h: u32| -> wgpu::TextureView {
+            match &gpu.resources[&h] {
+                Resource::Texture { view, .. } => view.clone(),
+                _ => unreachable!("the checker checked {h} is a texture"),
+            }
+        };
+        let color_view = match pass.color {
+            stream::SCREEN => Some(self.screen.as_ref().expect("checked above").view.clone()),
+            stream::NONE => None,
+            h => Some(view_of(self, h)),
+        };
+        let depth_view = (pass.depth != stream::NONE).then(|| view_of(self, pass.depth));
+        let color_attachment = color_view.as_ref().map(|view| wgpu::RenderPassColorAttachment {
+            view,
+            depth_slice: None,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load: if pass.keep_color {
+                    wgpu::LoadOp::Load
+                } else {
+                    wgpu::LoadOp::Clear(wgpu::Color { r, g, b, a })
                 },
-            })],
-            depth_stencil_attachment: None,
+                store: wgpu::StoreOp::Store,
+            },
+        });
+        let depth_attachment =
+            depth_view.as_ref().map(|view| wgpu::RenderPassDepthStencilAttachment {
+                view,
+                depth_ops: Some(wgpu::Operations {
+                    load: if pass.keep_depth {
+                        wgpu::LoadOp::Load
+                    } else {
+                        wgpu::LoadOp::Clear(pass.clear_depth)
+                    },
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            });
+        let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some(label),
+            color_attachments: &[color_attachment],
+            depth_stencil_attachment: depth_attachment,
             timestamp_writes: timestamps.zip(self.timer.as_ref()).map(|(i, t)| {
                 wgpu::RenderPassTimestampWrites {
                     query_set: &t.queries,
@@ -618,36 +887,77 @@ impl Gpu {
             occlusion_query_set: None,
             multiview_mask: None,
         });
-        for d in &pass.draws {
-            let offset = self.push_uniforms(&d.uniforms);
-            let bind_group = self.bind_group(d.pipeline, &d.buffers);
-            let Kind::Render(render) = &self.pipelines[d.pipeline as usize].kind else {
+        for ((d, bind_group), offset) in open.draws.iter().zip(&bind_groups).zip(&offsets) {
+            let Kind::Render { variants, .. } = &self.pipelines[d.pipeline as usize].kind else {
                 unreachable!("the checker checked the kind");
             };
-            rp.set_pipeline(render);
-            rp.set_bind_group(0, &bind_group, offset.as_slice());
-            rp.draw(0..d.vertices, 0..d.instances);
+            rp.set_pipeline(&variants[&targets]);
+            rp.set_bind_group(0, bind_group, offset.as_slice());
+            match d.how {
+                DrawHow::Direct { vertices, instances } => rp.draw(0..vertices, 0..instances),
+                DrawHow::Indirect { buffer, offset } => {
+                    let Resource::Buffer(args) = &self.resources[&buffer] else {
+                        unreachable!("the checker checked {buffer} is a buffer");
+                    };
+                    rp.draw_indirect(args, u64::from(offset));
+                }
+            }
         }
         drop(rp);
         self.encoder = Some(encoder);
-        self.flush()
+        if on_screen { self.flush() } else { Ok(()) }
     }
 
-    /// Copies a buffer back to the CPU (waits for the GPU).
-    pub(crate) fn read_buffer(&mut self, handle: u32) -> Result<Vec<u8>> {
+    /// A buffer's bytes `offset..offset + size`, copied back to the CPU (waits for the GPU).
+    pub(crate) fn read_range(&mut self, handle: u32, offset: u32, size: u32) -> Result<Vec<u8>> {
         self.flush()?;
-        let buffer = self
-            .buffers
-            .get(&handle)
-            .ok_or_else(|| Error::Gpu(format!("there's no buffer {handle}")))?;
-        let staging = self.readback_buffer(buffer.size());
-        let mut encoder =
-            self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-        encoder.copy_buffer_to_buffer(buffer, 0, &staging, 0, buffer.size());
-        self.queue.submit([encoder.finish()]);
-        let bytes = map_read(&self.device, &staging)?;
+        let Some(Resource::Buffer(buffer)) = self.resources.get(&handle) else {
+            return Err(Error::Gpu(format!("there's no buffer {handle}")));
+        };
+        let staging = self.readback_buffer(u64::from(size.max(4)));
+        let bytes = self.copy_back(buffer, u64::from(offset), u64::from(size), &staging)?;
         self.check_errors()?;
         Ok(bytes)
+    }
+
+    /// Copies `source`'s bytes `offset..offset + size` to the CPU through `staging`, a
+    /// readback buffer at least `size` bytes long (waits for the GPU).
+    fn copy_back(
+        &self,
+        source: &wgpu::Buffer,
+        offset: u64,
+        size: u64,
+        staging: &wgpu::Buffer,
+    ) -> Result<Vec<u8>> {
+        let mut encoder =
+            self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        encoder.copy_buffer_to_buffer(source, offset, staging, 0, size);
+        self.queue.submit([encoder.finish()]);
+        let mut bytes = map_read(&self.device, staging)?;
+        bytes.truncate(size as usize);
+        Ok(bytes)
+    }
+
+    /// The handles of the buffers that exist, oldest first: for tests.
+    pub(crate) fn buffers(&self) -> Vec<u32> {
+        let mut out: Vec<u32> = self
+            .resources
+            .iter()
+            .filter(|(_, r)| matches!(r, Resource::Buffer(_)))
+            .map(|(&h, _)| h)
+            .collect();
+        // Handles are given in order and never reused.
+        out.sort_unstable();
+        out
+    }
+
+    /// Copies a whole buffer back to the CPU (waits for the GPU): for tests.
+    pub(crate) fn read_buffer(&mut self, handle: u32) -> Result<Vec<u8>> {
+        let size = match self.resources.get(&handle) {
+            Some(Resource::Buffer(b)) => b.size() as u32,
+            _ => return Err(Error::Gpu(format!("there's no buffer {handle}"))),
+        };
+        self.read_range(handle, 0, size)
     }
 
     /// Copies the screen back: RGBA8, rows top to bottom, no padding (waits for the GPU).
@@ -686,6 +996,25 @@ impl Gpu {
         Ok(frame)
     }
 
+    /// A debug build's: an error if a pipeline indexed an array out of range (its number, from
+    /// 1, is in the flag). Waits for the GPU.
+    fn check_debug_flag(&mut self) -> Result<()> {
+        let Some(flag) = &self.debug_flag else { return Ok(()) };
+        let bytes = self.copy_back(&flag.buffer, 0, 4, &flag.readback)?;
+        let code = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        if code == 0 {
+            return Ok(());
+        }
+        let name = match self.pipelines.get(code as usize - 1) {
+            Some(p) => format!("`{}`", p.name),
+            None => format!("number {code}"),
+        };
+        Err(Error::Gpu(format!(
+            "debug build: pipeline {name} indexed an array out of range (in this frame, or a \
+             call before it); WGSL then reads or writes an element in range, or a zero"
+        )))
+    }
+
     fn readback_buffer(&self, size: u64) -> wgpu::Buffer {
         self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("readback"),
@@ -699,36 +1028,129 @@ impl Gpu {
 impl Executor for Gpu {
     fn execute(&mut self, cmd: &Command<'_>) -> Result<()> {
         match cmd {
-            Command::CreateBuffer { handle, size } => {
-                self.create_buffer(*handle, *size);
-                Ok(())
+            Command::CreateBuffer { handle, size } => self.create_buffer(*handle, *size),
+            Command::CreateTexture { handle, width, height, format } => {
+                self.create_texture(*handle, *width, *height, *format)
+            }
+            Command::CreateSampler { handle, linear, repeat, compare } => {
+                self.create_sampler(*handle, *linear, *repeat, *compare)
             }
             Command::WriteBuffer { handle, offset, data } => {
-                self.write_buffer(*handle, *offset, data)
+                return self.write_buffer(*handle, *offset, data);
             }
-            Command::Dispatch { pipeline, groups, buffers, uniforms } => {
-                self.dispatch(*pipeline, *groups, buffers, uniforms)
+            Command::WriteTexture { handle, x, y, width, height, data } => {
+                return self.write_texture(*handle, [*x, *y], [*width, *height], data);
+            }
+            Command::CopyBuffer {
+                source,
+                source_offset,
+                destination,
+                destination_offset,
+                size,
+            } => {
+                self.copy_buffer(*source, *source_offset, *destination, *destination_offset, *size)
+            }
+            Command::Dispatch { pipeline, groups, bindings, uniforms } => {
+                return self.dispatch(*pipeline, Ok(*groups), bindings, uniforms);
+            }
+            Command::DispatchIndirect { pipeline, arguments, offset, bindings, uniforms } => {
+                return self.dispatch(*pipeline, Err((*arguments, *offset)), bindings, uniforms);
             }
             Command::BeginScreenPass { clear } => {
-                self.pass = Some(ScreenPass { clear: *clear, draws: Vec::new() });
-                Ok(())
+                let pass = Pass {
+                    color: stream::SCREEN,
+                    keep_color: false,
+                    clear: *clear,
+                    depth: stream::NONE,
+                    keep_depth: false,
+                    clear_depth: 1.0,
+                };
+                self.pass = Some(OpenPass { pass, draws: Vec::new() });
             }
-            Command::Draw { pipeline, vertices, instances, buffers, uniforms } => {
-                self.draw(*pipeline, *vertices, *instances, buffers, uniforms);
-                Ok(())
+            Command::BeginPass(pass) => {
+                self.pass = Some(OpenPass { pass: *pass, draws: Vec::new() })
             }
-            Command::Present => self.present(),
-            Command::DestroyBuffer { handle } => {
-                self.destroy_buffer(*handle);
-                Ok(())
+            Command::Draw { pipeline, vertices, instances, bindings, uniforms } => {
+                let how = DrawHow::Direct { vertices: *vertices, instances: *instances };
+                self.draw(*pipeline, how, bindings, uniforms);
             }
+            Command::DrawIndirect { pipeline, arguments, offset, bindings, uniforms } => {
+                let how = DrawHow::Indirect { buffer: *arguments, offset: *offset };
+                self.draw(*pipeline, how, bindings, uniforms);
+            }
+            Command::Present => return self.end_pass(Opcode::Present),
+            Command::EndPass => return self.end_pass(Opcode::EndPass),
+            Command::DestroyBuffer { handle }
+            | Command::DestroyTexture { handle }
+            | Command::DestroySampler { handle } => self.destroy(*handle),
+            // Requests are the program's host's business (`program`), not the GPU's.
+            Command::ReadBuffer { .. }
+            | Command::StorageRead { .. }
+            | Command::StorageWrite { .. }
+            | Command::Fetch { .. }
+            | Command::Log { .. } => {}
         }
+        Ok(())
     }
 
     fn end_frame(&mut self) -> Result<()> {
         self.flush()?;
-        self.check_errors()
+        self.check_errors()?;
+        self.check_debug_flag()
     }
+
+    fn read_back(&mut self, handle: u32, offset: u32, size: u32) -> Result<Vec<u8>> {
+        self.read_range(handle, offset, size)
+    }
+
+    fn limits(&self) -> wrela_abi::Limits {
+        limits_of(&self.limits)
+    }
+}
+
+/// Makes a render pipeline's variant for `targets`, if it isn't made yet.
+fn render_variant(device: &wgpu::Device, name: &str, kind: &mut Kind, targets: Targets) {
+    let Kind::Render { module, pipeline_layout, vertex, fragment, variants } = kind else {
+        return;
+    };
+    if variants.contains_key(&targets) {
+        return;
+    }
+    let color = targets.0.map(|format| wgpu::ColorTargetState {
+        format,
+        blend: None,
+        write_mask: wgpu::ColorWrites::ALL,
+    });
+    let depth_stencil = targets.1.map(|format| wgpu::DepthStencilState {
+        format,
+        depth_write_enabled: Some(true),
+        depth_compare: Some(wgpu::CompareFunction::Less),
+        stencil: wgpu::StencilState::default(),
+        bias: wgpu::DepthBiasState::default(),
+    });
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some(name),
+        layout: Some(pipeline_layout),
+        vertex: wgpu::VertexState {
+            module,
+            entry_point: Some(vertex),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        // Triangle list, counter-clockwise front faces, no culling: WebGPU's defaults.
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil,
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module,
+            entry_point: Some(fragment),
+            compilation_options: Default::default(),
+            targets: &[color],
+        }),
+        multiview_mask: None,
+        cache: None,
+    });
+    variants.insert(targets, pipeline);
 }
 
 fn create_ring(device: &wgpu::Device, capacity: u64) -> wgpu::Buffer {

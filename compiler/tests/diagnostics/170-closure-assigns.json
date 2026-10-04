@@ -1,0 +1,40 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0110",
+      "file": "main.wrela",
+      "fixes": [
+        {
+          "edits": [
+            {
+              "end": 246,
+              "file": "main.wrela",
+              "replacement": "{ sum += x }",
+              "start": 238
+            }
+          ],
+          "message": "put the assignment in a block"
+        }
+      ],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "a closure's body is an expression, and an assignment is a statement",
+      "notes": [
+        "without braces, a closure's body is the value it returns"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 22,
+        "end": 244,
+        "end_column": 24,
+        "end_line": 12,
+        "line": 12,
+        "start": 242
+      },
+      "title": "an assignment where an expression is expected"
+    }
+  ],
+  "version": 2
+}

@@ -1,0 +1,20 @@
+// A kernel's `mut` parameter that every invocation would write at once: a run `mut [T]`. A
+// kernel writes its own element through `mut Slots<T>`, indexed by its `GlobalId`.
+// ---- wrong
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch}
+
+@compute(64)
+fn fill(out: mut [f32], id: GlobalId) {
+    out[id.x] = 1.0
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch}
+
+@compute(64)
+fn fill(out: mut Slots<f32>, id: GlobalId) {
+    out[id] = 1.0
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

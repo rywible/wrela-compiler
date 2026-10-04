@@ -236,3 +236,61 @@ fn a_suffix_starts_after_the_whole_number() {
         assert_eq!(super::split_suffix(text), (number, unit), "{text}");
     }
 }
+
+/// spec/lexical.md's keyword list (L11) is the lexer's, word for word and in order.
+#[test]
+fn the_keyword_list_is_the_specs() {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../spec/lexical.md");
+    let spec = std::fs::read_to_string(path).expect("spec/lexical.md");
+    let l11 = spec.find("**L11.**").expect("L11 in spec/lexical.md");
+    let block = &spec[l11..];
+    let start = block.find("```").expect("L11's code block") + 3;
+    let end = start + block[start..].find("```").expect("the end of L11's code block");
+    let listed: Vec<&str> = block[start..end].split_whitespace().collect();
+    let lexer: Vec<&str> = T::KEYWORDS.iter().filter_map(|k| k.fixed_text()).collect();
+    assert_eq!(listed, lexer, "L11's keywords and the lexer's differ");
+    for word in &listed {
+        assert_eq!(T::keyword(word).map(|k| k.fixed_text()), Some(Some(*word)), "{word}");
+    }
+}
+
+/// L22: an f-string splits at its holes, a format spec ends a hole, brackets nest in one, and
+/// `{{` `}}` are text.
+#[test]
+fn fstrings_split_at_their_holes() {
+    assert_eq!(kinds(r#"f"a""#), [T::FString, T::Eof]);
+    assert_eq!(kinds(r#"f"{{x}}""#), [T::FString, T::Eof]);
+    assert_eq!(kinds(r#"f"w: {w:.1} kg""#), [T::FStringHead, T::Ident, T::FStringTail, T::Eof]);
+    assert_eq!(
+        kinds(r#"f"{a}, {b}""#),
+        [T::FStringHead, T::Ident, T::FStringMid, T::Ident, T::FStringTail, T::Eof]
+    );
+    // `::` and brackets don't end a hole; a nested f-string is its own.
+    assert_eq!(
+        kinds(r#"f"{a::b(c: d)}""#),
+        [
+            T::FStringHead,
+            T::Ident,
+            T::ColonColon,
+            T::Ident,
+            T::LParen,
+            T::Ident,
+            T::Colon,
+            T::Ident,
+            T::RParen,
+            T::FStringTail,
+            T::Eof
+        ]
+    );
+    assert_eq!(
+        kinds(r#"f"{f"{x}"}""#),
+        [T::FStringHead, T::FStringHead, T::Ident, T::FStringTail, T::FStringTail, T::Eof]
+    );
+    let (spec, text) = super::fstring_segment(":>8.2}, kg{{\"x\"}}{");
+    assert_eq!((spec.as_deref(), text.as_str()), (Some(">8.2"), ", kg{\"x\"}"));
+    assert_eq!(super::string_value(r#""a\tb\"""#), "a\tb\"");
+    for bad in [r#"f"{x"#, "f\"{x\n}\"", r#"f"a}b""#, r#"f"{x:.2"#] {
+        let lexed = super::lex(FileId(0), bad);
+        assert!(lexed.diagnostics.iter().any(|d| d.code.as_str() == "E0005"), "{bad}");
+    }
+}

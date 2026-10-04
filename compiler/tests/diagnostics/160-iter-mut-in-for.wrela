@@ -1,0 +1,8 @@
+// mistake: `.iter_mut()` in a `for` loop, as in Rust
+// expect: E0207
+// fix: yes
+fn double(xs: mut Vec<f32>) {
+    for x in xs.iter_mut() {
+        x *= 2.0
+    }
+}

@@ -1,0 +1,44 @@
+// An `impl` of a trait has a method or an associated type the trait doesn't declare. Put
+// other methods in an `impl` of the type itself.
+// ---- wrong
+trait Shape {
+    fn area(self) -> f32
+}
+
+struct Square {
+    side: f32,
+}
+
+impl Shape for Square {
+    fn area(self) -> f32 {
+        self.side * self.side
+    }
+
+    fn perimeter(self) -> f32 {
+        4.0 * self.side
+    }
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+trait Shape {
+    fn area(self) -> f32
+}
+
+struct Square {
+    side: f32,
+}
+
+impl Shape for Square {
+    fn area(self) -> f32 {
+        self.side * self.side
+    }
+}
+
+impl Square {
+    fn perimeter(self) -> f32 {
+        4.0 * self.side
+    }
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

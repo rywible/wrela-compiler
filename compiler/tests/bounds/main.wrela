@@ -1,0 +1,32 @@
+// A kernel that reads past the end of its buffer from 0.05 s on
+// (compiler/tests/tests/suite/bounds.rs). WGSL doesn't trap: the read gives an element in range,
+// or a zero. A debug build checks each index, and the host reports the first frame that went
+// out of range; a release build doesn't check.
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch, write}
+
+@compute(64)
+fn spill(input: [u32], out: mut Slots<u32>, past: u32, id: GlobalId) {
+    // A fixed array's index, always in range: checked, never out.
+    let table = [10, 20, 30, 40]
+    out[id] = input[id.x + past] + table[(id.x + past) % 4]
+}
+
+pub struct Buffers {
+    input: GpuBuffer<u32>,
+    out: GpuBuffer<u32>,
+}
+
+pub fn init() -> Buffers {
+    var input: GpuBuffer<u32> = buffer(64)
+    var values: Vec<u32> = Vec::with_capacity(64)
+    for i in 0..64 {
+        values.push(i)
+    }
+    write(mut input, 0, values)
+    Buffers { input, out: buffer(64) }
+}
+
+pub fn frame(state: mut Buffers, time: f32, width: u32, height: u32) {
+    let past = if time < 0.05 { 0 } else { 1 }
+    dispatch(spill.bind(input: state.input, out: mut state.out, past: past), groups: 1)
+}

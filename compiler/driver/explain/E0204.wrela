@@ -1,0 +1,16 @@
+// An attribute wrela doesn't know. Attributes are a closed list: `@deterministic`, `@gpu`,
+// `@compute`, `@vertex`, `@fragment`, `@fieldwise`, `@diagnostic` and the others language.md
+// lists. There are no user-defined attributes.
+// ---- wrong
+@inline
+fn double(x: f32) -> f32 {
+    2.0 * x
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+fn double(x: f32) -> f32 {
+    2.0 * x
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

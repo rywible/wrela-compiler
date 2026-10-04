@@ -1,0 +1,53 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0512",
+      "file": "main.wrela",
+      "fixes": [
+        {
+          "edits": [
+            {
+              "end": 148,
+              "file": "main.wrela",
+              "replacement": "var",
+              "start": 145
+            }
+          ],
+          "message": "make it `var`"
+        }
+      ],
+      "help": [
+        "declare it with `var s` to change it"
+      ],
+      "internal": false,
+      "label": null,
+      "labels": [
+        {
+          "file": "main.wrela",
+          "message": "declared here",
+          "span": {
+            "column": 9,
+            "end": 150,
+            "end_column": 10,
+            "end_line": 10,
+            "line": 10,
+            "start": 149
+          }
+        }
+      ],
+      "message": "can't lend mutably `s`: `s` is a `let` binding",
+      "notes": [],
+      "severity": "error",
+      "span": {
+        "column": 15,
+        "end": 187,
+        "end_column": 16,
+        "end_line": 11,
+        "line": 11,
+        "start": 186
+      },
+      "title": "a `mut` projection of a read-only place"
+    }
+  ],
+  "version": 2
+}

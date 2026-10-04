@@ -1,0 +1,14 @@
+// mistake: indexing an arena with another arena's handle
+// expect: E0312
+// fix: no
+struct Lever: Clone {
+    pulled: bool,
+}
+
+struct Gate: Clone {
+    open: bool,
+}
+
+fn pull(levers: mut Arena<Lever>, g: Handle<Gate>) {
+    levers[g].pulled = true
+}

@@ -1,0 +1,29 @@
+// An `unsafe` block in a package whose `wrela.toml` doesn't declare `unsafe = true`. Unsafe
+// code is opted into, package by package, so a reviewer can find it.
+// ---- wrong
+use std::mem::copy
+
+fn move_bytes() {
+    unsafe {
+        copy(dst: 16, src: 32, bytes: 4)
+    }
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- file wrela.toml
+[package]
+name = "bytes"
+// ---- fixed
+use std::mem::copy
+
+fn move_bytes() {
+    unsafe {
+        copy(dst: 16, src: 32, bytes: 4)
+    }
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- file wrela.toml
+[package]
+name = "bytes"
+unsafe = true

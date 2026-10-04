@@ -1,0 +1,30 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0305",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [
+        "use a signed type such as `i32`"
+      ],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "`-` doesn't apply to `u32`",
+      "notes": [
+        "unsigned integers can't be negative"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 18,
+        "end": 110,
+        "end_column": 20,
+        "end_line": 5,
+        "line": 5,
+        "start": 108
+      },
+      "title": "an operator that doesn't apply to these types"
+    }
+  ],
+  "version": 2
+}

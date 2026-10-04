@@ -1,0 +1,21 @@
+// Code does something its context forbids: reading the clock or the host's storage in
+// `@deterministic` code, recording GPU work while a constant is computed, a host call in GPU code.
+// The message names the effect and the chain of calls that reaches it. Pass what's needed in
+// instead.
+// ---- wrong
+use std::io::{Pending, load}
+
+@deterministic
+fn step(seed: u32) -> u32 {
+    let saved: Pending<u8> = load("save")
+    seed + 1
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+@deterministic
+fn step(seed: u32) -> u32 {
+    seed + 1
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

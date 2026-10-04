@@ -1,0 +1,13 @@
+// A field read of a value whose type has no fields: a number, a `bool`.
+// ---- wrong
+fn height(h: f32) -> f32 {
+    h.y
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+fn height(p: vec2) -> f32 {
+    p.y
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

@@ -1,6 +1,6 @@
 //! One IR function to one WASM function, plus the generated helpers and export wrappers.
 
-use crate::{Helpers, globals, memory, repr, sret, valtype};
+use crate::{Helpers, globals, in_memory, memory, repr, sret, valtype};
 use std::collections::HashMap;
 use wasm_encoder::{BlockType, Function, Instruction as I, MemArg, ValType};
 use wrela_ir as ir;
@@ -43,6 +43,7 @@ fn zero(t: ValType) -> I<'static> {
         ValType::I64 => I::I64Const(0),
         ValType::F32 => I::F32Const(0.0.into()),
         ValType::F64 => I::F64Const(0.0.into()),
+        ValType::V128 => I::V128Const(0),
         _ => I::I32Const(0),
     }
 }
@@ -86,11 +87,7 @@ enum Label {
 struct Fe<'m> {
     m: &'m ir::Module,
     f: &'m ir::Function,
-    /// The index of the module's first IR function: function `f`'s is `first_fn + f`.
-    first_fn: u32,
-    helpers: &'m Helpers,
-    /// Each constant's address (`ir::Module::data`).
-    data: &'m [u32],
+    at: &'m At<'m>,
     ins: Vec<I<'static>>,
     locals: Vec<ValType>,
     nparams: u32,
@@ -112,6 +109,8 @@ struct Fe<'m> {
     /// free after it (see [`live_ranges`]).
     local_starts: HashMap<*const ir::Stmt, Vec<ir::LocalId>>,
     local_ends: HashMap<*const ir::Stmt, Vec<ir::LocalId>>,
+    /// How many statements mention each IR local.
+    local_mentions: Vec<u32>,
     value_slots: Vec<Option<u32>>,
     ir_locals: Vec<LocalRepr>,
     frame: u32,
@@ -121,8 +120,14 @@ struct Fe<'m> {
 }
 
 /// Whether an expression makes a new aggregate in memory (and so needs a frame slot).
-fn makes_memory(m: &ir::Module, f: &ir::Function, v: ir::ValueId, e: &ir::Expr) -> bool {
-    if !m.types.is_aggregate(f.value_ty(v)) {
+fn makes_memory(
+    m: &ir::Module,
+    f: &ir::Function,
+    v: ir::ValueId,
+    e: &ir::Expr,
+    simd: bool,
+) -> bool {
+    if !in_memory(&m.types, f.value_ty(v), simd) {
         return false;
     }
     match e {
@@ -136,9 +141,22 @@ fn makes_memory(m: &ir::Module, f: &ir::Function, v: ir::ValueId, e: &ir::Expr) 
         | ir::Expr::Binary(..)
         | ir::Expr::Builtin(..)
         | ir::Expr::Run(_) => true,
-        ir::Expr::Call(callee, _) => sret(m, &m.functions[callee.index()]),
+        ir::Expr::Call(callee, _) => sret(m, &m.functions[callee.index()], simd),
         _ => false,
     }
+}
+
+/// Where the module's parts are, for each function's code.
+pub(crate) struct At<'m> {
+    /// The index of the module's first IR function: function `f`'s is `first_fn + f`.
+    pub first_fn: u32,
+    pub helpers: &'m Helpers,
+    /// Each constant's address (`ir::Module::data`).
+    pub data: &'m [u32],
+    /// Where the heap starts.
+    pub heap_base: u32,
+    /// Vectors are `v128`s (`crate::Options::simd`).
+    pub simd: bool,
 }
 
 /// A function's code, and where each source location starts in it (byte offsets from the
@@ -146,18 +164,15 @@ fn makes_memory(m: &ir::Module, f: &ir::Function, v: ir::ValueId, e: &ir::Expr) 
 pub(crate) fn emit_function(
     m: &ir::Module,
     index: usize,
-    first_fn: u32,
-    helpers: &Helpers,
-    data: &[u32],
+    at: &At,
 ) -> R<(Function, Vec<(u32, wrela_diag::Span)>)> {
     let f = &m.functions[index];
-    let sret = sret(m, f);
+    let simd = at.simd;
+    let sret = sret(m, f, simd);
     let mut fe = Fe {
         m,
         f,
-        first_fn,
-        helpers,
-        data,
+        at,
         ins: Vec::new(),
         locals: Vec::new(),
         nparams: u32::from(sret) + f.params.len() as u32,
@@ -170,6 +185,7 @@ pub(crate) fn emit_function(
         release: HashMap::new(),
         local_starts: HashMap::new(),
         local_ends: HashMap::new(),
+        local_mentions: Vec::new(),
         value_slots: vec![None; f.values.len()],
         ir_locals: Vec::new(),
         frame: 0,
@@ -182,17 +198,26 @@ pub(crate) fn emit_function(
     // memory. More slots can be added while the body is emitted: the prologue, which sets the
     // frame's size, is emitted last.
     let mut addressed = vec![false; f.locals.len()];
-    let mut in_memory = Vec::new();
+    let mut made = Vec::new();
     ir::visit::walk(&f.body, &mut |s| {
         mark_addressed(s, &mut addressed);
+        // A vector local indexed by a value is in memory (a `v128`'s lanes are numbered by
+        // constants).
+        s.for_each_place(&mut |p| {
+            if let Some(l) = p.root_local()
+                && p.path.iter().any(|x| matches!(x, ir::Proj::Index(_)))
+            {
+                addressed[l.index()] = true;
+            }
+        });
         if let ir::Stmt::Let(v, e) = s
-            && makes_memory(m, f, *v, e)
+            && makes_memory(m, f, *v, e, simd)
         {
-            in_memory.push(*v);
+            made.push(*v);
         }
     });
     for (l, &taken) in f.locals.iter().zip(&addressed) {
-        if m.types.is_aggregate(l.ty) || taken {
+        if in_memory(&m.types, l.ty, simd) || taken {
             let off = fe.slot(l.ty);
             fe.ir_locals.push(LocalRepr::Slot(off));
         } else {
@@ -203,10 +228,11 @@ pub(crate) fn emit_function(
     let scalar: Vec<bool> =
         fe.ir_locals.iter().map(|r| matches!(r, LocalRepr::Scalar(_))).collect();
     let mut ranges = Ranges { scalar: &scalar, total: vec![0; scalar.len()], ..Ranges::default() };
-    ir::visit::walk(&f.body, &mut |s| mentions(s, &mut |l| ranges.total[l.index()] += 1));
+    ir::visit::count_local_mentions(&f.body, &mut ranges.total);
     ranges.block(&f.body, false);
-    (fe.local_starts, fe.local_ends) = (ranges.starts, ranges.ends);
-    for v in in_memory {
+    (fe.local_starts, fe.local_ends, fe.local_mentions) =
+        (ranges.starts, ranges.ends, ranges.total);
+    for v in made {
         fe.value_slots[v.index()] = Some(fe.slot(f.value_ty(v)));
     }
     releases(&f.body, &mut fe.release);
@@ -221,10 +247,29 @@ pub(crate) fn emit_function(
     // (sp - limit, never negative) is less than the frame; sp = fp = sp - frame. (Comparing
     // sp - frame with the limit instead would wrap around when the frame is larger than sp.)
     let frame = round_up(16, fe.frame);
-    let prologue = [
+    let mut prologue = Vec::new();
+    if f.counted {
+        // Past the limit, a panic with the module's message; then one more call in progress.
+        let msg = m.depth_message.ok_or("internal: a counted function with no message")?;
+        prologue.extend([
+            I::GlobalGet(globals::DEPTH),
+            I::I32Const(ir::RECURSION_LIMIT as i32),
+            I::I32GeU,
+            I::If(BlockType::Empty),
+        ]);
+        prologue.extend(ops::panic_with(at.data, msg)?);
+        prologue.extend([
+            I::End,
+            I::GlobalGet(globals::DEPTH),
+            I::I32Const(1),
+            I::I32Add,
+            I::GlobalSet(globals::DEPTH),
+        ]);
+    }
+    prologue.extend([
         I::GlobalGet(globals::SP),
         I::LocalTee(fe.saved_sp),
-        I::I32Const(memory::STACK_LIMIT as i32),
+        I::GlobalGet(globals::STACK_FLOOR),
         I::I32Sub,
         I::I32Const(frame as i32),
         I::I32LtU,
@@ -236,7 +281,7 @@ pub(crate) fn emit_function(
         I::I32Sub,
         I::LocalTee(fe.fp),
         I::GlobalSet(globals::SP),
-    ];
+    ]);
     let mut func = function(fe.locals.iter().copied(), &prologue);
     // Each location starts at the offset its first instruction is written at.
     let mut lines = Vec::new();
@@ -411,6 +456,54 @@ impl<'m> Fe<'m> {
         self.m.types.get(t)
     }
 
+    /// A vector type's components, when its values are `v128`s.
+    fn vec_n(&self, t: ir::TypeId) -> Option<u8> {
+        match self.ty(t) {
+            ir::TypeDef::Vector(n) if self.at.simd => Some(*n),
+            _ => None,
+        }
+    }
+
+    /// Pushes, as a `v128`, the vector of `n` components at the address on top of the stack
+    /// plus `off`: only its own bytes, so a `vec3` at the end of memory isn't read past.
+    fn vec_load(&mut self, n: u8, off: u32) {
+        match n {
+            2 => self.ins.push(I::V128Load64Zero(mem(off, 2))),
+            3 => {
+                let a = self.new_local(ValType::I32);
+                self.ins.extend([
+                    I::LocalTee(a),
+                    I::LocalGet(a),
+                    I::V128Load64Zero(mem(off, 2)),
+                    I::V128Load32Lane { memarg: mem(off + 8, 2), lane: 2 },
+                ]);
+            }
+            _ => self.ins.push(I::V128Load(mem(off, 2))),
+        }
+    }
+
+    /// Stores the `v128` on top of the stack as a vector of `n` components at the address
+    /// below it plus `off`: only its own bytes.
+    fn vec_store(&mut self, n: u8, off: u32) {
+        match n {
+            2 => self.ins.push(I::V128Store64Lane { memarg: mem(off, 2), lane: 0 }),
+            3 => {
+                let x = self.new_local(ValType::V128);
+                let a = self.new_local(ValType::I32);
+                self.ins.extend([
+                    I::LocalSet(x),
+                    I::LocalTee(a),
+                    I::LocalGet(x),
+                    I::V128Store64Lane { memarg: mem(off, 2), lane: 0 },
+                    I::LocalGet(a),
+                    I::LocalGet(x),
+                    I::V128Store32Lane { memarg: mem(off + 8, 2), lane: 2 },
+                ]);
+            }
+            _ => self.ins.push(I::V128Store(mem(off, 2))),
+        }
+    }
+
     /// The scalar a value of type `t` is in memory: a pointer is a `u32` (a derived
     /// projection's result holds pointers in a struct).
     fn scalar(&self, t: ir::TypeId) -> R<ir::Scalar> {
@@ -425,6 +518,14 @@ impl<'m> Fe<'m> {
 
     fn epilogue(&mut self) {
         self.ins.extend([I::LocalGet(self.saved_sp), I::GlobalSet(globals::SP)]);
+        if self.f.counted {
+            self.ins.extend([
+                I::GlobalGet(globals::DEPTH),
+                I::I32Const(1),
+                I::I32Sub,
+                I::GlobalSet(globals::DEPTH),
+            ]);
+        }
     }
 
     fn trap_if(&mut self) {
@@ -505,7 +606,7 @@ impl<'m> Fe<'m> {
                 Ok(t)
             }
             ir::PlaceRoot::Data(d) => {
-                let at = self.data.get(d.index()).ok_or("internal: missing constant data")?;
+                let at = self.at.data.get(d.index()).ok_or("internal: missing constant data")?;
                 self.ins.push(I::I32Const(*at as i32));
                 Ok(self.m.data[d.index()].ty)
             }
@@ -589,13 +690,25 @@ impl<'m> Fe<'m> {
 
     fn load_place(&mut self, p: &ir::Place, dst: ir::ValueId) -> R<()> {
         if let ir::PlaceRoot::Local(l) = &p.root
-            && p.path.is_empty()
             && let LocalRepr::Scalar(w) = self.ir_locals[l.index()]
         {
-            self.ins.extend([I::LocalGet(w), I::LocalSet(self.v(dst))]);
+            self.ins.push(I::LocalGet(w));
+            match p.path.as_slice() {
+                [] => {}
+                // A component of a vector in a `v128`.
+                [ir::Proj::Comp(c)] => self.ins.push(I::F32x4ExtractLane(*c)),
+                _ => return Err(format!("internal: a load of {p:?} from a local in a register")),
+            }
+            self.ins.push(I::LocalSet(self.v(dst)));
             return Ok(());
         }
         let t = self.vty(dst);
+        if let Some(n) = self.vec_n(t) {
+            self.addr(p)?;
+            self.vec_load(n, 0);
+            self.ins.push(I::LocalSet(self.v(dst)));
+            return Ok(());
+        }
         if self.m.types.is_aggregate(t) {
             // Copy into the value's own slot.
             self.slot_addr(dst)?;
@@ -612,14 +725,28 @@ impl<'m> Fe<'m> {
 
     fn store_place(&mut self, p: &ir::Place, v: ir::ValueId) -> R<()> {
         if let ir::PlaceRoot::Local(l) = &p.root
-            && p.path.is_empty()
             && let LocalRepr::Scalar(w) = self.ir_locals[l.index()]
         {
-            self.ins.extend([I::LocalGet(self.v(v)), I::LocalSet(w)]);
+            match p.path.as_slice() {
+                [] => self.ins.extend([I::LocalGet(self.v(v)), I::LocalSet(w)]),
+                // A component of a vector in a `v128`.
+                [ir::Proj::Comp(c)] => self.ins.extend([
+                    I::LocalGet(w),
+                    I::LocalGet(self.v(v)),
+                    I::F32x4ReplaceLane(*c),
+                    I::LocalSet(w),
+                ]),
+                _ => return Err(format!("internal: a store to {p:?} in a local in a register")),
+            }
             return Ok(());
         }
         let t = self.vty(v);
         self.addr(p)?;
+        if let Some(n) = self.vec_n(t) {
+            self.ins.push(I::LocalGet(self.v(v)));
+            self.vec_store(n, 0);
+            return Ok(());
+        }
         if self.m.types.is_aggregate(t) {
             self.ins.push(I::LocalGet(self.v(v)));
             self.copy(t);
@@ -633,6 +760,11 @@ impl<'m> Fe<'m> {
     /// Stores scalar or aggregate value `v` at `[addr local] + offset`.
     fn store_at(&mut self, addr: u32, offset: u32, v: ir::ValueId) -> R<()> {
         let t = self.vty(v);
+        if let Some(n) = self.vec_n(t) {
+            self.ins.extend([I::LocalGet(addr), I::LocalGet(self.v(v))]);
+            self.vec_store(n, offset);
+            return Ok(());
+        }
         if self.m.types.is_aggregate(t) {
             self.ins.extend([
                 I::LocalGet(addr),
@@ -687,7 +819,7 @@ impl<'m> Fe<'m> {
     fn stmt(&mut self, s: &ir::Stmt) -> R<()> {
         for l in self.local_starts.remove(&std::ptr::from_ref(s)).unwrap_or_default() {
             // A local used before holds an old value; the IR local starts at zero.
-            let t = repr(&self.m.types, self.f.locals[l.index()].ty);
+            let t = repr(&self.m.types, self.f.locals[l.index()].ty, self.at.simd);
             let used = self.free.get(&t).is_some_and(|free| !free.is_empty());
             let w = self.reuse_local(t);
             if used {
@@ -696,7 +828,7 @@ impl<'m> Fe<'m> {
             self.ir_locals[l.index()] = LocalRepr::Scalar(w);
         }
         if let ir::Stmt::Let(v, _) = s {
-            let t = repr(&self.m.types, self.vty(*v));
+            let t = repr(&self.m.types, self.vty(*v), self.at.simd);
             self.values[v.index()] = self.reuse_local(t);
         }
         self.scratch.push(Vec::new());
@@ -733,6 +865,14 @@ impl<'m> Fe<'m> {
                 Ok(())
             }
             ir::Stmt::Loop { body, continuing } => {
+                // Four iterations at a time first, where they can be (`vloop`); not in a debug
+                // build, whose NaN checks panic at an iteration.
+                if self.at.simd
+                    && self.m.nan_message.is_none()
+                    && let Some(plan) = vloop::plan(self, body, continuing)
+                {
+                    vloop::emit(self, &plan)?;
+                }
                 self.ins.push(I::Block(BlockType::Empty));
                 self.labels.push(Label::LoopExit);
                 self.ins.push(I::Loop(BlockType::Empty));
@@ -793,7 +933,7 @@ impl<'m> Fe<'m> {
             ir::Expr::Call(f, args) => {
                 let callee = &self.m.functions[f.index()];
                 // A callee that returns a value through a pointer still needs somewhere to put it.
-                let sret = sret(self.m, callee);
+                let sret = sret(self.m, callee, self.at.simd);
                 if let Some(t) = callee.ret
                     && sret
                 {
@@ -801,15 +941,106 @@ impl<'m> Fe<'m> {
                     self.frame_addr(off);
                 }
                 self.call_args(args)?;
-                self.ins.push(I::Call(self.first_fn + f.0));
+                self.ins.push(I::Call(self.at.first_fn + f.0));
                 if callee.ret.is_some() && !sret {
                     self.ins.push(I::Drop);
                 }
                 Ok(())
             }
             ir::Expr::Host(op, args) => ops::host(self, op, args, None),
+            ir::Expr::Mem(op, args) => self.mem_op(*op, args, None),
             _ => Ok(()),
         }
+    }
+
+    /// A raw memory operation, its result (if any) in `dst`.
+    fn mem_op(&mut self, op: ir::MemOp, args: &[ir::ValueId], dst: Option<ir::ValueId>) -> R<()> {
+        let arg = |fe: &Self, i: usize| -> R<I<'static>> {
+            let v = args.get(i).ok_or("internal: a memory operation without its arguments")?;
+            Ok(I::LocalGet(fe.v(*v)))
+        };
+        match op {
+            ir::MemOp::HeapBase => self.ins.push(I::I32Const(self.at.heap_base as i32)),
+            ir::MemOp::Pages => self.ins.push(I::MemorySize(0)),
+            ir::MemOp::Grow => self.ins.extend([arg(self, 0)?, I::MemoryGrow(0)]),
+            ir::MemOp::Load(s) => self.ins.extend([arg(self, 0)?, load_op(s, 0)]),
+            ir::MemOp::Store(s) => self.ins.extend([arg(self, 0)?, arg(self, 1)?, store_op(s, 0)]),
+            ir::MemOp::Copy => self.ins.extend([
+                arg(self, 0)?,
+                arg(self, 1)?,
+                arg(self, 2)?,
+                I::MemoryCopy { src_mem: 0, dst_mem: 0 },
+            ]),
+            ir::MemOp::Fill => {
+                self.ins.extend([arg(self, 0)?, arg(self, 1)?, arg(self, 2)?, I::MemoryFill(0)])
+            }
+            ir::MemOp::Ptr | ir::MemOp::Addr => self.ins.push(arg(self, 0)?),
+            // The memory is shared: workers run the same code at once.
+            ir::MemOp::Cas => self.ins.extend([
+                arg(self, 0)?,
+                arg(self, 1)?,
+                arg(self, 2)?,
+                I::I32AtomicRmwCmpxchg(mem(0, 2)),
+            ]),
+            ir::MemOp::AtomicAdd => {
+                self.ins.extend([arg(self, 0)?, arg(self, 1)?, I::I32AtomicRmwAdd(mem(0, 2))])
+            }
+            ir::MemOp::AtomicLoad => self.ins.extend([arg(self, 0)?, I::I32AtomicLoad(mem(0, 2))]),
+            ir::MemOp::AtomicStore => {
+                self.ins.extend([arg(self, 0)?, arg(self, 1)?, I::I32AtomicStore(mem(0, 2))])
+            }
+            ir::MemOp::Wait => self.ins.extend([
+                arg(self, 0)?,
+                arg(self, 1)?,
+                // No time limit.
+                I::I64Const(-1),
+                I::MemoryAtomicWait32(mem(0, 2)),
+            ]),
+            ir::MemOp::Notify => {
+                self.ins.extend([arg(self, 0)?, arg(self, 1)?, I::MemoryAtomicNotify(mem(0, 2))])
+            }
+            ir::MemOp::RunTask => self.ins.extend([
+                arg(self, 1)?,
+                arg(self, 2)?,
+                arg(self, 0)?,
+                I::CallIndirect { type_index: self.at.helpers.task_type, table_index: 0 },
+            ]),
+            ir::MemOp::Panic => {
+                // The count, cut to the room there is; the bytes; then the trap.
+                let n = self.new_local(ValType::I32);
+                self.ins.extend([
+                    arg(self, 1)?,
+                    I::I32Const(memory::PANIC_CAP as i32),
+                    arg(self, 1)?,
+                    I::I32Const(memory::PANIC_CAP as i32),
+                    I::I32LeU,
+                    I::Select,
+                    I::LocalSet(n),
+                    I::I32Const(memory::PANIC_MESSAGE as i32),
+                    I::LocalGet(n),
+                    I::I32Store(mem(0, 2)),
+                    I::I32Const(memory::PANIC_MESSAGE as i32 + 4),
+                    arg(self, 0)?,
+                    I::LocalGet(n),
+                    I::MemoryCopy { src_mem: 0, dst_mem: 0 },
+                    I::Unreachable,
+                ]);
+                return Ok(());
+            }
+        }
+        if let Some(v) = dst {
+            self.ins.push(I::LocalSet(self.v(v)));
+        } else if !matches!(
+            op,
+            ir::MemOp::Store(_)
+                | ir::MemOp::Copy
+                | ir::MemOp::Fill
+                | ir::MemOp::AtomicStore
+                | ir::MemOp::RunTask
+        ) {
+            self.ins.push(I::Drop);
+        }
+        Ok(())
     }
 
     fn call_args(&mut self, args: &[ir::Arg]) -> R<()> {
@@ -843,7 +1074,9 @@ impl<'m> Fe<'m> {
                 self.ins.extend([i, I::LocalSet(self.v(v))]);
             }
             ir::Expr::Zero(_) => {
-                if self.m.types.is_aggregate(t) {
+                if self.vec_n(t).is_some() {
+                    self.ins.extend([I::V128Const(0), I::LocalSet(self.v(v))]);
+                } else if self.m.types.is_aggregate(t) {
                     self.fresh_slot(v, true)?;
                 } else {
                     let s = self.scalar(t)?;
@@ -876,12 +1109,12 @@ impl<'m> Fe<'m> {
                 ]);
             }
             ir::Expr::Call(f, args) => {
-                let sret = sret(self.m, &self.m.functions[f.index()]);
+                let sret = sret(self.m, &self.m.functions[f.index()], self.at.simd);
                 if sret {
                     self.slot_addr(v)?;
                 }
                 self.call_args(args)?;
-                self.ins.push(I::Call(self.first_fn + f.0));
+                self.ins.push(I::Call(self.at.first_fn + f.0));
                 if sret {
                     self.set_to_slot(v)?;
                 } else {
@@ -899,16 +1132,51 @@ impl<'m> Fe<'m> {
                 }
             }
             ir::Expr::Extract(x, i) => self.extract(v, *x, *i)?,
+            ir::Expr::ExtractDyn(x, i) if self.vec_n(self.vty(*x)).is_some() => {
+                // A lane of a `v128`, by a value: checked, then each lane chosen in turn.
+                let n = self.vec_n(self.vty(*x)).unwrap_or(4);
+                self.bounds_check(*i, u32::from(n));
+                self.ins.extend([I::LocalGet(self.v(*x)), I::F32x4ExtractLane(0)]);
+                for lane in 1..n {
+                    self.ins.extend([
+                        I::LocalSet(self.v(v)),
+                        I::LocalGet(self.v(*x)),
+                        I::F32x4ExtractLane(lane),
+                        I::LocalGet(self.v(v)),
+                        I::LocalGet(self.v(*i)),
+                        I::I32Const(i32::from(lane)),
+                        I::I32Eq,
+                        I::Select,
+                    ]);
+                }
+                self.ins.push(I::LocalSet(self.v(v)));
+            }
             ir::Expr::ExtractDyn(x, i) => {
                 let xt = self.vty(*x);
                 self.ins.push(I::LocalGet(self.v(*x)));
                 let et = self.project(xt, &ir::Proj::Index(*i))?;
-                if self.m.types.is_aggregate(et) {
+                if let Some(n) = self.vec_n(et) {
+                    self.vec_load(n, 0);
+                    self.ins.push(I::LocalSet(self.v(v)));
+                } else if self.m.types.is_aggregate(et) {
                     self.ins.push(I::LocalSet(self.v(v)));
                 } else {
                     let s = self.scalar(et)?;
                     self.ins.extend([load_op(s, 0), I::LocalSet(self.v(v))]);
                 }
+            }
+            ir::Expr::Splat(x, _) if self.at.simd => {
+                self.ins.extend([I::LocalGet(self.v(*x)), I::F32x4Splat, I::LocalSet(self.v(v))]);
+            }
+            ir::Expr::Swizzle(x, comps) if self.at.simd => {
+                // Lanes past the result's repeat its first component.
+                let lanes = std::array::from_fn(|k| comps.get(k).copied().unwrap_or(comps[0]));
+                self.ins.extend([
+                    I::LocalGet(self.v(*x)),
+                    I::LocalGet(self.v(*x)),
+                    I::I8x16Shuffle(ops::shuffle(lanes)),
+                    I::LocalSet(self.v(v)),
+                ]);
             }
             ir::Expr::Splat(x, n) => {
                 let a = self.fresh_slot(v, false)?;
@@ -940,19 +1208,25 @@ impl<'m> Fe<'m> {
             ir::Expr::Bitcast(x, to) => {
                 let from = self.scalar(self.vty(*x))?;
                 self.ins.push(I::LocalGet(self.v(*x)));
+                // A NaN's bits are canonical where a bit cast observes them (§11).
                 match (from, to) {
                     (ir::Scalar::F32, ir::Scalar::U32 | ir::Scalar::I32) => {
+                        ops::canonical_on_stack(self, false);
                         self.ins.push(I::I32ReinterpretF32)
                     }
                     (ir::Scalar::U32 | ir::Scalar::I32, ir::Scalar::F32) => {
                         self.ins.push(I::F32ReinterpretI32)
                     }
                     (ir::Scalar::F64, ir::Scalar::U64 | ir::Scalar::I64) => {
+                        ops::canonical_on_stack(self, true);
                         self.ins.push(I::I64ReinterpretF64)
                     }
                     (ir::Scalar::U64 | ir::Scalar::I64, ir::Scalar::F64) => {
                         self.ins.push(I::F64ReinterpretI64)
                     }
+                    // Integers of one width share their bits: nothing to do.
+                    (ir::Scalar::U32 | ir::Scalar::I32, ir::Scalar::U32 | ir::Scalar::I32)
+                    | (ir::Scalar::U64 | ir::Scalar::I64, ir::Scalar::U64 | ir::Scalar::I64) => {}
                     _ => return Err(format!("internal: bitcast {from:?} to {to:?}")),
                 }
                 self.ins.push(I::LocalSet(self.v(v)));
@@ -967,12 +1241,25 @@ impl<'m> Fe<'m> {
                 ]);
             }
             ir::Expr::Unary(op, x) => ops::unary(self, v, *op, *x)?,
-            ir::Expr::Binary(op, a, b) => ops::binary(self, v, *op, *a, *b)?,
-            ir::Expr::Builtin(b, args) => ops::builtin(self, v, *b, args)?,
+            ir::Expr::Binary(op, a, b) => {
+                ops::binary(self, v, *op, *a, *b)?;
+                if !op.is_comparison() {
+                    ops::nan_check(self, v, &[*a, *b]);
+                }
+            }
+            ir::Expr::Builtin(b, args) => {
+                ops::builtin(self, v, *b, args)?;
+                ops::nan_check(self, v, args);
+            }
             ir::Expr::Host(op, args) => ops::host(self, op, args, Some(v))?,
+            ir::Expr::Mem(op, args) => self.mem_op(*op, args, Some(v))?,
             ir::Expr::EntryInput(_) => return Err("internal: a GPU entry input in CPU code".into()),
             ir::Expr::ArrayLength(_) => {
                 return Err("internal: a storage buffer's length in CPU code".into());
+            }
+            ir::Expr::Texture(..) => return Err("internal: a texture read in CPU code".into()),
+            ir::Expr::Atomic(..) | ir::Expr::Barrier => {
+                return Err("internal: an atomic or a barrier in CPU code".into());
             }
         }
         Ok(())
@@ -983,6 +1270,16 @@ impl<'m> Fe<'m> {
     }
 
     fn construct(&mut self, v: ir::ValueId, t: ir::TypeId, parts: &[ir::ValueId]) -> R<()> {
+        if self.vec_n(t).is_some() {
+            // The first component in every lane, then the others in theirs.
+            let (first, rest) = parts.split_first().ok_or("internal: an empty vector")?;
+            self.ins.extend([I::LocalGet(self.v(*first)), I::F32x4Splat]);
+            for (k, p) in rest.iter().enumerate() {
+                self.ins.extend([I::LocalGet(self.v(*p)), I::F32x4ReplaceLane(k as u8 + 1)]);
+            }
+            self.ins.push(I::LocalSet(self.v(v)));
+            return Ok(());
+        }
         // A vector's parts are its components; other types can have padding.
         let a = self.fresh_slot(v, !self.m.types.is_vector(t))?;
         match *self.ty(t) {
@@ -1011,6 +1308,12 @@ impl<'m> Fe<'m> {
                     self.store_at(a, stride.saturating_mul(k as u32), p)?;
                 }
             }
+            // A run's address, then its length.
+            ir::TypeDef::Run(_) => {
+                for (k, &p) in parts.iter().enumerate() {
+                    self.store_at(a, 4 * k as u32, p)?;
+                }
+            }
             ref d => return Err(format!("internal: construct {d:?}")),
         }
         Ok(())
@@ -1018,6 +1321,15 @@ impl<'m> Fe<'m> {
 
     fn extract(&mut self, v: ir::ValueId, x: ir::ValueId, i: u32) -> R<()> {
         let xt = self.vty(x);
+        if self.vec_n(xt).is_some() {
+            let lane = u8::try_from(i).map_err(|_| "internal: a vector component past 3")?;
+            self.ins.extend([
+                I::LocalGet(self.v(x)),
+                I::F32x4ExtractLane(lane),
+                I::LocalSet(self.v(v)),
+            ]);
+            return Ok(());
+        }
         let (off, et) = match *self.ty(xt) {
             ir::TypeDef::Struct { .. } | ir::TypeDef::Enum { .. } => {
                 let ft = self.m.types.field(xt, i).ok_or("internal: a missing field")?;
@@ -1035,7 +1347,9 @@ impl<'m> Fe<'m> {
             ref d => return Err(format!("internal: extract from {d:?}")),
         };
         self.ins.push(I::LocalGet(self.v(x)));
-        if self.m.types.is_aggregate(et) {
+        if let Some(n) = self.vec_n(et) {
+            self.vec_load(n, off);
+        } else if self.m.types.is_aggregate(et) {
             // An immutable view of part of an immutable value: no copy needed.
             self.add_offset(off);
         } else {
@@ -1048,6 +1362,7 @@ impl<'m> Fe<'m> {
 }
 
 mod ops;
+mod vloop;
 pub(crate) use ops::helper_bodies;
 
 /// An export's wrapper: scalars and flattened vectors in, a scalar or a flattened vector out,
@@ -1055,24 +1370,120 @@ pub(crate) use ops::helper_bodies;
 /// (the result's room first, then each vector parameter's). A host passes an 8- or 16-bit
 /// integer or a `bool` as any i32: it's brought into range as a conversion would (the low bits;
 /// any nonzero `bool` is true), since the code inside assumes it is.
+/// `__worker(index)`'s body: worker `index`'s stack (below `memory::MAX_WORKERS`, or a trap),
+/// then std's worker loop (function `worker`), which returns when the host shuts it down.
+/// The start function of a module whose memory is shared: copies the constants (passive data
+/// segment 0, `len` bytes) to `base` once, however many instances share the memory. The first
+/// instance claims [`memory::DATA_READY`] and copies; any other waits until it reads 2. Each
+/// then drops its segment.
+pub(crate) fn init_data(base: u32, len: u32) -> Function {
+    let flag = memory::DATA_READY as i32;
+    let ins = [
+        I::I32Const(flag),
+        I::I32Const(0),
+        I::I32Const(1),
+        I::I32AtomicRmwCmpxchg(mem(0, 2)),
+        I::If(BlockType::Empty),
+        // Another instance copies, or has.
+        I::Block(BlockType::Empty),
+        I::Loop(BlockType::Empty),
+        I::I32Const(flag),
+        I::I32AtomicLoad(mem(0, 2)),
+        I::I32Const(2),
+        I::I32Eq,
+        I::BrIf(1),
+        I::I32Const(flag),
+        I::I32Const(1),
+        I::I64Const(-1),
+        I::MemoryAtomicWait32(mem(0, 2)),
+        I::Drop,
+        I::Br(0),
+        I::End,
+        I::End,
+        I::Else,
+        I::I32Const(base as i32),
+        I::I32Const(0),
+        I::I32Const(len as i32),
+        I::MemoryInit { mem: 0, data_index: 0 },
+        I::I32Const(flag),
+        I::I32Const(2),
+        I::I32AtomicStore(mem(0, 2)),
+        I::I32Const(flag),
+        I::I32Const(-1),
+        I::MemoryAtomicNotify(mem(0, 2)),
+        I::Drop,
+        I::End,
+        I::DataDrop(0),
+        I::End,
+    ];
+    function([], &ins)
+}
+
+/// `__audio(task, context)`: sets the audio thread's own stack, then calls task `task` (by
+/// index, of type `task_type`) with the context and chunk 0 (wrela_abi's `EXPORT_AUDIO`).
+pub(crate) fn audio_wrapper(task_type: u32) -> Function {
+    let ins = [
+        I::I32Const(memory::AUDIO_STACK_LIMIT as i32),
+        I::GlobalSet(globals::STACK_FLOOR),
+        I::I32Const(memory::AUDIO_STACK_TOP as i32),
+        I::GlobalSet(globals::SP),
+        I::LocalGet(1),
+        I::I32Const(0),
+        I::LocalGet(0),
+        I::CallIndirect { type_index: task_type, table_index: 0 },
+        I::End,
+    ];
+    function([], &ins)
+}
+
+pub(crate) fn worker_wrapper(worker: u32) -> Function {
+    let size = memory::WORKER_STACK_SIZE as i32;
+    let top = memory::STACK_TOP as i32;
+    let ins = [
+        I::LocalGet(0),
+        I::I32Const(memory::MAX_WORKERS as i32),
+        I::I32GeU,
+        I::If(BlockType::Empty),
+        I::Unreachable,
+        I::End,
+        // Its floor: STACK_TOP + index × size; its top, one size up.
+        I::LocalGet(0),
+        I::I32Const(size),
+        I::I32Mul,
+        I::I32Const(top),
+        I::I32Add,
+        I::GlobalSet(globals::STACK_FLOOR),
+        I::GlobalGet(globals::STACK_FLOOR),
+        I::I32Const(size),
+        I::I32Add,
+        I::GlobalSet(globals::SP),
+        I::Call(worker),
+        I::End,
+    ];
+    function([], &ins)
+}
+
 pub(crate) fn export_wrapper(
     m: &ir::Module,
     f: ir::FuncId,
     index: u32,
     h: &Helpers,
     stack_top: u32,
+    simd: bool,
 ) -> R<(Vec<ValType>, Vec<ValType>, Function)> {
     const VEC: i32 = 16;
     let func = &m.functions[f.index()];
+    // A vector result: in memory (`sret`), or a `v128` with SIMD.
     let (results, sret, comps) = match func.ret {
         None => (Vec::new(), false, 0),
         Some(t) => match m.types.get(t) {
             ir::TypeDef::Scalar(s) => (vec![valtype(*s)], false, 0),
-            ir::TypeDef::Vector(n) => (vec![ValType::F32; *n as usize], true, u32::from(*n)),
+            ir::TypeDef::Vector(n) => (vec![ValType::F32; *n as usize], !simd, u32::from(*n)),
             d => return Err(format!("internal: export returns {d:?}")),
         },
     };
-    // Each parameter: its first WASM parameter, and for a vector, its components and offset.
+    // Each parameter: its first WASM parameter, and for a vector, its components and offset
+    // (`None` for a `v128`).
     let mut params = Vec::new();
     let mut ins_args = Vec::new();
     let mut normalize = Vec::new();
@@ -1080,18 +1491,22 @@ pub(crate) fn export_wrapper(
     for p in &func.params {
         let at = params.len() as u32;
         match m.types.get(p.ty) {
-            // By value or as a place, a vector parameter is its address.
+            ir::TypeDef::Vector(n) if simd && !p.by_ref => {
+                params.extend(std::iter::repeat_n(ValType::F32, *n as usize));
+                ins_args.push((at, Some((u32::from(*n), None))));
+            }
+            // As a place (or by value, without SIMD), a vector parameter is its address.
             ir::TypeDef::Vector(n) => {
                 params.extend(std::iter::repeat_n(ValType::F32, *n as usize));
-                ins_args.push((at, Some((u32::from(*n), size))));
+                ins_args.push((at, Some((u32::from(*n), Some(size)))));
                 size += VEC;
             }
-            _ if m.types.is_aggregate(p.ty) => {
+            _ if in_memory(&m.types, p.ty, simd) => {
                 return Err(format!("internal: export {} takes an aggregate", func.name));
             }
             _ if p.by_ref => return Err(format!("internal: export {} takes a place", func.name)),
             _ => {
-                params.push(repr(&m.types, p.ty));
+                params.push(repr(&m.types, p.ty, simd));
                 ins_args.push((at, None));
                 if let Some(s) = m.types.as_scalar(p.ty) {
                     normalize.push((at, s));
@@ -1100,32 +1515,29 @@ pub(crate) fn export_wrapper(
         }
     }
     let n = params.len() as u32;
-    // Locals: the frame's address, then the scalar result while the flush runs.
+    // Locals: the frame's address, then the scalar or `v128` result while the flush runs.
     let frame = n;
     let mut locals: Vec<ValType> = vec![ValType::I32];
     if !sret && !results.is_empty() {
-        locals.push(results[0]);
+        locals.push(if comps > 0 { ValType::V128 } else { results[0] });
     }
     let result = n + 1;
     // A call starts afresh even after one that trapped (a host may go on calling, as tests
-    // do): the shadow stack empty, and the batch the trap left unsubmitted dropped. The buffers
-    // it made, the host never saw; the ones it destroyed, the host still has, and this call's
-    // release destroys them.
+    // do): the shadow stack empty, and the batch the trap left unsubmitted dropped. The
+    // resources it made, the host never saw, so their handles are made again.
     let mut ins: Vec<I<'static>> = vec![
         I::I32Const(stack_top as i32),
         I::GlobalSet(globals::SP),
+        I::I32Const(0),
+        I::GlobalSet(globals::DEPTH),
         I::GlobalGet(globals::CMD_LEN),
         I::If(BlockType::Empty),
         I::I32Const(0),
         I::GlobalSet(globals::CMD_LEN),
         I::GlobalGet(globals::SUBMITTED_TO),
         I::GlobalSet(globals::NEXT_HANDLE),
-        I::GlobalGet(globals::RELEASED_TO),
-        I::GlobalSet(globals::LIVE_FROM),
         I::End,
     ];
-    // The previous call's buffers go first.
-    ins.push(I::Call(h.release));
     for (at, s) in normalize {
         let fix = match s {
             ir::Scalar::U8 => vec![I::I32Const(0xFF), I::I32And],
@@ -1149,7 +1561,7 @@ pub(crate) fn export_wrapper(
         ]);
     }
     for &(at, vector) in &ins_args {
-        if let Some((comps, off)) = vector {
+        if let Some((comps, Some(off))) = vector {
             for c in 0..comps {
                 ins.extend([
                     I::LocalGet(frame),
@@ -1164,7 +1576,13 @@ pub(crate) fn export_wrapper(
     }
     for &(at, vector) in &ins_args {
         match vector {
-            Some((_, off)) => ins.extend([I::LocalGet(frame), I::I32Const(off), I::I32Add]),
+            Some((_, Some(off))) => ins.extend([I::LocalGet(frame), I::I32Const(off), I::I32Add]),
+            Some((comps, None)) => {
+                ins.extend([I::LocalGet(at), I::F32x4Splat]);
+                for c in 1..comps {
+                    ins.extend([I::LocalGet(at + c), I::F32x4ReplaceLane(c as u8)]);
+                }
+            }
             None => ins.push(I::LocalGet(at)),
         }
     }
@@ -1176,6 +1594,10 @@ pub(crate) fn export_wrapper(
     if sret {
         for c in 0..comps {
             ins.extend([I::LocalGet(frame), I::F32Load(mem(4 * c, 2))]);
+        }
+    } else if comps > 0 {
+        for c in 0..comps {
+            ins.extend([I::LocalGet(result), I::F32x4ExtractLane(c as u8)]);
         }
     } else if !results.is_empty() {
         ins.push(I::LocalGet(result));

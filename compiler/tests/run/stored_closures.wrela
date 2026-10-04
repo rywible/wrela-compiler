@@ -1,0 +1,53 @@
+// run: a closure that captures only `Copy` values is a value: it can be stored in a struct,
+// returned inside one, and called from where it's stored
+// expect: shade(2.0) = 21.0
+// expect: twice_stored(3.0) = 18.0
+// expect: copied_at_creation() = 10.0
+// expect: named_fn(4.0) = 8.0
+
+struct With<F> {
+    base: f32,
+    f: F,
+}
+
+impl<F: fn(f32) -> f32> With<F> {
+    fn eval(self, x: f32) -> f32 {
+        self.base + (self.f)(x)
+    }
+}
+
+fn tinted<F: fn(f32) -> f32>(base: f32, f: F) -> With<F> {
+    With { base, f }
+}
+
+pub fn shade(x: f32) -> f32 {
+    let seed = 10.0
+    let w = tinted(1.0, |p| p * seed)
+    w.eval(x)
+}
+
+fn apply_twice<F: fn(f32) -> f32>(f: F, x: f32) -> f32 {
+    f(f(x))
+}
+
+pub fn twice_stored(x: f32) -> f32 {
+    let k = 1.0
+    let w = tinted(0.0, |p| p + k)
+    apply_twice(w.f, x) * 2.0 + w.eval(0.0) * 8.0
+}
+
+pub fn copied_at_creation() -> f32 {
+    var scale = 2.0
+    let f = |p: f32| p * scale
+    scale = 100.0
+    f(5.0)
+}
+
+fn double(x: f32) -> f32 {
+    x * 2.0
+}
+
+pub fn named_fn(x: f32) -> f32 {
+    let w = tinted(0.0, double)
+    w.eval(x)
+}

@@ -1,0 +1,7 @@
+// mistake: `?` on a `Result` in a function that returns an `Option`
+// expect: E0300
+// fix: no
+fn parse(text: Result<u32, Text>) -> Option<u32> {
+    let n = text?
+    Some(n + 1)
+}

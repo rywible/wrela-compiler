@@ -1,0 +1,34 @@
+// A method in a trait's `impl` whose signature isn't the trait's: other parameter types, other
+// modes, another return type.
+// ---- wrong
+trait Shape {
+    fn area(self) -> f32
+}
+
+struct Square {
+    side: f32,
+}
+
+impl Shape for Square {
+    fn area(self) -> u32 {
+        1
+    }
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+trait Shape {
+    fn area(self) -> f32
+}
+
+struct Square {
+    side: f32,
+}
+
+impl Shape for Square {
+    fn area(self) -> f32 {
+        self.side * self.side
+    }
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

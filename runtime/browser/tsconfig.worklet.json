@@ -1,0 +1,9 @@
+{
+  "//": "The audio worklet. TypeScript has no AudioWorklet lib: WebWorker gives WebAssembly and the types messages.ts names, and worklet.ts declares the AudioWorkletGlobalScope names it uses.",
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "lib": ["ES2023", "WebWorker"],
+    "types": []
+  },
+  "files": ["src/worklet.ts"]
+}

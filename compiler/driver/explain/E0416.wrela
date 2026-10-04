@@ -1,0 +1,17 @@
+// A method of a `@fieldwise` trait that can't be derived field by field, and has no default: its
+// return type isn't one a derivation can combine (`()`, `bool`, `Ordering`, `Self`, or a
+// `Result` of `()` or `Self`). Give it a default body, or change what it returns.
+// ---- wrong
+@fieldwise
+trait Size {
+    fn size(self) -> u32
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+@fieldwise
+trait Size {
+    fn size(self, total: mut u32)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

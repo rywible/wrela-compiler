@@ -1,0 +1,24 @@
+// run: an arena of grazers, added, removed and summed
+// expect: total_age() = 5.0
+
+struct Grazer: Clone {
+    age: f32,
+}
+
+pub fn total_age() -> f32 {
+    var herd: Arena<Grazer> = Arena::new()
+    let _ = herd.insert(Grazer { age: 1.0 })
+    let h = herd.insert(Grazer { age: 5.0 })
+    let _ = herd.insert(Grazer { age: 2.0 })
+    let _ = herd.remove(h)
+    for mut g in herd {
+        g.age += 1.0
+    }
+    var total = 0.0
+    for g in herd {
+        total += g.age
+    }
+    total
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

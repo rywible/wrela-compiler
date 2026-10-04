@@ -1,0 +1,15 @@
+// `&` isn't part of wrela's types or expressions: there are no references. A parameter reads
+// its argument in place already; write `mut T` for one the function changes, and pass the
+// argument as `x` or `mut x`.
+// ---- wrong
+fn grow(x: &mut f32) {
+    x = x * 2.0
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+fn grow(x: mut f32) {
+    x = x * 2.0
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

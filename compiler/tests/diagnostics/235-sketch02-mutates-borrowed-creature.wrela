@@ -1,0 +1,12 @@
+// mistake: sketch 02 §8: drawing code that changes the creature it was lent
+// expect: E0505
+// fix: no
+struct Creature {
+    pose: vec3,
+    scale: f32,
+}
+
+fn draw(c: Creature) -> vec3 {
+    c.scale = 1.0
+    c.pose * c.scale
+}

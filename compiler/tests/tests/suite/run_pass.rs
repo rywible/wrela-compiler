@@ -6,12 +6,14 @@
 //! // run: integer `**` with an `i32` base
 //! // expect: sq(-3) = 9
 //! // expect: overflow() traps
+//! // expect: deep(300) panics "recursion deeper than 256 calls"
 //! ```
 //!
 //! A case is a `.wrela` file, built as a one-file package, or a directory, built as a package
 //! (its `main.wrela` holds the expectations). Arguments and results are numbers, read by the
 //! export's WASM types (`u32` and `bool` are `i32`s). A program without a `frame` export gets
-//! an empty one.
+//! an empty one. Each program is also built without SIMD, which must give the same results
+//! (language.md §11).
 
 use crate::{scratch, with_frame};
 use std::path::Path;
@@ -22,6 +24,8 @@ use wrela_tests::{build, cases, copy_dir, header, repo_root};
 enum Want {
     Returns(String),
     Traps,
+    /// A trap after a panic with this message.
+    Panics(String),
 }
 
 struct Expect {
@@ -33,9 +37,11 @@ struct Expect {
 }
 
 fn parse_expect(text: &str) -> Expect {
-    let (call, want) = match text.strip_suffix(" traps") {
-        Some(c) => (c, Want::Traps),
-        None => {
+    let panics = text.split_once(" panics \"").and_then(|(c, m)| Some((c, m.strip_suffix('"')?)));
+    let (call, want) = match (text.strip_suffix(" traps"), panics) {
+        (Some(c), _) => (c, Want::Traps),
+        (None, Some((c, m))) => (c, Want::Panics(m.to_string())),
+        (None, None) => {
             let (c, v) = text
                 .rsplit_once(" = ")
                 .unwrap_or_else(|| panic!("`{text}` isn't `f(..) = v` or `f(..) traps`"));
@@ -94,6 +100,14 @@ fn run_case(path: &Path) -> Result<usize, String> {
     let built = build(&dir).map_err(|e| format!("doesn't build:\n{e}"))?;
     built.write_to(&out).expect("write the build");
     let mut host = CpuHost::load(&out).map_err(|e| format!("doesn't load: {e}"))?;
+    // The same program without SIMD must give the same results (language.md §11; simd.rs).
+    let scalar_out = dir.join("build-scalar");
+    let scalar = wrela_driver::build_without_simd(&dir);
+    if scalar.has_errors() {
+        return Err("doesn't build without SIMD".into());
+    }
+    scalar.write_to(&scalar_out).expect("write the build");
+    let mut scalar = CpuHost::load(&scalar_out).map_err(|e| format!("doesn't load: {e}"))?;
     let exports = host.exports();
     let mut problems = Vec::new();
     for e in &expects {
@@ -107,8 +121,18 @@ fn run_case(path: &Path) -> Result<usize, String> {
         }
         let args: Vec<Value> = e.args.iter().zip(params).map(|(a, t)| value(a, t)).collect();
         let got = host.call_export(&e.call, &args);
+        let without = scalar.call_export(&e.call, &args);
+        let agree = match (&got, &without) {
+            (Ok(x), Ok(y)) => x.len() == y.len() && x.iter().zip(y).all(|(a, b)| same(a, b)),
+            (Err(Error::Trap(x)), Err(Error::Trap(y))) => x == y,
+            _ => false,
+        };
+        if !agree {
+            problems.push(format!("`{}`: {got:?} with SIMD, {without:?} without", e.text));
+        }
         match (&e.want, got) {
             (Want::Traps, Err(Error::Trap(_))) => {}
+            (Want::Panics(m), Err(Error::Trap(t))) if t.starts_with(&format!("panic: {m}: ")) => {}
             (Want::Returns(v), Ok(_)) if results.is_empty() && v != "()" => {
                 problems.push(format!("`{}`: `{}` returns nothing: expect `()`", e.text, e.call));
             }

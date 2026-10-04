@@ -1,0 +1,10 @@
+// mistake: sketch 01 §6: reading something besides the inputs (the device) in a deterministic step
+// expect: E0600
+// fix: no
+use std::gpu::limits
+
+@deterministic
+fn step(phase: f32, dt: f32) -> f32 {
+    let wide = limits().max_texture_size > 4096
+    if wide { phase + dt } else { phase + 2.0 * dt }
+}

@@ -1,0 +1,67 @@
+// How a creature is drawn (sketch 02 §1): ordinary engine data. Game code overrides fields
+// (sketch 01 §5), and the engine's quality profiles override them per device. Nothing here is
+// known to the compiler; struct field defaults (D-048) let a game mention only what it changes.
+
+use std::units::{cm, m, mm}
+
+/// Mesh extraction's error bound: the extracted surface stays within `tolerance` of the field.
+pub struct Mesh: Copy {
+    pub tolerance: f32,
+}
+
+/// Skin weights from each part's own distance, falling off over `falloff` (D-023).
+pub struct ByPart: Copy + GpuData {
+    pub falloff: f32,
+}
+
+/// How the mesh deforms with the skeleton.
+pub struct Skin: Copy + GpuData {
+    pub weights: ByPart,
+    pub max_bones: u32 = 4,
+}
+
+pub enum Shading: Copy + Eq + GpuData {
+    /// The field's gradient per pixel: detail finer than the mesh.
+    PerPixel,
+    /// The mesh's normals: the cheap setting.
+    PerVertex,
+}
+
+/// Far away, the creature as bricks of voxels this size, beyond this distance.
+pub struct Bricks: Copy {
+    pub voxel: f32,
+    pub beyond: f32,
+}
+
+/// How shadows are cast. Creatures deform: shadow maps, not distance fields (D-086).
+pub enum Shadow: Copy {
+    Map { resolution: u32 },
+    None,
+}
+
+/// What evaluates the field: the compiled field, or `std::stage::interpret` for fields built at
+/// run time (D-029).
+pub enum Eval: Copy + Eq {
+    Compiled,
+    Interpreted,
+}
+
+pub struct CreatureLook: Copy {
+    pub surface: Mesh = Mesh { tolerance: 2mm },
+    pub deform: Skin = Skin { weights: ByPart { falloff: 5cm }, max_bones: 4 },
+    pub shading: Shading = Shading::PerPixel,
+    pub far: Option<Bricks> = None,
+    pub shadow: Shadow = Shadow::Map { resolution: 1024 },
+    pub eval: Eval = Eval::Compiled,
+}
+
+impl Mesh {
+    /// The extraction grid's cell for a field whose surface bends no tighter than `radius`:
+    /// a cell's chord stays within `tolerance` (sagitta `c² / 8 r`), at most 2 cm.
+    pub fn cell_size(self, radius: f32) -> f32 {
+        min(sqrt(8.0 * radius * self.tolerance), 2cm)
+    }
+}
+
+/// Far enough that bricks never draw.
+pub const NEVER: f32 = 1000m

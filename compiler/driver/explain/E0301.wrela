@@ -1,0 +1,22 @@
+// A call with more or fewer arguments than the function has parameters (a parameter with a
+// default may be left out).
+// ---- wrong
+fn area(w: f32, h: f32) -> f32 {
+    w * h
+}
+
+fn square() -> f32 {
+    area(2.0, 2.0, 2.0)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+fn area(w: f32, h: f32) -> f32 {
+    w * h
+}
+
+fn square() -> f32 {
+    area(w: 2.0, h: 2.0)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

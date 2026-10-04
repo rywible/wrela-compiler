@@ -1,0 +1,156 @@
+// Requests to the host (language.md §6.15): the program's storage ("bytes at a path") and
+// fetching files of its build. A request is made at once and answered on a later call: the
+// `Pending` it gives is polled, as is a GPU readback's (`std::gpu::read`). Making a request is
+// the `io` effect, and polling one `nondet`, so `@deterministic` code does neither: an answer
+// reaches the simulation only through a tick's input.
+
+/// Why a request failed.
+pub struct IoError: Clone {
+    message: String,
+}
+
+impl IoError {
+    /// What the host said, in its words.
+    pub fn message(self) -> borrow str {
+        self.message
+    }
+}
+
+/// A request the host answers on a later call. Its answer is a run of `T`s: bytes (`T` is
+/// `u8`) for storage and fetch, a buffer's elements for a readback. A `Pending` is an ordinary
+/// value: keep it in the program's state and poll it each frame.
+pub struct Pending<T>: Clone {
+    request: u32,
+    done: bool,
+}
+
+impl<T> Pending<T> {
+    /// The handle of request `request`, just made.
+    pub(package) fn new(request: u32) -> Pending<T> {
+        Pending { request, done: false }
+    }
+}
+
+impl<T: Plain> Pending<T> {
+    /// The answer, once it has arrived: `None` before that, `Some` once, then `None` again.
+    pub fn poll(mut self) -> Option<Result<Vec<T>, IoError>> {
+        if self.done {
+            return None
+        }
+        let status = request_status(self.request)
+        if status == PENDING {
+            return None
+        }
+        self.done = true
+        if status == FAILED {
+            // Forgets the request.
+            let _gone: Vec<u8> = Vec::from_answer(self.request, 0)
+            return Some(
+                Err(IoError { message: String::from("the host couldn't answer the request") }),
+            )
+        }
+        Some(Ok(Vec::from_answer(self.request, u32(status))))
+    }
+
+    /// Whether `poll` has given the answer.
+    pub fn is_done(self) -> bool {
+        self.done
+    }
+}
+
+/// `request_status`'s answers that aren't lengths.
+const PENDING: i32 = -1
+const FAILED: i32 = -2
+
+/// What's wrong with a storage path or a URL, if anything: it's relative, with `/` between its
+/// parts, and none of them empty, `.` or `..` (the hosts check the same).
+fn path_problem(path: str) -> Option<Text> {
+    if path.is_empty() {
+        return Some("is empty")
+    }
+    // `/` first, `\`, `:`, `?` and `#` anywhere.
+    for i in 0..path.len() {
+        let b = path.byte(i)
+        if (i == 0 && b == 47) || b == 92 || b == 58 || b == 63 || b == 35 {
+            return Some("must be relative, with `/` between its parts")
+        }
+    }
+    var start = 0
+    for i in 0..path.len() + 1 {
+        if i == path.len() || path.byte(i) == 47 {
+            let n = i - start
+            let dot = |k: u32| path.byte(start + k) == 46
+            if n == 0 || (n == 1 && dot(0)) || (n == 2 && dot(0) && dot(1)) {
+                return Some("has an empty, `.` or `..` part")
+            }
+            start = i + 1
+        }
+    }
+    None
+}
+
+fn check_path(what: Text, path: str) {
+    if let Some(why) = path_problem(path) {
+        panic(f"{what}: the path `{path}` {why}")
+    }
+}
+
+/// Reads the bytes stored at `path` in the program's storage: the host's files in the native
+/// host, the origin's private file system in a browser.
+pub fn load(path: str) -> Pending<u8> {
+    check_path("load", path)
+    let request = next_request()
+    storage_read_command(request, path)
+    Pending::new(request)
+}
+
+/// Stores `bytes` at `path` in the program's storage, replacing what was there. The answer is
+/// no bytes.
+pub fn store(path: str, bytes: [u8]) -> Pending<u8> {
+    check_path("store", path)
+    let request = next_request()
+    storage_write_command(request, path, bytes)
+    Pending::new(request)
+}
+
+/// Fetches the file at `url`, relative to the program's build.
+pub fn fetch(url: str) -> Pending<u8> {
+    check_path("fetch", url)
+    let request = next_request()
+    fetch_command(request, url)
+    Pending::new(request)
+}
+
+/// Shows `line` on the host's console: the terminal that runs the native host, the browser's
+/// developer console. For finding out what a program does while writing it; a player doesn't
+/// see it. It's the `io` effect, so `@deterministic` code doesn't print.
+///
+/// ```wrela
+/// use std::io::print
+///
+/// let n = 3
+/// print(f"{n} grazers, {0.5:.2} m apart")
+/// ```
+pub fn print(line: str) {
+    print_command(line)
+}
+
+/// A new request number.
+@intrinsic
+pub(package) fn next_request() -> u32 {}
+
+/// -1 while request `request` is pending, -2 if it failed, else its answer's length in bytes.
+@intrinsic
+pub(package) fn request_status(request: u32) -> i32 {}
+
+@intrinsic
+fn storage_read_command(request: u32, path: str) {}
+
+@intrinsic
+fn storage_write_command(request: u32, path: str, bytes: [u8]) {}
+
+@intrinsic
+fn fetch_command(request: u32, url: str) {}
+
+@intrinsic
+fn print_command(line: str) {}

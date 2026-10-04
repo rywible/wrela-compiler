@@ -3,7 +3,7 @@ struct Inner {
     x: f32,
 }
 
-struct Outer: Copy + Clone {
+struct Outer: Copy {
     inner: Inner, //~ E0407
 }
 
@@ -15,7 +15,7 @@ struct P {
     x: f32,
 }
 
-impl Copy for P {} //~ E0403
+impl Copy for P {} //~ E0415
 
 struct Holder: GpuData {
     xs: [f32; 0], //~ E0407

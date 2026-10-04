@@ -1,0 +1,4 @@
+// mistake: adding a length to a time
+// expect: E0305
+// fix: no
+const REACH: f32 = 2.0m + 3.0s

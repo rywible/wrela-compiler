@@ -1,0 +1,34 @@
+// rejects: const.build
+// A panic while the build computes a constant is a compile error, where the program's own code
+// panicked, with the calls that led there (§10).
+struct Skeleton {
+    bones: Vec<Text>,
+}
+
+impl Skeleton {
+    fn bone(self, name: Text) -> u32 {
+        for i in 0..self.bones.len() {
+            if self.bones[i] == name {
+                return i
+            }
+        }
+        panic(f"no bone is named `{name}`") //~ E0704
+    }
+}
+
+fn grazer() -> Skeleton {
+    var bones = Vec::new()
+    bones.push("hip")
+    bones.push("chest")
+    Skeleton { bones }
+}
+
+const GRAZER = grazer()
+const HIP = GRAZER.bone("hip")
+const CHEST = GRAZER.bone("chets")
+
+// An index past the end panics too.
+const NUMBERS: Vec<u32> = Vec::new()
+const FIRST = NUMBERS[0] //~ E0704
+
+pub fn frame(time: f32, width: u32, height: u32) {}

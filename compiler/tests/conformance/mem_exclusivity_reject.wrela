@@ -21,12 +21,12 @@ fn f(w: mut World) -> u32 {
     let c = read(w) //~ E0506
     v += 1.0
     pair(mut w.values[1], mut w.values[2]) //~ E0513
-    let l = w.log
+    borrow l = w.log
     w.log = Log { count: 0 } //~ E0507
     c + l.count
 }
 
-enum Phase: Copy + Clone {
+enum Phase: Copy {
     Start,
     Done,
 }

@@ -1,0 +1,261 @@
+// Acoustics (sketch 01 §7): engine code, not stdlib (D-081). A part's vibration modes come from
+// its field, shape and density, by an eigenvalue solve that a constant runs when the program is
+// built (`const HOOF_MODES = modal_modes(hoof())`); a strike excites them on the audio thread.
+
+use std::derive::{Box3, interval}
+use std::field::{Blend, Field, Surface}
+use std::hash::StateHash
+use std::math::{TAU, cos, exp, sin}
+use std::serialize::Serialize
+
+/// How much of a strike's energy a surface takes, per second of ringing: 0 rings on, 1 is
+/// dead.
+pub struct Absorption: Copy + GpuData + Blend + StateHash + Serialize {
+    pub coefficient: f32,
+}
+
+pub const SOFT_TISSUE: Absorption = Absorption { coefficient: 0.9 }
+pub const KERATIN: Absorption = Absorption { coefficient: 0.25 }
+pub const SOIL: Absorption = Absorption { coefficient: 0.6 }
+pub const ROCK: Absorption = Absorption { coefficient: 0.1 }
+
+/// What the modal solve reads from a field's channels.
+pub trait Acoustic {
+    /// kg/m³.
+    fn density(self) -> f32
+
+    /// Young's modulus, in pascals.
+    fn stiffness(self) -> f32
+}
+
+/// The most modes a solve keeps.
+pub const MODES: u32 = 8
+
+/// A body's lowest vibration modes: each one's frequency (Hz) and how strongly a strike
+/// excites it.
+pub struct ModalModes: Copy + StateHash {
+    pub count: u32,
+    pub frequency: [f32; 8],
+    pub gain: [f32; 8],
+}
+
+/// The cells of the lattice the solve puts masses on, per axis.
+const LATTICE: u32 = 6
+
+/// The modes of the body a field describes, from a lattice of masses inside it, joined by
+/// springs to their neighbours: the lowest eigenvalues of the lattice's stiffness over its
+/// mass. Run it in a constant: an eigenvalue solve is far too slow for the audio thread, and
+/// staging is never left to the optimizer (D-072). `extent` bounds the field around its origin.
+pub fn modal_modes<C: Acoustic, F: Field<C>>(field: F, extent: f32) -> ModalModes {
+    // The body's box: the cells of a coarse grid whose interval reaches inside (the derived
+    // interval, so a thin part isn't missed between samples).
+    let n = 16
+    let cell = 2.0 * extent / f32(n)
+    var lo = vec3(extent)
+    var hi = vec3(-extent)
+    for i in 0..n * n * n {
+        let c = vec3(f32(i % n), f32((i / n) % n), f32(i / (n * n)))
+        let b = Box3 { lo: vec3(-extent) + c * cell, hi: vec3(-extent) + (c + 1.0) * cell }
+        let r = interval(|q: vec3| field.distance(q), b)
+        if r.lo < 0.0 {
+            lo = min(lo, b.lo)
+            hi = max(hi, b.hi)
+        }
+    }
+    assert(lo.x < hi.x, "a field with nothing inside has no modes")
+    // A lattice over that box; a node is a mass where its cell's centre is inside.
+    let step = (hi - lo) / f32(LATTICE)
+    var index = [u32(0); 216]
+    var nodes: Vec<vec3> = Vec::new()
+    for i in 0..LATTICE * LATTICE * LATTICE {
+        let c = vec3(f32(i % LATTICE), f32((i / LATTICE) % LATTICE), f32(i / (LATTICE * LATTICE)))
+        let p = lo + (c + 0.5) * step
+        if field.distance(p) < 0.0 {
+            nodes.push(p)
+            index[i] = nodes.len()
+        }
+    }
+    let count = nodes.len()
+    assert(count >= 2, "too thin a body for its lattice")
+    // The stiffness matrix over the masses: a spring of stiffness E h between neighbours, each
+    // mass ρ h³, so K / m is E / (ρ h²) times the lattice's graph Laplacian.
+    let h = (step.x + step.y + step.z) / 3.0
+    let mid = field.channels(lo + 0.5 * (hi - lo))
+    let scale = mid.stiffness() / (mid.density() * h * h)
+    var k: Vec<f64> = Vec::new()
+    for _ in 0..count * count {
+        k.push(0.0)
+    }
+    for i in 0..LATTICE * LATTICE * LATTICE {
+        let a = index[i]
+        if a == 0 {
+            continue
+        }
+        let (x, y, z) = (i % LATTICE, (i / LATTICE) % LATTICE, i / (LATTICE * LATTICE))
+        let neighbours = [
+            if x + 1 < LATTICE { index[i + 1] } else { 0 },
+            if y + 1 < LATTICE { index[i + LATTICE] } else { 0 },
+            if z + 1 < LATTICE { index[i + LATTICE * LATTICE] } else { 0 },
+        ]
+        for b in neighbours {
+            if b == 0 {
+                continue
+            }
+            let (u, v) = (a - 1, b - 1)
+            k[u * count + u] += f64(scale)
+            k[v * count + v] += f64(scale)
+            k[u * count + v] -= f64(scale)
+            k[v * count + u] -= f64(scale)
+        }
+    }
+    let values = jacobi_eigenvalues(mut k, count)
+    // The lowest nonzero ones (the zeros are rigid motions), as frequencies.
+    var out = ModalModes { count: 0, frequency: [0.0; 8], gain: [0.0; 8] }
+    for lambda in values {
+        if lambda <= 1e-6 * f64(scale) || out.count == MODES {
+            continue
+        }
+        out.frequency[out.count] = f32(sqrt(lambda)) / TAU
+        out.gain[out.count] = 1.0 / f32(out.count + 1)
+        out.count += 1
+    }
+    out
+}
+
+/// The eigenvalues of the symmetric `n` by `n` matrix `a` (row by row), ascending: cyclic Jacobi
+/// rotations until the off-diagonal is negligible. `a` is destroyed.
+fn jacobi_eigenvalues(a: mut Vec<f64>, n: u32) -> Vec<f64> {
+    for _ in 0..50 {
+        var off = 0.0
+        var diag = 0.0
+        for i in 0..n {
+            for j in 0..n {
+                let x = a[i * n + j]
+                if i == j { diag += x * x } else { off += x * x }
+            }
+        }
+        if off <= 1e-24 * diag {
+            break
+        }
+        for p in 0..n {
+            for q in p + 1..n {
+                let apq = a[p * n + q]
+                if abs(apq) < 1e-300 {
+                    continue
+                }
+                let theta = (a[q * n + q] - a[p * n + p]) / (2.0 * apq)
+                let t = sign(theta) / (abs(theta) + sqrt(theta * theta + 1.0))
+                let t = if theta == 0.0 { 1.0 } else { t }
+                let c = 1.0 / sqrt(t * t + 1.0)
+                let s = t * c
+                for r in 0..n {
+                    let arp = a[r * n + p]
+                    let arq = a[r * n + q]
+                    a[r * n + p] = c * arp - s * arq
+                    a[r * n + q] = s * arp + c * arq
+                }
+                for r in 0..n {
+                    let apr = a[p * n + r]
+                    let aqr = a[q * n + r]
+                    a[p * n + r] = c * apr - s * aqr
+                    a[q * n + r] = s * apr + c * aqr
+                }
+            }
+        }
+    }
+    var values: Vec<f64> = Vec::new()
+    for i in 0..n {
+        values.push(a[i * n + i])
+    }
+    values.sort_by(|x, y| x < y)
+    values
+}
+
+/// What a surface is like where something hit it: its acoustic channel.
+pub struct SurfacePoint: Copy {
+    pub absorption: Absorption,
+}
+
+/// Where something hit, and how hard (N·s).
+pub struct Contact: Copy {
+    pub surface: SurfacePoint,
+    pub impulse: f32,
+}
+
+/// What a strike rings: each mode's frequency, starting amplitude and decay per sample.
+pub struct Voice: Copy {
+    pub count: u32,
+    pub frequency: [f32; 8],
+    pub amplitude: [f32; 8],
+    pub decay: [f32; 8],
+}
+
+/// The modes of a body struck with `impulse` against a surface that absorbs `against`.
+@audio
+pub fn modal(modes: ModalModes, against: Absorption, impulse: f32) -> Voice {
+    var v = Voice {
+        count: modes.count,
+        frequency: modes.frequency,
+        amplitude: [0.0; 8],
+        decay: [1.0; 8],
+    }
+    for i in 0..modes.count {
+        v.amplitude[i] = impulse * modes.gain[i]
+        // The surface takes its fraction of the energy per second; higher modes go faster.
+        let per_second = 1.0 + 8.0 * against.coefficient * (1.0 + 0.25 * f32(i))
+        v.decay[i] = exp(-per_second / 48000.0)
+    }
+    v
+}
+
+/// Resonators ringing: a bank a voice's strikes add to.
+pub struct Bank: Copy {
+    re: [f32; 32],
+    im: [f32; 32],
+    cos_w: [f32; 32],
+    sin_w: [f32; 32],
+    decay: [f32; 32],
+    next: u32,
+}
+
+pub fn bank() -> Bank {
+    Bank {
+        re: [0.0; 32],
+        im: [0.0; 32],
+        cos_w: [1.0; 32],
+        sin_w: [0.0; 32],
+        decay: [0.0; 32],
+        next: 0,
+    }
+}
+
+impl Bank {
+    /// Starts a voice's modes ringing, in the bank's oldest slots.
+    @audio
+    pub fn strike(mut self, v: Voice) {
+        for i in 0..v.count {
+            let s = self.next
+            let w = TAU * v.frequency[i] / 48000.0
+            self.re[s] = 0.0
+            self.im[s] = v.amplitude[i]
+            self.cos_w[s] = cos(w)
+            self.sin_w[s] = sin(w)
+            self.decay[s] = v.decay[i]
+            self.next = (self.next + 1) % 32
+        }
+    }
+
+    /// The bank's next sample.
+    @audio
+    pub fn sample(mut self) -> f32 {
+        var y = 0.0
+        for i in 0..32 {
+            let re = (self.re[i] * self.cos_w[i] - self.im[i] * self.sin_w[i]) * self.decay[i]
+            let im = (self.re[i] * self.sin_w[i] + self.im[i] * self.cos_w[i]) * self.decay[i]
+            self.re[i] = re
+            self.im[i] = im
+            y += im
+        }
+        y
+    }
+}

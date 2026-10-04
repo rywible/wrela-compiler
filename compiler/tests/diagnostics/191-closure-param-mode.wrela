@@ -1,0 +1,12 @@
+// mistake: a mode on a closure's parameter
+// expect: E0100
+// fix: yes
+fn each(xs: mut Vec<f32>, f: fn(mut f32)) {
+    for mut x in xs {
+        f(mut x)
+    }
+}
+
+fn double(xs: mut Vec<f32>) {
+    each(mut xs, |x: mut f32| { x *= 2.0 })
+}

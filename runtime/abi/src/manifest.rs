@@ -1,4 +1,4 @@
-//! # The manifest, version 1
+//! # The manifest, version 2
 //!
 //! `manifest.json` describes everything game-specific a host needs besides the WASM: each
 //! pipeline's shader, entry points and bindings (D-099). The runtime reads it at load; nothing
@@ -8,23 +8,35 @@
 //! - A pipeline's **uniform block** holds every small `GpuData` argument of its entry points,
 //!   packed in parameter order by WGSL's layout rules. It's a `uniform` binding when its layout
 //!   satisfies WGSL's uniform rules, else a read-only `storage` binding (same bytes either way).
-//! - Its **buffers** are the `GpuBuffer`s passed for `[T]` (read) and `Slots<T>` (read-write)
-//!   parameters, in parameter order.
-//! - A render pipeline draws a triangle list into the screen, whose format is [`SCREEN_FORMAT`]
-//!   without sRGB encoding, so hosts produce the same bytes.
+//! - Its other **bindings** are, in parameter order, what its entry points take besides
+//!   uniforms and builtins: buffers for `[T]` (read) and `Slots<T>` (read-write) parameters,
+//!   textures, depth textures, samplers and comparison samplers. A dispatch or draw lists one
+//!   binding of the command stream for each, in the same order.
+//! - A debug build's pipeline may have a **debug flag**: a read-write storage buffer of one
+//!   `atomic<u32>` at the binding `debug_flag` names, which no command lists. The host makes
+//!   one 4-byte buffer for the program, binds it there in every dispatch and draw, and reads it
+//!   after each frame: a pipeline that indexed an array out of range stored its number in the
+//!   manifest's list, from 1 (the largest such number stays).
+//! - A render pipeline draws a triangle list into its pass's colour target: the screen, whose
+//!   format is [`SCREEN_FORMAT`] without sRGB encoding (so hosts produce the same bytes), or a
+//!   texture. With a depth target, a fragment is kept where its depth is less than what's
+//!   there, which it replaces. Hosts make one pipeline per combination of target formats a
+//!   pipeline is drawn with.
 
+use crate::Limits;
 use serde::Serialize;
 use serde_json::{Map, Value};
 use std::fmt;
 
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 /// The screen's texture format, in WebGPU's spelling.
 pub const SCREEN_FORMAT: &str = "rgba8unorm";
-/// WebGPU's default limits that the manifest is checked against.
-pub const MAX_WORKGROUP_SIZE: [u32; 3] = [256, 256, 64];
-pub const MAX_WORKGROUP_INVOCATIONS: u32 = 256;
-pub const MAX_STORAGE_BUFFERS_PER_STAGE: usize = 8;
-pub const MAX_UNIFORM_BUFFER_BINDING_SIZE: u32 = 65536;
+/// WebGPU's default limits that the manifest is checked against ([`Limits::DEFAULT`]).
+pub const MAX_WORKGROUP_SIZE: [u32; 3] = Limits::DEFAULT.max_workgroup_size;
+pub const MAX_WORKGROUP_INVOCATIONS: u32 = Limits::DEFAULT.max_workgroup_invocations;
+pub const MAX_STORAGE_BUFFERS_PER_STAGE: usize =
+    Limits::DEFAULT.max_storage_buffers_per_stage as usize;
+pub const MAX_UNIFORM_BUFFER_BINDING_SIZE: u32 = Limits::DEFAULT.max_uniform_buffer_binding_size;
 
 /// Whether a file the manifest names is one in the build directory, as both hosts read it: a
 /// name of letters, digits, `_`, `-` and `.`, not starting with `.`. Not a path that leaves
@@ -53,7 +65,10 @@ pub struct Pipeline {
     #[serde(flatten)]
     pub stage: Stage,
     pub uniform: Option<UniformBlock>,
-    pub buffers: Vec<BufferBinding>,
+    pub bindings: Vec<ResourceBinding>,
+    /// A debug build's: the binding of the flag its bounds checks set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub debug_flag: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -78,17 +93,63 @@ pub struct UniformBlock {
     pub space: UniformSpace,
 }
 
+/// What a pipeline binds at one binding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum Access {
+pub enum BindingKind {
+    /// A storage buffer the pipeline reads.
     Read,
+    /// A storage buffer it reads and writes.
     ReadWrite,
+    /// A filterable float texture.
+    Texture,
+    /// A depth texture, for comparison sampling.
+    DepthTexture,
+    /// A filtering sampler.
+    Sampler,
+    /// A comparison sampler.
+    ComparisonSampler,
+}
+
+impl BindingKind {
+    pub const ALL: [BindingKind; 6] = [
+        BindingKind::Read,
+        BindingKind::ReadWrite,
+        BindingKind::Texture,
+        BindingKind::DepthTexture,
+        BindingKind::Sampler,
+        BindingKind::ComparisonSampler,
+    ];
+
+    pub fn is_buffer(self) -> bool {
+        matches!(self, BindingKind::Read | BindingKind::ReadWrite)
+    }
+
+    pub fn is_texture(self) -> bool {
+        matches!(self, BindingKind::Texture | BindingKind::DepthTexture)
+    }
+
+    pub fn is_sampler(self) -> bool {
+        matches!(self, BindingKind::Sampler | BindingKind::ComparisonSampler)
+    }
+
+    /// The name the manifest gives it.
+    pub fn name(self) -> &'static str {
+        match self {
+            BindingKind::Read => "read",
+            BindingKind::ReadWrite => "read_write",
+            BindingKind::Texture => "texture",
+            BindingKind::DepthTexture => "depth_texture",
+            BindingKind::Sampler => "sampler",
+            BindingKind::ComparisonSampler => "comparison_sampler",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
-pub struct BufferBinding {
+pub struct ResourceBinding {
     pub binding: u32,
-    pub access: Access,
+    pub kind: BindingKind,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -161,7 +222,7 @@ impl Manifest {
                     "pipeline {i}'s shader name isn't a file name in the build directory"
                 ));
             }
-            let mut bindings: Vec<u32> = p.buffers.iter().map(|b| b.binding).collect();
+            let mut bindings: Vec<u32> = p.bindings.iter().map(|b| b.binding).collect();
             if let Some(u) = &p.uniform {
                 if u.size == 0 || u.size % 4 != 0 {
                     return err(format!(
@@ -184,14 +245,16 @@ impl Manifest {
                 }
                 bindings.push(u.binding);
             }
+            bindings.extend(p.debug_flag);
             let n = bindings.len();
             bindings.sort_unstable();
             bindings.dedup();
             if bindings.len() != n {
                 return err(format!("pipeline {i} uses a binding twice"));
             }
-            let storage = p.buffers.len()
-                + usize::from(p.uniform.as_ref().is_some_and(|u| u.space == UniformSpace::Storage));
+            let storage = p.bindings.iter().filter(|b| b.kind.is_buffer()).count()
+                + usize::from(p.uniform.as_ref().is_some_and(|u| u.space == UniformSpace::Storage))
+                + usize::from(p.debug_flag.is_some());
             if storage > MAX_STORAGE_BUFFERS_PER_STAGE {
                 return err(format!(
                     "pipeline {i} has {storage} storage buffers; WebGPU's default limit is {MAX_STORAGE_BUFFERS_PER_STAGE}"
@@ -335,19 +398,26 @@ mod read {
                 })
             }
         };
-        let Value::Array(bufs) = field(o, "buffers", &place)? else {
-            return fail(format!("{place}.buffers must be an array"));
+        let Value::Array(list) = field(o, "bindings", &place)? else {
+            return fail(format!("{place}.bindings must be an array"));
         };
-        let buffers = bufs
+        let kinds = [
+            ("read", BindingKind::Read),
+            ("read_write", BindingKind::ReadWrite),
+            ("texture", BindingKind::Texture),
+            ("depth_texture", BindingKind::DepthTexture),
+            ("sampler", BindingKind::Sampler),
+            ("comparison_sampler", BindingKind::ComparisonSampler),
+        ];
+        let bindings = list
             .iter()
             .enumerate()
             .map(|(j, b)| {
-                let bp = format!("{place}.buffers[{j}]");
+                let bp = format!("{place}.bindings[{j}]");
                 let bo = object(b, &bp)?;
-                let accesses = [("read", Access::Read), ("read_write", Access::ReadWrite)];
-                Ok(BufferBinding {
+                Ok(ResourceBinding {
                     binding: u32(bo, "binding", &bp)?,
-                    access: one_of(bo, "access", &bp, &accesses)?,
+                    kind: one_of(bo, "kind", &bp, &kinds)?,
                 })
             })
             .collect::<Result<_>>()?;
@@ -368,7 +438,12 @@ mod read {
                 fragment_entry: string(o, "fragment_entry", &place)?,
             },
         };
-        Ok(Pipeline { name, shader, stage, uniform, buffers })
+        // A missing `debug_flag` is read as null.
+        let debug_flag = match o.get("debug_flag").unwrap_or(&Value::Null) {
+            Value::Null => None,
+            v => Some(as_u32(v, &format!("{place}.debug_flag"))?),
+        };
+        Ok(Pipeline { name, shader, stage, uniform, bindings, debug_flag })
     }
 
     /// A manifest whose version has been checked.
@@ -400,8 +475,8 @@ mod tests {
     fn golden_json() {
         let json = sample().to_json();
         let expected = r#"{
-  "manifest_version": 1,
-  "stream_version": 2,
+  "manifest_version": 2,
+  "stream_version": 4,
   "wasm": "game.wasm",
   "pipelines": [
     {
@@ -419,10 +494,10 @@ mod tests {
         "size": 32,
         "space": "uniform"
       },
-      "buffers": [
+      "bindings": [
         {
           "binding": 1,
-          "access": "read_write"
+          "kind": "read_write"
         }
       ]
     },
@@ -433,7 +508,16 @@ mod tests {
       "vertex_entry": "vs",
       "fragment_entry": "fs",
       "uniform": null,
-      "buffers": []
+      "bindings": [
+        {
+          "binding": 0,
+          "kind": "texture"
+        },
+        {
+          "binding": 1,
+          "kind": "sampler"
+        }
+      ]
     }
   ]
 }
@@ -444,9 +528,9 @@ mod tests {
 
     #[test]
     fn rejects_other_versions() {
-        let json = sample().to_json().replace("\"manifest_version\": 1", "\"manifest_version\": 2");
+        let json = sample().to_json().replace("\"manifest_version\": 2", "\"manifest_version\": 1");
         assert!(Manifest::parse(&json).is_err());
-        let json = sample().to_json().replace("\"stream_version\": 2", "\"stream_version\": 9");
+        let json = sample().to_json().replace("\"stream_version\": 4", "\"stream_version\": 9");
         assert!(Manifest::parse(&json).is_err());
     }
 
@@ -458,7 +542,7 @@ mod tests {
         }
         assert!(m.validate().is_err());
         let mut m = sample();
-        m.pipelines[0].buffers[0].binding = 0;
+        m.pipelines[0].bindings[0].binding = 0;
         assert!(m.validate().is_err());
         let mut m = sample();
         m.pipelines[0].uniform =

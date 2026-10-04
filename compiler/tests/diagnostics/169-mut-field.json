@@ -1,0 +1,30 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0519",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [
+        "store a handle (`Handle<T>`) or an owned copy, make the type a `borrow struct`, or pass a closure that does the work where the place is"
+      ],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "a `mut` field is a projection, so it can't be a field of an ordinary struct",
+      "notes": [
+        "a projection lives only as long as the call that made it (§6.6)"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 10,
+        "end": 155,
+        "end_column": 13,
+        "end_line": 9,
+        "line": 9,
+        "start": 152
+      },
+      "title": "a projection as a field of an ordinary type"
+    }
+  ],
+  "version": 2
+}

@@ -1,0 +1,30 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0607",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [
+        "use `sample_level` (or `sample_compare_level`), which any GPU code can call"
+      ],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "sampling picks its detail from neighbouring pixels, so it's in fragment shaders only, and this is the vertex shader `cover`",
+      "notes": [
+        "called through `cover` → `Texture::sample`"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 13,
+        "end": 339,
+        "end_column": 46,
+        "end_line": 11,
+        "line": 11,
+        "start": 306
+      },
+      "title": "a GPU feature used in CPU code"
+    }
+  ],
+  "version": 2
+}

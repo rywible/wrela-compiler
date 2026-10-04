@@ -1,0 +1,8 @@
+// mistake: sketch 03 §7: the wall clock in `tick` (wrela has none: time is an input)
+// expect: E0200
+// fix: no
+@deterministic
+fn tick(turn: u32) -> u32 {
+    let t = clock_now()
+    turn + 1
+}

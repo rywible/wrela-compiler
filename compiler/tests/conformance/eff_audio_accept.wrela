@@ -1,0 +1,41 @@
+// accepts: eff.audio
+// `@audio` code may read its state and the events a ring brings it, do arithmetic, call
+// std's math and panic; a voice's state moves to the audio thread with `play`.
+use std::audio::{RingReader, RingWriter, SAMPLE_RATE, play, ring}
+use std::math::sin
+
+struct Tone {
+    phase: f32,
+    pitch: f32,
+    pitches: RingReader<f32>,
+}
+
+@audio
+fn tone(t: mut Tone, out: mut [f32]) {
+    if let Some(p) = t.pitches.pop() {
+        t.pitch = p
+    }
+    for i in 0..out.len() {
+        out[i] = 0.1 * sin(t.phase)
+        t.phase += 6.2831853 * t.pitch / f32(SAMPLE_RATE)
+        if t.phase > 6.2831853 {
+            t.phase -= 6.2831853
+        }
+    }
+}
+
+pub struct Game {
+    pitches: RingWriter<f32>,
+}
+
+pub fn init() -> Game {
+    let (writer, reader) = ring::<f32>(8)
+    var w = take writer
+    let _ = w.push(440.0)
+    play(Tone { phase: 0.0, pitch: 220.0, pitches: take reader }, tone)
+    Game { pitches: take w }
+}
+
+pub fn frame(state: mut Game, time: f32, width: u32, height: u32) {
+    let _ = state.pitches.push(220.0 + time)
+}

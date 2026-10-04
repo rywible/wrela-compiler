@@ -1,0 +1,76 @@
+// run: borrow structs as results (§6.6): a function returns one built from its parameters, and
+// `pair_mut` gives two elements to change at once, checked at run time (§6.5)
+// expect: arena_pair() = 11
+// expect: same_handle() panics "pair_mut: both handles name one value"
+// expect: vec_pair() = 3
+// expect: same_index() panics "pair_mut: both indices name one element"
+// expect: made() = 7
+
+struct G: Clone {
+    hunger: u32,
+}
+
+pub fn arena_pair() -> u32 {
+    var herd = Arena::new()
+    let x = herd.insert(G { hunger: 1 })
+    let y = herd.insert(G { hunger: 10 })
+    let both = herd.pair_mut(x, y)
+    both.a.hunger += both.b.hunger
+    both.b.hunger = 0
+    herd[x].hunger + herd[y].hunger
+}
+
+pub fn same_handle() -> u32 {
+    var herd = Arena::new()
+    let x = herd.insert(G { hunger: 1 })
+    let both = herd.pair_mut(x, x)
+    both.a.hunger
+}
+
+pub fn vec_pair() -> u32 {
+    var v = Vec::new()
+    v.push(1)
+    v.push(2)
+    let p = v.pair_mut(i: 0, j: 1)
+    p.a += p.b
+    v[0]
+}
+
+pub fn same_index() -> u32 {
+    var v = Vec::new()
+    v.push(1)
+    let p = v.pair_mut(i: 0, j: 0)
+    p.a
+}
+
+struct World {
+    count: u32,
+}
+
+struct Frame {
+    n: u32,
+}
+
+borrow struct Ctx {
+    world: borrow World,
+    frame: mut Frame,
+}
+
+fn make(world: World, frame: mut Frame) -> Ctx {
+    Ctx { world, frame: mut frame }
+}
+
+fn step(c: Ctx) {
+    c.frame.n += c.world.count
+}
+
+pub fn made() -> u32 {
+    let w = World { count: 3 }
+    var f = Frame { n: 1 }
+    let c = make(w, mut f)
+    step(c)
+    step(c)
+    f.n
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

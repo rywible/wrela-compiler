@@ -1,0 +1,21 @@
+// run: functions that return `mut` projections
+// expect: run() = 23.0
+
+fn biggest(xs: mut [f32]) -> mut f32 {
+    var at = 0
+    for i in 1..xs.len() {
+        if xs[i] > xs[at] {
+            at = i
+        }
+    }
+    mut xs[at]
+}
+
+pub fn run() -> f32 {
+    var xs = [1.0, 9.0, 4.0]
+    mut b = biggest(mut xs)
+    b *= 2.0
+    xs[0] + xs[1] + xs[2]
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

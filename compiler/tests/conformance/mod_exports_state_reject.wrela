@@ -1,0 +1,12 @@
+// rejects: mod.use
+// With `init`, `frame` takes the state first; `init` takes nothing and returns the state.
+struct World {
+    t: f32,
+}
+
+pub fn init() -> World {
+    World { t: 0.0 }
+}
+
+pub fn frame(time: f32, width: u32, height: u32) { //~ E0703
+}

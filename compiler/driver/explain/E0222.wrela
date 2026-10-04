@@ -1,0 +1,28 @@
+// A `@test` that `wrela test` can't run. A test of code is a free function of no parameters
+// and no result: `wrela test` calls it with nothing and reads nothing back, so it checks what
+// it computes with `assert`. A frame test, `@test(frames: n)`, runs the program's frames first
+// and takes nothing, or the program's state, borrowed. A method, a generic function or an
+// entry point can't be a test.
+// ---- wrong
+fn area(w: f32, h: f32) -> f32 {
+    w * h
+}
+
+@test
+fn area_of_a_square(side: f32) -> bool {
+    area(side, side) == side * side
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+fn area(w: f32, h: f32) -> f32 {
+    w * h
+}
+
+@test
+fn area_of_a_square() {
+    let side = 3.0
+    assert(area(side, side) == 9.0)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

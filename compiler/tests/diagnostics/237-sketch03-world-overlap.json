@@ -1,0 +1,41 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0513",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [
+        {
+          "file": "main.wrela",
+          "message": "`w` is passed here",
+          "span": {
+            "column": 28,
+            "end": 357,
+            "end_column": 29,
+            "end_line": 18,
+            "line": 18,
+            "start": 356
+          }
+        }
+      ],
+      "message": "`w.grazers[_]` overlaps `w`, which this call already takes",
+      "notes": [
+        "in one call, arguments can't overlap when one of them is `mut` (§6.5)"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 10,
+        "end": 354,
+        "end_column": 26,
+        "end_line": 18,
+        "line": 18,
+        "start": 338
+      },
+      "title": "overlapping arguments where one is `mut`"
+    }
+  ],
+  "version": 2
+}

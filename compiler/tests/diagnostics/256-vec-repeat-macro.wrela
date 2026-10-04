@@ -1,0 +1,6 @@
+// mistake: `vec![x; n]` for n copies, as in Rust
+// expect: E0115
+// fix: no
+fn zeros() -> Vec<f32> {
+    vec![0.0; 4]
+}

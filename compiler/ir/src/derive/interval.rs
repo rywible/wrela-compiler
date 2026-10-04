@@ -63,13 +63,17 @@ pub(super) fn interval(
         )));
     }
     let f32 = m.types.f32();
-    if func.ret != Some(f32) || func.ret_ref {
-        return Err(Error::not_derivable("an interval needs a function that returns an `f32`"));
+    let ret_ok = func.ret.is_some_and(|r| r == f32 || matches!(m.types.get(r), TypeDef::Vector(_)));
+    if !ret_ok || func.ret_ref {
+        return Err(Error::not_derivable(
+            "an interval needs a function that returns an `f32` or a float vector",
+        ));
     }
-    let mut mask = vec![false; func.params.len()];
-    mask[xi] = true;
+    let out_ty = func.ret.unwrap_or(f32);
+    let mut mask = vec![0; func.params.len()];
+    mask[xi] = all_bits(&m.types, x_ty);
     let d = derive(m, cache, f, mask.clone(), target, false)?;
-    let returns = returns_active(m, cache, f, mask, Mode::Interval);
+    let returns = returns_active(m, cache, f, mask, Mode::Interval) != 0;
 
     let mut params = func.params[..xi].to_vec();
     params.push(Param { name: "over".into(), ty: box_ty, by_ref: false, mutable: false });
@@ -100,22 +104,45 @@ pub(super) fn interval(
     body.push(Stmt::Let(r, Expr::Call(d, args)));
     let (mut rlo, mut rhi) = (r, r);
     if returns {
-        rlo = g.new_value(f32);
+        rlo = g.new_value(out_ty);
         body.push(Stmt::Let(rlo, Expr::Extract(r, 0)));
-        rhi = g.new_value(f32);
+        rhi = g.new_value(out_ty);
         body.push(Stmt::Let(rhi, Expr::Extract(r, 1)));
     }
     if target == Target::Cpu {
-        // A NaN bound means "unknown": make it infinite.
+        // A NaN bound means "unknown": make it infinite, a component at a time.
         let b = m.types.bool();
+        let n = match m.types.get(out_ty) {
+            TypeDef::Vector(n) => Some(*n as u32),
+            _ => None,
+        };
         for (v, inf) in [(&mut rlo, f32::NEG_INFINITY), (&mut rhi, f32::INFINITY)] {
-            let ok = g.new_value(b);
-            body.push(Stmt::Let(ok, Expr::Binary(BinOp::Eq, *v, *v)));
-            let c = g.new_value(f32);
-            body.push(Stmt::Let(c, Expr::Const(Const::F32(inf))));
-            let s = g.new_value(f32);
-            body.push(Stmt::Let(s, Expr::Select { cond: ok, if_true: *v, if_false: c }));
-            *v = s;
+            let mut parts = Vec::new();
+            for c in 0..n.unwrap_or(1) {
+                let x = match n {
+                    Some(_) => {
+                        let x = g.new_value(f32);
+                        body.push(Stmt::Let(x, Expr::Extract(*v, c)));
+                        x
+                    }
+                    None => *v,
+                };
+                let ok = g.new_value(b);
+                body.push(Stmt::Let(ok, Expr::Binary(BinOp::Eq, x, x)));
+                let k = g.new_value(f32);
+                body.push(Stmt::Let(k, Expr::Const(Const::F32(inf))));
+                let s = g.new_value(f32);
+                body.push(Stmt::Let(s, Expr::Select { cond: ok, if_true: x, if_false: k }));
+                parts.push(s);
+            }
+            *v = match n {
+                Some(_) => {
+                    let w = g.new_value(out_ty);
+                    body.push(Stmt::Let(w, Expr::Construct(out_ty, parts)));
+                    w
+                }
+                None => parts[0],
+            };
         }
     }
     let out = g.new_value(interval_ty);
@@ -133,7 +160,7 @@ fn derive(
     m: &mut Module,
     cache: &mut DeriveCache,
     f: FuncId,
-    mask: Vec<bool>,
+    mask: Vec<Bits>,
     target: Target,
     speculative: bool,
 ) -> R<FuncId> {
@@ -156,7 +183,7 @@ fn derive(
     let orig = m.functions[f.index()].clone();
     no_gpu_work(&orig.body)?;
     let exit = single_exit(m, &orig);
-    let returns = returns_active(m, cache, f, mask.clone(), Mode::Interval);
+    let returns = returns_active(m, cache, f, mask.clone(), Mode::Interval) != 0;
     let (func, result, act) = match exit {
         None => (orig, None, body_activity(m, cache, f, &mask, Mode::Interval)),
         Some((func, result)) => {
@@ -177,10 +204,11 @@ fn derive(
     no_write_through_mut(&func, &act, &mask, "a range")?;
     let mut nf = func.clone_signature();
     nf.name = format!("{}_iv", func.name);
+    nf.interval = true;
     // A range's `lo` takes the original's slot, as a range type.
     let mut hparam = vec![None; func.params.len()];
     for (i, p) in func.params.iter().enumerate() {
-        if mask[i] {
+        if mask[i] != 0 {
             let ty = range_ty(&mut m.types, p.ty);
             nf.params[i].ty = ty;
             hparam[i] = Some(nf.params.len() as u32);
@@ -189,7 +217,7 @@ fn derive(
     }
     let mut hlocal = vec![None; func.locals.len()];
     for (l, decl) in func.locals.iter().enumerate() {
-        if act.locals[l] {
+        if act.locals[l] != 0 {
             let ty = range_ty(&mut m.types, decl.ty);
             nf.locals[l].ty = ty;
             hlocal[l] = Some(nf.new_local(format!("{}_hi", decl.name), ty));
@@ -216,9 +244,11 @@ fn derive(
     cache.interval.insert(key.clone(), id);
     cache.building.push((f, key.1.clone(), speculative));
     let ptrs = Pointers::of(m, &func);
+    let local_src = single_stores(m, &func);
     let mut b = Ivx {
         m,
         cache,
+        f: &func,
         act,
         ptrs,
         target,
@@ -226,13 +256,17 @@ fn derive(
         hparam,
         hlocal,
         iv: HashMap::new(),
+        defs: HashMap::new(),
+        local_src,
+        branch_writes: Vec::new(),
+        splitting: false,
         returns,
         speculative: 0,
         track: Track::default(),
     };
     let mut body = Vec::new();
     let built = (|| -> R<()> {
-        if let Some(r) = result.filter(|r| b.act.locals[r.index()]) {
+        if let Some(r) = result.filter(|r| b.act.local(*r)) {
             // The result starts empty, so a side that never returns adds nothing to the hull.
             // (A projection's pointers have no hull: every side that runs returns one.)
             let ty = b.nf.locals[r.index()].ty;
@@ -255,12 +289,52 @@ fn derive(
     Ok(id)
 }
 
+/// What narrowing changed for a branch, to put back after it.
+enum Saved {
+    /// A value's range, or that it had none of its own.
+    Value(ValueId, Option<Iv>),
+    /// A local's range as it was.
+    Local(LocalId, Iv),
+}
+
+/// By local: the one value stored in it, when it's stored exactly once, whole, and nothing
+/// else writes it (no projection's store, no `mut` argument): a `let` binding.
+fn single_stores(m: &Module, f: &Function) -> Vec<Option<ValueId>> {
+    let mut src: Vec<Option<ValueId>> = vec![None; f.locals.len()];
+    let mut writes = vec![0u32; f.locals.len()];
+    visit::walk(&f.body, &mut |s| match s {
+        Stmt::Store(Place { root: PlaceRoot::Local(l), path }, v) => {
+            writes[l.index()] += 1;
+            if path.is_empty() {
+                src[l.index()] = Some(*v);
+            } else {
+                writes[l.index()] += 1;
+            }
+        }
+        Stmt::Let(_, Expr::Call(g, args)) | Stmt::Eval(Expr::Call(g, args)) => {
+            for (a, p) in args.iter().zip(&m.functions[g.index()].params) {
+                if let (Arg::Place(Place { root: PlaceRoot::Local(l), .. }), true) = (a, p.mutable)
+                {
+                    writes[l.index()] += 2;
+                }
+            }
+        }
+        Stmt::Let(_, Expr::Addr(Place { root: PlaceRoot::Local(l), .. })) => {
+            writes[l.index()] += 2;
+        }
+        _ => {}
+    });
+    src.iter().zip(&writes).map(|(s, &w)| if w == 1 { *s } else { None }).collect()
+}
+
 /// What [`Ivx::leaves`] applies to each leaf.
 type LeafFn<'f, 'a> = dyn FnMut(&mut Ivx<'a>, &mut Block, TypeId, &[ValueId]) -> R<ValueId> + 'f;
 
 struct Ivx<'a> {
     m: &'a mut Module,
     cache: &'a mut DeriveCache,
+    /// The function being derived, whose types the activity's leaves are of.
+    f: &'a Function,
     act: Activity,
     /// What the function's pointers point into.
     ptrs: Pointers,
@@ -269,6 +343,17 @@ struct Ivx<'a> {
     hparam: Vec<Option<u32>>,
     hlocal: Vec<Option<LocalId>>,
     iv: HashMap<ValueId, Iv>,
+    /// Each active value's expression, in the original's values: what a branch's guard narrows
+    /// through (`narrow`).
+    defs: HashMap<ValueId, Expr>,
+    /// By local: the one value stored in it, if it's stored once, whole, and written no other
+    /// way (a `let` binding): what narrowing a load of it narrows next.
+    local_src: Vec<Option<ValueId>>,
+    /// The roots the branch being narrowed writes, which narrowing leaves alone.
+    branch_writes: Vec<PlaceRoot>,
+    /// Whether a `floor`'s case split is under way: one at a time, so the code grows by at
+    /// most 2³ (`split_floor`).
+    splitting: bool,
     returns: bool,
     /// How many branches deep we are that run whether or not a point would take them.
     speculative: u32,
@@ -384,10 +469,6 @@ impl<'a> Ivx<'a> {
         let c = if s == Scalar::F64 { Const::F64(x) } else { Const::F32(x as f32) };
         let v = self.emit(out, st, Expr::Const(c));
         self.coerce(out, v, ty)
-    }
-
-    fn coerce_iv(&mut self, out: &mut Block, x: Iv, ty: TypeId) -> Iv {
-        (self.coerce(out, x.0, ty), self.coerce(out, x.1, ty))
     }
 
     /// The largest magnitude a float of this type takes here: infinity on the CPU, `MAX` on the
@@ -638,7 +719,7 @@ impl<'a> Ivx<'a> {
 
     /// The places holding a range's `lo` and `hi`.
     fn places(&self, p: &Place) -> R<(Place, Place)> {
-        if p.path.iter().any(|x| matches!(x, Proj::Index(v) if self.act.values[v.index()])) {
+        if self.act.index_active(p) {
             return Err(Error::not_derivable(
                 "an interval through an array index that depends on the input isn't supported",
             ));
@@ -681,8 +762,7 @@ impl<'a> Ivx<'a> {
     /// The active locals and parameters a block may write, through a projection too.
     fn written(&self, b: &Block, into: &mut Vec<PlaceRoot>) {
         let active = |r: &PlaceRoot| match r {
-            PlaceRoot::Local(l) => self.act.locals[l.index()],
-            PlaceRoot::Param(i) => self.act.params[*i as usize],
+            PlaceRoot::Local(_) | PlaceRoot::Param(_) => self.act.root(r),
             _ => false,
         };
         let mut add = |r: &PlaceRoot| {
@@ -718,8 +798,202 @@ impl<'a> Ivx<'a> {
     // ---- statements --------------------------------------------------------------------------
 
     fn block_into(&mut self, b: &Block, out: &mut Block) -> R<()> {
-        for s in b {
+        for (i, s) in b.iter().enumerate() {
+            if let Stmt::Let(v, Expr::Builtin(Builtin::Floor, args)) = s
+                && !self.splitting
+                && self.act.value(*v)
+                && self.splittable(args[0])
+            {
+                let mut rest = b[i + 1..].to_vec();
+                let tail = matches!(rest.last(), Some(Stmt::Return(_))).then(|| rest.pop());
+                // The cases run in a loop of their own, so a `break` or `continue` of the
+                // loop around this block can't be in them.
+                if !leaves_loop(&rest) {
+                    self.stmt(s, out)?;
+                    let tail = tail.as_ref().and_then(|t| t.as_ref());
+                    self.split_floor(*v, args[0], &rest, tail, out)?;
+                    if let Some(t) = tail {
+                        self.stmt(t, out)?;
+                    }
+                    return Ok(());
+                }
+            }
             self.stmt(s, out)?;
+        }
+        Ok(())
+    }
+
+    /// Whether `x` is an `f32` or a float vector: what `split_floor` handles.
+    fn splittable(&self, x: ValueId) -> bool {
+        let ty = self.ty(x);
+        matches!(self.m.types.get(ty), TypeDef::Scalar(Scalar::F32) | TypeDef::Vector(_))
+    }
+
+    /// `v = floor(x)`, then `rest` (to the end of the block, but for a final `return`), derived
+    /// once and run for each case of which integer each component's floor is, and joined. Where a
+    /// component's range crosses exactly one integer plane, its floor isn't one integer, and
+    /// what's computed from it (value noise's hashed lattice values) would get its whole range
+    /// (spike 13); in each case it's exact, and `x - floor(x)` is as narrow as the box. A
+    /// component that crosses no plane, or more than one, isn't split. Up to 2³ cases; each
+    /// writes the same roots, and the join is their hull, of the cases whose components all
+    /// cross where they're split. `tail`, the block's `return`, may return a value `rest`
+    /// computes: that's joined too.
+    fn split_floor(
+        &mut self,
+        v: ValueId,
+        x: ValueId,
+        rest: &Block,
+        tail: Option<&Stmt>,
+        out: &mut Block,
+    ) -> R<()> {
+        let ty = self.ty(x);
+        let n = match *self.m.types.get(ty) {
+            TypeDef::Vector(n) => n as u32,
+            _ => 1,
+        };
+        let f32t = self.m.types.f32();
+        let bt = self.bool_ty();
+        let (xl, xh) = self.range(x);
+        let comp = |me: &mut Self, out: &mut Block, w: ValueId, c: u32| {
+            if n == 1 { w } else { me.emit(out, f32t, Expr::Extract(w, c)) }
+        };
+        // Each component's floors at its ends, and whether they're one integer apart.
+        let mut fl = Vec::new();
+        for c in 0..n {
+            let (l, h) = (comp(self, out, xl, c), comp(self, out, xh, c));
+            let fl_lo = self.builtin(out, Builtin::Floor, vec![l], f32t);
+            let fl_hi = self.builtin(out, Builtin::Floor, vec![h], f32t);
+            let one = self.fc(out, f32t, 1.0);
+            let next = self.bin(out, BinOp::Add, fl_lo, one, f32t);
+            let two = self.cmp(out, BinOp::Eq, fl_hi, next);
+            fl.push((fl_lo, fl_hi, next, two));
+        }
+        let mut roots = Vec::new();
+        self.written(rest, &mut roots);
+        let mut before = Vec::new();
+        for r in &roots {
+            before.push(self.load_root(out, r)?);
+        }
+        let returned = match tail {
+            Some(Stmt::Return(Some(r))) if self.act.value(*r) => Some(*r),
+            _ => None,
+        };
+        let old_floor = self.iv.get(&v).copied();
+        // The cases run in a loop, derived once: each sets the floor, skips itself if a
+        // component it splits doesn't cross, and joins what it gives into accumulators.
+        let u32t = self.m.types.u32();
+        let case = self.nf.new_local("case", u32t);
+        let first = self.nf.new_local("first_case", bt);
+        let zero = self.emit(out, u32t, Expr::Const(Const::U32(0)));
+        out.push(Stmt::Store(Place::local(case), zero));
+        let yes = self.emit(out, bt, Expr::Const(Const::Bool(true)));
+        out.push(Stmt::Store(Place::local(first), yes));
+        let mut accs = Vec::new();
+        for r in &roots {
+            let ty = self.root_ty(r)?;
+            accs.push((self.nf.new_local("acc_lo", ty), self.nf.new_local("acc_hi", ty), ty));
+        }
+        let ret_acc = match returned {
+            Some(r) => {
+                let t = self.ty(r);
+                let ty = range_ty(&mut self.m.types, t);
+                Some((self.nf.new_local("ret_lo", ty), self.nf.new_local("ret_hi", ty), ty))
+            }
+            None => None,
+        };
+        let mut body = Vec::new();
+        let i = self.emit(&mut body, u32t, Expr::Load(Place::local(case)));
+        let cases = self.emit(&mut body, u32t, Expr::Const(Const::U32(1 << n)));
+        let done = self.cmp(&mut body, BinOp::Eq, i, cases);
+        body.push(Stmt::If { cond: done, then: vec![Stmt::Break], else_: Vec::new() });
+        // This case's floor: per component, its low integer (bit 0) or the next one (bit 1);
+        // where the component isn't split, its whole range, and bit 1 doesn't hold.
+        let (mut los, mut his) = (Vec::new(), Vec::new());
+        let mut holds = self.emit(&mut body, bt, Expr::Const(Const::Bool(true)));
+        let one_u = self.emit(&mut body, u32t, Expr::Const(Const::U32(1)));
+        for (c, &(fl_lo, fl_hi, next, two)) in fl.iter().enumerate() {
+            let cc = self.emit(&mut body, u32t, Expr::Const(Const::U32(c as u32)));
+            let shifted = self.emit(&mut body, u32t, Expr::Binary(BinOp::Shr, i, cc));
+            let b = self.emit(&mut body, u32t, Expr::Binary(BinOp::BitAnd, shifted, one_u));
+            let bit = self.cmp(&mut body, BinOp::Eq, b, one_u);
+            let whole = self.select(&mut body, two, fl_lo, fl_hi);
+            los.push(self.select(&mut body, bit, next, fl_lo));
+            his.push(self.select(&mut body, bit, next, whole));
+            let nb = self.not(&mut body, bit);
+            let ok = self.bin(&mut body, BinOp::Or, nb, two, bt);
+            holds = self.bin(&mut body, BinOp::And, holds, ok, bt);
+        }
+        let floor = if n == 1 {
+            (los[0], his[0])
+        } else {
+            (
+                self.emit(&mut body, ty, Expr::Construct(ty, los)),
+                self.emit(&mut body, ty, Expr::Construct(ty, his)),
+            )
+        };
+        self.iv.insert(v, floor);
+        let mut each = Vec::new();
+        for (r, b) in roots.iter().zip(&before) {
+            self.store_root(&mut each, r, *b)?;
+        }
+        self.splitting = true;
+        self.speculative += 1;
+        self.block_into(rest, &mut each)?;
+        self.speculative -= 1;
+        self.splitting = false;
+        // Join: the first case's result as it is, each later one's hull with the accumulator.
+        let mut got = Vec::new();
+        for r in &roots {
+            got.push(self.load_root(&mut each, r)?);
+        }
+        let mut ends: Vec<(LocalId, LocalId, TypeId, Iv)> =
+            accs.iter().zip(got).map(|(&(l, h, t), g)| (l, h, t, g)).collect();
+        if let (Some((l, h, t)), Some(r)) = (ret_acc, returned) {
+            let g = self.lifted(&mut each, r);
+            ends.push((l, h, t, g));
+        }
+        let no = self.emit(&mut each, bt, Expr::Const(Const::Bool(false)));
+        let yes = self.emit(&mut each, bt, Expr::Const(Const::Bool(true)));
+        let is_first = self.emit(&mut each, bt, Expr::Load(Place::local(first)));
+        let mut first_stores = Vec::new();
+        let mut later_stores = Vec::new();
+        for (l, h, t, g) in ends {
+            first_stores.push(Stmt::Store(Place::local(l), g.0));
+            first_stores.push(Stmt::Store(Place::local(h), g.1));
+            let acc = (
+                self.emit(&mut later_stores, t, Expr::Load(Place::local(l))),
+                self.emit(&mut later_stores, t, Expr::Load(Place::local(h))),
+            );
+            let j = self.merge(&mut later_stores, t, (no, yes), g, acc)?;
+            later_stores.push(Stmt::Store(Place::local(l), j.0));
+            later_stores.push(Stmt::Store(Place::local(h), j.1));
+        }
+        each.push(Stmt::If { cond: is_first, then: first_stores, else_: later_stores });
+        each.push(Stmt::Store(Place::local(first), no));
+        body.push(Stmt::If { cond: holds, then: each, else_: Vec::new() });
+        let mut continuing = Vec::new();
+        let i2 = self.emit(&mut continuing, u32t, Expr::Load(Place::local(case)));
+        let one2 = self.emit(&mut continuing, u32t, Expr::Const(Const::U32(1)));
+        let i3 = self.emit(&mut continuing, u32t, Expr::Binary(BinOp::Add, i2, one2));
+        continuing.push(Stmt::Store(Place::local(case), i3));
+        out.push(Stmt::Loop { body, continuing });
+        match old_floor {
+            Some(o) => self.iv.insert(v, o),
+            None => self.iv.remove(&v),
+        };
+        for (r, &(l, h, t)) in roots.iter().zip(&accs) {
+            let j = (
+                self.emit(out, t, Expr::Load(Place::local(l))),
+                self.emit(out, t, Expr::Load(Place::local(h))),
+            );
+            self.store_root(out, r, j)?;
+        }
+        if let (Some(r), Some((l, h, t))) = (returned, ret_acc) {
+            let j = (
+                self.emit(out, t, Expr::Load(Place::local(l))),
+                self.emit(out, t, Expr::Load(Place::local(h))),
+            );
+            self.iv.insert(r, j);
         }
         Ok(())
     }
@@ -740,9 +1014,16 @@ impl<'a> Ivx<'a> {
         if let Expr::Call(g, args) = e {
             return self.call_fn(Some(v), *g, args, out);
         }
-        if self.act.values[v.index()] {
+        if self.act.value(v) {
             let r = self.expr(v, e, out)?;
             self.iv.insert(v, r);
+            self.defs.insert(v, e.clone());
+        } else if let Expr::Extract(x, i) = e
+            && self.act.value(*x)
+        {
+            // An inactive field of a struct that's active in others: the same in both bounds.
+            let (lo, _) = self.range(*x);
+            out.push(Stmt::Let(v, Expr::Extract(lo, *i)));
         } else {
             out.push(s.clone());
         }
@@ -754,17 +1035,22 @@ impl<'a> Ivx<'a> {
             Stmt::Eval(Expr::Call(g, args)) => self.call_fn(None, *g, args, out),
             Stmt::Let(v, e) => self.let_(s, *v, e, out),
             Stmt::Store(p, v) => {
-                if place_root_active(&self.act, p) {
+                if self.act.place(self.m, self.f, p) {
                     let (lp, hp) = self.places(p)?;
                     let (lo, hi) = self.lifted(out, *v);
                     out.push(Stmt::Store(lp, lo));
                     out.push(Stmt::Store(hp, hi));
+                } else if self.partly_active(p) {
+                    // An inactive part of a range: both bounds hold it.
+                    let (lp, hp) = self.places(p)?;
+                    out.push(Stmt::Store(lp, *v));
+                    out.push(Stmt::Store(hp, *v));
                 } else {
                     out.push(s.clone());
                 }
                 Ok(())
             }
-            Stmt::If { cond, then, else_ } if self.act.values[cond.index()] => {
+            Stmt::If { cond, then, else_ } if self.act.value(*cond) => {
                 // Either side may run: run both, one after the other, from the same state, and
                 // join what they wrote.
                 let c = self.range(*cond);
@@ -775,14 +1061,22 @@ impl<'a> Ivx<'a> {
                 for r in &roots {
                     before.push(self.load_root(out, r)?);
                 }
+                // Each side knows its guard: `a < b` narrows `a` and `b`, and what they were
+                // computed from, while that side is derived.
                 self.speculative += 1;
+                self.branch_writes = roots.clone();
+                let saved = self.narrow_by(out, *cond, true)?;
                 self.block_into(then, out)?;
+                self.restore(out, saved)?;
                 let mut after_then = Vec::new();
                 for (r, b) in roots.iter().zip(&before) {
                     after_then.push(self.load_root(out, r)?);
                     self.store_root(out, r, *b)?;
                 }
+                self.branch_writes = roots.clone();
+                let saved = self.narrow_by(out, *cond, false)?;
                 self.block_into(else_, out)?;
+                self.restore(out, saved)?;
                 self.speculative -= 1;
                 for (r, t) in roots.iter().zip(after_then) {
                     let e = self.load_root(out, r)?;
@@ -805,17 +1099,27 @@ impl<'a> Ivx<'a> {
     }
 
     fn call_fn(&mut self, v: Option<ValueId>, g: FuncId, args: &[Arg], out: &mut Block) -> R<()> {
-        let mask: Vec<bool> = args.iter().map(|a| arg_active(&self.act, a)).collect();
-        if !mask.iter().any(|b| *b) {
+        let mask: Vec<Bits> = args.iter().map(|a| arg_bits(self.m, self.f, &self.act, a)).collect();
+        // A `mut` place that's an inactive part of a range: the call writes its `lo`, and the
+        // `hi` copies it after.
+        let mut sync = Vec::new();
+        for ((a, bits), p) in args.iter().zip(&mask).zip(&self.m.functions[g.index()].params) {
+            if let (Arg::Place(pl), 0, true) = (a, bits, p.mutable)
+                && self.partly_active(pl)
+            {
+                sync.push(pl.clone());
+            }
+        }
+        if mask.iter().all(|b| *b == 0) {
             out.push(let_or_eval(v, Expr::Call(g, args.to_vec())));
-            return Ok(());
+            return self.sync_hi(out, sync);
         }
         let dg = derive(self.m, self.cache, g, mask.clone(), self.target, self.speculative > 0)?;
-        let returns = returns_active(self.m, self.cache, g, mask.clone(), Mode::Interval);
+        let returns = returns_active(self.m, self.cache, g, mask.clone(), Mode::Interval) != 0;
         let mut new_args = Vec::new();
         let mut his = Vec::new();
         for (a, active) in args.iter().zip(&mask) {
-            match (a, active) {
+            match (a, *active != 0) {
                 (_, false) => new_args.push(a.clone()),
                 (Arg::Value(x), true) => {
                     let (lo, hi) = self.range(*x);
@@ -844,6 +1148,292 @@ impl<'a> Ivx<'a> {
             }
             (v, _) => out.push(let_or_eval(v, Expr::Call(dg, new_args))),
         }
+        self.sync_hi(out, sync)
+    }
+
+    /// Whether `p` is an inactive part of an active local or parameter.
+    fn partly_active(&self, p: &Place) -> bool {
+        matches!(p.root, PlaceRoot::Local(_) | PlaceRoot::Param(_))
+            && self.act.root(&p.root)
+            && !self.act.place(self.m, self.f, p)
+    }
+
+    /// Copies each place's `lo` to its `hi`.
+    fn sync_hi(&mut self, out: &mut Block, places: Vec<Place>) -> R<()> {
+        for p in places {
+            let ty = place_type(self.m, &self.nf, &p)?;
+            let (lp, hp) = self.places(&p)?;
+            let x = self.emit(out, ty, Expr::Load(lp));
+            out.push(Stmt::Store(hp, x));
+        }
+        Ok(())
+    }
+
+    // ---- narrowing by a branch's guard ---------------------------------------------------------
+
+    /// The orderings `cond` implies between floats where it's `holds`: each `(a, b, strict)`
+    /// says `a ≤ b` (`a < b` when `strict`). Through `!`, `&&` where it holds and `||` where it
+    /// doesn't. (A NaN breaks the negated ones, but a NaN has no range here anyway.)
+    fn facts(
+        &self,
+        cond: ValueId,
+        holds: bool,
+        out: &mut Vec<(ValueId, ValueId, bool)>,
+        depth: u32,
+    ) {
+        if depth > 4 {
+            return;
+        }
+        let Some(e) = self.defs.get(&cond) else { return };
+        match e.clone() {
+            Expr::Unary(UnOp::Not, c) => self.facts(c, !holds, out, depth + 1),
+            Expr::Binary(BinOp::And, a, b) if holds => {
+                self.facts(a, true, out, depth + 1);
+                self.facts(b, true, out, depth + 1);
+            }
+            Expr::Binary(BinOp::Or, a, b) if !holds => {
+                self.facts(a, false, out, depth + 1);
+                self.facts(b, false, out, depth + 1);
+            }
+            Expr::Binary(op @ (BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge), a, b) => {
+                let float = |v: ValueId| {
+                    matches!(self.m.types.as_scalar(self.ty(v)), Some(Scalar::F32 | Scalar::F64))
+                };
+                if !float(a) || !float(b) {
+                    return;
+                }
+                out.push(match (op, holds) {
+                    (BinOp::Lt, true) => (a, b, true),
+                    (BinOp::Le, true) => (a, b, false),
+                    (BinOp::Gt, true) => (b, a, true),
+                    (BinOp::Ge, true) => (b, a, false),
+                    (BinOp::Lt, false) => (b, a, false),
+                    (BinOp::Le, false) => (b, a, true),
+                    (BinOp::Gt, false) => (a, b, false),
+                    _ => (a, b, true),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    /// Narrows the ranges `cond`'s facts bound, for the side where it's `holds`: what to give
+    /// back to `restore` after that side.
+    fn narrow_by(&mut self, out: &mut Block, cond: ValueId, holds: bool) -> R<Vec<Saved>> {
+        let mut facts = Vec::new();
+        self.facts(cond, holds, &mut facts, 0);
+        let mut saved = Vec::new();
+        for (a, b, strict) in facts {
+            let ty = self.ty(a);
+            let (al, _) = self.range(a);
+            let (_, bh) = self.range(b);
+            // a ≤ b.hi, and b ≥ a.lo; strictly, a bound of 0 moves off it.
+            let (ahi, blo) = if strict {
+                (self.off_zero(out, bh, ty, false), self.off_zero(out, al, ty, true))
+            } else {
+                (bh, al)
+            };
+            self.narrow(out, a, None, Some(ahi), 0, &mut saved)?;
+            self.narrow(out, b, Some(blo), None, 0, &mut saved)?;
+        }
+        Ok(saved)
+    }
+
+    /// `x`, or the least float above (`up`) or below 0 if it's 0: a strict bound on that side.
+    fn off_zero(&mut self, out: &mut Block, x: ValueId, ty: TypeId, up: bool) -> ValueId {
+        let t = self.tiny(ty);
+        let tiny = self.fc(out, ty, if up { t } else { -t });
+        let zero = self.fc(out, ty, 0.0);
+        let is0 = self.cmp(out, BinOp::Eq, x, zero);
+        self.select(out, is0, tiny, x)
+    }
+
+    fn restore(&mut self, out: &mut Block, saved: Vec<Saved>) -> R<()> {
+        for s in saved.into_iter().rev() {
+            match s {
+                Saved::Value(v, Some(r)) => {
+                    self.iv.insert(v, r);
+                }
+                Saved::Value(v, None) => {
+                    self.iv.remove(&v);
+                }
+                Saved::Local(l, r) => self.store_root(out, &PlaceRoot::Local(l), r)?,
+            }
+        }
+        Ok(())
+    }
+
+    /// Narrows active local `l`, which the branch doesn't write, to `[lo, hi]` (component
+    /// `comp` of a vector's) while the branch is derived, then the value stored in it, if it's
+    /// a `let` binding's.
+    fn narrow_local(
+        &mut self,
+        out: &mut Block,
+        l: LocalId,
+        comp: Option<u32>,
+        (lo, hi): Iv,
+        depth: u32,
+        saved: &mut Vec<Saved>,
+    ) -> R<()> {
+        let root = PlaceRoot::Local(l);
+        if !self.act.local(l) || self.branch_writes.contains(&root) {
+            return Ok(());
+        }
+        let ty = self.root_ty(&root)?;
+        let old = self.load_root(out, &root)?;
+        let new = match comp {
+            None => (
+                self.builtin(out, Builtin::Max, vec![old.0, lo], ty),
+                self.builtin(out, Builtin::Min, vec![old.1, hi], ty),
+            ),
+            Some(i) => {
+                let TypeDef::Vector(n) = *self.m.types.get(ty) else { return Ok(()) };
+                let st = self.m.types.f32();
+                let mut ends = [old.0, old.1];
+                for (k, end) in ends.iter_mut().enumerate() {
+                    let parts: Vec<ValueId> = (0..n as u32)
+                        .map(|j| {
+                            let c = self.emit(out, st, Expr::Extract(*end, j));
+                            match (j == i, k) {
+                                (true, 0) => self.builtin(out, Builtin::Max, vec![c, lo], st),
+                                (true, _) => self.builtin(out, Builtin::Min, vec![c, hi], st),
+                                _ => c,
+                            }
+                        })
+                        .collect();
+                    *end = self.emit(out, ty, Expr::Construct(ty, parts));
+                }
+                (ends[0], ends[1])
+            }
+        };
+        saved.push(Saved::Local(l, old));
+        self.store_root(out, &root, new)?;
+        if let (None, Some(src)) = (comp, self.local_src[l.index()]) {
+            self.narrow(out, src, Some(lo), Some(hi), depth + 1, saved)?;
+        }
+        Ok(())
+    }
+
+    /// Narrows active value `v`'s range to at least `lo` and at most `hi`, then what it was
+    /// computed from, where that's exact enough to follow: `max`, `min`, a vector's component,
+    /// `+`, `-` and negation. Each override goes on `saved`.
+    fn narrow(
+        &mut self,
+        out: &mut Block,
+        v: ValueId,
+        lo: Option<ValueId>,
+        hi: Option<ValueId>,
+        depth: u32,
+        saved: &mut Vec<Saved>,
+    ) -> R<()> {
+        if !self.act.value(v) {
+            return Ok(());
+        }
+        let ty = self.ty(v);
+        if !matches!(self.m.types.as_scalar(ty), Some(Scalar::F32 | Scalar::F64)) {
+            return Ok(());
+        }
+        let (l, h) = self.range(v);
+        let l2 = match lo {
+            Some(x) => self.builtin(out, Builtin::Max, vec![l, x], ty),
+            None => l,
+        };
+        let h2 = match hi {
+            Some(x) => self.builtin(out, Builtin::Min, vec![h, x], ty),
+            None => h,
+        };
+        saved.push(Saved::Value(v, self.iv.get(&v).copied()));
+        self.iv.insert(v, (l2, h2));
+        if depth >= 8 {
+            return Ok(());
+        }
+        let Some(e) = self.defs.get(&v).cloned() else { return Ok(()) };
+        match e {
+            Expr::Load(Place { root: PlaceRoot::Local(l), path }) => match path[..] {
+                [] => self.narrow_local(out, l, None, (l2, h2), depth, saved)?,
+                [Proj::Comp(i)] => {
+                    self.narrow_local(out, l, Some(u32::from(i)), (l2, h2), depth, saved)?
+                }
+                _ => {}
+            },
+            Expr::Builtin(Builtin::Max, args) if args.len() == 2 && self.ty(args[0]) == ty => {
+                // Both are at most the max; one is at least its low end where the other can't be.
+                let (p, q) = (args[0], args[1]);
+                let ((pl, ph), (ql, qh)) = (self.range(p), self.range(q));
+                let q_low = self.cmp(out, BinOp::Lt, ph, l2);
+                let q_lo = self.select(out, q_low, l2, ql);
+                let p_low = self.cmp(out, BinOp::Lt, qh, l2);
+                let p_lo = self.select(out, p_low, l2, pl);
+                self.narrow(out, p, Some(p_lo), Some(h2), depth + 1, saved)?;
+                self.narrow(out, q, Some(q_lo), Some(h2), depth + 1, saved)?;
+            }
+            Expr::Builtin(Builtin::Min, args) if args.len() == 2 && self.ty(args[0]) == ty => {
+                let (p, q) = (args[0], args[1]);
+                let ((pl, ph), (ql, qh)) = (self.range(p), self.range(q));
+                let q_high = self.cmp(out, BinOp::Gt, pl, h2);
+                let q_hi = self.select(out, q_high, h2, qh);
+                let p_high = self.cmp(out, BinOp::Gt, ql, h2);
+                let p_hi = self.select(out, p_high, h2, ph);
+                self.narrow(out, p, Some(l2), Some(p_hi), depth + 1, saved)?;
+                self.narrow(out, q, Some(l2), Some(q_hi), depth + 1, saved)?;
+            }
+            Expr::Extract(x, i) if self.act.value(x) => {
+                let xt = self.ty(x);
+                let TypeDef::Vector(n) = *self.m.types.get(xt) else { return Ok(()) };
+                let (xl, xh) = self.range(x);
+                let mut ends = [xl, xh];
+                for (k, end) in ends.iter_mut().enumerate() {
+                    let parts: Vec<ValueId> = (0..n as u32)
+                        .map(|j| match (j == i, k) {
+                            (true, 0) => l2,
+                            (true, _) => h2,
+                            _ => self.emit(out, ty, Expr::Extract(*end, j)),
+                        })
+                        .collect();
+                    *end = self.emit(out, xt, Expr::Construct(xt, parts));
+                }
+                saved.push(Saved::Value(x, self.iv.get(&x).copied()));
+                self.iv.insert(x, (ends[0], ends[1]));
+                // A component of a vector `let` binding: the binding too.
+                if let Some(Expr::Load(Place { root: PlaceRoot::Local(l), path })) =
+                    self.defs.get(&x).cloned()
+                    && path.is_empty()
+                {
+                    self.narrow_local(out, l, Some(i), (l2, h2), depth, saved)?;
+                }
+            }
+            Expr::Unary(UnOp::Neg, p) => {
+                let nl = self.emit(out, ty, Expr::Unary(UnOp::Neg, h2));
+                let nh = self.emit(out, ty, Expr::Unary(UnOp::Neg, l2));
+                self.narrow(out, p, Some(nl), Some(nh), depth + 1, saved)?;
+            }
+            Expr::Binary(op @ (BinOp::Add | BinOp::Sub), p, q)
+                if self.ty(p) == ty && self.ty(q) == ty =>
+            {
+                // v = fl(p ± q) is within an ulp of p ± q: so p is within v ∓ q, an ulp wider.
+                let ((pl, ph), (ql, qh)) = (self.range(p), self.range(q));
+                let (p_lo, p_hi, q_lo, q_hi) = if op == BinOp::Add {
+                    (
+                        self.bin(out, BinOp::Sub, l2, qh, ty),
+                        self.bin(out, BinOp::Sub, h2, ql, ty),
+                        self.bin(out, BinOp::Sub, l2, ph, ty),
+                        self.bin(out, BinOp::Sub, h2, pl, ty),
+                    )
+                } else {
+                    (
+                        self.bin(out, BinOp::Add, l2, ql, ty),
+                        self.bin(out, BinOp::Add, h2, qh, ty),
+                        self.bin(out, BinOp::Sub, pl, h2, ty),
+                        self.bin(out, BinOp::Sub, ph, l2, ty),
+                    )
+                };
+                let pr = self.widen(out, (p_lo, p_hi), ty, 2.0, 0.0);
+                let qr = self.widen(out, (q_lo, q_hi), ty, 2.0, 0.0);
+                self.narrow(out, p, Some(pr.0), Some(pr.1), depth + 1, saved)?;
+                self.narrow(out, q, Some(qr.0), Some(qr.1), depth + 1, saved)?;
+            }
+            _ => {}
+        }
         Ok(())
     }
 
@@ -866,7 +1456,7 @@ impl<'a> Ivx<'a> {
             Expr::Unary(op, x) => self.unary(out, *op, *x, ty)?,
             Expr::Binary(op, a, b) => self.binary(out, *op, *a, *b, ty)?,
             Expr::Builtin(b, args) => self.builtin_range(out, *b, args, ty)?,
-            Expr::ExtractDyn(x, i) if self.act.values[i.index()] => {
+            Expr::ExtractDyn(x, i) if self.act.value(*i) => {
                 // Any element: the hull of them all.
                 let n = match self.m.types.get(self.ty(*x)) {
                     TypeDef::Array(_, n) => *n,
@@ -911,7 +1501,7 @@ impl<'a> Ivx<'a> {
             }
             Expr::Select { cond, if_true, if_false } => {
                 let (t, f) = (self.lifted(out, *if_true), self.lifted(out, *if_false));
-                if self.act.values[cond.index()] {
+                if self.act.value(*cond) {
                     let c = self.range(*cond);
                     self.merge(out, ty, c, t, f)?
                 } else {
@@ -931,9 +1521,24 @@ impl<'a> Ivx<'a> {
                     "an interval can't go through a run (`[T]`) of values that depend on the input yet: pass the array itself (`[f32; N]`)",
                 ));
             }
+            Expr::Texture(..) => {
+                return Err(Error::not_derivable(
+                    "an interval can't go through a texture read: its texels are data, not code",
+                ));
+            }
+            Expr::Atomic(..) | Expr::Barrier => {
+                return Err(Error::not_derivable(
+                    "an interval can't go through an atomic or a barrier: derived code is pure",
+                ));
+            }
             Expr::Host(..) => {
                 return Err(Error::not_derivable(
                     "an interval can't go through GPU work (a buffer, a dispatch or a draw)",
+                ));
+            }
+            Expr::Mem(..) => {
+                return Err(Error::not_derivable(
+                    "an interval can't go through code that allocates or reads raw memory",
                 ));
             }
         })
@@ -1456,12 +2061,7 @@ impl<'a> Ivx<'a> {
                 );
                 self.widen1(out, d, ty)
             }
-            B::Normalize => {
-                let f32t = self.m.types.f32();
-                let len = self.length(out, r[0], ty, f32t);
-                let len = self.coerce_iv(out, len, ty);
-                self.per_comp(out, ty, &[r[0], len], Self::div)?
-            }
+            B::Normalize => self.normalize(out, r[0], ty)?,
             B::AllEqual => {
                 let bt = self.bool_ty();
                 let (a, bb) = (r[0], r[1]);
@@ -1513,7 +2113,94 @@ impl<'a> Ivx<'a> {
         );
         // Sums of squares don't cancel; the error is relative. WGSL: sqrt(dot(e, e)).
         let ulps = if self.gpu() { 16.0 } else { 4.0 };
-        self.widen(out, r, ty, ulps, 0.0)
+        let (l, h) = self.widen(out, r, ty, ulps, 0.0);
+        // A vector is at least as long as its largest component's least magnitude, also where
+        // the squares underflow: one that can't be 0 has a length that can't be either.
+        let least = self.abs(out, x, at).0;
+        let mut biggest = self.emit(out, ty, Expr::Extract(least, 0));
+        for c in 1..n as u32 {
+            let e = self.emit(out, ty, Expr::Extract(least, c));
+            biggest = self.builtin(out, Builtin::Max, vec![biggest, e], ty);
+        }
+        // The length as computed rounds down by at most the widening's ulps.
+        let k = self.fc(out, ty, 1.0 - (ulps + 1.0) * self.eps(ty));
+        let floor = self.bin(out, BinOp::Mul, biggest, k, ty);
+        (self.builtin(out, Builtin::Max, vec![l, floor], ty), h)
+    }
+
+    /// `normalize(x)`, a component at a time: `x_i / sqrt(x_i² + R²)`, where `R²` is the
+    /// others' squares summed, rises with `x_i` and, for each sign of `x_i`, shrinks in
+    /// magnitude as `R²` grows. So its ends are at the ends of `x_i` and `R²`: exact, also where
+    /// the other components are exactly 0, where dividing `x` by its length as intervals would
+    /// lose that `x_i / |x_i|` is ±1.
+    fn normalize(&mut self, out: &mut Block, x: Iv, ty: TypeId) -> R<Iv> {
+        let TypeDef::Vector(n) = *self.m.types.get(ty) else {
+            return Err(Error::internal("a normalize of a non-vector"));
+        };
+        let f32t = self.m.types.f32();
+        let sq = self.sqr(out, x, ty);
+        let (mut los, mut his) = (Vec::new(), Vec::new());
+        for i in 0..n as u32 {
+            // R² over the others: its least and greatest.
+            let mut r = None;
+            for j in (0..n as u32).filter(|&j| j != i) {
+                let l = self.emit(out, f32t, Expr::Extract(sq.0, j));
+                let h = self.emit(out, f32t, Expr::Extract(sq.1, j));
+                r = Some(match r {
+                    None => (l, h),
+                    Some((al, ah)) => (
+                        self.bin(out, BinOp::Add, al, l, f32t),
+                        self.bin(out, BinOp::Add, ah, h, f32t),
+                    ),
+                });
+            }
+            let (rl, rh) = r.ok_or_else(|| Error::internal("a one-component vector"))?;
+            let a = self.emit(out, f32t, Expr::Extract(x.0, i));
+            let b = self.emit(out, f32t, Expr::Extract(x.1, i));
+            let zero = self.fc(out, f32t, 0.0);
+            // lo: at a, with the R² that makes it least; hi: at b, with the R² that makes it most.
+            let a_pos = self.cmp(out, BinOp::Ge, a, zero);
+            let ra = self.select(out, a_pos, rh, rl);
+            let lo = self.unit_part(out, a, ra, f32t);
+            let b_pos = self.cmp(out, BinOp::Ge, b, zero);
+            let rb = self.select(out, b_pos, rl, rh);
+            let hi = self.unit_part(out, b, rb, f32t);
+            // normalize rounds: a few ulps on the CPU (a division by a square root), more on
+            // the GPU (an inverse square root), and never past ±1 by more than that.
+            let ulps = if self.gpu() { 8.0 } else { 4.0 };
+            let (lo, hi) = self.widen(out, (lo, hi), f32t, ulps, 0.0);
+            los.push(lo);
+            his.push(hi);
+        }
+        Ok((
+            self.emit(out, ty, Expr::Construct(ty, los)),
+            self.emit(out, ty, Expr::Construct(ty, his)),
+        ))
+    }
+
+    /// `x / sqrt(x² + r2)` without underflow: ±1 where `r2` is 0 (`x` ≠ 0), 0 where `x` is,
+    /// and `sign(x) / sqrt(1 + r2 / x²)` otherwise; ±1 is also the answer for `x = r2 = 0`,
+    /// where the direction is any: the caller's range then spans [-1, 1].
+    fn unit_part(&mut self, out: &mut Block, x: ValueId, r2: ValueId, ty: TypeId) -> ValueId {
+        let one = self.fc(out, ty, 1.0);
+        let neg = self.fc(out, ty, -1.0);
+        let zero = self.fc(out, ty, 0.0);
+        let pos = self.cmp(out, BinOp::Ge, x, zero);
+        let s = self.select(out, pos, one, neg);
+        let xx = self.bin(out, BinOp::Mul, x, x, ty);
+        let q = self.bin(out, BinOp::Div, r2, xx, ty);
+        let q1 = self.bin(out, BinOp::Add, one, q, ty);
+        let root = self.builtin(out, Builtin::Sqrt, vec![q1], ty);
+        let f = self.bin(out, BinOp::Div, s, root, ty);
+        // r2 = 0: exactly ±1 (also for x = 0, the range's end where any direction is possible).
+        let no_r = self.cmp(out, BinOp::Eq, r2, zero);
+        let f = self.select(out, no_r, s, f);
+        // x = 0 with r2 > 0: 0 (r2 / 0 is infinite, so f is ±0 already; NaN only for 0 / 0).
+        let x0 = self.cmp(out, BinOp::Eq, x, zero);
+        let not_r = self.not(out, no_r);
+        let bt = self.bool_ty();
+        let x0r = self.bin(out, BinOp::And, x0, not_r, bt);
+        self.select(out, x0r, zero, f)
     }
 
     fn inverse_sqrt(&mut self, out: &mut Block, ty: TypeId, x: &[Iv]) -> R<Iv> {

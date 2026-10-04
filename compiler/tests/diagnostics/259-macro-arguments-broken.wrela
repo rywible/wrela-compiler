@@ -1,0 +1,6 @@
+// mistake: a `format!` whose arguments have a syntax error
+// expect: E0115 E0100
+// fix: no
+fn label(score: u32) -> String {
+    format!("{} points" score)
+}

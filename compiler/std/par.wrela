@@ -1,0 +1,168 @@
+// Parallel jobs (language.md §6.12, D-062): a job's chunks run on this thread and on the
+// program's workers (wrela_abi::memory's workers), which each instance of the program shares
+// memory with. Results don't depend on how many workers there are: a job's chunks are fixed by
+// its size alone, each writes only its own part, and what's reduced is combined in chunk order.
+//
+// The job's state is at wrela_abi::memory::WORKERS_STATE (256): the generation (bumped when a
+// job starts; workers wait on it), a ticket (the generation's low 16 bits, then the next chunk,
+// which threads claim with a compare-and-swap, so a late worker can't claim another job's
+// chunk), the task, its context and its chunk count, how many chunks are done (the starting
+// thread waits on it), the two words hosts write (a worker failed, and shut down), and how many
+// chunks workers have run, which hosts read. The words hosts use are copies of wrela_abi's, and
+// a test there checks them.
+
+use std::mem::{abort, atomic_add, atomic_load, atomic_store, compare_swap, notify, run_task, wait}
+
+const GENERATION: u32 = 256
+const TICKET: u32 = 260
+const TASK: u32 = 264
+const CTX: u32 = 268
+const CHUNKS: u32 = 272
+const DONE: u32 = 276
+const FAILED: u32 = 280
+const SHUTDOWN: u32 = 284
+const HELPED: u32 = 288
+// The bit a host sets in DONE when a worker traps.
+const DONE_FAILED: u32 = 2147483648
+
+/// The most chunks a job has: the ticket counts them in 16 bits.
+pub(package) const MAX_CHUNKS: u32 = 4096
+
+/// Runs `par_each_chunk(chunk, chunks, xs, f)` for each chunk below `chunks` (at most
+/// `MAX_CHUNKS`), on this thread and on the workers, and returns when every one is done. The
+/// compiler makes a task of it, which reads its arguments (`f`'s captures among them) from a
+/// context on this thread's stack.
+@intrinsic
+pub(package) fn par_each<T>(chunks: u32, xs: mut Vec<T>, f: @parallel fn(mut T)) {}
+
+/// Chunk `chunk` of `chunks` of a `par_each`: its elements, each `f`'d in order.
+pub(package) fn par_each_chunk<T>(chunk: u32, chunks: u32, xs: mut Vec<T>, f: @parallel fn(mut T)) {
+    let n = xs.len()
+    let size = (n + chunks - 1) / chunks
+    let end = min(n, (chunk + 1) * size)
+    for i in chunk * size..end {
+        f(mut xs[i])
+    }
+}
+
+/// As `par_each`, for `par_map_reduce_chunk`.
+@intrinsic
+pub(package) fn par_map_reduce<T, R: Clone>(
+    chunks: u32,
+    xs: Vec<T>,
+    init: R,
+    map: @parallel fn(T) -> R,
+    reduce: @parallel fn(R, R) -> R,
+    partial: mut Vec<R>,
+) {}
+
+/// Chunk `chunk` of `chunks` of a `par_map_reduce`: its elements `map`ped and folded from
+/// `init` in order, into `partial[chunk]`.
+pub(package) fn par_map_reduce_chunk<T, R: Clone>(
+    chunk: u32,
+    chunks: u32,
+    xs: Vec<T>,
+    init: R,
+    map: @parallel fn(T) -> R,
+    reduce: @parallel fn(R, R) -> R,
+    partial: mut Vec<R>,
+) {
+    let n = xs.len()
+    let size = (n + chunks - 1) / chunks
+    var acc = init.clone()
+    let end = min(n, (chunk + 1) * size)
+    for i in chunk * size..end {
+        acc = reduce(acc, map(xs[i]))
+    }
+    partial[chunk] = take acc
+}
+
+/// The job a `par_each` or `par_map_reduce` starts: task `task`, with its context at `ctx`,
+/// on chunks below `n`.
+pub(package) fn run_chunks(task: u32, ctx: u32, n: u32) {
+    if n == 0 {
+        return
+    }
+    unsafe {
+        let gen = atomic_load(GENERATION) + 1
+        let ticket = (gen & 65535) << 16
+        // The new ticket first: a late worker's claim on the last job fails from here on.
+        atomic_store(TICKET, ticket)
+        atomic_store(TASK, task)
+        atomic_store(CTX, ctx)
+        atomic_store(CHUNKS, n)
+        atomic_store(DONE, 0)
+        atomic_store(GENERATION, gen)
+        let _ = notify(GENERATION, 4294967295)
+        work(gen & 65535, task, ctx, n, worker: false)
+        loop {
+            let done = atomic_load(DONE)
+            // A worker trapped: its host set the top bit, so this sees it before it could wait.
+            // Its panic message is the program's.
+            if done >= DONE_FAILED || atomic_load(FAILED) != 0 {
+                abort()
+            }
+            if done >= n {
+                return
+            }
+            let _ = wait(DONE, done)
+        }
+    }
+}
+
+/// Claims and runs the job's chunks until none are left, or another job has started. A worker
+/// counts the chunks it runs.
+fn work(g16: u32, task: u32, ctx: u32, n: u32, worker: bool) {
+    unsafe {
+        loop {
+            let t = atomic_load(TICKET)
+            if t >> 16 != g16 || t & 65535 >= n {
+                return
+            }
+            if compare_swap(TICKET, t, t + 1) == t {
+                run_task(task, ctx, t & 65535)
+                if worker {
+                    let _ = atomic_add(HELPED, 1)
+                }
+                let _ = atomic_add(DONE, 1)
+                let _ = notify(DONE, 1)
+            }
+        }
+    }
+}
+
+/// A worker's life (`__worker`): wait for a job, help with it, until the host shuts it down.
+pub(package) fn worker_loop() {
+    unsafe {
+        var seen = atomic_load(GENERATION)
+        loop {
+            // Before each wait too: a worker that starts after the host shut it down (and bumped
+            // the generation it then reads as seen) would otherwise wait for good.
+            if atomic_load(SHUTDOWN) != 0 {
+                return
+            }
+            let _ = wait(GENERATION, seen)
+            if atomic_load(SHUTDOWN) != 0 {
+                return
+            }
+            let gen = atomic_load(GENERATION)
+            if gen != seen {
+                seen = gen
+                work(
+                    gen & 65535,
+                    atomic_load(TASK),
+                    atomic_load(CTX),
+                    atomic_load(CHUNKS),
+                    worker: true,
+                )
+            }
+        }
+    }
+}
+
+/// How many chunks a job over `n` elements has: about 64 elements each, at most `MAX_CHUNKS`.
+/// It depends on `n` alone, so a job's results don't depend on how many workers there are.
+pub(package) fn chunks_for(n: u32) -> u32 {
+    let k = (n + 63) / 64
+    if k > MAX_CHUNKS { MAX_CHUNKS } else { k }
+}

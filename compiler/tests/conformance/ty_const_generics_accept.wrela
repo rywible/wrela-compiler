@@ -1,0 +1,22 @@
+// accepts: ty.const-generics
+fn sum<const N: u32>(xs: [f32; N]) -> f32 {
+    var total = 0.0
+    for i in 0..N {
+        total += xs[i]
+    }
+    total
+}
+
+trait Total {
+    fn total(self) -> f32
+}
+
+impl<const N: u32> Total for [f32; N] {
+    fn total(self) -> f32 {
+        sum(self)
+    }
+}
+
+fn f() -> f32 {
+    sum([1.0, 2.0]) + [3.0, 4.0, 5.0].total() + sum([0.0; 8])
+}

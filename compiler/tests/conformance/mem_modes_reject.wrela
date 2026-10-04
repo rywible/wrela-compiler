@@ -32,7 +32,7 @@ fn first(xs: mut [f32; 2]) -> mut f32 {
     }
 }
 
-struct Holder: Copy + Clone {
+struct Holder: Copy {
     a: f32,
 }
 

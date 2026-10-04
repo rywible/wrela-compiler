@@ -1,0 +1,26 @@
+// An item that isn't `pub` is used from another module. An item is private to its module
+// unless it's declared `pub` (or `pub(package)`, for its package only).
+// ---- wrong
+use shapes::circle_area
+
+fn coin() -> f32 {
+    circle_area(0.01)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- file shapes.wrela
+fn circle_area(r: f32) -> f32 {
+    3.14159 * r * r
+}
+// ---- fixed
+use shapes::circle_area
+
+fn coin() -> f32 {
+    circle_area(0.01)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- file shapes.wrela
+pub fn circle_area(r: f32) -> f32 {
+    3.14159 * r * r
+}

@@ -1,0 +1,22 @@
+// accepts: const.tests
+// A `@test` runs when `wrela test` asks, as the build runs constants: it reads constants and
+// calls the program's functions, and nothing of it is in a build (§10).
+const SIDE: f32 = 3.0
+
+fn area(w: f32, h: f32) -> f32 {
+    w * h
+}
+
+@test
+fn area_of_a_square() {
+    assert(area(SIDE, SIDE) == 9.0)
+}
+
+@test
+fn areas_add() {
+    var total = 0.0
+    for i in 0..4 {
+        total = total + area(1.0, f32(i))
+    }
+    assert(total == 6.0)
+}

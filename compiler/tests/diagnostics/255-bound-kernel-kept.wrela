@@ -1,0 +1,15 @@
+// mistake: a kernel bound to its arguments, kept to dispatch later
+// expect: E0603
+// fix: no
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch}
+
+@compute(64)
+fn fill(value: f32, out: mut Slots<f32>, id: GlobalId) {
+    out[id] = value
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    var out: GpuBuffer<f32> = buffer(64)
+    let job = fill.bind(time, mut out)
+    dispatch(fill.bind(time, mut out), groups: 1)
+}

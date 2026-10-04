@@ -1,0 +1,14 @@
+// mistake: calling a kernel as a function
+// expect: E0606 E0601
+// fix: no
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch}
+
+@compute(64)
+fn fill(value: f32, out: mut Slots<f32>, id: GlobalId) {
+    out[id] = value
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    var out: GpuBuffer<f32> = buffer(64)
+    fill(time, mut out, GlobalId { x: 0, y: 0, z: 0 })
+}

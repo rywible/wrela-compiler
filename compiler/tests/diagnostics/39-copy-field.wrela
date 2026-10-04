@@ -5,6 +5,6 @@ struct Log {
     count: u32,
 }
 
-struct Pair: Copy + Clone {
+struct Pair: Copy {
     log: Log,
 }

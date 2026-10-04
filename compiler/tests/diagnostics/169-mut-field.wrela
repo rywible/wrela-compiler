@@ -1,0 +1,10 @@
+// mistake: a `mut` projection as a field of an ordinary struct
+// expect: E0519
+// fix: no
+struct Log {
+    lines: Vec<Text>,
+}
+
+struct Ctx {
+    log: mut Log,
+}

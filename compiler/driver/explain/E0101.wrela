@@ -1,0 +1,12 @@
+// A `(`, `[` or `{` is never closed. The diagnostic points at the opening bracket.
+// ---- wrong
+fn area(w: f32, h: f32) -> f32 {
+    (w * h
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+fn area(w: f32, h: f32) -> f32 {
+    w * h
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

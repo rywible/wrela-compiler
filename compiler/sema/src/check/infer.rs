@@ -226,8 +226,18 @@ impl Infer {
             (TyKind::Array(x, n), TyKind::Array(y, m)) if n == m => {
                 self.unify_in(types, *x, *y, done)
             }
+            (TyKind::ArrayN(x, n), TyKind::Array(y, m))
+            | (TyKind::Array(y, m), TyKind::ArrayN(x, n)) => {
+                let len = types.intern(TyKind::ConstU32(*m));
+                self.unify_in(types, *x, *y, done)?;
+                self.unify_in(types, *n, len, done)
+            }
+            (TyKind::ArrayN(x, n), TyKind::ArrayN(y, m)) => {
+                self.unify_in(types, *x, *y, done)?;
+                self.unify_in(types, *n, *m, done)
+            }
             (TyKind::Slice(x), TyKind::Slice(y)) => self.unify_in(types, *x, *y, done),
-            (TyKind::FnPtr(xp, xr), TyKind::FnPtr(yp, yr)) => {
+            (TyKind::FnPtr(xp, xr, xf), TyKind::FnPtr(yp, yr, yf)) if xf == yf => {
                 self.unify_all(types, xp, yp, done)?;
                 self.unify_in(types, *xr, *yr, done)
             }

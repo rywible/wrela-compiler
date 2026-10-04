@@ -1,0 +1,30 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0510",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [
+        "to keep work for later, store an enum of actions and `match` on it"
+      ],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "a function type can only be a parameter's type",
+      "notes": [
+        "a closure that captures only values can be stored, but its type is its own and inferred (§6.7)"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 15,
+        "end": 110,
+        "end_column": 19,
+        "end_line": 5,
+        "line": 5,
+        "start": 106
+      },
+      "title": "a closure that escapes"
+    }
+  ],
+  "version": 2
+}

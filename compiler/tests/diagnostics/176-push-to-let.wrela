@@ -1,0 +1,8 @@
+// mistake: pushing onto a `Vec` bound with `let`
+// expect: E0512
+// fix: yes
+fn names() -> u32 {
+    let xs: Vec<u32> = Vec::new()
+    xs.push(1)
+    xs.len()
+}

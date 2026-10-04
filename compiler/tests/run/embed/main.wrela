@@ -1,0 +1,62 @@
+// run: `embed("path")` gives `Bytes` of a file in the package, read by the build (§10); it
+// passes as a `[u8]` (an argument, a borrow struct's field), and a constant can hold it or
+// compute from it
+// expect: len() = 5
+// expect: sum_all() = 549
+// expect: last() = 255
+// expect: computed() = 549
+// expect: viewed() = 549
+// expect: empty() = 0
+// expect: past_end() traps
+
+struct Net {
+    weights: Bytes,
+}
+
+const WEIGHTS = embed("data/weights.bin")
+const NET = Net { weights: embed("data/weights.bin") }
+const SUM = sum(embed("data/weights.bin"))
+
+fn sum(bs: [u8]) -> u32 {
+    var s = 0
+    for b in bs {
+        s += u32(b)
+    }
+    s
+}
+
+pub fn len() -> u32 {
+    WEIGHTS.len()
+}
+
+pub fn sum_all() -> u32 {
+    sum(WEIGHTS)
+}
+
+pub fn last() -> u32 {
+    u32(NET.weights.at(4))
+}
+
+pub fn computed() -> u32 {
+    SUM
+}
+
+borrow struct View {
+    bytes: [u8],
+}
+
+pub fn viewed() -> u32 {
+    let v = View { bytes: WEIGHTS }
+    sum(v.bytes)
+}
+
+pub fn empty() -> u32 {
+    let e = embed("data/empty.bin")
+    e.len() + sum(e)
+}
+
+pub fn past_end() -> u32 {
+    u32(WEIGHTS.at(5))
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

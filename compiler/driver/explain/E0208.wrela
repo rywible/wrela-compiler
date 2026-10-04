@@ -1,0 +1,4 @@
+// A directory in the package is a symbolic link. The compiler doesn't follow links: what a
+// package holds is the files under its directory, so a build is the same wherever it runs.
+// Copy the directory in, or make the code it holds a dependency in `wrela.toml`.
+// ---- untested: a symbolic link can't be written as a file's text (the test suite makes one: diagnostics.rs)

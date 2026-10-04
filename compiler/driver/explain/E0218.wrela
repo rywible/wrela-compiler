@@ -1,0 +1,12 @@
+// An `embed` whose file can't be read, or whose path isn't a plain relative path in the
+// package: no `..`, no absolute path, a literal string.
+// ---- wrong
+const WEIGHTS: Bytes = embed("weights.bin")
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+const WEIGHTS: Bytes = embed("weights.bin")
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- file weights.bin
+0123456789

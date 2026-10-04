@@ -12,6 +12,8 @@ pub enum BuiltinTy {
     Float(FloatTy),
     Vec(u8),
     Mat(u8),
+    /// `str`: a borrowed run of UTF-8.
+    Str,
 }
 
 impl BuiltinTy {
@@ -34,6 +36,7 @@ impl BuiltinTy {
             "mat2" => BuiltinTy::Mat(2),
             "mat3" => BuiltinTy::Mat(3),
             "mat4" => BuiltinTy::Mat(4),
+            "str" => BuiltinTy::Str,
             _ => return None,
         })
     }
@@ -45,6 +48,7 @@ impl BuiltinTy {
             BuiltinTy::Float(f) => TyKind::Float(f),
             BuiltinTy::Vec(n) => TyKind::Vec(n),
             BuiltinTy::Mat(n) => TyKind::Mat(n),
+            BuiltinTy::Str => TyKind::Str,
         })
     }
 }
@@ -99,6 +103,18 @@ macro_rules! builtin_fns {
             }
         }
     };
+}
+
+impl BuiltinFn {
+    /// The names of its parameters, for a built-in whose arguments can be named. Only
+    /// `select`'s: its order (the value for `false` first) is easy to swap, so a call names
+    /// them (W0005).
+    pub fn param_names(self) -> Option<&'static [&'static str]> {
+        match self {
+            BuiltinFn::Select => Some(&["if_false", "if_true", "cond"]),
+            _ => None,
+        }
+    }
 }
 
 builtin_fns! {
@@ -158,6 +174,12 @@ builtin_fns! {
     WrappingMul = "wrapping_mul", 2, Method, false, None;
     /// `xs.len()` of a run or an array: its element count, a `u32`.
     Len = "len", 1, Method, false, None;
+    /// `panic(message)`: a bug. Traps with the message (§15); its type is `!`.
+    Panic = "panic", 1, Free, false, None;
+    /// `assert(cond, message)`: panics with the message when `cond` is false.
+    Assert = "assert", 2, Free, false, None;
+    /// `embed("path")`: the file at `path` in the package, read by the build, as `Bytes` (§10).
+    Embed = "embed", 1, Free, false, None;
 }
 
 /// E0702: a transcendental (`what`: `sin`, `**`) of an `f64`. std computes them on the CPU in
@@ -301,7 +323,7 @@ impl BuiltinFn {
                 Ok(types.f64)
             }
             Len => match types.kind(args[0]) {
-                TyKind::Slice(_) | TyKind::Array(..) => Ok(types.u32),
+                TyKind::Slice(_) | TyKind::Array(..) | TyKind::ArrayN(..) => Ok(types.u32),
                 _ => Err(format!(
                     "`len` is a method of runs and arrays, not of `{}`",
                     p.display_ty(args[0])
@@ -311,6 +333,11 @@ impl BuiltinFn {
                 let t = same(args)?;
                 takes(types.is_int(t), "integers", t)
             }
+            // Checked where they're called: their message is text.
+            Panic => Ok(types.never),
+            Assert => Ok(types.unit),
+            // Checked where it's called: its path is a string literal.
+            Embed => Ok(types.error),
         }
     }
 }

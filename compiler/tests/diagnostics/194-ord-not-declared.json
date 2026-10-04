@@ -1,0 +1,28 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0305",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [
+        "declare it where `Score` is declared: `struct Score: Ord { ... }`"
+      ],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "`Score` can't be ordered: it doesn't declare `Ord`",
+      "notes": [],
+      "severity": "error",
+      "span": {
+        "column": 5,
+        "end": 174,
+        "end_column": 10,
+        "end_line": 9,
+        "line": 9,
+        "start": 169
+      },
+      "title": "an operator that doesn't apply to these types"
+    }
+  ],
+  "version": 2
+}

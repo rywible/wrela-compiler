@@ -1,0 +1,6 @@
+// mistake: `format!`, as in Rust
+// expect: E0115
+// fix: yes
+fn label(name: Text, score: u32) -> String {
+    format!("{} scored {}", name, score)
+}

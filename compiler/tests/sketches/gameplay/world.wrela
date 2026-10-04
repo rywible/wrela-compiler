@@ -1,0 +1,161 @@
+// The shared world, and the tick: commands, timers and events (paper test §4).
+//
+// Changed from the paper test:
+// - The event list is moved out with std's `replace` before the systems run (F11): each needs
+//   `mut w`.
+// - `Tick` is the engine's type alias (F17); timers are the engine's `Timers<A>`.
+
+use dialogue::{Conversation, Effect, MIRA_START, apply, choose}
+use engine::sim::{Sim, SimState, SimValue, Tick}
+use engine::timers::Timers
+use flags::{FlagId, Flags, GATE_OPENED}
+use inventory::{Player, equip, unequip}
+use items::ItemId
+use menus::Command
+use quests::{QuestState, quests_react}
+use std::arena::{Arena, Handle}
+use std::hash::StateHash
+use std::serialize::Serialize
+use std::units::s
+
+/// Everything the simulation knows: ordinary values (§6.11).
+pub struct World: Sim {
+    pub tick: Tick,
+    pub player: Player,
+    pub flags: Flags,
+    pub talk: Option<Conversation>, // the conversation in progress
+    pub quests: Vec<QuestState>, // one per quest
+    pub timers: Timers<Action>,
+    pub events: Vec<Event>, // this tick's; empty between ticks
+    pub gates: Arena<Gate>,
+    pub levers: Arena<Lever>,
+    pub pickups: Arena<Pickup>,
+}
+
+pub struct Gate: Sim {
+    pub open: bool,
+}
+
+pub struct Lever: Sim {
+    pub gate: Handle<Gate>,
+}
+
+pub struct Pickup: Sim {
+    pub item: ItemId,
+    pub count: u32,
+    pub pos: vec3,
+}
+
+/// Everything a timer can do later.
+pub enum Action: SimValue {
+    OpenGate(Handle<Gate>),
+    CloseGate(Handle<Gate>),
+    Give { item: ItemId, count: u32 },
+}
+
+/// What happened this tick. Systems read the list in a fixed order; there are no subscriber
+/// lists, whose handlers would be closures of different types (F9).
+pub enum Event: SimValue {
+    ItemGained { item: ItemId, count: u32 },
+    ItemLost { item: ItemId, count: u32 },
+    FlagSet(FlagId),
+    LeverPulled(Handle<Lever>),
+    GateOpened(Handle<Gate>),
+    QuestAdvanced { quest: u32, stage: u32 },
+}
+
+/// A tick's input: what the menus clicked, as commands.
+pub struct TickInput: Clone {
+    pub commands: Vec<Command>,
+}
+
+@deterministic
+pub fn tick(w: mut World, input: TickInput) {
+    for c in input.commands {
+        command(mut w, c)
+    }
+    for t in w.timers.take_due(w.tick) { // an owned Vec: it doesn't borrow `w`
+        run(mut w, t.action)
+    }
+    react(mut w)
+    w.tick += 1
+}
+
+@deterministic
+fn command(w: mut World, c: Command) {
+    match c {
+        Command::Equip { slot } => {
+            let _ = equip(mut w.player, slot)
+        },
+        Command::Unequip { at } => {
+            let _ = unequip(mut w.player, at)
+        },
+        Command::MoveSlot { from, to } => w.player.bag.move_slot(from, to),
+        Command::SortBag => w.player.bag.sort(),
+        Command::Talk => w.talk = Some(Conversation { node: MIRA_START }),
+        Command::Choose { choice } => choose(mut w, choice),
+        Command::PullLever(l) => pull_lever(mut w, l),
+        Command::PickUp(p) => pick_up(mut w, p),
+    }
+}
+
+/// "In two seconds, the gate opens."
+@deterministic
+fn pull_lever(w: mut World, l: Handle<Lever>) {
+    if !w.levers.contains(l) { // a command can name a lever that's gone
+        return
+    }
+    let gate = w.levers[l].gate // a `Handle<Gate>`: both live in the world
+    let _ = w.timers.after(w.tick, 2s, Action::OpenGate(gate))
+    w.events.push(Event::LeverPulled(l))
+}
+
+@deterministic
+fn run(w: mut World, a: Action) {
+    match a {
+        Action::OpenGate(g) => {
+            if w.gates.contains(g) { // the gate may be gone by now
+                w.gates[g].open = true
+                w.events.push(Event::GateOpened(g))
+                apply(mut w, Effect::Set(GATE_OPENED))
+            }
+        },
+        Action::CloseGate(g) => {
+            if w.gates.contains(g) {
+                w.gates[g].open = false
+            }
+        },
+        Action::Give { item, count } => apply(mut w, Effect::Give { item, count }),
+    }
+}
+
+/// The player walks over something on the ground.
+@deterministic
+fn pick_up(w: mut World, h: Handle<Pickup>) {
+    if !w.pickups.contains(h) {
+        return
+    }
+    let p = w.pickups.remove(h) // moves it out of the arena
+    let left = w.player.bag.add(p.item, p.count)
+    if left < p.count {
+        w.events.push(Event::ItemGained { item: p.item, count: p.count - left })
+    }
+    if left > 0 {
+        let _ = w.pickups.insert(Pickup { count: left, ..p }) // the rest stays on the ground
+    }
+}
+
+/// Runs the systems that react to events, in a fixed order, until no new events appear.
+@deterministic
+fn react(w: mut World) {
+    var rounds = 0
+    while w.events.len() > 0 {
+        assert(rounds < 8, "events keep causing events") // a cycle is a bug
+        let events = replace(mut w.events, Vec::new()) // owned (F11): the systems need `mut w`
+        for e in events {
+            quests_react(mut w, e)
+            // further systems go here, in a fixed order
+        }
+        rounds += 1
+    }
+}

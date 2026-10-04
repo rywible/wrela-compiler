@@ -1,0 +1,80 @@
+// Parallel jobs (compiler/tests/tests/suite/parallel.rs): 10,000 particles stepped with
+// `par_each_mut` and their energy summed with `par_map_reduce`, each frame. Their state goes
+// to the GPU every frame, so the state hash covers it: it must not depend on how many workers
+// run the jobs.
+use std::gpu::{GpuBuffer, buffer, write}
+
+struct Particle: Copy + GpuData {
+    pos: vec4,
+    vel: vec4,
+}
+
+pub struct World {
+    particles: Vec<Particle>,
+    out: GpuBuffer<Particle>,
+    energy: f32,
+}
+
+const N: u32 = 10000
+
+pub fn init() -> World {
+    var particles: Vec<Particle> = Vec::with_capacity(N)
+    for i in 0..N {
+        let pos = vec4(f32(i % 100), 1.0 + f32(i / 100), 0.0, 0.0)
+        let vel = vec4(1.0, f32(i % 7) * 0.1, 0.5 - f32(i % 3) * 0.25, 0.0)
+        particles.push(Particle { pos, vel })
+    }
+    World { particles, out: buffer(N), energy: 0.0 }
+}
+
+/// One step of a bouncing particle.
+@deterministic
+fn step(p: mut Particle, dt: f32) {
+    p.vel.y -= 9.8 * dt
+    p.pos += p.vel * dt
+    if p.pos.y < 0.0 {
+        p.pos.y = -p.pos.y
+        p.vel.y = -p.vel.y * 0.8
+    }
+}
+
+pub fn frame(state: mut World, time: f32, width: u32, height: u32) {
+    let dt = 1.0 / 60.0
+    state.particles.par_each_mut(|p| step(mut p, dt))
+    state.energy = state.particles.par_map_reduce(0.0, |p| dot(p.vel, p.vel), |a, b| a + b)
+    write(mut state.out, 0, state.particles)
+}
+
+/// The particles' kinetic energy (twice it, per unit mass) after the last frame.
+pub fn energy(state: World) -> f32 {
+    state.energy
+}
+
+/// The same sum, on this thread alone, in the order `par_map_reduce` folds.
+pub fn energy_alone(state: World) -> f32 {
+    let n = state.particles.len()
+    let chunks = (n + 63) / 64
+    let size = (n + chunks - 1) / chunks
+    var out = 0.0
+    for c in 0..chunks {
+        var acc = 0.0
+        let end = min(n, (c + 1) * size)
+        for i in c * size..end {
+            let v = state.particles[i].vel
+            acc = acc + dot(v, v)
+        }
+        out = out + acc
+    }
+    out
+}
+
+/// Marks particle `at`, then runs a job that panics on the marked one: whichever thread runs
+/// its chunk, the program's own or a worker, the panic is the program's.
+pub fn poison(state: mut World, at: u32) {
+    state.particles[at].vel.w = 1.0
+    state.particles.par_each_mut(|p| {
+        if p.vel.w != 0.0 {
+            panic("a poisoned particle")
+        }
+    })
+}

@@ -1,0 +1,41 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0417",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [
+        {
+          "file": "main.wrela",
+          "message": "`Plain` declared here",
+          "span": {
+            "column": 14,
+            "end": 97,
+            "end_column": 19,
+            "end_line": 4,
+            "line": 4,
+            "start": 92
+          }
+        }
+      ],
+      "message": "`Save` can't derive `Plain`: the field `name` has type `String`, which doesn't have it",
+      "notes": [
+        "`Save` declares `Plain`, which is derived field by field, so the field `name` needs it too (§3)"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 5,
+        "end": 132,
+        "end_column": 17,
+        "end_line": 6,
+        "line": 6,
+        "start": 120
+      },
+      "title": "a type that can't derive a `@fieldwise` trait it declares"
+    }
+  ],
+  "version": 2
+}

@@ -26,7 +26,7 @@ pub fn program(frames: &[Vec<Vec<u8>>]) -> String {
     format!(
         r#"(module
   (import "wrela" "submit" (func $submit (param i32 i32)))
-  (memory (export "memory") {pages})
+  (import "wrela" "memory" (memory {pages} 16384 shared)) (export "memory" (memory 0))
   (global $n (mut i32) (i32.const 0)){data}
   (func (export "frame") (param f32 i32 i32){body}
     (global.set $n (i32.add (global.get $n) (i32.const 1)))))
@@ -34,6 +34,6 @@ pub fn program(frames: &[Vec<Vec<u8>>]) -> String {
     )
 }
 
-fn escape(bytes: &[u8]) -> String {
+pub fn escape(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("\\{b:02x}")).collect()
 }

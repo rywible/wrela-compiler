@@ -1,0 +1,7 @@
+// mistake: a `Plain` struct with a `String` field
+// expect: E0417
+// fix: no
+struct Save: Plain {
+    level: u32,
+    name: String,
+}

@@ -1,0 +1,26 @@
+// accepts: mem.exclusivity mem.projections
+// A `Copy` argument is copied before the call's `mut` access begins, so it may read a place a
+// `mut` argument overlaps; a `-> mut T` result borrows only the `mut` arguments.
+struct Counter {
+    count: u32,
+    items: [u32; 4],
+}
+
+impl Counter {
+    fn add(mut self, n: u32) {
+        self.count += n
+    }
+
+    fn slot(mut self, i: u32) -> mut u32 {
+        mut self.items[i]
+    }
+}
+
+fn f(c: mut Counter, v: mut Vec<u32>) {
+    c.add(c.count)
+    v.push(v.len())
+    var i = 1
+    mut s = c.slot(i)
+    i += 1
+    s += i
+}

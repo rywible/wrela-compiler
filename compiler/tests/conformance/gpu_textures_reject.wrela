@@ -1,0 +1,30 @@
+// rejects: gpu.textures
+// Sampling picks its detail from neighbouring pixels: fragment shaders only, in uniform
+// control flow. CPU code can't read texels.
+use std::gpu::{
+    ClipPosition, FragCoord, Sampler, Texture, VertexIndex, begin_screen_pass, draw, present,
+    sampler, texture,
+}
+
+@vertex
+fn cover(v: VertexIndex, heights: Texture, s: Sampler) -> ClipPosition {
+    let h = heights.sample(s, vec2(0.5, 0.5)).x //~ E0607
+    ClipPosition { position: vec4(f32(v.index % 2), f32(v.index / 2), h, 1.0) }
+}
+
+@fragment
+fn paint(pixel: FragCoord, image: Texture, s: Sampler) -> vec4 {
+    if pixel.position.x > 10.0 {
+        return image.sample(s, vec2(0.5, 0.5)) //~ E0608
+    }
+    vec4(0.0)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    let image = texture(width: 4, height: 4)
+    let s = sampler()
+    begin_screen_pass(clear: vec4(0.0))
+    draw(cover.bind(heights: image, s: s), paint.bind(image: image, s: s), vertices: 3)
+    present()
+    let texel = image.load(x: 0, y: 0) //~ E0607
+}

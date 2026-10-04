@@ -1,0 +1,44 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0705",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [
+        "check that its loops end, or compute the value at load instead"
+      ],
+      "internal": false,
+      "label": null,
+      "labels": [
+        {
+          "file": "main.wrela",
+          "message": "while the build computes `STEPS`",
+          "span": {
+            "column": 20,
+            "end": 107,
+            "end_column": 28,
+            "end_line": 4,
+            "line": 4,
+            "start": 99
+          }
+        }
+      ],
+      "message": "computing the constant `STEPS` ran past the build's fuel limit",
+      "notes": [
+        "the call chain: const STEPS → settle",
+        "the build stops a constant after about 17 billion WASM instructions, so a computation that doesn't end is an error rather than a hang (§10)"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 5,
+        "end": 203,
+        "end_column": 6,
+        "end_line": 10,
+        "line": 8,
+        "start": 153
+      },
+      "title": "a constant whose computation ran past the build's fuel limit"
+    }
+  ],
+  "version": 2
+}

@@ -1,0 +1,10 @@
+// mistake: printing from `@deterministic` code
+// expect: E0600
+// fix: no
+use std::io::print
+
+@deterministic
+fn tick(turn: u32) -> u32 {
+    print(f"turn {turn}")
+    turn + 1
+}

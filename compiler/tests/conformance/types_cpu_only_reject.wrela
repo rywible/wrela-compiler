@@ -1,7 +1,7 @@
 // rejects: ty.cpu-only
 use std::gpu::{GlobalId, Slots}
 
-struct Params: Copy + Clone + GpuData {
+struct Params: Copy + GpuData {
     scale: f32,
 }
 

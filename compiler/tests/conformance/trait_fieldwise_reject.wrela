@@ -1,0 +1,37 @@
+// rejects: trait.fieldwise
+@fieldwise
+trait Size {
+    fn size(self) -> u32 //~ E0416
+
+    fn ok(self)
+
+    fn ok_field(name: u32) {} //~ E0414
+}
+
+struct Opaque {
+    handle: u32,
+}
+
+@fieldwise
+trait Visit {
+    fn visit(self)
+}
+
+impl Visit for f32 {
+    fn visit(self) {}
+}
+
+struct Thing: Visit {
+    a: f32,
+    b: Opaque, //~ E0417
+}
+
+struct Plain {
+    x: f32,
+}
+
+impl Clone for Plain { //~ E0415
+    fn clone(self) -> Plain {
+        Plain { x: self.x }
+    }
+}

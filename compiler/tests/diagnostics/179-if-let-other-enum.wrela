@@ -1,0 +1,15 @@
+// mistake: `if let` with a variant of another enum
+// expect: E0320
+// fix: no
+enum Mood {
+    Calm,
+    Alert,
+}
+
+fn calm(m: Option<Mood>) -> bool {
+    if let Mood::Calm = m {
+        true
+    } else {
+        false
+    }
+}

@@ -1,0 +1,26 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0320",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "a string pattern matches text, not `u32`",
+      "notes": [],
+      "severity": "error",
+      "span": {
+        "column": 9,
+        "end": 130,
+        "end_column": 15,
+        "end_line": 6,
+        "line": 6,
+        "start": 124
+      },
+      "title": "a pattern that doesn't match the type"
+    }
+  ],
+  "version": 2
+}

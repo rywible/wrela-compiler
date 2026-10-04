@@ -15,7 +15,7 @@ use wrela_host::{CpuBuild, CpuHost, Host, Value};
 use wrela_tests::{Rng, one_f32, one_u32, par_each, sized, u32s, worse};
 
 /// The corpus, in the order of `with_function` in compiler/tests/fields/main.wrela.
-const NAMES: [&str; 17] = [
+const NAMES: [&str; 21] = [
     "sphere",
     "ellipsoid",
     "round cone",
@@ -33,6 +33,10 @@ const NAMES: [&str; 17] = [
     "vectors",
     "branchy",
     "cells",
+    "sphere (tape)",
+    "waves (tape)",
+    "blob (tape)",
+    "closures",
 ];
 /// Boxes per function on the GPU, and on the CPU at full size.
 const BOXES: u32 = 1_000_000;
@@ -198,7 +202,8 @@ fn intervals_enclose_every_sample_on_the_gpu() {
     for (fi, name) in NAMES.iter().enumerate() {
         let args = [Value::I32(fi as i32), Value::I32(13), Value::I32(BOXES as i32)];
         host.call_export("check_gpu", &args).expect("check_gpu");
-        let out = u32s(&host.read_buffer(fi as u32).expect("results"));
+        let out = *host.buffers().last().expect("a buffer");
+        let out = u32s(&host.read_buffer(out).expect("results"));
         let misses: u64 = out.iter().map(|&x| u64::from(x % 256)).sum();
         let unwidened: u64 = out.iter().map(|&x| u64::from(x / 256)).sum();
         report.push(format!(
@@ -210,4 +215,17 @@ fn intervals_enclose_every_sample_on_the_gpu() {
         assert_eq!(unwidened, 0, "{name}: a GPU interval over a point wasn't widened");
     }
     println!("AC3 intervals on the GPU:\n{}", report.join("\n"));
+}
+
+/// AC12: on the GPU, the box of a vector's interval (the creature's gradient) is the three
+/// components' intervals, over 10⁴ random boxes. (The CPU's: run/interval_vectors.)
+#[test]
+#[ignore = "needs a GPU"]
+fn the_interval_of_a_vector_is_its_components_on_the_gpu() {
+    let mut host = Host::load(built("fields")).expect("load");
+    let n = 10_000;
+    host.call_export("check_vector_intervals", &[Value::I32(5), Value::I32(n)]).expect("check");
+    let out = *host.buffers().last().expect("a buffer");
+    let same = u32s(&host.read_buffer(out).expect("read"));
+    assert_eq!(same.iter().filter(|&&s| s == 1).count(), n as usize);
 }

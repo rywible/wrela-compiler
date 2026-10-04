@@ -1,0 +1,12 @@
+// A constant of a type that can't live as long as the program: a closure, a run `[T]`, a
+// projection. A constant is an owned value; make a function instead.
+// ---- wrong
+const PICK = || 1
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+fn pick() -> i32 {
+    1
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

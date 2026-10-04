@@ -1,0 +1,29 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0600",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "`load` does IO, and `par_each_mut` runs it on several workers at once, which can't `io`",
+      "notes": [
+        "the call chain: a closure in `warm` → load",
+        "reading or writing outside the program is the `io` effect; see language.md §8 for what each context forbids"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 35,
+        "end": 173,
+        "end_column": 48,
+        "end_line": 7,
+        "line": 7,
+        "start": 160
+      },
+      "title": "an effect a context forbids"
+    }
+  ],
+  "version": 2
+}

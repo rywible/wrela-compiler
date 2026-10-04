@@ -1,0 +1,29 @@
+// A value whose type is too large to compile: more than 4096 parts. A type that doubles with
+// each step, as `(a, a)` does, grows past any machine. Use an array or a `Vec`.
+// ---- wrong
+fn grow() -> u32 {
+    let a0 = (1, 1)
+    let a1 = (a0, a0)
+    let a2 = (a1, a1)
+    let a3 = (a2, a2)
+    let a4 = (a3, a3)
+    let a5 = (a4, a4)
+    let a6 = (a5, a5)
+    let a7 = (a6, a6)
+    let a8 = (a7, a7)
+    let a9 = (a8, a8)
+    let a10 = (a9, a9)
+    let a11 = (a10, a10)
+    let a12 = (a11, a11)
+    let a13 = (a12, a12)
+    1
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+fn grow() -> u32 {
+    let a = [1; 8192]
+    a.len()
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

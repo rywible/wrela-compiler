@@ -113,12 +113,14 @@ fn the_compiled_grazer_matches_the_hand_written_one() {
         (0..328).filter(|&i| params[i].to_bits() != fixture[i].to_bits()).collect();
     assert!(mismatched.is_empty(), "parameters differ from the spike's at {mismatched:?}");
 
-    // The compiled field: points over the grazer's bounds (buffer 0), the distance (1), and the
-    // distance and gradient (2).
+    // The compiled field: points over the grazer's bounds, the distance, and the distance and
+    // gradient: the newest three buffers, which the program's state holds.
     host.call_export("evaluate", &[Value::I32(1), Value::I32(POINTS as i32)]).expect("evaluate");
-    let points = host.read_buffer(0).expect("points");
-    let dist = f32s(&host.read_buffer(1).expect("distances"));
-    let samp = f32s(&host.read_buffer(2).expect("samples"));
+    let made = host.buffers();
+    let [.., p, d, s] = made[..] else { panic!("evaluate made {made:?}") };
+    let points = host.read_buffer(p).expect("points");
+    let dist = f32s(&host.read_buffer(d).expect("distances"));
+    let samp = f32s(&host.read_buffer(s).expect("samples"));
     let batches = host.take_batches();
     drop(host);
 
@@ -239,15 +241,15 @@ fn the_compiled_grazer_matches_the_hand_written_one() {
 #[ignore = "needs a GPU"]
 fn block_culling_on_the_spikes_grid() {
     let mut host = load();
-    let mut handle = 0u32;
     let mut kept = [0u64; 2];
     let mut blocks = 0u64;
     for seed in 1..=40 {
         for (rule, k) in kept.iter_mut().enumerate() {
             let args = [Value::I32(seed), Value::F32(0.015), Value::I32(rule as i32)];
             let n = one_u32(&mut host, "cull", &args);
-            let live = u32s(&host.read_buffer(handle).expect("live blocks"));
-            handle += 1;
+            // The newest buffer, which the program's state holds.
+            let live = *host.buffers().last().expect("a buffer");
+            let live = u32s(&host.read_buffer(live).expect("live blocks"));
             *k += live.iter().map(|&x| u64::from(x)).sum::<u64>();
             if rule == 0 {
                 blocks += u64::from(n);

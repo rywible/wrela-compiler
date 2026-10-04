@@ -5,23 +5,23 @@
       "file": "main.wrela",
       "fixes": [],
       "help": [
-        "pass it straight to a parameter of type `fn(..)`"
+        "copy what it needs into a local first (`let x = s.clone()`), or pass the closure straight to a parameter"
       ],
       "internal": false,
       "label": null,
       "labels": [],
-      "message": "a closure or function can't be stored in a struct or enum",
+      "message": "a closure that captures `s`, a projection, can't be stored in a struct or enum",
       "notes": [
-        "closures don't escape the call they're passed to (§6.7); storing or returning one is tier 1 (`@escaping`)"
+        "a closure that captures only `Copy` values holds copies of them, and can be stored; one that borrows or changes what it uses can only be passed down (§6.7)"
       ],
       "severity": "error",
       "span": {
         "column": 13,
-        "end": 136,
-        "end_column": 33,
-        "end_line": 5,
-        "line": 5,
-        "start": 116
+        "end": 220,
+        "end_column": 35,
+        "end_line": 10,
+        "line": 10,
+        "start": 198
       },
       "title": "a closure that escapes"
     }

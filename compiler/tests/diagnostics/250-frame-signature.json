@@ -1,0 +1,28 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0703",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "`frame`'s signature is `frame(time: f32, width: u32, height: u32)`, with no result: the host calls it each frame",
+      "notes": [
+        "a host program exports `frame`: the time in seconds, and the screen's size in pixels; a program with `init` gets its state first (§12)"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 5,
+        "end": 117,
+        "end_column": 24,
+        "end_line": 4,
+        "line": 4,
+        "start": 98
+      },
+      "title": "an exported function with an unsupported signature"
+    }
+  ],
+  "version": 2
+}

@@ -1,0 +1,20 @@
+// rejects: eff.derived
+// What's derived can't record GPU work, allocate, do IO or be non-deterministic: the error is
+// where it does, with the chain of calls.
+use std::derive::gradient
+use std::gpu::{GpuBuffer, buffer}
+
+fn recorded(x: f32) -> f32 {
+    let b: GpuBuffer<f32> = buffer(4) //~ E0700
+    x
+}
+
+fn grows(x: f32) -> f32 {
+    var v = Vec::new()
+    v.push(x) //~ E0700
+    v[0]
+}
+
+pub fn a(x: f32) -> f32 {
+    gradient(recorded, x) + gradient(grows, x)
+}

@@ -1,0 +1,137 @@
+// A modal-synthesis voice (D-004; compiler/tests/tests/suite/audio.rs): each strike excites
+// the modes of a struck bar, a set of damped resonators whose frequencies and decays come from
+// its material. The voice runs on the audio thread and reads its strikes from a ring. Every
+// strike is pushed before the voice starts, each with the sample it's due at, so the samples
+// don't depend on when the audio thread runs: Chrome's AudioWorklet and the native host's
+// offline run give the same ones, bit for bit.
+use std::audio::{QUANTUM, RingReader, RingWriter, SAMPLE_RATE, play, ring}
+use std::math::{TAU, cos, exp, sin}
+
+/// A strike: when (in samples from the start), which material, how hard, and where along the
+/// bar (0 to 1), which weights the modes.
+struct Strike: Copy {
+    at: u32,
+    material: u32,
+    strength: f32,
+    position: f32,
+}
+
+/// One mode: a damped resonator. Each sample its state turns by the mode's angle and shrinks
+/// by its decay.
+struct Mode: Copy {
+    re: f32,
+    im: f32,
+    cos_w: f32,
+    sin_w: f32,
+    decay: f32,
+    // Which shape of the bar this is: its index, for the strike position's weight.
+    k: u32,
+}
+
+const MODES: u32 = 8
+
+/// A free bar's modes, as ratios of its fundamental.
+const RATIOS: [f32; 8] = [1.0, 2.756, 5.404, 8.933, 13.344, 18.638, 24.815, 31.873]
+
+/// Each material: its fundamental in hertz, and its damping (how fast its modes decay).
+const FUNDAMENTALS: [f32; 3] = [220.0, 330.0, 165.0]
+const DAMPING: [f32; 3] = [3.0, 9.0, 1.5]
+
+/// The voice's state, which moves to the audio thread.
+struct Bars {
+    modes: [Mode; 24],
+    strikes: RingReader<Strike>,
+    next: Option<Strike>,
+    sample: u32,
+}
+
+fn modes() -> [Mode; 24] {
+    var out = [Mode { re: 0.0, im: 0.0, cos_w: 1.0, sin_w: 0.0, decay: 1.0, k: 0 }; 24]
+    for m in 0..3 {
+        for k in 0..MODES {
+            let f = FUNDAMENTALS[m] * RATIOS[k]
+            let w = TAU * f / f32(SAMPLE_RATE)
+            // Higher modes die faster.
+            let d = exp(-DAMPING[m] * (1.0 + 0.5 * f32(k)) / f32(SAMPLE_RATE))
+            out[m * MODES + k] = Mode {
+                re: 0.0,
+                im: 0.0,
+                cos_w: cos(w),
+                sin_w: sin(w),
+                decay: d,
+                k,
+            }
+        }
+    }
+    out
+}
+
+/// Excites the struck material's modes: a mode's amplitude is its shape at the position.
+fn excite(modes: mut [Mode; 24], s: Strike) {
+    for k in 0..MODES {
+        // (A float `%`, which once called the wrong helper in a program with a voice.)
+        let weight = sin(f32(k + 1) * 3.14159265 * (s.position % 1.0))
+        modes[s.material * MODES + k].im += s.strength * weight / f32(k + 1)
+    }
+}
+
+@audio
+fn render(bars: mut Bars, out: mut [f32]) {
+    for i in 0..out.len() {
+        // The strikes due by now.
+        loop {
+            if bars.next.is_none() {
+                bars.next = bars.strikes.pop()
+            }
+            match bars.next {
+                Some(s) if s.at <= bars.sample => {
+                    excite(mut bars.modes, s)
+                    bars.next = None
+                },
+                _ => break,
+            }
+        }
+        var y = 0.0
+        for mut m in bars.modes {
+            let re = (m.re * m.cos_w - m.im * m.sin_w) * m.decay
+            let im = (m.re * m.sin_w + m.im * m.cos_w) * m.decay
+            m.re = re
+            m.im = im
+            y += im
+        }
+        out[i] = 0.2 * y
+        bars.sample += 1
+    }
+}
+
+pub struct Game {
+    strikes: RingWriter<Strike>,
+    frames: u32,
+}
+
+pub fn init() -> Game {
+    let (writer, r) = ring::<Strike>(64)
+    var w = take writer
+    // A pattern of strikes over the first second and a half.
+    for i in 0..24 {
+        let at = i * 3000 + (i % 3) * 400
+        let strike = Strike {
+            at,
+            material: i % 3,
+            strength: 0.5 + 0.1 * f32(i % 5),
+            position: 0.15 + 0.03 * f32(i % 7),
+        }
+        let _ = w.push(strike)
+    }
+    play(Bars { modes: modes(), strikes: take r, next: None, sample: 0 }, render)
+    Game { strikes: take w, frames: 0 }
+}
+
+pub fn frame(state: mut Game, time: f32, width: u32, height: u32) {
+    state.frames += 1
+}
+
+/// How many samples one call to the voice renders.
+pub fn quantum() -> u32 {
+    QUANTUM
+}

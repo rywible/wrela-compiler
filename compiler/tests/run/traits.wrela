@@ -37,7 +37,7 @@ trait B {
     fn b(self) -> Self::Out
 }
 
-struct S: Copy + Clone {
+struct S: Copy {
     x: i32,
 }
 
@@ -64,7 +64,7 @@ trait Has {
     type K
 }
 
-struct P: Copy + Clone {
+struct P: Copy {
     x: i32,
 }
 
@@ -117,7 +117,7 @@ trait Counter {
     fn get(self) -> Self::Out
 }
 
-struct C1: Copy + Clone {
+struct C1: Copy {
     v: i32,
 }
 
@@ -128,12 +128,12 @@ impl Counter for C1 {
     }
 }
 
-struct Pt: Copy + Clone {
+struct Pt: Copy {
     x: i32,
     y: i32,
 }
 
-struct M: Copy + Clone {
+struct M: Copy {
     k: i32,
 }
 
@@ -170,7 +170,7 @@ trait Scale<T> {
     fn scale(self, by: T) -> f32
 }
 
-struct V: Copy + Clone {
+struct V: Copy {
     x: f32,
 }
 
@@ -353,7 +353,7 @@ impl Measure for Metres {
 }
 
 /// A field of an associated type: `In<Metres>` is `Copy` because `Metres::Unit` is `f32`.
-struct In<M: Measure>: Copy + Clone {
+struct In<M: Measure>: Copy {
     v: M::Unit,
 }
 
@@ -396,7 +396,7 @@ trait Stretch<T> {
     fn stretch(self, by: T) -> f32
 }
 
-struct Rod: Copy + Clone {
+struct Rod: Copy {
     w: f32,
 }
 
@@ -421,7 +421,7 @@ trait Holds {
     fn part(self) -> Self::Part
 }
 
-struct Bundle: Copy + Clone {
+struct Bundle: Copy {
     rod: Rod,
 }
 

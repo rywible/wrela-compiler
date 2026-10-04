@@ -1,0 +1,9 @@
+// accepts: mem.unsafe
+// A package that declares `unsafe = true` in its `wrela.toml` may use `unsafe` (§6.14).
+use std::mem::load_u32
+
+fn peek(addr: u32) -> u32 {
+    unsafe {
+        load_u32(addr)
+    }
+}

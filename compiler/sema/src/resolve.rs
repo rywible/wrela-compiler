@@ -28,7 +28,7 @@ impl Scope {
     pub fn of_owner(p: &Program, module: ModuleId, owner: FnOwner) -> Scope {
         let mut scope = Scope::new(module);
         match owner {
-            FnOwner::Free => {}
+            FnOwner::Free | FnOwner::Const(_) => {}
             FnOwner::Impl(i) => {
                 scope.self_ty = Some(p.impl_(i).self_ty);
                 scope.impl_ = Some(i);
@@ -72,6 +72,18 @@ pub enum TyPos<'a> {
     Param(&'a mut ImplicitParams),
     /// A return type: `-> Surface` names the one concrete type the body returns.
     Return(&'a mut Option<Vec<TraitRef>>),
+    /// A local binding's type: a run may be one (§6.6), a trait may not.
+    Local,
+    /// A generic parameter's bound: a function type may be one (`F: fn(vec3) -> f32`).
+    FnBound,
+}
+
+impl TyPos<'_> {
+    /// Whether a projection type (a run, `str`) may be written here: a parameter's, a
+    /// result's or a local binding's type, never a field's or a type argument (§6.6).
+    fn allows_runs(&self) -> bool {
+        !matches!(self, TyPos::Normal)
+    }
 }
 
 /// The generic parameters a signature's `x: Trait` parameters introduce, numbered after the
@@ -105,6 +117,51 @@ pub enum PathLookup {
 /// Whether `name` in module `m` is an item that failed to parse (or an import of one).
 pub fn is_broken(p: &Program, m: ModuleId, name: &str) -> bool {
     p.module(m).broken.contains(name)
+}
+
+/// Where std defines a public item named `name`, if it does, outside the prelude (whose items
+/// are in scope already): `std::hash`. An unknown name that's one of std's is usually one that
+/// isn't imported.
+pub fn std_home(p: &Program, name: &str) -> Option<String> {
+    p.modules.iter().enumerate().find_map(|(i, m)| {
+        let defined_here = m
+            .scope
+            .get(name)
+            .is_some_and(|b| b.public && res_module(p, b.res) == Some(ModuleId(i as u32)));
+        (m.path.first().is_some_and(|f| f == "std")
+            && m.path.get(1).is_some_and(|s| s != "prelude")
+            && defined_here)
+            .then(|| m.path.join("::"))
+    })
+}
+
+/// The module an item resolution is defined in, for the items that have one.
+fn res_module(p: &Program, r: Res) -> Option<ModuleId> {
+    match r {
+        Res::Fn(f) => Some(p.func(f).module),
+        Res::Adt(a) => Some(p.adt(a).module),
+        Res::Trait(t) => Some(p.trait_(t).module),
+        Res::TraitSet(s) => Some(p.trait_sets[s.index()].module),
+        Res::Const(c) => Some(p.const_(c).module),
+        _ => None,
+    }
+}
+
+/// `d` with what fixes an unknown `name` that std has: an import, at the top of the file.
+pub fn with_std_import(p: &Program, d: Diagnostic, name: &str, at: Span) -> Diagnostic {
+    match std_home(p, name) {
+        Some(home) => {
+            let mut d = d;
+            d.fixes.clear();
+            d.with_note(format!("`{name}` is in `{home}`, which this module doesn't import"))
+                .with_fix(
+                    format!("import it: `use {home}::{name}`"),
+                    Span::new(at.file, 0, 0),
+                    format!("use {home}::{name}\n"),
+                )
+        }
+        None => d,
+    }
 }
 
 /// The closest of `candidates` to `name` by edit distance, if it's close enough to suggest.
@@ -175,8 +232,17 @@ pub fn lookup_name(p: &Program, m: ModuleId, name: &str) -> Option<Res> {
 /// The names visible in `m` that name types: structs, enums, traits and built-in types
 /// (and modules, which a type's path can start with).
 pub fn visible_type_names(p: &Program, m: ModuleId) -> Vec<String> {
-    let is_type =
-        |r: &Res| matches!(r, Res::Adt(_) | Res::Trait(_) | Res::BuiltinTy(_) | Res::Module(_));
+    let is_type = |r: &Res| {
+        matches!(
+            r,
+            Res::Adt(_)
+                | Res::Trait(_)
+                | Res::TraitSet(_)
+                | Res::BuiltinTy(_)
+                | Res::Module(_)
+                | Res::Alias(_)
+        )
+    };
     let mut out: Vec<String> =
         p.module(m).scope.iter().filter(|(_, b)| is_type(&b.res)).map(|(n, _)| n.clone()).collect();
     if let Some(prelude) = prelude(p) {
@@ -205,8 +271,10 @@ fn describe_res(p: &Program, r: Res) -> String {
         Res::Module(m) => format!("the module `{}`", p.module(m).name()),
         Res::Adt(a) => format!("the type `{}`", p.adt(a).name),
         Res::Trait(t) => format!("the trait `{}`", p.trait_(t).name),
+        Res::TraitSet(s) => format!("the trait set `{}`", p.trait_sets[s.index()].name),
         Res::Fn(f) => format!("the function `{}`", p.func(f).name),
         Res::Const(c) => format!("the constant `{}`", p.const_(c).name),
+        Res::Alias(a) => format!("the type `{}`", p.aliases[a.index()].name),
         Res::Variant(a, v) => {
             format!("the variant `{}::{}`", p.adt(a).name, p.adt(a).variants()[v as usize].name)
         }
@@ -233,9 +301,9 @@ impl PathSeg for ast::PathSegment {
 }
 
 /// Resolves a path of plain names (a `use` path, or a path's module prefix) from module `from`.
-/// The first segment is `std`, a name in `from`'s scope, a top-level module of the package, or
-/// a prelude name. Before the `final_pass`, a name that isn't found is `NotYet`: an import may
-/// still bind it.
+/// The first segment is `std`, a name in `from`'s scope, a top-level module of `from`'s
+/// package, one of its package's dependencies, or a prelude name. Before the `final_pass`, a
+/// name that isn't found is `NotYet`: an import may still bind it.
 pub fn resolve_module_path_in(
     p: &Program,
     from: ModuleId,
@@ -243,6 +311,9 @@ pub fn resolve_module_path_in(
     final_pass: bool,
 ) -> PathLookup {
     let first = segs[0].ident();
+    let package = p.package_of(from);
+    let top = |name: &str| p.module(package.root).children.get(name).copied();
+    let dep = |name: &str| package.deps.get(name).map(|d| p.packages[d.index()].root);
     let mut res = if first.name == "std" {
         match p.std_root {
             Some(s) => Res::Module(s),
@@ -260,10 +331,12 @@ pub fn resolve_module_path_in(
         segs.len() == 1
             || matches!(b.res, Res::Module(_))
             || matches!(b.res, Res::Adt(a) if p.adt(a).is_enum())
-            || !p.package_root.is_some_and(|r| p.module(r).children.contains_key(&first.name))
+            || top(&first.name).is_none() && dep(&first.name).is_none()
     }) {
         b.res
-    } else if let Some(&m) = p.package_root.and_then(|r| p.module(r).children.get(&first.name)) {
+    } else if let Some(m) = top(&first.name) {
+        Res::Module(m)
+    } else if let Some(m) = dep(&first.name) {
         Res::Module(m)
     } else if let Some(r) = lookup_global(p, &first.name) {
         r
@@ -285,11 +358,13 @@ pub fn resolve_module_path_in(
             ));
         }
         let mut names = visible_names(p, from);
-        if let Some(r) = p.package_root {
-            names.extend(p.module(r).children.keys().cloned());
-        }
+        names.extend(p.module(package.root).children.keys().cloned());
+        names.extend(package.deps.keys().cloned());
         if let Some(s) = closest(&first.name, names.iter().map(String::as_str)) {
             d = d.with_fix(format!("did you mean `{s}`?"), first.span, s);
+        }
+        if segs.len() == 1 {
+            d = with_std_import(p, d, &first.name, first.span);
         }
         return PathLookup::Error(Box::new(d));
     };
@@ -299,6 +374,20 @@ pub fn resolve_module_path_in(
             Res::Module(m) => {
                 let module = p.module(m);
                 if let Some(b) = module.scope.get(&seg.name) {
+                    if b.public && b.package_only && !p.same_package(m, from) {
+                        let d = Diagnostic::new(
+                            codes::E0203,
+                            seg.span,
+                            format!(
+                                "`{}` is visible only inside the package `{}`",
+                                seg.name,
+                                p.package_of(m).name
+                            ),
+                        )
+                        .with_secondary(b.span, "declared `pub(package)` here")
+                        .with_note("only a package's `pub` items cross to the packages that depend on it (§3)");
+                        return PathLookup::Error(Box::new(d));
+                    }
                     if !b.public && m != from {
                         let d = Diagnostic::new(
                             codes::E0203,
@@ -398,7 +487,49 @@ pub(crate) fn wrong_generic_count(span: Span, name: &str, want: usize, given: us
     )
 }
 
-/// Resolves a bound or supertrait: a path naming a trait, with its generic arguments.
+/// Resolves a bound, a supertrait or an opt-in: a trait, or a trait set's traits (§7), with
+/// their generic arguments. Empty after an error.
+pub fn resolve_trait_refs(
+    p: &Program,
+    diags: &mut Vec<Diagnostic>,
+    scope: &Scope,
+    te: &ast::TypeExpr,
+) -> Vec<TraitRef> {
+    if let ast::TypeExprKind::Path(path) = &te.kind
+        && let Some(Res::TraitSet(s)) = resolve_value_item(p, scope.module, path)
+    {
+        return set_traits(p, diags, scope, te, path, s).unwrap_or_default();
+    }
+    resolve_trait_ref(p, diags, scope, te).into_iter().collect()
+}
+
+/// A trait set's traits, with the arguments `path` gives its parameters.
+fn set_traits(
+    p: &Program,
+    diags: &mut Vec<Diagnostic>,
+    scope: &Scope,
+    te: &ast::TypeExpr,
+    path: &ast::Path,
+    s: TraitSetId,
+) -> Option<Vec<TraitRef>> {
+    let def = &p.trait_sets[s.index()];
+    let last = &path.segments[path.segments.len() - 1];
+    let args: Vec<TyId> = last
+        .generics
+        .iter()
+        .flatten()
+        .map(|a| resolve_type(p, diags, scope, a, TyPos::Normal))
+        .collect();
+    if args.len() != def.generics.len() {
+        diags.push(wrong_generic_count(te.span, &def.name, def.generics.len(), args.len()));
+        return None;
+    }
+    let subst = Subst::from_pairs(&def.generics, &args);
+    Some(def.traits.iter().map(|r| r.subst(&p.types, &subst)).collect())
+}
+
+/// Resolves a trait where exactly one is needed (an impl's): a path naming a trait, with its
+/// generic arguments. A trait set is E0419.
 pub fn resolve_trait_ref(
     p: &Program,
     diags: &mut Vec<Diagnostic>,
@@ -410,6 +541,21 @@ pub fn resolve_trait_ref(
         return None;
     };
     let res = lookup_or_report(p, diags, scope.module, &path.segments)?;
+    if let Res::TraitSet(s) = res {
+        let def = &p.trait_sets[s.index()];
+        let names: Vec<String> =
+            def.traits.iter().map(|r| format!("`{}`", p.trait_(r.trait_).name)).collect();
+        diags.push(
+            Diagnostic::new(
+                codes::E0419,
+                te.span,
+                format!("`{}` is a trait set, so it can't be implemented", def.name),
+            )
+            .with_note(format!("it names {}", names.join(", ")))
+            .with_help("implement each of its traits, or declare the ones a type opts in to"),
+        );
+        return None;
+    }
     let Res::Trait(t) = res else {
         diags.push(
             Diagnostic::new(
@@ -474,6 +620,13 @@ pub fn add_with_supertraits(p: &Program, self_ty: TyId, r: TraitRef, out: &mut V
     go(p, self_ty, r, out, &mut Vec::new());
 }
 
+/// E0327: a run (`what`) where a value is stored: a field, a type argument.
+fn run_stored(span: Span, what: &str) -> Diagnostic {
+    Diagnostic::new(codes::E0327, span, format!("{what} is a projection, so it can't be stored here"))
+        .with_note("a run borrows its caller's data: it's a parameter's, a result's or a local binding's type, never a field or a type argument (§6.6)")
+        .with_help("store an owned `Vec<T>` or `String`, a handle, or group projections in a `borrow struct`")
+}
+
 /// Resolves a type expression.
 pub fn resolve_type(
     p: &Program,
@@ -493,6 +646,15 @@ pub fn resolve_type(
         }
         ast::TypeExprKind::Array(elem, len) => {
             let e = resolve_type(p, diags, scope, elem, TyPos::Normal);
+            // A length that's a `const N: u32` parameter (§4).
+            if let Some(l) = len
+                && let ast::ExprKind::Path(path) = &l.kind
+                && path.is_single()
+                && let Some(g) = scope.param(&path.segments[0].ident.name)
+                && p.param(g).is_const
+            {
+                return p.types.intern(TyKind::ArrayN(e, p.types.param(g)));
+            }
             match len {
                 Some(len) => match const_u32(p, scope.module, len) {
                     Some(n) => p.types.array(e, n),
@@ -502,36 +664,107 @@ pub fn resolve_type(
                     }
                 },
                 None => {
-                    if !matches!(pos, TyPos::Param(_)) {
-                        diags.push(
-                            Diagnostic::new(codes::E0327, te.span, "a run `[T]` can only be a parameter's type")
-                                .with_note("a run borrows its caller's data, so it can't be stored or returned (§6.2)")
-                                .with_help("use a fixed-size array `[T; N]`"),
-                        );
+                    if !pos.allows_runs() {
+                        diags.push(run_stored(te.span, "a run `[T]`"));
                         return p.types.error;
                     }
                     p.types.intern(TyKind::Slice(e))
                 }
             }
         }
-        ast::TypeExprKind::Fn(params, ret) => {
+        ast::TypeExprKind::Fn(f) => {
             // Only a written type; a body's inferred types are checked once it's finished.
-            if !matches!(pos, TyPos::Param(_)) {
+            if !matches!(pos, TyPos::Param(_) | TyPos::FnBound) {
                 diags.push(
                     Diagnostic::new(codes::E0510, te.span, "a function type can only be a parameter's type")
-                        .with_note("closures don't escape the call they're passed to (§6.7); storing or returning one is tier 1 (`@escaping`)"),
+                        .with_note("a closure that captures only values can be stored, but its type is its own and inferred (§6.7)")
+                        .with_help("to keep work for later, store an enum of actions and `match` on it"),
                 );
                 return p.types.error;
             }
-            let ps =
-                params.iter().map(|t| resolve_type(p, diags, scope, t, TyPos::Normal)).collect();
-            let r = match ret {
+            let mut flags = FnFlags::default();
+            for a in &f.attrs {
+                if a.name == "deterministic" {
+                    flags.deterministic = true;
+                } else if a.name == "parallel" {
+                    flags.parallel = true;
+                } else if a.name == "audio" {
+                    flags.audio = true;
+                } else {
+                    diags.push(
+                        Diagnostic::new(
+                            codes::E0204,
+                            a.span,
+                            format!("`@{}` isn't an attribute of function types", a.name),
+                        )
+                        .with_note(
+                            "a function type takes `@deterministic`, `@parallel` or `@audio` (§9)",
+                        ),
+                    );
+                }
+            }
+            if f.params.len() > FnFlags::MAX_MODES {
+                diags.push(Diagnostic::new(
+                    codes::E0702,
+                    te.span,
+                    format!("a function type has at most {} parameters", FnFlags::MAX_MODES),
+                ));
+            }
+            let mut ps = Vec::new();
+            for (i, fp) in f.params.iter().enumerate() {
+                // A parameter of a function type may be a run, as a function's may (§6.6).
+                ps.push(resolve_type(p, diags, scope, &fp.ty, TyPos::Local));
+                flags = flags.with_mode(i, fp.mode);
+            }
+            let r = match &f.ret {
                 Some(r) => resolve_type(p, diags, scope, r, TyPos::Normal),
                 None => p.types.unit,
             };
-            p.types.intern(TyKind::FnPtr(ps, r))
+            p.types.intern(TyKind::FnPtr(ps, r, flags))
+        }
+        ast::TypeExprKind::Int(_) => {
+            diags.push(Diagnostic::new(
+                codes::E0212,
+                te.span,
+                "a number is a constant generic argument, not a type",
+            ));
+            p.types.error
         }
         ast::TypeExprKind::Path(path) => resolve_type_path(p, diags, scope, te, path, pos),
+        ast::TypeExprKind::Traits(list) => {
+            let before = diags.len();
+            let refs: Vec<TraitRef> =
+                list.iter().flat_map(|t| resolve_trait_refs(p, diags, scope, t)).collect();
+            if diags[before..].iter().any(|d| d.is_error()) || refs.is_empty() {
+                return p.types.error;
+            }
+            let names: Vec<&str> = refs.iter().map(|r| p.trait_(r.trait_).name.as_str()).collect();
+            match pos {
+                TyPos::Param(implicit) => {
+                    let id = implicit.add(ParamDef {
+                        name: format!("impl {}", names.join(" + ")),
+                        bounds: refs,
+                        span: te.span,
+                        is_self: false,
+                        is_const: false,
+                        fn_bound: None,
+                    });
+                    p.types.param(id)
+                }
+                TyPos::Return(opaque) => {
+                    *opaque = Some(refs);
+                    p.types.error // replaced by the caller with the opaque type
+                }
+                TyPos::Normal | TyPos::Local | TyPos::FnBound => {
+                    diags.push(
+                        Diagnostic::new(codes::E0410, te.span, format!("`{}` are traits, so they aren't a type here", names.join(" + ")))
+                            .with_note("traits name a type only as a parameter's type (any type with them) or a return type (the one type the body returns)")
+                            .with_help("add a generic parameter, as in `struct S<T: A + B> { x: T }`"),
+                    );
+                    p.types.error
+                }
+            }
+        }
     }
 }
 
@@ -686,14 +919,8 @@ fn resolve_type_path(
                 );
                 if let Some(s) = closest(first, names.iter().map(String::as_str)) {
                     d = d.with_fix(format!("did you mean `{s}`?"), segs[0].ident.span, s);
-                } else if first == "str" || first == "String" {
-                    d = Diagnostic::new(codes::E0901, segs[0].ident.span, "strings are tier 1");
-                } else if matches!(
-                    first.as_str(),
-                    "Vec" | "Box" | "Handle" | "Arena" | "List" | "Region" | "Result"
-                ) {
-                    d = d.with_note(format!("`{first}` comes with tier 1's stdlib (milestone 2)"));
                 }
+                let d = with_std_import(p, d, first, segs[0].ident.span);
                 diags.push(d);
                 return p.types.error;
             }
@@ -704,26 +931,48 @@ fn resolve_type_path(
             None => return p.types.error,
         }
     };
+    // A struct's `const N: u32` parameter takes a number (or a constant's name, or a const
+    // parameter).
+    let const_at = |i: usize| match res {
+        Res::Adt(a) => p.adt(a).generics.get(i).is_some_and(|&g| p.param(g).is_const),
+        _ => false,
+    };
     let args: Vec<TyId> = last
         .generics
         .iter()
         .flatten()
-        .map(|a| resolve_type(p, diags, scope, a, TyPos::Normal))
+        .enumerate()
+        .map(|(i, a)| match &a.kind {
+            ast::TypeExprKind::Int(lit) if const_at(i) => match &lit.kind {
+                ast::LitKind::Int(v) if v.ok().is_some_and(|v| u32::try_from(v).is_ok()) => {
+                    p.types.intern(TyKind::ConstU32(v.ok().unwrap_or(0) as u32))
+                }
+                _ => {
+                    diags.push(Diagnostic::new(codes::E0212, a.span, "a length is a `u32`"));
+                    p.types.error
+                }
+            },
+            _ => resolve_type(p, diags, scope, a, TyPos::Normal),
+        })
         .collect();
     match res {
         Res::BuiltinTy(b) => {
             if !args.is_empty() {
                 diags.push(
                     Diagnostic::new(
-                        codes::E0900,
+                        codes::E0322,
                         te.span,
-                        format!(
-                            "`{}` takes no generic arguments here; vector units are tier 1",
-                            last.ident.name
-                        ),
+                        format!("`{}` takes no generic arguments", last.ident.name),
+                    )
+                    .with_note(
+                        "units are constants, not types: a length is an `f32` in metres (§5)",
                     )
                     .with_help(format!("write `{}`", last.ident.name)),
                 );
+            }
+            if b == BuiltinTy::Str && !pos.allows_runs() {
+                diags.push(run_stored(te.span, "a `str`"));
+                return p.types.error;
             }
             b.ty(&p.types)
         }
@@ -734,6 +983,49 @@ fn resolve_type_path(
                 return p.types.error;
             }
             p.types.adt(a, args)
+        }
+        Res::Alias(a) => {
+            let def = &p.aliases[a.index()];
+            if args.len() != def.generics.len() {
+                diags.push(wrong_generic_count(te.span, &def.name, def.generics.len(), args.len()));
+                return p.types.error;
+            }
+            p.types.subst(def.ty, &Subst::from_pairs(&def.generics, &args))
+        }
+        Res::TraitSet(s) => {
+            let def = &p.trait_sets[s.index()];
+            if args.len() != def.generics.len() {
+                diags.push(wrong_generic_count(te.span, &def.name, def.generics.len(), args.len()));
+                return p.types.error;
+            }
+            let subst = Subst::from_pairs(&def.generics, &args);
+            let refs: Vec<TraitRef> =
+                def.traits.iter().map(|r| r.subst(&p.types, &subst)).collect();
+            match pos {
+                TyPos::Param(implicit) => {
+                    let id = implicit.add(ParamDef {
+                        name: format!("impl {}", def.name),
+                        bounds: refs,
+                        span: te.span,
+                        is_self: false,
+                        is_const: false,
+                        fn_bound: None,
+                    });
+                    p.types.param(id)
+                }
+                TyPos::Return(opaque) => {
+                    *opaque = Some(refs);
+                    p.types.error // replaced by the caller with the opaque type
+                }
+                TyPos::Normal | TyPos::Local | TyPos::FnBound => {
+                    diags.push(
+                        Diagnostic::new(codes::E0410, te.span, format!("`{}` is a trait set, so it isn't a type here", def.name))
+                            .with_note("traits name a type only as a parameter's type (any type with them) or a return type (the one type the body returns)")
+                            .with_help("add a generic parameter, as in `struct S<T: Set> { x: T }`"),
+                    );
+                    p.types.error
+                }
+            }
         }
         Res::Trait(t) => {
             let want = p.trait_(t).generics.len();
@@ -749,6 +1041,8 @@ fn resolve_type_path(
                         bounds: vec![r],
                         span: te.span,
                         is_self: false,
+                        is_const: false,
+                        fn_bound: None,
                     });
                     p.types.param(id)
                 }
@@ -756,7 +1050,7 @@ fn resolve_type_path(
                     *opaque = Some(vec![r]);
                     p.types.error // replaced by the caller with the opaque type
                 }
-                TyPos::Normal => {
+                TyPos::Normal | TyPos::Local | TyPos::FnBound => {
                     diags.push(
                         Diagnostic::new(codes::E0410, te.span, format!("`{}` is a trait, so it isn't a type here", p.trait_(t).name))
                             .with_note("a trait names a type only as a parameter's type (any type with it) or a return type (the one type the body returns)")

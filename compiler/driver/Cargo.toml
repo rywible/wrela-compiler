@@ -20,6 +20,10 @@ wrela-lower.workspace = true
 wrela-wasm.workspace = true
 wrela-wgsl.workspace = true
 wrela-abi.workspace = true
+# Build-time constants run the program's own code (language.md §10).
+wasmtime.workspace = true
+# Frame tests run the program's frames on the native host's CPU, without its GPU (§10).
+wrela-host = { path = "../../runtime/native", default-features = false }
 
 [lints]
 workspace = true

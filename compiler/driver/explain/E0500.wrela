@@ -1,0 +1,35 @@
+// A value is used after it was moved: passed to a `take` parameter, or moved with `take`.
+// After a move the name holds nothing. Use the value before the move, or move a `.clone()`.
+// ---- wrong
+struct Log {
+    lines: Vec<Text>,
+}
+
+fn archive(log: take Log) -> u32 {
+    log.lines.len()
+}
+
+fn twice() -> u32 {
+    var log = Log { lines: Vec::new() }
+    let n = archive(take log)
+    n + log.lines.len()
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+struct Log {
+    lines: Vec<Text>,
+}
+
+fn archive(log: take Log) -> u32 {
+    log.lines.len()
+}
+
+fn twice() -> u32 {
+    var log = Log { lines: Vec::new() }
+    let k = log.lines.len()
+    let n = archive(take log)
+    n + k
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

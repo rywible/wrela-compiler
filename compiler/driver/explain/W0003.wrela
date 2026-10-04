@@ -1,0 +1,7 @@
+// A file named like the entry module but in another case, `Main.wrela`: the entry module is
+// `main.wrela`, in lower case. Without it, the package is a library with no exports.
+// ---- wrong
+// ---- file Main.wrela
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+pub fn frame(time: f32, width: u32, height: u32) {}

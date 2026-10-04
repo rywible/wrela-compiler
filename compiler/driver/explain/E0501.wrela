@@ -1,0 +1,32 @@
+// A value that isn't `Copy` is moved out of a named place without `take`. Moving empties the
+// place, so wrela makes it visible: write `take x`. To keep `x`, pass `x.clone()`.
+// ---- wrong
+struct Log {
+    lines: Vec<Text>,
+}
+
+fn archive(log: take Log) -> u32 {
+    log.lines.len()
+}
+
+fn once() -> u32 {
+    let log = Log { lines: Vec::new() }
+    archive(log)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+struct Log {
+    lines: Vec<Text>,
+}
+
+fn archive(log: take Log) -> u32 {
+    log.lines.len()
+}
+
+fn once() -> u32 {
+    let log = Log { lines: Vec::new() }
+    archive(take log)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

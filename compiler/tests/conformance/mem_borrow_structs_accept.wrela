@@ -1,0 +1,27 @@
+// accepts: mem.borrow-structs
+// A borrow struct borrows exactly its fields' places, in each field's mode, as passing them
+// one by one would: disjoint fields of one value, and the value again after the call.
+struct World {
+    terrain: [f32; 4],
+    herd: [u32; 4],
+    time: f32,
+}
+
+borrow struct Ctx {
+    terrain: borrow [f32; 4],
+    herd: mut [u32; 4],
+    time: f32,
+}
+
+fn step(c: Ctx) {
+    for i in 0..4 {
+        c.herd[i] += u32(c.terrain[i] + c.time)
+    }
+}
+
+fn f(w: mut World) -> f32 {
+    let c = Ctx { terrain: w.terrain, herd: mut w.herd, time: w.time }
+    step(c)
+    step(c)
+    w.time + w.terrain[0]
+}

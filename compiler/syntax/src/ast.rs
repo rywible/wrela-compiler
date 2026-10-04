@@ -23,11 +23,19 @@ pub struct Attribute {
     pub span: Span,
 }
 
+/// `pub`, or `pub(package)`: visible outside the module, and with `package`, only inside the
+/// package (§3).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Vis {
+    pub span: Span,
+    pub package: bool,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Item {
     pub attrs: Vec<Attribute>,
-    /// The span of `pub`, if the item has it.
-    pub vis: Option<Span>,
+    /// `pub` or `pub(package)`, if the item has it.
+    pub vis: Option<Vis>,
     pub kind: ItemKind,
     pub span: Span,
 }
@@ -38,9 +46,13 @@ pub enum ItemKind {
     Struct(StructDecl),
     Enum(EnumDecl),
     Trait(TraitDecl),
+    /// `trait Sim = Clone + StateHash`: a name for a set of traits (language.md §7).
+    TraitSet(TraitSetDecl),
     Impl(ImplDecl),
     Const(ConstDecl),
     Use(UseTree),
+    /// `type Name<T> = Type`.
+    TypeAlias(TypeAliasDecl),
     /// An item that failed to parse (the error is reported), with its name if that parsed.
     Error(Option<Ident>),
 }
@@ -52,7 +64,9 @@ impl ItemKind {
             ItemKind::Struct(s) => Some(&s.name),
             ItemKind::Enum(e) => Some(&e.name),
             ItemKind::Trait(t) => Some(&t.name),
+            ItemKind::TraitSet(t) => Some(&t.name),
             ItemKind::Const(c) => Some(&c.name),
+            ItemKind::TypeAlias(t) => Some(&t.name),
             ItemKind::Error(name) => name.as_ref(),
             ItemKind::Impl(_) | ItemKind::Use(_) => None,
         }
@@ -80,6 +94,8 @@ impl Mode {
 pub struct GenericParam {
     pub name: Ident,
     pub bounds: Vec<TypeExpr>,
+    /// `const N: u32`: a constant parameter, of this type (its bounds are empty).
+    pub const_ty: Option<TypeExpr>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -144,9 +160,31 @@ pub enum TypeExprKind {
     /// `()` is the empty tuple.
     Tuple(Vec<TypeExpr>),
     Paren(Box<TypeExpr>),
-    Fn(Vec<TypeExpr>, Option<Box<TypeExpr>>),
+    /// `@deterministic fn(mut W, T) -> R`: the attributes' names, then the parameters.
+    Fn(FnType),
+    /// A constant generic argument: `Ring<f32, 8>`.
+    Int(Lit),
+    /// Traits joined with `+` where a trait names a type: a parameter's type (any type with
+    /// them all) or a return type (the one type the body returns): `-> Field<Tissue> +
+    /// Lipschitz`.
+    Traits(Vec<TypeExpr>),
     /// Where a type failed to parse (the error is reported).
     Error,
+}
+
+/// A function type.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FnType {
+    pub attrs: Vec<Ident>,
+    pub params: Vec<FnTypeParam>,
+    pub ret: Option<Box<TypeExpr>>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct FnTypeParam {
+    pub mode: Mode,
+    pub ty: TypeExpr,
+    pub span: Span,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -174,8 +212,10 @@ impl Path {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct FieldDecl {
-    pub vis: Option<Span>,
+    pub vis: Option<Vis>,
     pub name: Ident,
+    /// A borrow struct's field may be a projection: `borrow T` or `mut T`.
+    pub mode: RetMode,
     pub ty: TypeExpr,
     pub default: Option<Expr>,
     pub span: Span,
@@ -183,6 +223,8 @@ pub struct FieldDecl {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct StructDecl {
+    /// `borrow struct`: a named group of projections (language.md §6.6).
+    pub borrow: bool,
     pub name: Ident,
     pub generics: Vec<GenericParam>,
     pub traits: Vec<TypeExpr>,
@@ -234,6 +276,14 @@ pub struct TraitDecl {
     pub members: Vec<TraitMember>,
 }
 
+/// `trait Name<T> = A + B<T>`: the traits it names, in order.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TraitSetDecl {
+    pub name: Ident,
+    pub generics: Vec<GenericParam>,
+    pub traits: Vec<TypeExpr>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum ImplMemberKind {
     Fn(FnDecl),
@@ -243,7 +293,7 @@ pub enum ImplMemberKind {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ImplMember {
     pub attrs: Vec<Attribute>,
-    pub vis: Option<Span>,
+    pub vis: Option<Vis>,
     pub kind: ImplMemberKind,
     pub span: Span,
 }
@@ -255,6 +305,13 @@ pub struct ImplDecl {
     pub trait_: Option<TypeExpr>,
     pub self_ty: TypeExpr,
     pub members: Vec<ImplMember>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TypeAliasDecl {
+    pub name: Ident,
+    pub generics: Vec<GenericParam>,
+    pub ty: TypeExpr,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -291,11 +348,13 @@ pub struct Stmt {
     pub span: Span,
 }
 
-/// `var x = e` declares a variable; `mut x = e` names a place to change through.
+/// `var x = e` declares a variable; `mut x = e` names a place to change through, and
+/// `borrow x = e` a place to read in place.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum VarKind {
     Var,
     Mut,
+    Borrow,
 }
 
 impl VarKind {
@@ -303,6 +362,7 @@ impl VarKind {
         match self {
             VarKind::Var => "var",
             VarKind::Mut => "mut",
+            VarKind::Borrow => "borrow",
         }
     }
 }
@@ -387,13 +447,14 @@ pub enum ForIter {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum StmtKind {
-    /// `let p = e`.
+    /// `let p = e`, or `let p = e else { ... }`, whose block must leave the scope.
     Let {
         pat: Pat,
         ty: Option<TypeExpr>,
         init: Expr,
+        else_: Option<Block>,
     },
-    /// `var x = e` or `mut x = e`: one name, not a pattern.
+    /// `var x = e`, `mut x = e` or `borrow x = e`: one name, not a pattern.
     Var {
         kind: VarKind,
         name: Ident,
@@ -529,7 +590,7 @@ pub enum LitKind {
     Float(f64),
     Bool(bool),
     Str,
-    /// A number with a unit suffix (tier 1).
+    /// A number with a unit suffix: `15cm`.
     Suffixed,
 }
 
@@ -667,12 +728,16 @@ pub enum ExprKind {
     },
     Paren(Box<Expr>),
     Block(Block),
+    /// `if cond { }`, or `if let pat = cond { }` when `pat` is there.
     If {
+        pat: Option<Box<Pat>>,
         cond: Box<Expr>,
         then: Block,
         else_: Option<Box<Expr>>,
     },
+    /// `match x { }`; `match mut x { }` binds mutable projections.
     Match {
+        mutable: bool,
         scrutinee: Box<Expr>,
         arms: Vec<Arm>,
     },
@@ -684,8 +749,29 @@ pub enum ExprKind {
     Return(Option<Box<Expr>>),
     Break,
     Continue,
+    /// `x?`: the value of an `Ok` or `Some`, or a return of the error or `None`.
+    Try(Box<Expr>),
+    /// An assignment as a match arm's body: `Some(s) => s.count += 1`.
+    Assign {
+        target: Box<Expr>,
+        op: AssignOp,
+        value: Box<Expr>,
+    },
+    /// `unsafe { ... }` (the stdlib's core, §6.14).
+    Unsafe(Block),
+    /// `f"Weight: {w:.1} kg"`: text and holes, in order.
+    FString(Vec<FPart>),
     /// A placeholder after a syntax error.
     Error,
+}
+
+/// A part of an f-string.
+#[derive(Clone, Debug, PartialEq)]
+pub enum FPart {
+    /// Text, with escapes and `{{ }}` decoded.
+    Text(String),
+    /// `{expr}` or `{expr:spec}`.
+    Hole { expr: Expr, spec: Option<String>, span: Span },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -753,9 +839,11 @@ impl Expr {
             | ExprKind::Take(x)
             | ExprKind::MutArg(x)
             | ExprKind::Paren(x)
+            | ExprKind::Try(x)
             | ExprKind::Field { base: x, .. } => f(x),
             ExprKind::Binary(_, a, b)
             | ExprKind::Index { base: a, index: b }
+            | ExprKind::Assign { target: a, value: b, .. }
             | ExprKind::ArrayRepeat { value: a, count: b } => {
                 f(a);
                 f(b);
@@ -772,15 +860,22 @@ impl Expr {
                 }
             }
             ExprKind::Tuple(xs) | ExprKind::Array(xs) => xs.iter().for_each(f),
-            ExprKind::Block(b) => b.for_each_expr(f),
-            ExprKind::If { cond, then, else_ } => {
+            ExprKind::Block(b) | ExprKind::Unsafe(b) => b.for_each_expr(f),
+            ExprKind::FString(parts) => {
+                for p in parts {
+                    if let FPart::Hole { expr, .. } = p {
+                        f(expr);
+                    }
+                }
+            }
+            ExprKind::If { cond, then, else_, .. } => {
                 f(cond);
                 then.for_each_expr(f);
                 if let Some(e) = else_ {
                     f(e);
                 }
             }
-            ExprKind::Match { scrutinee, arms } => {
+            ExprKind::Match { scrutinee, arms, .. } => {
                 f(scrutinee);
                 for a in arms {
                     if let Some(g) = &a.guard {
@@ -810,7 +905,13 @@ impl Block {
     pub fn for_each_expr<'a>(&'a self, f: &mut impl FnMut(&'a Expr)) {
         for s in &self.stmts {
             match &s.kind {
-                StmtKind::Let { init, .. } | StmtKind::Var { init, .. } => f(init),
+                StmtKind::Let { init, else_, .. } => {
+                    f(init);
+                    if let Some(b) = else_ {
+                        b.for_each_expr(f);
+                    }
+                }
+                StmtKind::Var { init, .. } => f(init),
                 StmtKind::Assign { target, value, .. } => {
                     f(target);
                     f(value);
@@ -878,7 +979,10 @@ impl Item {
                 }
             }
             ItemKind::Const(c) => f(&c.value),
-            ItemKind::Use(_) | ItemKind::Error(_) => {}
+            ItemKind::Use(_)
+            | ItemKind::TypeAlias(_)
+            | ItemKind::TraitSet(_)
+            | ItemKind::Error(_) => {}
         }
     }
 }

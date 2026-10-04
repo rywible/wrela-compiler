@@ -1,0 +1,23 @@
+// accepts: const.tests
+// A frame test runs the program's `init` and frames, then the test with the program's state,
+// borrowed (§10).
+pub struct Game {
+    ticks: u32,
+}
+
+pub fn init() -> Game {
+    Game { ticks: 0 }
+}
+
+pub fn frame(state: mut Game, time: f32, width: u32, height: u32) {
+    state.ticks += 1
+}
+
+@test(frames: 10)
+fn counts_its_frames(game: Game) {
+    assert(game.ticks == 10)
+}
+
+@test(frames: 1)
+fn runs_a_frame() {
+}

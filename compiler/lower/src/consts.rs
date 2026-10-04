@@ -32,6 +32,21 @@ impl<'a> Cx<'a> {
         let checked = self.checked;
         let (t, e) = checked.consts.get(&c)?;
         let ty = self.lower_ty(mb, *t, e.span)?;
+        if crate::eval::is_computed(checked, c) {
+            // Computed by the build: its value, once it's computed.
+            let Some(v) = self.data.values.get(&c).cloned() else {
+                self.missing.insert(c);
+                return None;
+            };
+            let placed = self.place_value(mb, *t, ty, &v, e.span);
+            if placed.is_none() {
+                let name = &checked.program.const_(c).name;
+                self.err(Diagnostic::internal(format!(
+                    "the computed value of `{name}` doesn't fit its type"
+                )));
+            }
+            return placed.map(|v| (ty, v));
+        }
         match self.fold(mb, e) {
             Some(v) => Some((ty, v)),
             None => {
@@ -67,9 +82,26 @@ impl<'a> Cx<'a> {
                 };
                 scalar(self, mb, l)?
             }
-            ExprKind::Const(c) => {
-                let (_, v) = checked.consts.get(c)?;
-                self.fold(mb, v)?
+            ExprKind::Const(c) => self.const_value(mb, *c)?.1,
+            ExprKind::Text(s) => {
+                if mb.target() == ir::Target::Gpu {
+                    return None;
+                }
+                let (d, n) = self.text_data(mb, s);
+                ir::ConstValue::Parts(vec![
+                    ir::ConstValue::Addr(d),
+                    ir::ConstValue::Scalar(ir::Const::U32(n)),
+                ])
+            }
+            ExprKind::Embed(path) => {
+                if mb.target() == ir::Target::Gpu {
+                    return None;
+                }
+                let (d, n) = self.embed_data(mb, path)?;
+                ir::ConstValue::Parts(vec![
+                    ir::ConstValue::Addr(d),
+                    ir::ConstValue::Scalar(ir::Const::U32(n)),
+                ])
             }
             ExprKind::Adt { variant, fields, base: None, .. } => {
                 let map = self.field_map(mb, e.ty, *variant, e.span);
@@ -151,6 +183,21 @@ impl<'c, 'a> Fl<'c, 'a> {
                 }
                 Some(self.value(t, ir::Expr::Construct(t, vals)))
             }
+            ir::ConstValue::Bytes(bs) => {
+                let u8 = types.scalar(ir::Scalar::U8);
+                let vals: Vec<ir::ValueId> = bs
+                    .iter()
+                    .map(|&b| {
+                        self.value(
+                            u8,
+                            ir::Expr::Const(ir::Const::Small(ir::Scalar::U8, i64::from(b))),
+                        )
+                    })
+                    .collect();
+                Some(self.value(t, ir::Expr::Construct(t, vals)))
+            }
+            // GPU code has no addresses; nothing on the GPU holds one.
+            ir::ConstValue::Addr(_) => None,
             ir::ConstValue::Variant(k, payload) => {
                 let p = match (payload, types.field(t, 1 + k)) {
                     (Some(p), Some(pt)) => Some(self.build_const(pt, p)?),

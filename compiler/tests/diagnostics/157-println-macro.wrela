@@ -1,0 +1,7 @@
+// mistake: `println!` to see a value, as in Rust
+// expect: E0115
+// fix: yes
+fn step(speed: f32) -> f32 {
+    println!("speed is {:.2}", speed)
+    speed * 2.0
+}

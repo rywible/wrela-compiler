@@ -1,0 +1,20 @@
+// A workgroup size outside what every GPU allows: each of `@compute(x, y, z)` at least 1, and
+// their product at most 256.
+// ---- wrong
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch}
+
+@compute(512)
+fn big(out: mut Slots<u32>, id: GlobalId) {
+    out[id] = id.x
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch}
+
+@compute(256)
+fn big(out: mut Slots<u32>, id: GlobalId) {
+    out[id] = id.x
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

@@ -15,27 +15,54 @@ pub struct Program {
     pub impls: Vec<ImplDef>,
     pub fns: Vec<FnDef>,
     pub consts: Vec<ConstDef>,
+    pub aliases: Vec<AliasDef>,
+    pub trait_sets: Vec<TraitSetDef>,
     pub params: Vec<ParamDef>,
     /// The root of the user's package and of std.
     pub package_root: Option<ModuleId>,
     pub std_root: Option<ModuleId>,
+    /// The packages: std, the program's own, and its dependencies.
+    pub packages: Vec<PackageDef>,
     /// The entry module (`main.wrela`), and its file.
     pub main: Option<ModuleId>,
     pub main_file: Option<wrela_diag::FileId>,
+    /// Each file's text, for fixes that move what's written.
+    pub texts: HashMap<wrela_diag::FileId, std::sync::Arc<str>>,
     pub lang: HashMap<Lang, LangRes>,
     /// Impls by trait, for trait solving.
     pub impls_of_trait: HashMap<TraitId, Vec<ImplId>>,
     /// Inherent impls by the ADT they're for.
     pub inherent_impls: HashMap<AdtId, Vec<ImplId>>,
+    /// Std's inherent impls of built-in types (`impl str`).
+    pub builtin_inherent: Vec<ImplId>,
+    /// Whether dropping a type may do something: worked out once per type.
+    pub(crate) drop_cache: std::cell::RefCell<HashMap<TyId, bool>>,
+    /// Each closure's parameter and return types, in its owner's generic terms, for whether
+    /// it fits a function-type bound (`impl<F: fn(vec3) -> f32> Tr for F`). Recorded when the
+    /// closure is checked, and again when its body's types are final.
+    pub(crate) closure_sigs: std::cell::RefCell<HashMap<ClosureRef, (Vec<TyId>, TyId)>>,
     /// Whether a type implements a structural trait (`Copy`, `Clone`, `GpuData`): worked out
     /// once per type, since struct types share their fields' types.
     pub(crate) builtin_impls: std::cell::RefCell<HashMap<(TyId, Lang), bool>>,
+    /// Whether a type that declares a `@fieldwise` trait has it: its fields all do. Worked out
+    /// once per type and trait.
+    pub(crate) fieldwise_impls: std::cell::RefCell<HashMap<(TyId, TraitRef), bool>>,
+    /// The solver's goals in the order it took them up, and where each derivation of a
+    /// `@fieldwise` trait in progress started in that order: a goal met again after one
+    /// started is met (a type that holds itself through a `Box` has the trait if the rest of
+    /// its fields do).
+    pub(crate) goal_order: std::cell::RefCell<GoalOrder>,
     /// The goals the trait solver is working on: an impl's bounds can lead back to one of
     /// them. The first one's size, while there are any.
     pub(crate) solving: std::cell::RefCell<(HashSet<(TyId, TraitRef)>, u32)>,
     /// Where the source's syntax errors are.
     pub syntax_errors: Vec<wrela_diag::Span>,
+    /// The unit suffixes: `std::units`' constants by name (§5).
+    pub units: HashMap<String, ConstId>,
 }
+
+/// The trait solver's goals in order, and where each derivation in progress started.
+pub(crate) type GoalOrder = (Vec<(TyId, TraitRef)>, Vec<usize>);
 
 /// Longer type names are cut here, so diagnostics stay readable.
 const MAX_TYPE_TEXT: usize = 200;
@@ -54,6 +81,11 @@ impl Program {
     pub fn adt(&self, a: AdtId) -> &AdtDef {
         &self.adts[a.index()]
     }
+    /// What's written at `span`, if its file is known.
+    pub fn text(&self, span: wrela_diag::Span) -> Option<&str> {
+        self.texts.get(&span.file)?.get(span.start as usize..span.end as usize)
+    }
+
     pub fn trait_(&self, t: TraitId) -> &TraitDef {
         &self.traits[t.index()]
     }
@@ -98,12 +130,31 @@ impl Program {
         self.traits[t.index()].lang == Some(l)
     }
 
+    /// The message a library wrote for `ty` lacking `r` (§7): the trait's `@diagnostic`, else
+    /// the type's, with `{Self}` replaced by the type and `{Trait}` by the trait.
+    pub fn custom_message(&self, ty: TyId, r: &TraitRef) -> Option<String> {
+        let from_type = match self.types.kind(ty) {
+            TyKind::Adt(a, _) => self.adt(*a).diagnostic.clone(),
+            _ => None,
+        };
+        let text = self.trait_(r.trait_).diagnostic.clone().or(from_type)?;
+        Some(
+            text.replace("{Self}", &self.display_ty(ty))
+                .replace("{Trait}", &self.display_trait_ref(r)),
+        )
+    }
+
     /// The lang item a type is, if it's a lang struct or enum (with any arguments).
     pub fn lang_of_ty(&self, t: TyId) -> Option<Lang> {
         match self.types.kind(t) {
             TyKind::Adt(a, _) => self.adt(*a).lang,
             _ => None,
         }
+    }
+
+    /// Whether `t` is a borrow struct (§6.6).
+    pub fn is_borrow_struct(&self, t: TyId) -> bool {
+        matches!(self.types.kind(t), TyKind::Adt(a, _) if self.adt(*a).borrow)
     }
 
     /// The impls of a trait.
@@ -120,7 +171,7 @@ impl Program {
     pub fn fn_all_generics(&self, f: FnId) -> Vec<ParamId> {
         let def = self.func(f);
         let mut out = match def.owner {
-            FnOwner::Free => Vec::new(),
+            FnOwner::Free | FnOwner::Const(_) => Vec::new(),
             FnOwner::Impl(i) => self.impl_(i).generics.clone(),
             FnOwner::Trait(t) => {
                 let tr = self.trait_(t);
@@ -137,7 +188,7 @@ impl Program {
     pub fn fn_display_name(&self, f: FnId) -> String {
         let def = self.func(f);
         match def.owner {
-            FnOwner::Free => def.name.clone(),
+            FnOwner::Free | FnOwner::Const(_) => def.name.clone(),
             FnOwner::Impl(i) => {
                 let self_ty = self.impl_(i).self_ty;
                 format!("{}::{}", self.display_ty(self_ty), def.name)
@@ -200,11 +251,22 @@ impl Program {
                 self.write_ty(*e, s);
                 let _ = write!(s, "; {n}]");
             }
+            TyKind::ArrayN(e, n) => {
+                s.push('[');
+                self.write_ty(*e, s);
+                s.push_str("; ");
+                self.write_ty(*n, s);
+                s.push(']');
+            }
+            TyKind::ConstU32(n) => {
+                let _ = write!(s, "{n}");
+            }
             TyKind::Slice(e) => {
                 s.push('[');
                 self.write_ty(*e, s);
                 s.push(']');
             }
+            TyKind::Str => s.push_str("str"),
             TyKind::Adt(a, args) => {
                 s.push_str(&self.adt(*a).name);
                 if !args.is_empty() {
@@ -230,9 +292,30 @@ impl Program {
                     let _ = write!(s, "the type `{}` returns", self.func(*f).name);
                 }
             },
-            TyKind::FnPtr(ps, r) => {
+            TyKind::FnPtr(ps, r, flags) => {
+                if flags.deterministic {
+                    s.push_str("@deterministic ");
+                }
+                if flags.parallel {
+                    s.push_str("@parallel ");
+                }
+                if flags.audio {
+                    s.push_str("@audio ");
+                }
                 s.push_str("fn(");
-                self.write_list(ps, s);
+                for (i, &t) in ps.iter().enumerate() {
+                    if i > 0 {
+                        s.push_str(", ");
+                    }
+                    match flags.mode(i) {
+                        wrela_syntax::ast::Mode::Borrow => {}
+                        m => {
+                            s.push_str(m.keyword());
+                            s.push(' ');
+                        }
+                    }
+                    self.write_ty(t, s);
+                }
                 s.push(')');
                 if *r != self.types.unit {
                     s.push_str(" -> ");
@@ -276,6 +359,17 @@ impl Program {
         self.adt_fields(a, variant).iter().map(|f| self.field_under(f.ty, &subst)).collect()
     }
 
+    /// The `variant` that `fields_of` takes for each of `a`'s field lists: each variant's
+    /// index for an enum (none, for an enum without variants), and `None` for a struct.
+    pub fn field_lists(&self, a: AdtId) -> Vec<Option<u32>> {
+        let adt = self.adt(a);
+        if adt.is_enum() {
+            (0..adt.variants().len() as u32).map(Some).collect()
+        } else {
+            vec![None]
+        }
+    }
+
     /// The type of field `i` of a struct or of one of an enum's variants, as [`Self::fields_of`]
     /// gives it; `None` if there's no such field.
     pub fn field_ty(
@@ -311,7 +405,18 @@ impl Program {
     }
 
     /// Whether a module is part of std.
+    /// Whether module `m` is std's: std's privileges come from its package (language.md §3).
     pub fn is_std(&self, m: ModuleId) -> bool {
-        self.modules[m.index()].is_std
+        self.package_of(m).kind == PackageKind::Std
+    }
+
+    /// The package module `m` is in.
+    pub fn package_of(&self, m: ModuleId) -> &PackageDef {
+        &self.packages[self.modules[m.index()].package.index()]
+    }
+
+    /// Whether two modules are in one package.
+    pub fn same_package(&self, a: ModuleId, b: ModuleId) -> bool {
+        self.modules[a.index()].package == self.modules[b.index()].package
     }
 }

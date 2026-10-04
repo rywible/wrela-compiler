@@ -1,0 +1,167 @@
+// std's allocator: the heap that `Vec`, `String` and `Box` live in (language.md §6.9).
+//
+// Blocks of up to 1 MiB come in size classes, the powers of two from 16 bytes, each with a list
+// of freed blocks to reuse. Larger blocks are whole multiples of 64 KiB, on a list of their own,
+// reused first fit. Fresh memory comes from a bump pointer, which grows the memory as it needs.
+// Every block is 16-byte aligned. Callers say a block's size when they free it, so blocks carry
+// no header. Addresses never reach a program's results, so where a block lands can't change
+// what a program computes.
+//
+// The state lives at wrela_abi::memory::ALLOC_STATE (16): the bump pointer (0 until the first
+// allocation), where the memory ends, a lock word, the large blocks' list, one list head per
+// size class, then how many blocks `alloc` has returned. A test in wrela_abi checks that STATE
+// and BUMP are ALLOC_STATE.
+
+use std::mem::{compare_swap, copy, heap_base, load_u32, memory_grow, memory_pages, store_u32}
+
+const STATE: u32 = 16
+const BUMP: u32 = 16
+const END: u32 = 20
+const LOCK: u32 = 24
+const LARGE: u32 = 28
+const HEADS: u32 = 32
+const CLASSES: u32 = 17
+const COUNT: u32 = HEADS + 4 * CLASSES
+const SMALLEST: u32 = 16
+const PAGE: u32 = 65536
+
+/// A block of at least `size` bytes, aligned to `align` (at most 16), or 0 when `size` is 0.
+/// Running out of memory panics.
+pub fn alloc(size: u32, align: u32) -> u32 {
+    if size == 0 {
+        return 0
+    }
+    if align > SMALLEST {
+        panic("std's allocator aligns blocks to at most 16 bytes")
+    }
+    lock()
+    let k = class(size)
+    let block = if k < CLASSES {
+        unsafe {
+            let head = load_u32(HEADS + 4 * k)
+            if head != 0 {
+                store_u32(HEADS + 4 * k, load_u32(head))
+                head
+            } else {
+                carve(SMALLEST << k)
+            }
+        }
+    } else {
+        large(round_up(size, PAGE))
+    }
+    unsafe {
+        store_u32(COUNT, load_u32(COUNT).wrapping_add(1))
+    }
+    unlock()
+    block
+}
+
+/// How many blocks the allocator has handed out since the program started, wrapping at 2³²:
+/// for checking that code doesn't allocate (a `Vec` that grows, an f-string, a `clone`). A
+/// `realloc` that keeps its block doesn't count.
+pub fn allocations() -> u32 {
+    unsafe { load_u32(COUNT) }
+}
+
+/// Frees a block that `alloc` returned for `size` bytes. Freeing 0 does nothing.
+pub fn free(addr: u32, size: u32) {
+    if addr == 0 {
+        return
+    }
+    lock()
+    let k = class(size)
+    unsafe {
+        if k < CLASSES {
+            store_u32(addr, load_u32(HEADS + 4 * k))
+            store_u32(HEADS + 4 * k, addr)
+        } else {
+            // A large block's list node: the next block, then this one's size.
+            store_u32(addr, load_u32(LARGE))
+            store_u32(addr + 4, round_up(size, PAGE))
+            store_u32(LARGE, addr)
+        }
+    }
+    unlock()
+}
+
+/// A block of `new` bytes holding the first `min(old, new)` bytes of `addr`'s, which was
+/// `old` bytes: the same block when it has room.
+pub fn realloc(addr: u32, old: u32, new: u32, align: u32) -> u32 {
+    if addr != 0 && new != 0 && class(old) < CLASSES && class(old) == class(new) {
+        return addr
+    }
+    unsafe {
+        let to = alloc(new, align)
+        if addr != 0 {
+            copy(to, addr, min(old, new))
+            free(addr, old)
+        }
+        to
+    }
+}
+
+/// The size class of `size` bytes: the smallest `k` with `16 << k >= size`; `CLASSES` and up
+/// for a large block.
+fn class(size: u32) -> u32 {
+    var k = 0
+    while k < CLASSES && SMALLEST << k < size {
+        k += 1
+    }
+    k
+}
+
+fn round_up(n: u32, to: u32) -> u32 {
+    (n + to - 1) / to * to
+}
+
+/// A large block of `n` bytes, a multiple of 64 KiB: the first freed one big enough, else
+/// fresh.
+fn large(n: u32) -> u32 {
+    unsafe {
+        var prev = LARGE
+        var at = load_u32(LARGE)
+        while at != 0 {
+            if load_u32(at + 4) >= n {
+                store_u32(prev, load_u32(at))
+                return at
+            }
+            prev = at
+            at = load_u32(at)
+        }
+    }
+    carve(n)
+}
+
+/// `n` fresh bytes from the bump pointer, growing the memory if it must.
+fn carve(n: u32) -> u32 {
+    unsafe {
+        var bump = load_u32(BUMP)
+        if bump == 0 {
+            bump = heap_base()
+            store_u32(END, memory_pages() * PAGE)
+        }
+        let end = load_u32(END)
+        if n > end - bump {
+            let pages = (n - (end - bump) + PAGE - 1) / PAGE
+            if memory_grow(pages) == 4294967295 {
+                panic("out of memory: the heap can't grow past 1 GiB")
+            }
+            store_u32(END, end + pages * PAGE)
+        }
+        store_u32(BUMP, bump + n)
+        bump
+    }
+}
+
+/// Takes the allocator's lock: workers share the heap.
+fn lock() {
+    unsafe {
+        while compare_swap(LOCK, expected: 0, new: 1) != 0 {}
+    }
+}
+
+fn unlock() {
+    unsafe {
+        store_u32(LOCK, 0)
+    }
+}

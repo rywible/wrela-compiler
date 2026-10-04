@@ -1,0 +1,10 @@
+// mistake: an `f64` in a kernel
+// expect: E0326
+// fix: no
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch}
+
+@compute(64)
+fn wide(scale: f32, out: mut Slots<f32>, id: GlobalId) {
+    let w: f64 = f64(scale)
+    out[id] = f32(w * 2.0)
+}

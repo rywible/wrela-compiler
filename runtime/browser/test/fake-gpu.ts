@@ -7,6 +7,21 @@ export interface FakeBuffer {
   usage: number;
   destroyed: boolean;
   destroy(): void;
+  /** What a readback maps: the bytes the fake GPU says the buffer holds. */
+  contents?: Uint8Array;
+  mapAsync(mode: number): Promise<void>;
+  getMappedRange(): ArrayBuffer;
+  unmap(): void;
+}
+
+export interface FakeTexture {
+  label: string;
+  format: string;
+  size: number[];
+  usage: number;
+  destroyed: boolean;
+  destroy(): void;
+  createView(): { label: string };
 }
 
 /** One thing that reached the queue or a pass, in order. */
@@ -14,7 +29,11 @@ export type Event =
   | { kind: "writeBuffer"; buffer: string; offset: number; data: Uint8Array }
   | { kind: "submit" }
   | { kind: "dispatch"; pipeline: string; groups: number[]; offsets: number[]; bindGroup: FakeBindGroup }
-  | { kind: "renderPass"; clear: GPUColor; view: string }
+  | { kind: "renderPass"; clear: GPUColor; view: string; depth?: string; load?: string }
+  | { kind: "writeTexture"; texture: string; origin: unknown; bytesPerRow: number; size: unknown }
+  | { kind: "copyBuffer"; from: string; fromOffset: number; to: string; toOffset: number; size: number }
+  | { kind: "dispatchIndirect"; pipeline: string; buffer: string; offset: number }
+  | { kind: "drawIndirect"; pipeline: string; buffer: string; offset: number }
   | { kind: "draw"; pipeline: string; vertices: number; instances: number; offsets: number[]; bindGroup: FakeBindGroup }
   | { kind: "copy"; from: string; to: string };
 
@@ -29,6 +48,10 @@ export interface FakeBindGroup {
 export class FakeDevice {
   readonly events: Event[] = [];
   readonly buffers: FakeBuffer[] = [];
+  readonly textures: FakeTexture[] = [];
+  readonly samplers: GPUSamplerDescriptor[] = [];
+  /** Render pipelines made on demand (not at load), by label and target formats. */
+  readonly variants: string[] = [];
   readonly layouts: GPUBindGroupLayoutDescriptor[] = [];
   /** Validation errors by label, which creating a bind group layout raises into the innermost
    * error scope. */
@@ -55,10 +78,14 @@ export class FakeDevice {
     submit: () => {
       this.events.push({ kind: "submit" });
     },
+    writeTexture: (dest: GPUTexelCopyTextureInfo, _data: Uint8Array, layout: GPUTexelCopyBufferLayout, size: GPUExtent3D) => {
+      const texture = (dest.texture as unknown as FakeTexture).label;
+      this.events.push({ kind: "writeTexture", texture, origin: dest.origin, bytesPerRow: layout.bytesPerRow!, size });
+    },
   };
 
   createBuffer(desc: GPUBufferDescriptor): FakeBuffer {
-    const buffer = {
+    const buffer: FakeBuffer = {
       label: desc.label ?? "",
       size: desc.size,
       usage: desc.usage,
@@ -66,9 +93,44 @@ export class FakeDevice {
       destroy() {
         this.destroyed = true;
       },
+      async mapAsync() {},
+      getMappedRange() {
+        const out = new Uint8Array(this.size);
+        out.set(this.contents ?? []);
+        return out.buffer;
+      },
+      unmap() {},
     };
     this.buffers.push(buffer);
     return buffer;
+  }
+
+  createTexture(desc: GPUTextureDescriptor): FakeTexture {
+    const label = desc.label ?? "";
+    const texture = {
+      label,
+      format: desc.format,
+      size: Array.from(desc.size as number[]),
+      usage: desc.usage,
+      destroyed: false,
+      destroy() {
+        this.destroyed = true;
+      },
+      createView: () => ({ label }),
+    };
+    this.textures.push(texture);
+    return texture;
+  }
+
+  createSampler(desc: GPUSamplerDescriptor) {
+    this.samplers.push(desc);
+    return { label: desc.label };
+  }
+
+  createRenderPipeline(desc: GPURenderPipelineDescriptor) {
+    const targets = Array.from(desc.fragment?.targets ?? []).map((t) => t?.format ?? "none");
+    this.variants.push(`${desc.label} ${targets.join(",") || "none"}|${desc.depthStencil?.format ?? "none"}`);
+    return { label: desc.label, kind: "render", desc };
   }
 
   createBindGroupLayout(desc: GPUBindGroupLayoutDescriptor) {
@@ -121,7 +183,11 @@ export class FakeDevice {
   }
 
   createBindGroup(desc: GPUBindGroupDescriptor): FakeBindGroup {
-    const entries = Array.from(desc.entries, (e) => ({ binding: e.binding, ...(e.resource as GPUBufferBinding) }));
+    // A buffer's entry is `{ buffer, offset, size }`; a texture view's or sampler's is itself.
+    const entries = Array.from(desc.entries, (e) => {
+      const r = e.resource as GPUBufferBinding & { label?: string };
+      return "buffer" in r ? { binding: e.binding, ...r } : { binding: e.binding, buffer: r as unknown as GPUBuffer };
+    });
     const buffers = entries.map((e) => e.buffer as unknown as FakeBuffer);
     return {
       id: this.#bindGroups++,
@@ -148,8 +214,14 @@ export class FakeDevice {
         dispatchWorkgroups(x: number, y: number, z: number) {
           events.push({ kind: "dispatch", pipeline, groups: [x, y, z], offsets, bindGroup: bindGroup! });
         },
+        dispatchWorkgroupsIndirect(b: FakeBuffer, offset: number) {
+          events.push({ kind: "dispatchIndirect", pipeline, buffer: b.label, offset });
+        },
         draw(vertices: number, instances: number) {
           events.push({ kind: "draw", pipeline, vertices, instances, offsets, bindGroup: bindGroup! });
+        },
+        drawIndirect(b: FakeBuffer, offset: number) {
+          events.push({ kind: "drawIndirect", pipeline, buffer: b.label, offset });
         },
         end() {},
       };
@@ -158,9 +230,16 @@ export class FakeDevice {
       beginComputePass: () => pass(),
       beginRenderPass: (desc: GPURenderPassDescriptor) => {
         const [attachment] = Array.from(desc.colorAttachments);
-        const view = attachment!.view as unknown as { label: string };
-        events.push({ kind: "renderPass", clear: attachment!.clearValue!, view: view.label });
+        const view = (attachment?.view as unknown as { label: string } | undefined)?.label ?? "none";
+        const event: Event = { kind: "renderPass", clear: attachment?.clearValue ?? { r: 0, g: 0, b: 0, a: 0 }, view };
+        const depth = desc.depthStencilAttachment;
+        if (depth !== undefined) event.depth = `${(depth.view as unknown as { label: string }).label} ${depth.depthLoadOp}`;
+        if (attachment?.loadOp === "load") event.load = "load";
+        events.push(event);
         return pass();
+      },
+      copyBufferToBuffer: (from: FakeBuffer, fromOffset: number, to: FakeBuffer, toOffset: number, size: number) => {
+        events.push({ kind: "copyBuffer", from: from.label, fromOffset, to: to.label, toOffset, size });
       },
       copyTextureToTexture: (from: { texture: { label: string } }, to: { texture: { label: string } }) => {
         events.push({ kind: "copy", from: from.texture.label, to: to.texture.label });

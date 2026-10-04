@@ -1,0 +1,240 @@
+// Physical properties from a creature's field (sketch 01 §4): what the simulation reads, so
+// it's computed by `@deterministic` code and comes out the same on every client (D-052). The
+// derived interval classifies cells as inside, outside or straddling; only straddling cells
+// are refined, so the cost follows the surface's area, not the volume (T3).
+
+use creature::{Bone, Creature, Skeleton}
+use std::derive::{Box3, interval}
+use std::field::{Field, Surface}
+use std::hash::StateHash
+
+/// What a quantity is gathered per.
+pub enum Per: Copy + Eq {
+    /// Each bone: a cell counts for the bone whose part is nearest it.
+    Bone,
+    /// The whole creature.
+    Whole,
+}
+
+/// A body's mass (kg), its centre of mass, and its moments of inertia about axes through the
+/// centre (kg m², about x, y and z).
+pub struct MassProps: Copy + StateHash {
+    pub mass: f32,
+    pub centre: vec3,
+    pub inertia: vec3,
+}
+
+/// Mass, per bone (indexed by bone) or whole.
+pub struct Mass: Clone + StateHash {
+    pub per: Vec<MassProps>,
+    pub total: MassProps,
+}
+
+/// A capsule: the points within `radius` of the segment from `a` to `b`.
+pub struct Capsule: Copy + StateHash {
+    pub bone: Bone,
+    pub a: vec3,
+    pub b: vec3,
+    pub radius: f32,
+}
+
+/// What the simulation sees of a creature.
+pub struct Physique: Clone + StateHash {
+    pub mass: Mass,
+    pub collision: Vec<Capsule>,
+}
+
+/// A cube around the field, from its skeleton's rest positions grown by a metre, halved
+/// until the field's interval shows it in a smaller one: the region the octrees cover.
+fn cover<C, K: Creature<C>>(c: K) -> Box3 {
+    borrow s = c.skeleton()
+    var lo = vec3(1.0e9)
+    var hi = vec3(-1.0e9)
+    for i in 0..s.len() {
+        let p = s.rest(Bone { index: i })
+        lo = min(lo, p)
+        hi = max(hi, p)
+    }
+    let centre = 0.5 * (lo + hi)
+    let half = max(max(hi.x - lo.x, hi.y - lo.y), hi.z - lo.z) * 0.5 + 1.0
+    Box3 { lo: centre - half, hi: centre + half }
+}
+
+/// A box holding the creature's surface: the cells of an octree, five levels deep, that the
+/// derived interval can't show are outside.
+pub fn bounds<C, K: Creature<C>>(c: K) -> Box3 {
+    let field = c.field()
+    var lo = vec3(1.0e9)
+    var hi = vec3(-1.0e9)
+    var stack: Vec<(Box3, u32)> = Vec::new()
+    stack.push((cover(c), 0))
+    loop {
+        let Some((b, depth)) = stack.pop() else { break }
+        let r = interval(|q: vec3| field.distance(q), b)
+        if r.lo > 0.0 {
+            continue
+        }
+        if depth == 5 || r.hi < 0.0 {
+            lo = min(lo, b.lo)
+            hi = max(hi, b.hi)
+            continue
+        }
+        let h = 0.5 * (b.hi.x - b.lo.x)
+        for j in 0..8 {
+            let o = vec3(f32(j & 1), f32((j >> 1) & 1), f32((j >> 2) & 1)) * h
+            stack.push((Box3 { lo: b.lo + o, hi: b.lo + o + h }, depth + 1))
+        }
+    }
+    Box3 { lo, hi }
+}
+
+/// Mass properties of a cell of density `rho` (a cube), about its own centre.
+fn cell_props(lo: vec3, size: f32, rho: f32) -> MassProps {
+    let mass = rho * size * size * size
+    // A cube's moment about an axis through its centre: m (a² + b²) / 12.
+    let i = mass * size * size / 6.0
+    MassProps { mass, centre: lo + 0.5 * size, inertia: vec3(i) }
+}
+
+/// Adds `b` to `a`, moving the moments to the new centre (the parallel-axis theorem).
+fn combine(a: MassProps, b: MassProps) -> MassProps {
+    let mass = a.mass + b.mass
+    if mass <= 0.0 {
+        return a
+    }
+    let centre = (a.centre * a.mass + b.centre * b.mass) / mass
+    let shift = |m: MassProps| {
+        let d = m.centre - centre
+        m.inertia +
+            m.mass * vec3(d.y * d.y + d.z * d.z, d.x * d.x + d.z * d.z, d.x * d.x + d.y * d.y)
+    }
+    MassProps { mass, centre, inertia: shift(a) + shift(b) }
+}
+
+const EMPTY: MassProps = MassProps { mass: 0.0, centre: vec3(), inertia: vec3() }
+
+/// The creature's mass: the density its channels give, `density(channels)`, integrated over
+/// its inside, refining cells the surface crosses down to `finest`. In handle order, cell by
+/// cell, so the sums don't depend on anything but the creature.
+@deterministic
+pub fn integrate<C, K: Creature<C>>(c: K, density: fn(C) -> f32, per: Per, finest: f32) -> Mass {
+    let field = c.field()
+    let bones = c.skeleton().len()
+    var out = Mass { per: Vec::new(), total: EMPTY }
+    for _ in 0..bones {
+        out.per.push(EMPTY)
+    }
+    var stack: Vec<Box3> = Vec::new()
+    stack.push(cover(c))
+    loop {
+        let Some(b) = stack.pop() else { break }
+        let size = b.hi.x - b.lo.x
+        let centre = 0.5 * (b.lo + b.hi)
+        // A cell at the finest size is sampled at its centre; a larger one is classified by
+        // the derived interval over it.
+        var inside = false
+        if size <= finest {
+            if field.distance(centre) >= 0.0 {
+                continue
+            }
+            inside = true
+        } else {
+            let r = interval(|q: vec3| field.distance(q), b)
+            if r.lo > 0.0 {
+                continue
+            }
+            inside = r.hi < 0.0
+        }
+        if inside {
+            let m = cell_props(b.lo, size, density(field.channels(centre)))
+            out.total = combine(out.total, m)
+            if per == Per::Bone {
+                let i = c.nearest_bone(centre).index
+                out.per[i] = combine(out.per[i], m)
+            }
+        } else {
+            // Children pushed in reverse, so they're taken in order.
+            let h = 0.5 * size
+            for k in 0..8 {
+                let j = 7 - k
+                let o = vec3(f32(j & 1), f32((j >> 1) & 1), f32((j >> 2) & 1)) * h
+                stack.push(Box3 { lo: b.lo + o, hi: b.lo + o + h })
+            }
+        }
+    }
+    out
+}
+
+/// A capsule per bone (or one, whole) holding the creature's inside within `tolerance`: its
+/// axis runs from the bone to its first child, and its radius reaches the farthest inside
+/// cell nearest that bone.
+@deterministic
+pub fn fit_capsules<C, K: Creature<C>>(c: K, per: Per, tolerance: f32) -> Vec<Capsule> {
+    let field = c.field()
+    borrow s = c.skeleton()
+    let n = s.len()
+    // Each bone's axis: to its first child, or nowhere for a leaf.
+    var axes: Vec<(vec3, vec3)> = Vec::new()
+    for i in 0..n {
+        let a = s.rest(Bone { index: i })
+        axes.push((a, a))
+    }
+    for i in 0..n {
+        let b = Bone { index: i }
+        let parent = s.parent(b).index
+        if parent != i && axes[parent].0 == axes[parent].1 {
+            axes[parent] = (axes[parent].0, s.rest(b))
+        }
+    }
+    var radius: Vec<f32> = Vec::new()
+    var used: Vec<bool> = Vec::new()
+    for _ in 0..n {
+        radius.push(0.0)
+        used.push(false)
+    }
+    var stack: Vec<Box3> = Vec::new()
+    stack.push(cover(c))
+    loop {
+        let Some(b) = stack.pop() else { break }
+        let size = b.hi.x - b.lo.x
+        if size > tolerance {
+            let r = interval(|q: vec3| field.distance(q), b)
+            if r.lo > 0.0 {
+                continue
+            }
+            let h = 0.5 * size
+            for k in 0..8 {
+                let j = 7 - k
+                let o = vec3(f32(j & 1), f32((j >> 1) & 1), f32((j >> 2) & 1)) * h
+                stack.push(Box3 { lo: b.lo + o, hi: b.lo + o + h })
+            }
+            continue
+        }
+        let centre = 0.5 * (b.lo + b.hi)
+        if field.distance(centre) >= 0.0 {
+            continue
+        }
+        let i = match per {
+            Per::Bone => c.nearest_bone(centre).index,
+            Per::Whole => 0,
+        }
+        let (a, e) = axes[i]
+        radius[i] = max(radius[i], segment_distance(centre, a, e) + 0.5 * tolerance)
+        used[i] = true
+    }
+    var out: Vec<Capsule> = Vec::new()
+    for i in 0..n {
+        if used[i] {
+            let (a, e) = axes[i]
+            out.push(Capsule { bone: Bone { index: i }, a, b: e, radius: radius[i] })
+        }
+    }
+    out
+}
+
+/// How far `p` is from the segment `a`–`b`.
+pub fn segment_distance(p: vec3, a: vec3, b: vec3) -> f32 {
+    let ab = b - a
+    let t = if dot(ab, ab) > 0.0 { clamp(dot(p - a, ab) / dot(ab, ab), 0.0, 1.0) } else { 0.0 }
+    length(p - (a + t * ab))
+}

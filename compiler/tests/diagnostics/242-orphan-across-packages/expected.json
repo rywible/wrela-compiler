@@ -1,0 +1,30 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0404",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [
+        "wrap the type in a struct of your own, or define your own trait"
+      ],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "this package can't implement `geometry`'s `Area` for a built-in `vec2`",
+      "notes": [
+        "an impl lives with its trait or with its type (D-071)"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 1,
+        "end": 196,
+        "end_column": 2,
+        "end_line": 10,
+        "line": 6,
+        "start": 117
+      },
+      "title": "an impl outside the trait's or the type's module tree (orphan rule)"
+    }
+  ],
+  "version": 2
+}

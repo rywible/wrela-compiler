@@ -1,0 +1,19 @@
+// mistake: a barrier only half the invocations reach
+// expect: E0610 E0609
+// fix: no
+use std::gpu::{GlobalId, GpuBuffer, LocalId, Shared, Slots, barrier, buffer, dispatch}
+
+@compute(64)
+fn half(out: mut Slots<f32>, row: mut Shared<f32, 64>, lid: LocalId, id: GlobalId) {
+    let mine = row.chunk(lid)
+    row.write(mine, 0, 1.0)
+    if lid.x < 32 {
+        barrier(mut row)
+    }
+    out[id] = row.get(0)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    var out: GpuBuffer<f32> = buffer(64)
+    dispatch(half.bind(out: mut out), groups: 1)
+}

@@ -1,0 +1,15 @@
+// A function with a return type whose body ends without a value: its last line is a
+// statement (a `let`, an assignment), not an expression.
+// ---- wrong
+fn double(x: f32) -> f32 {
+    let y = x * 2.0
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+fn double(x: f32) -> f32 {
+    let y = x * 2.0
+    y
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

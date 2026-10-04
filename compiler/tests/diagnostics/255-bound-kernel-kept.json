@@ -1,0 +1,28 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0603",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "`fill.bind(...)` goes straight into `dispatch` or `draw`",
+      "notes": [
+        "an entry point bound to its arguments is recorded where it's bound; it isn't a value to keep (§12)"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 15,
+        "end": 381,
+        "end_column": 39,
+        "end_line": 13,
+        "line": 13,
+        "start": 357
+      },
+      "title": "a dispatch or draw whose entry points, binding or counts are wrong"
+    }
+  ],
+  "version": 2
+}

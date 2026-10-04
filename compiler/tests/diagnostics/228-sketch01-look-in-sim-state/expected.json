@@ -1,0 +1,41 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0417",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [
+        {
+          "file": "main.wrela",
+          "message": "`SimState` declared here",
+          "span": {
+            "column": 19,
+            "end": 204,
+            "end_column": 27,
+            "end_line": 11,
+            "line": 11,
+            "start": 196
+          }
+        }
+      ],
+      "message": "`Spring` isn't sim state: sim state is rolled back and hashed, so it must be the same on every client. Presentation data (poses for drawing, springs, sounds) lives outside it",
+      "notes": [
+        "`GrazerSim` declares `SimState`, which is derived field by field, so the field `tail` needs it too (§3)"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 5,
+        "end": 239,
+        "end_column": 17,
+        "end_line": 13,
+        "line": 13,
+        "start": 227
+      },
+      "title": "a type that can't derive a `@fieldwise` trait it declares"
+    }
+  ],
+  "version": 2
+}

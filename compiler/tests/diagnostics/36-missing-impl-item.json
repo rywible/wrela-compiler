@@ -13,11 +13,11 @@
           "message": "declared here",
           "span": {
             "column": 5,
-            "end": 687,
+            "end": 1364,
             "end_column": 38,
-            "end_line": 13,
-            "line": 13,
-            "start": 654
+            "end_line": 29,
+            "line": 29,
+            "start": 1331
           }
         }
       ],
@@ -26,11 +26,11 @@
       "severity": "error",
       "span": {
         "column": 1,
-        "end": 188,
+        "end": 180,
         "end_column": 25,
         "end_line": 10,
         "line": 10,
-        "start": 164
+        "start": 156
       },
       "title": "a missing trait item in an impl"
     }

@@ -1,0 +1,57 @@
+// run: `const N: u32` generic parameters: functions and impls over every array length
+// expect: sum4() = 10.0
+// expect: sum2() = 3.0
+// expect: len_of() = 7
+// expect: zeros(3) = 0.0
+// expect: biggest() = 9.0
+
+fn sum<const N: u32>(xs: [f32; N]) -> f32 {
+    var total = 0.0
+    for x in xs {
+        total += x
+    }
+    total
+}
+
+pub fn sum4() -> f32 {
+    sum([1.0, 2.0, 3.0, 4.0])
+}
+
+pub fn sum2() -> f32 {
+    sum([1.0, 2.0])
+}
+
+fn count<T, const N: u32>(xs: [T; N]) -> u32 {
+    N
+}
+
+pub fn len_of() -> u32 {
+    count([1, 2, 3, 4, 5, 6, 7])
+}
+
+fn filled<const N: u32>(x: f32) -> [f32; N] {
+    [x; N]
+}
+
+pub fn zeros(i: u32) -> f32 {
+    let z: [f32; 5] = filled(0.0)
+    z[i]
+}
+
+trait Biggest {
+    fn biggest(self) -> f32
+}
+
+impl<const N: u32> Biggest for [f32; N] {
+    fn biggest(self) -> f32 {
+        var b = self[0]
+        for i in 1..N {
+            b = max(b, self[i])
+        }
+        b
+    }
+}
+
+pub fn biggest() -> f32 {
+    [3.0, 9.0, 1.0].biggest()
+}

@@ -1,0 +1,14 @@
+// A type is used where a value goes, or a value where a type goes: `let x = Vec`, or a
+// parameter whose type is a function's name.
+// ---- wrong
+fn length(p: sqrt) -> f32 {
+    1.0
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+fn length(p: vec2) -> f32 {
+    sqrt(dot(p, p))
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

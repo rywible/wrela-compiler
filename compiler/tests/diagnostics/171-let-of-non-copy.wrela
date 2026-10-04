@@ -1,0 +1,15 @@
+// mistake: `let` of a field whose type isn't `Copy`
+// expect: E0518
+// fix: yes
+struct Inventory: Clone {
+    items: Vec<u32>,
+}
+
+struct Player {
+    bag: Inventory,
+}
+
+fn count(p: Player) -> u32 {
+    let bag = p.bag
+    bag.items.len()
+}

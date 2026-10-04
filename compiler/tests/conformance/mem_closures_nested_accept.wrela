@@ -1,0 +1,24 @@
+// accepts: mem.closures
+// A closure captures another closure, which travels as its value; a closure of a point is a
+// `Surface` (std::field), so one can be a field, with the derived gradient and the combinators.
+use std::field::{Surface, sphere}
+
+fn apply(f: fn(f32) -> f32, x: f32) -> f32 {
+    f(x)
+}
+
+fn twice_plus_one(x: f32) -> f32 {
+    let double = |y: f32| 2.0 * y
+    apply(|z| double(z) + 1.0, x)
+}
+
+fn blob(r: f32) -> Surface {
+    let ball = |p: vec3| length(p) - r
+    let slab = |p: vec3| abs(p.y) - 0.1
+    let both = |p: vec3| min(ball(p), slab(p))
+    both.smooth_union(sphere(0.2), k: 0.05)
+}
+
+fn normal(x: f32) -> vec3 {
+    normalize(blob(0.5).gradient(vec3(x, 0.3, 0.0)))
+}

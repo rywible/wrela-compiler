@@ -1,0 +1,28 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0115",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [
+        "for `n` copies of `x`, push them in a loop; when `x` is `Copy` and `n` is a constant, `Vec::from([x; n])`"
+      ],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "`vec!` is a macro, and wrela has no macros",
+      "notes": [],
+      "severity": "error",
+      "span": {
+        "column": 5,
+        "end": 111,
+        "end_column": 9,
+        "end_line": 5,
+        "line": 5,
+        "start": 107
+      },
+      "title": "a macro call, which wrela doesn't have"
+    }
+  ],
+  "version": 2
+}

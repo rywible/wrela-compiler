@@ -1,0 +1,30 @@
+// A derivative (`dpdx`, `dpdy`, `fwidth`) where neighbouring pixels may take different paths:
+// after a branch on a value that varies by pixel. The GPU computes it from the neighbours, which
+// must all reach it. Compute it before the branch.
+// ---- wrong
+use std::gpu::FragCoord
+
+@fragment
+fn edge(pixel: FragCoord) -> vec4 {
+    let d = pixel.position.x - 8.0
+    if d > 0.0 {
+        return vec4(0.0)
+    }
+    vec4(fwidth(d))
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+use std::gpu::FragCoord
+
+@fragment
+fn edge(pixel: FragCoord) -> vec4 {
+    let d = pixel.position.x - 8.0
+    let w = fwidth(d)
+    if d > 0.0 {
+        return vec4(0.0)
+    }
+    vec4(w)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

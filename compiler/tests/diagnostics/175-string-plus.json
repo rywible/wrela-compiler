@@ -1,0 +1,40 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0305",
+      "file": "main.wrela",
+      "fixes": [
+        {
+          "edits": [
+            {
+              "end": 116,
+              "file": "main.wrela",
+              "replacement": "f\"hello, {name}\"",
+              "start": 100
+            }
+          ],
+          "message": "write an f-string"
+        }
+      ],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "`+` doesn't join text in wrela",
+      "notes": [
+        "text is joined by an f-string, which formats each part into one `String` (§4)"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 5,
+        "end": 116,
+        "end_column": 21,
+        "end_line": 5,
+        "line": 5,
+        "start": 100
+      },
+      "title": "an operator that doesn't apply to these types"
+    }
+  ],
+  "version": 2
+}

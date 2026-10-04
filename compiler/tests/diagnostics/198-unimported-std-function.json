@@ -1,0 +1,40 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0200",
+      "file": "main.wrela",
+      "fixes": [
+        {
+          "edits": [
+            {
+              "end": 0,
+              "file": "main.wrela",
+              "replacement": "use std::io::store\n",
+              "start": 0
+            }
+          ],
+          "message": "import it: `use std::io::store`"
+        }
+      ],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "there's no `store` in scope",
+      "notes": [
+        "`store` is in `std::io`, which this module doesn't import"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 13,
+        "end": 127,
+        "end_column": 18,
+        "end_line": 5,
+        "line": 5,
+        "start": 122
+      },
+      "title": "an unknown name"
+    }
+  ],
+  "version": 2
+}

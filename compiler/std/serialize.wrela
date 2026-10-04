@@ -1,0 +1,474 @@
+// Saving and loading (language.md §6.11): `Serialize`, derived field by field, with each field's
+// name and each variant's name in the bytes. A save doesn't depend on how a type is laid out,
+// and loading a save that doesn't fit its type, or is cut short, gives a `LoadError`, never a
+// trap.
+//
+// The bytes: numbers little-endian at their own widths, `bool` as one byte, floats as their
+// bits, text as a `u32` byte count then UTF-8, a `Vec` as a `u32` count then its elements. A
+// struct's fields come in order, each after its name; an enum's variant name comes before its
+// fields.
+
+/// Bytes being written.
+pub struct Writer: Clone {
+    bytes: Vec<u8>,
+}
+
+impl Writer {
+    /// A writer that holds no bytes.
+    pub fn new() -> Writer {
+        Writer { bytes: Vec::new() }
+    }
+
+    /// How many bytes are written.
+    pub fn len(self) -> u32 {
+        self.bytes.len()
+    }
+
+    /// The bytes, moved out.
+    pub fn into_bytes(take self) -> Vec<u8> {
+        var w = take self
+        replace(mut w.bytes, Vec::new())
+    }
+
+    /// Writes the byte `b`.
+    pub fn write_u8(mut self, b: u8) {
+        self.bytes.push(b)
+    }
+
+    /// Writes `x` as four bytes, little-endian.
+    pub fn write_u32(mut self, x: u32) {
+        for k in 0..4 {
+            self.bytes.push(u8((x >> (8 * k)) & 255))
+        }
+    }
+
+    /// Writes `x` as eight bytes, little-endian.
+    pub fn write_u64(mut self, x: u64) {
+        for k in 0..8 {
+            self.bytes.push(u8((x >> u32(8 * k)) & 255))
+        }
+    }
+
+    /// A byte count, then the UTF-8.
+    pub fn write_str(mut self, s: str) {
+        let n = s.len()
+        self.write_u32(n)
+        self.bytes.reserve(n)
+        for i in 0..n {
+            self.bytes.push(s.byte(i))
+        }
+    }
+}
+
+/// Why bytes couldn't be loaded: where, and what was wrong.
+pub struct LoadError: Copy + Eq {
+    /// The byte offset where it went wrong.
+    pub at: u32,
+    pub what: Text,
+}
+
+/// Bytes being read.
+pub struct Reader: Clone {
+    bytes: Vec<u8>,
+    at: u32,
+}
+
+impl Reader {
+    /// A reader at the start of `bytes`.
+    pub fn new(bytes: take Vec<u8>) -> Reader {
+        Reader { bytes: take bytes, at: 0 }
+    }
+
+    /// How many bytes are left.
+    pub fn left(self) -> u32 {
+        self.bytes.len() - self.at
+    }
+
+    /// Whether every byte is read.
+    pub fn at_end(self) -> bool {
+        self.at == self.bytes.len()
+    }
+
+    /// An error at the reader's position: for a hand-written `deserialize`.
+    pub fn fail(self, what: Text) -> LoadError {
+        LoadError { at: self.at, what }
+    }
+
+    /// The next `n` bytes' offset, if there are `n` left.
+    fn take_bytes(mut self, n: u32) -> Result<u32, LoadError> {
+        if self.left() < n {
+            return Err(self.fail("the bytes end too soon"))
+        }
+        let at = self.at
+        self.at += n
+        Ok(at)
+    }
+
+    /// The next byte, or an error if no bytes are left.
+    pub fn read_u8(mut self) -> Result<u8, LoadError> {
+        let at = self.take_bytes(1)?
+        Ok(self.bytes[at])
+    }
+
+    /// The next four bytes as a little-endian `u32`, or an error if fewer are left.
+    pub fn read_u32(mut self) -> Result<u32, LoadError> {
+        let at = self.take_bytes(4)?
+        var x = 0
+        for k in 0..4 {
+            x = x | (u32(self.bytes[at + k]) << (8 * k))
+        }
+        Ok(x)
+    }
+
+    /// The next eight bytes as a little-endian `u64`, or an error if fewer are left.
+    pub fn read_u64(mut self) -> Result<u64, LoadError> {
+        let at = self.take_bytes(8)?
+        var x: u64 = 0
+        for k in 0..8 {
+            x = x | (u64(self.bytes[at + k]) << (8 * k))
+        }
+        Ok(x)
+    }
+
+    /// Text written by `write_str`: it must be UTF-8.
+    pub fn read_string(mut self) -> Result<String, LoadError> {
+        let n = self.read_u32()?
+        let at = self.take_bytes(n)?
+        var bytes: Vec<u8> = Vec::with_capacity(n)
+        for i in 0..n {
+            bytes.push(self.bytes[at + i])
+        }
+        let Some(s) = String::from_utf8(take bytes) else {
+            return Err(LoadError { at, what: "the text isn't UTF-8" })
+        }
+        Ok(s)
+    }
+
+    /// The name `want` next: the field a derived load expects.
+    pub fn expect_name(mut self, want: str) -> Result<(), LoadError> {
+        let at = self.at
+        let n = self.read_u32()?
+        let start = self.take_bytes(n)?
+        if n != want.len() {
+            return Err(LoadError { at, what: "a field's name isn't the one expected" })
+        }
+        for i in 0..n {
+            if self.bytes[start + i] != want.byte(i) {
+                return Err(LoadError { at, what: "a field's name isn't the one expected" })
+            }
+        }
+        Ok(())
+    }
+
+    /// The variant whose name is next, as its index into `names`.
+    pub fn read_variant(mut self, names: [Text]) -> Result<u32, LoadError> {
+        let at = self.at
+        let n = self.read_u32()?
+        let start = self.take_bytes(n)?
+        for k in 0..names.len() {
+            let name = names[k]
+            if name.len() == n {
+                var same = true
+                for i in 0..n {
+                    if self.bytes[start + i] != name.byte(i) {
+                        same = false
+                        break
+                    }
+                }
+                if same {
+                    return Ok(k)
+                }
+            }
+        }
+        Err(LoadError { at, what: "the variant's name isn't one of the enum's" })
+    }
+}
+
+/// Saving and loading, field by field: `x.serialize(mut w)` writes `x`, and
+/// `T::deserialize(mut r)` reads a `T` back. Declare it on a type, `struct Save: Serialize
+/// { ... }`, and both are derived.
+@fieldwise
+pub trait Serialize {
+    /// Writes the value into `w`.
+    fn serialize(self, w: mut Writer)
+
+    /// Reads a value from `r`, or an error if the bytes don't hold one.
+    fn deserialize(r: mut Reader) -> Result<Self, LoadError>
+
+    /// What the derived `serialize` writes before a field: by default, its name.
+    fn serialize_field(name: Text, w: mut Writer) {
+        w.write_str(name)
+    }
+
+    /// What the derived `serialize` writes for an enum value's variant: by default, its name.
+    fn serialize_variant(index: u32, name: Text, w: mut Writer) {
+        w.write_str(name)
+    }
+
+    /// What the derived `deserialize` reads before a field: by default, its name, which must
+    /// match `name`.
+    fn deserialize_field(name: Text, r: mut Reader) -> Result<(), LoadError> {
+        r.expect_name(name)
+    }
+
+    /// Reads which variant comes next: its index in `names`. By default, it reads a name, which
+    /// must be one of `names`.
+    fn deserialize_variant(names: [Text], r: mut Reader) -> Result<u32, LoadError> {
+        r.read_variant(names)
+    }
+}
+
+/// `x`'s bytes.
+///
+/// ```wrela
+/// use std::serialize::{LoadError, Serialize, load, save}
+///
+/// struct Day: Serialize {
+///     day: u32,
+///     gold: f32,
+/// }
+///
+/// let bytes = save(Day { day: 3, gold: 12.5 })
+/// let back: Result<Day, LoadError> = load(take bytes)
+/// match back {
+///     Ok(d) => assert(d.day == 3 && d.gold == 12.5),
+///     Err(e) => panic(e.what),
+/// }
+/// ```
+pub fn save<T: Serialize>(x: T) -> Vec<u8> {
+    var w = Writer::new()
+    x.serialize(mut w)
+    take w.into_bytes()
+}
+
+/// A `T` from `bytes`, which must hold exactly one.
+pub fn load<T: Serialize>(bytes: take Vec<u8>) -> Result<T, LoadError> {
+    var r = Reader::new(take bytes)
+    let x = T::deserialize(mut r)?
+    if !r.at_end() {
+        return Err(LoadError { at: r.at, what: "bytes are left after the value" })
+    }
+    Ok(x)
+}
+
+// The leaves.
+
+impl Serialize for bool {
+    fn serialize(self, w: mut Writer) {
+        w.write_u8(if self { 1 } else { 0 })
+    }
+
+    fn deserialize(r: mut Reader) -> Result<bool, LoadError> {
+        let at = r.at
+        match r.read_u8()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(LoadError { at, what: "a `bool` is 0 or 1" }),
+        }
+    }
+}
+
+impl Serialize for u8 {
+    fn serialize(self, w: mut Writer) {
+        w.write_u8(self)
+    }
+
+    fn deserialize(r: mut Reader) -> Result<u8, LoadError> {
+        r.read_u8()
+    }
+}
+
+impl Serialize for u32 {
+    fn serialize(self, w: mut Writer) {
+        w.write_u32(self)
+    }
+
+    fn deserialize(r: mut Reader) -> Result<u32, LoadError> {
+        r.read_u32()
+    }
+}
+
+impl Serialize for i32 {
+    fn serialize(self, w: mut Writer) {
+        w.write_u32(u32(self))
+    }
+
+    fn deserialize(r: mut Reader) -> Result<i32, LoadError> {
+        Ok(i32(r.read_u32()?))
+    }
+}
+
+impl Serialize for u64 {
+    fn serialize(self, w: mut Writer) {
+        w.write_u64(self)
+    }
+
+    fn deserialize(r: mut Reader) -> Result<u64, LoadError> {
+        r.read_u64()
+    }
+}
+
+impl Serialize for i64 {
+    fn serialize(self, w: mut Writer) {
+        w.write_u64(u64(self))
+    }
+
+    fn deserialize(r: mut Reader) -> Result<i64, LoadError> {
+        Ok(i64(r.read_u64()?))
+    }
+}
+
+impl Serialize for f32 {
+    fn serialize(self, w: mut Writer) {
+        w.write_u32(bitcast_u32(self))
+    }
+
+    fn deserialize(r: mut Reader) -> Result<f32, LoadError> {
+        Ok(bitcast_f32(r.read_u32()?))
+    }
+}
+
+impl Serialize for f64 {
+    fn serialize(self, w: mut Writer) {
+        w.write_u64(bitcast_u64(self))
+    }
+
+    fn deserialize(r: mut Reader) -> Result<f64, LoadError> {
+        Ok(bitcast_f64(r.read_u64()?))
+    }
+}
+
+impl Serialize for vec2 {
+    fn serialize(self, w: mut Writer) {
+        self.x.serialize(mut w)
+        self.y.serialize(mut w)
+    }
+
+    fn deserialize(r: mut Reader) -> Result<vec2, LoadError> {
+        let x = f32::deserialize(mut r)?
+        let y = f32::deserialize(mut r)?
+        Ok(vec2(x, y))
+    }
+}
+
+impl Serialize for vec3 {
+    fn serialize(self, w: mut Writer) {
+        self.x.serialize(mut w)
+        self.y.serialize(mut w)
+        self.z.serialize(mut w)
+    }
+
+    fn deserialize(r: mut Reader) -> Result<vec3, LoadError> {
+        let x = f32::deserialize(mut r)?
+        let y = f32::deserialize(mut r)?
+        let z = f32::deserialize(mut r)?
+        Ok(vec3(x, y, z))
+    }
+}
+
+impl Serialize for vec4 {
+    fn serialize(self, w: mut Writer) {
+        self.x.serialize(mut w)
+        self.y.serialize(mut w)
+        self.z.serialize(mut w)
+        self.w.serialize(mut w)
+    }
+
+    fn deserialize(r: mut Reader) -> Result<vec4, LoadError> {
+        let x = f32::deserialize(mut r)?
+        let y = f32::deserialize(mut r)?
+        let z = f32::deserialize(mut r)?
+        let w2 = f32::deserialize(mut r)?
+        Ok(vec4(x, y, z, w2))
+    }
+}
+
+impl Serialize for String {
+    fn serialize(self, w: mut Writer) {
+        w.write_str(self)
+    }
+
+    fn deserialize(r: mut Reader) -> Result<String, LoadError> {
+        r.read_string()
+    }
+}
+
+impl<T: Serialize> Serialize for Vec<T> {
+    fn serialize(self, w: mut Writer) {
+        w.write_u32(self.len())
+        for x in self {
+            x.serialize(mut w)
+        }
+    }
+
+    fn deserialize(r: mut Reader) -> Result<Vec<T>, LoadError> {
+        let at = r.at
+        let n = r.read_u32()?
+        // Each element takes at least a byte: a count past that is a corrupt save, not a reason
+        // to allocate.
+        if n > r.left() {
+            return Err(LoadError { at, what: "a count is larger than the bytes left" })
+        }
+        var out = Vec::with_capacity(n)
+        for _ in 0..n {
+            out.push(T::deserialize(mut r)?)
+        }
+        Ok(out)
+    }
+}
+
+/// A fixed array of `Copy` elements, each in order. (Its elements are read into an array the
+/// first one's copies fill, so they must be `Copy`.)
+impl<T: Serialize + Copy, const N: u32> Serialize for [T; N] {
+    fn serialize(self, w: mut Writer) {
+        for x in self {
+            x.serialize(mut w)
+        }
+    }
+
+    fn deserialize(r: mut Reader) -> Result<[T; N], LoadError> {
+        var out = [T::deserialize(mut r)?; N]
+        for i in 1..N {
+            out[i] = T::deserialize(mut r)?
+        }
+        Ok(out)
+    }
+}
+
+impl<A: Serialize, B: Serialize> Serialize for (A, B) {
+    fn serialize(self, w: mut Writer) {
+        self.0.serialize(mut w)
+        self.1.serialize(mut w)
+    }
+
+    fn deserialize(r: mut Reader) -> Result<(A, B), LoadError> {
+        let a = A::deserialize(mut r)?
+        let b = B::deserialize(mut r)?
+        Ok((a, b))
+    }
+}
+
+impl<A: Serialize, B: Serialize, C: Serialize> Serialize for (A, B, C) {
+    fn serialize(self, w: mut Writer) {
+        self.0.serialize(mut w)
+        self.1.serialize(mut w)
+        self.2.serialize(mut w)
+    }
+
+    fn deserialize(r: mut Reader) -> Result<(A, B, C), LoadError> {
+        let a = A::deserialize(mut r)?
+        let b = B::deserialize(mut r)?
+        let c = C::deserialize(mut r)?
+        Ok((a, b, c))
+    }
+}
+
+impl<T: Serialize> Serialize for Box<T> {
+    fn serialize(self, w: mut Writer) {
+        self.get().serialize(mut w)
+    }
+
+    fn deserialize(r: mut Reader) -> Result<Box<T>, LoadError> {
+        Ok(Box::new(T::deserialize(mut r)?))
+    }
+}

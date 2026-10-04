@@ -1,0 +1,14 @@
+// A value of one type where another is expected. wrela converts nothing implicitly: an `i32`
+// isn't an `f32`, and a `u32` isn't an `i32`. Convert with the type's name, `f32(n)`.
+// ---- wrong
+fn as_float(n: i32) -> f32 {
+    n
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+fn as_float(n: i32) -> f32 {
+    f32(n)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

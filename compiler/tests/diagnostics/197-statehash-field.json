@@ -1,0 +1,41 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0417",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [
+        {
+          "file": "main.wrela",
+          "message": "`StateHash` declared here",
+          "span": {
+            "column": 15,
+            "end": 179,
+            "end_column": 24,
+            "end_line": 10,
+            "line": 10,
+            "start": 170
+          }
+        }
+      ],
+      "message": "`World` can't derive `StateHash`: the field `camera` has type `Camera`, which doesn't have it",
+      "notes": [
+        "`World` declares `StateHash`, which is derived field by field, so the field `camera` needs it too (§3)"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 5,
+        "end": 215,
+        "end_column": 19,
+        "end_line": 12,
+        "line": 12,
+        "start": 201
+      },
+      "title": "a type that can't derive a `@fieldwise` trait it declares"
+    }
+  ],
+  "version": 2
+}

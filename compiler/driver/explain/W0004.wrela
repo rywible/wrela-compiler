@@ -1,0 +1,14 @@
+// `Clone` declared beside `Copy`. A type that declares `Copy` is `Clone` too, so the second is
+// noise; `wrela fix` removes it.
+// ---- wrong
+struct P: Copy + Clone {
+    x: f32,
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+struct P: Copy {
+    x: f32,
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

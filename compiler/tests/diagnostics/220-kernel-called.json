@@ -1,0 +1,53 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0606",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "`fill` is a GPU `@compute` kernel; record it with `dispatch(kernel.bind(...), groups: n)`",
+      "notes": [
+        "entry points run on the GPU and can't be called directly"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 5,
+        "end": 332,
+        "end_column": 9,
+        "end_line": 13,
+        "line": 13,
+        "start": 328
+      },
+      "title": "an entry point called directly"
+    },
+    {
+      "code": "E0601",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [
+        "take it as a kernel parameter: `id: GlobalId`"
+      ],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "a `GlobalId` can't be built",
+      "notes": [
+        "each invocation gets its own from the GPU, and `Slots` and workgroup memory's chunks are indexed by it, so each invocation writes only its own (§6.13)"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 25,
+        "end": 356,
+        "end_column": 33,
+        "end_line": 13,
+        "line": 13,
+        "start": 348
+      },
+      "title": "a kernel `mut` parameter that isn't safe to share across invocations"
+    }
+  ],
+  "version": 2
+}

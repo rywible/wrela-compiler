@@ -1,0 +1,10 @@
+// mistake: reading storage in `@deterministic` code
+// expect: E0600
+// fix: no
+use std::io::load
+
+@deterministic
+fn tick(turn: u32) -> u32 {
+    let _ = load("save")
+    turn + 1
+}

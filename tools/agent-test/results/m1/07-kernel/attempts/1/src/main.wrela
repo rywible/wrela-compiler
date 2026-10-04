@@ -1,7 +1,7 @@
 use std::field::{Surface, sphere}
 use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch}
 
-struct Grid: Copy + Clone + GpuData {
+struct Grid: Copy + GpuData {
     origin: vec3,
     cell: f32,
     n: u32,

@@ -1,0 +1,15 @@
+// Something a back end can't do yet: a uniform larger than the GPU's limit, a projection
+// returned in GPU code, a transcendental of an `f64`. The message says what, and the help what to
+// do instead.
+// ---- wrong
+fn wave(x: f64) -> f64 {
+    sin(x)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+fn wave(x: f32) -> f32 {
+    sin(x)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

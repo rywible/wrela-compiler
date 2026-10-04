@@ -1,0 +1,42 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0704",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [
+        {
+          "file": "main.wrela",
+          "message": "while the build computes `SPINE`",
+          "span": {
+            "column": 20,
+            "end": 149,
+            "end_column": 33,
+            "end_line": 5,
+            "line": 5,
+            "start": 136
+          }
+        }
+      ],
+      "message": "computing the constant `SPINE` panicked: no bone is named `spine`",
+      "notes": [
+        "the call chain: const SPINE → find",
+        "the build runs the program's own code to compute a constant, so a panic or a failed `assert` in it fails the build (§10)"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 5,
+        "end": 306,
+        "end_column": 40,
+        "end_line": 13,
+        "line": 13,
+        "start": 271
+      },
+      "title": "a constant whose computation panicked or trapped"
+    }
+  ],
+  "version": 2
+}

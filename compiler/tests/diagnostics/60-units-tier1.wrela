@@ -1,7 +1,0 @@
-// mistake: a unit suffix
-// expect: E0900
-// fix: yes
-fn f() -> f32 {
-    let height = 2m
-    height
-}

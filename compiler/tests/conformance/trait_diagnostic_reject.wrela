@@ -1,0 +1,15 @@
+// rejects: trait.diagnostic
+@diagnostic("`{Self}` can't be simulated: give it `SimState` by declaring it, with fields that have it")
+trait SimState {}
+
+impl SimState for f32 {}
+
+fn tick<S: SimState>(s: S) {}
+
+struct Camera {
+    fov: f32,
+}
+
+fn f(c: Camera) {
+    tick(c) //~ E0400
+}

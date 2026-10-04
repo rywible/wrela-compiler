@@ -1,0 +1,40 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0519",
+      "file": "main.wrela",
+      "fixes": [
+        {
+          "edits": [
+            {
+              "end": 143,
+              "file": "main.wrela",
+              "replacement": " ",
+              "start": 135
+            }
+          ],
+          "message": "remove them"
+        }
+      ],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "the borrow struct `View` can't declare traits: it's a projection",
+      "notes": [
+        "a borrow struct lives only as long as the call that made it, so it's never copied, cloned or kept (§6.6)"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 19,
+        "end": 142,
+        "end_column": 26,
+        "end_line": 8,
+        "line": 8,
+        "start": 135
+      },
+      "title": "a projection as a field of an ordinary type"
+    }
+  ],
+  "version": 2
+}

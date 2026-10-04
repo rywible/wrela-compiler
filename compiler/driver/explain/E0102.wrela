@@ -1,0 +1,13 @@
+// A closing bracket doesn't match the one it closes: `(` closed by `]`, `{` closed by `)`.
+// ---- wrong
+fn area(w: f32, h: f32) -> f32 {
+    (w * h]
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+fn area(w: f32, h: f32) -> f32 {
+    (w * h)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

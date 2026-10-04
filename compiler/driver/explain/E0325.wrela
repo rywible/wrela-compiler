@@ -1,0 +1,20 @@
+// An array's length that isn't a constant `u32` under 2^32: a local, or a number too large.
+// An array's length is part of its type, known when the program is built. For a length known only
+// when it runs, use a `Vec`.
+// ---- wrong
+fn zeros() -> f32 {
+    let n = 3
+    let a = [0.0; n]
+    a[0]
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+const N: u32 = 3
+
+fn zeros() -> f32 {
+    let a = [0.0; N]
+    a[0]
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

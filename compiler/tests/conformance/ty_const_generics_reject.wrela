@@ -1,0 +1,12 @@
+// rejects: ty.const-generics
+fn scale<const K: f32>(x: f32) -> f32 { //~ E0331
+    x
+}
+
+fn length() -> u32 {
+    4
+}
+
+fn table() -> [f32; length()] { //~ E0325
+    [0.0; 4]
+}

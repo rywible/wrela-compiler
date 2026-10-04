@@ -1,0 +1,33 @@
+// An `impl` of a trait for a type where neither the trait nor the type is the package's own
+// module tree's: the orphan rule. Two packages could otherwise both implement it. Wrap the type
+// in a struct of your own, and implement the trait for that.
+// ---- wrong
+use std::cmp::Ordering
+
+impl Ord for vec2 {
+    fn cmp(self, other: vec2) -> Ordering {
+        Ordering::Equal
+    }
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+use std::cmp::Ordering
+
+struct Point: Eq {
+    p: vec2,
+}
+
+impl Ord for Point {
+    fn cmp(self, other: Point) -> Ordering {
+        if self.p.x < other.p.x {
+            Ordering::Less
+        } else if self.p.x > other.p.x {
+            Ordering::Greater
+        } else {
+            Ordering::Equal
+        }
+    }
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

@@ -1,0 +1,38 @@
+// accepts: mem.borrow-structs
+// A function can return a borrow struct built from its `borrow` and `mut` parameters (§6.6).
+struct World {
+    count: u32,
+}
+
+struct Frame {
+    n: u32,
+}
+
+borrow struct Ctx {
+    world: borrow World,
+    frame: mut Frame,
+    dt: f32,
+}
+
+fn make(world: World, frame: mut Frame) -> Ctx {
+    Ctx { world, frame: mut frame, dt: 0.5 }
+}
+
+fn pass(c: Ctx) -> Ctx {
+    c
+}
+
+fn step(c: Ctx) {
+    c.frame.n += c.world.count
+}
+
+fn f() -> u32 {
+    let w = World { count: 3 }
+    var f = Frame { n: 1 }
+    let c = pass(make(w, mut f))
+    step(c)
+    // `w` is only borrowed: reading it is fine while `c` is live.
+    let k = w.count
+    step(c)
+    f.n + k
+}

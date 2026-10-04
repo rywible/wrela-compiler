@@ -1,0 +1,40 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0100",
+      "file": "main.wrela",
+      "fixes": [
+        {
+          "edits": [
+            {
+              "end": 220,
+              "file": "main.wrela",
+              "replacement": "",
+              "start": 216
+            }
+          ],
+          "message": "remove it"
+        }
+      ],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "a closure parameter has no mode of its own: `mut` comes from the function type it's passed as",
+      "notes": [
+        "a closure called through `fn(mut T)` takes its argument as `mut` already (§6.7)"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 22,
+        "end": 219,
+        "end_column": 25,
+        "end_line": 11,
+        "line": 11,
+        "start": 216
+      },
+      "title": "unexpected token"
+    }
+  ],
+  "version": 2
+}

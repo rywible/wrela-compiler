@@ -1,0 +1,6 @@
+# Sketch 01, "a creature as a field" (compiler/tests/tests/suite/sketches.rs).
+[package]
+name = "grazer"
+
+[dependencies]
+engine = { path = "../engine" }

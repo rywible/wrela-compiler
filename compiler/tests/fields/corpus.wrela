@@ -4,12 +4,15 @@
 // branches on the input, early returns, loops and integer arithmetic. Each is a `Surface`, so
 // `gradient` and `interval` come from the trait's defaults.
 use grazer::{Grazer, grazer}
-use std::field::{Surface, ellipsoid, fbm, half_space, hash_u32, round_cone, sphere, value_noise}
+use std::field::{
+    Lipschitz, Surface, ellipsoid, fbm, half_space, hash_u32, round_cone, sphere, value_noise,
+}
+use std::stage::Tape
 
 /// The creature from examples/hello-field (shape.wrela), mid-breath.
-pub fn creature() -> Surface {
+pub fn creature() -> Lipschitz {
     let body = ellipsoid(vec3(0.62, 0.435, 0.42))
-    let neck = round_cone(vec3(0.35, 0.15, 0.0), vec3(0.75, 0.62, 0.0), 0.16, 0.1)
+    let neck = round_cone(vec3(0.35, 0.15, 0.0), vec3(0.75, 0.62, 0.0), r_top: 0.16, r_bottom: 0.1)
     let head = sphere(radius: 0.2).translate(vec3(0.82, 0.72, 0.0))
     body
         .smooth_union(neck, k: 0.12)
@@ -18,7 +21,7 @@ pub fn creature() -> Surface {
 }
 
 /// Value noise at a frequency.
-pub struct Noise: Copy + Clone + GpuData {
+pub struct Noise: Copy + GpuData {
     pub freq: f32,
 }
 
@@ -29,7 +32,7 @@ impl Surface for Noise {
 }
 
 /// sin, cos, exp, sqrt.
-pub struct Waves: Copy + Clone + GpuData {
+pub struct Waves: Copy + GpuData {
     pub s: f32,
 }
 
@@ -40,7 +43,7 @@ impl Surface for Waves {
 }
 
 /// log, log2, pow, exp2, inverseSqrt.
-pub struct Logs: Copy + Clone + GpuData {
+pub struct Logs: Copy + GpuData {
     pub s: f32,
 }
 
@@ -54,7 +57,7 @@ impl Surface for Logs {
 }
 
 /// tan, atan, atan2, asin, acos.
-pub struct Trig: Copy + Clone + GpuData {
+pub struct Trig: Copy + GpuData {
     pub s: f32,
 }
 
@@ -69,7 +72,7 @@ impl Surface for Trig {
 }
 
 /// Division, products of the input with itself, remainders.
-pub struct Rational: Copy + Clone + GpuData {
+pub struct Rational: Copy + GpuData {
     pub s: f32,
 }
 
@@ -83,7 +86,7 @@ impl Surface for Rational {
 
 /// The piecewise built-ins: smoothstep, mix with a varying weight, clamp, step, abs, floor,
 /// fract, sign, min, max.
-pub struct Pieces: Copy + Clone + GpuData {
+pub struct Pieces: Copy + GpuData {
     pub s: f32,
 }
 
@@ -103,7 +106,7 @@ impl Surface for Pieces {
 }
 
 /// The vector built-ins: length, dot, normalize, cross, distance, swizzles, mix of vectors.
-pub struct Vectors: Copy + Clone + GpuData {
+pub struct Vectors: Copy + GpuData {
     pub c: vec3,
 }
 
@@ -119,7 +122,7 @@ impl Surface for Vectors {
 }
 
 /// Branches on the input, an early return, and a loop of fixed length.
-pub struct Branchy: Copy + Clone + GpuData {
+pub struct Branchy: Copy + GpuData {
     pub n: u32,
 }
 
@@ -141,7 +144,7 @@ impl Surface for Branchy {
 }
 
 /// Integer arithmetic on the input: lattice cells and hashes, as value noise does.
-pub struct Cells: Copy + Clone + GpuData {
+pub struct Cells: Copy + GpuData {
     pub s: f32,
 }
 
@@ -154,32 +157,97 @@ impl Surface for Cells {
     }
 }
 
-pub fn sphere_() -> Surface {
+pub fn sphere_() -> Lipschitz {
     sphere(0.7)
 }
 
-pub fn ellipsoid_() -> Surface {
+pub fn ellipsoid_() -> Lipschitz {
     ellipsoid(vec3(0.5, 0.3, 0.8))
 }
 
-pub fn cone_() -> Surface {
-    round_cone(vec3(0.1, -0.5, 0.0), vec3(-0.2, 0.6, 0.3), 0.3, 0.1)
+pub fn cone_() -> Lipschitz {
+    round_cone(vec3(0.1, -0.5, 0.0), vec3(-0.2, 0.6, 0.3), r_top: 0.3, r_bottom: 0.1)
 }
 
-pub fn hoof_() -> Surface {
-    round_cone(vec3(), vec3(y: -0.08), 0.06, 0.07).intersect(half_space(vec3(y: -1.0), 0.07))
+pub fn hoof_() -> Lipschitz {
+    round_cone(vec3(), vec3(y: -0.08), r_top: 0.06, r_bottom: 0.07).intersect(
+        half_space(vec3(y: -1.0), 0.07),
+    )
 }
 
-pub fn blob_() -> Surface {
+pub fn blob_() -> Lipschitz {
     sphere(radius: 0.5)
-        .smooth_union(round_cone(vec3(), vec3(y: 1.0), 0.3, 0.1), k: 0.1)
+        .smooth_union(round_cone(vec3(), vec3(y: 1.0), r_top: 0.3, r_bottom: 0.1), k: 0.1)
         .smooth_union(ellipsoid(vec3(0.3, 0.2, 0.4)).translate(vec3(0.4, 0.1, 0.0)), k: 0.05)
 }
 
-pub fn fbm_() -> Surface {
+pub fn fbm_() -> Lipschitz {
     sphere(0.6).displace(fbm(freq: 3.0, octaves: 4), amp: 0.2)
 }
 
 pub fn grazer_() -> Grazer {
     grazer(1)
+}
+
+// ---- fields built at runtime (std::stage), each with its compiled twin ------------------------
+/// `sphere_()`, as a tape.
+pub fn sphere_tape() -> Tape {
+    var t = Tape::new()
+    let _ = t.sphere(vec3(), 0.7)
+    t
+}
+
+/// `Waves { s }`, as a tape.
+pub fn waves_tape(s: f32) -> Tape {
+    var t = Tape::new()
+    let x = t.x()
+    let y = t.y()
+    let z = t.z()
+    // sin(s x) cos(2 y) + exp(0.3 z) - sqrt(x x + 1), in the compiled field's order.
+    let s_ = t.constant(s)
+    let sx = t.mul(s_, x)
+    let sin_sx = t.sin(sx)
+    let two = t.constant(2.0)
+    let two_y = t.mul(two, y)
+    let cos_2y = t.cos(two_y)
+    let a = t.mul(sin_sx, cos_2y)
+    let k = t.constant(0.3)
+    let kz = t.mul(k, z)
+    let e = t.exp(kz)
+    let b = t.add(a, e)
+    let xx = t.mul(x, x)
+    let one = t.constant(1.0)
+    let xx1 = t.add(xx, one)
+    let r = t.sqrt(xx1)
+    let _ = t.sub(b, r)
+    t
+}
+
+/// Three spheres joined with smooth unions: an edit log, as a sculpting tool keeps one.
+/// A field written as closures: the outer one captures the two inner ones (§6.7), and a closure
+/// of a point is a `Surface`.
+pub fn closures_(s: f32) -> Surface {
+    let ball = |p: vec3| length(p) - 0.6
+    let ripple = |p: vec3| sin(p.x * s) * 0.05
+    |p: vec3| ball(p) + ripple(p)
+}
+
+pub fn blob_spheres() -> Surface {
+    sphere(0.5)
+        .smooth_union(sphere(0.3).translate(vec3(0.4, 0.1, 0.0)), k: 0.1)
+        .smooth_union(sphere(0.25).translate(vec3(-0.3, 0.4, 0.2)), k: 0.05)
+}
+
+/// `blob_spheres()`, as a tape built from the edits.
+pub fn blob_tape() -> Tape {
+    let centers = [vec3(), vec3(0.4, 0.1, 0.0), vec3(-0.3, 0.4, 0.2)]
+    let radii = [0.5, 0.3, 0.25]
+    let ks = [0.0, 0.1, 0.05]
+    var t = Tape::new()
+    var d = t.sphere(centers[0], radii[0])
+    for i in 1..3 {
+        let s = t.sphere(centers[i], radii[i])
+        d = t.smooth_min(d, s, ks[i])
+    }
+    t
 }

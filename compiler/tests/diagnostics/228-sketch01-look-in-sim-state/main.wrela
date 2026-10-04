@@ -1,0 +1,14 @@
+// mistake: sketch 01 §6: presentation state (a spring) inside sim state
+// expect: E0417
+// fix: no
+use engine::sim::SimState
+
+struct Spring {
+    pos: vec3,
+    vel: vec3,
+}
+
+struct GrazerSim: SimState {
+    root: vec3,
+    tail: Spring,
+}

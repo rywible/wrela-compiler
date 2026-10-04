@@ -1,0 +1,40 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0604",
+      "file": "main.wrela",
+      "fixes": [
+        {
+          "edits": [
+            {
+              "end": 178,
+              "file": "main.wrela",
+              "replacement": " + GpuData",
+              "start": 178
+            }
+          ],
+          "message": "opt `Wind` in to `GpuData`"
+        }
+      ],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "`w` is a `Wind`, which isn't `GpuData`, so it can't go to the GPU",
+      "notes": [
+        "data crossing to the GPU must be `GpuData`, so its layout is the same on both sides (§6.13)"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 9,
+        "end": 243,
+        "end_column": 16,
+        "end_line": 12,
+        "line": 12,
+        "start": 236
+      },
+      "title": "data crossing to the GPU that isn't `GpuData`"
+    }
+  ],
+  "version": 2
+}

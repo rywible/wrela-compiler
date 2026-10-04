@@ -1,0 +1,30 @@
+// An attribute where it can't go: on an `impl`, on a statement, or after the item's keyword.
+// Attributes go on the line before a function, a struct or a trait.
+// ---- wrong
+@deterministic
+impl Counter {
+    fn next(mut self) -> u32 {
+        self.n += 1
+        self.n
+    }
+}
+
+struct Counter {
+    n: u32,
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+impl Counter {
+    @deterministic
+    fn next(mut self) -> u32 {
+        self.n += 1
+        self.n
+    }
+}
+
+struct Counter {
+    n: u32,
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

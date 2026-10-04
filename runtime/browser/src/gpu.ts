@@ -1,22 +1,29 @@
 // The GPU side: builds the manifest's pipelines, and carries out decoded, sequenced and checked
 // commands with WebGPU. The same mapping as the native host (runtime/native/src/gpu.rs):
 //
-// - Work is recorded into one pending command encoder and submitted ("flushed") at Present,
-//   before a WriteBuffer (so earlier dispatches see the old contents), and at the end of each
-//   frame. Each dispatch gets its own compute pass.
-// - A screen pass's draws are collected and recorded into one render pass at Present, since a
-//   pass can span batches.
+// - Work is recorded into one pending command encoder and submitted ("flushed") at the end of a
+//   pass on the screen, before a WriteBuffer or WriteTexture (so earlier work sees the old
+//   contents), before a readback, and at the end of each call. Each dispatch gets its own
+//   compute pass.
+// - A pass's draws are collected and recorded into one render pass when it ends (Present or
+//   EndPass), since a pass can span batches.
+// - A render pipeline is made for each combination of target formats it's drawn with: the
+//   screen's or a texture's colour format, and a depth format or none. With depth, a fragment
+//   is kept where its depth is less than what's there, which it replaces.
 // - Uniform bytes go into a ring buffer bound with dynamic offsets (256-byte aligned by
 //   default), staged on the CPU and written just before each flush, so every command in a
 //   submission has its own slice. It grows (after a flush) when a submission needs more.
 // - Bind group 0 of each pipeline is laid out from the manifest: the uniform block (dynamic
-//   offset), then the buffers in order. Bind groups are cached per (pipeline, buffer handles).
+//   offset), then the bindings in order. Bind groups are cached per (pipeline, bindings), until
+//   one of their resources is destroyed.
+// - A destroyed buffer or texture is released after the next flush: work recorded before it
+//   still uses it.
 
-import { SCREEN_FORMAT } from "./abi.gen.ts";
+import { NONE, SCREEN, SCREEN_FORMAT } from "./abi.gen.ts";
+import { CommandError, isDepth } from "./check.ts";
 import { errorMessage } from "./errors.ts";
-import type { BufferBinding, Manifest, Pipeline, UniformBlock } from "./manifest.ts";
-import { CommandError } from "./check.ts";
-import type { Bytes, Command, OpcodeName } from "./stream.ts";
+import type { Manifest, Pipeline, ResourceBinding, UniformBlock } from "./manifest.ts";
+import type { Binding, Bytes, Command, OpcodeName, Pass, TextureFormat } from "./stream.ts";
 
 const RING_START = 64 * 1024;
 
@@ -32,16 +39,28 @@ export class ShaderError extends Error {
   }
 }
 
+/** What a render pipeline needs to make a variant for other targets. */
+interface RenderParts {
+  module: GPUShaderModule;
+  layout: GPUPipelineLayout;
+  vertex: string;
+  fragment: string;
+  /** By target formats: `colour|depth`, each a format or `none`. */
+  variants: Map<string, GPURenderPipeline>;
+}
+
 export interface BuiltPipeline {
   name: string;
   layout: GPUBindGroupLayout;
   compute: GPUComputePipeline | null;
-  render: GPURenderPipeline | null;
+  render: RenderParts | null;
   uniform: UniformBlock | null;
-  buffers: BufferBinding[];
+  bindings: ResourceBinding[];
+  /** A debug build's: where its bounds checks' flag is bound. */
+  debugFlag: number | null;
 }
 
-/** Where screen passes draw. */
+/** Where passes on the screen draw. */
 export interface ScreenTarget {
   /** The texture this frame's screen pass renders into (`SCREEN_FORMAT`). */
   texture(): GPUTexture;
@@ -53,6 +72,26 @@ function compilationMessages(info: GPUCompilationInfo): string | null {
   const errors = info.messages.filter((m) => m.type === "error");
   if (errors.length === 0) return null;
   return errors.map((m) => `${m.lineNum}:${m.linePos}: ${m.message}`).join("\n");
+}
+
+/** The key of a render pipeline's variant for these target formats. */
+const targetsKey = (color: GPUTextureFormat | null, depth: GPUTextureFormat | null) => `${color ?? "none"}|${depth ?? "none"}`;
+
+function renderDescriptor(
+  name: string,
+  parts: RenderParts,
+  color: GPUTextureFormat | null,
+  depth: GPUTextureFormat | null,
+): GPURenderPipelineDescriptor {
+  return {
+    label: name,
+    layout: parts.layout,
+    vertex: { module: parts.module, entryPoint: parts.vertex, buffers: [] },
+    // Triangle list, counter-clockwise front faces, no culling (the defaults).
+    primitive: { topology: "triangle-list" },
+    ...(depth === null ? {} : { depthStencil: { format: depth, depthWriteEnabled: true, depthCompare: "less" } }),
+    fragment: { module: parts.module, entryPoint: parts.fragment, targets: color === null ? [] : [{ format: color }] },
+  };
 }
 
 async function buildPipeline(device: GPUDevice, p: Pipeline, source: string): Promise<BuiltPipeline> {
@@ -75,14 +114,44 @@ async function buildPipeline(device: GPUDevice, p: Pipeline, source: string): Pr
       },
     });
   }
-  for (const b of p.buffers) {
-    const readOnly = b.access === "read";
+  if (p.debug_flag !== null) {
+    // WebGPU forbids writable storage in vertex shaders (which aren't checked).
     entries.push({
-      binding: b.binding,
-      // WebGPU forbids writable storage in vertex shaders.
-      visibility: readOnly || p.kind === "compute" ? visibility : GPUShaderStage.FRAGMENT,
-      buffer: { type: readOnly ? "read-only-storage" : "storage" },
+      binding: p.debug_flag,
+      visibility: p.kind === "compute" ? visibility : GPUShaderStage.FRAGMENT,
+      buffer: { type: "storage" },
     });
+  }
+  for (const b of p.bindings) {
+    switch (b.kind) {
+      case "read":
+      case "read_write": {
+        const readOnly = b.kind === "read";
+        entries.push({
+          binding: b.binding,
+          // WebGPU forbids writable storage in vertex shaders.
+          visibility: readOnly || p.kind === "compute" ? visibility : GPUShaderStage.FRAGMENT,
+          buffer: { type: readOnly ? "read-only-storage" : "storage" },
+        });
+        break;
+      }
+      case "texture":
+      case "depth_texture":
+        entries.push({
+          binding: b.binding,
+          visibility,
+          texture: { sampleType: b.kind === "texture" ? "float" : "depth", viewDimension: "2d" },
+        });
+        break;
+      case "sampler":
+      case "comparison_sampler":
+        entries.push({
+          binding: b.binding,
+          visibility,
+          sampler: { type: b.kind === "sampler" ? "filtering" : "comparison" },
+        });
+        break;
+    }
   }
 
   // Pipelines build at the same time and share the device's error scope stack, so the scope is
@@ -97,7 +166,7 @@ async function buildPipeline(device: GPUDevice, p: Pipeline, source: string): Pr
   const error = await scope;
   if (error !== null) throw fail(error.message);
   let compute: GPUComputePipeline | null = null;
-  let render: GPURenderPipeline | null = null;
+  let render: RenderParts | null = null;
   try {
     if (p.kind === "compute") {
       compute = await device.createComputePipelineAsync({
@@ -106,26 +175,21 @@ async function buildPipeline(device: GPUDevice, p: Pipeline, source: string): Pr
         compute: { module, entryPoint: p.entry },
       });
     } else {
-      render = await device.createRenderPipelineAsync({
-        label: p.name,
+      render = {
+        module,
         layout: pipelineLayout,
-        vertex: { module, entryPoint: p.vertex_entry, buffers: [] },
-        // Triangle list, counter-clockwise front faces, no culling (the defaults).
-        primitive: { topology: "triangle-list" },
-        fragment: { module, entryPoint: p.fragment_entry, targets: [{ format: SCREEN_FORMAT }] },
-      });
+        vertex: p.vertex_entry,
+        fragment: p.fragment_entry,
+        variants: new Map(),
+      };
+      // The screen's variant now, so a shader's errors come at load.
+      const screen = await device.createRenderPipelineAsync(renderDescriptor(p.name, render, SCREEN_FORMAT, null));
+      render.variants.set(targetsKey(SCREEN_FORMAT, null), screen);
     }
   } catch (e) {
     throw fail(errorMessage(e));
   }
-  return {
-    name: p.name,
-    layout,
-    compute,
-    render,
-    uniform: p.uniform,
-    buffers: p.buffers,
-  };
+  return { name: p.name, layout, compute, render, uniform: p.uniform, bindings: p.bindings, debugFlag: p.debug_flag };
 }
 
 /** Builds every pipeline up front. `shaders[i]` is pipeline `i`'s WGSL. */
@@ -133,97 +197,355 @@ export function buildPipelines(device: GPUDevice, manifest: Manifest, shaders: s
   return Promise.all(manifest.pipelines.map((p, i) => buildPipeline(device, p, shaders[i]!)));
 }
 
-type Draw = Extract<Command, { op: "Draw" }>;
+/** A draw waiting for its pass to end. */
+interface PendingDraw {
+  pipeline: number;
+  how: { vertices: number; instances: number } | { buffer: number; offset: number };
+  bindings: Binding[];
+  uniforms: Bytes;
+}
+
+/** A live resource the program made. */
+type Resource =
+  | { kind: "buffer"; buffer: GPUBuffer }
+  | { kind: "texture"; texture: GPUTexture; view: GPUTextureView; format: TextureFormat }
+  | { kind: "sampler"; sampler: GPUSampler };
 
 /** `n` rounded up to a multiple of `align`. */
 export const alignTo = (n: number, align: number) => Math.ceil(n / align) * align;
 
+/** A pass's GPU time, as the native host records it (runtime/native `GpuTiming`). */
+export interface GpuTiming {
+  /** The frame it ran in (`GpuExecutor.frame`). */
+  frame: number;
+  /** The dispatch's pipeline name, or `screen pass` or `pass`. */
+  label: string;
+  nanos: number;
+}
+
+/** Most passes timed in one submission: more flush first. */
+const TIMED_PASSES = 256;
+
+/** Timestamps at each pass's start and end ("timestamp-query"), read back after each
+ * submission. */
+class Timer {
+  readonly #queries: GPUQuerySet;
+  readonly #resolve: GPUBuffer;
+  /** The passes timed in the submission being recorded: their frame and label. */
+  #pending: { frame: number; label: string }[] = [];
+  /** The readbacks under way. */
+  readonly #reading: Promise<void>[] = [];
+  readonly results: GpuTiming[] = [];
+
+  constructor(readonly device: GPUDevice) {
+    this.#queries = device.createQuerySet({ label: "timestamps", type: "timestamp", count: 2 * TIMED_PASSES });
+    this.#resolve = device.createBuffer({
+      label: "timestamps",
+      size: 16 * TIMED_PASSES,
+      usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC,
+    });
+  }
+
+  get full(): boolean {
+    return this.#pending.length === TIMED_PASSES;
+  }
+
+  /** The writes for the next pass. */
+  next(frame: number, label: string): GPUComputePassTimestampWrites {
+    const i = this.#pending.length;
+    this.#pending.push({ frame, label });
+    return { querySet: this.#queries, beginningOfPassWriteIndex: 2 * i, endOfPassWriteIndex: 2 * i + 1 };
+  }
+
+  /** Records the copy of this submission's timestamps, before its encoder finishes; `read`
+   * reads them back after it's submitted. */
+  resolve(encoder: GPUCommandEncoder): (() => void) | null {
+    const passes = this.#pending.splice(0);
+    if (passes.length === 0) return null;
+    const bytes = 16 * passes.length;
+    const staging = this.device.createBuffer({ label: "timestamps", size: bytes, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+    encoder.resolveQuerySet(this.#queries, 0, 2 * passes.length, this.#resolve, 0);
+    encoder.copyBufferToBuffer(this.#resolve, 0, staging, 0, bytes);
+    return () => {
+      this.#reading.push(
+        staging.mapAsync(GPUMapMode.READ).then(() => {
+          const t = new BigUint64Array(staging.getMappedRange());
+          passes.forEach((p, i) => this.results.push({ ...p, nanos: Number(t[2 * i + 1]! - t[2 * i]!) }));
+          staging.unmap();
+          staging.destroy();
+        }),
+      );
+    };
+  }
+
+  /** Every timing read back so far, once the readbacks under way are done. */
+  async settled(): Promise<GpuTiming[]> {
+    await Promise.all(this.#reading.splice(0));
+    return this.results;
+  }
+}
+
 export class GpuExecutor {
   readonly #align: number;
-  readonly #buffers = new Map<number, GPUBuffer>();
-  /** By pipeline and buffer handles. */
+  readonly #resources = new Map<number, Resource>();
+  /** By pipeline and bindings. */
   readonly #bindGroups = new Map<string, { group: GPUBindGroup; handles: number[] }>();
-  /** The keys of the bind groups that use each buffer, so DestroyBuffer drops only those. */
+  /** The keys of the bind groups that use each resource, so destroying it drops only those. */
   readonly #groupsOf = new Map<number, Set<string>>();
-  /** Buffers destroyed by the program, released once the work recorded before is submitted. */
-  readonly #doomed: GPUBuffer[] = [];
+  /** Buffers and textures destroyed by the program, released once the work recorded before is
+   * submitted. */
+  readonly #doomed: (GPUBuffer | GPUTexture)[] = [];
   #ring: GPUBuffer;
   #staging: Bytes = new Uint8Array(RING_START);
   #staged = 0;
   #encoder: GPUCommandEncoder | null = null;
-  #pass: { clear: [number, number, number, number]; draws: Draw[] } | null = null;
+  #pass: { pass: Pass; draws: PendingDraw[] } | null = null;
+  readonly #timer: Timer | null;
+  /** A debug build's: the flag its pipelines' bounds checks set (the manifest's `debug_flag`),
+   * and the buffer it's read back through, made once. */
+  readonly #debugFlag: { buffer: GPUBuffer; readback: GPUBuffer } | null;
+  /** The frame being recorded, for timings. */
+  frame = 0;
 
+  /** With `timestamps`, on a device with "timestamp-query", each pass's GPU time is recorded
+   * (`timings`). */
   constructor(
     readonly device: GPUDevice,
     readonly pipelines: BuiltPipeline[],
     readonly screen: ScreenTarget,
+    timestamps = false,
   ) {
     const l = device.limits;
     this.#align = Math.max(l.minUniformBufferOffsetAlignment, l.minStorageBufferOffsetAlignment);
     this.#ring = this.#createRing(RING_START);
+    this.#timer = timestamps && device.features.has("timestamp-query") ? new Timer(device) : null;
+    this.#debugFlag = pipelines.some((p) => p.debugFlag !== null)
+      ? {
+          buffer: device.createBuffer({ label: "debug flag", size: 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC }),
+          readback: this.#readbackBuffer(4),
+        }
+      : null;
   }
 
-  /** Carries out a command that has been decoded, sequenced and checked. */
+  /** A debug build's: rejects if a pipeline has indexed an array out of range (its number, from
+   * 1, is in the flag), once the GPU's work so far is done. One read at a time. As the native
+   * host's `check_debug_flag`. */
+  async checkDebugFlag(): Promise<void> {
+    if (this.#debugFlag === null) return;
+    this.flush();
+    const bytes = await this.#copyBack(this.#debugFlag.buffer, 0, 4, this.#debugFlag.readback);
+    const code = new DataView(bytes.buffer).getUint32(0, true);
+    if (code === 0) return;
+    const p = this.pipelines[code - 1];
+    const name = p === undefined ? `number ${code}` : `\`${p.name}\``;
+    throw new Error(
+      `GPU error: debug build: pipeline ${name} indexed an array out of range (in this frame, or a call before it); WGSL then reads or writes an element in range, or a zero`,
+    );
+  }
+
+  /** Whether passes are timed. */
+  get timed(): boolean {
+    return this.#timer !== null;
+  }
+
+  /** Each timed pass's GPU time so far, once read back. */
+  async timings(): Promise<GpuTiming[]> {
+    this.flush();
+    return this.#timer === null ? [] : this.#timer.settled();
+  }
+
+  /** Room for a pass's timestamps: flushes if the timer is full. Like every flush, it comes
+   * before anything is recorded for the pass. */
+  #reserveTimestamps(): void {
+    if (this.#timer?.full) this.flush();
+  }
+
+  /** The timestamp writes for a pass about to be recorded; never flushes. */
+  #timestamps(label: string): { timestampWrites?: GPUComputePassTimestampWrites } {
+    return this.#timer === null ? {} : { timestampWrites: this.#timer.next(this.frame, label) };
+  }
+
+  /** Carries out a command that has been decoded, sequenced and checked. Requests are the
+   * program's business, except a readback's copy (`readBack`). */
   execute(cmd: Command): void {
     switch (cmd.op) {
       case "CreateBuffer":
-        this.#buffers.set(
-          cmd.handle,
-          this.device.createBuffer({
+        this.#resources.set(cmd.handle, {
+          kind: "buffer",
+          buffer: this.device.createBuffer({
             label: `buffer ${cmd.handle}`,
             size: cmd.size,
-            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
+            usage:
+              GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC | GPUBufferUsage.INDIRECT,
           }),
-        );
+        });
         return;
+      case "CreateTexture": {
+        const depth = isDepth(cmd.format);
+        const texture = this.device.createTexture({
+          label: `texture ${cmd.handle}`,
+          size: [cmd.width, cmd.height],
+          format: cmd.format,
+          usage:
+            GPUTextureUsage.TEXTURE_BINDING |
+            GPUTextureUsage.RENDER_ATTACHMENT |
+            GPUTextureUsage.COPY_SRC |
+            (depth ? 0 : GPUTextureUsage.COPY_DST),
+        });
+        this.#resources.set(cmd.handle, { kind: "texture", texture, view: texture.createView(), format: cmd.format });
+        return;
+      }
+      case "CreateSampler": {
+        const filter = cmd.linear ? "linear" : "nearest";
+        const address = cmd.repeat ? "repeat" : "clamp-to-edge";
+        const sampler = this.device.createSampler({
+          label: `sampler ${cmd.handle}`,
+          addressModeU: address,
+          addressModeV: address,
+          addressModeW: address,
+          magFilter: filter,
+          minFilter: filter,
+          mipmapFilter: "nearest",
+          ...(cmd.compare === null ? {} : { compare: cmd.compare }),
+        });
+        this.#resources.set(cmd.handle, { kind: "sampler", sampler });
+        return;
+      }
       case "WriteBuffer":
         if (cmd.data.length === 0) return;
-        // Dispatches recorded before this write must see the old contents.
+        // Work recorded before this write must see the old contents.
         this.flush();
         this.device.queue.writeBuffer(this.#buffer(cmd.handle), cmd.offset, cmd.data);
         return;
-      case "Dispatch":
-        this.#dispatch(cmd.pipeline, cmd.groups, cmd.buffers, cmd.uniforms);
-        return;
-      case "BeginScreenPass":
-        this.#pass = { clear: cmd.clear, draws: [] };
-        return;
-      case "Draw":
-        // The uniform bytes are a view into the program's memory: copy them.
-        this.#pass?.draws.push({ ...cmd, uniforms: cmd.uniforms.slice() });
-        return;
-      case "Present":
-        this.#present();
-        return;
-      case "DestroyBuffer": {
-        // Recorded work may still use it: it's destroyed once that work is submitted.
-        this.#doomed.push(this.#buffer(cmd.handle));
-        this.#buffers.delete(cmd.handle);
-        for (const key of this.#groupsOf.get(cmd.handle) ?? []) this.#dropBindGroup(key);
-        this.#groupsOf.delete(cmd.handle);
+      case "WriteTexture": {
+        if (cmd.data.length === 0) return;
+        this.flush();
+        const t = this.#texture(cmd.handle);
+        // Rows of `width` texels, no padding (the checker checked the length).
+        this.device.queue.writeTexture(
+          { texture: t.texture, origin: { x: cmd.x, y: cmd.y } },
+          cmd.data,
+          { bytesPerRow: cmd.data.length / cmd.height, rowsPerImage: cmd.height },
+          { width: cmd.width, height: cmd.height },
+        );
         return;
       }
+      case "CopyBuffer":
+        this.#encoderNow().copyBufferToBuffer(
+          this.#buffer(cmd.source),
+          cmd.sourceOffset,
+          this.#buffer(cmd.destination),
+          cmd.destinationOffset,
+          cmd.size,
+        );
+        return;
+      case "Dispatch":
+        this.#dispatch(cmd.op, cmd.pipeline, cmd.groups, cmd.bindings, cmd.uniforms);
+        return;
+      case "DispatchIndirect":
+        this.#dispatch(cmd.op, cmd.pipeline, { buffer: cmd.arguments, offset: cmd.offset }, cmd.bindings, cmd.uniforms);
+        return;
+      case "BeginScreenPass":
+        this.#pass = {
+          pass: { color: SCREEN, keepColor: false, clear: cmd.clear, depth: NONE, keepDepth: false, clearDepth: 1 },
+          draws: [],
+        };
+        return;
+      case "BeginPass":
+        this.#pass = { pass: cmd.pass, draws: [] };
+        return;
+      case "Draw":
+      case "DrawIndirect": {
+        const how =
+          cmd.op === "Draw"
+            ? { vertices: cmd.vertices, instances: cmd.instances }
+            : { buffer: cmd.arguments, offset: cmd.offset };
+        // The uniform bytes are a view into the program's memory: copy them.
+        this.#pass?.draws.push({ pipeline: cmd.pipeline, how, bindings: cmd.bindings, uniforms: cmd.uniforms.slice() });
+        return;
+      }
+      case "Present":
+      case "EndPass":
+        this.#endPass(cmd.op);
+        return;
+      case "DestroyBuffer":
+      case "DestroyTexture":
+      case "DestroySampler":
+        this.#destroy(cmd.handle);
+        return;
+      case "ReadBuffer":
+      case "StorageRead":
+      case "StorageWrite":
+      case "Fetch":
+      case "Log":
+        return;
     }
   }
 
   /** Submits everything recorded so far, after writing its uniform bytes, then destroys the
-   * buffers the program destroyed (WebGPU waits for submitted work that uses them). */
+   * resources the program destroyed (WebGPU waits for submitted work that uses them). */
   flush(): void {
     if (this.#encoder !== null) {
       if (this.#staged > 0) {
         this.device.queue.writeBuffer(this.#ring, 0, this.#staging, 0, this.#staged);
         this.#staged = 0;
       }
+      const read = this.#timer?.resolve(this.#encoder) ?? null;
       this.device.queue.submit([this.#encoder.finish()]);
       this.#encoder = null;
+      read?.();
     }
-    for (const b of this.#doomed.splice(0)) b.destroy();
+    for (const r of this.#doomed.splice(0)) r.destroy();
+  }
+
+  /** A buffer's bytes `offset..offset + size`, once the GPU's work recorded so far is done:
+   * a `ReadBuffer` request's answer. */
+  readBack(handle: number, offset: number, size: number): Promise<Bytes> {
+    this.flush();
+    const staging = this.#readbackBuffer(Math.max(size, 4));
+    return this.#copyBack(this.#buffer(handle), offset, size, staging).then((bytes) => {
+      staging.destroy();
+      return bytes;
+    });
+  }
+
+  /** Copies `source`'s bytes `offset..offset + size` to the CPU through `staging`, a readback
+   * buffer at least `size` bytes long, once the GPU has done the copy. */
+  async #copyBack(source: GPUBuffer, offset: number, size: number, staging: GPUBuffer): Promise<Bytes> {
+    const encoder = this.device.createCommandEncoder();
+    encoder.copyBufferToBuffer(source, offset, staging, 0, size);
+    this.device.queue.submit([encoder.finish()]);
+    await staging.mapAsync(GPUMapMode.READ);
+    const bytes = new Uint8Array(staging.getMappedRange()).slice(0, size);
+    staging.unmap();
+    return bytes;
+  }
+
+  #readbackBuffer(size: number): GPUBuffer {
+    return this.device.createBuffer({ label: "readback", size, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+  }
+
+  #destroy(handle: number): void {
+    const r = this.#resources.get(handle);
+    if (r === undefined) throw new Error(`host bug: resource ${handle} passed the checks but doesn't exist`);
+    // Recorded work may still use it: it's destroyed once that work is submitted.
+    if (r.kind === "buffer") this.#doomed.push(r.buffer);
+    if (r.kind === "texture") this.#doomed.push(r.texture);
+    this.#resources.delete(handle);
+    for (const key of this.#groupsOf.get(handle) ?? []) this.#dropBindGroup(key);
+    this.#groupsOf.delete(handle);
   }
 
   #buffer(handle: number): GPUBuffer {
-    const b = this.#buffers.get(handle);
-    if (b === undefined) throw new Error(`host bug: buffer ${handle} passed the checks but doesn't exist`);
-    return b;
+    const r = this.#resources.get(handle);
+    if (r?.kind !== "buffer") throw new Error(`host bug: buffer ${handle} passed the checks but doesn't exist`);
+    return r.buffer;
+  }
+
+  #texture(handle: number): Extract<Resource, { kind: "texture" }> {
+    const r = this.#resources.get(handle);
+    if (r?.kind !== "texture") throw new Error(`host bug: texture ${handle} passed the checks but doesn't exist`);
+    return r;
   }
 
   #pipeline(index: number): BuiltPipeline {
@@ -274,8 +596,15 @@ export class GpuExecutor {
     return [offset];
   }
 
-  #bindGroup(index: number, handles: number[]): GPUBindGroup {
-    const key = `${index}:${handles.join(",")}`;
+  #bindGroup(index: number, bindings: Binding[]): GPUBindGroup {
+    // The pipeline, then each binding's range: built in one pass, as every dispatch and draw
+    // makes one, cached or not.
+    let key = `${index}:`;
+    for (let i = 0; i < bindings.length; i++) {
+      const b = bindings[i]!;
+      if (i > 0) key += ",";
+      key += b.handle + "@" + b.offset + "+" + b.size;
+    }
     const cached = this.#bindGroups.get(key);
     if (cached !== undefined) return cached.group;
     const p = this.#pipeline(index);
@@ -283,8 +612,22 @@ export class GpuExecutor {
     if (p.uniform !== null) {
       entries.push({ binding: p.uniform.binding, resource: { buffer: this.#ring, offset: 0, size: p.uniform.size } });
     }
-    handles.forEach((h, i) => entries.push({ binding: p.buffers[i]!.binding, resource: { buffer: this.#buffer(h) } }));
+    bindings.forEach((b, i) => {
+      const r = this.#resources.get(b.handle);
+      if (r === undefined) throw new Error(`host bug: resource ${b.handle} passed the checks but doesn't exist`);
+      const resource: GPUBindingResource =
+        r.kind === "buffer"
+          ? { buffer: r.buffer, offset: b.offset, size: b.size }
+          : r.kind === "texture"
+            ? r.view
+            : r.sampler;
+      entries.push({ binding: p.bindings[i]!.binding, resource });
+    });
+    if (p.debugFlag !== null && this.#debugFlag !== null) {
+      entries.push({ binding: p.debugFlag, resource: { buffer: this.#debugFlag.buffer } });
+    }
     const group = this.device.createBindGroup({ label: p.name, layout: p.layout, entries });
+    const handles = bindings.map((b) => b.handle);
     this.#bindGroups.set(key, { group, handles });
     for (const h of handles) {
       let keys = this.#groupsOf.get(h);
@@ -301,47 +644,106 @@ export class GpuExecutor {
     for (const h of cached.handles) this.#groupsOf.get(h)?.delete(key);
   }
 
-  #dispatch(index: number, groups: [number, number, number], buffers: number[], uniforms: Bytes): void {
+  #dispatch(
+    op: OpcodeName,
+    index: number,
+    groups: [number, number, number] | { buffer: number; offset: number },
+    bindings: Binding[],
+    uniforms: Bytes,
+  ): void {
     const p = this.#pipeline(index);
     if (p.compute === null) throw new Error(`host bug: pipeline ${index} isn't a compute pipeline`);
-    this.#reserve("Dispatch", alignTo(uniforms.length, this.#align));
+    // Everything that can flush happens before anything is recorded for this dispatch.
+    this.#reserveTimestamps();
+    this.#reserve(op, alignTo(uniforms.length, this.#align));
     const offsets = this.#push(uniforms);
-    const bindGroup = this.#bindGroup(index, buffers);
-    const pass = this.#encoderNow().beginComputePass({ label: p.name });
+    const bindGroup = this.#bindGroup(index, bindings);
+    const timed = this.#timestamps(p.name);
+    const pass = this.#encoderNow().beginComputePass({ label: p.name, ...timed });
     pass.setPipeline(p.compute);
     pass.setBindGroup(0, bindGroup, offsets);
-    pass.dispatchWorkgroups(groups[0], groups[1], groups[2]);
+    if (Array.isArray(groups)) pass.dispatchWorkgroups(groups[0], groups[1], groups[2]);
+    else pass.dispatchWorkgroupsIndirect(this.#buffer(groups.buffer), groups.offset);
     pass.end();
   }
 
-  #present(): void {
-    const pass = this.#pass;
+  /** The render pipeline of `index` for these targets, made now if it isn't yet. */
+  #variant(index: number, color: GPUTextureFormat | null, depth: GPUTextureFormat | null): GPURenderPipeline {
+    const p = this.#pipeline(index);
+    if (p.render === null) throw new Error(`host bug: pipeline ${index} isn't a render pipeline`);
+    const key = targetsKey(color, depth);
+    let v = p.render.variants.get(key);
+    if (v === undefined) {
+      v = this.device.createRenderPipeline(renderDescriptor(p.name, p.render, color, depth));
+      p.render.variants.set(key, v);
+    }
+    return v;
+  }
+
+  /** Records the open pass's draws: on the screen (Present) or into textures (EndPass). */
+  #endPass(op: OpcodeName): void {
+    const open = this.#pass;
     this.#pass = null;
-    if (pass === null) throw new Error("host bug: Present without a screen pass");
+    if (open === null) throw new Error(`host bug: ${op} without a pass`);
+    const pass = open.pass;
+    const onScreen = pass.color === SCREEN;
+    const colorView = onScreen ? this.screen.texture().createView() : pass.color === NONE ? null : this.#texture(pass.color).view;
+    const colorFormat: GPUTextureFormat | null = onScreen
+      ? SCREEN_FORMAT
+      : pass.color === NONE
+        ? null
+        : this.#texture(pass.color).format;
+    const depth = pass.depth === NONE ? null : this.#texture(pass.depth);
     // Everything that can flush happens before anything is recorded for this pass.
-    this.#reserve("Present", pass.draws.reduce((n, d) => n + alignTo(d.uniforms.length, this.#align), 0));
+    this.#reserveTimestamps();
+    this.#reserve(op, open.draws.reduce((n, d) => n + alignTo(d.uniforms.length, this.#align), 0));
     // And everything that can throw: a pass begun is ended.
-    const draws = pass.draws.map((d) => {
-      const p = this.#pipeline(d.pipeline);
-      if (p.render === null) throw new Error(`host bug: pipeline ${d.pipeline} isn't a render pipeline`);
-      return { draw: d, pipeline: p.render, group: this.#bindGroup(d.pipeline, d.buffers) };
-    });
+    const draws = open.draws.map((d) => ({
+      draw: d,
+      pipeline: this.#variant(d.pipeline, colorFormat, depth?.format ?? null),
+      group: this.#bindGroup(d.pipeline, d.bindings),
+      args: "buffer" in d.how ? this.#buffer(d.how.buffer) : null,
+    }));
     const [r, g, b, a] = pass.clear;
+    const label = onScreen ? "screen pass" : "pass";
+    const timed = this.#timestamps(label);
     const encoder = this.#encoderNow();
     const rp = encoder.beginRenderPass({
-      label: "screen pass",
-      colorAttachments: [
-        { view: this.screen.texture().createView(), clearValue: { r, g, b, a }, loadOp: "clear", storeOp: "store" },
-      ],
+      label,
+      ...timed,
+      colorAttachments:
+        colorView === null
+          ? []
+          : [
+              {
+                view: colorView,
+                clearValue: { r, g, b, a },
+                loadOp: pass.keepColor ? "load" : "clear",
+                storeOp: "store",
+              },
+            ],
+      ...(depth === null
+        ? {}
+        : {
+            depthStencilAttachment: {
+              view: depth.view,
+              depthClearValue: pass.clearDepth,
+              depthLoadOp: pass.keepDepth ? "load" : "clear",
+              depthStoreOp: "store",
+            },
+          }),
     });
-    for (const { draw: d, pipeline, group } of draws) {
+    for (const { draw: d, pipeline, group, args } of draws) {
       const offsets = this.#push(d.uniforms);
       rp.setPipeline(pipeline);
       rp.setBindGroup(0, group, offsets);
-      rp.draw(d.vertices, d.instances);
+      if ("vertices" in d.how) rp.draw(d.how.vertices, d.how.instances);
+      else rp.drawIndirect(args!, d.how.offset);
     }
     rp.end();
-    this.screen.afterPass?.(encoder);
-    this.flush();
+    if (onScreen) {
+      this.screen.afterPass?.(encoder);
+      this.flush();
+    }
   }
 }

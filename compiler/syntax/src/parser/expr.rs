@@ -2,7 +2,7 @@
 
 use super::{Failed, PResult, Parser, describe};
 use crate::ast::*;
-use crate::lexer::{float_value, int_value};
+use crate::lexer::{float_value, fstring_segment, int_value};
 use crate::token::{Token, TokenKind as T};
 use wrela_diag::{Diagnostic, Span, codes};
 
@@ -16,7 +16,7 @@ pub(crate) enum Ctx {
 
 impl<'a> Parser<'a> {
     /// The literal a token is: a number, a string, `true` or `false`.
-    fn lit_of(&self, t: Token) -> Lit {
+    pub(crate) fn lit_of(&self, t: Token) -> Lit {
         let text = self.text_of(t.span);
         let kind = match t.kind {
             T::Int => LitKind::Int(int_value(text)),
@@ -129,9 +129,41 @@ impl<'a> Parser<'a> {
                 self.expect_bind_eq()?;
                 // A value that fails to parse leaves the binding, so its uses still resolve.
                 let init = self.expr_or_error(Self::parse_expr);
-                StmtKind::Let { pat, ty, init }
+                let else_ = if self.at(T::Else) {
+                    if !let_else_shaped(&init) {
+                        let t = self.tok();
+                        self.error(
+                            Diagnostic::new(
+                                codes::E0100,
+                                t.span,
+                                "in `let … else`, the value can't end with `}` or be an operator's result",
+                            )
+                            .with_note("`else` would be read as the value's own (L23)")
+                            .with_fix_edits(
+                                "wrap the value in parentheses",
+                                vec![
+                                    wrela_diag::Edit {
+                                        span: init.span.shrink_to_start(),
+                                        replacement: "(".into(),
+                                    },
+                                    wrela_diag::Edit {
+                                        span: init.span.shrink_to_end(),
+                                        replacement: ")".into(),
+                                    },
+                                ],
+                            ),
+                        );
+                        return Err(Failed);
+                    }
+                    self.bump();
+                    Some(self.parse_block()?)
+                } else {
+                    None
+                };
+                StmtKind::Let { pat, ty, init, else_ }
             }
             T::Var => self.parse_named_bind(VarKind::Var)?,
+            T::Borrow => self.parse_named_bind(VarKind::Borrow)?,
             T::Mut if self.nth(1) == T::Ident && matches!(self.nth(2), T::Eq | T::Colon) => {
                 self.parse_named_bind(VarKind::Mut)?
             }
@@ -150,13 +182,30 @@ impl<'a> Parser<'a> {
                 let mutable = self.eat(T::Mut);
                 let pat = self.parse_pattern()?;
                 self.expect(T::In, "`in`")?;
-                let first = self.parse_expr_ctx(Ctx::NoStruct)?;
-                let iter = if self.at(T::DotDot) || self.at(T::DotDotEq) {
+                // `for i in (0..n).rev()`, as in Rust: a range counts up.
+                let iter = if self.at(T::LParen) && self.reversed_range_ahead() {
+                    let open = self.bump().span;
+                    let start = self.parse_expr_ctx(Ctx::NoStruct)?;
                     let inclusive = self.bump().kind == T::DotDotEq;
                     let end = self.parse_expr_ctx(Ctx::NoStruct)?;
-                    ForIter::Range { start: first, end, inclusive }
+                    for _ in 0..5 {
+                        self.bump(); // `)`, `.`, `rev`, `(`, `)`
+                    }
+                    self.error(
+                        Diagnostic::new(codes::E0100, open.to(self.prev_span()), "a range counts up: wrela has no `.rev()`")
+                            .with_note("ranges are only `for` loops' `a..b` and `a..=b`, counting up; wrela has no iterators")
+                            .with_help("count up and turn it around: `for k in 0..n { let i = n - 1 - k ... }`"),
+                    );
+                    ForIter::Range { start, end, inclusive }
                 } else {
-                    ForIter::Expr(first)
+                    let first = self.parse_expr_ctx(Ctx::NoStruct)?;
+                    if self.at(T::DotDot) || self.at(T::DotDotEq) {
+                        let inclusive = self.bump().kind == T::DotDotEq;
+                        let end = self.parse_expr_ctx(Ctx::NoStruct)?;
+                        ForIter::Range { start: first, end, inclusive }
+                    } else {
+                        ForIter::Expr(first)
+                    }
                 };
                 let body = self.parse_block()?;
                 StmtKind::For { mutable, pat, iter, body }
@@ -251,7 +300,45 @@ impl<'a> Parser<'a> {
 
     /// ("var" | "mut") IDENT (":" type)? "=" expr
     fn parse_named_bind(&mut self, kind: VarKind) -> PResult<StmtKind> {
-        self.bump();
+        let kw = self.bump();
+        // `var (a, b) = ...`: `var` binds one name. Two `var`s, when the value is a tuple.
+        if self.at(T::LParen) {
+            let open = self.bump().span;
+            let names = self.list(T::RParen, |p| p.ident("a name"), |p, first, _| p.name_at(first));
+            self.close_list(T::RParen, "`,` or `)`");
+            let close = self.prev_span();
+            self.expect_bind_eq()?;
+            let init = self.expr_or_error(Self::parse_expr);
+            let word = self.text_of(kw.span).to_string();
+            let mut d = Diagnostic::new(
+                codes::E0100,
+                open.to(close),
+                format!("`{word}` binds one name, not a tuple's parts"),
+            )
+            .with_note("`let (a, b) = t` binds each part to read; a variable is one name");
+            if let ExprKind::Tuple(parts) = &init.kind
+                && parts.len() == names.len()
+            {
+                let line = self.text[..kw.span.start as usize].rsplit('\n').next().unwrap_or("");
+                let indent: String = line.chars().take_while(|c| c.is_whitespace()).collect();
+                let lines: Vec<String> = names
+                    .iter()
+                    .zip(parts)
+                    .map(|(n, e)| format!("{word} {} = {}", n.name, self.text_of(e.span)))
+                    .collect();
+                d = d.with_fix(
+                    format!("a `{word}` for each"),
+                    kw.span.to(init.span),
+                    lines.join(&format!("\n{indent}")),
+                );
+            } else {
+                d = d.with_help(format!(
+                    "bind the tuple with `let`, then each part with `{word} a = t.0`"
+                ));
+            }
+            self.error(d);
+            return Ok(StmtKind::Expr(Expr::error(kw.span.to(init.span))));
+        }
         let name = self.ident("a name")?;
         let ty = self.opt_colon_type()?;
         self.expect_bind_eq()?;
@@ -308,6 +395,9 @@ impl<'a> Parser<'a> {
                 | T::Float
                 | T::Suffixed
                 | T::Str
+                | T::FString
+                | T::FStringHead
+                | T::Unsafe
                 | T::True
                 | T::False
                 | T::SelfValue
@@ -339,6 +429,24 @@ impl<'a> Parser<'a> {
                 T::Pipe,
                 |p| {
                     let name = p.ident("a closure parameter")?;
+                    // `|x: mut f32|`: the mode is the function type's, not the closure's.
+                    if p.at(T::Colon) && matches!(p.nth(1), T::Mut | T::Take | T::Borrow) {
+                        let kw = p.token_at(1).span;
+                        let end = p.token_at(2).span.start;
+                        p.error(
+                            Diagnostic::new(
+                                codes::E0100,
+                                kw,
+                                format!("a closure parameter has no mode of its own: `{}` comes from the function type it's passed as", p.text_of(kw)),
+                            )
+                            .with_note("a closure called through `fn(mut T)` takes its argument as `mut` already (§6.7)")
+                            .with_fix("remove it", Span::new(kw.file, kw.start, end), ""),
+                        );
+                        p.bump();
+                        p.bump();
+                        let ty = p.parse_type()?;
+                        return Ok(ClosureParam { name, ty: Some(ty) });
+                    }
                     let ty = p.opt_colon_type()?;
                     Ok(ClosureParam { name, ty })
                 },
@@ -349,14 +457,41 @@ impl<'a> Parser<'a> {
             );
             self.close_list(T::Pipe, "`,` or `|`");
         }
-        let (ret, body) = if self.eat(T::Arrow) {
-            let ty = self.parse_type()?;
-            let b = self.parse_block()?;
-            let span = b.span;
-            (Some(ty), Expr::new(ExprKind::Block(b), span))
-        } else {
-            (None, self.parse_expr()?)
-        };
+        let (ret, body) =
+            if self.eat(T::Arrow) {
+                let ty = self.parse_type()?;
+                let b = self.parse_block()?;
+                let span = b.span;
+                (Some(ty), Expr::new(ExprKind::Block(b), span))
+            } else {
+                let body = self.parse_expr()?;
+                match AssignOp::from_token(self.kind()) {
+                    // `|x| total += x`: an assignment is a statement, and a closure's body without
+                    // braces is an expression. Reported, and read as the block it needs.
+                    Some(op) if is_postfix_shaped(&body) => {
+                        let at = self.bump().span;
+                        let value = self.parse_expr()?;
+                        let whole = body.span.to(value.span);
+                        let text = self.text_of(whole).to_string();
+                        self.error(
+                        Diagnostic::new(
+                            codes::E0110,
+                            at,
+                            "a closure's body is an expression, and an assignment is a statement",
+                        )
+                        .with_note("without braces, a closure's body is the value it returns")
+                        .with_fix("put the assignment in a block", whole, format!("{{ {text} }}")),
+                    );
+                        let stmt = Stmt {
+                            kind: StmtKind::Assign { target: body, op, value },
+                            span: whole,
+                        };
+                        let block = Block { stmts: vec![stmt], span: whole };
+                        (None, Expr::new(ExprKind::Block(block), whole))
+                    }
+                    _ => (None, body),
+                }
+            };
         Ok(Expr::new(
             ExprKind::Closure { params, ret, body: Box::new(body) },
             start.to(self.prev_span()),
@@ -444,11 +579,13 @@ impl<'a> Parser<'a> {
         Ok(lhs)
     }
 
-    /// unary_expr ::= ("-" | "!" | "take" | "mut") unary_expr | power_expr
+    /// unary_expr ::= ("-" | "!" | "take" | "mut") unary_expr | power_expr; in the heads of
+    /// `if`, `while`, `for` and `match` (unary_expr_ns), without `mut`, so that `match mut x`
+    /// has one reading.
     fn parse_unary(&mut self, ctx: Ctx) -> PResult<Expr> {
         let start = self.span();
         let kind = self.kind();
-        if matches!(kind, T::Minus | T::Bang | T::Take | T::Mut) {
+        if matches!(kind, T::Minus | T::Bang | T::Take) || (kind == T::Mut && ctx == Ctx::Full) {
             self.bump();
             let inner = Box::new(self.nested(|p| p.parse_unary(ctx))?);
             let span = start.to(inner.span);
@@ -523,16 +660,10 @@ impl<'a> Parser<'a> {
                     after_field = false;
                 }
                 T::Question => {
-                    // `?` is tier 1: say so, and read on as if it weren't there.
                     let q = self.bump();
-                    self.error(
-                        Diagnostic::new(
-                            codes::E0902,
-                            q.span,
-                            "`?` and `Result` are tier 1, so errors can't be propagated yet",
-                        )
-                        .with_help("match on the value instead"),
-                    );
+                    let span = e.span.to(q.span);
+                    e = Expr::new(ExprKind::Try(Box::new(e)), span);
+                    after_field = false;
                 }
                 T::LBracket => {
                     self.bump();
@@ -607,13 +738,157 @@ impl<'a> Parser<'a> {
                             e = Expr::new(ExprKind::Field { base: Box::new(e), name }, span);
                             after_field = true;
                         }
+                        // `x.take()`, Rust's `Option::take`: `take` is a keyword.
+                        T::Take if self.nth(1) == T::LParen && self.nth(2) == T::RParen => {
+                            let kw = self.bump().span;
+                            self.bump();
+                            let close = self.bump().span;
+                            let span = e.span.to(close);
+                            let recv = self.text_of(e.span).to_string();
+                            self.error(
+                                Diagnostic::new(
+                                    codes::E0207,
+                                    kw,
+                                    "`.take()` isn't a method in wrela: `take` moves a value out of a place",
+                                )
+                                .with_note("to take an `Option`'s value and leave `None`, swap `None` in")
+                                .with_fix(
+                                    format!("write `replace(mut {recv}, None)`"),
+                                    span,
+                                    format!("replace(mut {recv}, None)"),
+                                ),
+                            );
+                            e = Expr::error(span);
+                            after_field = false;
+                        }
                         _ => return Err(self.expected("a field or method name after `.`")),
                     }
+                }
+                // `name!(...)`: a Rust macro.
+                T::Bang
+                    if self.tok().span.start == e.span.end
+                        && matches!(self.nth(1), T::LParen | T::LBracket)
+                        && matches!(&e.kind, ExprKind::Path(p) if p.segments.len() == 1) =>
+                {
+                    e = self.macro_call(e)?;
+                    after_field = false;
                 }
                 _ => break,
             }
         }
         Ok(e)
+    }
+
+    /// Whether the tokens from here are `( a .. b ).rev()` (`..=` too), at bracket depth 0.
+    fn reversed_range_ahead(&self) -> bool {
+        let mut depth = 0i32;
+        let mut range = false;
+        for k in 0..256 {
+            match self.nth(k) {
+                T::LParen | T::LBracket | T::LBrace => depth += 1,
+                T::RParen | T::RBracket | T::RBrace => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return range
+                            && self.nth(k + 1) == T::Dot
+                            && self.text_of(self.token_at(k + 2).span) == "rev"
+                            && self.nth(k + 3) == T::LParen
+                            && self.nth(k + 4) == T::RParen;
+                    }
+                }
+                T::DotDot | T::DotDotEq if depth == 1 => range = true,
+                T::Eof | T::Newline => return false,
+                _ => {}
+            }
+        }
+        false
+    }
+
+    /// `name!(...)` or `name![...]`, a Rust macro: E0115, with the call wrela writes instead
+    /// where there is one (`format!` is an f-string, `println!` a `print` of one). Read as an
+    /// error expression. A fix is made of the arguments' text, so there's none when they have
+    /// a syntax error: recovery skipped tokens that the fix would drop.
+    fn macro_call(&mut self, e: Expr) -> PResult<Expr> {
+        let ExprKind::Path(path) = &e.kind else { return Err(Failed) };
+        let name = path.segments[0].ident.name.clone();
+        let bang = self.bump().span;
+        let errors = self.syntax_errors;
+        // `name![...]` reads as an array, which is what `vec!` takes: `[a, b]` or `[x; n]`.
+        let (args, array) = if self.at(T::LParen) {
+            (self.parse_call_args()?.0.into_iter().map(|a| a.value).collect(), None)
+        } else {
+            let a = self.parse_primary(Ctx::Full)?;
+            let items =
+                if let ExprKind::Array(items) = &a.kind { items.clone() } else { Vec::new() };
+            (items, Some(a))
+        };
+        let span = e.span.to(self.prev_span());
+        let at = e.span.to(bang);
+        let texts: Option<Vec<String>> = (self.syntax_errors == errors)
+            .then(|| args.iter().map(|a| self.text_of(a.span).to_string()).collect());
+        let d = Diagnostic::new(
+            codes::E0115,
+            at,
+            format!("`{name}!` is a macro, and wrela has no macros"),
+        );
+        let fstring = || -> Option<String> {
+            let t = texts.as_deref()?;
+            f_string(t.first()?, &t[1..])
+        };
+        let mut print_fix = false;
+        let d = match name.as_str() {
+            "format" => match fstring() {
+                Some(f) => d.with_fix("write an f-string", span, f),
+                None => d.with_help("write an f-string: `f\"{a} and {b}\"`"),
+            },
+            "println" | "print" | "eprintln" | "eprint" => {
+                let d = d.with_note("a wrela program has no console of its own; `std::io::print` shows a line on the host's (§6.15)");
+                match fstring() {
+                    // The import is added once the module's names are known (`settle_print_fixes`).
+                    Some(f) => {
+                        print_fix = true;
+                        d.with_fix("print it with `std::io::print`", span, format!("print({f})"))
+                    }
+                    None => d.with_help("print it: `print(f\"{x}\")`, with `use std::io::print`"),
+                }
+            }
+            "panic" => match fstring() {
+                Some(f) => d.with_fix("call `panic`", span, format!("panic({f})")),
+                None => d.with_help("call `panic(message)`"),
+            },
+            "assert" => match texts.as_deref() {
+                Some([c]) => d.with_fix("call `assert`", span, format!("assert({c}, {:?})", format!("{c} is false"))),
+                Some([c, rest @ ..]) => match f_string(&rest[0], &rest[1..]) {
+                    Some(f) => d.with_fix("call `assert`", span, format!("assert({c}, {f})")),
+                    None => d.with_help("call `assert(condition, message)`"),
+                },
+                _ => d.with_help("call `assert(condition, message)`"),
+            },
+            "assert_eq" | "assert_ne" => match texts.as_deref() {
+                Some([a, b]) => {
+                    let op = if name == "assert_eq" { "==" } else { "!=" };
+                    let msg = format!("{a} {op} {b} is false");
+                    d.with_fix("call `assert`", span, format!("assert({a} {op} {b}, {msg:?})"))
+                }
+                _ => d.with_help("call `assert(a == b, message)`"),
+            },
+            "vec" if array.is_some() => match array.as_ref().map(|a| &a.kind) {
+                Some(ExprKind::Array(_)) if texts.is_some() => {
+                    let a = array.as_ref().map_or("", |a| self.text_of(a.span));
+                    d.with_fix("make a `Vec` from an array", span, format!("Vec::from({a})"))
+                }
+                // An array repeats only a `Copy` value, a constant number of times.
+                Some(ExprKind::ArrayRepeat { .. }) => d.with_help("for `n` copies of `x`, push them in a loop; when `x` is `Copy` and `n` is a constant, `Vec::from([x; n])`"),
+                _ => d.with_help("make a `Vec` from an array: `Vec::from([a, b])`"),
+            },
+            _ => d.with_help("write the code the macro would: wrela has functions, generics and `@fieldwise` derivation instead"),
+        };
+        let index = self.diags.len();
+        self.error(d);
+        if print_fix && self.diags.len() > index {
+            self.print_fixes.push(index);
+        }
+        Ok(Expr::error(span))
     }
 
     /// call_args ::= "(" args? ")"; positional arguments come before named ones.
@@ -670,16 +945,16 @@ impl<'a> Parser<'a> {
                 self.bump();
                 Ok(Expr::new(ExprKind::Lit(self.lit_of(t)), t.span))
             }
-            T::Unsafe if self.nth(1) == T::LBrace => {
-                // `unsafe` is for the stdlib's core, in tier 1: say so, and read the block.
+            T::FString | T::FStringHead => self.parse_fstring(),
+            T::Unsafe => {
+                // unsafe_block ::= "unsafe" block
                 let u = self.bump();
-                self.error(
-                    Diagnostic::new(codes::E0904, u.span, "`unsafe` is tier 1")
-                        .with_note("only the stdlib's core will use it (language.md §6.14)"),
-                );
+                if !self.at(T::LBrace) {
+                    return Err(self.expected("`{` after `unsafe`"));
+                }
                 let b = self.parse_block()?;
                 let span = u.span.to(b.span);
-                Ok(Expr::new(ExprKind::Block(b), span))
+                Ok(Expr::new(ExprKind::Unsafe(b), span))
             }
             T::Ident | T::SelfType | T::SelfValue => {
                 let path = self.parse_path_expr()?;
@@ -750,6 +1025,36 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// fstring ::= FSTRING | FSTRING_HEAD expr (FSTRING_MID expr)* FSTRING_TAIL
+    fn parse_fstring(&mut self) -> PResult<Expr> {
+        let first = self.bump();
+        let mut parts = Vec::new();
+        let (_, text) = fstring_segment(self.text_of(first.span));
+        if !text.is_empty() {
+            parts.push(FPart::Text(text));
+        }
+        if first.kind == T::FStringHead {
+            loop {
+                let expr = self.parse_expr()?;
+                let seg = self.tok();
+                if !matches!(seg.kind, T::FStringMid | T::FStringTail) {
+                    return Err(self.expected("`}` to close the f-string's hole"));
+                }
+                self.bump();
+                let (spec, text) = fstring_segment(self.text_of(seg.span));
+                let span = expr.span;
+                parts.push(FPart::Hole { expr, spec, span });
+                if !text.is_empty() {
+                    parts.push(FPart::Text(text));
+                }
+                if seg.kind == T::FStringTail {
+                    break;
+                }
+            }
+        }
+        Ok(Expr::new(ExprKind::FString(parts), first.span.to(self.prev_span())))
+    }
+
     /// path_expr ::= expr_segment ("::" expr_segment)*;
     /// expr_segment ::= IDENT ("::" generic_args)? | "Self" | "self"
     fn parse_path_expr(&mut self) -> PResult<Path> {
@@ -817,9 +1122,16 @@ impl<'a> Parser<'a> {
         Ok(Expr::new(ExprKind::StructLit { path, fields, base, multiline }, span))
     }
 
-    /// if_expr ::= "if" expr_ns block ("else" (if_expr | block))?
+    /// if_expr ::= "if" ("let" pattern "=")? expr_ns block ("else" (if_expr | block))?
     fn parse_if(&mut self) -> PResult<Expr> {
         let start = self.expect(T::If, "`if`")?.span;
+        let pat = if self.eat(T::Let) {
+            let pat = self.parse_pattern()?;
+            self.expect(T::Eq, "`=`")?;
+            Some(Box::new(pat))
+        } else {
+            None
+        };
         let cond = self.parse_expr_ctx(Ctx::NoStruct)?;
         if !self.at(T::LBrace) {
             return Err(self.expected("`{` to start the `if` body"));
@@ -853,14 +1165,15 @@ impl<'a> Parser<'a> {
             None
         };
         Ok(Expr::new(
-            ExprKind::If { cond: Box::new(cond), then, else_ },
+            ExprKind::If { pat, cond: Box::new(cond), then, else_ },
             start.to(self.prev_span()),
         ))
     }
 
-    /// match_expr ::= "match" expr_ns "{" (arm (arm_sep arm)* arm_sep?)? "}"
+    /// match_expr ::= "match" "mut"? expr_ns "{" (arm (arm_sep arm)* arm_sep?)? "}"
     fn parse_match(&mut self) -> PResult<Expr> {
         let start = self.expect(T::Match, "`match`")?.span;
+        let mutable = self.eat(T::Mut);
         let scrutinee = self.parse_expr_ctx(Ctx::NoStruct)?;
         self.expect(T::LBrace, "`{`")?;
         let mut arms = Vec::new();
@@ -875,7 +1188,26 @@ impl<'a> Parser<'a> {
                 let guard =
                     if self.eat(T::If) { Some(self.parse_expr_ctx(Ctx::NoStruct)?) } else { None };
                 self.expect(T::FatArrow, "`=>`")?;
-                let body = self.parse_expr()?;
+                // arm ::= ... "=>" (expr | postfix_expr assign_op expr)
+                let mut body = self.parse_expr()?;
+                if let Some(op) = AssignOp::from_token(self.kind()) {
+                    if !is_postfix_shaped(&body) {
+                        let t = self.tok();
+                        self.error(Diagnostic::new(
+                            codes::E0100,
+                            t.span,
+                            "only a name, a field, an element or a call result can be assigned to",
+                        ));
+                        return Err(Failed);
+                    }
+                    self.bump();
+                    let value = self.parse_expr()?;
+                    let span = body.span.to(value.span);
+                    body = Expr::new(
+                        ExprKind::Assign { target: Box::new(body), op, value: Box::new(value) },
+                        span,
+                    );
+                }
                 Ok(Arm { pats, guard, body, span: arm_start.to(self.prev_span()) })
             })();
             match arm {
@@ -896,7 +1228,7 @@ impl<'a> Parser<'a> {
         self.closers.pop();
         self.close_list(T::RBrace, "`,`, a line break or `}`");
         Ok(Expr::new(
-            ExprKind::Match { scrutinee: Box::new(scrutinee), arms },
+            ExprKind::Match { mutable, scrutinee: Box::new(scrutinee), arms },
             start.to(self.prev_span()),
         ))
     }
@@ -925,7 +1257,7 @@ impl<'a> Parser<'a> {
                 self.bump();
                 PatKind::Lit { neg, lit: self.lit_of(lt) }
             }
-            T::True | T::False => {
+            T::True | T::False | T::Str => {
                 self.bump();
                 PatKind::Lit { neg: false, lit: self.lit_of(t) }
             }
@@ -988,6 +1320,37 @@ impl<'a> Parser<'a> {
     }
 }
 
+/// Whether an expression can be the value of a `let … else` (L23): let_else_init ::= ("-" |
+/// "!" | "take" | "mut") let_else_init | let_else_primary postfixes, where let_else_primary ::=
+/// literal | path_expr | paren_expr | array_expr. Nothing in it ends with `}`, so the `else`
+/// after it is the `let`'s.
+fn let_else_shaped(e: &Expr) -> bool {
+    match &e.kind {
+        ExprKind::Unary(_, x) | ExprKind::Take(x) | ExprKind::MutArg(x) => let_else_shaped(x),
+        _ => {
+            let mut base = e;
+            while let ExprKind::Call { callee: b, .. }
+            | ExprKind::MethodCall { receiver: b, .. }
+            | ExprKind::Field { base: b, .. }
+            | ExprKind::Index { base: b, .. }
+            | ExprKind::Try(b) = &base.kind
+            {
+                base = b;
+            }
+            matches!(
+                base.kind,
+                ExprKind::Lit(_)
+                    | ExprKind::FString(_)
+                    | ExprKind::Path(_)
+                    | ExprKind::Paren(_)
+                    | ExprKind::Tuple(_)
+                    | ExprKind::Array(_)
+                    | ExprKind::ArrayRepeat { .. }
+            )
+        }
+    }
+}
+
 /// The grammar's assignment target is a postfix_expr: a primary followed by postfixes.
 fn is_postfix_shaped(e: &Expr) -> bool {
     !matches!(
@@ -1000,5 +1363,73 @@ fn is_postfix_shaped(e: &Expr) -> bool {
             | ExprKind::Return(_)
             | ExprKind::Break
             | ExprKind::Continue
+            | ExprKind::Assign { .. }
     )
+}
+
+/// A Rust format string and its arguments (as written) as a wrela f-string: `{}` takes the
+/// next argument, `{name}` and `{0}` name one, `:?` is dropped, and a spec wrela has is kept. `None` when it
+/// doesn't fit an f-string (another format spec, an argument with quotes or braces).
+fn f_string(literal: &str, args: &[String]) -> Option<String> {
+    let inner = literal.strip_prefix('"')?.strip_suffix('"')?;
+    if args.iter().any(|a| a.contains(['"', '{', '}', '\n'])) {
+        return None;
+    }
+    let mut out = String::from("f\"");
+    let mut next = 0;
+    let mut chars = inner.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '{' if chars.peek() == Some(&'{') => {
+                chars.next();
+                out.push_str("{{");
+            }
+            '}' if chars.peek() == Some(&'}') => {
+                chars.next();
+                out.push_str("}}");
+            }
+            '{' => {
+                let mut hole = String::new();
+                for c in chars.by_ref() {
+                    if c == '}' {
+                        break;
+                    }
+                    hole.push(c);
+                }
+                let (what, spec) = match hole.split_once(':') {
+                    Some((w, s)) => (w, Some(s)),
+                    None => (hole.as_str(), None),
+                };
+                let value = if what.is_empty() {
+                    let v = args.get(next)?.clone();
+                    next += 1;
+                    v
+                } else if let Ok(i) = what.parse::<usize>() {
+                    args.get(i)?.clone()
+                } else {
+                    what.to_string()
+                };
+                let spec = match spec {
+                    None | Some("?") | Some("") => String::new(),
+                    Some(s) if crate::lexer::parse_spec(s).is_ok() => format!(":{s}"),
+                    Some(_) => return None,
+                };
+                out.push('{');
+                out.push_str(&value);
+                out.push_str(&spec);
+                out.push('}');
+            }
+            '}' => return None,
+            c => out.push(c),
+        }
+    }
+    if next < args.len() && inner.contains("{}") {
+        return None;
+    }
+    out.push('"');
+    // A plain string needs no `f`.
+    if !out.contains('{') {
+        out.remove(0);
+    }
+    Some(out)
 }

@@ -1,22 +1,44 @@
 //! The compiler's end-to-end tests, in one binary: each module is one suite (see its docs).
 
+mod audio;
+mod bounds;
 mod buffers;
+mod channels;
+mod closed_list;
 mod codes;
 mod conformance;
 mod derive;
 mod diagnostics;
 mod doc_examples;
+mod encodings;
+mod explain;
+mod format;
 mod fuzz;
+mod gpu_limits;
 mod grazer;
 mod hello_field;
 mod language;
 mod limits;
+mod lipschitz;
 mod math;
+mod noise;
 mod numerics;
+mod parallel;
+mod queries;
 mod render;
+mod renderer;
 mod reproducible;
+mod requests;
 mod run_pass;
+mod simd;
+mod sketches;
+mod snapshots;
+mod spike13;
+mod stage;
+mod std_docs;
+mod test_items;
 mod warnings;
+mod workgroup;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;

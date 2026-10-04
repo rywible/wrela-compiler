@@ -1,0 +1,6 @@
+// mistake: comparing a distance with an angle
+// expect: E0305
+// fix: no
+fn near(d: f32) -> bool {
+    1.5km < 30deg
+}

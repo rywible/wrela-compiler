@@ -1,0 +1,11 @@
+// accepts: trait.diagnostic
+@diagnostic("`{Self}` can't be simulated")
+trait SimState {}
+
+impl SimState for f32 {}
+
+fn tick<S: SimState>(s: S) {}
+
+fn f(x: f32) {
+    tick(x)
+}

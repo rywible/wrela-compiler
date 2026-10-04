@@ -1,0 +1,26 @@
+// rejects: trait.sets
+use std::hash::StateHash
+
+trait Loop = Clone + Again //~ E0418
+
+trait Again = Loop
+
+trait Hashed = Clone + StateHash
+
+struct Raw {
+    bits: u32,
+}
+
+impl Hashed for Raw {} //~ E0419
+
+struct Holder {
+    h: Hashed, //~ E0410
+}
+
+struct Cell: Clone {
+    bits: u32,
+}
+
+struct Kept: Hashed {
+    cell: Cell, //~ E0417
+}

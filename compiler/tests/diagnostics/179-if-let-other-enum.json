@@ -1,0 +1,26 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0320",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "a `Mood` pattern can't match a `Option<Mood>`",
+      "notes": [],
+      "severity": "error",
+      "span": {
+        "column": 12,
+        "end": 172,
+        "end_column": 22,
+        "end_line": 10,
+        "line": 10,
+        "start": 162
+      },
+      "title": "a pattern that doesn't match the type"
+    }
+  ],
+  "version": 2
+}

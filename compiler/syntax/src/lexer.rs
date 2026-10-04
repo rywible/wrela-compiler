@@ -3,7 +3,7 @@
 
 use crate::ast::IntValue;
 use crate::token::{Comment, Token, TokenKind};
-use wrela_diag::{Diagnostic, FileId, Span, codes};
+use wrela_diag::{Diagnostic, Edit, FileId, Span, codes};
 
 /// The lexer's output: tokens (NEWLINEs inserted, EOF last), comments and diagnostics.
 #[derive(Debug, Default)]
@@ -11,13 +11,23 @@ pub struct Lexed {
     pub tokens: Vec<Token>,
     pub comments: Vec<Comment>,
     pub diagnostics: Vec<Diagnostic>,
+    /// Where each lifetime (`'a`, E0114) was, which makes no token: the parser offers a
+    /// `borrow struct` for a struct that had one.
+    pub lifetimes: Vec<Span>,
 }
 
 const TYPE_SUFFIXES: &[&str] =
     &["i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64", "f32", "f64"];
 
 pub fn lex(file: FileId, text: &str) -> Lexed {
-    let mut lx = Lexer { file, src: text.as_bytes(), text, pos: 0, out: Lexed::default() };
+    let mut lx = Lexer {
+        file,
+        src: text.as_bytes(),
+        text,
+        pos: 0,
+        out: Lexed::default(),
+        holes: Vec::new(),
+    };
     lx.run();
     let mut lexed = lx.out;
     lexed.tokens = insert_newlines(lexed.tokens, file);
@@ -30,6 +40,9 @@ struct Lexer<'a> {
     text: &'a str,
     pos: usize,
     out: Lexed,
+    /// The f-string holes open (L22), innermost last: each with where it opened and how many
+    /// brackets are open inside it.
+    holes: Vec<(usize, u32)>,
 }
 
 fn is_ident_start(b: u8) -> bool {
@@ -84,11 +97,13 @@ impl<'a> Lexer<'a> {
             match b {
                 b' ' | b'\t' => self.pos += 1,
                 b'\n' => {
+                    self.unclosed_holes();
                     self.pos += 1;
                     line_break = true;
                     line_has_token = false;
                 }
                 b'\r' => {
+                    self.unclosed_holes();
                     self.pos += 1;
                     if self.peek(0) == Some(b'\n') {
                         self.pos += 1;
@@ -129,6 +144,7 @@ impl<'a> Lexer<'a> {
                 }
             }
         }
+        self.unclosed_holes();
         let end = self.src.len();
         self.out.tokens.push(Token {
             kind: TokenKind::Eof,
@@ -204,11 +220,115 @@ impl<'a> Lexer<'a> {
         had_break
     }
 
+    /// Whether the `'` here starts what Rust calls a character literal, `'a'`: a quote closes
+    /// it on the same line.
+    fn char_literal(&self) -> bool {
+        let mut i = self.pos + 1;
+        while self.src.get(i).is_some_and(|&b| is_ident_continue(b)) {
+            i += 1;
+        }
+        self.src.get(i) == Some(&b'\'')
+    }
+
+    /// A lifetime, as Rust writes one (`'a`), or a loop label (`'outer`): E0114, and no token.
+    /// A lifetime's fix removes it, with the brackets or the comma it leaves behind (those
+    /// make no token either, so the parser sees what the fix would leave); a struct whose
+    /// only parameters are lifetimes holds projections, so its fix makes it a `borrow struct`.
+    fn lifetime(&mut self) {
+        let start = self.pos;
+        self.pos += 1;
+        while self.peek(0).is_some_and(is_ident_continue) {
+            self.pos += 1;
+        }
+        let end = self.pos;
+        let name = &self.text[start..end];
+        let sp = self.span(start, end);
+        self.out.lifetimes.push(sp);
+        let spaces = |from: usize| {
+            let mut i = from;
+            while matches!(self.src.get(i), Some(b' ' | b'\t')) {
+                i += 1;
+            }
+            i
+        };
+        let after = spaces(end);
+        let prev = self.out.tokens.last().map(|t| (t.kind, t.span));
+        let label = matches!(prev, Some((TokenKind::Break | TokenKind::Continue, _)))
+            || (self.src.get(after) == Some(&b':')
+                && self.text[spaces(after + 1)..].starts_with(['l', 'f', 'w']));
+        if label {
+            // `'outer: loop`: the `:` goes with it.
+            if self.src.get(after) == Some(&b':') {
+                self.pos = after + 1;
+            }
+            self.error(
+                Diagnostic::new(codes::E0114, sp, format!("`{name}` is a loop label, which wrela doesn't have"))
+                    .with_note("`break` and `continue` leave the innermost loop")
+                    .with_help("move the inner loop into a function that returns, or set a flag the outer loop checks"),
+            );
+            return;
+        }
+        let d = Diagnostic::new(codes::E0114, sp, format!("`{name}` is a lifetime, which wrela doesn't have"))
+            .with_note("wrela has no references, so nothing needs a lifetime: a parameter reads its argument in place, and a projection lives as long as the call that made it (§6.4)");
+        let d = match (prev, self.src.get(after)) {
+            // `<'a>`: the brackets go too. On a struct, it holds projections.
+            (Some((TokenKind::Lt, lt)), Some(b'>')) => {
+                self.out.tokens.pop();
+                self.pos = after + 1;
+                let whole = self.span(lt.start as usize, self.pos);
+                let n = self.out.tokens.len();
+                let is_struct = n >= 2
+                    && self.out.tokens[n - 2].kind == TokenKind::Struct
+                    && self.out.tokens[n - 1].kind == TokenKind::Ident;
+                if is_struct {
+                    let kw = self.out.tokens[n - 2].span;
+                    d.with_help("a struct that holds projections is a `borrow struct` (§6.6)")
+                        .with_fix_edits(
+                            "make it a `borrow struct`",
+                            vec![
+                                Edit { span: kw, replacement: "borrow struct".into() },
+                                Edit { span: whole, replacement: String::new() },
+                            ],
+                        )
+                } else {
+                    d.with_fix("remove it", whole, "")
+                }
+            }
+            // `<'a, T>`: the comma after it goes too.
+            (Some((TokenKind::Lt, _)), Some(b',')) => {
+                self.pos = spaces(after + 1);
+                d.with_fix("remove it", self.span(start, self.pos), "")
+            }
+            // `<T, 'a>`: the comma before it goes too.
+            (Some((TokenKind::Comma, comma)), _) => {
+                self.out.tokens.pop();
+                d.with_fix("remove it", self.span(comma.start as usize, end), "")
+            }
+            // `&'a T`: it, and the space after it.
+            _ => d.with_fix("remove it", self.span(start, after), ""),
+        };
+        self.error(d);
+    }
+
     /// Lexes the token at the current position. Returns whether it made one: a run of
     /// characters that can't appear here (L3) is reported and skipped.
     fn token(&mut self, line_break_before: bool) -> bool {
         let start = self.pos;
         let b = self.src[self.pos];
+        // L22: in an f-string's hole, outside brackets, `}` ends the hole and `:` starts its
+        // format spec.
+        if let Some(&(_, 0)) = self.holes.last()
+            && (b == b'}' || (b == b':' && self.peek(1) != Some(b':')))
+        {
+            self.hole_end(line_break_before);
+            return true;
+        }
+        if b == b'f' && self.peek(1) == Some(b'"') {
+            self.pos += 2;
+            let kind = self.fstring_text(start, true);
+            self.push(kind, start, line_break_before);
+            return true;
+        }
         if b == b'_' && !self.peek(1).is_some_and(is_ident_continue) {
             self.pos += 1;
             self.push(TokenKind::Underscore, start, line_break_before);
@@ -220,8 +340,20 @@ impl<'a> Lexer<'a> {
             self.number(line_break_before);
         } else if b == b'"' {
             self.string(line_break_before);
+        } else if b == b'\'' && self.peek(1).is_some_and(is_ident_start) && !self.char_literal() {
+            self.lifetime();
+            return false;
         } else if let Some(kind) = self.punct() {
             self.pos += kind.fixed_text().map_or(1, str::len);
+            if let Some((_, depth)) = self.holes.last_mut() {
+                match kind {
+                    TokenKind::LParen | TokenKind::LBracket | TokenKind::LBrace => *depth += 1,
+                    TokenKind::RParen | TokenKind::RBracket | TokenKind::RBrace => {
+                        *depth = depth.saturating_sub(1)
+                    }
+                    _ => {}
+                }
+            }
             self.push(kind, start, line_break_before);
         } else {
             // L3: a run of characters that can't appear here, reported once.
@@ -311,6 +443,113 @@ impl<'a> Lexer<'a> {
         self.push(kind, start, line_break_before);
     }
 
+    /// L22: the end of an f-string's hole, at `}` or a format spec's `:`, and the text after it,
+    /// up to the next hole (FSTRING_MID) or the closing quote (FSTRING_TAIL).
+    fn hole_end(&mut self, line_break_before: bool) {
+        let start = self.pos;
+        if self.src[self.pos] == b':' {
+            // The format spec runs to the `}` that ends the hole.
+            loop {
+                match self.peek(0) {
+                    Some(b'}') => break,
+                    None | Some(b'\n' | b'\r' | b'"') => {
+                        let sp = self.span(start, self.pos);
+                        self.error(
+                            Diagnostic::new(codes::E0005, sp, "this format spec isn't closed")
+                                .with_help("end it with `}`, as in `{x:.2}` (L22)"),
+                        );
+                        self.holes.pop();
+                        self.push(TokenKind::FStringTail, start, line_break_before);
+                        return;
+                    }
+                    Some(_) => self.pos += self.char_at(self.pos).map_or(1, char::len_utf8),
+                }
+            }
+        }
+        self.pos += 1;
+        self.holes.pop();
+        let kind = self.fstring_text(start, false);
+        self.push(kind, start, line_break_before);
+    }
+
+    /// L22: an f-string's text from the current position, up to a hole's `{` or the closing
+    /// quote. Returns the token it ends: after `f"` (`first`) an FSTRING or FSTRING_HEAD, after a
+    /// hole an FSTRING_TAIL or FSTRING_MID.
+    fn fstring_text(&mut self, start: usize, first: bool) -> TokenKind {
+        let (closed, opened) = if first {
+            (TokenKind::FString, TokenKind::FStringHead)
+        } else {
+            (TokenKind::FStringTail, TokenKind::FStringMid)
+        };
+        loop {
+            match self.peek(0) {
+                None | Some(b'\n' | b'\r') => {
+                    let sp = self.span(start, self.pos);
+                    self.error(
+                        Diagnostic::new(codes::E0005, sp, "this f-string isn't closed")
+                            .with_help("close it with `\"` on the same line (L22)"),
+                    );
+                    return closed;
+                }
+                Some(b'"') => {
+                    self.pos += 1;
+                    return closed;
+                }
+                Some(b'{') if self.peek(1) == Some(b'{') => self.pos += 2,
+                Some(b'}') if self.peek(1) == Some(b'}') => self.pos += 2,
+                Some(b'{') => {
+                    self.pos += 1;
+                    self.holes.push((self.pos, 0));
+                    return opened;
+                }
+                Some(b'}') => {
+                    let sp = self.span(self.pos, self.pos + 1);
+                    self.error(
+                        Diagnostic::new(
+                            codes::E0005,
+                            sp,
+                            "a `}` in an f-string's text is written `}}`",
+                        )
+                        .with_fix("double it", sp, "}}"),
+                    );
+                    self.pos += 1;
+                }
+                Some(b'\\') => self.escape(),
+                Some(_) => self.pos += self.char_at(self.pos).map_or(1, char::len_utf8),
+            }
+        }
+    }
+
+    /// A line or the file ends inside f-string holes: each is reported, and closed.
+    fn unclosed_holes(&mut self) {
+        while let Some((at, _)) = self.holes.pop() {
+            let sp = self.span(at - 1, at);
+            self.error(
+                Diagnostic::new(codes::E0005, sp, "this f-string hole isn't closed").with_help(
+                    "close it with `}`, and the string with `\"`, on the same line (L22)",
+                ),
+            );
+        }
+    }
+
+    /// An escape at `\` in a string's text (L14): reported if unknown.
+    fn escape(&mut self) {
+        let esc = self.pos;
+        self.pos += 1;
+        match self.peek(0) {
+            Some(b'\\' | b'"' | b'n' | b'r' | b't' | b'0') => self.pos += 1,
+            _ => {
+                let c = self.char_at(self.pos).map_or(0, char::len_utf8);
+                self.pos += c;
+                let sp = self.span(esc, self.pos);
+                self.error(
+                    Diagnostic::new(codes::E0005, sp, "an unknown escape")
+                        .with_help("the escapes are `\\\\ \\\" \\n \\r \\t \\0` (L14)"),
+                );
+            }
+        }
+    }
+
     fn string(&mut self, line_break_before: bool) {
         let start = self.pos;
         self.pos += 1;
@@ -328,22 +567,7 @@ impl<'a> Lexer<'a> {
                     self.pos += 1;
                     break;
                 }
-                Some(b'\\') => {
-                    let esc = self.pos;
-                    self.pos += 1;
-                    match self.peek(0) {
-                        Some(b'\\' | b'"' | b'n' | b'r' | b't' | b'0') => self.pos += 1,
-                        _ => {
-                            let c = self.char_at(self.pos).map_or(0, char::len_utf8);
-                            self.pos += c;
-                            let sp = self.span(esc, self.pos);
-                            self.error(
-                                Diagnostic::new(codes::E0005, sp, "an unknown escape")
-                                    .with_help("the escapes are `\\\\ \\\" \\n \\r \\t \\0` (L14)"),
-                            );
-                        }
-                    }
-                }
+                Some(b'\\') => self.escape(),
                 Some(_) => {
                     let c = self.char_at(self.pos).map_or(1, char::len_utf8);
                     self.pos += c;
@@ -608,6 +832,121 @@ pub(crate) fn newlines_after(
         out.push(tok);
         prev = Some(tok);
     }
+}
+
+/// The text a STRING token's source spells: quotes removed, escapes decoded (L14).
+pub fn string_value(text: &str) -> String {
+    let inner = text.strip_prefix('"').unwrap_or(text);
+    let inner = inner.strip_suffix('"').unwrap_or(inner);
+    decode(inner, false)
+}
+
+/// The parts of an f-string token's text (L22): its format spec (the hole before it ends with
+/// one, as in `:.1}`), and its literal text, decoded.
+pub fn fstring_segment(text: &str) -> (Option<String>, String) {
+    let mut rest = text;
+    let mut spec = None;
+    if let Some(r) = rest.strip_prefix("f\"") {
+        rest = r;
+    } else if let Some(r) = rest.strip_prefix(':') {
+        let end = r.find('}').unwrap_or(r.len());
+        spec = Some(r[..end].to_string());
+        rest = r.get(end + 1..).unwrap_or("");
+    } else if let Some(r) = rest.strip_prefix('}') {
+        rest = r;
+    }
+    // The text ends before the `{` that opens the next hole, or the closing quote.
+    // (A token that ends in `{` ends at a hole: the lexer reads `{{` as text first.)
+    let body = match rest.as_bytes().last() {
+        Some(b'"' | b'{') => &rest[..rest.len() - 1],
+        _ => rest,
+    };
+    (spec, decode(body, true))
+}
+
+/// A format spec's parts (`{x:spec}`, §4).
+pub struct SpecFields {
+    pub width: u32,
+    pub precision: Option<u32>,
+    /// 0 for none, then `<`, `>` and `^`.
+    pub align: u32,
+    pub zero: bool,
+    pub hex: bool,
+}
+
+/// Reads a format spec: `[<^>][0][width][.precision][x]`.
+pub fn parse_spec(s: &str) -> Result<SpecFields, String> {
+    let mut f = SpecFields { width: 0, precision: None, align: 0, zero: false, hex: false };
+    let b = s.as_bytes();
+    let mut i = 0;
+    let number = |i: &mut usize| -> Result<Option<u32>, String> {
+        let start = *i;
+        while *i < b.len() && b[*i].is_ascii_digit() {
+            *i += 1;
+        }
+        if *i == start {
+            return Ok(None);
+        }
+        s[start..*i].parse::<u32>().map(Some).map_err(|_| "a number in it is too large".into())
+    };
+    if let Some(&c) = b.first() {
+        f.align = match c {
+            b'<' => 1,
+            b'>' => 2,
+            b'^' => 3,
+            _ => 0,
+        };
+        if f.align != 0 {
+            i += 1;
+        }
+    }
+    if b.get(i) == Some(&b'0') {
+        f.zero = true;
+        i += 1;
+    }
+    f.width = number(&mut i)?.unwrap_or(0);
+    if b.get(i) == Some(&b'.') {
+        i += 1;
+        match number(&mut i)? {
+            Some(p) => f.precision = Some(p),
+            None => return Err("`.` needs the number of digits after it".into()),
+        }
+    }
+    if b.get(i) == Some(&b'x') {
+        f.hex = true;
+        i += 1;
+    }
+    if i != b.len() {
+        return Err(format!("`{}` isn't part of a spec", &s[i..]));
+    }
+    if f.width > 1 << 16 || f.precision.is_some_and(|p| p > 1 << 10) {
+        return Err("its width or precision is too large".into());
+    }
+    Ok(f)
+}
+
+/// A string's text with its escapes decoded; in an f-string (`braces`), `{{` and `}}` too.
+fn decode(s: &str, braces: bool) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('r') => out.push('\r'),
+                Some('t') => out.push('\t'),
+                Some('0') => out.push('\0'),
+                Some(other) => out.push(other),
+                None => {}
+            },
+            '{' | '}' if braces && chars.peek() == Some(&c) => {
+                chars.next();
+                out.push(c);
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// The value of an INT token's text: `_` ignored, a radix prefix read.

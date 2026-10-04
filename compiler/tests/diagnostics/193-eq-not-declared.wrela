@@ -1,0 +1,11 @@
+// mistake: comparing two structs that don't declare `Eq`
+// expect: E0305
+// fix: no
+struct Cell {
+    x: u32,
+    y: u32,
+}
+
+fn same(a: Cell, b: Cell) -> bool {
+    a == b
+}

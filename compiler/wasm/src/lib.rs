@@ -1,14 +1,19 @@
 //! The WASM back end (language.md §11, D-074).
 //!
-//! - **Strict numerics.** WASM's float arithmetic is IEEE-strict, and this back end emits no
-//!   SIMD at all, so no relaxed-SIMD instruction (the only fused multiply-add in WASM) can
-//!   appear; [`check_no_relaxed_simd`] proves it for any module. Integer overflow, division by
-//!   zero, out-of-range shifts, float-to-int conversions out of range, out-of-bounds indexing and
+//! - **Strict numerics.** WASM's float arithmetic is IEEE-strict. The back end emits standard
+//!   SIMD only, never relaxed SIMD (whose fused multiply-add is the only one in WASM);
+//!   [`check_no_relaxed_simd`] proves it for any module. Integer overflow, division by zero,
+//!   out-of-range shifts, float-to-int conversions out of range, out-of-bounds indexing and
 //!   stack overflow all trap.
-//! - **Memory.** Scalars live in WASM locals. Every aggregate (vector, matrix, struct, array,
-//!   run) lives in memory, laid out by WGSL's rules (`wrela_ir::layout`), on a shadow stack: a
-//!   value is a pointer to its own frame slot, written once. Loading an aggregate from a place
-//!   copies it; storing copies it back.
+//! - **SIMD** ([`Options::simd`], language.md §11). A `vec2`, `vec3` or `vec4` value is a
+//!   `v128`, its components in the low lanes (the others hold anything, and nothing reads
+//!   them), and its arithmetic is `f32x4` instructions. Each lane is rounded exactly as the
+//!   scalar operation would round it, and a sum of lanes (a dot product, a length) adds them one
+//!   at a time in the scalar order, so the bits are the same as without SIMD.
+//! - **Memory.** Scalars, and vectors with SIMD, live in WASM locals. Every other aggregate
+//!   (matrix, struct, array, run; vectors without SIMD) lives in memory, laid out by WGSL's
+//!   rules (`wrela_ir::layout`), on a shadow stack: a value is a pointer to its own frame slot,
+//!   written once. Loading an aggregate from a place copies it; storing copies it back.
 //! - **The program ABI** (wrela-abi): the module imports only `wrela.submit` and exports
 //!   `memory` and the program's exports. Host operations write commands into a buffer in
 //!   memory, flushed through `submit` when it fills and when every exported call returns.
@@ -19,17 +24,9 @@ use std::collections::HashMap;
 use wasm_encoder::*;
 use wrela_ir as ir;
 
-/// Where things are in linear memory. Constant data is at the top, and the shadow stack starts
-/// below it.
+/// Where things are in linear memory: `wrela_abi::memory`.
 pub mod memory {
-    /// The command buffer: a batch header, then commands.
-    pub const CMD_BASE: u32 = 1024;
-    pub const CMD_CAP: u32 = 1 << 20;
-    /// The shadow stack grows down from below the constant data to here.
-    pub const STACK_LIMIT: u32 = CMD_BASE + wrela_abi::stream::HEADER_LEN as u32 + CMD_CAP + 1024;
-    /// Memory size in 64 KiB pages: 16 MiB. Fixed: tier 0 has no heap.
-    pub const PAGES: u64 = 256;
-    pub const STACK_TOP: u32 = (PAGES as u32) * 65536;
+    pub use wrela_abi::memory::*;
     // A dispatch or draw with the largest uniform block lowering allows still fits in one batch,
     // with room for its other words.
     const _: () = assert!(CMD_CAP - wrela_ir::MAX_UNIFORM_BYTES >= 256);
@@ -39,15 +36,22 @@ pub mod memory {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Helpers {
     pub submit: u32,
+    /// The imports `wrela.request_status(request) -> i32` and `wrela.request_take(request,
+    /// ptr)`.
+    pub request_status: u32,
+    pub request_take: u32,
+    /// The import `wrela.limit(index) -> i32`.
+    pub limit: u32,
+    /// The import `wrela.audio(task, context)`, in a module that starts a voice.
+    pub audio: u32,
+    /// The type of a task function ([`ir::MemOp::RunTask`]): (context, chunk) -> ().
+    pub task_type: u32,
     /// `flush()`: submits the pending commands, if any.
     pub flush: u32,
     /// `reserve(bytes) -> address`: room for a command, flushing first if needed.
     pub reserve: u32,
     /// `write(handle, offset, ptr, bytes)`: WriteBuffer commands, in chunks that fit.
     pub write: u32,
-    /// `release()`: DestroyBuffer for the buffers made since the last release. Each export
-    /// calls it first: a buffer lives until the program's next call (language.md §12).
-    pub release: u32,
     /// `fmod(a, b)`, for f32s and f64s: float `%`, exactly (language.md §11).
     pub fmod_f32: u32,
     pub fmod_f64: u32,
@@ -57,13 +61,17 @@ pub(crate) struct Helpers {
 pub(crate) mod globals {
     pub const SP: u32 = 0;
     pub const CMD_LEN: u32 = 1;
+    /// The next resource handle: from 1, so a zeroed buffer value names none.
     pub const NEXT_HANDLE: u32 = 2;
-    /// The first handle not yet released.
-    pub const LIVE_FROM: u32 = 3;
     /// The first handle not yet submitted: a batch a trap left unsubmitted made the rest.
-    pub const SUBMITTED_TO: u32 = 4;
-    /// `LIVE_FROM` as submitted: the handles below it were destroyed.
-    pub const RELEASED_TO: u32 = 5;
+    pub const SUBMITTED_TO: u32 = 3;
+    /// How many counted calls are in progress (`ir::Function::counted`).
+    pub const DEPTH: u32 = 4;
+    /// The next request number: from 1. Requests are numbered in the order they're made, and a
+    /// number is never used twice.
+    pub const NEXT_REQUEST: u32 = 5;
+    /// The lowest address the shadow stack may reach: the main stack's, or a worker's.
+    pub const STACK_FLOOR: u32 = 6;
 }
 
 pub(crate) fn valtype(s: ir::Scalar) -> ValType {
@@ -75,12 +83,19 @@ pub(crate) fn valtype(s: ir::Scalar) -> ValType {
     }
 }
 
-/// A type's WASM value type: its scalar's, or a pointer (i32) for aggregates.
-pub(crate) fn repr(types: &ir::Types, t: ir::TypeId) -> ValType {
+/// A type's WASM value type: its scalar's, a `v128` for a vector with SIMD, or a pointer (i32)
+/// for the aggregates in memory.
+pub(crate) fn repr(types: &ir::Types, t: ir::TypeId, simd: bool) -> ValType {
     match types.get(t) {
         ir::TypeDef::Scalar(s) => valtype(*s),
+        ir::TypeDef::Vector(_) if simd => ValType::V128,
         _ => ValType::I32,
     }
+}
+
+/// Whether a value of type `t` lives in memory: an aggregate, but a vector with SIMD.
+pub(crate) fn in_memory(types: &ir::Types, t: ir::TypeId, simd: bool) -> bool {
+    types.is_aggregate(t) && !(simd && matches!(types.get(t), ir::TypeDef::Vector(_)))
 }
 
 /// Function types, deduplicated.
@@ -100,24 +115,28 @@ impl TypeTable {
     }
 }
 
-/// Whether an IR function returns its result through a pointer, its first WASM parameter: an
-/// aggregate it returns by value.
-pub(crate) fn sret(m: &ir::Module, f: &ir::Function) -> bool {
-    f.ret.is_some_and(|t| !f.ret_ref && m.types.is_aggregate(t))
+/// Whether an IR function returns its result through a pointer, its first WASM parameter: a
+/// value in memory it returns by value.
+pub(crate) fn sret(m: &ir::Module, f: &ir::Function, simd: bool) -> bool {
+    f.ret.is_some_and(|t| !f.ret_ref && in_memory(&m.types, t, simd))
 }
 
 /// The WASM signature of an IR function: (params, results).
-pub(crate) fn signature(m: &ir::Module, f: &ir::Function) -> (Vec<ValType>, Vec<ValType>) {
+pub(crate) fn signature(
+    m: &ir::Module,
+    f: &ir::Function,
+    simd: bool,
+) -> (Vec<ValType>, Vec<ValType>) {
     let mut params = Vec::new();
-    if sret(m, f) {
+    if sret(m, f, simd) {
         params.push(ValType::I32);
     }
     for p in &f.params {
-        params.push(if p.by_ref { ValType::I32 } else { repr(&m.types, p.ty) });
+        params.push(if p.by_ref { ValType::I32 } else { repr(&m.types, p.ty, simd) });
     }
     let results = match f.ret {
         Some(_) if f.ret_ref => vec![ValType::I32],
-        Some(t) if !m.types.is_aggregate(t) => vec![repr(&m.types, t)],
+        Some(t) if !in_memory(&m.types, t, simd) => vec![repr(&m.types, t, simd)],
         _ => Vec::new(),
     };
     (params, results)
@@ -131,27 +150,87 @@ pub struct Emitted {
     pub lines: Vec<(u32, Option<wrela_diag::Span>)>,
 }
 
-/// Emits the CPU module as WASM, and checks the WASM uses no relaxed SIMD (see
-/// [`check_no_relaxed_simd`]).
+/// What the back end emits.
+#[derive(Clone, Copy, Debug)]
+pub struct Options {
+    /// The memory is imported and shared (`wrela.memory`). Without, the module defines its own
+    /// memory, unshared: for running on one thread, as the build does its constants (no worker
+    /// runs it, so nothing waits).
+    pub shared_memory: bool,
+    /// Vectors are `v128` values, and their arithmetic SIMD (see the crate's docs). Without,
+    /// they're in memory and each component is computed on its own: the same results, bit for
+    /// bit, which a test checks.
+    pub simd: bool,
+}
+
+impl Default for Options {
+    fn default() -> Options {
+        Options { shared_memory: true, simd: true }
+    }
+}
+
+/// Emits the CPU module as WASM with the default [`Options`], and checks the WASM uses no
+/// relaxed SIMD (see [`check_no_relaxed_simd`]).
 pub fn emit(m: &ir::Module) -> Result<Emitted, String> {
+    emit_with(m, Options::default())
+}
+
+/// [`emit`], with these options.
+pub fn emit_with(m: &ir::Module, options: Options) -> Result<Emitted, String> {
+    let Options { shared_memory, simd } = options;
     if !m.entry_points.is_empty() || !m.resources.is_empty() {
         return Err("internal: a GPU module reached the WASM back end".into());
     }
     let mut types = TypeTable::default();
     let mut imports = ImportSection::new();
+    let (data_at, data_base, data_bytes, heap_base) = data(m)?;
     let submit_ty = types.get(vec![ValType::I32, ValType::I32], vec![]);
-    imports.import(
-        wrela_abi::IMPORT_MODULE,
-        wrela_abi::IMPORT_SUBMIT,
-        EntityType::Function(submit_ty),
-    );
-    let helpers =
-        Helpers { submit: 0, flush: 1, reserve: 2, write: 3, release: 4, fmod_f32: 5, fmod_f64: 6 };
-    let (data_at, data_base, data_bytes) = data(m)?;
+    let status_ty = types.get(vec![ValType::I32], vec![ValType::I32]);
+    for (name, ty) in [
+        (wrela_abi::IMPORT_SUBMIT, submit_ty),
+        (wrela_abi::IMPORT_REQUEST_STATUS, status_ty),
+        (wrela_abi::IMPORT_REQUEST_TAKE, submit_ty),
+        (wrela_abi::IMPORT_LIMIT, status_ty),
+    ] {
+        imports.import(wrela_abi::IMPORT_MODULE, name, EntityType::Function(ty));
+    }
+    if m.audio {
+        let ty = EntityType::Function(submit_ty);
+        imports.import(wrela_abi::IMPORT_MODULE, wrela_abi::IMPORT_AUDIO, ty);
+    }
+    let nimports = imports.len();
+    // The memory, shared: workers' instances get the same one (wrela_abi::memory).
+    let memory_type = MemoryType {
+        minimum: u64::from(heap_base / memory::PAGE + memory::HEAP_START_PAGES),
+        maximum: Some(u64::from(memory::MAX_PAGES)),
+        memory64: false,
+        shared: shared_memory,
+        page_size_log2: None,
+    };
+    let mut memories = MemorySection::new();
+    if shared_memory {
+        let name = wrela_abi::IMPORT_MEMORY;
+        imports.import(wrela_abi::IMPORT_MODULE, name, EntityType::Memory(memory_type));
+    } else {
+        memories.memory(memory_type);
+    }
+    let helpers = Helpers {
+        submit: 0,
+        request_status: 1,
+        request_take: 2,
+        limit: 3,
+        audio: 4,
+        flush: nimports,
+        reserve: nimports + 1,
+        write: nimports + 2,
+        fmod_f32: nimports + 3,
+        fmod_f64: nimports + 4,
+        task_type: submit_ty,
+    };
     let helper_bodies = func::helper_bodies(&helpers);
     // The code section: the helpers, the program's functions, then the export wrappers.
     let nhelpers = helper_bodies.len();
-    let first_fn = 1 + nhelpers as u32;
+    let first_fn = nimports + nhelpers as u32;
     let mut functions = FunctionSection::new();
     let mut code = CodeSection::new();
     for (params, results, body) in helper_bodies {
@@ -162,11 +241,12 @@ pub fn emit(m: &ir::Module) -> Result<Emitted, String> {
     // The program's functions, and each one's locations.
     let mut body_lines = Vec::with_capacity(m.functions.len());
     for (i, f) in m.functions.iter().enumerate() {
-        let (params, results) = signature(m, f);
+        let (params, results) = signature(m, f, simd);
         let ty = types.get(params, results);
         functions.function(ty);
-        let (body, lines) = func::emit_function(m, i, first_fn, &helpers, &data_at)
-            .map_err(|e| format!("{}: {e}", f.name))?;
+        let at = func::At { first_fn, helpers: &helpers, data: &data_at, heap_base, simd };
+        let (body, lines) =
+            func::emit_function(m, i, &at).map_err(|e| format!("{}: {e}", f.name))?;
         code.function(&body);
         body_lines.push(lines);
     }
@@ -176,38 +256,108 @@ pub fn emit(m: &ir::Module) -> Result<Emitted, String> {
     let wrappers = first_fn + m.functions.len() as u32..;
     for (next, (name, f)) in wrappers.zip(&m.exports) {
         let (params, results, body) =
-            func::export_wrapper(m, *f, first_fn + f.0, &helpers, data_base)?;
+            func::export_wrapper(m, *f, first_fn + f.0, &helpers, memory::STACK_TOP, simd)?;
         let ty = types.get(params, results);
         functions.function(ty);
         code.function(&body);
         exports.export(name, ExportKind::Func, next);
     }
-    let mut memories = MemorySection::new();
-    memories.memory(MemoryType {
-        minimum: memory::PAGES,
-        maximum: Some(memory::PAGES),
-        memory64: false,
-        shared: false,
-        page_size_log2: None,
+    // `__worker(index)`: the worker's own stack, then std's worker loop (wrela_abi::memory).
+    if let Some(w) = m.worker {
+        let body = func::worker_wrapper(first_fn + w.0);
+        let ty = types.get(vec![ValType::I32], vec![]);
+        functions.function(ty);
+        code.function(&body);
+        let next = first_fn + m.functions.len() as u32 + m.exports.len() as u32;
+        exports.export(wrela_abi::EXPORT_WORKER, ExportKind::Func, next);
+    }
+    // `__audio(task, context)`: the audio thread's stack, then the voice's task.
+    if m.audio {
+        let body = func::audio_wrapper(helpers.task_type);
+        let ty = types.get(vec![ValType::I32, ValType::I32], vec![]);
+        functions.function(ty);
+        code.function(&body);
+        let next = first_fn
+            + m.functions.len() as u32
+            + m.exports.len() as u32
+            + u32::from(m.worker.is_some());
+        exports.export(wrela_abi::EXPORT_AUDIO, ExportKind::Func, next);
+    }
+    // A shared memory's constants are copied once, by a start function, not by each instance
+    // as it starts: a worker's instance starts while the program runs, and would overwrite
+    // what's changed since (the program's state among it).
+    let passive = shared_memory && !data_bytes.is_empty();
+    let start = passive.then(|| {
+        let body = func::init_data(data_base, data_bytes.len() as u32);
+        let ty = types.get(vec![], vec![]);
+        functions.function(ty);
+        code.function(&body);
+        first_fn
+            + m.functions.len() as u32
+            + m.exports.len() as u32
+            + u32::from(m.worker.is_some())
+            + u32::from(m.audio)
     });
+    // The tasks a parallel job's chunks run, by index.
+    let mut tables = TableSection::new();
+    let mut elements = ElementSection::new();
+    if !m.tasks.is_empty() {
+        let n = m.tasks.len() as u64;
+        tables.table(TableType {
+            element_type: RefType::FUNCREF,
+            minimum: n,
+            maximum: Some(n),
+            table64: false,
+            shared: false,
+        });
+        let funcs: Vec<u32> = m.tasks.iter().map(|t| first_fn + t.0).collect();
+        elements.active(Some(0), &ConstExpr::i32_const(0), Elements::Functions(funcs.into()));
+    }
     let mut globals = GlobalSection::new();
     let g = |mutable| GlobalType { val_type: ValType::I32, mutable, shared: false };
-    globals.global(g(true), &ConstExpr::i32_const(data_base as i32));
-    // CMD_LEN, NEXT_HANDLE, LIVE_FROM, SUBMITTED_TO and RELEASED_TO start at 0.
-    for _ in globals::CMD_LEN..=globals::RELEASED_TO {
-        globals.global(g(true), &ConstExpr::i32_const(0));
+    globals.global(g(true), &ConstExpr::i32_const(memory::STACK_TOP as i32));
+    // CMD_LEN starts at 0, NEXT_HANDLE and SUBMITTED_TO at 1, DEPTH at 0, NEXT_REQUEST at 1,
+    // and the stack's floor is the main stack's (a worker sets its own).
+    for (i, start) in [
+        (globals::CMD_LEN, 0),
+        (globals::NEXT_HANDLE, 1),
+        (globals::SUBMITTED_TO, 1),
+        (globals::DEPTH, 0),
+        (globals::NEXT_REQUEST, 1),
+        (globals::STACK_FLOOR, memory::STACK_LIMIT as i32),
+    ] {
+        debug_assert_eq!(i, globals.len());
+        globals.global(g(true), &ConstExpr::i32_const(start));
     }
     let mut module = Module::new();
     module.section(&types.section);
     module.section(&imports);
     module.section(&functions);
-    module.section(&memories);
+    if !m.tasks.is_empty() {
+        module.section(&tables);
+    }
+    if !shared_memory {
+        module.section(&memories);
+    }
     module.section(&globals);
     module.section(&exports);
+    if let Some(function_index) = start {
+        module.section(&StartSection { function_index });
+    }
+    if !m.tasks.is_empty() {
+        module.section(&elements);
+    }
+    if passive {
+        module.section(&DataCountSection { count: 1 });
+    }
     module.section(&code);
     if !data_bytes.is_empty() {
         let mut data = DataSection::new();
-        data.active(0, &ConstExpr::i32_const(data_base as i32), data_bytes);
+        if passive {
+            data.passive(data_bytes);
+        } else {
+            data.active(0, &ConstExpr::i32_const(data_base as i32), data_bytes);
+        }
         module.section(&data);
     }
     let wasm = module.finish();
@@ -229,9 +379,9 @@ pub fn emit(m: &ir::Module) -> Result<Emitted, String> {
     Ok(Emitted { wasm, lines })
 }
 
-/// Where the module's constant data goes: each one's address, where the data starts (the stack
-/// starts below it), and its bytes.
-fn data(m: &ir::Module) -> Result<(Vec<u32>, u32, Vec<u8>), String> {
+/// Where the module's constant data goes: each one's address, where the data starts (above the
+/// stack), its bytes, and where the heap starts (the next page).
+fn data(m: &ir::Module) -> Result<(Vec<u32>, u32, Vec<u8>, u32), String> {
     use ir::layout::{layout, round_up};
     let mut offsets = Vec::new();
     let mut end = 0u32;
@@ -242,24 +392,29 @@ fn data(m: &ir::Module) -> Result<(Vec<u32>, u32, Vec<u8>), String> {
         end = at.saturating_add(l.size);
     }
     let size = round_up(16, end);
-    if size > memory::STACK_TOP - memory::STACK_LIMIT - (1 << 20) {
+    let base = memory::DATA_BASE;
+    let room = (memory::MAX_PAGES - memory::HEAP_START_PAGES) * memory::PAGE - base;
+    if size > room {
         return Err(format!(
             "the program's constants take {size} bytes, more than memory has room for"
         ));
     }
-    let base = memory::STACK_TOP - size;
     let mut bytes = vec![0u8; size as usize];
+    let addrs: Vec<u32> = offsets.iter().map(|&o| base + o).collect();
     for (d, &at) in m.data.iter().zip(&offsets) {
-        write_const(&m.types, d.ty, &d.value, &mut bytes, at as usize)?;
+        write_const(&m.types, d.ty, &d.value, &addrs, &mut bytes, at as usize)?;
     }
-    Ok((offsets.iter().map(|&o| base + o).collect(), base, bytes))
+    let heap_base = round_up(memory::PAGE, base + size);
+    Ok((addrs, base, bytes, heap_base))
 }
 
 /// Writes a constant of type `t` at `at`, laid out as memory holds it (`wrela_ir::layout`).
+/// `addrs` is each piece of constant data's address.
 fn write_const(
     types: &ir::Types,
     t: ir::TypeId,
     v: &ir::ConstValue,
+    addrs: &[u32],
     out: &mut [u8],
     at: usize,
 ) -> Result<(), String> {
@@ -280,33 +435,38 @@ fn write_const(
         (&ir::TypeDef::Vector(_), ir::ConstValue::Parts(ps)) => {
             let f32 = types.lookup(&ir::TypeDef::Scalar(ir::Scalar::F32)).ok_or("no f32")?;
             for (k, p) in ps.iter().enumerate() {
-                write_const(types, f32, p, out, at + 4 * k)?;
+                write_const(types, f32, p, addrs, out, at + 4 * k)?;
             }
         }
         (&ir::TypeDef::Matrix(n), ir::ConstValue::Parts(ps)) => {
             let col = types.lookup(&ir::TypeDef::Vector(n)).ok_or("no column type")?;
             for (k, p) in ps.iter().enumerate() {
-                write_const(types, col, p, out, at + (column_stride(n) as usize) * k)?;
+                write_const(types, col, p, addrs, out, at + (column_stride(n) as usize) * k)?;
             }
         }
         (&ir::TypeDef::Array(e, _), ir::ConstValue::Parts(ps)) => {
             let stride = array_stride(types, e) as usize;
             for (k, p) in ps.iter().enumerate() {
-                write_const(types, e, p, out, at + stride * k)?;
+                write_const(types, e, p, addrs, out, at + stride * k)?;
             }
         }
         (ir::TypeDef::Struct { fields, .. }, ir::ConstValue::Parts(ps)) => {
             let offsets = field_offsets(types, t);
             for ((&(_, ft), p), &off) in fields.iter().zip(ps).zip(offsets) {
-                write_const(types, ft, p, out, at + off as usize)?;
+                write_const(types, ft, p, addrs, out, at + off as usize)?;
             }
+        }
+        (&ir::TypeDef::Array(..), ir::ConstValue::Bytes(bs)) => put(bs),
+        (ir::TypeDef::Scalar(ir::Scalar::U32), ir::ConstValue::Addr(d)) => {
+            let a = addrs.get(d.index()).ok_or("internal: an address of missing data")?;
+            put(&a.to_le_bytes())
         }
         (ir::TypeDef::Enum { .. }, ir::ConstValue::Variant(k, payload)) => {
             put(&k.to_le_bytes());
             if let Some(p) = payload {
                 let pt = types.field(t, 1 + k).ok_or("internal: a variant with no payload")?;
                 let off = field_offsets(types, t)[1 + *k as usize] as usize;
-                write_const(types, pt, p, out, at + off)?;
+                write_const(types, pt, p, addrs, out, at + off)?;
             }
         }
         (d, v) => return Err(format!("internal: constant {v:?} of type {d:?}")),
@@ -336,6 +496,22 @@ pub fn check_no_relaxed_simd(bytes: &[u8]) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// How many SIMD instructions (those with the `0xfd` prefix) a WASM module's code has.
+pub fn simd_instructions(bytes: &[u8]) -> Result<usize, String> {
+    let mut n = 0;
+    for payload in wasmparser::Parser::new(0).parse_all(bytes) {
+        let payload = payload.map_err(|e| e.to_string())?;
+        if let wasmparser::Payload::CodeSectionEntry(body) = payload {
+            let mut ops = body.get_operators_reader().map_err(|e| e.to_string())?;
+            while !ops.eof() {
+                let (_, at) = ops.read_with_offset().map_err(|e| e.to_string())?;
+                n += usize::from(bytes.get(at as usize) == Some(&0xfd));
+            }
+        }
+    }
+    Ok(n)
 }
 
 /// Fails if a function body uses a relaxed-SIMD instruction (see [`check_no_relaxed_simd`]).
@@ -417,6 +593,96 @@ mod tests {
         m.exports.push(("double".into(), id));
         let out = emit(&m).expect("emits");
         assert_eq!(check_no_relaxed_simd(&out.wasm), Ok(()));
+    }
+
+    /// `fn f(xs: mut [f32], n: u32)`: a loop over `0..n` whose body, after the exit test, is
+    /// `body(f, i, xs)`; and how many `f32x4` instructions it compiles to, with SIMD and without.
+    fn loop_simd(
+        body: impl Fn(&mut wrela_ir::Function, wrela_ir::ValueId) -> Vec<wrela_ir::Stmt>,
+        locals: &[&str],
+    ) -> (usize, usize) {
+        use wrela_ir::{BinOp, Const, Expr, Param, Place, Stmt, TypeDef};
+        let mut m = wrela_ir::Module::default();
+        let (f32t, u32t, boolt) = (m.types.f32(), m.types.u32(), m.types.bool());
+        let run = m.types.intern(TypeDef::Run(f32t));
+        let xs = Param { name: "xs".into(), ty: run, by_ref: true, mutable: true };
+        let n = Param { name: "n".into(), ty: u32t, by_ref: false, mutable: false };
+        let mut f = wrela_ir::Function::new("f", vec![xs, n], None);
+        for l in locals {
+            f.new_local(*l, f32t);
+        }
+        let ctr = f.new_local("counter", u32t);
+        let (nv, zero, i, done) =
+            (f.new_value(u32t), f.new_value(u32t), f.new_value(u32t), f.new_value(boolt));
+        let (a, one, next) = (f.new_value(u32t), f.new_value(u32t), f.new_value(u32t));
+        let mut lp = vec![
+            Stmt::Let(i, Expr::Load(Place::local(ctr))),
+            Stmt::Let(done, Expr::Binary(BinOp::Ge, i, nv)),
+            Stmt::If { cond: done, then: vec![Stmt::Break], else_: Vec::new() },
+        ];
+        lp.extend(body(&mut f, i));
+        f.body = vec![
+            Stmt::Let(nv, Expr::Param(1)),
+            Stmt::Let(zero, Expr::Const(Const::U32(0))),
+            Stmt::Store(Place::local(ctr), zero),
+            Stmt::Loop {
+                body: lp,
+                continuing: vec![
+                    Stmt::Let(a, Expr::Load(Place::local(ctr))),
+                    Stmt::Let(one, Expr::Const(Const::U32(1))),
+                    Stmt::Let(next, Expr::Binary(BinOp::Add, a, one)),
+                    Stmt::Store(Place::local(ctr), next),
+                ],
+            },
+            Stmt::Return(None),
+        ];
+        m.add_function(f);
+        let count = |simd| {
+            let out = emit_with(&m, Options { simd, ..Options::default() }).expect("emits");
+            let mut n = 0;
+            for payload in wasmparser::Parser::new(0).parse_all(&out.wasm) {
+                if let Ok(wasmparser::Payload::CodeSectionEntry(body)) = payload {
+                    let mut ops = body.get_operators_reader().expect("operators");
+                    while !ops.eof() {
+                        n +=
+                            usize::from(format!("{:?}", ops.read().expect("op")).contains("F32x4"));
+                    }
+                }
+            }
+            n
+        };
+        (count(true), count(false))
+    }
+
+    /// `xs[i] = xs[i] * 2.0` runs four iterations at a time; `s = s + xs[i]` doesn't (it keeps
+    /// `s` from one iteration to the next); nor does anything without SIMD.
+    #[test]
+    fn independent_loops_run_four_at_a_time() {
+        use wrela_ir::{BinOp, Const, Expr, Place, PlaceRoot, Proj, Stmt};
+        let elem = |i| Place::root(PlaceRoot::Param(0)).with(Proj::Index(i));
+        let double = |f: &mut wrela_ir::Function, i| {
+            let f32t = f.locals[0].ty;
+            let (x, two, y) = (f.new_value(f32t), f.new_value(f32t), f.new_value(f32t));
+            vec![
+                Stmt::Let(x, Expr::Load(elem(i))),
+                Stmt::Let(two, Expr::Const(Const::F32(2.0))),
+                Stmt::Let(y, Expr::Binary(BinOp::Mul, x, two)),
+                Stmt::Store(elem(i), y),
+            ]
+        };
+        assert!(matches!(loop_simd(double, &["unused"]), (n, 0) if n >= 1));
+        let sum = |f: &mut wrela_ir::Function, i| {
+            let f32t = f.locals[0].ty;
+            let s = wrela_ir::LocalId(0);
+            let (x, a, b) = (f.new_value(f32t), f.new_value(f32t), f.new_value(f32t));
+            vec![
+                Stmt::Let(x, Expr::Load(elem(i))),
+                Stmt::Let(a, Expr::Load(Place::local(s))),
+                Stmt::Let(b, Expr::Binary(BinOp::Add, a, x)),
+                Stmt::Store(Place::local(s), b),
+            ]
+        };
+        assert_eq!(loop_simd(sum, &["s"]), (0, 0));
     }
 
     /// Engines reject a function with more than 50,000 locals; a derived function can have

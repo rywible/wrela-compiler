@@ -1,0 +1,22 @@
+// mistake: a draw with both shaders' arguments among its own, as before binding
+// expect: E0603
+// fix: yes
+use std::gpu::{ClipPosition, FragCoord, VertexIndex, begin_screen_pass, draw, present}
+
+@vertex
+fn cover(v: VertexIndex, size: f32) -> ClipPosition {
+    let x = f32(v.index % 2) * 4.0 * size - 1.0
+    let y = f32(v.index / 2) * 4.0 * size - 1.0
+    ClipPosition { position: vec4(x, y, 0.0, 1.0) }
+}
+
+@fragment
+fn sky(pixel: FragCoord, top: vec4, bottom: vec4) -> vec4 {
+    mix(bottom, top, pixel.position.y / 720.0)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    begin_screen_pass(clear: vec4(0.0, 0.0, 0.0, 1.0))
+    draw(cover, sky, vertices: 3, size: 1.0, top: vec4(0.1, 0.2, 0.6, 1.0), bottom: vec4(1.0))
+    present()
+}

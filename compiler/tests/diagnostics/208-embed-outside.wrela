@@ -1,0 +1,4 @@
+// mistake: embedding a file outside the package
+// expect: E0218
+// fix: no
+const KEYS: Bytes = embed("../secrets.txt")

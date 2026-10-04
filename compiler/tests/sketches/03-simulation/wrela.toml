@@ -1,0 +1,7 @@
+# Sketch 03, "the simulation" (compiler/tests/tests/suite/sketches.rs).
+[package]
+name = "simulation"
+
+[dependencies]
+engine = { path = "../engine" }
+grazer = { path = "../01-creature" }

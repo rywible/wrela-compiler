@@ -1,0 +1,19 @@
+// `break` or `continue` outside a loop.
+// ---- wrong
+fn first(xs: [f32]) -> f32 {
+    if xs.len() == 0 {
+        break
+    }
+    xs[0]
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+fn first(xs: [f32]) -> f32 {
+    if xs.len() == 0 {
+        return 0.0
+    }
+    xs[0]
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

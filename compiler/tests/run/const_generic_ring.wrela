@@ -1,0 +1,32 @@
+// run: a function and a struct generic over a length
+// expect: run() = 17.0
+
+fn sum<const N: u32>(xs: [f32; N]) -> f32 {
+    var s = 0.0
+    for i in 0..N {
+        s += xs[i]
+    }
+    s
+}
+
+struct Ring<const N: u32>: Copy {
+    values: [f32; N],
+    next: u32,
+}
+
+impl<const N: u32> Ring<N> {
+    fn push(mut self, v: f32) {
+        self.values[self.next] = v
+        self.next = (self.next + 1) % N
+    }
+}
+
+pub fn run() -> f32 {
+    var r = Ring { values: [0.0; 4], next: 0 }
+    for i in 0..6 {
+        r.push(f32(i))
+    }
+    sum(r.values) + sum([1.0, 2.0])
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

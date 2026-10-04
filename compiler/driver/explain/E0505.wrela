@@ -1,0 +1,18 @@
+// An assignment to something that can't change: a `let` binding, a parameter that isn't `mut`,
+// a constant, a temporary. Declare a variable with `var`, or a parameter `mut`.
+// ---- wrong
+fn count() -> u32 {
+    let n = 0
+    n = n + 1
+    n
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+fn count() -> u32 {
+    var n = 0
+    n = n + 1
+    n
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

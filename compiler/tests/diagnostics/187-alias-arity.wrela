@@ -1,0 +1,8 @@
+// mistake: a type alias used without its parameter
+// expect: E0322
+// fix: no
+type Pair<T> = (T, T)
+
+fn sum(p: Pair) -> f32 {
+    p.0 + p.1
+}

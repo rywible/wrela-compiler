@@ -108,8 +108,8 @@ fn nested_loops() -> f32 {
 // R3-11: loans held through projections of projections, and of call results.
 fn second_level() -> u32 {
     var w = mk()
-    let g = w.log
-    let h = g
+    borrow g = w.log
+    borrow h = g
     w.log = Log { count: 7, last: 0.0, inner: Inner { v: 2 } } //~ E0507
     h.count
 }
@@ -132,7 +132,7 @@ fn nested_call_projection() -> f32 {
 }
 
 fn field_of_call_projection(w: mut World) -> u32 {
-    let l = peek(w).inner
+    borrow l = peek(w).inner
     w.log.inner = Inner { v: 9 } //~ E0507
     l.v
 }

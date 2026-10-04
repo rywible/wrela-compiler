@@ -1,0 +1,4 @@
+// rejects: mem.plain
+struct Save: Plain {
+    name: String, //~ E0417
+}

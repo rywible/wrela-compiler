@@ -1,0 +1,10 @@
+// A number that isn't well formed: `0x` with no digits, an exponent with no digits (`1e`), or
+// a fraction after an exponent.
+// ---- wrong
+const LIMIT: f32 = 1e
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+const LIMIT: f32 = 1e3
+
+pub fn frame(time: f32, width: u32, height: u32) {}

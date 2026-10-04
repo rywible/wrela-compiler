@@ -1,0 +1,15 @@
+// rejects: mod.packages trait.orphan
+// Only a dependency's `pub` API crosses: not its private items, not its `pub(package)` ones;
+// and the orphan rule holds across packages.
+use geo::shapes::{Circle, Area}
+
+fn f() -> f32 {
+    let c = Circle { r: 2.0 }
+    geo::shapes::secret(c.r) + geo::shapes::squared(c.r) //~ E0203 E0203
+}
+
+impl Area for Circle { //~ E0404
+    fn area(self) -> f32 {
+        self.r
+    }
+}

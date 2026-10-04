@@ -1,0 +1,14 @@
+// mistake: a `SortedMap` keyed by a struct that doesn't declare `Ord`
+// expect: E0400 E0400
+// fix: yes
+use std::arena::SortedMap
+
+struct Cell: Eq + Clone {
+    x: u32,
+    y: u32,
+}
+
+fn heights() -> u32 {
+    var m: SortedMap<Cell, f32> = SortedMap::new()
+    m.len()
+}

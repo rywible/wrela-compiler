@@ -1,0 +1,26 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0325",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "an array length is an integer literal or a constant holding one, not a variable",
+      "notes": [],
+      "severity": "error",
+      "span": {
+        "column": 20,
+        "end": 119,
+        "end_column": 21,
+        "end_line": 5,
+        "line": 5,
+        "start": 118
+      },
+      "title": "an array length that isn't a constant"
+    }
+  ],
+  "version": 2
+}

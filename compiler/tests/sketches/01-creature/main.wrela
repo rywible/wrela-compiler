@@ -1,0 +1,143 @@
+// Sketch 01's program (compiler/tests/tests/suite/sketches.rs): the sketch is `sketch.wrela`;
+// this module is the program's interface to the host, what the tests call. It runs a few
+// grazers: `step` each tick, `animate` and `draw` each frame, and their hooves' strikes rung by
+// the audio thread.
+
+use engine::acoustics::{Bank, Contact, SurfacePoint, SOIL, bank}
+use engine::creature::Creature
+use engine::rng::{Rng, seed}
+use engine::sim::{
+    CreatureKey, Frame, GaitState, Intent, Mode, Pose, SimTier, Spring, SpringChain, Transform,
+}
+use sketch::{
+    GrazerLook, GrazerSim, HOOF_MODES, Terrain, World, animate, draw, grazer, grazer_physique,
+    hoof_strike, step,
+}
+use std::arena::Arena
+use std::audio::{RingReader, RingWriter, play, ring}
+use std::field::Lipschitz
+use std::hash::state_hash
+use std::units::cm
+
+// ---- §2, §4 and §7 as numbers -----------------------------------------------------------------
+
+/// Grazer `id`'s physique: its mass (kg), the number of bones with mass, the capsules' count,
+/// and the first capsule's radius.
+pub fn physique(id: u32) -> vec4 {
+    let p = grazer_physique(grazer(seed(id)))
+    var bones = 0
+    for m in p.mass.per {
+        if m.mass > 0.0 {
+            bones += 1
+        }
+    }
+    vec4(p.mass.total.mass, f32(bones), f32(p.collision.len()), p.collision[0].radius)
+}
+
+/// The physique's state hash: the same on every client, and every run.
+pub fn physique_hash(id: u32) -> u64 {
+    state_hash(grazer_physique(grazer(seed(id))))
+}
+
+// ---- a herd, ticked and drawn -----------------------------------------------------------------
+
+/// The voice: a bank of resonators that hoof strikes ring.
+struct Hooves {
+    bank: Bank,
+    strikes: RingReader<Contact>,
+}
+
+@audio
+fn ring_hooves(h: mut Hooves, out: mut [f32]) {
+    loop {
+        let Some(c) = h.strikes.pop() else { break }
+        h.bank.strike(hoof_strike(c))
+    }
+    for i in 0..out.len() {
+        out[i] = 0.1 * h.bank.sample()
+    }
+}
+
+pub struct Game {
+    world: World,
+    looks: Vec<GrazerLook>,
+    frame: Frame,
+    strikes: RingWriter<Contact>,
+    ticks: u32,
+    planted: u32,
+}
+
+const HERD: u32 = 3
+
+pub fn init() -> Game {
+    var grazers: Arena<GrazerSim> = Arena::new()
+    var looks: Vec<GrazerLook> = Vec::new()
+    let world_rng = Rng::new(seed(42))
+    for i in 0..HERD {
+        let gait = GaitState { phase: 0.3 * f32(i), speed: 0.5, turn: 0.0, mode: Mode::Walk }
+        let _ = grazers.insert(
+            GrazerSim {
+                kind: CreatureKey { kind: 1, seed: seed(i + 1) },
+                tier: if i == 0 { SimTier::Full } else { SimTier::Ambient },
+                rng: world_rng.split(i),
+                root: Transform { pos: vec3(3.0 * f32(i), 0, 0), heading: 0.0 },
+                gait,
+                pose: gait.pose(),
+            },
+        )
+        looks.push(
+            GrazerLook {
+                pose: gait.pose(),
+                tail: SpringChain::new(6, 40.0),
+                ears: [Spring { pos: vec3(), vel: vec3() }; 2],
+            },
+        )
+    }
+    let (writer, reader) = ring::<Contact>(64)
+    play(Hooves { bank: bank(), strikes: take reader }, ring_hooves)
+    let terrain = Terrain { hill: vec3(4, 0, 6), height: 0.8, width: 3.0 }
+    Game {
+        world: World { terrain, grazers },
+        looks,
+        frame: Frame::new(),
+        strikes: take writer,
+        ticks: 0,
+        planted: 0,
+    }
+}
+
+pub fn frame(state: mut Game, time: f32, width: u32, height: u32) {
+    // A tick per frame: each grazer turns gently and walks on.
+    var i = 0
+    for mut g in state.world.grazers {
+        let intent = Intent { turn: 0.2 * f32(i % 2), speed: 0.8, flee: false }
+        // A stride's end: the first leg's foot comes down.
+        let before = g.gait.phase
+        step(mut g, state.world.terrain, intent)
+        if g.gait.phase < before {
+            state.planted += 1
+            let _ = state.strikes.push(
+                Contact { surface: SurfacePoint { absorption: SOIL }, impulse: 0.5 },
+            )
+        }
+        i += 1
+    }
+    state.ticks += 1
+    state.frame = Frame::new()
+    var k = 0
+    for g in state.world.grazers {
+        animate(g, mut state.looks[k], state.world, 1.0 / 60.0)
+        draw(g, state.looks[k], mut state.frame)
+        k += 1
+    }
+}
+
+/// The sim state's hash: every grazer, as `@deterministic` code computed it.
+pub fn world_hash(state: Game) -> u64 {
+    state_hash(state.world)
+}
+
+/// How many creatures the last frame drew, and how many hooves struck the ground.
+pub fn drawn(state: Game) -> vec2 {
+    vec2(f32(state.frame.items.len()), f32(state.planted))
+}

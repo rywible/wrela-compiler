@@ -6,7 +6,7 @@
 use crate::common::{self, TempDir};
 
 use wrela_abi::hash::StateHash;
-use wrela_abi::stream::Encoder;
+use wrela_abi::stream::{Binding, Encoder};
 use wrela_host::{Error, Host, Options, Value, frame_time, image};
 
 const SEEDS: [u32; 4] = [0xff30_1810, 0xff20_70e0, 0xff40_1030, 0xff60_c0f0];
@@ -24,7 +24,7 @@ fn first_light_hash(times: &[f32], width: u32, height: u32) -> u64 {
         &Encoder::new()
             .create_buffer(1, 256)
             .write_buffer(1, 0, &words(&SEEDS))
-            .dispatch(1, [1, 1, 1], &[1], &words(&[STEP, 64, 0, 0]))
+            .dispatch(1, [1, 1, 1], &[Binding::range(1, 0, 256)], &words(&[STEP, 64, 0, 0]))
             .finish(),
     );
     for &t in times {
@@ -44,7 +44,7 @@ fn first_light_hash(times: &[f32], width: u32, height: u32) -> u64 {
         hash.update(
             &Encoder::new()
                 .begin_screen_pass([0.02, 0.03, 0.06, 1.0])
-                .draw(0, 3, 1, &[1], &uniforms)
+                .draw(0, 3, 1, &[Binding::range(1, 0, 256)], &uniforms)
                 .present()
                 .finish(),
         );
@@ -169,13 +169,13 @@ struct C { cell: vec2u, size: vec2u, colour: u32, _pad: u32, _pad2: vec2u }
 @fragment fn fs() -> @location(0) vec4f { return unpack4x8unorm(c.colour); }
 "#;
 const STORE_MANIFEST: &str = r#"{
-  "manifest_version": 1, "stream_version": 2, "wasm": "game.wasm",
+  "manifest_version": 2, "stream_version": 4, "wasm": "game.wasm",
   "pipelines": [
     { "name": "store", "shader": "store.wgsl", "kind": "compute", "entry": "store", "workgroup_size": [1, 1, 1],
       "uniform": { "binding": 0, "size": 16, "space": "uniform" },
-      "buffers": [{ "binding": 1, "access": "read_write" }] },
+      "bindings": [{ "binding": 1, "kind": "read_write" }] },
     { "name": "cell", "shader": "cell.wgsl", "kind": "render", "vertex_entry": "vs", "fragment_entry": "fs",
-      "uniform": { "binding": 0, "size": 32, "space": "uniform" }, "buffers": [] }
+      "uniform": { "binding": 0, "size": 32, "space": "uniform" }, "bindings": [] }
   ]
 }"#;
 
@@ -203,7 +203,7 @@ fn every_command_gets_its_own_uniforms() {
     let mut e = Encoder::new();
     e.create_buffer(1, n * 4);
     for i in 0..n {
-        e.dispatch(0, [1, 1, 1], &[1], &words(&[i, i * 7 + 1, 0, 0]));
+        e.dispatch(0, [1, 1, 1], &[Binding::range(1, 0, n * 4)], &words(&[i, i * 7 + 1, 0, 0]));
     }
     e.begin_screen_pass([0.0, 0.0, 0.0, 1.0]);
     for i in 0..w * h {
@@ -227,9 +227,9 @@ fn writes_apply_in_recorded_order() {
     let mut e = Encoder::new();
     e.create_buffer(1, 16)
         .write_buffer(1, 0, &words(&[1, 2, 3, 4]))
-        .dispatch(0, [1, 1, 1], &[1], &words(&[1, 20, 0, 0]))
+        .dispatch(0, [1, 1, 1], &[Binding::range(1, 0, 16)], &words(&[1, 20, 0, 0]))
         .write_buffer(1, 8, &words(&[30]))
-        .dispatch(0, [1, 1, 1], &[1], &words(&[3, 40, 0, 0]))
+        .dispatch(0, [1, 1, 1], &[Binding::range(1, 0, 16)], &words(&[3, 40, 0, 0]))
         .write_buffer(1, 0, &words(&[10]));
     let (_dir, mut host) = store_host("order", &[vec![e.finish()]], &Options::default());
     host.run_frames(&[0.0], 4, 4).expect("runs");
@@ -244,10 +244,10 @@ fn times_dispatches_and_passes_with_timestamps() {
         if i == 0 {
             e.create_buffer(1, 64);
         }
-        e.dispatch(0, [1, 1, 1], &[1], &words(&[i, i, 0, 0])).dispatch(
+        e.dispatch(0, [1, 1, 1], &[Binding::range(1, 0, 64)], &words(&[i, i, 0, 0])).dispatch(
             0,
             [1, 1, 1],
-            &[1],
+            &[Binding::range(1, 0, 64)],
             &words(&[i + 1, i, 0, 0]),
         );
         e.begin_screen_pass([0.0; 4])
@@ -275,7 +275,7 @@ fn times_more_passes_than_one_query_set_holds() {
     let mut e = Encoder::new();
     e.create_buffer(1, 4 * 300);
     for i in 0..300 {
-        e.dispatch(0, [1, 1, 1], &[1], &words(&[i, i, 0, 0]));
+        e.dispatch(0, [1, 1, 1], &[Binding::range(1, 0, 4 * 300)], &words(&[i, i, 0, 0]));
     }
     let (_dir, mut host) = store_host(
         "many-timestamps",

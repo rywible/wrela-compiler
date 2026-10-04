@@ -1,8 +1,16 @@
 // rejects: struct.defaults
 struct Look {
     tolerance: f32 = true, //~ E0300
-    resolution: u32 = 2 + 2, //~ E0324
+    resolution: u32 = 2 + 2,
     soft: bool,
+}
+
+struct Ring<T> {
+    first: T = zero(), //~ E0324
+}
+
+fn zero<T>() -> T {
+    panic("no zero")
 }
 
 fn f() -> f32 {

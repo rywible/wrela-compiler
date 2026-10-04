@@ -1,0 +1,14 @@
+// mistake: a constant whose computation panics
+// expect: E0704
+// fix: no
+const NAMES: [Text; 2] = ["hip", "knee"]
+const SPINE: u32 = find("spine")
+
+fn find(name: Text) -> u32 {
+    for i in 0..2 {
+        if NAMES[i] == name {
+            return i
+        }
+    }
+    panic(f"no bone is named `{name}`")
+}

@@ -1,0 +1,138 @@
+// Raw memory: what std's unsafe core is built on (language.md §6.14). Addresses are `u32`s, and
+// nothing here is checked: a wrong address or size breaks the program's memory. Each function
+// can be called only inside `unsafe`, which only std's core uses.
+
+/// A destructor: what dropping a value does besides dropping its fields. Only std's core
+/// implements it (§18), for the types that own memory: `Vec`, `Box`.
+pub trait Drop {
+    /// Frees what the value owns. The compiler calls it once, when the value is dropped.
+    fn drop(mut self)
+}
+
+/// The bytes a `T` takes, padding included: the distance between neighbours in an array.
+@intrinsic
+pub fn size_of<T>() -> u32 {}
+
+/// The alignment of a `T`, in bytes.
+@intrinsic
+pub fn align_of<T>() -> u32 {}
+
+/// Whether dropping a `T` does anything: whether it holds memory to free.
+@intrinsic
+pub fn needs_drop<T>() -> bool {}
+
+/// The `T` at `addr`, moved out. The memory is left as it was: what's there mustn't be dropped
+/// again.
+@intrinsic
+pub fn read<T>(addr: u32) -> T {}
+
+/// Moves `value` to `addr`. What was there isn't dropped.
+@intrinsic
+pub fn write<T>(addr: u32, value: take T) {}
+
+/// Drops the `T` at `addr`, and leaves zeros there.
+@intrinsic
+pub fn drop_at<T>(addr: u32) {}
+
+/// A read-only projection of the `T` at `addr`, which borrows `owner`, the value that owns the
+/// memory.
+@intrinsic
+pub fn at<T, O>(owner: O, addr: u32) -> borrow T {}
+
+/// A mutable projection of the `T` at `addr`, which borrows `owner` mutably.
+@intrinsic
+pub fn at_mut<T, O>(owner: mut O, addr: u32) -> mut T {}
+
+/// Two values to change at once: what `pair_mut` gives (`Vec`'s, `Arena`'s). Each field is a
+/// `mut` projection, and the two never overlap.
+pub borrow struct Pair<T> {
+    pub a: mut T,
+    pub b: mut T,
+}
+
+/// Mutable projections of the `T`s at `a` and `b`, which must not overlap, both borrowing
+/// `owner` mutably.
+@intrinsic
+pub fn at_mut_pair<T, O>(owner: mut O, a: u32, b: u32) -> Pair<T> {}
+
+/// Where the heap starts: the first page after the program's constants.
+@intrinsic
+pub fn heap_base() -> u32 {}
+
+/// The memory's size, in 64 KiB pages.
+@intrinsic
+pub fn memory_pages() -> u32 {}
+
+/// Grows the memory by `pages` pages: its old size in pages, or `u32::MAX` if it can't grow.
+@intrinsic
+pub fn memory_grow(pages: u32) -> u32 {}
+
+/// The `u32` at `addr`, little-endian.
+@intrinsic
+pub fn load_u32(addr: u32) -> u32 {}
+
+/// Writes `value` at `addr`, little-endian.
+@intrinsic
+pub fn store_u32(addr: u32, value: u32) {}
+
+/// The byte at `addr`.
+@intrinsic
+pub fn load_u8(addr: u32) -> u8 {}
+
+/// Writes the byte `value` at `addr`.
+@intrinsic
+pub fn store_u8(addr: u32, value: u8) {}
+
+/// Copies `bytes` bytes from `src` to `dst`; the ranges may overlap.
+@intrinsic
+pub fn copy(dst: u32, src: u32, bytes: u32) {}
+
+/// Sets `bytes` bytes at `dst` to `byte`.
+@intrinsic
+pub fn fill(dst: u32, byte: u32, bytes: u32) {}
+
+/// Compares the `u32` at `addr` with `expected` and, if they're equal, replaces it with `new`:
+/// the value that was there. Atomic once workers share the memory.
+@intrinsic
+pub fn compare_swap(addr: u32, expected: u32, new: u32) -> u32 {}
+
+/// Copies request `request`'s answer, which the host holds, to `addr`, and forgets the request
+/// (`wrela.request_take`). The caller makes room for the bytes `std::io::request_status` gave.
+@intrinsic
+pub fn take_answer(request: u32, addr: u32) {}
+
+/// Adds `value` to the `u32` at `addr`, atomically: the old value. Workers share the memory.
+@intrinsic
+pub fn atomic_add(addr: u32, value: u32) -> u32 {}
+
+/// The `u32` at `addr`, read atomically.
+@intrinsic
+pub fn atomic_load(addr: u32) -> u32 {}
+
+/// Stores `value` at `addr`, atomically.
+@intrinsic
+pub fn atomic_store(addr: u32, value: u32) {}
+
+/// Waits while the `u32` at `addr` is `expected` (until another thread `notify`s it): 0 when
+/// woken, 1 when it wasn't `expected`.
+@intrinsic
+pub fn wait(addr: u32, expected: u32) -> u32 {}
+
+/// Wakes up to `count` threads waiting at `addr`: how many it woke.
+@intrinsic
+pub fn notify(addr: u32, count: u32) -> u32 {}
+
+/// Runs task `task` (a parallel job's code: `std::par`) on chunk `chunk`, with its context at
+/// `ctx`.
+@intrinsic
+pub fn run_task(task: u32, ctx: u32, chunk: u32) {}
+
+/// Traps, keeping the panic message another thread left (`std::par`).
+@intrinsic
+pub fn abort() {}
+
+/// Whether this is a debug build (`wrela build --debug`, and `wrela test`), which pays for
+/// checks a release build doesn't make: a constant, so a release build has no trace of them,
+/// nor of the functions only they call.
+@intrinsic
+pub fn debug_build() -> bool {}

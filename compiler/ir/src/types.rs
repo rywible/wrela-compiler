@@ -84,6 +84,9 @@ pub enum TypeDef {
     Run(TypeId),
     /// A pointer to a `T` (CPU only).
     Ptr(TypeId),
+    /// `atomic<u32>` or `atomic<i32>` (GPU only): read and written with `Expr::Atomic`, loads
+    /// and stores.
+    Atomic(Scalar),
 }
 
 #[derive(Clone, Debug, Default)]
@@ -198,6 +201,7 @@ impl Types {
     pub fn has_float(&self, t: TypeId) -> bool {
         match self.get(t) {
             TypeDef::Scalar(s) => s.is_float(),
+            TypeDef::Atomic(_) => false,
             TypeDef::Vector(_) | TypeDef::Matrix(_) => true,
             TypeDef::Struct { fields, .. } => fields.iter().any(|(_, f)| self.has_float(*f)),
             TypeDef::Enum { variants, .. } => {
@@ -219,6 +223,7 @@ impl Types {
             TypeDef::RuntimeArray(e) => format!("[{}]", self.display(*e)),
             TypeDef::Run(e) => format!("run[{}]", self.display(*e)),
             TypeDef::Ptr(e) => format!("*{}", self.display(*e)),
+            TypeDef::Atomic(s) => format!("atomic<{}>", s.name()),
         }
     }
 }

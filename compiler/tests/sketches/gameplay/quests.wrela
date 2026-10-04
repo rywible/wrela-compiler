@@ -1,0 +1,146 @@
+// Quests that react to events (paper test §4), read from data/quests.txt when the game is
+// built.
+//
+// Changed from the paper test: a quest's stages and rewards are `Vec`s inside one constant
+// (F5); goals compare items and flags with `==` (F6); the tracker's line is an `f"…"` string
+// (F7).
+
+use dialogue::{Effect, apply, effect}
+use engine::sim::{SimState, SimValue}
+use engine::ui::Ui
+use flags::{FlagId, flag}
+use items::{ItemId, item, item_def}
+use std::hash::StateHash
+use std::serialize::Serialize
+use text::{Words, columns, file_text, rows}
+use world::{Event, World}
+
+/// What a quest stage asks for.
+pub enum Goal: Copy {
+    Collect { item: ItemId, count: u32 },
+    Flag(FlagId),
+}
+
+pub struct Stage: Clone {
+    pub journal: String,
+    pub goal: Goal,
+    /// Applied when the stage is done.
+    pub reward: Vec<Effect>,
+}
+
+pub struct QuestDef: Clone {
+    pub key: String,
+    pub title: String,
+    pub stages: Vec<Stage>,
+}
+
+pub const QUESTS: Vec<QuestDef> = parse_quests(
+    file_text(embed("data/quests.txt"), "data/quests.txt"),
+)
+
+/// Progress on one quest: sim state, one per quest.
+pub struct QuestState: SimValue {
+    pub stage: u32,
+    pub done: bool,
+    pub tracked: bool,
+}
+
+fn parse_quests(file: String) -> Vec<QuestDef> {
+    var quests: Vec<QuestDef> = Vec::new()
+    for r in rows(file) {
+        let row = r.0
+        let c = columns(r.1, "|")
+        var w = Words::new(c[0], row, "data/quests.txt")
+        let keyword = w.next()
+        match keyword {
+            "quest" => {
+                if c.len() != 2 {
+                    w.stop("expected `quest <key> | <title>`")
+                }
+                quests.push(QuestDef { key: w.next(), title: c[1].clone(), stages: Vec::new() })
+            },
+            "stage" => {
+                if quests.len() == 0 || c.len() < 2 {
+                    w.stop("expected `stage <goal> | <journal> [| <rewards>]`, inside a quest")
+                }
+                let kind = w.next()
+                let (name, count) = w.call_args()
+                let goal = match kind {
+                    "collect" => Goal::Collect { item: item(name), count },
+                    "flag" => Goal::Flag(flag(name)),
+                    _ => w.fail(f"unknown goal `{kind}`"),
+                }
+                var reward: Vec<Effect> = Vec::new()
+                if c.len() > 2 {
+                    var r = Words::new(c[2], row, "data/quests.txt")
+                    while !r.done() {
+                        reward.push(effect(mut r))
+                    }
+                }
+                let q = quests.len() - 1
+                quests[q].stages.push(
+                    Stage { journal: c[1].clone(), goal: take goal, reward: take reward },
+                )
+            },
+            _ => w.stop(f"unknown line `{keyword}`"),
+        }
+    }
+    quests
+}
+
+/// Each quest's state at the start: the first stage, tracked.
+pub fn fresh() -> Vec<QuestState> {
+    var out: Vec<QuestState> = Vec::new()
+    for _ in 0..QUESTS.len() {
+        out.push(QuestState { stage: 0, done: false, tracked: true })
+    }
+    out
+}
+
+@deterministic
+pub fn quests_react(w: mut World, e: Event) {
+    for q in 0..QUESTS.len() {
+        let st = w.quests[q] // `Copy`: no borrow of `w` stays live
+        if st.done {
+            continue
+        }
+        borrow stage = QUESTS[q].stages[st.stage]
+        let met = match (stage.goal, e) {
+            (Goal::Collect { item, count }, Event::ItemGained { item: got, .. }) => {
+                got == item && w.player.bag.count(item) >= count
+            },
+            (Goal::Flag(f), Event::FlagSet(set)) => f == set,
+            _ => false,
+        }
+        if met {
+            advance(mut w, q)
+        }
+    }
+}
+
+@deterministic
+fn advance(w: mut World, q: u32) {
+    let st = w.quests[q]
+    for r in QUESTS[q].stages[st.stage].reward {
+        apply(mut w, r) // §2's `apply`: give, take, set flags
+    }
+    let next = st.stage + 1
+    w.quests[q] = QuestState { stage: next, done: next == QUESTS[q].stages.len(), ..st }
+    w.events.push(Event::QuestAdvanced { quest: q, stage: next }) // handled next round
+}
+
+/// The HUD's quest lines, such as "Wolf pelts 3/5". Presentation.
+pub fn tracked_quest(ui: mut Ui, world: World) {
+    for q in 0..QUESTS.len() {
+        let st = world.quests[q]
+        if !st.tracked || st.done {
+            continue
+        }
+        borrow stage = QUESTS[q].stages[st.stage]
+        ui.label(stage.journal)
+        if let Goal::Collect { item, count } = stage.goal {
+            let have = min(world.player.bag.count(item), count)
+            ui.label(f"{item_def(item).name} {have}/{count}")
+        }
+    }
+}

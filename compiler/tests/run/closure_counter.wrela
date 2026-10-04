@@ -1,0 +1,19 @@
+// run: a closure passed as `fn(u32)` writes what it captures
+// expect: count_near() = 3
+
+fn each_near(points: [vec3], p: vec3, r: f32, f: fn(u32)) {
+    for i in 0..points.len() {
+        if distance(points[i], p) <= r {
+            f(i)
+        }
+    }
+}
+
+pub fn count_near() -> u32 {
+    let points = [vec3(), vec3(1.0, 0.0, 0.0), vec3(5.0, 0.0, 0.0), vec3(0.0, 2.0, 0.0)]
+    var count = 0
+    each_near(points, vec3(), 2.0, |i| { count += 1 })
+    count
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

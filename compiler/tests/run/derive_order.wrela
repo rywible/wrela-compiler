@@ -45,8 +45,9 @@ pub fn value_x(x: f32, y: f32) -> f32 {
     row(vec3(x, y, 0.0))
 }
 
-/// x / |p| over [1, 1.1]² × [0, 0.1] is in about [0.67, 0.74].
+/// x / |p| over [1, 1.1]² × [0, 0.1] is in [1 / √2.22, 1.1 / √2.21] = [0.671156, 0.739940]:
+/// the derived range holds it, and is within 1% of it.
 pub fn encloses() -> bool {
     let r = nx_range(vec3(1.0, 1.0, 0.0), vec3(1.1, 1.1, 0.1))
-    r.x <= 0.67 && r.y >= 0.74 && r.x > 0.5
+    r.x <= 0.671156 && r.y >= 0.73994 && r.x > 0.6645 && r.y < 0.7474
 }

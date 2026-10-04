@@ -1,0 +1,14 @@
+// An expression, block, type or pattern is nested deeper than the compiler goes (128 levels of
+// brackets, 512 of operators). Move the inner parts into `let` bindings or functions.
+// ---- wrong
+fn deep() -> i32 {
+    ((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((1))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+fn deep() -> i32 {
+    1
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

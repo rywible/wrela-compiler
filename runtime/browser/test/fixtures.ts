@@ -46,10 +46,11 @@ export function shapes(): Manifest {
         vertex_entry: "vs",
         fragment_entry: "fs",
         uniform: { binding: 0, size: 16, space: "uniform" },
-        buffers: [
-          { binding: 1, access: "read" },
-          { binding: 2, access: "read_write" },
+        bindings: [
+          { binding: 1, kind: "read" },
+          { binding: 2, kind: "read_write" },
         ],
+        debug_flag: null,
       },
       {
         kind: "compute",
@@ -58,10 +59,11 @@ export function shapes(): Manifest {
         entry: "main",
         workgroup_size: [64, 1, 1],
         uniform: { binding: 0, size: 16, space: "uniform" },
-        buffers: [
-          { binding: 1, access: "read" },
-          { binding: 2, access: "read_write" },
+        bindings: [
+          { binding: 1, kind: "read" },
+          { binding: 2, kind: "read_write" },
         ],
+        debug_flag: null,
       },
     ],
   };

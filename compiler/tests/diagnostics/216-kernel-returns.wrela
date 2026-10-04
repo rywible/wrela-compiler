@@ -1,0 +1,9 @@
+// mistake: a compute kernel that returns its result
+// expect: E0602
+// fix: no
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch}
+
+@compute(64)
+fn double(x: f32, id: GlobalId) -> f32 {
+    x * 2.0
+}

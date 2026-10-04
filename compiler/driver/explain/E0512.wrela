@@ -1,0 +1,26 @@
+// A `mut` projection (`mut x`, a `mut` binding, a `-> mut T` result) of a place that can't
+// change: a constant, a `let` binding, a parameter that isn't `mut`.
+// ---- wrong
+fn grow(x: mut f32) {
+    x *= 2.0
+}
+
+fn twice() -> f32 {
+    let x = 1.0
+    grow(mut x)
+    x
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+fn grow(x: mut f32) {
+    x *= 2.0
+}
+
+fn twice() -> f32 {
+    var x = 1.0
+    grow(mut x)
+    x
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

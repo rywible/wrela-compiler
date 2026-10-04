@@ -1,0 +1,6 @@
+# quest <name> | <title>, then stages: stage <goal> | <journal> [| <reward effects>]
+quest pelts | Wolf Trouble
+  stage collect(wolf_pelt, 3) | Collect three wolf pelts. | give(gold_coin, 20)
+  stage flag(pelts_delivered) | Bring the pelts to Mira. | give(bread, 2)
+quest gate | The Old Gate
+  stage flag(gate_opened) | Open the gate by the river.

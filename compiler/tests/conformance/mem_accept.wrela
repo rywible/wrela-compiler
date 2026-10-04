@@ -73,7 +73,7 @@ fn pick_from(p: mut Pair, q: Pair) -> mut f32 {
 // A `mut` result points into the `mut` arguments only, so writing through it leaves a
 // `borrow` argument and what borrows it alone.
 fn result_writes(p: mut Pair, q: Pair) -> u32 {
-    let held = q.a
+    borrow held = q.a
     mut x = pick_from(mut p, q)
     x += 1.0
     held.count

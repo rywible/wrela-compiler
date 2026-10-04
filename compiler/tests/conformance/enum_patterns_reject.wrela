@@ -6,7 +6,7 @@ enum K {
     C,
 }
 
-struct S: Copy + Clone {
+struct S: Copy {
     a: i32,
     b: i32,
 }

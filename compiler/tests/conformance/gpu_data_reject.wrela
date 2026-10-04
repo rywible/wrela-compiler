@@ -1,7 +1,7 @@
 // rejects: gpu.data
 use std::gpu::{ClipPosition, GlobalId, Slots, VertexIndex, dispatch}
 
-struct Loose: Copy + Clone {
+struct Loose: Copy {
     scale: f32,
 }
 
@@ -11,7 +11,7 @@ fn fill(p: Loose, out: mut Slots<f32>, id: GlobalId) { //~ E0604
 }
 
 // Only a fragment shader takes the vertex output.
-struct Out: Copy + Clone {
+struct Out: Copy {
     pos: ClipPosition,
 }
 

@@ -1,0 +1,17 @@
+// accepts: mod.use
+// A program with state exports `init`, and `frame` takes the state first, `mut` (§12).
+struct World {
+    t: f32,
+}
+
+pub fn init() -> World {
+    World { t: 0.0 }
+}
+
+pub fn frame(world: mut World, time: f32, width: u32, height: u32) {
+    world.t = time
+}
+
+pub fn time(world: World) -> f32 {
+    world.t
+}

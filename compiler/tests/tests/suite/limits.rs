@@ -83,7 +83,7 @@ fn depth_at_the_limit_builds_and_past_it_is_an_error() {
 
 #[test]
 fn polymorphic_recursion_is_an_error() {
-    let src = "struct Pair<T>: Copy + Clone {
+    let src = "struct Pair<T>: Copy {
     a: T,
     b: T,
 }
@@ -305,11 +305,11 @@ fn a_type_that_doubles_through_later_bindings_is_an_error_quickly() {
 #[test]
 fn values_too_large_for_memory_trap_on_entry() {
     // Each struct holds two of the one before: 2^41 floats, laid out once per struct.
-    let mut src = String::from("struct P0: Copy + Clone { a: f32, b: f32 }\n");
+    let mut src = String::from("struct P0: Copy { a: f32, b: f32 }\n");
     src.push_str("fn mk0() -> P0 {\n    P0 { a: 1.0, b: 2.0 }\n}\n");
     for i in 1..40 {
         let j = i - 1;
-        src.push_str(&format!("struct P{i}: Copy + Clone {{ a: P{j}, b: P{j} }}\n"));
+        src.push_str(&format!("struct P{i}: Copy {{ a: P{j}, b: P{j} }}\n"));
         src.push_str(&format!(
             "fn mk{i}() -> P{i} {{\n    let x = mk{j}()\n    P{i} {{ a: x, b: x }}\n}}\n"
         ));

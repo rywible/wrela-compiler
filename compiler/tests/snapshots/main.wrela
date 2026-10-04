@@ -1,0 +1,165 @@
+// Snapshots (compiler/tests/tests/suite/snapshots.rs, language.md §6.11): a small world for
+// restores and replays, and a large one, 10,000 entities of 256 bytes, for measuring a copy and
+// a hash. Keyframes are clones, taken with `clone_into` into the previous keyframe; checksums are
+// the derived `StateHash`.
+use std::alloc::allocations
+use std::hash::{StateHash, state_hash}
+
+struct Entity: Copy + StateHash {
+    pos: vec4,
+    vel: vec4,
+    // The rest of 256 bytes: what an entity carries besides its motion.
+    data: [f32; 56],
+}
+
+struct World: Clone + StateHash {
+    tick: u32,
+    seed: u32,
+    entities: Vec<Entity>,
+    // The last 32 inputs, oldest overwritten first.
+    inputs: Vec<u32>,
+    names: Vec<String>,
+}
+
+pub struct Game {
+    world: World,
+    keyframes: Vec<World>,
+    big: World,
+    spare: World,
+    // Allocations counted around the last `keyframe` or `restore`.
+    allocated: u32,
+}
+
+const SLOTS: u32 = 8
+
+fn world(n: u32) -> World {
+    var entities: Vec<Entity> = Vec::with_capacity(n)
+    for i in 0..n {
+        let x = f32(i)
+        var data = [0.0; 56]
+        for k in 0..56 {
+            data[k] = x * 0.5 + f32(k)
+        }
+        entities.push(Entity { pos: vec4(x, 0.0, 0.0, 1.0), vel: vec4(1.0, 0.5, 0.0, 0.0), data })
+    }
+    var inputs: Vec<u32> = Vec::new()
+    for i in 0..32 {
+        inputs.push(i)
+    }
+    var names: Vec<String> = Vec::new()
+    for i in 0..4 {
+        names.push(f"entity group {i}")
+    }
+    World { tick: 0, seed: 12345, entities, inputs, names }
+}
+
+pub fn init() -> Game {
+    let w = world(256)
+    var keyframes: Vec<World> = Vec::new()
+    for _i in 0..SLOTS {
+        keyframes.push(w.clone())
+    }
+    let big = world(10000)
+    let spare = big.clone()
+    Game { world: w, keyframes, big, spare, allocated: 0 }
+}
+
+/// One tick of the world, with this tick's input.
+@deterministic
+fn step(w: mut World, input: u32) {
+    w.seed = w.seed.wrapping_mul(1664525).wrapping_add(1013904223)
+    let push = f32(input % 7) * 0.01
+    for mut e in w.entities {
+        e.vel.y -= 0.0981
+        e.vel.x += push
+        e.pos += e.vel * 0.01
+        if e.pos.y < 0.0 {
+            e.pos.y = -e.pos.y
+            e.vel.y = -e.vel.y * 0.9
+        }
+        e.data[input % 56] += e.pos.x * 0.001
+    }
+    w.inputs[w.tick % 32] = input
+    w.tick += 1
+}
+
+pub fn frame(state: mut Game, time: f32, width: u32, height: u32) {
+}
+
+/// Advances the small world one tick.
+pub fn tick(state: mut Game, input: u32) {
+    step(mut state.world, input)
+}
+
+/// The small world's tick.
+pub fn tick_count(state: Game) -> u32 {
+    state.world.tick
+}
+
+/// The small world's checksum.
+pub fn hash(state: Game) -> u64 {
+    state_hash(state.world)
+}
+
+/// Copies the small world into keyframe `slot`, reusing its buffers.
+pub fn keyframe(state: mut Game, slot: u32) {
+    let before = allocations()
+    state.world.clone_into(mut state.keyframes[slot])
+    state.allocated = allocations() - before
+}
+
+/// Keyframe `slot`'s checksum.
+pub fn keyframe_hash(state: Game, slot: u32) -> u64 {
+    state_hash(state.keyframes[slot])
+}
+
+/// Makes keyframe `slot` the small world again.
+pub fn restore(state: mut Game, slot: u32) {
+    let before = allocations()
+    state.keyframes[slot].clone_into(mut state.world)
+    state.allocated = allocations() - before
+}
+
+/// What the last `keyframe` or `restore` allocated.
+pub fn allocated(state: Game) -> u32 {
+    state.allocated
+}
+
+/// For measuring: `n` copies of the large world into the spare, reusing its buffers.
+pub fn copy_big(state: mut Game, n: u32) {
+    for _i in 0..n {
+        state.big.clone_into(mut state.spare)
+    }
+}
+
+/// For measuring: `n` clones of the large world, each a fresh allocation, dropped.
+pub fn clone_big(state: Game, n: u32) -> u32 {
+    var ticks = 0
+    for _i in 0..n {
+        let c = state.big.clone()
+        ticks += c.tick + 1
+    }
+    ticks
+}
+
+/// For measuring: `n` checksums of the large world.
+pub fn hash_big(state: Game, n: u32) -> u64 {
+    var h: u64 = 0
+    for _i in 0..n {
+        h = h ^ state_hash(state.big)
+    }
+    h
+}
+
+/// Whether the spare (after `copy_big`) has the large world's checksum.
+pub fn spare_matches(state: Game) -> bool {
+    state_hash(state.spare) == state_hash(state.big)
+}
+
+/// How many blocks a `clone` of the small world allocates: its buffers, fresh.
+pub fn clone_allocations(state: Game) -> u32 {
+    let before = allocations()
+    let c = state.world.clone()
+    let n = allocations() - before
+    n + c.tick - c.tick
+}

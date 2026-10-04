@@ -4,13 +4,15 @@
       "code": "E0510",
       "file": "main.wrela",
       "fixes": [],
-      "help": [],
+      "help": [
+        "to keep work for later, store an enum of actions and `match` on it"
+      ],
       "internal": false,
       "label": null,
       "labels": [],
       "message": "a function type can only be a parameter's type",
       "notes": [
-        "closures don't escape the call they're passed to (§6.7); storing or returning one is tier 1 (`@escaping`)"
+        "a closure that captures only values can be stored, but its type is its own and inferred (§6.7)"
       ],
       "severity": "error",
       "span": {

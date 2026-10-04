@@ -1,0 +1,49 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0115",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [
+        "write an f-string: `f\"{a} and {b}\"`"
+      ],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "`format!` is a macro, and wrela has no macros",
+      "notes": [],
+      "severity": "error",
+      "span": {
+        "column": 5,
+        "end": 138,
+        "end_column": 12,
+        "end_line": 5,
+        "line": 5,
+        "start": 131
+      },
+      "title": "a macro call, which wrela doesn't have"
+    },
+    {
+      "code": "E0100",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "expected `,` or `)`, found a name",
+      "notes": [],
+      "severity": "error",
+      "span": {
+        "column": 25,
+        "end": 156,
+        "end_column": 30,
+        "end_line": 5,
+        "line": 5,
+        "start": 151
+      },
+      "title": "unexpected token"
+    }
+  ],
+  "version": 2
+}

@@ -1,0 +1,29 @@
+// A `dispatch` or `draw` that isn't in its form. Each entry point is bound to its arguments,
+// which are matched as a call's are: `dispatch(kernel.bind(...), groups: n)`, and
+// `draw(vs.bind(...), fs.bind(...), vertices: n)`, with an entry point that takes nothing named
+// alone. Also: a name that isn't an entry point of the right stage, missing counts, or
+// `k.bind(...)` outside `dispatch` and `draw`.
+// ---- wrong
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch}
+
+@compute(64)
+fn fill(value: f32, out: mut Slots<f32>, id: GlobalId) {
+    out[id] = value
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    var out: GpuBuffer<f32> = buffer(64)
+    dispatch(fill, groups: 1, value: time, out: mut out)
+}
+// ---- fixed
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch}
+
+@compute(64)
+fn fill(value: f32, out: mut Slots<f32>, id: GlobalId) {
+    out[id] = value
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    var out: GpuBuffer<f32> = buffer(64)
+    dispatch(fill.bind(time, mut out), groups: 1)
+}

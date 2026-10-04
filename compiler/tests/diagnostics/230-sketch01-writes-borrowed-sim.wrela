@@ -1,0 +1,16 @@
+// mistake: sketch 01 §6: presentation code writing the sim state it only reads
+// expect: E0505
+// fix: no
+struct GrazerSim {
+    root: vec3,
+    phase: f32,
+}
+
+struct GrazerLook {
+    tail: vec3,
+}
+
+fn animate(g: GrazerSim, look: mut GrazerLook, dt: f32) {
+    look.tail = g.root
+    g.phase += dt
+}

@@ -1,0 +1,55 @@
+// Float formatting under test (compiler/tests/tests/suite/format.rs): each export formats a
+// value and returns a hash of the text, so a test can compare it with Rust's formatting.
+use std::fmt::{Format, Spec}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+
+/// FNV-1a over the text's bytes, then its length.
+fn fnv(s: str) -> u64 {
+    var h: u64 = 0xcbf29ce484222325
+    for i in 0..s.len() {
+        h = (h ^ u64(s.byte(i))).wrapping_mul(0x100000001b3)
+    }
+    h ^ u64(s.len())
+}
+
+/// No precision when `prec` is negative.
+fn spec(prec: i32) -> Spec {
+    var sp = Spec::none()
+    if prec >= 0 {
+        sp.has_precision = true
+        sp.precision = u32(prec)
+    }
+    sp
+}
+
+pub fn f32_hash(x: f32, prec: i32) -> u64 {
+    var s = String::new()
+    x.format(mut s, spec(prec))
+    fnv(s)
+}
+
+pub fn f64_hash(x: f64, prec: i32) -> u64 {
+    var s = String::new()
+    x.format(mut s, spec(prec))
+    fnv(s)
+}
+
+/// Byte `i` of the text, or 0 past its end: to show a mismatch.
+pub fn f32_byte(x: f32, prec: i32, i: u32) -> u32 {
+    var s = String::new()
+    x.format(mut s, spec(prec))
+    if i < s.len() { u32(s.byte(i)) } else { 0 }
+}
+
+pub fn f64_byte(x: f64, prec: i32, i: u32) -> u32 {
+    var s = String::new()
+    x.format(mut s, spec(prec))
+    if i < s.len() { u32(s.byte(i)) } else { 0 }
+}
+
+pub fn i64_hash(x: i64) -> u64 {
+    var s = String::new()
+    x.format(mut s, Spec::none())
+    fnv(s)
+}

@@ -1,0 +1,10 @@
+// rejects: attr.gpu
+// A `@gpu` function's effects are checked where it's defined: the checker finds them with the
+// other errors.
+use std::gpu::{GpuBuffer, buffer}
+
+@gpu
+fn record(s: Copy) -> f32 {
+    let b: GpuBuffer<f32> = buffer(4) //~ E0600
+    1.0
+}

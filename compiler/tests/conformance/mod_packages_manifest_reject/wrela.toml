@@ -1,0 +1,5 @@
+[package]
+version = "1.0" # //~ E0219
+
+[dependencies]
+geo = { git = "https://example.com/geo" } # //~ E0219

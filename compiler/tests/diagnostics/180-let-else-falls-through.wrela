@@ -1,0 +1,9 @@
+// mistake: a `let ... else` whose `else` gives a value instead of returning it
+// expect: E0330
+// fix: yes
+fn first(xs: mut Vec<u32>) -> u32 {
+    let Some(x) = xs.pop() else {
+        0
+    }
+    x
+}

@@ -1,0 +1,7 @@
+// rejects: const.build
+// The build reads the file: one that isn't in the package is an error where it's named.
+const WEIGHTS = embed("weights.bin") //~ E0218
+
+fn size() -> u32 {
+    WEIGHTS.len()
+}

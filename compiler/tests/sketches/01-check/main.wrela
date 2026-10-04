@@ -1,0 +1,43 @@
+// Sketch 01's creature against M1's tier-0 grazer (compiler/tests/tests/suite/sketches.rs).
+
+use engine::creature::Creature
+use engine::rng::seed
+use grazer::sketch::grazer
+use std::units::cm
+
+// ---- the comparison with M1's grazer ----------------------------------------------------------
+
+/// SplitMix64's mix: the test's points, the same every run.
+fn mix(x: u64) -> u64 {
+    var z = x.wrapping_add(0x9e3779b97f4a7c15)
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9)
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb)
+    z ^ (z >> 31)
+}
+
+/// The largest difference between this grazer's distance and M1's, at `n` points in a box
+/// around it (its bounds, grown by 30 cm), and how many of them are within 1 cm of the surface.
+pub fn max_gap(id: u32, n: u32) -> vec2 {
+    let ours = grazer(seed(id)).field()
+    let theirs = m1::grazer::grazer(id)
+    let b = m1::grazer::bounds(m1::grazer::params(id))
+    let lo = vec3(f32(b.lo.x), f32(b.lo.y), f32(b.lo.z)) - 0.3
+    let hi = vec3(f32(b.hi.x), f32(b.hi.y), f32(b.hi.z)) + 0.3
+    var gap = 0.0
+    var near = 0
+    for i in 0..n {
+        let r = mix(u64(i) * 3 + u64(id) * 0x100000000)
+        let u = vec3(f32(r & 0xfffff), f32((r >> 20) & 0xfffff), f32((r >> 40) & 0xfffff)) /
+            1048576.0
+        let p = lo + (hi - lo) * u
+        let a = ours.distance(p)
+        let d = theirs.distance(p)
+        gap = max(gap, abs(a - d))
+        if abs(d) < 1cm {
+            near += 1
+        }
+    }
+    vec2(gap, f32(near))
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

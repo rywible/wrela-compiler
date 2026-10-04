@@ -19,7 +19,10 @@ pub enum InstanceKey {
     /// A closure in `owner`'s body, lifted to a function of its captures and parameters.
     Closure { owner: Rc<InstanceKey>, id: ClosureId },
     /// A derived interpretation of a callable (language.md §13).
-    Derived { of: Callable, kind: DeriveKind, input: TyId },
+    /// `output`: an interval's result type (its range is that type's box).
+    Derived { of: Callable, kind: DeriveKind, input: TyId, output: Option<TyId> },
+    /// Drop or clone glue for a concrete type (`crate::glue`).
+    Glue { kind: crate::glue::GlueKind, ty: TyId },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -47,7 +50,7 @@ impl InstanceKey {
         match self {
             InstanceKey::Fn { func, .. } => Some(*func),
             InstanceKey::Closure { owner, .. } => owner.source_fn(),
-            InstanceKey::Derived { .. } => None,
+            InstanceKey::Derived { .. } | InstanceKey::Glue { .. } => None,
         }
     }
 
@@ -58,7 +61,9 @@ impl InstanceKey {
             InstanceKey::Fn { substs, callables, .. } => {
                 !substs.is_empty() || callables.iter().any(Option::is_some)
             }
-            InstanceKey::Closure { .. } | InstanceKey::Derived { .. } => false,
+            InstanceKey::Closure { .. }
+            | InstanceKey::Derived { .. }
+            | InstanceKey::Glue { .. } => false,
         }
     }
 
@@ -66,7 +71,7 @@ impl InstanceKey {
         match self {
             InstanceKey::Fn { substs, .. } => substs,
             InstanceKey::Closure { owner, .. } => owner.substs(),
-            InstanceKey::Derived { .. } => &[],
+            InstanceKey::Derived { .. } | InstanceKey::Glue { .. } => &[],
         }
     }
 
@@ -74,7 +79,7 @@ impl InstanceKey {
         match self {
             InstanceKey::Fn { resources, .. } => resources,
             InstanceKey::Closure { owner, .. } => owner.resources(),
-            InstanceKey::Derived { .. } => &[],
+            InstanceKey::Derived { .. } | InstanceKey::Glue { .. } => &[],
         }
     }
 }

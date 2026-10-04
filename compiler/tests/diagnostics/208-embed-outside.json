@@ -1,0 +1,28 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0218",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "`embed` can't read `../secrets.txt`: each part of the path names a directory or the file: no `.`, `..` or empty parts",
+      "notes": [
+        "a path is relative to the package's root, and uses `/` (§10)"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 27,
+        "end": 119,
+        "end_column": 43,
+        "end_line": 4,
+        "line": 4,
+        "start": 103
+      },
+      "title": "an `embed` whose file can't be read"
+    }
+  ],
+  "version": 2
+}

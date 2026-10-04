@@ -8,6 +8,6 @@ fn big(out: mut Slots<u32>, id: GlobalId) {
 
 // The kernel is still one: its dispatch isn't an error too.
 fn run() {
-    let out: GpuBuffer<u32> = buffer(64)
-    dispatch(big, groups: 1, out: out)
+    var out: GpuBuffer<u32> = buffer(64)
+    dispatch(big.bind(out: mut out), groups: 1)
 }

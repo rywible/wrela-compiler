@@ -1,0 +1,26 @@
+// rejects: gpu.buffer-modes
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, copy, dispatch, write}
+
+@compute(64)
+fn twice(input: [f32], out: mut Slots<f32>, id: GlobalId) {
+    out[id] = input[id.x] * 2.0
+}
+
+pub fn modes(a: mut GpuBuffer<f32>, b: mut GpuBuffer<f32>) {
+    dispatch(twice.bind(input: a, out: b), groups: 1) //~ E0503
+    dispatch(twice.bind(input: mut a, out: mut b), groups: 1) //~ E0504
+    dispatch(twice.bind(input: a.span(start: 0, count: 64), out: b.span(start: 64, count: 64)), groups: 1) //~ E0603
+    write(a, 0, [1.0]) //~ E0503
+}
+
+pub fn overlaps(a: mut GpuBuffer<f32>, b: mut GpuBuffer<f32>) {
+    dispatch(twice.bind(input: a, out: mut a), groups: 1) //~ E0513
+    // Two spans of one buffer overlap, whatever their ranges.
+    dispatch(twice.bind(input: a.span(start: 0, count: 64), out: a.span_mut(start: 64, count: 64)), groups: 1) //~ E0507
+    let s = a.span(start: 0, count: 64)
+    write(mut a, 0, [1.0]) //~ E0507
+    copy(from: s, to: b.span_mut(start: 0, count: 64))
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+}

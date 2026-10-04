@@ -1,0 +1,12 @@
+// mistake: changing an arena while a `mut` binding into it is in use
+// expect: E0506
+// fix: no
+struct Lever: Clone {
+    pulled: bool,
+}
+
+fn toggle(levers: mut Arena<Lever>, l: Handle<Lever>) {
+    mut a = levers[l]
+    levers[l].pulled = false
+    a.pulled = true
+}

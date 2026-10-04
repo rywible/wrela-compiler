@@ -1,0 +1,40 @@
+// run: a fixed array of surfaces joins with `union()` and `smooth_union(k)`, folding in order:
+// the same distance as the chained binary combinators, bit for bit (std::field, §17)
+// expect: union_gap(0.45) = 0.0
+// expect: union_gap(2.0) = 0.0
+// expect: smooth_gap(0.45) = 0.0
+// expect: smooth_gap(-0.2) = 0.0
+// expect: empty() = 1e30
+// expect: bound(0.1) = 1.0
+use std::field::{Lipschitz, Sphere, Surface, Translate, sphere}
+
+fn leg(at: f32) -> Translate<Sphere> {
+    sphere(0.1).translate(vec3(at, 0.0, 0.0))
+}
+
+fn legs() -> [Translate<Sphere>; 4] {
+    [leg(0.0), leg(0.3), leg(0.6), leg(0.9)]
+}
+
+pub fn union_gap(x: f32) -> f32 {
+    let p = vec3(x, 0.05, 0.0)
+    let (a, b, c, d) = (leg(0.0), leg(0.3), leg(0.6), leg(0.9))
+    legs().union().distance(p) - a.union(b).union(c).union(d).distance(p)
+}
+
+pub fn smooth_gap(x: f32) -> f32 {
+    let p = vec3(x, 0.05, 0.0)
+    let (a, b, c, d) = (leg(0.0), leg(0.3), leg(0.6), leg(0.9))
+    let k = 0.06
+    legs().smooth_union(k).distance(p) -
+        a.smooth_union(b, k).smooth_union(c, k).smooth_union(d, k).distance(p)
+}
+
+pub fn empty() -> f32 {
+    let none: [Sphere; 0] = [sphere(1.0); 0]
+    none.union().distance(vec3(0.0))
+}
+
+pub fn bound(near: f32) -> f32 {
+    legs().smooth_union(0.06).lipschitz(near)
+}

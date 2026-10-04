@@ -18,7 +18,10 @@ impl<'p> Checker<'p> {
         // Through any inference variables bound so far: `[In { .. }; 2]`'s elements are `Copy`
         // even before the array's type is written anywhere.
         let resolved = self.infer.resolve(&self.p.types, ty);
-        let kind = if self.p.types.has_vars(resolved) {
+        // In a `match mut`, a binding into the place projects it mutably, `Copy` or not.
+        let kind = if from_place && self.binding_mut {
+            Some(LocalKind::Projection { mutable: true })
+        } else if self.p.types.has_vars(resolved) {
             None
         } else {
             Some(binding_kind(self.p, resolved, from_place))
@@ -45,14 +48,26 @@ impl<'p> Checker<'p> {
         let p = self.check_pat(pat, ty, from_place);
         self.bound_once(&p);
         if !self.irrefutable(&p) {
-            self.err(
-                Diagnostic::new(
-                    codes::E0309,
-                    pat.span,
-                    "this pattern might not match, so `let` can't use it",
-                )
-                .with_help("use `match` to handle the other cases"),
+            let mut d = Diagnostic::new(
+                codes::E0309,
+                pat.span,
+                "this pattern might not match, so `let` can't use it",
             );
+            // `let (c, s) = ...` with the unit `s` in scope: a constant, not a new name.
+            let mut consts = Vec::new();
+            constant_names(self.p, self.scope.module, pat, &mut consts);
+            match consts.first() {
+                Some((name, span)) => {
+                    d = d
+                        .with_secondary(*span, format!("`{name}` is a constant in scope, so this compares with it"))
+                        .with_note(format!(
+                            "a name in a pattern that a constant or a unit variant has (here `{name}`) matches that value rather than binding a new name"
+                        ))
+                        .with_help(format!("give the binding another name than `{name}`"));
+                }
+                None => d = d.with_help("use `match` to handle the other cases"),
+            }
+            self.err(d);
         }
         p
     }
@@ -71,7 +86,7 @@ impl<'p> Checker<'p> {
                         names(first, out);
                     }
                 }
-                PatKind::Wild | PatKind::Lit(_) => {}
+                PatKind::Wild | PatKind::Lit(_) | PatKind::Text(_) => {}
             }
         }
         let mut bound = Vec::new();
@@ -95,7 +110,7 @@ impl<'p> Checker<'p> {
     fn irrefutable(&self, p: &Pat) -> bool {
         match &p.kind {
             PatKind::Wild | PatKind::Bind(_) => true,
-            PatKind::Lit(_) => false,
+            PatKind::Lit(_) | PatKind::Text(_) => false,
             PatKind::Tuple(ps) => ps.iter().all(|x| self.irrefutable(x)),
             PatKind::Adt { adt, variant, fields, .. } => {
                 (variant.is_none() || self.p.adt(*adt).variants().len() == 1)
@@ -128,6 +143,19 @@ impl<'p> Checker<'p> {
                     }
                     _ => PatKind::Bind(self.declare_binding(name, ty, from_place)),
                 }
+            }
+            ast::PatKind::Lit { neg: false, lit } if lit.kind == ast::LitKind::Str => {
+                // A string matches text: a `str`, `Text` or `String` (§21's string patterns).
+                if !self.is_stringy(ty) && !matches!(self.kind(ty), TyKind::Error) {
+                    let shown = self.display(ty);
+                    self.err(Diagnostic::new(
+                        codes::E0320,
+                        lit.span,
+                        format!("a string pattern matches text, not `{shown}`"),
+                    ));
+                    return self.unmatched(pat, ty);
+                }
+                PatKind::Text(wrela_syntax::lexer::string_value(&lit.text).into())
             }
             ast::PatKind::Lit { neg, lit } => {
                 self.check_lit_pattern(*neg, lit, ty).map_or(PatKind::Wild, PatKind::Lit)
@@ -514,7 +542,7 @@ impl<'p> Checker<'p> {
                 self.declare_unmatched_field(f);
                 continue;
             }
-            if v.is_none() && !decls[i].public && self.p.adt(a).module != self.scope.module {
+            if v.is_none() && self.field_hidden(self.p.adt(a).module, &decls[i]) {
                 self.err(
                     Diagnostic::new(
                         codes::E0210,
@@ -564,11 +592,25 @@ impl<'p> Checker<'p> {
         &mut self,
         scrutinee: &ast::Expr,
         arms: &[ast::Arm],
+        mutable: bool,
         expected: Option<TyId>,
         span: Span,
     ) -> Expr {
         let s = self.check_expr(scrutinee, None);
         let from_place = s.is_place();
+        if mutable {
+            if !from_place && !matches!(s.kind, ExprKind::Error) {
+                self.err(
+                    Diagnostic::new(
+                        codes::E0512,
+                        s.span,
+                        "`match mut` changes a place in place, and this is a temporary",
+                    )
+                    .with_help("match without `mut`: the arms own the temporary's parts"),
+                );
+            }
+            self.mark_written(&s);
+        }
         // The arms agree with each other; `expected` only guides them, as with `if`, so a
         // match of arrays can still pass as a run.
         let mut result = None;
@@ -579,8 +621,10 @@ impl<'p> Checker<'p> {
         for arm in arms {
             let env_len = self.env.len();
             let errors = self.diags.len();
+            self.binding_mut = mutable;
             let pats: Vec<Pat> =
                 arm.pats.iter().map(|p| self.check_pat(p, s.ty, from_place)).collect();
+            self.binding_mut = false;
             pats.iter().for_each(|p| self.bound_once(p));
             bad_pattern |= wrela_diag::has_errors(&self.diags[errors..]);
             if pats.len() > 1 && pats.iter().any(has_binding) {
@@ -637,7 +681,7 @@ impl<'p> Checker<'p> {
         {
             self.check_exhaustive(&s, &out, span);
         }
-        Expr { ty, span, kind: ExprKind::Match { scrutinee: Box::new(s), arms: out } }
+        Expr { ty, span, kind: ExprKind::Match { scrutinee: Box::new(s), arms: out, mutable } }
     }
 
     fn check_exhaustive(&mut self, s: &Expr, arms: &[Arm], span: Span) {
@@ -699,6 +743,7 @@ impl<'p> Checker<'p> {
             }
             PatKind::Lit(Lit::Int(i)) => DPat::Lit(format!("{i}")),
             PatKind::Lit(l) => DPat::Lit(format!("{l:?}")),
+            PatKind::Text(t) => DPat::Lit(format!("{t:?}")),
             PatKind::Tuple(ps) => {
                 DPat::Ctor(Ctor::Single, ps.iter().map(|x| self.dpat(x)).collect())
             }
@@ -723,6 +768,10 @@ impl<'p> Checker<'p> {
 }
 
 /// How a pattern binding of the known type `ty` holds its value.
+pub(super) fn binding_kind_of(p: &Program, ty: TyId, from_place: bool) -> LocalKind {
+    binding_kind(p, ty, from_place)
+}
+
 fn binding_kind(p: &Program, ty: TyId, from_place: bool) -> LocalKind {
     if from_place && !crate::traits::implements_builtin(p, ty, Lang::Copy) {
         LocalKind::Projection { mutable: false }
@@ -968,5 +1017,35 @@ fn has_error_pat(p: &ast::Pat) -> bool {
         | ast::PatKind::Ident(_)
         | ast::PatKind::Lit { .. }
         | ast::PatKind::Path(_) => false,
+    }
+}
+
+/// The names in a pattern that are constants in scope (so they compare, not bind).
+fn constant_names(
+    p: &crate::program::Program,
+    m: crate::ty::ModuleId,
+    pat: &ast::Pat,
+    out: &mut Vec<(String, wrela_diag::Span)>,
+) {
+    match &pat.kind {
+        ast::PatKind::Ident(id) => {
+            if matches!(
+                crate::resolve::lookup_name(p, m, &id.name),
+                Some(crate::defs::Res::Const(_))
+            ) {
+                out.push((id.name.clone(), id.span));
+            }
+        }
+        ast::PatKind::Tuple(ps) | ast::PatKind::TupleStruct(_, ps) => {
+            ps.iter().for_each(|x| constant_names(p, m, x, out))
+        }
+        ast::PatKind::Struct { fields, .. } => {
+            for f in fields {
+                if let Some(x) = &f.pat {
+                    constant_names(p, m, x, out);
+                }
+            }
+        }
+        _ => {}
     }
 }

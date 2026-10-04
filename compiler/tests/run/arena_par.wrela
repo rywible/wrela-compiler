@@ -1,0 +1,33 @@
+// run: `Arena::par_each_mut` changes each value in place, as `Vec::par_each_mut` does
+// expect: bumped(5) = 15
+// expect: bumped_vec(5) = 15
+
+struct Thing: Clone {
+    n: u32,
+}
+
+pub fn bumped(k: u32) -> u32 {
+    var a: Arena<Thing> = Arena::new()
+    for i in 0..3 {
+        let _ = a.insert(Thing { n: i })
+    }
+    a.par_each_mut(|t| { t.n += k - 1 })
+    var s = 0
+    for t in a {
+        s += t.n
+    }
+    s
+}
+
+pub fn bumped_vec(k: u32) -> u32 {
+    var v: Vec<Thing> = Vec::new()
+    for i in 0..3 {
+        v.push(Thing { n: i })
+    }
+    v.par_each_mut(|t| { t.n += k - 1 })
+    var s = 0
+    for t in v {
+        s += t.n
+    }
+    s
+}

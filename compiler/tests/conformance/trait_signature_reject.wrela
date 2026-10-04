@@ -15,7 +15,7 @@ trait Make {
     fn scaled(self, k: f32 = 1.0) -> f32
 }
 
-struct S: Copy + Clone {
+struct S: Copy {
     x: f32,
 }
 

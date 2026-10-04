@@ -4,7 +4,7 @@ use std::gpu::{GlobalId, Slots}
 /// A field.
 pub fn blob(r: f32) -> SmoothUnion<Sphere, RoundCone> {
     sphere(radius: r)
-        .smooth_union(round_cone(vec3(), vec3(y: 1.0), 0.3, 0.1), k: 0.1)
+        .smooth_union(round_cone(vec3(), vec3(y: 1.0), r_top: 0.3, r_bottom: 0.1), k: 0.1)
 }
 
 pub struct Grid: Copy + GpuData {

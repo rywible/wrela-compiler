@@ -1,5 +1,5 @@
 // accepts: mem.copy
-struct In: Copy + Clone {
+struct In: Copy {
     a: i32,
 }
 

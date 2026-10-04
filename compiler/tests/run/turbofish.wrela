@@ -3,7 +3,7 @@
 // expect: zero() = 7
 // expect: trait_args() = 1006.0
 
-struct S: Copy + Clone {
+struct S: Copy {
     k: i32,
 }
 

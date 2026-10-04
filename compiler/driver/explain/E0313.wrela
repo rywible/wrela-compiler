@@ -1,0 +1,22 @@
+// A condition (of an `if` or a `while`) that isn't a `bool`. Numbers aren't true or false:
+// compare (`n != 0`).
+// ---- wrong
+fn any(n: u32) -> bool {
+    if n {
+        true
+    } else {
+        false
+    }
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+fn any(n: u32) -> bool {
+    if n != 0 {
+        true
+    } else {
+        false
+    }
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

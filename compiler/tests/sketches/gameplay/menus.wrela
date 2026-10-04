@@ -1,0 +1,227 @@
+// A menu and HUD in immediate-mode UI (paper test §3). Presentation: never rolled back. Clicks
+// never change sim state: they become commands, which reach the sim as the next tick's input.
+//
+// Changed from the paper test:
+// - Labels are `f"…"` strings (F7): `f"Weight: {p.bag.weight():.1} / {p.max_carry:.0} kg"`,
+//   where the paper test chained a fixed buffer's methods. They allocate each frame; a HUD that
+//   mustn't would keep a `String` and `clear()` it.
+// - `if let` replaces the `match`es with an empty arm (F8); `poll` reaches the pending request
+//   through `match mut` (F3).
+// - `slot_name` returns `Text`, a literal (F4); a menu's context, a borrow struct, goes to
+//   several calls in a row (F16).
+// - The engine's `panel` takes the panel's height, to draw its background first.
+
+use dialogue::{Conversation, DIALOGUE, offered}
+use engine::ui::{Anchor, Ui}
+use inventory::{ItemStack, slot_name}
+use items::{EquipSlot, GOLD, item_def}
+use quests::tracked_quest
+use std::arena::Handle
+use std::io::{IoError, Pending, store}
+use std::serialize::{Serialize, save}
+use std::units::deg
+use world::{Lever, Pickup, World}
+
+pub enum Command: Copy + Eq {
+    Equip { slot: u32 },
+    Unequip { at: u32 },
+    MoveSlot { from: u32, to: u32 },
+    SortBag,
+    Talk,
+    Choose { choice: u32 },
+    PullLever(Handle<Lever>),
+    PickUp(Handle<Pickup>),
+}
+
+pub enum Screen: Copy + Eq {
+    Playing,
+    Paused,
+    Inventory,
+    Settings,
+}
+
+pub struct Settings: Clone + Serialize {
+    pub master: f32 = 0.8,
+    pub music: f32 = 0.6,
+    pub fov: f32 = 75deg, // radians, as every angle is (§5)
+    pub subtitles: bool = true,
+}
+
+pub struct Menus {
+    pub screen: Screen,
+    pub settings: Settings,
+    pub saving: Option<Pending<u8>>, // a settings write in flight (§6.15)
+    pub saved: u32,
+    pub error: Option<IoError>,
+}
+
+/// What every menu needs, as one parameter (§6.6).
+pub borrow struct MenuCtx {
+    pub ui: mut Ui,
+    pub menus: mut Menus,
+    pub world: borrow World, // the snapshot presentation was handed
+    pub cmds: mut Vec<Command>,
+}
+
+/// The keys this frame.
+pub struct Input: Copy {
+    pub escape: bool,
+}
+
+const RED: vec4 = vec4(0.8, 0.15, 0.1, 1.0)
+
+pub fn draw_ui(c: MenuCtx, input: Input) {
+    if input.escape {
+        c.menus.screen = match c.menus.screen {
+            Screen::Playing => Screen::Paused,
+            _ => Screen::Playing,
+        }
+    }
+    hud(c) // the context goes to several calls in a row (F16)
+    if let Some(t) = c.world.talk { // F8
+        dialogue_box(c, t)
+    }
+    match c.menus.screen {
+        Screen::Playing => {},
+        Screen::Paused => pause_menu(c),
+        Screen::Inventory => inventory_screen(c),
+        Screen::Settings => settings_screen(c),
+    }
+    poll_save(mut c.menus)
+}
+
+fn hud(c: MenuCtx) {
+    borrow p = c.world.player
+    c.ui.panel("hud", at: Anchor::TopLeft, width: 260.0, height: 150.0)
+    c.ui.bar(p.health / 100.0, color: RED)
+    c.ui.label(f"Gold: {p.bag.count(GOLD)}") // "Gold: 340"
+    c.ui.label(f"Weight: {p.bag.weight():.1} / {p.max_carry:.0} kg") // "Weight: 12.5 / 40 kg"
+    tracked_quest(mut c.ui, c.world) // §4
+    c.ui.end_panel()
+}
+
+fn pause_menu(c: MenuCtx) {
+    c.ui.panel("Paused", at: Anchor::Center, width: 240.0, height: 130.0)
+    if c.ui.button("Resume") {
+        c.menus.screen = Screen::Playing
+    }
+    if c.ui.button("Inventory") {
+        c.menus.screen = Screen::Inventory
+    }
+    if c.ui.button("Settings") {
+        c.menus.screen = Screen::Settings
+    }
+    c.ui.end_panel()
+}
+
+/// Lists the bag. A click on a wearable item equips it; dragging moves or merges stacks.
+fn inventory_screen(c: MenuCtx) {
+    borrow p = c.world.player
+    c.ui.panel("Inventory", at: Anchor::Center, width: 420.0, height: 470.0)
+    c.ui.label(f"Weight: {p.bag.weight():.1} kg")
+    for i in 0..12 { // the first two rows of the bag
+        c.ui.push_id(i)
+        if let Some(s) = p.bag.slots[i] {
+            if c.ui.button(stack_label(s)) {
+                if item_def(s.item).equip != EquipSlot::Nowhere { // `!=` on an enum (F6)
+                    c.cmds.push(Command::Equip { slot: i })
+                }
+            }
+            if c.ui.hovered() {
+                c.ui.tooltip(item_def(s.item).name)
+            }
+            c.ui.drag_source(i)
+        } else {
+            c.ui.label("-")
+        }
+        if let Some(from) = c.ui.dropped() {
+            c.cmds.push(Command::MoveSlot { from, to: i })
+        }
+        c.ui.pop_id()
+    }
+    c.ui.label("Worn")
+    for at in 4..6 {
+        c.ui.push_id(100 + at)
+        if let Some(s) = p.worn[at] {
+            if c.ui.button(stack_label(s)) {
+                c.cmds.push(Command::Unequip { at })
+            }
+        } else {
+            c.ui.label(slot_name(at))
+        }
+        c.ui.pop_id()
+    }
+    if c.ui.button("Sort") {
+        c.cmds.push(Command::SortBag)
+    }
+    if c.ui.button("Back") {
+        c.menus.screen = Screen::Paused
+    }
+    c.ui.end_panel()
+}
+
+/// "Iron Sword", or "Arrow x20".
+fn stack_label(s: ItemStack) -> String {
+    borrow name = item_def(s.item).name
+    if s.count == 1 { name.clone() } else { f"{name} x{s.count}" }
+}
+
+fn settings_screen(c: MenuCtx) {
+    mut s = c.menus.settings
+    c.ui.panel("Settings", at: Anchor::Center, width: 360.0, height: 170.0)
+    c.ui.slider(percent("Master volume", s.master), mut s.master, lo: 0.0, hi: 1.0)
+    c.ui.slider(percent("Music", s.music), mut s.music, lo: 0.0, hi: 1.0)
+    var fov = s.fov / deg // the slider works in degrees
+    if c.ui.slider(f"Field of view: {u32(round(fov))} deg", mut fov, lo: 60.0, hi: 110.0) {
+        s.fov = fov * deg
+    }
+    c.ui.checkbox("Subtitles", mut s.subtitles)
+    if c.ui.button("Back") {
+        c.menus.saving = Some(store("settings", save(s))) // a request, polled below
+        c.menus.screen = Screen::Paused
+    }
+    c.ui.end_panel()
+}
+
+/// "Music: 60%"
+fn percent(label: str, x: f32) -> String {
+    f"{label}: {u32(round(x * 100.0))}%"
+}
+
+/// Called every frame. The write finishes on some later frame.
+fn poll_save(m: mut Menus) {
+    var finished = false
+    var failed: Option<IoError> = None
+    match mut m.saving {
+        Some(p) => { // `p` changes in place (F3)
+            match p.poll() {
+                Some(Ok(_)) => {
+                    finished = true
+                },
+                Some(Err(e)) => {
+                    finished = true
+                    failed = Some(take e)
+                },
+                None => {},
+            }
+        },
+        None => {},
+    }
+    if finished {
+        m.saving = None
+        m.saved += 1
+        m.error = take failed
+    }
+}
+
+fn dialogue_box(c: MenuCtx, talk: Conversation) {
+    borrow node = DIALOGUE[talk.node]
+    c.ui.panel(node.speaker, at: Anchor::Bottom, width: 620.0, height: 140.0)
+    c.ui.label(node.line)
+    for i in offered(talk, c.world.player, c.world.flags) { // an owned Vec<u32>
+        if c.ui.button(node.choices[i].text) {
+            c.cmds.push(Command::Choose { choice: i })
+        }
+    }
+    c.ui.end_panel()
+}

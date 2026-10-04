@@ -1,0 +1,22 @@
+// `.clone()` of a type that isn't `Clone`. A type declares `Clone` to be cloned:
+// `struct Log: Clone { ... }`.
+// ---- wrong
+struct Log {
+    lines: Vec<Text>,
+}
+
+fn copy_of(log: Log) -> Log {
+    log.clone()
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+struct Log: Clone {
+    lines: Vec<Text>,
+}
+
+fn copy_of(log: Log) -> Log {
+    log.clone()
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

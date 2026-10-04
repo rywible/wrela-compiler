@@ -1,0 +1,8 @@
+// rejects: const.build
+// `embed` takes a string literal, a path inside the package, of a file that's there (§10).
+const NAME: Text = "weights.bin"
+
+const A = embed("../outside.bin") //~ E0218
+const B = embed("/etc/hosts") //~ E0218
+const C = embed(NAME) //~ E0218
+const D = embed("data//weights.bin") //~ E0218

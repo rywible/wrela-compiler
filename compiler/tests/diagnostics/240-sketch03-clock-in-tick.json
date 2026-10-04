@@ -1,0 +1,26 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0200",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "there's no `clock_now` in scope",
+      "notes": [],
+      "severity": "error",
+      "span": {
+        "column": 13,
+        "end": 179,
+        "end_column": 22,
+        "end_line": 6,
+        "line": 6,
+        "start": 170
+      },
+      "title": "an unknown name"
+    }
+  ],
+  "version": 2
+}

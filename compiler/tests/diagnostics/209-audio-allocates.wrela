@@ -1,0 +1,19 @@
+// mistake: allocating in a voice's render function
+// expect: E0600
+// fix: no
+use std::audio::play
+
+struct Synth {
+    phase: f32,
+    notes: Vec<f32>,
+}
+
+@audio
+fn render(s: mut Synth, out: mut [f32]) {
+    s.notes.push(s.phase)
+}
+
+pub fn init() -> u32 {
+    play(Synth { phase: 0.0, notes: Vec::new() }, render)
+    0
+}

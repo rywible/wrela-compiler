@@ -14,6 +14,9 @@ pub fn walk_tys(e: &mut Expr, f: &mut impl FnMut(&mut TyId)) {
     f(&mut e.ty);
     match &mut e.kind {
         ExprKind::Lit(_)
+        | ExprKind::Text(_)
+        | ExprKind::Embed(_)
+        | ExprKind::ConstParam(_)
         | ExprKind::Local(_)
         | ExprKind::Const(_)
         | ExprKind::Closure(_)
@@ -26,6 +29,7 @@ pub fn walk_tys(e: &mut Expr, f: &mut impl FnMut(&mut TyId)) {
         | ExprKind::Swizzle(x, _)
         | ExprKind::ArrayRepeat(x, _)
         | ExprKind::Convert(x)
+        | ExprKind::Discriminant(x)
         | ExprKind::Take(x)
         | ExprKind::MutArg(x) => walk_tys(x, f),
         ExprKind::Binary(_, a, b) | ExprKind::Index(a, b) => {
@@ -40,6 +44,7 @@ pub fn walk_tys(e: &mut Expr, f: &mut impl FnMut(&mut TyId)) {
                     trait_args.iter_mut().for_each(&mut *f);
                     method_args.iter_mut().for_each(&mut *f);
                 }
+                Callee::Value(v) => walk_tys(v, f),
                 _ => {}
             }
             for a in &mut c.args {
@@ -66,7 +71,7 @@ pub fn walk_tys(e: &mut Expr, f: &mut impl FnMut(&mut TyId)) {
                 walk_tys(e, f);
             }
         }
-        ExprKind::Match { scrutinee, arms } => {
+        ExprKind::Match { scrutinee, arms, .. } => {
             walk_tys(scrutinee, f);
             for a in arms {
                 walk_pat(&mut a.pat, f);
@@ -94,7 +99,10 @@ pub fn walk_tys(e: &mut Expr, f: &mut impl FnMut(&mut TyId)) {
             d.fragment.1.iter_mut().for_each(&mut *f);
             walk_tys(&mut d.vertices, f);
             walk_tys(&mut d.instances, f);
-            for (_, a) in &mut d.args {
+            if let Some(i) = &mut d.indirect {
+                walk_tys(i, f);
+            }
+            for (_, _, a) in &mut d.args {
                 walk_tys(a, f);
             }
         }
@@ -105,9 +113,12 @@ fn walk_block(b: &mut Block, f: &mut impl FnMut(&mut TyId)) {
     f(&mut b.ty);
     for s in &mut b.stmts {
         match &mut s.kind {
-            StmtKind::Bind { pat, init } => {
+            StmtKind::Bind { pat, init, else_ } => {
                 walk_pat(pat, f);
                 walk_tys(init, f);
+                if let Some(b) = else_ {
+                    walk_block(b, f);
+                }
             }
             StmtKind::Assign { place, value, .. } => {
                 walk_tys(place, f);
@@ -149,12 +160,48 @@ fn walk_pat(p: &mut Pat, f: &mut impl FnMut(&mut TyId)) {
     }
 }
 
+/// Infers generic parameters that only a bound mentions, which a bound recorded before its
+/// type was known (a dispatch's kernel's, a draw's shaders') couldn't infer then: until nothing
+/// more is learned.
+fn infer_from_bounds(c: &mut Checker) {
+    let open = |c: &Checker| {
+        c.obligations
+            .iter()
+            .flat_map(|o| o.trait_ref.args.iter())
+            .filter(|&&a| c.p.types.has_vars(c.infer.resolve(&c.p.types, a)))
+            .count()
+    };
+    loop {
+        let before = open(c);
+        if before == 0 {
+            return;
+        }
+        let pending: Vec<(TyId, TraitRef)> =
+            c.obligations.iter().map(|o| (o.ty, o.trait_ref.clone())).collect();
+        for (ty, r) in pending {
+            c.infer_from_bound(ty, &r);
+        }
+        if open(c) == before {
+            return;
+        }
+    }
+}
+
 /// Resolves every type, and checks what needed resolved types.
 pub(super) fn finish_common(c: &mut Checker) {
+    infer_from_bounds(c);
     c.settle_projections(true);
     let unknown = c.infer.apply_defaults(&c.p.types);
+    // A signature with an error in it was reported where it's written: what the body can't
+    // infer from it follows from that.
+    let bad_sig = c.fn_id.is_some_and(|f| {
+        let def = c.p.func(f);
+        let error = |t: TyId| c.p.types.any(t, &mut |k| matches!(k, TyKind::Error));
+        error(def.ret) || def.params.iter().any(|ps| error(ps.ty))
+    });
     if let Some(&span) = unknown.first()
         && !wrela_diag::has_errors(&c.diags)
+        && !bad_sig
     {
         c.err(
             Diagnostic::new(codes::E0306, span, "the type of this can't be inferred")
@@ -162,6 +209,32 @@ pub(super) fn finish_common(c: &mut Checker) {
         );
     }
     c.binding_kinds();
+    // `let x = place` owns: only a `Copy` value can be copied out (§6.3).
+    for (id, at, keyword) in std::mem::take(&mut c.owned_lets) {
+        let ty = c.infer.resolve(&c.p.types, c.locals[id.index()].ty);
+        if matches!(c.p.types.kind(ty), TyKind::Error)
+            || crate::mir::is_callable(&c.p.types, ty)
+            || crate::traits::implements_builtin(c.p, ty, crate::defs::Lang::Copy)
+        {
+            continue;
+        }
+        let name = c.locals[id.index()].name.clone();
+        let shown = c.p.display_ty(ty);
+        let mut d = Diagnostic::new(
+            codes::E0518,
+            at,
+            format!("`let` owns its value, and `{shown}` isn't `Copy`, so `{name}` can't be a copy of this place"),
+        )
+        .with_note("`let x = place` copies only a `Copy` value (§6.3)")
+        .with_fix("read it in place: `borrow`", keyword, "borrow");
+        if crate::traits::implements_builtin(c.p, ty, crate::defs::Lang::Clone) {
+            d = d.with_fix("copy it: `.clone()`", at.shrink_to_end(), ".clone()");
+        }
+        d = d.with_fix("move it: `take`", at.shrink_to_start(), "take ");
+        c.err(d);
+        // Read as a projection, so nothing else is reported about it.
+        c.locals[id.index()].kind = LocalKind::Projection { mutable: false };
+    }
     // `-x` of an integer whose type inference settled later: it must be signed.
     for (ty, span) in std::mem::take(&mut c.negated_ints) {
         let ty = c.infer.resolve(&c.p.types, ty);
@@ -330,6 +403,16 @@ pub(super) fn finish_common(c: &mut Checker) {
         let ty = traits::normalize(c.p, ty, None);
         if !traits::implements(c.p, ty, &r) {
             let (t, tr) = (c.p.display_ty(ty), c.p.display_trait_ref(&r));
+            // A library's own message replaces the default (§7), at the user's code.
+            if let Some(msg) = c.p.custom_message(ty, &r) {
+                c.diags.push(
+                    Diagnostic::new(o.code, o.span, msg).with_note(format!(
+                        "`{t}` doesn't implement `{tr}`, which {} needs",
+                        o.why
+                    )),
+                );
+                continue;
+            }
             let mut d = Diagnostic::new(
                 o.code,
                 o.span,
@@ -386,24 +469,28 @@ pub(super) fn finish(
             format!("`{}`'s type is too large: it has more than {MAX_TYPE_SIZE} parts", l.name),
         ));
     }
-    let mut closures: Vec<ClosureDef> =
-        std::mem::take(&mut c.closures).into_iter().flatten().collect();
-    for cl in &mut closures {
+    let mut closures: Vec<ClosureDef> = Vec::new();
+    for (k, cl) in std::mem::take(&mut c.closures).into_iter().enumerate() {
+        let Some(mut cl) = cl else { continue };
         resolve(&mut cl.ret);
         walk_tys(&mut cl.body, &mut resolve);
+        let sig = cl.params.iter().map(|p| locals[p.index()].ty).collect();
+        let id = ClosureRef { owner: c.fn_id, id: ClosureId(k as u32) };
+        c.p.closure_sigs.borrow_mut().insert(id, (sig, cl.ret));
+        closures.push(cl);
     }
     let hidden_ret = hidden.map(|h| infer.resolve(types, h));
-    stored_callables(c.p, &value, &mut c.diags);
+    let own = Own { owner: c.fn_id, closures: &closures, locals: &locals };
+    stored_callables(c.p, &own, &value, &mut c.diags);
     for cl in &closures {
-        stored_callables(c.p, &cl.body, &mut c.diags);
+        stored_callables(c.p, &own, &cl.body, &mut c.diags);
     }
     let body = Body { params, locals, closures, value, hidden_ret };
     (body, c.diags)
 }
 
 /// E0504 for a `mut` marker that passes nothing mutably: it marks an argument, what a
-/// `-> mut T` function returns, or what a `mut` binding projects. And E0908 for `match mut`,
-/// which is tier 1 (its bindings would be read-only).
+/// `-> mut T` function returns, or what a `mut` binding projects.
 pub(super) fn stray_markers(p: &Program, body: &Body, ret_mut: bool, out: &mut Vec<Diagnostic>) {
     let walk = Markers { p, body, ret_mut };
     walk.expr(&body.value, ret_mut, out);
@@ -442,10 +529,8 @@ impl Markers<'_> {
             ExprKind::Call(c) => {
                 let checked = match c.callee {
                     Callee::Fn { .. } | Callee::TraitMethod { .. } => true,
-                    // A local that names a function is called as the function is.
-                    Callee::Local(l) => {
-                        matches!(self.p.types.kind(self.body.local(l).ty), TyKind::FnDef(..))
-                    }
+                    // A call through a local is checked against the modes its type gives.
+                    Callee::Local(_) | Callee::Value(_) => true,
                     Callee::Builtin(_) | Callee::Clone => false,
                 };
                 for (i, a) in c.args.iter().enumerate() {
@@ -456,23 +541,8 @@ impl Markers<'_> {
                 self.expr(&d.groups, false, out);
                 d.args.iter().for_each(|(_, a)| self.expr(a, true, out));
             }
-            ExprKind::Match { scrutinee, arms } => {
-                match &scrutinee.kind {
-                    ExprKind::MutArg(inner) => {
-                        out.push(
-                            Diagnostic::new(
-                                codes::E0908,
-                                scrutinee.span,
-                                "`match mut` is tier 1: the names it binds would be read-only",
-                            )
-                            .with_help(
-                                "match without `mut`, and write a changed value back to the place",
-                            ),
-                        );
-                        self.expr(inner, false, out);
-                    }
-                    _ => self.expr(scrutinee, false, out),
-                }
+            ExprKind::Match { scrutinee, arms, .. } => {
+                self.expr(scrutinee, false, out);
                 for arm in arms {
                     if let Some(g) = &arm.guard {
                         self.expr(g, false, out);
@@ -489,6 +559,11 @@ impl Markers<'_> {
             }
             ExprKind::Block(b) => self.block(b, here, out),
             ExprKind::Return(Some(v)) => self.expr(v, self.ret_mut, out),
+            // A borrow struct's fields are checked against their modes where it's checked: a
+            // `mut` one takes `mut place`.
+            ExprKind::Adt { adt, fields, .. } if self.p.adt(*adt).borrow => {
+                fields.iter().for_each(|f| self.expr(f, true, out));
+            }
             _ => e.for_each_child(&mut |c| match c {
                 Child::Expr(x) => self.expr(x, false, out),
                 Child::Block(b) => self.block(b, false, out),
@@ -499,10 +574,13 @@ impl Markers<'_> {
     fn block(&self, b: &Block, tail: bool, out: &mut Vec<Diagnostic>) {
         for s in &b.stmts {
             match &s.kind {
-                StmtKind::Bind { pat, init } => {
+                StmtKind::Bind { pat, init, else_ } => {
                     let projects_mut = matches!(&pat.kind, PatKind::Bind(l)
                         if matches!(self.body.local(*l).kind, LocalKind::Projection { mutable: true }));
                     self.expr(init, projects_mut, out);
+                    if let Some(b) = else_ {
+                        self.block(b, false, out);
+                    }
                 }
                 StmtKind::Assign { place, value, .. } => {
                     self.expr(place, false, out);
@@ -531,111 +609,210 @@ impl Markers<'_> {
     }
 }
 
-/// E0510 (§6.7): a function type is a parameter's type only, so a closure or function can't
+/// The function being finished, for whether its closures can be stored.
+struct Own<'a> {
+    owner: Option<FnId>,
+    closures: &'a [ClosureDef],
+    locals: &'a [LocalDecl],
+}
+
+impl Own<'_> {
+    /// The first capture that keeps closure `c` from being stored: one it writes, or a value
+    /// that isn't `Copy` (a projection). `None` if it captures only `Copy` values it reads.
+    fn projection_capture(&self, p: &Program, c: ClosureRef) -> Option<LocalId> {
+        if c.owner != self.owner {
+            return None; // checked where it's made
+        }
+        let def = self.closures.get(c.id.0 as usize)?;
+        def.captures.iter().find_map(|&(l, written)| {
+            let ty = self.locals[l.index()].ty;
+            (written || !traits::implements_builtin(p, ty, Lang::Copy)).then_some(l)
+        })
+    }
+
+    /// What in a value of type `t` can't be stored: a `fn(..)` parameter's value, or a closure
+    /// that captures a projection (with that capture).
+    fn unstorable(&self, p: &Program, t: TyId) -> Option<Option<LocalId>> {
+        fn go(
+            own: &Own,
+            p: &Program,
+            t: TyId,
+            clear: &mut std::collections::HashSet<TyId>,
+        ) -> Option<Option<LocalId>> {
+            if clear.contains(&t) {
+                return None;
+            }
+            let found = match p.types.kind(t) {
+                TyKind::FnPtr(..) => Some(None),
+                &TyKind::Closure(c, _) => own.projection_capture(p, c).map(Some),
+                TyKind::Tuple(ts) | TyKind::Adt(_, ts) => {
+                    ts.iter().find_map(|&t| go(own, p, t, clear))
+                }
+                TyKind::Array(e, _) | TyKind::ArrayN(e, _) | TyKind::Slice(e) => {
+                    go(own, p, *e, clear)
+                }
+                _ => None,
+            };
+            if found.is_none() {
+                clear.insert(t);
+            }
+            found
+        }
+        go(self, p, t, &mut std::collections::HashSet::new())
+    }
+}
+
+/// E0510 (§6.7): a closure that captures a projection, and a `fn(..)` parameter's value, can't
 /// be put in a tuple, an array, a struct or an enum, or be a generic's type argument (generic
-/// code could return or keep it). `resolve_type` checks the types written; this checks the
-/// types inferred.
-fn stored_callables(p: &Program, e: &Expr, out: &mut Vec<Diagnostic>) {
-    let holds = |t: TyId| holds_callable(&p.types, t);
+/// code could return or keep it). A closure that captures only `Copy` values can: it holds
+/// copies of them. `resolve_type` checks the types written; this checks the types inferred.
+fn stored_callables(p: &Program, own: &Own, e: &Expr, out: &mut Vec<Diagnostic>) {
+    let bad = |t: TyId| own.unstorable(p, t);
     let what = match &e.kind {
-        ExprKind::Tuple(_) if holds(e.ty) => Some("stored in a tuple"),
-        ExprKind::Array(_) | ExprKind::ArrayRepeat(..) if holds(e.ty) => Some("stored in an array"),
-        ExprKind::Adt { .. } if holds(e.ty) => Some("stored in a struct or enum"),
+        ExprKind::Tuple(_) => bad(e.ty).map(|c| ("stored in a tuple", c)),
+        ExprKind::Array(_) | ExprKind::ArrayRepeat(..) => {
+            bad(e.ty).map(|c| ("stored in an array", c))
+        }
+        ExprKind::Adt { .. } => bad(e.ty).map(|c| ("stored in a struct or enum", c)),
         ExprKind::Call(c) => {
             let generic = match &c.callee {
-                Callee::Fn { args, .. } => args.iter().any(|&t| holds(t)),
+                Callee::Fn { args, .. } => args.iter().find_map(|&t| bad(t)),
                 Callee::TraitMethod { self_ty, trait_args, method_args, .. } => {
-                    holds(*self_ty) || trait_args.iter().chain(method_args).any(|&t| holds(t))
+                    std::iter::once(self_ty)
+                        .chain(trait_args)
+                        .chain(method_args)
+                        .find_map(|&t| bad(t))
                 }
-                _ => false,
+                _ => None,
             };
-            generic.then_some("a generic's type argument")
+            generic.map(|c| ("a generic's type argument", c))
         }
-        ExprKind::FnRef(_, args) if args.iter().any(|&t| holds(t)) => {
-            Some("a generic's type argument")
+        ExprKind::FnRef(_, args) => {
+            args.iter().find_map(|&t| bad(t)).map(|c| ("a generic's type argument", c))
         }
         _ => None,
     };
-    if let Some(what) = what {
-        out.push(
-            Diagnostic::new(codes::E0510, e.span, format!("a closure or function can't be {what}"))
-                .with_note("closures don't escape the call they're passed to (§6.7); storing or returning one is tier 1 (`@escaping`)")
-                .with_help("pass it straight to a parameter of type `fn(..)`"),
-        );
+    if let Some((what, capture)) = what {
+        let d = match capture {
+            Some(l) => {
+                let name = &own.locals[l.index()].name;
+                Diagnostic::new(
+                    codes::E0510,
+                    e.span,
+                    format!("a closure that captures `{name}`, a projection, can't be {what}"),
+                )
+                .with_note("a closure that captures only `Copy` values holds copies of them, and can be stored; one that borrows or changes what it uses can only be passed down (§6.7)")
+                .with_help(format!("copy what it needs into a local first (`let x = {name}.clone()`), or pass the closure straight to a parameter"))
+            }
+            None => Diagnostic::new(
+                codes::E0510,
+                e.span,
+                format!("a `fn(..)` parameter's value can't be {what}"),
+            )
+            .with_note("a function type is a parameter's type only (§6.7)")
+            .with_help("take a generic `F: fn(..)` instead: its values can be stored"),
+        };
+        out.push(d);
     }
     e.for_each_child(&mut |c| match c {
-        Child::Expr(x) => stored_callables(p, x, out),
-        Child::Block(b) => stored_callables_block(p, b, out),
+        Child::Expr(x) => stored_callables(p, own, x, out),
+        Child::Block(b) => stored_callables_block(p, own, b, out),
     });
 }
 
-fn stored_callables_block(p: &Program, b: &Block, out: &mut Vec<Diagnostic>) {
+fn stored_callables_block(p: &Program, own: &Own, b: &Block, out: &mut Vec<Diagnostic>) {
     for s in &b.stmts {
         let (exprs, body): (&[&Expr], _) = match &s.kind {
-            StmtKind::Bind { init: e, .. } | StmtKind::Expr(e) => (&[e], None),
+            StmtKind::Bind { init: e, else_, .. } => (&[e], else_.as_ref()),
+            StmtKind::Expr(e) => (&[e], None),
             StmtKind::Assign { place, value, .. } => (&[place, value], None),
             StmtKind::While { cond, body } => (&[cond], Some(body)),
             StmtKind::Loop { body } => (&[], Some(body)),
             StmtKind::ForRange { start, end, body, .. } => (&[start, end], Some(body)),
             StmtKind::ForEach { array, body, .. } => (&[array], Some(body)),
         };
-        exprs.iter().for_each(|e| stored_callables(p, e, out));
+        exprs.iter().for_each(|e| stored_callables(p, own, e, out));
         if let Some(body) = body {
-            stored_callables_block(p, body, out);
+            stored_callables_block(p, own, body, out);
         }
     }
     if let Some(t) = &b.tail {
-        stored_callables(p, t, out);
+        stored_callables(p, own, t, out);
     }
 }
 
-/// Whether a value of type `t` is or holds a closure or function.
-fn holds_callable(types: &Types, t: TyId) -> bool {
-    // `clear`: parts found not to hold one, tested once however often a type shares them.
-    fn holds(types: &Types, t: TyId, clear: &mut std::collections::HashSet<TyId>) -> bool {
-        if clear.contains(&t) {
-            return false;
-        }
-        let found = match types.kind(t) {
-            TyKind::Closure(..) | TyKind::FnPtr(..) | TyKind::FnDef(..) => true,
-            TyKind::Tuple(ts) | TyKind::Adt(_, ts) => ts.iter().any(|&t| holds(types, t, clear)),
-            TyKind::Array(e, _) | TyKind::Slice(e) => holds(types, *e, clear),
-            _ => false,
-        };
-        if !found {
-            clear.insert(t);
-        }
-        found
-    }
-    holds(types, t, &mut std::collections::HashSet::new())
-}
-
-pub(super) fn finish_const(mut c: Checker, mut e: Expr) -> ((TyId, Expr), Vec<Diagnostic>) {
-    finish_common(&mut c);
-    let infer = &c.infer;
-    let types = &c.p.types;
-    walk_tys(&mut e, &mut |t| *t = infer.resolve(types, *t));
-    if let Some(bad) = non_literal(&e) {
-        c.err(
+/// Finishes a constant's value, checked as the body of the function that computes it (§10).
+/// The value must be one that lives as long as the program (E0332).
+pub(super) fn finish_const(c: Checker, e: Expr, ret: TyId) -> (TyId, Body, Vec<Diagnostic>) {
+    let p = c.p;
+    let declared = c.infer.resolve(&p.types, ret);
+    let (body, mut diags) = finish(c, Vec::new(), e, None);
+    let ty = match p.types.kind(body.value.ty) {
+        TyKind::Never => declared,
+        _ => body.value.ty,
+    };
+    if let Some(what) = not_constant(p, ty, &mut std::collections::HashSet::new()) {
+        // Its uses stay quiet: the error type has every property.
+        let error = p.types.error;
+        diags.push(
             Diagnostic::new(
-                codes::E0906,
-                bad.span,
-                "a constant's value must be a literal value in tier 0",
+                codes::E0332,
+                body.value.span,
+                format!("a constant can't hold {what}: its type is `{}`", p.display_ty(ty)),
             )
-            .with_note("evaluating calls and arithmetic at compile time is tier 1 (D-073)"),
+            .with_note("a constant is an owned value that lives as long as the program; the build computes it and lays it out as read-only data (§10)"),
         );
-        // A rejected value has no type for its uses: they stay quiet, and don't take what's
-        // made here (a closure belongs to this body) into another body.
-        let error = c.p.types.error;
-        return ((error, Expr { ty: error, span: e.span, kind: ExprKind::Error }), c.diags);
+        return (error, body, diags);
     }
-    ((e.ty, e), c.diags)
+    (ty, body, diags)
 }
 
-/// The first part of a typed constant that isn't a literal value.
+/// What in a value of type `t` can't be part of a constant: a function or closure, a run or
+/// `str` (a projection of another place), or a borrow struct (it holds projections).
+fn not_constant(
+    p: &Program,
+    t: TyId,
+    seen: &mut std::collections::HashSet<TyId>,
+) -> Option<&'static str> {
+    if !seen.insert(t) {
+        return None;
+    }
+    match p.types.kind(t) {
+        TyKind::FnPtr(..) | TyKind::Closure(..) | TyKind::FnDef(..) => {
+            Some("a function or a closure")
+        }
+        TyKind::Slice(_) | TyKind::Str => Some("a run, a projection of another place"),
+        TyKind::Tuple(ts) => ts.clone().into_iter().find_map(|t| not_constant(p, t, seen)),
+        TyKind::Array(e, _) | TyKind::ArrayN(e, _) => not_constant(p, *e, seen),
+        TyKind::Adt(a, args) => {
+            let (a, args) = (*a, args.clone());
+            if p.adt(a).borrow {
+                return Some("a borrow struct, which holds projections");
+            }
+            // The type arguments too: a `Vec<T>`'s elements are no field's type.
+            let variants = match p.adt(a).variants().len() {
+                0 => vec![None],
+                n => (0..n as u32).map(Some).collect(),
+            };
+            let fields = variants.into_iter().flat_map(|v| p.fields_of(a, &args, v));
+            args.iter()
+                .copied()
+                .chain(fields.collect::<Vec<_>>())
+                .find_map(|t| not_constant(p, t, seen))
+        }
+        _ => None,
+    }
+}
+
+/// The first part of a typed constant that isn't a literal value: with one, the build computes
+/// the constant (`crate::mir::build::is_literal`, but a constant it names may be computed).
 pub fn non_literal(e: &Expr) -> Option<&Expr> {
     match &e.kind {
-        ExprKind::Lit(_) | ExprKind::Const(_) | ExprKind::Error => None,
+        ExprKind::Lit(_)
+        | ExprKind::Text(_)
+        | ExprKind::Embed(_)
+        | ExprKind::Const(_)
+        | ExprKind::Error => None,
         ExprKind::Unary(wrela_syntax::ast::UnOp::Neg, x) if matches!(x.kind, ExprKind::Lit(_)) => {
             None
         }
@@ -646,7 +823,6 @@ pub fn non_literal(e: &Expr) -> Option<&Expr> {
             xs.iter().find_map(non_literal)
         }
         ExprKind::ArrayRepeat(x, _) => non_literal(x),
-        ExprKind::Convert(x) if matches!(x.kind, ExprKind::Lit(_)) => None,
         _ => Some(e),
     }
 }

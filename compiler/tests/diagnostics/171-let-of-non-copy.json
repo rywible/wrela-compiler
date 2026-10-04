@@ -1,0 +1,62 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0518",
+      "file": "main.wrela",
+      "fixes": [
+        {
+          "edits": [
+            {
+              "end": 207,
+              "file": "main.wrela",
+              "replacement": "borrow",
+              "start": 204
+            }
+          ],
+          "message": "read it in place: `borrow`"
+        },
+        {
+          "edits": [
+            {
+              "end": 219,
+              "file": "main.wrela",
+              "replacement": ".clone()",
+              "start": 219
+            }
+          ],
+          "message": "copy it: `.clone()`"
+        },
+        {
+          "edits": [
+            {
+              "end": 214,
+              "file": "main.wrela",
+              "replacement": "take ",
+              "start": 214
+            }
+          ],
+          "message": "move it: `take`"
+        }
+      ],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "`let` owns its value, and `Inventory` isn't `Copy`, so `bag` can't be a copy of this place",
+      "notes": [
+        "`let x = place` copies only a `Copy` value (§6.3)"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 15,
+        "end": 219,
+        "end_column": 20,
+        "end_line": 13,
+        "line": 13,
+        "start": 214
+      },
+      "title": "`let` of a place whose type isn't `Copy`"
+    }
+  ],
+  "version": 2
+}

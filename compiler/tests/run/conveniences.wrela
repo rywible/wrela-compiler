@@ -1,0 +1,42 @@
+// run: the gameplay paper test's small conveniences that are in (language.md §21): an enum's
+// integer value is its variant's index, an index is a `u32` or an `i32` (a negative one is out
+// of range, so it traps), an assignment is a `match` arm, and text is matched by string patterns
+// expect: index_of(0) = 0
+// expect: index_of(2) = 2
+// expect: at(1) = 2.0
+// expect: at(-1) traps
+// expect: arms(0) = 1.0
+// expect: arms(5) = 12.0
+// expect: speed(1) = 2.0
+enum Mood {
+    Calm,
+    Alert,
+    Fleeing,
+}
+
+pub fn index_of(k: u32) -> u32 {
+    let m = if k == 0 { Mood::Calm } else if k == 1 { Mood::Alert } else { Mood::Fleeing }
+    u32(m)
+}
+
+pub fn at(i: i32) -> f32 {
+    let xs = [1.0, 2.0, 3.0]
+    xs[i]
+}
+
+pub fn arms(k: u32) -> f32 {
+    var x = 10.0
+    match k {
+        0 => x = 1.0,
+        _ => x += 2.0,
+    }
+    x
+}
+
+pub fn speed(k: u32) -> f32 {
+    let name = if k == 0 { "calm" } else { "alert" }
+    match name {
+        "calm" => 1.0,
+        _ => 2.0,
+    }
+}

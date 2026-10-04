@@ -1,0 +1,17 @@
+// A constant whose value depends on itself, directly or through the functions it calls.
+// ---- wrong
+const COUNT: u32 = count()
+
+fn count() -> u32 {
+    COUNT + 1
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+const COUNT: u32 = count()
+
+fn count() -> u32 {
+    1
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

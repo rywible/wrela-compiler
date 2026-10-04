@@ -1,0 +1,40 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0115",
+      "file": "main.wrela",
+      "fixes": [
+        {
+          "edits": [
+            {
+              "end": 186,
+              "file": "main.wrela",
+              "replacement": "print(f\"speed is {speed}\")",
+              "start": 156
+            }
+          ],
+          "message": "print it with `std::io::print`"
+        }
+      ],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "`println!` is a macro, and wrela has no macros",
+      "notes": [
+        "a wrela program has no console of its own; `std::io::print` shows a line on the host's (§6.15)"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 5,
+        "end": 164,
+        "end_column": 13,
+        "end_line": 7,
+        "line": 7,
+        "start": 156
+      },
+      "title": "a macro call, which wrela doesn't have"
+    }
+  ],
+  "version": 2
+}

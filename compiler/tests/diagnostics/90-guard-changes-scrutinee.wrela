@@ -1,7 +1,7 @@
 // mistake: a match guard changing what a later arm tests
 // expect: E0507
 // fix: no
-enum State: Copy + Clone {
+enum State: Copy {
     Idle,
     Busy,
 }

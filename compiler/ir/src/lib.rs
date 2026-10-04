@@ -12,6 +12,7 @@
 //! integer arithmetic is checked (traps) on the CPU and wraps on the GPU, only GPU code has
 //! resources and entry points, and only CPU code has constant data.
 
+pub mod bounds;
 pub mod derive;
 mod error;
 pub mod layout;
@@ -22,6 +23,7 @@ mod types;
 pub mod uniformity;
 mod verify;
 pub mod visit;
+pub mod workgroup;
 
 pub use error::{Error, Result};
 pub use types::*;
@@ -181,7 +183,7 @@ impl Builtin {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum PlaceRoot {
     Local(LocalId),
     /// A pointer parameter (by index).
@@ -194,7 +196,7 @@ pub enum PlaceRoot {
     Data(DataId),
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Proj {
     /// A struct field.
     Field(u32),
@@ -204,7 +206,7 @@ pub enum Proj {
     Index(ValueId),
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Place {
     pub root: PlaceRoot,
     pub path: Vec<Proj>,
@@ -244,25 +246,152 @@ pub enum HostOp {
     CreateBuffer {
         elem_size: u32,
     },
+    /// Releases the buffer with this handle (u32).
+    DestroyBuffer,
+    /// Args: source, source offset, destination, destination offset, size: `u32`s, the offsets
+    /// and size in bytes.
+    CopyBuffer,
     /// `write(handle, at, values)`: args are the handle, the first element, and a run (a
-    /// pointer and a count) of elements `elem_size` bytes.
+    /// pointer and a count) of elements of type `elem`, `elem_size` bytes each.
     WriteBuffer {
+        elem: TypeId,
         elem_size: u32,
     },
-    /// Args: groups x, y, z, the buffer handles, then the uniform block value (if any).
+    /// Args: groups x, y, z (or, `indirect`, the handle and byte offset of a buffer holding
+    /// them), each binding's handle, offset and size (`u32`s), then the uniform block value (if
+    /// any).
     Dispatch {
         pipeline: u32,
-        buffers: u32,
+        bindings: u32,
         uniform: Option<TypeId>,
+        indirect: bool,
     },
     BeginScreenPass,
-    /// Args: vertices, instances, the buffer handles, then the uniform block value.
+    /// A command of `words` 4-byte words and then `runs` runs of bytes. The args are the words
+    /// (`u32`, `i32` or `f32`; with `handle`, all but the first, which is a new resource handle
+    /// the op returns), then each run (a `[u8]`). The payload is the words, each run's length,
+    /// then each run's bytes, padded with zeros to a multiple of 4 (stream v3's layout for
+    /// textures, samplers, passes and requests).
+    Command {
+        opcode: u32,
+        words: u32,
+        runs: u32,
+        handle: bool,
+    },
+    /// A new request number (a `u32`): `wrela.submit`'s requests are numbered by the program.
+    NextRequest,
+    /// `wrela.request_status(request)`: an `i32`, -1 while pending, -2 failed, else the answer's
+    /// length in bytes.
+    RequestStatus,
+    /// `wrela.request_take(request, address)`: copies the answer to the address (a `u32`).
+    RequestTake,
+    /// `wrela.limit(index)`: one of the GPU's limits, a `u32`.
+    Limit,
+    /// `wrela.audio(task, context)`: starts the program's voice.
+    Audio,
+    /// Args: vertices, instances (or, `indirect`, the handle and byte offset of a buffer
+    /// holding the counts), each binding's handle, offset and size, then the uniform block
+    /// value.
     Draw {
         pipeline: u32,
-        buffers: u32,
+        bindings: u32,
         uniform: Option<TypeId>,
+        indirect: bool,
     },
     Present,
+}
+
+/// Raw memory (CPU only): what std's unsafe core is built on (language.md §6.14). Addresses are
+/// `u32`s.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MemOp {
+    /// The heap's first address, a `u32`: where the back end's memory layout puts it.
+    HeapBase,
+    /// The memory's size in 64 KiB pages, a `u32`.
+    Pages,
+    /// Grows the memory by this many pages: the old size in pages, or `u32::MAX` if it can't.
+    Grow,
+    /// The scalar of this kind at an address.
+    Load(Scalar),
+    /// Stores a scalar (the second argument) at an address (the first).
+    Store(Scalar),
+    /// Copies bytes: destination, source, count.
+    Copy,
+    /// Fills bytes: destination, the byte, count.
+    Fill,
+    /// An address as a pointer to a value of the type the result's pointer type names, so a
+    /// place can be rooted at it ([`PlaceRoot::Ptr`]).
+    Ptr,
+    /// A pointer's address, a `u32`.
+    Addr,
+    /// Compare and swap of the `u32` at an address: (address, expected, replacement); the value
+    /// that was there.
+    Cas,
+    /// A panic: writes the message, a `u32` address and a byte count, where hosts read it
+    /// (`wrela_abi::memory::PANIC_MESSAGE`), then traps.
+    Panic,
+    /// Atomically adds the second argument to the `u32` at an address: the old value.
+    AtomicAdd,
+    /// The `u32` at an address, read atomically.
+    AtomicLoad,
+    /// Stores the second argument at an address, atomically.
+    AtomicStore,
+    /// Waits while the `u32` at an address is the second argument (`memory.atomic.wait32`, no
+    /// time limit): 0 woken, 1 it wasn't that value.
+    Wait,
+    /// Wakes up to the second argument's count of threads waiting at an address: how many.
+    Notify,
+    /// Calls task function number `args[0]` (an index into [`Module::tasks`]) with a context
+    /// address and a chunk index.
+    RunTask,
+}
+
+/// What [`Expr::Atomic`] does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AtomicOp {
+    /// `atomicLoad`: no operand; the value.
+    Load,
+    /// `atomicStore`: the value to store; nothing (evaluated only for its effect).
+    Store,
+    Add,
+    Sub,
+    Min,
+    Max,
+    And,
+    Or,
+    Xor,
+    Exchange,
+    /// Stores the new value if the old one is the expected one. Its value is a struct of the
+    /// old value and a `bool`, whether it stored: it may fail even when they're equal (WGSL's
+    /// `atomicCompareExchangeWeak`).
+    CompareExchange,
+}
+
+/// What [`Expr::Texture`] reads. Coordinates are `vec2`s in [0, 1] for sampling, and `u32`s
+/// for a texel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TextureOp {
+    /// Args: the coordinates. A `vec4`; fragment shaders only (it uses derivatives).
+    Sample,
+    /// Args: the coordinates and the mip level (an `f32`). A `vec4`.
+    SampleLevel,
+    /// Of a depth texture, with a comparison sampler. Args: the coordinates and the reference
+    /// depth. An `f32`, the fraction of texels that pass; fragment shaders only.
+    SampleCompare,
+    /// As `SampleCompare`, at level 0: any stage.
+    SampleCompareLevel,
+    /// Args: x and y. The texel at level 0: a `vec4`, or an `f32` of a depth texture.
+    Load,
+    /// The width or height, a `u32`.
+    Width,
+    Height,
+}
+
+impl TextureOp {
+    /// Whether it uses derivatives: fragment shaders only, in uniform control flow.
+    pub fn uses_derivatives(self) -> bool {
+        matches!(self, TextureOp::Sample | TextureOp::SampleCompare)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -302,8 +431,18 @@ pub enum Expr {
     /// A pointer to a place, as a value (CPU only: a projection to return).
     Addr(Place),
     Host(HostOp, Vec<ValueId>),
+    /// Raw memory (CPU only).
+    Mem(MemOp, Vec<ValueId>),
     /// The element count of a storage buffer's runtime array (GPU only), a `u32`.
     ArrayLength(Place),
+    /// A read of a texture resource (GPU only), with a sampler resource for the sampling ops.
+    Texture(TextureOp, ResourceId, Option<ResourceId>, Vec<ValueId>),
+    /// An atomic read-modify-write of the atomic at the place (GPU only): the value that was
+    /// there. Args: the operand (for `CompareExchange`, the expected value then the new one).
+    Atomic(AtomicOp, Place, Vec<ValueId>),
+    /// `workgroupBarrier()` (GPU only): no invocation of the workgroup goes on until all have
+    /// reached it, and their workgroup memory writes are visible. In uniform control flow only.
+    Barrier,
     /// A GPU builtin input of the entry point (`@builtin(...)`), by index into the entry's
     /// inputs, as the std struct that holds it (`GlobalId`, `FragCoord`, ...).
     EntryInput(u32),
@@ -357,6 +496,10 @@ pub struct LocalDecl {
     pub ty: TypeId,
 }
 
+/// How many counted calls (recursion that `@deterministic` code reaches) may be in progress
+/// at once: the next panics, the same way on every engine (language.md §8).
+pub const RECURSION_LIMIT: u32 = 256;
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Function {
     pub name: String,
@@ -369,6 +512,14 @@ pub struct Function {
     /// Each value's type, by `ValueId`.
     pub values: Vec<TypeId>,
     pub body: Block,
+    /// A recursive function whose depth is counted (CPU only): a call made while
+    /// [`RECURSION_LIMIT`] counted calls are in progress panics with [`Module::depth_message`]
+    /// (language.md §8).
+    pub counted: bool,
+    /// An interval derivation's (`derive::interval`): GPU flattening may keep a call to it
+    /// rather than inline it (`opt::outlined`), since nested derivations call the same ones
+    /// from many places.
+    pub interval: bool,
 }
 
 impl Function {
@@ -400,6 +551,8 @@ impl Function {
             locals: self.locals.clone(),
             values: self.values.clone(),
             body: Vec::new(),
+            counted: self.counted,
+            interval: false,
         }
     }
 
@@ -427,6 +580,12 @@ pub enum ResourceKind {
     StorageReadWrite,
     /// `var<private>`: one per invocation, no binding (the entry point fills it in).
     Private,
+    /// `var<workgroup>` holding `ty` (an array): one per workgroup, shared by its invocations.
+    Workgroup,
+    /// `texture_2d<f32>`, or `texture_depth_2d`.
+    Texture { depth: bool },
+    /// `sampler`, or `sampler_comparison`.
+    Sampler { comparison: bool },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -486,6 +645,11 @@ pub enum ConstValue {
     Parts(Vec<ConstValue>),
     /// An enum's value: its variant, and the payload if the variant has one.
     Variant(u32, Option<Box<ConstValue>>),
+    /// An array of bytes (`u8`s): text, embedded files.
+    Bytes(Vec<u8>),
+    /// A `u32`: the address of other constant data (CPU only). A constant the build computed
+    /// points at its parts this way: a `Vec`'s elements, a `Box`'s value, a `Text`'s bytes.
+    Addr(DataId),
 }
 
 /// A constant in memory, which code reads through [`PlaceRoot::Data`] (CPU only): one copy
@@ -508,6 +672,24 @@ pub struct Module {
     pub exports: Vec<(String, FuncId)>,
     /// CPU only: constant data.
     pub data: Vec<Data>,
+    /// CPU only: the text a counted call past the limit panics with: the data holding it, and
+    /// its length (see [`Function::counted`]).
+    pub depth_message: Option<(DataId, u32)>,
+    /// CPU only, in a debug build: the text a float operation that creates a NaN panics with
+    /// (language.md §11). A release build has none, and no such checks.
+    pub nan_message: Option<(DataId, u32)>,
+    /// CPU only: the program's state, which lasts across calls (language.md §12): data the
+    /// program changes, unlike the rest, which is constant.
+    pub state: Option<DataId>,
+    /// CPU only: functions called by index ([`MemOp::RunTask`]): a parallel job's chunks.
+    /// Each takes a context address and a chunk index.
+    pub tasks: Vec<FuncId>,
+    /// CPU only: std's worker loop, which the module exports as `__worker` when it has one
+    /// (a program that uses parallelism).
+    pub worker: Option<FuncId>,
+    /// CPU only: whether the program starts a voice (`std::audio`), so the module exports
+    /// `__audio`, which runs a task on the audio thread's stack.
+    pub audio: bool,
 }
 
 impl Module {
@@ -535,7 +717,11 @@ impl Module {
             PlaceRoot::Resource(r) => {
                 let res = self.resources.get(r.index())?;
                 match res.kind {
-                    ResourceKind::Uniform { .. } | ResourceKind::Private => res.ty,
+                    ResourceKind::Uniform { .. }
+                    | ResourceKind::Private
+                    | ResourceKind::Workgroup
+                    | ResourceKind::Texture { .. }
+                    | ResourceKind::Sampler { .. } => res.ty,
                     ResourceKind::StorageRead | ResourceKind::StorageReadWrite => {
                         match p.path.as_slice() {
                             [Proj::Index(_), rest @ ..] => return Some((res.ty, rest)),
@@ -564,6 +750,20 @@ impl Module {
             }
             _ => None,
         }
+    }
+
+    /// The local whose own storage place `p` (of `f`) is in: its root is a local, and its
+    /// path doesn't go through a run or a pointer the local holds (whose data is elsewhere).
+    pub fn local_storage(&self, f: &Function, p: &Place) -> Option<LocalId> {
+        let l = p.root_local()?;
+        let mut t = f.locals.get(l.index())?.ty;
+        for proj in &p.path {
+            if matches!(self.types.get(t), TypeDef::Run(_) | TypeDef::Ptr(_)) {
+                return None;
+            }
+            t = self.proj_ty(t, proj)?;
+        }
+        Some(l)
     }
 
     pub fn add_function(&mut self, f: Function) -> FuncId {

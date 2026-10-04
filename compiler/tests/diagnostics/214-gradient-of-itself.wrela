@@ -1,0 +1,11 @@
+// mistake: a function that takes its own gradient
+// expect: E0700
+// fix: no
+use std::derive::gradient
+
+pub fn climb(x: f32) -> f32 {
+    if x > 4.0 {
+        return x
+    }
+    gradient(climb, x + 1.0)
+}

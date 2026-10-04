@@ -1,0 +1,346 @@
+// Immediate-mode UI (the gameplay paper test §3): widgets are calls made each frame. The `Ui`
+// holds a layout cursor, which widget the pointer is on or pressing, a drag in flight, and the
+// frame's draw list: rectangles, text drawn as a block per character. Nothing is retained
+// between frames but the pointer's state, so there's no widget tree and no stored closure.
+
+use std::gpu::{
+    ClipPosition, Flat, GpuBuffer, InstanceIndex, VertexIndex, begin_screen_pass, buffer, draw,
+    present, write,
+}
+
+/// A rectangle to draw, in pixels from the top left, and its colour.
+pub struct Rect: Copy + GpuData {
+    pub pos: vec2,
+    pub size: vec2,
+    pub color: vec4,
+}
+
+/// Where a panel sits on the screen.
+pub enum Anchor: Copy + Eq {
+    TopLeft,
+    Center,
+    Bottom,
+}
+
+/// The pointer this frame: where it is, whether its button is down, and whether it went down
+/// or up this frame.
+pub struct Pointer: Copy {
+    pub pos: vec2,
+    pub down: bool,
+    pub pressed: bool,
+    pub released: bool,
+}
+
+/// A character's cell, in pixels.
+pub const CHAR: vec2 = vec2(7.0, 12.0)
+const ROW: f32 = 20.0
+const PAD: f32 = 6.0
+
+pub const TEXT: vec4 = vec4(0.95, 0.95, 0.9, 1.0)
+const PANEL: vec4 = vec4(0.1, 0.12, 0.16, 0.85)
+const BUTTON: vec4 = vec4(0.25, 0.3, 0.38, 1.0)
+const HOT: vec4 = vec4(0.35, 0.42, 0.55, 1.0)
+
+pub struct Ui {
+    screen: vec2,
+    pointer: Pointer,
+    cursor: vec2,
+    width: f32,
+    panel: u32,
+    ids: Vec<u32>,
+    /// The last widget: its id and rectangle.
+    last: u32,
+    last_lo: vec2,
+    last_hi: vec2,
+    /// The widget the pointer went down on, while it's down.
+    active: u32,
+    /// A drag in flight: its payload, plus one (0 for none).
+    drag: u32,
+    /// A drag released this frame: its payload, plus one, and where.
+    dropped: u32,
+    dropped_at: vec2,
+    pub draws: Vec<Rect>,
+    /// Each widget's text (hashed) and centre, this frame and the last: what a scripted test
+    /// clicks (`find`).
+    seen: Vec<(u32, vec2)>,
+    last_seen: Vec<(u32, vec2)>,
+}
+
+/// FNV-1a of a widget's text and the id stack: tells widgets apart.
+fn id_of(text: str, ids: [u32]) -> u32 {
+    var h = 2166136261
+    for i in 0..text.len() {
+        h = (h ^ u32(text.byte(i))).wrapping_mul(16777619)
+    }
+    for x in ids {
+        h = (h ^ x).wrapping_mul(16777619)
+    }
+    h | 1
+}
+
+impl Ui {
+    pub fn new() -> Ui {
+        Ui {
+            screen: vec2(640.0, 480.0),
+            pointer: Pointer { pos: vec2(-1.0), down: false, pressed: false, released: false },
+            cursor: vec2(0.0),
+            width: 0.0,
+            panel: 0,
+            ids: Vec::new(),
+            last: 0,
+            last_lo: vec2(0.0),
+            last_hi: vec2(0.0),
+            active: 0,
+            drag: 0,
+            dropped: 0,
+            dropped_at: vec2(-1.0),
+            draws: Vec::new(),
+            seen: Vec::new(),
+            last_seen: Vec::new(),
+        }
+    }
+
+    /// Where the widget showing `text` was last frame: its centre. For tests that drive the UI
+    /// as a player would.
+    pub fn find(self, text: str) -> Option<vec2> {
+        let h = id_of(text, [0; 0])
+        for seen in self.last_seen {
+            if seen.0 == h {
+                return Some(seen.1)
+            }
+        }
+        None
+    }
+
+    fn note(mut self, text: str, lo: vec2, hi: vec2) {
+        self.seen.push((id_of(text, [0; 0]), 0.5 * (lo + hi)))
+    }
+
+    /// Starts a frame: the screen's size and the pointer. The draw list starts empty.
+    pub fn begin(mut self, screen: vec2, pointer: Pointer) {
+        self.screen = screen
+        self.pointer = pointer
+        self.draws.clear()
+        self.ids.clear()
+        self.last_seen = replace(mut self.seen, Vec::new())
+        self.dropped = 0
+        if pointer.released {
+            if self.drag != 0 {
+                self.dropped = self.drag
+                self.dropped_at = pointer.pos
+            }
+            self.drag = 0
+        }
+        if !pointer.down && !pointer.released {
+            self.active = 0
+        }
+    }
+
+    fn rect(mut self, pos: vec2, size: vec2, color: vec4) {
+        self.draws.push(Rect { pos, size, color })
+    }
+
+    /// Text, a block per character (no font in this engine), from `at`.
+    fn text(mut self, s: str, at: vec2, color: vec4) {
+        for i in 0..s.len() {
+            if s.byte(i) != 32 {
+                self.rect(at + vec2(f32(i) * CHAR.x, 0.0), CHAR - vec2(1.0, 2.0), color)
+            }
+        }
+    }
+
+    fn inside(self, lo: vec2, hi: vec2) -> bool {
+        let p = self.pointer.pos
+        p.x >= lo.x && p.y >= lo.y && p.x < hi.x && p.y < hi.y
+    }
+
+    /// Places a widget `height` tall on the panel's next row.
+    fn place(mut self, id: u32, height: f32) -> (vec2, vec2) {
+        let lo = self.cursor
+        let hi = lo + vec2(self.width - 2.0 * PAD, height)
+        self.cursor.y += height + 4.0
+        self.last = id
+        self.last_lo = lo
+        self.last_hi = hi
+        (lo, hi)
+    }
+
+    /// Widgets stack downward until `end_panel`. `height` is how tall it will be.
+    pub fn panel(mut self, title: str, at: Anchor, width: f32, height: f32) {
+        let lo = match at {
+            Anchor::TopLeft => vec2(10.0, 10.0),
+            Anchor::Center => 0.5 * (self.screen - vec2(width, height)),
+            Anchor::Bottom => vec2(0.5 * (self.screen.x - width), self.screen.y - height - 10.0),
+        }
+        self.rect(lo, vec2(width, height), PANEL)
+        self.text(title, lo + vec2(PAD, PAD), TEXT)
+        self.cursor = lo + vec2(PAD, PAD + ROW)
+        self.width = width
+        self.panel += 1
+    }
+
+    pub fn end_panel(mut self) {
+        self.panel -= 1
+    }
+
+    pub fn label(mut self, text: str) {
+        let id = id_of(text, self.ids)
+        let (lo, hi) = self.place(id, CHAR.y + 2.0)
+        self.note(text, lo, hi)
+        self.text(text, lo, TEXT)
+    }
+
+    /// True on the frame it's clicked: released over it after going down over it.
+    pub fn button(mut self, text: str) -> bool {
+        let id = id_of(text, self.ids)
+        let (lo, hi) = self.place(id, ROW)
+        self.note(text, lo, hi)
+        let over = self.inside(lo, hi)
+        if over && self.pointer.pressed {
+            self.active = id
+        }
+        self.rect(lo, hi - lo, if over { HOT } else { BUTTON })
+        self.text(text, lo + vec2(4.0, 4.0), TEXT)
+        over && self.pointer.released && self.active == id
+    }
+
+    /// A value between `lo` and `hi`, set where the pointer drags it. True if it changed.
+    pub fn slider(mut self, text: str, value: mut f32, lo: f32, hi: f32) -> bool {
+        let id = id_of(text, self.ids)
+        let (a, b) = self.place(id, ROW)
+        self.note(text, a, b)
+        if self.inside(a, b) && self.pointer.pressed {
+            self.active = id
+        }
+        var changed = false
+        if self.active == id && self.pointer.down {
+            let t = clamp((self.pointer.pos.x - a.x) / (b.x - a.x), 0.0, 1.0)
+            let v = mix(lo, hi, t)
+            changed = v != value
+            value = v
+        }
+        let t = clamp((value - lo) / (hi - lo), 0.0, 1.0)
+        self.rect(a, b - a, BUTTON)
+        self.rect(a, vec2((b.x - a.x) * t, b.y - a.y), HOT)
+        self.text(text, a + vec2(4.0, 4.0), TEXT)
+        changed
+    }
+
+    /// Toggles `value` on a click. True if it changed.
+    pub fn checkbox(mut self, text: str, value: mut bool) -> bool {
+        let id = id_of(text, self.ids)
+        let (lo, hi) = self.place(id, ROW)
+        self.note(text, lo, hi)
+        let over = self.inside(lo, hi)
+        if over && self.pointer.pressed {
+            self.active = id
+        }
+        let clicked = over && self.pointer.released && self.active == id
+        if clicked {
+            value = !value
+        }
+        self.rect(lo, vec2(ROW, ROW), if value { HOT } else { BUTTON })
+        self.text(text, lo + vec2(ROW + 6.0, 4.0), TEXT)
+        clicked
+    }
+
+    /// A bar `fill` (0 to 1) full.
+    pub fn bar(mut self, fill: f32, color: vec4) {
+        let (lo, hi) = self.place(0, 10.0)
+        self.rect(lo, hi - lo, vec4(0.0, 0.0, 0.0, 0.6))
+        self.rect(lo, vec2((hi.x - lo.x) * clamp(fill, 0.0, 1.0), hi.y - lo.y), color)
+    }
+
+    /// Whether the pointer is on the last widget.
+    pub fn hovered(self) -> bool {
+        self.inside(self.last_lo, self.last_hi)
+    }
+
+    pub fn tooltip(mut self, text: str) {
+        let at = self.pointer.pos + vec2(12.0, 12.0)
+        self.rect(at, vec2(f32(text.len()) * CHAR.x + 8.0, ROW), PANEL)
+        self.text(text, at + vec2(4.0, 4.0), TEXT)
+    }
+
+    /// Dragging starts at the last widget when the pointer goes down on it.
+    pub fn drag_source(mut self, payload: u32) {
+        if self.hovered() && self.pointer.pressed {
+            self.drag = payload + 1
+        }
+    }
+
+    /// A payload dropped on the last widget this frame.
+    pub fn dropped(mut self) -> Option<u32> {
+        let p = self.dropped_at
+        let on = p.x >= self.last_lo.x &&
+            p.y >= self.last_lo.y &&
+            p.x < self.last_hi.x &&
+            p.y < self.last_hi.y
+        if self.dropped != 0 && on {
+            let payload = self.dropped - 1
+            self.dropped = 0
+            Some(payload)
+        } else {
+            None
+        }
+    }
+
+    /// Tells apart widgets with the same text, until `pop_id`.
+    pub fn push_id(mut self, id: u32) {
+        self.ids.push(id)
+    }
+
+    pub fn pop_id(mut self) {
+        let _ = self.ids.pop()
+    }
+}
+
+// ---- drawing the list ----------------------------------------------------------------------------
+
+pub struct UiVertex: Copy {
+    pub clip: ClipPosition,
+    pub color: Flat<vec4>,
+}
+
+@vertex
+fn ui_rect(v: VertexIndex, i: InstanceIndex, rects: [Rect], screen: vec2) -> UiVertex {
+    let r = rects[i.index]
+    let corners = [
+        vec2(0.0, 0.0),
+        vec2(1.0, 0.0),
+        vec2(0.0, 1.0),
+        vec2(0.0, 1.0),
+        vec2(1.0, 0.0),
+        vec2(1.0, 1.0),
+    ]
+    let p = r.pos + corners[v.index] * r.size
+    let ndc = vec2(2.0 * p.x / screen.x - 1.0, 1.0 - 2.0 * p.y / screen.y)
+    UiVertex {
+        clip: ClipPosition { position: vec4(ndc, 0.0, 1.0) },
+        color: Flat { value: r.color },
+    }
+}
+
+@fragment
+fn ui_color(v: UiVertex) -> vec4 {
+    v.color.value
+}
+
+/// Draws a frame's list to the screen, cleared to `clear`, in order (later rectangles on top;
+/// no blending, so a translucent colour is drawn opaque). The list is uploaded before the pass
+/// begins: a pass holds only draws.
+pub fn render(ui: Ui, clear: vec4) {
+    let n = max(ui.draws.len(), 1)
+    var rects: GpuBuffer<Rect> = buffer(n)
+    write(mut rects, 0, ui.draws)
+    begin_screen_pass(clear: clear)
+    if ui.draws.len() > 0 {
+        draw(
+            ui_rect.bind(rects: rects, screen: ui.screen),
+            ui_color,
+            vertices: 6,
+            instances: ui.draws.len(),
+        )
+    }
+    present()
+}

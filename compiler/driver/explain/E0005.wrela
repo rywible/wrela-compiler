@@ -1,0 +1,10 @@
+// A string literal that isn't well formed: it isn't closed on its line, it has an escape that
+// wrela doesn't know, or an f-string's `{...}` hole isn't closed.
+// ---- wrong
+const GREETING: Text = "hello
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+const GREETING: Text = "hello"
+
+pub fn frame(time: f32, width: u32, height: u32) {}

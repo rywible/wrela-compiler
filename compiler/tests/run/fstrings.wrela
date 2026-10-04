@@ -1,0 +1,36 @@
+// run: `f"…"` builds a `String` through std's `Format`
+// expect: plain() = true
+// expect: numbers() = true
+// expect: floats() = true
+// expect: padded() = true
+// expect: nested() = true
+
+pub fn plain() -> bool {
+    let name = "Tess"
+    let s = f"Hello, {name}! {{braces}}"
+    s == "Hello, Tess! {braces}"
+}
+
+pub fn numbers() -> bool {
+    let n = 42
+    let m: i64 = -9223372036854775808
+    let s = f"{n} {-7} {255:x} {m} {true}"
+    s == "42 -7 ff -9223372036854775808 true"
+}
+
+pub fn floats() -> bool {
+    let w = 2.25
+    let a = f"{w:.1} {0.1} {1.0} {100.0} {1.5e-7} {w:.3}"
+    a == "2.2 0.1 1 100 0.00000015 2.250"
+}
+
+pub fn padded() -> bool {
+    let s = f"[{7:>4}][{7:<4}][{7:^5}][{-7:05}][{"ab":>4}]"
+    s == "[   7][7   ][  7  ][-0007][  ab]"
+}
+
+pub fn nested() -> bool {
+    let v = vec3(1.0, 2.5, -0.5)
+    let s = f"at {v:.1}"
+    s == "at (1.0, 2.5, -0.5)"
+}

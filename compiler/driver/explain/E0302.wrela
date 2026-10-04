@@ -1,0 +1,21 @@
+// A named argument whose name isn't one of the function's parameters.
+// ---- wrong
+fn area(width: f32, height: f32) -> f32 {
+    width * height
+}
+
+fn wall() -> f32 {
+    area(3.0, depth: 2.0)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+fn area(width: f32, height: f32) -> f32 {
+    width * height
+}
+
+fn wall() -> f32 {
+    area(3.0, height: 2.0)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

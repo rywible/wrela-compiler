@@ -1,0 +1,18 @@
+// rejects: mem.match-mut
+fn make() -> Option<u32> {
+    Some(1)
+}
+
+fn f() -> u32 {
+    match mut make() { //~ E0512
+        Some(v) => v,
+        None => 0,
+    }
+}
+
+fn g(x: Option<u32>) {
+    match mut x { //~ E0512
+        Some(v) => v += 1,
+        None => {}
+    }
+}

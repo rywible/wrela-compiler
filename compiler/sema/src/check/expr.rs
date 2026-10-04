@@ -7,6 +7,7 @@ use crate::thir::*;
 use crate::ty::*;
 use wrela_diag::{Diagnostic, Span, codes};
 use wrela_syntax::ast::{self, BinOp, UnOp};
+use wrela_syntax::lexer::parse_spec;
 
 /// What a path in an expression names.
 pub(crate) enum ValueRes {
@@ -16,6 +17,8 @@ pub(crate) enum ValueRes {
     TypeRelative(TyId, ast::Ident),
     /// `Trait::method`.
     TraitRelative(TraitId, ast::Ident),
+    /// A `const N: u32` generic parameter's value.
+    ConstParam(ParamId),
 }
 
 impl<'p> Checker<'p> {
@@ -109,7 +112,7 @@ impl<'p> Checker<'p> {
             }
             ast::ExprKind::Array(items) => {
                 let elem_exp = match expected.map(|t| self.kind(t)) {
-                    Some(TyKind::Array(t, _)) | Some(TyKind::Slice(t)) => Some(*t),
+                    Some(TyKind::Array(t, _) | TyKind::ArrayN(t, _) | TyKind::Slice(t)) => Some(*t),
                     _ => None,
                 };
                 let elem = elem_exp.unwrap_or_else(|| self.new_var(VarKind::General, span));
@@ -129,11 +132,20 @@ impl<'p> Checker<'p> {
             }
             ast::ExprKind::ArrayRepeat { value, count } => {
                 let elem_exp = match expected.map(|t| self.kind(t)) {
-                    Some(TyKind::Array(t, _)) => Some(*t),
+                    Some(TyKind::Array(t, _) | TyKind::ArrayN(t, _)) => Some(*t),
                     _ => None,
                 };
                 let v = self.check_expr(value, elem_exp);
-                let n = match self.const_u32(count) {
+                // `[x; N]` with `const N: u32`: its length is known once it's instantiated.
+                let param_len = match &count.kind {
+                    ast::ExprKind::Path(p) if p.is_single() => self
+                        .scope
+                        .param(&p.segments[0].ident.name)
+                        .filter(|&g| self.p.param(g).is_const),
+                    _ => None,
+                };
+                let n = if param_len.is_some() { Some(0) } else { self.const_u32(count) };
+                let n = match n {
                     Some(n) => n,
                     None => {
                         let local = match &count.kind {
@@ -166,19 +178,50 @@ impl<'p> Checker<'p> {
                         format!("`[x; n]` copies `x`, so it must be `Copy`, and `{shown}` isn't"),
                     ));
                 }
-                let ty = self.p.types.array(v.ty, n);
+                let ty = match param_len {
+                    Some(g) => self.p.types.intern(TyKind::ArrayN(v.ty, self.p.types.param(g))),
+                    None => self.p.types.array(v.ty, n),
+                };
                 Expr { ty, span, kind: ExprKind::ArrayRepeat(Box::new(v), n) }
             }
             ast::ExprKind::Block(b) => {
                 let blk = self.check_block(b, expected);
                 Expr { ty: blk.ty, span, kind: ExprKind::Block(blk) }
             }
-            ast::ExprKind::If { cond, then, else_ } => {
+            ast::ExprKind::If { pat: None, cond, then, else_ } => {
                 self.check_if(cond, then, else_.as_deref(), expected, span)
             }
-            ast::ExprKind::Match { scrutinee, arms } => {
-                self.check_match(scrutinee, arms, expected, span)
+            ast::ExprKind::If { pat: Some(pat), cond, then, else_ } => {
+                self.check_if_let(pat, cond, then, else_.as_deref(), expected, span)
             }
+            ast::ExprKind::Match { mutable, scrutinee, arms } => {
+                self.check_match(scrutinee, arms, *mutable, expected, span)
+            }
+            ast::ExprKind::Try(inner) => self.check_try(inner, span),
+            ast::ExprKind::Assign { target, op, value } => {
+                let st = self.check_assign(target, *op, value, span);
+                let unit = self.p.types.unit;
+                let block = Block { stmts: vec![st], tail: None, ty: unit, span };
+                Expr { ty: unit, span, kind: ExprKind::Block(block) }
+            }
+            ast::ExprKind::Unsafe(b) => {
+                if !self.p.package_of(self.scope.module).unsafe_ok {
+                    self.err(
+                        Diagnostic::new(
+                            codes::E0214,
+                            span.shrink_to_start().to(b.span.shrink_to_start()),
+                            "`unsafe` is only for packages that declare it",
+                        )
+                        .with_note("`unsafe` exists for the stdlib's core: the checker can't verify what's inside (§6.14)")
+                        .with_help("declare `unsafe = true` in the package's `wrela.toml`, if it must"),
+                    );
+                }
+                self.unsafe_depth += 1;
+                let blk = self.check_block(b, expected);
+                self.unsafe_depth -= 1;
+                Expr { ty: blk.ty, span, kind: ExprKind::Block(blk) }
+            }
+            ast::ExprKind::FString(parts) => self.check_fstring(parts, span),
             ast::ExprKind::Closure { params, ret, body } => {
                 self.check_closure(params, ret.as_ref(), body, expected, span)
             }
@@ -264,24 +307,60 @@ impl<'p> Checker<'p> {
                 Expr { ty, span, kind: ExprKind::Lit(Lit::Float(v, f)) }
             }
             ast::LitKind::Str => {
-                self.err(Diagnostic::new(codes::E0901, span, "strings are tier 1"));
-                self.error_expr(span)
+                let text = wrela_syntax::lexer::string_value(&lit.text);
+                self.text_expr(text, span)
             }
-            ast::LitKind::Suffixed => {
-                // The number as written, exponent and radix included (`1e-3m` is `1e-3`).
-                let (digits, _) = wrela_syntax::lexer::split_suffix(&lit.text);
-                self.err(
-                    Diagnostic::new(
-                        codes::E0900,
-                        span,
-                        format!("`{}` has a unit, and units are tier 1", lit.text),
-                    )
-                    .with_help("in tier 0, write the number in the unit your code works in")
-                    .with_fix("drop the unit", span, digits),
-                );
-                self.error_expr(span)
-            }
+            ast::LitKind::Suffixed => self.check_suffixed(lit, expected),
         }
+    }
+
+    /// A string literal's value: a `Text`.
+    pub(crate) fn text_expr(&mut self, text: String, span: Span) -> Expr {
+        match self.p.lang_adt(Lang::Text) {
+            Some(a) => Expr {
+                ty: self.p.types.intern(TyKind::Adt(a, Vec::new())),
+                span,
+                kind: ExprKind::Text(text.into()),
+            },
+            None => self.error_expr(span),
+        }
+    }
+
+    /// `15cm`: the number times its unit's constant, `std::units::cm`, folded now (§5). The
+    /// product is worked out in `f64` and rounded once to an `f32`.
+    fn check_suffixed(&mut self, lit: &ast::Lit, expected: Option<TyId>) -> Expr {
+        let span = lit.span;
+        let (digits, suffix) = wrela_syntax::lexer::split_suffix(&lit.text);
+        let Some(&c) = self.p.units.get(suffix) else {
+            let mut d = Diagnostic::new(codes::E0216, span, format!("`{suffix}` isn't a unit"))
+                .with_note("units are the constants in `std::units`, in SI: `m`, `cm`, `kg`, `s`, `deg`, ...");
+            let names = self.p.units.keys().map(String::as_str);
+            if let Some(s) = resolve::closest(suffix, names) {
+                let at = Span::new(span.file, span.start + digits.len() as u32, span.end);
+                d = d.with_fix(format!("did you mean `{s}`?"), at, s);
+            }
+            self.err(d);
+            return self.error_expr(span);
+        };
+        let number = match wrela_syntax::lexer::int_value(digits) {
+            ast::IntValue::Ok(v) => v as f64,
+            _ => wrela_syntax::lexer::float_value(digits),
+        };
+        let unit = match &self.p.const_(c).value.kind {
+            ast::ExprKind::Lit(ast::Lit { kind: ast::LitKind::Float(v), .. }) => *v,
+            ast::ExprKind::Lit(ast::Lit {
+                kind: ast::LitKind::Int(ast::IntValue::Ok(v)), ..
+            }) => *v as f64,
+            _ => 1.0,
+        };
+        let v = number * unit;
+        let ty = match expected {
+            Some(t) if matches!(self.kind(t), TyKind::Float(_)) => self.shallow(t),
+            _ => self.new_var(VarKind::Float, span),
+        };
+        let f = v as f32;
+        self.float_literals.push((ty, v, f, span));
+        Expr { ty, span, kind: ExprKind::Lit(Lit::Float(v, f)) }
     }
 
     // ---- paths -----------------------------------------------------------------------------
@@ -306,6 +385,11 @@ impl<'p> Checker<'p> {
             if let Some(r) = resolve::lookup_name(self.p, self.scope.module, &first.name) {
                 return Some(ValueRes::Item(r));
             }
+            if let Some(g) = self.scope.param(&first.name)
+                && self.p.param(g).is_const
+            {
+                return Some(ValueRes::ConstParam(g));
+            }
             if self.scope.param(&first.name).is_some() {
                 self.err(Diagnostic::new(
                     codes::E0212,
@@ -327,6 +411,7 @@ impl<'p> Checker<'p> {
             if let Some(s) = resolve::closest(&first.name, names.iter().map(String::as_str)) {
                 d = d.with_fix(format!("did you mean `{s}`?"), first.span, s);
             }
+            let d = resolve::with_std_import(self.p, d, &first.name, first.span);
             self.err(d);
             return None;
         }
@@ -400,6 +485,9 @@ impl<'p> Checker<'p> {
         match r {
             ValueRes::Local(l) => {
                 Expr { ty: self.locals[l.index()].ty, span, kind: ExprKind::Local(l) }
+            }
+            ValueRes::ConstParam(g) => {
+                Expr { ty: self.p.types.u32, span, kind: ExprKind::ConstParam(g) }
             }
             ValueRes::Item(Res::Const(c)) => {
                 Expr { ty: self.const_ty(c), span, kind: ExprKind::Const(c) }
@@ -493,6 +581,15 @@ impl<'p> Checker<'p> {
                 ));
                 self.error_expr(span)
             }
+            ValueRes::Item(Res::TraitSet(s)) => {
+                let name = &self.p.trait_sets[s.index()].name;
+                self.err(Diagnostic::new(
+                    codes::E0212,
+                    span,
+                    format!("`{name}` is a trait set, not a value"),
+                ));
+                self.error_expr(span)
+            }
             ValueRes::Item(Res::Module(m)) => {
                 let name = self.p.module(m).name();
                 self.err(Diagnostic::new(
@@ -502,7 +599,7 @@ impl<'p> Checker<'p> {
                 ));
                 self.error_expr(span)
             }
-            ValueRes::Item(Res::BuiltinTy(_)) => {
+            ValueRes::Item(Res::BuiltinTy(_) | Res::Alias(_)) => {
                 let name = path.last().name.clone();
                 self.err(
                     Diagnostic::new(codes::E0212, span, format!("`{name}` is a type, not a value"))
@@ -567,7 +664,7 @@ impl<'p> Checker<'p> {
     }
 
     /// Whether a type has an inherent associated function or method of this name.
-    fn has_associated_fn(&self, a: AdtId, name: &str) -> bool {
+    pub(crate) fn has_associated_fn(&self, a: AdtId, name: &str) -> bool {
         self.p.inherent_impls.get(&a).is_some_and(|impls| {
             impls
                 .iter()
@@ -721,6 +818,7 @@ impl<'p> Checker<'p> {
         expected: Option<TyId>,
         span: Span,
     ) -> Expr {
+        self.check_units(op, a, b);
         let (ea, eb) = match op {
             BinOp::And | BinOp::Or => {
                 let t = self.p.types.bool;
@@ -741,12 +839,155 @@ impl<'p> Checker<'p> {
                 let x = self.check_expr(a, hint);
                 // A literal on the right takes the left's type: `x * 2` with x: f32.
                 let y = self.check_expr(b, Some(x.ty));
-                (x, y)
+                if op.is_comparison() {
+                    match self.trait_comparison(op, x, y, span) {
+                        Ok(e) => return e,
+                        Err(xy) => *xy,
+                    }
+                } else {
+                    (x, y)
+                }
             }
         };
+        // `"a" + b`: text is joined with an f-string.
+        if op == BinOp::Add
+            && self.is_stringy(self.shallow(ea.ty))
+            && self.is_stringy(self.shallow(eb.ty))
+        {
+            let mut d = Diagnostic::new(codes::E0305, span, "`+` doesn't join text in wrela")
+                .with_note(
+                    "text is joined by an f-string, which formats each part into one `String` (§4)",
+                );
+            match (f_part(a), f_part(b)) {
+                (Some(x), Some(y)) => {
+                    d = d.with_fix("write an f-string", span, format!("f\"{x}{y}\""));
+                }
+                _ => d = d.with_help("write an f-string: `f\"{a}{b}\"`"),
+            }
+            self.err(d);
+            return self.error_expr(span);
+        }
         // Literals on the left take the right's type: `2 * x`.
         let ty = self.binary_result(op, ea.ty, eb.ty, span).unwrap_or(self.p.types.error);
         Expr { ty, span, kind: ExprKind::Binary(op, Box::new(ea), Box::new(eb)) }
+    }
+
+    /// A comparison that goes through `Eq` or `Ord` (§3): of strings (as `str`), or of values
+    /// whose types declare the trait. `==` calls `a.eq(b)`, and `a < b` is
+    /// `a.cmp(b) == Ordering::Less`. Numbers, `bool`, vectors and enums whose variants hold
+    /// nothing compare without a trait (the operands are handed back).
+    fn trait_comparison(
+        &mut self,
+        op: BinOp,
+        a: Expr,
+        b: Expr,
+        span: Span,
+    ) -> Result<Expr, Box<(Expr, Expr)>> {
+        let (ta, tb) = (self.shallow(a.ty), self.shallow(b.ty));
+        let ordered = matches!(op, BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge);
+        let lang = if ordered { Lang::Ord } else { Lang::Eq };
+        let Some(tr) = self.p.lang_trait(lang) else { return Err(Box::new((a, b))) };
+        let self_ty = if self.is_stringy(ta) && self.is_stringy(tb) {
+            self.p.types.intern(TyKind::Str)
+        } else {
+            let builtin = match self.kind(ta) {
+                TyKind::Adt(adt, _) => {
+                    let def = self.p.adt(*adt);
+                    !ordered && def.is_enum() && def.variants().iter().all(|v| v.fields.is_empty())
+                }
+                TyKind::Param(_) | TyKind::Tuple(_) | TyKind::Array(..) | TyKind::ArrayN(..) => {
+                    false
+                }
+                _ => true,
+            };
+            if builtin || self.infer.unify(&self.p.types, ta, tb).is_err() {
+                return Err(Box::new((a, b)));
+            }
+            let r = TraitRef { trait_: tr, args: Vec::new() };
+            let name = self.p.trait_(tr).name.clone();
+            let shown = self.display(ta);
+            if !self.p.types.has_vars(ta) && !crate::traits::implements(self.p, ta, &r) {
+                let what = if ordered { "ordered" } else { "compared with `==`" };
+                let mut d = Diagnostic::new(
+                    codes::E0305,
+                    span,
+                    format!("`{shown}` can't be {what}: it doesn't declare `{name}`"),
+                );
+                if let TyKind::Adt(adt, _) = self.kind(ta) {
+                    let def = self.p.adt(*adt);
+                    d = d.with_help(format!(
+                        "declare it where `{}` is declared: `{} {}: {name} {{ ... }}`",
+                        def.name,
+                        if def.is_enum() { "enum" } else { "struct" },
+                        def.name
+                    ));
+                }
+                self.err(d);
+                return Ok(self.error_expr(span));
+            }
+            self.obligation(ta, r, span, format!("`{}`", op.text()));
+            ta
+        };
+        let method_name = if ordered { "cmp" } else { "eq" };
+        let Some(method) = crate::traits::trait_method(self.p, tr, method_name) else {
+            return Err(Box::new((a, b)));
+        };
+        let bool_ty = self.p.types.bool;
+        let ret = if ordered {
+            match self.p.lang_adt(Lang::Ordering) {
+                Some(o) => self.p.types.intern(TyKind::Adt(o, Vec::new())),
+                None => return Err(Box::new((a, b))),
+            }
+        } else {
+            bool_ty
+        };
+        let call = Expr {
+            ty: ret,
+            span,
+            kind: ExprKind::Call(Call {
+                callee: Callee::TraitMethod {
+                    method,
+                    self_ty,
+                    trait_args: Vec::new(),
+                    method_args: Vec::new(),
+                },
+                args: vec![a, b],
+                modes: vec![Mode::Borrow, Mode::Borrow],
+                order: vec![0, 1],
+                receiver: true,
+                ret_mode: RetMode::Owned,
+            }),
+        };
+        if !ordered {
+            return Ok(if op == BinOp::Eq {
+                call
+            } else {
+                Expr { ty: bool_ty, span, kind: ExprKind::Unary(UnOp::Not, Box::new(call)) }
+            });
+        }
+        // `<` is `== Less`, `<=` is `!= Greater`, `>` is `== Greater`, `>=` is `!= Less`.
+        let (variant, test) = match op {
+            BinOp::Lt => (0, BinOp::Eq),
+            BinOp::Le => (2, BinOp::Ne),
+            BinOp::Gt => (2, BinOp::Eq),
+            _ => (0, BinOp::Ne),
+        };
+        let TyKind::Adt(ordering, _) = *self.kind(ret) else {
+            return Err(Box::new((call, self.error_expr(span))));
+        };
+        let k = Expr {
+            ty: ret,
+            span,
+            kind: ExprKind::Adt {
+                adt: ordering,
+                args: Vec::new(),
+                variant: Some(variant),
+                fields: Vec::new(),
+                order: Vec::new(),
+                base: None,
+            },
+        };
+        Ok(Expr { ty: bool_ty, span, kind: ExprKind::Binary(test, Box::new(call), Box::new(k)) })
     }
 
     /// The type the right operand of `op` is checked against, when the left is an `a`: a shift
@@ -1006,7 +1247,7 @@ impl<'p> Checker<'p> {
                     Some(i) => {
                         let f = &fields[i];
                         let adt_mod = self.p.adt(a).module;
-                        if !f.public && adt_mod != self.scope.module {
+                        if self.field_hidden(adt_mod, f) {
                             self.err(
                                 Diagnostic::new(
                                     codes::E0210,
@@ -1158,6 +1399,30 @@ impl<'p> Checker<'p> {
             let elem = args[0];
             return Expr { ty: elem, span, kind: ExprKind::Index(Box::new(b), Box::new(i)) };
         }
+        // `arena[h]`: the value a `Handle<T>` names (§6.8).
+        if let TyKind::Adt(a, args) = &k
+            && self.p.is_lang_adt(*a, Lang::Arena)
+        {
+            let elem = args[0];
+            let handle = self.p.lang_adt(Lang::Handle).map(|h| self.p.types.adt(h, vec![elem]));
+            let i = self.check_expr(index, handle);
+            if let Some(h) = handle
+                && !self.try_unify(i.ty, h)
+                && !matches!(self.kind(i.ty), TyKind::Error)
+            {
+                let shown = self.display(i.ty);
+                let want = self.display(h);
+                self.err(
+                    Diagnostic::new(
+                        codes::E0312,
+                        i.span,
+                        format!("an arena is indexed by a `{want}`, not `{shown}`"),
+                    )
+                    .with_note("an arena's values are named by their handles (§6.8)"),
+                );
+            }
+            return Expr { ty: elem, span, kind: ExprKind::Index(Box::new(b), Box::new(i)) };
+        }
         let i = self.check_expr(index, None);
         // An integer literal is a `u32` index. A value whose literal type isn't settled yet
         // (`let i = 1`) can be either index type: it's checked once it's settled.
@@ -1200,10 +1465,11 @@ impl<'p> Checker<'p> {
             ));
         }
         let elem = match k {
-            TyKind::Array(t, _) | TyKind::Slice(t) => *t,
+            TyKind::Array(t, _) | TyKind::ArrayN(t, _) | TyKind::Slice(t) => *t,
             TyKind::Vec(_) => self.p.types.f32,
             TyKind::Mat(n) => self.p.types.vec(*n),
             TyKind::Error => self.p.types.error,
+            _ if let Some(t) = self.vec_elem(b.ty) => t,
             _ => {
                 let shown = self.display(b.ty);
                 self.err(Diagnostic::new(
@@ -1218,6 +1484,66 @@ impl<'p> Checker<'p> {
     }
 
     // ---- struct literals -------------------------------------------------------------------
+
+    /// A borrow struct's field `d` given `value` (§6.6): a projection field takes a place, and
+    /// a `mut` one is marked `mut place`, as at a call site.
+    fn borrow_field(&mut self, d: &FieldDef, value: &Expr) {
+        let marked = matches!(value.kind, ExprKind::MutArg(_));
+        match d.mode {
+            RetMode::Mut if !marked && !matches!(value.kind, ExprKind::Error) => {
+                self.err(
+                    Diagnostic::new(
+                        codes::E0503,
+                        value.span,
+                        format!("`{}` is a `mut` projection, so it's given as `mut place`", d.name),
+                    )
+                    .with_fix(
+                        "add `mut`",
+                        value.span.shrink_to_start(),
+                        "mut ",
+                    ),
+                );
+            }
+            RetMode::Borrow | RetMode::Owned if marked => {
+                let ExprKind::MutArg(inner) = &value.kind else { return };
+                self.err(
+                    Diagnostic::new(
+                        codes::E0504,
+                        value.span,
+                        format!(
+                            "`{}` isn't a `mut` projection, so it can't take `mut ...`",
+                            d.name
+                        ),
+                    )
+                    .with_fix(
+                        "remove `mut`",
+                        Span::new(value.span.file, value.span.start, inner.span.start),
+                        "",
+                    ),
+                );
+            }
+            _ => {}
+        }
+        if d.mode != RetMode::Owned {
+            let inner = match &value.kind {
+                ExprKind::MutArg(x) => x.as_ref(),
+                _ => value,
+            };
+            if !inner.is_place() && !matches!(inner.kind, ExprKind::Error) {
+                self.err(
+                    Diagnostic::new(
+                        codes::E0508,
+                        value.span,
+                        format!(
+                            "`{}` is a projection, so it's given a place, and this is a temporary",
+                            d.name
+                        ),
+                    )
+                    .with_help("bind the value to a name first, and give the name"),
+                );
+            }
+        }
+    }
 
     fn check_struct_lit(
         &mut self,
@@ -1279,11 +1605,12 @@ impl<'p> Checker<'p> {
             self.adt_args(adt, path, expected, span)
         };
         let ty = self.p.types.adt(adt, args.clone());
-        if self.p.is_lang_adt(adt, Lang::GlobalId) {
+        if self.p.is_lang_adt(adt, Lang::GlobalId) || self.p.is_lang_adt(adt, Lang::LocalId) {
+            let name = &self.p.adt(adt).name;
             self.err(
-                Diagnostic::new(codes::E0601, path.span, "a `GlobalId` can't be built")
-                    .with_note("each invocation gets its own from the GPU, and a `Slots` is indexed by it, so each invocation writes only its own slot (§6.13)")
-                    .with_help("take it as a kernel parameter: `id: GlobalId`"),
+                Diagnostic::new(codes::E0601, path.span, format!("a `{name}` can't be built"))
+                    .with_note("each invocation gets its own from the GPU, and `Slots` and workgroup memory's chunks are indexed by it, so each invocation writes only its own (§6.13)")
+                    .with_help(format!("take it as a kernel parameter: `id: {name}`")),
             );
         }
         let decls = self.p.adt_fields(adt, variant);
@@ -1320,7 +1647,7 @@ impl<'p> Checker<'p> {
                 self.err(d);
                 continue;
             };
-            if !decls[i].public && adt_mod != self.scope.module && variant.is_none() {
+            if self.field_hidden(adt_mod, &decls[i]) && variant.is_none() {
                 self.err(
                     Diagnostic::new(
                         codes::E0210,
@@ -1354,7 +1681,13 @@ impl<'p> Checker<'p> {
                     self.check_path_expr(&p, Some(fty), f.name.span)
                 }
             };
-            self.expect(value.ty, fty, value.span);
+            if self.p.adt(adt).borrow {
+                self.borrow_field(&decls[i], &value);
+            }
+            // A run field takes what passes as a run: an array, a `Vec`, a string.
+            if !self.run_coerces(value.ty, fty) {
+                self.expect(value.ty, fty, value.span);
+            }
             given[i] = Some(value);
             order.push(i as u32);
         }
@@ -1368,7 +1701,7 @@ impl<'p> Checker<'p> {
                         let fty = field_tys[i];
                         out.push(Expr { ty: fty, span: b.span, kind: ExprKind::FromBase });
                     } else if let Some(d) = &decls[i].default {
-                        out.push(self.check_default(d, field_tys[i], adt_mod));
+                        out.push(self.check_default(d, field_tys[i], adt_mod, true));
                         order.push(i as u32);
                     } else {
                         missing.push((decls[i].name.clone(), field_tys[i]));
@@ -1422,12 +1755,27 @@ impl<'p> Checker<'p> {
 
     /// A parameter's or field's default where a call or literal leaves it out. It's checked
     /// as where it's declared, in `module`: its names are that module's, never the caller's.
-    pub(crate) fn check_default(&mut self, d: &ast::Expr, ty: TyId, module: ModuleId) -> Expr {
+    /// A constant is a place nothing moves out of (§10), so where the value is `owned` (a
+    /// field, a `take` parameter) a constant that isn't `Copy` is cloned.
+    pub(crate) fn check_default(
+        &mut self,
+        d: &ast::Expr,
+        ty: TyId,
+        module: ModuleId,
+        owned: bool,
+    ) -> Expr {
         let scope = std::mem::replace(&mut self.scope, resolve::Scope::new(module));
         let env = std::mem::take(&mut self.env);
         let e = self.check_expect(d, ty);
         self.env = env;
         self.scope = scope;
+        if owned
+            && matches!(e.kind, ExprKind::Const(_))
+            && !crate::traits::implements_builtin(self.p, ty, Lang::Copy)
+        {
+            let span = e.span;
+            return self.clone_of(e, ty, span);
+        }
         e
     }
 
@@ -1452,60 +1800,400 @@ impl<'p> Checker<'p> {
         let c = self.check_expr(cond, Some(bool_ty));
         self.expect_cond(&c);
         let t = self.check_block(then, expected);
-        let (else_e, ty) = match else_ {
-            Some(e) => {
-                let ex = self.check_expr(e, expected.or(Some(t.ty)));
-                let ty = if matches!(self.kind(t.ty), TyKind::Never) {
-                    ex.ty
-                } else {
-                    if !matches!(self.kind(ex.ty), TyKind::Never)
-                        && self.infer.unify(&self.p.types, ex.ty, t.ty).is_err()
-                    {
-                        let (a, b) = (self.display(t.ty), self.display(ex.ty));
-                        // Point at the values, not the blocks around them.
-                        let at = match &ex.kind {
-                            ExprKind::Block(b) => b.tail.as_ref().map_or(ex.span, |t| t.span),
-                            _ => ex.span,
-                        };
-                        let then_at = t.tail.as_ref().map_or(t.span, |x| x.span);
-                        let d = Diagnostic::new(
-                            codes::E0300,
-                            at,
-                            format!(
-                                "the branches of this `if` have different types: `{a}` and `{b}`"
-                            ),
-                        )
-                        .with_secondary(then_at, format!("this is `{a}`"));
-                        self.err(self.branch_mismatch(d, t.ty, ex.ty));
-                    }
-                    t.ty
-                };
-                (Some(Box::new(ex)), ty)
+        let (else_e, ty) =
+            self.check_else(&t, else_, expected, span, "if", "the condition is false");
+        let else_ = else_e.map(Box::new);
+        Expr { ty, span, kind: ExprKind::If { cond: Box::new(c), then: t, else_ } }
+    }
+
+    /// The `else` of an `if` or an `if let` (`what`), after its branch `t`: the checked `else`,
+    /// and the type of the whole. With no `else`, the branch can't have a value: `when` says
+    /// when the missing `else` would run.
+    fn check_else(
+        &mut self,
+        t: &Block,
+        else_: Option<&ast::Expr>,
+        expected: Option<TyId>,
+        span: Span,
+        what: &str,
+        when: &str,
+    ) -> (Option<Expr>, TyId) {
+        let unit = self.p.types.unit;
+        let Some(e) = else_ else {
+            if let Some(tail) = &t.tail
+                && !matches!(self.kind(tail.ty), TyKind::Never | TyKind::Error | TyKind::Tuple(_))
+                && expected.is_some_and(|e| self.shallow(e) != unit)
+            {
+                let shown = self.display(tail.ty);
+                self.err(
+                    Diagnostic::new(codes::E0300, span, format!("this `{what}` has no `else`, so it has no value when {when}, but its branch is a `{shown}`"))
+                        .with_help("add an `else` branch"),
+                );
             }
-            None => {
-                let unit = self.p.types.unit;
-                if let Some(tail) = &t.tail
-                    && !matches!(
-                        self.kind(tail.ty),
-                        TyKind::Never | TyKind::Error | TyKind::Tuple(_)
-                    )
-                    && expected.is_some_and(|e| self.shallow(e) != unit)
-                {
-                    let shown = self.display(tail.ty);
-                    self.err(
-                        Diagnostic::new(codes::E0300, span, format!("this `if` has no `else`, so it has no value when the condition is false, but its branch is a `{shown}`"))
-                            .with_help("add an `else` branch"),
-                    );
-                }
-                (None, unit)
+            return (None, unit);
+        };
+        let ex = self.check_expr(e, expected.or(Some(t.ty)));
+        if matches!(self.kind(t.ty), TyKind::Never) {
+            let ty = ex.ty;
+            return (Some(ex), ty);
+        }
+        if !matches!(self.kind(ex.ty), TyKind::Never)
+            && self.infer.unify(&self.p.types, ex.ty, t.ty).is_err()
+        {
+            let (a, b) = (self.display(t.ty), self.display(ex.ty));
+            // Point at the values, not the blocks around them.
+            let at = match &ex.kind {
+                ExprKind::Block(b) => b.tail.as_ref().map_or(ex.span, |t| t.span),
+                _ => ex.span,
+            };
+            let then_at = t.tail.as_ref().map_or(t.span, |x| x.span);
+            let d = Diagnostic::new(
+                codes::E0300,
+                at,
+                format!("the branches of this `{what}` have different types: `{a}` and `{b}`"),
+            )
+            .with_secondary(then_at, format!("this is `{a}`"));
+            self.err(self.branch_mismatch(d, t.ty, ex.ty));
+        }
+        (Some(ex), t.ty)
+    }
+
+    /// `f"..."`: a `String` built a part at a time: each text with `push_str`, and each
+    /// `{value:spec}` with std's `Format` (§4).
+    fn check_fstring(&mut self, parts: &[ast::FPart], span: Span) -> Expr {
+        let p = self.p;
+        let (Some(string), Some(format), Some(spec_adt)) =
+            (p.lang_adt(Lang::String), p.lang_trait(Lang::Format), p.lang_adt(Lang::FormatSpec))
+        else {
+            return self.error_expr(span);
+        };
+        let method =
+            |name: &str| {
+                p.inherent_impls.get(&string).into_iter().flatten().find_map(|&i| {
+                    p.impl_(i).methods.iter().copied().find(|&f| p.func(f).name == name)
+                })
+            };
+        let (Some(new_fn), Some(push_fn), Some(format_fn)) =
+            (method("new"), method("push_str"), crate::traits::trait_method(p, format, "format"))
+        else {
+            return self.error_expr(span);
+        };
+        let string_ty = p.types.adt(string, Vec::new());
+        let unit = p.types.unit;
+        let s = self.declare_unnamed(string_ty, LocalKind::Owned { mutable: true }, span);
+        self.locals[s.index()].name = "f-string".into();
+        let local = |ty| Expr { ty, span, kind: ExprKind::Local(s) };
+        let mut_s =
+            Expr { ty: string_ty, span, kind: ExprKind::MutArg(Box::new(local(string_ty))) };
+        let call = |callee, args: Vec<Expr>, modes: Vec<Mode>, receiver, ty| {
+            let n = args.len();
+            Expr {
+                ty,
+                span,
+                kind: ExprKind::Call(Call {
+                    callee,
+                    args,
+                    modes,
+                    order: (0..n).collect(),
+                    receiver,
+                    ret_mode: RetMode::Owned,
+                }),
             }
         };
-        Expr { ty, span, kind: ExprKind::If { cond: Box::new(c), then: t, else_: else_e } }
+        let init = call(
+            Callee::Fn { func: new_fn, args: Vec::new() },
+            Vec::new(),
+            Vec::new(),
+            false,
+            string_ty,
+        );
+        let mut stmts = vec![Stmt {
+            kind: StmtKind::Bind {
+                pat: Pat { ty: string_ty, kind: PatKind::Bind(s), span },
+                init,
+                else_: None,
+            },
+            span,
+        }];
+        for part in parts {
+            match part {
+                ast::FPart::Text(t) if t.is_empty() => {}
+                ast::FPart::Text(t) => {
+                    let text = self.text_expr(t.clone(), span);
+                    let e = call(
+                        Callee::Fn { func: push_fn, args: Vec::new() },
+                        vec![mut_s.clone(), text],
+                        vec![Mode::Mut, Mode::Borrow],
+                        true,
+                        unit,
+                    );
+                    stmts.push(Stmt { kind: StmtKind::Expr(e), span });
+                }
+                ast::FPart::Hole { expr, spec, span: hole } => {
+                    let x = self.check_expr(expr, None);
+                    let r = TraitRef { trait_: format, args: Vec::new() };
+                    let shown = self.display(x.ty);
+                    if !self.p.types.has_vars(self.infer.resolve(&self.p.types, x.ty))
+                        && !crate::traits::implements(
+                            self.p,
+                            self.infer.resolve(&self.p.types, x.ty),
+                            &r,
+                        )
+                        && !matches!(self.kind(x.ty), TyKind::Error)
+                    {
+                        self.err(
+                            Diagnostic::new(
+                                codes::E0400,
+                                x.span,
+                                format!("`{shown}` can't go in an f-string: it doesn't implement `Format`"),
+                            )
+                            .with_note("numbers, `bool`, vectors and text implement it (§4)"),
+                        );
+                        continue;
+                    }
+                    self.obligation(x.ty, r, x.span, "`{...}` in an f-string".into());
+                    let fields = match parse_spec(spec.as_deref().unwrap_or("")) {
+                        Ok(f) => f,
+                        Err(why) => {
+                            self.err(
+                                Diagnostic::new(codes::E0217, *hole, format!("this format spec isn't valid: {why}"))
+                                    .with_note("a spec is `[<^>][0][width][.precision][x]`, as in `{x:>8.2}` (§4)"),
+                            );
+                            continue;
+                        }
+                    };
+                    let spec_ty = p.types.adt(spec_adt, Vec::new());
+                    let u32_lit = |v: u32| Expr {
+                        ty: p.types.u32,
+                        span: *hole,
+                        kind: ExprKind::Lit(Lit::Int(i128::from(v))),
+                    };
+                    let bool_lit = |b: bool| Expr {
+                        ty: p.types.bool,
+                        span: *hole,
+                        kind: ExprKind::Lit(Lit::Bool(b)),
+                    };
+                    let spec_e = Expr {
+                        ty: spec_ty,
+                        span: *hole,
+                        kind: ExprKind::Adt {
+                            adt: spec_adt,
+                            args: Vec::new(),
+                            variant: None,
+                            fields: vec![
+                                u32_lit(fields.width),
+                                u32_lit(fields.precision.unwrap_or(0)),
+                                bool_lit(fields.precision.is_some()),
+                                u32_lit(fields.align),
+                                bool_lit(fields.zero),
+                                bool_lit(fields.hex),
+                            ],
+                            order: (0..6).collect(),
+                            base: None,
+                        },
+                    };
+                    let callee = Callee::TraitMethod {
+                        method: format_fn,
+                        self_ty: x.ty,
+                        trait_args: Vec::new(),
+                        method_args: Vec::new(),
+                    };
+                    let e = call(
+                        callee,
+                        vec![x, mut_s.clone(), spec_e],
+                        vec![Mode::Borrow, Mode::Mut, Mode::Borrow],
+                        true,
+                        unit,
+                    );
+                    stmts.push(Stmt { kind: StmtKind::Expr(e), span: *hole });
+                }
+            }
+        }
+        let tail = Expr { ty: string_ty, span, kind: ExprKind::Take(Box::new(local(string_ty))) };
+        Expr {
+            ty: string_ty,
+            span,
+            kind: ExprKind::Block(Block { stmts, tail: Some(Box::new(tail)), ty: string_ty, span }),
+        }
+    }
+
+    /// `if let pat = cond { then } else { else_ }`: a `match` with the pattern's arm and a
+    /// `_` arm.
+    fn check_if_let(
+        &mut self,
+        pat: &ast::Pat,
+        scrutinee: &ast::Expr,
+        then: &ast::Block,
+        else_: Option<&ast::Expr>,
+        expected: Option<TyId>,
+        span: Span,
+    ) -> Expr {
+        let s = self.check_expr(scrutinee, None);
+        let env_len = self.env.len();
+        let p = self.check_pat(pat, s.ty, s.is_place());
+        self.bound_once(&p);
+        let t = self.check_block(then, expected);
+        self.env.truncate(env_len);
+        let (else_e, ty) =
+            self.check_else(&t, else_, expected, span, "if let", "the pattern doesn't match");
+        let unit = self.p.types.unit;
+        let else_e = else_e.unwrap_or_else(|| {
+            let empty = Block { stmts: Vec::new(), tail: None, ty: unit, span };
+            Expr { ty: unit, span, kind: ExprKind::Block(empty) }
+        });
+        let then_e = Expr { ty: t.ty, span: t.span, kind: ExprKind::Block(t) };
+        let wild = Pat { ty: s.ty, kind: PatKind::Wild, span };
+        let arms = vec![
+            Arm { pat: p, guard: None, body: then_e, span: pat.span },
+            Arm { pat: wild, guard: None, body: else_e, span },
+        ];
+        Expr { ty, span, kind: ExprKind::Match { scrutinee: Box::new(s), arms, mutable: false } }
+    }
+
+    /// `x?` (§15): `x`'s value if it's `Some` or `Ok`; otherwise the function returns `None`, or
+    /// the `Err`. A `match` with two arms.
+    fn check_try(&mut self, inner: &ast::Expr, span: Span) -> Expr {
+        let x = self.check_expr(inner, None);
+        let (Some(option), Some(result)) =
+            (self.p.lang_adt(Lang::Option), self.p.lang_adt(Lang::Result))
+        else {
+            return self.error_expr(span);
+        };
+        let target = self.closure_ret().unwrap_or(self.ret_ty);
+        let (adt, args) = match self.kind(x.ty) {
+            TyKind::Adt(a, args) if *a == option || *a == result => (*a, args.clone()),
+            TyKind::Error => return self.error_expr(span),
+            _ => {
+                let shown = self.display(x.ty);
+                self.err(
+                    Diagnostic::new(
+                        codes::E0300,
+                        x.span,
+                        format!("`?` takes an `Option` or a `Result`, not `{shown}`"),
+                    )
+                    .with_note("`x?` is `x`'s value, or a return of its `None` or `Err` (§15)"),
+                );
+                return self.error_expr(span);
+            }
+        };
+        let is_result = adt == result;
+        // The function returns the same kind, with the same error type.
+        let ret_args: Vec<TyId> = if is_result {
+            vec![self.new_var(VarKind::General, span), args[1]]
+        } else {
+            vec![self.new_var(VarKind::General, span)]
+        };
+        let ret_ty = self.p.types.adt(adt, ret_args.clone());
+        if !matches!(self.kind(target), TyKind::Error) && !self.try_unify(target, ret_ty) {
+            let (want, has) = (self.display(ret_ty), self.display(target));
+            let what = if is_result { "a `Result` with this error type" } else { "an `Option`" };
+            let mut d = Diagnostic::new(
+                codes::E0300,
+                span,
+                format!(
+                    "`?` returns its {} from the function, which returns `{has}`",
+                    if is_result { "`Err`" } else { "`None`" }
+                ),
+            )
+            .with_note(format!("so the function must return {what}: `{want}`"));
+            if is_result
+                && let TyKind::Adt(a, targs) = self.kind(target)
+                && *a == result
+            {
+                let theirs = self.display(targs[1]);
+                let ours = self.display(args[1]);
+                d = d.with_help(format!(
+                    "convert the error first: `x.map_err(..)?` turns a `{ours}` into a `{theirs}`"
+                ));
+            }
+            self.err(d);
+        }
+        let value_ty = args[0];
+        let from_place = x.is_place();
+        let declare = |c: &mut Self, name: &str, ty: TyId| {
+            let kind =
+                super::pat::binding_kind_of(c.p, c.infer.resolve(&c.p.types, ty), from_place);
+            let id = c.declare_unnamed(ty, kind, x.span);
+            c.locals[id.index()].name = name.into();
+            id
+        };
+        let v = declare(self, "value", value_ty);
+        // `Option`: `None`, `Some(T)`; `Result`: `Ok(T)`, `Err(E)`.
+        let (ok_variant, err_variant) = if is_result { (0u32, 1u32) } else { (1, 0) };
+        let ok_pat = Pat {
+            ty: x.ty,
+            kind: PatKind::Adt {
+                adt,
+                args: args.clone(),
+                variant: Some(ok_variant),
+                fields: vec![(0, Pat { ty: value_ty, kind: PatKind::Bind(v), span: x.span })],
+            },
+            span: x.span,
+        };
+        // A temporary's value is owned by its bindings, and moved on from them.
+        let owned = |e: Expr| {
+            if from_place {
+                e
+            } else {
+                Expr { ty: e.ty, span: e.span, kind: ExprKind::Take(Box::new(e)) }
+            }
+        };
+        let ok_body = owned(Expr { ty: value_ty, span: x.span, kind: ExprKind::Local(v) });
+        let (err_fields, ret_fields) = if is_result {
+            let e = declare(self, "error", args[1]);
+            let pat = vec![(0, Pat { ty: args[1], kind: PatKind::Bind(e), span: x.span })];
+            let val = vec![owned(Expr { ty: args[1], span: x.span, kind: ExprKind::Local(e) })];
+            (pat, val)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        let err_pat = Pat {
+            ty: x.ty,
+            kind: PatKind::Adt {
+                adt,
+                args: args.clone(),
+                variant: Some(err_variant),
+                fields: err_fields,
+            },
+            span: x.span,
+        };
+        let order = (0..ret_fields.len() as u32).collect();
+        let ret_value = Expr {
+            ty: ret_ty,
+            span,
+            kind: ExprKind::Adt {
+                adt,
+                args: ret_args,
+                variant: Some(err_variant),
+                fields: ret_fields,
+                order,
+                base: None,
+            },
+        };
+        let never = self.p.types.never;
+        let ret = Expr { ty: never, span, kind: ExprKind::Return(Some(Box::new(ret_value))) };
+        let arms = vec![
+            Arm { pat: ok_pat, guard: None, body: ok_body, span },
+            Arm { pat: err_pat, guard: None, body: ret, span },
+        ];
+        Expr {
+            ty: value_ty,
+            span,
+            kind: ExprKind::Match { scrutinee: Box::new(x), arms, mutable: false },
+        }
     }
 
     fn check_return(&mut self, value: Option<&ast::Expr>, span: Span) -> Expr {
         let target = self.closure_ret().unwrap_or(self.ret_ty);
         let v = match value {
+            Some(v) if matches!(self.kind(target), TyKind::Slice(_) | TyKind::Str) => {
+                // A run result: an array, a `Vec` or a string passes as one.
+                let e = self.check_expr(v, None);
+                if !self.run_coerces(e.ty, target) {
+                    self.expect(e.ty, target, e.span);
+                }
+                Some(Box::new(e))
+            }
             Some(v) => Some(Box::new(self.check_expect(v, target))),
             None => {
                 let unit = self.p.types.unit;
@@ -1534,8 +2222,10 @@ impl<'p> Checker<'p> {
         span: Span,
     ) -> Expr {
         let exp = match expected.map(|t| self.kind(t)) {
-            Some(TyKind::FnPtr(ps, r)) if ps.len() == params.len() => Some((ps.clone(), *r)),
-            Some(TyKind::FnPtr(ps, _)) => {
+            Some(TyKind::FnPtr(ps, r, flags)) if ps.len() == params.len() => {
+                Some((ps.clone(), *r, *flags))
+            }
+            Some(TyKind::FnPtr(ps, _, _)) => {
                 self.err(Diagnostic::new(
                     codes::E0301,
                     span,
@@ -1551,14 +2241,14 @@ impl<'p> Checker<'p> {
             // types are errors too, not left to infer.
             Some(TyKind::Error) => {
                 let e = self.p.types.error;
-                Some((vec![e; params.len()], e))
+                Some((vec![e; params.len()], e, FnFlags::default()))
             }
             _ => None,
         };
         let ret_ty = match ret {
             Some(t) => self.resolve_type(t),
             None => match &exp {
-                Some((_, r)) => *r,
+                Some((_, r, _)) => *r,
                 None => self.new_var(VarKind::General, span),
             },
         };
@@ -1569,16 +2259,19 @@ impl<'p> Checker<'p> {
             let ty = match &p.ty {
                 Some(t) => {
                     let t = self.resolve_type(t);
-                    if let Some((ps, _)) = &exp {
+                    if let Some((ps, _, _)) = &exp {
                         self.expect(ps[i], t, p.name.span);
                     }
                     t
                 }
                 None => match &exp {
-                    Some((ps, _)) => ps[i],
+                    Some((ps, _, _)) => ps[i],
                     None => self.new_var(VarKind::General, p.name.span),
                 },
             };
+            // A closure's parameters take their modes from the function type it's passed as
+            // (§6.7): `fn(mut Ui)` makes `|u| ...`'s `u` a mutable projection.
+            let mode = exp.as_ref().map_or(Mode::Borrow, |(_, _, f)| f.mode(i));
             if let Some(first) = params[..i].iter().find(|q| q.name.name == p.name.name) {
                 self.err(
                     Diagnostic::new(
@@ -1589,14 +2282,14 @@ impl<'p> Checker<'p> {
                     .with_secondary(first.name.span, "first here"),
                 );
             }
-            locals.push(self.declare_closure_param(&p.name, ty));
+            locals.push(self.declare_closure_param(&p.name, ty, mode));
         }
         let b = self.without_loops(|this| this.check_expect(body, ret_ty));
         self.env.truncate(env_len);
         let id2 = self.end_closure(locals, ret_ty, b, span);
         debug_assert_eq!(id, id2);
         let env = self.scope_args();
-        let ty = self.p.types.intern(TyKind::Closure(id, env));
+        let ty = self.p.types.intern(TyKind::Closure(ClosureRef { owner: self.fn_id, id }, env));
         Expr { ty, span, kind: ExprKind::Closure(id) }
     }
 
@@ -1626,5 +2319,30 @@ pub(super) fn variant_expr(
         ty,
         span,
         kind: ExprKind::Adt { adt, args, variant: Some(v), fields, order, base: None },
+    }
+}
+
+/// How one side of `a + b` goes in an f-string: a string literal's text (its braces doubled),
+/// or `{name}` for a name or a field. `None` for anything else.
+fn f_part(e: &ast::Expr) -> Option<String> {
+    match &e.kind {
+        ast::ExprKind::Lit(l) if l.kind == ast::LitKind::Str && !l.text.starts_with('f') => {
+            let inner = l.text.strip_prefix('"')?.strip_suffix('"')?;
+            Some(inner.replace('{', "{{").replace('}', "}}"))
+        }
+        _ => Some(format!("{{{}}}", path_text(e)?)),
+    }
+}
+
+/// A name or a chain of fields, as written: `p.name`.
+fn path_text(e: &ast::Expr) -> Option<String> {
+    match &e.kind {
+        ast::ExprKind::Path(p) if p.segments.iter().all(|s| s.generics.is_none()) => {
+            Some(p.segments.iter().map(|s| s.ident.name.as_str()).collect::<Vec<_>>().join("::"))
+        }
+        ast::ExprKind::Field { base, name: ast::FieldName::Ident(n) } => {
+            Some(format!("{}.{}", path_text(base)?, n.name))
+        }
+        _ => None,
     }
 }

@@ -1,0 +1,9 @@
+// mistake: a string pattern for a number
+// expect: E0320
+// fix: no
+fn speed(mood: u32) -> f32 {
+    match mood {
+        "calm" => 1.0,
+        _ => 2.0,
+    }
+}

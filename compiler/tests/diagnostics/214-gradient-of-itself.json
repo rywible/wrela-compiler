@@ -1,0 +1,26 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0700",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "can't derive this function: it uses its gradient, so deriving it would need its derivative's derivative, without end",
+      "notes": [],
+      "severity": "error",
+      "span": {
+        "column": 5,
+        "end": 204,
+        "end_column": 29,
+        "end_line": 10,
+        "line": 10,
+        "start": 180
+      },
+      "title": "a function that can't be derived"
+    }
+  ],
+  "version": 2
+}

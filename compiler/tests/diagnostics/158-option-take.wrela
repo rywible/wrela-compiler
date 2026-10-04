@@ -1,0 +1,10 @@
+// mistake: `Option::take()`, as in Rust
+// expect: E0207
+// fix: yes
+struct Slot {
+    item: Option<u32>,
+}
+
+fn empty(s: mut Slot) -> Option<u32> {
+    s.item.take()
+}

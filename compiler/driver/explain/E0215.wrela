@@ -1,0 +1,28 @@
+// A call to one of std's unsafe functions (`std::mem`'s raw memory operations) outside an
+// `unsafe` block. Wrap the call in `unsafe { }`; the package must declare `unsafe = true`.
+// ---- wrong
+use std::mem::copy
+
+fn move_bytes() {
+    copy(dst: 16, src: 32, bytes: 4)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- file wrela.toml
+[package]
+name = "bytes"
+unsafe = true
+// ---- fixed
+use std::mem::copy
+
+fn move_bytes() {
+    unsafe {
+        copy(dst: 16, src: 32, bytes: 4)
+    }
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- file wrela.toml
+[package]
+name = "bytes"
+unsafe = true

@@ -1,0 +1,432 @@
+// Sketch 01, "a creature as a field" (design-archive-2026-10: docs/design/sketches/
+// 01-creature.md), in the language as built: the paper test's rewrite (#41, Q11), with
+// build-time constants where it had to work around their absence (Q12). Each change from the
+// sketch is noted where it's made ("Changed:"), with its reason; main.wrela is the program
+// around it, and sketches.rs tests it.
+//
+// Layers (D-050): `std::` is the stdlib; `engine::` (compiler/tests/sketches/engine) is the
+// engine; the rest is the game.
+
+use engine::acoustics::{
+    Absorption, Acoustic, Contact, KERATIN, SOFT_TISSUE, Voice, modal, modal_modes,
+}
+use engine::creature::{Bone, Chain, Creature, Segment, Skeleton, creature}
+use engine::look::{Bricks, ByPart, CreatureLook, Mesh, Shadow, Skin}
+use engine::physique::{Per, Physique}
+use engine::render::Shaded
+use engine::rng::{Rng, Seed, seed}
+use engine::sim::{
+    CreatureKey, DOWN, Frame, GaitNet, GaitState, Ground, Intent, Pose, Sim, SimState, SimTier,
+    Spring, SpringChain, Transform,
+}
+use std::arena::Arena
+use std::derive::Box3
+use std::serialize::Serialize
+use std::field::{
+    Blend, Cat, Color, Field, Lipschitz, Surface, cat, ellipsoid, fbm, half_space, rgb, round_cone,
+    value_noise,
+}
+use std::hash::StateHash
+use std::units::{cm, kg, m, mm}
+
+// ---- §1 Channels: what a point knows about itself ---------------------------------------------
+
+pub enum Material: Copy + GpuData + StateHash {
+    Hide,
+    Keratin,
+}
+
+/// What a point on or inside the grazer knows, besides its distance to the surface.
+pub struct Tissue: Copy + GpuData + Blend {
+    albedo: Color,
+    roughness: f32,
+    density: f32, // kg/m³
+    absorption: Absorption,
+    material: Cat<Material>,
+}
+
+// Changed: `Absorption::SOFT_TISSUE` is `SOFT_TISSUE`, a constant of the engine's module: types
+// have no associated constants. `Cat(Material::Hide)` is `cat(Material::Hide)`: there are no
+// tuple structs (§21's small conveniences).
+const HIDE = Tissue {
+    albedo: rgb(r: 0.42, g: 0.33, b: 0.24),
+    roughness: 0.7,
+    density: 1050 * kg / m ** 3,
+    absorption: SOFT_TISSUE,
+    material: cat(Material::Hide),
+}
+
+const HOOF = Tissue {
+    albedo: rgb(r: 0.12, g: 0.10, b: 0.09),
+    roughness: 0.35,
+    density: 1300 * kg / m ** 3,
+    absorption: KERATIN,
+    material: cat(Material::Keratin),
+}
+
+impl Acoustic for Tissue {
+    fn density(self) -> f32 {
+        self.density
+    }
+
+    /// Young's modulus: hide is soft; a hoof is keratin.
+    fn stiffness(self) -> f32 {
+        match self.material.value {
+            Material::Hide => 2.0e7,
+            Material::Keratin => 2.0e9,
+        }
+    }
+}
+
+/// How the renderer shades a point of the grazer (sketch 02's `shade`).
+impl Shaded for Tissue {
+    fn albedo(self) -> vec3 {
+        vec3(self.albedo.r, self.albedo.g, self.albedo.b)
+    }
+
+    fn roughness(self) -> f32 {
+        self.roughness
+    }
+}
+
+// ---- §2 Parts: small fields in bone space -----------------------------------------------------
+
+/// The hide's dapples: two browns, mixed by value noise. Its seed moves the pattern.
+fn dapple(p: vec3, s: Seed) -> Color {
+    let t = value_noise(p * 3.0 + vec3(f32(s.value % 97)))
+    rgb(r: 0.42, g: 0.33, b: 0.24).blend(rgb(r: 0.30, g: 0.22, b: 0.15), 0.5 + 0.5 * t)
+}
+
+/// The torso, in the root's space: the grazer's rest frame, its origin on the ground under the
+/// pelvis. +z is forward, +y is up. `chest` is where the chest bone is.
+///
+/// Changed:
+/// - The numbers are spike 01's (its `makeGrazer`), which M1's grazer has, so the two can be
+///   compared; the sketch's were a first guess. So the torso takes `size`, the individual's
+///   scale (the spike scales each part's size but not its bark), and its bark's noise offset.
+/// - It's in the root's space, not the chest's: the bark is noise in rest space, as in M1's
+///   grazer. In the chest's space the noise would see points shifted by the chest's position,
+///   and with its offsets near 100 m, rounding would move it by up to about 2e-5 m.
+/// - The kinds are gone (Q8): its `lipschitz` exceeds 1 and says so; `assert` checks it.
+fn torso(chest: vec3, bulk: f32, size: f32, bark: vec3, s: Seed) -> Field<Tissue> + Lipschitz {
+    let r = size * bulk
+    ellipsoid(radii: vec3(0.42m, 0.48m, 0.80m) * r)
+        .translate(chest + vec3(0, 5cm, -15cm) * size)
+        .smooth_union(
+            ellipsoid(radii: vec3(0.38m, 0.44m, 0.50m) * r).translate(
+                chest + vec3(0, 5cm, -85cm) * size,
+            ), // haunch
+            k: 15cm * size,
+        )
+        .displace(fbm(freq: 25 / m, octaves: 4, offset: bark), amp: 3mm) // wrinkles
+        .with_at(|p| Tissue { albedo: dapple(p, s), ..HIDE }) // captures `s` by value, so the field can store it
+}
+
+/// The neck, spanning its whole chain from the chain's first bone.
+///
+/// Changed: the sketch called `neck_tube` without writing it; this is spike 01's round cone.
+fn neck_tube(span: vec3, r_base: f32, r_tip: f32) -> Field<Tissue> + Lipschitz {
+    round_cone(vec3(), span, r_base, r_tip).with(HIDE)
+}
+
+/// The head, in its bone's space. (The sketch's `head(seed)`, written; spike 01's numbers.)
+fn head(size: f32) -> Field<Tissue> + Lipschitz {
+    ellipsoid(radii: vec3(12cm, 15cm, 24cm) * size)
+        .translate(vec3(0, -4cm, 10cm) * size)
+        .smooth_union(
+            round_cone(
+                vec3(0, -5cm, 15cm) * size,
+                vec3(0, -16cm, 42cm) * size,
+                10cm * size,
+                6.5cm * size,
+            ),
+            k: 5cm * size,
+        ) // muzzle
+        .with(HIDE)
+}
+
+/// The tail, spanning its chain. (The sketch's `tail()`, written; spike 01's numbers.)
+fn tail(span: vec3, size: f32) -> Field<Tissue> + Lipschitz {
+    round_cone(vec3(), span, 7cm * size, 2.5cm * size).with(HIDE)
+}
+
+/// One leg segment, from its joint to the next.
+///
+/// Changed: a segment runs to its next joint (`seg.end`), not straight down `-y`: bones have
+/// no rotation at rest, and spike 01's legs bend.
+fn leg_segment(end: vec3, r_top: f32, r_bottom: f32) -> Field<Tissue> + Lipschitz {
+    round_cone(vec3(), end, r_top, r_bottom).with(HIDE)
+}
+
+/// A hoof, in its foot's space: a round cone cut flat at the sole.
+///
+/// Changed: the sole's half-space faces down, keeping what's above it (`dot(p, n) < offset`);
+/// the sketch's faced up, which kept only the cone's tip below the sole. Sizes scale with the
+/// individual, as spike 01's do.
+fn hoof(size: f32) -> Field<Tissue> + Lipschitz {
+    round_cone(vec3(), vec3(y: -8cm * size), r_top: 6cm * size, r_bottom: 7cm * size)
+        .intersect(half_space(normal: vec3(y: -1), offset: 7cm * size)) // flat sole
+        .with(HOOF)
+}
+
+/// The sketch's `@assert(lipschitz <= 1.5, near: 10cm)` on `torso`, which the paper test made a
+/// test. std's stated bound holds (it's at least every gradient sampled within 10 cm of the
+/// surface), but it's above 1.5: the bark's 3 mm of fbm at 25 per metre, four octaves, adds
+/// `amp × fbm.lipschitz()`, std's bound on the noise's gradient, to the ellipsoids' own.
+@test
+fn the_torsos_stated_bound_holds() {
+    let t = torso(vec3(0, 1.3m, 1.0m), bulk: 1.0, size: 1.0, bark: vec3(), s: seed(1))
+    let l = t.lipschitz(near: 10cm)
+    let around = Box3 { lo: vec3(-0.6, 0.7, -0.5), hi: vec3(0.6, 1.9, 1.6) }
+    var near = 0
+    var most = 0.0
+    for i in 0..16384 {
+        let p = around.sample(1, i)
+        if abs(t.distance(p)) < 10cm {
+            near += 1
+            let g = length(t.gradient(p))
+            assert(g <= l, f"at ({p.x}, {p.y}, {p.z})")
+            most = max(most, g)
+        }
+    }
+    assert(near > 1000 && most >= 0.9, "too few samples near the surface")
+}
+
+// ---- §3 Skeleton and assembly -----------------------------------------------------------------
+
+/// A leg's three segments, each from one joint to the next (spike 01's).
+const FORE: [vec3; 3] = [vec3(0, -45cm, -4cm), vec3(0, -42cm, 3cm), vec3(0, -20cm, 2cm)]
+const HIND: [vec3; 3] = [vec3(0, -50cm, 10cm), vec3(0, -45cm, -12cm), vec3(0, -22cm, 0)]
+
+/// The grazer's bones, built when the program is built, so a misspelled name fails the build.
+///
+/// Changed:
+/// - A root at the origin holds the torso (see `torso`); the pelvis hangs from it.
+/// - Chains and legs start at an offset from their parent (`at:`), and a leg's segments are
+///   offsets, not lengths: spike 01's skeleton, which M1's grazer has.
+/// - The legs are listed right before left (spike 01's order): a smooth union's fold depends on
+///   its order, and the comparison with M1 is within 1e-5 m.
+fn grazer_skeleton() -> Skeleton {
+    var s = Skeleton::new()
+    let root = s.root("root", at: vec3())
+    let pelvis = s.bone("pelvis", parent: root, at: vec3(y: 1.3m))
+    let chest = s.bone("chest", parent: pelvis, at: vec3(z: 1.0m))
+    let neck = s.chain(
+        "neck",
+        parent: chest,
+        at: vec3(y: 20cm, z: 55cm),
+        joints: 4,
+        span: vec3(y: 55cm, z: 45cm),
+    )
+    s.bone("head", parent: neck.last(), at: neck.step() + vec3(z: 12cm))
+    s.chain(
+        "tail",
+        parent: pelvis,
+        at: vec3(y: 15cm, z: -40cm),
+        joints: 6,
+        span: vec3(y: -55cm, z: -45cm),
+    )
+    s.leg("fore right", parent: chest, at: vec3(25cm, -15cm, 25cm), segments: FORE)
+    s.leg("fore left", parent: chest, at: vec3(-25cm, -15cm, 25cm), segments: FORE)
+    s.leg("hind right", parent: pelvis, at: vec3(25cm, -5cm, 5cm), segments: HIND)
+    s.leg("hind left", parent: pelvis, at: vec3(-25cm, -5cm, 5cm), segments: HIND)
+    s
+}
+
+const GRAZER = grazer_skeleton()
+const ROOT = GRAZER.find("root")
+const CHEST = GRAZER.find("chest")
+const HEAD = GRAZER.find("head")
+const NECK = GRAZER.find_chain("neck")
+const TAIL = GRAZER.find_chain("tail")
+
+/// One grazer. Each member of a herd uses a different seed, so variation costs zero bytes.
+///
+/// Changed:
+/// - `Creature<Tissue>` is a trait in return position, as the sketch meant: one concrete type,
+///   inferred. A trait has no constructor, so the builder is `creature(skeleton)`.
+/// - The bones are constants found by name (Q12), not a `GrazerBones` struct of handles.
+/// - Each part's size takes the individual's scale (`size`), and the bark's offset comes from
+///   the grazer's `Rng`, as in spike 01. A segment's radii depend on which segment it is.
+pub fn grazer(seed: Seed) -> Creature<Tissue> {
+    var rng = Rng::new(seed)
+    let bulk = rng.range(lo: 0.9, hi: 1.15)
+    let size = rng.range(lo: 0.92, hi: 1.08)
+    let bark = vec3(rng.range(lo: 0, hi: 100), rng.range(lo: 0, hi: 100), rng.range(lo: 0, hi: 100))
+    let s = GRAZER.scaled(size)
+    let chest = s.rest(CHEST)
+
+    creature(take s)
+        .part(ROOT, torso(chest, bulk, size, bark, seed))
+        .part(
+            NECK.first(),
+            neck_tube(NECK.span() * size, r_base: 22cm * size * bulk, r_tip: 12cm * size),
+        )
+        .part(HEAD, head(size))
+        .part(TAIL.first(), tail(TAIL.span() * size, size))
+        .each_leg(|leg| {
+            leg.fill(
+                |seg| leg_segment(
+                    seg.end,
+                    TOP[seg.index] *
+                        select(if_false: 1.0, if_true: bulk, cond: seg.index == 0) *
+                        size,
+                    BOTTOM[seg.index] * size,
+                ),
+            )
+                .foot(hoof(size))
+        })
+        .blend(k: 6cm * size) // smooth-union across joints: organic joints for free
+}
+
+/// Each leg segment's radius at its top and its bottom (spike 01's); the hip's top takes the
+/// grazer's bulk.
+const TOP: [f32; 3] = [10cm, 6.5cm, 4.8cm]
+const BOTTOM: [f32; 3] = [6.5cm, 4.8cm, 4.2cm]
+
+// ---- §4 Physical properties belong to the definition ------------------------------------------
+
+/// What the simulation sees. These values change gameplay, so they're part of what the grazer
+/// *is*, not how it's drawn. They must come out bit-identical on every client (D-015).
+///
+/// Changed: `per: Bone` names an enum's variant, `Per::Bone`: a type isn't a value.
+@deterministic
+pub fn grazer_physique(c: Creature<Tissue>) -> Physique {
+    Physique {
+        mass: c.integrate(|t| t.density, per: Per::Bone, finest: 1cm), // adaptive; mass, centre of mass, inertia per bone
+        collision: c.fit_capsules(per: Per::Bone, tolerance: 1cm), // cheap shapes to re-simulate on rollback
+    }
+}
+
+// ---- §5 Look: how the grazer is drawn ---------------------------------------------------------
+
+/// Engine configuration: an ordinary struct value. Unmentioned fields keep the engine's
+/// defaults (D-048).
+///
+/// Changed: `ShadowMap { resolution: 1024 }` is the variant `Shadow::Map`, as sketch 02's
+/// `CreatureLook` declares it; `Skin`'s `max_bones` keeps its default.
+pub const GRAZER_LOOK = CreatureLook {
+    surface: Mesh { tolerance: 1mm }, // up close: rasterized triangles (D-001)
+    deform: Skin { weights: ByPart { falloff: 6cm } }, // D-023 default
+    far: Some(Bricks { voxel: 3cm, beyond: 40m }),
+    shadow: Shadow::Map { resolution: 1024 }, // it deforms: shadow maps, not distance fields (D-086)
+}
+
+// ---- §6 Simulation and presentation -----------------------------------------------------------
+
+/// Sim state: ordinary values. Snapshots are `clone()`; checksums are the derived `StateHash`.
+/// `SimState` is the engine's declared trait with a structural check (D-078): every field
+/// must be sim state too.
+pub struct GrazerSim: Sim {
+    pub kind: CreatureKey, // definition + seed: a deterministic key, never a handle (D-084)
+    pub tier: SimTier, // Full: pose lives in sim. Ambient: root + phase only (D-034)
+    pub rng: Rng, // per-grazer stream, seeded from (world seed, handle): parallel-safe
+    pub root: Transform,
+    pub gait: GaitState, // phase, speed, mode
+    pub pose: Pose, // gameplay pose: hitboxes, foot contacts (Full tier only)
+}
+
+/// Presentation state. Never rolled back; may differ between clients.
+///
+/// Changed: no `bones: GrazerBones` (the paper test's): the bones are constants.
+pub struct GrazerLook {
+    pub pose: Pose, // Ambient tier: the full pose is computed here instead
+    pub tail: SpringChain,
+    pub ears: [Spring; 2],
+}
+
+/// Small learned controller, trained offline. Quantized weights with recorded provenance
+/// (D-036): `Bytes`, read in place, so no parsing and no global.
+///
+/// Changed: the paper test's struct literal around the built-in `embed`; the sketch's
+/// `GaitNet::embed(...)` was a call inside a constant, which Q12 allows again, but `embed`
+/// returns `Bytes` and the net reads them in place, so there's nothing for a call to do.
+const GAIT = GaitNet { weights: embed("grazer_gait.wnn") }
+
+/// The ground (sketch 03 has the game's real one: a base field and an edit log). A gentle
+/// hill; its distance is the height difference scaled by the hill's steepest slope, so it
+/// never overestimates.
+pub struct Terrain: Sim {
+    pub hill: vec3,
+    pub height: f32,
+    pub width: f32,
+}
+
+impl Ground for Terrain {
+    fn ground(self, p: vec3) -> f32 {
+        let d = p.xz - self.hill.xz
+        let h = self.height * exp(-dot(d, d) / (self.width * self.width))
+        (p.y - h) * 0.8
+    }
+}
+
+/// The world, as much of it as this sketch reads (sketch 03 has the game's).
+pub struct World: Sim {
+    pub terrain: Terrain,
+    pub grazers: Arena<GrazerSim>,
+}
+
+/// Takes the terrain, not the whole world: the grazer lives inside the world, so mutating it
+/// while borrowing the world would overlap (sketch 03 §2).
+///
+/// Changed: it takes any `Ground` (the engine's trait), so sketch 03's terrain, a base field
+/// and an edit log, is one. A leg's pose is in the grazer's own space, so the ray starts from
+/// where the foot is in the world, a metre above it, and the hit comes back into the grazer's
+/// space.
+@deterministic
+pub fn step(g: mut GrazerSim, terrain: Ground, intent: Intent) {
+    g.gait = GAIT.eval(g.gait, intent, slope: terrain.slope_under(g.root))
+    g.root = g.root.advance(g.gait.root_motion())
+    if g.tier == SimTier::Full {
+        g.pose = g.gait.pose()
+        for mut leg in g.pose.legs { // each leg: a mutable projection of a `[LegPose; 4]` field
+            let ground = terrain.raycast(
+                from: g.root.to_world(leg.foot_pos()) + vec3(y: 1m),
+                dir: DOWN,
+            ) // a field query on the CPU, strict floats
+            leg.plant(on: g.root.to_local(ground)) // two-bone IK
+        }
+    }
+}
+
+/// Changed: the tail follows `look.pose.chain(TAIL, GRAZER)`, the chain's joints in the pose,
+/// where the sketch wrote `look.pose["tail"]`.
+pub fn animate(g: GrazerSim, look: mut GrazerLook, world: World, dt: f32) {
+    look.pose = match g.tier {
+        SimTier::Full => g.pose.clone(), // explicit: `g` is borrowed (D-064)
+        SimTier::Ambient => g.gait.pose().planted_on(world.terrain), // same work, but never rolled back
+    }
+    look.tail.follow(look.pose.chain(TAIL, GRAZER), dt) // secondary motion is presentation-only
+}
+
+/// Changed: the pose is cloned before it's layered: `look` is borrowed, and layering takes the
+/// pose (the sketch moved it out of a borrowed place).
+pub fn draw(g: GrazerSim, look: GrazerLook, frame: mut Frame) {
+    frame.draw(g.kind, pose: look.pose.clone().layer(look.tail).layer(look.ears)) // the engine finds the realized mesh by key
+}
+
+// ---- §7 Sound ---------------------------------------------------------------------------------
+
+/// The hoof's vibration modes, from its field (shape + density). This is an eigenvalue solve,
+/// so it's written as a `const` and runs when the program is built (D-072).
+///
+/// Changed: `modal_modes` takes the extent of the space to search for the body, and `hoof`
+/// takes a size (an individual's scale): this is the hoof at scale 1.
+pub const HOOF_MODES = modal_modes(hoof(1.0), extent: 15cm)
+
+/// §7: `HOOF_MODES` ran its eigenvalue solve when the program was built. The hoof rings in the
+/// kilohertz, its modes ascending.
+@test
+fn the_hoof_rings_in_the_kilohertz() {
+    assert(HOOF_MODES.count >= 3)
+    assert(HOOF_MODES.frequency[0] > 200.0 && HOOF_MODES.frequency[0] < 20000.0)
+    for k in 1..3 {
+        assert(HOOF_MODES.frequency[k] >= HOOF_MODES.frequency[k - 1])
+    }
+}
+
+/// A hoof hits the ground.
+@audio
+pub fn hoof_strike(hit: Contact) -> Voice {
+    modal(HOOF_MODES, against: hit.surface.absorption, impulse: hit.impulse)
+}

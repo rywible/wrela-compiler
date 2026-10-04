@@ -1,0 +1,12 @@
+// rejects: mem.drop
+use std::mem::Drop
+
+struct File {
+    handle: u32,
+}
+
+impl Drop for File { //~ E0413
+    fn drop(mut self) {
+        self.handle = 0
+    }
+}

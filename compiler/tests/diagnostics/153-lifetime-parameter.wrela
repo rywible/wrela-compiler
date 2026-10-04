@@ -1,0 +1,6 @@
+// mistake: a lifetime parameter, as in Rust
+// expect: E0114 E0106 E0114
+// fix: yes
+fn first<'a>(xs: &'a Vec<f32>) -> f32 {
+    xs[0]
+}

@@ -93,16 +93,21 @@ const UNITS: &[(&str, Cat)] = &[
     ("impl_member", Cat::Member),
     ("param", Cat::Param),
     ("field_decl", Cat::Field),
+    ("borrow_field", Cat::Field),
     ("variant", Cat::Variant),
     ("use_tree", Cat::UseTree),
     ("block", Cat::Block),
     ("stmt", Cat::Stmt),
     ("arm", Cat::Arm),
     ("type", Cat::Type),
+    ("trait_type", Cat::Type),
     ("path_type", Cat::Type),
+    ("bound", Cat::Type),
     ("closure", Cat::Expr),
     ("jump", Cat::Expr),
     ("if_expr", Cat::Expr),
+    ("let_else_init", Cat::Expr),
+    ("let_else_primary", Cat::Expr),
 ];
 
 /// Expression rules with an `_ns` twin (the rule again, for the head of an `if`, `while`,
@@ -141,6 +146,7 @@ impl Roles {
             set_twins(name, Role::LeftChain);
         }
         set_twins("postfix_expr", Role::Postfix);
+        set("let_else_postfix", Role::Postfix);
         for (name, cat) in UNITS {
             set(name, Role::Unit(*cat));
         }
@@ -255,6 +261,10 @@ impl AstWalker {
                     }
                 }
             }
+            ItemKind::TraitSet(t) => {
+                self.generics(&t.generics);
+                self.types(&t.traits);
+            }
             ItemKind::Impl(i) => {
                 self.generics(&i.generics);
                 if let Some(t) = &i.trait_ {
@@ -277,6 +287,10 @@ impl AstWalker {
                 self.expr(&c.value);
             }
             ItemKind::Use(u) => self.use_tree(u),
+            ItemKind::TypeAlias(t) => {
+                self.generics(&t.generics);
+                self.ty(&t.ty);
+            }
         }
     }
 
@@ -320,6 +334,9 @@ impl AstWalker {
     fn generics(&mut self, g: &[GenericParam]) {
         for p in g {
             self.types(&p.bounds);
+            if let Some(t) = &p.const_ty {
+                self.ty(t);
+            }
         }
     }
 
@@ -340,6 +357,10 @@ impl AstWalker {
     }
 
     fn ty(&mut self, t: &TypeExpr) {
+        // A constant generic argument is an INT in the grammar, not a type.
+        if let TypeExprKind::Int(_) = t.kind {
+            return;
+        }
         self.add(t.span, Cat::Type);
         match &t.kind {
             TypeExprKind::Path(p) => self.path(p),
@@ -349,12 +370,14 @@ impl AstWalker {
                     self.expr(l);
                 }
             }
-            TypeExprKind::Tuple(tys) => self.types(tys),
+            TypeExprKind::Tuple(tys) | TypeExprKind::Traits(tys) => self.types(tys),
             TypeExprKind::Paren(inner) => self.ty(inner),
-            TypeExprKind::Error => {}
-            TypeExprKind::Fn(params, ret) => {
-                self.types(params);
-                if let Some(r) = ret {
+            TypeExprKind::Error | TypeExprKind::Int(_) => {}
+            TypeExprKind::Fn(f) => {
+                for p in &f.params {
+                    self.ty(&p.ty);
+                }
+                if let Some(r) = &f.ret {
                     self.ty(r);
                 }
             }
@@ -379,12 +402,15 @@ impl AstWalker {
     fn stmt(&mut self, s: &Stmt) {
         self.add(s.span, Cat::Stmt);
         match &s.kind {
-            StmtKind::Let { pat, ty, init } => {
+            StmtKind::Let { pat, ty, init, else_ } => {
                 self.pat(pat);
                 if let Some(t) = ty {
                     self.ty(t);
                 }
                 self.expr(init);
+                if let Some(b) = else_ {
+                    self.block(b);
+                }
             }
             StmtKind::Var { ty, init, .. } => {
                 if let Some(t) = ty {
@@ -431,14 +457,33 @@ impl AstWalker {
     }
 
     fn expr(&mut self, e: &Expr) {
+        // An arm's assignment is the arm's body in the grammar, not an expression.
+        if let ExprKind::Assign { target, value, .. } = &e.kind {
+            self.expr(target);
+            self.expr(value);
+            return;
+        }
         self.add(e.span, Cat::Expr);
         match &e.kind {
-            ExprKind::Lit(_) | ExprKind::Break | ExprKind::Continue | ExprKind::Error => {}
+            ExprKind::Lit(_)
+            | ExprKind::Break
+            | ExprKind::Continue
+            | ExprKind::Error
+            | ExprKind::Assign { .. } => {}
             ExprKind::Path(p) => self.path(p),
             ExprKind::Unary(_, x)
             | ExprKind::Take(x)
             | ExprKind::MutArg(x)
+            | ExprKind::Try(x)
             | ExprKind::Paren(x) => self.expr(x),
+            ExprKind::Unsafe(b) => self.block(b),
+            ExprKind::FString(parts) => {
+                for p in parts {
+                    if let FPart::Hole { expr, .. } = p {
+                        self.expr(expr);
+                    }
+                }
+            }
             ExprKind::Binary(_, l, r) => {
                 self.expr(l);
                 self.expr(r);
@@ -476,14 +521,17 @@ impl AstWalker {
                 self.expr(count);
             }
             ExprKind::Block(b) => self.block(b),
-            ExprKind::If { cond, then, else_ } => {
+            ExprKind::If { pat, cond, then, else_ } => {
+                if let Some(p) = pat {
+                    self.pat(p);
+                }
                 self.expr(cond);
                 self.block(then);
                 if let Some(e) = else_ {
                     self.block_expr(e);
                 }
             }
-            ExprKind::Match { scrutinee, arms } => {
+            ExprKind::Match { scrutinee, arms, .. } => {
                 self.expr(scrutinee);
                 for a in arms {
                     self.add(a.span, Cat::Arm);

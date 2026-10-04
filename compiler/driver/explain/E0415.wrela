@@ -1,0 +1,16 @@
+// An `impl` of `Copy` or `Clone`. A type declares them instead, `struct P: Copy`,
+// and the compiler makes them field by field.
+// ---- wrong
+struct P {
+    x: f32,
+}
+
+impl Copy for P {}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+struct P: Copy {
+    x: f32,
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

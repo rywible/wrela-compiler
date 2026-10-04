@@ -44,13 +44,14 @@ fn code_words(s: &str) -> impl Iterator<Item = (&str, &str)> {
     })
 }
 
-/// The codes a test file expects. In WRELA files: those after `//~` and `// expect:`. In JSON
+/// The codes a test file expects. In WRELA files and manifests (`wrela.toml`, whose markers
+/// follow a `#`): those after `//~` and `// expect:`. In JSON
 /// goldens: `"code": "CODE"`. In Rust: `"CODE"` as a whole string literal, or `codes::CODE`,
 /// outside `//` comments.
 fn expected(ext: &str, text: &str, out: &mut BTreeSet<String>) {
     for line in text.lines() {
         match ext {
-            "wrela" => {
+            "wrela" | "toml" => {
                 let tail = line.split_once("//~").or_else(|| line.split_once("// expect:"));
                 if let Some((_, tail)) = tail {
                     out.extend(code_words(tail).map(|(_, c)| c.to_string()));
@@ -81,7 +82,7 @@ fn expected(ext: &str, text: &str, out: &mut BTreeSet<String>) {
 #[test]
 fn every_code_is_tested() {
     let mut files =
-        read_where(&repo_root().join("compiler/tests"), &["wrela", "rs", "json"], |_| true);
+        read_where(&repo_root().join("compiler/tests"), &["wrela", "rs", "json", "toml"], |_| true);
     for krate in
         ["diag", "syntax", "sema", "lower", "ir", "wasm", "wgsl", "driver", "cli", "grammar"]
     {

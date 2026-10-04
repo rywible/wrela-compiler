@@ -8,7 +8,7 @@
       "internal": false,
       "label": null,
       "labels": [],
-      "message": "`fill` is a GPU `@compute` kernel; record it with `dispatch(...)`",
+      "message": "`fill` is a GPU `@compute` kernel; record it with `dispatch(kernel.bind(...), groups: n)`",
       "notes": [
         "entry points run on the GPU and can't be called directly"
       ],

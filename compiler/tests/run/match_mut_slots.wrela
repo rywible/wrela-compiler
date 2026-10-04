@@ -1,0 +1,31 @@
+// run: `match mut` changes an enum's fields in place
+// expect: run() = 3
+
+enum Slot {
+    Empty,
+    Full { item: u32, count: u32 },
+}
+
+fn add(slot: mut Slot, item: u32) {
+    match mut slot {
+        Slot::Empty => slot = Slot::Full { item, count: 1 },
+        Slot::Full { count, .. } => count += 1,
+    }
+}
+
+fn count_of(slot: Slot) -> u32 {
+    match slot {
+        Slot::Empty => 0,
+        Slot::Full { count, .. } => count,
+    }
+}
+
+pub fn run() -> u32 {
+    var slot = Slot::Empty
+    add(mut slot, 7)
+    add(mut slot, 7)
+    add(mut slot, 7)
+    count_of(slot)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

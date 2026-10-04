@@ -1,0 +1,82 @@
+// Rotations as unit quaternions (language.md §4: `Quat`, tier 1), on the CPU and the GPU alike.
+// The prelude puts `Quat` in scope everywhere, beside the vector and matrix types.
+
+use std::hash::StateHash
+use std::serialize::Serialize
+
+/// A rotation: a unit quaternion, `v.xyz` its vector part and `v.w` its scalar part. Compose
+/// with `mul`, apply with `rotate`, and mix two with `nlerp` (which is how it `Blend`s).
+pub struct Quat: Copy + GpuData + Eq + StateHash + Serialize {
+    pub v: vec4,
+}
+
+impl Quat {
+    /// No rotation.
+    pub fn identity() -> Quat {
+        Quat { v: vec4(0.0, 0.0, 0.0, 1.0) }
+    }
+
+    /// A rotation by `angle` radians about `axis` (any nonzero length), right-handed.
+    pub fn axis_angle(axis: vec3, angle: f32) -> Quat {
+        let h = 0.5 * angle
+        Quat { v: vec4(normalize(axis) * sin(h), cos(h)) }
+    }
+
+    /// The rotation a rotation matrix holds (its columns the rotated axes); Shepperd's method,
+    /// from the largest of the four candidates, so it stays accurate for every rotation.
+    pub fn from_mat3(m: mat3) -> Quat {
+        let (x, y, z) = (m[0], m[1], m[2])
+        let trace = x.x + y.y + z.z
+        var q = vec4(0.0)
+        if trace > 0.0 {
+            let s = 2.0 * sqrt(trace + 1.0)
+            q = vec4((y.z - z.y) / s, (z.x - x.z) / s, (x.y - y.x) / s, 0.25 * s)
+        } else if x.x > y.y && x.x > z.z {
+            let s = 2.0 * sqrt(1.0 + x.x - y.y - z.z)
+            q = vec4(0.25 * s, (y.x + x.y) / s, (z.x + x.z) / s, (y.z - z.y) / s)
+        } else if y.y > z.z {
+            let s = 2.0 * sqrt(1.0 + y.y - x.x - z.z)
+            q = vec4((y.x + x.y) / s, 0.25 * s, (z.y + y.z) / s, (z.x - x.z) / s)
+        } else {
+            let s = 2.0 * sqrt(1.0 + z.z - x.x - y.y)
+            q = vec4((z.x + x.z) / s, (z.y + y.z) / s, 0.25 * s, (x.y - y.x) / s)
+        }
+        Quat { v: normalize(q) }
+    }
+
+    /// `self` after `other`: applying the result rotates by `other`, then by `self`.
+    pub fn mul(self, other: Quat) -> Quat {
+        let (a, b) = (self.v, other.v)
+        Quat {
+            v: vec4(a.w * b.xyz + b.w * a.xyz + cross(a.xyz, b.xyz), a.w * b.w - dot(a.xyz, b.xyz)),
+        }
+    }
+
+    /// `p` rotated.
+    pub fn rotate(self, p: vec3) -> vec3 {
+        let t = 2.0 * cross(self.v.xyz, p)
+        p + self.v.w * t + cross(self.v.xyz, t)
+    }
+
+    /// The opposite rotation.
+    pub fn inverse(self) -> Quat {
+        Quat { v: vec4(-self.v.xyz, self.v.w) }
+    }
+
+    /// The rotation as a matrix, whose columns are the rotated axes.
+    pub fn to_mat3(self) -> mat3 {
+        mat3(
+            self.rotate(vec3(1.0, 0.0, 0.0)),
+            self.rotate(vec3(0.0, 1.0, 0.0)),
+            self.rotate(vec3(0.0, 0.0, 1.0)),
+        )
+    }
+
+    /// `self` where `t` is 0, `other` where it's 1, between along the shorter way, normalized.
+    pub fn nlerp(self, other: Quat, t: f32) -> Quat {
+        let b = if dot(self.v, other.v) < 0.0 { -other.v } else { other.v }
+        let m = mix(self.v, b, vec4(t))
+        let l = length(m)
+        if l > 0.0 { Quat { v: m / l } } else { self }
+    }
+}

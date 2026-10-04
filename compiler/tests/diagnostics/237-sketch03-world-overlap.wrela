@@ -1,0 +1,19 @@
+// mistake: sketch 03 §7: stepping a grazer while lending the whole world it's in
+// expect: E0513
+// fix: no
+struct GrazerSim: Clone {
+    root: vec3,
+}
+
+struct World {
+    grazers: Arena<GrazerSim>,
+    wind: vec3,
+}
+
+fn step(g: mut GrazerSim, w: World) {
+    g.root += w.wind
+}
+
+fn tick(w: mut World, h: Handle<GrazerSim>) {
+    step(mut w.grazers[h], w)
+}

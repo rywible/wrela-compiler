@@ -1,0 +1,23 @@
+// accepts: mem.let-owns
+struct Log: Clone {
+    count: u32,
+    last: f32,
+}
+
+struct World: Clone {
+    log: Log,
+    pos: vec3,
+}
+
+fn bindings(w: World) -> f32 {
+    let p = w.pos
+    borrow l = w.log
+    let copy = w.log.clone()
+    f32(l.count + copy.count) + p.x
+}
+
+fn owned(w: take World) -> u32 {
+    var w = take w
+    let l = take w.log
+    l.count
+}
