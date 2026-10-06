@@ -1,0 +1,37 @@
+// rejects: gpu.dispatch
+// A draw's cull mode and depth bias are part of its pipeline, which the host makes when the
+// program loads: build-time constants, written where it draws. Indices take their counts from
+// `indirect:`, and are `u32`s.
+use std::gpu::{
+    ClipPosition, Cull, DepthBias, GpuBuffer, VertexIndex, begin_screen_pass, buffer, draw,
+    present,
+}
+
+@vertex
+fn corner(points: [vec2], v: VertexIndex) -> ClipPosition {
+    let p = points[v.index]
+    ClipPosition { position: vec4(p.x, p.y, 0.5, 1.0) }
+}
+
+@fragment
+fn white() -> vec4 {
+    vec4(1.0, 1.0, 1.0, 1.0)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    let points: GpuBuffer<vec2> = buffer(4)
+    let indices: GpuBuffer<u32> = buffer(6)
+    let floats: GpuBuffer<f32> = buffer(6)
+    let counts: GpuBuffer<u32> = buffer(5)
+    let cull = if width > height { Cull::Back } else { Cull::None }
+    let bias = DepthBias { constant: 4, slope: 2.0, clamp: 0.0 }
+    let steps = i32(width)
+    begin_screen_pass(clear: vec4(0.0, 0.0, 0.0, 1.0))
+    draw(corner.bind(points), white, vertices: 3, cull: cull) //~ E0603
+    draw(corner.bind(points), white, vertices: 3, depth_bias: bias) //~ E0603
+    draw(corner.bind(points), white, vertices: 3, depth_bias: DepthBias { constant: steps, slope: 0.0, clamp: 0.0 }) //~ E0603
+    draw(corner.bind(points), white, vertices: 3, cull: Cull::Back, cull: Cull::None) //~ E0304
+    draw(corner.bind(points), white, indices: indices, vertices: 3) //~ E0603
+    draw(corner.bind(points), white, indices: floats, indirect: counts) //~ E0603
+    present()
+}

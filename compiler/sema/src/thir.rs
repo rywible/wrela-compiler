@@ -220,6 +220,18 @@ pub enum DrawCount {
     Vertices,
     Instances,
     Indirect,
+    Indices,
+}
+
+/// A draw's render state, which its pipeline holds: build-time constants (§12).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct RenderState {
+    /// `std::gpu::Cull`'s variant: 0 none, 1 front, 2 back.
+    pub cull: u32,
+    /// `std::gpu::DepthBias`: the constant, and the slope scale's and the clamp's f32 bits.
+    pub bias_constant: i32,
+    pub bias_slope: u32,
+    pub bias_clamp: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -229,8 +241,13 @@ pub struct Draw {
     pub vertices: Expr,
     pub instances: Expr,
     /// Instead of the counts: a `GpuBuffer<u32>` or `GpuSpan<u32>` holding the vertex count,
-    /// the instance count, the first vertex and the first instance.
+    /// the instance count, the first vertex and the first instance (or, with `indices`, the
+    /// index count, the instance count, the first index, the base vertex and the first
+    /// instance).
     pub indirect: Option<Box<Expr>>,
+    /// An indexed draw's `u32` indices: a `GpuBuffer<u32>` or `GpuSpan<u32>`.
+    pub indices: Option<Box<Expr>>,
+    pub state: RenderState,
     /// Each shader's arguments, bound to it (§12), as (entry point: 0 the vertex shader, 1 the
     /// fragment shader; parameter index; argument), in the order written.
     pub args: Vec<(usize, usize, Expr)>,
@@ -425,6 +442,9 @@ impl Expr {
                 f(Child::Expr(&d.vertices));
                 f(Child::Expr(&d.instances));
                 if let Some(i) = &d.indirect {
+                    f(Child::Expr(i));
+                }
+                if let Some(i) = &d.indices {
                     f(Child::Expr(i));
                 }
                 d.args.iter().for_each(|(_, _, a)| f(Child::Expr(a)));

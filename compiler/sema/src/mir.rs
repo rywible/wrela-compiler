@@ -300,6 +300,9 @@ pub struct Draw {
     pub args: Vec<(usize, usize, Place, Span)>,
     /// The buffer (or span) holding the counts, in place of `vertices` and `instances`.
     pub indirect: Option<(Place, Span)>,
+    /// An indexed draw's indices (with `indirect`).
+    pub indices: Option<(Place, Span)>,
+    pub state: crate::thir::RenderState,
 }
 
 #[derive(Clone, Debug)]

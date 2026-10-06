@@ -6,7 +6,7 @@
 use crate::common::{self, TempDir};
 
 use wrela_abi::hash::StateHash;
-use wrela_abi::stream::{Binding, Encoder};
+use wrela_abi::stream::{self, Binding, Encoder, Pass, TextureFormat};
 use wrela_host::{Error, Host, Options, Value, frame_time, image};
 
 const SEEDS: [u32; 4] = [0xff30_1810, 0xff20_70e0, 0xff40_1030, 0xff60_c0f0];
@@ -169,7 +169,7 @@ struct C { cell: vec2u, size: vec2u, colour: u32, _pad: u32, _pad2: vec2u }
 @fragment fn fs() -> @location(0) vec4f { return unpack4x8unorm(c.colour); }
 "#;
 const STORE_MANIFEST: &str = r#"{
-  "manifest_version": 3, "stream_version": 5, "wasm": "game.wasm",
+  "manifest_version": 4, "stream_version": 6, "wasm": "game.wasm",
   "pipelines": [
     { "name": "store", "shader": "store.wgsl", "kind": "compute", "entry": "store", "workgroup_size": [1, 1, 1],
       "uniform": { "binding": 0, "size": 16, "space": "uniform" },
@@ -290,4 +290,85 @@ fn times_more_passes_than_one_query_set_holds() {
         run.timings.iter().filter(|t| t.nanos <= 0.0).count()
     );
     assert_eq!(host.read_buffer(1).expect("reads back"), words(&(0..300).collect::<Vec<_>>()));
+}
+
+/// A render pipeline that draws `pos[i]` at depth `m.z` in colour `m.colour`, three times over:
+/// with no culling and no bias, culling back faces with a depth bias of -1000 steps, and culling
+/// back faces with none.
+const MESH_WGSL: &str = r#"
+struct M { colour: u32, z: f32, _pad: vec2u }
+@group(0) @binding(0) var<uniform> m: M;
+@group(0) @binding(1) var<storage, read> pos: array<vec2f>;
+@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f { return vec4f(pos[i], m.z, 1); }
+@fragment fn fs() -> @location(0) vec4f { return unpack4x8unorm(m.colour); }
+"#;
+const MESH_MANIFEST: &str = r#"{
+  "manifest_version": 4, "stream_version": 6, "wasm": "game.wasm",
+  "pipelines": [
+    { "name": "plain", "shader": "mesh.wgsl", "kind": "render", "vertex_entry": "vs", "fragment_entry": "fs",
+      "uniform": { "binding": 0, "size": 16, "space": "uniform" }, "bindings": [{ "binding": 1, "kind": "read" }] },
+    { "name": "biased", "shader": "mesh.wgsl", "kind": "render", "vertex_entry": "vs", "fragment_entry": "fs",
+      "cull": "back", "depth_bias": { "constant": -1000, "slope_scale": 0, "clamp": 0 },
+      "uniform": { "binding": 0, "size": 16, "space": "uniform" }, "bindings": [{ "binding": 1, "kind": "read" }] },
+    { "name": "culled", "shader": "mesh.wgsl", "kind": "render", "vertex_entry": "vs", "fragment_entry": "fs",
+      "cull": "back",
+      "uniform": { "binding": 0, "size": 16, "space": "uniform" }, "bindings": [{ "binding": 1, "kind": "read" }] }
+  ]
+}"#;
+
+/// Indexed indirect draws (stream v6), with each render pipeline's cull mode and depth bias
+/// (manifest v4): two quads from one index buffer, the left one's triangles facing the screen
+/// and the right one's facing away. Red covers both; green, culling back faces and biased
+/// towards the eye, covers only the left one, though it's at red's depth; blue, culling back
+/// faces with no bias, is hidden by green's depth.
+#[test]
+#[ignore = "needs the GPU"]
+fn indexed_indirect_draws_cull_and_bias() {
+    let f = |x: f32| x.to_bits();
+    let positions = [
+        [-1.0, -1.0],
+        [0.0, -1.0],
+        [0.0, 1.0],
+        [-1.0, 1.0], // left: counter-clockwise
+        [0.0, -1.0],
+        [1.0, -1.0],
+        [1.0, 1.0],
+        [0.0, 1.0], // right
+    ];
+    let pos: Vec<u32> = positions.iter().flat_map(|[x, y]: &[f32; 2]| [f(*x), f(*y)]).collect();
+    // The right quad's triangles run clockwise: they face away.
+    let indices = [0, 1, 2, 0, 2, 3, 4, 6, 5, 4, 7, 6];
+    let (w, h) = (8, 4);
+    let mut e = Encoder::new();
+    e.create_buffer(1, 64)
+        .write_buffer(1, 0, &words(&pos))
+        .create_buffer(2, 48)
+        .write_buffer(2, 0, &words(&indices))
+        .create_buffer(3, 32)
+        .write_buffer(3, 0, &words(&[12, 1, 0, 0, 0, 0, 0, 0]))
+        .create_texture(9, w, h, TextureFormat::Depth32Float)
+        .begin_pass(Pass {
+            color: stream::SCREEN,
+            keep_color: false,
+            clear: [0.0, 0.0, 0.0, 1.0],
+            depth: 9,
+            keep_depth: false,
+            clear_depth: 1.0,
+        });
+    let pos = [Binding::range(1, 0, 64)];
+    for (pipeline, colour) in [(0, 0xff00_00ff_u32), (1, 0xff00_ff00), (2, 0xffff_0000)] {
+        e.draw_indexed_indirect(pipeline, [2, 0, 48], 3, 0, &pos, &words(&[colour, f(0.5), 0, 0]));
+    }
+    e.present();
+    let wasm = wat::parse_str(common::wat::program(&[vec![e.finish()]])).expect("compiles");
+    let dir = common::build("indexed", MESH_MANIFEST, &[("mesh.wgsl", MESH_WGSL)], &wasm);
+    let mut host = Host::load(&dir).expect("loads");
+    let run = host.run_frames(&[0.0], w, h).expect("runs");
+    for y in 0..h {
+        for x in 0..w {
+            let want = if x < w / 2 { [0, 255, 0, 255] } else { [255, 0, 0, 255] };
+            assert_eq!(pixel(&run.frame, w, x, y), want, "pixel ({x}, {y})");
+        }
+    }
+    drop(host);
 }

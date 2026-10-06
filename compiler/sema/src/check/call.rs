@@ -2854,14 +2854,18 @@ impl<'p> Checker<'p> {
     }
 
     /// `draw(vs.bind(...), fs.bind(...), vertices: n)`, with `instances: m` or, for both,
-    /// `indirect: buf`.
+    /// `indirect: buf`; `indices: buf` with `indirect:` for an indexed draw; and the render
+    /// state, `cull:` and `depth_bias:`, build-time constants.
     fn check_draw(&mut self, args: &[ast::Arg], span: Span) -> Expr {
         let unit = self.p.types.unit;
         let u32_ty = self.p.types.u32;
         let counts = |a: &ast::Arg| {
-            a.name
-                .as_ref()
-                .is_some_and(|n| matches!(n.name.as_str(), "vertices" | "instances" | "indirect"))
+            a.name.as_ref().is_some_and(|n| {
+                matches!(
+                    n.name.as_str(),
+                    "vertices" | "instances" | "indirect" | "indices" | "cull" | "depth_bias"
+                )
+            })
         };
         // The form before binding: the shaders' arguments among `draw`'s own, by name.
         let extra: Vec<&ast::Arg> =
@@ -2933,6 +2937,9 @@ impl<'p> Checker<'p> {
         let mut vertices = None;
         let mut instances = None;
         let mut indirect: Option<Box<Expr>> = None;
+        let mut indices: Option<Box<Expr>> = None;
+        let mut state = RenderState::default();
+        let (mut cull_given, mut bias_given) = (false, false);
         let mut counts = Vec::new();
         for a in &args[2..] {
             let Some(n) = &a.name else {
@@ -2974,6 +2981,44 @@ impl<'p> Checker<'p> {
                     indirect = Some(Box::new(e));
                     counts.push(DrawCount::Indirect);
                 }
+                "indices" => {
+                    let e = self.check_expr(&a.value, None);
+                    if !self.counts_buffer(e.ty) && !matches!(self.kind(e.ty), TyKind::Error) {
+                        self.err(Diagnostic::new(
+                            codes::E0603,
+                            e.span,
+                            format!("`indices:` takes a `GpuBuffer<u32>` or a `GpuSpan<u32>` of the indices, not a `{}`", self.display(e.ty)),
+                        ));
+                    }
+                    if indices.is_some() {
+                        twice(self);
+                        continue;
+                    }
+                    indices = Some(Box::new(e));
+                    counts.push(DrawCount::Indices);
+                }
+                "cull" => {
+                    if cull_given {
+                        twice(self);
+                        continue;
+                    }
+                    cull_given = true;
+                    if let Some(c) = self.render_constant(&a.value, Lang::Cull) {
+                        state.cull = c[0] as u32;
+                    }
+                }
+                "depth_bias" => {
+                    if bias_given {
+                        twice(self);
+                        continue;
+                    }
+                    bias_given = true;
+                    if let Some(c) = self.render_constant(&a.value, Lang::DepthBias) {
+                        state.bias_constant = c[0] as i32;
+                        state.bias_slope = (c[1] as f32).to_bits();
+                        state.bias_clamp = (c[2] as f32).to_bits();
+                    }
+                }
                 "vertices" | "instances" => {
                     let e = self.check_expect(&a.value, u32_ty);
                     let (slot, c) = if n.name == "vertices" {
@@ -2990,6 +3035,16 @@ impl<'p> Checker<'p> {
                 }
                 _ => unreachable!("the shaders' arguments are bound (above)"),
             }
+        }
+        if indices.is_some() && indirect.is_none() {
+            self.err(
+                Diagnostic::new(
+                    codes::E0603,
+                    span,
+                    "an indexed draw takes its counts from `indirect:`",
+                )
+                .with_note("the buffer holds the index count, the instance count, the first index, the base vertex and the first instance"),
+            );
         }
         if indirect.is_some() && (vertices.is_some() || instances.is_some()) {
             self.err(Diagnostic::new(
@@ -3018,10 +3073,66 @@ impl<'p> Checker<'p> {
             vertices,
             instances,
             indirect,
+            indices,
+            state,
             args: bound,
             counts,
         };
         Expr { ty: unit, span, kind: ExprKind::Draw(Box::new(d)) }
+    }
+
+    /// A draw's `cull:` (`std::gpu::Cull`) or `depth_bias:` (`std::gpu::DepthBias`): a value
+    /// the pipeline holds, so a build-time constant, written as a variant or a struct of
+    /// number literals. A cull mode's variant index, or a bias's three fields.
+    fn render_constant(&mut self, value: &ast::Expr, lang: Lang) -> Option<[f64; 3]> {
+        let a = self.p.lang_adt(lang)?;
+        let ty = self.p.types.intern(TyKind::Adt(a, Vec::new()));
+        let e = self.check_expect(value, ty);
+        if matches!(self.kind(e.ty), TyKind::Error) {
+            return None;
+        }
+        /// A number literal, maybe negated.
+        fn number(e: &Expr) -> Option<f64> {
+            match &e.kind {
+                ExprKind::Lit(Lit::Int(n)) => Some(*n as f64),
+                ExprKind::Lit(Lit::Float(x, _)) => Some(*x),
+                ExprKind::Unary(ast::UnOp::Neg, inner) => number(inner).map(|x| -x),
+                _ => None,
+            }
+        }
+        let got = match (&e.kind, lang) {
+            (ExprKind::Adt { variant: Some(v), fields, .. }, Lang::Cull) if fields.is_empty() => {
+                Some([f64::from(*v), 0.0, 0.0])
+            }
+            (ExprKind::Adt { variant: None, fields, base: None, .. }, Lang::DepthBias) => {
+                match fields.iter().map(number).collect::<Option<Vec<f64>>>().as_deref() {
+                    Some(&[c, s, k]) => Some([c, s, k]),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        if got.is_none() {
+            let (what, example) = match lang {
+                Lang::Cull => ("cull mode", "`cull: Cull::Back`"),
+                _ => (
+                    "depth bias",
+                    "`depth_bias: DepthBias { constant: 4, slope: 2.0, clamp: 0.0 }`",
+                ),
+            };
+            self.err(
+                Diagnostic::new(
+                    codes::E0603,
+                    e.span,
+                    format!("a draw's {what} is a build-time constant, written where it draws"),
+                )
+                .with_note(
+                    "it's part of the draw's pipeline, which the host makes when the program loads",
+                )
+                .with_help(format!("write it out, e.g. {example}")),
+            );
+        }
+        got
     }
 }
 

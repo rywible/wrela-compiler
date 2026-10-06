@@ -14,11 +14,12 @@
 //!   existing, a buffer's range inside the buffer and starting at a multiple of 256 bytes
 //!   (WebGPU's default `minStorageBufferOffsetAlignment`), and exactly the uniform block's size
 //!   in uniform bytes; a dispatch's group counts are within the limit; an indirect command's
-//!   arguments fit in their buffer.
+//!   arguments fit in their buffer; an indexed draw's indices are a non-empty range of `u32`s
+//!   inside their buffer.
 //! - **Usage scopes** (WebGPU's rule): no buffer or texture is used both read-only and
 //!   read-write in one dispatch or one pass, none is bound read-write twice by one command, and
-//!   a pass's attachments aren't bound by its draws. An indirect command's arguments buffer is
-//!   read-only use.
+//!   a pass's attachments aren't bound by its draws. An indirect command's arguments buffer and
+//!   an indexed draw's index buffer are read-only use.
 //! - **Passes:** the clear colour and depth are finite; a pass's attachments exist, the colour
 //!   one isn't a depth texture and the depth one is, and they're the same size.
 //! - **Requests:** a storage path or a URL is relative, `/`-separated, with no empty, `.` or
@@ -272,6 +273,24 @@ impl Checker {
             Command::DrawIndirect { pipeline, arguments, offset, bindings, uniforms } => {
                 self.bindings(op, *pipeline, bindings, uniforms.len())?;
                 self.arguments(op, *arguments, *offset, 16)?;
+            }
+            Command::DrawIndexedIndirect {
+                pipeline,
+                indices,
+                index_offset,
+                index_size,
+                arguments,
+                offset,
+                bindings,
+                uniforms,
+            } => {
+                self.bindings(op, *pipeline, bindings, uniforms.len())?;
+                if *index_size == 0 {
+                    return err(format!("the index range of buffer {indices} is empty"));
+                }
+                self.range(op, *indices, *index_offset, *index_size, "reading indices:")?;
+                Self::used(&mut self.scope, op, "buffer", *indices, false)?;
+                self.arguments(op, *arguments, *offset, 20)?;
             }
             Command::Present | Command::EndPass => self.attachments.clear(),
             Command::StorageRead { path, .. } | Command::StorageWrite { path, .. } => {

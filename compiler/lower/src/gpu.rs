@@ -19,15 +19,23 @@ use wrela_sema::ty::*;
 /// A pipeline as CPU code names it.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum PipelineKey {
-    Compute { kernel: FnId, substs: Vec<TyId> },
-    Render { vertex: (FnId, Vec<TyId>), fragment: (FnId, Vec<TyId>) },
+    Compute {
+        kernel: FnId,
+        substs: Vec<TyId>,
+    },
+    Render {
+        vertex: (FnId, Vec<TyId>),
+        fragment: (FnId, Vec<TyId>),
+        /// Its cull mode and depth bias, written where it's drawn: one pipeline each.
+        state: wrela_sema::thir::RenderState,
+    },
 }
 
 impl PipelineKey {
     pub fn mentions(&self, f: FnId) -> bool {
         match self {
             PipelineKey::Compute { kernel, .. } => *kernel == f,
-            PipelineKey::Render { vertex, fragment } => vertex.0 == f || fragment.0 == f,
+            PipelineKey::Render { vertex, fragment, .. } => vertex.0 == f || fragment.0 == f,
         }
     }
 }
@@ -66,6 +74,8 @@ pub struct PipelineOut {
     /// A render pipeline whose fragment shader returns `Over`: its colour is blended over the
     /// target's.
     pub blend: bool,
+    /// A render pipeline's cull mode and depth bias.
+    pub state: wrela_sema::thir::RenderState,
     /// The functions its module instantiates, with their type arguments (`wrela query`).
     pub instances: Vec<(FnId, Vec<TyId>)>,
 }
@@ -296,7 +306,7 @@ fn interface(cx: &mut Cx, key: &PipelineKey) -> Interface {
         PipelineKey::Compute { kernel, substs } => {
             Interface::of(cx, &[(*kernel, substs.as_slice())], None, None)
         }
-        PipelineKey::Render { vertex, fragment } => {
+        PipelineKey::Render { vertex, fragment, .. } => {
             let vret = ret_type(cx, vertex.0, &vertex.1);
             let entries = [(vertex.0, vertex.1.as_slice()), (fragment.0, fragment.1.as_slice())];
             Interface::of(cx, &entries, Some(vret), Some(vret))
@@ -554,17 +564,25 @@ pub(crate) fn lower_draw(fl: &mut Fl, d: &mir::Draw, span: Span) {
     }
     let vs = (d.vertex.0, d.vertex.1.iter().map(|&a| fl.concrete(a)).collect::<Vec<_>>());
     let fs = (d.fragment.0, d.fragment.1.iter().map(|&a| fl.concrete(a)).collect::<Vec<_>>());
-    let (pindex, iface) = pipeline(fl.cx, PipelineKey::Render { vertex: vs, fragment: fs }, span);
+    let key = PipelineKey::Render { vertex: vs, fragment: fs, state: d.state };
+    let (pindex, iface) = pipeline(fl.cx, key, span);
+    // An indexed draw's indices: their buffer's handle, and the byte offset and size.
+    let mut counts = Vec::new();
+    if let Some((place, at)) = &d.indices {
+        let u32_ty = fl.cx.checked.program.types.u32;
+        let Some(b) = buffer_binding(fl, place, u32_ty, *at) else { return };
+        counts.extend(b);
+    }
     // The counts, or where their buffer holds them.
-    let (vertices, instances) = match &d.indirect {
+    match &d.indirect {
         Some((place, at)) => {
             let Some([handle, offset]) = indirect_binding(fl, place, *at) else { return };
-            (handle, offset)
+            counts.extend([handle, offset]);
         }
         None => {
             let Some(vertices) = fl.operand(&d.vertices) else { return };
             let Some(instances) = fl.operand(&d.instances) else { return };
-            (vertices, instances)
+            counts.extend([vertices, instances]);
         }
     };
     let arg = |e: usize, i: usize| d.args.iter().find(|a| a.0 == e && a.1 == i);
@@ -588,11 +606,16 @@ pub(crate) fn lower_draw(fl: &mut Fl, d: &mir::Draw, span: Span) {
     }
     handles.extend(fl.literal_binding(false).into_iter().flatten());
     let bindings = handles.len() as u32 / 3;
-    let mut args = vec![vertices, instances];
+    let mut args = counts;
     args.extend(handles);
     let uniform = uniform_block(fl, &fields, &vals, &mut args, "draw", span);
-    let op =
-        ir::HostOp::Draw { pipeline: pindex, bindings, uniform, indirect: d.indirect.is_some() };
+    let op = ir::HostOp::Draw {
+        pipeline: pindex,
+        bindings,
+        uniform,
+        indirect: d.indirect.is_some(),
+        indexed: d.indices.is_some(),
+    };
     fl.emit(ir::Stmt::Eval(ir::Expr::Host(op, args)));
 }
 
@@ -1281,6 +1304,9 @@ pub(crate) fn lower_pipeline(
         PipelineKey::Compute { .. } => lower_compute(cx, iface),
         PipelineKey::Render { .. } => lower_render(cx, iface),
     }?;
+    if let PipelineKey::Render { state, .. } = key {
+        out.state = *state;
+    }
     out.key = key.clone();
     out.sites = sites;
     Some(out)
@@ -1600,6 +1626,7 @@ fn lower_compute(cx: &mut Cx, iface: Rc<Interface>) -> Option<PipelineOut> {
         sites: Vec::new(),
         debug_flag: None,
         blend: false,
+        state: Default::default(),
         instances,
     })
 }
@@ -1670,6 +1697,7 @@ fn lower_render(cx: &mut Cx, iface: Rc<Interface>) -> Option<PipelineOut> {
         sites: Vec::new(),
         debug_flag: None,
         blend,
+        state: Default::default(),
         instances,
     })
 }

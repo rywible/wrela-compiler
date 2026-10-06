@@ -511,7 +511,8 @@ fn number(v: &serde_json::Value) -> f64 {
 
 /// A test-mode run's `results/<name>`, as JSON.
 pub fn result_json(results: &Path, name: &str) -> serde_json::Value {
-    let text = std::fs::read_to_string(results.join(name)).unwrap_or_else(|e| panic!("{name}: {e}"));
+    let text =
+        std::fs::read_to_string(results.join(name)).unwrap_or_else(|e| panic!("{name}: {e}"));
     serde_json::from_str(&text).unwrap_or_else(|e| panic!("{name} isn't JSON: {e}"))
 }
 

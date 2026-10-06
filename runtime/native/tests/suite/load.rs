@@ -14,16 +14,24 @@ fn load_with_manifest(name: &str, edit: impl Fn(&str) -> String) -> Error {
 #[test]
 fn rejects_another_manifest_version() {
     let err = load_with_manifest("manifest-v1", |m| {
-        m.replace("\"manifest_version\": 3", "\"manifest_version\": 1")
+        m.replace(
+            &format!("\"manifest_version\": {}", wrela_abi::manifest::VERSION),
+            "\"manifest_version\": 1",
+        )
     });
     assert!(matches!(&err, Error::Manifest(_)), "{err}");
-    assert!(err.to_string().contains("manifest version 1, but this host reads version 3"), "{err}");
+    let want =
+        format!("manifest version 1, but this host reads version {}", wrela_abi::manifest::VERSION);
+    assert!(err.to_string().contains(&want), "{err}");
 }
 
 #[test]
 fn rejects_another_stream_version() {
     let err = load_with_manifest("stream-v9", |m| {
-        m.replace("\"stream_version\": 5", "\"stream_version\": 9")
+        m.replace(
+            &format!("\"stream_version\": {}", wrela_abi::stream::VERSION),
+            "\"stream_version\": 9",
+        )
     });
     assert!(matches!(&err, Error::Manifest(_)), "{err}");
     assert!(err.to_string().contains("command stream version 9"), "{err}");

@@ -47,6 +47,9 @@ interface RenderParts {
   fragment: string;
   /** Its colour is drawn over the target's (the manifest's `blend`). */
   blend: boolean;
+  /** The manifest's `cull` and `depth_bias`. */
+  cull: GPUCullMode;
+  depthBias: { constant: number; slope_scale: number; clamp: number };
   /** By target formats: `colour|depth`, each a format or `none`. */
   variants: Map<string, GPURenderPipeline>;
 }
@@ -95,9 +98,20 @@ function renderDescriptor(
     label: name,
     layout: parts.layout,
     vertex: { module: parts.module, entryPoint: parts.vertex, buffers: [] },
-    // Triangle list, counter-clockwise front faces, no culling (the defaults).
-    primitive: { topology: "triangle-list" },
-    ...(depth === null ? {} : { depthStencil: { format: depth, depthWriteEnabled: true, depthCompare: "less" } }),
+    // Triangle list, counter-clockwise front faces (the default).
+    primitive: { topology: "triangle-list", cullMode: parts.cull },
+    ...(depth === null
+      ? {}
+      : {
+          depthStencil: {
+            format: depth,
+            depthWriteEnabled: true,
+            depthCompare: "less",
+            depthBias: parts.depthBias.constant,
+            depthBiasSlopeScale: parts.depthBias.slope_scale,
+            depthBiasClamp: parts.depthBias.clamp,
+          },
+        }),
     fragment: {
       module: parts.module,
       entryPoint: parts.fragment,
@@ -193,6 +207,8 @@ async function buildPipeline(device: GPUDevice, p: Pipeline, source: string): Pr
         vertex: p.vertex_entry,
         fragment: p.fragment_entry,
         blend: p.blend,
+        cull: p.cull,
+        depthBias: p.depth_bias,
         variants: new Map(),
       };
       // The screen's variant now, so a shader's errors come at load.
@@ -213,7 +229,10 @@ export function buildPipelines(device: GPUDevice, manifest: Manifest, shaders: s
 /** A draw waiting for its pass to end. */
 interface PendingDraw {
   pipeline: number;
-  how: { vertices: number; instances: number } | { buffer: number; offset: number };
+  how:
+    | { vertices: number; instances: number }
+    | { buffer: number; offset: number }
+    | { indices: number; indexOffset: number; indexSize: number; buffer: number; offset: number };
   bindings: Binding[];
   uniforms: Bytes;
 }
@@ -389,7 +408,11 @@ export class GpuExecutor {
             label: `buffer ${cmd.handle}`,
             size: cmd.size,
             usage:
-              GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC | GPUBufferUsage.INDIRECT,
+              GPUBufferUsage.STORAGE |
+              GPUBufferUsage.COPY_DST |
+              GPUBufferUsage.COPY_SRC |
+              GPUBufferUsage.INDIRECT |
+              GPUBufferUsage.INDEX,
           }),
         });
         return;
@@ -468,11 +491,20 @@ export class GpuExecutor {
         this.#pass = { pass: cmd.pass, draws: [] };
         return;
       case "Draw":
-      case "DrawIndirect": {
+      case "DrawIndirect":
+      case "DrawIndexedIndirect": {
         const how =
           cmd.op === "Draw"
             ? { vertices: cmd.vertices, instances: cmd.instances }
-            : { buffer: cmd.arguments, offset: cmd.offset };
+            : cmd.op === "DrawIndirect"
+              ? { buffer: cmd.arguments, offset: cmd.offset }
+              : {
+                  indices: cmd.indices,
+                  indexOffset: cmd.index_offset,
+                  indexSize: cmd.index_size,
+                  buffer: cmd.arguments,
+                  offset: cmd.offset,
+                };
         // The uniform bytes are a view into the program's memory: copy them.
         this.#pass?.draws.push({ pipeline: cmd.pipeline, how, bindings: cmd.bindings, uniforms: cmd.uniforms.slice() });
         return;
@@ -716,6 +748,7 @@ export class GpuExecutor {
       pipeline: this.#variant(d.pipeline, colorFormat, depth?.format ?? null),
       group: this.#bindGroup(d.pipeline, d.bindings),
       args: "buffer" in d.how ? this.#buffer(d.how.buffer) : null,
+      indices: "indices" in d.how ? this.#buffer(d.how.indices) : null,
     }));
     const [r, g, b, a] = pass.clear;
     const label = onScreen ? "screen pass" : "pass";
@@ -746,12 +779,15 @@ export class GpuExecutor {
             },
           }),
     });
-    for (const { draw: d, pipeline, group, args } of draws) {
+    for (const { draw: d, pipeline, group, args, indices } of draws) {
       const offsets = this.#push(d.uniforms);
       rp.setPipeline(pipeline);
       rp.setBindGroup(0, group, offsets);
       if ("vertices" in d.how) rp.draw(d.how.vertices, d.how.instances);
-      else rp.drawIndirect(args!, d.how.offset);
+      else if ("indices" in d.how) {
+        rp.setIndexBuffer(indices!, "uint32", d.how.indexOffset, d.how.indexSize);
+        rp.drawIndexedIndirect(args!, d.how.offset);
+      } else rp.drawIndirect(args!, d.how.offset);
     }
     rp.end();
     if (onScreen) {

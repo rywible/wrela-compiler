@@ -48,6 +48,7 @@ fn golden_bytes() {
         words(&[23, 28, 5, 11, 2]), // Post
         b"studio/edit\0".to_vec(),
         vec![123, 125, 0, 0],
+        words(&[24, 32, 1, 3, 0, 12, 3, 16, 0, 0]), // DrawIndexedIndirect
     ]
     .concat();
     expected.extend(words(&[VERSION, body.len() as u32]));

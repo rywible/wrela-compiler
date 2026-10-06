@@ -48,6 +48,8 @@ export function shapes(): Manifest {
         vertex_entry: "vs",
         fragment_entry: "fs",
         blend: false,
+        cull: "none",
+        depth_bias: { constant: 0, slope_scale: 0, clamp: 0 },
         uniform: { binding: 0, size: 16, space: "uniform" },
         bindings: [
           { binding: 1, kind: "read" },

@@ -211,6 +211,13 @@ export class Checker {
         this.#bindings(op, cmd.pipeline, cmd.bindings, cmd.uniforms.length);
         this.#arguments(op, cmd.arguments, cmd.offset, 16);
         return;
+      case "DrawIndexedIndirect":
+        this.#bindings(op, cmd.pipeline, cmd.bindings, cmd.uniforms.length);
+        if (cmd.index_size === 0) throw new CommandError(op, `the index range of buffer ${cmd.indices} is empty`);
+        this.#range(op, cmd.indices, cmd.index_offset, cmd.index_size, "reading indices:");
+        this.#used(op, "buffer", cmd.indices, false);
+        this.#arguments(op, cmd.arguments, cmd.offset, 20);
+        return;
       case "Present":
       case "EndPass":
         this.#attachments = [];

@@ -196,15 +196,20 @@ fn a_tick_log_replays_and_a_changed_record_fails_at_its_tick() {
 #[ignore = "needs Chrome, python3 and a GPU"]
 fn the_ticker_in_chrome_agrees_with_the_native_host() {
     let (dir, rel) = wrela_tests::page("compiler/tests/ticker", "ticker-chrome");
-    std::fs::copy(wrela_tests::repo_root().join("compiler/tests/ticker/keys.json"), dir.join("keys.json"))
-        .expect("copy the script");
+    std::fs::copy(
+        wrela_tests::repo_root().join("compiler/tests/ticker/keys.json"),
+        dir.join("keys.json"),
+    )
+    .expect("copy the script");
     let text = std::fs::read_to_string(dir.join("keys.json")).expect("the script");
     let script = wrela_host::parse_script(&text).expect("a script");
     let built = CpuBuild::load(&dir).expect("load");
     let native = built.record_ticks(300, &script, 2).expect("native ticks");
     let hex = |h: u64| format!("{h:016x}");
     let frames = 120;
-    for (fps, workers, paced) in [(60.0, 4, false), (30.0, 1, false), (144.0, 4, false), (60.0, 4, true)] {
+    for (fps, workers, paced) in
+        [(60.0, 4, false), (30.0, 1, false), (144.0, 4, false), (60.0, 4, true)]
+    {
         let run = wrela_tests::ChromeRun {
             workers,
             paced,

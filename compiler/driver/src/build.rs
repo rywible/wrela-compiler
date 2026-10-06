@@ -71,6 +71,16 @@ pub fn emit(l: &Lowered, sources: &SourceMap, simd: bool) -> BuildOutput {
                 vertex_entry: vertex.clone(),
                 fragment_entry: fragment.clone(),
                 blend: p.blend,
+                cull: match p.state.cull {
+                    1 => wrela_abi::manifest::Cull::Front,
+                    2 => wrela_abi::manifest::Cull::Back,
+                    _ => wrela_abi::manifest::Cull::None,
+                },
+                depth_bias: wrela_abi::manifest::DepthBias {
+                    constant: p.state.bias_constant,
+                    slope_scale: f32::from_bits(p.state.bias_slope),
+                    clamp: f32::from_bits(p.state.bias_clamp),
+                },
             },
             _ => {
                 diagnostics.push(Diagnostic::internal(format!(

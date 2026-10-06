@@ -102,6 +102,9 @@ pub fn walk_tys(e: &mut Expr, f: &mut impl FnMut(&mut TyId)) {
             if let Some(i) = &mut d.indirect {
                 walk_tys(i, f);
             }
+            if let Some(i) = &mut d.indices {
+                walk_tys(i, f);
+            }
             for (_, _, a) in &mut d.args {
                 walk_tys(a, f);
             }

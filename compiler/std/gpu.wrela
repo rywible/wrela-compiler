@@ -186,8 +186,57 @@ pub fn dispatch() {}
 /// Records a draw into the current pass: `draw(vs.bind(...), fs.bind(...), vertices: n)`, with
 /// `instances: m`, or `indirect: buf` for both counts. Each shader is bound to its own
 /// arguments, as `dispatch`'s kernel is; one that takes nothing is named alone.
+///
+/// `indices: buf` (a `GpuBuffer<u32>` or a `GpuSpan<u32>`) draws indexed, with `indirect:`
+/// holding the index count, the instance count, the first index, the base vertex and the first
+/// instance. `cull:` (a `Cull`, `Cull::None` if not given) and `depth_bias:` (a `DepthBias`,
+/// none if not given) are part of the draw's pipeline, so they're build-time constants,
+/// written out where it draws.
+///
+/// ```wrela
+/// use std::gpu::{ClipPosition, Cull, DepthBias, GpuBuffer, VertexIndex, buffer, draw}
+///
+/// @vertex
+/// fn corner(points: [vec2], i: VertexIndex) -> ClipPosition {
+///     ClipPosition { position: vec4(points[i.index].x, points[i.index].y, 0.5, 1.0) }
+/// }
+///
+/// @fragment
+/// fn white() -> vec4 {
+///     vec4(1.0, 1.0, 1.0, 1.0)
+/// }
+///
+/// fn quad(points: GpuBuffer<vec2>, indices: GpuBuffer<u32>, counts: GpuBuffer<u32>) {
+///     draw(
+///         corner.bind(points),
+///         white,
+///         indices: indices,
+///         indirect: counts,
+///         cull: Cull::Back,
+///         depth_bias: DepthBias { constant: 4, slope: 2.0, clamp: 0.0 },
+///     )
+/// }
+/// ```
 @intrinsic
 pub fn draw() {}
+
+/// Which triangles a draw drops by facing: a triangle whose corners run counter-clockwise on
+/// the target faces the front.
+pub enum Cull: Copy {
+    None,
+    Front,
+    Back,
+}
+
+/// How far a draw moves each fragment's depth, away from the eye for positive values:
+/// `constant` steps of the depth format's precision and `slope` times the triangle's depth
+/// slope, at most `clamp` in size (no limit when it's 0). A shadow map's pass uses it so a
+/// surface doesn't shadow itself.
+pub struct DepthBias: Copy {
+    pub constant: i32,
+    pub slope: f32,
+    pub clamp: f32,
+}
 
 /// Starts drawing to the screen, cleared to `clear`.
 @intrinsic

@@ -8,7 +8,8 @@ use crate::check::Checker;
 use crate::hash::StateHash;
 use crate::lines::Lines;
 use crate::manifest::{
-    BindingKind, Manifest, Pipeline, ResourceBinding, Stage, UniformBlock, UniformSpace,
+    BindingKind, Cull, DepthBias, Manifest, Pipeline, ResourceBinding, Stage, UniformBlock,
+    UniformSpace,
 };
 use crate::stream::{
     self, Binding, Command, Compare, Encoder, NONE, Pass, SCREEN, Sequencer, StreamError,
@@ -102,6 +103,20 @@ fn command(c: &Command) -> Value {
             "op": "DrawIndirect", "pipeline": pipeline, "arguments": arguments,
             "offset": offset, "bindings": bindings(bs), "uniforms": uniforms,
         }),
+        Command::DrawIndexedIndirect {
+            pipeline,
+            indices,
+            index_offset,
+            index_size,
+            arguments,
+            offset,
+            bindings: bs,
+            uniforms,
+        } => json!({
+            "op": "DrawIndexedIndirect", "pipeline": pipeline, "indices": indices,
+            "index_offset": index_offset, "index_size": index_size, "arguments": arguments,
+            "offset": offset, "bindings": bindings(bs), "uniforms": uniforms,
+        }),
         Command::ReadBuffer { request, handle, offset, size } => json!({
             "op": "ReadBuffer", "request": request, "handle": handle, "offset": offset,
             "size": size,
@@ -167,6 +182,7 @@ pub(crate) fn golden_batch() -> Vec<u8> {
         .fetch(4, "data/level.bin")
         .log("frame 3: 2 grazers, é")
         .post(5, "studio/edit", &[123, 125])
+        .draw_indexed_indirect(1, [3, 0, 12], 3, 16, &[], &[])
         .finish()
 }
 
@@ -352,8 +368,13 @@ pub fn check_manifest() -> Manifest {
         bindings: vec![bind(1, BindingKind::Read), bind(2, BindingKind::ReadWrite)],
         debug_flag: None,
     };
-    let render =
-        Stage::Render { vertex_entry: "vs".into(), fragment_entry: "fs".into(), blend: false };
+    let render = Stage::Render {
+        vertex_entry: "vs".into(),
+        fragment_entry: "fs".into(),
+        blend: false,
+        cull: Cull::None,
+        depth_bias: DepthBias::default(),
+    };
     m.pipelines.push(shape("draw", render.clone()));
     let compute = Stage::Compute { entry: "main".into(), workgroup_size: [64, 1, 1] };
     m.pipelines.push(shape("compute", compute.clone()));
@@ -417,6 +438,8 @@ fn checks() -> Value {
     };
     let b = |h: u32| Binding::range(h, 0, 512);
     let ab = [b(1), b(2)];
+    // Buffer 2 read, buffer 1 written.
+    let rw = [Binding::range(2, 256, 4), b(1)];
     let tex = [Binding::of(8), Binding::of(10), Binding::of(9), Binding::of(11)];
     let pass = Pass {
         color: 8,
@@ -435,20 +458,63 @@ fn checks() -> Value {
                 e.write_buffer(1, 504, &[7; 8])
                     .dispatch(1, [65_535, 1, 1], &ab, &u)
                     .copy_buffer(1, 0, 2, 256, 256)
-                    .dispatch_indirect(1, 2, 500, &[b(1), Binding::range(2, 256, 256)], &u)
+                    .dispatch_indirect(1, 1, 500, &ab, &u)
                     .write_texture(8, [1, 1], [2, 2], &[0; 16])
                     .begin_screen_pass([0.0; 4])
                     .draw(0, 3, 1, &ab, &u)
                     .draw(5, 3, 1, &tex, &[])
                     .present()
                     .begin_pass(Pass { color: stream::NONE, ..pass })
-                    .draw_indirect(0, 1, 496, &[Binding::range(2, 256, 4), b(1)], &u)
+                    .draw_indirect(0, 2, 496, &[Binding::range(2, 256, 4), b(1)], &u)
+                    .draw_indexed_indirect(
+                        0,
+                        [2, 256, 236],
+                        2,
+                        492,
+                        &[Binding::range(2, 256, 4), b(1)],
+                        &u,
+                    )
                     .end_pass()
                     .read_buffer(1, 1, 8, 16)
                     .destroy_buffer(1)
                     .destroy_buffer(2)
                     .destroy_texture(8)
                     .destroy_sampler(10);
+            }),
+        ),
+        check(
+            "indices past the end of their buffer",
+            &m,
+            &with_buffers(&|e| {
+                e.begin_screen_pass([0.0; 4]).draw_indexed_indirect(
+                    0,
+                    [2, 256, 260],
+                    2,
+                    0,
+                    &rw,
+                    &u,
+                );
+            }),
+        ),
+        check(
+            "an empty index range",
+            &m,
+            &with_buffers(&|e| {
+                e.begin_screen_pass([0.0; 4]).draw_indexed_indirect(0, [2, 0, 0], 2, 0, &rw, &u);
+            }),
+        ),
+        check(
+            "indexed arguments past the end of their buffer",
+            &m,
+            &with_buffers(&|e| {
+                e.begin_screen_pass([0.0; 4]).draw_indexed_indirect(0, [2, 0, 16], 2, 496, &rw, &u);
+            }),
+        ),
+        check(
+            "an index buffer the draw writes",
+            &m,
+            &with_buffers(&|e| {
+                e.begin_screen_pass([0.0; 4]).draw_indexed_indirect(0, [1, 0, 16], 2, 0, &rw, &u);
             }),
         ),
         check("a handle used twice", &m, &with_buffers(&|e| _ = e.create_buffer(1, 4))),
@@ -736,6 +802,8 @@ pub(crate) fn sample_manifest() -> Manifest {
             vertex_entry: "vs".into(),
             fragment_entry: "fs".into(),
             blend: false,
+            cull: Cull::None,
+            depth_bias: DepthBias::default(),
         },
         uniform: None,
         bindings: vec![
@@ -777,11 +845,17 @@ fn manifests() -> Vec<Value> {
         manifest("golden", golden.clone()),
         manifest(
             "another manifest version",
-            golden.replace("\"manifest_version\": 2", "\"manifest_version\": 1"),
+            golden.replace(
+                &format!("\"manifest_version\": {}", crate::manifest::VERSION),
+                &format!("\"manifest_version\": {}", crate::manifest::VERSION - 1),
+            ),
         ),
         manifest(
             "another stream version",
-            golden.replace("\"stream_version\": 4", "\"stream_version\": 9"),
+            golden.replace(
+                &format!("\"stream_version\": {}", stream::VERSION),
+                "\"stream_version\": 99",
+            ),
         ),
         manifest("too wide a workgroup", edited(&|m| compute(m, [512, 1, 1]))),
         manifest("too many invocations", edited(&|m| compute(m, [16, 16, 2]))),
@@ -789,6 +863,29 @@ fn manifests() -> Vec<Value> {
         manifest("a debug build's flag", edited(&|m| m.pipelines[0].debug_flag = Some(2))),
         manifest("a debug flag on a binding", edited(&|m| m.pipelines[0].debug_flag = Some(1))),
         manifest("a debug flag as a string", golden.replace("\"bindings\": [", "\"debug_flag\": \"2\",\n      \"bindings\": [")),
+        manifest(
+            "a render pipeline that culls back faces, with a depth bias",
+            edited(&|m| {
+                if let Stage::Render { cull, depth_bias, .. } = &mut m.pipelines[1].stage {
+                    *cull = Cull::Back;
+                    *depth_bias = DepthBias { constant: 4, slope_scale: 2.0, clamp: 0.0 };
+                }
+            }),
+        ),
+        manifest(
+            "a cull mode that isn't one",
+            golden.replace(
+                "\"fragment_entry\": \"fs\",",
+                "\"fragment_entry\": \"fs\", \"cull\": \"sideways\",",
+            ),
+        ),
+        manifest(
+            "a depth bias that isn't whole",
+            golden.replace(
+                "\"fragment_entry\": \"fs\",",
+                "\"fragment_entry\": \"fs\", \"depth_bias\": { \"constant\": 1.5, \"slope_scale\": 0, \"clamp\": 0 },",
+            ),
+        ),
         manifest(
             "a blended render pipeline",
             edited(&|m| {

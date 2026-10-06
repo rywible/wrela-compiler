@@ -58,6 +58,17 @@ export type Command =
   | { op: "EndPass" }
   | { op: "DispatchIndirect"; pipeline: number; arguments: number; offset: number; bindings: Binding[]; uniforms: Bytes }
   | { op: "DrawIndirect"; pipeline: number; arguments: number; offset: number; bindings: Binding[]; uniforms: Bytes }
+  | {
+      op: "DrawIndexedIndirect";
+      pipeline: number;
+      indices: number;
+      index_offset: number;
+      index_size: number;
+      arguments: number;
+      offset: number;
+      bindings: Binding[];
+      uniforms: Bytes;
+    }
   | { op: "ReadBuffer"; request: number; handle: number; offset: number; size: number }
   | { op: "StorageRead"; request: number; path: string }
   | { op: "StorageWrite"; request: number; path: string; data: Bytes }
@@ -230,6 +241,23 @@ export function decode(batch: Bytes): Command[] {
         cmd = { op: name, pipeline: w(0), arguments: w(1), offset: w(2), bindings, uniforms };
         break;
       }
+      case "DrawIndexedIndirect": {
+        const [bindings, uniforms] = bound(6);
+        if (w(2) % 4 !== 0 || w(3) % 4 !== 0) throw bad("the indices' offset and size must be multiples of 4");
+        if (w(5) % 4 !== 0) throw bad("the arguments' offset must be a multiple of 4");
+        cmd = {
+          op: name,
+          pipeline: w(0),
+          indices: w(1),
+          index_offset: w(2),
+          index_size: w(3),
+          arguments: w(4),
+          offset: w(5),
+          bindings,
+          uniforms,
+        };
+        break;
+      }
       case "BeginScreenPass": {
         exactly(4);
         cmd = { op: name, clear: [f(0), f(1), f(2), f(3)] };
@@ -359,6 +387,7 @@ export class Sequencer {
       }
       case "Draw":
       case "DrawIndirect":
+      case "DrawIndexedIndirect":
         if (this.#at === "outside") throw err("a draw must come inside a pass");
         return;
       case "Present":

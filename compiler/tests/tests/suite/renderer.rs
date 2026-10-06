@@ -84,3 +84,34 @@ fn both_hosts_time_each_pass() {
     assert!(browser.iter().all(|(_, _, n)| n.is_finite() && *n >= 0.0), "{browser:?}");
     assert!(browser.iter().any(|(_, _, n)| *n > 0.0), "every pass took no time: {browser:?}");
 }
+
+/// Indexed indirect draws, each pipeline with the cull mode and depth bias its draw states
+/// (compiler/tests/indexed): the left half green, the right red, in the native host and in
+/// Chrome, which agree on the frame and the state hash. Its three draws are three pipelines.
+#[test]
+#[ignore = "needs Chrome, python3 and a GPU"]
+fn indexed_draws_cull_and_bias_in_both_hosts() {
+    let (dir, rel) = page("compiler/tests/indexed", "indexed-hosts");
+    let manifest = std::fs::read_to_string(dir.join("manifest.json")).expect("manifest");
+    let manifest = wrela_abi::Manifest::parse(&manifest).expect("valid");
+    let states: Vec<String> = manifest
+        .pipelines
+        .iter()
+        .map(|p| match &p.stage {
+            wrela_abi::manifest::Stage::Render { cull, depth_bias, .. } => {
+                format!("{cull:?} {}", depth_bias.constant)
+            }
+            _ => "compute".into(),
+        })
+        .collect();
+    assert_eq!(states, ["None 0", "Back -1000", "Back 0"]);
+    let browser = run_in_chrome(&rel, 2, SIZE, SIZE, 60.0);
+    let run = native(&dir);
+    for (x, want) in [(8, [0, 255, 0, 255]), (SIZE - 8, [255, 0, 0, 255])] {
+        near(pixel(&run.frame, x, SIZE / 2), want, "the native host");
+        near(pixel(&browser.frame, x, SIZE / 2), want, "Chrome");
+    }
+    assert_eq!(browser.hash, run.hash_hex(), "the hosts' state hashes differ");
+    let diff = image::compare(&browser.frame, &run.frame).expect("same size");
+    assert!(diff.mean <= MEAN_LIMIT, "mean difference {:.4} over {MEAN_LIMIT}", diff.mean);
+}

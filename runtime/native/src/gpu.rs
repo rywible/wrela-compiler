@@ -31,7 +31,9 @@ use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex};
 use wgpu::util::align_to;
-use wrela_abi::manifest::{BindingKind, Manifest, ResourceBinding, Stage, UniformSpace};
+use wrela_abi::manifest::{
+    BindingKind, Cull, DepthBias, Manifest, ResourceBinding, Stage, UniformSpace,
+};
 use wrela_abi::stream::{self, Binding, Command, Compare, Opcode, Pass, TextureFormat};
 
 /// The screen's format: `SCREEN_FORMAT` (rgba8unorm) in wgpu's spelling.
@@ -100,6 +102,9 @@ enum Kind {
         fragment: String,
         /// Its colour is drawn over the target's (the manifest's `blend`).
         blend: bool,
+        /// The manifest's `cull` and `depth_bias`.
+        cull: Cull,
+        depth_bias: DepthBias,
         variants: HashMap<Targets, wgpu::RenderPipeline>,
     },
 }
@@ -108,8 +113,22 @@ enum Kind {
 type BindGroupKey = (u32, Box<[Binding]>);
 
 enum DrawHow {
-    Direct { vertices: u32, instances: u32 },
-    Indirect { buffer: u32, offset: u32 },
+    Direct {
+        vertices: u32,
+        instances: u32,
+    },
+    Indirect {
+        buffer: u32,
+        offset: u32,
+    },
+    /// `u32` indices: `size` bytes at `at` in buffer `indices`.
+    IndexedIndirect {
+        indices: u32,
+        at: u32,
+        size: u32,
+        buffer: u32,
+        offset: u32,
+    },
 }
 
 struct PendingDraw {
@@ -412,13 +431,15 @@ impl Gpu {
                     cache: None,
                 },
             )),
-            Stage::Render { vertex_entry, fragment_entry, blend } => {
+            Stage::Render { vertex_entry, fragment_entry, blend, cull, depth_bias } => {
                 let mut kind = Kind::Render {
                     module,
                     pipeline_layout,
                     vertex: vertex_entry.clone(),
                     fragment: fragment_entry.clone(),
                     blend: *blend,
+                    cull: *cull,
+                    depth_bias: *depth_bias,
                     variants: HashMap::new(),
                 };
                 // The screen's variant now, so a shader's errors come at load.
@@ -640,7 +661,8 @@ impl Gpu {
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_DST
                 | wgpu::BufferUsages::COPY_SRC
-                | wgpu::BufferUsages::INDIRECT,
+                | wgpu::BufferUsages::INDIRECT
+                | wgpu::BufferUsages::INDEX,
             mapped_at_creation: false,
         });
         self.resources.insert(handle, Resource::Buffer(buffer));
@@ -904,6 +926,16 @@ impl Gpu {
                     };
                     rp.draw_indirect(args, u64::from(offset));
                 }
+                DrawHow::IndexedIndirect { indices, at, size, buffer, offset } => {
+                    let (Resource::Buffer(index), Resource::Buffer(args)) =
+                        (&self.resources[&indices], &self.resources[&buffer])
+                    else {
+                        unreachable!("the checker checked {indices} and {buffer} are buffers");
+                    };
+                    let range = u64::from(at)..u64::from(at) + u64::from(size);
+                    rp.set_index_buffer(index.slice(range), wgpu::IndexFormat::Uint32);
+                    rp.draw_indexed_indirect(args, u64::from(offset));
+                }
             }
         }
         drop(rp);
@@ -1081,6 +1113,25 @@ impl Executor for Gpu {
                 let how = DrawHow::Indirect { buffer: *arguments, offset: *offset };
                 self.draw(*pipeline, how, bindings, uniforms);
             }
+            Command::DrawIndexedIndirect {
+                pipeline,
+                indices,
+                index_offset,
+                index_size,
+                arguments,
+                offset,
+                bindings,
+                uniforms,
+            } => {
+                let how = DrawHow::IndexedIndirect {
+                    indices: *indices,
+                    at: *index_offset,
+                    size: *index_size,
+                    buffer: *arguments,
+                    offset: *offset,
+                };
+                self.draw(*pipeline, how, bindings, uniforms);
+            }
             Command::Present => return self.end_pass(Opcode::Present),
             Command::EndPass => return self.end_pass(Opcode::EndPass),
             Command::DestroyBuffer { handle }
@@ -1114,7 +1165,17 @@ impl Executor for Gpu {
 
 /// Makes a render pipeline's variant for `targets`, if it isn't made yet.
 fn render_variant(device: &wgpu::Device, name: &str, kind: &mut Kind, targets: Targets) {
-    let Kind::Render { module, pipeline_layout, vertex, fragment, blend, variants } = kind else {
+    let Kind::Render {
+        module,
+        pipeline_layout,
+        vertex,
+        fragment,
+        blend,
+        cull,
+        depth_bias,
+        variants,
+    } = kind
+    else {
         return;
     };
     if variants.contains_key(&targets) {
@@ -1143,7 +1204,11 @@ fn render_variant(device: &wgpu::Device, name: &str, kind: &mut Kind, targets: T
         depth_write_enabled: Some(true),
         depth_compare: Some(wgpu::CompareFunction::Less),
         stencil: wgpu::StencilState::default(),
-        bias: wgpu::DepthBiasState::default(),
+        bias: wgpu::DepthBiasState {
+            constant: depth_bias.constant,
+            slope_scale: depth_bias.slope_scale,
+            clamp: depth_bias.clamp,
+        },
     });
     let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some(name),
@@ -1154,8 +1219,15 @@ fn render_variant(device: &wgpu::Device, name: &str, kind: &mut Kind, targets: T
             compilation_options: Default::default(),
             buffers: &[],
         },
-        // Triangle list, counter-clockwise front faces, no culling: WebGPU's defaults.
-        primitive: wgpu::PrimitiveState::default(),
+        // Triangle list, counter-clockwise front faces: WebGPU's defaults.
+        primitive: wgpu::PrimitiveState {
+            cull_mode: match cull {
+                Cull::None => None,
+                Cull::Front => Some(wgpu::Face::Front),
+                Cull::Back => Some(wgpu::Face::Back),
+            },
+            ..wgpu::PrimitiveState::default()
+        },
         depth_stencil,
         multisample: wgpu::MultisampleState::default(),
         fragment: Some(wgpu::FragmentState {

@@ -1,4 +1,4 @@
-// The manifest, version 2: parsing and validation. Mirrors `Manifest::parse` and
+// The manifest: parsing and validation. Mirrors `Manifest::parse` and
 // `Manifest::validate` in runtime/abi/src/manifest.rs: the same version rules, the same reading
 // of each field, the same checks in the same order, the same messages. (Only JSON that doesn't
 // parse is reported in each host's own words.)
@@ -35,7 +35,24 @@ export interface ResourceBinding {
 
 export type Stage =
   | { kind: "compute"; entry: string; workgroup_size: [number, number, number] }
-  | { kind: "render"; vertex_entry: string; fragment_entry: string; blend: boolean };
+  | {
+      kind: "render";
+      vertex_entry: string;
+      fragment_entry: string;
+      blend: boolean;
+      /** Which triangles it drops by facing. */
+      cull: Cull;
+      depth_bias: DepthBias;
+    };
+
+export type Cull = "none" | "front" | "back";
+
+/** WebGPU's `depthBias`, `depthBiasSlopeScale` and `depthBiasClamp`. */
+export interface DepthBias {
+  constant: number;
+  slope_scale: number;
+  clamp: number;
+}
 
 export type Pipeline = Stage & {
   name: string;
@@ -141,10 +158,29 @@ function pipeline(v: unknown, i: number): Pipeline {
     const sizes = ws.map((s: unknown, k) => asU32(s, `${where}.workgroup_size[${k}]`));
     stage = { kind, entry: str(o, "entry", where), workgroup_size: [sizes[0]!, sizes[1]!, sizes[2]!] };
   } else {
+    const vertex_entry = str(o, "vertex_entry", where);
+    const fragment_entry = str(o, "fragment_entry", where);
     // A missing `blend` is false.
     const b = o["blend"] ?? false;
     if (typeof b !== "boolean") throw new ManifestError(`${where}.blend must be true or false`);
-    stage = { kind, vertex_entry: str(o, "vertex_entry", where), fragment_entry: str(o, "fragment_entry", where), blend: b };
+    // A missing `cull` is none, and a missing `depth_bias` none.
+    const cull = o["cull"] === undefined ? "none" : oneOf(o, "cull", where, ["none", "front", "back"] as const);
+    let depth_bias: DepthBias = { constant: 0, slope_scale: 0, clamp: 0 };
+    if (o["depth_bias"] !== undefined) {
+      const bw = `${where}.depth_bias`;
+      const bo = object(o["depth_bias"], bw);
+      const c = field(bo, "constant", bw);
+      if (typeof c !== "number" || !Number.isInteger(c) || c < -0x8000_0000 || c > 0x7fff_ffff) {
+        throw new ManifestError(`${bw}.constant must be an i32`);
+      }
+      const finite = (key: string) => {
+        const x = field(bo, key, bw);
+        if (typeof x !== "number" || !Number.isFinite(Math.fround(x))) throw new ManifestError(`${bw}.${key} must be a finite number`);
+        return Math.fround(x);
+      };
+      depth_bias = { constant: c, slope_scale: finite("slope_scale"), clamp: finite("clamp") };
+    }
+    stage = { kind, vertex_entry, fragment_entry, blend: b, cull, depth_bias };
   }
   // A missing `debug_flag` is read as null.
   const d = o["debug_flag"] ?? null;

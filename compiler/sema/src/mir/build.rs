@@ -1238,7 +1238,7 @@ impl<'a> Builder<'a> {
             let p = self.gpu_arg(a)?;
             args.push((*e, *i, p, a.span));
         }
-        let (mut vertices, mut instances, mut indirect) = (None, None, None);
+        let (mut vertices, mut instances, mut indirect, mut indices) = (None, None, None, None);
         for c in &d.counts {
             match c {
                 thir::DrawCount::Vertices => vertices = Some(self.value(&d.vertices, Want::Read)?),
@@ -1248,6 +1248,11 @@ impl<'a> Builder<'a> {
                 thir::DrawCount::Indirect => {
                     if let Some(ind) = &d.indirect {
                         indirect = Some((self.borrowed_place(ind)?, ind.span));
+                    }
+                }
+                thir::DrawCount::Indices => {
+                    if let Some(ind) = &d.indices {
+                        indices = Some((self.borrowed_place(ind)?, ind.span));
                     }
                 }
             }
@@ -1266,6 +1271,8 @@ impl<'a> Builder<'a> {
             instances: instances?,
             args,
             indirect,
+            indices,
+            state: d.state,
         })))
     }
 

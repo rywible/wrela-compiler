@@ -241,6 +241,7 @@ fn rvalue_uses(body: &Body, r: &Rvalue, out: &mut Vec<Local>) {
             operand_uses(&d.instances, out);
             d.args.iter().for_each(|(_, _, p, _)| place_uses(p, out));
             d.indirect.iter().for_each(|(p, _)| place_uses(p, out));
+            d.indices.iter().for_each(|(p, _)| place_uses(p, out));
         }
     }
 }
@@ -1979,6 +1980,9 @@ fn rvalue_places(body: &Body, r: &Rvalue, add: &mut dyn FnMut(&Place, bool)) {
                 add(p, false);
             }
             if let Some((p, _)) = &d.indirect {
+                add(p, false);
+            }
+            if let Some((p, _)) = &d.indices {
                 add(p, false);
             }
         }

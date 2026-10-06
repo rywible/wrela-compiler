@@ -1,4 +1,4 @@
-//! # The command stream, version 5
+//! # The command stream, version 6
 //!
 //! A program records GPU work as commands in its own memory and hands them to the host in
 //! batches through `wrela.submit(ptr, len)` (D-099). The host decodes each batch in bulk into
@@ -41,6 +41,7 @@
 //! | 21 | `Fetch` | `request`, `url length`, then the URL's UTF-8, padded to 4 bytes: the bytes at the URL, relative to the build, a request |
 //! | 22 | `Log` | `length`, then a line of UTF-8, padded to 4 bytes: shown on the host's console (`std::io::print`) |
 //! | 23 | `Post` | `request`, `url length`, `body length`, then the URL's UTF-8 and the body, each padded to 4 bytes: sends the body to the host that serves the build, at the URL relative to the build; the answer is the host's reply, a request |
+//! | 24 | `DrawIndexedIndirect` | `pipeline`, `index buffer`, `index offset`, `index size` (bytes of `u32` indices there, each a multiple of 4), `arguments buffer`, `offset` (index count, instance count, first index, base vertex, first instance there), the bindings, the uniforms |
 //!
 //! **Requests** (language.md §6.15) are answered on a later call: the program polls each with
 //! the imports `wrela.request_status(request) -> i32` (-1 while it's pending, -2 if it failed,
@@ -61,8 +62,8 @@
 //!   a draw a render pipeline.
 //! - **Order:** commands take effect in the order they're recorded. A host that batches GPU
 //!   work must flush recorded dispatches before applying a later `WriteBuffer`.
-//! - **Passes:** `BeginScreenPass` or `BeginPass`, then any number of `Draw`s and
-//!   `DrawIndirect`s, then `Present` (a pass on the screen) or `EndPass` (any other). Draws
+//! - **Passes:** `BeginScreenPass` or `BeginPass`, then any number of `Draw`s,
+//!   `DrawIndirect`s and `DrawIndexedIndirect`s, then `Present` (a pass on the screen) or `EndPass` (any other). Draws
 //!   happen only inside a pass; everything else only outside one. A pass closes in the same
 //!   call that opened it (a browser's canvas texture lives only until the frame's task ends):
 //!   [`Sequencer::end_frame`].
@@ -73,7 +74,7 @@
 use std::fmt;
 
 /// The stream format's version. Bumped by any change a host could notice.
-pub const VERSION: u32 = 5;
+pub const VERSION: u32 = 6;
 pub const MAGIC: [u8; 4] = *b"WRCS";
 /// The batch header: magic, version, body length.
 pub const HEADER_LEN: usize = 12;
@@ -111,10 +112,11 @@ pub enum Opcode {
     Fetch = 21,
     Log = 22,
     Post = 23,
+    DrawIndexedIndirect = 24,
 }
 
 impl Opcode {
-    pub const ALL: [Opcode; 23] = [
+    pub const ALL: [Opcode; 24] = [
         Opcode::CreateBuffer,
         Opcode::WriteBuffer,
         Opcode::Dispatch,
@@ -138,6 +140,7 @@ impl Opcode {
         Opcode::Fetch,
         Opcode::Log,
         Opcode::Post,
+        Opcode::DrawIndexedIndirect,
     ];
 
     pub fn from_u32(v: u32) -> Option<Opcode> {
@@ -169,6 +172,7 @@ impl Opcode {
             Opcode::Fetch => "Fetch",
             Opcode::Log => "Log",
             Opcode::Post => "Post",
+            Opcode::DrawIndexedIndirect => "DrawIndexedIndirect",
         }
     }
 }
@@ -360,6 +364,17 @@ pub enum Command<'a> {
         bindings: Vec<Binding>,
         uniforms: &'a [u8],
     },
+    /// Indexed: `u32` indices, `index_size` bytes at `index_offset` in buffer `indices`.
+    DrawIndexedIndirect {
+        pipeline: u32,
+        indices: u32,
+        index_offset: u32,
+        index_size: u32,
+        arguments: u32,
+        offset: u32,
+        bindings: Vec<Binding>,
+        uniforms: &'a [u8],
+    },
     ReadBuffer {
         request: u32,
         handle: u32,
@@ -409,6 +424,7 @@ impl Command<'_> {
             Command::EndPass => Opcode::EndPass,
             Command::DispatchIndirect { .. } => Opcode::DispatchIndirect,
             Command::DrawIndirect { .. } => Opcode::DrawIndirect,
+            Command::DrawIndexedIndirect { .. } => Opcode::DrawIndexedIndirect,
             Command::ReadBuffer { .. } => Opcode::ReadBuffer,
             Command::StorageRead { .. } => Opcode::StorageRead,
             Command::StorageWrite { .. } => Opcode::StorageWrite,
@@ -627,6 +643,25 @@ pub fn decode(batch: &[u8]) -> Result<Vec<Command<'_>>, StreamError> {
                     Command::DrawIndirect { pipeline, arguments, offset, bindings, uniforms }
                 }
             }
+            Opcode::DrawIndexedIndirect => {
+                let (bindings, uniforms) = bindings_and_uniforms(p, 6).map_err(bad)?;
+                if w(2) % 4 != 0 || w(3) % 4 != 0 {
+                    return Err(bad("the indices' offset and size must be multiples of 4"));
+                }
+                if w(5) % 4 != 0 {
+                    return Err(bad("the arguments' offset must be a multiple of 4"));
+                }
+                Command::DrawIndexedIndirect {
+                    pipeline: w(0),
+                    indices: w(1),
+                    index_offset: w(2),
+                    index_size: w(3),
+                    arguments: w(4),
+                    offset: w(5),
+                    bindings,
+                    uniforms,
+                }
+            }
             Opcode::BeginScreenPass => {
                 exactly(4)?;
                 Command::BeginScreenPass { clear: [0, 1, 2, 3].map(|i| f32::from_bits(w(i))) }
@@ -827,10 +862,18 @@ impl Sequencer {
             (Command::BeginScreenPass { .. } | Command::BeginPass(_), _) => {
                 err("a pass is already open")
             }
-            (Command::Draw { .. } | Command::DrawIndirect { .. }, Place::Outside) => {
-                err("a draw must come inside a pass")
-            }
-            (Command::Draw { .. } | Command::DrawIndirect { .. }, _) => Ok(()),
+            (
+                Command::Draw { .. }
+                | Command::DrawIndirect { .. }
+                | Command::DrawIndexedIndirect { .. },
+                Place::Outside,
+            ) => err("a draw must come inside a pass"),
+            (
+                Command::Draw { .. }
+                | Command::DrawIndirect { .. }
+                | Command::DrawIndexedIndirect { .. },
+                _,
+            ) => Ok(()),
             (Command::Present, Place::ScreenPass) => {
                 self.at = Place::Outside;
                 Ok(())
@@ -1044,6 +1087,23 @@ impl Encoder {
         let mut words = vec![pipeline, arguments, offset];
         Self::bound(&mut words, bindings, uniforms);
         self.command(Opcode::DrawIndirect, &words, uniforms);
+        self
+    }
+
+    /// `indices` is the index buffer's handle, offset and size in bytes; `arguments` and
+    /// `offset` say where the counts are.
+    pub fn draw_indexed_indirect(
+        &mut self,
+        pipeline: u32,
+        indices: [u32; 3],
+        arguments: u32,
+        offset: u32,
+        bindings: &[Binding],
+        uniforms: &[u8],
+    ) -> &mut Self {
+        let mut words = vec![pipeline, indices[0], indices[1], indices[2], arguments, offset];
+        Self::bound(&mut words, bindings, uniforms);
+        self.command(Opcode::DrawIndexedIndirect, &words, uniforms);
         self
     }
 

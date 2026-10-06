@@ -1229,10 +1229,18 @@ pub(super) fn host(
             fe.ins.push(I::Call(fe.at.helpers.write));
         }
         ir::HostOp::Dispatch { pipeline, bindings, uniform, indirect }
-        | ir::HostOp::Draw { pipeline, bindings, uniform, indirect } => {
+        | ir::HostOp::Draw { pipeline, bindings, uniform, indirect, .. } => {
             let dispatch = matches!(op, ir::HostOp::Dispatch { .. });
-            // The pipeline, then the counts: three groups, two counts, or a buffer and offset.
-            let fixed = if dispatch && !*indirect { 4 } else { 3 };
+            let indexed = matches!(op, ir::HostOp::Draw { indexed: true, .. });
+            // The pipeline, then the counts: three groups, two counts, or a buffer and offset
+            // (after the index buffer's handle, offset and size, for an indexed draw).
+            let fixed = if indexed {
+                6
+            } else if dispatch && !*indirect {
+                4
+            } else {
+                3
+            };
             let nb = *bindings as usize;
             let usize_ = uniform.map_or(0, |t| round_up(16, layout(&fe.m.types, t).size));
             // Lowering keeps the uniforms small enough (`ir::MAX_UNIFORM_BYTES`) for the
@@ -1245,6 +1253,7 @@ pub(super) fn host(
                 (true, false) => Opcode::Dispatch,
                 (true, true) => Opcode::DispatchIndirect,
                 (false, false) => Opcode::Draw,
+                (false, true) if indexed => Opcode::DrawIndexedIndirect,
                 (false, true) => Opcode::DrawIndirect,
             };
             let a = begin_command(fe, opc, payload);

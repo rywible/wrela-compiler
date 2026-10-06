@@ -495,7 +495,7 @@ fn summarize(
                 wrela_lower::PipelineKey::Compute { kernel, substs } => {
                     ("compute", vec![entry(*kernel, substs)])
                 }
-                wrela_lower::PipelineKey::Render { vertex, fragment } => {
+                wrela_lower::PipelineKey::Render { vertex, fragment, .. } => {
                     ("render", vec![entry(vertex.0, &vertex.1), entry(fragment.0, &fragment.1)])
                 }
             };

@@ -7,8 +7,8 @@ import { readFixtureText } from "./fixtures.ts";
 
 /** The Rust crate's golden manifest (runtime/abi/src/manifest.rs, `golden_json`). */
 const GOLDEN = `{
-  "manifest_version": 3,
-  "stream_version": 5,
+  "manifest_version": 4,
+  "stream_version": 6,
   "wasm": "game.wasm",
   "pipelines": [
     {
@@ -41,8 +41,8 @@ function expectInvalid(f: () => unknown, text: string): void {
 
 test("parses the Rust crate's golden manifest", () => {
   expect(sample()).toEqual({
-    manifest_version: 3,
-    stream_version: 5,
+    manifest_version: 4,
+    stream_version: 6,
     wasm: "game.wasm",
     pipelines: [
       {
@@ -62,6 +62,8 @@ test("parses the Rust crate's golden manifest", () => {
         vertex_entry: "vs",
         fragment_entry: "fs",
         blend: false,
+        cull: "none",
+        depth_bias: { constant: 0, slope_scale: 0, clamp: 0 },
         uniform: null,
         bindings: [
           { binding: 0, kind: "texture" },

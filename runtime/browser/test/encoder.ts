@@ -114,6 +114,11 @@ export class Encoder {
     return this.#command(Opcode.DrawIndirect, [pipeline, args, offset, ...Encoder.#bound(bindings, uniforms)], uniforms);
   }
 
+  /** `indices`: the index buffer's handle, offset and size in bytes. */
+  drawIndexedIndirect(pipeline: number, indices: [number, number, number], args: number, offset: number, bindings: B[], uniforms: Uint8Array): this {
+    return this.#command(Opcode.DrawIndexedIndirect, [pipeline, ...indices, args, offset, ...Encoder.#bound(bindings, uniforms)], uniforms);
+  }
+
   readBuffer(request: number, handle: number, offset: number, size: number): this {
     return this.#command(Opcode.ReadBuffer, [request, handle, offset, size]);
   }

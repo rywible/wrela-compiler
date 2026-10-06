@@ -1,0 +1,75 @@
+// Indexed indirect draws with a cull mode and a depth bias (compiler/tests/tests/suite/
+// renderer.rs): two quads from one index buffer, the left one's triangles facing the screen and
+// the right one's facing away, drawn three times at one depth. Red covers both. Green culls
+// back faces and is biased towards the eye, so it covers the left quad though it's at red's
+// depth. Blue culls back faces with no bias, so green's depth hides it.
+use std::gpu::{
+    ClipPosition, Cull, DepthBias, GpuBuffer, VertexIndex, begin_screen_pass_with_depth, buffer,
+    depth_texture, draw, write,
+}
+
+@vertex
+fn corner(points: [vec2], z: f32, v: VertexIndex) -> ClipPosition {
+    let p = points[v.index]
+    ClipPosition { position: vec4(p.x, p.y, z, 1.0) }
+}
+
+@fragment
+fn flat(colour: vec4) -> vec4 {
+    colour
+}
+
+pub struct Scene {
+    points: GpuBuffer<vec2>,
+    indices: GpuBuffer<u32>,
+    counts: GpuBuffer<u32>,
+}
+
+pub fn init() -> Scene {
+    var points: GpuBuffer<vec2> = buffer(8)
+    let corners = [
+        vec2(-1.0, -1.0),
+        vec2(0.0, -1.0),
+        vec2(0.0, 1.0),
+        vec2(-1.0, 1.0),
+        vec2(0.0, -1.0),
+        vec2(1.0, -1.0),
+        vec2(1.0, 1.0),
+        vec2(0.0, 1.0),
+    ]
+    write(mut points, 0, corners)
+    // The left quad's triangles run counter-clockwise, the right one's clockwise.
+    var indices: GpuBuffer<u32> = buffer(12)
+    let order: [u32; 12] = [0, 1, 2, 0, 2, 3, 4, 6, 5, 4, 7, 6]
+    write(mut indices, 0, order)
+    // The index count, the instance count, the first index, the base vertex, the first instance.
+    var counts: GpuBuffer<u32> = buffer(5)
+    let args: [u32; 5] = [12, 1, 0, 0, 0]
+    write(mut counts, 0, args)
+    Scene { points: take points, indices: take indices, counts: take counts }
+}
+
+pub fn frame(scene: mut Scene, time: f32, width: u32, height: u32) {
+    var depth = depth_texture(width, height)
+    let pass = begin_screen_pass_with_depth(mut depth)
+    let red = vec4(1.0, 0.0, 0.0, 1.0)
+    let green = vec4(0.0, 1.0, 0.0, 1.0)
+    let blue = vec4(0.0, 0.0, 1.0, 1.0)
+    draw(corner.bind(scene.points, 0.5), flat.bind(red), indices: scene.indices, indirect: scene.counts)
+    draw(
+        corner.bind(scene.points, 0.5),
+        flat.bind(green),
+        indices: scene.indices,
+        indirect: scene.counts,
+        cull: Cull::Back,
+        depth_bias: DepthBias { constant: -1000, slope: 0.0, clamp: 0.0 },
+    )
+    draw(
+        corner.bind(scene.points, 0.5),
+        flat.bind(blue),
+        indices: scene.indices,
+        indirect: scene.counts,
+        cull: Cull::Back,
+    )
+    pass.present()
+}

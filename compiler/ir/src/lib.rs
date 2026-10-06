@@ -295,13 +295,14 @@ pub enum HostOp {
     /// (`u32`s); how many, a `u32`.
     Input,
     /// Args: vertices, instances (or, `indirect`, the handle and byte offset of a buffer
-    /// holding the counts), each binding's handle, offset and size, then the uniform block
-    /// value.
+    /// holding the counts, after the index buffer's handle, byte offset and size when
+    /// `indexed`), each binding's handle, offset and size, then the uniform block value.
     Draw {
         pipeline: u32,
         bindings: u32,
         uniform: Option<TypeId>,
         indirect: bool,
+        indexed: bool,
     },
     Present,
 }

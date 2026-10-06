@@ -80,8 +80,8 @@ test("buffers are created zeroed, as storage that can be copied both ways and ho
   run(new Encoder().createBuffer(3, 64));
   const b = device.buffers.find((b) => b.label === "buffer 3")!;
   expect(b.size).toBe(64);
-  const { STORAGE, COPY_DST, COPY_SRC, INDIRECT } = GPUBufferUsage;
-  expect(b.usage).toBe(STORAGE | COPY_DST | COPY_SRC | INDIRECT);
+  const { STORAGE, COPY_DST, COPY_SRC, INDIRECT, INDEX } = GPUBufferUsage;
+  expect(b.usage).toBe(STORAGE | COPY_DST | COPY_SRC | INDIRECT | INDEX);
 });
 
 test("a write after a dispatch submits the dispatch first", async () => {

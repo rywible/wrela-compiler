@@ -1,4 +1,4 @@
-//! # The manifest, version 3
+//! # The manifest, version 4
 //!
 //! `manifest.json` describes everything game-specific a host needs besides the WASM: each
 //! pipeline's shader, entry points and bindings (D-099). The runtime reads it at load; nothing
@@ -24,13 +24,19 @@
 //!   pipeline is drawn with. A render pipeline with `"blend": true` draws its colour over what's
 //!   in the target (alpha blending, straight alpha: `src × src.a + dst × (1 − src.a)` for the
 //!   colour, `src.a + dst.a × (1 − src.a)` for alpha); without it, its colour replaces it.
+//! - A render pipeline's `"cull"` drops triangles by facing (`"none"`, the default, `"front"`
+//!   or `"back"`; a triangle whose vertices run counter-clockwise on the target faces the
+//!   front). Its `"depth_bias"` moves each fragment's depth by `constant` steps of the depth
+//!   format and `slope_scale` times the triangle's depth slope, at most `clamp` (when not 0)
+//!   in size: WebGPU's `depthBias`, `depthBiasSlopeScale` and `depthBiasClamp`. Neither may be
+//!   given at run time, so a program states both where it draws (language.md §12).
 
 use crate::Limits;
 use serde::Serialize;
 use serde_json::{Map, Value};
 use std::fmt;
 
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
 /// The screen's texture format, in WebGPU's spelling.
 pub const SCREEN_FORMAT: &str = "rgba8unorm";
 /// WebGPU's default limits that the manifest is checked against ([`Limits::DEFAULT`]).
@@ -86,7 +92,42 @@ pub enum Stage {
         /// Draws its colour over the target's (alpha blending) rather than replacing it.
         #[serde(skip_serializing_if = "std::ops::Not::not")]
         blend: bool,
+        #[serde(skip_serializing_if = "Cull::is_none")]
+        cull: Cull,
+        #[serde(skip_serializing_if = "DepthBias::is_none")]
+        depth_bias: DepthBias,
     },
+}
+
+/// Which triangles a render pipeline drops by facing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Cull {
+    #[default]
+    None,
+    Front,
+    Back,
+}
+
+impl Cull {
+    pub fn is_none(&self) -> bool {
+        *self == Cull::None
+    }
+}
+
+/// How far a render pipeline moves each fragment's depth (WebGPU's `depthBias`,
+/// `depthBiasSlopeScale` and `depthBiasClamp`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
+pub struct DepthBias {
+    pub constant: i32,
+    pub slope_scale: f32,
+    pub clamp: f32,
+}
+
+impl DepthBias {
+    pub fn is_none(&self) -> bool {
+        *self == DepthBias::default()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -364,6 +405,14 @@ mod read {
         as_u32(field(o, key, place)?, &format!("{place}.{key}"))
     }
 
+    /// A finite number, as an f32.
+    fn finite(o: &Json, key: &str, place: &str) -> Result<f32> {
+        match field(o, key, place)?.as_f64() {
+            Some(x) if (x as f32).is_finite() => Ok(x as f32),
+            _ => fail(format!("{place}.{key} must be a finite number")),
+        }
+    }
+
     fn string(o: &Json, key: &str, place: &str) -> Result<String> {
         match field(o, key, place)? {
             Value::String(s) => Ok(s.clone()),
@@ -452,6 +501,37 @@ mod read {
                     Value::Bool(b) => *b,
                     _ => return fail(format!("{place}.blend must be true or false")),
                 },
+                // A missing `cull` is none, and a missing `depth_bias` none.
+                cull: match o.get("cull") {
+                    None => Cull::None,
+                    Some(_) => one_of(
+                        o,
+                        "cull",
+                        &place,
+                        &[("none", Cull::None), ("front", Cull::Front), ("back", Cull::Back)],
+                    )?,
+                },
+                depth_bias: match o.get("depth_bias") {
+                    None => DepthBias::default(),
+                    Some(v) => {
+                        let bp = format!("{place}.depth_bias");
+                        let bo = object(v, &bp)?;
+                        let constant = match field(bo, "constant", &bp)?.as_f64() {
+                            Some(x)
+                                if x.fract() == 0.0
+                                    && (f64::from(i32::MIN)..=f64::from(i32::MAX)).contains(&x) =>
+                            {
+                                x as i32
+                            }
+                            _ => return fail(format!("{bp}.constant must be an i32")),
+                        };
+                        DepthBias {
+                            constant,
+                            slope_scale: finite(bo, "slope_scale", &bp)?,
+                            clamp: finite(bo, "clamp", &bp)?,
+                        }
+                    }
+                },
             },
         };
         // A missing `debug_flag` is read as null.
@@ -491,8 +571,8 @@ mod tests {
     fn golden_json() {
         let json = sample().to_json();
         let expected = r#"{
-  "manifest_version": 3,
-  "stream_version": 5,
+  "manifest_version": 4,
+  "stream_version": 6,
   "wasm": "game.wasm",
   "pipelines": [
     {
@@ -544,9 +624,14 @@ mod tests {
 
     #[test]
     fn rejects_other_versions() {
-        let json = sample().to_json().replace("\"manifest_version\": 3", "\"manifest_version\": 1");
+        let json = sample()
+            .to_json()
+            .replace(&format!("\"manifest_version\": {VERSION}"), "\"manifest_version\": 1");
         assert!(Manifest::parse(&json).is_err());
-        let json = sample().to_json().replace("\"stream_version\": 5", "\"stream_version\": 9");
+        let json = sample().to_json().replace(
+            &format!("\"stream_version\": {}", crate::stream::VERSION),
+            "\"stream_version\": 99",
+        );
         assert!(Manifest::parse(&json).is_err());
     }
 
