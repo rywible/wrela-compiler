@@ -1,7 +1,20 @@
 // accepts: eff.deterministic-fn
-// A function passed as a `@deterministic fn` may allocate, panic and recurse (to 256 calls).
+// A function passed as a `@deterministic fn` may allocate, panic and recurse (to 256 calls). A
+// generic parameter bounded by one passes on to another, and to a plain `fn`.
 fn apply(f: @deterministic fn(u32) -> u32, x: u32) -> u32 {
     f(x)
+}
+
+fn keep<F: @deterministic fn(u32) -> u32>(f: F, x: u32) -> u32 {
+    f(x)
+}
+
+fn loose<F: fn(u32) -> u32>(f: F, x: u32) -> u32 {
+    f(x)
+}
+
+fn pass_on<G: @deterministic fn(u32) -> u32>(g: G, x: u32) -> u32 {
+    keep(g, x) + loose(g, x)
 }
 
 fn twice(x: u32) -> u32 {
@@ -11,8 +24,10 @@ fn twice(x: u32) -> u32 {
 
 pub fn run() -> u32 {
     let base = 3
-    apply(|x| { let v: Vec<u32> = Vec::with_capacity(x); v.capacity() + base }, 4) + apply(twice, 5)
+    apply(|x| {
+        let v: Vec<u32> = Vec::with_capacity(x)
+        v.capacity() + base
+    }, 4) + apply(twice, 5) + pass_on(twice, 6)
 }
 
-pub fn frame(time: f32, width: u32, height: u32) {
-}
+pub fn frame(time: f32, width: u32, height: u32) {}

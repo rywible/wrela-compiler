@@ -876,7 +876,14 @@ impl<'p> Checker<'p> {
             // its own type, which can be stored (§6.7).
             Some(b) => {
                 let e = self.check_expr(value, Some(b));
-                self.coerce_arg(&e, b);
+                // A value of a parameter's type bounded by a function type (`G: fn(..)`, passed
+                // on) fits if its bound does.
+                match *self.kind(e.ty) {
+                    TyKind::Param(g) if let Some(bound) = self.p.param(g).fn_bound => {
+                        self.pass_bounded(bound, b, e.span);
+                    }
+                    _ => self.coerce_arg(&e, b),
+                }
                 if !self.try_unify(e.ty, p.ty) && !matches!(self.kind(e.ty), TyKind::Error) {
                     let shown = self.display(e.ty);
                     self.err(Diagnostic::new(
@@ -917,6 +924,41 @@ impl<'p> Checker<'p> {
             _ => {}
         }
         e
+    }
+
+    /// A value of a parameter's type bounded by `have` (`G: fn(..)`) passed where a function
+    /// of type `want` is expected: the same parameters, modes and result, and each attribute
+    /// `want` asks for (`@deterministic`, `@parallel`, `@audio`) in `have` too.
+    fn pass_bounded(&mut self, have: TyId, want: TyId, span: Span) {
+        let (TyKind::FnPtr(hp, hr, hf), TyKind::FnPtr(wp, wr, wf)) =
+            (self.kind(have).clone(), self.kind(want).clone())
+        else {
+            self.expect(have, want, span);
+            return;
+        };
+        let lacks = [
+            (wf.deterministic && !hf.deterministic, "@deterministic"),
+            (wf.parallel && !hf.parallel, "@parallel"),
+            (wf.audio && !hf.audio, "@audio"),
+        ];
+        if hp.len() != wp.len() || hf.modes != wf.modes || lacks.iter().any(|(l, _)| *l) {
+            let mut d = Diagnostic::new(
+                codes::E0300,
+                span,
+                format!("expected `{}`, found `{}`", self.display(want), self.display(have)),
+            );
+            for (_, attr) in lacks.iter().filter(|(l, _)| *l) {
+                d = d.with_note(format!(
+                    "the parameter's bound isn't `{attr}`, so the function it holds may not be"
+                ));
+            }
+            self.err(d);
+            return;
+        }
+        for (&a, &b) in hp.iter().zip(&wp) {
+            self.expect(a, b, span);
+        }
+        self.expect(hr, wr, span);
     }
 
     /// Argument coercions: an array or a `Vec` passes as a run (`[T; N]` and `Vec<T>` to

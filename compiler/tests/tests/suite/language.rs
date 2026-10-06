@@ -323,6 +323,10 @@ impl Scene {
         ..NONE
     },
     Context { first: "use std::field::{Surface, round_cone, sphere}", ..NONE },
+    // §6.17's examples are whole programs.
+    Context { first: "use std::tick::{Ticked, start}", ..NONE },
+    Context { first: "use std::handoff::{Latest, Publisher, handoff}", ..NONE },
+    Context { first: "use std::par::job", ..NONE },
     Context {
         first: "pub struct Herd: Clone {",
         items: "pub struct GrazerSim: Clone {\n    pub pos: vec3,\n}\n",
