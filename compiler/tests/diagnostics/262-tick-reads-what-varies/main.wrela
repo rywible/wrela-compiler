@@ -1,9 +1,12 @@
-// mistake: #43 §11: a `@deterministic` function, as a tick's are, reading a hand-off's newest value
-// expect: E0600
+// mistake: #43 §11: `@deterministic` functions, as a tick's are, reading the sim clock, a hand-off's newest value, whether a job is done, and a GPU result
+// expect: E0600 E0600 E0600 E0600
 // fix: no
 use engine::run::{Asks, TickInput, run}
 use engine::sim::{Sim, Tick}
+use std::gpu::{GpuBuffer, read}
 use std::handoff::{Latest, handoff}
+use std::par::{Job, job}
+use std::tick::origin
 
 pub struct World: Sim {
     pub tick: Tick,
@@ -25,8 +28,29 @@ impl Asks for World {
 }
 
 @deterministic
+fn clock() -> f64 {
+    origin()
+}
+
+@deterministic
 fn peek(seen: mut Latest<u32>) -> u32 {
     seen.read()
+}
+
+@deterministic
+fn finished(pending: Job<u32>) -> bool {
+    pending.done()
+}
+
+@deterministic
+fn gpu(counts: GpuBuffer<u32>) -> u32 {
+    let _ = read(counts.span(0, 1))
+    0
+}
+
+@deterministic
+fn twice(x: take u32) -> u32 {
+    x * 2
 }
 
 @deterministic
@@ -43,6 +67,10 @@ pub fn init() -> u32 {
     let (_, first) = handoff(0)
     var latest = take first
     let _ = peek(mut latest)
+    let _ = clock()
+    let pending = job(4, twice)
+    let _ = finished(pending)
+    let _ = take pending.join()
     let _ = run(World { tick: 0 }, hz: 60, step: step, present: snap)
     0
 }

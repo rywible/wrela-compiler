@@ -1,0 +1,101 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0600",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "`origin` is non-deterministic, and `clock` is `@deterministic`, which can't `nondet`",
+      "notes": [
+        "the call chain: clock → origin",
+        "depending on something besides the inputs (the clock, randomness, readback) is the `nondet` effect; see language.md §8 for what each context forbids"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 5,
+        "end": 714,
+        "end_column": 13,
+        "end_line": 32,
+        "line": 32,
+        "start": 706
+      },
+      "title": "an effect a context forbids"
+    },
+    {
+      "code": "E0600",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "`Latest<T>::read` is non-deterministic, and `peek` is `@deterministic`, which can't `nondet`",
+      "notes": [
+        "the call chain: peek → Latest<T>::read",
+        "depending on something besides the inputs (the clock, randomness, readback) is the `nondet` effect; see language.md §8 for what each context forbids"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 5,
+        "end": 788,
+        "end_column": 16,
+        "end_line": 37,
+        "line": 37,
+        "start": 777
+      },
+      "title": "an effect a context forbids"
+    },
+    {
+      "code": "E0600",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "`Job<O>::done` is non-deterministic, and `finished` is `@deterministic`, which can't `nondet`",
+      "notes": [
+        "the call chain: finished → Job<O>::done",
+        "depending on something besides the inputs (the clock, randomness, readback) is the `nondet` effect; see language.md §8 for what each context forbids"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 5,
+        "end": 866,
+        "end_column": 19,
+        "end_line": 42,
+        "line": 42,
+        "start": 852
+      },
+      "title": "an effect a context forbids"
+    },
+    {
+      "code": "E0600",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "`read` is non-deterministic, and `gpu` is `@deterministic`, which can't `nondet`",
+      "notes": [
+        "the call chain: gpu → read",
+        "depending on something besides the inputs (the clock, randomness, readback) is the `nondet` effect; see language.md §8 for what each context forbids"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 13,
+        "end": 960,
+        "end_column": 36,
+        "end_line": 47,
+        "line": 47,
+        "start": 937
+      },
+      "title": "an effect a context forbids"
+    }
+  ],
+  "version": 2
+}
