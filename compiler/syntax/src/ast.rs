@@ -471,6 +471,12 @@ pub enum StmtKind {
         cond: Expr,
         body: Block,
     },
+    /// `while let pat = init { body }`: runs `body` while `init` matches `pat`.
+    WhileLet {
+        pat: Pat,
+        init: Expr,
+        body: Block,
+    },
     Loop {
         body: Block,
     },
@@ -917,7 +923,7 @@ impl Block {
                     f(value);
                 }
                 StmtKind::Expr(e) => f(e),
-                StmtKind::While { cond, body } => {
+                StmtKind::While { cond, body } | StmtKind::WhileLet { init: cond, body, .. } => {
                     f(cond);
                     body.for_each_expr(f);
                 }

@@ -242,6 +242,21 @@ impl<T> Vec<T> {
         self.len = kept
     }
 
+    /// `n` elements, element `i` made by `make(i)`: for a `T` that can't be cloned, which
+    /// `filled` needs.
+    ///
+    /// ```wrela
+    /// let squares = Vec::from_fn(4, |i| i * i)
+    /// assert(squares[3] == 9)
+    /// ```
+    pub fn from_fn(n: u32, make: fn(u32) -> T) -> Vec<T> {
+        var v = Vec::with_capacity(n)
+        for i in 0..n {
+            v.push(make(i))
+        }
+        v
+    }
+
     /// Sorts the elements by `before`, which says whether its first argument goes before its
     /// second. Stable: equal elements keep their order. A merge sort, O(n log n): its room, as
     /// many bytes as the elements take, is allocated for the call (`sort_by_in` keeps it).
@@ -296,8 +311,12 @@ impl<T> Vec<T> {
                 var j = mid
                 for k in lo..hi {
                     // The left run's element while it's not after the right run's: stable.
-                    let left = i < mid &&
-                        (j >= hi || !unsafe { before(at::<T, Vec<T>>(self, src + j * size), at::<T, Vec<T>>(self, src + i * size)) })
+                    let left = i < mid && (j >= hi || !unsafe {
+                        before(
+                            at::<T, Vec<T>>(self, src + j * size),
+                            at::<T, Vec<T>>(self, src + i * size),
+                        )
+                    })
                     unsafe {
                         if left {
                             copy(dst + k * size, src + i * size, size)
@@ -460,6 +479,20 @@ impl<T> Drop for Vec<T> {
 }
 
 impl<T: Clone> Vec<T> {
+    /// `n` copies of `value`.
+    ///
+    /// ```wrela
+    /// let v = Vec::filled(3, 0.5)
+    /// assert(v.len() == 3 && v[2] == 0.5)
+    /// ```
+    pub fn filled(n: u32, value: T) -> Vec<T> {
+        var v = Vec::with_capacity(n)
+        for _ in 0..n {
+            v.push(value.clone())
+        }
+        v
+    }
+
     /// A `Vec` of a copy of each of `xs`: `Vec::from([1.0, 2.0])`.
     pub fn from(xs: [T]) -> Vec<T> {
         var out = Vec::with_capacity(xs.len())

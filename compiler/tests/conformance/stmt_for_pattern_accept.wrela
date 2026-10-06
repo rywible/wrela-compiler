@@ -1,0 +1,31 @@
+// accepts: stmt.for-pattern
+// A `for` loop over a sequence destructures each element; `for mut` changes its parts in place.
+struct Spring: Copy {
+    rest: f32,
+    k: f32,
+}
+
+fn energy(pairs: [(f32, f32)], springs: [Spring]) -> f32 {
+    var e = 0.0
+    for (x, k) in pairs {
+        e += 0.5 * k * x * x
+    }
+    for Spring { rest, k } in springs {
+        e += rest * k
+    }
+    e
+}
+
+fn stiffen(springs: mut [Spring]) {
+    for mut Spring { k, .. } in springs {
+        k *= 2.0
+    }
+}
+
+fn names(v: Vec<(u32, Vec<u32>)>) -> u32 {
+    var total = 0
+    for (n, parts) in v {
+        total += n + parts.len()
+    }
+    total
+}

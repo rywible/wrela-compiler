@@ -167,6 +167,15 @@ impl<'a> Parser<'a> {
             T::Mut if self.nth(1) == T::Ident && matches!(self.nth(2), T::Eq | T::Colon) => {
                 self.parse_named_bind(VarKind::Mut)?
             }
+            T::While if self.nth(1) == T::Let => {
+                self.bump();
+                self.bump();
+                let pat = self.parse_pattern()?;
+                self.expect(T::Eq, "`=`")?;
+                let init = self.parse_expr_ctx(Ctx::NoStruct)?;
+                let body = self.parse_block()?;
+                StmtKind::WhileLet { pat, init, body }
+            }
             T::While => {
                 self.bump();
                 let cond = self.parse_expr_ctx(Ctx::NoStruct)?;
@@ -420,6 +429,7 @@ impl<'a> Parser<'a> {
     }
 
     /// closure ::= ("|" (closure_param ("," closure_param)* ","?)? "|" | "||") ("->" type block | expr)
+    /// closure_param ::= (IDENT | "_") (":" type)?
     fn parse_closure(&mut self) -> PResult<Expr> {
         let start = self.span();
         let mut params = Vec::new();
@@ -428,7 +438,13 @@ impl<'a> Parser<'a> {
             params = self.list(
                 T::Pipe,
                 |p| {
-                    let name = p.ident("a closure parameter")?;
+                    // `|_| ...`: a parameter it doesn't use, which nothing can name.
+                    let name = if p.at(T::Underscore) {
+                        let t = p.bump();
+                        Ident { name: "_".into(), span: t.span }
+                    } else {
+                        p.ident("a closure parameter")?
+                    };
                     // `|x: mut f32|`: the mode is the function type's, not the closure's.
                     if p.at(T::Colon) && matches!(p.nth(1), T::Mut | T::Take | T::Borrow) {
                         let kw = p.token_at(1).span;

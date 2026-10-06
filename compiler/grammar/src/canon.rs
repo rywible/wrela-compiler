@@ -427,6 +427,11 @@ impl AstWalker {
                 self.expr(cond);
                 self.block(body);
             }
+            StmtKind::WhileLet { pat, init, body } => {
+                self.pat(pat);
+                self.expr(init);
+                self.block(body);
+            }
             StmtKind::Loop { body } => self.block(body),
             StmtKind::For { pat, iter, body, .. } => {
                 self.pat(pat);

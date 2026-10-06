@@ -85,6 +85,8 @@ pub const RULES: &[(&str, &str)] = &[
     ("ty.alias", "`type Name<T> = Type` names a type; an alias can't name itself"),
     ("stmt.if-let", "`if let pat = x { } else { }` tests a pattern; its value needs an `else`"),
     ("stmt.let-else", "`let pat = x else { }`, whose `else` leaves the scope"),
+    ("stmt.while-let", "`while let pat = x { }` runs its body while `x` matches"),
+    ("stmt.for-pattern", "`for pat in xs` destructures each element, and its pattern can't fail"),
     ("err.try", "`x?` returns a `None` or an `Err` from a function returning the same kind"),
     ("mem.match-mut", "`match mut place` binds mutable projections of a place"),
     ("mem.let-owns", "`let` owns: a place whose type isn't `Copy` is borrowed, cloned or taken"),

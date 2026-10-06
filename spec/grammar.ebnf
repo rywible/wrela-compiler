@@ -110,7 +110,7 @@ let_else_postfix ::= let_else_primary postfixes
 let_else_primary ::= literal | path_expr | paren_expr | array_expr
 assign_stmt      ::= postfix_expr assign_op expr
 assign_op        ::= "=" | "+=" | "-=" | "*=" | "/=" | "%=" | "**=" | "&=" | "|=" | "^=" | "<<=" | ">>="
-while_stmt       ::= "while" expr_ns block
+while_stmt       ::= "while" ("let" pattern "=")? expr_ns block
 loop_stmt        ::= "loop" block
 for_stmt         ::= "for" "mut"? pattern "in" expr_ns ((".." | "..=") expr_ns)? block
 
@@ -121,7 +121,7 @@ for_stmt         ::= "for" "mut"? pattern "in" expr_ns ((".." | "..=") expr_ns)?
 expr             ::= closure | jump | or_expr
 jump             ::= "return" expr? | "break" | "continue"
 closure          ::= ("|" (closure_param ("," closure_param)* ","?)? "|" | "||") ("->" type block | expr)
-closure_param    ::= IDENT (":" type)?
+closure_param    ::= (IDENT | "_") (":" type)?
 
 or_expr          ::= and_expr ("||" and_expr)*
 and_expr         ::= cmp_expr ("&&" cmp_expr)*

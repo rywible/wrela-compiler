@@ -1,0 +1,26 @@
+// rejects: stmt.for-pattern
+fn first(xs: [Option<f32>]) -> f32 {
+    var s = 0.0
+    // A pattern that might not match: `match` each element instead.
+    for Some(x) in xs { //~ E0309
+        s += x
+    }
+    s
+}
+
+fn count(n: u32) -> u32 {
+    var s = 0
+    // A range's index is one name.
+    for (a, b) in 0..n { //~ E0100
+        s += 1
+    }
+    s
+}
+
+fn twice(pairs: [(f32, f32)]) -> f32 {
+    var s = 0.0
+    for (a, a) in pairs { //~ E0201
+        s += a
+    }
+    s
+}

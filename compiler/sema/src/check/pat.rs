@@ -107,7 +107,7 @@ impl<'p> Checker<'p> {
         }
     }
 
-    fn irrefutable(&self, p: &Pat) -> bool {
+    pub(crate) fn irrefutable(&self, p: &Pat) -> bool {
         match &p.kind {
             PatKind::Wild | PatKind::Bind(_) => true,
             PatKind::Lit(_) | PatKind::Text(_) => false,

@@ -1027,11 +1027,7 @@ pub struct AtomicMapBuffer {
 /// An empty `AtomicMapBuffer` with room for `capacity` keys.
 pub fn atomic_map_buffer(capacity: u32) -> AtomicMapBuffer {
     var entries: GpuBuffer<u32> = buffer(2 * capacity)
-    var empty: Vec<u32> = Vec::with_capacity(2 * capacity)
-    for _ in 0..2 * capacity {
-        empty.push(EMPTY)
-    }
-    write(mut entries, 0, empty)
+    write(mut entries, 0, Vec::filled(2 * capacity, EMPTY))
     AtomicMapBuffer { entries }
 }
 

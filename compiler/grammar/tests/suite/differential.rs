@@ -20,7 +20,7 @@ const SEED: u64 = 0xac5;
 #[test]
 fn generated_programs_agree() {
     let checker = Checker::default();
-    let mut cfg = RunConfig::new(sized(4000, 4000), SEED);
+    let mut cfg = RunConfig::new(sized(5000, 5000), SEED);
     cfg.round_trip = false;
     let stats = run(&checker, &cfg);
     let report = stats.report(&checker);

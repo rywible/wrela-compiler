@@ -1054,6 +1054,14 @@ impl<'a> Builder<'a> {
             StmtKind::While { cond, body } => {
                 concat([self.tok("while "), self.expr(cond), text(" "), self.block(body, true)])
             }
+            StmtKind::WhileLet { pat, init, body } => concat([
+                self.tok("while let "),
+                self.pat(pat),
+                self.tok(" = "),
+                self.expr(init),
+                text(" "),
+                self.block(body, true),
+            ]),
             StmtKind::Loop { body } => concat([self.tok("loop "), self.block(body, true)]),
             StmtKind::For { mutable, pat, iter, body } => {
                 let mut out = vec![self.tok(if *mutable { "for mut " } else { "for " })];

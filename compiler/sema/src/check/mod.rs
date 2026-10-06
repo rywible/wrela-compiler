@@ -545,6 +545,22 @@ impl<'p> Checker<'p> {
                 let b = self.check_loop_body(body);
                 StmtKind::While { cond: c, body: b }
             }
+            ast::StmtKind::WhileLet { pat, init, body } => {
+                // `loop { let pat = init else { break }; body }` (`stmt.while-let`).
+                let env_len = self.env.len();
+                let (ty, init) = self.check_init(None, init);
+                let p = self.check_pat(pat, ty, init.is_place());
+                self.bound_once(&p);
+                let never = self.p.types.never;
+                let leave = Expr { ty: never, span: pat.span, kind: ExprKind::Break };
+                let leave =
+                    Block { stmts: Vec::new(), tail: Some(Box::new(leave)), ty: never, span: pat.span };
+                let mut b = self.check_loop_body(body);
+                self.env.truncate(env_len);
+                let bind = StmtKind::Bind { pat: p, init, else_: Some(leave) };
+                b.stmts.insert(0, Stmt { kind: bind, span: pat.span });
+                StmtKind::Loop { body: b }
+            }
             ast::StmtKind::Loop { body } => StmtKind::Loop { body: self.check_loop_body(body) },
             ast::StmtKind::For { mutable, pat, iter, body } => {
                 return self.check_for(*mutable, pat, iter, body, s.span);
@@ -742,12 +758,17 @@ impl<'p> Checker<'p> {
         span: Span,
     ) -> Option<Stmt> {
         let env_len = self.env.len();
-        // One name, or `_` for a loop that doesn't use it.
-        let name = match &pat.kind {
-            ast::PatKind::Ident(name) => Some(name),
-            ast::PatKind::Wild => None,
+        // One name, or `_` for a loop that doesn't use it; over a sequence, a pattern that
+        // destructures each element (`for (a, b) in pairs`).
+        let (name, parts) = match &pat.kind {
+            ast::PatKind::Ident(name) => (Some(name), None),
+            ast::PatKind::Wild => (None, None),
+            _ if matches!(iter, ast::ForIter::Expr(_)) => (None, Some(pat)),
             _ => {
-                self.err(Diagnostic::new(codes::E0100, pat.span, "a `for` loop binds one name"));
+                self.err(
+                    Diagnostic::new(codes::E0100, pat.span, "a range's index is one name")
+                        .with_help("name it, or `_` for a loop that doesn't use it"),
+                );
                 return None;
             }
         };
@@ -819,7 +840,26 @@ impl<'p> Checker<'p> {
                     LocalKind::Projection { mutable }
                 };
                 let var = self.declare_binder(name, elem, kind, pat.span);
-                let b = self.check_loop_body(body);
+                // The pattern destructures the element, as `let` does a place: its names copy
+                // `Copy` parts and project the rest, mutably in a `for mut` (§6.3).
+                let destructure = parts.map(|pat| {
+                    let init = Expr { ty: elem, span: pat.span, kind: ExprKind::Local(var) };
+                    let outer = std::mem::replace(&mut self.binding_mut, mutable);
+                    let p = self.check_pat(pat, elem, true);
+                    self.binding_mut = outer;
+                    self.bound_once(&p);
+                    if !self.irrefutable(&p) {
+                        self.err(
+                            Diagnostic::new(codes::E0309, pat.span, "this pattern might not match, so a `for` loop can't use it")
+                                .with_help("loop over each element and `match` it, or skip the others with `let ... else { continue }`"),
+                        );
+                    }
+                    Stmt { kind: StmtKind::Bind { pat: p, init, else_: None }, span: pat.span }
+                });
+                let mut b = self.check_loop_body(body);
+                if let Some(d) = destructure {
+                    b.stmts.insert(0, d);
+                }
                 StmtKind::ForEach { var, array: arr, mutable, body: b }
             }
         };

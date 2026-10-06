@@ -1,0 +1,22 @@
+// accepts: stmt.while-let
+// `while let` runs while a value matches; its names are the body's.
+fn drain(stack: mut Vec<u32>) -> u32 {
+    var sum = 0
+    while let Some(x) = stack.pop() {
+        if x == 0 {
+            continue
+        }
+        sum += x
+    }
+    sum
+}
+
+fn halve(n: u32) -> u32 {
+    var steps = 0
+    var x = n
+    while let (half, true) = (x / 2, x > 1) {
+        x = half
+        steps += 1
+    }
+    steps
+}

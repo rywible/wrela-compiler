@@ -1,0 +1,18 @@
+// rejects: stmt.while-let
+fn last(stack: mut Vec<u32>) -> u32 {
+    while let Some(x) = stack.pop() {
+        if x > 9 {
+            break
+        }
+    }
+    // The pattern's names are the body's only.
+    x //~ E0200
+}
+
+fn pairs(v: mut Vec<(u32, u32)>) -> u32 {
+    var s = 0
+    while let Some((a, a)) = v.pop() { //~ E0201
+        s += a
+    }
+    s
+}

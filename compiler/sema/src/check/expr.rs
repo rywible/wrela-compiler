@@ -2281,7 +2281,10 @@ impl<'p> Checker<'p> {
             // A closure's parameters take their modes from the function type it's passed as
             // (§6.7): `fn(mut Ui)` makes `|u| ...`'s `u` a mutable projection.
             let mode = exp.as_ref().map_or(Mode::Borrow, |(_, _, f)| f.mode(i));
-            if let Some(first) = params[..i].iter().find(|q| q.name.name == p.name.name) {
+            // `_` names nothing, so it can be every unused parameter.
+            if let Some(first) =
+                params[..i].iter().find(|q| q.name.name == p.name.name && p.name.name != "_")
+            {
                 self.err(
                     Diagnostic::new(
                         codes::E0201,
