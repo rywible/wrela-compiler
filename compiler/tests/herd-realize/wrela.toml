@@ -1,0 +1,8 @@
+# The herd's grazers realized one at a time, at any cell size, for #42 AC2's comparison with
+# spike 01's extraction (compiler/tests/tests/suite/herd.rs).
+[package]
+name = "herd_realize"
+
+[dependencies]
+engine = { path = "../../../engine" }
+herd = { path = "../../../examples/herd" }

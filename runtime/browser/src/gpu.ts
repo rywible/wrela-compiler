@@ -26,6 +26,9 @@ import type { Manifest, Pipeline, ResourceBinding, UniformBlock } from "./manife
 import type { Binding, Bytes, Command, OpcodeName, Pass, TextureFormat } from "./stream.ts";
 
 const RING_START = 64 * 1024;
+/** The upload ring's starting size, and the largest write it takes (as the native host's). */
+const UPLOAD_START = 256 * 1024;
+const UPLOAD_MAX = 16 * 1024 * 1024;
 
 /** A pipeline failed to build: its WGSL didn't compile, or its layout or entry points are wrong. */
 export class ShaderError extends Error {
@@ -253,6 +256,9 @@ export interface GpuTiming {
   /** The dispatch's pipeline name, or `screen pass` or `pass`. */
   label: string;
   nanos: number;
+  /** When it began, in nanoseconds on the GPU's clock (a frame's time is from its first start to
+   * its last end: passes overlap). */
+  start: number;
 }
 
 /** Most passes timed in one submission: more flush first. */
@@ -302,7 +308,9 @@ class Timer {
       this.#reading.push(
         staging.mapAsync(GPUMapMode.READ).then(() => {
           const t = new BigUint64Array(staging.getMappedRange());
-          passes.forEach((p, i) => this.results.push({ ...p, nanos: Number(t[2 * i + 1]! - t[2 * i]!) }));
+          passes.forEach((p, i) =>
+            this.results.push({ ...p, nanos: Number(t[2 * i + 1]! - t[2 * i]!), start: Number(t[2 * i]!) }),
+          );
           staging.unmap();
           staging.destroy();
         }),
@@ -330,6 +338,12 @@ export class GpuExecutor {
   #ring: GPUBuffer;
   #staging: Bytes = new Uint8Array(RING_START);
   #staged = 0;
+  /** This submission's buffer writes: their bytes, written to `#upload` at the flush, and a copy
+   * of each from there recorded where the write is, so a write splits no work into submissions
+   * (as the native host's `UploadRing`). */
+  #upload: GPUBuffer;
+  #uploadBytes: Bytes = new Uint8Array(UPLOAD_START);
+  #uploaded = 0;
   #encoder: GPUCommandEncoder | null = null;
   #pass: { pass: Pass; draws: PendingDraw[] } | null = null;
   readonly #timer: Timer | null;
@@ -350,6 +364,7 @@ export class GpuExecutor {
     const l = device.limits;
     this.#align = Math.max(l.minUniformBufferOffsetAlignment, l.minStorageBufferOffsetAlignment);
     this.#ring = this.#createRing(RING_START);
+    this.#upload = this.#createUpload(UPLOAD_START);
     this.#timer = timestamps && device.features.has("timestamp-query") ? new Timer(device) : null;
     this.#debugFlag = pipelines.some((p) => p.debugFlag !== null)
       ? {
@@ -448,10 +463,7 @@ export class GpuExecutor {
         return;
       }
       case "WriteBuffer":
-        if (cmd.data.length === 0) return;
-        // Work recorded before this write must see the old contents.
-        this.flush();
-        this.device.queue.writeBuffer(this.#buffer(cmd.handle), cmd.offset, cmd.data);
+        this.#write(cmd.handle, cmd.offset, cmd.data);
         return;
       case "WriteTexture": {
         if (cmd.data.length === 0) return;
@@ -535,6 +547,10 @@ export class GpuExecutor {
         this.device.queue.writeBuffer(this.#ring, 0, this.#staging, 0, this.#staged);
         this.#staged = 0;
       }
+      if (this.#uploaded > 0) {
+        this.device.queue.writeBuffer(this.#upload, 0, this.#uploadBytes, 0, this.#uploaded);
+        this.#uploaded = 0;
+      }
       const read = this.#timer?.resolve(this.#encoder) ?? null;
       this.device.queue.submit([this.#encoder.finish()]);
       this.#encoder = null;
@@ -597,6 +613,42 @@ export class GpuExecutor {
     const p = this.pipelines[index];
     if (p === undefined) throw new Error(`host bug: pipeline ${index} passed the checks but doesn't exist`);
     return p;
+  }
+
+  /** A copy from the upload ring (`#upload`): the stream's writes are whole words, as a copy
+   * moves. A very big one goes through the queue after what's recorded is submitted. */
+  #write(handle: number, offset: number, data: Bytes): void {
+    const len = data.length;
+    if (len === 0) return;
+    if (len > UPLOAD_MAX) {
+      // Work recorded before this write must see the old contents.
+      this.flush();
+      this.device.queue.writeBuffer(this.#buffer(handle), offset, data);
+      return;
+    }
+    if (this.#uploaded + len > this.#uploadBytes.length) {
+      this.flush();
+      if (len > this.#uploadBytes.length) {
+        let capacity = this.#uploadBytes.length * 2;
+        while (capacity < len) capacity *= 2;
+        this.#upload.destroy(); // the flush above submitted the last work that used it
+        this.#upload = this.#createUpload(capacity);
+        this.#uploadBytes = new Uint8Array(capacity);
+      }
+    }
+    const at = this.#uploaded;
+    // The bytes are a view into the program's memory: copied now.
+    this.#uploadBytes.set(data, at);
+    this.#uploaded += len;
+    this.#encoderNow().copyBufferToBuffer(this.#upload, at, this.#buffer(handle), offset, len);
+  }
+
+  #createUpload(capacity: number): GPUBuffer {
+    return this.device.createBuffer({
+      label: "upload ring",
+      size: capacity,
+      usage: GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+    });
   }
 
   #createRing(capacity: number): GPUBuffer {

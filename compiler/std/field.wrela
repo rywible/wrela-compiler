@@ -202,7 +202,8 @@ impl Bound {
             return Bound { slope: min(self.slope, other.slope), ..other }
         }
         let r = 0.5 * (d + self.radius + other.radius)
-        let centre = self.centre + (other.centre - self.centre) * ((r - self.radius) / max(d, 1.0e-30))
+        let centre = self.centre +
+            (other.centre - self.centre) * ((r - self.radius) / max(d, 1.0e-30))
         Bound { centre, radius: r, slope: min(self.slope, other.slope) }
     }
 
@@ -593,7 +594,11 @@ impl Surface for Ellipsoid {
     fn bound(self) -> Bound {
         // The usual bound's distance: spike 01 assumed it falls off at least half as fast as the
         // true distance does.
-        Bound { centre: vec3(), radius: max(self.radii.x, max(self.radii.y, self.radii.z)), slope: 0.5 }
+        Bound {
+            centre: vec3(),
+            radius: max(self.radii.x, max(self.radii.y, self.radii.z)),
+            slope: 0.5,
+        }
     }
 }
 
@@ -621,7 +626,11 @@ impl Surface for Oval {
     }
 
     fn bound(self) -> Bound {
-        Bound { centre: vec3(), radius: max(self.radii.x, max(self.radii.y, self.radii.z)), slope: 0.5 }
+        Bound {
+            centre: vec3(),
+            radius: max(self.radii.x, max(self.radii.y, self.radii.z)),
+            slope: 0.5,
+        }
     }
 }
 
@@ -1680,6 +1689,24 @@ pub trait Lipschitz: Surface {
     /// over a block that straddles the surface, at least the block's radius.
     fn lipschitz(self, near: f32) -> f32
 
+    /// A range holding its distance over `b`: the derived interval, narrowed by the distance
+    /// at `b`'s centre and the bound (spike 01's culling interval). The derived interval says
+    /// how far from the surface `b` can be, which is the scope the bound needs; along the
+    /// segment from the centre to any point of `b`, the distance then changes by at most the
+    /// bound times the half-diagonal. Each narrows the other: a culling test keeps fewer boxes
+    /// with both. A displacement narrows its surface's and adds its noise's range, which is
+    /// tighter than its noise's steepness allows and needs no noise at the centre.
+    fn interval_near(self, b: Box3) -> Interval {
+        let x = self.interval(b)
+        let l = self.lipschitz(max(abs(x.lo), abs(x.hi)) * 1.001 + 0.000001)
+        if l >= 1.0e30 {
+            return x
+        }
+        let r = l * 0.5 * length(b.hi - b.lo)
+        let d = self.distance(0.5 * (b.lo + b.hi))
+        Interval { lo: max(x.lo, d - r), hi: min(x.hi, d + r) }
+    }
+
     /// The distance, held within ±`near` and divided by `lipschitz(near)`: never more than the
     /// distance to the surface, so sphere tracing can step by it. A debug build checks the
     /// bound against the derived gradient first (`check_lipschitz`).
@@ -1863,6 +1890,10 @@ impl<S: Lipschitz> Lipschitz for Translate<S> {
     fn lipschitz(self, near: f32) -> f32 {
         self.inner.lipschitz(near)
     }
+
+    fn interval_near(self, b: Box3) -> Interval {
+        self.inner.interval_near(Box3 { lo: b.lo - self.by, hi: b.hi - self.by })
+    }
 }
 
 impl<S: Lipschitz, N: Noise> Lipschitz for Displace<S, N> {
@@ -1872,6 +1903,19 @@ impl<S: Lipschitz, N: Noise> Lipschitz for Displace<S, N> {
         let r = self.noise.range()
         let reach = abs(self.amp) * max(abs(r.lo), abs(r.hi))
         self.inner.lipschitz(near + reach) + abs(self.amp) * self.noise.lipschitz()
+    }
+
+    /// The inner surface's, plus the noise's range scaled by the amplitude: no noise evaluated,
+    /// and narrower than the noise's steepness allows. Widened by the rounding of the noise's
+    /// sum and of this one.
+    fn interval_near(self, b: Box3) -> Interval {
+        let x = self.inner.interval_near(b)
+        let r = self.noise.range()
+        let e = 1.0e-5 * max(abs(r.lo), abs(r.hi))
+        let (a, c) = (self.amp * (r.lo - e), self.amp * (r.hi + e))
+        let lo = x.lo + min(a, c)
+        let hi = x.hi + max(a, c)
+        Interval { lo: lo - 1.0e-6 * abs(lo), hi: hi + 1.0e-6 * abs(hi) }
     }
 }
 
@@ -1914,17 +1958,29 @@ impl<S: Lipschitz> Lipschitz for Named<S> {
     fn lipschitz(self, near: f32) -> f32 {
         self.inner.lipschitz(near)
     }
+
+    fn interval_near(self, b: Box3) -> Interval {
+        self.inner.interval_near(b)
+    }
 }
 
 impl<S: Lipschitz, C: Copy + GpuData> Lipschitz for With<S, C> {
     fn lipschitz(self, near: f32) -> f32 {
         self.inner.lipschitz(near)
     }
+
+    fn interval_near(self, b: Box3) -> Interval {
+        self.inner.interval_near(b)
+    }
 }
 
 impl<S: Lipschitz, F: Copy + GpuData> Lipschitz for WithAt<S, F> {
     fn lipschitz(self, near: f32) -> f32 {
         self.inner.lipschitz(near)
+    }
+
+    fn interval_near(self, b: Box3) -> Interval {
+        self.inner.interval_near(b)
     }
 }
 
@@ -2400,6 +2456,34 @@ fn derived_intervals_enclose_the_distances_in_their_boxes() {
             assert(r.lo <= d && d <= r.hi, f"a box at ({c.x}, {c.y}, {c.z})")
         }
     }
+}
+
+@test
+fn narrowed_intervals_enclose_the_distances_and_narrow_the_derived() {
+    let blob = test_blob().translate(vec3(0.1, 0.0, 0.0))
+    let plain = round_cone(vec3(0.5, -0.2, 0.0), vec3(1.4, 0.6, 0.2), r_top: 0.15, r_bottom: 0.3)
+    let space = Box3 { lo: vec3(-2.0), hi: vec3(2.0) }
+    var narrower = 0
+    for i in 0..64 {
+        let c = space.sample(6, i)
+        let b = Box3 { lo: c - vec3(0.1), hi: c + vec3(0.1) }
+        let r = blob.interval_near(b)
+        let s = plain.interval_near(b)
+        for j in 0..16 {
+            let p = b.sample(7, j)
+            let d = blob.distance(p)
+            assert(r.lo <= d && d <= r.hi, f"the blob, a box at ({c.x}, {c.y}, {c.z})")
+            let e = plain.distance(p)
+            assert(s.lo <= e && e <= s.hi, f"the plain blob, a box at ({c.x}, {c.y}, {c.z})")
+        }
+        // A round cone's derived interval is loose; its distance at the centre, which changes
+        // by at most 1 a unit, narrows it.
+        let x = interval(|q: vec3| plain.distance(q), b)
+        if s.hi - s.lo < 0.9 * (x.hi - x.lo) {
+            narrower += 1
+        }
+    }
+    assert(narrower > 8, f"only {narrower} of 64 boxes narrowed")
 }
 
 @test

@@ -33,7 +33,10 @@ pub fn init() -> Scene {
     for i in 0..2 {
         let g = grazer(seed(i + 1))
         let look = GRAZER_LOOK
-        let grid = Grid::around(grow(g.bounds(), look.surface.tolerance), look.surface.cell_size(0.05))
+        let grid = Grid::around(
+            grow(g.bounds(), look.surface.tolerance),
+            look.surface.cell_size(0.05),
+        )
         var mesh = Mesh::new(Room { vertices: grid.blocks * 8, quads: grid.blocks * 16 })
         var scratch = Scratch::new(grid.blocks)
         record(g.field(), grid, look.deform.weights.falloff, mut scratch, mut mesh)

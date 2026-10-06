@@ -84,7 +84,7 @@ test("buffers are created zeroed, as storage that can be copied both ways and ho
   expect(b.usage).toBe(STORAGE | COPY_DST | COPY_SRC | INDIRECT | INDEX);
 });
 
-test("a write after a dispatch submits the dispatch first", async () => {
+test("a write is a copy from the upload ring in order with the work around it, not a submission", async () => {
   const { device, run, executor } = await setup();
   run(
     new Encoder()
@@ -95,13 +95,16 @@ test("a write after a dispatch submits the dispatch first", async () => {
       .writeBuffer(1, 4, words([8])),
   );
   executor.flush();
-  expect(kinds(device.events)).toEqual(["writeBuffer", "dispatch", "writeBuffer", "submit", "writeBuffer"]);
-  // The first write needs no flush (nothing recorded yet); the dispatch's uniforms go into the
-  // ring just before its submission.
-  const [first, , ring, , second] = device.events as Extract<Event, { kind: "writeBuffer" }>[];
-  expect([first!.buffer, first!.offset, Array.from(first!.data)]).toEqual(["buffer 1", 0, [7, 0, 0, 0]]);
-  expect([ring!.buffer, Array.from(ring!.data)]).toEqual(["uniform ring", Array.from(u(5))]);
-  expect([second!.buffer, second!.offset]).toEqual(["buffer 1", 4]);
+  expect(kinds(device.events)).toEqual(["copyBuffer", "dispatch", "copyBuffer", "writeBuffer", "writeBuffer", "submit"]);
+  // Each write's bytes go into the upload ring, written once just before the submission, with the
+  // dispatch's uniforms into theirs.
+  const [first, , second, ring, upload] = device.events as Extract<Event, { kind: "copyBuffer" | "writeBuffer" }>[];
+  expect(first).toMatchObject({ kind: "copyBuffer", from: "upload ring", fromOffset: 0, to: "buffer 1", toOffset: 0, size: 4 });
+  expect(second).toMatchObject({ kind: "copyBuffer", from: "upload ring", fromOffset: 4, to: "buffer 1", toOffset: 4, size: 4 });
+  expect(ring).toMatchObject({ kind: "writeBuffer", buffer: "uniform ring" });
+  expect(Array.from((ring as Extract<Event, { kind: "writeBuffer" }>).data)).toEqual(Array.from(u(5)));
+  expect(upload).toMatchObject({ kind: "writeBuffer", buffer: "upload ring" });
+  expect(Array.from((upload as Extract<Event, { kind: "writeBuffer" }>).data)).toEqual([7, 0, 0, 0, 8, 0, 0, 0]);
 });
 
 test("each dispatch and draw gets its own aligned uniform slice", async () => {

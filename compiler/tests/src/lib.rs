@@ -8,6 +8,8 @@
 //! Sampled tests have two sizes: small by default, so `cargo test` stays fast, and the size the
 //! acceptance criteria name when `WRELA_FULL` is set ([`sized`]), as `tools/check.sh` does.
 
+pub mod spike01;
+
 use std::path::{Path, PathBuf};
 use wrela_diag::{Diagnostic, Edit, FileId};
 use wrela_host::{CpuHost, Host, Value, map_read};

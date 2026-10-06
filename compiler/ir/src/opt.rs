@@ -41,9 +41,177 @@ pub fn flatten_gpu(m: &mut Module) -> Result<()> {
         collapse_rebuilds(&mut f);
         cse(&mut f);
         dce(&mut f);
+        if_convert(m, &mut f);
+        cse(&mut f);
+        dce(&mut f);
         m.functions[i] = f;
     }
     Ok(())
+}
+
+// ---- small branches as selects (GPU) ----------------------------------------------------------
+
+/// The most statements a branch made into selects may have, both sides together. Where the
+/// condition differs between a SIMD group's invocations (a point's own distances: `smin`'s
+/// `d > 0`, a round cone's three regions), the group runs both sides anyway, one after the
+/// other, with its invocations masked; as selects it runs them once, together. Where every
+/// invocation agrees, it pays for the side none takes: a few statements.
+const SELECT_SIZE: usize = 32;
+
+/// Makes each small `if` whose sides only compute and set local scalars or vectors into
+/// straight-line code: both sides' values, then each local set to a `select` of them. After
+/// every derivation, so an interval still sees the branch (GPU only: computing a side that
+/// isn't taken can't trap there).
+fn if_convert(m: &Module, f: &mut Function) {
+    let mut body = std::mem::take(&mut f.body);
+    if_convert_block(m, f, &mut body);
+    f.body = body;
+}
+
+fn if_convert_block(m: &Module, f: &mut Function, b: &mut Block) {
+    let old = std::mem::take(b);
+    for mut s in old {
+        // The innermost first: a converted `if` makes the one around it straight too.
+        for inner in s.blocks_mut() {
+            if_convert_block(m, f, inner);
+        }
+        match s {
+            Stmt::If { cond, then, else_ } => match as_selects(m, f, cond, &then, &else_) {
+                Some(straight) => b.extend(straight),
+                None => b.push(Stmt::If { cond, then, else_ }),
+            },
+            s => b.push(s),
+        }
+    }
+}
+
+/// `if cond { then } else { else_ }` as straight-line code, if its sides only compute (pure
+/// expressions, loads of what neither side stores) and set whole scalar or vector locals, and
+/// are small.
+fn as_selects(
+    m: &Module,
+    f: &mut Function,
+    cond: ValueId,
+    then: &Block,
+    else_: &Block,
+) -> Option<Block> {
+    let size = then.len() + else_.len();
+    if size == 0 || size > SELECT_SIZE {
+        return None;
+    }
+    // A side's load of what it stored before reads that value.
+    let forward = |side: &Block| -> Block {
+        let mut known: HashMap<LocalId, ValueId> = HashMap::new();
+        let mut rename: HashMap<ValueId, ValueId> = HashMap::new();
+        let mut out = Vec::new();
+        for st in side {
+            let mut st = st.clone();
+            st.for_each_value_mut(&mut |x| {
+                if let Some(y) = rename.get(x) {
+                    *x = *y;
+                }
+            });
+            match &st {
+                Stmt::Store(p, v) if p.path.is_empty() => {
+                    if let Some(l) = p.root_local() {
+                        known.insert(l, *v);
+                    }
+                }
+                Stmt::Let(v, Expr::Load(p)) if p.path.is_empty() => {
+                    if let Some(&w) = p.root_local().and_then(|l| known.get(&l)) {
+                        rename.insert(*v, w);
+                        continue;
+                    }
+                }
+                _ => {}
+            }
+            out.push(st);
+        }
+        out
+    };
+    let (then, else_) = (&forward(then), &forward(else_));
+    let register = |t: TypeId| matches!(m.types.get(t), TypeDef::Scalar(_) | TypeDef::Vector(_));
+    // What each side stores: its last value for each local, in the order first stored.
+    let mut stored: Vec<LocalId> = Vec::new();
+    let mut sides: [HashMap<LocalId, ValueId>; 2] = [HashMap::new(), HashMap::new()];
+    for (k, side) in [then, else_].into_iter().enumerate() {
+        for st in side {
+            match st {
+                Stmt::Store(p, v) => {
+                    let l = p.root_local().filter(|_| p.path.is_empty())?;
+                    if !register(f.locals[l.index()].ty) {
+                        return None;
+                    }
+                    if !stored.contains(&l) {
+                        stored.push(l);
+                    }
+                    sides[k].insert(l, *v);
+                }
+                Stmt::Let(_, e) if select_safe(m, e) => {}
+                Stmt::At(_) => {}
+                _ => return None,
+            }
+        }
+    }
+    // A side's load of a local either side stores would read it too soon.
+    let reads_stored = [then, else_].into_iter().flatten().any(|st| match st {
+        Stmt::Let(_, Expr::Load(p)) => p.root_local().is_some_and(|l| stored.contains(&l)),
+        _ => false,
+    });
+    if reads_stored {
+        return None;
+    }
+    let mut out: Block = [then, else_]
+        .into_iter()
+        .flatten()
+        .filter(|st| matches!(st, Stmt::Let(..)))
+        .cloned()
+        .collect();
+    for l in stored {
+        let t = f.locals[l.index()].ty;
+        let mut side = |k: usize, out: &mut Block| match sides[k].get(&l) {
+            Some(&v) => v,
+            None => {
+                let old = f.new_value(t);
+                out.push(Stmt::Let(old, Expr::Load(Place::local(l))));
+                old
+            }
+        };
+        let (yes, no) = (side(0, &mut out), side(1, &mut out));
+        let v = f.new_value(t);
+        out.push(Stmt::Let(v, Expr::Select { cond, if_true: yes, if_false: no }));
+        out.push(Stmt::Store(Place::local(l), v));
+    }
+    Some(out)
+}
+
+/// Whether an expression can be computed where its branch isn't taken: it does nothing but
+/// compute, reads only locals and uniforms, and isn't a derivative (which wants the uniform
+/// control flow it's in).
+fn select_safe(m: &Module, e: &Expr) -> bool {
+    match e {
+        Expr::Const(_)
+        | Expr::Zero(_)
+        | Expr::Unary(..)
+        | Expr::Binary(..)
+        | Expr::Construct(..)
+        | Expr::Extract(..)
+        | Expr::ExtractDyn(..)
+        | Expr::Splat(..)
+        | Expr::Swizzle(..)
+        | Expr::Convert(..)
+        | Expr::Bitcast(..)
+        | Expr::Select { .. } => true,
+        Expr::Builtin(b, _) => !matches!(b, Builtin::Dpdx | Builtin::Dpdy | Builtin::Fwidth),
+        Expr::Load(p) => match p.root {
+            PlaceRoot::Local(_) => true,
+            PlaceRoot::Resource(r) => {
+                matches!(m.resources[r.index()].kind, ResourceKind::Uniform { .. })
+            }
+            _ => false,
+        },
+        _ => false,
+    }
 }
 
 /// A value built of another's parts, all of them in order (`Construct(t, [x.0, x.1, ...])`
@@ -589,10 +757,29 @@ impl Inliner<'_> {
         let locals = callee.locals.iter().map(|l| self.f.new_local(l.name.clone(), l.ty)).collect();
         let values = vec![None; callee.values.len()];
         let mut cx = Copier { callee, caller: self.f, args, values, locals, result: None };
-        out.extend(cx.block(&callee.body)?);
+        let copied = cx.block(&callee.body)?;
+        let result = cx.result;
+        // In a loop, the calls the body kept are in the loop now: those a loop inlines are.
+        let copied = if self.loops > 0
+            && !self.in_loops.is_empty()
+            && visit::any(&copied, &mut |s| s.expr().and_then(Expr::callee).is_some())
+        {
+            self.rename.resize(self.f.values.len(), None);
+            self.block(copied)?
+        } else {
+            copied
+        };
+        out.extend(copied);
+        // The result, if a call inlined just now gave it.
+        let result = result.map(|mut r| {
+            while let Some(Some(w)) = self.rename.get(r.index()) {
+                r = *w;
+            }
+            r
+        });
         // A body that never ends (it loops forever, or traps) has no `return` to take the
         // result from: what follows the call never runs, but needs a value.
-        let result = match (cx.result, ty) {
+        let result = match (result, ty) {
             (None, Some(t)) => {
                 let v = self.f.new_value(t);
                 out.push(Stmt::Let(v, Expr::Zero(t)));

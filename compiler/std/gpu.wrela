@@ -925,6 +925,12 @@ impl<T: GpuData> AppendBuffer<T> {
         self.items.span(0, self.items.len())
     }
 
+    /// The items, for a kernel to change in place (where it takes `mut Slots<T>`).
+    pub fn items_mut(mut self) -> GpuSpanMut<T> {
+        let n = self.items.len()
+        self.items.span_mut(0, n)
+    }
+
     /// How many were pushed, the first of three `u32`s (then 1 and 1): to read back, or as an
     /// indirect dispatch's group counts.
     pub fn count(self) -> GpuSpan<u32> {
