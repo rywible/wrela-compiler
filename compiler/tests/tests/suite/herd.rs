@@ -175,6 +175,37 @@ fn seed_1s_mass_is_within_0_05_percent_of_the_ground_truth() {
     assert!(off.abs() <= 0.05, "{mass} kg is {off:.3}% from {truth}");
 }
 
+/// #43 §9: the physique per bone, by the spike's method: the bones' masses sum to the whole,
+/// which is `adaptive_mass`'s; every bone's moments of inertia meet the triangle inequality;
+/// and each bone over 1 kg is within 5% of the derived interval's method (`integrate`). The two
+/// lay their cells on different grids, and a cell where two bones meet counts wholly for the
+/// bone nearest its centre, so they differ by a share of a cell at each bone's ends: 20% at
+/// 4 cm, 3.6% at 2 cm and 2.4% at 1 cm.
+#[test]
+fn the_physique_gives_each_bone_its_mass_and_moments() {
+    let mut host = ours();
+    let r = host.call_export("physique", &[Value::I32(1), Value::F32(0.02)]).expect("physique");
+    let [Value::F32(total), Value::F32(sum), Value::F32(bones), Value::F32(least)] = r[..] else {
+        panic!("{r:?}")
+    };
+    let mass = f64_of(&host.call_export("mass", &[Value::I32(1), Value::F32(0.02)]).expect("mass"));
+    let differ = f64_of(
+        &host
+            .call_export("physique_methods_differ", &[Value::I32(1), Value::F32(0.02)])
+            .expect("differ"),
+    );
+    eprintln!(
+        "seed 1 at 2 cm: {total:.2} kg in {bones} bones (summed {sum:.2}; adaptive_mass {mass:.2}); \
+         moments' triangle margin at least {least:.3}; bones within {:.2}% of integrate's",
+        differ * 100.0
+    );
+    assert!((f64::from(total) - mass).abs() <= 1e-6 * mass, "{total} against {mass}");
+    assert!((total - sum).abs() <= 1e-4 * total, "{sum} summed against {total}");
+    assert!(bones >= 20.0, "only {bones} bones have mass");
+    assert!(least >= -1e-4, "a bone's moments break the triangle inequality: {least}");
+    assert!(differ <= 0.05, "a bone is {:.2}% from integrate's", differ * 100.0);
+}
+
 /// AC6's timings on the CPU (WASM), in one harness, alternating: the physique at 2 cm (≤ 1.25×
 /// the spike's), the grazer's field per evaluation whole and pruned, and a raycast (each ≤ 1.25×).
 #[test]
