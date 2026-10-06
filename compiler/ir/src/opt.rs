@@ -58,10 +58,16 @@ pub fn flatten_gpu(m: &mut Module) -> Result<()> {
 /// invocation agrees, it pays for the side none takes: a few statements.
 const SELECT_SIZE: usize = 32;
 
+/// The most statements a larger branch's sides may compute, together, for them to be matched
+/// up ([`Merger`]).
+const MERGE_SIZE: usize = 3 * SELECT_SIZE;
+
 /// Makes each small `if` whose sides only compute and set local scalars or vectors into
-/// straight-line code: both sides' values, then each local set to a `select` of them. After
-/// every derivation, so an interval still sees the branch (GPU only: computing a side that
-/// isn't taken can't trap there).
+/// straight-line code: both sides' values, then each local set to a `select` of them. A larger
+/// one whose sides compute the same expressions of different operands (`smin`'s two sides, and
+/// their derived gradients) computes them once, of selected operands. After every derivation,
+/// so an interval still sees the branch (GPU only: computing a side that isn't taken can't trap
+/// there).
 fn if_convert(m: &Module, f: &mut Function) {
     let mut body = std::mem::take(&mut f.body);
     if_convert_block(m, f, &mut body);
@@ -87,7 +93,7 @@ fn if_convert_block(m: &Module, f: &mut Function, b: &mut Block) {
 
 /// `if cond { then } else { else_ }` as straight-line code, if its sides only compute (pure
 /// expressions, loads of what neither side stores) and set whole scalar or vector locals, and
-/// are small.
+/// are small (both sides whole), or larger and alike (their expressions matched up).
 fn as_selects(
     m: &Module,
     f: &mut Function,
@@ -95,8 +101,11 @@ fn as_selects(
     then: &Block,
     else_: &Block,
 ) -> Option<Block> {
+    // A small branch's size counts its sides' `At`s too, though they compute nothing: the
+    // GPU ratios were measured with that count. A larger one's counts what its sides compute.
     let size = then.len() + else_.len();
-    if size == 0 || size > SELECT_SIZE {
+    let computed = then.iter().chain(else_).filter(|st| !matches!(st, Stmt::At(_))).count();
+    if size == 0 || computed > MERGE_SIZE {
         return None;
     }
     // A side's load of what it stored before reads that value.
@@ -167,22 +176,194 @@ fn as_selects(
         .filter(|st| matches!(st, Stmt::Let(..)))
         .cloned()
         .collect();
-    for l in stored {
-        let t = f.locals[l.index()].ty;
-        let mut side = |k: usize, out: &mut Block| match sides[k].get(&l) {
-            Some(&v) => v,
-            None => {
-                let old = f.new_value(t);
-                out.push(Stmt::Let(old, Expr::Load(Place::local(l))));
-                old
-            }
-        };
-        let (yes, no) = (side(0, &mut out), side(1, &mut out));
-        let v = f.new_value(t);
-        out.push(Stmt::Let(v, Expr::Select { cond, if_true: yes, if_false: no }));
-        out.push(Stmt::Store(Place::local(l), v));
+    // Each local's value from each side: what it stores, or what the local holds.
+    let side = |f: &mut Function, k: usize, l: LocalId, out: &mut Block| match sides[k].get(&l) {
+        Some(&v) => v,
+        None => {
+            let old = f.new_value(f.locals[l.index()].ty);
+            out.push(Stmt::Let(old, Expr::Load(Place::local(l))));
+            old
+        }
+    };
+    if size <= SELECT_SIZE {
+        // Both sides whole, each local set to a select of its two values.
+        for l in stored {
+            let (yes, no) = (side(f, 0, l, &mut out), side(f, 1, l, &mut out));
+            let v = f.new_value(f.locals[l.index()].ty);
+            out.push(Stmt::Let(v, Expr::Select { cond, if_true: yes, if_false: no }));
+            out.push(Stmt::Store(Place::local(l), v));
+        }
+        return Some(out);
     }
-    Some(out)
+    // A larger branch, where its sides are one computation of different operands: they share
+    // at least two thirds of the smaller side ([`Merger`]), and the straight-line code computes
+    // at most a small branch's worth more than the larger side alone (what a SIMD group whose
+    // invocations agree runs). A guard's sides share nothing: it stays a branch.
+    let computes = |side: &Block| side.iter().filter(|st| !matches!(st, Stmt::At(_))).count();
+    let (a, b) = (computes(then), computes(else_));
+    let (larger, smaller) = (a.max(b), a.min(b));
+    let mark = f.values.len();
+    let mut merger = Merger {
+        m,
+        cond,
+        defs: [then, else_].map(|side| {
+            side.iter()
+                .filter_map(|st| match st {
+                    Stmt::Let(v, e) => Some((*v, e.clone())),
+                    _ => None,
+                })
+                .collect()
+        }),
+        done: HashMap::new(),
+        shared: 0,
+    };
+    let mut stores = Vec::new();
+    for l in stored {
+        let (yes, no) = (side(f, 0, l, &mut out), side(f, 1, l, &mut out));
+        let Some(v) = merger.merge(f, &mut out, yes, no) else {
+            f.values.truncate(mark);
+            return None;
+        };
+        stores.push(Stmt::Store(Place::local(l), v));
+    }
+    out.extend(stores);
+    let out = live(out);
+    if merger.shared > 0
+        && 3 * merger.shared >= 2 * smaller
+        && out.len() <= larger + SELECT_SIZE / 2
+    {
+        Some(out)
+    } else {
+        // Nothing made is used.
+        f.values.truncate(mark);
+        None
+    }
+}
+
+/// Matches up the two sides of a branch made into selects: a value of each side, defined by the
+/// same expression of (possibly) different operands, is that expression of their operands
+/// matched up, computed once; values that differ otherwise are selected between.
+struct Merger<'a> {
+    m: &'a Module,
+    cond: ValueId,
+    /// Each side's definitions.
+    defs: [HashMap<ValueId, Expr>; 2],
+    /// The value made for each pair already matched up.
+    done: HashMap<(ValueId, ValueId), ValueId>,
+    /// How many expressions the two sides share (each computed once, not twice).
+    shared: usize,
+}
+
+impl Merger<'_> {
+    /// The value that is `yes` where the condition holds and `no` where it doesn't, its
+    /// statements appended to `out`; `None` where a select can't be made (a struct, or values
+    /// of two types).
+    fn merge(
+        &mut self,
+        f: &mut Function,
+        out: &mut Block,
+        yes: ValueId,
+        no: ValueId,
+    ) -> Option<ValueId> {
+        if yes == no {
+            return Some(yes);
+        }
+        if let Some(&v) = self.done.get(&(yes, no)) {
+            return Some(v);
+        }
+        let t = f.values[yes.index()];
+        if f.values[no.index()] != t {
+            return None;
+        }
+        let float = matches!(self.m.types.get(t), TypeDef::Scalar(Scalar::F32 | Scalar::F64));
+        let shared = match (self.defs[0].get(&yes), self.defs[1].get(&no)) {
+            (Some(a), Some(b)) if same_shape(a, b) => Some((a.clone(), operands(a), operands(b))),
+            // `-y` is `-0.0 - y`, exactly: a side that subtracts from what the other negates
+            // (a derived gradient's `0 - y`, simplified) matches it.
+            (Some(Expr::Unary(UnOp::Neg, y)), Some(Expr::Binary(BinOp::Sub, x2, y2))) if float => {
+                let zero = negative_zero(self.m, f, out, t);
+                Some((Expr::Binary(BinOp::Sub, zero, *y), vec![zero, *y], vec![*x2, *y2]))
+            }
+            (Some(Expr::Binary(BinOp::Sub, x1, y1)), Some(Expr::Unary(UnOp::Neg, y))) if float => {
+                let zero = negative_zero(self.m, f, out, t);
+                Some((Expr::Binary(BinOp::Sub, *x1, *y1), vec![*x1, *y1], vec![zero, *y]))
+            }
+            _ => None,
+        };
+        let e = match shared {
+            Some((mut e, ours, theirs)) => {
+                let mut merged = Vec::with_capacity(ours.len());
+                for (a, b) in ours.into_iter().zip(theirs) {
+                    merged.push(self.merge(f, out, a, b)?);
+                }
+                let mut merged = merged.into_iter();
+                e.for_each_value_mut(&mut |x| *x = merged.next().expect("as many operands"));
+                self.shared += 1;
+                e
+            }
+            None if matches!(self.m.types.get(t), TypeDef::Scalar(_) | TypeDef::Vector(_)) => {
+                Expr::Select { cond: self.cond, if_true: yes, if_false: no }
+            }
+            None => return None,
+        };
+        let v = f.new_value(t);
+        out.push(Stmt::Let(v, e));
+        self.done.insert((yes, no), v);
+        Some(v)
+    }
+}
+
+/// `-0.0` of the float type `t`, defined at the end of `out`.
+fn negative_zero(m: &Module, f: &mut Function, out: &mut Block, t: TypeId) -> ValueId {
+    let c = match m.types.get(t) {
+        TypeDef::Scalar(Scalar::F64) => Const::F64(-0.0),
+        _ => Const::F32(-0.0),
+    };
+    let v = f.new_value(t);
+    out.push(Stmt::Let(v, Expr::Const(c)));
+    v
+}
+
+/// An expression's operands, in order.
+fn operands(e: &Expr) -> Vec<ValueId> {
+    let mut out = Vec::new();
+    e.for_each_value(&mut |x| out.push(x));
+    out
+}
+
+/// Whether two expressions are the same but for their operands. Float constants are the same
+/// bit for bit (`0.0` isn't `-0.0`).
+fn same_shape(a: &Expr, b: &Expr) -> bool {
+    let blank = |e: &Expr| {
+        let mut e = e.clone();
+        e.for_each_value_mut(&mut |x| *x = ValueId(0));
+        e
+    };
+    match (a, b) {
+        (Expr::Const(Const::F32(x)), Expr::Const(Const::F32(y))) => x.to_bits() == y.to_bits(),
+        (Expr::Const(Const::F64(x)), Expr::Const(Const::F64(y))) => x.to_bits() == y.to_bits(),
+        _ => blank(a) == blank(b),
+    }
+}
+
+/// The statements of straight-line code that its stores need, in order: it has no other effect,
+/// and its values are its own.
+fn live(code: Block) -> Block {
+    let mut needed: HashSet<ValueId> = HashSet::new();
+    let mut keep = vec![false; code.len()];
+    for (i, st) in code.iter().enumerate().rev() {
+        let used = match st {
+            Stmt::Let(v, _) => needed.contains(v),
+            _ => true,
+        };
+        if used {
+            keep[i] = true;
+            st.for_each_value(&mut |x| {
+                needed.insert(x);
+            });
+        }
+    }
+    code.into_iter().zip(keep).filter_map(|(st, k)| k.then_some(st)).collect()
 }
 
 /// Whether an expression can be computed where its branch isn't taken: it does nothing but
@@ -2239,6 +2420,88 @@ mod tests {
         dce(&mut f);
         assert_eq!(f.body, vec![Stmt::Let(x, Expr::Param(0)), Stmt::Return(Some(x))]);
         assert!(f.locals.is_empty());
+    }
+
+    /// A large branch whose sides compute the same expressions of different operands becomes
+    /// those expressions computed once, of selected operands; one side's negation matches the
+    /// other side's subtraction, as a subtraction from `-0.0`. A guard (one side empty) stays.
+    #[test]
+    fn a_large_branchs_sides_alike_are_computed_once() {
+        const STEPS: usize = 20;
+        let mut m = Module::default();
+        let (f32t, boolt) = (m.types.f32(), m.types.bool());
+        let param =
+            |name: &str| Param { name: name.into(), ty: f32t, by_ref: false, mutable: false };
+        let mut f = Function::new("f", vec![param("x"), param("y")], Some(f32t));
+        let (x, y, c) = (f.new_value(f32t), f.new_value(f32t), f.new_value(boolt));
+        let (v, w) = (f.new_local("v", f32t), f.new_local("w", f32t));
+        // if x > y { t = x; t = t * x + y (20 times); v = t; w = -(t * y) }
+        // else { t = y; t = t * y + x (20 times); v = t; w = x - t * x }
+        let mut side = |a: ValueId, b: ValueId, negate: bool| {
+            let mut out = Vec::new();
+            let mut t = a;
+            for _ in 0..STEPS {
+                let (prod, sum) = (f.new_value(f32t), f.new_value(f32t));
+                out.push(Stmt::Let(prod, Expr::Binary(BinOp::Mul, t, a)));
+                out.push(Stmt::Let(sum, Expr::Binary(BinOp::Add, prod, b)));
+                t = sum;
+            }
+            out.push(Stmt::Store(Place::local(v), t));
+            let (prod, r) = (f.new_value(f32t), f.new_value(f32t));
+            out.push(Stmt::Let(prod, Expr::Binary(BinOp::Mul, t, b)));
+            let last = match negate {
+                true => Expr::Unary(UnOp::Neg, prod),
+                false => Expr::Binary(BinOp::Sub, b, prod),
+            };
+            out.push(Stmt::Let(r, last));
+            out.push(Stmt::Store(Place::local(w), r));
+            out
+        };
+        let (then, else_) = (side(x, y, true), side(y, x, false));
+        let guard = side(x, y, false);
+        let out = f.new_value(f32t);
+        f.body = vec![
+            Stmt::Let(x, Expr::Param(0)),
+            Stmt::Let(y, Expr::Param(1)),
+            Stmt::Let(c, Expr::Binary(BinOp::Gt, x, y)),
+            Stmt::If { cond: c, then, else_ },
+            Stmt::If { cond: c, then: guard, else_: vec![] },
+            Stmt::Let(out, Expr::Load(Place::local(w))),
+            Stmt::Return(Some(out)),
+        ];
+        if_convert(&m, &mut f);
+        let ifs = f.body.iter().filter(|st| matches!(st, Stmt::If { .. })).count();
+        assert_eq!(ifs, 1, "the guard stays a branch, the other doesn't: {:?}", f.body);
+        let mut exprs: HashMap<ValueId, Expr> = HashMap::new();
+        let mut stores: HashMap<LocalId, ValueId> = HashMap::new();
+        for st in f.body.iter().take_while(|st| !matches!(st, Stmt::If { .. })) {
+            match st {
+                Stmt::Let(v, e) => drop(exprs.insert(*v, e.clone())),
+                Stmt::Store(p, v) => drop(stores.insert(p.root_local().expect("a local"), *v)),
+                _ => {}
+            }
+        }
+        let def = |v: ValueId| exprs[&v].clone();
+        let select = |v: ValueId, yes: ValueId, no: ValueId| {
+            assert_eq!(def(v), Expr::Select { cond: c, if_true: yes, if_false: no });
+        };
+        // v: the chain, of a and b selected once each.
+        let Expr::Binary(BinOp::Add, prod, b) = def(stores[&v]) else { panic!("{:?}", f.body) };
+        let Expr::Binary(BinOp::Mul, _, a) = def(prod) else { panic!("{:?}", f.body) };
+        select(a, x, y);
+        select(b, y, x);
+        // w: (-0.0 or x) - (t * b).
+        let Expr::Binary(BinOp::Sub, from, last) = def(stores[&w]) else { panic!("{:?}", f.body) };
+        assert_eq!(def(last), Expr::Binary(BinOp::Mul, stores[&v], b));
+        let Expr::Select { if_true: zero, if_false, .. } = def(from) else {
+            panic!("{:?}", f.body)
+        };
+        assert_eq!(if_false, x);
+        assert!(
+            matches!(def(zero), Expr::Const(Const::F32(z)) if z.to_bits() == (-0.0f32).to_bits())
+        );
+        let muls = exprs.values().filter(|e| matches!(e, Expr::Binary(BinOp::Mul, ..))).count();
+        assert_eq!(muls, STEPS + 1, "each product once: {:?}", f.body);
     }
 
     /// A function given the same large uniform data from two calls is copied once with that
