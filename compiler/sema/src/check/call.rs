@@ -3154,7 +3154,8 @@ impl<'p> Checker<'p> {
 
     /// A draw's `cull:` (`std::gpu::Cull`) or `depth_bias:` (`std::gpu::DepthBias`): a value
     /// the pipeline holds, so a build-time constant, written as a variant or a struct of
-    /// number literals. A cull mode's variant index, or a bias's three fields.
+    /// number literals, there or in a `const` it names. A cull mode's variant index, or a
+    /// bias's three fields.
     fn render_constant(&mut self, value: &ast::Expr, lang: Lang) -> Option<[f64; 3]> {
         let a = self.p.lang_adt(lang)?;
         let ty = self.p.types.intern(TyKind::Adt(a, Vec::new()));
@@ -3181,6 +3182,7 @@ impl<'p> Checker<'p> {
                     _ => None,
                 }
             }
+            (&ExprKind::Const(c), _) => declared_render_constant(self.p, c, lang, a),
             _ => None,
         };
         if got.is_none() {
@@ -3204,6 +3206,47 @@ impl<'p> Checker<'p> {
             );
         }
         got
+    }
+}
+
+/// A `const` of a draw's state type (`Lang::Cull` or `Lang::DepthBias`, the ADT `a`), as its
+/// declaration writes it: a variant, or a struct of number literals, maybe negated
+/// (`render_constant`).
+fn declared_render_constant(
+    p: &crate::Program,
+    c: ConstId,
+    lang: Lang,
+    a: AdtId,
+) -> Option<[f64; 3]> {
+    fn number(e: &ast::Expr) -> Option<f64> {
+        match &e.kind {
+            ast::ExprKind::Lit(ast::Lit {
+                kind: ast::LitKind::Int(ast::IntValue::Ok(v)), ..
+            }) => Some(*v as f64),
+            ast::ExprKind::Lit(ast::Lit { kind: ast::LitKind::Float(x), .. }) => Some(*x),
+            ast::ExprKind::Unary(ast::UnOp::Neg, inner) => number(inner).map(|x| -x),
+            _ => None,
+        }
+    }
+    let adt = p.adt(a);
+    match (&p.const_(c).value.kind, lang) {
+        (ast::ExprKind::Path(path), Lang::Cull) => {
+            let name = &path.segments.last()?.ident.name;
+            let v = adt.variants().iter().position(|v| &v.name == name)?;
+            Some([v as f64, 0.0, 0.0])
+        }
+        (ast::ExprKind::StructLit { fields, base: None, .. }, Lang::DepthBias) => {
+            if fields.len() != adt.fields().len() {
+                return None;
+            }
+            let mut out = [0.0; 3];
+            for f in fields {
+                let k = adt.fields().iter().position(|d| d.name == f.name.name)?;
+                *out.get_mut(k)? = number(f.value.as_ref()?)?;
+            }
+            Some(out)
+        }
+        _ => None,
     }
 }
 

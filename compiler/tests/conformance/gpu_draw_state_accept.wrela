@@ -1,10 +1,14 @@
 // accepts: gpu.dispatch
 // Indexed indirect draws, and a draw's render state written where it draws: a cull mode and a
-// depth bias, build-time constants (a negative bias, a whole number for a float, the defaults).
+// depth bias, build-time constants (a negative bias, a whole number for a float, the defaults),
+// there or in a `const`.
 use std::gpu::{
     ClipPosition, Cull, DepthBias, GpuBuffer, VertexIndex, begin_screen_pass, buffer, draw,
     present,
 }
+
+const SHADOW_BIAS = DepthBias { slope: 2.0, constant: 4, clamp: 0.0 }
+const FACES = Cull::Back
 
 @vertex
 fn corner(points: [vec2], v: VertexIndex) -> ClipPosition {
@@ -33,5 +37,6 @@ pub fn frame(time: f32, width: u32, height: u32) {
         depth_bias: DepthBias { constant: -4, slope: 2, clamp: 0.5 },
     )
     draw(corner.bind(points), white, vertices: 3, cull: Cull::None, depth_bias: DepthBias { constant: 1, slope: -1.5, clamp: 0.0 })
+    draw(corner.bind(points), white, vertices: 3, cull: FACES, depth_bias: SHADOW_BIAS)
     present()
 }

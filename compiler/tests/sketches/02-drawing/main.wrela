@@ -142,7 +142,7 @@ pub fn frame(state: mut Scene, time: f32, width: u32, height: u32) {
             ),
             shade.bind(
                 field: field,
-                look: ByChannels { unused: 0 },
+                look: ByChannels {},
                 view: v,
                 lights: LIGHTS,
                 shadow: state.shadow,
