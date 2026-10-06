@@ -1331,10 +1331,11 @@ fn spin_ns() -> f64 {
     best
 }
 
-/// AC5, measured, not gated: with the herd's frames drawing beside them (the native host, the
-/// ticks on a thread of their own, neither waiting for the other), how many blocks a steady tick
-/// allocates, and how long it loses waiting on the allocator's lock (std::alloc counts the
-/// times it found the lock taken and the tries it spun; a try's cost is [`spin_ns`]'s).
+/// AC5, measured: with the herd's frames drawing beside them (the native host, the ticks on a
+/// thread of their own, neither waiting for the other), how many blocks a steady tick allocates,
+/// and how long it loses waiting on the allocator's lock (std::alloc counts the times it found
+/// the lock taken and the tries it spun; a try's cost is [`spin_ns`]'s). A steady tick reuses
+/// its buffers (#43 §5.2), so it allocates nothing: that's asserted.
 #[test]
 #[ignore = "a measurement: needs a GPU"]
 fn the_herds_ticks_beside_frames_allocate_and_wait() {
@@ -1366,6 +1367,7 @@ fn the_herds_ticks_beside_frames_allocate_and_wait() {
         pct(&times, 0.5),
         pct(&times, 0.99),
     );
+    assert_eq!(allocs[allocs.len() - 1], 0.0, "a steady tick allocated");
 }
 
 // ---- AC7: the herd's grazer against the spike's ---------------------------------------------------
