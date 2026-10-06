@@ -99,11 +99,14 @@ export async function startProgram(
   screen: ScreenTarget,
   options: ProgramOptions = {},
   timestamps = false,
+  onPipelines?: (ms: number) => void,
 ): Promise<Program> {
-    const [pipelines, compiled] = await Promise.all([
-    buildPipelines(device, build.manifest, build.shaders),
-    Program.compile(build.wasm),
-  ]);
+  const started = performance.now();
+  const built = buildPipelines(device, build.manifest, build.shaders).then((p) => {
+    onPipelines?.(performance.now() - started);
+    return p;
+  });
+  const [pipelines, compiled] = await Promise.all([built, Program.compile(build.wasm)]);
   const executor = new GpuExecutor(device, pipelines, screen, timestamps);
   const checker = new Checker(build.manifest, limitsOf(device.limits));
     return Program.instantiate(compiled, checker, executor, options);

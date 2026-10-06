@@ -155,6 +155,17 @@ pub fn realize(game: mut Game, s: u32, cell: f32) {
     record(g.field(), grid, 0.06, mut game.scratch, mut game.mesh)
 }
 
+/// Realizes seed `s` at `cell` into scratch of its own, whose probe, in a debug build, holds each
+/// boundary corner's value as each live block evaluated it (#42 AC2): the probe is the sixth
+/// newest buffer (the mesh's five are newer).
+pub fn probe_corners(game: mut Game, s: u32, cell: f32) {
+    let g = grazer(s)
+    let grid = Grid::around(g.bounds(), cell)
+    game.scratch = Scratch::new(grid.blocks)
+    game.mesh = Mesh::new(Room { vertices: grid.blocks * 8, quads: grid.blocks * 8 })
+    record(g.field(), grid, 0.06, mut game.scratch, mut game.mesh)
+}
+
 pub fn frame(game: mut Game, time: f32, width: u32, height: u32) {}
 
 /// Realizes seed `s` at `cell` `n` times over, back to back: for timing, the GPU kept busy.

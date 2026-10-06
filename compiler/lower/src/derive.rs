@@ -41,7 +41,9 @@ pub(crate) fn call(
             (which, ty.map(|t| fl.concrete(t)))
         }
         DeriveKind::Reads => (fl.cx.checked.program.types.unit, ty.map(|t| fl.concrete(t))),
-        DeriveKind::ValueAndGradient => (substs[0], None),
+        DeriveKind::ValueAndGradient => {
+            (substs[0], if lang == Lang::ValueGradientWith { substs.get(1).copied() } else { None })
+        }
     };
     let key = InstanceKey::Derived { of: callable, kind, input, output };
     let callee = fl.cx.instance(fl.mb, key, Some((fl.id, c.span)));
@@ -89,11 +91,18 @@ pub(crate) fn signature(cx: &mut Cx, mb: &mut ModuleBuilder, key: &InstanceKey) 
     let f32 = mb.m.types.f32();
     match kind {
         DeriveKind::ValueAndGradient => {
-            if let Some(x) = x {
+            let with = output.map(|t| cx.lower_ty(mb, t, span));
+            if let (Some(x), Some(with)) = (x, with.unwrap_or(Some(f32))) {
                 params.push(ir::Param { name: "x".into(), ty: x, by_ref: false, mutable: false });
+                let mut fields = vec![("_0".into(), f32), ("_1".into(), x)];
+                if output.is_some() {
+                    fields.push(("_2".into(), with));
+                }
+                let names: Vec<String> =
+                    fields.iter().map(|(_, t)| mb.m.types.display(*t).to_string()).collect();
                 let tuple = mb.m.types.intern(ir::TypeDef::Struct {
-                    name: format!("(f32, {})", mb.m.types.display(x)),
-                    fields: vec![("_0".into(), f32), ("_1".into(), x)],
+                    name: format!("({})", names.join(", ")),
+                    fields,
                 });
                 return ir::Function::new("value_and_gradient", params, Some(tuple));
             }
@@ -331,7 +340,15 @@ fn build(
         // The captures are every parameter but the last, the input.
         DeriveKind::ValueAndGradient => {
             let ncap = mb.m.functions[id.index()].params.len() as u32 - 1;
-            ir::derive::value_and_gradient(&mut mb.m, &mut mb.derived, inner, ncap, target)
+            let InstanceKey::Derived { output, .. } = key else { unreachable!() };
+            ir::derive::value_and_gradient(
+                &mut mb.m,
+                &mut mb.derived,
+                inner,
+                ncap,
+                target,
+                output.is_some(),
+            )
         }
         DeriveKind::Interval => {
             let sig = &mb.m.functions[id.index()];

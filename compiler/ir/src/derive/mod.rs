@@ -32,15 +32,17 @@ pub struct DeriveCache {
 }
 
 /// A function of `f`'s captures and `x` (its last parameter) returning `(f32, X)`: `f(x)` and
-/// its gradient with respect to `x`, for `target`.
+/// its gradient with respect to `x`, for `target`. `with`: `f` returns `(f32, T)`, and the
+/// function returns `(f32, X, T)`, the `T` as `f` computes it.
 pub fn value_and_gradient(
     m: &mut Module,
     cache: &mut DeriveCache,
     f: FuncId,
     ncap: u32,
     target: Target,
+    with: bool,
 ) -> Result<FuncId> {
-    ad::value_and_gradient(m, cache, f, ncap, target)
+    ad::value_and_gradient(m, cache, f, ncap, target, with)
 }
 
 /// A function of `f`'s captures and a box (`box_ty`, with fields `lo` and `hi`) returning an

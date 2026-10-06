@@ -342,7 +342,13 @@ fn derived_callables(p: &Program, f: FnId, body: &Body) -> Vec<(BodyId, Span)> {
         let Callee::Fn { func, .. } = &c.callee else { return };
         let derived = matches!(
             p.func(*func).lang,
-            Some(Lang::Gradient | Lang::ValueAndGradient | Lang::IntervalOf | Lang::LiftGradient)
+            Some(
+                Lang::Gradient
+                    | Lang::ValueAndGradient
+                    | Lang::ValueGradientWith
+                    | Lang::IntervalOf
+                    | Lang::LiftGradient,
+            )
         );
         if derived
             && let Some(place) = c.args.first().and_then(|a| a.place())

@@ -350,7 +350,6 @@ impl Fl<'_, '_> {
                 | L::StartVoice
                 | L::StartTicker
                 | L::MemAbort
-                | L::DebugBuild
                 | L::StrAddr
                 | L::StrLen
                 | L::StrPart
@@ -358,7 +357,12 @@ impl Fl<'_, '_> {
         let known = raw
             || matches!(
                 lang,
-                L::MemSizeOf | L::MemAlignOf | L::MemNeedsDrop | L::Swap | L::Replace
+                L::MemSizeOf
+                    | L::MemAlignOf
+                    | L::MemNeedsDrop
+                    | L::Swap
+                    | L::Replace
+                    | L::DebugBuild
             );
         if !known {
             return None;

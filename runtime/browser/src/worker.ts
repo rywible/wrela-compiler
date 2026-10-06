@@ -248,9 +248,14 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
     delay: params.tickdelay,
     wasmHash: wasmHash(build.wasm),
   });
+  let pipelinesMs: number | null = null;
+  const salted =
+    params.salt > 0
+      ? { ...build, shaders: build.shaders.map((s, i) => `${s}\n// salt ${params.salt} ${i}\n`) }
+      : build;
   const program = await startProgram(
     device,
-    build,
+    salted,
     {
       texture: () => screen,
       afterPass: (encoder) =>
@@ -270,6 +275,9 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
       },
     },
     params.timestamps > 0,
+    (ms) => {
+      pipelinesMs = ms;
+    },
   );
   const executor = program.executor as GpuExecutor;
   if (params.timestamps > 0 && !executor.timed) throw new GpuError("the test asks for timestamps, but this device has no timestamp queries");
@@ -333,6 +341,7 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
     putResult(base, "log.txt", printed.map((l) => `${l}\n`).join("")),
     putResult(base, "frames.json", JSON.stringify({ cpu_ms: cpu, began_ms, printed_in })),
     params.timestamps > 0 ? executor.timings().then((t) => putResult(base, "timings.json", JSON.stringify(t))) : null,
+    params.salt > 0 ? putResult(base, "pipelines.json", JSON.stringify({ ms: pipelinesMs, count: build.manifest.pipelines.length })) : null,
   ]);
   if (params.audio > 0) {
     if (!program.hasVoice) throw new Error("the test asks for audio, but the program started no voice");

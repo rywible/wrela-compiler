@@ -176,6 +176,6 @@ pub fn abort_from(thread: u32) {
 
 /// Whether this is a debug build (`wrela build --debug`, and `wrela test`), which pays for
 /// checks a release build doesn't make: a constant, so a release build has no trace of them,
-/// nor of the functions only they call.
+/// nor of the functions only they call. GPU code can ask too.
 @intrinsic
 pub fn debug_build() -> bool {}

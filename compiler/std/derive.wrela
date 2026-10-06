@@ -151,6 +151,13 @@ pub fn gradient<X: Domain>(f: fn(X) -> f32, at: X) -> X {}
 @intrinsic
 pub fn value_and_gradient<X: Domain>(f: fn(X) -> f32, at: X) -> (f32, X) {}
 
+/// `f(at)`'s value, its gradient, and the rest of what `f` returns, from one derived
+/// evaluation: a field's channels beside its distance and normal, where computing them apart
+/// would compute the distance twice (a creature's shading, #43 §8.3). Only the value is
+/// differentiated.
+@intrinsic
+pub fn value_gradient_with<X: Domain, T>(f: fn(X) -> (f32, T), at: X) -> (f32, X, T) {}
+
 /// A range that contains `f(x)` for every `x` in `over`, by interval arithmetic over `f`'s
 /// body: an `Interval` for an `f32`, and a box for a vector, each component's range from one
 /// derived function. On the GPU each operation widens its result outward by its error bound
@@ -159,6 +166,16 @@ pub fn value_and_gradient<X: Domain>(f: fn(X) -> f32, at: X) -> (f32, X) {}
 pub fn interval<X: Domain, Y: Domain>(f: fn(X) -> Y, over: X::Box) -> Y::Box {}
 
 // ---- tests (the suite runs std's: `std_tests_pass`) --------------------------------------------
+
+@test
+fn a_gradient_carries_the_rest_of_the_result() {
+    let p = vec3(0.3, -0.4, 1.2)
+    let f = |q: vec3| (length(q) - 1.0, (q.x * q.y, vec2(q.z, 2.0)))
+    let (d, g, rest) = value_gradient_with(f, p)
+    let (d2, g2) = value_and_gradient(|q: vec3| length(q) - 1.0, p)
+    assert(d == d2 && g == g2, "the value and gradient are value_and_gradient's")
+    assert(rest.0 == p.x * p.y && rest.1 == vec2(p.z, 2.0), "the rest is the function's")
+}
 
 @test
 fn samples_spread_evenly_through_their_box() {

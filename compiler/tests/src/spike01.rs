@@ -251,7 +251,11 @@ pub struct FrameTimes {
     pub terrain: f64,
     pub shade: f64,
     pub creatures: f64,
+    /// From the shadow pass's start to the shading pass's end: passes overlap here (on the
+    /// native host the terrain's runs beside the shadow pass).
     pub frame: f64,
+    /// The three passes' own times summed: the frame's GPU work, however it overlaps.
+    pub passes: f64,
 }
 
 fn read(device: &wgpu::Device, queue: &wgpu::Queue, src: &wgpu::Buffer, size: u64) -> Vec<u8> {
@@ -1184,6 +1188,7 @@ impl Spike {
                     shade: d(2),
                     creatures: d(0) + d(2),
                     frame: (t[5] - t[0]) / 1e6,
+                    passes: d(0) + d(1) + d(2),
                 }
             })
             .collect()

@@ -328,6 +328,13 @@ fn headless<S: AsRef<std::ffi::OsStr>>(args: impl IntoIterator<Item = S>) -> boo
         .success()
 }
 
+/// Runs a plain page (no wrela build) at `rel` in headless Chrome with URL fragment
+/// `fragment`: whether it wrote `ok` to `results/DONE` within `timeout` seconds.
+pub fn run_page_in_chrome(rel: &str, fragment: &str, timeout: u32) -> bool {
+    let _ = std::fs::remove_dir_all(repo_root().join(rel).join("results"));
+    headless([rel, fragment, &timeout.to_string()])
+}
+
 /// A test-mode run in headless Chrome that must fail: the message the page failed with.
 pub fn chrome_failure(rel: &str, run: ChromeRun) -> String {
     assert!(
@@ -401,6 +408,9 @@ pub struct ChromeRun {
     pub framedelay: u32,
     /// Keep no state hashes (they cost CPU time a timing run shouldn't count).
     pub nohash: bool,
+    /// Makes every shader unique, so its pipelines are created cold, and times creating them
+    /// (`results/pipelines.json`; 0: none).
+    pub salt: u32,
 }
 
 impl ChromeRun {
@@ -420,6 +430,7 @@ impl ChromeRun {
             tickdelay: 0,
             framedelay: 0,
             nohash: false,
+            salt: 0,
         }
     }
 
@@ -446,10 +457,11 @@ impl ChromeRun {
             tickdelay,
             framedelay,
             nohash,
+            salt,
         } = self;
         let count = |name: &str, n: u32| if n > 0 { format!("&{name}={n}") } else { String::new() };
         format!(
-            "#test&frames={frames}&width={width}&height={height}&fps={fps}&workers={workers}{}{}{}{}{}{}{}{}{}",
+            "#test&frames={frames}&width={width}&height={height}&fps={fps}&workers={workers}{}{}{}{}{}{}{}{}{}{}",
             count("audio", *audio),
             if *timestamps { "&timestamps=1" } else { "" },
             if input.is_empty() { String::new() } else { format!("&input={input}") },
@@ -459,6 +471,7 @@ impl ChromeRun {
             count("tickdelay", *tickdelay),
             count("framedelay", *framedelay),
             if *nohash { "&nohash=1" } else { "" },
+            count("salt", *salt),
         )
     }
 }

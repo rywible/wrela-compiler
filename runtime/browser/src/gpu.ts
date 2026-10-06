@@ -214,9 +214,18 @@ async function buildPipeline(device: GPUDevice, p: Pipeline, source: string): Pr
         depthBias: p.depth_bias,
         variants: new Map(),
       };
-      // The screen's variant now, so a shader's errors come at load.
-      const screen = await device.createRenderPipelineAsync(renderDescriptor(p.name, render, SCREEN_FORMAT, null));
-      render.variants.set(targetsKey(SCREEN_FORMAT, null), screen);
+      // The variants a pass is likeliest to draw it into, now and side by side: the screen, the
+      // screen with a depth target, a depth pass alone. A shader's errors then come at load, and
+      // no frame waits to compile these (a texture's other formats are made at a first draw).
+      const targets: [GPUTextureFormat | null, GPUTextureFormat | null][] = [
+        [SCREEN_FORMAT, null],
+        [SCREEN_FORMAT, "depth32float"],
+        [null, "depth32float"],
+      ];
+      const made = await Promise.all(
+        targets.map(([c, d]) => device.createRenderPipelineAsync(renderDescriptor(p.name, render!, c, d))),
+      );
+      targets.forEach(([c, d], i) => render!.variants.set(targetsKey(c, d), made[i]!));
     }
   } catch (e) {
     throw fail(errorMessage(e));

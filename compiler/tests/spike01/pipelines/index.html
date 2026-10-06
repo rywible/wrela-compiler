@@ -1,0 +1,100 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>spike 01's pipelines, cold</title>
+<!--
+  Spike 01's scene pipelines created cold, all at once, as its main.js's `pipelines(salt, true)`
+  does: the same 12 pipelines from the same files, the same layouts, unique source (its SALT).
+  main.js runs its whole benchmark on load and exports nothing, so this copies that one function
+  and its layouts. tools/headless.py runs it; it PUTs results/pipelines.json ({ms, count}) and
+  results/DONE (#42 AC4, herd::the_herds_pipelines_load_cold_as_fast).
+-->
+<script type="module">
+const put = (name, body) => fetch(`results/${name}`, { method: "PUT", body });
+try {
+  const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
+  const device = await adapter.requestDevice();
+  const fixture = (f) => fetch(`../../fixtures/spike01/${f}.wgsl`).then((r) => r.text());
+  const src = { field: await fixture("field"), extract: await fixture("extract"), draw: await fixture("draw") };
+  const C = GPUShaderStage.COMPUTE, VS = GPUShaderStage.VERTEX, FS = GPUShaderStage.FRAGMENT;
+  const e = (binding, visibility, type) => ({ binding, visibility, buffer: { type } });
+  const extract = (skip) => device.createBindGroupLayout({
+    entries: [e(0, C, "uniform"), e(1, C, "uniform"), ...[2, 3, 4, 5, 6, 7, 8].filter((b) => b !== skip).map((b) => e(b, C, "storage"))],
+  });
+  const L = {
+    cull: extract(-1),
+    place: extract(3),
+    frame: device.createBindGroupLayout({
+      entries: [
+        e(0, VS | FS, "uniform"),
+        { binding: 1, visibility: FS, texture: { sampleType: "depth" } },
+        { binding: 2, visibility: FS, sampler: { type: "comparison" } },
+        { binding: 3, visibility: FS, texture: { sampleType: "float", viewDimension: "3d" } },
+        { binding: 4, visibility: FS, sampler: { type: "filtering" } },
+      ],
+    }),
+    shadowFrame: device.createBindGroupLayout({ entries: [e(0, VS | FS, "uniform")] }),
+    grazer: device.createBindGroupLayout({ entries: [e(0, FS, "uniform"), e(1, VS, "read-only-storage")] }),
+  };
+  const salt = Math.random() * 1000 + 1;
+  const salted = (code) => code.replace("const SALT: f32 = 0.0;", `const SALT: f32 = ${salt.toFixed(4)};`);
+  // main.js's `pipelines(salt, true)`, from here on.
+  const t0 = performance.now();
+  const em = device.createShaderModule({ code: salted(src.field) + src.extract, label: "extract" });
+  const dm = device.createShaderModule({ code: salted(src.field) + src.draw, label: "draw" });
+  const vbuf = [{
+    arrayStride: 48,
+    attributes: [
+      { shaderLocation: 0, offset: 0, format: "float32x3" },
+      { shaderLocation: 1, offset: 12, format: "uint8x4" },
+      { shaderLocation: 2, offset: 16, format: "float32x3" },
+      { shaderLocation: 3, offset: 28, format: "unorm8x4" },
+      { shaderLocation: 4, offset: 32, format: "uint32" },
+    ],
+  }];
+  const pl = (...bgls) => device.createPipelineLayout({ bindGroupLayouts: bgls });
+  const compute = (entryPoint, bgl) => () => device.createComputePipelineAsync({ layout: pl(bgl), compute: { module: em, entryPoint } });
+  const prim = { topology: "triangle-list", cullMode: "back", frontFace: "ccw" };
+  const depth = (depthCompare, depthWriteEnabled) => ({ format: "depth32float", depthCompare, depthWriteEnabled });
+  const shade = (entryPoint, prepass) => () => device.createRenderPipelineAsync({
+    layout: pl(L.frame, L.grazer),
+    vertex: { module: dm, entryPoint: "skin", buffers: vbuf },
+    fragment: { module: dm, entryPoint, targets: [{ format: "rgba8unorm-srgb" }] },
+    primitive: prim,
+    depthStencil: prepass ? depth("equal", false) : depth("less", true),
+  });
+  const list = [
+    compute("cull_blocks", L.cull),
+    compute("place_vertices", L.place),
+    compute("emit_quads", L.place),
+    () => device.createRenderPipelineAsync({
+      layout: pl(L.shadowFrame, L.grazer),
+      vertex: { module: dm, entryPoint: "skin_shadow", buffers: vbuf },
+      primitive: { ...prim, cullMode: "none" },
+      depthStencil: { ...depth("less", true), depthBias: 4, depthBiasSlopeScale: 2 },
+    }),
+    () => device.createRenderPipelineAsync({
+      layout: pl(L.frame, L.grazer),
+      vertex: { module: dm, entryPoint: "skin", buffers: vbuf },
+      primitive: prim, depthStencil: depth("less", true),
+    }),
+    shade("shade_field", true),
+    shade("shade_lookup", true),
+    shade("shade_vertex", true),
+    shade("shade_field", false),
+    shade("shade_lookup", false),
+    shade("shade_vertex", false),
+    () => device.createRenderPipelineAsync({
+      layout: pl(L.frame),
+      vertex: { module: dm, entryPoint: "terrain_vs" },
+      fragment: { module: dm, entryPoint: "terrain_fs", targets: [{ format: "rgba8unorm-srgb" }] },
+      primitive: { topology: "triangle-list", cullMode: "none" }, depthStencil: depth("less", true),
+    }),
+  ];
+  await Promise.all(list.map((f) => f()));
+  const ms = performance.now() - t0;
+  await put("pipelines.json", JSON.stringify({ ms, count: list.length }));
+  await put("DONE", "ok");
+} catch (err) {
+  await put("DONE", String(err && err.stack || err));
+}
+</script>

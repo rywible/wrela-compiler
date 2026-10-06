@@ -19,7 +19,8 @@ pub enum InstanceKey {
     /// A closure in `owner`'s body, lifted to a function of its captures and parameters.
     Closure { owner: Rc<InstanceKey>, id: ClosureId },
     /// A derived interpretation of a callable (language.md §13).
-    /// `output`: an interval's result type (its range is that type's box).
+    /// `output`: an interval's result type (its range is that type's box), or what a value and
+    /// gradient carries beside them (`value_gradient_with`'s `T`).
     Derived { of: Callable, kind: DeriveKind, input: TyId, output: Option<TyId> },
     /// Drop or clone glue for a concrete type (`crate::glue`).
     Glue { kind: crate::glue::GlueKind, ty: TyId },
@@ -27,7 +28,7 @@ pub enum InstanceKey {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum DeriveKind {
-    /// The value and its gradient: `(f32, X)`.
+    /// The value and its gradient: `(f32, X)`; with an `output` `T`, `(f32, X, T)`.
     ValueAndGradient,
     /// The interval over a box.
     Interval,

@@ -308,6 +308,7 @@ test("a pass into textures draws with the pipeline made for their formats, and i
       .createBuffer(2, 64)
       .createTexture(3, 8, 8, "rgba8unorm")
       .createTexture(4, 8, 8, "depth32float")
+      .createTexture(5, 8, 8, "rgba16float")
       .beginPass(offscreen(3, 4))
       .draw(0, 3, 1, [1, 2], u(0))
       .endPass()
@@ -316,10 +317,15 @@ test("a pass into textures draws with the pipeline made for their formats, and i
       .endPass()
       .beginPass(offscreen(3, NONE, true))
       .draw(0, 3, 1, [1, 2], u(2))
+      .endPass()
+      .beginPass(offscreen(5, NONE))
+      .draw(0, 3, 1, [1, 2], u(3))
       .endPass(),
   );
-  expect(device.variants).toEqual(["draw rgba8unorm|depth32float", "draw none|depth32float"]);
-  expect(device.events.filter((e) => e.kind === "renderPass")).toEqual([
+  // The screen's format with and without a depth target, and a depth pass, were made at load;
+  // another format's variant is made at its first draw.
+  expect(device.variants).toEqual(["draw rgba16float|none"]);
+  expect(device.events.filter((e) => e.kind === "renderPass").slice(0, 3)).toEqual([
     { kind: "renderPass", clear: { r: 0, g: 0, b: 0, a: 1 }, view: "texture 3", depth: "texture 4 clear" },
     { kind: "renderPass", clear: { r: 0, g: 0, b: 0, a: 0 }, view: "none", depth: "texture 4 clear" },
     { kind: "renderPass", clear: { r: 0, g: 0, b: 0, a: 1 }, view: "texture 3", load: "load" },

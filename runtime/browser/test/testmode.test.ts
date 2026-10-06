@@ -27,10 +27,12 @@ test("reads every parameter", () => {
     paced: 0,
     tickdelay: 0,
     framedelay: 0,
+    salt: 0,
   });
   expect(parseTestParams("#test&input=scripts/a.json&latency=40")).toEqual({ ...TEST_DEFAULTS, input: "scripts/a.json", latency: 40 });
-  expect(parseTestParams("#test&paced=1&tickdelay=30&framedelay=5&keylatency=20")).toEqual({
+  expect(parseTestParams("#test&paced=1&tickdelay=30&framedelay=5&keylatency=20&salt=7")).toEqual({
     ...TEST_DEFAULTS,
+    salt: 7,
     paced: 1,
     tickdelay: 30,
     framedelay: 5,

@@ -20,7 +20,9 @@
 // for the other, as in normal play: for time budgets. Either way, `ticks.json` has each tick's
 // time and records, and, unless `nohash=1`, each state hash; `ticks.log` is the tick log
 // (runtime/abi `ticks`), which `wrela-host --replay` replays. With `tickdelay=ms`, each tick is
-// held that much longer; with `framedelay=ms`, each frame. `load.json` has when the page opened
+// held that much longer; with `framedelay=ms`, each frame. With `salt=n`, each shader gets a
+// comment that makes it unique, so no cache serves its pipelines, and `pipelines.json` has how
+// long creating them all, at once, took (#42 AC4's cold pipelines). `load.json` has when the page opened
 // and each file it loaded. It's part of the shipped bundle, so the agreement test runs
 // the exact bytes a game ships, but only a page served from this machine (tools/serve.py and
 // tools/headless.py bind 127.0.0.1) enters it: a game's public URL ignores `#test`.
@@ -49,6 +51,8 @@ export interface TestParams {
   tickdelay: number;
   /** Ms each frame is held longer (0: none). */
   framedelay: number;
+  /** A number that makes every shader's source unique (0: none). */
+  salt: number;
 }
 
 export const TEST_DEFAULTS: TestParams = {
@@ -66,6 +70,7 @@ export const TEST_DEFAULTS: TestParams = {
   paced: 0,
   tickdelay: 0,
   framedelay: 0,
+  salt: 0,
 };
 /** Every parameter's name, in order. */
 const NAMES = Object.keys(TEST_DEFAULTS) as (keyof TestParams)[];

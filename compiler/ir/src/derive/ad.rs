@@ -23,23 +23,40 @@ pub(super) fn value_and_gradient(
     f: FuncId,
     ncap: u32,
     target: Target,
+    with: bool,
 ) -> Result<FuncId> {
     let func = m.functions[f.index()].clone();
     let xi = ncap as usize;
     let x_ty = func.params.get(xi).ok_or_else(|| Error::internal("no input parameter"))?.ty;
     let n = dims(m, x_ty)?;
-    if func.ret != Some(m.types.f32()) || func.ret_ref {
-        return Err(Error::not_derivable("a gradient needs a function that returns an `f32`"));
-    }
+    let f32 = m.types.f32();
+    // With a payload: `f` returns `(f32, T)`; the value is its first field.
+    let payload = match (with, func.ret.map(|r| m.types.get(r).clone())) {
+        (false, _) if func.ret == Some(f32) && !func.ret_ref => None,
+        (true, Some(TypeDef::Struct { fields, .. }))
+            if fields.len() == 2 && fields[0].1 == f32 && !func.ret_ref =>
+        {
+            Some(fields[1].1)
+        }
+        (false, _) => {
+            return Err(Error::not_derivable("a gradient needs a function that returns an `f32`"));
+        }
+        (true, _) => {
+            return Err(Error::not_derivable(
+                "`value_gradient_with` needs a function that returns `(f32, T)`",
+            ));
+        }
+    };
     let mut mask = vec![0; func.params.len()];
     mask[xi] = all_bits(&m.types, x_ty);
     let d = derive(m, cache, f, mask.clone(), n, target)?;
     let returns = returns_active(m, cache, f, mask, Mode::Ad) != 0;
-    let f32 = m.types.f32();
-    let tuple = m.types.intern(TypeDef::Struct {
-        name: format!("(f32, {})", m.types.display(x_ty)),
-        fields: vec![("_0".into(), f32), ("_1".into(), x_ty)],
-    });
+    let mut fields = vec![("_0".into(), f32), ("_1".into(), x_ty)];
+    if let Some(t) = payload {
+        fields.push(("_2".into(), t));
+    }
+    let names: Vec<String> = fields.iter().map(|(_, t)| m.types.display(*t).to_string()).collect();
+    let tuple = m.types.intern(TypeDef::Struct { name: format!("({})", names.join(", ")), fields });
     let mut g = Function::new(
         format!("{}_value_and_gradient", func.name),
         func.params.clone(),
@@ -77,21 +94,33 @@ pub(super) fn value_and_gradient(
         .ok_or_else(|| Error::internal("derived function returns nothing"))?;
     let r = g.new_value(dual_ty);
     body.push(Stmt::Let(r, Expr::Call(d, args)));
-    let (value, parts) = if returns {
-        let v = g.new_value(f32);
-        body.push(Stmt::Let(v, Expr::Extract(r, 0)));
+    // The value (with a payload, the first field of `f`'s result), and the payload.
+    let ret = func.ret.ok_or_else(|| Error::internal("no result"))?;
+    let first = |g: &mut Function, body: &mut Block, of: ValueId| match payload {
+        None => of,
+        Some(_) => {
+            let v = g.new_value(f32);
+            body.push(Stmt::Let(v, Expr::Extract(of, 0)));
+            v
+        }
+    };
+    let (value, parts, result) = if returns {
+        let whole = g.new_value(ret);
+        body.push(Stmt::Let(whole, Expr::Extract(r, 0)));
+        let v = first(&mut g, &mut body, whole);
         let mut parts = Vec::new();
         for k in 0..n {
-            let p = g.new_value(f32);
-            body.push(Stmt::Let(p, Expr::Extract(r, 1 + k as u32)));
-            parts.push(p);
+            let t = g.new_value(ret);
+            body.push(Stmt::Let(t, Expr::Extract(r, 1 + k as u32)));
+            parts.push(first(&mut g, &mut body, t));
         }
-        (v, parts)
+        (v, parts, whole)
     } else {
         // The function doesn't depend on its input: the gradient is zero.
         let z = g.new_value(f32);
         body.push(Stmt::Let(z, Expr::Const(Const::F32(0.0))));
-        (r, vec![z; n as usize])
+        let v = first(&mut g, &mut body, r);
+        (v, vec![z; n as usize], r)
     };
     let grad = if n == 1 {
         parts[0]
@@ -100,8 +129,14 @@ pub(super) fn value_and_gradient(
         body.push(Stmt::Let(gv, Expr::Construct(x_ty, parts)));
         gv
     };
+    let mut items = vec![value, grad];
+    if let Some(t) = payload {
+        let p = g.new_value(t);
+        body.push(Stmt::Let(p, Expr::Extract(result, 1)));
+        items.push(p);
+    }
     let out = g.new_value(tuple);
-    body.push(Stmt::Let(out, Expr::Construct(tuple, vec![value, grad])));
+    body.push(Stmt::Let(out, Expr::Construct(tuple, items)));
     body.push(Stmt::Return(Some(out)));
     g.body = body;
     Ok(m.add_function(g))

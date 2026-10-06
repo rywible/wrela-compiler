@@ -635,7 +635,12 @@ pub(crate) fn intrinsic(
     let lang = fl.cx.checked.program.func(func).lang;
     let span = c.span;
     match lang {
-        Some(l @ (Lang::Gradient | Lang::ValueAndGradient | Lang::IntervalOf)) => {
+        Some(
+            l @ (Lang::Gradient
+            | Lang::ValueAndGradient
+            | Lang::ValueGradientWith
+            | Lang::IntervalOf),
+        ) => {
             return crate::derive::call(fl, l, substs, c, ty);
         }
         Some(
