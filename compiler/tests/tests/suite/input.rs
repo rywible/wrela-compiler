@@ -95,10 +95,14 @@ fn events_reach_the_program_by_the_next_frame() {
         );
         if frame > 0 {
             // A frame that started at the same time as the event (the clocks' resolution can't
-            // order them) was already reading its input.
+            // order them) was already reading its input. The same time is within Chrome's
+            // clock resolution in an isolated page (5 µs): each context adds its own time origin
+            // to its clock, and at epoch milliseconds the sums of equal instants can differ by
+            // a rounding (a run failed by under a microsecond).
             assert!(
-                starts[frame - 1] <= sent,
-                "event sent at {sent} waited a frame (frame {frame})"
+                starts[frame - 1] <= sent + 0.005,
+                "event sent at {sent} waited a frame (frame {frame}, whose predecessor started {:.3} ms after it)",
+                starts[frame - 1] - sent
             );
         }
         worst = worst.max(starts[frame] - sent);
