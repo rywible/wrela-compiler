@@ -3,7 +3,7 @@
 // either passes as. Every string is UTF-8, and is measured and indexed in bytes.
 
 use std::collections::Vec
-use std::mem::load_u8
+use std::mem::{load_u32, load_u8}
 
 /// Text known when the program is built: a string literal, or text a build-time constant made.
 /// A `Copy` handle to read-only UTF-8, so it can be stored anywhere: in GPU data too, where it
@@ -40,6 +40,47 @@ impl Bytes {
             panic("at: the index is past the end of the bytes")
         }
         unsafe { load_u8(self.addr + i) }
+    }
+
+    /// The little-endian `u16` at byte `at` (any alignment). Bytes past the end panic, as
+    /// they do for each of these reads.
+    pub fn u16_le(self, at: u32) -> u16 {
+        self.check(at, 2)
+        unsafe { u16(load_u8(self.addr + at)) | (u16(load_u8(self.addr + at + 1)) << 8) }
+    }
+
+    /// The little-endian `u32` at byte `at`.
+    pub fn u32_le(self, at: u32) -> u32 {
+        self.check(at, 4)
+        unsafe { load_u32(self.addr + at) }
+    }
+
+    /// The little-endian `i32` at byte `at`.
+    pub fn i32_le(self, at: u32) -> i32 {
+        i32(self.u32_le(at))
+    }
+
+    /// The little-endian `f32` at byte `at`.
+    pub fn f32_le(self, at: u32) -> f32 {
+        bitcast_f32(self.u32_le(at))
+    }
+
+    /// The little-endian `u64` at byte `at`.
+    pub fn u64_le(self, at: u32) -> u64 {
+        self.check(at, 8)
+        unsafe { u64(load_u32(self.addr + at)) | (u64(load_u32(self.addr + at + 4)) << 32) }
+    }
+
+    /// The little-endian `f64` at byte `at`.
+    pub fn f64_le(self, at: u32) -> f64 {
+        bitcast_f64(self.u64_le(at))
+    }
+
+    /// Panics unless the `n` bytes from `at` are inside.
+    fn check(self, at: u32, n: u32) {
+        if at > self.len || self.len - at < n {
+            panic("a read past the end of the bytes")
+        }
     }
 }
 

@@ -6,7 +6,7 @@ use std::alloc::{alloc, free, realloc}
 use std::par::{chunks_for, par_each}
 use std::mem::{
     Drop, align_of, at, at_mut, at_mut_pair, copy, drop_at, read, size_of, take_answer, take_input,
-    write,
+    write, zeroed,
 }
 pub use std::mem::Pair
 
@@ -409,6 +409,116 @@ impl<T> Vec<T> {
     }
 }
 
+/// A list of at most `N` values, held in place: an array and how many of it are in use. It's
+/// `Copy`, and `Plain` and `GpuData` where `T` is, so it can be in a snapshot (§6.12) or on the
+/// GPU, where a `Vec` can't. `b[i]` projects element `i` (on the CPU, an index at or past
+/// `len()` panics), and `for x in b` walks the elements in use. It hashes, saves and compares
+/// only those.
+///
+/// ```wrela
+/// var b: Bounded<u32, 4> = Bounded::new()
+/// b.push(3)
+/// b.push(5)
+/// b[0] += 1
+/// var sum = 0
+/// for x in b {
+///     sum += x
+/// }
+/// assert(sum == 9 && b.len() == 2 && !b.is_full())
+/// ```
+pub struct Bounded<T, const N: u32>: Copy + Plain + GpuData {
+    // The compiler indexes `Bounded` in place: these two fields, in this order.
+    items: [T; N],
+    len: u32,
+}
+
+impl<T, const N: u32> Bounded<T, N> {
+    /// How many elements are in use.
+    pub fn len(self) -> u32 {
+        self.len
+    }
+
+    /// Whether none is.
+    pub fn is_empty(self) -> bool {
+        self.len == 0
+    }
+
+    /// Whether all `N` are.
+    pub fn is_full(self) -> bool {
+        self.len == N
+    }
+
+    /// `N`: how many it can hold.
+    pub fn capacity(self) -> u32 {
+        N
+    }
+}
+
+impl<T: Copy, const N: u32> Bounded<T, N> {
+    /// An empty list.
+    pub fn new() -> Bounded<T, N> {
+        // The elements past `len` are never read: each is written by `push` first.
+        Bounded { items: unsafe { zeroed() }, len: 0 }
+    }
+
+    /// A list of `xs`' elements, in order: at most `N` of them (more panic).
+    pub fn from(xs: [T]) -> Bounded<T, N> {
+        var b = Bounded::new()
+        for x in xs {
+            b.push(x)
+        }
+        b
+    }
+
+    /// Adds `value` at the end. A full list panics.
+    pub fn push(mut self, value: T) {
+        if self.len == N {
+            panic("push: the `Bounded` is full")
+        }
+        self.items[self.len] = value
+        self.len += 1
+    }
+
+    /// The last element, removed; `None` if it's empty.
+    pub fn pop(mut self) -> Option<T> {
+        if self.len == 0 {
+            return None
+        }
+        self.len -= 1
+        Some(self.items[self.len])
+    }
+
+    /// Element `i`, removed: the ones after it move down one. An index at or past `len()`
+    /// panics.
+    pub fn remove(mut self, i: u32) -> T {
+        let x = self[i]
+        for k in i + 1..self.len {
+            self.items[k - 1] = self.items[k]
+        }
+        self.len -= 1
+        x
+    }
+
+    /// Removes every element.
+    pub fn clear(mut self) {
+        self.len = 0
+    }
+}
+
+impl<T: Eq, const N: u32> Eq for Bounded<T, N> {
+    fn eq(self, other: Bounded<T, N>) -> bool {
+        if self.len != other.len {
+            return false
+        }
+        for i in 0..self.len {
+            if self.items[i] != other.items[i] {
+                return false
+            }
+        }
+        true
+    }
+}
+
 /// Sorts `xs`, an array's elements or a run's, by `before`, which says whether its first
 /// argument goes before its second. Stable, O(n log n): a merge sort, whose room, a copy of
 /// the elements, is allocated for the call. (`Vec::sort_by` sorts a `Vec`, of any `T`.)
@@ -689,4 +799,28 @@ fn an_array_sorts_stably() {
         let (a, b) = (pairs[i - 1], pairs[i])
         assert(a.0 < b.0 || (a.0 == b.0 && a.1 < b.1))
     }
+}
+
+@test
+fn a_bounded_list_holds_what_was_pushed() {
+    var b: Bounded<(u32, f32), 3> = Bounded::new()
+    assert(b.is_empty() && b.capacity() == 3)
+    b.push((1, 0.5))
+    b.push((2, 1.5))
+    b[1].1 += 1.0
+    assert(b.len() == 2 && b[1].1 == 2.5)
+    var keys = 0
+    for (k, _) in b {
+        keys += k
+    }
+    assert(keys == 3)
+    // Equal by their elements in use, whatever the rest of the array held.
+    var c = Bounded::from([(1, 0.5), (2, 2.5), (9, 9.0)])
+    assert(c.pop() == Some((9, 9.0)))
+    assert(b == c)
+    b.clear()
+    assert(b.is_empty() && b != c)
+    // Removing moves the rest down, in order.
+    var d: Bounded<u32, 4> = Bounded::from([1, 2, 3, 4])
+    assert(d.is_full() && d.remove(1) == 2 && d.len() == 3 && d[1] == 3 && d[2] == 4)
 }

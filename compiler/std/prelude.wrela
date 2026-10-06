@@ -1,7 +1,7 @@
 // The prelude: in scope in every module, with the built-in types and functions.
 
 pub use std::cmp::{Eq, Ord, Ordering}
-pub use std::collections::{Box, Vec, replace, swap}
+pub use std::collections::{Bounded, Box, Vec, replace, swap}
 pub use std::string::{Bytes, String, Text}
 pub use std::arena::{Arena, Handle, SortedMap}
 pub use std::quat::Quat

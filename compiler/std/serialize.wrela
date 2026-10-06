@@ -419,6 +419,29 @@ impl<T: Serialize> Serialize for Vec<T> {
 
 /// A fixed array of `Copy` elements, each in order. (Its elements are read into an array the
 /// first one's copies fill, so they must be `Copy`.)
+/// The elements in use, as a `Vec`'s are: a `u32` count, then each.
+impl<T: Serialize + Copy, const N: u32> Serialize for Bounded<T, N> {
+    fn serialize(self, w: mut Writer) {
+        w.write_u32(self.len())
+        for x in self {
+            x.serialize(mut w)
+        }
+    }
+
+    fn deserialize(r: mut Reader) -> Result<Bounded<T, N>, LoadError> {
+        let at = r.at
+        let n = r.read_u32()?
+        if n > N {
+            return Err(LoadError { at, what: "more elements than the `Bounded` holds" })
+        }
+        var out = Bounded::new()
+        for _ in 0..n {
+            out.push(T::deserialize(mut r)?)
+        }
+        Ok(out)
+    }
+}
+
 impl<T: Serialize + Copy, const N: u32> Serialize for [T; N] {
     fn serialize(self, w: mut Writer) {
         for x in self {

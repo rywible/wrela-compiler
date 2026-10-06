@@ -26,6 +26,11 @@ pub fn needs_drop<T>() -> bool {}
 @intrinsic
 pub fn read<T>(addr: u32) -> T {}
 
+/// A `T` whose bytes are all zero: for a place that's written before it's read (a `Bounded`'s
+/// unused elements), since not every type's zero is a value it can hold.
+@intrinsic
+pub fn zeroed<T>() -> T {}
+
 /// Moves `value` to `addr`. What was there isn't dropped.
 @intrinsic
 pub fn write<T>(addr: u32, value: take T) {}

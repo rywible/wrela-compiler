@@ -20,3 +20,20 @@ impl<const N: u32> Total for [f32; N] {
 fn f() -> f32 {
     sum([1.0, 2.0]) + [3.0, 4.0, 5.0].total() + sum([0.0; 8])
 }
+
+// A struct's length argument: a number, a constant's name, or a const parameter.
+const KEPT: u32 = 8
+
+struct Window<const N: u32> {
+    xs: [f32; N],
+}
+
+fn widest<const M: u32>(w: Window<M>) -> u32 {
+    M
+}
+
+fn g() -> u32 {
+    let a: Window<KEPT> = Window { xs: [0.0; 8] }
+    let b: Bounded<u32, KEPT> = Bounded::new()
+    widest(a) + b.capacity()
+}

@@ -141,7 +141,9 @@ impl Fl<'_, '_> {
     pub fn container_len(&mut self, p: &mir::Place) -> Option<Option<ir::ValueId>> {
         let t = self.place_src_ty(p);
         Some(match self.lang(t)? {
-            Lang::Vec | Lang::Text | Lang::Bytes => self.read(&p.with(mir::Proj::Field(1))),
+            Lang::Vec | Lang::Text | Lang::Bytes | Lang::Bounded => {
+                self.read(&p.with(mir::Proj::Field(1)))
+            }
             // An arena's values: its `values` field, a `Vec`.
             Lang::Arena => self.read(&p.with(mir::Proj::Field(0)).with(mir::Proj::Field(1))),
             Lang::String => self.read(&p.with(mir::Proj::Field(0)).with(mir::Proj::Field(1))),
@@ -178,6 +180,25 @@ impl Fl<'_, '_> {
         let pt = self.mb.m.types.intern(ir::TypeDef::Ptr(et));
         let ptr = self.value(pt, ir::Expr::Mem(ir::MemOp::Ptr, vec![addr]));
         Some(ir::Place::root(ir::PlaceRoot::Ptr(ptr)))
+    }
+
+    /// Element `i` of the `Bounded` at `b`: its array's, in place. On the CPU, an index at or
+    /// past the elements in use panics; the GPU indexes the array as any other.
+    pub fn bounded_elem(&mut self, b: ir::Place, b_ty: TyId, i: ir::ValueId) -> Option<ir::Place> {
+        let span = self.code.span;
+        let (fi, _) = self.cx.field(self.mb, b_ty, None, 0, span)?;
+        if !self.is_gpu() {
+            let (fl, _) = self.cx.field(self.mb, b_ty, None, 1, span)?;
+            let u = self.u32_ty();
+            let len = self.load(b.clone().with(ir::Proj::Field(fl)), u);
+            let bt = self.mb.m.types.bool();
+            let past = self.value(bt, ir::Expr::Binary(ir::BinOp::Ge, i, len));
+            self.push_block();
+            self.panic_text("index out of range: past the elements of a `Bounded`");
+            let then = self.pop_block();
+            self.emit(ir::Stmt::If { cond: past, then, else_: Vec::new() });
+        }
+        Some(b.with(ir::Proj::Field(fi)).with(ir::Proj::Index(i)))
     }
 
     /// The value of the `Arena<elem>` at `arena` that `index` names: a `Handle<elem>`, whose
@@ -359,6 +380,7 @@ impl Fl<'_, '_> {
                 lang,
                 L::MemSizeOf
                     | L::MemAlignOf
+                    | L::MemZeroed
                     | L::MemNeedsDrop
                     | L::Swap
                     | L::Replace
@@ -387,6 +409,10 @@ impl Fl<'_, '_> {
             Lang::MemAlignOf => {
                 let n = elem(self, 0).map_or(1, |e| ir::layout::layout(&self.mb.m.types, e).align);
                 Some(self.u32c(n))
+            }
+            Lang::MemZeroed => {
+                let t = elem(self, 0)?;
+                Some(self.value(t, ir::Expr::Zero(t)))
             }
             Lang::MemNeedsDrop => {
                 let d = self.cx.needs_drop(substs[0]);

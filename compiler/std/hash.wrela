@@ -216,6 +216,16 @@ impl StateHash for String {
     }
 }
 
+/// The elements in use, as a `Vec`'s are: a count, then each.
+impl<T: StateHash, const N: u32> StateHash for Bounded<T, N> {
+    fn state_hash(self, h: mut Hasher) {
+        h.write_u32(self.len())
+        for x in self {
+            x.state_hash(mut h)
+        }
+    }
+}
+
 impl<T: StateHash> StateHash for Vec<T> {
     fn state_hash(self, h: mut Hasher) {
         h.write_u32(self.len())

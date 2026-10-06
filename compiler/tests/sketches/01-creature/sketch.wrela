@@ -418,10 +418,11 @@ pub const HOOF_MODES = modal_modes(hoof(1.0), extent: 15cm)
 /// kilohertz, its modes ascending.
 @test
 fn the_hoof_rings_in_the_kilohertz() {
-    assert(HOOF_MODES.count >= 3)
-    assert(HOOF_MODES.frequency[0] > 200.0 && HOOF_MODES.frequency[0] < 20000.0)
+    let modes = HOOF_MODES.modes
+    assert(modes.len() >= 3)
+    assert(modes[0].frequency > 200.0 && modes[0].frequency < 20000.0)
     for k in 1..3 {
-        assert(HOOF_MODES.frequency[k] >= HOOF_MODES.frequency[k - 1])
+        assert(modes[k].frequency >= modes[k - 1].frequency)
     }
 }
 

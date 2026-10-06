@@ -915,13 +915,13 @@ impl<'p> Checker<'p> {
         }
     }
 
-    /// The element type of what a `for` loop walks besides arrays and runs: a `Vec<T>`'s or an
-    /// `Arena<T>`'s (§6.6).
+    /// The element type of what a `for` loop walks besides arrays and runs: a `Vec<T>`'s, a
+    /// `Bounded<T, N>`'s or an `Arena<T>`'s (§6.6).
     pub(crate) fn walked_elem(&self, t: TyId) -> Option<TyId> {
         let t = self.infer.resolve(&self.p.types, t);
         match self.p.types.kind(t) {
             TyKind::Adt(a, args)
-                if matches!(self.p.adt(*a).lang, Some(Lang::Vec | Lang::Arena)) =>
+                if matches!(self.p.adt(*a).lang, Some(Lang::Vec | Lang::Bounded | Lang::Arena)) =>
             {
                 args.first().copied()
             }

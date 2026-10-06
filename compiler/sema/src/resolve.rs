@@ -823,19 +823,25 @@ pub fn const_u32(p: &Program, module: ModuleId, e: &ast::Expr) -> Option<u32> {
                 v.ok().and_then(|v| u32::try_from(v).ok())
             }
             ast::ExprKind::Paren(inner) => go(p, module, inner, visiting),
-            ast::ExprKind::Path(path) => {
-                let Res::Const(c) = resolve_value_item(p, module, path)? else { return None };
-                if visiting.contains(&c) {
-                    return None;
-                }
-                visiting.push(c);
-                let def = p.const_(c);
-                let v = go(p, def.module, &def.value, visiting);
-                visiting.pop();
-                v
-            }
+            ast::ExprKind::Path(path) => const_path(p, module, path, visiting),
             _ => None,
         }
+    }
+    fn const_path(
+        p: &Program,
+        module: ModuleId,
+        path: &ast::Path,
+        visiting: &mut Vec<ConstId>,
+    ) -> Option<u32> {
+        let Res::Const(c) = resolve_value_item(p, module, path)? else { return None };
+        if visiting.contains(&c) {
+            return None;
+        }
+        visiting.push(c);
+        let def = p.const_(c);
+        let v = go(p, def.module, &def.value, visiting);
+        visiting.pop();
+        v
     }
     go(p, module, e, &mut Vec::new())
 }
@@ -943,6 +949,21 @@ fn resolve_type_path(
         .flatten()
         .enumerate()
         .map(|(i, a)| match &a.kind {
+            // A constant's name: its value (a const parameter's name resolves as a type).
+            ast::TypeExprKind::Path(path)
+                if const_at(i)
+                    && !(path.is_single() && scope.param(&path.segments[0].ident.name).is_some())
+                    && matches!(resolve_value_item(p, scope.module, path), Some(Res::Const(_))) =>
+            {
+                let e = ast::Expr::new(ast::ExprKind::Path(path.clone()), path.span);
+                match const_u32(p, scope.module, &e) {
+                    Some(n) => p.types.intern(TyKind::ConstU32(n)),
+                    None => {
+                        diags.push(length_error(p, scope.module, &e));
+                        p.types.error
+                    }
+                }
+            }
             ast::TypeExprKind::Int(lit) if const_at(i) => match &lit.kind {
                 ast::LitKind::Int(v) if v.ok().is_some_and(|v| u32::try_from(v).is_ok()) => {
                     p.types.intern(TyKind::ConstU32(v.ok().unwrap_or(0) as u32))

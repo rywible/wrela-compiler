@@ -982,6 +982,19 @@ impl<'c, 'a> Fl<'c, 'a> {
                         continue;
                     }
                     if let TyKind::Adt(_, args) = k
+                        && self.cx.checked.program.lang_of_ty(ty) == Some(Lang::Bounded)
+                    {
+                        // An element in use of the array it holds in place.
+                        let elem = args[0];
+                        let b = ir::Place { root: root.clone(), path: std::mem::take(&mut path) };
+                        let iv = self.index_u32(iv);
+                        let at = self.bounded_elem(b, ty, iv)?;
+                        root = at.root;
+                        path = at.path;
+                        ty = elem;
+                        continue;
+                    }
+                    if let TyKind::Adt(_, args) = k
                         && self.cx.checked.program.lang_of_ty(ty) == Some(Lang::Vec)
                     {
                         // An element on the heap: a place at its address.

@@ -10,3 +10,15 @@ fn length() -> u32 {
 fn table() -> [f32; length()] { //~ E0325
     [0.0; 4]
 }
+
+struct Window<const N: u32> {
+    xs: [f32; N],
+}
+
+// A length argument is a number or a constant holding one, as an array's is.
+const TWICE: u32 = 2 * 4
+
+fn window() -> u32 {
+    let w: Window<TWICE> = Window { xs: [0.0; 8] } //~ E0325
+    8
+}
