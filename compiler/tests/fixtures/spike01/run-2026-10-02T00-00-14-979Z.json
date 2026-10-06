@@ -1,0 +1,524 @@
+{
+  "started": "2026-10-02T00:00:14.979Z",
+  "device": {
+    "vendor": "apple",
+    "architecture": "metal-3",
+    "description": "",
+    "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/154.0.0.0 Safari/537.36",
+    "timestampQuery": true,
+    "hardwareConcurrency": 10,
+    "pageVisibility": "visible"
+  },
+  "cpu": {
+    "evals_per_ms": {
+      "full": 4272,
+      "pruned": 4583
+    },
+    "lipschitz": {
+      "max": 11,
+      "mean": 0.978,
+      "share_over_1_5": 0.001395
+    },
+    "mass": {
+      "0.02": {
+        "ms": 39.467,
+        "mass_kg": 1118.937,
+        "volume_m3": 1.0641962826719293,
+        "com": [
+          0,
+          1.433,
+          0.809
+        ],
+        "evals": 242513,
+        "leaves": 89968,
+        "inside_nodes": 43345
+      },
+      "0.01": {
+        "ms": 154.8,
+        "mass_kg": 1119.113,
+        "volume_m3": 1.0643456594564726,
+        "com": [
+          0,
+          1.433,
+          0.809
+        ],
+        "evals": 962257,
+        "leaves": 360489,
+        "inside_nodes": 203844
+      },
+      "0.005": {
+        "ms": 603.5,
+        "mass_kg": 1119.114,
+        "volume_m3": 1.0643398322587083,
+        "com": [
+          0,
+          1.433,
+          0.809
+        ],
+        "evals": 3846169,
+        "leaves": 1440190,
+        "inside_nodes": 886936
+      }
+    },
+    "raycast": {
+      "us_per_ray": 3.151,
+      "avg_evals": 11.048,
+      "hit_share": 1,
+      "ms_per_tick_160_rays": 0.504
+    },
+    "det_hash": "fe85e8e2fa409633"
+  },
+  "pipelines": {
+    "cold_sequential": {
+      "cull_blocks": 69.9,
+      "place_vertices": 301.9,
+      "emit_quads": 24.1,
+      "shadow": 34,
+      "prepass": 33.6,
+      "shade_field": 143.3,
+      "shade_lookup": 129.5,
+      "shade_vertex": 67.6,
+      "shade_field_np": 0.4,
+      "shade_lookup_np": 0.4,
+      "shade_vertex_np": 0.1,
+      "terrain": 99.3,
+      "total": 904.3
+    },
+    "cold_parallel_total": 318.9,
+    "warm_sequential": {
+      "cull_blocks": 0.4,
+      "place_vertices": 0.7,
+      "emit_quads": 0.5,
+      "shadow": 0.3,
+      "prepass": 0.3,
+      "shade_field": 0.3,
+      "shade_lookup": 0.1,
+      "shade_vertex": 0.2,
+      "shade_field_np": 0.3,
+      "shade_lookup_np": 0.1,
+      "shade_vertex_np": 0.2,
+      "terrain": 0.2,
+      "total": 3.8
+    },
+    "per_scene": "cull, place, emit, shadow, prepass, one shade, terrain (+ blit) = 8"
+  },
+  "extraction": {
+    "0.03": {
+      "cell_m": 0.03,
+      "individuals": 40,
+      "gpu_ms_per_individual": {
+        "median": 2.163,
+        "cull": 0,
+        "place": 2.097,
+        "emit": 0
+      },
+      "gpu_ms_herd_total": 87.753,
+      "wall_ms_herd_batch": [
+        129.3,
+        91.6,
+        92.5
+      ],
+      "blocks_median": 6336,
+      "live_blocks_median": 2156,
+      "live_fraction": 0.352,
+      "cells_evaluated_median": 137984,
+      "verts_median": 12828,
+      "tris_median": 25664,
+      "tris_herd": 1038776,
+      "holes_total": 0,
+      "overflow_flags": 0,
+      "mesh_mb_herd": 35.664,
+      "allocated_mb_herd": 58.393,
+      "max_live_dispatch": 2636
+    },
+    "0.02": {
+      "cell_m": 0.02,
+      "individuals": 40,
+      "gpu_ms_per_individual": {
+        "median": 5.177,
+        "cull": 0.066,
+        "place": 5.046,
+        "emit": 0.066
+      },
+      "gpu_ms_herd_total": 204.734,
+      "wall_ms_herd_batch": [
+        214.3,
+        210.8,
+        210.9
+      ],
+      "blocks_median": 18941,
+      "live_blocks_median": 4700,
+      "live_fraction": 0.25,
+      "cells_evaluated_median": 300800,
+      "verts_median": 28946,
+      "tris_median": 57900,
+      "tris_herd": 2341024,
+      "holes_total": 0,
+      "overflow_flags": 0,
+      "mesh_mb_herd": 80.375,
+      "allocated_mb_herd": 127.913,
+      "max_live_dispatch": 5898
+    },
+    "0.015": {
+      "cell_m": 0.015,
+      "individuals": 40,
+      "gpu_ms_per_individual": {
+        "median": 8.716,
+        "cull": 0.066,
+        "place": 8.585,
+        "emit": 0.066
+      },
+      "gpu_ms_herd_total": 350.683,
+      "wall_ms_herd_batch": [
+        364.2,
+        357.1,
+        357.2
+      ],
+      "blocks_median": 42336,
+      "live_blocks_median": 8210,
+      "live_fraction": 0.195,
+      "cells_evaluated_median": 525440,
+      "verts_median": 51423,
+      "tris_median": 102844,
+      "tris_herd": 4169800,
+      "holes_total": 2,
+      "overflow_flags": 0,
+      "mesh_mb_herd": 143.161,
+      "allocated_mb_herd": 225.689,
+      "max_live_dispatch": 10264
+    },
+    "0.01": {
+      "cell_m": 0.01,
+      "individuals": 40,
+      "gpu_ms_per_individual": {
+        "median": 20.709,
+        "cull": 0.197,
+        "place": 20.316,
+        "emit": 0.197
+      },
+      "gpu_ms_herd_total": 830.931,
+      "wall_ms_herd_batch": [
+        869.7,
+        836.8,
+        836.8
+      ],
+      "blocks_median": 134688,
+      "live_blocks_median": 18603,
+      "live_fraction": 0.138,
+      "cells_evaluated_median": 1190592,
+      "verts_median": 116376,
+      "tris_median": 232748,
+      "tris_herd": 9414986,
+      "holes_total": 10,
+      "overflow_flags": 0,
+      "mesh_mb_herd": 323.241,
+      "allocated_mb_herd": 506.316,
+      "max_live_dispatch": 23574
+    }
+  },
+  "frames": {
+    "herd/field": {
+      "shadow": 2.49,
+      "terrain": 0.524,
+      "prepass": 2.425,
+      "shade": 4.063,
+      "creatures": 8.978,
+      "creatures_p95": 9.044,
+      "frame_gpu": 10.158,
+      "throughput_ms": 10.781,
+      "individuals": 40,
+      "tris": 4169800,
+      "creature_pixels": 278685,
+      "creature_pixel_share": 0.134,
+      "ns_per_creature_pixel_shade": 14.579
+    },
+    "herd/field/no-prepass": {
+      "shadow": 2.49,
+      "terrain": 0.524,
+      "prepass": 0,
+      "shade": 4.063,
+      "creatures": 6.554,
+      "creatures_p95": 6.619,
+      "frame_gpu": 7.274,
+      "throughput_ms": 8.226,
+      "individuals": 40,
+      "tris": 4169800,
+      "creature_pixels": 278685,
+      "creature_pixel_share": 0.134,
+      "ns_per_creature_pixel_shade": 14.579
+    },
+    "herd/lookup": {
+      "shadow": 2.49,
+      "terrain": 0.524,
+      "prepass": 2.425,
+      "shade": 3.08,
+      "creatures": 7.995,
+      "creatures_p95": 8.061,
+      "frame_gpu": 9.11,
+      "throughput_ms": 9.687,
+      "individuals": 40,
+      "tris": 4169800,
+      "creature_pixels": 278685,
+      "creature_pixel_share": 0.134,
+      "ns_per_creature_pixel_shade": 11.052
+    },
+    "herd/lookup/no-prepass": {
+      "shadow": 2.49,
+      "terrain": 0.524,
+      "prepass": 0,
+      "shade": 3.08,
+      "creatures": 5.571,
+      "creatures_p95": 5.636,
+      "frame_gpu": 6.291,
+      "throughput_ms": 6.874,
+      "individuals": 40,
+      "tris": 4169800,
+      "creature_pixels": 278685,
+      "creature_pixel_share": 0.134,
+      "ns_per_creature_pixel_shade": 11.052
+    },
+    "herd/vertex": {
+      "shadow": 2.49,
+      "terrain": 0.524,
+      "prepass": 2.425,
+      "shade": 2.818,
+      "creatures": 7.799,
+      "creatures_p95": 8.454,
+      "frame_gpu": 8.913,
+      "throughput_ms": 9.772,
+      "individuals": 40,
+      "tris": 4169800,
+      "creature_pixels": 278685,
+      "creature_pixel_share": 0.134,
+      "ns_per_creature_pixel_shade": 10.112
+    },
+    "herd/vertex/no-prepass": {
+      "shadow": 2.49,
+      "terrain": 0.524,
+      "prepass": 0,
+      "shade": 2.818,
+      "creatures": 5.439,
+      "creatures_p95": 5.702,
+      "frame_gpu": 6.095,
+      "throughput_ms": 6.73,
+      "individuals": 40,
+      "tris": 4169800,
+      "creature_pixels": 278685,
+      "creature_pixel_share": 0.134,
+      "ns_per_creature_pixel_shade": 10.112
+    },
+    "herd_lod3cm/field": {
+      "shadow": 0.786,
+      "terrain": 0.524,
+      "prepass": 0.721,
+      "shade": 1.704,
+      "creatures": 3.211,
+      "creatures_p95": 3.277,
+      "frame_gpu": 5.505,
+      "throughput_ms": 6.113,
+      "individuals": 40,
+      "tris": 1038776,
+      "creature_pixels": 279399,
+      "creature_pixel_share": 0.135,
+      "ns_per_creature_pixel_shade": 6.099
+    },
+    "herd_lod3cm/field/no-prepass": {
+      "shadow": 0.786,
+      "terrain": 0.524,
+      "prepass": 0,
+      "shade": 1.704,
+      "creatures": 2.49,
+      "creatures_p95": 2.556,
+      "frame_gpu": 3.736,
+      "throughput_ms": 4.308,
+      "individuals": 40,
+      "tris": 1038776,
+      "creature_pixels": 279399,
+      "creature_pixel_share": 0.135,
+      "ns_per_creature_pixel_shade": 6.099
+    },
+    "herd_lod3cm/lookup": {
+      "shadow": 0.786,
+      "terrain": 0.524,
+      "prepass": 0.721,
+      "shade": 1.049,
+      "creatures": 2.556,
+      "creatures_p95": 2.687,
+      "frame_gpu": 4.85,
+      "throughput_ms": 5.583,
+      "individuals": 40,
+      "tris": 1038776,
+      "creature_pixels": 279399,
+      "creature_pixel_share": 0.135,
+      "ns_per_creature_pixel_shade": 3.754
+    },
+    "herd_lod3cm/lookup/no-prepass": {
+      "shadow": 0.786,
+      "terrain": 0.524,
+      "prepass": 0,
+      "shade": 1.049,
+      "creatures": 1.835,
+      "creatures_p95": 1.966,
+      "frame_gpu": 2.949,
+      "throughput_ms": 3.807,
+      "individuals": 40,
+      "tris": 1038776,
+      "creature_pixels": 279399,
+      "creature_pixel_share": 0.135,
+      "ns_per_creature_pixel_shade": 3.754
+    },
+    "herd_lod3cm/vertex": {
+      "shadow": 0.786,
+      "terrain": 0.524,
+      "prepass": 0.721,
+      "shade": 0.918,
+      "creatures": 2.425,
+      "creatures_p95": 2.556,
+      "frame_gpu": 4.653,
+      "throughput_ms": 5.54,
+      "individuals": 40,
+      "tris": 1038776,
+      "creature_pixels": 279399,
+      "creature_pixel_share": 0.135,
+      "ns_per_creature_pixel_shade": 3.286
+    },
+    "herd_lod3cm/vertex/no-prepass": {
+      "shadow": 0.786,
+      "terrain": 0.524,
+      "prepass": 0,
+      "shade": 0.918,
+      "creatures": 1.704,
+      "creatures_p95": 1.835,
+      "frame_gpu": 2.818,
+      "throughput_ms": 3.799,
+      "individuals": 40,
+      "tris": 1038776,
+      "creature_pixels": 279399,
+      "creature_pixel_share": 0.135,
+      "ns_per_creature_pixel_shade": 3.286
+    },
+    "closeup/field": {
+      "shadow": 0.197,
+      "terrain": 0.393,
+      "prepass": 0.262,
+      "shade": 0.852,
+      "creatures": 1.245,
+      "creatures_p95": 1.442,
+      "frame_gpu": 1.18,
+      "throughput_ms": 1.181,
+      "individuals": 1,
+      "tris": 107964,
+      "creature_pixels": 449493,
+      "creature_pixel_share": 0.217,
+      "ns_per_creature_pixel_shade": 1.895
+    },
+    "closeup/field/no-prepass": {
+      "shadow": 0.197,
+      "terrain": 0.393,
+      "prepass": 0,
+      "shade": 0.918,
+      "creatures": 1.049,
+      "creatures_p95": 1.114,
+      "frame_gpu": 1.114,
+      "throughput_ms": 1.11,
+      "individuals": 1,
+      "tris": 107964,
+      "creature_pixels": 449493,
+      "creature_pixel_share": 0.217,
+      "ns_per_creature_pixel_shade": 2.042
+    },
+    "closeup/lookup": {
+      "shadow": 0.197,
+      "terrain": 0.393,
+      "prepass": 0.262,
+      "shade": 0.328,
+      "creatures": 0.786,
+      "creatures_p95": 0.852,
+      "frame_gpu": 0.59,
+      "throughput_ms": 0.614,
+      "individuals": 1,
+      "tris": 107964,
+      "creature_pixels": 449493,
+      "creature_pixel_share": 0.217,
+      "ns_per_creature_pixel_shade": 0.73
+    },
+    "closeup/lookup/no-prepass": {
+      "shadow": 0.197,
+      "terrain": 0.393,
+      "prepass": 0,
+      "shade": 0.328,
+      "creatures": 0.524,
+      "creatures_p95": 0.59,
+      "frame_gpu": 0.524,
+      "throughput_ms": 0.556,
+      "individuals": 1,
+      "tris": 107964,
+      "creature_pixels": 449493,
+      "creature_pixel_share": 0.217,
+      "ns_per_creature_pixel_shade": 0.73
+    },
+    "closeup/vertex": {
+      "shadow": 0.197,
+      "terrain": 0.393,
+      "prepass": 0.262,
+      "shade": 0.328,
+      "creatures": 0.786,
+      "creatures_p95": 0.852,
+      "frame_gpu": 0.59,
+      "throughput_ms": 0.592,
+      "individuals": 1,
+      "tris": 107964,
+      "creature_pixels": 449493,
+      "creature_pixel_share": 0.217,
+      "ns_per_creature_pixel_shade": 0.73
+    },
+    "closeup/vertex/no-prepass": {
+      "shadow": 0.197,
+      "terrain": 0.393,
+      "prepass": 0,
+      "shade": 0.328,
+      "creatures": 0.459,
+      "creatures_p95": 0.524,
+      "frame_gpu": 0.524,
+      "throughput_ms": 0.536,
+      "individuals": 1,
+      "tris": 107964,
+      "creature_pixels": 449493,
+      "creature_pixel_share": 0.217,
+      "ns_per_creature_pixel_shade": 0.73
+    }
+  },
+  "paced": {
+    "herd/field/no-prepass": {
+      "pacing": "busy-wait at 60 Hz (pane hidden)",
+      "frames": 150,
+      "frame_gpu_median": 12.452,
+      "frame_gpu_p95": 13.959,
+      "frame_gpu_max": 14.221,
+      "frame_gpu_over_16_7": 0,
+      "gpu_start_spacing_median": 16.646,
+      "gpu_start_spacing_max": 22.675
+    },
+    "herd_lod3cm/field/no-prepass": {
+      "pacing": "busy-wait at 60 Hz (pane hidden)",
+      "frames": 150,
+      "frame_gpu_median": 11.403,
+      "frame_gpu_p95": 12.255,
+      "frame_gpu_max": 13.435,
+      "frame_gpu_over_16_7": 0,
+      "gpu_start_spacing_median": 16.646,
+      "gpu_start_spacing_max": 30.474
+    },
+    "closeup/field/no-prepass": {
+      "pacing": "busy-wait at 60 Hz (pane hidden)",
+      "frames": 150,
+      "frame_gpu_median": 4.719,
+      "frame_gpu_p95": 4.915,
+      "frame_gpu_max": 5.112,
+      "frame_gpu_over_16_7": 0,
+      "gpu_start_spacing_median": 16.646,
+      "gpu_start_spacing_max": 16.908
+    }
+  },
+  "finished": "2026-10-02T00:00:45.521Z"
+}
