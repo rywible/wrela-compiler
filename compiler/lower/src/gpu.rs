@@ -566,11 +566,16 @@ pub(crate) fn lower_draw(fl: &mut Fl, d: &mir::Draw, span: Span) {
     let fs = (d.fragment.0, d.fragment.1.iter().map(|&a| fl.concrete(a)).collect::<Vec<_>>());
     let key = PipelineKey::Render { vertex: vs, fragment: fs, state: d.state };
     let (pindex, iface) = pipeline(fl.cx, key, span);
-    // An indexed draw's indices: their buffer's handle, and the byte offset and size.
+    // An indexed draw's indices: their buffer's handle, and the byte offset and size, by its
+    // elements' stride (`u32`s, or structs of them).
     let mut counts = Vec::new();
     if let Some((place, at)) = &d.indices {
-        let u32_ty = fl.cx.checked.program.types.u32;
-        let Some(b) = buffer_binding(fl, place, u32_ty, *at) else { return };
+        let t = fl.place_src_ty(place);
+        let elem = match fl.cx.checked.program.types.kind(t) {
+            TyKind::Adt(_, args) if !args.is_empty() => args[0],
+            _ => fl.cx.checked.program.types.u32,
+        };
+        let Some(b) = buffer_binding(fl, place, elem, *at) else { return };
         counts.extend(b);
     }
     // The counts, or where their buffer holds them.

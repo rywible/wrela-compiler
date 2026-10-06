@@ -274,7 +274,12 @@ pub(crate) fn emit_function(
         I::I32Const(frame as i32),
         I::I32LtU,
         I::If(BlockType::Empty),
-        I::Unreachable,
+    ]);
+    match m.stack_message {
+        Some(msg) => prologue.extend(ops::panic_with(at.data, msg)?),
+        None => prologue.push(I::Unreachable),
+    }
+    prologue.extend([
         I::End,
         I::LocalGet(fe.saved_sp),
         I::I32Const(frame as i32),

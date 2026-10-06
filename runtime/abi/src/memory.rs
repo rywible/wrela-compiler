@@ -176,9 +176,9 @@ pub const MAX_TICK_RECORDS: u32 = 256;
 /// The samples `__audio` renders: [`crate::AUDIO_QUANTUM`] `f32`s, mono.
 pub const AUDIO_OUT: u32 = 0x13_0000;
 
-/// The program's thread's shadow stack: from [`STACK_TOP`] down to [`STACK_LIMIT`], 8 MiB.
+/// The program's thread's shadow stack: from [`STACK_TOP`] down to [`STACK_LIMIT`], 16 MiB.
 pub const STACK_LIMIT: u32 = 2 << 20;
-pub const STACK_SIZE: u32 = 8 << 20;
+pub const STACK_SIZE: u32 = 16 << 20;
 pub const STACK_TOP: u32 = STACK_LIMIT + STACK_SIZE;
 /// Each other thread's shadow stack.
 pub const THREAD_STACK_SIZE: u32 = 1 << 20;

@@ -7,52 +7,73 @@
 // hosts).
 
 use engine::creature::Creature
-use engine::look::Shading
-use engine::render::{Lights, MAX_BONES, Palette, SkinnedMesh, View, realize_mesh, shade, skin}
+use engine::realize::{Grid, Mesh, Room, Scratch, grow, record}
+use engine::render::{ByChannels, Lights, MAX_BONES, Palette, View, shade, skin, view}
 use engine::rng::seed
 use grazer::sketch::{GRAZER_LOOK, Tissue, grazer}
-use std::gpu::{DepthTexture, begin_screen_pass_with_depth, depth_texture, draw}
+use std::gpu::{
+    ComparisonSampler, Cull, DepthTexture, GpuBuffer, begin_depth_pass,
+    begin_screen_pass_with_depth, buffer, comparison_sampler, depth_texture, draw, write,
+}
 
 pub struct Scene {
     /// Two grazers, two seeds: one type, so the same pipelines (sketch 02 §5).
-    meshes: Vec<SkinnedMesh>,
+    meshes: Vec<Mesh>,
+    palettes: GpuBuffer<mat4>,
     depth: DepthTexture,
+    shadow: DepthTexture,
+    shadow_sampler: ComparisonSampler,
     width: u32,
     height: u32,
 }
 
 pub fn init() -> Scene {
     // Realization: when the engine realizes an individual (here, at load), then kept.
-    var meshes: Vec<SkinnedMesh> = Vec::new()
+    var meshes: Vec<Mesh> = Vec::new()
     for i in 0..2 {
-        meshes.push(realize_mesh(grazer(seed(i + 1)), GRAZER_LOOK))
+        let g = grazer(seed(i + 1))
+        let look = GRAZER_LOOK
+        let grid = Grid::around(grow(g.bounds(), look.surface.tolerance), look.surface.cell_size(0.05))
+        var mesh = Mesh::new(Room { vertices: grid.blocks * 8, quads: grid.blocks * 16 })
+        var scratch = Scratch::new(grid.blocks)
+        record(g.field(), grid, look.deform.weights.falloff, mut scratch, mut mesh)
+        meshes.push(take mesh)
     }
-    Scene { meshes, depth: depth_texture(width: 1, height: 1), width: 1, height: 1 }
+    // No shadows: a shadow map of one texel, all lit.
+    var shadow = depth_texture(width: 1, height: 1)
+    begin_depth_pass(mut shadow, clear_depth: 1.0).end()
+    Scene {
+        meshes,
+        palettes: buffer(2 * MAX_BONES),
+        depth: depth_texture(width: 1, height: 1),
+        shadow: take shadow,
+        shadow_sampler: comparison_sampler(),
+        width: 1,
+        height: 1,
+    }
 }
 
-/// A camera looking at the grazer from its side and a little ahead, `aspect` wide.
+/// A camera looking at the grazer from its side and a little ahead, `aspect` wide, 45° high.
 fn camera(aspect: f32) -> View {
-    let eye = vec3(4.6, 2.0, 1.3)
-    let at = vec3(0.0, 1.1, 0.6)
-    let f = normalize(at - eye)
-    let r = normalize(cross(f, vec3(0.0, 1.0, 0.0)))
-    let u = cross(r, f)
-    let view = mat4(
-        vec4(r.x, u.x, -f.x, 0.0),
-        vec4(r.y, u.y, -f.y, 0.0),
-        vec4(r.z, u.z, -f.z, 0.0),
-        vec4(-dot(r, eye), -dot(u, eye), dot(f, eye), 1.0),
+    view(
+        eye: vec3(4.6, 2.0, 1.3),
+        at: vec3(0.0, 1.1, 0.6),
+        fovy: 0.7853982,
+        aspect: aspect,
+        sun: vec3(0.4, 1.0, 0.3),
+        extent: 4.0,
     )
-    // A perspective projection, 45° high, depth 0 at 0.1 m to 1 at 50 m (WebGPU's range).
-    let (near, far) = (0.1, 50.0)
-    let t = 1.0 / tan(0.3926991)
-    let proj = mat4(
-        vec4(t / aspect, 0.0, 0.0, 0.0),
-        vec4(0.0, t, 0.0, 0.0),
-        vec4(0.0, 0.0, far / (near - far), -1.0),
-        vec4(0.0, 0.0, near * far / (near - far), 0.0),
-    )
-    View { view_proj: proj * view }
+}
+
+const LIGHTS = Lights {
+    sun_colour: vec3(1.6, 1.5, 1.35),
+    sky: vec3(0.55, 0.65, 0.8),
+    ground: vec3(0.3, 0.27, 0.22),
+    ambient: 0.6,
+    exposure: 0.9,
+    f0: 0.04,
+    normal_offset: 0.03,
+    compare_bias: 0.002,
 }
 
 /// The rest pose moved by `at`, with the neck's and head's bones (3 to 7) turned a little
@@ -98,11 +119,10 @@ pub fn frame(state: mut Scene, time: f32, width: u32, height: u32) {
         state.width = width
         state.height = height
     }
-    let view = camera(f32(width) / f32(height))
-    let lights = Lights {
-        sun: normalize(vec3(-0.4, -1.0, -0.3)),
-        sun_colour: vec3(1.0, 0.95, 0.85),
-        sky: vec3(0.25, 0.3, 0.4),
+    let v = camera(f32(width) / f32(height))
+    for i in 0..2 {
+        let at = vec3(-2.2 * f32(i), 0.0, -1.5 * f32(i))
+        write(mut state.palettes, i * MAX_BONES, pose(time + f32(i), at).bones)
     }
     let pass = begin_screen_pass_with_depth(mut state.depth, clear: vec4(0.55, 0.7, 0.85, 1.0))
     var i = 0
@@ -110,17 +130,24 @@ pub fn frame(state: mut Scene, time: f32, width: u32, height: u32) {
         // The field's numbers are this individual's; its structure, and so the pipelines, the
         // herd's.
         let field = grazer(seed(i + 1)).field()
-        let at = vec3(-2.2 * f32(i), 0.0, -1.5 * f32(i))
         draw(
             skin.bind(
                 verts: mesh.verts.items(),
-                weights: mesh.weights,
-                quads: mesh.quads.items(),
-                palette: pose(time + f32(i), at),
-                view: view,
+                palettes: state.palettes.span(start: 0, count: 2 * MAX_BONES),
+                first: i * MAX_BONES,
+                view: v,
             ),
-            shade.bind(field: field, shading: Shading::PerPixel, lights: lights),
-            indirect: mesh.draw.span(start: 0, count: 4),
+            shade.bind(
+                field: field,
+                look: ByChannels { unused: 0 },
+                view: v,
+                lights: LIGHTS,
+                shadow: state.shadow,
+                shadow_sampler: state.shadow_sampler,
+            ),
+            indices: mesh.quads.items(),
+            indirect: mesh.args.span(start: 0, count: 5),
+            cull: Cull::Back,
         )
         i += 1
     }

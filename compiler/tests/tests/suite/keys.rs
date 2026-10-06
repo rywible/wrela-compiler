@@ -71,7 +71,11 @@ fn x86_host() -> std::path::PathBuf {
 
 /// `wrela-host --replay <log> --no-gpu <build>` for x86-64, under Rosetta: its output, and
 /// whether it passed.
-fn replay_on_x86(host: &std::path::Path, log: &std::path::Path, build: &std::path::Path) -> (bool, String) {
+fn replay_on_x86(
+    host: &std::path::Path,
+    log: &std::path::Path,
+    build: &std::path::Path,
+) -> (bool, String) {
     let out = std::process::Command::new("arch")
         .arg("-x86_64")
         .arg(host)
@@ -81,11 +85,8 @@ fn replay_on_x86(host: &std::path::Path, log: &std::path::Path, build: &std::pat
         .arg(build)
         .output()
         .expect("arch -x86_64 runs (Rosetta 2)");
-    let text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
+    let text =
+        format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
     (out.status.success(), text)
 }
 
@@ -164,11 +165,13 @@ fn key_presses_reach_the_screen_through_the_sim() {
         .filter(|(_, line)| line == "moved")
         .map(|(frame, _)| chrome.began_ms[*frame])
         .collect();
-    let mut ms: Vec<f64> = sent
-        .iter()
-        .filter_map(|&t| moved.iter().find(|&&f| f >= t).map(|f| f - t))
-        .collect();
-    assert!(ms.len() as u32 >= presses * 3 / 4, "only {} of {presses} presses moved the player", ms.len());
+    let mut ms: Vec<f64> =
+        sent.iter().filter_map(|&t| moved.iter().find(|&&f| f >= t).map(|f| f - t)).collect();
+    assert!(
+        ms.len() as u32 >= presses * 3 / 4,
+        "only {} of {presses} presses moved the player",
+        ms.len()
+    );
     ms.sort_by(f64::total_cmp);
     let median = ms[ms.len() / 2];
     let p99 = ms[(ms.len() * 99 / 100).min(ms.len() - 1)];

@@ -694,6 +694,8 @@ pub struct Module {
     /// CPU only: the text a counted call past the limit panics with: the data holding it, and
     /// its length (see [`Function::counted`]).
     pub depth_message: Option<(DataId, u32)>,
+    /// CPU only: the text a call whose frame doesn't fit on its thread's stack panics with.
+    pub stack_message: Option<(DataId, u32)>,
     /// CPU only, in a debug build: the text a float operation that creates a NaN panics with
     /// (language.md §11). A release build has none, and no such checks.
     pub nan_message: Option<(DataId, u32)>,

@@ -2634,6 +2634,32 @@ impl<'p> Checker<'p> {
         out
     }
 
+    /// Whether `t` holds an indexed draw's indices: a `GpuBuffer<T>` or `GpuSpan<T>` where `T`
+    /// is `u32`, or a struct whose fields are all `u32`s (a triangle's or a quad's, so a kernel
+    /// can append whole ones), which the draw reads as consecutive `u32` indices.
+    fn index_buffer(&mut self, t: TyId) -> bool {
+        let t = self.infer.resolve(&self.p.types, t);
+        let u32_ty = self.p.types.u32;
+        let TyKind::Adt(a, args) = self.kind(t).clone() else { return false };
+        if !matches!(self.p.adt(a).lang, Some(Lang::GpuBuffer | Lang::GpuSpan)) {
+            return false;
+        }
+        let Some(&elem) = args.first() else { return false };
+        let elem = self.infer.resolve(&self.p.types, elem);
+        if elem == u32_ty {
+            return true;
+        }
+        match self.kind(elem).clone() {
+            TyKind::Adt(e, eargs) if eargs.is_empty() => match &self.p.adt(e).kind {
+                AdtKind::Struct(fields) => {
+                    !fields.is_empty() && fields.iter().all(|f| f.ty == u32_ty)
+                }
+                AdtKind::Enum(_) => false,
+            },
+            _ => false,
+        }
+    }
+
     /// Whether `t` holds a dispatch's or draw's counts: a `GpuBuffer<u32>` or `GpuSpan<u32>`.
     fn counts_buffer(&mut self, t: TyId) -> bool {
         let t = self.infer.resolve(&self.p.types, t);
@@ -2983,12 +3009,15 @@ impl<'p> Checker<'p> {
                 }
                 "indices" => {
                     let e = self.check_expr(&a.value, None);
-                    if !self.counts_buffer(e.ty) && !matches!(self.kind(e.ty), TyKind::Error) {
-                        self.err(Diagnostic::new(
-                            codes::E0603,
-                            e.span,
-                            format!("`indices:` takes a `GpuBuffer<u32>` or a `GpuSpan<u32>` of the indices, not a `{}`", self.display(e.ty)),
-                        ));
+                    if !self.index_buffer(e.ty) && !matches!(self.kind(e.ty), TyKind::Error) {
+                        self.err(
+                            Diagnostic::new(
+                                codes::E0603,
+                                e.span,
+                                format!("`indices:` takes a `GpuBuffer` or a `GpuSpan` of `u32` indices, not a `{}`", self.display(e.ty)),
+                            )
+                            .with_note("its elements may also be structs of `u32` fields, a triangle's or a quad's indices each"),
+                        );
                     }
                     if indices.is_some() {
                         twice(self);

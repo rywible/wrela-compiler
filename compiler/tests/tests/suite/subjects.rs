@@ -109,15 +109,15 @@ fn the_grazer_matches_round_1s() {
     matches_its_original("grazer");
 }
 
-/// The mesh sketch 02's extraction makes of a subject (its program realizes it in `init`):
+/// The mesh the engine's realization makes of a subject (its program realizes it in `init`):
 /// the vertices' rest positions and the quads, read back after a frame. After `init` the
-/// program holds the mesh's buffers alone, oldest first: the vertices' count and the
-/// vertices (an append buffer makes its count first), the quads' count and the quads, the skin
-/// weights and the draw's arguments.
-fn mesh(host: &mut wrela_host::Host) -> (Vec<[f32; 3]>, Vec<[u32; 4]>) {
+/// program holds the mesh's buffers first, oldest first: the vertices' count and the vertices
+/// (an append buffer makes its count first), the quads' count and the quads, and the draw's
+/// arguments; then the palette's.
+fn mesh(host: &mut wrela_host::Host) -> (Vec<[f32; 3]>, Vec<[u32; 6]>) {
     let held = host.buffers();
-    let [vcount, verts, qcount, quads, _weights, _draw] = held[..] else {
-        panic!("the program holds {} buffers, not the mesh's six", held.len())
+    let [vcount, verts, qcount, quads, _args, _palettes] = held[..] else {
+        panic!("the program holds {} buffers, not the mesh's five and a palette", held.len())
     };
     let count = |h: u32, host: &mut wrela_host::Host| {
         wrela_tests::u32s(&host.read_buffer(h).expect("a count"))[0] as usize
@@ -125,20 +125,19 @@ fn mesh(host: &mut wrela_host::Host) -> (Vec<[f32; 3]>, Vec<[u32; 4]>) {
     let (nv, nq) = (count(vcount, host), count(qcount, host));
     let vbytes = host.read_buffer(verts).expect("vertices");
     let qwords = wrela_tests::u32s(&host.read_buffer(quads).expect("quads"));
-    // A `SkinVertex` is 32 bytes (WGSL's layout): its rest position first.
-    assert!(nv * 32 <= vbytes.len(), "{nv} vertices overflow the buffer");
-    assert!(nq * 4 <= qwords.len(), "{nq} quads overflow the buffer");
+    // A `SkinVertex` is 48 bytes: its rest position first. A quad is six indices.
+    assert!(nv * 48 <= vbytes.len(), "{nv} vertices overflow the buffer");
+    assert!(nq * 6 <= qwords.len(), "{nq} quads overflow the buffer");
     let v = (0..nv).map(|i| {
-        let f = f32s(&vbytes[i * 32..i * 32 + 12]);
+        let f = f32s(&vbytes[i * 48..i * 48 + 12]);
         [f[0], f[1], f[2]]
     });
-    let q =
-        (0..nq).map(|i| [qwords[4 * i], qwords[4 * i + 1], qwords[4 * i + 2], qwords[4 * i + 3]]);
+    let q = (0..nq).map(|i| std::array::from_fn(|k| qwords[6 * i + k]));
     (v.collect(), q.collect())
 }
 
 /// The pieces a mesh is in: its vertices joined by its quads (union-find).
-fn pieces(verts: usize, quads: &[[u32; 4]]) -> (usize, Vec<usize>) {
+fn pieces(verts: usize, quads: &[[u32; 6]]) -> (usize, Vec<usize>) {
     let mut parent: Vec<usize> = (0..verts).collect();
     fn root(p: &mut [usize], mut i: usize) -> usize {
         while p[i] != i {
@@ -152,7 +151,7 @@ fn pieces(verts: usize, quads: &[[u32; 4]]) -> (usize, Vec<usize>) {
         for &v in q {
             used[v as usize] = true;
         }
-        for k in 1..4 {
+        for k in 1..6 {
             let (a, b) = (root(&mut parent, q[0] as usize), root(&mut parent, q[k] as usize));
             parent[a] = b;
         }

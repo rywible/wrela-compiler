@@ -864,6 +864,11 @@ fn mark_counted(cx: &mut Cx, mb: &mut ModuleBuilder) {
         let (d, len) = cx.text_data(mb, &msg);
         mb.m.depth_message = Some((d, len));
     }
+    let (d, len) = cx.text_data(
+        mb,
+        "the stack overflowed: calls too deep, or values too large for the thread's stack",
+    );
+    mb.m.stack_message = Some((d, len));
 }
 
 pub(crate) fn cpu_math_lang(b: ir::Builtin) -> Option<Lang> {

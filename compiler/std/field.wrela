@@ -45,6 +45,15 @@ pub trait Surface: Copy + GpuData {
         value_and_gradient(|q| self.distance(q), p)
     }
 
+    /// Its distance at `p` as something `footprint` wide sees it (a pixel's or a cell's span):
+    /// detail finer than the footprint fades to its mean instead of aliasing (D-077). A
+    /// displacement filters its noise (`Noise::filtered`), and every combinator passes the
+    /// footprint on, so detail anywhere in a surface's tree is filtered. The default is the
+    /// distance itself: a surface with no detail finer than the footprints it's seen at.
+    fn filtered(self, p: vec3, footprint: f32) -> f32 {
+        self.distance(p)
+    }
+
     /// A range holding every distance in `over`, derived by interval arithmetic.
     fn interval(self, over: Box3) -> Interval {
         interval(|q| self.distance(q), over)
@@ -769,6 +778,10 @@ impl<A: Surface, B: Surface> Surface for Union<A, B> {
         min(self.a.distance(p), self.b.distance(p))
     }
 
+    fn filtered(self, p: vec3, footprint: f32) -> f32 {
+        min(self.a.filtered(p, footprint), self.b.filtered(p, footprint))
+    }
+
     fn part_offset(self, p: vec3, i: u32, by: f32) -> f32 {
         let (da, db) = pair_offsets(self.a, self.b, p, i, by)
         min(da, db)
@@ -804,6 +817,10 @@ pub struct SmoothUnion<A, B>: Copy + GpuData {
 impl<A: Surface, B: Surface> Surface for SmoothUnion<A, B> {
     fn distance(self, p: vec3) -> f32 {
         smin(self.a.distance(p), self.b.distance(p), self.k)
+    }
+
+    fn filtered(self, p: vec3, footprint: f32) -> f32 {
+        smin(self.a.filtered(p, footprint), self.b.filtered(p, footprint), self.k)
     }
 
     fn part_offset(self, p: vec3, i: u32, by: f32) -> f32 {
@@ -857,6 +874,14 @@ impl<S: Surface, const N: u32> Surface for UnionAll<S, N> {
         var d = EMPTY
         for i in 0..N {
             d = min(d, self.parts[i].distance(p))
+        }
+        d
+    }
+
+    fn filtered(self, p: vec3, footprint: f32) -> f32 {
+        var d = EMPTY
+        for i in 0..N {
+            d = min(d, self.parts[i].filtered(p, footprint))
         }
         d
     }
@@ -916,6 +941,17 @@ impl<S: Surface, const N: u32> Surface for SmoothUnionAll<S, N> {
         var d = self.parts[0].distance(p)
         for i in 1..N {
             d = smin(d, self.parts[i].distance(p), self.k)
+        }
+        d
+    }
+
+    fn filtered(self, p: vec3, footprint: f32) -> f32 {
+        if N == 0 {
+            return EMPTY
+        }
+        var d = self.parts[0].filtered(p, footprint)
+        for i in 1..N {
+            d = smin(d, self.parts[i].filtered(p, footprint), self.k)
         }
         d
     }
@@ -981,6 +1017,10 @@ impl<A: Surface, B: Surface> Surface for Intersect<A, B> {
         max(self.a.distance(p), self.b.distance(p))
     }
 
+    fn filtered(self, p: vec3, footprint: f32) -> f32 {
+        max(self.a.filtered(p, footprint), self.b.filtered(p, footprint))
+    }
+
     fn part_offset(self, p: vec3, i: u32, by: f32) -> f32 {
         let (da, db) = pair_offsets(self.a, self.b, p, i, by)
         max(da, db)
@@ -1017,6 +1057,10 @@ impl<S: Surface> Surface for Translate<S> {
         self.inner.distance(p - self.by)
     }
 
+    fn filtered(self, p: vec3, footprint: f32) -> f32 {
+        self.inner.filtered(p - self.by, footprint)
+    }
+
     fn part_offset(self, p: vec3, i: u32, by: f32) -> f32 {
         self.inner.part_offset(p - self.by, i, by)
     }
@@ -1048,6 +1092,10 @@ pub struct Displace<S, N>: Copy + GpuData {
 impl<S: Surface, N: Noise> Surface for Displace<S, N> {
     fn distance(self, p: vec3) -> f32 {
         self.inner.distance(p) + self.amp * self.noise.value(p)
+    }
+
+    fn filtered(self, p: vec3, footprint: f32) -> f32 {
+        self.inner.filtered(p, footprint) + self.amp * self.noise.filtered(p, vec3(footprint))
     }
 
     fn part_offset(self, p: vec3, i: u32, by: f32) -> f32 {
@@ -1090,6 +1138,10 @@ impl<A: Surface, B: Surface> Surface for SmoothSubtract<A, B> {
         smax(self.a.distance(p), -self.b.distance(p), self.k)
     }
 
+    fn filtered(self, p: vec3, footprint: f32) -> f32 {
+        smax(self.a.filtered(p, footprint), -self.b.filtered(p, footprint), self.k)
+    }
+
     fn part_offset(self, p: vec3, i: u32, by: f32) -> f32 {
         let (da, db) = pair_offsets(self.a, self.b, p, i, by)
         smax(da, -db, self.k)
@@ -1126,6 +1178,10 @@ pub struct SmoothIntersect<A, B>: Copy + GpuData {
 impl<A: Surface, B: Surface> Surface for SmoothIntersect<A, B> {
     fn distance(self, p: vec3) -> f32 {
         smax(self.a.distance(p), self.b.distance(p), self.k)
+    }
+
+    fn filtered(self, p: vec3, footprint: f32) -> f32 {
+        smax(self.a.filtered(p, footprint), self.b.filtered(p, footprint), self.k)
     }
 
     fn part_offset(self, p: vec3, i: u32, by: f32) -> f32 {
@@ -1174,6 +1230,10 @@ impl<S: Surface> Surface for Rotate<S> {
         self.inner.distance(self.local(p))
     }
 
+    fn filtered(self, p: vec3, footprint: f32) -> f32 {
+        self.inner.filtered(self.local(p), footprint)
+    }
+
     fn part_offset(self, p: vec3, i: u32, by: f32) -> f32 {
         self.inner.part_offset(self.local(p), i, by)
     }
@@ -1205,6 +1265,10 @@ pub struct Scale<S>: Copy + GpuData {
 impl<S: Surface> Surface for Scale<S> {
     fn distance(self, p: vec3) -> f32 {
         self.inner.distance(p / self.by) * self.by
+    }
+
+    fn filtered(self, p: vec3, footprint: f32) -> f32 {
+        self.inner.filtered(p / self.by, footprint / abs(self.by)) * self.by
     }
 
     /// `by` is in this surface's units: the inner surface's part is raised by `by / self.by`.
@@ -1243,6 +1307,10 @@ fn mirrored(p: vec3) -> vec3 {
 impl<S: Surface> Surface for Mirror<S> {
     fn distance(self, p: vec3) -> f32 {
         self.inner.distance(mirrored(p))
+    }
+
+    fn filtered(self, p: vec3, footprint: f32) -> f32 {
+        self.inner.filtered(mirrored(p), footprint)
     }
 
     /// A part as written decides at x ≥ 0, its image at x < 0 (as `part_at` has it).
@@ -1296,6 +1364,10 @@ pub struct Named<S>: Copy + GpuData {
 impl<S: Surface> Surface for Named<S> {
     fn distance(self, p: vec3) -> f32 {
         self.inner.distance(p)
+    }
+
+    fn filtered(self, p: vec3, footprint: f32) -> f32 {
+        self.inner.filtered(p, footprint)
     }
 
     fn part_name(self, i: u32) -> PartName {
@@ -1521,6 +1593,10 @@ pub struct ToBound<S>: Copy + GpuData {
 impl<S: Surface> Surface for ToBound<S> {
     fn distance(self, p: vec3) -> f32 {
         clamp(self.inner.distance(p), -self.near, self.near) * self.scale
+    }
+
+    fn filtered(self, p: vec3, footprint: f32) -> f32 {
+        clamp(self.inner.filtered(p, footprint), -self.near, self.near) * self.scale
     }
 
     fn part_offset(self, p: vec3, i: u32, by: f32) -> f32 {
@@ -1908,6 +1984,10 @@ impl<S: Surface, C: Copy + GpuData> Surface for With<S, C> {
         self.inner.distance(p)
     }
 
+    fn filtered(self, p: vec3, footprint: f32) -> f32 {
+        self.inner.filtered(p, footprint)
+    }
+
     fn part_offset(self, p: vec3, i: u32, by: f32) -> f32 {
         self.inner.part_offset(p, i, by)
     }
@@ -1948,6 +2028,10 @@ pub struct WithAt<S, F>: Copy + GpuData {
 impl<S: Surface, F: Copy + GpuData> Surface for WithAt<S, F> {
     fn distance(self, p: vec3) -> f32 {
         self.inner.distance(p)
+    }
+
+    fn filtered(self, p: vec3, footprint: f32) -> f32 {
+        self.inner.filtered(p, footprint)
     }
 
     fn part_offset(self, p: vec3, i: u32, by: f32) -> f32 {
