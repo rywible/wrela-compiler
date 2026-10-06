@@ -278,6 +278,8 @@ export class Program {
   readonly hash: StateHash | null;
   #sequencer = new Sequencer();
   #memory: WebAssembly.Memory | null = null;
+  /** The memory's maximum, in bytes: what the program reserves. */
+  #reserved = 0;
   /** Where the code came from, for trap messages. */
   #lines: Lines | null = null;
   #frame: FrameFn | null = null;
@@ -372,6 +374,7 @@ export class Program {
     program.#instance = instance;
     program.#module = module;
     program.#memory = memory;
+    program.#reserved = (compiled.memory.maximum ?? compiled.memory.initial) * 65536;
     program.#frame = instance.exports[EXPORT_FRAME] as FrameFn;
     // The helpers: each its own instance of the module on its own thread, with the memory.
     if (EXPORT_WORKER in instance.exports && options.spawnWorker) {
@@ -561,6 +564,11 @@ export class Program {
     this.#call(() => this.#frame!(time, width, height));
     this.#sequencer.endFrame();
     this.executor.flush();
+  }
+
+  /** Its memory, in bytes: the maximum it reserves, and what it has grown to. */
+  get memoryBytes(): { reserved: number; used: number } {
+    return { reserved: this.#reserved, used: this.#memory?.buffer.byteLength ?? 0 };
   }
 
   /** How many chunks of parallel jobs the workers (not the program's own thread) have run. */

@@ -378,6 +378,14 @@ test("a readback submits the work before it, then copies its range out", async (
   expect(readback.destroyed).toBe(true);
 });
 
+test("the program's buffers and textures are counted in bytes, now and at most", async () => {
+  const { run, executor } = await setup();
+  run(new Encoder().createBuffer(1, 1000).createTexture(2, 8, 4, "rgba16float").createTexture(3, 8, 8, "depth32float"));
+  expect(executor.memory).toEqual({ bytes: 1000 + 256 + 256, peak: 1512 });
+  run(new Encoder().destroyBuffer(1).destroyTexture(2));
+  expect(executor.memory).toEqual({ bytes: 256, peak: 1512 });
+});
+
 test("destroying a texture releases it after the work before it is submitted", async () => {
   const { device, run, executor } = await setup();
   run(new Encoder().createTexture(3, 8, 8, "rgba8unorm").destroyTexture(3).createSampler(4, false, false, null).destroySampler(4));

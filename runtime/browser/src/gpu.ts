@@ -19,7 +19,7 @@
 // - A destroyed buffer or texture is released after the next flush: work recorded before it
 //   still uses it.
 
-import { NONE, SCREEN, SCREEN_FORMAT } from "./abi.gen.ts";
+import { NONE, SCREEN, SCREEN_FORMAT, TEXTURE_FORMATS } from "./abi.gen.ts";
 import { CommandError, isDepth } from "./check.ts";
 import { errorMessage } from "./errors.ts";
 import type { Manifest, Pipeline, ResourceBinding, UniformBlock } from "./manifest.ts";
@@ -252,7 +252,7 @@ interface PendingDraw {
 /** A live resource the program made. */
 type Resource =
   | { kind: "buffer"; buffer: GPUBuffer }
-  | { kind: "texture"; texture: GPUTexture; view: GPUTextureView; format: TextureFormat }
+  | { kind: "texture"; texture: GPUTexture; view: GPUTextureView; format: TextureFormat; bytes: number }
   | { kind: "sampler"; sampler: GPUSampler };
 
 /** `n` rounded up to a multiple of `align`. */
@@ -337,6 +337,9 @@ class Timer {
 export class GpuExecutor {
   readonly #align: number;
   readonly #resources = new Map<number, Resource>();
+  /** The bytes of the program's buffers and textures now, and at most so far. */
+  #bytes = 0;
+  #peak = 0;
   /** By pipeline and bindings. */
   readonly #bindGroups = new Map<string, { group: GPUBindGroup; handles: number[] }>();
   /** The keys of the bind groups that use each resource, so destroying it drops only those. */
@@ -426,6 +429,7 @@ export class GpuExecutor {
   execute(cmd: Command): void {
     switch (cmd.op) {
       case "CreateBuffer":
+        this.#allocated(cmd.size);
         this.#resources.set(cmd.handle, {
           kind: "buffer",
           buffer: this.device.createBuffer({
@@ -452,7 +456,9 @@ export class GpuExecutor {
             GPUTextureUsage.COPY_SRC |
             (depth ? 0 : GPUTextureUsage.COPY_DST),
         });
-        this.#resources.set(cmd.handle, { kind: "texture", texture, view: texture.createView(), format: cmd.format });
+        const bytes = cmd.width * cmd.height * TEXTURE_FORMATS.find((f) => f.name === cmd.format)!.bytes;
+        this.#resources.set(cmd.handle, { kind: "texture", texture, view: texture.createView(), format: cmd.format, bytes });
+        this.#allocated(bytes);
         return;
       }
       case "CreateSampler": {
@@ -595,12 +601,29 @@ export class GpuExecutor {
     return this.device.createBuffer({ label: "readback", size, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
   }
 
+  /** The program's buffers and textures, in bytes: now, and at most so far (test mode's
+   * `memory.json`). */
+  get memory(): { bytes: number; peak: number } {
+    return { bytes: this.#bytes, peak: this.#peak };
+  }
+
+  #allocated(bytes: number): void {
+    this.#bytes += bytes;
+    this.#peak = Math.max(this.#peak, this.#bytes);
+  }
+
   #destroy(handle: number): void {
     const r = this.#resources.get(handle);
     if (r === undefined) throw new Error(`host bug: resource ${handle} passed the checks but doesn't exist`);
     // Recorded work may still use it: it's destroyed once that work is submitted.
-    if (r.kind === "buffer") this.#doomed.push(r.buffer);
-    if (r.kind === "texture") this.#doomed.push(r.texture);
+    if (r.kind === "buffer") {
+      this.#doomed.push(r.buffer);
+      this.#allocated(-r.buffer.size);
+    }
+    if (r.kind === "texture") {
+      this.#doomed.push(r.texture);
+      this.#allocated(-r.bytes);
+    }
     this.#resources.delete(handle);
     for (const key of this.#groupsOf.get(handle) ?? []) this.#dropBindGroup(key);
     this.#groupsOf.delete(handle);

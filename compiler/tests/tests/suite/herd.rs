@@ -853,7 +853,8 @@ fn paced_herd(name: &str, script: &str) -> (std::path::PathBuf, wrela_tests::Bro
 /// load). Each grazer is drawn within 0.5 s of its spawn and has its level within 2 s (AC4's
 /// latency); a tick takes at most 4 ms at the 99th percentile (AC5). Reported beside: the
 /// pipelines (at most 64; the spike's 8), the time from opening the page to the first frame with
-/// all 40 grazers, and the bytes downloaded before it.
+/// all 40 grazers, the bytes downloaded before it, and the memory: the program's GPU buffers and
+/// textures at most, and its WASM memory used and reserved.
 #[test]
 #[ignore = "needs Chrome, python3 and a GPU"]
 fn the_herd_keeps_its_frames_in_chrome() {
@@ -891,12 +892,17 @@ fn the_herd_keeps_its_frames_in_chrome() {
     let mut ticks = chrome.ticks.as_ref().expect("the sim's ticks").cpu_ms.clone();
     ticks.sort_by(f64::total_cmp);
     let p99 = ticks[(ticks.len() * 99 / 100).min(ticks.len() - 1)];
+    let memory = wrela_tests::result_json(&results, "memory.json");
+    let mib = |v: &serde_json::Value| v.as_f64().expect("bytes") / 1048576.0;
     eprintln!(
-        "paced: {missed} of {} frames over 16.7 ms (worst {worst:.2} ms, median {:.2}); every grazer drawn within {drawn:.0} ms and at its level within {leveled:.0} ms; {} ticks, 99th percentile {p99:.2} ms; {pipelines} pipelines (the spike's 8); all 40 drawn {to_all:.0} ms after the page opened, {:.2} MB downloaded before",
+        "paced: {missed} of {} frames over 16.7 ms (worst {worst:.2} ms, median {:.2}); every grazer drawn within {drawn:.0} ms and at its level within {leveled:.0} ms; {} ticks, 99th percentile {p99:.2} ms; {pipelines} pipelines (the spike's 8); all 40 drawn {to_all:.0} ms after the page opened, {:.2} MB downloaded before; GPU buffers and textures {:.1} MiB at most, WASM memory {:.1} MiB used of {:.0} reserved",
         ms.len(),
         median(&ms),
         ticks.len(),
-        bytes / 1e6
+        bytes / 1e6,
+        mib(&memory["gpu"]["peak"]),
+        mib(&memory["wasm"]["used"]),
+        mib(&memory["wasm"]["reserved"]),
     );
     assert!(all.is_some(), "the herd never drew all 40 grazers");
     assert!(ms.len() >= 590, "only {} frames were timed", ms.len());

@@ -23,7 +23,8 @@
 // held that much longer; with `framedelay=ms`, each frame. With `salt=n`, each shader gets a
 // comment that makes it unique, so no cache serves its pipelines, and `pipelines.json` has how
 // long creating them all, at once, took (#42 AC4's cold pipelines). `load.json` has when the page opened
-// and each file it loaded. It's part of the shipped bundle, so the agreement test runs
+// and each file it loaded; `memory.json` the bytes of the program's GPU buffers and textures (at
+// the end, and at most) and of its WASM memory (reserved, and grown to). It's part of the shipped bundle, so the agreement test runs
 // the exact bytes a game ships, but only a page served from this machine (tools/serve.py and
 // tools/headless.py bind 127.0.0.1) enters it: a game's public URL ignores `#test`.
 

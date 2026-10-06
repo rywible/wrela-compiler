@@ -342,6 +342,7 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
     putResult(base, "frames.json", JSON.stringify({ cpu_ms: cpu, began_ms, printed_in })),
     params.timestamps > 0 ? executor.timings().then((t) => putResult(base, "timings.json", JSON.stringify(t))) : null,
     params.salt > 0 ? putResult(base, "pipelines.json", JSON.stringify({ ms: pipelinesMs, count: build.manifest.pipelines.length })) : null,
+    putResult(base, "memory.json", JSON.stringify({ gpu: executor.memory, wasm: program.memoryBytes })),
   ]);
   if (params.audio > 0) {
     if (!program.hasVoice) throw new Error("the test asks for audio, but the program started no voice");
