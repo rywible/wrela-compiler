@@ -89,30 +89,40 @@ struct Pair: Copy + Plain {
     pad: [u32; 14],
 }
 
-/// Publishes `n` values, one after another.
+/// Publishes `n` values, one after another, and after each, its number on a second hand-off:
+/// a reader that sees number `i` there knows value `i` was complete before it looked.
 @deterministic
-fn publish_all(input: take (std::handoff::Publisher<Pair>, u32)) -> u32 {
-    let (o, n) = take input
+fn publish_all(
+    input: take (std::handoff::Publisher<Pair>, std::handoff::Publisher<u32>, u32),
+) -> u32 {
+    let (o, d, n) = take input
     var out = take o
+    var done = take d
     for i in 1..n + 1 {
         out.publish(Pair { n: i, sq: i.wrapping_mul(i), pad: [i; 14] })
+        done.publish(i)
     }
     n
 }
 
 /// A helper publishes `n` values while this thread reads at least `reads` times: in a debug
-/// build, every read checks its value's checksum and that it's no older than the last. How
-/// many reads, and how many values the newest read had seen.
+/// build, every read checks its value's checksum and that it's no older than the last. Each
+/// read is also the latest complete value: no older than one whose publishing had finished
+/// before the read began. How many reads, and how many values the newest read had seen.
 pub fn stress(n: u32, reads: u32) -> vec2 {
     let (out, latest) = handoff(Pair { n: 0, sq: 0, pad: [0; 14] })
+    let (done_out, done_latest) = handoff(0)
     var latest = take latest
-    let j = job((take out, n), publish_all)
+    var done = take done_latest
+    let j = job((take out, take done_out, n), publish_all)
     var count: u32 = 0
     var last: u32 = 0
     loop {
+        let finished = done.read()
         borrow v = latest.read()
         assert(v.sq == v.n.wrapping_mul(v.n), "a pair read torn")
         assert(v.n >= last, "an older pair than the last")
+        assert(v.n >= finished, "a read gave an older pair than one already complete")
         last = v.n
         count += 1
         if count >= reads && last == n {

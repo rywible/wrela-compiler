@@ -80,7 +80,9 @@ fn allocations_are_counted_per_thread() {
 
 /// A hand-off is never read torn (AC6): a helper publishes as fast as it can while this thread
 /// reads, in a debug build, where each read checks its value's checksum and that it's no older
-/// than the last; and the program checks each pair it reads. 0 mismatches in 10⁶ reads.
+/// than the last; and the program checks each pair it reads, and that it's the latest complete
+/// (no older than one the helper had finished publishing before the read). 0 mismatches in 10⁶
+/// reads.
 #[test]
 fn a_hand_off_is_never_read_torn() {
     let dir = crate::scratch("threads-handoff");

@@ -1554,9 +1554,10 @@ fn the_engine_and_the_herd_keep_their_layers() {
     }
 }
 
-/// AC6: frames don't wait for ticks. Paced in Chrome, 300 frames of the live herd at 640×360,
+/// AC6: frames don't wait for ticks. Paced in Chrome, 600 frames of the live herd at 640×360,
 /// with each tick held 30 ms (two ticks' time): the render worker's frame intervals keep their
-/// median and 99th percentile within 1 ms of a run with normal ticks.
+/// median and 99th percentile within 1 ms of a run with normal ticks. (Each frame reads the
+/// latest complete snapshot: threads::a_hand_off_is_never_read_torn.)
 #[test]
 #[ignore = "needs Chrome, python3 and a GPU"]
 fn frames_dont_wait_for_slow_ticks() {
@@ -1567,7 +1568,7 @@ fn frames_dont_wait_for_slow_ticks() {
             paced: true,
             nohash: true,
             tickdelay,
-            ..wrela_tests::ChromeRun::new(300, 640, 360, 60.0)
+            ..wrela_tests::ChromeRun::new(600, 640, 360, 60.0)
         };
         let chrome = wrela_tests::run_in_chrome_with(&rel, run);
         let ticks = chrome.ticks.as_ref().map_or(0, |t| t.cpu_ms.len());
