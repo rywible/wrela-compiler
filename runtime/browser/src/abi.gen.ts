@@ -57,6 +57,8 @@ export const IMPORT_MEMORY = "memory";
 export const EXPORT_WORKER = "__worker";
 export const IMPORT_AUDIO = "audio";
 export const IMPORT_INPUT = "input";
+export const IMPORT_TICK = "tick";
+export const EXPORT_TICK = "__tick";
 /** Input (runtime/abi `input`): an event is EVENT_SIZE bytes, six words: its kind, its
  * modifiers, then four words that depend on the kind. */
 export const EVENT_SIZE = 24;
@@ -86,21 +88,48 @@ export const HOST_FUNCTIONS = [
   ["limit", "(i32) -> (i32)"],
   ["audio", "(i32, i32) -> ()"],
   ["input", "(i32, i32) -> (i32)"],
+  ["tick", "(i32, i32, i32) -> ()"],
 ] as const;
 export const EXPORT_AUDIO = "__audio";
 /** The audio thread's rate and render quantum, and where `__audio` leaves a quantum's samples. */
 export const AUDIO_SAMPLE_RATE = 48000;
 export const AUDIO_QUANTUM = 128;
-export const AUDIO_OUT = 18874368;
-/** The workers' job's words a host writes, and how many workers a program runs at most
- * (runtime/abi `memory`). */
-export const WORKERS_GENERATION = 256;
-export const WORKERS_DONE = 276;
-export const WORKERS_FAILED = 280;
-export const WORKERS_DONE_FAILED = 2147483648;
-export const WORKERS_SHUTDOWN = 284;
-export const WORKERS_HELPED = 288;
+export const AUDIO_OUT = 1245184;
+/** The threads (runtime/abi `memory`): their numbers, their blocks, and the words of a block and
+ * of a job slot a host reads and writes. */
+export const THREADS = 11;
+export const THREAD_MAIN = 0;
+export const THREAD_TICK = 1;
+export const THREAD_AUDIO = 2;
+export const THREAD_HELPER0 = 3;
 export const MAX_WORKERS = 8;
+export const THREAD_BLOCKS = 1114112;
+export const THREAD_BLOCK_SIZE = 8192;
+export const JOB_DONE = 20;
+export const JOB_FAILED = 24;
+export const JOB_DONE_FAILED = 2147483648;
+export const RUNNING = 32;
+export const JOB_SLOTS = 1212416;
+export const JOB_SLOT_COUNT = 256;
+export const JOB_SLOT_SIZE = 16;
+export const SLOT_STATE = 0;
+export const SLOT_THREAD = 12;
+export const SLOT_FAILED = 5;
+/** The helpers' shared words: their wake-up, the host's shutdown, how many chunks they ran, and
+ * how long they hold a job's result back (tests). */
+export const PAR_WAKE = 256;
+export const PAR_SHUTDOWN = 260;
+export const PAR_HELPED = 264;
+export const PAR_HOLD = 268;
+/** The ticker's words (runtime/abi `memory`), and its records' region. */
+export const TICK_WANT_HASH = 512;
+export const TICK_HASH = 520;
+export const TICK_ORIGIN = 528;
+export const TICK_RECORDS = 1228800;
+export const MAX_TICK_RECORDS = 256;
+/** The tick log (runtime/abi `ticks`). */
+export const TICK_LOG_VERSION = 1;
+export const TICK_LOG_HEADER_LEN = 32;
 export const REQUEST_PENDING = -1;
 export const REQUEST_FAILED = -2;
 export const EXPORT_FRAME = "frame";
@@ -121,6 +150,7 @@ export const DEFAULT_LIMITS = [8192, 134217728, 8, 65536, 16384, 256, 256, 256, 
 export const FNV_OFFSET = 0xcbf29ce484222325n;
 export const FNV_PRIME = 0x00000100000001b3n;
 
-/** Where a panic leaves its message: a u32 byte count, then UTF-8 (at most PANIC_CAP bytes). */
-export const PANIC_MESSAGE = 512;
-export const PANIC_CAP = 3580;
+/** Where in a thread's block a panic leaves its message: a u32 byte count, then UTF-8 (at most
+ * PANIC_CAP bytes). */
+export const PANIC = 4096;
+export const PANIC_CAP = 4092;

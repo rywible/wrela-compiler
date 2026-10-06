@@ -366,7 +366,7 @@ impl Item {
 }
 
 fn take_panic_message(data: &mut [u8]) -> Option<String> {
-    let at = wrela_abi::memory::PANIC_MESSAGE as usize;
+    let at = wrela_abi::memory::panic_at(wrela_abi::memory::THREAD_MAIN) as usize;
     let msg = wrela_abi::memory::panic_message(data.get(at..)?)?;
     data[at..at + 4].fill(0);
     Some(msg)
@@ -484,9 +484,9 @@ pub(crate) fn failure(
                 Item::Test(_) => "check that its loops end, or test less at once",
             });
     } else if code == codes::E0706 {
-        let framed = matches!(item, Item::Test(f) if p.func(f).attrs.test_frames.is_some());
+        let framed = matches!(item, Item::Test(f) if p.func(f).attrs.runs_program());
         d = d.with_note(if framed {
-            "a frame test runs `init` and the program's frames, then the test: it passes unless one of them panics, and a failed `assert` panics (§10)"
+            "a frame test runs `init` and the program's frames (or a tick test its ticks), then the test: it passes unless one of them panics, and a failed `assert` panics (§10)"
         } else {
             "a test passes unless it panics, and a failed `assert` panics (§10)"
         });

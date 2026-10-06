@@ -1659,9 +1659,6 @@ impl<'c, 'a> Fl<'c, 'a> {
                     {
                         return crate::par::par_job(self, l, &substs, c);
                     }
-                    if self.cx.checked.program.func(*func).lang == Some(Lang::StartVoice) {
-                        return crate::audio::start_voice(self, &substs, c);
-                    }
                     return crate::gpu::intrinsic(self, *func, &substs, c, ty);
                 }
                 self.call_fn(*func, substs, &c.args, span)

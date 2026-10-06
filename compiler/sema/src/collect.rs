@@ -310,7 +310,9 @@ impl<'d, 'u> Collector<'d, 'u> {
     ) -> FnId {
         let Vis { public, package_only } = vis;
         let generics = self.declare_generics(&f.generics);
-        let mut attrs = self.fn_attrs(attrs, is_std);
+        let core = is_std
+            && self.p.module(m).path.get(1).is_some_and(|s| UNSAFE_CORE.contains(&s.as_str()));
+        let mut attrs = self.fn_attrs(attrs, is_std, core);
         // std's unsafe core: its public functions are callable only inside `unsafe` (§6.14).
         attrs.unsafe_call = is_std
             && public
@@ -670,11 +672,35 @@ impl<'d, 'u> Collector<'d, 'u> {
         }
     }
 
-    fn fn_attrs(&mut self, attrs: &[ast::Attribute], is_std: bool) -> FnAttrs {
+    fn fn_attrs(&mut self, attrs: &[ast::Attribute], is_std: bool, core: bool) -> FnAttrs {
         let mut out = FnAttrs::default();
         for a in attrs {
             let name = a.name.name.as_str();
             match name {
+                "thread_entry" | "effects" if !core => {
+                    self.diags.push(
+                        Diagnostic::new(
+                            codes::E0204,
+                            a.span,
+                            format!("`@{name}` is for std's unsafe core alone"),
+                        )
+                        .with_note(match name {
+                            "effects" => "effects are inferred, never written (§8): std's core states only what comes through memory from another thread or the host",
+                            _ => "a host calls a thread entry on a thread of its own; programs start threads through std (`std::tick`, `std::par`, `std::audio`)",
+                        }),
+                    );
+                }
+                "thread_entry" => {
+                    if a.args.is_some() {
+                        self.diags.push(Diagnostic::new(
+                            codes::E0204,
+                            a.span,
+                            "`@thread_entry` takes no arguments",
+                        ));
+                    }
+                    out.thread_entry = Some(a.span);
+                }
+                "effects" => out.effects = self.declared_effects(a),
                 "compute" | "vertex" | "fragment" => {
                     if let Some((_, prev)) = out.entry {
                         self.diags.push(
@@ -723,7 +749,8 @@ impl<'d, 'u> Collector<'d, 'u> {
                 "intrinsic" if is_std => out.intrinsic = true,
                 "test" => {
                     if let Some(args) = &a.args {
-                        (out.test_frames, out.test_input) = self.test_frames(a, args);
+                        (out.test_frames, out.test_ticks, out.test_input) =
+                            self.test_frames(a, args);
                     }
                     out.test = Some(a.span);
                 }
@@ -796,21 +823,55 @@ impl<'d, 'u> Collector<'d, 'u> {
         out
     }
 
+    /// `@effects(nondet, io, ...)`'s effects (std's unsafe core).
+    fn declared_effects(&mut self, a: &ast::Attribute) -> Vec<crate::effects::Effect> {
+        use crate::effects::Effect;
+        let mut out = Vec::new();
+        for arg in a.args.iter().flatten() {
+            let name = match &arg.value.kind {
+                ast::ExprKind::Path(p) if p.is_single() && arg.name.is_none() => {
+                    Some(p.segments[0].ident.name.as_str())
+                }
+                _ => None,
+            };
+            match name.and_then(Effect::named) {
+                Some(e) => out.push(e),
+                None => self.diags.push(Diagnostic::new(
+                    codes::E0204,
+                    arg.span,
+                    "`@effects` names effects: alloc, io, nondet, recursion, host or panic",
+                )),
+            }
+        }
+        out
+    }
+
     /// `@compute(x)`, `@compute(x, y)` or `@compute(x, y, z)`, within WebGPU's default limits.
-    /// `@test(frames: n)`'s `n` (§10): from 1 to [`MAX_TEST_FRAMES`], and, with
-    /// `input: "path"`, the script of input events its frames get. Anything else is E0222.
+    /// `@test(frames: n)`'s `n` (§10): from 1 to [`MAX_TEST_FRAMES`], or `@test(ticks: n)`'s,
+    /// and, with `input: "path"`, the script of input events (or the tick log) they get.
+    /// Anything else is E0222.
     fn test_frames(
         &mut self,
         a: &ast::Attribute,
         args: &[ast::Arg],
-    ) -> (Option<u32>, Option<(String, Span)>) {
+    ) -> (Option<u32>, Option<u32>, Option<(String, Span)>) {
         let named =
             |name: &str| args.iter().find(|x| x.name.as_ref().is_some_and(|n| n.name == name));
-        let others = args
-            .iter()
-            .any(|x| !x.name.as_ref().is_some_and(|n| n.name == "frames" || n.name == "input"));
-        let n = match named("frames").map(|x| &x.value.kind) {
-            Some(ast::ExprKind::Lit(ast::Lit { kind: ast::LitKind::Int(v), .. })) => v.ok(),
+        let others = args.iter().any(|x| {
+            !x.name
+                .as_ref()
+                .is_some_and(|n| matches!(n.name.as_str(), "frames" | "ticks" | "input"))
+        });
+        let count = |name: &str| match named(name).map(|x| &x.value.kind) {
+            Some(ast::ExprKind::Lit(ast::Lit { kind: ast::LitKind::Int(v), .. })) => {
+                v.ok().filter(|&n| (1..=u64::from(MAX_TEST_FRAMES)).contains(&n))
+            }
+            _ => None,
+        };
+        let (frames, ticks) = (named("frames").is_some(), named("ticks").is_some());
+        let n = match (frames, ticks) {
+            (true, false) => count("frames"),
+            (false, true) => count("ticks"),
             _ => None,
         };
         let input = match named("input") {
@@ -823,19 +884,20 @@ impl<'d, 'u> Collector<'d, 'u> {
             },
         };
         match (n, input) {
-            (Some(n), Ok(input)) if !others && (1..=u64::from(MAX_TEST_FRAMES)).contains(&n) => {
-                (Some(n as u32), input)
+            (Some(n), Ok(input)) if !others => {
+                let n = n as u32;
+                if frames { (Some(n), None, input) } else { (None, Some(n), input) }
             }
             _ => {
                 self.diags.push(
                     Diagnostic::new(
                         codes::E0222,
                         a.span,
-                        format!("`@test` takes `frames: n`, from 1 to {MAX_TEST_FRAMES}: how many of the program's frames run before the test; and may take `input: \"script.json\"`, a script of input events for them"),
+                        format!("`@test` takes `frames: n` or `ticks: n`, from 1 to {MAX_TEST_FRAMES}: how many of the program's frames, or ticks, run before the test; and may take `input: \"script.json\"`, a script of input events for them (or, with `ticks`, a tick log to check them against)"),
                     )
                     .with_note("`@test` alone is a test of code; `@test(frames: 600)` runs the program for 600 frames, then the test with its state (§10)"),
                 );
-                (None, None)
+                (None, None, None)
             }
         }
     }
@@ -1330,7 +1392,7 @@ impl<'d, 'u> Collector<'d, 'u> {
     fn test_signature(&mut self, id: FnId) {
         let def = self.p.func(id);
         let Some(at) = def.attrs.test else { return };
-        let frames = def.attrs.test_frames.is_some();
+        let frames = def.attrs.runs_program();
         let program = self.p.package_of(def.module).kind == PackageKind::Program;
         // A dependency's frame test is about its own program, checked when it's the package
         // checked; here its frames aren't this program's.
@@ -1352,7 +1414,7 @@ impl<'d, 'u> Collector<'d, 'u> {
         } else if frames && !def.params.is_empty() && state.is_none() {
             Some("it takes a parameter, and the program has no state to pass it (`init` makes one)")
         } else if frames && (def.params.len() > 1 || !def.params.iter().all(takes_state)) {
-            Some("a frame test takes nothing, or the program's state, borrowed")
+            Some("a frame or tick test takes nothing, or the program's state, borrowed")
         } else if !frames && !def.params.is_empty() {
             Some("it takes parameters, and nothing passes them")
         } else if def.ret != self.p.types.unit {
@@ -1373,7 +1435,7 @@ impl<'d, 'u> Collector<'d, 'u> {
                     format!("`{}` can't be a `@test`: {why}", def.name),
                 )
                 .with_secondary(at, "declared a test here")
-                .with_note("a test is `@test fn name() { ... }`, or `@test(frames: n) fn name(state: State) { ... }` to run the program's frames first: it passes unless it panics, and a failed `assert` panics"),
+                .with_note("a test is `@test fn name() { ... }`, or `@test(frames: n) fn name(state: State) { ... }` to run the program's frames first (`ticks: n`, its ticks): it passes unless it panics, and a failed `assert` panics"),
             );
         }
     }

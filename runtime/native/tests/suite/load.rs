@@ -48,6 +48,6 @@ fn rejects_a_program_with_other_imports() {
     let err = Host::load(&dir).err().expect("rejected");
     assert_eq!(
         err.to_string(),
-        "invalid program: it imports `env.now`, which isn't one of the host's: `wrela.memory`, `wrela.submit`, `wrela.request_status`, `wrela.request_take`, `wrela.limit`, `wrela.audio`, `wrela.input`"
+        "invalid program: it imports `env.now`, which isn't one of the host's: `wrela.memory`, `wrela.submit`, `wrela.request_status`, `wrela.request_take`, `wrela.limit`, `wrela.audio`, `wrela.input`, `wrela.tick`"
     );
 }

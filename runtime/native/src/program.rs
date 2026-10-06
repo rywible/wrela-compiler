@@ -17,13 +17,13 @@ use wrela_abi::check::{Checker, CommandError};
 use wrela_abi::hash::StateHash;
 use wrela_abi::input::{EVENT_SIZE, Event, Queue};
 use wrela_abi::lines::{self, Lines};
-use wrela_abi::memory::MAX_WORKERS;
+use wrela_abi::memory::{self, MAX_WORKERS};
 use wrela_abi::stream::{self, Command, Sequencer};
 use wrela_abi::{
-    AUDIO_QUANTUM, EXPORT_AUDIO, EXPORT_FRAME, EXPORT_INIT, EXPORT_MEMORY, EXPORT_WORKER,
-    HOST_FUNCTIONS, IMPORT_AUDIO, IMPORT_INPUT, IMPORT_LIMIT, IMPORT_MEMORY, IMPORT_MODULE,
-    IMPORT_REQUEST_STATUS, IMPORT_REQUEST_TAKE, IMPORT_SUBMIT, Manifest, REQUEST_FAILED,
-    REQUEST_PENDING,
+    AUDIO_QUANTUM, EXPORT_AUDIO, EXPORT_FRAME, EXPORT_INIT, EXPORT_MEMORY, EXPORT_TICK,
+    EXPORT_WORKER, HOST_FUNCTIONS, IMPORT_AUDIO, IMPORT_INPUT, IMPORT_LIMIT, IMPORT_MEMORY,
+    IMPORT_MODULE, IMPORT_REQUEST_STATUS, IMPORT_REQUEST_TAKE, IMPORT_SUBMIT, IMPORT_TICK,
+    Manifest, REQUEST_FAILED, REQUEST_PENDING,
 };
 
 /// The process's one wasmtime engine: every program compiles and runs under it, as wasmtime
@@ -138,6 +138,8 @@ struct State<E> {
     started: bool,
     /// The voice `wrela.audio` started: its task and context.
     voice: Option<(u32, u32)>,
+    /// The ticker `wrela.tick` started: its task, context and rate.
+    ticker: Option<(u32, u32, u32)>,
     /// The lines the program printed (`std::io::print`), each also shown on stderr unless quiet.
     logs: Vec<String>,
     /// Input events not yet read (`wrela.input`).
@@ -306,8 +308,60 @@ impl<E: Executor> State<E> {
     }
 }
 
-/// The audio thread's instance of the program, and its `__audio(task, context)`.
-type AudioThread = (Store<()>, TypedFunc<(u32, u32), ()>);
+/// The audio thread's instance of the program, and its `__audio(thread, task, context)`.
+type AudioThread = (Store<()>, TypedFunc<(u32, u32, u32), ()>);
+
+/// The ticker's thread's instance of the program, its `__tick(thread, task, context, tick)`,
+/// and the next tick's number.
+pub(crate) struct TickThread {
+    store: Store<()>,
+    tick: TypedFunc<(u32, u32, u32, u32), ()>,
+    next: u32,
+    memory: SharedMemory,
+    task: u32,
+    context: u32,
+    fuel: Option<u64>,
+}
+
+impl TickThread {
+    /// Runs the next tick with `records`, and asks for its state's hash if `hash`: on whichever
+    /// OS thread holds this (a tick can run beside the program's frames).
+    pub(crate) fn run(
+        &mut self,
+        records: Vec<[u8; EVENT_SIZE as usize]>,
+        hash: bool,
+    ) -> std::result::Result<Ticked, (u32, wasmtime::Error)> {
+        let k = self.next;
+        let mut bytes = (records.len() as u32).to_le_bytes().to_vec();
+        for r in &records {
+            bytes.extend(r);
+        }
+        shared::write(&self.memory, memory::TICK_RECORDS as usize, &bytes);
+        shared::store_u32(&self.memory, memory::TICK_WANT_HASH, u32::from(hash));
+        if let Some(fuel) = self.fuel {
+            self.store.set_fuel(fuel).map_err(|e| (k, e))?;
+        }
+        let result =
+            self.tick.call(&mut self.store, (memory::THREAD_TICK, self.task, self.context, k));
+        self.next += 1;
+        result.map_err(|e| (k, e))?;
+        let reported = || {
+            let lo = shared::load_u32(&self.memory, memory::TICK_HASH);
+            let hi = shared::load_u32(&self.memory, memory::TICK_HASH + 4);
+            u64::from(lo) | (u64::from(hi) << 32)
+        };
+        Ok(Ticked { tick: k, records, hash: hash.then(reported) })
+    }
+}
+
+/// What a tick was given and gave: its number, its records, and the state's hash after its
+/// step when the host asked for it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Ticked {
+    pub tick: u32,
+    pub records: Vec<[u8; EVENT_SIZE as usize]>,
+    pub hash: Option<u64>,
+}
 
 pub(crate) struct Program<E: 'static> {
     store: Store<State<E>>,
@@ -317,6 +371,11 @@ pub(crate) struct Program<E: 'static> {
     module: Module,
     /// The audio thread's instance, once [`Program::render_audio`] has made it.
     audio: Option<AudioThread>,
+    /// The ticker's thread's instance, once [`Program::tick`] has made it.
+    ticker: Option<TickThread>,
+    /// The ticker's records not yet stamped into a tick, as bytes: a tick takes at most
+    /// `wrela_abi::memory::MAX_TICK_RECORDS`, and the rest wait for the next.
+    records: std::collections::VecDeque<[u8; EVENT_SIZE as usize]>,
     instance: Instance,
     frame: TypedFunc<(f32, u32, u32), ()>,
     /// Where the code came from, for trap messages (`wrela_abi::lines`).
@@ -424,6 +483,7 @@ pub(crate) struct Compiled {
 
 /// Compiles a program and checks it against the ABI ([`check_abi`]); with `fuel`, for the
 /// metered engine, where each call gets that much fuel.
+#[cfg(test)]
 pub(crate) fn compile_with(wasm: &[u8], fuel: Option<u64>) -> Result<Compiled> {
     let engine = if fuel.is_some() { &*METERED } else { &*ENGINE };
     let module = Module::new(engine, wasm).map_err(|e| Error::Program(format!("{e:#}")))?;
@@ -433,7 +493,17 @@ pub(crate) fn compile_with(wasm: &[u8], fuel: Option<u64>) -> Result<Compiled> {
 /// [`compile_with`] with no fuel, the compiled code kept beside the build in `dir`
 /// (`crate::cache`).
 pub(crate) fn compile_cached(wasm: &[u8], dir: &std::path::Path) -> Result<Compiled> {
-    compiled(crate::cache::module(&ENGINE, wasm, dir)?, wasm, None)
+    compile_cached_with(wasm, dir, None)
+}
+
+/// [`compile_with`], the compiled code kept beside the build in `dir` (`crate::cache`).
+pub(crate) fn compile_cached_with(
+    wasm: &[u8],
+    dir: &std::path::Path,
+    fuel: Option<u64>,
+) -> Result<Compiled> {
+    let engine = if fuel.is_some() { &*METERED } else { &*ENGINE };
+    compiled(crate::cache::module(engine, wasm, dir)?, wasm, fuel)
 }
 
 fn compiled(module: Module, wasm: &[u8], fuel: Option<u64>) -> Result<Compiled> {
@@ -487,6 +557,7 @@ impl<E: Executor> Program<E> {
         linker.func_wrap(IMPORT_MODULE, IMPORT_LIMIT, limit::<E>).map_err(wrap)?;
         linker.func_wrap(IMPORT_MODULE, IMPORT_AUDIO, audio::<E>).map_err(wrap)?;
         linker.func_wrap(IMPORT_MODULE, IMPORT_INPUT, input::<E>).map_err(wrap)?;
+        linker.func_wrap(IMPORT_MODULE, IMPORT_TICK, tick::<E>).map_err(wrap)?;
         let state = State {
             memory: memory.clone(),
             checker: Checker::with_limits(manifest, executor.limits()),
@@ -500,6 +571,7 @@ impl<E: Executor> Program<E> {
             requests: Requests { io, ..Requests::default() },
             started: false,
             voice: None,
+            ticker: None,
             logs: Vec::new(),
             input: Queue::default(),
         };
@@ -513,11 +585,14 @@ impl<E: Executor> Program<E> {
             failure.unwrap_or_else(|| Error::Program(format!("{e:#}")))
         })?;
         store.data_mut().started = true;
-        // The workers: each its own instance on its own thread, sharing the memory.
+        // The helpers: each its own instance on its own thread, sharing the memory.
         let has_worker = compiled.module.get_export(EXPORT_WORKER).is_some();
         let n = if has_worker { workers.clamp(1, MAX_WORKERS + 1) - 1 } else { 0 };
-        let threads =
-            (0..n).map(|i| spawn_worker(compiled.module.clone(), memory.clone(), i)).collect();
+        let threads = (0..n)
+            .map(|i| {
+                spawn_worker(compiled.module.clone(), memory.clone(), memory::THREAD_HELPER0 + i)
+            })
+            .collect();
         let frame = instance
             .get_typed_func::<(f32, u32, u32), ()>(&mut store, EXPORT_FRAME)
             .map_err(|e| Error::Program(format!("{e:#}")))?;
@@ -530,6 +605,8 @@ impl<E: Executor> Program<E> {
             memory,
             module: compiled.module.clone(),
             audio: None,
+            ticker: None,
+            records: Default::default(),
             fuel: compiled.fuel,
             last_failure: None,
         };
@@ -631,9 +708,17 @@ impl<E: Executor> Program<E> {
         match (result, failure) {
             (Ok(()), _) => Ok(()),
             (Err(_), Some(failure)) => Err(failure),
-            (Err(trap), None) => {
-                let what = self.describe_trap(&trap);
-                let panic = self.take_panic_message();
+            (Err(trap), None) => Err(self.trapped(&trap, memory::THREAD_MAIN)),
+        }
+    }
+
+    /// A trap on thread `thread` as the host reports it, with its panic message and where it
+    /// was; kept as [`Program::last_failure`].
+    fn trapped(&mut self, trap: &wasmtime::Error, thread: u32) -> Error {
+        {
+            {
+                let what = self.describe_trap(trap);
+                let panic = self.take_panic_message(thread);
                 let frames = trap
                     .downcast_ref::<wasmtime::WasmBacktrace>()
                     .map(|bt| {
@@ -646,20 +731,20 @@ impl<E: Executor> Program<E> {
                     .unwrap_or_default();
                 let kind = trap.downcast_ref::<wasmtime::Trap>().copied();
                 self.last_failure = Some(Failure { frames, trap: kind, panic: panic.clone() });
-                Err(Error::Trap(match panic {
+                Error::Trap(match panic {
                     Some(msg) => format!("panic: {msg}: {what}"),
                     None => what,
-                }))
+                })
             }
         }
     }
 
-    /// The message a panic left before it trapped (`wrela_abi::memory::PANIC_MESSAGE`), cleared
-    /// so a later trap that isn't a panic doesn't repeat it.
-    fn take_panic_message(&mut self) -> Option<String> {
-        use wrela_abi::memory::{PANIC_CAP, PANIC_MESSAGE, panic_message};
+    /// The message a panic on thread `thread` left before it trapped (its block's
+    /// `wrela_abi::memory::PANIC`), cleared so a later trap that isn't a panic doesn't repeat it.
+    fn take_panic_message(&mut self, thread: u32) -> Option<String> {
+        use wrela_abi::memory::{PANIC_CAP, panic_at, panic_message};
         let memory = &self.store.data().memory;
-        let at = PANIC_MESSAGE as usize;
+        let at = panic_at(thread) as usize;
         let message = panic_message(&shared::read(memory, at, 4 + PANIC_CAP as usize)?)?;
         shared::write(memory, at, &0u32.to_le_bytes());
         Some(message)
@@ -696,7 +781,7 @@ impl<E: Executor> Program<E> {
             let (mut store, instance) =
                 other_instance(&self.module, &self.memory, "the audio thread").map_err(wrap)?;
             let render = instance
-                .get_typed_func::<(u32, u32), ()>(&mut store, EXPORT_AUDIO)
+                .get_typed_func::<(u32, u32, u32), ()>(&mut store, EXPORT_AUDIO)
                 .map_err(wrap)?;
             self.audio = Some((store, render));
         }
@@ -705,7 +790,7 @@ impl<E: Executor> Program<E> {
         let mut out = Vec::with_capacity(n * quanta as usize);
         for _ in 0..quanta {
             render
-                .call(&mut *store, (task, context))
+                .call(&mut *store, (memory::THREAD_AUDIO, task, context))
                 .map_err(|e| Error::Trap(format!("the voice trapped: {}", e.root_cause())))?;
             let bytes = shared::read(&self.memory, wrela_abi::memory::AUDIO_OUT as usize, n * 4)
                 .ok_or_else(|| Error::Program("the samples are past the memory's end".into()))?;
@@ -714,9 +799,95 @@ impl<E: Executor> Program<E> {
         Ok(out)
     }
 
-    /// How many chunks of parallel jobs the workers have run (`wrela_abi::memory::WORKERS_HELPED`).
+    /// How many chunks of parallel jobs the helpers have run (`wrela_abi::memory::PAR_HELPED`).
     pub(crate) fn helped(&self) -> u32 {
-        crate::shared::load_u32(&self.memory, wrela_abi::memory::WORKERS_HELPED)
+        crate::shared::load_u32(&self.memory, memory::PAR_HELPED)
+    }
+
+    /// Makes each helper hold back a long job's result for `micros` microseconds once it's
+    /// ready (`wrela_abi::memory::PAR_HOLD`): for tests, which slow jobs down so the threads
+    /// that take them wait.
+    pub(crate) fn hold_jobs(&self, micros: u32) {
+        crate::shared::store_u32(&self.memory, memory::PAR_HOLD, micros);
+    }
+
+    /// The ticker's rate, once the program has started one (`std::tick::start`).
+    pub(crate) fn ticker_hz(&self) -> Option<u32> {
+        self.store.data().ticker.map(|t| t.2)
+    }
+
+    /// Whether each tick reports its state's hash (`wrela_abi::memory::TICK_WANT_HASH`), and so
+    /// does the ticker's `start`, if it hasn't run yet.
+    pub(crate) fn want_hashes(&self, on: bool) {
+        crate::shared::store_u32(&self.memory, memory::TICK_WANT_HASH, u32::from(on));
+    }
+
+    /// The state hash the ticker reported last: after `start`, the first state's.
+    pub(crate) fn reported_hash(&self) -> u64 {
+        let lo = crate::shared::load_u32(&self.memory, memory::TICK_HASH);
+        let hi = crate::shared::load_u32(&self.memory, memory::TICK_HASH + 4);
+        u64::from(lo) | (u64::from(hi) << 32)
+    }
+
+    /// Queues input events for the ticker: the next ticks take them as records, at most
+    /// `wrela_abi::memory::MAX_TICK_RECORDS` each, oldest first.
+    pub(crate) fn push_records(&mut self, events: impl IntoIterator<Item = Event>) {
+        self.records.extend(events.into_iter().map(|e| e.bytes()));
+    }
+
+    /// Queues records exactly as a tick log has them.
+    pub(crate) fn push_raw_records(&mut self, records: &[[u8; EVENT_SIZE as usize]]) {
+        self.records.extend(records.iter().copied());
+    }
+
+    /// The next tick's number.
+    pub(crate) fn next_tick(&self) -> u32 {
+        self.ticker.as_ref().map_or(0, |t| t.next)
+    }
+
+    /// Runs the ticker's next tick on its own instance, with the queued records (at most
+    /// `MAX_TICK_RECORDS`; the rest wait): its number, and the state's hash if
+    /// [`Program::want_hashes`] asked for it. An error if the program has no ticker, or the
+    /// tick trapped (the program's panic).
+    pub(crate) fn tick(&mut self, hash: bool) -> Result<Ticked> {
+        let n = self.records.len().min(memory::MAX_TICK_RECORDS as usize);
+        let records: Vec<[u8; EVENT_SIZE as usize]> = self.records.drain(..n).collect();
+        let mut thread = self.take_tick_thread()?;
+        let result = thread.run(records, hash);
+        self.ticker = Some(thread);
+        result.map_err(|(k, trap)| self.tick_trapped(k, &trap))
+    }
+
+    /// The ticker's thread's instance, made the first time, to run ticks on any OS thread
+    /// ([`TickThread::run`]); give it back with [`Program::restore_tick_thread`]. An error if
+    /// the program hasn't started a ticker.
+    pub(crate) fn take_tick_thread(&mut self) -> Result<TickThread> {
+        let Some((task, context, _)) = self.store.data().ticker else {
+            return Err(Error::Program("it hasn't started a ticker (`std::tick::start`)".into()));
+        };
+        if let Some(t) = self.ticker.take() {
+            return Ok(t);
+        }
+        let wrap = |e: wasmtime::Error| Error::Program(format!("{e:#}"));
+        let (mut store, instance) =
+            other_instance(&self.module, &self.memory, "the ticker").map_err(wrap)?;
+        let tick = instance
+            .get_typed_func::<(u32, u32, u32, u32), ()>(&mut store, EXPORT_TICK)
+            .map_err(wrap)?;
+        let memory = self.memory.clone();
+        Ok(TickThread { store, tick, next: 0, memory, task, context, fuel: self.fuel })
+    }
+
+    pub(crate) fn restore_tick_thread(&mut self, t: TickThread) {
+        self.ticker = Some(t);
+    }
+
+    /// Tick `k` trapped: the program's panic, as the host reports it.
+    pub(crate) fn tick_trapped(&mut self, k: u32, trap: &wasmtime::Error) -> Error {
+        match self.trapped(trap, memory::THREAD_TICK) {
+            Error::Trap(why) => Error::Trap(format!("in tick {k}: {why}")),
+            e => e,
+        }
     }
 
     pub(crate) fn hash(&self) -> StateHash {
@@ -743,12 +914,9 @@ impl<E: Executor> Program<E> {
     }
 }
 
-/// A worker thread: an instance of the program, with the shared memory, running
-/// `__worker(index)` until the program shuts it down. If it traps, it tells the thread waiting
-/// for the job (wrela_abi::memory's workers).
-/// Another thread's instance of the program, on the shared memory: a worker's or the audio
-/// thread's. Its code records no GPU work and makes no requests (its effects are checked), so
-/// the host's functions refuse to run, as `who`.
+/// Another thread's instance of the program, on the shared memory: a helper's, the audio
+/// thread's or the ticker's. Its code records no GPU work and makes no requests (its effects
+/// are checked), so the host's functions refuse to run, as `who`.
 fn other_instance(
     module: &Module,
     memory: &SharedMemory,
@@ -773,32 +941,51 @@ fn other_instance(
     Ok((store, instance))
 }
 
-fn spawn_worker(module: Module, memory: SharedMemory, index: u32) -> std::thread::JoinHandle<()> {
+/// A helper: an instance of the program on a thread of its own, number `thread`, running
+/// `__worker(thread)` until the program shuts it down. If it traps, it tells the thread that
+/// waits for what it ran (wrela_abi `memory`'s helpers), and runs nothing more.
+fn spawn_worker(module: Module, memory: SharedMemory, thread: u32) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let run = || -> wasmtime::Result<()> {
-            let (mut store, instance) = other_instance(&module, &memory, "a worker")?;
+            let (mut store, instance) = other_instance(&module, &memory, "a helper")?;
             let worker = instance.get_typed_func::<u32, ()>(&mut store, EXPORT_WORKER)?;
-            worker.call(&mut store, index)
+            worker.call(&mut store, thread)
         };
         if run().is_err() {
-            use wrela_abi::memory::{WORKERS_DONE, WORKERS_DONE_FAILED, WORKERS_FAILED};
-            shared::store_u32(&memory, WORKERS_FAILED, 1);
-            shared::or_u32(&memory, WORKERS_DONE, WORKERS_DONE_FAILED);
-            let _ = memory.atomic_notify(u64::from(WORKERS_DONE), u32::MAX);
+            helper_trapped(&memory, thread);
         }
     })
 }
 
+/// A helper, `thread`, trapped: the thread waiting for what it ran learns it, and traps with
+/// its panic message (wrela_abi `memory`'s helpers).
+fn helper_trapped(m: &SharedMemory, thread: u32) {
+    let running = shared::load_u32(m, memory::thread_block(thread) + memory::RUNNING);
+    let blocks = memory::THREAD_BLOCKS..memory::thread_block(memory::THREADS);
+    let slots =
+        memory::JOB_SLOTS..memory::JOB_SLOTS + memory::JOB_SLOT_COUNT * memory::JOB_SLOT_SIZE;
+    if blocks.contains(&running) {
+        // A thread's parallel job: its starting thread waits on DONE.
+        shared::store_u32(m, running + memory::JOB_FAILED, thread + 1);
+        shared::or_u32(m, running + memory::JOB_DONE, memory::JOB_DONE_FAILED);
+        let _ = m.atomic_notify(u64::from(running + memory::JOB_DONE), u32::MAX);
+    } else if slots.contains(&running) {
+        // A long job: whoever takes it waits on its state.
+        shared::store_u32(m, running + memory::SLOT_THREAD, thread);
+        shared::store_u32(m, running + memory::SLOT_STATE, memory::SLOT_FAILED);
+        let _ = m.atomic_notify(u64::from(running + memory::SLOT_STATE), u32::MAX);
+    }
+}
+
 impl<E: 'static> Drop for Program<E> {
-    /// Shuts the workers down: they see the flag when they wake.
+    /// Shuts the helpers down: they see the flag when they wake.
     fn drop(&mut self) {
-        use wrela_abi::memory::{WORKERS_GENERATION, WORKERS_SHUTDOWN};
         if self.threads.is_empty() {
             return;
         }
-        shared::store_u32(&self.memory, WORKERS_SHUTDOWN, 1);
-        shared::add_u32(&self.memory, WORKERS_GENERATION, 1);
-        let _ = self.memory.atomic_notify(u64::from(WORKERS_GENERATION), u32::MAX);
+        shared::store_u32(&self.memory, memory::PAR_SHUTDOWN, 1);
+        shared::add_u32(&self.memory, memory::PAR_WAKE, 1);
+        let _ = self.memory.atomic_notify(u64::from(memory::PAR_WAKE), u32::MAX);
         for t in self.threads.drain(..) {
             let _ = t.join();
         }
@@ -851,6 +1038,30 @@ fn audio<E: Executor>(
         return Err(wasmtime::format_err!("{message}"));
     }
     state.voice = Some((task, context));
+    Ok(())
+}
+
+/// `wrela.tick(task, context, hz)`: starts the program's ticker, whose ticks the host runs
+/// ([`Program::tick`]). A program has one: a second is its panic.
+fn tick<E: Executor>(
+    mut caller: wasmtime::Caller<'_, State<E>>,
+    task: u32,
+    context: u32,
+    hz: u32,
+) -> wasmtime::Result<()> {
+    let state = caller.data_mut();
+    if !state.started {
+        state.failure = Some(Error::Program(CALLED_WHILE_STARTING.into()));
+        return Err(wasmtime::format_err!("{CALLED_WHILE_STARTING}"));
+    }
+    if state.ticker.is_some() {
+        let e =
+            Error::Trap("panic: a program starts one ticker, and this one started a second".into());
+        let message = e.to_string();
+        state.failure = Some(e);
+        return Err(wasmtime::format_err!("{message}"));
+    }
+    state.ticker = Some((task, context, hz));
     Ok(())
 }
 

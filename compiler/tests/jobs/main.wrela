@@ -1,0 +1,133 @@
+// Long jobs (`std::par::job`), parallel work started inside parallel work, and hand-offs
+// (`std::handoff`), run by compiler/tests/tests/suite/threads.rs with 1, 2 and 8 threads.
+
+use std::alloc::allocations
+use std::handoff::handoff
+use std::par::{Job, job}
+
+/// A value a job computes: FNV-1a of `n` numbers from `seed`, slowly enough to keep a helper
+/// busy for a while.
+@deterministic
+fn churn(input: take (u32, u32)) -> u32 {
+    let (seed, n) = input
+    var h: u32 = 2166136261 ^ seed
+    for i in 0..n {
+        h = (h ^ i).wrapping_mul(16777619)
+    }
+    h
+}
+
+/// `jobs` jobs at once, each joined: their results folded in the order they were made.
+pub fn many(jobs: u32, n: u32) -> u32 {
+    var pending: Vec<Job<u32>> = Vec::new()
+    for k in 0..jobs {
+        pending.push(job((k, n), churn))
+    }
+    var h: u32 = 0
+    while pending.len() > 0 {
+        let j = pending.remove(0)
+        h = h.wrapping_mul(31).wrapping_add(take j.join())
+    }
+    h
+}
+
+/// A job that starts another job and joins it: with one helper, the inner one runs inside the
+/// outer's `join`, so neither waits for the other.
+@deterministic
+fn outer(n: take u32) -> u32 {
+    let inner = job((7, n), churn)
+    take inner.join() ^ 1
+}
+
+pub fn nested_jobs(n: u32) -> u32 {
+    let j = job(n, outer)
+    take j.join()
+}
+
+/// A job that traps when its input says so.
+@deterministic
+fn checked(n: take u32) -> u32 {
+    assert(n != 13, "a job's input was 13")
+    n * 2
+}
+
+/// Starts a job of `n`, does other work, then joins it: a trap in the job is the program's
+/// panic here.
+pub fn trap_at_join(n: u32) -> u32 {
+    let j = job(n, checked)
+    let other = churn((1, 1000))
+    take j.join() + other % 2
+}
+
+/// Parallel work inside a parallel closure: the inner work runs on that thread alone, and the
+/// results are the same whatever the helpers.
+pub fn nested_parallel(rows: u32) -> u32 {
+    var grid: Vec<Vec<u32>> = Vec::new()
+    for r in 0..rows {
+        var row: Vec<u32> = Vec::new()
+        for c in 0..300 {
+            row.push(r * 1000 + c)
+        }
+        grid.push(take row)
+    }
+    grid.par_each_mut(|row| {
+        row.par_each_mut(|x| { x = x.wrapping_mul(2654435761) })
+    })
+    var h: u32 = 0
+    for row in grid {
+        for x in row {
+            h = h.wrapping_mul(31) ^ x
+        }
+    }
+    h
+}
+
+/// A value published through a hand-off: its number and its square, so a torn read shows.
+struct Pair: Copy + Plain {
+    n: u32,
+    sq: u32,
+    pad: [u32; 14],
+}
+
+/// Publishes `n` values, one after another.
+@deterministic
+fn publish_all(input: take (std::handoff::Publisher<Pair>, u32)) -> u32 {
+    let (o, n) = take input
+    var out = take o
+    for i in 1..n + 1 {
+        out.publish(Pair { n: i, sq: i.wrapping_mul(i), pad: [i; 14] })
+    }
+    n
+}
+
+/// A helper publishes `n` values while this thread reads at least `reads` times: in a debug
+/// build, every read checks its value's checksum and that it's no older than the last. How
+/// many reads, and how many values the newest read had seen.
+pub fn stress(n: u32, reads: u32) -> vec2 {
+    let (out, latest) = handoff(Pair { n: 0, sq: 0, pad: [0; 14] })
+    var latest = take latest
+    let j = job((take out, n), publish_all)
+    var count: u32 = 0
+    var last: u32 = 0
+    loop {
+        borrow v = latest.read()
+        assert(v.sq == v.n.wrapping_mul(v.n), "a pair read torn")
+        assert(v.n >= last, "an older pair than the last")
+        last = v.n
+        count += 1
+        if count >= reads && last == n {
+            break
+        }
+    }
+    let _ = take j.join()
+    vec2(f32(count), f32(latest.published()))
+}
+
+/// How many blocks this thread allocates making `n` jobs while helpers allocate too.
+pub fn allocations_while_helping(n: u32) -> u32 {
+    let before = allocations()
+    let _ = many(n, 10000)
+    allocations() - before
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

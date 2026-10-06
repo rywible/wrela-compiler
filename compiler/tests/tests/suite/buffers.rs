@@ -47,7 +47,7 @@ pub fn moved() -> u32 {
 fn load(name: &str, src: &str) -> CpuHost {
     let dir = package(name, src);
     must_build(&dir, &dir.join("build"));
-    CpuHost::load(dir.join("build")).expect("load")
+    wrela_host::CpuBuild::load(dir.join("build")).expect("load").recording().start().expect("start")
 }
 
 /// What `pick` takes from the commands of every batch submitted since the last look.

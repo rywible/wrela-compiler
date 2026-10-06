@@ -794,7 +794,7 @@ pub(super) fn pass_through(
 /// address, a panic, the heap's bounds, and reading an integer (comparing text) can.
 fn harmless(op: &MemOp) -> bool {
     match op {
-        MemOp::Addr | MemOp::Panic | MemOp::HeapBase | MemOp::Pages => true,
+        MemOp::Addr | MemOp::Panic | MemOp::HeapBase | MemOp::Pages | MemOp::ThreadBlock => true,
         MemOp::Load(s) => !matches!(s, Scalar::F32 | Scalar::F64),
         _ => false,
     }

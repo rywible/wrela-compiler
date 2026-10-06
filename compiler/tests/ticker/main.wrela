@@ -1,0 +1,130 @@
+// A ticker (`std::tick`) and a hand-off (`std::handoff`) from it to the frames, run by
+// compiler/tests/tests/suite/threads.rs: each tick counts its records' key presses, does
+// parallel work, and publishes a snapshot; each frame reads the newest snapshot and does
+// parallel work of its own at the same time.
+
+use std::handoff::{Latest, Publisher, handoff}
+use std::hash::{StateHash, state_hash}
+use std::input::{Event, Key}
+use std::tick::{Ticked, origin, start}
+
+/// What the ticker owns: its world, and the publishing end of the hand-off.
+struct Sim {
+    world: World,
+    out: Publisher<Snap>,
+}
+
+/// The ticker's world: what's hashed.
+struct World: Clone + StateHash {
+    ticks: u32,
+    keys: u32,
+    spaces: u32,
+    cells: Vec<u32>,
+}
+
+/// What the frames see of the world.
+struct Snap: Copy + Plain {
+    tick: u32,
+    keys: u32,
+    cells: u32,
+}
+
+@deterministic
+fn step(sim: mut Sim, t: Ticked) {
+    for e in t.records {
+        if let Event::KeyDown { key, .. } = e {
+            sim.world.keys += 1
+            if key == Key::Space {
+                sim.world.spaces += 1
+            }
+        }
+    }
+    // Parallel work from the ticker's thread.
+    let k = t.tick
+    sim.world.cells.par_each_mut(|c| { c = c.wrapping_mul(1664525).wrapping_add(1013904223 ^ k) })
+    var sum: u32 = 0
+    for c in sim.world.cells {
+        sum = sum.wrapping_add(c)
+    }
+    sim.world.ticks += 1
+    sim.out.publish(Snap { tick: t.tick, keys: sim.world.keys, cells: sum })
+}
+
+@deterministic
+fn hash(sim: Sim) -> u64 {
+    state_hash(sim.world)
+}
+
+pub struct Game {
+    latest: Latest<Snap>,
+    newest: Snap,
+    frames: u32,
+    work: Vec<u32>,
+    origin: f64,
+}
+
+pub fn init() -> Game {
+    var cells: Vec<u32> = Vec::new()
+    for i in 0..5000 {
+        cells.push(i)
+    }
+    let first = Snap { tick: 0, keys: 0, cells: 0 }
+    let (out, latest) = handoff(first)
+    let world = World { ticks: 0, keys: 0, spaces: 0, cells: take cells }
+    start(Sim { world: take world, out: take out }, hz: 60, step: step, hash: hash)
+    var work: Vec<u32> = Vec::new()
+    for i in 0..5000 {
+        work.push(i * 7)
+    }
+    Game { latest: take latest, newest: first, frames: 0, work: take work, origin: 0.0 }
+}
+
+pub fn frame(game: mut Game, time: f32, width: u32, height: u32) {
+    game.newest = game.latest.read()
+    game.origin = origin()
+    // Parallel work from the program's thread, while the ticker may be doing its own.
+    game.work.par_each_mut(|x| { x = x.wrapping_mul(22695477).wrapping_add(1) })
+    game.frames += 1
+}
+
+/// The newest snapshot the frames have read: its tick, the key presses so far, and the cells'
+/// sum.
+pub fn newest(game: Game) -> vec3 {
+    vec3(f32(game.newest.tick), f32(game.newest.keys), f32(game.newest.cells % 65536))
+}
+
+/// The frames' parallel work's result.
+pub fn work(game: Game) -> u32 {
+    var h: u32 = 0
+    for x in game.work {
+        h = h.wrapping_mul(31) ^ x
+    }
+    h
+}
+
+@deterministic
+fn nothing(n: mut u32, t: Ticked) {}
+
+@deterministic
+fn zero(n: u32) -> u64 {
+    0
+}
+
+/// A second ticker: a panic.
+pub fn start_again() {
+    start(0, hz: 30, step: nothing, hash: zero)
+}
+
+/// In lockstep at 60 frames a second, a ticker at 60 Hz has run i + 1 ticks before frame i,
+/// whose newest snapshot is tick i.
+@test(frames: 30)
+fn frames_see_the_ticks_in_lockstep(game: Game) {
+    assert(game.frames == 30)
+    assert(game.newest.tick == 29, f"frame 29 saw tick {game.newest.tick}")
+}
+
+/// Ticks alone, with their records: the key presses arrive as records.
+@test(ticks: 120, input: "keys.json")
+fn ticks_take_their_records(game: Game) {
+    assert(game.frames == 0)
+}

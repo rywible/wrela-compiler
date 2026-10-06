@@ -889,11 +889,12 @@ The sim/presentation split is an engine pattern built on this, not a language fe
   - `std::prelude`: `Option`, `Result`, `Copy`, `Clone`, `GpuData`
   - `std::gpu`: `GpuBuffer`, `Slots`, `GlobalId`, `LocalId`, `WorkgroupId`, `VertexIndex`, `InstanceIndex`, `FragCoord`, `ClipPosition`, `Flat`, `Over`, `dispatch`, `draw`, `buffer`, `write_buffer`, `destroy_buffer`, `copy_buffer`, `GpuSpan`, `GpuSpanMut`, `begin_screen_pass`, `present`, `Texture`, `DepthTexture`, `Sampler`, `ComparisonSampler`, `create_texture`, `write_texture_rows`, `destroy_texture`, `create_sampler`, `destroy_sampler`, `begin_pass_command`, `end_pass_command`, `texture_sample`, `texture_sample_level`, `texture_sample_compare`, `texture_sample_compare_level`, `texture_load`, `depth_load`, `texture_width`, `texture_height`, `read_buffer_command`, `limit`, `Shared`, `Atomics`, `Append`, `AtomicMap`, `AppendBuffer`, `AtomicMapBuffer`, `local_index`, `workgroup_invocations`, `shared_get`, `shared_set`, `workgroup_barrier`, `atomic_len`, `atomic_load`, `atomic_store`, `atomic_add`, `atomic_sub`, `atomic_min`, `atomic_max`, `atomic_and`, `atomic_or`, `atomic_xor`, `atomic_exchange`, `atomic_compare_exchange`, `append_push`
   - `std::io`: `next_request`, `request_status`, `storage_read_command`, `storage_write_command`, `fetch_command`, `print_command`, `post_command`
-  - `std::mem`: `take_answer`, `take_input`, `Drop`, `size_of`, `align_of`, `needs_drop`, `read`, `write`, `drop_at`, `at`, `at_mut`, `at_mut_pair`, `heap_base`, `memory_pages`, `memory_grow`, `load_u32`, `store_u32`, `load_u8`, `store_u8`, `copy`, `fill`, `compare_swap`, `atomic_add`, `atomic_load`, `atomic_store`, `wait`, `notify`, `run_task`, `abort`, `debug_build`
+  - `std::mem`: `take_answer`, `take_input`, `Drop`, `size_of`, `align_of`, `needs_drop`, `read`, `write`, `drop_at`, `at`, `at_mut`, `at_mut_pair`, `heap_base`, `memory_pages`, `memory_grow`, `load_u32`, `store_u32`, `load_u8`, `store_u8`, `copy`, `fill`, `compare_swap`, `atomic_add`, `atomic_load`, `atomic_store`, `wait`, `notify`, `run_task`, `task`, `thread_block`, `wait_for`, `abort`, `debug_build`
   - `std::derive`: `Interval`, `Domain`, `gradient`, `value_and_gradient`, `interval`
   - `std::math`: `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2`, `exp`, `exp2`, `log`, `log2`, `pow`
-  - `std::par`: `par_each`, `par_each_chunk`, `par_map_reduce`, `par_map_reduce_chunk`, `run_chunks`, `worker_loop`
-  - `std::audio`: `start_voice`, `render_quantum`
+  - `std::par`: `par_each`, `par_each_chunk`, `par_map_reduce`, `par_map_reduce_chunk`, `run_chunks`
+  - `std::audio`: `start_voice`
+  - `std::tick`: `start_ticker`
   - `std::collections`: `Vec`, `Box`, `swap`, `replace`
   - `std::string`: `Text`, `Bytes`, `String`, `str_addr`, `str_len`, `str_part`
   - `std::cmp`: `Eq`, `Ord`, `Ordering`
@@ -901,7 +902,11 @@ The sim/presentation split is an engine pattern built on this, not a language fe
   - `std::arena`: `Arena`, `Handle`
   - `std::lift`: `gradient`, `reads`, `literal_count`, `literal_value`, `literal_built_value`, `set_literal`, `literal_source`, `lifted_files`, `lifted_file`
 - **Stdlib modules pass an admission test** (D-081): each would make sense in a program that isn't a game. Acoustics, creatures, terrain and timelines are engine code, in a package of their own (the sketches' `engine`), not in std.
-- **The stdlib is written in wrela** with a small unsafe core (§6.14). These files are the core, and the only ones with `unsafe`: `std::mem` (raw memory), `std::alloc` (the allocator), `std::collections` (`Vec` and `Box`), `std::string`, `std::par` (the workers) and `std::audio` (the voice's ring). `closed_list.rs` checks it.
+- **The stdlib is written in wrela** with a small unsafe core (§6.14). These files are the core, and the only ones with `unsafe`: `std::mem` (raw memory), `std::alloc` (the allocator), `std::collections` (`Vec` and `Box`), `std::string`, `std::par` (the helpers and jobs), `std::audio` (the voice and its ring), `std::tick` (the ticker) and `std::handoff` (the triple buffer). `closed_list.rs` checks it.
+- **The core states what inference can't see** (`closed_list.rs` checks that only the core's files use these two attributes, and the compiler rejects them anywhere else, E0204):
+  - `@effects(...)` names effects a std function has that come from another thread or the host through memory, which inference can't see: `Latest::read` and `Job::done` are `@effects(nondet)`, starting the voice and the ticker `@effects(io)`. It's the one place effects are written; everywhere else they're inferred (§8). The effects of the GPU commands, requests and host imports the compiler lowers itself are what it lowers them to.
+  - `@thread_entry` marks a std function that a host calls on a thread of its own (wrela_abi's `memory`): its first parameter is the thread's number, which gives it its stack and its block, and its others are `u32`s. It's exported as `__` and its name when the program uses its module: `std::par`'s `worker` (each helper), `std::audio`'s `audio` (the voice's quanta), `std::tick`'s `tick` (each tick). The compiler names none of them.
+  - `std::mem::task(run)` gives the number of a task: a function the module calls by number with a chunk and a context's address, as `run_task` and the thread entries do. The voice and the ticker are tasks; a parallel job's chunks are tasks the compiler makes from their closures.
 
 **The module map** (final; `wrela doc std` lists it, and `wrela doc <item>` shows any item):
 

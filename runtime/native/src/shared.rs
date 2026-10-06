@@ -4,9 +4,10 @@
 //!
 //! The program's own thread reads a batch, or writes a request's answer or clears a panic
 //! message, only inside a call it makes to the host, while no parallel job runs: so no worker
-//! touches those bytes meanwhile. The words a host writes for its workers
-//! ([`wrela_abi::memory::WORKERS_FAILED`], [`wrela_abi::memory::WORKERS_SHUTDOWN`]) are
-//! written atomically, as the workers read them.
+//! touches those bytes meanwhile. The words a host writes for its other threads (a helper's
+//! trap: [`wrela_abi::memory::JOB_FAILED`], a slot's state; [`wrela_abi::memory::PAR_SHUTDOWN`],
+//! the ticker's) are written atomically, as those threads read them. A tick's records are
+//! written before the call that reads them, while the ticker's thread waits for it.
 #![allow(unsafe_code)]
 
 use std::sync::atomic::{AtomicU32, Ordering};

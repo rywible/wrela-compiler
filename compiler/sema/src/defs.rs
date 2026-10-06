@@ -363,6 +363,9 @@ lang_items! {
     MemWait = "std::mem::wait",
     MemNotify = "std::mem::notify",
     MemRunTask = "std::mem::run_task",
+    MemTask = "std::mem::task",
+    MemThreadBlock = "std::mem::thread_block",
+    MemWaitFor = "std::mem::wait_for",
     MemAbort = "std::mem::abort",
     DebugBuild = "std::mem::debug_build",
     ParEach = "std::par::par_each",
@@ -370,9 +373,8 @@ lang_items! {
     ParMapReduce = "std::par::par_map_reduce",
     ParMapReduceChunk = "std::par::par_map_reduce_chunk",
     RunChunks = "std::par::run_chunks",
-    WorkerLoop = "std::par::worker_loop",
     StartVoice = "std::audio::start_voice",
-    RenderQuantum = "std::audio::render_quantum",
+    StartTicker = "std::tick::start_ticker",
     Vec = "std::collections::Vec",
     Box = "std::collections::Box",
     Swap = "std::collections::swap",
@@ -552,7 +554,28 @@ pub struct FnAttrs {
     /// `@test(frames: n, input: "script.json")`: a script of input events the frames get, by
     /// its path in the package, and where the path is written.
     pub test_input: Option<(String, Span)>,
+    /// `@test(ticks: n)`: the program's ticks the test runs first, with no frames (§10).
+    pub test_ticks: Option<u32>,
+    /// `@thread_entry` (std's unsafe core): a host calls it on a thread of its own, with that
+    /// thread's number first (wrela_abi `memory`'s threads); exported as `__` and its name.
+    pub thread_entry: Option<Span>,
+    /// `@effects(...)` (std's unsafe core): effects it has that inference can't see, because
+    /// another thread or the host decides them through memory (§8).
+    pub effects: Vec<crate::effects::Effect>,
 }
+
+impl FnAttrs {
+    /// Whether it's a test that runs the program first: its frames (`@test(frames: n)`) or its
+    /// ticks (`@test(ticks: n)`).
+    pub fn runs_program(&self) -> bool {
+        self.test_frames.is_some() || self.test_ticks.is_some()
+    }
+}
+
+/// std's unsafe core (language.md §17, §6.14): the only modules that use `unsafe`, and the
+/// only ones whose functions may state `@effects` or be a `@thread_entry`.
+pub const UNSAFE_CORE: &[&str] =
+    &["mem", "alloc", "collections", "string", "par", "audio", "tick", "handoff"];
 
 #[derive(Clone, Debug)]
 pub struct FnDef {

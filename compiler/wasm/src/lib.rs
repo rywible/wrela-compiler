@@ -46,6 +46,8 @@ pub(crate) struct Helpers {
     pub audio: u32,
     /// The import `wrela.input(ptr, cap) -> i32`, in a module that reads input.
     pub input: u32,
+    /// The import `wrela.tick(task, context, hz)`, in a module that starts a ticker.
+    pub tick: u32,
     /// The type of a task function ([`ir::MemOp::RunTask`]): (context, chunk) -> ().
     pub task_type: u32,
     /// `flush()`: submits the pending commands, if any.
@@ -74,6 +76,9 @@ pub(crate) mod globals {
     pub const NEXT_REQUEST: u32 = 5;
     /// The lowest address the shadow stack may reach: the main stack's, or a worker's.
     pub const STACK_FLOOR: u32 = 6;
+    /// The running thread's block (wrela_abi `memory`): the program's thread's, until a thread
+    /// entry sets its own.
+    pub const THREAD: u32 = 7;
 }
 
 pub(crate) fn valtype(s: ir::Scalar) -> ValType {
@@ -196,6 +201,7 @@ pub fn emit_with(m: &ir::Module, options: Options) -> Result<Emitted, String> {
     ] {
         imports.import(wrela_abi::IMPORT_MODULE, name, EntityType::Function(ty));
     }
+    let audio = imports.len();
     if m.audio {
         let ty = EntityType::Function(submit_ty);
         imports.import(wrela_abi::IMPORT_MODULE, wrela_abi::IMPORT_AUDIO, ty);
@@ -205,6 +211,11 @@ pub fn emit_with(m: &ir::Module, options: Options) -> Result<Emitted, String> {
     if m.input {
         let ty = EntityType::Function(input_ty);
         imports.import(wrela_abi::IMPORT_MODULE, wrela_abi::IMPORT_INPUT, ty);
+    }
+    let tick = imports.len();
+    if m.tick {
+        let ty = types.get(vec![ValType::I32; 3], vec![]);
+        imports.import(wrela_abi::IMPORT_MODULE, wrela_abi::IMPORT_TICK, EntityType::Function(ty));
     }
     let nimports = imports.len();
     // The memory, shared: workers' instances get the same one (wrela_abi::memory).
@@ -227,8 +238,9 @@ pub fn emit_with(m: &ir::Module, options: Options) -> Result<Emitted, String> {
         request_status: 1,
         request_take: 2,
         limit: 3,
-        audio: 4,
+        audio,
         input,
+        tick,
         flush: nimports,
         reserve: nimports + 1,
         write: nimports + 2,
@@ -271,26 +283,17 @@ pub fn emit_with(m: &ir::Module, options: Options) -> Result<Emitted, String> {
         code.function(&body);
         exports.export(name, ExportKind::Func, next);
     }
-    // `__worker(index)`: the worker's own stack, then std's worker loop (wrela_abi::memory).
-    if let Some(w) = m.worker {
-        let body = func::worker_wrapper(first_fn + w.0);
-        let ty = types.get(vec![ValType::I32], vec![]);
+    // Thread entries, `__name(thread, ...)`: the thread's own stack and block, then the
+    // entry (wrela_abi `memory`'s threads).
+    let mut next = first_fn + m.functions.len() as u32 + m.exports.len() as u32;
+    for (name, f) in &m.thread_entries {
+        let n = m.functions[f.index()].params.len() as u32;
+        let body = func::thread_entry_wrapper(first_fn + f.0, n);
+        let ty = types.get(vec![ValType::I32; n as usize], vec![]);
         functions.function(ty);
         code.function(&body);
-        let next = first_fn + m.functions.len() as u32 + m.exports.len() as u32;
-        exports.export(wrela_abi::EXPORT_WORKER, ExportKind::Func, next);
-    }
-    // `__audio(task, context)`: the audio thread's stack, then the voice's task.
-    if m.audio {
-        let body = func::audio_wrapper(helpers.task_type);
-        let ty = types.get(vec![ValType::I32, ValType::I32], vec![]);
-        functions.function(ty);
-        code.function(&body);
-        let next = first_fn
-            + m.functions.len() as u32
-            + m.exports.len() as u32
-            + u32::from(m.worker.is_some());
-        exports.export(wrela_abi::EXPORT_AUDIO, ExportKind::Func, next);
+        exports.export(&format!("__{name}"), ExportKind::Func, next);
+        next += 1;
     }
     // A shared memory's constants are copied once, by a start function, not by each instance
     // as it starts: a worker's instance starts while the program runs, and would overwrite
@@ -301,11 +304,7 @@ pub fn emit_with(m: &ir::Module, options: Options) -> Result<Emitted, String> {
         let ty = types.get(vec![], vec![]);
         functions.function(ty);
         code.function(&body);
-        first_fn
-            + m.functions.len() as u32
-            + m.exports.len() as u32
-            + u32::from(m.worker.is_some())
-            + u32::from(m.audio)
+        next
     });
     // The tasks a parallel job's chunks run, by index.
     let mut tables = TableSection::new();
@@ -334,6 +333,7 @@ pub fn emit_with(m: &ir::Module, options: Options) -> Result<Emitted, String> {
         (globals::DEPTH, 0),
         (globals::NEXT_REQUEST, 1),
         (globals::STACK_FLOOR, memory::STACK_LIMIT as i32),
+        (globals::THREAD, memory::thread_block(memory::THREAD_MAIN) as i32),
     ] {
         debug_assert_eq!(i, globals.len());
         globals.global(g(true), &ConstExpr::i32_const(start));

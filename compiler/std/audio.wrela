@@ -3,12 +3,12 @@
 // the audio thread when it starts, so only that thread changes it; a ring is the one value both
 // threads use, and each end belongs to one of them.
 //
-// The audio thread runs its own instance of the program's module on the same memory
-// (wrela_abi's `__audio`): `start_voice` makes `render_quantum` a task, as `std::par` does a
-// job's chunks, with the voice's address as its context.
+// The audio thread runs its own instance of the program's module on the same memory: `play`
+// makes the voice a task (`std::mem::task`), with the voice's address as its context, which
+// the host's audio thread runs a quantum at a time through `audio` (wrela_abi's `__audio`).
 
 use std::alloc::alloc
-use std::mem::{align_of, atomic_load, atomic_store, read, size_of, store_u32, write}
+use std::mem::{align_of, atomic_load, atomic_store, read, run_task, size_of, store_u32, task, write}
 
 /// The audio thread's sample rate, in hertz.
 pub const SAMPLE_RATE: u32 = 48000
@@ -18,42 +18,52 @@ pub const QUANTUM: u32 = 128
 
 /// Where a quantum's samples go for the host: wrela_abi::memory::AUDIO_OUT. (This and the rate
 /// and quantum above are copies of wrela_abi's, and a test there checks them.)
-const OUT: u32 = 18874368
+const OUT: u32 = 1245184
 
-/// A voice's state, and its quantum's samples: what the audio thread owns.
-pub(package) struct Voice<S> {
+/// A voice's state, how it renders, and its quantum's samples: what the audio thread owns.
+pub(package) struct Voice<S, R> {
     state: S,
+    render: R,
     out: [f32; 128],
 }
 
 /// Starts the program's voice. From now on the audio thread calls `render(mut state, mut out)`
 /// for each quantum: `out` holds `QUANTUM` samples at `SAMPLE_RATE`, mono, to fill. `state`
-/// moves to the audio thread for good; send the voice events through a `ring`, whose reader it
-/// holds. A program has one voice: a second `play` traps.
-pub fn play<S>(state: take S, render: @audio fn(mut S, mut [f32])) {
+/// moves to the audio thread for good, and `render` with it, so it's a function, or a closure
+/// that captures nothing; send the voice events through a `ring`, whose reader it holds. A
+/// program has one voice: a second `play` traps.
+pub fn play<S, R: @audio fn(mut S, mut [f32])>(state: take S, render: R) {
     unsafe {
-        let voice = alloc(size_of::<Voice<S>>(), align_of::<Voice<S>>())
-        write(voice, Voice { state: take state, out: [0.0; QUANTUM] })
-        start_voice(voice, render)
+        let voice = alloc(size_of::<Voice<S, R>>(), align_of::<Voice<S, R>>())
+        write(voice, Voice { state: take state, render, out: [0.0; QUANTUM] })
+        start_voice(task(render_quantum::<S, R>), voice)
     }
 }
 
-/// Makes the voice at `voice` (a `Voice<S>`) the audio thread's task (`wrela.audio`).
+/// Makes task `task`, with the voice at `voice` as its context, the audio thread's
+/// (`wrela.audio`).
 @intrinsic
-pub(package) fn start_voice<S>(voice: u32, render: @audio fn(mut S, mut [f32])) {}
+@effects(io)
+pub(package) fn start_voice(task: u32, voice: u32) {}
 
 /// One quantum of the voice: its samples, rendered and left at `OUT`. (`quantum` is the task's
 /// chunk, unused.)
-pub(package) fn render_quantum<S>(
-    quantum: u32,
-    voice: mut Voice<S>,
-    render: @audio fn(mut S, mut [f32]),
-) {
+fn render_quantum<S, R: @audio fn(mut S, mut [f32])>(quantum: u32, voice: mut Voice<S, R>) {
+    borrow render = voice.render
     render(mut voice.state, mut voice.out)
     unsafe {
         for i in 0..QUANTUM {
             write(OUT + 4 * i, voice.out[i])
         }
+    }
+}
+
+/// The audio thread's entry (wrela_abi's `__audio`): one quantum of the voice that `play`
+/// started, task `task` with its voice at `voice`.
+@thread_entry
+pub(package) fn audio(thread: u32, task: u32, voice: u32) {
+    unsafe {
+        run_task(task, voice, 0)
     }
 }
 

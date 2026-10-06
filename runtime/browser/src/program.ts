@@ -9,14 +9,27 @@ import {
   EXPORT_FRAME,
   EXPORT_INIT,
   EXPORT_MEMORY,
+  EXPORT_TICK,
   EXPORT_WORKER,
   HOST_FUNCTIONS,
   IMPORT_MEMORY,
+  JOB_DONE,
+  JOB_DONE_FAILED,
+  JOB_FAILED,
+  JOB_SLOT_COUNT,
+  JOB_SLOT_SIZE,
+  JOB_SLOTS,
   MAX_WORKERS,
-  WORKERS_DONE,
-  WORKERS_DONE_FAILED,
-  WORKERS_FAILED,
-  WORKERS_HELPED,
+  PAR_HELPED,
+  RUNNING,
+  SLOT_FAILED,
+  SLOT_STATE,
+  SLOT_THREAD,
+  THREAD_BLOCK_SIZE,
+  THREAD_BLOCKS,
+  THREAD_HELPER0,
+  THREAD_MAIN,
+  THREADS,
   EVENT_SIZE,
   IMPORT_AUDIO,
   IMPORT_INPUT,
@@ -25,8 +38,9 @@ import {
   IMPORT_REQUEST_STATUS,
   IMPORT_REQUEST_TAKE,
   IMPORT_SUBMIT,
+  IMPORT_TICK,
+  PANIC,
   PANIC_CAP,
-  PANIC_MESSAGE,
   REQUEST_FAILED,
   REQUEST_PENDING,
 } from "./abi.gen.ts";
@@ -174,28 +188,49 @@ export interface Compiled {
   memory: MemoryLimits;
 }
 
-/** Starts worker thread `index` on `module`, with `memory`: something that instantiates it
- * there and calls `__worker(index)` (`runWorker`). */
-export type SpawnWorker = (module: WebAssembly.Module, memory: WebAssembly.Memory, index: number) => void;
+/** Starts helper thread `thread` (its number, wrela_abi memory's threads) on `module`, with
+ * `memory`: something that instantiates it there and calls `__worker(thread)` (`runWorker`). */
+export type SpawnWorker = (module: WebAssembly.Module, memory: WebAssembly.Memory, thread: number) => void;
 
-/** On a worker thread: instantiates the program with the shared memory and runs jobs until the
- * program shuts it down. If it traps, it tells the thread waiting for the job (wrela_abi
- * memory's workers). */
-export async function runWorker(module: WebAssembly.Module, memory: WebAssembly.Memory, index: number): Promise<void> {
+/** Another thread's instance of the program: its code records no GPU work and makes no
+ * requests (its effects are checked), so the host's functions refuse to run, as `who`. */
+export function otherInstance(module: WebAssembly.Module, memory: WebAssembly.Memory, who: string): Promise<WebAssembly.Instance> {
   const refuse = () => {
-    throw new TrapError("a worker can't call the host");
+    throw new TrapError(`${who} can't call the host`);
   };
   const imports = {
     [IMPORT_MODULE]: { [IMPORT_MEMORY]: memory, ...Object.fromEntries(HOST_FUNCTIONS.map(([name]) => [name, refuse])) },
   };
+  return WebAssembly.instantiate(module, imports);
+}
+
+/** On a helper thread, number `thread`: instantiates the program with the shared memory and
+ * runs work until the program shuts it down. If it traps, it tells the thread that waits for
+ * what it ran (wrela_abi memory's helpers), and runs nothing more. */
+export async function runWorker(module: WebAssembly.Module, memory: WebAssembly.Memory, thread: number): Promise<void> {
   try {
-    const instance = await WebAssembly.instantiate(module, imports);
-    (instance.exports[EXPORT_WORKER] as (i: number) => void)(index);
+    const instance = await otherInstance(module, memory, "a helper");
+    (instance.exports[EXPORT_WORKER] as (thread: number) => void)(thread);
   } catch {
-    const words = new Int32Array(memory.buffer);
-    Atomics.store(words, WORKERS_FAILED / 4, 1);
-    Atomics.or(words, WORKERS_DONE / 4, WORKERS_DONE_FAILED);
-    Atomics.notify(words, WORKERS_DONE / 4);
+    helperTrapped(memory, thread);
+  }
+}
+
+/** A helper, `thread`, trapped: the thread waiting for what it ran learns it, and traps with its
+ * panic message (wrela_abi memory's helpers), as the native host does. */
+export function helperTrapped(memory: WebAssembly.Memory, thread: number): void {
+  const words = new Int32Array(memory.buffer);
+  const running = Atomics.load(words, (THREAD_BLOCKS + thread * THREAD_BLOCK_SIZE + RUNNING) / 4) >>> 0;
+  if (running >= THREAD_BLOCKS && running < THREAD_BLOCKS + THREADS * THREAD_BLOCK_SIZE) {
+    // A thread's parallel job: its starting thread waits on its count of done chunks.
+    Atomics.store(words, (running + JOB_FAILED) / 4, thread + 1);
+    Atomics.or(words, (running + JOB_DONE) / 4, JOB_DONE_FAILED | 0);
+    Atomics.notify(words, (running + JOB_DONE) / 4);
+  } else if (running >= JOB_SLOTS && running < JOB_SLOTS + JOB_SLOT_COUNT * JOB_SLOT_SIZE) {
+    // A long job: whoever joins it waits on its state.
+    Atomics.store(words, (running + SLOT_THREAD) / 4, thread);
+    Atomics.store(words, (running + SLOT_STATE) / 4, SLOT_FAILED);
+    Atomics.notify(words, (running + SLOT_STATE) / 4);
   }
 }
 
@@ -218,6 +253,19 @@ export interface ProgramOptions {
   /** Called with each line the program prints (`std::io::print`), after the console has it:
    * test mode keeps them (`results/log.txt`). */
   onPrint?: (line: string) => void;
+  /** Starts the program's ticker (`std::tick::start`) on its own thread; without it, the ticker
+   * is kept but never ticks. */
+  startTicker?: (ticker: TickerOptions) => void;
+}
+
+/** The program's ticker, as its thread gets it: the module and memory to run it with, and the
+ * task, context and rate `__tick` takes (wrela_abi's `IMPORT_TICK`). */
+export interface TickerOptions {
+  module: WebAssembly.Module;
+  memory: WebAssembly.Memory;
+  task: number;
+  context: number;
+  hz: number;
 }
 
 /** A loaded program and everything that happens to its batches. */
@@ -234,6 +282,9 @@ export class Program {
   /** The voice the program started: its task and context. */
   #voice: { task: number; context: number } | null = null;
   readonly #startVoice: ((voice: VoiceOptions) => void) | null;
+  /** The ticker the program started: its task, context and rate. */
+  #ticker: { task: number; context: number; hz: number } | null = null;
+  readonly #startTicker: ((ticker: TickerOptions) => void) | null;
   /** The error behind the most recent trap raised by `submit`, so the caller gets it rather
    * than whatever the engine wraps it in. */
   #failure: unknown = null;
@@ -254,6 +305,7 @@ export class Program {
     this.hash = options.hash ? new StateHash() : null;
     this.#io = options.io ?? null;
     this.#startVoice = options.startVoice ?? null;
+    this.#startTicker = options.startTicker ?? null;
     this.#onPrint = options.onPrint ?? null;
   }
 
@@ -303,6 +355,7 @@ export class Program {
         [IMPORT_LIMIT]: (index: number) => (checker.limits[index >>> 0] ?? 0) | 0,
         [IMPORT_AUDIO]: (task: number, context: number) => program.#audioImport(task >>> 0, context >>> 0),
         [IMPORT_INPUT]: (ptr: number, cap: number) => program.#inputImport(ptr >>> 0, cap >>> 0),
+        [IMPORT_TICK]: (task: number, context: number, hz: number) => program.#tickImport(task >>> 0, context >>> 0, hz >>> 0),
       },
     };
     // As the native host words it: a module that can't be instantiated isn't a valid program.
@@ -316,10 +369,10 @@ export class Program {
     program.#module = module;
     program.#memory = memory;
     program.#frame = instance.exports[EXPORT_FRAME] as FrameFn;
-    // The workers: each its own instance of the module on its own thread, with the memory.
+    // The helpers: each its own instance of the module on its own thread, with the memory.
     if (EXPORT_WORKER in instance.exports && options.spawnWorker) {
       const n = Math.min(Math.max(options.workers ?? 1, 1), MAX_WORKERS + 1) - 1;
-      for (let i = 0; i < n; i++) options.spawnWorker(module, memory, i);
+      for (let i = 0; i < n; i++) options.spawnWorker(module, memory, THREAD_HELPER0 + i);
     }
     // A program with state makes it once, before anything else runs (language.md §12).
     const init = instance.exports[EXPORT_INIT];
@@ -471,6 +524,25 @@ export class Program {
     return this.#voice !== null;
   }
 
+  /** `wrela.tick(task, context, hz)`: starts the program's ticker, once: a second is its panic. */
+  #tickImport(task: number, context: number, hz: number): void {
+    this.#starting();
+    if (this.#ticker !== null) throw new TrapError("panic: a program starts one ticker, and this one started a second");
+    if (!(EXPORT_TICK in this.#instance!.exports)) throw new TrapError(`it starts a ticker but doesn't export \`${EXPORT_TICK}\``);
+    this.#ticker = { task, context, hz };
+    this.#startTicker?.({ module: this.#module!, memory: this.#memory!, task, context, hz });
+  }
+
+  /** The ticker the program started, if it has: its task, context and rate. */
+  get ticker(): { task: number; context: number; hz: number } | null {
+    return this.#ticker;
+  }
+
+  /** The program's module and memory, for another thread's instance. */
+  get shared(): { module: WebAssembly.Module; memory: WebAssembly.Memory } {
+    return { module: this.#module!, memory: this.#memory! };
+  }
+
   /** Refuses a call from the module's start function, which runs while it's instantiated (the
    * compiler's copies the constants into the memory, wrela_abi memory's `DATA_READY`). */
   #starting(): void {
@@ -489,7 +561,7 @@ export class Program {
   /** How many chunks of parallel jobs the workers (not the program's own thread) have run. */
   workerChunks(): number {
     if (!this.#memory) return 0;
-    return Atomics.load(new Uint32Array(this.#memory.buffer), WORKERS_HELPED / 4);
+    return Atomics.load(new Uint32Array(this.#memory.buffer), PAR_HELPED / 4);
   }
 
   /** Calls another export (for tests). */
@@ -499,18 +571,11 @@ export class Program {
     return this.#call(() => (f as (...a: number[]) => unknown)(...args));
   }
 
-  /** The message a panic left before it trapped, cleared so a later trap that isn't a panic
-   * doesn't repeat it. */
+  /** The message a panic on the program's thread left before it trapped, cleared so a later trap
+   * that isn't a panic doesn't repeat it. */
   #takePanicMessage(): string | null {
     if (!this.#memory) return null;
-    const view = new DataView(this.#memory.buffer);
-    const count = Math.min(view.getUint32(PANIC_MESSAGE, true), PANIC_CAP);
-    if (count === 0) return null;
-        // A copy: TextDecoder doesn't read shared memory.
-    const bytes = new Uint8Array(this.#memory.buffer, PANIC_MESSAGE + 4, count).slice();
-    const msg = new TextDecoder().decode(bytes);
-    view.setUint32(PANIC_MESSAGE, 0, true);
-    return msg;
+    return takePanicMessage(this.#memory, THREAD_MAIN);
   }
 
   /** What trapped, and where in the source if the program says and the engine's stack trace
@@ -545,4 +610,19 @@ export class Program {
     if (failure !== null) throw failure;
     return result;
   }
+}
+
+/** The message a panic on thread `thread` left before it trapped (its block's `PANIC`), cleared
+ * so a later trap that isn't a panic doesn't repeat it. */
+export function takePanicMessage(memory: WebAssembly.Memory, thread: number): string | null {
+  const at = THREAD_BLOCKS + thread * THREAD_BLOCK_SIZE + PANIC;
+  // A memory too small to hold the block (not a compiled program's) left no message there.
+  if (at + 4 + PANIC_CAP > memory.buffer.byteLength) return null;
+  const view = new DataView(memory.buffer);
+  const count = Math.min(view.getUint32(at, true), PANIC_CAP);
+  if (count === 0) return null;
+  // A copy: TextDecoder doesn't read shared memory.
+  const bytes = new Uint8Array(memory.buffer, at + 4, count).slice();
+  view.setUint32(at, 0, true);
+  return new TextDecoder().decode(bytes);
 }

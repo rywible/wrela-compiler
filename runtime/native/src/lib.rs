@@ -37,8 +37,9 @@ pub use cache::compiled_code_name;
 pub use error::{Error, Result};
 #[cfg(feature = "gpu")]
 pub use gpu::{GpuTiming, map_read, open_device, read_timestamps};
-pub use program::{Failure, PostHandler, Value};
-pub use wrela_abi::input::{Event, Scripted, parse_script};
+pub use program::{Failure, PostHandler, Ticked, Value};
+pub use wrela_abi::input::{At, Event, Scripted, parse_script};
+pub use wrela_abi::ticks::TickLog;
 
 #[cfg(feature = "gpu")]
 use gpu::Gpu;
@@ -122,6 +123,63 @@ impl RunResult {
 pub fn frame_time(i: u32, fps: f64) -> f32 {
     (f64::from(i) / fps) as f32
 }
+
+/// How many ticks have run before frame `i` in lockstep (test mode, #43 §2.3), as both hosts
+/// compute it: ⌊(i + 1) · hz / fps⌋, in f64. Frame `i` waits for them, and the ticker waits for
+/// frame `i` before the next, so the frame draws the same snapshot in both hosts.
+pub fn lockstep_ticks(i: u32, hz: u32, fps: f64) -> u32 {
+    ((f64::from(i) + 1.0) * f64::from(hz) / fps).floor() as u32
+}
+
+/// Why a tick log didn't replay.
+#[derive(Debug)]
+pub enum ReplayError {
+    /// The log is for another build: its WASM hash isn't this build's.
+    OtherBuild { log: u64, build: u64 },
+    /// The program has no ticker after `init`.
+    NoTicker,
+    /// The log's rate isn't the ticker's.
+    OtherRate { log: u32, ticker: u32 },
+    /// The first world's hash, after `init`, isn't the log's.
+    FirstWorld { log: u64, replayed: u64 },
+    /// Tick `tick`'s hash isn't the log's: the first that differs.
+    Tick { tick: u32, log: u64, replayed: u64 },
+    /// The program failed: it trapped, or the host couldn't run it.
+    Failed(Error),
+}
+
+impl std::fmt::Display for ReplayError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let hex = wrela_abi::hash::hex;
+        match self {
+            ReplayError::OtherBuild { log, build } => write!(
+                f,
+                "the log is for another build: its WASM hash is {}, this build's {}",
+                hex(*log),
+                hex(*build)
+            ),
+            ReplayError::NoTicker => write!(f, "the program starts no ticker in `init`"),
+            ReplayError::OtherRate { log, ticker } => {
+                write!(f, "the log's ticks are at {log} Hz, the ticker's at {ticker} Hz")
+            }
+            ReplayError::FirstWorld { log, replayed } => write!(
+                f,
+                "the first world differs: the log has {}, the replay {}",
+                hex(*log),
+                hex(*replayed)
+            ),
+            ReplayError::Tick { tick, log, replayed } => write!(
+                f,
+                "tick {tick} differs: the log has {}, the replay {}",
+                hex(*log),
+                hex(*replayed)
+            ),
+            ReplayError::Failed(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for ReplayError {}
 
 /// Compiles the build in `dir` and keeps its compiled code beside it, so the loads that follow
 /// don't compile it again (`cache`).
@@ -289,25 +347,95 @@ pub struct CpuBuild {
     manifest: Manifest,
     compiled: program::Compiled,
     dir: std::path::PathBuf,
+    /// FNV-1a 64 of the WASM: which build a tick log is for.
+    wasm_hash: u64,
+    /// Whether its hosts keep a copy of every batch ([`CpuHost::take_batches`]).
+    record: bool,
 }
 
 impl CpuBuild {
-    /// Loads the build in `dir`; its shaders must exist but aren't compiled.
+    /// Loads the build in `dir`; its shaders must exist but aren't compiled. Its compiled code
+    /// is kept beside it, as a [`Host`]'s is.
     pub fn load(dir: impl AsRef<Path>) -> Result<CpuBuild> {
         CpuBuild::load_compiled(dir.as_ref(), None)
     }
 
-    /// [`CpuBuild::load`], with each call (`init`, a frame, an export) given `fuel` units of
-    /// work (about one per WASM instruction): a call that does more traps, after the same work
-    /// on every machine. For tests that run a program's frames.
+    /// [`CpuBuild::load`], with each call (`init`, a frame, a tick, an export) given `fuel`
+    /// units of work (about one per WASM instruction): a call that does more traps, after the
+    /// same work on every machine. For tests that run a program's frames.
     pub fn load_metered(dir: impl AsRef<Path>, fuel: u64) -> Result<CpuBuild> {
         CpuBuild::load_compiled(dir.as_ref(), Some(fuel))
     }
 
     fn load_compiled(dir: &Path, fuel: Option<u64>) -> Result<CpuBuild> {
         let (manifest, wasm, _) = read_build(dir)?;
-        let compiled = program::compile_with(&wasm, fuel)?;
-        Ok(CpuBuild { compiled, manifest, dir: dir.to_path_buf() })
+        let compiled = program::compile_cached_with(&wasm, dir, fuel)?;
+        let wasm_hash = wrela_abi::ticks::wasm_hash(&wasm);
+        Ok(CpuBuild { compiled, manifest, dir: dir.to_path_buf(), wasm_hash, record: false })
+    }
+
+    /// Its hosts keep a copy of every batch the program submits ([`CpuHost::take_batches`]):
+    /// for tests that look at what a program recorded. A long run keeps none.
+    pub fn recording(mut self) -> CpuBuild {
+        self.record = true;
+        self
+    }
+
+    /// FNV-1a 64 of its WASM ([`wrela_abi::ticks::wasm_hash`]).
+    pub fn wasm_hash(&self) -> u64 {
+        self.wasm_hash
+    }
+
+    /// Runs the program's ticks with no frames (`wrela-host --no-gpu`): `init`, then `ticks`
+    /// ticks with `script`'s records (its tick-keyed events), each tick's state hash asked
+    /// for: the tick log they make. Parallel work runs on `workers` threads (0 for the default).
+    pub fn record_ticks(&self, ticks: u32, script: &[Scripted], workers: u32) -> Result<TickLog> {
+        let mut host = self.instantiate_in(workers, None)?;
+        host.want_hashes(true);
+        host.init()?;
+        let Some(hz) = host.ticker_hz() else {
+            return Err(Error::Program(
+                "it starts no ticker in `init` (`std::tick::start`)".into(),
+            ));
+        };
+        let mut log = TickLog::new(self.wasm_hash, hz, host.reported_hash());
+        for k in 0..ticks {
+            host.push_records(wrela_abi::input::records_at(script, k));
+            let t = host.tick(true)?;
+            log.ticks.push(wrela_abi::ticks::Tick {
+                records: t.records,
+                hash: t.hash.expect("asked for"),
+            });
+        }
+        Ok(log)
+    }
+
+    /// Replays a tick log (`wrela-host --replay`): `init`, then each of the log's ticks with
+    /// its records, checking the first world's hash and each tick's against the log's. Stops at
+    /// the first that differs, and names it. How many ticks replayed.
+    pub fn replay(&self, log: &TickLog, workers: u32) -> Result<u32, ReplayError> {
+        if log.wasm_hash != self.wasm_hash {
+            return Err(ReplayError::OtherBuild { log: log.wasm_hash, build: self.wasm_hash });
+        }
+        let mut host = self.instantiate_in(workers, None).map_err(ReplayError::Failed)?;
+        host.want_hashes(true);
+        host.init().map_err(ReplayError::Failed)?;
+        let hz = host.ticker_hz().ok_or(ReplayError::NoTicker)?;
+        if hz != log.hz {
+            return Err(ReplayError::OtherRate { log: log.hz, ticker: hz });
+        }
+        if host.reported_hash() != log.first {
+            return Err(ReplayError::FirstWorld { log: log.first, replayed: host.reported_hash() });
+        }
+        for (k, t) in log.ticks.iter().enumerate() {
+            host.push_raw_records(&t.records);
+            let got = host.tick(true).map_err(ReplayError::Failed)?;
+            let replayed = got.hash.expect("asked for");
+            if replayed != t.hash {
+                return Err(ReplayError::Tick { tick: k as u32, log: t.hash, replayed });
+            }
+        }
+        Ok(log.ticks.len() as u32)
     }
 
     /// A new instance of the program: its own memory, batches and hash, and its parallel jobs
@@ -331,7 +459,8 @@ impl CpuBuild {
         let io = io(&self.dir, storage, None, false);
         let n = self::workers(workers);
         let (compiled, manifest) = (&self.compiled, &self.manifest);
-        let program = Program::instantiate_with(compiled, manifest, NoGpu, io, true, n, false)?;
+        let program =
+            Program::instantiate_with(compiled, manifest, NoGpu, io, self.record, n, false)?;
         Ok(CpuHost { program })
     }
 }
@@ -402,5 +531,116 @@ impl CpuHost {
     /// The names and WASM types of the module's exported functions: `(params, results)`.
     pub fn exports(&self) -> Vec<(String, Vec<&'static str>, Vec<&'static str>)> {
         self.program.exports()
+    }
+
+    /// The ticker's rate, once the program has started one (`std::tick::start`).
+    pub fn ticker_hz(&self) -> Option<u32> {
+        self.program.ticker_hz()
+    }
+
+    /// Whether the ticker reports its state's hash: from `start` on (the first world's) if
+    /// asked before [`CpuHost::init`].
+    pub fn want_hashes(&mut self, on: bool) {
+        self.program.want_hashes(on);
+    }
+
+    /// The state hash the ticker reported last.
+    pub fn reported_hash(&self) -> u64 {
+        self.program.reported_hash()
+    }
+
+    /// Queues input events as the ticker's records: the next ticks take them, at most
+    /// `wrela_abi::memory::MAX_TICK_RECORDS` each.
+    pub fn push_records(&mut self, events: impl IntoIterator<Item = Event>) {
+        self.program.push_records(events);
+    }
+
+    /// Queues records exactly as a tick log has them (`TickLog`'s ticks' `records`).
+    pub fn push_raw_records(&mut self, records: &[[u8; wrela_abi::input::EVENT_SIZE as usize]]) {
+        self.program.push_raw_records(records);
+    }
+
+    /// Runs the ticker's next tick with the queued records: what it was given, and its state's
+    /// hash if `hash`. An error if there's no ticker, or the tick trapped (the program's panic).
+    pub fn tick(&mut self, hash: bool) -> Result<Ticked> {
+        self.program.tick(hash)
+    }
+
+    /// The next tick's number.
+    pub fn next_tick(&self) -> u32 {
+        self.program.next_tick()
+    }
+
+    /// Runs frame `i` of a lockstep schedule at `fps` (test mode, #43 §2.3): the ticks that
+    /// come before it, then the frame, with `script`'s events of frame `i` queued for the frame
+    /// and the ticker, and its tick-keyed events as their ticks' records.
+    pub fn lockstep_frame(
+        &mut self,
+        i: u32,
+        fps: f64,
+        width: u32,
+        height: u32,
+        script: &[Scripted],
+    ) -> Result<()> {
+        let events: Vec<Event> = wrela_abi::input::events_at(script, i).collect();
+        for &e in &events {
+            self.program.push_input(e);
+        }
+        if let Some(hz) = self.program.ticker_hz() {
+            self.program.push_records(events);
+            while self.program.next_tick() < lockstep_ticks(i, hz, fps) {
+                let k = self.program.next_tick();
+                self.program.push_records(wrela_abi::input::records_at(script, k));
+                self.program.tick(false)?;
+            }
+        }
+        self.program.frame(frame_time(i, fps), width, height)
+    }
+
+    /// Makes each helper hold back a long job's result for `micros` microseconds once it's
+    /// ready: tests slow jobs down, so the threads that take them wait.
+    pub fn hold_jobs(&self, micros: u32) {
+        self.program.hold_jobs(micros);
+    }
+
+    /// Runs `ticks` ticks (with no records, each asked for its hash) on an OS thread of their
+    /// own while this one runs `frames` frames at `fps`, neither waiting for the other (test
+    /// mode's paced schedule, #43 §2.3): each tick's state hash.
+    pub fn ticks_beside_frames(
+        &mut self,
+        ticks: u32,
+        frames: u32,
+        fps: f64,
+        width: u32,
+        height: u32,
+    ) -> Result<Vec<u64>> {
+        let mut thread = self.program.take_tick_thread()?;
+        let (hashes, framed) = std::thread::scope(|s| {
+            let ticking = s.spawn(move || {
+                let mut out = Vec::new();
+                for _ in 0..ticks {
+                    match thread.run(Vec::new(), true) {
+                        Ok(t) => out.push(t.hash.expect("asked for")),
+                        Err(e) => return (thread, out, Some(e)),
+                    }
+                }
+                (thread, out, None)
+            });
+            let mut framed = Ok(());
+            for i in 0..frames {
+                framed = self.program.frame(frame_time(i, fps), width, height);
+                if framed.is_err() {
+                    break;
+                }
+            }
+            (ticking.join().expect("the ticker's thread"), framed)
+        });
+        let (thread, out, failed) = hashes;
+        self.program.restore_tick_thread(thread);
+        if let Some((k, trap)) = failed {
+            return Err(self.program.tick_trapped(k, &trap));
+        }
+        framed?;
+        Ok(out)
     }
 }

@@ -48,8 +48,14 @@
 //!
 //! `type` is `move`, `down`, `up`, `wheel`, `keydown`, `keyup`, `key` (a key down then up),
 //! or `text` (a `Text` event for each character); `button` defaults to `primary`; `shift`,
-//! `ctrl`, `alt` and `meta` default to false; frames don't decrease. Before calling `frame` for
-//! frame `i`, a host queues every event of frame `i`, in order. [`parse_script`] reads one.
+//! `ctrl`, `alt` and `meta` default to false. [`parse_script`] reads one.
+//!
+//! An event has the frame it arrives before (`"frame": n`), or instead the tick it's a record
+//! of (`"tick": n`, language.md's `std::tick`); each kind's numbers don't decrease.
+//! - Before calling `frame` for frame `i`, a host queues every event of frame `i`, in order, for
+//!   the program's `std::input::events()`; a program with a ticker gets them as records too,
+//!   which its next tick takes (in lockstep, the first tick that runs for frame `i`).
+//! - A tick's events are tick `n`'s records, and nothing else: the frames never see them.
 
 use serde_json::Value;
 
@@ -232,6 +238,13 @@ impl Event {
         Event { kind: EventKind::Text, modifiers: 0, words: [c as u32, 0, 0, 0] }
     }
 
+    /// An event from its bytes: `None` for a kind this ABI doesn't know.
+    pub fn from_bytes(b: &[u8; EVENT_SIZE as usize]) -> Option<Event> {
+        let w = |i: usize| u32::from_le_bytes([b[4 * i], b[4 * i + 1], b[4 * i + 2], b[4 * i + 3]]);
+        let kind = EventKind::ALL.into_iter().find(|k| *k as u32 == w(0))?;
+        Some(Event { kind, modifiers: w(1), words: [w(2), w(3), w(4), w(5)] })
+    }
+
     /// Its [`EVENT_SIZE`] bytes, as the program reads them.
     pub fn bytes(&self) -> [u8; EVENT_SIZE as usize] {
         let mut out = [0u8; EVENT_SIZE as usize];
@@ -243,16 +256,28 @@ impl Event {
     }
 }
 
-/// A script's event, and the frame it arrives before.
+/// When a script's event arrives: before a frame, or as a tick's record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum At {
+    Frame(u32),
+    Tick(u32),
+}
+
+/// A script's event, and when it arrives.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Scripted {
-    pub frame: u32,
+    pub at: At,
     pub event: Event,
 }
 
 /// The events of `script` that arrive before frame `frame`.
 pub fn events_at(script: &[Scripted], frame: u32) -> impl Iterator<Item = Event> + '_ {
-    script.iter().filter(move |s| s.frame == frame).map(|s| s.event)
+    script.iter().filter(move |s| s.at == At::Frame(frame)).map(|s| s.event)
+}
+
+/// The events of `script` that are tick `tick`'s records.
+pub fn records_at(script: &[Scripted], tick: u32) -> impl Iterator<Item = Event> + '_ {
+    script.iter().filter(move |s| s.at == At::Tick(tick)).map(|s| s.event)
 }
 
 /// Reads a script ([the format](self#scripted-input)): its events, in order, or why it isn't
@@ -262,19 +287,31 @@ pub fn parse_script(text: &str) -> Result<Vec<Scripted>, String> {
         serde_json::from_str(text).map_err(|e| format!("the script isn't JSON: {e}"))?;
     let items = value.as_array().ok_or("a script is a JSON array of events")?;
     let mut out = Vec::new();
-    let mut last = 0;
+    let (mut last_frame, mut last_tick) = (0, 0);
     for (i, item) in items.iter().enumerate() {
         let at = |why: &str| format!("event {i}: {why}");
         let o = item.as_object().ok_or_else(|| at("an event is a JSON object"))?;
-        let frame = o
-            .get("frame")
-            .and_then(Value::as_u64)
-            .filter(|&f| f <= u64::from(u32::MAX))
-            .ok_or_else(|| at("`frame` must be a whole number"))? as u32;
-        if frame < last {
-            return Err(at("frames don't decrease"));
-        }
-        last = frame;
+        let number = |key: &str| {
+            o.get(key).map(|v| v.as_u64().filter(|&f| f <= u64::from(u32::MAX)).map(|f| f as u32))
+        };
+        let when = match (number("frame"), number("tick")) {
+            (Some(Some(f)), None) => {
+                if f < last_frame {
+                    return Err(at("frames don't decrease"));
+                }
+                last_frame = f;
+                At::Frame(f)
+            }
+            (None, Some(Some(t))) => {
+                if t < last_tick {
+                    return Err(at("ticks don't decrease"));
+                }
+                last_tick = t;
+                At::Tick(t)
+            }
+            (Some(_), Some(_)) => return Err(at("an event has a `frame` or a `tick`, not both")),
+            _ => return Err(at("`frame` (or `tick`) must be a whole number")),
+        };
         let num = |key: &str| -> Result<f32, String> {
             match o.get(key) {
                 None => Ok(0.0),
@@ -313,7 +350,7 @@ pub fn parse_script(text: &str) -> Result<Vec<Scripted>, String> {
                 k => Ok(k),
             }
         };
-        let mut push = |event| out.push(Scripted { frame, event });
+        let mut push = |event| out.push(Scripted { at: when, event });
         match ty {
             "move" => {
                 push(Event::pointer(EventKind::PointerMove, num("x")?, num("y")?, 0, modifiers))
@@ -401,7 +438,7 @@ mod tests {
         assert_eq!(s[5].event.kind, EventKind::KeyUp);
         assert_eq!(s[6].event.words, [key_code("KeyA"), 1, 0, 0]);
         assert_eq!(s[8].event, Event::text('é'));
-        assert_eq!(s[8].frame, 4);
+        assert_eq!(s[8].at, At::Frame(4));
         let bytes = s[3].event.bytes();
         assert_eq!(&bytes[..4], &4u32.to_le_bytes());
         assert_eq!(&bytes[20..], &120.0f32.to_bits().to_le_bytes());
@@ -411,8 +448,10 @@ mod tests {
     fn bad_scripts_say_why() {
         let bad = [
             ("{}", "a script is a JSON array"),
-            (r#"[{"type": "move"}]"#, "`frame` must be a whole number"),
+            (r#"[{"type": "move"}]"#, "`frame` (or `tick`) must be a whole number"),
             (r#"[{"frame": 2, "type": "move"}, {"frame": 1, "type": "move"}]"#, "don't decrease"),
+            (r#"[{"tick": 2, "type": "move"}, {"tick": 1, "type": "move"}]"#, "don't decrease"),
+            (r#"[{"tick": 2, "frame": 1, "type": "move"}]"#, "not both"),
             (r#"[{"frame": 0, "type": "jump"}]"#, "isn't a type"),
             (r#"[{"frame": 0, "type": "key", "key": "A"}]"#, "isn't a key"),
             (r#"[{"frame": 0, "type": "down", "button": "left"}]"#, "`button` is primary"),
@@ -421,6 +460,22 @@ mod tests {
             let e = parse_script(text).expect_err(text);
             assert!(e.contains(why), "{text}: {e}");
         }
+    }
+
+    /// Tick-keyed events are a tick's records, and frames never see them.
+    #[test]
+    fn ticks_events_are_records() {
+        let script = r#"[
+            {"tick": 3, "type": "key", "key": "Space"},
+            {"frame": 0, "type": "move", "x": 1, "y": 2},
+            {"tick": 5, "type": "text", "text": "z"}
+        ]"#;
+        let s = parse_script(script).expect("a valid script");
+        assert_eq!(s.len(), 4);
+        assert_eq!(records_at(&s, 3).count(), 2);
+        assert_eq!(records_at(&s, 5).collect::<Vec<_>>(), [Event::text('z')]);
+        assert_eq!(events_at(&s, 0).count(), 1);
+        assert_eq!(events_at(&s, 3).count(), 0);
     }
 
     #[test]

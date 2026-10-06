@@ -996,6 +996,17 @@ impl<'m> Fe<'m> {
                 I::I64Const(-1),
                 I::MemoryAtomicWait32(mem(0, 2)),
             ]),
+            ir::MemOp::WaitFor => self.ins.extend([
+                arg(self, 0)?,
+                arg(self, 1)?,
+                // Microseconds to nanoseconds.
+                arg(self, 2)?,
+                I::I64ExtendI32U,
+                I::I64Const(1000),
+                I::I64Mul,
+                I::MemoryAtomicWait32(mem(0, 2)),
+            ]),
+            ir::MemOp::ThreadBlock => self.ins.push(I::GlobalGet(globals::THREAD)),
             ir::MemOp::Notify => {
                 self.ins.extend([arg(self, 0)?, arg(self, 1)?, I::MemoryAtomicNotify(mem(0, 2))])
             }
@@ -1016,10 +1027,12 @@ impl<'m> Fe<'m> {
                     I::I32LeU,
                     I::Select,
                     I::LocalSet(n),
-                    I::I32Const(memory::PANIC_MESSAGE as i32),
+                    I::GlobalGet(globals::THREAD),
                     I::LocalGet(n),
-                    I::I32Store(mem(0, 2)),
-                    I::I32Const(memory::PANIC_MESSAGE as i32 + 4),
+                    I::I32Store(mem(memory::PANIC, 2)),
+                    I::GlobalGet(globals::THREAD),
+                    I::I32Const(memory::PANIC as i32 + 4),
+                    I::I32Add,
                     arg(self, 0)?,
                     I::LocalGet(n),
                     I::MemoryCopy { src_mem: 0, dst_mem: 0 },
@@ -1419,47 +1432,53 @@ pub(crate) fn init_data(base: u32, len: u32) -> Function {
     function([], &ins)
 }
 
-/// `__audio(task, context)`: sets the audio thread's own stack, then calls task `task` (by
-/// index, of type `task_type`) with the context and chunk 0 (wrela_abi's `EXPORT_AUDIO`).
-pub(crate) fn audio_wrapper(task_type: u32) -> Function {
-    let ins = [
-        I::I32Const(memory::AUDIO_STACK_LIMIT as i32),
-        I::GlobalSet(globals::STACK_FLOOR),
-        I::I32Const(memory::AUDIO_STACK_TOP as i32),
-        I::GlobalSet(globals::SP),
-        I::LocalGet(1),
-        I::I32Const(0),
+/// A thread entry's export (`@thread_entry`, wrela_abi `memory`'s threads): its first argument
+/// is the thread's number, which picks the stack it runs on and the block it uses (a number
+/// past the last thread traps); then it calls the entry, `entry`, with every argument, `params`
+/// `i32`s.
+pub(crate) fn thread_entry_wrapper(entry: u32, params: u32) -> Function {
+    let size = memory::THREAD_STACK_SIZE as i32;
+    let mut ins = vec![
         I::LocalGet(0),
-        I::CallIndirect { type_index: task_type, table_index: 0 },
-        I::End,
-    ];
-    function([], &ins)
-}
-
-pub(crate) fn worker_wrapper(worker: u32) -> Function {
-    let size = memory::WORKER_STACK_SIZE as i32;
-    let top = memory::STACK_TOP as i32;
-    let ins = [
-        I::LocalGet(0),
-        I::I32Const(memory::MAX_WORKERS as i32),
+        I::I32Const(memory::THREADS as i32),
         I::I32GeU,
         I::If(BlockType::Empty),
         I::Unreachable,
         I::End,
-        // Its floor: STACK_TOP + index × size; its top, one size up.
+        // The program's thread's stack, or, for thread t from 1, STACK_TOP + (t - 1) × size up
+        // to one size more.
         I::LocalGet(0),
+        I::If(BlockType::Empty),
+        I::LocalGet(0),
+        I::I32Const(1),
+        I::I32Sub,
         I::I32Const(size),
         I::I32Mul,
-        I::I32Const(top),
+        I::I32Const(memory::STACK_TOP as i32),
         I::I32Add,
         I::GlobalSet(globals::STACK_FLOOR),
         I::GlobalGet(globals::STACK_FLOOR),
         I::I32Const(size),
         I::I32Add,
         I::GlobalSet(globals::SP),
-        I::Call(worker),
+        I::Else,
+        I::I32Const(memory::STACK_LIMIT as i32),
+        I::GlobalSet(globals::STACK_FLOOR),
+        I::I32Const(memory::STACK_TOP as i32),
+        I::GlobalSet(globals::SP),
         I::End,
+        // Its block.
+        I::LocalGet(0),
+        I::I32Const(memory::THREAD_BLOCK_SIZE as i32),
+        I::I32Mul,
+        I::I32Const(memory::THREAD_BLOCKS as i32),
+        I::I32Add,
+        I::GlobalSet(globals::THREAD),
     ];
+    for i in 0..params {
+        ins.push(I::LocalGet(i));
+    }
+    ins.extend([I::Call(entry), I::End]);
     function([], &ins)
 }
 

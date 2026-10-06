@@ -127,14 +127,52 @@ pub fn wait(addr: u32, expected: u32) -> u32 {}
 @intrinsic
 pub fn notify(addr: u32, count: u32) -> u32 {}
 
-/// Runs task `task` (a parallel job's code: `std::par`) on chunk `chunk`, with its context at
-/// `ctx`.
+/// Runs task `task` (`task`'s number) on chunk `chunk`, with its context at `ctx`.
 @intrinsic
 pub fn run_task(task: u32, ctx: u32, chunk: u32) {}
 
-/// Traps, keeping the panic message another thread left (`std::par`).
+/// The number of a task: a function the module calls by number (`run_task`, a host's thread
+/// entries) with a chunk and a context's address, which runs `run(chunk, mut context)`, the
+/// context being the `C` there. `run` is a named function: what runs on another thread has no
+/// captures of this one's.
+@intrinsic
+pub fn task<C>(run: fn(u32, mut C)) -> u32 {}
+
+/// The threads' blocks: each thread's parallel job, what it runs for others, its allocations
+/// and its panic message (wrela_abi::memory's threads; these are copies of its numbers, which a
+/// test there checks).
+pub const THREAD_BLOCKS: u32 = 1114112
+/// The bytes of each thread's block.
+pub const THREAD_BLOCK_SIZE: u32 = 8192
+/// Where in a block a panic's message is: a `u32` byte count, then UTF-8.
+pub const PANIC: u32 = 4096
+
+/// The running thread's block's address: the program's thread's, or the one a thread entry
+/// was given.
+@intrinsic
+pub fn thread_block() -> u32 {}
+
+/// Waits as `wait` does, for at most `micros` microseconds: 0 when woken, 1 when it wasn't
+/// `expected`, 2 when the time ran out.
+@intrinsic
+pub fn wait_for(addr: u32, expected: u32, micros: u32) -> u32 {}
+
+/// Traps, keeping the panic message this thread's block has (another thread's, copied there).
 @intrinsic
 pub fn abort() {}
+
+/// Traps with the panic message thread `thread` left: the program panics with another thread's
+/// panic (`std::par`'s helpers).
+pub fn abort_from(thread: u32) {
+    unsafe {
+        let from = THREAD_BLOCKS + thread * THREAD_BLOCK_SIZE + PANIC
+        let to = thread_block() + PANIC
+        if from != to {
+            copy(to, from, THREAD_BLOCK_SIZE - PANIC)
+        }
+        abort()
+    }
+}
 
 /// Whether this is a debug build (`wrela build --debug`, and `wrela test`), which pays for
 /// checks a release build doesn't make: a constant, so a release build has no trace of them,

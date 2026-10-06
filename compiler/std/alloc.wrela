@@ -8,11 +8,14 @@
 // what a program computes.
 //
 // The state lives at wrela_abi::memory::ALLOC_STATE (16): the bump pointer (0 until the first
-// allocation), where the memory ends, a lock word, the large blocks' list, one list head per
-// size class, then how many blocks `alloc` has returned. A test in wrela_abi checks that STATE
-// and BUMP are ALLOC_STATE.
+// allocation), where the memory ends, a lock word, the large blocks' list, and one list head
+// per size class. How many blocks `alloc` has returned is counted in each thread's block, so
+// what one thread counts doesn't depend on another's timing. A test in wrela_abi checks that
+// STATE and BUMP are ALLOC_STATE, and ALLOCATIONS is the block's word.
 
-use std::mem::{compare_swap, copy, heap_base, load_u32, memory_grow, memory_pages, store_u32}
+use std::mem::{
+    compare_swap, copy, heap_base, load_u32, memory_grow, memory_pages, store_u32, thread_block,
+}
 
 const STATE: u32 = 16
 const BUMP: u32 = 16
@@ -21,7 +24,8 @@ const LOCK: u32 = 24
 const LARGE: u32 = 28
 const HEADS: u32 = 32
 const CLASSES: u32 = 17
-const COUNT: u32 = HEADS + 4 * CLASSES
+/// A thread's count of the blocks it has allocated, in its block.
+const ALLOCATIONS: u32 = 36
 const SMALLEST: u32 = 16
 const PAGE: u32 = 65536
 
@@ -49,18 +53,21 @@ pub fn alloc(size: u32, align: u32) -> u32 {
     } else {
         large(round_up(size, PAGE))
     }
-    unsafe {
-        store_u32(COUNT, load_u32(COUNT).wrapping_add(1))
-    }
     unlock()
+    unsafe {
+        // Only this thread writes its count.
+        let count = thread_block() + ALLOCATIONS
+        store_u32(count, load_u32(count).wrapping_add(1))
+    }
     block
 }
 
-/// How many blocks the allocator has handed out since the program started, wrapping at 2³²:
-/// for checking that code doesn't allocate (a `Vec` that grows, an f-string, a `clone`). A
-/// `realloc` that keeps its block doesn't count.
+/// How many blocks the allocator has handed out to this thread since the program started,
+/// wrapping at 2³²: for checking that code doesn't allocate (a `Vec` that grows, an f-string,
+/// a `clone`). A `realloc` that keeps its block doesn't count. Each thread counts its own, so
+/// the count doesn't depend on what other threads do, or when.
 pub fn allocations() -> u32 {
-    unsafe { load_u32(COUNT) }
+    unsafe { load_u32(thread_block() + ALLOCATIONS) }
 }
 
 /// Frees a block that `alloc` returned for `size` bytes. Freeing 0 does nothing.

@@ -344,6 +344,11 @@ impl Fl<'_, '_> {
                 | L::MemWait
                 | L::MemNotify
                 | L::MemRunTask
+                | L::MemTask
+                | L::MemThreadBlock
+                | L::MemWaitFor
+                | L::StartVoice
+                | L::StartTicker
                 | L::MemAbort
                 | L::DebugBuild
                 | L::StrAddr
@@ -443,6 +448,22 @@ impl Fl<'_, '_> {
             Lang::MemWait => mem(self, M::Wait, 2, Some(u)),
             Lang::MemNotify => mem(self, M::Notify, 2, Some(u)),
             Lang::MemRunTask => mem(self, M::RunTask, 3, None),
+            Lang::MemThreadBlock => mem(self, M::ThreadBlock, 0, Some(u)),
+            Lang::MemWaitFor => mem(self, M::WaitFor, 3, Some(u)),
+            Lang::MemTask => crate::task::task(self, substs, c),
+            Lang::StartVoice | Lang::StartTicker => {
+                let n = if lang == Lang::StartVoice { 2 } else { 3 };
+                let args: Option<Vec<ir::ValueId>> = (0..n).map(|k| arg(self, k)).collect();
+                let op = if lang == Lang::StartVoice {
+                    self.mb.m.audio = true;
+                    ir::HostOp::Audio
+                } else {
+                    self.mb.m.tick = true;
+                    ir::HostOp::Tick
+                };
+                self.emit(ir::Stmt::Eval(ir::Expr::Host(op, args?)));
+                None
+            }
             Lang::DebugBuild => Some(self.konst(ir::Const::Bool(self.cx.data.debug))),
             Lang::MemAbort => {
                 // A trap that keeps the panic message a worker left.

@@ -289,6 +289,8 @@ pub enum HostOp {
     Limit,
     /// `wrela.audio(task, context)`: starts the program's voice.
     Audio,
+    /// `wrela.tick(task, context, hz)`: starts the program's ticker.
+    Tick,
     /// `wrela.input(address, cap)`: copies up to `cap` queued input events to the address
     /// (`u32`s); how many, a `u32`.
     Input,
@@ -331,8 +333,14 @@ pub enum MemOp {
     /// that was there.
     Cas,
     /// A panic: writes the message, a `u32` address and a byte count, where hosts read it
-    /// (`wrela_abi::memory::PANIC_MESSAGE`), then traps.
+    /// (the thread's block's `wrela_abi::memory::PANIC`), then traps.
     Panic,
+    /// The address of the running thread's block (`wrela_abi::memory::thread_block`), a `u32`:
+    /// the program's thread's, or the one a thread entry was given.
+    ThreadBlock,
+    /// Waits while the `u32` at an address is the second argument, for at most the third's
+    /// microseconds: 0 woken, 1 it wasn't that value, 2 the time ran out.
+    WaitFor,
     /// Atomically adds the second argument to the `u32` at an address: the old value.
     AtomicAdd,
     /// The `u32` at an address, read atomically.
@@ -694,15 +702,19 @@ pub struct Module {
     /// CPU only: other data the program changes: a lifted build's table of literals, and what
     /// keeps its GPU copy (language.md §22).
     pub writable: Vec<DataId>,
-    /// CPU only: functions called by index ([`MemOp::RunTask`]): a parallel job's chunks.
-    /// Each takes a context address and a chunk index.
+    /// CPU only: functions called by index ([`MemOp::RunTask`]): a parallel job's chunks, a
+    /// voice's quanta, a ticker's ticks. Each takes a context address and a chunk index.
     pub tasks: Vec<FuncId>,
-    /// CPU only: std's worker loop, which the module exports as `__worker` when it has one
-    /// (a program that uses parallelism).
-    pub worker: Option<FuncId>,
-    /// CPU only: whether the program starts a voice (`std::audio`), so the module exports
-    /// `__audio`, which runs a task on the audio thread's stack.
+    /// CPU only: std's thread entries the program uses (`@thread_entry`), each exported as
+    /// `__` and its name: a host calls it on a thread of its own, with the thread's number
+    /// first (wrela_abi `memory`'s threads), and it runs on that thread's stack.
+    pub thread_entries: Vec<(String, FuncId)>,
+    /// CPU only: whether the program starts a voice (`std::audio`), so the module imports
+    /// `wrela.audio`.
     pub audio: bool,
+    /// CPU only: whether the program starts a ticker (`std::tick`), so the module imports
+    /// `wrela.tick`.
+    pub tick: bool,
     /// CPU only: whether the program reads input (`std::input`), so the module imports
     /// `wrela.input`.
     pub input: bool,

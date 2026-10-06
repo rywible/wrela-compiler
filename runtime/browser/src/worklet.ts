@@ -1,8 +1,9 @@
 // The audio worklet: renders the program's voice on the audio thread, one render quantum per
-// `process` call, by calling wrela_abi's `__audio` on its own instance of the program's module,
+// `process` call, by calling wrela_abi's `__audio` (on the audio thread, wrela_abi memory's
+// `THREAD_AUDIO`) on its own instance of the program's module,
 // which shares the program's memory. The samples are at `AUDIO_OUT` after each call.
 
-import { AUDIO_OUT, AUDIO_QUANTUM, EXPORT_AUDIO, HOST_FUNCTIONS, IMPORT_MEMORY, IMPORT_MODULE } from "./abi.gen.ts";
+import { AUDIO_OUT, AUDIO_QUANTUM, EXPORT_AUDIO, HOST_FUNCTIONS, IMPORT_MEMORY, IMPORT_MODULE, THREAD_AUDIO } from "./abi.gen.ts";
 import { VOICE_PROCESSOR, type VoiceOptions } from "./messages.ts";
 
 // The AudioWorkletGlobalScope's own names, which TypeScript has no lib for.
@@ -15,7 +16,7 @@ declare function registerProcessor(
 ): void;
 
 class Voice extends AudioWorkletProcessor {
-  readonly #render: (task: number, context: number) => void;
+  readonly #render: (thread: number, task: number, context: number) => void;
   readonly #samples: Float32Array;
   readonly #task: number;
   readonly #context: number;
@@ -32,7 +33,7 @@ class Voice extends AudioWorkletProcessor {
       [IMPORT_MODULE]: { [IMPORT_MEMORY]: memory, ...Object.fromEntries(HOST_FUNCTIONS.map(([name]) => [name, refuse])) },
     };
     const instance = new WebAssembly.Instance(module, imports);
-    this.#render = instance.exports[EXPORT_AUDIO] as (task: number, context: number) => void;
+    this.#render = instance.exports[EXPORT_AUDIO] as (thread: number, task: number, context: number) => void;
     // The memory may grow, but a view of shared memory stays valid, and this one is below the heap.
     this.#samples = new Float32Array(memory.buffer, AUDIO_OUT, AUDIO_QUANTUM);
     this.#task = task;
@@ -42,7 +43,7 @@ class Voice extends AudioWorkletProcessor {
   process(_inputs: Float32Array[][], outputs: Float32Array[][]): boolean {
     if (this.#failed) return false;
     try {
-      this.#render(this.#task, this.#context);
+      this.#render(THREAD_AUDIO, this.#task, this.#context);
     } catch (e) {
       // A trap stops the voice: say so, and render silence from here on.
       this.#failed = true;

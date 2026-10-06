@@ -875,7 +875,12 @@ impl Reuse<'_> {
                 let reads = matches!(
                     e,
                     Expr::Mem(
-                        MemOp::HeapBase | MemOp::Pages | MemOp::Load(_) | MemOp::Ptr | MemOp::Addr,
+                        MemOp::HeapBase
+                            | MemOp::Pages
+                            | MemOp::Load(_)
+                            | MemOp::Ptr
+                            | MemOp::Addr
+                            | MemOp::ThreadBlock,
                         _
                     )
                 );
@@ -974,10 +979,12 @@ fn drop_dead_stores(m: &Module, f: &mut Function) {
     sweep(&mut f.body, &read);
 }
 
-/// The functions a CPU module's code is entered at: its exports, its tasks and its worker.
+/// The functions a CPU module's code is entered at: its exports, its tasks and its thread
+/// entries.
 fn roots(m: &Module) -> Vec<usize> {
     let exports = m.exports.iter().map(|e| e.1);
-    exports.chain(m.tasks.iter().copied()).chain(m.worker).map(|f| f.index()).collect()
+    let entries = m.thread_entries.iter().map(|e| e.1);
+    exports.chain(m.tasks.iter().copied()).chain(entries).map(|f| f.index()).collect()
 }
 
 /// An order of the functions in which each comes after those it calls, but where calls make a
@@ -1069,7 +1076,7 @@ fn remove_unreached(m: &mut Module) {
     let renumber = |f: &mut FuncId| *f = FuncId(remap[f.index()].expect("a reached function"));
     m.exports.iter_mut().for_each(|e| renumber(&mut e.1));
     m.tasks.iter_mut().for_each(renumber);
-    m.worker.iter_mut().for_each(renumber);
+    m.thread_entries.iter_mut().for_each(|e| renumber(&mut e.1));
 }
 
 /// Removes the functions that nothing reaches from `roots`, and renumbers the calls in the

@@ -30,6 +30,14 @@ pub enum Effect {
 }
 
 impl Effect {
+    pub const ALL: [Effect; 6] =
+        [Effect::Alloc, Effect::Io, Effect::Nondet, Effect::Recursion, Effect::Host, Effect::Panic];
+
+    /// The effect `@effects(...)` names `name`.
+    pub fn named(name: &str) -> Option<Effect> {
+        Effect::ALL.into_iter().find(|e| e.name() == name)
+    }
+
     pub fn name(self) -> &'static str {
         match self {
             Effect::Alloc => "alloc",
@@ -202,7 +210,13 @@ fn typed_callables(p: &Program, f: FnId, body: &Body) -> Vec<TypedArg> {
         };
         let def = p.func(callee);
         for (param, a) in def.params.iter().zip(&c.args) {
-            let TyKind::FnPtr(_, _, flags) = p.types.kind(param.ty) else { continue };
+            // A function type, or a generic parameter bounded by one (`F: @deterministic
+            // fn(mut S, Ticked)`, which keeps the function it's given).
+            let fn_ty = match p.types.kind(param.ty) {
+                TyKind::Param(g) => p.param(*g).fn_bound.unwrap_or(param.ty),
+                _ => param.ty,
+            };
+            let TyKind::FnPtr(_, _, flags) = p.types.kind(fn_ty) else { continue };
             if !(flags.deterministic || flags.parallel || flags.audio) {
                 continue;
             }
@@ -589,6 +603,13 @@ fn node(
     let std_module = |g: FnId| p.module(p.func(g).module).path.get(1).cloned();
     let call_to = |n: &mut Node, g: FnId, span: Span| {
         let def = p.func(g);
+        // What std's core states it does, which inference can't see (`@effects`): at the call
+        // when it has no body here, else where its body is (below).
+        if def.attrs.intrinsic {
+            for &e in &def.attrs.effects {
+                n.direct.push((e, span, format!("`{}` is declared `{}`", def.name, e.name())));
+            }
+        }
         // std's intrinsics and its heap: the effects are what they are.
         if def.lang.is_some_and(Lang::is_nondet) {
             let why = format!("`{}` depends on when the host answers", def.name);
@@ -600,10 +621,6 @@ fn node(
         }
         if def.lang == Some(Lang::LiftSet) {
             n.direct.push((Effect::Host, span, "`set` changes a lifted literal".into()));
-            return;
-        }
-        if def.lang == Some(Lang::StartVoice) {
-            n.direct.push((Effect::Io, span, "`play` starts audio output".into()));
             return;
         }
         if def.lang.is_some_and(Lang::records_gpu_work) {
@@ -623,6 +640,13 @@ fn node(
         }
         n.calls.push((BodyId { func: g, closure: None }, span));
     };
+    if std::ptr::eq(code, &body.fns[0]) {
+        let def = p.func(f);
+        for &e in &def.attrs.effects {
+            let why = format!("`{}` is declared `{}`", def.name, e.name());
+            n.direct.push((e, def.sig_span, why));
+        }
+    }
     for b in &code.blocks {
         for s in &b.stmts {
             let r = match &s.kind {

@@ -8,7 +8,7 @@ import { LIMIT_SOURCES } from "./check.ts";
 import { errorMessage } from "./errors.ts";
 import { fitSize, GameClock } from "./frame.ts";
 import { alignTo, type GpuExecutor } from "./gpu.ts";
-import { InputRing, parseScript, type Scripted } from "./input.ts";
+import { eventsAt, InputRing, parseScript, type Scripted } from "./input.ts";
 import { browserIo, type Build, loadBuild, startProgram } from "./loader.ts";
 import { type Program, runWorker, type SpawnWorker } from "./program.ts";
 import type { FromWorker, ToWorker, VoiceOptions } from "./messages.ts";
@@ -209,7 +209,7 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
     const wait = start + (i * 1000) / fps - performance.now();
     if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
     executor.frame = i;
-    for (const s of script) if (s.frame === i) program.queueInput(s.event);
+    for (const e of eventsAt(script, i)) program.queueInput(e);
     latency.frames.push(performance.timeOrigin + performance.now());
     for (const sent of deliverInput(program)) latency.delivered.push({ sent, frame: i });
     const began = performance.now();

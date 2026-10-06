@@ -1360,6 +1360,12 @@ pub(super) fn host(
             fe.ins.extend([I::LocalGet(fe.v(args[0])), I::LocalGet(fe.v(args[1]))]);
             fe.ins.push(I::Call(helper));
         }
+        ir::HostOp::Tick => {
+            for &a in args {
+                fe.ins.push(I::LocalGet(fe.v(a)));
+            }
+            fe.ins.push(I::Call(fe.at.helpers.tick));
+        }
     }
     Ok(())
 }
@@ -1483,10 +1489,12 @@ pub(crate) fn panic_with(data: &[u32], msg: (ir::DataId, u32)) -> R<Vec<I<'stati
     let at = *data.get(d.index()).ok_or("internal: a missing message")?;
     let n = n.min(memory::PANIC_CAP);
     Ok(vec![
-        I::I32Const(memory::PANIC_MESSAGE as i32),
+        I::GlobalGet(globals::THREAD),
         I::I32Const(n as i32),
-        I::I32Store(mem(0, 2)),
-        I::I32Const(memory::PANIC_MESSAGE as i32 + 4),
+        I::I32Store(mem(memory::PANIC, 2)),
+        I::GlobalGet(globals::THREAD),
+        I::I32Const(memory::PANIC as i32 + 4),
+        I::I32Add,
         I::I32Const(at as i32),
         I::I32Const(n as i32),
         I::MemoryCopy { src_mem: 0, dst_mem: 0 },

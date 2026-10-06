@@ -1,0 +1,160 @@
+// The ticker (language.md §16): a fixed-rate step on a thread of its own. `start` moves a state,
+// a step and a hash to the ticker's thread (wrela_abi::memory's threads), where the host steps
+// the state `hz` times a second. Each tick gets its number, its length and the input events
+// the host stamped at its start (its records), and nothing else: no clock, and nothing that
+// depends on timing. So given the first state and every tick's records, every tick's state is
+// fixed, on any host (D-052). The host can ask for the state's hash after each step: to record
+// a tick log, or to check one.
+//
+// The host runs each tick through the thread entry `tick` (wrela_abi's `__tick`), with the
+// tick's records at `RECORDS`.
+
+use std::alloc::alloc
+use std::input::{Event, RawEvent, event_of}
+use std::mem::{align_of, load_u32, read, run_task, size_of, store_u32, task, write}
+
+// The ticker's words, and its records' region: copies of wrela_abi::memory's, which a test
+// there checks.
+const WANT_HASH: u32 = 512
+const HASH: u32 = 520
+const ORIGIN: u32 = 528
+const RECORDS: u32 = 1228800
+const MAX_RECORDS: u32 = 256
+
+/// One tick, as the step gets it.
+pub struct Ticked: Clone {
+    /// Its number, from 0.
+    pub tick: u32,
+    /// Its length, in seconds: 1 / hz.
+    pub dt: f32,
+    /// The input events the host stamped at its start, oldest first: at most 256 (the host
+    /// keeps the rest for the next tick).
+    pub records: Vec<Event>,
+}
+
+/// The ticker's state, its step and its hash, and its rate: what its thread owns.
+struct Ticker<S, F, H> {
+    state: S,
+    step: F,
+    hash: H,
+    hz: u32,
+}
+
+/// Starts the program's ticker: `state` moves to a thread of its own, where `step(mut state,
+/// ticked)` runs `hz` times a second, tick after tick. `step` and `hash` are functions, or
+/// closures that capture only values, since they move there too; both are `@deterministic`, so
+/// a tick's state is a function of the first state and the ticks' records. `hash` gives the
+/// state's hash, which the host asks for when it records the ticks (a tick log) or checks them.
+/// A program has one ticker: a second `start` panics.
+///
+/// ```wrela
+/// use std::tick::{Ticked, start}
+///
+/// /// A data logger: it samples a signal at 100 Hz and keeps a running mean, on its own thread,
+/// /// while the program's thread draws and answers its user.
+/// struct Logger: Clone {
+///     samples: u32,
+///     mean: f32,
+/// }
+///
+/// @deterministic
+/// fn sample(log: mut Logger, t: Ticked) {
+///     let x = sin(f32(t.tick) * t.dt * 6.2831855)   // the signal at this tick's time
+///     log.samples += 1
+///     log.mean += (x - log.mean) / f32(log.samples)
+/// }
+///
+/// @deterministic
+/// fn checksum(log: Logger) -> u64 {
+///     u64(log.samples) * 4294967296 + u64(bitcast_u32(log.mean))
+/// }
+///
+/// pub fn init() -> u32 {
+///     start(Logger { samples: 0, mean: 0.0 }, hz: 100, step: sample, hash: checksum)
+///     0
+/// }
+///
+/// pub fn frame(state: mut u32, time: f32, width: u32, height: u32) {}
+/// ```
+pub fn start<S, F: @deterministic fn(mut S, Ticked), H: @deterministic fn(S) -> u64>(
+    state: take S,
+    hz: u32,
+    step: F,
+    hash: H,
+) {
+    assert(hz > 0, "a ticker ticks at least once a second")
+    unsafe {
+        // The first state's hash, for a tick log's header: before the state moves.
+        if load_u32(WANT_HASH) != 0 {
+            report(hash(state))
+        }
+        let at = alloc(size_of::<Ticker<S, F, H>>(), align_of::<Ticker<S, F, H>>())
+        write(at, Ticker { state: take state, step, hash, hz })
+        start_ticker(task(run_tick::<S, F, H>), at, hz)
+    }
+}
+
+/// Makes task `task`, with the ticker at `ticker` as its context, the ticker thread's, `hz`
+/// times a second (`wrela.tick`). A second panics.
+@intrinsic
+@effects(io)
+pub(package) fn start_ticker(task: u32, ticker: u32, hz: u32) {}
+
+/// Leaves a state's hash where the host reads it.
+fn report(h: u64) {
+    unsafe {
+        store_u32(HASH, u32(h))
+        store_u32(HASH + 4, u32(h >> 32))
+    }
+}
+
+/// Tick `k`: the step, with the tick's records, then the state's hash if the host wants it.
+fn run_tick<S, F: @deterministic fn(mut S, Ticked), H: @deterministic fn(S) -> u64>(
+    k: u32,
+    t: mut Ticker<S, F, H>,
+) {
+    let ticked = Ticked { tick: k, dt: 1.0 / f32(t.hz), records: records() }
+    borrow step = t.step
+    step(mut t.state, ticked)
+    unsafe {
+        if load_u32(WANT_HASH) != 0 {
+            borrow hash = t.hash
+            report(hash(t.state))
+        }
+    }
+}
+
+/// The records of the tick about to run: the host wrote them.
+fn records() -> Vec<Event> {
+    unsafe {
+        let n = min(load_u32(RECORDS), MAX_RECORDS)
+        var out: Vec<Event> = Vec::with_capacity(n)
+        for i in 0..n {
+            if let Some(e) = event_of(read::<RawEvent>(RECORDS + 4 + 24 * i)) {
+                out.push(e)
+            }
+        }
+        out
+    }
+}
+
+/// The ticker thread's entry (wrela_abi's `__tick`): tick `k` of the ticker at `ticker`, whose
+/// task is `task`.
+@thread_entry
+pub(package) fn tick(thread: u32, task: u32, ticker: u32, k: u32) {
+    unsafe {
+        run_task(task, ticker, k)
+    }
+}
+
+/// The sim clock's origin: the frame time, in seconds, at which tick 0 was due, so tick `k` is
+/// due at `origin() + k / hz`. A frame uses it to place the newest tick in time. The host moves
+/// it forward when it drops ticks it couldn't run in time, or the page was hidden. It's
+/// `nondet` (§8): it depends on timing.
+@effects(nondet)
+pub fn origin() -> f64 {
+    unsafe {
+        let bits = u64(load_u32(ORIGIN)) | (u64(load_u32(ORIGIN + 4)) << 32)
+        bitcast_f64(bits)
+    }
+}

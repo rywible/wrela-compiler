@@ -142,7 +142,7 @@ pub enum Event: Copy + Eq + StateHash + Serialize {
 }
 
 /// An event as the host lays it out: its kind, its modifiers, then four words.
-struct RawEvent: Copy + Plain {
+pub(package) struct RawEvent: Copy + Plain {
     kind: u32,
     mods: u32,
     a: u32,
@@ -194,7 +194,7 @@ fn button_of(b: u32) -> Button {
 }
 
 /// An event from its layout; `None` for a kind this std doesn't know.
-fn event_of(r: RawEvent) -> Option<Event> {
+pub(package) fn event_of(r: RawEvent) -> Option<Event> {
     let at = vec2(bitcast_f32(r.a), bitcast_f32(r.b))
     let mods = mods_of(r.mods)
     match r.kind {
@@ -306,7 +306,8 @@ pub fn key_of(code: u32) -> Key {
 }
 
 /// What's held and where the pointer is, kept from the events a program reads: call `read` once
-/// per frame (or `update` with events from elsewhere, such as a replay), then ask.
+/// per frame, or `update` with events from elsewhere (a tick's records, `std::tick::Ticked`, or
+/// a replay), then ask.
 pub struct Input: Clone {
     /// This frame's events, oldest first.
     pub events: Vec<Event>,

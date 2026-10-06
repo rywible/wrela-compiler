@@ -920,6 +920,19 @@
   ],
   "input": [
     {
+      "at": [
+        "frame 0",
+        "frame 1",
+        "frame 1",
+        "frame 2",
+        "frame 3",
+        "frame 3",
+        "frame 3",
+        "frame 3",
+        "frame 4",
+        "frame 4",
+        "frame 4"
+      ],
       "events": [
         "0100000000000000000028410000a0410000000000000000",
         "0200000001000000000028410000a0410200000000000000",
@@ -932,19 +945,6 @@
         "070000000000000061000000000000000000000000000000",
         "0700000000000000e9000000000000000000000000000000",
         "0700000000000000ff000000000000000000000000000000"
-      ],
-      "frames": [
-        0,
-        1,
-        1,
-        2,
-        3,
-        3,
-        3,
-        3,
-        4,
-        4,
-        4
       ],
       "name": "every kind",
       "script": "[\n  {\"frame\": 0, \"type\": \"move\", \"x\": 10.5, \"y\": 20},\n  {\"frame\": 1, \"type\": \"down\", \"x\": 10.5, \"y\": 20, \"button\": \"secondary\", \"shift\": true},\n  {\"frame\": 1, \"type\": \"up\", \"x\": 11, \"y\": 21, \"alt\": true},\n  {\"frame\": 2, \"type\": \"wheel\", \"x\": 1, \"y\": 2, \"dx\": -3, \"dy\": 120.25},\n  {\"frame\": 3, \"type\": \"key\", \"key\": \"Tab\", \"ctrl\": true, \"meta\": true},\n  {\"frame\": 3, \"type\": \"keydown\", \"key\": \"KeyA\", \"repeat\": true},\n  {\"frame\": 3, \"type\": \"keyup\", \"key\": \"KeyA\"},\n  {\"frame\": 4, \"type\": \"text\", \"text\": \"aéÿ\"}\n]"
@@ -960,12 +960,12 @@
       "script": "[{"
     },
     {
-      "error": "event 0: `frame` must be a whole number",
+      "error": "event 0: `frame` (or `tick`) must be a whole number",
       "name": "no frame",
       "script": "[{\"type\": \"move\"}]"
     },
     {
-      "error": "event 0: `frame` must be a whole number",
+      "error": "event 0: `frame` (or `tick`) must be a whole number",
       "name": "a fractional frame",
       "script": "[{\"frame\": 1.5, \"type\": \"move\"}]"
     },
@@ -973,6 +973,32 @@
       "error": "event 1: frames don't decrease",
       "name": "frames that decrease",
       "script": "[{\"frame\": 2, \"type\": \"move\"}, {\"frame\": 1, \"type\": \"move\"}]"
+    },
+    {
+      "at": [
+        "tick 3",
+        "tick 3",
+        "frame 0",
+        "tick 3"
+      ],
+      "events": [
+        "050000000000000029000000000000000000000000000000",
+        "060000000000000029000000000000000000000000000000",
+        "010000000000000000000000000000000000000000000000",
+        "070000000000000071000000000000000000000000000000"
+      ],
+      "name": "ticks and frames",
+      "script": "[{\"tick\": 3, \"type\": \"key\", \"key\": \"Space\"}, {\"frame\": 0, \"type\": \"move\"}, {\"tick\": 3, \"type\": \"text\", \"text\": \"q\"}]"
+    },
+    {
+      "error": "event 1: ticks don't decrease",
+      "name": "ticks that decrease",
+      "script": "[{\"tick\": 2, \"type\": \"move\"}, {\"tick\": 1, \"type\": \"move\"}]"
+    },
+    {
+      "error": "event 0: an event has a `frame` or a `tick`, not both",
+      "name": "a frame and a tick",
+      "script": "[{\"frame\": 2, \"tick\": 1, \"type\": \"move\"}]"
     },
     {
       "error": "event 0: `jump` isn't a type (move, down, up, wheel, keydown, keyup, key or text)",
@@ -1476,6 +1502,27 @@
         "message": "ReadBuffer out of sequence: only draws can happen inside a pass"
       },
       "name": "a readback in a pass"
+    }
+  ],
+  "tick_logs": [
+    {
+      "bytes": "5752544c01000000f2f258fb7e30a62e3c00000000000000080706050403020100000000000000001032547698badcfe01000000020000000500000000000000290000000000000000000000000000000700000000000000770000000000000000000000000000000100000000000000",
+      "first": "0102030405060708",
+      "hz": 60,
+      "ticks": [
+        {
+          "hash": "fedcba9876543210",
+          "records": []
+        },
+        {
+          "hash": "0000000000000001",
+          "records": [
+            "050000000000000029000000000000000000000000000000",
+            "070000000000000077000000000000000000000000000000"
+          ]
+        }
+      ],
+      "wasm_hash": "2ea6307efb58f2f2"
     }
   ]
 }

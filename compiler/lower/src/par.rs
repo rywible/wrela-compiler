@@ -5,7 +5,7 @@
 //! chunk function's other arguments as its instance takes them (values, or a place's address,
 //! with a closure argument's captures in its place); it's on this thread's stack, in the memory
 //! the workers share, and `run_chunks` returns only when every chunk is done, so it outlives
-//! the job. The first job also gives the module its worker loop, which it exports as `__worker`.
+//! the job. The helpers that run the other chunks enter through std's `@thread_entry` worker.
 
 use crate::body::{Fl, Repr};
 use crate::instance::InstanceKey;
@@ -31,9 +31,7 @@ pub(crate) fn par_job(
         Lang::ParEach => Lang::ParEachChunk,
         _ => Lang::ParMapReduceChunk,
     });
-    let (Some(chunk_fn), Some(run), Some(worker)) =
-        (chunk_fn, program.lang_fn(Lang::RunChunks), program.lang_fn(Lang::WorkerLoop))
-    else {
+    let (Some(chunk_fn), Some(run)) = (chunk_fn, program.lang_fn(Lang::RunChunks)) else {
         fl.cx.err(Diagnostic::internal("std::par's scheduler is missing"));
         return None;
     };
@@ -122,11 +120,6 @@ pub(crate) fn par_job(
         }
         args
     });
-    // The workers' loop, which the module then exports.
-    if fl.mb.m.worker.is_none() {
-        let w = fl.cx.instance(fl.mb, InstanceKey::plain(worker, Vec::new()), Some((fl.id, span)));
-        fl.mb.m.worker = Some(w);
-    }
     let rc = fl.cx.instance(fl.mb, InstanceKey::plain(run, Vec::new()), Some((fl.id, span)));
     let n = fl.arg_value(c.args.first()?)?;
     let kv = fl.u32c(k);

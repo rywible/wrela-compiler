@@ -39,11 +39,22 @@ export function keyEvent(down: boolean, key: number, repeat: boolean, modifiers:
 
 export const textEvent = (codepoint: number) => encodeEvent(EventKind.Text, 0, codepoint, 0, 0, 0);
 
-/** A script's event and the frame it arrives before. */
+/** When a script's event arrives: before a frame, or as a tick's record (runtime/abi `input`). */
+export type At = { frame: number } | { tick: number };
+
+/** A script's event and when it arrives. */
 export interface Scripted {
-  frame: number;
+  at: At;
   event: Uint8Array;
 }
+
+/** The events of `script` that arrive before frame `frame`. */
+export const eventsAt = (script: Scripted[], frame: number) =>
+  script.filter((s) => "frame" in s.at && s.at.frame === frame).map((s) => s.event);
+
+/** The events of `script` that are tick `tick`'s records. */
+export const recordsAt = (script: Scripted[], tick: number) =>
+  script.filter((s) => "tick" in s.at && s.at.tick === tick).map((s) => s.event);
 
 /** Reads a script (runtime/abi `input`'s format), with the Rust parser's messages. */
 export function parseScript(text: string): Scripted[] {
@@ -55,17 +66,29 @@ export function parseScript(text: string): Scripted[] {
   }
   if (!Array.isArray(value)) throw new Error("a script is a JSON array of events");
   const out: Scripted[] = [];
-  let last = 0;
+  let lastFrame = 0;
+  let lastTick = 0;
   value.forEach((item: unknown, i: number) => {
     const at = (why: string) => new Error(`event ${i}: ${why}`);
     if (typeof item !== "object" || item === null || Array.isArray(item)) throw at("an event is a JSON object");
     const o = item as Record<string, unknown>;
-    const frame = o.frame;
-    if (typeof frame !== "number" || !Number.isInteger(frame) || frame < 0 || frame > 0xffffffff) {
-      throw at("`frame` must be a whole number");
+    const whole = (v: unknown) => typeof v === "number" && Number.isInteger(v) && v >= 0 && v <= 0xffffffff;
+    let when: At;
+    if (o.frame !== undefined && o.tick !== undefined) {
+      throw at(whole(o.frame) && whole(o.tick) ? "an event has a `frame` or a `tick`, not both" : "`frame` (or `tick`) must be a whole number");
+    } else if (o.frame !== undefined && whole(o.frame)) {
+      const frame = o.frame as number;
+      if (frame < lastFrame) throw at("frames don't decrease");
+      lastFrame = frame;
+      when = { frame };
+    } else if (o.tick !== undefined && whole(o.tick)) {
+      const tick = o.tick as number;
+      if (tick < lastTick) throw at("ticks don't decrease");
+      lastTick = tick;
+      when = { tick };
+    } else {
+      throw at("`frame` (or `tick`) must be a whole number");
     }
-    if (frame < last) throw at("frames don't decrease");
-    last = frame;
     const num = (key: string) => {
       const v = o[key];
       if (v === undefined) return 0;
@@ -98,7 +121,7 @@ export function parseScript(text: string): Scripted[] {
       if (k === 0) throw at(`\`${name}\` isn't a key (they're DOM codes, such as KeyA)`);
       return k;
     };
-    const push = (event: Uint8Array) => out.push({ frame, event });
+    const push = (event: Uint8Array) => out.push({ at: when, event });
     switch (type) {
       case "move":
         push(pointerEvent(EventKind.PointerMove, num("x"), num("y"), 0, modifiers));
@@ -149,33 +172,40 @@ export function modifiersOf(e: { shiftKey: boolean; ctrlKey: boolean; altKey: bo
 export const buttonOf = (button: number) => (button === 1 ? 1 : button === 2 ? 2 : 0);
 
 /**
- * A single-writer, single-reader ring of events in a SharedArrayBuffer: the main thread writes,
- * the render worker reads. Word 0 is how many events have been written, word 1 how many read;
- * then CAPACITY events, each with the writer's clock (a float64, ms since the time origin)
- * after it. A full ring drops what's written (a frame that long gone needs no more pointer moves).
+ * A single-writer ring of events in a SharedArrayBuffer, with two readers: the main thread
+ * writes; the render worker's frames read them for the program's `std::input::events()`, and the
+ * ticker's thread stamps them into its ticks' records (#43 §2.2). Words: how many events have
+ * been written, how many the frames have read, how many the ticker has read, and whether the
+ * ticker reads; then CAPACITY events, each with the writer's clock (a float64, ms since the time
+ * origin) after it.
+ * - The writer drops an event only when the ticker's reader is a full ring behind (or, with no
+ *   ticker, the frames' reader): what the ticker reads is the sim's input, which is never lost.
+ * - With a ticker, the frames' reader, a full ring behind, skips ahead: a UI loses events, the
+ *   sim never does.
  */
 export class InputRing {
   static readonly CAPACITY = 1024;
   static readonly SLOT = EVENT_SIZE + 8;
+  static readonly HEADER = 16;
   readonly #counts: Int32Array;
   readonly #bytes: Uint8Array;
   readonly #view: DataView;
 
   constructor(readonly buffer: SharedArrayBuffer) {
-    this.#counts = new Int32Array(buffer, 0, 2);
-    this.#bytes = new Uint8Array(buffer, 8);
-    this.#view = new DataView(buffer, 8);
+    this.#counts = new Int32Array(buffer, 0, 4);
+    this.#bytes = new Uint8Array(buffer, InputRing.HEADER);
+    this.#view = new DataView(buffer, InputRing.HEADER);
   }
 
   static create(): InputRing {
-    return new InputRing(new SharedArrayBuffer(8 + InputRing.CAPACITY * InputRing.SLOT));
+    return new InputRing(new SharedArrayBuffer(InputRing.HEADER + InputRing.CAPACITY * InputRing.SLOT));
   }
 
   /** Writes an event, stamped with `time` (performance.timeOrigin + performance.now()). */
   write(event: Uint8Array, time: number): boolean {
     const written = Atomics.load(this.#counts, 0);
-    const read = Atomics.load(this.#counts, 1);
-    if (written - read >= InputRing.CAPACITY) return false;
+    const slowest = Atomics.load(this.#counts, 3) !== 0 ? Atomics.load(this.#counts, 2) : Atomics.load(this.#counts, 1);
+    if (written - slowest >= InputRing.CAPACITY) return false;
     const at = (written % InputRing.CAPACITY) * InputRing.SLOT;
     this.#bytes.set(event, at);
     this.#view.setFloat64(at + EVENT_SIZE, time, true);
@@ -183,11 +213,31 @@ export class InputRing {
     return true;
   }
 
-  /** Every event written so far and not yet read, oldest first, each with its time. */
+  /** The ticker reads from now on: the writer keeps what it hasn't read. */
+  attachTicker(): void {
+    Atomics.store(this.#counts, 2, Atomics.load(this.#counts, 0));
+    Atomics.store(this.#counts, 3, 1);
+  }
+
+  /** Every event written and not yet read by the frames, oldest first, each with its time. A
+   * reader that's fallen a full ring behind skips the events written over. */
   read(): { events: Uint8Array; times: number[] } {
+    return this.#read(1, true);
+  }
+
+  /** Every event written and not yet read by the ticker, at most `cap`, oldest first, each with
+   * its time; the rest wait for the next read. */
+  readTicker(cap: number): { events: Uint8Array; times: number[] } {
+    return this.#read(2, false, cap);
+  }
+
+  #read(reader: number, skip: boolean, cap = Infinity): { events: Uint8Array; times: number[] } {
     const written = Atomics.load(this.#counts, 0);
-    const read = Atomics.load(this.#counts, 1);
-    const n = written - read;
+    let read = Atomics.load(this.#counts, reader);
+    // A margin, so the slot the writer fills next isn't one this reads.
+    const room = InputRing.CAPACITY - 64;
+    if (skip && Atomics.load(this.#counts, 3) !== 0 && written - read > room) read = written - room;
+    const n = Math.min(written - read, cap);
     const events = new Uint8Array(n * EVENT_SIZE);
     const times: number[] = [];
     for (let i = 0; i < n; i++) {
@@ -195,7 +245,7 @@ export class InputRing {
       events.set(this.#bytes.subarray(at, at + EVENT_SIZE), i * EVENT_SIZE);
       times.push(this.#view.getFloat64(at + EVENT_SIZE, true));
     }
-    Atomics.store(this.#counts, 1, written);
+    Atomics.store(this.#counts, reader, read + n);
     return { events, times };
   }
 }

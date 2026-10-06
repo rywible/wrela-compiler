@@ -1,0 +1,5 @@
+[
+  { "tick": 3, "type": "key", "key": "Space" },
+  { "tick": 10, "type": "keydown", "key": "KeyA" },
+  { "tick": 10, "type": "keydown", "key": "KeyB" }
+]

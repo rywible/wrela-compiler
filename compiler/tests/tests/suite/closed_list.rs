@@ -71,4 +71,34 @@ fn unsafe_is_only_in_the_listed_core() {
     // `std::mem` declares the raw operations, which only `unsafe` code may call.
     using.insert("mem".into());
     assert_eq!(using, listed, "§17's unsafe core and the std files that use `unsafe`");
+    let compiler: BTreeSet<String> =
+        wrela_sema::defs::UNSAFE_CORE.iter().map(|m| m.to_string()).collect();
+    assert_eq!(compiler, listed, "§17's unsafe core and the compiler's (`UNSAFE_CORE`)");
+}
+
+/// `@effects` and `@thread_entry` are the unsafe core's alone (§17): only its files use them,
+/// and the compiler rejects them in a program (and in any other std module) with E0204.
+#[test]
+fn only_the_core_states_effects_and_thread_entries() {
+    let core = wrela_sema::defs::UNSAFE_CORE;
+    let mut entries = 0;
+    for (path, text) in wrela_driver::STD_SOURCES {
+        let module = path.strip_prefix("std::").expect("std::");
+        let uses = text.lines().any(|l| {
+            let l = l.trim_start();
+            l.starts_with("@effects") || l.starts_with("@thread_entry")
+        });
+        if uses {
+            assert!(core.contains(&module), "std::{module} uses `@effects` or `@thread_entry`");
+        }
+        entries += text.lines().filter(|l| l.trim_start().starts_with("@thread_entry")).count();
+    }
+    assert_eq!(entries, 3, "std's thread entries: the helpers', the voice's and the ticker's");
+    let dir = crate::package(
+        "closed_list_attrs",
+        "@effects(nondet)\nfn now() -> u32 {\n    0\n}\n\n@thread_entry\nfn run(thread: u32) {}\n\npub fn frame(time: f32, width: u32, height: u32) {\n    let _ = now()\n}\n",
+    );
+    let out = wrela_driver::check(&dir);
+    let codes: Vec<&str> = out.diagnostics.iter().map(|d| d.code.as_str()).collect();
+    assert_eq!(codes, ["E0204", "E0204"], "{:#?}", out.diagnostics);
 }

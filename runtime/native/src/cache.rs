@@ -18,24 +18,32 @@ use wasmtime::{Engine, Module};
 
 /// The name of the compiled code of `wasm` in a build's `.native` directory.
 pub fn compiled_code_name(wasm: &[u8]) -> String {
-    let mut hash = wrela_abi::hash::StateHash::new();
-    hash.update(wasm);
-    format!("game-{}.cwasm", hash.hex())
+    format!("{}.cwasm", stem(wasm))
 }
 
-/// Where the compiled code of `wasm` goes for the build in `dir`.
-fn path(dir: &Path, wasm: &[u8]) -> PathBuf {
-    dir.join(".native").join(compiled_code_name(wasm))
+/// The start of the names of `wasm`'s compiled code: `game-` and the WASM's hash.
+fn stem(wasm: &[u8]) -> String {
+    let mut hash = wrela_abi::hash::StateHash::new();
+    hash.update(wasm);
+    format!("game-{}", hash.hex())
+}
+
+/// Where the compiled code of `wasm` goes for the build in `dir`: code that counts fuel (for
+/// tests) is another file.
+fn path(dir: &Path, wasm: &[u8], fuel: bool) -> PathBuf {
+    let name = if fuel { format!("{}-fuel.cwasm", stem(wasm)) } else { compiled_code_name(wasm) };
+    dir.join(".native").join(name)
 }
 
 /// Removes the compiled code of every other WASM from the directory `keep` is in: a build has
 /// one WASM, and the code of the ones it had before is never read again.
-fn remove_others(keep: &Path) {
+fn remove_others(keep: &Path, wasm: &[u8]) {
     let Some(dir) = keep.parent() else { return };
+    let stem = stem(wasm);
     for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
         let name = e.file_name();
         let name = name.to_string_lossy();
-        if e.path() != keep && name.starts_with("game-") && name.ends_with(".cwasm") {
+        if !name.starts_with(&stem) && name.starts_with("game-") && name.ends_with(".cwasm") {
             let _ = std::fs::remove_file(e.path());
         }
     }
@@ -45,7 +53,7 @@ fn remove_others(keep: &Path) {
 /// left it there, else compiled, and written there (best effort: a build in a read-only place
 /// still loads).
 pub(crate) fn module(engine: &Engine, wasm: &[u8], dir: &Path) -> Result<Module> {
-    let file = path(dir, wasm);
+    let file = path(dir, wasm, engine.get_consume_fuel());
     if file.is_file() {
         // SAFETY: the file is what `Module::serialize` wrote for this WASM (see the module's
         // documentation); wasmtime refuses code from another version or configuration, and then
@@ -64,7 +72,7 @@ pub(crate) fn module(engine: &Engine, wasm: &[u8], dir: &Path) -> Result<Module>
             && std::fs::write(&tmp, bytes).is_ok()
             && std::fs::rename(&tmp, &file).is_ok();
         if written {
-            remove_others(&file);
+            remove_others(&file, wasm);
         } else {
             let _ = std::fs::remove_file(&tmp);
         }

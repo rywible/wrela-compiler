@@ -11,7 +11,6 @@
 //!   CPU-only types; derivatives only exist in fragment shaders. These are found while lowering
 //!   each GPU pipeline and reported with the call chain.
 
-mod audio;
 mod body;
 mod consts;
 mod derive;
@@ -22,6 +21,7 @@ mod instance;
 mod lift;
 mod mem;
 mod par;
+mod task;
 mod ty;
 
 pub use eval::{
@@ -186,6 +186,52 @@ fn on_gpu_in(p: &Program, t: TyId, known: &mut HashMap<TyId, bool>) -> bool {
     ok
 }
 
+/// std's thread entries (`@thread_entry`) the program uses: each one whose module the program
+/// uses, by any of the module's other functions (std's `std::par` for the helpers' `worker`,
+/// `std::audio` for `audio`, `std::tick` for `tick`). Each is lowered and exported as `__` and
+/// its name (wrela_abi `memory`'s threads).
+fn thread_entries(cx: &mut Cx, cpu: &mut ModuleBuilder) {
+    let p = &cx.checked.program;
+    let entries: Vec<(FnId, String, wrela_sema::ty::ModuleId)> = (0..p.fns.len() as u32)
+        .map(FnId)
+        .filter(|f| p.func(*f).attrs.thread_entry.is_some() && cx.checked.mir.contains_key(f))
+        .map(|f| (f, p.func(f).name.clone(), p.func(f).module))
+        .collect();
+    let mut done = Vec::new();
+    loop {
+        let mut added = false;
+        for (e, name, module) in &entries {
+            if done.contains(e) {
+                continue;
+            }
+            let p = &cx.checked.program;
+            let used = cpu
+                .instances
+                .keys()
+                .filter_map(InstanceKey::source_fn)
+                .any(|f| f != *e && p.func(f).module == *module);
+            if !used {
+                continue;
+            }
+            let def = p.func(*e);
+            let u32s = def.params.iter().all(|ps| ps.ty == p.types.u32);
+            if def.params.is_empty() || !u32s || !p.types.is_unit(def.ret) {
+                cx.err(Diagnostic::internal(format!(
+                    "the thread entry `{name}` must take `u32`s (the thread's number first) and return nothing"
+                )));
+            }
+            let id = cx.instance(cpu, InstanceKey::plain(*e, Vec::new()), None);
+            cpu.m.thread_entries.push((name.clone(), id));
+            done.push(*e);
+            added = true;
+        }
+        if !added {
+            break;
+        }
+        cx.drain(cpu);
+    }
+}
+
 /// What a debug build's NaN check panics with (§11).
 pub(crate) const NAN_MESSAGE: &str = "debug build: a float operation created a NaN";
 
@@ -344,6 +390,7 @@ pub fn lower(
     cx.drain(&mut cpu);
     rewrite_cpu_math(&mut cx, &mut cpu);
     cx.drain(&mut cpu);
+    thread_entries(&mut cx, &mut cpu);
     mark_counted(&mut cx, &mut cpu);
     if data.debug {
         // Checked where floats are computed, by the back end.

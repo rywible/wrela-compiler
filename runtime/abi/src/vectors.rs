@@ -1006,6 +1006,12 @@ fn input_scripts() -> Value {
         ("no frame", r#"[{"type": "move"}]"#),
         ("a fractional frame", r#"[{"frame": 1.5, "type": "move"}]"#),
         ("frames that decrease", r#"[{"frame": 2, "type": "move"}, {"frame": 1, "type": "move"}]"#),
+        (
+            "ticks and frames",
+            r#"[{"tick": 3, "type": "key", "key": "Space"}, {"frame": 0, "type": "move"}, {"tick": 3, "type": "text", "text": "q"}]"#,
+        ),
+        ("ticks that decrease", r#"[{"tick": 2, "type": "move"}, {"tick": 1, "type": "move"}]"#),
+        ("a frame and a tick", r#"[{"frame": 2, "tick": 1, "type": "move"}]"#),
         ("an unknown type", r#"[{"frame": 0, "type": "jump"}]"#),
         ("an unknown key", r#"[{"frame": 0, "type": "key", "key": "A"}]"#),
         ("an unknown button", r#"[{"frame": 0, "type": "down", "button": "left"}]"#),
@@ -1019,12 +1025,38 @@ fn input_scripts() -> Value {
             Ok(events) => json!({
                 "name": name,
                 "script": text,
-                "frames": events.iter().map(|e| e.frame).collect::<Vec<_>>(),
+                "at": events
+                    .iter()
+                    .map(|e| match e.at {
+                        crate::input::At::Frame(n) => format!("frame {n}"),
+                        crate::input::At::Tick(n) => format!("tick {n}"),
+                    })
+                    .collect::<Vec<_>>(),
                 "events": events.iter().map(|e| hex(&e.event.bytes())).collect::<Vec<_>>(),
             }),
             Err(e) => json!({ "name": name, "script": text, "error": e }),
         })
         .collect()
+}
+
+/// A tick log's bytes (runtime/abi `ticks`), which the browser runtime's writer must give too.
+fn tick_logs() -> Value {
+    use crate::input::Event;
+    use crate::ticks::{Tick, TickLog};
+    let mut log = TickLog::new(crate::ticks::wasm_hash(b"\0asm"), 60, 0x0102_0304_0506_0708);
+    log.ticks.push(Tick { records: Vec::new(), hash: 0xfedc_ba98_7654_3210 });
+    log.ticks.push(Tick {
+        records: vec![Event::key(true, 41, false, 0).bytes(), Event::text('w').bytes()],
+        hash: 1,
+    });
+    let records = |t: &Tick| t.records.iter().map(|r| hex(r)).collect::<Vec<_>>();
+    json!([{
+        "wasm_hash": format!("{:016x}", log.wasm_hash),
+        "hz": log.hz,
+        "first": format!("{:016x}", log.first),
+        "ticks": log.ticks.iter().map(|t| json!({ "records": records(t), "hash": format!("{:016x}", t.hash) })).collect::<Vec<_>>(),
+        "bytes": hex(&log.encode()),
+    }])
 }
 
 /// Every vector, as `runtime/abi/vectors.json` holds them.
@@ -1039,6 +1071,7 @@ pub fn vectors() -> String {
         "manifests": manifests(),
         "lines": line_tables(),
         "input": input_scripts(),
+        "tick_logs": tick_logs(),
     });
     let mut s = serde_json::to_string_pretty(&v).expect("vectors serialize");
     s.push('\n');

@@ -302,7 +302,7 @@ fn run_tests(root: &Path, filter: Option<&str>, kind: PackageKind) -> TestOutput
         filtered_out = all - tests.len();
         // Tests of code run as constants are computed; frame tests run the program first.
         let (framed, plain): (Vec<_>, Vec<_>) =
-            tests.iter().partition(|&&f| p.func(f).attrs.test_frames.is_some());
+            tests.iter().partition(|&&f| p.func(f).attrs.runs_program());
         let mut ran = Vec::new();
         if !plain.is_empty() {
             let (r, d) = consts::run_tests(&checked, &sources, &data, &plain);

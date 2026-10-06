@@ -26,9 +26,12 @@
 //!   `wrela.request_status(request: i32) -> i32` and `wrela.request_take(request: i32, ptr: i32)`,
 //!   which answer the requests its batches make, `wrela.limit(index: i32) -> i32`, which
 //!   gives one of the GPU's limits ([`Limits`]), `wrela.audio(task: i32, context: i32)`,
-//!   which starts the program's voice ([`IMPORT_AUDIO`]), and `wrela.input(ptr: i32, cap: i32)
+//!   which starts the program's voice ([`IMPORT_AUDIO`]), `wrela.tick(task: i32, context: i32,
+//!   hz: i32)`, which starts its ticker ([`IMPORT_TICK`]), and `wrela.input(ptr: i32, cap: i32)
 //!   -> i32`, which gives it the pointer and keyboard events that have arrived ([`input`]);
 //! - imports its memory, shared, as `wrela.memory` ([`memory`]);
+//! - may export thread entries (`__worker`, `__audio`, `__tick`), which a host calls on the
+//!   program's other threads ([`memory`]'s threads);
 //! - may have a start function, which runs as each instance starts and may not call the host:
 //!   the compiler's copies the program's constants into the memory, once however many instances
 //!   share it ([`memory::DATA_READY`]).
@@ -49,6 +52,7 @@ pub mod lines;
 pub mod manifest;
 pub mod memory;
 pub mod stream;
+pub mod ticks;
 pub mod typescript;
 pub mod vectors;
 
@@ -68,14 +72,22 @@ pub const IMPORT_LIMIT: &str = "limit";
 /// `wrela.audio(task, context)`: starts the program's voice, which the audio thread renders by
 /// calling [`EXPORT_AUDIO`] with the same two numbers (language.md §6.13). Once per program.
 pub const IMPORT_AUDIO: &str = "audio";
+/// `wrela.tick(task, context, hz)`: starts the program's ticker, which the ticker's thread
+/// steps `hz` times a second by calling [`EXPORT_TICK`] with the two numbers and the tick's
+/// (language.md's `std::tick`). Once per program: a second is a panic.
+pub const IMPORT_TICK: &str = "tick";
 /// The memory, which the module imports, shared (`memory`), and also exports.
 pub const IMPORT_MEMORY: &str = "memory";
-/// The export a worker thread calls (`memory`'s docs: workers).
+/// `__worker(thread)`: a helper's thread entry (`memory`'s threads and helpers).
 pub const EXPORT_WORKER: &str = "__worker";
-/// `__audio(task, context)`: renders one quantum of the voice `wrela.audio` started, at
-/// [`memory::AUDIO_OUT`], on the audio thread's own stack. The audio thread calls it on its own
-/// instance of the module, with the same memory.
+/// `__audio(thread, task, context)`: renders one quantum of the voice `wrela.audio` started, at
+/// [`memory::AUDIO_OUT`], on the audio thread ([`memory::THREAD_AUDIO`]), on its own instance
+/// of the module, with the same memory.
 pub const EXPORT_AUDIO: &str = "__audio";
+/// `__tick(thread, task, context, tick)`: runs tick `tick` of the ticker `wrela.tick` started,
+/// with the records at [`memory::TICK_RECORDS`], on the ticker's thread
+/// ([`memory::THREAD_TICK`]), on its own instance of the module, with the same memory.
+pub const EXPORT_TICK: &str = "__tick";
 /// The audio thread's sample rate, in hertz, and how many samples one `__audio` call renders
 /// (a Web Audio render quantum). Both hosts render at this rate; the browser resamples to the
 /// device's.
@@ -103,13 +115,14 @@ impl HostFunction {
 }
 
 /// Every function a program may import besides its memory ([`IMPORT_MEMORY`]).
-pub const HOST_FUNCTIONS: [HostFunction; 6] = [
+pub const HOST_FUNCTIONS: [HostFunction; 7] = [
     HostFunction { name: IMPORT_SUBMIT, params: 2, results: 0 },
     HostFunction { name: IMPORT_REQUEST_STATUS, params: 1, results: 1 },
     HostFunction { name: IMPORT_REQUEST_TAKE, params: 2, results: 0 },
     HostFunction { name: IMPORT_LIMIT, params: 1, results: 1 },
     HostFunction { name: IMPORT_AUDIO, params: 2, results: 0 },
     HostFunction { name: IMPORT_INPUT, params: 2, results: 1 },
+    HostFunction { name: IMPORT_TICK, params: 3, results: 0 },
 ];
 
 /// The export the host calls each frame.
@@ -212,15 +225,38 @@ mod tests {
         for (file, name, value) in [
             ("alloc.wrela", "STATE", ALLOC_STATE),
             ("alloc.wrela", "BUMP", ALLOC_STATE),
-            ("par.wrela", "GENERATION", WORKERS_GENERATION),
-            ("par.wrela", "DONE", WORKERS_DONE),
-            ("par.wrela", "FAILED", WORKERS_FAILED),
-            ("par.wrela", "SHUTDOWN", WORKERS_SHUTDOWN),
-            ("par.wrela", "HELPED", WORKERS_HELPED),
-            ("par.wrela", "DONE_FAILED", WORKERS_DONE_FAILED),
+            ("alloc.wrela", "ALLOCATIONS", ALLOCATIONS),
+            ("mem.wrela", "THREAD_BLOCKS", THREAD_BLOCKS),
+            ("mem.wrela", "THREAD_BLOCK_SIZE", THREAD_BLOCK_SIZE),
+            ("mem.wrela", "PANIC", PANIC),
+            ("par.wrela", "WAKE", PAR_WAKE),
+            ("par.wrela", "SHUTDOWN", PAR_SHUTDOWN),
+            ("par.wrela", "HELPED", PAR_HELPED),
+            ("par.wrela", "HOLD", PAR_HOLD),
+            ("par.wrela", "THREADS", THREADS),
+            ("par.wrela", "GENERATION", JOB_GENERATION),
+            ("par.wrela", "TICKET", JOB_TICKET),
+            ("par.wrela", "TASK", JOB_TASK),
+            ("par.wrela", "CONTEXT", JOB_CONTEXT),
+            ("par.wrela", "CHUNKS", JOB_CHUNKS),
+            ("par.wrela", "DONE", JOB_DONE),
+            ("par.wrela", "FAILED", JOB_FAILED),
+            ("par.wrela", "DONE_FAILED", JOB_DONE_FAILED),
+            ("par.wrela", "DEPTH", DEPTH),
+            ("par.wrela", "RUNNING", RUNNING),
+            ("par.wrela", "SLOTS", JOB_SLOTS),
+            ("par.wrela", "SLOT_COUNT", JOB_SLOT_COUNT),
+            ("par.wrela", "SLOT_SIZE", JOB_SLOT_SIZE),
+            ("par.wrela", "SLOT_THREAD", SLOT_THREAD),
+            ("par.wrela", "FAILED_JOB", SLOT_FAILED),
             ("audio.wrela", "OUT", AUDIO_OUT),
             ("audio.wrela", "SAMPLE_RATE", crate::AUDIO_SAMPLE_RATE),
             ("audio.wrela", "QUANTUM", crate::AUDIO_QUANTUM),
+            ("tick.wrela", "WANT_HASH", TICK_WANT_HASH),
+            ("tick.wrela", "HASH", TICK_HASH),
+            ("tick.wrela", "ORIGIN", TICK_ORIGIN),
+            ("tick.wrela", "RECORDS", TICK_RECORDS),
+            ("tick.wrela", "MAX_RECORDS", MAX_TICK_RECORDS),
         ] {
             let text = std::fs::read_to_string(std.join(file)).unwrap();
             let decl = format!("const {name}: u32 = ");

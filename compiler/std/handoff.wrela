@@ -1,0 +1,183 @@
+// Hand-offs (language.md §16): the latest value from one thread to another. One thread
+// publishes whole values; another reads the newest complete one. Neither waits, and a value is
+// never read half-written. It's a triple buffer: three slots, of which the publisher owns one
+// (its back), the reader one (its front), and the third (the middle) holds the newest complete
+// value. One atomic word holds the middle slot's index, and a bit that says whether the reader
+// has seen it. Publishing writes the back slot, then swaps it with the middle; reading swaps
+// the front with the middle when the bit says there's something new. Two slots wouldn't do:
+// one side would have to wait or retry.
+//
+// The value is `Plain`, so it's a copy of bytes: nothing in a slot points into the
+// publisher's heap. In a debug build (and so a test), each slot also carries how many values
+// the publisher had published when it wrote it, and a checksum of its bytes, which reading
+// checks: a value read torn, or older than one read before, panics.
+
+use std::alloc::alloc
+use std::mem::{
+    at, atomic_load, compare_swap, copy, debug_build, load_u32, load_u8, size_of, store_u32, write,
+}
+
+/// The bit of the middle word that says the reader hasn't seen the middle slot's value.
+const NEW: u32 = 4
+
+/// A slot's header: the publish number, then the checksum; the value is after it.
+const HEADER: u32 = 16
+
+/// The end of a hand-off that publishes.
+pub struct Publisher<T: Plain> {
+    block: u32,
+    slot_size: u32,
+    back: u32,
+    published: u32,
+}
+
+/// The end of a hand-off that reads the latest value.
+pub struct Latest<T: Plain> {
+    block: u32,
+    slot_size: u32,
+    front: u32,
+    /// The front slot's value's address.
+    value: u32,
+    seen: u32,
+}
+
+/// A hand-off of `T`s from one thread to another, whose value starts as `initial`: one end
+/// publishes, the other reads the newest. Give each end to the thread that uses it; neither
+/// can be copied. Its memory is never freed: make hand-offs once, at startup.
+///
+/// ```wrela
+/// use std::handoff::{Latest, handoff}
+/// use std::tick::{Ticked, start}
+///
+/// /// A sensor's reading, as its thread publishes it to the program's UI.
+/// struct Reading: Copy + Plain {
+///     sample: u32,
+///     celsius: f32,
+/// }
+///
+/// struct Sensor {
+///     out: std::handoff::Publisher<Reading>,
+///     sample: u32,
+/// }
+///
+/// @deterministic
+/// fn measure(s: mut Sensor, t: Ticked) {
+///     s.sample += 1
+///     s.out.publish(Reading { sample: s.sample, celsius: 20.0 + 0.1 * f32(s.sample % 7) })
+/// }
+///
+/// @deterministic
+/// fn count(s: Sensor) -> u64 {
+///     u64(s.sample)
+/// }
+///
+/// pub fn init() -> Latest<Reading> {
+///     let (out, latest) = handoff(Reading { sample: 0, celsius: 0.0 })
+///     start(Sensor { out: take out, sample: 0 }, hz: 10, step: measure, hash: count)
+///     latest
+/// }
+///
+/// pub fn frame(state: mut Latest<Reading>, time: f32, width: u32, height: u32) {
+///     borrow r = state.read()   // the newest reading: never half-written, never waits
+///     if r.sample % 100 == 1 {
+///         std::io::print(f"{r.celsius:.1} °C")
+///     }
+/// }
+/// ```
+pub fn handoff<T: Plain>(initial: take T) -> (Publisher<T>, Latest<T>) {
+    let n = size_of::<T>()
+    let slot_size = (HEADER + n + 15) / 16 * 16
+    unsafe {
+        let block = alloc(16 + 3 * slot_size, 16)
+        // Every slot holds `initial` (a value's bytes are all of it), and the middle slot is
+        // 2, seen.
+        write(block + 16 + HEADER, take initial)
+        for i in 1..3 {
+            copy(block + 16 + i * slot_size + HEADER, block + 16 + HEADER, n)
+        }
+        let sum = checksum(block + 16 + HEADER, n)
+        for i in 0..3 {
+            store_u32(block + 16 + i * slot_size, 0)
+            store_u32(block + 16 + i * slot_size + 4, sum)
+        }
+        store_u32(block, 2)
+        (
+            Publisher { block, slot_size, back: 0, published: 0 },
+            Latest { block, slot_size, front: 1, value: block + 16 + slot_size + HEADER, seen: 0 },
+        )
+    }
+}
+
+/// FNV-1a 32 of `n` bytes at `addr`.
+fn checksum(addr: u32, n: u32) -> u32 {
+    var h: u32 = 2166136261
+    unsafe {
+        for i in 0..n {
+            h = (h ^ u32(load_u8(addr + i))).wrapping_mul(16777619)
+        }
+    }
+    h
+}
+
+impl<T: Plain> Publisher<T> {
+    /// Makes `value` the newest: it never waits for the reader.
+    pub fn publish(mut self, value: take T) {
+        unsafe {
+            let slot = self.block + 16 + self.back * self.slot_size
+            write(slot + HEADER, take value)
+            if debug_build() {
+                self.published += 1
+                store_u32(slot, self.published)
+                store_u32(slot + 4, checksum(slot + HEADER, size_of::<T>()))
+            }
+            // The back slot becomes the middle, new; the old middle becomes the back.
+            loop {
+                let middle = atomic_load(self.block)
+                if compare_swap(self.block, middle, self.back | NEW) == middle {
+                    self.back = middle & 3
+                    return
+                }
+            }
+        }
+    }
+}
+
+impl<T: Plain> Latest<T> {
+    /// The newest complete value: if nothing new has been published since the last read, the
+    /// same value as then. It never waits, and never sees a value half-written. It's `nondet`
+    /// (§8): which value it gives depends on timing.
+    @effects(nondet)
+    pub fn read(mut self) -> borrow T {
+        unsafe {
+            if atomic_load(self.block) & NEW != 0 {
+                // The front slot becomes the middle, seen; the newest becomes the front.
+                loop {
+                    let middle = atomic_load(self.block)
+                    if compare_swap(self.block, middle, self.front) == middle {
+                        self.front = middle & 3
+                        break
+                    }
+                }
+                self.value = self.block + 16 + self.front * self.slot_size + HEADER
+                if debug_build() {
+                    let slot = self.block + 16 + self.front * self.slot_size
+                    let number = load_u32(slot)
+                    if checksum(slot + HEADER, size_of::<T>()) != load_u32(slot + 4) {
+                        panic("a hand-off's value was read torn")
+                    }
+                    if number < self.seen {
+                        panic("a hand-off gave an older value than it gave before")
+                    }
+                    self.seen = number
+                }
+            }
+            at::<T, Latest<T>>(self, self.value)
+        }
+    }
+
+    /// How many values were published before the one `read` gave last: in a debug build only
+    /// (0 otherwise), for tests.
+    pub fn published(self) -> u32 {
+        self.seen
+    }
+}
