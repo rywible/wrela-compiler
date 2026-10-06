@@ -1,0 +1,28 @@
+// accepts: ty.opaque-alias
+// An alias that names traits names the type the first function in its module that returns it
+// returns, seen through those traits: storable in a struct, passed and returned by name.
+use std::field::{Surface, sphere}
+
+pub type Blob = Surface + Copy
+
+fn blob(r: f32) -> Blob {
+    sphere(radius: r).smooth_union(sphere(radius: 0.5 * r).translate(vec3(r, 0.0, 0.0)), k: 0.1)
+}
+
+// Another function that returns it returns a value of it.
+fn small() -> Blob {
+    blob(0.25)
+}
+
+struct Scene: Copy {
+    a: Blob,
+    b: Blob,
+}
+
+fn nearest(s: Scene, p: vec3) -> f32 {
+    min(s.a.distance(p), s.b.distance(p))
+}
+
+fn scene() -> f32 {
+    nearest(Scene { a: blob(1.0), b: small() }, vec3(0.5))
+}

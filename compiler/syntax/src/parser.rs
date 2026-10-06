@@ -1183,13 +1183,14 @@ impl<'a> Parser<'a> {
         Ok(StructDecl { borrow, name, generics, traits, fields, multiline })
     }
 
-    /// type_item ::= "type" IDENT generic_params? "=" type
+    /// type_item ::= "type" IDENT generic_params? "=" trait_type
     fn parse_type_alias(&mut self) -> PResult<TypeAliasDecl> {
         self.expect(T::Type, "`type`")?;
         let name = self.ident("a type name")?;
         let generics = self.opt_generic_params()?;
         self.expect(T::Eq, "`=` and the type")?;
-        let ty = self.parse_type()?;
+        // Traits name the type a function returns (§4): `type Blob = Surface + Copy`.
+        let ty = self.parse_trait_position_type()?;
         Ok(TypeAliasDecl { name, generics, ty })
     }
 

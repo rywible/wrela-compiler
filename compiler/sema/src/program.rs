@@ -282,6 +282,13 @@ impl Program {
                 s.push_str(name);
             }
             // The type a function returns that's named by its traits: `impl Surface`.
+            // An alias that names traits shows as its name.
+            TyKind::Opaque(f, args)
+                if args.is_empty()
+                    && let Some(a) = self.aliases.iter().find(|a| a.defined_by == Some(*f)) =>
+            {
+                s.push_str(&a.name);
+            }
             TyKind::Opaque(f, _) => match &self.func(*f).opaque {
                 Some(traits) if !traits.is_empty() => {
                     let names: Vec<String> =

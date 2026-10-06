@@ -74,7 +74,7 @@ impl_item        ::= "impl" generic_params? type ("for" type)? "{" sep* (impl_me
 impl_member      ::= attribute* vis? fn_item | "type" IDENT "=" type
 
 const_item       ::= "const" IDENT (":" type)? "=" expr
-type_item        ::= "type" IDENT generic_params? "=" type
+type_item        ::= "type" IDENT generic_params? "=" trait_type
 
 use_item         ::= "use" use_tree
 use_tree         ::= IDENT ("::" IDENT)* ("::" "{" (use_tree ("," use_tree)* ","?)? NEWLINE? "}" | "as" IDENT)?

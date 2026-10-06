@@ -165,7 +165,7 @@ pub fn near_surface(game: mut Game, s: u32, n: u32) {
     write(mut game.points, 0, pts)
     game.dist = buffer(n)
     game.samp = buffer(n)
-    let field = g.field()
+    let field = herd::grazer::grazer_field(s)
     dispatch(
         distances.bind(field: field, points: game.points.span(0, n), out: mut game.dist),
         groups: n / 64,

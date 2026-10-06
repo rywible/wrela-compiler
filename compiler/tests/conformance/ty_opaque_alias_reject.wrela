@@ -1,0 +1,31 @@
+// rejects: ty.opaque-alias
+use std::field::{Surface, sphere}
+
+pub type Blob = Surface + Copy
+
+fn blob(r: f32) -> Blob {
+    sphere(radius: r)
+}
+
+// A second function returns a value of it, not a new one.
+fn other() -> Blob {
+    sphere(radius: 2.0) //~ E0300
+}
+
+// Only its traits are seen.
+fn radius(b: Blob) -> f32 {
+    b.radius //~ E0311
+}
+
+// No function in the module returns it.
+pub type Lonely = Surface //~ E0410
+
+// The function that decides it isn't generic.
+pub type Made = Surface
+
+fn made<T: Copy>(x: T) -> Made { //~ E0410
+    sphere(radius: 1.0) //~ E0300
+}
+
+// It names one type, so it has no parameters.
+pub type Some<T> = Surface //~ E0410

@@ -633,6 +633,9 @@ pub struct AliasDef {
     pub generics: Vec<ParamId>,
     /// The type it names; the error type until it's resolved.
     pub ty: TyId,
+    /// For an alias that names traits (`type GrazerField = Parts<Tissue>`, §4): the function
+    /// whose result is the type it names, hidden behind those traits.
+    pub defined_by: Option<FnId>,
     pub public: bool,
     pub span: Span,
 }

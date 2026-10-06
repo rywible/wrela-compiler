@@ -71,6 +71,10 @@ pub const RULES: &[(&str, &str)] = &[
     ("ty.vectors", "vectors and matrices: constructors and swizzles"),
     ("ty.arrays", "fixed-size arrays `[T; N]` with constant lengths"),
     (
+        "ty.opaque-alias",
+        "an alias that names traits names the type the first function in its module to return it returns",
+    ),
+    (
         "ty.const-generics",
         "`const N: u32` parameters range over array lengths; a length makes no calls",
     ),

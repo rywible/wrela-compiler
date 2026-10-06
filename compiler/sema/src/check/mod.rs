@@ -361,6 +361,16 @@ impl<'p> Checker<'p> {
             (TyKind::Tuple(t), _) if t.is_empty() => {
                 d = d.with_note("a block's value is its last line when that's an expression; a statement has no value");
             }
+            // An alias that names traits: one function decides its type (§4).
+            (_, TyKind::Opaque(f, args))
+                if args.is_empty()
+                    && self.p.aliases.iter().any(|al| al.defined_by == Some(*f)) =>
+            {
+                let name = &self.p.func(*f).name;
+                d = d
+                    .with_note(format!("`{e}` is the type `{name}` returns, seen only through its traits"))
+                    .with_help(format!("use a value of it, such as `{name}(...)`'s"));
+            }
             _ => {}
         }
         self.err(d);

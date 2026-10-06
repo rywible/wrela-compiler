@@ -140,14 +140,14 @@ const-item-b-pn-nc ::= lead "const" ws1 ident const-item-1-b-wc-wc sp "=" expr-b
 const-item-b-pn-ti ::= lead "const" ws1 ident const-item-1-b-wc-wc sp "=" expr-b-pn-ti | lead "const" ws1 ident const-item-1-b-wc-pc sp "=" expr-b-pn-ti
 const-item-b-pn-wc ::= lead "const" ws1 ident const-item-1-b-wc-wc sp "=" expr-b-pn-wc | lead "const" ws1 ident const-item-1-b-wc-pc sp "=" expr-b-pn-wc
 const-item-b-pn-pc ::= lead "const" ws1 ident const-item-1-b-wc-wc sp "=" expr-b-pn-pc | lead "const" ws1 ident const-item-1-b-wc-pc sp "=" expr-b-pn-pc
-type-item-b-wc-wc ::= sp1 "type" ws1 ident sp "=" bound-b-pn-wc | sp1 "type" ws1 ident fn-sig-1-b-wc-pc sp "=" bound-b-pn-wc
-type-item-b-wc-pc ::= sp1 "type" ws1 ident sp "=" type-b-pn-pc | sp1 "type" ws1 ident fn-sig-1-b-wc-pc sp "=" type-b-pn-pc
-type-item-b-wn-wc ::= ws1 "type" ws1 ident sp "=" bound-b-pn-wc | ws1 "type" ws1 ident fn-sig-1-b-wc-pc sp "=" bound-b-pn-wc
-type-item-b-wn-pc ::= ws1 "type" ws1 ident sp "=" type-b-pn-pc | ws1 "type" ws1 ident fn-sig-1-b-wc-pc sp "=" type-b-pn-pc
-type-item-b-pc-wc ::= sp "type" ws1 ident sp "=" bound-b-pn-wc | sp "type" ws1 ident fn-sig-1-b-wc-pc sp "=" bound-b-pn-wc
-type-item-b-pc-pc ::= sp "type" ws1 ident sp "=" type-b-pn-pc | sp "type" ws1 ident fn-sig-1-b-wc-pc sp "=" type-b-pn-pc
-type-item-b-pn-wc ::= lead "type" ws1 ident sp "=" bound-b-pn-wc | lead "type" ws1 ident fn-sig-1-b-wc-pc sp "=" bound-b-pn-wc
-type-item-b-pn-pc ::= lead "type" ws1 ident sp "=" type-b-pn-pc | lead "type" ws1 ident fn-sig-1-b-wc-pc sp "=" type-b-pn-pc
+type-item-b-wc-wc ::= sp1 "type" ws1 ident sp "=" trait-type-b-pn-wc | sp1 "type" ws1 ident fn-sig-1-b-wc-pc sp "=" trait-type-b-pn-wc
+type-item-b-wc-pc ::= sp1 "type" ws1 ident sp "=" trait-type-b-pn-pc | sp1 "type" ws1 ident fn-sig-1-b-wc-pc sp "=" trait-type-b-pn-pc
+type-item-b-wn-wc ::= ws1 "type" ws1 ident sp "=" trait-type-b-pn-wc | ws1 "type" ws1 ident fn-sig-1-b-wc-pc sp "=" trait-type-b-pn-wc
+type-item-b-wn-pc ::= ws1 "type" ws1 ident sp "=" trait-type-b-pn-pc | ws1 "type" ws1 ident fn-sig-1-b-wc-pc sp "=" trait-type-b-pn-pc
+type-item-b-pc-wc ::= sp "type" ws1 ident sp "=" trait-type-b-pn-wc | sp "type" ws1 ident fn-sig-1-b-wc-pc sp "=" trait-type-b-pn-wc
+type-item-b-pc-pc ::= sp "type" ws1 ident sp "=" trait-type-b-pn-pc | sp "type" ws1 ident fn-sig-1-b-wc-pc sp "=" trait-type-b-pn-pc
+type-item-b-pn-wc ::= lead "type" ws1 ident sp "=" trait-type-b-pn-wc | lead "type" ws1 ident fn-sig-1-b-wc-pc sp "=" trait-type-b-pn-wc
+type-item-b-pn-pc ::= lead "type" ws1 ident sp "=" trait-type-b-pn-pc | lead "type" ws1 ident fn-sig-1-b-wc-pc sp "=" trait-type-b-pn-pc
 use-item-b-wc-wc ::= sp1 "use" use-tree-b-wn-wc
 use-item-b-wc-pc ::= sp1 "use" use-tree-b-wn-pc
 use-item-b-wn-wc ::= ws1 "use" use-tree-b-wn-wc

@@ -100,7 +100,13 @@ pub fn collect(
     packages: &[PackageInfo],
     diags: &mut Vec<Diagnostic>,
 ) -> Program {
-    let mut c = Collector { p: Program::default(), diags, pending: Vec::new(), uses: Vec::new() };
+    let mut c = Collector {
+        p: Program::default(),
+        diags,
+        pending: Vec::new(),
+        uses: Vec::new(),
+        alias_fns: HashMap::new(),
+    };
     c.p.syntax_errors = units.iter().flat_map(|u| u.syntax_errors.iter().copied()).collect();
     c.p.texts = units.iter().map(|u| (u.ast.span.file, u.text.clone())).collect();
     let modules = c.build_modules(&units, packages);
@@ -120,6 +126,8 @@ struct Collector<'d, 'u> {
     diags: &'d mut Vec<Diagnostic>,
     pending: Vec<(ModuleId, PendingItem<'u>)>,
     uses: Vec<PendingUse>,
+    /// The functions that define aliases naming traits, and those traits.
+    alias_fns: HashMap<FnId, (AliasId, Vec<TraitRef>)>,
 }
 
 impl<'d, 'u> Collector<'d, 'u> {
@@ -523,6 +531,7 @@ impl<'d, 'u> Collector<'d, 'u> {
                     module: m,
                     generics,
                     ty,
+                    defined_by: None,
                     public,
                     span: item.span,
                 });
@@ -1306,9 +1315,69 @@ impl<'d, 'u> Collector<'d, 'u> {
             let (m, id, t) = aliases[i];
             let mut scope = Scope::new(m);
             scope.push_params(&self.p, &self.p.aliases[id.index()].generics);
+            // An alias that names traits names the type a function returns (`ty.opaque-alias`).
+            let mut quiet = Vec::new();
+            let mut bounds = None;
+            let _ = resolve::resolve_type(&self.p, &mut quiet, &scope, &t.ty, TyPos::Return(&mut bounds));
+            if let Some(bounds) = bounds {
+                self.diags.extend(quiet);
+                let ty = self.opaque_alias(m, id, t, bounds, pending);
+                self.p.aliases[id.index()].ty = ty;
+                continue;
+            }
             let ty = resolve::resolve_type(&self.p, self.diags, &scope, &t.ty, TyPos::Normal);
             self.p.aliases[id.index()].ty = ty;
         }
+    }
+
+    /// The type an alias that names `bounds` names: the type its module's first function to
+    /// return it returns, hidden behind those traits (§4). That function's body decides the
+    /// type; other functions that return the alias return a value of it.
+    fn opaque_alias(
+        &mut self,
+        m: ModuleId,
+        id: AliasId,
+        t: &ast::TypeAliasDecl,
+        bounds: Vec<TraitRef>,
+        pending: &[(ModuleId, PendingItem<'u>)],
+    ) -> TyId {
+        let name = &t.name.name;
+        if !t.generics.is_empty() {
+            self.diags.push(
+                Diagnostic::new(codes::E0410, t.name.span, format!("`{name}` names traits, so it has no parameters"))
+                    .with_note("it names the one type a function returns (§4)"),
+            );
+            return self.p.types.error;
+        }
+        let returns_it = |d: &ast::FnDecl| {
+            d.ret.as_ref().is_some_and(|r| match &r.ty.kind {
+                ast::TypeExprKind::Path(p) => {
+                    p.segments.len() == 1
+                        && p.segments[0].ident.name == *name
+                        && p.segments[0].generics.is_none()
+                }
+                _ => false,
+            })
+        };
+        let def = pending.iter().find_map(|(pm, it)| match it {
+            PendingItem::Fn(f, d) if *pm == m && returns_it(d) => Some(*f),
+            _ => None,
+        });
+        let Some(f) = def else {
+            self.diags.push(
+                Diagnostic::new(
+                    codes::E0410,
+                    t.name.span,
+                    format!("`{name}` names traits, and no function in this module returns it"),
+                )
+                .with_note("an alias that names traits names the type a function returns: the first function in its module whose result is the alias (§4)")
+                .with_help(format!("return it from a function in this module: `fn make() -> {name} {{ ... }}`")),
+            );
+            return self.p.types.error;
+        };
+        self.p.aliases[id.index()].defined_by = Some(f);
+        self.alias_fns.insert(f, (id, bounds));
+        self.p.types.intern(TyKind::Opaque(f, Vec::new()))
     }
 
     /// Resolves every trait set's traits, each after the sets it names, so a set can name
@@ -1951,6 +2020,26 @@ impl<'d, 'u> Collector<'d, 'u> {
             }
             None => (self.p.types.unit, RetMode::Owned),
         };
+        // The function that defines an alias naming traits returns that alias's hidden type: its
+        // body decides it, as a trait in return position's does. It isn't generic: the alias
+        // names one type.
+        if opaque.is_none()
+            && let Some((alias, bounds)) = self.alias_fns.get(&id).cloned()
+        {
+            if !self.p.fns[id.index()].generics.is_empty() || !implicit.is_empty() {
+                let a = &self.p.aliases[alias.index()];
+                self.diags.push(
+                    Diagnostic::new(
+                        codes::E0410,
+                        f.name.span,
+                        format!("`{}` decides what `{}` names, so it can't be generic", f.name.name, a.name),
+                    )
+                    .with_note("an alias that names traits names one type: the first function in its module that returns it decides it (§4)"),
+                );
+            } else {
+                opaque = Some(bounds);
+            }
+        }
         let ret = if opaque.is_some() {
             // The return type names traits: it's this function's hidden concrete type.
             let all = self.p.fn_all_generics(id);
