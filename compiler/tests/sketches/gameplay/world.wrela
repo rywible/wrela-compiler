@@ -64,15 +64,16 @@ pub enum Event: SimValue {
     QuestAdvanced { quest: u32, stage: u32 },
 }
 
-/// A tick's input: what the menus clicked, as commands.
+/// A tick's input: what the menus clicked, as commands, and the tick's length (seconds).
 pub struct TickInput: Clone {
     pub commands: Vec<Command>,
+    pub dt: f32,
 }
 
 @deterministic
 pub fn tick(w: mut World, input: TickInput) {
     for c in input.commands {
-        command(mut w, c)
+        command(mut w, c, input.dt)
     }
     for t in w.timers.take_due(w.tick) { // an owned Vec: it doesn't borrow `w`
         run(mut w, t.action)
@@ -82,7 +83,7 @@ pub fn tick(w: mut World, input: TickInput) {
 }
 
 @deterministic
-fn command(w: mut World, c: Command) {
+fn command(w: mut World, c: Command, dt: f32) {
     match c {
         Command::Equip { slot } => {
             let _ = equip(mut w.player, slot)
@@ -94,19 +95,19 @@ fn command(w: mut World, c: Command) {
         Command::SortBag => w.player.bag.sort(),
         Command::Talk => w.talk = Some(Conversation { node: MIRA_START }),
         Command::Choose { choice } => choose(mut w, choice),
-        Command::PullLever(l) => pull_lever(mut w, l),
+        Command::PullLever(l) => pull_lever(mut w, l, dt),
         Command::PickUp(p) => pick_up(mut w, p),
     }
 }
 
 /// "In two seconds, the gate opens."
 @deterministic
-fn pull_lever(w: mut World, l: Handle<Lever>) {
+fn pull_lever(w: mut World, l: Handle<Lever>, dt: f32) {
     if !w.levers.contains(l) { // a command can name a lever that's gone
         return
     }
     let gate = w.levers[l].gate // a `Handle<Gate>`: both live in the world
-    let _ = w.timers.after(w.tick, 2s, Action::OpenGate(gate))
+    let _ = w.timers.after(w.tick, 2s, dt, Action::OpenGate(gate))
     w.events.push(Event::LeverPulled(l))
 }
 

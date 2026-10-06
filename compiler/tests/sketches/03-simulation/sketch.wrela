@@ -61,12 +61,13 @@ pub struct PlayerSim: Sim {
     pub root: Transform,
 }
 
-/// What a tick's input is: how the player walks (metres, x and z), and whether they dig or
-/// fill where they stand.
+/// What a tick's input is: how the player walks (metres, x and z), whether they dig or fill
+/// where they stand, and the tick's length (seconds).
 pub struct TickInput: Copy + Eq + StateHash + Serialize {
     pub walk: vec2,
     pub dig: bool,
     pub fill: bool,
+    pub dt: f32,
 }
 
 // ---- §2 Modes and projections in practice -----------------------------------------------------
@@ -176,7 +177,7 @@ pub fn tick(world: mut World, input: TickInput) {
         let threat = near.closest(g.root.pos, within: 25m)
         let mates = herd.within(g.root.pos, radius: 15m) // other grazers, as of the start of the tick
         let intent = herd_intent(mut g, threat, mates) // uses g.rng: a per-grazer stream
-        step(mut g, world.terrain, intent) // sketch 01's step
+        step(mut g, world.terrain, intent, input.dt) // sketch 01's step
     })
     world.tick += 1
 }

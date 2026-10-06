@@ -374,9 +374,9 @@ pub struct World: Sim {
 /// where the foot is in the world, a metre above it, and the hit comes back into the grazer's
 /// space.
 @deterministic
-pub fn step(g: mut GrazerSim, terrain: Ground, intent: Intent) {
-    g.gait = GAIT.eval(g.gait, intent, slope: terrain.slope_under(g.root))
-    g.root = g.root.advance(g.gait.root_motion())
+pub fn step(g: mut GrazerSim, terrain: Ground, intent: Intent, dt: f32) {
+    g.gait = GAIT.eval(g.gait, intent, slope: terrain.slope_under(g.root), dt: dt)
+    g.root = g.root.advance(g.gait.root_motion(dt))
     if g.tier == SimTier::Full {
         g.pose = g.gait.pose()
         for mut leg in g.pose.legs { // each leg: a mutable projection of a `[LegPose; 4]` field

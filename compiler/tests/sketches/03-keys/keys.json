@@ -1,0 +1,7 @@
+[
+  { "tick": 10, "type": "keydown", "key": "ArrowRight" },
+  { "tick": 70, "type": "keyup", "key": "ArrowRight" },
+  { "tick": 80, "type": "keydown", "key": "ArrowUp" },
+  { "tick": 100, "type": "key", "key": "Space" },
+  { "tick": 140, "type": "keyup", "key": "ArrowUp" }
+]

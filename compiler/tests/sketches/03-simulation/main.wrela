@@ -58,7 +58,7 @@ fn world() -> World {
 /// The input for tick `t`: the player walks a circle of 25 m, and digs every 30 ticks.
 fn input(t: Tick) -> TickInput {
     let a = 0.02 * f32(t)
-    TickInput { walk: 0.5 * vec2(-sin(a), cos(a)), dig: t % 30 == 29, fill: false }
+    TickInput { walk: 0.5 * vec2(-sin(a), cos(a)), dig: t % 30 == 29, fill: false, dt: 1.0 / 60.0 }
 }
 
 pub fn init() -> Game {

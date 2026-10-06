@@ -1,0 +1,8 @@
+# Sketch 03's world driven by keys through per-tick records (compiler/tests/tests/suite/keys.rs).
+[package]
+name = "keys"
+
+[dependencies]
+engine = { path = "../../../../engine" }
+grazer = { path = "../01-creature" }
+simulation = { path = "../03-simulation" }

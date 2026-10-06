@@ -106,6 +106,9 @@ pub fn init() -> Game {
     }
 }
 
+/// A tick's length: this program ticks once a frame, as at 60 frames a second.
+const TICK: f32 = 1.0 / 60.0
+
 pub fn frame(state: mut Game, time: f32, width: u32, height: u32) {
     // A tick per frame: each grazer turns gently and walks on.
     var i = 0
@@ -113,7 +116,7 @@ pub fn frame(state: mut Game, time: f32, width: u32, height: u32) {
         let intent = Intent { turn: 0.2 * f32(i % 2), speed: 0.8, flee: false }
         // A stride's end: the first leg's foot comes down.
         let before = g.gait.phase
-        step(mut g, state.world.terrain, intent)
+        step(mut g, state.world.terrain, intent, dt: TICK)
         if g.gait.phase < before {
             state.planted += 1
             let _ = state.strikes.push(

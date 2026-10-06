@@ -1,0 +1,195 @@
+// Sketch 03's world on the ticker's thread (`engine::run`), its player driven by keys through
+// per-tick records (#42 AC6): the arrows walk, Space digs. Each frame draws the player where
+// the snapshots put it, as a square on a map of the world, and prints `moved` when it starts to
+// move, so a test can tell when a key press reached the screen. compiler/tests/tests/suite/
+// keys.rs records a run in Chrome as a tick log and replays it on the native host.
+
+use engine::present::{Snapshots, lerp_angle}
+use engine::rng::{Rng, seed}
+use engine::run::{Asks, Stamped, TickInput, run}
+use engine::sim::{CreatureKey, GaitState, Mode, Sim, SimState, SimTier, Tick, Transform}
+use grazer::sketch::GrazerSim
+use simulation::sketch::{PlayerSim, Terrain, TerrainField, World, tick}
+use std::arena::Arena
+use std::gpu::{ClipPosition, VertexIndex, begin_screen_pass, draw, present}
+use std::hash::StateHash
+use std::input::{Event, Key}
+use std::io::print
+use std::serialize::Serialize
+
+/// The sketch's world, and the arrow keys held: bit 0 up, 1 down, 2 left, 3 right.
+pub struct Keyed: Sim {
+    pub world: World,
+    pub held: u32,
+}
+
+/// It asks for no jobs.
+impl Asks for Keyed {
+    type Ask = u32
+    type Answer = u32
+
+    @deterministic
+    fn asks(self, tick: Tick) -> Vec<(u32, Tick)> {
+        Vec::new()
+    }
+
+    @deterministic
+    fn work(ask: u32) -> u32 {
+        ask
+    }
+}
+
+/// What the frames see: where the player is (x and z), how many digs, and the ticks run.
+pub struct Snap: Copy + Plain {
+    pub player: vec2,
+    pub digs: u32,
+}
+
+const HERD: u32 = 40
+
+/// How fast the player walks, in metres a second.
+const WALK: f32 = 3.0
+
+/// The world at tick 0, as sketch 03's program has it: grazers in a ring of 20 m, the player in
+/// its middle.
+fn world() -> World {
+    var grazers: Arena<GrazerSim> = Arena::new()
+    let rng = Rng::new(seed(3))
+    for i in 0..HERD {
+        let a = 6.2831853 * f32(i) / f32(HERD)
+        let gait = GaitState { phase: f32(i % 7) / 7.0, speed: 0.5, turn: 0.0, mode: Mode::Walk }
+        let _ = grazers.insert(
+            GrazerSim {
+                kind: CreatureKey { kind: 1, seed: seed(i + 1) },
+                tier: if i % 4 == 0 { SimTier::Full } else { SimTier::Ambient },
+                rng: rng.split(i),
+                root: Transform {
+                    pos: vec3(20.0 * cos(a), 0.0, 20.0 * sin(a)),
+                    heading: a + 1.5707964,
+                },
+                gait,
+                pose: gait.pose(),
+            },
+        )
+    }
+    var players: Arena<PlayerSim> = Arena::new()
+    let _ = players.insert(PlayerSim { root: Transform { pos: vec3(0.0, 0.0, 0.0), heading: 0.0 } })
+    World {
+        tick: 0,
+        seed: seed(3),
+        terrain: Terrain {
+            base: TerrainField { height: 0.0, roll: 0.5, wavelength: 8.0 },
+            edits: Vec::new(),
+        },
+        grazers,
+        players,
+    }
+}
+
+/// An arrow key's bit in `Keyed::held`.
+fn arrow(key: Key) -> u32 {
+    match key {
+        Key::Up => 1,
+        Key::Down => 2,
+        Key::Left => 4,
+        Key::Right => 8,
+        _ => 0,
+    }
+}
+
+/// A tick: the records change the keys held (Space digs), then sketch 03's tick runs, the
+/// player walking as the arrows say.
+@deterministic
+fn step(k: mut Keyed, input: TickInput<Keyed>) {
+    var dig = false
+    for e in input.records {
+        match e {
+            Event::KeyDown { key, repeat, .. } => {
+                if key == Key::Space && !repeat {
+                    dig = true
+                }
+                k.held = k.held | arrow(key)
+            },
+            Event::KeyUp { key, .. } => k.held = k.held & (15 ^ arrow(key)),
+            _ => {},
+        }
+    }
+    let h = k.held
+    let dir = vec2(
+        f32(h >> 3 & 1) - f32(h >> 2 & 1),
+        f32(h & 1) - f32(h >> 1 & 1),
+    )
+    let walk = if dot(dir, dir) > 0.0 { normalize(dir) * WALK * input.dt } else { vec2(0.0) }
+    tick(mut k.world, simulation::sketch::TickInput { walk, dig, fill: false, dt: input.dt })
+}
+
+/// The snapshot: the player, and the digs so far.
+@deterministic
+fn snapshot(k: Keyed) -> Snap {
+    var player = vec2(0.0)
+    for p in k.world.players {
+        player = vec2(p.root.pos.x, p.root.pos.z)
+    }
+    Snap { player, digs: k.world.terrain.edits.len() }
+}
+
+pub struct Game {
+    snaps: Snapshots<Snap>,
+    /// Where the player was drawn last frame, and whether it had stopped there.
+    drawn: vec2,
+    still: bool,
+}
+
+pub fn init() -> Game {
+    let world = Keyed { world: world(), held: 0 }
+    let latest = run(take world, hz: 60, step: step, present: snapshot)
+    Game { snaps: Snapshots::new(take latest, hz: 60), drawn: vec2(0.0), still: true }
+}
+
+/// A square of `size` (clip space) at `at`, two triangles.
+@vertex
+fn square(at: vec2, size: f32, v: VertexIndex) -> ClipPosition {
+    let corners = [
+        vec2(-1.0, -1.0),
+        vec2(1.0, -1.0),
+        vec2(-1.0, 1.0),
+        vec2(-1.0, 1.0),
+        vec2(1.0, -1.0),
+        vec2(1.0, 1.0),
+    ]
+    let c = corners[v.index % 6]
+    ClipPosition { position: vec4(at + c * size, 0.0, 1.0) }
+}
+
+@fragment
+fn flat(colour: vec4) -> vec4 {
+    colour
+}
+
+pub fn frame(game: mut Game, time: f32, width: u32, height: u32) {
+    game.snaps.update()
+    let b = game.snaps.at(game.snaps.sim_time(time))
+    let p = mix(b.a.player, b.b.player, vec2(b.alpha))
+    let moving = length(p - game.drawn) > 1.0e-5
+    if moving && game.still {
+        print("moved")
+    }
+    game.still = !moving
+    game.drawn = p
+    // The map: 60 m across, the player a square.
+    begin_screen_pass(clear: vec4(0.1, 0.12, 0.1, 1.0))
+    let at = p / 30.0
+    let shade = 0.5 + 0.5 * f32(b.b.digs % 2)
+    draw(square.bind(at, 0.03), flat.bind(vec4(1.0, shade, 0.2, 1.0)), vertices: 6)
+    present()
+}
+
+/// The newest snapshot's player, and its ticks run (for the tests).
+pub fn newest(game: Game) -> vec3 {
+    let s = game.snaps.newest()
+    vec3(s.snap.player.x, s.snap.player.y, f32(s.ticks))
+}
+
+/// Ticks alone, with the keys of `keys.json`: the arrows walk the player.
+@test(ticks: 200, input: "keys.json")
+fn the_keys_walk_the_player(game: Game) {}
