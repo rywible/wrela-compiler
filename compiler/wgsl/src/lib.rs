@@ -41,11 +41,33 @@ pub fn emit(m: &ir::Module) -> R<Wgsl> {
     let text =
         naga::back::wgsl::write_string(&module, &info, naga::back::wgsl::WriterFlags::empty())
             .map_err(|e| format!("internal: writing WGSL failed: {e}"))?;
+    let text = unindented(&text);
     let entry_points = entry_point_names(&module);
     if let Some(n) = entry_points.iter().find(|n| !text.contains(&format!("fn {n}("))) {
         return Err(format!("internal: the WGSL writer didn't name an entry point `{n}`"));
     }
     Ok(Wgsl { text, entry_points })
+}
+
+/// A struct's name in WGSL: its type's, cut to 32 characters. A creature's nested types'
+/// names run to hundreds (`Then_Then_Then_Placed_With_...`), each written where it's declared
+/// and where it's used; naga's namer makes the cut names unique.
+fn struct_name(name: &str) -> String {
+    let full = ir::ident(name);
+    let cut: String = full.chars().take(32).collect();
+    cut.trim_end_matches('_').to_string()
+}
+
+/// WGSL text without its lines' indentation, which the language ignores. A creature's item
+/// dispatch nests an `if` for each item, so naga's four spaces a level were 45% of a 70-part
+/// creature's shading shader (#42 AC9's size budget); the text is for the GPU's compiler.
+fn unindented(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for line in text.lines() {
+        out.push_str(line.trim_start());
+        out.push('\n');
+    }
+    out
 }
 
 /// The names naga's WGSL writer gives a module's entry points: its namer, set up as the writer
@@ -239,7 +261,7 @@ impl<'m> Cx<'m> {
                         offset,
                     });
                 }
-                (Some(ir::ident(name)), TypeInner::Struct { members, span: l.size })
+                (Some(struct_name(name)), TypeInner::Struct { members, span: l.size })
             }
             ir::TypeDef::Run(_) | ir::TypeDef::Ptr(_) => {
                 return Err("internal: a CPU-only type in GPU code".into());
@@ -1502,6 +1524,28 @@ mod tests {
 
     /// A tiny compute module round-trips through naga's validator and back through its WGSL
     /// parser.
+    /// The text has no indentation, and a struct's name is cut to 32 characters (#42 AC9's size
+    /// budget for a large creature's shaders).
+    #[test]
+    fn the_text_is_unindented_and_long_struct_names_are_cut() {
+        let mut m = kernel("k");
+        let u = m.types.u32();
+        let long = "Then_Then_Then_Placed_With_Translate_Ell_Coat_Placed_With_Translate_Ell_Coat";
+        let s = m
+            .types
+            .intern(ir::TypeDef::Struct { name: long.into(), fields: vec![("a".into(), u)] });
+        m.resources.push(ir::Resource {
+            name: "u".into(),
+            binding: 0,
+            kind: ir::ResourceKind::Uniform { storage: true },
+            ty: s,
+        });
+        let w = emit(&m).expect("emits");
+        assert!(w.text.lines().all(|l| !l.starts_with([' ', '\t'])), "{}", w.text);
+        assert!(w.text.contains("struct Then_Then_Then_Placed_With_Trans {"), "{}", w.text);
+        assert!(!w.text.contains(long));
+    }
+
     #[test]
     fn a_minimal_kernel_is_valid_wgsl() {
         let wgsl = emit(&kernel("k")).expect("valid").text;

@@ -1545,8 +1545,10 @@ fn bind_uniform(cx: &mut Cx, mb: &mut ModuleBuilder, iface: &Interface) -> Optio
     // bytes are a read-only storage binding.
     let storage = !ir::layout::uniform_compatible(&mb.m.types, ty)
         || size > wrela_abi::manifest::MAX_UNIFORM_BUFFER_BINDING_SIZE;
+    // Named `u`: a creature's shader reads it a thousand times or more, each written out in the
+    // WGSL with its whole path.
     let id = mb.m.add_resource(ir::Resource {
-        name: "uniforms".into(),
+        name: "u".into(),
         binding: 0,
         kind: ir::ResourceKind::Uniform { storage },
         ty,
@@ -1957,6 +1959,11 @@ fn verify(cx: &mut Cx, mb: &mut ModuleBuilder, name: &str) -> Option<()> {
         return None;
     }
     let mut checked = ir::verify(&mb.m);
+    // For the compiler's own debugging: `WRELA_DUMP_IR=gpu:<pipeline>` prints that pipeline's
+    // module before it's flattened.
+    if std::env::var("WRELA_DUMP_IR").is_ok_and(|d| d.strip_prefix("gpu:") == Some(name)) {
+        eprintln!("{}", ir::print::print(&mb.m));
+    }
     if cx.emit {
         checked =
             checked.and_then(|()| ir::opt::flatten_gpu(&mut mb.m)).and_then(|()| ir::verify(&mb.m));

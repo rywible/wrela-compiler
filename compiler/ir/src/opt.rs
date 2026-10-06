@@ -511,12 +511,199 @@ fn callee_order(m: &Module) -> Result<(Vec<usize>, Vec<bool>)> {
 /// code, with
 /// what it inlines, only computes: no entry point's inputs, resources, barriers, atomics or
 /// textures. (Entry points are written whole.)
-fn outlined(m: &Module) -> Vec<bool> {
+fn outlined(m: &mut Module) -> Vec<bool> {
     // Small arguments' functions stay calls only where the inlined shader would be too big
     // to write (a creature's, the lens's): elsewhere every call is inlined, as M1 measured
-    // fastest (a branch-free kernel the GPU compiler sees whole).
-    let (keep, biggest) = outlined_with(m, false);
-    if biggest > INLINE_LIMIT { outlined_with(m, true).0 } else { keep }
+    // fastest (a branch-free kernel the GPU compiler sees whole). There, a function given the
+    // same uniform data from several places is specialized to it first, so it can stay a call.
+    let (keep, biggest) = outlined_with(m, false, &[]);
+    if biggest <= INLINE_LIMIT {
+        return keep;
+    }
+    let (keep, _) = outlined_with(m, true, &[]);
+    if flattened_size(m, &keep) <= SPECIALIZE_LIMIT {
+        return keep;
+    }
+    let copies = specialize_uniform_calls(m);
+    outlined_with(m, true, &copies).0
+}
+
+/// Where a module calls a function with uniform data (a `load` of a read-only resource at a
+/// fixed place), the function is copied once for that data, read where it's used, and each
+/// call passes it the rest of its arguments; then the copies' own calls likewise, until none
+/// is left. A copy reads the uniform as an inlined call would, and can stay a call
+/// (`outlined_with`), so a function given the same data from several places appears once in
+/// the WGSL rather than at each call: a creature's fold, called from a block's corners and from
+/// each edge's root search, with the creature's numbers in the uniform.
+fn specialize_uniform_calls(m: &mut Module) -> Vec<bool> {
+    type Key = (usize, Vec<(usize, Place)>);
+    let fixed = |m: &Module, p: &Place| {
+        matches!(p.root, PlaceRoot::Resource(r)
+            if matches!(m.resources[r.index()].kind, ResourceKind::Uniform { .. } | ResourceKind::StorageRead))
+            && p.path.iter().all(|x| !matches!(x, Proj::Index(_)))
+    };
+    // A call's key: its callee, and its arguments that are uniform data too big to pass in
+    // registers, by position. (A function given a few numbers, a part's shape, is one function
+    // for every part already.)
+    let key = |m: &Module,
+               loads: &HashMap<ValueId, Place>,
+               g: FuncId,
+               args: &[Arg]|
+     -> Option<Key> {
+        let callee = &m.functions[g.index()];
+        let big = |k: usize| {
+            callee.params.get(k).is_some_and(|p| scalars(m, p.ty, 0).is_none_or(|n| n > SMALL_ARGS))
+        };
+        let spec: Vec<(usize, Place)> = args
+            .iter()
+            .enumerate()
+            .filter_map(|(k, a)| match a {
+                Arg::Value(v) if big(k) => loads.get(v).map(|p| (k, p.clone())),
+                _ => None,
+            })
+            .collect();
+        let by_value = spec.iter().all(|(k, _)| callee.params.get(*k).is_some_and(|p| !p.by_ref));
+        (!spec.is_empty() && by_value).then_some((g.index(), spec))
+    };
+    // The values that are uniform data at a fixed place: a load, a struct's field of one, or
+    // a load from a local that holds one (a parameter kept in a local: stored once, whole, and
+    // never written again or lent).
+    let loads_of = |m: &Module, f: &Function| {
+        let mut stores = vec![0u32; f.locals.len()];
+        let mut lent = vec![false; f.locals.len()];
+        visit::walk(&f.body, &mut |s| {
+            if let Stmt::Store(p, _) = s
+                && let PlaceRoot::Local(l) = p.root
+            {
+                stores[l.index()] += 1;
+            }
+            if let Some(e) = s.expr() {
+                let by_place = match e {
+                    Expr::Call(_, args) => args.iter().any(|a| matches!(a, Arg::Place(_))),
+                    Expr::Addr(_) | Expr::Run(_) | Expr::Atomic(..) => true,
+                    _ => false,
+                };
+                if by_place {
+                    e.for_each_place(&mut |p| {
+                        if let PlaceRoot::Local(l) = p.root {
+                            lent[l.index()] = true;
+                        }
+                    });
+                }
+            }
+        });
+        let constant = |p: &Place| p.path.iter().all(|x| !matches!(x, Proj::Index(_)));
+        let mut loads: HashMap<ValueId, Place> = HashMap::new();
+        let mut held: HashMap<LocalId, Place> = HashMap::new();
+        visit::walk(&f.body, &mut |s| match s {
+            Stmt::Let(v, Expr::Load(p)) if fixed(m, p) => {
+                loads.insert(*v, p.clone());
+            }
+            Stmt::Let(v, Expr::Load(p)) if constant(p) => {
+                if let PlaceRoot::Local(l) = p.root
+                    && let Some(at) = held.get(&l)
+                {
+                    let mut at = at.clone();
+                    at.path.extend(p.path.iter().cloned());
+                    loads.insert(*v, at);
+                }
+            }
+            Stmt::Let(v, Expr::Extract(base, k))
+                if matches!(m.types.get(f.values[base.index()]), TypeDef::Struct { .. }) =>
+            {
+                if let Some(p) = loads.get(base).map(|p| p.with(Proj::Field(*k))) {
+                    loads.insert(*v, p);
+                }
+            }
+            Stmt::Store(p, v) if p.path.is_empty() => {
+                if let PlaceRoot::Local(l) = p.root
+                    && stores[l.index()] == 1
+                    && !lent[l.index()]
+                    && let Some(at) = loads.get(v)
+                {
+                    held.insert(l, at.clone());
+                }
+            }
+            _ => {}
+        });
+        loads
+    };
+    let mut made: HashMap<Key, FuncId> = HashMap::new();
+    // GPU code doesn't recurse, and each copy has a parameter fewer: this ends.
+    loop {
+        let mut fresh: Vec<Key> = Vec::new();
+        for f in &m.functions {
+            let loads = loads_of(m, f);
+            visit::walk(&f.body, &mut |s| {
+                if let Some(Expr::Call(g, args)) = s.expr()
+                    && let Some(k) = key(m, &loads, *g, args)
+                    && !made.contains_key(&k)
+                    && !fresh.contains(&k)
+                {
+                    fresh.push(k);
+                }
+            });
+        }
+        if fresh.is_empty() {
+            break;
+        }
+        for k in fresh {
+            let mut g = m.functions[k.0].clone();
+            let gone: Vec<usize> = k.1.iter().map(|(i, _)| *i).collect();
+            let renumber = |j: u32| j - gone.iter().filter(|&&x| (x as u32) < j).count() as u32;
+            visit::walk_mut(&mut g.body, &mut |s| {
+                if let Stmt::Let(_, e) = s
+                    && let Expr::Param(j) = *e
+                {
+                    *e = match k.1.iter().find(|(i, _)| *i as u32 == j) {
+                        Some((_, p)) => Expr::Load(p.clone()),
+                        None => Expr::Param(renumber(j)),
+                    };
+                }
+                // By-reference parameters are places, named by number too.
+                s.for_each_place_mut(&mut |p| {
+                    if let PlaceRoot::Param(j) = p.root {
+                        p.root = PlaceRoot::Param(renumber(j));
+                    }
+                });
+            });
+            g.params = g
+                .params
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| !gone.contains(i))
+                .map(|(_, p)| p.clone())
+                .collect();
+            g.name = format!("{}_u", g.name);
+            m.functions.push(g);
+            made.insert(k, FuncId(m.functions.len() as u32 - 1));
+        }
+        for i in 0..m.functions.len() {
+            let loads = loads_of(m, &m.functions[i]);
+            let mut body = std::mem::take(&mut m.functions[i].body);
+            visit::walk_mut(&mut body, &mut |s| {
+                let (Stmt::Let(_, e) | Stmt::Eval(e)) = s else { return };
+                let Expr::Call(g, args) = e else { return };
+                let Some(k) = key(m, &loads, *g, args) else { return };
+                if let Some(&h) = made.get(&k) {
+                    let gone: Vec<usize> = k.1.iter().map(|(i, _)| *i).collect();
+                    let rest = args
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| !gone.contains(i))
+                        .map(|(_, a)| a.clone())
+                        .collect();
+                    *e = Expr::Call(h, rest);
+                }
+            });
+            m.functions[i].body = body;
+        }
+    }
+    let mut copies = vec![false; m.functions.len()];
+    for h in made.values() {
+        copies[h.index()] = true;
+    }
+    copies
 }
 
 /// The size of an entry point inlined whole, in statements, past which functions that take
@@ -524,9 +711,18 @@ fn outlined(m: &Module) -> Vec<bool> {
 /// wolf's and the lens's are over (up to twelve times), and would be MBs of WGSL.
 const INLINE_LIMIT: usize = 16000;
 
+/// The size of a flattened module (`flattened_size`), in statements, past which functions given
+/// uniform data are specialized to it (`specialize_uniform_calls`): a 70-part creature's
+/// realization and shading (31,000 to 79,000 statements), whose WGSL was up to nine times the
+/// 256 KiB budget. Below it (the herd's, at most 15,300), specialized calls cost the vertex pass
+/// a fifth of its time, kept as calls where they were inlined.
+const SPECIALIZE_LIMIT: usize = 25000;
+
 /// Which functions stay calls (see `outlined`), with small arguments' functions too if
-/// `small_calls`; and the biggest entry point's size with what it inlines.
-fn outlined_with(m: &Module, small_calls: bool) -> (Vec<bool>, usize) {
+/// `small_calls`; and the biggest entry point's size with what it inlines. A copy specialized
+/// to uniform data (`copies`) stays a call only where two calls or more share it: called once,
+/// it's inlined, as the function it copies would have been.
+fn outlined_with(m: &Module, small_calls: bool, copies: &[bool]) -> (Vec<bool>, usize) {
     let n = m.functions.len();
     let mut keep = vec![false; n];
     let Ok((order, _)) = callee_order(m) else { return (keep, 0) };
@@ -534,13 +730,21 @@ fn outlined_with(m: &Module, small_calls: bool) -> (Vec<bool>, usize) {
     // A body's size with its inlined callees, and whether it only computes.
     let mut size = vec![0usize; n];
     let mut pure = vec![false; n];
+    let mut calls = vec![0u32; n];
+    for f in &m.functions {
+        visit::walk(&f.body, &mut |s| {
+            if let Some(Expr::Call(g, _)) = s.expr() {
+                calls[g.index()] += 1;
+            }
+        });
+    }
     for f in order {
         let func = &m.functions[f];
         let (mut sz, mut ok) = (0usize, true);
         visit::walk(&func.body, &mut |s| {
             sz += 1;
             if let Stmt::Store(p, _) = s
-                && !matches!(p.root, PlaceRoot::Local(_))
+                && !matches!(p.root, PlaceRoot::Local(_) | PlaceRoot::Param(_))
             {
                 ok = false;
             }
@@ -564,8 +768,22 @@ fn outlined_with(m: &Module, small_calls: bool) -> (Vec<bool>, usize) {
                     _ => {}
                 }
                 e.for_each_place(&mut |p| {
-                    if !matches!(p.root, PlaceRoot::Local(_) | PlaceRoot::Data(_)) {
-                        ok = false;
+                    // A copy specialized to uniform data reads it (`specialize_uniform_calls`).
+                    let readable = |r: ResourceId| {
+                        small_calls
+                            && matches!(e, Expr::Load(_))
+                            && matches!(
+                                m.resources[r.index()].kind,
+                                ResourceKind::Uniform { .. } | ResourceKind::StorageRead
+                            )
+                    };
+                    match p.root {
+                        PlaceRoot::Local(_) | PlaceRoot::Data(_) => {}
+                        // A by-reference parameter is the caller's place, which the caller's
+                        // call checks (a kept function has none: `signature`).
+                        PlaceRoot::Param(_) => {}
+                        PlaceRoot::Resource(r) if readable(r) => {}
+                        _ => ok = false,
                     }
                 });
             }
@@ -591,7 +809,8 @@ fn outlined_with(m: &Module, small_calls: bool) -> (Vec<bool>, usize) {
         } else {
             small_calls && small && sz >= OUTLINE_SMALL
         };
-        keep[f] = !entry.contains(&f) && ok && signature && big;
+        let shared = !copies.get(f).copied().unwrap_or(false) || calls[f] >= 2;
+        keep[f] = !entry.contains(&f) && ok && signature && big && shared;
     }
     let biggest = entry.iter().map(|&e| size[e]).max().unwrap_or(0);
     (keep, biggest)
@@ -1969,6 +2188,28 @@ fn retain_by_index<T>(items: &mut Vec<T>, keep: impl Fn(usize) -> bool) -> Vec<O
     remap
 }
 
+/// The statements a module flattened with `keep` holds: each entry point with what it inlines,
+/// and each kept function once, with what it inlines.
+fn flattened_size(m: &Module, keep: &[bool]) -> usize {
+    let Ok((order, _)) = callee_order(m) else { return 0 };
+    let mut size = vec![0usize; m.functions.len()];
+    for f in order {
+        let mut sz = 0;
+        visit::walk(&m.functions[f].body, &mut |s| {
+            sz += 1;
+            if let Some(Expr::Call(g, _)) = s.expr()
+                && !keep[g.index()]
+            {
+                sz += size[g.index()];
+            }
+        });
+        size[f] = sz;
+    }
+    let entries: usize = m.entry_points.iter().map(|e| size[e.function.index()]).sum();
+    let kept: usize = (0..m.functions.len()).filter(|&f| keep[f]).map(|f| size[f]).sum();
+    entries + kept
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1998,6 +2239,83 @@ mod tests {
         dce(&mut f);
         assert_eq!(f.body, vec![Stmt::Let(x, Expr::Param(0)), Stmt::Return(Some(x))]);
         assert!(f.locals.is_empty());
+    }
+
+    /// A function given the same large uniform data from two calls is copied once with that
+    /// data read where it's used (`specialize_uniform_calls`), and both calls pass only the
+    /// rest; a small piece of uniform data, passed in registers, isn't.
+    #[test]
+    fn calls_given_the_same_uniform_data_share_a_specialized_copy() {
+        let mut m = Module::default();
+        let f32t = m.types.f32();
+        let table = m.types.intern(TypeDef::Array(f32t, 64));
+        let block = m.types.intern(TypeDef::Struct {
+            name: "Block".into(),
+            fields: vec![("table".into(), table), ("scale".into(), f32t)],
+        });
+        let u = m.add_resource(Resource {
+            name: "u".into(),
+            binding: 0,
+            kind: ResourceKind::Uniform { storage: true },
+            ty: block,
+        });
+        let whole = Place::root(PlaceRoot::Resource(u)).with(Proj::Field(0));
+        let scale = Place::root(PlaceRoot::Resource(u)).with(Proj::Field(1));
+        // fn pick(t: [f32; 64], x: f32) -> f32 { x }, and fn twice(s: f32, x: f32) -> f32 { x }
+        let callee = |m: &mut Module, name: &str, first: TypeId| {
+            let ps = vec![
+                Param { name: "t".into(), ty: first, by_ref: false, mutable: false },
+                Param { name: "x".into(), ty: f32t, by_ref: false, mutable: false },
+            ];
+            let mut f = Function::new(name, ps, Some(f32t));
+            let (t, x) = (f.new_value(first), f.new_value(f32t));
+            f.body = vec![
+                Stmt::Let(t, Expr::Param(0)),
+                Stmt::Let(x, Expr::Param(1)),
+                Stmt::Return(Some(x)),
+            ];
+            m.add_function(f)
+        };
+        let pick = callee(&mut m, "pick", table);
+        let twice = callee(&mut m, "twice", f32t);
+        // fn main(x: f32) -> f32 { pick(u.table, pick(u.table, twice(u.scale, twice(u.scale, x)))) }
+        let ps = vec![Param { name: "x".into(), ty: f32t, by_ref: false, mutable: false }];
+        let mut main = Function::new("main", ps, Some(f32t));
+        let x = main.new_value(f32t);
+        let mut body = vec![Stmt::Let(x, Expr::Param(0))];
+        let mut last = x;
+        for (g, at, ty) in [
+            (twice, &scale, f32t),
+            (twice, &scale, f32t),
+            (pick, &whole, table),
+            (pick, &whole, table),
+        ] {
+            let (d, r) = (main.new_value(ty), main.new_value(f32t));
+            body.push(Stmt::Let(d, Expr::Load(at.clone())));
+            body.push(Stmt::Let(r, Expr::Call(g, vec![Arg::Value(d), Arg::Value(last)])));
+            last = r;
+        }
+        body.push(Stmt::Return(Some(last)));
+        main.body = body;
+        let main = m.add_function(main);
+        let copies = specialize_uniform_calls(&mut m);
+        let names: Vec<&str> = m.functions.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["pick", "twice", "main", "pick_u"]);
+        assert_eq!(copies, [false, false, false, true]);
+        let copy = &m.functions[3];
+        assert_eq!(copy.params.len(), 1);
+        assert_eq!(copy.body[0], Stmt::Let(ValueId(0), Expr::Load(whole.clone())));
+        assert_eq!(copy.body[1], Stmt::Let(ValueId(1), Expr::Param(0)));
+        let calls: Vec<(FuncId, usize)> = {
+            let mut out = Vec::new();
+            visit::walk(&m.functions[main.index()].body, &mut |s| {
+                if let Some(Expr::Call(g, args)) = s.expr() {
+                    out.push((*g, args.len()));
+                }
+            });
+            out
+        };
+        assert_eq!(calls, [(twice, 2), (twice, 2), (FuncId(3), 1), (FuncId(3), 1)]);
     }
 
     fn param(m: &mut Module, by_ref: bool) -> Param {
