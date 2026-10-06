@@ -54,6 +54,12 @@ pub trait Surface: Copy + GpuData {
         self.distance(p)
     }
 
+    /// A sphere outside which its distance has a lower bound (`Bound::below`): what culling and
+    /// sampling read to skip a surface that can't matter at a point. The default bounds nothing.
+    fn bound(self) -> Bound {
+        UNBOUNDED
+    }
+
     /// A range holding every distance in `over`, derived by interval arithmetic.
     fn interval(self, over: Box3) -> Interval {
         interval(|q| self.distance(q), over)
@@ -161,6 +167,54 @@ pub trait Surface: Copy + GpuData {
     /// the distance itself; `part_share` is how much it changes.
     fn part_offset(self, p: vec3, i: u32, by: f32) -> f32 {
         self.distance(p) + by
+    }
+}
+
+/// Where a surface is: a sphere, and how fast its distance grows outside it. Its distance at
+/// `p` is at least `slope` times `p`'s distance from the sphere: exactly so for a surface whose
+/// distance is exact (slope 1); for one whose distance is a bound, `slope` is what the surface
+/// states (the ellipsoid's 0.5 is spike 01's assumption, not a proof).
+pub struct Bound: Copy + GpuData {
+    pub centre: vec3,
+    pub radius: f32,
+    pub slope: f32,
+}
+
+/// A bound that holds nothing out: everywhere is inside it.
+pub const UNBOUNDED: Bound = Bound { centre: vec3(), radius: 1.0e30, slope: 1.0 }
+
+impl Bound {
+    /// The least the surface's distance can be at `p`.
+    pub fn below(self, p: vec3) -> f32 {
+        self.slope * (length(p - self.centre) - self.radius)
+    }
+
+    /// A bound holding both, with the smaller slope.
+    pub fn and(self, other: Bound) -> Bound {
+        if self.radius >= 1.0e30 || other.radius >= 1.0e30 {
+            return UNBOUNDED
+        }
+        let d = length(other.centre - self.centre)
+        if d + other.radius <= self.radius {
+            return Bound { slope: min(self.slope, other.slope), ..self }
+        }
+        if d + self.radius <= other.radius {
+            return Bound { slope: min(self.slope, other.slope), ..other }
+        }
+        let r = 0.5 * (d + self.radius + other.radius)
+        let centre = self.centre + (other.centre - self.centre) * ((r - self.radius) / max(d, 1.0e-30))
+        Bound { centre, radius: r, slope: min(self.slope, other.slope) }
+    }
+
+    /// The bound grown so the distance may be `by` lower anywhere (a blend's seam, a
+    /// displacement).
+    pub fn lowered(self, by: f32) -> Bound {
+        Bound { radius: self.radius + abs(by) / max(self.slope, 1.0e-30), ..self }
+    }
+
+    /// Moved by `by`.
+    pub fn moved(self, by: vec3) -> Bound {
+        Bound { centre: self.centre + by, ..self }
     }
 }
 
@@ -509,6 +563,10 @@ impl Surface for Sphere {
     fn distance(self, p: vec3) -> f32 {
         length(p) - self.radius
     }
+
+    fn bound(self) -> Bound {
+        Bound { centre: vec3(), radius: self.radius, slope: 1.0 }
+    }
 }
 
 /// An ellipsoid centred at the origin. No exact distance exists; this is the usual bound.
@@ -530,6 +588,12 @@ impl Surface for Ellipsoid {
             return -min(self.radii.x, min(self.radii.y, self.radii.z))
         }
         k0 * (k0 - 1.0) / max(k1, 0.000000001)
+    }
+
+    fn bound(self) -> Bound {
+        // The usual bound's distance: spike 01 assumed it falls off at least half as fast as the
+        // true distance does.
+        Bound { centre: vec3(), radius: max(self.radii.x, max(self.radii.y, self.radii.z)), slope: 0.5 }
     }
 }
 
@@ -554,6 +618,10 @@ impl Surface for Oval {
         }
         let k1 = length(p / (self.radii * self.radii))
         k0 * (k0 - 1.0) / max(k1, 0.000000001)
+    }
+
+    fn bound(self) -> Bound {
+        Bound { centre: vec3(), radius: max(self.radii.x, max(self.radii.y, self.radii.z)), slope: 0.5 }
     }
 }
 
@@ -633,6 +701,11 @@ impl Surface for RoundCone {
             }
         }
     }
+
+    fn bound(self) -> Bound {
+        let half = 0.5 * length(self.b - self.a)
+        Bound { centre: 0.5 * (self.a + self.b), radius: half + max(self.r1, self.r2), slope: 1.0 }
+    }
 }
 
 /// A box centred at the origin, with half-extents `half`. Exact.
@@ -653,6 +726,10 @@ impl Surface for Cuboid {
         let q = abs(p) - self.half
         let m = max(q.x, max(q.y, q.z))
         if m > 0.0 { length(max(q, vec3(0.0))) } else { m }
+    }
+
+    fn bound(self) -> Bound {
+        Bound { centre: vec3(), radius: length(self.half), slope: 1.0 }
     }
 }
 
@@ -778,6 +855,10 @@ impl<A: Surface, B: Surface> Surface for Union<A, B> {
         min(self.a.distance(p), self.b.distance(p))
     }
 
+    fn bound(self) -> Bound {
+        self.a.bound().and(self.b.bound())
+    }
+
     fn filtered(self, p: vec3, footprint: f32) -> f32 {
         min(self.a.filtered(p, footprint), self.b.filtered(p, footprint))
     }
@@ -817,6 +898,10 @@ pub struct SmoothUnion<A, B>: Copy + GpuData {
 impl<A: Surface, B: Surface> Surface for SmoothUnion<A, B> {
     fn distance(self, p: vec3) -> f32 {
         smin(self.a.distance(p), self.b.distance(p), self.k)
+    }
+
+    fn bound(self) -> Bound {
+        self.a.bound().and(self.b.bound()).lowered(0.25 * max(self.k, 0.0))
     }
 
     fn filtered(self, p: vec3, footprint: f32) -> f32 {
@@ -1017,6 +1102,12 @@ impl<A: Surface, B: Surface> Surface for Intersect<A, B> {
         max(self.a.distance(p), self.b.distance(p))
     }
 
+    fn bound(self) -> Bound {
+        // Its distance is at least each operand's: the tighter bound holds.
+        let (a, b) = (self.a.bound(), self.b.bound())
+        if a.radius <= b.radius { a } else { b }
+    }
+
     fn filtered(self, p: vec3, footprint: f32) -> f32 {
         max(self.a.filtered(p, footprint), self.b.filtered(p, footprint))
     }
@@ -1057,6 +1148,10 @@ impl<S: Surface> Surface for Translate<S> {
         self.inner.distance(p - self.by)
     }
 
+    fn bound(self) -> Bound {
+        self.inner.bound().moved(self.by)
+    }
+
     fn filtered(self, p: vec3, footprint: f32) -> f32 {
         self.inner.filtered(p - self.by, footprint)
     }
@@ -1092,6 +1187,11 @@ pub struct Displace<S, N>: Copy + GpuData {
 impl<S: Surface, N: Noise> Surface for Displace<S, N> {
     fn distance(self, p: vec3) -> f32 {
         self.inner.distance(p) + self.amp * self.noise.value(p)
+    }
+
+    fn bound(self) -> Bound {
+        let r = self.noise.range()
+        self.inner.bound().lowered(abs(self.amp) * max(abs(r.lo), abs(r.hi)))
     }
 
     fn filtered(self, p: vec3, footprint: f32) -> f32 {
@@ -1267,6 +1367,11 @@ impl<S: Surface> Surface for Scale<S> {
         self.inner.distance(p / self.by) * self.by
     }
 
+    fn bound(self) -> Bound {
+        let b = self.inner.bound()
+        Bound { centre: b.centre * self.by, radius: b.radius * abs(self.by), slope: b.slope }
+    }
+
     fn filtered(self, p: vec3, footprint: f32) -> f32 {
         self.inner.filtered(p / self.by, footprint / abs(self.by)) * self.by
     }
@@ -1364,6 +1469,10 @@ pub struct Named<S>: Copy + GpuData {
 impl<S: Surface> Surface for Named<S> {
     fn distance(self, p: vec3) -> f32 {
         self.inner.distance(p)
+    }
+
+    fn bound(self) -> Bound {
+        self.inner.bound()
     }
 
     fn filtered(self, p: vec3, footprint: f32) -> f32 {
@@ -1984,6 +2093,10 @@ impl<S: Surface, C: Copy + GpuData> Surface for With<S, C> {
         self.inner.distance(p)
     }
 
+    fn bound(self) -> Bound {
+        self.inner.bound()
+    }
+
     fn filtered(self, p: vec3, footprint: f32) -> f32 {
         self.inner.filtered(p, footprint)
     }
@@ -2028,6 +2141,10 @@ pub struct WithAt<S, F>: Copy + GpuData {
 impl<S: Surface, F: Copy + GpuData> Surface for WithAt<S, F> {
     fn distance(self, p: vec3) -> f32 {
         self.inner.distance(p)
+    }
+
+    fn bound(self) -> Bound {
+        self.inner.bound()
     }
 
     fn filtered(self, p: vec3, footprint: f32) -> f32 {
