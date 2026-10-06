@@ -17,6 +17,7 @@ mod fuzz;
 mod gpu_limits;
 mod grazer;
 mod hello_field;
+mod herd;
 mod input;
 mod keys;
 mod language;

@@ -1,7 +1,7 @@
 //! One IR function to one WASM function, plus the generated helpers and export wrappers.
 
 use crate::{Helpers, globals, in_memory, memory, repr, sret, valtype};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use wasm_encoder::{BlockType, Function, Instruction as I, MemArg, ValType};
 use wrela_ir as ir;
 use wrela_ir::layout::{array_stride, column_stride, field_offsets, layout, round_up};
@@ -35,6 +35,97 @@ fn store_op(s: ir::Scalar, offset: u32) -> I<'static> {
         ir::Scalar::F64 => I::F64Store(mem(offset, 3)),
         _ => I::I32Store(mem(offset, 2)),
     }
+}
+
+/// The most bytes a copy of a value does as loads and stores of its own, and a zeroing as
+/// stores; more take `memory.copy` and `memory.fill`.
+const INLINE_BYTES: u32 = 128;
+const INLINE_ZERO_BYTES: u32 = 256;
+
+/// A load or store's width, in a copy done as loads and stores.
+#[derive(Clone, Copy)]
+enum Width {
+    V128,
+    I64,
+    I32,
+    I16,
+    I8,
+}
+
+impl Width {
+    /// log2 of its bytes.
+    fn log2(self) -> u32 {
+        match self {
+            Width::V128 => 4,
+            Width::I64 => 3,
+            Width::I32 => 2,
+            Width::I16 => 1,
+            Width::I8 => 0,
+        }
+    }
+
+    fn val_type(self) -> ValType {
+        match self {
+            Width::V128 => ValType::V128,
+            Width::I64 => ValType::I64,
+            _ => ValType::I32,
+        }
+    }
+
+    /// The alignment to promise at offset `off` in a value aligned to `align` bytes.
+    fn memarg(self, off: u32, align: u32) -> MemArg {
+        let at = if off == 0 { u32::MAX } else { off.trailing_zeros() };
+        mem(off, self.log2().min(align.max(1).trailing_zeros()).min(at))
+    }
+
+    fn load(self, off: u32, align: u32) -> I<'static> {
+        let m = self.memarg(off, align);
+        match self {
+            Width::V128 => I::V128Load(m),
+            Width::I64 => I::I64Load(m),
+            Width::I32 => I::I32Load(m),
+            Width::I16 => I::I32Load16U(m),
+            Width::I8 => I::I32Load8U(m),
+        }
+    }
+
+    fn store(self, off: u32, align: u32) -> I<'static> {
+        let m = self.memarg(off, align);
+        match self {
+            Width::V128 => I::V128Store(m),
+            Width::I64 => I::I64Store(m),
+            Width::I32 => I::I32Store(m),
+            Width::I16 => I::I32Store16(m),
+            Width::I8 => I::I32Store8(m),
+        }
+    }
+
+    fn zero(self) -> I<'static> {
+        match self {
+            Width::V128 => I::V128Const(0),
+            Width::I64 => I::I64Const(0),
+            _ => I::I32Const(0),
+        }
+    }
+}
+
+/// `size` bytes as loads or stores, widest first: each one's offset and width.
+fn chunks(size: u32, simd: bool) -> Vec<(u32, Width)> {
+    let widths: &[Width] = if simd {
+        &[Width::V128, Width::I64, Width::I32, Width::I16, Width::I8]
+    } else {
+        &[Width::I64, Width::I32, Width::I16, Width::I8]
+    };
+    let mut out = Vec::new();
+    let mut off = 0;
+    for &w in widths {
+        let n = 1 << w.log2();
+        while size - off >= n {
+            out.push((off, w));
+            off += n;
+        }
+    }
+    out
 }
 
 /// Zero, of WASM type `t`.
@@ -117,6 +208,19 @@ struct Fe<'m> {
     labels: Vec<Label>,
     /// Where the source location changes: the index in `ins` and the location (`ir::Stmt::At`).
     marks: Vec<(usize, wrela_diag::Span)>,
+    /// Where each restore of the stack pointer starts in `ins` (`epilogue`): two instructions,
+    /// dropped when the function has no frame.
+    restores: Vec<usize>,
+    /// Each comparison of a `u32` value with a constant (`if i >= n { break }`), and each
+    /// negation of one: the operator, the value, the constant, and whether it's negated.
+    compares: HashMap<ir::ValueId, (ir::BinOp, ir::ValueId, u32, bool)>,
+    /// What's known where code is being emitted: some `u32` values are each less than a
+    /// number, by a condition that leads there. A bounds check or a shift's check it proves is
+    /// left out.
+    less: HashMap<ir::ValueId, u32>,
+    /// The aggregate zeros (`Expr::Zero`) that are only ever stored: each store zeros its place
+    /// itself, rather than copy the zero from a slot of its own (`var a = [0.0; 64]`).
+    stored_zeros: HashSet<ir::ValueId>,
 }
 
 /// Whether an expression makes a new aggregate in memory (and so needs a frame slot).
@@ -191,6 +295,10 @@ pub(crate) fn emit_function(
         frame: 0,
         labels: Vec::new(),
         marks: Vec::new(),
+        restores: Vec::new(),
+        compares: compares(m, f),
+        less: HashMap::new(),
+        stored_zeros: stored_zeros(m, f, simd),
     };
     fe.fp = fe.new_local(ValType::I32);
     fe.saved_sp = fe.new_local(ValType::I32);
@@ -212,6 +320,7 @@ pub(crate) fn emit_function(
         });
         if let ir::Stmt::Let(v, e) = s
             && makes_memory(m, f, *v, e, simd)
+            && !fe.stored_zeros.contains(v)
         {
             made.push(*v);
         }
@@ -266,27 +375,33 @@ pub(crate) fn emit_function(
             I::GlobalSet(globals::DEPTH),
         ]);
     }
-    prologue.extend([
-        I::GlobalGet(globals::SP),
-        I::LocalTee(fe.saved_sp),
-        I::GlobalGet(globals::STACK_FLOOR),
-        I::I32Sub,
-        I::I32Const(frame as i32),
-        I::I32LtU,
-        I::If(BlockType::Empty),
-    ]);
-    match m.stack_message {
-        Some(msg) => prologue.extend(ops::panic_with(at.data, msg)?),
-        None => prologue.push(I::Unreachable),
+    if frame == 0 {
+        // No frame: nothing to check, and the stack pointer stays as it is. (Its callees check
+        // their own frames.)
+        drop_restores(&mut fe);
+    } else {
+        prologue.extend([
+            I::GlobalGet(globals::SP),
+            I::LocalTee(fe.saved_sp),
+            I::GlobalGet(globals::STACK_FLOOR),
+            I::I32Sub,
+            I::I32Const(frame as i32),
+            I::I32LtU,
+            I::If(BlockType::Empty),
+        ]);
+        match m.stack_message {
+            Some(msg) => prologue.extend(ops::panic_with(at.data, msg)?),
+            None => prologue.push(I::Unreachable),
+        }
+        prologue.extend([
+            I::End,
+            I::LocalGet(fe.saved_sp),
+            I::I32Const(frame as i32),
+            I::I32Sub,
+            I::LocalTee(fe.fp),
+            I::GlobalSet(globals::SP),
+        ]);
     }
-    prologue.extend([
-        I::End,
-        I::LocalGet(fe.saved_sp),
-        I::I32Const(frame as i32),
-        I::I32Sub,
-        I::LocalTee(fe.fp),
-        I::GlobalSet(globals::SP),
-    ]);
     let mut func = function(fe.locals.iter().copied(), &prologue);
     // Each location starts at the offset its first instruction is written at.
     let mut lines = Vec::new();
@@ -298,6 +413,98 @@ pub(crate) fn emit_function(
         func.instruction(i);
     }
     Ok((func, lines))
+}
+
+/// `Fe::stored_zeros`: the zeros of types in memory whose every use is a store of them.
+fn stored_zeros(m: &ir::Module, f: &ir::Function, simd: bool) -> HashSet<ir::ValueId> {
+    let mut zeros = HashSet::new();
+    let mut other = HashSet::new();
+    ir::visit::walk(&f.body, &mut |s| {
+        match s {
+            // (A value too large for any stack is made, to trap: `ir::opt::KEEP_BYTES`.)
+            ir::Stmt::Let(v, ir::Expr::Zero(t))
+                if in_memory(&m.types, *t, simd)
+                    && layout(&m.types, *t).size < ir::opt::KEEP_BYTES =>
+            {
+                zeros.insert(*v);
+            }
+            // The stored value is the only use that's allowed; a place's index isn't.
+            ir::Stmt::Store(p, _) => p.for_each_value(&mut |x| {
+                other.insert(x);
+            }),
+            s => s.for_each_value(&mut |x| {
+                other.insert(x);
+            }),
+        }
+    });
+    zeros.retain(|v| !other.contains(v));
+    zeros
+}
+
+/// Whether a block always leaves where it ends: it ends in a `break`, `continue`, `return` or
+/// trap.
+fn leaves(b: &ir::Block) -> bool {
+    matches!(
+        b.iter().rev().find(|s| !matches!(s, ir::Stmt::At(_))),
+        Some(ir::Stmt::Break | ir::Stmt::Continue | ir::Stmt::Return(_) | ir::Stmt::Trap)
+    )
+}
+
+/// `Fe::compares`: each `u32` value compared with a constant, and each negation of such a
+/// comparison.
+fn compares(
+    m: &ir::Module,
+    f: &ir::Function,
+) -> HashMap<ir::ValueId, (ir::BinOp, ir::ValueId, u32, bool)> {
+    let mut consts = HashMap::new();
+    let mut out = HashMap::new();
+    let u32_ty = m.types.lookup(&ir::TypeDef::Scalar(ir::Scalar::U32));
+    ir::visit::walk(&f.body, &mut |s| match s {
+        ir::Stmt::Let(v, ir::Expr::Const(ir::Const::U32(n))) => {
+            consts.insert(*v, *n);
+        }
+        ir::Stmt::Let(c, ir::Expr::Binary(op, a, b))
+            if matches!(op, ir::BinOp::Lt | ir::BinOp::Le | ir::BinOp::Gt | ir::BinOp::Ge)
+                && Some(f.value_ty(*a)) == u32_ty =>
+        {
+            if let Some(&n) = consts.get(b) {
+                out.insert(*c, (*op, *a, n, false));
+            }
+        }
+        ir::Stmt::Let(c, ir::Expr::Unary(ir::UnOp::Not, x)) => {
+            if let Some(&(op, a, n, negated)) = out.get(x) {
+                out.insert(*c, (op, a, n, !negated));
+            }
+        }
+        _ => {}
+    });
+    out
+}
+
+/// Removes the restores of the stack pointer from a function that has no frame, keeping each
+/// source location's mark at its instruction.
+fn drop_restores(fe: &mut Fe) {
+    let mut gone = vec![false; fe.ins.len()];
+    for &at in &fe.restores {
+        gone[at] = true;
+        gone[at + 1] = true;
+    }
+    // Instruction k's new index: the instructions before it that stay.
+    let mut index = Vec::with_capacity(fe.ins.len() + 1);
+    let mut n = 0;
+    for &g in &gone {
+        index.push(n);
+        n += usize::from(!g);
+    }
+    index.push(n);
+    for mark in &mut fe.marks {
+        mark.0 = index[mark.0];
+    }
+    let mut k = 0;
+    fe.ins.retain(|_| {
+        k += 1;
+        !gone[k - 1]
+    });
 }
 
 /// For each statement, the values whose locals are free once it's emitted: those its block
@@ -522,6 +729,7 @@ impl<'m> Fe<'m> {
     }
 
     fn epilogue(&mut self) {
+        self.restores.push(self.ins.len());
         self.ins.extend([I::LocalGet(self.saved_sp), I::GlobalSet(globals::SP)]);
         if self.f.counted {
             self.ins.extend([
@@ -567,8 +775,42 @@ impl<'m> Fe<'m> {
     /// Copies a value of aggregate type `t` from the address on top of the stack to the
     /// address below it.
     fn copy(&mut self, t: ir::TypeId) {
-        let size = layout(&self.m.types, t).size;
-        self.ins.extend([I::I32Const(size as i32), I::MemoryCopy { src_mem: 0, dst_mem: 0 }]);
+        let l = layout(&self.m.types, t);
+        if l.size > INLINE_BYTES {
+            self.ins.extend([I::I32Const(l.size as i32), I::MemoryCopy { src_mem: 0, dst_mem: 0 }]);
+            return;
+        }
+        // Small copies as loads and stores: engines can make `memory.copy` a call out of the
+        // code, which costs more than the copy. Every load is before every store, so the two
+        // regions can overlap, as they can for `memory.copy`.
+        let (dst, src) = (self.new_local(ValType::I32), self.new_local(ValType::I32));
+        self.ins.extend([I::LocalSet(src), I::LocalSet(dst)]);
+        let chunks = chunks(l.size, self.at.simd);
+        let mut held = Vec::with_capacity(chunks.len());
+        for &(off, w) in &chunks {
+            let t = self.new_local(w.val_type());
+            self.ins.extend([I::LocalGet(src), w.load(off, l.align), I::LocalSet(t)]);
+            held.push(t);
+        }
+        for (&(off, w), t) in chunks.iter().zip(held) {
+            self.ins.extend([I::LocalGet(dst), I::LocalGet(t), w.store(off, l.align)]);
+        }
+    }
+
+    /// Zeros the `size` bytes at the address in local `a`.
+    fn zero(&mut self, a: u32, size: u32) {
+        if size > INLINE_ZERO_BYTES {
+            self.ins.extend([
+                I::LocalGet(a),
+                I::I32Const(0),
+                I::I32Const(size as i32),
+                I::MemoryFill(0),
+            ]);
+            return;
+        }
+        for (off, w) in chunks(size, self.at.simd) {
+            self.ins.extend([I::LocalGet(a), w.zero(), w.store(off, 0)]);
+        }
     }
 
     /// The address of a value's own frame slot.
@@ -684,6 +926,9 @@ impl<'m> Fe<'m> {
     }
 
     fn bounds_check(&mut self, i: ir::ValueId, n: u32) {
+        if self.known_below(i, n) {
+            return;
+        }
         self.ins.extend([I::LocalGet(self.v(i)), I::I32Const(n as i32), I::I32GeU]);
         self.trap_if();
     }
@@ -747,6 +992,12 @@ impl<'m> Fe<'m> {
         }
         let t = self.vty(v);
         self.addr(p)?;
+        if self.stored_zeros.contains(&v) {
+            let a = self.new_local(ValType::I32);
+            self.ins.push(I::LocalSet(a));
+            self.zero(a, layout(&self.m.types, t).size);
+            return Ok(());
+        }
         if let Some(n) = self.vec_n(t) {
             self.ins.push(I::LocalGet(self.v(v)));
             self.vec_store(n, 0);
@@ -794,12 +1045,7 @@ impl<'m> Fe<'m> {
         self.ins.extend([I::LocalTee(a), I::LocalSet(self.v(v))]);
         if zero {
             let size = layout(&self.m.types, self.vty(v)).size;
-            self.ins.extend([
-                I::LocalGet(a),
-                I::I32Const(0),
-                I::I32Const(size as i32),
-                I::MemoryFill(0),
-            ]);
+            self.zero(a, size);
         }
         Ok(a)
     }
@@ -807,10 +1053,54 @@ impl<'m> Fe<'m> {
     // ---- statements ------------------------------------------------------------------------
 
     fn block(&mut self, b: &ir::Block) -> R<()> {
+        let mut learned = Vec::new();
         for s in b {
             self.stmt(s)?;
+            // Past an `if` one of whose branches always leaves and the other is empty, the
+            // condition is what takes the empty one.
+            if let ir::Stmt::If { cond, then, else_ } = s {
+                let gone = match (leaves(then), leaves(else_)) {
+                    (true, false) if else_.is_empty() => Some(false),
+                    (false, true) if then.is_empty() => Some(true),
+                    _ => None,
+                };
+                if let Some(holds) = gone {
+                    learned.extend(self.learn(*cond, holds));
+                }
+            }
         }
+        self.forget(learned);
         Ok(())
+    }
+
+    /// Adds what `cond` being `holds` says (a value less than a number) to what's known, and
+    /// returns what it replaced, for `forget`.
+    fn learn(&mut self, cond: ir::ValueId, holds: bool) -> Option<(ir::ValueId, Option<u32>)> {
+        let &(op, v, n, negated) = self.compares.get(&cond)?;
+        let below = match (op, holds != negated) {
+            (ir::BinOp::Lt, true) | (ir::BinOp::Ge, false) => n,
+            (ir::BinOp::Le, true) | (ir::BinOp::Gt, false) => n.checked_add(1)?,
+            _ => return None,
+        };
+        let old = self.less.get(&v).copied();
+        if old.is_none_or(|o| below < o) {
+            self.less.insert(v, below);
+        }
+        Some((v, old))
+    }
+
+    fn forget(&mut self, learned: Vec<(ir::ValueId, Option<u32>)>) {
+        for (v, old) in learned.into_iter().rev() {
+            match old {
+                Some(o) => self.less.insert(v, o),
+                None => self.less.remove(&v),
+            };
+        }
+    }
+
+    /// Whether `v` is known to be less than `n`.
+    fn known_below(&self, v: ir::ValueId, n: u32) -> bool {
+        self.less.get(&v).is_some_and(|&b| b <= n)
     }
 
     fn depth_of(&self, want: Label) -> R<u32> {
@@ -860,10 +1150,14 @@ impl<'m> Fe<'m> {
             ir::Stmt::If { cond, then, else_ } => {
                 self.ins.extend([I::LocalGet(self.v(*cond)), I::If(BlockType::Empty)]);
                 self.labels.push(Label::Plain);
+                let learned = self.learn(*cond, true);
                 self.block(then)?;
+                self.forget(learned.into_iter().collect());
                 if !else_.is_empty() {
                     self.ins.push(I::Else);
+                    let learned = self.learn(*cond, false);
                     self.block(else_)?;
+                    self.forget(learned.into_iter().collect());
                 }
                 self.labels.pop();
                 self.ins.push(I::End);
@@ -1092,7 +1386,9 @@ impl<'m> Fe<'m> {
                 self.ins.extend([i, I::LocalSet(self.v(v))]);
             }
             ir::Expr::Zero(_) => {
-                if self.vec_n(t).is_some() {
+                if self.stored_zeros.contains(&v) {
+                    // Each store zeros its place (`store_place`).
+                } else if self.vec_n(t).is_some() {
                     self.ins.extend([I::V128Const(0), I::LocalSet(self.v(v))]);
                 } else if self.m.types.is_aggregate(t) {
                     self.fresh_slot(v, true)?;

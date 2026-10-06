@@ -744,4 +744,183 @@ mod tests {
         }
         assert!(most < 16, "a function has {most} locals");
     }
+
+    /// The operators of the emitted function whose code holds the f32 constant `marker`, as
+    /// text: a test's function, found among the module's helpers and wrappers.
+    fn body_with(wasm: &[u8], marker: f32) -> Vec<String> {
+        for payload in wasmparser::Parser::new(0).parse_all(wasm) {
+            if let Ok(wasmparser::Payload::CodeSectionEntry(body)) = payload {
+                let mut ops = body.get_operators_reader().expect("operators");
+                let mut out = Vec::new();
+                while !ops.eof() {
+                    out.push(format!("{:?}", ops.read().expect("op")));
+                }
+                let mark = format!("F32Const {{ value: Ieee32({}) }}", marker.to_bits());
+                if out.contains(&mark) {
+                    return out;
+                }
+            }
+        }
+        panic!("no function holds {marker}")
+    }
+
+    /// `fn f(p: &[f32; n]) -> f32 { let l = p; l[0] + MARK }`: a copy of `n` floats into a local.
+    fn copy_of(n: u32) -> Vec<String> {
+        use wrela_ir::{BinOp, Const, Expr, Param, Place, PlaceRoot, Proj, Stmt, TypeDef};
+        let mut m = wrela_ir::Module::default();
+        let (f32t, u32t) = (m.types.f32(), m.types.u32());
+        let arr = m.types.intern(TypeDef::Array(f32t, n));
+        let p = Param { name: "p".into(), ty: arr, by_ref: true, mutable: false };
+        let mut f = wrela_ir::Function::new("f", vec![p], Some(f32t));
+        let l = f.new_local("l", arr);
+        let (v, zero, x, mark, out) = (
+            f.new_value(arr),
+            f.new_value(u32t),
+            f.new_value(f32t),
+            f.new_value(f32t),
+            f.new_value(f32t),
+        );
+        f.body = vec![
+            Stmt::Let(v, Expr::Load(Place::root(PlaceRoot::Param(0)))),
+            Stmt::Store(Place::local(l), v),
+            Stmt::Let(zero, Expr::Const(Const::U32(0))),
+            Stmt::Let(x, Expr::Load(Place::local(l).with(Proj::Index(zero)))),
+            Stmt::Let(mark, Expr::Const(Const::F32(1234.5))),
+            Stmt::Let(out, Expr::Binary(BinOp::Add, x, mark)),
+            Stmt::Return(Some(out)),
+        ];
+        // Not exported (an export takes no aggregate): the back end emits it all the same.
+        m.add_function(f);
+        wrela_ir::verify(&m).expect("valid IR");
+        let out = emit(&m).expect("emits");
+        wasmparser::Validator::new().validate_all(&out.wasm).expect("a valid module");
+        body_with(&out.wasm, 1234.5)
+    }
+
+    /// A small value is copied with loads and stores of its own (an engine can make
+    /// `memory.copy` a call out of the code); a large one with `memory.copy`.
+    #[test]
+    fn small_copies_are_loads_and_stores() {
+        let copies = |ops: &[String]| ops.iter().filter(|o| o.starts_with("MemoryCopy")).count();
+        assert_eq!(copies(&copy_of(8)), 0);
+        assert!(copies(&copy_of(256)) >= 1);
+    }
+
+    /// `fn f(x: f32) -> f32 { x + MARK }` has no frame: no stack check, and the stack pointer
+    /// isn't touched. A function with a frame checks and moves it.
+    #[test]
+    fn a_function_without_a_frame_leaves_the_stack_alone() {
+        use wrela_ir::{BinOp, Const, Expr, Param, Stmt};
+        let mut m = wrela_ir::Module::default();
+        let f32t = m.types.f32();
+        let x_param = Param { name: "x".into(), ty: f32t, by_ref: false, mutable: false };
+        let mut f = wrela_ir::Function::new("f", vec![x_param], Some(f32t));
+        let (x, mark, out) = (f.new_value(f32t), f.new_value(f32t), f.new_value(f32t));
+        f.body = vec![
+            Stmt::Let(x, Expr::Param(0)),
+            Stmt::Let(mark, Expr::Const(Const::F32(1234.5))),
+            Stmt::Let(out, Expr::Binary(BinOp::Add, x, mark)),
+            Stmt::Return(Some(out)),
+        ];
+        let id = m.add_function(f);
+        m.exports.push(("f".into(), id));
+        let out = emit(&m).expect("emits");
+        let sp = format!("GlobalGet {{ global_index: {} }}", globals::SP);
+        assert!(!body_with(&out.wasm, 1234.5).contains(&sp));
+        assert!(copy_of(256).contains(&sp));
+    }
+
+    /// In `for i in 0..4 { a[i] }` over a `[f32; 4]`, the loop's own test proves each index in
+    /// range: the access isn't checked again. Over `0..5` it is.
+    #[test]
+    fn an_index_the_loop_test_proves_isnt_checked() {
+        use wrela_ir::{BinOp, Const, Expr, Param, Place, PlaceRoot, Proj, Stmt, TypeDef};
+        let traps = |len: u32| {
+            let mut m = wrela_ir::Module::default();
+            let (f32t, u32t, boolt) = (m.types.f32(), m.types.u32(), m.types.bool());
+            let arr = m.types.intern(TypeDef::Array(f32t, 4));
+            let p = Param { name: "a".into(), ty: arr, by_ref: true, mutable: false };
+            let mut f = wrela_ir::Function::new("f", vec![p], Some(f32t));
+            let (ctr, sum) = (f.new_local("i", u32t), f.new_local("s", f32t));
+            let v = |f: &mut wrela_ir::Function, t| f.new_value(t);
+            let (zero, n, zf, mark) =
+                (v(&mut f, u32t), v(&mut f, u32t), v(&mut f, f32t), v(&mut f, f32t));
+            let (i, done, x, s0, s1) = (
+                v(&mut f, u32t),
+                v(&mut f, boolt),
+                v(&mut f, f32t),
+                v(&mut f, f32t),
+                v(&mut f, f32t),
+            );
+            let (a, one, next, out) =
+                (v(&mut f, u32t), v(&mut f, u32t), v(&mut f, u32t), v(&mut f, f32t));
+            f.body = vec![
+                Stmt::Let(zero, Expr::Const(Const::U32(0))),
+                Stmt::Let(n, Expr::Const(Const::U32(len))),
+                Stmt::Let(zf, Expr::Const(Const::F32(0.0))),
+                Stmt::Let(mark, Expr::Const(Const::F32(1234.5))),
+                Stmt::Store(Place::local(ctr), zero),
+                Stmt::Store(Place::local(sum), mark),
+                Stmt::Loop {
+                    body: vec![
+                        Stmt::Let(i, Expr::Load(Place::local(ctr))),
+                        Stmt::Let(done, Expr::Binary(BinOp::Ge, i, n)),
+                        Stmt::If { cond: done, then: vec![Stmt::Break], else_: Vec::new() },
+                        Stmt::Let(
+                            x,
+                            Expr::Load(Place::root(PlaceRoot::Param(0)).with(Proj::Index(i))),
+                        ),
+                        Stmt::Let(s0, Expr::Load(Place::local(sum))),
+                        Stmt::Let(s1, Expr::Binary(BinOp::Add, s0, x)),
+                        Stmt::Store(Place::local(sum), s1),
+                    ],
+                    continuing: vec![
+                        Stmt::Let(a, Expr::Load(Place::local(ctr))),
+                        Stmt::Let(one, Expr::Const(Const::U32(1))),
+                        Stmt::Let(next, Expr::Binary(BinOp::Add, a, one)),
+                        Stmt::Store(Place::local(ctr), next),
+                    ],
+                },
+                Stmt::Let(out, Expr::Load(Place::local(sum))),
+                Stmt::Return(Some(out)),
+            ];
+            let _ = zf;
+            m.add_function(f);
+            wrela_ir::verify(&m).expect("valid IR");
+            let out = emit_with(&m, Options { simd: false, ..Options::default() }).expect("emits");
+            body_with(&out.wasm, 1234.5).iter().filter(|o| *o == "Unreachable").count()
+        };
+        // The counter's increment is checked either way.
+        assert_eq!(traps(5), traps(4) + 1);
+    }
+
+    /// `var a = [0.0; 64]` zeros the local's own memory: no zero is made elsewhere and copied.
+    #[test]
+    fn a_zero_only_stored_is_written_in_place() {
+        use wrela_ir::{Const, Expr, Place, Proj, Stmt, TypeDef};
+        let mut m = wrela_ir::Module::default();
+        let (f32t, u32t) = (m.types.f32(), m.types.u32());
+        let arr = m.types.intern(TypeDef::Array(f32t, 64));
+        let mut f = wrela_ir::Function::new("f", Vec::new(), Some(f32t));
+        let l = f.new_local("a", arr);
+        let (z, k, mark, x) =
+            (f.new_value(arr), f.new_value(u32t), f.new_value(f32t), f.new_value(f32t));
+        f.body = vec![
+            Stmt::Let(z, Expr::Zero(arr)),
+            Stmt::Store(Place::local(l), z),
+            Stmt::Let(k, Expr::Const(Const::U32(7))),
+            Stmt::Let(mark, Expr::Const(Const::F32(1234.5))),
+            Stmt::Store(Place::local(l).with(Proj::Index(k)), mark),
+            Stmt::Let(x, Expr::Load(Place::local(l).with(Proj::Index(k)))),
+            Stmt::Return(Some(x)),
+        ];
+        let id = m.add_function(f);
+        m.exports.push(("f".into(), id));
+        let out = emit(&m).expect("emits");
+        let ops = body_with(&out.wasm, 1234.5);
+        assert!(
+            !ops.iter().any(|o| o.starts_with("MemoryCopy") || o.starts_with("MemoryFill")),
+            "{ops:?}"
+        );
+    }
 }

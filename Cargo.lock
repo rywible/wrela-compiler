@@ -2080,6 +2080,7 @@ dependencies = [
  "ab_glyph",
  "pollster",
  "serde_json",
+ "wasmtime",
  "wgpu",
  "wrela-abi",
  "wrela-diag",

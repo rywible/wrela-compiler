@@ -21,6 +21,7 @@ wrela-grammar.workspace = true
 wrela-host.workspace = true
 wrela-abi.workspace = true
 serde_json.workspace = true
+wasmtime.workspace = true
 wrela-wfont.workspace = true
 # The reference rasterizer the ui package's text is compared with (AC2).
 ab_glyph = "0.2"

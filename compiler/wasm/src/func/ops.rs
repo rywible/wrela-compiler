@@ -180,6 +180,19 @@ impl Iw {
 /// Pushes `a op b` for scalars of type `s`, held in locals `a` and `b`. Integer arithmetic is
 /// checked unless the op is a wrapping one.
 fn scalar_bin(fe: &mut Fe, op: ir::BinOp, s: ir::Scalar, a: u32, b: u32) -> R<()> {
+    scalar_bin_known(fe, op, s, a, b, false)
+}
+
+/// `scalar_bin`; `small_shift`: a shift's amount is known to be less than the width, so it
+/// isn't checked.
+fn scalar_bin_known(
+    fe: &mut Fe,
+    op: ir::BinOp,
+    s: ir::Scalar,
+    a: u32,
+    b: u32,
+    small_shift: bool,
+) -> R<()> {
     use ir::BinOp as B;
     let (la, lb) = (I::LocalGet(a), I::LocalGet(b));
     if s.is_float() {
@@ -281,8 +294,10 @@ fn scalar_bin(fe: &mut Fe, op: ir::BinOp, s: ir::Scalar, a: u32, b: u32) -> R<()
         }
         B::Shl | B::Shr => {
             // A shift of at least the width traps on the CPU. The amount is a u32.
-            fe.ins.extend([lb.clone(), I::I32Const(s.bits() as i32), I::I32GeU]);
-            fe.trap_if();
+            if !small_shift {
+                fe.ins.extend([lb.clone(), I::I32Const(s.bits() as i32), I::I32GeU]);
+                fe.trap_if();
+            }
             fe.ins.extend([la, lb]);
             if w.wide {
                 fe.ins.push(I::I64ExtendI32U);
@@ -673,7 +688,9 @@ pub(super) fn binary(
     let (ta, tb) = (fe.vty(a), fe.vty(b));
     if !fe.m.types.is_aggregate(t) && !fe.m.types.is_aggregate(ta) {
         let s = fe.scalar(ta)?;
-        scalar_bin(fe, op, s, fe.v(a), fe.v(b))?;
+        let small_shift =
+            matches!(op, ir::BinOp::Shl | ir::BinOp::Shr) && fe.known_below(b, s.bits());
+        scalar_bin_known(fe, op, s, fe.v(a), fe.v(b), small_shift)?;
         fe.ins.push(I::LocalSet(fe.v(v)));
         return Ok(());
     }

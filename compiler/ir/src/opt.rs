@@ -435,7 +435,7 @@ fn inline_all(m: &mut Module, keep: &[bool]) -> Result<()> {
     let n = m.functions.len();
     let mut exits: Vec<Option<Function>> = vec![None; n];
     for f in order {
-        inline_into(m, f, &mut exits, keep, None)?;
+        inline_into(m, f, &mut exits, keep, &[], None)?;
         if called[f] {
             exits[f] = exit_form(m, f);
         }
@@ -459,13 +459,25 @@ fn inline_into(
     f: usize,
     exits: &mut [Option<Function>],
     keep: &[bool],
+    in_loops: &[bool],
     budget: Option<(usize, &[usize])>,
 ) -> Result<()> {
     let mut func = std::mem::take(&mut m.functions[f]);
     let body = std::mem::take(&mut func.body);
     let rename = vec![None; func.values.len()];
     let size = budget.map_or(0, |_| size_of(&body));
-    let mut cx = Inliner { m, exits, f: &mut func, rename, keep, budget, size, at: None };
+    let mut cx = Inliner {
+        m,
+        exits,
+        f: &mut func,
+        rename,
+        keep,
+        in_loops,
+        loops: 0,
+        budget,
+        size,
+        at: None,
+    };
     let body = cx.block(body);
     func.body = body?;
     m.functions[f] = func;
@@ -488,6 +500,11 @@ struct Inliner<'a> {
     rename: Vec<Option<ValueId>>,
     /// The functions that stay calls.
     keep: &'a [bool],
+    /// The functions of those that are inlined where they're called in a loop (none, if it's
+    /// empty).
+    in_loops: &'a [bool],
+    /// How many loops the code being copied is in.
+    loops: u32,
     /// The most statements the body may grow to, and each function's size (see `inline_into`).
     budget: Option<(usize, &'a [usize])>,
     /// The body's size so far, with what's inlined into it.
@@ -500,7 +517,8 @@ impl Inliner<'_> {
     /// Whether a call to `g` is inlined: it's not kept, and it fits the budget (whose size it
     /// then takes).
     fn inlines(&mut self, g: FuncId) -> bool {
-        if self.keep[g.index()] {
+        let in_loop = self.loops > 0 && self.in_loops.get(g.index()).copied().unwrap_or(false);
+        if self.keep[g.index()] && !in_loop {
             return false;
         }
         match self.budget {
@@ -546,9 +564,11 @@ impl Inliner<'_> {
                     out.push(Stmt::If { cond, then, else_ });
                 }
                 Stmt::Loop { body, continuing } => {
-                    let body = self.block(body)?;
-                    let continuing = self.block(continuing)?;
-                    out.push(Stmt::Loop { body, continuing });
+                    self.loops += 1;
+                    let body = self.block(body);
+                    let continuing = self.block(continuing);
+                    self.loops -= 1;
+                    out.push(Stmt::Loop { body: body?, continuing: continuing? });
                 }
                 other => out.push(other),
             }
@@ -707,8 +727,10 @@ impl Copier<'_> {
 // ---- inlining on the CPU --------------------------------------------------------------------
 
 /// The size of a body, in statements once its own callees are inlined, that the CPU inlines at
-/// each of its calls.
-const CPU_INLINE_SIZE: usize = 40;
+/// each of its calls; and at each of its calls in a loop, where a call costs the most (a
+/// fold's step over an array of parts, called once per part).
+const CPU_INLINE_SIZE: usize = 250;
+const CPU_LOOP_INLINE_SIZE: usize = 600;
 
 /// The most statements a CPU function grows to with what's inlined into it.
 const CPU_BUDGET: usize = 4000;
@@ -742,24 +764,416 @@ pub fn inline_cpu(m: &mut Module) -> Result<()> {
     }
     let recursive = recursive(&callees);
     let mut keep = vec![true; n];
+    let mut in_loops = vec![false; n];
     let mut sizes = vec![0usize; n];
     let mut exits: Vec<Option<Function>> = vec![None; n];
     for f in postorder(&callees) {
-        inline_into(m, f, &mut exits, &keep, Some((CPU_BUDGET, &sizes)))?;
+        inline_into(m, f, &mut exits, &keep, &in_loops, Some((CPU_BUDGET, &sizes)))?;
+        // Tidied before it's measured, and before it's inlined anywhere.
+        let mut func = std::mem::take(&mut m.functions[f]);
+        tidy(m, &mut func);
+        m.functions[f] = func;
         sizes[f] = size_of(&m.functions[f].body);
         let once = sites[f] == 1 && !root[f];
-        if !recursive[f] && !m.functions[f].counted && (sizes[f] <= CPU_INLINE_SIZE || once) {
-            keep[f] = false;
-            exits[f] = exit_form(m, f);
+        if !recursive[f] && !m.functions[f].counted {
+            if sizes[f] <= CPU_INLINE_SIZE || once {
+                keep[f] = false;
+                exits[f] = exit_form(m, f);
+            } else if sizes[f] <= CPU_LOOP_INLINE_SIZE {
+                in_loops[f] = true;
+                exits[f] = exit_form(m, f);
+            }
         }
     }
     remove_unreached(m);
-    for i in 0..m.functions.len() {
-        let mut f = std::mem::take(&mut m.functions[i]);
-        reuse_loads(m, &mut f);
-        m.functions[i] = f;
-    }
     Ok(())
+}
+
+/// A CPU function's clean-up after inlining: its struct locals split, parts read through, loads
+/// that read what's known reused, and what nothing uses dropped.
+fn tidy(m: &Module, f: &mut Function) {
+    split_locals(m, f);
+    forward_extracts(m, f);
+    reuse_loads(m, f);
+    // Merging is safe where a merged expression could trap: the first, which is kept, runs
+    // before any of the others.
+    cse(f);
+    drop_dead_values(m, f);
+    sink_values(m, f);
+    compact_locals(f);
+}
+
+// ---- splitting struct locals (CPU) ----------------------------------------------------------
+
+/// The most fields a struct local has for it to be split, and the most bytes.
+const SPLIT_FIELDS: usize = 12;
+const SPLIT_BYTES: u32 = 256;
+
+/// Splits each small local of a struct type (a tuple's too) whose address isn't taken into a
+/// local per field, the fields' own structs again, so that a tuple a function builds and takes apart
+/// at once, such as an inlined `mirrored`'s `(vec3, bool)` or a fold's `(f32, Tissue)`, lives in
+/// WASM locals rather than in its frame. A store of the whole is a store of each field; a load
+/// of the whole builds it again from its fields' loads (which `forward_extracts` then reads
+/// through).
+fn split_locals(m: &Module, f: &mut Function) {
+    // Nested structs split a level a round.
+    for _ in 0..4 {
+        // Only locals something mentions (a split one is mentioned no more).
+        let mut mentions = vec![0u32; f.locals.len()];
+        visit::count_local_mentions(&f.body, &mut mentions);
+        let mut split = vec![false; f.locals.len()];
+        for (i, l) in f.locals.iter().enumerate() {
+            split[i] = mentions[i] > 0
+                && matches!(m.types.get(l.ty), TypeDef::Struct { fields, .. }
+                    if !fields.is_empty() && fields.len() <= SPLIT_FIELDS)
+                && crate::layout::layout(&m.types, l.ty).size <= SPLIT_BYTES;
+        }
+        // A local whose place goes anywhere but a load or a store stays whole.
+        visit::walk(&f.body, &mut |s| match s {
+            Stmt::Store(..) | Stmt::Let(_, Expr::Load(_)) => {}
+            s => s.for_each_place(&mut |p| {
+                if let Some(l) = p.root_local() {
+                    split[l.index()] = false;
+                }
+            }),
+        });
+        if !split.iter().any(|&x| x) {
+            return;
+        }
+        // Each split local's fields' locals.
+        let mut parts: Vec<Vec<LocalId>> = vec![Vec::new(); f.locals.len()];
+        for i in 0..split.len() {
+            if !split[i] {
+                continue;
+            }
+            let (name, ty) = (f.locals[i].name.clone(), f.locals[i].ty);
+            let TypeDef::Struct { fields, .. } = m.types.get(ty) else { unreachable!() };
+            parts[i] = fields.iter().map(|(n, t)| f.new_local(format!("{name}.{n}"), *t)).collect();
+        }
+        let mut body = std::mem::take(&mut f.body);
+        split_block(m, f, &mut body, &parts);
+        f.body = body;
+    }
+}
+
+fn split_block(m: &Module, f: &mut Function, b: &mut Block, parts: &[Vec<LocalId>]) {
+    // The split local a place is in, and the place in its field's local.
+    let inner = |p: &Place| -> Option<Place> {
+        let l = p.root_local()?;
+        let ls = parts.get(l.index()).filter(|ls| !ls.is_empty())?;
+        let Some(Proj::Field(k)) = p.path.first() else { return None };
+        Some(Place { root: PlaceRoot::Local(ls[*k as usize]), path: p.path[1..].to_vec() })
+    };
+    let whole = |p: &Place| -> Option<&Vec<LocalId>> {
+        let l = p.root_local()?;
+        parts.get(l.index()).filter(|ls| !ls.is_empty() && p.path.is_empty())
+    };
+    let old = std::mem::take(b);
+    for mut s in old {
+        for inner_block in s.blocks_mut() {
+            split_block(m, f, inner_block, parts);
+        }
+        match s {
+            Stmt::Store(ref p, v) if whole(p).is_some() => {
+                let ls = whole(p).expect("checked").clone();
+                for (k, l) in ls.into_iter().enumerate() {
+                    let x = f.new_value(f.locals[l.index()].ty);
+                    b.push(Stmt::Let(x, Expr::Extract(v, k as u32)));
+                    b.push(Stmt::Store(Place::local(l), x));
+                }
+            }
+            Stmt::Store(ref p, v) if inner(p).is_some() => {
+                b.push(Stmt::Store(inner(p).expect("checked"), v));
+            }
+            Stmt::Let(v, Expr::Load(ref p)) if whole(p).is_some() => {
+                let ls = whole(p).expect("checked").clone();
+                let xs: Vec<ValueId> = ls
+                    .into_iter()
+                    .map(|l| {
+                        let x = f.new_value(f.locals[l.index()].ty);
+                        b.push(Stmt::Let(x, Expr::Load(Place::local(l))));
+                        x
+                    })
+                    .collect();
+                b.push(Stmt::Let(v, Expr::Construct(f.value_ty(v), xs)));
+            }
+            Stmt::Let(v, Expr::Load(ref p)) if inner(p).is_some() => {
+                b.push(Stmt::Let(v, Expr::Load(inner(p).expect("checked"))));
+            }
+            s => b.push(s),
+        }
+    }
+    let _ = m;
+}
+
+/// Reads a part of a value built from its parts as that part: `Extract(Construct(t, xs), i)` is
+/// `xs[i]`. (A part is defined before the value, so it's visible wherever the value is.)
+fn forward_extracts(m: &Module, f: &mut Function) {
+    let mut built: HashMap<ValueId, Vec<ValueId>> = HashMap::new();
+    visit::walk(&f.body, &mut |s| {
+        if let Stmt::Let(v, Expr::Construct(t, xs)) = s {
+            let whole = match m.types.get(*t) {
+                TypeDef::Struct { .. } => true,
+                TypeDef::Vector(n) | TypeDef::Matrix(n) => xs.len() == *n as usize,
+                _ => false,
+            };
+            if whole {
+                built.insert(*v, xs.clone());
+            }
+        }
+    });
+    if built.is_empty() {
+        return;
+    }
+    let mut rename: Vec<Option<ValueId>> = vec![None; f.values.len()];
+    fn go(
+        b: &mut Block,
+        built: &HashMap<ValueId, Vec<ValueId>>,
+        rename: &mut Vec<Option<ValueId>>,
+    ) {
+        let resolve = |rename: &[Option<ValueId>], mut v: ValueId| {
+            while let Some(Some(w)) = rename.get(v.index()) {
+                v = *w;
+            }
+            v
+        };
+        b.retain_mut(|s| {
+            s.for_each_value_mut(&mut |x| *x = resolve(rename, *x));
+            if let Stmt::Let(w, Expr::Extract(x, i)) = s
+                && let Some(xs) = built.get(x)
+            {
+                rename[w.index()] = Some(resolve(rename, xs[*i as usize]));
+                return false;
+            }
+            for inner in s.blocks_mut() {
+                go(inner, built, rename);
+            }
+            true
+        });
+    }
+    // The parts a construct holds are renamed as they're reached: each is defined before it.
+    let mut body = std::mem::take(&mut f.body);
+    go(&mut body, &built, &mut rename);
+    // A construct's parts were recorded before renaming: read them through it again.
+    if rename.iter().any(Option::is_some) {
+        visit::walk_mut(&mut body, &mut |s| {
+            s.for_each_value_mut(&mut |x| {
+                while let Some(Some(w)) = rename.get(x.index()) {
+                    *x = *w;
+                }
+            })
+        });
+    }
+    f.body = body;
+}
+
+/// The size from which an aggregate stays where it's made, used or not: a value larger than
+/// the stack traps when its function is entered (language.md §2), whether or not it's read.
+/// (Every stack is larger than this.)
+pub const KEEP_BYTES: u32 = 1 << 20;
+
+/// Whether `e` makes a value of `KEEP_BYTES` or more.
+fn huge(m: &Module, e: &Expr, f: &Function) -> bool {
+    let t = match e {
+        Expr::Construct(t, _) | Expr::Zero(t) | Expr::Variant(t, ..) => *t,
+        Expr::Splat(x, _) | Expr::Swizzle(x, _) | Expr::Select { if_true: x, .. } => f.value_ty(*x),
+        _ => return false,
+    };
+    m.types.is_aggregate(t) && crate::layout::layout(&m.types, t).size >= KEEP_BYTES
+}
+
+/// Whether `e` can't trap or do anything else, and reads nothing that can change: constants,
+/// values built from parts or taken apart, float arithmetic (but in a debug build, which checks
+/// each float it computes for NaN, `Module::nan_message`), comparisons and bit operations, and
+/// conversions that can't fail; but not a value of `KEEP_BYTES` or more. Such a value can be
+/// dropped if nothing uses it, or computed later.
+fn inert(m: &Module, f: &Function, e: &Expr) -> bool {
+    if huge(m, e, f) {
+        return false;
+    }
+    let is_float = |v: ValueId| match m.types.get(f.value_ty(v)) {
+        TypeDef::Scalar(s) => s.is_float(),
+        TypeDef::Vector(_) | TypeDef::Matrix(_) => true,
+        _ => false,
+    };
+    let float = |v: ValueId| m.nan_message.is_none() && is_float(v);
+    match e {
+        Expr::Const(_)
+        | Expr::Zero(_)
+        | Expr::Construct(..)
+        | Expr::Variant(..)
+        | Expr::Extract(..)
+        | Expr::Splat(..)
+        | Expr::Swizzle(..)
+        | Expr::Bitcast(..)
+        | Expr::Select { .. } => true,
+        // Integer arithmetic is checked, and a shift by too much traps.
+        Expr::Binary(op, a, _) => {
+            float(*a)
+                || op.is_comparison()
+                || matches!(
+                    op,
+                    BinOp::WrappingAdd
+                        | BinOp::WrappingSub
+                        | BinOp::WrappingMul
+                        | BinOp::BitAnd
+                        | BinOp::BitOr
+                        | BinOp::BitXor
+                        | BinOp::And
+                        | BinOp::Or
+                )
+        }
+        Expr::Unary(op, a) => float(*a) || matches!(op, UnOp::Not),
+        Expr::Builtin(_, xs) => xs.iter().all(|x| float(*x)),
+        // A float out of an integer's range traps.
+        Expr::Convert(x, _) => !is_float(*x),
+        _ => false,
+    }
+}
+
+/// Drops the values nothing uses that are `inert`, or loads of a local's own storage without an
+/// index (which is checked). Then the stores to locals nothing reads any more.
+fn drop_dead_values(m: &Module, f: &mut Function) {
+    loop {
+        let mut uses = vec![0u32; f.values.len()];
+        visit::walk(&f.body, &mut |s| s.for_each_value(&mut |v| uses[v.index()] += 1));
+        let removable = |e: &Expr| match e {
+            Expr::Load(p) => {
+                m.local_storage(f, p).is_some()
+                    && p.path.iter().all(|x| !matches!(x, Proj::Index(_)))
+            }
+            e => inert(m, f, e),
+        };
+        let mut dead = vec![false; f.values.len()];
+        let mut any = false;
+        visit::walk(&f.body, &mut |s| {
+            if let Stmt::Let(v, e) = s
+                && uses[v.index()] == 0
+                && removable(e)
+            {
+                dead[v.index()] = true;
+                any = true;
+            }
+        });
+        if !any {
+            break;
+        }
+        fn sweep(b: &mut Block, dead: &[bool]) {
+            b.retain_mut(|s| {
+                for inner in s.blocks_mut() {
+                    sweep(inner, dead);
+                }
+                !matches!(s, Stmt::Let(v, _) if dead[v.index()])
+            });
+        }
+        sweep(&mut f.body, &dead);
+    }
+    drop_dead_stores(m, f);
+}
+
+/// Moves each `inert` value that only one branch of a later `if` uses into that branch, so the
+/// other doesn't compute it: a fold's `(f32, C)` that only a join reads, built at every item
+/// though most are skipped (and built in memory, being an aggregate). Never into a loop, which
+/// would compute it again each time round.
+fn sink_values(m: &Module, f: &mut Function) {
+    let mut body = std::mem::take(&mut f.body);
+    sink_block(m, f, &mut body);
+    f.body = body;
+}
+
+/// A branch of an `if`, as `sink_block` sees it: the values it uses, and the statements moved
+/// to its start (the last first).
+type Arm = (HashSet<ValueId>, Vec<Stmt>);
+
+fn sink_block(m: &Module, f: &Function, b: &mut Block) {
+    fn deep(s: &Stmt, into: &mut HashSet<ValueId>) {
+        s.for_each_value(&mut |v| {
+            into.insert(v);
+        });
+        for inner in s.blocks() {
+            for t in inner {
+                deep(t, into);
+            }
+        }
+    }
+    fn deep_block(b: &Block) -> HashSet<ValueId> {
+        let mut out = HashSet::new();
+        for s in b {
+            deep(s, &mut out);
+        }
+        out
+    }
+    let n = b.len();
+    // Each value's users among the block's statements (counting what's nested in them).
+    let mut users: HashMap<ValueId, Vec<usize>> = HashMap::new();
+    for (j, s) in b.iter().enumerate() {
+        let mut u = HashSet::new();
+        deep(s, &mut u);
+        for v in u {
+            users.entry(v).or_default().push(j);
+        }
+    }
+    // For each `if`: what each branch uses, and the values moved into it (last first).
+    let mut branch: Vec<Option<[Arm; 2]>> = b
+        .iter()
+        .map(|s| match s {
+            Stmt::If { then, else_, .. } => {
+                Some([(deep_block(then), Vec::new()), (deep_block(else_), Vec::new())])
+            }
+            _ => None,
+        })
+        .collect();
+    let mut moved = vec![false; n];
+    // From the last, so a value's parts follow it into the branch it went to.
+    for i in (0..n).rev() {
+        let Stmt::Let(v, e) = &b[i] else { continue };
+        if !inert(m, f, e) {
+            continue;
+        }
+        let v = *v;
+        let Some(us) = users.get(&v) else { continue };
+        let mut later = us.iter().copied().filter(|&j| j > i && !moved[j]);
+        let Some(j) = later.next() else { continue };
+        if later.any(|k| k != j) {
+            continue;
+        }
+        let Stmt::If { cond, .. } = &b[j] else { continue };
+        if *cond == v {
+            continue;
+        }
+        let Some(arms) = branch[j].as_mut() else { continue };
+        let k = match (arms[0].0.contains(&v), arms[1].0.contains(&v)) {
+            (true, false) => 0,
+            (false, true) => 1,
+            _ => continue,
+        };
+        let s = b[i].clone();
+        s.for_each_value(&mut |x| {
+            arms[k].0.insert(x);
+            users.entry(x).or_default().push(j);
+        });
+        arms[k].1.push(s);
+        moved[i] = true;
+    }
+    let old = std::mem::take(b);
+    for (i, mut s) in old.into_iter().enumerate() {
+        if moved[i] {
+            continue;
+        }
+        if let (Stmt::If { then, else_, .. }, Some([(_, a), (_, c)])) = (&mut s, branch[i].take()) {
+            // Moved last first: their order, reversed back.
+            if !a.is_empty() {
+                then.splice(0..0, a.into_iter().rev());
+            }
+            if !c.is_empty() {
+                else_.splice(0..0, c.into_iter().rev());
+            }
+        }
+        for inner in s.blocks_mut() {
+            sink_block(m, f, inner);
+        }
+        b.push(s);
+    }
 }
 
 // ---- branches on constants (CPU) ------------------------------------------------------------
@@ -1533,6 +1947,180 @@ mod tests {
         assert!(sum.is_some() && main.body.last() == Some(&Stmt::Return(sum)), "{:?}", main.body);
         let stores_n = |s: &Stmt| matches!(s, Stmt::Store(p, _) if p.root_local() == Some(n));
         assert!(!visit::any(&main.body, &mut |s| stores_n(s)));
+        crate::verify(&m).expect("a valid module");
+    }
+
+    /// A `(vec3, bool)` local, stored whole in each branch of an `if` and read back field by
+    /// field (an inlined `mirrored`), becomes two locals; its parts are read through, and no
+    /// tuple is built.
+    #[test]
+    fn a_struct_local_is_split_into_its_fields() {
+        let mut m = Module::default();
+        let (f32t, boolt) = (m.types.f32(), m.types.bool());
+        let v3 = m.types.vector(3);
+        let pair = m.types.intern(TypeDef::Struct {
+            name: "(vec3, bool)".into(),
+            fields: vec![("_0".into(), v3), ("_1".into(), boolt)],
+        });
+        let mut f = Function::new("f", Vec::new(), Some(f32t));
+        let l = f.new_local("q", pair);
+        let (x, c) = (f.new_value(v3), f.new_value(boolt));
+        let (t1, t2, back, q, img, out) = (
+            f.new_value(pair),
+            f.new_value(pair),
+            f.new_value(pair),
+            f.new_value(v3),
+            f.new_value(boolt),
+            f.new_value(f32t),
+        );
+        f.body = vec![
+            Stmt::Let(x, Expr::Zero(v3)),
+            Stmt::Let(c, Expr::Const(Const::Bool(true))),
+            Stmt::If {
+                cond: c,
+                then: vec![
+                    Stmt::Let(t1, Expr::Construct(pair, vec![x, c])),
+                    Stmt::Store(Place::local(l), t1),
+                ],
+                else_: vec![
+                    Stmt::Let(t2, Expr::Construct(pair, vec![x, c])),
+                    Stmt::Store(Place::local(l), t2),
+                ],
+            },
+            Stmt::Let(back, Expr::Load(Place::local(l))),
+            Stmt::Let(q, Expr::Extract(back, 0)),
+            Stmt::Let(img, Expr::Extract(back, 1)),
+            Stmt::Let(out, Expr::Extract(q, 0)),
+            Stmt::Return(Some(out)),
+        ];
+        tidy(&m, &mut f);
+        // The vec3's local is left; the bool's went, since nothing reads it.
+        assert_eq!(f.locals.iter().map(|l| l.ty).collect::<Vec<_>>(), [v3], "{:?}", f.locals);
+        assert!(
+            !visit::any(
+                &f.body,
+                &mut |s| matches!(s, Stmt::Let(_, Expr::Construct(t, _)) if *t == pair)
+            ),
+            "{:?}",
+            f.body
+        );
+        let _ = img;
+    }
+
+    /// A value only one branch of a later `if` uses is computed in that branch; one both use,
+    /// or the condition itself, stays.
+    #[test]
+    fn a_value_one_branch_uses_moves_into_it() {
+        let mut m = Module::default();
+        let (f32t, boolt) = (m.types.f32(), m.types.bool());
+        let v2 = m.types.vector(2);
+        let mut f = Function::new("f", Vec::new(), Some(f32t));
+        let l = f.new_local("out", f32t);
+        let (a, b, c, built, both, first) = (
+            f.new_value(f32t),
+            f.new_value(f32t),
+            f.new_value(boolt),
+            f.new_value(v2),
+            f.new_value(f32t),
+            f.new_value(f32t),
+        );
+        let out = f.new_value(f32t);
+        f.body = vec![
+            Stmt::Let(a, Expr::Const(Const::F32(1.0))),
+            Stmt::Let(b, Expr::Const(Const::F32(2.0))),
+            Stmt::Let(c, Expr::Binary(BinOp::Lt, a, b)),
+            Stmt::Let(built, Expr::Construct(v2, vec![a, b])),
+            Stmt::Let(both, Expr::Binary(BinOp::Add, a, b)),
+            Stmt::If {
+                cond: c,
+                then: vec![Stmt::Store(Place::local(l), both)],
+                else_: vec![
+                    Stmt::Let(first, Expr::Extract(built, 0)),
+                    Stmt::Store(Place::local(l), first),
+                    Stmt::Store(Place::local(l), both),
+                ],
+            },
+            Stmt::Let(out, Expr::Load(Place::local(l))),
+            Stmt::Return(Some(out)),
+        ];
+        sink_values(&m, &mut f);
+        let Stmt::If { else_, .. } = &f.body[4] else { panic!("{:?}", f.body) };
+        assert!(matches!(else_[0], Stmt::Let(v, Expr::Construct(..)) if v == built), "{else_:?}");
+        assert!(matches!(f.body[3], Stmt::Let(v, _) if v == both), "{:?}", f.body);
+    }
+
+    /// A value larger than any stack is made though nothing reads it: its function traps on
+    /// entry (language.md §2).
+    #[test]
+    fn values_too_large_for_the_stack_stay() {
+        let mut m = Module::default();
+        let f32t = m.types.f32();
+        let big = m.types.intern(TypeDef::Array(f32t, 1 << 20));
+        let small = m.types.intern(TypeDef::Array(f32t, 4));
+        let mut f = Function::new("f", Vec::new(), None);
+        let (a, b) = (f.new_value(big), f.new_value(small));
+        f.body = vec![
+            Stmt::Let(a, Expr::Zero(big)),
+            Stmt::Let(b, Expr::Zero(small)),
+            Stmt::Return(None),
+        ];
+        drop_dead_values(&m, &mut f);
+        assert_eq!(f.body, vec![Stmt::Let(a, Expr::Zero(big)), Stmt::Return(None)]);
+    }
+
+    /// A body too large to inline everywhere is inlined where it's called in a loop, and stays
+    /// a call elsewhere.
+    #[test]
+    fn a_call_in_a_loop_inlines_a_larger_body() {
+        let mut m = Module::default();
+        let f32t = m.types.f32();
+        let x_param = Param { name: "x".into(), ty: f32t, by_ref: false, mutable: false };
+        // fn g(x) -> f32: a chain of 300 additions.
+        let mut g = Function::new("g", vec![x_param], Some(f32t));
+        let x = g.new_value(f32t);
+        let mut body = vec![Stmt::Let(x, Expr::Param(0))];
+        let mut at = x;
+        for _ in 0..300 {
+            let v = g.new_value(f32t);
+            body.push(Stmt::Let(v, Expr::Binary(BinOp::Mul, at, x)));
+            at = v;
+        }
+        body.push(Stmt::Return(Some(at)));
+        g.body = body;
+        let g = m.add_function(g);
+        // export fn main() -> f32 { g(1); loop { g(2); break } ... }
+        let mut main = Function::new("main", Vec::new(), Some(f32t));
+        let (one, two, a, b) = (
+            main.new_value(f32t),
+            main.new_value(f32t),
+            main.new_value(f32t),
+            main.new_value(f32t),
+        );
+        main.body = vec![
+            Stmt::Let(one, Expr::Const(Const::F32(1.0))),
+            Stmt::Let(a, Expr::Call(g, vec![Arg::Value(one)])),
+            Stmt::Loop {
+                body: vec![
+                    Stmt::Let(two, Expr::Const(Const::F32(2.0))),
+                    Stmt::Let(b, Expr::Call(g, vec![Arg::Value(two)])),
+                    Stmt::Break,
+                ],
+                continuing: Vec::new(),
+            },
+            Stmt::Return(Some(a)),
+        ];
+        let main = m.add_function(main);
+        m.exports.push(("main".into(), main));
+        let _ = b;
+        inline_cpu(&mut m).expect("inline");
+        let main = m.functions.iter().find(|f| f.name == "main").expect("main");
+        let Stmt::Loop { body, .. } =
+            main.body.iter().find(|s| matches!(s, Stmt::Loop { .. })).expect("the loop")
+        else {
+            unreachable!()
+        };
+        assert!(visit::calls(body).is_empty(), "the loop's call is inlined: {body:?}");
+        assert_eq!(visit::calls(&main.body).len(), 1, "the call outside the loop stays");
         crate::verify(&m).expect("a valid module");
     }
 }
