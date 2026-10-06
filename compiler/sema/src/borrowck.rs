@@ -1780,6 +1780,16 @@ impl<'a> FnCheck<'a> {
         };
         let mut d = Diagnostic::new(code, span, format!("can't {verb} `{what}`: {why}"));
         d = match decl.kind {
+            // The value is the function's own: a new binding can change it, and the callers'
+            // contract stays as it is (`mut` would make them lend their place instead).
+            LocalKind::User(thir::LocalKind::Param(Mode::Take)) => {
+                let name = if decl.name == "self" { "s" } else { decl.name.as_str() };
+                d.with_help(format!(
+                    "it's yours: move it into a `var` to change it, `var {name} = take {}`",
+                    decl.name
+                ))
+                .with_secondary(decl.span, "taken here")
+            }
             LocalKind::User(thir::LocalKind::Param(_)) => d.with_help(format!(
                 "make the parameter `mut`: `{}: mut ...`, and pass `mut` at the call site",
                 decl.name

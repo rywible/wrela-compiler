@@ -1,0 +1,19 @@
+// mistake: changing a parameter taken with `take`, which is read-only in the function
+// expect: E0505
+// fix: no
+
+struct Counter: Copy {
+    n: u32,
+}
+
+fn bumped(c: take Counter) -> Counter {
+    c.n += 1
+    c
+}
+
+pub fn main() -> u32 {
+    let c = Counter { n: 1 }
+    bumped(c).n
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
