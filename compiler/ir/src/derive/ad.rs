@@ -458,8 +458,18 @@ impl Ad<'_> {
             out.push(let_or_eval(v, Expr::Call(g, args.to_vec())));
             return Ok(());
         }
-        let dg = derive(self.m, self.cache, g, mask.clone(), self.n, self.target)?;
         let returns = returns_active(self.m, self.cache, g, mask.clone(), Mode::Ad) != 0;
+        // A call that gives back nothing a derivative flows through (its result carries none,
+        // and it writes no active argument) runs as it is: `skeleton.find(name)` reads an
+        // active skeleton for a bone's index, through code (comparing text) that has no
+        // derivative.
+        let params = &self.m.functions[g.index()].params;
+        let writes = mask.iter().zip(params).any(|(b, p)| *b != 0 && p.mutable);
+        if !returns && !writes {
+            out.push(let_or_eval(v, Expr::Call(g, args.to_vec())));
+            return Ok(());
+        }
+        let dg = derive(self.m, self.cache, g, mask.clone(), self.n, self.target)?;
         let mut new_args = args.to_vec();
         for (i, a) in args.iter().enumerate() {
             if mask[i] == 0 {

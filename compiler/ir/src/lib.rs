@@ -289,6 +289,9 @@ pub enum HostOp {
     Limit,
     /// `wrela.audio(task, context)`: starts the program's voice.
     Audio,
+    /// `wrela.input(address, cap)`: copies up to `cap` queued input events to the address
+    /// (`u32`s); how many, a `u32`.
+    Input,
     /// Args: vertices, instances (or, `indirect`, the handle and byte offset of a buffer
     /// holding the counts), each binding's handle, offset and size, then the uniform block
     /// value.
@@ -532,6 +535,13 @@ impl Function {
         ValueId(self.values.len() as u32 - 1)
     }
 
+    /// A new value of type `ty`, defined as `e` at the end of `body`.
+    pub fn let_(&mut self, body: &mut Block, ty: TypeId, e: Expr) -> ValueId {
+        let v = self.new_value(ty);
+        body.push(Stmt::Let(v, e));
+        v
+    }
+
     pub fn new_local(&mut self, name: impl Into<String>, ty: TypeId) -> LocalId {
         self.locals.push(LocalDecl { name: name.into(), ty });
         LocalId(self.locals.len() as u32 - 1)
@@ -681,6 +691,9 @@ pub struct Module {
     /// CPU only: the program's state, which lasts across calls (language.md §12): data the
     /// program changes, unlike the rest, which is constant.
     pub state: Option<DataId>,
+    /// CPU only: other data the program changes: a lifted build's table of literals, and what
+    /// keeps its GPU copy (language.md §22).
+    pub writable: Vec<DataId>,
     /// CPU only: functions called by index ([`MemOp::RunTask`]): a parallel job's chunks.
     /// Each takes a context address and a chunk index.
     pub tasks: Vec<FuncId>,
@@ -690,6 +703,9 @@ pub struct Module {
     /// CPU only: whether the program starts a voice (`std::audio`), so the module exports
     /// `__audio`, which runs a task on the audio thread's stack.
     pub audio: bool,
+    /// CPU only: whether the program reads input (`std::input`), so the module imports
+    /// `wrela.input`.
+    pub input: bool,
 }
 
 impl Module {

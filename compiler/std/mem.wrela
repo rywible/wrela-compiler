@@ -101,6 +101,11 @@ pub fn compare_swap(addr: u32, expected: u32, new: u32) -> u32 {}
 @intrinsic
 pub fn take_answer(request: u32, addr: u32) {}
 
+/// Copies up to `cap` of the input events the host has queued to `addr`, oldest first, 24
+/// bytes each (`wrela.input`): how many it copied. The caller makes room for `cap` of them.
+@intrinsic
+pub fn take_input(addr: u32, cap: u32) -> u32 {}
+
 /// Adds `value` to the `u32` at `addr`, atomically: the old value. Workers share the memory.
 @intrinsic
 pub fn atomic_add(addr: u32, value: u32) -> u32 {}

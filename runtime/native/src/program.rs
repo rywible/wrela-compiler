@@ -15,12 +15,13 @@ use wasmtime::{
 };
 use wrela_abi::check::{Checker, CommandError};
 use wrela_abi::hash::StateHash;
+use wrela_abi::input::{EVENT_SIZE, Event, Queue};
 use wrela_abi::lines::{self, Lines};
 use wrela_abi::memory::MAX_WORKERS;
 use wrela_abi::stream::{self, Command, Sequencer};
 use wrela_abi::{
     AUDIO_QUANTUM, EXPORT_AUDIO, EXPORT_FRAME, EXPORT_INIT, EXPORT_MEMORY, EXPORT_WORKER,
-    HOST_FUNCTIONS, IMPORT_AUDIO, IMPORT_LIMIT, IMPORT_MEMORY, IMPORT_MODULE,
+    HOST_FUNCTIONS, IMPORT_AUDIO, IMPORT_INPUT, IMPORT_LIMIT, IMPORT_MEMORY, IMPORT_MODULE,
     IMPORT_REQUEST_STATUS, IMPORT_REQUEST_TAKE, IMPORT_SUBMIT, Manifest, REQUEST_FAILED,
     REQUEST_PENDING,
 };
@@ -137,20 +138,48 @@ struct State<E> {
     started: bool,
     /// The voice `wrela.audio` started: its task and context.
     voice: Option<(u32, u32)>,
-    /// The lines the program printed (`std::io::print`), each also shown on stderr.
+    /// The lines the program printed (`std::io::print`), each also shown on stderr unless quiet.
     logs: Vec<String>,
+    /// Input events not yet read (`wrela.input`).
+    input: Queue,
 }
 
 /// What a start function that calls the host gets.
 const CALLED_WHILE_STARTING: &str =
     "its start function called the host; a wrela program calls the host only from an export";
 
-/// Where a program's requests read and write (language.md §6.15): its build, for `Fetch`, and
-/// its storage directory, for `StorageRead` and `StorageWrite`.
+/// Where a program's requests read and write (language.md §6.15): its build, for `Fetch`, its
+/// storage directory, for `StorageRead` and `StorageWrite`, and what answers its `Post`s.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Io {
     pub build: Option<PathBuf>,
     pub storage: Option<PathBuf>,
+    pub post: Option<PostHandler>,
+    /// Don't show printed lines on stderr: the caller shows them ([`crate::Options::quiet`]).
+    pub quiet: bool,
+}
+
+/// A post's answer, from the URL and the body.
+type Answer = dyn Fn(&str, &[u8]) -> std::result::Result<Vec<u8>, String> + Send + Sync;
+
+/// What answers a program's posts (`std::io::post`): given the URL (relative to the build) and
+/// the body, the reply's bytes, or why there's none. The host that serves the build answers
+/// them; a native host has none unless its user gives one.
+#[derive(Clone)]
+pub struct PostHandler(pub Arc<Answer>);
+
+impl PostHandler {
+    pub fn new(
+        f: impl Fn(&str, &[u8]) -> std::result::Result<Vec<u8>, String> + Send + Sync + 'static,
+    ) -> PostHandler {
+        PostHandler(Arc::new(f))
+    }
+}
+
+impl std::fmt::Debug for PostHandler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PostHandler")
+    }
 }
 
 /// The program's requests: answered ones it hasn't taken, and ones answered during the current
@@ -207,6 +236,14 @@ impl Requests {
                     .and_then(|f| std::fs::read(f).map_err(|e| e.to_string()));
                 (*request, a)
             }
+            Command::Post { request, url, body } => {
+                self.start(*request, cmd.opcode())?;
+                let a = match &self.io.post {
+                    Some(h) => (h.0)(url, body),
+                    None => Err("this host has nothing that answers posts".to_string()),
+                };
+                (*request, a)
+            }
             _ => return Ok(()),
         };
         self.arriving.push((request, answer));
@@ -254,9 +291,12 @@ impl<E: Executor> State<E> {
                 }
                 Command::StorageRead { .. }
                 | Command::StorageWrite { .. }
-                | Command::Fetch { .. } => self.requests.io(&cmd)?,
+                | Command::Fetch { .. }
+                | Command::Post { .. } => self.requests.io(&cmd)?,
                 Command::Log { text } => {
-                    eprintln!("wrela: {text}");
+                    if !self.requests.io.quiet {
+                        eprintln!("wrela: {text}");
+                    }
                     self.logs.push(text.to_string());
                 }
                 _ => {}
@@ -387,6 +427,16 @@ pub(crate) struct Compiled {
 pub(crate) fn compile_with(wasm: &[u8], fuel: Option<u64>) -> Result<Compiled> {
     let engine = if fuel.is_some() { &*METERED } else { &*ENGINE };
     let module = Module::new(engine, wasm).map_err(|e| Error::Program(format!("{e:#}")))?;
+    compiled(module, wasm, fuel)
+}
+
+/// [`compile_with`] with no fuel, the compiled code kept beside the build in `dir`
+/// (`crate::cache`).
+pub(crate) fn compile_cached(wasm: &[u8], dir: &std::path::Path) -> Result<Compiled> {
+    compiled(crate::cache::module(&ENGINE, wasm, dir)?, wasm, None)
+}
+
+fn compiled(module: Module, wasm: &[u8], fuel: Option<u64>) -> Result<Compiled> {
     let memory = check_abi(&module)?;
     let lines = match lines::custom_section(wasm, lines::SECTION) {
         Some(payload) => Some(Arc::new(Lines::decode(payload).map_err(|e| {
@@ -402,6 +452,7 @@ impl<E: Executor> Program<E> {
     /// carried out by `executor`.
     /// `workers` is how many threads run a parallel job's chunks, this one included: 1 runs
     /// them all here.
+    #[cfg(any(test, feature = "gpu"))]
     pub(crate) fn instantiate(
         compiled: &Compiled,
         manifest: &Manifest,
@@ -435,6 +486,7 @@ impl<E: Executor> Program<E> {
         linker.func_wrap(IMPORT_MODULE, IMPORT_REQUEST_TAKE, request_take::<E>).map_err(wrap)?;
         linker.func_wrap(IMPORT_MODULE, IMPORT_LIMIT, limit::<E>).map_err(wrap)?;
         linker.func_wrap(IMPORT_MODULE, IMPORT_AUDIO, audio::<E>).map_err(wrap)?;
+        linker.func_wrap(IMPORT_MODULE, IMPORT_INPUT, input::<E>).map_err(wrap)?;
         let state = State {
             memory: memory.clone(),
             checker: Checker::with_limits(manifest, executor.limits()),
@@ -449,6 +501,7 @@ impl<E: Executor> Program<E> {
             started: false,
             voice: None,
             logs: Vec::new(),
+            input: Queue::default(),
         };
         let mut store = Store::new(engine, state);
         if let Some(fuel) = compiled.fuel {
@@ -670,6 +723,11 @@ impl<E: Executor> Program<E> {
         self.store.data().hash
     }
 
+    /// Queues an input event: the program reads it (`wrela.input`) from its next call on.
+    pub(crate) fn push_input(&mut self, e: Event) {
+        self.store.data_mut().input.push(e);
+    }
+
     /// The lines printed since the last call.
     pub(crate) fn take_logs(&mut self) -> Vec<String> {
         std::mem::take(&mut self.store.data_mut().logs)
@@ -794,6 +852,32 @@ fn audio<E: Executor>(
     }
     state.voice = Some((task, context));
     Ok(())
+}
+
+/// `wrela.input(ptr, cap) -> count`: copies up to `cap` queued input events to `ptr`, oldest
+/// first, and returns how many (wrela_abi `input`).
+fn input<E: Executor>(
+    mut caller: wasmtime::Caller<'_, State<E>>,
+    ptr: u32,
+    cap: u32,
+) -> wasmtime::Result<i32> {
+    let state = caller.data_mut();
+    if !state.started {
+        state.failure = Some(Error::Program(CALLED_WHILE_STARTING.into()));
+        return Err(wasmtime::format_err!("{CALLED_WHILE_STARTING}"));
+    }
+    let n = (cap as usize).min(state.input.len());
+    let fits = (ptr as usize)
+        .checked_add(n * EVENT_SIZE as usize)
+        .is_some_and(|end| end <= state.memory.data().len());
+    if !fits {
+        return Err(wasmtime::format_err!(
+            "input({ptr}, {cap}) reaches past the end of the program's memory"
+        ));
+    }
+    let bytes = state.input.take(cap);
+    shared::write(&state.memory, ptr as usize, &bytes);
+    Ok(n as i32)
 }
 
 /// `wrela.limit(index) -> i32`: one of the device's limits ([`wrela_abi::Limits`]), as a `u32`'s

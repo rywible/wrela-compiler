@@ -19,9 +19,17 @@ fn step(c: Ctx) {
     }
 }
 
+/// Writes through its `mut` field, and says to what: a statement that drops the result still
+/// changes the herd, so it isn't a result thrown away (E0333).
+fn grow(c: Ctx) -> u32 {
+    c.herd[0] += 1
+    c.herd[0]
+}
+
 fn f(w: mut World) -> f32 {
     let c = Ctx { terrain: w.terrain, herd: mut w.herd, time: w.time }
     step(c)
     step(c)
+    grow(c)
     w.time + w.terrain[0]
 }

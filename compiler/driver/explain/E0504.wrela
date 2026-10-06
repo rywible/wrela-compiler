@@ -6,7 +6,7 @@ fn double(x: f32) -> f32 {
 }
 
 fn twice() -> f32 {
-    var x = 1.0
+    let x = 1.0
     double(mut x)
 }
 
@@ -17,7 +17,7 @@ fn double(x: f32) -> f32 {
 }
 
 fn twice() -> f32 {
-    var x = 1.0
+    let x = 1.0
     double(x)
 }
 

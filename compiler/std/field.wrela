@@ -6,8 +6,14 @@
 // `C` (D-002), which the combinators blend where surfaces blend (`Blend`). A `Lipschitz`
 // surface states a bound on its gradient, near the surface (D-092), so sphere tracing can step
 // by it (`to_bound`). A `Noise` states its range, its gradient's bound and its bandlimit.
+//
+// A surface's parts are the leaves of its tree of combinators (language.md §22): each knows
+// which part decides its distance at a point (`part_at`), each part's own distance, and its
+// name, so a tool can say what a point belongs to without knowing what made the surface.
 
+use std::collections::Vec
 use std::derive::{Box3, Interval, gradient, interval, value_and_gradient}
+use std::quat::Quat
 use std::hash::StateHash
 use std::mem::debug_build
 
@@ -80,6 +86,369 @@ pub trait Surface: Copy + GpuData {
     fn with_at<C, F: Copy + GpuData + fn(vec3) -> C>(self, at: F) -> WithAt<Self, F> {
         WithAt { inner: self, at }
     }
+
+    /// `a` with `b` cut out of it, the cut's edge rounded over a width of about `k`.
+    fn smooth_subtract<B: Surface>(self, b: B, k: f32) -> SmoothSubtract<Self, B> {
+        SmoothSubtract { a: self, b, k }
+    }
+
+    /// What `a` and `b` hold in common, the edge rounded over a width of about `k`.
+    fn smooth_intersect<B: Surface>(self, b: B, k: f32) -> SmoothIntersect<Self, B> {
+        SmoothIntersect { a: self, b, k }
+    }
+
+    /// The same surface, turned by `by` about the origin.
+    fn rotate(self, by: Quat) -> Rotate<Self> {
+        Rotate { inner: self, to_local: by.inverse().to_mat3() }
+    }
+
+    /// The same surface, `by` times the size, about the origin.
+    fn scale(self, by: f32) -> Scale<Self> {
+        Scale { inner: self, by }
+    }
+
+    /// The surface and its mirror image in the plane x = 0: what it is at `p`, it is at
+    /// `(-p.x, p.y, p.z)`. Written for x ≥ 0, its parts are twice its own: those at x ≥ 0, then
+    /// their images.
+    fn mirror_x(self) -> Mirror<Self> {
+        Mirror { inner: self }
+    }
+
+    /// The same surface, one part with a name: tools say where a point is by it (§22).
+    fn named(self, name: Text) -> Named<Self> {
+        Named { inner: self, name }
+    }
+
+    // ---- provenance (§22) ----
+
+    /// How many parts it has: the leaves of its tree of combinators. A primitive, a closure
+    /// and a `named` surface are one part each.
+    fn parts(self) -> u32 {
+        1
+    }
+
+    /// Its distance at `p` (the same as `distance`), and the part that decides it: through each
+    /// combinator, the operand whose distance the result follows. For a union or a blend that's
+    /// the nearer, for an intersection the farther, and for a cut the cutter where the cut is
+    /// the surface. Parts are numbered from 0, in the order the tree's leaves are written.
+    fn part_at(self, p: vec3) -> (f32, u32) {
+        (self.distance(p), 0)
+    }
+
+    /// Part `i`'s own distance at `p`: that part as if it were the whole surface, moved, turned,
+    /// scaled and displaced as the combinators above it move, turn, scale and displace it.
+    fn part_distance(self, p: vec3, i: u32) -> f32 {
+        self.distance(p)
+    }
+
+    /// Part `i`'s name: empty where nothing names it.
+    fn part_name(self, i: u32) -> PartName {
+        unnamed()
+    }
+
+    /// The distance at `p` if part `i`'s own distance were `by` more: through each combinator,
+    /// that operand raised and the others as they are. Where part `i` doesn't decide the
+    /// distance (another part is nearer by more than the width of any blend between them) it's
+    /// the distance itself; `part_share` is how much it changes.
+    fn part_offset(self, p: vec3, i: u32, by: f32) -> f32 {
+        self.distance(p) + by
+    }
+}
+
+/// How much part `i` decides `field`'s distance at `p`: how much the distance changes where
+/// the part's own distance does (`part_offset`, by 0.1 mm), from 0 (another part decides it:
+/// the part can change without moving the surface there) to 1 (the part alone decides it), and
+/// between in a blend.
+pub fn part_share<S: Surface>(field: S, p: vec3, i: u32) -> f32 {
+    (field.part_offset(p, i, by: 0.0001) - field.distance(p)) / 0.0001
+}
+
+// ---- measures (§22) ----------------------------------------------------------------------
+//
+// Where a surface is, as numbers a spec can hold it to (std::lift's `Checks`). Each searches
+// with values, then takes one Newton step along its ray, so its derivative by anything the
+// field reads (a lifted literal, `std::lift::gradient`) is the exact one: the search's own
+// change cancels in the step.
+
+/// How far along the ray from `o` in direction `dir` (a unit vector) it first meets `field`'s
+/// surface, within `far`; -1 if it doesn't.
+pub fn hit<S: Surface>(field: S, o: vec3, dir: vec3, far: f32 = 10.0) -> f32 {
+    var t = 0.0
+    var found = false
+    for _ in 0..512 {
+        let d = field.distance(o + dir * t)
+        if abs(d) < 0.00005 {
+            found = true
+            break
+        }
+        t += max(d * 0.8, 0.00005)
+        if t > far {
+            break
+        }
+    }
+    if !found {
+        return -1.0
+    }
+    // One Newton step: the root's derivative, from the slope along the ray.
+    let h = 0.0001
+    let p = o + dir * t
+    let slope = (field.distance(p + dir * h) - field.distance(p - dir * h)) / (2.0 * h)
+    if abs(slope) < 0.05 {
+        return t
+    }
+    t - field.distance(p) / slope
+}
+
+/// The height of the surface's top above the ground point (`x`, `z`): where a ray from 10 m
+/// up meets it, going down; 0 if nothing is above that point.
+pub fn top<S: Surface>(field: S, x: f32, z: f32) -> f32 {
+    let t = hit(field, vec3(x, 10.0, z), vec3(0.0, -1.0, 0.0), far: 20.0)
+    if t < 0.0 { 0.0 } else { 10.0 - t }
+}
+
+/// The height of the surface's underside above the ground point (`x`, `z`): where a ray from
+/// 10 m down meets it, going up; 0 if nothing is there.
+pub fn bottom<S: Surface>(field: S, x: f32, z: f32) -> f32 {
+    let t = hit(field, vec3(x, -10.0, z), vec3(0.0, 1.0, 0.0), far: 20.0)
+    if t < 0.0 { 0.0 } else { t - 10.0 }
+}
+
+/// How wide the surface is across x along the line at height `y` and depth `z`: from where
+/// a ray from the left meets it to where one from the right does; 0 if neither does.
+pub fn width<S: Surface>(field: S, y: f32, z: f32) -> f32 {
+    let a = hit(field, vec3(10.0, y, z), vec3(-1.0, 0.0, 0.0), far: 20.0)
+    let b = hit(field, vec3(-10.0, y, z), vec3(1.0, 0.0, 0.0), far: 20.0)
+    if a < 0.0 || b < 0.0 { 0.0 } else { (10.0 - a) - (b - 10.0) }
+}
+
+/// The surface's front along z at height `y`, `x` from the middle: where a ray from 10 m in
+/// front (+z) meets it, going back; -10 if nothing is there.
+pub fn front<S: Surface>(field: S, x: f32, y: f32) -> f32 {
+    let t = hit(field, vec3(x, y, 10.0), vec3(0.0, 0.0, -1.0), far: 20.0)
+    if t < 0.0 { -10.0 } else { 10.0 - t }
+}
+
+/// The surface's back along z at height `y`, `x` from the middle (`front`, from behind); 10
+/// if nothing is there.
+pub fn back<S: Surface>(field: S, x: f32, y: f32) -> f32 {
+    let t = hit(field, vec3(x, y, -10.0), vec3(0.0, 0.0, 1.0), far: 20.0)
+    if t < 0.0 { 10.0 } else { t - 10.0 }
+}
+
+/// How far the surface reaches in direction `dir` (a unit vector) within `region`: the
+/// largest p · dir over the surface there. Rays along −dir sweep the region's cross-section,
+/// 16 by 16, then twice more 8 by 8 around the best, each from where it enters the region, so
+/// the surface outside it hides nothing. The measure is the best ray's hit, so its derivative
+/// is that point's; where the surface fills the region's edge, it's the edge. -10⁹ if the
+/// region holds no surface.
+pub fn farthest<S: Surface>(field: S, dir: vec3, region: Box3) -> f32 {
+    let c = 0.5 * (region.lo + region.hi)
+    let e = region.hi - region.lo
+    let reach = length(e)
+    // Two axes across `dir`.
+    let helper = if abs(dir.y) < 0.9 { vec3(0.0, 1.0, 0.0) } else { vec3(1.0, 0.0, 0.0) }
+    let u = normalize(cross(helper, dir))
+    let v = cross(dir, u)
+    // The rays' way, and its inverse for the region's slabs.
+    let w = -dir
+    let inv = vec3(slab_inverse(w.x), slab_inverse(w.y), slab_inverse(w.z))
+    var centre = vec2(0.0)
+    var half = 0.5 * reach
+    var best = -1.0e9
+    for round in 0..3 {
+        let n = if round == 0 { 16 } else { 8 }
+        var found = centre
+        for i in 0..n {
+            for j in 0..n {
+                let a = centre +
+                    vec2((f32(i) + 0.5) / f32(n) * 2.0 - 1.0, (f32(j) + 0.5) / f32(n) * 2.0 - 1.0) *
+                        half
+                let o = c + u * a.x + v * a.y + dir * reach
+                // Where the ray enters the region and leaves it.
+                let t_lo = (region.lo - o) * inv
+                let t_hi = (region.hi - o) * inv
+                let near = min(t_lo, t_hi)
+                let far = max(t_lo, t_hi)
+                let t0 = max(max(near.x, near.y), max(near.z, 0.0))
+                let t1 = min(far.x, min(far.y, far.z))
+                if t0 < t1 {
+                    let p0 = o + w * t0
+                    var m = -1.0e9
+                    if field.distance(p0) <= 0.0 {
+                        m = dot(p0, dir)
+                    } else {
+                        let t = hit(field, p0, w, far: t1 - t0)
+                        if t >= 0.0 {
+                            m = dot(p0 + w * t, dir)
+                        }
+                    }
+                    if m > best {
+                        best = m
+                        found = a
+                    }
+                }
+            }
+        }
+        centre = found
+        half = half * 2.5 / f32(n)
+    }
+    best
+}
+
+/// 1 / x for a ray's slab test, large and finite where x is 0, so no NaN comes of 0 / 0.
+fn slab_inverse(x: f32) -> f32 {
+    if abs(x) < 0.000001 { 1.0e6 } else { 1.0 / x }
+}
+
+/// The index of the part named `name` (`part_name(i).name`): the first, if several share it,
+/// and `parts()` if none does.
+pub fn part_named<S: Surface>(field: S, name: str) -> u32 {
+    for i in 0..field.parts() {
+        if field.part_name(i).name == name {
+            return i
+        }
+    }
+    field.parts()
+}
+
+/// Part `i`'s family: the first part with its name in its group, so a part and its mirror
+/// image are one family. An unnamed part is its own.
+pub fn part_family<S: Surface>(field: S, i: u32) -> u32 {
+    let a = field.part_name(i)
+    if a.name.len() == 0 {
+        return i
+    }
+    for j in 0..i {
+        let b = field.part_name(j)
+        if b.name == a.name && b.group == a.group {
+            return j
+        }
+    }
+    i
+}
+
+/// Each part's family (`part_family`), by index.
+pub fn part_families<S: Surface>(field: S) -> Vec<u32> {
+    let n = field.parts()
+    var out: Vec<u32> = Vec::with_capacity(n)
+    for i in 0..n {
+        out.push(part_family(field, i))
+    }
+    out
+}
+
+/// Part `i`'s mirror image: the part with its name in its group, mirrored the other way; `i`
+/// itself if it has none, or no name.
+pub fn part_image<S: Surface>(field: S, i: u32) -> u32 {
+    let a = field.part_name(i)
+    if a.name.len() == 0 {
+        return i
+    }
+    for j in 0..field.parts() {
+        let b = field.part_name(j)
+        if j != i && b.name == a.name && b.group == a.group && b.mirrored != a.mirrored {
+            return j
+        }
+    }
+    i
+}
+
+// ---- certified checks (§22) ------------------------------------------------------------
+
+/// What a certified check of a region found: the property holds at every point of it (proved by
+/// derived intervals, §13), it fails at a point (a counterexample), or the intervals couldn't
+/// tell within the depth asked, first in the box given.
+pub enum Certified: Copy {
+    Holds,
+    Fails(vec3),
+    Unknown(Box3),
+}
+
+impl Certified {
+    /// Whether the check proved the property: `Holds`.
+    pub fn holds(self) -> bool {
+        match self {
+            Certified::Holds => true,
+            _ => false,
+        }
+    }
+}
+
+/// Whether `f` is positive everywhere in `region`: its derived interval over each box (the
+/// region, then its octree, `depth` levels at most) is above 0 there, or a point where it isn't.
+/// Each box is checked at its centre too, so a failure is found as a point, not just a box.
+///
+/// ```wrela
+/// use std::derive::Box3
+/// use std::field::{Surface, certify_positive, sphere}
+///
+/// let s = sphere(0.5).translate(vec3(0.0, 0.6, 0.0))
+/// let below = Box3 { lo: vec3(-2.0, -1.0, -2.0), hi: vec3(2.0, 0.0, 2.0) }
+/// assert(certify_positive(|p: vec3| s.distance(p), below, depth: 6).holds())
+/// ```
+pub fn certify_positive(f: fn(vec3) -> f32, region: Box3, depth: u32) -> Certified {
+    var stack: Vec<(Box3, u32)> = Vec::new()
+    stack.push((region, 0))
+    var unknown: Option<Box3> = None
+    while stack.len() > 0 {
+        let Some(item) = stack.pop() else { break }
+        let (b, d) = item
+        let r = interval(f, b)
+        if r.lo > 0.0 {
+            continue
+        }
+        let c = 0.5 * (b.lo + b.hi)
+        if r.hi <= 0.0 || !(f(c) > 0.0) {
+            return Certified::Fails(c)
+        }
+        if d >= depth {
+            if unknown.is_none() {
+                unknown = Some(b)
+            }
+            continue
+        }
+        let h = 0.5 * (b.hi - b.lo)
+        for j in 0..8 {
+            let o = vec3(f32(j & 1), f32((j >> 1) & 1), f32((j >> 2) & 1)) * h
+            stack.push((Box3 { lo: b.lo + o, hi: b.lo + o + h }, d + 1))
+        }
+    }
+    match unknown {
+        Some(b) => Certified::Unknown(b),
+        None => Certified::Holds,
+    }
+}
+
+/// Whether nothing of `field`'s inside is in `region` (its distance is positive everywhere
+/// there): for example, nothing below the ground.
+pub fn certify_clear<S: Surface>(field: S, region: Box3, depth: u32) -> Certified {
+    certify_positive(|p: vec3| field.distance(p), region, depth)
+}
+
+/// Whether parts `a` and `b` of `field` don't overlap anywhere in `region`: at every point at
+/// least one of them is outside (the larger of their own distances is positive).
+pub fn certify_apart<S: Surface>(field: S, a: u32, b: u32, region: Box3, depth: u32) -> Certified {
+    certify_positive(
+        |p: vec3| max(field.part_distance(p, a), field.part_distance(p, b)),
+        region,
+        depth,
+    )
+}
+
+/// A part's name, for tools (§22): the name its author gave it, the name of the group it's in,
+/// the name of the space it's placed in (an engine's creature places parts on bones), and
+/// whether it's the mirror image of the part as written. Each name is empty where nothing gives
+/// one.
+pub struct PartName: Copy {
+    pub name: Text,
+    pub group: Text,
+    pub frame: Text,
+    pub mirrored: bool,
+}
+
+/// A part with no name.
+pub fn unnamed() -> PartName {
+    PartName { name: "", group: "", frame: "", mirrored: false }
 }
 
 /// A scalar function over 3D space, used to displace surfaces.
@@ -152,6 +521,60 @@ impl Surface for Ellipsoid {
             return -min(self.radii.x, min(self.radii.y, self.radii.z))
         }
         k0 * (k0 - 1.0) / max(k1, 0.000000001)
+    }
+}
+
+/// An ellipsoid whose distance stays well behaved: outside it's `Ellipsoid`'s, which is near
+/// the true distance; inside it's (k0 − 1) times the smallest radius, whose gradient is never
+/// more than 1, where `Ellipsoid`'s grows without bound towards the centre (3 to 25 in thin or
+/// blended ellipsoids). The surface is the same. Prefer it for parts that blend.
+pub struct Oval: Copy + GpuData {
+    pub radii: vec3,
+}
+
+/// An oval with half-axes `radii`, centred at the origin (`Oval`).
+pub fn oval(radii: vec3) -> Oval {
+    Oval { radii }
+}
+
+impl Surface for Oval {
+    fn distance(self, p: vec3) -> f32 {
+        let k0 = length(p / self.radii)
+        if k0 < 1.0 {
+            return (k0 - 1.0) * min(self.radii.x, min(self.radii.y, self.radii.z))
+        }
+        let k1 = length(p / (self.radii * self.radii))
+        k0 * (k0 - 1.0) / max(k1, 0.000000001)
+    }
+}
+
+/// Round cones through `points`, each `radii` thick there, joined end to end: a limb, a neck
+/// or a tail that bends at its points. Consecutive cones share the sphere at their joint, so
+/// their union is smooth there and swells nothing (a smooth seam between segments bulges by a
+/// quarter of its width). Exact.
+pub struct Tube<const N: u32>: Copy + GpuData {
+    pub points: [vec3; N],
+    pub radii: [f32; N],
+}
+
+/// A tube through `points`, `radii` thick at each (`Tube`).
+pub fn tube<const N: u32>(points: [vec3; N], radii: [f32; N]) -> Tube<N> {
+    Tube { points, radii }
+}
+
+impl<const N: u32> Surface for Tube<N> {
+    fn distance(self, p: vec3) -> f32 {
+        var d = length(p - self.points[0]) - self.radii[0]
+        for i in 1..N {
+            let c = round_cone(
+                self.points[i - 1],
+                self.points[i],
+                r_top: self.radii[i - 1],
+                r_bottom: self.radii[i],
+            )
+            d = min(d, c.distance(p))
+        }
+        d
     }
 }
 
@@ -261,7 +684,10 @@ impl Surface for HalfSpace {
 /// blend's seam (spike 13).
 pub fn smin(a: f32, b: f32, k: f32) -> f32 {
     // The smallest normal f32 keeps `0.25 / k` finite, and `m` is 0 for `k <= 0`. `m` times
-    // at most a quarter doesn't overflow where `m * m` would.
+    // at most a quarter doesn't overflow where `m * m` would. (A derived interval with `k = 0`
+    // can multiply that huge `s` into an infinity, and the infinity by 0: a caller whose `k`
+    // can be 0 chooses `min` itself, as the engine's seams do. A branch here would cost a
+    // derived gradient a sixth of its speed: the grazer's, `grazer.rs`.)
     let s = 0.25 / max(k, 1.1754944e-38)
     let d = b - a
     if d > 0.0 {
@@ -276,6 +702,62 @@ pub fn smin(a: f32, b: f32, k: f32) -> f32 {
     }
 }
 
+// Provenance (§22) through a combinator of two surfaces, whose parts are `a`'s then `b`'s, and
+// through one of an array of surfaces: what the combinators share. Each has its own `part_at`.
+
+/// The distances of `a` and `b` at `p`, part `i` of the two raised by `by` (`part_offset`).
+fn pair_offsets<A: Surface, B: Surface>(a: A, b: B, p: vec3, i: u32, by: f32) -> (f32, f32) {
+    let n = a.parts()
+    if i < n { (a.part_offset(p, i, by), b.distance(p)) } else {
+        (a.distance(p), b.part_offset(p, i - n, by))
+    }
+}
+
+fn pair_parts<A: Surface, B: Surface>(a: A, b: B) -> u32 {
+    a.parts() + b.parts()
+}
+
+fn pair_part_distance<A: Surface, B: Surface>(a: A, b: B, p: vec3, i: u32) -> f32 {
+    let n = a.parts()
+    if i < n { a.part_distance(p, i) } else { b.part_distance(p, i - n) }
+}
+
+fn pair_part_name<A: Surface, B: Surface>(a: A, b: B, i: u32) -> PartName {
+    let n = a.parts()
+    if i < n { a.part_name(i) } else { b.part_name(i - n) }
+}
+
+/// Which of `parts` holds part `i` of them all, and its number there; `N` where none does.
+fn locate<S: Surface, const N: u32>(parts: [S; N], i: u32) -> (u32, u32) {
+    var first = 0
+    for k in 0..N {
+        let n = parts[k].parts()
+        if i < first + n {
+            return (k, i - first)
+        }
+        first += n
+    }
+    (N, 0)
+}
+
+fn array_parts<S: Surface, const N: u32>(parts: [S; N]) -> u32 {
+    var n = 0
+    for i in 0..N {
+        n += parts[i].parts()
+    }
+    n
+}
+
+fn array_part_distance<S: Surface, const N: u32>(parts: [S; N], p: vec3, i: u32) -> f32 {
+    let (k, j) = locate(parts, i)
+    if k < N { parts[k].part_distance(p, j) } else { EMPTY }
+}
+
+fn array_part_name<S: Surface, const N: u32>(parts: [S; N], i: u32) -> PartName {
+    let (k, j) = locate(parts, i)
+    if k < N { parts[k].part_name(j) } else { unnamed() }
+}
+
 /// Two surfaces joined: `a.union(b)`.
 pub struct Union<A, B>: Copy + GpuData {
     pub a: A,
@@ -285,6 +767,30 @@ pub struct Union<A, B>: Copy + GpuData {
 impl<A: Surface, B: Surface> Surface for Union<A, B> {
     fn distance(self, p: vec3) -> f32 {
         min(self.a.distance(p), self.b.distance(p))
+    }
+
+    fn part_offset(self, p: vec3, i: u32, by: f32) -> f32 {
+        let (da, db) = pair_offsets(self.a, self.b, p, i, by)
+        min(da, db)
+    }
+
+    fn parts(self) -> u32 {
+        pair_parts(self.a, self.b)
+    }
+
+    /// The nearer operand's part; a tie takes `a`'s.
+    fn part_at(self, p: vec3) -> (f32, u32) {
+        let (da, ia) = self.a.part_at(p)
+        let (db, ib) = self.b.part_at(p)
+        (min(da, db), if da <= db { ia } else { self.a.parts() + ib })
+    }
+
+    fn part_distance(self, p: vec3, i: u32) -> f32 {
+        pair_part_distance(self.a, self.b, p, i)
+    }
+
+    fn part_name(self, i: u32) -> PartName {
+        pair_part_name(self.a, self.b, i)
     }
 }
 
@@ -298,6 +804,30 @@ pub struct SmoothUnion<A, B>: Copy + GpuData {
 impl<A: Surface, B: Surface> Surface for SmoothUnion<A, B> {
     fn distance(self, p: vec3) -> f32 {
         smin(self.a.distance(p), self.b.distance(p), self.k)
+    }
+
+    fn part_offset(self, p: vec3, i: u32, by: f32) -> f32 {
+        let (da, db) = pair_offsets(self.a, self.b, p, i, by)
+        smin(da, db, self.k)
+    }
+
+    fn parts(self) -> u32 {
+        pair_parts(self.a, self.b)
+    }
+
+    /// The nearer operand's part: the one whose distance the blend follows most.
+    fn part_at(self, p: vec3) -> (f32, u32) {
+        let (da, ia) = self.a.part_at(p)
+        let (db, ib) = self.b.part_at(p)
+        (smin(da, db, self.k), if da <= db { ia } else { self.a.parts() + ib })
+    }
+
+    fn part_distance(self, p: vec3, i: u32) -> f32 {
+        pair_part_distance(self.a, self.b, p, i)
+    }
+
+    fn part_name(self, i: u32) -> PartName {
+        pair_part_name(self.a, self.b, i)
     }
 }
 
@@ -330,6 +860,46 @@ impl<S: Surface, const N: u32> Surface for UnionAll<S, N> {
         }
         d
     }
+
+    fn part_offset(self, p: vec3, i: u32, by: f32) -> f32 {
+        let (m, j) = locate(self.parts, i)
+        var d = EMPTY
+        for k in 0..N {
+            let dk = if k == m { self.parts[k].part_offset(p, j, by) } else {
+                self.parts[k].distance(p)
+            }
+            d = min(d, dk)
+        }
+        d
+    }
+
+    fn parts(self) -> u32 {
+        array_parts(self.parts)
+    }
+
+    /// The nearest operand's part; a tie takes the earlier's.
+    fn part_at(self, p: vec3) -> (f32, u32) {
+        var d = EMPTY
+        var part = 0
+        var first = 0
+        for i in 0..N {
+            let (di, pi) = self.parts[i].part_at(p)
+            if di < d {
+                part = first + pi
+            }
+            d = min(d, di)
+            first += self.parts[i].parts()
+        }
+        (d, part)
+    }
+
+    fn part_distance(self, p: vec3, i: u32) -> f32 {
+        array_part_distance(self.parts, p, i)
+    }
+
+    fn part_name(self, i: u32) -> PartName {
+        array_part_name(self.parts, i)
+    }
 }
 
 /// A fixed array of surfaces joined by rounded seams: `parts.smooth_union(k)`.
@@ -349,6 +919,52 @@ impl<S: Surface, const N: u32> Surface for SmoothUnionAll<S, N> {
         }
         d
     }
+
+    fn part_offset(self, p: vec3, i: u32, by: f32) -> f32 {
+        let (m, j) = locate(self.parts, i)
+        var d = EMPTY
+        for k in 0..N {
+            let dk = if k == m { self.parts[k].part_offset(p, j, by) } else {
+                self.parts[k].distance(p)
+            }
+            d = if k == 0 { dk } else { smin(d, dk, self.k) }
+        }
+        d
+    }
+
+    fn parts(self) -> u32 {
+        array_parts(self.parts)
+    }
+
+    /// The part of the operand nearest `p`, as the blend weighs them.
+    fn part_at(self, p: vec3) -> (f32, u32) {
+        if N == 0 {
+            return (EMPTY, 0)
+        }
+        let (d0, p0) = self.parts[0].part_at(p)
+        var d = d0
+        var nearest = d0
+        var part = p0
+        var first = self.parts[0].parts()
+        for i in 1..N {
+            let (di, pi) = self.parts[i].part_at(p)
+            if di < nearest {
+                nearest = di
+                part = first + pi
+            }
+            d = smin(d, di, self.k)
+            first += self.parts[i].parts()
+        }
+        (d, part)
+    }
+
+    fn part_distance(self, p: vec3, i: u32) -> f32 {
+        array_part_distance(self.parts, p, i)
+    }
+
+    fn part_name(self, i: u32) -> PartName {
+        array_part_name(self.parts, i)
+    }
 }
 
 /// The distance of a union of no parts: farther than anything a scene holds.
@@ -364,6 +980,30 @@ impl<A: Surface, B: Surface> Surface for Intersect<A, B> {
     fn distance(self, p: vec3) -> f32 {
         max(self.a.distance(p), self.b.distance(p))
     }
+
+    fn part_offset(self, p: vec3, i: u32, by: f32) -> f32 {
+        let (da, db) = pair_offsets(self.a, self.b, p, i, by)
+        max(da, db)
+    }
+
+    fn parts(self) -> u32 {
+        pair_parts(self.a, self.b)
+    }
+
+    /// The farther operand's part; a tie takes `a`'s.
+    fn part_at(self, p: vec3) -> (f32, u32) {
+        let (da, ia) = self.a.part_at(p)
+        let (db, ib) = self.b.part_at(p)
+        (max(da, db), if da >= db { ia } else { self.a.parts() + ib })
+    }
+
+    fn part_distance(self, p: vec3, i: u32) -> f32 {
+        pair_part_distance(self.a, self.b, p, i)
+    }
+
+    fn part_name(self, i: u32) -> PartName {
+        pair_part_name(self.a, self.b, i)
+    }
 }
 
 /// A surface moved: `s.translate(by)`.
@@ -375,6 +1015,26 @@ pub struct Translate<S>: Copy + GpuData {
 impl<S: Surface> Surface for Translate<S> {
     fn distance(self, p: vec3) -> f32 {
         self.inner.distance(p - self.by)
+    }
+
+    fn part_offset(self, p: vec3, i: u32, by: f32) -> f32 {
+        self.inner.part_offset(p - self.by, i, by)
+    }
+
+    fn parts(self) -> u32 {
+        self.inner.parts()
+    }
+
+    fn part_at(self, p: vec3) -> (f32, u32) {
+        self.inner.part_at(p - self.by)
+    }
+
+    fn part_distance(self, p: vec3, i: u32) -> f32 {
+        self.inner.part_distance(p - self.by, i)
+    }
+
+    fn part_name(self, i: u32) -> PartName {
+        self.inner.part_name(i)
     }
 }
 
@@ -388,6 +1048,258 @@ pub struct Displace<S, N>: Copy + GpuData {
 impl<S: Surface, N: Noise> Surface for Displace<S, N> {
     fn distance(self, p: vec3) -> f32 {
         self.inner.distance(p) + self.amp * self.noise.value(p)
+    }
+
+    fn part_offset(self, p: vec3, i: u32, by: f32) -> f32 {
+        self.inner.part_offset(p, i, by) + self.amp * self.noise.value(p)
+    }
+
+    fn parts(self) -> u32 {
+        self.inner.parts()
+    }
+
+    fn part_at(self, p: vec3) -> (f32, u32) {
+        let (d, i) = self.inner.part_at(p)
+        (d + self.amp * self.noise.value(p), i)
+    }
+
+    fn part_distance(self, p: vec3, i: u32) -> f32 {
+        self.inner.part_distance(p, i) + self.amp * self.noise.value(p)
+    }
+
+    fn part_name(self, i: u32) -> PartName {
+        self.inner.part_name(i)
+    }
+}
+
+/// The smooth maximum of two distances: `-smin(-a, -b, k)`. Where they're `k` or more apart
+/// it's exactly the larger; with `k <= 0` it's `max(a, b)`.
+pub fn smax(a: f32, b: f32, k: f32) -> f32 {
+    -smin(-a, -b, k)
+}
+
+/// `a` with `b` cut out of it: `a.smooth_subtract(b, k)`.
+pub struct SmoothSubtract<A, B>: Copy + GpuData {
+    pub a: A,
+    pub b: B,
+    pub k: f32,
+}
+
+impl<A: Surface, B: Surface> Surface for SmoothSubtract<A, B> {
+    fn distance(self, p: vec3) -> f32 {
+        smax(self.a.distance(p), -self.b.distance(p), self.k)
+    }
+
+    fn part_offset(self, p: vec3, i: u32, by: f32) -> f32 {
+        let (da, db) = pair_offsets(self.a, self.b, p, i, by)
+        smax(da, -db, self.k)
+    }
+
+    fn parts(self) -> u32 {
+        pair_parts(self.a, self.b)
+    }
+
+    /// The cutter's part where the cut is the surface (inside `b`, farther than `a`), else
+    /// `a`'s.
+    fn part_at(self, p: vec3) -> (f32, u32) {
+        let (da, ia) = self.a.part_at(p)
+        let (db, ib) = self.b.part_at(p)
+        (smax(da, -db, self.k), if da >= -db { ia } else { self.a.parts() + ib })
+    }
+
+    fn part_distance(self, p: vec3, i: u32) -> f32 {
+        pair_part_distance(self.a, self.b, p, i)
+    }
+
+    fn part_name(self, i: u32) -> PartName {
+        pair_part_name(self.a, self.b, i)
+    }
+}
+
+/// What two surfaces hold in common, rounded: `a.smooth_intersect(b, k)`.
+pub struct SmoothIntersect<A, B>: Copy + GpuData {
+    pub a: A,
+    pub b: B,
+    pub k: f32,
+}
+
+impl<A: Surface, B: Surface> Surface for SmoothIntersect<A, B> {
+    fn distance(self, p: vec3) -> f32 {
+        smax(self.a.distance(p), self.b.distance(p), self.k)
+    }
+
+    fn part_offset(self, p: vec3, i: u32, by: f32) -> f32 {
+        let (da, db) = pair_offsets(self.a, self.b, p, i, by)
+        smax(da, db, self.k)
+    }
+
+    fn parts(self) -> u32 {
+        pair_parts(self.a, self.b)
+    }
+
+    /// The farther operand's part; a tie takes `a`'s.
+    fn part_at(self, p: vec3) -> (f32, u32) {
+        let (da, ia) = self.a.part_at(p)
+        let (db, ib) = self.b.part_at(p)
+        (smax(da, db, self.k), if da >= db { ia } else { self.a.parts() + ib })
+    }
+
+    fn part_distance(self, p: vec3, i: u32) -> f32 {
+        pair_part_distance(self.a, self.b, p, i)
+    }
+
+    fn part_name(self, i: u32) -> PartName {
+        pair_part_name(self.a, self.b, i)
+    }
+}
+
+/// A surface turned about the origin: `s.rotate(by)`. It keeps the rotation that takes a point
+/// into the surface's own space.
+pub struct Rotate<S>: Copy + GpuData {
+    pub inner: S,
+    pub to_local: mat3,
+}
+
+impl<S> Rotate<S> {
+    /// `p` in the surface's own space: column by column, as a derived interval needs (it has
+    /// no matrix arithmetic).
+    fn local(self, p: vec3) -> vec3 {
+        let m = self.to_local
+        m[0] * p.x + m[1] * p.y + m[2] * p.z
+    }
+}
+
+impl<S: Surface> Surface for Rotate<S> {
+    fn distance(self, p: vec3) -> f32 {
+        self.inner.distance(self.local(p))
+    }
+
+    fn part_offset(self, p: vec3, i: u32, by: f32) -> f32 {
+        self.inner.part_offset(self.local(p), i, by)
+    }
+
+    fn parts(self) -> u32 {
+        self.inner.parts()
+    }
+
+    fn part_at(self, p: vec3) -> (f32, u32) {
+        self.inner.part_at(self.local(p))
+    }
+
+    fn part_distance(self, p: vec3, i: u32) -> f32 {
+        self.inner.part_distance(self.local(p), i)
+    }
+
+    fn part_name(self, i: u32) -> PartName {
+        self.inner.part_name(i)
+    }
+}
+
+/// A surface scaled about the origin: `s.scale(by)`. Distances scale with it, so a distance
+/// stays a distance.
+pub struct Scale<S>: Copy + GpuData {
+    pub inner: S,
+    pub by: f32,
+}
+
+impl<S: Surface> Surface for Scale<S> {
+    fn distance(self, p: vec3) -> f32 {
+        self.inner.distance(p / self.by) * self.by
+    }
+
+    /// `by` is in this surface's units: the inner surface's part is raised by `by / self.by`.
+    fn part_offset(self, p: vec3, i: u32, by: f32) -> f32 {
+        self.inner.part_offset(p / self.by, i, by / self.by) * self.by
+    }
+
+    fn parts(self) -> u32 {
+        self.inner.parts()
+    }
+
+    fn part_at(self, p: vec3) -> (f32, u32) {
+        let (d, i) = self.inner.part_at(p / self.by)
+        (d * self.by, i)
+    }
+
+    fn part_distance(self, p: vec3, i: u32) -> f32 {
+        self.inner.part_distance(p / self.by, i) * self.by
+    }
+
+    fn part_name(self, i: u32) -> PartName {
+        self.inner.part_name(i)
+    }
+}
+
+/// A surface and its mirror image in x = 0: `s.mirror_x()`.
+pub struct Mirror<S>: Copy + GpuData {
+    pub inner: S,
+}
+
+/// `p` reflected into x ≥ 0, where a mirrored surface is written.
+fn mirrored(p: vec3) -> vec3 {
+    vec3(abs(p.x), p.y, p.z)
+}
+
+impl<S: Surface> Surface for Mirror<S> {
+    fn distance(self, p: vec3) -> f32 {
+        self.inner.distance(mirrored(p))
+    }
+
+    /// A part as written decides at x ≥ 0, its image at x < 0 (as `part_at` has it).
+    fn part_offset(self, p: vec3, i: u32, by: f32) -> f32 {
+        let n = self.inner.parts()
+        let image = p.x < 0.0
+        if (i < n) != image {
+            self.inner.part_offset(mirrored(p), i % n, by)
+        } else {
+            self.inner.distance(mirrored(p))
+        }
+    }
+
+    /// Its own parts, as written (at x ≥ 0), then their images.
+    fn parts(self) -> u32 {
+        2 * self.inner.parts()
+    }
+
+    fn part_at(self, p: vec3) -> (f32, u32) {
+        let (d, i) = self.inner.part_at(mirrored(p))
+        (d, if p.x < 0.0 { self.inner.parts() + i } else { i })
+    }
+
+    fn part_distance(self, p: vec3, i: u32) -> f32 {
+        let n = self.inner.parts()
+        if i < n {
+            self.inner.part_distance(p, i)
+        } else {
+            self.inner.part_distance(vec3(-p.x, p.y, p.z), i - n)
+        }
+    }
+
+    fn part_name(self, i: u32) -> PartName {
+        let n = self.inner.parts()
+        if i < n {
+            self.inner.part_name(i)
+        } else {
+            var name = self.inner.part_name(i - n)
+            name.mirrored = !name.mirrored
+            name
+        }
+    }
+}
+
+/// A surface that is one part, named: `s.named(name)`.
+pub struct Named<S>: Copy + GpuData {
+    pub inner: S,
+    pub name: Text,
+}
+
+impl<S: Surface> Surface for Named<S> {
+    fn distance(self, p: vec3) -> f32 {
+        self.inner.distance(p)
+    }
+
+    fn part_name(self, i: u32) -> PartName {
+        PartName { name: self.name, group: "", frame: "", mirrored: false }
     }
 }
 
@@ -610,6 +1522,27 @@ impl<S: Surface> Surface for ToBound<S> {
     fn distance(self, p: vec3) -> f32 {
         clamp(self.inner.distance(p), -self.near, self.near) * self.scale
     }
+
+    fn part_offset(self, p: vec3, i: u32, by: f32) -> f32 {
+        clamp(self.inner.part_offset(p, i, by / self.scale), -self.near, self.near) * self.scale
+    }
+
+    fn parts(self) -> u32 {
+        self.inner.parts()
+    }
+
+    fn part_at(self, p: vec3) -> (f32, u32) {
+        let (d, i) = self.inner.part_at(p)
+        (clamp(d, -self.near, self.near) * self.scale, i)
+    }
+
+    fn part_distance(self, p: vec3, i: u32) -> f32 {
+        clamp(self.inner.part_distance(p, i), -self.near, self.near) * self.scale
+    }
+
+    fn part_name(self, i: u32) -> PartName {
+        self.inner.part_name(i)
+    }
 }
 
 impl<S: Surface> Lipschitz for ToBound<S> {
@@ -652,6 +1585,26 @@ impl Lipschitz for Cuboid {
 
 impl Lipschitz for HalfSpace {
     /// Exact: `half_space` makes its normal a unit vector.
+    fn lipschitz(self, near: f32) -> f32 {
+        1.0
+    }
+}
+
+impl Lipschitz for Oval {
+    /// Inside, 1. Outside, within `near` (e = near / min(r)): the first term of `Ellipsoid`'s
+    /// gradient is at most 2 − 1 / (1 + e), and the second, from k1's change, e (max(r) /
+    /// min(r))² / (1 + e).
+    fn lipschitz(self, near: f32) -> f32 {
+        let lo = min(self.radii.x, min(self.radii.y, self.radii.z))
+        let hi = max(self.radii.x, max(self.radii.y, self.radii.z))
+        let e = max(near, 0.0) / lo
+        let r = hi / lo
+        max(1.0, 2.0 - 1.0 / (1.0 + e) + e * r * r / (1.0 + e)) * 1.001
+    }
+}
+
+impl<const N: u32> Lipschitz for Tube<N> {
+    /// A union of exact distances: 1.
     fn lipschitz(self, near: f32) -> f32 {
         1.0
     }
@@ -734,6 +1687,47 @@ impl<S: Lipschitz, N: Noise> Lipschitz for Displace<S, N> {
         let r = self.noise.range()
         let reach = abs(self.amp) * max(abs(r.lo), abs(r.hi))
         self.inner.lipschitz(near + reach) + abs(self.amp) * self.noise.lipschitz()
+    }
+}
+
+impl<A: Lipschitz, B: Lipschitz> Lipschitz for SmoothSubtract<A, B> {
+    /// A smooth maximum's gradient is a weighted mean of its operands', so the larger bound,
+    /// each within `near` plus the blend's reach (`k / 4`).
+    fn lipschitz(self, near: f32) -> f32 {
+        let n = near + 0.25 * max(self.k, 0.0)
+        max(self.a.lipschitz(n), self.b.lipschitz(n))
+    }
+}
+
+impl<A: Lipschitz, B: Lipschitz> Lipschitz for SmoothIntersect<A, B> {
+    fn lipschitz(self, near: f32) -> f32 {
+        let n = near + 0.25 * max(self.k, 0.0)
+        max(self.a.lipschitz(n), self.b.lipschitz(n))
+    }
+}
+
+impl<S: Lipschitz> Lipschitz for Rotate<S> {
+    fn lipschitz(self, near: f32) -> f32 {
+        self.inner.lipschitz(near)
+    }
+}
+
+impl<S: Lipschitz> Lipschitz for Scale<S> {
+    /// Scaling keeps a gradient's length; `near` is the inner surface's `near / by`.
+    fn lipschitz(self, near: f32) -> f32 {
+        self.inner.lipschitz(near / abs(self.by))
+    }
+}
+
+impl<S: Lipschitz> Lipschitz for Mirror<S> {
+    fn lipschitz(self, near: f32) -> f32 {
+        self.inner.lipschitz(near)
+    }
+}
+
+impl<S: Lipschitz> Lipschitz for Named<S> {
+    fn lipschitz(self, near: f32) -> f32 {
+        self.inner.lipschitz(near)
     }
 }
 
@@ -913,6 +1907,26 @@ impl<S: Surface, C: Copy + GpuData> Surface for With<S, C> {
     fn distance(self, p: vec3) -> f32 {
         self.inner.distance(p)
     }
+
+    fn part_offset(self, p: vec3, i: u32, by: f32) -> f32 {
+        self.inner.part_offset(p, i, by)
+    }
+
+    fn parts(self) -> u32 {
+        self.inner.parts()
+    }
+
+    fn part_at(self, p: vec3) -> (f32, u32) {
+        self.inner.part_at(p)
+    }
+
+    fn part_distance(self, p: vec3, i: u32) -> f32 {
+        self.inner.part_distance(p, i)
+    }
+
+    fn part_name(self, i: u32) -> PartName {
+        self.inner.part_name(i)
+    }
 }
 
 impl<S: Surface, C: Copy + GpuData> Field<C> for With<S, C> {
@@ -934,6 +1948,26 @@ pub struct WithAt<S, F>: Copy + GpuData {
 impl<S: Surface, F: Copy + GpuData> Surface for WithAt<S, F> {
     fn distance(self, p: vec3) -> f32 {
         self.inner.distance(p)
+    }
+
+    fn part_offset(self, p: vec3, i: u32, by: f32) -> f32 {
+        self.inner.part_offset(p, i, by)
+    }
+
+    fn parts(self) -> u32 {
+        self.inner.parts()
+    }
+
+    fn part_at(self, p: vec3) -> (f32, u32) {
+        self.inner.part_at(p)
+    }
+
+    fn part_distance(self, p: vec3, i: u32) -> f32 {
+        self.inner.part_distance(p, i)
+    }
+
+    fn part_name(self, i: u32) -> PartName {
+        self.inner.part_name(i)
     }
 }
 
@@ -1059,6 +2093,72 @@ impl<C: Blend, S: Field<C>, const N: u32> Field<C> for SmoothUnionAll<S, N> {
     }
 }
 
+/// `a`'s channels: the cut takes away, and its face is `a`'s.
+impl<C, A: Field<C>, B: Surface> Field<C> for SmoothSubtract<A, B> {
+    fn channels(self, p: vec3) -> C {
+        self.a.channels(p)
+    }
+
+    fn distance_and_channels(self, p: vec3) -> (f32, C) {
+        let (da, ca) = self.a.distance_and_channels(p)
+        (smax(da, -self.b.distance(p), self.k), ca)
+    }
+}
+
+/// The operands' channels blended as the smooth maximum weighs them.
+impl<C: Blend, A: Field<C>, B: Field<C>> Field<C> for SmoothIntersect<A, B> {
+    fn channels(self, p: vec3) -> C {
+        self.distance_and_channels(p).1
+    }
+
+    fn distance_and_channels(self, p: vec3) -> (f32, C) {
+        let (da, ca) = self.a.distance_and_channels(p)
+        let (db, cb) = self.b.distance_and_channels(p)
+        (smax(da, db, self.k), ca.blend(cb, smin_weight(-da, -db, self.k)))
+    }
+}
+
+impl<C, S: Field<C>> Field<C> for Rotate<S> {
+    fn channels(self, p: vec3) -> C {
+        self.inner.channels(self.local(p))
+    }
+
+    fn distance_and_channels(self, p: vec3) -> (f32, C) {
+        self.inner.distance_and_channels(self.local(p))
+    }
+}
+
+impl<C, S: Field<C>> Field<C> for Scale<S> {
+    fn channels(self, p: vec3) -> C {
+        self.inner.channels(p / self.by)
+    }
+
+    fn distance_and_channels(self, p: vec3) -> (f32, C) {
+        let (d, c) = self.inner.distance_and_channels(p / self.by)
+        (d * self.by, c)
+    }
+}
+
+impl<C, S: Field<C>> Field<C> for Mirror<S> {
+    fn channels(self, p: vec3) -> C {
+        self.inner.channels(mirrored(p))
+    }
+
+    fn distance_and_channels(self, p: vec3) -> (f32, C) {
+        self.inner.distance_and_channels(mirrored(p))
+    }
+}
+
+impl<C, S: Field<C>> Field<C> for Named<S> {
+    fn channels(self, p: vec3) -> C {
+        self.inner.channels(p)
+    }
+
+    fn distance_and_channels(self, p: vec3) -> (f32, C) {
+        self.inner.distance_and_channels(p)
+    }
+}
+
 // ---- tests (the suite runs std's: `std_tests_pass`) --------------------------------------------
 
 /// A blob of every primitive, smooth-unioned, and displaced by noise: what std's field tests
@@ -1117,4 +2217,104 @@ fn stated_bounds_hold_near_the_surface() {
         }
     }
     assert(checked > 50, "too few samples near the surface")
+}
+
+/// A body, a knob and its mirror image, and a cut: four parts, each found where it decides the
+/// distance, with the distance `distance` gives.
+fn test_parts() -> Surface {
+    let knob = sphere(0.2).translate(vec3(0.6, 0.0, 0.0)).named("knob").mirror_x()
+    sphere(0.5)
+        .named("body")
+        .smooth_union(knob, k: 0.05)
+        .smooth_subtract(
+            cuboid(half: vec3(0.1)).translate(vec3(0.0, 0.5, 0.0)).named("notch"),
+            k: 0.02,
+        )
+}
+
+@test
+fn each_part_is_found_where_it_decides_the_distance() {
+    let s = test_parts()
+    assert(s.parts() == 4)
+    let at = |p: vec3| s.part_at(p).1
+    assert(at(vec3(0.0, -0.3, 0.0)) == 0)
+    assert(at(vec3(0.7, 0.0, 0.0)) == 1)
+    assert(at(vec3(-0.7, 0.0, 0.0)) == 2)
+    assert(at(vec3(0.0, 0.45, 0.0)) == 3)
+    assert(s.part_name(1).name == "knob" && !s.part_name(1).mirrored)
+    assert(s.part_name(2).name == "knob" && s.part_name(2).mirrored)
+    assert(s.part_name(3).name == "notch")
+    // The image's own distance is the knob's, reflected.
+    let p = vec3(-0.75, 0.1, 0.05)
+    assert(abs(s.part_distance(p, 2) - s.part_distance(vec3(0.75, 0.1, 0.05), 1)) < 1.0e-6)
+    let b = Box3 { lo: vec3(-1.0), hi: vec3(1.0) }
+    for i in 0..1024 {
+        let q = b.sample(5, i)
+        assert(s.part_at(q).0 == s.distance(q), f"at ({q.x}, {q.y}, {q.z})")
+    }
+}
+
+@test
+fn a_part_shares_the_distance_where_it_decides_it_and_in_its_blends() {
+    let s = test_parts()
+    // On the body, away from the knobs and the notch: the body alone.
+    let low = vec3(0.0, -0.5, 0.0)
+    assert(abs(part_share(s, low, 0) - 1.0) < 1.0e-3)
+    for i in 1..4 {
+        assert(part_share(s, low, i) == 0.0, f"part {i}")
+    }
+    // The knob as written decides at x > 0, its image at x < 0.
+    let knob = vec3(0.8, 0.0, 0.0)
+    assert(abs(part_share(s, knob, 1) - 1.0) < 1.0e-3)
+    assert(part_share(s, knob, 2) == 0.0)
+    assert(part_share(s, vec3(-0.8, 0.0, 0.0), 2) > 0.999)
+    // Where the knob meets the body (the circle where both spheres' surfaces cross), within
+    // the blend's width, both share it.
+    let seam = vec3(0.475, 0.156, 0.0)
+    let (a, k) = (part_share(s, seam, 0), part_share(s, seam, 1))
+    assert(a > 0.0 && a < 1.0 && k > 0.0 && k < 1.0, f"body {a}, knob {k}")
+    assert(abs(a + k - 1.0) < 1.0e-2)
+    // Raising a part where it decides raises the distance as much.
+    assert(abs(s.part_offset(low, 0, by: 0.01) - (s.distance(low) + 0.01)) < 1.0e-6)
+    // Scaled, an offset is in the scaled surface's units.
+    let big = s.scale(2.0)
+    assert(abs(big.part_offset(2.0 * low, 0, by: 0.01) - (big.distance(2.0 * low) + 0.01)) < 1.0e-6)
+}
+
+@test
+fn certified_checks_prove_what_holds_and_find_what_fails() {
+    let below = Box3 { lo: vec3(-2.0, -1.0, -2.0), hi: vec3(2.0, 0.0, 2.0) }
+    // Clear of the ground: proved.
+    let up = sphere(0.5).translate(vec3(0.0, 0.6, 0.0))
+    assert(certify_clear(up, below, depth: 6).holds())
+    // Sunk 10 cm: a point below the ground inside it.
+    let sunk = sphere(0.5).translate(vec3(0.0, 0.4, 0.0))
+    match certify_clear(sunk, below, depth: 6) {
+        Certified::Fails(p) => assert(
+            p.y <= 0.0 && sunk.distance(p) <= 0.0,
+            f"at ({p.x}, {p.y}, {p.z})",
+        ),
+        _ => assert(false, "a sunk sphere is found"),
+    }
+    // Touching the ground at a point: no interval can prove it clear, and no point fails.
+    let touching = sphere(0.5).translate(vec3(0.0, 0.5, 0.0))
+    match certify_clear(touching, below, depth: 5) {
+        Certified::Unknown(b) => assert(
+            b.lo.y < 0.0001 && b.hi.y > -0.5,
+            "the box is at the touch",
+        ),
+        Certified::Holds => assert(false, "a touching sphere isn't proved clear"),
+        Certified::Fails(p) => assert(false, f"no point is inside: ({p.x}, {p.y}, {p.z})"),
+    }
+    // Two parts apart, and two that overlap.
+    let pair = sphere(0.3).named("a").union(sphere(0.3).translate(vec3(1.0, 0.0, 0.0)).named("b"))
+    let around = Box3 { lo: vec3(-1.0), hi: vec3(2.0, 1.0, 1.0) }
+    assert(certify_apart(pair, a: 0, b: 1, region: around, depth: 6).holds())
+    let close = sphere(0.3).named("a").union(sphere(0.3).translate(vec3(0.5, 0.0, 0.0)).named("b"))
+    match certify_apart(close, a: 0, b: 1, region: around, depth: 6) {
+        Certified::Fails(p) => assert(
+            close.part_distance(p, 0) <= 0.0 && close.part_distance(p, 1) <= 0.0,
+        ),
+        _ => assert(false, "overlapping parts are found"),
+    }
 }

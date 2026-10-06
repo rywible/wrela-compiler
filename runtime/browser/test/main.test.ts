@@ -37,10 +37,16 @@ let loads = 0;
  * `device-pixel-content-box` (as Safari's does). */
 async function load(url: string, options: { hidden?: boolean; devicePixelBox?: boolean } = {}): Promise<Page> {
   const page: Page = { posted: [], puts: [], shown: [], observed: [], mediaListeners: [], visibilityListeners: [] };
-  const canvas = { style: {}, clientWidth: 100, clientHeight: 50, transferControlToOffscreen: () => ({}) };
+  const canvas = {
+    style: {},
+    clientWidth: 100,
+    clientHeight: 50,
+    transferControlToOffscreen: () => ({}),
+    addEventListener: () => {},
+  };
   const u = new URL(url);
   fake("location", { hostname: u.hostname, hash: u.hash });
-  fake("window", { devicePixelRatio: 2 });
+  fake("window", { devicePixelRatio: 2, addEventListener: () => {} });
   fake("document", {
     baseURI: `${u.origin}${u.pathname}`,
     visibilityState: options.hidden ? "hidden" : "visible",
@@ -86,7 +92,7 @@ async function load(url: string, options: { hidden?: boolean; devicePixelBox?: b
 
 test("a #test fragment with bad parameters still ends the test", async () => {
   const page = await load("http://127.0.0.1:8000/page/#test&frame=3");
-  expect(page.shown).toEqual(["wrela stopped: unknown test parameter `frame` (expected frames, width, height, fps, workers, audio or timestamps)"]);
+  expect(page.shown).toEqual(["wrela stopped: unknown test parameter `frame` (expected frames, width, height, fps, workers, audio, timestamps, nohash, input or latency)"]);
   expect(page.puts).toEqual(["PUT http://127.0.0.1:8000/page/results/DONE"]);
   expect(page.posted).toEqual([]);
 });

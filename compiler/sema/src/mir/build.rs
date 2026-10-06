@@ -68,6 +68,7 @@ pub fn build(p: &Program, consts: &Consts, f: FnId, body: &thir::Body) -> (Body,
         diags: Vec::new(),
         fs: FnState::new(def.ret_mode, None, body.value.span),
         chained: None,
+        discarded: Vec::new(),
     };
     let mut fns = vec![b.build_fn(&body.params, &body.value, def.ret_mode, None, body.value.span)];
     for (i, c) in body.closures.iter().enumerate() {
@@ -84,7 +85,8 @@ pub fn build(p: &Program, consts: &Consts, f: FnId, body: &thir::Body) -> (Body,
             span: c.span,
         })
         .collect();
-    let mir = Body { locals: b.locals, fns, closures, hidden_ret: body.hidden_ret };
+    let discarded = std::mem::take(&mut b.discarded);
+    let mir = Body { locals: b.locals, fns, closures, hidden_ret: body.hidden_ret, discarded };
     (mir, b.diags)
 }
 
@@ -171,6 +173,8 @@ struct Builder<'a> {
     /// A call that is the base of a field, index or swizzle, or another call's receiver: a
     /// `take` written before it needs parentheses (`(take b.finish()).n`).
     chained: Option<Span>,
+    /// Calls whose values statements discard ([`Body::discarded`]).
+    discarded: Vec<(Callee, bool, TyId, Span)>,
 }
 
 impl<'a> Builder<'a> {
@@ -564,7 +568,9 @@ impl<'a> Builder<'a> {
                 if !self.inlined(*c) {
                     return self.place_value(e, want);
                 }
-                if self.is_table(v) {
+                // A lifted package's table is built here from its literals, so each is lifted.
+                let lifted = self.p.package_of(self.p.const_(*c).module).lifted;
+                if self.is_table(v) && !lifted {
                     return self.temp_of(Rvalue::Const(*c), e.ty, span);
                 }
                 self.value(v, Want::Read)
@@ -1741,6 +1747,15 @@ impl<'a> Builder<'a> {
             }
             StmtKind::Assign { place, op, value } => self.assign(place, *op, value, s.span),
             StmtKind::Expr(e) => {
+                if let ExprKind::Call(c) = &e.kind {
+                    // A borrow struct with a `mut` field lends that field `mut`, in any mode.
+                    let lends_mut = c.modes.contains(&Mode::Mut)
+                        || c.args.iter().any(|a| {
+                            self.p.is_borrow_struct(a.ty)
+                                && crate::borrowck::has_mut_field(self.p, a.ty)
+                        });
+                    self.discarded.push((c.callee.clone(), lends_mut, e.ty, e.span));
+                }
                 if self.is_named_place(e) && !matches!(e.kind, ExprKind::Call(_)) {
                     // A place on its own: evaluate and check its indices, read nothing.
                     if let Some(p) = self.place(e) {

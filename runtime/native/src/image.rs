@@ -23,24 +23,33 @@ pub fn write_png(path: &Path, width: u32, height: u32, rgba: &[u8]) -> Result<()
     writer.finish().map_err(png_err)
 }
 
-/// Reads an RGBA8 PNG (a golden frame): its width, height and pixels, rows top to bottom.
+/// Reads a PNG as RGBA8 (a golden frame, or a reference image): its width, height and pixels,
+/// rows top to bottom. Grey, grey with alpha, RGB, indexed and 16-bit images are converted.
 pub fn read_png(path: &Path) -> Result<(u32, u32, Vec<u8>)> {
     let io = |e: std::io::Error| Error::io(path, e);
     let decode = |e: png::DecodingError| Error::io(path, std::io::Error::other(e));
     let file = std::fs::File::open(path).map_err(io)?;
-    let mut reader =
-        png::Decoder::new(std::io::BufReader::new(file)).read_info().map_err(decode)?;
-    let info = reader.info();
-    if (info.color_type, info.bit_depth) != (png::ColorType::Rgba, png::BitDepth::Eight) {
-        return Err(Error::io(path, std::io::Error::other("not an 8-bit RGBA PNG")));
-    }
+    let mut decoder = png::Decoder::new(std::io::BufReader::new(file));
+    decoder.set_transformations(png::Transformations::normalize_to_color8());
+    let mut reader = decoder.read_info().map_err(decode)?;
     let size = reader
         .output_buffer_size()
         .ok_or_else(|| Error::io(path, std::io::Error::other("the image is too large")))?;
     let mut out = vec![0; size];
     let frame = reader.next_frame(&mut out).map_err(decode)?;
     out.truncate(frame.buffer_size());
-    Ok((frame.width, frame.height, out))
+    let rgba = match frame.color_type {
+        png::ColorType::Rgba => out,
+        png::ColorType::Rgb => out.chunks_exact(3).flat_map(|c| [c[0], c[1], c[2], 255]).collect(),
+        png::ColorType::GrayscaleAlpha => {
+            out.chunks_exact(2).flat_map(|c| [c[0], c[0], c[0], c[1]]).collect()
+        }
+        png::ColorType::Grayscale => out.iter().flat_map(|&g| [g, g, g, 255]).collect(),
+        png::ColorType::Indexed => {
+            return Err(Error::io(path, std::io::Error::other("an indexed PNG wasn't expanded")));
+        }
+    };
+    Ok((frame.width, frame.height, rgba))
 }
 
 /// How far apart two frames are, over every channel of every pixel, in 8-bit steps.

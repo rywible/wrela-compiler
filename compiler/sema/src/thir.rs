@@ -33,7 +33,8 @@ pub struct LocalDecl {
     pub ty: TyId,
     pub kind: LocalKind,
     pub span: Span,
-    /// The `let` that binds it alone (`let x = ...`), for fixes that change it to `var`.
+    /// The `let` or `var` that binds it alone (`let x = ...`), for fixes that change one to the
+    /// other.
     pub keyword: Option<Span>,
     /// Bound by a struct pattern's field shorthand (`S { count }`): renaming it keeps the
     /// field's name (`count: _count`).

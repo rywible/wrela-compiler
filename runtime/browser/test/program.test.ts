@@ -59,7 +59,7 @@ describe("the ABI check", () => {
     const log = { module: "env", name: "log", kind: "func" as const, type: { params: ["i32" as const], results: [] } };
     await rejects(
       buildModule({ imports: [log], memory: 1, funcs: [frameOnly] }),
-            "invalid program: it imports `env.log`, which isn't one of the host's: `wrela.memory`, `wrela.submit`, `wrela.request_status`, `wrela.request_take`, `wrela.limit`, `wrela.audio`",
+            "invalid program: it imports `env.log`, which isn't one of the host's: `wrela.memory`, `wrela.submit`, `wrela.request_status`, `wrela.request_take`, `wrela.limit`, `wrela.audio`, `wrela.input`",
     );
     const wrongType = { ...SUBMIT, type: { params: ["i32" as const], results: [] } };
     await rejects(
@@ -336,7 +336,7 @@ test("first-light's CPU side gives the native host's state hash", async () => {
   const manifest = parseManifest(readFixtureText("manifest.json"));
   const program = await Program.load(readFixture("game.wasm"), checker(manifest), new Recorder(), { hash: true });
   for (let i = 0; i < 60; i++) program.frame(i / 60, 640, 360);
-  expect(program.hash!.hex()).toBe("82cb694bcab728bd");
+  expect(program.hash!.hex()).toBe("3f3cd379aa0254b4");
   const log = (program.executor as Recorder).log;
   expect(log.slice(0, 7)).toEqual(["CreateBuffer", "WriteBuffer", "Dispatch", "BeginScreenPass", "Draw", "Present", "end"]);
   expect(log.length).toBe(3 + 60 * 4);
@@ -387,6 +387,7 @@ describe("requests", () => {
       fetch: async (url: string) => (url === "data/level.bin" ? Uint8Array.of(1, 2, 3, 4, 5) : Promise.reject(new Error("no such file"))),
       storageRead: async () => new Uint8Array(0),
       storageWrite: async () => {},
+      post: async () => new Uint8Array(0),
     };
     const p = await program(new Encoder().fetch(4, "data/level.bin").finish(), { io });
     p.call("ask");
@@ -456,4 +457,85 @@ test("a logged line goes to the console, prefixed", async () => {
   } finally {
     log.mockRestore();
   }
+});
+
+describe("posts", () => {
+  const STATUS = { module: "wrela", name: "request_status", kind: "func" as const, type: { params: ["i32" as const], results: ["i32" as const] } };
+  const TAKE = { module: "wrela", name: "request_take", kind: "func" as const, type: { params: ["i32" as const, "i32" as const], results: [] } };
+  const I32 = { params: [], results: ["i32" as const] };
+  const program = (batch: Uint8Array, io?: Parameters<typeof Program.load>[3]) =>
+    Program.load(
+      buildModule({
+        imports: [SUBMIT, STATUS, TAKE],
+        memory: 1,
+        funcs: [
+          { type: FRAME_TYPE, body: [], export: "frame" },
+          { type: { params: [], results: [] }, body: [...op.i32(16), ...op.i32(batch.length), ...op.call(0)], export: "ask" },
+          { type: I32, body: [...op.i32(4), ...op.call(1)], export: "status" },
+          { type: I32, body: [...op.i32(4), ...op.i32(1024), ...op.call(2), ...op.i32(1024), 0x28, 0x02, 0x00], export: "take" },
+        ],
+        data: [{ offset: 16, bytes: batch }],
+      }),
+      checker(),
+      new Recorder(),
+      io,
+    );
+  const later = () => new Promise((r) => setTimeout(r, 0));
+
+  test("go to the host's post, and fail without one", async () => {
+    const batch = new Encoder().post(4, "studio/echo", Uint8Array.of(1, 2, 3, 4)).finish();
+    const io = {
+      fetch: async () => new Uint8Array(0),
+      storageRead: async () => new Uint8Array(0),
+      storageWrite: async () => {},
+      post: async (url: string, body: Uint8Array) => {
+        expect(url).toBe("studio/echo");
+        return Uint8Array.from(body).reverse();
+      },
+    };
+    const p = await program(batch, { io });
+    p.call("ask");
+    await later();
+    expect(p.call("status")).toBe(4);
+    expect(p.call("take")).toBe(0x01020304);
+    const q = await program(batch);
+    q.call("ask");
+    await later();
+    expect(q.call("status")).toBe(-2);
+    const elsewhere = await program(new Encoder().post(4, "https://example.com/x", new Uint8Array(0)).finish());
+    expect(() => elsewhere.call("ask")).toThrow("must be relative");
+  });
+});
+
+describe("input", () => {
+  const INPUT = { module: "wrela", name: "input", kind: "func" as const, type: { params: ["i32" as const, "i32" as const], results: ["i32" as const] } };
+  // `take(cap)` reads up to `cap` events to 1024; `word(at)` reads a word; `pastTheEnd` reads one
+  // event where it doesn't fit.
+  const wasm = buildModule({
+    imports: [INPUT],
+    memory: 1,
+    funcs: [
+      { type: FRAME_TYPE, body: [], export: "frame" },
+      { type: { params: ["i32"], results: ["i32"] }, body: [...op.i32(1024), 0x20, 0x00, ...op.call(0)], export: "take" },
+      { type: { params: ["i32"], results: ["i32"] }, body: [0x20, 0x00, 0x28, 0x02, 0x00], export: "word" },
+      { type: { params: [], results: ["i32"] }, body: [...op.i32(65530), ...op.i32(1), ...op.call(0)], export: "pastTheEnd" },
+    ],
+  });
+
+  test("is read oldest first, and what isn't read waits", async () => {
+    const { pointerEvent, textEvent, keyEvent, bits } = await import("../src/input.ts");
+    const p = await Program.load(wasm, checker(), new Recorder());
+    p.queueInput(new Uint8Array([...pointerEvent(2, 3.5, 4, 2, 1), ...textEvent(0xe9), ...keyEvent(true, 40, false, 0)]));
+    expect(p.call("take", 2)).toBe(2);
+    expect(p.call("word", 1024)).toBe(2);
+    expect(p.call("word", 1028)).toBe(1);
+    expect(p.call("word", 1032)).toBe(bits(3.5) | 0);
+    expect(p.call("word", 1040)).toBe(2);
+    expect(p.call("word", 1024 + 24 + 8)).toBe(0xe9);
+    expect(p.call("take", 8)).toBe(1);
+    expect(p.call("word", 1024)).toBe(5);
+    expect(p.call("take", 8)).toBe(0);
+    p.queueInput(textEvent(120));
+    expect(() => p.call("pastTheEnd")).toThrow("past the end of the program's memory");
+  });
 });

@@ -1,4 +1,4 @@
-//! # The command stream, version 4
+//! # The command stream, version 5
 //!
 //! A program records GPU work as commands in its own memory and hands them to the host in
 //! batches through `wrela.submit(ptr, len)` (D-099). The host decodes each batch in bulk into
@@ -40,6 +40,7 @@
 //! | 20 | `StorageWrite` | `request`, `path length`, `data length`, then the path's UTF-8 and the data, each padded to 4 bytes: stores the bytes at the path, a request |
 //! | 21 | `Fetch` | `request`, `url length`, then the URL's UTF-8, padded to 4 bytes: the bytes at the URL, relative to the build, a request |
 //! | 22 | `Log` | `length`, then a line of UTF-8, padded to 4 bytes: shown on the host's console (`std::io::print`) |
+//! | 23 | `Post` | `request`, `url length`, `body length`, then the URL's UTF-8 and the body, each padded to 4 bytes: sends the body to the host that serves the build, at the URL relative to the build; the answer is the host's reply, a request |
 //!
 //! **Requests** (language.md §6.15) are answered on a later call: the program polls each with
 //! the imports `wrela.request_status(request) -> i32` (-1 while it's pending, -2 if it failed,
@@ -72,7 +73,7 @@
 use std::fmt;
 
 /// The stream format's version. Bumped by any change a host could notice.
-pub const VERSION: u32 = 4;
+pub const VERSION: u32 = 5;
 pub const MAGIC: [u8; 4] = *b"WRCS";
 /// The batch header: magic, version, body length.
 pub const HEADER_LEN: usize = 12;
@@ -109,10 +110,11 @@ pub enum Opcode {
     StorageWrite = 20,
     Fetch = 21,
     Log = 22,
+    Post = 23,
 }
 
 impl Opcode {
-    pub const ALL: [Opcode; 22] = [
+    pub const ALL: [Opcode; 23] = [
         Opcode::CreateBuffer,
         Opcode::WriteBuffer,
         Opcode::Dispatch,
@@ -135,6 +137,7 @@ impl Opcode {
         Opcode::StorageWrite,
         Opcode::Fetch,
         Opcode::Log,
+        Opcode::Post,
     ];
 
     pub fn from_u32(v: u32) -> Option<Opcode> {
@@ -165,6 +168,7 @@ impl Opcode {
             Opcode::StorageWrite => "StorageWrite",
             Opcode::Fetch => "Fetch",
             Opcode::Log => "Log",
+            Opcode::Post => "Post",
         }
     }
 }
@@ -378,6 +382,11 @@ pub enum Command<'a> {
     Log {
         text: &'a str,
     },
+    Post {
+        request: u32,
+        url: &'a str,
+        body: &'a [u8],
+    },
 }
 
 impl Command<'_> {
@@ -405,6 +414,7 @@ impl Command<'_> {
             Command::StorageWrite { .. } => Opcode::StorageWrite,
             Command::Fetch { .. } => Opcode::Fetch,
             Command::Log { .. } => Opcode::Log,
+            Command::Post { .. } => Opcode::Post,
         }
     }
 }
@@ -555,6 +565,19 @@ pub fn decode(batch: &[u8]) -> Result<Vec<Command<'_>>, StreamError> {
         // The `n` bytes of UTF-8 text at byte `from` of the payload (`not_utf8` if they aren't).
         let text = |from: usize, n: usize, not_utf8| {
             std::str::from_utf8(&p[from..from + n]).map_err(|_| bad(not_utf8))
+        };
+        // A text, then bytes, their lengths in words 1 and 2 (`mismatch` if they don't fill the
+        // payload, `not_utf8` if the text isn't UTF-8).
+        let two_runs = |mismatch, not_utf8| {
+            if words < 3 {
+                return Err(bad("expected at least 3 words"));
+            }
+            let (n, m) = (w(1) as usize, w(2) as usize);
+            if padded(n).checked_add(padded(m)) != Some(len - 12) {
+                return Err(bad(mismatch));
+            }
+            let at = 12 + padded(n);
+            Ok((text(12, n, not_utf8)?, &p[at..at + m]))
         };
         let cmd = match opcode {
             Opcode::CreateBuffer => {
@@ -730,16 +753,18 @@ pub fn decode(batch: &[u8]) -> Result<Vec<Command<'_>>, StreamError> {
                 Command::Log { text: text(4, n, "the text isn't UTF-8")? }
             }
             Opcode::StorageWrite => {
-                if words < 3 {
-                    return Err(bad("expected at least 3 words"));
-                }
-                let (n, m) = (w(1) as usize, w(2) as usize);
-                if padded(n).checked_add(padded(m)) != Some(len - 12) {
-                    return Err(bad("the path's and data's lengths don't match the payload"));
-                }
-                let path = text(12, n, "the path isn't UTF-8")?;
-                let at = 12 + padded(n);
-                Command::StorageWrite { request: w(0), path, data: &p[at..at + m] }
+                let (path, data) = two_runs(
+                    "the path's and data's lengths don't match the payload",
+                    "the path isn't UTF-8",
+                )?;
+                Command::StorageWrite { request: w(0), path, data }
+            }
+            Opcode::Post => {
+                let (url, body) = two_runs(
+                    "the URL's and body's lengths don't match the payload",
+                    "the URL isn't UTF-8",
+                )?;
+                Command::Post { request: w(0), url, body }
             }
         };
         out.push(cmd);
@@ -1051,6 +1076,14 @@ impl Encoder {
     pub fn fetch(&mut self, request: u32, url: &str) -> &mut Self {
         let bytes = Self::pad(url.as_bytes());
         self.command(Opcode::Fetch, &[request, url.len() as u32], &bytes);
+        self
+    }
+
+    pub fn post(&mut self, request: u32, url: &str, body: &[u8]) -> &mut Self {
+        let mut bytes = Self::pad(url.as_bytes());
+        bytes.extend(Self::pad(body));
+        let words = [request, url.len() as u32, body.len() as u32];
+        self.command(Opcode::Post, &words, &bytes);
         self
     }
 

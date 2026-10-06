@@ -34,11 +34,53 @@ pub fn flatten_gpu(m: &mut Module) -> Result<()> {
         let mut f = std::mem::take(&mut m.functions[i]);
         forward(m, &mut f);
         promote(m, &mut f);
+        dce(&mut f);
+        // An inlined function given a constant `bool` keeps only the branch it takes (the lens's
+        // `isolate: false`), as the CPU's inlining does.
+        fold_constant_branches(&mut f);
+        collapse_rebuilds(&mut f);
         cse(&mut f);
         dce(&mut f);
         m.functions[i] = f;
     }
     Ok(())
+}
+
+/// A value built of another's parts, all of them in order (`Construct(t, [x.0, x.1, ...])`
+/// with `x` of type `t`), is that value: derived code rewraps its dual numbers so at each step,
+/// and in WGSL each rewrap is a statement and a copy. (`x` is defined before its parts, so it's
+/// visible wherever the rebuilt value is.)
+fn collapse_rebuilds(f: &mut Function) {
+    let mut extract: HashMap<ValueId, (ValueId, u32)> = HashMap::new();
+    visit::walk(&f.body, &mut |s| {
+        if let Stmt::Let(v, Expr::Extract(x, i)) = s {
+            extract.insert(*v, (*x, *i));
+        }
+    });
+    if extract.is_empty() {
+        return;
+    }
+    let mut rename: Vec<Option<ValueId>> = vec![None; f.values.len()];
+    visit::walk(&f.body, &mut |s| {
+        if let Stmt::Let(w, Expr::Construct(t, parts)) = s
+            && let Some(&(x, 0)) = parts.first().and_then(|p| extract.get(p))
+            && f.values[x.index()] == *t
+            && parts.iter().enumerate().all(|(i, p)| extract.get(p) == Some(&(x, i as u32)))
+        {
+            rename[w.index()] = Some(x);
+        }
+    });
+    if !rename.iter().any(Option::is_some) {
+        return;
+    }
+    // A rebuilt value of a rebuilt value is the first.
+    let resolve = |mut v: ValueId| {
+        while let Some(Some(y)) = rename.get(v.index()) {
+            v = *y;
+        }
+        v
+    };
+    visit::walk_mut(&mut f.body, &mut |s| s.for_each_value_mut(&mut |x| *x = resolve(*x)));
 }
 
 // ---- common subexpressions -------------------------------------------------------------------
@@ -154,21 +196,22 @@ fn promote_block(
 ) {
     let mut added = Vec::new();
     let old = std::mem::take(b);
+    // A value passed down through inlined calls is a local read from a local read from a
+    // local: a value stored is read as it's renamed, so one pass follows the whole chain.
+    let renamed = |rename: &[Option<ValueId>], x: ValueId| {
+        rename.get(x.index()).copied().flatten().unwrap_or(x)
+    };
     for mut s in old {
-        s.for_each_value_mut(&mut |x| {
-            if let Some(Some(y)) = rename.get(x.index()) {
-                *x = *y;
-            }
-        });
+        s.for_each_value_mut(&mut |x| *x = renamed(rename, *x));
         match s {
             Stmt::Let(v, Expr::Load(ref p))
                 if p.root_local()
                     .and_then(|l| stored.get(&l))
-                    .is_some_and(|x| visible.contains(x))
+                    .is_some_and(|&x| visible.contains(&renamed(rename, x)))
                     && p.path.iter().all(|x| !matches!(x, Proj::Index(_))) =>
             {
                 let l = p.root_local().expect("a local");
-                let mut at = stored[&l];
+                let mut at = renamed(rename, stored[&l]);
                 if p.path.is_empty() {
                     rename[v.index()] = Some(at);
                     continue;
@@ -229,6 +272,34 @@ fn promote_block(
 /// The smallest body, in statements once its own callees are inlined, that stays a call.
 const OUTLINE_SIZE: usize = 48;
 
+/// The size from which a function that takes few arguments stays a call (see `outlined`).
+const OUTLINE_SMALL: usize = 24;
+
+/// The most scalars a function's arguments (and its result) hold for it to stay a call by size
+/// alone: a few registers.
+const SMALL_ARGS: usize = 48;
+
+/// How many scalars a value of type `t` holds, if a call passes it in registers: a scalar, a
+/// vector, or a struct or enum of them, nested less than 8 deep. `None` for any other type: an
+/// array passed by value is a private copy, which a GPU indexes slowly (why GPU code was all
+/// inlined to begin with).
+fn scalars(m: &Module, t: TypeId, depth: u32) -> Option<usize> {
+    match m.types.get(t) {
+        TypeDef::Scalar(_) => Some(1),
+        TypeDef::Vector(n) => Some(*n as usize),
+        TypeDef::Struct { fields, .. } if depth < 8 => fields
+            .iter()
+            .try_fold(0usize, |n, (_, ft)| Some(n.saturating_add(scalars(m, *ft, depth + 1)?))),
+        TypeDef::Enum { variants, .. } if depth < 8 => {
+            variants.iter().try_fold(1usize, |n, (_, p)| match p {
+                Some(pt) => Some(n.saturating_add(scalars(m, *pt, depth + 1)?)),
+                None => Some(n),
+            })
+        }
+        _ => None,
+    }
+}
+
 /// Callees first: an order in which every function comes after those it calls.
 fn callee_order(m: &Module) -> Result<(Vec<usize>, Vec<bool>)> {
     let n = m.functions.len();
@@ -273,27 +344,25 @@ fn callee_order(m: &Module) -> Result<(Vec<usize>, Vec<bool>)> {
 /// what it inlines, only computes: no entry point's inputs, resources, barriers, atomics or
 /// textures. (Entry points are written whole.)
 fn outlined(m: &Module) -> Vec<bool> {
+    // Small arguments' functions stay calls only where the inlined shader would be too big
+    // to write (a creature's, the lens's): elsewhere every call is inlined, as M1 measured
+    // fastest (a branch-free kernel the GPU compiler sees whole).
+    let (keep, biggest) = outlined_with(m, false);
+    if biggest > INLINE_LIMIT { outlined_with(m, true).0 } else { keep }
+}
+
+/// The size of an entry point inlined whole, in statements, past which functions that take
+/// few arguments stay calls. M1's fields are at most half of it; sketch 02's shaders and the
+/// wolf's and the lens's are over (up to twelve times), and would be MBs of WGSL.
+const INLINE_LIMIT: usize = 16000;
+
+/// Which functions stay calls (see `outlined`), with small arguments' functions too if
+/// `small_calls`; and the biggest entry point's size with what it inlines.
+fn outlined_with(m: &Module, small_calls: bool) -> (Vec<bool>, usize) {
     let n = m.functions.len();
     let mut keep = vec![false; n];
-    let Ok((order, _)) = callee_order(m) else { return keep };
+    let Ok((order, _)) = callee_order(m) else { return (keep, 0) };
     let entry: HashSet<usize> = m.entry_points.iter().map(|e| e.function.index()).collect();
-    // Scalars, vectors, and structs and enums of them with no arrays: what a call passes in
-    // registers. (An array passed by value is a private copy, which a GPU indexes slowly: why
-    // GPU code was all inlined to begin with.)
-    fn plain(m: &Module, t: TypeId, depth: u32) -> bool {
-        match m.types.get(t) {
-            TypeDef::Scalar(_) | TypeDef::Vector(_) => true,
-            TypeDef::Struct { fields, .. } => {
-                depth < 8 && fields.iter().all(|(_, ft)| plain(m, *ft, depth + 1))
-            }
-            TypeDef::Enum { variants, .. } => {
-                depth < 8
-                    && variants.iter().all(|(_, p)| p.is_none_or(|pt| plain(m, pt, depth + 1)))
-            }
-            _ => false,
-        }
-    }
-    let plain = |t: TypeId| plain(m, t, 0);
     // A body's size with its inlined callees, and whether it only computes.
     let mut size = vec![0usize; n];
     let mut pure = vec![false; n];
@@ -335,15 +404,29 @@ fn outlined(m: &Module) -> Vec<bool> {
         });
         size[f] = sz;
         pure[f] = ok;
-        let signature = func.params.iter().all(|p| !p.by_ref && plain(p.ty))
-            && func.ret.is_none_or(plain)
-            && !func.ret_ref;
-        // Interval derivations only: they're what nested derivations call from many places.
-        // Other code stays inlined, as M1 measured it: a field's parts called in a loop (the
-        // grazer's legs) ran slower as calls.
-        keep[f] = func.interval && !entry.contains(&f) && ok && signature && sz >= OUTLINE_SIZE;
+        // How many scalars the arguments and the result hold: `None` if one isn't passed in
+        // registers (or is passed by reference).
+        let args = func.params.iter().try_fold(0usize, |n, p| {
+            if p.by_ref { None } else { Some(n.saturating_add(scalars(m, p.ty, 0)?)) }
+        });
+        let ret = func.ret.map_or(Some(0), |t| scalars(m, t, 0));
+        let signature = args.is_some() && ret.is_some() && !func.ret_ref;
+        // Interval derivations: they're what nested derivations call from many places. And
+        // any other big function whose arguments are a few registers' worth (value noise, a
+        // part's shape): its body appears once, where inlined it would appear at every use of
+        // the field (its distance, its gradient, its parts). Other code stays inlined, as M1
+        // measured it: a field's parts called in a loop (the grazer's legs) ran slower as
+        // calls, each copying its share of the uniform.
+        let small = args.is_some_and(|n| n <= SMALL_ARGS) && ret.is_some_and(|n| n <= SMALL_ARGS);
+        let big = if func.interval {
+            sz >= OUTLINE_SIZE
+        } else {
+            small_calls && small && sz >= OUTLINE_SMALL
+        };
+        keep[f] = !entry.contains(&f) && ok && signature && big;
     }
-    keep
+    let biggest = entry.iter().map(|&e| size[e]).max().unwrap_or(0);
+    (keep, biggest)
 }
 
 /// Inlines every call but those to `keep`'s functions, callees first.

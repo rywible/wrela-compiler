@@ -179,10 +179,19 @@ fn check_entry(p: &Program, f: FnId, entry: Entry, out: &mut Vec<Diagnostic>) {
                 }
             }
         }
-        Entry::Fragment if !matches!(p.types.kind(def.ret), TyKind::Vec(4)) => out.push(
-            Diagnostic::new(codes::E0602, def.sig_span, format!("{stage} returns a `vec4` colour"))
-                .with_note("it writes one colour to the screen"),
-        ),
+        Entry::Fragment
+            if !matches!(p.types.kind(def.ret), TyKind::Vec(4))
+                && p.lang_of_ty(def.ret) != Some(Lang::Over) =>
+        {
+            out.push(
+                Diagnostic::new(
+                    codes::E0602,
+                    def.sig_span,
+                    format!("{stage} returns a `vec4` colour, or an `Over` colour to blend"),
+                )
+                .with_note("it writes one colour to its target: a `vec4` replaces what's there, and `std::gpu::Over` is drawn over it"),
+            )
+        }
         _ => {}
     }
     // What it takes.

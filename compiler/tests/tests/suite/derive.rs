@@ -15,7 +15,7 @@ use wrela_host::{CpuBuild, CpuHost, Host, Value};
 use wrela_tests::{Rng, one_f32, one_u32, par_each, sized, u32s, worse};
 
 /// The corpus, in the order of `with_function` in compiler/tests/fields/main.wrela.
-const NAMES: [&str; 21] = [
+const NAMES: [&str; 23] = [
     "sphere",
     "ellipsoid",
     "round cone",
@@ -37,6 +37,8 @@ const NAMES: [&str; 21] = [
     "waves (tape)",
     "blob (tape)",
     "closures",
+    "table",
+    "powers",
 ];
 /// Boxes per function on the GPU, and on the CPU at full size.
 const BOXES: u32 = 1_000_000;

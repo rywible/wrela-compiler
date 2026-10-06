@@ -70,6 +70,7 @@ pub fn emit(l: &Lowered, sources: &SourceMap, simd: bool) -> BuildOutput {
             (PipelineKind::Render, [vertex, fragment]) => wrela_abi::manifest::Stage::Render {
                 vertex_entry: vertex.clone(),
                 fragment_entry: fragment.clone(),
+                blend: p.blend,
             },
             _ => {
                 diagnostics.push(Diagnostic::internal(format!(

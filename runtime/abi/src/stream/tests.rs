@@ -45,6 +45,9 @@ fn golden_bytes() {
         b"data/level.bin\0\0".to_vec(),
         words(&[22, 28, 22]), // Log
         "frame 3: 2 grazers, é\0\0".as_bytes().to_vec(),
+        words(&[23, 28, 5, 11, 2]), // Post
+        b"studio/edit\0".to_vec(),
+        vec![123, 125, 0, 0],
     ]
     .concat();
     expected.extend(words(&[VERSION, body.len() as u32]));

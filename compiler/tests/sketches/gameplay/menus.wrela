@@ -10,9 +10,10 @@
 // - `slot_name` returns `Text`, a literal (F4); a menu's context, a borrow struct, goes to
 //   several calls in a row (F16).
 // - The engine's `panel` takes the panel's height, to draw its background first.
+// - The UI is the ui package's (M3): text in a font, and a checkbox is a toggle.
 
 use dialogue::{Conversation, DIALOGUE, offered}
-use engine::ui::{Anchor, Ui}
+use ui::widgets::{Anchor, Ui}
 use inventory::{ItemStack, slot_name}
 use items::{EquipSlot, GOLD, item_def}
 use quests::tracked_quest
@@ -175,7 +176,7 @@ fn settings_screen(c: MenuCtx) {
     if c.ui.slider(f"Field of view: {u32(round(fov))} deg", mut fov, lo: 60.0, hi: 110.0) {
         s.fov = fov * deg
     }
-    c.ui.checkbox("Subtitles", mut s.subtitles)
+    c.ui.toggle("Subtitles", mut s.subtitles)
     if c.ui.button("Back") {
         c.menus.saving = Some(store("settings", save(s))) // a request, polled below
         c.menus.screen = Screen::Paused

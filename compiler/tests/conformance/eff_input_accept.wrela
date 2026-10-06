@@ -1,0 +1,29 @@
+// accepts: eff.input
+// Input is read outside `@deterministic` code and enters the simulation as data: the events a
+// tick is given, as it's given the time.
+use std::input::{Event, Input, events}
+
+pub struct Game {
+    input: Input,
+    moves: u32,
+}
+
+@deterministic
+fn tick(moves: u32, events: [Event]) -> u32 {
+    var n = moves
+    for e in events {
+        if let Event::PointerMove { .. } = e {
+            n += 1
+        }
+    }
+    n
+}
+
+pub fn init() -> Game {
+    Game { input: Input::new(), moves: 0 }
+}
+
+pub fn frame(state: mut Game, time: f32, width: u32, height: u32) {
+    state.input.update(events())
+    state.moves = tick(state.moves, state.input.events)
+}

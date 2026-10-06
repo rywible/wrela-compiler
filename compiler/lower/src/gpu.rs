@@ -63,6 +63,11 @@ pub struct PipelineOut {
     pub sites: Vec<Span>,
     /// A debug build's: the binding of the flag its bounds checks set (`ir::bounds`).
     pub debug_flag: Option<u32>,
+    /// A render pipeline whose fragment shader returns `Over`: its colour is blended over the
+    /// target's.
+    pub blend: bool,
+    /// The functions its module instantiates, with their type arguments (`wrela query`).
+    pub instances: Vec<(FnId, Vec<TyId>)>,
 }
 
 /// What a GPU module is for, while it's lowered.
@@ -80,6 +85,8 @@ pub(crate) struct GpuCx {
     pub uniform: Option<ir::ResourceId>,
     /// For each of the interface's uniforms, its field in the block (`None`: no runtime value).
     pub uniform_fields: Vec<Option<u32>>,
+    /// A lifted build's literal table (§22): the storage buffer every pipeline binds last.
+    pub literals: Option<ir::ResourceId>,
 }
 
 impl GpuCx {
@@ -98,6 +105,7 @@ impl GpuCx {
             num_workgroups: None,
             uniform: None,
             uniform_fields: Vec::new(),
+            literals: None,
         }
     }
 
@@ -488,6 +496,8 @@ pub(crate) fn lower_dispatch(fl: &mut Fl, d: &mir::Dispatch, span: Span) {
             }
         }
     }
+    // A lifted build's literal table (only a build with literals has one).
+    handles.extend(fl.literal_binding(true).into_iter().flatten());
     let bindings = handles.len() as u32 / 3;
     let mut args = groups;
     args.extend(handles);
@@ -576,6 +586,7 @@ pub(crate) fn lower_draw(fl: &mut Fl, d: &mir::Draw, span: Span) {
         let Some(b) = bindings_for(fl, *pt, class, place, *arg_span) else { return };
         handles.extend(b);
     }
+    handles.extend(fl.literal_binding(false).into_iter().flatten());
     let bindings = handles.len() as u32 / 3;
     let mut args = vec![vertices, instances];
     args.extend(handles);
@@ -598,6 +609,31 @@ pub(crate) fn intrinsic(
     match lang {
         Some(l @ (Lang::Gradient | Lang::ValueAndGradient | Lang::IntervalOf)) => {
             return crate::derive::call(fl, l, substs, c, ty);
+        }
+        Some(
+            l @ (Lang::LiftGradient
+            | Lang::LiftReads
+            | Lang::LiftCount
+            | Lang::LiftValue
+            | Lang::LiftBuiltValue
+            | Lang::LiftSet
+            | Lang::LiftSource
+            | Lang::LiftFiles
+            | Lang::LiftFile),
+        ) => {
+            if fl.is_gpu() {
+                let name = fl.cx.checked.program.func(func).name.clone();
+                fl.cx.err(Diagnostic::new(
+                    codes::E0600,
+                    span,
+                    format!("`{name}` reads a lifted build's table on the CPU; GPU code reads literals as written"),
+                ));
+                return None;
+            }
+            if matches!(l, Lang::LiftGradient | Lang::LiftReads) {
+                return crate::derive::call(fl, l, substs, c, ty);
+            }
+            return crate::lift::intrinsic(fl, l, c, ty);
         }
         Some(l) if l.records_gpu_work() && fl.is_gpu() => {
             let name = fl.cx.checked.program.func(func).name.clone();
@@ -648,6 +684,8 @@ pub(crate) fn intrinsic(
         }
         Some(Lang::BeginScreenPass) => {
             let clear = fl.arg_value(&c.args[0])?;
+            // A lifted build's literals reach the GPU before the pass: a pass holds only draws.
+            fl.upload_literals();
             fl.emit(ir::Stmt::Eval(ir::Expr::Host(ir::HostOp::BeginScreenPass, vec![clear])));
             None
         }
@@ -676,6 +714,9 @@ pub(crate) fn intrinsic(
             for a in &c.args {
                 args.push(fl.arg_value(a)?);
             }
+            if l == Lang::BeginPass {
+                fl.upload_literals();
+            }
             let op = ir::HostOp::Command { opcode: opcode as u32, words, runs: 0, handle };
             if handle {
                 let u = fl.mb.m.types.u32();
@@ -684,9 +725,13 @@ pub(crate) fn intrinsic(
             fl.emit(ir::Stmt::Eval(ir::Expr::Host(op, args)));
             None
         }
-        Some(l @ (Lang::NextRequest | Lang::RequestStatus | Lang::RequestTake | Lang::Limit))
-            if fl.is_gpu() =>
-        {
+        Some(
+            l @ (Lang::NextRequest
+            | Lang::RequestStatus
+            | Lang::RequestTake
+            | Lang::Limit
+            | Lang::InputTake),
+        ) if fl.is_gpu() => {
             let name = fl.cx.checked.program.func(func).name.clone();
             fl.cx.err(Diagnostic::new(
                 codes::E0600,
@@ -709,6 +754,13 @@ pub(crate) fn intrinsic(
             let i = fl.mb.m.types.scalar(ir::Scalar::I32);
             Some(fl.value(i, ir::Expr::Host(ir::HostOp::RequestStatus, vec![r])))
         }
+        Some(Lang::InputTake) => {
+            let at = fl.arg_value(&c.args[0])?;
+            let cap = fl.arg_value(&c.args[1])?;
+            fl.mb.m.input = true;
+            let u = fl.mb.m.types.u32();
+            Some(fl.value(u, ir::Expr::Host(ir::HostOp::Input, vec![at, cap])))
+        }
         Some(Lang::RequestTake) => {
             let r = fl.arg_value(&c.args[0])?;
             let at = fl.arg_value(&c.args[1])?;
@@ -720,7 +772,8 @@ pub(crate) fn intrinsic(
             | Lang::StorageReadCommand
             | Lang::StorageWriteCommand
             | Lang::FetchCommand
-            | Lang::PrintCommand),
+            | Lang::PrintCommand
+            | Lang::PostCommand),
         ) => {
             // The request number and (a readback) the buffer's range, then the runs: a path or
             // URL, the bytes to store, a line to print.
@@ -729,6 +782,7 @@ pub(crate) fn intrinsic(
                 Lang::StorageReadCommand => (Opcode::StorageRead, 1),
                 Lang::StorageWriteCommand => (Opcode::StorageWrite, 1),
                 Lang::PrintCommand => (Opcode::Log, 0),
+                Lang::PostCommand => (Opcode::Post, 1),
                 _ => (Opcode::Fetch, 1),
             };
             let mut args = Vec::new();
@@ -1336,6 +1390,18 @@ fn entry_module(cx: &mut Cx, iface: Rc<Interface>, stage: Entry) -> EntryModule 
             }
         }
     }
+    // A lifted build's literals: a buffer every pipeline binds, after the others (§22).
+    let literals = crate::lift::len(cx);
+    if literals > 0 {
+        let binding = 1 + bindings.len() as u32;
+        let ty = mb.m.types.f32();
+        let kind = ir::ResourceKind::StorageRead;
+        let id = mb.m.add_resource(ir::Resource { name: "literals".into(), binding, kind, ty });
+        bindings.push(ResourceBinding { binding, kind: BindingKind::Read });
+        if let Some(g) = mb.gpu.as_mut() {
+            g.literals = Some(id);
+        }
+    }
     // Workgroup memory: one array per `Shared` parameter.
     let mut workgroup_bytes = 0u32;
     for (e, entry) in iface.entries.iter().enumerate() {
@@ -1471,7 +1537,7 @@ fn check_storage_buffers(cx: &mut Cx, iface: &Interface, uniform: Option<&Unifor
             _ => Vec::new(),
         })
         .collect();
-    let n = buffers.len() + usize::from(in_storage);
+    let n = buffers.len() + usize::from(in_storage) + usize::from(crate::lift::len(cx) > 0);
     if n <= max {
         return;
     }
@@ -1523,6 +1589,7 @@ fn lower_compute(cx: &mut Cx, iface: Rc<Interface>) -> Option<PipelineOut> {
         inputs: entry_inputs(&iface.entries[0], true),
     });
     verify(cx, &mut mb, name)?;
+    let instances = mb.fn_instances();
     Some(PipelineOut {
         name: name.clone(),
         module: mb.m,
@@ -1532,6 +1599,8 @@ fn lower_compute(cx: &mut Cx, iface: Rc<Interface>) -> Option<PipelineOut> {
         key: PipelineKey::Compute { kernel: FnId(0), substs: Vec::new() },
         sites: Vec::new(),
         debug_flag: None,
+        blend: false,
+        instances,
     })
 }
 
@@ -1551,6 +1620,7 @@ fn lower_render(cx: &mut Cx, iface: Rc<Interface>) -> Option<PipelineOut> {
         g.what = describe_entry(Entry::Fragment, &fdef.name);
     }
     let fret_t = ret_type(cx, fragment.func, &fragment.substs);
+    let blend = checked.program.lang_of_ty(fret_t) == Some(Lang::Over);
     let fret = cx.lower_ty(&mut mb, fret_t, fdef.sig_span);
     let takes_varyings =
         fragment.params.iter().any(|&(t, _)| t == vret) && !is_clip_position(cx, vret);
@@ -1562,6 +1632,12 @@ fn lower_render(cx: &mut Cx, iface: Rc<Interface>) -> Option<PipelineOut> {
         if takes_varyings { Some(vret_ir) } else { None },
     );
     cx.drain(&mut mb);
+    if blend {
+        // An `Over` is its colour: the entry point returns the `vec4` WGSL blends.
+        let v4 = mb.m.types.intern(ir::TypeDef::Vector(4));
+        let f = &mut mb.m.functions[fentry.index()];
+        unwrap_returns(f, v4);
+    }
     check_recursion(cx, &mb);
     check_uniformity(cx, &mb, fentry, &entry_inputs(fragment, false));
     let (position_field, flat) = varying_layout(cx, &mut mb, vret, vdef.sig_span)?;
@@ -1583,6 +1659,7 @@ fn lower_render(cx: &mut Cx, iface: Rc<Interface>) -> Option<PipelineOut> {
     });
     let name = format!("{}_{}", ir::ident(&vdef.name), ir::ident(&fdef.name));
     verify(cx, &mut mb, &name)?;
+    let instances = mb.fn_instances();
     Some(PipelineOut {
         name: format!("{}+{}", vdef.name, fdef.name),
         module: mb.m,
@@ -1592,7 +1669,39 @@ fn lower_render(cx: &mut Cx, iface: Rc<Interface>) -> Option<PipelineOut> {
         key: PipelineKey::Compute { kernel: FnId(0), substs: Vec::new() },
         sites: Vec::new(),
         debug_flag: None,
+        blend,
+        instances,
     })
+}
+
+/// Makes `f` return field 0 of what it returned (an `Over`'s colour), of type `v4`.
+fn unwrap_returns(f: &mut ir::Function, v4: ir::TypeId) {
+    fn walk(f: &mut ir::Function, block: ir::Block, v4: ir::TypeId) -> ir::Block {
+        let mut out = Vec::with_capacity(block.len());
+        for s in block {
+            match s {
+                ir::Stmt::Return(Some(v)) => {
+                    let c = f.let_(&mut out, v4, ir::Expr::Extract(v, 0));
+                    out.push(ir::Stmt::Return(Some(c)));
+                }
+                ir::Stmt::If { cond, then, else_ } => {
+                    let then = walk(f, then, v4);
+                    let else_ = walk(f, else_, v4);
+                    out.push(ir::Stmt::If { cond, then, else_ });
+                }
+                ir::Stmt::Loop { body, continuing } => {
+                    let body = walk(f, body, v4);
+                    let continuing = walk(f, continuing, v4);
+                    out.push(ir::Stmt::Loop { body, continuing });
+                }
+                other => out.push(other),
+            }
+        }
+        out
+    }
+    let body = std::mem::take(&mut f.body);
+    f.body = walk(f, body, v4);
+    f.ret = Some(v4);
 }
 
 fn is_clip_position(cx: &Cx, t: TyId) -> bool {

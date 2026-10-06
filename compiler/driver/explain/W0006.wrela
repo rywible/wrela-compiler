@@ -1,0 +1,16 @@
+// A `var` that's never assigned again, written through or lent `mut`: it's a `let`, and `var`
+// misleads whoever reads it into looking for the change.
+// ---- wrong
+fn area(w: f32, h: f32) -> f32 {
+    var a = w * h
+    a
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+fn area(w: f32, h: f32) -> f32 {
+    let a = w * h
+    a
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

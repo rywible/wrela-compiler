@@ -23,6 +23,7 @@
 //! it checks what the program submits but executes none of it, so it needs neither a GPU nor
 //! the lock, for tests that call exports.
 
+mod cache;
 mod error;
 #[cfg(feature = "gpu")]
 mod gpu;
@@ -32,10 +33,12 @@ pub mod lock;
 mod program;
 mod shared;
 
+pub use cache::compiled_code_name;
 pub use error::{Error, Result};
 #[cfg(feature = "gpu")]
 pub use gpu::{GpuTiming, map_read, open_device, read_timestamps};
-pub use program::{Failure, Value};
+pub use program::{Failure, PostHandler, Value};
+pub use wrela_abi::input::{Event, Scripted, parse_script};
 
 #[cfg(feature = "gpu")]
 use gpu::Gpu;
@@ -59,6 +62,11 @@ pub struct Options {
     /// How many threads run a parallel job's chunks, the program's own included (at most
     /// `wrela_abi::memory::MAX_WORKERS + 1`); 0 for [`default_workers`].
     pub workers: u32,
+    /// What answers the program's posts (`std::io::post`); without it, they fail.
+    pub post: Option<PostHandler>,
+    /// Don't show the program's printed lines on stderr (`wrela: ...`): for a caller that
+    /// shows them itself ([`Host::take_logs`]), such as `wrela studio`'s headless runner.
+    pub quiet: bool,
 }
 
 /// The threads a program's parallel jobs run on by default: one per core, at most
@@ -72,11 +80,14 @@ fn workers(n: u32) -> u32 {
     if n == 0 { default_workers() } else { n }
 }
 
-/// Where a build in `dir` reads and writes, with `storage` overriding its storage directory.
-fn io(dir: &Path, storage: Option<&Path>) -> program::Io {
+/// Where a build in `dir` reads and writes, with `storage` overriding its storage directory,
+/// and what answers its posts.
+fn io(dir: &Path, storage: Option<&Path>, post: Option<PostHandler>, quiet: bool) -> program::Io {
     program::Io {
         build: Some(dir.to_path_buf()),
         storage: Some(storage.map_or_else(|| dir.join("storage"), Path::to_path_buf)),
+        post,
+        quiet,
     }
 }
 
@@ -110,6 +121,13 @@ impl RunResult {
 /// rounded to f32.
 pub fn frame_time(i: u32, fps: f64) -> f32 {
     (f64::from(i) / fps) as f32
+}
+
+/// Compiles the build in `dir` and keeps its compiled code beside it, so the loads that follow
+/// don't compile it again (`cache`).
+pub fn precompile(dir: impl AsRef<Path>) -> Result<()> {
+    let (_, wasm, _) = read_build(dir.as_ref())?;
+    program::compile_cached(&wasm, dir.as_ref()).map(|_| ())
 }
 
 /// Reads a build's manifest, WASM and WGSL from `dir`.
@@ -151,10 +169,10 @@ impl Host {
         let dir = dir.as_ref();
         let (manifest, wasm, shaders) = read_build(dir)?;
         // Everything that can be checked without the GPU is, before taking it.
-        let compiled = program::compile_with(&wasm, None)?;
+        let compiled = program::compile_cached(&wasm, dir)?;
         let lock = lock::GpuLock::acquire(&format!("wrela-host {}", dir.display()))?;
         let gpu = Gpu::new(&manifest, &shaders, options.timestamps)?;
-        let io = io(dir, options.storage.as_deref());
+        let io = io(dir, options.storage.as_deref(), options.post.clone(), options.quiet);
         let n = workers(options.workers);
         let program = Program::instantiate(&compiled, &manifest, gpu, io, options.record, n)?;
         Ok(Host { program, _lock: lock })
@@ -163,8 +181,23 @@ impl Host {
     /// Calls `frame(times[i], width, height)` for each time in order, then reads the screen
     /// back.
     pub fn run_frames(&mut self, times: &[f32], width: u32, height: u32) -> Result<RunResult> {
+        self.run_frames_with(times, width, height, &[])
+    }
+
+    /// [`Host::run_frames`], with `script`'s events queued before the frames they're for
+    /// (wrela_abi `input`).
+    pub fn run_frames_with(
+        &mut self,
+        times: &[f32],
+        width: u32,
+        height: u32,
+        script: &[Scripted],
+    ) -> Result<RunResult> {
         self.program.executor().set_screen(width, height)?;
         for (i, &time) in times.iter().enumerate() {
+            for e in wrela_abi::input::events_at(script, i as u32) {
+                self.program.push_input(e);
+            }
             self.program.executor().set_frame(i);
             self.program.frame(time, width, height)?;
         }
@@ -183,6 +216,28 @@ impl Host {
     /// Renders `quanta` quanta of the program's voice offline (as [`CpuHost::render_audio`]).
     pub fn render_audio(&mut self, quanta: u32) -> Result<Vec<f32>> {
         self.program.render_audio(quanta)
+    }
+
+    /// Queues an input event, which the program reads from its next call on.
+    pub fn push_input(&mut self, e: Event) {
+        self.program.push_input(e);
+    }
+
+    /// Calls `frame(time, width, height)` once, and ends the frame: for a caller that drives
+    /// the program a frame at a time (a studio session), and reads the screen when it wants.
+    pub fn frame(&mut self, time: f32, width: u32, height: u32) -> Result<()> {
+        self.program.executor().set_screen(width, height)?;
+        self.program.frame(time, width, height)
+    }
+
+    /// The screen after the last frame: RGBA8, rows top to bottom.
+    pub fn read_screen(&mut self) -> Result<Vec<u8>> {
+        self.program.executor().read_screen()
+    }
+
+    /// The lines the program printed (`std::io::print`) since the last call.
+    pub fn take_logs(&mut self) -> Vec<String> {
+        self.program.take_logs()
     }
 
     /// The handles of the GPU buffers the program holds, oldest first: for tests, to find a
@@ -273,7 +328,7 @@ impl CpuBuild {
     /// `storage` (by default, `storage/` in the build's directory), and without running
     /// `init`: call [`CpuHost::init`] next, which says why it failed if it does.
     pub fn instantiate_in(&self, workers: u32, storage: Option<&Path>) -> Result<CpuHost> {
-        let io = io(&self.dir, storage);
+        let io = io(&self.dir, storage, None, false);
         let n = self::workers(workers);
         let (compiled, manifest) = (&self.compiled, &self.manifest);
         let program = Program::instantiate_with(compiled, manifest, NoGpu, io, true, n, false)?;
@@ -301,6 +356,11 @@ impl CpuHost {
     /// Calls `frame(time, width, height)` and ends the frame.
     pub fn frame(&mut self, time: f32, width: u32, height: u32) -> Result<()> {
         self.program.frame(time, width, height)
+    }
+
+    /// Queues an input event, which the program reads from its next call on.
+    pub fn push_input(&mut self, e: Event) {
+        self.program.push_input(e);
     }
 
     /// The batches submitted since the last call (or load).

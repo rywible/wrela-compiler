@@ -1,0 +1,17 @@
+// mistake: a result thrown away by a call that changes nothing, as if it changed in place
+// expect: E0333 E0333
+// fix: yes
+struct Grazer: Copy {
+    pos: vec3,
+}
+
+fn grow(g: Grazer, k: f32) -> Grazer {
+    Grazer { pos: g.pos * k }
+}
+
+fn step(g: Grazer) -> Grazer {
+    var h = g
+    h.pos.normalize()
+    grow(h, k: 2.0)
+    h
+}

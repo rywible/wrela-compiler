@@ -21,6 +21,9 @@ wrela-grammar.workspace = true
 wrela-host.workspace = true
 wrela-abi.workspace = true
 serde_json.workspace = true
+wrela-wfont.workspace = true
+# The reference rasterizer the ui package's text is compared with (AC2).
+ab_glyph = "0.2"
 wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "metal", "vulkan", "dx12", "wgsl"] }
 pollster = "0.4"
 

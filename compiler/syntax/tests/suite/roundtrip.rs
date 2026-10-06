@@ -58,6 +58,33 @@ fn comments_survive() {
     }
 }
 
+/// A table of short numbers that doesn't fit on a line fills its lines, as rustfmt does; other
+/// arrays, and tables with comments in them, keep one element to a line.
+#[test]
+fn tables_of_short_numbers_fill_their_lines() {
+    let numbers: Vec<String> = (0..40).map(|i| format!("{}", i * 37 % 1000 - 300)).collect();
+    let out = round_trip(&format!("const T: [i32; 40] = [{}]\n", numbers.join(", ")));
+    let rows: Vec<&str> = out.lines().skip(1).take_while(|l| *l != "]").collect();
+    assert!(rows.len() == 3, "{out}");
+    let mut next = 0;
+    for (k, row) in rows.iter().enumerate() {
+        assert!(row.len() <= 100 && row.starts_with("    "), "{row}");
+        let n = row.split(", ").count();
+        assert_eq!(row.trim(), format!("{},", numbers[next..next + n].join(", ")));
+        next += n;
+        // A row that isn't the last is full: the next number wouldn't fit on it.
+        if k + 1 < rows.len() {
+            assert!(row.len() + 1 + numbers[next].len() + 1 > 100, "{row}");
+        }
+    }
+    assert_eq!(next, numbers.len());
+    let long: Vec<&str> = vec!["a_name_that_is_long"; 6];
+    let names = round_trip(&format!("const T: [f32; 6] = [{}]\n", long.join(", ")));
+    assert_eq!(names.lines().count(), 8, "names keep one to a line: {names}");
+    let commented = round_trip("const T: [i32; 3] = [\n    1, // one\n    2,\n    3,\n]\n");
+    assert_eq!(commented, "const T: [i32; 3] = [\n    1, // one\n    2,\n    3,\n]\n");
+}
+
 #[test]
 fn leading_dot_chains_are_kept() {
     let src = "fn f() {\n    let r = a\n        .b(1)\n        .c(2)\n}\n";

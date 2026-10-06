@@ -221,7 +221,8 @@ export class Checker {
         if (why !== undefined) throw err(`the storage path \`${cmd.path}\` ${why}`);
         return;
       }
-      case "Fetch": {
+      case "Fetch":
+      case "Post": {
         const why = pathProblem(cmd.url);
         if (why !== undefined) throw err(`the URL \`${cmd.url}\` ${why}`);
         return;

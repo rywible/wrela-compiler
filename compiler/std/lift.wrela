@@ -1,0 +1,220 @@
+// Lifted literals (language.md §22): in a lifted build (`wrela build --lift <package>`), each
+// `f32` literal of the chosen packages is read from a table, not built into the code, so a tool
+// can change a number while the program runs: a write to the table, never a rebuild. The
+// program's CPU code reads the table from memory, and its GPU code from a storage buffer that
+// the next dispatch or draw after a change uploads.
+//
+// The build keeps where each literal is in the source, the text of the files they're in, and
+// each file's hash when it was built, so a tool can show a literal's line and write a change
+// back (`wrela edit`). In a build that isn't lifted there are no literals: `count()` is 0.
+
+use std::string::String
+
+/// A lifted literal: its place in the table.
+pub struct Literal: Copy + Eq + Ord + GpuData {
+    pub index: u32,
+}
+
+/// Where a literal is: its file (an index, `file_name`), its bytes `start..end` in it, and the
+/// line and column it starts at, from 1.
+pub struct Source: Copy + Eq {
+    pub file: u32,
+    pub start: u32,
+    pub end: u32,
+    pub line: u32,
+    pub column: u32,
+}
+
+/// How many literals this build lifted.
+pub fn count() -> u32 {
+    literal_count()
+}
+
+/// Literal `i`, or `None` past the last.
+pub fn literal(i: u32) -> Option<Literal> {
+    if i < literal_count() { Some(Literal { index: i }) } else { None }
+}
+
+impl Literal {
+    /// Its value now.
+    pub fn value(self) -> f32 {
+        check(self)
+        literal_value(self.index)
+    }
+
+    /// The value the source gives it: what it had when the program was built.
+    pub fn built_value(self) -> f32 {
+        check(self)
+        literal_built_value(self.index)
+    }
+
+    /// Changes its value: code reads the new one from now on, on the CPU and the GPU.
+    pub fn set(self, value: f32) {
+        check(self)
+        set_literal(self.index, value)
+    }
+
+    /// Where it is in the source.
+    pub fn source(self) -> Source {
+        check(self)
+        literal_source(self.index)
+    }
+}
+
+fn check(l: Literal) {
+    if l.index >= literal_count() {
+        panic("no lifted literal has that index")
+    }
+}
+
+/// How many source files hold lifted literals.
+pub fn files() -> u32 {
+    lifted_files()
+}
+
+/// File `i`'s name, as diagnostics name it (`[wolf] parts.wrela`).
+pub fn file_name(i: u32) -> Text {
+    lifted_file(i, 0)
+}
+
+/// File `i`'s path on disk, relative to the program's package.
+pub fn file_path(i: u32) -> Text {
+    lifted_file(i, 1)
+}
+
+/// File `i`'s text when the program was built.
+pub fn file_text(i: u32) -> Text {
+    lifted_file(i, 2)
+}
+
+/// File `i`'s hash when the program was built (FNV-1a 64 of its bytes, as 16 hex digits):
+/// `wrela edit` refuses to change a file that has changed since.
+pub fn file_hash(i: u32) -> Text {
+    lifted_file(i, 3)
+}
+
+/// The value `f` gives, and how it changes with each literal of `which`, in order: its
+/// derivative by each (a parameter gradient). Derived as `gradient` is, forward mode, through
+/// everything `f` calls, building values from literals included (§13). It runs on the CPU. In
+/// a build that isn't lifted, `which` can't name a literal, so `N` is 0.
+@intrinsic
+pub fn gradient<const N: u32>(f: fn() -> f32, which: [Literal; N]) -> (f32, [f32; N]) {}
+
+/// The literals `f`'s code can read, through everything it calls, in index order: those
+/// that can change what it gives.
+@intrinsic
+pub fn reads(f: fn() -> f32) -> [Literal] {}
+
+// ---- specs (§22) ---------------------------------------------------------------------------
+//
+// A spec is what a program's numbers should come to, written as code: `near(name, value,
+// target)` and its kin, in a function generic over `Checks`. Run with a `Report`, it says how
+// each check stands; with a `Loss`, it's one number a solver (`wrela solve --spec`) makes small
+// by changing lifted literals, through `gradient`. `Loss` touches no memory, so the function a
+// gradient derives may call it.
+//
+//     pub fn spec<C: Checks>(c: mut C) {
+//         let f = wolf().field()
+//         c.near("withers height", top(f, 0.0, 0.20), 0.80)
+//         c.at_most("chest width / depth", width(f, 0.55, 0.15) / (top(f, 0.0, 0.15) - bottom(f, 0.0, 0.15)), 0.6)
+//     }
+
+/// What a spec's checks go to: a `Report` or a `Loss`.
+pub trait Checks {
+    /// A check of `value` against `target`, of kind `kind` ("near", "at least" or "at most"):
+    /// `miss` is how far it misses (0 where it holds exactly), and `within` how far it may.
+    fn check(mut self, name: Text, kind: Text, value: f32, target: f32, miss: f32, within: f32)
+
+    /// `value` should be `target`, give or take `within`.
+    fn near(mut self, name: Text, value: f32, target: f32, within: f32 = 0.005) {
+        self.check(name, "near", value, target, value - target, within)
+    }
+
+    /// `value` should be at least `low` (`within` scales how much a shortfall counts).
+    fn at_least(mut self, name: Text, value: f32, low: f32, within: f32 = 0.005) {
+        self.check(name, "at least", value, low, min(value - low, 0.0), within)
+    }
+
+    /// `value` should be at most `high`.
+    fn at_most(mut self, name: Text, value: f32, high: f32, within: f32 = 0.005) {
+        self.check(name, "at most", value, high, max(value - high, 0.0), within)
+    }
+}
+
+/// A spec's checks as one number: the sum of each check's miss over its `within`, squared.
+/// 0 when every check holds exactly.
+pub struct Loss: Copy {
+    pub total: f32,
+}
+
+impl Loss {
+    /// A loss of 0, before any check.
+    pub fn new() -> Loss {
+        Loss { total: 0.0 }
+    }
+}
+
+impl Checks for Loss {
+    fn check(mut self, name: Text, kind: Text, value: f32, target: f32, miss: f32, within: f32) {
+        let e = miss / max(within, 0.000001)
+        self.total += e * e
+    }
+}
+
+/// A spec's checks as JSON: each one's name, value, target and miss, and whether it holds
+/// (within `within`), in the order checked.
+pub struct Report {
+    pub json: String,
+    pub held: u32,
+    pub missed: u32,
+}
+
+impl Report {
+    /// A report with no checks yet.
+    pub fn new() -> Report {
+        Report { json: String::new(), held: 0, missed: 0 }
+    }
+
+    /// The report as one JSON object: the checks, and how many hold.
+    pub fn done(self) -> String {
+        f"{{\"checks\":[{self.json}],\"held\":{self.held},\"missed\":{self.missed}}}"
+    }
+}
+
+impl Checks for Report {
+    fn check(mut self, name: Text, kind: Text, value: f32, target: f32, miss: f32, within: f32) {
+        let ok = abs(miss) <= within
+        if ok {
+            self.held += 1
+        } else {
+            self.missed += 1
+        }
+        if self.json.len() > 0 {
+            self.json.push_str(",")
+        }
+        let line = f"{{\"name\":\"{name}\",\"check\":\"{kind}\",\"value\":{value},\"target\":{target},\"miss\":{miss},\"within\":{within},\"holds\":{ok}}}"
+        self.json.push_str(line.as_str())
+    }
+}
+
+@intrinsic
+fn literal_count() -> u32 {}
+
+@intrinsic
+fn literal_value(i: u32) -> f32 {}
+
+@intrinsic
+fn literal_built_value(i: u32) -> f32 {}
+
+@intrinsic
+fn set_literal(i: u32, value: f32) {}
+
+@intrinsic
+fn literal_source(i: u32) -> Source {}
+
+@intrinsic
+fn lifted_files() -> u32 {}
+
+/// File `i`'s name (0), path (1), text (2) or hash (3).
+@intrinsic
+fn lifted_file(i: u32, what: u32) -> Text {}

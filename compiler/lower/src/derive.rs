@@ -21,6 +21,8 @@ pub(crate) fn call(
 ) -> Option<ir::ValueId> {
     let kind = match lang {
         Lang::IntervalOf => DeriveKind::Interval,
+        Lang::LiftGradient => DeriveKind::Literals,
+        Lang::LiftReads => DeriveKind::Reads,
         _ => DeriveKind::ValueAndGradient,
     };
     let Some(Repr::Callable(callable, srcs)) = fl.callable_arg(&c.args[0]) else {
@@ -31,13 +33,23 @@ pub(crate) fn call(
         ));
         return None;
     };
-    let input = substs[0];
-    let output = (kind == DeriveKind::Interval).then(|| substs.get(1).copied()).flatten();
+    let (input, output) = match kind {
+        DeriveKind::Interval => (substs[0], substs.get(1).copied()),
+        // `gradient<const N>`: the literals' type and the result's are the call's.
+        DeriveKind::Literals => {
+            let which = fl.place_src_ty(c.args[1].place()?);
+            (which, ty.map(|t| fl.concrete(t)))
+        }
+        DeriveKind::Reads => (fl.cx.checked.program.types.unit, ty.map(|t| fl.concrete(t))),
+        DeriveKind::ValueAndGradient => (substs[0], None),
+    };
     let key = InstanceKey::Derived { of: callable, kind, input, output };
     let callee = fl.cx.instance(fl.mb, key, Some((fl.id, c.span)));
     let mut args = fl.capture_args(&srcs)?;
-    let x = fl.arg_value(&c.args[1])?;
-    args.push(ir::Arg::Value(x));
+    if kind != DeriveKind::Reads {
+        let x = fl.arg_value(&c.args[1])?;
+        args.push(ir::Arg::Value(x));
+    }
     let ret = fl.mb.m.functions[callee.index()].ret?;
     let v = fl.value(ret, ir::Expr::Call(callee, args));
     match lang {
@@ -86,6 +98,23 @@ pub(crate) fn signature(cx: &mut Cx, mb: &mut ModuleBuilder, key: &InstanceKey) 
                 return ir::Function::new("value_and_gradient", params, Some(tuple));
             }
             ir::Function::new("value_and_gradient", params, None)
+        }
+        DeriveKind::Literals => {
+            let w = cx.lower_ty(mb, *input, span);
+            let r = output.and_then(|o| cx.lower_ty(mb, o, span));
+            if let Some(w) = w {
+                params.push(ir::Param {
+                    name: "which".into(),
+                    ty: w,
+                    by_ref: false,
+                    mutable: false,
+                });
+            }
+            ir::Function::new("literal_gradient", params, r)
+        }
+        DeriveKind::Reads => {
+            let r = output.and_then(|o| cx.lower_ty(mb, o, span));
+            ir::Function::new("literal_reads", params, r)
         }
         DeriveKind::Interval => {
             // The range of the result: an `Interval` for an `f32`, a box for a vector.
@@ -200,22 +229,76 @@ pub(crate) fn build_next(cx: &mut Cx, mb: &mut ModuleBuilder) {
     }
 }
 
-/// The waiting derived instances among the functions `from` reaches through calls.
+/// The waiting derived instances among the functions `from` reaches through calls (not
+/// through a waiting one: its body isn't built yet).
 fn reached(m: &ir::Module, from: ir::FuncId, waiting: &[ir::FuncId]) -> Vec<ir::FuncId> {
-    let mut seen = vec![false; m.functions.len()];
-    let mut stack = vec![from];
-    let mut found = Vec::new();
-    while let Some(f) = stack.pop() {
-        if std::mem::replace(&mut seen[f.index()], true) {
-            continue;
+    let reach = ir::visit::reachable(m, from, waiting);
+    reach.into_iter().filter(|f| waiting.contains(f)).collect()
+}
+
+/// `reads(f)` (§22): a run of the lifted literals `inner` can read through every call, in index
+/// order, laid out as constant data.
+fn build_reads(mb: &mut ModuleBuilder, id: ir::FuncId, inner: ir::FuncId) {
+    if let Some(t) = mb.lift {
+        // The indices are values: each literal read is `Load(table[c])` with `c` a constant,
+        // defined before it.
+        let mut indices = std::collections::BTreeSet::new();
+        for g in ir::visit::reachable(&mb.m, inner, &[]) {
+            let mut consts = std::collections::HashMap::new();
+            ir::visit::walk(&mb.m.functions[g.index()].body, &mut |s| {
+                if let ir::Stmt::Let(v, ir::Expr::Const(ir::Const::U32(c))) = s {
+                    consts.insert(*v, *c);
+                } else if let ir::Stmt::Let(_, ir::Expr::Load(p)) = s
+                    && p.root == ir::PlaceRoot::Data(t.table)
+                    && let [ir::Proj::Index(i)] = p.path.as_slice()
+                    && let Some(c) = consts.get(i)
+                {
+                    indices.insert(*c);
+                }
+            });
         }
-        if waiting.contains(&f) {
-            found.push(f);
-            continue;
+        let f = &mb.m.functions[id.index()];
+        let Some(run_t) = f.ret else { return };
+        let ir::TypeDef::Run(lit_t) = *mb.m.types.get(run_t) else { return };
+        let n = indices.len() as u32;
+        let arr = mb.m.types.intern(ir::TypeDef::Array(lit_t, n.max(1)));
+        let scalar =
+            |v: u32| ir::ConstValue::Parts(vec![ir::ConstValue::Scalar(ir::Const::U32(v))]);
+        let mut parts: Vec<ir::ConstValue> = indices.iter().map(|&i| scalar(i)).collect();
+        if parts.is_empty() {
+            parts.push(scalar(0));
         }
-        stack.extend(ir::visit::calls(&m.functions[f.index()].body));
+        let d = mb.m.add_data(ir::Data {
+            name: "literal_reads".into(),
+            ty: arr,
+            value: ir::ConstValue::Parts(parts),
+        });
+        let f = &mut mb.m.functions[id.index()];
+        let mut body = Vec::new();
+        let full = ir::Place::root(ir::PlaceRoot::Data(d));
+        let r = f.let_(&mut body, run_t, ir::Expr::Run(full));
+        if n == 0 {
+            // No literals: a run of none.
+            let u = mb.m.types.u32();
+            let addr = f.let_(&mut body, u, ir::Expr::Extract(r, 0));
+            let zero = f.let_(&mut body, u, ir::Expr::Const(ir::Const::U32(0)));
+            let empty = f.let_(&mut body, run_t, ir::Expr::Construct(run_t, vec![addr, zero]));
+            body.push(ir::Stmt::Return(Some(empty)));
+        } else {
+            body.push(ir::Stmt::Return(Some(r)));
+        }
+        f.body.extend(body);
+        return;
     }
-    found
+    // A build that isn't lifted reads no literals.
+    let Some(run_t) = mb.m.functions[id.index()].ret else { return };
+    let u = mb.m.types.u32();
+    let f = &mut mb.m.functions[id.index()];
+    let mut body = Vec::new();
+    let zero = f.let_(&mut body, u, ir::Expr::Const(ir::Const::U32(0)));
+    let empty = f.let_(&mut body, run_t, ir::Expr::Construct(run_t, vec![zero, zero]));
+    body.push(ir::Stmt::Return(Some(empty)));
+    f.body.extend(body);
 }
 
 /// The IR transform of a derived instance, `inner` its callable's instance.
@@ -227,20 +310,38 @@ fn build(
     inner: ir::FuncId,
 ) {
     let InstanceKey::Derived { kind, .. } = key else { return };
-    let ncap = mb.m.functions[id.index()].params.len() - 1;
     let target = mb.target();
     let result = match kind {
+        DeriveKind::Reads => return build_reads(mb, id, inner),
+        DeriveKind::Literals => {
+            let sig = &mb.m.functions[id.index()];
+            match (sig.params.last().map(|p| p.ty), sig.ret) {
+                (Some(which), Some(ret)) => ir::derive::literal_gradient(
+                    &mut mb.m,
+                    &mut mb.derived,
+                    inner,
+                    mb.lift.map(|t| t.table),
+                    which,
+                    ret,
+                    target,
+                ),
+                _ => Err(ir::Error::internal("a parameter gradient's signature is incomplete")),
+            }
+        }
+        // The captures are every parameter but the last, the input.
         DeriveKind::ValueAndGradient => {
-            ir::derive::value_and_gradient(&mut mb.m, &mut mb.derived, inner, ncap as u32, target)
+            let ncap = mb.m.functions[id.index()].params.len() as u32 - 1;
+            ir::derive::value_and_gradient(&mut mb.m, &mut mb.derived, inner, ncap, target)
         }
         DeriveKind::Interval => {
             let sig = &mb.m.functions[id.index()];
+            let ncap = sig.params.len() as u32 - 1;
             match (sig.params.last().map(|p| p.ty), sig.ret) {
                 (Some(box_ty), Some(interval_ty)) => ir::derive::interval(
                     &mut mb.m,
                     &mut mb.derived,
                     inner,
-                    ncap as u32,
+                    ncap,
                     target,
                     box_ty,
                     interval_ty,

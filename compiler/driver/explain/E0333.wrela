@@ -1,0 +1,19 @@
+// A statement that calls a function only to throw its value away, where the call changes
+// nothing: no effect, and no argument lent `mut`. `p.normalize()` gives a new vector; it
+// doesn't change `p`. Use the result, or write `let _ = ...` to discard it on purpose.
+// ---- wrong
+fn unit_up(p: vec3) -> vec3 {
+    var q = p
+    q.normalize()
+    q
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+fn unit_up(p: vec3) -> vec3 {
+    var q = p
+    q = q.normalize()
+    q
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

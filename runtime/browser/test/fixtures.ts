@@ -26,6 +26,7 @@ export interface Vectors {
   /** `malformed`: JSON that doesn't parse, which each host rejects in its own words. */
   manifests: { name: string; json: string; error: string | null; malformed?: boolean }[];
   lines: { name: string; bytes: string; at: [number, string | null][]; error: string | null }[];
+  input: { name: string; script: string; frames?: number[]; events?: string[]; error?: string }[];
 }
 
 /** The ABI's test vectors (runtime/abi/vectors.json). */
@@ -45,6 +46,7 @@ export function shapes(): Manifest {
         shader: "draw.wgsl",
         vertex_entry: "vs",
         fragment_entry: "fs",
+        blend: false,
         uniform: { binding: 0, size: 16, space: "uniform" },
         bindings: [
           { binding: 1, kind: "read" },

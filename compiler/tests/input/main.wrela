@@ -1,0 +1,91 @@
+// Input, recorded (AC1): the program keeps every event it reads in its state, and each frame
+// prints its state's hash, so the command stream's hash (which covers what it prints) is the
+// same in two hosts only if they gave it the same events in the same frames
+// (compiler/tests/tests/suite/input.rs runs it in both).
+
+use std::hash::{StateHash, state_hash}
+use std::input::{Button, Event, Input, Key, events}
+use std::io::print
+
+pub struct Log: Clone + StateHash {
+    /// Each event read, and the frame that read it.
+    events: Vec<(u32, Event)>,
+    frames: u32,
+    /// Where the pointer was and what was held at the end of each frame.
+    pointer: Vec<vec2>,
+    held: Vec<u32>,
+}
+
+pub struct Game {
+    log: Log,
+    input: Input,
+}
+
+pub fn init() -> Game {
+    Game {
+        log: Log { events: Vec::new(), frames: 0, pointer: Vec::new(), held: Vec::new() },
+        input: Input::new(),
+    }
+}
+
+pub fn frame(state: mut Game, time: f32, width: u32, height: u32) {
+    for e in events() {
+        state.log.events.push((state.log.frames, e))
+        state.input.update(Vec::from([e]))
+    }
+    state.log.pointer.push(state.input.pointer)
+    var held = 0
+    if state.input.down(Button::Primary) {
+        held = held | 1
+    }
+    if state.input.held(Key::ShiftLeft) {
+        held = held | 2
+    }
+    state.log.held.push(held)
+    state.log.frames += 1
+    print(
+        f"frame {state.log.frames}: {state.log.events.len()} events, hash {state_hash(state.log)}",
+    )
+}
+
+/// How many events the program has read.
+pub fn event_count(state: Game) -> u32 {
+    state.log.events.len()
+}
+
+/// The log's hash.
+pub fn log_hash(state: Game) -> u64 {
+    state_hash(state.log)
+}
+
+/// The text typed, as a sum of its code points, and how many characters.
+pub fn typed(state: Game) -> vec2 {
+    var sum = 0
+    var n = 0
+    for fe in state.log.events {
+        if let Event::Text { char } = fe.1 {
+            sum += char
+            n += 1
+        }
+    }
+    vec2(f32(sum), f32(n))
+}
+
+/// The script (script.json) reaches the program, each event in the frame it's for.
+@test(frames: 12, input: "script.json")
+fn every_event_arrives_in_its_frame(game: Game) {
+    assert(game.log.frames == 12)
+    let n = game.log.events.len()
+    assert(n == 23, f"{n} events")
+    let first = game.log.events[0]
+    assert(first.0 == 0)
+    assert(first.1 == Event::PointerMove { at: vec2(100.0, 120.0), mods: std::input::Mods {} })
+    // A drag: down at frame 2, moved at 3 and 4, up at 5 (with Shift held from 2 to 6).
+    assert(game.log.held[2] == 3 && game.log.held[4] == 3 && game.log.held[5] == 2)
+    assert(game.log.held[7] == 0)
+    assert(game.log.pointer[4] == vec2(160.0, 140.0))
+    // "Grüße, ÿ!": 9 characters, three of them past ASCII.
+    let t = typed(game)
+    assert(t.y == 9.0, f"{t.y} characters")
+    assert(t.x == f32(71 + 114 + 252 + 223 + 101 + 44 + 32 + 255 + 33))
+}

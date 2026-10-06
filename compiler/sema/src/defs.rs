@@ -73,6 +73,8 @@ pub struct PackageDef {
     pub deps: BTreeMap<String, PackageId>,
     /// Its manifest declares that it uses `unsafe` (std's core does).
     pub unsafe_ok: bool,
+    /// A lifted build lifts its literals (language.md §22).
+    pub lifted: bool,
 }
 
 impl Module {
@@ -188,6 +190,7 @@ macro_rules! lang_items {
                         | Lang::StorageWriteCommand
                         | Lang::FetchCommand
                         | Lang::PrintCommand
+                        | Lang::PostCommand
                 )
             }
 
@@ -196,7 +199,11 @@ macro_rules! lang_items {
             pub fn is_nondet(self) -> bool {
                 matches!(
                     self,
-                    Lang::RequestStatus | Lang::RequestTake | Lang::ReadBufferCommand | Lang::Limit
+                    Lang::RequestStatus
+                        | Lang::RequestTake
+                        | Lang::ReadBufferCommand
+                        | Lang::Limit
+                        | Lang::InputTake
                 )
             }
 
@@ -239,6 +246,7 @@ lang_items! {
     FragCoord = "std::gpu::FragCoord",
     ClipPosition = "std::gpu::ClipPosition",
     Flat = "std::gpu::Flat",
+    Over = "std::gpu::Over",
     Dispatch = "std::gpu::dispatch",
     Draw = "std::gpu::draw",
     Buffer = "std::gpu::buffer",
@@ -272,10 +280,12 @@ lang_items! {
     NextRequest = "std::io::next_request",
     RequestStatus = "std::io::request_status",
     RequestTake = "std::mem::take_answer",
+    InputTake = "std::mem::take_input",
     StorageReadCommand = "std::io::storage_read_command",
     StorageWriteCommand = "std::io::storage_write_command",
     FetchCommand = "std::io::fetch_command",
     PrintCommand = "std::io::print_command",
+    PostCommand = "std::io::post_command",
     Limit = "std::gpu::limit",
     Shared = "std::gpu::Shared",
     Atomics = "std::gpu::Atomics",
@@ -306,6 +316,15 @@ lang_items! {
     Gradient = "std::derive::gradient",
     ValueAndGradient = "std::derive::value_and_gradient",
     IntervalOf = "std::derive::interval",
+    LiftGradient = "std::lift::gradient",
+    LiftReads = "std::lift::reads",
+    LiftCount = "std::lift::literal_count",
+    LiftValue = "std::lift::literal_value",
+    LiftBuiltValue = "std::lift::literal_built_value",
+    LiftSet = "std::lift::set_literal",
+    LiftSource = "std::lift::literal_source",
+    LiftFiles = "std::lift::lifted_files",
+    LiftFile = "std::lift::lifted_file",
     CpuSin = "std::math::sin",
     CpuCos = "std::math::cos",
     CpuTan = "std::math::tan",
@@ -530,6 +549,9 @@ pub struct FnAttrs {
     pub test: Option<Span>,
     /// `@test(frames: n)`: the program's frames the test runs first (§10).
     pub test_frames: Option<u32>,
+    /// `@test(frames: n, input: "script.json")`: a script of input events the frames get, by
+    /// its path in the package, and where the path is written.
+    pub test_input: Option<(String, Span)>,
 }
 
 #[derive(Clone, Debug)]

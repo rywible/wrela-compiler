@@ -1,0 +1,63 @@
+// A creature-like field of std shapes: literals in every form a lifted build lifts. A constant
+// whose value is literal (`HEAD`), one used in two places (`R`), a default (`k`), unit
+// suffixes, negated literals, a table of more than 16 numbers (`LEGS`), and noise.
+
+use std::derive::Box3
+use std::field::{Lipschitz, Surface, ellipsoid, fbm, round_cone, sphere}
+use std::units::{cm, mm}
+
+/// The head's place.
+pub const HEAD: vec3 = vec3(0.0, 0.95, 0.62)
+
+/// A radius two parts share.
+const R: f32 = 0.11
+
+/// The legs' feet, a table: more than 16 numbers.
+const LEGS: [vec3; 6] = [
+    vec3(0.18, 0.0, 0.32),
+    vec3(-0.18, 0.0, 0.32),
+    vec3(0.2, 0.0, -0.3),
+    vec3(-0.2, 0.0, -0.3),
+    vec3(0.06, 0.02, -0.55),
+    vec3(-0.06, 0.02, -0.55),
+]
+
+fn leg(top: vec3, foot: vec3, r: f32 = 4cm) -> Surface + Lipschitz {
+    round_cone(top, foot, r_top: r * 1.4, r_bottom: r)
+}
+
+/// The blob: a body, a head, six legs and a tail, smoothly joined, with a little noise.
+pub fn blob() -> Surface + Lipschitz {
+    let body = ellipsoid(radii: vec3(0.22, 0.2, 0.45)).translate(vec3(0, 55cm, 0))
+    let head = sphere(radius: R).translate(HEAD)
+    let neck = round_cone(vec3(0.0, 0.6, 0.3), HEAD, r_top: R, r_bottom: 0.08)
+    let tail = round_cone(vec3(0.0, 0.6, -0.42), vec3(0.0, 0.45, -0.75), r_top: 0.05, r_bottom: 2cm)
+    let legs = [
+        leg(vec3(0.12, 0.45, 0.3), LEGS[0]),
+        leg(vec3(-0.12, 0.45, 0.3), LEGS[1]),
+        leg(vec3(0.12, 0.45, -0.3), LEGS[2]),
+        leg(vec3(-0.12, 0.45, -0.3), LEGS[3]),
+        leg(vec3(0.05, 0.5, -0.45), LEGS[4], r: 3cm),
+        leg(vec3(-0.05, 0.5, -0.45), LEGS[5], r: 3cm),
+    ]
+    body.smooth_union(neck, k: 6cm)
+        .smooth_union(head, k: 4cm)
+        .smooth_union(tail, k: 0.03)
+        .smooth_union(legs.smooth_union(k: 2cm), k: 5cm)
+        .displace(fbm(freq: 12.0, octaves: 3, offset: vec3(-1.5, 0.25, -0.75)), amp: 2mm)
+}
+
+/// Where the blob is: points in it are sampled.
+pub const AROUND: Box3 = Box3 { lo: vec3(-0.35, -0.05, -0.9), hi: vec3(0.35, 1.15, 0.8) }
+
+/// A number only a computed constant reads.
+pub const SCALE: f32 = sum([0.5, 0.25])
+
+fn sum(xs: [f32; 2]) -> f32 {
+    xs[0] + xs[1]
+}
+
+/// An `f64`, which a lifted build doesn't lift.
+pub fn wide() -> f64 {
+    2.5
+}

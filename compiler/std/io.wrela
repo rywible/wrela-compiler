@@ -121,6 +121,16 @@ pub fn fetch(url: str) -> Pending<u8> {
     Pending::new(request)
 }
 
+/// Sends `bytes` to the host that serves the program, at `url`, relative to its build: the
+/// answer is the host's reply. A browser posts to the build's own origin only; the native host
+/// answers with what its user gives it, and fails the request otherwise.
+pub fn post(url: str, bytes: [u8]) -> Pending<u8> {
+    check_path("post", url)
+    let request = next_request()
+    post_command(request, url, bytes)
+    Pending::new(request)
+}
+
 /// Shows `line` on the host's console: the terminal that runs the native host, the browser's
 /// developer console. For finding out what a program does while writing it; a player doesn't
 /// see it. It's the `io` effect, so `@deterministic` code doesn't print.
@@ -154,3 +164,6 @@ fn fetch_command(request: u32, url: str) {}
 
 @intrinsic
 fn print_command(line: str) {}
+
+@intrinsic
+fn post_command(request: u32, url: str, bytes: [u8]) {}

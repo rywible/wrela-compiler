@@ -1,9 +1,17 @@
 // Test mode: `index.html#test&frames=60&width=1920&height=1080&fps=60&workers=4&audio=750` runs a
 // fixed number of frames at fixed times and canvas size, its parallel jobs on a fixed number of
-// threads (the program's own included), then saves the last frame and the state hash to
-// `results/` for tools/headless.py. With `audio`, the main thread also renders that many
+// threads (the program's own included), then saves the last frame, the state hash, the lines
+// the program printed (`log.txt`) and each frame's CPU time, when it began, and the frame each
+// printed line came in (`frames.json`) to `results/` for
+// tools/headless.py. With `audio`, the main thread also renders that many
 // quanta of the program's voice offline, in an AudioWorklet, and saves the samples; with
-// `timestamps=1`, each pass's GPU time (`timings.json`, where the device has timestamp queries). It's part of the shipped bundle, so the agreement test runs
+// `timestamps=1`, each pass's GPU time (`timings.json`, where the device has timestamp queries);
+// with `nohash=1`, no state hash (hashing every submitted byte costs CPU time a timing run
+// shouldn't count; `hash.txt` then says `none`);
+// with `input=script.json`, a script of input events (runtime/abi `input`), each queued before
+// the frame it's for; with `latency=n`, the main thread sends n pointer events through the DOM at
+// random times while the frames run in real time, and saves when each reached the program
+// (`latency.json`). It's part of the shipped bundle, so the agreement test runs
 // the exact bytes a game ships, but only a page served from this machine (tools/serve.py and
 // tools/headless.py bind 127.0.0.1) enters it: a game's public URL ignores `#test`.
 
@@ -17,10 +25,31 @@ export interface TestParams {
   audio: number;
   /** 1: time each pass on the GPU. */
   timestamps: number;
+  /** 1: keep no state hash. */
+  nohash: number;
+  /** A script of input events, relative to the page; "" for none. */
+  input: string;
+  /** Pointer events to send through the DOM while the frames run (0: none). */
+  latency: number;
 }
 
-export const TEST_DEFAULTS: TestParams = { frames: 60, width: 1920, height: 1080, fps: 60, workers: 1, audio: 0, timestamps: 0 };
-const KEYS = ["frames", "width", "height", "fps", "workers", "audio", "timestamps"] as const;
+export const TEST_DEFAULTS: TestParams = {
+  frames: 60,
+  width: 1920,
+  height: 1080,
+  fps: 60,
+  workers: 1,
+  audio: 0,
+  timestamps: 0,
+  nohash: 0,
+  input: "",
+  latency: 0,
+};
+/** Every parameter's name, in order. */
+const NAMES = Object.keys(TEST_DEFAULTS) as (keyof TestParams)[];
+/** The parameters that are numbers. */
+type Count = { [K in keyof TestParams]: TestParams[K] extends number ? K : never }[keyof TestParams];
+const KEYS = NAMES.filter((k): k is Count => typeof TEST_DEFAULTS[k] === "number");
 
 /** Whether a page's host is this machine, where test mode may run. */
 export function isLoopback(hostname: string): boolean {
@@ -37,13 +66,21 @@ export function parseTestParams(hash: string): TestParams | null {
   const params = { ...TEST_DEFAULTS };
   for (const pair of pairs) {
     const [key, value = ""] = pair.split("=", 2);
+    if (key === "input") {
+      if (value === "" || value.startsWith("/") || value.includes(":") || value.split("/").some((p) => p === "" || p === "." || p === "..")) {
+        throw new Error(`test parameter input=${value} must be a path relative to the page`);
+      }
+      params.input = value;
+      continue;
+    }
     if (!KEYS.some((k) => k === key)) {
-      throw new Error(`unknown test parameter \`${key}\` (expected frames, width, height, fps, workers, audio or timestamps)`);
+      const expected = `${NAMES.slice(0, -1).join(", ")} or ${NAMES[NAMES.length - 1]}`;
+      throw new Error(`unknown test parameter \`${key}\` (expected ${expected})`);
     }
     const n = Number(value);
     const ok = key === "fps" ? Number.isFinite(n) && n > 0 : Number.isInteger(n) && n > 0 && /^\d+$/.test(value);
     if (!ok) throw new Error(`test parameter ${key}=${value} must be a positive ${key === "fps" ? "number" : "integer"}`);
-    params[key as (typeof KEYS)[number]] = n;
+    params[key as Count] = n;
   }
   return params;
 }

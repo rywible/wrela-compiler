@@ -492,7 +492,8 @@ fn requests_are_answered_from_the_next_call_then_taken_once() {
     std::fs::create_dir_all(build.join("data")).expect("dir");
     std::fs::write(build.join("data/level.bin"), [1, 2, 3, 4, 5]).expect("write");
     let batch = Encoder::new().fetch(4, "data/level.bin").finish();
-    let mut p = requester(&batch, Io { build: Some(build), storage: None });
+    let mut p =
+        requester(&batch, Io { build: Some(build), storage: None, post: None, quiet: false });
     p.call("ask", &[]).expect("ask");
     assert_eq!(call_i32(&mut p, "status"), 5);
     assert_eq!(call_i32(&mut p, "take"), 0x0403_0201);
@@ -502,7 +503,7 @@ fn requests_are_answered_from_the_next_call_then_taken_once() {
 #[test]
 fn storage_keeps_bytes_at_paths() {
     let storage = scratch_dir("storage");
-    let io = Io { build: None, storage: Some(storage.clone()) };
+    let io = Io { build: None, storage: Some(storage.clone()), post: None, quiet: false };
     let write = Encoder::new().storage_write(4, "saves/a", &[9, 8, 7, 6]).finish();
     let mut p = requester(&write, io.clone());
     p.call("ask", &[]).expect("ask");
@@ -548,4 +549,74 @@ fn storage_paths_stay_inside_the_programs_storage() {
         err.to_string(),
         "StorageWrite failed: the storage path `../escape` has an empty, `.` or `..` part"
     );
+}
+
+#[test]
+fn posts_go_to_the_handler_and_fail_without_one() {
+    let batch = Encoder::new().post(4, "studio/echo", &[1, 2, 3, 4]).finish();
+    let echo = PostHandler::new(|url, body| {
+        assert_eq!(url, "studio/echo");
+        Ok(body.iter().rev().copied().collect())
+    });
+    let mut p = requester(&batch, Io { post: Some(echo), ..Io::default() });
+    p.call("ask", &[]).expect("ask");
+    assert_eq!(call_i32(&mut p, "status"), 4);
+    assert_eq!(call_i32(&mut p, "take"), 0x0102_0304);
+    let mut p = requester(&batch, Io::default());
+    p.call("ask", &[]).expect("ask");
+    assert_eq!(call_i32(&mut p, "status"), REQUEST_FAILED);
+    let elsewhere = Encoder::new().post(4, "https://example.com/x", &[]).finish();
+    let err = requester(&elsewhere, Io::default()).call("ask", &[]).expect_err("rejected");
+    assert!(err.to_string().contains("must be relative"), "{err}");
+}
+
+/// A program whose `take(cap)` reads up to `cap` input events to address 1024, and whose
+/// `word(at)` reads the word at an address.
+fn reader() -> Program<Recorder> {
+    let wat = r#"(module
+  (import "wrela" "input" (func $input (param i32 i32) (result i32)))
+  (import "wrela" "memory" (memory 1 16384 shared)) (export "memory" (memory 0))
+  (func (export "frame") (param f32 i32 i32))
+  (func (export "take") (param i32) (result i32) (call $input (i32.const 1024) (local.get 0)))
+  (func (export "past_the_end") (result i32) (call $input (i32.const 65530) (i32.const 1)))
+  (func (export "word") (param i32) (result i32) (i32.load (local.get 0))))"#;
+    let wasm = wat::parse_str(wat).expect("test WAT compiles");
+    Program::instantiate(
+        &compile_with(&wasm, None).expect("compiles"),
+        &manifest(),
+        Recorder::default(),
+        Io::default(),
+        false,
+        1,
+    )
+    .expect("instantiates")
+}
+
+#[test]
+fn input_is_read_oldest_first_and_what_isnt_read_waits() {
+    use wrela_abi::input::{EventKind, SHIFT};
+    let mut p = reader();
+    let take = |p: &mut Program<Recorder>, cap: i32| match p.call("take", &[Value::I32(cap)]) {
+        Ok(v) => v,
+        Err(e) => panic!("take: {e}"),
+    };
+    let word = |p: &mut Program<Recorder>, at: i32| match p.call("word", &[Value::I32(at)]) {
+        Ok(v) => v[0],
+        Err(e) => panic!("word: {e}"),
+    };
+    p.push_input(Event::pointer(EventKind::PointerDown, 3.5, 4.0, 2, SHIFT));
+    p.push_input(Event::text('é'));
+    p.push_input(Event::key(true, 40, false, 0));
+    assert_eq!(take(&mut p, 2), [Value::I32(2)]);
+    assert_eq!(word(&mut p, 1024), Value::I32(EventKind::PointerDown as i32));
+    assert_eq!(word(&mut p, 1028), Value::I32(SHIFT as i32));
+    assert_eq!(word(&mut p, 1032), Value::I32(3.5f32.to_bits() as i32));
+    assert_eq!(word(&mut p, 1040), Value::I32(2));
+    assert_eq!(word(&mut p, 1024 + 24 + 8), Value::I32('é' as i32));
+    assert_eq!(take(&mut p, 8), [Value::I32(1)]);
+    assert_eq!(word(&mut p, 1024), Value::I32(EventKind::KeyDown as i32));
+    assert_eq!(take(&mut p, 8), [Value::I32(0)]);
+    p.push_input(Event::text('x'));
+    let err = p.call("past_the_end", &[]).expect_err("past the end");
+    assert!(err.to_string().contains("past the end of the program's memory"), "{err}");
 }

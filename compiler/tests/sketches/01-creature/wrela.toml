@@ -3,4 +3,4 @@
 name = "grazer"
 
 [dependencies]
-engine = { path = "../engine" }
+engine = { path = "../../../../engine" }

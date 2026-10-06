@@ -1,16 +1,18 @@
-//! `wrela-host <build-dir> [--frames N] [--fps F] [--size WxH] [--png out.png] [--rgba out.rgba]
-//! [--timestamps]`: runs a build headless and prints its state hash.
+//! `wrela-host <build-dir> [--frames N] [--fps F] [--size WxH] [--input script.json]
+//! [--png out.png] [--rgba out.rgba] [--timestamps]`: runs a build headless and prints its state
+//! hash.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 use wrela_host::{Host, Options, frame_time};
 
-const USAGE: &str = "usage: wrela-host <build-dir> [--frames N] [--fps F] [--size WxH] [--png out.png] [--rgba out.rgba] [--timestamps]
+const USAGE: &str = "usage: wrela-host <build-dir> [--frames N] [--fps F] [--size WxH] [--input script.json] [--png out.png] [--rgba out.rgba] [--timestamps]
 
 Runs the build's frame(i / fps, width, height) for i in 0..N (default 1 frame at 60 fps,
 640x360), then prints the state hash: FNV-1a 64 over every submitted byte, 16 hex digits.
---png and --rgba write the last frame (raw RGBA8, rows top to bottom). --timestamps prints each
-dispatch's and screen pass's GPU time to stderr.";
+--input gives the program a script of input events (runtime/abi `input`). --png and --rgba
+write the last frame (raw RGBA8, rows top to bottom). --timestamps prints each dispatch's and
+screen pass's GPU time to stderr.";
 
 struct Args {
     dir: PathBuf,
@@ -19,6 +21,7 @@ struct Args {
     size: (u32, u32),
     png: Option<PathBuf>,
     rgba: Option<PathBuf>,
+    input: Option<PathBuf>,
     timestamps: bool,
 }
 
@@ -31,6 +34,7 @@ fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
         size: (640, 360),
         png: None,
         rgba: None,
+        input: None,
         timestamps: false,
     };
     while let Some(arg) = argv.next() {
@@ -57,6 +61,7 @@ fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
             }
             "--png" => args.png = Some(value("--png")?.into()),
             "--rgba" => args.rgba = Some(value("--rgba")?.into()),
+            "--input" => args.input = Some(value("--input")?.into()),
             "--timestamps" => args.timestamps = true,
             "-h" | "--help" => return Err(USAGE.into()),
             flag if flag.starts_with("--") => {
@@ -71,10 +76,19 @@ fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
 }
 
 fn run(args: &Args) -> Result<(), wrela_host::Error> {
+    let script = match &args.input {
+        Some(path) => {
+            let text = std::fs::read_to_string(path)
+                .map_err(|e| wrela_host::Error::Io { path: path.clone(), source: e })?;
+            wrela_host::parse_script(&text)
+                .map_err(|why| wrela_host::Error::Program(format!("{}: {why}", path.display())))?
+        }
+        None => Vec::new(),
+    };
     let mut host =
         Host::load_with(&args.dir, &Options { timestamps: args.timestamps, ..Options::default() })?;
     let times: Vec<f32> = (0..args.frames).map(|i| frame_time(i, args.fps)).collect();
-    let run = host.run_frames(&times, args.size.0, args.size.1)?;
+    let run = host.run_frames_with(&times, args.size.0, args.size.1, &script)?;
     drop(host); // release the GPU (and its lock) before writing files
     if let Some(path) = &args.png {
         run.write_png(path)?;

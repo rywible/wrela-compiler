@@ -8,8 +8,9 @@ import { LIMIT_SOURCES } from "./check.ts";
 import { errorMessage } from "./errors.ts";
 import { fitSize, GameClock } from "./frame.ts";
 import { alignTo, type GpuExecutor } from "./gpu.ts";
+import { InputRing, parseScript, type Scripted } from "./input.ts";
 import { browserIo, type Build, loadBuild, startProgram } from "./loader.ts";
-import { runWorker, type SpawnWorker } from "./program.ts";
+import { type Program, runWorker, type SpawnWorker } from "./program.ts";
 import type { FromWorker, ToWorker, VoiceOptions } from "./messages.ts";
 import { encodePng } from "./png.ts";
 import { frameTime, putResult, type TestParams } from "./testmode.ts";
@@ -27,6 +28,17 @@ class GpuError extends Error {
 let base = "";
 let testing = false;
 let failed = false;
+/** Input events from the main thread (input.ts). */
+let ring: InputRing | null = null;
+
+/** Gives the program the events the main thread has written: it reads them in its next call.
+ * Their times, for the latency test. */
+function deliverInput(program: Program): number[] {
+  if (!ring) return [];
+  const { events, times } = ring.read();
+  program.queueInput(events);
+  return times;
+}
 
 /** Stops everything and reports `e`: to the page, and in test mode to `results/DONE`. */
 function fatal(e: unknown): void {
@@ -97,6 +109,7 @@ async function run(canvas: OffscreenCanvas, device: GPUDevice, build: Build): Pr
           canvas.width = width;
           canvas.height = height;
         }
+        deliverInput(program);
         program.frame(time, width, height);
         if (!checking) {
           checking = true;
@@ -149,6 +162,14 @@ async function readTexture(device: GPUDevice, texture: GPUTexture): Promise<Uint
 
 async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build, params: TestParams): Promise<void> {
   const { frames, width, height, fps } = params;
+  // What the program printed (`results/log.txt`), and each frame's CPU time: the program's
+  // `frame` and its batch's checks and encoding, up to its submission (`results/frames.json`).
+  const printed: string[] = [];
+  const cpu: number[] = [];
+  // When each frame began (ms since the epoch), and the frame each printed line came in.
+  const began_ms: number[] = [];
+  const printed_in: number[] = [];
+  let frameNow = 0;
   canvas.width = width;
   canvas.height = height;
   const ctx = context(canvas, device, GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_DST);
@@ -168,12 +189,19 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
       afterPass: (encoder) =>
         encoder.copyTextureToTexture({ texture: screen }, { texture: ctx.getCurrentTexture() }, [width, height]),
     },
-    { hash: true, io: browserIo(base), workers: params.workers, spawnWorker, startVoice },
+    { hash: params.nohash === 0, io: browserIo(base), workers: params.workers, spawnWorker, startVoice, onPrint: (line) => {
+        printed.push(line);
+        printed_in.push(frameNow);
+      } },
     params.timestamps > 0,
   );
   const executor = program.executor as GpuExecutor;
   if (params.timestamps > 0 && !executor.timed) throw new GpuError("the test asks for timestamps, but this device has no timestamp queries");
-  const hash = program.hash!;
+  const hash = program.hash;
+  const script: Scripted[] = params.input ? parseScript(await (await fetch(new URL(params.input, base))).text()) : [];
+  // The latency test: when each frame started, and which events (by when they were sent) it got.
+  const latency = { frames: [] as number[], delivered: [] as { sent: number; frame: number }[] };
+  if (params.latency > 0) self.postMessage({ type: "latency-start", ms: ((frames - 2) * 1000) / fps } satisfies FromWorker);
   const start = performance.now();
   for (let i = 0; i < frames; i++) {
     // Paced at `fps`, as a display paces frames: requests are answered in real time between
@@ -181,7 +209,16 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
     const wait = start + (i * 1000) / fps - performance.now();
     if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
     executor.frame = i;
-    await scoped(device, () => program.frame(frameTime(i, fps), width, height));
+    for (const s of script) if (s.frame === i) program.queueInput(s.event);
+    latency.frames.push(performance.timeOrigin + performance.now());
+    for (const sent of deliverInput(program)) latency.delivered.push({ sent, frame: i });
+    const began = performance.now();
+    frameNow = i;
+    began_ms.push(performance.timeOrigin + began);
+    await scoped(device, () => {
+      program.frame(frameTime(i, fps), width, height);
+      cpu.push(performance.now() - began);
+    });
     await device.queue.onSubmittedWorkDone();
     await executor.checkDebugFlag();
   }
@@ -189,15 +226,21 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
   await Promise.all([
     putResult(base, "frame.rgba", rgba),
     putResult(base, "frame.png", encodePng(width, height, rgba)),
-    putResult(base, "hash.txt", `${hash.hex()}\n`),
+    putResult(base, "hash.txt", `${hash ? hash.hex() : "none"}\n`),
     putResult(base, "workers.txt", `${program.workerChunks()}\n`),
+    putResult(base, "log.txt", printed.map((l) => `${l}\n`).join("")),
+    putResult(base, "frames.json", JSON.stringify({ cpu_ms: cpu, began_ms, printed_in })),
     params.timestamps > 0 ? executor.timings().then((t) => putResult(base, "timings.json", JSON.stringify(t))) : null,
   ]);
   if (params.audio > 0) {
     if (!program.hasVoice) throw new Error("the test asks for audio, but the program started no voice");
     await audioRendered;
   }
-  console.log(`wrela test: ${frames} frames at ${width}x${height}, state hash ${hash.hex()}`);
+  if (params.latency > 0) {
+    await latencySent;
+    await putResult(base, "latency.json", JSON.stringify(latency));
+  }
+  console.log(`wrela test: ${frames} frames at ${width}x${height}, state hash ${hash ? hash.hex() : "none"}`);
   await putResult(base, "DONE", "ok");
 }
 
@@ -213,11 +256,20 @@ const audioRendered = new Promise<void>((resolve) => {
   renderedAudio = resolve;
 });
 
+/** Test mode, `latency`: resolved when the main thread has sent its events. */
+let sentLatency = () => {};
+const latencySent = new Promise<void>((resolve) => {
+  sentLatency = resolve;
+});
+
 self.onmessage = (event: MessageEvent<ToWorker>) => {
   const msg = event.data;
   switch (msg.type) {
     case "audio-rendered":
       renderedAudio();
+      return;
+    case "latency-sent":
+      sentLatency();
       return;
     case "thread":
       // It runs until the program shuts it down, or the page goes away.
@@ -226,6 +278,7 @@ self.onmessage = (event: MessageEvent<ToWorker>) => {
     case "start": {
       base = msg.base;
       testing = msg.test !== null;
+      ring = new InputRing(msg.input);
       size = { width: msg.width, height: msg.height };
       const test = msg.test;
       // The device and the build are fetched at once.

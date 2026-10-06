@@ -53,6 +53,8 @@ pub struct BuildData {
     /// A build whose WASM uses no SIMD (`wrela_wasm::Options::simd`): its results are the same,
     /// bit for bit, which a test checks.
     pub no_simd: bool,
+    /// A lifted build's literals (language.md §22).
+    pub lift: Option<crate::LiftTable>,
 }
 
 /// The module the build runs to compute some constants.
@@ -290,7 +292,7 @@ impl Cx<'_> {
         span: Span,
     ) -> Result<Value, String> {
         use ir::layout::{array_stride, column_stride, field_offsets};
-        let t = self.reveal(t);
+        let t = self.checked.reveal(t);
         let offsets = field_offsets(&mb.m.types, it).to_vec();
         if let Some((is_vec, elem)) = self.owner_of(t) {
             let data = mem.u32(at + offsets[0])?;
@@ -418,7 +420,7 @@ impl Cx<'_> {
         v: &Value,
         span: Span,
     ) -> Option<ir::ConstValue> {
-        let t = self.reveal(t);
+        let t = self.checked.reveal(t);
         if let Some((is_vec, elem)) = self.owner_of(t) {
             let Value::Parts(ps) = v else { return None };
             let data = match ps.first()? {

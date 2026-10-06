@@ -213,7 +213,7 @@ pub fn prelude_lookup(p: &Program, name: &str) -> Option<Res> {
 }
 
 /// A name every module sees after its own: the prelude's, then the built-ins'.
-fn lookup_global(p: &Program, name: &str) -> Option<Res> {
+pub fn lookup_global(p: &Program, name: &str) -> Option<Res> {
     prelude_lookup(p, name)
         .or_else(|| BuiltinTy::lookup(name).map(Res::BuiltinTy))
         .or_else(|| BuiltinFn::lookup(name).map(Res::BuiltinFn))

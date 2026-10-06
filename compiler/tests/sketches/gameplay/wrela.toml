@@ -5,4 +5,5 @@
 name = "gameplay"
 
 [dependencies]
-engine = { path = "../engine" }
+engine = { path = "../../../../engine" }
+ui = { path = "../../../../ui" }

@@ -1345,6 +1345,15 @@ pub(super) fn host(
                 None => fe.ins.push(I::Drop),
             }
         }
+        ir::HostOp::Input => {
+            let h = fe.at.helpers;
+            fe.ins.extend([I::LocalGet(fe.v(args[0])), I::LocalGet(fe.v(args[1]))]);
+            fe.ins.push(I::Call(h.input));
+            match result {
+                Some(r) => fe.ins.push(I::LocalSet(fe.v(r))),
+                None => fe.ins.push(I::Drop),
+            }
+        }
         ir::HostOp::Audio | ir::HostOp::RequestTake => {
             let h = fe.at.helpers;
             let helper = if matches!(op, ir::HostOp::Audio) { h.audio } else { h.request_take };

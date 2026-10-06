@@ -72,6 +72,7 @@ const CONTEXTS: &[Context] = &[
         ..NONE
     },
     Context { first: "pub struct Look {", ..NONE },
+    Context { first: "use std::derive::Box3", ..NONE },
     Context { first: "pub struct Game {", ..NONE },
     Context { first: "pub enum Edit: Copy {", ..NONE },
     Context { first: "@fieldwise", items: "use std::hash::{Hasher, canonical_bits}", ..NONE },

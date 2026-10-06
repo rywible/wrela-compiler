@@ -31,6 +31,11 @@ pub enum DeriveKind {
     ValueAndGradient,
     /// The interval over a box.
     Interval,
+    /// A parameter gradient (§22): the value and its derivative by each of some lifted
+    /// literals. `input` is the literals' array type, `output` the result's.
+    Literals,
+    /// The lifted literals the callable can read (§22): `output` is the run's type.
+    Reads,
 }
 
 /// What's passed for a parameter of function type.

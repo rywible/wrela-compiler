@@ -1,16 +1,13 @@
 //! `wrela doc` (AC13): every public item of std is found by its path, with its signature, in
 //! under 100 ms (timed in a release build: a debug build's parser is slower).
 
-use std::process::Command;
+mod common;
+
 use std::time::Instant;
 
 fn doc(args: &[&str]) -> (bool, String, f64) {
     let t = Instant::now();
-    let out = Command::new(env!("CARGO_BIN_EXE_wrela"))
-        .arg("doc")
-        .args(args)
-        .output()
-        .expect("run wrela");
+    let out = common::wrela().arg("doc").args(args).output().expect("run wrela");
     let secs = t.elapsed().as_secs_f64();
     (out.status.success(), String::from_utf8_lossy(&out.stdout).into_owned(), secs)
 }
@@ -64,4 +61,43 @@ fn a_bare_name_is_found() {
     assert!(ok && list.contains("items are named `par_map_reduce`"), "{list}");
     let (ok, _, _) = doc(&["no_such_thing_anywhere"]);
     assert!(!ok);
+}
+
+/// The built-in functions are listed, and one is found by its name.
+#[test]
+fn builtins_are_listed() {
+    let (ok, list, _) = doc(&["builtins"]);
+    assert!(ok, "{list}");
+    for f in ["length(x)", "clamp(x, y, z)", "smoothstep(x, y, z)", "normalize(x)"] {
+        assert!(list.contains(f), "{f} isn't listed:\n{list}");
+    }
+    let (ok, page, _) = doc(&["mix"]);
+    assert!(ok && page.starts_with("mix: a built-in function of 3 arguments"), "{page}");
+}
+
+/// The packages a package depends on are read: their items are found under the dependency's
+/// name, and a struct's page shows its fields with their doc comments.
+#[test]
+fn a_dependency_is_read() {
+    let dir = common::package(
+        "doc-deps",
+        &[
+            (
+                "wrela.toml",
+                "[package]\nname = \"app\"\n\n[dependencies]\nkit = { path = \"kit\" }\n",
+            ),
+            ("main.wrela", common::FRAME),
+            ("kit/wrela.toml", &common::manifest("kit")),
+            (
+                "kit/shapes.wrela",
+                "// Shapes for the kit.\n\n/// A box's size.\npub struct Size {\n    /// Across, in metres.\n    pub width: f32,\n    pub height: f32,\n}\n",
+            ),
+        ],
+    );
+    let d = dir.to_str().unwrap();
+    let (ok, page, _) = doc(&["kit::shapes::Size", d]);
+    assert!(ok && page.starts_with("kit::shapes::Size"), "{page}");
+    assert!(page.contains("/// Across, in metres.") && page.contains("pub width: f32"), "{page}");
+    let (ok, listing, _) = doc(&["kit::shapes", d]);
+    assert!(ok && items(&listing) == ["Size"], "{listing}");
 }

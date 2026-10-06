@@ -30,8 +30,9 @@ step() { printf '\n== %s\n' "$*"; }
 
 # wrela sources the formatter owns. The conformance and diagnostics cases aren't here: some
 # are malformed on purpose, and their annotations are part of their layout.
-WRELA_SOURCES=(examples compiler/std compiler/tests/fields compiler/tests/math compiler/tests/sketches
-  compiler/tests/numerics compiler/tests/render compiler/tests/queries compiler/tests/simd)
+WRELA_SOURCES=(examples engine compiler/std compiler/tests/fields compiler/tests/math compiler/tests/sketches
+  compiler/tests/numerics compiler/tests/render compiler/tests/queries compiler/tests/simd
+  compiler/tests/input compiler/tests/lift ui studio)
 
 step "rustfmt"
 cargo fmt --all -- --check
@@ -55,13 +56,16 @@ python3 -m unittest discover -q -s tools/tests
 step "browser runtime: tests, types, dist is current, size budget"
 (cd runtime/browser && bun run checks)
 
-step "speed, cold processes: hello field's check < 200 ms and build < 2 s, sketch 03's < 500 ms and < 5 s; WGSL size of every example's and sketch's pipelines"
+step "speed, cold processes: hello field's check < 200 ms and build < 2 s, sketch 03's and the lens's (on each subject) < 500 ms and < 5 s; WGSL size of every example's, sketch's and lens's pipelines"
 python3 - "$wrela" <<'PY'
 import gzip, pathlib, shutil, subprocess, sys, tempfile, time
 wrela = sys.argv[1]
-def best(args, n=5):
+def best(args, n=5, cold=None):
     times = []
     for _ in range(n):
+        # A build that keeps a cache (the lens's compiled code) is timed cold.
+        if cold:
+            shutil.rmtree(cold, ignore_errors=True)
         t = time.perf_counter()
         subprocess.run([wrela, *args], check=True, capture_output=True)
         times.append(time.perf_counter() - t)
@@ -69,25 +73,41 @@ def best(args, n=5):
 out = tempfile.mkdtemp()
 try:
     hello, sketch = "examples/hello-field", "compiler/tests/sketches/03-simulation"
-    for name, args, budget in [
+    # The lens on each subject (AC12 of #39): `wrela studio` writes its program beside the
+    # subject (build/studio/lens) and builds it lifted, then keeps its compiled code.
+    subjects = ["wolf", "grazer"]
+    for s in subjects:
+        subprocess.run([wrela, "studio", f"examples/{s}", "build"], check=True, capture_output=True)
+    lens = lambda s: f"examples/{s}/build/studio/lens"
+    runs = [
         ("check hello field", ["check", hello], 0.2),
         ("build hello field", ["build", hello, "-o", f"{out}/speed-hello"], 2.0),
         ("check sketch 03", ["check", sketch], 0.5),
         ("build sketch 03", ["build", sketch, "-o", f"{out}/speed-sketch"], 5.0),
-    ]:
-        lo, hi = best(args)
+    ]
+    for s in subjects:
+        runs += [
+            (f"check the lens on the {s}", ["check", lens(s)], 0.5),
+            (f"build the lens on the {s}", ["build", lens(s), "--lift", s, "-o", f"{out}/speed-lens-{s}"], 5.0),
+            (f"studio build on the {s} (and its compiled code)", ["studio", f"examples/{s}", "build"], 5.0,
+             f"examples/{s}/build/studio/page/.native"),
+        ]
+    for name, args, budget, *cold in runs:
+        lo, hi = best(args, cold=cold[0] if cold else None)
         print(f"  wrela {name}: {lo * 1000:.0f}-{hi * 1000:.0f} ms (budget {budget * 1000:.0f} ms)")
         if hi > budget:
             sys.exit(f"wrela {name} took {hi * 1000:.0f} ms, over its budget")
     # Each pipeline's WGSL: what the browser downloads and the driver compiles (pipeline
     # creation time is budgeted by the --gpu tests). Hello field keeps its own budget; every
     # other example's and sketch's pipelines are at most 256 KiB each.
-    packages = sorted(p.parent for root in ["examples", "compiler/tests/sketches"]
+    packages = sorted(p.parent for root in ["examples", "compiler/tests/sketches", "ui/tests"]
                       for p in pathlib.Path(root).glob("*/main.wrela"))
+    packages += [pathlib.Path(lens(s)) for s in subjects]
     pipelines = 0
     for pkg in packages:
-        built = pathlib.Path(out) / pkg.name
-        subprocess.run([wrela, "build", str(pkg), "-o", str(built)], check=True, capture_output=True)
+        built = pathlib.Path(out) / pkg.parent.parent.parent.name / pkg.name if pkg.name == "lens" else pathlib.Path(out) / pkg.name
+        lift = ["--lift", pkg.parent.parent.parent.name] if pkg.name == "lens" else []
+        subprocess.run([wrela, "build", str(pkg), "-o", str(built), *lift], check=True, capture_output=True)
         raw_budget, gz_budget = (128 * 1024, 24 * 1024) if str(pkg) == hello else (256 * 1024, None)
         for wgsl in sorted(built.glob("*.wgsl")):
             pipelines += 1
@@ -103,12 +123,21 @@ finally:
 PY
 
 if [ "$gpu" = 1 ]; then
-  # The load-time budgets measure shader compilation on the CPU, so they run alone: with the
-  # other tests compiling beside them, spike 13's cold load took 2.6 s instead of 0.8 s.
-  budgets=(loading_creates_the_pipelines_within_budget the_gpu_certificate_is_small_quick_and_right)
+  # The time budgets run alone: the load-time ones measure shader compilation on the CPU (with
+  # the other tests compiling beside them, spike 13's cold load took 2.6 s instead of 0.8 s),
+  # and Chrome's input latency and text budgets measure real time (under the other tests'
+  # load, an event missed its next frame, and 10,000 glyphs took 0.52 ms instead of 0.23).
+  # So do the lens's: its frames' and clicks' times in Chrome, its drag updates in a session,
+  # its fits' 10 s, and an edit's 2 s to show.
+  budgets=(loading_creates_the_pipelines_within_budget the_gpu_certificate_is_small_quick_and_right
+    events_reach_the_program_by_the_next_frame a_screen_of_code_draws_within_half_a_millisecond
+    the_lens_is_fast_enough_and_the_same_in_both_hosts a_session_gives_the_same_results_headless_and_in_chrome
+    fits_recover_the_wolfs_longer_neck_and_bigger_ears an_edit_by_another_tool_shows_in_the_open_lens_within_2_s)
+  skips=()
+  for b in "${budgets[@]}"; do skips+=(--skip "$b"); done
   step "GPU and headless-Chrome tests"
-  cargo test -q --release --workspace -- --ignored --skip "${budgets[0]}" --skip "${budgets[1]}"
-  step "load-time budgets, one test at a time"
+  cargo test -q --release --workspace -- --ignored "${skips[@]}"
+  step "time budgets, one test at a time"
   cargo test -q --release -p wrela-tests --test suite -- --ignored --test-threads=1 "${budgets[@]}"
 fi
 

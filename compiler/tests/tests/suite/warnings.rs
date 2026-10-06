@@ -1,6 +1,7 @@
 //! Warnings: W0001 (a local bound and never used), W0002 (an arm that can't match), W0004
-//! (`Clone` declared beside `Copy`) and W0005 (a bare literal by position where a swap would
-//! compile, or a `select` by position). The conformance suite checks errors only.
+//! (`Clone` declared beside `Copy`), W0005 (a bare literal by position where a swap would
+//! compile, or a `select` by position) and W0006 (a `var` that never changes). The conformance
+//! suite checks errors only.
 
 use crate::package;
 
@@ -39,6 +40,47 @@ fn unused_locals_are_reported_once_each() {
     let lines: Vec<usize> = w.iter().filter(|(c, _)| c == "W0001").map(|(_, l)| *l).collect();
     // `a`, `c` (assigned, never read), `d`, `k`.
     assert_eq!(lines, [2, 4, 7, 8], "{w:?}");
+}
+
+/// A `var` that nothing changes is W0006, with a fix that makes it a `let`; one that's assigned,
+/// written through, lent `mut`, projected `mut` or captured by a closure that writes it isn't.
+#[test]
+fn a_var_that_never_changes_is_reported_and_fixed() {
+    let src = "struct P: Copy {
+    x: f32,
+}
+
+fn bump(p: mut P) {
+    p.x += 1.0
+}
+
+fn f() -> f32 {
+    var same = 1.0
+    var assigned = 1.0
+    assigned = 2.0
+    var field = P { x: 1.0 }
+    field.x = 3.0
+    var lent = P { x: 1.0 }
+    bump(mut lent)
+    var pushed: Vec<f32> = Vec::new()
+    pushed.push(1.0)
+    var projected = P { x: 1.0 }
+    mut q = projected
+    q.x = 2.0
+    var captured = 0.0
+    let add = |k: f32| {
+        captured += k
+    }
+    add(1.0)
+    same + assigned + field.x + lent.x + pushed[0] + projected.x + captured
+}";
+    let w = warnings("var", src);
+    assert_eq!(w, [("W0006".to_string(), 10)], "{w:?}");
+    let out = wrela_driver::check(&package("warnings/var-fixed", src));
+    let file = out.diagnostics[0].span().expect("a span").file;
+    let fixed = wrela_tests::apply_fixes(src, file, &out.diagnostics);
+    assert!(fixed.contains("    let same = 1.0"), "{fixed}");
+    assert!(warnings("var-fixed-again", &fixed).is_empty());
 }
 
 #[test]

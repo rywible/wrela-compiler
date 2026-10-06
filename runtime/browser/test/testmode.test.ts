@@ -20,7 +20,11 @@ test("reads every parameter", () => {
     workers: 4,
     audio: 750,
     timestamps: 0,
+    input: "",
+    latency: 0,
+    nohash: 0,
   });
+  expect(parseTestParams("#test&input=scripts/a.json&latency=40")).toEqual({ ...TEST_DEFAULTS, input: "scripts/a.json", latency: 40 });
 });
 
 test("rejects unknown or invalid parameters", () => {
@@ -29,6 +33,8 @@ test("rejects unknown or invalid parameters", () => {
   expect(() => parseTestParams("#test&width=1.5")).toThrow("must be a positive integer");
   expect(() => parseTestParams("#test&height=")).toThrow("must be a positive integer");
   expect(() => parseTestParams("#test&fps=-1")).toThrow("fps=-1 must be a positive number");
+  expect(() => parseTestParams("#test&input=../x.json")).toThrow("must be a path relative to the page");
+  expect(() => parseTestParams("#test&input=http://x/y")).toThrow("must be a path relative to the page");
 });
 
 test("frame times are i / fps, rounded to f32 like the native host's", () => {

@@ -113,6 +113,9 @@ fn command(c: &Command) -> Value {
             json!({ "op": "StorageWrite", "request": request, "path": path, "data": data })
         }
         Command::Fetch { request, url } => json!({ "op": "Fetch", "request": request, "url": url }),
+        Command::Post { request, url, body } => {
+            json!({ "op": "Post", "request": request, "url": url, "body": body })
+        }
         Command::Log { text } => json!({ "op": "Log", "text": text }),
     }
 }
@@ -163,6 +166,7 @@ pub(crate) fn golden_batch() -> Vec<u8> {
         .storage_write(3, "saves/a", &[1, 2, 3, 4, 5])
         .fetch(4, "data/level.bin")
         .log("frame 3: 2 grazers, é")
+        .post(5, "studio/edit", &[123, 125])
         .finish()
 }
 
@@ -257,6 +261,10 @@ fn batches() -> Vec<Value> {
             &edit(Encoder::new().fetch(1, "data").finish(), h + 12, 9),
         ),
         batch(
+            "a post body length that disagrees with the payload",
+            &edit(Encoder::new().post(1, "x", &[1, 2]).finish(), h + 16, 9),
+        ),
+        batch(
             "a log line that isn't UTF-8",
             &edit(Encoder::new().log("ok").finish(), h + 12, 0xFF),
         ),
@@ -344,7 +352,8 @@ pub fn check_manifest() -> Manifest {
         bindings: vec![bind(1, BindingKind::Read), bind(2, BindingKind::ReadWrite)],
         debug_flag: None,
     };
-    let render = Stage::Render { vertex_entry: "vs".into(), fragment_entry: "fs".into() };
+    let render =
+        Stage::Render { vertex_entry: "vs".into(), fragment_entry: "fs".into(), blend: false };
     m.pipelines.push(shape("draw", render.clone()));
     let compute = Stage::Compute { entry: "main".into(), workgroup_size: [64, 1, 1] };
     m.pipelines.push(shape("compute", compute.clone()));
@@ -697,6 +706,11 @@ fn checks() -> Value {
             &Encoder::new().fetch(1, "https://example.com/x").finish(),
         ),
         check(
+            "a post to another site",
+            &m,
+            &Encoder::new().post(1, "https://example.com/x", &[1]).finish(),
+        ),
+        check(
             "requests, made rightly",
             &m,
             &Encoder::new().storage_write(1, "a/b", &[1]).fetch(2, "c.bin").finish(),
@@ -718,7 +732,11 @@ pub(crate) fn sample_manifest() -> Manifest {
     m.pipelines.push(Pipeline {
         name: "cover+shade".into(),
         shader: "pipeline_1.wgsl".into(),
-        stage: Stage::Render { vertex_entry: "vs".into(), fragment_entry: "fs".into() },
+        stage: Stage::Render {
+            vertex_entry: "vs".into(),
+            fragment_entry: "fs".into(),
+            blend: false,
+        },
         uniform: None,
         bindings: vec![
             ResourceBinding { binding: 0, kind: BindingKind::Texture },
@@ -771,6 +789,15 @@ fn manifests() -> Vec<Value> {
         manifest("a debug build's flag", edited(&|m| m.pipelines[0].debug_flag = Some(2))),
         manifest("a debug flag on a binding", edited(&|m| m.pipelines[0].debug_flag = Some(1))),
         manifest("a debug flag as a string", golden.replace("\"bindings\": [", "\"debug_flag\": \"2\",\n      \"bindings\": [")),
+        manifest(
+            "a blended render pipeline",
+            edited(&|m| {
+                if let Stage::Render { blend, .. } = &mut m.pipelines[1].stage {
+                    *blend = true;
+                }
+            }),
+        ),
+        manifest("a blend that isn't a bool", golden.replace("\"fragment_entry\": \"fs\",", "\"fragment_entry\": \"fs\",\n      \"blend\": 1,")),
         manifest(
             "a uniform block that isn't a multiple of 16",
             edited(&|m| {
@@ -957,6 +984,49 @@ fn line_tables() -> Vec<Value> {
     ]
 }
 
+/// Input scripts (`crate::input`), each with the events it gives, as their bytes in hex and
+/// their frames, or the error it's refused with.
+fn input_scripts() -> Value {
+    let scripts = [
+        (
+            "every kind",
+            r#"[
+  {"frame": 0, "type": "move", "x": 10.5, "y": 20},
+  {"frame": 1, "type": "down", "x": 10.5, "y": 20, "button": "secondary", "shift": true},
+  {"frame": 1, "type": "up", "x": 11, "y": 21, "alt": true},
+  {"frame": 2, "type": "wheel", "x": 1, "y": 2, "dx": -3, "dy": 120.25},
+  {"frame": 3, "type": "key", "key": "Tab", "ctrl": true, "meta": true},
+  {"frame": 3, "type": "keydown", "key": "KeyA", "repeat": true},
+  {"frame": 3, "type": "keyup", "key": "KeyA"},
+  {"frame": 4, "type": "text", "text": "aéÿ"}
+]"#,
+        ),
+        ("not an array", "{}"),
+        ("not JSON", "[{"),
+        ("no frame", r#"[{"type": "move"}]"#),
+        ("a fractional frame", r#"[{"frame": 1.5, "type": "move"}]"#),
+        ("frames that decrease", r#"[{"frame": 2, "type": "move"}, {"frame": 1, "type": "move"}]"#),
+        ("an unknown type", r#"[{"frame": 0, "type": "jump"}]"#),
+        ("an unknown key", r#"[{"frame": 0, "type": "key", "key": "A"}]"#),
+        ("an unknown button", r#"[{"frame": 0, "type": "down", "button": "left"}]"#),
+        ("a coordinate that isn't a number", r#"[{"frame": 0, "type": "move", "x": "1"}]"#),
+        ("a modifier that isn't a bool", r#"[{"frame": 0, "type": "move", "shift": 1}]"#),
+        ("text that's missing", r#"[{"frame": 0, "type": "text"}]"#),
+    ];
+    scripts
+        .iter()
+        .map(|(name, text)| match crate::input::parse_script(text) {
+            Ok(events) => json!({
+                "name": name,
+                "script": text,
+                "frames": events.iter().map(|e| e.frame).collect::<Vec<_>>(),
+                "events": events.iter().map(|e| hex(&e.event.bytes())).collect::<Vec<_>>(),
+            }),
+            Err(e) => json!({ "name": name, "script": text, "error": e }),
+        })
+        .collect()
+}
+
 /// Every vector, as `runtime/abi/vectors.json` holds them.
 pub fn vectors() -> String {
     let v = json!({
@@ -968,6 +1038,7 @@ pub fn vectors() -> String {
         "checks": checks(),
         "manifests": manifests(),
         "lines": line_tables(),
+        "input": input_scripts(),
     });
     let mut s = serde_json::to_string_pretty(&v).expect("vectors serialize");
     s.push('\n');

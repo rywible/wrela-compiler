@@ -20,6 +20,11 @@ fn builds_are_reproducible() {
         ("compiler/tests/sketches", "01-creature"),
         ("compiler/tests/sketches", "02-drawing"),
     ];
+    // The sketches' engine, where their path dependency finds it from the copies:
+    // `../../../../engine` from somewhere/else/compiler-tests-sketches/<sketch>.
+    if !tmp.join("engine").exists() {
+        copy_dir(&repo_root().join("engine"), &tmp.join("engine"));
+    }
     // Each package three times: from where it is, twice, and from a copy at another path.
     let sources: Vec<_> = pkgs
         .iter()

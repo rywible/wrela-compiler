@@ -3,7 +3,9 @@
 //! (`wrela_host::CpuHost`), which checks every command a frame records and answers storage
 //! and fetch requests, but has no GPU: `init`, then `n` frames at 60 a second on a 640 × 480
 //! screen, then the test with the program's state. Each test runs on a new instance, with
-//! storage of its own, and each call (`init`, a frame, the test) gets a test's fuel.
+//! storage of its own, and each call (`init`, a frame, the test) gets a test's fuel. A test
+//! with `input: "script.json"` gets the script's input events (runtime/abi `input`), each
+//! queued before the frame it's for.
 
 use crate::build;
 use crate::consts::{Fault, Item, TEST_FUEL, failure};
@@ -25,6 +27,7 @@ pub fn run(
     sources: &SourceMap,
     data: &BuildData,
     tests: &[FnId],
+    root: &Path,
 ) -> (Vec<(FnId, Option<Diagnostic>)>, Vec<Diagnostic>) {
     let mut roots = wrela_lower::Roots::of(checked);
     roots.tests = tests.to_vec();
@@ -53,22 +56,43 @@ pub fn run(
     };
     let mut results = Vec::new();
     for (i, &f) in tests.iter().enumerate() {
-        let frames = checked.program.func(f).attrs.test_frames.unwrap_or(1);
-        let storage = dir.0.join(format!("storage.{i}"));
-        let failed = run_one(&built, &storage, i, frames).map(|Failed { error, fault, phase }| {
-            match fault {
-                Some(fault) => {
-                    failure(checked, sources, &out.lines, Item::Test(f), &fault, Some(&phase))
+        let attrs = &checked.program.func(f).attrs;
+        let frames = attrs.test_frames.unwrap_or(1);
+        let script = match &attrs.test_input {
+            None => Vec::new(),
+            Some((path, span)) => match read_script(root, path) {
+                Ok(s) => s,
+                Err(why) => {
+                    let d = Diagnostic::new(
+                        codes::E0222,
+                        *span,
+                        format!("the test's input script `{path}` {why}"),
+                    )
+                    .with_note("a script is a JSON array of input events, by the frame each arrives before (runtime/abi `input`)");
+                    results.push((f, Some(d)));
+                    continue;
                 }
-                // Not a trap: a command the host can't carry out, say.
-                None => Diagnostic::new(
-                    codes::E0706,
-                    checked.program.func(f).span,
-                    format!("the test `{}` failed {phase}: {error}", checked.program.func(f).name),
-                )
-                .with_note("a frame test passes unless its frames or the test fail (§10)"),
-            }
-        });
+            },
+        };
+        let storage = dir.0.join(format!("storage.{i}"));
+        let failed =
+            run_one(&built, &storage, i, frames, &script).map(|Failed { error, fault, phase }| {
+                match fault {
+                    Some(fault) => {
+                        failure(checked, sources, &out.lines, Item::Test(f), &fault, Some(&phase))
+                    }
+                    // Not a trap: a command the host can't carry out, say.
+                    None => Diagnostic::new(
+                        codes::E0706,
+                        checked.program.func(f).span,
+                        format!(
+                            "the test `{}` failed {phase}: {error}",
+                            checked.program.func(f).name
+                        ),
+                    )
+                    .with_note("a frame test passes unless its frames or the test fail (§10)"),
+                }
+            });
         results.push((f, failed));
     }
     (results, diags)
@@ -82,8 +106,25 @@ struct Failed {
     phase: String,
 }
 
-/// Runs frame test `i`: `init`, `frames` frames, then the test. Why it failed, if it did.
-fn run_one(built: &wrela_host::CpuBuild, storage: &Path, i: usize, frames: u32) -> Option<Failed> {
+/// The script at `path` in the package at `root`, or why it can't be read.
+fn read_script(root: &Path, path: &str) -> Result<Vec<wrela_host::Scripted>, String> {
+    if wrela_abi::check::path_problem(path).is_some() {
+        return Err("must be a path inside the package, with `/` between its parts".into());
+    }
+    let text =
+        std::fs::read_to_string(root.join(path)).map_err(|e| format!("can't be read: {e}"))?;
+    wrela_host::parse_script(&text).map_err(|e| format!("isn't a script: {e}"))
+}
+
+/// Runs frame test `i`: `init`, `frames` frames with `script`'s input, then the test. Why it
+/// failed, if it did.
+fn run_one(
+    built: &wrela_host::CpuBuild,
+    storage: &Path,
+    i: usize,
+    frames: u32,
+    script: &[wrela_host::Scripted],
+) -> Option<Failed> {
     let failed = |error, host: Option<&wrela_host::CpuHost>, phase: String| {
         let fault = host.and_then(|h| h.last_failure()).map(|f| Fault {
             frames: f.frames.clone(),
@@ -103,6 +144,9 @@ fn run_one(built: &wrela_host::CpuBuild, storage: &Path, i: usize, frames: u32) 
         return failed(e, Some(&host), "in `init`".to_string());
     }
     for k in 0..frames {
+        for e in wrela_abi::input::events_at(script, k) {
+            host.push_input(e);
+        }
         let time = wrela_host::frame_time(k, FPS);
         if let Err(e) = host.frame(time, WIDTH, HEIGHT) {
             return failed(e, Some(&host), format!("in frame {k} of {frames}"));

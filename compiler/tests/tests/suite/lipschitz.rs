@@ -7,10 +7,20 @@ use crate::built;
 use wrela_host::{CpuBuild, CpuHost, Value};
 use wrela_tests::{one_f32, one_u32};
 
-const NAMES: [&str; 8] =
-    ["sphere", "ellipsoid", "round cone", "hoof", "blob", "fbm", "creature", "grazer"];
+const NAMES: [&str; 10] = [
+    "sphere",
+    "ellipsoid",
+    "round cone",
+    "hoof",
+    "blob",
+    "fbm",
+    "creature",
+    "grazer",
+    "oval",
+    "tube",
+];
 /// Where each is sampled: [-2, 2]³ times this, so enough points are near each surface.
-const SCALES: [f32; 8] = [1.0, 1.0, 1.0, 0.1, 1.0, 1.0, 1.0, 1.0];
+const SCALES: [f32; 10] = [1.0, 1.0, 1.0, 0.1, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
 /// The scopes consumers pass: a sphere tracer's step, and a block's radius.
 const SCOPES: [f32; 2] = [0.02, 0.1];
 
@@ -73,6 +83,9 @@ fn the_corpus_bounds_at_10_cm() {
     assert_eq!(&got[..4], &[1.0, got[1], 1.0, 1.0]);
     assert!(got[1] > 1.0 && got[1] < 10.0, "the ellipsoid's bound: {}", got[1]);
     assert!(got[7].is_infinite(), "the grazer's bound: {}", got[7]);
+    // The oval's is finite where its ellipsoid's isn't, and smaller at 10 cm; the tube is exact.
+    assert!(got[8] < got[1], "the oval's bound: {}", got[8]);
+    assert_eq!(got[9], 1.0, "the tube's bound");
 }
 
 /// A release build trusts a stated bound; a debug build checks it when `to_bound` uses it.

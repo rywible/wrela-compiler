@@ -25,8 +25,9 @@
 //!   bytes at `ptr` in its memory (see [`stream`]); and may import
 //!   `wrela.request_status(request: i32) -> i32` and `wrela.request_take(request: i32, ptr: i32)`,
 //!   which answer the requests its batches make, `wrela.limit(index: i32) -> i32`, which
-//!   gives one of the GPU's limits ([`Limits`]), and `wrela.audio(task: i32, context: i32)`,
-//!   which starts the program's voice ([`IMPORT_AUDIO`]);
+//!   gives one of the GPU's limits ([`Limits`]), `wrela.audio(task: i32, context: i32)`,
+//!   which starts the program's voice ([`IMPORT_AUDIO`]), and `wrela.input(ptr: i32, cap: i32)
+//!   -> i32`, which gives it the pointer and keyboard events that have arrived ([`input`]);
 //! - imports its memory, shared, as `wrela.memory` ([`memory`]);
 //! - may have a start function, which runs as each instance starts and may not call the host:
 //!   the compiler's copies the program's constants into the memory, once however many instances
@@ -43,6 +44,7 @@
 
 pub mod check;
 pub mod hash;
+pub mod input;
 pub mod lines;
 pub mod manifest;
 pub mod memory;
@@ -50,6 +52,7 @@ pub mod stream;
 pub mod typescript;
 pub mod vectors;
 
+pub use input::IMPORT_INPUT;
 pub use manifest::Manifest;
 pub use typescript::typescript;
 
@@ -100,12 +103,13 @@ impl HostFunction {
 }
 
 /// Every function a program may import besides its memory ([`IMPORT_MEMORY`]).
-pub const HOST_FUNCTIONS: [HostFunction; 5] = [
+pub const HOST_FUNCTIONS: [HostFunction; 6] = [
     HostFunction { name: IMPORT_SUBMIT, params: 2, results: 0 },
     HostFunction { name: IMPORT_REQUEST_STATUS, params: 1, results: 1 },
     HostFunction { name: IMPORT_REQUEST_TAKE, params: 2, results: 0 },
     HostFunction { name: IMPORT_LIMIT, params: 1, results: 1 },
     HostFunction { name: IMPORT_AUDIO, params: 2, results: 0 },
+    HostFunction { name: IMPORT_INPUT, params: 2, results: 1 },
 ];
 
 /// The export the host calls each frame.

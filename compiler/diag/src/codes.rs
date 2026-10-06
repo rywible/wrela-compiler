@@ -164,6 +164,7 @@ codes! {
     E0330 = "E0330", "a `let … else` whose `else` doesn't leave the scope";
     E0331 = "E0331", "a `const` generic parameter that isn't a `u32`";
     E0332 = "E0332", "a constant of a type that can't live as long as the program";
+    E0333 = "E0333", "a call's result thrown away, where the call does nothing else";
 
     // ---- E04xx: traits and generics --------------------------------------------------------
     E0400 = "E0400", "a type that doesn't implement a trait";
@@ -239,6 +240,7 @@ codes! {
     W0003 = "W0003", "a file named like the entry module, in another case";
     W0004 = "W0004", "`Clone` declared beside `Copy`, which implies it";
     W0005 = "W0005", "an argument passed by position where a swap would compile";
+    W0006 = "W0006", "a `var` that never changes";
 
     // ---- I0xxx: bugs in the compiler -------------------------------------------------------
     I0001 = "I0001", "an internal compiler error";

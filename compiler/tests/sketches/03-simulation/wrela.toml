@@ -3,5 +3,5 @@
 name = "simulation"
 
 [dependencies]
-engine = { path = "../engine" }
+engine = { path = "../../../../engine" }
 grazer = { path = "../01-creature" }

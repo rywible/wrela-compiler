@@ -7,3 +7,5 @@ __pycache__/
 /target/
 **/build/
 node_modules/
+# The native host's compiled code, kept beside a build it loads (runtime/native cache.rs)
+.native/

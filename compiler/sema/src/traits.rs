@@ -636,6 +636,59 @@ pub fn normalize(p: &Program, ty: TyId, in_impl: Option<&ImplDef>) -> TyId {
     resolve_projections(p, ty)
 }
 
+/// `t` with each type a function returns by naming its traits (`Opaque(f, args)`, from
+/// `-> Creature<Coat>`) replaced by the type `f`'s body gives (`hidden`), its generic arguments
+/// substituted: through tuples, ADTs, arrays and runs, and the associated types of such types
+/// (`<impl Creature<C>>::Shape`), which name an impl's type once revealed. A function with no
+/// body in `hidden`, or one whose type is defined by itself (a cycle E0409 refuses), gives the
+/// error type.
+pub fn reveal(p: &Program, hidden: &HashMap<FnId, TyId>, t: TyId) -> TyId {
+    // `open`: the functions whose types are being revealed, to find a cycle.
+    fn go(p: &Program, hidden: &HashMap<FnId, TyId>, t: TyId, open: &mut Vec<FnId>) -> TyId {
+        let types = &p.types;
+        if !types.any(t, &mut |k| matches!(k, TyKind::Opaque(..))) {
+            return t;
+        }
+        let mut rev = |x: TyId| go(p, hidden, x, open);
+        match types.kind(t) {
+            TyKind::Opaque(f, args) => {
+                let Some(&h) = hidden.get(f) else { return types.error };
+                // The arguments first, so what's left to reveal is `f`'s own.
+                let args: Vec<TyId> = args.iter().map(|&x| rev(x)).collect();
+                if open.contains(f) {
+                    return types.error;
+                }
+                let subst = Subst::from_pairs(&p.fn_all_generics(*f), &args);
+                let t = normalize(p, types.subst(h, &subst), None);
+                open.push(*f);
+                let t = go(p, hidden, t, open);
+                open.pop();
+                t
+            }
+            TyKind::Tuple(ts) => {
+                let ts = ts.iter().map(|&x| rev(x)).collect();
+                types.intern(TyKind::Tuple(ts))
+            }
+            TyKind::Adt(a, ts) => {
+                let ts = ts.iter().map(|&x| rev(x)).collect();
+                types.intern(TyKind::Adt(*a, ts))
+            }
+            TyKind::Array(e, n) => types.intern(TyKind::Array(rev(*e), *n)),
+            TyKind::ArrayN(e, n) => types.intern(TyKind::ArrayN(rev(*e), *n)),
+            TyKind::Slice(e) => types.intern(TyKind::Slice(rev(*e))),
+            TyKind::Projection { self_ty, trait_, trait_args, name } => {
+                let self_ty = rev(*self_ty);
+                let trait_args = trait_args.iter().map(|&x| rev(x)).collect();
+                let (trait_, name) = (*trait_, name.clone());
+                let t = types.intern(TyKind::Projection { self_ty, trait_, trait_args, name });
+                rev(normalize(p, t, None))
+            }
+            _ => t,
+        }
+    }
+    go(p, hidden, t, &mut Vec::new())
+}
+
 fn resolve_projections(p: &Program, ty: TyId) -> TyId {
     resolve_projections_in(p, ty, &mut Vec::new())
 }

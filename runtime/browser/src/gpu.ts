@@ -45,6 +45,8 @@ interface RenderParts {
   layout: GPUPipelineLayout;
   vertex: string;
   fragment: string;
+  /** Its colour is drawn over the target's (the manifest's `blend`). */
+  blend: boolean;
   /** By target formats: `colour|depth`, each a format or `none`. */
   variants: Map<string, GPURenderPipeline>;
 }
@@ -77,6 +79,12 @@ function compilationMessages(info: GPUCompilationInfo): string | null {
 /** The key of a render pipeline's variant for these target formats. */
 const targetsKey = (color: GPUTextureFormat | null, depth: GPUTextureFormat | null) => `${color ?? "none"}|${depth ?? "none"}`;
 
+/** Straight alpha, over what's there (the manifest's `blend`). */
+const OVER: GPUBlendState = {
+  color: { srcFactor: "src-alpha", dstFactor: "one-minus-src-alpha", operation: "add" },
+  alpha: { srcFactor: "one", dstFactor: "one-minus-src-alpha", operation: "add" },
+};
+
 function renderDescriptor(
   name: string,
   parts: RenderParts,
@@ -90,7 +98,11 @@ function renderDescriptor(
     // Triangle list, counter-clockwise front faces, no culling (the defaults).
     primitive: { topology: "triangle-list" },
     ...(depth === null ? {} : { depthStencil: { format: depth, depthWriteEnabled: true, depthCompare: "less" } }),
-    fragment: { module: parts.module, entryPoint: parts.fragment, targets: color === null ? [] : [{ format: color }] },
+    fragment: {
+      module: parts.module,
+      entryPoint: parts.fragment,
+      targets: color === null ? [] : [{ format: color, ...(parts.blend ? { blend: OVER } : {}) }],
+    },
   };
 }
 
@@ -180,6 +192,7 @@ async function buildPipeline(device: GPUDevice, p: Pipeline, source: string): Pr
         layout: pipelineLayout,
         vertex: p.vertex_entry,
         fragment: p.fragment_entry,
+        blend: p.blend,
         variants: new Map(),
       };
       // The screen's variant now, so a shader's errors come at load.

@@ -524,6 +524,10 @@ impl<'p> Checker<'p> {
                     ast::VarKind::Borrow => LocalKind::Projection { mutable: false },
                 };
                 let id = self.declare_local(&name.name, ty, lk, name.span);
+                if *kind == ast::VarKind::Var {
+                    let kw = Span::new(s.span.file, s.span.start, s.span.start + 3);
+                    self.locals[id.index()].keyword = Some(kw);
+                }
                 let pat = Pat { ty, kind: PatKind::Bind(id), span: name.span };
                 StmtKind::Bind { pat, init, else_: None }
             }

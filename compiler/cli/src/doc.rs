@@ -80,12 +80,36 @@ pub fn run(args: &[String]) -> ExitCode {
             return ExitCode::SUCCESS;
         }
     }
+    // The built-in functions: all of them, or one.
+    let builtins = wrela_driver::builtins();
+    if q == ["builtins"] {
+        println!("the built-in functions (no import; most work on scalars and vectors alike):");
+        for (name, arity, method) in &builtins {
+            let args = ["x", "y", "z"][..(*arity).min(3)].join(", ");
+            if *method {
+                println!("  x.{name}({})", ["", "y", "y, z"][arity.saturating_sub(1).min(2)]);
+            } else {
+                println!("  {name}({args})");
+            }
+        }
+        return ExitCode::SUCCESS;
+    }
+    if q.len() == 1
+        && let Some((name, arity, _)) = builtins.iter().find(|b| b.0 == q[0])
+    {
+        println!(
+            "{name}: a built-in function of {arity} argument{} (language.md §4; `wrela doc builtins` lists them all)",
+            wrela_diag::plural(*arity)
+        );
+        return ExitCode::SUCCESS;
+    }
     // A module, or std's list of them.
     if q == ["std"] {
         println!("std's modules:");
         for m in index.modules.iter().filter(|m| m.path[0] == "std") {
             println!("  {:<20} {}", m.path.join("::"), m.summary);
         }
+        println!("  (and the built-in functions: `wrela doc builtins`)");
         return ExitCode::SUCCESS;
     }
     if let Some(m) = index.modules.iter().find(|m| m.path == q) {
@@ -169,6 +193,22 @@ fn build_index(dir: Option<&Path>) -> Result<Index, String> {
             let text = std::fs::read_to_string(&f.path)
                 .map_err(|e| format!("can't read `{}`: {e}", f.path.display()))?;
             sources.push((f.module, f.display, text));
+        }
+        // The packages it depends on, each module under its package's name (`engine::creature`).
+        if let Ok(text) = std::fs::read_to_string(dir.join("wrela.toml"))
+            && let Ok(m) = wrela_driver::manifest::parse(FileId(0), &text)
+        {
+            for dep in m.deps {
+                let Ok(files) = wrela_driver::package::find_files(&dir.join(&dep.path)) else {
+                    continue;
+                };
+                for f in files {
+                    let Ok(text) = std::fs::read_to_string(&f.path) else { continue };
+                    let mut module = vec![dep.name.clone()];
+                    module.extend(f.module);
+                    sources.push((module, format!("[{}] {}", dep.name, f.display), text));
+                }
+            }
         }
     }
     let sources: Vec<Source> = sources
@@ -326,14 +366,22 @@ fn struct_signature(s: &Source, item: &ast::Item, st: &ast::StructDecl) -> Strin
     let all = text(s, item.span);
     let Some(open) = all.find('{') else { return all };
     let mut out = all[..open].trim_end().to_string();
-    let public: Vec<String> =
-        st.fields.iter().filter(|f| f.vis.is_some()).map(|f| text(s, f.span)).collect();
+    // Each public field with the doc comment above it.
+    let public: Vec<(Vec<&str>, String)> = st
+        .fields
+        .iter()
+        .filter(|f| f.vis.is_some())
+        .map(|f| (doc_comments(s, f.span.start), text(s, f.span)))
+        .collect();
     let hidden = st.fields.len() - public.len();
     if public.is_empty() && hidden == 0 {
         return all;
     }
     out.push_str(" {\n");
-    for f in &public {
+    for (doc, f) in &public {
+        for d in doc {
+            out.push_str(&format!("    {}\n", d.trim_end()));
+        }
         out.push_str(&format!("    {f},\n"));
     }
     if hidden > 0 {
@@ -386,8 +434,8 @@ fn elide(s: &Source, span: Span, holes: &[Span]) -> String {
     out
 }
 
-/// The `///` lines just above `start` (attributes may come between), without their `///`.
-fn doc_before(s: &Source, start: u32) -> String {
+/// The `///` comments just above `start` (attributes may come between), as they're written.
+fn doc_comments(s: &Source, start: u32) -> Vec<&str> {
     let mut lines = Vec::new();
     let mut end = start as usize;
     let before = s.parsed.comments.iter().rev().filter(|c| (c.span.end as usize) <= start as usize);
@@ -397,11 +445,22 @@ fn doc_before(s: &Source, start: u32) -> String {
         if !c.doc || !c.own_line || !gap_ok {
             break;
         }
-        let t = c.text.trim_start_matches("///");
-        lines.push(t.strip_prefix(' ').unwrap_or(t).to_string());
+        lines.push(c.text.as_str());
         end = c.span.start as usize;
     }
     lines.reverse();
+    lines
+}
+
+/// The `///` lines just above `start` (attributes may come between), without their `///`.
+fn doc_before(s: &Source, start: u32) -> String {
+    let lines: Vec<&str> = doc_comments(s, start)
+        .into_iter()
+        .map(|c| {
+            let t = c.trim_start_matches("///");
+            t.strip_prefix(' ').unwrap_or(t)
+        })
+        .collect();
     lines.join("\n")
 }
 

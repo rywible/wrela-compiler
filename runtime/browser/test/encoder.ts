@@ -134,6 +134,12 @@ export class Encoder {
     return this.#command(Opcode.Fetch, [request, u.length], pad(u));
   }
 
+  post(request: number, url: string, body: Uint8Array): this {
+    const u = utf8(url);
+    const bytes = new Uint8Array([...pad(u), ...pad(body)]);
+    return this.#command(Opcode.Post, [request, u.length, body.length], bytes);
+  }
+
   log(text: string): this {
     const t = utf8(text);
     return this.#command(Opcode.Log, [t.length], pad(t));

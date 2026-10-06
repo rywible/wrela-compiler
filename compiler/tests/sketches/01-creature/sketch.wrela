@@ -4,7 +4,7 @@
 // sketch is noted where it's made ("Changed:"), with its reason; main.wrela is the program
 // around it, and sketches.rs tests it.
 //
-// Layers (D-050): `std::` is the stdlib; `engine::` (compiler/tests/sketches/engine) is the
+// Layers (D-050): `std::` is the stdlib; `engine::` (the top-level `engine/` package) is the
 // engine; the rest is the game.
 
 use engine::acoustics::{

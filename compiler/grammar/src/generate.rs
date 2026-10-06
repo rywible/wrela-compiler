@@ -212,10 +212,6 @@ pub(crate) fn is_word(k: TokenKind) -> bool {
     ) || k.is_keyword()
 }
 
-pub(crate) fn is_number(k: TokenKind) -> bool {
-    matches!(k, TokenKind::Int | TokenKind::Float | TokenKind::Suffixed)
-}
-
 /// Whether `a` then `b`, written with nothing between them, lex as exactly those two tokens.
 /// An f-string's pieces are lexed where they'd be (L22): what's around them opens and closes
 /// the holes they need.
@@ -311,7 +307,7 @@ pub fn no_glue_pairs() -> HashSet<(TokenKind, TokenKind)> {
         for (b, b_texts) in &kinds {
             // The cheap tests first: the last one lexes every pair of texts.
             if (is_word(*a) && is_word(*b))
-                || (is_number(*a) && *b == TokenKind::Dot)
+                || (a.is_number() && *b == TokenKind::Dot)
                 || a_texts.iter().any(|x| b_texts.iter().any(|y| !lexes_apart(*a, x, *b, y)))
             {
                 out.insert((*a, *b));

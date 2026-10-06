@@ -1,5 +1,6 @@
 //! Walking IR code: the statements of a block and its nested blocks, the values an expression
-//! reads and the places it touches, and the function a call calls.
+//! reads and the places it touches, the function a call calls, and the functions a function
+//! reaches.
 //!
 //! Every match here names every variant, so a new statement or expression has to say what it
 //! uses here, once, rather than in each pass that walks code.
@@ -397,5 +398,24 @@ pub fn calls(b: &Block) -> Vec<FuncId> {
             out.push(g);
         }
     });
+    out
+}
+
+/// Every function `from` reaches through calls, `from` first, each once, in the order a
+/// depth-first walk comes to them. The walk doesn't look inside `stop`'s functions: they're
+/// reached, but not what they call.
+pub fn reachable(m: &Module, from: FuncId, stop: &[FuncId]) -> Vec<FuncId> {
+    let mut seen = vec![false; m.functions.len()];
+    let mut stack = vec![from];
+    let mut out = Vec::new();
+    while let Some(f) = stack.pop() {
+        if std::mem::replace(&mut seen[f.index()], true) {
+            continue;
+        }
+        out.push(f);
+        if !stop.contains(&f) {
+            stack.extend(calls(&m.functions[f.index()].body));
+        }
+    }
     out
 }

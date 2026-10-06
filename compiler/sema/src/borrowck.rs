@@ -29,7 +29,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use wrela_diag::{Diagnostic, Span, codes};
 
 /// Whether a borrow struct has a `mut` field, in it or in a borrow struct inside it.
-fn has_mut_field(p: &Program, t: crate::ty::TyId) -> bool {
+pub(crate) fn has_mut_field(p: &Program, t: crate::ty::TyId) -> bool {
     let crate::ty::TyKind::Adt(a, args) = p.types.kind(t) else { return false };
     p.adt_fields(*a, None)
         .iter()
@@ -37,29 +37,92 @@ fn has_mut_field(p: &Program, t: crate::ty::TyId) -> bool {
         .any(|(f, ft)| f.mode == RetMode::Mut || (p.is_borrow_struct(ft) && has_mut_field(p, ft)))
 }
 
-/// Checks every function and closure body of `body`. A body is checked before the closures it
-/// makes, so a closure's body knows what the projections it captures alias.
+/// Checks every function and closure body of `body`.
 pub fn check(p: &Program, body: &Body) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    run_bodies(p, body, None, &mut |diags, _| out.extend(diags));
+    out.extend(unused_locals(p, body));
+    out.extend(unchanged_vars(body));
+    out
+}
+
+/// Runs the checker on every function and closure body of `body`, giving `each` what each run
+/// finds: its diagnostics, and the state before the line `asked` about ([`state_at`]), if the
+/// body has it. A body is checked before the closures it makes, so a closure's body knows what
+/// the projections it captures alias.
+fn run_bodies(
+    p: &Program,
+    body: &Body,
+    asked: Option<(wrela_diag::FileId, u32, u32)>,
+    each: &mut dyn FnMut(Vec<Diagnostic>, Option<(u32, StateView)>),
+) {
     let holders: Vec<bool> = body
         .locals
         .iter()
         .map(|d| d.kind.is_projection() || is_callable(&p.types, d.ty) || p.is_borrow_struct(d.ty))
         .collect();
-    let mut out = Vec::new();
     let mut captured = Captured::new();
     for (i, f) in body.fns.iter().enumerate() {
         let closure = (i > 0).then(|| ClosureId(i as u32 - 1));
-        let (diags, made) = FnCheck::new(p, body, f, closure, &holders, &captured).run();
-        out.extend(diags);
+        let mut c = FnCheck::new(p, body, f, closure, &holders, &captured);
+        c.asked = asked;
+        let (diags, made, probed) = c.run();
         for (key, t) in made {
             let ts = captured.entry(key).or_default();
             if !ts.iter().any(|x| x.place == t.place) {
                 ts.push(t);
             }
         }
+        each(diags, probed);
     }
-    out.extend(unused_locals(p, body));
-    out
+}
+
+/// What the memory checker knows before a line runs, for tools (`wrela query`): the loans live
+/// there and the places moved out of.
+#[derive(Clone, Debug, Default)]
+pub struct StateView {
+    pub loans: Vec<LoanView>,
+    pub moved: Vec<MovedView>,
+}
+
+#[derive(Clone, Debug)]
+pub struct LoanView {
+    /// The place lent, as diagnostics name it (`w.pos`).
+    pub place: String,
+    pub mutable: bool,
+    /// What holds the loan: `` `x` ``, `the result of `f``, `the `match``.
+    pub holder: String,
+    /// Where the loan is made.
+    pub span: Span,
+}
+
+#[derive(Clone, Debug)]
+pub struct MovedView {
+    pub place: String,
+    /// Moved on some paths here, not all.
+    pub maybe: bool,
+    /// Where it's moved.
+    pub span: Span,
+}
+
+/// [`StateView`] before the first statement of `body` (its function's or a closure's) to run
+/// that starts in `file` between offsets `lo` and `hi` (a line): `None` if none does.
+pub fn state_at(
+    p: &Program,
+    body: &Body,
+    file: wrela_diag::FileId,
+    lo: u32,
+    hi: u32,
+) -> Option<StateView> {
+    let mut best: Option<(u32, StateView)> = None;
+    run_bodies(p, body, Some((file, lo, hi)), &mut |_, probed| {
+        if let Some((start, view)) = probed
+            && best.as_ref().is_none_or(|(b, _)| start < *b)
+        {
+            best = Some((start, view));
+        }
+    });
+    best.map(|(_, v)| v)
 }
 
 /// For a closure and a projection it captures: what the projection aliases where the closure
@@ -417,6 +480,10 @@ struct FnCheck<'a> {
     captured: &'a Captured,
     /// What the projections captured by the closures this body makes alias.
     made: Vec<CapturedTarget>,
+    /// For [`state_at`]: the line asked about (its file, and its offsets), and the state before
+    /// its first statement (where that statement starts).
+    asked: Option<(wrela_diag::FileId, u32, u32)>,
+    probed: Option<(u32, State)>,
 }
 
 impl<'a> FnCheck<'a> {
@@ -444,10 +511,12 @@ impl<'a> FnCheck<'a> {
             reported_at: Vec::new(),
             captured,
             made: Vec::new(),
+            asked: None,
+            probed: None,
         }
     }
 
-    fn run(mut self) -> (Vec<Diagnostic>, Vec<CapturedTarget>) {
+    fn run(mut self) -> (Vec<Diagnostic>, Vec<CapturedTarget>, Option<(u32, StateView)>) {
         let reachable = self.reachable();
         self.liveness(&reachable);
         // Forward: each reachable block's state on entry, to a fixpoint.
@@ -497,7 +566,41 @@ impl<'a> FnCheck<'a> {
                 self.transfer_block(BlockId(i as u32), st);
             }
         }
-        (self.diags, self.made)
+        let probed = self.probed.take().map(|(start, st)| (start, self.view(&st)));
+        (self.diags, self.made, probed)
+    }
+
+    /// A state as [`state_at`] shows it.
+    fn view(&self, st: &State) -> StateView {
+        let loans = st
+            .loans
+            .iter()
+            .map(|i| {
+                let l = &self.loans[i];
+                LoanView {
+                    place: self.describe(&l.place),
+                    mutable: l.mutable && !l.reserved,
+                    holder: self.holder_text(l.holder),
+                    span: l.span,
+                }
+            })
+            .collect();
+        let moved = st
+            .moves
+            .iter()
+            .map(|m| MovedView { place: self.describe(&m.place), maybe: m.maybe, span: m.span })
+            .collect();
+        StateView { loans, moved }
+    }
+
+    /// For [`state_at`]: keeps `st` if the statement at `span` is the first on the line asked
+    /// about to run (the blocks are in the order they're written, and so are their statements).
+    fn probe(&mut self, st: &State, span: Span) {
+        let Some((file, lo, hi)) = self.asked else { return };
+        if self.emit && span.file == file && (lo..hi).contains(&span.start) && self.probed.is_none()
+        {
+            self.probed = Some((span.start, st.clone()));
+        }
     }
 
     /// The reachable blocks, in reverse postorder from the entry.
@@ -676,10 +779,12 @@ impl<'a> FnCheck<'a> {
     fn transfer_block(&mut self, b: BlockId, mut st: State) -> State {
         let block = self.f.block(b);
         for (i, s) in block.stmts.iter().enumerate() {
+            self.probe(&st, s.span);
             self.statement(&mut st, (b, i), s);
             self.end_loans(&mut st, (b, i));
         }
         let at = (b, block.stmts.len());
+        self.probe(&st, block.term.span);
         match &block.term.kind {
             TerminatorKind::If { cond, .. } => self.operand(&mut st, at, cond),
             TerminatorKind::Return(Some(o)) => {
@@ -1842,8 +1947,8 @@ fn rvalue_places(body: &Body, r: &Rvalue, add: &mut dyn FnMut(&Place, bool)) {
             }
         }
         Rvalue::Discriminant(p) | Rvalue::Len(p) => add(p, false),
-        Rvalue::Call(c) => {
-            for a in &c.args {
+        Rvalue::Call(Call { args, .. }) | Rvalue::BorrowStruct { fields: args, .. } => {
+            for a in args {
                 match a {
                     Arg::Borrow(p, _) => add(p, false),
                     Arg::Mut(p, _) => add(p, true),
@@ -1882,15 +1987,77 @@ fn rvalue_places(body: &Body, r: &Rvalue, add: &mut dyn FnMut(&Place, bool)) {
         | Rvalue::Text(_)
         | Rvalue::Embed(_)
         | Rvalue::ConstParam(_) => {}
-        Rvalue::BorrowStruct { fields, .. } => {
-            for a in fields {
-                match a {
-                    Arg::Borrow(p, _) => add(p, false),
-                    Arg::Mut(p, _) => add(p, true),
-                    Arg::Take(o) => operand(o, add),
+    }
+}
+
+/// W0006: a `var` that never changes after it's bound: nothing assigns it again, writes
+/// through it, lends it `mut`, or captures it to write. It's a `let`.
+fn unchanged_vars(body: &Body) -> Vec<Diagnostic> {
+    let n = body.locals.len();
+    let mut changed = vec![false; n];
+    // Assignments of a whole local: its binding is one.
+    let mut whole = vec![0u32; n];
+    let mark = |p: &Place, changed: &mut Vec<bool>| changed[p.local.index()] = true;
+    for f in &body.fns {
+        for b in &f.blocks {
+            for s in &b.stmts {
+                match &s.kind {
+                    StatementKind::Assign(place, r) => {
+                        if place.proj.is_empty() {
+                            whole[place.local.index()] += 1;
+                        } else {
+                            mark(place, &mut changed);
+                        }
+                        rvalue_writes(r, &mut |p| mark(p, &mut changed));
+                    }
+                    StatementKind::Eval(r) => rvalue_writes(r, &mut |p| mark(p, &mut changed)),
+                    StatementKind::Bind { place, mutable: true, .. } => mark(place, &mut changed),
+                    _ => {}
                 }
             }
         }
+    }
+    for c in &body.closures {
+        for &(l, writes) in &c.captures {
+            if writes {
+                changed[l.index()] = true;
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for (i, d) in body.locals.iter().enumerate() {
+        let var =
+            matches!(d.kind, LocalKind::User(crate::thir::LocalKind::Owned { mutable: true }));
+        if !var || changed[i] || whole[i] > 1 || d.name.starts_with('_') {
+            continue;
+        }
+        let Some(kw) = d.keyword else { continue };
+        out.push(
+            Diagnostic::new(
+                codes::W0006,
+                d.span,
+                format!("`{}` is a `var`, but it never changes", d.name),
+            )
+            .with_note("`let` owns a value that stays as it is; `var` says it will change (§6.3)")
+            .with_fix("make it a `let`", kw, "let"),
+        );
+    }
+    out
+}
+
+/// Calls `write` on each place `r` lends `mut` or hands to the GPU (which may write it).
+fn rvalue_writes(r: &Rvalue, write: &mut impl FnMut(&Place)) {
+    match r {
+        Rvalue::Call(Call { args, .. }) | Rvalue::BorrowStruct { fields: args, .. } => {
+            for a in args {
+                if let Arg::Mut(p, _) = a {
+                    write(p);
+                }
+            }
+        }
+        Rvalue::Dispatch(d) => d.args.iter().for_each(|(_, p, _)| write(p)),
+        Rvalue::Draw(d) => d.args.iter().for_each(|(_, _, p, _)| write(p)),
+        _ => {}
     }
 }
 

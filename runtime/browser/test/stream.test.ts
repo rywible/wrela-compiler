@@ -32,6 +32,7 @@ test("the test encoder writes the vectors' golden batch", () => {
     .storageWrite(3, "saves/a", Uint8Array.of(1, 2, 3, 4, 5))
     .fetch(4, "data/level.bin")
     .log("frame 3: 2 grazers, é")
+    .post(5, "studio/edit", Uint8Array.of(123, 125))
     .finish();
   expect(Buffer.from(batch).toString("hex")).toBe(golden);
   expect(NONE).toBe(0xffffffff);

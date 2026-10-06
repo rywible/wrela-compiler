@@ -714,6 +714,10 @@ impl<'c, 'a> Fl<'c, 'a> {
     /// A table's value (`mir::Rvalue::Const`): on the CPU its constant data, read in place; GPU
     /// code builds it.
     fn table(&mut self, c: ConstId) -> Repr {
+        // A lifted build's constant of a lifted package is built from its literals (§22).
+        if let Some(v) = self.lifted_const(c) {
+            return Repr::Value(v);
+        }
         if !self.is_gpu() {
             return match self.cx.const_data(self.mb, c) {
                 Some(d) => Repr::Place(ir::Place::root(ir::PlaceRoot::Data(d))),
@@ -1197,6 +1201,9 @@ impl<'c, 'a> Fl<'c, 'a> {
     pub fn operand(&mut self, o: &mir::Operand) -> Option<ir::ValueId> {
         match &o.kind {
             OperandKind::Const(l) => {
+                if let Some(i) = self.lifted_index(o) {
+                    return self.lifted(i);
+                }
                 let ty = self.ty(o.ty, o.span)?;
                 let c = self.lit(*l, ty)?;
                 Some(self.value(ty, ir::Expr::Const(c)))
@@ -1208,6 +1215,18 @@ impl<'c, 'a> Fl<'c, 'a> {
                 v
             }
         }
+    }
+
+    /// The index of the lifted literal an operand is, in a lifted build (§22): an `f32`
+    /// literal written in a lifted package.
+    fn lifted_index(&self, o: &mir::Operand) -> Option<u32> {
+        let lift = self.cx.lift?;
+        let OperandKind::Const(_) = o.kind else { return None };
+        let f32_ty = self.cx.checked.program.types.f32;
+        if o.ty != f32_ty {
+            return None;
+        }
+        lift.of(o.span)
     }
 
     fn lit(&mut self, l: Lit, ty: ir::TypeId) -> Option<ir::Const> {
@@ -1491,11 +1510,12 @@ impl<'c, 'a> Fl<'c, 'a> {
         span: Span,
     ) -> Option<ir::ValueId> {
         let t = self.ty(ty, span)?;
-        let zero = match &x.kind {
-            OperandKind::Const(Lit::Int(0) | Lit::Bool(false)) => true,
-            OperandKind::Const(Lit::Float(f, _)) => *f == 0.0 && f.is_sign_positive(),
-            _ => false,
-        };
+        let zero = self.lifted_index(x).is_none()
+            && match &x.kind {
+                OperandKind::Const(Lit::Int(0) | Lit::Bool(false)) => true,
+                OperandKind::Const(Lit::Float(f, _)) => *f == 0.0 && f.is_sign_positive(),
+                _ => false,
+            };
         if zero {
             return Some(self.value(t, ir::Expr::Zero(t)));
         }
@@ -1677,7 +1697,7 @@ impl<'c, 'a> Fl<'c, 'a> {
                 let substs: Vec<TyId> = program
                     .fn_all_generics(func)
                     .iter()
-                    .map(|g| self.cx.reveal(subst.get(*g).unwrap_or(program.types.error)))
+                    .map(|g| self.cx.checked.reveal(subst.get(*g).unwrap_or(program.types.error)))
                     .collect();
                 if program.func(func).attrs.intrinsic {
                     return crate::gpu::intrinsic(self, func, &substs, c, ty);

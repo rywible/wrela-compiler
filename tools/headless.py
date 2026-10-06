@@ -3,6 +3,11 @@
 
     tools/headless.py <page-dir relative to the repo root> [hash] [timeout-seconds]
     tools/headless.py runtime/browser/tests/hello-field '#run' 120
+    tools/headless.py --url <url> <page-dir> [timeout-seconds]
+
+With --url, another server already serves the page (the studio server, which answers the lens's
+posts): Chrome opens the URL, and the run is done when the page's `results/DONE` file appears
+(the page-dir may then be any directory).
 
 The page finishes by PUTting `results/DONE`: the body `ok` means it passed, anything else is the
 failure message. Its other PUTs land in `<page-dir>/results/`, and its console output (exceptions
@@ -155,15 +160,24 @@ def interrupt(signum, frame):
 
 
 def main(argv):
-    if not 2 <= len(argv) <= 4:
-        fail(2, "usage: tools/headless.py <page-dir> [hash] [timeout-seconds]")
-    page = os.path.normpath(argv[1]).strip("/")
-    fragment = argv[2] if len(argv) > 2 else "#run"
+    url = None
+    if len(argv) > 1 and argv[1] == "--url":
+        if not 4 <= len(argv) <= 5:
+            fail(2, "usage: tools/headless.py --url <url> <page-dir> [timeout-seconds]")
+        url, page_dir = argv[2], os.path.abspath(argv[3])
+        page = page_dir
+        timeout_arg = argv[4] if len(argv) > 4 else None
+    else:
+        if not 2 <= len(argv) <= 4:
+            fail(2, "usage: tools/headless.py <page-dir> [hash] [timeout-seconds]")
+        page = os.path.normpath(argv[1]).strip("/")
+        fragment = argv[2] if len(argv) > 2 else "#run"
+        timeout_arg = argv[3] if len(argv) > 3 else None
+        page_dir = os.path.join(serve.ROOT, page)
     try:
-        timeout = float(argv[3]) if len(argv) > 3 else 120.0
+        timeout = float(timeout_arg) if timeout_arg else 120.0
     except ValueError:
-        fail(2, f"timeout must be a number of seconds, not {argv[3]!r}")
-    page_dir = os.path.join(serve.ROOT, page)
+        fail(2, f"timeout must be a number of seconds, not {timeout_arg!r}")
     if not os.path.isdir(page_dir):
         fail(2, f"no page directory at {page_dir}")
     if not os.access(CHROME, os.X_OK):
@@ -182,8 +196,11 @@ def main(argv):
             pass
 
     done = []
-    server = start_server(page, done)
-    url = f"http://127.0.0.1:{server.server_address[1]}/{page}/{fragment}"
+    server = None
+    if url is None:
+        server = start_server(page, done)
+        url = f"http://127.0.0.1:{server.server_address[1]}/{page}/{fragment}"
+    done_file = os.path.join(results, "DONE")
     profile = tempfile.mkdtemp(prefix="wrela-chrome.")
     chrome_log = os.path.join(profile, "chrome.log")
     start = time.monotonic()
@@ -215,6 +232,9 @@ def main(argv):
                 start_new_session=True,
             )
         while True:
+            if server is None and not done and os.path.exists(done_file):
+                with open(done_file, errors="replace") as f:
+                    done.append(f.read().strip())
             if done:
                 status, reason = (0, None) if done[0] == "ok" else (1, f"page failed: {done[0]}")
                 break
@@ -230,7 +250,8 @@ def main(argv):
     finally:
         if proc is not None:
             stop(proc)
-        server.shutdown()
+        if server is not None:
+            server.shutdown()
         lines = extract_console(chrome_log, os.path.join(results, "console.log"))
         shutil.rmtree(profile, ignore_errors=True)
         os.close(lock)

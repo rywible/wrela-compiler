@@ -3,6 +3,8 @@
 
 import { AUDIO_QUANTUM, AUDIO_SAMPLE_RATE } from "./abi.gen.ts";
 import { errorMessage } from "./errors.ts";
+import { InputRing } from "./input.ts";
+import { listen } from "./listen.ts";
 import { type FromWorker, type ToWorker, VOICE_PROCESSOR, type VoiceOptions } from "./messages.ts";
 import { asksForTest, isLoopback, parseTestParams, putResult, type TestParams } from "./testmode.ts";
 
@@ -87,6 +89,23 @@ async function playVoice(voice: VoiceOptions, test: TestParams | null, worker: W
   }
 }
 
+/** The clock input events are stamped with, which the worker shares: ms since 1970. */
+const now = () => performance.timeOrigin + performance.now();
+
+/** Test mode, `latency`: `n` pointer moves sent through the DOM at random times over `ms`. */
+async function sendLatencyEvents(canvas: HTMLCanvasElement, n: number, ms: number): Promise<void> {
+  const r = canvas.getBoundingClientRect();
+  const times = Array.from({ length: n }, () => Math.random() * ms).sort((a, b) => a - b);
+  const start = performance.now();
+  for (const t of times) {
+    const wait = start + t - performance.now();
+    if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
+    const x = r.left + Math.random() * r.width;
+    const y = r.top + Math.random() * r.height;
+    canvas.dispatchEvent(new PointerEvent("pointermove", { clientX: x, clientY: y, bubbles: true }));
+  }
+}
+
 function start(): void {
   const testing = isLoopback(location.hostname) && asksForTest(location.hash);
   try {
@@ -105,10 +124,16 @@ function start(): void {
     }
     const workerUrl = "worker.js";
     const worker = new Worker(new URL(workerUrl, import.meta.url), { type: "module", name: "wrela render" });
+    const ring = InputRing.create();
     worker.onmessage = (event: MessageEvent<FromWorker>) => {
       const msg = event.data;
       if (msg.type === "audio") {
         playVoice(msg.voice, test, worker).catch((e: unknown) => failEarly(e, testing));
+      } else if (msg.type === "latency-start") {
+        sendLatencyEvents(canvas, test?.latency ?? 0, msg.ms).then(
+          () => worker.postMessage({ type: "latency-sent" } satisfies ToWorker),
+          (e: unknown) => failEarly(e, testing),
+        );
       } else {
         showFatal(msg.message);
       }
@@ -117,13 +142,19 @@ function start(): void {
       event.preventDefault();
       failEarly(new Error(`the render worker failed: ${event.message || "it couldn't start"}`), testing);
     };
+    // The canvas keeps its size in device pixels for input positions; the worker owns its
+    // drawing.
     const offscreen = canvas.transferControlToOffscreen();
     const { width, height } = devicePixels(canvas);
-    const msg: ToWorker = { type: "start", canvas: offscreen, base: document.baseURI, width, height, test };
+    const sized = { width, height };
+    listen(canvas, ring, now, () => sized);
+    const msg: ToWorker = { type: "start", canvas: offscreen, base: document.baseURI, width, height, test, input: ring.buffer };
     worker.postMessage(msg, [offscreen]);
     if (!test) {
-      const resize = (entry?: ResizeObserverEntry) =>
-        worker.postMessage({ type: "resize", ...devicePixels(canvas, entry) } satisfies ToWorker);
+      const resize = (entry?: ResizeObserverEntry) => {
+        Object.assign(sized, devicePixels(canvas, entry));
+        worker.postMessage({ type: "resize", ...sized } satisfies ToWorker);
+      };
       const observer = new ResizeObserver(([entry]) => resize(entry));
       try {
         // The size in device pixels also changes with the pixel ratio alone (a move to

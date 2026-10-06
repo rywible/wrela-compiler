@@ -44,6 +44,8 @@ pub(crate) struct Helpers {
     pub limit: u32,
     /// The import `wrela.audio(task, context)`, in a module that starts a voice.
     pub audio: u32,
+    /// The import `wrela.input(ptr, cap) -> i32`, in a module that reads input.
+    pub input: u32,
     /// The type of a task function ([`ir::MemOp::RunTask`]): (context, chunk) -> ().
     pub task_type: u32,
     /// `flush()`: submits the pending commands, if any.
@@ -198,6 +200,12 @@ pub fn emit_with(m: &ir::Module, options: Options) -> Result<Emitted, String> {
         let ty = EntityType::Function(submit_ty);
         imports.import(wrela_abi::IMPORT_MODULE, wrela_abi::IMPORT_AUDIO, ty);
     }
+    let input_ty = types.get(vec![ValType::I32, ValType::I32], vec![ValType::I32]);
+    let input = imports.len();
+    if m.input {
+        let ty = EntityType::Function(input_ty);
+        imports.import(wrela_abi::IMPORT_MODULE, wrela_abi::IMPORT_INPUT, ty);
+    }
     let nimports = imports.len();
     // The memory, shared: workers' instances get the same one (wrela_abi::memory).
     let memory_type = MemoryType {
@@ -220,6 +228,7 @@ pub fn emit_with(m: &ir::Module, options: Options) -> Result<Emitted, String> {
         request_take: 2,
         limit: 3,
         audio: 4,
+        input,
         flush: nimports,
         reserve: nimports + 1,
         write: nimports + 2,

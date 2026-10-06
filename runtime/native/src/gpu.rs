@@ -98,6 +98,8 @@ enum Kind {
         pipeline_layout: wgpu::PipelineLayout,
         vertex: String,
         fragment: String,
+        /// Its colour is drawn over the target's (the manifest's `blend`).
+        blend: bool,
         variants: HashMap<Targets, wgpu::RenderPipeline>,
     },
 }
@@ -410,12 +412,13 @@ impl Gpu {
                     cache: None,
                 },
             )),
-            Stage::Render { vertex_entry, fragment_entry } => {
+            Stage::Render { vertex_entry, fragment_entry, blend } => {
                 let mut kind = Kind::Render {
                     module,
                     pipeline_layout,
                     vertex: vertex_entry.clone(),
                     fragment: fragment_entry.clone(),
+                    blend: *blend,
                     variants: HashMap::new(),
                 };
                 // The screen's variant now, so a shader's errors come at load.
@@ -1088,6 +1091,7 @@ impl Executor for Gpu {
             | Command::StorageRead { .. }
             | Command::StorageWrite { .. }
             | Command::Fetch { .. }
+            | Command::Post { .. }
             | Command::Log { .. } => {}
         }
         Ok(())
@@ -1110,15 +1114,28 @@ impl Executor for Gpu {
 
 /// Makes a render pipeline's variant for `targets`, if it isn't made yet.
 fn render_variant(device: &wgpu::Device, name: &str, kind: &mut Kind, targets: Targets) {
-    let Kind::Render { module, pipeline_layout, vertex, fragment, variants } = kind else {
+    let Kind::Render { module, pipeline_layout, vertex, fragment, blend, variants } = kind else {
         return;
     };
     if variants.contains_key(&targets) {
         return;
     }
+    // Straight alpha, over what's there (the manifest's `blend`).
+    let over = wgpu::BlendState {
+        color: wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::SrcAlpha,
+            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+            operation: wgpu::BlendOperation::Add,
+        },
+        alpha: wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::One,
+            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+            operation: wgpu::BlendOperation::Add,
+        },
+    };
     let color = targets.0.map(|format| wgpu::ColorTargetState {
         format,
-        blend: None,
+        blend: blend.then_some(over),
         write_mask: wgpu::ColorWrites::ALL,
     });
     let depth_stencil = targets.1.map(|format| wgpu::DepthStencilState {

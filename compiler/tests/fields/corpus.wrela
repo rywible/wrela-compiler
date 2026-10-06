@@ -5,7 +5,8 @@
 // `gradient` and `interval` come from the trait's defaults.
 use grazer::{Grazer, grazer}
 use std::field::{
-    Lipschitz, Surface, ellipsoid, fbm, half_space, hash_u32, round_cone, sphere, value_noise,
+    Lipschitz, Surface, ellipsoid, fbm, half_space, hash_u32, oval, round_cone, sphere, tube,
+    value_noise,
 }
 use std::stage::Tape
 
@@ -157,12 +158,72 @@ impl Surface for Cells {
     }
 }
 
+/// Table reads at indices that depend on the input, as a loft's radii are read: a radius per
+/// band along z and angle around it, interpolated, with a `u32` index and an `i32` one.
+pub struct Table: Copy + GpuData {
+    pub radii: [f32; 48],
+    pub bands: [f32; 6],
+}
+
+impl Surface for Table {
+    fn distance(self, p: vec3) -> f32 {
+        let ts = saturate(p.z * 0.5 + 0.5) * 5.0
+        let i0 = min(u32(ts), 4)
+        let f = saturate(ts - f32(i0))
+        let a = fract(atan2(p.y, p.x) / 6.2831855) * 8.0
+        let j0 = min(u32(a), 7)
+        let g = saturate(a - f32(j0))
+        let j1 = (j0 + 1) % 8
+        let near = mix(self.radii[i0 * 8 + j0], self.radii[i0 * 8 + j1], g)
+        let far = mix(self.radii[i0 * 8 + 8 + j0], self.radii[i0 * 8 + 8 + j1], g)
+        let band = self.bands[clamp(i32(floor(p.z * 3.0)) + 3, 0, 5)]
+        length(vec2(p.x, p.y)) - mix(near, far, f) + band
+    }
+}
+
+/// Powers of ranges that reach 0 (a superellipse's |cos θ|ⁿ): on the CPU, the derived interval's
+/// corners never take a power of a base below 0, which is NaN (a debug build traps it, chosen or
+/// not); on the GPU, a base at 0 (its log -∞) no longer makes the widening's tolerance ∞, and
+/// the interval NaN (it missed a fifth of the samples).
+pub struct Powers: Copy + GpuData {
+    pub n: f32,
+}
+
+impl Surface for Powers {
+    fn distance(self, p: vec3) -> f32 {
+        let x = pow(abs(sin(3.0 * p.x)), self.n)
+        let y = pow(abs(cos(2.0 * p.y)) / 0.9, 1.5)
+        length(p) - 0.5 - 0.1 * x - 0.05 * y + 0.02 * log2(1.0 + abs(p.z))
+    }
+}
+
+pub fn table_() -> Table {
+    var radii = [0.0; 48]
+    for i in 0..48 {
+        radii[i] = 0.4 + 0.15 * sin(f32(i) * 1.7)
+    }
+    Table { radii, bands: [0.0, 0.05, -0.03, 0.02, 0.0, -0.04] }
+}
+
 pub fn sphere_() -> Lipschitz {
     sphere(0.7)
 }
 
 pub fn ellipsoid_() -> Lipschitz {
     ellipsoid(vec3(0.5, 0.3, 0.8))
+}
+
+/// The ellipsoid's radii as an oval: its distance's gradient stays under 1 inside.
+pub fn oval_() -> Lipschitz {
+    oval(vec3(0.5, 0.3, 0.8))
+}
+
+/// A bent tube that thickens and thins: a leg's shape.
+pub fn tube_() -> Lipschitz {
+    tube(
+        [vec3(0.0, 0.8, 0.0), vec3(0.1, 0.2, 0.15), vec3(-0.1, -0.3, 0.0), vec3(0.0, -0.8, 0.3)],
+        [0.25, 0.12, 0.18, 0.06],
+    )
 }
 
 pub fn cone_() -> Lipschitz {

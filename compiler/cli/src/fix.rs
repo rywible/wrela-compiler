@@ -311,19 +311,17 @@ fn report(out: &Output, made: &[Made], changed: &BTreeMap<PathBuf, String>, json
         unmade += 1;
     }
     let errors = out.diagnostics.iter().filter(|d| d.is_error()).count();
-    let count = |n: usize, one: &str, many: &str| {
-        if n == 1 { format!("1 {one}") } else { format!("{n} {many}") }
-    };
     let head = match (made.len(), unmade, errors) {
         (0, 0, 0) => "nothing to fix".to_string(),
         (0, 0, _) => "nothing a tool can fix".to_string(),
         (0, _, _) => "no fix made".to_string(),
         (n, _, _) => {
-            format!("{} in {}", count(n, "fix", "fixes"), count(changed.len(), "file", "files"))
+            let files = crate::count(changed.len(), "file", "files");
+            format!("{} in {files}", crate::count(n, "fix", "fixes"))
         }
     };
     if errors > 0 {
-        println!("{head}; {} left", count(errors, "error", "errors"));
+        println!("{head}; {} left", crate::count(errors, "error", "errors"));
     } else if made.is_empty() {
         println!("{head}");
     } else {

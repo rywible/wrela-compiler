@@ -1,0 +1,17 @@
+[package]
+name = "wrela-wfont"
+description = "Makes the ui package's fonts: signed-distance-field glyphs, metrics and kerning from a TrueType font"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "wfont"
+path = "src/main.rs"
+
+[dependencies]
+ttf-parser = "0.25"
+
+[lints]
+workspace = true

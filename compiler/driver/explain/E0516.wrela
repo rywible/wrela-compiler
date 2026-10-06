@@ -10,7 +10,7 @@ fn archive(log: take Log) -> u32 {
 }
 
 fn maybe(c: bool) -> u32 {
-    var log = Log { lines: Vec::new() }
+    let log = Log { lines: Vec::new() }
     if c {
         archive(take log)
     } else {
@@ -30,7 +30,7 @@ fn archive(log: take Log) -> u32 {
 }
 
 fn maybe(c: bool) -> u32 {
-    var log = Log { lines: Vec::new() }
+    let log = Log { lines: Vec::new() }
     let n = log.lines.len()
     if c {
         archive(take log)

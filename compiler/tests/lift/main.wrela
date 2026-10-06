@@ -1,0 +1,98 @@
+// Lifted builds (language.md §22): the blob (shapes/blob.wrela), its distance and its parameter
+// gradients on the CPU, and drawn on the GPU, so a test can compare a lifted build with a
+// normal one and change literals while it runs.
+
+use shapes::blob::{AROUND, blob}
+use std::derive::Box3
+use std::field::Surface
+use std::gpu::{ClipPosition, FragCoord, VertexIndex, begin_screen_pass, draw, present}
+use std::lift::{Literal, count, gradient, literal}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    begin_screen_pass(clear: vec4(0.1, 0.1, 0.12, 1.0))
+    draw(cover, side.bind(field: blob(), size: vec2(f32(width), f32(height))), vertices: 3)
+    present()
+}
+
+@vertex
+fn cover(v: VertexIndex) -> ClipPosition {
+    let x = f32(v.index % 2) * 4.0 - 1.0
+    let y = f32(v.index / 2) * 4.0 - 1.0
+    ClipPosition { position: vec4(x, y, 0.0, 1.0) }
+}
+
+/// The field from the side, orthographic, sphere traced: shaded by its gradient.
+@fragment
+fn side<F: Surface>(pixel: FragCoord, field: F, size: vec2) -> vec4 {
+    let uv = pixel.position.xy / size
+    let o = vec3(2.0, 1.2 - uv.y * 1.4, uv.x * 2.0 - 1.0)
+    let dir = vec3(-1.0, 0.0, 0.0)
+    var t = 0.0
+    var hit = false
+    for _ in 0..96 {
+        let d = field.distance(o + dir * t)
+        if d < 0.0005 {
+            hit = true
+            break
+        }
+        t += d * 0.9
+        if t > 4.0 {
+            break
+        }
+    }
+    if !hit {
+        return vec4(0.1, 0.1, 0.12, 1.0)
+    }
+    let n = normalize(field.gradient(o + dir * t))
+    vec4(n * 0.5 + 0.5, 1.0)
+}
+
+/// The blob's distance at a point.
+pub fn distance(x: f32, y: f32, z: f32) -> f32 {
+    blob().distance(vec3(x, y, z))
+}
+
+/// Sample point `i` near the blob (`Box3::sample`, seed 7).
+pub fn sample(i: u32) -> vec3 {
+    AROUND.sample(7, i)
+}
+
+pub fn literals() -> u32 {
+    count()
+}
+
+pub fn value(i: u32) -> f32 {
+    if let Some(l) = literal(i) { l.value() } else { 0.0 }
+}
+
+pub fn set(i: u32, v: f32) {
+    if let Some(l) = literal(i) {
+        l.set(v)
+    }
+}
+
+/// The distance's derivative by literal `i` at a point, derived.
+pub fn derivative(x: f32, y: f32, z: f32, i: u32) -> f32 {
+    let p = vec3(x, y, z)
+    let (_, d) = gradient(|| blob().distance(p), [Literal { index: i }])
+    d[0]
+}
+
+/// The distance's derivatives by literals `i` to `i + 3`, derived together: their sum, to check
+/// several directions in one derivation give each its own.
+pub fn derivatives4(x: f32, y: f32, z: f32, i: u32) -> vec4 {
+    let p = vec3(x, y, z)
+    let which = [
+        Literal { index: i },
+        Literal { index: i + 1 },
+        Literal { index: i + 2 },
+        Literal { index: i + 3 },
+    ]
+    let (_, d) = gradient(|| blob().distance(p), which)
+    vec4(d[0], d[1], d[2], d[3])
+}
+
+/// How many literals the blob's distance reads.
+pub fn reads_count() -> u32 {
+    std::lift::reads(|| blob().distance(vec3(0.0))).len()
+}

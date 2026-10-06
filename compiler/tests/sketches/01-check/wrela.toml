@@ -4,6 +4,6 @@
 name = "check"
 
 [dependencies]
-engine = { path = "../engine" }
+engine = { path = "../../../../engine" }
 grazer = { path = "../01-creature" }
 m1 = { path = "../../fields" }

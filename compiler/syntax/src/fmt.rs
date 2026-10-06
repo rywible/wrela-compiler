@@ -219,6 +219,8 @@ struct List {
     multiline: bool,
     /// A comma after a lone element even on one line (`(x,)`).
     lone_comma: bool,
+    /// When it breaks, as many elements on each line as fit: a table of short numbers.
+    fill: bool,
 }
 
 const PARENS: List = List {
@@ -228,8 +230,23 @@ const PARENS: List = List {
     rest_last: false,
     multiline: false,
     lone_comma: false,
+    fill: false,
 };
 const BRACES: List = List { open: "{", close: "}", padded: true, ..PARENS };
+
+/// A number literal, maybe negated, of at most 10 characters: an element of a table.
+fn short_number(e: &Expr) -> bool {
+    let lit = match &e.kind {
+        ExprKind::Unary(UnOp::Neg, x) => match &x.kind {
+            ExprKind::Lit(l) => l,
+            _ => return false,
+        },
+        ExprKind::Lit(l) => l,
+        _ => return false,
+    };
+    matches!(lit.kind, LitKind::Int(_) | LitKind::Float(_) | LitKind::Suffixed)
+        && lit.text.len() <= 10
+}
 
 impl<'a> Builder<'a> {
     // ---- code --------------------------------------------------------------------------------
@@ -546,8 +563,10 @@ impl<'a> Builder<'a> {
                 inner.push(text(","));
             }
             let at = start(self, x);
-            inner.push(self.soft_break(at, if i == 0 { line() } else { Doc::Line }));
-            inner.push(item(self, x));
+            let sep = self.soft_break(at, if i == 0 { line() } else { Doc::Line });
+            let x = item(self, x);
+            // Filled, each later element breaks its line only if it doesn't fit on it.
+            inner.push(if l.fill && i > 0 { group(concat([sep, x])) } else { concat([sep, x]) });
         }
         if !items.is_empty() && !l.rest_last {
             inner.push(if l.lone_comma && items.len() == 1 {
@@ -1129,7 +1148,12 @@ impl<'a> Builder<'a> {
                 let multiline = items.first().is_some_and(|x| {
                     self.text[e.span.start as usize..x.span.start as usize].contains('\n')
                 });
-                let l = List { open: "[", close: "]", multiline, ..PARENS };
+                // A table of short numbers fills its lines (as rustfmt does), unless it has
+                // comments in it, which keep their places one element to a line.
+                let span = &self.text[e.span.start as usize..e.span.end as usize];
+                let fill =
+                    items.len() > 1 && items.iter().all(short_number) && !span.contains("//");
+                let l = List { open: "[", close: "]", multiline, fill, ..PARENS };
                 self.list(items, |_, x| x.span.start, |b, x| b.expr(x), e.span.end, l)
             }
             ExprKind::ArrayRepeat { value, count } => concat([

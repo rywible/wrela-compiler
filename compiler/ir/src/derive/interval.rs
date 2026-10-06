@@ -362,9 +362,7 @@ struct Ivx<'a> {
 
 impl Builder for Ivx<'_> {
     fn emit(&mut self, out: &mut Block, ty: TypeId, e: Expr) -> ValueId {
-        let v = self.nf.new_value(ty);
-        out.push(Stmt::Let(v, e));
-        v
+        self.nf.let_(out, ty, e)
     }
 
     fn types(&self) -> &Types {
@@ -724,14 +722,130 @@ impl<'a> Ivx<'a> {
                 "an interval through an array index that depends on the input isn't supported",
             ));
         }
-        if let PlaceRoot::Ptr(v) = p.root {
+        self.split(p)
+    }
+
+    /// The places holding the `lo` and `hi` of the range at `p`, whatever its indices are: in
+    /// an inactive local or parameter, or in data, both are `p`.
+    fn split(&self, p: &Place) -> R<(Place, Place)> {
+        let at = |root: PlaceRoot| Place { root, path: p.path.clone() };
+        Ok(match &p.root {
             // A projection's range: pointers into the place's `lo` and its `hi`.
-            let (lo, hi) = self.range(v);
-            let at = |r: ValueId| Place { root: PlaceRoot::Ptr(r), path: p.path.clone() };
-            return Ok((at(lo), at(hi)));
+            PlaceRoot::Ptr(v) => {
+                let (lo, hi) = self.range(*v);
+                (at(PlaceRoot::Ptr(lo)), at(PlaceRoot::Ptr(hi)))
+            }
+            r if self.act.root(r) => (p.clone(), at(self.hi_root(r)?)),
+            _ => (p.clone(), p.clone()),
+        })
+    }
+
+    /// A load through an array (or vector) index that depends on the input: the hull of the
+    /// elements the index's range reaches, held to the array's bounds. A loop joins them, so the
+    /// code doesn't grow with the array, and a range of a few indices (a table read near a
+    /// point) gives a tight bound. One such index per place, into an array of known length, of
+    /// elements with no enum in them.
+    fn load_any(&mut self, out: &mut Block, p: &Place, ty: TypeId) -> R<Iv> {
+        let mut active = p.path.iter().enumerate().filter_map(|(k, x)| match x {
+            Proj::Index(v) if self.act.value(*v) => Some((k, *v)),
+            _ => None,
+        });
+        let (at, index) = active.next().ok_or_else(|| Error::internal("no active index"))?;
+        if active.next().is_some() {
+            return Err(Error::not_derivable(
+                "an interval through two array indexes that depend on the input isn't supported",
+            ));
         }
-        let hi = Place { root: self.hi_root(&p.root)?, path: p.path.clone() };
-        Ok((p.clone(), hi))
+        let prefix = Place { root: p.root.clone(), path: p.path[..at].to_vec() };
+        let n = match self.m.place_ty(self.f, &prefix).map(|t| self.m.types.get(t).clone()) {
+            Some(TypeDef::Array(_, n)) => n,
+            Some(TypeDef::Vector(n)) => u32::from(n),
+            _ => {
+                return Err(Error::not_derivable(
+                    "an interval through an index that depends on the input, into an array of \
+                     unknown length, isn't supported",
+                ));
+            }
+        };
+        if self.m.place_ty(self.f, p) != Some(ty) {
+            return Err(Error::not_derivable(
+                "an interval through an index that depends on the input, into an array of \
+                 enums, isn't supported",
+            ));
+        }
+        // The index's range, held to 0..n − 1, as u32.
+        let u32t = self.m.types.u32();
+        let it = self.ty(index);
+        let (il, ih) = self.range(index);
+        let held = |me: &mut Self, out: &mut Block, x: ValueId| -> R<ValueId> {
+            let last = match me.m.types.as_scalar(it) {
+                Some(Scalar::U32) => Const::U32(n - 1),
+                Some(Scalar::I32) => Const::I32(n as i32 - 1),
+                _ => {
+                    return Err(Error::not_derivable(
+                        "an interval through an index that isn't u32 or i32",
+                    ));
+                }
+            };
+            let last = me.emit(out, it, Expr::Const(last));
+            let over = me.cmp(out, BinOp::Gt, x, last);
+            let x = me.select(out, over, last, x);
+            if me.m.types.as_scalar(it) == Some(Scalar::I32) {
+                let zero = me.emit(out, it, Expr::Const(Const::I32(0)));
+                let under = me.cmp(out, BinOp::Lt, x, zero);
+                let x = me.select(out, under, zero, x);
+                return Ok(me.emit(out, u32t, Expr::Convert(x, Scalar::U32)));
+            }
+            Ok(x)
+        };
+        let first = held(self, out, il)?;
+        let last = held(self, out, ih)?;
+        // The element at `i`: its place's `lo` and `hi`, the index replaced (by a value of the
+        // new function, which `places` can't check).
+        let element = |me: &mut Self, out: &mut Block, i: ValueId| -> R<Iv> {
+            let mut q = p.clone();
+            q.path[at] = Proj::Index(i);
+            let (lp, hp) = me.split(&q)?;
+            Ok((me.emit(out, ty, Expr::Load(lp)), me.emit(out, ty, Expr::Load(hp))))
+        };
+        let k = self.nf.new_local("index", u32t);
+        let lo = self.nf.new_local("hull_lo", ty);
+        let hi = self.nf.new_local("hull_hi", ty);
+        out.push(Stmt::Store(Place::local(k), first));
+        let e = element(self, out, first)?;
+        out.push(Stmt::Store(Place::local(lo), e.0));
+        out.push(Stmt::Store(Place::local(hi), e.1));
+        let mut body = Vec::new();
+        let i = self.emit(&mut body, u32t, Expr::Load(Place::local(k)));
+        let one = self.emit(&mut body, u32t, Expr::Const(Const::U32(1)));
+        let next = self.emit(&mut body, u32t, Expr::Binary(BinOp::Add, i, one));
+        let past = self.cmp(&mut body, BinOp::Gt, next, last);
+        body.push(Stmt::If { cond: past, then: vec![Stmt::Break], else_: Vec::new() });
+        body.push(Stmt::Store(Place::local(k), next));
+        let e = element(self, &mut body, next)?;
+        let acc = (
+            self.emit(&mut body, ty, Expr::Load(Place::local(lo))),
+            self.emit(&mut body, ty, Expr::Load(Place::local(hi))),
+        );
+        let joined = self.hull(&mut body, ty, acc, e)?;
+        body.push(Stmt::Store(Place::local(lo), joined.0));
+        body.push(Stmt::Store(Place::local(hi), joined.1));
+        out.push(Stmt::Loop { body, continuing: Vec::new() });
+        Ok((
+            self.emit(out, ty, Expr::Load(Place::local(lo))),
+            self.emit(out, ty, Expr::Load(Place::local(hi))),
+        ))
+    }
+
+    /// The hull of two ranges of type `ty`.
+    fn hull(&mut self, out: &mut Block, ty: TypeId, a: Iv, b: Iv) -> R<Iv> {
+        let lo = self.leaves(out, ty, &[a.0, b.0], &mut |s, out, lt, v| {
+            Ok(s.extreme(out, lt, v[0], v[1], false))
+        })?;
+        let hi = self.leaves(out, ty, &[a.1, b.1], &mut |s, out, lt, v| {
+            Ok(s.extreme(out, lt, v[0], v[1], true))
+        })?;
+        Ok((lo, hi))
     }
 
     fn root_ty(&self, r: &PlaceRoot) -> R<TypeId> {
@@ -1449,6 +1563,7 @@ impl<'a> Ivx<'a> {
                     .ok_or_else(|| Error::internal("an inactive parameter's range"))?;
                 (self.emit(out, ty, Expr::Param(*i)), self.emit(out, ty, Expr::Param(h)))
             }
+            Expr::Load(p) if self.act.index_active(p) => self.load_any(out, p, ty)?,
             Expr::Load(p) => {
                 let (lp, hp) = self.places(p)?;
                 (self.emit(out, ty, Expr::Load(lp)), self.emit(out, ty, Expr::Load(hp)))
@@ -1969,7 +2084,8 @@ impl<'a> Ivx<'a> {
             B::Exp | B::Exp2 => {
                 let x = self.monotone(out, b, &r, ty);
                 if gpu {
-                    self.exp_gpu_widen(out, x, r[0], ty)
+                    let held = self.exp_held(out, r[0], ty);
+                    self.exp_gpu_widen(out, x, held, ty)
                 } else {
                     self.widen(out, x, ty, CPU_STD_ULPS, 0.0)
                 }
@@ -2236,14 +2352,21 @@ impl<'a> Ivx<'a> {
             let l = self.log_ends(out, Builtin::Log2, a, ty);
             let p = self.mul(out, b, l, ty);
             let p = self.widen1(out, p, ty);
+            let p = self.exp_held(out, p, ty);
             let e = (
                 self.builtin(out, Builtin::Exp2, vec![p.0], ty),
                 self.builtin(out, Builtin::Exp2, vec![p.1], ty),
             );
             self.exp_gpu_widen(out, e, p, ty)
         } else {
-            // `y log x` is bilinear in (y, log x), so the extremes are at the corners.
-            let e = self.corners(out, ty, a, b, |s, out, x, y| {
+            // `y log x` is bilinear in (y, log x), so the extremes are at the corners. A base
+            // below zero gives the full range, so the corners take it held at zero: `pow` of
+            // a negative base is NaN, which a debug build traps even where it's not chosen.
+            let held = (
+                self.builtin(out, Builtin::Max, vec![a.0, z], ty),
+                self.builtin(out, Builtin::Max, vec![a.1, z], ty),
+            );
+            let e = self.corners(out, ty, held, b, |s, out, x, y| {
                 s.builtin(out, Builtin::Pow, vec![x, y], ty)
             });
             self.widen(out, e, ty, CPU_STD_ULPS, 0.0)
@@ -2259,7 +2382,9 @@ impl<'a> Ivx<'a> {
         let mut ends = Vec::new();
         for v in [x.0, x.1] {
             let pos = self.cmp(out, BinOp::Gt, v, z);
-            let l = self.builtin(out, b, vec![v], ty);
+            // (The log of the end held at zero: of a negative end it's NaN, unchosen.)
+            let held = self.builtin(out, Builtin::Max, vec![v, z], ty);
+            let l = self.builtin(out, b, vec![held], ty);
             ends.push(self.select(out, pos, l, fl));
         }
         let r = (ends[0], ends[1]);
@@ -2271,7 +2396,21 @@ impl<'a> Ivx<'a> {
         }
     }
 
-    /// Widening for `exp` and `exp2` on the GPU (WGSL: 3 + 2|x| ulp), `x` the argument's range.
+    /// `x` held to ±200, where `exp` and `exp2` are already 0 and +∞ in f32: the range
+    /// [`Self::exp_gpu_widen`] widens by. Unheld, an end at ±∞ (`pow`'s base at zero, whose log
+    /// is -∞) makes the widening's tolerance ∞, and ∞ times the result's end there (0) is NaN, an
+    /// interval holding nothing.
+    fn exp_held(&mut self, out: &mut Block, x: Iv, ty: TypeId) -> Iv {
+        let (lim_lo, lim_hi) = (self.fc(out, ty, -200.0), self.fc(out, ty, 200.0));
+        let mut clamp = |v: ValueId| {
+            let v = self.builtin(out, Builtin::Max, vec![v, lim_lo], ty);
+            self.builtin(out, Builtin::Min, vec![v, lim_hi], ty)
+        };
+        (clamp(x.0), clamp(x.1))
+    }
+
+    /// Widening for `exp` and `exp2` on the GPU (WGSL: 3 + 2|x| ulp), `x` the argument's range,
+    /// [held](Self::exp_held).
     fn exp_gpu_widen(&mut self, out: &mut Block, e: Iv, x: Iv, ty: TypeId) -> Iv {
         let m = self.magnitude(out, x, ty);
         let four = self.fc(out, ty, 4.0 * F32_EPS);

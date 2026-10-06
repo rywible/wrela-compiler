@@ -315,18 +315,23 @@ fn page_built_by(
     (dir, rel)
 }
 
-/// A test-mode run in headless Chrome that must fail: the message the page failed with.
-pub fn chrome_failure(rel: &str, run: ChromeRun) -> String {
-    let ChromeRun { frames, width, height, fps, workers, .. } = run;
-    let fragment =
-        format!("#test&frames={frames}&width={width}&height={height}&fps={fps}&workers={workers}");
-    let status = std::process::Command::new("python3")
+/// Runs tools/headless.py, from the repo root, with `args`: whether the run passed.
+fn headless<S: AsRef<std::ffi::OsStr>>(args: impl IntoIterator<Item = S>) -> bool {
+    std::process::Command::new("python3")
         .arg(repo_root().join("tools/headless.py"))
-        .args([rel, fragment.as_str(), "300"])
+        .args(args)
         .current_dir(repo_root())
         .status()
-        .expect("python3 runs tools/headless.py");
-    assert!(!status.success(), "the browser run passed; it should have failed");
+        .expect("python3 runs tools/headless.py")
+        .success()
+}
+
+/// A test-mode run in headless Chrome that must fail: the message the page failed with.
+pub fn chrome_failure(rel: &str, run: ChromeRun) -> String {
+    assert!(
+        !headless([rel, &run.fragment(), "300"]),
+        "the browser run passed; it should have failed"
+    );
     let done = repo_root().join(rel).join("results/DONE");
     std::fs::read_to_string(done).expect("results/DONE")
 }
@@ -347,7 +352,7 @@ pub struct BrowserRun {
 
 /// How [`run_in_chrome_with`] runs a page: test mode's parameters (runtime/browser's
 /// testmode.ts).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct ChromeRun {
     pub frames: u32,
     pub width: u32,
@@ -359,11 +364,39 @@ pub struct ChromeRun {
     pub audio: u32,
     /// Time each pass on the GPU.
     pub timestamps: bool,
+    /// A script of input events, relative to the page (runtime/abi `input`); "" for none.
+    pub input: String,
+    /// Pointer events the page sends through the DOM while the frames run (0: none):
+    /// `results/latency.json` says when each reached the program.
+    pub latency: u32,
 }
 
 impl ChromeRun {
     pub fn new(frames: u32, width: u32, height: u32, fps: f64) -> ChromeRun {
-        ChromeRun { frames, width, height, fps, workers: 1, audio: 0, timestamps: false }
+        ChromeRun {
+            frames,
+            width,
+            height,
+            fps,
+            workers: 1,
+            audio: 0,
+            timestamps: false,
+            input: String::new(),
+            latency: 0,
+        }
+    }
+
+    /// The page's URL fragment that asks for this run.
+    fn fragment(&self) -> String {
+        let ChromeRun { frames, width, height, fps, workers, audio, timestamps, input, latency } =
+            self;
+        format!(
+            "#test&frames={frames}&width={width}&height={height}&fps={fps}&workers={workers}{}{}{}{}",
+            if *audio > 0 { format!("&audio={audio}") } else { String::new() },
+            if *timestamps { "&timestamps=1" } else { "" },
+            if input.is_empty() { String::new() } else { format!("&input={input}") },
+            if *latency > 0 { format!("&latency={latency}") } else { String::new() },
+        )
     }
 }
 
@@ -375,19 +408,8 @@ pub fn run_in_chrome(rel: &str, frames: u32, width: u32, height: u32, fps: f64) 
 
 /// [`run_in_chrome`], with all of test mode's parameters.
 pub fn run_in_chrome_with(rel: &str, run: ChromeRun) -> BrowserRun {
-    let ChromeRun { frames, width, height, fps, workers, audio, timestamps } = run;
-    let fragment = format!(
-        "#test&frames={frames}&width={width}&height={height}&fps={fps}&workers={workers}{}{}",
-        if audio > 0 { format!("&audio={audio}") } else { String::new() },
-        if timestamps { "&timestamps=1" } else { "" },
-    );
-    let status = std::process::Command::new("python3")
-        .arg(repo_root().join("tools/headless.py"))
-        .args([rel, fragment.as_str(), "300"])
-        .current_dir(repo_root())
-        .status()
-        .expect("python3 runs tools/headless.py");
-    assert!(status.success(), "the browser run failed; see {rel}/results/console.log");
+    let passed = headless([rel, &run.fragment(), "300"]);
+    assert!(passed, "the browser run failed; see {rel}/results/console.log");
     let results = repo_root().join(rel).join("results");
     BrowserRun {
         hash: std::fs::read_to_string(results.join("hash.txt")).expect("hash.txt").trim().into(),
@@ -397,25 +419,44 @@ pub fn run_in_chrome_with(rel: &str, run: ChromeRun) -> BrowserRun {
             .trim()
             .parse()
             .expect("a count"),
-        audio: if audio > 0 {
+        audio: if run.audio > 0 {
             let bytes = std::fs::read(results.join("audio.f32")).expect("audio.f32");
             bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect()
         } else {
             Vec::new()
         },
-        timings: if timestamps {
-            let text = std::fs::read_to_string(results.join("timings.json")).expect("timings.json");
-            let v: serde_json::Value = serde_json::from_str(&text).expect("timings.json is JSON");
-            let entries = v.as_array().expect("an array").iter();
-            entries
-                .map(|t| {
-                    let frame = t["frame"].as_u64().expect("a frame") as usize;
-                    let label = t["label"].as_str().expect("a label").to_string();
-                    (frame, label, t["nanos"].as_f64().expect("nanoseconds"))
-                })
-                .collect()
-        } else {
-            Vec::new()
-        },
+        timings: if run.timestamps { timings(&results) } else { Vec::new() },
     }
+}
+
+/// Each pass's GPU time in a test-mode run's `results/` (its `timings.json`): its frame, its
+/// label (as the native host's `GpuTiming`) and nanoseconds.
+pub fn timings(results: &Path) -> Vec<(usize, String, f64)> {
+    let text = std::fs::read_to_string(results.join("timings.json")).expect("timings.json");
+    let v: serde_json::Value = serde_json::from_str(&text).expect("timings.json is JSON");
+    let entries = v.as_array().expect("an array").iter();
+    entries
+        .map(|t| {
+            let frame = t["frame"].as_u64().expect("a frame") as usize;
+            let label = t["label"].as_str().expect("a label").to_string();
+            (frame, label, t["nanos"].as_f64().expect("nanoseconds"))
+        })
+        .collect()
+}
+
+/// Runs the page another server serves at `url` (the studio server) in headless Chrome
+/// (tools/headless.py --url): its results go to `page/results/`. Panics, pointing at the
+/// console log, if the run fails.
+pub fn run_url_in_chrome(url: &str, page: &Path, timeout: u32) {
+    let results = page.join("results");
+    let _ = std::fs::remove_dir_all(&results);
+    std::fs::create_dir_all(&results).expect("results dir");
+    let timeout = timeout.to_string();
+    let args: [&std::ffi::OsStr; 4] =
+        ["--url".as_ref(), url.as_ref(), page.as_os_str(), timeout.as_ref()];
+    assert!(
+        headless(args),
+        "the browser run failed; see {}",
+        results.join("console.log").display()
+    );
 }

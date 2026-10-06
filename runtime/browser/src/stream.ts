@@ -62,7 +62,8 @@ export type Command =
   | { op: "StorageRead"; request: number; path: string }
   | { op: "StorageWrite"; request: number; path: string; data: Bytes }
   | { op: "Fetch"; request: number; url: string }
-  | { op: "Log"; text: string };
+  | { op: "Log"; text: string }
+  | { op: "Post"; request: number; url: string; body: Bytes };
 
 const NAMES = new Map<number, OpcodeName>(
   (Object.entries(Opcode) as [OpcodeName, number][]).map(([name, value]) => [value, name]),
@@ -183,6 +184,16 @@ export function decode(batch: Bytes): Command[] {
       const ustart = (from + 2 + 3 * n) * 4;
       if (ulen !== len - ustart) throw bad("uniform length doesn't match the payload");
       return [bindings, batch.subarray(start + ustart, start + len)];
+    };
+    // A text, then bytes, their lengths in words 1 and 2 (`mismatch` if they don't fill the
+    // payload). `what` names the text if it isn't UTF-8.
+    const twoRuns = (what: string, mismatch: string): [string, Bytes] => {
+      if (words < 3) throw bad("expected at least 3 words");
+      const n = w(1);
+      const m = w(2);
+      if (padded(n) + padded(m) !== len - 12) throw bad(mismatch);
+      const from = start + 12 + padded(n);
+      return [text(12, n, what), batch.subarray(from, from + m)];
     };
     let cmd: Command;
     switch (name) {
@@ -306,15 +317,13 @@ export function decode(batch: Bytes): Command[] {
         break;
       }
       case "StorageWrite": {
-        if (words < 3) throw bad("expected at least 3 words");
-        const n = w(1);
-        const m = w(2);
-        if (padded(n) + padded(m) !== len - 12) {
-          throw bad("the path's and data's lengths don't match the payload");
-        }
-        const path = text(12, n, "path");
-        const from = start + 12 + padded(n);
-        cmd = { op: name, request: w(0), path, data: batch.subarray(from, from + m) };
+        const [path, data] = twoRuns("path", "the path's and data's lengths don't match the payload");
+        cmd = { op: name, request: w(0), path, data };
+        break;
+      }
+      case "Post": {
+        const [url, body] = twoRuns("URL", "the URL's and body's lengths don't match the payload");
+        cmd = { op: name, request: w(0), url, body };
         break;
       }
     }

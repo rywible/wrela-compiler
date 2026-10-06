@@ -126,6 +126,21 @@ pub struct ClipPosition: Copy {
     pub position: vec4,
 }
 
+/// A fragment shader's colour, drawn over what's in its target: alpha blending, with straight
+/// (not premultiplied) alpha. A fragment shader that returns a `vec4` replaces what's there.
+///
+/// ```wrela
+/// use std::gpu::{FragCoord, Over}
+///
+/// @fragment
+/// fn glass(pixel: FragCoord) -> Over {
+///     Over { color: vec4(0.2, 0.4, 0.8, 0.5) }   // half covers what's under it
+/// }
+/// ```
+pub struct Over: Copy {
+    pub color: vec4,
+}
+
 /// A vertex output that isn't interpolated.
 pub struct Flat<T>: Copy {
     pub value: T,
@@ -945,7 +960,7 @@ impl AtomicMap {
 
 /// A key's first slot: its bits mixed, so near keys spread out.
 fn hash_key(key: u32) -> u32 {
-    var h = key.wrapping_mul(2654435761)
+    let h = key.wrapping_mul(2654435761)
     h ^ (h >> 16)
 }
 

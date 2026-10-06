@@ -3,8 +3,9 @@
 //! changes nothing. Only the package's own files change, and every place the report names is
 //! in the files as they are after.
 
+mod common;
+
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 const RUSTY: &str = "struct Log {
     lines: Vec<Text>,
@@ -88,7 +89,7 @@ pub fn frame(time: f32, width: u32, height: u32) {}
 
 /// Runs `wrela`: its exit status, its stdout, and its stdout and stderr together.
 fn wrela(args: &[&str]) -> (Option<i32>, String, String) {
-    let out = Command::new(env!("CARGO_BIN_EXE_wrela")).args(args).output().expect("run wrela");
+    let out = common::wrela().args(args).output().expect("run wrela");
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     let text = stdout.clone() + &String::from_utf8_lossy(&out.stderr);
     (out.status.code(), stdout, text)
@@ -96,11 +97,7 @@ fn wrela(args: &[&str]) -> (Option<i32>, String, String) {
 
 /// A new package `name` whose `main.wrela` is `text`.
 fn package(name: &str, text: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("mkdir");
-    std::fs::write(dir.join("main.wrela"), text).expect("write");
-    dir
+    common::package(name, &[("main.wrela", text)])
 }
 
 fn s(p: &Path) -> &str {

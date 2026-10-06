@@ -17,7 +17,9 @@ import {
   WORKERS_DONE_FAILED,
   WORKERS_FAILED,
   WORKERS_HELPED,
+  EVENT_SIZE,
   IMPORT_AUDIO,
+  IMPORT_INPUT,
   IMPORT_LIMIT,
   IMPORT_MODULE,
   IMPORT_REQUEST_STATUS,
@@ -62,11 +64,13 @@ export interface Executor {
   readBack?(handle: number, offset: number, size: number): Promise<Bytes>;
 }
 
-/** Where a program's requests read and write: its storage (bytes at paths) and its build. */
+/** Where a program's requests read and write: its storage (bytes at paths) and its build, and
+ * where its posts go: the host that serves the build. */
 export interface Io {
   storageRead(path: string): Promise<Bytes>;
   storageWrite(path: string, data: Bytes): Promise<void>;
   fetch(url: string): Promise<Bytes>;
+  post(url: string, body: Bytes): Promise<Bytes>;
 }
 
 /** An answer: the bytes, or why the request failed. */
@@ -211,6 +215,9 @@ export interface ProgramOptions {
    * default) runs them all on it. More need `spawnWorker`. */
   workers?: number;
   spawnWorker?: SpawnWorker;
+  /** Called with each line the program prints (`std::io::print`), after the console has it:
+   * test mode keeps them (`results/log.txt`). */
+  onPrint?: (line: string) => void;
 }
 
 /** A loaded program and everything that happens to its batches. */
@@ -235,6 +242,9 @@ export class Program {
   #failed: string | null = null;
   readonly #requests = new Requests();
   readonly #io: Io | null;
+  readonly #onPrint: ((line: string) => void) | null;
+  /** Input events not yet read (`wrela.input`), EVENT_SIZE bytes each, oldest first. */
+  #input: Uint8Array[] = [];
 
   private constructor(
     readonly checker: Checker,
@@ -244,6 +254,7 @@ export class Program {
     this.hash = options.hash ? new StateHash() : null;
     this.#io = options.io ?? null;
     this.#startVoice = options.startVoice ?? null;
+    this.#onPrint = options.onPrint ?? null;
   }
 
     static async load(wasm: Bytes, checker: Checker, executor: Executor, options: ProgramOptions = {}): Promise<Program> {
@@ -291,6 +302,7 @@ export class Program {
         // One of the device's limits, a u32's bits; 0 past the last.
         [IMPORT_LIMIT]: (index: number) => (checker.limits[index >>> 0] ?? 0) | 0,
         [IMPORT_AUDIO]: (task: number, context: number) => program.#audioImport(task >>> 0, context >>> 0),
+        [IMPORT_INPUT]: (ptr: number, cap: number) => program.#inputImport(ptr >>> 0, cap >>> 0),
       },
     };
     // As the native host words it: a module that can't be instantiated isn't a valid program.
@@ -364,9 +376,16 @@ export class Program {
       case "Fetch":
         this.#requests.start(cmd.op, cmd.request, io ? () => io.fetch(cmd.url) : none("build to fetch from"));
         return;
+      case "Post": {
+        // The body is a view into the program's memory: copy it.
+        const body = cmd.body.slice();
+        this.#requests.start(cmd.op, cmd.request, io ? () => io.post(cmd.url, body) : none("server to post to"));
+        return;
+      }
       case "Log":
         // `std::io::print`: a line for whoever runs the program, prefixed so it's found.
         console.log(`wrela: ${cmd.text}`);
+        this.#onPrint?.(cmd.text);
         return;
       default:
         return;
@@ -415,6 +434,27 @@ export class Program {
       this.#failure = e;
       throw e;
     }
+  }
+
+  /** Queues input events (EVENT_SIZE bytes each): the program reads them from its next call
+   * on (runtime/abi `input`). */
+  queueInput(events: Uint8Array): void {
+    for (let at = 0; at + EVENT_SIZE <= events.length; at += EVENT_SIZE) {
+      this.#input.push(events.slice(at, at + EVENT_SIZE));
+    }
+  }
+
+  /** `wrela.input(ptr, cap) -> count`: copies up to `cap` queued events to `ptr`. */
+  #inputImport(ptr: number, cap: number): number {
+    this.#starting();
+    const n = Math.min(cap, this.#input.length);
+    const memory = new Uint8Array(this.#memory!.buffer);
+    if (ptr + n * EVENT_SIZE > memory.length) {
+      throw new TrapError(`input(${ptr}, ${cap}) reaches past the end of the program's memory`);
+    }
+    for (let i = 0; i < n; i++) memory.set(this.#input[i]!, ptr + i * EVENT_SIZE);
+    this.#input.splice(0, n);
+    return n;
   }
 
   /** `wrela.audio(task, context)`: starts the program's voice, once. */

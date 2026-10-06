@@ -103,7 +103,7 @@ impl Verifier<'_> {
     /// The type of a place (whose values the caller has checked are visible).
     /// Whether a place is in constant data: everything but the program's state.
     fn constant(&self, p: &Place) -> bool {
-        matches!(p.root, PlaceRoot::Data(d) if self.m.state != Some(d))
+        matches!(p.root, PlaceRoot::Data(d) if self.m.state != Some(d) && !self.m.writable.contains(&d))
     }
 
     fn place(&self, p: &Place) -> Result<TypeId> {

@@ -35,7 +35,7 @@ export interface ResourceBinding {
 
 export type Stage =
   | { kind: "compute"; entry: string; workgroup_size: [number, number, number] }
-  | { kind: "render"; vertex_entry: string; fragment_entry: string };
+  | { kind: "render"; vertex_entry: string; fragment_entry: string; blend: boolean };
 
 export type Pipeline = Stage & {
   name: string;
@@ -141,7 +141,10 @@ function pipeline(v: unknown, i: number): Pipeline {
     const sizes = ws.map((s: unknown, k) => asU32(s, `${where}.workgroup_size[${k}]`));
     stage = { kind, entry: str(o, "entry", where), workgroup_size: [sizes[0]!, sizes[1]!, sizes[2]!] };
   } else {
-    stage = { kind, vertex_entry: str(o, "vertex_entry", where), fragment_entry: str(o, "fragment_entry", where) };
+    // A missing `blend` is false.
+    const b = o["blend"] ?? false;
+    if (typeof b !== "boolean") throw new ManifestError(`${where}.blend must be true or false`);
+    stage = { kind, vertex_entry: str(o, "vertex_entry", where), fragment_entry: str(o, "fragment_entry", where), blend: b };
   }
   // A missing `debug_flag` is read as null.
   const d = o["debug_flag"] ?? null;

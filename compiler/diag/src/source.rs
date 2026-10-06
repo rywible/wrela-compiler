@@ -110,6 +110,16 @@ impl SourceFile {
         self.text.get(start..end).unwrap_or("").trim_end_matches(['\n', '\r'])
     }
 
+    /// The byte offset where 0-based line `line` starts.
+    pub fn line_start(&self, line: usize) -> u32 {
+        self.line_starts[line]
+    }
+
+    /// How many lines the file has.
+    pub fn line_count(&self) -> usize {
+        self.line_starts.len()
+    }
+
     /// The byte offset where the text of 0-based line `line` ends (before the line break).
     pub fn line_end(&self, line: usize) -> u32 {
         self.line_starts[line] + self.line_text(line).len() as u32

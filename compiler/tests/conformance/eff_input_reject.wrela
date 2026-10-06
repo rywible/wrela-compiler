@@ -1,0 +1,16 @@
+// rejects: eff.input
+// Reading input is `nondet`: `@deterministic` code takes events as data instead.
+use std::input::{Event, Input, events}
+
+@deterministic
+fn moves() -> u32 {
+    events().len() //~ E0600
+}
+
+@deterministic
+fn step(input: mut Input) {
+    input.read() //~ E0600
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+}

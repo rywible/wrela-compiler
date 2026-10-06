@@ -41,6 +41,12 @@ enum Value {
     Table(Vec<(String, Value, Span)>),
 }
 
+/// The name the manifest in `dir` gives its package, if it has one that reads.
+pub fn name_in(dir: &std::path::Path) -> Option<String> {
+    let text = std::fs::read_to_string(dir.join("wrela.toml")).ok()?;
+    parse(FileId(0), &text).ok()?.name.map(|(n, _)| n)
+}
+
 /// Reads the manifest `text`, which is file `file` in the source map. Errors are E0219.
 pub fn parse(file: FileId, text: &str) -> Result<Manifest, Vec<Diagnostic>> {
     let mut out = Manifest::default();

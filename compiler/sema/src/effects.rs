@@ -66,6 +66,9 @@ pub struct BodyId {
 struct Node {
     direct: Vec<(Effect, Span, String)>,
     calls: Vec<(BodyId, Span)>,
+    /// It calls something whose effects depend on what's instantiated (a trait method of a
+    /// generic parameter, a closure or a function passed in): lowering knows them, not this.
+    open: bool,
 }
 
 /// The effect graph of a program's bodies.
@@ -74,6 +77,8 @@ pub struct Effects<'p> {
     nodes: BTreeMap<BodyId, Node>,
     /// Each body's effects, everything it reaches included.
     all: HashMap<BodyId, Vec<Effect>>,
+    /// The bodies that reach a call whose effects aren't known here ([`Node::open`]).
+    open: std::collections::HashSet<BodyId>,
 }
 
 /// Checks every context's effects (E0600).
@@ -118,6 +123,7 @@ pub fn check(p: &Program, mir: &BTreeMap<FnId, Body>) -> Vec<Diagnostic> {
             let ctx = "a derived interpretation derives it";
             out.extend(fx.report(callee, DERIVED, ctx, span, codes::E0700));
         }
+        out.extend(discarded_results(p, body, &fx));
         // What's passed as a `@deterministic fn` or a `@parallel fn` (§9, §6.12).
         for arg in typed_callables(p, f, body) {
             if arg.flags.deterministic {
@@ -135,6 +141,41 @@ pub fn check(p: &Program, mir: &BTreeMap<FnId, Body>) -> Vec<Diagnostic> {
                 out.extend(audio_captures(body, &arg));
             }
         }
+    }
+    out
+}
+
+/// E0333: a statement that calls a function only to throw its value away, where the call
+/// does nothing else: no effect, and no argument lent `mut`. `p.pos.normalize()` or
+/// `grow(p, 2.0)` written as statements look like changes in place to a reader used to them,
+/// and do nothing. `let _ = f()` discards on purpose.
+fn discarded_results(p: &Program, body: &Body, fx: &Effects) -> Vec<Diagnostic> {
+    use crate::builtins::BuiltinFn;
+    let mut out = Vec::new();
+    for (callee, lends_mut, ty, span) in &body.discarded {
+        if *lends_mut
+            || p.types.has_params(*ty)
+            || p.types.is_unit(*ty)
+            || matches!(p.types.kind(*ty), TyKind::Never | TyKind::Error)
+        {
+            continue;
+        }
+        let name = match callee {
+            Callee::Builtin(BuiltinFn::Panic | BuiltinFn::Assert) => continue,
+            Callee::Builtin(b) => b.name().to_string(),
+            Callee::Fn { func, .. } if fx.pure(*func) => p.func(*func).name.clone(),
+            _ => continue,
+        };
+        out.push(
+            Diagnostic::new(
+                codes::E0333,
+                *span,
+                format!("this throws away what `{name}` returns, and the call does nothing else"),
+            )
+            .with_note("a call changes only what it's lent `mut`; this one is lent nothing, so its result is all it gives")
+            .with_help("use the result (`x = x.normalize()`), or write `let _ = ...` to discard it on purpose")
+            .with_fix("discard it on purpose", span.shrink_to_start(), "let _ = "),
+        );
     }
     out
 }
@@ -287,7 +328,7 @@ fn derived_callables(p: &Program, f: FnId, body: &Body) -> Vec<(BodyId, Span)> {
         let Callee::Fn { func, .. } = &c.callee else { return };
         let derived = matches!(
             p.func(*func).lang,
-            Some(Lang::Gradient | Lang::ValueAndGradient | Lang::IntervalOf)
+            Some(Lang::Gradient | Lang::ValueAndGradient | Lang::IntervalOf | Lang::LiftGradient)
         );
         if derived
             && let Some(place) = c.args.first().and_then(|a| a.place())
@@ -299,18 +340,31 @@ fn derived_callables(p: &Program, f: FnId, body: &Body) -> Vec<(BodyId, Span)> {
     out
 }
 
+/// One effect of a function's, for tools (`wrela query`): a shortest chain of calls to where
+/// it happens (the function itself first), and where and what it is there.
+#[derive(Clone, Debug)]
+pub struct EffectWhy {
+    pub effect: Effect,
+    pub chain: Vec<String>,
+    pub span: Span,
+    pub what: String,
+}
+
 impl<'p> Effects<'p> {
-    fn build(p: &'p Program, mir: &BTreeMap<FnId, Body>) -> Effects<'p> {
+    /// The effect graph of every body in `mir`.
+    pub fn build(p: &'p Program, mir: &BTreeMap<FnId, Body>) -> Effects<'p> {
+        let hidden: HashMap<FnId, TyId> =
+            mir.iter().filter_map(|(&f, b)| b.hidden_ret.map(|h| (f, h))).collect();
         let mut nodes = BTreeMap::new();
         for (&f, body) in mir {
             for (k, code) in body.fns.iter().enumerate() {
                 let closure = (k > 0).then(|| ClosureId(k as u32 - 1));
                 let id = BodyId { func: f, closure };
-                nodes.insert(id, node(p, f, body, code));
+                nodes.insert(id, node(p, f, body, code, &hidden));
             }
         }
         // std functions without bodies here (intrinsics) have their effects by what they are.
-        let mut fx = Effects { p, nodes, all: HashMap::new() };
+        let mut fx = Effects { p, nodes, all: HashMap::new(), open: Default::default() };
         fx.mark_recursion();
         fx.propagate();
         fx
@@ -352,7 +406,8 @@ impl<'p> Effects<'p> {
     }
 
     fn propagate(&mut self) {
-        // Iterate to a fixpoint: effect sets only grow, and there are six.
+        // Iterate to a fixpoint: effect sets only grow, and there are six. What reaches an open
+        // call is open too: a call to a body that isn't here (an intrinsic) isn't.
         let ids: Vec<BodyId> = self.nodes.keys().copied().collect();
         for &b in &ids {
             let mut e: Vec<Effect> = self.nodes[&b].direct.iter().map(|d| d.0).collect();
@@ -360,14 +415,17 @@ impl<'p> Effects<'p> {
             e.dedup();
             self.all.insert(b, e);
         }
+        self.open = ids.iter().copied().filter(|b| self.nodes[b].open).collect();
         loop {
             let mut changed = false;
             for &b in &ids {
                 let mut e = self.all[&b].clone();
+                let mut open = false;
                 for (c, _) in &self.nodes[&b].calls {
                     if let Some(ce) = self.all.get(c) {
                         e.extend(ce.iter().copied());
                     }
+                    open |= self.open.contains(c);
                 }
                 e.sort();
                 e.dedup();
@@ -375,11 +433,36 @@ impl<'p> Effects<'p> {
                     self.all.insert(b, e);
                     changed = true;
                 }
+                if open && self.open.insert(b) {
+                    changed = true;
+                }
             }
             if !changed {
                 break;
             }
         }
+    }
+
+    /// `f`'s effects, each with why it has it, and whether it calls something whose effects
+    /// depend on how it's instantiated (lowering checks those). `None` if `f` has no body here.
+    pub fn explain(&self, f: FnId) -> Option<(Vec<EffectWhy>, bool)> {
+        let root = BodyId { func: f, closure: None };
+        let has = self.all.get(&root)?;
+        let mut out = Vec::new();
+        for &e in has {
+            if let Some((chain, span, what)) = self.witness(root, e) {
+                let chain = chain.iter().map(|&b| self.name(b)).collect();
+                out.push(EffectWhy { effect: e, chain, span, what });
+            }
+        }
+        Some((out, self.open.contains(&root)))
+    }
+
+    /// Whether calling `f` does nothing but compute its result: no effect, through everything
+    /// it calls, and nothing whose effects depend on its instantiation.
+    fn pure(&self, f: FnId) -> bool {
+        let b = BodyId { func: f, closure: None };
+        self.all.get(&b).is_some_and(Vec::is_empty) && !self.open.contains(&b)
     }
 
     fn name(&self, b: BodyId) -> String {
@@ -495,7 +578,13 @@ impl<'p> Effects<'p> {
 }
 
 /// A body's own effects and calls.
-fn node(p: &Program, f: FnId, body: &Body, code: &mir::FnBody) -> Node {
+fn node(
+    p: &Program,
+    f: FnId,
+    body: &Body,
+    code: &mir::FnBody,
+    hidden: &HashMap<FnId, TyId>,
+) -> Node {
     let mut n = Node::default();
     let std_module = |g: FnId| p.module(p.func(g).module).path.get(1).cloned();
     let call_to = |n: &mut Node, g: FnId, span: Span| {
@@ -507,6 +596,10 @@ fn node(p: &Program, f: FnId, body: &Body, code: &mir::FnBody) -> Node {
         }
         if def.lang.is_some_and(Lang::requests_io) {
             n.direct.push((Effect::Io, span, format!("`{}` asks the host for IO", def.name)));
+            return;
+        }
+        if def.lang == Some(Lang::LiftSet) {
+            n.direct.push((Effect::Host, span, "`set` changes a lifted literal".into()));
             return;
         }
         if def.lang == Some(Lang::StartVoice) {
@@ -539,7 +632,9 @@ fn node(p: &Program, f: FnId, body: &Body, code: &mir::FnBody) -> Node {
                 }
                 StatementKind::Eval(r) => r,
                 StatementKind::Drop(place) => {
-                    let t = mir::place_ty(p, &body.locals, place);
+                    // Through the types functions return by naming their traits: dropping
+                    // `wolf()`'s result drops what `wolf` made, which may own nothing.
+                    let t = traits::reveal(p, hidden, mir::place_ty(p, &body.locals, place));
                     if heap_type(p, t) {
                         let (heap, gpu) = drop_effects(p, t);
                         if gpu {
@@ -574,6 +669,8 @@ fn node(p: &Program, f: FnId, body: &Body, code: &mir::FnBody) -> Node {
                             )
                         {
                             call_to(&mut n, g, c.span);
+                        } else {
+                            n.open = true;
                         }
                     }
                     Callee::Builtin(crate::builtins::BuiltinFn::Panic) => {
@@ -594,7 +691,8 @@ fn node(p: &Program, f: FnId, body: &Body, code: &mir::FnBody) -> Node {
                             }
                         }
                     }
-                    Callee::Builtin(_) | Callee::Local(_) | Callee::Value(_) => {}
+                    Callee::Local(_) | Callee::Value(_) => n.open = true,
+                    Callee::Builtin(_) => {}
                 },
                 Rvalue::Dispatch(_) => {
                     n.direct.push((Effect::Host, s.span, "`dispatch` records GPU work".into()));

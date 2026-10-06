@@ -1,4 +1,4 @@
-//! # The manifest, version 2
+//! # The manifest, version 3
 //!
 //! `manifest.json` describes everything game-specific a host needs besides the WASM: each
 //! pipeline's shader, entry points and bindings (D-099). The runtime reads it at load; nothing
@@ -21,14 +21,16 @@
 //!   format is [`SCREEN_FORMAT`] without sRGB encoding (so hosts produce the same bytes), or a
 //!   texture. With a depth target, a fragment is kept where its depth is less than what's
 //!   there, which it replaces. Hosts make one pipeline per combination of target formats a
-//!   pipeline is drawn with.
+//!   pipeline is drawn with. A render pipeline with `"blend": true` draws its colour over what's
+//!   in the target (alpha blending, straight alpha: `src × src.a + dst × (1 − src.a)` for the
+//!   colour, `src.a + dst.a × (1 − src.a)` for alpha); without it, its colour replaces it.
 
 use crate::Limits;
 use serde::Serialize;
 use serde_json::{Map, Value};
 use std::fmt;
 
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 /// The screen's texture format, in WebGPU's spelling.
 pub const SCREEN_FORMAT: &str = "rgba8unorm";
 /// WebGPU's default limits that the manifest is checked against ([`Limits::DEFAULT`]).
@@ -74,8 +76,17 @@ pub struct Pipeline {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Stage {
-    Compute { entry: String, workgroup_size: [u32; 3] },
-    Render { vertex_entry: String, fragment_entry: String },
+    Compute {
+        entry: String,
+        workgroup_size: [u32; 3],
+    },
+    Render {
+        vertex_entry: String,
+        fragment_entry: String,
+        /// Draws its colour over the target's (alpha blending) rather than replacing it.
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        blend: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -277,7 +288,7 @@ impl Manifest {
                         ));
                     }
                 }
-                Stage::Render { vertex_entry, fragment_entry } => {
+                Stage::Render { vertex_entry, fragment_entry, .. } => {
                     if vertex_entry.is_empty() || fragment_entry.is_empty() {
                         return err(format!("pipeline {i} is missing an entry point"));
                     }
@@ -436,6 +447,11 @@ mod read {
             false => Stage::Render {
                 vertex_entry: string(o, "vertex_entry", &place)?,
                 fragment_entry: string(o, "fragment_entry", &place)?,
+                // A missing `blend` is false.
+                blend: match o.get("blend").unwrap_or(&Value::Bool(false)) {
+                    Value::Bool(b) => *b,
+                    _ => return fail(format!("{place}.blend must be true or false")),
+                },
             },
         };
         // A missing `debug_flag` is read as null.
@@ -475,8 +491,8 @@ mod tests {
     fn golden_json() {
         let json = sample().to_json();
         let expected = r#"{
-  "manifest_version": 2,
-  "stream_version": 4,
+  "manifest_version": 3,
+  "stream_version": 5,
   "wasm": "game.wasm",
   "pipelines": [
     {
@@ -528,9 +544,9 @@ mod tests {
 
     #[test]
     fn rejects_other_versions() {
-        let json = sample().to_json().replace("\"manifest_version\": 2", "\"manifest_version\": 1");
+        let json = sample().to_json().replace("\"manifest_version\": 3", "\"manifest_version\": 1");
         assert!(Manifest::parse(&json).is_err());
-        let json = sample().to_json().replace("\"stream_version\": 4", "\"stream_version\": 9");
+        let json = sample().to_json().replace("\"stream_version\": 5", "\"stream_version\": 9");
         assert!(Manifest::parse(&json).is_err());
     }
 

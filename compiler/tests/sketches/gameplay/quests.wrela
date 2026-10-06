@@ -7,7 +7,7 @@
 
 use dialogue::{Effect, apply, effect}
 use engine::sim::{SimState, SimValue}
-use engine::ui::Ui
+use ui::widgets::Ui
 use flags::{FlagId, flag}
 use items::{ItemId, item, item_def}
 use std::hash::StateHash

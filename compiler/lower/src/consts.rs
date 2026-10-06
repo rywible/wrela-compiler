@@ -60,19 +60,116 @@ impl<'a> Cx<'a> {
     }
 
     /// The value of a literal value (language.md §3, constants), by its type's runtime parts.
-    fn fold(
+    pub(crate) fn fold(
         &mut self,
         mb: &mut ModuleBuilder,
         e: &wrela_sema::thir::Expr,
     ) -> Option<ir::ConstValue> {
-        let checked = self.checked;
-        let types = &checked.program.types;
-        let scalar = |cx: &mut Self, mb: &mut ModuleBuilder, l: Lit| {
-            let t = cx.lower_ty(mb, e.ty, e.span)?;
-            lit_const(&mb.m.types, l, t).map(ir::ConstValue::Scalar)
+        walk(&mut Data { cx: self, mb }, e)
+    }
+}
+
+/// How [`walk`] builds a literal value: as constant data ([`Data`]), or in code (an [`Fl`]),
+/// with a lifted build's `f32` literals read from the table.
+trait Build<'a> {
+    type V: Clone;
+    fn cx(&mut self) -> (&mut Cx<'a>, &mut ModuleBuilder);
+    /// A literal, a negated literal, a constant, a text or an embed, of IR type `t`; `None` for
+    /// anything else.
+    fn leaf(&mut self, e: &wrela_sema::thir::Expr, t: ir::TypeId) -> Option<Self::V>;
+    /// A value of IR type `t` from its parts: a struct's fields, a tuple's or an array's
+    /// elements, a matrix's columns or a vector's components.
+    fn parts(&mut self, t: ir::TypeId, parts: Vec<Self::V>) -> Self::V;
+    /// Variant `v` of the enum `t`, its payload made of `parts`.
+    fn variant(&mut self, t: ir::TypeId, v: u32, parts: Vec<Self::V>) -> Self::V;
+    /// Adds the components of a vector `p` to `out`, or `p` itself, a scalar.
+    fn components(&mut self, p: Self::V, out: &mut Vec<Self::V>);
+}
+
+/// A literal value, by its type's runtime parts, as `b` builds it.
+fn walk<'a, B: Build<'a>>(b: &mut B, e: &wrela_sema::thir::Expr) -> Option<B::V> {
+    let checked = b.cx().0.checked;
+    let t = {
+        let (cx, mb) = b.cx();
+        cx.lower_ty(mb, e.ty, e.span)?
+    };
+    Some(match &e.kind {
+        ExprKind::Adt { variant, fields, base: None, .. } => {
+            let map = {
+                let (cx, mb) = b.cx();
+                cx.field_map(mb, e.ty, *variant, e.span)
+            };
+            let mut parts = Vec::new();
+            for (f, (k, _)) in fields.iter().zip(map) {
+                if k.is_some() {
+                    parts.push(walk(b, f)?);
+                }
+            }
+            match variant {
+                None => b.parts(t, parts),
+                Some(v) => b.variant(t, *v, parts),
+            }
+        }
+        ExprKind::Tuple(xs) | ExprKind::Array(xs) => {
+            let mut parts = Vec::new();
+            for x in xs {
+                let (cx, mb) = b.cx();
+                if cx.lower_ty(mb, x.ty, x.span).is_some() {
+                    parts.push(walk(b, x)?);
+                }
+            }
+            b.parts(t, parts)
+        }
+        ExprKind::ArrayRepeat(x, n) => {
+            let v = walk(b, x)?;
+            b.parts(t, vec![v; *n as usize])
+        }
+        ExprKind::Construct(xs) => {
+            let mut parts = Vec::new();
+            for x in xs {
+                parts.push(walk(b, x)?);
+            }
+            // A vector's components: scalars, and the components of vectors; one scalar fills
+            // all. (A matrix's parts are its columns.)
+            if let &TyKind::Vec(n) = checked.program.types.kind(e.ty) {
+                let mut comps = Vec::new();
+                for p in parts {
+                    b.components(p, &mut comps);
+                }
+                if comps.len() == 1 {
+                    comps = vec![comps[0].clone(); n as usize];
+                }
+                parts = comps;
+            }
+            b.parts(t, parts)
+        }
+        _ => b.leaf(e, t)?,
+    })
+}
+
+/// Builds a literal value as constant data.
+struct Data<'x, 'a> {
+    cx: &'x mut Cx<'a>,
+    mb: &'x mut ModuleBuilder,
+}
+
+impl<'a> Build<'a> for Data<'_, 'a> {
+    type V = ir::ConstValue;
+
+    fn cx(&mut self) -> (&mut Cx<'a>, &mut ModuleBuilder) {
+        (self.cx, self.mb)
+    }
+
+    fn leaf(&mut self, e: &wrela_sema::thir::Expr, t: ir::TypeId) -> Option<ir::ConstValue> {
+        let types = &self.cx.checked.program.types;
+        let scalar =
+            |mb: &ModuleBuilder, l: Lit| lit_const(&mb.m.types, l, t).map(ir::ConstValue::Scalar);
+        let run = |(d, n): (ir::DataId, u32)| {
+            let len = ir::ConstValue::Scalar(ir::Const::U32(n));
+            ir::ConstValue::Parts(vec![ir::ConstValue::Addr(d), len])
         };
         Some(match &e.kind {
-            ExprKind::Lit(l) => scalar(self, mb, *l)?,
+            ExprKind::Lit(l) => scalar(self.mb, *l)?,
             ExprKind::Unary(UnOp::Neg, x) => {
                 let l = match x.kind {
                     ExprKind::Lit(Lit::Int(v)) if types.is_int(e.ty) => Lit::Int(-v),
@@ -80,90 +177,109 @@ impl<'a> Cx<'a> {
                     ExprKind::Lit(Lit::Float(d, f)) => Lit::Float(-d, -f),
                     _ => return None,
                 };
-                scalar(self, mb, l)?
+                scalar(self.mb, l)?
             }
-            ExprKind::Const(c) => self.const_value(mb, *c)?.1,
-            ExprKind::Text(s) => {
-                if mb.target() == ir::Target::Gpu {
-                    return None;
-                }
-                let (d, n) = self.text_data(mb, s);
-                ir::ConstValue::Parts(vec![
-                    ir::ConstValue::Addr(d),
-                    ir::ConstValue::Scalar(ir::Const::U32(n)),
-                ])
+            ExprKind::Const(c) => self.cx.const_value(self.mb, *c)?.1,
+            // Data's address and length (GPU code has no addresses).
+            ExprKind::Text(_) | ExprKind::Embed(_) if self.mb.target() == ir::Target::Gpu => {
+                return None;
             }
-            ExprKind::Embed(path) => {
-                if mb.target() == ir::Target::Gpu {
-                    return None;
-                }
-                let (d, n) = self.embed_data(mb, path)?;
-                ir::ConstValue::Parts(vec![
-                    ir::ConstValue::Addr(d),
-                    ir::ConstValue::Scalar(ir::Const::U32(n)),
-                ])
-            }
-            ExprKind::Adt { variant, fields, base: None, .. } => {
-                let map = self.field_map(mb, e.ty, *variant, e.span);
-                let mut parts = Vec::new();
-                for (f, (k, _)) in fields.iter().zip(map) {
-                    if k.is_some() {
-                        parts.push(self.fold(mb, f)?);
-                    }
-                }
-                match variant {
-                    None => ir::ConstValue::Parts(parts),
-                    Some(v) => {
-                        let t = self.lower_ty(mb, e.ty, e.span)?;
-                        let payload =
-                            mb.m.types.field(t, 1 + v).map(|_| ir::ConstValue::Parts(parts));
-                        ir::ConstValue::Variant(*v, payload.map(Box::new))
-                    }
-                }
-            }
-            ExprKind::Tuple(xs) | ExprKind::Array(xs) => {
-                let mut parts = Vec::new();
-                for x in xs {
-                    if self.lower_ty(mb, x.ty, x.span).is_some() {
-                        parts.push(self.fold(mb, x)?);
-                    }
-                }
-                ir::ConstValue::Parts(parts)
-            }
-            ExprKind::ArrayRepeat(x, n) => {
-                let v = self.fold(mb, x)?;
-                ir::ConstValue::Parts(vec![v; *n as usize])
-            }
-            ExprKind::Construct(xs) => {
-                let mut parts = Vec::new();
-                for x in xs {
-                    parts.push(self.fold(mb, x)?);
-                }
-                match types.kind(e.ty) {
-                    // Components: scalars, and the components of vectors; one scalar fills all.
-                    &TyKind::Vec(n) => {
-                        let mut comps = Vec::new();
-                        for p in parts {
-                            match p {
-                                ir::ConstValue::Parts(cs) => comps.extend(cs),
-                                s => comps.push(s),
-                            }
-                        }
-                        if comps.len() == 1 {
-                            comps = vec![comps[0].clone(); n as usize];
-                        }
-                        ir::ConstValue::Parts(comps)
-                    }
-                    // Columns.
-                    _ => ir::ConstValue::Parts(parts),
-                }
-            }
+            ExprKind::Text(s) => run(self.cx.text_data(self.mb, s)),
+            ExprKind::Embed(path) => run(self.cx.embed_data(self.mb, path)?),
             _ => return None,
         })
+    }
+
+    fn parts(&mut self, _: ir::TypeId, parts: Vec<ir::ConstValue>) -> ir::ConstValue {
+        ir::ConstValue::Parts(parts)
+    }
+
+    fn variant(&mut self, t: ir::TypeId, v: u32, parts: Vec<ir::ConstValue>) -> ir::ConstValue {
+        let payload = self.mb.m.types.field(t, 1 + v).map(|_| ir::ConstValue::Parts(parts));
+        ir::ConstValue::Variant(v, payload.map(Box::new))
+    }
+
+    fn components(&mut self, p: ir::ConstValue, out: &mut Vec<ir::ConstValue>) {
+        match p {
+            ir::ConstValue::Parts(cs) => out.extend(cs),
+            s => out.push(s),
+        }
+    }
+}
+
+/// Builds a literal value in code: a lifted build's `f32` literals read from the table (§22).
+impl<'a> Build<'a> for Fl<'_, 'a> {
+    type V = ir::ValueId;
+
+    fn cx(&mut self) -> (&mut Cx<'a>, &mut ModuleBuilder) {
+        (self.cx, self.mb)
+    }
+
+    fn leaf(&mut self, e: &wrela_sema::thir::Expr, t: ir::TypeId) -> Option<ir::ValueId> {
+        let f32_ty = self.cx.checked.program.types.f32;
+        let lifted = (e.ty == f32_ty).then(|| self.cx.lift.and_then(|l| l.of(e.span))).flatten();
+        match &e.kind {
+            ExprKind::Lit(_) | ExprKind::Unary(UnOp::Neg, _) if lifted.is_some() => {
+                self.lifted(lifted?)
+            }
+            ExprKind::Const(c) => match self.lifted_const(*c) {
+                Some(v) => Some(v),
+                None => {
+                    let (ty, v) = self.cx.const_value(self.mb, *c)?;
+                    self.build_const(ty, &v)
+                }
+            },
+            _ => {
+                let v = Data { cx: self.cx, mb: self.mb }.leaf(e, t)?;
+                self.build_const(t, &v)
+            }
+        }
+    }
+
+    fn parts(&mut self, t: ir::TypeId, parts: Vec<ir::ValueId>) -> ir::ValueId {
+        self.value(t, ir::Expr::Construct(t, parts))
+    }
+
+    fn variant(&mut self, t: ir::TypeId, v: u32, parts: Vec<ir::ValueId>) -> ir::ValueId {
+        let payload = self
+            .mb
+            .m
+            .types
+            .field(t, 1 + v)
+            .map(|pt| self.value(pt, ir::Expr::Construct(pt, parts)));
+        self.value(t, ir::Expr::Variant(t, v, payload))
+    }
+
+    fn components(&mut self, p: ir::ValueId, out: &mut Vec<ir::ValueId>) {
+        let f32_t = self.mb.m.types.f32();
+        match *self.mb.m.types.get(self.f.value_ty(p)) {
+            ir::TypeDef::Vector(k) => {
+                for i in 0..k {
+                    out.push(self.value(f32_t, ir::Expr::Extract(p, u32::from(i))));
+                }
+            }
+            _ => out.push(p),
+        }
     }
 }
 
 impl<'c, 'a> Fl<'c, 'a> {
+    /// A lifted build's constant `c` of a lifted package, built here from its literals, each
+    /// read from the table (§22); `None` for any other constant, which is data.
+    pub(crate) fn lifted_const(&mut self, c: ConstId) -> Option<ir::ValueId> {
+        self.cx.lift?;
+        let checked = self.cx.checked;
+        let program = &checked.program;
+        if crate::eval::is_computed(checked, c) {
+            return None;
+        }
+        if !program.package_of(program.const_(c).module).lifted {
+            return None;
+        }
+        let (_, e) = checked.consts.get(&c)?;
+        walk(self, e)
+    }
+
     /// A constant's value built in code (GPU code has no constant data).
     pub fn build_const(&mut self, t: ir::TypeId, v: &ir::ConstValue) -> Option<ir::ValueId> {
         let types = &mut self.mb.m.types;

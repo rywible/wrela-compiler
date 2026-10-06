@@ -1,0 +1,408 @@
+// Input (language.md §6.15's polled requests' neighbour): the pointer and keyboard events the
+// host has queued since the program last read them. Reading them is `nondet` (§8): what a call
+// reads depends on when a person moved the mouse, so `@deterministic` code takes input as data,
+// as it takes the time (`Input::update` is ordinary code over a run of events).
+//
+// The hosts deliver events through `wrela.input` (runtime/abi `input`): the same events in the
+// same order in Chrome and in the native host, which plays a script of them for tests.
+
+use std::hash::StateHash
+use std::serialize::Serialize
+
+/// A pointer button.
+pub enum Button: Copy + Eq + Ord + StateHash + Serialize {
+    Primary,
+    Middle,
+    Secondary,
+}
+
+/// The modifier keys held when an event happened.
+pub struct Mods: Copy + Eq + StateHash + Serialize {
+    pub shift: bool = false,
+    pub ctrl: bool = false,
+    pub alt: bool = false,
+    pub meta: bool = false,
+}
+
+impl Mods {
+    /// Control, or Meta (Command on a Mac): the key shortcuts use.
+    pub fn command(self) -> bool {
+        self.ctrl || self.meta
+    }
+}
+
+/// A physical key, wherever the keyboard's layout puts its letter (DOM's `KeyboardEvent.code`):
+/// `Key::A` is the key left of S. What a key types arrives as `Event::Text`.
+pub enum Key: Copy + Eq + Ord + StateHash + Serialize {
+    Unknown,
+    A,
+    B,
+    C,
+    D,
+    E,
+    F,
+    G,
+    H,
+    I,
+    J,
+    K,
+    L,
+    M,
+    N,
+    O,
+    P,
+    Q,
+    R,
+    S,
+    T,
+    U,
+    V,
+    W,
+    X,
+    Y,
+    Z,
+    Digit0,
+    Digit1,
+    Digit2,
+    Digit3,
+    Digit4,
+    Digit5,
+    Digit6,
+    Digit7,
+    Digit8,
+    Digit9,
+    Enter,
+    Escape,
+    Backspace,
+    Tab,
+    Space,
+    Left,
+    Right,
+    Up,
+    Down,
+    Home,
+    End,
+    PageUp,
+    PageDown,
+    Insert,
+    Delete,
+    ShiftLeft,
+    ShiftRight,
+    ControlLeft,
+    ControlRight,
+    AltLeft,
+    AltRight,
+    MetaLeft,
+    MetaRight,
+    CapsLock,
+    Minus,
+    Equal,
+    BracketLeft,
+    BracketRight,
+    Backslash,
+    Semicolon,
+    Quote,
+    Backquote,
+    Comma,
+    Period,
+    Slash,
+    F1,
+    F2,
+    F3,
+    F4,
+    F5,
+    F6,
+    F7,
+    F8,
+    F9,
+    F10,
+    F11,
+    F12,
+    NumpadEnter,
+    NumpadAdd,
+    NumpadSubtract,
+    NumpadMultiply,
+    NumpadDivide,
+    NumpadDecimal,
+}
+
+/// An input event. Positions are in pixels from the screen's top left, as `frame`'s width and
+/// height count them.
+pub enum Event: Copy + Eq + StateHash + Serialize {
+    PointerMove { at: vec2, mods: Mods },
+    PointerDown { at: vec2, button: Button, mods: Mods },
+    PointerUp { at: vec2, button: Button, mods: Mods },
+    /// A scroll: right and down are positive, in pixels.
+    Wheel { at: vec2, delta: vec2, mods: Mods },
+    /// `repeat` is true when the key is held and the keyboard repeats it.
+    KeyDown { key: Key, repeat: bool, mods: Mods },
+    KeyUp { key: Key, mods: Mods },
+    /// A character typed: a Unicode scalar value.
+    Text { char: u32 },
+}
+
+/// An event as the host lays it out: its kind, its modifiers, then four words.
+struct RawEvent: Copy + Plain {
+    kind: u32,
+    mods: u32,
+    a: u32,
+    b: u32,
+    c: u32,
+    d: u32,
+}
+
+/// The events that have arrived since the program last read them, oldest first. Each event is
+/// read once. It's `nondet` (§8).
+///
+/// ```wrela
+/// use std::input::{Event, events}
+///
+/// pub fn frame(time: f32, width: u32, height: u32) {
+///     for e in events() {
+///         if let Event::PointerDown { at, .. } = e {
+///             std::io::print(f"down at {at.x}, {at.y}")
+///         }
+///     }
+/// }
+/// ```
+pub fn events() -> Vec<Event> {
+    let raw: Vec<RawEvent> = Vec::from_input()
+    var out: Vec<Event> = Vec::with_capacity(raw.len())
+    for r in raw {
+        if let Some(e) = event_of(r) {
+            out.push(e)
+        }
+    }
+    out
+}
+
+fn mods_of(bits: u32) -> Mods {
+    Mods {
+        shift: bits & 1 != 0,
+        ctrl: bits & 2 != 0,
+        alt: bits & 4 != 0,
+        meta: bits & 8 != 0,
+    }
+}
+
+fn button_of(b: u32) -> Button {
+    match b {
+        1 => Button::Middle,
+        2 => Button::Secondary,
+        _ => Button::Primary,
+    }
+}
+
+/// An event from its layout; `None` for a kind this std doesn't know.
+fn event_of(r: RawEvent) -> Option<Event> {
+    let at = vec2(bitcast_f32(r.a), bitcast_f32(r.b))
+    let mods = mods_of(r.mods)
+    match r.kind {
+        1 => Some(Event::PointerMove { at, mods }),
+        2 => Some(Event::PointerDown { at, button: button_of(r.c), mods }),
+        3 => Some(Event::PointerUp { at, button: button_of(r.c), mods }),
+        4 => Some(Event::Wheel { at, delta: vec2(bitcast_f32(r.c), bitcast_f32(r.d)), mods }),
+        5 => Some(Event::KeyDown { key: key_of(r.a), repeat: r.b != 0, mods }),
+        6 => Some(Event::KeyUp { key: key_of(r.a), mods }),
+        7 => Some(Event::Text { char: r.a }),
+        _ => None,
+    }
+}
+
+/// The key numbered `code` (runtime/abi `input`'s `KEYS`): `Key::Unknown` for another.
+pub fn key_of(code: u32) -> Key {
+    match code {
+        1 => Key::A,
+        2 => Key::B,
+        3 => Key::C,
+        4 => Key::D,
+        5 => Key::E,
+        6 => Key::F,
+        7 => Key::G,
+        8 => Key::H,
+        9 => Key::I,
+        10 => Key::J,
+        11 => Key::K,
+        12 => Key::L,
+        13 => Key::M,
+        14 => Key::N,
+        15 => Key::O,
+        16 => Key::P,
+        17 => Key::Q,
+        18 => Key::R,
+        19 => Key::S,
+        20 => Key::T,
+        21 => Key::U,
+        22 => Key::V,
+        23 => Key::W,
+        24 => Key::X,
+        25 => Key::Y,
+        26 => Key::Z,
+        27 => Key::Digit0,
+        28 => Key::Digit1,
+        29 => Key::Digit2,
+        30 => Key::Digit3,
+        31 => Key::Digit4,
+        32 => Key::Digit5,
+        33 => Key::Digit6,
+        34 => Key::Digit7,
+        35 => Key::Digit8,
+        36 => Key::Digit9,
+        37 => Key::Enter,
+        38 => Key::Escape,
+        39 => Key::Backspace,
+        40 => Key::Tab,
+        41 => Key::Space,
+        42 => Key::Left,
+        43 => Key::Right,
+        44 => Key::Up,
+        45 => Key::Down,
+        46 => Key::Home,
+        47 => Key::End,
+        48 => Key::PageUp,
+        49 => Key::PageDown,
+        50 => Key::Insert,
+        51 => Key::Delete,
+        52 => Key::ShiftLeft,
+        53 => Key::ShiftRight,
+        54 => Key::ControlLeft,
+        55 => Key::ControlRight,
+        56 => Key::AltLeft,
+        57 => Key::AltRight,
+        58 => Key::MetaLeft,
+        59 => Key::MetaRight,
+        60 => Key::CapsLock,
+        61 => Key::Minus,
+        62 => Key::Equal,
+        63 => Key::BracketLeft,
+        64 => Key::BracketRight,
+        65 => Key::Backslash,
+        66 => Key::Semicolon,
+        67 => Key::Quote,
+        68 => Key::Backquote,
+        69 => Key::Comma,
+        70 => Key::Period,
+        71 => Key::Slash,
+        72 => Key::F1,
+        73 => Key::F2,
+        74 => Key::F3,
+        75 => Key::F4,
+        76 => Key::F5,
+        77 => Key::F6,
+        78 => Key::F7,
+        79 => Key::F8,
+        80 => Key::F9,
+        81 => Key::F10,
+        82 => Key::F11,
+        83 => Key::F12,
+        84 => Key::NumpadEnter,
+        85 => Key::NumpadAdd,
+        86 => Key::NumpadSubtract,
+        87 => Key::NumpadMultiply,
+        88 => Key::NumpadDivide,
+        89 => Key::NumpadDecimal,
+        _ => Key::Unknown,
+    }
+}
+
+/// What's held and where the pointer is, kept from the events a program reads: call `read` once
+/// per frame (or `update` with events from elsewhere, such as a replay), then ask.
+pub struct Input: Clone {
+    /// This frame's events, oldest first.
+    pub events: Vec<Event>,
+    /// Where the pointer last was.
+    pub pointer: vec2,
+    buttons: u32,
+    keys: [u32; 4],
+    pub mods: Mods,
+}
+
+impl Input {
+    /// Nothing held, and the pointer nowhere (-1, -1).
+    pub fn new() -> Input {
+        Input {
+            events: Vec::new(),
+            pointer: vec2(-1.0),
+            buttons: 0,
+            keys: [0; 4],
+            mods: Mods {},
+        }
+    }
+
+    /// Reads the events that have arrived (`events()`, `nondet`) and updates what's held.
+    pub fn read(mut self) {
+        self.update(events())
+    }
+
+    /// This frame's events are `events`: what's held follows them. Deterministic.
+    pub fn update(mut self, events: take Vec<Event>) {
+        for e in events {
+            match e {
+                Event::PointerMove { at, mods } => {
+                    self.pointer = at
+                    self.mods = mods
+                },
+                Event::PointerDown { at, button, mods } => {
+                    self.pointer = at
+                    self.buttons = self.buttons | (1 << u32(button))
+                    self.mods = mods
+                },
+                Event::PointerUp { at, button, mods } => {
+                    self.pointer = at
+                    self.buttons = self.buttons & !(1 << u32(button))
+                    self.mods = mods
+                },
+                Event::Wheel { at, mods, .. } => {
+                    self.pointer = at
+                    self.mods = mods
+                },
+                Event::KeyDown { key, mods, .. } => {
+                    let k = u32(key)
+                    self.keys[k / 32] = self.keys[k / 32] | (1 << (k % 32))
+                    self.mods = mods
+                },
+                Event::KeyUp { key, mods } => {
+                    let k = u32(key)
+                    self.keys[k / 32] = self.keys[k / 32] & !(1 << (k % 32))
+                    self.mods = mods
+                },
+                Event::Text { .. } => {},
+            }
+        }
+        self.events = take events
+    }
+
+    /// Whether `key` is held.
+    pub fn held(self, key: Key) -> bool {
+        let k = u32(key)
+        (self.keys[k / 32] >> (k % 32)) & 1 == 1
+    }
+
+    /// Whether `button` is held.
+    pub fn down(self, button: Button) -> bool {
+        (self.buttons >> u32(button)) & 1 == 1
+    }
+
+    /// Whether `key` went down this frame (not a repeat).
+    pub fn pressed(self, key: Key) -> bool {
+        for e in self.events {
+            if let Event::KeyDown { key: k, repeat: false, .. } = e {
+                if k == key {
+                    return true
+                }
+            }
+        }
+        false
+    }
+
+    /// The text typed this frame, in order: Unicode scalar values.
+    pub fn typed(self) -> Vec<u32> {
+        var out: Vec<u32> = Vec::new()
+        for e in self.events {
+            if let Event::Text { char } = e {
+                out.push(char)
+            }
+        }
+        out
+    }
+}

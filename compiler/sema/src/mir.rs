@@ -43,6 +43,10 @@ pub struct Body {
     pub closures: Vec<ClosureInfo>,
     /// For a return type that names traits: the concrete type the body returns.
     pub hidden_ret: Option<TyId>,
+    /// Calls a statement makes only to throw their value away: the callee, whether any
+    /// argument is lent `mut`, the value's type, and where (the effects pass reports those
+    /// that change nothing, E0333).
+    pub discarded: Vec<(Callee, bool, TyId, Span)>,
 }
 
 impl Body {
@@ -159,7 +163,7 @@ pub struct LocalDecl {
     pub ty: TyId,
     pub kind: LocalKind,
     pub span: Span,
-    /// The `let` that binds it alone, for fixes that change it to `var`.
+    /// The `let` or `var` that binds it alone, for fixes that change one to the other.
     pub keyword: Option<Span>,
     /// Bound by a struct pattern's field shorthand (see `thir::LocalDecl`).
     pub shorthand: bool,
@@ -348,6 +352,47 @@ pub enum Rvalue {
     },
     Dispatch(Box<Dispatch>),
     Draw(Box<Draw>),
+}
+
+impl Rvalue {
+    /// Calls `f` on each operand, in order: a call's and a borrow struct's `take` arguments
+    /// among them, not the places they lend.
+    pub fn for_each_operand(&self, f: &mut impl FnMut(&Operand)) {
+        match self {
+            Rvalue::Use(o)
+            | Rvalue::Unary(_, o)
+            | Rvalue::ArrayRepeat(o, _)
+            | Rvalue::Convert(o) => f(o),
+            Rvalue::Binary(_, a, b) => {
+                f(a);
+                f(b);
+            }
+            Rvalue::Adt { fields: xs, .. }
+            | Rvalue::Tuple(xs)
+            | Rvalue::Array(xs)
+            | Rvalue::Construct(xs) => xs.iter().for_each(f),
+            Rvalue::Call(Call { args, .. }) | Rvalue::BorrowStruct { fields: args, .. } => {
+                for a in args {
+                    if let Arg::Take(o) = a {
+                        f(o);
+                    }
+                }
+            }
+            Rvalue::Dispatch(d) => d.groups.iter().for_each(f),
+            Rvalue::Draw(d) => {
+                f(&d.vertices);
+                f(&d.instances);
+            }
+            Rvalue::Discriminant(_)
+            | Rvalue::Len(_)
+            | Rvalue::Closure(_)
+            | Rvalue::FnRef(..)
+            | Rvalue::Const(_)
+            | Rvalue::Text(_)
+            | Rvalue::Embed(_)
+            | Rvalue::ConstParam(_) => {}
+        }
+    }
 }
 
 #[derive(Clone, Debug)]

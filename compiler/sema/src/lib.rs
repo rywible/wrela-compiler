@@ -21,7 +21,7 @@ pub const OUTPUT_DIRS: &[&str] = &["build", "results", "node_modules", "target"]
 pub mod traits;
 pub mod ty;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use wrela_diag::Diagnostic;
 
 pub use collect::SourceUnit;
@@ -43,6 +43,8 @@ pub const STD_SOURCES: &[(&str, &str)] = &[
     ("std::par", include_str!("../../std/par.wrela")),
     ("std::audio", include_str!("../../std/audio.wrela")),
     ("std::io", include_str!("../../std/io.wrela")),
+    ("std::input", include_str!("../../std/input.wrela")),
+    ("std::lift", include_str!("../../std/lift.wrela")),
     ("std::gpu", include_str!("../../std/gpu.wrela")),
     ("std::derive", include_str!("../../std/derive.wrela")),
     ("std::field", include_str!("../../std/field.wrela")),
@@ -58,6 +60,15 @@ pub struct Checked {
     /// Each function body's MIR.
     pub mir: BTreeMap<ty::FnId, mir::Body>,
     pub consts: BTreeMap<ty::ConstId, (ty::TyId, thir::Expr)>,
+    /// The type each function that returns by naming its traits (`-> Creature<Coat>`) returns.
+    pub hidden: HashMap<ty::FnId, ty::TyId>,
+}
+
+impl Checked {
+    /// `t` through the types functions return by naming their traits ([`traits::reveal`]).
+    pub fn reveal(&self, t: ty::TyId) -> ty::TyId {
+        traits::reveal(&self.program, &self.hidden, t)
+    }
 }
 
 /// Every file `embed` reads, with where it's read: from the bodies' MIR and the constants'
@@ -168,5 +179,6 @@ pub fn check_packages(
     for i in 0..p.adts.len() {
         diags.extend(check::check_field_defaults(p, &const_tys, ty::AdtId(i as u32)));
     }
-    Checked { program, mir, consts }
+    let hidden = hidden.into_iter().collect();
+    Checked { program, mir, consts, hidden }
 }

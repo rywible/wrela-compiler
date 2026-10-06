@@ -6,6 +6,7 @@ import { Checker, CommandError } from "../src/check.ts";
 import { StateHash } from "../src/hash.ts";
 import { Lines } from "../src/lines.ts";
 import { parseManifest } from "../src/manifest.ts";
+import { parseScript } from "../src/input.ts";
 import { decode, Sequencer, StreamError } from "../src/stream.ts";
 import { type ErrorVector, vectors } from "./fixtures.ts";
 
@@ -112,6 +113,23 @@ describe("line tables", () => {
       }
       expect(error).toBe(v.error);
       for (const [offset, loc] of v.at) expect(lines!.at(offset)).toBe(loc);
+    });
+  }
+});
+
+describe("input scripts", () => {
+  const hex = (b: Uint8Array) => Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+  for (const v of vectors.input) {
+    test(v.name, () => {
+      if (v.error !== undefined) {
+        // JSON's own errors are worded by each parser; the rest are the ABI's.
+        const expected = v.error.startsWith("the script isn't JSON") ? "the script isn't JSON" : v.error;
+        expect(() => parseScript(v.script)).toThrow(expected);
+        return;
+      }
+      const events = parseScript(v.script);
+      expect(events.map((e) => e.frame)).toEqual(v.frames!);
+      expect(events.map((e) => hex(e.event))).toEqual(v.events!);
     });
   }
 });

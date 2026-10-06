@@ -16,7 +16,7 @@ export interface Build {
   shaders: string[];
 }
 
-export type Fetch = (url: URL) => Promise<Response>;
+export type Fetch = (url: URL, init?: RequestInit) => Promise<Response>;
 
 async function get(fetchFn: Fetch, url: URL): Promise<Response> {
   let response: Response;
@@ -56,7 +56,7 @@ export async function loadBuild(base: string, fetchFn: Fetch = (url) => fetch(ur
  * path (so two games on one origin don't share it). Paths are checked before they get here
  * (`pathProblem`).
  */
-export function browserIo(base: string, fetchFn: Fetch = (url) => fetch(url)): Io {
+export function browserIo(base: string, fetchFn: Fetch = (url, init) => fetch(url, init)): Io {
   const root = ["wrela", ...new URL(base).pathname.split("/").filter((p) => p !== "")];
   const dir = async (parts: string[], create: boolean) => {
     let d = await navigator.storage.getDirectory();
@@ -81,6 +81,12 @@ export function browserIo(base: string, fetchFn: Fetch = (url) => fetch(url)): I
       const w = await (await file(path, true)).createWritable();
       await w.write(data);
       await w.close();
+    },
+    async post(url, body) {
+      // Only to the build's own origin: the path is relative (`pathProblem`).
+      const response = await fetchFn(new URL(url, base), { method: "POST", body });
+      if (!response.ok) throw new Error(`POST ${url} failed: ${response.status} ${response.statusText}`);
+      return new Uint8Array(await response.arrayBuffer());
     },
   };
 }

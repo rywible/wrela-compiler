@@ -57,6 +57,9 @@ pub struct PackageInfo {
     pub deps: Vec<(String, usize)>,
     /// Its manifest declares `unsafe`.
     pub unsafe_ok: bool,
+    /// A lifted build lifts its literals (language.md §22): its literal tables are built where
+    /// they're used, from their literals, rather than kept as data.
+    pub lifted: bool,
 }
 
 impl PackageInfo {
@@ -68,12 +71,14 @@ impl PackageInfo {
                 kind: PackageKind::Std,
                 deps: Vec::new(),
                 unsafe_ok: true,
+                lifted: false,
             },
             PackageInfo {
                 name: "main".into(),
                 kind: PackageKind::Program,
                 deps: Vec::new(),
                 unsafe_ok: false,
+                lifted: false,
             },
         ]
     }
@@ -177,6 +182,7 @@ impl<'d, 'u> Collector<'d, 'u> {
                 kind: info.kind,
                 deps: info.deps.iter().map(|(n, d)| (n.clone(), PackageId(*d as u32))).collect(),
                 unsafe_ok: info.unsafe_ok,
+                lifted: info.lifted,
             });
         }
         let mut modules = Vec::new();
@@ -717,7 +723,7 @@ impl<'d, 'u> Collector<'d, 'u> {
                 "intrinsic" if is_std => out.intrinsic = true,
                 "test" => {
                     if let Some(args) = &a.args {
-                        out.test_frames = self.test_frames(a, args);
+                        (out.test_frames, out.test_input) = self.test_frames(a, args);
                     }
                     out.test = Some(a.span);
                 }
@@ -791,29 +797,45 @@ impl<'d, 'u> Collector<'d, 'u> {
     }
 
     /// `@compute(x)`, `@compute(x, y)` or `@compute(x, y, z)`, within WebGPU's default limits.
-    /// `@test(frames: n)`'s `n` (§10): from 1 to [`MAX_TEST_FRAMES`]. Anything else is E0222.
-    fn test_frames(&mut self, a: &ast::Attribute, args: &[ast::Arg]) -> Option<u32> {
-        let n = match args {
-            [arg] if arg.name.as_ref().is_some_and(|n| n.name == "frames") => {
-                match &arg.value.kind {
-                    ast::ExprKind::Lit(ast::Lit { kind: ast::LitKind::Int(v), .. }) => v.ok(),
-                    _ => None,
-                }
-            }
+    /// `@test(frames: n)`'s `n` (§10): from 1 to [`MAX_TEST_FRAMES`], and, with
+    /// `input: "path"`, the script of input events its frames get. Anything else is E0222.
+    fn test_frames(
+        &mut self,
+        a: &ast::Attribute,
+        args: &[ast::Arg],
+    ) -> (Option<u32>, Option<(String, Span)>) {
+        let named =
+            |name: &str| args.iter().find(|x| x.name.as_ref().is_some_and(|n| n.name == name));
+        let others = args
+            .iter()
+            .any(|x| !x.name.as_ref().is_some_and(|n| n.name == "frames" || n.name == "input"));
+        let n = match named("frames").map(|x| &x.value.kind) {
+            Some(ast::ExprKind::Lit(ast::Lit { kind: ast::LitKind::Int(v), .. })) => v.ok(),
             _ => None,
         };
-        match n {
-            Some(n) if (1..=u64::from(MAX_TEST_FRAMES)).contains(&n) => Some(n as u32),
+        let input = match named("input") {
+            None => Ok(None),
+            Some(x) => match &x.value.kind {
+                ast::ExprKind::Lit(l @ ast::Lit { kind: ast::LitKind::Str, .. }) => {
+                    Ok(Some((wrela_syntax::lexer::string_value(&l.text), x.value.span)))
+                }
+                _ => Err(()),
+            },
+        };
+        match (n, input) {
+            (Some(n), Ok(input)) if !others && (1..=u64::from(MAX_TEST_FRAMES)).contains(&n) => {
+                (Some(n as u32), input)
+            }
             _ => {
                 self.diags.push(
                     Diagnostic::new(
                         codes::E0222,
                         a.span,
-                        format!("`@test` takes `frames: n`, from 1 to {MAX_TEST_FRAMES}: how many of the program's frames run before the test"),
+                        format!("`@test` takes `frames: n`, from 1 to {MAX_TEST_FRAMES}: how many of the program's frames run before the test; and may take `input: \"script.json\"`, a script of input events for them"),
                     )
                     .with_note("`@test` alone is a test of code; `@test(frames: 600)` runs the program for 600 frames, then the test with its state (§10)"),
                 );
-                None
+                (None, None)
             }
         }
     }
@@ -1310,6 +1332,11 @@ impl<'d, 'u> Collector<'d, 'u> {
         let Some(at) = def.attrs.test else { return };
         let frames = def.attrs.test_frames.is_some();
         let program = self.p.package_of(def.module).kind == PackageKind::Program;
+        // A dependency's frame test is about its own program, checked when it's the package
+        // checked; here its frames aren't this program's.
+        if frames && !program {
+            return;
+        }
         // The program's state: what `init`, in main.wrela, makes.
         let state = self.p.main.and_then(|main| {
             self.p
@@ -1322,8 +1349,6 @@ impl<'d, 'u> Collector<'d, 'u> {
         };
         let why = if def.owner != FnOwner::Free {
             Some("it's a method, and a test is a function of its own")
-        } else if frames && !program {
-            Some("a library has no frames to run: a frame test is a program's")
         } else if frames && !def.params.is_empty() && state.is_none() {
             Some("it takes a parameter, and the program has no state to pass it (`init` makes one)")
         } else if frames && (def.params.len() > 1 || !def.params.iter().all(takes_state)) {

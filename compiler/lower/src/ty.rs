@@ -53,54 +53,7 @@ impl<'a> Cx<'a> {
         let p = &self.checked.program;
         let t = p.types.subst(t, subst);
         let t = wrela_sema::traits::normalize(p, t, None);
-        self.reveal(t)
-    }
-
-    /// Replaces `Opaque(f, args)` by `f`'s hidden return type, instantiated.
-    pub fn reveal(&mut self, t: TyId) -> TyId {
-        if !self.checked.program.types.any(t, &mut |k| matches!(k, TyKind::Opaque(..))) {
-            return t;
-        }
-        let k = self.checked.program.types.kind(t);
-        match k {
-            TyKind::Opaque(f, args) => {
-                let Some(hidden) = self.checked.mir.get(f).and_then(|b| b.hidden_ret) else {
-                    return self.checked.program.types.error;
-                };
-                let generics = self.checked.program.fn_all_generics(*f);
-                let subst = Subst::from_pairs(&generics, args);
-                self.concrete(hidden, &subst)
-            }
-            TyKind::Tuple(ts) => {
-                let ts = ts.iter().map(|&x| self.reveal(x)).collect();
-                self.checked.program.types.intern(TyKind::Tuple(ts))
-            }
-            TyKind::Adt(a, ts) => {
-                let ts = ts.iter().map(|&x| self.reveal(x)).collect();
-                self.checked.program.types.intern(TyKind::Adt(*a, ts))
-            }
-            TyKind::Array(e, n) => {
-                let e = self.reveal(*e);
-                self.checked.program.types.intern(TyKind::Array(e, *n))
-            }
-            TyKind::Slice(e) => {
-                let e = self.reveal(*e);
-                self.checked.program.types.intern(TyKind::Slice(e))
-            }
-            // An associated type of a return-position trait type (`<impl Creature<C>>::Shape`):
-            // revealed, it names an impl's type, which normalizing finds.
-            TyKind::Projection { self_ty, trait_, trait_args, name } => {
-                let (trait_, name) = (*trait_, name.clone());
-                let args: Vec<TyId> = trait_args.clone();
-                let self_ty = self.reveal(*self_ty);
-                let trait_args = args.iter().map(|&x| self.reveal(x)).collect();
-                let p = &self.checked.program;
-                let t = p.types.intern(TyKind::Projection { self_ty, trait_, trait_args, name });
-                let t = wrela_sema::traits::normalize(p, t, None);
-                self.reveal(t)
-            }
-            _ => t,
-        }
+        self.checked.reveal(t)
     }
 
     /// The substitution of an instance's source function's generics.
@@ -224,7 +177,7 @@ impl<'a> Cx<'a> {
                     }
                     let mut fields = Vec::new();
                     for (d, ft) in p.adt_fields(*a, None).iter().zip(p.fields_of(*a, args, None)) {
-                        let ft = self.reveal(ft);
+                        let ft = self.checked.reveal(ft);
                         if let Some(f) = self.lower_ty(mb, ft, span) {
                             // A borrow struct's projection field points at its place.
                             let f = if borrow && d.mode != RetMode::Owned {
@@ -243,7 +196,7 @@ impl<'a> Cx<'a> {
                 }
             }
             TyKind::Opaque(..) => {
-                let r = self.reveal(t);
+                let r = self.checked.reveal(t);
                 self.lower_ty(mb, r, span)
             }
             // A closure that captures only `Copy` values it reads is a value: copies of them
@@ -368,7 +321,7 @@ impl<'a> Cx<'a> {
         let mut out = Vec::new();
         let mut next = 0;
         for ft in fields {
-            let revealed = self.reveal(ft);
+            let revealed = self.checked.reveal(ft);
             if self.lower_ty(mb, revealed, span).is_some() {
                 out.push((Some(next), ft));
                 next += 1;

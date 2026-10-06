@@ -15,7 +15,19 @@ pub fn run(args: &[String]) -> ExitCode {
     };
     let dir = &args.dir;
     let out = args.out.unwrap_or_else(|| dir.join("build"));
-    let output = if args.debug { wrela_driver::build_debug(dir) } else { wrela_driver::build(dir) };
+    let output = if !args.lift.is_empty() {
+        match wrela_driver::build_lifted(dir, &args.lift, args.debug) {
+            Ok(o) => o,
+            Err(why) => {
+                eprintln!("error: {why}");
+                return ExitCode::from(2);
+            }
+        }
+    } else if args.debug {
+        wrela_driver::build_debug(dir)
+    } else {
+        wrela_driver::build(dir)
+    };
     let failed = crate::report(&output, args.json);
     let owned = match owned(&out) {
         Ok(o) => o,
@@ -69,6 +81,7 @@ fn written_by_build(name: &str) -> bool {
     pipeline
         || name == "game.wasm"
         || name == "manifest.json"
+        || name == "lift.json"
         || wrela_driver::build::RUNTIME_FILES.iter().any(|(f, _)| *f == name)
 }
 

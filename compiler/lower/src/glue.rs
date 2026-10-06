@@ -47,7 +47,7 @@ impl<'a> Cx<'a> {
             .iter()
             .map(|g| subst.get(*g).unwrap_or(program.types.error))
             .collect();
-        let substs = substs.into_iter().map(|t| self.reveal(t)).collect();
+        let substs = substs.into_iter().map(|t| self.checked.reveal(t)).collect();
         Some(InstanceKey::plain(func, substs))
     }
 
@@ -270,7 +270,7 @@ impl G<'_, '_> {
             .field_map(self.mb, t, variant, span)
             .into_iter()
             .filter_map(|(k, ft)| {
-                let ft = self.cx.reveal(ft);
+                let ft = self.cx.checked.reveal(ft);
                 k.map(|k| (base.with(ir::Proj::Field(k)), ft))
             })
             .collect()

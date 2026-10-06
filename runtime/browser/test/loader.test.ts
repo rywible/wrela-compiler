@@ -35,11 +35,11 @@ test("loads a build's manifest, WASM and shaders", async () => {
 });
 
 test("rejects a manifest of another version, loudly", async () => {
-  const manifest = readFixtureText("manifest.json").replace('"manifest_version": 2', '"manifest_version": 3');
+  const manifest = readFixtureText("manifest.json").replace('"manifest_version": 3', '"manifest_version": 4');
   const load = loadBuild(BASE, server({ "manifest.json": manifest }).fetch);
   await expect(load).rejects.toThrow(ManifestError);
   await expect(loadBuild(BASE, server({ "manifest.json": manifest }).fetch)).rejects.toThrow(
-    "invalid manifest: manifest version 3, but this host reads version 2",
+    "invalid manifest: manifest version 4, but this host reads version 3",
   );
 });
 

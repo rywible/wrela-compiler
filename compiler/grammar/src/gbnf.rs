@@ -43,7 +43,7 @@
 
 use crate::cfg::{Cfg, Recursion, Sym};
 use crate::ebnf::{Grammar, Terminal};
-use crate::generate::{glued_gt, is_number, is_word, no_glue_pairs};
+use crate::generate::{glued_gt, is_word, no_glue_pairs};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -148,7 +148,7 @@ fn class(t: Terminal) -> Prev {
     if t == Terminal::TupleIndex {
         return Prev::Ti;
     }
-    if is_number(k) {
+    if k.is_number() {
         return Prev::Nc;
     }
     if matches!(k, TokenKind::Pipe | TokenKind::OrOr) {
@@ -722,7 +722,7 @@ pub fn export(g: &Grammar) -> Result<String, ExportError> {
                         let dot_then_name =
                             t == DOT && matches!(a.get(i + 1), Some(SSym::T(n, ..)) if *n == IDENT);
                         let mandatory = preds.iter().any(|p| {
-                            merges(*p, t) && !(dot_then_name && is_number(p.lexer_kind()))
+                            merges(*p, t) && !(dot_then_name && p.lexer_kind().is_number())
                         });
                         // Nothing breaks a line in an f-string's hole, which ends at an
                         // FSTRING_MID or FSTRING_TAIL (L22).

@@ -1,0 +1,79 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0333",
+      "file": "main.wrela",
+      "fixes": [
+        {
+          "edits": [
+            {
+              "end": 287,
+              "file": "main.wrela",
+              "replacement": "let _ = ",
+              "start": 287
+            }
+          ],
+          "message": "discard it on purpose"
+        }
+      ],
+      "help": [
+        "use the result (`x = x.normalize()`), or write `let _ = ...` to discard it on purpose"
+      ],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "this throws away what `normalize` returns, and the call does nothing else",
+      "notes": [
+        "a call changes only what it's lent `mut`; this one is lent nothing, so its result is all it gives"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 5,
+        "end": 304,
+        "end_column": 22,
+        "end_line": 14,
+        "line": 14,
+        "start": 287
+      },
+      "title": "a call's result thrown away, where the call does nothing else"
+    },
+    {
+      "code": "E0333",
+      "file": "main.wrela",
+      "fixes": [
+        {
+          "edits": [
+            {
+              "end": 309,
+              "file": "main.wrela",
+              "replacement": "let _ = ",
+              "start": 309
+            }
+          ],
+          "message": "discard it on purpose"
+        }
+      ],
+      "help": [
+        "use the result (`x = x.normalize()`), or write `let _ = ...` to discard it on purpose"
+      ],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "this throws away what `grow` returns, and the call does nothing else",
+      "notes": [
+        "a call changes only what it's lent `mut`; this one is lent nothing, so its result is all it gives"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 5,
+        "end": 324,
+        "end_column": 20,
+        "end_line": 15,
+        "line": 15,
+        "start": 309
+      },
+      "title": "a call's result thrown away, where the call does nothing else"
+    }
+  ],
+  "version": 2
+}

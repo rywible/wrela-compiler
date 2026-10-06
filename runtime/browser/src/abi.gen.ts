@@ -1,8 +1,8 @@
 // Generated from the wrela-abi crate (runtime/abi): the one definition of the
 // command stream and manifest. Don't edit; run `cargo run -p wrela-abi --bin gen-ts`.
 
-export const STREAM_VERSION = 4;
-export const MANIFEST_VERSION = 2;
+export const STREAM_VERSION = 5;
+export const MANIFEST_VERSION = 3;
 /** The bytes `WRCS`, read as a little-endian u32. */
 export const STREAM_MAGIC = 0x53435257;
 export const HEADER_LEN = 12;
@@ -34,6 +34,7 @@ export const Opcode = {
   StorageWrite: 20,
   Fetch: 21,
   Log: 22,
+  Post: 23,
 } as const;
 
 /** A texture's format, by its number in the stream: WebGPU's name, the bytes of one texel, and
@@ -55,6 +56,27 @@ export const IMPORT_LIMIT = "limit";
 export const IMPORT_MEMORY = "memory";
 export const EXPORT_WORKER = "__worker";
 export const IMPORT_AUDIO = "audio";
+export const IMPORT_INPUT = "input";
+/** Input (runtime/abi `input`): an event is EVENT_SIZE bytes, six words: its kind, its
+ * modifiers, then four words that depend on the kind. */
+export const EVENT_SIZE = 24;
+export const EventKind = {
+  PointerMove: 1,
+  PointerDown: 2,
+  PointerUp: 3,
+  Wheel: 4,
+  KeyDown: 5,
+  KeyUp: 6,
+  Text: 7,
+} as const;
+export const MODIFIER_SHIFT = 1;
+export const MODIFIER_CONTROL = 2;
+export const MODIFIER_ALT = 4;
+export const MODIFIER_META = 8;
+/** A pointer's buttons, by number, as a script names them. */
+export const BUTTONS = ["primary", "middle", "secondary"] as const;
+/** The physical keys, by number: DOM's `KeyboardEvent.code` (0: one not listed). */
+export const KEYS = ["Unknown", "KeyA", "KeyB", "KeyC", "KeyD", "KeyE", "KeyF", "KeyG", "KeyH", "KeyI", "KeyJ", "KeyK", "KeyL", "KeyM", "KeyN", "KeyO", "KeyP", "KeyQ", "KeyR", "KeyS", "KeyT", "KeyU", "KeyV", "KeyW", "KeyX", "KeyY", "KeyZ", "Digit0", "Digit1", "Digit2", "Digit3", "Digit4", "Digit5", "Digit6", "Digit7", "Digit8", "Digit9", "Enter", "Escape", "Backspace", "Tab", "Space", "ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End", "PageUp", "PageDown", "Insert", "Delete", "ShiftLeft", "ShiftRight", "ControlLeft", "ControlRight", "AltLeft", "AltRight", "MetaLeft", "MetaRight", "CapsLock", "Minus", "Equal", "BracketLeft", "BracketRight", "Backslash", "Semicolon", "Quote", "Backquote", "Comma", "Period", "Slash", "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12", "NumpadEnter", "NumpadAdd", "NumpadSubtract", "NumpadMultiply", "NumpadDivide", "NumpadDecimal"] as const;
 /** Every function a program may import besides its memory, with its type as both hosts word
  * it. */
 export const HOST_FUNCTIONS = [
@@ -63,6 +85,7 @@ export const HOST_FUNCTIONS = [
   ["request_take", "(i32, i32) -> ()"],
   ["limit", "(i32) -> (i32)"],
   ["audio", "(i32, i32) -> ()"],
+  ["input", "(i32, i32) -> (i32)"],
 ] as const;
 export const EXPORT_AUDIO = "__audio";
 /** The audio thread's rate and render quantum, and where `__audio` leaves a quantum's samples. */

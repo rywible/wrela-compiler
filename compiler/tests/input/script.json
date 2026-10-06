@@ -1,0 +1,16 @@
+[
+  { "frame": 0, "type": "move", "x": 100, "y": 120 },
+  { "frame": 1, "type": "move", "x": 110, "y": 125 },
+  { "frame": 2, "type": "keydown", "key": "ShiftLeft", "shift": true },
+  { "frame": 2, "type": "down", "x": 110, "y": 125, "shift": true },
+  { "frame": 3, "type": "move", "x": 135, "y": 130, "shift": true },
+  { "frame": 4, "type": "move", "x": 160, "y": 140, "shift": true },
+  { "frame": 5, "type": "up", "x": 160, "y": 140, "shift": true },
+  { "frame": 6, "type": "keyup", "key": "ShiftLeft" },
+  { "frame": 6, "type": "wheel", "x": 160, "y": 140, "dx": 0, "dy": 120 },
+  { "frame": 7, "type": "wheel", "x": 160, "y": 140, "dx": -2.5, "dy": -40 },
+  { "frame": 8, "type": "key", "key": "Tab" },
+  { "frame": 9, "type": "down", "x": 5, "y": 6, "button": "secondary", "ctrl": true },
+  { "frame": 9, "type": "up", "x": 5, "y": 6, "button": "secondary" },
+  { "frame": 10, "type": "text", "text": "Grüße, ÿ!" }
+]

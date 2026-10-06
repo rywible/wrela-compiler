@@ -8,7 +8,7 @@
 
 use engine::creature::Creature
 use engine::look::Shading
-use engine::render::{Lights, Palette, SkinnedMesh, View, realize_mesh, shade, skin}
+use engine::render::{Lights, MAX_BONES, Palette, SkinnedMesh, View, realize_mesh, shade, skin}
 use engine::rng::seed
 use grazer::sketch::{GRAZER_LOOK, Tissue, grazer}
 use std::gpu::{DepthTexture, begin_screen_pass_with_depth, depth_texture, draw}
@@ -63,7 +63,7 @@ fn pose(time: f32, at: vec3) -> Palette {
         vec4(0.0, 1.0, 0.0, 0.0),
         vec4(0.0, 0.0, 1.0, 0.0),
         vec4(at, 1.0),
-    ); 32]
+    ); MAX_BONES]
     let a = 0.15 * sin(time * 2.0)
     let (c, s) = (cos(a), sin(a))
     let pivot = vec3(0.0, 1.5, 1.55)

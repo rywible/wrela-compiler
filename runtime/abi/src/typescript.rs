@@ -1,6 +1,6 @@
 //! The browser runtime's copy of the ABI's constants, generated so they're defined once.
 
-use crate::{check, hash, manifest, stream};
+use crate::{check, hash, input, manifest, stream};
 
 /// The checked-in TypeScript module, relative to the repository root.
 pub const TS_PATH: &str = "runtime/browser/src/abi.gen.ts";
@@ -33,6 +33,10 @@ pub fn typescript() -> String {
         .iter()
         .map(|f| format!("  [{:?}, {:?}],\n", f.name, f.signature()))
         .collect();
+    let event_kinds: String =
+        input::EventKind::ALL.iter().map(|&k| format!("  {}: {},\n", k.name(), k as u32)).collect();
+    let keys = list(input::KEYS.iter().map(|k| format!("{k:?}")));
+    let buttons = list(input::BUTTONS.iter().map(|b| format!("{b:?}")));
     let [size_x, size_y, size_z] = manifest::MAX_WORKGROUP_SIZE;
     format!(
         r#"// Generated from the wrela-abi crate (runtime/abi): the one definition of the
@@ -67,6 +71,20 @@ export const IMPORT_LIMIT = {import_limit:?};
 export const IMPORT_MEMORY = {import_memory:?};
 export const EXPORT_WORKER = {export_worker:?};
 export const IMPORT_AUDIO = {import_audio:?};
+export const IMPORT_INPUT = {import_input:?};
+/** Input (runtime/abi `input`): an event is EVENT_SIZE bytes, six words: its kind, its
+ * modifiers, then four words that depend on the kind. */
+export const EVENT_SIZE = {event_size};
+export const EventKind = {{
+{event_kinds}}} as const;
+export const MODIFIER_SHIFT = {shift};
+export const MODIFIER_CONTROL = {control};
+export const MODIFIER_ALT = {alt};
+export const MODIFIER_META = {meta};
+/** A pointer's buttons, by number, as a script names them. */
+export const BUTTONS = [{buttons}] as const;
+/** The physical keys, by number: DOM's `KeyboardEvent.code` (0: one not listed). */
+export const KEYS = [{keys}] as const;
 /** Every function a program may import besides its memory, with its type as both hosts word
  * it. */
 export const HOST_FUNCTIONS = [
@@ -124,6 +142,12 @@ export const PANIC_CAP = {panic_cap};
         import_memory = crate::IMPORT_MEMORY,
         export_worker = crate::EXPORT_WORKER,
         import_audio = crate::IMPORT_AUDIO,
+        import_input = input::IMPORT_INPUT,
+        event_size = input::EVENT_SIZE,
+        shift = input::SHIFT,
+        control = input::CONTROL,
+        alt = input::ALT,
+        meta = input::META,
         export_audio = crate::EXPORT_AUDIO,
         audio_sample_rate = crate::AUDIO_SAMPLE_RATE,
         audio_quantum = crate::AUDIO_QUANTUM,

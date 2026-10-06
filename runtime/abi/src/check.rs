@@ -279,7 +279,7 @@ impl Checker {
                     return err(format!("the storage path `{path}` {why}"));
                 }
             }
-            Command::Fetch { url, .. } => {
+            Command::Fetch { url, .. } | Command::Post { url, .. } => {
                 if let Some(why) = path_problem(url) {
                     return err(format!("the URL `{url}` {why}"));
                 }

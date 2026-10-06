@@ -1,6 +1,6 @@
 //! AC11: the programs the language was designed from, sketches 01–03 (design-archive-2026-10:
 //! docs/design/sketches/), written in the language as built, with the engine they're written
-//! against (compiler/tests/sketches/engine). Each change from a sketch is noted next to its
+//! against (the top-level `engine/` package). Each change from a sketch is noted next to its
 //! code ("Changed:"), with its reason.
 
 use crate::built;
@@ -164,7 +164,8 @@ fn sketch_03s_tick_doesnt_depend_on_the_workers() {
 
 /// The programs' own tests (`@test`, `wrela test`): sketch 01's torso bound and hoof modes,
 /// sketch 03's timeline replays and saves, the gameplay paper test's scripted player (a frame
-/// test of 360 frames), and the example's.
+/// test of 360 frames), the examples': hello field's, and the wolf's and the grazer's walks
+/// (frame tests of 120 frames, AC7).
 #[test]
 fn the_programs_own_tests_pass() {
     let programs = [
@@ -172,6 +173,8 @@ fn the_programs_own_tests_pass() {
         "compiler/tests/sketches/03-simulation",
         "compiler/tests/sketches/gameplay",
         "examples/hello-field",
+        "examples/wolf",
+        "examples/grazer",
     ];
     for pkg in programs {
         let dir = wrela_tests::repo_root().join(pkg);

@@ -6,8 +6,9 @@ use std::collections::Vec
 use std::mem::load_u8
 
 /// Text known when the program is built: a string literal, or text a build-time constant made.
-/// A `Copy` handle to read-only UTF-8, so it can be stored anywhere.
-pub struct Text: Copy {
+/// A `Copy` handle to read-only UTF-8, so it can be stored anywhere: in GPU data too, where it
+/// travels as its handle (a field names its parts with it, §22), and only the CPU reads it.
+pub struct Text: Copy + GpuData {
     // The compiler builds literals as these two fields, in this order.
     addr: u32,
     len: u32,
@@ -108,6 +109,39 @@ impl String {
             panic("push_byte: only ASCII keeps a string UTF-8")
         }
         self.bytes.push(b)
+    }
+
+    /// Adds the character whose code point is `cp`, a Unicode scalar value, as UTF-8.
+    pub fn push_char(mut self, cp: u32) {
+        if cp > 1114111 || (cp >= 55296 && cp < 57344) {
+            panic("push_char: not a Unicode scalar value")
+        }
+        if cp < 128 {
+            self.bytes.push(u8(cp))
+        } else if cp < 2048 {
+            self.bytes.push(u8(192 | (cp >> 6)))
+            self.bytes.push(u8(128 | (cp & 63)))
+        } else if cp < 65536 {
+            self.bytes.push(u8(224 | (cp >> 12)))
+            self.bytes.push(u8(128 | ((cp >> 6) & 63)))
+            self.bytes.push(u8(128 | (cp & 63)))
+        } else {
+            self.bytes.push(u8(240 | (cp >> 18)))
+            self.bytes.push(u8(128 | ((cp >> 12) & 63)))
+            self.bytes.push(u8(128 | ((cp >> 6) & 63)))
+            self.bytes.push(u8(128 | (cp & 63)))
+        }
+    }
+
+    /// The text, as a `str` (a `String` passes as one where one is expected; this is for a
+    /// `str`'s methods).
+    pub fn as_str(self) -> borrow str {
+        str_part(self, 0, self.len())
+    }
+
+    /// Its UTF-8, as bytes: what a request's body is (`std::io::post`).
+    pub fn as_bytes(self) -> borrow [u8] {
+        self.bytes
     }
 
     /// Empties it; the capacity stays.

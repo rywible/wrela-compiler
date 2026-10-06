@@ -42,18 +42,15 @@ fn by_entry(pipelines: &[PipelineSummary]) -> Vec<(&str, Vec<&PipelineSummary>)>
 /// The report for people.
 pub fn text(pipelines: &[PipelineSummary]) -> String {
     let entries = by_entry(pipelines);
-    let plural = |n: usize, one: &str, many: &str| {
-        if n == 1 { one.to_string() } else { format!("{n} {many}") }
-    };
     let mut s = format!(
         "{} from {}\n",
-        plural(pipelines.len(), "1 pipeline", "pipelines"),
-        plural(entries.len(), "1 entry point", "entry points")
+        crate::count(pipelines.len(), "pipeline", "pipelines"),
+        crate::count(entries.len(), "entry point", "entry points")
     );
     for (name, ps) in entries {
         s.push_str(&format!(
             "\n`{name}`: {}\n",
-            plural(ps.len(), "1 instantiation", "instantiations")
+            crate::count(ps.len(), "instantiation", "instantiations")
         ));
         for p in ps {
             let verb = if p.kind == "compute" { "dispatched" } else { "drawn" };

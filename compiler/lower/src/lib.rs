@@ -19,6 +19,7 @@ mod eval;
 mod glue;
 mod gpu;
 mod instance;
+mod lift;
 mod mem;
 mod par;
 mod ty;
@@ -29,6 +30,7 @@ pub use eval::{
 };
 pub use gpu::{PipelineKey, PipelineKind, PipelineOut};
 pub use instance::{Callable, InstanceKey};
+pub use lift::{LiftTable, LiftedFile, LiftedLiteral, candidates};
 
 use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
@@ -45,6 +47,9 @@ use wrela_sema::ty::{FnId, TyId, TyKind};
 pub struct Lowered {
     pub cpu: ir::Module,
     pub pipelines: Vec<PipelineOut>,
+    /// The functions the CPU module instantiates, each with its type arguments (its owner's,
+    /// then its own): for tools (`wrela query`). A pipeline's are its own.
+    pub instances: Vec<(FnId, Vec<TyId>)>,
 }
 
 /// What to lower.
@@ -181,10 +186,10 @@ fn on_gpu_in(p: &Program, t: TyId, known: &mut HashMap<TyId, bool>) -> bool {
     ok
 }
 
-/// Shared state while lowering every module of one program.
 /// What a debug build's NaN check panics with (§11).
 pub(crate) const NAN_MESSAGE: &str = "debug build: a float operation created a NaN";
 
+/// Shared state while lowering every module of one program.
 pub(crate) struct Cx<'a> {
     pub checked: &'a Checked,
     /// The values of the constants the build has computed, and the files `embed` reads.
@@ -202,6 +207,9 @@ pub(crate) struct Cx<'a> {
     pub pipelines: Vec<(gpu::PipelineKey, Rc<gpu::Interface>)>,
     /// Where CPU code dispatches or draws each of `pipelines`.
     pub pipeline_sites: Vec<Vec<Span>>,
+    /// A lifted build's literals (§22): only the program's own modules read them, never the
+    /// modules that compute constants or run tests.
+    pub lift: Option<&'a LiftTable>,
 }
 
 /// One target module being built: the CPU module by default.
@@ -235,6 +243,8 @@ pub(crate) struct ModuleBuilder {
     pub deriving: Vec<derive::Pending>,
     /// The constant data holding each text (CPU only).
     pub texts: HashMap<String, ir::DataId>,
+    /// A lifted build's table of literals, and what keeps its GPU copy (CPU only).
+    pub lift: Option<lift::CpuTable>,
 }
 
 impl ModuleBuilder {
@@ -245,6 +255,21 @@ impl ModuleBuilder {
 
     pub fn target(&self) -> ir::Target {
         if self.gpu.is_some() { ir::Target::Gpu } else { ir::Target::Cpu }
+    }
+
+    /// The functions this module instantiates, each with its type arguments, in order.
+    pub fn fn_instances(&self) -> Vec<(FnId, Vec<TyId>)> {
+        let mut out: Vec<(FnId, Vec<TyId>)> = self
+            .instances
+            .keys()
+            .filter_map(|k| match k {
+                InstanceKey::Fn { func, substs, .. } => Some((*func, substs.clone())),
+                _ => None,
+            })
+            .collect();
+        out.sort();
+        out.dedup();
+        out
     }
 
     /// How diagnostics name an instance: its source name, else its IR name.
@@ -266,7 +291,9 @@ pub fn lower(
     emit: bool,
 ) -> (Lowered, Vec<Diagnostic>) {
     let mut cx = Cx::new(checked, data, emit);
+    cx.lift = data.lift.as_ref().filter(|t| !t.literals.is_empty());
     let mut cpu = ModuleBuilder::default();
+    cx.make_table(&mut cpu);
     let mut has_frame = false;
     for &f in &roots.also {
         cx.instance(&mut cpu, InstanceKey::plain(f, Vec::new()), None);
@@ -371,7 +398,8 @@ pub fn lower(
             cx.diags.extend(found.into_iter().filter(|d| d.span().is_some_and(inside)));
         }
     }
-    let lowered = Lowered { cpu: cpu.m, pipelines };
+    let instances = cpu.fn_instances();
+    let lowered = Lowered { cpu: cpu.m, pipelines, instances };
     let mut diags = cx.diags;
     wrela_diag::sort_and_dedup(&mut diags);
     (lowered, diags)
@@ -388,6 +416,7 @@ impl<'a> Cx<'a> {
             diags: Vec::new(),
             pipelines: Vec::new(),
             pipeline_sites: Vec::new(),
+            lift: None,
         }
     }
 

@@ -6,7 +6,11 @@
 // in. Each frame runs the UI, then one tick with the commands it made, and draws the UI.
 
 use dialogue::MIRA_START
-use engine::ui::{Pointer, Ui, render}
+use std::gpu::{begin_screen_pass, present}
+use std::input::{Button, Event, Mods}
+use ui::draw::Renderer
+use ui::text::Fonts
+use ui::widgets::{Theme, Ui}
 use flags::{FLAG_NAMES, Flags, flag}
 use inventory::{Inventory, ItemStack, Player}
 use items::{ARROW, BREAD, GOLD, PELT, SILVER_RING, SWORD, item}
@@ -29,6 +33,31 @@ enum Step: Clone {
     Do(Command),
     /// Waits this many frames.
     Wait(u32),
+}
+
+/// The pointer this frame: where it is, whether its button is down, and whether it went down or
+/// up this frame.
+struct Pointer: Copy {
+    pos: vec2,
+    down: bool,
+    pressed: bool,
+    released: bool,
+}
+
+impl Pointer {
+    /// The input events it stands for, as a person's pointer would make them.
+    fn events(self) -> Vec<Event> {
+        var out: Vec<Event> = Vec::new()
+        let mods = Mods {}
+        out.push(Event::PointerMove { at: self.pos, mods })
+        if self.pressed {
+            out.push(Event::PointerDown { at: self.pos, button: Button::Primary, mods })
+        }
+        if self.released {
+            out.push(Event::PointerUp { at: self.pos, button: Button::Primary, mods })
+        }
+        out
+    }
 }
 
 struct Script {
@@ -60,7 +89,7 @@ impl Script {
 
     /// Where `text` is, or, after 20 frames without it, gives the step up.
     fn locate(mut self, ui: Ui, text: Text) -> Option<vec2> {
-        let at = ui.find(text)
+        let at = if let Some(r) = ui.find(text) { Some(r.center()) } else { None }
         if at.is_none() {
             self.waited += 1
             if self.waited > 20 {
@@ -126,6 +155,7 @@ pub struct Game {
     world: World,
     menus: Menus,
     ui: Ui,
+    renderer: Renderer,
     script: Script,
 }
 
@@ -198,17 +228,23 @@ pub fn init() -> Game {
         saved: 0,
         error: None,
     }
+    let fonts = Fonts::load()
+    // The paper test's panels were sized for 20-pixel rows.
+    var ui = Ui::new(Fonts::load())
+    ui.theme = Theme { size: 13.0, row: 20.0, spacing: 3.0, pad: 4.0 }
     Game {
         world,
         menus,
-        ui: Ui::new(),
+        renderer: Renderer::new(fonts),
+        ui: take ui,
         script: Script { steps, at: 0, phase: 0, waited: 0, stuck: 0 },
     }
 }
 
 pub fn frame(state: mut Game, time: f32, width: u32, height: u32) {
     let (pointer, input, command) = state.script.next(state.ui)
-    state.ui.begin(vec2(f32(width), f32(height)), pointer)
+    let screen = vec2(f32(width), f32(height))
+    state.ui.begin(screen, pointer.events())
     var cmds: Vec<Command> = Vec::new()
     if let Some(c) = command {
         cmds.push(c)
@@ -217,8 +253,12 @@ pub fn frame(state: mut Game, time: f32, width: u32, height: u32) {
         MenuCtx { ui: mut state.ui, menus: mut state.menus, world: state.world, cmds: mut cmds },
         input,
     )
+    state.ui.end()
     tick(mut state.world, TickInput { commands: take cmds })
-    render(state.ui, clear: vec4(0.2, 0.25, 0.2, 1.0))
+    state.renderer.upload(state.ui.draw)
+    begin_screen_pass(clear: vec4(0.2, 0.25, 0.2, 1.0))
+    state.renderer.draw(screen)
+    present()
 }
 
 // ---- tests (`wrela test`) ------------------------------------------------------------------------

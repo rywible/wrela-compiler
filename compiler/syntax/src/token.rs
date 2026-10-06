@@ -160,6 +160,11 @@ token_kinds! {
 }
 
 impl TokenKind {
+    /// Is this token a number (an integer, a float, or either with a suffix)?
+    pub fn is_number(self) -> bool {
+        matches!(self, TokenKind::Int | TokenKind::Float | TokenKind::Suffixed)
+    }
+
     /// L17 condition 2: can this token end a statement?
     pub fn can_end_statement(self) -> bool {
         use TokenKind::*;

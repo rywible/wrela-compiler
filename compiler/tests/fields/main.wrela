@@ -3,9 +3,9 @@
 // block culling on the spike's grid, with the derived interval and with the spike's
 // hand-written Lipschitz bound. Also AC3's corpus (compiler/tests/tests/suite/derive.rs).
 use corpus::{
-    Branchy, Cells, Logs, Noise, Pieces, Rational, Trig, Vectors, Waves, blob_, blob_spheres,
-    blob_tape, closures_, cone_, creature, ellipsoid_, fbm_, grazer_, hoof_, sphere_, sphere_tape,
-    waves_tape,
+    Branchy, Cells, Logs, Noise, Pieces, Powers, Rational, Trig, Vectors, Waves, blob_,
+    blob_spheres, blob_tape, closures_, cone_, creature, ellipsoid_, fbm_, grazer_, hoof_, oval_,
+    sphere_, sphere_tape, table_, tube_, waves_tape,
 }
 use grazer::{Grazer, P3, PARAM_FLOATS, bounds, grazer, grazer_from, p3, params}
 use std::derive::{Box3, interval}
@@ -354,7 +354,9 @@ fn with_function<V: Visit>(fi: u32, v: V) -> V::Out {
         17 => v.visit(sphere_tape()),
         18 => v.visit(waves_tape(3.0)),
         19 => v.visit(blob_tape()),
-        _ => v.visit(closures_(5.0)),
+        20 => v.visit(closures_(5.0)),
+        21 => v.visit(table_()),
+        _ => v.visit(Powers { n: 2.4 }),
     }
 }
 
@@ -587,7 +589,7 @@ trait VisitLipschitz {
 }
 
 /// The corpus's `Lipschitz` surfaces: 0 sphere, 1 ellipsoid, 2 round cone, 3 hoof, 4 blob,
-/// 5 fbm, 6 creature, 7 grazer.
+/// 5 fbm, 6 creature, 7 grazer, 8 oval, 9 tube.
 fn with_lipschitz<V: VisitLipschitz>(i: u32, v: V) -> V::Out {
     match i {
         0 => v.visit(sphere_()),
@@ -597,7 +599,9 @@ fn with_lipschitz<V: VisitLipschitz>(i: u32, v: V) -> V::Out {
         4 => v.visit(blob_()),
         5 => v.visit(fbm_()),
         6 => v.visit(creature()),
-        _ => v.visit(grazer_()),
+        7 => v.visit(grazer_()),
+        8 => v.visit(oval_()),
+        _ => v.visit(tube_()),
     }
 }
 

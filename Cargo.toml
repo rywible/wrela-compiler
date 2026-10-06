@@ -14,6 +14,7 @@ members = [
     "compiler/tests",
     "runtime/abi",
     "runtime/native",
+    "tools/wfont",
 ]
 
 [workspace.package]
@@ -34,6 +35,7 @@ wrela-lower = { path = "compiler/lower" }
 wrela-wasm = { path = "compiler/wasm" }
 wrela-wgsl = { path = "compiler/wgsl" }
 wrela-grammar = { path = "compiler/grammar" }
+wrela-wfont = { path = "tools/wfont" }
 wasmtime = { version = "49", default-features = false, features = ["cranelift", "runtime", "std", "threads"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }

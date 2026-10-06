@@ -9,6 +9,9 @@
 
 pub mod ad;
 pub mod interval;
+pub mod literal;
+
+pub use literal::literal_gradient;
 
 use crate::*;
 use std::collections::HashMap;
@@ -786,14 +789,26 @@ pub(super) fn pass_through(
     Ok(())
 }
 
-/// An error if a function's body records GPU work (a host operation), which a derived function
-/// can't do.
+/// Whether a raw memory operation can run in a derived function as it is: it moves no float
+/// (which memory would carry without its derivative) and changes nothing. A text literal's
+/// address, a panic, the heap's bounds, and reading an integer (comparing text) can.
+fn harmless(op: &MemOp) -> bool {
+    match op {
+        MemOp::Addr | MemOp::Panic | MemOp::HeapBase | MemOp::Pages => true,
+        MemOp::Load(s) => !matches!(s, Scalar::F32 | Scalar::F64),
+        _ => false,
+    }
+}
+
+/// An error if a function's body records GPU work (a host operation) or moves memory other than
+/// harmlessly, which a derived function can't do.
 pub(super) fn no_gpu_work(body: &Block) -> Result<()> {
     // Where: the last `At` before it (`at` before the block).
     fn find(b: &Block, mut at: Option<wrela_diag::Span>) -> Option<Option<wrela_diag::Span>> {
         for s in b {
             match s {
                 Stmt::At(span) => at = Some(*span),
+                Stmt::Let(_, Expr::Mem(op, _)) | Stmt::Eval(Expr::Mem(op, _)) if harmless(op) => {}
                 Stmt::Let(_, Expr::Host(..) | Expr::Mem(..))
                 | Stmt::Eval(Expr::Host(..) | Expr::Mem(..)) => return Some(at),
                 _ => {
