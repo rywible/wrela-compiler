@@ -165,6 +165,11 @@ pub enum Builtin {
     Fwidth,
     /// `all(a == b)` for vectors.
     AllEqual,
+    /// Of a 32- or 64-bit integer, a `u32`: how many bits are set, and how many zeros lead (from
+    /// the top bit) and trail (from bit 0); the width for 0.
+    CountOnes,
+    LeadingZeros,
+    TrailingZeros,
 }
 
 impl Builtin {

@@ -878,6 +878,21 @@ fn scalar_builtin(fe: &mut Fe, b: ir::Builtin, s: ir::Scalar, xs: &[u32]) -> R<(
                 fe.ins.extend([I::LocalGet(neg), g(0), g(0), w.konst(0), w.lts(), I::Select]);
             }
             B::Abs => fe.ins.push(g(0)),
+            // A `u32` of a 32- or 64-bit integer.
+            B::CountOnes | B::LeadingZeros | B::TrailingZeros => {
+                fe.ins.push(g(0));
+                fe.ins.push(match (b, w.wide) {
+                    (B::CountOnes, false) => I::I32Popcnt,
+                    (B::CountOnes, true) => I::I64Popcnt,
+                    (B::LeadingZeros, false) => I::I32Clz,
+                    (B::LeadingZeros, true) => I::I64Clz,
+                    (_, false) => I::I32Ctz,
+                    (_, true) => I::I64Ctz,
+                });
+                if w.wide {
+                    fe.ins.push(I::I32WrapI64);
+                }
+            }
             B::Sign => {
                 fe.ins.extend([g(0), w.konst(0), w.gts(), g(0), w.konst(0), w.lts(), I::I32Sub]);
                 if w.wide {

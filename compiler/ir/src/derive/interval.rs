@@ -2194,6 +2194,8 @@ impl<'a> Ivx<'a> {
                     "an interval of a screen-space derivative isn't supported",
                 ));
             }
+            // Their results are integers, which take the branch above.
+            B::CountOnes | B::LeadingZeros | B::TrailingZeros => self.full(out, ty),
         })
     }
 

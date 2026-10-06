@@ -172,6 +172,10 @@ builtin_fns! {
     WrappingAdd = "wrapping_add", 2, Method, false, None;
     WrappingSub = "wrapping_sub", 2, Method, false, None;
     WrappingMul = "wrapping_mul", 2, Method, false, None;
+    /// Integer methods: how many bits are set, and how many zeros lead and trail; a `u32`.
+    CountOnes = "count_ones", 1, Method, false, None;
+    LeadingZeros = "leading_zeros", 1, Method, false, None;
+    TrailingZeros = "trailing_zeros", 1, Method, false, None;
     /// `xs.len()` of a run or an array: its element count, a `u32`.
     Len = "len", 1, Method, false, None;
     /// `panic(message)`: a bug. Traps with the message (§15); its type is `!`.
@@ -332,6 +336,14 @@ impl BuiltinFn {
             WrappingAdd | WrappingSub | WrappingMul => {
                 let t = same(args)?;
                 takes(types.is_int(t), "integers", t)
+            }
+            CountOnes | LeadingZeros | TrailingZeros => {
+                let wide = matches!(
+                    types.kind(args[0]),
+                    TyKind::Int(IntTy::I32 | IntTy::U32 | IntTy::I64 | IntTy::U64)
+                );
+                takes(wide, "a 32- or 64-bit integer", args[0])?;
+                Ok(types.u32)
             }
             // Checked where they're called: their message is text.
             Panic => Ok(types.never),

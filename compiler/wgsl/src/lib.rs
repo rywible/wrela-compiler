@@ -1381,6 +1381,23 @@ impl<'a, 'm> Fb<'a, 'm> {
                 );
                 Expression::Relational { fun: naga::RelationalFunction::All, argument: eq }
             }
+            // WGSL's are of the argument's type; the result is a `u32` (an `i32`'s count is
+            // never negative, so it's the same bits).
+            B::CountOnes | B::LeadingZeros | B::TrailingZeros => {
+                let fun = match b {
+                    B::CountOnes => MathFunction::CountOneBits,
+                    B::LeadingZeros => MathFunction::CountLeadingZeros,
+                    _ => MathFunction::CountTrailingZeros,
+                };
+                let count = self.expr(
+                    Expression::Math { fun, arg: hs[0], arg1: None, arg2: None, arg3: None },
+                    out,
+                );
+                if self.cx.m.types.as_scalar(self.f.value_ty(args[0])) == Some(ir::Scalar::U32) {
+                    return Ok(count);
+                }
+                Expression::As { expr: count, kind: ScalarKind::Uint, convert: None }
+            }
             _ => {
                 let fun = match b {
                     B::Sqrt => MathFunction::Sqrt,
@@ -1416,7 +1433,13 @@ impl<'a, 'm> Fb<'a, 'm> {
                     B::Dot => MathFunction::Dot,
                     B::Cross => MathFunction::Cross,
                     B::Normalize => MathFunction::Normalize,
-                    B::Dpdx | B::Dpdy | B::Fwidth | B::AllEqual => unreachable!("handled above"),
+                    B::Dpdx
+                    | B::Dpdy
+                    | B::Fwidth
+                    | B::AllEqual
+                    | B::CountOnes
+                    | B::LeadingZeros
+                    | B::TrailingZeros => unreachable!("handled above"),
                 };
                 Expression::Math {
                     fun,

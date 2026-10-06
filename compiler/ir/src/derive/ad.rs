@@ -717,6 +717,8 @@ impl Ad<'_> {
         let ln2 = std::f64::consts::LN_2;
         Ok(match b {
             B::Floor | B::Ceil | B::Round | B::Trunc | B::Sign | B::Step | B::AllEqual => None,
+            // Integers: no tangent.
+            B::CountOnes | B::LeadingZeros | B::TrailingZeros => None,
             B::Dpdx | B::Dpdy | B::Fwidth => {
                 return Err(Error::not_derivable(
                     "derivatives of screen-space derivatives aren't supported",

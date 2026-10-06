@@ -228,3 +228,60 @@ pub fn frame(time: f32, width: u32, height: u32) {}
     let size = |out: &str| std::fs::metadata(dir.join(out).join("game.wasm")).expect("wasm").len();
     assert!(size("debug") > size("release"));
 }
+
+/// The inputs compiler/tests/bits counts: 0, 1, the top bit, every bit, then xorshift's.
+fn bits_input(i: u32) -> u32 {
+    if i < 4 {
+        return [0, 1, 1 << 31, u32::MAX][i as usize];
+    }
+    let mut x: u32 = 2463534242 ^ i;
+    for _ in 0..3 {
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+    }
+    x >> (i % 29)
+}
+
+/// `count_ones`, `leading_zeros` and `trailing_zeros` are Rust's, of `u32`, `i32`, `u64` and
+/// `i64` (the width for 0).
+#[test]
+fn bits_are_counted() {
+    let mut h = CpuHost::load(built("bits")).expect("load");
+    let u = |x: u32| Value::I32(x as i32);
+    for i in 0..256 {
+        let x = bits_input(i);
+        let wide = (u64::from(x) << 32 | u64::from(x.rotate_left(7))) >> (i % 61);
+        for (name, arg, want) in [
+            ("ones_u32", u(x), x.count_ones()),
+            ("leading_u32", u(x), x.leading_zeros()),
+            ("trailing_u32", u(x), x.trailing_zeros()),
+            ("ones_i32", u(x), (x as i32).count_ones()),
+            ("leading_i32", u(x), (x as i32).leading_zeros()),
+            ("trailing_i32", u(x), (x as i32).trailing_zeros()),
+            ("ones_u64", Value::I64(wide as i64), wide.count_ones()),
+            ("leading_u64", Value::I64(wide as i64), wide.leading_zeros()),
+            ("trailing_i64", Value::I64(wide as i64), (wide as i64).trailing_zeros()),
+        ] {
+            returns(&mut h, name, &[arg], u(want));
+        }
+    }
+}
+
+/// The GPU counts bits as the CPU does (WGSL's `countOneBits` and its kin), of `u32`s and
+/// `i32`s: compiler/tests/bits's first frame.
+#[test]
+#[ignore = "needs a GPU"]
+fn the_gpu_counts_bits_as_the_cpu_does() {
+    let mut gpu = wrela_host::Host::load(built("bits")).expect("load");
+    gpu.frame(0.0, 64, 64).expect("a frame");
+    let out = *gpu.buffers().last().expect("a buffer");
+    let words = wrela_tests::u32s(&gpu.read_buffer(out).expect("read"));
+    for i in 0..256 {
+        let x = bits_input(i);
+        let want = [x.count_ones(), x.leading_zeros(), x.trailing_zeros()];
+        let got = &words[i as usize * 6..i as usize * 6 + 6];
+        assert_eq!(got[..3], want, "{x:#010x} as a u32");
+        assert_eq!(got[3..], want, "{x:#010x} as an i32");
+    }
+}
