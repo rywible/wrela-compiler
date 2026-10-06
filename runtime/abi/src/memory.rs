@@ -45,8 +45,9 @@
 //! Each thread has a block of [`THREAD_BLOCK_SIZE`] bytes ([`thread_block`]): the parallel job
 //! it started ([`JOB_GENERATION`] to [`JOB_FAILED`]), how deep it is in work it runs for others
 //! ([`DEPTH`]), what it's running for another thread ([`RUNNING`]), how many blocks it has
-//! allocated ([`ALLOCATIONS`]), how many times it waited at a job's join ([`JOIN_WAITS`]), and its
-//! panic message ([`PANIC`]).
+//! allocated ([`ALLOCATIONS`]), how many times it waited at a job's join ([`JOIN_WAITS`]), how
+//! many times it found the allocator's lock taken and the tries it spun on it ([`LOCK_WAITS`],
+//! [`LOCK_SPINS`]), and its panic message ([`PANIC`]).
 //!
 //! ## Helpers
 //!
@@ -146,6 +147,11 @@ pub const ALLOCATIONS: u32 = 36;
 /// on the ticker's thread, the sim waiting for an answer due (`std::par::Job::join`). Hosts log
 /// it.
 pub const JOIN_WAITS: u32 = 40;
+/// How many times this thread found the allocator's lock taken (`std::alloc`): hosts measure
+/// the time threads lose to one another on the heap with it.
+pub const LOCK_WAITS: u32 = 44;
+/// How many tries this thread spun on the allocator's lock, over all its waits.
+pub const LOCK_SPINS: u32 = 48;
 /// A panic's message: a `u32` byte count, then the message's UTF-8, cut to [`PANIC_CAP`] bytes.
 /// A host reads it after a trap on the thread; the count is 0 when the trap wasn't a panic.
 pub const PANIC: u32 = 4096;

@@ -59,3 +59,20 @@ pub const W: f32 = 1.0
 pub const Pa: f32 = 1.0
 /// A kilopascal: 1000 Pa.
 pub const kPa: f32 = 1000.0
+
+// ---- tests (the suite runs std's: `std_tests_pass`) --------------------------------------------
+
+/// A suffix folds exactly: the number times its unit, rounded once to the type it's used as, so
+/// it's the decimal it names (`15cm` is `0.15`, where `15.0 * 0.01` in `f64` isn't).
+@test
+fn a_suffix_is_the_decimal_it_names() {
+    let wide: f64 = 15cm
+    let narrow: f32 = 15cm
+    assert(wide == 0.15 && narrow == 0.15, "15cm is 0.15")
+    let tiny: f64 = 3mm
+    assert(tiny == 0.003, "3mm is 0.003")
+    let long: f64 = 1.25km
+    assert(long == 1250.0, "1.25km is 1250")
+    let right: f64 = 90deg
+    assert(right == 1.5707963267948966, "90deg is π/2, to f64's precision")
+}

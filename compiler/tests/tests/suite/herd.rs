@@ -1299,6 +1299,69 @@ fn the_herds_ticks_hash_the_same_everywhere() {
     }
 }
 
+/// What one failed try at a lock costs, in nanoseconds, while another core holds it: one
+/// thread holds an atomic word for 20 ms while this one spins on it with compare-and-swap, as
+/// std's allocator does. It turns the allocator's spins into time.
+fn spin_ns() -> f64 {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    let word = AtomicU32::new(1);
+    let mut best = f64::MAX;
+    for _ in 0..5 {
+        word.store(1, Ordering::SeqCst);
+        let (spins, took) = std::thread::scope(|s| {
+            s.spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                word.store(0, Ordering::SeqCst);
+            });
+            let start = Instant::now();
+            let mut spins = 0u64;
+            while word.compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+                spins += 1;
+            }
+            (spins, start.elapsed().as_secs_f64())
+        });
+        best = best.min(took * 1e9 / spins as f64);
+    }
+    best
+}
+
+/// AC5, measured, not gated: with the herd's frames drawing beside them (the native host, the
+/// ticks on a thread of their own, neither waiting for the other), how many blocks a steady tick
+/// allocates, and how long it loses waiting on the allocator's lock (std::alloc counts the
+/// times it found the lock taken and the tries it spun; a try's cost is [`spin_ns`]'s).
+#[test]
+#[ignore = "a measurement: needs a GPU"]
+fn the_herds_ticks_beside_frames_allocate_and_wait() {
+    let dir = herd();
+    let options = wrela_host::Options { defer_init: true, ..wrela_host::Options::default() };
+    let mut host = wrela_host::Host::load_with(&dir, &options).expect("load");
+    host.init().expect("init");
+    let ticked = host.ticks_beside_frames(3_000, 1_500, 60.0, 1920, 1080).expect("run");
+    // Steady: after every physique has arrived (due a second after the spawn).
+    let steady = &ticked[120..];
+    let mut allocs: Vec<f64> = steady.iter().map(|(t, _)| f64::from(t.allocations)).collect();
+    allocs.sort_by(f64::total_cmp);
+    let waits: u64 = steady.iter().map(|(t, _)| u64::from(t.lock_waits)).sum();
+    let spins: u64 = steady.iter().map(|(t, _)| u64::from(t.lock_spins)).sum();
+    let mut times: Vec<f64> = steady.iter().map(|(_, ms)| *ms).collect();
+    times.sort_by(f64::total_cmp);
+    let pct = |v: &[f64], p: f64| v[((v.len() - 1) as f64 * p).round() as usize];
+    let ns = spin_ns();
+    let n = steady.len() as f64;
+    eprintln!(
+        "{} steady ticks beside frames: {:.0} blocks allocated a tick (median; {:.0} at most), \
+         the allocator's lock found taken {waits} times ({spins} tries, {:.1} ns each): \
+         {:.2} us a tick lost to it on average; ticks took {:.2} ms (median), {:.2} ms (p99)",
+        steady.len(),
+        pct(&allocs, 0.5),
+        allocs[allocs.len() - 1],
+        ns,
+        spins as f64 * ns / 1000.0 / n,
+        pct(&times, 0.5),
+        pct(&times, 0.99),
+    );
+}
+
 // ---- AC7: the herd's grazer against the spike's ---------------------------------------------------
 
 /// AC7: at every vertex of the spike's 1.5 cm mesh of seed 1, the herd's skin weights (the

@@ -326,8 +326,10 @@ impl<'p> Checker<'p> {
         }
     }
 
-    /// `15cm`: the number times its unit's constant, `std::units::cm`, folded now (§5). The
-    /// product is worked out in `f64` and rounded once to an `f32`.
+    /// `15cm`: the number times its unit's constant, `std::units::cm`, folded now (§5). When
+    /// both are decimals, as every unit in std is, the product is exact and rounded once to
+    /// each float type, so `15cm` is `0.15`, as an `f32` and as an `f64`. Otherwise it's worked
+    /// out in `f64` and rounded once to an `f32`.
     fn check_suffixed(&mut self, lit: &ast::Lit, expected: Option<TyId>) -> Expr {
         let span = lit.span;
         let (digits, suffix) = wrela_syntax::lexer::split_suffix(&lit.text);
@@ -346,19 +348,26 @@ impl<'p> Checker<'p> {
             ast::IntValue::Ok(v) => v as f64,
             _ => wrela_syntax::lexer::float_value(digits),
         };
-        let unit = match &self.p.const_(c).value.kind {
+        let value = &self.p.const_(c).value.kind;
+        let unit = match value {
             ast::ExprKind::Lit(ast::Lit { kind: ast::LitKind::Float(v), .. }) => *v,
             ast::ExprKind::Lit(ast::Lit {
                 kind: ast::LitKind::Int(ast::IntValue::Ok(v)), ..
             }) => *v as f64,
             _ => 1.0,
         };
-        let v = number * unit;
+        let exact = match value {
+            ast::ExprKind::Lit(u) => decimal_product(digits, &u.text),
+            _ => None,
+        };
+        let (v, f) = match exact {
+            Some(text) => (text.parse().unwrap_or(f64::NAN), text.parse().unwrap_or(f32::NAN)),
+            None => (number * unit, (number * unit) as f32),
+        };
         let ty = match expected {
             Some(t) if matches!(self.kind(t), TyKind::Float(_)) => self.shallow(t),
             _ => self.new_var(VarKind::Float, span),
         };
-        let f = v as f32;
         self.float_literals.push((ty, v, f, span));
         Expr { ty, span, kind: ExprKind::Lit(Lit::Float(v, f)) }
     }
@@ -2345,4 +2354,31 @@ fn path_text(e: &ast::Expr) -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// Two decimal numbers' product, exactly, as decimal text (`15` and `0.01` give `15e-2`), for
+/// a unit suffix's fold: `None` if either isn't a plain decimal (digits, `_`, one `.`, an
+/// exponent) or the product's digits don't fit.
+fn decimal_product(a: &str, b: &str) -> Option<String> {
+    let (ma, ea) = decimal(a)?;
+    let (mb, eb) = decimal(b)?;
+    Some(format!("{}e{}", ma.checked_mul(mb)?, ea.checked_add(eb)?))
+}
+
+/// A decimal's digits and power of ten: `1.25e3` is (125, 1).
+fn decimal(text: &str) -> Option<(u128, i32)> {
+    let clean: String = text.chars().filter(|c| *c != '_').collect();
+    let (body, exp) = match clean.split_once(['e', 'E']) {
+        Some((body, exp)) => (body, exp.parse::<i32>().ok()?),
+        None => (clean.as_str(), 0),
+    };
+    let (whole, frac) = body.split_once('.').unwrap_or((body, ""));
+    if whole.is_empty() && frac.is_empty() {
+        return None;
+    }
+    let mut digits: u128 = 0;
+    for c in whole.chars().chain(frac.chars()) {
+        digits = digits.checked_mul(10)?.checked_add(u128::from(c.to_digit(10)?))?;
+    }
+    Some((digits, exp.checked_sub(i32::try_from(frac.len()).ok()?)?))
 }

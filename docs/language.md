@@ -267,7 +267,7 @@ Implicit conversions don't exist either: an integer literal can be any numeric t
 Unit suffixes are constants (D-025). There are no unit types (§18).
 
 - **Every physical quantity is SI:** metres, seconds, kilograms and radians. An `f32` that holds a length holds metres; names and doc comments say which quantity it is.
-- **Suffixes convert to SI at compile time:** `15cm` is `15 * cm`, which is 0.15, and `90deg` is π/2. Compound units are arithmetic on the constants: `1050 * kg/m**3`.
+- **Suffixes convert to SI at compile time:** `15cm` is `15 * cm`, which is 0.15, and `90deg` is π/2. The product is exact, rounded once to the type the number is used as, so `15cm` is the same number as `0.15` in `f32` and in `f64` (`15.0 * 0.01` in `f64` isn't). Compound units are arithmetic on the constants: `1050 * kg/m**3`.
 - **Unit suffixes resolve in their own namespace,** which locals can't shadow. `2m` means metres even if a local is named `m`.
 - **Constraint:** no unit may collide with numeric syntax. There's no unit named `e`.
 - **A bare number meant in another unit still compiles.** Write the suffix: `sin(90deg)`, not `sin(90)`.
@@ -712,7 +712,7 @@ A program can run a fixed-rate step on a thread of its own, hand its newest resu
       take pending.join()
   }
   ```
-- **The engine's sim** joins a job only at the tick its answer is due (`engine::run`'s `Asks`): if it isn't done then, the ticker waits, so the tick an answer enters on doesn't depend on the helpers. Each thread counts the times it waited at a join (wrela_abi's `JOIN_WAITS`), and the native host logs a tick that waited.
+- **The engine's sim** joins a job only at the tick its answer is due (`engine::run`'s `Asks`): if it isn't done then, the ticker waits, so the tick an answer enters on doesn't depend on the helpers. Each thread counts the times it waited at a join (wrela_abi's `JOIN_WAITS`), and the native host logs a tick that waited. Each also counts the blocks it allocated, and the times it found the allocator's lock taken and the tries it spun on it (`ALLOCATIONS`, `LOCK_WAITS`, `LOCK_SPINS`): the native host reports them for each tick.
 - **Per-tick input.** Before each frame, a host queues the input events since the last for `std::input::events()`, and the same events become the next tick's records. A tick sees only its records, never the frames' input queue, so its state depends on the records alone.
 - **The tick log** (wrela_abi's `ticks`) is a run's ticks as a host ran them: the build's WASM hash, the rate, the first world's hash, then each tick's records and the state hash its step gave. Given the build, the first world and the records, every hash is fixed, so any host can replay a log and check it. Chrome's test mode writes one (`results/ticks.log`), and so does the native host on request.
 - **The native host without a GPU:** `wrela-host --no-gpu <build> --ticks N` runs the ticker alone, no frames, and prints each tick's hash; `--log out.ticks` writes the log. `wrela-host --replay <log> [--no-gpu] <build>` replays a log's records and fails at the first tick whose hash differs, naming it. A build of `wrela-host` without its `gpu` feature has these two only: an x86-64 one under Rosetta checks the sim's bits on x86's code generation (`keys/a_run_recorded_in_chrome_replays_on_arm64_and_x86_64`).

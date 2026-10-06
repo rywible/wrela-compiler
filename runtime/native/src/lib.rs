@@ -283,6 +283,18 @@ impl Host {
         Ok(RunResult { hash: self.program.hash().value(), width, height, frame, timings })
     }
 
+    /// [`CpuHost::ticks_beside_frames`], with the GPU: the frames draw.
+    pub fn ticks_beside_frames(
+        &mut self,
+        ticks: u32,
+        frames: u32,
+        fps: f64,
+        width: u32,
+        height: u32,
+    ) -> Result<Vec<(Ticked, f64)>> {
+        self.program.ticks_beside_frames(ticks, frames, fps, width, height)
+    }
+
     /// Runs the program's `init`, for a host loaded with [`Options::defer_init`].
     pub fn init(&mut self) -> Result<()> {
         self.program.run_init()
@@ -659,7 +671,7 @@ impl CpuHost {
 
     /// Runs `ticks` ticks (with no records, each asked for its hash) on an OS thread of their
     /// own while this one runs `frames` frames at `fps`, neither waiting for the other (test
-    /// mode's paced schedule, #43 §2.3): each tick's state hash.
+    /// mode's paced schedule, #43 §2.3): each tick, and its time in milliseconds.
     pub fn ticks_beside_frames(
         &mut self,
         ticks: u32,
@@ -667,34 +679,7 @@ impl CpuHost {
         fps: f64,
         width: u32,
         height: u32,
-    ) -> Result<Vec<u64>> {
-        let mut thread = self.program.take_tick_thread()?;
-        let (hashes, framed) = std::thread::scope(|s| {
-            let ticking = s.spawn(move || {
-                let mut out = Vec::new();
-                for _ in 0..ticks {
-                    match thread.run(Vec::new(), true) {
-                        Ok(t) => out.push(t.hash.expect("asked for")),
-                        Err(e) => return (thread, out, Some(e)),
-                    }
-                }
-                (thread, out, None)
-            });
-            let mut framed = Ok(());
-            for i in 0..frames {
-                framed = self.program.frame(frame_time(i, fps), width, height);
-                if framed.is_err() {
-                    break;
-                }
-            }
-            (ticking.join().expect("the ticker's thread"), framed)
-        });
-        let (thread, out, failed) = hashes;
-        self.program.restore_tick_thread(thread);
-        if let Some((k, trap)) = failed {
-            return Err(self.program.tick_trapped(k, &trap));
-        }
-        framed?;
-        Ok(out)
+    ) -> Result<Vec<(Ticked, f64)>> {
+        self.program.ticks_beside_frames(ticks, frames, fps, width, height)
     }
 }

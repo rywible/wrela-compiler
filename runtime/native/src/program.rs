@@ -341,8 +341,12 @@ impl TickThread {
         if let Some(fuel) = self.fuel {
             self.store.set_fuel(fuel).map_err(|e| (k, e))?;
         }
-        let waits = (memory::thread_block(memory::THREAD_TICK) + memory::JOIN_WAITS) as usize;
-        let before = shared::load_u32(&self.memory, waits as u32);
+        // The ticker's counts (its block's words), before and after: what the tick did.
+        let block = memory::thread_block(memory::THREAD_TICK);
+        let words =
+            [memory::JOIN_WAITS, memory::ALLOCATIONS, memory::LOCK_WAITS, memory::LOCK_SPINS];
+        let counts = || words.map(|w| shared::load_u32(&self.memory, block + w));
+        let before = counts();
         let result =
             self.tick.call(&mut self.store, (memory::THREAD_TICK, self.task, self.context, k));
         self.next += 1;
@@ -352,8 +356,18 @@ impl TickThread {
             let hi = shared::load_u32(&self.memory, memory::TICK_HASH + 4);
             u64::from(lo) | (u64::from(hi) << 32)
         };
-        let waited = shared::load_u32(&self.memory, waits as u32).wrapping_sub(before);
-        Ok(Ticked { tick: k, records, hash: hash.then(reported), waited })
+        let after = counts();
+        let [waited, allocations, lock_waits, lock_spins] =
+            [0, 1, 2, 3].map(|i| after[i].wrapping_sub(before[i]));
+        Ok(Ticked {
+            tick: k,
+            records,
+            hash: hash.then(reported),
+            waited,
+            allocations,
+            lock_waits,
+            lock_spins,
+        })
     }
 }
 
@@ -367,6 +381,12 @@ pub struct Ticked {
     /// How many times the tick waited at a job's join for a helper still running it: the sim
     /// waiting for an answer due (wrela_abi `JOIN_WAITS`). The host logs it.
     pub waited: u32,
+    /// How many blocks the tick allocated (`ALLOCATIONS`).
+    pub allocations: u32,
+    /// How many times it found the allocator's lock taken, and the tries it spun on it
+    /// (`LOCK_WAITS`, `LOCK_SPINS`).
+    pub lock_waits: u32,
+    pub lock_spins: u32,
 }
 
 pub(crate) struct Program<E: 'static> {
@@ -923,6 +943,48 @@ impl<E: Executor> Program<E> {
 
     pub(crate) fn restore_tick_thread(&mut self, t: TickThread) {
         self.ticker = Some(t);
+    }
+
+    /// Runs `ticks` ticks (with no records, each asked for its hash) on an OS thread of their
+    /// own while this one runs `frames` frames at `fps`, neither waiting for the other (test
+    /// mode's paced schedule, #43 §2.3): each tick, and its time in milliseconds.
+    pub(crate) fn ticks_beside_frames(
+        &mut self,
+        ticks: u32,
+        frames: u32,
+        fps: f64,
+        width: u32,
+        height: u32,
+    ) -> Result<Vec<(Ticked, f64)>> {
+        let mut thread = self.take_tick_thread()?;
+        let (ticked, framed) = std::thread::scope(|s| {
+            let ticking = s.spawn(move || {
+                let mut out = Vec::new();
+                for _ in 0..ticks {
+                    let start = std::time::Instant::now();
+                    match thread.run(Vec::new(), true) {
+                        Ok(t) => out.push((t, start.elapsed().as_secs_f64() * 1000.0)),
+                        Err(e) => return (thread, out, Some(e)),
+                    }
+                }
+                (thread, out, None)
+            });
+            let mut framed = Ok(());
+            for i in 0..frames {
+                framed = self.frame(crate::frame_time(i, fps), width, height);
+                if framed.is_err() {
+                    break;
+                }
+            }
+            (ticking.join().expect("the ticker's thread"), framed)
+        });
+        let (thread, out, failed) = ticked;
+        self.restore_tick_thread(thread);
+        if let Some((k, trap)) = failed {
+            return Err(self.tick_trapped(k, &trap));
+        }
+        framed?;
+        Ok(out)
     }
 
     /// Tick `k` trapped: the program's panic, as the host reports it.

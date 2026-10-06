@@ -150,7 +150,8 @@ fn parallel_work_from_ticks_and_frames_doesnt_collide() {
     let work = u32_of(&frames_alone.call_export("work", &[]).expect("work"));
     for round in 0..sized(20, 1000) {
         let mut host = ticker(8);
-        let hashes = host.ticks_beside_frames(ticks, frames, 60.0, 64, 64).expect("both");
+        let ticked = host.ticks_beside_frames(ticks, frames, 60.0, 64, 64).expect("both");
+        let hashes: Vec<u64> = ticked.iter().map(|(t, _)| t.hash.expect("asked for")).collect();
         assert_eq!(hashes, alone, "round {round}: the ticks' hashes");
         assert_eq!(u32_of(&host.call_export("work", &[]).expect("work")), work, "round {round}");
     }

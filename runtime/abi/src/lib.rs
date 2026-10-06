@@ -226,6 +226,8 @@ mod tests {
             ("alloc.wrela", "STATE", ALLOC_STATE),
             ("alloc.wrela", "BUMP", ALLOC_STATE),
             ("alloc.wrela", "ALLOCATIONS", ALLOCATIONS),
+            ("alloc.wrela", "LOCK_WAITS", LOCK_WAITS),
+            ("alloc.wrela", "LOCK_SPINS", LOCK_SPINS),
             ("mem.wrela", "THREAD_BLOCKS", THREAD_BLOCKS),
             ("mem.wrela", "THREAD_BLOCK_SIZE", THREAD_BLOCK_SIZE),
             ("mem.wrela", "PANIC", PANIC),
