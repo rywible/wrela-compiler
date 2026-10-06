@@ -396,7 +396,10 @@ pub fn lower(
         // Checked where floats are computed, by the back end.
         cpu.m.nan_message = Some(cx.text_data(&mut cpu, NAN_MESSAGE));
     }
-    if !wrela_diag::has_errors(&cx.diags)
+    // Inlining finds no mistakes in the program, only makes its code faster, so a check (no
+    // code emitted) skips it.
+    if emit
+        && !wrela_diag::has_errors(&cx.diags)
         && let Err(e) = ir::opt::inline_cpu(&mut cpu.m)
     {
         cx.err(Diagnostic::internal(format!("inlining the CPU module: {e}")));
