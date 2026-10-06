@@ -10,6 +10,9 @@ use std::mem::{
 }
 pub use std::mem::Pair
 
+/// The runs a sort sorts by insertion before it merges them.
+const SORT_RUN: u32 = 16
+
 /// A growable array of `T`s on the heap. `v[i]` projects element `i`, and an index past the end
 /// panics; `for x in v` walks the elements in order. Dropping it drops its elements and frees
 /// its memory. To avoid allocating every frame, keep one and `clear()` it: it keeps its
@@ -240,14 +243,81 @@ impl<T> Vec<T> {
     }
 
     /// Sorts the elements by `before`, which says whether its first argument goes before its
-    /// second. Stable: equal elements keep their order. (Insertion sort: for the small lists
-    /// gameplay code keeps.)
+    /// second. Stable: equal elements keep their order. A merge sort, O(n log n): its room, as
+    /// many bytes as the elements take, is allocated for the call (`sort_by_in` keeps it).
+    ///
+    /// ```wrela
+    /// var v: Vec<u32> = Vec::new()
+    /// for x in [5, 3, 9, 1] {
+    ///     v.push(x)
+    /// }
+    /// v.sort_by(|a, b| a < b)
+    /// assert(v[0] == 1 && v[3] == 9)
+    /// ```
     pub fn sort_by(mut self, before: fn(T, T) -> bool) {
-        for i in 1..self.len {
-            var j = i
-            while j > 0 && before(self[j], self[j - 1]) {
-                self.swap(j, j - 1)
-                j -= 1
+        var room: Vec<u8> = Vec::new()
+        self.sort_by_in(before, mut room)
+    }
+
+    /// `sort_by`, with its room in `room`, which keeps it: once `room` has grown to the
+    /// elements' bytes, a sort allocates nothing (a tick's, §6.17).
+    pub fn sort_by_in(mut self, before: fn(T, T) -> bool, room: mut Vec<u8>) {
+        let n = self.len
+        // Runs of `SORT_RUN` elements, each sorted in place by insertion.
+        var lo = 0
+        while lo < n {
+            let hi = min(lo + SORT_RUN, n)
+            for i in lo + 1..hi {
+                var j = i
+                while j > lo && before(self[j], self[j - 1]) {
+                    self.swap(j, j - 1)
+                    j -= 1
+                }
+            }
+            lo = hi
+        }
+        if n <= SORT_RUN {
+            return
+        }
+        // Then merged in pairs, from one buffer to the other, each element moved bitwise
+        // (so none is dropped or copied), until one run is left.
+        let size = size_of::<T>()
+        room.clear()
+        room.reserve(n * size)
+        var src = self.data
+        var dst = room.data
+        var width = SORT_RUN
+        while width < n {
+            var lo = 0
+            while lo < n {
+                let mid = min(lo + width, n)
+                let hi = min(lo + 2 * width, n)
+                var i = lo
+                var j = mid
+                for k in lo..hi {
+                    // The left run's element while it's not after the right run's: stable.
+                    let left = i < mid &&
+                        (j >= hi || !unsafe { before(at::<T, Vec<T>>(self, src + j * size), at::<T, Vec<T>>(self, src + i * size)) })
+                    unsafe {
+                        if left {
+                            copy(dst + k * size, src + i * size, size)
+                            i += 1
+                        } else {
+                            copy(dst + k * size, src + j * size, size)
+                            j += 1
+                        }
+                    }
+                }
+                lo = hi
+            }
+            let t = src
+            src = dst
+            dst = t
+            width = 2 * width
+        }
+        if src != self.data {
+            unsafe {
+                copy(self.data, src, n * size)
             }
         }
     }
@@ -317,6 +387,66 @@ impl<T> Vec<T> {
             self.data = realloc(self.data, self.cap * size, cap * size, align_of::<T>())
         }
         self.cap = cap
+    }
+}
+
+/// Sorts `xs`, an array's elements or a run's, by `before`, which says whether its first
+/// argument goes before its second. Stable, O(n log n): a merge sort, whose room, a copy of
+/// the elements, is allocated for the call. (`Vec::sort_by` sorts a `Vec`, of any `T`.)
+///
+/// ```wrela
+/// use std::collections::sort_by
+///
+/// var xs = [2.5, -1.0, 7.0, 0.5]
+/// sort_by(mut xs, |a, b| a < b)
+/// assert(xs[0] == -1.0 && xs[3] == 7.0)
+/// ```
+pub fn sort_by<T: Copy>(xs: mut [T], before: fn(T, T) -> bool) {
+    let n = xs.len()
+    // Runs of `SORT_RUN` elements, each sorted by insertion.
+    var lo = 0
+    while lo < n {
+        let hi = min(lo + SORT_RUN, n)
+        for i in lo + 1..hi {
+            let x = xs[i]
+            var j = i
+            while j > lo && before(x, xs[j - 1]) {
+                xs[j] = xs[j - 1]
+                j -= 1
+            }
+            xs[j] = x
+        }
+        lo = hi
+    }
+    if n <= SORT_RUN {
+        return
+    }
+    // Then merged in pairs into the room, and back, until one run is left.
+    var room: Vec<T> = Vec::with_capacity(n)
+    var width = SORT_RUN
+    while width < n {
+        room.clear()
+        var lo = 0
+        while lo < n {
+            let mid = min(lo + width, n)
+            let hi = min(lo + 2 * width, n)
+            var i = lo
+            var j = mid
+            while i < mid || j < hi {
+                if i < mid && (j >= hi || !before(xs[j], xs[i])) {
+                    room.push(xs[i])
+                    i += 1
+                } else {
+                    room.push(xs[j])
+                    j += 1
+                }
+            }
+            lo = hi
+        }
+        for k in 0..n {
+            xs[k] = room[k]
+        }
+        width = 2 * width
     }
 }
 
@@ -469,5 +599,61 @@ impl<T: Eq> Eq for Box<T> {
 impl<T: Ord> Ord for Box<T> {
     fn cmp(self, other: Box<T>) -> Ordering {
         self.get().cmp(other.get())
+    }
+}
+
+// ---- tests ------------------------------------------------------------------------------------
+
+struct Keyed {
+    key: u32,
+    order: u32,
+    owned: Vec<u32>,
+}
+
+@test
+fn a_vec_sorts_stably_whatever_its_length() {
+    for n in [0, 1, 2, 15, 16, 17, 31, 32, 33, 100, 1000, 4097] {
+        var v: Vec<Keyed> = Vec::new()
+        var s = n + 7
+        for i in 0..n {
+            s = s.wrapping_mul(1664525).wrapping_add(1013904223)
+            var owned = Vec::new()
+            owned.push(i)
+            v.push(Keyed { key: (s >> 16) % 50, order: i, owned: take owned })
+        }
+        v.sort_by(|a, b| a.key < b.key)
+        assert(v.len() == n)
+        for i in 1..n {
+            let (a, b) = (v[i - 1].key, v[i].key)
+            assert(a < b || (a == b && v[i - 1].order < v[i].order))
+            // Each element moved whole: what it owns came with it.
+            assert(v[i].owned[0] == v[i].order)
+        }
+    }
+}
+
+@test
+fn a_sort_in_its_room_allocates_nothing_more() {
+    var room: Vec<u8> = Vec::new()
+    var v: Vec<u32> = Vec::new()
+    for i in 0..300 {
+        v.push((i * 7919) % 300)
+    }
+    v.sort_by_in(|a, b| a < b, mut room)
+    let cap = room.capacity()
+    v.sort_by_in(|a, b| a > b, mut room)
+    assert(room.capacity() == cap && v[0] == 299 && v[299] == 0)
+}
+
+@test
+fn an_array_sorts_stably() {
+    var pairs = [(0, 0); 40]
+    for i in 0..40 {
+        pairs[i] = ((i * 17) % 5, i)
+    }
+    sort_by(mut pairs, |a, b| a.0 < b.0)
+    for i in 1..40 {
+        let (a, b) = (pairs[i - 1], pairs[i])
+        assert(a.0 < b.0 || (a.0 == b.0 && a.1 < b.1))
     }
 }

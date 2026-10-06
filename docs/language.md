@@ -1019,7 +1019,7 @@ The sim/presentation split is an engine pattern built on this, not a language fe
 |---|---|
 | `std::prelude` | In scope in every module: `Option`, `Result`, `Copy`, `Clone`, `GpuData`, `Plain`, and `Eq`, `Ord`, `Ordering`, `Vec`, `Box`, `swap`, `replace`, `String`, `Text`, `Bytes`, `Arena`, `Handle`, `SortedMap` and `Quat` from their modules |
 | `std::cmp` | `Eq`, `Ord` and `Ordering`: `==` and `<` for types that declare them (§3) |
-| `std::collections` | `Vec`, `Box`; `swap` and `replace`, which move values out of places |
+| `std::collections` | `Vec`, `Box`; `swap` and `replace`, which move values out of places; `sort_by`, a stable O(n log n) sort of a run of `Copy` values. `Vec::sort_by` sorts any `Vec`, and `Vec::sort_by_in` keeps its room in a `Vec<u8>`, so a tick that sorts allocates nothing once it's grown (§6.17) |
 | `std::string` | `String`, `Text` (text known at build time), `Bytes` (bytes known at build time) |
 | `std::fmt` | `Format`, which `f"…"` calls, and `Spec`, a hole's format spec |
 | `std::arena` | `Arena<T>` and `Handle<T>` (§6.8); `SortedMap<K: Ord, V>`, which iterates in key order, so `@deterministic` code may use it |
