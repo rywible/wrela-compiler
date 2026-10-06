@@ -26,7 +26,13 @@ fn std_math_is_within_an_ulp() {
     let mut host = CpuHost::load(built("math")).expect("load");
     let mut rng = Rng::new(42);
     type One = fn(f64) -> f64;
-    let ones: [(&str, One, f64, f64); 14] = [
+    let ones: [(&str, One, f64, f64); 20] = [
+        ("f_sinh", f64::sinh, -90.0, 90.0),
+        ("f_sinh", f64::sinh, -1.0, 1.0),
+        ("f_cosh", f64::cosh, -90.0, 90.0),
+        ("f_cosh", f64::cosh, -1.0, 1.0),
+        ("f_tanh", f64::tanh, -12.0, 12.0),
+        ("f_tanh", f64::tanh, 1e-30, 1.0),
         ("f_sin", f64::sin, -1e4, 1e4),
         ("f_cos", f64::cos, -1e4, 1e4),
         ("f_tan", f64::tan, -1e2, 1e2),

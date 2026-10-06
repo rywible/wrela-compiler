@@ -3,7 +3,7 @@
 // block culling on the spike's grid, with the derived interval and with the spike's
 // hand-written Lipschitz bound. Also AC3's corpus (compiler/tests/tests/suite/derive.rs).
 use corpus::{
-    Branchy, Cells, Logs, Noise, Pieces, Powers, Rational, Trig, Vectors, Waves, blob_,
+    Branchy, Cells, Hyperbolic, Logs, Noise, Pieces, Powers, Rational, Trig, Vectors, Waves, blob_,
     blob_spheres, blob_tape, closures_, cone_, creature, ellipsoid_, fbm_, grazer_, hoof_, oval_,
     sphere_, sphere_tape, table_, tube_, waves_tape,
 }
@@ -356,6 +356,7 @@ fn with_function<V: Visit>(fi: u32, v: V) -> V::Out {
         19 => v.visit(blob_tape()),
         20 => v.visit(closures_(5.0)),
         21 => v.visit(table_()),
+        22 => v.visit(Hyperbolic { s: 1.7 }),
         _ => v.visit(Powers { n: 2.4 }),
     }
 }

@@ -22,6 +22,7 @@ pub const PI: f32 = 3.14159265
 pub const TAU: f32 = 6.28318531
 const LN2: f64 = 0.693147180559945286227
 const LOG2E: f64 = 1.44269504088896338700
+const HALF_LN2: f64 = 0.346573590279972643113
 const SQRT2: f64 = 1.41421356237309514547
 
 const S1: f64 = -0.166666666416265235595
@@ -194,6 +195,11 @@ pub fn tan(x: f32) -> f32 {
 
 /// e^r for |r| <= ln(2)/2, by its Taylor series to degree 11.
 fn exp_poly(r: f64) -> f64 {
+    1.0 + r * exp_tail(r)
+}
+
+/// (e^r - 1) / r for |r| <= ln(2)/2: `exp_poly`'s series after its 1, divided by r.
+fn exp_tail(r: f64) -> f64 {
     // Horner's rule, from the highest degree down.
     var p = 0.0000000250521083854417188
     p = 0.000000275573192239858907 + r * p
@@ -205,8 +211,22 @@ fn exp_poly(r: f64) -> f64 {
     p = 0.0416666666666666667 + r * p
     p = 0.166666666666666667 + r * p
     p = 0.5 + r * p
-    p = 1.0 + r * p
     1.0 + r * p
+}
+
+/// e^x for an f64 `x`, |x| <= 700.
+fn exp_f64(x: f64) -> f64 {
+    let n = round(x * LOG2E)
+    exp_poly(x - n * LN2) * pow2(i32(n))
+}
+
+/// e^x - 1 for an f64 `x`, |x| <= 700: near 0, without the cancellation of `e^x - 1`.
+fn expm1_f64(x: f64) -> f64 {
+    if abs(x) <= HALF_LN2 {
+        x * exp_tail(x)
+    } else {
+        exp_f64(x) - 1.0
+    }
 }
 
 /// 2^n as an f64, for -1022 <= n <= 1023.
@@ -240,6 +260,54 @@ pub fn exp(x: f32) -> f32 {
     }
     let n = round(xd * LOG2E)
     f32(exp_poly(xd - n * LN2) * pow2(i32(n)))
+}
+
+/// The hyperbolic sine of `x`, (e^x - e^-x) / 2.
+pub fn sinh(x: f32) -> f32 {
+    if is_nan(x) {
+        return x
+    }
+    // Odd: from |x|, then x's sign (by its bit, so -0 stays -0).
+    let a = abs(f64(x))
+    if a > 90.0 {
+        return with_sign_of(1.0 / 0.0, x)
+    }
+    // With E = e^a - 1, e^a - e^-a = E + E / (E + 1): no cancellation near 0.
+    let e = expm1_f64(a)
+    with_sign_of(f32(0.5 * (e + e / (e + 1.0))), x)
+}
+
+/// The hyperbolic cosine of `x`, (e^x + e^-x) / 2.
+pub fn cosh(x: f32) -> f32 {
+    if is_nan(x) {
+        return x
+    }
+    let a = abs(f64(x))
+    if a > 90.0 {
+        return f32(1.0 / 0.0)
+    }
+    let e = exp_f64(a)
+    f32(0.5 * (e + 1.0 / e))
+}
+
+/// The hyperbolic tangent of `x`, sinh(x) / cosh(x), in [-1, 1].
+pub fn tanh(x: f32) -> f32 {
+    if is_nan(x) {
+        return x
+    }
+    // Odd: from |x|, then x's sign. Past 20 it's 1 to within f64's precision.
+    let a = abs(f64(x))
+    if a > 20.0 {
+        return with_sign_of(1.0, x)
+    }
+    // With E = e^(2a) - 1, (e^(2a) - 1) / (e^(2a) + 1) = E / (E + 2).
+    let e = expm1_f64(2.0 * a)
+    with_sign_of(f32(e / (e + 2.0)), x)
+}
+
+/// `r`, a magnitude, with the sign of `x`.
+fn with_sign_of(r: f32, x: f32) -> f32 {
+    if (bitcast_u32(x) >> 31) == 1 { -r } else { r }
 }
 
 /// 2 to the power `x`.

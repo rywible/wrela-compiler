@@ -131,6 +131,9 @@ builtin_fns! {
     Exp2 = "exp2", 1, Both, true, Some(Lang::CpuExp2);
     Log = "log", 1, Both, true, Some(Lang::CpuLog);
     Log2 = "log2", 1, Both, true, Some(Lang::CpuLog2);
+    Sinh = "sinh", 1, Both, true, Some(Lang::CpuSinh);
+    Cosh = "cosh", 1, Both, true, Some(Lang::CpuCosh);
+    Tanh = "tanh", 1, Both, true, Some(Lang::CpuTanh);
     Floor = "floor", 1, Both, true, None;
     Ceil = "ceil", 1, Both, true, None;
     Round = "round", 1, Both, true, None;
@@ -241,7 +244,7 @@ impl BuiltinFn {
         };
         match self {
             Sqrt | InverseSqrt | Sin | Cos | Tan | Asin | Acos | Atan | Exp | Exp2 | Log | Log2
-            | Floor | Ceil | Round | Trunc | Fract | Saturate | Normalize | Dpdx | Dpdy
+            | Sinh | Cosh | Tanh | Floor | Ceil | Round | Trunc | Fract | Saturate | Normalize | Dpdx | Dpdy
             | Fwidth => {
                 let t = takes(float_like(args[0]), "a float or float vector", args[0])?;
                 if self == Normalize { takes(is_vec(t), "a vector", t) } else { Ok(t) }

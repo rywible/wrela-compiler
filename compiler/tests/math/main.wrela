@@ -22,6 +22,18 @@ pub fn f_exp(x: f32) -> f32 {
     exp(x)
 }
 
+pub fn f_sinh(x: f32) -> f32 {
+    sinh(x)
+}
+
+pub fn f_cosh(x: f32) -> f32 {
+    cosh(x)
+}
+
+pub fn f_tanh(x: f32) -> f32 {
+    tanh(x)
+}
+
 pub fn f_exp2(x: f32) -> f32 {
     exp2(x)
 }

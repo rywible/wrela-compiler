@@ -43,6 +43,17 @@ impl Surface for Waves {
     }
 }
 
+/// sinh, cosh, tanh: over the corpus's [-2, 2]³ and beyond, through `s`.
+pub struct Hyperbolic: Copy + GpuData {
+    pub s: f32,
+}
+
+impl Surface for Hyperbolic {
+    fn distance(self, p: vec3) -> f32 {
+        tanh(self.s * p.x) * cosh(0.5 * p.y) + 0.1 * sinh(self.s * p.z) - 0.3
+    }
+}
+
 /// log, log2, pow, exp2, inverseSqrt.
 pub struct Logs: Copy + GpuData {
     pub s: f32,

@@ -780,6 +780,21 @@ impl Ad<'_> {
                 })
             }
             B::Exp => d[0].map(|da| self.scale(out, da, v, ty)),
+            B::Sinh => d[0].map(|da| {
+                let c = self.builtin(out, B::Cosh, vec![a0], ty);
+                self.scale(out, da, c, ty)
+            }),
+            B::Cosh => d[0].map(|da| {
+                let s = self.builtin(out, B::Sinh, vec![a0], ty);
+                self.scale(out, da, s, ty)
+            }),
+            // 1 - tanh², from the value: it stays in [0, 1] where cosh² would overflow.
+            B::Tanh => d[0].map(|da| {
+                let one = self.fc(out, ty, 1.0);
+                let r2 = self.bin(out, BinOp::Mul, v, v, ty);
+                let f = self.bin(out, BinOp::Sub, one, r2, ty);
+                self.scale(out, da, f, ty)
+            }),
             B::Exp2 => d[0].map(|da| {
                 let c = self.fc(out, ty, ln2);
                 let f = self.bin(out, BinOp::Mul, v, c, ty);

@@ -2090,6 +2090,20 @@ impl<'a> Ivx<'a> {
                     self.widen(out, x, ty, CPU_STD_ULPS, 0.0)
                 }
             }
+            // Increasing: the ends. The GPU's are "inherited" from `exp` (WGSL): their error is
+            // relative where they're large, and near 0, where they're a difference of `exp`s
+            // near 1, it's absolute, about an ulp of 1.
+            B::Sinh | B::Tanh => {
+                let x = self.monotone(out, b, &r, ty);
+                match gpu {
+                    true => self.widen(out, x, ty, HYPERBOLIC_GPU_ULPS, HYPERBOLIC_GPU_ABS),
+                    false => self.widen(out, x, ty, CPU_STD_ULPS, 0.0),
+                }
+            }
+            B::Cosh => {
+                let x = self.per_comp(out, ty, &r, Self::cosh)?;
+                self.widen(out, x, ty, if gpu { HYPERBOLIC_GPU_ULPS } else { CPU_STD_ULPS }, 0.0)
+            }
             B::Log | B::Log2 => {
                 self.per_comp(out, ty, &r, |s, out, ty, x| Ok(s.log_ends(out, b, x[0], ty)))?
             }
@@ -2424,6 +2438,25 @@ impl<'a> Ivx<'a> {
         self.widen_k(out, e, ty, (ml, mh), k, 0.0)
     }
 
+    /// `cosh` over `x`: least at 0, so 1 where `x` holds 0, and its larger end's at most.
+    fn cosh(&mut self, out: &mut Block, ty: TypeId, x: &[Iv]) -> R<Iv> {
+        let (lo, hi) = x[0];
+        let (cl, ch) = (
+            self.builtin(out, Builtin::Cosh, vec![lo], ty),
+            self.builtin(out, Builtin::Cosh, vec![hi], ty),
+        );
+        let near = self.builtin(out, Builtin::Min, vec![cl, ch], ty);
+        let far = self.builtin(out, Builtin::Max, vec![cl, ch], ty);
+        let zero = self.fc(out, ty, 0.0);
+        let one = self.fc(out, ty, 1.0);
+        let bt = self.m.types.bool();
+        let below = self.emit(out, bt, Expr::Binary(BinOp::Le, lo, zero));
+        let above = self.emit(out, bt, Expr::Binary(BinOp::Ge, hi, zero));
+        let holds = self.emit(out, bt, Expr::Binary(BinOp::And, below, above));
+        let low = self.emit(out, ty, Expr::Select { cond: holds, if_true: one, if_false: near });
+        Ok((low, far))
+    }
+
     fn sin(&mut self, out: &mut Block, ty: TypeId, x: &[Iv]) -> R<Iv> {
         // Peaks at π/2 + 2πk, troughs at -π/2 + 2πk.
         let h = std::f64::consts::FRAC_PI_2;
@@ -2628,6 +2661,12 @@ impl<'a> Ivx<'a> {
 /// std's CPU transcendentals compute in f64 and round once to f32: within an ulp. Twice that,
 /// for the point and the bound, and some margin.
 const CPU_STD_ULPS: f64 = 4.0;
+
+/// How far the GPU's `sinh`, `cosh` and `tanh` may be from the truth: ulps of the result's
+/// magnitude (WGSL inherits their accuracy from `exp`'s, 3 + 2|x| ulps), and, for `sinh` and
+/// `tanh` near 0, an absolute error. The GPU interval tests hold them to these.
+const HYPERBOLIC_GPU_ULPS: f64 = 1024.0;
+const HYPERBOLIC_GPU_ABS: f64 = 1.0 / 1048576.0;
 
 /// The float range whose truncation fits in an integer type (exactly representable ends).
 fn float_int_range(from: Scalar, to: Scalar) -> (f64, f64) {
