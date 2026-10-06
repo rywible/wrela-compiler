@@ -10,7 +10,6 @@ publish.workspace = true
 name = "wrela-host"
 path = "src/main.rs"
 test = false
-required-features = ["gpu"]
 
 [features]
 default = ["gpu"]

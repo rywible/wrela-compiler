@@ -28,10 +28,16 @@ fn stem(wasm: &[u8]) -> String {
     format!("game-{}", hash.hex())
 }
 
-/// Where the compiled code of `wasm` goes for the build in `dir`: code that counts fuel (for
-/// tests) is another file.
+/// Where the compiled code of `wasm` goes for the build in `dir`: code for another machine (an
+/// x86-64 host under Rosetta, beside an arm64 one), or code that counts fuel (for tests), is
+/// another file.
 fn path(dir: &Path, wasm: &[u8], fuel: bool) -> PathBuf {
-    let name = if fuel { format!("{}-fuel.cwasm", stem(wasm)) } else { compiled_code_name(wasm) };
+    let arch = std::env::consts::ARCH;
+    let name = match (fuel, arch) {
+        (false, "aarch64") => compiled_code_name(wasm),
+        (false, _) => format!("{}-{arch}.cwasm", stem(wasm)),
+        (true, _) => format!("{}-{arch}-fuel.cwasm", stem(wasm)),
+    };
     dir.join(".native").join(name)
 }
 

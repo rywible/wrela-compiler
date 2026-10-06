@@ -522,7 +522,7 @@ impl<E: Executor> Program<E> {
     /// carried out by `executor`.
     /// `workers` is how many threads run a parallel job's chunks, this one included: 1 runs
     /// them all here.
-    #[cfg(any(test, feature = "gpu"))]
+    #[cfg(test)]
     pub(crate) fn instantiate(
         compiled: &Compiled,
         manifest: &Manifest,
@@ -856,6 +856,38 @@ impl<E: Executor> Program<E> {
         let result = thread.run(records, hash);
         self.ticker = Some(thread);
         result.map_err(|(k, trap)| self.tick_trapped(k, &trap))
+    }
+
+    /// Frame `i` of a lockstep schedule at `fps` (#43 §2.3): `script`'s events of frame `i`
+    /// queued for the frame and the ticker, then the ticks that come before the frame (each with
+    /// its tick-keyed records too), then the frame. With `log`, each tick's records and state
+    /// hash go into it.
+    pub(crate) fn lockstep_frame(
+        &mut self,
+        i: u32,
+        fps: f64,
+        width: u32,
+        height: u32,
+        script: &[wrela_abi::input::Scripted],
+        mut log: Option<&mut wrela_abi::ticks::TickLog>,
+    ) -> Result<()> {
+        let events: Vec<Event> = wrela_abi::input::events_at(script, i).collect();
+        for &e in &events {
+            self.push_input(e);
+        }
+        if let Some(hz) = self.ticker_hz() {
+            self.push_records(events);
+            while self.next_tick() < crate::lockstep_ticks(i, hz, fps) {
+                let k = self.next_tick();
+                self.push_records(wrela_abi::input::records_at(script, k));
+                let t = self.tick(log.is_some())?;
+                if let Some(log) = log.as_deref_mut() {
+                    let hash = t.hash.expect("asked for");
+                    log.ticks.push(wrela_abi::ticks::Tick { records: t.records, hash });
+                }
+            }
+        }
+        self.frame(crate::frame_time(i, fps), width, height)
     }
 
     /// The ticker's thread's instance, made the first time, to run ticks on any OS thread

@@ -68,6 +68,9 @@ pub struct Options {
     /// Don't show the program's printed lines on stderr (`wrela: ...`): for a caller that
     /// shows them itself ([`Host::take_logs`]), such as `wrela studio`'s headless runner.
     pub quiet: bool,
+    /// Don't run the program's `init` while loading: the caller runs it ([`Host::init`]),
+    /// after asking for the ticker's first hash, say.
+    pub defer_init: bool,
 }
 
 /// The threads a program's parallel jobs run on by default: one per core, at most
@@ -211,6 +214,7 @@ fn read_file<T>(
 #[cfg(feature = "gpu")]
 pub struct Host {
     program: Program<Gpu>,
+    wasm_hash: u64,
     // Declared last: dropped after the GPU.
     _lock: lock::GpuLock,
 }
@@ -232,14 +236,76 @@ impl Host {
         let gpu = Gpu::new(&manifest, &shaders, options.timestamps)?;
         let io = io(dir, options.storage.as_deref(), options.post.clone(), options.quiet);
         let n = workers(options.workers);
-        let program = Program::instantiate(&compiled, &manifest, gpu, io, options.record, n)?;
-        Ok(Host { program, _lock: lock })
+        let program = Program::instantiate_with(
+            &compiled,
+            &manifest,
+            gpu,
+            io,
+            options.record,
+            n,
+            !options.defer_init,
+        )?;
+        let wasm_hash = wrela_abi::ticks::wasm_hash(&wasm);
+        Ok(Host { program, wasm_hash, _lock: lock })
     }
 
     /// Calls `frame(times[i], width, height)` for each time in order, then reads the screen
     /// back.
     pub fn run_frames(&mut self, times: &[f32], width: u32, height: u32) -> Result<RunResult> {
         self.run_frames_with(times, width, height, &[])
+    }
+
+    /// Runs `frames` frames at `fps` in lockstep with the program's ticker, if it has one
+    /// (test mode, #43 §2.3; [`CpuHost::lockstep_frame`]), then reads the screen back. With
+    /// `log`, each tick's records and state hash go into it (its header filled in here; ask for
+    /// the first world's hash with [`Host::want_hashes`] before the program's `init`, which a
+    /// [`Options::defer_init`] load leaves to [`Host::init`]).
+    pub fn run_lockstep(
+        &mut self,
+        frames: u32,
+        fps: f64,
+        width: u32,
+        height: u32,
+        script: &[Scripted],
+        mut log: Option<&mut TickLog>,
+    ) -> Result<RunResult> {
+        self.program.executor().set_screen(width, height)?;
+        if let (Some(log), Some(hz)) = (log.as_deref_mut(), self.program.ticker_hz()) {
+            log.hz = hz;
+        }
+        for i in 0..frames {
+            self.program.executor().set_frame(i as usize);
+            self.program.lockstep_frame(i, fps, width, height, script, log.as_deref_mut())?;
+        }
+        let gpu = self.program.executor();
+        let frame = gpu.read_screen()?;
+        let timings = gpu.take_timings();
+        Ok(RunResult { hash: self.program.hash().value(), width, height, frame, timings })
+    }
+
+    /// Runs the program's `init`, for a host loaded with [`Options::defer_init`].
+    pub fn init(&mut self) -> Result<()> {
+        self.program.run_init()
+    }
+
+    /// Whether the ticker reports its state's hash ([`CpuHost::want_hashes`]).
+    pub fn want_hashes(&mut self, on: bool) {
+        self.program.want_hashes(on);
+    }
+
+    /// The state hash the ticker reported last.
+    pub fn reported_hash(&self) -> u64 {
+        self.program.reported_hash()
+    }
+
+    /// The ticker's rate, once the program has started one.
+    pub fn ticker_hz(&self) -> Option<u32> {
+        self.program.ticker_hz()
+    }
+
+    /// FNV-1a 64 of the build's WASM ([`wrela_abi::ticks::wasm_hash`]).
+    pub fn wasm_hash(&self) -> u64 {
+        self.wasm_hash
     }
 
     /// [`Host::run_frames`], with `script`'s events queued before the frames they're for
@@ -582,19 +648,7 @@ impl CpuHost {
         height: u32,
         script: &[Scripted],
     ) -> Result<()> {
-        let events: Vec<Event> = wrela_abi::input::events_at(script, i).collect();
-        for &e in &events {
-            self.program.push_input(e);
-        }
-        if let Some(hz) = self.program.ticker_hz() {
-            self.program.push_records(events);
-            while self.program.next_tick() < lockstep_ticks(i, hz, fps) {
-                let k = self.program.next_tick();
-                self.program.push_records(wrela_abi::input::records_at(script, k));
-                self.program.tick(false)?;
-            }
-        }
-        self.program.frame(frame_time(i, fps), width, height)
+        self.program.lockstep_frame(i, fps, width, height, script, None)
     }
 
     /// Makes each helper hold back a long job's result for `micros` microseconds once it's

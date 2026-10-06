@@ -155,3 +155,34 @@ fn parallel_work_from_ticks_and_frames_doesnt_collide() {
         assert_eq!(u32_of(&host.call_export("work", &[]).expect("work")), work, "round {round}");
     }
 }
+
+/// A tick log (runtime/abi `ticks`) replays to the same hashes (`wrela-host --replay`), with
+/// any helpers, and a log with one record changed fails at that tick and names it (AC6).
+#[test]
+fn a_tick_log_replays_and_a_changed_record_fails_at_its_tick() {
+    let script = wrela_host::parse_script(
+        r#"[
+            {"tick": 3, "type": "key", "key": "Space"},
+            {"tick": 10, "type": "keydown", "key": "KeyA"},
+            {"tick": 40, "type": "keyup", "key": "KeyA"}
+        ]"#,
+    )
+    .expect("a script");
+    let built = CpuBuild::load(built("ticker")).expect("load");
+    let log = built.record_ticks(60, &script, 1).expect("record");
+    let bytes = log.encode();
+    let read = wrela_host::TickLog::decode(&bytes).expect("reads back");
+    for workers in [1, 2, 8] {
+        assert_eq!(built.replay(&read, workers).expect("replays"), 60);
+    }
+    // A key going down at tick 10 becomes one going up: tick 10's hash differs.
+    let mut changed = read.clone();
+    changed.ticks[10].records[0][0] = wrela_abi::input::EventKind::KeyUp as u8;
+    match built.replay(&changed, 2) {
+        Err(wrela_host::ReplayError::Tick { tick, .. }) => assert_eq!(tick, 10),
+        other => panic!("expected tick 10 to differ: {other:?}"),
+    }
+    let mut other = read.clone();
+    other.wasm_hash ^= 1;
+    assert!(matches!(built.replay(&other, 1), Err(wrela_host::ReplayError::OtherBuild { .. })));
+}
