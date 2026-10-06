@@ -1,0 +1,48 @@
+// mistake: #43 §11: a presentation type (a spring for drawing) stored in the world the sim steps
+// expect: E0417 E0400
+// fix: no
+use engine::run::{Asks, TickInput, run}
+use engine::sim::{Sim, Tick}
+
+/// What a frame draws a tail with: presentation, not sim state.
+pub struct Spring: Copy {
+    pub pos: f32,
+    pub vel: f32,
+}
+
+pub struct World: Sim {
+    pub tick: Tick,
+    pub tail: Spring,
+}
+
+impl Asks for World {
+    type Ask = u32
+    type Answer = u32
+
+    @deterministic
+    fn asks(self, tick: Tick) -> Vec<(u32, Tick)> {
+        Vec::new()
+    }
+
+    @deterministic
+    fn work(ask: u32) -> u32 {
+        ask
+    }
+}
+
+@deterministic
+fn step(w: mut World, input: TickInput<World>) {
+    w.tick += 1
+}
+
+@deterministic
+fn snap(w: World) -> u32 {
+    w.tick
+}
+
+pub fn init() -> u32 {
+    let _ = run(World { tick: 0, tail: Spring { pos: 0.0, vel: 0.0 } }, hz: 60, step: step, present: snap)
+    0
+}
+
+pub fn frame(state: mut u32, time: f32, width: u32, height: u32) {}

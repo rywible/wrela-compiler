@@ -1221,3 +1221,303 @@ fn the_herds_pipelines_load_cold_as_fast() {
     );
     assert!(o <= 1.5 * t, "the herd's pipelines take {:.2}x the spike's", o / t);
 }
+
+// ---- AC5: one hash sequence everywhere ------------------------------------------------------------
+
+/// AC5: the herd's world, over 10,000 ticks, has one sequence of per-tick hashes in every host and
+/// configuration: the native host without the GPU (`--no-gpu`) with 0, 1 and 7 helpers, and with
+/// its jobs (the grazers' physiques) slowed tenfold, which makes the sim wait (AC6); the native
+/// host with the GPU, ticking in lockstep with its frames; the native host built for x86-64, under
+/// Rosetta, replaying the log; and Chrome on the lockstep schedule at 30, 60 and 144 frames a
+/// second, and at 60 with each frame held 20 ms longer.
+#[test]
+#[ignore = "needs Chrome, python3, a GPU and Rosetta"]
+fn the_herds_ticks_hash_the_same_everywhere() {
+    const TICKS: u32 = 10_000;
+    let (dir, rel) = wrela_tests::page("examples/herd", "herd-hashes");
+    let hex = |h: u64| format!("{h:016x}");
+    let built = CpuBuild::load(&dir).expect("load");
+    let log = built.record_ticks(TICKS, &[], 1).expect("no helpers");
+    let reference: Vec<String> = log.ticks.iter().map(|t| hex(t.hash)).collect();
+    for workers in [2, 8] {
+        let other = built.record_ticks(TICKS, &[], workers).expect("helpers");
+        let hashes: Vec<String> = other.ticks.iter().map(|t| hex(t.hash)).collect();
+        assert_eq!(hashes, reference, "{} helpers", workers - 1);
+    }
+    eprintln!("no GPU: 0, 1 and 7 helpers agree over {TICKS} ticks");
+    // Jobs slowed tenfold (each physique held 0.36 s after it's done, one helper): the sim waits
+    // for the answers due, logs that it did, and the hashes don't change.
+    let mut slow = built.instantiate_in(2, None).expect("instantiate");
+    slow.hold_jobs(360_000);
+    slow.want_hashes(true);
+    slow.init().expect("init");
+    let mut hashes = Vec::new();
+    for _ in 0..TICKS {
+        hashes.push(hex(slow.tick(true).expect("a tick").hash.expect("a hash")));
+    }
+    let waits = slow.take_logs().into_iter().filter(|l| l.contains("waited for a job")).count();
+    assert_eq!(hashes, reference, "jobs slowed tenfold");
+    assert!(waits > 0, "the slowed run never waited for a job");
+    eprintln!("jobs slowed tenfold agree over {TICKS} ticks; the sim waited at {waits} ticks");
+    // With the GPU, in lockstep with 60 frames a second. The host holds the GPU lock until it's
+    // dropped, which it must be before Chrome waits for the lock.
+    let gpu: Vec<String> = {
+        let options = wrela_host::Options { defer_init: true, ..wrela_host::Options::default() };
+        let mut host = wrela_host::Host::load_with(&dir, &options).expect("load");
+        host.want_hashes(true);
+        host.init().expect("init");
+        let mut glog = wrela_host::TickLog::new(host.wasm_hash(), 60, host.reported_hash());
+        host.run_lockstep(TICKS, 60.0, 64, 64, &[], Some(&mut glog)).expect("run");
+        glog.ticks.iter().map(|t| hex(t.hash)).collect()
+    };
+    assert_eq!(gpu[..], reference[..gpu.len()], "the native host with the GPU");
+    assert!(gpu.len() >= TICKS as usize - 1, "only {} ticks with the GPU", gpu.len());
+    eprintln!("the native host with the GPU agrees over {} ticks", gpu.len());
+    // x86-64 under Rosetta: the log replays.
+    let path = dir.join("herd.ticks");
+    std::fs::write(&path, log.encode()).expect("write the log");
+    let (ok, text) = crate::keys::replay_on_x86(&crate::keys::x86_host(), &path, &dir);
+    assert!(ok, "x86-64 didn't replay the herd's log: {text}");
+    assert!(text.contains(&format!("{TICKS} ticks replayed")), "{text}");
+    eprintln!("x86-64 under Rosetta replays {TICKS} ticks");
+    for (fps, delay) in [(60.0, 0), (30.0, 0), (144.0, 0), (60.0, 20)] {
+        let frames = (f64::from(TICKS) * fps / 60.0).ceil() as u32 + 1;
+        let run = wrela_tests::ChromeRun {
+            workers: 8,
+            framedelay: delay,
+            ..wrela_tests::ChromeRun::new(frames, 64, 64, fps)
+        };
+        let chrome = wrela_tests::run_in_chrome_with(&rel, run);
+        let ticks = chrome.ticks.expect("the sim's ticks");
+        let what = format!(
+            "Chrome at {fps} fps{}",
+            if delay > 0 { ", each frame 20 ms longer" } else { "" }
+        );
+        assert!(ticks.hashes.len() >= TICKS as usize, "{what}: {} ticks", ticks.hashes.len());
+        assert_eq!(ticks.hashes[..TICKS as usize], reference[..], "{what}");
+        eprintln!("{what} agrees over {TICKS} ticks");
+    }
+}
+
+// ---- AC7: the herd's grazer against the spike's ---------------------------------------------------
+
+/// AC7: at every vertex of the spike's 1.5 cm mesh of seed 1, the herd's skin weights (the
+/// creature API's skin bindings, `Parts::skin_at` under the vertex's mask, a cell wide, falling
+/// off over 6 cm) pick the same four bones, each weight within 1/255.
+#[test]
+#[ignore = "needs a GPU and bun"]
+fn the_herds_skin_weights_are_the_spikes() {
+    let (vertices, cell) = {
+        let spike = wrela_tests::spike01::Spike::new();
+        let (_, inds) = spike.extract_herd(0.015, 1);
+        (spike.vertices(&inds[0]), 0.015f32)
+    };
+    let mut host = ours();
+    let (mut bones_off, mut weight_off, mut worst) = (0, 0, 0u8);
+    for v in &vertices {
+        let [x, y, z] = [0, 1, 2].map(|k| f32::from_bits(v[k]));
+        let r = host
+            .call_export(
+                "skin_at",
+                &[
+                    Value::I32(1),
+                    Value::F32(x),
+                    Value::F32(y),
+                    Value::F32(z),
+                    Value::I32(v[8] as i32),
+                    Value::I32(0),
+                    Value::F32(cell),
+                ],
+            )
+            .expect("skin_at");
+        let [Value::F32(b), Value::F32(w)] = r[..] else { panic!("{r:?}") };
+        let (ours_b, ours_w) = (b.to_bits().to_le_bytes(), w.to_bits().to_le_bytes());
+        let (theirs_b, theirs_w) = (v[3].to_le_bytes(), v[7].to_le_bytes());
+        // The same bones with the same weights, whatever their order, where weights are equal.
+        let mut a: Vec<(u8, u8)> =
+            (0..4).filter(|&k| ours_w[k] > 0).map(|k| (ours_b[k], ours_w[k])).collect();
+        let mut t: Vec<(u8, u8)> =
+            (0..4).filter(|&k| theirs_w[k] > 0).map(|k| (theirs_b[k], theirs_w[k])).collect();
+        a.sort();
+        t.sort();
+        let same_bones = a.len() == t.len() && a.iter().zip(&t).all(|(p, q)| p.0 == q.0);
+        if !same_bones {
+            bones_off += 1;
+            continue;
+        }
+        let off = a.iter().zip(&t).map(|(p, q)| p.1.abs_diff(q.1)).max().unwrap_or(0);
+        worst = worst.max(off);
+        weight_off += usize::from(off > 1);
+    }
+    eprintln!(
+        "{} vertices: {bones_off} with other bones, {weight_off} with a weight over 1/255 off (the most {worst}/255)",
+        vertices.len()
+    );
+    assert!(vertices.len() > 10_000, "only {} vertices", vertices.len());
+    assert_eq!(bones_off, 0, "vertices whose bones differ");
+    assert_eq!(weight_off, 0, "vertices whose weights differ by more than 1/255");
+}
+
+const HARNESS_C: &str = "
+@group(0) @binding(0) var<uniform> G: Grazer;
+@group(0) @binding(1) var<storage, read> points: array<vec4f>;
+@group(0) @binding(2) var<storage, read_write> samp: array<vec4f>;
+
+@compute @workgroup_size(64)
+fn eval_c(@builtin(global_invocation_id) id: vec3u) {
+  let s = grazer_g(points[id.x].xyz, ALL_PARTS, 0.0);
+  samp[id.x] = vec4f(s.d, s.ch, 0.0);
+}
+";
+
+/// AC7: the herd's grazer, seed 1, matches field.wgsl with the seed-1 parameters at 4,096 points
+/// from `Box3::sample` within 2 cm of its surface, on the GPU: distances within 1e-6 m, channels
+/// (torso-ness, hoof-ness) within 1e-5.
+#[test]
+#[ignore = "needs a GPU"]
+fn the_herds_grazer_is_field_wgsls_near_the_surface() {
+    use wrela_tests::{Bind, RawGpu, f32s};
+    let n: u32 = 4096;
+    let dir = built("herd-realize");
+    let mut host = wrela_host::Host::load(&dir).expect("load");
+    host.call_export("near_surface", &[Value::I32(1), Value::I32(n as i32)]).expect("near_surface");
+    let made = host.buffers();
+    let [.., p, d, s] = made[..] else { panic!("near_surface made {made:?}") };
+    let points = host.read_buffer(p).expect("points");
+    let dist = f32s(&host.read_buffer(d).expect("distances"));
+    let samp = f32s(&host.read_buffer(s).expect("samples"));
+    drop(host);
+    let field = std::fs::read_to_string(fixture("field.wgsl")).expect("field.wgsl");
+    let params: Vec<u8> = params_seed1().iter().flat_map(|x| x.to_le_bytes()).collect();
+    let gpu = RawGpu::new().expect("a GPU");
+    let run = |wgsl: String, entry: &str, out: u64| {
+        let (_, o) = gpu
+            .run(
+                &wgsl,
+                entry,
+                &[Bind::Uniform(&params), Bind::Read(&points), Bind::Write(out)],
+                n / 64,
+                1,
+            )
+            .expect(entry);
+        f32s(&o[0])
+    };
+    let hd = run(format!("{field}{HARNESS_D}"), "eval_d", u64::from(n) * 4);
+    let hc = run(format!("{field}{HARNESS_C}"), "eval_c", u64::from(n) * 16);
+    let mut worst_d = 0.0f32;
+    let mut worst_c = 0.0f32;
+    for i in 0..n as usize {
+        worst_d = worst_d.max((dist[i] - hd[i]).abs()).max((samp[4 * i] - hc[4 * i]).abs());
+        worst_c = worst_c
+            .max((samp[4 * i + 1] - hc[4 * i + 1]).abs())
+            .max((samp[4 * i + 2] - hc[4 * i + 2]).abs());
+    }
+    eprintln!(
+        "{n} points within 2 cm of the surface: distances within {worst_d:.2e} m, channels within {worst_c:.2e}"
+    );
+    assert!(worst_d <= 1e-6, "a distance {worst_d:.2e} m off");
+    assert!(worst_c <= 1e-5, "a channel {worst_c:.2e} off");
+}
+
+/// The `.wrela` files of `dir` (and its subdirectories but `build/`), each with its text.
+fn wrela_files(dir: &std::path::Path) -> Vec<(PathBuf, String)> {
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(dir).expect("a directory").flatten() {
+        let p = e.path();
+        if p.is_dir() && p.file_name().is_some_and(|n| n != "build") {
+            out.extend(wrela_files(&p));
+        } else if p.extension().is_some_and(|x| x == "wrela") {
+            out.push((p.clone(), std::fs::read_to_string(&p).expect("read")));
+        }
+    }
+    out
+}
+
+/// A file's text without its comments (`//` to the line's end; wrela has no others).
+fn code_of(text: &str) -> String {
+    text.lines().map(|l| l.split("//").next().unwrap_or("")).collect::<Vec<_>>().join("\n")
+}
+
+/// AC7, layering: the engine doesn't depend on the herd, and no code in it names the grazer or
+/// the herd (its comments may cite them); neither uses `unsafe`; and the compiler's crates name
+/// nothing of the engine (the `wrela` command's tools, which find an `engine/` beside a parts
+/// file, aren't the compiler). And AC9's "no ratio is met by hand": the engine and the herd are
+/// wrela sources and their manifests alone, with no WGSL or JS of their own.
+#[test]
+fn the_engine_and_the_herd_keep_their_layers() {
+    let root = repo_root();
+    for dir in ["engine", "examples/herd"] {
+        let listed = std::process::Command::new("git")
+            .args(["ls-files", dir])
+            .current_dir(&root)
+            .output()
+            .expect("git ls-files");
+        for file in String::from_utf8_lossy(&listed.stdout).lines() {
+            assert!(
+                file.ends_with(".wrela") || file.ends_with("/wrela.toml"),
+                "{file} isn't a wrela source or a manifest"
+            );
+        }
+    }
+    let manifest =
+        std::fs::read_to_string(root.join("engine/wrela.toml")).expect("engine/wrela.toml");
+    assert!(!manifest.contains("herd"), "the engine depends on the herd: {manifest}");
+    for (path, text) in wrela_files(&root.join("engine")) {
+        let code = code_of(&text);
+        for word in ["grazer", "Grazer", "herd", "Herd", "unsafe"] {
+            assert!(!code.contains(word), "{} has `{word}` in its code", path.display());
+        }
+    }
+    for (path, text) in wrela_files(&root.join("examples/herd")) {
+        assert!(!code_of(&text).contains("unsafe"), "{} uses `unsafe`", path.display());
+    }
+    for krate in ["syntax", "sema", "lower", "ir", "wasm", "wgsl", "driver", "diag"] {
+        let mut stack = vec![root.join("compiler").join(krate).join("src")];
+        while let Some(dir) = stack.pop() {
+            for e in std::fs::read_dir(&dir).expect("a directory").flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    let text = std::fs::read_to_string(&p).expect("read");
+                    assert!(
+                        !text.contains("engine::") && !text.contains("\"engine\""),
+                        "{} names the engine",
+                        p.display()
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// AC6: frames don't wait for ticks. Paced in Chrome, 300 frames of the live herd at 640×360,
+/// with each tick held 30 ms (two ticks' time): the render worker's frame intervals keep their
+/// median and 99th percentile within 1 ms of a run with normal ticks.
+#[test]
+#[ignore = "needs Chrome, python3 and a GPU"]
+fn frames_dont_wait_for_slow_ticks() {
+    let (_, rel) = wrela_tests::page("examples/herd", "herd-slow-ticks");
+    let intervals = |tickdelay: u32| {
+        let run = wrela_tests::ChromeRun {
+            workers: 8,
+            paced: true,
+            nohash: true,
+            tickdelay,
+            ..wrela_tests::ChromeRun::new(300, 640, 360, 60.0)
+        };
+        let chrome = wrela_tests::run_in_chrome_with(&rel, run);
+        let ticks = chrome.ticks.as_ref().map_or(0, |t| t.cpu_ms.len());
+        let mut d: Vec<f64> = chrome.began_ms.windows(2).skip(30).map(|w| w[1] - w[0]).collect();
+        d.sort_by(f64::total_cmp);
+        (d[d.len() / 2], d[(d.len() * 99 / 100).min(d.len() - 1)], ticks)
+    };
+    let (m0, p0, t0) = intervals(0);
+    let (m1, p1, t1) = intervals(30);
+    eprintln!(
+        "frame intervals: normal ticks median {m0:.2} ms, 99th percentile {p0:.2} ({t0} ticks); ticks held 30 ms median {m1:.2}, 99th {p1:.2} ({t1} ticks)"
+    );
+    assert!(t1 < t0, "the held ticks weren't slower: {t1} ticks against {t0}");
+    assert!((m1 - m0).abs() <= 1.0, "the median interval moved {:.2} ms", m1 - m0);
+    assert!((p1 - p0).abs() <= 1.0, "the 99th percentile moved {:.2} ms", p1 - p0);
+}

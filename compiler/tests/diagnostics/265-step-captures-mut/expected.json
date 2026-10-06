@@ -1,0 +1,30 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0510",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [
+        "copy what it needs into a local first (`let x = count.clone()`), or pass the closure straight to a parameter"
+      ],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "a closure that captures `count`, a projection, can't be a generic's type argument",
+      "notes": [
+        "a closure that captures only `Copy` values holds copies of them, and can be stored; one that borrows or changes what it uses can only be passed down (§6.7)"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 13,
+        "end": 790,
+        "end_column": 98,
+        "end_line": 39,
+        "line": 39,
+        "start": 705
+      },
+      "title": "a closure that escapes"
+    }
+  ],
+  "version": 2
+}

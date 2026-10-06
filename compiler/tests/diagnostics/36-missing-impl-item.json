@@ -13,11 +13,11 @@
           "message": "declared here",
           "span": {
             "column": 5,
-            "end": 1364,
+            "end": 1690,
             "end_column": 38,
-            "end_line": 29,
-            "line": 29,
-            "start": 1331
+            "end_line": 35,
+            "line": 35,
+            "start": 1657
           }
         }
       ],

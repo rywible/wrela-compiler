@@ -233,3 +233,96 @@ fn the_ticker_in_chrome_agrees_with_the_native_host() {
         assert_eq!(built.replay(&log, 2).expect("replays") as usize, ticks.hashes.len(), "{what}");
     }
 }
+
+/// A job that traps does so at the tick that takes it (AC6): `engine::run`'s world asks at tick
+/// 2 for a job due at tick 10, and at tick 5 for one due at tick 20 whose work panics; the ticks
+/// before 20 run, and tick 20 traps with the job's message. With no helpers, one or seven, and
+/// with jobs slowed (each result held 100 ms, so tick 10 waits for its job). The ticks are 2 ms
+/// apart, so a helper takes each job before its due tick does.
+#[test]
+fn a_trapping_job_traps_at_the_tick_that_takes_it() {
+    let dir = super::engine_package("threads-due-trap", "due", DUE_TRAP);
+    let built = wrela_driver::build(&dir);
+    assert!(!built.has_errors(), "{:?}", built.diagnostics);
+    built.write_to(&dir).expect("write");
+    let build = CpuBuild::load(&dir).expect("load");
+    for (workers, hold) in [(1, 0), (2, 0), (8, 0), (2, 100_000), (8, 100_000)] {
+        let mut host = build.instantiate_in(workers, None).expect("instantiate");
+        host.hold_jobs(hold);
+        host.init().expect("init");
+        for k in 0..20 {
+            let t = std::time::Instant::now();
+            host.tick(false)
+                .unwrap_or_else(|e| panic!("{workers} threads, held {hold}: tick {k}: {e}"));
+            if k == 10 && hold > 0 {
+                let waited = t.elapsed().as_secs_f64() * 1000.0;
+                assert!(waited > 50.0, "{workers} threads: tick 10 took {waited:.1} ms");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let e = host.tick(false).expect_err("tick 20 takes the trapping job");
+        let msg = e.to_string();
+        assert!(
+            msg.contains("in tick 20") && msg.contains("a job's input was 13"),
+            "{workers} threads, held {hold}: {msg}"
+        );
+    }
+}
+
+const DUE_TRAP: &str = "use engine::run::{Asks, Stamped, TickInput, run}
+use engine::sim::{Sim, Tick}
+use std::handoff::Latest
+
+/// The ticks run and the answers' sum.
+pub struct Count: Sim {
+    pub ticks: u32,
+    pub sum: u32,
+}
+
+impl Asks for Count {
+    type Ask = u32
+    type Answer = u32
+
+    /// At tick 2, a job due at tick 10; at tick 5, one due at tick 20 that panics.
+    @deterministic
+    fn asks(self, tick: Tick) -> Vec<(u32, Tick)> {
+        var out: Vec<(u32, Tick)> = Vec::new()
+        if tick == 2 {
+            out.push((4, 10))
+        }
+        if tick == 5 {
+            out.push((13, 20))
+        }
+        out
+    }
+
+    @deterministic
+    fn work(ask: u32) -> u32 {
+        assert(ask != 13, f\"a job's input was {ask}\")
+        ask * 2
+    }
+}
+
+@deterministic
+fn step(c: mut Count, input: TickInput<Count>) {
+    c.ticks += 1
+    for a in input.answers {
+        c.sum += a.answer
+    }
+}
+
+@deterministic
+fn snapshot(c: Count) -> u32 {
+    c.sum
+}
+
+pub struct Game {
+    latest: Latest<Stamped<u32>>,
+}
+
+pub fn init() -> Game {
+    Game { latest: run(Count { ticks: 0, sum: 0 }, hz: 60, step: step, present: snapshot) }
+}
+
+pub fn frame(game: mut Game, time: f32, width: u32, height: u32) {}
+";

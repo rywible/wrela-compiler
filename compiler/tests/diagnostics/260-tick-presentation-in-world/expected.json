@@ -1,0 +1,62 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0417",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [
+        {
+          "file": "main.wrela",
+          "message": "`SimState` declared here",
+          "span": {
+            "column": 19,
+            "end": 354,
+            "end_column": 22,
+            "end_line": 13,
+            "line": 13,
+            "start": 351
+          }
+        }
+      ],
+      "message": "`Spring` isn't sim state: sim state is rolled back and hashed, so it must be the same on every client. Presentation data (poses for drawing, springs, sounds) lives outside it; declare `SimState` on `Spring` only if it's simulation data",
+      "notes": [
+        "`World` declares `SimState`, which is derived field by field, so the field `tail` needs it too (§3)"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 5,
+        "end": 397,
+        "end_column": 21,
+        "end_line": 15,
+        "line": 15,
+        "start": 381
+      },
+      "title": "a type that can't derive a `@fieldwise` trait it declares"
+    },
+    {
+      "code": "E0400",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "`World` doesn't implement `StateHash`, which `W` in `run` needs",
+      "notes": [],
+      "severity": "error",
+      "span": {
+        "column": 17,
+        "end": 866,
+        "end_column": 71,
+        "end_line": 44,
+        "line": 44,
+        "start": 812
+      },
+      "title": "a type that doesn't implement a trait"
+    }
+  ],
+  "version": 2
+}

@@ -2778,8 +2778,15 @@ fn check_fieldwise_opt_in(p: &Program, diags: &mut Vec<Diagnostic>, imp: &ImplDe
         if p.types.has_params(f.ty) || crate::traits::implements(p, f.ty, r) {
             continue;
         }
-        // A library's `@diagnostic` speaks for the field's type (§7).
-        let message = match p.custom_message(f.ty, r) {
+        // A library's `@diagnostic` speaks for the field's type (§7). When another trait the
+        // type opts into is one the field lacks too, and its library speaks for the field's
+        // type, that error says what's wrong, and this one would only hide it (a presentation
+        // type in sim state lacks `StateHash` too, and `SimState`'s message explains why).
+        let custom = p.custom_message(f.ty, r);
+        if custom.is_none() && spoken_for_elsewhere(p, imp, f.ty) {
+            continue;
+        }
+        let message = match custom {
             Some(m) => m,
             None => format!(
                 "`{}` can't derive `{}`: the field `{}` has type `{}`, which doesn't have it",
@@ -2798,6 +2805,23 @@ fn check_fieldwise_opt_in(p: &Program, diags: &mut Vec<Diagnostic>, imp: &ImplDe
                 )),
         );
     }
+}
+
+/// Whether `self_ty` opts into a `@fieldwise` trait that `field` lacks and whose library gives
+/// a message for `field`'s type (`check_fieldwise_opt_in`).
+fn spoken_for_elsewhere(p: &Program, imp: &ImplDef, field: TyId) -> bool {
+    p.impls_of_trait.iter().any(|(t, impls)| {
+        p.trait_(*t).fieldwise
+            && impls.iter().any(|&i| {
+                let o = p.impl_(i);
+                o.from_opt_in
+                    && o.self_ty == imp.self_ty
+                    && o.trait_ref.as_ref().is_some_and(|r| {
+                        !crate::traits::implements(p, field, r)
+                            && p.custom_message(field, r).is_some()
+                    })
+            })
+    })
 }
 
 /// What a type is at its top, for grouping impls: two whose self types have different heads

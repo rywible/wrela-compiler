@@ -1,0 +1,50 @@
+// mistake: #43 §11: a `@deterministic` function, as a tick's are, reading a hand-off's newest value
+// expect: E0600
+// fix: no
+use engine::run::{Asks, TickInput, run}
+use engine::sim::{Sim, Tick}
+use std::handoff::{Latest, handoff}
+
+pub struct World: Sim {
+    pub tick: Tick,
+}
+
+impl Asks for World {
+    type Ask = u32
+    type Answer = u32
+
+    @deterministic
+    fn asks(self, tick: Tick) -> Vec<(u32, Tick)> {
+        Vec::new()
+    }
+
+    @deterministic
+    fn work(ask: u32) -> u32 {
+        ask
+    }
+}
+
+@deterministic
+fn peek(seen: mut Latest<u32>) -> u32 {
+    seen.read()
+}
+
+@deterministic
+fn step(w: mut World, input: TickInput<World>) {
+    w.tick += 1
+}
+
+@deterministic
+fn snap(w: World) -> u32 {
+    w.tick
+}
+
+pub fn init() -> u32 {
+    let (_, first) = handoff(0)
+    var latest = take first
+    let _ = peek(mut latest)
+    let _ = run(World { tick: 0 }, hz: 60, step: step, present: snap)
+    0
+}
+
+pub fn frame(state: mut u32, time: f32, width: u32, height: u32) {}

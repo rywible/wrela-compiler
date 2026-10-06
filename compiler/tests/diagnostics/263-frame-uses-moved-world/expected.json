@@ -1,0 +1,41 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0500",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [
+        "pass `world.clone()` where it's moved if you still need it here"
+      ],
+      "internal": false,
+      "label": null,
+      "labels": [
+        {
+          "file": "main.wrela",
+          "message": "`world` is moved here",
+          "span": {
+            "column": 22,
+            "end": 690,
+            "end_column": 27,
+            "end_line": 38,
+            "line": 38,
+            "start": 685
+          }
+        }
+      ],
+      "message": "`world.tick` was moved, so it can't be used here",
+      "notes": [],
+      "severity": "error",
+      "span": {
+        "column": 5,
+        "end": 741,
+        "end_column": 15,
+        "end_line": 39,
+        "line": 39,
+        "start": 731
+      },
+      "title": "a use of a moved value"
+    }
+  ],
+  "version": 2
+}

@@ -134,6 +134,37 @@ pub fn evaluate_masked(game: mut Game, s: u32, n: u32, lo: u32, fp: f32) {
     )
 }
 
+/// The distance and channels (torso-ness, hoof-ness) at each point, every part in.
+@compute(64)
+fn channel_samples(field: herd::grazer::GrazerField, points: [vec4], out: mut Slots<vec4>, id: GlobalId) {
+    let (d, c) = field.distance_and_channels(points[id.x].xyz)
+    out[id] = vec4(d, c.torso, c.hoof, 0.0)
+}
+
+/// `n` points near seed `s`'s surface (#42 AC7): `Box3::sample`'s points over its bounds, in
+/// order, those within 2 cm of its surface by the CPU's distance. Three new buffers: the points,
+/// and at each, the GPU's distance, and its distance and channels.
+pub fn near_surface(game: mut Game, s: u32, n: u32) {
+    let g = grazer(s)
+    let b = g.bounds()
+    var pts: Vec<vec4> = Vec::new()
+    var i = 0
+    while pts.len() < n {
+        let p = b.sample(1, i)
+        if abs(g.distance(p)) < 0.02 {
+            pts.push(vec4(p, 0.0))
+        }
+        i += 1
+    }
+    game.points = buffer(n)
+    write(mut game.points, 0, pts)
+    game.dist = buffer(n)
+    game.samp = buffer(n)
+    let field = g.field()
+    dispatch(distances.bind(field: field, points: game.points.span(0, n), out: mut game.dist), groups: n / 64)
+    dispatch(channel_samples.bind(field: field, points: game.points.span(0, n), out: mut game.samp), groups: n / 64)
+}
+
 /// The grid seed `s` is realized on at `cell`: its blocks along x, y and z, and the cell.
 pub fn grid(s: u32, cell: f32) -> vec4 {
     let g = Grid::around(grazer(s).bounds(), cell)

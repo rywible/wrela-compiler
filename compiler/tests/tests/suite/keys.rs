@@ -57,7 +57,7 @@ fn a_keyed_run_replays_and_a_changed_record_fails_at_its_tick() {
 }
 
 /// `wrela-host`, built for x86-64 without the GPU, to run under Rosetta: its path.
-fn x86_host() -> std::path::PathBuf {
+pub(crate) fn x86_host() -> std::path::PathBuf {
     let root = wrela_tests::repo_root();
     let status = std::process::Command::new("cargo")
         .args(["build", "--release", "-p", "wrela-host", "--no-default-features"])
@@ -71,7 +71,7 @@ fn x86_host() -> std::path::PathBuf {
 
 /// `wrela-host --replay <log> --no-gpu <build>` for x86-64, under Rosetta: its output, and
 /// whether it passed.
-fn replay_on_x86(
+pub(crate) fn replay_on_x86(
     host: &std::path::Path,
     log: &std::path::Path,
     build: &std::path::Path,

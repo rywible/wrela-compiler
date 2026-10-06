@@ -832,6 +832,22 @@ impl Spike {
         (positions, u32s(&i)[..ni as usize].to_vec())
     }
 
+    /// An individual's vertices as the spike wrote them: 48 bytes each (position, four bones a
+    /// byte each, normal, four weights a byte each, the part mask, padding).
+    pub fn vertices(&self, ind: &Individual) -> Vec<[u32; 12]> {
+        let d = u32s(&read(&self.device, &self.queue, &ind.draw, 32));
+        let nv = u64::from(d[5].min(ind.vcap));
+        let v = read(&self.device, &self.queue, &ind.verts, (nv * 48).max(16));
+        v.chunks_exact(48)
+            .take(nv as usize)
+            .map(|c| {
+                std::array::from_fn(|k| {
+                    u32::from_le_bytes(c[4 * k..4 * k + 4].try_into().expect("4"))
+                })
+            })
+            .collect()
+    }
+
     fn frame_resources(&mut self) {
         if self.frame.is_some() {
             return;

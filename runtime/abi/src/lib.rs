@@ -244,6 +244,7 @@ mod tests {
             ("par.wrela", "DONE_FAILED", JOB_DONE_FAILED),
             ("par.wrela", "DEPTH", DEPTH),
             ("par.wrela", "RUNNING", RUNNING),
+            ("par.wrela", "JOIN_WAITS", JOIN_WAITS),
             ("par.wrela", "SLOTS", JOB_SLOTS),
             ("par.wrela", "SLOT_COUNT", JOB_SLOT_COUNT),
             ("par.wrela", "SLOT_SIZE", JOB_SLOT_SIZE),

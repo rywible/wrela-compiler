@@ -44,6 +44,8 @@ const DONE_FAILED: u32 = 2147483648
 const DEPTH: u32 = 28
 // What this thread is running for another: a block's job, or a slot.
 const RUNNING: u32 = 32
+// How many times this thread has waited at a join for a job a helper was running.
+const JOIN_WAITS: u32 = 40
 
 // The long jobs' slots, and a slot's words and states.
 const SLOTS: u32 = 1212416
@@ -359,6 +361,10 @@ impl<O> Job<O> {
                             run_job(self.slot, held: false)
                         }
                     } else if state == STARTED {
+                        // Counted for the hosts, which log a ticker's waits (wrela_abi
+                        // `JOIN_WAITS`): only this thread writes its count.
+                        let waits = thread_block() + JOIN_WAITS
+                        store_u32(waits, load_u32(waits).wrapping_add(1))
                         let _ = wait(self.slot, STARTED)
                     } else if state == FAILED_JOB {
                         // Its host wrote the helper's number, and the helper's panic message is

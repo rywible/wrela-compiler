@@ -1,0 +1,43 @@
+// mistake: #43 §11: a step that captures a `mut` place (it would outlive the call it was lent in)
+// expect: E0510
+// fix: no
+use engine::run::{Asks, TickInput, run}
+use engine::sim::{Sim, Tick}
+
+pub struct World: Sim {
+    pub tick: Tick,
+}
+
+impl Asks for World {
+    type Ask = u32
+    type Answer = u32
+
+    @deterministic
+    fn asks(self, tick: Tick) -> Vec<(u32, Tick)> {
+        Vec::new()
+    }
+
+    @deterministic
+    fn work(ask: u32) -> u32 {
+        ask
+    }
+}
+
+@deterministic
+fn bump(w: mut World, input: TickInput<World>, count: mut u32) {
+    w.tick += 1
+    count += 1
+}
+
+@deterministic
+fn snap(w: World) -> u32 {
+    w.tick
+}
+
+pub fn init() -> u32 {
+    var count: u32 = 0
+    let _ = run(World { tick: 0 }, hz: 60, step: |w, i| bump(mut w, i, mut count), present: snap)
+    count
+}
+
+pub fn frame(state: mut u32, time: f32, width: u32, height: u32) {}

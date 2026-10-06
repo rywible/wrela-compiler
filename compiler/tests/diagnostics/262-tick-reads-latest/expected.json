@@ -1,0 +1,29 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0600",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "`Latest<T>::read` is non-deterministic, and `peek` is `@deterministic`, which can't `nondet`",
+      "notes": [
+        "the call chain: peek → Latest<T>::read",
+        "depending on something besides the inputs (the clock, randomness, readback) is the `nondet` effect; see language.md §8 for what each context forbids"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 5,
+        "end": 585,
+        "end_column": 16,
+        "end_line": 29,
+        "line": 29,
+        "start": 574
+      },
+      "title": "an effect a context forbids"
+    }
+  ],
+  "version": 2
+}

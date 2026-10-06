@@ -341,6 +341,8 @@ impl TickThread {
         if let Some(fuel) = self.fuel {
             self.store.set_fuel(fuel).map_err(|e| (k, e))?;
         }
+        let waits = (memory::thread_block(memory::THREAD_TICK) + memory::JOIN_WAITS) as usize;
+        let before = shared::load_u32(&self.memory, waits as u32);
         let result =
             self.tick.call(&mut self.store, (memory::THREAD_TICK, self.task, self.context, k));
         self.next += 1;
@@ -350,7 +352,8 @@ impl TickThread {
             let hi = shared::load_u32(&self.memory, memory::TICK_HASH + 4);
             u64::from(lo) | (u64::from(hi) << 32)
         };
-        Ok(Ticked { tick: k, records, hash: hash.then(reported) })
+        let waited = shared::load_u32(&self.memory, waits as u32).wrapping_sub(before);
+        Ok(Ticked { tick: k, records, hash: hash.then(reported), waited })
     }
 }
 
@@ -361,6 +364,9 @@ pub struct Ticked {
     pub tick: u32,
     pub records: Vec<[u8; EVENT_SIZE as usize]>,
     pub hash: Option<u64>,
+    /// How many times the tick waited at a job's join for a helper still running it: the sim
+    /// waiting for an answer due (wrela_abi `JOIN_WAITS`). The host logs it.
+    pub waited: u32,
 }
 
 pub(crate) struct Program<E: 'static> {
@@ -855,7 +861,12 @@ impl<E: Executor> Program<E> {
         let mut thread = self.take_tick_thread()?;
         let result = thread.run(records, hash);
         self.ticker = Some(thread);
-        result.map_err(|(k, trap)| self.tick_trapped(k, &trap))
+        let t = result.map_err(|(k, trap)| self.tick_trapped(k, &trap))?;
+        if t.waited > 0 {
+            let line = format!("tick {}: the sim waited for a job due ({}×)", t.tick, t.waited);
+            self.store.data_mut().logs.push(line);
+        }
+        Ok(t)
     }
 
     /// Frame `i` of a lockstep schedule at `fps` (#43 §2.3): `script`'s events of frame `i`

@@ -1,0 +1,26 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0400",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "`Snap` doesn't implement `Plain`, which `Snap` in `run` needs",
+      "notes": [],
+      "severity": "error",
+      "span": {
+        "column": 13,
+        "end": 724,
+        "end_column": 70,
+        "end_line": 41,
+        "line": 41,
+        "start": 667
+      },
+      "title": "a type that doesn't implement a trait"
+    }
+  ],
+  "version": 2
+}

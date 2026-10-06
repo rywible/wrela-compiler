@@ -614,6 +614,110 @@ A value used after it moved is §6.1's example, and a `mut` borrow that another 
 
 ---
 
+### 6.17 Ticks, hand-offs and long jobs (milestone 4)
+
+A program can run a fixed-rate step on a thread of its own, hand its newest result to the frames, and send long work to a helper. All three are std, built on the unsafe core (§6.14); the engine's `run` (a world on a timeline, #43) is ordinary code on top of them. None of them is specific to games.
+
+- **`std::tick::start(state, hz:, step:, hash:)`** moves `state` to the ticker's thread, where `step(mut state, ticked)` runs `hz` times a second, tick after tick. `Ticked` holds the tick's number, its length in seconds and its **records**: the input events the host stamped at the tick's start, oldest first, at most 256 (the rest wait for the next tick). `step` and `hash` are `@deterministic` (§14) functions, or closures that capture only values (E0510), since they move there too: a tick's state is a function of the first state and the records. `hash` gives the state's hash, which a host asks for when it records or checks ticks. A program has one ticker; a second `start` panics. `std::tick::origin()` is when tick 0 was due, in frame time: a frame places the newest tick with it. It's `nondet`: the host moves it when it drops ticks it couldn't run in time, or the page was hidden.
+
+  ```wrela
+  use std::tick::{Ticked, start}
+
+  /// A data logger: it samples a signal at 100 Hz and keeps a running mean, on its own thread,
+  /// while the program's thread answers its user.
+  struct Logger: Clone {
+      samples: u32,
+      mean: f32,
+  }
+
+  @deterministic
+  fn sample(log: mut Logger, t: Ticked) {
+      let x = sin(f32(t.tick) * t.dt * 6.2831855)   // the signal at this tick's time
+      log.samples += 1
+      log.mean += (x - log.mean) / f32(log.samples)
+  }
+
+  @deterministic
+  fn checksum(log: Logger) -> u64 {
+      u64(log.samples) * 4294967296 + u64(bitcast_u32(log.mean))
+  }
+
+  pub fn init() -> u32 {
+      start(Logger { samples: 0, mean: 0.0 }, hz: 100, step: sample, hash: checksum)
+      0
+  }
+
+  pub fn frame(state: mut u32, time: f32, width: u32, height: u32) {}
+  ```
+- **`std::handoff::handoff(initial)`** gives a `Publisher<T>` and a `Latest<T>`, for two threads: `publish(value)` on one, `read()` on the other, which gives the newest complete value. Neither waits, and no value is read half-written: it's a triple buffer, one atomic word between them. `T` is `Plain` (§6.10), so a value is a copy of bytes (E0400 otherwise). `read` is `nondet`: which value it gives depends on timing, so a tick can't read one (E0600). In a debug build each value carries its publish number and a checksum, and a read checks both: none is read torn or older than one read before (`threads/a_hand_off_is_never_read_torn`: 0 in 10⁶ reads, a helper publishing as fast as it can).
+
+  ```wrela
+  use std::handoff::{Latest, Publisher, handoff}
+  use std::tick::{Ticked, start}
+
+  /// A sensor's reading, as its thread publishes it to the program's UI.
+  struct Reading: Copy + Plain {
+      sample: u32,
+      celsius: f32,
+  }
+
+  struct Sensor {
+      out: Publisher<Reading>,
+      sample: u32,
+  }
+
+  @deterministic
+  fn measure(s: mut Sensor, t: Ticked) {
+      s.sample += 1
+      s.out.publish(Reading { sample: s.sample, celsius: 20.0 + 0.1 * f32(s.sample % 7) })
+  }
+
+  @deterministic
+  fn count(s: Sensor) -> u64 {
+      u64(s.sample)
+  }
+
+  pub fn init() -> Latest<Reading> {
+      let (out, latest) = handoff(Reading { sample: 0, celsius: 0.0 })
+      start(Sensor { out: take out, sample: 0 }, hz: 10, step: measure, hash: count)
+      latest
+  }
+
+  pub fn frame(state: mut Latest<Reading>, time: f32, width: u32, height: u32) {
+      borrow r = state.read()   // the newest reading: never half-written, never waits
+      if r.sample % 100 == 1 {
+          std::io::print(f"{r.celsius:.1} °C")
+      }
+  }
+  ```
+- **`std::par::job(input, f)`** starts `f(input)` on a helper, a long job that holds it while it runs, and gives a `Job<O>`; `join()` gives the result, waiting if a helper is still running it. `f` is `@deterministic`, so the result is a function of `input` alone, whichever thread runs it and whenever. A job no helper has started runs inside `join`: with no helpers every job runs there, and a job that joins another can't deadlock. A trap in a job is the program's panic at its `join`. `done()` says whether it has finished, and is `nondet`. A parallel job (`par_each_mut`) inside a job, or inside a `@parallel fn`, runs on its thread alone (`threads/`).
+
+  ```wrela
+  use std::par::job
+
+  fn checksum(data: take Vec<u32>) -> u32 {
+      var h: u32 = 2166136261
+      for x in data {
+          h = (h ^ x).wrapping_mul(16777619)
+      }
+      h
+  }
+
+  pub fn verify() -> u32 {
+      var data: Vec<u32> = Vec::new()
+      for i in 0..100000 {
+          data.push(i)
+      }
+      let pending = job(take data, checksum)   // a helper hashes while this thread goes on
+      take pending.join()
+  }
+  ```
+- **The engine's sim** joins a job only at the tick its answer is due (`engine::run`'s `Asks`): if it isn't done then, the ticker waits, so the tick an answer enters on doesn't depend on the helpers. Each thread counts the times it waited at a join (wrela_abi's `JOIN_WAITS`), and the native host logs a tick that waited.
+- **Per-tick input.** Before each frame, a host queues the input events since the last for `std::input::events()`, and the same events become the next tick's records. A tick sees only its records, never the frames' input queue, so its state depends on the records alone.
+- **The tick log** (wrela_abi's `ticks`) is a run's ticks as a host ran them: the build's WASM hash, the rate, the first world's hash, then each tick's records and the state hash its step gave. Given the build, the first world and the records, every hash is fixed, so any host can replay a log and check it. Chrome's test mode writes one (`results/ticks.log`), and so does the native host on request.
+- **The native host without a GPU:** `wrela-host --no-gpu <build> --ticks N` runs the ticker alone, no frames, and prints each tick's hash; `--log out.ticks` writes the log. `wrela-host --replay <log> [--no-gpu] <build>` replays a log's records and fails at the first tick whose hash differs, naming it. A build of `wrela-host` without its `gpu` feature has these two only: an x86-64 one under Rosetta checks the sim's bits on x86's code generation (`keys/a_run_recorded_in_chrome_replays_on_arm64_and_x86_64`).
+- **Test mode's two schedules** (#43 §2.3): in **lockstep**, before frame i the ticks up to ⌊(i + 1)·hz/fps⌋ run and the frame waits for them, the same in both hosts, so frames and hashes compare across hosts; **paced** (`#test&paced=1`), ticks run on the ticker's own clock and neither waits for the other, as in play, for time budgets.
+
 ## 7. Generics and traits
 
 | Rule | Tier | Decisions |
@@ -738,7 +842,7 @@ There's no separate interpreter in the compiler, and no reflection (§18). What'
   }
   ```
   - A field's natural test is a property at many points: `for i in 0..n { let p = space.sample(seed, i) ... }`. `Box3::sample` (and `Interval`'s and `Box2`'s) gives Sobol's sequence, shifted by `seed`: the first 2ⁿ points split evenly among a box's cells, so a few thousand points cover it. std's own tests check its fields this way: derived gradients against finite differences, intervals against the distances in their boxes, and stated bounds near the surface.
-- **A failed `assert` shows what it compared** where the failure is explained: in a test, a constant and a debug build. The operands of its comparison (`==`, `!=`, `<`, `<=`, `>`, `>=`, through `Eq` and `Ord` too) that aren't literals are each evaluated once, before the comparison, and the panic shows those whose types implement `Format`, with their source: ``assertion failed: `got` is 0.33333334``, and text quoted. A message given comes first, and is made only when the `assert` fails, so an f-string costs nothing while it holds. A release build's failed `assert` says only its message, and has no code to format the values: code behind `if debug_build()` isn't in a release build, nor are the functions only it calls.
+- **A failed `assert` shows what it compared** where the failure is explained: in a test, a constant and a debug build. The operands of its comparison (`==`, `!=`, `<`, `<=`, `>`, `>=`, through `Eq` and `Ord` too) that aren't literals are each evaluated once, before the comparison, and the panic shows those whose types implement `Format`, with their source: ``assertion failed: `got` is 0.33333334``, and text quoted. A message given comes first, and is made only when the `assert` fails, so an f-string costs nothing while it holds. A release build's failed `assert` says only its message, and has no code to format the values: code behind `if debug_build()` isn't in a release build, nor are the functions only it calls. GPU code can ask `debug_build()` too: the engine's vertex pass writes each boundary corner's value for a test only in a debug build (#42 AC2).
 - **`embed("path")`,** which reads a file inside the package and gives `Bytes`: a `Copy` handle to read-only data in the build. The path is a string literal, relative to the package's root, with `/` between its parts and no `.` or `..`; a file that can't be read, or a path that leaves the package (a symbolic link included), is E0218. The output depends only on the file's bytes, so builds stay reproducible. Static data lives as long as the program, so a handle to it can be stored. GPU code can't hold `Bytes`.
 - **Types,** for monomorphization, and **fieldwise derivations** (§3).
 

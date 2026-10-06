@@ -56,7 +56,7 @@ python3 -m unittest discover -q -s tools/tests
 step "browser runtime: tests, types, dist is current, size budget"
 (cd runtime/browser && bun run checks)
 
-step "speed, cold processes: hello field's check < 200 ms and build < 2 s, sketch 03's and the lens's (on each subject) < 500 ms and < 5 s; WGSL size of every example's, sketch's and lens's pipelines"
+step "speed, cold processes: hello field's check < 200 ms and build < 2 s, sketch 03's, the herd's and the lens's (on each subject) < 500 ms and < 5 s; WGSL size of every example's, sketch's and lens's pipelines"
 python3 - "$wrela" <<'PY'
 import gzip, pathlib, shutil, subprocess, sys, tempfile, time
 wrela = sys.argv[1]
@@ -84,6 +84,8 @@ try:
         ("build hello field", ["build", hello, "-o", f"{out}/speed-hello"], 2.0),
         ("check sketch 03", ["check", sketch], 0.5),
         ("build sketch 03", ["build", sketch, "-o", f"{out}/speed-sketch"], 5.0),
+        ("check the herd", ["check", "examples/herd"], 0.5),
+        ("build the herd", ["build", "examples/herd", "-o", f"{out}/speed-herd"], 5.0),
     ]
     for s in subjects:
         runs += [
@@ -128,11 +130,17 @@ if [ "$gpu" = 1 ]; then
   # and Chrome's input latency and text budgets measure real time (under the other tests'
   # load, an event missed its next frame, and 10,000 glyphs took 0.52 ms instead of 0.23).
   # So do the lens's: its frames' and clicks' times in Chrome, its drag updates in a session,
-  # its fits' 10 s, and an edit's 2 s to show.
+  # its fits' 10 s, and an edit's 2 s to show. So do the herd's ratios to spike 01 (#42): each
+  # compares two timings taken side by side, and another test's load skews one of them.
   budgets=(loading_creates_the_pipelines_within_budget the_gpu_certificate_is_small_quick_and_right
     events_reach_the_program_by_the_next_frame a_screen_of_code_draws_within_half_a_millisecond
     the_lens_is_fast_enough_and_the_same_in_both_hosts a_session_gives_the_same_results_headless_and_in_chrome
-    fits_recover_the_wolfs_longer_neck_and_bigger_ears an_edit_by_another_tool_shows_in_the_open_lens_within_2_s)
+    fits_recover_the_wolfs_longer_neck_and_bigger_ears an_edit_by_another_tool_shows_in_the_open_lens_within_2_s
+    the_cpu_side_costs_what_the_spikes_did realization_matches_the_spikes
+    the_herds_grazer_field_costs_what_field_wgsl_does drawing_the_herd_costs_what_the_spikes_did
+    the_herd_keeps_its_frames_in_chrome moving_to_the_herd_keeps_the_frames_in_chrome
+    lod_looks_like_the_finest_and_costs_like_the_coarsest the_herds_pipelines_load_cold_as_fast
+    frames_dont_wait_for_slow_ticks)
   skips=()
   for b in "${budgets[@]}"; do skips+=(--skip "$b"); done
   step "GPU and headless-Chrome tests"

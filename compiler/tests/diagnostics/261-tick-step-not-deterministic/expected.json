@@ -1,0 +1,29 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0600",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "`origin` is non-deterministic, and `run` takes it as a `@deterministic fn`, which can't `nondet`",
+      "notes": [
+        "the call chain: step → origin",
+        "depending on something besides the inputs (the clock, randomness, readback) is the `nondet` effect; see language.md §8 for what each context forbids"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 19,
+        "end": 551,
+        "end_column": 38,
+        "end_line": 27,
+        "line": 27,
+        "start": 532
+      },
+      "title": "an effect a context forbids"
+    }
+  ],
+  "version": 2
+}

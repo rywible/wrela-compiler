@@ -1,0 +1,46 @@
+// mistake: #43 §11: presentation code writing the sim's snapshot it borrowed
+// expect: E0505
+// fix: no
+use engine::run::{Asks, Stamped, TickInput, run}
+use engine::sim::{Sim, Tick}
+
+pub struct World: Sim {
+    pub tick: Tick,
+}
+
+impl Asks for World {
+    type Ask = u32
+    type Answer = u32
+
+    @deterministic
+    fn asks(self, tick: Tick) -> Vec<(u32, Tick)> {
+        Vec::new()
+    }
+
+    @deterministic
+    fn work(ask: u32) -> u32 {
+        ask
+    }
+}
+
+@deterministic
+fn step(w: mut World, input: TickInput<World>) {
+    w.tick += 1
+}
+
+@deterministic
+fn snap(w: World) -> u32 {
+    w.tick
+}
+
+fn draw(s: Stamped<u32>) {
+    s.snap = 0
+}
+
+pub fn init() -> u32 {
+    var latest = run(World { tick: 0 }, hz: 60, step: step, present: snap)
+    draw(latest.read())
+    0
+}
+
+pub fn frame(state: mut u32, time: f32, width: u32, height: u32) {}

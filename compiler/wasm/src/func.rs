@@ -1679,13 +1679,6 @@ mod ops;
 mod vloop;
 pub(crate) use ops::helper_bodies;
 
-/// An export's wrapper: scalars and flattened vectors in, a scalar or a flattened vector out,
-/// then a flush. A vector crosses as its components; inside, it's in memory on the shadow stack
-/// (the result's room first, then each vector parameter's). A host passes an 8- or 16-bit
-/// integer or a `bool` as any i32: it's brought into range as a conversion would (the low bits;
-/// any nonzero `bool` is true), since the code inside assumes it is.
-/// `__worker(index)`'s body: worker `index`'s stack (below `memory::MAX_WORKERS`, or a trap),
-/// then std's worker loop (function `worker`), which returns when the host shuts it down.
 /// The start function of a module whose memory is shared: copies the constants (passive data
 /// segment 0, `len` bytes) to `base` once, however many instances share the memory. The first
 /// instance claims [`memory::DATA_READY`] and copies; any other waits until it reads 2. Each
@@ -1783,6 +1776,11 @@ pub(crate) fn thread_entry_wrapper(entry: u32, params: u32) -> Function {
     function([], &ins)
 }
 
+/// An export's wrapper: scalars and flattened vectors in, a scalar or a flattened vector out,
+/// then a flush. A vector crosses as its components; inside, it's in memory on the shadow stack
+/// (the result's room first, then each vector parameter's). A host passes an 8- or 16-bit
+/// integer or a `bool` as any i32: it's brought into range as a conversion would (the low bits;
+/// any nonzero `bool` is true), since the code inside assumes it is.
 pub(crate) fn export_wrapper(
     m: &ir::Module,
     f: ir::FuncId,
