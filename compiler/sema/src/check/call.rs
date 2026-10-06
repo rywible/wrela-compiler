@@ -1868,6 +1868,40 @@ impl<'p> Checker<'p> {
         self.failed_call(args, span)
     }
 
+    /// `T::f` as a value, not called: `ty`'s inherent function `f`, or a trait's, through a
+    /// trait `ty` has (`W::work`, which lowering resolves to `W`'s impl once `W` is known).
+    pub(crate) fn associated_fn_value(
+        &mut self,
+        ty: TyId,
+        name: &ast::Ident,
+        generics: Option<&[ast::TypeExpr]>,
+        span: Span,
+    ) -> Option<Expr> {
+        let (f, args) = match self.find_inherent(ty, &name.name, name.span) {
+            Inherent::Method(f, impl_args) => {
+                let mut args = impl_args;
+                args.extend(self.method_generic_args(f, generics, span));
+                (f, args)
+            }
+            Inherent::Ambiguous => return Some(self.error_expr(span)),
+            Inherent::Missing => {
+                let traits = self.traits_with_method(ty, &name.name, name.span);
+                let [(t, trait_args, unsure)] = traits.as_slice() else { return None };
+                let m = traits::trait_method(self.p, *t, &name.name)?;
+                if *unsure {
+                    let r = TraitRef { trait_: *t, args: trait_args.clone() };
+                    self.trait_obligation(ty, &r, span, &name.name);
+                }
+                let mut args = vec![ty];
+                args.extend(trait_args.iter().copied());
+                args.extend(self.method_generic_args(m, generics, span));
+                (m, args)
+            }
+        };
+        let fty = self.p.types.intern(TyKind::FnDef(f, args.clone()));
+        Some(Expr { ty: fty, span, kind: ExprKind::FnRef(f, args) })
+    }
+
     /// An inherent method of `ty` named `name`, and the impl's arguments for `ty`. When more
     /// than one impl of `ty`'s type has it (`impl S<f32>` and `impl S<u32>`) and `ty`'s
     /// arguments don't say which, choosing one would depend on the order the impls are written

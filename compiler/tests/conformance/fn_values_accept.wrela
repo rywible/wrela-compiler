@@ -1,0 +1,42 @@
+// accepts: fn.values
+// A named function is a value; so is a type's associated function, its own or a trait's, which
+// a generic function names through its parameter.
+trait Rate {
+    fn per_second(ticks: u32) -> f32
+}
+
+struct Sim {}
+
+impl Rate for Sim {
+    fn per_second(ticks: u32) -> f32 {
+        f32(ticks) * 60.0
+    }
+}
+
+struct Herd {
+    size: u32,
+}
+
+impl Herd {
+    fn of(size: u32) -> Herd {
+        Herd { size }
+    }
+
+    fn twice(self) -> u32 {
+        2 * self.size
+    }
+}
+
+fn apply(f: fn(u32) -> f32, x: u32) -> f32 {
+    f(x)
+}
+
+fn rate_of<R: Rate>(x: u32) -> f32 {
+    apply(R::per_second, x)
+}
+
+fn values() -> f32 {
+    let make = Herd::of
+    let size = Herd::twice
+    rate_of::<Sim>(2) + apply(Sim::per_second, 1) + f32(size(make(3)))
+}

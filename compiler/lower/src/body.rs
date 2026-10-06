@@ -408,11 +408,10 @@ impl<'c, 'a> Fl<'c, 'a> {
             // Bound below if the closure takes it as a parameter; a buffer is its resource; a
             // named function is its type, so it isn't passed.
             self.locals[l.index()] =
-                match (self.types().kind(t), self.cx.capture_resource(&owner, l)) {
-                    (TyKind::FnDef(func, substs), _) => Repr::Callable(
-                        Callable::Func { func: *func, substs: substs.clone() },
-                        Vec::new(),
-                    ),
+                match (self.types().kind(t).clone(), self.cx.capture_resource(&owner, l)) {
+                    (TyKind::FnDef(func, substs), _) => {
+                        Repr::Callable(self.func_callable(func, substs), Vec::new())
+                    }
                     (_, Some(r)) => Repr::Place(ir::Place::root(ir::PlaceRoot::Resource(r))),
                     (_, None) => Repr::Erased,
                 };
@@ -728,6 +727,41 @@ impl<'c, 'a> Fl<'c, 'a> {
         built.map_or(Repr::Erased, Repr::Value)
     }
 
+    /// What a named function used as a value calls: the function, or for a trait's (`W::work`,
+    /// §7), the implementation for the `Self` it now has.
+    fn func_callable(&mut self, func: FnId, substs: Vec<TyId>) -> Callable {
+        let program = &self.cx.checked.program;
+        let FnOwner::Trait(t) = program.func(func).owner else {
+            return Callable::Func { func, substs };
+        };
+        let n = 1 + program.trait_(t).generics.len();
+        let substs: Vec<TyId> = substs.iter().map(|&a| self.concrete(a)).collect();
+        let program = &self.cx.checked.program;
+        match wrela_sema::traits::resolve_trait_method(
+            program,
+            func,
+            substs[0],
+            &substs[1..n],
+            &substs[n..],
+        ) {
+            Some((f, subst)) => {
+                let substs = program
+                    .fn_all_generics(f)
+                    .iter()
+                    .map(|g| self.cx.checked.reveal(subst.get(*g).unwrap_or(program.types.error)))
+                    .collect();
+                Callable::Func { func: f, substs }
+            }
+            None => {
+                let shown = program.display_ty(substs[0]);
+                self.cx.err(Diagnostic::internal(format!(
+                    "no implementation of a trait's function for `{shown}` at lowering"
+                )));
+                Callable::Func { func, substs }
+            }
+        }
+    }
+
     /// Whether `v` is a run.
     pub fn is_run(&self, v: ir::ValueId) -> bool {
         matches!(self.mb.m.types.get(self.f.value_ty(v)), ir::TypeDef::Run(_))
@@ -738,7 +772,7 @@ impl<'c, 'a> Fl<'c, 'a> {
     fn stored_callable(&mut self, l: Local) -> Option<(Callable, Vec<CaptureSrc>)> {
         let t = self.concrete(self.local_ty(l));
         match self.types().kind(t).clone() {
-            TyKind::FnDef(func, substs) => Some((Callable::Func { func, substs }, Vec::new())),
+            TyKind::FnDef(func, substs) => Some((self.func_callable(func, substs), Vec::new())),
             TyKind::Closure(c, env) => {
                 let owner = self.cx.stored_closure_owner(c, &env)?;
                 let fields = self.cx.closure_fields(self.mb, c, &env)?;
@@ -787,7 +821,7 @@ impl<'c, 'a> Fl<'c, 'a> {
             }
             Rvalue::FnRef(f, args) => {
                 let substs = args.iter().map(|&a| self.concrete(a)).collect();
-                Some(Repr::Callable(Callable::Func { func: *f, substs }, Vec::new()))
+                Some(Repr::Callable(self.func_callable(*f, substs), Vec::new()))
             }
             Rvalue::Use(mir::Operand {
                 kind: OperandKind::Copy(p) | OperandKind::Move(p, _),

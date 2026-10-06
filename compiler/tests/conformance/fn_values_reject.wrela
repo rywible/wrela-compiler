@@ -1,0 +1,23 @@
+// rejects: fn.values
+trait Rate {
+    fn per_second(ticks: u32) -> f32
+}
+
+struct Sim {}
+
+impl Rate for Sim {
+    fn per_second(ticks: u32) -> f32 {
+        f32(ticks) * 60.0
+    }
+}
+
+fn apply(f: fn(u32) -> f32, x: u32) -> f32 {
+    f(x)
+}
+
+fn values() -> f32 {
+    // A trait's function as a value needs the type whose implementation it is: `Sim::per_second`.
+    let a = apply(Rate::per_second, 1) //~ E0212
+    let b = apply(Sim::per_minute, 1) //~ E0207
+    a + b
+}

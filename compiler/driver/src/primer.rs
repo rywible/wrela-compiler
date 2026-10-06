@@ -30,6 +30,7 @@ pub const RULES: &[(&str, &str)] = &[
     ("fn.defaults", "parameters may have defaults"),
     ("fn.return", "a function that returns a value ends with one, or returns one, on every path"),
     ("fn.return-trait", "a trait in return position names one inferred concrete type"),
+    ("fn.values", "a named function is a value, and so is a type's associated function: `W::work`"),
     ("struct.defaults", "struct fields may have constant defaults a literal may omit"),
     ("struct.opt-in", "a struct opts in to Copy, Clone and GpuData in its declaration"),
     ("struct.base", "`..base` fills the remaining fields from another value"),

@@ -654,19 +654,28 @@ impl<'p> Checker<'p> {
                     self.err(d);
                     return self.error_expr(span);
                 }
+                // `T::f` as a value: an associated function of the type, its own or a trait's.
+                let generics = path.segments.last().and_then(|s| s.generics.as_deref());
+                if let Some(e) = self.associated_fn_value(ty, &name, generics, span) {
+                    return e;
+                }
                 self.err(Diagnostic::new(
-                    codes::E0212,
-                    span,
-                    format!("`{}` can only be called here", name.name),
+                    codes::E0207,
+                    name.span,
+                    format!("`{}` has no associated function `{}`", self.display(ty), name.name),
                 ));
                 self.error_expr(span)
             }
-            ValueRes::TraitRelative(_, name) => {
-                self.err(Diagnostic::new(
-                    codes::E0212,
-                    span,
-                    format!("`{}` can only be called here", name.name),
-                ));
+            ValueRes::TraitRelative(t, name) => {
+                let tname = &self.p.trait_(t).name;
+                self.err(
+                    Diagnostic::new(
+                        codes::E0212,
+                        span,
+                        format!("`{tname}::{}` names no implementation, so it can only be called here", name.name),
+                    )
+                    .with_help(format!("name the type whose implementation it is, as in `T::{}` with `T: {tname}`", name.name)),
+                );
                 self.error_expr(span)
             }
         }
