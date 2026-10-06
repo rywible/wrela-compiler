@@ -2,7 +2,7 @@
   "//": "skipLibCheck: @webgpu/types mentions DOM-only types (HTMLImageElement) that the worker's lib lacks.",
   "extends": "./tsconfig.base.json",
   "compilerOptions": {
-    "lib": ["ES2023", "WebWorker"],
+    "lib": ["ES2024", "WebWorker"],
     "types": ["@webgpu/types"],
     "skipLibCheck": true
   },

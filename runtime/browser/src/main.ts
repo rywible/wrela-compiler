@@ -5,7 +5,7 @@ import { AUDIO_QUANTUM, AUDIO_SAMPLE_RATE } from "./abi.gen.ts";
 import { errorMessage } from "./errors.ts";
 import { InputRing } from "./input.ts";
 import { listen } from "./listen.ts";
-import { type FromWorker, type ToWorker, VOICE_PROCESSOR, type VoiceOptions } from "./messages.ts";
+import { type FromWorker, type Loaded, type ToWorker, VOICE_PROCESSOR, type VoiceOptions } from "./messages.ts";
 import { asksForTest, isLoopback, parseTestParams, putResult, type TestParams } from "./testmode.ts";
 
 let shown = false;
@@ -106,6 +106,36 @@ async function sendLatencyEvents(canvas: HTMLCanvasElement, n: number, ms: numbe
   }
 }
 
+/** Test mode, `keylatency`: `n` presses of the right arrow key (down, then up 100 ms later)
+ * sent through the DOM over `ms`, each in its own slot of at least 250 ms, at a random time in
+ * it. */
+async function sendKeyPresses(n: number, ms: number): Promise<void> {
+  const slot = Math.max(ms / Math.max(n, 1), 250);
+  const start = performance.now();
+  const at = async (t: number) => {
+    const wait = start + t - performance.now();
+    if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
+  };
+  const key = (type: string) => window.dispatchEvent(new KeyboardEvent(type, { code: "ArrowRight", key: "ArrowRight", bubbles: true }));
+  for (let i = 0; i < n; i++) {
+    const t = i * slot + Math.random() * (slot - 150);
+    await at(t);
+    key("keydown");
+    await at(t + 100);
+    key("keyup");
+  }
+}
+
+/** What the page loaded so far, for test mode's `load.json`: the page itself and each file. */
+function loaded(): Loaded[] {
+  const entries = [...performance.getEntriesByType("navigation"), ...performance.getEntriesByType("resource")] as PerformanceResourceTiming[];
+  return entries.map((e) => ({
+    name: e.name,
+    bytes: e.transferSize > 0 ? e.transferSize : e.encodedBodySize,
+    end_ms: performance.timeOrigin + e.responseEnd,
+  }));
+}
+
 function start(): void {
   const testing = isLoopback(location.hostname) && asksForTest(location.hash);
   try {
@@ -129,8 +159,11 @@ function start(): void {
       const msg = event.data;
       if (msg.type === "audio") {
         playVoice(msg.voice, test, worker).catch((e: unknown) => failEarly(e, testing));
+      } else if (msg.type === "load-query") {
+        worker.postMessage({ type: "load", opened_ms: performance.timeOrigin, resources: loaded() } satisfies ToWorker);
       } else if (msg.type === "latency-start") {
-        sendLatencyEvents(canvas, test?.latency ?? 0, msg.ms).then(
+        const sent = test?.keylatency ? sendKeyPresses(test.keylatency, msg.ms) : sendLatencyEvents(canvas, test?.latency ?? 0, msg.ms);
+        sent.then(
           () => worker.postMessage({ type: "latency-sent" } satisfies ToWorker),
           (e: unknown) => failEarly(e, testing),
         );

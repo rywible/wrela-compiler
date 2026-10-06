@@ -1,26 +1,33 @@
 import { expect, test } from "bun:test";
-import { fitSize, GameClock } from "../src/frame.ts";
+import { fitSize, frameSeconds, VisibleClock } from "../src/frame.ts";
 
-test("game time counts only visible running", () => {
-  const clock = new GameClock();
-  expect([clock.tick(1000), clock.tick(1016), clock.tick(1032)]).toEqual([0, 0.016, 0.032]);
+test("visible time stands still while the page is hidden", () => {
+  const clock = VisibleClock.create();
+  const start = clock.at(1000);
+  expect([1000, 1016, 1032].map((now) => frameSeconds(clock, start, now))).toEqual([0, 0.016, 0.032]);
   // Hidden for 60 s, with no frames (a browser may give a hidden page none).
-  clock.setVisible(false);
-  clock.setVisible(true);
-  expect([clock.tick(61_032), clock.tick(61_048)]).toEqual([0.032, 0.048]);
-  // Hidden with frames still running: they run nothing.
-  clock.setVisible(false);
-  expect([clock.tick(61_064), clock.tick(70_000)]).toEqual([null, null]);
-  clock.setVisible(true);
-  expect([clock.tick(70_016), clock.tick(70_032)]).toEqual([0.048, 0.064]);
+  clock.setVisible(false, 1040);
+  clock.setVisible(true, 61_040);
+  expect([61_048, 61_064].map((now) => frameSeconds(clock, start, now))).toEqual([0.048, 0.064]);
+  // Hidden with frames still running: they run nothing, and the time holds.
+  clock.setVisible(false, 61_070);
+  expect([61_080, 70_000].map((now) => frameSeconds(clock, start, now))).toEqual([null, null]);
+  expect(clock.at(70_000) - start).toBe(70);
+  clock.setVisible(true, 70_000);
+  expect(frameSeconds(clock, start, 70_016)).toBe(0.086);
 });
 
-test("a hidden page's first frames run nothing", () => {
-  const clock = new GameClock();
-  clock.setVisible(false);
-  expect(clock.tick(5)).toBeNull();
-  clock.setVisible(true);
-  expect([clock.tick(9000), clock.tick(9016)]).toEqual([0, 0.016]);
+test("a second thread reads the same visible time", () => {
+  const clock = VisibleClock.create();
+  clock.setVisible(false, 500);
+  clock.setVisible(true, 2500);
+  const other = new VisibleClock(clock.buffer);
+  expect(other.visible).toBe(true);
+  expect(other.at(3000)).toBe(clock.at(3000));
+  expect(other.at(3000)).toBe(1000);
+  // Showing an already visible page changes nothing.
+  clock.setVisible(true, 9000);
+  expect(other.at(9000)).toBe(7000);
 });
 
 test("a canvas too large for the device is scaled down as a whole", () => {

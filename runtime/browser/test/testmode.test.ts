@@ -22,9 +22,20 @@ test("reads every parameter", () => {
     timestamps: 0,
     input: "",
     latency: 0,
+    keylatency: 0,
     nohash: 0,
+    paced: 0,
+    tickdelay: 0,
+    framedelay: 0,
   });
   expect(parseTestParams("#test&input=scripts/a.json&latency=40")).toEqual({ ...TEST_DEFAULTS, input: "scripts/a.json", latency: 40 });
+  expect(parseTestParams("#test&paced=1&tickdelay=30&framedelay=5&keylatency=20")).toEqual({
+    ...TEST_DEFAULTS,
+    paced: 1,
+    tickdelay: 30,
+    framedelay: 5,
+    keylatency: 20,
+  });
 });
 
 test("rejects unknown or invalid parameters", () => {

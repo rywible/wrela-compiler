@@ -186,3 +186,45 @@ fn a_tick_log_replays_and_a_changed_record_fails_at_its_tick() {
     other.wasm_hash ^= 1;
     assert!(matches!(built.replay(&other, 1), Err(wrela_host::ReplayError::OtherBuild { .. })));
 }
+
+/// The ticker in Chrome (runtime/browser's ticker.ts, its own worker): on test mode's lockstep
+/// schedule at 30, 60 and 144 frames a second, with 1 and 4 threads, its ticks' state hashes
+/// are the native host's, the frames see the same snapshots, and Chrome's tick log replays
+/// natively (#43 §2.3, AC5, AC6). On the paced schedule (ticks on the ticker's own clock, the
+/// frames not waiting) the hashes are the same for every tick it ran.
+#[test]
+#[ignore = "needs Chrome, python3 and a GPU"]
+fn the_ticker_in_chrome_agrees_with_the_native_host() {
+    let (dir, rel) = wrela_tests::page("compiler/tests/ticker", "ticker-chrome");
+    std::fs::copy(wrela_tests::repo_root().join("compiler/tests/ticker/keys.json"), dir.join("keys.json"))
+        .expect("copy the script");
+    let text = std::fs::read_to_string(dir.join("keys.json")).expect("the script");
+    let script = wrela_host::parse_script(&text).expect("a script");
+    let built = CpuBuild::load(&dir).expect("load");
+    let native = built.record_ticks(300, &script, 2).expect("native ticks");
+    let hex = |h: u64| format!("{h:016x}");
+    let frames = 120;
+    for (fps, workers, paced) in [(60.0, 4, false), (30.0, 1, false), (144.0, 4, false), (60.0, 4, true)] {
+        let run = wrela_tests::ChromeRun {
+            workers,
+            paced,
+            input: "keys.json".into(),
+            ..wrela_tests::ChromeRun::new(frames, 16, 16, fps)
+        };
+        let chrome = wrela_tests::run_in_chrome_with(&rel, run);
+        let ticks = chrome.ticks.expect("the ticker's ticks");
+        let what = format!("{fps} fps, {workers} threads{}", if paced { ", paced" } else { "" });
+        assert_eq!(ticks.hz, 60, "{what}");
+        if !paced {
+            let n = wrela_host::lockstep_ticks(frames - 1, 60, fps) as usize;
+            assert_eq!(ticks.hashes.len(), n, "{what}: the ticks before the last frame");
+        }
+        assert!(ticks.hashes.len() > 30, "{what}: {} ticks", ticks.hashes.len());
+        for (k, h) in ticks.hashes.iter().enumerate() {
+            assert_eq!(*h, hex(native.ticks[k].hash), "{what}: tick {k}");
+        }
+        let log = wrela_host::TickLog::decode(&ticks.log.expect("a tick log")).expect("reads");
+        assert_eq!(log.first, native.first, "{what}: the first world");
+        assert_eq!(built.replay(&log, 2).expect("replays") as usize, ticks.hashes.len(), "{what}");
+    }
+}

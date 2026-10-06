@@ -40,6 +40,7 @@ import {
   IMPORT_SUBMIT,
   IMPORT_TICK,
   PANIC,
+  TICK_WANT_HASH,
   PANIC_CAP,
   REQUEST_FAILED,
   REQUEST_PENDING,
@@ -256,6 +257,9 @@ export interface ProgramOptions {
   /** Starts the program's ticker (`std::tick::start`) on its own thread; without it, the ticker
    * is kept but never ticks. */
   startTicker?: (ticker: TickerOptions) => void;
+  /** Each tick reports its state's hash (wrela_abi memory's `TICK_WANT_HASH`), and so does the
+   * ticker's `start`, in `init`: test mode keeps them in a tick log. */
+  tickHashes?: boolean;
 }
 
 /** The program's ticker, as its thread gets it: the module and memory to run it with, and the
@@ -374,6 +378,7 @@ export class Program {
       const n = Math.min(Math.max(options.workers ?? 1, 1), MAX_WORKERS + 1) - 1;
       for (let i = 0; i < n; i++) options.spawnWorker(module, memory, THREAD_HELPER0 + i);
     }
+    if (options.tickHashes) new DataView(memory.buffer).setUint32(TICK_WANT_HASH, 1, true);
     // A program with state makes it once, before anything else runs (language.md §12).
     const init = instance.exports[EXPORT_INIT];
     if (typeof init === "function") program.#call(() => (init as () => void)());
@@ -578,15 +583,8 @@ export class Program {
     return takePanicMessage(this.#memory, THREAD_MAIN);
   }
 
-  /** What trapped, and where in the source if the program says and the engine's stack trace
-   * gives offsets: the location of the innermost frame that has one. */
   #describe(e: unknown): string {
-    const what = errorMessage(e);
-    const stack = e instanceof Error ? (e.stack ?? "") : "";
-    const at = wasmOffsets(stack)
-      .map((offset) => this.#lines?.at(offset) ?? null)
-      .find((loc) => loc !== null);
-    return at ? `${what} at ${at}` : what;
+    return describeTrap(e, this.#lines);
   }
 
   #call<T>(f: () => T): T {
@@ -610,6 +608,17 @@ export class Program {
     if (failure !== null) throw failure;
     return result;
   }
+}
+
+/** What trapped, and where in the source if the program says (`lines`) and the engine's stack
+ * trace gives offsets: the location of the innermost frame that has one. */
+export function describeTrap(e: unknown, lines: Lines | null): string {
+  const what = errorMessage(e);
+  const stack = e instanceof Error ? (e.stack ?? "") : "";
+  const at = wasmOffsets(stack)
+    .map((offset) => lines?.at(offset) ?? null)
+    .find((loc) => loc !== null);
+  return at ? `${what} at ${at}` : what;
 }
 
 /** The message a panic on thread `thread` left before it trapped (its block's `PANIC`), cleared

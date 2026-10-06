@@ -8,6 +8,7 @@ import { Lines } from "../src/lines.ts";
 import { parseManifest } from "../src/manifest.ts";
 import { parseScript } from "../src/input.ts";
 import { decode, Sequencer, StreamError } from "../src/stream.ts";
+import { TickLogWriter, wasmHash } from "../src/ticks.ts";
 import { type ErrorVector, vectors } from "./fixtures.ts";
 
 const bytes = (hex: string) => Uint8Array.from(hex.match(/../g) ?? [], (b) => Number.parseInt(b, 16));
@@ -130,6 +131,20 @@ describe("input scripts", () => {
       const events = parseScript(v.script);
       expect(events.map((e) => ("frame" in e.at ? `frame ${e.at.frame}` : `tick ${e.at.tick}`))).toEqual(v.at!);
       expect(events.map((e) => hex(e.event))).toEqual(v.events!);
+    });
+  }
+});
+
+describe("tick logs", () => {
+  const hex = (b: Uint8Array) => Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+  test("a build's WASM hash", () => {
+    expect(wasmHash(new Uint8Array([0, 0x61, 0x73, 0x6d])).toString(16).padStart(16, "0")).toBe(vectors.tick_logs[0]!.wasm_hash);
+  });
+  for (const v of vectors.tick_logs) {
+    test(`${v.ticks.length} ticks at ${v.hz} Hz`, () => {
+      const log = new TickLogWriter(BigInt(`0x${v.wasm_hash}`), v.hz, BigInt(`0x${v.first}`));
+      for (const t of v.ticks) log.push(bytes(t.records.join("")), BigInt(`0x${t.hash}`));
+      expect(hex(log.encode())).toBe(v.bytes);
     });
   }
 });

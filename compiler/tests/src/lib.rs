@@ -329,7 +329,7 @@ fn headless<S: AsRef<std::ffi::OsStr>>(args: impl IntoIterator<Item = S>) -> boo
 /// A test-mode run in headless Chrome that must fail: the message the page failed with.
 pub fn chrome_failure(rel: &str, run: ChromeRun) -> String {
     assert!(
-        !headless([rel, &run.fragment(), "300"]),
+        !headless([rel, &run.fragment(), &run.timeout().to_string()]),
         "the browser run passed; it should have failed"
     );
     let done = repo_root().join(rel).join("results/DONE");
@@ -348,6 +348,27 @@ pub struct BrowserRun {
     /// Each pass's GPU time, when [`ChromeRun::timestamps`] asked for them: its frame, its
     /// label (as the native host's `GpuTiming`) and nanoseconds.
     pub timings: Vec<(usize, String, f64)>,
+    /// The ticker's ticks, when the program started one.
+    pub ticks: Option<ChromeTicks>,
+    /// Each frame's CPU time (ms), when it began (ms since 1970), and the frame each printed
+    /// line came in (`results/frames.json`), with the lines (`results/log.txt`).
+    pub cpu_ms: Vec<f64>,
+    pub began_ms: Vec<f64>,
+    pub printed: Vec<(usize, String)>,
+}
+
+/// What the ticker's thread did in a test-mode run in Chrome (`results/ticks.json`).
+pub struct ChromeTicks {
+    pub hz: u32,
+    /// When each tick began (ms since 1970), and its CPU time (ms).
+    pub began_ms: Vec<f64>,
+    pub cpu_ms: Vec<f64>,
+    /// Each tick's state hash (16 hex digits), unless the run kept none.
+    pub hashes: Vec<String>,
+    /// Ticks the clock dropped, catching up.
+    pub dropped: u64,
+    /// The tick log (runtime/abi `ticks`), unless the run kept no hashes.
+    pub log: Option<Vec<u8>>,
 }
 
 /// How [`run_in_chrome_with`] runs a page: test mode's parameters (runtime/browser's
@@ -369,6 +390,15 @@ pub struct ChromeRun {
     /// Pointer events the page sends through the DOM while the frames run (0: none):
     /// `results/latency.json` says when each reached the program.
     pub latency: u32,
+    /// Right-arrow key presses the page sends through the DOM while the frames run (0: none).
+    pub keylatency: u32,
+    /// Ticks on the ticker's own clock, not in lockstep with the frames (#43 §2.3).
+    pub paced: bool,
+    /// Ms each tick, and each frame, is held longer.
+    pub tickdelay: u32,
+    pub framedelay: u32,
+    /// Keep no state hashes (they cost CPU time a timing run shouldn't count).
+    pub nohash: bool,
 }
 
 impl ChromeRun {
@@ -383,19 +413,50 @@ impl ChromeRun {
             timestamps: false,
             input: String::new(),
             latency: 0,
+            keylatency: 0,
+            paced: false,
+            tickdelay: 0,
+            framedelay: 0,
+            nohash: false,
         }
+    }
+
+    /// Seconds the run may take: 300, or three times its frames' paced time and two minutes
+    /// more, for a long run.
+    fn timeout(&self) -> u32 {
+        (f64::from(self.frames) / self.fps * 3.0 + 120.0).max(300.0) as u32
     }
 
     /// The page's URL fragment that asks for this run.
     fn fragment(&self) -> String {
-        let ChromeRun { frames, width, height, fps, workers, audio, timestamps, input, latency } =
-            self;
+        let ChromeRun {
+            frames,
+            width,
+            height,
+            fps,
+            workers,
+            audio,
+            timestamps,
+            input,
+            latency,
+            keylatency,
+            paced,
+            tickdelay,
+            framedelay,
+            nohash,
+        } = self;
+        let count = |name: &str, n: u32| if n > 0 { format!("&{name}={n}") } else { String::new() };
         format!(
-            "#test&frames={frames}&width={width}&height={height}&fps={fps}&workers={workers}{}{}{}{}",
-            if *audio > 0 { format!("&audio={audio}") } else { String::new() },
+            "#test&frames={frames}&width={width}&height={height}&fps={fps}&workers={workers}{}{}{}{}{}{}{}{}{}",
+            count("audio", *audio),
             if *timestamps { "&timestamps=1" } else { "" },
             if input.is_empty() { String::new() } else { format!("&input={input}") },
-            if *latency > 0 { format!("&latency={latency}") } else { String::new() },
+            count("latency", *latency),
+            count("keylatency", *keylatency),
+            if *paced { "&paced=1" } else { "" },
+            count("tickdelay", *tickdelay),
+            count("framedelay", *framedelay),
+            if *nohash { "&nohash=1" } else { "" },
         )
     }
 }
@@ -408,9 +469,14 @@ pub fn run_in_chrome(rel: &str, frames: u32, width: u32, height: u32, fps: f64) 
 
 /// [`run_in_chrome`], with all of test mode's parameters.
 pub fn run_in_chrome_with(rel: &str, run: ChromeRun) -> BrowserRun {
-    let passed = headless([rel, &run.fragment(), "300"]);
-    assert!(passed, "the browser run failed; see {rel}/results/console.log");
     let results = repo_root().join(rel).join("results");
+    // A run before this one, on the same page, left its own results.
+    let _ = std::fs::remove_dir_all(&results);
+    std::fs::create_dir_all(&results).expect("results dir");
+    let passed = headless([rel, &run.fragment(), &run.timeout().to_string()]);
+    assert!(passed, "the browser run failed; see {rel}/results/console.log");
+    let frames = result_json(&results, "frames.json");
+    let log = std::fs::read_to_string(results.join("log.txt")).expect("log.txt");
     BrowserRun {
         hash: std::fs::read_to_string(results.join("hash.txt")).expect("hash.txt").trim().into(),
         frame: std::fs::read(results.join("frame.rgba")).expect("frame.rgba"),
@@ -426,7 +492,49 @@ pub fn run_in_chrome_with(rel: &str, run: ChromeRun) -> BrowserRun {
             Vec::new()
         },
         timings: if run.timestamps { timings(&results) } else { Vec::new() },
+        ticks: chrome_ticks(&results),
+        cpu_ms: frames["cpu_ms"].as_array().expect("cpu_ms").iter().map(number).collect(),
+        began_ms: frames["began_ms"].as_array().expect("began_ms").iter().map(number).collect(),
+        printed: frames["printed_in"]
+            .as_array()
+            .expect("printed_in")
+            .iter()
+            .map(|f| f.as_u64().expect("a frame") as usize)
+            .zip(log.lines().map(str::to_string))
+            .collect(),
     }
+}
+
+fn number(v: &serde_json::Value) -> f64 {
+    v.as_f64().expect("a number")
+}
+
+/// A test-mode run's `results/<name>`, as JSON.
+pub fn result_json(results: &Path, name: &str) -> serde_json::Value {
+    let text = std::fs::read_to_string(results.join(name)).unwrap_or_else(|e| panic!("{name}: {e}"));
+    serde_json::from_str(&text).unwrap_or_else(|e| panic!("{name} isn't JSON: {e}"))
+}
+
+/// The ticker's ticks in a test-mode run's `results/`, if the program started one.
+fn chrome_ticks(results: &Path) -> Option<ChromeTicks> {
+    if !results.join("ticks.json").exists() {
+        return None;
+    }
+    let v = result_json(results, "ticks.json");
+    let numbers = |key: &str| v[key].as_array().expect(key).iter().map(number).collect();
+    Some(ChromeTicks {
+        hz: v["hz"].as_u64().expect("hz") as u32,
+        began_ms: numbers("began_ms"),
+        cpu_ms: numbers("cpu_ms"),
+        hashes: v["hashes"]
+            .as_array()
+            .expect("hashes")
+            .iter()
+            .map(|h| h.as_str().expect("a hash").to_string())
+            .collect(),
+        dropped: v["dropped"].as_u64().expect("dropped"),
+        log: std::fs::read(results.join("ticks.log")).ok(),
+    })
 }
 
 /// Each pass's GPU time in a test-mode run's `results/` (its `timings.json`): its frame, its

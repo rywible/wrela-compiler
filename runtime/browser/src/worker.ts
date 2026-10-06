@@ -6,14 +6,16 @@
 import { MAX_WORKERS, SCREEN_FORMAT } from "./abi.gen.ts";
 import { LIMIT_SOURCES } from "./check.ts";
 import { errorMessage } from "./errors.ts";
-import { fitSize, GameClock } from "./frame.ts";
+import { fitSize, frameSeconds, VisibleClock } from "./frame.ts";
 import { alignTo, type GpuExecutor } from "./gpu.ts";
 import { eventsAt, InputRing, parseScript, type Scripted } from "./input.ts";
 import { browserIo, type Build, loadBuild, startProgram } from "./loader.ts";
-import { type Program, runWorker, type SpawnWorker } from "./program.ts";
-import type { FromWorker, ToWorker, VoiceOptions } from "./messages.ts";
+import { type Program, runWorker, type SpawnWorker, type TickerOptions } from "./program.ts";
+import type { FromWorker, Loaded, ToWorker, VoiceOptions } from "./messages.ts";
 import { encodePng } from "./png.ts";
 import { frameTime, putResult, type TestParams } from "./testmode.ts";
+import { type FromTicker, lockstepTicks, runTicker, TickerControl, TickerMode, type TickReport } from "./ticker.ts";
+import { wasmHash } from "./ticks.ts";
 
 declare const self: DedicatedWorkerGlobalScope;
 
@@ -44,6 +46,7 @@ function deliverInput(program: Program): number[] {
 function fatal(e: unknown): void {
   if (failed) return;
   failed = true;
+  ticker.control.stop(clock);
   const text = errorMessage(e);
   self.postMessage({ type: "fatal", message: text } satisfies FromWorker);
   if (testing) {
@@ -77,24 +80,80 @@ function context(canvas: OffscreenCanvas, device: GPUDevice, usage: number): GPU
   return ctx;
 }
 
+// ---- The ticker's thread ----
+
+/** Visible time, which frames and ticks count (frame.ts). */
+const clock = VisibleClock.create();
+
+/** The ticker's thread, once the program starts its ticker, and how it's run. */
+const ticker = {
+  control: TickerControl.create(),
+  worker: null as Worker | null,
+  /** Test mode: a script's events, for the ticker too. */
+  script: [] as Scripted[],
+  /** Test mode: keep each tick's state hash and its time. */
+  hashes: false,
+  timing: false,
+  delay: 0,
+  wasmHash: 0n,
+  /** Test mode: resolved with the ticks when the ticker's thread has stopped. */
+  report: null as Promise<{ report: TickReport; log: Uint8Array<ArrayBuffer> | null }> | null,
+};
+
+/** Starts the program's ticker on its own thread: this script again, told to run it. */
+function startTicker(options: TickerOptions): void {
+  ring?.attachTicker();
+  const thread = new Worker(self.location.href, { type: "module", name: "wrela sim" });
+  ticker.worker = thread;
+  ticker.report = new Promise((resolve) => {
+    thread.onmessage = (event: MessageEvent<FromTicker>) => {
+      const msg = event.data;
+      if (msg.type === "fatal") fatal(new Error(msg.message));
+      else resolve(msg);
+    };
+  });
+  thread.onerror = (event) => {
+    event.preventDefault();
+    fatal(new Error(`the ticker's thread failed: ${event.message || "it couldn't start"}`));
+  };
+  thread.postMessage({
+    type: "ticker",
+    ...options,
+    control: ticker.control.buffer,
+    clock: clock.buffer,
+    input: ring!.buffer,
+    script: ticker.script,
+    hashes: ticker.hashes,
+    timing: ticker.timing,
+    wasmHash: ticker.wasmHash,
+    delay: ticker.delay,
+  } satisfies ToWorker);
+}
+
 // ---- Running normally ----
 
 let size = { width: 1, height: 1 };
-const clock = new GameClock();
 
 /** Hands the program's voice to the main thread, which plays it in an AudioWorklet: an
  * AudioContext exists only there. */
 const startVoice = (voice: VoiceOptions) => self.postMessage({ type: "audio", voice } satisfies FromWorker);
 
+/** Helpers for parallel work and jobs: one per core beyond the main thread, the render worker
+ * and the ticker's thread, at most MAX_WORKERS (#43 §2.1). The program's own thread counts too. */
+const normalWorkers = () => Math.max(0, Math.min((navigator.hardwareConcurrency || 1) - 3, MAX_WORKERS)) + 1;
+
+const epochNow = () => performance.timeOrigin + performance.now();
+
 async function run(canvas: OffscreenCanvas, device: GPUDevice, build: Build): Promise<void> {
   const ctx = context(canvas, device, GPUTextureUsage.RENDER_ATTACHMENT);
-  const workers = Math.min(navigator.hardwareConcurrency || 1, MAX_WORKERS + 1);
+  ticker.control.start = clock.at(epochNow());
   const program = await startProgram(
     device,
     build,
     { texture: () => ctx.getCurrentTexture() },
-    { io: browserIo(base), workers, spawnWorker, startVoice },
+    { io: browserIo(base), workers: normalWorkers(), spawnWorker, startVoice, startTicker },
   );
+  ticker.control.go(TickerMode.CLOCK);
   const max = device.limits.maxTextureDimension2D;
   const executor = program.executor as GpuExecutor;
   // A debug build's bounds checks: the flag is read after a frame, one read at a time.
@@ -102,7 +161,7 @@ async function run(canvas: OffscreenCanvas, device: GPUDevice, build: Build): Pr
   const tick = (now: number) => {
     if (failed) return;
     try {
-      const time = clock.tick(now);
+      const time = frameSeconds(clock, ticker.control.start, performance.timeOrigin + now);
       if (time !== null) {
         const { width, height } = fitSize(size.width, size.height, max);
         if (canvas.width !== width || canvas.height !== height) {
@@ -181,6 +240,14 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
     format: SCREEN_FORMAT,
     usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
   });
+  const script: Scripted[] = params.input ? parseScript(await (await fetch(new URL(params.input, base))).text()) : [];
+  Object.assign(ticker, {
+    script,
+    hashes: params.nohash === 0,
+    timing: true,
+    delay: params.tickdelay,
+    wasmHash: wasmHash(build.wasm),
+  });
   const program = await startProgram(
     device,
     build,
@@ -189,26 +256,52 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
       afterPass: (encoder) =>
         encoder.copyTextureToTexture({ texture: screen }, { texture: ctx.getCurrentTexture() }, [width, height]),
     },
-    { hash: params.nohash === 0, io: browserIo(base), workers: params.workers, spawnWorker, startVoice, onPrint: (line) => {
+    {
+      hash: params.nohash === 0,
+      io: browserIo(base),
+      workers: params.workers,
+      spawnWorker,
+      startVoice,
+      startTicker,
+      tickHashes: params.nohash === 0,
+      onPrint: (line) => {
         printed.push(line);
         printed_in.push(frameNow);
-      } },
+      },
+    },
     params.timestamps > 0,
   );
   const executor = program.executor as GpuExecutor;
   if (params.timestamps > 0 && !executor.timed) throw new GpuError("the test asks for timestamps, but this device has no timestamp queries");
   const hash = program.hash;
-  const script: Scripted[] = params.input ? parseScript(await (await fetch(new URL(params.input, base))).text()) : [];
+  const hz = program.ticker?.hz ?? 0;
+  const control = ticker.control;
   // The latency test: when each frame started, and which events (by when they were sent) it got.
   const latency = { frames: [] as number[], delivered: [] as { sent: number; frame: number }[] };
-  if (params.latency > 0) self.postMessage({ type: "latency-start", ms: ((frames - 2) * 1000) / fps } satisfies FromWorker);
+  if (params.latency > 0 || params.keylatency > 0) {
+    self.postMessage({ type: "latency-start", ms: ((frames - 2) * 1000) / fps } satisfies FromWorker);
+  }
+  const nap = new Int32Array(new SharedArrayBuffer(4));
   const start = performance.now();
+  if (hz > 0) {
+    control.start = clock.at(epochNow());
+    control.go(params.paced > 0 ? TickerMode.CLOCK : TickerMode.LOCKSTEP);
+  }
   for (let i = 0; i < frames; i++) {
     // Paced at `fps`, as a display paces frames: requests are answered in real time between
     // them, as when the game runs.
     const wait = start + (i * 1000) / fps - performance.now();
     if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
     executor.frame = i;
+    control.framesStarted(i + 1);
+    if (hz > 0 && params.paced === 0) {
+      // Lockstep: the ticks before this frame run first, as on the native host.
+      const target = lockstepTicks(i, hz, fps);
+      control.runTo(target);
+      await control.ranTo(target);
+      // The ticker's thread reports its trap (`startTicker`).
+      if (control.failed) return;
+    }
     for (const e of eventsAt(script, i)) program.queueInput(e);
     latency.frames.push(performance.timeOrigin + performance.now());
     for (const sent of deliverInput(program)) latency.delivered.push({ sent, frame: i });
@@ -217,10 +310,19 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
     began_ms.push(performance.timeOrigin + began);
     await scoped(device, () => {
       program.frame(frameTime(i, fps), width, height);
+      if (params.framedelay > 0) Atomics.wait(nap, 0, 0, params.framedelay);
       cpu.push(performance.now() - began);
     });
     await device.queue.onSubmittedWorkDone();
     await executor.checkDebugFlag();
+  }
+  if (hz > 0) {
+    control.stop(clock);
+    const { report, log } = await ticker.report!;
+    await Promise.all([
+      putResult(base, "ticks.json", JSON.stringify({ hz, paced: params.paced > 0, ...report })),
+      log ? putResult(base, "ticks.log", log) : null,
+    ]);
   }
   const rgba = await readTexture(device, screen);
   await Promise.all([
@@ -236,10 +338,19 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
     if (!program.hasVoice) throw new Error("the test asks for audio, but the program started no voice");
     await audioRendered;
   }
-  if (params.latency > 0) {
+  if (params.latency > 0 || params.keylatency > 0) {
     await latencySent;
     await putResult(base, "latency.json", JSON.stringify(latency));
   }
+  self.postMessage({ type: "load-query" } satisfies FromWorker);
+  const page = await pageLoaded;
+  const ours = (performance.getEntriesByType("resource") as PerformanceResourceTiming[]).map((e) => ({
+    name: e.name,
+    bytes: e.transferSize > 0 ? e.transferSize : e.encodedBodySize,
+    end_ms: performance.timeOrigin + e.responseEnd,
+  }));
+  const load = { opened_ms: page.opened_ms, first_frame_ms: began_ms[0] ?? null, resources: [...page.resources, ...ours] };
+  await putResult(base, "load.json", JSON.stringify(load));
   console.log(`wrela test: ${frames} frames at ${width}x${height}, state hash ${hash ? hash.hex() : "none"}`);
   await putResult(base, "DONE", "ok");
 }
@@ -262,9 +373,24 @@ const latencySent = new Promise<void>((resolve) => {
   sentLatency = resolve;
 });
 
+/** Test mode: resolved with what the page loaded, when the main thread answers. */
+let answerLoad = (_: { opened_ms: number; resources: Loaded[] }) => {};
+const pageLoaded = new Promise<{ opened_ms: number; resources: Loaded[] }>((resolve) => {
+  answerLoad = resolve;
+});
+
 self.onmessage = (event: MessageEvent<ToWorker>) => {
   const msg = event.data;
   switch (msg.type) {
+    case "load":
+      answerLoad(msg);
+      return;
+    case "ticker": {
+      // This is the ticker's thread: it runs until it's stopped, or the page goes away.
+      const { type: _, ...start } = msg;
+      void runTicker(start, (m) => self.postMessage(m));
+      return;
+    }
     case "audio-rendered":
       renderedAudio();
       return;
@@ -291,7 +417,7 @@ self.onmessage = (event: MessageEvent<ToWorker>) => {
       size = { width: msg.width, height: msg.height };
       return;
     case "visibility":
-      clock.setVisible(msg.visible);
+      clock.setVisible(msg.visible, epochNow());
       return;
   }
 };

@@ -11,7 +11,17 @@
 // with `input=script.json`, a script of input events (runtime/abi `input`), each queued before
 // the frame it's for; with `latency=n`, the main thread sends n pointer events through the DOM at
 // random times while the frames run in real time, and saves when each reached the program
-// (`latency.json`). It's part of the shipped bundle, so the agreement test runs
+// (`latency.json`); with `keylatency=n`, n presses of the right arrow key instead, at least
+// 250 ms apart.
+//
+// A program with a ticker (`std::tick::start`) runs it on the lockstep schedule (#43 §2.3):
+// before frame i, the ticks up to ⌊(i + 1)·hz/fps⌋ run, and the frame waits for them, as on
+// the native host. With `paced=1`, ticks run on the ticker's own clock instead and neither waits
+// for the other, as in normal play: for time budgets. Either way, `ticks.json` has each tick's
+// time and records, and, unless `nohash=1`, each state hash; `ticks.log` is the tick log
+// (runtime/abi `ticks`), which `wrela-host --replay` replays. With `tickdelay=ms`, each tick is
+// held that much longer; with `framedelay=ms`, each frame. `load.json` has when the page opened
+// and each file it loaded. It's part of the shipped bundle, so the agreement test runs
 // the exact bytes a game ships, but only a page served from this machine (tools/serve.py and
 // tools/headless.py bind 127.0.0.1) enters it: a game's public URL ignores `#test`.
 
@@ -31,6 +41,14 @@ export interface TestParams {
   input: string;
   /** Pointer events to send through the DOM while the frames run (0: none). */
   latency: number;
+  /** Key presses to send through the DOM while the frames run (0: none). */
+  keylatency: number;
+  /** 1: ticks on the ticker's own clock, not in lockstep with the frames. */
+  paced: number;
+  /** Ms each tick is held longer (0: none). */
+  tickdelay: number;
+  /** Ms each frame is held longer (0: none). */
+  framedelay: number;
 }
 
 export const TEST_DEFAULTS: TestParams = {
@@ -44,6 +62,10 @@ export const TEST_DEFAULTS: TestParams = {
   nohash: 0,
   input: "",
   latency: 0,
+  keylatency: 0,
+  paced: 0,
+  tickdelay: 0,
+  framedelay: 0,
 };
 /** Every parameter's name, in order. */
 const NAMES = Object.keys(TEST_DEFAULTS) as (keyof TestParams)[];

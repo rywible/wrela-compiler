@@ -1,27 +1,71 @@
 // What each frame of a normal run is given (worker.ts): the time, and the canvas size.
 
-/** Seconds of visible running: the time stops while the page is hidden. */
-export class GameClock {
-  #elapsed = 0;
-  /** The last frame's timestamp while visible; null before the first visible frame. */
-  #last: number | null = null;
-  #visible = true;
+/**
+ * Visible time: ms since 1970, less the time the page was hidden. A browser may run no frames
+ * while the page is hidden, or keep running them, so the time stops when the page hides, not at
+ * the next frame. The render worker writes it, as the page shows and hides; the ticker's thread
+ * reads it too (#43 §2.1), so a frame's time and the ticks' clock agree. It's in a
+ * SharedArrayBuffer: words, a sequence count (odd while it's written) and whether the page is
+ * visible; then float64s, the hidden time before the page last hid and when it hid.
+ */
+export class VisibleClock {
+  static readonly BYTES = 24;
+  readonly #words: Int32Array;
+  readonly #floats: Float64Array;
 
-  /** The page was shown or hidden. A browser may run no frames while the page is hidden, or
-   * keep running them, so the time stops here, not at the next frame. */
-  setVisible(visible: boolean): void {
-    this.#visible = visible;
-    this.#last = null;
+  constructor(readonly buffer: SharedArrayBuffer) {
+    this.#words = new Int32Array(buffer, 0, 2);
+    this.#floats = new Float64Array(buffer, 8, 2);
   }
 
-  /** The time for a frame at timestamp `now` (milliseconds), or null while the page is hidden
-   * (run no frame). */
-  tick(now: number): number | null {
-    if (!this.#visible) return null;
-    if (this.#last !== null) this.#elapsed += now - this.#last;
-    this.#last = now;
-    return this.#elapsed / 1000;
+  static create(): VisibleClock {
+    const clock = new VisibleClock(new SharedArrayBuffer(VisibleClock.BYTES));
+    Atomics.store(clock.#words, 1, 1);
+    return clock;
   }
+
+  /** The page was shown or hidden at `now` (ms since 1970). Only one thread calls it. */
+  setVisible(visible: boolean, now: number): void {
+    if (visible === this.visible) return;
+    Atomics.add(this.#words, 0, 1);
+    if (visible) this.#floats[0]! += now - this.#floats[1]!;
+    else this.#floats[1] = now;
+    Atomics.store(this.#words, 1, visible ? 1 : 0);
+    Atomics.add(this.#words, 0, 1);
+    Atomics.notify(this.#words, 1);
+  }
+
+  get visible(): boolean {
+    return Atomics.load(this.#words, 1) !== 0;
+  }
+
+  /** Visible time at `now` (ms since 1970): it stands still while the page is hidden. */
+  at(now: number): number {
+    for (;;) {
+      const seq = Atomics.load(this.#words, 0);
+      if (seq % 2 !== 0) continue;
+      const [hidden, hiddenAt] = [this.#floats[0]!, this.#floats[1]!];
+      const visible = Atomics.load(this.#words, 1) !== 0;
+      if (Atomics.load(this.#words, 0) === seq) return visible ? now - hidden : hiddenAt - hidden;
+    }
+  }
+
+  /** Waits up to `ms` for the page to show, if it's hidden. */
+  waitVisible(ms: number): void {
+    Atomics.wait(this.#words, 1, 0, ms);
+  }
+
+  /** Wakes a thread that waits for the page to show (`waitVisible`), to see something else. */
+  wake(): void {
+    Atomics.notify(this.#words, 1);
+  }
+}
+
+/** Seconds of visible running since `start` (visible ms, `VisibleClock.at`), for each frame;
+ * null while the page is hidden (run no frame). */
+export function frameSeconds(clock: VisibleClock, start: number, now: number): number | null {
+  if (!clock.visible) return null;
+  return (clock.at(now) - start) / 1000;
 }
 
 /** A canvas size in device pixels that fits the device's largest texture (`max` on each
