@@ -1351,12 +1351,12 @@ fn the_herds_ticks_beside_frames_allocate_and_wait() {
     eprintln!(
         "{} steady ticks beside frames: {:.0} blocks allocated a tick (median; {:.0} at most), \
          the allocator's lock found taken {waits} times ({spins} tries, {:.1} ns each): \
-         {:.2} us a tick lost to it on average; ticks took {:.2} ms (median), {:.2} ms (p99)",
+         {:.1} ns a tick lost to it on average; ticks took {:.2} ms (median), {:.2} ms (p99)",
         steady.len(),
         pct(&allocs, 0.5),
         allocs[allocs.len() - 1],
         ns,
-        spins as f64 * ns / 1000.0 / n,
+        spins as f64 * ns / n,
         pct(&times, 0.5),
         pct(&times, 0.99),
     );

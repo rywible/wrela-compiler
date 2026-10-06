@@ -292,6 +292,7 @@ impl Host {
         width: u32,
         height: u32,
     ) -> Result<Vec<(Ticked, f64)>> {
+        self.program.executor().set_screen(width, height)?;
         self.program.ticks_beside_frames(ticks, frames, fps, width, height)
     }
 
