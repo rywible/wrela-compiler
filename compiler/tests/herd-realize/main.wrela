@@ -4,7 +4,7 @@
 // the quads' count and items, and the draw's arguments) and times the passes.
 
 use engine::creature::{ALL, Creature, Parts}
-use engine::realize::{Grid, Mesh, Room, Scratch, record}
+use engine::realize::{Grid, Mesh, Room, Scratch, record, record_cull, record_finish, record_slice}
 use herd::grazer::grazer
 use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch, write}
 use std::field::Field
@@ -136,7 +136,12 @@ pub fn evaluate_masked(game: mut Game, s: u32, n: u32, lo: u32, fp: f32) {
 
 /// The distance and channels (torso-ness, hoof-ness) at each point, every part in.
 @compute(64)
-fn channel_samples(field: herd::grazer::GrazerField, points: [vec4], out: mut Slots<vec4>, id: GlobalId) {
+fn channel_samples(
+    field: herd::grazer::GrazerField,
+    points: [vec4],
+    out: mut Slots<vec4>,
+    id: GlobalId,
+) {
     let (d, c) = field.distance_and_channels(points[id.x].xyz)
     out[id] = vec4(d, c.torso, c.hoof, 0.0)
 }
@@ -161,8 +166,14 @@ pub fn near_surface(game: mut Game, s: u32, n: u32) {
     game.dist = buffer(n)
     game.samp = buffer(n)
     let field = g.field()
-    dispatch(distances.bind(field: field, points: game.points.span(0, n), out: mut game.dist), groups: n / 64)
-    dispatch(channel_samples.bind(field: field, points: game.points.span(0, n), out: mut game.samp), groups: n / 64)
+    dispatch(
+        distances.bind(field: field, points: game.points.span(0, n), out: mut game.dist),
+        groups: n / 64,
+    )
+    dispatch(
+        channel_samples.bind(field: field, points: game.points.span(0, n), out: mut game.samp),
+        groups: n / 64,
+    )
 }
 
 /// The grid seed `s` is realized on at `cell`: its blocks along x, y and z, and the cell.
@@ -184,6 +195,28 @@ pub fn realize(game: mut Game, s: u32, cell: f32) {
     game.scratch.fit(grid.blocks)
     game.mesh = Mesh::new(Room { vertices: grid.blocks * 8, quads: grid.blocks * 8 })
     record(g.field(), grid, 0.06, mut game.scratch, mut game.mesh)
+}
+
+/// Realizes seed `s` at `cell` as a `Realizer` spreads a level change over frames, in `slices`
+/// slices of its live blocks, into a mesh of its own: the mesh's buffers are the newest.
+pub fn realize_sliced(game: mut Game, s: u32, cell: f32, slices: u32) {
+    let g = grazer(s)
+    let grid = Grid::around(g.bounds(), cell)
+    game.scratch.fit(grid.blocks)
+    game.mesh = Mesh::new(Room { vertices: grid.blocks * 8, quads: grid.blocks * 8 })
+    let field = g.field()
+    record_cull(field, grid, mut game.scratch, mut game.mesh)
+    for k in 0..slices {
+        record_slice(
+            field,
+            grid,
+            slice: k,
+            slices: slices,
+            scratch: mut game.scratch,
+            mesh: mut game.mesh,
+        )
+    }
+    record_finish(field, grid, 0.06, mut game.scratch, mut game.mesh)
 }
 
 /// Realizes seed `s` at `cell` into scratch of its own, whose probe, in a debug build, holds each

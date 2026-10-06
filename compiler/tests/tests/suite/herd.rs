@@ -438,6 +438,60 @@ fn read_mesh(host: &mut wrela_host::Host, five: &[u32]) -> Ours {
     }
 }
 
+/// A `Realizer` spreads a level change over frames (`record_vertices` a slice at a time): the
+/// mesh is the one a whole realization makes, triangle for triangle, at 3 and 1.5 cm, in 1, 5
+/// and 40 slices (40: most are past the live blocks' end, and empty).
+#[test]
+#[ignore = "needs a GPU"]
+fn a_realization_in_slices_is_the_whole_ones() {
+    let dir = crate::built("herd-realize");
+    let mut host = wrela_host::Host::load(&dir).expect("load");
+    let newest = |host: &mut wrela_host::Host| {
+        let b = host.buffers();
+        b[b.len() - 5..].to_vec()
+    };
+    // Each triangle as its corners' bits, from its lowest corner on (so the vertices' order in
+    // the buffer, which slices change, doesn't matter, but the winding does).
+    let triangles = |o: &Ours| {
+        let mut t: Vec<[[u32; 3]; 3]> = o
+            .mesh
+            .tris
+            .iter()
+            .map(|&t| {
+                let c = o.mesh.corners(t).map(|p| p.map(f32::to_bits));
+                let k = (0..3).min_by_key(|&k| c[k]).expect("a corner");
+                [c[k], c[(k + 1) % 3], c[(k + 2) % 3]]
+            })
+            .collect();
+        t.sort();
+        t
+    };
+    for cell in [0.03f32, 0.015] {
+        host.call_export("realize", &[Value::I32(1), Value::F32(cell)]).expect("realize");
+        let five = newest(&mut host);
+        let whole = read_mesh(&mut host, &five);
+        let want = triangles(&whole);
+        assert!(whole.tris > 1000 && whole.holes == 0 && whole.flags == 0);
+        for slices in [1, 5, 40] {
+            host.call_export(
+                "realize_sliced",
+                &[Value::I32(1), Value::F32(cell), Value::I32(slices)],
+            )
+            .expect("realize_sliced");
+            let five = newest(&mut host);
+            let sliced = read_mesh(&mut host, &five);
+            let what = format!("{cell} m in {slices} slices");
+            assert_eq!(
+                (sliced.live, sliced.tris, sliced.holes, sliced.flags),
+                (whole.live, whole.tris, whole.holes, whole.flags),
+                "{what}"
+            );
+            assert!(triangles(&sliced) == want, "{what}: the triangles differ");
+        }
+        eprintln!("{cell} m: {} triangles, the same in 1, 5 and 40 slices", whole.tris);
+    }
+}
+
 /// Ours at `cell`, as the spike's harness runs it: the room calibrated on the largest grid (a
 /// quarter more, and 1,024 to spare), then the 40 back to back, twice; the second run's counts
 /// and meshes, and each grazer's GPU time (its five dispatches), ms.
@@ -946,7 +1000,8 @@ fn the_herd_keeps_its_frames_in_chrome() {
 
 /// AC4, frame time under load: the camera moves from the close-up to the herd (at frame 300,
 /// the close-up's grazer at its finest level), and no frame from then on is over 16.7 ms while
-/// the herd's grazers are realized for the herd's view.
+/// the herd's grazers are drawn and refined for the herd's view. (The others, off screen in the
+/// close-up, were realized at their coarsest level meanwhile, one a frame: `Realizer::spend`.)
 #[test]
 #[ignore = "needs Chrome, python3 and a GPU"]
 fn moving_to_the_herd_keeps_the_frames_in_chrome() {
@@ -956,13 +1011,14 @@ fn moving_to_the_herd_keeps_the_frames_in_chrome() {
     let after: Vec<f64> = ms[299..].to_vec();
     let missed = after.iter().filter(|&&m| m > 16.7).count();
     let worst = after.iter().copied().fold(0.0, f64::max);
-    let drawn = chrome.printed.iter().filter(|(f, l)| *f >= 300 && l.ends_with("drawn")).count();
+    let drawn = chrome.printed.iter().filter(|(f, l)| *f >= 300 && l.ends_with(" drawn")).count();
+    let all = chrome.printed.iter().any(|(f, l)| *f >= 300 && l.starts_with("all 40"));
     eprintln!(
         "close-up to herd: {missed} of {} frames over 16.7 ms (worst {worst:.2} ms, median {:.2}); {drawn} grazers first drawn after the move",
         after.len(),
         median(&after)
     );
-    assert!(drawn >= 30, "the move drew only {drawn} grazers anew");
+    assert!(all, "the herd's 40 grazers weren't all drawn after the move");
     assert_eq!(missed, 0, "{missed} frames missed their deadline (worst {worst:.2} ms)");
 }
 
@@ -1167,15 +1223,16 @@ fn mesh_memory_is_the_spikes() {
 }
 
 /// AC4, no leaks: a scripted 10-minute camera tour of the live herd (key O: five 2-minute loops
-/// round it, from 30 m out to 4), at 20 frames a second in the native host: no slab overflows, no
-/// grazer once drawn is ever without a mesh, and the mesh memory allocated after the tour is
+/// round it, from 30 m out to 4), at 60 frames a second in the native host (a level change takes
+/// a slice of frames, `Realizer::advance`, so the frame rate is the game's): no slab overflows,
+/// no grazer once drawn is ever without a mesh, and the mesh memory allocated after the tour is
 /// within one slab per level of its peak during the first loop.
 #[test]
 #[ignore = "needs a GPU"]
 fn a_ten_minute_tour_leaks_no_mesh_memory() {
     let dir = herd_gpu();
     let mut host = wrela_host::Host::load(&dir).expect("load the herd");
-    let fps = 20.0;
+    let fps = 60.0;
     let start =
         wrela_host::parse_script(r#"[{"frame":0,"type":"key","key":"KeyO"}]"#).expect("a script");
     let (mut first_peak, mut peak, mut lost) = (0.0f64, 0.0f64, 0u32);

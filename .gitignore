@@ -3,6 +3,8 @@
 **/results/console.log
 **/results/*.png
 **/results/*.tmp
+# The spike's cold-pipelines page runs where it is (herd::the_herds_pipelines_load_cold_as_fast)
+compiler/tests/spike01/pipelines/results/
 __pycache__/
 /target/
 **/build/
