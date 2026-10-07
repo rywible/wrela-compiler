@@ -79,6 +79,7 @@ pub fn emit(l: &Lowered, sources: &SourceMap, simd: bool) -> BuildOutput {
                         clamp: f32::from_bits(state.bias_clamp),
                     },
                     depth: state.depth,
+                    writes_depth: p.writes_depth,
                 }
             }
             _ => {

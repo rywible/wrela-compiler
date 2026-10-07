@@ -189,15 +189,18 @@ fn check_entry(p: &Program, f: FnId, entry: Entry, out: &mut Vec<Diagnostic>) {
         }
         Entry::Fragment
             if !matches!(p.types.kind(def.ret), TyKind::Vec(VecElem::F32, 4))
-                && p.lang_of_ty(def.ret) != Some(Lang::Over) =>
+                && !matches!(p.lang_of_ty(def.ret), Some(Lang::Over | Lang::WithDepth)) =>
         {
             out.push(
                 Diagnostic::new(
                     codes::E0602,
                     def.sig_span,
-                    format!("{stage} returns a `vec4` colour, or an `Over` colour to blend"),
+                    format!(
+                        "{stage} returns a `vec4` colour, an `Over` colour to blend, or a \
+                         `WithDepth` colour and depth"
+                    ),
                 )
-                .with_note("it writes one colour to its target: a `vec4` replaces what's there, and `std::gpu::Over` is drawn over it"),
+                .with_note("it writes one colour to its target: a `vec4` replaces what's there, `std::gpu::Over` is drawn over it, and `std::gpu::WithDepth` replaces it with a depth of its own"),
             )
         }
         _ => {}

@@ -1,12 +1,12 @@
 // Depth state (compiler/tests/tests/suite/renderer.rs): each comparison a draw's depth test can
-// make, with depth writes on and off. The screen is cut into eight cells, two rows of four. In
-// each, a grey quad at depth 0.5 fills the cell first; the case's quad is drawn over it with
-// its test; then a white probe, nearer than 0.5 and tested `Less`, over the cell's right half.
-// So the left half shows whether the case's quad passed its test, and the right half whether
-// it wrote its depth.
+// make, with depth writes on and off; and fragments that give their own depth (`WithDepth`).
+// The screen is cut into twelve cells, three rows of four. In each, a grey quad at depth 0.5
+// fills the cell first; the case's quad is drawn over it with its test; then a white probe,
+// tested `Less`, over the cell's right half. So the left half shows whether the case's quad
+// passed its test, and the right half whether it wrote its depth.
 use std::gpu::{
-    ClipPosition, Compare, Depth, DepthTexture, VertexIndex, begin_screen_pass_with_depth,
-    depth_texture, draw,
+    ClipPosition, Compare, Depth, DepthTexture, VertexIndex, WithDepth,
+    begin_screen_pass_with_depth, depth_texture, draw,
 }
 
 /// A cell of the screen in clip space, its lower left corner and its size, and a depth.
@@ -35,6 +35,12 @@ fn flat(colour: vec4) -> vec4 {
     colour
 }
 
+/// A colour at a depth of its own, whatever its triangle's.
+@fragment
+fn at_depth(colour: vec4, depth: f32) -> WithDepth {
+    WithDepth { color: colour, depth }
+}
+
 pub struct Scene {
     depth: DepthTexture,
     width: u32,
@@ -47,13 +53,14 @@ pub fn init() -> Scene {
 
 /// Cell `k`'s rectangle at depth `z`.
 fn cell(k: u32, z: f32) -> Rect {
-    Rect { lo: vec2(-1.0 + 0.5 * f32(k % 4), 1.0 - f32(k / 4 + 1)), size: vec2(0.5, 1.0), z }
+    let h = 2.0 / 3.0
+    Rect { lo: vec2(-1.0 + 0.5 * f32(k % 4), 1.0 - h * f32(k / 4 + 1)), size: vec2(0.5, h), z }
 }
 
 /// The right half of cell `k`, at depth `z`.
 fn right(k: u32, z: f32) -> Rect {
     let c = cell(k, z)
-    Rect { lo: vec2(c.lo.x + 0.25, c.lo.y), size: vec2(0.25, 1.0), z }
+    Rect { lo: vec2(c.lo.x + 0.25, c.lo.y), size: vec2(0.25, c.size.y), z }
 }
 
 const GREY = vec4(0.5, 0.5, 0.5, 1.0)
@@ -66,7 +73,7 @@ pub fn frame(s: mut Scene, time: f32, width: u32, height: u32) {
         s.height = height
     }
     let pass = begin_screen_pass_with_depth(mut s.depth, clear: vec4(0.0, 0.0, 0.0, 1.0))
-    for k in 0..8 {
+    for k in 0..10 {
         draw(quad.bind(cell(k, 0.5)), flat.bind(GREY), vertices: 6)
     }
     // 0: nearer, `Less`: drawn, and its depth written (the probe at 0.45 is behind it).
@@ -126,8 +133,14 @@ pub fn frame(s: mut Scene, time: f32, width: u32, height: u32) {
         vertices: 6,
         depth: Depth { compare: Compare::Equal, write: false },
     )
-    let probes = [0.45, 0.45, 0.45, 0.55, 0.7, 0.7, 0.45, 0.45]
-    for k in 0..8 {
+    // 8: drawn far (0.9), its fragments at 0.4: drawn, and their depth written (the probe at
+    // 0.45 is behind it).
+    let orange = vec4(1.0, 0.5, 0.0, 1.0)
+    draw(quad.bind(cell(8, 0.9)), at_depth.bind(orange, depth: 0.4), vertices: 6)
+    // 9: drawn near (0.1), its fragments at 0.6: hidden.
+    draw(quad.bind(cell(9, 0.1)), at_depth.bind(orange, depth: 0.6), vertices: 6)
+    let probes = [0.45, 0.45, 0.45, 0.55, 0.7, 0.7, 0.45, 0.45, 0.45, 0.45]
+    for k in 0..10 {
         draw(quad.bind(right(k, probes[k])), flat.bind(WHITE), vertices: 6)
     }
     pass.present()

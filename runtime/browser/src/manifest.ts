@@ -47,6 +47,8 @@ export type Stage =
       cull: Cull;
       depth_bias: DepthBias;
       depth: DepthState;
+      /** Gives each fragment its own depth: drawn only in a pass with a depth target. */
+      writes_depth: boolean;
     };
 
 export type Cull = "none" | "front" | "back";
@@ -200,7 +202,10 @@ function pipeline(v: unknown, i: number): Pipeline {
       if (typeof write !== "boolean") throw new ManifestError(`${dw}.write must be true or false`);
       depth = { compare, write };
     }
-    stage = { kind, vertex_entry, fragment_entry, blend: b, cull, depth_bias, depth };
+    // A missing `writes_depth` is false.
+    const writes_depth = o["writes_depth"] ?? false;
+    if (typeof writes_depth !== "boolean") throw new ManifestError(`${where}.writes_depth must be true or false`);
+    stage = { kind, vertex_entry, fragment_entry, blend: b, cull, depth_bias, depth, writes_depth };
   }
   // A missing `debug_flag` is read as null.
   const d = o["debug_flag"] ?? null;

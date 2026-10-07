@@ -28,7 +28,6 @@ const CREATURE: u32 = 5;
 mod off {
     pub const TREES: i32 = 1;
     pub const GRASS: i32 = 2;
-    pub const SHADOWS: i32 = 4;
     pub const CREATURE: i32 = 16;
     pub const STONES: i32 = 32;
     pub const SKY: i32 = 64;
@@ -717,4 +716,1076 @@ fn no_pixel_sees_through_the_terrain_between_levels() {
         checked += 1;
     }
     assert!(checked >= 170, "only {checked} frames checked");
+}
+
+// ---- vegetation (AC4) ------------------------------------------------------------------------
+
+const FLOWER: u32 = 7;
+
+/// The finest level's grass at (x, z): how much of the meadow grows there (its texel's cover).
+fn grass_at(cover: &[u8], clip: &Clip, x: f64, z: f64) -> f64 {
+    let mut l = 0;
+    while l + 1 < clip.levels.len() && clip.reach(l, x, z) > 0.98 {
+        l += 1;
+    }
+    let [ax, az, s] = clip.levels[l];
+    let i = (((x - ax) / s).round().clamp(0.0, f64::from(QUADS))) as u32;
+    let j = (((z - az) / s).round().clamp(0.0, f64::from(QUADS))) as u32;
+    let t = (l as u32 * STRIDE + j * ROW + i) as usize;
+    f64::from(cover[t * TEXEL_BYTES + 11]) / 255.0
+}
+
+/// The share of the meadow's pixels that show grass (or its flowers), near (within 25 m) and
+/// far (25 to 80 m; the blades reach 92 m): of the pixels that show the ground or grass where
+/// the clipmap's meadow grows at least half its grass.
+fn grass_coverage(c: &mut Clearing) -> [f64; 2] {
+    let cam = c.camera();
+    let scene = c.scene();
+    let depth = c.depth();
+    let texels = c.capture(6);
+    let clip = Clip::read(c);
+    let (w, h) = (cam.screen[0] as usize, cam.screen[1] as usize);
+    let mut grass = [0usize; 2];
+    let mut all = [0usize; 2];
+    for y in 0..h {
+        for x in 0..w {
+            let i = y * w + x;
+            let k = class(scene[i][3]);
+            if k != GROUND && k != GRASS && k != FLOWER {
+                continue;
+            }
+            let p = cam.world_at([x as f64 + 0.5, y as f64 + 0.5], f64::from(depth[i]));
+            let d = len(sub(p, cam.eye));
+            let band = if d < 25.0 {
+                0
+            } else if d < 80.0 {
+                1
+            } else {
+                continue;
+            };
+            if grass_at(&texels, &clip, p[0], p[2]) < 0.5 {
+                continue;
+            }
+            all[band] += 1;
+            if k != GROUND {
+                grass[band] += 1;
+            }
+        }
+    }
+    [0, 1].map(|b| grass[b] as f64 / all[b].max(1) as f64)
+}
+
+/// AC4: the grass is placed on the GPU round the eye and follows it: over the camera's path
+/// (every second), the share of the meadow's pixels its blades cover, near and far, stays
+/// within 10% of the path's start (a ring's edge that thinned would show as a drop).
+#[test]
+#[ignore = "long: the camera's path, needs a GPU"]
+fn the_grass_never_thins_along_the_path() {
+    let mut c = Clearing::load("clearing-grass");
+    c.until_ready(8);
+    let start = grass_coverage(&mut c);
+    println!("grass coverage at the start: near {:.3}, far {:.3}", start[0], start[1]);
+    assert!(start[0] > 0.5 && start[1] > 0.5, "little grass at the start: {start:?}");
+    c.walk();
+    c.step();
+    let mut worst = [1.0f64; 2];
+    let mut samples = 0;
+    while c.path_time() < 60.0 {
+        c.step();
+        if c.frame % 60 != 0 {
+            continue;
+        }
+        let now = grass_coverage(&mut c);
+        let t = c.path_time();
+        for b in 0..2 {
+            let ratio = now[b] / start[b];
+            worst[b] = worst[b].min(ratio);
+            assert!(
+                (0.9..=1.1).contains(&ratio) || now[b].is_nan(),
+                "at {t:.1} s, the {} grass covers {:.3} of the meadow (the start's {:.3})",
+                ["near", "far"][b],
+                now[b],
+                start[b]
+            );
+        }
+        samples += 1;
+    }
+    println!("lowest coverage against the start over {samples} samples: {worst:?}");
+}
+
+/// AC4's early depth: in the cards' shading pass (equal depth, after the prepass), no pixel is
+/// shaded by more cards than cover it, and over the pixels it shades, each is shaded no more
+/// than 1.5 times on average (counted by an atomic, `test_count`). Beside it, how many times
+/// the cards covering a pixel would have shaded it without the prepass (spike 15's way). At
+/// the path's start, the middle and its end (the pan up the great tree).
+#[test]
+#[ignore = "long: the camera's path, needs a GPU"]
+fn the_cards_shade_each_pixel_once() {
+    let mut c = Clearing::load("clearing-counts");
+    c.until_ready(4);
+    c.walk();
+    c.step();
+    for at in [0.0, 30.0, 58.0] {
+        while c.path_time() < at {
+            c.step();
+        }
+        c.call("test_count", &[]);
+        c.step();
+        let shaded = u32s(&c.capture(4));
+        let covering = u32s(&c.capture(5));
+        let (mut sum, mut n, mut more, mut layers, mut crowns) = (0u64, 0u64, 0u64, 0u64, 0u64);
+        let mut beyond = Vec::new();
+        for (i, (s, cv)) in shaded.iter().zip(&covering).enumerate() {
+            if s > cv {
+                beyond.push((i, *s, *cv));
+            }
+            if *cv > 0 {
+                crowns += 1;
+                layers += u64::from(*cv);
+            }
+            if *s > 0 {
+                sum += u64::from(*s);
+                n += 1;
+                if *s > 1 {
+                    more += 1;
+                }
+            }
+        }
+        let mean = sum as f64 / n.max(1) as f64;
+        println!(
+            "at {at} s: {} pixels shaded more than their covering cards: {:?}",
+            beyond.len(),
+            &beyond[..beyond.len().min(6)]
+        );
+        println!(
+            "at {at} s: {n} pixels shaded, {mean:.4} times each on average ({more} more than once); \
+             {crowns} covered by cards, {:.2} cards deep on average",
+            layers as f64 / crowns.max(1) as f64
+        );
+        assert!(n > 1000, "at {at} s the cards shade only {n} pixels");
+        assert!(mean <= 1.5, "at {at} s the cards shade a pixel {mean} times on average");
+    }
+}
+
+/// A tree alone, `kind`, drawn one way (`cards_to`, `impostors_to`), from `distance` m away
+/// across the valley's floor, against the sun (so its light through counts): the screen, and
+/// which of its pixels show the tree.
+fn solo(
+    c: &mut Clearing,
+    cpu: &mut wrela_host::CpuHost,
+    kind: u32,
+    distance: f32,
+    cards_to: f32,
+    impostors_to: f32,
+) -> (Vec<u8>, Vec<u8>) {
+    let at = [-260.0f32, 520.0];
+    c.call(
+        "test_solo",
+        &[
+            Value::I32(kind as i32),
+            Value::F32(at[0]),
+            Value::F32(at[1]),
+            Value::F32(cards_to),
+            Value::F32(impostors_to),
+        ],
+    );
+    let ground = field(cpu, f64::from(at[0]), f64::from(at[1])).0 as f32;
+    let toward = [-0.62f32, 0.78];
+    let eye = [at[0] + toward[0] * distance, at[1] + toward[1] * distance];
+    let under = field(cpu, f64::from(eye[0]), f64::from(eye[1])).0 as f32;
+    let eye_y = (ground + 6.0 + distance * 0.08).max(under + 4.0);
+    c.hold([eye[0], eye_y, eye[1]], [at[0], ground + 6.0, at[1]]);
+    // Settled (the static shadows redrawn, temporal AA's history full), then converged: the
+    // mean of the 16 frames of the jitter's cycle; the tree where any of them shows it.
+    c.steps(48);
+    let mut sum = vec![0u32; (W * H * 4) as usize];
+    let mut count = vec![0u8; (W * H) as usize];
+    for _ in 0..16 {
+        c.step();
+        for (s, v) in sum.iter_mut().zip(c.screen()) {
+            *s += u32::from(v);
+        }
+        for (t, p) in count.iter_mut().zip(c.output()) {
+            *t += u8::from(matches!(class(p[3]), LEAVES | BARK));
+        }
+    }
+    let screen = sum.iter().map(|s| ((s + 8) / 16) as u8).collect();
+    (screen, count)
+}
+
+/// Two frames compared over a crown's box (the pixels either shows it in, and round them),
+/// each averaged over blocks of `block` × `block` pixels: the mean of |a − b| (/255).
+fn blocked(a: &[u8], b: &[u8], ta: &[bool], tb: &[bool], block: usize) -> (f64, usize) {
+    let (w, h) = (W as usize, H as usize);
+    let (mut x0, mut x1, mut y0, mut y1) = (w, 0, h, 0);
+    for i in (0..ta.len()).filter(|&i| ta[i] || tb[i]) {
+        let (x, y) = (i % w, i / w);
+        (x0, x1, y0, y1) = (x0.min(x), x1.max(x), y0.min(y), y1.max(y));
+    }
+    if x1 < x0 {
+        return (0.0, 0);
+    }
+    let (x0, y0) = (x0 / block * block, y0 / block * block);
+    let (mut sum, mut n) = (0.0, 0);
+    for by in (y0..=y1.min(h - block)).step_by(block) {
+        for bx in (x0..=x1.min(w - block)).step_by(block) {
+            for ch in 0..3 {
+                let (mut sa, mut sb) = (0.0, 0.0);
+                for y in by..by + block {
+                    for x in bx..bx + block {
+                        sa += f64::from(a[4 * (y * w + x) + ch]);
+                        sb += f64::from(b[4 * (y * w + x) + ch]);
+                    }
+                }
+                sum += (sa - sb).abs() / (block * block) as f64 / 3.0;
+            }
+            n += 1;
+        }
+    }
+    (sum / n.max(1) as f64, n)
+}
+
+/// AC4's levels: each kind's crown drawn as cards and as an impostor where they meet (150 m),
+/// and as an impostor and as a volume where they meet (1 km), matches within a mean of 4/255:
+/// its silhouette and its light through it (spike 03), seen against the sun, over the crown's
+/// box at the coarser level's own resolution (blocks two of its texels, or voxels, wide on
+/// screen: the finest detail it holds). The final frames compared, converged (spike 03: each
+/// the mean of temporal AA's cycle of 16); each pair's per-pixel figures reported too.
+#[test]
+#[ignore = "long: every kind, four ways, needs a GPU"]
+fn a_crown_matches_where_its_levels_meet() {
+    let mut c = Clearing::load("clearing-levels");
+    c.until_ready(2);
+    c.off(off::GRASS | off::CREATURE | off::STONES | off::WIND);
+    let (dir, _) = built("clearing-levels-cpu");
+    let mut cpu = wrela_host::CpuHost::load(&dir).expect("load on the CPU");
+    let kinds = 12;
+    let mut report = Vec::new();
+    // Each way's ranges just beyond and just short of the meeting distance, as the forest
+    // switches there.
+    let ways = [
+        (150.0f32, (158.0f32, 1.0e9f32), (142.0f32, 1.0e9f32), 1usize),
+        (1000.0, (0.0, 1050.0), (0.0, 950.0), 2),
+    ];
+    // An output pixel's width at a distance (m): the clearing's 42° field of view.
+    let pixel = |d: f32| f64::from(2.0 * (21.0f32).to_radians().tan() * d / H as f32);
+    // (`CLEARING_KINDS=1,10` checks only those, while looking into them.)
+    let only: Option<Vec<u32>> = std::env::var("CLEARING_KINDS")
+        .ok()
+        .map(|v| v.split(',').filter_map(|k| k.trim().parse().ok()).collect());
+    for kind in (0..kinds).filter(|k| only.as_ref().is_none_or(|o| o.contains(k))) {
+        let sizes = c.call("test_kind", &[Value::I32(kind as i32)]);
+        for (distance, near, far, which) in ways {
+            // Two of the coarser level's texels (the impostor's) or voxels (the volume's).
+            let block = ((2.0 * sizes[which] / pixel(distance)).round() as usize).max(1);
+            let (a, ca) = solo(&mut c, &mut cpu, kind, distance, near.0, near.1);
+            let (b, cb) = solo(&mut c, &mut cpu, kind, distance, far.0, far.1);
+            let (ta, tb): (Vec<bool>, Vec<bool>) =
+                (ca.iter().map(|&n| n > 0).collect(), cb.iter().map(|&n| n > 0).collect());
+            let mut solid = (0.0, 0.0);
+            for i in (0..ca.len()).filter(|&i| ca[i] == 16 && cb[i] == 16) {
+                for ch in 0..3 {
+                    solid.0 += f64::from(b[4 * i + ch]) - f64::from(a[4 * i + ch]);
+                }
+                solid.1 += 3.0;
+            }
+            println!(
+                "  where both always show it: the farther level brighter by {:.2}/255 over {} pixels",
+                solid.0 / solid.1,
+                solid.1 / 3.0
+            );
+            let union = (0..ta.len()).filter(|&i| ta[i] || tb[i]);
+            let (raw, over, n) = compare(&a, &b, union);
+            let (mean, blocks) = blocked(&a, &b, &ta, &tb, block);
+            let (m8, _) = blocked(&a, &b, &ta, &tb, 8);
+            let (m16, _) = blocked(&a, &b, &ta, &tb, 16);
+            let mut bias = 0.0;
+            let mut nb_ = 0.0;
+            for i in (0..ta.len()).filter(|&i| ta[i] && tb[i]) {
+                for ch in 0..3 {
+                    bias += f64::from(b[4 * i + ch]) - f64::from(a[4 * i + ch]);
+                }
+                nb_ += 3.0;
+            }
+            println!(
+                "  blocks of 8: {m8:.2}, of 16: {m16:.2}; the farther level brighter by {:.2}/255",
+                bias / nb_
+            );
+            let (na, nb) = (ta.iter().filter(|x| **x).count(), tb.iter().filter(|x| **x).count());
+            report.push((kind, distance, mean, n));
+            println!(
+                "kind {kind:2} at {distance:4} m: {mean:.2}/255 over {blocks} blocks of {block} px; per pixel {raw:.2}/255 ({:.1}% over 8) over {n}; silhouettes {na} and {nb} pixels",
+                over * 100.0
+            );
+            if std::env::var("CLEARING_KINDS").is_ok() {
+                let centroid = |t: &[bool]| {
+                    let (mut x, mut y, mut n) = (0.0, 0.0, 0.0);
+                    for i in (0..t.len()).filter(|&i| t[i]) {
+                        x += (i % W as usize) as f64;
+                        y += (i / W as usize) as f64;
+                        n += 1.0;
+                    }
+                    (x / n, y / n)
+                };
+                let (ca, cb) = (centroid(&ta), centroid(&tb));
+                println!(
+                    "  centroids: {ca:?} and {cb:?}: moved ({:.2}, {:.2}) px",
+                    cb.0 - ca.0,
+                    cb.1 - ca.1
+                );
+                let mask: Vec<u8> = (0..ta.len())
+                    .flat_map(|i| match (ta[i], tb[i]) {
+                        (true, true) => [255, 255, 255, 255],
+                        (true, false) => [255, 0, 0, 255],
+                        (false, true) => [0, 255, 0, 255],
+                        _ => [0, 0, 0, 255],
+                    })
+                    .collect();
+                let at = repo_root()
+                    .join(format!("target/tmp/clearing-levels-{kind}-{distance}-mask.png"));
+                wrela_host::image::write_png(&at, W, H, &mask).expect("write");
+            }
+            if kind == 0 || mean > 4.0 {
+                let dir = repo_root().join("target/tmp");
+                let name = |w: &str| dir.join(format!("clearing-levels-{kind}-{distance}-{w}.png"));
+                wrela_host::image::write_png(&name("a"), W, H, &a).expect("write");
+                wrela_host::image::write_png(&name("b"), W, H, &b).expect("write");
+            }
+        }
+    }
+    for (kind, distance, mean, n) in report {
+        // A crown too small to add to the terrain's shading isn't drawn either way.
+        if n == 0 {
+            println!("kind {kind} at {distance} m: drawn neither way (under a few pixels)");
+            continue;
+        }
+        assert!(mean <= 4.0, "kind {kind} at {distance} m: its levels differ by {mean}/255");
+    }
+}
+
+// ---- light (AC5) -----------------------------------------------------------------------------
+
+/// How many draws a frame's batch makes after the label `name` (to the next label).
+fn draws_after(batch: &[u8], name: &str) -> usize {
+    use wrela_abi::stream::{Command, decode};
+    let mut inside = false;
+    let mut n = 0;
+    for cmd in decode(batch).expect("a batch") {
+        match cmd {
+            Command::Label { name: l } => inside = l == name,
+            Command::Draw { .. }
+            | Command::DrawIndirect { .. }
+            | Command::DrawIndexedIndirect { .. }
+                if inside =>
+            {
+                n += 1
+            }
+            _ => {}
+        }
+    }
+    n
+}
+
+/// AC5: static shadows are cached: the first frame draws the forest and the stones into the
+/// static cascades, a steady frame draws nothing into them, and moving the sun draws them again
+/// (counted in the frames' command streams).
+#[test]
+#[ignore = "needs a GPU"]
+fn static_shadows_are_drawn_once_and_again_when_the_sun_moves() {
+    let mut c = Clearing::load("clearing-static");
+    c.step();
+    let first: usize = c.batches().iter().map(|b| draws_after(b, "shadows static")).sum();
+    assert!(first > 10, "the first frame draws {first} times into the static cascades");
+    c.until_ready(2);
+    c.batches();
+    c.steps(30);
+    let steady: Vec<usize> = c.batches().iter().map(|b| draws_after(b, "shadows static")).collect();
+    assert!(steady.iter().all(|&n| n == 0), "steady frames draw static shadows: {steady:?}");
+    let sun = [0.85f32, 0.45, -0.25];
+    c.call(
+        "test_sun",
+        &[Value::F32(sun[0]), Value::F32(sun[1]), Value::F32(sun[2]), Value::F32(1.0)],
+    );
+    c.step();
+    let moved: usize = c.batches().iter().map(|b| draws_after(b, "shadows static")).sum();
+    assert_eq!(moved, first, "moving the sun drew {moved} times, the first frame {first}");
+    c.steps(5);
+    let after: usize = c.batches().iter().map(|b| draws_after(b, "shadows static")).sum();
+    assert_eq!(after, 0, "frames after the sun moved still draw static shadows");
+}
+
+/// The scene at the start's shot (camera held, the wind still), and its depth.
+fn shot_scene(c: &mut Clearing) -> (Vec<[f32; 4]>, Vec<f32>, Cam) {
+    let cam = c.camera();
+    (c.scene(), c.depth(), cam)
+}
+
+/// Luminance, linear.
+fn luma(p: [f32; 4]) -> f64 {
+    f64::from(0.2126 * p[0] + 0.7152 * p[1] + 0.0722 * p[2])
+}
+
+/// The pixels a change darkened: those showing class `classes` in both scenes, darker by over
+/// 15% in `a`; their world points.
+fn darkened(
+    a: &[[f32; 4]],
+    b: &[[f32; 4]],
+    depth: &[f32],
+    cam: &Cam,
+    classes: &[u32],
+) -> Vec<(u32, [f64; 3])> {
+    let w = cam.screen[0] as usize;
+    let mut out = Vec::new();
+    for i in 0..a.len() {
+        let (ka, kb) = (class(a[i][3]), class(b[i][3]));
+        if ka != kb || !classes.contains(&ka) {
+            continue;
+        }
+        if luma(a[i]) < luma(b[i]) * 0.85 {
+            let px = [(i % w) as f64 + 0.5, (i / w) as f64 + 0.5];
+            out.push((ka, cam.world_at(px, f64::from(depth[i]))));
+        }
+    }
+    out
+}
+
+/// AC5: the creature's shadow is dynamic: it falls on the terrain and on the grass, and it moves
+/// with the creature. The same frame (the same jitter, 16 frames apart, the camera held and the
+/// wind still) with the creature and without: the pixels of ground and grass it darkens; then
+/// again after it has walked.
+#[test]
+#[ignore = "needs a GPU"]
+fn the_creatures_shadow_falls_on_terrain_and_grass_and_moves() {
+    let mut c = Clearing::load("clearing-creature-shadow");
+    c.until_ready(0);
+    c.off(off::WIND);
+    // Looking down at the creature from its sunny side.
+    c.hold([2.0, 6.5, 9.5], [-3.2, 3.0, 14.5]);
+    let mut centroids = Vec::new();
+    for round in 0..2 {
+        c.steps(16 - c.frame % 16);
+        let (a, depth, cam) = shot_scene(&mut c);
+        c.off(off::WIND | off::CREATURE);
+        c.steps(16);
+        let (b, _, _) = shot_scene(&mut c);
+        c.off(off::WIND);
+        let dark = darkened(&a, &b, &depth, &cam, &[GROUND, GRASS]);
+        let on_ground = dark.iter().filter(|d| d.0 == GROUND).count();
+        let on_grass = dark.iter().filter(|d| d.0 == GRASS).count();
+        println!(
+            "round {round}: the creature's shadow darkens {on_ground} ground and {on_grass} grass pixels"
+        );
+        assert!(on_ground + on_grass > 400, "round {round}: no shadow ({on_ground}, {on_grass})");
+        if round == 0 {
+            assert!(
+                on_ground > 50 && on_grass > 50,
+                "round 0: on ground {on_ground}, on grass {on_grass}"
+            );
+        }
+        let n = dark.len() as f64;
+        let mut centre = [0.0; 3];
+        for (_, p) in &dark {
+            centre = add_scaled(centre, *p, 1.0 / n);
+        }
+        centroids.push(centre);
+        if round == 0 {
+            c.walk();
+            c.steps(160);
+        }
+    }
+    let moved = len(sub(centroids[1], centroids[0]));
+    println!("the shadow's middle moved {moved:.2} m");
+    assert!(moved > 0.5, "the creature walked, and its shadow moved {moved} m");
+}
+
+/// The SH basis's constants (probes::probe_light's).
+const Y0: f64 = 0.282095;
+const Y1: f64 = 0.488603;
+
+/// AC5's probes: the sky light (and bounce) from probes baked at load, against a brute-force
+/// reference of the same light (spike 05's method): at every 4th pixel each way of the start's
+/// frame, the light a probe at the surface point itself would hold, traced with 1024 rays
+/// through the same occluders, ground and sky. Compared in the image: the same frame drawn
+/// with every surface's sky light set to 0, to 1, and to 1 plus half each axis of the normal
+/// gives how each pixel answers to its sky light, through its own shader, normal and occlusion
+/// (`Light::sky_test`); each pixel is then lit by the probes' light and by the reference's, and
+/// the two compared through the tone curve: a mean of at most 4/255, and no more than 2% of the
+/// pixels over 8/255. (Pixels whose shading isn't linear in the sky light, the creature's cel,
+/// are left out.)
+#[test]
+#[ignore = "needs a GPU"]
+fn the_probes_match_a_brute_force_reference() {
+    let mut c = Clearing::load("clearing-probes");
+    c.until_ready(0);
+    c.off(off::WIND);
+    c.steps(16 - c.frame % 16);
+    // The same frame (16 apart: the same jitter) six ways.
+    let mut scene = |c: &mut Clearing, on: i32, sh: [f32; 4]| {
+        let args = [
+            Value::I32(on),
+            Value::F32(sh[0]),
+            Value::F32(sh[1]),
+            Value::F32(sh[2]),
+            Value::F32(sh[3]),
+        ];
+        c.call("test_sky", &args);
+        c.steps(16);
+        c.scene()
+    };
+    let one = (1.0 / Y0) as f32;
+    let half = (0.5 / Y1) as f32;
+    let lit = scene(&mut c, 0, [0.0; 4]);
+    let dark = scene(&mut c, 1, [0.0; 4]);
+    let white = scene(&mut c, 1, [one, 0.0, 0.0, 0.0]);
+    let axes = [
+        scene(&mut c, 1, [one, half, 0.0, 0.0]),
+        scene(&mut c, 1, [one, 0.0, half, 0.0]),
+        scene(&mut c, 1, [one, 0.0, 0.0, half]),
+    ];
+    c.call(
+        "test_sky",
+        &[Value::I32(0), Value::F32(0.0), Value::F32(0.0), Value::F32(0.0), Value::F32(0.0)],
+    );
+    // The reference at every 4th pixel, in chunks (each a short submission).
+    let cam = c.camera();
+    let step = 4u32;
+    let w = cam.screen[0] as usize;
+    let cols = cam.screen[0] as u32 / step;
+    let total = cols * (cam.screen[1] as u32 / step);
+    let chunk = 512;
+    let mut points = Vec::new();
+    let mut first = 0;
+    while first < total {
+        let count = chunk.min(total - first);
+        c.call(
+            "test_reference",
+            &[
+                Value::I32(first as i32),
+                Value::I32(count as i32),
+                Value::I32(step as i32),
+                Value::I32(1024),
+            ],
+        );
+        let newest = *c.host.buffers().last().expect("a buffer");
+        let r = f32s(&c.host.read_buffer(newest).expect("read"));
+        for (k, p) in r.chunks(28).enumerate() {
+            let at = first + k as u32;
+            let (x, y) = ((at % cols) * step + step / 2, (at / cols) * step + step / 2);
+            if p[24] > 0.5 {
+                let sh = |o: usize| {
+                    [0, 1, 2].map(|ch| [0, 1, 2, 3].map(|i| f64::from(p[o + 4 * ch + i])))
+                };
+                points.push((
+                    y as usize * w + x as usize,
+                    sh(0),
+                    sh(12),
+                    (p[24] - 1.0).round() as u32,
+                    p[25],
+                ));
+            }
+        }
+        first += count;
+    }
+    // A pixel lit by `sh` (each channel's four coefficients, convolved), as `probe_light`
+    // lights it: its normal, from how it answers to each axis (`O − U = A n / 2`, `U − B = A`, by
+    // its strongest channel), then each channel's light (over π, none below 0) times its answer.
+    let light = |i: usize, sh: &[[f64; 4]; 3]| -> Option<[f32; 3]> {
+        let a = [0, 1, 2].map(|ch| f64::from(white[i][ch]) - f64::from(dark[i][ch]));
+        let ch = (0..3).max_by(|&x, &y| a[x].total_cmp(&a[y]))?;
+        if a[ch] < 1e-3 {
+            return None;
+        }
+        let n = [0, 1, 2]
+            .map(|axis| 2.0 * (f64::from(axes[axis][i][ch]) - f64::from(white[i][ch])) / a[ch]);
+        Some([0, 1, 2].map(|ch| {
+            let s = sh[ch][0] * Y0 + Y1 * (sh[ch][1] * n[0] + sh[ch][2] * n[1] + sh[ch][3] * n[2]);
+            (f64::from(dark[i][ch]) + a[ch] * (s / std::f64::consts::PI).max(0.0)) as f32
+        }))
+    };
+    let mut show = |rgb: [f32; 3]| {
+        let args = rgb.map(Value::F32);
+        c.call("test_display", &args).iter().map(|x| x * 255.0).collect::<Vec<f64>>()
+    };
+    let (mut sum, mut over, mut n, mut unlike) = (0.0, 0usize, 0usize, 0usize);
+    let mut classes: BTreeMap<u32, (f64, f64, usize)> = BTreeMap::new();
+    let mut nonlinear: BTreeMap<u32, usize> = BTreeMap::new();
+    for (i, probes, traced, k, _) in &points {
+        if *k == CREATURE {
+            continue;
+        }
+        let (Some(a), Some(b)) = (light(*i, probes), light(*i, traced)) else { continue };
+        // The pixel answers linearly: the probes' light rebuilt is the frame as drawn (within a
+        // grass blade's light, which its blade holds to 8 bits).
+        let drawn = show([lit[*i][0], lit[*i][1], lit[*i][2]]);
+        let (a, b) = (show(a), show(b));
+        if a.iter().zip(&drawn).any(|(x, y)| (x - y).abs() > 2.5) {
+            unlike += 1;
+            *nonlinear.entry(*k).or_default() += 1;
+            continue;
+        }
+        let d: Vec<f64> = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).collect();
+        let mean = d.iter().sum::<f64>() / 3.0;
+        sum += mean;
+        n += 1;
+        if d.iter().any(|x| *x > 8.0) {
+            over += 1;
+        }
+        let e = classes.entry(*k).or_default();
+        e.0 += mean;
+        e.1 += (a.iter().sum::<f64>() - b.iter().sum::<f64>()) / 3.0;
+        e.2 += 1;
+    }
+    for (k, (abs, signed, m)) in &classes {
+        let m = *m as f64;
+        println!(
+            "  class {k}: {m} pixels, mean {:.2}/255, probes minus reference {:+.2}/255",
+            abs / m,
+            signed / m
+        );
+    }
+    println!("  not linear, by class: {nonlinear:?}");
+    let (mean, share) = (sum / n.max(1) as f64, over as f64 / n.max(1) as f64);
+    println!(
+        "probes against the reference at {n} pixels ({unlike} not linear in the sky light): mean {mean:.2}/255, {:.2}% over 8/255",
+        share * 100.0
+    );
+    assert!(
+        unlike * 50 < points.len(),
+        "{unlike} of {} pixels don't answer linearly",
+        points.len()
+    );
+    assert!(n > 10000, "only {n} pixels");
+    assert!(mean <= 4.0, "the probes are {mean}/255 from the reference on average");
+    assert!(share <= 0.02, "{:.2}% of pixels are over 8/255 from the reference", share * 100.0);
+}
+
+// ---- the sky (AC6) ---------------------------------------------------------------------------
+
+/// AC6: the clouds and the probes are cooked at load in strips, so no submission runs long:
+/// every frame until the clearing's ready takes under 100 ms of GPU time (its span, in the
+/// native host and in Chrome), and the clouds' strips each well under it.
+#[test]
+#[ignore = "needs Chrome, python3 and a GPU"]
+fn loading_never_submits_more_than_100_ms() {
+    let mut c =
+        Clearing::load_with("clearing-load", &Options { timestamps: true, ..Options::default() });
+    c.until_ready(0);
+    let ready = c.frame;
+    let timings = c.host.take_timings().expect("timings");
+    let spans = wrela_host::frame_spans(&timings);
+    let longest = spans.iter().map(|s| s.1).fold(0.0, f64::max);
+    let strips = timings
+        .iter()
+        .filter(|t| t.label == "clouds cook")
+        .map(|t| t.nanos / 1e6)
+        .fold(0.0, f64::max);
+    println!(
+        "native: {ready} frames to ready, the longest frame {longest:.1} ms, the longest strip {strips:.1} ms"
+    );
+    assert!(longest < 100.0, "a loading frame took {longest} ms of GPU time");
+    let (_, rel) = built("clearing-load-chrome");
+    let run = wrela_tests::ChromeRun {
+        timestamps: true,
+        ..wrela_tests::ChromeRun::new(ready + 5, W, H, 60.0)
+    };
+    let r = wrela_tests::run_in_chrome_with(&rel, run);
+    let longest = r.spans.iter().map(|s| s.1).fold(0.0, f64::max);
+    println!("Chrome: the longest of {} frames {longest:.1} ms", r.spans.len());
+    assert!(longest < 100.0, "a loading frame took {longest} ms of GPU time in Chrome");
+}
+
+/// AC6: the clouds' shadows fall on the valley from the cooked map: the start's frame with the
+/// map and with it all lit (the same jitter, the wind still): over 3% of the valley's ground
+/// (beyond 150 m) is darker by over 15% with it (the cumulus over it, as the sun casts them).
+#[test]
+#[ignore = "needs a GPU"]
+fn the_clouds_shadows_fall_on_the_valley() {
+    let mut c = Clearing::load("clearing-cloud-shadows");
+    c.until_ready(0);
+    c.off(off::WIND);
+    c.steps(16 - c.frame % 16);
+    let (a, depth, cam) = shot_scene(&mut c);
+    c.off(off::WIND | off::CLOUD_SHADOWS);
+    c.steps(16);
+    let (b, _, _) = shot_scene(&mut c);
+    let dark = darkened(&a, &b, &depth, &cam, &[GROUND]);
+    let far = |p: &[f64; 3]| len(sub(*p, cam.eye)) > 150.0;
+    let valley_dark = dark.iter().filter(|d| far(&d.1)).count();
+    let w = cam.screen[0] as usize;
+    let valley = (0..a.len())
+        .filter(|&i| class(a[i][3]) == GROUND && depth[i] > 0.0)
+        .filter(|&i| {
+            far(&cam.world_at([(i % w) as f64 + 0.5, (i / w) as f64 + 0.5], f64::from(depth[i])))
+        })
+        .count();
+    let share = valley_dark as f64 / valley.max(1) as f64;
+    println!("the clouds shadow {valley_dark} of {valley} valley pixels ({:.1}%)", share * 100.0);
+    assert!(valley > 5000, "the shot shows {valley} pixels of the valley");
+    assert!(share > 0.03, "the clouds shadow {:.1}% of the valley", share * 100.0);
+}
+
+// ---- temporal AA, upscaling and the look (AC7, AC1) -------------------------------------------
+
+/// The start's frame settled (64 frames, the wind still), at scale `scale` (2: from 960×540).
+fn settled_start(name: &str, scale: i32, view: i32) -> (Vec<u8>, Vec<[f32; 4]>) {
+    let mut c = Clearing::load(name);
+    c.call("test_scale", &[Value::I32(scale)]);
+    c.view(view);
+    c.until_ready(0);
+    c.off(off::WIND);
+    c.steps(64);
+    let out = c.output();
+    (c.screen(), out)
+}
+
+/// AC7: the start's frame upscaled from 960×540 against the same frame drawn at 1920×1080, each
+/// settled: within a mean of 3/255 (the look's frames, and temporal AA's output alone).
+#[test]
+#[ignore = "needs a GPU"]
+fn the_upscaled_frame_matches_the_native_one() {
+    let mut means = Vec::new();
+    for (view, what) in [(VIEW_LOOK, "the look"), (VIEW_TEMPORAL, "temporal AA's output")] {
+        let (half, tags) = settled_start("clearing-upscaled", 2, view);
+        let (native, _) = settled_start("clearing-native", 1, view);
+        let (mean, over, _) = compare(&half, &native, 0..(W * H) as usize);
+        for k in 0..8 {
+            let (m, o, n) =
+                compare(&half, &native, (0..(W * H) as usize).filter(|&i| class(tags[i][3]) == k));
+            if n > 0 {
+                println!("  class {k}: {n} pixels, mean {m:.2}/255, {:.1}% over 8/255", o * 100.0);
+            }
+        }
+        println!(
+            "{what}: upscaled against native, mean {mean:.2}/255, {:.1}% over 8/255",
+            over * 100.0
+        );
+        let dir = repo_root().join("target/tmp");
+        wrela_host::image::write_png(
+            &dir.join(format!("clearing-upscaled-{view}.png")),
+            W,
+            H,
+            &half,
+        )
+        .expect("write");
+        wrela_host::image::write_png(
+            &dir.join(format!("clearing-native-{view}.png")),
+            W,
+            H,
+            &native,
+        )
+        .expect("write");
+        let diff: Vec<u8> = half
+            .chunks(4)
+            .zip(native.chunks(4))
+            .flat_map(|(a, b)| {
+                let d = |c: usize| (u32::from(a[c].abs_diff(b[c])) * 8).min(255) as u8;
+                [d(0), d(1), d(2), 255]
+            })
+            .collect();
+        wrela_host::image::write_png(
+            &dir.join(format!("clearing-upscaled-diff-{view}.png")),
+            W,
+            H,
+            &diff,
+        )
+        .expect("write");
+        means.push((what, mean));
+    }
+    for (what, mean) in means {
+        assert!(mean <= 3.0, "{what}: the upscaled frame is {mean}/255 from the native one");
+    }
+}
+
+/// Frame `b` warped into frame `a` (spike 12's flicker measure): each output pixel of `b`, at
+/// its depth (the scene's sample nearest it), seen by `a`'s camera, against `a` there; pixels
+/// of the sky, of the creature, or disoccluded (its depth in `a` not within 1%) are left out.
+/// The mean warp error (/255), the share over 8/255, the pixels compared, and the mean motion
+/// (output pixels).
+fn warp_error(
+    a: (&[u8], &[f32], &Cam, &[[f32; 4]]),
+    b: (&[u8], &[f32], &Cam, &[[f32; 4]]),
+) -> (f64, f64, usize, f64) {
+    let (sa, da, ca, ta) = a;
+    let (sb, db, cb, tb) = b;
+    let (sw, sh) = (cb.screen[0] as usize, cb.screen[1] as usize);
+    let scale = W as f64 / cb.screen[0];
+    let unjittered = |c: &Cam| Cam { jitter: [0.0, 0.0], ..*c };
+    let (ua, ub) = (unjittered(ca), unjittered(cb));
+    let (mut sum, mut over, mut n, mut motion) = (0.0, 0usize, 0usize, 0.0);
+    for y in (0..H as usize).step_by(2) {
+        for x in (0..W as usize).step_by(2) {
+            let o = y * W as usize + x;
+            if class(tb[o][3]) == CREATURE || class(tb[o][3]) == SKY {
+                continue;
+            }
+            // The output pixel's point in b: its unjittered ray at the nearest sample's depth.
+            let (qx, qy) =
+                (((x as f64 + 0.5) / scale) as usize, ((y as f64 + 0.5) / scale) as usize);
+            let z = f64::from(db[qy.min(sh - 1) * sw + qx.min(sw - 1)]);
+            if z <= 0.0 {
+                continue;
+            }
+            let p = ub.world_at([(x as f64 + 0.5) / scale, (y as f64 + 0.5) / scale], z);
+            let Some((pa, za)) = ua.project(p, [f64::from(W), f64::from(H)]) else { continue };
+            let (ax, ay) = (pa[0].floor(), pa[1].floor());
+            if ax < 0.0 || ay < 0.0 || ax >= f64::from(W) || ay >= f64::from(H) {
+                continue;
+            }
+            let ia = ay as usize * W as usize + ax as usize;
+            if class(ta[ia][3]) == CREATURE || class(ta[ia][3]) == SKY {
+                continue;
+            }
+            let (sx, sy) = ((pa[0] / scale) as usize, (pa[1] / scale) as usize);
+            let zs = f64::from(da[sy.min(sh - 1) * sw + sx.min(sw - 1)]);
+            if (zs - za).abs() > za * 0.01 {
+                continue;
+            }
+            let mut most = 0.0f64;
+            let mut d3 = 0.0;
+            for ch in 0..3 {
+                let d = f64::from(sa[4 * ia + ch]).sub_abs(f64::from(sb[4 * o + ch]));
+                d3 += d;
+                most = most.max(d);
+            }
+            sum += d3 / 3.0;
+            if most > 8.0 {
+                over += 1;
+            }
+            n += 1;
+            motion += ((pa[0] - x as f64 - 0.5).powi(2) + (pa[1] - y as f64 - 0.5).powi(2)).sqrt();
+        }
+    }
+    let nf = n.max(1) as f64;
+    (sum / nf, over as f64 / nf, n, motion / nf)
+}
+
+trait SubAbs {
+    fn sub_abs(self, other: f64) -> f64;
+}
+
+impl SubAbs for f64 {
+    fn sub_abs(self, other: f64) -> f64 {
+        (self - other).abs()
+    }
+}
+
+/// AC7's flicker: over the camera path's first 10 s (the wind still), each frame warped into
+/// the one before it: the look's mean warp error at most 0.8/255, and no more than 2% of the
+/// pixels over 8/255 (spike 12's realistic baseline, with no temporal AA: 0.31/255 and 0.9%).
+#[test]
+#[ignore = "long: the camera's path, needs a GPU"]
+fn the_look_doesnt_flicker() {
+    let mut c = Clearing::load("clearing-flicker");
+    c.until_ready(16);
+    c.off(off::WIND);
+    c.walk();
+    c.step();
+    let grab = |c: &mut Clearing| {
+        let cam = c.camera();
+        let depth = c.depth();
+        let out = c.output();
+        (c.screen(), depth, cam, out)
+    };
+    let mut last = grab(&mut c);
+    let (mut sum, mut over, mut motion, mut pairs) = (0.0, 0.0, 0.0, 0usize);
+    let mut worst = (0.0f64, 0.0f64, 0.0f64);
+    while c.path_time() < 10.0 {
+        c.step();
+        let now = grab(&mut c);
+        let (m, o, n, mv) =
+            warp_error((&last.0, &last.1, &last.2, &last.3), (&now.0, &now.1, &now.2, &now.3));
+        if n > 10000 {
+            sum += m;
+            over += o;
+            motion += mv;
+            pairs += 1;
+            if m > worst.0 {
+                worst = (m, o, c.path_time());
+            }
+        }
+        last = now;
+    }
+    let p = pairs.max(1) as f64;
+    let (mean, share) = (sum / p, over / p);
+    println!(
+        "flicker over {pairs} frames: mean warp error {mean:.3}/255, {:.2}% over 8/255, at {:.2} px a frame; worst {:.3}/255 at {:.2} s",
+        share * 100.0,
+        motion / p,
+        worst.0,
+        worst.2
+    );
+    assert!(pairs > 500, "only {pairs} frames compared");
+    assert!(mean <= 0.8, "the look's warp error is {mean}/255");
+    assert!(share <= 0.02, "{:.2}% of pixels flicker over 8/255", share * 100.0);
+}
+
+/// AC7's motion: the creature's pixels are reprojected by its motion target, the rest by depth
+/// and the camera: as it walks, the motion target marks exactly the pixels that show it.
+#[test]
+#[ignore = "needs a GPU"]
+fn the_motion_target_marks_the_creature() {
+    let mut c = Clearing::load("clearing-motion");
+    c.until_ready(0);
+    c.walk();
+    c.steps(90);
+    for _ in 0..3 {
+        c.steps(20);
+        let scene = c.scene();
+        let motion = c.motion();
+        let (mut creature, mut missed, mut stray, mut moving) = (0, 0, 0, 0);
+        for (s, m) in scene.iter().zip(&motion) {
+            let is = class(s[3]) == CREATURE;
+            let marked = m[2] > 0.5;
+            creature += usize::from(is);
+            missed += usize::from(is && !marked);
+            stray += usize::from(!is && marked);
+            moving += usize::from(marked && (m[0] != 0.0 || m[1] != 0.0));
+        }
+        println!(
+            "{creature} creature pixels: {missed} unmarked, {stray} marked elsewhere, {moving} moving"
+        );
+        assert!(creature > 500, "the creature shows {creature} pixels");
+        assert!(missed * 200 <= creature, "{missed} of {creature} creature pixels have no motion");
+        assert!(stray * 200 <= creature, "{stray} pixels not of the creature are marked moving");
+        assert!(moving * 2 >= creature, "the walking creature's motion is zero at most pixels");
+    }
+}
+
+/// AC7's ghosting: no trail behind the walking creature longer than 4 px at 1080p. The same
+/// frames drawn twice, temporal AA's history on in both: with the creature, and without it (the
+/// ground it walks over as it is). A pixel the creature covered in the last 8 frames and
+/// doesn't now (its tags), whose colour is the creature's with it (its chromaticity within 0.04
+/// of the creature's mean, its brightness alike) and not without it, is its trail; the farthest
+/// such pixel from the creature's outline is the trail's length.
+#[test]
+#[ignore = "needs a GPU"]
+fn the_walking_creature_leaves_no_trail() {
+    let frames = [150u32, 200, 250, 300, 350];
+    let run = |name: &str, creature: bool| {
+        let mut c = Clearing::load(name);
+        c.view(VIEW_TEMPORAL);
+        c.until_ready(0);
+        c.off(off::WIND | if creature { 0 } else { off::CREATURE });
+        let from = c.frame;
+        c.walk();
+        let mut out = Vec::new();
+        for &f in &frames {
+            let mut recent = vec![false; (W * H) as usize];
+            while c.frame < from + f {
+                c.step();
+                if c.frame + 8 >= from + f && c.frame < from + f && creature {
+                    for (i, t) in c.output().iter().enumerate() {
+                        recent[i] |= class(t[3]) == CREATURE;
+                    }
+                }
+            }
+            let o = c.output();
+            out.push((c.screen(), o, recent));
+        }
+        out
+    };
+    let with = run("clearing-ghost-a", true);
+    let without = run("clearing-ghost-b", false);
+    let mut longest = 0.0f64;
+    for (k, ((a, tags, recent), (b, _, _))) in with.iter().zip(&without).enumerate() {
+        let is = |i: usize| class(tags[i][3]) == CREATURE;
+        let outline: Vec<(f64, f64)> = (0..tags.len())
+            .filter(|&i| is(i))
+            .map(|i| ((i % W as usize) as f64, (i / W as usize) as f64))
+            .collect();
+        assert!(outline.len() > 1000, "frame {k}: the creature shows {} pixels", outline.len());
+        let n = outline.len() as f64;
+        // The creature's colour: its pixels' mean chromaticity and brightness.
+        let chroma = |c: [f64; 3]| {
+            let sum = (c[0] + c[1] + c[2]).max(1.0);
+            ([c[0] / sum, c[1] / sum], sum)
+        };
+        let (mut mc, mut ml) = ([0.0f64; 2], 0.0f64);
+        for i in (0..tags.len()).filter(|&i| is(i)) {
+            let (ch, l) = chroma([0, 1, 2].map(|c| f64::from(a[4 * i + c])));
+            mc = [mc[0] + ch[0] / n, mc[1] + ch[1] / n];
+            ml += l / n;
+        }
+        let like = |c: [f64; 3]| {
+            let (ch, l) = chroma(c);
+            ((ch[0] - mc[0]).powi(2) + (ch[1] - mc[1]).powi(2)).sqrt() < 0.04
+                && l > ml * 0.4
+                && l < ml * 2.5
+        };
+        let (mut trail, mut at, mut left) = (0.0f64, (0usize, 0usize), 0usize);
+        for i in (0..tags.len()).filter(|&i| recent[i] && !is(i)) {
+            left += 1;
+            let ca = [0, 1, 2].map(|ch| f64::from(a[4 * i + ch]));
+            let cb = [0, 1, 2].map(|ch| f64::from(b[4 * i + ch]));
+            if like(ca) && !like(cb) {
+                let (x, y) = ((i % W as usize) as f64, (i / W as usize) as f64);
+                let d = outline
+                    .iter()
+                    .map(|p| ((p.0 - x).powi(2) + (p.1 - y).powi(2)).sqrt())
+                    .fold(f64::MAX, f64::min);
+                if d > trail {
+                    trail = d;
+                    at = (x as usize, y as usize);
+                }
+            }
+        }
+        println!(
+            "frame {k}: of {left} pixels the creature left, its trail reaches {trail:.1} px (at {at:?})"
+        );
+        assert!(left > 100, "frame {k}: the creature left only {left} pixels: is it walking?");
+        longest = longest.max(trail);
+    }
+    assert!(longest <= 4.0, "the walking creature leaves a trail {longest} px long");
+}
+
+/// AC1's still, reported (not gated): the start's frame, settled, against spike 15's C still
+/// (`examples/clearing/stills/c-gouache-and-light.png` at `cfc521a`), the creature's pixels
+/// (and 24 px round them) left out; both, and their difference, are written to target/tmp.
+#[test]
+#[ignore = "needs git and a GPU"]
+fn the_start_against_spike_15s_still() {
+    let out = std::process::Command::new("git")
+        .args(["show", "cfc521a:examples/clearing/stills/c-gouache-and-light.png"])
+        .current_dir(repo_root())
+        .output()
+        .expect("git");
+    assert!(out.status.success(), "spike 15's still isn't in this repository's history");
+    let dir = repo_root().join("target/tmp");
+    std::fs::create_dir_all(&dir).expect("target/tmp");
+    let theirs_path = dir.join("clearing-spike-15-c.png");
+    std::fs::write(&theirs_path, &out.stdout).expect("write");
+    let (tw, th, theirs) = wrela_host::image::read_png(&theirs_path).expect("read the still");
+    assert_eq!((tw, th), (W, H));
+    let (ours, output) = settled_start("clearing-still", 2, VIEW_LOOK);
+    wrela_host::image::write_png(&dir.join("clearing-m5-start.png"), W, H, &ours).expect("write");
+    let creature: Vec<usize> =
+        (0..output.len()).filter(|&i| class(output[i][3]) == CREATURE).collect();
+    let mut apart = vec![false; output.len()];
+    for &i in &creature {
+        let (x, y) = ((i % W as usize) as i64, (i / W as usize) as i64);
+        for dy in -24..=24i64 {
+            for dx in -24..=24i64 {
+                let (px, py) = (x + dx, y + dy);
+                if px >= 0 && py >= 0 && px < W as i64 && py < H as i64 {
+                    apart[py as usize * W as usize + px as usize] = true;
+                }
+            }
+        }
+    }
+    let (mean, over, n) = compare(&ours, &theirs, (0..output.len()).filter(|&i| !apart[i]));
+    let diff: Vec<u8> = ours
+        .chunks(4)
+        .zip(theirs.chunks(4))
+        .flat_map(|(a, b)| {
+            let d = |c: usize| (a[c].abs_diff(b[c]) as u32 * 4).min(255) as u8;
+            [d(0), d(1), d(2), 255]
+        })
+        .collect();
+    wrela_host::image::write_png(&dir.join("clearing-m5-start-diff.png"), W, H, &diff)
+        .expect("write");
+    println!(
+        "the start against spike 15's C still: mean {mean:.1}/255, {:.1}% of {n} pixels over 8/255 (the creature's {} pixels and 24 px round them left out)",
+        over * 100.0,
+        creature.len()
+    );
 }

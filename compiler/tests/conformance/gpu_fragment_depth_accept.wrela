@@ -1,0 +1,36 @@
+// accepts: gpu.entry
+// A fragment shader may give its fragment's depth: it returns a `WithDepth`, its colour and
+// its depth (drawn in a pass with a depth target).
+use std::gpu::{
+    ClipPosition, DepthTexture, FragCoord, VertexIndex, WithDepth, begin_screen_pass_with_depth,
+    depth_texture, draw,
+}
+
+@vertex
+fn cover(v: VertexIndex) -> ClipPosition {
+    let x = f32((v.index << 1) & 2) * 2.0 - 1.0
+    let y = f32(v.index & 2) * 2.0 - 1.0
+    ClipPosition { position: vec4(x, y, 0.5, 1.0) }
+}
+
+@fragment
+fn sloped(p: FragCoord) -> WithDepth {
+    if p.position.x < 8.0 {
+        return WithDepth { color: vec4(1.0), depth: 0.0 }
+    }
+    WithDepth { color: vec4(0.5), depth: fract(p.position.x / 64.0) }
+}
+
+pub struct S {
+    depth: DepthTexture,
+}
+
+pub fn init() -> S {
+    S { depth: depth_texture(width: 64, height: 64) }
+}
+
+pub fn frame(s: mut S, time: f32, width: u32, height: u32) {
+    let pass = begin_screen_pass_with_depth(mut s.depth, clear: vec4(0.0))
+    draw(cover, sloped, vertices: 3)
+    pass.present()
+}

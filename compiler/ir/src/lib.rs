@@ -653,9 +653,11 @@ pub enum Stage {
         varyings: Vec<Varying>,
     },
     /// Takes the vertex's output (if it reads it) as its last argument: its type, and its
-    /// members. Returns a vec4 colour.
+    /// members. Returns a vec4 colour, or (`depth`) a struct of a vec4 colour and an f32 depth
+    /// (`@builtin(frag_depth)`).
     Fragment {
         varyings: Option<(TypeId, Vec<Varying>)>,
+        depth: bool,
     },
 }
 

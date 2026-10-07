@@ -415,6 +415,7 @@ impl<'m> Cx<'m> {
             locals: Vec::new(),
             entry,
             io: None,
+            frag_out: None,
             param_base: 0,
             inputs: Vec::new(),
             consts: HashSet::new(),
@@ -467,6 +468,8 @@ struct Fb<'a, 'm> {
     entry: Option<&'m ir::EntryPoint>,
     /// The vertex output (fragment input) struct, its members, and the IR type they're parts of.
     io: Option<(Handle<Type>, &'m [ir::Varying], ir::TypeId)>,
+    /// A fragment shader's output struct, when it writes its depth: its colour and its depth.
+    frag_out: Option<Handle<Type>>,
     /// Where the IR's parameters start among the naga arguments: after the builtin inputs.
     param_base: u32,
     /// For each builtin input, its naga argument; `None` for a fragment's position when it
@@ -553,7 +556,7 @@ impl<'a, 'm> Fb<'a, 'm> {
                 self.func.result = Some(FunctionResult { ty: io, binding: None });
                 self.io = Some((io, varyings, rt));
             }
-            ir::Stage::Fragment { varyings } => {
+            ir::Stage::Fragment { varyings, depth } => {
                 if let Some((vt, map)) = varyings {
                     let io = self.cx.io_struct(*vt, map)?;
                     self.func.arguments.push(FunctionArgument {
@@ -564,16 +567,42 @@ impl<'a, 'm> Fb<'a, 'm> {
                     self.io = Some((io, map, *vt));
                 }
                 let v4 = self.cx.ty_vec4();
-                self.func.result = Some(FunctionResult {
-                    ty: v4,
-                    binding: Some(Binding::Location {
-                        location: 0,
-                        interpolation: None,
-                        sampling: None,
-                        blend_src: None,
-                        per_primitive: false,
-                    }),
-                });
+                let colour = Binding::Location {
+                    location: 0,
+                    interpolation: None,
+                    sampling: None,
+                    blend_src: None,
+                    per_primitive: false,
+                };
+                if *depth {
+                    // A `WithDepth`: its colour, and its depth as the fragment's.
+                    let f = self.cx.ty_inner(TypeInner::Scalar(Scalar::F32));
+                    let members = vec![
+                        StructMember {
+                            name: Some("color".into()),
+                            ty: v4,
+                            binding: Some(colour),
+                            offset: 0,
+                        },
+                        StructMember {
+                            name: Some("depth".into()),
+                            ty: f,
+                            binding: Some(Binding::BuiltIn(BuiltIn::FragDepth)),
+                            offset: 16,
+                        },
+                    ];
+                    let out = self.cx.out.types.insert(
+                        Type {
+                            name: Some(format!("{}_out", e.name)),
+                            inner: TypeInner::Struct { members, span: 32 },
+                        },
+                        Span::UNDEFINED,
+                    );
+                    self.frag_out = Some(out);
+                    self.func.result = Some(FunctionResult { ty: out, binding: None });
+                } else {
+                    self.func.result = Some(FunctionResult { ty: v4, binding: Some(colour) });
+                }
             }
         }
         Ok(())
@@ -829,8 +858,15 @@ impl<'a, 'm> Fb<'a, 'm> {
         out.push(Statement::Return { value }, Span::UNDEFINED);
     }
 
-    /// A vertex shader's return value, rebuilt as the output struct.
+    /// A vertex shader's return value, rebuilt as the output struct; or a fragment shader's
+    /// `WithDepth`, as its output struct.
     fn output(&mut self, h: Handle<Expression>, out: &mut Block) -> R<Handle<Expression>> {
+        if let Some(ty) = self.frag_out {
+            let components = (0..2)
+                .map(|index| self.expr(Expression::AccessIndex { base: h, index }, out))
+                .collect();
+            return Ok(self.expr(Expression::Compose { ty, components }, out));
+        }
         let Some((io, map, _)) = self.io else { return Ok(h) };
         let Some(ir::EntryPoint { stage: ir::Stage::Vertex { .. }, .. }) = self.entry else {
             return Ok(h);

@@ -66,6 +66,7 @@ test("parses the Rust crate's golden manifest", () => {
         cull: "none",
         depth_bias: { constant: 0, slope_scale: 0, clamp: 0 },
         depth: { compare: "less", write: true },
+        writes_depth: false,
         uniform: null,
         bindings: [
           { binding: 0, kind: "texture" },

@@ -1,4 +1,4 @@
-//! # The manifest, version 5
+//! # The manifest, version 6
 //!
 //! `manifest.json` describes everything game-specific a host needs besides the WASM: each
 //! pipeline's shader, entry points and bindings (D-099). The runtime reads it at load; nothing
@@ -25,7 +25,10 @@
 //!   `"write"`, whether it replaces it (`true` by default). Hosts make one pipeline per combination of target formats a
 //!   pipeline is drawn with. A render pipeline with `"blend": true` draws its colour over what's
 //!   in the target (alpha blending, straight alpha: `src × src.a + dst × (1 − src.a)` for the
-//!   colour, `src.a + dst.a × (1 − src.a)` for alpha); without it, its colour replaces it.
+//!   colour, `src.a + dst.a × (1 − src.a)` for alpha); without it, its colour replaces it. One
+//!   with `"writes_depth": true` gives each fragment its own depth (WGSL's `frag_depth`), so it
+//!   is drawn only in a pass with a depth target: hosts make no variant of it without one, and
+//!   refuse a draw of it in a pass without one.
 //! - A render pipeline's `"cull"` drops triangles by facing (`"none"`, the default, `"front"`
 //!   or `"back"`; a triangle whose vertices run counter-clockwise on the target faces the
 //!   front). Its `"depth_bias"` moves each fragment's depth by `constant` steps of the depth
@@ -39,7 +42,7 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 use std::fmt;
 
-pub const VERSION: u32 = 5;
+pub const VERSION: u32 = 6;
 /// The screen's texture format, in WebGPU's spelling.
 pub const SCREEN_FORMAT: &str = "rgba8unorm";
 /// WebGPU's default limits that the manifest is checked against ([`Limits::DEFAULT`]).
@@ -101,6 +104,9 @@ pub enum Stage {
         depth_bias: DepthBias,
         #[serde(skip_serializing_if = "DepthState::is_default")]
         depth: DepthState,
+        /// Gives each fragment its own depth: drawn only in a pass with a depth target.
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        writes_depth: bool,
     },
 }
 
@@ -587,6 +593,11 @@ mod read {
                         }
                     }
                 },
+                // A missing `writes_depth` is false.
+                writes_depth: match o.get("writes_depth").unwrap_or(&Value::Bool(false)) {
+                    Value::Bool(b) => *b,
+                    _ => return fail(format!("{place}.writes_depth must be true or false")),
+                },
             },
         };
         // A missing `debug_flag` is read as null.
@@ -626,7 +637,7 @@ mod tests {
     fn golden_json() {
         let json = sample().to_json();
         let expected = r#"{
-  "manifest_version": 5,
+  "manifest_version": 6,
   "stream_version": 7,
   "wasm": "game.wasm",
   "pipelines": [

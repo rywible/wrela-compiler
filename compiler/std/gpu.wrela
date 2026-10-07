@@ -162,6 +162,15 @@ pub struct Over: Copy {
     pub color: vec4,
 }
 
+/// A fragment shader's colour and its own depth (from 0 to 1, as the clip position's z over its
+/// w), in place of the depth its triangle gives it: the depth test and the depth target take
+/// it. For a flat stand-in whose fragments show something at other depths (an impostor's
+/// leaves). The GPU's early depth test is off for a shader that returns one.
+pub struct WithDepth: Copy {
+    pub color: vec4,
+    pub depth: f32,
+}
+
 /// A vertex output that isn't interpolated.
 pub struct Flat<T>: Copy {
     pub value: T,

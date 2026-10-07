@@ -140,6 +140,8 @@ enum Kind {
         cull: Cull,
         depth_bias: DepthBias,
         depth: DepthState,
+        /// Each fragment gives its own depth: drawn only in a pass with a depth target.
+        writes_depth: bool,
         variants: HashMap<Targets, wgpu::RenderPipeline>,
     },
 }
@@ -521,7 +523,15 @@ impl Gpu {
                     cache: None,
                 },
             )),
-            Stage::Render { vertex_entry, fragment_entry, blend, cull, depth_bias, depth } => {
+            Stage::Render {
+                vertex_entry,
+                fragment_entry,
+                blend,
+                cull,
+                depth_bias,
+                depth,
+                writes_depth,
+            } => {
                 let mut kind = Kind::Render {
                     module,
                     pipeline_layout,
@@ -531,10 +541,13 @@ impl Gpu {
                     cull: *cull,
                     depth_bias: *depth_bias,
                     depth: *depth,
+                    writes_depth: *writes_depth,
                     variants: HashMap::new(),
                 };
-                // The screen's variant now, so a shader's errors come at load.
-                render_variant(&self.device, &p.name, &mut kind, (Some(SCREEN_FORMAT), None));
+                // The screen's variant now, so a shader's errors come at load (with a depth
+                // target, for one that writes its fragments' depth).
+                let depth = writes_depth.then_some(wgpu::TextureFormat::Depth32Float);
+                render_variant(&self.device, &p.name, &mut kind, (Some(SCREEN_FORMAT), depth));
                 kind
             }
         };
@@ -975,6 +988,14 @@ impl Gpu {
         // Every pipeline variant the pass needs, made before anything is recorded.
         for d in &open.draws {
             let Pipeline { name, kind, .. } = &mut self.pipelines[d.pipeline as usize];
+            if let Kind::Render { writes_depth: true, .. } = kind
+                && depth_format.is_none()
+            {
+                return Err(Error::Gpu(format!(
+                    "`{name}` gives its fragments their depth, so it's drawn in a pass with a \
+                     depth target, and this pass has none"
+                )));
+            }
             render_variant(&self.device, name, kind, targets);
         }
         // Everything that can flush happens before anything is recorded for this pass.
@@ -1304,6 +1325,7 @@ fn render_variant(device: &wgpu::Device, name: &str, kind: &mut Kind, targets: T
         depth_bias,
         depth,
         variants,
+        ..
     } = kind
     else {
         return;

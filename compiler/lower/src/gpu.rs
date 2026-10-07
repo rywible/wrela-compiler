@@ -74,6 +74,8 @@ pub struct PipelineOut {
     /// A render pipeline whose fragment shader returns `Over`: its colour is blended over the
     /// target's.
     pub blend: bool,
+    /// A render pipeline whose fragment shader gives its depth (`WithDepth`).
+    pub writes_depth: bool,
     /// The functions its module instantiates, with their type arguments (`wrela query`).
     pub instances: Vec<(FnId, Vec<TyId>)>,
 }
@@ -1658,6 +1660,7 @@ fn lower_compute(cx: &mut Cx, iface: Rc<Interface>) -> Option<PipelineOut> {
         sites: Vec::new(),
         debug_flag: None,
         blend: false,
+        writes_depth: false,
         instances,
     })
 }
@@ -1679,6 +1682,7 @@ fn lower_render(cx: &mut Cx, iface: Rc<Interface>) -> Option<PipelineOut> {
     }
     let fret_t = ret_type(cx, fragment.func, &fragment.substs);
     let blend = checked.program.lang_of_ty(fret_t) == Some(Lang::Over);
+    let writes_depth = checked.program.lang_of_ty(fret_t) == Some(Lang::WithDepth);
     let fret = cx.lower_ty(&mut mb, fret_t, fdef.sig_span);
     let takes_varyings =
         fragment.params.iter().any(|&(t, _)| t == vret) && !is_clip_position(cx, vret);
@@ -1707,7 +1711,10 @@ fn lower_render(cx: &mut Cx, iface: Rc<Interface>) -> Option<PipelineOut> {
     });
     mb.m.entry_points.push(ir::EntryPoint {
         name: ir::ident(&fdef.name),
-        stage: ir::Stage::Fragment { varyings: takes_varyings.then_some((vret_ir, varyings)) },
+        stage: ir::Stage::Fragment {
+            varyings: takes_varyings.then_some((vret_ir, varyings)),
+            depth: writes_depth,
+        },
         function: fentry,
         inputs: entry_inputs(fragment, false),
     });
@@ -1724,6 +1731,7 @@ fn lower_render(cx: &mut Cx, iface: Rc<Interface>) -> Option<PipelineOut> {
         sites: Vec::new(),
         debug_flag: None,
         blend,
+        writes_depth,
         instances,
     })
 }

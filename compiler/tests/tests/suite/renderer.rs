@@ -115,7 +115,8 @@ fn indexed_draws_cull_and_bias_in_both_hosts() {
 }
 
 /// A draw's depth test and depth writes (compiler/tests/depth-state, §10.2 of #28): eight cells,
-/// each a comparison with writes on or off. A cell's left half shows whether its quad passed
+/// each a comparison with writes on or off, and two whose fragments give their own depth
+/// (`WithDepth`), nearer and farther than their triangles'. A cell's left half shows whether its quad passed
 /// its test over the grey at depth 0.5, and its right half whether a white probe passed after
 /// it, so whether the quad wrote its depth. The native host draws what each case should, and
 /// Chrome draws the same frame with the same state hash.
@@ -143,11 +144,12 @@ fn each_depth_test_and_write_draws_the_same_in_both_hosts() {
         let want = DepthState { compare, write };
         assert!(states.contains(&want), "no pipeline has {want:?}: {states:?}");
     }
-    let (w, h) = (SIZE, SIZE / 2);
+    let (w, h) = (SIZE, SIZE * 3 / 4);
     let browser = run_in_chrome(&rel, 2, w, h, 60.0);
     let run = Host::load(&dir).expect("load").run_frames(&[0.0, 1.0 / 60.0], w, h).expect("run");
     let (grey, white) = ([128, 128, 128, 255], [255, 255, 255, 255]);
-    let cases: [(&str, [u8; 4], [u8; 4]); 8] = [
+    let orange = [255, 128, 0, 255];
+    let cases: [(&str, [u8; 4], [u8; 4]); 10] = [
         ("less, nearer, writing", [255, 0, 0, 255], [255, 0, 0, 255]),
         ("less-equal, as near", [0, 255, 0, 255], white),
         ("equal, as near, no writes", [0, 0, 255, 255], white),
@@ -156,6 +158,8 @@ fn each_depth_test_and_write_draws_the_same_in_both_hosts() {
         ("always, far, writing", [0, 255, 255, 255], white),
         ("less, farther", grey, white),
         ("equal, farther", grey, white),
+        ("drawn far, its fragments nearer", orange, orange),
+        ("drawn near, its fragments farther", grey, white),
     ];
     let px = |frame: &[u8], x: u32, y: u32| -> [u8; 4] {
         let i = (4 * (y * w + x)) as usize;

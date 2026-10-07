@@ -381,6 +381,7 @@ pub fn check_manifest() -> Manifest {
         cull: Cull::None,
         depth_bias: DepthBias::default(),
         depth: DepthState::default(),
+        writes_depth: false,
     };
     m.pipelines.push(shape("draw", render.clone()));
     let compute = Stage::Compute { entry: "main".into(), workgroup_size: [64, 1, 1] };
@@ -812,6 +813,7 @@ pub(crate) fn sample_manifest() -> Manifest {
             cull: Cull::None,
             depth_bias: DepthBias::default(),
             depth: DepthState::default(),
+            writes_depth: false,
         },
         uniform: None,
         bindings: vec![

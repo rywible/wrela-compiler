@@ -61,7 +61,7 @@ pub fn lay_out_gpu_memory(m: &mut Module) -> Result<()> {
         };
     }
     for e in &mut m.entry_points {
-        if let Stage::Fragment { varyings: Some((t, _)) } = &mut e.stage {
+        if let Stage::Fragment { varyings: Some((t, _)), .. } = &mut e.stage {
             *t = tm.stored(&mut m.types, *t);
         }
     }

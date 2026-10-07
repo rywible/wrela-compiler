@@ -57,6 +57,8 @@ interface RenderParts {
   depthBias: { constant: number; slope_scale: number; clamp: number };
   /** The manifest's `depth`: how fragments' depths are tested, and whether they're kept. */
   depth: { compare: GPUCompareFunction; write: boolean };
+  /** Its fragments give their own depth: drawn only in a pass with a depth target. */
+  writesDepth: boolean;
   /** By target formats: `colour|depth`, each a format or `none`. */
   variants: Map<string, GPURenderPipeline>;
 }
@@ -217,16 +219,18 @@ async function buildPipeline(device: GPUDevice, p: Pipeline, source: string): Pr
         cull: p.cull,
         depthBias: p.depth_bias,
         depth: p.depth,
+        writesDepth: p.writes_depth,
         variants: new Map(),
       };
       // The variants a pass is likeliest to draw it into, now and side by side: the screen, the
       // screen with a depth target, a depth pass alone. A shader's errors then come at load, and
       // no frame waits to compile these (a texture's other formats are made at a first draw).
+      // (One that gives its fragments their depth is drawn only with a depth target.)
       const targets: [GPUTextureFormat | null, GPUTextureFormat | null][] = [
         [SCREEN_FORMAT, null],
         [SCREEN_FORMAT, "depth32float"],
         [null, "depth32float"],
-      ];
+      ].filter(([, d]) => d !== null || !p.writes_depth) as [GPUTextureFormat | null, GPUTextureFormat | null][];
       const made = await Promise.all(
         targets.map(([c, d]) => device.createRenderPipelineAsync(renderDescriptor(p.name, render!, c, d))),
       );
@@ -875,6 +879,11 @@ export class GpuExecutor {
   #variant(index: number, color: GPUTextureFormat | null, depth: GPUTextureFormat | null): GPURenderPipeline {
     const p = this.#pipeline(index);
     if (p.render === null) throw new Error(`host bug: pipeline ${index} isn't a render pipeline`);
+    if (depth === null && p.render.writesDepth) {
+      throw new Error(
+        `\`${p.name}\` gives its fragments their depth, so it's drawn in a pass with a depth target, and this pass has none`,
+      );
+    }
     const key = targetsKey(color, depth);
     let v = p.render.variants.get(key);
     if (v === undefined) {

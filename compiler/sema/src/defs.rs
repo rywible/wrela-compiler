@@ -248,6 +248,7 @@ lang_items! {
     ClipPosition = "std::gpu::ClipPosition",
     Flat = "std::gpu::Flat",
     Over = "std::gpu::Over",
+    WithDepth = "std::gpu::WithDepth",
     Cull = "std::gpu::Cull",
     DepthBias = "std::gpu::DepthBias",
     Depth = "std::gpu::Depth",
