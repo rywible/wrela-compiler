@@ -273,13 +273,14 @@ async function run(canvas: OffscreenCanvas, device: GPUDevice, build: Build, liv
 
 // ---- Test mode ----
 
-/** Runs inside error scopes, so a GPU error fails the test at the frame that caused it. */
-async function scoped(device: GPUDevice, f: () => void): Promise<void> {
+/** Runs inside error scopes, so a GPU error fails the test at the frame that caused it (and an
+ * error `f` throws, or its promise rejects with, fails it too). */
+async function scoped(device: GPUDevice, f: () => void | Promise<void>): Promise<void> {
   const filters: GPUErrorFilter[] = ["validation", "out-of-memory", "internal"];
   for (const filter of filters) device.pushErrorScope(filter);
   let thrown: unknown = null;
   try {
-    f();
+    await f();
   } catch (e) {
     thrown = e;
   }

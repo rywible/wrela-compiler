@@ -544,7 +544,11 @@ export class GpuExecutor {
     if (this.#deferred === null) return;
     for (const d of this.#deferred.splice(0)) {
       if ("cmd" in d) {
-        this.#run(d.cmd);
+        try {
+          this.#run(d.cmd);
+        } catch (e) {
+          throw new Error(`serial mode, ${d.cmd.op}: ${errorMessage(e)}`);
+        }
         const op = d.cmd.op;
         if (op === "Dispatch" || op === "DispatchIndirect" || op === "EndPass" || op === "Present") {
           this.flush();

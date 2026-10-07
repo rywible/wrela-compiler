@@ -211,7 +211,7 @@ fn write_edit(pkg: &Path, edit: impl Fn(&str) -> String) -> std::time::Instant {
 /// build in without reloading, with its sim replayed: its printed sim matches the native host's
 /// unbroken run, frame by frame.
 #[test]
-#[ignore = "long: needs Chrome and a GPU"]
+#[ignore = "long: alone: it times edits by the wall clock, needs Chrome and a GPU"]
 fn wrela_run_reloads_the_page_in_place() {
     let pkg = edited("reload-chrome-src", |src| src.to_string() + "\n");
     let out = super::scratch("reload-chrome");
