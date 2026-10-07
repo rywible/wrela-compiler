@@ -105,7 +105,8 @@ fn ordinary_layouts_are_in_the_language() {
 }
 
 /// The formatter's layout is in the GBNF: grammar-generated programs (tier 0, with tuple
-/// indexes the GBNF can write: up to four decimal digits), formatted.
+/// indexes the GBNF can write: up to four decimal digits), formatted. Not those the formatter
+/// leaves partly as written: an f-string hole that holds a `match`.
 #[test]
 fn formatted_programs_are_in_the_language() {
     use wrela_grammar::generate::{Coverage, GenConfig, Generator};
@@ -140,7 +141,24 @@ fn formatted_programs_are_in_the_language() {
                         .1
                         .starts_with(['x', 'X', 'b', 'B', 'o', 'O'])
             };
-            if p.has_errors() || tokens.iter().any(odd_unit) || tokens.windows(2).any(odd_index) {
+            // A hole holding a `match` keeps its text as written: the formatter puts a match's
+            // arms on lines of their own, which a hole can't hold (L22), so its layout is the
+            // generator's, which the GBNF needn't accept.
+            let mut holes = 0;
+            let match_in_hole = tokens.iter().any(|t| {
+                match t.kind {
+                    T::FStringHead => holes += 1,
+                    T::FStringTail => holes -= 1,
+                    T::Match => return holes > 0,
+                    _ => {}
+                }
+                false
+            });
+            if p.has_errors()
+                || tokens.iter().any(odd_unit)
+                || tokens.windows(2).any(odd_index)
+                || match_in_hole
+            {
                 continue;
             }
             let out = wrela_syntax::fmt::format(&p, &src);
