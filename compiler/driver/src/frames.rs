@@ -11,7 +11,7 @@
 //! get, and whose state hashes each tick's must be.
 
 use crate::build;
-use crate::consts::{Fault, Item, TEST_FUEL, failure};
+use crate::consts::{Fault, Item, failure};
 use std::path::{Path, PathBuf};
 use wrela_diag::{Diagnostic, SourceMap, codes, has_errors};
 use wrela_lower::BuildData;
@@ -31,6 +31,7 @@ pub fn run(
     data: &BuildData,
     tests: &[FnId],
     root: &Path,
+    fuel: u64,
 ) -> (Vec<(FnId, Option<Diagnostic>)>, Vec<Diagnostic>) {
     let mut roots = wrela_lower::Roots::of(checked);
     roots.tests = tests.to_vec();
@@ -50,7 +51,7 @@ pub fn run(
             return (Vec::new(), diags);
         }
     }
-    let built = match wrela_host::CpuBuild::load_metered(&dir.0, TEST_FUEL) {
+    let built = match wrela_host::CpuBuild::load_metered(&dir.0, fuel) {
         Ok(b) => b,
         Err(e) => {
             diags.push(Diagnostic::internal(format!("loading a frame test's build: {e}")));
@@ -84,9 +85,14 @@ pub fn run(
         let failed =
             run_one(&built, &storage, i, run, &input).map(|Failed { error, fault, phase }| {
                 match fault {
-                    Some(fault) => {
-                        failure(checked, sources, &out.lines, Item::Test(f), &fault, Some(&phase))
-                    }
+                    Some(fault) => failure(
+                        checked,
+                        sources,
+                        &out.lines,
+                        Item::Test(f, fuel),
+                        &fault,
+                        Some(&phase),
+                    ),
                     // Not a trap: a command the host can't carry out, say.
                     None => Diagnostic::new(
                         codes::E0706,

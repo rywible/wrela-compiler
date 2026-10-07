@@ -306,6 +306,7 @@ pub fn run_tests(
     sources: &SourceMap,
     data: &BuildData,
     tests: &[wrela_sema::ty::FnId],
+    fuel: u64,
 ) -> (Vec<(wrela_sema::ty::FnId, Option<Diagnostic>)>, Vec<Diagnostic>) {
     let (module, diags) = wrela_lower::lower_tests(checked, tests, data);
     let Some(module) = module.filter(|_| !wrela_diag::has_errors(&diags)) else {
@@ -319,13 +320,13 @@ pub fn run_tests(
     let mut results = Vec::new();
     for (f, name) in &module.exports {
         let ran = compiled.start(&engine).map_err(Diagnostic::internal);
-        let failed = match ran.map(|mut r| r.call(name, TEST_FUEL)) {
+        let failed = match ran.map(|mut r| r.call(name, fuel)) {
             Ok(Ok(_)) => None,
             Err(d) => Some(d),
             Ok(Err(CallError::Internal(e))) => Some(Diagnostic::internal(format!("{e:#}"))),
             Ok(Err(CallError::Failed(e, panic))) => {
                 let fault = Fault::of(&e, panic);
-                Some(failure(checked, sources, &compiled.lines, Item::Test(*f), &fault, None))
+                Some(failure(checked, sources, &compiled.lines, Item::Test(*f, fuel), &fault, None))
             }
         };
         results.push((*f, failed));
@@ -333,18 +334,27 @@ pub fn run_tests(
     (results, diags)
 }
 
-/// What failed: computing a constant, or a test.
+/// What failed: computing a constant, or a test (with the fuel it ran with).
 #[derive(Clone, Copy)]
 pub(crate) enum Item {
     Const(ConstId),
-    Test(wrela_sema::ty::FnId),
+    Test(wrela_sema::ty::FnId, u64),
+}
+
+/// A number of instructions, roughly: "17 billion", "16 million".
+fn instructions(n: u64) -> String {
+    match n {
+        1_000_000_000.. => format!("{} billion", n / 1_000_000_000),
+        1_000_000.. => format!("{} million", n / 1_000_000),
+        _ => n.to_string(),
+    }
 }
 
 impl Item {
     fn span(self, p: &wrela_sema::program::Program) -> Span {
         match self {
             Item::Const(c) => p.const_(c).span,
-            Item::Test(f) => p.func(f).span,
+            Item::Test(f, _) => p.func(f).span,
         }
     }
 
@@ -352,7 +362,7 @@ impl Item {
     fn what(self, p: &wrela_sema::program::Program) -> String {
         match self {
             Item::Const(c) => format!("computing {}", p.const_(c).shown()),
-            Item::Test(f) => format!("the test `{}`", p.func(f).name),
+            Item::Test(f, _) => format!("the test `{}`", p.func(f).name),
         }
     }
 
@@ -360,7 +370,7 @@ impl Item {
     fn within(self, p: &wrela_sema::program::Program) -> String {
         match self {
             Item::Const(c) => format!("while the build computes {}", p.const_(c).short()),
-            Item::Test(f) => format!("in the test `{}`", p.func(f).name),
+            Item::Test(f, _) => format!("in the test `{}`", p.func(f).name),
         }
     }
 }
@@ -432,10 +442,10 @@ pub(crate) fn failure(
     let in_std = |s: &Span| is_std(s) && !item_in_std;
     let in_item =
         |s: &Span| s.file == item_span.file && item_span.start <= s.start && s.end <= item_span.end;
-    let failed = if matches!(item, Item::Test(_)) { codes::E0706 } else { codes::E0704 };
+    let failed = if matches!(item, Item::Test(..)) { codes::E0706 } else { codes::E0704 };
     let (code, verb, detail) = match (fault.trap, &fault.panic) {
         (Some(wasmtime::Trap::OutOfFuel), _) => {
-            let limit = if matches!(item, Item::Test(_)) { "a test's" } else { "the build's" };
+            let limit = if matches!(item, Item::Test(..)) { "a test's" } else { "the build's" };
             (codes::E0705, format!("ran past {limit} fuel limit"), None)
         }
         (_, Some(msg)) => (failed, "panicked".to_string(), Some(msg.clone())),
@@ -471,20 +481,20 @@ pub(crate) fn failure(
         d = d
             .with_note(match item {
                 Item::Const(_) => format!(
-                    "the build stops a constant after about {} billion WASM instructions, so a computation that doesn't end is an error rather than a hang (§10)",
-                    FUEL / 1_000_000_000
+                    "the build stops a constant after about {} WASM instructions, so a computation that doesn't end is an error rather than a hang (§10)",
+                    instructions(FUEL)
                 ),
-                Item::Test(_) => format!(
-                    "`wrela test` stops a test after about {} billion WASM instructions, so a test that doesn't end fails rather than hangs (§10)",
-                    TEST_FUEL / 1_000_000_000
+                Item::Test(_, fuel) => format!(
+                    "`wrela test` stops a test after about {} WASM instructions, so a test that doesn't end fails rather than hangs (§10)",
+                    instructions(fuel)
                 ),
             })
             .with_help(match item {
                 Item::Const(_) => "check that its loops end, or compute the value at load instead",
-                Item::Test(_) => "check that its loops end, or test less at once",
+                Item::Test(..) => "check that its loops end, or test less at once",
             });
     } else if code == codes::E0706 {
-        let framed = matches!(item, Item::Test(f) if p.func(f).attrs.runs_program());
+        let framed = matches!(item, Item::Test(f, _) if p.func(f).attrs.runs_program());
         d = d.with_note(if framed {
             "a frame test runs `init` and the program's frames (or a tick test its ticks), then the test: it passes unless one of them panics, and a failed `assert` panics (§10)"
         } else {

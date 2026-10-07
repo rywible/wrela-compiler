@@ -176,7 +176,7 @@ fn median_pass(timings: &[(usize, String, f64)], label: &str) -> f64 {
 /// A screen of source code, 10,000 glyphs and more, draws in at most 0.5 ms of GPU time at
 /// 1080p: the median of 30 frames, in each host.
 #[test]
-#[ignore = "needs Chrome, python3 and a GPU"]
+#[ignore = "long: needs Chrome, python3 and a GPU"]
 fn a_screen_of_code_draws_within_half_a_millisecond() {
     const FRAMES: u32 = 30;
     let (dir, rel) = wrela_tests::page("ui/tests/code", "code-screen");

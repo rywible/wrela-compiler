@@ -49,7 +49,7 @@ fn requests_are_answered_on_later_frames() {
 }
 
 #[test]
-#[ignore = "needs Chrome, python3 and a GPU"]
+#[ignore = "long: needs Chrome, python3 and a GPU"]
 fn the_browser_gives_the_same_answers() {
     let (dir, rel) = page("compiler/tests/requests", "requests-browser");
     with_level(&dir);

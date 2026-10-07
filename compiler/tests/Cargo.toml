@@ -27,6 +27,8 @@ wrela-wfont.workspace = true
 ab_glyph = "0.2"
 wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "metal", "vulkan", "dx12", "wgsl"] }
 pollster = "0.4"
+# The tests' allocator: macOS's spent 30% of the suite's time in malloc, its threads contending.
+mimalloc = { version = "0.1", default-features = false }
 
 [lints]
 workspace = true

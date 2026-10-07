@@ -7,6 +7,10 @@ use crate::{package, scratch};
 use wrela_diag::codes;
 use wrela_host::CpuHost;
 
+/// A test's fuel here: enough for every test but `spins`, which runs past it at once rather
+/// than after `wrela test`'s seconds.
+const FUEL: u64 = 1 << 26;
+
 const TESTS: &str = "const SCALE: f32 = 2.0
 
 fn double(x: f32) -> f32 {
@@ -64,7 +68,7 @@ fn reads_a_vec() {
 #[test]
 fn tests_run_in_order_and_fail_with_a_call_chain() {
     let dir = package("test_items/run", TESTS);
-    let out = wrela_driver::test(&dir, None);
+    let out = wrela_driver::test_with_fuel(&dir, None, FUEL);
     let errors: Vec<_> = out.diagnostics.iter().filter(|d| d.is_error()).collect();
     assert!(errors.is_empty(), "{errors:?}");
     let ran: Vec<(&str, Option<&str>)> = out
@@ -288,7 +292,7 @@ fn third(n: u32) -> u32 {
 #[test]
 fn a_filter_chooses_tests_by_name() {
     let dir = package("test_items/filter", TESTS);
-    let out = wrela_driver::test(&dir, Some("pin"));
+    let out = wrela_driver::test_with_fuel(&dir, Some("pin"), FUEL);
     let ran: Vec<&str> = out.results.iter().map(|r| r.name.as_str()).collect();
     assert_eq!(ran, ["spins"]);
     assert_eq!(out.filtered_out, 4);
@@ -485,7 +489,7 @@ fn starts(game: Game) {
 fn spins() {
 }
 ";
-    let out = wrela_driver::test(&package("test_items/frames-fuel", spins), None);
+    let out = wrela_driver::test_with_fuel(&package("test_items/frames-fuel", spins), None, FUEL);
     let d = out.results[0].failure.as_ref().expect("fails");
     assert_eq!(d.code, wrela_diag::codes::E0705);
     assert_eq!(d.message, "the test `spins` ran past a test's fuel limit in frame 0 of 1");

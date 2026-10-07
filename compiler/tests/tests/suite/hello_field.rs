@@ -104,7 +104,7 @@ fn the_native_frame_matches_the_golden_and_the_cpu() {
 }
 
 #[test]
-#[ignore = "needs Chrome, python3 and a GPU"]
+#[ignore = "long: needs Chrome, python3 and a GPU"]
 fn the_browser_matches_the_golden_and_the_native_host() {
     let (dir, rel) = page("browser");
     // The browser first: this thread holds no GPU lock while Chrome runs (Chrome waits for
@@ -135,7 +135,7 @@ fn the_browser_matches_the_golden_and_the_native_host() {
 const LOAD_BUDGET_SECONDS: f64 = 1.0;
 
 #[test]
-#[ignore = "needs a GPU"]
+#[ignore = "long: needs a GPU"]
 fn loading_creates_the_pipelines_within_budget() {
     let (dir, _) = page("load");
     // Held across the loads (each takes it again), so the time doesn't count a wait for it.
@@ -149,7 +149,7 @@ fn loading_creates_the_pipelines_within_budget() {
     }
     eprintln!("hello-field loads in at most {slowest:.3} s (budget {LOAD_BUDGET_SECONDS} s)");
     // A debug build's wgpu validates as it goes (its first device takes seconds to open), and
-    // its wasmtime compiles slowly: the budget is the release host's (`tools/check.sh --gpu`
+    // its wasmtime compiles slowly: the budget is the release host's (`tools/check.sh --long`
     // runs the GPU tests in release).
     if !cfg!(debug_assertions) {
         assert!(slowest <= LOAD_BUDGET_SECONDS, "loading took {slowest:.3} s");

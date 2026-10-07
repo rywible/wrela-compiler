@@ -91,7 +91,7 @@ pub(crate) fn replay_on_x86(
 }
 
 #[test]
-#[ignore = "needs Chrome, python3, a GPU and Rosetta"]
+#[ignore = "long: needs Chrome, python3, a GPU and Rosetta"]
 fn a_run_recorded_in_chrome_replays_on_arm64_and_x86_64() {
     let (dir, rel) = wrela_tests::page("compiler/tests/sketches/03-keys", "keys-chrome");
     std::fs::write(dir.join("keys.json"), script(TICKS)).expect("write the script");
@@ -136,7 +136,7 @@ fn a_run_recorded_in_chrome_replays_on_arm64_and_x86_64() {
 /// the first frame that draws its effect, in Chrome at 60 frames a second, paced. Each press
 /// is matched with the first frame after it that printed `moved`.
 #[test]
-#[ignore = "needs Chrome, python3 and a GPU"]
+#[ignore = "long: needs Chrome, python3 and a GPU"]
 fn key_presses_reach_the_screen_through_the_sim() {
     let (dir, rel) = wrela_tests::page("compiler/tests/sketches/03-keys", "keys-latency");
     let presses = 40;

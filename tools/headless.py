@@ -68,6 +68,7 @@ def acquire_gpu_lock(page):
         fd = os.open(LOCK_PATH, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
     except OSError as e:
         fail(2, f"can't open the GPU lock {LOCK_PATH}: {e}")
+    start = time.monotonic()
     waited = 0.0
     while True:
         try:
@@ -79,8 +80,9 @@ def acquire_gpu_lock(page):
                 print(f"waiting for the GPU lock, held by: {holder}", file=sys.stderr)
             if waited >= LOCK_WAIT_LIMIT:
                 fail(3, f"gave up waiting for the GPU lock ({LOCK_PATH}) after an hour")
-            time.sleep(0.5)
-            waited += 0.5
+            # Often: a run that queues starts as soon as the lock is free.
+            time.sleep(0.05)
+            waited = time.monotonic() - start
     if waited:
         print(f"got the GPU lock after {waited:.0f}s", file=sys.stderr)
     os.ftruncate(fd, 0)

@@ -104,7 +104,7 @@ fn replayed_ticks_give_the_same_hashes() {
 /// in wasmtime. `cargo test --release -p wrela-tests --test suite snapshot_costs -- --ignored
 /// --nocapture` prints them.
 #[test]
-#[ignore = "a measurement; run it with --release"]
+#[ignore = "long: a measurement; run it with --release"]
 fn snapshot_costs() {
     let (dir, _) = page("compiler/tests/snapshots", "snapshots-costs");
     let mut host = CpuBuild::load(&dir).expect("load").start_with(1).expect("start");

@@ -2,7 +2,10 @@
 //! to load (the lens on the wolf: 1.5 s of 2.2), and an agent's actions load the same build
 //! over and over. The first load writes the module's compiled code to
 //! `<build>/.native/game-<hash>.cwasm` (the hash is the WASM's); later loads of the same WASM
-//! read it back. `wrela studio` writes it right after building the lens (`precompile`).
+//! read it back. `wrela studio` writes it right after building the lens (`precompile`). With
+//! `WRELA_NATIVE_CACHE` naming a directory, every build keeps its code there instead (the
+//! tests' builds, made afresh each run with mostly the same WASM), and code written more than a
+//! day before is removed as new code is written.
 //!
 //! Reading compiled code back is `unsafe` in wasmtime: the bytes become executable code, so they
 //! must be what `Module::serialize` wrote. Wasmtime checks that they were written by its own
@@ -38,7 +41,13 @@ fn path(dir: &Path, wasm: &[u8], fuel: bool) -> PathBuf {
         (false, _) => format!("{}-{arch}.cwasm", stem(wasm)),
         (true, _) => format!("{}-{arch}-fuel.cwasm", stem(wasm)),
     };
-    dir.join(".native").join(name)
+    shared().unwrap_or_else(|| dir.join(".native")).join(name)
+}
+
+/// A directory of compiled code that every build shares, if `WRELA_NATIVE_CACHE` names one:
+/// the tests', whose builds are made afresh on each run while their WASM mostly stays the same.
+fn shared() -> Option<PathBuf> {
+    std::env::var_os("WRELA_NATIVE_CACHE").filter(|d| !d.is_empty()).map(PathBuf::from)
 }
 
 /// Removes the compiled code of every other WASM from the directory `keep` is in: a build has
@@ -50,6 +59,21 @@ fn remove_others(keep: &Path, wasm: &[u8]) {
         let name = e.file_name();
         let name = name.to_string_lossy();
         if !name.starts_with(&stem) && name.starts_with("game-") && name.ends_with(".cwasm") {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+}
+
+/// Removes the code in the shared directory `keep` is in that was written more than a day ago.
+fn remove_stale(keep: &Path) {
+    let Some(dir) = keep.parent() else { return };
+    let day = std::time::Duration::from_secs(24 * 60 * 60);
+    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let old = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .is_ok_and(|t| t.elapsed().is_ok_and(|a| a > day));
+        if old && e.file_name().to_string_lossy().ends_with(".cwasm") {
             let _ = std::fs::remove_file(e.path());
         }
     }
@@ -77,8 +101,10 @@ pub(crate) fn module(engine: &Engine, wasm: &[u8], dir: &Path) -> Result<Module>
         let written = std::fs::create_dir_all(file.parent().unwrap_or(dir)).is_ok()
             && std::fs::write(&tmp, bytes).is_ok()
             && std::fs::rename(&tmp, &file).is_ok();
-        if written {
+        if written && shared().is_none() {
             remove_others(&file, wasm);
+        } else if written {
+            remove_stale(&file);
         } else {
             let _ = std::fs::remove_file(&tmp);
         }

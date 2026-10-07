@@ -95,7 +95,7 @@ fn sketch_01s_herd_walks_and_rings() {
 /// that sways its neck and shaded per pixel by its field. Chrome and the native host give the
 /// same frame, within a mean of 0.5/255 (AC11), and the grazer fills part of it.
 #[test]
-#[ignore = "needs Chrome, python3 and a GPU"]
+#[ignore = "long: needs Chrome, python3 and a GPU"]
 fn sketch_02_draws_the_grazer_in_both_hosts() {
     use wrela_host::image;
     const FRAMES: u32 = 4;
@@ -177,9 +177,10 @@ fn the_programs_own_tests_pass() {
         "examples/wolf",
         "examples/grazer",
     ];
-    for pkg in programs {
-        let dir = wrela_tests::repo_root().join(pkg);
-        let out = wrela_driver::test(&dir, None);
+    let outs = wrela_tests::par_map(&programs, |pkg| {
+        wrela_driver::test(&wrela_tests::repo_root().join(pkg), None)
+    });
+    for (pkg, out) in programs.iter().zip(outs) {
         let shown = |ds: &[&wrela_diag::Diagnostic]| {
             let ds: Vec<wrela_diag::Diagnostic> = ds.iter().map(|&d| d.clone()).collect();
             wrela_diag::render::render_all(&out.sources, &ds)
@@ -197,7 +198,7 @@ const GAMEPLAY_FRAMES: u32 = 360;
 /// The four systems in Chrome and in the native host: the same frames (their state hash covers
 /// every command, the UI's draws among them).
 #[test]
-#[ignore = "needs Chrome, python3 and a GPU"]
+#[ignore = "long: needs Chrome, python3 and a GPU"]
 fn the_gameplay_systems_run_in_both_hosts() {
     let (dir, rel) = wrela_tests::page("compiler/tests/sketches/gameplay", "gameplay-hosts");
     let chrome = wrela_tests::run_in_chrome(&rel, GAMEPLAY_FRAMES, 640, 480, 60.0);

@@ -553,45 +553,50 @@ fn block_lines(message: &str, head: usize) -> String {
 /// Every problem with the blocks: each is checked in its context. Without contexts, a block
 /// that should compile is also run, its statements as an export, so its `assert`s hold.
 fn check_blocks(name: &str, blocks: &[Block], contexts: &[Context]) -> Vec<String> {
-    let mut problems = Vec::new();
-    for (n, block) in blocks.iter().enumerate() {
-        let first = block.code.lines().next().unwrap_or("");
-        let cx = contexts.iter().find(|c| c.first == first).unwrap_or(&NONE);
-        if cx.first.is_empty() && !contexts.is_empty() {
-            problems.push(format!("{}: no context names the block starting `{first}`", block.at));
-            continue;
-        }
-        let run = contexts.is_empty();
-        let (dir, head) = example_package(&format!("{name}/{n}"), block, cx, run);
-        let out = wrela_driver::check(&dir);
-        let errors: Vec<_> = out.diagnostics.iter().filter(|d| d.is_error()).collect();
-        let expected = expected_errors(&block.code);
-        let ok = errors.len() == expected.len()
-            && errors.iter().zip(&expected).all(|(d, e)| meets(d, e, head));
-        if !ok {
-            problems.push(format!(
-                "{}: expected {} error(s) {expected:#?}, got:\n{}",
-                block.at,
-                expected.len(),
-                wrela_diag::render::render_all(&out.sources, &out.diagnostics)
-            ));
-        } else if run
-            && expected.is_empty()
-            && let Err(e) = run_example(&dir)
-        {
-            problems.push(format!("{}: {e}", block.at));
-        } else if expected.is_empty() && block.code.contains("@test") {
-            // A block with tests: they pass.
-            let t = wrela_driver::test(&dir, None);
-            if !t.passed() || t.results.is_empty() {
-                let mut all = t.diagnostics.clone();
-                all.extend(t.results.iter().filter_map(|r| r.failure.clone()));
-                let shown = wrela_diag::render::render_all(&t.sources, &all);
-                problems.push(format!("{}: its tests don't pass:\n{shown}", block.at));
-            }
+    let indexed: Vec<(usize, &Block)> = blocks.iter().enumerate().collect();
+    wrela_tests::par_map(&indexed, |&(n, block)| check_block(name, n, block, contexts))
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
+/// What's wrong with block `n` of `name`'s, if anything.
+fn check_block(name: &str, n: usize, block: &Block, contexts: &[Context]) -> Option<String> {
+    let first = block.code.lines().next().unwrap_or("");
+    let cx = contexts.iter().find(|c| c.first == first).unwrap_or(&NONE);
+    if cx.first.is_empty() && !contexts.is_empty() {
+        return Some(format!("{}: no context names the block starting `{first}`", block.at));
+    }
+    let run = contexts.is_empty();
+    let (dir, head) = example_package(&format!("{name}/{n}"), block, cx, run);
+    let out = wrela_driver::check(&dir);
+    let errors: Vec<_> = out.diagnostics.iter().filter(|d| d.is_error()).collect();
+    let expected = expected_errors(&block.code);
+    let ok = errors.len() == expected.len()
+        && errors.iter().zip(&expected).all(|(d, e)| meets(d, e, head));
+    if !ok {
+        return Some(format!(
+            "{}: expected {} error(s) {expected:#?}, got:\n{}",
+            block.at,
+            expected.len(),
+            wrela_diag::render::render_all(&out.sources, &out.diagnostics)
+        ));
+    } else if run
+        && expected.is_empty()
+        && let Err(e) = run_example(&dir)
+    {
+        return Some(format!("{}: {e}", block.at));
+    } else if expected.is_empty() && block.code.contains("@test") {
+        // A block with tests: they pass.
+        let t = wrela_driver::test(&dir, None);
+        if !t.passed() || t.results.is_empty() {
+            let mut all = t.diagnostics.clone();
+            all.extend(t.results.iter().filter_map(|r| r.failure.clone()));
+            let shown = wrela_diag::render::render_all(&t.sources, &all);
+            return Some(format!("{}: its tests don't pass:\n{shown}", block.at));
         }
     }
-    problems
+    None
 }
 
 /// Builds the package at `dir` and calls its `example` export.

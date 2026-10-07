@@ -18,7 +18,7 @@
 use crate::{scratch, with_frame};
 use std::path::Path;
 use wrela_host::{CpuHost, Error, Value};
-use wrela_tests::{build, cases, copy_dir, header, repo_root};
+use wrela_tests::{build, cases, copy_dir, header, par_map, repo_root};
 
 #[derive(Debug)]
 enum Want {
@@ -161,16 +161,18 @@ fn run_case(path: &Path) -> Result<usize, String> {
 fn run_pass() {
     let cases = cases(&repo_root().join("compiler/tests/run"));
     let only = std::env::var("WRELA_RUN_ONLY").ok();
+    let name =
+        |path: &std::path::PathBuf| path.file_stem().expect("name").to_string_lossy().into_owned();
+    let chosen: Vec<_> = cases
+        .iter()
+        .filter(|p| only.as_ref().is_none_or(|o| name(p).contains(o.as_str())))
+        .collect();
     let mut failures = Vec::new();
     let mut checked = 0;
-    for path in &cases {
-        let name = path.file_stem().expect("name").to_string_lossy().into_owned();
-        if only.as_ref().is_some_and(|o| !name.contains(o.as_str())) {
-            continue;
-        }
-        match run_case(path) {
+    for (path, result) in chosen.iter().zip(par_map(&chosen, |p| run_case(p))) {
+        match result {
             Ok(n) => checked += n,
-            Err(e) => failures.push(format!("{name}:\n{e}")),
+            Err(e) => failures.push(format!("{}:\n{e}", name(path))),
         }
     }
     println!("{} programs, {checked} expectations", cases.len());

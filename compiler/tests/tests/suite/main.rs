@@ -1,5 +1,9 @@
 //! The compiler's end-to-end tests, in one binary: each module is one suite (see its docs).
 
+// macOS's allocator spent 30% of the suite's time in malloc and free, its threads contending.
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod audio;
 mod bounds;
 mod buffers;

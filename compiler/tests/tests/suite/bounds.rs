@@ -32,7 +32,7 @@ fn a_release_build_does_not_check() {
 }
 
 #[test]
-#[ignore = "needs a GPU and Chrome"]
+#[ignore = "long: needs a GPU and Chrome"]
 fn chrome_reports_an_index_out_of_range() {
     let (_, rel) = debug_page("compiler/tests/bounds", "bounds-chrome-debug");
     // Frame 3 is at 0.05 s.

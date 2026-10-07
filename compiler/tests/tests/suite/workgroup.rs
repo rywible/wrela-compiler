@@ -51,7 +51,7 @@ fn shared_memory_atomics_appends_and_maps_give_what_they_should() {
 }
 
 #[test]
-#[ignore = "needs Chrome, python3 and a GPU"]
+#[ignore = "long: needs Chrome, python3 and a GPU"]
 fn the_browser_gives_the_same_results() {
     let (dir, rel) = page("compiler/tests/workgroup", "workgroup-browser");
     let browser = run_in_chrome(&rel, FRAMES, 16, 16, 60.0);

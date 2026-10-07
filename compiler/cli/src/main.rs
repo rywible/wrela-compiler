@@ -48,6 +48,10 @@
 //! Exit status: 0 success, 1 the program has errors (or `fmt --check` found unformatted
 //! files, or a test failed), 2 a usage or I/O error.
 
+// A faster allocator than macOS's: the compiler allocates a great deal.
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 

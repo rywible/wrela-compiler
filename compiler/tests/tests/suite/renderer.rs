@@ -51,7 +51,7 @@ fn each_capability_draws_what_it_should() {
 }
 
 #[test]
-#[ignore = "needs Chrome, python3 and a GPU"]
+#[ignore = "long: needs Chrome, python3 and a GPU"]
 fn the_browser_draws_the_native_hosts_frame() {
     let (dir, rel) = page("compiler/tests/renderer", "renderer-browser");
     // The browser first: this thread holds no GPU lock while Chrome runs.
@@ -66,7 +66,7 @@ fn the_browser_draws_the_native_hosts_frame() {
 /// Chrome's test mode times each pass on the GPU, as the native host does: the same passes, in
 /// the same frames, with the same labels.
 #[test]
-#[ignore = "needs Chrome, python3 and a GPU"]
+#[ignore = "long: needs Chrome, python3 and a GPU"]
 fn both_hosts_time_each_pass() {
     let (dir, rel) = page("compiler/tests/renderer", "renderer-timings");
     let run = wrela_tests::ChromeRun {
@@ -89,7 +89,7 @@ fn both_hosts_time_each_pass() {
 /// (compiler/tests/indexed): the left half green, the right red, in the native host and in
 /// Chrome, which agree on the frame and the state hash. Its three draws are three pipelines.
 #[test]
-#[ignore = "needs Chrome, python3 and a GPU"]
+#[ignore = "long: needs Chrome, python3 and a GPU"]
 fn indexed_draws_cull_and_bias_in_both_hosts() {
     let (dir, rel) = page("compiler/tests/indexed", "indexed-hosts");
     let manifest = std::fs::read_to_string(dir.join("manifest.json")).expect("manifest");

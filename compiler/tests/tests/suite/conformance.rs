@@ -18,7 +18,7 @@
 use crate::scratch;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
-use wrela_tests::{cases, files_under, header, repo_root};
+use wrela_tests::{cases, files_under, header, par_map, repo_root};
 
 /// The rules, by section of docs/language.md, which names each one where it's written
 /// (`the_rule_table_is_the_specs`): the driver keeps the table, which `wrela primer` reads too.
@@ -121,9 +121,14 @@ fn conformance() {
     let known: BTreeSet<&str> = RULES.iter().map(|r| r.0).collect();
     let mut accepted: BTreeSet<String> = BTreeSet::new();
     let mut rejected: BTreeSet<String> = BTreeSet::new();
-    let mut failures = Vec::new();
-    for path in &paths {
+    // The cases compiled at once; then their rules gathered, in order.
+    let checked = par_map(&paths, |path| {
         let case = load_case(path);
+        let got = errors(&case);
+        (case, got)
+    });
+    let mut failures = Vec::new();
+    for (case, got) in checked {
         for r in case.accepts.iter().chain(&case.rejects) {
             assert!(known.contains(r.as_str()), "{}: unknown rule `{r}`", case.name);
         }
@@ -142,7 +147,6 @@ fn conformance() {
             "{}: marks errors but rejects no rule",
             case.name
         );
-        let got = errors(&case);
         if got != case.expected {
             failures.push(format!(
                 "{}:\n  expected {:?}\n  got      {:?}",

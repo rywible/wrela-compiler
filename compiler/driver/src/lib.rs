@@ -265,22 +265,33 @@ impl TestOutput {
 /// build, its constants computed, then each test whose name contains `filter` called, with
 /// nothing of them in a build.
 pub fn test(root: &Path, filter: Option<&str>) -> TestOutput {
-    on_compiler_thread(|| run_tests(root, filter, PackageKind::Program))
+    test_with_fuel(root, filter, consts::TEST_FUEL)
+}
+
+/// [`test`], each test stopped after `fuel` (wasmtime's, about a WASM instruction each) rather
+/// than [`consts::TEST_FUEL`]: for the compiler's own tests of tests that never end.
+pub fn test_with_fuel(root: &Path, filter: Option<&str>, fuel: u64) -> TestOutput {
+    on_compiler_thread(|| run_tests(root, filter, PackageKind::Program, fuel))
 }
 
 /// [`test`] for std's own tests, with the package at `root` as the program: how std's
 /// tests run (the suite's `std_tests_pass`), since only a program package's tests run.
 pub fn test_std(root: &Path, filter: Option<&str>) -> TestOutput {
-    on_compiler_thread(|| run_tests(root, filter, PackageKind::Std))
+    on_compiler_thread(|| run_tests(root, filter, PackageKind::Std, consts::TEST_FUEL))
 }
 
-fn run_tests(root: &Path, filter: Option<&str>, kind: PackageKind) -> TestOutput {
+fn run_tests(root: &Path, filter: Option<&str>, kind: PackageKind, fuel: u64) -> TestOutput {
     let (sources, mut diagnostics, loaded) = load(root);
     let Some(Loaded { units, packages, dirs, .. }) = loaded else {
         split_std_warnings(&sources, &mut diagnostics);
         return TestOutput { sources, diagnostics, results: Vec::new(), filtered_out: 0 };
     };
-    let checked = wrela_sema::check_packages(units, &packages, &mut diagnostics);
+    // std's own tests memory-check its bodies, which other programs leave out.
+    let checked = if kind == PackageKind::Std {
+        wrela_sema::check_packages_and_std(units, &packages, &mut diagnostics)
+    } else {
+        wrela_sema::check_packages(units, &packages, &mut diagnostics)
+    };
     // A debug build's checks, as `wrela build --debug` makes them (§11).
     let mut data = wrela_lower::BuildData { debug: true, ..Default::default() };
     let mut filtered_out = 0;
@@ -305,12 +316,12 @@ fn run_tests(root: &Path, filter: Option<&str>, kind: PackageKind) -> TestOutput
             tests.iter().partition(|&&f| p.func(f).attrs.runs_program());
         let mut ran = Vec::new();
         if !plain.is_empty() {
-            let (r, d) = consts::run_tests(&checked, &sources, &data, &plain);
+            let (r, d) = consts::run_tests(&checked, &sources, &data, &plain, fuel);
             ran.extend(r);
             diagnostics.extend(d);
         }
         if !framed.is_empty() && !has_errors(&diagnostics) {
-            let (r, d) = frames::run(&checked, &sources, &data, &framed, root);
+            let (r, d) = frames::run(&checked, &sources, &data, &framed, root, fuel);
             ran.extend(r);
             diagnostics.extend(d);
         }
@@ -539,11 +550,20 @@ fn load_with(root: &Path, overlay: &Overlay) -> (SourceMap, Vec<Diagnostic>, Opt
         layout_failed: false,
         files: Vec::new(),
     };
-    for (name, text) in STD_SOURCES {
-        let path = name.split("::").map(String::from).collect();
-        let name = format!("<{name}>");
-        let u = add_unit(&mut l.sources, &mut l.diags, name, text.to_string(), path, 0);
-        l.units.push(u);
+    for (k, (name, text)) in STD_SOURCES.iter().enumerate() {
+        // std's files come first in every compile, so their file ids, and what parsing them
+        // gives, are the same each time: parsed once a process.
+        let file = l.sources.add(format!("<{name}>"), text.to_string());
+        let (ast, diags) = &std_parsed()[k];
+        assert_eq!(ast.span.file, file, "std's files are added first, in order");
+        l.diags.extend(diags.iter().cloned());
+        l.units.push(SourceUnit {
+            path: name.split("::").map(String::from).collect(),
+            ast: ast.clone(),
+            package: 0,
+            syntax_errors: Vec::new(),
+            text: l.sources.file(file).text.as_str().into(),
+        });
     }
     l.package(root, None, PackageKind::Program, None);
     if l.layout_failed {
@@ -766,6 +786,27 @@ impl Loader {
         self.visiting.pop();
         Some(index)
     }
+}
+
+/// std's files, parsed as the first files of a source map: each one's tree and diagnostics.
+fn std_parsed() -> &'static [(wrela_syntax::ast::File, Vec<Diagnostic>)] {
+    static PARSED: std::sync::OnceLock<Vec<(wrela_syntax::ast::File, Vec<Diagnostic>)>> =
+        std::sync::OnceLock::new();
+    PARSED.get_or_init(|| {
+        let mut sources = SourceMap::new();
+        STD_SOURCES
+            .iter()
+            .map(|(name, text)| {
+                let file = sources.add(format!("<{name}>"), text.to_string());
+                let parsed = wrela_syntax::parse(file, text);
+                assert!(
+                    !parsed.diagnostics.iter().any(Diagnostic::is_error),
+                    "std's {name} has syntax errors"
+                );
+                (parsed.file, parsed.diagnostics)
+            })
+            .collect()
+    })
 }
 
 /// Adds a file to `sources` and parses it as the module `path`. Its lexical and syntax

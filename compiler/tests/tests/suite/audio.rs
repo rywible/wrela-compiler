@@ -29,7 +29,7 @@ fn the_voice_sounds() {
 
 /// Chrome's AudioWorklet, rendering offline, gives the native host's samples, bit for bit.
 #[test]
-#[ignore = "needs Chrome, python3 and a GPU"]
+#[ignore = "long: needs Chrome, python3 and a GPU"]
 fn both_hosts_render_the_same_samples() {
     let (dir, rel) = page("compiler/tests/audio", "audio-hosts");
     let want = native(&dir);

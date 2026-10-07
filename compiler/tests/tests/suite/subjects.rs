@@ -104,7 +104,7 @@ fn the_wolf_matches_round_1s() {
 }
 
 #[test]
-#[ignore = "needs a GPU"]
+#[ignore = "long: needs a GPU"]
 fn the_grazer_matches_round_1s() {
     matches_its_original("grazer");
 }
@@ -195,13 +195,13 @@ fn realized_in_one_piece(name: &str) {
 }
 
 #[test]
-#[ignore = "needs a GPU"]
+#[ignore = "long: needs a GPU"]
 fn the_wolf_is_realized_in_one_piece() {
     realized_in_one_piece("wolf");
 }
 
 #[test]
-#[ignore = "needs a GPU"]
+#[ignore = "long: needs a GPU"]
 fn the_grazer_is_realized_in_one_piece() {
     realized_in_one_piece("grazer");
 }

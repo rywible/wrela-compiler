@@ -3,10 +3,12 @@
 //! the same GPU for comparison.
 //!
 //! The GPU tests are `#[ignore]`d: they need a GPU and take the GPU lock (`wrela_host::lock`).
-//! `tools/check.sh` runs them with `--ignored`.
+//! `tools/check.sh` runs them, but those whose reason starts `long:` (Chrome, timing and soak
+//! runs), which `tools/check.sh --long` runs.
 //!
 //! Sampled tests have two sizes: small by default, so `cargo test` stays fast, and the size the
-//! acceptance criteria name when `WRELA_FULL` is set ([`sized`]), as `tools/check.sh` does.
+//! acceptance criteria name when `WRELA_FULL` is set ([`sized`]), as `tools/check.sh --long`
+//! does.
 
 pub mod spike01;
 
@@ -124,6 +126,39 @@ pub fn u32s(bytes: &[u8]) -> Vec<u32> {
 
 pub fn bytes_of(xs: &[f32]) -> Vec<u8> {
     xs.iter().flat_map(|x| x.to_le_bytes()).collect()
+}
+
+/// `f` of each item, on every core at once (each item once), in the items' order: for a test
+/// that checks many independent cases. Each thread has a 64 MiB stack, as deep programs need.
+pub fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let next = AtomicUsize::new(0);
+    let threads =
+        std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(1, items.len().max(1));
+    let mut done: Vec<(usize, R)> = std::thread::scope(|s| {
+        let workers: Vec<_> = (0..threads)
+            .map(|_| {
+                std::thread::Builder::new()
+                    .stack_size(64 << 20)
+                    .spawn_scoped(s, || {
+                        let mut mine = Vec::new();
+                        loop {
+                            let i = next.fetch_add(1, Ordering::Relaxed);
+                            let Some(item) = items.get(i) else { break };
+                            mine.push((i, f(item)));
+                        }
+                        mine
+                    })
+                    .expect("spawn a worker")
+            })
+            .collect();
+        workers
+            .into_iter()
+            .flat_map(|w| w.join().unwrap_or_else(|e| std::panic::resume_unwind(e)))
+            .collect()
+    });
+    done.sort_by_key(|(i, _)| *i);
+    done.into_iter().map(|(_, r)| r).collect()
 }
 
 /// The larger error; NaN if either is (`f64::max` drops a NaN, which would pass every check).

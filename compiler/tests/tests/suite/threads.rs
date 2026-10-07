@@ -196,7 +196,7 @@ fn a_tick_log_replays_and_a_changed_record_fails_at_its_tick() {
 /// natively (#43 §2.3, AC5, AC6). On the paced schedule (ticks on the ticker's own clock, the
 /// frames not waiting) the hashes are the same for every tick it ran.
 #[test]
-#[ignore = "needs Chrome, python3 and a GPU"]
+#[ignore = "long: needs Chrome, python3 and a GPU"]
 fn the_ticker_in_chrome_agrees_with_the_native_host() {
     let (dir, rel) = wrela_tests::page("compiler/tests/ticker", "ticker-chrome");
     std::fs::copy(

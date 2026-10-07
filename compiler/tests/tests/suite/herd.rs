@@ -209,7 +209,7 @@ fn the_physique_gives_each_bone_its_mass_and_moments() {
 /// AC6's timings on the CPU (WASM), in one harness, alternating: the physique at 2 cm (≤ 1.25×
 /// the spike's), the grazer's field per evaluation whole and pruned, and a raycast (each ≤ 1.25×).
 #[test]
-#[ignore = "a timing run: cargo test -p wrela-tests --test suite herd:: -- --ignored --nocapture"]
+#[ignore = "long: a timing run: cargo test -p wrela-tests --test suite herd:: -- --ignored --nocapture"]
 fn the_cpu_side_costs_what_the_spikes_did() {
     let mut spike = Spike::new();
     let mut host = ours();
@@ -255,7 +255,7 @@ fn the_cpu_side_costs_what_the_spikes_did() {
 /// triangles per individual, the herd's triangles and its holes. The kernels are the spike's,
 /// unchanged; the recorded run was in Chrome, this is the native host's wgpu, on the M4.
 #[test]
-#[ignore = "needs a GPU and bun"]
+#[ignore = "long: needs a GPU and bun"]
 fn the_spike_harness_gives_the_recorded_runs_counts() {
     let recorded: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(fixture("run-2026-10-02T00-00-14-979Z.json")).expect("the run"),
@@ -527,7 +527,7 @@ fn realize_herd(host: &mut wrela_host::Host, cell: f32) -> (Vec<Ours>, Vec<f64>)
 /// against the spike's extraction, run beside it in one process, alternating (the spike's
 /// harness runs its batch three times and keeps the last).
 #[test]
-#[ignore = "needs a GPU and bun"]
+#[ignore = "long: needs a GPU and bun"]
 fn realization_matches_the_spikes() {
     let dir = built("herd-realize");
     let options = wrela_host::Options { timestamps: true, ..wrela_host::Options::default() };
@@ -657,7 +657,7 @@ fn compiled_kernel(
 /// its bounds: distances and gradients (every part in, unfiltered), and GPU time per evaluation
 /// in one harness, alternating.
 #[test]
-#[ignore = "needs a GPU"]
+#[ignore = "long: needs a GPU"]
 fn the_herds_grazer_field_costs_what_field_wgsl_does() {
     use wrela_tests::{Bind, RawGpu, f32s};
     let n: u32 = 1 << 20;
@@ -738,7 +738,7 @@ fn still_script(key: &str, close: bool) -> String {
 /// mean of 0.5/255, in the native host and in Chrome; and the two hosts' frames match each
 /// other's within 0.5/255.
 #[test]
-#[ignore = "needs Chrome, python3, a GPU and bun"]
+#[ignore = "long: needs Chrome, python3, a GPU and bun"]
 fn the_herd_draws_the_spikes_frames() {
     use wrela_tests::spike01::{H, SceneKind, W, image_difference};
     let (dir, rel) = wrela_tests::page("examples/herd", "herd-parity");
@@ -823,7 +823,7 @@ fn frame_ms(timings: &[wrela_host::GpuTiming], from: usize, passes: bool) -> Vec
 /// and the whole frame, its passes' times summed (ours poses on the GPU; the spike posed on the
 /// CPU). Each ≤ 1.25×.
 #[test]
-#[ignore = "needs a GPU and bun"]
+#[ignore = "long: needs a GPU and bun"]
 fn drawing_the_herd_costs_what_the_spikes_did() {
     use wrela_tests::spike01::{H, SceneKind, W};
     let dir = herd_gpu();
@@ -941,7 +941,7 @@ fn paced_herd(name: &str, script: &str) -> (std::path::PathBuf, wrela_tests::Bro
 /// all 40 grazers, the bytes downloaded before it, and the memory: the program's GPU buffers and
 /// textures at most, and its WASM memory used and reserved.
 #[test]
-#[ignore = "needs Chrome, python3 and a GPU"]
+#[ignore = "long: needs Chrome, python3 and a GPU"]
 fn the_herd_keeps_its_frames_in_chrome() {
     let (dir, chrome, ms) = paced_herd("herd-paced", "[]");
     let missed = ms.iter().filter(|&&m| m > 16.7).count();
@@ -1003,7 +1003,7 @@ fn the_herd_keeps_its_frames_in_chrome() {
 /// the herd's grazers are drawn and refined for the herd's view. (The others, off screen in the
 /// close-up, were realized at their coarsest level meanwhile, one a frame: `Realizer::spend`.)
 #[test]
-#[ignore = "needs Chrome, python3 and a GPU"]
+#[ignore = "long: needs Chrome, python3 and a GPU"]
 fn moving_to_the_herd_keeps_the_frames_in_chrome() {
     let script =
         r#"[{"frame":0,"type":"key","key":"KeyC"},{"frame":300,"type":"key","key":"KeyH"}]"#;
@@ -1080,7 +1080,7 @@ fn realization_reads_nothing_back_between_its_passes() {
 /// `probe_corners`); over the 40 grazers at 3, 2, 1.5 and 1 cm,
 /// every corner has one bit pattern, whichever blocks evaluate it (#43 §7.5).
 #[test]
-#[ignore = "needs a GPU"]
+#[ignore = "long: needs a GPU"]
 fn shared_corners_have_one_value() {
     let src = repo_root().join("compiler/tests/herd-realize");
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("herd-realize-debug");
@@ -1132,7 +1132,7 @@ fn shared_corners_have_one_value() {
 /// creatures' GPU time (shadow and shading, the terrain left out) is ≤ 1.25× the spike's herd
 /// at 3 cm, run by the harness, alternating.
 #[test]
-#[ignore = "needs a GPU and bun"]
+#[ignore = "long: needs a GPU and bun"]
 fn lod_looks_like_the_finest_and_costs_like_the_coarsest() {
     use wrela_tests::spike01::{H, SceneKind, W, image_difference};
     let dir = herd_gpu();
@@ -1189,7 +1189,7 @@ fn lod_looks_like_the_finest_and_costs_like_the_coarsest() {
 /// ≤ 1.25× what the spike's harness allocates for the same (each individual's room sized by a
 /// calibration on the largest, plus a quarter).
 #[test]
-#[ignore = "needs a GPU and bun"]
+#[ignore = "long: needs a GPU and bun"]
 fn mesh_memory_is_the_spikes() {
     let dir = herd_gpu();
     let times: Vec<f32> = (0..=STILL_FRAME).map(|i| wrela_host::frame_time(i, 60.0)).collect();
@@ -1228,7 +1228,7 @@ fn mesh_memory_is_the_spikes() {
 /// no grazer once drawn is ever without a mesh, and the mesh memory allocated after the tour is
 /// within one slab per level of its peak during the first loop.
 #[test]
-#[ignore = "needs a GPU"]
+#[ignore = "long: needs a GPU"]
 fn a_ten_minute_tour_leaks_no_mesh_memory() {
     let dir = herd_gpu();
     let mut host = wrela_host::Host::load(&dir).expect("load the herd");
@@ -1281,7 +1281,7 @@ fn a_ten_minute_tour_leaks_no_mesh_memory() {
 /// all at once, in Chrome takes ≤ 1.5× creating spike 01's 12 cold, all at once, as its main.js
 /// did (compiler/tests/spike01/pipelines), alternating, three of each.
 #[test]
-#[ignore = "needs Chrome, python3 and a GPU"]
+#[ignore = "long: needs Chrome, python3 and a GPU"]
 fn the_herds_pipelines_load_cold_as_fast() {
     let (dir, rel) = wrela_tests::page("examples/herd", "herd-cold");
     let spike = "compiler/tests/spike01/pipelines";
@@ -1325,7 +1325,7 @@ fn the_herds_pipelines_load_cold_as_fast() {
 /// Rosetta, replaying the log; and Chrome on the lockstep schedule at 30, 60 and 144 frames a
 /// second, and at 60 with each frame held 20 ms longer.
 #[test]
-#[ignore = "needs Chrome, python3, a GPU and Rosetta"]
+#[ignore = "long: needs Chrome, python3, a GPU and Rosetta"]
 fn the_herds_ticks_hash_the_same_everywhere() {
     const TICKS: u32 = 10_000;
     let (dir, rel) = wrela_tests::page("examples/herd", "herd-hashes");
@@ -1425,7 +1425,7 @@ fn spin_ns() -> f64 {
 /// the lock taken and the tries it spun; a try's cost is [`spin_ns`]'s). A steady tick reuses
 /// its buffers (#43 §5.2), so it allocates nothing: that's asserted.
 #[test]
-#[ignore = "a measurement: needs a GPU"]
+#[ignore = "long: a measurement: needs a GPU"]
 fn the_herds_ticks_beside_frames_allocate_and_wait() {
     let dir = herd();
     let options = wrela_host::Options { defer_init: true, ..wrela_host::Options::default() };
@@ -1655,7 +1655,7 @@ fn the_engine_and_the_herd_keep_their_layers() {
 /// median and 99th percentile within 1 ms of a run with normal ticks. (Each frame reads the
 /// latest complete snapshot: threads::a_hand_off_is_never_read_torn.)
 #[test]
-#[ignore = "needs Chrome, python3 and a GPU"]
+#[ignore = "long: needs Chrome, python3 and a GPU"]
 fn frames_dont_wait_for_slow_ticks() {
     let (_, rel) = wrela_tests::page("examples/herd", "herd-slow-ticks");
     let intervals = |tickdelay: u32| {

@@ -730,13 +730,13 @@ fn report(subject: &str, outcomes: &[Outcome]) {
 }
 
 #[test]
-#[ignore = "needs a GPU"]
+#[ignore = "long: needs a GPU"]
 fn the_wolfs_drags_meet_ac9() {
     report("wolf", &drags("wolf", &WOLF));
 }
 
 #[test]
-#[ignore = "needs a GPU"]
+#[ignore = "long: needs a GPU"]
 fn the_grazers_drags_meet_ac9() {
     report("grazer", &drags("grazer", &GRAZER));
 }
@@ -745,7 +745,7 @@ fn the_grazers_drags_meet_ac9() {
 /// wolf's nose pad, dragged 30 mm forward, leaves the muzzle (as spike 09 found). The pieces the
 /// lens's diagnosis counts don't change.
 #[test]
-#[ignore = "needs a GPU"]
+#[ignore = "long: needs a GPU"]
 fn a_drag_that_would_split_the_wolf_stops_while_it_is_whole() {
     let subject = Subject::shared("wolf", "as-is", &[]);
     let mut lens = subject.lens();
@@ -763,7 +763,7 @@ fn a_drag_that_would_split_the_wolf_stops_while_it_is_whole() {
 /// four parts share (the wolf's toes'), with literals the dragged point doesn't depend on (zero
 /// derivatives), and with two that move it alike (collinear derivatives).
 #[test]
-#[ignore = "needs a GPU"]
+#[ignore = "long: needs a GPU"]
 fn drags_with_odd_literals_stay_finite() {
     let subject = Subject::shared("wolf", "as-is", &[]);
     let count = super::lift::report(&subject.page)["literals"].as_array().unwrap().len() as u32;
@@ -839,7 +839,7 @@ const LONGER_NECK: [(&str, &str); 2] = [
 /// most (on a separate CPU build: the head's scale and pitch have no millimetres of their own),
 /// and the fit takes 10 s at most.
 #[test]
-#[ignore = "needs a GPU"]
+#[ignore = "long: needs a GPU"]
 fn fits_recover_the_wolfs_longer_neck_and_bigger_ears() {
     const RES: u32 = 512;
     let target = Subject::shared("wolf", "longer-neck", &LONGER_NECK);
@@ -1068,13 +1068,13 @@ fn clicks(name: &'static str, marks: &[Landmark]) {
 }
 
 #[test]
-#[ignore = "needs a GPU"]
+#[ignore = "long: needs a GPU"]
 fn clicks_on_the_wolfs_landmarks_find_their_parts_and_source() {
     clicks("wolf", &WOLF_MARKS);
 }
 
 #[test]
-#[ignore = "needs a GPU"]
+#[ignore = "long: needs a GPU"]
 fn clicks_on_the_grazers_landmarks_find_their_parts_and_source() {
     clicks("grazer", &GRAZER_MARKS);
 }
@@ -1206,7 +1206,7 @@ fn agree(a: &serde_json::Value, b: &serde_json::Value) -> bool {
 /// files written, and last frames within a mean of 0.5/255. Chrome's times are reported: a
 /// click's frame (AC5: ≤ 50 ms), a drag's updates (AC9: ≤ 33 ms with a 512² view).
 #[test]
-#[ignore = "needs Chrome, python3 and a GPU"]
+#[ignore = "long: needs Chrome, python3 and a GPU"]
 fn a_session_gives_the_same_results_headless_and_in_chrome() {
     const SIZE2: (u32, u32) = (512, 512);
     const RES: u32 = 256;
@@ -1331,7 +1331,7 @@ fn a_session_gives_the_same_results_headless_and_in_chrome() {
 /// of 0.5/255; and a headless view takes ≤ 1 s after a build (loading the lens, its first
 /// frame, and reading the screen, natively). Times are medians of 20.
 #[test]
-#[ignore = "needs Chrome, python3 and a GPU"]
+#[ignore = "long: needs Chrome, python3 and a GPU"]
 fn the_lens_is_fast_enough_and_the_same_in_both_hosts() {
     let subject = Subject::new("wolf", "speed");
     // The sheet's screen: 1024² of views beside the panel (400 wide).
@@ -1584,13 +1584,13 @@ fn diagnostics_agree_with_fieldview(name: &'static str) {
 }
 
 #[test]
-#[ignore = "needs a GPU"]
+#[ignore = "long: needs a GPU"]
 fn the_wolfs_diagnostics_agree_with_round_1s_tool() {
     diagnostics_agree_with_fieldview("wolf");
 }
 
 #[test]
-#[ignore = "needs a GPU"]
+#[ignore = "long: needs a GPU"]
 fn the_grazers_diagnostics_agree_with_round_1s_tool() {
     diagnostics_agree_with_fieldview("grazer");
 }
@@ -1668,7 +1668,7 @@ fn describe_agrees_with_the_diagnosis(subject: &Subject) -> serde_json::Value {
 }
 
 #[test]
-#[ignore = "needs a GPU"]
+#[ignore = "long: needs a GPU"]
 fn the_wolfs_description_agrees_with_its_diagnosis() {
     let a = describe_agrees_with_the_diagnosis(&Subject::shared("wolf", "as-is", &[]));
     let fur = a["asymmetry_mm"].as_f64().unwrap();
@@ -1692,7 +1692,7 @@ fn the_wolfs_description_agrees_with_its_diagnosis() {
 }
 
 #[test]
-#[ignore = "needs a GPU"]
+#[ignore = "long: needs a GPU"]
 fn the_grazers_description_agrees_with_its_diagnosis() {
     let a = describe_agrees_with_the_diagnosis(&Subject::shared("grazer", "as-is", &[]));
     let fur = a["asymmetry_mm"].as_f64().unwrap();
@@ -1706,7 +1706,7 @@ fn the_grazers_description_agrees_with_its_diagnosis() {
 /// what's new (every 250 ms) and types `set` into the lens, and the lens draws its views again.
 /// Timed from the file's write to the start of the frame that set the literal.
 #[test]
-#[ignore = "needs Chrome, python3 and a GPU"]
+#[ignore = "long: needs Chrome, python3 and a GPU"]
 fn an_edit_by_another_tool_shows_in_the_open_lens_within_2_s() {
     let subject = Subject::for_chrome("wolf", "external-edit");
     let file = subject.files.iter().find(|(p, _)| p.ends_with("creature.wrela")).unwrap().0.clone();
@@ -1958,7 +1958,7 @@ fn lifted_sheets_match(
 }
 
 #[test]
-#[ignore = "needs a GPU"]
+#[ignore = "long: needs a GPU"]
 fn the_wolfs_lifted_sheets_match_the_normal_builds() {
     // The cranium 1 cm further back in the head.
     lifted_sheets_match(
@@ -1974,7 +1974,7 @@ fn the_wolfs_lifted_sheets_match_the_normal_builds() {
 }
 
 #[test]
-#[ignore = "needs a GPU"]
+#[ignore = "long: needs a GPU"]
 fn the_grazers_lifted_sheets_match_the_normal_builds() {
     // The brow 1 cm higher.
     lifted_sheets_match(
@@ -1995,7 +1995,7 @@ fn the_grazers_lifted_sheets_match_the_normal_builds() {
 /// 5 pixels up (past the 4 that make a press a drag) and back to 3 (12 mm), over 10 frames, and
 /// comes up; the drag finishes (rounded, checked whole, measured), and the back has moved there.
 #[test]
-#[ignore = "needs a GPU"]
+#[ignore = "long: needs a GPU"]
 fn a_pointer_drag_moves_the_surface_under_it() {
     let subject = Subject::shared("wolf", "as-is", &[]);
     let mut lens = subject.lens();

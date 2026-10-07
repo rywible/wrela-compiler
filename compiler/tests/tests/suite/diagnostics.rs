@@ -19,7 +19,7 @@
 //! is edited, and which std file it names still is.
 
 use crate::package;
-use wrela_tests::{apply_fixes, cases, files_under, header, repo_root};
+use wrela_tests::{apply_fixes, cases, files_under, header, par_map, repo_root};
 
 struct Outcome {
     codes: Vec<String>,
@@ -53,9 +53,8 @@ fn compile(name: &str, text: &str, dir: Option<&std::path::Path>) -> Outcome {
 fn diagnostics_meet_the_bar() {
     let bless = std::env::var_os("WRELA_BLESS").is_some();
     let cases = cases(&repo_root().join("compiler/tests/diagnostics"));
-    let mut failures = Vec::new();
-    let mut with_fixes = 0;
-    for path in &cases {
+    // Each case: its failure, if it fails, and whether it has a fix.
+    let results = par_map(&cases, |path| {
         let name = path.file_stem().expect("name").to_string_lossy().into_owned();
         // A directory is a package (with its dependencies): its `main.wrela` has the headers.
         let dir = path.is_dir().then_some(path.as_path());
@@ -93,7 +92,6 @@ fn diagnostics_meet_the_bar() {
             problems.push("a fix is suggested, but the header says `fix: no`".into());
         }
         if wants_fix {
-            with_fixes += 1;
             match &out.fixed {
                 None => problems.push("no fix suggested".into()),
                 Some(fixed) => {
@@ -107,14 +105,12 @@ fn diagnostics_meet_the_bar() {
                 }
             }
         }
-        if !problems.is_empty() {
-            failures.push(format!(
-                "{name} ({mistake}):\n  {}\n{}",
-                problems.join("\n  "),
-                out.text
-            ));
-        }
-    }
+        let failure = (!problems.is_empty())
+            .then(|| format!("{name} ({mistake}):\n  {}\n{}", problems.join("\n  "), out.text));
+        (failure, wants_fix)
+    });
+    let with_fixes = results.iter().filter(|(_, fix)| *fix).count();
+    let failures: Vec<String> = results.into_iter().filter_map(|(f, _)| f).collect();
     println!("{} curated mistakes, {with_fixes} with fixes that compile", cases.len());
     assert!(cases.len() >= 50, "only {} cases", cases.len());
     assert!(failures.is_empty(), "{} cases failed:\n{}", failures.len(), failures.join("\n"));

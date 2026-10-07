@@ -8,7 +8,7 @@ pub fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
-/// Whether sampled tests run at full size: `WRELA_FULL` is set (as `tools/check.sh` does).
+/// Whether sampled tests run at full size: `WRELA_FULL` is set (as `tools/check.sh --long` does).
 pub fn full() -> bool {
     std::env::var_os("WRELA_FULL").is_some()
 }

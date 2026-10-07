@@ -21,8 +21,8 @@ fn items(listing: &str) -> Vec<String> {
         .collect()
 }
 
-#[test]
-fn every_public_std_item_has_a_page() {
+/// Every public item of std, by its path (`std::arena::Arena`).
+fn std_items() -> Vec<String> {
     let (ok, modules, _) = doc(&["std"]);
     assert!(ok, "{modules}");
     let modules: Vec<String> = modules
@@ -32,20 +32,43 @@ fn every_public_std_item_has_a_page() {
         .map(String::from)
         .collect();
     assert!(modules.len() >= 20, "{modules:?}");
-    let mut slowest = 0.0f64;
-    let mut checked = 0;
+    let mut paths = Vec::new();
     for m in &modules {
         let (ok, listing, _) = doc(&[m]);
         assert!(ok, "{m}: {listing}");
-        for item in items(&listing) {
-            let path = format!("{m}::{item}");
-            let (ok, page, secs) = doc(&[&path]);
-            assert!(ok && page.starts_with(&path), "{path}:\n{page}");
-            slowest = slowest.max(secs);
-            checked += 1;
-        }
+        paths.extend(items(&listing).into_iter().map(|item| format!("{m}::{item}")));
     }
-    assert!(checked > 150, "only {checked} items");
+    assert!(paths.len() > 150, "only {} items", paths.len());
+    paths
+}
+
+#[test]
+fn every_public_std_item_has_a_page() {
+    let paths = std_items();
+    // A process per page, several at once.
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+    std::thread::scope(|s| {
+        for chunk in paths.chunks(paths.len().div_ceil(threads)) {
+            s.spawn(move || {
+                for path in chunk {
+                    let (ok, page, _) = doc(&[path]);
+                    assert!(ok && page.starts_with(path.as_str()), "{path}:\n{page}");
+                }
+            });
+        }
+    });
+}
+
+/// Each page in under 100 ms, one at a time.
+#[test]
+#[ignore = "long: a timing run"]
+fn every_page_takes_under_a_tenth_of_a_second() {
+    let mut slowest = 0.0f64;
+    for path in std_items() {
+        let (ok, page, secs) = doc(&[&path]);
+        assert!(ok, "{path}:\n{page}");
+        slowest = slowest.max(secs);
+    }
     if !cfg!(debug_assertions) {
         assert!(slowest < 0.1, "the slowest page took {slowest:.3} s");
     }

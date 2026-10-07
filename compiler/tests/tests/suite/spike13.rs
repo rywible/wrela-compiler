@@ -238,7 +238,7 @@ fn the_creature_derives_over_time() {
 /// driver cache helps; M2 began at 4.7 s); every certificate checked by sampling is right;
 /// and each pipeline's WGSL is at most 256 KiB. The GPU times are printed.
 #[test]
-#[ignore = "needs a GPU"]
+#[ignore = "long: needs a GPU"]
 fn the_gpu_certificate_is_small_quick_and_right() {
     let dir = built("spike13");
     // A copy whose shaders differ from any run before: cold.

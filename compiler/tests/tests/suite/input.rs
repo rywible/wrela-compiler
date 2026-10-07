@@ -45,7 +45,7 @@ fn the_native_host_plays_a_script() {
 /// The same script gives the same state hash in Chrome's test mode and in the native host:
 /// moves, clicks, a drag with Shift held, the wheel, keys, and text with Latin-1 letters.
 #[test]
-#[ignore = "needs Chrome, python3 and a GPU"]
+#[ignore = "long: needs Chrome, python3 and a GPU"]
 fn both_hosts_read_the_same_events() {
     let (dir, rel) = wrela_tests::page("compiler/tests/input", "input-hosts");
     std::fs::copy(wrela_tests::repo_root().join(SCRIPT), dir.join("script.json")).expect("copy");
@@ -67,7 +67,7 @@ fn both_hosts_read_the_same_events() {
 /// through the DOM at random times, while frames run at 60 a second, each arrive in the first
 /// frame that starts after them.
 #[test]
-#[ignore = "needs Chrome, python3 and a GPU"]
+#[ignore = "long: needs Chrome, python3 and a GPU"]
 fn events_reach_the_program_by_the_next_frame() {
     let (dir, rel) = wrela_tests::page("compiler/tests/input", "input-latency");
     let run =

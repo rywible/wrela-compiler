@@ -212,7 +212,7 @@ fn a_voice_renders_the_same_samples_with_simd() {
 /// Measured, not gated: a loop of `vec4` math (compiler/tests/simd's `vec4_math`), and `f32`
 /// loops four iterations at a time (`f32_loop`), with SIMD and without.
 #[test]
-#[ignore = "a measurement; run it with --release"]
+#[ignore = "long: a measurement; run it with --release"]
 fn simd_speed() {
     let (simd, scalar) = both("compiler/tests/simd", "speed");
     let time = |dir: &Path, name: &str, n: i32| {

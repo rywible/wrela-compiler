@@ -125,11 +125,31 @@ pub fn check_program(units: Vec<SourceUnit>, diags: &mut Vec<Diagnostic>) -> Che
     check_packages(units, &collect::PackageInfo::std_and_program(), diags)
 }
 
-/// Collects and type-checks a whole program, made of `packages` (language.md §3).
+/// Collects and type-checks a whole program, made of `packages` (language.md §3). std's bodies
+/// aren't memory-checked: they're the same in every program, and its own tests check them
+/// ([`check_packages_and_std`]).
 pub fn check_packages(
     units: Vec<SourceUnit>,
     packages: &[collect::PackageInfo],
     diags: &mut Vec<Diagnostic>,
+) -> Checked {
+    check(units, packages, diags, false)
+}
+
+/// [`check_packages`], memory-checking std's bodies too: for std's own tests.
+pub fn check_packages_and_std(
+    units: Vec<SourceUnit>,
+    packages: &[collect::PackageInfo],
+    diags: &mut Vec<Diagnostic>,
+) -> Checked {
+    check(units, packages, diags, true)
+}
+
+fn check(
+    units: Vec<SourceUnit>,
+    packages: &[collect::PackageInfo],
+    diags: &mut Vec<Diagnostic>,
+    memory_check_std: bool,
 ) -> Checked {
     let mut program = collect::collect(units, packages, diags);
     let consts = {
@@ -148,13 +168,18 @@ pub fn check_packages(
     }
     // From here on the definitions are read-only.
     let p = &program;
+    let memory_check = |f: ty::FnId| {
+        memory_check_std || p.package_of(p.func(f).module).kind != defs::PackageKind::Std
+    };
     let check::CheckedConsts { tys: const_tys, values: consts, bodies: const_bodies } = consts;
     let mut mir = BTreeMap::new();
     for (c, body) in &const_bodies {
         let f = p.const_(*c).eval;
         let (m, d) = mir::build::build(p, &consts, f, body);
         diags.extend(d);
-        diags.extend(borrowck::check(p, &m));
+        if memory_check(f) {
+            diags.extend(borrowck::check(p, &m));
+        }
         mir.insert(f, m);
     }
     let mut hidden = Vec::new();
@@ -172,7 +197,9 @@ pub fn check_packages(
             if typed && !incomplete {
                 let (m, d) = mir::build::build(p, &consts, f, &b);
                 diags.extend(d);
-                diags.extend(borrowck::check(p, &m));
+                if memory_check(f) {
+                    diags.extend(borrowck::check(p, &m));
+                }
                 mir.insert(f, m);
             }
         }

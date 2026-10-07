@@ -43,7 +43,7 @@ fn stage(build: &Path, runtime: &Path, page: &Path) {
 }
 
 #[test]
-#[ignore = "needs Chrome, python3 and the GPU"]
+#[ignore = "long: needs Chrome, python3 and the GPU"]
 fn browser_and_native_agree_on_first_light() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let build = common::first_light();
