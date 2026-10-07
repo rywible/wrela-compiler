@@ -335,3 +335,26 @@ pub fn bits64() -> u64 {
     assert_eq!(&uploads[1][8..12], &canonical);
     assert_eq!(&uploads[1][12..16], &2.0f32.to_le_bytes());
 }
+
+/// Plain data crosses to the GPU and back with the same bytes: compiler/tests/gpu-data's first
+/// frame fills pairs of buffers, the CPU's values then the GPU's: structs and arrays of bools
+/// (a `u32` each in GPU memory, as on the CPU), what a kernel reads from the CPU's, a buffer of
+/// bools, structs of enums (a tag and the payload's words) and what a kernel reads from those.
+#[test]
+#[ignore = "needs a GPU"]
+fn gpu_data_has_the_cpus_bytes() {
+    let mut gpu = wrela_host::Host::load(crate::built("gpu-data")).expect("load");
+    gpu.frame(0.0, 64, 64).expect("a frame");
+    let b = gpu.buffers();
+    // The game's buffers, in the order `init` makes them: three pairs, `ons`, two pairs.
+    let pairs = [("flags", 0), ("read", 2), ("picks", 4), ("items", 7), ("measures", 9)];
+    let first = b.len() - 11;
+    for (name, at) in pairs {
+        let cpu = gpu.read_buffer(b[first + at]).expect("read");
+        let on_gpu = gpu.read_buffer(b[first + at + 1]).expect("read");
+        assert_eq!(cpu.len(), on_gpu.len(), "{name}");
+        assert!(cpu.iter().any(|&x| x != 0), "{name}: the CPU's values are all zero");
+        let differ = cpu.chunks(4).zip(on_gpu.chunks(4)).position(|(a, b)| a != b);
+        assert_eq!(differ, None, "{name}: the CPU's and the GPU's words differ (the first)");
+    }
+}

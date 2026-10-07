@@ -2823,20 +2823,8 @@ fn check_structural_opt_in(p: &Program, diags: &mut Vec<Diagnostic>, imp: &ImplD
     if lang == Some(Lang::Clone) && crate::traits::explicit_clone(p, a).is_some() {
         return;
     }
-    // An enum without payloads is its tag, a `u32`, on both targets; one with payloads would
-    // need a union, which WGSL lacks.
-    if lang == Some(Lang::GpuData) && adt.is_enum() && adt.all_fields().next().is_some() {
-        diags.push(
-            Diagnostic::new(
-                codes::E0407,
-                imp.span,
-                format!("the enum `{}` can't be `GpuData`: its variants carry data", adt.name),
-            )
-            .with_note("WGSL has no sum types, so only an enum without payloads, which is a `u32` tag, crosses to the GPU")
-            .with_help("use a struct with a `u32` tag and a field for each payload"),
-        );
-        return;
-    }
+    // An enum is its `u32` tag and its payloads' bytes, laid out as the CPU lays it out, on
+    // both targets (`ir::gpu_memory`): its payloads must be `GpuData`, as a struct's fields.
     for f in adt.all_fields() {
         if p.types.has_params(f.ty) {
             continue; // conditional on the arguments; checked where it's used
@@ -2845,7 +2833,7 @@ fn check_structural_opt_in(p: &Program, diags: &mut Vec<Diagnostic>, imp: &ImplD
         if !ok {
             let why = match lang {
                 Some(Lang::GpuData) => {
-                    "WGSL can't hold it in a buffer (bool, 64-bit and 8/16-bit types and empty arrays can't cross to the GPU)"
+                    "WGSL can't hold it in a buffer (64-bit and 8/16-bit types and empty arrays can't cross to the GPU)"
                 }
                 _ => "it isn't",
             };

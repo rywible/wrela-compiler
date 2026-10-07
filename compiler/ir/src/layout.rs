@@ -168,9 +168,13 @@ pub fn array_stride(types: &Types, elem: TypeId) -> u32 {
 /// struct starting at least a 16-byte-rounded size later).
 pub fn uniform_compatible(types: &Types, t: TypeId) -> bool {
     match types.get(t) {
-        // An enum never reaches the GPU.
-        TypeDef::Enum { .. } => false,
-        TypeDef::Scalar(s) => s.on_gpu() && *s != Scalar::Bool,
+        // A struct there (`gpu_memory`): its tag, and the payload's words in an array of `u32`s
+        // or of vectors of them, as wide as the enum's alignment, which needs a 16-byte stride.
+        TypeDef::Enum { variants, .. } => {
+            variants.iter().all(|(_, p)| p.is_none()) || layout(types, t).align == 16
+        }
+        // A `bool` is a `u32` there (`gpu_memory`).
+        TypeDef::Scalar(s) => s.on_gpu(),
         TypeDef::Vector(s, _) => s.on_gpu(),
         TypeDef::Matrix(_) => true,
         TypeDef::Array(e, _) => {
@@ -182,11 +186,14 @@ pub fn uniform_compatible(types: &Types, t: TypeId) -> bool {
                 if !uniform_compatible(types, *f) {
                     return false;
                 }
-                let nested = matches!(types.get(*f), TypeDef::Struct { .. } | TypeDef::Array(..));
+                let nested = matches!(
+                    types.get(*f),
+                    TypeDef::Struct { .. } | TypeDef::Enum { .. } | TypeDef::Array(..)
+                );
                 if nested && !offsets[i].is_multiple_of(16) {
                     return false;
                 }
-                if matches!(types.get(*f), TypeDef::Struct { .. })
+                if matches!(types.get(*f), TypeDef::Struct { .. } | TypeDef::Enum { .. })
                     && let Some(&next) = offsets.get(i + 1)
                     && next < offsets[i].saturating_add(round_up(16, layout(types, *f).size))
                 {

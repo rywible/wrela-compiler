@@ -1679,20 +1679,16 @@ fn lower_render(cx: &mut Cx, iface: Rc<Interface>) -> Option<PipelineOut> {
     }
     check_recursion(cx, &mb);
     check_uniformity(cx, &mb, fentry, &entry_inputs(fragment, false));
-    let (position_field, flat) = varying_layout(cx, &mut mb, vret, vdef.sig_span)?;
+    let varyings = varying_layout(cx, &mut mb, vret, vdef.sig_span)?;
     mb.m.entry_points.push(ir::EntryPoint {
         name: ir::ident(&vdef.name),
-        stage: ir::Stage::Vertex { position_field, flat: flat.clone() },
+        stage: ir::Stage::Vertex { varyings: varyings.clone() },
         function: ventry,
         inputs: entry_inputs(vertex, false),
     });
     mb.m.entry_points.push(ir::EntryPoint {
         name: ir::ident(&fdef.name),
-        stage: ir::Stage::Fragment {
-            varyings: takes_varyings.then_some(vret_ir),
-            position_field: takes_varyings.then_some(position_field),
-            flat,
-        },
+        stage: ir::Stage::Fragment { varyings: takes_varyings.then_some((vret_ir, varyings)) },
         function: fentry,
         inputs: entry_inputs(fragment, false),
     });
@@ -1748,28 +1744,30 @@ fn is_clip_position(cx: &Cx, t: TyId) -> bool {
     cx.checked.program.lang_of_ty(t) == Some(Lang::ClipPosition)
 }
 
-/// Which field of the vertex output is the clip position, and which fields are `Flat`. E0602
-/// for a field that can't pass to the fragment shader: one of a generic type, which the
-/// vertex shader's own check couldn't see.
+/// The members of the struct WGSL passes from the vertex shader to the fragment shader: the
+/// clip position, and each value the vertex output's other fields hold (a matrix's columns, a
+/// struct's or a tuple's fields, a `Flat<T>`'s value, not interpolated). E0602 for a field that
+/// can't pass: one of a generic type, which the vertex shader's own check couldn't see.
 fn varying_layout(
     cx: &mut Cx,
     mb: &mut ModuleBuilder,
     vret: TyId,
     span: Span,
-) -> Option<(u32, Vec<bool>)> {
+) -> Option<Vec<ir::Varying>> {
+    let position = |path| ir::Varying { path, position: true, flat: false };
     if is_clip_position(cx, vret) {
-        return Some((0, vec![false]));
+        return Some(vec![position(vec![0])]);
     }
     let checked = cx.checked;
     let p = &checked.program;
     let TyKind::Adt(a, _) = p.types.kind(vret) else { return None };
     let decls = p.adt(*a).fields();
-    let mut position = None;
-    let mut flat = Vec::new();
+    let mut found = false;
+    let mut out = Vec::new();
     for ((k, ft), decl) in cx.field_map(mb, vret, None, span).into_iter().zip(decls) {
         let Some(k) = k else { continue };
         if is_clip_position(cx, ft) {
-            if position.is_some() {
+            if found {
                 // A generic field made a `ClipPosition` (the checker counts the declared ones).
                 cx.err(
                     Diagnostic::new(
@@ -1781,14 +1779,48 @@ fn varying_layout(
                 );
                 return None;
             }
-            position = Some(k);
+            found = true;
+            out.push(position(vec![k, 0]));
         } else if !wrela_sema::gpu::is_varying(p, ft) {
             cx.err(wrela_sema::gpu::not_varying(p, &decl.name, ft, decl.span));
             return None;
+        } else {
+            varying_leaves(cx, mb, ft, vec![k], false, span, &mut out);
         }
-        flat.push(p.lang_of_ty(ft) == Some(Lang::Flat));
     }
-    position.map(|p| (p, flat))
+    found.then_some(out)
+}
+
+/// The values a vertex output's part of type `t`, at `path`, passes on: see `varying_layout`.
+fn varying_leaves(
+    cx: &mut Cx,
+    mb: &mut ModuleBuilder,
+    t: TyId,
+    path: Vec<u32>,
+    flat: bool,
+    span: Span,
+    out: &mut Vec<ir::Varying>,
+) {
+    let p = &cx.checked.program;
+    let leaf = |path, flat| ir::Varying { path, position: false, flat };
+    match p.types.kind(t) {
+        TyKind::Mat(n) => {
+            for c in 0..u32::from(*n) {
+                out.push(leaf([path.clone(), vec![c]].concat(), flat));
+            }
+        }
+        TyKind::Adt(..) | TyKind::Tuple(_) => {
+            let flat = flat || p.lang_of_ty(t) == Some(Lang::Flat);
+            for (k, ft) in cx.field_map(mb, t, None, span) {
+                if let Some(k) = k {
+                    varying_leaves(cx, mb, ft, [path.clone(), vec![k]].concat(), flat, span, out);
+                }
+            }
+        }
+        // An integer isn't interpolated (WGSL's rule).
+        TyKind::Int(_) | TyKind::Vec(VecElem::I32 | VecElem::U32, _) => out.push(leaf(path, true)),
+        _ => out.push(leaf(path, flat)),
+    }
 }
 
 /// The builtins an entry point reads: its builtin parameters' inputs in order, each once (WGSL
@@ -1953,7 +1985,8 @@ pub(crate) fn debug_checks(cx: &mut Cx, out: &mut PipelineOut, code: u32) {
     }
 }
 
-/// Checks a pipeline's module and, if it'll be emitted, flattens it (`ir::opt::flatten_gpu`).
+/// Checks a pipeline's module and, if it'll be emitted, flattens it (`ir::opt::flatten_gpu`)
+/// and lays out its memory as the CPU's (`ir::gpu_memory`).
 fn verify(cx: &mut Cx, mb: &mut ModuleBuilder, name: &str) -> Option<()> {
     if wrela_diag::has_errors(&cx.diags) {
         return None;
@@ -1965,8 +1998,10 @@ fn verify(cx: &mut Cx, mb: &mut ModuleBuilder, name: &str) -> Option<()> {
         eprintln!("{}", ir::print::print(&mb.m));
     }
     if cx.emit {
-        checked =
-            checked.and_then(|()| ir::opt::flatten_gpu(&mut mb.m)).and_then(|()| ir::verify(&mb.m));
+        checked = checked
+            .and_then(|()| ir::opt::flatten_gpu(&mut mb.m))
+            .and_then(|()| ir::gpu_memory::lay_out_gpu_memory(&mut mb.m))
+            .and_then(|()| ir::verify(&mb.m));
     }
     if let Err(e) = checked {
         cx.err(Diagnostic::internal(format!("the IR for `{name}` is malformed: {e}")));

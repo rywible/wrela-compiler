@@ -4,9 +4,11 @@ use std::gpu::{
     buffer, dispatch, draw, present, write,
 }
 
+// A bool is GPU data: a `u32` in GPU memory.
 struct Params: Copy + GpuData {
     scale: f32,
     count: u32,
+    on: bool,
 }
 
 @gpu
@@ -16,7 +18,7 @@ fn twice(x: f32) -> f32 {
 
 @compute(64)
 fn fill(p: Params, input: [f32], out: mut Slots<f32>, id: GlobalId) {
-    if id.x < p.count {
+    if id.x < p.count && p.on {
         out[id] = twice(input[id.x]) * p.scale
     }
 }
@@ -44,12 +46,21 @@ fn paint(pixel: FragCoord, p: Params) -> vec4 {
     vec4(pixel.position.xy * p.scale, 0.0, 1.0)
 }
 
-// A vertex output's values pass to the fragment shader, which takes them whether or not
-// anything draws the two yet.
+// A vertex output's values pass to the fragment shader: numbers and vectors, a matrix (a
+// value per column), structs and tuples of them (a value per field), each interpolated or
+// flat.
+struct Pair: Copy {
+    lo: u32,
+    hi: u32,
+}
+
 struct Lit: Copy {
     pos: ClipPosition,
     tint: vec4,
     id: Flat<u32>,
+    turn: mat3,
+    mask: Flat<Pair>,
+    both: (vec2, f32),
 }
 
 @vertex
@@ -58,23 +69,29 @@ fn spot(v: VertexIndex) -> Lit {
         pos: ClipPosition { position: vec4(0.0, 0.0, 0.0, 1.0) },
         tint: vec4(1.0),
         id: Flat { value: v.index },
+        turn: mat3(vec3(1.0, 0.0, 0.0), vec3(0.0, 1.0, 0.0), vec3(0.0, 0.0, 1.0)),
+        mask: Flat { value: Pair { lo: v.index, hi: 7 } },
+        both: (vec2(0.5), 2.0),
     }
 }
 
 @fragment
 fn glow(o: Lit) -> vec4 {
-    o.tint * f32(o.id.value)
+    let n = o.turn * vec3(0.0, 0.0, 1.0)
+    let m = f32(o.mask.value.lo + o.mask.value.hi)
+    o.tint * f32(o.id.value) * n.z * m * o.both.1 * o.both.0.x
 }
 
 pub fn frame(time: f32, width: u32, height: u32) {
     var input: GpuBuffer<f32> = buffer(64)
     write(mut input, 0, [1.0, 2.0, 3.0])
     var out: GpuBuffer<f32> = buffer(64)
-    let p = Params { scale: time, count: 3 }
+    let p = Params { scale: time, count: 3, on: true }
     dispatch(fill.bind(p: p, input: input, out: mut out), groups: 1)
     var cells: GpuBuffer<u32> = buffer(64)
     dispatch(grid.bind(out: mut cells), groups: (1, 1, 1))
     begin_screen_pass(clear: vec4(0.0, 0.0, 0.0, 1.0))
     draw(cover, paint.bind(p: p), vertices: 3)
+    draw(spot, glow, vertices: 3)
     present()
 }

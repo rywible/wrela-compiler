@@ -319,82 +319,49 @@ impl<'m> Cx<'m> {
         ))
     }
 
-    /// The vertex output (and fragment input) struct: the clip position, then the varyings.
-    fn io_struct(
-        &mut self,
-        vt: ir::TypeId,
-        position_field: u32,
-        flat: &[bool],
-    ) -> R<(Handle<Type>, IoMap)> {
+    /// The vertex output (and fragment input) struct: a member for each of `varyings`, which
+    /// are parts of a value of type `vt`.
+    fn io_struct(&mut self, vt: ir::TypeId, varyings: &[ir::Varying]) -> R<Handle<Type>> {
         let m = self.m;
-        let ir::TypeDef::Struct { fields, name } = m.types.get(vt) else {
+        let ir::TypeDef::Struct { name, .. } = m.types.get(vt) else {
             return Err("internal: vertex output isn't a struct".into());
         };
-        let v4 = self.ty_vec4();
         let mut members = Vec::new();
-        let mut offset = 0;
-        let mut map = Vec::new();
         let mut location = 0;
-        for (i, (fname, ft)) in fields.iter().enumerate() {
-            let is_pos = i as u32 == position_field;
-            let (ty, inner_flat) = if is_pos {
-                (v4, false)
-            } else {
-                let is_flat = flat.get(i).copied().unwrap_or(false);
-                // A `Flat<T>` is a struct with one field.
-                let inner = if is_flat {
-                    match m.types.get(*ft) {
-                        ir::TypeDef::Struct { fields, .. } => fields[0].1,
-                        _ => *ft,
-                    }
-                } else {
-                    *ft
-                };
-                (self.ty(inner)?, is_flat)
-            };
-            let binding = if is_pos {
+        for (k, v) in varyings.iter().enumerate() {
+            let ty = self.ty(part_ty(&m.types, vt, &v.path)?)?;
+            let binding = if v.position {
                 Binding::BuiltIn(BuiltIn::Position { invariant: false })
             } else {
-                let interp = if inner_flat
-                    || matches!(
-                        self.out.types[ty].inner,
-                        TypeInner::Scalar(Scalar { kind: ScalarKind::Uint | ScalarKind::Sint, .. })
-                    ) {
-                    Interpolation::Flat
+                let (interpolation, sampling) = if v.flat {
+                    (Interpolation::Flat, Sampling::First)
                 } else {
-                    Interpolation::Perspective
-                };
-                let b = Binding::Location {
-                    location,
-                    interpolation: Some(interp),
-                    sampling: Some(if interp == Interpolation::Flat {
-                        Sampling::First
-                    } else {
-                        Sampling::Center
-                    }),
-                    blend_src: None,
-                    per_primitive: false,
+                    (Interpolation::Perspective, Sampling::Center)
                 };
                 location += 1;
-                b
+                Binding::Location {
+                    location: location - 1,
+                    interpolation: Some(interpolation),
+                    sampling: Some(sampling),
+                    blend_src: None,
+                    per_primitive: false,
+                }
             };
             members.push(StructMember {
-                name: Some(ir::ident(fname)),
+                name: Some(format!("v{k}")),
                 ty,
                 binding: Some(binding),
-                offset,
+                offset: 16 * k as u32,
             });
-            offset += 16;
-            map.push((i as u32, inner_flat));
         }
-        let h = self.out.types.insert(
+        let span = (16 * varyings.len() as u32).max(16);
+        Ok(self.out.types.insert(
             Type {
                 name: Some(format!("{}_io", ir::ident(name))),
-                inner: TypeInner::Struct { members, span: offset.max(16) },
+                inner: TypeInner::Struct { members, span },
             },
             Span::UNDEFINED,
-        );
-        Ok((h, map))
+        ))
     }
 
     fn ty_vec4(&mut self) -> Handle<Type> {
@@ -486,20 +453,16 @@ fn pure(e: &ir::Expr) -> bool {
     }
 }
 
-/// Whether field `i` of the vertex output type `t` is a struct of one field (a `Flat<T>` or a
-/// `ClipPosition`) that the WGSL passes as that field.
-fn wrapped(types: &ir::Types, t: ir::TypeId, i: u32) -> R<bool> {
-    let ft = types.field(t, i).ok_or("internal: a varying's type")?;
-    match types.get(ft) {
-        ir::TypeDef::Struct { fields, .. } if fields.len() == 1 => Ok(true),
-        ir::TypeDef::Struct { .. } => Err("internal: a varying that's a struct".into()),
-        _ => Ok(false),
-    }
+/// The type of the part of a value of type `t` at `path`: field indexes, then a matrix
+/// column's.
+fn part_ty(types: &ir::Types, t: ir::TypeId, path: &[u32]) -> R<ir::TypeId> {
+    path.iter().try_fold(t, |t, &k| match types.get(t) {
+        ir::TypeDef::Matrix(n) => types
+            .lookup(&ir::TypeDef::Vector(ir::Scalar::F32, *n))
+            .ok_or_else(|| "internal: a matrix's column type".to_string()),
+        _ => types.field(t, k).ok_or_else(|| "internal: a varying's path".to_string()),
+    })
 }
-
-/// For each member of a vertex output (fragment input) struct: the IR struct's field it holds,
-/// and whether that field is a `Flat<T>`.
-type IoMap = Vec<(u32, bool)>;
 
 /// Builds one naga function.
 struct Fb<'a, 'm> {
@@ -511,7 +474,8 @@ struct Fb<'a, 'm> {
     /// The entry point being written, or `None` for a function that stays a call.
     entry: Option<&'m ir::EntryPoint>,
     /// For a vertex entry: the output struct and how its members map to the IR struct's.
-    io: Option<(Handle<Type>, IoMap, ir::TypeId)>,
+    /// The vertex output (fragment input) struct, its members, and the IR type they're parts of.
+    io: Option<(Handle<Type>, Vec<ir::Varying>, ir::TypeId)>,
     /// Where the IR's parameters start among the naga arguments: after the builtin inputs.
     param_base: u32,
     /// For each builtin input, its naga argument; `None` for a fragment's position when it
@@ -592,21 +556,21 @@ impl<'a, 'm> Fb<'a, 'm> {
         self.param_base = self.func.arguments.len() as u32;
         match &e.stage {
             ir::Stage::Compute { .. } => {}
-            ir::Stage::Vertex { position_field, flat } => {
+            ir::Stage::Vertex { varyings } => {
                 let rt = self.f.ret.ok_or("internal: a vertex shader with no output")?;
-                let (io, map) = self.cx.io_struct(rt, *position_field, flat)?;
+                let io = self.cx.io_struct(rt, varyings)?;
                 self.func.result = Some(FunctionResult { ty: io, binding: None });
-                self.io = Some((io, map, rt));
+                self.io = Some((io, varyings.clone(), rt));
             }
-            ir::Stage::Fragment { varyings, position_field, flat } => {
-                if let (Some(vt), Some(pf)) = (varyings, position_field) {
-                    let (io, map) = self.cx.io_struct(*vt, *pf, flat)?;
+            ir::Stage::Fragment { varyings } => {
+                if let Some((vt, map)) = varyings {
+                    let io = self.cx.io_struct(*vt, map)?;
                     self.func.arguments.push(FunctionArgument {
                         name: Some("varyings".into()),
                         ty: io,
                         binding: None,
                     });
-                    self.io = Some((io, map, *vt));
+                    self.io = Some((io, map.clone(), *vt));
                 }
                 let v4 = self.cx.ty_vec4();
                 self.func.result = Some(FunctionResult {
@@ -875,23 +839,50 @@ impl<'a, 'm> Fb<'a, 'm> {
 
     /// A vertex shader's return value, rebuilt as the output struct.
     fn output(&mut self, h: Handle<Expression>, out: &mut Block) -> R<Handle<Expression>> {
-        let Some((io, map, rt)) = self.io.clone() else { return Ok(h) };
+        let Some((io, map, _)) = self.io.clone() else { return Ok(h) };
         let Some(ir::EntryPoint { stage: ir::Stage::Vertex { .. }, .. }) = self.entry else {
             return Ok(h);
         };
         let mut comps = Vec::new();
-        for (i, _) in map {
-            let field = self.expr(Expression::AccessIndex { base: h, index: i }, out);
-            // A `Flat<T>`'s value, or a `ClipPosition` field's `position`: the one field of a
-            // struct. (A bare `ClipPosition` output's field is the position itself.)
-            let v = if wrapped(&self.cx.m.types, rt, i)? {
-                self.expr(Expression::AccessIndex { base: field, index: 0 }, out)
-            } else {
-                field
-            };
-            comps.push(v);
+        for v in map {
+            let mut part = h;
+            for &k in &v.path {
+                part = self.expr(Expression::AccessIndex { base: part, index: k }, out);
+            }
+            comps.push(part);
         }
         Ok(self.expr(Expression::Compose { ty: io, components: comps }, out))
+    }
+
+    /// The part at `path` of the fragment shader's input, of IR type `t`, rebuilt from the
+    /// members of `arg`, the input struct that holds its parts (`map`).
+    fn rebuild(
+        &mut self,
+        arg: Handle<Expression>,
+        map: &[ir::Varying],
+        t: ir::TypeId,
+        path: &mut Vec<u32>,
+        out: &mut Block,
+    ) -> R<Handle<Expression>> {
+        if let Some(k) = map.iter().position(|v| v.path == *path) {
+            return Ok(self.expr(Expression::AccessIndex { base: arg, index: k as u32 }, out));
+        }
+        let types = &self.cx.m.types;
+        let parts: Vec<ir::TypeId> = match types.get(t) {
+            ir::TypeDef::Struct { fields, .. } => fields.iter().map(|f| f.1).collect(),
+            ir::TypeDef::Matrix(n) => {
+                vec![part_ty(types, t, &[0])?; usize::from(*n)]
+            }
+            _ => return Err("internal: a varying's part that no member holds".into()),
+        };
+        let mut comps = Vec::new();
+        for (k, pt) in parts.into_iter().enumerate() {
+            path.push(k as u32);
+            comps.push(self.rebuild(arg, map, pt, path, out)?);
+            path.pop();
+        }
+        let ty = self.cx.ty(t)?;
+        Ok(self.expr(Expression::Compose { ty, components: comps }, out))
     }
 
     fn value(&mut self, v: ir::ValueId, e: &ir::Expr, out: &mut Block) -> R<Handle<Expression>> {
@@ -950,26 +941,7 @@ impl<'a, 'm> Fb<'a, 'm> {
                         self.entry
                 {
                     let arg = self.expr(Expression::FunctionArgument(self.param_base + *i), out);
-                    let ir::TypeDef::Struct { fields, .. } = types.get(vt) else {
-                        return Err("internal: varyings".into());
-                    };
-                    let mut comps = Vec::new();
-                    for (k, (i, _)) in map.into_iter().enumerate() {
-                        let member =
-                            self.expr(Expression::AccessIndex { base: arg, index: k as u32 }, out);
-                        let ft = fields[i as usize].1;
-                        comps.push(if wrapped(types, vt, i)? {
-                            let fty = self.cx.ty(ft)?;
-                            self.expr(
-                                Expression::Compose { ty: fty, components: vec![member] },
-                                out,
-                            )
-                        } else {
-                            member
-                        });
-                    }
-                    let ty = self.cx.ty(vt)?;
-                    self.expr(Expression::Compose { ty, components: comps }, out)
+                    self.rebuild(arg, &map, vt, &mut Vec::new(), out)?
                 } else {
                     self.expr(Expression::FunctionArgument(self.param_base + *i), out)
                 }
@@ -981,15 +953,12 @@ impl<'a, 'm> Fb<'a, 'm> {
                     Some(None) => {
                         let (
                             Some((_, map, _)),
-                            Some(ir::EntryPoint {
-                                stage: ir::Stage::Fragment { position_field: Some(pf), .. },
-                                ..
-                            }),
+                            Some(ir::EntryPoint { stage: ir::Stage::Fragment { .. }, .. }),
                         ) = (&self.io, self.entry)
                         else {
                             return Err("internal: an input with no argument".into());
                         };
-                        let k = map.iter().position(|&(f, _)| f == *pf).unwrap_or(0) as u32;
+                        let k = map.iter().position(|v| v.position).unwrap_or(0) as u32;
                         let v = self.expr(Expression::FunctionArgument(self.param_base), out);
                         self.expr(Expression::AccessIndex { base: v, index: k }, out)
                     }
@@ -1272,7 +1241,14 @@ impl<'a, 'm> Fb<'a, 'm> {
             // struct.
             (Some(r), true, Some(t)) => {
                 let old = self.expr(Expression::AccessIndex { base: r, index: 0 }, out);
-                let stored = self.expr(Expression::AccessIndex { base: r, index: 1 }, out);
+                let mut stored = self.expr(Expression::AccessIndex { base: r, index: 1 }, out);
+                // A struct's `bool` is a `u32` (`ir::gpu_memory`).
+                let types = &self.cx.m.types;
+                if types.field(t, 1).and_then(|b| types.as_scalar(b)) == Some(ir::Scalar::U32) {
+                    let (kind, width) = (ScalarKind::Uint, 4);
+                    stored =
+                        self.expr(Expression::As { expr: stored, kind, convert: Some(width) }, out);
+                }
                 let ty = self.cx.ty(t)?;
                 Some(self.expr(Expression::Compose { ty, components: vec![old, stored] }, out))
             }

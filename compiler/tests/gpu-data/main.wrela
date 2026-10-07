@@ -1,0 +1,181 @@
+// Plain data of every kind on the CPU and the GPU (compiler/tests/tests/suite/buffers.rs). The
+// first frame fills pairs of buffers, the CPU's then the GPU's, which must hold the same bytes:
+// structs of bools as `make` builds them, what a kernel reads from the CPU's (`summary`), and a
+// buffer of bools; then structs holding enums (`item`) and what a kernel reads from the CPU's
+// (`measure`). GPU memory holds a bool as a `u32`, 0 or 1, and an enum as its tag and its
+// payload's words, as the CPU does.
+
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch, write}
+
+pub const N: u32 = 64
+
+struct Flags: Copy + GpuData {
+    on: bool,
+    count: u32,
+    picks: [bool; 3],
+    inner: Inner,
+}
+
+struct Inner: Copy + GpuData {
+    a: bool,
+    v: vec3,
+    b: bool,
+}
+
+fn make(i: u32, odd: bool) -> Flags {
+    let on = (i % 2 == 1) == odd
+    Flags {
+        on,
+        count: u32(on) + i,
+        picks: [i % 3 == 0, on, !on],
+        inner: Inner { a: i > 10, v: vec3(f32(i)), b: i % 5 == 0 && on },
+    }
+}
+
+/// The bools of `f`, a bit each.
+fn summary(f: Flags) -> u32 {
+    var bits = u32(f.on) | (u32(f.inner.a) << 1) | (u32(f.inner.b) << 2)
+    for k in 0..3 {
+        bits = bits | (u32(f.picks[k]) << (3 + k))
+    }
+    bits
+}
+
+enum Shape: Copy + GpuData {
+    Empty,
+    Ball(f32),
+    Box { half: vec3, round: f32 },
+    Tag(bool),
+    Pair(i32, u32),
+}
+
+struct Item: Copy + GpuData {
+    id: u32,
+    shape: Shape,
+    on: bool,
+}
+
+fn item(i: u32) -> Item {
+    let shape = match i % 5 {
+        0 => Shape::Empty,
+        1 => Shape::Ball(f32(i) * 0.5),
+        2 => Shape::Box { half: vec3(f32(i), 1.0, -2.0), round: 0.25 },
+        3 => Shape::Tag(i % 2 == 1),
+        _ => Shape::Pair(-i32(i), i * 3),
+    }
+    var it = Item { id: i, shape, on: i % 3 == 0 }
+    tweak(mut it)
+    it
+}
+
+/// Changes a payload in place.
+fn tweak(it: mut Item) {
+    match mut it.shape {
+        Shape::Ball(r) => r += 1.0,
+        Shape::Box { half, round } => half.y = round * 4.0,
+        Shape::Pair(_, b) => b += 1,
+        _ => {},
+    }
+}
+
+/// An item's bits mixed, from its shape's variant and payload (no float arithmetic, which a
+/// GPU may round otherwise).
+fn measure(it: Item) -> u32 {
+    let m = match it.shape {
+        Shape::Empty => 1,
+        Shape::Ball(r) => bitcast_u32(r),
+        Shape::Box { half, round } => {
+            bitcast_u32(half.x) ^
+                (bitcast_u32(half.y) >> 1) ^
+                (bitcast_u32(half.z) >> 2) ^
+                bitcast_u32(round)
+        },
+        Shape::Tag(b) => if b { 2 } else { 3 },
+        Shape::Pair(a, b) => u32(a) ^ (b << 4),
+    }
+    m ^ (u32(it.on) << 31) ^ (it.id << 20)
+}
+
+@compute(64)
+fn items_on_gpu(out: mut Slots<Item>, id: GlobalId) {
+    out[id] = item(id.x)
+}
+
+@compute(64)
+fn measure_on_gpu(items: [Item], out: mut Slots<u32>, id: GlobalId) {
+    out[id] = measure(items[id.x])
+}
+
+@compute(64)
+fn make_on_gpu(out: mut Slots<Flags>, odd: bool, id: GlobalId) {
+    out[id] = make(id.x, odd)
+}
+
+/// Each of the CPU's values' summary, with bit 8 set where `ons` agrees with it.
+@compute(64)
+fn read_on_gpu(flags: [Flags], ons: [bool], out: mut Slots<u32>, id: GlobalId) {
+    let f = flags[id.x]
+    out[id] = summary(f) | (u32(ons[id.x] == f.on) << 8)
+}
+
+@compute(64)
+fn picks_on_gpu(flags: [Flags], out: mut Slots<bool>, id: GlobalId) {
+    out[id] = flags[id.x].picks[2]
+}
+
+pub struct Game {
+    flags_cpu: GpuBuffer<Flags>,
+    flags_gpu: GpuBuffer<Flags>,
+    read_cpu: GpuBuffer<u32>,
+    read_gpu: GpuBuffer<u32>,
+    picks_cpu: GpuBuffer<bool>,
+    picks_gpu: GpuBuffer<bool>,
+    ons: GpuBuffer<bool>,
+    items_cpu: GpuBuffer<Item>,
+    items_gpu: GpuBuffer<Item>,
+    measures_cpu: GpuBuffer<u32>,
+    measures_gpu: GpuBuffer<u32>,
+    done: bool,
+}
+
+pub fn init() -> Game {
+    Game {
+        flags_cpu: buffer(N),
+        flags_gpu: buffer(N),
+        read_cpu: buffer(N),
+        read_gpu: buffer(N),
+        picks_cpu: buffer(N),
+        picks_gpu: buffer(N),
+        ons: buffer(N),
+        items_cpu: buffer(N),
+        items_gpu: buffer(N),
+        measures_cpu: buffer(N),
+        measures_gpu: buffer(N),
+        done: false,
+    }
+}
+
+pub fn frame(game: mut Game, time: f32, width: u32, height: u32) {
+    if game.done {
+        return
+    }
+    let flags = Vec::from_fn(N, |i| make(i, odd: true))
+    write(mut game.flags_cpu, 0, flags)
+    dispatch(make_on_gpu.bind(out: mut game.flags_gpu, odd: true), groups: N / 64)
+    write(mut game.ons, 0, Vec::from_fn(N, |i| make(i, odd: true).on))
+    write(mut game.read_cpu, 0, Vec::from_fn(N, |i| summary(make(i, odd: true)) | 256))
+    dispatch(
+        read_on_gpu.bind(flags: game.flags_cpu, ons: game.ons, out: mut game.read_gpu),
+        groups: N / 64,
+    )
+    write(mut game.picks_cpu, 0, Vec::from_fn(N, |i| make(i, odd: true).picks[2]))
+    dispatch(picks_on_gpu.bind(flags: game.flags_cpu, out: mut game.picks_gpu), groups: N / 64)
+    write(mut game.items_cpu, 0, Vec::from_fn(N, |i| item(i)))
+    dispatch(items_on_gpu.bind(out: mut game.items_gpu), groups: N / 64)
+    write(mut game.measures_cpu, 0, Vec::from_fn(N, |i| measure(item(i))))
+    dispatch(
+        measure_on_gpu.bind(items: game.items_cpu, out: mut game.measures_gpu),
+        groups: N / 64,
+    )
+    game.done = true
+}

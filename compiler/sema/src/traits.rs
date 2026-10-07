@@ -424,7 +424,8 @@ pub fn implements_builtin(p: &Program, ty: TyId, lang: Lang) -> bool {
 fn implements_builtin_uncached(p: &Program, ty: TyId, lang: Lang) -> bool {
     match p.types.kind(ty) {
         TyKind::Error | TyKind::Never => true,
-        TyKind::Bool => lang != Lang::GpuData,
+        // GPU memory holds one as a `u32` (`ir::gpu_memory`).
+        TyKind::Bool => true,
         TyKind::Int(i) => lang != Lang::GpuData || i.on_gpu(),
         TyKind::Float(f) => lang != Lang::GpuData || *f == FloatTy::F32,
         TyKind::Vec(e, _) => lang != Lang::GpuData || e.on_gpu(),

@@ -37,22 +37,35 @@ pub fn is_vertex_output(p: &Program, t: TyId) -> bool {
 /// (`maxInterStageShaderVariables`).
 pub const MAX_VARYINGS: usize = 16;
 
-/// Whether a vertex output's field of type `t` can pass to the fragment shader: WGSL passes
-/// numbers and float vectors, interpolated or (in a `Flat<T>`) not.
+/// Whether a vertex output's field of type `t` can pass to the fragment shader.
 pub fn is_varying(p: &Program, t: TyId) -> bool {
-    let number = |t: TyId| {
-        matches!(
-            p.types.kind(t),
-            TyKind::Float(FloatTy::F32)
-                | TyKind::Vec(VecElem::F32 | VecElem::I32 | VecElem::U32, _)
-                | TyKind::Int(IntTy::I32 | IntTy::U32)
-        )
-    };
+    varying_count(p, t).is_some()
+}
+
+/// How many values a vertex output's field of type `t` passes to the fragment shader, each in
+/// its own WGSL location: one for a number or a vector of `f32`s, `i32`s or `u32`s, one per
+/// column for a matrix, and its fields' for a struct or a tuple of those; each interpolated or,
+/// in a `Flat<T>`, not. `None` if it can't pass.
+pub fn varying_count(p: &Program, t: TyId) -> Option<usize> {
     match p.types.kind(t) {
+        TyKind::Float(FloatTy::F32)
+        | TyKind::Int(IntTy::I32 | IntTy::U32)
+        | TyKind::Vec(VecElem::F32 | VecElem::I32 | VecElem::U32, _) => Some(1),
+        TyKind::Mat(n) => Some(usize::from(*n)),
         TyKind::Adt(_, args) if p.lang_of_ty(t) == Some(Lang::Flat) => {
-            args.first().is_some_and(|&a| number(a))
+            varying_count(p, *args.first()?)
         }
-        _ => number(t),
+        TyKind::Adt(a, args)
+            if p.lang_of_ty(t).is_none() && !p.adt(*a).is_enum() && !p.adt(*a).borrow =>
+        {
+            let fields = p.fields_of(*a, args, None);
+            if fields.is_empty() {
+                return None;
+            }
+            fields.into_iter().map(|f| varying_count(p, f)).sum()
+        }
+        TyKind::Tuple(ts) if !ts.is_empty() => ts.iter().map(|&f| varying_count(p, f)).sum(),
+        _ => None,
     }
 }
 
@@ -67,8 +80,9 @@ pub fn not_varying(p: &Program, field: &str, ty: TyId, span: wrela_diag::Span) -
         ),
     )
     .with_note(
-        "WGSL passes numbers and float vectors between stages (`f32`, `i32`, `u32`, `vecN`), \
-         each interpolated or in a `Flat<T>`",
+        "WGSL passes numbers and vectors between stages (`f32`, `i32`, `u32`, `vec3`, `vec3i`, \
+         `vec3u`), and wrela matrices and structs of them too, each interpolated or in a \
+         `Flat<T>`",
     )
 }
 
@@ -169,14 +183,16 @@ fn check_entry(p: &Program, f: FnId, entry: Entry, out: &mut Vec<Diagnostic>) {
                         out.push(not_varying(p, &f.name, f.ty, f.span));
                     }
                 }
-                if varyings.count() > MAX_VARYINGS {
+                let count: usize =
+                    varyings.filter_map(|f| varying_count(p, f.ty)).sum();
+                if count > MAX_VARYINGS {
                     out.push(
                         Diagnostic::new(
                             codes::E0602,
                             def.sig_span,
-                            format!("{stage} passes more than {MAX_VARYINGS} values to the fragment shader"),
+                            format!("{stage} passes {count} values to the fragment shader, more than {MAX_VARYINGS}"),
                         )
-                        .with_note(format!("WebGPU's default limit is {MAX_VARYINGS} (`maxInterStageShaderVariables`)")),
+                        .with_note(format!("WebGPU's default limit is {MAX_VARYINGS} (`maxInterStageShaderVariables`): a matrix passes a value per column, and a struct one per field")),
                     );
                 }
             }

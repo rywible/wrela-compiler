@@ -15,6 +15,7 @@
 pub mod bounds;
 pub mod derive;
 mod error;
+pub mod gpu_memory;
 pub mod layout;
 pub mod opt;
 pub mod print;
@@ -643,17 +644,28 @@ pub enum Stage {
     Compute {
         workgroup_size: [u32; 3],
     },
-    /// Returns a struct whose field `position` is the clip position; the rest are varyings.
+    /// Returns a struct that holds the clip position and the values passed to the fragment
+    /// shader (or a `ClipPosition` alone): each a member of WGSL's output struct.
     Vertex {
-        position_field: u32,
-        flat: Vec<bool>,
+        varyings: Vec<Varying>,
     },
-    /// Takes the vertex's varyings struct (if any) as its last argument; returns a vec4 color.
+    /// Takes the vertex's output (if it reads it) as its last argument: its type, and its
+    /// members. Returns a vec4 colour.
     Fragment {
-        varyings: Option<TypeId>,
-        position_field: Option<u32>,
-        flat: Vec<bool>,
+        varyings: Option<(TypeId, Vec<Varying>)>,
     },
+}
+
+/// A member of the struct a vertex shader passes to the fragment shader: the clip position,
+/// or a value WGSL passes in a location of its own.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Varying {
+    /// Where it is in the vertex's output: field indexes, then for a matrix a column's.
+    pub path: Vec<u32>,
+    /// The clip position (`@builtin(position)`).
+    pub position: bool,
+    /// Passed as it is, not interpolated (a `Flat<T>`'s value, or an integer).
+    pub flat: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]

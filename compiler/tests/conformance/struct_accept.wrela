@@ -8,12 +8,21 @@ struct Look: Copy {
 struct Pair: Copy + GpuData {
     a: vec3,
     b: f32,
+    on: bool,
+}
+
+// An enum is GPU data when its payloads are.
+enum Mark: Copy + GpuData {
+    None,
+    At(vec3),
+    Pair(Pair),
 }
 
 fn f() -> u32 {
     let base = Look { soft: true }
     let fine = Look { tolerance: 0.001, ..base }
-    let p = Pair { a: vec3(), b: 1.0 }
+    let p = Pair { a: vec3(), b: 1.0, on: true }
+    let m = Mark::Pair(p)
     let q = p
     fine.resolution + u32(q.b + p.b)
 }
