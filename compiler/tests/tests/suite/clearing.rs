@@ -2130,7 +2130,8 @@ fn clearing_copy(name: &str) -> PathBuf {
     let abs = |p: &str| repo_root().join(p).display().to_string();
     let text = text
         .replace("\"../../engine\"", &format!("{:?}", abs("engine")))
-        .replace("\"../grazer\"", &format!("{:?}", abs("examples/grazer")));
+        .replace("\"../grazer\"", &format!("{:?}", abs("examples/grazer")))
+        .replace("\"../great-tree\"", &format!("{:?}", abs("examples/great-tree")));
     std::fs::write(&manifest, text).expect("write wrela.toml");
     dir
 }

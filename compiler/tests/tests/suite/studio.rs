@@ -2125,3 +2125,43 @@ fn specs_blueprints_and_close_ups_answer_on_a_ball() {
     let off = lens.act("zoom", &[0.0, 0.0, 0.0, 0.0]);
     assert_eq!(off["framing"], "the subject", "{off}");
 }
+
+/// AC9 of #51: the great tree is a plant in wrela source (examples/great-tree, `engine::plant`),
+/// and the lens draws it, probes it and drags its literals, as it does a creature's. A tree is
+/// ten times a creature's size: the lens searches for its bounds in a box that grows until it
+/// holds the subject, and its rays reach past the subject's far side.
+#[test]
+#[ignore = "needs a GPU"]
+fn the_lens_draws_probes_and_drags_the_great_tree() {
+    let subject = Subject::new("great-tree", "lens");
+    let mut lens = subject.lens();
+    // Drawn: the whole tree, its crown 16 m up, framed in the side view.
+    let d = lens.act("describe", &[]);
+    let (lo, hi) = (vec3(&d["lo"]), vec3(&d["hi"]));
+    assert!(hi[1] > 15.0 && hi[0] - lo[0] > 18.0, "the tree's bounds: {lo:?} to {hi:?}");
+    lens.act_with("view", &[Value::I32(0)]);
+    let screen = lens.host.read_screen().expect("the screen");
+    let background = &screen[..4];
+    let drawn = screen.chunks(4).filter(|p| p[..3].iter().zip(background).any(|(a, b)| a.abs_diff(*b) > 24)).count();
+    let share = drawn as f64 / (screen.len() / 4) as f64;
+    assert!(share > 0.1, "the tree covers {:.1}% of the side view", share * 100.0);
+    // Probed: the trunk's wood and the crown's clumps, each part named.
+    let (_, trunk) = lens.ray([5.0, 0.5, 0.0], [-1.0, 0.0, 0.0]).expect("the trunk");
+    let (_, crown) = lens.ray([30.0, 12.0, 0.0], [-1.0, 0.0, 0.0]).expect("the crown");
+    assert_eq!((trunk.as_str(), crown.as_str()), ("limb", "clump"));
+    let p = lens.act("probe", &[0.0, 0.5, 0.0]);
+    assert!(p["distance"].as_f64().expect("a distance") < -0.5, "inside the trunk: {p}");
+    // Dragged: a point on the crown's side 25 cm out, written through `wrela edit`, landing
+    // within 1 mm of its target in the rebuilt tree.
+    let moved = lens.drag([30.0, 12.0, 0.0], [-1.0, 0.0, 0.0], [0.25, 0.0, 0.0]);
+    let changed = moved["literals"].as_array().map_or(0, Vec::len);
+    assert!((1..=LITERALS).contains(&changed), "{moved}");
+    assert!(moved["error_mm"].as_f64().expect("an error") <= 1.0, "{moved}");
+    let to = vec3(&moved["to"]);
+    let written = lens.act("write", &[]);
+    assert_eq!(written["answer"]["written"], true, "{written}");
+    let mut rebuilt = subject.rebuilt("drag");
+    let landed = distance(&mut rebuilt, to).abs() as f64;
+    assert!(landed <= ERROR, "the rebuilt tree is {:.2} mm from the target", landed * 1000.0);
+    subject.restore();
+}
