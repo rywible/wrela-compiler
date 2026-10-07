@@ -76,10 +76,10 @@ fn creature_cube() -> Aabb {
 /// std's `smin` chooses once, with one branch, so a blend's seam certifies: the smooth
 /// creature (two smooth unions) certifies to 7.8 mm leaves wherever its surface is. (The spike
 /// found std's earlier `smin`, which chose twice, with `min` and `abs`, left the seams open; its
-/// own `smin_if` certified at 3.9 mm.) The two boxes left open hold the body ellipsoid's centre,
-/// far inside, where std's ellipsoid bound divides by a length that can be 0, so its interval
-/// reaches 0: the spurious zero the spike's topology test found, which M1's grazer test keeps
-/// as it is (it compares interior values with spike 01's hand-written kernel).
+/// own `smin_if` certified at 3.9 mm.) No box is left open: std's ellipsoid has no zero inside
+/// the body (#28 §10.4). Its bound divided k0 (k0 − 1) by a length that's 0 at the centre, so
+/// its interval reached 0 there, the spurious zero the spike's topology test found, and the two
+/// boxes around the body's centre stayed open.
 #[test]
 fn smins_seams_certify() {
     let mut host = host();
@@ -93,7 +93,7 @@ fn smins_seams_certify() {
         let v = one_f32(&mut host, "value", &args);
         assert!(v.abs() > 2.0 * leaf, "an open box near the surface, at {c:?} (distance {v})");
     }
-    assert!(open.len() <= 2, "{} boxes open", open.len());
+    assert!(open.is_empty(), "{} boxes open, at {:?}", open.len(), open.first().map(|b| b.centre()));
 }
 
 /// A box's flat faces certify: with std's `cuboid` (one branch on inside or outside) and

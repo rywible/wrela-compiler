@@ -577,11 +577,14 @@ impl Surface for Ellipsoid {
     fn distance(self, p: vec3) -> f32 {
         let k0 = length(p / self.radii)
         let k1 = length(p / (self.radii * self.radii))
-        // At the centre the bound is 0 / 0; the distance there is minus the smallest radius.
-        if k1 == 0.0 {
-            return -min(self.radii.x, min(self.radii.y, self.radii.z))
-        }
-        k0 * (k0 - 1.0) / max(k1, 0.000000001)
+        // The usual bound, k0 (k0 - 1) / k1, written as (k0 - 1) times k0 / k1, which always
+        // lies between the smallest and the largest radius. Held there, it's the same value
+        // everywhere but the centre, where it's 0 / 0 and the distance is minus the smallest
+        // radius; and its interval never reaches 0 inside the body. (Spike 13's certificate
+        // found the zero that k0 (k0 - 1) / k1's interval had at the centre.)
+        let shortest = min(self.radii.x, min(self.radii.y, self.radii.z))
+        let longest = max(self.radii.x, max(self.radii.y, self.radii.z))
+        (k0 - 1.0) * clamp(k0 / max(k1, 0.000000001), shortest, longest)
     }
 
     fn bound(self) -> Bound {
