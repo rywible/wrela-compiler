@@ -14,9 +14,8 @@
 //! another site open in the browser can't edit the files. Test mode's results (`PUT
 //! /results/<file>`) go to the page's `results/`.
 
-use crate::studio;
+use crate::{http, studio};
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -281,60 +280,12 @@ const SCRIPT: &str = r#"<script>
 </script>
 "#;
 
-/// The largest request body the server takes (a test's frame, an edit's JSON).
-const MAX_BODY: usize = 16 << 20;
-
 fn handle(stream: TcpStream, state: &Shared) -> std::io::Result<()> {
-    let mut reader = BufReader::new(stream.try_clone()?);
-    let mut line = String::new();
-    reader.read_line(&mut line)?;
-    let mut parts = line.split_whitespace();
-    let (method, target) = (parts.next().unwrap_or(""), parts.next().unwrap_or("/"));
-    let mut length = 0usize;
-    let (mut host, mut origin) = (String::new(), None::<String>);
-    loop {
-        let mut h = String::new();
-        if reader.read_line(&mut h)? == 0 || h.trim().is_empty() {
-            break;
-        }
-        if let Some((k, v)) = h.split_once(':') {
-            let (k, v) = (k.trim(), v.trim());
-            if k.eq_ignore_ascii_case("content-length") {
-                length = v.parse().unwrap_or(0);
-            } else if k.eq_ignore_ascii_case("host") {
-                host = v.to_ascii_lowercase();
-            } else if k.eq_ignore_ascii_case("origin") {
-                origin = Some(v.to_ascii_lowercase());
-            }
-        }
-    }
-    let port = state.port;
-    let local = ["127.0.0.1", "localhost", "[::1]"];
-    if !local.iter().any(|h| host == *h || host == format!("{h}:{port}")) {
-        let why: &[u8] = b"this server answers only requests for this machine";
-        return respond(&mut stream.try_clone()?, 403, "text/plain", why);
-    }
-    // A post (an edit) only from this server's own pages.
-    if method == "POST" && origin.as_deref() != Some(format!("http://{host}").as_str()) {
-        let why: &[u8] = b"posts are taken only from this server's pages";
-        return respond(&mut stream.try_clone()?, 403, "text/plain", why);
-    }
-    // A body past the cap is refused, not cut short (and then written as if whole).
-    if length > MAX_BODY {
-        let why = format!("a request's body is at most {MAX_BODY} bytes");
-        return respond(&mut stream.try_clone()?, 413, "text/plain", why.as_bytes());
-    }
-    let mut body = vec![0u8; length];
-    reader.read_exact(&mut body)?;
-    let (path, query) = target.split_once('?').unwrap_or((target, ""));
+    let Some(req) = http::read(&stream, state.port)? else { return Ok(()) };
     let mut out = stream;
-    match (method, path) {
+    match (req.method.as_str(), req.path.as_str()) {
         ("GET", "/studio/state") => {
-            let since: usize = query
-                .split('&')
-                .find_map(|kv| kv.strip_prefix("since="))
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0);
+            let since: usize = req.param("since").and_then(|v| v.parse().ok()).unwrap_or(0);
             let s = state.live.lock().expect("the state");
             let updates: Vec<serde_json::Value> =
                 s.updates.iter().skip(since).map(|(i, v)| serde_json::json!([i, v])).collect();
@@ -344,34 +295,24 @@ fn handle(stream: TcpStream, state: &Shared) -> std::io::Result<()> {
                 "updates": updates,
                 "error": s.error,
             });
-            respond(&mut out, 200, "application/json", answer.to_string().as_bytes())
+            http::respond(&mut out, 200, "application/json", answer.to_string().as_bytes())
         }
         ("POST", "/studio/edit") => {
-            let answer = edit(state, &body);
-            respond(&mut out, 200, "application/json", answer.to_string().as_bytes())
+            let answer = edit(state, &req.body);
+            http::respond(&mut out, 200, "application/json", answer.to_string().as_bytes())
         }
-        ("PUT", _) if path.starts_with("/results/") => {
-            let name = &path["/results/".len()..];
-            let plain = !name.is_empty()
-                && name.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
-                && !name.starts_with('.');
-            if !plain {
-                return respond(&mut out, 403, "text/plain", b"a result is a plain file name");
-            }
-            let results = state.page.join("results");
-            std::fs::create_dir_all(&results)?;
-            crate::write_atomic(&results.join(name), &body)?;
-            respond(&mut out, 201, "text/plain", b"")
+        ("PUT", path) if path.starts_with("/results/") => {
+            http::put_result(&mut out, &state.page.join("results"), &path["/results/".len()..], &req.body)
         }
         ("POST", "/studio/reference") => match &state.reference {
-            Some(mask) => respond(&mut out, 200, "application/octet-stream", mask),
-            None => respond(&mut out, 404, "text/plain", b"no reference: serve with --reference"),
+            Some(mask) => http::respond(&mut out, 200, "application/octet-stream", mask),
+            None => http::respond(&mut out, 404, "text/plain", b"no reference: serve with --reference"),
         },
-        ("GET", _) => {
+        ("GET", path) => {
             let page = &state.page;
             let rel = if path == "/" { "index.html" } else { path.trim_start_matches('/') };
             if wrela_abi::check::path_problem(rel).is_some() {
-                return respond(&mut out, 404, "text/plain", b"not found");
+                return http::respond(&mut out, 404, "text/plain", b"not found");
             }
             match std::fs::read(page.join(rel)) {
                 Ok(mut bytes) => {
@@ -380,12 +321,12 @@ fn handle(stream: TcpStream, state: &Shared) -> std::io::Result<()> {
                             .replace("</body>", &format!("{SCRIPT}</body>"));
                         bytes = html.into_bytes();
                     }
-                    respond(&mut out, 200, mime(rel), &bytes)
+                    http::respond(&mut out, 200, http::mime(rel), &bytes)
                 }
-                Err(_) => respond(&mut out, 404, "text/plain", b"not found"),
+                Err(_) => http::respond(&mut out, 404, "text/plain", b"not found"),
             }
         }
-        _ => respond(&mut out, 405, "text/plain", b"not allowed"),
+        _ => http::respond(&mut out, 405, "text/plain", b"not allowed"),
     }
 }
 
@@ -405,36 +346,4 @@ fn edit(state: &Shared, body: &[u8]) -> serde_json::Value {
         }
     }
     answer
-}
-
-fn mime(path: &str) -> &'static str {
-    match path.rsplit('.').next() {
-        Some("html") => "text/html; charset=utf-8",
-        Some("js") => "text/javascript",
-        Some("wasm") => "application/wasm",
-        Some("json") => "application/json",
-        Some("wgsl") => "text/plain; charset=utf-8",
-        Some("png") => "image/png",
-        _ => "application/octet-stream",
-    }
-}
-
-/// An HTTP response, with the headers that let the page's workers share memory (COOP and
-/// COEP, which `SharedArrayBuffer` needs) and keep nothing cached.
-fn respond(out: &mut TcpStream, status: u16, kind: &str, body: &[u8]) -> std::io::Result<()> {
-    let reason = match status {
-        200 => "OK",
-        201 => "Created",
-        403 => "Forbidden",
-        404 => "Not Found",
-        413 => "Content Too Large",
-        _ => "Method Not Allowed",
-    };
-    write!(
-        out,
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nCross-Origin-Opener-Policy: same-origin\r\nCross-Origin-Embedder-Policy: require-corp\r\nConnection: close\r\n\r\n",
-        body.len()
-    )?;
-    out.write_all(body)?;
-    out.flush()
 }

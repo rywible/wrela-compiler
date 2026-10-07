@@ -13,7 +13,9 @@ pub mod consts;
 pub mod edit;
 pub mod explain;
 mod frames;
+mod http;
 pub mod lift;
+pub mod live;
 pub mod manifest;
 pub mod package;
 pub mod primer;
@@ -144,6 +146,18 @@ pub fn build_lifted(root: &Path, lift: &[String], debug: bool) -> Result<Output,
         }
         let mode = if debug { Mode::Debug } else { Mode::Release };
         Ok(compile_loaded(root, mode, wrela_lower::Roots::of, lift, loaded))
+    })
+}
+
+/// The packages of the program at `root`, the program's first and then its dependencies: each
+/// one's name (its manifest's) and its directory. An error if it doesn't load.
+pub fn packages(root: &Path) -> Result<Vec<(String, std::path::PathBuf)>, String> {
+    on_compiler_thread(|| {
+        let (sources, diagnostics, loaded) = load(root);
+        let Some(l) = loaded else {
+            return Err(wrela_diag::render::render_all(&sources, &diagnostics));
+        };
+        Ok(l.packages.iter().zip(l.dirs).skip(1).map(|(p, d)| (p.name.clone(), d)).collect())
     })
 }
 

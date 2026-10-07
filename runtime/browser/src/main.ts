@@ -143,6 +143,8 @@ function start(): void {
         playVoice(msg.voice, test, worker).catch((e: unknown) => failEarly(e, testing));
       } else if (msg.type === "load-query") {
         worker.postMessage({ type: "load", opened_ms: performance.timeOrigin, resources: loaded(["navigation", "resource"]) } satisfies ToWorker);
+      } else if (msg.type === "reload") {
+        location.reload();
       } else if (msg.type === "latency-start") {
         const sent = test?.keylatency ? sendKeyPresses(test.keylatency, msg.ms) : sendLatencyEvents(canvas, test?.latency ?? 0, msg.ms);
         sent.then(
@@ -163,7 +165,9 @@ function start(): void {
     const { width, height } = devicePixels(canvas);
     const sized = { width, height };
     listen(canvas, ring, epochNow, () => sized);
-    const msg: ToWorker = { type: "start", canvas: offscreen, base: document.baseURI, width, height, test, input: ring.buffer };
+    // `wrela run` serves the page with this mark: it sends new literals and builds (hot reload).
+    const live = document.querySelector('meta[name="wrela-live"]') !== null;
+    const msg: ToWorker = { type: "start", canvas: offscreen, base: document.baseURI, width, height, test, input: ring.buffer, live };
     worker.postMessage(msg, [offscreen]);
     if (!test) {
       const resize = (entry?: ResizeObserverEntry) => {

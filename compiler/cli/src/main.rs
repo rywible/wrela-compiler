@@ -67,6 +67,7 @@ mod pipelines;
 mod primer;
 mod query;
 mod refactor;
+mod run;
 mod reference;
 mod solve;
 mod studio;
@@ -94,6 +95,7 @@ pub(crate) fn usage() -> ExitCode {
         "wrela bisect <package-dir> --until \"<export> <op> <number>\" [--frames n] [--json] [--fps f] [--size WxH] [--input <script.json>] [--release]",
         "wrela reference replica <parts.toml> -o <out-dir> [--engine <dir>] [--harmonics k] [--sections-every m] [--seam m]",
         "wrela reference deviation <parts.toml> <package-dir> [--points n] [--json]",
+        "wrela run <package-dir> [--port N] [--lift <package>]... [--debug]",
         "wrela studio <package-dir> [serve [--port N] | build | run <script> | look | beside <manifest> | variants <package-dir>... | sweep <literal> <value>... | <action> [args...]] [--png FILE] [--view F] [--size WxH] [--reference PNG] [--debug]",
     ];
     eprintln!("usage:\n  {}\nqueries: {}", lines.join("\n  "), wrela_driver::query::KINDS);
@@ -118,6 +120,7 @@ fn main() -> ExitCode {
         "pipelines" => pipelines::run(rest),
         "test" => test::run(rest),
         "studio" => studio::run(rest),
+        "run" => run::run(rest),
         "reference" => reference::run(rest),
         "solve" => solve::run(rest),
         "primer" => primer::run(rest),

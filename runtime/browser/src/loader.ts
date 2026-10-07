@@ -3,7 +3,7 @@
 
 import { Checker, limitsOf } from "./check.ts";
 import { errorMessage } from "./errors.ts";
-import { buildPipelines, GpuExecutor, type ScreenTarget } from "./gpu.ts";
+import { type BuiltPipeline, buildPipelines, GpuExecutor, type ScreenTarget } from "./gpu.ts";
 import { type Manifest, parseManifest } from "./manifest.ts";
 import { type Io, Program, type ProgramOptions } from "./program.ts";
 import type { Bytes } from "./stream.ts";
@@ -101,9 +101,10 @@ export async function startProgram(
   timestamps = false,
   onPipelines?: (ms: number) => void,
   serial = false,
+  cache?: Map<string, Promise<BuiltPipeline>>,
 ): Promise<Program> {
   const started = performance.now();
-  const built = buildPipelines(device, build.manifest, build.shaders).then((p) => {
+  const built = buildPipelines(device, build.manifest, build.shaders, cache).then((p) => {
     onPipelines?.(performance.now() - started);
     return p;
   });

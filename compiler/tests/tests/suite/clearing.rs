@@ -2117,3 +2117,183 @@ fn sixty_frames_a_second_over_the_path_in_chrome() {
     );
     assert!(missed_runs.is_empty(), "{missed_runs:?}");
 }
+
+// ---- hot reload (#51 AC9) ----------------------------------------------------------------------
+
+/// The clearing copied to a scratch directory `name`, its dependencies' paths made absolute,
+/// for edits that leave the repository's files alone.
+fn clearing_copy(name: &str) -> PathBuf {
+    let dir = super::scratch(name);
+    wrela_tests::copy_dir(&repo_root().join("examples/clearing"), &dir);
+    let manifest = dir.join("wrela.toml");
+    let text = std::fs::read_to_string(&manifest).expect("wrela.toml");
+    let abs = |p: &str| repo_root().join(p).display().to_string();
+    let text = text
+        .replace("\"../../engine\"", &format!("{:?}", abs("engine")))
+        .replace("\"../grazer\"", &format!("{:?}", abs("examples/grazer")));
+    std::fs::write(&manifest, text).expect("write wrela.toml");
+    dir
+}
+
+/// Edits `file` of the package at `pkg`: replaces `from` with `to`, once.
+fn edit_file(pkg: &std::path::Path, file: &str, from: &str, to: &str) -> std::time::Instant {
+    let path = pkg.join(file);
+    let text = std::fs::read_to_string(&path).expect("the file");
+    assert!(text.contains(from), "{file} has no `{from}`");
+    std::fs::write(&path, text.replacen(from, to, 1)).expect("write the file");
+    std::time::Instant::now()
+}
+
+/// The mean difference of two frames (RGBA8), over RGB, in /255.
+fn mean_difference(a: &[u8], b: &[u8]) -> f64 {
+    let sum: u64 = a.chunks(4).zip(b.chunks(4)).map(|(p, q)| (0..3).map(|c| p[c].abs_diff(q[c]) as u64).sum::<u64>()).sum();
+    sum as f64 / (a.len() / 4 * 3) as f64
+}
+
+/// AC9's hot reload in the native host: the clearing, built lifted and watched
+/// (`wrela_driver::live::Watcher`), running. An edit of one of its literals (the sun's
+/// direction) shows within 0.5 s of its save, cooked into what depends on it (the sky, the
+/// shadows; the probes bake beside the old ones); a structural edit (a narrower field of view,
+/// a new literal in the code) within 3 s, the new build swapped in without a restart, where
+/// the old one was: the camera on its path and the creature on its walk as an unbroken run of
+/// the new build has them.
+#[test]
+#[ignore = "long: alone: the clearing built and run three times, needs a GPU"]
+fn hot_reload_in_the_native_host() {
+    let pkg = clearing_copy("clearing-hot-native-src");
+    let out = super::scratch("clearing-hot-native");
+    let _ = std::fs::remove_dir_all(&out);
+    let mut watcher = wrela_driver::live::Watcher::start(&pkg, &out, &[], false).expect("the first build");
+    let options = Options { quiet: true, ..Options::default() };
+    let mut c = Clearing { host: Host::load_with(&watcher.dir(), &options).expect("load"), frame: 0, script: Vec::new() };
+    c.walk();
+    c.until_ready(0);
+    while c.path_time() < 2.0 {
+        c.step();
+    }
+    let before = c.host.read_screen().expect("the screen");
+    // A literal: the sun lower in the west.
+    let t = edit_file(&pkg, "scene.wrela", "vec3(0.900, 0.407, -0.159)", "vec3(0.900, 0.250, -0.159)");
+    let literal_ms;
+    loop {
+        std::thread::sleep(wrela_driver::live::SCAN);
+        match watcher.poll() {
+            Some(wrela_driver::live::Change::Literals(values)) => {
+                for (i, v) in values {
+                    c.host.set_literal(i, v).expect("set");
+                }
+                c.step();
+                let _ = c.host.read_screen().expect("the screen");
+                literal_ms = t.elapsed().as_secs_f64() * 1000.0;
+                break;
+            }
+            Some(other) => panic!("a literal edit gave {other:?}"),
+            None => assert!(t.elapsed().as_secs() < 10, "the edit wasn't seen"),
+        }
+    }
+    let after = c.host.read_screen().expect("the screen");
+    let changed = mean_difference(&before, &after);
+    // A structural edit: the field of view narrowed by a new factor in the code.
+    let cam_before = c.camera();
+    let t = edit_file(&pkg, "main.wrela", "        FOVY,\n        width: w,", "        FOVY * 0.8,\n        width: w,");
+    let structural_ms;
+    let reloaded_at;
+    loop {
+        std::thread::sleep(wrela_driver::live::SCAN);
+        match watcher.poll() {
+            Some(wrela_driver::live::Change::Built { dir, .. }) => {
+                let _ = c.host.take_logs();
+                c.host.reload(Some(&dir)).expect("reload");
+                reloaded_at = c.frame;
+                // The new build shows nothing until it's cooked everything.
+                loop {
+                    c.step();
+                    if c.host.take_logs().iter().any(|l| l.starts_with("clearing ready")) {
+                        break;
+                    }
+                    assert!(c.frame < reloaded_at + 600, "the new build never got ready");
+                }
+                c.step();
+                let _ = c.host.read_screen().expect("the screen");
+                structural_ms = t.elapsed().as_secs_f64() * 1000.0;
+                break;
+            }
+            Some(other) => panic!("a structural edit gave {other:?}"),
+            None => assert!(t.elapsed().as_secs() < 30, "the edit wasn't seen"),
+        }
+    }
+    let cam_after = c.camera();
+    println!(
+        "a literal edit shown {literal_ms:.0} ms after its save (the frame changed by {changed:.1}/255); a structural one {structural_ms:.0} ms after, {} frames after the swap",
+        c.frame - reloaded_at
+    );
+    assert!(changed > 2.0, "the sun's edit changed the frame by only {changed:.2}/255");
+    assert!(literal_ms <= 500.0, "{literal_ms:.0} ms");
+    assert!(structural_ms <= 3000.0, "{structural_ms:.0} ms");
+    // The new build drew with the narrower view, from where an unbroken run of it would be.
+    let ratio = cam_after.tan_half / cam_before.tan_half;
+    assert!((ratio - (0.8f64 * 21f64.to_radians()).tan() / 21f64.to_radians().tan()).abs() < 1e-4, "{ratio}");
+    let mut fresh = Clearing { host: Host::load_with(&watcher.dir(), &options).expect("load"), frame: 0, script: Vec::new() };
+    fresh.walk();
+    while fresh.frame < c.frame {
+        fresh.step();
+    }
+    let (a, b) = (fresh.camera(), c.camera());
+    let gap = (0..3).map(|k| (a.eye[k] - b.eye[k]).abs()).fold(0.0, f64::max);
+    assert!(gap < 1e-3, "the camera after the reload is {gap} m from an unbroken run's: {:?} against {:?}", b.eye, a.eye);
+}
+
+/// Waits until the `wrela run` server has had `n` changes shown, or panics after `limit`.
+fn shown_by(server: &wrela_driver::live::Server, n: usize, limit: std::time::Duration) -> wrela_driver::live::Shown {
+    let began = std::time::Instant::now();
+    loop {
+        let shown = server.shown();
+        if shown.len() >= n {
+            return shown[n - 1].clone();
+        }
+        assert!(began.elapsed() < limit, "change {n} wasn't shown in {limit:?}: {:?}", server.changes());
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+}
+
+/// AC9's hot reload in Chrome: the clearing served by `wrela run` (`wrela_driver::live`), at
+/// 1080p, its frames paced at 60 Hz. A literal edit (the sun's direction) shows within 0.5 s of
+/// its save, a structural edit (a narrower field of view) within 3 s, the new build swapped in
+/// in the same page: each timed from the file's write to the page's report of the first frame
+/// that drew it.
+#[test]
+#[ignore = "long: alone: the clearing in Chrome for 25 s, needs a GPU"]
+fn hot_reload_in_chrome() {
+    let pkg = clearing_copy("clearing-hot-chrome-src");
+    let out = super::scratch("clearing-hot-chrome");
+    let server = wrela_driver::live::serve(&pkg, &out, 0, &[], false, true).expect("serve");
+    std::fs::write(out.join("1/script.json"), r#"[{"frame":1,"type":"key","key":"Space"}]"#).expect("the script");
+    let url = format!(
+        "http://127.0.0.1:{}/#test&frames=1500&width={W}&height={H}&fps=60&input=script.json&nohash=1",
+        server.port
+    );
+    let page = out.clone();
+    let chrome = std::thread::spawn(move || wrela_tests::run_url_in_chrome(&url, &page, 240));
+    let limit = std::time::Duration::from_secs(60);
+    // A first edit, shown once the page draws: temporal AA's blend, read each frame.
+    edit_file(&pkg, "main.wrela", "blend: 0.12,", "blend: 0.121,");
+    shown_by(&server, 1, limit);
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    let t = edit_file(&pkg, "scene.wrela", "vec3(0.900, 0.407, -0.159)", "vec3(0.900, 0.250, -0.159)");
+    let literal = shown_by(&server, 2, limit);
+    let literal_ms = t.elapsed().as_secs_f64() * 1000.0;
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    let t = edit_file(&pkg, "main.wrela", "        FOVY,\n        width: w,", "        FOVY * 0.8,\n        width: w,");
+    let structural = shown_by(&server, 3, limit);
+    let structural_ms = t.elapsed().as_secs_f64() * 1000.0;
+    chrome.join().expect("the Chrome run");
+    println!(
+        "a literal edit shown at frame {} after {literal_ms:.0} ms; a structural one at frame {} after {structural_ms:.0} ms",
+        literal.frame, structural.frame
+    );
+    assert_eq!((literal.kind.as_str(), structural.kind.as_str()), ("literals", "build"));
+    assert!(literal_ms <= 500.0, "a literal edit took {literal_ms:.0} ms");
+    assert!(structural_ms <= 3000.0, "a structural edit took {structural_ms:.0} ms");
+    let log = std::fs::read_to_string(out.join("results/log.txt")).expect("log.txt");
+    assert_eq!(log.lines().filter(|l| l.starts_with("clearing ready")).count(), 2, "{log}");
+}

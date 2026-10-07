@@ -243,8 +243,25 @@ async function buildPipeline(device: GPUDevice, p: Pipeline, source: string): Pr
 }
 
 /** Builds every pipeline up front. `shaders[i]` is pipeline `i`'s WGSL. */
-export function buildPipelines(device: GPUDevice, manifest: Manifest, shaders: string[]): Promise<BuiltPipeline[]> {
-  return Promise.all(manifest.pipelines.map((p, i) => buildPipeline(device, p, shaders[i]!)));
+export function buildPipelines(
+  device: GPUDevice,
+  manifest: Manifest,
+  shaders: string[],
+  cache?: Map<string, Promise<BuiltPipeline>>,
+): Promise<BuiltPipeline[]> {
+  return Promise.all(
+    manifest.pipelines.map((p, i) => {
+      if (!cache) return buildPipeline(device, p, shaders[i]!);
+      // A hot reload keeps a pipeline whose manifest entry and WGSL are the same.
+      const key = `${JSON.stringify(p)}\n${shaders[i]!}`;
+      let built = cache.get(key);
+      if (!built) {
+        built = buildPipeline(device, p, shaders[i]!);
+        cache.set(key, built);
+      }
+      return built;
+    }),
+  );
 }
 
 /** A draw waiting for its pass to end, with its own copy of its uniform bytes. */
@@ -437,6 +454,9 @@ export class GpuExecutor {
   readonly #debugFlag: { buffer: GPUBuffer; readback: GPUBuffer } | null;
   /** The frame being recorded, for timings. */
   frame = 0;
+  /** Whether a pass on the screen has ended since this was last cleared: a frame that drew
+   * nothing there leaves the screen as it was. */
+  presented = false;
   /** The name the program gave the next pass or dispatch (`Label`). */
   #label: string | null = null;
   /** The serial timing mode's commands, waiting for `drain` to run them each pass and dispatch
@@ -634,6 +654,9 @@ export class GpuExecutor {
         this.#pass?.draws.push({ ...cmd, uniforms: cmd.uniforms.slice() });
         return;
       case "Present":
+        this.presented = true;
+        this.#endPass(cmd.op);
+        return;
       case "EndPass":
         this.#endPass(cmd.op);
         return;
@@ -710,6 +733,14 @@ export class GpuExecutor {
   #allocated(bytes: number): void {
     this.#bytes += bytes;
     this.#peak = Math.max(this.#peak, this.#bytes);
+  }
+
+  /** Hot reload: every buffer and texture the program made, destroyed, after what's recorded
+   * is submitted; the executor is used no more. */
+  destroyAll(): void {
+    this.#pass = null;
+    for (const handle of [...this.#resources.keys()]) this.#destroy(handle);
+    this.flush();
   }
 
   #destroy(handle: number): void {

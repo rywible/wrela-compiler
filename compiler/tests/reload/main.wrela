@@ -7,6 +7,7 @@ use std::gpu::{ClipPosition, VertexIndex, begin_screen_pass, draw, present}
 use std::handoff::{Latest, Publisher, handoff}
 use std::hash::{StateHash, state_hash}
 use std::input::{Event, Key}
+use std::io::print
 use std::lift::{Watch, generation, reads}
 use std::reload::{keep, kept}
 use std::serialize::{LoadError, Serialize, load, save}
@@ -110,6 +111,11 @@ pub fn frame(g: mut Game, time: f32, width: u32, height: u32) {
         g.cooks += 1
     }
     g.carried.frames += 1
+    // The sim, now and then: a browser's run prints it, to compare with the native host's.
+    if g.carried.frames % 30 == 0 {
+        borrow s = g.latest.read()
+        print(f"frame {g.carried.frames}: ticks {s.ticks}, spaces {s.spaces}, sum {s.sum}")
+    }
     let bytes = save(g.carried)
     keep(bytes)
     begin_screen_pass(clear: vec4(tint() * 0.5, 1.0))

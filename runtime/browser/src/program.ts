@@ -20,6 +20,8 @@ import {
   JOB_SLOTS_END,
   MAX_WORKERS,
   PAR_HELPED,
+  PAR_SHUTDOWN,
+  PAR_WAKE,
   RUNNING,
   SLOT_FAILED,
   SLOT_STATE,
@@ -30,8 +32,11 @@ import {
   THREAD_HELPER0,
   THREAD_MAIN,
   EVENT_SIZE,
+  EXPORT_LIFT_SET,
   IMPORT_AUDIO,
   IMPORT_INPUT,
+  IMPORT_KEEP,
+  IMPORT_KEPT,
   IMPORT_LIMIT,
   IMPORT_MODULE,
   IMPORT_REQUEST_STATUS,
@@ -256,6 +261,10 @@ export interface ProgramOptions {
   /** Each tick reports its state's hash (wrela_abi memory's `TICK_WANT_HASH`), and so does the
    * ticker's `start`, in `init`: test mode keeps them in a tick log. */
   tickHashes?: boolean;
+  /** Hot reload: what the build this one replaces kept (`wrela.kept`), and its input not yet
+   * read. */
+  kept?: Uint8Array | undefined;
+  input?: Uint8Array[] | undefined;
 }
 
 /** A loaded program and everything that happens to its batches. */
@@ -288,6 +297,9 @@ export class Program {
   readonly #onPrint: ((line: string) => void) | null;
   /** Input events not yet read (`wrela.input`), EVENT_SIZE bytes each, oldest first. */
   #input: Uint8Array[] = [];
+  /** What the replaced build kept (`wrela.kept`), and what this one keeps (`wrela.keep`). */
+  readonly #kept: Uint8Array;
+  #keeping = new Uint8Array(0);
 
   private constructor(
     readonly checker: Checker,
@@ -299,6 +311,8 @@ export class Program {
     this.#startVoice = options.startVoice ?? null;
     this.#startTicker = options.startTicker ?? null;
     this.#onPrint = options.onPrint ?? null;
+    this.#kept = options.kept ?? new Uint8Array(0);
+    this.#input = options.input ? [...options.input] : [];
   }
 
   static async load(wasm: Bytes, checker: Checker, executor: Executor, options: ProgramOptions = {}): Promise<Program> {
@@ -348,6 +362,8 @@ export class Program {
         [IMPORT_AUDIO]: (task: number, context: number) => program.#audioImport(task >>> 0, context >>> 0),
         [IMPORT_INPUT]: (ptr: number, cap: number) => program.#inputImport(ptr >>> 0, cap >>> 0),
         [IMPORT_TICK]: (task: number, context: number, hz: number) => program.#tickImport(task >>> 0, context >>> 0, hz >>> 0),
+        [IMPORT_KEEP]: (ptr: number, len: number) => program.#keepImport(ptr >>> 0, len >>> 0),
+        [IMPORT_KEPT]: (ptr: number, cap: number) => program.#keptImport(ptr >>> 0, cap >>> 0),
       },
     };
     // As the native host words it: a module that can't be instantiated isn't a valid program.
@@ -502,6 +518,54 @@ export class Program {
     for (let i = 0; i < n; i++) memory.set(this.#input[i]!, ptr + i * EVENT_SIZE);
     this.#input.splice(0, n);
     return n;
+  }
+
+  /** `wrela.keep(ptr, len)`: keeps those bytes for the build that replaces this one. */
+  #keepImport(ptr: number, len: number): void {
+    this.#starting();
+    const memory = new Uint8Array(this.#memory!.buffer);
+    if (ptr + len > memory.length) throw new TrapError(`keep(${ptr}, ${len}) reaches past the end of the program's memory`);
+    this.#keeping = memory.slice(ptr, ptr + len);
+  }
+
+  /** `wrela.kept(ptr, cap) -> length`: copies up to `cap` bytes of what the replaced build
+   * kept to `ptr`; how many it kept. */
+  #keptImport(ptr: number, cap: number): number {
+    this.#starting();
+    const n = Math.min(cap, this.#kept.length);
+    const memory = new Uint8Array(this.#memory!.buffer);
+    if (ptr + n > memory.length) throw new TrapError(`kept(${ptr}, ${cap}) reaches past the end of the program's memory`);
+    memory.set(this.#kept.subarray(0, n), ptr);
+    return this.#kept.length;
+  }
+
+  /** Hot reload: what this build keeps for the one that replaces it, and its input not yet
+   * read. */
+  get keeping(): Uint8Array {
+    return this.#keeping;
+  }
+
+  get unreadInput(): Uint8Array[] {
+    return this.#input;
+  }
+
+  /** Hot reload of a literal: in a lifted build, literal `i` takes `value` from the next call
+   * on (`__lift_set`). False if the build isn't lifted. */
+  setLiteral(i: number, value: number): boolean {
+    const f = this.#instance?.exports[EXPORT_LIFT_SET];
+    if (typeof f !== "function") return false;
+    this.#call(() => (f as (i: number, v: number) => void)(i, value));
+    return true;
+  }
+
+  /** Stops the program's helpers (they see the flag when they wake): the program runs no
+   * more (a hot reload replaces it). */
+  shutdown(): void {
+    if (!this.#memory) return;
+    const words = new Int32Array(this.#memory.buffer);
+    Atomics.store(words, PAR_SHUTDOWN / 4, 1);
+    Atomics.add(words, PAR_WAKE / 4, 1);
+    Atomics.notify(words, PAR_WAKE / 4);
   }
 
   /** `wrela.audio(task, context)`: starts the program's voice, once. */

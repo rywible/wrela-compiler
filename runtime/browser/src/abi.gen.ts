@@ -128,6 +128,9 @@ export const SLOT_THREAD = 12;
 export const SLOT_FAILED = 5;
 /** How many chunks the helpers have run (one of their shared words). */
 export const PAR_HELPED = 264;
+/** The helpers' wake count and shutdown flag: a host stops a program's helpers with them. */
+export const PAR_WAKE = 256;
+export const PAR_SHUTDOWN = 260;
 /** The ticker's words (runtime/abi `memory`), and its records' region. */
 export const TICK_WANT_HASH = 512;
 export const TICK_HASH = 520;

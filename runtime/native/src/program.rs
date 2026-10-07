@@ -67,6 +67,7 @@ pub(crate) trait Executor: 'static {
         wrela_abi::Limits::DEFAULT
     }
     /// Hot reload: forget the old build's resources, and take the new build's pipelines.
+    #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
     fn reload(&mut self, _manifest: &Manifest, _shaders: &[String]) -> Result<()> {
         Ok(())
     }
@@ -394,7 +395,8 @@ pub struct Ticked {
 
 pub(crate) struct Program<E: 'static> {
     store: Store<State<E>>,
-    /// The worker threads, which return when the program is dropped.
+    /// The worker threads, which return when the program is dropped (or retired).
+    #[allow(dead_code)]
     threads: Helpers,
     memory: SharedMemory,
     module: Module,
@@ -730,6 +732,7 @@ impl<E: Executor> Program<E> {
     /// stop, and what carries over to the new one is handed back
     /// ([`Program::instantiate_carrying`]). Ticks it was still to replay are replayed by the
     /// next build too.
+    #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
     pub(crate) fn retire(self) -> Retired<E> {
         let Program { store, threads, ticker, ran, replay, records, .. } = self;
         drop(threads);

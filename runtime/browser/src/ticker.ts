@@ -16,7 +16,7 @@ import { EVENT_SIZE, EXPORT_TICK, MAX_TICK_RECORDS, THREAD_TICK, TICK_HASH, TICK
 import { errorMessage } from "./errors.ts";
 import { VisibleClock } from "./frame.ts";
 import { type Arrivals, arrivals, epochNow, InputRing } from "./input.ts";
-import type { FromTicker, TickerStart, TickReport } from "./messages.ts";
+import type { FromTicker, Replay, TickerStart, TickReport } from "./messages.ts";
 import { Lines } from "./lines.ts";
 import { otherInstance, TrapError, trapMessage } from "./program.ts";
 import { holdFor } from "./testmode.ts";
@@ -178,7 +178,7 @@ export async function runTicker(start: TickerStart, post: (msg: FromTicker) => v
     post({ type: "fatal", message: errorMessage(e) });
     return;
   }
-  post({ type: "ticks", report: ticker.report, log: ticker.log?.encode() ?? null });
+  post({ type: "ticks", report: ticker.report, log: ticker.log?.encode() ?? null, replay: ticker.replayed() });
 }
 
 /** Where a tick's records are, after their count. */
@@ -201,6 +201,10 @@ class Ticker {
   t0: number | null = null;
   readonly log: TickLogWriter | null;
   readonly report: TickReport = { cpu_ms: [] };
+  /** The records of each tick run that had any: what a build that replaces this one replays. */
+  readonly ran: [number, Uint8Array<ArrayBuffer>][] = [];
+  /** Hot reload: the ticks the replaced build ran, run again first with their records. */
+  readonly replay: { upto: number; ticks: Map<number, Uint8Array<ArrayBuffer>> } | null;
   /** Views of the shared memory, made once: a view of shared memory stays valid as it grows,
    * and the ticker's words and records are below the heap. */
   readonly #view: DataView;
@@ -220,6 +224,26 @@ class Ticker {
     // The first world's hash, which `start` reported before the ticker began.
     const first = this.#view.getBigUint64(TICK_HASH, true);
     this.log = start.hashes ? new TickLogWriter(start.wasmHash, start.hz, first) : null;
+    const r = start.replay;
+    this.replay = r && r.upto > 0 ? { upto: r.upto, ticks: new Map(r.ticks) } : null;
+    // A script's events of the frames started before the reload reached the replaced build.
+    if (r) this.framesQueued = control.frames;
+    // The replaced build's clock goes on: its ticks were due when they were.
+    if (r?.origin != null) this.setOrigin(r.origin);
+  }
+
+  /** Whether the next tick is one the replaced build ran. */
+  get replaying(): boolean {
+    return this.replay !== null && this.next < this.replay.upto;
+  }
+
+  /** What a build that replaces this one replays: the ticks run (and those still to replay),
+   * with their records, and the clock's origin. */
+  replayed(): Replay {
+    const ticks = new Map(this.ran);
+    if (this.replay) for (const [k, r] of this.replay.ticks) if (!ticks.has(k)) ticks.set(k, r);
+    const upto = Math.max(this.next, this.replay?.upto ?? 0);
+    return { upto, ticks: [...ticks].sort((a, b) => a[0] - b[0]), origin: this.t0 };
   }
 
   loop(): void {
@@ -228,6 +252,11 @@ class Ticker {
       const seen = control.wakes;
       if (control.stopped) return;
       const mode = control.mode;
+      // Hot reload, on the ticker's own clock: the replaced build's ticks first, at once.
+      if (mode === TickerMode.CLOCK && this.replaying) {
+        this.runTick();
+        continue;
+      }
       if (mode === TickerMode.LOCKSTEP) {
         if (this.next < control.target) this.runTick();
         else control.sleep(seen);
@@ -274,17 +303,28 @@ class Ticker {
   runTick(): void {
     const { start, control, queue } = this;
     const k = this.next;
-    let n = Math.min(queue.length, MAX_TICK_RECORDS);
-    for (let i = 0; i < n; i++) this.#bytes.set(queue[i]!, RECORDS + i * EVENT_SIZE);
-    if (n > 0) queue.splice(0, n);
-    for (const frames = control.frames; this.framesQueued < frames; this.framesQueued++) {
-      n = this.#stamp(this.script.frames.get(this.framesQueued) ?? NONE, n);
+    let n = 0;
+    if (this.replaying) {
+      // The records the replaced build's tick had; what arrives meanwhile waits.
+      const logged = this.replay!.ticks.get(k);
+      if (logged) {
+        this.#bytes.set(logged, RECORDS);
+        n = logged.length / EVENT_SIZE;
+      }
+    } else {
+      n = Math.min(queue.length, MAX_TICK_RECORDS);
+      for (let i = 0; i < n; i++) this.#bytes.set(queue[i]!, RECORDS + i * EVENT_SIZE);
+      if (n > 0) queue.splice(0, n);
+      for (const frames = control.frames; this.framesQueued < frames; this.framesQueued++) {
+        n = this.#stamp(this.script.frames.get(this.framesQueued) ?? NONE, n);
+      }
+      if (n < MAX_TICK_RECORDS) n += this.ring.readTicker(this.#bytes, RECORDS + n * EVENT_SIZE, MAX_TICK_RECORDS - n);
+      n = this.#stamp(this.script.ticks.get(k) ?? NONE, n);
     }
-    if (n < MAX_TICK_RECORDS) n += this.ring.readTicker(this.#bytes, RECORDS + n * EVENT_SIZE, MAX_TICK_RECORDS - n);
-    n = this.#stamp(this.script.ticks.get(k) ?? NONE, n);
     this.#view.setUint32(TICK_RECORDS, n, true);
-    // The log's copy of the records, taken before the tick runs.
-    const records = this.log ? this.#bytes.slice(RECORDS, RECORDS + n * EVENT_SIZE) : null;
+    // The records, taken before the tick runs: for the log, and for a build that replaces this.
+    const records = this.#bytes.slice(RECORDS, RECORDS + n * EVENT_SIZE);
+    if (n > 0) this.ran.push([k, records]);
     const began = epochNow();
     try {
       this.tick(THREAD_TICK, start.task, start.context, k);
@@ -295,7 +335,7 @@ class Ticker {
     const cpu = epochNow() - began;
     if (start.delay > 0) holdFor(start.delay);
     if (start.timing) this.report.cpu_ms.push(cpu);
-    if (this.log) this.log.push(records!, this.#view.getBigUint64(TICK_HASH, true));
+    if (this.log) this.log.push(records, this.#view.getBigUint64(TICK_HASH, true));
     this.next = k + 1;
     control.ran(this.next);
   }

@@ -46,7 +46,9 @@ pub use wrela_abi::ticks::{TickLog, frame_time, lockstep_ticks};
 #[cfg(feature = "gpu")]
 use gpu::Gpu;
 use program::Program;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(feature = "gpu")]
+use std::path::PathBuf;
 use wrela_abi::Manifest;
 
 /// How to run a program.

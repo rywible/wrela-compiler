@@ -7,11 +7,12 @@ import { MAX_WORKERS, SCREEN_FORMAT } from "./abi.gen.ts";
 import { LIMIT_SOURCES } from "./check.ts";
 import { errorMessage } from "./errors.ts";
 import { fitSize, frameSeconds, VisibleClock } from "./frame.ts";
-import { alignTo, type GpuExecutor } from "./gpu.ts";
+import { alignTo, type BuiltPipeline, type GpuExecutor } from "./gpu.ts";
 import { arrivals, epochNow, InputRing, parseScript, type Scripted } from "./input.ts";
 import { browserIo, type Build, loadBuild, startProgram } from "./loader.ts";
+import { Live } from "./live.ts";
 import { type Program, runWorker, type SpawnWorker } from "./program.ts";
-import type { FromTicker, FromWorker, Loaded, TickerOptions, TickerStart, TickReport, ToWorker, VoiceOptions } from "./messages.ts";
+import type { FromTicker, FromWorker, Loaded, Replay, TickerOptions, TickerStart, TickReport, ToWorker, VoiceOptions } from "./messages.ts";
 import { encodePng } from "./png.ts";
 import { frameTime, holdFor, loaded, putResult, sleepUntil, type TestParams } from "./testmode.ts";
 import { lockstepTicks, runTicker, TickerControl, TickerMode } from "./ticker.ts";
@@ -85,11 +86,13 @@ function context(canvas: OffscreenCanvas, device: GPUDevice, usage: number): GPU
 /** Visible time, which frames and ticks count (frame.ts). */
 const clock = VisibleClock.create();
 
-/** The ticker's thread, once the program starts its ticker. */
+/** The ticker's thread, once the program starts its ticker. A hot reload gives the new
+ * build's ticker a new one. */
 const ticker = {
   control: TickerControl.create(),
-  /** Test mode: resolved with the ticks when the ticker's thread has stopped. */
-  report: null as Promise<{ report: TickReport; log: Uint8Array<ArrayBuffer> | null }> | null,
+  /** Resolved with the ticks when the ticker's thread has stopped (test mode, a hot reload). */
+  report: null as Promise<{ report: TickReport; log: Uint8Array<ArrayBuffer> | null; replay: Replay }> | null,
+  thread: null as Worker | null,
 };
 
 /** How the ticker's thread runs the ticks: test mode's settings, or none (`NORMAL_TICKS`). */
@@ -99,11 +102,14 @@ type TickSettings = Pick<TickerStart, "script" | "hashes" | "timing" | "delay">;
 const NORMAL_TICKS: TickSettings = { script: [], hashes: false, timing: false, delay: 0 };
 
 /** What starts the program's ticker on its own thread, with `settings`: this script again, told
- * to run it. `wasm` is the build's, whose hash heads the tick log when hashes are kept. */
-function tickerStarter(wasm: Uint8Array, settings: TickSettings): (options: TickerOptions) => void {
+ * to run it. `wasm` is the build's, whose hash heads the tick log when hashes are kept. With
+ * `replay`, a hot reload's: the ticker runs the replaced build's ticks again first, and reads
+ * the input ring on from where the replaced one stopped. */
+function tickerStarter(wasm: Uint8Array, settings: TickSettings, replay: Replay | null = null): (options: TickerOptions) => void {
   return (options) => {
-    ring?.attachTicker();
+    if (replay === null) ring?.attachTicker();
     const thread = new Worker(self.location.href, { type: "module", name: "wrela sim" });
+    ticker.thread = thread;
     ticker.report = new Promise((resolve) => {
       thread.onmessage = (event: MessageEvent<FromTicker>) => {
         const msg = event.data;
@@ -123,8 +129,53 @@ function tickerStarter(wasm: Uint8Array, settings: TickSettings): (options: Tick
       clock: clock.buffer,
       input: ring!.buffer,
       wasmHash: settings.hashes ? wasmHash(wasm) : 0n,
+      replay,
     } satisfies ToWorker);
   };
+}
+
+// ---- Hot reload ----
+
+/** The pipelines built so far, by their manifest entry and WGSL: a new build keeps those that
+ * are the same. */
+const pipelineCache = new Map<string, Promise<BuiltPipeline>>();
+
+/** The helper threads the running program started: a hot reload stops them. */
+const helpers: Worker[] = [];
+
+/** What a replaced program hands on to its new build: what it kept, its input not yet read,
+ * and its ticks to run again. */
+interface Carried {
+  kept: Uint8Array;
+  input: Uint8Array[];
+  replay: Replay | null;
+}
+
+/** Stops `old` for the build at `base` (hot reload): its ticker stops and reports its ticks,
+ * its helpers stop, and its buffers and textures go. `start` starts the new build with what
+ * the old one hands on; the ticker's new words say `frames` frames have started. */
+async function swap(
+  old: Program,
+  base: string,
+  frames: number,
+  start: (build: Build, carried: Carried) => Promise<Program>,
+): Promise<Program> {
+  const build = await loadBuild(base);
+  let replay: Replay | null = null;
+  if (old.ticker !== null && ticker.report !== null) {
+    const stopped = ticker.report;
+    ticker.control.stop();
+    replay = (await stopped).replay;
+    ticker.thread?.terminate();
+  }
+  old.shutdown();
+  for (const h of helpers.splice(0)) h.terminate();
+  (old.executor as GpuExecutor).destroyAll();
+  ticker.control = TickerControl.create();
+  ticker.report = null;
+  ticker.thread = null;
+  ticker.control.framesStarted(frames);
+  return start(build, { kept: old.keeping, input: old.unreadInput, replay });
 }
 
 // ---- Running normally ----
@@ -139,29 +190,61 @@ const startVoice = (voice: VoiceOptions) => self.postMessage({ type: "audio", vo
  * and the ticker's thread, at most MAX_WORKERS (#43 §2.1). The program's own thread counts too. */
 const normalWorkers = () => Math.max(0, Math.min((navigator.hardwareConcurrency || 1) - 3, MAX_WORKERS)) + 1;
 
-async function run(canvas: OffscreenCanvas, device: GPUDevice, build: Build): Promise<void> {
+async function run(canvas: OffscreenCanvas, device: GPUDevice, build: Build, live: Live | null): Promise<void> {
   const ctx = context(canvas, device, GPUTextureUsage.RENDER_ATTACHMENT);
   clock.startAt(epochNow());
-  const program = await startProgram(
-    device,
-    build,
-    { texture: () => ctx.getCurrentTexture() },
-    {
-      io: browserIo(base),
-      workers: normalWorkers(),
-      spawnWorker,
-      startVoice,
-      startTicker: tickerStarter(build.wasm, NORMAL_TICKS),
-    },
-  );
+  const screen = { texture: () => ctx.getCurrentTexture() };
+  const start = (b: Build, carried: Carried | null) =>
+    startProgram(
+      device,
+      b,
+      screen,
+      {
+        io: browserIo(base),
+        workers: normalWorkers(),
+        spawnWorker,
+        startVoice,
+        startTicker: tickerStarter(b.wasm, NORMAL_TICKS, carried?.replay ?? null),
+        kept: carried?.kept,
+        input: carried?.input,
+      },
+      false,
+      undefined,
+      false,
+      pipelineCache,
+    );
+  let program = await start(build, null);
   ticker.control.go(TickerMode.CLOCK);
   const max = device.limits.maxTextureDimension2D;
-  const executor = program.executor as GpuExecutor;
   // A debug build's bounds checks: the flag is read after a frame, one read at a time.
   let checking = false;
+  // Hot reload: the frames drawn, and whether a new build is being swapped in (the canvas
+  // keeps the last frame meanwhile).
+  let frames = 0;
+  let swapping = false;
   const tick = (now: number) => {
     if (failed) return;
     try {
+      const next = live && !swapping ? live.take(program) : null;
+      if (next !== null) {
+        // A voice plays on the main thread, which a swap can't reach: the page reloads.
+        if (program.hasVoice) {
+          self.postMessage({ type: "reload" } satisfies FromWorker);
+          return;
+        }
+        swapping = true;
+        swap(program, next, frames, start).then((p) => {
+          program = p;
+          ticker.control.go(TickerMode.CLOCK);
+          live!.swapped();
+          swapping = false;
+        }, fatal);
+      }
+      if (swapping) {
+        self.requestAnimationFrame(tick);
+        return;
+      }
+      const executor = program.executor as GpuExecutor;
       const time = frameSeconds(clock, performance.timeOrigin + now);
       if (time !== null) {
         const { width, height } = fitSize(size.width, size.height, max);
@@ -170,7 +253,11 @@ async function run(canvas: OffscreenCanvas, device: GPUDevice, build: Build): Pr
           canvas.height = height;
         }
         deliverInput(program);
+        executor.presented = false;
         program.frame(time, width, height);
+        // A change is shown by the first frame that draws after it.
+        if (executor.presented) live?.drawn(frames);
+        frames++;
         if (!checking) {
           checking = true;
           executor.checkDebugFlag().then(() => (checking = false), fatal);
@@ -220,7 +307,7 @@ async function readTexture(device: GPUDevice, texture: GPUTexture): Promise<Uint
   return out;
 }
 
-async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build, params: TestParams): Promise<void> {
+async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build, params: TestParams, live: Live | null): Promise<void> {
   const { frames, width, height, fps } = params;
   // What the program printed (`results/log.txt`), and each frame's CPU time: the program's
   // `frame` and its batch's checks and encoding, up to its submission (`results/frames.json`).
@@ -249,52 +336,57 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
     params.salt > 0
       ? { ...build, shaders: build.shaders.map((s, i) => `${s}\n// salt ${params.salt} ${i}\n`) }
       : build;
-  const program = await startProgram(
-    device,
-    salted,
-    {
-      texture: () => screen,
+  const target = {
+    texture: () => screen,
       // Saturated, the canvas is left alone: it shows a frame per display refresh, and would
       // pace the frames by the display's.
-      afterPass: (encoder) => {
-        if (params.saturate === 0) {
-          encoder.copyTextureToTexture({ texture: screen }, { texture: ctx.getCurrentTexture() }, [width, height]);
-        }
+    afterPass: (encoder: GPUCommandEncoder) => {
+      if (params.saturate === 0) {
+        encoder.copyTextureToTexture({ texture: screen }, { texture: ctx.getCurrentTexture() }, [width, height]);
+      }
+    },
+  };
+  const start = (b: Build, carried: Carried | null) =>
+    startProgram(
+      device,
+      b,
+      target,
+      {
+        hash: hashes,
+        io: browserIo(base),
+        workers: params.workers,
+        spawnWorker,
+        startVoice,
+        startTicker: tickerStarter(b.wasm, { script, hashes, timing: true, delay: params.tickdelay }, carried?.replay ?? null),
+        tickHashes: hashes,
+        onPrint: (line) => {
+          printed.push(line);
+          printed_in.push(frameNow);
+        },
+        kept: carried?.kept,
+        input: carried?.input,
       },
-    },
-    {
-      hash: hashes,
-      io: browserIo(base),
-      workers: params.workers,
-      spawnWorker,
-      startVoice,
-      startTicker: tickerStarter(build.wasm, { script, hashes, timing: true, delay: params.tickdelay }),
-      tickHashes: hashes,
-      onPrint: (line) => {
-        printed.push(line);
-        printed_in.push(frameNow);
+      params.timestamps > 0,
+      (ms) => {
+        pipelinesMs = ms;
       },
-    },
-    params.timestamps > 0,
-    (ms) => {
-      pipelinesMs = ms;
-    },
-    params.timestamps === 2,
-  );
-  const executor = program.executor as GpuExecutor;
+      params.timestamps === 2,
+      pipelineCache,
+    );
+  let program = await start(salted, null);
+  let executor = program.executor as GpuExecutor;
   if (params.timestamps > 0 && !executor.timed) throw new GpuError("the test asks for timestamps, but this device has no timestamp queries");
-  const hash = program.hash;
-  const hz = program.ticker?.hz ?? 0;
-  const control = ticker.control;
+  let hz = program.ticker?.hz ?? 0;
+  const schedule = params.paced > 0 ? TickerMode.CLOCK : TickerMode.LOCKSTEP;
   // The latency test: when each frame started, and which events (by when they were sent) it got.
   const latency = { frames: [] as number[], delivered: [] as { sent: number; frame: number }[] };
   if (params.latency > 0 || params.keylatency > 0) {
     self.postMessage({ type: "latency-start", ms: ((frames - 2) * 1000) / fps } satisfies FromWorker);
   }
-  const start = performance.now();
+  const began0 = performance.now();
   if (hz > 0) {
     clock.startAt(epochNow());
-    control.go(params.paced > 0 ? TickerMode.CLOCK : TickerMode.LOCKSTEP);
+    ticker.control.go(schedule);
   }
   // Saturated, the frames the GPU hasn't finished (at most two: the CPU records a frame while
   // the GPU draws the last).
@@ -302,7 +394,17 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
   for (let i = 0; i < frames; i++) {
     // Paced at `fps`, as a display paces frames: requests are answered in real time between
     // them, as when the game runs.
-    if (params.saturate === 0) await sleepUntil(start + (i * 1000) / fps);
+    if (params.saturate === 0) await sleepUntil(began0 + (i * 1000) / fps);
+    // Hot reload: a new build replaces the program before this frame.
+    const next = live?.take(program) ?? null;
+    if (next !== null) {
+      program = await swap(program, next, i, start);
+      executor = program.executor as GpuExecutor;
+      hz = program.ticker?.hz ?? 0;
+      if (hz > 0) ticker.control.go(schedule);
+      live!.swapped();
+    }
+    const control = ticker.control;
     executor.frame = i;
     control.framesStarted(i + 1);
     if (hz > 0 && params.paced === 0) {
@@ -331,9 +433,12 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
       if (inFlight.length > 2) await inFlight.shift();
     } else await device.queue.onSubmittedWorkDone();
     await executor.checkDebugFlag();
+    if (executor.presented) live?.drawn(i);
+    executor.presented = false;
   }
+  const hash = program.hash;
   if (hz > 0) {
-    control.stop();
+    ticker.control.stop();
     const { report, log } = await ticker.report!;
     await Promise.all([
       putResult(base, "ticks.json", JSON.stringify({ hz, ...report })),
@@ -372,6 +477,7 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
 /** Starts a worker thread for the program's parallel jobs: this script again, told to run them. */
 const spawnWorker: SpawnWorker = (module, memory, index) => {
   const thread = new Worker(self.location.href, { type: "module", name: `wrela thread ${index}` });
+  helpers.push(thread);
   thread.postMessage({ type: "thread", module, memory, index } satisfies ToWorker);
 };
 
@@ -413,8 +519,10 @@ self.onmessage = (event: MessageEvent<ToWorker>) => {
       size = { width: msg.width, height: msg.height };
       const test = msg.test;
       // The device and the build are fetched at once.
+      const live = msg.live ? new Live(base) : null;
+      live?.start();
       Promise.all([openDevice((test?.timestamps ?? 0) > 0), loadBuild(base)])
-        .then(([device, build]) => (test ? runTest(msg.canvas, device, build, test) : run(msg.canvas, device, build)))
+        .then(([device, build]) => (test ? runTest(msg.canvas, device, build, test, live) : run(msg.canvas, device, build, live)))
         .catch(fatal);
       return;
     }

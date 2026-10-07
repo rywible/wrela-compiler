@@ -125,6 +125,9 @@ export const SLOT_THREAD = {slot_thread};
 export const SLOT_FAILED = {slot_failed};
 /** How many chunks the helpers have run (one of their shared words). */
 export const PAR_HELPED = {par_helped};
+/** The helpers' wake count and shutdown flag: a host stops a program's helpers with them. */
+export const PAR_WAKE = {par_wake};
+export const PAR_SHUTDOWN = {par_shutdown};
 /** The ticker's words (runtime/abi `memory`), and its records' region. */
 export const TICK_WANT_HASH = {tick_want_hash};
 export const TICK_HASH = {tick_hash};
@@ -211,6 +214,8 @@ export const PANIC_CAP = {panic_cap};
         slot_thread = crate::memory::SLOT_THREAD,
         slot_failed = crate::memory::SLOT_FAILED,
         par_helped = crate::memory::PAR_HELPED,
+        par_wake = crate::memory::PAR_WAKE,
+        par_shutdown = crate::memory::PAR_SHUTDOWN,
         tick_want_hash = crate::memory::TICK_WANT_HASH,
         tick_hash = crate::memory::TICK_HASH,
         tick_origin = crate::memory::TICK_ORIGIN,

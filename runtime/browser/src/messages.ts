@@ -17,6 +17,9 @@ export type ToWorker =
       test: TestParams | null;
       /** The ring the main thread writes input events into (input.ts). */
       input: SharedArrayBuffer;
+      /** The page is served by `wrela run`: new literals and new builds come while it runs
+       * (hot reload, live.ts). */
+      live: boolean;
     }
   | { type: "resize"; width: number; height: number }
   | { type: "visibility"; visible: boolean }
@@ -47,7 +50,9 @@ export type FromWorker =
   /** Test mode: the main thread answers with what the page loaded (`load`). */
   | { type: "load-query" }
   /** The program started its voice: the main thread plays it in an AudioWorklet. */
-  | { type: "audio"; voice: VoiceOptions };
+  | { type: "audio"; voice: VoiceOptions }
+  /** Hot reload of a program whose voice plays: the page reloads. */
+  | { type: "reload" };
 
 /** The program's voice, as the audio worklet's processor gets it: the module and memory to
  * run it with, and the task and context `__audio` takes (wrela_abi's `IMPORT_AUDIO`). */
@@ -88,6 +93,16 @@ export interface TickerStart extends TickerOptions {
   wasmHash: bigint;
   /** Test mode: each tick is held this many ms more, as if it took that long. */
   delay: number;
+  /** Hot reload: the ticks the replaced build ran, to run again first, and its clock's origin. */
+  replay: Replay | null;
+}
+
+/** The ticks a replaced build ran (hot reload): how many, the records of those that had any,
+ * and the origin of its clock (std::tick's `origin`), which the new ticker keeps. */
+export interface Replay {
+  upto: number;
+  ticks: [number, Uint8Array<ArrayBuffer>][];
+  origin: number | null;
 }
 
 /** What the ticks did, for test mode's results (`ticks.json`; their records and state hashes
@@ -100,5 +115,6 @@ export interface TickReport {
 /** What the ticker's thread tells the render worker. */
 export type FromTicker =
   | { type: "fatal"; message: string }
-  /** Stopped (test mode): the ticks, and the tick log when hashes were kept. */
-  | { type: "ticks"; report: TickReport; log: Uint8Array<ArrayBuffer> | null };
+  /** Stopped (test mode, or a hot reload): the ticks, the tick log when hashes were kept, and
+   * what a build that replaces this one replays. */
+  | { type: "ticks"; report: TickReport; log: Uint8Array<ArrayBuffer> | null; replay: Replay };
