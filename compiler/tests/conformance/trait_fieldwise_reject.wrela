@@ -35,3 +35,8 @@ impl Clone for Plain { //~ E0415
         Plain { x: self.x }
     }
 }
+
+// A tuple has it where each element does.
+fn visits() {
+    (1.0, Opaque { handle: 1 }).visit() //~ E0400
+}

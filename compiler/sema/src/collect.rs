@@ -11,6 +11,9 @@ use std::rc::Rc;
 use wrela_diag::{Diagnostic, Span, codes};
 use wrela_syntax::ast;
 
+/// The most elements a tuple has for a `@fieldwise` trait to be derived for it.
+pub const MAX_DERIVED_TUPLE: usize = 12;
+
 /// One parsed source file and the module it is.
 pub struct SourceUnit {
     /// The module path in its package: `["shapes", "blob"]`, or `["std", "field"]` for std.
@@ -2196,10 +2199,10 @@ impl<'d, 'u> Collector<'d, 'u> {
         }
     }
 
-    /// The methods a declared `@fieldwise` trait derives for ADT `a`, in impl `id` (§3): each
-    /// trait method but its hooks, with `Self` as the type. A method that can't be derived and
-    /// has a default keeps the default.
-    fn derived_methods(&mut self, a: AdtId, id: ImplId, imp: &ImplDef) -> Vec<FnId> {
+    /// The methods a `@fieldwise` trait derives for impl `id`'s type (§3): each trait method
+    /// but its hooks, with `Self` as the type. A method that can't be derived and has a default
+    /// keeps the default.
+    fn derived_methods(&mut self, id: ImplId, imp: &ImplDef) -> Vec<FnId> {
         let Some(r) = imp.trait_ref.clone() else { return Vec::new() };
         let tr = self.p.trait_(r.trait_);
         if !tr.fieldwise || tr.lang.is_some_and(Lang::is_structural) {
@@ -2242,11 +2245,81 @@ impl<'d, 'u> Collector<'d, 'u> {
                 name_span: imp.span,
                 sig_span: imp.span,
                 lang: None,
-                derived: Some(DerivedFn { adt: a, method: m, trait_ref: r.clone() }),
+                derived: Some(DerivedFn { method: m, trait_ref: r.clone() }),
             });
             out.push(FnId(self.p.fns.len() as u32 - 1));
         }
         out
+    }
+
+    /// A `@fieldwise` trait's impls for tuples of up to [`MAX_DERIVED_TUPLE`] elements and for
+    /// arrays: derived element by element, and conditional on the elements, as an opt-in's are
+    /// on the fields (`traits::implements_fieldwise`).
+    fn tuple_and_array_impls(&mut self) {
+        for t in 0..self.p.traits.len() {
+            let tr = self.p.traits[t].clone();
+            // Its supertraits must be derived for them too, or structural.
+            let derivable = |r: &TraitRef| {
+                let s = self.p.trait_(r.trait_);
+                s.fieldwise || s.lang.is_some_and(Lang::is_structural)
+            };
+            if !tr.fieldwise
+                || tr.lang.is_some_and(Lang::is_structural)
+                || !tr.assoc_types.is_empty()
+                || !tr.supertraits.iter().all(derivable)
+            {
+                continue;
+            }
+            // `None` for the array.
+            for arity in std::iter::once(None).chain((2..=MAX_DERIVED_TUPLE).map(Some)) {
+                let param = |p: &mut Program, name: String, is_const: bool| {
+                    p.new_param(ParamDef {
+                        name,
+                        bounds: Vec::new(),
+                        span: tr.span,
+                        is_self: false,
+                        is_const,
+                        fn_bound: None,
+                    })
+                };
+                let trait_params: Vec<ParamId> = tr
+                    .generics
+                    .iter()
+                    .map(|&g| {
+                        let d = self.p.param(g).clone();
+                        param(&mut self.p, d.name, d.is_const)
+                    })
+                    .collect();
+                let (elems, self_ty) = match arity {
+                    None => {
+                        let e = param(&mut self.p, "T".into(), false);
+                        let n = param(&mut self.p, "N".into(), true);
+                        let (et, nt) = (self.p.types.param(e), self.p.types.param(n));
+                        (vec![e, n], self.p.types.intern(TyKind::ArrayN(et, nt)))
+                    }
+                    Some(k) => {
+                        let es: Vec<ParamId> =
+                            (0..k).map(|i| param(&mut self.p, format!("T{i}"), false)).collect();
+                        let ts = es.iter().map(|&e| self.p.types.param(e)).collect();
+                        (es, self.p.types.tuple(ts))
+                    }
+                };
+                let args = trait_params.iter().map(|&g| self.p.types.param(g)).collect();
+                let imp = ImplDef {
+                    module: tr.module,
+                    generics: [trait_params, elems].concat(),
+                    trait_ref: Some(TraitRef { trait_: TraitId(t as u32), args }),
+                    self_ty,
+                    assoc_types: BTreeMap::new(),
+                    methods: Vec::new(),
+                    span: tr.span,
+                    from_opt_in: true,
+                };
+                let id = ImplId(self.p.impls.len() as u32);
+                let methods = self.derived_methods(id, &imp);
+                self.p.impls.push(ImplDef { methods, ..imp });
+            }
+        }
     }
 
     /// Adds the impls that opting in implies, and indexes every impl by its trait or type.
@@ -2306,11 +2379,12 @@ impl<'d, 'u> Collector<'d, 'u> {
                 ));
             }
         }
-        for (a, imp) in implied {
+        for (_, imp) in implied {
             let id = ImplId(self.p.impls.len() as u32);
-            let methods = self.derived_methods(a, id, &imp);
+            let methods = self.derived_methods(id, &imp);
             self.p.impls.push(ImplDef { methods, ..imp });
         }
+        self.tuple_and_array_impls();
         for (i, imp) in self.p.impls.iter().enumerate() {
             let id = ImplId(i as u32);
             match &imp.trait_ref {
@@ -2573,12 +2647,16 @@ fn check_members(
         }
     }
     // The type has the trait's supertraits too. A declared one that's derived holds where its
-    // fields have it, and so does a supertrait the type declares too.
+    // fields have it, and so does a supertrait the type declares too. A tuple's or an array's
+    // derived impl holds where its elements have the trait, so they have its supertraits, which
+    // are derived for it too (`tuple_and_array_impls`).
+    let elementwise = imp.from_opt_in
+        && matches!(*p.types.kind(imp.self_ty), TyKind::Tuple(_) | TyKind::ArrayN(..));
     for sup in &tr.supertraits {
         let sup = sup.subst(&p.types, &trait_subst);
         let declared_too = imp.from_opt_in
             && matches!(*p.types.kind(imp.self_ty), TyKind::Adt(a, _) if p.adt(a).opt_in.iter().any(|(o, _)| *o == sup));
-        if !declared_too && !crate::traits::implements(p, imp.self_ty, &sup) {
+        if !declared_too && !elementwise && !crate::traits::implements(p, imp.self_ty, &sup) {
             diags.push(
                 Diagnostic::new(
                     codes::E0400,

@@ -1,7 +1,8 @@
 //! Fieldwise derivation (language.md §3): the methods of a `@fieldwise` trait, for a type that
-//! declares the trait, derived field by field and built as a typed tree. No source is written
-//! or resolved: each derived method is an ordinary function to the memory checker and to
-//! lowering.
+//! declares the trait and for tuples and arrays, derived field by field (element by element)
+//! and built as a typed tree. No source is written or resolved: each derived method is an
+//! ordinary function to the memory checker and to lowering. An array's is a loop over its
+//! elements; a tuple's or an array's elements have no names, so no field hook is called.
 //!
 //! A method's **shape** is what it returns, and decides how the fields' results combine:
 //!
@@ -274,16 +275,20 @@ pub fn derive(p: &Program, f: FnId) -> (Option<Body>, Vec<Diagnostic>) {
         Ok(s) => s,
         Err(_) => return (None, Vec::new()), // reported at the trait
     };
-    let adt = p.adt(d.adt);
-    let args: Vec<TyId> = adt.generics.iter().map(|&g| p.types.param(g)).collect();
-    let self_ty = p.types.adt(d.adt, args.clone());
+    let FnOwner::Impl(imp) = def.owner else { return (None, Vec::new()) };
+    let self_ty = p.impl_(imp).self_ty;
+    let of = match p.types.kind(self_ty) {
+        TyKind::Adt(a, args) => Of::Adt(*a, args.clone()),
+        TyKind::Tuple(ts) => Of::Tuple(ts.clone()),
+        TyKind::ArrayN(e, n) => Of::Array(*e, *n),
+        _ => return (None, Vec::new()),
+    };
     let method_args: Vec<TyId> = def.generics.iter().map(|&g| p.types.param(g)).collect();
     let mut b = Builder {
         p,
         locals: Vec::new(),
         span,
-        adt: d.adt,
-        args,
+        of,
         self_ty,
         trait_: tr,
         method: d.method,
@@ -313,12 +318,19 @@ pub fn derive(p: &Program, f: FnId) -> (Option<Body>, Vec<Diagnostic>) {
     (body, b.diags)
 }
 
+/// What a derivation takes apart: a struct or an enum, a tuple, or an array.
+enum Of {
+    Adt(AdtId, Vec<TyId>),
+    Tuple(Vec<TyId>),
+    /// `[T; N]`: the element type, and the length (a `const` parameter).
+    Array(TyId, TyId),
+}
+
 struct Builder<'p> {
     p: &'p Program,
     locals: Vec<LocalDecl>,
     span: Span,
-    adt: AdtId,
-    args: Vec<TyId>,
+    of: Of,
     self_ty: TyId,
     trait_: TraitId,
     method: FnId,
@@ -575,26 +587,41 @@ impl Builder<'_> {
         }
     }
 
-    fn body(&mut self) -> Option<Expr> {
-        if self.p.adt(self.adt).is_enum() {
-            self.enum_body()
-        } else {
-            let fields = self.p.fields_of(self.adt, &self.args, None);
-            let names: Vec<String> =
-                self.p.adt_fields(self.adt, None).iter().map(|f| f.name.clone()).collect();
-            let parts: Vec<Vec<Expr>> = (0..fields.len())
-                .map(|i| {
-                    self.self_params
-                        .iter()
-                        .map(|&k| {
-                            let base = self.var(self.params[k]);
-                            self.e(fields[i], ExprKind::Field(Box::new(base), i as u32))
-                        })
-                        .collect()
-                })
-                .collect();
-            Some(self.combine(None, &fields, &names, parts))
+    /// The ADT taken apart, and its arguments.
+    fn adt(&self) -> (AdtId, Vec<TyId>) {
+        match &self.of {
+            Of::Adt(a, args) => (*a, args.clone()),
+            _ => unreachable!("only a struct or an enum has variants"),
         }
+    }
+
+    fn body(&mut self) -> Option<Expr> {
+        let (fields, names) = match &self.of {
+            Of::Adt(a, _) if self.p.adt(*a).is_enum() => return self.enum_body(),
+            Of::Adt(a, args) => {
+                let names: Vec<String> =
+                    self.p.adt_fields(*a, None).iter().map(|f| f.name.clone()).collect();
+                (self.p.fields_of(*a, args, None), Some(names))
+            }
+            // A tuple's fields have no names: the hooks aren't called for them.
+            Of::Tuple(ts) => (ts.clone(), None),
+            Of::Array(e, n) => {
+                let (e, n) = (*e, *n);
+                return Some(self.array_body(e, n));
+            }
+        };
+        let parts: Vec<Vec<Expr>> = (0..fields.len())
+            .map(|i| {
+                self.self_params
+                    .iter()
+                    .map(|&k| {
+                        let base = self.var(self.params[k]);
+                        self.e(fields[i], ExprKind::Field(Box::new(base), i as u32))
+                    })
+                    .collect()
+            })
+            .collect();
+        Some(self.combine(None, &fields, names.as_deref(), parts))
     }
 
     /// The fields' calls combined by the method's shape; `variant` builds that variant (for a
@@ -603,14 +630,15 @@ impl Builder<'_> {
         &mut self,
         variant: Option<u32>,
         fields: &[TyId],
-        names: &[String],
+        names: Option<&[String]>,
         parts: Vec<Vec<Expr>>,
     ) -> Expr {
         let field_hook = hook(self.p, self.trait_, self.method, "_field");
         let mut calls = Vec::new();
-        for ((&ft, name), ps) in fields.iter().zip(names).zip(parts) {
-            let hk = field_hook.map(|h| {
-                let t = self.text(name);
+        for (i, (&ft, ps)) in fields.iter().zip(parts).enumerate() {
+            let name = names.map(|ns| ns[i].clone());
+            let hk = field_hook.zip(name).map(|(h, name)| {
+                let t = self.text(&name);
                 self.hook_call(h, vec![t])
             });
             let call = self.field_call(ft, ps);
@@ -695,29 +723,179 @@ impl Builder<'_> {
                     });
                 }
                 let n = vals.len() as u32;
-                let built = self.e(
-                    self.self_ty,
-                    ExprKind::Adt {
-                        adt: self.adt,
-                        args: self.args.clone(),
-                        variant,
-                        fields: vals,
-                        order: (0..n).collect(),
-                        base: None,
-                    },
-                );
+                let kind = match &self.of {
+                    Of::Tuple(_) => ExprKind::Tuple(vals),
+                    _ => {
+                        let (adt, args) = self.adt();
+                        ExprKind::Adt {
+                            adt,
+                            args,
+                            variant,
+                            fields: vals,
+                            order: (0..n).collect(),
+                            base: None,
+                        }
+                    }
+                };
+                let built = self.e(self.self_ty, kind);
                 if self.shape == Shape::TryBuild { self.ok(built) } else { built }
             }
         }
     }
 
+    /// An array's derivation: a loop over its elements, from the first to its length `n` (a
+    /// `const` parameter), in order. A method that builds one starts from the first element's
+    /// result, copied to every element (`implements_fieldwise` wants a `Copy` element then), and
+    /// builds an empty one zeroed, calling nothing.
+    fn array_body(&mut self, e: TyId, n: TyId) -> Expr {
+        let (u, bool_ty, unit, never) =
+            (self.p.types.u32, self.p.types.bool, self.p.types.unit, self.p.types.never);
+        let len = match self.p.types.kind(n) {
+            TyKind::Param(g) => self.e(u, ExprKind::ConstParam(*g)),
+            TyKind::ConstU32(k) => self.u32_lit(*k),
+            _ => self.e(u, ExprKind::Error),
+        };
+        let i = self.local("i", u, LocalKind::Owned { mutable: false });
+        // The method's call on element `at` of each `Self` parameter.
+        let call_at = |b: &mut Self, at: &Expr| -> Expr {
+            let parts = b
+                .self_params
+                .clone()
+                .into_iter()
+                .map(|k| {
+                    let base = b.var(b.params[k]);
+                    b.e(e, ExprKind::Index(Box::new(base), Box::new(at.clone())))
+                })
+                .collect();
+            b.field_call(e, parts)
+        };
+        let block =
+            |b: &Self, stmts: Vec<Stmt>| Block { stmts, tail: None, ty: unit, span: b.span };
+        let each = |b: &Self, from: Expr, body: Vec<Stmt>| Stmt {
+            kind: StmtKind::ForRange {
+                var: i,
+                start: from,
+                end: len.clone(),
+                inclusive: false,
+                body: block(b, body),
+            },
+            span: b.span,
+        };
+        // `if cond { return value }`.
+        let return_if = |b: &Self, cond: Expr, value: Expr| {
+            let ret = b.e(never, ExprKind::Return(Some(Box::new(value))));
+            let then = block(b, vec![b.stmt(ret)]);
+            b.stmt(b.e(unit, ExprKind::If { cond: Box::new(cond), then, else_: None }))
+        };
+        let at_i = self.var(i);
+        match self.shape {
+            Shape::Unit | Shape::TryUnit => {
+                let call = call_at(self, &at_i);
+                let call = if self.shape == Shape::TryUnit { self.try_(call) } else { call };
+                let l = each(self, self.u32_lit(0), vec![self.stmt(call)]);
+                let tail = (self.shape == Shape::TryUnit).then(|| {
+                    let unit = self.e(unit, ExprKind::Tuple(Vec::new()));
+                    self.ok(unit)
+                });
+                self.block(vec![l], tail)
+            }
+            Shape::All => {
+                let call = call_at(self, &at_i);
+                let not =
+                    self.e(bool_ty, ExprKind::Unary(wrela_syntax::ast::UnOp::Not, Box::new(call)));
+                let no = self.e(bool_ty, ExprKind::Lit(Lit::Bool(false)));
+                let check = return_if(self, not, no);
+                let l = each(self, self.u32_lit(0), vec![check]);
+                let yes = self.e(bool_ty, ExprKind::Lit(Lit::Bool(true)));
+                self.block(vec![l], Some(yes))
+            }
+            Shape::Order => {
+                let call = call_at(self, &at_i);
+                let ty = call.ty;
+                let o = self.local("order", ty, LocalKind::Owned { mutable: false });
+                let bind = Stmt {
+                    kind: StmtKind::Bind {
+                        pat: Pat { ty, kind: PatKind::Bind(o), span: self.span },
+                        init: call,
+                        else_: None,
+                    },
+                    span: self.span,
+                };
+                let decided = self.e(
+                    bool_ty,
+                    ExprKind::Binary(
+                        wrela_syntax::ast::BinOp::Ne,
+                        Box::new(self.var(o)),
+                        Box::new(self.ordering(1)),
+                    ),
+                );
+                let check = return_if(self, decided, self.var(o));
+                let l = each(self, self.u32_lit(0), vec![bind, check]);
+                let equal = self.ordering(1);
+                self.block(vec![l], Some(equal))
+            }
+            Shape::Build | Shape::TryBuild => {
+                let tries = self.shape == Shape::TryBuild;
+                // Empty: zeroed, with no call.
+                let empty = self.e(
+                    bool_ty,
+                    ExprKind::Binary(
+                        wrela_syntax::ast::BinOp::Eq,
+                        Box::new(len.clone()),
+                        Box::new(self.u32_lit(0)),
+                    ),
+                );
+                let zeroed = match self.p.lang_fn(Lang::MemZeroed) {
+                    Some(z) => self.e(
+                        self.self_ty,
+                        ExprKind::Call(Call {
+                            callee: Callee::Fn { func: z, args: vec![self.self_ty] },
+                            args: Vec::new(),
+                            modes: Vec::new(),
+                            receiver: false,
+                            order: Vec::new(),
+                            ret_mode: RetMode::Owned,
+                        }),
+                    ),
+                    None => self.e(self.self_ty, ExprKind::Error),
+                };
+                let zeroed = if tries { self.ok(zeroed) } else { zeroed };
+                let early = return_if(self, empty, zeroed);
+                let first = call_at(self, &self.u32_lit(0));
+                let first = if tries { self.try_(first) } else { first };
+                let out = self.local("out", self.self_ty, LocalKind::Owned { mutable: true });
+                let filled = self.e(self.self_ty, ExprKind::ArrayRepeat(Box::new(first), 0));
+                let bind = Stmt {
+                    kind: StmtKind::Bind {
+                        pat: Pat { ty: self.self_ty, kind: PatKind::Bind(out), span: self.span },
+                        init: filled,
+                        else_: None,
+                    },
+                    span: self.span,
+                };
+                let next = call_at(self, &at_i);
+                let next = if tries { self.try_(next) } else { next };
+                let place =
+                    self.e(e, ExprKind::Index(Box::new(self.var(out)), Box::new(self.var(i))));
+                let assign = Stmt {
+                    kind: StmtKind::Assign { place, op: None, value: next },
+                    span: self.span,
+                };
+                let l = each(self, self.u32_lit(1), vec![assign]);
+                let built = self.var(out);
+                let tail = if tries { self.ok(built) } else { built };
+                self.block(vec![early, bind, l], Some(tail))
+            }
+        }
+    }
+
     fn enum_body(&mut self) -> Option<Expr> {
-        let adt = self.p.adt(self.adt);
+        let (a, args) = self.adt();
+        let adt = self.p.adt(a);
         let variants: Vec<(String, Vec<TyId>, Vec<String>)> = (0..adt.variants().len() as u32)
             .map(|v| {
-                let fields = self.p.fields_of(self.adt, &self.args, Some(v));
-                let names =
-                    self.p.adt_fields(self.adt, Some(v)).iter().map(|f| f.name.clone()).collect();
+                let fields = self.p.fields_of(a, &args, Some(v));
+                let names = self.p.adt_fields(a, Some(v)).iter().map(|f| f.name.clone()).collect();
                 (adt.variants()[v as usize].name.clone(), fields, names)
             })
             .collect();
@@ -752,7 +930,7 @@ impl Builder<'_> {
             let parts: Vec<Vec<Expr>> = (0..fields.len())
                 .map(|i| binds.iter().map(|ls| self.var(ls[i])).collect())
                 .collect();
-            let mut inner = self.combine(Some(v), fields, names, parts);
+            let mut inner = self.combine(Some(v), fields, Some(names), parts);
             if let Some(h) = variant_hook {
                 let (idx, name) = (self.u32_lit(v), self.text(vname));
                 let call = self.hook_call(h, vec![idx, name]);
@@ -801,14 +979,10 @@ impl Builder<'_> {
                 (i as u32, Pat { ty: ft, kind: PatKind::Bind(l), span: self.span })
             })
             .collect();
+        let (adt, args) = self.adt();
         Pat {
             ty: self.self_ty,
-            kind: PatKind::Adt {
-                adt: self.adt,
-                args: self.args.clone(),
-                variant: Some(v),
-                fields: fs,
-            },
+            kind: PatKind::Adt { adt, args, variant: Some(v), fields: fs },
             span: self.span,
         }
     }
@@ -919,7 +1093,7 @@ impl Builder<'_> {
         let mut acc = panic;
         for (v, (_, fields, names)) in variants.iter().enumerate().rev() {
             let parts = vec![Vec::new(); fields.len()];
-            let built = self.combine(Some(v as u32), fields, names, parts);
+            let built = self.combine(Some(v as u32), fields, Some(names), parts);
             let bool_ty = self.p.types.bool;
             let test = self.e(
                 bool_ty,
@@ -941,7 +1115,7 @@ impl Builder<'_> {
     /// E0417: this type can't derive the method.
     fn cant(&mut self, why: String) {
         let tr = &self.p.trait_(self.trait_).name;
-        let ty = &self.p.adt(self.adt).name;
+        let ty = &self.p.display_ty(self.self_ty);
         self.diags.push(
             Diagnostic::new(codes::E0417, self.span, format!("`{ty}` can't derive `{tr}`: {why}"))
                 .with_help(format!("write `impl {tr} for {ty}` by hand instead of declaring it")),

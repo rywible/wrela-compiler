@@ -312,26 +312,3 @@ impl<T: StateHash> StateHash for Box<T> {
         self.get().state_hash(mut h)
     }
 }
-
-impl<T: StateHash, const N: u32> StateHash for [T; N] {
-    fn state_hash(self, h: mut Hasher) {
-        for x in self {
-            x.state_hash(mut h)
-        }
-    }
-}
-
-impl<A: StateHash, B: StateHash> StateHash for (A, B) {
-    fn state_hash(self, h: mut Hasher) {
-        self.0.state_hash(mut h)
-        self.1.state_hash(mut h)
-    }
-}
-
-impl<A: StateHash, B: StateHash, C: StateHash> StateHash for (A, B, C) {
-    fn state_hash(self, h: mut Hasher) {
-        self.0.state_hash(mut h)
-        self.1.state_hash(mut h)
-        self.2.state_hash(mut h)
-    }
-}

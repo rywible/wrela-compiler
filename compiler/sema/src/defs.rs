@@ -611,10 +611,10 @@ pub struct FnDef {
     pub derived: Option<DerivedFn>,
 }
 
-/// What a derived method derives: method `method` of the trait `trait_ref` names, for `adt`.
+/// What a derived method derives: method `method` of the trait `trait_ref` names, for its
+/// impl's type.
 #[derive(Clone, Debug)]
 pub struct DerivedFn {
-    pub adt: AdtId,
     pub method: FnId,
     pub trait_ref: TraitRef,
 }

@@ -389,23 +389,43 @@ pub fn implements(p: &Program, ty: TyId, r: &TraitRef) -> bool {
     found
 }
 
-/// Whether `ty`, an ADT that declares the `@fieldwise` trait `r`, has it: every field does
-/// (§3). A type that holds itself has it if the rest of its fields do.
+/// Whether `ty`, an ADT that declares the `@fieldwise` trait `r`, a tuple or an array, has it:
+/// every field, element or the element type does (§3), and an array's element type is `Copy`
+/// if the trait has a method that builds a `Self` (the derivation copies the first element's
+/// result to the rest). A type that holds itself has it if the rest of its fields do.
 pub fn implements_fieldwise(p: &Program, ty: TyId, r: &TraitRef) -> bool {
     let key = (ty, r.clone());
     if let Some(&known) = p.fieldwise_impls.borrow().get(&key) {
         return known;
     }
     p.fieldwise_impls.borrow_mut().insert(key.clone(), true);
-    let TyKind::Adt(a, args) = p.types.kind(ty) else { return false };
     let mark = p.goal_order.borrow().0.len();
     p.goal_order.borrow_mut().1.push(mark);
-    let ok = p.field_lists(*a).into_iter().all(|v| {
-        p.fields_of(*a, args, v).into_iter().all(|f| implements(p, normalize(p, f, None), r))
-    });
+    let has = |t: TyId| implements(p, normalize(p, t, None), r);
+    let ok = match p.types.kind(ty) {
+        TyKind::Adt(a, args) => {
+            p.field_lists(*a).into_iter().all(|v| p.fields_of(*a, args, v).into_iter().all(has))
+        }
+        TyKind::Tuple(ts) => ts.iter().all(|&t| has(t)),
+        TyKind::Array(e, _) | TyKind::ArrayN(e, _) => {
+            has(*e) && (!builds_self(p, r.trait_) || implements_builtin(p, *e, Lang::Copy))
+        }
+        _ => false,
+    };
     p.goal_order.borrow_mut().1.pop();
     p.fieldwise_impls.borrow_mut().insert(key, ok);
     ok
+}
+
+/// Whether a `@fieldwise` trait has a derived method that builds a `Self`.
+fn builds_self(p: &Program, t: TraitId) -> bool {
+    p.trait_(t).methods.iter().any(|&m| {
+        !crate::fieldwise::is_hook(p, t, m)
+            && matches!(
+                crate::fieldwise::shape(p, t, m),
+                Ok(crate::fieldwise::Shape::Build | crate::fieldwise::Shape::TryBuild)
+            )
+    })
 }
 
 /// `Copy`, `Clone` and `GpuData`, which are structural.

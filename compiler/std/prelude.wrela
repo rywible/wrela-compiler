@@ -179,11 +179,3 @@ impl Plain for mat4 {}
 impl Plain for Text {}
 
 impl Plain for Bytes {}
-
-impl<T: Plain, const N: u32> Plain for [T; N] {}
-
-impl<A: Plain, B: Plain> Plain for (A, B) {}
-
-impl<A: Plain, B: Plain, C: Plain> Plain for (A, B, C) {}
-
-impl<A: Plain, B: Plain, C: Plain, D: Plain> Plain for (A, B, C, D) {}

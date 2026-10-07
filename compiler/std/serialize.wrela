@@ -577,50 +577,6 @@ impl<T: Serialize + Copy, const N: u32> Serialize for Bounded<T, N> {
     }
 }
 
-impl<T: Serialize + Copy, const N: u32> Serialize for [T; N] {
-    fn serialize(self, w: mut Writer) {
-        for x in self {
-            x.serialize(mut w)
-        }
-    }
-
-    fn deserialize(r: mut Reader) -> Result<[T; N], LoadError> {
-        var out = [T::deserialize(mut r)?; N]
-        for i in 1..N {
-            out[i] = T::deserialize(mut r)?
-        }
-        Ok(out)
-    }
-}
-
-impl<A: Serialize, B: Serialize> Serialize for (A, B) {
-    fn serialize(self, w: mut Writer) {
-        self.0.serialize(mut w)
-        self.1.serialize(mut w)
-    }
-
-    fn deserialize(r: mut Reader) -> Result<(A, B), LoadError> {
-        let a = A::deserialize(mut r)?
-        let b = B::deserialize(mut r)?
-        Ok((a, b))
-    }
-}
-
-impl<A: Serialize, B: Serialize, C: Serialize> Serialize for (A, B, C) {
-    fn serialize(self, w: mut Writer) {
-        self.0.serialize(mut w)
-        self.1.serialize(mut w)
-        self.2.serialize(mut w)
-    }
-
-    fn deserialize(r: mut Reader) -> Result<(A, B, C), LoadError> {
-        let a = A::deserialize(mut r)?
-        let b = B::deserialize(mut r)?
-        let c = C::deserialize(mut r)?
-        Ok((a, b, c))
-    }
-}
-
 impl<T: Serialize> Serialize for Box<T> {
     fn serialize(self, w: mut Writer) {
         self.get().serialize(mut w)

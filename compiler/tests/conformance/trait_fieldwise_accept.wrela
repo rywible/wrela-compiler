@@ -39,3 +39,17 @@ fn f() -> u32 {
     }
     n
 }
+
+// Tuples (of up to 12 elements) and arrays derive it too, element by element, where their
+// elements have it; an array's in a loop. Their elements have no names: no field hook.
+fn g() -> u32 {
+    var n = 0
+    (1.0, 2.0, 3.0, 4.0, 5.0).count(mut n)
+    [1.0, 2.0, 3.0].count(mut n)
+    let ps = [Pair { a: 1.0, b: 2.0 }, Pair { a: 0.0, b: 0.0 }]
+    ps.count(mut n)
+    if (1, 2, 3, 4, 5) < (1, 2, 3, 4, 6) && ps == ps && [(1, 2.0), (3, 4.0)] != [(1, 2.0), (3, 5.0)] {
+        n += 1000
+    }
+    n
+}
