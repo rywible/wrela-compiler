@@ -1,0 +1,93 @@
+// Frame timing (compiler/tests/tests/suite/renderer.rs, #28 §10.3): three named pieces of GPU
+// work, independent of each other, so a GPU may run them side by side: `shade`, a pass of
+// fragments that each loop; `simulate`, a kernel whose invocations each loop; `blur`, another
+// pass. Keys choose what a frame draws: 0 all three (the default), 1 `shade` alone, 2
+// `simulate` alone, 3 `blur` alone.
+use std::gpu::{
+    ClipPosition, FragCoord, GlobalId, GpuBuffer, Slots, Texture, TextureFormat, VertexIndex,
+    begin_pass, begin_screen_pass, buffer, dispatch, draw, label, present, texture,
+}
+use std::input::{Event, Key, events}
+
+@vertex
+fn cover(v: VertexIndex) -> ClipPosition {
+    let x = f32((v.index << 1) & 2) * 2.0 - 1.0
+    let y = f32(v.index & 2) * 2.0 - 1.0
+    ClipPosition { position: vec4(x, y, 0.5, 1.0) }
+}
+
+/// `steps` turns of a little map at the pixel: work the GPU can't skip.
+@fragment
+fn busy(pixel: FragCoord, steps: u32, seed: f32) -> vec4 {
+    var p = pixel.position.xy * 0.001 + vec2(seed)
+    for _ in 0..steps {
+        p = vec2(sin(p.x * 1.7 + p.y), cos(p.y * 1.3 - p.x)) * 0.9 + vec2(0.05)
+    }
+    vec4(p, 0.0, 1.0)
+}
+
+@compute(64)
+fn simulate(steps: u32, out: mut Slots<vec2>, id: GlobalId) {
+    var p = vec2(f32(id.x) * 0.0001, 0.5)
+    for _ in 0..steps {
+        p = vec2(sin(p.x * 1.7 + p.y), cos(p.y * 1.3 - p.x)) * 0.9 + vec2(0.05)
+    }
+    out[id] = p
+}
+
+@fragment
+fn show(target: Texture) -> vec4 {
+    vec4(target.load(x: 0, y: 0).xy, 0.0, 1.0)
+}
+
+pub struct Work {
+    a: Texture,
+    c: Texture,
+    points: GpuBuffer<vec2>,
+    only: u32,
+}
+
+const SIDE: u32 = 1024
+const POINTS: u32 = 262144
+
+pub fn init() -> Work {
+    Work {
+        a: texture(width: SIDE, height: SIDE, format: TextureFormat::Rgba16Float),
+        c: texture(width: SIDE, height: SIDE, format: TextureFormat::Rgba16Float),
+        points: buffer(POINTS),
+        only: 0,
+    }
+}
+
+pub fn frame(w: mut Work, time: f32, width: u32, height: u32) {
+    for e in events() {
+        if let Event::KeyDown { key, .. } = e {
+            w.only = match key {
+                Key::Digit1 => 1,
+                Key::Digit2 => 2,
+                Key::Digit3 => 3,
+                Key::Digit0 => 0,
+                _ => w.only,
+            }
+        }
+    }
+    if w.only == 0 || w.only == 1 {
+        label("shade")
+        let p = begin_pass(mut w.a)
+        draw(cover, busy.bind(steps: 160, seed: 0.1), vertices: 3)
+        p.end()
+    }
+    if w.only == 0 || w.only == 2 {
+        label("simulate")
+        dispatch(simulate.bind(steps: 1000, out: mut w.points), groups: POINTS / 64)
+    }
+    if w.only == 0 || w.only == 3 {
+        label("blur")
+        let p = begin_pass(mut w.c)
+        draw(cover, busy.bind(steps: 100, seed: 0.7), vertices: 3)
+        p.end()
+    }
+    begin_screen_pass(clear: vec4(0.0, 0.0, 0.0, 1.0))
+    draw(cover, show.bind(target: w.a), vertices: 3)
+    present()
+}

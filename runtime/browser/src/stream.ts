@@ -74,6 +74,7 @@ export type Command =
   | { op: "StorageWrite"; request: number; path: string; data: Bytes }
   | { op: "Fetch"; request: number; url: string }
   | { op: "Log"; text: string }
+  | { op: "Label"; name: string }
   | { op: "Post"; request: number; url: string; body: Bytes };
 
 const NAMES = new Map<number, OpcodeName>(
@@ -337,11 +338,13 @@ export function decode(batch: Bytes): Command[] {
         cmd = name === "Fetch" ? { op: name, request: w(0), url: t } : { op: name, request: w(0), path: t };
         break;
       }
-      case "Log": {
+      case "Log":
+      case "Label": {
         if (words < 1) throw bad("expected at least 1 word");
         const n = w(0);
         if (padded(n) !== len - 4) throw bad("the text's length doesn't match the payload");
-        cmd = { op: name, text: text(4, n, "text") };
+        const t = text(4, n, "text");
+        cmd = name === "Log" ? { op: name, text: t } : { op: name, name: t };
         break;
       }
       case "StorageWrite": {

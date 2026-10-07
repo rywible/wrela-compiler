@@ -150,6 +150,11 @@ export class Encoder {
     return this.#command(Opcode.Log, [t.length], pad(t));
   }
 
+  label(name: string): this {
+    const t = utf8(name);
+    return this.#command(Opcode.Label, [t.length], pad(t));
+  }
+
   finish(): Uint8Array<ArrayBuffer> {
     const out = new Uint8Array(HEADER_LEN + this.#body.length);
     out.set(words([STREAM_MAGIC, STREAM_VERSION, this.#body.length]));

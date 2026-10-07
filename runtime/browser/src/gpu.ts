@@ -252,6 +252,28 @@ type Resource =
   | { kind: "texture"; texture: GPUTexture; view: GPUTextureView; format: TextureFormat; bytes: number }
   | { kind: "sampler"; sampler: GPUSampler };
 
+/** A command kept for the serial mode's `drain`, or a readback waiting its turn. */
+type Deferred =
+  | { cmd: Command }
+  | { handle: number; offset: number; size: number; answer: PromiseWithResolvers<Bytes> };
+
+/** `cmd` with its bytes copied out of the program's memory, which the program reuses. */
+function copied(cmd: Command): Command {
+  switch (cmd.op) {
+    case "WriteBuffer":
+    case "WriteTexture":
+      return { ...cmd, data: cmd.data.slice() };
+    case "Dispatch":
+    case "DispatchIndirect":
+    case "Draw":
+    case "DrawIndirect":
+    case "DrawIndexedIndirect":
+      return { ...cmd, bindings: cmd.bindings.slice(), uniforms: cmd.uniforms.slice() };
+    default:
+      return cmd;
+  }
+}
+
 /** `n` rounded up to a multiple of `align`. */
 export const alignTo = (n: number, align: number) => Math.ceil(n / align) * align;
 
@@ -259,9 +281,15 @@ export const alignTo = (n: number, align: number) => Math.ceil(n / align) * alig
 export interface GpuTiming {
   /** The frame it ran in (`GpuExecutor.frame`). */
   frame: number;
-  /** The dispatch's pipeline name, or `screen pass` or `pass`. */
+  /** The name the program gave it (`Label`), else the dispatch's pipeline name, or `screen pass`
+   * or `pass`. */
   label: string;
+  /** `end - start`. */
   nanos: number;
+  /** When it started and ended on the GPU's clock, in nanoseconds from the first timestamp
+   * read: a frame's span is its first start to its last end. */
+  start: number;
+  end: number;
 }
 
 /** `capacity` doubled until it's at least `n`. */
@@ -317,6 +345,8 @@ class Timer {
   readonly #resolve: GPUBuffer;
   /** The passes timed in the submission being recorded: their frame and label. */
   #pending: { frame: number; label: string }[] = [];
+  /** The first timestamp read, which the others are measured from. */
+  #origin: bigint | null = null;
   /** The readbacks under way. */
   readonly #reading: Promise<void>[] = [];
   readonly results: GpuTiming[] = [];
@@ -354,7 +384,14 @@ class Timer {
       this.#reading.push(
         staging.mapAsync(GPUMapMode.READ).then(() => {
           const t = new BigUint64Array(staging.getMappedRange());
-          passes.forEach((p, i) => this.results.push({ ...p, nanos: Number(t[2 * i + 1]! - t[2 * i]!) }));
+          passes.forEach((p, i) => {
+            const [a, b] = [t[2 * i]!, t[2 * i + 1]!];
+            this.#origin ??= a;
+            const start = Number(a - this.#origin);
+            // An end before its start (a clock that wrapped) is taken as the start.
+            const end = Math.max(start, Number(b - this.#origin));
+            this.results.push({ ...p, nanos: end - start, start, end });
+          });
           staging.unmap();
           staging.destroy();
         }),
@@ -396,15 +433,23 @@ export class GpuExecutor {
   readonly #debugFlag: { buffer: GPUBuffer; readback: GPUBuffer } | null;
   /** The frame being recorded, for timings. */
   frame = 0;
+  /** The name the program gave the next pass or dispatch (`Label`). */
+  #label: string | null = null;
+  /** The serial timing mode's commands, waiting for `drain` to run them each pass and dispatch
+   * alone; null in the other modes, which run each command as it comes. */
+  readonly #deferred: Deferred[] | null;
 
   /** With `timestamps`, on a device with "timestamp-query", each pass's GPU time is recorded
-   * (`timings`). */
+   * (`timings`); with `serial` too, each pass and dispatch runs alone, so its time is its own
+   * (the program's commands then wait for `drain`, which test mode calls after each frame). */
   constructor(
     readonly device: GPUDevice,
     readonly pipelines: BuiltPipeline[],
     readonly screen: ScreenTarget,
     timestamps = false,
+    serial = false,
   ) {
+    this.#deferred = timestamps && serial ? [] : null;
     const l = device.limits;
     this.#align = Math.max(l.minUniformBufferOffsetAlignment, l.minStorageBufferOffsetAlignment);
     this.#uniforms = new Ring(
@@ -461,9 +506,33 @@ export class GpuExecutor {
     return this.#timer === null ? {} : { timestampWrites: this.#timer.next(this.frame, label) };
   }
 
-  /** Carries out a command that has been decoded, sequenced and checked. Requests are the
-   * program's business, except a readback's copy (`readBack`). */
+  /** Carries out a command that has been decoded, sequenced and checked, or keeps a copy of it
+   * for `drain` in the serial mode. Requests are the program's business, except a readback's
+   * copy (`readBack`). */
   execute(cmd: Command): void {
+    if (this.#deferred !== null) this.#deferred.push({ cmd: copied(cmd) });
+    else this.#run(cmd);
+  }
+
+  /** The serial mode: runs the commands kept since the last call, submitting each pass and
+   * dispatch alone and waiting for the GPU to finish it before the next. */
+  async drain(): Promise<void> {
+    if (this.#deferred === null) return;
+    for (const d of this.#deferred.splice(0)) {
+      if ("cmd" in d) {
+        this.#run(d.cmd);
+        const op = d.cmd.op;
+        if (op === "Dispatch" || op === "DispatchIndirect" || op === "EndPass" || op === "Present") {
+          this.flush();
+          await this.device.queue.onSubmittedWorkDone();
+        }
+      } else {
+        this.readBack(d.handle, d.offset, d.size, true).then(d.answer.resolve, d.answer.reject);
+      }
+    }
+  }
+
+  #run(cmd: Command): void {
     switch (cmd.op) {
       case "CreateBuffer":
         this.#allocated(cmd.size);
@@ -569,6 +638,9 @@ export class GpuExecutor {
       case "DestroySampler":
         this.#destroy(cmd.handle);
         return;
+      case "Label":
+        this.#label = cmd.name;
+        return;
       case "ReadBuffer":
       case "StorageRead":
       case "StorageWrite":
@@ -593,8 +665,14 @@ export class GpuExecutor {
   }
 
   /** A buffer's bytes `offset..offset + size`, once the GPU's work recorded so far is done:
-   * a `ReadBuffer` request's answer. */
-  readBack(handle: number, offset: number, size: number): Promise<Bytes> {
+   * a `ReadBuffer` request's answer. In the serial mode it waits its turn behind the commands
+   * kept for `drain`, unless `now`. */
+  readBack(handle: number, offset: number, size: number, now = false): Promise<Bytes> {
+    if (this.#deferred !== null && !now) {
+      const answer = Promise.withResolvers<Bytes>();
+      this.#deferred.push({ handle, offset, size, answer });
+      return answer.promise;
+    }
     this.flush();
     const staging = this.#readbackBuffer(Math.max(size, 4));
     return this.#copyBack(this.#buffer(handle), offset, size, staging).then((bytes) => {
@@ -782,8 +860,10 @@ export class GpuExecutor {
     this.#reserve(op, alignTo(uniforms.length, this.#align));
     const offsets = this.#push(uniforms);
     const bindGroup = this.#bindGroup(index, bindings);
-    const timed = this.#timestamps(p.name);
-    const pass = this.#encoderNow().beginComputePass({ label: p.name, ...timed });
+    const label = this.#label ?? p.name;
+    this.#label = null;
+    const timed = this.#timestamps(label);
+    const pass = this.#encoderNow().beginComputePass({ label, ...timed });
     pass.setPipeline(p.compute);
     pass.setBindGroup(0, bindGroup, offsets);
     if (Array.isArray(groups)) pass.dispatchWorkgroups(groups[0], groups[1], groups[2]);
@@ -830,7 +910,8 @@ export class GpuExecutor {
       indices: d.op === "DrawIndexedIndirect" ? this.#buffer(d.indices) : null,
     }));
     const [r, g, b, a] = pass.clear;
-    const label = onScreen ? "screen pass" : "pass";
+    const label = this.#label ?? (onScreen ? "screen pass" : "pass");
+    this.#label = null;
     const timed = this.#timestamps(label);
     const encoder = this.#encoderNow();
     const rp = encoder.beginRenderPass({

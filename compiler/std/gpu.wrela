@@ -711,6 +711,16 @@ fn begin_pass_command(
 @intrinsic
 fn end_pass_command() {}
 
+/// Names the next pass or dispatch in the host's timings (language.md §12): `label("terrain")`
+/// before `begin_pass_with_depth(...)`. A pass that isn't named is `pass` (`screen pass` on the
+/// screen), and a dispatch its kernel's pipeline.
+pub fn label(name: str) {
+    label_command(name)
+}
+
+@intrinsic
+fn label_command(name: str) {}
+
 @intrinsic
 fn texture_sample(t: Texture, s: Sampler, uv: vec2) -> vec4 {}
 

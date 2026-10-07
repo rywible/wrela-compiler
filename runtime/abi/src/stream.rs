@@ -42,6 +42,7 @@
 //! | 22 | `Log` | `length`, then a line of UTF-8, padded to 4 bytes: shown on the host's console (`std::io::print`) |
 //! | 23 | `Post` | `request`, `url length`, `body length`, then the URL's UTF-8 and the body, each padded to 4 bytes: sends the body to the host that serves the build, at the URL relative to the build; the answer is the host's reply, a request |
 //! | 24 | `DrawIndexedIndirect` | `pipeline`, `index buffer`, `index offset`, `index size` (bytes of `u32` indices there, each a multiple of 4), `arguments buffer`, `offset` (index count, instance count, first index, base vertex, first instance there), the bindings, the uniforms |
+//! | 25 | `Label` | `length`, then a name of UTF-8, padded to 4 bytes: the name of the next pass or dispatch in the host's timings (`pass`, `screen pass` or the dispatch's pipeline when there's none). Outside a pass only. |
 //!
 //! **Requests** (language.md §6.15) are answered on a later call: the program polls each with
 //! the imports `wrela.request_status(request) -> i32` (-1 while it's pending, -2 if it failed,
@@ -118,10 +119,11 @@ pub enum Opcode {
     Log = 22,
     Post = 23,
     DrawIndexedIndirect = 24,
+    Label = 25,
 }
 
 impl Opcode {
-    pub const ALL: [Opcode; 24] = [
+    pub const ALL: [Opcode; 25] = [
         Opcode::CreateBuffer,
         Opcode::WriteBuffer,
         Opcode::Dispatch,
@@ -146,6 +148,7 @@ impl Opcode {
         Opcode::Log,
         Opcode::Post,
         Opcode::DrawIndexedIndirect,
+        Opcode::Label,
     ];
 
     pub fn from_u32(v: u32) -> Option<Opcode> {
@@ -178,6 +181,7 @@ impl Opcode {
             Opcode::Log => "Log",
             Opcode::Post => "Post",
             Opcode::DrawIndexedIndirect => "DrawIndexedIndirect",
+            Opcode::Label => "Label",
         }
     }
 }
@@ -420,6 +424,10 @@ pub enum Command<'a> {
     Log {
         text: &'a str,
     },
+    /// The name of the next pass or dispatch in the host's timings.
+    Label {
+        name: &'a str,
+    },
     Post {
         request: u32,
         url: &'a str,
@@ -453,6 +461,7 @@ impl Command<'_> {
             Command::StorageWrite { .. } => Opcode::StorageWrite,
             Command::Fetch { .. } => Opcode::Fetch,
             Command::Log { .. } => Opcode::Log,
+            Command::Label { .. } => Opcode::Label,
             Command::Post { .. } => Opcode::Post,
         }
     }
@@ -800,7 +809,7 @@ pub fn decode(batch: &[u8]) -> Result<Vec<Command<'_>>, StreamError> {
                     Command::StorageRead { request: w(0), path: text }
                 }
             }
-            Opcode::Log => {
+            Opcode::Log | Opcode::Label => {
                 if words < 1 {
                     return Err(bad("expected at least 1 word"));
                 }
@@ -808,7 +817,12 @@ pub fn decode(batch: &[u8]) -> Result<Vec<Command<'_>>, StreamError> {
                 if padded(n) != len - 4 {
                     return Err(bad("the text's length doesn't match the payload"));
                 }
-                Command::Log { text: text(4, n, "the text isn't UTF-8")? }
+                let text = text(4, n, "the text isn't UTF-8")?;
+                if opcode == Opcode::Log {
+                    Command::Log { text }
+                } else {
+                    Command::Label { name: text }
+                }
             }
             Opcode::StorageWrite => {
                 let (path, data) = two_runs(
@@ -1173,6 +1187,12 @@ impl Encoder {
     pub fn log(&mut self, text: &str) -> &mut Self {
         let bytes = Self::pad(text.as_bytes());
         self.command(Opcode::Log, &[text.len() as u32], &bytes);
+        self
+    }
+
+    pub fn label(&mut self, name: &str) -> &mut Self {
+        let bytes = Self::pad(name.as_bytes());
+        self.command(Opcode::Label, &[name.len() as u32], &bytes);
         self
     }
 

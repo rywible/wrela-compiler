@@ -132,6 +132,7 @@ fn command(c: &Command) -> Value {
             json!({ "op": "Post", "request": request, "url": url, "body": body })
         }
         Command::Log { text } => json!({ "op": "Log", "text": text }),
+        Command::Label { name } => json!({ "op": "Label", "name": name }),
     }
 }
 
@@ -183,6 +184,7 @@ pub(crate) fn golden_batch() -> Vec<u8> {
         .log("frame 3: 2 grazers, é")
         .post(5, "studio/edit", &[123, 125])
         .draw_indexed_indirect(1, [3, 0, 12], 3, 16, &[], &[])
+        .label("terrain")
         .finish()
 }
 
@@ -317,6 +319,10 @@ fn sequences() -> Vec<Value> {
         sequence(
             "a buffer made in a pass",
             &e().begin_screen_pass([0.0; 4]).create_buffer(0, 4).finish(),
+        ),
+        sequence(
+            "a label in a pass",
+            &e().begin_pass(offscreen()).label("terrain").end_pass().finish(),
         ),
         sequence(
             "a dispatch in a pass",

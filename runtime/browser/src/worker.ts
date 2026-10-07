@@ -274,6 +274,7 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
     (ms) => {
       pipelinesMs = ms;
     },
+    params.timestamps === 2,
   );
   const executor = program.executor as GpuExecutor;
   if (params.timestamps > 0 && !executor.timed) throw new GpuError("the test asks for timestamps, but this device has no timestamp queries");
@@ -315,6 +316,8 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
       if (params.framedelay > 0) holdFor(params.framedelay);
       cpu.push(performance.now() - began);
     });
+    // The serial timing mode runs the frame's passes now, one at a time.
+    await scoped(device, () => executor.drain());
     await device.queue.onSubmittedWorkDone();
     await executor.checkDebugFlag();
   }

@@ -172,3 +172,111 @@ fn each_depth_test_and_write_draws_the_same_in_both_hosts() {
     let diff = image::compare(&browser.frame, &run.frame).expect("same size");
     assert!(diff.mean <= MEAN_LIMIT, "mean difference {:.4} over {MEAN_LIMIT}", diff.mean);
 }
+
+/// The labelled pieces of compiler/tests/timing.
+const PIECES: [&str; 3] = ["shade", "simulate", "blur"];
+
+/// Each piece's median GPU time (ms) over a run's second half, by label: the GPU's clocks
+/// settle over its first frames (the same kernel took 8 ms, then 2 ms from frame 20 on).
+fn medians(timings: &[(usize, String, f64)]) -> std::collections::BTreeMap<String, f64> {
+    let half = timings.iter().map(|t| t.0).max().unwrap_or(0) / 2;
+    let mut by: std::collections::BTreeMap<String, Vec<f64>> = Default::default();
+    for (f, l, ns) in timings {
+        if *f >= half {
+            by.entry(l.clone()).or_default().push(ns / 1e6);
+        }
+    }
+    by.into_iter().map(|(l, v)| (l, wrela_tests::median(&v))).collect()
+}
+
+/// A key's press at frame 0, as a script.
+fn press(key: &str) -> String {
+    format!(r#"[{{"frame":0,"type":"key","key":"{key}"}}]"#)
+}
+
+/// #28 §10.3 (AC10 of #51): both hosts time each pass and dispatch, with the name the program
+/// gave it (`std::gpu::label`), its start and its end, so a frame's span is its first start to
+/// its last end; and the serial mode runs them one at a time, so each one's time is within 10%
+/// of the same piece drawn alone (compiler/tests/timing: three independent pieces, which an
+/// Apple GPU runs side by side otherwise).
+///
+/// The GPU sets its clocks by its load and its heat, so frames run back to back (paced at 60 Hz,
+/// a light frame lets the clocks fall: the same pass took 1.0 ms, then 4.3, then 5.4 in Chrome),
+/// and the serial frame and each piece alone are measured alternately, twice each, the better
+/// of each kept: after a minute of full load the same pass took 4.8 ms, then 3.4 ms.
+#[test]
+#[ignore = "long: alone: needs Chrome, python3 and a GPU"]
+fn each_pass_times_as_it_does_alone_in_both_hosts() {
+    use std::collections::BTreeMap;
+    let (dir, rel) = page("compiler/tests/timing", "timing");
+    let frames = 160;
+    let times: Vec<f32> = (0..frames).map(|i| wrela_host::frame_time(i, 1000.0)).collect();
+    let native = |script: &str, serial: bool| {
+        let options = wrela_host::Options { timestamps: true, serial, ..Default::default() };
+        let mut host = Host::load_with(&dir, &options).expect("load");
+        let script = wrela_host::parse_script(script).expect("a script");
+        let t = host.run_frames_with(&times, 256, 256, &script).expect("run").timings;
+        let tuples: Vec<(usize, String, f64)> =
+            t.iter().map(|t| (t.frame, t.label.clone(), t.nanos)).collect();
+        (medians(&tuples), wrela_host::frame_spans(&t), t)
+    };
+    let chrome = |script: &str, serial: bool| {
+        let run = wrela_tests::ChromeRun {
+            timestamps: true,
+            serial,
+            script: Some(script.into()),
+            ..wrela_tests::ChromeRun::new(frames, 256, 256, 1000.0)
+        };
+        let r = wrela_tests::run_in_chrome_with(&rel, run);
+        (medians(&r.timings), r.spans, r.timings)
+    };
+    let mut report = Vec::new();
+    for (h, host) in ["the native host", "Chrome"].into_iter().enumerate() {
+        let run = |script: &str, serial: bool| {
+            let (m, spans, timings) = if h == 0 {
+                let (m, s, t) = native(script, serial);
+                (m, s, t.into_iter().map(|t| (t.frame, t.label, t.nanos)).collect())
+            } else {
+                chrome(script, serial)
+            };
+            (m, spans, timings)
+        };
+        // A span for every frame, at least as long as any piece in it; each piece named.
+        let (_, spans, timings) = run("[]", false);
+        assert_eq!(spans.len(), frames as usize, "{host}: a span for every frame");
+        for (f, span) in &spans {
+            let longest = timings.iter().filter(|t| t.0 == *f).map(|t| t.2).fold(0.0, f64::max);
+            assert!(
+                *span >= longest / 1e6 - 1e-6,
+                "{host}, frame {f}: span {span} ms, a piece {longest} ns"
+            );
+        }
+        for p in PIECES {
+            assert!(timings.iter().any(|t| t.1 == p), "{host} timed no `{p}`");
+        }
+        let mut serial: BTreeMap<String, f64> = BTreeMap::new();
+        let mut alone: BTreeMap<String, f64> = BTreeMap::new();
+        for _ in 0..2 {
+            for (k, piece) in PIECES.iter().enumerate() {
+                let (s, _, _) = run("[]", true);
+                let e = serial.entry(piece.to_string()).or_insert(f64::INFINITY);
+                *e = e.min(s[*piece]);
+                let (a, _, _) = run(&press(&format!("Digit{}", k + 1)), false);
+                let e = alone.entry(piece.to_string()).or_insert(f64::INFINITY);
+                *e = e.min(a[*piece]);
+            }
+        }
+        for piece in PIECES {
+            let (s, a) = (serial[piece], alone[piece]);
+            let line = format!(
+                "{host}: `{piece}` {s:.3} ms in the serial mode, {a:.3} ms alone ({:+.1}%)",
+                (s / a - 1.0) * 100.0
+            );
+            eprintln!("{line}");
+            report.push(((s / a - 1.0).abs() <= 0.10, line));
+        }
+    }
+    for (ok, line) in report {
+        assert!(ok, "over 10% from the piece alone: {line}");
+    }
+}

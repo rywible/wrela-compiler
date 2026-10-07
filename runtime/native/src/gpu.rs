@@ -48,9 +48,39 @@ const TIMESTAMP_QUERIES: u32 = 512;
 pub struct GpuTiming {
     /// Index of the frame in the run.
     pub frame: usize,
-    /// The dispatch's pipeline name, or `screen pass` or `pass`.
+    /// The name the program gave it (`std::gpu::label`), else the dispatch's pipeline name, or
+    /// `screen pass` or `pass`.
     pub label: String,
+    /// Its duration, `end - start`.
     pub nanos: f64,
+    /// When it started and ended on the GPU's clock, in nanoseconds from an origin of its own:
+    /// a frame's span is its first start to its last end.
+    pub start: f64,
+    pub end: f64,
+}
+
+/// Each frame's span in `timings` (ms): from its first timed piece's start to its last's end,
+/// by frame, for the frames that have any.
+pub fn frame_spans(timings: &[GpuTiming]) -> Vec<(usize, f64)> {
+    let mut spans: std::collections::BTreeMap<usize, (f64, f64)> = Default::default();
+    for t in timings {
+        let e = spans.entry(t.frame).or_insert((t.start, t.end));
+        e.0 = e.0.min(t.start);
+        e.1 = e.1.max(t.end);
+    }
+    spans.into_iter().map(|(f, (a, b))| (f, (b - a) / 1e6)).collect()
+}
+
+/// Whether passes and dispatches are timed, and how.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Timing {
+    #[default]
+    Off,
+    /// Each timed as it runs, beside the others (a frame's span is its first start to its last
+    /// end).
+    Span,
+    /// Each submitted and waited for alone: its own time, with nothing beside it.
+    Serial,
 }
 
 /// A texture format in wgpu's spelling.
@@ -211,6 +241,9 @@ struct Timer {
     /// What each pair of queries in this submission times: (frame, label).
     pending: Vec<(usize, String)>,
     results: Vec<GpuTiming>,
+    /// Each pass and dispatch submitted and waited for alone, so none overlaps another: each
+    /// one's own time (the serial mode).
+    serial: bool,
 }
 
 pub(crate) struct Gpu {
@@ -231,6 +264,8 @@ pub(crate) struct Gpu {
     pass: Option<OpenPass>,
     screen: Option<Screen>,
     timer: Option<Timer>,
+    /// The name the program gave the next pass or dispatch (`Label`).
+    label: Option<String>,
     errors: Arc<Mutex<Vec<String>>>,
     frame: usize,
     /// A debug build's: the flag its pipelines' bounds checks set (the manifest's
@@ -296,7 +331,9 @@ pub fn open_device(label: &str, features: wgpu::Features) -> Result<(wgpu::Devic
 
 impl Gpu {
     /// Opens the GPU and builds every pipeline. `shaders[i]` is pipeline `i`'s WGSL source.
-    pub(crate) fn new(manifest: &Manifest, shaders: &[String], timestamps: bool) -> Result<Gpu> {
+    /// `timing` says whether passes are timed, and how.
+    pub(crate) fn new(manifest: &Manifest, shaders: &[String], timing: Timing) -> Result<Gpu> {
+        let timestamps = timing != Timing::Off;
         let features =
             if timestamps { wgpu::Features::TIMESTAMP_QUERY } else { wgpu::Features::empty() };
         let (device, queue) = open_device("wrela-host", features)?;
@@ -325,7 +362,7 @@ impl Gpu {
         let ring = Ring::new(&device, "uniform ring", usage, RING_START);
         let usage = wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST;
         let upload = Ring::new(&device, "upload ring", usage, u64::from(stream::UPLOAD_START));
-        let timer = timestamps.then(|| Timer::new(&device));
+        let timer = timestamps.then(|| Timer::new(&device, timing == Timing::Serial));
         let mut gpu = Gpu {
             device,
             queue,
@@ -341,6 +378,7 @@ impl Gpu {
             pass: None,
             screen: None,
             timer,
+            label: None,
             errors,
             frame: 0,
             debug_flag: None,
@@ -684,6 +722,16 @@ impl Gpu {
         self.ring.write(&self.queue);
         self.upload.write(&self.queue);
         self.queue.submit([encoder.finish()]);
+        // The serial mode reads its timestamps once a frame (`collect`), so nothing waits
+        // between its submissions and the GPU keeps its clocks.
+        if self.timer.as_ref().is_some_and(|t| !t.serial) {
+            self.collect()?;
+        }
+        Ok(())
+    }
+
+    /// Reads back the timestamps of the submissions made since the last call.
+    fn collect(&mut self) -> Result<()> {
         if let Some(timer) = &mut self.timer
             && !timer.pending.is_empty()
         {
@@ -697,6 +745,7 @@ impl Gpu {
     fn reserve_timestamps(&mut self) -> Result<()> {
         if self.timer.as_ref().is_some_and(|t| t.pending.len() as u32 * 2 >= TIMESTAMP_QUERIES) {
             self.flush()?;
+            self.collect()?;
         }
         Ok(())
     }
@@ -852,7 +901,9 @@ impl Gpu {
         let bind_group = self.bind_group(pipeline, bindings);
         let mut encoder = self.take_encoder();
         let p = &self.pipelines[pipeline as usize];
-        let timestamps = self.timer.as_mut().map(|t| t.next(self.frame, &p.name));
+        let label = self.label.take();
+        let timestamps =
+            self.timer.as_mut().map(|t| t.next(self.frame, label.as_deref().unwrap_or(&p.name)));
         let Kind::Compute(compute) = &p.kind else {
             unreachable!("the checker checked the kind");
         };
@@ -876,6 +927,18 @@ impl Gpu {
         }
         drop(pass);
         self.encoder = Some(encoder);
+        self.alone()
+    }
+
+    /// In the serial mode, submits what's recorded and waits for the GPU to finish it, so the
+    /// next pass or dispatch starts alone. (Submissions alone aren't enough: on Apple GPUs a
+    /// render pass overlaps the kernel submitted before it.) Its timestamps are read once a
+    /// frame, so only the wait comes between the submissions.
+    fn alone(&mut self) -> Result<()> {
+        if self.timer.as_ref().is_some_and(|t| t.serial) {
+            self.flush()?;
+            self.device.poll(wgpu::PollType::wait_indefinitely()).map_err(gpu_err)?;
+        }
         Ok(())
     }
 
@@ -918,7 +981,8 @@ impl Gpu {
         let total = open.draws.iter().map(|d| self.aligned(d.uniforms.len())).sum();
         self.reserve_uniforms(op, total)?;
         self.reserve_timestamps()?;
-        let label = if on_screen { "screen pass" } else { "pass" };
+        let named = self.label.take();
+        let label = named.as_deref().unwrap_or(if on_screen { "screen pass" } else { "pass" });
         let timestamps = self.timer.as_mut().map(|t| t.next(self.frame, label));
         let [r, g, b, a] = pass.clear.map(f64::from);
         let mut bind_groups = Vec::new();
@@ -1003,7 +1067,7 @@ impl Gpu {
         }
         drop(rp);
         self.encoder = Some(encoder);
-        if on_screen { self.flush() } else { Ok(()) }
+        if on_screen { self.flush() } else { self.alone() }
     }
 
     /// A buffer's bytes `offset..offset + size`, copied back to the CPU (waits for the GPU).
@@ -1207,12 +1271,14 @@ impl Executor for Gpu {
             | Command::Fetch { .. }
             | Command::Post { .. }
             | Command::Log { .. } => {}
+            Command::Label { name } => self.label = Some(name.to_string()),
         }
         Ok(())
     }
 
     fn end_frame(&mut self) -> Result<()> {
         self.flush()?;
+        self.collect()?;
         self.check_errors()?;
         self.check_debug_flag()
     }
@@ -1321,8 +1387,9 @@ pub fn map_read(device: &wgpu::Device, buffer: &wgpu::Buffer) -> Result<Vec<u8>>
 }
 
 impl Timer {
-    fn new(device: &wgpu::Device) -> Timer {
+    fn new(device: &wgpu::Device, serial: bool) -> Timer {
         Timer {
+            serial,
             queries: device.create_query_set(&wgpu::QuerySetDescriptor {
                 label: Some("timestamps"),
                 ty: wgpu::QueryType::Timestamp,
@@ -1343,9 +1410,9 @@ impl Timer {
     /// Reads back the timestamps of the submission just made. This waits for the GPU at every
     /// flush, so the timing mode measures GPU durations, not throughput.
     fn collect(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
-        let times = read_timestamps(device, queue, &self.queries, self.pending.len() as u32)?;
-        for ((frame, label), nanos) in self.pending.drain(..).zip(times) {
-            self.results.push(GpuTiming { frame, label, nanos });
+        let times = read_timestamp_spans(device, queue, &self.queries, self.pending.len() as u32)?;
+        for ((frame, label), (start, end)) in self.pending.drain(..).zip(times) {
+            self.results.push(GpuTiming { frame, label, nanos: end - start, start, end });
         }
         Ok(())
     }
@@ -1363,6 +1430,18 @@ pub fn read_timestamps(
     queries: &wgpu::QuerySet,
     passes: u32,
 ) -> Result<Vec<f64>> {
+    let spans = read_timestamp_spans(device, queue, queries, passes)?;
+    Ok(spans.into_iter().map(|(start, end)| end - start).collect())
+}
+
+/// [`read_timestamps`]' passes' starts and ends, in nanoseconds on the GPU's clock (an end
+/// before its start, as a clock that wrapped, is taken as the start).
+pub fn read_timestamp_spans(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    queries: &wgpu::QuerySet,
+    passes: u32,
+) -> Result<Vec<(f64, f64)>> {
     if passes == 0 {
         return Ok(Vec::new());
     }
@@ -1390,6 +1469,9 @@ pub fn read_timestamps(
     let period = f64::from(queue.get_timestamp_period());
     Ok(bytes
         .chunks_exact(16)
-        .map(|pair| tick(&pair[8..]).saturating_sub(tick(&pair[..8])) as f64 * period)
+        .map(|pair| {
+            let (a, b) = (tick(&pair[..8]), tick(&pair[8..]));
+            (a as f64 * period, a.max(b) as f64 * period)
+        })
         .collect())
 }

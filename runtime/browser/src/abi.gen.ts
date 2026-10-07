@@ -40,6 +40,7 @@ export const Opcode = {
   Log: 22,
   Post: 23,
   DrawIndexedIndirect: 24,
+  Label: 25,
 } as const;
 
 /** A texture's format, by its number in the stream: WebGPU's name, the bytes of one texel, and

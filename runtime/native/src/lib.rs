@@ -36,7 +36,9 @@ mod shared;
 pub use cache::compiled_code_prefix;
 pub use error::{Error, Result};
 #[cfg(feature = "gpu")]
-pub use gpu::{GpuTiming, map_read, open_device, read_timestamps};
+pub use gpu::{
+    GpuTiming, Timing, frame_spans, map_read, open_device, read_timestamp_spans, read_timestamps,
+};
 pub use program::{Failure, PostHandler, Ticked, Value};
 pub use wrela_abi::input::{Event, Scripted, parse_script};
 pub use wrela_abi::ticks::{TickLog, frame_time, lockstep_ticks};
@@ -50,10 +52,15 @@ use wrela_abi::Manifest;
 /// How to run a program.
 #[derive(Clone, Debug, Default)]
 pub struct Options {
-    /// Time every dispatch and screen pass with GPU timestamp queries ([`RunResult::timings`]).
-    /// The host then waits for the GPU at every submission, so use it for durations, not
-    /// throughput. Fails to load if the adapter can't time.
+    /// Time every dispatch and pass with GPU timestamp queries ([`RunResult::timings`]): each
+    /// one's start and end, beside the others, so a frame's span is its first start to its
+    /// last end ([`frame_spans`]). The host then waits for the GPU at every submission, so use
+    /// it for durations, not throughput. Fails to load if the adapter can't time.
     pub timestamps: bool,
+    /// With `timestamps`, run each pass and dispatch alone: submitted and waited for before the
+    /// next is recorded, so each one's time is its own (on Apple GPUs passes overlap, and one
+    /// pass's start to end holds others' work).
+    pub serial: bool,
     /// Keep a copy of every batch the program submits ([`Host::take_batches`]): for tests
     /// that look at what a program recorded, such as a dispatch's uniform bytes.
     pub record: bool,
@@ -233,7 +240,12 @@ impl Host {
         // Everything that can be checked without the GPU is, before taking it.
         let compiled = program::compile_cached(&wasm, wasm_hash, Some(dir), None)?;
         let lock = lock::GpuLock::acquire(&format!("wrela-host {}", dir.display()))?;
-        let gpu = Gpu::new(&manifest, &shaders, options.timestamps)?;
+        let timing = match (options.timestamps, options.serial) {
+            (false, _) => Timing::Off,
+            (true, false) => Timing::Span,
+            (true, true) => Timing::Serial,
+        };
+        let gpu = Gpu::new(&manifest, &shaders, timing)?;
         let io = io(dir, options.storage.as_deref(), options.post.clone(), options.quiet);
         let n = workers(options.workers);
         let program = Program::instantiate_with(

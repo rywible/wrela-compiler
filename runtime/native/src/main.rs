@@ -1,7 +1,7 @@
 //! `wrela-host`: runs a build headless.
 //!
 //! - `wrela-host <build-dir> [--frames N] [--fps F] [--size WxH] [--input script.json]
-//!   [--png out.png] [--rgba out.rgba] [--timestamps] [--log out.ticks] [--workers N]`: frames
+//!   [--png out.png] [--rgba out.rgba] [--timestamps [--serial]] [--log out.ticks] [--workers N]`: frames
 //!   on the GPU (in lockstep with the program's ticker, if it has one), then the state hash.
 //! - `wrela-host --no-gpu <build-dir> --ticks N [--input script.json] [--log out.ticks]
 //!   [--workers N]`: the program's ticks alone, with no GPU and no frames: each tick's state
@@ -17,7 +17,7 @@ use std::process::ExitCode;
 use wrela_host::{CpuBuild, TickLog};
 
 const USAGE: &str = "usage:
-  wrela-host <build-dir> [--frames N] [--fps F] [--size WxH] [--input script.json] [--png out.png] [--rgba out.rgba] [--timestamps] [--log out.ticks] [--workers N]
+  wrela-host <build-dir> [--frames N] [--fps F] [--size WxH] [--input script.json] [--png out.png] [--rgba out.rgba] [--timestamps [--serial]] [--log out.ticks] [--workers N]
   wrela-host --no-gpu <build-dir> --ticks N [--input script.json] [--log out.ticks] [--workers N]
   wrela-host --replay <log> [--no-gpu] <build-dir> [--workers N]
 
@@ -25,7 +25,8 @@ With a GPU: runs the build's frame(i / fps, width, height) for i in 0..N (defaul
 fps, 640x360), its ticker (if it starts one) in lockstep, then prints the state hash: FNV-1a 64
 over every submitted byte, 16 hex digits. --input gives the program a script of input events
 (runtime/abi `input`). --png and --rgba write the last frame (raw RGBA8, rows top to bottom).
---timestamps prints each dispatch's and screen pass's GPU time to stderr.
+--timestamps prints each dispatch's and pass's GPU time to stderr, and each frame's span (its
+first start to its last end); --serial runs each pass and dispatch alone, so each time is its own.
 
 --no-gpu runs the ticker's ticks alone, with no GPU and no frames, and prints the first world's
 state hash and each tick's (`tick K HASH`). --log writes the ticks as a tick log (runtime/abi
@@ -42,6 +43,7 @@ struct Args {
     rgba: Option<PathBuf>,
     input: Option<PathBuf>,
     timestamps: bool,
+    serial: bool,
     no_gpu: bool,
     ticks: Option<u32>,
     log: Option<PathBuf>,
@@ -60,6 +62,7 @@ fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
         rgba: None,
         input: None,
         timestamps: false,
+        serial: false,
         no_gpu: false,
         ticks: None,
         log: None,
@@ -95,6 +98,7 @@ fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
             "--log" => args.log = Some(value("--log")?.into()),
             "--replay" => args.replay = Some(value("--replay")?.into()),
             "--timestamps" => args.timestamps = true,
+            "--serial" => args.serial = true,
             "--no-gpu" => args.no_gpu = true,
             "-h" | "--help" => return Err(USAGE.into()),
             flag if flag.starts_with("--") => {
@@ -170,6 +174,7 @@ fn frames(args: &Args) -> Result<(), Failure> {
     let script = read_script(args)?;
     let options = Options {
         timestamps: args.timestamps,
+        serial: args.serial,
         workers: args.workers,
         defer_init: true,
         ..Options::default()
@@ -192,6 +197,9 @@ fn frames(args: &Args) -> Result<(), Failure> {
     }
     for t in &run.timings {
         eprintln!("frame {:>4}  {:<24} {:>10.3} us", t.frame, t.label, t.nanos / 1000.0);
+    }
+    for (frame, ms) in wrela_host::frame_spans(&run.timings) {
+        eprintln!("frame {frame:>4}  span {ms:.3} ms");
     }
     println!("{}", run.hash_hex());
     Ok(())

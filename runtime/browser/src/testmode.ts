@@ -5,7 +5,9 @@
 // printed line came in (`frames.json`) to `results/` for
 // tools/headless.py. With `audio`, the main thread also renders that many
 // quanta of the program's voice offline, in an AudioWorklet, and saves the samples; with
-// `timestamps=1`, each pass's GPU time (`timings.json`, where the device has timestamp queries);
+// `timestamps=1`, each pass's GPU time, start and end (`timings.json`, where the device has
+// timestamp queries); with `timestamps=2`, each pass and dispatch run alone, one at a time, so each
+// time is its own (on Apple GPUs passes overlap);
 // with `nohash=1`, no state hash (hashing every submitted byte costs CPU time a timing run
 // shouldn't count; `hash.txt` then says `none`);
 // with `input=script.json`, a script of input events (runtime/abi `input`), each queued before

@@ -425,6 +425,9 @@ pub struct BrowserRun {
     /// Each pass's GPU time, when [`ChromeRun::timestamps`] asked for them: its frame, its
     /// label (as the native host's `GpuTiming`) and nanoseconds.
     pub timings: Vec<(usize, String, f64)>,
+    /// Each frame's span (ms), when [`ChromeRun::timestamps`] asked for them: from its first
+    /// timed pass's start to its last's end.
+    pub spans: Vec<(usize, f64)>,
     /// The ticker's ticks, when the program started one.
     pub ticks: Option<ChromeTicks>,
     /// When each frame began (ms since 1970), and the frame each printed line came in
@@ -460,6 +463,9 @@ pub struct ChromeRun {
     pub audio: u32,
     /// Time each pass on the GPU.
     pub timestamps: bool,
+    /// With `timestamps`, each pass and dispatch run alone, one at a time (`timestamps=2`), so
+    /// each time is its own.
+    pub serial: bool,
     /// A script of input events (runtime/abi `input`), which the run writes beside the page.
     pub script: Option<String>,
     /// Pointer events the page sends through the DOM while the frames run (0: none):
@@ -500,6 +506,7 @@ impl ChromeRun {
             workers,
             audio,
             timestamps,
+            serial,
             script,
             latency,
             keylatency,
@@ -516,7 +523,7 @@ impl ChromeRun {
         let flag = |on: &bool| u32::from(*on);
         for (name, n) in [
             ("audio", *audio),
-            ("timestamps", flag(timestamps)),
+            ("timestamps", flag(timestamps) * (1 + flag(serial))),
             ("latency", *latency),
             ("keylatency", *keylatency),
             ("paced", flag(paced)),
@@ -571,6 +578,7 @@ pub fn run_in_chrome_with(rel: &str, run: ChromeRun) -> BrowserRun {
             Vec::new()
         },
         timings: if run.timestamps { timings(&results) } else { Vec::new() },
+        spans: if run.timestamps { spans(&results) } else { Vec::new() },
         ticks: chrome_ticks(&results),
         began_ms: frames["began_ms"].as_array().expect("began_ms").iter().map(number).collect(),
         printed: frames["printed_in"]
@@ -620,6 +628,21 @@ pub fn timings(results: &Path) -> Vec<(usize, String, f64)> {
             (frame, label, t["nanos"].as_f64().expect("nanoseconds"))
         })
         .collect()
+}
+
+/// Each frame's span in a test-mode run's `results/` (its `timings.json`): from its first
+/// timed pass's start to its last's end, in ms, by frame.
+pub fn spans(results: &Path) -> Vec<(usize, f64)> {
+    let v = result_json(results, "timings.json");
+    let mut by_frame: BTreeMap<usize, (f64, f64)> = BTreeMap::new();
+    for t in v.as_array().expect("an array") {
+        let frame = t["frame"].as_u64().expect("a frame") as usize;
+        let (a, b) = (number(&t["start"]), number(&t["end"]));
+        let e = by_frame.entry(frame).or_insert((a, b));
+        e.0 = e.0.min(a);
+        e.1 = e.1.max(b);
+    }
+    by_frame.into_iter().map(|(f, (a, b))| (f, (b - a) / 1e6)).collect()
 }
 
 /// Runs the page another server serves at `url` (the studio server) in headless Chrome

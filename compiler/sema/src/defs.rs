@@ -177,6 +177,7 @@ macro_rules! lang_items {
                         | Lang::DestroySampler
                         | Lang::BeginPass
                         | Lang::EndPass
+                        | Lang::LabelCommand
                         | Lang::ReadBufferCommand
                 )
             }
@@ -270,6 +271,7 @@ lang_items! {
     CreateSampler = "std::gpu::create_sampler",
     DestroySampler = "std::gpu::destroy_sampler",
     BeginPass = "std::gpu::begin_pass_command",
+    LabelCommand = "std::gpu::label_command",
     EndPass = "std::gpu::end_pass_command",
     TextureSample = "std::gpu::texture_sample",
     TextureSampleLevel = "std::gpu::texture_sample_level",

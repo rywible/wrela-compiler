@@ -236,6 +236,7 @@ export class Checker {
         return;
       }
       case "Log":
+      case "Label":
         return;
     }
   }
