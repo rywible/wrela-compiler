@@ -295,6 +295,21 @@ impl Host {
         Ok((self.result(width, height)?, log))
     }
 
+    /// Frame `i` of a lockstep run ([`Host::run_lockstep`]), alone: for a test that looks at the
+    /// program between frames (its exports, the screen). Frames go in order from 0.
+    pub fn lockstep_frame(
+        &mut self,
+        i: u32,
+        fps: f64,
+        width: u32,
+        height: u32,
+        script: &[Scripted],
+    ) -> Result<()> {
+        self.program.executor().set_screen(width, height)?;
+        self.program.executor().set_frame(i as usize);
+        self.program.lockstep_frame(i, fps, width, height, script, None)
+    }
+
     /// [`CpuHost::ticks_beside_frames`], with the GPU: the frames draw.
     pub fn ticks_beside_frames(
         &mut self,
