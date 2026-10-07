@@ -895,6 +895,7 @@ fn the_cards_shade_each_pixel_once() {
             layers as f64 / crowns.max(1) as f64
         );
         assert!(n > 1000, "at {at} s the cards shade only {n} pixels");
+        assert!(beyond.is_empty(), "at {at} s pixels are shaded by more cards than cover them");
         assert!(mean <= 1.5, "at {at} s the cards shade a pixel {mean} times on average");
     }
 }
