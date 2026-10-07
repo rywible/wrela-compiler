@@ -8,8 +8,8 @@ use crate::check::Checker;
 use crate::hash::StateHash;
 use crate::lines::Lines;
 use crate::manifest::{
-    BindingKind, Cull, DepthBias, Manifest, Pipeline, ResourceBinding, Stage, UniformBlock,
-    UniformSpace,
+    BindingKind, Cull, DepthBias, DepthState, Manifest, Pipeline, ResourceBinding, Stage,
+    UniformBlock, UniformSpace,
 };
 use crate::stream::{
     self, Binding, Command, Compare, Encoder, NONE, Pass, SCREEN, Sequencer, StreamError,
@@ -374,6 +374,7 @@ pub fn check_manifest() -> Manifest {
         blend: false,
         cull: Cull::None,
         depth_bias: DepthBias::default(),
+        depth: DepthState::default(),
     };
     m.pipelines.push(shape("draw", render.clone()));
     let compute = Stage::Compute { entry: "main".into(), workgroup_size: [64, 1, 1] };
@@ -804,6 +805,7 @@ pub(crate) fn sample_manifest() -> Manifest {
             blend: false,
             cull: Cull::None,
             depth_bias: DepthBias::default(),
+            depth: DepthState::default(),
         },
         uniform: None,
         bindings: vec![
@@ -871,6 +873,28 @@ fn manifests() -> Vec<Value> {
                     *depth_bias = DepthBias { constant: 4, slope_scale: 2.0, clamp: 0.0 };
                 }
             }),
+        ),
+        manifest(
+            "a render pipeline that draws where depths are equal, writing none",
+            edited(&|m| {
+                if let Stage::Render { depth, .. } = &mut m.pipelines[1].stage {
+                    *depth = DepthState { compare: Compare::Equal, write: false };
+                }
+            }),
+        ),
+        manifest(
+            "a depth test that isn't one",
+            golden.replace(
+                "\"fragment_entry\": \"fs\",",
+                "\"fragment_entry\": \"fs\", \"depth\": { \"compare\": \"nearer\", \"write\": true },",
+            ),
+        ),
+        manifest(
+            "a depth write that isn't a bool",
+            golden.replace(
+                "\"fragment_entry\": \"fs\",",
+                "\"fragment_entry\": \"fs\", \"depth\": { \"compare\": \"always\", \"write\": 0 },",
+            ),
         ),
         manifest(
             "a cull mode that isn't one",

@@ -32,7 +32,7 @@ use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex};
 use wgpu::util::align_to;
 use wrela_abi::manifest::{
-    BindingKind, Cull, DepthBias, Manifest, ResourceBinding, Stage, UniformSpace,
+    BindingKind, Cull, DepthBias, DepthState, Manifest, ResourceBinding, Stage, UniformSpace,
 };
 use wrela_abi::stream::{self, Binding, Command, Compare, Opcode, Pass, TextureFormat};
 
@@ -68,6 +68,10 @@ fn wgpu_compare(c: Compare) -> wgpu::CompareFunction {
         Compare::LessEqual => wgpu::CompareFunction::LessEqual,
         Compare::Greater => wgpu::CompareFunction::Greater,
         Compare::GreaterEqual => wgpu::CompareFunction::GreaterEqual,
+        Compare::Equal => wgpu::CompareFunction::Equal,
+        Compare::NotEqual => wgpu::CompareFunction::NotEqual,
+        Compare::Always => wgpu::CompareFunction::Always,
+        Compare::Never => wgpu::CompareFunction::Never,
     }
 }
 
@@ -102,9 +106,10 @@ enum Kind {
         fragment: String,
         /// Its colour is drawn over the target's (the manifest's `blend`).
         blend: bool,
-        /// The manifest's `cull` and `depth_bias`.
+        /// The manifest's `cull`, `depth_bias` and `depth`.
         cull: Cull,
         depth_bias: DepthBias,
+        depth: DepthState,
         variants: HashMap<Targets, wgpu::RenderPipeline>,
     },
 }
@@ -478,7 +483,7 @@ impl Gpu {
                     cache: None,
                 },
             )),
-            Stage::Render { vertex_entry, fragment_entry, blend, cull, depth_bias } => {
+            Stage::Render { vertex_entry, fragment_entry, blend, cull, depth_bias, depth } => {
                 let mut kind = Kind::Render {
                     module,
                     pipeline_layout,
@@ -487,6 +492,7 @@ impl Gpu {
                     blend: *blend,
                     cull: *cull,
                     depth_bias: *depth_bias,
+                    depth: *depth,
                     variants: HashMap::new(),
                 };
                 // The screen's variant now, so a shader's errors come at load.
@@ -1230,6 +1236,7 @@ fn render_variant(device: &wgpu::Device, name: &str, kind: &mut Kind, targets: T
         blend,
         cull,
         depth_bias,
+        depth,
         variants,
     } = kind
     else {
@@ -1258,8 +1265,8 @@ fn render_variant(device: &wgpu::Device, name: &str, kind: &mut Kind, targets: T
     });
     let depth_stencil = targets.1.map(|format| wgpu::DepthStencilState {
         format,
-        depth_write_enabled: Some(true),
-        depth_compare: Some(wgpu::CompareFunction::Less),
+        depth_write_enabled: Some(depth.write),
+        depth_compare: Some(wgpu_compare(depth.compare)),
         stencil: wgpu::StencilState::default(),
         bias: wgpu::DepthBiasState {
             constant: depth_bias.constant,

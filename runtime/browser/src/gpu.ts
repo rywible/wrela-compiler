@@ -55,6 +55,8 @@ interface RenderParts {
   /** The manifest's `cull` and `depth_bias`. */
   cull: GPUCullMode;
   depthBias: { constant: number; slope_scale: number; clamp: number };
+  /** The manifest's `depth`: how fragments' depths are tested, and whether they're kept. */
+  depth: { compare: GPUCompareFunction; write: boolean };
   /** By target formats: `colour|depth`, each a format or `none`. */
   variants: Map<string, GPURenderPipeline>;
 }
@@ -110,8 +112,8 @@ function renderDescriptor(
       : {
           depthStencil: {
             format: depth,
-            depthWriteEnabled: true,
-            depthCompare: "less",
+            depthWriteEnabled: parts.depth.write,
+            depthCompare: parts.depth.compare,
             depthBias: parts.depthBias.constant,
             depthBiasSlopeScale: parts.depthBias.slope_scale,
             depthBiasClamp: parts.depthBias.clamp,
@@ -214,6 +216,7 @@ async function buildPipeline(device: GPUDevice, p: Pipeline, source: string): Pr
         blend: p.blend,
         cull: p.cull,
         depthBias: p.depth_bias,
+        depth: p.depth,
         variants: new Map(),
       };
       // The variants a pass is likeliest to draw it into, now and side by side: the screen, the

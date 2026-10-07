@@ -232,6 +232,8 @@ pub struct RenderState {
     pub bias_constant: i32,
     pub bias_slope: u32,
     pub bias_clamp: u32,
+    /// `std::gpu::Depth`: how fragments' depths are tested, and whether they're written.
+    pub depth: wrela_abi::manifest::DepthState,
 }
 
 #[derive(Clone, Debug)]

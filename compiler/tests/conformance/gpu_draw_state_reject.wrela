@@ -1,10 +1,10 @@
-// rejects: gpu.dispatch
-// A draw's cull mode and depth bias are part of its pipeline, which the host makes when the
-// program loads: build-time constants, written where it draws. Indices take their counts from
-// `indirect:`, and are `u32`s.
+// rejects: gpu.draw-state
+// A draw's cull mode, depth bias and depth test are part of its pipeline, which the host makes
+// when the program loads: build-time constants, written where it draws. Indices take their
+// counts from `indirect:`, and are `u32`s.
 use std::gpu::{
-    ClipPosition, Cull, DepthBias, GpuBuffer, VertexIndex, begin_screen_pass, buffer, draw,
-    present,
+    ClipPosition, Compare, Cull, Depth, DepthBias, GpuBuffer, VertexIndex, begin_screen_pass,
+    buffer, draw, present,
 }
 
 @vertex
@@ -26,11 +26,17 @@ pub fn frame(time: f32, width: u32, height: u32) {
     let cull = if width > height { Cull::Back } else { Cull::None }
     let bias = DepthBias { constant: 4, slope: 2.0, clamp: 0.0 }
     let steps = i32(width)
+    let test = if width > height { Compare::Less } else { Compare::Equal }
+    let depth = Depth { compare: Compare::Equal, write: false }
+    let writes = width > height
     begin_screen_pass(clear: vec4(0.0, 0.0, 0.0, 1.0))
     draw(corner.bind(points), white, vertices: 3, cull: cull) //~ E0603
     draw(corner.bind(points), white, vertices: 3, depth_bias: bias) //~ E0603
     draw(corner.bind(points), white, vertices: 3, depth_bias: DepthBias { constant: steps, slope: 0.0, clamp: 0.0 }) //~ E0603
     draw(corner.bind(points), white, vertices: 3, cull: Cull::Back, cull: Cull::None) //~ E0304
+    draw(corner.bind(points), white, vertices: 3, depth: depth) //~ E0603
+    draw(corner.bind(points), white, vertices: 3, depth: Depth { compare: test, write: true }) //~ E0603
+    draw(corner.bind(points), white, vertices: 3, depth: Depth { compare: Compare::Less, write: writes }) //~ E0603
     draw(corner.bind(points), white, indices: indices, vertices: 3) //~ E0603
     draw(corner.bind(points), white, indices: floats, indirect: counts) //~ E0603
     present()

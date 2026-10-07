@@ -1,5 +1,6 @@
-// A GPU-only feature in CPU code: `dpdx`, `fwidth`, sampling a texture, an entry point's
-// inputs. They exist where the GPU runs the code.
+// A GPU feature where it doesn't exist: `dpdx`, `fwidth`, sampling a texture or an entry
+// point's inputs in CPU code, which exist where the GPU runs the code; `discard()` anywhere but
+// a fragment shader, which alone has a fragment to drop.
 // ---- wrong
 pub fn frame(time: f32, width: u32, height: u32) {
     let rate = dpdx(time)

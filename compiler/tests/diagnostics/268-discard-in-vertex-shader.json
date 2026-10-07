@@ -1,0 +1,30 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0607",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [
+        "make the test in the fragment shader, passing it what it needs from the vertex shader"
+      ],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "`discard` is for fragment shaders, and this is the vertex shader `card`",
+      "notes": [
+        "`discard` drops the fragment a fragment shader is shading; a kernel, a vertex shader and CPU code have no fragment to drop"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 9,
+        "end": 404,
+        "end_column": 18,
+        "end_line": 16,
+        "line": 16,
+        "start": 395
+      },
+      "title": "a GPU feature where it doesn't exist"
+    }
+  ],
+  "version": 2
+}

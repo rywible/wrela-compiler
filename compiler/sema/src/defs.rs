@@ -249,6 +249,7 @@ lang_items! {
     Over = "std::gpu::Over",
     Cull = "std::gpu::Cull",
     DepthBias = "std::gpu::DepthBias",
+    Depth = "std::gpu::Depth",
     Dispatch = "std::gpu::dispatch",
     Draw = "std::gpu::draw",
     Buffer = "std::gpu::buffer",

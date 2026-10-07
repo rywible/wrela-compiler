@@ -336,7 +336,7 @@ test("first-light's CPU side gives the native host's state hash", async () => {
   const manifest = parseManifest(readFixtureText("manifest.json"));
   const program = await Program.load(readFixture("game.wasm"), checker(manifest), new Recorder(), { hash: true });
   for (let i = 0; i < 60; i++) program.frame(i / 60, 640, 360);
-  expect(program.hash!.hex()).toBe("0b03089c651c1ed7");
+  expect(program.hash!.hex()).toBe("21cf54db42e693e6");
   const log = (program.executor as Recorder).log;
   expect(log.slice(0, 7)).toEqual(["CreateBuffer", "WriteBuffer", "Dispatch", "BeginScreenPass", "Draw", "Present", "end"]);
   expect(log.length).toBe(3 + 60 * 4);

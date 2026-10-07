@@ -21,7 +21,7 @@
         "line": 5,
         "start": 141
       },
-      "title": "a GPU feature used in CPU code"
+      "title": "a GPU feature where it doesn't exist"
     }
   ],
   "version": 2

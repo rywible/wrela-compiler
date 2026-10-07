@@ -1,4 +1,4 @@
-//! # The manifest, version 4
+//! # The manifest, version 5
 //!
 //! `manifest.json` describes everything game-specific a host needs besides the WASM: each
 //! pipeline's shader, entry points and bindings (D-099). The runtime reads it at load; nothing
@@ -20,7 +20,9 @@
 //! - A render pipeline draws a triangle list into its pass's colour target: the screen, whose
 //!   format is [`SCREEN_FORMAT`] without sRGB encoding (so hosts produce the same bytes), or a
 //!   texture. With a depth target, a fragment is kept where its depth is less than what's
-//!   there, which it replaces. Hosts make one pipeline per combination of target formats a
+//!   there, which it replaces, unless its `"depth"` says otherwise: `"compare"`, how its depth
+//!   compares with what's there for it to be kept (WebGPU's names, `"less"` by default), and
+//!   `"write"`, whether it replaces it (`true` by default). Hosts make one pipeline per combination of target formats a
 //!   pipeline is drawn with. A render pipeline with `"blend": true` draws its colour over what's
 //!   in the target (alpha blending, straight alpha: `src × src.a + dst × (1 − src.a)` for the
 //!   colour, `src.a + dst.a × (1 − src.a)` for alpha); without it, its colour replaces it.
@@ -28,15 +30,16 @@
 //!   or `"back"`; a triangle whose vertices run counter-clockwise on the target faces the
 //!   front). Its `"depth_bias"` moves each fragment's depth by `constant` steps of the depth
 //!   format and `slope_scale` times the triangle's depth slope, at most `clamp` (when not 0)
-//!   in size: WebGPU's `depthBias`, `depthBiasSlopeScale` and `depthBiasClamp`. Neither may be
-//!   given at run time, so a program states both where it draws (language.md §12).
+//!   in size: WebGPU's `depthBias`, `depthBiasSlopeScale` and `depthBiasClamp`. None of these
+//!   may be given at run time, so a program states them where it draws (language.md §12).
 
 use crate::Limits;
+pub use crate::stream::Compare;
 use serde::Serialize;
 use serde_json::{Map, Value};
 use std::fmt;
 
-pub const VERSION: u32 = 4;
+pub const VERSION: u32 = 5;
 /// The screen's texture format, in WebGPU's spelling.
 pub const SCREEN_FORMAT: &str = "rgba8unorm";
 /// WebGPU's default limits that the manifest is checked against ([`Limits::DEFAULT`]).
@@ -96,7 +99,39 @@ pub enum Stage {
         cull: Cull,
         #[serde(skip_serializing_if = "DepthBias::is_none")]
         depth_bias: DepthBias,
+        #[serde(skip_serializing_if = "DepthState::is_default")]
+        depth: DepthState,
     },
+}
+
+/// How a render pipeline tests and writes depth, in a pass with a depth target: WebGPU's
+/// `depthCompare` and `depthWriteEnabled`. The default keeps the nearest fragment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct DepthState {
+    pub compare: Compare,
+    pub write: bool,
+}
+
+impl Default for DepthState {
+    fn default() -> DepthState {
+        DepthState { compare: Compare::Less, write: true }
+    }
+}
+
+impl DepthState {
+    pub fn is_default(&self) -> bool {
+        *self == DepthState::default()
+    }
+}
+
+impl Serialize for DepthState {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut o = s.serialize_struct("DepthState", 2)?;
+        o.serialize_field("compare", self.compare.name())?;
+        o.serialize_field("write", &self.write)?;
+        o.end()
+    }
 }
 
 /// Which triangles a render pipeline drops by facing.
@@ -529,6 +564,26 @@ mod read {
                             constant,
                             slope_scale: finite(bo, "slope_scale", &bp)?,
                             clamp: finite(bo, "clamp", &bp)?,
+                        }
+                    }
+                },
+                // A missing `depth` is the default; so are its missing fields.
+                depth: match o.get("depth") {
+                    None => DepthState::default(),
+                    Some(v) => {
+                        let dp = format!("{place}.depth");
+                        let d = object(v, &dp)?;
+                        let compares: Vec<(&str, Compare)> =
+                            Compare::ALL.iter().map(|c| (c.name(), *c)).collect();
+                        DepthState {
+                            compare: match d.get("compare") {
+                                None => Compare::Less,
+                                Some(_) => one_of(d, "compare", &dp, &compares)?,
+                            },
+                            write: match d.get("write").unwrap_or(&Value::Bool(true)) {
+                                Value::Bool(b) => *b,
+                                _ => return fail(format!("{dp}.write must be true or false")),
+                            },
                         }
                     }
                 },

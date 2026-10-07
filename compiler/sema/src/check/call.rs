@@ -2983,13 +2983,13 @@ impl<'p> Checker<'p> {
 
     /// `draw(vs.bind(...), fs.bind(...), vertices: n)`, with `instances: m` or, for both,
     /// `indirect: buf`; `indices: buf` with `indirect:` for an indexed draw; and the render
-    /// state, `cull:` and `depth_bias:`, build-time constants.
+    /// state, `cull:`, `depth_bias:` and `depth:`, build-time constants.
     fn check_draw(&mut self, args: &[ast::Arg], span: Span) -> Expr {
         let unit = self.p.types.unit;
         let u32_ty = self.p.types.u32;
         // `draw`'s own named arguments.
-        const OWN: [&str; 6] =
-            ["vertices", "instances", "indirect", "indices", "cull", "depth_bias"];
+        const OWN: [&str; 7] =
+            ["vertices", "instances", "indirect", "indices", "cull", "depth_bias", "depth"];
         let own = |a: &ast::Arg| a.name.as_ref().is_some_and(|n| OWN.contains(&n.name.as_str()));
         // The form before binding: the shaders' arguments among `draw`'s own, by name.
         let extra: Vec<&ast::Arg> =
@@ -3117,7 +3117,7 @@ impl<'p> Checker<'p> {
                     }
                 }
                 // The render state given twice isn't checked again.
-                "cull" | "depth_bias" if twice => {}
+                "cull" | "depth_bias" | "depth" if twice => {}
                 "cull" => {
                     if let Some(c) = self.render_constant(&a.value, Lang::Cull) {
                         use wrela_abi::manifest::Cull;
@@ -3134,6 +3134,14 @@ impl<'p> Checker<'p> {
                         state.bias_constant = c[0] as i32;
                         state.bias_slope = (c[1] as f32).to_bits();
                         state.bias_clamp = (c[2] as f32).to_bits();
+                    }
+                }
+                "depth" => {
+                    if let Some(c) = self.render_constant(&a.value, Lang::Depth) {
+                        use wrela_abi::manifest::DepthState;
+                        // `std::gpu::Compare`'s variants, in order, then the write flag.
+                        let compare = DEPTH_COMPARES[(c[0] as usize).min(DEPTH_COMPARES.len() - 1)];
+                        state.depth = DepthState { compare, write: c[1] != 0.0 };
                     }
                 }
                 "vertices" | "instances" => {
@@ -3245,6 +3253,22 @@ impl<'p> Checker<'p> {
             (ExprKind::Adt { variant: Some(v), fields, .. }, Lang::Cull) if fields.is_empty() => {
                 Some([f64::from(*v), 0.0, 0.0])
             }
+            (ExprKind::Adt { variant: None, fields, base: None, .. }, Lang::Depth) => {
+                /// A unit variant's index, or a bool literal as 0 or 1.
+                fn plain(e: &Expr) -> Option<f64> {
+                    match &e.kind {
+                        ExprKind::Adt { variant: Some(v), fields, .. } if fields.is_empty() => {
+                            Some(f64::from(*v))
+                        }
+                        ExprKind::Lit(Lit::Bool(b)) => Some(if *b { 1.0 } else { 0.0 }),
+                        _ => None,
+                    }
+                }
+                match fields.iter().map(plain).collect::<Option<Vec<f64>>>().as_deref() {
+                    Some(&[c, w]) => Some([c, w, 0.0]),
+                    _ => None,
+                }
+            }
             (ExprKind::Adt { variant: None, fields, base: None, .. }, Lang::DepthBias) => {
                 match fields.iter().map(number).collect::<Option<Vec<f64>>>().as_deref() {
                     Some(&[c, s, k]) => Some([c, s, k]),
@@ -3257,6 +3281,9 @@ impl<'p> Checker<'p> {
         if got.is_none() {
             let (what, example) = match lang {
                 Lang::Cull => ("cull mode", "`cull: Cull::Back`"),
+                Lang::Depth => {
+                    ("depth state", "`depth: Depth { compare: Compare::Equal, write: false }`")
+                }
                 _ => (
                     "depth bias",
                     "`depth_bias: DepthBias { constant: 4, slope: 2.0, clamp: 0.0 }`",
@@ -3278,8 +3305,15 @@ impl<'p> Checker<'p> {
     }
 }
 
-/// A `const` of a draw's state type (`Lang::Cull` or `Lang::DepthBias`, the ADT `a`), as its
-/// declaration writes it: a variant, or a struct of number literals, maybe negated
+/// `std::gpu::Compare`'s variants, in the order std declares them, as the manifest names them.
+const DEPTH_COMPARES: [wrela_abi::manifest::Compare; 8] = {
+    use wrela_abi::manifest::Compare::*;
+    [Less, LessEqual, Greater, GreaterEqual, Equal, NotEqual, Always, Never]
+};
+
+/// A `const` of a draw's state type (`Lang::Cull`, `Lang::DepthBias` or `Lang::Depth`, the ADT
+/// `a`), as its declaration writes it: a variant, a struct of number literals, maybe negated,
+/// or a `Depth` of a `Compare` variant and a bool, its defaults filling what it leaves out
 /// (`render_constant`).
 fn declared_render_constant(
     p: &crate::Program,
@@ -3303,6 +3337,41 @@ fn declared_render_constant(
             let name = &path.segments.last()?.ident.name;
             let v = adt.variants().iter().position(|v| &v.name == name)?;
             Some([v as f64, 0.0, 0.0])
+        }
+        (ast::ExprKind::StructLit { fields, base: None, .. }, Lang::Depth) => {
+            /// A `Compare` variant's index, or a bool literal as 0 or 1.
+            fn plain(e: &ast::Expr) -> Option<f64> {
+                match &e.kind {
+                    ast::ExprKind::Path(path) => {
+                        let name = &path.segments.last()?.ident.name;
+                        let names = [
+                            "Less",
+                            "LessEqual",
+                            "Greater",
+                            "GreaterEqual",
+                            "Equal",
+                            "NotEqual",
+                            "Always",
+                            "Never",
+                        ];
+                        names.iter().position(|n| n == name).map(|i| i as f64)
+                    }
+                    ast::ExprKind::Lit(ast::Lit { kind: ast::LitKind::Bool(b), .. }) => {
+                        Some(if *b { 1.0 } else { 0.0 })
+                    }
+                    _ => None,
+                }
+            }
+            let mut out = [0.0; 3];
+            for (k, d) in adt.fields().iter().enumerate() {
+                let given = fields.iter().find(|f| f.name.name == d.name);
+                let value = match given {
+                    Some(f) => f.value.as_ref()?,
+                    None => d.default.as_ref()?,
+                };
+                *out.get_mut(k)? = plain(value)?;
+            }
+            Some(out)
         }
         (ast::ExprKind::StructLit { fields, base: None, .. }, Lang::DepthBias) => {
             if fields.len() != adt.fields().len() {

@@ -1,0 +1,53 @@
+// rejects: gpu.discard
+// `discard()` drops a fragment, so it's for fragment shaders: a kernel, a vertex shader and CPU
+// code have no fragment to drop (E0607), nor does a function they call.
+use std::gpu::{
+    ClipPosition, GlobalId, GpuBuffer, Slots, VertexIndex, begin_screen_pass, buffer, discard,
+    dispatch, draw, present,
+}
+
+@compute(64)
+fn kernel(out: mut Slots<f32>, id: GlobalId) {
+    if id.x > 10 {
+        discard() //~ E0607
+    }
+    out[id] = 1.0
+}
+
+@gpu
+fn maybe_drop(x: f32) {
+    if x < 0.0 {
+        discard() //~ E0607
+    }
+}
+
+@vertex
+fn corner(v: VertexIndex) -> ClipPosition {
+    let x = f32(v.index)
+    if x > 2.0 {
+        discard() //~ E0607
+    }
+    maybe_drop(x)
+    ClipPosition { position: vec4(x, 0.0, 0.5, 1.0) }
+}
+
+@fragment
+fn white() -> vec4 {
+    vec4(1.0, 1.0, 1.0, 1.0)
+}
+
+fn cpu(x: f32) -> f32 {
+    if x < 0.0 {
+        discard() //~ E0607
+    }
+    x
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    var out: GpuBuffer<f32> = buffer(64)
+    dispatch(kernel.bind(mut out), groups: 1)
+    begin_screen_pass(clear: vec4(0.0, 0.0, 0.0, 1.0))
+    draw(corner, white, vertices: 3)
+    present()
+    let _ = cpu(time)
+}

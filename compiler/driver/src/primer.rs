@@ -159,6 +159,11 @@ pub const RULES: &[(&str, &str)] = &[
     ("gpu.data", "data that crosses to the GPU is `GpuData`"),
     ("gpu.dispatch", "`dispatch` and `draw` match their entry points; entry points aren't called"),
     (
+        "gpu.draw-state",
+        "a draw's cull mode, depth bias and depth test are build-time constants, written where it draws",
+    ),
+    ("gpu.discard", "`discard()` drops a fragment, in fragment shaders only"),
+    (
         "gpu.buffer-modes",
         "a buffer the GPU writes is passed `mut`; buffers and spans bound together don't overlap",
     ),

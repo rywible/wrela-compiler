@@ -5,6 +5,7 @@
 
 import {
   BINDING_KINDS,
+  COMPARES,
   MANIFEST_VERSION,
   MAX_STORAGE_BUFFERS_PER_STAGE,
   MAX_UNIFORM_BUFFER_BINDING_SIZE,
@@ -15,6 +16,8 @@ import {
 import { errorMessage } from "./errors.ts";
 
 export type UniformSpace = "uniform" | "storage";
+/** How two depths compare, in WebGPU's names. */
+export type Compare = Exclude<(typeof COMPARES)[number], null>;
 /** What a binding binds: a storage buffer read or read-write, a texture, or a sampler. */
 export type BindingKind = (typeof BINDING_KINDS)[number];
 
@@ -43,6 +46,7 @@ export type Stage =
       /** Which triangles it drops by facing. */
       cull: Cull;
       depth_bias: DepthBias;
+      depth: DepthState;
     };
 
 export type Cull = "none" | "front" | "back";
@@ -52,6 +56,12 @@ export interface DepthBias {
   constant: number;
   slope_scale: number;
   clamp: number;
+}
+
+/** WebGPU's `depthCompare` and `depthWriteEnabled`: by default, the nearest fragment is kept. */
+export interface DepthState {
+  compare: Compare;
+  write: boolean;
 }
 
 export type Pipeline = Stage & {
@@ -180,7 +190,17 @@ function pipeline(v: unknown, i: number): Pipeline {
       };
       depth_bias = { constant: c, slope_scale: finite("slope_scale"), clamp: finite("clamp") };
     }
-    stage = { kind, vertex_entry, fragment_entry, blend: b, cull, depth_bias };
+    // A missing `depth` is the default; so are its missing fields.
+    let depth: DepthState = { compare: "less", write: true };
+    if (o["depth"] !== undefined) {
+      const dw = `${where}.depth`;
+      const d = object(o["depth"], dw);
+      const compare = d["compare"] === undefined ? "less" : oneOf(d, "compare", dw, COMPARES.filter((c): c is Compare => c !== null));
+      const write = d["write"] ?? true;
+      if (typeof write !== "boolean") throw new ManifestError(`${dw}.write must be true or false`);
+      depth = { compare, write };
+    }
+    stage = { kind, vertex_entry, fragment_entry, blend: b, cull, depth_bias, depth };
   }
   // A missing `debug_flag` is read as null.
   const d = o["debug_flag"] ?? null;

@@ -1,8 +1,8 @@
 // Generated from the wrela-abi crate (runtime/abi): the one definition of the
 // command stream and manifest. Don't edit; run `cargo run -p wrela-abi --bin generate`.
 
-export const STREAM_VERSION = 6;
-export const MANIFEST_VERSION = 4;
+export const STREAM_VERSION = 7;
+export const MANIFEST_VERSION = 5;
 /** The bytes `WRCS`, read as a little-endian u32. */
 export const STREAM_MAGIC = 0x53435257;
 export const HEADER_LEN = 12;
@@ -51,7 +51,7 @@ export const TEXTURE_FORMATS = [
 ] as const;
 /** A comparison sampler's test, by its number in the stream: WebGPU's name (0 is a sampler that
  * doesn't compare). */
-export const COMPARES = [null, "less", "less-equal", "greater", "greater-equal"] as const;
+export const COMPARES = [null, "less", "less-equal", "greater", "greater-equal", "equal", "not-equal", "always", "never"] as const;
 
 export const IMPORT_MODULE = "wrela";
 export const IMPORT_SUBMIT = "submit";

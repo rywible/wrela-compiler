@@ -1,14 +1,16 @@
-// accepts: gpu.dispatch
-// Indexed indirect draws, and a draw's render state written where it draws: a cull mode and a
-// depth bias, build-time constants (a negative bias, a whole number for a float, the defaults),
-// there or in a `const`.
+// accepts: gpu.draw-state
+// Indexed indirect draws, and a draw's render state written where it draws: a cull mode, a
+// depth bias and a depth test, build-time constants (a negative bias, a whole number for a
+// float, the defaults; each comparison, depth writes off), there or in a `const`.
 use std::gpu::{
-    ClipPosition, Cull, DepthBias, GpuBuffer, VertexIndex, begin_screen_pass, buffer, draw,
-    present,
+    ClipPosition, Compare, Cull, Depth, DepthBias, GpuBuffer, VertexIndex, begin_screen_pass,
+    begin_screen_pass_with_depth, buffer, depth_texture, draw, present,
 }
 
 const SHADOW_BIAS = DepthBias { slope: 2.0, constant: 4, clamp: 0.0 }
 const FACES = Cull::Back
+const SHADE_CARDS = Depth { compare: Compare::Equal, write: false }
+const UNDER = Depth { write: false }
 
 @vertex
 fn corner(points: [vec2], v: VertexIndex) -> ClipPosition {
@@ -39,4 +41,15 @@ pub fn frame(time: f32, width: u32, height: u32) {
     draw(corner.bind(points), white, vertices: 3, cull: Cull::None, depth_bias: DepthBias { constant: 1, slope: -1.5, clamp: 0.0 })
     draw(corner.bind(points), white, vertices: 3, cull: FACES, depth_bias: SHADOW_BIAS)
     present()
+    var depth = depth_texture(width, height)
+    let pass = begin_screen_pass_with_depth(mut depth)
+    draw(corner.bind(points), white, vertices: 3, depth: Depth { compare: Compare::Less, write: true })
+    draw(corner.bind(points), white, vertices: 3, depth: Depth { compare: Compare::LessEqual })
+    draw(corner.bind(points), white, vertices: 3, depth: Depth { compare: Compare::Equal, write: false })
+    draw(corner.bind(points), white, vertices: 3, depth: Depth { compare: Compare::Greater })
+    draw(corner.bind(points), white, vertices: 3, depth: Depth { compare: Compare::Always, write: false })
+    draw(corner.bind(points), white, vertices: 3, depth: Depth {}, cull: Cull::Back)
+    draw(corner.bind(points), white, vertices: 3, depth: SHADE_CARDS)
+    draw(corner.bind(points), white, vertices: 3, depth: UNDER)
+    pass.present()
 }

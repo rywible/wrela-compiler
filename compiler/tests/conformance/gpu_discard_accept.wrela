@@ -1,0 +1,40 @@
+// accepts: gpu.discard
+// A fragment shader drops a fragment with `discard()`: a card cut to a disc. The invocation goes
+// on as a helper, so a derivative after it is still defined; a `@gpu` function that a fragment
+// shader calls may discard too.
+use std::gpu::{ClipPosition, VertexIndex, begin_screen_pass, discard, draw, present}
+
+struct Card: Copy {
+    clip: ClipPosition,
+    uv: vec2,
+}
+
+@vertex
+fn card(v: VertexIndex) -> Card {
+    let corners = [vec2(-1.0, -1.0), vec2(1.0, -1.0), vec2(-1.0, 1.0)]
+    let c = corners[v.index % 3]
+    Card { clip: ClipPosition { position: vec4(c * 0.5, 0.5, 1.0) }, uv: c }
+}
+
+@gpu
+fn cut_outside(uv: vec2, r: f32) {
+    if length(uv) > r {
+        discard()
+    }
+}
+
+@fragment
+fn disc(c: Card) -> vec4 {
+    if length(c.uv) > 0.9 {
+        discard()
+    }
+    cut_outside(c.uv, r: 0.95)
+    let edge = fwidth(length(c.uv))
+    vec4(1.0, 1.0, 1.0, edge)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    begin_screen_pass(clear: vec4(0.0, 0.0, 0.0, 1.0))
+    draw(card, disc, vertices: 3)
+    present()
+}

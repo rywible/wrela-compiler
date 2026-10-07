@@ -78,6 +78,7 @@ pub fn emit(l: &Lowered, sources: &SourceMap, simd: bool) -> BuildOutput {
                         slope_scale: f32::from_bits(state.bias_slope),
                         clamp: f32::from_bits(state.bias_clamp),
                     },
+                    depth: state.depth,
                 }
             }
             _ => {

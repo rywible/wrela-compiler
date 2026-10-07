@@ -1,0 +1,134 @@
+// Depth state (compiler/tests/tests/suite/renderer.rs): each comparison a draw's depth test can
+// make, with depth writes on and off. The screen is cut into eight cells, two rows of four. In
+// each, a grey quad at depth 0.5 fills the cell first; the case's quad is drawn over it with
+// its test; then a white probe, nearer than 0.5 and tested `Less`, over the cell's right half.
+// So the left half shows whether the case's quad passed its test, and the right half whether
+// it wrote its depth.
+use std::gpu::{
+    ClipPosition, Compare, Depth, DepthTexture, VertexIndex, begin_screen_pass_with_depth,
+    depth_texture, draw,
+}
+
+/// A cell of the screen in clip space, its lower left corner and its size, and a depth.
+struct Rect: Copy + GpuData {
+    lo: vec2,
+    size: vec2,
+    z: f32,
+}
+
+@vertex
+fn quad(v: VertexIndex, rect: Rect) -> ClipPosition {
+    let corners = [
+        vec2(0.0, 0.0),
+        vec2(1.0, 0.0),
+        vec2(0.0, 1.0),
+        vec2(0.0, 1.0),
+        vec2(1.0, 0.0),
+        vec2(1.0, 1.0),
+    ]
+    let p = rect.lo + corners[v.index % 6] * rect.size
+    ClipPosition { position: vec4(p, rect.z, 1.0) }
+}
+
+@fragment
+fn flat(colour: vec4) -> vec4 {
+    colour
+}
+
+pub struct Scene {
+    depth: DepthTexture,
+    width: u32,
+    height: u32,
+}
+
+pub fn init() -> Scene {
+    Scene { depth: depth_texture(width: 1, height: 1), width: 1, height: 1 }
+}
+
+/// Cell `k`'s rectangle at depth `z`.
+fn cell(k: u32, z: f32) -> Rect {
+    Rect { lo: vec2(-1.0 + 0.5 * f32(k % 4), 1.0 - f32(k / 4 + 1)), size: vec2(0.5, 1.0), z }
+}
+
+/// The right half of cell `k`, at depth `z`.
+fn right(k: u32, z: f32) -> Rect {
+    let c = cell(k, z)
+    Rect { lo: vec2(c.lo.x + 0.25, c.lo.y), size: vec2(0.25, 1.0), z }
+}
+
+const GREY = vec4(0.5, 0.5, 0.5, 1.0)
+const WHITE = vec4(1.0, 1.0, 1.0, 1.0)
+
+pub fn frame(s: mut Scene, time: f32, width: u32, height: u32) {
+    if width != s.width || height != s.height {
+        s.depth = depth_texture(width, height)
+        s.width = width
+        s.height = height
+    }
+    let pass = begin_screen_pass_with_depth(mut s.depth, clear: vec4(0.0, 0.0, 0.0, 1.0))
+    for k in 0..8 {
+        draw(quad.bind(cell(k, 0.5)), flat.bind(GREY), vertices: 6)
+    }
+    // 0: nearer, `Less`: drawn, and its depth written (the probe at 0.45 is behind it).
+    let red = vec4(1.0, 0.0, 0.0, 1.0)
+    draw(
+        quad.bind(cell(0, 0.4)),
+        flat.bind(red),
+        vertices: 6,
+        depth: Depth { compare: Compare::Less, write: true },
+    )
+    // 1: as near, `LessEqual`: drawn, its depth the same.
+    let green = vec4(0.0, 1.0, 0.0, 1.0)
+    draw(
+        quad.bind(cell(1, 0.5)),
+        flat.bind(green),
+        vertices: 6,
+        depth: Depth { compare: Compare::LessEqual },
+    )
+    // 2: as near, `Equal`, no writes: drawn.
+    let blue = vec4(0.0, 0.0, 1.0, 1.0)
+    draw(
+        quad.bind(cell(2, 0.5)),
+        flat.bind(blue),
+        vertices: 6,
+        depth: Depth { compare: Compare::Equal, write: false },
+    )
+    // 3: farther, `Greater`: drawn, and its depth written (the probe at 0.55 is in front).
+    let yellow = vec4(1.0, 1.0, 0.0, 1.0)
+    draw(
+        quad.bind(cell(3, 0.6)),
+        flat.bind(yellow),
+        vertices: 6,
+        depth: Depth { compare: Compare::Greater },
+    )
+    // 4: far, `Always`, no writes: drawn, and the depth stays 0.5 (the probe at 0.7 fails).
+    let magenta = vec4(1.0, 0.0, 1.0, 1.0)
+    draw(
+        quad.bind(cell(4, 0.9)),
+        flat.bind(magenta),
+        vertices: 6,
+        depth: Depth { compare: Compare::Always, write: false },
+    )
+    // 5: far, `Always`, writing: drawn, and the depth 0.9 (the probe at 0.7 passes).
+    let cyan = vec4(0.0, 1.0, 1.0, 1.0)
+    draw(
+        quad.bind(cell(5, 0.9)),
+        flat.bind(cyan),
+        vertices: 6,
+        depth: Depth { compare: Compare::Always, write: true },
+    )
+    // 6: farther, `Less`: hidden.
+    draw(quad.bind(cell(6, 0.6)), flat.bind(red), vertices: 6)
+    // 7: farther, `Equal`: hidden.
+    draw(
+        quad.bind(cell(7, 0.6)),
+        flat.bind(green),
+        vertices: 6,
+        depth: Depth { compare: Compare::Equal, write: false },
+    )
+    let probes = [0.45, 0.45, 0.45, 0.55, 0.7, 0.7, 0.45, 0.45]
+    for k in 0..8 {
+        draw(quad.bind(right(k, probes[k])), flat.bind(WHITE), vertices: 6)
+    }
+    pass.present()
+}

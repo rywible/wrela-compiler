@@ -1,4 +1,4 @@
-//! # The command stream, version 6
+//! # The command stream, version 7
 //!
 //! A program records GPU work as commands in its own memory and hands them to the host in
 //! batches through `wrela.submit(ptr, len)` (D-099). The host decodes each batch in bulk into
@@ -74,7 +74,7 @@
 use std::fmt;
 
 /// The stream format's version. Bumped by any change a host could notice.
-pub const VERSION: u32 = 6;
+pub const VERSION: u32 = 7;
 pub const MAGIC: [u8; 4] = *b"WRCS";
 /// The batch header: magic, version, body length.
 pub const HEADER_LEN: usize = 12;
@@ -224,20 +224,34 @@ impl TextureFormat {
     }
 }
 
-/// A comparison sampler's test: what passes, the reference against the texel. (0 in the stream
-/// is a sampler that doesn't compare.)
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// How two depths compare: a comparison sampler's test (what passes, the reference against the
+/// texel), and a render pipeline's depth test (the fragment's depth against the target's). (0 in
+/// the stream is a sampler that doesn't compare.)
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[repr(u32)]
 pub enum Compare {
+    #[default]
     Less = 1,
     LessEqual = 2,
     Greater = 3,
     GreaterEqual = 4,
+    Equal = 5,
+    NotEqual = 6,
+    Always = 7,
+    Never = 8,
 }
 
 impl Compare {
-    pub const ALL: [Compare; 4] =
-        [Compare::Less, Compare::LessEqual, Compare::Greater, Compare::GreaterEqual];
+    pub const ALL: [Compare; 8] = [
+        Compare::Less,
+        Compare::LessEqual,
+        Compare::Greater,
+        Compare::GreaterEqual,
+        Compare::Equal,
+        Compare::NotEqual,
+        Compare::Always,
+        Compare::Never,
+    ];
 
     pub fn from_u32(v: u32) -> Option<Compare> {
         Compare::ALL.into_iter().find(|c| *c as u32 == v)
@@ -250,6 +264,10 @@ impl Compare {
             Compare::LessEqual => "less-equal",
             Compare::Greater => "greater",
             Compare::GreaterEqual => "greater-equal",
+            Compare::Equal => "equal",
+            Compare::NotEqual => "not-equal",
+            Compare::Always => "always",
+            Compare::Never => "never",
         }
     }
 }

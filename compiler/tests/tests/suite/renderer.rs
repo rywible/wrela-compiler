@@ -113,3 +113,62 @@ fn indexed_draws_cull_and_bias_in_both_hosts() {
     let diff = image::compare(&browser.frame, &run.frame).expect("same size");
     assert!(diff.mean <= MEAN_LIMIT, "mean difference {:.4} over {MEAN_LIMIT}", diff.mean);
 }
+
+/// A draw's depth test and depth writes (compiler/tests/depth-state, §10.2 of #28): eight cells,
+/// each a comparison with writes on or off. A cell's left half shows whether its quad passed
+/// its test over the grey at depth 0.5, and its right half whether a white probe passed after
+/// it, so whether the quad wrote its depth. The native host draws what each case should, and
+/// Chrome draws the same frame with the same state hash.
+#[test]
+#[ignore = "long: needs Chrome, python3 and a GPU"]
+fn each_depth_test_and_write_draws_the_same_in_both_hosts() {
+    use wrela_abi::manifest::{Compare, DepthState, Stage};
+    let (dir, rel) = page("compiler/tests/depth-state", "depth-state");
+    let states: Vec<DepthState> = wrela_tests::manifest(&dir)
+        .pipelines
+        .iter()
+        .filter_map(|p| match &p.stage {
+            Stage::Render { depth, .. } => Some(*depth),
+            _ => None,
+        })
+        .collect();
+    for (compare, write) in [
+        (Compare::Less, true),
+        (Compare::LessEqual, true),
+        (Compare::Equal, false),
+        (Compare::Greater, true),
+        (Compare::Always, false),
+        (Compare::Always, true),
+    ] {
+        let want = DepthState { compare, write };
+        assert!(states.contains(&want), "no pipeline has {want:?}: {states:?}");
+    }
+    let (w, h) = (SIZE, SIZE / 2);
+    let browser = run_in_chrome(&rel, 2, w, h, 60.0);
+    let run = Host::load(&dir).expect("load").run_frames(&[0.0, 1.0 / 60.0], w, h).expect("run");
+    let (grey, white) = ([128, 128, 128, 255], [255, 255, 255, 255]);
+    let cases: [(&str, [u8; 4], [u8; 4]); 8] = [
+        ("less, nearer, writing", [255, 0, 0, 255], [255, 0, 0, 255]),
+        ("less-equal, as near", [0, 255, 0, 255], white),
+        ("equal, as near, no writes", [0, 0, 255, 255], white),
+        ("greater, farther, writing", [255, 255, 0, 255], white),
+        ("always, far, no writes", [255, 0, 255, 255], [255, 0, 255, 255]),
+        ("always, far, writing", [0, 255, 255, 255], white),
+        ("less, farther", grey, white),
+        ("equal, farther", grey, white),
+    ];
+    let px = |frame: &[u8], x: u32, y: u32| -> [u8; 4] {
+        let i = (4 * (y * w + x)) as usize;
+        frame[i..i + 4].try_into().expect("4 bytes")
+    };
+    for (k, (what, left, right)) in cases.iter().enumerate() {
+        let (x0, y0) = (32 * (k as u32 % 4), 32 * (k as u32 / 4));
+        for (host, frame) in [("the native host", &run.frame), ("Chrome", &browser.frame)] {
+            near(px(frame, x0 + 8, y0 + 16), *left, &format!("{what}: the quad, {host}"));
+            near(px(frame, x0 + 24, y0 + 16), *right, &format!("{what}: the probe, {host}"));
+        }
+    }
+    assert_eq!(browser.hash, run.hash_hex(), "the hosts' state hashes differ");
+    let diff = image::compare(&browser.frame, &run.frame).expect("same size");
+    assert!(diff.mean <= MEAN_LIMIT, "mean difference {:.4} over {MEAN_LIMIT}", diff.mean);
+}

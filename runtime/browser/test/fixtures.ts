@@ -51,6 +51,7 @@ export function shapes(): Manifest {
         blend: false,
         cull: "none",
         depth_bias: { constant: 0, slope_scale: 0, clamp: 0 },
+        depth: { compare: "less", write: true },
         uniform: { binding: 0, size: 16, space: "uniform" },
         bindings: [
           { binding: 1, kind: "read" },

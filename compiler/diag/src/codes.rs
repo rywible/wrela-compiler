@@ -218,7 +218,7 @@ codes! {
     E0604 = "E0604", "data crossing to the GPU that isn't `GpuData`";
     E0605 = "E0605", "a workgroup size out of range";
     E0606 = "E0606", "an entry point called directly";
-    E0607 = "E0607", "a GPU feature used in CPU code";
+    E0607 = "E0607", "a GPU feature where it doesn't exist";
         E0608 = "E0608", "a derivative in non-uniform control flow";
     E0609 = "E0609", "workgroup memory read and written with no barrier between";
     E0610 = "E0610", "a barrier in non-uniform control flow";

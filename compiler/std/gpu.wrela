@@ -210,12 +210,12 @@ pub fn dispatch() {}
 ///
 /// `indices: buf` (a `GpuBuffer<u32>` or a `GpuSpan<u32>`) draws indexed, with `indirect:`
 /// holding the index count, the instance count, the first index, the base vertex and the first
-/// instance. `cull:` (a `Cull`, `Cull::None` if not given) and `depth_bias:` (a `DepthBias`,
-/// none if not given) are part of the draw's pipeline, so they're build-time constants,
-/// written out where it draws.
+/// instance. `cull:` (a `Cull`, `Cull::None` if not given), `depth_bias:` (a `DepthBias`,
+/// none if not given) and `depth:` (a `Depth`: the nearest fragment kept, if not given) are
+/// part of the draw's pipeline, so they're build-time constants, written out where it draws.
 ///
 /// ```wrela
-/// use std::gpu::{ClipPosition, Cull, DepthBias, GpuBuffer, VertexIndex, buffer, draw}
+/// use std::gpu::{ClipPosition, Compare, Cull, Depth, DepthBias, GpuBuffer, VertexIndex, buffer, draw}
 ///
 /// @vertex
 /// fn corner(points: [vec2], i: VertexIndex) -> ClipPosition {
@@ -235,6 +235,14 @@ pub fn dispatch() {}
 ///         indirect: counts,
 ///         cull: Cull::Back,
 ///         depth_bias: DepthBias { constant: 4, slope: 2.0, clamp: 0.0 },
+///     )
+///     // Again where the first drew, with no depth written.
+///     draw(
+///         corner.bind(points),
+///         white,
+///         indices: indices,
+///         indirect: counts,
+///         depth: Depth { compare: Compare::Equal, write: false },
 ///     )
 /// }
 /// ```
@@ -257,6 +265,15 @@ pub struct DepthBias: Copy {
     pub constant: i32,
     pub slope: f32,
     pub clamp: f32,
+}
+
+/// How a draw tests and writes depth, in a pass with a depth target: a fragment is drawn where
+/// its depth `compare`s with the target's as it says, and it keeps its depth there if `write`.
+/// The default keeps the nearest fragment. A card's shading after its depth prepass draws where
+/// the depth is `Equal` and writes none.
+pub struct Depth: Copy {
+    pub compare: Compare = Compare::Less,
+    pub write: bool = true,
 }
 
 /// Drops the fragment a fragment shader is shading: it writes no colour and no depth (an alpha
@@ -334,13 +351,18 @@ pub enum Address: Copy {
     Repeat,
 }
 
-/// A comparison sampler's test: a texel passes when the reference depth is less than it, and
-/// so on.
+/// How two depths compare: a comparison sampler's test (a texel passes when the reference depth
+/// is less than it, and so on), and a draw's depth test (a fragment passes when its depth is
+/// less than the target's, and so on). `Always` passes every one, and `Never` none.
 pub enum Compare: Copy {
     Less,
     LessEqual,
     Greater,
     GreaterEqual,
+    Equal,
+    NotEqual,
+    Always,
+    Never,
 }
 
 /// How shaders read a `Texture` between its texels.
@@ -413,6 +435,10 @@ pub fn comparison_sampler(compare: Compare = Compare::LessEqual) -> ComparisonSa
         Compare::LessEqual => 2,
         Compare::Greater => 3,
         Compare::GreaterEqual => 4,
+        Compare::Equal => 5,
+        Compare::NotEqual => 6,
+        Compare::Always => 7,
+        Compare::Never => 8,
     }
     ComparisonSampler { handle: create_sampler(linear: 1, repeat: 0, compare: code) }
 }

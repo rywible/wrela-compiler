@@ -886,7 +886,9 @@ pub(crate) fn intrinsic(
                     codes::E0607,
                     user_span(fl, c.span),
                     format!("`discard` is for fragment shaders, and this is {what}"),
-                );
+                )
+                .with_note("`discard` drops the fragment a fragment shader is shading; a kernel, a vertex shader and CPU code have no fragment to drop")
+                .with_help("make the test in the fragment shader, passing it what it needs from the vertex shader");
                 fl.cx.err(with_call_chain(fl, d));
                 return None;
             }
