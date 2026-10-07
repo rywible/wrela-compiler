@@ -11,9 +11,9 @@
 //!
 //! A case is a `.wrela` file, built as a one-file package, or a directory, built as a package
 //! (its `main.wrela` holds the expectations). Arguments and results are numbers, read by the
-//! export's WASM types (`u32` and `bool` are `i32`s). A program without a `frame` export gets
-//! an empty one. Each program is also built without SIMD, which must give the same results
-//! (language.md §11).
+//! export's WASM types (`u32` and `bool` are `i32`s); several results are written `(a, b, ...)`.
+//! A program without a `frame` export gets an empty one. Each program is also built without
+//! SIMD, which must give the same results (language.md §11).
 
 use crate::{scratch, with_frame};
 use std::path::Path;
@@ -137,9 +137,15 @@ fn run_case(path: &Path) -> Result<usize, String> {
                 problems.push(format!("`{}`: `{}` returns nothing: expect `()`", e.text, e.call));
             }
             (Want::Returns(v), Ok(vals)) => {
-                let want: Vec<Value> = match results.first() {
-                    Some(t) => vec![value(v, t)],
-                    None => Vec::new(),
+                // Several results: `(a, b, ...)`, each read by its result's type.
+                let want: Vec<Value> = match v.strip_prefix('(').and_then(|v| v.strip_suffix(')')) {
+                    Some(vs) if results.len() > 1 => vs
+                        .split(',')
+                        .map(str::trim)
+                        .zip(results)
+                        .map(|(v, t)| value(v, t))
+                        .collect(),
+                    _ => results.first().map(|t| value(v, t)).into_iter().collect(),
                 };
                 if want.len() != vals.len() || !want.iter().zip(&vals).all(|(a, b)| same(a, b)) {
                     problems.push(format!("`{}`: returned {vals:?}, expected {want:?}", e.text));

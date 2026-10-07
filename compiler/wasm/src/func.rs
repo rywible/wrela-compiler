@@ -1803,25 +1803,32 @@ pub(crate) fn export_wrapper(
 ) -> R<(Vec<ValType>, Vec<ValType>, Function)> {
     const VEC: i32 = 16;
     let func = &m.functions[f.index()];
-    // A vector result: in memory (`sret`), or a `v128` (an f32 vector, with SIMD).
-    let (results, sret, comps, ret_comp) = match func.ret {
-        None => (Vec::new(), false, 0, ir::Scalar::F32),
+    // A result: a scalar; an f32 vector as a `v128`, with SIMD (`comps` lanes); or anything
+    // else in memory (`sret`), returned as its scalars in order (`leaves`).
+    let (results, sret, comps, leaves, ret_bytes) = match func.ret {
+        None => (Vec::new(), false, 0, Vec::new(), 0),
         Some(t) => match m.types.get(t) {
-            ir::TypeDef::Scalar(s) => (vec![valtype(*s)], false, 0, *s),
-            &ir::TypeDef::Vector(s, n) => {
-                let v128 = simd && s == ir::Scalar::F32;
-                (vec![valtype(s); n as usize], !v128, u32::from(n), s)
+            ir::TypeDef::Scalar(s) => (vec![valtype(*s)], false, 0, Vec::new(), 0),
+            &ir::TypeDef::Vector(ir::Scalar::F32, n) if simd => {
+                (vec![ValType::F32; n as usize], false, u32::from(n), Vec::new(), 0)
             }
-            d => return Err(format!("internal: export returns {d:?}")),
+            _ => {
+                let leaves = ir::layout::scalars(&m.types, t);
+                if leaves.is_empty() {
+                    return Err(format!("internal: export {} returns no numbers", func.name));
+                }
+                let results = leaves.iter().map(|&(_, s)| valtype(s)).collect();
+                let size = ir::layout::layout(&m.types, t).size;
+                (results, true, 0, leaves, ir::layout::round_up(16, size) as i32)
+            }
         },
     };
-    let ret_size = crate::scalar_size(ret_comp);
     // Each parameter: its first WASM parameter, and for a vector, its components and offset
     // (`None` for a `v128`).
     let mut params = Vec::new();
     let mut ins_args = Vec::new();
     let mut normalize = Vec::new();
-    let mut size = if sret { VEC.max(32 * i32::from(ret_size == 8)) } else { 0 };
+    let mut size = ret_bytes;
     for p in &func.params {
         let at = params.len() as u32;
         match m.types.get(p.ty) {
@@ -1930,8 +1937,8 @@ pub(crate) fn export_wrapper(
     }
     ins.push(I::Call(h.flush));
     if sret {
-        for c in 0..comps {
-            ins.extend([I::LocalGet(frame), load_op(ret_comp, ret_size * c)]);
+        for &(at, s) in &leaves {
+            ins.extend([I::LocalGet(frame), load_op(s, at)]);
         }
     } else if comps > 0 {
         for c in 0..comps {

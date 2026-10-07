@@ -3,7 +3,8 @@
 //! `wrela bisect <package-dir> --until "<export> <op> <number>" [--frames n] [--json]` runs
 //! frames until a condition holds, and says at which frame (`<op>` is `<`, `<=`, `>`, `>=`,
 //! `==` or `!=`; `nan <export>` holds when the export says NaN; `<export>.x` picks a vector's
-//! component). Both take `[--fps f] [--size WxH] [--input script.json] [--release]`.
+//! component, and `<export>.5` any value by its place, as a struct's are returned). Both take
+//! `[--fps f] [--size WxH] [--input script.json] [--release]`.
 //!
 //! An export watched takes no arguments but the program's state (if it has one: the host passes
 //! it), and returns numbers. The program is a debug build (language.md §11's checks, so a
@@ -154,12 +155,14 @@ fn step(
 /// A vector's components, by name.
 const COMPONENTS: [&str; 4] = ["x", "y", "z", "w"];
 
-/// An export's values' column names: the export's for one value, with `.x`, `.y`, ... for more.
+/// An export's values' column names: the export's for one value, with `.x`, `.y`, ... for up to
+/// four (a vector's), and `.0`, `.1`, ... for more (a struct's, in the order it returns them).
 fn columns(name: &str, n: usize) -> Vec<String> {
-    if n == 1 {
-        return vec![name.to_string()];
+    match n {
+        1 => vec![name.to_string()],
+        2..=4 => COMPONENTS[..n].iter().map(|c| format!("{name}.{c}")).collect(),
+        _ => (0..n).map(|k| format!("{name}.{k}")).collect(),
     }
-    (0..n).map(|k| format!("{name}.{}", COMPONENTS.get(k).copied().unwrap_or("?"))).collect()
 }
 
 /// Values as an export's are shown, each as an `f32`, with `sep` between.
@@ -246,7 +249,7 @@ fn parse_until(text: &str) -> Option<Until> {
         _ => return None,
     };
     let (export, component) = match target.rsplit_once('.') {
-        Some((e, c)) => (e, COMPONENTS.iter().position(|k| *k == c)?),
+        Some((e, c)) => (e, COMPONENTS.iter().position(|k| *k == c).or_else(|| c.parse().ok())?),
         None => (target, 0),
     };
     Some(Until { export: export.to_string(), component, test })

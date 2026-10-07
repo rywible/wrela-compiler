@@ -576,8 +576,9 @@ impl<'a> Cx<'a> {
     }
 
     /// Whether an exported function's signature can cross the WASM boundary: scalars and
-    /// vectors in, and a scalar, a vector or nothing out. `frame` has the one signature the
-    /// host calls, and no export takes the name of the program's memory.
+    /// vectors in, and out a scalar, a vector, a struct, tuple or array of those (each its
+    /// values, in order: [`export_values`]) or nothing. `frame` has the one signature the host
+    /// calls, and no export takes the name of the program's memory.
     fn check_export(&mut self, f: FnId, state: Option<TyId>) -> bool {
         let def = self.checked.program.func(f);
         if def.name == wrela_abi::EXPORT_MEMORY {
@@ -674,7 +675,10 @@ impl<'a> Cx<'a> {
             }
         }
         let rk = self.checked.program.types.kind(def.ret);
-        if !exportable(rk, true) || def.ret_mode != wrela_sema::defs::RetMode::Owned {
+        let values = export_values(&self.checked.program, def.ret);
+        if !(exportable(rk, true) || values.is_some_and(|n| n <= MAX_EXPORT_VALUES))
+            || def.ret_mode != wrela_sema::defs::RetMode::Owned
+        {
             ok = false;
             let mode = match def.ret_mode {
                 wrela_sema::defs::RetMode::Owned => "",
@@ -686,10 +690,16 @@ impl<'a> Cx<'a> {
                 wrela_diag::codes::E0703,
                 def.sig_span,
                 format!(
-                    "`{}` is exported, so it returns a number, a `bool`, a vector or nothing, not `{shown}`",
+                    "`{}` is exported, so it returns a number, a `bool`, a vector, a struct, tuple or array of those, or nothing, not `{shown}`",
                     def.name
                 ),
             );
+            if values.is_some_and(|n| n > MAX_EXPORT_VALUES) {
+                d = d.with_note(format!(
+                    "it holds {} values, and an export returns at most {MAX_EXPORT_VALUES}",
+                    values.unwrap_or(0)
+                ));
+            }
             if !mode.is_empty() {
                 d = d.with_note(
                     "a projection points into the program's memory, which the host can't hold",
@@ -939,4 +949,31 @@ fn rewrite_block(
         out.push(s);
     }
     out
+}
+
+/// The most values an export returns (WASM's multi-value results, each a number).
+const MAX_EXPORT_VALUES: usize = 64;
+
+/// How many values a value of type `t` crosses the WASM boundary as, if it can as an export's
+/// result: one for a number or a `bool`, a vector's or a matrix's components, and its parts'
+/// for a struct, a tuple or an array of those. Not an enum, nor a type the language or std
+/// gives a meaning (`Text`, `Vec`, ...): none crosses as its bytes.
+fn export_values(p: &wrela_sema::program::Program, t: TyId) -> Option<usize> {
+    match p.types.kind(t) {
+        TyKind::Bool | TyKind::Int(_) | TyKind::Float(_) => Some(1),
+        TyKind::Vec(_, n) => Some(usize::from(*n)),
+        TyKind::Mat(n) => Some(usize::from(*n) * usize::from(*n)),
+        TyKind::Tuple(ts) if !ts.is_empty() => ts.iter().map(|&e| export_values(p, e)).sum(),
+        TyKind::Array(e, n) if *n > 0 => Some(export_values(p, *e)? * *n as usize),
+        TyKind::Adt(a, args)
+            if p.lang_of_ty(t).is_none() && !p.adt(*a).is_enum() && !p.adt(*a).borrow =>
+        {
+            let fields = p.fields_of(*a, args, None);
+            if fields.is_empty() {
+                return None;
+            }
+            fields.into_iter().map(|f| export_values(p, f)).sum()
+        }
+        _ => None,
+    }
 }

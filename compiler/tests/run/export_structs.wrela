@@ -1,0 +1,36 @@
+// run: an export returns a struct, a tuple or an array of numbers, bools and vectors as its
+// values, in order: fields, elements, components
+// expect: stats(3) = (7.5, 4, 1, 1.0, 2.0, 3.0, 3298534883328)
+// expect: pair(1.5) = (3.0, -3)
+// expect: grid() = (1, 2, 3, 4)
+// expect: nested() = (7.5, 4, 1, 1.0, 2.0, 3.0, 3298534883328, 0.5, 0.25, 200)
+
+pub struct Stats {
+    pub mass: f32,
+    pub bones: u32,
+    pub ok: bool,
+    pub centre: vec3,
+    pub id: u64,
+}
+
+pub fn stats(s: u32) -> Stats {
+    Stats {
+        mass: 2.5 * f32(s),
+        bones: s + 1,
+        ok: s > 2,
+        centre: vec3(1.0, 2.0, 3.0),
+        id: u64(s) << 40,
+    }
+}
+
+pub fn pair(x: f32) -> (f32, i32) {
+    (x * 2.0, -3)
+}
+
+pub fn grid() -> [[u32; 2]; 2] {
+    [[1, 2], [3, 4]]
+}
+
+pub fn nested() -> (Stats, vec2d, u8) {
+    (stats(3), vec2d(0.5, 0.25), u8(200))
+}

@@ -177,9 +177,9 @@ pub fn near_surface(game: mut Game, s: u32, n: u32) {
 }
 
 /// The grid seed `s` is realized on at `cell`: its blocks along x, y and z, and the cell.
-pub fn grid(s: u32, cell: f32) -> vec4 {
+pub fn grid(s: u32, cell: f32) -> (vec3u, f32) {
     let g = Grid::around(grazer(s).bounds(), cell)
-    vec4(vec3(g.size), g.cell)
+    (g.size, g.cell)
 }
 
 /// Its grid's origin.

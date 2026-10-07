@@ -7,8 +7,13 @@ pub fn first(p: Point) -> f32 { //~ E0703
     p.x
 }
 
-pub fn pair(a: f32) -> [f32; 2] { //~ E0703
-    [a, a]
+// A result crosses as its numbers; an enum, or text, has none of its own.
+pub fn pair(a: f32) -> Option<f32> { //~ E0703
+    Some(a)
+}
+
+pub fn named(a: f32) -> (f32, Text) { //~ E0703
+    (a, "a")
 }
 
 pub fn frame(time: f32, width: u32, height: u32) {}

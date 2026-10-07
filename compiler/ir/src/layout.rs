@@ -153,6 +153,45 @@ pub fn field_offsets(types: &Types, t: TypeId) -> &[u32] {
     types.field_offsets(t)
 }
 
+/// The scalars a value of type `t` holds, in order (fields, then elements, then components;
+/// a matrix's columns), with their byte offsets: how an export returns it (each one a WASM
+/// result). An enum's, a run's or a pointer's aren't listed.
+pub fn scalars(types: &Types, t: TypeId) -> Vec<(u32, Scalar)> {
+    fn go(types: &Types, t: TypeId, at: u32, out: &mut Vec<(u32, Scalar)>) {
+        match types.get(t) {
+            TypeDef::Scalar(s) => out.push((at, *s)),
+            TypeDef::Vector(s, n) => {
+                let size = scalar_layout(*s).size;
+                out.extend((0..u32::from(*n)).map(|c| (at + c * size, *s)));
+            }
+            TypeDef::Matrix(n) => {
+                for c in 0..u32::from(*n) {
+                    out.extend(
+                        (0..u32::from(*n))
+                            .map(|r| (at + c * column_stride(*n) + 4 * r, Scalar::F32)),
+                    );
+                }
+            }
+            TypeDef::Array(e, n) => {
+                let stride = array_stride(types, *e);
+                for i in 0..*n {
+                    go(types, *e, at + i * stride, out);
+                }
+            }
+            TypeDef::Struct { fields, .. } => {
+                let offsets = field_offsets(types, t);
+                for (k, (_, f)) in fields.iter().enumerate() {
+                    go(types, *f, at + offsets[k], out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    go(types, t, 0, &mut out);
+    out
+}
+
 /// The distance between a `matN`'s columns.
 pub fn column_stride(n: u8) -> u32 {
     vector_layout(n, 4).stride()

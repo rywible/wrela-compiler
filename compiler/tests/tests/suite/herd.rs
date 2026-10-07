@@ -185,7 +185,7 @@ fn seed_1s_mass_is_within_0_05_percent_of_the_ground_truth() {
 fn the_physique_gives_each_bone_its_mass_and_moments() {
     let mut host = ours();
     let r = host.call_export("physique", &[Value::I32(1), Value::F32(0.02)]).expect("physique");
-    let [Value::F32(total), Value::F32(sum), Value::F32(bones), Value::F32(least)] = r[..] else {
+    let [Value::F32(total), Value::F32(sum), Value::I32(bones), Value::F32(least)] = r[..] else {
         panic!("{r:?}")
     };
     let mass = f64_of(&host.call_export("mass", &[Value::I32(1), Value::F32(0.02)]).expect("mass"));
@@ -201,7 +201,7 @@ fn the_physique_gives_each_bone_its_mass_and_moments() {
     );
     assert!((f64::from(total) - mass).abs() <= 1e-6 * mass, "{total} against {mass}");
     assert!((total - sum).abs() <= 1e-4 * total, "{sum} summed against {total}");
-    assert!(bones >= 20.0, "only {bones} bones have mass");
+    assert!(bones >= 20, "only {bones} bones have mass");
     assert!(least >= -1e-4, "a bone's moments break the triangle inequality: {least}");
     assert!(differ <= 0.05, "a bone is {:.2}% from integrate's", differ * 100.0);
 }
@@ -498,7 +498,7 @@ fn a_realization_in_slices_is_the_whole_ones() {
 fn realize_herd(host: &mut wrela_host::Host, cell: f32) -> (Vec<Ours>, Vec<f64>) {
     let blocks = |host: &mut wrela_host::Host, s: u32| {
         let g = host.call_export("grid", &[Value::I32(s as i32), Value::F32(cell)]).expect("grid");
-        let [Value::F32(x), Value::F32(y), Value::F32(z), _] = g[..] else { panic!("{g:?}") };
+        let [Value::I32(x), Value::I32(y), Value::I32(z), _] = g[..] else { panic!("{g:?}") };
         (x * y * z) as u32
     };
     let largest = (1..=40).max_by_key(|&s| blocks(host, s)).expect("a seed");
@@ -1041,7 +1041,7 @@ fn realization_reads_nothing_back_between_its_passes() {
     let times: Vec<f32> = (0..240).map(|i| wrela_host::frame_time(i, 60.0)).collect();
     host.run_frames_with(&times, 960, 540, &script).expect("run the herd");
     let r = host.call_export("realized", &[]).expect("realized");
-    let [Value::F32(realizations), Value::F32(readbacks), _, _] = r[..] else { panic!("{r:?}") };
+    let [Value::I32(realizations), Value::I32(readbacks), _, _] = r[..] else { panic!("{r:?}") };
     let manifest = std::fs::read_to_string(dir.join("manifest.json")).expect("manifest");
     let manifest = wrela_abi::Manifest::parse(&manifest).expect("a manifest");
     let name = |p: u32| manifest.pipelines[p as usize].name.clone();
@@ -1071,8 +1071,8 @@ fn realization_reads_nothing_back_between_its_passes() {
     );
     assert!(culls > 40, "only {culls} realizations");
     assert_eq!(between, 0, "a readback between a realization's passes");
-    assert_eq!(reads as f32, readbacks, "readbacks the realizer doesn't count");
-    assert_eq!(culls as f32, realizations, "realizations the realizer doesn't count");
+    assert_eq!(reads as i32, readbacks, "readbacks the realizer doesn't count");
+    assert_eq!(culls as i32, realizations, "realizations the realizer doesn't count");
 }
 
 /// AC2: shared corners agree. In a debug build each live block writes the value of each
@@ -1150,7 +1150,7 @@ fn lod_looks_like_the_finest_and_costs_like_the_coarsest() {
         let levels: Vec<u32> = (1..=40)
             .map(|s| {
                 let v = host.call_export("level", &[Value::I32(s)]).expect("level");
-                let [Value::F32(drawn), Value::F32(target)] = v[..] else { panic!("{v:?}") };
+                let [Value::I32(drawn), Value::I32(target)] = v[..] else { panic!("{v:?}") };
                 assert_eq!(drawn, target, "grazer {s} hasn't its level after {frames} frames");
                 drawn as u32
             })
@@ -1249,8 +1249,8 @@ fn a_ten_minute_tour_leaks_no_mesh_memory() {
         }
         for (s, once) in drawn_once.iter_mut().enumerate() {
             let v = host.call_export("level", &[Value::I32(s as i32 + 1)]).expect("level");
-            let [Value::F32(drawn), _] = v[..] else { panic!("{v:?}") };
-            let has = drawn < 4.0;
+            let [Value::I32(drawn), _] = v[..] else { panic!("{v:?}") };
+            let has = (drawn as u32) < 4;
             if *once && !has {
                 lost += 1;
             }
@@ -1262,13 +1262,13 @@ fn a_ten_minute_tour_leaks_no_mesh_memory() {
         .map(|l| f64::from(wrela_tests::one_f32(&mut host, "slab_mib", &[Value::I32(l)])))
         .sum();
     let r = host.call_export("realized", &[]).expect("realized");
-    let [Value::F32(realizations), _, Value::F32(holes), Value::F32(overflows)] = r[..] else {
+    let [Value::I32(realizations), _, Value::I32(holes), Value::I32(overflows)] = r[..] else {
         panic!("{r:?}")
     };
     eprintln!(
         "tour: {realizations} realizations, {overflows} overflows, {holes} holes, {lost} meshes lost; mesh memory peaked at {first_peak:.1} MiB in the first loop, {peak:.1} in all, {after:.1} after (a slab per level: {slabs:.2} MiB)"
     );
-    assert_eq!(overflows, 0.0, "slabs overflowed");
+    assert_eq!(overflows, 0, "slabs overflowed");
     assert_eq!(lost, 0, "a drawn grazer lost its mesh");
     assert!(drawn_once.iter().all(|&d| d), "a grazer was never drawn");
     assert!(
@@ -1489,8 +1489,8 @@ fn the_herds_skin_weights_are_the_spikes() {
                 ],
             )
             .expect("skin_at");
-        let [Value::F32(b), Value::F32(w)] = r[..] else { panic!("{r:?}") };
-        let (ours_b, ours_w) = (b.to_bits().to_le_bytes(), w.to_bits().to_le_bytes());
+        let [Value::I32(b), Value::I32(w)] = r[..] else { panic!("{r:?}") };
+        let (ours_b, ours_w) = (b.to_le_bytes(), w.to_le_bytes());
         let (theirs_b, theirs_w) = (v[3].to_le_bytes(), v[7].to_le_bytes());
         // The same bones with the same weights, whatever their order, where weights are equal.
         let mut a: Vec<(u8, u8)> =
