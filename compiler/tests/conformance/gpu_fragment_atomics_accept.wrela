@@ -1,0 +1,27 @@
+// accepts: gpu.atomics
+// A fragment shader may take `mut Atomics<T>`: it counts what it shades (a test's tally), and
+// CPU code passes the buffer `mut` in the shader's `.bind(...)`.
+use std::gpu::{
+    Atomics, ClipPosition, FragCoord, GpuBuffer, VertexIndex, begin_screen_pass, buffer, draw,
+    present,
+}
+
+@vertex
+fn cover(v: VertexIndex) -> ClipPosition {
+    let x = f32((v.index << 1) & 2) * 2.0 - 1.0
+    let y = f32(v.index & 2) * 2.0 - 1.0
+    ClipPosition { position: vec4(x, y, 0.5, 1.0) }
+}
+
+@fragment
+fn counted(p: FragCoord, shaded: mut Atomics<u32>) -> vec4 {
+    let _ = shaded.add(u32(p.position.x) % shaded.len(), 1)
+    vec4(1.0)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    var shaded: GpuBuffer<u32> = buffer(64)
+    begin_screen_pass(clear: vec4(0.0))
+    draw(cover, counted.bind(shaded: mut shaded), vertices: 3)
+    present()
+}

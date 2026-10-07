@@ -49,6 +49,8 @@ fn golden_bytes() {
         b"studio/edit\0".to_vec(),
         vec![123, 125, 0, 0],
         words(&[24, 32, 1, 3, 0, 12, 3, 16, 0, 0]), // DrawIndexedIndirect
+        words(&[25, 12, 7]),                        // Label
+        b"terrain\0".to_vec(),
     ]
     .concat();
     expected.extend(words(&[VERSION, body.len() as u32]));

@@ -543,6 +543,16 @@ impl Markers<'_> {
                 self.expr(&d.groups, false, out);
                 d.args.iter().for_each(|(_, a)| self.expr(a, true, out));
             }
+            // A shader's arguments are checked against its parameters where it's bound (E0503,
+            // E0504): a fragment shader's atomics are passed `mut`.
+            ExprKind::Draw(d) => {
+                self.expr(&d.vertices, false, out);
+                self.expr(&d.instances, false, out);
+                for e in d.indirect.iter().chain(&d.indices) {
+                    self.expr(e, false, out);
+                }
+                d.args.iter().for_each(|(_, _, a)| self.expr(a, true, out));
+            }
             ExprKind::Match { scrutinee, arms, .. } => {
                 self.expr(scrutinee, false, out);
                 for arm in arms {

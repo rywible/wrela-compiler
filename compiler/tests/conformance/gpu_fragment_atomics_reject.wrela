@@ -1,0 +1,16 @@
+// rejects: gpu.atomics
+// WebGPU gives a vertex shader no writable buffers, so only a fragment shader (or a kernel)
+// takes `mut Atomics<T>`; a fragment shader's other outputs stay a kernel's.
+use std::gpu::{Atomics, ClipPosition, FragCoord, Slots, VertexIndex}
+
+@vertex
+fn cover(v: VertexIndex, seen: mut Atomics<u32>) -> ClipPosition { //~ E0602
+    ClipPosition { position: vec4(0.0, 0.0, 0.5, 1.0) }
+}
+
+@fragment
+fn slots(p: FragCoord, out: mut Slots<f32>) -> vec4 { //~ E0602
+    vec4(1.0)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

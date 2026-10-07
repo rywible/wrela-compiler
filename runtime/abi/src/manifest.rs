@@ -626,8 +626,8 @@ mod tests {
     fn golden_json() {
         let json = sample().to_json();
         let expected = r#"{
-  "manifest_version": 4,
-  "stream_version": 6,
+  "manifest_version": 5,
+  "stream_version": 7,
   "wasm": "game.wasm",
   "pipelines": [
     {

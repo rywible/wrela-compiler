@@ -282,10 +282,14 @@ fn check_entry(p: &Program, f: FnId, entry: Entry, out: &mut Vec<Diagnostic>) {
             );
             out.push(d);
         }
-        if slots && !matches!(entry, Entry::Compute(_)) {
+        // A fragment shader may count into atomics (a test's tally of what it shaded, say);
+        // WebGPU forbids a vertex shader writable storage.
+        let fragment_atomics = entry == Entry::Fragment && lang == Some(Lang::Atomics);
+        if slots && !matches!(entry, Entry::Compute(_)) && !fragment_atomics {
             let why = match lang {
                 Some(Lang::Slots) => "slots are indexed by a kernel's `GlobalId`",
                 Some(Lang::Shared) => "workgroup memory is a kernel's",
+                Some(Lang::Atomics) => "WebGPU gives a vertex shader no writable buffers",
                 _ => "a draw's shaders don't write buffers yet",
             };
             out.push(Diagnostic::new(

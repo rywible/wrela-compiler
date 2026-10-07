@@ -93,7 +93,12 @@ fn smins_seams_certify() {
         let v = one_f32(&mut host, "value", &args);
         assert!(v.abs() > 2.0 * leaf, "an open box near the surface, at {c:?} (distance {v})");
     }
-    assert!(open.is_empty(), "{} boxes open, at {:?}", open.len(), open.first().map(|b| b.centre()));
+    assert!(
+        open.is_empty(),
+        "{} boxes open, at {:?}",
+        open.len(),
+        open.first().map(|b| b.centre())
+    );
 }
 
 /// A box's flat faces certify: with std's `cuboid` (one branch on inside or outside) and
