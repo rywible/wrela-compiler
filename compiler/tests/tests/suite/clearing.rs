@@ -32,7 +32,6 @@ mod off {
     pub const STONES: i32 = 32;
     pub const SKY: i32 = 64;
     pub const WIND: i32 = 128;
-    pub const HISTORY: i32 = 256;
     pub const CLOUD_SHADOWS: i32 = 512;
 }
 const VIEW_LOOK: i32 = 0;
@@ -1220,7 +1219,7 @@ fn the_probes_match_a_brute_force_reference() {
     c.off(off::WIND);
     c.steps(16 - c.frame % 16);
     // The same frame (16 apart: the same jitter) six ways.
-    let mut scene = |c: &mut Clearing, on: i32, sh: [f32; 4]| {
+    let scene = |c: &mut Clearing, on: i32, sh: [f32; 4]| {
         let args = [
             Value::I32(on),
             Value::F32(sh[0]),
@@ -1928,4 +1927,168 @@ fn trees_change_level_without_popping() {
             "kind {kind}, {what}: a quarter second changed it by {worst}/255 of the whole {whole}/255"
         );
     }
+}
+
+// ---- 60 fps (AC2) -----------------------------------------------------------------------------
+
+/// The systems of #28 §11, their slices (ms), and the timed passes and dispatches that are each.
+const SYSTEMS: [(&str, f64, &[&str]); 7] = [
+    ("terrain", 1.5, &["terrain", "terrain cook"]),
+    ("vegetation", 4.0, &["vegetation prepass", "vegetation", "place", "draw_counts"]),
+    ("creature", 1.5, &["creature", "motion"]),
+    ("light", 3.0, &["shadow moving", "shadows static"]),
+    ("sky", 1.0, &["sky", "clouds cook"]),
+    ("temporal AA", 1.0, &["temporal"]),
+    ("look", 2.0, &["look", "look glow", "look develop"]),
+];
+
+/// The camera's path, from Space at frame 1: the frame it began at (the clearing prints it).
+fn path_start(printed: &[(usize, String)]) -> usize {
+    printed
+        .iter()
+        .find_map(|(_, l)| l.strip_prefix("path begins at frame ").and_then(|n| n.trim().parse().ok()))
+        .expect("the path began")
+}
+
+/// Each system's time (ms) in each of `frames`, from a run's timings: the medians over them.
+fn system_medians(timings: &[(usize, String, f64)], frames: std::ops::Range<usize>) -> Vec<(&'static str, f64, f64)> {
+    SYSTEMS
+        .iter()
+        .map(|(name, slice, labels)| {
+            let mut per_frame: BTreeMap<usize, f64> = frames.clone().map(|f| (f, 0.0)).collect();
+            for (f, l, ns) in timings {
+                if let Some(t) = per_frame.get_mut(f)
+                    && labels.contains(&l.as_str())
+                {
+                    *t += ns / 1e6;
+                }
+            }
+            let v: Vec<f64> = per_frame.into_values().collect();
+            (*name, *slice, wrela_tests::median(&v))
+        })
+        .collect()
+}
+
+/// AC2's per-system times: each system's time, the median over the camera's 60 s path, timed
+/// with each pass run alone (the serial timing mode, §10.3), in the native host and in Chrome;
+/// each within its slice, or over it by less than a quarter (which the slack lends, if the
+/// frame passes).
+#[test]
+#[ignore = "long: alone: the path twice, in serial timing, needs Chrome and a GPU"]
+fn each_system_keeps_its_slice() {
+    let (dir, rel) = built("clearing-systems");
+    let script = r#"[{"frame":1,"type":"key","key":"Space"}]"#;
+    // Native: the path's frames in lockstep, each pass alone.
+    let options = Options { timestamps: true, serial: true, ..Options::default() };
+    let mut c = Clearing::load_with("clearing-systems-native", &options);
+    c.script = parse_script(script).expect("a script");
+    while c.path_time() < 0.0 {
+        assert!(c.frame < 600, "the path never began");
+        c.step();
+    }
+    let from = c.frame as usize;
+    while c.path_time() < 60.0 {
+        c.step();
+    }
+    let to = c.frame as usize;
+    let timings: Vec<(usize, String, f64)> = c
+        .host
+        .take_timings()
+        .expect("timings")
+        .into_iter()
+        .map(|t| (t.frame, t.label, t.nanos))
+        .collect();
+    let native = system_medians(&timings, from..to);
+    drop(c);
+    let _ = dir;
+    // Chrome: the same, paced off (each frame as soon as the last), each pass alone.
+    let run = wrela_tests::ChromeRun {
+        script: Some(script.into()),
+        timestamps: true,
+        serial: true,
+        nohash: true,
+        ..wrela_tests::ChromeRun::new(3600 + 120, W, H, 60.0)
+    };
+    let r = wrela_tests::run_in_chrome_with(&rel, run);
+    let start = path_start(&r.printed);
+    let chrome = system_medians(&r.timings, start..(start + 3600).min(r.spans.len()));
+    let mut over = Vec::new();
+    for ((name, slice, n), (_, _, c)) in native.iter().zip(&chrome) {
+        println!("{name:12} slice {slice:4.1} ms: native {n:6.3} ms, Chrome {c:6.3} ms");
+        if *c > slice * 1.25 || *n > slice * 1.25 {
+            over.push(format!("{name}: native {n:.2}, Chrome {c:.2} ms (slice {slice})"));
+        }
+    }
+    let (n_total, c_total): (f64, f64) = (native.iter().map(|s| s.2).sum(), chrome.iter().map(|s| s.2).sum());
+    println!("the systems together: native {n_total:.2} ms, Chrome {c_total:.2} ms");
+    assert!(over.is_empty(), "over their slices by a quarter or more: {over:?}");
+}
+
+/// AC2: 60 fps. The clearing with the creature walking, paced at 60 Hz in Chrome at 1080p, over
+/// the camera's 60 s path, three runs: no frame's GPU time (its span, §10.3) over 16.7 ms. Each
+/// frame's passes summed are reported beside (the GPU idles between a paced frame's passes as
+/// its clocks fall, which the span counts). Measured, not gated: the time from opening the page
+/// to the first full frame (the clearing's cooking done), the bytes downloaded before it, and
+/// the GPU memory at most.
+#[test]
+#[ignore = "long: alone: three minutes of paced frames in Chrome, needs a GPU"]
+fn sixty_frames_a_second_over_the_path_in_chrome() {
+    let mut missed_runs = Vec::new();
+    for k in 0..3 {
+        let (dir, rel) = built(&format!("clearing-paced-{k}"));
+        let run = wrela_tests::ChromeRun {
+            script: Some(r#"[{"frame":1,"type":"key","key":"Space"}]"#.into()),
+            timestamps: true,
+            paced: true,
+            nohash: true,
+            ..wrela_tests::ChromeRun::new(3600 + 120, W, H, 60.0)
+        };
+        let r = wrela_tests::run_in_chrome_with(&rel, run);
+        let start = path_start(&r.printed);
+        let spans: Vec<f64> =
+            r.spans.iter().filter(|(f, _)| *f >= start && *f < start + 3600).map(|s| s.1).collect();
+        let mut summed: BTreeMap<usize, f64> = BTreeMap::new();
+        for (f, _, ns) in &r.timings {
+            if *f >= start && *f < start + 3600 {
+                *summed.entry(*f).or_insert(0.0) += ns / 1e6;
+            }
+        }
+        let sums: Vec<f64> = summed.into_values().collect();
+        let missed = spans.iter().filter(|&&s| s > 16.7).count();
+        let missed_sum = sums.iter().filter(|&&s| s > 16.7).count();
+        let worst = spans.iter().copied().fold(0.0, f64::max);
+        let results = dir.join("results");
+        let load = wrela_tests::result_json(&results, "load.json");
+        let opened = load["opened_ms"].as_f64().expect("opened_ms");
+        let ready = r
+            .printed
+            .iter()
+            .find_map(|(_, l)| l.strip_prefix("clearing ready at frame ").and_then(|n| n.trim().parse::<usize>().ok()))
+            .expect("the clearing got ready");
+        let at = r.began_ms[ready + 1];
+        let bytes: f64 = load["resources"]
+            .as_array()
+            .expect("resources")
+            .iter()
+            .filter(|res| res["end_ms"].as_f64().expect("end_ms") <= at)
+            .map(|res| res["bytes"].as_f64().expect("bytes"))
+            .sum();
+        let memory = wrela_tests::result_json(&results, "memory.json");
+        let mib = |v: &serde_json::Value| v.as_f64().unwrap_or(f64::NAN) / 1048576.0;
+        println!(
+            "run {k}: {missed} of {} frames over 16.7 ms by span (worst {worst:.2}, median {:.2}, 99th percentile {:.2}); by passes summed {missed_sum} (median {:.2}); the first full frame {:.2} s after the page opened, {:.2} MB downloaded before it; GPU buffers and textures {:.0} MiB at most",
+            spans.len(),
+            wrela_tests::median(&spans),
+            wrela_tests::percentile(&spans, 0.99),
+            wrela_tests::median(&sums),
+            (at - opened) / 1000.0,
+            bytes / 1e6,
+            mib(&memory["gpu"]["peak"]),
+        );
+        assert!(spans.len() >= 3590, "run {k}: only {} frames of the path were timed", spans.len());
+        if missed > 0 {
+            missed_runs.push(format!("run {k}: {missed} frames over 16.7 ms (worst {worst:.2})"));
+        }
+    }
+    assert!(missed_runs.is_empty(), "{missed_runs:?}");
 }
