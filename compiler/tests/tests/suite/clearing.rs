@@ -281,21 +281,26 @@ fn entries(p: &wrela_abi::manifest::Pipeline) -> (String, String, Option<DepthSt
     }
 }
 
-fn pipelines() -> Vec<Pipeline> {
-    let (dir, _) = built("clearing-wgsl");
-    let m = wrela_tests::manifest(&dir);
-    m.pipelines
-        .iter()
-        .map(|p| {
-            let (vertex, fragment, _) = entries(p);
-            Pipeline {
-                name: p.name.clone(),
-                vertex,
-                fragment,
-                wgsl: std::fs::read_to_string(dir.join(&p.shader)).expect("read the WGSL"),
-            }
-        })
-        .collect()
+/// The clearing's pipelines, read once: the tests that check them run at the same time, and each
+/// copy of the build would empty the one another test reads.
+fn pipelines() -> &'static [Pipeline] {
+    static PIPELINES: std::sync::OnceLock<Vec<Pipeline>> = std::sync::OnceLock::new();
+    PIPELINES.get_or_init(|| {
+        let (dir, _) = built("clearing-wgsl");
+        let m = wrela_tests::manifest(&dir);
+        m.pipelines
+            .iter()
+            .map(|p| {
+                let (vertex, fragment, _) = entries(p);
+                Pipeline {
+                    name: p.name.clone(),
+                    vertex,
+                    fragment,
+                    wgsl: std::fs::read_to_string(dir.join(&p.shader)).expect("read the WGSL"),
+                }
+            })
+            .collect()
+    })
 }
 
 /// The text of WGSL function `name` (its signature to its closing brace).
