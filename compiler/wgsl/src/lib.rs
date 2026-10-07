@@ -747,6 +747,7 @@ impl<'a, 'm> Fb<'a, 'm> {
                 ir::Expr::Barrier => {
                     out.push(Statement::ControlBarrier(naga::Barrier::WORK_GROUP), Span::UNDEFINED);
                 }
+                ir::Expr::Discard => out.push(Statement::Kill, Span::UNDEFINED),
                 ir::Expr::Atomic(op, p, args) => {
                     self.atomic(*op, p, args, None, out)?;
                 }
@@ -983,6 +984,7 @@ impl<'a, 'm> Fb<'a, 'm> {
                 self.atomic(*op, p, args, Some(t), out)?.ok_or("internal: an atomic's value")?
             }
             ir::Expr::Barrier => return Err("internal: a barrier's value".into()),
+            ir::Expr::Discard => return Err("internal: a discard's value".into()),
             ir::Expr::Call(g, args) => self
                 .call(*g, args, out)?
                 .ok_or("internal: a call's value from a function that returns nothing")?,

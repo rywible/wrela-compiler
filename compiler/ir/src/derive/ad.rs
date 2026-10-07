@@ -658,7 +658,7 @@ impl Ad<'_> {
                     "can't differentiate through a texture read: its texels are data, not code",
                 ));
             }
-            Expr::Atomic(..) | Expr::Barrier => {
+            Expr::Atomic(..) | Expr::Barrier | Expr::Discard => {
                 return Err(Error::not_derivable(
                     "can't differentiate through an atomic or a barrier: derived code is pure",
                 ));

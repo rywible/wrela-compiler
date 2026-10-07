@@ -147,7 +147,7 @@ impl Verifier<'_> {
                 _ => return Err(bug("a run of something that isn't an array")),
             },
             Expr::Addr(p) => types.lookup(&TypeDef::Ptr(self.place(p)?)),
-            Expr::Barrier => return Ok(None),
+            Expr::Barrier | Expr::Discard => return Ok(None),
             Expr::Atomic(op, p, xs) => {
                 let t = self.place(p)?;
                 let TypeDef::Atomic(s) = *self.def(t) else {

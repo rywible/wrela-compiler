@@ -259,6 +259,12 @@ pub struct DepthBias: Copy {
     pub clamp: f32,
 }
 
+/// Drops the fragment a fragment shader is shading: it writes no colour and no depth (an alpha
+/// test, for leaves and grass cut from cards). Its invocation goes on as a helper, so
+/// derivatives stay defined (WGSL's demotion). In a fragment shader only (E0607).
+@intrinsic
+pub fn discard() {}
+
 /// Starts drawing to the screen, cleared to `clear`.
 @intrinsic
 pub fn begin_screen_pass(clear: vec4) {}

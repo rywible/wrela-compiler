@@ -300,6 +300,7 @@ lang_items! {
     SharedGet = "std::gpu::shared_get",
     SharedSet = "std::gpu::shared_set",
     WorkgroupBarrier = "std::gpu::workgroup_barrier",
+    Discard = "std::gpu::discard",
     AtomicLen = "std::gpu::atomic_len",
     AtomicLoad = "std::gpu::atomic_load",
     AtomicStore = "std::gpu::atomic_store",

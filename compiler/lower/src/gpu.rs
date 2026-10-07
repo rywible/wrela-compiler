@@ -872,6 +872,27 @@ pub(crate) fn intrinsic(
             | Lang::AtomicCompareExchange
             | Lang::AppendPush),
         ) => shared_op(fl, l, c, ty),
+        Some(Lang::Discard) => {
+            // A fragment shader's, or a `@gpu` function's checked on its own (its callers'
+            // pipelines decide).
+            let ok = fl
+                .mb
+                .gpu
+                .as_ref()
+                .is_some_and(|g| g.stage.is_none() || g.stage == Some(Entry::Fragment));
+            if !ok {
+                let what = fl.mb.gpu.as_ref().map_or("CPU code", |g| g.what.as_str()).to_string();
+                let d = Diagnostic::new(
+                    codes::E0607,
+                    user_span(fl, c.span),
+                    format!("`discard` is for fragment shaders, and this is {what}"),
+                );
+                fl.cx.err(with_call_chain(fl, d));
+                return None;
+            }
+            fl.emit(ir::Stmt::Eval(ir::Expr::Discard));
+            None
+        }
         Some(
             l @ (Lang::TextureSample
             | Lang::TextureSampleLevel

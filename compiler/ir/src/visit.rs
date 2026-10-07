@@ -62,7 +62,8 @@ impl Expr {
             | Expr::Zero(_)
             | Expr::EntryInput(_)
             | Expr::Param(_)
-            | Expr::Barrier => {}
+            | Expr::Barrier
+            | Expr::Discard => {}
             Expr::Load(p) | Expr::Run(p) | Expr::Addr(p) | Expr::ArrayLength(p) => {
                 p.for_each_value(f)
             }
@@ -109,7 +110,8 @@ impl Expr {
             | Expr::Zero(_)
             | Expr::EntryInput(_)
             | Expr::Param(_)
-            | Expr::Barrier => {}
+            | Expr::Barrier
+            | Expr::Discard => {}
             Expr::Load(p) | Expr::Run(p) | Expr::Addr(p) | Expr::ArrayLength(p) => {
                 p.for_each_value_mut(f)
             }
@@ -186,6 +188,7 @@ impl Expr {
             | Expr::Mem(..)
             | Expr::Texture(..)
             | Expr::Barrier
+            | Expr::Discard
             | Expr::Select { .. } => {}
         }
     }
@@ -224,6 +227,7 @@ impl Expr {
             | Expr::Mem(..)
             | Expr::Texture(..)
             | Expr::Barrier
+            | Expr::Discard
             | Expr::Select { .. } => {}
         }
     }
@@ -233,7 +237,12 @@ impl Expr {
     pub fn has_effect(&self) -> bool {
         matches!(
             self,
-            Expr::Call(..) | Expr::Host(..) | Expr::Mem(..) | Expr::Atomic(..) | Expr::Barrier
+            Expr::Call(..)
+                | Expr::Host(..)
+                | Expr::Mem(..)
+                | Expr::Atomic(..)
+                | Expr::Barrier
+                | Expr::Discard
         )
     }
 
@@ -267,6 +276,7 @@ impl Expr {
             | Expr::Texture(..)
             | Expr::Atomic(..)
             | Expr::Barrier
+            | Expr::Discard
             | Expr::EntryInput(_)
             | Expr::Param(_) => false,
         }

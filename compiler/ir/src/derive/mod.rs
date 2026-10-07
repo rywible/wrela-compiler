@@ -570,7 +570,7 @@ fn expr_bits(cx: &Walk<'_>, e: &Expr, a: &Activity, ty: TypeId) -> Bits {
     match e {
         Expr::Const(_) | Expr::Zero(_) | Expr::EntryInput(_) => 0,
         Expr::Texture(_, _, _, xs) => any(xs.iter().any(v)),
-        Expr::Atomic(..) | Expr::Barrier => all,
+        Expr::Atomic(..) | Expr::Barrier | Expr::Discard => all,
         Expr::Param(i) => a.params[*i as usize],
         Expr::Load(p) => a.place_bits(types, p, ty),
         Expr::ArrayLength(p) => any(a.place(cx.m, cx.f, p)),

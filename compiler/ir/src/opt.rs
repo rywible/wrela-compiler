@@ -909,6 +909,7 @@ fn outlined_with(
                     }
                     Expr::EntryInput(_)
                     | Expr::Barrier
+                    | Expr::Discard
                     | Expr::Atomic(..)
                     | Expr::Texture(..)
                     | Expr::Host(..)

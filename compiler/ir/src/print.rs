@@ -114,6 +114,7 @@ fn expr(m: &Module, e: &Expr) -> String {
         Expr::ArrayLength(p) => format!("array_length {}", place(p)),
         Expr::Atomic(op, p, xs) => format!("atomic {op:?} {}, {}", place(p), vals(xs)),
         Expr::Barrier => "barrier".to_string(),
+        Expr::Discard => "discard".to_string(),
         Expr::Texture(op, t, s, xs) => match s {
             Some(s) => format!("texture {op:?} r{}, r{}, {}", t.0, s.0, vals(xs)),
             None => format!("texture {op:?} r{}, {}", t.0, vals(xs)),

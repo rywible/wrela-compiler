@@ -1565,7 +1565,7 @@ impl<'m> Fe<'m> {
                 return Err("internal: a storage buffer's length in CPU code".into());
             }
             ir::Expr::Texture(..) => return Err("internal: a texture read in CPU code".into()),
-            ir::Expr::Atomic(..) | ir::Expr::Barrier => {
+            ir::Expr::Atomic(..) | ir::Expr::Barrier | ir::Expr::Discard => {
                 return Err("internal: an atomic or a barrier in CPU code".into());
             }
         }

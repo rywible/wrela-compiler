@@ -465,6 +465,9 @@ pub enum Expr {
     /// `workgroupBarrier()` (GPU only): no invocation of the workgroup goes on until all have
     /// reached it, and their workgroup memory writes are visible. In uniform control flow only.
     Barrier,
+    /// `discard` (a fragment shader only): the fragment writes nothing, and its invocation goes
+    /// on only as a helper, so derivatives stay defined (WGSL's demotion).
+    Discard,
     /// A GPU builtin input of the entry point (`@builtin(...)`), by index into the entry's
     /// inputs, as the std struct that holds it (`GlobalId`, `FragCoord`, ...).
     EntryInput(u32),

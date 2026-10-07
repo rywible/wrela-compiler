@@ -1647,7 +1647,7 @@ impl<'a> Ivx<'a> {
                     "an interval can't go through a texture read: its texels are data, not code",
                 ));
             }
-            Expr::Atomic(..) | Expr::Barrier => {
+            Expr::Atomic(..) | Expr::Barrier | Expr::Discard => {
                 return Err(Error::not_derivable(
                     "an interval can't go through an atomic or a barrier: derived code is pure",
                 ));
