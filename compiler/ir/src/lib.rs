@@ -304,6 +304,12 @@ pub enum HostOp {
     /// `wrela.input(address, cap)`: copies up to `cap` queued input events to the address
     /// (`u32`s); how many, a `u32`.
     Input,
+    /// `wrela.keep(address, length)`: the host keeps those bytes for the build that replaces
+    /// this one (hot reload).
+    Keep,
+    /// `wrela.kept(address, cap)`: copies up to `cap` of the bytes the replaced build kept to
+    /// the address; how many it kept, a `u32`.
+    Kept,
     /// Args: vertices, instances (or, `indirect`, the handle and byte offset of a buffer
     /// holding the counts, after the index buffer's handle, byte offset and size when
     /// `indexed`), each binding's handle, offset and size, then the uniform block value.
@@ -747,6 +753,9 @@ pub struct Module {
     /// CPU only: whether the program reads input (`std::input`), so the module imports
     /// `wrela.input`.
     pub input: bool,
+    /// CPU only: whether the program keeps bytes across a hot reload (`std::reload`), so the
+    /// module imports `wrela.keep` and `wrela.kept`.
+    pub reload: bool,
 }
 
 impl Module {

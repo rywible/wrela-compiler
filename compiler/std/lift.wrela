@@ -100,10 +100,57 @@ pub fn file_hash(i: u32) -> Text {
 @intrinsic
 pub fn gradient<const N: u32>(f: fn() -> f32, which: [Literal; N]) -> (f32, [f32; N]) {}
 
-/// The literals `f`'s code can read, through everything it calls, in index order: those
-/// that can change what it gives.
+/// The literals `f`'s code can read, through everything it calls on the CPU, in index order:
+/// those that can change what it gives. (GPU work it records reads its own literals when it
+/// runs.)
 @intrinsic
-pub fn reads(f: fn() -> f32) -> [Literal] {}
+pub fn reads<T>(f: fn() -> T) -> [Literal] {}
+
+/// How many changes the table has had since the program started (`set`, or a host's edit): a
+/// program that cooks something from literals compares it with the count it cooked at, to
+/// cook again when it changes (`Watch`). 0 in a build that isn't lifted.
+pub fn generation() -> u32 {
+    literal_generation()
+}
+
+/// Literals some work reads, and their values when it last ran: whether any has changed since
+/// (`changed`). Made from `reads(f)` of the work.
+pub struct Watch {
+    literals: Vec<Literal>,
+    values: Vec<f32>,
+    generation: u32,
+}
+
+impl Watch {
+    /// Watches `literals`, at their values now.
+    pub fn new(literals: [Literal]) -> Watch {
+        var w = Watch { literals: Vec::new(), values: Vec::new(), generation: generation() }
+        for l in literals {
+            w.literals.push(l)
+            w.values.push(l.value())
+        }
+        w
+    }
+
+    /// Whether a literal it watches has a new value since it was made or last changed: then it
+    /// takes the values now, so it says so once for each change.
+    pub fn changed(mut self) -> bool {
+        let g = generation()
+        if g == self.generation {
+            return false
+        }
+        self.generation = g
+        var any = false
+        for i in 0..self.literals.len() {
+            let v = self.literals[i].value()
+            if bitcast_u32(v) != bitcast_u32(self.values[i]) {
+                self.values[i] = v
+                any = true
+            }
+        }
+        any
+    }
+}
 
 // ---- specs (§22) ---------------------------------------------------------------------------
 //
@@ -208,6 +255,9 @@ fn literal_built_value(i: u32) -> f32 {}
 
 @intrinsic
 fn set_literal(i: u32, value: f32) {}
+
+@intrinsic
+fn literal_generation() -> u32 {}
 
 @intrinsic
 fn literal_source(i: u32) -> Source {}

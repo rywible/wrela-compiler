@@ -1,0 +1,35 @@
+// Hot reload (language.md §22): a tool replaces a running program's build with a new one, in
+// the same page or process, and the new build starts with `init`, as any program does. What
+// the old build kept with `keep` is what the new one's `kept` gives, so a program carries
+// across what it wants to: where the camera is, what the player chose. Bytes, so a program
+// says how (`std::serialize`'s `save` and `load`, which fail cleanly when the type has
+// changed). A program started anew kept nothing.
+//
+// ```wrela
+// use std::reload::{keep, kept}
+// use std::serialize::{load, save}
+//
+// pub fn init() -> Game {
+//     var g = Game::new()
+//     if let Ok(view) = load::<View>(kept()) {
+//         g.view = view
+//     }
+//     g
+// }
+//
+// pub fn frame(g: mut Game, time: f32, width: u32, height: u32) {
+//     keep(save(g.view).as_slice())
+// }
+// ```
+
+/// Keeps `bytes` for the build that replaces this one: the host holds them, in place of what
+/// this build kept before. Cheap enough for each frame (a copy of the bytes).
+pub fn keep(bytes: [u8]) {
+    Vec::keep(bytes)
+}
+
+/// What the build this one replaced last kept: no bytes if it kept none, or this build
+/// replaced none.
+pub fn kept() -> Vec<u8> {
+    Vec::from_kept()
+}

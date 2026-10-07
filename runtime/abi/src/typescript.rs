@@ -78,6 +78,10 @@ export const IMPORT_AUDIO = {import_audio:?};
 export const IMPORT_INPUT = {import_input:?};
 export const IMPORT_TICK = {import_tick:?};
 export const EXPORT_TICK = {export_tick:?};
+/** Hot reload: what a host calls to change a lifted literal, and keeps for the next build. */
+export const EXPORT_LIFT_SET = {export_lift_set:?};
+export const IMPORT_KEEP = {import_keep:?};
+export const IMPORT_KEPT = {import_kept:?};
 /** Input (runtime/abi `input`): an event is EVENT_SIZE bytes, six words: its kind, its
  * modifiers, then four words that depend on the kind. */
 export const EVENT_SIZE = {event_size};
@@ -177,6 +181,9 @@ export const PANIC_CAP = {panic_cap};
         import_input = input::IMPORT_INPUT,
         import_tick = crate::IMPORT_TICK,
         export_tick = crate::EXPORT_TICK,
+        export_lift_set = crate::EXPORT_LIFT_SET,
+        import_keep = crate::IMPORT_KEEP,
+        import_kept = crate::IMPORT_KEPT,
         event_size = input::EVENT_SIZE,
         shift = input::SHIFT,
         control = input::CONTROL,

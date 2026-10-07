@@ -650,6 +650,7 @@ pub(crate) fn intrinsic(
             | Lang::LiftValue
             | Lang::LiftBuiltValue
             | Lang::LiftSet
+            | Lang::LiftGeneration
             | Lang::LiftSource
             | Lang::LiftFiles
             | Lang::LiftFile),
@@ -763,7 +764,9 @@ pub(crate) fn intrinsic(
             | Lang::RequestStatus
             | Lang::RequestTake
             | Lang::Limit
-            | Lang::InputTake),
+            | Lang::InputTake
+            | Lang::Keep
+            | Lang::Kept),
         ) if fl.is_gpu() => {
             let name = fl.cx.checked.program.func(func).name.clone();
             fl.cx.err(Diagnostic::new(
@@ -786,6 +789,22 @@ pub(crate) fn intrinsic(
             let r = fl.arg_value(&c.args[0])?;
             let i = fl.mb.m.types.scalar(ir::Scalar::I32);
             Some(fl.value(i, ir::Expr::Host(ir::HostOp::RequestStatus, vec![r])))
+        }
+        Some(Lang::Keep) => {
+            let run = fl.arg_value(&c.args[0])?;
+            let u = fl.mb.m.types.u32();
+            let at = fl.value(u, ir::Expr::Extract(run, 0));
+            let len = fl.value(u, ir::Expr::Extract(run, 1));
+            fl.mb.m.reload = true;
+            fl.emit(ir::Stmt::Eval(ir::Expr::Host(ir::HostOp::Keep, vec![at, len])));
+            None
+        }
+        Some(Lang::Kept) => {
+            let at = fl.arg_value(&c.args[0])?;
+            let cap = fl.arg_value(&c.args[1])?;
+            fl.mb.m.reload = true;
+            let u = fl.mb.m.types.u32();
+            Some(fl.value(u, ir::Expr::Host(ir::HostOp::Kept, vec![at, cap])))
         }
         Some(Lang::InputTake) => {
             let at = fl.arg_value(&c.args[0])?;

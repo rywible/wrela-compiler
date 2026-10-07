@@ -113,6 +113,16 @@ pub fn take_answer(request: u32, addr: u32) {}
 @intrinsic
 pub fn take_input(addr: u32, cap: u32) -> u32 {}
 
+/// Gives the host `bytes` to keep for the build that replaces this one (`wrela.keep`,
+/// `std::reload`): they replace what it kept before.
+@intrinsic
+pub fn keep_bytes(bytes: [u8]) {}
+
+/// Copies up to `cap` of the bytes the build this one replaced kept to `addr`
+/// (`wrela.kept`): how many it kept, all of them, which may be more than `cap`.
+@intrinsic
+pub fn kept_bytes(addr: u32, cap: u32) -> u32 {}
+
 /// Adds `value` to the `u32` at `addr`, atomically: the old value. Workers share the memory.
 @intrinsic
 pub fn atomic_add(addr: u32, value: u32) -> u32 {}

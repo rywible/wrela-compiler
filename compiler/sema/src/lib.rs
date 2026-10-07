@@ -47,6 +47,7 @@ pub const STD_SOURCES: &[(&str, &str)] = &[
     ("std::io", include_str!("../../std/io.wrela")),
     ("std::input", include_str!("../../std/input.wrela")),
     ("std::lift", include_str!("../../std/lift.wrela")),
+    ("std::reload", include_str!("../../std/reload.wrela")),
     ("std::gpu", include_str!("../../std/gpu.wrela")),
     ("std::derive", include_str!("../../std/derive.wrela")),
     ("std::field", include_str!("../../std/field.wrela")),

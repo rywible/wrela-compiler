@@ -254,6 +254,9 @@ pub(crate) struct Gpu {
     limits: wgpu::Limits,
     align: u64,
     pipelines: Vec<Pipeline>,
+    /// Each pipeline's manifest entry and WGSL, as text: a hot reload keeps a pipeline whose
+    /// both are the same.
+    pipeline_keys: Vec<String>,
     resources: HashMap<u32, Resource>,
     /// Each pipeline's cached bind groups, by the bindings they hold.
     bind_groups: Vec<HashMap<Box<[Binding]>, wgpu::BindGroup>>,
@@ -371,6 +374,7 @@ impl Gpu {
             limits,
             align,
             pipelines: Vec::new(),
+            pipeline_keys: Vec::new(),
             resources: HashMap::new(),
             bind_groups: vec![HashMap::new(); manifest.pipelines.len()],
             bound_in: HashMap::new(),
@@ -385,23 +389,51 @@ impl Gpu {
             frame: 0,
             debug_flag: None,
         };
-        if manifest.pipelines.iter().any(|p| p.debug_flag.is_some()) {
-            gpu.debug_flag = Some(DebugFlag {
-                buffer: gpu.device.create_buffer(&wgpu::BufferDescriptor {
+        gpu.take_pipelines(manifest, shaders)?;
+        Ok(gpu)
+    }
+
+    /// Builds the manifest's pipelines, keeping each of the ones it has whose manifest entry
+    /// and WGSL are the same.
+    fn take_pipelines(&mut self, manifest: &Manifest, shaders: &[String]) -> Result<()> {
+        if self.debug_flag.is_none() && manifest.pipelines.iter().any(|p| p.debug_flag.is_some()) {
+            self.debug_flag = Some(DebugFlag {
+                buffer: self.device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("debug flag"),
                     size: 4,
                     usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
                     mapped_at_creation: false,
                 }),
-                readback: gpu.readback_buffer(4),
+                readback: self.readback_buffer(4),
             });
         }
+        let old_keys = std::mem::take(&mut self.pipeline_keys);
+        let mut old: HashMap<String, Pipeline> =
+            old_keys.into_iter().zip(std::mem::take(&mut self.pipelines)).collect();
         for (p, source) in manifest.pipelines.iter().zip(shaders) {
-            let pipeline = gpu.build_pipeline(p, source)?;
-            gpu.pipelines.push(pipeline);
+            let key = format!("{p:?}\n{source}");
+            let pipeline = match old.remove(&key) {
+                Some(kept) => kept,
+                None => self.build_pipeline(p, source)?,
+            };
+            self.pipelines.push(pipeline);
+            self.pipeline_keys.push(key);
         }
-        gpu.check_errors()?;
-        Ok(gpu)
+        self.bind_groups = vec![HashMap::new(); manifest.pipelines.len()];
+        self.check_errors()
+    }
+
+    /// Hot reload: finishes the old build's work, forgets its resources, and takes the new
+    /// build's pipelines. The device, the screen and the rings stay.
+    fn reload_build(&mut self, manifest: &Manifest, shaders: &[String]) -> Result<()> {
+        self.pass = None;
+        self.label = None;
+        self.flush()?;
+        self.collect()?;
+        self.device.poll(wgpu::PollType::wait_indefinitely()).map_err(gpu_err)?;
+        self.resources.clear();
+        self.bound_in.clear();
+        self.take_pipelines(manifest, shaders)
     }
 
     fn build_pipeline(&self, p: &wrela_abi::manifest::Pipeline, source: &str) -> Result<Pipeline> {
@@ -1310,6 +1342,10 @@ impl Executor for Gpu {
 
     fn limits(&self) -> wrela_abi::Limits {
         limits_of(&self.limits)
+    }
+
+    fn reload(&mut self, manifest: &Manifest, shaders: &[String]) -> Result<()> {
+        self.reload_build(manifest, shaders)
     }
 }
 

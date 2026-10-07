@@ -46,7 +46,7 @@ pub use wrela_abi::ticks::{TickLog, frame_time, lockstep_ticks};
 #[cfg(feature = "gpu")]
 use gpu::Gpu;
 use program::Program;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use wrela_abi::Manifest;
 
 /// How to run a program.
@@ -219,14 +219,61 @@ fn read_file<T>(
 /// A loaded program, ready to run.
 #[cfg(feature = "gpu")]
 pub struct Host {
-    program: Program<Gpu>,
+    /// Always a program, but while a hot reload swaps it ([`Host::reload`]).
+    program: Option<Program<Gpu>>,
     wasm_hash: u64,
+    /// The build's directory and how it was loaded: what a hot reload loads the next build
+    /// with.
+    dir: PathBuf,
+    options: Options,
     // Declared last: dropped after the GPU.
     _lock: lock::GpuLock,
 }
 
 #[cfg(feature = "gpu")]
 impl Host {
+    fn p(&mut self) -> &mut Program<Gpu> {
+        self.program.as_mut().expect("the host has a program")
+    }
+
+    /// Hot reload: replaces the running program with the build in `dir` (by default the one
+    /// it was loaded from, rebuilt), in this process, on the same device. The new build starts
+    /// with `init`; what the old one kept (`std::reload::keep`) is what its `kept()` gives;
+    /// its ticker, if it starts one, runs the old one's ticks again first, each with the
+    /// records it had, so the sim is where the old one was (as the new code runs it); input
+    /// the old one hadn't read is the new one's. A pipeline whose WGSL and manifest entry
+    /// are unchanged is kept.
+    pub fn reload(&mut self, dir: Option<&Path>) -> Result<()> {
+        let dir = dir.map_or_else(|| self.dir.clone(), Path::to_path_buf);
+        let (manifest, wasm, shaders) = read_build(&dir)?;
+        let wasm_hash = wrela_abi::ticks::wasm_hash(&wasm);
+        let compiled = program::compile_cached(&wasm, wasm_hash, Some(&dir), None)?;
+        let old = self.program.take().expect("the host has a program");
+        let mut carried = old.retire();
+        program::Executor::reload(&mut carried.executor, &manifest, &shaders)?;
+        let options = &self.options;
+        let io = io(&dir, options.storage.as_deref(), options.post.clone(), options.quiet);
+        let program = Program::instantiate_carrying(
+            &compiled,
+            &manifest,
+            carried,
+            io,
+            workers(options.workers),
+            true,
+        )?;
+        self.program = Some(program);
+        self.wasm_hash = wasm_hash;
+        self.dir = dir;
+        Ok(())
+    }
+
+    /// Hot reload of a literal: in a lifted build (`wrela build --lift`), literal `i` takes
+    /// `value`, as `std::lift::set` gives it, from the program's next call on (CPU and GPU).
+    pub fn set_literal(&mut self, i: u32, value: f32) -> Result<()> {
+        let args = [Value::I32(i as i32), Value::F32(value)];
+        self.p().call(wrela_abi::EXPORT_LIFT_SET, &args).map(|_| ())
+    }
+
     /// Loads the build in `dir` (manifest.json, the WASM, the WGSL), opens the GPU and builds
     /// every pipeline.
     pub fn load(dir: impl AsRef<Path>) -> Result<Host> {
@@ -257,7 +304,13 @@ impl Host {
             n,
             !options.defer_init,
         )?;
-        Ok(Host { program, wasm_hash, _lock: lock })
+        Ok(Host {
+            program: Some(program),
+            wasm_hash,
+            dir: dir.to_path_buf(),
+            options: options.clone(),
+            _lock: lock,
+        })
     }
 
     /// Calls `frame(times[i], width, height)` for each time in order, then reads the screen
@@ -281,16 +334,17 @@ impl Host {
         script: &[Scripted],
         log: bool,
     ) -> Result<(RunResult, Option<TickLog>)> {
-        self.program.executor().set_screen(width, height)?;
+        self.p().executor().set_screen(width, height)?;
         let mut log = if log {
-            self.program.want_hashes(true);
-            Some(self.program.tick_log(self.wasm_hash)?)
+            self.p().want_hashes(true);
+            let hash = self.wasm_hash;
+            Some(self.p().tick_log(hash)?)
         } else {
             None
         };
         for i in 0..frames {
-            self.program.executor().set_frame(i as usize);
-            self.program.lockstep_frame(i, fps, width, height, script, log.as_mut())?;
+            self.p().executor().set_frame(i as usize);
+            self.p().lockstep_frame(i, fps, width, height, script, log.as_mut())?;
         }
         Ok((self.result(width, height)?, log))
     }
@@ -305,9 +359,9 @@ impl Host {
         height: u32,
         script: &[Scripted],
     ) -> Result<()> {
-        self.program.executor().set_screen(width, height)?;
-        self.program.executor().set_frame(i as usize);
-        self.program.lockstep_frame(i, fps, width, height, script, None)
+        self.p().executor().set_screen(width, height)?;
+        self.p().executor().set_frame(i as usize);
+        self.p().lockstep_frame(i, fps, width, height, script, None)
     }
 
     /// [`CpuHost::ticks_beside_frames`], with the GPU: the frames draw.
@@ -319,18 +373,18 @@ impl Host {
         width: u32,
         height: u32,
     ) -> Result<Vec<(Ticked, f64)>> {
-        self.program.executor().set_screen(width, height)?;
-        self.program.ticks_beside_frames(ticks, frames, fps, width, height)
+        self.p().executor().set_screen(width, height)?;
+        self.p().ticks_beside_frames(ticks, frames, fps, width, height)
     }
 
     /// Runs the program's `init`, for a host loaded with [`Options::defer_init`].
     pub fn init(&mut self) -> Result<()> {
-        self.program.run_init()
+        self.p().run_init()
     }
 
     /// Whether the ticker reports its state's hash ([`CpuHost::want_hashes`]).
     pub fn want_hashes(&mut self, on: bool) {
-        self.program.want_hashes(on);
+        self.p().want_hashes(on);
     }
 
     /// [`Host::run_frames`], with `script`'s events queued before the frames they're for
@@ -342,79 +396,80 @@ impl Host {
         height: u32,
         script: &[Scripted],
     ) -> Result<RunResult> {
-        self.program.executor().set_screen(width, height)?;
+        self.p().executor().set_screen(width, height)?;
         for (i, &time) in times.iter().enumerate() {
             for e in wrela_abi::input::events_at(script, i as u32) {
-                self.program.push_input(e);
+                self.p().push_input(e);
             }
-            self.program.executor().set_frame(i);
-            self.program.frame(time, width, height)?;
+            self.p().executor().set_frame(i);
+            self.p().frame(time, width, height)?;
         }
         self.result(width, height)
     }
 
     /// The outcome of a run: the screen, read back, and the GPU durations recorded.
     fn result(&mut self, width: u32, height: u32) -> Result<RunResult> {
-        let gpu = self.program.executor();
+        let gpu = self.p().executor();
         let frame = gpu.read_screen()?;
         let timings = gpu.take_timings();
-        Ok(RunResult { hash: self.program.hash().value(), width, height, frame, timings })
+        let hash = self.p().hash().value();
+        Ok(RunResult { hash, width, height, frame, timings })
     }
 
     /// Calls one of the program's other exports with numeric arguments: CPU evaluation for
     /// tests. Anything it submits runs (and counts toward the hash).
     pub fn call_export(&mut self, name: &str, args: &[Value]) -> Result<Vec<Value>> {
-        self.program.call(name, args)
+        self.p().call(name, args)
     }
 
     /// Renders `quanta` quanta of the program's voice offline (as [`CpuHost::render_audio`]).
     pub fn render_audio(&mut self, quanta: u32) -> Result<Vec<f32>> {
-        self.program.render_audio(quanta)
+        self.p().render_audio(quanta)
     }
 
     /// Queues an input event, which the program reads from its next call on.
     pub fn push_input(&mut self, e: Event) {
-        self.program.push_input(e);
+        self.p().push_input(e);
     }
 
     /// Calls `frame(time, width, height)` once, and ends the frame: for a caller that drives
     /// the program a frame at a time (a studio session), and reads the screen when it wants.
     pub fn frame(&mut self, time: f32, width: u32, height: u32) -> Result<()> {
-        self.program.executor().set_screen(width, height)?;
-        self.program.frame(time, width, height)
+        self.p().executor().set_screen(width, height)?;
+        self.p().frame(time, width, height)
     }
 
     /// The screen after the last frame: RGBA8, rows top to bottom.
     pub fn read_screen(&mut self) -> Result<Vec<u8>> {
-        self.program.executor().read_screen()
+        self.p().executor().read_screen()
     }
 
     /// The lines the program printed (`std::io::print`) since the last call.
     pub fn take_logs(&mut self) -> Vec<String> {
-        self.program.take_logs()
+        self.p().take_logs()
     }
 
     /// The handles of the GPU buffers the program holds, oldest first: for tests, to find a
     /// buffer to read back. A buffer the program dropped is gone.
     pub fn buffers(&mut self) -> Vec<u32> {
-        self.program.executor().buffers()
+        self.p().executor().buffers()
     }
 
     /// Reads a GPU buffer back after a run. For tests: it waits for the GPU.
     pub fn read_buffer(&mut self, handle: u32) -> Result<Vec<u8>> {
-        self.program.executor().read_buffer(handle)
+        self.p().executor().read_buffer(handle)
     }
 
     /// The batches submitted since the last call (or load), with [`Options::record`]; decode
     /// them with [`wrela_abi::stream::decode`].
     pub fn take_batches(&mut self) -> Vec<Vec<u8>> {
-        self.program.take_batches()
+        self.p().take_batches()
     }
 
     /// The GPU durations recorded since the last call (or load), with [`Options::timestamps`]:
     /// for timing work an export submits. It waits for the GPU.
     pub fn take_timings(&mut self) -> Result<Vec<GpuTiming>> {
-        let gpu = self.program.executor();
+        let gpu = self.p().executor();
         gpu.flush()?;
         Ok(gpu.take_timings())
     }

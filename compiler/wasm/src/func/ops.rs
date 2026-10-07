@@ -1388,10 +1388,15 @@ pub(super) fn host(
                 None => fe.ins.push(I::Drop),
             }
         }
-        ir::HostOp::Input => {
+        ir::HostOp::Keep => {
             let h = fe.at.helpers;
             fe.ins.extend([I::LocalGet(fe.v(args[0])), I::LocalGet(fe.v(args[1]))]);
-            fe.ins.push(I::Call(h.input));
+            fe.ins.push(I::Call(h.keep));
+        }
+        ir::HostOp::Input | ir::HostOp::Kept => {
+            let h = fe.at.helpers;
+            fe.ins.extend([I::LocalGet(fe.v(args[0])), I::LocalGet(fe.v(args[1]))]);
+            fe.ins.push(I::Call(if matches!(op, ir::HostOp::Input) { h.input } else { h.kept }));
             match result {
                 Some(r) => fe.ins.push(I::LocalSet(fe.v(r))),
                 None => fe.ins.push(I::Drop),

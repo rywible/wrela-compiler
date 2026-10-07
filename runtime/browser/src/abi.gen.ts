@@ -65,6 +65,10 @@ export const IMPORT_AUDIO = "audio";
 export const IMPORT_INPUT = "input";
 export const IMPORT_TICK = "tick";
 export const EXPORT_TICK = "__tick";
+/** Hot reload: what a host calls to change a lifted literal, and keeps for the next build. */
+export const EXPORT_LIFT_SET = "__lift_set";
+export const IMPORT_KEEP = "keep";
+export const IMPORT_KEPT = "kept";
 /** Input (runtime/abi `input`): an event is EVENT_SIZE bytes, six words: its kind, its
  * modifiers, then four words that depend on the kind. */
 export const EVENT_SIZE = 24;
@@ -95,6 +99,8 @@ export const HOST_FUNCTIONS = [
   ["audio", "(i32, i32) -> ()"],
   ["input", "(i32, i32) -> (i32)"],
   ["tick", "(i32, i32, i32) -> ()"],
+  ["keep", "(i32, i32) -> ()"],
+  ["kept", "(i32, i32) -> (i32)"],
 ] as const;
 export const EXPORT_AUDIO = "__audio";
 /** The audio thread's rate and render quantum, and where `__audio` leaves a quantum's samples. */

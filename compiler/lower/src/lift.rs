@@ -218,6 +218,8 @@ impl Cx<'_> {
         });
         mb.m.writable.extend([table, state]);
         let buffer_fn = buffer_helper(mb, table, state, n);
+        let set = set_export(mb, table, state, n);
+        mb.m.exports.push((wrela_abi::EXPORT_LIFT_SET.into(), set));
         mb.lift = Some(CpuTable { table, built, state, buffer_fn, sources: None, files: None });
     }
 }
@@ -269,6 +271,38 @@ fn buffer_helper(
     mb.m.add_function(f)
 }
 
+/// `__lift_set(i, value)`, exported: what a host calls to change literal `i` (a tool's edit,
+/// hot reload), as `std::lift::set` does. An index past the last changes nothing.
+fn set_export(mb: &mut ModuleBuilder, table: ir::DataId, state: ir::DataId, n: u32) -> ir::FuncId {
+    let u = mb.m.types.u32();
+    let b = mb.m.types.bool();
+    let f32_t = mb.m.types.f32();
+    let params = vec![
+        ir::Param { name: "i".into(), ty: u, by_ref: false, mutable: false },
+        ir::Param { name: "value".into(), ty: f32_t, by_ref: false, mutable: false },
+    ];
+    let mut f = ir::Function::new("lift_set", params, None);
+    let mut body = Vec::new();
+    let i = f.let_(&mut body, u, ir::Expr::Param(0));
+    let v = f.let_(&mut body, f32_t, ir::Expr::Param(1));
+    let count = f.let_(&mut body, u, ir::Expr::Const(ir::Const::U32(n)));
+    let inside = f.let_(&mut body, b, ir::Expr::Binary(ir::BinOp::Lt, i, count));
+    let mut set = Vec::new();
+    set.push(ir::Stmt::Store(
+        ir::Place { root: ir::PlaceRoot::Data(table), path: vec![ir::Proj::Index(i)] },
+        v,
+    ));
+    let counter = ir::Place { root: ir::PlaceRoot::Data(state), path: vec![ir::Proj::Field(1)] };
+    let g = f.let_(&mut set, u, ir::Expr::Load(counter.clone()));
+    let one = f.let_(&mut set, u, ir::Expr::Const(ir::Const::U32(1)));
+    let next = f.let_(&mut set, u, ir::Expr::Binary(ir::BinOp::WrappingAdd, g, one));
+    set.push(ir::Stmt::Store(counter, next));
+    body.push(ir::Stmt::If { cond: inside, then: set, else_: Vec::new() });
+    body.push(ir::Stmt::Return(None));
+    f.body = body;
+    mb.m.add_function(f)
+}
+
 /// `std::lift`'s table intrinsics (§22), on the CPU.
 pub(crate) fn intrinsic(
     fl: &mut Fl,
@@ -316,6 +350,17 @@ pub(crate) fn intrinsic(
             }
             None
         }
+        Lang::LiftGeneration => match table {
+            // The state's counter starts at 1, so the first upload happens.
+            Some(t) => {
+                let counter =
+                    ir::Place { root: ir::PlaceRoot::Data(t.state), path: vec![ir::Proj::Field(1)] };
+                let g = fl.value(u, ir::Expr::Load(counter));
+                let one = fl.u32c(1);
+                Some(fl.value(u, ir::Expr::Binary(ir::BinOp::WrappingSub, g, one)))
+            }
+            None => Some(fl.u32c(0)),
+        },
         Lang::LiftSource => {
             let i = fl.arg_value(&c.args[0])?;
             let st = fl.ty(ty?, span)?;

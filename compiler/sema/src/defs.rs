@@ -192,6 +192,8 @@ macro_rules! lang_items {
                         | Lang::FetchCommand
                         | Lang::PrintCommand
                         | Lang::PostCommand
+                        | Lang::Keep
+                        | Lang::Kept
                 )
             }
 
@@ -205,6 +207,7 @@ macro_rules! lang_items {
                         | Lang::ReadBufferCommand
                         | Lang::Limit
                         | Lang::InputTake
+                        | Lang::Kept
                 )
             }
 
@@ -287,6 +290,8 @@ lang_items! {
     RequestStatus = "std::io::request_status",
     RequestTake = "std::mem::take_answer",
     InputTake = "std::mem::take_input",
+    Keep = "std::mem::keep_bytes",
+    Kept = "std::mem::kept_bytes",
     StorageReadCommand = "std::io::storage_read_command",
     StorageWriteCommand = "std::io::storage_write_command",
     FetchCommand = "std::io::fetch_command",
@@ -330,6 +335,7 @@ lang_items! {
     LiftValue = "std::lift::literal_value",
     LiftBuiltValue = "std::lift::literal_built_value",
     LiftSet = "std::lift::set_literal",
+    LiftGeneration = "std::lift::literal_generation",
     LiftSource = "std::lift::literal_source",
     LiftFiles = "std::lift::lifted_files",
     LiftFile = "std::lift::lifted_file",

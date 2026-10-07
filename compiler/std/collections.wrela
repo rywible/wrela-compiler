@@ -5,8 +5,8 @@
 use std::alloc::{free, place, realloc}
 use std::par::{chunks_for, par_each}
 use std::mem::{
-    Drop, align_of, at, at_mut, at_mut_pair, copy, drop_at, read, size_of, take_answer, take_input,
-    write, zeroed,
+    Drop, align_of, at, at_mut, at_mut_pair, copy, drop_at, keep_bytes, kept_bytes, read, size_of,
+    take_answer, take_input, write, zeroed,
 }
 pub use std::mem::Pair
 
@@ -53,6 +53,28 @@ impl<T: Plain> Vec<T> {
         }
         v.len = n
         v
+    }
+}
+
+impl Vec<u8> {
+    /// For `std::reload`: the bytes the build this one replaced kept.
+    pub(package) fn from_kept() -> Vec<u8> {
+        let n = unsafe { kept_bytes(addr: 0, cap: 0) }
+        var v: Vec<u8> = Vec::with_capacity(max(n, 1))
+        if n > 0 {
+            unsafe {
+                kept_bytes(addr: v.data, cap: n)
+            }
+        }
+        v.len = n
+        v
+    }
+
+    /// For `std::reload`: gives the host `bytes` to keep.
+    pub(package) fn keep(bytes: [u8]) {
+        unsafe {
+            keep_bytes(bytes)
+        }
     }
 }
 

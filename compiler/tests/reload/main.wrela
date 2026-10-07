@@ -1,0 +1,138 @@
+// Hot reload (language.md §22), run by compiler/tests/tests/suite/reload.rs: a literal the CPU
+// and the GPU read each frame (the screen's colour); a value cooked from literals at load and
+// cooked again when one it reads changes (`std::lift::Watch`); what the program carries across a
+// reload (`std::reload`); and a ticker, whose ticks a new build runs again with their records.
+
+use std::gpu::{ClipPosition, VertexIndex, begin_screen_pass, draw, present}
+use std::handoff::{Latest, Publisher, handoff}
+use std::hash::{StateHash, state_hash}
+use std::input::{Event, Key}
+use std::lift::{Watch, generation, reads}
+use std::reload::{keep, kept}
+use std::serialize::{LoadError, Serialize, load, save}
+use std::tick::{Ticked, start}
+
+/// What the ticker owns.
+struct Sim {
+    world: World,
+    out: Publisher<Snap>,
+}
+
+struct World: Clone + StateHash {
+    ticks: u32,
+    spaces: u32,
+    sum: u32,
+}
+
+struct Snap: Copy + Plain {
+    ticks: u32,
+    spaces: u32,
+    sum: u32,
+}
+
+/// How much a Space press weighs in the sum.
+const WEIGHT: u32 = 7
+
+@deterministic
+fn step(sim: mut Sim, t: Ticked) {
+    for e in t.records {
+        if let Event::KeyDown { key, .. } = e {
+            if key == Key::Space {
+                sim.world.spaces += 1
+            }
+        }
+    }
+    sim.world.ticks += 1
+    sim.world.sum = sim.world.sum.wrapping_mul(31).wrapping_add(t.tick + WEIGHT * sim.world.spaces)
+    sim.out.publish(Snap { ticks: sim.world.ticks, spaces: sim.world.spaces, sum: sim.world.sum })
+}
+
+@deterministic
+fn hash(sim: Sim) -> u64 {
+    state_hash(sim.world)
+}
+
+/// What the program carries across a reload.
+struct Carried: Clone + Serialize {
+    frames: u32,
+    mark: f32,
+}
+
+pub struct Game {
+    latest: Latest<Snap>,
+    carried: Carried,
+    /// Whether `init` found what a replaced build kept.
+    restored: bool,
+    /// Cooked from literals at load, and again when one it reads changes.
+    cooked: f32,
+    cooks: u32,
+    watch: Watch,
+}
+
+/// The screen's colour: the CPU clears to it, and the GPU draws its left half with it.
+fn tint() -> vec3 {
+    vec3(0.25, 0.5, 0.75)
+}
+
+/// What's cooked: read only when it's cooked.
+fn cook() -> f32 {
+    1.5 * 2.0
+}
+
+pub fn init() -> Game {
+    let (out, latest) = handoff(Snap { ticks: 0, spaces: 0, sum: 0 })
+    let world = World { ticks: 0, spaces: 0, sum: 0 }
+    start(Sim { world: take world, out: take out }, hz: 60, step: step, hash: hash)
+    let back: Result<Carried, LoadError> = load(kept())
+    let restored = back.is_ok()
+    let carried = match back {
+        Ok(c) => c.clone(),
+        Err(_) => Carried { frames: 0, mark: 0.0 },
+    }
+    Game { latest, carried, restored, cooked: cook(), cooks: 1, watch: Watch::new(reads(cook)) }
+}
+
+@vertex
+pub fn half(v: VertexIndex) -> ClipPosition {
+    let x = if v.index == 1 || v.index >= 4 { 0.0 } else { -1.0 }
+    let y = if v.index == 2 || v.index == 4 || v.index == 5 { 1.0 } else { -1.0 }
+    ClipPosition { position: vec4(x, y, 0.5, 1.0) }
+}
+
+@fragment
+pub fn tinted() -> vec4 {
+    vec4(tint(), 1.0)
+}
+
+pub fn frame(g: mut Game, time: f32, width: u32, height: u32) {
+    if g.watch.changed() {
+        g.cooked = cook()
+        g.cooks += 1
+    }
+    g.carried.frames += 1
+    let bytes = save(g.carried)
+    keep(bytes)
+    begin_screen_pass(clear: vec4(tint() * 0.5, 1.0))
+    draw(half, tinted, vertices: 6)
+    present()
+}
+
+/// The sim's newest snapshot and the table's changes: ticks, Space presses, the sum (its low
+/// 16 bits), the generation.
+pub fn report(g: mut Game) -> vec4 {
+    borrow s = g.latest.read()
+    vec4(f32(s.ticks), f32(s.spaces), f32(s.sum % 65536), f32(generation()))
+}
+
+/// What's carried, whether it was restored, and what's cooked: frames, mark, restored, cooked.
+pub fn carried(g: Game) -> vec4 {
+    vec4(f32(g.carried.frames), g.carried.mark, if g.restored { 1.0 } else { 0.0 }, g.cooked)
+}
+
+pub fn cooks(g: Game) -> u32 {
+    g.cooks
+}
+
+pub fn set_mark(g: mut Game, mark: f32) {
+    g.carried.mark = mark
+}

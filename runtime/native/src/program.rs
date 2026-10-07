@@ -22,7 +22,8 @@ use wrela_abi::stream::{self, Command, Sequencer};
 use wrela_abi::ticks::{Tick, TickLog, frame_time, lockstep_ticks};
 use wrela_abi::{
     AUDIO_QUANTUM, EXPORT_AUDIO, EXPORT_FRAME, EXPORT_INIT, EXPORT_MEMORY, EXPORT_TICK,
-    EXPORT_WORKER, HOST_FUNCTIONS, IMPORT_AUDIO, IMPORT_INPUT, IMPORT_LIMIT, IMPORT_MEMORY,
+    EXPORT_WORKER, HOST_FUNCTIONS, IMPORT_AUDIO, IMPORT_INPUT, IMPORT_KEEP, IMPORT_KEPT,
+    IMPORT_LIMIT, IMPORT_MEMORY,
     IMPORT_MODULE, IMPORT_REQUEST_STATUS, IMPORT_REQUEST_TAKE, IMPORT_SUBMIT, IMPORT_TICK,
     Manifest, REQUEST_FAILED, REQUEST_PENDING,
 };
@@ -64,6 +65,10 @@ pub(crate) trait Executor: 'static {
     /// The device's limits, which commands are checked against and `wrela.limit` gives.
     fn limits(&self) -> wrela_abi::Limits {
         wrela_abi::Limits::DEFAULT
+    }
+    /// Hot reload: forget the old build's resources, and take the new build's pipelines.
+    fn reload(&mut self, _manifest: &Manifest, _shaders: &[String]) -> Result<()> {
+        Ok(())
     }
 }
 
@@ -145,6 +150,10 @@ struct State<E> {
     logs: Vec<String>,
     /// Input events not yet read (`wrela.input`).
     input: Queue,
+    /// What the build this one replaced kept (`wrela.kept`), and what this one keeps
+    /// (`wrela.keep`): hot reload.
+    kept: Vec<u8>,
+    keeping: Vec<u8>,
 }
 
 /// What a start function that calls the host gets.
@@ -386,7 +395,7 @@ pub struct Ticked {
 pub(crate) struct Program<E: 'static> {
     store: Store<State<E>>,
     /// The worker threads, which return when the program is dropped.
-    threads: Vec<std::thread::JoinHandle<()>>,
+    threads: Helpers,
     memory: SharedMemory,
     module: Module,
     /// The audio thread's instance, once [`Program::render_audio`] has made it.
@@ -404,6 +413,55 @@ pub(crate) struct Program<E: 'static> {
     fuel: Option<u64>,
     /// Why the last call failed, if it did.
     last_failure: Option<Failure>,
+    /// The records of each tick run that had any, by tick: what a build that replaces this one
+    /// replays (hot reload).
+    ran: Vec<(u32, Vec<[u8; EVENT_SIZE as usize]>)>,
+    /// Hot reload: the ticks the replaced build ran, which this one runs again first, each with
+    /// the records it had.
+    replay: Option<Replay>,
+}
+
+/// The ticks a replaced build ran, for the build that replaces it to run again (hot reload).
+struct Replay {
+    /// How many: ticks 0 to `upto - 1`.
+    upto: u32,
+    /// The records of those that had any, by tick.
+    records: std::collections::HashMap<u32, Vec<[u8; EVENT_SIZE as usize]>>,
+}
+
+/// What a program hands the build that replaces it while it runs (hot reload): its executor
+/// (the device, which keeps running), what it kept (`std::reload`), the ticks it ran with their
+/// records, and its input not yet read.
+pub(crate) struct Retired<E> {
+    pub executor: E,
+    kept: Vec<u8>,
+    ticks: u32,
+    ran: Vec<(u32, Vec<[u8; EVENT_SIZE as usize]>)>,
+    input: Queue,
+    records: std::collections::VecDeque<[u8; EVENT_SIZE as usize]>,
+    logs: Vec<String>,
+    batches: Option<Vec<Vec<u8>>>,
+}
+
+/// A program's helper threads: dropping it shuts them down (they see the flag when they wake)
+/// and waits for them.
+struct Helpers {
+    memory: SharedMemory,
+    threads: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for Helpers {
+    fn drop(&mut self) {
+        if self.threads.is_empty() {
+            return;
+        }
+        shared::store_u32(&self.memory, memory::PAR_SHUTDOWN, 1);
+        shared::add_u32(&self.memory, memory::PAR_WAKE, 1);
+        let _ = self.memory.atomic_notify(u64::from(memory::PAR_WAKE), u32::MAX);
+        for t in self.threads.drain(..) {
+            let _ = t.join();
+        }
+    }
 }
 
 /// Checks a module against the program ABI before instantiating it: it imports its memory,
@@ -565,6 +623,31 @@ impl<E: Executor> Program<E> {
         workers: u32,
         run_init: bool,
     ) -> Result<Program<E>> {
+        let carried = Retired {
+            executor,
+            kept: Vec::new(),
+            ticks: 0,
+            ran: Vec::new(),
+            input: Queue::default(),
+            records: Default::default(),
+            logs: Vec::new(),
+            batches: record.then(Vec::new),
+        };
+        Program::instantiate_carrying(compiled, manifest, carried, io, workers, run_init)
+    }
+
+    /// Hot reload: a new build's program in place of the one `carried` comes from, on its
+    /// executor, with what it kept, its input not yet read, and its ticks to run again (each
+    /// with the records it had) before any other.
+    pub(crate) fn instantiate_carrying(
+        compiled: &Compiled,
+        manifest: &Manifest,
+        carried: Retired<E>,
+        io: Io,
+        workers: u32,
+        run_init: bool,
+    ) -> Result<Program<E>> {
+        let Retired { executor, kept, ticks, ran, input, records, logs, batches } = carried;
         let engine = compiled.module.engine();
         let mut linker = Linker::new(engine);
         let wrap = |e: wasmtime::Error| Error::Program(format!("{e:#}"));
@@ -576,8 +659,10 @@ impl<E: Executor> Program<E> {
         linker.func_wrap(IMPORT_MODULE, IMPORT_REQUEST_TAKE, request_take::<E>).map_err(wrap)?;
         linker.func_wrap(IMPORT_MODULE, IMPORT_LIMIT, limit::<E>).map_err(wrap)?;
         linker.func_wrap(IMPORT_MODULE, IMPORT_AUDIO, audio::<E>).map_err(wrap)?;
-        linker.func_wrap(IMPORT_MODULE, IMPORT_INPUT, input::<E>).map_err(wrap)?;
+        linker.func_wrap(IMPORT_MODULE, IMPORT_INPUT, self::input::<E>).map_err(wrap)?;
         linker.func_wrap(IMPORT_MODULE, IMPORT_TICK, tick::<E>).map_err(wrap)?;
+        linker.func_wrap(IMPORT_MODULE, IMPORT_KEEP, keep::<E>).map_err(wrap)?;
+        linker.func_wrap(IMPORT_MODULE, IMPORT_KEPT, self::kept::<E>).map_err(wrap)?;
         let state = State {
             memory: memory.clone(),
             checker: Checker::with_limits(manifest, executor.limits()),
@@ -586,14 +671,16 @@ impl<E: Executor> Program<E> {
             sequencer: Sequencer::new(),
             failure: None,
             // From the start, so `init`'s batches are kept too.
-            batches: record.then(Vec::new),
+            batches,
             failed: None,
             requests: Requests { io, ..Requests::default() },
             started: false,
             voice: None,
             ticker: None,
-            logs: Vec::new(),
-            input: Queue::default(),
+            logs,
+            input,
+            kept,
+            keeping: Vec::new(),
         };
         let mut store = Store::new(engine, state);
         if let Some(fuel) = compiled.fuel {
@@ -613,6 +700,7 @@ impl<E: Executor> Program<E> {
                 spawn_worker(compiled.module.clone(), memory.clone(), memory::THREAD_HELPER0 + i)
             })
             .collect();
+        let threads = Helpers { memory: memory.clone(), threads };
         let frame = instance
             .get_typed_func::<(f32, u32, u32), ()>(&mut store, EXPORT_FRAME)
             .map_err(|e| Error::Program(format!("{e:#}")))?;
@@ -626,14 +714,44 @@ impl<E: Executor> Program<E> {
             module: compiled.module.clone(),
             audio: None,
             ticker: None,
-            records: Default::default(),
+            records,
             fuel: compiled.fuel,
             last_failure: None,
+            ran: Vec::new(),
+            replay: (ticks > 0).then(|| Replay { upto: ticks, records: ran.into_iter().collect() }),
         };
         if run_init {
             program.init()?;
         }
         Ok(program)
+    }
+
+    /// Ends this program for a build that replaces it while it runs (hot reload): its helpers
+    /// stop, and what carries over to the new one is handed back
+    /// ([`Program::instantiate_carrying`]). Ticks it was still to replay are replayed by the
+    /// next build too.
+    pub(crate) fn retire(self) -> Retired<E> {
+        let Program { store, threads, ticker, ran, replay, records, .. } = self;
+        drop(threads);
+        let state = store.into_data();
+        let ticks = ticker.map_or(0, |t| t.next).max(replay.as_ref().map_or(0, |r| r.upto));
+        let mut ran = ran;
+        if let Some(r) = replay {
+            // The ticks it hadn't replayed yet: what the build before it ran.
+            let done: std::collections::HashSet<u32> = ran.iter().map(|t| t.0).collect();
+            ran.extend(r.records.into_iter().filter(|(k, _)| !done.contains(k)));
+        }
+        ran.sort_by_key(|t| t.0);
+        Retired {
+            executor: state.executor,
+            kept: state.keeping,
+            ticks,
+            ran,
+            input: state.input,
+            records,
+            logs: state.logs,
+            batches: state.batches,
+        }
     }
 
     /// Runs `init`, for a program [`Program::instantiate_with`] made without running it.
@@ -871,8 +989,20 @@ impl<E: Executor> Program<E> {
     /// [`Program::want_hashes`] asked for it. An error if the program has no ticker, or the
     /// tick trapped (the program's panic).
     pub(crate) fn tick(&mut self) -> Result<Ticked> {
-        let n = self.records.len().min(memory::MAX_TICK_RECORDS as usize);
-        let records: Vec<[u8; EVENT_SIZE as usize]> = self.records.drain(..n).collect();
+        let k = self.next_tick();
+        // Replaying the replaced build's ticks: each with the records it had, while the
+        // queued records wait.
+        let records: Vec<[u8; EVENT_SIZE as usize]> = match &mut self.replay {
+            Some(r) if k < r.upto => r.records.remove(&k).unwrap_or_default(),
+            _ => {
+                self.replay = None;
+                let n = self.records.len().min(memory::MAX_TICK_RECORDS as usize);
+                self.records.drain(..n).collect()
+            }
+        };
+        if !records.is_empty() {
+            self.ran.push((k, records.clone()));
+        }
         let mut thread = self.take_tick_thread()?;
         let result = thread.run(records);
         self.ticker = Some(thread);
@@ -1078,21 +1208,6 @@ fn helper_trapped(m: &SharedMemory, thread: u32) {
     }
 }
 
-impl<E: 'static> Drop for Program<E> {
-    /// Shuts the helpers down: they see the flag when they wake.
-    fn drop(&mut self) {
-        if self.threads.is_empty() {
-            return;
-        }
-        shared::store_u32(&self.memory, memory::PAR_SHUTDOWN, 1);
-        shared::add_u32(&self.memory, memory::PAR_WAKE, 1);
-        let _ = self.memory.atomic_notify(u64::from(memory::PAR_WAKE), u32::MAX);
-        for t in self.threads.drain(..) {
-            let _ = t.join();
-        }
-    }
-}
-
 /// Fails the host function that's running: `e` is kept for the caller ([`State::failure`]),
 /// and wasmtime traps with its message.
 fn fail<E>(state: &mut State<E>, e: Error) -> wasmtime::Error {
@@ -1186,6 +1301,45 @@ fn input<E: Executor>(
     let bytes = state.input.take(cap);
     shared::write(&state.memory, ptr as usize, &bytes);
     Ok(n as i32)
+}
+
+/// `wrela.keep(ptr, len)`: keeps those bytes for the build that replaces this one (hot reload).
+fn keep<E: Executor>(
+    mut caller: wasmtime::Caller<'_, State<E>>,
+    ptr: u32,
+    len: u32,
+) -> wasmtime::Result<()> {
+    let state = caller.data_mut();
+    check_started(state)?;
+    let Some(bytes) = shared::read(&state.memory, ptr as usize, len as usize) else {
+        return Err(wasmtime::format_err!(
+            "keep({ptr}, {len}) reaches past the end of the program's memory"
+        ));
+    };
+    state.keeping = bytes;
+    Ok(())
+}
+
+/// `wrela.kept(ptr, cap) -> i32`: copies up to `cap` bytes of what the replaced build kept to
+/// `ptr`; how many it kept.
+fn kept<E: Executor>(
+    mut caller: wasmtime::Caller<'_, State<E>>,
+    ptr: u32,
+    cap: u32,
+) -> wasmtime::Result<i32> {
+    let state = caller.data_mut();
+    check_started(state)?;
+    let n = (cap as usize).min(state.kept.len());
+    let fits = (ptr as usize)
+        .checked_add(n)
+        .is_some_and(|end| end <= state.memory.data().len());
+    if !fits {
+        return Err(wasmtime::format_err!(
+            "kept({ptr}, {cap}) reaches past the end of the program's memory"
+        ));
+    }
+    shared::write(&state.memory, ptr as usize, &state.kept[..n]);
+    Ok(state.kept.len() as i32)
 }
 
 /// `wrela.limit(index) -> i32`: one of the device's limits ([`wrela_abi::Limits`]), as a `u32`'s

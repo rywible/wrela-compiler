@@ -39,6 +39,7 @@ mod queries;
 mod render;
 mod renderer;
 mod reproducible;
+mod reload;
 mod requests;
 mod run_pass;
 mod simd;
