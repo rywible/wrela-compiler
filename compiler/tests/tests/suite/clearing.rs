@@ -1218,7 +1218,7 @@ const Y1: f64 = 0.488603;
 /// pixels over 8/255. (Pixels whose shading isn't linear in the sky light, the creature's cel,
 /// are left out.)
 #[test]
-#[ignore = "needs a GPU"]
+#[ignore = "long: a brute-force reference of the sky light, needs a GPU"]
 fn the_probes_match_a_brute_force_reference() {
     let mut c = Clearing::load("clearing-probes");
     c.until_ready(0);
@@ -1448,7 +1448,7 @@ fn settled_start(name: &str, scale: i32, view: i32) -> (Vec<u8>, Vec<[f32; 4]>) 
 /// AC7: the start's frame upscaled from 960×540 against the same frame drawn at 1920×1080, each
 /// settled: within a mean of 3/255 (the look's frames, and temporal AA's output alone).
 #[test]
-#[ignore = "needs a GPU"]
+#[ignore = "long: a frame at 1080p against the upscaled one, settled, needs a GPU"]
 fn the_upscaled_frame_matches_the_native_one() {
     let mut means = Vec::new();
     for (view, what) in [(VIEW_LOOK, "the look"), (VIEW_TEMPORAL, "temporal AA's output")] {
@@ -1749,7 +1749,7 @@ fn the_walking_creature_leaves_no_trail() {
 /// (`examples/clearing/stills/c-gouache-and-light.png` at `cfc521a`), the creature's pixels
 /// (and 24 px round them) left out; both, and their difference, are written to target/tmp.
 #[test]
-#[ignore = "needs git and a GPU"]
+#[ignore = "long: the start settled at 1080p against spike 15's still, needs git and a GPU"]
 fn the_start_against_spike_15s_still() {
     let out = std::process::Command::new("git")
         .args(["show", "cfc521a:examples/clearing/stills/c-gouache-and-light.png"])
