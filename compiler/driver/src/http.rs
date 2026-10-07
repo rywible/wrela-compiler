@@ -54,7 +54,12 @@ pub(crate) fn read(stream: &TcpStream, port: u16) -> std::io::Result<Option<Requ
     let mut out = stream.try_clone()?;
     let local = ["127.0.0.1", "localhost", "[::1]"];
     if !local.iter().any(|h| host == *h || host == format!("{h}:{port}")) {
-        respond(&mut out, 403, "text/plain", b"this server answers only requests for this machine")?;
+        respond(
+            &mut out,
+            403,
+            "text/plain",
+            b"this server answers only requests for this machine",
+        )?;
         return Ok(None);
     }
     // A post only from this server's own pages.
@@ -106,7 +111,12 @@ pub(crate) fn mime(path: &str) -> &'static str {
 
 /// An HTTP response, with the headers that let the page's workers share memory (COOP and
 /// COEP, which `SharedArrayBuffer` needs) and keep nothing cached.
-pub(crate) fn respond(out: &mut TcpStream, status: u16, kind: &str, body: &[u8]) -> std::io::Result<()> {
+pub(crate) fn respond(
+    out: &mut TcpStream,
+    status: u16,
+    kind: &str,
+    body: &[u8],
+) -> std::io::Result<()> {
     let reason = match status {
         200 => "OK",
         201 => "Created",

@@ -2142,7 +2142,10 @@ fn the_lens_draws_probes_and_drags_the_great_tree() {
     lens.act_with("view", &[Value::I32(0)]);
     let screen = lens.host.read_screen().expect("the screen");
     let background = &screen[..4];
-    let drawn = screen.chunks(4).filter(|p| p[..3].iter().zip(background).any(|(a, b)| a.abs_diff(*b) > 24)).count();
+    let drawn = screen
+        .chunks(4)
+        .filter(|p| p[..3].iter().zip(background).any(|(a, b)| a.abs_diff(*b) > 24))
+        .count();
     let share = drawn as f64 / (screen.len() / 4) as f64;
     assert!(share > 0.1, "the tree covers {:.1}% of the side view", share * 100.0);
     // Probed: the trunk's wood and the crown's clumps, each part named.

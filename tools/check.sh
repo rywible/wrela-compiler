@@ -134,7 +134,7 @@ if [ "$long" = 1 ]; then
   step "long: tests at full size"
   WRELA_FULL=1 cargo test -q --release --workspace
 
-  step "long: the CLI's speed, cold processes: hello field's check < 200 ms and build < 2 s, sketch 03's, the herd's and the lens's (on each subject) < 500 ms and < 5 s"
+  step "long: the CLI's speed, cold processes: hello field's check < 200 ms and build < 2 s, sketch 03's, the herd's, the clearing's and the lens's (on each subject) < 500 ms and < 5 s"
   python3 - "$wrela" <<'PY'
 import shutil, subprocess, sys, tempfile, time
 wrela = sys.argv[1]
@@ -151,10 +151,11 @@ def best(args, n=5, cold=None):
 out = tempfile.mkdtemp()
 try:
     hello, sketch = "examples/hello-field", "compiler/tests/sketches/03-simulation"
-    # The lens on each subject (AC12 of #39): `wrela studio` writes its program beside the
-    # subject (build/studio/lens) and builds it lifted, then keeps its compiled code.
-    subjects = ["wolf", "grazer"]
-    for s in subjects:
+    # The lens on each subject (AC12 of #39; the great tree and the fawn, #51): `wrela studio`
+    # writes its program beside the subject (build/studio/lens) and builds it lifted, then
+    # keeps its compiled code. Each subject's directory, and its package's name.
+    subjects = [("wolf", "wolf"), ("grazer", "grazer"), ("great-tree", "great_tree"), ("fawn", "fawn")]
+    for s, _ in subjects:
         subprocess.run([wrela, "studio", f"examples/{s}", "build"], check=True, capture_output=True)
     lens = lambda s: f"examples/{s}/build/studio/lens"
     runs = [
@@ -164,11 +165,13 @@ try:
         ("build sketch 03", ["build", sketch, "-o", f"{out}/speed-sketch"], 5.0),
         ("check the herd", ["check", "examples/herd"], 0.5),
         ("build the herd", ["build", "examples/herd", "-o", f"{out}/speed-herd"], 5.0),
+        ("check the clearing", ["check", "examples/clearing"], 0.5),
+        ("build the clearing", ["build", "examples/clearing", "-o", f"{out}/speed-clearing"], 5.0),
     ]
-    for s in subjects:
+    for s, name in subjects:
         runs += [
             (f"check the lens on the {s}", ["check", lens(s)], 0.5),
-            (f"build the lens on the {s}", ["build", lens(s), "--lift", s, "-o", f"{out}/speed-lens-{s}"], 5.0),
+            (f"build the lens on the {s}", ["build", lens(s), "--lift", name, "-o", f"{out}/speed-lens-{s}"], 5.0),
             (f"studio build on the {s} (and its compiled code)", ["studio", f"examples/{s}", "build"], 5.0,
              f"examples/{s}/build/studio/page/.native"),
         ]

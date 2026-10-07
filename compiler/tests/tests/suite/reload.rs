@@ -70,7 +70,8 @@ fn pixel(host: &mut Host, x: u32, y: u32) -> [u8; 3] {
 /// Runs frames `from..to` in lockstep.
 fn frames(host: &mut Host, from: u32, to: u32, script: &[Scripted]) {
     for i in from..to {
-        host.lockstep_frame(i, FPS, SIZE, SIZE, script).unwrap_or_else(|e| panic!("frame {i}: {e}"));
+        host.lockstep_frame(i, FPS, SIZE, SIZE, script)
+            .unwrap_or_else(|e| panic!("frame {i}: {e}"));
     }
 }
 
@@ -176,14 +177,22 @@ fn a_new_sim_replays_the_old_ones_input() {
 }
 
 /// Waits until the server has had `n` changes shown, or panics after `limit`.
-fn wait_shown(server: &wrela_driver::live::Server, n: usize, limit: std::time::Duration) -> wrela_driver::live::Shown {
+fn wait_shown(
+    server: &wrela_driver::live::Server,
+    n: usize,
+    limit: std::time::Duration,
+) -> wrela_driver::live::Shown {
     let began = std::time::Instant::now();
     loop {
         let shown = server.shown();
         if shown.len() >= n {
             return shown[n - 1].clone();
         }
-        assert!(began.elapsed() < limit, "change {n} wasn't shown in {limit:?}: {:?}", server.changes());
+        assert!(
+            began.elapsed() < limit,
+            "change {n} wasn't shown in {limit:?}: {:?}",
+            server.changes()
+        );
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
 }
@@ -206,7 +215,8 @@ fn write_edit(pkg: &Path, edit: impl Fn(&str) -> String) -> std::time::Instant {
 fn wrela_run_reloads_the_page_in_place() {
     let pkg = edited("reload-chrome-src", |src| src.to_string() + "\n");
     let out = super::scratch("reload-chrome");
-    let server = wrela_driver::live::serve(&pkg, &out, 0, &["main".into()], false, true).expect("serve");
+    let server =
+        wrela_driver::live::serve(&pkg, &out, 0, &["main".into()], false, true).expect("serve");
     std::fs::write(
         out.join("1/script.json"),
         r#"[{"frame":10,"type":"key","key":"Space"},{"frame":50,"type":"key","key":"Space"}]"#,
@@ -252,7 +262,7 @@ fn wrela_run_reloads_the_page_in_place() {
     let lines: Vec<&str> = printed.lines().filter(|l| l.starts_with("frame ")).collect();
     assert!(lines.len() >= 25, "{printed}");
     let mut native = Host::load_with(
-        &built("reload-chrome-native", &package()),
+        built("reload-chrome-native", &package()),
         &wrela_host::Options { quiet: true, ..wrela_host::Options::default() },
     )
     .expect("load");

@@ -353,8 +353,10 @@ pub(crate) fn intrinsic(
         Lang::LiftGeneration => match table {
             // The state's counter starts at 1, so the first upload happens.
             Some(t) => {
-                let counter =
-                    ir::Place { root: ir::PlaceRoot::Data(t.state), path: vec![ir::Proj::Field(1)] };
+                let counter = ir::Place {
+                    root: ir::PlaceRoot::Data(t.state),
+                    path: vec![ir::Proj::Field(1)],
+                };
                 let g = fl.value(u, ir::Expr::Load(counter));
                 let one = fl.u32c(1);
                 Some(fl.value(u, ir::Expr::Binary(ir::BinOp::WrappingSub, g, one)))

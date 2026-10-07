@@ -681,7 +681,7 @@ fn no_pixel_sees_through_the_terrain_between_levels() {
     let mut checked = 0;
     while c.path_time() < 60.0 {
         c.step();
-        if c.frame % 20 != 0 {
+        if !c.frame.is_multiple_of(20) {
             continue;
         }
         let s = c.screen();
@@ -791,7 +791,7 @@ fn the_grass_never_thins_along_the_path() {
     let mut samples = 0;
     while c.path_time() < 60.0 {
         c.step();
-        if c.frame % 60 != 0 {
+        if !c.frame.is_multiple_of(60) {
             continue;
         }
         let now = grass_coverage(&mut c);
@@ -1085,16 +1085,22 @@ fn draws_after(batch: &[u8], name: &str) -> usize {
     n
 }
 
-/// AC5: static shadows are cached: the first frame draws the forest and the stones into the
-/// static cascades, a steady frame draws nothing into them, and moving the sun draws them again
-/// (counted in the frames' command streams).
+/// AC5: static shadows are cached: once the forest and the boulders are cooked (a few at a
+/// frame, at load), one frame draws them into the static cascades, a steady frame draws nothing
+/// into them, and moving the sun draws them again (counted in the frames' command streams).
 #[test]
 #[ignore = "needs a GPU"]
 fn static_shadows_are_drawn_once_and_again_when_the_sun_moves() {
     let mut c = Clearing::load("clearing-static");
-    c.step();
-    let first: usize = c.batches().iter().map(|b| draws_after(b, "shadows static")).sum();
-    assert!(first > 10, "the first frame draws {first} times into the static cascades");
+    let mut drawn = Vec::new();
+    for _ in 0..30 {
+        c.step();
+        drawn.push(c.batches().iter().map(|b| draws_after(b, "shadows static")).sum::<usize>());
+    }
+    let frames: Vec<usize> = (0..drawn.len()).filter(|&i| drawn[i] > 0).collect();
+    assert_eq!(frames.len(), 1, "the frames that drew static shadows at load: {drawn:?}");
+    let first = drawn[frames[0]];
+    assert!(first > 10, "the load drew {first} times into the static cascades");
     c.until_ready(2);
     c.batches();
     c.steps(30);
@@ -1364,7 +1370,7 @@ fn the_probes_match_a_brute_force_reference() {
 /// every frame until the clearing's ready takes under 100 ms of GPU time (its span, in the
 /// native host and in Chrome), and the clouds' strips each well under it.
 #[test]
-#[ignore = "needs Chrome, python3 and a GPU"]
+#[ignore = "long: alone: a GPU time budget, needs Chrome, python3 and a GPU"]
 fn loading_never_submits_more_than_100_ms() {
     let mut c =
         Clearing::load_with("clearing-load", &Options { timestamps: true, ..Options::default() });
@@ -1382,6 +1388,8 @@ fn loading_never_submits_more_than_100_ms() {
         "native: {ready} frames to ready, the longest frame {longest:.1} ms, the longest strip {strips:.1} ms"
     );
     assert!(longest < 100.0, "a loading frame took {longest} ms of GPU time");
+    // The native host's GPU lock goes before Chrome takes it.
+    drop(c);
     let (_, rel) = built("clearing-load-chrome");
     let run = wrela_tests::ChromeRun {
         timestamps: true,
@@ -1854,7 +1862,8 @@ fn trees_change_level_without_popping() {
     // and card_px as a multiple of the cards' finest width on screen), over its frames: the
     // card levels' middle half of an octave (×1.19 to ×1.68 of 40 m) in 240 frames, the
     // impostor's band (±8% of 150 m) in 290, the volume's (±8% of 1 km) in 1920.
-    let sweeps: [(&str, f32, [f32; 3], [f32; 3], u32); 4] = [
+    type Sweep = (&'static str, f32, [f32; 3], [f32; 3], u32);
+    let sweeps: [Sweep; 4] = [
         ("cards' level 0 to 1", 40.0, [1.0e4, 1.0e5, 1.0], [1.0e4, 1.0e5, 2.0], 240),
         ("cards' level 1 to 2", 40.0, [1.0e4, 1.0e5, 2.0], [1.0e4, 1.0e5, 4.0], 240),
         ("cards to impostor", 150.0, [163.0, 1.0e5, 1.0], [138.0, 1.0e5, 1.0], 290),
@@ -1946,12 +1955,17 @@ const SYSTEMS: [(&str, f64, &[&str]); 7] = [
 fn path_start(printed: &[(usize, String)]) -> usize {
     printed
         .iter()
-        .find_map(|(_, l)| l.strip_prefix("path begins at frame ").and_then(|n| n.trim().parse().ok()))
+        .find_map(|(_, l)| {
+            l.strip_prefix("path begins at frame ").and_then(|n| n.trim().parse().ok())
+        })
         .expect("the path began")
 }
 
 /// Each system's time (ms) in each of `frames`, from a run's timings: the medians over them.
-fn system_medians(timings: &[(usize, String, f64)], frames: std::ops::Range<usize>) -> Vec<(&'static str, f64, f64)> {
+fn system_medians(
+    timings: &[(usize, String, f64)],
+    frames: std::ops::Range<usize>,
+) -> Vec<(&'static str, f64, f64)> {
     SYSTEMS
         .iter()
         .map(|(name, slice, labels)| {
@@ -2022,12 +2036,15 @@ fn each_system_keeps_its_slice() {
     let mut over = Vec::new();
     for ((name, slice, n), (_, _, c)) in native.iter().zip(&chrome) {
         let borrows = if *n > *slice { " (borrows from the slack)" } else { "" };
-        println!("{name:12} slice {slice:4.1} ms: native {n:6.3} ms{borrows}; Chrome's serial mode {c:6.3} ms");
+        println!(
+            "{name:12} slice {slice:4.1} ms: native {n:6.3} ms{borrows}; Chrome's serial mode {c:6.3} ms"
+        );
         if *n > slice * 1.25 {
             over.push(format!("{name}: {n:.2} ms (slice {slice})"));
         }
     }
-    let (n_total, c_total): (f64, f64) = (native.iter().map(|s| s.2).sum(), chrome.iter().map(|s| s.2).sum());
+    let (n_total, c_total): (f64, f64) =
+        (native.iter().map(|s| s.2).sum(), chrome.iter().map(|s| s.2).sum());
     println!("the systems together: native {n_total:.2} ms, Chrome {c_total:.2} ms");
     assert!(over.is_empty(), "over their slices by a quarter or more: {over:?}");
 }
@@ -2093,7 +2110,9 @@ fn sixty_frames_a_second_over_the_path_in_chrome() {
     let ready = r
         .printed
         .iter()
-        .find_map(|(_, l)| l.strip_prefix("clearing ready at frame ").and_then(|n| n.trim().parse::<usize>().ok()))
+        .find_map(|(_, l)| {
+            l.strip_prefix("clearing ready at frame ").and_then(|n| n.trim().parse::<usize>().ok())
+        })
         .expect("the clearing got ready");
     let at = r.began_ms[ready + 1];
     let bytes: f64 = load["resources"]
@@ -2147,7 +2166,11 @@ fn edit_file(pkg: &std::path::Path, file: &str, from: &str, to: &str) -> std::ti
 
 /// The mean difference of two frames (RGBA8), over RGB, in /255.
 fn mean_difference(a: &[u8], b: &[u8]) -> f64 {
-    let sum: u64 = a.chunks(4).zip(b.chunks(4)).map(|(p, q)| (0..3).map(|c| p[c].abs_diff(q[c]) as u64).sum::<u64>()).sum();
+    let sum: u64 = a
+        .chunks(4)
+        .zip(b.chunks(4))
+        .map(|(p, q)| (0..3).map(|c| p[c].abs_diff(q[c]) as u64).sum::<u64>())
+        .sum();
     sum as f64 / (a.len() / 4 * 3) as f64
 }
 
@@ -2164,9 +2187,14 @@ fn hot_reload_in_the_native_host() {
     let pkg = clearing_copy("clearing-hot-native-src");
     let out = super::scratch("clearing-hot-native");
     let _ = std::fs::remove_dir_all(&out);
-    let mut watcher = wrela_driver::live::Watcher::start(&pkg, &out, &[], false).expect("the first build");
+    let mut watcher =
+        wrela_driver::live::Watcher::start(&pkg, &out, &[], false).expect("the first build");
     let options = Options { quiet: true, ..Options::default() };
-    let mut c = Clearing { host: Host::load_with(&watcher.dir(), &options).expect("load"), frame: 0, script: Vec::new() };
+    let mut c = Clearing {
+        host: Host::load_with(watcher.dir(), &options).expect("load"),
+        frame: 0,
+        script: Vec::new(),
+    };
     c.walk();
     c.until_ready(0);
     while c.path_time() < 2.0 {
@@ -2174,7 +2202,8 @@ fn hot_reload_in_the_native_host() {
     }
     let before = c.host.read_screen().expect("the screen");
     // A literal: the sun lower in the west.
-    let t = edit_file(&pkg, "scene.wrela", "vec3(0.900, 0.407, -0.159)", "vec3(0.900, 0.250, -0.159)");
+    let t =
+        edit_file(&pkg, "scene.wrela", "vec3(0.900, 0.407, -0.159)", "vec3(0.900, 0.250, -0.159)");
     let literal_ms;
     loop {
         std::thread::sleep(wrela_driver::live::SCAN);
@@ -2196,7 +2225,12 @@ fn hot_reload_in_the_native_host() {
     let changed = mean_difference(&before, &after);
     // A structural edit: the field of view narrowed by a new factor in the code.
     let cam_before = c.camera();
-    let t = edit_file(&pkg, "main.wrela", "        FOVY,\n        width: w,", "        FOVY * 0.8,\n        width: w,");
+    let t = edit_file(
+        &pkg,
+        "main.wrela",
+        "        FOVY,\n        width: w,",
+        "        FOVY * 0.8,\n        width: w,",
+    );
     let structural_ms;
     let reloaded_at;
     loop {
@@ -2233,26 +2267,46 @@ fn hot_reload_in_the_native_host() {
     assert!(structural_ms <= 3000.0, "{structural_ms:.0} ms");
     // The new build drew with the narrower view, from where an unbroken run of it would be.
     let ratio = cam_after.tan_half / cam_before.tan_half;
-    assert!((ratio - (0.8f64 * 21f64.to_radians()).tan() / 21f64.to_radians().tan()).abs() < 1e-4, "{ratio}");
-    let mut fresh = Clearing { host: Host::load_with(&watcher.dir(), &options).expect("load"), frame: 0, script: Vec::new() };
+    assert!(
+        (ratio - (0.8f64 * 21f64.to_radians()).tan() / 21f64.to_radians().tan()).abs() < 1e-4,
+        "{ratio}"
+    );
+    let mut fresh = Clearing {
+        host: Host::load_with(watcher.dir(), &options).expect("load"),
+        frame: 0,
+        script: Vec::new(),
+    };
     fresh.walk();
     while fresh.frame < c.frame {
         fresh.step();
     }
     let (a, b) = (fresh.camera(), c.camera());
     let gap = (0..3).map(|k| (a.eye[k] - b.eye[k]).abs()).fold(0.0, f64::max);
-    assert!(gap < 1e-3, "the camera after the reload is {gap} m from an unbroken run's: {:?} against {:?}", b.eye, a.eye);
+    assert!(
+        gap < 1e-3,
+        "the camera after the reload is {gap} m from an unbroken run's: {:?} against {:?}",
+        b.eye,
+        a.eye
+    );
 }
 
 /// Waits until the `wrela run` server has had `n` changes shown, or panics after `limit`.
-fn shown_by(server: &wrela_driver::live::Server, n: usize, limit: std::time::Duration) -> wrela_driver::live::Shown {
+fn shown_by(
+    server: &wrela_driver::live::Server,
+    n: usize,
+    limit: std::time::Duration,
+) -> wrela_driver::live::Shown {
     let began = std::time::Instant::now();
     loop {
         let shown = server.shown();
         if shown.len() >= n {
             return shown[n - 1].clone();
         }
-        assert!(began.elapsed() < limit, "change {n} wasn't shown in {limit:?}: {:?}", server.changes());
+        assert!(
+            began.elapsed() < limit,
+            "change {n} wasn't shown in {limit:?}: {:?}",
+            server.changes()
+        );
         std::thread::sleep(std::time::Duration::from_millis(2));
     }
 }
@@ -2268,7 +2322,8 @@ fn hot_reload_in_chrome() {
     let pkg = clearing_copy("clearing-hot-chrome-src");
     let out = super::scratch("clearing-hot-chrome");
     let server = wrela_driver::live::serve(&pkg, &out, 0, &[], false, true).expect("serve");
-    std::fs::write(out.join("1/script.json"), r#"[{"frame":1,"type":"key","key":"Space"}]"#).expect("the script");
+    std::fs::write(out.join("1/script.json"), r#"[{"frame":1,"type":"key","key":"Space"}]"#)
+        .expect("the script");
     let url = format!(
         "http://127.0.0.1:{}/#test&frames=1500&width={W}&height={H}&fps=60&input=script.json&nohash=1",
         server.port
@@ -2280,11 +2335,17 @@ fn hot_reload_in_chrome() {
     edit_file(&pkg, "main.wrela", "blend: 0.12,", "blend: 0.121,");
     shown_by(&server, 1, limit);
     std::thread::sleep(std::time::Duration::from_secs(2));
-    let t = edit_file(&pkg, "scene.wrela", "vec3(0.900, 0.407, -0.159)", "vec3(0.900, 0.250, -0.159)");
+    let t =
+        edit_file(&pkg, "scene.wrela", "vec3(0.900, 0.407, -0.159)", "vec3(0.900, 0.250, -0.159)");
     let literal = shown_by(&server, 2, limit);
     let literal_ms = t.elapsed().as_secs_f64() * 1000.0;
     std::thread::sleep(std::time::Duration::from_secs(2));
-    let t = edit_file(&pkg, "main.wrela", "        FOVY,\n        width: w,", "        FOVY * 0.8,\n        width: w,");
+    let t = edit_file(
+        &pkg,
+        "main.wrela",
+        "        FOVY,\n        width: w,",
+        "        FOVY * 0.8,\n        width: w,",
+    );
     let structural = shown_by(&server, 3, limit);
     let structural_ms = t.elapsed().as_secs_f64() * 1000.0;
     chrome.join().expect("the Chrome run");

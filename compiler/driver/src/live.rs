@@ -148,7 +148,11 @@ impl Watcher {
                     let len = meta.len();
                     let seen = match before.get(&path) {
                         Some(s) if s.modified == modified && s.len == len => s.clone(),
-                        _ => Seen { modified, len, text: std::fs::read_to_string(&path).unwrap_or_default() },
+                        _ => Seen {
+                            modified,
+                            len,
+                            text: std::fs::read_to_string(&path).unwrap_or_default(),
+                        },
                     };
                     out.insert(path, seen);
                 }
@@ -214,7 +218,9 @@ impl Watcher {
             .and_then(|t| serde_json::from_str::<Report>(&t).map_err(|e| e.to_string()));
         let report = match report {
             Ok(r) => r,
-            Err(why) => return Change::Failed(format!("the build's lift.json doesn't read: {why}")),
+            Err(why) => {
+                return Change::Failed(format!("the build's lift.json doesn't read: {why}"));
+            }
         };
         self.values = report.literals.iter().map(|l| l.value).collect();
         self.report = report;
@@ -355,7 +361,11 @@ pub fn serve(
     let state = Arc::new(State {
         out: out.to_path_buf(),
         port,
-        live: Mutex::new(Live { version: watcher.version(), events: Vec::new(), shown: Vec::new() }),
+        live: Mutex::new(Live {
+            version: watcher.version(),
+            events: Vec::new(),
+            shown: Vec::new(),
+        }),
         changed: Condvar::new(),
     });
     let stopping = Arc::new(AtomicBool::new(false));
@@ -417,7 +427,12 @@ const MARK: &str = r#"<meta name="wrela-live" content="1">"#;
 /// How long a long poll waits for a change before it answers that there's none.
 const LONG_POLL: Duration = Duration::from_secs(15);
 
-fn handle(stream: TcpStream, state: &State, stopping: &AtomicBool, quiet: bool) -> std::io::Result<()> {
+fn handle(
+    stream: TcpStream,
+    state: &State,
+    stopping: &AtomicBool,
+    quiet: bool,
+) -> std::io::Result<()> {
     let Some(req) = http::read(&stream, state.port)? else { return Ok(()) };
     let mut out = stream;
     match (req.method.as_str(), req.path.as_str()) {
@@ -456,15 +471,21 @@ fn handle(stream: TcpStream, state: &State, stopping: &AtomicBool, quiet: bool) 
                     let save = shown.since_save.map_or(String::new(), |d| {
                         format!("{:.0} ms after the save, ", d.as_secs_f64() * 1000.0)
                     });
-                    println!("shown at frame {frame}: {save}{:.0} ms after the watcher saw it", shown.since_seen.as_secs_f64() * 1000.0);
+                    println!(
+                        "shown at frame {frame}: {save}{:.0} ms after the watcher saw it",
+                        shown.since_seen.as_secs_f64() * 1000.0
+                    );
                 }
                 s.shown.push(shown);
             }
             http::respond(&mut out, 200, "text/plain", b"")
         }
-        ("PUT", path) if path.starts_with("/results/") => {
-            http::put_result(&mut out, &state.out.join("results"), &path["/results/".len()..], &req.body)
-        }
+        ("PUT", path) if path.starts_with("/results/") => http::put_result(
+            &mut out,
+            &state.out.join("results"),
+            &path["/results/".len()..],
+            &req.body,
+        ),
         ("GET", path) => {
             // `/<version>/file` is that build's; any other path, the newest build's.
             let trimmed = path.trim_start_matches('/');
@@ -480,7 +501,11 @@ fn handle(stream: TcpStream, state: &State, stopping: &AtomicBool, quiet: bool) 
             match std::fs::read(dir.join(rel)) {
                 Ok(mut bytes) => {
                     if rel == "index.html" {
-                        let html = String::from_utf8_lossy(&bytes).replacen("<head>", &format!("<head>{MARK}"), 1);
+                        let html = String::from_utf8_lossy(&bytes).replacen(
+                            "<head>",
+                            &format!("<head>{MARK}"),
+                            1,
+                        );
                         bytes = html.into_bytes();
                     }
                     http::respond(&mut out, 200, http::mime(rel), &bytes)
