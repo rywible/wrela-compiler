@@ -1789,3 +1789,143 @@ fn the_start_against_spike_15s_still() {
         creature.len()
     );
 }
+
+// ---- zero pop-in (the owner's ask) ---------------------------------------------------------
+
+/// A frame's pixels within the circle a crown covers on screen (its middle `centre` and its
+/// reach `r` projected), as display values.
+fn crown_pixels(c: &mut Clearing, centre: [f64; 3], r: f64) -> Vec<[u8; 3]> {
+    let cam = Cam { jitter: [0.0, 0.0], ..c.camera() };
+    let Some((px, _)) = cam.project(centre, [f64::from(W), f64::from(H)]) else {
+        return Vec::new();
+    };
+    let d = len(sub(centre, cam.eye));
+    let radius = r / (d * 2.0 * cam.tan_half) * f64::from(H);
+    let screen = c.screen();
+    let mut out = Vec::new();
+    let x0 = (px[0] - radius).max(0.0) as usize;
+    let x1 = (px[0] + radius).min(f64::from(W) - 1.0) as usize;
+    let y0 = (px[1] - radius).max(0.0) as usize;
+    let y1 = (px[1] + radius).min(f64::from(H) - 1.0) as usize;
+    for y in y0..=y1 {
+        for x in x0..=x1 {
+            let (dx, dy) = (x as f64 + 0.5 - px[0], y as f64 + 0.5 - px[1]);
+            if dx * dx + dy * dy <= radius * radius {
+                let i = 4 * (y * W as usize + x);
+                out.push([screen[i], screen[i + 1], screen[i + 2]]);
+            }
+        }
+    }
+    out
+}
+
+/// The mean of |a − b| over two lists of pixels' channels (/255).
+fn mean_change(a: &[[u8; 3]], b: &[[u8; 3]]) -> f64 {
+    let sum: f64 = a
+        .iter()
+        .zip(b)
+        .map(|(p, q)| (0..3).map(|ch| f64::from(p[ch].abs_diff(q[ch]))).sum::<f64>())
+        .sum();
+    sum / (3.0 * a.len().max(1) as f64)
+}
+
+/// Zero pop-in: a lone tree changes level smoothly. The camera is held and the wind still, and
+/// where its levels hand over is swept past the tree, as fast as a camera nearing it at about
+/// 5 m/s would pass the handover, so the level is all that changes: each step of its cards'
+/// levels (at 40 m, by how wide their cards look), its cards to its impostor (at 150 m), its
+/// impostor to its volume (at 1 km). No quarter of a second (16 frames, the same jitter: a
+/// still frame repeats) changes the crown by more than a quarter of the whole change from one
+/// level to the other (and a fifth of a step, and a still frame's noise): a level switched at
+/// once puts all of it in one. The great tree, an edge tree and a far tree.
+#[test]
+#[ignore = "long: twelve sweeps, needs a GPU"]
+fn trees_change_level_without_popping() {
+    let mut c = Clearing::load("clearing-pop");
+    c.until_ready(2);
+    c.off(off::GRASS | off::CREATURE | off::STONES | off::WIND);
+    let (dir, _) = built("clearing-pop-cpu");
+    let mut cpu = wrela_host::CpuHost::load(&dir).expect("load on the CPU");
+    let at = [-260.0f32, 520.0];
+    let toward = [-0.62f32, 0.78];
+    let ground = field(&mut cpu, f64::from(at[0]), f64::from(at[1])).0 as f32;
+    let lod = |c: &mut Clearing, cards_to: f32, impostors_to: f32, card_px: f32| {
+        c.call("test_lod", &[Value::F32(cards_to), Value::F32(impostors_to), Value::F32(card_px)]);
+    };
+    // Each sweep: what, the distance, and the handover's start and end (cards_to, impostors_to,
+    // and card_px as a multiple of the cards' finest width on screen), over its frames: the
+    // card levels' middle half of an octave (×1.19 to ×1.68 of 40 m) in 240 frames, the
+    // impostor's band (±8% of 150 m) in 290, the volume's (±8% of 1 km) in 1920.
+    let sweeps: [(&str, f32, [f32; 3], [f32; 3], u32); 4] = [
+        ("cards' level 0 to 1", 40.0, [1.0e4, 1.0e5, 1.0], [1.0e4, 1.0e5, 2.0], 240),
+        ("cards' level 1 to 2", 40.0, [1.0e4, 1.0e5, 2.0], [1.0e4, 1.0e5, 4.0], 240),
+        ("cards to impostor", 150.0, [163.0, 1.0e5, 1.0], [138.0, 1.0e5, 1.0], 290),
+        ("impostor to volume", 1000.0, [100.0, 1087.0, 1.0], [100.0, 926.0, 1.0], 1920),
+    ];
+    let mut report = Vec::new();
+    for kind in [0u32, 1, 10] {
+        let reach = c.call("test_kind", &[Value::I32(kind as i32)])[0];
+        for (what, distance, from, to, frames) in sweeps {
+            let solo = [kind as i32].map(Value::I32);
+            let place = [at[0], at[1], from[0], from[1]].map(Value::F32);
+            c.call("test_solo", &[solo[0], place[0], place[1], place[2], place[3]]);
+            let eye = [at[0] + toward[0] * distance, at[1] + toward[1] * distance];
+            let under = field(&mut cpu, f64::from(eye[0]), f64::from(eye[1])).0 as f32;
+            let eye_y = (ground + 6.0 + distance * 0.08).max(under + 4.0);
+            c.hold([eye[0], eye_y, eye[1]], [at[0], ground + 6.0, at[1]]);
+            c.step();
+            let args = [Value::I32(kind as i32), Value::F32(at[0]), Value::F32(at[1])];
+            let px = c.call("test_card_px", &args)[0] as f32;
+            lod(&mut c, from[0], from[1], px * from[2]);
+            let centre = [f64::from(at[0]), f64::from(ground) + 6.0, f64::from(at[1])];
+            c.steps(64);
+            // A still frame's noise: the same jitter, 16 frames on.
+            let still_a = crown_pixels(&mut c, centre, reach);
+            c.steps(16);
+            let still_b = crown_pixels(&mut c, centre, reach);
+            let noise = mean_change(&still_a, &still_b);
+            let mut seen: Vec<Vec<[u8; 3]>> = vec![still_b];
+            for f in 1..=frames {
+                let t = f as f32 / frames as f32;
+                let lerp = |k: usize| from[k] + (to[k] - from[k]) * t;
+                // card_px sweeps by its log (a level is an octave of it).
+                let card_px = px * from[2] * (to[2] / from[2]).powf(t);
+                lod(&mut c, lerp(0), lerp(1), card_px);
+                c.step();
+                seen.push(crown_pixels(&mut c, centre, reach));
+            }
+            c.steps(48);
+            seen.push(crown_pixels(&mut c, centre, reach));
+            let whole = mean_change(&seen[0], seen.last().expect("frames"));
+            if std::env::var("CLEARING_SERIES").is_ok() && kind == 0 {
+                let series: Vec<String> = (0..seen.len() - 17)
+                    .step_by(8)
+                    .map(|f| {
+                        format!(
+                            "{:.2}/{:.2}",
+                            mean_change(&seen[0], &seen[f]),
+                            mean_change(&seen[f], &seen[f + 16])
+                        )
+                    })
+                    .collect();
+                println!(
+                    "  {what}: from the start / over 16, every 8 frames: {}",
+                    series.join(" ")
+                );
+            }
+            let worst = (0..seen.len() - 17)
+                .map(|f| mean_change(&seen[f], &seen[f + 16]))
+                .fold(0.0, f64::max);
+            println!(
+                "kind {kind:2}, {what:20} at {distance:5} m: the whole change {whole:.2}/255, the most in a quarter second {worst:.2}/255 (a still frame's noise {noise:.2})"
+            );
+            report.push((kind, what, whole, worst, noise));
+        }
+    }
+    for (kind, what, whole, worst, noise) in report {
+        assert!(whole > 0.3, "kind {kind}, {what}: the sweep changed nothing ({whole}/255)");
+        assert!(
+            worst <= 0.25 * whole + 0.2 + noise,
+            "kind {kind}, {what}: a quarter second changed it by {worst}/255 of the whole {whole}/255"
+        );
+    }
+}
