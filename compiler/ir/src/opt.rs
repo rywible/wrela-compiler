@@ -452,7 +452,15 @@ impl Hash for CseKey {
                 Const::F64(x) => x.to_bits().hash(h),
             },
             Expr::Zero(t) => t.hash(h),
+            // The operation too, as `==` compares it: `a + b` and `a * b` hash apart.
+            Expr::Unary(op, x) => (op, x).hash(h),
+            Expr::Binary(op, a, b) => (op, a, b).hash(h),
+            Expr::Builtin(b, xs) => (b, xs).hash(h),
+            Expr::Construct(t, xs) => (t, xs).hash(h),
             Expr::Extract(x, k) => (x, k).hash(h),
+            Expr::Splat(x, n) => (x, n).hash(h),
+            Expr::Swizzle(x, cs) => (x, cs).hash(h),
+            Expr::Convert(x, s) | Expr::Bitcast(x, s) => (x, s).hash(h),
             e => e.for_each_value(&mut |v| v.hash(h)),
         }
     }

@@ -172,6 +172,15 @@ impl std::fmt::Display for ReplayError {
 
 impl std::error::Error for ReplayError {}
 
+/// [`ReplayError::OtherBuild`] unless `log` is for the build whose WASM hash is `build`.
+fn same_build(log: &TickLog, build: u64) -> Result<(), ReplayError> {
+    if log.wasm_hash == build {
+        Ok(())
+    } else {
+        Err(ReplayError::OtherBuild { log: log.wasm_hash, build })
+    }
+}
+
 /// Compiles the build in `dir` and keeps its compiled code beside it, so the loads that follow
 /// don't compile it again (`cache`).
 pub fn precompile(dir: impl AsRef<Path>) -> Result<()> {
@@ -462,8 +471,10 @@ impl CpuBuild {
     }
 
     /// Replays a tick log (`wrela-host --replay`): `init`, then each of the log's ticks
-    /// ([`CpuHost::replay_ticks`]). How many ticks replayed.
+    /// ([`CpuHost::replay_ticks`]). How many ticks replayed. A log for another build fails
+    /// before the program starts.
     pub fn replay(&self, log: &TickLog, workers: u32) -> Result<u32, ReplayError> {
+        same_build(log, self.wasm_hash)?;
         let mut host = self
             .hashing_host(workers)
             .map_err(|error| ReplayError::Failed { tick: None, error })?;
@@ -608,9 +619,7 @@ impl CpuHost {
     /// names it. Ask for hashes before `init` ([`CpuHost::want_hashes`]), or the first world's
     /// has none.
     pub fn replay_ticks(&mut self, log: &TickLog, ticks: u32) -> Result<(), ReplayError> {
-        if log.wasm_hash != self.wasm_hash {
-            return Err(ReplayError::OtherBuild { log: log.wasm_hash, build: self.wasm_hash });
-        }
+        same_build(log, self.wasm_hash)?;
         let hz = self.ticker_hz().ok_or(ReplayError::NoTicker)?;
         if hz != log.hz {
             return Err(ReplayError::OtherRate { log: log.hz, ticker: hz });

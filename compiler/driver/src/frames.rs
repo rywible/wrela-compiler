@@ -190,12 +190,9 @@ fn run_one(
             }
             let in_tick = |k| format!("in tick {k} of {ticks}");
             match log {
-                // The log's records, each tick's state hash checked against the log's.
+                // The log's records, each tick's state hash checked against the log's. A log for
+                // another build or rate says so first, whatever its length.
                 Some(log) => {
-                    if log.ticks.len() < ticks as usize {
-                        let n = log.ticks.len();
-                        return mismatch(format!("its tick log has {n} ticks, not {ticks}"));
-                    }
                     if let Err(e) = host.replay_ticks(log, ticks) {
                         return match e {
                             wrela_host::ReplayError::Failed { tick, error } => {
@@ -203,6 +200,10 @@ fn run_one(
                             }
                             why => mismatch(format!("its tick log doesn't replay: {why}")),
                         };
+                    }
+                    if log.ticks.len() < ticks as usize {
+                        let n = log.ticks.len();
+                        return mismatch(format!("its tick log has {n} ticks, not {ticks}"));
                     }
                 }
                 None => {
