@@ -1,0 +1,146 @@
+// Vectors of i32s, u32s and f64s (compiler/tests/tests/suite/numerics.rs). The first frame
+// computes `mixed` of `INPUTS` inputs on the CPU and the GPU, into the program's two newest
+// buffers (the CPU's, then the GPU's), which must hold the same bytes. Values stay small, so
+// no component overflows (the CPU traps where the GPU wraps). The `@test`s check the CPU's
+// values.
+
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch, write}
+use std::mem::size_of
+
+pub const INPUTS: u32 = 256
+
+/// Input `i`'s three numbers, each below 2^12.
+fn input(i: u32) -> vec3u {
+    var x: u32 = 2463534242 ^ i
+    var out = vec3u()
+    for k in 0..3 {
+        x = x ^ (x << 13)
+        x = x ^ (x >> 17)
+        x = x ^ (x << 5)
+        out[k] = x >> 20
+    }
+    out
+}
+
+/// What integer vectors compute: arithmetic, shifts and bits, built-ins, conversions to and
+/// from float vectors, and swizzles.
+struct Mixed: Copy + GpuData {
+    sum: vec3u,
+    diff: vec3i,
+    prod: vec4i,
+    quot: vec3u,
+    rem: vec3u,
+    shifted: vec3u,
+    bits: vec3u,
+    least: vec3i,
+    clamped: vec3i,
+    sign_abs: vec3i,
+    cell: vec3i,
+    floats: vec3,
+    picked: vec2u,
+    dotted: u32,
+    same: u32,
+}
+
+fn mixed(i: u32) -> Mixed {
+    let a = input(i)
+    let b = input(i + 1000) + vec3u(1)
+    let s = vec3i(a) - vec3i(2048)
+    let t = vec3i(b) - vec3i(2048)
+    Mixed {
+        sum: a + b * 3,
+        diff: s - t,
+        prod: vec4i(s * 2, -t.x) * vec4i(3, -1, 2, 1),
+        quot: a / b,
+        rem: a % b,
+        shifted: (a << vec3u(1, 2, 3)) + (b >> 2),
+        bits: (a & b) | (a ^ vec3u(255)),
+        least: min(s, t) + max(s, vec3i(0)),
+        clamped: clamp(s, vec3i(-100), vec3i(100)),
+        sign_abs: sign(s) * abs(t),
+        cell: vec3i(floor(vec3(s) / 37.5)),
+        floats: vec3(a) * 0.25 + vec3(t),
+        picked: a.zx + b.yy,
+        dotted: dot(a % vec3u(100), b % vec3u(100)),
+        same: u32(a == a) + 2 * u32(a == b),
+    }
+}
+
+@compute(64)
+fn on_gpu(out: mut Slots<Mixed>, id: GlobalId) {
+    out[id] = mixed(id.x)
+}
+
+pub struct Game {
+    cpu: GpuBuffer<Mixed>,
+    gpu: GpuBuffer<Mixed>,
+    done: bool,
+}
+
+pub fn init() -> Game {
+    Game { cpu: buffer(INPUTS), gpu: buffer(INPUTS), done: false }
+}
+
+pub fn frame(game: mut Game, time: f32, width: u32, height: u32) {
+    if game.done {
+        return
+    }
+    let values = Vec::from_fn(INPUTS, |i| mixed(i))
+    write(mut game.cpu, 0, values)
+    dispatch(on_gpu.bind(out: mut game.gpu), groups: INPUTS / 64)
+    game.done = true
+}
+
+/// A component overflows on the CPU as a scalar does: it traps.
+pub fn overflow() -> i32 {
+    let a = vec2i(2147483647, 0)
+    (a + vec2i(1, 0)).x
+}
+
+@test
+fn integer_vectors() {
+    let a = vec3i(1, -2, 3)
+    let b = vec3i(4, 5, -6)
+    let c = a + b * 2
+    assert(c == vec3i(9, 8, -9))
+    assert(c.x == 9 && c.yz == vec2i(8, -9))
+    assert(dot(a, b) == 4 - 10 - 18)
+    assert(abs(a) == vec3i(1, 2, 3) && min(a, b) == vec3i(1, -2, -6) && -a == vec3i(-1, 2, -3))
+    let u = vec3u(7, 8, 9)
+    assert((u >> 1) == vec3u(3, 4, 4) && (u & vec3u(1)) == vec3u(1, 0, 1))
+    assert(u % 4 == vec3u(3, 0, 1) && u / 2 == vec3u(3, 4, 4))
+    // Float to integer truncates; integer to integer keeps the low bits.
+    let cell = vec3u(vec3(2.7, 0.2, 5.9))
+    assert(cell == vec3u(2, 0, 5) && vec3(cell) * 0.5 == vec3(1.0, 0.0, 2.5))
+    assert(vec2u(vec2i(-1, 2)) == vec2u(4294967295, 2))
+    var g = vec4i(0)
+    g.w = 4
+    g[1] = 2
+    assert(g == vec4i(0, 2, 0, 4))
+}
+
+@test
+fn double_vectors() {
+    let p = vec3d(1.0, 2.0, 2.0)
+    assert(length(p) == 3.0 && distance(p, vec3d(1.0, 2.0, 0.0)) == 2.0)
+    let q = normalize(p) * 3.0
+    assert(abs(q.x - 1.0) < 1e-15 && abs(q.y - 2.0) < 1e-15)
+    assert(cross(vec3d(1.0, 0.0, 0.0), vec3d(0.0, 1.0, 0.0)) == vec3d(0.0, 0.0, 1.0))
+    // f64 keeps what f32 rounds away.
+    let x = vec2d(0.1, 0.2) + vec2d(1e-9)
+    assert(x.x == 0.1 + 1e-9 && vec3(p) == vec3(1.0, 2.0, 2.0))
+    // Aligned as their components: a Vec of them, and one in a struct.
+    let v = Vec::from_fn(5, |i| vec4d(f64(i)) * 0.5)
+    assert(v[4] == vec4d(2.0) && size_of::<vec3d>() == 24)
+    let pair = (u8(1), vec3d(3.0))
+    assert(pair.1.z == 3.0)
+}
+
+@test
+fn vectors_format_and_compare() {
+    let a = vec3i(1, -2, 3)
+    assert(f"{a}" == "(1, -2, 3)" && f"{vec2u(4, 5)}" == "(4, 5)")
+    let s = f"{vec2d(0.5, 1.0)}"
+    assert(s == "(0.5, 1)" && f"{vec2(0.5, 1.0)}" == s)
+    assert(a == vec3i(1, -2, 3) && a != vec3i(1, 2, 3))
+}

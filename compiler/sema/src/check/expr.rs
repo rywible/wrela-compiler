@@ -672,9 +672,15 @@ impl<'p> Checker<'p> {
                     Diagnostic::new(
                         codes::E0212,
                         span,
-                        format!("`{tname}::{}` names no implementation, so it can only be called here", name.name),
+                        format!(
+                            "`{tname}::{}` names no implementation, so it can only be called here",
+                            name.name
+                        ),
                     )
-                    .with_help(format!("name the type whose implementation it is, as in `T::{}` with `T: {tname}`", name.name)),
+                    .with_help(format!(
+                        "name the type whose implementation it is, as in `T::{}` with `T: {tname}`",
+                        name.name
+                    )),
                 );
                 self.error_expr(span)
             }
@@ -785,11 +791,8 @@ impl<'p> Checker<'p> {
         let ok = match op {
             UnOp::Neg => match k {
                 TyKind::Int(it) => it.signed(),
-                TyKind::Float(_)
-                | TyKind::Vec(_)
-                | TyKind::Mat(_)
-                | TyKind::Error
-                | TyKind::Never => true,
+                TyKind::Vec(e, _) => *e != VecElem::U32,
+                TyKind::Float(_) | TyKind::Mat(_) | TyKind::Error | TyKind::Never => true,
                 TyKind::Var(_) => vk != Some(VarKind::General),
                 _ => false,
             },
@@ -1077,7 +1080,7 @@ impl<'p> Checker<'p> {
                 let ok = match k {
                     TyKind::Int(_) | TyKind::Float(_) => true,
                     TyKind::Var(_) => self.is_number_var(a),
-                    TyKind::Bool | TyKind::Vec(_) => !ordered,
+                    TyKind::Bool | TyKind::Vec(..) => !ordered,
                     &TyKind::Adt(adt, _) => {
                         !ordered
                             && self.p.adt(adt).is_enum()
@@ -1104,6 +1107,9 @@ impl<'p> Checker<'p> {
                 if self.infer.unify(&self.p.types, a, b).is_err() {
                     return fail(self);
                 }
+                if self.is_int_vec(a) {
+                    return Some(a);
+                }
                 if self.is_intlike(a) || matches!(self.kind(a), TyKind::Bool) {
                     self.int_only(a, op.text(), span);
                     Some(a)
@@ -1113,6 +1119,17 @@ impl<'p> Checker<'p> {
             }
             BinOp::Shl | BinOp::Shr => {
                 let u = self.p.types.u32;
+                // An integer vector shifts each component, by one amount or by a `u32` each.
+                if let &TyKind::Vec(e, n) = self.kind(a)
+                    && e != VecElem::F32
+                    && e != VecElem::F64
+                {
+                    let each = self.p.types.vec_of(VecElem::U32, n);
+                    if !self.try_unify(b, u) && !self.try_unify(b, each) {
+                        return fail(self);
+                    }
+                    return Some(a);
+                }
                 if !self.is_intlike(a) || self.infer.unify(&self.p.types, b, u).is_err() {
                     return fail(self);
                 }
@@ -1137,7 +1154,8 @@ impl<'p> Checker<'p> {
                 }
                 self.pows.push((a, b, span));
                 match self.kind(a) {
-                    TyKind::Float(_) | TyKind::Vec(_) => Some(a),
+                    TyKind::Float(_) => Some(a),
+                    TyKind::Vec(e, _) if e.is_float() => Some(a),
                     // A literal is a float literal, still open: `2.0 ** 3.0` may be an `f64`.
                     TyKind::Var(_) if self.is_number_var(a) => {
                         let f = self.new_var(VarKind::Float, span);
@@ -1152,16 +1170,23 @@ impl<'p> Checker<'p> {
                 }
             }
             BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
-                // Vector and scalar, matrix and vector.
+                // Vector and scalar (its component's type), matrix and vector.
+                let scalar =
+                    |k: &TyKind| matches!(k, TyKind::Float(_) | TyKind::Int(_) | TyKind::Var(_));
+                let comp_of = |this: &Self, k: &TyKind| match k {
+                    &TyKind::Vec(e, _) => this.p.types.elem(e),
+                    _ => f32,
+                };
                 match (&ka, &kb) {
-                    (TyKind::Vec(_), TyKind::Float(_) | TyKind::Var(_))
-                    | (TyKind::Mat(_), TyKind::Float(_) | TyKind::Var(_))
-                        if !matches!(kb, TyKind::Var(_)) || self.is_number_var(b) =>
+                    (TyKind::Vec(..) | TyKind::Mat(_), _)
+                        if scalar(kb)
+                            && (!matches!(kb, TyKind::Var(_)) || self.is_number_var(b)) =>
                     {
+                        let c = comp_of(self, ka);
                         if matches!(kb, TyKind::Var(_)) {
-                            let _ = self.infer.unify(&self.p.types, b, f32);
+                            let _ = self.infer.unify(&self.p.types, b, c);
                         }
-                        if self.shallow(b) != f32 {
+                        if self.shallow(b) != c {
                             return fail(self);
                         }
                         if matches!(ka, TyKind::Mat(_)) && !matches!(op, BinOp::Mul) {
@@ -1169,13 +1194,15 @@ impl<'p> Checker<'p> {
                         }
                         return Some(a);
                     }
-                    (TyKind::Float(_) | TyKind::Var(_), TyKind::Vec(_) | TyKind::Mat(_))
-                        if !matches!(ka, TyKind::Var(_)) || self.is_number_var(a) =>
+                    (_, TyKind::Vec(..) | TyKind::Mat(_))
+                        if scalar(ka)
+                            && (!matches!(ka, TyKind::Var(_)) || self.is_number_var(a)) =>
                     {
+                        let c = comp_of(self, kb);
                         if matches!(ka, TyKind::Var(_)) {
-                            let _ = self.infer.unify(&self.p.types, a, f32);
+                            let _ = self.infer.unify(&self.p.types, a, c);
                         }
-                        if self.shallow(a) != f32
+                        if self.shallow(a) != c
                             || matches!(op, BinOp::Div | BinOp::Rem) && matches!(kb, TyKind::Mat(_))
                         {
                             return fail(self);
@@ -1185,7 +1212,8 @@ impl<'p> Checker<'p> {
                         }
                         return Some(b);
                     }
-                    (TyKind::Mat(n), TyKind::Vec(m)) | (TyKind::Vec(m), TyKind::Mat(n))
+                    (TyKind::Mat(n), TyKind::Vec(VecElem::F32, m))
+                    | (TyKind::Vec(VecElem::F32, m), TyKind::Mat(n))
                         if op == BinOp::Mul =>
                     {
                         if n != m {
@@ -1199,7 +1227,7 @@ impl<'p> Checker<'p> {
                     return fail(self);
                 }
                 match self.kind(a) {
-                    TyKind::Int(_) | TyKind::Float(_) | TyKind::Vec(_) => Some(a),
+                    TyKind::Int(_) | TyKind::Float(_) | TyKind::Vec(..) => Some(a),
                     TyKind::Mat(_) if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul) => Some(a),
                     TyKind::Var(_) if self.is_number_var(a) => Some(a),
                     _ => fail(self),
@@ -1315,7 +1343,7 @@ impl<'p> Checker<'p> {
                     self.error_expr(span)
                 }
             },
-            (TyKind::Vec(n), ast::FieldName::Ident(id)) => {
+            (&TyKind::Vec(e, ref n), ast::FieldName::Ident(id)) => {
                 let comps: Option<Vec<u8>> = id
                     .name
                     .chars()
@@ -1337,9 +1365,9 @@ impl<'p> Checker<'p> {
                             && !mixed =>
                     {
                         let ty = if cs.len() == 1 {
-                            self.p.types.f32
+                            self.p.types.elem(e)
                         } else {
-                            self.p.types.vec(cs.len() as u8)
+                            self.p.types.vec_of(e, cs.len() as u8)
                         };
                         Expr { ty, span, kind: ExprKind::Swizzle(Box::new(b), cs) }
                     }
@@ -1348,10 +1376,15 @@ impl<'p> Checker<'p> {
                             Diagnostic::new(
                                 codes::E0317,
                                 id.span,
-                                format!("`.{}` isn't a component of a `vec{n}`", id.name),
+                                format!(
+                                    "`.{}` isn't a component of a `{}`",
+                                    id.name,
+                                    self.display(b.ty)
+                                ),
                             )
                             .with_note(format!(
-                                "a `vec{n}`'s components are {}",
+                                "a `{}`'s components are {}",
+                                self.display(b.ty),
                                 ["x", "y", "z", "w"][..*n as usize].join(", ")
                             )),
                         );
@@ -1465,17 +1498,17 @@ impl<'p> Checker<'p> {
             // A number converts; a vector has components to choose from.
             self.err(match self.kind(i.ty) {
                 TyKind::Int(_) | TyKind::Float(_) => d.with_help("convert it: `u32(i)`"),
-                TyKind::Vec(_) => d.with_help("index with one of its components: `[v.x]`"),
+                TyKind::Vec(..) => d.with_help("index with one of its components: `[v.x]`"),
                 _ => d,
             });
         }
         // A vector's or matrix's components are fixed: a literal index past them is caught here
         // (a computed one traps at run time, like an array's).
-        if let (TyKind::Vec(n) | TyKind::Mat(n), ExprKind::Lit(Lit::Int(v))) = (&k, &i.kind)
+        if let (TyKind::Vec(_, n) | TyKind::Mat(n), ExprKind::Lit(Lit::Int(v))) = (&k, &i.kind)
             && *v >= i128::from(*n)
         {
             let shown = self.display(b.ty);
-            let what = if matches!(k, TyKind::Vec(_)) { "components" } else { "columns" };
+            let what = if matches!(k, TyKind::Vec(..)) { "components" } else { "columns" };
             self.err(Diagnostic::new(
                 codes::E0312,
                 i.span,
@@ -1484,7 +1517,7 @@ impl<'p> Checker<'p> {
         }
         let elem = match k {
             TyKind::Array(t, _) | TyKind::ArrayN(t, _) | TyKind::Slice(t) => *t,
-            TyKind::Vec(_) => self.p.types.f32,
+            &TyKind::Vec(e, _) => self.p.types.elem(e),
             TyKind::Mat(n) => self.p.types.vec(*n),
             TyKind::Error => self.p.types.error,
             _ if let Some(t) = self.vec_elem(b.ty) => t,
@@ -1767,7 +1800,7 @@ impl<'p> Checker<'p> {
             TyKind::Float(_) => "0.0".into(),
             TyKind::Int(_) => "0".into(),
             TyKind::Bool => "false".into(),
-            TyKind::Vec(n) => format!("vec{n}()"),
+            TyKind::Vec(..) => format!("{}()", self.display(t)),
             _ => return None,
         })
     }

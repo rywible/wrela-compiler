@@ -383,6 +383,141 @@ impl Serialize for vec4 {
     }
 }
 
+impl Serialize for vec2i {
+    fn serialize(self, w: mut Writer) {
+        self.x.serialize(mut w)
+        self.y.serialize(mut w)
+    }
+
+    fn deserialize(r: mut Reader) -> Result<vec2i, LoadError> {
+        let x = i32::deserialize(mut r)?
+        let y = i32::deserialize(mut r)?
+        Ok(vec2i(x, y))
+    }
+}
+
+impl Serialize for vec3i {
+    fn serialize(self, w: mut Writer) {
+        self.x.serialize(mut w)
+        self.y.serialize(mut w)
+        self.z.serialize(mut w)
+    }
+
+    fn deserialize(r: mut Reader) -> Result<vec3i, LoadError> {
+        let x = i32::deserialize(mut r)?
+        let y = i32::deserialize(mut r)?
+        let z = i32::deserialize(mut r)?
+        Ok(vec3i(x, y, z))
+    }
+}
+
+impl Serialize for vec4i {
+    fn serialize(self, w: mut Writer) {
+        self.x.serialize(mut w)
+        self.y.serialize(mut w)
+        self.z.serialize(mut w)
+        self.w.serialize(mut w)
+    }
+
+    fn deserialize(r: mut Reader) -> Result<vec4i, LoadError> {
+        let x = i32::deserialize(mut r)?
+        let y = i32::deserialize(mut r)?
+        let z = i32::deserialize(mut r)?
+        let w = i32::deserialize(mut r)?
+        Ok(vec4i(x, y, z, w))
+    }
+}
+
+impl Serialize for vec2u {
+    fn serialize(self, w: mut Writer) {
+        self.x.serialize(mut w)
+        self.y.serialize(mut w)
+    }
+
+    fn deserialize(r: mut Reader) -> Result<vec2u, LoadError> {
+        let x = u32::deserialize(mut r)?
+        let y = u32::deserialize(mut r)?
+        Ok(vec2u(x, y))
+    }
+}
+
+impl Serialize for vec3u {
+    fn serialize(self, w: mut Writer) {
+        self.x.serialize(mut w)
+        self.y.serialize(mut w)
+        self.z.serialize(mut w)
+    }
+
+    fn deserialize(r: mut Reader) -> Result<vec3u, LoadError> {
+        let x = u32::deserialize(mut r)?
+        let y = u32::deserialize(mut r)?
+        let z = u32::deserialize(mut r)?
+        Ok(vec3u(x, y, z))
+    }
+}
+
+impl Serialize for vec4u {
+    fn serialize(self, w: mut Writer) {
+        self.x.serialize(mut w)
+        self.y.serialize(mut w)
+        self.z.serialize(mut w)
+        self.w.serialize(mut w)
+    }
+
+    fn deserialize(r: mut Reader) -> Result<vec4u, LoadError> {
+        let x = u32::deserialize(mut r)?
+        let y = u32::deserialize(mut r)?
+        let z = u32::deserialize(mut r)?
+        let w = u32::deserialize(mut r)?
+        Ok(vec4u(x, y, z, w))
+    }
+}
+
+impl Serialize for vec2d {
+    fn serialize(self, w: mut Writer) {
+        self.x.serialize(mut w)
+        self.y.serialize(mut w)
+    }
+
+    fn deserialize(r: mut Reader) -> Result<vec2d, LoadError> {
+        let x = f64::deserialize(mut r)?
+        let y = f64::deserialize(mut r)?
+        Ok(vec2d(x, y))
+    }
+}
+
+impl Serialize for vec3d {
+    fn serialize(self, w: mut Writer) {
+        self.x.serialize(mut w)
+        self.y.serialize(mut w)
+        self.z.serialize(mut w)
+    }
+
+    fn deserialize(r: mut Reader) -> Result<vec3d, LoadError> {
+        let x = f64::deserialize(mut r)?
+        let y = f64::deserialize(mut r)?
+        let z = f64::deserialize(mut r)?
+        Ok(vec3d(x, y, z))
+    }
+}
+
+impl Serialize for vec4d {
+    fn serialize(self, w: mut Writer) {
+        self.x.serialize(mut w)
+        self.y.serialize(mut w)
+        self.z.serialize(mut w)
+        self.w.serialize(mut w)
+    }
+
+    fn deserialize(r: mut Reader) -> Result<vec4d, LoadError> {
+        let x = f64::deserialize(mut r)?
+        let y = f64::deserialize(mut r)?
+        let z = f64::deserialize(mut r)?
+        let w = f64::deserialize(mut r)?
+        Ok(vec4d(x, y, z, w))
+    }
+}
+
 impl Serialize for String {
     fn serialize(self, w: mut Writer) {
         w.write_str(self)

@@ -97,7 +97,18 @@ impl<'a> Cx<'a> {
                 }
                 Some(mb.m.types.scalar(s))
             }
-            TyKind::Vec(n) => Some(mb.m.types.vector(*n)),
+            &TyKind::Vec(e, n) => {
+                let s = match e {
+                    VecElem::F32 => ir::Scalar::F32,
+                    VecElem::I32 => ir::Scalar::I32,
+                    VecElem::U32 => ir::Scalar::U32,
+                    VecElem::F64 => ir::Scalar::F64,
+                };
+                if gpu && !e.on_gpu() {
+                    self.cpu_only(mb, &format!("vec{n}d"), span);
+                }
+                Some(mb.m.types.vector_of(s, n))
+            }
             TyKind::Mat(n) => Some(mb.m.types.intern(ir::TypeDef::Matrix(*n))),
             // A run of UTF-8: a run of bytes, on the CPU.
             TyKind::Str => {

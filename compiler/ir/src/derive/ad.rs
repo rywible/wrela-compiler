@@ -9,7 +9,7 @@ use std::collections::HashMap;
 fn dims(m: &Module, t: TypeId) -> Result<u8> {
     match m.types.get(t) {
         TypeDef::Scalar(Scalar::F32) => Ok(1),
-        TypeDef::Vector(n) => Ok(*n),
+        TypeDef::Vector(Scalar::F32, n) => Ok(*n),
         _ => Err(Error::not_derivable(format!(
             "a gradient needs an `f32` or a float vector, not `{}`",
             m.types.display(t)
@@ -972,7 +972,7 @@ impl Ad<'_> {
                     let b = self.m.types.bool();
                     let pos = self.emit(out, b, Expr::Binary(BinOp::Gt, v, zero));
                     let n = match self.m.types.get(a0ty) {
-                        TypeDef::Vector(n) => *n,
+                        TypeDef::Vector(_, n) => *n,
                         _ => 3,
                     };
                     let one = self.fc(out, ty, 1.0);

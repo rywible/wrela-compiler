@@ -61,8 +61,8 @@ impl Scalar {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum TypeDef {
     Scalar(Scalar),
-    /// An f32 vector of 2 to 4 components.
-    Vector(u8),
+    /// A vector of 2 to 4 components: f32s, i32s, u32s, or (CPU only) f64s.
+    Vector(Scalar, u8),
     /// A square f32 matrix of 2 to 4 columns.
     Matrix(u8),
     Struct {
@@ -108,10 +108,10 @@ impl Types {
         // `v[i]`) looks them up.
         match d {
             TypeDef::Matrix(n) => {
-                self.intern(TypeDef::Vector(n));
+                self.intern(TypeDef::Vector(Scalar::F32, n));
             }
-            TypeDef::Vector(_) => {
-                self.intern(TypeDef::Scalar(Scalar::F32));
+            TypeDef::Vector(s, _) => {
+                self.intern(TypeDef::Scalar(s));
             }
             _ => {}
         }
@@ -157,8 +157,13 @@ impl Types {
     pub fn u32(&mut self) -> TypeId {
         self.scalar(Scalar::U32)
     }
+    /// An f32 vector.
     pub fn vector(&mut self, n: u8) -> TypeId {
-        self.intern(TypeDef::Vector(n))
+        self.intern(TypeDef::Vector(Scalar::F32, n))
+    }
+
+    pub fn vector_of(&mut self, s: Scalar, n: u8) -> TypeId {
+        self.intern(TypeDef::Vector(s, n))
     }
 
     pub fn as_scalar(&self, t: TypeId) -> Option<Scalar> {
@@ -168,11 +173,11 @@ impl Types {
         }
     }
 
-    /// The scalar type of a scalar, vector or matrix: f32 for vectors and matrices.
+    /// The scalar type of a scalar, vector or matrix: a vector's components', a matrix's f32.
     pub fn element_scalar(&self, t: TypeId) -> Option<Scalar> {
         match self.get(t) {
-            TypeDef::Scalar(s) => Some(*s),
-            TypeDef::Vector(_) | TypeDef::Matrix(_) => Some(Scalar::F32),
+            TypeDef::Scalar(s) | TypeDef::Vector(s, _) => Some(*s),
+            TypeDef::Matrix(_) => Some(Scalar::F32),
             _ => None,
         }
     }
@@ -188,7 +193,12 @@ impl Types {
     }
 
     pub fn is_vector(&self, t: TypeId) -> bool {
-        matches!(self.get(t), TypeDef::Vector(_))
+        matches!(self.get(t), TypeDef::Vector(..))
+    }
+
+    /// Whether it's an f32 vector: what derivations, intervals and the CPU's SIMD handle.
+    pub fn is_f32_vector(&self, t: TypeId) -> bool {
+        matches!(self.get(t), TypeDef::Vector(Scalar::F32, _))
     }
 
     /// Whether the type lives in memory on the CPU (everything but scalars and pointers).
@@ -202,7 +212,8 @@ impl Types {
         match self.get(t) {
             TypeDef::Scalar(s) => s.is_float(),
             TypeDef::Atomic(_) => false,
-            TypeDef::Vector(_) | TypeDef::Matrix(_) => true,
+            TypeDef::Vector(s, _) => s.is_float(),
+            TypeDef::Matrix(_) => true,
             TypeDef::Struct { fields, .. } => fields.iter().any(|(_, f)| self.has_float(*f)),
             TypeDef::Enum { variants, .. } => {
                 variants.iter().any(|(_, p)| p.is_some_and(|p| self.has_float(p)))
@@ -216,7 +227,13 @@ impl Types {
     pub fn display(&self, t: TypeId) -> String {
         match self.get(t) {
             TypeDef::Scalar(s) => s.name().to_string(),
-            TypeDef::Vector(n) => format!("vec{n}"),
+            TypeDef::Vector(s, n) => match s {
+                Scalar::F32 => format!("vec{n}"),
+                Scalar::F64 => format!("vec{n}d"),
+                Scalar::I32 => format!("vec{n}i"),
+                Scalar::U32 => format!("vec{n}u"),
+                _ => format!("vec{n}<{}>", s.name()),
+            },
             TypeDef::Matrix(n) => format!("mat{n}"),
             TypeDef::Struct { name, .. } | TypeDef::Enum { name, .. } => name.clone(),
             TypeDef::Array(e, n) => format!("[{}; {n}]", self.display(*e)),

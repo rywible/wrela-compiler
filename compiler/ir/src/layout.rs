@@ -43,11 +43,12 @@ fn scalar_layout(s: Scalar) -> Layout {
     Layout { size: n, align: n }
 }
 
-fn vector_layout(n: u8) -> Layout {
+/// WGSL's vector layout (a `vec3` aligned as a `vec4`), for components of `c` bytes.
+fn vector_layout(n: u8, c: u32) -> Layout {
     match n {
-        2 => Layout { size: 8, align: 8 },
-        3 => Layout { size: 12, align: 16 },
-        _ => Layout { size: 16, align: 16 },
+        2 => Layout { size: 2 * c, align: 2 * c },
+        3 => Layout { size: 3 * c, align: 4 * c },
+        _ => Layout { size: 4 * c, align: 4 * c },
     }
 }
 
@@ -60,9 +61,11 @@ pub fn layout(types: &Types, t: TypeId) -> Layout {
 pub(crate) fn compute(types: &Types, d: &TypeDef) -> (Layout, Box<[u32]>) {
     let layout = match d {
         TypeDef::Scalar(s) | TypeDef::Atomic(s) => scalar_layout(*s),
-        TypeDef::Vector(n) => vector_layout(*n),
+        // A vector of f64s never reaches the GPU: its natural layout, as an array's.
+        TypeDef::Vector(Scalar::F64, n) => scalar_layout(Scalar::F64).array(u32::from(*n)),
+        TypeDef::Vector(s, n) => vector_layout(*n, scalar_layout(*s).size),
         // Its columns, as an array.
-        TypeDef::Matrix(n) => vector_layout(*n).array(u32::from(*n)),
+        TypeDef::Matrix(n) => vector_layout(*n, 4).array(u32::from(*n)),
         TypeDef::Array(e, n) => types.layout(*e).array(*n),
         TypeDef::RuntimeArray(e) => types.layout(*e).array(1),
         TypeDef::Struct { fields, .. } => {
@@ -152,7 +155,7 @@ pub fn field_offsets(types: &Types, t: TypeId) -> &[u32] {
 
 /// The distance between a `matN`'s columns.
 pub fn column_stride(n: u8) -> u32 {
-    vector_layout(n).stride()
+    vector_layout(n, 4).stride()
 }
 
 /// The distance between consecutive elements of an array of `elem`.
@@ -168,7 +171,8 @@ pub fn uniform_compatible(types: &Types, t: TypeId) -> bool {
         // An enum never reaches the GPU.
         TypeDef::Enum { .. } => false,
         TypeDef::Scalar(s) => s.on_gpu() && *s != Scalar::Bool,
-        TypeDef::Vector(_) | TypeDef::Matrix(_) => true,
+        TypeDef::Vector(s, _) => s.on_gpu(),
+        TypeDef::Matrix(_) => true,
         TypeDef::Array(e, _) => {
             array_stride(types, *e).is_multiple_of(16) && uniform_compatible(types, *e)
         }

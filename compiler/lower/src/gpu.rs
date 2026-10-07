@@ -1673,7 +1673,7 @@ fn lower_render(cx: &mut Cx, iface: Rc<Interface>) -> Option<PipelineOut> {
     cx.drain(&mut mb);
     if blend {
         // An `Over` is its colour: the entry point returns the `vec4` WGSL blends.
-        let v4 = mb.m.types.intern(ir::TypeDef::Vector(4));
+        let v4 = mb.m.types.vector(4);
         let f = &mut mb.m.functions[fentry.index()];
         unwrap_returns(f, v4);
     }

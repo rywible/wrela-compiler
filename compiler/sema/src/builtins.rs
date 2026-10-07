@@ -2,7 +2,7 @@
 //! (language.md §17) that isn't written in wrela. They're in scope everywhere (the prelude).
 
 use crate::program::Program;
-use crate::ty::{FloatTy, IntTy, TyId, TyKind, Types};
+use crate::ty::{FloatTy, IntTy, TyId, TyKind, Types, VecElem};
 
 /// A type name in the prelude.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -10,7 +10,7 @@ pub enum BuiltinTy {
     Bool,
     Int(IntTy),
     Float(FloatTy),
-    Vec(u8),
+    Vec(VecElem, u8),
     Mat(u8),
     /// `str`: a borrowed run of UTF-8.
     Str,
@@ -30,9 +30,18 @@ impl BuiltinTy {
             "u64" => BuiltinTy::Int(IntTy::U64),
             "f32" => BuiltinTy::Float(FloatTy::F32),
             "f64" => BuiltinTy::Float(FloatTy::F64),
-            "vec2" => BuiltinTy::Vec(2),
-            "vec3" => BuiltinTy::Vec(3),
-            "vec4" => BuiltinTy::Vec(4),
+            "vec2" => BuiltinTy::Vec(VecElem::F32, 2),
+            "vec3" => BuiltinTy::Vec(VecElem::F32, 3),
+            "vec4" => BuiltinTy::Vec(VecElem::F32, 4),
+            "vec2i" => BuiltinTy::Vec(VecElem::I32, 2),
+            "vec3i" => BuiltinTy::Vec(VecElem::I32, 3),
+            "vec4i" => BuiltinTy::Vec(VecElem::I32, 4),
+            "vec2u" => BuiltinTy::Vec(VecElem::U32, 2),
+            "vec3u" => BuiltinTy::Vec(VecElem::U32, 3),
+            "vec4u" => BuiltinTy::Vec(VecElem::U32, 4),
+            "vec2d" => BuiltinTy::Vec(VecElem::F64, 2),
+            "vec3d" => BuiltinTy::Vec(VecElem::F64, 3),
+            "vec4d" => BuiltinTy::Vec(VecElem::F64, 4),
             "mat2" => BuiltinTy::Mat(2),
             "mat3" => BuiltinTy::Mat(3),
             "mat4" => BuiltinTy::Mat(4),
@@ -46,7 +55,7 @@ impl BuiltinTy {
             BuiltinTy::Bool => TyKind::Bool,
             BuiltinTy::Int(i) => TyKind::Int(i),
             BuiltinTy::Float(f) => TyKind::Float(f),
-            BuiltinTy::Vec(n) => TyKind::Vec(n),
+            BuiltinTy::Vec(e, n) => TyKind::Vec(e, n),
             BuiltinTy::Mat(n) => TyKind::Mat(n),
             BuiltinTy::Str => TyKind::Str,
         })
@@ -217,9 +226,14 @@ impl BuiltinFn {
     pub fn result(self, p: &Program, args: &[TyId]) -> Result<TyId, String> {
         use BuiltinFn::*;
         let types = &p.types;
-        let float_like = |t: TyId| matches!(types.kind(t), TyKind::Float(_) | TyKind::Vec(_));
-        let numeric = |t: TyId| float_like(t) || types.is_int(t);
-        let is_vec = |t: TyId| matches!(types.kind(t), TyKind::Vec(_));
+        let float_like = |t: TyId| match types.kind(t) {
+            TyKind::Float(_) => true,
+            TyKind::Vec(e, _) => e.is_float(),
+            _ => false,
+        };
+        let numeric =
+            |t: TyId| float_like(t) || types.is_int(t) || matches!(types.kind(t), TyKind::Vec(..));
+        let is_vec = |t: TyId| matches!(types.kind(t), TyKind::Vec(..));
         // `t` if `ok`; otherwise that this function takes `what`, not a `t`.
         let takes = |ok: bool, what: &str, t: TyId| {
             if ok {
@@ -244,8 +258,8 @@ impl BuiltinFn {
         };
         match self {
             Sqrt | InverseSqrt | Sin | Cos | Tan | Asin | Acos | Atan | Exp | Exp2 | Log | Log2
-            | Sinh | Cosh | Tanh | Floor | Ceil | Round | Trunc | Fract | Saturate | Normalize | Dpdx | Dpdy
-            | Fwidth => {
+            | Sinh | Cosh | Tanh | Floor | Ceil | Round | Trunc | Fract | Saturate | Normalize
+            | Dpdx | Dpdy | Fwidth => {
                 let t = takes(float_like(args[0]), "a float or float vector", args[0])?;
                 if self == Normalize { takes(is_vec(t), "a vector", t) } else { Ok(t) }
             }
@@ -274,7 +288,7 @@ impl BuiltinFn {
                 takes(float_like(t), "floats or float vectors", t)?;
                 let third = args[2];
                 let or_f32 = self == Mix && is_vec(t);
-                if third == t || (or_f32 && third == types.f32) {
+                if third == t || (or_f32 && third == scalar_of(types, t)) {
                     Ok(t)
                 } else {
                     Err(format!(
@@ -289,17 +303,21 @@ impl BuiltinFn {
                 let t = takes(float_like(args[0]), "a float or vector", args[0])?;
                 Ok(scalar_of(types, t))
             }
-            Distance | Dot => {
+            Distance => {
                 let t = same(args)?;
                 takes(float_like(t), "float vectors", t)?;
-                if self == Dot {
-                    takes(is_vec(t), "vectors", t)?;
-                }
+                Ok(scalar_of(types, t))
+            }
+            // Of any vectors, integers' too, as WGSL's.
+            Dot => {
+                let t = same(args)?;
+                takes(is_vec(t), "vectors", t)?;
                 Ok(scalar_of(types, t))
             }
             Cross => {
                 let t = same(args)?;
-                takes(t == types.vec3, "two `vec3`s", t)
+                let d3 = types.vec_of(VecElem::F64, 3);
+                takes(t == types.vec3 || t == d3, "two `vec3`s or two `vec3d`s", t)
             }
             Select => {
                 // Any type: per component on a vector, and whole on any other value (the GPU
@@ -360,7 +378,8 @@ impl BuiltinFn {
 /// The scalar type of a scalar or vector type.
 pub fn scalar_of(types: &Types, t: TyId) -> TyId {
     match types.kind(t) {
-        TyKind::Vec(_) | TyKind::Mat(_) => types.f32,
+        &TyKind::Vec(e, _) => types.elem(e),
+        TyKind::Mat(_) => types.f32,
         _ => t,
     }
 }

@@ -300,12 +300,12 @@ pub(super) fn finish_common(c: &mut Checker) {
     // `**` whose base's type settled later.
     for (base, exp, span) in std::mem::take(&mut c.pows) {
         let (b, e) = (c.infer.resolve(&c.p.types, base), c.infer.resolve(&c.p.types, exp));
-        if b == c.p.types.f64 {
+        if crate::builtins::scalar_of(&c.p.types, b) == c.p.types.f64 {
             c.err(crate::builtins::f64_math("**", span));
         }
         let ok = match c.p.types.kind(b) {
             TyKind::Int(_) => e == c.p.types.u32,
-            TyKind::Float(_) | TyKind::Vec(_) => e == b,
+            TyKind::Float(_) | TyKind::Vec(..) => e == b,
             _ => true,
         };
         if !ok && !matches!(c.p.types.kind(e), TyKind::Error) {

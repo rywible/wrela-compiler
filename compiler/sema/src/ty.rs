@@ -94,6 +94,58 @@ impl IntTy {
     }
 }
 
+/// What a vector's components are (§4): `vecN`'s f32s, `vecNi`'s i32s, `vecNu`'s u32s, and on
+/// the CPU only, `vecNd`'s f64s.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum VecElem {
+    F32,
+    I32,
+    U32,
+    F64,
+}
+
+impl VecElem {
+    /// What follows `vecN` in the type's name.
+    pub fn suffix(self) -> &'static str {
+        match self {
+            VecElem::F32 => "",
+            VecElem::I32 => "i",
+            VecElem::U32 => "u",
+            VecElem::F64 => "d",
+        }
+    }
+
+    /// A component's type.
+    pub fn kind(self) -> TyKind {
+        match self {
+            VecElem::F32 => TyKind::Float(FloatTy::F32),
+            VecElem::I32 => TyKind::Int(IntTy::I32),
+            VecElem::U32 => TyKind::Int(IntTy::U32),
+            VecElem::F64 => TyKind::Float(FloatTy::F64),
+        }
+    }
+
+    pub fn is_float(self) -> bool {
+        matches!(self, VecElem::F32 | VecElem::F64)
+    }
+
+    /// Whether WGSL has it: all but f64's.
+    pub fn on_gpu(self) -> bool {
+        self != VecElem::F64
+    }
+
+    /// The vector element a scalar type is, if it's one.
+    pub fn of(k: &TyKind) -> Option<VecElem> {
+        match k {
+            TyKind::Float(FloatTy::F32) => Some(VecElem::F32),
+            TyKind::Int(IntTy::I32) => Some(VecElem::I32),
+            TyKind::Int(IntTy::U32) => Some(VecElem::U32),
+            TyKind::Float(FloatTy::F64) => Some(VecElem::F64),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum FloatTy {
     F32,
@@ -180,8 +232,9 @@ pub enum TyKind {
     Bool,
     Int(IntTy),
     Float(FloatTy),
-    /// `vec2`, `vec3`, `vec4`: f32 vectors.
-    Vec(u8),
+    /// `vec2`, `vec3`, `vec4`: f32 vectors; `vec3i`, `vec3u` and (CPU only) `vec3d`: i32, u32
+    /// and f64 vectors.
+    Vec(VecElem, u8),
     /// `mat2`, `mat3`, `mat4`: square f32 matrices, column-major.
     Mat(u8),
     /// `()` is the empty tuple.
@@ -277,9 +330,9 @@ impl Types {
         t.unit = t.intern(TyKind::Tuple(Vec::new()));
         t.never = t.intern(TyKind::Never);
         t.error = t.intern(TyKind::Error);
-        t.vec2 = t.intern(TyKind::Vec(2));
-        t.vec3 = t.intern(TyKind::Vec(3));
-        t.vec4 = t.intern(TyKind::Vec(4));
+        t.vec2 = t.intern(TyKind::Vec(VecElem::F32, 2));
+        t.vec3 = t.intern(TyKind::Vec(VecElem::F32, 3));
+        t.vec4 = t.intern(TyKind::Vec(VecElem::F32, 4));
         t
     }
 
@@ -326,8 +379,18 @@ impl Types {
         self.kinds.len() == 0
     }
 
+    /// An f32 vector.
     pub fn vec(&self, n: u8) -> TyId {
-        self.intern(TyKind::Vec(n))
+        self.intern(TyKind::Vec(VecElem::F32, n))
+    }
+
+    pub fn vec_of(&self, e: VecElem, n: u8) -> TyId {
+        self.intern(TyKind::Vec(e, n))
+    }
+
+    /// A vector element's scalar type.
+    pub fn elem(&self, e: VecElem) -> TyId {
+        self.intern(e.kind())
     }
 
     pub fn int(&self, i: IntTy) -> TyId {
@@ -538,7 +601,7 @@ pub fn children(kind: &TyKind, f: &mut impl FnMut(TyId)) {
         TyKind::Bool
         | TyKind::Int(_)
         | TyKind::Float(_)
-        | TyKind::Vec(_)
+        | TyKind::Vec(..)
         | TyKind::Mat(_)
         | TyKind::Str
         | TyKind::ConstU32(_)

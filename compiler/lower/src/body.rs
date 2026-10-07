@@ -762,6 +762,22 @@ impl<'c, 'a> Fl<'c, 'a> {
         }
     }
 
+    /// A component's type of the vector type `t`.
+    fn comp_ty(&self, t: TyId) -> TyId {
+        match *self.types().kind(t) {
+            TyKind::Vec(e, _) => self.types().elem(e),
+            _ => self.types().f32,
+        }
+    }
+
+    /// The type of `n` of the vector type `t`'s components, a swizzle's.
+    fn swizzled_ty(&self, t: TyId, n: usize) -> TyId {
+        match *self.types().kind(t) {
+            TyKind::Vec(e, _) => self.types().vec_of(e, n as u8),
+            _ => self.types().vec(n as u8),
+        }
+    }
+
     /// Whether `v` is a run.
     pub fn is_run(&self, v: ir::ValueId) -> bool {
         matches!(self.mb.m.types.get(self.f.value_ty(v)), ir::TypeDef::Run(_))
@@ -943,18 +959,18 @@ impl<'c, 'a> Fl<'c, 'a> {
                     mir::Proj::Comp(c) => {
                         path.push(ir::Proj::Comp(cs[*c as usize]));
                         swizzle = None;
-                        ty = self.types().f32;
+                        ty = self.comp_ty(ty);
                     }
                     mir::Proj::Swizzle(more) => {
                         let picked: Vec<u8> = more.iter().map(|&c| cs[c as usize]).collect();
-                        ty = self.types().vec(picked.len() as u8);
+                        ty = self.swizzled_ty(ty, picked.len());
                         swizzle = Some(picked);
                     }
                     mir::Proj::Index(t) => {
                         let iv = self.local_value(*t)?;
                         path.push(ir::Proj::Index(self.swizzle_index(cs, iv)));
                         swizzle = None;
-                        ty = self.types().f32;
+                        ty = self.comp_ty(ty);
                     }
                     _ => return None,
                 }
@@ -984,11 +1000,11 @@ impl<'c, 'a> Fl<'c, 'a> {
                 }
                 mir::Proj::Comp(c) => {
                     path.push(ir::Proj::Comp(*c));
-                    ty = self.types().f32;
+                    ty = self.comp_ty(ty);
                 }
                 mir::Proj::Swizzle(cs) => {
                     swizzle = Some(cs.clone());
-                    ty = self.types().vec(cs.len() as u8);
+                    ty = self.swizzled_ty(ty, cs.len());
                 }
                 mir::Proj::Index(t) => {
                     let iv = self.local_value(*t)?;
@@ -1044,7 +1060,7 @@ impl<'c, 'a> Fl<'c, 'a> {
                     path.push(ir::Proj::Index(iv));
                     ty = match k {
                         TyKind::Array(e, _) | TyKind::Slice(e) => *e,
-                        TyKind::Vec(_) => self.types().f32,
+                        &TyKind::Vec(e, _) => self.types().elem(e),
                         TyKind::Mat(n) => self.types().vec(*n),
                         _ => self.types().error,
                     };
@@ -1195,13 +1211,13 @@ impl<'c, 'a> Fl<'c, 'a> {
                     v = self.value(it, ir::Expr::Extract(v, fi));
                 }
                 mir::Proj::Comp(c) => {
-                    ty = self.types().f32;
-                    let f32 = self.mb.m.types.f32();
-                    v = self.value(f32, ir::Expr::Extract(v, *c as u32));
+                    ty = self.comp_ty(ty);
+                    let ct = self.cx.lower_ty(self.mb, ty, self.code.span)?;
+                    v = self.value(ct, ir::Expr::Extract(v, *c as u32));
                 }
                 mir::Proj::Swizzle(cs) => {
-                    ty = self.types().vec(cs.len() as u8);
-                    let vt = self.mb.m.types.vector(cs.len() as u8);
+                    ty = self.swizzled_ty(ty, cs.len());
+                    let vt = self.cx.lower_ty(self.mb, ty, self.code.span)?;
                     v = self.value(vt, ir::Expr::Swizzle(v, cs.clone()));
                 }
                 _ => return None,
@@ -1220,9 +1236,11 @@ impl<'c, 'a> Fl<'c, 'a> {
         let Some((place, _, swizzle)) = self.place_parts(p) else { return };
         match swizzle {
             Some(cs) => {
-                let f32 = self.mb.m.types.f32();
+                let s =
+                    self.mb.m.types.element_scalar(self.f.value_ty(v)).unwrap_or(ir::Scalar::F32);
+                let ct = self.mb.m.types.scalar(s);
                 for (k, c) in cs.into_iter().enumerate() {
-                    let comp = self.value(f32, ir::Expr::Extract(v, k as u32));
+                    let comp = self.value(ct, ir::Expr::Extract(v, k as u32));
                     self.emit(ir::Stmt::Store(place.with(ir::Proj::Comp(c)), comp));
                 }
             }
@@ -1307,10 +1325,11 @@ impl<'c, 'a> Fl<'c, 'a> {
                 self.array_repeat(x, n, t, span)
             }
             Rvalue::Construct(xs) => self.construct(xs, ty?, span),
+            // A vector converts each component (`vec3(cell)`).
             Rvalue::Convert(x) => {
                 let v = self.operand(x)?;
                 let t = self.ty(ty?, span)?;
-                let s = self.mb.m.types.as_scalar(t)?;
+                let s = self.mb.m.types.element_scalar(t)?;
                 Some(self.value(t, ir::Expr::Convert(v, s)))
             }
             Rvalue::Discriminant(p) => {
@@ -1377,7 +1396,7 @@ impl<'c, 'a> Fl<'c, 'a> {
             let iop = if op == BinOp::Eq { ir::BinOp::Eq } else { ir::BinOp::Ne };
             return Some(self.value(rty, ir::Expr::Binary(iop, ta, tb)));
         }
-        if let TyKind::Vec(_) = self.types().kind(at)
+        if let TyKind::Vec(..) = self.types().kind(at)
             && matches!(op, BinOp::Eq | BinOp::Ne)
         {
             let eq = self.value(rty, ir::Expr::Builtin(ir::Builtin::AllEqual, vec![av, bv]));
@@ -1421,11 +1440,11 @@ impl<'c, 'a> Fl<'c, 'a> {
         Some(self.value(rty, ir::Expr::Binary(iop, av, bv)))
     }
 
-    /// `x` splatted to the type of `like`, if `x` is a scalar `f32` and `like` a vector.
+    /// `x` splatted to the type of `like`, if `x` is a scalar and `like` a vector of it.
     fn splat_to(&mut self, x: ir::ValueId, like: ir::ValueId) -> ir::ValueId {
         let types = &self.mb.m.types;
         match (types.get(self.f.value_ty(x)), types.get(self.f.value_ty(like))) {
-            (ir::TypeDef::Scalar(ir::Scalar::F32), &ir::TypeDef::Vector(n)) => {
+            (&ir::TypeDef::Scalar(s), &ir::TypeDef::Vector(c, n)) if s == c => {
                 let t = self.f.value_ty(like);
                 self.value(t, ir::Expr::Splat(x, n))
             }
@@ -1482,7 +1501,7 @@ impl<'c, 'a> Fl<'c, 'a> {
     fn construct(&mut self, xs: &[mir::Operand], ty: TyId, span: Span) -> Option<ir::ValueId> {
         let t = self.ty(ty, span)?;
         let n = match self.mb.m.types.get(t) {
-            ir::TypeDef::Vector(n) => *n,
+            ir::TypeDef::Vector(_, n) => *n,
             ir::TypeDef::Matrix(_) => {
                 let cols: Vec<ir::ValueId> = xs.iter().filter_map(|x| self.operand(x)).collect();
                 return Some(self.value(t, ir::Expr::Construct(t, cols)));
@@ -1493,20 +1512,20 @@ impl<'c, 'a> Fl<'c, 'a> {
             xs.iter().filter_map(|x| self.operand(x).map(|v| (v, x.ty))).collect();
         let first_is_scalar = vals.len() == 1 && {
             let st = self.concrete(vals[0].1);
-            matches!(self.types().kind(st), TyKind::Float(_))
+            matches!(self.types().kind(st), TyKind::Float(_) | TyKind::Int(_))
         };
         if first_is_scalar && n > 1 {
             return Some(self.value(t, ir::Expr::Splat(vals[0].0, n)));
         }
         // Flatten vectors into components.
-        let f32 = self.mb.m.types.f32();
         let mut comps = Vec::new();
         for (v, vt) in vals {
             let vt = self.concrete(vt);
             match self.types().kind(vt) {
-                &TyKind::Vec(m) => {
+                &TyKind::Vec(e, m) => {
+                    let ct = self.ty(self.types().elem(e), span)?;
                     for c in 0..m {
-                        comps.push(self.value(f32, ir::Expr::Extract(v, c as u32)));
+                        comps.push(self.value(ct, ir::Expr::Extract(v, c as u32)));
                     }
                 }
                 _ => comps.push(v),

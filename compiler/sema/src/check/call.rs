@@ -1193,7 +1193,7 @@ impl<'p> Checker<'p> {
                     | BuiltinFn::Min
                     | BuiltinFn::Max
             );
-            let target = if matches!(self.kind(c), TyKind::Vec(_)) && !broadcasts {
+            let target = if matches!(self.kind(c), TyKind::Vec(..)) && !broadcasts {
                 c
             } else {
                 builtins::scalar_of(&self.p.types, c)
@@ -1249,10 +1249,11 @@ impl<'p> Checker<'p> {
                 | BuiltinFn::Clamp
                 | BuiltinFn::Step
                 | BuiltinFn::Smoothstep
-        ) && let Some(&v) = tys.iter().find(|&&t| matches!(self.p.types.kind(t), TyKind::Vec(_)))
+        ) && let Some(&v) =
+            tys.iter().find(|&&t| matches!(self.p.types.kind(t), TyKind::Vec(..)))
         {
-            let f32 = self.p.types.f32;
-            for (x, t) in xs.iter_mut().zip(&mut tys).filter(|(_, t)| **t == f32) {
+            let scalar = builtins::scalar_of(&self.p.types, v);
+            for (x, t) in xs.iter_mut().zip(&mut tys).filter(|(_, t)| **t == scalar) {
                 // Splat the scalar argument.
                 let at = x.span;
                 let scalar = std::mem::replace(x, Expr { ty: v, span: at, kind: ExprKind::Error });
@@ -1289,7 +1290,9 @@ impl<'p> Checker<'p> {
                 } else {
                     r
                 };
-                if b.cpu_impl().is_some() && ty == self.p.types.f64 {
+                if b.cpu_impl().is_some()
+                    && builtins::scalar_of(&self.p.types, ty) == self.p.types.f64
+                {
                     self.err(crate::builtins::f64_math(b.name(), span));
                 }
                 let stmts = self.bind_in_written_order(&mut xs, &written);
@@ -1602,7 +1605,7 @@ impl<'p> Checker<'p> {
                 );
                 self.error_expr(span)
             }
-            BuiltinTy::Vec(n) => self.vec_ctor(n, ty, args, span),
+            BuiltinTy::Vec(e, n) => self.vec_ctor(e, n, ty, args, span),
             BuiltinTy::Mat(n) => {
                 let col = self.p.types.vec(n);
                 if args.len() != n as usize {
@@ -1695,14 +1698,18 @@ impl<'p> Checker<'p> {
 
     /// `vec3()` is zero, `vec3(s)` splats, `vec3(a, b, c)` and `vec3(v2, z)` concatenate, and
     /// `vec3(y: 1.0)` names components (the rest are zero).
-    fn vec_ctor(&mut self, n: u8, ty: TyId, args: &[ast::Arg], span: Span) -> Expr {
-        let f32 = self.p.types.f32;
+    /// A vector of `n` `e`s: from its components named (the rest zero), none (zeros), its
+    /// components and smaller vectors of its element in order, one component for all, or one
+    /// vector of another element and its size, each component converted (`vec3(cell)`).
+    fn vec_ctor(&mut self, e: VecElem, n: u8, ty: TyId, args: &[ast::Arg], span: Span) -> Expr {
+        let comp = self.p.types.elem(e);
+        let name = format!("vec{n}{}", e.suffix());
         if args.iter().any(|a| a.name.is_some()) {
             let names = ["x", "y", "z", "w"];
             let mut comps: Vec<Option<Expr>> = vec![None; n as usize];
             let mut written = Vec::new();
             for a in args {
-                let Some(name) = &a.name else {
+                let Some(field) = &a.name else {
                     self.err(Diagnostic::new(
                         codes::E0105,
                         a.span,
@@ -1710,66 +1717,72 @@ impl<'p> Checker<'p> {
                     ));
                     continue;
                 };
-                let Some(i) = names[..n as usize].iter().position(|c| *c == name.name) else {
+                let Some(i) = names[..n as usize].iter().position(|c| *c == field.name) else {
                     self.err(Diagnostic::new(
                         codes::E0302,
-                        name.span,
-                        format!("`vec{n}` has no component `{}`", name.name),
+                        field.span,
+                        format!("`{name}` has no component `{}`", field.name),
                     ));
                     continue;
                 };
-                let e = self.check_expect(&a.value, f32);
+                let x = self.check_expect(&a.value, comp);
                 if comps[i].is_some() {
                     self.err(Diagnostic::new(
                         codes::E0304,
-                        name.span,
-                        format!("`{}` is given twice", name.name),
+                        field.span,
+                        format!("`{}` is given twice", field.name),
                     ));
                     continue;
                 }
-                comps[i] = Some(e);
+                comps[i] = Some(x);
                 written.push(i);
             }
-            return self.construct_in_order(ty, comps, &written, span);
+            return self.construct_in_order(ty, comp, comps, &written, span);
         }
         if args.is_empty() {
-            let xs = (0..n)
-                .map(|_| Expr { ty: f32, span, kind: ExprKind::Lit(Lit::Float(0.0, 0.0)) })
-                .collect();
+            let xs = (0..n).map(|_| zero_of(comp, e, span)).collect();
             return Expr { ty, span, kind: ExprKind::Construct(xs) };
         }
         let mut xs = Vec::new();
         let mut count = 0u32;
+        let single = args.len() == 1;
         for a in args {
-            let e = self.check_expr(&a.value, if args.len() == 1 { None } else { Some(f32) });
-            match self.kind(e.ty) {
-                TyKind::Vec(m) => count += u32::from(*m),
-                TyKind::Float(FloatTy::F32) => count += 1,
+            let x = self.check_expr(&a.value, if single { None } else { Some(comp) });
+            match self.kind(x.ty) {
+                &TyKind::Vec(xe, m) if xe == e => count += u32::from(m),
+                // One vector of another element: converted, as `f32(n)` converts a number.
+                &TyKind::Vec(_, m) if single && m == n => {
+                    return Expr { ty, span, kind: ExprKind::Convert(Box::new(x)) };
+                }
+                _ if self.infer.resolve(&self.p.types, x.ty) == comp => count += 1,
                 TyKind::Var(_) => {
-                    let _ = self.infer.unify(&self.p.types, e.ty, f32);
+                    let _ = self.infer.unify(&self.p.types, x.ty, comp);
                     count += 1;
                 }
                 TyKind::Error => count += 1,
                 _ => {
-                    let shown = self.display(e.ty);
+                    let shown = self.display(x.ty);
+                    let c = self.display(comp);
                     let d = Diagnostic::new(
                         codes::E0323,
-                        e.span,
-                        format!("a vector's components are `f32`s or vectors, not `{shown}`"),
+                        x.span,
+                        format!(
+                            "a `{name}`'s components are `{c}`s or vectors of them, not `{shown}`"
+                        ),
                     );
-                    // A number converts; anything else has no `f32` to give.
-                    let number = matches!(self.kind(e.ty), TyKind::Int(_) | TyKind::Float(_));
-                    self.err(if number { d.with_help("convert it: `f32(x)`") } else { d });
+                    // A number converts; anything else has no component to give.
+                    let number = matches!(self.kind(x.ty), TyKind::Int(_) | TyKind::Float(_));
+                    self.err(if number { d.with_help(format!("convert it: `{c}(x)`")) } else { d });
                     count += 1;
                 }
             }
-            xs.push(e);
+            xs.push(x);
         }
-        if !(count == n as u32 || (args.len() == 1 && count == 1)) {
+        if !(count == n as u32 || (single && count == 1)) {
             self.err(Diagnostic::new(
                 codes::E0323,
                 span,
-                format!("`vec{n}` needs {n} components, but these make {count}"),
+                format!("`{name}` needs {n} components, but these make {count}"),
             ));
         }
         Expr { ty, span, kind: ExprKind::Construct(xs) }
@@ -1782,12 +1795,13 @@ impl<'p> Checker<'p> {
     fn construct_in_order(
         &mut self,
         ty: TyId,
+        comp: TyId,
         mut comps: Vec<Option<Expr>>,
         written: &[usize],
         span: Span,
     ) -> Expr {
-        let f32 = self.p.types.f32;
-        let zero = Expr { ty: f32, span, kind: ExprKind::Lit(Lit::Float(0.0, 0.0)) };
+        let e = VecElem::of(self.p.types.kind(comp)).unwrap_or(VecElem::F32);
+        let zero = zero_of(comp, e, span);
         let pure = |e: &Option<Expr>| e.as_ref().is_none_or(|e| zonk::non_literal(e).is_none());
         if written.is_sorted() || comps.iter().filter(|c| !pure(c)).count() < 2 {
             let xs = comps.into_iter().map(|c| c.unwrap_or_else(|| zero.clone())).collect();
@@ -1795,12 +1809,12 @@ impl<'p> Checker<'p> {
         }
         let mut stmts = Vec::new();
         for &i in written {
-            let Some(e) = comps[i].take() else { continue };
-            let at = e.span;
-            let l = self.declare_unnamed(f32, LocalKind::Owned { mutable: false }, at);
-            let pat = Pat { ty: f32, kind: PatKind::Bind(l), span: at };
-            stmts.push(Stmt { kind: StmtKind::Bind { pat, init: e, else_: None }, span: at });
-            comps[i] = Some(Expr { ty: f32, span: at, kind: ExprKind::Local(l) });
+            let Some(x) = comps[i].take() else { continue };
+            let at = x.span;
+            let l = self.declare_unnamed(comp, LocalKind::Owned { mutable: false }, at);
+            let pat = Pat { ty: comp, kind: PatKind::Bind(l), span: at };
+            stmts.push(Stmt { kind: StmtKind::Bind { pat, init: x, else_: None }, span: at });
+            comps[i] = Some(Expr { ty: comp, span: at, kind: ExprKind::Local(l) });
         }
         let xs = comps.into_iter().map(|c| c.unwrap_or_else(|| zero.clone())).collect();
         let tail = Expr { ty, span, kind: ExprKind::Construct(xs) };
@@ -2239,7 +2253,7 @@ impl<'p> Checker<'p> {
         let pick = pick.or_else(|| {
             let builtin_ok = matches!(
                 self.p.types.kind(rt),
-                TyKind::Int(_) | TyKind::Float(_) | TyKind::Vec(_) | TyKind::Mat(_)
+                TyKind::Int(_) | TyKind::Float(_) | TyKind::Vec(..) | TyKind::Mat(_)
             );
             let sequence = matches!(
                 self.p.types.kind(rt),
@@ -3406,4 +3420,10 @@ pub(crate) fn embed_path_problem(path: &str) -> Option<&'static str> {
         );
     }
     None
+}
+
+/// A zero of a vector's component type: the literal `0` or `0.0`.
+fn zero_of(comp: TyId, e: VecElem, span: Span) -> Expr {
+    let lit = if e.is_float() { Lit::Float(0.0, 0.0) } else { Lit::Int(0) };
+    Expr { ty: comp, span, kind: ExprKind::Lit(lit) }
 }

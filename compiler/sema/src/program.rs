@@ -232,8 +232,8 @@ impl Program {
             TyKind::Bool => s.push_str("bool"),
             TyKind::Int(i) => s.push_str(i.name()),
             TyKind::Float(f) => s.push_str(f.name()),
-            TyKind::Vec(n) => {
-                let _ = write!(s, "vec{n}");
+            TyKind::Vec(e, n) => {
+                let _ = write!(s, "vec{n}{}", e.suffix());
             }
             TyKind::Mat(n) => {
                 let _ = write!(s, "mat{n}");

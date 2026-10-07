@@ -4,7 +4,7 @@
 
 use crate::defs::{Entry, FieldDef, Lang, Mode};
 use crate::program::Program;
-use crate::ty::{FloatTy, FnId, IntTy, TyId, TyKind};
+use crate::ty::{FloatTy, FnId, IntTy, TyId, TyKind, VecElem};
 use wrela_diag::{Diagnostic, codes};
 
 /// Every entry point's signature.
@@ -43,7 +43,9 @@ pub fn is_varying(p: &Program, t: TyId) -> bool {
     let number = |t: TyId| {
         matches!(
             p.types.kind(t),
-            TyKind::Float(FloatTy::F32) | TyKind::Vec(_) | TyKind::Int(IntTy::I32 | IntTy::U32)
+            TyKind::Float(FloatTy::F32)
+                | TyKind::Vec(VecElem::F32 | VecElem::I32 | VecElem::U32, _)
+                | TyKind::Int(IntTy::I32 | IntTy::U32)
         )
     };
     match p.types.kind(t) {
@@ -180,7 +182,7 @@ fn check_entry(p: &Program, f: FnId, entry: Entry, out: &mut Vec<Diagnostic>) {
             }
         }
         Entry::Fragment
-            if !matches!(p.types.kind(def.ret), TyKind::Vec(4))
+            if !matches!(p.types.kind(def.ret), TyKind::Vec(VecElem::F32, 4))
                 && p.lang_of_ty(def.ret) != Some(Lang::Over) =>
         {
             out.push(

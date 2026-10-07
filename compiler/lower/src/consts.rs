@@ -131,7 +131,7 @@ fn walk<'a, B: Build<'a>>(b: &mut B, e: &wrela_sema::thir::Expr) -> Option<B::V>
             }
             // A vector's components: scalars, and the components of vectors; one scalar fills
             // all. (A matrix's parts are its columns.)
-            if let &TyKind::Vec(n) = checked.program.types.kind(e.ty) {
+            if let &TyKind::Vec(_, n) = checked.program.types.kind(e.ty) {
                 let mut comps = Vec::new();
                 for p in parts {
                     b.components(p, &mut comps);
@@ -251,11 +251,11 @@ impl<'a> Build<'a> for Fl<'_, 'a> {
     }
 
     fn components(&mut self, p: ir::ValueId, out: &mut Vec<ir::ValueId>) {
-        let f32_t = self.mb.m.types.f32();
         match *self.mb.m.types.get(self.f.value_ty(p)) {
-            ir::TypeDef::Vector(k) => {
+            ir::TypeDef::Vector(s, k) => {
+                let ct = self.mb.m.types.scalar(s);
                 for i in 0..k {
-                    out.push(self.value(f32_t, ir::Expr::Extract(p, u32::from(i))));
+                    out.push(self.value(ct, ir::Expr::Extract(p, u32::from(i))));
                 }
             }
             _ => out.push(p),
@@ -287,7 +287,7 @@ impl<'c, 'a> Fl<'c, 'a> {
             ir::ConstValue::Scalar(c) => Some(self.value(t, ir::Expr::Const(c.clone()))),
             ir::ConstValue::Parts(ps) => {
                 let part_ty: Vec<ir::TypeId> = match *types.get(t) {
-                    ir::TypeDef::Vector(_) => vec![types.f32(); ps.len()],
+                    ir::TypeDef::Vector(s, _) => vec![types.scalar(s); ps.len()],
                     ir::TypeDef::Matrix(n) => vec![types.vector(n); ps.len()],
                     ir::TypeDef::Array(e, _) => vec![e; ps.len()],
                     ir::TypeDef::Struct { ref fields, .. } => fields.iter().map(|f| f.1).collect(),

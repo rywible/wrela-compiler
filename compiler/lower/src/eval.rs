@@ -214,7 +214,10 @@ pub(crate) fn zero(types: &ir::Types, t: ir::TypeId) -> ir::ConstValue {
             ir::Scalar::F64 => ir::Const::F64(0.0),
             s => ir::Const::Small(s, 0),
         }),
-        &ir::TypeDef::Vector(n) => V::Parts(vec![V::Scalar(ir::Const::F32(0.0)); n as usize]),
+        &ir::TypeDef::Vector(s, n) => {
+            let c = types.lookup(&ir::TypeDef::Scalar(s)).expect("a vector's component type");
+            V::Parts(vec![zero(types, c); n as usize])
+        }
         &ir::TypeDef::Matrix(n) => {
             V::Parts(vec![V::Parts(vec![V::Scalar(ir::Const::F32(0.0)); n as usize]); n as usize])
         }
@@ -331,11 +334,16 @@ impl Cx<'_> {
             ir::TypeDef::Scalar(s) | ir::TypeDef::Atomic(s) => {
                 Value::Scalar(read_scalar(mem, s, at)?)
             }
-            ir::TypeDef::Vector(n) => Value::Parts(
-                (0..u32::from(n))
-                    .map(|k| read_scalar(mem, ir::Scalar::F32, at + 4 * k).map(Value::Scalar))
-                    .collect::<Result<_, _>>()?,
-            ),
+            ir::TypeDef::Vector(s, n) => {
+                let types = &mb.m.types;
+                let c = types.lookup(&ir::TypeDef::Scalar(s)).ok_or("a vector's component type")?;
+                let size = ir::layout::layout(types, c).size;
+                Value::Parts(
+                    (0..u32::from(n))
+                        .map(|k| read_scalar(mem, s, at + size * k).map(Value::Scalar))
+                        .collect::<Result<_, _>>()?,
+                )
+            }
             ir::TypeDef::Matrix(n) => {
                 let mut cols = Vec::new();
                 for c in 0..u32::from(n) {
@@ -468,7 +476,7 @@ impl Cx<'_> {
         let def = mb.m.types.get(it).clone();
         Some(match (def, v) {
             (ir::TypeDef::Scalar(_), Value::Scalar(c)) => ir::ConstValue::Scalar(c.clone()),
-            (ir::TypeDef::Vector(_) | ir::TypeDef::Matrix(_), Value::Parts(_)) => to_plain(v)?,
+            (ir::TypeDef::Vector(..) | ir::TypeDef::Matrix(_), Value::Parts(_)) => to_plain(v)?,
             (ir::TypeDef::Array(e, _), Value::Parts(xs)) => {
                 let elem = match self.checked.program.types.kind(t) {
                     TyKind::Array(x, _) | TyKind::ArrayN(x, _) => *x,

@@ -84,10 +84,6 @@ impl Verifier<'_> {
         self.m.types.as_scalar(t)
     }
 
-    fn is_f32(&self, t: TypeId) -> bool {
-        self.scalar(t) == Some(Scalar::F32)
-    }
-
     fn is_bool(&self, t: TypeId) -> bool {
         self.scalar(t) == Some(Scalar::Bool)
     }
@@ -191,11 +187,11 @@ impl Verifier<'_> {
                 }
                 let (f32_, u32_) = (TypeDef::Scalar(Scalar::F32), TypeDef::Scalar(Scalar::U32));
                 let want: Vec<TypeDef> = match op {
-                    TextureOp::Sample => vec![TypeDef::Vector(2)],
+                    TextureOp::Sample => vec![TypeDef::Vector(Scalar::F32, 2)],
                     // The level, or the reference depth.
                     TextureOp::SampleLevel
                     | TextureOp::SampleCompare
-                    | TextureOp::SampleCompareLevel => vec![TypeDef::Vector(2), f32_],
+                    | TextureOp::SampleCompareLevel => vec![TypeDef::Vector(Scalar::F32, 2), f32_],
                     TextureOp::Load => vec![u32_.clone(), u32_],
                     TextureOp::Width | TextureOp::Height => Vec::new(),
                 };
@@ -210,7 +206,7 @@ impl Verifier<'_> {
                         TypeDef::Scalar(Scalar::F32)
                     }
                     TextureOp::Load if depth => TypeDef::Scalar(Scalar::F32),
-                    _ => TypeDef::Vector(4),
+                    _ => TypeDef::Vector(Scalar::F32, 4),
                 };
                 types.lookup(&out)
             }
@@ -241,7 +237,7 @@ impl Verifier<'_> {
                 // reductions a scalar. The arguments are scalars or vectors.
                 for a in args {
                     let t = self.ty(*a);
-                    if !matches!(self.def(t), TypeDef::Scalar(_) | TypeDef::Vector(_)) {
+                    if !matches!(self.def(t), TypeDef::Scalar(_) | TypeDef::Vector(..)) {
                         return Err(bug(format!("a builtin given a `{}`", self.show(t))));
                     }
                 }
@@ -281,32 +277,32 @@ impl Verifier<'_> {
                 }
                 match self.def(self.ty(*x)) {
                     TypeDef::Array(e, _) => Some(*e),
-                    TypeDef::Vector(_) => types.lookup(&TypeDef::Scalar(Scalar::F32)),
-                    TypeDef::Matrix(n) => types.lookup(&TypeDef::Vector(*n)),
+                    TypeDef::Vector(s, _) => types.lookup(&TypeDef::Scalar(*s)),
+                    TypeDef::Matrix(n) => types.lookup(&TypeDef::Vector(Scalar::F32, *n)),
                     d => return Err(bug(format!("a dynamic extract from a `{d:?}`"))),
                 }
             }
             Expr::Splat(x, n) => {
-                if !self.is_f32(self.ty(*x)) {
-                    return Err(bug("a splat of something that isn't an `f32`"));
-                }
-                types.lookup(&TypeDef::Vector(*n))
+                let Some(s) = self.scalar(self.ty(*x)).filter(|s| *s != Scalar::Bool) else {
+                    return Err(bug("a splat of something that isn't a number"));
+                };
+                types.lookup(&TypeDef::Vector(s, *n))
             }
             Expr::Swizzle(x, comps) => {
-                let TypeDef::Vector(n) = self.def(self.ty(*x)) else {
+                let TypeDef::Vector(s, n) = self.def(self.ty(*x)) else {
                     return Err(bug("a swizzle of something that isn't a vector"));
                 };
                 if comps.iter().any(|c| c >= n) || comps.len() < 2 || comps.len() > 4 {
                     return Err(bug(format!("a swizzle {comps:?} of a vec{n}")));
                 }
-                types.lookup(&TypeDef::Vector(comps.len() as u8))
+                types.lookup(&TypeDef::Vector(*s, comps.len() as u8))
             }
-            Expr::Convert(x, s) => {
-                if self.scalar(self.ty(*x)).is_none() {
-                    return Err(bug("a conversion of something that isn't a scalar"));
-                }
-                types.lookup(&TypeDef::Scalar(*s))
-            }
+            // A vector converts each component.
+            Expr::Convert(x, s) => match self.def(self.ty(*x)) {
+                TypeDef::Scalar(_) => types.lookup(&TypeDef::Scalar(*s)),
+                TypeDef::Vector(_, n) => types.lookup(&TypeDef::Vector(*s, *n)),
+                _ => return Err(bug("a conversion of something that isn't a scalar or vector")),
+            },
             Expr::Bitcast(x, s) => {
                 let from = self.scalar(self.ty(*x));
                 if from.is_none_or(|f| f.bits() != s.bits()) {
@@ -349,6 +345,14 @@ impl Verifier<'_> {
             return Ok(ta);
         }
         if matches!(op, BinOp::Shl | BinOp::Shr) {
+            // An integer vector shifts by a `u32` vector of its size.
+            if let (&TypeDef::Vector(s, n), &TypeDef::Vector(Scalar::U32, k)) =
+                (self.def(ta), self.def(tb))
+                && s.is_int()
+                && n == k
+            {
+                return Ok(ta);
+            }
             if !self.scalar(ta).is_some_and(|s| s.is_int()) || self.scalar(tb) != Some(Scalar::U32)
             {
                 return Err(bug(format!("a shift of `{}` by `{}`", self.show(ta), self.show(tb))));
@@ -364,7 +368,7 @@ impl Verifier<'_> {
                         Err(bug(format!("{op:?} of bools")))
                     }
                 }
-                TypeDef::Scalar(_) | TypeDef::Vector(_) => Ok(ta),
+                TypeDef::Scalar(_) | TypeDef::Vector(..) => Ok(ta),
                 TypeDef::Matrix(_) if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul) => Ok(ta),
                 d => Err(bug(format!("{op:?} of `{d:?}`"))),
             };
@@ -374,7 +378,8 @@ impl Verifier<'_> {
         match (self.def(ta), self.def(tb)) {
             (TypeDef::Matrix(_), TypeDef::Scalar(Scalar::F32)) => Ok(ta),
             (TypeDef::Scalar(Scalar::F32), TypeDef::Matrix(_)) => Ok(tb),
-            (TypeDef::Matrix(n), TypeDef::Vector(k)) | (TypeDef::Vector(k), TypeDef::Matrix(n))
+            (TypeDef::Matrix(n), TypeDef::Vector(Scalar::F32, k))
+            | (TypeDef::Vector(Scalar::F32, k), TypeDef::Matrix(n))
                 if op == BinOp::Mul && n == k =>
             {
                 Ok(if matches!(self.def(ta), TypeDef::Matrix(_)) { tb } else { ta })
@@ -449,13 +454,15 @@ impl Verifier<'_> {
                     )?;
                 }
             }
-            TypeDef::Vector(n) => {
-                if parts.len() != *n as usize || !parts.iter().all(|p| self.is_f32(self.ty(*p))) {
+            TypeDef::Vector(s, n) => {
+                if parts.len() != *n as usize
+                    || !parts.iter().all(|p| self.scalar(self.ty(*p)) == Some(*s))
+                {
                     return Err(bug(format!("a vec{n} built from {} parts", parts.len())));
                 }
             }
             TypeDef::Matrix(n) => {
-                let col = self.m.types.lookup(&TypeDef::Vector(*n));
+                let col = self.m.types.lookup(&TypeDef::Vector(Scalar::F32, *n));
                 if parts.len() != *n as usize || !parts.iter().all(|p| Some(self.ty(*p)) == col) {
                     return Err(bug(format!("a mat{n} built from the wrong columns")));
                 }
@@ -484,8 +491,10 @@ impl Verifier<'_> {
         let types = &self.m.types;
         let r = match self.def(t) {
             TypeDef::Struct { .. } | TypeDef::Enum { .. } => types.field(t, k),
-            TypeDef::Vector(n) if k < u32::from(*n) => types.lookup(&TypeDef::Scalar(Scalar::F32)),
-            TypeDef::Matrix(n) if k < u32::from(*n) => types.lookup(&TypeDef::Vector(*n)),
+            TypeDef::Vector(s, n) if k < u32::from(*n) => types.lookup(&TypeDef::Scalar(*s)),
+            TypeDef::Matrix(n) if k < u32::from(*n) => {
+                types.lookup(&TypeDef::Vector(Scalar::F32, *n))
+            }
             TypeDef::Array(e, n) if k < *n => Some(*e),
             TypeDef::Run(_) if k < 2 => types.lookup(&TypeDef::Scalar(Scalar::U32)),
             _ => None,

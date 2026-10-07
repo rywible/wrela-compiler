@@ -1318,7 +1318,13 @@ impl<'d, 'u> Collector<'d, 'u> {
             // An alias that names traits names the type a function returns (`ty.opaque-alias`).
             let mut quiet = Vec::new();
             let mut bounds = None;
-            let _ = resolve::resolve_type(&self.p, &mut quiet, &scope, &t.ty, TyPos::Return(&mut bounds));
+            let _ = resolve::resolve_type(
+                &self.p,
+                &mut quiet,
+                &scope,
+                &t.ty,
+                TyPos::Return(&mut bounds),
+            );
             if let Some(bounds) = bounds {
                 self.diags.extend(quiet);
                 let ty = self.opaque_alias(m, id, t, bounds, pending);
@@ -1344,8 +1350,12 @@ impl<'d, 'u> Collector<'d, 'u> {
         let name = &t.name.name;
         if !t.generics.is_empty() {
             self.diags.push(
-                Diagnostic::new(codes::E0410, t.name.span, format!("`{name}` names traits, so it has no parameters"))
-                    .with_note("it names the one type a function returns (§4)"),
+                Diagnostic::new(
+                    codes::E0410,
+                    t.name.span,
+                    format!("`{name}` names traits, so it has no parameters"),
+                )
+                .with_note("it names the one type a function returns (§4)"),
             );
             return self.p.types.error;
         }

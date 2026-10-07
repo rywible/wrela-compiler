@@ -56,14 +56,17 @@ pub(super) fn interval(
     let func = m.functions[f.index()].clone();
     let xi = ncap as usize;
     let x_ty = func.params.get(xi).ok_or_else(|| Error::internal("no input parameter"))?.ty;
-    if !matches!(m.types.get(x_ty), TypeDef::Scalar(Scalar::F32) | TypeDef::Vector(_)) {
+    if !matches!(m.types.get(x_ty), TypeDef::Scalar(Scalar::F32) | TypeDef::Vector(Scalar::F32, _))
+    {
         return Err(Error::not_derivable(format!(
             "an interval needs an `f32` or a float vector input, not `{}`",
             m.types.display(x_ty)
         )));
     }
     let f32 = m.types.f32();
-    let ret_ok = func.ret.is_some_and(|r| r == f32 || matches!(m.types.get(r), TypeDef::Vector(_)));
+    let ret_ok = func
+        .ret
+        .is_some_and(|r| r == f32 || matches!(m.types.get(r), TypeDef::Vector(Scalar::F32, _)));
     if !ret_ok || func.ret_ref {
         return Err(Error::not_derivable(
             "an interval needs a function that returns an `f32` or a float vector",
@@ -113,7 +116,7 @@ pub(super) fn interval(
         // A NaN bound means "unknown": make it infinite, a component at a time.
         let b = m.types.bool();
         let n = match m.types.get(out_ty) {
-            TypeDef::Vector(n) => Some(*n as u32),
+            TypeDef::Vector(_, n) => Some(*n as u32),
             _ => None,
         };
         for (v, inf) in [(&mut rlo, f32::NEG_INFINITY), (&mut rhi, f32::INFINITY)] {
@@ -549,7 +552,7 @@ impl<'a> Ivx<'a> {
 
     /// `x`, or `to` in each component that's NaN.
     fn unless_nan(&mut self, out: &mut Block, x: ValueId, ty: TypeId, to: f64) -> ValueId {
-        if let TypeDef::Vector(n) = *self.m.types.get(ty) {
+        if let TypeDef::Vector(_, n) = *self.m.types.get(ty) {
             let f32t = self.m.types.f32();
             let comps = (0..n as u32)
                 .map(|c| {
@@ -585,7 +588,7 @@ impl<'a> Ivx<'a> {
         let parts: Vec<TypeId>;
         let mut arrays = false;
         match self.m.types.get(ty).clone() {
-            TypeDef::Scalar(_) | TypeDef::Vector(_) => return f(self, out, ty, vals),
+            TypeDef::Scalar(_) | TypeDef::Vector(..) => return f(self, out, ty, vals),
             TypeDef::Matrix(n) => {
                 let col = self.m.types.vector(n);
                 parts = vec![col; n as usize];
@@ -759,7 +762,7 @@ impl<'a> Ivx<'a> {
         let prefix = Place { root: p.root.clone(), path: p.path[..at].to_vec() };
         let n = match self.m.place_ty(self.f, &prefix).map(|t| self.m.types.get(t).clone()) {
             Some(TypeDef::Array(_, n)) => n,
-            Some(TypeDef::Vector(n)) => u32::from(n),
+            Some(TypeDef::Vector(_, n)) => u32::from(n),
             _ => {
                 return Err(Error::not_derivable(
                     "an interval through an index that depends on the input, into an array of \
@@ -940,7 +943,10 @@ impl<'a> Ivx<'a> {
     /// Whether `x` is an `f32` or a float vector: what `split_floor` handles.
     fn splittable(&self, x: ValueId) -> bool {
         let ty = self.ty(x);
-        matches!(self.m.types.get(ty), TypeDef::Scalar(Scalar::F32) | TypeDef::Vector(_))
+        matches!(
+            self.m.types.get(ty),
+            TypeDef::Scalar(Scalar::F32) | TypeDef::Vector(Scalar::F32, _)
+        )
     }
 
     /// `v = floor(x)`, then `rest` (to the end of the block, but for a final `return`), derived
@@ -962,7 +968,7 @@ impl<'a> Ivx<'a> {
     ) -> R<()> {
         let ty = self.ty(x);
         let n = match *self.m.types.get(ty) {
-            TypeDef::Vector(n) => n as u32,
+            TypeDef::Vector(_, n) => n as u32,
             _ => 1,
         };
         let f32t = self.m.types.f32();
@@ -1401,7 +1407,7 @@ impl<'a> Ivx<'a> {
                 self.builtin(out, Builtin::Min, vec![old.1, hi], ty),
             ),
             Some(i) => {
-                let TypeDef::Vector(n) = *self.m.types.get(ty) else { return Ok(()) };
+                let TypeDef::Vector(_, n) = *self.m.types.get(ty) else { return Ok(()) };
                 let st = self.m.types.f32();
                 let mut ends = [old.0, old.1];
                 for (k, end) in ends.iter_mut().enumerate() {
@@ -1493,7 +1499,7 @@ impl<'a> Ivx<'a> {
             }
             Expr::Extract(x, i) if self.act.value(x) => {
                 let xt = self.ty(x);
-                let TypeDef::Vector(n) = *self.m.types.get(xt) else { return Ok(()) };
+                let TypeDef::Vector(_, n) = *self.m.types.get(xt) else { return Ok(()) };
                 let (xl, xh) = self.range(x);
                 let mut ends = [xl, xh];
                 for (k, end) in ends.iter_mut().enumerate() {
@@ -1575,10 +1581,10 @@ impl<'a> Ivx<'a> {
                 // Any element: the hull of them all.
                 let n = match self.m.types.get(self.ty(*x)) {
                     TypeDef::Array(_, n) => *n,
-                    TypeDef::Vector(n) => *n as u32,
+                    TypeDef::Vector(_, n) => *n as u32,
                     _ => return Err(Error::internal("a dynamic extract from a non-array")),
                 };
-                if !matches!(self.m.types.get(ty), TypeDef::Scalar(_) | TypeDef::Vector(_)) {
+                if !matches!(self.m.types.get(ty), TypeDef::Scalar(_) | TypeDef::Vector(..)) {
                     return Err(Error::not_derivable(
                         "an interval over an array of aggregates indexed by a value that \
                                 depends on the input isn't supported",
@@ -1909,7 +1915,7 @@ impl<'a> Ivx<'a> {
         args: &[Iv],
         mut rule: impl FnMut(&mut Self, &mut Block, TypeId, &[Iv]) -> R<Iv>,
     ) -> R<Iv> {
-        let TypeDef::Vector(n) = *self.m.types.get(ty) else {
+        let TypeDef::Vector(_, n) = *self.m.types.get(ty) else {
             return rule(self, out, ty, args);
         };
         let f32t = self.m.types.f32();
@@ -2151,7 +2157,7 @@ impl<'a> Ivx<'a> {
             }
             B::Dot => {
                 let at = self.ty(args[0]);
-                let TypeDef::Vector(n) = *self.m.types.get(at) else {
+                let TypeDef::Vector(_, n) = *self.m.types.get(at) else {
                     return Err(Error::internal("a dot of non-vectors"));
                 };
                 // dot(v, v) is a sum of squares.
@@ -2233,7 +2239,7 @@ impl<'a> Ivx<'a> {
 
     /// `length` of a vector (or `|x|` of a scalar), `at` the argument's type.
     fn length(&mut self, out: &mut Block, x: Iv, at: TypeId, ty: TypeId) -> Iv {
-        let TypeDef::Vector(n) = *self.m.types.get(at) else {
+        let TypeDef::Vector(_, n) = *self.m.types.get(at) else {
             return self.abs(out, x, ty);
         };
         let sq = self.sqr(out, x, at);
@@ -2266,7 +2272,7 @@ impl<'a> Ivx<'a> {
     /// the other components are exactly 0, where dividing `x` by its length as intervals would
     /// lose that `x_i / |x_i|` is ±1.
     fn normalize(&mut self, out: &mut Block, x: Iv, ty: TypeId) -> R<Iv> {
-        let TypeDef::Vector(n) = *self.m.types.get(ty) else {
+        let TypeDef::Vector(_, n) = *self.m.types.get(ty) else {
             return Err(Error::internal("a normalize of a non-vector"));
         };
         let f32t = self.m.types.f32();

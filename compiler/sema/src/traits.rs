@@ -427,7 +427,8 @@ fn implements_builtin_uncached(p: &Program, ty: TyId, lang: Lang) -> bool {
         TyKind::Bool => lang != Lang::GpuData,
         TyKind::Int(i) => lang != Lang::GpuData || i.on_gpu(),
         TyKind::Float(f) => lang != Lang::GpuData || *f == FloatTy::F32,
-        TyKind::Vec(_) | TyKind::Mat(_) => true,
+        TyKind::Vec(e, _) => lang != Lang::GpuData || e.on_gpu(),
+        TyKind::Mat(_) => true,
         TyKind::Tuple(ts) => ts.iter().all(|&t| implements_builtin(p, t, lang)),
         // WGSL has no empty arrays.
         TyKind::Array(e, n) => (lang != Lang::GpuData || *n > 0) && implements_builtin(p, *e, lang),
@@ -574,8 +575,11 @@ pub fn can_hold(p: &Program, holder: TyId, target: TyId) -> bool {
                 go(p, *e, target, seen)
             }
             TyKind::Str => target == p.types.int(IntTy::U8),
-            TyKind::Vec(_) | TyKind::Mat(_) => {
-                target == p.types.f32 || matches!(p.types.kind(target), TyKind::Vec(_))
+            &TyKind::Vec(e, _) => {
+                target == p.types.elem(e) || matches!(p.types.kind(target), TyKind::Vec(..))
+            }
+            TyKind::Mat(_) => {
+                target == p.types.f32 || matches!(p.types.kind(target), TyKind::Vec(..))
             }
             TyKind::Tuple(ts) => ts.iter().any(|&t| go(p, t, target, seen)),
             TyKind::Adt(a, args) => {
@@ -596,7 +600,7 @@ pub fn can_hold(p: &Program, holder: TyId, target: TyId) -> bool {
     // type arguments turn out to be.
     if matches!(
         p.types.kind(holder),
-        TyKind::Bool | TyKind::Int(_) | TyKind::Float(_) | TyKind::Vec(_) | TyKind::Mat(_)
+        TyKind::Bool | TyKind::Int(_) | TyKind::Float(_) | TyKind::Vec(..) | TyKind::Mat(_)
     ) && !opaque(p, target)
     {
         return go(p, holder, target, &mut Vec::new());

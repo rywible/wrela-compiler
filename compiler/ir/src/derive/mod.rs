@@ -759,7 +759,7 @@ impl Track {
 /// operands of an elementwise operation of one type).
 pub(super) fn splat_size(types: &Types, from: TypeId, to: TypeId) -> Option<u8> {
     match (types.get(from), types.get(to)) {
-        (TypeDef::Scalar(_), &TypeDef::Vector(n)) => Some(n),
+        (TypeDef::Scalar(_), &TypeDef::Vector(_, n)) => Some(n),
         _ => None,
     }
 }

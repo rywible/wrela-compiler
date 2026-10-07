@@ -167,7 +167,8 @@ fn on_gpu_in(p: &Program, t: TyId, known: &mut HashMap<TyId, bool>) -> bool {
         return k;
     }
     let ok = match p.types.kind(t) {
-        TyKind::Bool | TyKind::Vec(_) | TyKind::Mat(_) => true,
+        TyKind::Bool | TyKind::Mat(_) => true,
+        TyKind::Vec(e, _) => e.on_gpu(),
         TyKind::Int(i) => i.on_gpu(),
         TyKind::Float(f) => *f == wrela_sema::ty::FloatTy::F32,
         TyKind::Array(e, n) => *n > 0 && on_gpu_in(p, *e, known),
@@ -647,7 +648,7 @@ impl<'a> Cx<'a> {
         let mut ok = true;
         let exportable = |t: &TyKind, ret: bool| match t {
             TyKind::Bool | TyKind::Int(_) | TyKind::Float(_) => true,
-            TyKind::Vec(_) => true,
+            TyKind::Vec(..) => true,
             TyKind::Tuple(ts) => ret && ts.is_empty(),
             _ => false,
         };
@@ -892,6 +893,8 @@ fn rewrite_cpu_math(cx: &mut Cx, mb: &mut ModuleBuilder) {
         mb.m.functions[i] = f;
         i += 1;
     }
+    // Vectors of other components than f32s compute a component at a time on the CPU.
+    ir::scalarize::scalarize_vectors(&mut mb.m);
 }
 
 fn rewrite_block(
@@ -909,7 +912,7 @@ fn rewrite_block(
             let callee = cx.instance(mb, InstanceKey::plain(func, Vec::new()), None);
             let ty = f.value_ty(v);
             let f32 = mb.m.types.f32();
-            if let &ir::TypeDef::Vector(n) = mb.m.types.get(ty) {
+            if let &ir::TypeDef::Vector(ir::Scalar::F32, n) = mb.m.types.get(ty) {
                 let mut comps = Vec::new();
                 for c in 0..n as u32 {
                     let mut parts = Vec::new();

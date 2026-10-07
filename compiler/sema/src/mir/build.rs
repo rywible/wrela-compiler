@@ -751,7 +751,7 @@ impl<'a> Builder<'a> {
             }
             ExprKind::Index(b, i) => {
                 let p = self.chained_place(b)?;
-                if let (TyKind::Vec(_), ExprKind::Lit(Lit::Int(c))) =
+                if let (TyKind::Vec(..), ExprKind::Lit(Lit::Int(c))) =
                     (self.p.types.kind(b.ty), &i.kind)
                 {
                     // A literal index into a vector is a component (checked in range).
@@ -924,7 +924,7 @@ impl<'a> Builder<'a> {
             ts.map(|t| self.scalars(t)).fold(0u64, u64::saturating_add)
         };
         match p.types.kind(t) {
-            TyKind::Vec(n) => u64::from(*n),
+            TyKind::Vec(_, n) => u64::from(*n),
             TyKind::Mat(n) => u64::from(*n) * u64::from(*n),
             TyKind::Array(e, n) => self.scalars(*e).saturating_mul(u64::from(*n)),
             TyKind::Tuple(ts) => sum(&mut ts.iter().copied()),

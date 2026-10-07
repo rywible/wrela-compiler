@@ -104,7 +104,7 @@ pub fn validate(module: &naga::Module) -> R<naga::valid::ModuleInfo> {
 fn static_len(types: &ir::Types, t: ir::TypeId) -> Option<u32> {
     match types.get(t) {
         ir::TypeDef::Array(_, n) => Some(*n),
-        ir::TypeDef::Vector(n) | ir::TypeDef::Matrix(n) => Some(u32::from(*n)),
+        ir::TypeDef::Vector(_, n) | ir::TypeDef::Matrix(n) => Some(u32::from(*n)),
         _ => None,
     }
 }
@@ -237,8 +237,8 @@ impl<'m> Cx<'m> {
         let (name, inner) = match *m.types.get(t) {
             ir::TypeDef::Scalar(s) => (None, TypeInner::Scalar(scalar(s)?)),
             ir::TypeDef::Atomic(s) => (None, TypeInner::Atomic(scalar(s)?)),
-            ir::TypeDef::Vector(n) => {
-                (None, TypeInner::Vector { size: vsize(n), scalar: Scalar::F32 })
+            ir::TypeDef::Vector(s, n) => {
+                (None, TypeInner::Vector { size: vsize(n), scalar: scalar(s)? })
             }
             ir::TypeDef::Matrix(n) => {
                 (None, TypeInner::Matrix { columns: vsize(n), rows: vsize(n), scalar: Scalar::F32 })

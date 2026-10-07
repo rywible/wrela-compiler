@@ -18,6 +18,7 @@ mod error;
 pub mod layout;
 pub mod opt;
 pub mod print;
+pub mod scalarize;
 mod single_exit;
 mod types;
 pub mod uniformity;
@@ -780,10 +781,12 @@ impl Module {
             (TypeDef::Struct { .. } | TypeDef::Enum { .. }, Proj::Field(i)) => {
                 self.types.field(t, *i)
             }
-            (TypeDef::Vector(_), Proj::Comp(_) | Proj::Index(_)) => {
-                self.types.lookup(&TypeDef::Scalar(Scalar::F32))
+            (TypeDef::Vector(s, _), Proj::Comp(_) | Proj::Index(_)) => {
+                self.types.lookup(&TypeDef::Scalar(*s))
             }
-            (TypeDef::Matrix(n), Proj::Index(_)) => self.types.lookup(&TypeDef::Vector(*n)),
+            (TypeDef::Matrix(n), Proj::Index(_)) => {
+                self.types.lookup(&TypeDef::Vector(Scalar::F32, *n))
+            }
             (TypeDef::Array(e, _) | TypeDef::RuntimeArray(e) | TypeDef::Run(e), Proj::Index(_)) => {
                 Some(*e)
             }
@@ -858,7 +861,7 @@ mod tests {
     fn a_matrix_brings_its_parts() {
         let mut m = Module::default();
         let mat = m.types.intern(TypeDef::Matrix(3));
-        assert!(m.types.lookup(&TypeDef::Vector(3)).is_some());
+        assert!(m.types.lookup(&TypeDef::Vector(Scalar::F32, 3)).is_some());
         assert!(m.types.lookup(&TypeDef::Scalar(Scalar::F32)).is_some());
         assert_eq!(m.types.lookup(&TypeDef::Matrix(3)), Some(mat));
     }

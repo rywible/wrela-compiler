@@ -418,7 +418,9 @@ fn sum_of_squares(fe: &mut Fe, x: ir::ValueId, minus: Option<ir::ValueId>, n: u3
 
 fn dims(fe: &Fe, t: ir::TypeId) -> Option<(bool, u8)> {
     match fe.m.types.get(t) {
-        ir::TypeDef::Vector(n) => Some((false, *n)),
+        // Only f32 vectors reach the back end's arithmetic: the others' is done a component
+        // at a time before it (`wrela_ir::opt::scalarize_vectors`).
+        ir::TypeDef::Vector(ir::Scalar::F32, n) => Some((false, *n)),
         ir::TypeDef::Matrix(n) => Some((true, *n)),
         _ => None,
     }
@@ -1549,7 +1551,7 @@ fn float_parts(types: &ir::Types, t: ir::TypeId) -> Option<(Option<bool>, Vec<u3
     match types.get(t) {
         ir::TypeDef::Scalar(ir::Scalar::F32) => Some((Some(false), Vec::new())),
         ir::TypeDef::Scalar(ir::Scalar::F64) => Some((Some(true), Vec::new())),
-        ir::TypeDef::Vector(n) => Some((None, components(false, *n).collect())),
+        ir::TypeDef::Vector(ir::Scalar::F32, n) => Some((None, components(false, *n).collect())),
         ir::TypeDef::Matrix(n) => Some((None, components(true, *n).collect())),
         _ => None,
     }
@@ -1647,9 +1649,10 @@ pub(crate) fn canonicalize(fe: &mut Fe, t: ir::TypeId, addr: u32, off: u32) {
     };
     match types.get(t).clone() {
         ir::TypeDef::Scalar(s) => float(fe, s == ir::Scalar::F64, off),
-        ir::TypeDef::Vector(n) => {
+        ir::TypeDef::Vector(s, n) if s.is_float() => {
+            let size = crate::scalar_size(s);
             for k in 0..u32::from(n) {
-                float(fe, false, off + 4 * k);
+                float(fe, s == ir::Scalar::F64, off + size * k);
             }
         }
         ir::TypeDef::Matrix(n) => {
@@ -1692,7 +1695,8 @@ pub(crate) fn canonicalize(fe: &mut Fe, t: ir::TypeId, addr: u32, off: u32) {
             }
         }
         ir::TypeDef::Run(_) | ir::TypeDef::RuntimeArray(_) | ir::TypeDef::Ptr(_) => {}
-        ir::TypeDef::Atomic(_) => {}
+        // An integer vector holds no float.
+        ir::TypeDef::Atomic(_) | ir::TypeDef::Vector(..) => {}
     }
 }
 

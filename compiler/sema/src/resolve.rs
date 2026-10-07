@@ -952,7 +952,8 @@ fn resolve_type_path(
             // A constant's name: its value (a const parameter's name resolves as a type).
             ast::TypeExprKind::Path(path)
                 if const_at(i)
-                    && !(path.is_single() && scope.param(&path.segments[0].ident.name).is_some())
+                    && !(path.is_single()
+                        && scope.param(&path.segments[0].ident.name).is_some())
                     && matches!(resolve_value_item(p, scope.module, path), Some(Res::Const(_))) =>
             {
                 let e = ast::Expr::new(ast::ExprKind::Path(path.clone()), path.span);

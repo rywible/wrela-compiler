@@ -184,7 +184,7 @@ impl Cx<'_> {
     /// Whether a local can hold a value of type `t`: plain data, not a pointer or a run.
     fn holdable(&self, t: TypeId) -> bool {
         match self.types.get(t) {
-            TypeDef::Scalar(_) | TypeDef::Vector(_) | TypeDef::Matrix(_) => true,
+            TypeDef::Scalar(_) | TypeDef::Vector(..) | TypeDef::Matrix(_) => true,
             TypeDef::Struct { fields, .. } => fields.iter().all(|(_, f)| self.holdable(*f)),
             TypeDef::Enum { variants, .. } => {
                 variants.iter().all(|(_, p)| p.is_none_or(|p| self.holdable(p)))

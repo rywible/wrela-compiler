@@ -264,6 +264,60 @@ impl Eq for vec4 {
     }
 }
 
+impl Eq for vec2i {
+    fn eq(self, other: vec2i) -> bool {
+        self == other
+    }
+}
+
+impl Eq for vec3i {
+    fn eq(self, other: vec3i) -> bool {
+        self == other
+    }
+}
+
+impl Eq for vec4i {
+    fn eq(self, other: vec4i) -> bool {
+        self == other
+    }
+}
+
+impl Eq for vec2u {
+    fn eq(self, other: vec2u) -> bool {
+        self == other
+    }
+}
+
+impl Eq for vec3u {
+    fn eq(self, other: vec3u) -> bool {
+        self == other
+    }
+}
+
+impl Eq for vec4u {
+    fn eq(self, other: vec4u) -> bool {
+        self == other
+    }
+}
+
+impl Eq for vec2d {
+    fn eq(self, other: vec2d) -> bool {
+        self == other
+    }
+}
+
+impl Eq for vec3d {
+    fn eq(self, other: vec3d) -> bool {
+        self == other
+    }
+}
+
+impl Eq for vec4d {
+    fn eq(self, other: vec4d) -> bool {
+        self == other
+    }
+}
+
 // Arrays and tuples compare element by element, in order.
 
 impl<T: Eq, const N: u32> Eq for [T; N] {

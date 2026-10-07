@@ -566,10 +566,12 @@ fn proj_ty(p: &Program, t: TyId, variant: &mut Option<u32>, proj: &Proj) -> TyId
         (Proj::Field(i), TyKind::Tuple(ts)) => {
             ts.get(*i as usize).copied().unwrap_or(p.types.error)
         }
+        (Proj::Comp(_), &TyKind::Vec(e, _)) => p.types.elem(e),
         (Proj::Comp(_), _) => p.types.f32,
+        (Proj::Swizzle(cs), &TyKind::Vec(e, _)) => p.types.vec_of(e, cs.len() as u8),
         (Proj::Swizzle(cs), _) => p.types.vec(cs.len() as u8),
         (Proj::Index(_), TyKind::Array(e, _) | TyKind::ArrayN(e, _) | TyKind::Slice(e)) => *e,
-        (Proj::Index(_), TyKind::Vec(_)) => p.types.f32,
+        (Proj::Index(_), &TyKind::Vec(e, _)) => p.types.elem(e),
         (Proj::Index(_), TyKind::Mat(n)) => p.types.vec(*n),
         (Proj::Index(_), TyKind::Adt(_, args)) if !args.is_empty() => args[0], // `Slots<T>`
         _ => p.types.error,

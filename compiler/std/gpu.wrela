@@ -106,6 +106,27 @@ pub struct WorkgroupId: Copy {
     pub z: u32,
 }
 
+impl GlobalId {
+    /// As a vector.
+    pub fn xyz(self) -> vec3u {
+        vec3u(self.x, self.y, self.z)
+    }
+}
+
+impl LocalId {
+    /// As a vector.
+    pub fn xyz(self) -> vec3u {
+        vec3u(self.x, self.y, self.z)
+    }
+}
+
+impl WorkgroupId {
+    /// As a vector.
+    pub fn xyz(self) -> vec3u {
+        vec3u(self.x, self.y, self.z)
+    }
+}
+
 /// A vertex shader's vertex number.
 pub struct VertexIndex: Copy {
     pub index: u32,

@@ -90,19 +90,31 @@ pub(crate) fn valtype(s: ir::Scalar) -> ValType {
     }
 }
 
+/// The bytes of a scalar in memory.
+pub(crate) fn scalar_size(s: ir::Scalar) -> u32 {
+    match s {
+        ir::Scalar::I8 | ir::Scalar::U8 => 1,
+        ir::Scalar::I16 | ir::Scalar::U16 => 2,
+        ir::Scalar::I64 | ir::Scalar::U64 | ir::Scalar::F64 => 8,
+        _ => 4,
+    }
+}
+
 /// A type's WASM value type: its scalar's, a `v128` for a vector with SIMD, or a pointer (i32)
 /// for the aggregates in memory.
 pub(crate) fn repr(types: &ir::Types, t: ir::TypeId, simd: bool) -> ValType {
     match types.get(t) {
         ir::TypeDef::Scalar(s) => valtype(*s),
-        ir::TypeDef::Vector(_) if simd => ValType::V128,
+        ir::TypeDef::Vector(ir::Scalar::F32, _) if simd => ValType::V128,
         _ => ValType::I32,
     }
 }
 
-/// Whether a value of type `t` lives in memory: an aggregate, but a vector with SIMD.
+/// Whether a value of type `t` lives in memory: an aggregate, but an f32 vector with SIMD.
+/// (Other vectors are in memory, their arithmetic done a component at a time: checked, for an
+/// integer's, as a scalar's is.)
 pub(crate) fn in_memory(types: &ir::Types, t: ir::TypeId, simd: bool) -> bool {
-    types.is_aggregate(t) && !(simd && matches!(types.get(t), ir::TypeDef::Vector(_)))
+    types.is_aggregate(t) && !(simd && types.is_f32_vector(t))
 }
 
 /// Function types, deduplicated.
@@ -441,14 +453,16 @@ fn write_const(
             // 8- and 16-bit integers: their low bytes.
             ir::Const::Small(_, x) => put(&x.to_le_bytes()[..layout(types, t).size as usize]),
         },
-        (&ir::TypeDef::Vector(_), ir::ConstValue::Parts(ps)) => {
-            let f32 = types.lookup(&ir::TypeDef::Scalar(ir::Scalar::F32)).ok_or("no f32")?;
+        (&ir::TypeDef::Vector(s, _), ir::ConstValue::Parts(ps)) => {
+            let c = types.lookup(&ir::TypeDef::Scalar(s)).ok_or("no component type")?;
+            let size = layout(types, c).size as usize;
             for (k, p) in ps.iter().enumerate() {
-                write_const(types, f32, p, addrs, out, at + 4 * k)?;
+                write_const(types, c, p, addrs, out, at + size * k)?;
             }
         }
         (&ir::TypeDef::Matrix(n), ir::ConstValue::Parts(ps)) => {
-            let col = types.lookup(&ir::TypeDef::Vector(n)).ok_or("no column type")?;
+            let col =
+                types.lookup(&ir::TypeDef::Vector(ir::Scalar::F32, n)).ok_or("no column type")?;
             for (k, p) in ps.iter().enumerate() {
                 write_const(types, col, p, addrs, out, at + (column_stride(n) as usize) * k)?;
             }

@@ -180,7 +180,7 @@ fn floats(checked: &Checked, t: TyId, path: String, depth: u32, out: &mut Vec<(S
     }
     match p.types.kind(t) {
         TyKind::Float(wrela_sema::ty::FloatTy::F32) => out.push((path, 1)),
-        TyKind::Vec(n) => out.push((path, *n)),
+        TyKind::Vec(wrela_sema::ty::VecElem::F32, n) => out.push((path, *n)),
         TyKind::Adt(a, args) => {
             let adt = p.adt(*a);
             if adt.is_enum() {

@@ -285,3 +285,38 @@ fn the_gpu_counts_bits_as_the_cpu_does() {
         assert_eq!(got[3..], want, "{x:#010x} as an i32");
     }
 }
+
+/// Vectors of i32s and u32s compute the same on the CPU (a component at a time) and the GPU
+/// (WGSL's vectors): arithmetic, shifts and bits, built-ins, conversions to and from float
+/// vectors, and swizzles. compiler/tests/vectors's first frame writes the CPU's values and the
+/// GPU's into its two newest buffers.
+#[test]
+#[ignore = "needs a GPU"]
+fn the_gpu_computes_integer_vectors_as_the_cpu_does() {
+    let mut gpu = wrela_host::Host::load(built("vectors")).expect("load");
+    gpu.frame(0.0, 64, 64).expect("a frame");
+    let b = gpu.buffers();
+    let (cpu, on_gpu) = (b[b.len() - 2], b[b.len() - 1]);
+    let (cpu, on_gpu) =
+        (gpu.read_buffer(cpu).expect("read"), gpu.read_buffer(on_gpu).expect("read"));
+    assert_eq!(cpu.len(), on_gpu.len());
+    assert!(cpu.iter().any(|&x| x != 0), "the CPU's values are all zero");
+    let first = cpu.chunks(4).zip(on_gpu.chunks(4)).position(|(a, b)| a != b);
+    assert_eq!(first, None, "the CPU's and the GPU's words differ (the first differing word)");
+}
+
+/// Vectors of i32s, u32s and f64s on the CPU: compiler/tests/vectors's `@test`s.
+#[test]
+fn integer_and_double_vectors_compute_on_the_cpu() {
+    let out = wrela_driver::test(&wrela_tests::repo_root().join("compiler/tests/vectors"), None);
+    let failures: Vec<_> = out.results.iter().filter_map(|r| r.failure.as_ref()).collect();
+    assert!(out.passed(), "{:?} {failures:?}", out.diagnostics);
+    assert_eq!(out.results.len(), 3);
+}
+
+/// A component of an integer vector overflows as a scalar does on the CPU: it traps.
+#[test]
+fn an_integer_vector_component_traps_on_overflow() {
+    let mut h = CpuHost::load(built("vectors")).expect("load");
+    traps(&mut h, "overflow", &[]);
+}

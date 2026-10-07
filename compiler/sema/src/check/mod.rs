@@ -223,6 +223,11 @@ impl<'p> Checker<'p> {
             || self.infer.var_kind(&self.p.types, t) == Some(VarKind::Int)
     }
 
+    /// Whether `t` is an integer vector: `vecNi` or `vecNu`.
+    pub(crate) fn is_int_vec(&self, t: TyId) -> bool {
+        matches!(self.kind(t), TyKind::Vec(VecElem::I32 | VecElem::U32, _))
+    }
+
     /// Whether `t` is a number literal's type not settled yet.
     pub(crate) fn is_number_var(&self, t: TyId) -> bool {
         matches!(self.infer.var_kind(&self.p.types, t), Some(VarKind::Int | VarKind::Float))
@@ -350,12 +355,15 @@ impl<'p> Checker<'p> {
                     ],
                 );
             }
-            (TyKind::Float(_), TyKind::Vec(n)) | (TyKind::Int(_), TyKind::Vec(n)) => {
-                d = d.with_help(format!("make a vector from it with `vec{n}(...)`"));
+            (TyKind::Float(_), TyKind::Vec(..)) | (TyKind::Int(_), TyKind::Vec(..)) => {
+                d = d.with_help(format!("make a vector from it with `{e}(...)`"));
             }
-            (TyKind::Vec(n), TyKind::Float(_)) => {
+            (TyKind::Vec(..), TyKind::Vec(..)) => {
+                d = d.with_help(format!("convert it, each component: `{e}(...)`"));
+            }
+            (TyKind::Vec(..), TyKind::Float(_) | TyKind::Int(_)) => {
                 d = d.with_help(format!(
-                    "a `vec{n}` isn't a number; take a component (`.x`) or its `length()`"
+                    "a `{a}` isn't a number; take a component (`.x`) or its `length()`"
                 ));
             }
             (TyKind::Tuple(t), _) if t.is_empty() => {
@@ -363,12 +371,13 @@ impl<'p> Checker<'p> {
             }
             // An alias that names traits: one function decides its type (§4).
             (_, TyKind::Opaque(f, args))
-                if args.is_empty()
-                    && self.p.aliases.iter().any(|al| al.defined_by == Some(*f)) =>
+                if args.is_empty() && self.p.aliases.iter().any(|al| al.defined_by == Some(*f)) =>
             {
                 let name = &self.p.func(*f).name;
                 d = d
-                    .with_note(format!("`{e}` is the type `{name}` returns, seen only through its traits"))
+                    .with_note(format!(
+                        "`{e}` is the type `{name}` returns, seen only through its traits"
+                    ))
                     .with_help(format!("use a value of it, such as `{name}(...)`'s"));
             }
             _ => {}
@@ -563,8 +572,12 @@ impl<'p> Checker<'p> {
                 self.bound_once(&p);
                 let never = self.p.types.never;
                 let leave = Expr { ty: never, span: pat.span, kind: ExprKind::Break };
-                let leave =
-                    Block { stmts: Vec::new(), tail: Some(Box::new(leave)), ty: never, span: pat.span };
+                let leave = Block {
+                    stmts: Vec::new(),
+                    tail: Some(Box::new(leave)),
+                    ty: never,
+                    span: pat.span,
+                };
                 let mut b = self.check_loop_body(body);
                 self.env.truncate(env_len);
                 let bind = StmtKind::Bind { pat: p, init, else_: Some(leave) };

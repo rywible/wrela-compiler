@@ -139,7 +139,7 @@ fn as_selects(
         out
     };
     let (then, else_) = (&forward(then), &forward(else_));
-    let register = |t: TypeId| matches!(m.types.get(t), TypeDef::Scalar(_) | TypeDef::Vector(_));
+    let register = |t: TypeId| matches!(m.types.get(t), TypeDef::Scalar(_) | TypeDef::Vector(..));
     // What each side stores: its last value for each local, in the order first stored.
     let mut stored: Vec<LocalId> = Vec::new();
     let mut sides: [HashMap<LocalId, ValueId>; 2] = [HashMap::new(), HashMap::new()];
@@ -301,7 +301,7 @@ impl Merger<'_> {
                 self.shared += 1;
                 e
             }
-            None if matches!(self.m.types.get(t), TypeDef::Scalar(_) | TypeDef::Vector(_)) => {
+            None if matches!(self.m.types.get(t), TypeDef::Scalar(_) | TypeDef::Vector(..)) => {
                 Expr::Select { cond: self.cond, if_true: yes, if_false: no }
             }
             None => return None,
@@ -635,7 +635,7 @@ const SMALL_ARGS: usize = 48;
 fn scalars(m: &Module, t: TypeId, depth: u32) -> Option<usize> {
     match m.types.get(t) {
         TypeDef::Scalar(_) => Some(1),
-        TypeDef::Vector(n) => Some(*n as usize),
+        TypeDef::Vector(_, n) => Some(*n as usize),
         TypeDef::Struct { fields, .. } if depth < 8 => fields
             .iter()
             .try_fold(0usize, |n, (_, ft)| Some(n.saturating_add(scalars(m, *ft, depth + 1)?))),
@@ -1399,9 +1399,10 @@ const SPLIT_BYTES: u32 = 256;
 /// Splits each small local of a struct type (a tuple's too) whose address isn't taken into a
 /// local per field, the fields' own structs again, so that a tuple a function builds and takes apart
 /// at once, such as an inlined `mirrored`'s `(vec3, bool)` or a fold's `(f32, Tissue)`, lives in
-/// WASM locals rather than in its frame. A store of the whole is a store of each field; a load
-/// of the whole builds it again from its fields' loads (which `forward_extracts` then reads
-/// through).
+/// WASM locals rather than in its frame. A vector of `i32`s, `u32`s or `f64`s splits into its
+/// components the same way, unless a value indexes it. A store of the whole is a store of each
+/// field; a load of the whole builds it again from its fields' loads (which `forward_extracts`
+/// then reads through).
 fn split_locals(m: &Module, f: &mut Function) {
     // Nested structs split a level a round.
     for _ in 0..4 {
@@ -1411,13 +1412,20 @@ fn split_locals(m: &Module, f: &mut Function) {
         let mut split = vec![false; f.locals.len()];
         for (i, l) in f.locals.iter().enumerate() {
             split[i] = mentions[i] > 0
-                && matches!(m.types.get(l.ty), TypeDef::Struct { fields, .. }
-                    if !fields.is_empty() && fields.len() <= SPLIT_FIELDS)
+                && split_parts(m, l.ty)
+                    .is_some_and(|ps| !ps.is_empty() && ps.len() <= SPLIT_FIELDS)
                 && crate::layout::layout(&m.types, l.ty).size <= SPLIT_BYTES;
         }
-        // A local whose place goes anywhere but a load or a store stays whole.
+        // A local whose place goes anywhere but a load or a store stays whole, as does a vector
+        // indexed by a value.
         visit::walk(&f.body, &mut |s| match s {
-            Stmt::Store(..) | Stmt::Let(_, Expr::Load(_)) => {}
+            Stmt::Store(..) | Stmt::Let(_, Expr::Load(_)) => s.for_each_place(&mut |p| {
+                if let Some(l) = p.root_local()
+                    && matches!(p.path.first(), Some(Proj::Index(_)))
+                {
+                    split[l.index()] = false;
+                }
+            }),
             s => s.for_each_place(&mut |p| {
                 if let Some(l) = p.root_local() {
                     split[l.index()] = false;
@@ -1434,8 +1442,8 @@ fn split_locals(m: &Module, f: &mut Function) {
                 continue;
             }
             let (name, ty) = (f.locals[i].name.clone(), f.locals[i].ty);
-            let TypeDef::Struct { fields, .. } = m.types.get(ty) else { unreachable!() };
-            parts[i] = fields.iter().map(|(n, t)| f.new_local(format!("{name}.{n}"), *t)).collect();
+            let ps = split_parts(m, ty).expect("checked");
+            parts[i] = ps.into_iter().map(|(n, t)| f.new_local(format!("{name}.{n}"), t)).collect();
         }
         let mut body = std::mem::take(&mut f.body);
         split_block(m, f, &mut body, &parts);
@@ -1443,13 +1451,35 @@ fn split_locals(m: &Module, f: &mut Function) {
     }
 }
 
+/// The parts a local of type `t` splits into, named: a struct's fields (a tuple's too), or the
+/// components of a vector that `scalarize` computes a component at a time. None for others.
+fn split_parts(m: &Module, t: TypeId) -> Option<Vec<(String, TypeId)>> {
+    match m.types.get(t) {
+        TypeDef::Struct { fields, .. } => Some(fields.clone()),
+        TypeDef::Vector(s, n) if *s != Scalar::F32 => {
+            let ct = m.types.lookup(&TypeDef::Scalar(*s))?;
+            Some(
+                ["x", "y", "z", "w"][..usize::from(*n)]
+                    .iter()
+                    .map(|c| (c.to_string(), ct))
+                    .collect(),
+            )
+        }
+        _ => None,
+    }
+}
+
 fn split_block(m: &Module, f: &mut Function, b: &mut Block, parts: &[Vec<LocalId>]) {
-    // The split local a place is in, and the place in its field's local.
+    // The split local a place is in, and the place in its field's (or component's) local.
     let inner = |p: &Place| -> Option<Place> {
         let l = p.root_local()?;
         let ls = parts.get(l.index()).filter(|ls| !ls.is_empty())?;
-        let Some(Proj::Field(k)) = p.path.first() else { return None };
-        Some(Place { root: PlaceRoot::Local(ls[*k as usize]), path: p.path[1..].to_vec() })
+        let k = match p.path.first() {
+            Some(Proj::Field(k)) => *k as usize,
+            Some(Proj::Comp(k)) => usize::from(*k),
+            _ => return None,
+        };
+        Some(Place { root: PlaceRoot::Local(ls[k]), path: p.path[1..].to_vec() })
     };
     let whole = |p: &Place| -> Option<&Vec<LocalId>> {
         let l = p.root_local()?;
@@ -1501,7 +1531,7 @@ fn forward_extracts(m: &Module, f: &mut Function) {
         if let Stmt::Let(v, Expr::Construct(t, xs)) = s {
             let whole = match m.types.get(*t) {
                 TypeDef::Struct { .. } => true,
-                TypeDef::Vector(n) | TypeDef::Matrix(n) => xs.len() == *n as usize,
+                TypeDef::Vector(_, n) | TypeDef::Matrix(n) => xs.len() == *n as usize,
                 _ => false,
             };
             if whole {
@@ -1579,8 +1609,8 @@ fn inert(m: &Module, f: &Function, e: &Expr) -> bool {
         return false;
     }
     let is_float = |v: ValueId| match m.types.get(f.value_ty(v)) {
-        TypeDef::Scalar(s) => s.is_float(),
-        TypeDef::Vector(_) | TypeDef::Matrix(_) => true,
+        TypeDef::Scalar(s) | TypeDef::Vector(s, _) => s.is_float(),
+        TypeDef::Matrix(_) => true,
         _ => false,
     };
     let float = |v: ValueId| m.nan_message.is_none() && is_float(v);
@@ -2221,7 +2251,7 @@ fn forward_block(
                     Expr::Extract(x, k) => src.get(x).and_then(|base| {
                         let proj = match m.types.get(f.value_ty(*x)) {
                             TypeDef::Struct { .. } | TypeDef::Enum { .. } => Proj::Field(*k),
-                            TypeDef::Vector(_) => Proj::Comp(*k as u8),
+                            TypeDef::Vector(..) => Proj::Comp(*k as u8),
                             _ => return None,
                         };
                         Some(base.with(proj))

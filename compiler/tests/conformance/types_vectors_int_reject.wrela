@@ -1,0 +1,24 @@
+// rejects: ty.vectors
+fn mixed(c: vec3i, p: vec3) -> vec3i {
+    // Vectors of two elements don't mix: convert one.
+    c + p //~ E0305
+}
+
+fn shift(v: vec3) -> vec3 {
+    // Only integers shift.
+    v << 1 //~ E0305
+}
+
+fn negate(u: vec3u) -> vec3u {
+    -u //~ E0305
+}
+
+fn components(a: f32) -> vec3u {
+    // A `vec3u`'s components are `u32`s.
+    vec3u(a, 1, 2) //~ E0323
+}
+
+fn wave(d: vec3d) -> vec3d {
+    // An f64's transcendentals aren't supported yet.
+    sin(d) //~ E0702
+}

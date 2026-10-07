@@ -152,6 +152,24 @@ impl Plain for vec3 {}
 
 impl Plain for vec4 {}
 
+impl Plain for vec2i {}
+
+impl Plain for vec3i {}
+
+impl Plain for vec4i {}
+
+impl Plain for vec2u {}
+
+impl Plain for vec3u {}
+
+impl Plain for vec4u {}
+
+impl Plain for vec2d {}
+
+impl Plain for vec3d {}
+
+impl Plain for vec4d {}
+
 impl Plain for mat2 {}
 
 impl Plain for mat3 {}

@@ -88,7 +88,7 @@ impl Checks<'_> {
             if let Some(Expr::ExtractDyn(x, i)) = s.expr() {
                 let n = match self.m.types.get(self.f.value_ty(*x)) {
                     TypeDef::Array(_, n) => Some(*n),
-                    TypeDef::Vector(n) | TypeDef::Matrix(n) => Some(u32::from(*n)),
+                    TypeDef::Vector(_, n) | TypeDef::Matrix(n) => Some(u32::from(*n)),
                     _ => None,
                 };
                 if let Some(n) = n {
@@ -130,7 +130,7 @@ impl Checks<'_> {
             if let Proj::Index(i) = proj {
                 match self.m.types.get(t) {
                     TypeDef::Array(_, n) => out.push((*i, Len::Const(*n))),
-                    TypeDef::Vector(n) | TypeDef::Matrix(n) => {
+                    TypeDef::Vector(_, n) | TypeDef::Matrix(n) => {
                         out.push((*i, Len::Const(u32::from(*n))))
                     }
                     _ => {}
