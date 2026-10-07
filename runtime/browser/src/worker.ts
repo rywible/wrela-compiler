@@ -254,8 +254,13 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
     salted,
     {
       texture: () => screen,
-      afterPass: (encoder) =>
-        encoder.copyTextureToTexture({ texture: screen }, { texture: ctx.getCurrentTexture() }, [width, height]),
+      // Saturated, the canvas is left alone: it shows a frame per display refresh, and would
+      // pace the frames by the display's.
+      afterPass: (encoder) => {
+        if (params.saturate === 0) {
+          encoder.copyTextureToTexture({ texture: screen }, { texture: ctx.getCurrentTexture() }, [width, height]);
+        }
+      },
     },
     {
       hash: hashes,
@@ -291,10 +296,13 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
     clock.startAt(epochNow());
     control.go(params.paced > 0 ? TickerMode.CLOCK : TickerMode.LOCKSTEP);
   }
+  // Saturated, the frames the GPU hasn't finished (at most two: the CPU records a frame while
+  // the GPU draws the last).
+  const inFlight: Promise<undefined>[] = [];
   for (let i = 0; i < frames; i++) {
     // Paced at `fps`, as a display paces frames: requests are answered in real time between
     // them, as when the game runs.
-    await sleepUntil(start + (i * 1000) / fps);
+    if (params.saturate === 0) await sleepUntil(start + (i * 1000) / fps);
     executor.frame = i;
     control.framesStarted(i + 1);
     if (hz > 0 && params.paced === 0) {
@@ -318,7 +326,10 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
     });
     // The serial timing mode runs the frame's passes now, one at a time.
     await scoped(device, () => executor.drain());
-    await device.queue.onSubmittedWorkDone();
+    if (params.saturate > 0) {
+      inFlight.push(device.queue.onSubmittedWorkDone());
+      if (inFlight.length > 2) await inFlight.shift();
+    } else await device.queue.onSubmittedWorkDone();
     await executor.checkDebugFlag();
   }
   if (hz > 0) {

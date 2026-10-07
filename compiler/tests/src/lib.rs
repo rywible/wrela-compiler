@@ -483,6 +483,8 @@ pub struct ChromeRun {
     /// Makes every shader unique, so its pipelines are created cold, and times creating them
     /// (`results/pipelines.json`; 0: none).
     pub salt: u32,
+    /// Each frame as soon as the last is done, not at its time.
+    pub saturate: bool,
 }
 
 impl ChromeRun {
@@ -515,6 +517,7 @@ impl ChromeRun {
             framedelay,
             nohash,
             salt,
+            saturate,
         } = self;
         let mut fragment = format!(
             "#test&frames={frames}&width={width}&height={height}&fps={fps}&workers={workers}"
@@ -531,6 +534,7 @@ impl ChromeRun {
             ("framedelay", *framedelay),
             ("nohash", flag(nohash)),
             ("salt", *salt),
+            ("saturate", flag(saturate)),
         ] {
             if n > 0 {
                 fragment += &format!("&{name}={n}");

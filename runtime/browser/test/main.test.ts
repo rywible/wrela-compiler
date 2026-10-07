@@ -92,7 +92,7 @@ async function load(url: string, options: { hidden?: boolean; devicePixelBox?: b
 
 test("a #test fragment with bad parameters still ends the test", async () => {
   const page = await load("http://127.0.0.1:8000/page/#test&frame=3");
-  expect(page.shown).toEqual(["wrela stopped: unknown test parameter `frame` (expected frames, width, height, fps, workers, audio, timestamps, nohash, input, latency, keylatency, paced, tickdelay, framedelay or salt)"]);
+  expect(page.shown).toEqual(["wrela stopped: unknown test parameter `frame` (expected frames, width, height, fps, workers, audio, timestamps, nohash, input, latency, keylatency, paced, tickdelay, framedelay, salt or saturate)"]);
   expect(page.puts).toEqual(["PUT http://127.0.0.1:8000/page/results/DONE"]);
   expect(page.posted).toEqual([]);
 });

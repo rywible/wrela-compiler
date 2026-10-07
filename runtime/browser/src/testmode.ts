@@ -22,7 +22,10 @@
 // for the other, as in normal play: for time budgets. Either way, `ticks.json` has each tick's
 // CPU time, and, unless `nohash=1`, `ticks.log` is the tick log (runtime/abi `ticks`: each
 // tick's records and state hash), which `wrela-host --replay` replays. With `tickdelay=ms`, each tick is
-// held that much longer; with `framedelay=ms`, each frame. With `salt=n`, each shader gets a
+// held that much longer; with `framedelay=ms`, each frame. With `saturate=1`, each frame starts
+// as soon as the last is recorded, not at its time, with at most two frames on the GPU and the
+// canvas left alone (it would pace them by the display): a GPU that sets its clock by its load
+// stays busy, so a frame's GPU time is its work (GPU budgets). With `salt=n`, each shader gets a
 // comment that makes it unique, so no cache serves its pipelines, and `pipelines.json` has how
 // long creating them all, at once, took (#42 AC4's cold pipelines). `load.json` has when the page opened
 // and each file it loaded; `memory.json` the bytes of the program's GPU buffers and textures (at
@@ -58,6 +61,8 @@ export interface TestParams {
   framedelay: number;
   /** A number that makes every shader's source unique (0: none). */
   salt: number;
+  /** 1: each frame as soon as the last is done, not at its time. */
+  saturate: number;
 }
 
 export const TEST_DEFAULTS: TestParams = {
@@ -76,6 +81,7 @@ export const TEST_DEFAULTS: TestParams = {
   tickdelay: 0,
   framedelay: 0,
   salt: 0,
+  saturate: 0,
 };
 /** Every parameter's name, in order. */
 const NAMES = Object.keys(TEST_DEFAULTS) as (keyof TestParams)[];
