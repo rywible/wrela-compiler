@@ -23,9 +23,8 @@ use wrela_abi::ticks::{Tick, TickLog, frame_time, lockstep_ticks};
 use wrela_abi::{
     AUDIO_QUANTUM, EXPORT_AUDIO, EXPORT_FRAME, EXPORT_INIT, EXPORT_MEMORY, EXPORT_TICK,
     EXPORT_WORKER, HOST_FUNCTIONS, IMPORT_AUDIO, IMPORT_INPUT, IMPORT_KEEP, IMPORT_KEPT,
-    IMPORT_LIMIT, IMPORT_MEMORY,
-    IMPORT_MODULE, IMPORT_REQUEST_STATUS, IMPORT_REQUEST_TAKE, IMPORT_SUBMIT, IMPORT_TICK,
-    Manifest, REQUEST_FAILED, REQUEST_PENDING,
+    IMPORT_LIMIT, IMPORT_MEMORY, IMPORT_MODULE, IMPORT_REQUEST_STATUS, IMPORT_REQUEST_TAKE,
+    IMPORT_SUBMIT, IMPORT_TICK, Manifest, REQUEST_FAILED, REQUEST_PENDING,
 };
 
 /// The process's one wasmtime engine: every program compiles and runs under it, as wasmtime
@@ -1333,9 +1332,7 @@ fn kept<E: Executor>(
     let state = caller.data_mut();
     check_started(state)?;
     let n = (cap as usize).min(state.kept.len());
-    let fits = (ptr as usize)
-        .checked_add(n)
-        .is_some_and(|end| end <= state.memory.data().len());
+    let fits = (ptr as usize).checked_add(n).is_some_and(|end| end <= state.memory.data().len());
     if !fits {
         return Err(wasmtime::format_err!(
             "kept({ptr}, {cap}) reaches past the end of the program's memory"
