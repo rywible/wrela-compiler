@@ -780,6 +780,14 @@ fn grass_coverage(c: &mut Clearing) -> [f64; 2] {
 /// The fewest of the meadow's pixels a band of `grass_coverage` counts.
 const MEADOW_PIXELS: usize = 2000;
 
+/// AC8: the clearing's own tests (`wrela test examples/clearing`, world.wrela): over the whole
+/// walk, a planted foot slides under 5 mm and stands within 1 cm of the terrain, the legs keep
+/// their lengths within 1e-4 m, and the springs' energy decays after the trail's turns.
+#[test]
+fn the_walks_own_tests_pass() {
+    assert_eq!(super::tests_pass(&repo_root().join("examples/clearing")), 2);
+}
+
 /// AC4: the grass is placed on the GPU round the eye and follows it: over the camera's path
 /// (every second), the share of the meadow's pixels its blades cover, near and far, stays
 /// within 10% of the path's start (a ring's edge that thinned would show as a drop). A band

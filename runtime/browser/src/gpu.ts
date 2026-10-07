@@ -275,7 +275,7 @@ type Resource =
 
 /** A command kept for the serial mode's `drain`, or a readback waiting its turn. */
 type Deferred =
-  | { cmd: Command }
+  | { cmd: Command; frame: number }
   | { handle: number; offset: number; size: number; answer: PromiseWithResolvers<Bytes> };
 
 /** `cmd` with its bytes copied out of the program's memory, which the program reuses. */
@@ -454,6 +454,8 @@ export class GpuExecutor {
   readonly #debugFlag: { buffer: GPUBuffer; readback: GPUBuffer } | null;
   /** The frame being recorded, for timings. */
   frame = 0;
+  /** The serial mode: the frame whose command `drain` is running, which its timings take. */
+  #running: number | null = null;
   /** Whether a pass on the screen has ended since this was last cleared: a frame that drew
    * nothing there leaves the screen as it was. */
   presented = false;
@@ -527,14 +529,14 @@ export class GpuExecutor {
 
   /** The timestamp writes for a pass about to be recorded; never flushes. */
   #timestamps(label: string): { timestampWrites?: GPUComputePassTimestampWrites } {
-    return this.#timer === null ? {} : { timestampWrites: this.#timer.next(this.frame, label) };
+    return this.#timer === null ? {} : { timestampWrites: this.#timer.next(this.#running ?? this.frame, label) };
   }
 
   /** Carries out a command that has been decoded, sequenced and checked, or keeps a copy of it
    * for `drain` in the serial mode. Requests are the program's business, except a readback's
    * copy (`readBack`). */
   execute(cmd: Command): void {
-    if (this.#deferred !== null) this.#deferred.push({ cmd: copied(cmd) });
+    if (this.#deferred !== null) this.#deferred.push({ cmd: copied(cmd), frame: this.frame });
     else this.#run(cmd);
   }
 
@@ -544,10 +546,15 @@ export class GpuExecutor {
     if (this.#deferred === null) return;
     for (const d of this.#deferred.splice(0)) {
       if ("cmd" in d) {
+        // Its timings are the frame's that recorded it, which may have been before the one
+        // being recorded now.
+        this.#running = d.frame;
         try {
           this.#run(d.cmd);
         } catch (e) {
           throw new Error(`serial mode, ${d.cmd.op}: ${errorMessage(e)}`);
+        } finally {
+          this.#running = null;
         }
         const op = d.cmd.op;
         if (op === "Dispatch" || op === "DispatchIndirect" || op === "EndPass" || op === "Present") {

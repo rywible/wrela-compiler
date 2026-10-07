@@ -392,6 +392,11 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
   // Saturated, the frames the GPU hasn't finished (at most two: the CPU records a frame while
   // the GPU draws the last).
   const inFlight: Promise<undefined>[] = [];
+  // The serial timing mode's runs of each frame's passes, one after another, so their commands
+  // keep their order; the next frame is recorded while one runs, as a GPU-bound game's would
+  // be (waiting for each idled the GPU between frames, and its clock fell).
+  let draining: Promise<void> = Promise.resolve();
+  const drains: Promise<void>[] = [];
   for (let i = 0; i < frames; i++) {
     // Paced at `fps`, as a display paces frames: requests are answered in real time between
     // them, as when the game runs.
@@ -428,7 +433,11 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
       cpu.push(performance.now() - began);
     });
     // The serial timing mode runs the frame's passes now, one at a time.
-    await scoped(device, () => executor.drain());
+    draining = draining.then(() => scoped(device, () => executor.drain()));
+    draining.catch(fatal);
+    // At most two frames' passes waiting to run: recording stays near the GPU.
+    drains.push(draining);
+    if (drains.length > 2) await drains.shift()!.catch(() => {});
     if (params.saturate > 0) {
       inFlight.push(device.queue.onSubmittedWorkDone());
       if (inFlight.length > 2) await inFlight.shift();
@@ -437,6 +446,7 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
     if (executor.presented) live?.drawn(i);
     executor.presented = false;
   }
+  await draining;
   const hash = program.hash;
   if (hz > 0) {
     ticker.control.stop();
