@@ -226,8 +226,8 @@ pub enum DrawCount {
 /// A draw's render state, which its pipeline holds: build-time constants (§12).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct RenderState {
-    /// `std::gpu::Cull`'s variant: 0 none, 1 front, 2 back.
-    pub cull: u32,
+    /// `std::gpu::Cull`'s variant.
+    pub cull: wrela_abi::manifest::Cull,
     /// `std::gpu::DepthBias`: the constant, and the slope scale's and the clamp's f32 bits.
     pub bias_constant: i32,
     pub bias_slope: u32,
@@ -245,7 +245,8 @@ pub struct Draw {
     /// index count, the instance count, the first index, the base vertex and the first
     /// instance).
     pub indirect: Option<Box<Expr>>,
-    /// An indexed draw's `u32` indices: a `GpuBuffer<u32>` or `GpuSpan<u32>`.
+    /// An indexed draw's `u32` indices: a `GpuBuffer` or `GpuSpan` of `u32`s, or of structs of
+    /// `u32` fields.
     pub indices: Option<Box<Expr>>,
     pub state: RenderState,
     /// Each shader's arguments, bound to it (§12), as (entry point: 0 the vertex shader, 1 the
@@ -339,6 +340,21 @@ pub enum PatKind {
     },
     Tuple(Vec<Pat>),
     Or(Vec<Pat>),
+}
+
+/// A call that borrows each argument, evaluates them in order, and returns a value.
+pub(crate) fn plain_call(
+    callee: Callee,
+    args: Vec<Expr>,
+    receiver: bool,
+    ty: TyId,
+    span: Span,
+) -> Expr {
+    let n = args.len();
+    let modes = vec![Mode::Borrow; n];
+    let call =
+        Call { callee, args, modes, order: (0..n).collect(), receiver, ret_mode: RetMode::Owned };
+    Expr { ty, span, kind: ExprKind::Call(call) }
 }
 
 /// Code directly inside an expression: an expression, or a block.
@@ -441,12 +457,7 @@ impl Expr {
             ExprKind::Draw(d) => {
                 f(Child::Expr(&d.vertices));
                 f(Child::Expr(&d.instances));
-                if let Some(i) = &d.indirect {
-                    f(Child::Expr(i));
-                }
-                if let Some(i) = &d.indices {
-                    f(Child::Expr(i));
-                }
+                d.indirect.iter().chain(&d.indices).for_each(|i| f(Child::Expr(i)));
                 d.args.iter().for_each(|(_, _, a)| f(Child::Expr(a)));
             }
         }

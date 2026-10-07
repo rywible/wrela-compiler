@@ -61,6 +61,11 @@ pub(crate) fn load_u32(m: &SharedMemory, at: u32) -> u32 {
     word(m, at as usize).load(Ordering::SeqCst)
 }
 
+/// The `u64` at `at`: its two words, low first, each read atomically.
+pub(crate) fn load_u64(m: &SharedMemory, at: u32) -> u64 {
+    u64::from(load_u32(m, at)) | (u64::from(load_u32(m, at + 4)) << 32)
+}
+
 /// Sets `bits` in the word at `at` atomically.
 pub(crate) fn or_u32(m: &SharedMemory, at: u32, bits: u32) {
     word(m, at as usize).fetch_or(bits, Ordering::SeqCst);

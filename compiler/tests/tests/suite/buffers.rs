@@ -343,18 +343,9 @@ pub fn bits64() -> u64 {
 #[test]
 #[ignore = "needs a GPU"]
 fn gpu_data_has_the_cpus_bytes() {
-    let mut gpu = wrela_host::Host::load(crate::built("gpu-data")).expect("load");
-    gpu.frame(0.0, 64, 64).expect("a frame");
-    let b = gpu.buffers();
     // The game's buffers, in the order `init` makes them: three pairs, `ons`, two pairs.
-    let pairs = [("flags", 0), ("read", 2), ("picks", 4), ("items", 7), ("measures", 9)];
-    let first = b.len() - 11;
-    for (name, at) in pairs {
-        let cpu = gpu.read_buffer(b[first + at]).expect("read");
-        let on_gpu = gpu.read_buffer(b[first + at + 1]).expect("read");
-        assert_eq!(cpu.len(), on_gpu.len(), "{name}");
-        assert!(cpu.iter().any(|&x| x != 0), "{name}: the CPU's values are all zero");
-        let differ = cpu.chunks(4).zip(on_gpu.chunks(4)).position(|(a, b)| a != b);
-        assert_eq!(differ, None, "{name}: the CPU's and the GPU's words differ (the first)");
+    let b = crate::first_frame_buffers("gpu-data", 11);
+    for (name, at) in [("flags", 0), ("read", 2), ("picks", 4), ("items", 7), ("measures", 9)] {
+        crate::same_words(name, &b[at], &b[at + 1]);
     }
 }

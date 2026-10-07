@@ -647,16 +647,10 @@ impl<'a> Cx<'a> {
             return false;
         }
         let mut ok = true;
-        let exportable = |t: &TyKind, ret: bool| match t {
-            TyKind::Bool | TyKind::Int(_) | TyKind::Float(_) => true,
-            TyKind::Vec(..) => true,
-            TyKind::Tuple(ts) => ret && ts.is_empty(),
-            _ => false,
-        };
         let skip = usize::from(takes_state);
         for p in &def.params[skip..] {
             let k = self.checked.program.types.kind(p.ty);
-            if !exportable(k, false) {
+            if !matches!(k, TyKind::Bool | TyKind::Int(_) | TyKind::Float(_) | TyKind::Vec(..)) {
                 ok = false;
                 let shown = self.checked.program.display_ty(p.ty);
                 self.err(
@@ -674,9 +668,9 @@ impl<'a> Cx<'a> {
                 );
             }
         }
-        let rk = self.checked.program.types.kind(def.ret);
         let values = export_values(&self.checked.program, def.ret);
-        if !(exportable(rk, true) || values.is_some_and(|n| n <= MAX_EXPORT_VALUES))
+        if !(self.checked.program.types.is_unit(def.ret)
+            || values.is_some_and(|n| n <= MAX_EXPORT_VALUES))
             || def.ret_mode != wrela_sema::defs::RetMode::Owned
         {
             ok = false;
@@ -893,13 +887,16 @@ pub(crate) fn cpu_math_lang(b: ir::Builtin) -> Option<Lang> {
 }
 
 /// Replaces the CPU module's transcendental builtins by calls to std's wrela implementations,
-/// per component for vectors. Runs after derived interpretations, which read the builtins.
+/// per component for vectors; then makes the arithmetic of vectors of other components than
+/// f32s a component at a time (`ir::scalarize`). Runs after derived interpretations, which
+/// read the builtins.
 fn rewrite_cpu_math(cx: &mut Cx, mb: &mut ModuleBuilder) {
     let mut i = 0;
     while i < mb.m.functions.len() {
         let mut f = std::mem::take(&mut mb.m.functions[i]);
-        let body = std::mem::take(&mut f.body);
-        f.body = rewrite_block(cx, mb, &mut f, body);
+        let mut body = std::mem::take(&mut f.body);
+        ir::visit::expand(&mut body, &mut |s, out| rewrite_math(cx, mb, &mut f, s, out));
+        f.body = body;
         mb.m.functions[i] = f;
         i += 1;
     }
@@ -907,48 +904,39 @@ fn rewrite_cpu_math(cx: &mut Cx, mb: &mut ModuleBuilder) {
     ir::scalarize::scalarize_vectors(&mut mb.m);
 }
 
-fn rewrite_block(
+/// `s` into `out`; a transcendental builtin it computes becomes a call to std's (a call per
+/// component, for a vector).
+fn rewrite_math(
     cx: &mut Cx,
     mb: &mut ModuleBuilder,
     f: &mut ir::Function,
-    b: ir::Block,
-) -> ir::Block {
-    let mut out = Vec::with_capacity(b.len());
-    for mut s in b {
-        if let ir::Stmt::Let(v, ir::Expr::Builtin(op, args)) = &s
-            && let Some(func) = cpu_math_lang(*op).and_then(|l| cx.checked.program.lang_fn(l))
-        {
-            let v = *v;
-            let callee = cx.instance(mb, InstanceKey::plain(func, Vec::new()), None);
-            let ty = f.value_ty(v);
-            let f32 = mb.m.types.f32();
-            if let &ir::TypeDef::Vector(ir::Scalar::F32, n) = mb.m.types.get(ty) {
-                let mut comps = Vec::new();
-                for c in 0..n as u32 {
-                    let mut parts = Vec::new();
-                    for &a in args {
-                        let x = f.new_value(f32);
-                        out.push(ir::Stmt::Let(x, ir::Expr::Extract(a, c)));
-                        parts.push(ir::Arg::Value(x));
-                    }
-                    let r = f.new_value(f32);
-                    out.push(ir::Stmt::Let(r, ir::Expr::Call(callee, parts)));
-                    comps.push(r);
-                }
-                out.push(ir::Stmt::Let(v, ir::Expr::Construct(ty, comps)));
-            } else {
-                let args = args.iter().map(|&a| ir::Arg::Value(a)).collect();
-                out.push(ir::Stmt::Let(v, ir::Expr::Call(callee, args)));
-            }
-            continue;
-        }
-        for inner in s.blocks_mut() {
-            let b = std::mem::take(inner);
-            *inner = rewrite_block(cx, mb, f, b);
-        }
+    s: ir::Stmt,
+    out: &mut ir::Block,
+) {
+    if let ir::Stmt::Let(v, ir::Expr::Builtin(op, args)) = &s
+        && let Some(func) = cpu_math_lang(*op).and_then(|l| cx.checked.program.lang_fn(l))
+    {
+        let callee = cx.instance(mb, InstanceKey::plain(func, Vec::new()), None);
+        let ty = f.value_ty(*v);
+        let f32 = mb.m.types.f32();
+        let e = if let &ir::TypeDef::Vector(ir::Scalar::F32, n) = mb.m.types.get(ty) {
+            let comps = (0..u32::from(n))
+                .map(|c| {
+                    let parts = args
+                        .iter()
+                        .map(|&a| ir::Arg::Value(f.let_(out, f32, ir::Expr::Extract(a, c))))
+                        .collect();
+                    f.let_(out, f32, ir::Expr::Call(callee, parts))
+                })
+                .collect();
+            ir::Expr::Construct(ty, comps)
+        } else {
+            ir::Expr::Call(callee, args.iter().map(|&a| ir::Arg::Value(a)).collect())
+        };
+        out.push(ir::Stmt::Let(*v, e));
+    } else {
         out.push(s);
     }
-    out
 }
 
 /// The most values an export returns (WASM's multi-value results, each a number).
@@ -963,17 +951,7 @@ fn export_values(p: &wrela_sema::program::Program, t: TyId) -> Option<usize> {
         TyKind::Bool | TyKind::Int(_) | TyKind::Float(_) => Some(1),
         TyKind::Vec(_, n) => Some(usize::from(*n)),
         TyKind::Mat(n) => Some(usize::from(*n) * usize::from(*n)),
-        TyKind::Tuple(ts) if !ts.is_empty() => ts.iter().map(|&e| export_values(p, e)).sum(),
         TyKind::Array(e, n) if *n > 0 => Some(export_values(p, *e)? * *n as usize),
-        TyKind::Adt(a, args)
-            if p.lang_of_ty(t).is_none() && !p.adt(*a).is_enum() && !p.adt(*a).borrow =>
-        {
-            let fields = p.fields_of(*a, args, None);
-            if fields.is_empty() {
-                return None;
-            }
-            fields.into_iter().map(|f| export_values(p, f)).sum()
-        }
-        _ => None,
+        _ => p.plain_parts(t)?.into_iter().map(|e| export_values(p, e)).sum(),
     }
 }

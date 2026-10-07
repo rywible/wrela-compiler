@@ -211,8 +211,8 @@ fn run_trace(a: &Args) -> Result<ExitCode, String> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// A condition on an export: its name, which of its values (0 unless `.x`/`.y`/... picks), and
-/// what must hold of it.
+/// A condition on an export: its name, which of its values (0 unless `.x`/`.y`/... or a place,
+/// `.5`, picks), and what must hold of it.
 struct Until {
     export: String,
     component: usize,

@@ -1,19 +1,19 @@
 // Sketch 02, "drawing the grazer" (design-archive-2026-10: docs/design/sketches/
 // 02-drawing-the-grazer.md). The sketch is engine code: its look settings are
-// engine/look.wrela and its extraction and drawing engine/render.wrela, each change from the
-// sketch noted there ("Changed:"). This program realizes sketch 01's grazer once, at init,
+// engine/look.wrela, its extraction engine/realize.wrela and its drawing engine/render.wrela,
+// rebuilt since to #43 §7–§8. This program realizes sketch 01's grazer once, at init,
 // and draws it each frame: skinned by a palette that sways its neck, and shaded per pixel by
 // its field's channels and gradient (compiler/tests/tests/suite/sketches.rs runs it in both
 // hosts).
 
 use engine::creature::Creature
-use engine::realize::{Grid, Mesh, Room, Scratch, grow, record}
-use engine::render::{ByChannels, Lights, MAX_BONES, Palette, View, shade, skin, view}
+use engine::realize::{Mesh, realize_once}
+use engine::render::{ByChannels, Lights, MAX_BONES, Palette, View, shade, skin, unlit_shadow, view}
 use engine::rng::seed
-use grazer::sketch::{GRAZER_LOOK, Tissue, grazer}
+use grazer::sketch::{GRAZER_LOOK, grazer}
 use std::gpu::{
-    ComparisonSampler, Cull, DepthTexture, GpuBuffer, begin_depth_pass,
-    begin_screen_pass_with_depth, buffer, comparison_sampler, depth_texture, draw, write,
+    ComparisonSampler, Cull, DepthTexture, GpuBuffer, begin_screen_pass_with_depth, buffer,
+    comparison_sampler, depth_texture, draw, write,
 }
 
 pub struct Scene {
@@ -31,20 +31,10 @@ pub fn init() -> Scene {
     // Realization: when the engine realizes an individual (here, at load), then kept.
     var meshes: Vec<Mesh> = Vec::new()
     for i in 0..2 {
-        let g = grazer(seed(i + 1))
-        let look = GRAZER_LOOK
-        let grid = Grid::around(
-            grow(g.bounds(), look.surface.tolerance),
-            look.surface.cell_size(0.05),
-        )
-        var mesh = Mesh::new(Room { vertices: grid.blocks * 8, quads: grid.blocks * 16 })
-        var scratch = Scratch::new(grid.blocks)
-        record(g.field(), grid, look.deform.weights.falloff, mut scratch, mut mesh)
-        meshes.push(take mesh)
+        meshes.push(realize_once(grazer(seed(i + 1)), GRAZER_LOOK))
     }
-    // No shadows: a shadow map of one texel, all lit.
-    var shadow = depth_texture(width: 1, height: 1)
-    begin_depth_pass(mut shadow, clear_depth: 1.0).end()
+    // No shadows.
+    let shadow = unlit_shadow()
     Scene {
         meshes,
         palettes: buffer(2 * MAX_BONES),

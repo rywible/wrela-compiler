@@ -167,20 +167,12 @@ impl<'a> Parser<'a> {
             T::Mut if self.nth(1) == T::Ident && matches!(self.nth(2), T::Eq | T::Colon) => {
                 self.parse_named_bind(VarKind::Mut)?
             }
-            T::While if self.nth(1) == T::Let => {
-                self.bump();
-                self.bump();
-                let pat = self.parse_pattern()?;
-                self.expect(T::Eq, "`=`")?;
-                let init = self.parse_expr_ctx(Ctx::NoStruct)?;
-                let body = self.parse_block()?;
-                StmtKind::WhileLet { pat, init, body }
-            }
             T::While => {
                 self.bump();
+                let pat = self.opt_let_pattern()?;
                 let cond = self.parse_expr_ctx(Ctx::NoStruct)?;
                 let body = self.parse_block()?;
-                StmtKind::While { cond, body }
+                StmtKind::While { pat, cond, body }
             }
             T::Loop => {
                 self.bump();
@@ -441,7 +433,7 @@ impl<'a> Parser<'a> {
                     // `|_| ...`: a parameter it doesn't use, which nothing can name.
                     let name = if p.at(T::Underscore) {
                         let t = p.bump();
-                        Ident { name: "_".into(), span: t.span }
+                        p.ident_of(t)
                     } else {
                         p.ident("a closure parameter")?
                     };
@@ -1138,16 +1130,20 @@ impl<'a> Parser<'a> {
         Ok(Expr::new(ExprKind::StructLit { path, fields, base, multiline }, span))
     }
 
+    /// `let pattern =` after `if` or `while`, if it's there.
+    fn opt_let_pattern(&mut self) -> PResult<Option<Pat>> {
+        if !self.eat(T::Let) {
+            return Ok(None);
+        }
+        let pat = self.parse_pattern()?;
+        self.expect(T::Eq, "`=`")?;
+        Ok(Some(pat))
+    }
+
     /// if_expr ::= "if" ("let" pattern "=")? expr_ns block ("else" (if_expr | block))?
     fn parse_if(&mut self) -> PResult<Expr> {
         let start = self.expect(T::If, "`if`")?.span;
-        let pat = if self.eat(T::Let) {
-            let pat = self.parse_pattern()?;
-            self.expect(T::Eq, "`=`")?;
-            Some(Box::new(pat))
-        } else {
-            None
-        };
+        let pat = self.opt_let_pattern()?.map(Box::new);
         let cond = self.parse_expr_ctx(Ctx::NoStruct)?;
         if !self.at(T::LBrace) {
             return Err(self.expected("`{` to start the `if` body"));

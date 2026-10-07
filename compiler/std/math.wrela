@@ -258,8 +258,7 @@ pub fn exp(x: f32) -> f32 {
     if xd < -104.0 {
         return 0.0
     }
-    let n = round(xd * LOG2E)
-    f32(exp_poly(xd - n * LN2) * pow2(i32(n)))
+    f32(exp_f64(xd))
 }
 
 /// The hyperbolic sine of `x`, (e^x - e^-x) / 2.

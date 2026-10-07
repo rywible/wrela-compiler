@@ -240,8 +240,7 @@ fn rvalue_uses(body: &Body, r: &Rvalue, out: &mut Vec<Local>) {
             operand_uses(&d.vertices, out);
             operand_uses(&d.instances, out);
             d.args.iter().for_each(|(_, _, p, _)| place_uses(p, out));
-            d.indirect.iter().for_each(|(p, _)| place_uses(p, out));
-            d.indices.iter().for_each(|(p, _)| place_uses(p, out));
+            d.indirect.iter().chain(&d.indices).for_each(|(p, _)| place_uses(p, out));
         }
     }
 }
@@ -755,7 +754,7 @@ impl<'a> FnCheck<'a> {
                     out = Some(if run { RetMode::Borrow } else { f.mode });
                 }
             }
-            t = crate::mir::proj_ty_pub(self.p, t, &mut variant, proj);
+            t = crate::mir::proj_ty(self.p, t, &mut variant, proj);
         }
         out
     }
@@ -1989,10 +1988,7 @@ fn rvalue_places(body: &Body, r: &Rvalue, add: &mut dyn FnMut(&Place, bool)) {
             for (_, _, p, _) in &d.args {
                 add(p, false);
             }
-            if let Some((p, _)) = &d.indirect {
-                add(p, false);
-            }
-            if let Some((p, _)) = &d.indices {
+            for (p, _) in d.indirect.iter().chain(&d.indices) {
                 add(p, false);
             }
         }

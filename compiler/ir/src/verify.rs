@@ -488,18 +488,7 @@ impl Verifier<'_> {
     }
 
     fn extract(&self, t: TypeId, k: u32) -> Result<TypeId> {
-        let types = &self.m.types;
-        let r = match self.def(t) {
-            TypeDef::Struct { .. } | TypeDef::Enum { .. } => types.field(t, k),
-            TypeDef::Vector(s, n) if k < u32::from(*n) => types.lookup(&TypeDef::Scalar(*s)),
-            TypeDef::Matrix(n) if k < u32::from(*n) => {
-                types.lookup(&TypeDef::Vector(Scalar::F32, *n))
-            }
-            TypeDef::Array(e, n) if k < *n => Some(*e),
-            TypeDef::Run(_) if k < 2 => types.lookup(&TypeDef::Scalar(Scalar::U32)),
-            _ => None,
-        };
-        r.ok_or_else(|| bug(format!("part {k} of a `{}`", self.show(t))))
+        self.m.types.part(t, k).ok_or_else(|| bug(format!("part {k} of a `{}`", self.show(t))))
     }
 
     fn block(&mut self, b: &Block) -> Result<()> {

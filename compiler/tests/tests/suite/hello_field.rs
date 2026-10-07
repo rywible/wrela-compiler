@@ -9,9 +9,8 @@
 //! rewrites the golden from the native host.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use wrela_host::{Host, RunResult, Value, frame_time, image};
-use wrela_tests::{must_build, repo_root};
+use wrela_tests::repo_root;
 
 const WIDTH: u32 = 1280;
 const HEIGHT: u32 = 720;
@@ -25,12 +24,7 @@ const PROBE_LIMIT: f64 = 2.0;
 /// The build, in a directory under the repo root (tools/headless.py serves the repo), so it's
 /// also the browser's page.
 fn page(name: &str) -> (PathBuf, String) {
-    let rel = format!("target/tmp/hello-field-{name}");
-    let dir = repo_root().join(&rel);
-    let _ = std::fs::remove_dir_all(&dir);
-    must_build(&repo_root().join("examples/hello-field"), &dir);
-    std::fs::create_dir_all(dir.join("results")).expect("results dir");
-    (dir, rel)
+    wrela_tests::page("examples/hello-field", &format!("hello-field-{name}"))
 }
 
 fn golden() -> PathBuf {
@@ -109,23 +103,13 @@ fn the_browser_matches_the_golden_and_the_native_host() {
     let (dir, rel) = page("browser");
     // The browser first: this thread holds no GPU lock while Chrome runs (Chrome waits for
     // another thread's).
-    let fragment = format!("#test&frames={FRAMES}&width={WIDTH}&height={HEIGHT}&fps={FPS}");
-    let status = Command::new("python3")
-        .arg(repo_root().join("tools/headless.py"))
-        .args([rel.as_str(), &fragment, "300"])
-        .current_dir(repo_root())
-        .status()
-        .expect("python3 runs tools/headless.py");
-    assert!(status.success(), "the browser run failed; see {rel}/results/console.log");
-    let results = dir.join("results");
-    let browser_hash = std::fs::read_to_string(results.join("hash.txt")).expect("hash.txt");
-    let browser_frame = std::fs::read(results.join("frame.rgba")).expect("frame.rgba");
+    let browser = wrela_tests::run_in_chrome(&rel, FRAMES, WIDTH, HEIGHT, FPS);
 
     let run = native(&dir);
-    assert_eq!(browser_hash.trim(), run.hash_hex(), "the hosts' state hashes differ");
+    assert_eq!(browser.hash, run.hash_hex(), "the hosts' state hashes differ");
     eprintln!("state hash {} in Chrome and in the native host", run.hash_hex());
-    against_golden(&browser_frame, "headless Chrome");
-    let diff = image::compare(&browser_frame, &run.frame).expect("same size");
+    against_golden(&browser.frame, "headless Chrome");
+    let diff = image::compare(&browser.frame, &run.frame).expect("same size");
     eprintln!("Chrome against the native host: mean {:.4}/255, max {}/255", diff.mean, diff.max);
 }
 
@@ -135,7 +119,7 @@ fn the_browser_matches_the_golden_and_the_native_host() {
 const LOAD_BUDGET_SECONDS: f64 = 1.0;
 
 #[test]
-#[ignore = "long: needs a GPU"]
+#[ignore = "long: alone: needs a GPU"]
 fn loading_creates_the_pipelines_within_budget() {
     let (dir, _) = page("load");
     // Held across the loads (each takes it again), so the time doesn't count a wait for it.

@@ -15,10 +15,11 @@ use wasmtime::{
 };
 use wrela_abi::check::{Checker, CommandError};
 use wrela_abi::hash::StateHash;
-use wrela_abi::input::{EVENT_SIZE, Event, Queue};
+use wrela_abi::input::{EVENT_SIZE, Event, Queue, Scripted};
 use wrela_abi::lines::{self, Lines};
 use wrela_abi::memory::{self, MAX_WORKERS};
 use wrela_abi::stream::{self, Command, Sequencer};
+use wrela_abi::ticks::{Tick, TickLog, frame_time, lockstep_ticks};
 use wrela_abi::{
     AUDIO_QUANTUM, EXPORT_AUDIO, EXPORT_FRAME, EXPORT_INIT, EXPORT_MEMORY, EXPORT_TICK,
     EXPORT_WORKER, HOST_FUNCTIONS, IMPORT_AUDIO, IMPORT_INPUT, IMPORT_LIMIT, IMPORT_MEMORY,
@@ -313,7 +314,7 @@ type AudioThread = (Store<()>, TypedFunc<(u32, u32, u32), ()>);
 
 /// The ticker's thread's instance of the program, its `__tick(thread, task, context, tick)`,
 /// and the next tick's number.
-pub(crate) struct TickThread {
+struct TickThread {
     store: Store<()>,
     tick: TypedFunc<(u32, u32, u32, u32), ()>,
     next: u32,
@@ -324,20 +325,17 @@ pub(crate) struct TickThread {
 }
 
 impl TickThread {
-    /// Runs the next tick with `records`, and asks for its state's hash if `hash`: on whichever
-    /// OS thread holds this (a tick can run beside the program's frames).
-    pub(crate) fn run(
+    /// Runs the next tick with `records`, on whichever OS thread holds this (a tick can run
+    /// beside the program's frames): its state's hash too, if the host asked for it
+    /// ([`Program::want_hashes`]).
+    fn run(
         &mut self,
         records: Vec<[u8; EVENT_SIZE as usize]>,
-        hash: bool,
     ) -> std::result::Result<Ticked, (u32, wasmtime::Error)> {
         let k = self.next;
-        let mut bytes = (records.len() as u32).to_le_bytes().to_vec();
-        for r in &records {
-            bytes.extend(r);
-        }
-        shared::write(&self.memory, memory::TICK_RECORDS as usize, &bytes);
-        shared::store_u32(&self.memory, memory::TICK_WANT_HASH, u32::from(hash));
+        let at = memory::TICK_RECORDS as usize;
+        shared::write(&self.memory, at, &(records.len() as u32).to_le_bytes());
+        shared::write(&self.memory, at + 4, records.as_flattened());
         if let Some(fuel) = self.fuel {
             self.store.set_fuel(fuel).map_err(|e| (k, e))?;
         }
@@ -351,18 +349,14 @@ impl TickThread {
             self.tick.call(&mut self.store, (memory::THREAD_TICK, self.task, self.context, k));
         self.next += 1;
         result.map_err(|e| (k, e))?;
-        let reported = || {
-            let lo = shared::load_u32(&self.memory, memory::TICK_HASH);
-            let hi = shared::load_u32(&self.memory, memory::TICK_HASH + 4);
-            u64::from(lo) | (u64::from(hi) << 32)
-        };
         let after = counts();
         let [waited, allocations, lock_waits, lock_spins] =
             [0, 1, 2, 3].map(|i| after[i].wrapping_sub(before[i]));
+        let hashed = shared::load_u32(&self.memory, memory::TICK_WANT_HASH) != 0;
         Ok(Ticked {
             tick: k,
             records,
-            hash: hash.then(reported),
+            hash: hashed.then(|| shared::load_u64(&self.memory, memory::TICK_HASH)),
             waited,
             allocations,
             lock_waits,
@@ -507,29 +501,29 @@ pub(crate) struct Compiled {
     lines: Option<Arc<Lines>>,
 }
 
+/// The engine a program compiles for: [`METERED`] with `fuel`, else [`ENGINE`].
+fn engine_for(fuel: Option<u64>) -> &'static Engine {
+    if fuel.is_some() { &METERED } else { &ENGINE }
+}
+
 /// Compiles a program and checks it against the ABI ([`check_abi`]); with `fuel`, for the
 /// metered engine, where each call gets that much fuel.
 #[cfg(test)]
 pub(crate) fn compile_with(wasm: &[u8], fuel: Option<u64>) -> Result<Compiled> {
-    let engine = if fuel.is_some() { &*METERED } else { &*ENGINE };
-    let module = Module::new(engine, wasm).map_err(|e| Error::Program(format!("{e:#}")))?;
+    let module =
+        Module::new(engine_for(fuel), wasm).map_err(|e| Error::Program(format!("{e:#}")))?;
     compiled(module, wasm, fuel)
 }
 
-/// [`compile_with`] with no fuel, the compiled code kept beside the build in `dir`
-/// (`crate::cache`).
-pub(crate) fn compile_cached(wasm: &[u8], dir: &std::path::Path) -> Result<Compiled> {
-    compile_cached_with(wasm, dir, None)
-}
-
-/// [`compile_with`], the compiled code kept beside the build in `dir` (`crate::cache`).
-pub(crate) fn compile_cached_with(
+/// [`compile_with`], the compiled code kept beside the build in `dir`, if given
+/// (`crate::cache`); `hash` is the WASM's ([`wrela_abi::ticks::wasm_hash`]).
+pub(crate) fn compile_cached(
     wasm: &[u8],
-    dir: &std::path::Path,
+    hash: u64,
+    dir: Option<&std::path::Path>,
     fuel: Option<u64>,
 ) -> Result<Compiled> {
-    let engine = if fuel.is_some() { &*METERED } else { &*ENGINE };
-    compiled(crate::cache::module(engine, wasm, dir)?, wasm, fuel)
+    compiled(crate::cache::module(engine_for(fuel), wasm, hash, dir)?, wasm, fuel)
 }
 
 fn compiled(module: Module, wasm: &[u8], fuel: Option<u64>) -> Result<Compiled> {
@@ -741,28 +735,20 @@ impl<E: Executor> Program<E> {
     /// A trap on thread `thread` as the host reports it, with its panic message and where it
     /// was; kept as [`Program::last_failure`].
     fn trapped(&mut self, trap: &wasmtime::Error, thread: u32) -> Error {
-        {
-            {
-                let what = self.describe_trap(trap);
-                let panic = self.take_panic_message(thread);
-                let frames = trap
-                    .downcast_ref::<wasmtime::WasmBacktrace>()
-                    .map(|bt| {
-                        bt.frames()
-                            .iter()
-                            .filter_map(|f| f.module_offset())
-                            .map(|o| o as u32)
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let kind = trap.downcast_ref::<wasmtime::Trap>().copied();
-                self.last_failure = Some(Failure { frames, trap: kind, panic: panic.clone() });
-                Error::Trap(match panic {
-                    Some(msg) => format!("panic: {msg}: {what}"),
-                    None => what,
-                })
-            }
-        }
+        let what = self.describe_trap(trap);
+        let panic = self.take_panic_message(thread);
+        let frames = trap
+            .downcast_ref::<wasmtime::WasmBacktrace>()
+            .map(|bt| {
+                bt.frames().iter().filter_map(|f| f.module_offset()).map(|o| o as u32).collect()
+            })
+            .unwrap_or_default();
+        let kind = trap.downcast_ref::<wasmtime::Trap>().copied();
+        self.last_failure = Some(Failure { frames, trap: kind, panic: panic.clone() });
+        Error::Trap(match panic {
+            Some(msg) => format!("panic: {msg}: {what}"),
+            None => what,
+        })
     }
 
     /// The message a panic on thread `thread` left before it trapped (its block's
@@ -845,14 +831,23 @@ impl<E: Executor> Program<E> {
     /// Whether each tick reports its state's hash (`wrela_abi::memory::TICK_WANT_HASH`), and so
     /// does the ticker's `start`, if it hasn't run yet.
     pub(crate) fn want_hashes(&self, on: bool) {
-        crate::shared::store_u32(&self.memory, memory::TICK_WANT_HASH, u32::from(on));
+        shared::store_u32(&self.memory, memory::TICK_WANT_HASH, u32::from(on));
     }
 
     /// The state hash the ticker reported last: after `start`, the first state's.
     pub(crate) fn reported_hash(&self) -> u64 {
-        let lo = crate::shared::load_u32(&self.memory, memory::TICK_HASH);
-        let hi = crate::shared::load_u32(&self.memory, memory::TICK_HASH + 4);
-        u64::from(lo) | (u64::from(hi) << 32)
+        shared::load_u64(&self.memory, memory::TICK_HASH)
+    }
+
+    /// A tick log of no ticks yet, for the program's ticker and the build whose WASM hash is
+    /// `wasm_hash`: an error if the program has no ticker.
+    pub(crate) fn tick_log(&self, wasm_hash: u64) -> Result<TickLog> {
+        let Some(hz) = self.ticker_hz() else {
+            return Err(Error::Program(
+                "it starts no ticker in `init` (`std::tick::start`)".into(),
+            ));
+        };
+        Ok(TickLog::new(wasm_hash, hz, self.reported_hash()))
     }
 
     /// Queues input events for the ticker: the next ticks take them as records, at most
@@ -867,7 +862,7 @@ impl<E: Executor> Program<E> {
     }
 
     /// The next tick's number.
-    pub(crate) fn next_tick(&self) -> u32 {
+    fn next_tick(&self) -> u32 {
         self.ticker.as_ref().map_or(0, |t| t.next)
     }
 
@@ -875,11 +870,11 @@ impl<E: Executor> Program<E> {
     /// `MAX_TICK_RECORDS`; the rest wait): its number, and the state's hash if
     /// [`Program::want_hashes`] asked for it. An error if the program has no ticker, or the
     /// tick trapped (the program's panic).
-    pub(crate) fn tick(&mut self, hash: bool) -> Result<Ticked> {
+    pub(crate) fn tick(&mut self) -> Result<Ticked> {
         let n = self.records.len().min(memory::MAX_TICK_RECORDS as usize);
         let records: Vec<[u8; EVENT_SIZE as usize]> = self.records.drain(..n).collect();
         let mut thread = self.take_tick_thread()?;
-        let result = thread.run(records, hash);
+        let result = thread.run(records);
         self.ticker = Some(thread);
         let t = result.map_err(|(k, trap)| self.tick_trapped(k, &trap))?;
         if t.waited > 0 {
@@ -889,18 +884,34 @@ impl<E: Executor> Program<E> {
         Ok(t)
     }
 
+    /// Runs the next tick with `script`'s records of it (its tick-keyed events) queued after the
+    /// rest. With `log`, its records and state hash go into it (hashes asked for).
+    pub(crate) fn scripted_tick(
+        &mut self,
+        script: &[Scripted],
+        log: Option<&mut TickLog>,
+    ) -> Result<()> {
+        self.push_records(wrela_abi::input::records_at(script, self.next_tick()));
+        let t = self.tick()?;
+        if let Some(log) = log {
+            let hash = t.hash.expect("hashes asked for");
+            log.ticks.push(Tick { records: t.records, hash });
+        }
+        Ok(())
+    }
+
     /// Frame `i` of a lockstep schedule at `fps` (#43 §2.3): `script`'s events of frame `i`
     /// queued for the frame and the ticker, then the ticks that come before the frame (each with
     /// its tick-keyed records too), then the frame. With `log`, each tick's records and state
-    /// hash go into it.
+    /// hash go into it (hashes asked for).
     pub(crate) fn lockstep_frame(
         &mut self,
         i: u32,
         fps: f64,
         width: u32,
         height: u32,
-        script: &[wrela_abi::input::Scripted],
-        mut log: Option<&mut wrela_abi::ticks::TickLog>,
+        script: &[Scripted],
+        mut log: Option<&mut TickLog>,
     ) -> Result<()> {
         let events: Vec<Event> = wrela_abi::input::events_at(script, i).collect();
         for &e in &events {
@@ -908,23 +919,17 @@ impl<E: Executor> Program<E> {
         }
         if let Some(hz) = self.ticker_hz() {
             self.push_records(events);
-            while self.next_tick() < crate::lockstep_ticks(i, hz, fps) {
-                let k = self.next_tick();
-                self.push_records(wrela_abi::input::records_at(script, k));
-                let t = self.tick(log.is_some())?;
-                if let Some(log) = log.as_deref_mut() {
-                    let hash = t.hash.expect("asked for");
-                    log.ticks.push(wrela_abi::ticks::Tick { records: t.records, hash });
-                }
+            while self.next_tick() < lockstep_ticks(i, hz, fps) {
+                self.scripted_tick(script, log.as_deref_mut())?;
             }
         }
-        self.frame(crate::frame_time(i, fps), width, height)
+        self.frame(frame_time(i, fps), width, height)
     }
 
     /// The ticker's thread's instance, made the first time, to run ticks on any OS thread
-    /// ([`TickThread::run`]); give it back with [`Program::restore_tick_thread`]. An error if
-    /// the program hasn't started a ticker.
-    pub(crate) fn take_tick_thread(&mut self) -> Result<TickThread> {
+    /// ([`TickThread::run`]); give it back by putting it in `self.ticker`. An error if the
+    /// program hasn't started a ticker.
+    fn take_tick_thread(&mut self) -> Result<TickThread> {
         let Some((task, context, _)) = self.store.data().ticker else {
             return Err(Error::Program("it hasn't started a ticker (`std::tick::start`)".into()));
         };
@@ -941,10 +946,6 @@ impl<E: Executor> Program<E> {
         Ok(TickThread { store, tick, next: 0, memory, task, context, fuel: self.fuel })
     }
 
-    pub(crate) fn restore_tick_thread(&mut self, t: TickThread) {
-        self.ticker = Some(t);
-    }
-
     /// Runs `ticks` ticks (with no records, each asked for its hash) on an OS thread of their
     /// own while this one runs `frames` frames at `fps`, neither waiting for the other (test
     /// mode's paced schedule, #43 §2.3): each tick, and its time in milliseconds.
@@ -956,30 +957,26 @@ impl<E: Executor> Program<E> {
         width: u32,
         height: u32,
     ) -> Result<Vec<(Ticked, f64)>> {
+        self.want_hashes(true);
         let mut thread = self.take_tick_thread()?;
         let (ticked, framed) = std::thread::scope(|s| {
             let ticking = s.spawn(move || {
                 let mut out = Vec::new();
                 for _ in 0..ticks {
                     let start = std::time::Instant::now();
-                    match thread.run(Vec::new(), true) {
+                    match thread.run(Vec::new()) {
                         Ok(t) => out.push((t, start.elapsed().as_secs_f64() * 1000.0)),
                         Err(e) => return (thread, out, Some(e)),
                     }
                 }
                 (thread, out, None)
             });
-            let mut framed = Ok(());
-            for i in 0..frames {
-                framed = self.frame(crate::frame_time(i, fps), width, height);
-                if framed.is_err() {
-                    break;
-                }
-            }
+            let framed =
+                (0..frames).try_for_each(|i| self.frame(frame_time(i, fps), width, height));
             (ticking.join().expect("the ticker's thread"), framed)
         });
         let (thread, out, failed) = ticked;
-        self.restore_tick_thread(thread);
+        self.ticker = Some(thread);
         if let Some((k, trap)) = failed {
             return Err(self.tick_trapped(k, &trap));
         }
@@ -988,7 +985,7 @@ impl<E: Executor> Program<E> {
     }
 
     /// Tick `k` trapped: the program's panic, as the host reports it.
-    pub(crate) fn tick_trapped(&mut self, k: u32, trap: &wasmtime::Error) -> Error {
+    fn tick_trapped(&mut self, k: u32, trap: &wasmtime::Error) -> Error {
         match self.trapped(trap, memory::THREAD_TICK) {
             Error::Trap(why) => Error::Trap(format!("in tick {k}: {why}")),
             e => e,
@@ -1066,9 +1063,8 @@ fn spawn_worker(module: Module, memory: SharedMemory, thread: u32) -> std::threa
 /// its panic message (wrela_abi `memory`'s helpers).
 fn helper_trapped(m: &SharedMemory, thread: u32) {
     let running = shared::load_u32(m, memory::thread_block(thread) + memory::RUNNING);
-    let blocks = memory::THREAD_BLOCKS..memory::thread_block(memory::THREADS);
-    let slots =
-        memory::JOB_SLOTS..memory::JOB_SLOTS + memory::JOB_SLOT_COUNT * memory::JOB_SLOT_SIZE;
+    let blocks = memory::THREAD_BLOCKS..memory::THREAD_BLOCKS_END;
+    let slots = memory::JOB_SLOTS..memory::JOB_SLOTS_END;
     if blocks.contains(&running) {
         // A thread's parallel job: its starting thread waits on DONE.
         shared::store_u32(m, running + memory::JOB_FAILED, thread + 1);
@@ -1097,6 +1093,22 @@ impl<E: 'static> Drop for Program<E> {
     }
 }
 
+/// Fails the host function that's running: `e` is kept for the caller ([`State::failure`]),
+/// and wasmtime traps with its message.
+fn fail<E>(state: &mut State<E>, e: Error) -> wasmtime::Error {
+    let message = e.to_string();
+    state.failure = Some(e);
+    wasmtime::format_err!("{message}")
+}
+
+/// Fails a host function the instance's start function called: it may not call the host.
+fn check_started<E>(state: &mut State<E>) -> wasmtime::Result<()> {
+    if state.started {
+        return Ok(());
+    }
+    Err(fail(state, Error::Program(CALLED_WHILE_STARTING.into())))
+}
+
 /// `wrela.submit(ptr, len)`: decode and execute one batch of `len` bytes at `ptr`.
 fn submit<E: Executor>(
     mut caller: wasmtime::Caller<'_, State<E>>,
@@ -1104,10 +1116,7 @@ fn submit<E: Executor>(
     len: u32,
 ) -> wasmtime::Result<()> {
     let state = caller.data_mut();
-    if !state.started {
-        state.failure = Some(Error::Program(CALLED_WHILE_STARTING.into()));
-        return Err(wasmtime::format_err!("{CALLED_WHILE_STARTING}"));
-    }
+    check_started(state)?;
     // A handle of its own, so the batch is read in place while `state` changes.
     let memory = state.memory.clone();
     let result = match shared::slice(&memory, ptr as usize, len as usize) {
@@ -1117,11 +1126,7 @@ fn submit<E: Executor>(
             state.memory.data().len()
         ))),
     };
-    result.map_err(|e| {
-        let message = e.to_string();
-        state.failure = Some(e);
-        wasmtime::format_err!("{message}")
-    })
+    result.map_err(|e| fail(state, e))
 }
 
 /// `wrela.audio(task, context)`: starts the program's voice. The audio thread renders it
@@ -1132,15 +1137,10 @@ fn audio<E: Executor>(
     context: u32,
 ) -> wasmtime::Result<()> {
     let state = caller.data_mut();
-    if !state.started {
-        state.failure = Some(Error::Program(CALLED_WHILE_STARTING.into()));
-        return Err(wasmtime::format_err!("{CALLED_WHILE_STARTING}"));
-    }
+    check_started(state)?;
     if state.voice.is_some() {
         let e = Error::Trap("a program starts one voice, and this one started a second".into());
-        let message = e.to_string();
-        state.failure = Some(e);
-        return Err(wasmtime::format_err!("{message}"));
+        return Err(fail(state, e));
     }
     state.voice = Some((task, context));
     Ok(())
@@ -1155,16 +1155,11 @@ fn tick<E: Executor>(
     hz: u32,
 ) -> wasmtime::Result<()> {
     let state = caller.data_mut();
-    if !state.started {
-        state.failure = Some(Error::Program(CALLED_WHILE_STARTING.into()));
-        return Err(wasmtime::format_err!("{CALLED_WHILE_STARTING}"));
-    }
+    check_started(state)?;
     if state.ticker.is_some() {
         let e =
             Error::Trap("panic: a program starts one ticker, and this one started a second".into());
-        let message = e.to_string();
-        state.failure = Some(e);
-        return Err(wasmtime::format_err!("{message}"));
+        return Err(fail(state, e));
     }
     state.ticker = Some((task, context, hz));
     Ok(())
@@ -1178,10 +1173,7 @@ fn input<E: Executor>(
     cap: u32,
 ) -> wasmtime::Result<i32> {
     let state = caller.data_mut();
-    if !state.started {
-        state.failure = Some(Error::Program(CALLED_WHILE_STARTING.into()));
-        return Err(wasmtime::format_err!("{CALLED_WHILE_STARTING}"));
-    }
+    check_started(state)?;
     let n = (cap as usize).min(state.input.len());
     let fits = (ptr as usize)
         .checked_add(n * EVENT_SIZE as usize)
@@ -1220,10 +1212,7 @@ fn request_take<E: Executor>(
     ptr: u32,
 ) -> wasmtime::Result<()> {
     let state = caller.data_mut();
-    if !state.started {
-        state.failure = Some(Error::Program(CALLED_WHILE_STARTING.into()));
-        return Err(wasmtime::format_err!("{CALLED_WHILE_STARTING}"));
-    }
+    check_started(state)?;
     let Some(answer) = state.requests.answered.remove(&request) else {
         return Err(wasmtime::format_err!("request_take({request}): the request isn't answered"));
     };

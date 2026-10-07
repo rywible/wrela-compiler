@@ -5,17 +5,10 @@
 //! (`cargo test -p wrela-tests --test suite parallel:: -- --include-ignored`).
 
 use wrela_host::{CpuBuild, Host, Options, Value, frame_time};
-use wrela_tests::page;
+use wrela_tests::{one_f32, page};
 
 const FRAMES: u32 = 20;
 const WORKERS: [u32; 4] = [1, 2, 4, 8];
-
-fn f32_of(v: &[Value]) -> f32 {
-    match v {
-        [Value::F32(x)] => *x,
-        other => panic!("returned {other:?}"),
-    }
-}
 
 #[test]
 fn the_results_dont_depend_on_the_workers() {
@@ -25,18 +18,18 @@ fn the_results_dont_depend_on_the_workers() {
     for workers in WORKERS {
         let mut host = build.start_with(workers).expect("start");
         host.frame(frame_time(0, 60.0), 64, 64).expect("frame");
-        let first = f32_of(&host.call_export("energy", &[]).expect("energy"));
+        let first = one_f32(&mut host, "energy", &[]);
         for i in 1..FRAMES {
             host.frame(frame_time(i, 60.0), 64, 64).expect("frame");
         }
-        let energy = f32_of(&host.call_export("energy", &[]).expect("energy"));
+        let energy = one_f32(&mut host, "energy", &[]);
         // The particles fall: `par_each_mut`'s closure changes each one (writes through a
         // closure's `mut` parameter were once lost, and every hash agreed anyway).
         assert!(
             energy > first * 1.01,
             "{workers} workers: the particles didn't move ({first} then {energy})"
         );
-        let alone = f32_of(&host.call_export("energy_alone", &[]).expect("energy_alone"));
+        let alone = one_f32(&mut host, "energy_alone", &[]);
         assert_eq!(energy.to_bits(), alone.to_bits(), "{workers} workers: the reduction's order");
         let got = (host.hash(), energy);
         // The workers take part, once they've woken: on a busy machine the program's thread

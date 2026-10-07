@@ -234,83 +234,83 @@ impl Format for f64 {
 
 impl Format for vec2 {
     fn format(self, out: mut String, spec: Spec) {
-        components(mut out, [self.x, self.y, 0.0, 0.0], 2, spec)
+        components(mut out, [self.x, self.y], spec)
     }
 }
 
 impl Format for vec3 {
     fn format(self, out: mut String, spec: Spec) {
-        components(mut out, [self.x, self.y, self.z, 0.0], 3, spec)
+        components(mut out, [self.x, self.y, self.z], spec)
     }
 }
 
 impl Format for vec4 {
     fn format(self, out: mut String, spec: Spec) {
-        components(mut out, [self.x, self.y, self.z, self.w], 4, spec)
+        components(mut out, [self.x, self.y, self.z, self.w], spec)
     }
 }
 
 impl Format for vec2i {
     fn format(self, out: mut String, spec: Spec) {
-        components(mut out, [self.x, self.y, 0, 0], 2, spec)
+        components(mut out, [self.x, self.y], spec)
     }
 }
 
 impl Format for vec3i {
     fn format(self, out: mut String, spec: Spec) {
-        components(mut out, [self.x, self.y, self.z, 0], 3, spec)
+        components(mut out, [self.x, self.y, self.z], spec)
     }
 }
 
 impl Format for vec4i {
     fn format(self, out: mut String, spec: Spec) {
-        components(mut out, [self.x, self.y, self.z, self.w], 4, spec)
+        components(mut out, [self.x, self.y, self.z, self.w], spec)
     }
 }
 
 impl Format for vec2u {
     fn format(self, out: mut String, spec: Spec) {
-        components(mut out, [self.x, self.y, 0, 0], 2, spec)
+        components(mut out, [self.x, self.y], spec)
     }
 }
 
 impl Format for vec3u {
     fn format(self, out: mut String, spec: Spec) {
-        components(mut out, [self.x, self.y, self.z, 0], 3, spec)
+        components(mut out, [self.x, self.y, self.z], spec)
     }
 }
 
 impl Format for vec4u {
     fn format(self, out: mut String, spec: Spec) {
-        components(mut out, [self.x, self.y, self.z, self.w], 4, spec)
+        components(mut out, [self.x, self.y, self.z, self.w], spec)
     }
 }
 
 impl Format for vec2d {
     fn format(self, out: mut String, spec: Spec) {
-        components(mut out, [self.x, self.y, 0.0, 0.0], 2, spec)
+        components(mut out, [self.x, self.y], spec)
     }
 }
 
 impl Format for vec3d {
     fn format(self, out: mut String, spec: Spec) {
-        components(mut out, [self.x, self.y, self.z, 0.0], 3, spec)
+        components(mut out, [self.x, self.y, self.z], spec)
     }
 }
 
 impl Format for vec4d {
     fn format(self, out: mut String, spec: Spec) {
-        components(mut out, [self.x, self.y, self.z, self.w], 4, spec)
+        components(mut out, [self.x, self.y, self.z, self.w], spec)
     }
 }
 
 /// A vector: `(x, y, z)`, each component with the spec's precision.
-fn components<T: Format + Copy>(out: mut String, c: [T; 4], n: u32, spec: Spec) {
+fn components<T: Format>(out: mut String, c: [T], spec: Spec) {
     var each = spec
     each.width = 0
     var s = String::new()
     s.push_byte(40)
-    for i in 0..n {
+    for i in 0..c.len() {
         if i > 0 {
             s.push_str(", ")
         }

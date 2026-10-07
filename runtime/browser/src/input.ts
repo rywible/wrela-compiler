@@ -48,13 +48,26 @@ export interface Scripted {
   event: Uint8Array;
 }
 
-/** The events of `script` that arrive before frame `frame`. */
-export const eventsAt = (script: Scripted[], frame: number) =>
-  script.filter((s) => "frame" in s.at && s.at.frame === frame).map((s) => s.event);
+/** A script's events by when they arrive, each list oldest first: by the frame they arrive
+ * before, and by the tick whose records they are. */
+export interface Arrivals {
+  frames: Map<number, Uint8Array[]>;
+  ticks: Map<number, Uint8Array[]>;
+}
 
-/** The events of `script` that are tick `tick`'s records. */
-export const recordsAt = (script: Scripted[], tick: number) =>
-  script.filter((s) => "tick" in s.at && s.at.tick === tick).map((s) => s.event);
+/** The events of `script` by when they arrive: grouped once, so a frame or tick finds its own at
+ * once. */
+export function arrivals(script: Scripted[]): Arrivals {
+  const frames = new Map<number, Uint8Array[]>();
+  const ticks = new Map<number, Uint8Array[]>();
+  for (const { at, event } of script) {
+    const [map, key] = "frame" in at ? [frames, at.frame] : [ticks, at.tick];
+    const list = map.get(key);
+    if (list === undefined) map.set(key, [event]);
+    else list.push(event);
+  }
+  return { frames, ticks };
+}
 
 /** Reads a script (runtime/abi `input`'s format), with the Rust parser's messages. */
 export function parseScript(text: string): Scripted[] {
@@ -171,13 +184,22 @@ export function modifiersOf(e: { shiftKey: boolean; ctrlKey: boolean; altKey: bo
 /** A DOM button's number, as the ABI numbers it: 0 primary, 1 middle, 2 secondary. */
 export const buttonOf = (button: number) => (button === 1 ? 1 : button === 2 ? 2 : 0);
 
+/** The clock events are stamped with, which every thread shares: ms since 1970. */
+export const epochNow = () => performance.timeOrigin + performance.now();
+
+/** What a read of no events gives: nothing is allocated for it. */
+const NO_EVENTS: { events: Uint8Array; times: readonly number[] } = Object.freeze({
+  events: new Uint8Array(0),
+  times: Object.freeze([]),
+});
+
 /**
  * A single-writer ring of events in a SharedArrayBuffer, with two readers: the main thread
  * writes; the render worker's frames read them for the program's `std::input::events()`, and the
  * ticker's thread stamps them into its ticks' records (#43 §2.2). Words: how many events have
  * been written, how many the frames have read, how many the ticker has read, and whether the
- * ticker reads; then CAPACITY events, each with the writer's clock (a float64, ms since the time
- * origin) after it.
+ * ticker reads; then CAPACITY events, each with the writer's clock (a float64, ms since 1970,
+ * `epochNow`) after it.
  * - The writer drops an event only when the ticker's reader is a full ring behind (or, with no
  *   ticker, the frames' reader): what the ticker reads is the sim's input, which is never lost.
  * - With a ticker, the frames' reader, a full ring behind, skips ahead: a UI loses events, the
@@ -201,7 +223,7 @@ export class InputRing {
     return new InputRing(new SharedArrayBuffer(InputRing.HEADER + InputRing.CAPACITY * InputRing.SLOT));
   }
 
-  /** Writes an event, stamped with `time` (performance.timeOrigin + performance.now()). */
+  /** Writes an event, stamped with `time` (`epochNow`). */
   write(event: Uint8Array, time: number): boolean {
     const written = Atomics.load(this.#counts, 0);
     const slowest = Atomics.load(this.#counts, 3) !== 0 ? Atomics.load(this.#counts, 2) : Atomics.load(this.#counts, 1);
@@ -221,31 +243,41 @@ export class InputRing {
 
   /** Every event written and not yet read by the frames, oldest first, each with its time. A
    * reader that's fallen a full ring behind skips the events written over. */
-  read(): { events: Uint8Array; times: number[] } {
-    return this.#read(1, true);
-  }
-
-  /** Every event written and not yet read by the ticker, at most `cap`, oldest first, each with
-   * its time; the rest wait for the next read. */
-  readTicker(cap: number): { events: Uint8Array; times: number[] } {
-    return this.#read(2, false, cap);
-  }
-
-  #read(reader: number, skip: boolean, cap = Infinity): { events: Uint8Array; times: number[] } {
+  read(): { events: Uint8Array; times: readonly number[] } {
     const written = Atomics.load(this.#counts, 0);
-    let read = Atomics.load(this.#counts, reader);
+    let read = Atomics.load(this.#counts, 1);
     // A margin, so the slot the writer fills next isn't one this reads.
     const room = InputRing.CAPACITY - 64;
-    if (skip && Atomics.load(this.#counts, 3) !== 0 && written - read > room) read = written - room;
-    const n = Math.min(written - read, cap);
+    if (Atomics.load(this.#counts, 3) !== 0 && written - read > room) read = written - room;
+    const n = written - read;
+    if (n === 0) return NO_EVENTS;
     const events = new Uint8Array(n * EVENT_SIZE);
-    const times: number[] = [];
-    for (let i = 0; i < n; i++) {
-      const at = ((read + i) % InputRing.CAPACITY) * InputRing.SLOT;
-      events.set(this.#bytes.subarray(at, at + EVENT_SIZE), i * EVENT_SIZE);
-      times.push(this.#view.getFloat64(at + EVENT_SIZE, true));
-    }
-    Atomics.store(this.#counts, reader, read + n);
+    this.#copy(read, n, events, 0);
+    const times = Array.from({ length: n }, (_, i) => this.#view.getFloat64(this.#slot(read + i) + EVENT_SIZE, true));
+    Atomics.store(this.#counts, 1, read + n);
     return { events, times };
+  }
+
+  /** Copies the events written and not yet read by the ticker, at most `cap`, oldest first, into
+   * `out` from byte `at`; the rest wait for the next read. Returns how many. */
+  readTicker(out: Uint8Array, at: number, cap: number): number {
+    const read = Atomics.load(this.#counts, 2);
+    const n = Math.min(Atomics.load(this.#counts, 0) - read, cap);
+    this.#copy(read, n, out, at);
+    Atomics.store(this.#counts, 2, read + n);
+    return n;
+  }
+
+  /** Where event `i` (counted from the first written) is in the ring's bytes. */
+  #slot(i: number): number {
+    return (i % InputRing.CAPACITY) * InputRing.SLOT;
+  }
+
+  /** Copies `n` events, from event `from` on, into `out` from byte `at`. */
+  #copy(from: number, n: number, out: Uint8Array, at: number): void {
+    for (let i = 0; i < n; i++) {
+      const slot = this.#slot(from + i);
+      out.set(this.#bytes.subarray(slot, slot + EVENT_SIZE), at + i * EVENT_SIZE);
+    }
   }
 }

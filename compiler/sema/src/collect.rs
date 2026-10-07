@@ -12,13 +12,14 @@ use wrela_diag::{Diagnostic, Span, codes};
 use wrela_syntax::ast;
 
 /// The most elements a tuple has for a `@fieldwise` trait to be derived for it.
-pub const MAX_DERIVED_TUPLE: usize = 12;
+const MAX_DERIVED_TUPLE: usize = 12;
 
 /// One parsed source file and the module it is.
 pub struct SourceUnit {
     /// The module path in its package: `["shapes", "blob"]`, or `["std", "field"]` for std.
     pub path: Vec<String>,
-    pub ast: ast::File,
+    /// Its tree, shared: std's are parsed once a process.
+    pub ast: std::sync::Arc<ast::File>,
     /// Its package, by index into the packages `collect` is given. std's privileges come
     /// from std's package (`PackageKind::Std`).
     pub package: usize,
@@ -703,13 +704,7 @@ impl<'d, 'u> Collector<'d, 'u> {
                     );
                 }
                 "thread_entry" => {
-                    if a.args.is_some() {
-                        self.diags.push(Diagnostic::new(
-                            codes::E0204,
-                            a.span,
-                            "`@thread_entry` takes no arguments",
-                        ));
-                    }
+                    self.no_args(a, codes::E0204);
                     out.thread_entry = Some(a.span);
                 }
                 "effects" => out.effects = self.declared_effects(a),
@@ -727,20 +722,7 @@ impl<'d, 'u> Collector<'d, 'u> {
                     }
                     let entry = match name {
                         "vertex" | "fragment" => {
-                            if a.args.is_some() {
-                                self.diags.push(
-                                    Diagnostic::new(
-                                        codes::E0602,
-                                        a.span,
-                                        format!("`@{name}` takes no arguments"),
-                                    )
-                                    .with_fix(
-                                        "remove the arguments",
-                                        a.span,
-                                        format!("@{name}"),
-                                    ),
-                                );
-                            }
+                            self.no_args(a, codes::E0602);
                             if name == "vertex" { Entry::Vertex } else { Entry::Fragment }
                         }
                         // A size that's wrong is reported; the kernel is still one, so its
@@ -750,37 +732,18 @@ impl<'d, 'u> Collector<'d, 'u> {
                     out.entry = Some((entry, a.span));
                 }
                 "gpu" => {
-                    if a.args.is_some() {
-                        self.diags.push(
-                            Diagnostic::new(codes::E0602, a.span, "`@gpu` takes no arguments")
-                                .with_fix("remove the arguments", a.span, "@gpu"),
-                        );
-                    }
+                    self.no_args(a, codes::E0602);
                     out.gpu = Some(a.span);
                 }
                 "intrinsic" if is_std => out.intrinsic = true,
                 "test" => {
                     if let Some(args) = &a.args {
-                        (out.test_frames, out.test_ticks, out.test_input) =
-                            self.test_frames(a, args);
+                        (out.test_run, out.test_input) = self.test_run(a, args);
                     }
                     out.test = Some(a.span);
                 }
                 "deterministic" | "audio" => {
-                    if a.args.is_some() {
-                        self.diags.push(
-                            Diagnostic::new(
-                                codes::E0204,
-                                a.span,
-                                format!("`@{name}` takes no arguments"),
-                            )
-                            .with_fix(
-                                "remove the arguments",
-                                a.span,
-                                format!("@{name}"),
-                            ),
-                        );
-                    }
+                    self.no_args(a, codes::E0204);
                     if name == "deterministic" {
                         out.deterministic = Some(a.span);
                     } else {
@@ -835,6 +798,20 @@ impl<'d, 'u> Collector<'d, 'u> {
         out
     }
 
+    /// `code` for an attribute `a` that takes no arguments but is given some.
+    fn no_args(&mut self, a: &ast::Attribute, code: wrela_diag::Code) {
+        if a.args.is_some() {
+            let name = &a.name.name;
+            self.diags.push(
+                Diagnostic::new(code, a.span, format!("`@{name}` takes no arguments")).with_fix(
+                    "remove the arguments",
+                    a.span,
+                    format!("@{name}"),
+                ),
+            );
+        }
+    }
+
     /// `@effects(nondet, io, ...)`'s effects (std's unsafe core).
     fn declared_effects(&mut self, a: &ast::Attribute) -> Vec<crate::effects::Effect> {
         use crate::effects::Effect;
@@ -848,25 +825,29 @@ impl<'d, 'u> Collector<'d, 'u> {
             };
             match name.and_then(Effect::named) {
                 Some(e) => out.push(e),
-                None => self.diags.push(Diagnostic::new(
-                    codes::E0204,
-                    arg.span,
-                    "`@effects` names effects: alloc, io, nondet, recursion, host or panic",
-                )),
+                None => {
+                    let names = Effect::ALL.map(Effect::name);
+                    let (last, rest) = names.split_last().expect("there are effects");
+                    let all = format!("{} or {last}", rest.join(", "));
+                    self.diags.push(Diagnostic::new(
+                        codes::E0204,
+                        arg.span,
+                        format!("`@effects` names effects: {all}"),
+                    ));
+                }
             }
         }
         out
     }
 
-    /// `@compute(x)`, `@compute(x, y)` or `@compute(x, y, z)`, within WebGPU's default limits.
-    /// `@test(frames: n)`'s `n` (§10): from 1 to [`MAX_TEST_FRAMES`], or `@test(ticks: n)`'s,
-    /// and, with `input: "path"`, the script of input events (or the tick log) they get.
-    /// Anything else is E0222.
-    fn test_frames(
+    /// `@test(frames: n)` or `@test(ticks: n)` (§10), `n` from 1 to [`MAX_TEST_FRAMES`], and,
+    /// with `input: "path"`, the script of input events (or the tick log) they get. Anything
+    /// else is E0222.
+    fn test_run(
         &mut self,
         a: &ast::Attribute,
         args: &[ast::Arg],
-    ) -> (Option<u32>, Option<u32>, Option<(String, Span)>) {
+    ) -> (Option<TestRun>, Option<(String, Span)>) {
         let named =
             |name: &str| args.iter().find(|x| x.name.as_ref().is_some_and(|n| n.name == name));
         let others = args.iter().any(|x| {
@@ -898,7 +879,7 @@ impl<'d, 'u> Collector<'d, 'u> {
         match (n, input) {
             (Some(n), Ok(input)) if !others => {
                 let n = n as u32;
-                if frames { (Some(n), None, input) } else { (None, Some(n), input) }
+                (Some(if frames { TestRun::Frames(n) } else { TestRun::Ticks(n) }), input)
             }
             _ => {
                 self.diags.push(
@@ -909,11 +890,12 @@ impl<'d, 'u> Collector<'d, 'u> {
                     )
                     .with_note("`@test` alone is a test of code; `@test(frames: 600)` runs the program for 600 frames, then the test with its state (§10)"),
                 );
-                (None, None, None)
+                (None, None)
             }
         }
     }
 
+    /// `@compute(x)`, `@compute(x, y)` or `@compute(x, y, z)`, within WebGPU's default limits.
     fn workgroup_size(&mut self, a: &ast::Attribute) -> Option<[u32; 3]> {
         let Some(args) = &a.args else {
             self.diags.push(
@@ -1319,22 +1301,12 @@ impl<'d, 'u> Collector<'d, 'u> {
             let mut scope = Scope::new(m);
             scope.push_params(&self.p, &self.p.aliases[id.index()].generics);
             // An alias that names traits names the type a function returns (`ty.opaque-alias`).
-            let mut quiet = Vec::new();
             let mut bounds = None;
-            let _ = resolve::resolve_type(
-                &self.p,
-                &mut quiet,
-                &scope,
-                &t.ty,
-                TyPos::Return(&mut bounds),
-            );
+            let pos = TyPos::Alias(&mut bounds);
+            let mut ty = resolve::resolve_type(&self.p, self.diags, &scope, &t.ty, pos);
             if let Some(bounds) = bounds {
-                self.diags.extend(quiet);
-                let ty = self.opaque_alias(m, id, t, bounds, pending);
-                self.p.aliases[id.index()].ty = ty;
-                continue;
+                ty = self.opaque_alias(m, id, t, bounds, pending);
             }
-            let ty = resolve::resolve_type(&self.p, self.diags, &scope, &t.ty, TyPos::Normal);
             self.p.aliases[id.index()].ty = ty;
         }
     }
@@ -1474,7 +1446,7 @@ impl<'d, 'u> Collector<'d, 'u> {
     fn test_signature(&mut self, id: FnId) {
         let def = self.p.func(id);
         let Some(at) = def.attrs.test else { return };
-        let frames = def.attrs.runs_program();
+        let frames = def.attrs.test_run.is_some();
         let program = self.p.package_of(def.module).kind == PackageKind::Program;
         // A dependency's frame test is about its own program, checked when it's the package
         // checked; here its frames aren't this program's.
@@ -2315,11 +2287,16 @@ impl<'d, 'u> Collector<'d, 'u> {
                     span: tr.span,
                     from_opt_in: true,
                 };
-                let id = ImplId(self.p.impls.len() as u32);
-                let methods = self.derived_methods(id, &imp);
-                self.p.impls.push(ImplDef { methods, ..imp });
+                self.push_derived_impl(imp);
             }
         }
+    }
+
+    /// Adds `imp` to the program, with the methods its trait derives for its type.
+    fn push_derived_impl(&mut self, imp: ImplDef) {
+        let id = ImplId(self.p.impls.len() as u32);
+        let methods = self.derived_methods(id, &imp);
+        self.p.impls.push(ImplDef { methods, ..imp });
     }
 
     /// Adds the impls that opting in implies, and indexes every impl by its trait or type.
@@ -2364,25 +2341,20 @@ impl<'d, 'u> Collector<'d, 'u> {
                         continue;
                     }
                 }
-                implied.push((
-                    AdtId(a as u32),
-                    ImplDef {
-                        module: adt.module,
-                        generics: adt.generics.clone(),
-                        trait_ref: Some(r.clone()),
-                        self_ty,
-                        assoc_types: BTreeMap::new(),
-                        methods: Vec::new(),
-                        span: *span,
-                        from_opt_in: true,
-                    },
-                ));
+                implied.push(ImplDef {
+                    module: adt.module,
+                    generics: adt.generics.clone(),
+                    trait_ref: Some(r.clone()),
+                    self_ty,
+                    assoc_types: BTreeMap::new(),
+                    methods: Vec::new(),
+                    span: *span,
+                    from_opt_in: true,
+                });
             }
         }
-        for (_, imp) in implied {
-            let id = ImplId(self.p.impls.len() as u32);
-            let methods = self.derived_methods(id, &imp);
-            self.p.impls.push(ImplDef { methods, ..imp });
+        for imp in implied {
+            self.push_derived_impl(imp);
         }
         self.tuple_and_array_impls();
         for (i, imp) in self.p.impls.iter().enumerate() {
@@ -2948,7 +2920,7 @@ fn check_fieldwise_opt_in(p: &Program, diags: &mut Vec<Diagnostic>, imp: &ImplDe
         // type, that error says what's wrong, and this one would only hide it (a presentation
         // type in sim state lacks `StateHash` too, and `SimState`'s message explains why).
         let custom = p.custom_message(f.ty, r);
-        if custom.is_none() && spoken_for_elsewhere(p, imp, f.ty) {
+        if custom.is_none() && spoken_for_elsewhere(p, adt, f.ty) {
             continue;
         }
         let message = match custom {
@@ -2972,20 +2944,13 @@ fn check_fieldwise_opt_in(p: &Program, diags: &mut Vec<Diagnostic>, imp: &ImplDe
     }
 }
 
-/// Whether `self_ty` opts into a `@fieldwise` trait that `field` lacks and whose library gives
-/// a message for `field`'s type (`check_fieldwise_opt_in`).
-fn spoken_for_elsewhere(p: &Program, imp: &ImplDef, field: TyId) -> bool {
-    p.impls_of_trait.iter().any(|(t, impls)| {
-        p.trait_(*t).fieldwise
-            && impls.iter().any(|&i| {
-                let o = p.impl_(i);
-                o.from_opt_in
-                    && o.self_ty == imp.self_ty
-                    && o.trait_ref.as_ref().is_some_and(|r| {
-                        !crate::traits::implements(p, field, r)
-                            && p.custom_message(field, r).is_some()
-                    })
-            })
+/// Whether `adt` opts into a `@fieldwise` trait that `field` lacks and whose library gives a
+/// message for `field`'s type (`check_fieldwise_opt_in`).
+fn spoken_for_elsewhere(p: &Program, adt: &AdtDef, field: TyId) -> bool {
+    adt.opt_in.iter().any(|(r, _)| {
+        p.trait_(r.trait_).fieldwise
+            && !crate::traits::implements(p, field, r)
+            && p.custom_message(field, r).is_some()
     })
 }
 

@@ -30,24 +30,20 @@ impl BuiltinTy {
             "u64" => BuiltinTy::Int(IntTy::U64),
             "f32" => BuiltinTy::Float(FloatTy::F32),
             "f64" => BuiltinTy::Float(FloatTy::F64),
-            "vec2" => BuiltinTy::Vec(VecElem::F32, 2),
-            "vec3" => BuiltinTy::Vec(VecElem::F32, 3),
-            "vec4" => BuiltinTy::Vec(VecElem::F32, 4),
-            "vec2i" => BuiltinTy::Vec(VecElem::I32, 2),
-            "vec3i" => BuiltinTy::Vec(VecElem::I32, 3),
-            "vec4i" => BuiltinTy::Vec(VecElem::I32, 4),
-            "vec2u" => BuiltinTy::Vec(VecElem::U32, 2),
-            "vec3u" => BuiltinTy::Vec(VecElem::U32, 3),
-            "vec4u" => BuiltinTy::Vec(VecElem::U32, 4),
-            "vec2d" => BuiltinTy::Vec(VecElem::F64, 2),
-            "vec3d" => BuiltinTy::Vec(VecElem::F64, 3),
-            "vec4d" => BuiltinTy::Vec(VecElem::F64, 4),
             "mat2" => BuiltinTy::Mat(2),
             "mat3" => BuiltinTy::Mat(3),
             "mat4" => BuiltinTy::Mat(4),
             "str" => BuiltinTy::Str,
-            _ => return None,
+            _ => return Self::vec(name),
         })
+    }
+
+    /// `vecN` with its element's suffix (`vec3i`), for N from 2 to 4.
+    fn vec(name: &str) -> Option<BuiltinTy> {
+        let rest = name.strip_prefix("vec")?;
+        let n = rest.chars().next()?.to_digit(10).filter(|n| (2..=4).contains(n))?;
+        let e = VecElem::ALL.into_iter().find(|e| e.suffix() == &rest[1..])?;
+        Some(BuiltinTy::Vec(e, n as u8))
     }
 
     pub fn ty(self, types: &Types) -> TyId {
@@ -359,10 +355,7 @@ impl BuiltinFn {
                 takes(types.is_int(t), "integers", t)
             }
             CountOnes | LeadingZeros | TrailingZeros => {
-                let wide = matches!(
-                    types.kind(args[0]),
-                    TyKind::Int(IntTy::I32 | IntTy::U32 | IntTy::I64 | IntTy::U64)
-                );
+                let wide = matches!(types.kind(args[0]), TyKind::Int(i) if i.bits() >= 32);
                 takes(wide, "a 32- or 64-bit integer", args[0])?;
                 Ok(types.u32)
             }
@@ -382,6 +375,11 @@ pub fn scalar_of(types: &Types, t: TyId) -> TyId {
         TyKind::Mat(_) => types.f32,
         _ => t,
     }
+}
+
+/// Whether math on `t` is math on `f64`s: `t` is an `f64` or a vector of them (E0702).
+pub fn is_f64_math(types: &Types, t: TyId) -> bool {
+    scalar_of(types, t) == types.f64
 }
 
 #[cfg(test)]

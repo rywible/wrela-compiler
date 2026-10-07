@@ -12,22 +12,14 @@
 // talks to it through words in shared memory (`TickerControl`): a thread blocked in
 // `Atomics.wait` can't receive messages.
 
-import {
-  EVENT_SIZE,
-  EXPORT_TICK,
-  MAX_TICK_RECORDS,
-  THREAD_TICK,
-  TICK_HASH,
-  TICK_ORIGIN,
-  TICK_RECORDS,
-  TICK_WANT_HASH,
-} from "./abi.gen.ts";
+import { EVENT_SIZE, EXPORT_TICK, MAX_TICK_RECORDS, THREAD_TICK, TICK_HASH, TICK_ORIGIN, TICK_RECORDS } from "./abi.gen.ts";
 import { errorMessage } from "./errors.ts";
 import { VisibleClock } from "./frame.ts";
-import { eventsAt, InputRing, recordsAt } from "./input.ts";
-import type { TickerStart } from "./messages.ts";
+import { type Arrivals, arrivals, epochNow, InputRing } from "./input.ts";
+import type { FromTicker, TickerStart, TickReport } from "./messages.ts";
 import { Lines } from "./lines.ts";
-import { describeTrap, otherInstance, takePanicMessage, TrapError } from "./program.ts";
+import { otherInstance, TrapError, trapMessage } from "./program.ts";
+import { holdFor } from "./testmode.ts";
 import { TickLogWriter } from "./ticks.ts";
 
 /** Ticks a wake runs at most, behind; the rest of the debt is dropped (#43 §2.1). */
@@ -43,9 +35,9 @@ export const TickerMode = {
   LOCKSTEP: 2,
 } as const;
 
-// The shared words, as Int32 indices; then, at byte 32, a float64: the visible time (ms) when
-// the program started, which frames and ticks count from.
-/** Bumped and notified whenever the render worker changes another word. */
+// The shared words, as Int32 indices.
+/** Bumped and notified whenever the render worker changes another word, or the page shows or
+ * hides. */
 const WAKE = 0;
 const MODE = 1;
 /** 1: stop, and report the ticks run (test mode). */
@@ -56,40 +48,31 @@ const TARGET = 3;
 const FRAMES = 4;
 /** Ticks run; notified after each. */
 const DONE = 5;
-/** Ticks the clock dropped, catching up. */
-const DROPPED = 6;
 /** 1: a tick trapped (DONE is notified too). */
-const FAILED = 7;
-const WORDS = 8;
-const START = 32;
+const FAILED = 6;
+const WORDS = 7;
 
 /** The words the render worker and the ticker's thread share. */
 export class TickerControl {
   readonly #words: Int32Array;
-  readonly #start: Float64Array;
 
   constructor(readonly buffer: SharedArrayBuffer) {
     this.#words = new Int32Array(buffer, 0, WORDS);
-    this.#start = new Float64Array(buffer, START, 1);
   }
 
   static create(): TickerControl {
-    return new TickerControl(new SharedArrayBuffer(START + 8));
+    return new TickerControl(new SharedArrayBuffer(WORDS * 4));
   }
 
   #set(word: number, value: number): void {
     Atomics.store(this.#words, word, value);
+    this.wake();
+  }
+
+  /** Wakes the ticker's thread to look again: a word changed, or the page showed or hid. */
+  wake(): void {
     Atomics.add(this.#words, WAKE, 1);
     Atomics.notify(this.#words, WAKE);
-  }
-
-  /** The visible time (ms, `VisibleClock.at`) frames and ticks count from. */
-  get start(): number {
-    return this.#start[0]!;
-  }
-
-  set start(ms: number) {
-    this.#start[0] = ms;
   }
 
   /** Starts the ticks on a schedule (`TickerMode`). */
@@ -120,21 +103,12 @@ export class TickerControl {
   }
 
   /** Stops the ticks; in test mode the ticker's thread then reports them. */
-  stop(clock?: VisibleClock): void {
+  stop(): void {
     this.#set(STOP, 1);
-    clock?.wake();
   }
 
   get stopped(): boolean {
     return Atomics.load(this.#words, STOP) !== 0;
-  }
-
-  get done(): number {
-    return Atomics.load(this.#words, DONE);
-  }
-
-  get dropped(): number {
-    return Atomics.load(this.#words, DROPPED);
   }
 
   get failed(): boolean {
@@ -145,11 +119,6 @@ export class TickerControl {
   ran(n: number): void {
     Atomics.store(this.#words, DONE, n);
     Atomics.notify(this.#words, DONE);
-  }
-
-  /** On the ticker's thread: `n` more ticks were dropped. */
-  drop(n: number): void {
-    Atomics.add(this.#words, DROPPED, n);
   }
 
   /** On the ticker's thread: a tick trapped. */
@@ -163,8 +132,8 @@ export class TickerControl {
     return Atomics.load(this.#words, WAKE);
   }
 
-  /** On the ticker's thread: waits until the render worker changes a word after `seen`, or for
-   * `ms` (forever if not given). */
+  /** On the ticker's thread: waits until something wakes it after `seen` (`wake`), or for `ms`
+   * (forever if not given). */
   sleep(seen: number, ms?: number): void {
     Atomics.wait(this.#words, WAKE, seen, ms);
   }
@@ -181,27 +150,9 @@ export class TickerControl {
   }
 }
 
-/** The ticks before frame `i` on the lockstep schedule: ⌊(i + 1)·hz/fps⌋ (as the native host
- * computes it, `wrela_host::lockstep_ticks`). */
+/** The ticks before frame `i` on the lockstep schedule: ⌊(i + 1)·hz/fps⌋ (runtime/abi `ticks`'
+ * `lockstep_ticks`, which the vectors check). */
 export const lockstepTicks = (i: number, hz: number, fps: number) => Math.floor(((i + 1) * hz) / fps);
-
-/** What the ticks did, for test mode's results (`ticks.json`). */
-export interface TickReport {
-  /** When each tick began (ms since 1970) and how long it took (ms). */
-  began_ms: number[];
-  cpu_ms: number[];
-  /** Each tick's records, and state hash (16 hex digits) when hashes were kept. */
-  records: number[];
-  hashes: string[];
-  /** Ticks dropped, catching up. */
-  dropped: number;
-}
-
-/** What the ticker's thread tells the render worker. */
-export type FromTicker =
-  | { type: "fatal"; message: string }
-  /** Stopped (test mode): the ticks, and the tick log when hashes were kept. */
-  | { type: "ticks"; report: TickReport; log: Uint8Array<ArrayBuffer> | null };
 
 type TickFn = (thread: number, task: number, context: number, tick: number) => void;
 
@@ -230,22 +181,30 @@ export async function runTicker(start: TickerStart, post: (msg: FromTicker) => v
   post({ type: "ticks", report: ticker.report, log: ticker.log?.encode() ?? null });
 }
 
-const now = () => performance.timeOrigin + performance.now();
+/** Where a tick's records are, after their count. */
+const RECORDS = TICK_RECORDS + 4;
+/** A frame's or tick's script events, when the script has none. */
+const NONE: readonly Uint8Array[] = [];
 
 class Ticker {
   readonly clock: VisibleClock;
   readonly ring: InputRing;
+  /** Test mode: a script's events, by frame and by tick. */
+  readonly script: Arrivals;
   /** Events not yet stamped into a tick, oldest first. */
   readonly queue: Uint8Array[] = [];
   /** Frames whose script events are queued. */
   framesQueued = 0;
   next = 0;
-  /** The clock's origin: tick k is due at t₀ + k/hz (seconds from `control.start`). */
+  /** The clock's origin: tick k is due at t₀ + k/hz (seconds of visible time,
+   * `VisibleClock.seconds`). */
   t0: number | null = null;
   readonly log: TickLogWriter | null;
-  readonly report: TickReport = { began_ms: [], cpu_ms: [], records: [], hashes: [], dropped: 0 };
-  /** Something to sleep on, for a test's delay. */
-  readonly #nap = new Int32Array(new SharedArrayBuffer(4));
+  readonly report: TickReport = { cpu_ms: [] };
+  /** Views of the shared memory, made once: a view of shared memory stays valid as it grows,
+   * and the ticker's words and records are below the heap. */
+  readonly #view: DataView;
+  readonly #bytes: Uint8Array;
 
   constructor(
     readonly start: TickerStart,
@@ -255,15 +214,12 @@ class Ticker {
   ) {
     this.clock = new VisibleClock(start.clock);
     this.ring = new InputRing(start.input);
-    const view = new DataView(start.memory.buffer);
+    this.script = arrivals(start.script);
+    this.#view = new DataView(start.memory.buffer);
+    this.#bytes = new Uint8Array(start.memory.buffer);
     // The first world's hash, which `start` reported before the ticker began.
-    const first = view.getBigUint64(TICK_HASH, true);
+    const first = this.#view.getBigUint64(TICK_HASH, true);
     this.log = start.hashes ? new TickLogWriter(start.wasmHash, start.hz, first) : null;
-  }
-
-  /** Seconds of visible time since the program started. */
-  seconds(): number {
-    return (this.clock.at(now()) - this.control.start) / 1000;
   }
 
   loop(): void {
@@ -283,11 +239,11 @@ class Ticker {
       }
       if (!this.clock.visible) {
         // Ticks pause while the page is hidden: visible time stands still, so they resume
-        // where they were. (`stop` wakes this wait too.)
-        this.clock.waitVisible(1000);
+        // where they were. (The render worker wakes this sleep when the page shows.)
+        control.sleep(seen, 1000);
         continue;
       }
-      const s = this.seconds();
+      const s = this.clock.seconds(epochNow());
       if (this.t0 === null) this.setOrigin(s);
       const t0 = this.t0!;
       // Ticks 0 to due - 1 are due by now.
@@ -297,8 +253,6 @@ class Ticker {
         for (let i = 0; i < n && !control.stopped; i++) this.runTick();
         const behind = due - this.next;
         if (behind > 0 && !control.stopped) {
-          control.drop(behind);
-          this.report.dropped += behind;
           this.setOrigin(t0 + behind / start.hz);
         }
         continue;
@@ -310,56 +264,49 @@ class Ticker {
   /** Moves the clock's origin, which the program reads (`std::tick::origin`). */
   setOrigin(t0: number): void {
     this.t0 = t0;
-    new DataView(this.start.memory.buffer).setFloat64(TICK_ORIGIN, t0, true);
+    this.#view.setFloat64(TICK_ORIGIN, t0, true);
   }
 
   /** Runs the next tick with the events that have arrived, at most MAX_TICK_RECORDS (the rest
-   * wait for the next tick). */
+   * wait for the next tick). They're written straight into its records, in order: what earlier
+   * ticks left, a script's events of the frames started since, the input ring's, then a
+   * script's records of this tick. */
   runTick(): void {
     const { start, control, queue } = this;
     const k = this.next;
+    let n = Math.min(queue.length, MAX_TICK_RECORDS);
+    for (let i = 0; i < n; i++) this.#bytes.set(queue[i]!, RECORDS + i * EVENT_SIZE);
+    if (n > 0) queue.splice(0, n);
     for (const frames = control.frames; this.framesQueued < frames; this.framesQueued++) {
-      queue.push(...eventsAt(start.script, this.framesQueued));
+      n = this.#stamp(this.script.frames.get(this.framesQueued) ?? NONE, n);
     }
-    if (queue.length < MAX_TICK_RECORDS) {
-      const { events } = this.ring.readTicker(MAX_TICK_RECORDS - queue.length);
-      for (let at = 0; at < events.length; at += EVENT_SIZE) queue.push(events.subarray(at, at + EVENT_SIZE));
-    }
-    queue.push(...recordsAt(start.script, k));
-    const records = queue.splice(0, MAX_TICK_RECORDS);
-    const bytes = new Uint8Array(records.length * EVENT_SIZE);
-    records.forEach((r, i) => bytes.set(r, i * EVENT_SIZE));
-    const memory = start.memory.buffer;
-    const view = new DataView(memory);
-    view.setUint32(TICK_RECORDS, records.length, true);
-    new Uint8Array(memory).set(bytes, TICK_RECORDS + 4);
-    view.setUint32(TICK_WANT_HASH, start.hashes ? 1 : 0, true);
-    const began = now();
+    if (n < MAX_TICK_RECORDS) n += this.ring.readTicker(this.#bytes, RECORDS + n * EVENT_SIZE, MAX_TICK_RECORDS - n);
+    n = this.#stamp(this.script.ticks.get(k) ?? NONE, n);
+    this.#view.setUint32(TICK_RECORDS, n, true);
+    // The log's copy of the records, taken before the tick runs.
+    const records = this.log ? this.#bytes.slice(RECORDS, RECORDS + n * EVENT_SIZE) : null;
+    const began = epochNow();
     try {
       this.tick(THREAD_TICK, start.task, start.context, k);
     } catch (e) {
-      throw this.trapped(k, e);
+      // The program's panic, as the native host reports it.
+      throw new TrapError(`in tick ${k}: ${trapMessage(e, start.memory, THREAD_TICK, this.lines)}`);
     }
-    const cpu = now() - began;
-    if (start.delay > 0) Atomics.wait(this.#nap, 0, 0, start.delay);
-    if (start.timing) {
-      this.report.began_ms.push(began);
-      this.report.cpu_ms.push(cpu);
-      this.report.records.push(records.length);
-    }
-    if (this.log) {
-      const hash = view.getBigUint64(TICK_HASH, true);
-      this.log.push(bytes, hash);
-      this.report.hashes.push(hash.toString(16).padStart(16, "0"));
-    }
+    const cpu = epochNow() - began;
+    if (start.delay > 0) holdFor(start.delay);
+    if (start.timing) this.report.cpu_ms.push(cpu);
+    if (this.log) this.log.push(records!, this.#view.getBigUint64(TICK_HASH, true));
     this.next = k + 1;
     control.ran(this.next);
   }
 
-  /** Tick `k` trapped: the program's panic, as the native host reports it. */
-  trapped(k: number, e: unknown): TrapError {
-    const msg = takePanicMessage(this.start.memory, THREAD_TICK);
-    const what = describeTrap(e, this.lines);
-    return new TrapError(`in tick ${k}: ${msg === null ? what : `panic: ${msg}: ${what}`}`);
+  /** Stamps `events` into this tick's records after the first `n`, as many as fit; the rest are
+   * queued for the next tick. Returns how many records the tick has now. */
+  #stamp(events: readonly Uint8Array[], n: number): number {
+    for (const e of events) {
+      if (n < MAX_TICK_RECORDS) this.#bytes.set(e, RECORDS + n++ * EVENT_SIZE);
+      else this.queue.push(e);
+    }
+    return n;
   }
 }

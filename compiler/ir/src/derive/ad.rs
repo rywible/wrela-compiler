@@ -51,12 +51,7 @@ pub(super) fn value_and_gradient(
     mask[xi] = all_bits(&m.types, x_ty);
     let d = derive(m, cache, f, mask.clone(), n, target)?;
     let returns = returns_active(m, cache, f, mask, Mode::Ad) != 0;
-    let mut fields = vec![("_0".into(), f32), ("_1".into(), x_ty)];
-    if let Some(t) = payload {
-        fields.push(("_2".into(), t));
-    }
-    let names: Vec<String> = fields.iter().map(|(_, t)| m.types.display(*t).to_string()).collect();
-    let tuple = m.types.intern(TypeDef::Struct { name: format!("({})", names.join(", ")), fields });
+    let tuple = value_gradient_ty(&mut m.types, x_ty, payload);
     let mut g = Function::new(
         format!("{}_value_and_gradient", func.name),
         func.params.clone(),
@@ -69,17 +64,13 @@ pub(super) fn value_and_gradient(
     // parameter is passed like its original).
     let x_by_ref = func.params[xi].by_ref;
     for k in 0..n {
-        let one = g.new_value(f32);
-        body.push(Stmt::Let(one, Expr::Const(Const::F32(1.0))));
+        let one = g.let_(&mut body, f32, Expr::Const(Const::F32(1.0)));
         let seed = if n == 1 {
             one
         } else {
-            let zero = g.new_value(f32);
-            body.push(Stmt::Let(zero, Expr::Const(Const::F32(0.0))));
+            let zero = g.let_(&mut body, f32, Expr::Const(Const::F32(0.0)));
             let comps = (0..n).map(|c| if c == k { one } else { zero }).collect();
-            let e = g.new_value(x_ty);
-            body.push(Stmt::Let(e, Expr::Construct(x_ty, comps)));
-            e
+            g.let_(&mut body, x_ty, Expr::Construct(x_ty, comps))
         };
         if x_by_ref {
             let l = g.new_local(format!("seed{k}"), x_ty);
@@ -92,51 +83,35 @@ pub(super) fn value_and_gradient(
     let dual_ty = m.functions[d.index()]
         .ret
         .ok_or_else(|| Error::internal("derived function returns nothing"))?;
-    let r = g.new_value(dual_ty);
-    body.push(Stmt::Let(r, Expr::Call(d, args)));
+    let r = g.let_(&mut body, dual_ty, Expr::Call(d, args));
     // The value (with a payload, the first field of `f`'s result), and the payload.
     let ret = func.ret.ok_or_else(|| Error::internal("no result"))?;
     let first = |g: &mut Function, body: &mut Block, of: ValueId| match payload {
         None => of,
-        Some(_) => {
-            let v = g.new_value(f32);
-            body.push(Stmt::Let(v, Expr::Extract(of, 0)));
-            v
-        }
+        Some(_) => g.let_(body, f32, Expr::Extract(of, 0)),
     };
     let (value, parts, result) = if returns {
-        let whole = g.new_value(ret);
-        body.push(Stmt::Let(whole, Expr::Extract(r, 0)));
+        let whole = g.let_(&mut body, ret, Expr::Extract(r, 0));
         let v = first(&mut g, &mut body, whole);
         let mut parts = Vec::new();
         for k in 0..n {
-            let t = g.new_value(ret);
-            body.push(Stmt::Let(t, Expr::Extract(r, 1 + k as u32)));
+            let t = g.let_(&mut body, ret, Expr::Extract(r, 1 + k as u32));
             parts.push(first(&mut g, &mut body, t));
         }
         (v, parts, whole)
     } else {
         // The function doesn't depend on its input: the gradient is zero.
-        let z = g.new_value(f32);
-        body.push(Stmt::Let(z, Expr::Const(Const::F32(0.0))));
+        let z = g.let_(&mut body, f32, Expr::Const(Const::F32(0.0)));
         let v = first(&mut g, &mut body, r);
         (v, vec![z; n as usize], r)
     };
-    let grad = if n == 1 {
-        parts[0]
-    } else {
-        let gv = g.new_value(x_ty);
-        body.push(Stmt::Let(gv, Expr::Construct(x_ty, parts)));
-        gv
-    };
+    let grad =
+        if n == 1 { parts[0] } else { g.let_(&mut body, x_ty, Expr::Construct(x_ty, parts)) };
     let mut items = vec![value, grad];
     if let Some(t) = payload {
-        let p = g.new_value(t);
-        body.push(Stmt::Let(p, Expr::Extract(result, 1)));
-        items.push(p);
+        items.push(g.let_(&mut body, t, Expr::Extract(result, 1)));
     }
-    let out = g.new_value(tuple);
-    body.push(Stmt::Let(out, Expr::Construct(tuple, items)));
+    let out = g.let_(&mut body, tuple, Expr::Construct(tuple, items));
     body.push(Stmt::Return(Some(out)));
     g.body = body;
     Ok(m.add_function(g))

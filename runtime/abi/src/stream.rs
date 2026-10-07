@@ -84,6 +84,11 @@ pub const COMMAND_HEADER_LEN: usize = 8;
 pub const NONE: u32 = 0xFFFF_FFFF;
 /// A pass's colour attachment that is the screen.
 pub const SCREEN: u32 = 0xFFFF_FFFE;
+/// How both hosts carry out `WriteBuffer` without splitting a submission: its bytes go into an
+/// upload ring, [`UPLOAD_START`] bytes at first, and a copy from there is recorded in order. A
+/// write over [`UPLOAD_MAX`] bytes goes through the queue, between submissions.
+pub const UPLOAD_START: u32 = 256 * 1024;
+pub const UPLOAD_MAX: u32 = 16 * 1024 * 1024;
 
 /// Command opcodes. Values never change meaning; retired ones stay reserved.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -866,14 +871,14 @@ impl Sequencer {
                 Command::Draw { .. }
                 | Command::DrawIndirect { .. }
                 | Command::DrawIndexedIndirect { .. },
-                Place::Outside,
-            ) => err("a draw must come inside a pass"),
-            (
-                Command::Draw { .. }
-                | Command::DrawIndirect { .. }
-                | Command::DrawIndexedIndirect { .. },
-                _,
-            ) => Ok(()),
+                at,
+            ) => {
+                if at == Place::Outside {
+                    err("a draw must come inside a pass")
+                } else {
+                    Ok(())
+                }
+            }
             (Command::Present, Place::ScreenPass) => {
                 self.at = Place::Outside;
                 Ok(())

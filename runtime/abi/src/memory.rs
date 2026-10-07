@@ -162,6 +162,9 @@ pub const fn thread_block(thread: u32) -> u32 {
     THREAD_BLOCKS + thread * THREAD_BLOCK_SIZE
 }
 
+/// The end of the threads' blocks.
+pub const THREAD_BLOCKS_END: u32 = thread_block(THREADS);
+
 /// Where thread `thread`'s panic message is: [`PANIC`] in its block.
 pub const fn panic_at(thread: u32) -> u32 {
     thread_block(thread) + PANIC
@@ -171,6 +174,8 @@ pub const fn panic_at(thread: u32) -> u32 {
 pub const JOB_SLOTS: u32 = 0x12_8000;
 pub const JOB_SLOT_COUNT: u32 = 256;
 pub const JOB_SLOT_SIZE: u32 = 16;
+/// The end of the job slots.
+pub const JOB_SLOTS_END: u32 = JOB_SLOTS + JOB_SLOT_COUNT * JOB_SLOT_SIZE;
 /// A slot's state: [`SLOT_FREE`], being filled, queued, running, done or [`SLOT_FAILED`].
 pub const SLOT_STATE: u32 = 0;
 /// The thread a job ran on: the host writes it when the job trapped.
@@ -200,16 +205,6 @@ pub const MAX_PAGES: u32 = 16384;
 /// The heap's room when the program starts, in pages: 1 MiB.
 pub const HEAP_START_PAGES: u32 = 16;
 
-/// Thread `thread`'s stack: its lowest address and the address it starts from (its top).
-pub const fn stack_of(thread: u32) -> (u32, u32) {
-    if thread == THREAD_MAIN {
-        (STACK_LIMIT, STACK_TOP)
-    } else {
-        let floor = STACK_TOP + (thread - 1) * THREAD_STACK_SIZE;
-        (floor, floor + THREAD_STACK_SIZE)
-    }
-}
-
 /// A panic's message, from the memory's bytes at a thread's [`PANIC`] on: `None` if the count is
 /// 0 or the message runs past `bytes`. Bytes that aren't UTF-8 are replaced.
 pub fn panic_message(bytes: &[u8]) -> Option<String> {
@@ -223,8 +218,8 @@ pub fn panic_message(bytes: &[u8]) -> Option<String> {
 // The regions don't overlap, and each fits below the next.
 const _: () = assert!(TICK_STATE + 24 <= CMD_BASE);
 const _: () = assert!(CMD_BASE + crate::stream::HEADER_LEN as u32 + CMD_CAP <= THREAD_BLOCKS);
-const _: () = assert!(thread_block(THREADS) <= JOB_SLOTS);
-const _: () = assert!(JOB_SLOTS + JOB_SLOT_COUNT * JOB_SLOT_SIZE <= TICK_RECORDS);
+const _: () = assert!(THREAD_BLOCKS_END <= JOB_SLOTS);
+const _: () = assert!(JOB_SLOTS_END <= TICK_RECORDS);
 const _: () = assert!(TICK_RECORDS + 4 + MAX_TICK_RECORDS * crate::input::EVENT_SIZE <= AUDIO_OUT);
 const _: () = assert!(AUDIO_OUT + crate::AUDIO_QUANTUM * 4 <= STACK_LIMIT);
 const _: () = assert!(DATA_BASE.is_multiple_of(16));

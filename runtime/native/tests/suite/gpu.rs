@@ -168,16 +168,13 @@ struct C { cell: vec2u, size: vec2u, colour: u32, _pad: u32, _pad2: vec2u }
 }
 @fragment fn fs() -> @location(0) vec4f { return unpack4x8unorm(c.colour); }
 "#;
-const STORE_MANIFEST: &str = r#"{
-  "manifest_version": 4, "stream_version": 6, "wasm": "game.wasm",
-  "pipelines": [
+const STORE_PIPELINES: &str = r#"[
     { "name": "store", "shader": "store.wgsl", "kind": "compute", "entry": "store", "workgroup_size": [1, 1, 1],
       "uniform": { "binding": 0, "size": 16, "space": "uniform" },
       "bindings": [{ "binding": 1, "kind": "read_write" }] },
     { "name": "cell", "shader": "cell.wgsl", "kind": "render", "vertex_entry": "vs", "fragment_entry": "fs",
       "uniform": { "binding": 0, "size": 32, "space": "uniform" }, "bindings": [] }
-  ]
-}"#;
+  ]"#;
 
 /// A program submitting `frames`, loaded with the store and cell pipelines. The build's
 /// directory comes first, so `let (_dir, host) = ...` drops the host before the directory.
@@ -185,7 +182,7 @@ fn store_host(name: &str, frames: &[Vec<Vec<u8>>], options: &Options) -> (TempDi
     let wasm = wat::parse_str(common::wat::program(frames)).expect("compiles");
     let dir = common::build(
         name,
-        STORE_MANIFEST,
+        &common::manifest(STORE_PIPELINES),
         &[("store.wgsl", STORE_WGSL), ("cell.wgsl", CELL_WGSL)],
         &wasm,
     );
@@ -302,9 +299,7 @@ struct M { colour: u32, z: f32, _pad: vec2u }
 @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f { return vec4f(pos[i], m.z, 1); }
 @fragment fn fs() -> @location(0) vec4f { return unpack4x8unorm(m.colour); }
 "#;
-const MESH_MANIFEST: &str = r#"{
-  "manifest_version": 4, "stream_version": 6, "wasm": "game.wasm",
-  "pipelines": [
+const MESH_PIPELINES: &str = r#"[
     { "name": "plain", "shader": "mesh.wgsl", "kind": "render", "vertex_entry": "vs", "fragment_entry": "fs",
       "uniform": { "binding": 0, "size": 16, "space": "uniform" }, "bindings": [{ "binding": 1, "kind": "read" }] },
     { "name": "biased", "shader": "mesh.wgsl", "kind": "render", "vertex_entry": "vs", "fragment_entry": "fs",
@@ -313,8 +308,7 @@ const MESH_MANIFEST: &str = r#"{
     { "name": "culled", "shader": "mesh.wgsl", "kind": "render", "vertex_entry": "vs", "fragment_entry": "fs",
       "cull": "back",
       "uniform": { "binding": 0, "size": 16, "space": "uniform" }, "bindings": [{ "binding": 1, "kind": "read" }] }
-  ]
-}"#;
+  ]"#;
 
 /// Indexed indirect draws (stream v6), with each render pipeline's cull mode and depth bias
 /// (manifest v4): two quads from one index buffer, the left one's triangles facing the screen
@@ -361,7 +355,12 @@ fn indexed_indirect_draws_cull_and_bias() {
     }
     e.present();
     let wasm = wat::parse_str(common::wat::program(&[vec![e.finish()]])).expect("compiles");
-    let dir = common::build("indexed", MESH_MANIFEST, &[("mesh.wgsl", MESH_WGSL)], &wasm);
+    let dir = common::build(
+        "indexed",
+        &common::manifest(MESH_PIPELINES),
+        &[("mesh.wgsl", MESH_WGSL)],
+        &wasm,
+    );
     let mut host = Host::load(&dir).expect("loads");
     let run = host.run_frames(&[0.0], w, h).expect("runs");
     for y in 0..h {

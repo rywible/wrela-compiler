@@ -34,6 +34,18 @@ enum Inherent {
     Ambiguous,
 }
 
+/// What `Type::name` names: an associated function, the type's own or a trait's.
+enum Assoc {
+    Missing,
+    /// An inherent function, and its impl's arguments for the type.
+    Inherent(FnId, Vec<TyId>),
+    /// The function of the one trait the type has it through. `true`: the type might not have
+    /// the trait, so that's an obligation.
+    Trait(FnId, TraitRef, bool),
+    /// More than one impl has it (E0306, reported).
+    Ambiguous,
+}
+
 /// What a method call resolved to.
 enum Pick {
     /// An inherent method, with its impl's arguments solved against the receiver.
@@ -936,20 +948,19 @@ impl<'p> Checker<'p> {
             self.expect(have, want, span);
             return;
         };
-        let lacks = [
-            (wf.deterministic && !hf.deterministic, "@deterministic"),
-            (wf.parallel && !hf.parallel, "@parallel"),
-            (wf.audio && !hf.audio, "@audio"),
-        ];
-        if hp.len() != wp.len() || hf.modes != wf.modes || lacks.iter().any(|(l, _)| *l) {
+        let lacks: Vec<&str> = (wf.attrs().into_iter().zip(hf.attrs()))
+            .filter(|&((_, w), (_, h))| w && !h)
+            .map(|((attr, _), _)| attr)
+            .collect();
+        if hp.len() != wp.len() || hf.modes != wf.modes || !lacks.is_empty() {
             let mut d = Diagnostic::new(
                 codes::E0300,
                 span,
                 format!("expected `{}`, found `{}`", self.display(want), self.display(have)),
             );
-            for (_, attr) in lacks.iter().filter(|(l, _)| *l) {
+            for attr in lacks {
                 d = d.with_note(format!(
-                    "the parameter's bound isn't `{attr}`, so the function it holds may not be"
+                    "the parameter's bound isn't `@{attr}`, so the function it holds may not be"
                 ));
             }
             self.err(d);
@@ -1290,10 +1301,8 @@ impl<'p> Checker<'p> {
                 } else {
                     r
                 };
-                if b.cpu_impl().is_some()
-                    && builtins::scalar_of(&self.p.types, ty) == self.p.types.f64
-                {
-                    self.err(crate::builtins::f64_math(b.name(), span));
+                if b.cpu_impl().is_some() && builtins::is_f64_math(&self.p.types, ty) {
+                    self.err(builtins::f64_math(b.name(), span));
                 }
                 let stmts = self.bind_in_written_order(&mut xs, &written);
                 let call = plain_call(Callee::Builtin(b), xs, false, ty, span);
@@ -1696,14 +1705,12 @@ impl<'p> Checker<'p> {
         }
     }
 
-    /// `vec3()` is zero, `vec3(s)` splats, `vec3(a, b, c)` and `vec3(v2, z)` concatenate, and
-    /// `vec3(y: 1.0)` names components (the rest are zero).
     /// A vector of `n` `e`s: from its components named (the rest zero), none (zeros), its
     /// components and smaller vectors of its element in order, one component for all, or one
     /// vector of another element and its size, each component converted (`vec3(cell)`).
     fn vec_ctor(&mut self, e: VecElem, n: u8, ty: TyId, args: &[ast::Arg], span: Span) -> Expr {
         let comp = self.p.types.elem(e);
-        let name = format!("vec{n}{}", e.suffix());
+        let name = self.display(ty);
         if args.iter().any(|a| a.name.is_some()) {
             let names = ["x", "y", "z", "w"];
             let mut comps: Vec<Option<Expr>> = vec![None; n as usize];
@@ -1737,10 +1744,10 @@ impl<'p> Checker<'p> {
                 comps[i] = Some(x);
                 written.push(i);
             }
-            return self.construct_in_order(ty, comp, comps, &written, span);
+            return self.construct_in_order(ty, e, comps, &written, span);
         }
         if args.is_empty() {
-            let xs = (0..n).map(|_| zero_of(comp, e, span)).collect();
+            let xs = (0..n).map(|_| zero_of(&self.p.types, e, span)).collect();
             return Expr { ty, span, kind: ExprKind::Construct(xs) };
         }
         let mut xs = Vec::new();
@@ -1788,20 +1795,20 @@ impl<'p> Checker<'p> {
         Expr { ty, span, kind: ExprKind::Construct(xs) }
     }
 
-    /// A vector from named components, evaluated in the order written (`written`, by index
-    /// into `comps`); a component not given is zero. Components written out of their order
+    /// A vector of `e`s from named components, evaluated in the order written (`written`, by
+    /// index into `comps`); a component not given is zero. Components written out of their order
     /// that aren't literal values are bound first, in a block: `{ let a = z; let b = x;
     /// vec3(b, 0.0, a) }`.
     fn construct_in_order(
         &mut self,
         ty: TyId,
-        comp: TyId,
+        e: VecElem,
         mut comps: Vec<Option<Expr>>,
         written: &[usize],
         span: Span,
     ) -> Expr {
-        let e = VecElem::of(self.p.types.kind(comp)).unwrap_or(VecElem::F32);
-        let zero = zero_of(comp, e, span);
+        let comp = self.p.types.elem(e);
+        let zero = zero_of(&self.p.types, e, span);
         let pure = |e: &Option<Expr>| e.as_ref().is_none_or(|e| zonk::non_literal(e).is_none());
         if written.is_sorted() || comps.iter().filter(|c| !pure(c)).count() < 2 {
             let xs = comps.into_iter().map(|c| c.unwrap_or_else(|| zero.clone())).collect();
@@ -1842,44 +1849,40 @@ impl<'p> Checker<'p> {
             };
             return self.call_variant(a, v as u32, &path, args, expected.or(Some(ty)), span);
         }
-        match self.find_inherent(ty, &name.name, name.span) {
-            Inherent::Method(f, impl_args) => {
+        match self.find_associated(ty, name) {
+            Assoc::Inherent(f, impl_args) => {
                 let mut gargs = impl_args;
                 gargs.extend(self.method_generic_args(f, generics, span));
-                return self.call_fn(f, gargs, None, args, expected, span);
+                self.call_fn(f, gargs, None, args, expected, span)
             }
-            Inherent::Ambiguous => return self.failed_call(args, span),
-            Inherent::Missing => {}
-        }
-        // A trait's function, through a type that has the trait.
-        let traits = self.traits_with_method(ty, &name.name, name.span);
-        if let [(t, trait_args, unsure)] = traits.as_slice()
-            && let Some(m) = traits::trait_method(self.p, *t, &name.name)
-        {
-            if self.p.func(m).has_self() {
+            Assoc::Trait(m, r, unsure) => {
+                if self.p.func(m).has_self() {
+                    self.err(Diagnostic::new(
+                        codes::E0207,
+                        name.span,
+                        format!(
+                            "`{}` is a method; call it on a value: `x.{}(...)`",
+                            name.name, name.name
+                        ),
+                    ));
+                    return self.error_expr(span);
+                }
+                if unsure {
+                    self.trait_obligation(ty, &r, span, &name.name);
+                }
+                self.call_trait_method(m, ty, r.args, generics, None, args, span)
+            }
+            Assoc::Ambiguous => self.failed_call(args, span),
+            Assoc::Missing => {
+                let shown = self.display(ty);
                 self.err(Diagnostic::new(
                     codes::E0207,
                     name.span,
-                    format!(
-                        "`{}` is a method; call it on a value: `x.{}(...)`",
-                        name.name, name.name
-                    ),
+                    format!("`{shown}` has no associated function `{}`", name.name),
                 ));
-                return self.error_expr(span);
+                self.failed_call(args, span)
             }
-            let r = TraitRef { trait_: *t, args: trait_args.clone() };
-            if *unsure {
-                self.trait_obligation(ty, &r, span, &name.name);
-            }
-            return self.call_trait_method(m, ty, r.args, generics, None, args, span);
         }
-        let shown = self.display(ty);
-        self.err(Diagnostic::new(
-            codes::E0207,
-            name.span,
-            format!("`{shown}` has no associated function `{}`", name.name),
-        ));
-        self.failed_call(args, span)
     }
 
     /// `T::f` as a value, not called: `ty`'s inherent function `f`, or a trait's, through a
@@ -1891,29 +1894,39 @@ impl<'p> Checker<'p> {
         generics: Option<&[ast::TypeExpr]>,
         span: Span,
     ) -> Option<Expr> {
-        let (f, args) = match self.find_inherent(ty, &name.name, name.span) {
-            Inherent::Method(f, impl_args) => {
-                let mut args = impl_args;
-                args.extend(self.method_generic_args(f, generics, span));
-                (f, args)
-            }
-            Inherent::Ambiguous => return Some(self.error_expr(span)),
-            Inherent::Missing => {
-                let traits = self.traits_with_method(ty, &name.name, name.span);
-                let [(t, trait_args, unsure)] = traits.as_slice() else { return None };
-                let m = traits::trait_method(self.p, *t, &name.name)?;
-                if *unsure {
-                    let r = TraitRef { trait_: *t, args: trait_args.clone() };
+        let (f, mut args) = match self.find_associated(ty, name) {
+            Assoc::Inherent(f, impl_args) => (f, impl_args),
+            Assoc::Trait(m, r, unsure) => {
+                if unsure {
                     self.trait_obligation(ty, &r, span, &name.name);
                 }
                 let mut args = vec![ty];
-                args.extend(trait_args.iter().copied());
-                args.extend(self.method_generic_args(m, generics, span));
+                args.extend(r.args);
                 (m, args)
             }
+            Assoc::Ambiguous => return Some(self.error_expr(span)),
+            Assoc::Missing => return None,
         };
+        args.extend(self.method_generic_args(f, generics, span));
         let fty = self.p.types.intern(TyKind::FnDef(f, args.clone()));
         Some(Expr { ty: fty, span, kind: ExprKind::FnRef(f, args) })
+    }
+
+    /// The associated function `ty::name`: an inherent one, or else one of the one trait `ty`
+    /// has with a function of that name.
+    fn find_associated(&mut self, ty: TyId, name: &ast::Ident) -> Assoc {
+        match self.find_inherent(ty, &name.name, name.span) {
+            Inherent::Method(f, impl_args) => return Assoc::Inherent(f, impl_args),
+            Inherent::Ambiguous => return Assoc::Ambiguous,
+            Inherent::Missing => {}
+        }
+        let traits = self.traits_with_method(ty, &name.name, name.span);
+        if let [(t, trait_args, unsure)] = traits.as_slice()
+            && let Some(m) = traits::trait_method(self.p, *t, &name.name)
+        {
+            return Assoc::Trait(m, TraitRef { trait_: *t, args: trait_args.clone() }, *unsure);
+        }
+        Assoc::Missing
     }
 
     /// An inherent method of `ty` named `name`, and the impl's arguments for `ty`. When more
@@ -2724,23 +2737,30 @@ impl<'p> Checker<'p> {
         out
     }
 
+    /// `T` when `t` is a `GpuBuffer<T>` or a `GpuSpan<T>`, with both resolved.
+    fn gpu_buffer_elem(&self, t: TyId) -> Option<TyId> {
+        let t = self.infer.resolve(&self.p.types, t);
+        match self.kind(t) {
+            TyKind::Adt(a, args)
+                if matches!(self.p.adt(*a).lang, Some(Lang::GpuBuffer | Lang::GpuSpan)) =>
+            {
+                args.first().map(|&e| self.infer.resolve(&self.p.types, e))
+            }
+            _ => None,
+        }
+    }
+
     /// Whether `t` holds an indexed draw's indices: a `GpuBuffer<T>` or `GpuSpan<T>` where `T`
     /// is `u32`, or a struct whose fields are all `u32`s (a triangle's or a quad's, so a kernel
     /// can append whole ones), which the draw reads as consecutive `u32` indices.
-    fn index_buffer(&mut self, t: TyId) -> bool {
-        let t = self.infer.resolve(&self.p.types, t);
+    fn index_buffer(&self, t: TyId) -> bool {
         let u32_ty = self.p.types.u32;
-        let TyKind::Adt(a, args) = self.kind(t).clone() else { return false };
-        if !matches!(self.p.adt(a).lang, Some(Lang::GpuBuffer | Lang::GpuSpan)) {
-            return false;
-        }
-        let Some(&elem) = args.first() else { return false };
-        let elem = self.infer.resolve(&self.p.types, elem);
+        let Some(elem) = self.gpu_buffer_elem(t) else { return false };
         if elem == u32_ty {
             return true;
         }
-        match self.kind(elem).clone() {
-            TyKind::Adt(e, eargs) if eargs.is_empty() => match &self.p.adt(e).kind {
+        match self.kind(elem) {
+            TyKind::Adt(e, eargs) if eargs.is_empty() => match &self.p.adt(*e).kind {
                 AdtKind::Struct(fields) => {
                     !fields.is_empty() && fields.iter().all(|f| f.ty == u32_ty)
                 }
@@ -2751,16 +2771,8 @@ impl<'p> Checker<'p> {
     }
 
     /// Whether `t` holds a dispatch's or draw's counts: a `GpuBuffer<u32>` or `GpuSpan<u32>`.
-    fn counts_buffer(&mut self, t: TyId) -> bool {
-        let t = self.infer.resolve(&self.p.types, t);
-        let u32_ty = self.p.types.u32;
-        match self.kind(t) {
-            TyKind::Adt(a, args) => {
-                matches!(self.p.adt(*a).lang, Some(Lang::GpuBuffer | Lang::GpuSpan))
-                    && args.first().is_some_and(|&e| self.infer.resolve(&self.p.types, e) == u32_ty)
-            }
-            _ => false,
-        }
+    fn counts_buffer(&self, t: TyId) -> bool {
+        self.gpu_buffer_elem(t) == Some(self.p.types.u32)
     }
 
     /// A dispatch's or draw's argument for an entry point's parameter `p` (§6.13). A buffer
@@ -2975,17 +2987,13 @@ impl<'p> Checker<'p> {
     fn check_draw(&mut self, args: &[ast::Arg], span: Span) -> Expr {
         let unit = self.p.types.unit;
         let u32_ty = self.p.types.u32;
-        let counts = |a: &ast::Arg| {
-            a.name.as_ref().is_some_and(|n| {
-                matches!(
-                    n.name.as_str(),
-                    "vertices" | "instances" | "indirect" | "indices" | "cull" | "depth_bias"
-                )
-            })
-        };
+        // `draw`'s own named arguments.
+        const OWN: [&str; 6] =
+            ["vertices", "instances", "indirect", "indices", "cull", "depth_bias"];
+        let own = |a: &ast::Arg| a.name.as_ref().is_some_and(|n| OWN.contains(&n.name.as_str()));
         // The form before binding: the shaders' arguments among `draw`'s own, by name.
         let extra: Vec<&ast::Arg> =
-            args.iter().skip(2).filter(|a| a.name.is_some() && !counts(a)).collect();
+            args.iter().skip(2).filter(|a| a.name.is_some() && !own(a)).collect();
         if !extra.is_empty() && args.len() >= 2 {
             let shaders = (self.fn_named(&args[0].value), self.fn_named(&args[1].value));
             let rewrite = (|| {
@@ -3005,7 +3013,7 @@ impl<'p> Checker<'p> {
                         fargs.push(text);
                     }
                 }
-                let rest: Vec<&ast::Arg> = args.iter().skip(2).filter(|a| counts(a)).collect();
+                let rest: Vec<&ast::Arg> = args.iter().skip(2).filter(|a| own(a)).collect();
                 let mut parts = vec![
                     Self::bound_text(self.p.text(args[0].value.span)?, &vargs),
                     Self::bound_text(self.p.text(args[1].value.span)?, &fargs),
@@ -3055,8 +3063,8 @@ impl<'p> Checker<'p> {
         let mut indirect: Option<Box<Expr>> = None;
         let mut indices: Option<Box<Expr>> = None;
         let mut state = RenderState::default();
-        let (mut cull_given, mut bias_given) = (false, false);
         let mut counts = Vec::new();
+        let mut seen: Vec<&str> = Vec::new();
         for a in &args[2..] {
             let Some(n) = &a.name else {
                 self.err(
@@ -3070,68 +3078,58 @@ impl<'p> Checker<'p> {
                 self.check_expr(&a.value, None);
                 continue;
             };
-            let twice = |this: &mut Self| {
-                this.err(Diagnostic::new(
+            // A count given twice is still checked, for its own errors.
+            let twice = seen.contains(&n.name.as_str());
+            if twice {
+                self.err(Diagnostic::new(
                     codes::E0304,
                     a.span,
                     format!("`{}` is given twice", n.name),
                 ));
-            };
+            } else {
+                seen.push(&n.name);
+            }
             match n.name.as_str() {
                 "indirect" => {
-                    let e = self.check_expr(&a.value, None);
-                    if !self.counts_buffer(e.ty) && !matches!(self.kind(e.ty), TyKind::Error) {
-                        self.err(
-                            Diagnostic::new(
-                                codes::E0603,
-                                e.span,
-                                format!("`indirect:` takes a `GpuBuffer<u32>` or a `GpuSpan<u32>` of the counts, not a `{}`", self.display(e.ty)),
-                            )
-                            .with_note("the buffer holds the vertex count, the instance count, the first vertex and the first instance"),
-                        );
+                    let e = self.draw_buffer(
+                        "indirect",
+                        &a.value,
+                        Self::counts_buffer,
+                        "a `GpuBuffer<u32>` or a `GpuSpan<u32>` of the counts",
+                        "the buffer holds the vertex count, the instance count, the first vertex and the first instance",
+                    );
+                    if !twice {
+                        indirect = Some(Box::new(e));
+                        counts.push(DrawCount::Indirect);
                     }
-                    if indirect.is_some() {
-                        twice(self);
-                        continue;
-                    }
-                    indirect = Some(Box::new(e));
-                    counts.push(DrawCount::Indirect);
                 }
                 "indices" => {
-                    let e = self.check_expr(&a.value, None);
-                    if !self.index_buffer(e.ty) && !matches!(self.kind(e.ty), TyKind::Error) {
-                        self.err(
-                            Diagnostic::new(
-                                codes::E0603,
-                                e.span,
-                                format!("`indices:` takes a `GpuBuffer` or a `GpuSpan` of `u32` indices, not a `{}`", self.display(e.ty)),
-                            )
-                            .with_note("its elements may also be structs of `u32` fields, a triangle's or a quad's indices each"),
-                        );
+                    let e = self.draw_buffer(
+                        "indices",
+                        &a.value,
+                        Self::index_buffer,
+                        "a `GpuBuffer` or a `GpuSpan` of `u32` indices",
+                        "its elements may also be structs of `u32` fields, a triangle's or a quad's indices each",
+                    );
+                    if !twice {
+                        indices = Some(Box::new(e));
+                        counts.push(DrawCount::Indices);
                     }
-                    if indices.is_some() {
-                        twice(self);
-                        continue;
-                    }
-                    indices = Some(Box::new(e));
-                    counts.push(DrawCount::Indices);
                 }
+                // The render state given twice isn't checked again.
+                "cull" | "depth_bias" if twice => {}
                 "cull" => {
-                    if cull_given {
-                        twice(self);
-                        continue;
-                    }
-                    cull_given = true;
                     if let Some(c) = self.render_constant(&a.value, Lang::Cull) {
-                        state.cull = c[0] as u32;
+                        use wrela_abi::manifest::Cull;
+                        // `std::gpu::Cull`'s variants, in order.
+                        state.cull = match c[0] as u32 {
+                            1 => Cull::Front,
+                            2 => Cull::Back,
+                            _ => Cull::None,
+                        };
                     }
                 }
                 "depth_bias" => {
-                    if bias_given {
-                        twice(self);
-                        continue;
-                    }
-                    bias_given = true;
                     if let Some(c) = self.render_constant(&a.value, Lang::DepthBias) {
                         state.bias_constant = c[0] as i32;
                         state.bias_slope = (c[1] as f32).to_bits();
@@ -3140,17 +3138,15 @@ impl<'p> Checker<'p> {
                 }
                 "vertices" | "instances" => {
                     let e = self.check_expect(&a.value, u32_ty);
-                    let (slot, c) = if n.name == "vertices" {
-                        (&mut vertices, DrawCount::Vertices)
-                    } else {
-                        (&mut instances, DrawCount::Instances)
-                    };
-                    if slot.is_some() {
-                        twice(self);
-                        continue;
+                    if !twice {
+                        if n.name == "vertices" {
+                            vertices = Some(e);
+                            counts.push(DrawCount::Vertices);
+                        } else {
+                            instances = Some(e);
+                            counts.push(DrawCount::Instances);
+                        }
                     }
-                    *slot = Some(e);
-                    counts.push(c);
                 }
                 _ => unreachable!("the shaders' arguments are bound (above)"),
             }
@@ -3198,6 +3194,31 @@ impl<'p> Checker<'p> {
             counts,
         };
         Expr { ty: unit, span, kind: ExprKind::Draw(Box::new(d)) }
+    }
+
+    /// A draw's buffer argument `name:` (`indirect:` or `indices:`), E0603 unless `ok` says
+    /// its type is one: `takes` says what the argument takes, and `note` what the buffer holds.
+    fn draw_buffer(
+        &mut self,
+        name: &str,
+        value: &ast::Expr,
+        ok: fn(&Self, TyId) -> bool,
+        takes: &str,
+        note: &str,
+    ) -> Expr {
+        let e = self.check_expr(value, None);
+        if !ok(self, e.ty) && !matches!(self.kind(e.ty), TyKind::Error) {
+            let shown = self.display(e.ty);
+            self.err(
+                Diagnostic::new(
+                    codes::E0603,
+                    e.span,
+                    format!("`{name}:` takes {takes}, not a `{shown}`"),
+                )
+                .with_note(note),
+            );
+        }
+        e
     }
 
     /// A draw's `cull:` (`std::gpu::Cull`) or `depth_bias:` (`std::gpu::DepthBias`): a value
@@ -3325,15 +3346,6 @@ fn bare_true(e: &ast::Expr) -> bool {
     matches!(&e.kind, ast::ExprKind::Lit(l) if l.kind == ast::LitKind::Bool(true))
 }
 
-/// A call that borrows each argument, evaluates them in order, and returns a value.
-fn plain_call(callee: Callee, args: Vec<Expr>, receiver: bool, ty: TyId, span: Span) -> Expr {
-    let n = args.len();
-    let modes = vec![Mode::Borrow; n];
-    let call =
-        Call { callee, args, modes, order: (0..n).collect(), receiver, ret_mode: RetMode::Owned };
-    Expr { ty, span, kind: ExprKind::Call(call) }
-}
-
 /// The two operands of a comparison: of numbers, `bool` and vectors (`Binary`), or through
 /// `Eq` (`a.eq(b)`, negated for `!=`) or `Ord` (`a.cmp(b) == Ordering::Less`).
 fn comparison_operands<'e>(
@@ -3423,7 +3435,7 @@ pub(crate) fn embed_path_problem(path: &str) -> Option<&'static str> {
 }
 
 /// A zero of a vector's component type: the literal `0` or `0.0`.
-fn zero_of(comp: TyId, e: VecElem, span: Span) -> Expr {
+fn zero_of(types: &Types, e: VecElem, span: Span) -> Expr {
     let lit = if e.is_float() { Lit::Float(0.0, 0.0) } else { Lit::Int(0) };
-    Expr { ty: comp, span, kind: ExprKind::Lit(lit) }
+    Expr { ty: types.elem(e), span, kind: ExprKind::Lit(lit) }
 }

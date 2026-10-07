@@ -69,7 +69,7 @@ struct Counts: Copy + GpuData {
 @compute(64)
 fn counts(inputs: [u32], out: mut Slots<Counts>, id: GlobalId) {
     let x = inputs[id.x]
-    let y = bitcast_i32(bitcast_f32(x))
+    let y = i32(x)
     out[id] = Counts {
         ones: x.count_ones(),
         leading: x.leading_zeros(),

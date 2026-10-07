@@ -494,7 +494,7 @@ pub(crate) fn failure(
                 Item::Test(..) => "check that its loops end, or test less at once",
             });
     } else if code == codes::E0706 {
-        let framed = matches!(item, Item::Test(f, _) if p.func(f).attrs.runs_program());
+        let framed = matches!(item, Item::Test(f, _) if p.func(f).attrs.test_run.is_some());
         d = d.with_note(if framed {
             "a frame test runs `init` and the program's frames (or a tick test its ticks), then the test: it passes unless one of them panics, and a failed `assert` panics (§10)"
         } else {

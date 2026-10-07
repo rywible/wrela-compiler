@@ -2,7 +2,7 @@
 // `replace`. A collection owns its elements, frees them when it's dropped, and iterates in an
 // order that doesn't depend on addresses (D-015).
 
-use std::alloc::{alloc, free, realloc}
+use std::alloc::{free, place, realloc}
 use std::par::{chunks_for, par_each}
 use std::mem::{
     Drop, align_of, at, at_mut, at_mut_pair, copy, drop_at, read, size_of, take_answer, take_input,
@@ -371,10 +371,7 @@ impl<T> Vec<T> {
         reduce: @parallel fn(R, R) -> R,
     ) -> R {
         let chunks = chunks_for(self.len)
-        var partial: Vec<R> = Vec::with_capacity(chunks)
-        for _ in 0..chunks {
-            partial.push(init.clone())
-        }
+        var partial = Vec::filled(chunks, init)
         if chunks > 0 {
             std::par::par_map_reduce(chunks, self, init, map, reduce, mut partial)
         }
@@ -410,7 +407,7 @@ impl<T> Vec<T> {
 }
 
 /// A list of at most `N` values, held in place: an array and how many of it are in use. It's
-/// `Copy`, and `Plain` and `GpuData` where `T` is, so it can be in a snapshot (§6.12) or on the
+/// `Copy`, and `Plain` and `GpuData` where `T` is, so it can be in a snapshot (§6.11) or on the
 /// GPU, where a `Vec` can't. `b[i]` projects element `i` (on the CPU, an index at or past
 /// `len()` panics), and `for x in b` walks the elements in use. It hashes, saves and compares
 /// only those.
@@ -520,8 +517,8 @@ impl<T: Eq, const N: u32> Eq for Bounded<T, N> {
 }
 
 /// Sorts `xs`, an array's elements or a run's, by `before`, which says whether its first
-/// argument goes before its second. Stable, O(n log n): a merge sort, whose room, a copy of
-/// the elements, is allocated for the call. (`Vec::sort_by` sorts a `Vec`, of any `T`.)
+/// argument goes before its second. Stable, O(n log n): it sorts a copy of the elements, a
+/// `Vec` allocated for the call, with `Vec::sort_by`, which sorts a `Vec` of any `T`.
 ///
 /// ```wrela
 /// use std::collections::sort_by
@@ -531,51 +528,10 @@ impl<T: Eq, const N: u32> Eq for Bounded<T, N> {
 /// assert(xs[0] == -1.0 && xs[3] == 7.0)
 /// ```
 pub fn sort_by<T: Copy>(xs: mut [T], before: fn(T, T) -> bool) {
-    let n = xs.len()
-    // Runs of `SORT_RUN` elements, each sorted by insertion.
-    var lo = 0
-    while lo < n {
-        let hi = min(lo + SORT_RUN, n)
-        for i in lo + 1..hi {
-            let x = xs[i]
-            var j = i
-            while j > lo && before(x, xs[j - 1]) {
-                xs[j] = xs[j - 1]
-                j -= 1
-            }
-            xs[j] = x
-        }
-        lo = hi
-    }
-    if n <= SORT_RUN {
-        return
-    }
-    // Then merged in pairs into the room, and back, until one run is left.
-    var room: Vec<T> = Vec::with_capacity(n)
-    var width = SORT_RUN
-    while width < n {
-        room.clear()
-        var lo = 0
-        while lo < n {
-            let mid = min(lo + width, n)
-            let hi = min(lo + 2 * width, n)
-            var i = lo
-            var j = mid
-            while i < mid || j < hi {
-                if i < mid && (j >= hi || !before(xs[j], xs[i])) {
-                    room.push(xs[i])
-                    i += 1
-                } else {
-                    room.push(xs[j])
-                    j += 1
-                }
-            }
-            lo = hi
-        }
-        for k in 0..n {
-            xs[k] = room[k]
-        }
-        width = 2 * width
+    var v = Vec::from(xs)
+    v.sort_by(before)
+    for k in 0..xs.len() {
+        xs[k] = v[k]
     }
 }
 
@@ -596,11 +552,7 @@ impl<T: Clone> Vec<T> {
     /// assert(v.len() == 3 && v[2] == 0.5)
     /// ```
     pub fn filled(n: u32, value: T) -> Vec<T> {
-        var v = Vec::with_capacity(n)
-        for _ in 0..n {
-            v.push(value.clone())
-        }
-        v
+        Vec::from_fn(n, |_| value.clone())
     }
 
     /// A `Vec` of a copy of each of `xs`: `Vec::from([1.0, 2.0])`.
@@ -682,11 +634,7 @@ pub struct Box<T>: Clone {
 impl<T> Box<T> {
     /// Moves `value` to the heap.
     pub fn new(value: take T) -> Box<T> {
-        unsafe {
-            let a = alloc(size_of::<T>(), align_of::<T>())
-            write::<T>(a, take value)
-            Box { addr: a }
-        }
+        Box { addr: unsafe { place(take value) } }
     }
 
     /// The value, in place.

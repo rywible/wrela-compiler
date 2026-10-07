@@ -1,10 +1,10 @@
 // Spike 01's numbers for the Rust harness (compiler/tests/src/spike01.rs), from its own
-// grazer.js, unchanged: each seed's parameters and bounds; the herd's placement and each
-// scene's `View` uniform (main.js's `herdInstances` and `scene`, copied here: main.js runs its
-// benchmark on load and exports nothing); and bone palettes at given times (grazer.js's `pose`,
-// as main.js's `update` calls it).
+// grazer.js, unchanged: each seed's parameters and bounds; each scene's `View` uniform; and
+// bone palettes at given times (grazer.js's `pose`, as main.js's `update` calls it). The views
+// and the herd's placement are main.js's (`scene` and `herdInstances`), copied here: main.js
+// runs its benchmark on load and exports nothing.
 //
-//   bun data.mjs seeds                       JSON: seeds 1 to 40, the placement, the views
+//   bun data.mjs seeds                       JSON: seeds 1 to 40, the views
 //   bun data.mjs palettes <scene> <t>...     binary: for each t, each instance's 29 mat4s (f32)
 //
 // <scene> is `herd` (seeds 1 to 40 as placed) or `closeup` (seed 1 at the origin).
@@ -45,9 +45,9 @@ const grazers = Array.from({ length: HERD }, (_, i) => makeGrazer(i + 1));
 const [what, ...args] = process.argv.slice(2);
 
 if (what === 'seeds') {
-  const seeds = grazers.map(g => ({ seed: g.seed, params: Array.from(g.params), min: g.bounds.min, max: g.bounds.max }));
+  const seeds = grazers.map(g => ({ params: Array.from(g.params), min: g.bounds.min, max: g.bounds.max }));
   const views = { herd: view([2, 7.5, -27], [0, 0.8, 1], 26), closeup: view([0.85, 1.4, -3.6], [0.85, 1.2, 0], 4) };
-  process.stdout.write(JSON.stringify({ seeds, herd: herdInstances(), closeup: close, views }));
+  process.stdout.write(JSON.stringify({ seeds, views }));
 } else if (what === 'palettes') {
   const [scene, ...times] = args;
   const inst = scene === 'closeup' ? close : herdInstances();

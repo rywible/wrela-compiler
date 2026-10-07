@@ -393,12 +393,7 @@ pub fn part_family<S: Surface>(field: S, i: u32) -> u32 {
 
 /// Each part's family (`part_family`), by index.
 pub fn part_families<S: Surface>(field: S) -> Vec<u32> {
-    let n = field.parts()
-    var out: Vec<u32> = Vec::with_capacity(n)
-    for i in 0..n {
-        out.push(part_family(field, i))
-    }
-    out
+    Vec::from_fn(field.parts(), |i| part_family(field, i))
 }
 
 /// Part `i`'s mirror image: the part with its name in its group, mirrored the other way; `i`
@@ -454,9 +449,7 @@ pub fn certify_positive(f: fn(vec3) -> f32, region: Box3, depth: u32) -> Certifi
     var stack: Vec<(Box3, u32)> = Vec::new()
     stack.push((region, 0))
     var unknown: Option<Box3> = None
-    while stack.len() > 0 {
-        let Some(item) = stack.pop() else { break }
-        let (b, d) = item
+    while let Some((b, d)) = stack.pop() {
         let r = interval(f, b)
         if r.lo > 0.0 {
             continue
@@ -626,11 +619,7 @@ impl Surface for Oval {
     }
 
     fn bound(self) -> Bound {
-        Bound {
-            centre: vec3(),
-            radius: max(self.radii.x, max(self.radii.y, self.radii.z)),
-            slope: 0.5,
-        }
+        ellipsoid(self.radii).bound()
     }
 }
 
@@ -2242,6 +2231,21 @@ pub fn smin_weight(a: f32, b: f32, k: f32) -> f32 {
     if a < b { w } else { 1.0 - w }
 }
 
+/// `smin(a, b, k)` and `smin_weight(a, b, k)` at once, as spike 01's `smin_h` gives them: the
+/// two share `max(k - |a - b|, 0)`. The same numbers as theirs, bit for bit: for `k` up to
+/// 2^124, `0.5 / k` is exactly twice `0.25 / k`.
+pub fn smin_and_weight(a: f32, b: f32, k: f32) -> (f32, f32) {
+    let s = 0.25 / max(k, 1.1754944e-38)
+    let d = b - a
+    if d > 0.0 {
+        let m = max(k - d, 0.0)
+        (a - m * (m * s), m * (2.0 * s))
+    } else {
+        let m = max(k + select(if_false: d, if_true: 0.0, cond: a == b && d != d), 0.0)
+        (b - m * (m * s), 1.0 - m * (2.0 * s))
+    }
+}
+
 // The combinators evaluate each part once, for its distance and its channels together: asking
 // each part for its channels after its distance would evaluate a chain of n blended parts
 // O(n²) times.
@@ -2268,7 +2272,8 @@ impl<C: Blend, A: Field<C>, B: Field<C>> Field<C> for SmoothUnion<A, B> {
     fn distance_and_channels(self, p: vec3) -> (f32, C) {
         let (da, ca) = self.a.distance_and_channels(p)
         let (db, cb) = self.b.distance_and_channels(p)
-        (smin(da, db, self.k), ca.blend(cb, smin_weight(da, db, self.k)))
+        let (d, w) = smin_and_weight(da, db, self.k)
+        (d, ca.blend(cb, w))
     }
 }
 
@@ -2343,8 +2348,9 @@ impl<C: Blend, S: Field<C>, const N: u32> Field<C> for SmoothUnionAll<S, N> {
         var c = take c0
         for i in 1..N {
             let (di, ci) = self.parts[i].distance_and_channels(p)
-            c = c.blend(ci, smin_weight(d, di, self.k))
-            d = smin(d, di, self.k)
+            let (dn, w) = smin_and_weight(d, di, self.k)
+            c = c.blend(ci, w)
+            d = dn
         }
         (d, c)
     }

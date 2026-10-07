@@ -176,97 +176,73 @@ impl StateHash for f64 {
 
 impl StateHash for vec2 {
     fn state_hash(self, h: mut Hasher) {
-        h.write_u32(canonical_bits(self.x))
-        h.write_u32(canonical_bits(self.y))
+        StateHash::state_hash([self.x, self.y], mut h)
     }
 }
 
 impl StateHash for vec3 {
     fn state_hash(self, h: mut Hasher) {
-        h.write_u32(canonical_bits(self.x))
-        h.write_u32(canonical_bits(self.y))
-        h.write_u32(canonical_bits(self.z))
+        StateHash::state_hash([self.x, self.y, self.z], mut h)
     }
 }
 
 impl StateHash for vec4 {
     fn state_hash(self, h: mut Hasher) {
-        h.write_u32(canonical_bits(self.x))
-        h.write_u32(canonical_bits(self.y))
-        h.write_u32(canonical_bits(self.z))
-        h.write_u32(canonical_bits(self.w))
+        StateHash::state_hash([self.x, self.y, self.z, self.w], mut h)
     }
 }
 
 impl StateHash for vec2i {
     fn state_hash(self, h: mut Hasher) {
-        h.write_u32(u32(self.x))
-        h.write_u32(u32(self.y))
+        StateHash::state_hash([self.x, self.y], mut h)
     }
 }
 
 impl StateHash for vec3i {
     fn state_hash(self, h: mut Hasher) {
-        h.write_u32(u32(self.x))
-        h.write_u32(u32(self.y))
-        h.write_u32(u32(self.z))
+        StateHash::state_hash([self.x, self.y, self.z], mut h)
     }
 }
 
 impl StateHash for vec4i {
     fn state_hash(self, h: mut Hasher) {
-        h.write_u32(u32(self.x))
-        h.write_u32(u32(self.y))
-        h.write_u32(u32(self.z))
-        h.write_u32(u32(self.w))
+        StateHash::state_hash([self.x, self.y, self.z, self.w], mut h)
     }
 }
 
 impl StateHash for vec2u {
     fn state_hash(self, h: mut Hasher) {
-        h.write_u32(self.x)
-        h.write_u32(self.y)
+        StateHash::state_hash([self.x, self.y], mut h)
     }
 }
 
 impl StateHash for vec3u {
     fn state_hash(self, h: mut Hasher) {
-        h.write_u32(self.x)
-        h.write_u32(self.y)
-        h.write_u32(self.z)
+        StateHash::state_hash([self.x, self.y, self.z], mut h)
     }
 }
 
 impl StateHash for vec4u {
     fn state_hash(self, h: mut Hasher) {
-        h.write_u32(self.x)
-        h.write_u32(self.y)
-        h.write_u32(self.z)
-        h.write_u32(self.w)
+        StateHash::state_hash([self.x, self.y, self.z, self.w], mut h)
     }
 }
 
 impl StateHash for vec2d {
     fn state_hash(self, h: mut Hasher) {
-        h.write_u64(canonical_bits64(self.x))
-        h.write_u64(canonical_bits64(self.y))
+        StateHash::state_hash([self.x, self.y], mut h)
     }
 }
 
 impl StateHash for vec3d {
     fn state_hash(self, h: mut Hasher) {
-        h.write_u64(canonical_bits64(self.x))
-        h.write_u64(canonical_bits64(self.y))
-        h.write_u64(canonical_bits64(self.z))
+        StateHash::state_hash([self.x, self.y, self.z], mut h)
     }
 }
 
 impl StateHash for vec4d {
     fn state_hash(self, h: mut Hasher) {
-        h.write_u64(canonical_bits64(self.x))
-        h.write_u64(canonical_bits64(self.y))
-        h.write_u64(canonical_bits64(self.z))
-        h.write_u64(canonical_bits64(self.w))
+        StateHash::state_hash([self.x, self.y, self.z, self.w], mut h)
     }
 }
 

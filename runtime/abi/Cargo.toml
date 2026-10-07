@@ -12,8 +12,8 @@ publish.workspace = true
 doctest = false
 
 [[bin]]
-name = "gen-ts"
-path = "src/bin/gen-ts.rs"
+name = "generate"
+path = "src/bin/generate.rs"
 test = false
 
 [dependencies]

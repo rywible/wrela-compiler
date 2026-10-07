@@ -56,7 +56,8 @@ export function pathProblem(path: string): string | undefined {
 const formatOf = (f: TextureFormat) => TEXTURE_FORMATS.find((t) => t.name === f)!;
 /** Whether a texture format is a depth format. */
 export const isDepth = (f: TextureFormat) => formatOf(f).depth;
-const bytesPerTexel = (f: TextureFormat) => formatOf(f).bytes;
+/** The bytes of one texel of a texture format. */
+export const bytesPerTexel = (f: TextureFormat) => formatOf(f).bytes;
 
 interface Shape {
   name: string;

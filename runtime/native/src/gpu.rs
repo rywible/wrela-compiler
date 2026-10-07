@@ -40,10 +40,6 @@ use wrela_abi::stream::{self, Binding, Command, Compare, Opcode, Pass, TextureFo
 const SCREEN_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 /// The uniform ring's starting size.
 const RING_START: u64 = 64 * 1024;
-/// The upload ring's starting size, and the largest write it takes: a bigger one goes through
-/// the queue, between submissions.
-const UPLOAD_START: u64 = 256 * 1024;
-const UPLOAD_MAX: u64 = 16 * 1024 * 1024;
 /// Timestamp queries per submission (two per timed pass).
 const TIMESTAMP_QUERIES: u32 = 512;
 
@@ -55,10 +51,6 @@ pub struct GpuTiming {
     /// The dispatch's pipeline name, or `screen pass` or `pass`.
     pub label: String,
     pub nanos: f64,
-    /// When it began, in nanoseconds on the GPU's clock: passes overlap on a GPU that runs the
-    /// next pass's vertices while the last one's fragments finish, so a frame's GPU time is from
-    /// its first start to its last end, not their sum.
-    pub start: f64,
 }
 
 /// A texture format in wgpu's spelling.
@@ -159,22 +151,54 @@ struct Screen {
     height: u32,
 }
 
-struct UniformRing {
+/// A buffer whose bytes for this submission are staged on the CPU and written to it at the
+/// flush: the uniform ring, and the upload ring.
+///
+/// The upload ring holds this submission's buffer writes (`WriteBuffer`): a copy of each from
+/// there is recorded where the write is, so a write splits no work into submissions. (A queue
+/// write would have to come between two: the work recorded before it must see the old
+/// contents. Each submission waited for the GPU, which then started cold, and the pass after a
+/// write measured a third more, the herd's culling 15 times.)
+struct Ring {
+    label: &'static str,
     buffer: wgpu::Buffer,
-    capacity: u64,
-    /// This submission's uniform bytes, written to `buffer` at the flush.
     staging: Vec<u8>,
 }
 
-/// This submission's buffer writes (`WriteBuffer`): their bytes, written to `buffer` at the
-/// flush, and a copy of each from there recorded where the write is, so a write splits no work
-/// into submissions. (A queue write would have to come between two: the work recorded before
-/// it must see the old contents. Each submission waited for the GPU, which then started cold,
-/// and the pass after a write measured a third more, the herd's culling 15 times.)
-struct UploadRing {
-    buffer: wgpu::Buffer,
-    capacity: u64,
-    staging: Vec<u8>,
+impl Ring {
+    fn new(
+        device: &wgpu::Device,
+        label: &'static str,
+        usage: wgpu::BufferUsages,
+        size: u64,
+    ) -> Ring {
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size,
+            usage,
+            mapped_at_creation: false,
+        });
+        Ring { label, buffer, staging: Vec::new() }
+    }
+
+    fn capacity(&self) -> u64 {
+        self.buffer.size()
+    }
+
+    /// Replaces the buffer with one of `size` bytes, after a flush (nothing is staged).
+    fn grow(&mut self, device: &wgpu::Device, size: u64) {
+        debug_assert!(self.staging.is_empty());
+        let staging = std::mem::take(&mut self.staging);
+        *self = Ring { staging, ..Ring::new(device, self.label, self.buffer.usage(), size) };
+    }
+
+    /// Writes this submission's staged bytes to the buffer.
+    fn write(&mut self, queue: &wgpu::Queue) {
+        if !self.staging.is_empty() {
+            queue.write_buffer(&self.buffer, 0, &self.staging);
+            self.staging.clear();
+        }
+    }
 }
 
 struct Timer {
@@ -195,8 +219,9 @@ pub(crate) struct Gpu {
     bind_groups: Vec<HashMap<Box<[Binding]>, wgpu::BindGroup>>,
     /// For each resource, the cached bind groups it's in: destroying it drops them.
     bound_in: HashMap<u32, HashSet<BindGroupKey>>,
-    ring: UniformRing,
-    upload: UploadRing,
+    /// The uniform ring, bound with dynamic offsets, and the upload ring.
+    ring: Ring,
+    upload: Ring,
     encoder: Option<wgpu::CommandEncoder>,
     pass: Option<OpenPass>,
     screen: Option<Screen>,
@@ -289,16 +314,12 @@ impl Gpu {
                 .min_uniform_buffer_offset_alignment
                 .max(limits.min_storage_buffer_offset_alignment),
         );
-        let ring = UniformRing {
-            buffer: create_ring(&device, RING_START),
-            capacity: RING_START,
-            staging: Vec::new(),
-        };
-        let upload = UploadRing {
-            buffer: create_upload(&device, UPLOAD_START),
-            capacity: UPLOAD_START,
-            staging: Vec::new(),
-        };
+        let usage = wgpu::BufferUsages::UNIFORM
+            | wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST;
+        let ring = Ring::new(&device, "uniform ring", usage, RING_START);
+        let usage = wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST;
+        let upload = Ring::new(&device, "upload ring", usage, u64::from(stream::UPLOAD_START));
         let timer = timestamps.then(|| Timer::new(&device));
         let mut gpu = Gpu {
             device,
@@ -603,23 +624,19 @@ impl Gpu {
     /// them, since a flush submits what's recorded.
     fn reserve_uniforms(&mut self, opcode: Opcode, bytes: u64) -> Result<()> {
         let start = align_to(self.ring.staging.len() as u64, self.align);
-        if start + bytes <= self.ring.capacity {
+        if start + bytes <= self.ring.capacity() {
             return Ok(());
         }
         self.flush()?;
-        if bytes > self.ring.capacity {
-            let capacity = bytes.max(self.ring.capacity * 2).next_power_of_two();
+        if bytes > self.ring.capacity() {
+            let capacity = bytes.max(self.ring.capacity() * 2).next_power_of_two();
             if capacity > self.limits.max_buffer_size {
                 return Err(Error::command(
                     opcode,
                     format!("{bytes} uniform bytes in one submission is over the limit"),
                 ));
             }
-            self.ring = UniformRing {
-                buffer: create_ring(&self.device, capacity),
-                capacity,
-                staging: Vec::new(),
-            };
+            self.ring.grow(&self.device, capacity);
             // Cached bind groups point at the old ring.
             self.bind_groups.iter_mut().for_each(HashMap::clear);
             self.bound_in.clear();
@@ -634,7 +651,7 @@ impl Gpu {
             return None;
         }
         let offset = align_to(self.ring.staging.len() as u64, self.align);
-        debug_assert!(offset + bytes.len() as u64 <= self.ring.capacity);
+        debug_assert!(offset + bytes.len() as u64 <= self.ring.capacity());
         self.ring.staging.resize(offset as usize, 0);
         self.ring.staging.extend_from_slice(bytes);
         Some(offset as u32)
@@ -658,14 +675,8 @@ impl Gpu {
             debug_assert!(self.ring.staging.is_empty() && self.upload.staging.is_empty());
             return Ok(());
         };
-        if !self.ring.staging.is_empty() {
-            self.queue.write_buffer(&self.ring.buffer, 0, &self.ring.staging);
-            self.ring.staging.clear();
-        }
-        if !self.upload.staging.is_empty() {
-            self.queue.write_buffer(&self.upload.buffer, 0, &self.upload.staging);
-            self.upload.staging.clear();
-        }
+        self.ring.write(&self.queue);
+        self.upload.write(&self.queue);
         self.queue.submit([encoder.finish()]);
         if let Some(timer) = &mut self.timer
             && !timer.pending.is_empty()
@@ -743,28 +754,24 @@ impl Gpu {
         self.resources.insert(handle, Resource::Sampler(sampler));
     }
 
-    /// Records a copy from the upload ring (`UploadRing`): the stream's writes are whole words,
-    /// as a copy moves. A very big one goes through the queue after what's recorded is submitted.
+    /// Records a copy from the upload ring ([`Ring`]): the stream's writes are whole words, as a
+    /// copy moves. A very big one goes through the queue after what's recorded is submitted.
     fn write_buffer(&mut self, handle: u32, offset: u32, data: &[u8]) -> Result<()> {
         if data.is_empty() {
             return Ok(());
         }
         let len = data.len() as u64;
-        if len > UPLOAD_MAX {
+        if len > u64::from(stream::UPLOAD_MAX) {
             // Work recorded before this write must see the old contents.
             self.flush()?;
             self.queue.write_buffer(self.buffer(handle), u64::from(offset), data);
             return Ok(());
         }
-        if self.upload.staging.len() as u64 + len > self.upload.capacity {
+        if self.upload.staging.len() as u64 + len > self.upload.capacity() {
             self.flush()?;
-            if len > self.upload.capacity {
-                let capacity = len.max(self.upload.capacity * 2).next_power_of_two();
-                self.upload = UploadRing {
-                    buffer: create_upload(&self.device, capacity),
-                    capacity,
-                    staging: Vec::new(),
-                };
+            if len > self.upload.capacity() {
+                let capacity = len.max(self.upload.capacity() * 2).next_power_of_two();
+                self.upload.grow(&self.device, capacity);
             }
         }
         let at = self.upload.staging.len() as u64;
@@ -858,10 +865,7 @@ impl Gpu {
         match groups {
             Ok([x, y, z]) => pass.dispatch_workgroups(x, y, z),
             Err((buffer, at)) => {
-                let Resource::Buffer(args) = &self.resources[&buffer] else {
-                    unreachable!("the checker checked {buffer} is a buffer");
-                };
-                pass.dispatch_workgroups_indirect(args, u64::from(at));
+                pass.dispatch_workgroups_indirect(self.buffer(buffer), u64::from(at))
             }
         }
         drop(pass);
@@ -979,20 +983,15 @@ impl Gpu {
             match d.how {
                 DrawHow::Direct { vertices, instances } => rp.draw(0..vertices, 0..instances),
                 DrawHow::Indirect { buffer, offset } => {
-                    let Resource::Buffer(args) = &self.resources[&buffer] else {
-                        unreachable!("the checker checked {buffer} is a buffer");
-                    };
-                    rp.draw_indirect(args, u64::from(offset));
+                    rp.draw_indirect(self.buffer(buffer), u64::from(offset));
                 }
                 DrawHow::IndexedIndirect { indices, at, size, buffer, offset } => {
-                    let (Resource::Buffer(index), Resource::Buffer(args)) =
-                        (&self.resources[&indices], &self.resources[&buffer])
-                    else {
-                        unreachable!("the checker checked {indices} and {buffer} are buffers");
-                    };
                     let range = u64::from(at)..u64::from(at) + u64::from(size);
-                    rp.set_index_buffer(index.slice(range), wgpu::IndexFormat::Uint32);
-                    rp.draw_indexed_indirect(args, u64::from(offset));
+                    rp.set_index_buffer(
+                        self.buffer(indices).slice(range),
+                        wgpu::IndexFormat::Uint32,
+                    );
+                    rp.draw_indexed_indirect(self.buffer(buffer), u64::from(offset));
                 }
             }
         }
@@ -1300,26 +1299,6 @@ fn render_variant(device: &wgpu::Device, name: &str, kind: &mut Kind, targets: T
     variants.insert(targets, pipeline);
 }
 
-fn create_ring(device: &wgpu::Device, capacity: u64) -> wgpu::Buffer {
-    device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("uniform ring"),
-        size: capacity,
-        usage: wgpu::BufferUsages::UNIFORM
-            | wgpu::BufferUsages::STORAGE
-            | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    })
-}
-
-fn create_upload(device: &wgpu::Device, capacity: u64) -> wgpu::Buffer {
-    device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("upload ring"),
-        size: capacity,
-        usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    })
-}
-
 /// Maps a `MAP_READ` buffer and copies it out, waiting for the GPU.
 pub fn map_read(device: &wgpu::Device, buffer: &wgpu::Buffer) -> Result<Vec<u8>> {
     let slice = buffer.slice(..);
@@ -1357,9 +1336,9 @@ impl Timer {
     /// Reads back the timestamps of the submission just made. This waits for the GPU at every
     /// flush, so the timing mode measures GPU durations, not throughput.
     fn collect(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
-        let spans = read_timestamp_spans(device, queue, &self.queries, self.pending.len() as u32)?;
-        for ((frame, label), (start, end)) in self.pending.drain(..).zip(spans) {
-            self.results.push(GpuTiming { frame, label, nanos: (end - start).max(0.0), start });
+        let times = read_timestamps(device, queue, &self.queries, self.pending.len() as u32)?;
+        for ((frame, label), nanos) in self.pending.drain(..).zip(times) {
+            self.results.push(GpuTiming { frame, label, nanos });
         }
         Ok(())
     }
@@ -1377,17 +1356,6 @@ pub fn read_timestamps(
     queries: &wgpu::QuerySet,
     passes: u32,
 ) -> Result<Vec<f64>> {
-    let spans = read_timestamp_spans(device, queue, queries, passes)?;
-    Ok(spans.into_iter().map(|(start, end)| (end - start).max(0.0)).collect())
-}
-
-/// [`read_timestamps`]'s passes' starts and ends, in nanoseconds on the GPU's clock.
-pub fn read_timestamp_spans(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    queries: &wgpu::QuerySet,
-    passes: u32,
-) -> Result<Vec<(f64, f64)>> {
     if passes == 0 {
         return Ok(Vec::new());
     }
@@ -1415,6 +1383,6 @@ pub fn read_timestamp_spans(
     let period = f64::from(queue.get_timestamp_period());
     Ok(bytes
         .chunks_exact(16)
-        .map(|pair| (tick(&pair[..8]) as f64 * period, tick(&pair[8..]) as f64 * period))
+        .map(|pair| tick(&pair[8..]).saturating_sub(tick(&pair[..8])) as f64 * period)
         .collect())
 }

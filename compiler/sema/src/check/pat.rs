@@ -43,7 +43,16 @@ impl<'p> Checker<'p> {
         }
     }
 
-    pub(crate) fn check_let_pattern(&mut self, pat: &ast::Pat, ty: TyId, init: &Expr) -> Pat {
+    /// A pattern that must match: `let`'s, or a `for` loop's over each element. `user` names
+    /// the construct in E0309, and `help` says what to do instead.
+    pub(crate) fn check_let_pattern(
+        &mut self,
+        pat: &ast::Pat,
+        ty: TyId,
+        init: &Expr,
+        user: &str,
+        help: &str,
+    ) -> Pat {
         let from_place = init.is_place();
         let p = self.check_pat(pat, ty, from_place);
         self.bound_once(&p);
@@ -51,7 +60,7 @@ impl<'p> Checker<'p> {
             let mut d = Diagnostic::new(
                 codes::E0309,
                 pat.span,
-                "this pattern might not match, so `let` can't use it",
+                format!("this pattern might not match, so {user} can't use it"),
             );
             // `let (c, s) = ...` with the unit `s` in scope: a constant, not a new name.
             let mut consts = Vec::new();
@@ -65,7 +74,7 @@ impl<'p> Checker<'p> {
                         ))
                         .with_help(format!("give the binding another name than `{name}`"));
                 }
-                None => d = d.with_help("use `match` to handle the other cases"),
+                None => d = d.with_help(help),
             }
             self.err(d);
         }
@@ -107,7 +116,7 @@ impl<'p> Checker<'p> {
         }
     }
 
-    pub(crate) fn irrefutable(&self, p: &Pat) -> bool {
+    fn irrefutable(&self, p: &Pat) -> bool {
         match &p.kind {
             PatKind::Wild | PatKind::Bind(_) => true,
             PatKind::Lit(_) | PatKind::Text(_) => false,

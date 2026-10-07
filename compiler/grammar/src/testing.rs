@@ -18,39 +18,59 @@ pub fn sized<T>(small: T, full_size: T) -> T {
     if full() { full_size } else { small }
 }
 
-/// The stack of each thread [`par_each`] and [`with_big_stack`] start: the oracle's derivation
-/// counting recurses once per nested rule and repetition, which can be deep for whole files.
+/// The stack of each thread [`par_map_with`] and [`with_big_stack`] start: the oracle's
+/// derivation counting recurses once per nested rule and repetition, which can be deep for whole
+/// files.
 pub const BIG_STACK: usize = 256 << 20;
 
-/// Calls `f` on each item, spread over the machine's threads, each with a [`BIG_STACK`] and its
-/// own state from `init`. A panic in `f` panics here, with the same payload.
-pub fn par_each<T: Sync, S>(
+/// `f` of each item, in the items' order, spread over the machine's threads (each item once),
+/// each with a [`BIG_STACK`] and its own state from `init`. A panic in `f` panics here, with the
+/// same payload.
+pub fn par_map_with<T: Sync, S, R: Send>(
     items: &[T],
     init: impl Fn() -> S + Sync,
-    f: impl Fn(&mut S, &T) + Sync,
-) {
+    f: impl Fn(&mut S, &T) -> R + Sync,
+) -> Vec<R> {
     let next = std::sync::atomic::AtomicUsize::new(0);
     let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(items.len());
-    std::thread::scope(|s| {
+    let mut done: Vec<(usize, R)> = std::thread::scope(|s| {
         let workers: Vec<_> = (0..threads)
             .map(|_| {
                 std::thread::Builder::new()
                     .stack_size(BIG_STACK)
                     .spawn_scoped(s, || {
-                        let mut state = init();
+                        let (mut state, mut mine) = (init(), Vec::new());
                         loop {
                             let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             let Some(item) = items.get(i) else { break };
-                            f(&mut state, item);
+                            mine.push((i, f(&mut state, item)));
                         }
+                        mine
                     })
                     .expect("spawning a test thread")
             })
             .collect();
-        for w in workers {
-            w.join().unwrap_or_else(|p| std::panic::resume_unwind(p));
-        }
+        workers
+            .into_iter()
+            .flat_map(|w| w.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
+            .collect()
     });
+    done.sort_by_key(|(i, _)| *i);
+    done.into_iter().map(|(_, r)| r).collect()
+}
+
+/// [`par_map_with`], with no state: for a test that checks many independent cases.
+pub fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    par_map_with(items, || (), |_, item| f(item))
+}
+
+/// Calls `f` on each item, as [`par_map_with`] does.
+pub fn par_each<T: Sync, S>(
+    items: &[T],
+    init: impl Fn() -> S + Sync,
+    f: impl Fn(&mut S, &T) + Sync,
+) {
+    par_map_with(items, init, f);
 }
 
 /// Runs `f` on a thread with a [`BIG_STACK`].

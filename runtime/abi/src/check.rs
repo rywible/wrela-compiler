@@ -227,7 +227,7 @@ impl Checker {
             Command::DispatchIndirect { pipeline, arguments, offset, bindings, uniforms } => {
                 self.scope.clear();
                 self.bindings(op, *pipeline, bindings, uniforms.len())?;
-                self.arguments(op, *arguments, *offset, 12)?;
+                self.read_range(op, *arguments, *offset, 12, "reading arguments:")?;
             }
             Command::BeginScreenPass { clear } => {
                 self.clear_colour(op, clear)?;
@@ -272,7 +272,7 @@ impl Checker {
             }
             Command::DrawIndirect { pipeline, arguments, offset, bindings, uniforms } => {
                 self.bindings(op, *pipeline, bindings, uniforms.len())?;
-                self.arguments(op, *arguments, *offset, 16)?;
+                self.read_range(op, *arguments, *offset, 16, "reading arguments:")?;
             }
             Command::DrawIndexedIndirect {
                 pipeline,
@@ -288,9 +288,8 @@ impl Checker {
                 if *index_size == 0 {
                     return err(format!("the index range of buffer {indices} is empty"));
                 }
-                self.range(op, *indices, *index_offset, *index_size, "reading indices:")?;
-                Self::used(&mut self.scope, op, "buffer", *indices, false)?;
-                self.arguments(op, *arguments, *offset, 20)?;
+                self.read_range(op, *indices, *index_offset, *index_size, "reading indices:")?;
+                self.read_range(op, *arguments, *offset, 20, "reading arguments:")?;
             }
             Command::Present | Command::EndPass => self.attachments.clear(),
             Command::StorageRead { path, .. } | Command::StorageWrite { path, .. } => {
@@ -369,9 +368,17 @@ impl Checker {
         Ok(())
     }
 
-    /// An indirect command's arguments: `size` bytes at `offset` in buffer `handle`, read.
-    fn arguments(&mut self, op: Opcode, handle: u32, offset: u32, size: u32) -> Result<()> {
-        self.range(op, handle, offset, size, "reading arguments:")?;
+    /// `size` bytes at `offset` in buffer `handle`, which the command reads (`doing` says what):
+    /// an indirect command's arguments, or its indices.
+    fn read_range(
+        &mut self,
+        op: Opcode,
+        handle: u32,
+        offset: u32,
+        size: u32,
+        doing: &str,
+    ) -> Result<()> {
+        self.range(op, handle, offset, size, doing)?;
         Self::used(&mut self.scope, op, "buffer", handle, false)
     }
 

@@ -4,18 +4,14 @@
 // move, so a test can tell when a key press reached the screen. compiler/tests/tests/suite/
 // keys.rs records a run in Chrome as a tick log and replays it on the native host.
 
-use engine::present::{Snapshots, lerp_angle}
-use engine::rng::{Rng, seed}
-use engine::run::{Asks, Stamped, TickInput, run}
-use engine::sim::{CreatureKey, GaitState, Mode, Sim, SimState, SimTier, Tick, Transform}
-use grazer::sketch::GrazerSim
-use simulation::sketch::{PlayerSim, Terrain, TerrainField, World, tick}
-use std::arena::Arena
+use engine::present::Snapshots
+use engine::run::{Asks, TickInput, run}
+use engine::sim::{Sim, Tick}
+use simulation::sketch::{World, tick}
+use simulation::start::world
 use std::gpu::{ClipPosition, VertexIndex, begin_screen_pass, draw, present}
-use std::hash::StateHash
 use std::input::{Event, Key}
 use std::io::print
-use std::serialize::Serialize
 
 /// The sketch's world, and the arrow keys held: bit 0 up, 1 down, 2 left, 3 right.
 pub struct Keyed: Sim {
@@ -39,52 +35,14 @@ impl Asks for Keyed {
     }
 }
 
-/// What the frames see: where the player is (x and z), how many digs, and the ticks run.
+/// What the frames see: where the player is (x and z), and how many digs.
 pub struct Snap: Copy + Plain {
     pub player: vec2,
     pub digs: u32,
 }
 
-const HERD: u32 = 40
-
 /// How fast the player walks, in metres a second.
 const WALK: f32 = 3.0
-
-/// The world at tick 0, as sketch 03's program has it: grazers in a ring of 20 m, the player in
-/// its middle.
-fn world() -> World {
-    var grazers: Arena<GrazerSim> = Arena::new()
-    let rng = Rng::new(seed(3))
-    for i in 0..HERD {
-        let a = 6.2831853 * f32(i) / f32(HERD)
-        let gait = GaitState { phase: f32(i % 7) / 7.0, speed: 0.5, turn: 0.0, mode: Mode::Walk }
-        let _ = grazers.insert(
-            GrazerSim {
-                kind: CreatureKey { kind: 1, seed: seed(i + 1) },
-                tier: if i % 4 == 0 { SimTier::Full } else { SimTier::Ambient },
-                rng: rng.split(i),
-                root: Transform {
-                    pos: vec3(20.0 * cos(a), 0.0, 20.0 * sin(a)),
-                    heading: a + 1.5707964,
-                },
-                gait,
-                pose: gait.pose(),
-            },
-        )
-    }
-    var players: Arena<PlayerSim> = Arena::new()
-    let _ = players.insert(PlayerSim { root: Transform { pos: vec3(0.0, 0.0, 0.0), heading: 0.0 } })
-    World {
-        tick: 0,
-        seed: seed(3),
-        terrain: Terrain {
-            base: TerrainField { height: 0.0, roll: 0.5, wavelength: 8.0 },
-            edits: Vec::new(),
-        },
-        grazers,
-        players,
-    }
-}
 
 /// An arrow key's bit in `Keyed::held`.
 fn arrow(key: Key) -> u32 {

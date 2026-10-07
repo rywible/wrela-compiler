@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 use wrela_host::{CpuHost, Value};
-use wrela_tests::{Bind, RawGpu, bytes_of, f32s, one_f32, repo_root};
+use wrela_tests::{Bind, RawGpu, bytes_of, f32s, one_f32, one_vec3, repo_root};
 
 /// The largest difference allowed between a port and its original, in metres.
 const LIMIT: f64 = 0.0005;
@@ -19,21 +19,13 @@ fn built(name: &str) -> PathBuf {
     super::built(&format!("../../examples/{name}"))
 }
 
-fn vec3_of(v: &[Value]) -> [f32; 3] {
-    match v {
-        [Value::F32(x), Value::F32(y), Value::F32(z)] => [*x, *y, *z],
-        other => panic!("expected a vec3, got {other:?}"),
-    }
-}
-
 /// The first `n` of the subject's samples (`sample(seed, i)` in its box) within `NEAR` of its
 /// surface, and the port's distance at each.
 fn near_points(host: &mut CpuHost, n: usize) -> (Vec<[f32; 3]>, Vec<f32>) {
     let (mut points, mut ours) = (Vec::new(), Vec::new());
     let mut i = 0;
     while points.len() < n {
-        let p =
-            vec3_of(&host.call_export("sample", &[Value::I32(1), Value::I32(i)]).expect("sample"));
+        let p = one_vec3(host, "sample", &[Value::I32(1), Value::I32(i)]);
         let d = one_f32(host, "distance", &[Value::F32(p[0]), Value::F32(p[1]), Value::F32(p[2])]);
         if d.abs() < NEAR {
             points.push(p);
@@ -64,9 +56,13 @@ pub(crate) fn originals(name: &str, points: &[[f32; 3]]) -> Vec<f32> {
     let flat: Vec<f32> = points.iter().flat_map(|p| [p[0], p[1], p[2], 0.0]).collect();
     let gpu = RawGpu::new().expect("a GPU");
     let n = points.len() as u64;
-    let (_, out) = gpu
-        .run(&wgsl, "main", &[Bind::Read(&bytes_of(&flat)), Bind::Write(n * 4)], (n / 64) as u32, 1)
-        .expect("run round 1's field");
+    let (_, out) = gpu.run(
+        &wgsl,
+        "main",
+        &[Bind::Read(&bytes_of(&flat)), Bind::Write(n * 4)],
+        (n / 64) as u32,
+        1,
+    );
     f32s(&out[0])
 }
 
@@ -128,12 +124,8 @@ fn mesh(host: &mut wrela_host::Host) -> (Vec<[f32; 3]>, Vec<[u32; 6]>) {
     // A `SkinVertex` is 48 bytes: its rest position first. A quad is six indices.
     assert!(nv * 48 <= vbytes.len(), "{nv} vertices overflow the buffer");
     assert!(nq * 6 <= qwords.len(), "{nq} quads overflow the buffer");
-    let v = (0..nv).map(|i| {
-        let f = f32s(&vbytes[i * 48..i * 48 + 12]);
-        [f[0], f[1], f[2]]
-    });
     let q = (0..nq).map(|i| std::array::from_fn(|k| qwords[6 * i + k]));
-    (v.collect(), q.collect())
+    (wrela_tests::positions(&vbytes, nv), q.collect())
 }
 
 /// The pieces a mesh is in: its vertices joined by its quads (union-find).

@@ -790,12 +790,11 @@ impl Module {
     /// apply to `t`, or its type was never interned.
     pub fn proj_ty(&self, t: TypeId, proj: &Proj) -> Option<TypeId> {
         match (self.types.get(t), proj) {
-            (TypeDef::Struct { .. } | TypeDef::Enum { .. }, Proj::Field(i)) => {
-                self.types.field(t, *i)
+            (TypeDef::Struct { .. } | TypeDef::Enum { .. }, Proj::Field(k)) => {
+                self.types.part(t, *k)
             }
-            (TypeDef::Vector(s, _), Proj::Comp(_) | Proj::Index(_)) => {
-                self.types.lookup(&TypeDef::Scalar(*s))
-            }
+            (TypeDef::Vector(..), Proj::Comp(c)) => self.types.part(t, u32::from(*c)),
+            (TypeDef::Vector(s, _), Proj::Index(_)) => self.types.lookup(&TypeDef::Scalar(*s)),
             (TypeDef::Matrix(n), Proj::Index(_)) => {
                 self.types.lookup(&TypeDef::Vector(Scalar::F32, *n))
             }

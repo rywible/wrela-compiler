@@ -251,6 +251,13 @@ impl<'a> Build<'a> for Fl<'_, 'a> {
     }
 
     fn components(&mut self, p: ir::ValueId, out: &mut Vec<ir::ValueId>) {
+        self.push_components(p, out)
+    }
+}
+
+impl<'c, 'a> Fl<'c, 'a> {
+    /// Pushes a vector's components to `out`, each its own value, or another value as it is.
+    pub(crate) fn push_components(&mut self, p: ir::ValueId, out: &mut Vec<ir::ValueId>) {
         match *self.mb.m.types.get(self.f.value_ty(p)) {
             ir::TypeDef::Vector(s, k) => {
                 let ct = self.mb.m.types.scalar(s);
@@ -261,9 +268,7 @@ impl<'a> Build<'a> for Fl<'_, 'a> {
             _ => out.push(p),
         }
     }
-}
 
-impl<'c, 'a> Fl<'c, 'a> {
     /// A lifted build's constant `c` of a lifted package, built here from its literals, each
     /// read from the table (§22); `None` for any other constant, which is data.
     pub(crate) fn lifted_const(&mut self, c: ConstId) -> Option<ir::ValueId> {

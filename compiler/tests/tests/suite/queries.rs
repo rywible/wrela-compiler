@@ -20,7 +20,7 @@ fn count(v: &[Value]) -> u32 {
 /// skewed by the load (1.2x was seen once, against 1.00x alone). A regression shows in every
 /// one, so the best of the three is what's gated.
 #[test]
-#[ignore = "long: a timing run"]
+#[ignore = "long: alone: a timing run"]
 fn a_closure_query_costs_what_the_hand_written_loop_does_on_the_cpu() {
     let mut host = CpuBuild::load(built("queries")).expect("load").start_with(1).expect("start");
     let mut time = |name: &str| {

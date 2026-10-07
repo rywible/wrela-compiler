@@ -88,22 +88,17 @@ pub(crate) fn signature(cx: &mut Cx, mb: &mut ModuleBuilder, key: &InstanceKey) 
     let span = callable_span(cx, of);
     let mut params = cx.callable_params(mb, of);
     let x = cx.lower_ty(mb, *input, span);
-    let f32 = mb.m.types.f32();
     match kind {
         DeriveKind::ValueAndGradient => {
-            let with = output.map(|t| cx.lower_ty(mb, t, span));
-            if let (Some(x), Some(with)) = (x, with.unwrap_or(Some(f32))) {
+            // `T`'s type, with `value_gradient_with`: one with no value (`()`) leaves the
+            // function no result.
+            let with = match output {
+                Some(t) => cx.lower_ty(mb, *t, span).map(Some),
+                None => Some(None),
+            };
+            if let (Some(x), Some(with)) = (x, with) {
                 params.push(ir::Param { name: "x".into(), ty: x, by_ref: false, mutable: false });
-                let mut fields = vec![("_0".into(), f32), ("_1".into(), x)];
-                if output.is_some() {
-                    fields.push(("_2".into(), with));
-                }
-                let names: Vec<String> =
-                    fields.iter().map(|(_, t)| mb.m.types.display(*t).to_string()).collect();
-                let tuple = mb.m.types.intern(ir::TypeDef::Struct {
-                    name: format!("({})", names.join(", ")),
-                    fields,
-                });
+                let tuple = ir::derive::value_gradient_ty(&mut mb.m.types, x, with);
                 return ir::Function::new("value_and_gradient", params, Some(tuple));
             }
             ir::Function::new("value_and_gradient", params, None)
@@ -318,7 +313,7 @@ fn build(
     id: ir::FuncId,
     inner: ir::FuncId,
 ) {
-    let InstanceKey::Derived { kind, .. } = key else { return };
+    let InstanceKey::Derived { kind, output, .. } = key else { return };
     let target = mb.target();
     let result = match kind {
         DeriveKind::Reads => return build_reads(mb, id, inner),
@@ -340,7 +335,6 @@ fn build(
         // The captures are every parameter but the last, the input.
         DeriveKind::ValueAndGradient => {
             let ncap = mb.m.functions[id.index()].params.len() as u32 - 1;
-            let InstanceKey::Derived { output, .. } = key else { unreachable!() };
             ir::derive::value_and_gradient(
                 &mut mb.m,
                 &mut mb.derived,

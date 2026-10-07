@@ -23,7 +23,7 @@ export interface Func {
 export interface ModuleSpec {
   imports?: Import[];
   funcs?: Func[];
-    /** Pages of memory, imported shared as `wrela.memory` (or, with `ownMemory`, defined
+  /** Pages of memory, imported shared as `wrela.memory` (or, with `ownMemory`, defined
    * unshared), and exported as `memory` unless `exportMemory` is false. */
   memory?: number;
   ownMemory?: boolean;
@@ -80,7 +80,7 @@ export function buildModule(spec: ModuleSpec): Uint8Array<ArrayBuffer> {
     if (!types.includes(key)) types.push(key);
     return types.indexOf(key);
   };
-    const importEntries = imports.map((i) =>
+  const importEntries = imports.map((i) =>
     i.kind === "func"
       ? [...name(i.module), ...name(i.name), 0x00, ...uleb(typeIndex(i.type))]
       : [...name(i.module), ...name(i.name), 0x02, 0x00, 0x01],
@@ -109,7 +109,7 @@ export function buildModule(spec: ModuleSpec): Uint8Array<ArrayBuffer> {
     ...section(1, typeEntries.length ? vec(typeEntries) : []),
     ...section(2, importEntries.length ? vec(importEntries) : []),
     ...section(3, funcEntries.length ? vec(funcEntries) : []),
-        ...section(5, spec.memory !== undefined && spec.ownMemory ? vec([[0x00, ...uleb(spec.memory)]]) : []),
+    ...section(5, spec.memory !== undefined && spec.ownMemory ? vec([[0x00, ...uleb(spec.memory)]]) : []),
     ...section(7, exports.length ? vec(exports) : []),
     ...section(8, spec.start !== undefined ? uleb(spec.start) : []),
     ...section(10, code.length ? vec(code) : []),

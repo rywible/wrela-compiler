@@ -14,10 +14,7 @@ fn script() -> Vec<wrela_host::Scripted> {
 /// The package's frame test plays the script and finds each event in its frame.
 #[test]
 fn a_frame_test_plays_a_script() {
-    let out = wrela_driver::test(&wrela_tests::repo_root().join("compiler/tests/input"), None);
-    let failures: Vec<_> = out.results.iter().filter_map(|r| r.failure.as_ref()).collect();
-    assert!(out.passed(), "{:?} {failures:?}", out.diagnostics);
-    assert_eq!(out.results.len(), 1);
+    assert_eq!(crate::tests_pass(&wrela_tests::repo_root().join("compiler/tests/input")), 1);
 }
 
 /// On the native host's CPU, the script's events reach the program: all 23, and the same
@@ -48,9 +45,9 @@ fn the_native_host_plays_a_script() {
 #[ignore = "long: needs Chrome, python3 and a GPU"]
 fn both_hosts_read_the_same_events() {
     let (dir, rel) = wrela_tests::page("compiler/tests/input", "input-hosts");
-    std::fs::copy(wrela_tests::repo_root().join(SCRIPT), dir.join("script.json")).expect("copy");
+    let text = std::fs::read_to_string(wrela_tests::repo_root().join(SCRIPT)).expect("the script");
     let run = wrela_tests::ChromeRun {
-        input: "script.json".into(),
+        script: Some(text),
         ..wrela_tests::ChromeRun::new(12, 64, 64, 60.0)
     };
     let chrome = wrela_tests::run_in_chrome_with(&rel, run);
@@ -67,7 +64,7 @@ fn both_hosts_read_the_same_events() {
 /// through the DOM at random times, while frames run at 60 a second, each arrive in the first
 /// frame that starts after them.
 #[test]
-#[ignore = "long: needs Chrome, python3 and a GPU"]
+#[ignore = "long: alone: needs Chrome, python3 and a GPU"]
 fn events_reach_the_program_by_the_next_frame() {
     let (dir, rel) = wrela_tests::page("compiler/tests/input", "input-latency");
     let run =

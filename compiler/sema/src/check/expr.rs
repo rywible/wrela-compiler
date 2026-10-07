@@ -1121,8 +1121,7 @@ impl<'p> Checker<'p> {
                 let u = self.p.types.u32;
                 // An integer vector shifts each component, by one amount or by a `u32` each.
                 if let &TyKind::Vec(e, n) = self.kind(a)
-                    && e != VecElem::F32
-                    && e != VecElem::F64
+                    && !e.is_float()
                 {
                     let each = self.p.types.vec_of(VecElem::U32, n);
                     if !self.try_unify(b, u) && !self.try_unify(b, each) {
@@ -1173,16 +1172,12 @@ impl<'p> Checker<'p> {
                 // Vector and scalar (its component's type), matrix and vector.
                 let scalar =
                     |k: &TyKind| matches!(k, TyKind::Float(_) | TyKind::Int(_) | TyKind::Var(_));
-                let comp_of = |this: &Self, k: &TyKind| match k {
-                    &TyKind::Vec(e, _) => this.p.types.elem(e),
-                    _ => f32,
-                };
                 match (&ka, &kb) {
                     (TyKind::Vec(..) | TyKind::Mat(_), _)
                         if scalar(kb)
                             && (!matches!(kb, TyKind::Var(_)) || self.is_number_var(b)) =>
                     {
-                        let c = comp_of(self, ka);
+                        let c = crate::builtins::scalar_of(&self.p.types, self.shallow(a));
                         if matches!(kb, TyKind::Var(_)) {
                             let _ = self.infer.unify(&self.p.types, b, c);
                         }
@@ -1198,7 +1193,7 @@ impl<'p> Checker<'p> {
                         if scalar(ka)
                             && (!matches!(ka, TyKind::Var(_)) || self.is_number_var(a)) =>
                     {
-                        let c = comp_of(self, kb);
+                        let c = crate::builtins::scalar_of(&self.p.types, self.shallow(b));
                         if matches!(ka, TyKind::Var(_)) {
                             let _ = self.infer.unify(&self.p.types, a, c);
                         }

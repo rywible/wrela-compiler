@@ -134,7 +134,7 @@ export function functionTypes(bytes: Uint8Array): FunctionTypes {
           out.imports.push(ty);
           continue;
         }
-                out.imports.push(null);
+        out.imports.push(null);
         if (kind === 1) {
           r.valtype();
           r.limits();

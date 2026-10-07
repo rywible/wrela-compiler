@@ -88,7 +88,8 @@ impl From<ManifestError> for Error {
 }
 
 impl Error {
-    pub(crate) fn io(path: impl Into<PathBuf>, source: std::io::Error) -> Error {
+    /// A file that couldn't be read or written: [`Error::Io`].
+    pub fn io(path: impl Into<PathBuf>, source: std::io::Error) -> Error {
         Error::Io { path: path.into(), source }
     }
 

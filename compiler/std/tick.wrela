@@ -1,4 +1,4 @@
-// The ticker (language.md §16): a fixed-rate step on a thread of its own. `start` moves a state,
+// The ticker (language.md §6.17): a fixed-rate step on a thread of its own. `start` moves a state,
 // a step and a hash to the ticker's thread (wrela_abi::memory's threads), where the host steps
 // the state `hz` times a second. Each tick gets its number, its length and the input events
 // the host stamped at its start (its records), and nothing else: no clock, and nothing that
@@ -7,19 +7,12 @@
 // a tick log, or to check one.
 //
 // The host runs each tick through the thread entry `tick` (wrela_abi's `__tick`), with the
-// tick's records at `RECORDS`.
+// tick's records at `TICK_RECORDS`.
 
-use std::alloc::alloc
+use std::abi::{EVENT_SIZE, MAX_TICK_RECORDS, TICK_HASH, TICK_ORIGIN, TICK_RECORDS, TICK_WANT_HASH}
+use std::alloc::place
 use std::input::{Event, RawEvent, event_of}
-use std::mem::{align_of, load_u32, read, run_task, size_of, store_u32, task, write}
-
-// The ticker's words, and its records' region: copies of wrela_abi::memory's, which a test
-// there checks.
-const WANT_HASH: u32 = 512
-const HASH: u32 = 520
-const ORIGIN: u32 = 528
-const RECORDS: u32 = 1228800
-const MAX_RECORDS: u32 = 256
+use std::mem::{load_u32, read, run_task, store_u32, task}
 
 /// One tick, as the step gets it.
 pub struct Ticked: Clone {
@@ -85,11 +78,10 @@ pub fn start<S, F: @deterministic fn(mut S, Ticked), H: @deterministic fn(S) -> 
     assert(hz > 0, "a ticker ticks at least once a second")
     unsafe {
         // The first state's hash, for a tick log's header: before the state moves.
-        if load_u32(WANT_HASH) != 0 {
+        if load_u32(TICK_WANT_HASH) != 0 {
             report(hash(state))
         }
-        let at = alloc(size_of::<Ticker<S, F, H>>(), align_of::<Ticker<S, F, H>>())
-        write(at, Ticker { state: take state, step, hash, hz })
+        let at = place(Ticker { state: take state, step, hash, hz })
         start_ticker(task(run_tick::<S, F, H>), at, hz)
     }
 }
@@ -103,8 +95,8 @@ pub(package) fn start_ticker(task: u32, ticker: u32, hz: u32) {}
 /// Leaves a state's hash where the host reads it.
 fn report(h: u64) {
     unsafe {
-        store_u32(HASH, u32(h))
-        store_u32(HASH + 4, u32(h >> 32))
+        store_u32(TICK_HASH, u32(h))
+        store_u32(TICK_HASH + 4, u32(h >> 32))
     }
 }
 
@@ -117,7 +109,7 @@ fn run_tick<S, F: @deterministic fn(mut S, Ticked), H: @deterministic fn(S) -> u
     borrow step = t.step
     step(mut t.state, ticked)
     unsafe {
-        if load_u32(WANT_HASH) != 0 {
+        if load_u32(TICK_WANT_HASH) != 0 {
             borrow hash = t.hash
             report(hash(t.state))
         }
@@ -127,10 +119,10 @@ fn run_tick<S, F: @deterministic fn(mut S, Ticked), H: @deterministic fn(S) -> u
 /// The records of the tick about to run: the host wrote them.
 fn records() -> Vec<Event> {
     unsafe {
-        let n = min(load_u32(RECORDS), MAX_RECORDS)
+        let n = min(load_u32(TICK_RECORDS), MAX_TICK_RECORDS)
         var out: Vec<Event> = Vec::with_capacity(n)
         for i in 0..n {
-            if let Some(e) = event_of(read::<RawEvent>(RECORDS + 4 + 24 * i)) {
+            if let Some(e) = event_of(read::<RawEvent>(TICK_RECORDS + 4 + EVENT_SIZE * i)) {
                 out.push(e)
             }
         }
@@ -154,7 +146,7 @@ pub(package) fn tick(thread: u32, task: u32, ticker: u32, k: u32) {
 @effects(nondet)
 pub fn origin() -> f64 {
     unsafe {
-        let bits = u64(load_u32(ORIGIN)) | (u64(load_u32(ORIGIN + 4)) << 32)
+        let bits = u64(load_u32(TICK_ORIGIN)) | (u64(load_u32(TICK_ORIGIN + 4)) << 32)
         bitcast_f64(bits)
     }
 }

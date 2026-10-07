@@ -31,21 +31,24 @@ done
 step() { printf '\n== %s\n' "$*"; }
 
 # The long tests, by name (`module::test`, or `test` in a test program of one file): each test
-# whose `#[ignore]` reason starts `long:`.
-long_tests() {
-  python3 - <<'PY'
+# whose `#[ignore]` reason starts `long:`. Those whose reason goes on `alone:` (the time budgets)
+# run one at a time, in `alone`; the rest are in `long_tests`.
+long_tests=() alone=()
+while read -r kind name; do
+  if [ "$kind" = alone ]; then alone+=("$name"); else long_tests+=("$name"); fi
+done < <(python3 - <<'PY'
 import pathlib, re
 for f in sorted([*pathlib.Path("compiler").rglob("*.rs"), *pathlib.Path("runtime").rglob("*.rs")]):
     if "target" in f.parts:
         continue
     lines = f.read_text().splitlines()
     for i, line in enumerate(lines):
-        if re.search(r'#\[ignore = "long:', line):
+        if m := re.search(r'#\[ignore = "long: (alone:)?', line):
             name = next(re.search(r"fn (\w+)\(", l).group(1) for l in lines[i + 1:] if re.search(r"fn (\w+)\(", l))
             # A test file at the top of `tests/` is a test program of its own (no module).
-            print(name if f.parent.name == "tests" else f"{f.stem}::{name}")
+            print("alone" if m[1] else "long", name if f.parent.name == "tests" else f"{f.stem}::{name}")
 PY
-}
+)
 
 # wrela sources the formatter owns. The conformance and diagnostics cases aren't here: some
 # are malformed on purpose, and their annotations are part of their layout.
@@ -78,11 +81,11 @@ side doc cargo test -q --release --workspace --doc
 side tools python3 -m unittest discover -q -s tools/tests
 side bun sh -c 'cd runtime/browser && bun run checks'
 side wgsl python3 tools/wgsl_budgets.py "$wrela"
-long_tests > "$logs/long"
-python3 - "$logs" "${CARGO_TARGET_DIR:-target}/native-cache" <<'PY'
+python3 - "$logs" "${CARGO_TARGET_DIR:-target}/native-cache" "${long_tests[@]}" "${alone[@]}" <<'PY'
 import json, os, subprocess, sys, time
 logs, native_cache = sys.argv[1], os.path.abspath(sys.argv[2])
-skips = [a for t in open(f"{logs}/long").read().split() for a in ("--skip", t)]
+# The long tests, which the gate leaves out.
+skips = [a for t in sys.argv[3:] for a in ("--skip", t)]
 runs = []
 for line in open(f"{logs}/tests.json"):
     m = json.loads(line)
@@ -133,7 +136,7 @@ if [ "$long" = 1 ]; then
 
   step "long: the CLI's speed, cold processes: hello field's check < 200 ms and build < 2 s, sketch 03's, the herd's and the lens's (on each subject) < 500 ms and < 5 s"
   python3 - "$wrela" <<'PY'
-import gzip, pathlib, shutil, subprocess, sys, tempfile, time
+import shutil, subprocess, sys, tempfile, time
 wrela = sys.argv[1]
 def best(args, n=5, cold=None):
     times = []
@@ -178,31 +181,19 @@ finally:
     shutil.rmtree(out, ignore_errors=True)
 PY
 
-  # The time budgets run alone: the load-time ones measure shader compilation on the CPU (with
-  # the other tests compiling beside them, spike 13's cold load took 2.6 s instead of 0.8 s),
-  # and Chrome's input latency and text budgets measure real time (under the other tests'
-  # load, an event missed its next frame, and 10,000 glyphs took 0.52 ms instead of 0.23).
-  # So do the lens's: its frames' and clicks' times in Chrome, its drags in a session, its
+  # The time budgets (`long: alone:`) run alone: the load-time ones measure shader compilation
+  # on the CPU (with the other tests compiling beside them, spike 13's cold load took 2.6 s
+  # instead of 0.8 s), and Chrome's input latency and text budgets measure real time (under the
+  # other tests' load, an event missed its next frame, and 10,000 glyphs took 0.52 ms instead of
+  # 0.23). So do the lens's: its frames' and clicks' times in Chrome, its drags in a session, its
   # fits' 10 s, and an edit's 2 s to show. So do the herd's ratios to spike 01 (#42): each
   # compares two timings taken side by side, and another test's load skews one of them.
-  budgets=(loading_creates_the_pipelines_within_budget the_gpu_certificate_is_small_quick_and_right
-    events_reach_the_program_by_the_next_frame a_screen_of_code_draws_within_half_a_millisecond
-    the_lens_is_fast_enough_and_the_same_in_both_hosts a_session_gives_the_same_results_headless_and_in_chrome
-    fits_recover_the_wolfs_longer_neck_and_bigger_ears an_edit_by_another_tool_shows_in_the_open_lens_within_2_s
-    the_cpu_side_costs_what_the_spikes_did realization_matches_the_spikes
-    the_herds_grazer_field_costs_what_field_wgsl_does drawing_the_herd_costs_what_the_spikes_did
-    the_herd_keeps_its_frames_in_chrome moving_to_the_herd_keeps_the_frames_in_chrome
-    lod_looks_like_the_finest_and_costs_like_the_coarsest the_herds_pipelines_load_cold_as_fast
-    frames_dont_wait_for_slow_ticks a_closure_query_costs_what_the_hand_written_loop_does_on_the_cpu
-    every_page_takes_under_a_tenth_of_a_second)
-  long_names=()
-  while read -r t; do long_names+=("$t"); done < <(long_tests)
   skips=()
-  for b in "${budgets[@]}"; do skips+=(--skip "$b"); done
+  for t in "${alone[@]}"; do skips+=(--skip "$t"); done
   step "long: headless Chrome, soak runs and comparisons with spike 01"
-  cargo test -q --release --workspace -- --ignored "${long_names[@]}" "${skips[@]}"
+  cargo test -q --release --workspace -- --ignored "${long_tests[@]}" "${skips[@]}"
   step "long: time budgets, one test at a time"
-  cargo test -q --release --workspace -- --ignored --test-threads=1 "${budgets[@]}"
+  cargo test -q --release --workspace -- --ignored --test-threads=1 "${alone[@]}"
 
   step "long: grammar: 10^6 generated programs against the oracle and the formatter"
   cargo run -q --release -p wrela-grammar --bin differential -- 1000000

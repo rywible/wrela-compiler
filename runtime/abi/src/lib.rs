@@ -4,7 +4,7 @@
 //! runtime in `runtime/browser`, or the native host in `runtime/native`). It's an executable
 //! spec: the format's version, opcodes and layouts are defined here, documented here, and
 //! pinned by golden byte tests. The browser runtime's constants are generated from it
-//! ([`typescript`]), and a test fails if the checked-in copy drifts.
+//! ([`typescript`]), and so are std's ([`wrela`]); a test fails if a checked-in copy drifts.
 //!
 //! ## What a build ships (D-099)
 //!
@@ -55,6 +55,7 @@ pub mod stream;
 pub mod ticks;
 pub mod typescript;
 pub mod vectors;
+pub mod wrela;
 
 pub use input::IMPORT_INPUT;
 pub use manifest::Manifest;
@@ -191,83 +192,30 @@ impl Limits {
 }
 
 /// The checked-in files generated from this crate, each as (path, contents): the browser
-/// runtime's constants ([`typescript`]) and the test vectors ([`vectors`]).
-/// `cargo run -p wrela-abi --bin gen-ts` writes them.
-pub fn generated_files() -> [(PathBuf, String); 2] {
+/// runtime's constants ([`typescript`]), std's ([`wrela`]) and the test vectors ([`vectors`]).
+/// `cargo run -p wrela-abi --bin generate` writes them.
+pub fn generated_files() -> [(PathBuf, String); 3] {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     [
         (root.join(typescript::TS_PATH), typescript()),
+        (root.join(wrela::WRELA_PATH), wrela::wrela()),
         (root.join(vectors::VECTORS_PATH), vectors::vectors()),
     ]
 }
 
 #[cfg(test)]
 mod tests {
-    /// The checked-in generated files are this crate's output (the browser runtime reads them).
+    /// The checked-in generated files are this crate's output (the browser runtime and std
+    /// read them).
     #[test]
     fn checked_in_copies_are_current() {
         for (path, text) in super::generated_files() {
             let actual = std::fs::read_to_string(&path).unwrap_or_default();
             assert!(
                 actual == text,
-                "{} is stale; run `cargo run -p wrela-abi --bin gen-ts`",
+                "{} is stale; run `cargo run -p wrela-abi --bin generate`",
                 path.display()
             );
-        }
-    }
-
-    /// std's copies of the ABI's numbers (compiler/std, which can't import this crate) are this
-    /// crate's.
-    #[test]
-    fn std_copies_are_current() {
-        use crate::memory::*;
-        let std = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../compiler/std");
-        for (file, name, value) in [
-            ("alloc.wrela", "STATE", ALLOC_STATE),
-            ("alloc.wrela", "BUMP", ALLOC_STATE),
-            ("alloc.wrela", "ALLOCATIONS", ALLOCATIONS),
-            ("alloc.wrela", "LOCK_WAITS", LOCK_WAITS),
-            ("alloc.wrela", "LOCK_SPINS", LOCK_SPINS),
-            ("mem.wrela", "THREAD_BLOCKS", THREAD_BLOCKS),
-            ("mem.wrela", "THREAD_BLOCK_SIZE", THREAD_BLOCK_SIZE),
-            ("mem.wrela", "PANIC", PANIC),
-            ("par.wrela", "WAKE", PAR_WAKE),
-            ("par.wrela", "SHUTDOWN", PAR_SHUTDOWN),
-            ("par.wrela", "HELPED", PAR_HELPED),
-            ("par.wrela", "HOLD", PAR_HOLD),
-            ("par.wrela", "THREADS", THREADS),
-            ("par.wrela", "GENERATION", JOB_GENERATION),
-            ("par.wrela", "TICKET", JOB_TICKET),
-            ("par.wrela", "TASK", JOB_TASK),
-            ("par.wrela", "CONTEXT", JOB_CONTEXT),
-            ("par.wrela", "CHUNKS", JOB_CHUNKS),
-            ("par.wrela", "DONE", JOB_DONE),
-            ("par.wrela", "FAILED", JOB_FAILED),
-            ("par.wrela", "DONE_FAILED", JOB_DONE_FAILED),
-            ("par.wrela", "DEPTH", DEPTH),
-            ("par.wrela", "RUNNING", RUNNING),
-            ("par.wrela", "JOIN_WAITS", JOIN_WAITS),
-            ("par.wrela", "SLOTS", JOB_SLOTS),
-            ("par.wrela", "SLOT_COUNT", JOB_SLOT_COUNT),
-            ("par.wrela", "SLOT_SIZE", JOB_SLOT_SIZE),
-            ("par.wrela", "SLOT_THREAD", SLOT_THREAD),
-            ("par.wrela", "FAILED_JOB", SLOT_FAILED),
-            ("audio.wrela", "OUT", AUDIO_OUT),
-            ("audio.wrela", "SAMPLE_RATE", crate::AUDIO_SAMPLE_RATE),
-            ("audio.wrela", "QUANTUM", crate::AUDIO_QUANTUM),
-            ("tick.wrela", "WANT_HASH", TICK_WANT_HASH),
-            ("tick.wrela", "HASH", TICK_HASH),
-            ("tick.wrela", "ORIGIN", TICK_ORIGIN),
-            ("tick.wrela", "RECORDS", TICK_RECORDS),
-            ("tick.wrela", "MAX_RECORDS", MAX_TICK_RECORDS),
-        ] {
-            let text = std::fs::read_to_string(std.join(file)).unwrap();
-            let decl = format!("const {name}: u32 = ");
-            let found = text.lines().find_map(|l| {
-                let l = l.strip_prefix("pub ").unwrap_or(l);
-                l.strip_prefix(&decl)
-            });
-            assert_eq!(found, Some(value.to_string().as_str()), "std's `{name}` in {file}");
         }
     }
 }

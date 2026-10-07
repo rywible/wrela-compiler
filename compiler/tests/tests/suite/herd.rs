@@ -6,23 +6,15 @@
 //! warm-up round (M1's method): the spike's `cpu.wasm` and the herd's build.
 
 use crate::built;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
-use wrela_host::{CpuBuild, CpuHost, Value};
-use wrela_tests::{median, repo_root};
+use wrela_host::{CpuBuild, CpuHost, Host, RunResult, Value};
+use wrela_tests::spike01::{HARNESS_D, fixture, fixture_path, harness, params_seed1};
+use wrela_tests::{files_under, median, percentile, repo_root};
 
+/// The herd, built once for the suite (`built` builds it under the suite's scratch).
 fn herd() -> PathBuf {
     built("../../examples/herd")
-}
-
-fn fixture(name: &str) -> PathBuf {
-    repo_root().join("compiler/tests/fixtures/spike01").join(name)
-}
-
-/// Seed 1's parameters: the spike's `Grazer` uniform, 328 f32s.
-fn params_seed1() -> Vec<f32> {
-    let bytes = std::fs::read(fixture("params-seed1.f32")).expect("params-seed1.f32");
-    bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect()
 }
 
 /// The spike's CPU module, loaded with seed 1's parameters.
@@ -36,11 +28,12 @@ impl Spike {
         let mut config = wasmtime::Config::new();
         config.wasm_threads(true).shared_memory(true);
         let engine = wasmtime::Engine::new(&config).expect("an engine");
-        let module = wasmtime::Module::from_file(&engine, fixture("cpu.wasm")).expect("cpu.wasm");
+        let module =
+            wasmtime::Module::from_file(&engine, fixture_path("cpu.wasm")).expect("cpu.wasm");
         let mut store = wasmtime::Store::new(&engine, ());
         let instance = wasmtime::Instance::new(&mut store, &module, &[]).expect("instantiate");
         let mut s = Spike { store, instance };
-        let ptr = s.call_u32("params_ptr", &[]) as usize;
+        let ptr = s.call_u32("params_ptr") as usize;
         let memory = s.instance.get_memory(&mut s.store, "memory").expect("memory");
         for (i, x) in params_seed1().iter().enumerate() {
             memory.data_mut(&mut s.store)[ptr + 4 * i..ptr + 4 * i + 4]
@@ -51,7 +44,7 @@ impl Spike {
         s
     }
 
-    fn call_u32(&mut self, name: &str, _args: &[u32]) -> u32 {
+    fn call_u32(&mut self, name: &str) -> u32 {
         let f = self.instance.get_typed_func::<(), u32>(&mut self.store, name).expect(name);
         f.call(&mut self.store, ()).expect(name)
     }
@@ -138,8 +131,8 @@ fn ours() -> CpuHost {
     CpuBuild::load(herd()).expect("load the herd").start_with(1).expect("start")
 }
 
-fn our_eval(host: &mut CpuHost, n: u32, pruned: u32) -> f64 {
-    let (lo, hi) = spike_box();
+/// Our `bench_eval` over `n` points in the spike's box (`spike_box`).
+fn our_eval(host: &mut CpuHost, (lo, hi): ([f32; 3], [f32; 3]), n: u32, pruned: u32) -> f64 {
     let mut args = vec![Value::I32(1), Value::I32(n as i32), Value::I32(pruned as i32)];
     args.extend(lo.iter().chain(&hi).map(|x| Value::F32(*x)));
     f64_of(&host.call_export("bench_eval", &args).expect("bench_eval"))
@@ -209,21 +202,24 @@ fn the_physique_gives_each_bone_its_mass_and_moments() {
 /// AC6's timings on the CPU (WASM), in one harness, alternating: the physique at 2 cm (≤ 1.25×
 /// the spike's), the grazer's field per evaluation whole and pruned, and a raycast (each ≤ 1.25×).
 #[test]
-#[ignore = "long: a timing run: cargo test -p wrela-tests --test suite herd:: -- --ignored --nocapture"]
+#[ignore = "long: alone: a timing run: cargo test -p wrela-tests --test suite herd:: -- --ignored --nocapture"]
 fn the_cpu_side_costs_what_the_spikes_did() {
     let mut spike = Spike::new();
     let mut host = ours();
     let mut report = Vec::new();
     // The same points, so the same sums (to rounding).
-    let n = 200_000;
+    let (n, at) = (200_000, spike_box());
     for pruned in [0, 1] {
-        let (a, b) = (spike.bench_eval(n, pruned), our_eval(&mut host, n, pruned));
+        let (a, b) = (spike.bench_eval(n, pruned), our_eval(&mut host, at, n, pruned));
         assert!(
             (a - b).abs() <= 1e-4 * a.abs().max(1.0),
             "pruned {pruned}: the sums differ: {a} and {b}"
         );
-        let (ts, to) =
-            alternate(7, || _ = spike.bench_eval(n, pruned), || _ = our_eval(&mut host, n, pruned));
+        let (ts, to) = alternate(
+            7,
+            || _ = spike.bench_eval(n, pruned),
+            || _ = our_eval(&mut host, at, n, pruned),
+        );
         report.push((if pruned == 1 { "evaluation, pruned" } else { "evaluation, whole" }, ts, to));
     }
     let (ts, to) = alternate(
@@ -257,25 +253,21 @@ fn the_cpu_side_costs_what_the_spikes_did() {
 #[test]
 #[ignore = "long: needs a GPU and bun"]
 fn the_spike_harness_gives_the_recorded_runs_counts() {
-    let recorded: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(fixture("run-2026-10-02T00-00-14-979Z.json")).expect("the run"),
-    )
-    .expect("JSON");
+    let recorded: serde_json::Value =
+        serde_json::from_str(&fixture("run-2026-10-02T00-00-14-979Z.json")).expect("JSON");
     let spike = wrela_tests::spike01::Spike::new();
     for cell in ["0.03", "0.02", "0.015", "0.01"] {
         let (per, _) = spike.extract_herd(cell.parse().expect("a cell size"), 40);
         let med = |f: &dyn Fn(&wrela_tests::spike01::Extracted) -> u32| {
-            let mut v: Vec<u32> = per.iter().map(f).collect();
-            v.sort_unstable();
-            v[v.len() / 2]
+            median(&per.iter().map(|e| f64::from(f(e))).collect::<Vec<_>>())
         };
         let r = &recorded["extraction"][cell];
         let want = |k: &str| r[k].as_f64().expect(k);
         let ours = [
-            ("blocks_median", f64::from(med(&|e| e.blocks))),
-            ("live_blocks_median", f64::from(med(&|e| e.live))),
-            ("verts_median", f64::from(med(&|e| e.verts))),
-            ("tris_median", f64::from(med(&|e| e.tris))),
+            ("blocks_median", med(&|e| e.blocks)),
+            ("live_blocks_median", med(&|e| e.live)),
+            ("verts_median", med(&|e| e.verts)),
+            ("tris_median", med(&|e| e.tris)),
             ("tris_herd", per.iter().map(|e| f64::from(e.tris)).sum()),
             ("holes_total", per.iter().map(|e| f64::from(e.holes)).sum()),
         ];
@@ -422,12 +414,7 @@ struct Ours {
 fn read_mesh(host: &mut wrela_host::Host, five: &[u32]) -> Ours {
     let args = wrela_tests::u32s(&host.read_buffer(five[4]).expect("args"));
     let (nv, ni) = (args[5] as usize, args[0] as usize);
-    let v = host.read_buffer(five[1]).expect("vertices");
-    let verts = v
-        .chunks_exact(48)
-        .take(nv)
-        .map(|c| [0, 1, 2].map(|k| f32::from_le_bytes(c[4 * k..4 * k + 4].try_into().expect("4"))))
-        .collect();
+    let verts = wrela_tests::positions(&host.read_buffer(five[1]).expect("vertices"), nv);
     let indices = wrela_tests::u32s(&host.read_buffer(five[3]).expect("quads"));
     Ours {
         live: args[10],
@@ -527,7 +514,7 @@ fn realize_herd(host: &mut wrela_host::Host, cell: f32) -> (Vec<Ours>, Vec<f64>)
 /// against the spike's extraction, run beside it in one process, alternating (the spike's
 /// harness runs its batch three times and keeps the last).
 #[test]
-#[ignore = "long: needs a GPU and bun"]
+#[ignore = "long: alone: needs a GPU and bun"]
 fn realization_matches_the_spikes() {
     let dir = built("herd-realize");
     let options = wrela_host::Options { timestamps: true, ..wrela_host::Options::default() };
@@ -540,7 +527,7 @@ fn realization_matches_the_spikes() {
         let (mut ours, mut theirs, mut inds) = (Vec::new(), Vec::new(), Vec::new());
         for _ in 0..3 {
             let (t, i) = spike.extract_herd(cell, 40);
-            their_ms.push(median(&t.iter().map(|e| e.total_ms()).collect::<Vec<_>>()));
+            their_ms.push(median(&t.iter().map(|e| e.gpu_ms).collect::<Vec<_>>()));
             (theirs, inds) = (t, i);
             let (o, times) = realize_herd(&mut host, cell as f32);
             our_ms.push(median(&times));
@@ -599,82 +586,40 @@ fn realization_matches_the_spikes() {
 
 // ---- AC7: the herd's grazer against field.wgsl ------------------------------------------------
 
-const HARNESS_D: &str = "
-@group(0) @binding(0) var<uniform> G: Grazer;
-@group(0) @binding(1) var<storage, read> points: array<vec4f>;
-@group(0) @binding(2) var<storage, read_write> dist: array<f32>;
-
-@compute @workgroup_size(64)
-fn eval_d(@builtin(global_invocation_id) id: vec3u) {
-  dist[id.x] = grazer_d(points[id.x].xyz, ALL_PARTS, 0.0);
-}
-";
-
-const HARNESS_G: &str = "
-@group(0) @binding(0) var<uniform> G: Grazer;
-@group(0) @binding(1) var<storage, read> points: array<vec4f>;
-@group(0) @binding(2) var<storage, read_write> samp: array<vec4f>;
-
-@compute @workgroup_size(64)
-fn eval_g(@builtin(global_invocation_id) id: vec3u) {
-  let s = grazer_g(points[id.x].xyz, ALL_PARTS, 0.0);
-  samp[id.x] = vec4f(s.d, s.g);
-}
-";
-
-/// A compute pipeline of a build: its WGSL and entry point, and the uniform bytes of its first
-/// dispatch in `batches`.
-fn compiled_kernel(
-    dir: &std::path::Path,
-    name: &str,
-    batches: &[Vec<u8>],
-) -> (String, String, Vec<u8>) {
-    use wrela_abi::manifest::Stage;
-    use wrela_abi::stream::{Command, decode};
-    let manifest = std::fs::read_to_string(dir.join("manifest.json")).expect("manifest");
-    let manifest = wrela_abi::Manifest::parse(&manifest).expect("a valid manifest");
-    let (index, p) = manifest
-        .pipelines
-        .iter()
-        .enumerate()
-        .find(|(_, p)| p.name == name)
-        .unwrap_or_else(|| panic!("no pipeline `{name}`"));
-    let Stage::Compute { entry, .. } = &p.stage else { panic!("`{name}` isn't a kernel") };
-    let wgsl = std::fs::read_to_string(dir.join(&p.shader)).expect("the shader");
-    for batch in batches {
-        for cmd in decode(batch).expect("a valid batch") {
-            if let Command::Dispatch { pipeline, uniforms, .. } = cmd
-                && pipeline as usize == index
-            {
-                return (wgsl, entry.clone(), uniforms.to_vec());
-            }
-        }
-    }
-    panic!("nothing dispatched `{name}`")
+/// The herd's grazer, seed 1, at the `n` points herd-realize's export `export` (`evaluate` or
+/// `near_surface`) samples, the newest three buffers it holds: the points (vec4s, as bytes), its
+/// distances and its samples (vec4s: the distance, then the gradient or the channels); and the
+/// command batches it recorded, if `record`.
+fn grazer_points(
+    export: &str,
+    n: u32,
+    record: bool,
+) -> (Vec<u8>, Vec<f32>, Vec<f32>, Vec<Vec<u8>>) {
+    use wrela_tests::f32s;
+    let options = wrela_host::Options { record, ..wrela_host::Options::default() };
+    let mut host = Host::load_with(built("herd-realize"), &options).expect("load");
+    host.call_export(export, &[Value::I32(1), Value::I32(n as i32)]).expect(export);
+    let made = host.buffers();
+    let [.., p, d, s] = made[..] else { panic!("{export} made {made:?}") };
+    let points = host.read_buffer(p).expect("points");
+    let dist = f32s(&host.read_buffer(d).expect("distances"));
+    let samp = f32s(&host.read_buffer(s).expect("samples"));
+    (points, dist, samp, host.take_batches())
 }
 
 /// The herd's grazer, seed 1, against field.wgsl with the seed-1 parameters, at 2²⁰ points over
 /// its bounds: distances and gradients (every part in, unfiltered), and GPU time per evaluation
 /// in one harness, alternating.
 #[test]
-#[ignore = "long: needs a GPU"]
+#[ignore = "long: alone: needs a GPU"]
 fn the_herds_grazer_field_costs_what_field_wgsl_does() {
+    use wrela_tests::spike01::compiled_kernel;
     use wrela_tests::{Bind, RawGpu, f32s};
     let n: u32 = 1 << 20;
-    let dir = built("herd-realize");
-    let options = wrela_host::Options { record: true, ..wrela_host::Options::default() };
-    let mut host = wrela_host::Host::load_with(&dir, &options).expect("load");
-    host.call_export("evaluate", &[Value::I32(1), Value::I32(n as i32)]).expect("evaluate");
-    let made = host.buffers();
-    let [.., p, d, s] = made[..] else { panic!("evaluate made {made:?}") };
-    let points = host.read_buffer(p).expect("points");
-    let dist = f32s(&host.read_buffer(d).expect("distances"));
-    let samp = f32s(&host.read_buffer(s).expect("samples"));
-    let batches = host.take_batches();
-    drop(host);
-    let field = std::fs::read_to_string(fixture("field.wgsl")).expect("field.wgsl");
+    let (points, dist, samp, batches) = grazer_points("evaluate", n, true);
+    let field = fixture("field.wgsl");
     let gpu = RawGpu::new().expect("a GPU");
-    let params: Vec<u8> = params_seed1().iter().flat_map(|x| x.to_le_bytes()).collect();
+    let params = std::fs::read(fixture_path("params-seed1.f32")).expect("params-seed1.f32");
     let run = |wgsl: &str, entry: &str, uniform: &[u8], out: u64| {
         let first = if wgsl.contains("var<uniform> G") {
             Bind::Uniform(uniform)
@@ -682,12 +627,13 @@ fn the_herds_grazer_field_costs_what_field_wgsl_does() {
             Bind::Read(uniform)
         };
         gpu.run(wgsl, entry, &[first, Bind::Read(&points), Bind::Write(out)], n / 64, 10)
-            .expect(entry)
     };
-    let (hand_d, hand_g) = (format!("{field}{HARNESS_D}"), format!("{field}{HARNESS_G}"));
+    let hand_d = format!("{field}{HARNESS_D}");
+    let hand_g = format!("{field}{}", harness("eval_g", "vec4f(s.d, s.g)"));
     let (_, hd) = run(&hand_d, "eval_d", &params, u64::from(n) * 4);
     let (_, hg) = run(&hand_g, "eval_g", &params, u64::from(n) * 16);
     let (hd, hg) = (f32s(&hd[0]), f32s(&hg[0]));
+    let dir = built("herd-realize");
     let (ow, oe, ou) = compiled_kernel(&dir, "distances", &batches);
     let (gw, ge, gu) = compiled_kernel(&dir, "samples", &batches);
     let (mut od, mut og, mut td, mut tg) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
@@ -725,11 +671,33 @@ fn the_herds_grazer_field_costs_what_field_wgsl_does() {
 /// A still frame's time: one second in, 60 frames a second (frame 60).
 const STILL_FRAME: u32 = 60;
 
-/// The script that asks the herd for a still frame at `level` (`key`: Digit1 3 cm, Digit3
-/// 1.5 cm), from the close-up's camera or the herd's.
-fn still_script(key: &str, close: bool) -> String {
-    let camera = if close { r#",{"frame":0,"type":"key","key":"KeyC"}"# } else { "" };
-    format!(r#"[{{"frame":0,"type":"key","key":"{key}"}}{camera}]"#)
+/// The script that asks the herd for a still frame at a level (`key`: Digit1 3 cm, Digit3
+/// 1.5 cm, Digit4 LOD's), from the close-up's camera or the herd's, with the terrain or without
+/// (KeyT).
+fn still_script(key: &str, close: bool, terrain: bool) -> String {
+    let mut keys = vec![key];
+    keys.extend(close.then_some("KeyC"));
+    keys.extend((!terrain).then_some("KeyT"));
+    let events: Vec<String> =
+        keys.iter().map(|k| format!(r#"{{"frame":0,"type":"key","key":"{k}"}}"#)).collect();
+    format!("[{}]", events.join(","))
+}
+
+/// The herd's first `frames` frames at 60 a second, `width` × `height`, in the native host with
+/// `script` (a [`still_script`]), each pass timed if `timestamps`: the host after them, and the
+/// run.
+fn still(
+    script: &str,
+    frames: u32,
+    (width, height): (u32, u32),
+    timestamps: bool,
+) -> (Host, RunResult) {
+    let times: Vec<f32> = (0..frames).map(|i| wrela_host::frame_time(i, 60.0)).collect();
+    let script = wrela_host::parse_script(script).expect("a script");
+    let options = wrela_host::Options { timestamps, ..wrela_host::Options::default() };
+    let mut host = Host::load_with(herd(), &options).expect("load the herd");
+    let run = host.run_frames_with(&times, width, height, &script).expect("run the herd");
+    (host, run)
 }
 
 /// AC1's parity frames: the herd draws spike 01's placement with each grazer's phase at its own
@@ -743,7 +711,6 @@ fn the_herd_draws_the_spikes_frames() {
     use wrela_tests::spike01::{H, SceneKind, W, image_difference};
     let (dir, rel) = wrela_tests::page("examples/herd", "herd-parity");
     let t = f64::from(STILL_FRAME) / 60.0;
-    let times: Vec<f32> = (0..=STILL_FRAME).map(|i| wrela_host::frame_time(i, 60.0)).collect();
     let cases = [
         ("Digit1", 0.03, false),
         ("Digit1", 0.03, true),
@@ -766,19 +733,14 @@ fn the_herd_draws_the_spikes_frames() {
     let mut report = Vec::new();
     for (&(key, cell, close), theirs) in cases.iter().zip(&spike_frames) {
         let what = format!("{} at {cell} m", if close { "the close-up" } else { "the herd" });
-        let script = still_script(key, close);
-        let parsed = wrela_host::parse_script(&script).expect("a script");
-        let native = wrela_host::Host::load(&dir)
-            .expect("load the herd")
-            .run_frames_with(&times, W, H, &parsed)
-            .expect("run the herd");
+        let script = still_script(key, close, true);
+        let (_, native) = still(&script, STILL_FRAME + 1, (W, H), false);
         let name = format!("{}-{key}", if close { "close" } else { "herd" });
         native.write_png(dir.join(format!("{name}-native.png"))).expect("png");
         wrela_host::image::write_png(&dir.join(format!("{name}-spike.png")), W, H, theirs)
             .expect("png");
-        std::fs::write(dir.join("still.json"), &script).expect("write the script");
         let run = wrela_tests::ChromeRun {
-            input: "still.json".into(),
+            script: Some(script),
             ..wrela_tests::ChromeRun::new(STILL_FRAME + 1, W, H, 60.0)
         };
         let chrome = wrela_tests::run_in_chrome_with(&rel, run);
@@ -823,16 +785,13 @@ fn frame_ms(timings: &[wrela_host::GpuTiming], from: usize, passes: bool) -> Vec
 /// and the whole frame, its passes' times summed (ours poses on the GPU; the spike posed on the
 /// CPU). Each ≤ 1.25×.
 #[test]
-#[ignore = "long: needs a GPU and bun"]
+#[ignore = "long: alone: needs a GPU and bun"]
 fn drawing_the_herd_costs_what_the_spikes_did() {
     use wrela_tests::spike01::{H, SceneKind, W};
-    let dir = herd_gpu();
     let mut spike = wrela_tests::spike01::Spike::new();
     let frames = STILL_FRAME + 1;
-    let times: Vec<f32> = (0..frames).map(|i| wrela_host::frame_time(i, 60.0)).collect();
     // Realization settles in the first frames; the last 30 are timed.
     let from = (frames - 30) as usize;
-    let options = wrela_host::Options { timestamps: true, ..wrela_host::Options::default() };
     let mut report = Vec::new();
     for (key, cell, close) in
         [("Digit1", 0.03, false), ("Digit3", 0.015, false), ("Digit3", 0.015, true)]
@@ -846,13 +805,7 @@ fn drawing_the_herd_costs_what_the_spikes_did() {
         let (mut parts, mut theirs_t) = (std::collections::BTreeMap::new(), vec![]);
         for _ in 0..3 {
             for terrain in [false, true] {
-                let mut script = still_script(key, close);
-                if !terrain {
-                    script = script.replace(']', r#",{"frame":0,"type":"key","key":"KeyT"}]"#);
-                }
-                let parsed = wrela_host::parse_script(&script).expect("a script");
-                let mut host = wrela_host::Host::load_with(&dir, &options).expect("load the herd");
-                let run = host.run_frames_with(&times, W, H, &parsed).expect("run the herd");
+                let (_, run) = still(&still_script(key, close, terrain), frames, (W, H), true);
                 // Without the terrain, the passes are the creatures'; with it, the whole frame.
                 let ms = frame_ms(&run.timings, from, !terrain);
                 if !terrain {
@@ -902,21 +855,15 @@ fn drawing_the_herd_costs_what_the_spikes_did() {
     }
 }
 
-/// The herd, built once for the GPU tests (`built` builds it under the suite's scratch).
-fn herd_gpu() -> PathBuf {
-    built("../../examples/herd")
-}
-
 /// A paced run of the live herd in Chrome at 1080p, 60 Hz, 600 frames, seven helpers, with
 /// `script`'s keys: the run, and each frame's GPU time (ms), its passes' and dispatches' own
 /// times summed. Not from the first start to the last end: paced, the GPU's clocks fall and rise
 /// (the same frame took 3.8 ms, then 14.5, then 5.6), and Chrome leaves gaps between a frame's
 /// passes that grow as they fall (up to 4 ms), which the native host doesn't.
-fn paced_herd(name: &str, script: &str) -> (std::path::PathBuf, wrela_tests::BrowserRun, Vec<f64>) {
+fn paced_herd(name: &str, script: &str) -> (PathBuf, wrela_tests::BrowserRun, Vec<f64>) {
     let (dir, rel) = wrela_tests::page("examples/herd", name);
-    std::fs::write(dir.join("paced.json"), script).expect("write the script");
     let run = wrela_tests::ChromeRun {
-        input: "paced.json".into(),
+        script: Some(script.into()),
         workers: 8,
         timestamps: true,
         paced: true,
@@ -941,13 +888,12 @@ fn paced_herd(name: &str, script: &str) -> (std::path::PathBuf, wrela_tests::Bro
 /// all 40 grazers, the bytes downloaded before it, and the memory: the program's GPU buffers and
 /// textures at most, and its WASM memory used and reserved.
 #[test]
-#[ignore = "long: needs Chrome, python3 and a GPU"]
+#[ignore = "long: alone: needs Chrome, python3 and a GPU"]
 fn the_herd_keeps_its_frames_in_chrome() {
     let (dir, chrome, ms) = paced_herd("herd-paced", "[]");
     let missed = ms.iter().filter(|&&m| m > 16.7).count();
     let worst = ms.iter().copied().fold(0.0, f64::max);
-    let manifest = std::fs::read_to_string(dir.join("manifest.json")).expect("manifest");
-    let pipelines = wrela_abi::Manifest::parse(&manifest).expect("a manifest").pipelines.len();
+    let pipelines = wrela_tests::manifest(&dir).pipelines.len();
     let results = dir.join("results");
     let load = wrela_tests::result_json(&results, "load.json");
     let opened = load["opened_ms"].as_f64().expect("opened_ms");
@@ -974,9 +920,8 @@ fn the_herd_keeps_its_frames_in_chrome() {
     };
     let drawn = (1..=40).map(|s| first("drawn", s)).fold(0.0, f64::max);
     let leveled = (1..=40).map(|s| first("at its level", s)).fold(0.0, f64::max);
-    let mut ticks = chrome.ticks.as_ref().expect("the sim's ticks").cpu_ms.clone();
-    ticks.sort_by(f64::total_cmp);
-    let p99 = ticks[(ticks.len() * 99 / 100).min(ticks.len() - 1)];
+    let ticks = &chrome.ticks.as_ref().expect("the sim's ticks").cpu_ms;
+    let p99 = percentile(ticks, 0.99);
     let memory = wrela_tests::result_json(&results, "memory.json");
     let mib = |v: &serde_json::Value| v.as_f64().expect("bytes") / 1048576.0;
     eprintln!(
@@ -1003,7 +948,7 @@ fn the_herd_keeps_its_frames_in_chrome() {
 /// the herd's grazers are drawn and refined for the herd's view. (The others, off screen in the
 /// close-up, were realized at their coarsest level meanwhile, one a frame: `Realizer::spend`.)
 #[test]
-#[ignore = "long: needs Chrome, python3 and a GPU"]
+#[ignore = "long: alone: needs Chrome, python3 and a GPU"]
 fn moving_to_the_herd_keeps_the_frames_in_chrome() {
     let script =
         r#"[{"frame":0,"type":"key","key":"KeyC"},{"frame":300,"type":"key","key":"KeyH"}]"#;
@@ -1031,7 +976,7 @@ fn moving_to_the_herd_keeps_the_frames_in_chrome() {
 #[ignore = "needs a GPU"]
 fn realization_reads_nothing_back_between_its_passes() {
     use wrela_abi::stream::{Command, decode};
-    let dir = herd_gpu();
+    let dir = herd();
     let options = wrela_host::Options { record: true, ..wrela_host::Options::default() };
     let mut host = wrela_host::Host::load_with(&dir, &options).expect("load the herd");
     let script = wrela_host::parse_script(
@@ -1042,8 +987,7 @@ fn realization_reads_nothing_back_between_its_passes() {
     host.run_frames_with(&times, 960, 540, &script).expect("run the herd");
     let r = host.call_export("realized", &[]).expect("realized");
     let [Value::I32(realizations), Value::I32(readbacks), _, _] = r[..] else { panic!("{r:?}") };
-    let manifest = std::fs::read_to_string(dir.join("manifest.json")).expect("manifest");
-    let manifest = wrela_abi::Manifest::parse(&manifest).expect("a manifest");
+    let manifest = wrela_tests::manifest(&dir);
     let name = |p: u32| manifest.pipelines[p as usize].name.clone();
     let (mut inside, mut reads, mut between, mut culls) = (false, 0u32, 0u32, 0u32);
     for batch in host.take_batches() {
@@ -1082,13 +1026,7 @@ fn realization_reads_nothing_back_between_its_passes() {
 #[test]
 #[ignore = "long: needs a GPU"]
 fn shared_corners_have_one_value() {
-    let src = repo_root().join("compiler/tests/herd-realize");
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("herd-realize-debug");
-    let _ = std::fs::remove_dir_all(&dir);
-    let out = wrela_driver::build_debug(&src);
-    assert!(!out.has_errors(), "herd-realize doesn't build in debug");
-    out.write_to(&dir).expect("write the build");
-    let mut host = wrela_host::Host::load(&dir).expect("load");
+    let mut host = Host::load(crate::built_debug("herd-realize")).expect("load");
     let (mut corners, mut shared, mut values) = (0u64, 0u64, 0u64);
     for cell in [0.03f32, 0.02, 0.015, 0.01] {
         for s in 1..=40 {
@@ -1132,21 +1070,13 @@ fn shared_corners_have_one_value() {
 /// creatures' GPU time (shadow and shading, the terrain left out) is ≤ 1.25× the spike's herd
 /// at 3 cm, run by the harness, alternating.
 #[test]
-#[ignore = "long: needs a GPU and bun"]
+#[ignore = "long: alone: needs a GPU and bun"]
 fn lod_looks_like_the_finest_and_costs_like_the_coarsest() {
     use wrela_tests::spike01::{H, SceneKind, W, image_difference};
-    let dir = herd_gpu();
     let frames = 241;
-    let times: Vec<f32> = (0..frames).map(|i| wrela_host::frame_time(i, 60.0)).collect();
-    let still = |key: &str, terrain: bool, timed: bool| {
-        let mut script = still_script(key, false);
-        if !terrain {
-            script = script.replace(']', r#",{"frame":0,"type":"key","key":"KeyT"}]"#);
-        }
-        let parsed = wrela_host::parse_script(&script).expect("a script");
-        let options = wrela_host::Options { timestamps: timed, ..wrela_host::Options::default() };
-        let mut host = wrela_host::Host::load_with(&dir, &options).expect("load the herd");
-        let run = host.run_frames_with(&times, W, H, &parsed).expect("run the herd");
+    // A still frame, and each grazer's level, which must be the one LOD gives it.
+    let leveled = |key: &str, terrain: bool, timed: bool| {
+        let (mut host, run) = still(&still_script(key, false, terrain), frames, (W, H), timed);
         let levels: Vec<u32> = (1..=40)
             .map(|s| {
                 let v = host.call_export("level", &[Value::I32(s)]).expect("level");
@@ -1157,8 +1087,8 @@ fn lod_looks_like_the_finest_and_costs_like_the_coarsest() {
             .collect();
         (run, levels)
     };
-    let (lod, levels) = still("Digit4", true, false);
-    let (finest, _) = still("Digit3", true, false);
+    let (lod, levels) = leveled("Digit4", true, false);
+    let (finest, _) = leveled("Digit3", true, false);
     let (mean, far) = image_difference(&lod.frame, &finest.frame);
     let count = |l: u32| levels.iter().filter(|&&x| x == l).count();
     eprintln!(
@@ -1174,7 +1104,7 @@ fn lod_looks_like_the_finest_and_costs_like_the_coarsest() {
         let (_, inds) = spike.extract_herd(0.03, 40);
         let scene = spike.scene(SceneKind::Herd, inds.iter().collect());
         for _ in 0..3 {
-            let (run, _) = still("Digit4", false, true);
+            let (run, _) = leveled("Digit4", false, true);
             ours.extend(frame_ms(&run.timings, (frames - 30) as usize, true));
             theirs.extend(spike.measure(&scene, 10, 30).iter().map(|t| t.creatures));
         }
@@ -1191,13 +1121,10 @@ fn lod_looks_like_the_finest_and_costs_like_the_coarsest() {
 #[test]
 #[ignore = "long: needs a GPU and bun"]
 fn mesh_memory_is_the_spikes() {
-    let dir = herd_gpu();
-    let times: Vec<f32> = (0..=STILL_FRAME).map(|i| wrela_host::frame_time(i, 60.0)).collect();
     let mut ours = Vec::new();
     for key in ["Digit1", "Digit3"] {
-        let parsed = wrela_host::parse_script(&still_script(key, false)).expect("a script");
-        let mut host = wrela_host::Host::load(&dir).expect("load the herd");
-        host.run_frames_with(&times, 960, 540, &parsed).expect("run the herd");
+        let (mut host, _) =
+            still(&still_script(key, false, true), STILL_FRAME + 1, (960, 540), false);
         ours.push(wrela_tests::one_f32(&mut host, "mesh_memory", &[]) as f64);
     }
     let spike = wrela_tests::spike01::Spike::new();
@@ -1230,8 +1157,7 @@ fn mesh_memory_is_the_spikes() {
 #[test]
 #[ignore = "long: needs a GPU"]
 fn a_ten_minute_tour_leaks_no_mesh_memory() {
-    let dir = herd_gpu();
-    let mut host = wrela_host::Host::load(&dir).expect("load the herd");
+    let mut host = Host::load(herd()).expect("load the herd");
     let fps = 60.0;
     let start =
         wrela_host::parse_script(r#"[{"frame":0,"type":"key","key":"KeyO"}]"#).expect("a script");
@@ -1281,7 +1207,7 @@ fn a_ten_minute_tour_leaks_no_mesh_memory() {
 /// all at once, in Chrome takes ≤ 1.5× creating spike 01's 12 cold, all at once, as its main.js
 /// did (compiler/tests/spike01/pipelines), alternating, three of each.
 #[test]
-#[ignore = "long: needs Chrome, python3 and a GPU"]
+#[ignore = "long: alone: needs Chrome, python3 and a GPU"]
 fn the_herds_pipelines_load_cold_as_fast() {
     let (dir, rel) = wrela_tests::page("examples/herd", "herd-cold");
     let spike = "compiler/tests/spike01/pipelines";
@@ -1329,14 +1255,14 @@ fn the_herds_pipelines_load_cold_as_fast() {
 fn the_herds_ticks_hash_the_same_everywhere() {
     const TICKS: u32 = 10_000;
     let (dir, rel) = wrela_tests::page("examples/herd", "herd-hashes");
-    let hex = |h: u64| format!("{h:016x}");
+    let hashes =
+        |log: &wrela_host::TickLog| -> Vec<u64> { log.ticks.iter().map(|t| t.hash).collect() };
     let built = CpuBuild::load(&dir).expect("load");
     let log = built.record_ticks(TICKS, &[], 1).expect("no helpers");
-    let reference: Vec<String> = log.ticks.iter().map(|t| hex(t.hash)).collect();
+    let reference = hashes(&log);
     for workers in [2, 8] {
         let other = built.record_ticks(TICKS, &[], workers).expect("helpers");
-        let hashes: Vec<String> = other.ticks.iter().map(|t| hex(t.hash)).collect();
-        assert_eq!(hashes, reference, "{} helpers", workers - 1);
+        assert_eq!(hashes(&other), reference, "{} helpers", workers - 1);
     }
     eprintln!("no GPU: 0, 1 and 7 helpers agree over {TICKS} ticks");
     // Jobs slowed tenfold (each physique held 0.36 s after it's done, one helper): the sim waits
@@ -1345,24 +1271,21 @@ fn the_herds_ticks_hash_the_same_everywhere() {
     slow.hold_jobs(360_000);
     slow.want_hashes(true);
     slow.init().expect("init");
-    let mut hashes = Vec::new();
-    for _ in 0..TICKS {
-        hashes.push(hex(slow.tick(true).expect("a tick").hash.expect("a hash")));
-    }
+    let slowed: Vec<u64> =
+        (0..TICKS).map(|_| slow.tick().expect("a tick").hash.expect("a hash")).collect();
     let waits = slow.take_logs().into_iter().filter(|l| l.contains("waited for a job")).count();
-    assert_eq!(hashes, reference, "jobs slowed tenfold");
+    assert_eq!(slowed, reference, "jobs slowed tenfold");
     assert!(waits > 0, "the slowed run never waited for a job");
     eprintln!("jobs slowed tenfold agree over {TICKS} ticks; the sim waited at {waits} ticks");
     // With the GPU, in lockstep with 60 frames a second. The host holds the GPU lock until it's
     // dropped, which it must be before Chrome waits for the lock.
-    let gpu: Vec<String> = {
+    let gpu = {
         let options = wrela_host::Options { defer_init: true, ..wrela_host::Options::default() };
-        let mut host = wrela_host::Host::load_with(&dir, &options).expect("load");
+        let mut host = Host::load_with(&dir, &options).expect("load");
         host.want_hashes(true);
         host.init().expect("init");
-        let mut glog = wrela_host::TickLog::new(host.wasm_hash(), 60, host.reported_hash());
-        host.run_lockstep(TICKS, 60.0, 64, 64, &[], Some(&mut glog)).expect("run");
-        glog.ticks.iter().map(|t| hex(t.hash)).collect()
+        let (_, glog) = host.run_lockstep(TICKS, 60.0, 64, 64, &[], true).expect("run");
+        hashes(&glog.expect("a tick log"))
     };
     assert_eq!(gpu[..], reference[..gpu.len()], "the native host with the GPU");
     assert!(gpu.len() >= TICKS as usize - 1, "only {} ticks with the GPU", gpu.len());
@@ -1370,7 +1293,7 @@ fn the_herds_ticks_hash_the_same_everywhere() {
     // x86-64 under Rosetta: the log replays.
     let path = dir.join("herd.ticks");
     std::fs::write(&path, log.encode()).expect("write the log");
-    let (ok, text) = crate::keys::replay_on_x86(&crate::keys::x86_host(), &path, &dir);
+    let (ok, text) = crate::replay_on_x86(&crate::x86_host(), &path, &dir);
     assert!(ok, "x86-64 didn't replay the herd's log: {text}");
     assert!(text.contains(&format!("{TICKS} ticks replayed")), "{text}");
     eprintln!("x86-64 under Rosetta replays {TICKS} ticks");
@@ -1382,13 +1305,13 @@ fn the_herds_ticks_hash_the_same_everywhere() {
             ..wrela_tests::ChromeRun::new(frames, 64, 64, fps)
         };
         let chrome = wrela_tests::run_in_chrome_with(&rel, run);
-        let ticks = chrome.ticks.expect("the sim's ticks");
+        let ticks = hashes(&chrome.ticks.and_then(|t| t.log).expect("the sim's tick log"));
         let what = format!(
             "Chrome at {fps} fps{}",
             if delay > 0 { ", each frame 20 ms longer" } else { "" }
         );
-        assert!(ticks.hashes.len() >= TICKS as usize, "{what}: {} ticks", ticks.hashes.len());
-        assert_eq!(ticks.hashes[..TICKS as usize], reference[..], "{what}");
+        assert!(ticks.len() >= TICKS as usize, "{what}: {} ticks", ticks.len());
+        assert_eq!(ticks[..TICKS as usize], reference[..], "{what}");
         eprintln!("{what} agrees over {TICKS} ticks");
     }
 }
@@ -1434,13 +1357,11 @@ fn the_herds_ticks_beside_frames_allocate_and_wait() {
     let ticked = host.ticks_beside_frames(3_000, 1_500, 60.0, 1920, 1080).expect("run");
     // Steady: after every physique has arrived (due a second after the spawn).
     let steady = &ticked[120..];
-    let mut allocs: Vec<f64> = steady.iter().map(|(t, _)| f64::from(t.allocations)).collect();
-    allocs.sort_by(f64::total_cmp);
+    let allocs: Vec<f64> = steady.iter().map(|(t, _)| f64::from(t.allocations)).collect();
+    let most = allocs.iter().copied().fold(0.0, f64::max);
     let waits: u64 = steady.iter().map(|(t, _)| u64::from(t.lock_waits)).sum();
     let spins: u64 = steady.iter().map(|(t, _)| u64::from(t.lock_spins)).sum();
-    let mut times: Vec<f64> = steady.iter().map(|(_, ms)| *ms).collect();
-    times.sort_by(f64::total_cmp);
-    let pct = |v: &[f64], p: f64| v[((v.len() - 1) as f64 * p).round() as usize];
+    let times: Vec<f64> = steady.iter().map(|(_, ms)| *ms).collect();
     let ns = spin_ns();
     let n = steady.len() as f64;
     eprintln!(
@@ -1448,14 +1369,14 @@ fn the_herds_ticks_beside_frames_allocate_and_wait() {
          the allocator's lock found taken {waits} times ({spins} tries, {:.1} ns each): \
          {:.1} ns a tick lost to it on average; ticks took {:.2} ms (median), {:.2} ms (p99)",
         steady.len(),
-        pct(&allocs, 0.5),
-        allocs[allocs.len() - 1],
+        median(&allocs),
+        most,
         ns,
         spins as f64 * ns / n,
-        pct(&times, 0.5),
-        pct(&times, 0.99),
+        median(&times),
+        percentile(&times, 0.99),
     );
-    assert_eq!(allocs[allocs.len() - 1], 0.0, "a steady tick allocated");
+    assert_eq!(most, 0.0, "a steady tick allocated");
 }
 
 // ---- AC7: the herd's grazer against the spike's ---------------------------------------------------
@@ -1517,18 +1438,6 @@ fn the_herds_skin_weights_are_the_spikes() {
     assert_eq!(weight_off, 0, "vertices whose weights differ by more than 1/255");
 }
 
-const HARNESS_C: &str = "
-@group(0) @binding(0) var<uniform> G: Grazer;
-@group(0) @binding(1) var<storage, read> points: array<vec4f>;
-@group(0) @binding(2) var<storage, read_write> samp: array<vec4f>;
-
-@compute @workgroup_size(64)
-fn eval_c(@builtin(global_invocation_id) id: vec3u) {
-  let s = grazer_g(points[id.x].xyz, ALL_PARTS, 0.0);
-  samp[id.x] = vec4f(s.d, s.ch, 0.0);
-}
-";
-
 /// AC7: the herd's grazer, seed 1, matches field.wgsl with the seed-1 parameters at 4,096 points
 /// from `Box3::sample` within 2 cm of its surface, on the GPU: distances within 1e-6 m, channels
 /// (torso-ness, hoof-ness) within 1e-5.
@@ -1537,32 +1446,23 @@ fn eval_c(@builtin(global_invocation_id) id: vec3u) {
 fn the_herds_grazer_is_field_wgsls_near_the_surface() {
     use wrela_tests::{Bind, RawGpu, f32s};
     let n: u32 = 4096;
-    let dir = built("herd-realize");
-    let mut host = wrela_host::Host::load(&dir).expect("load");
-    host.call_export("near_surface", &[Value::I32(1), Value::I32(n as i32)]).expect("near_surface");
-    let made = host.buffers();
-    let [.., p, d, s] = made[..] else { panic!("near_surface made {made:?}") };
-    let points = host.read_buffer(p).expect("points");
-    let dist = f32s(&host.read_buffer(d).expect("distances"));
-    let samp = f32s(&host.read_buffer(s).expect("samples"));
-    drop(host);
-    let field = std::fs::read_to_string(fixture("field.wgsl")).expect("field.wgsl");
-    let params: Vec<u8> = params_seed1().iter().flat_map(|x| x.to_le_bytes()).collect();
+    let (points, dist, samp, _) = grazer_points("near_surface", n, false);
+    let field = fixture("field.wgsl");
+    let params = std::fs::read(fixture_path("params-seed1.f32")).expect("params-seed1.f32");
     let gpu = RawGpu::new().expect("a GPU");
     let run = |wgsl: String, entry: &str, out: u64| {
-        let (_, o) = gpu
-            .run(
-                &wgsl,
-                entry,
-                &[Bind::Uniform(&params), Bind::Read(&points), Bind::Write(out)],
-                n / 64,
-                1,
-            )
-            .expect(entry);
+        let (_, o) = gpu.run(
+            &wgsl,
+            entry,
+            &[Bind::Uniform(&params), Bind::Read(&points), Bind::Write(out)],
+            n / 64,
+            1,
+        );
         f32s(&o[0])
     };
     let hd = run(format!("{field}{HARNESS_D}"), "eval_d", u64::from(n) * 4);
-    let hc = run(format!("{field}{HARNESS_C}"), "eval_c", u64::from(n) * 16);
+    let hand_c = format!("{field}{}", harness("eval_c", "vec4f(s.d, s.ch, 0.0)"));
+    let hc = run(hand_c, "eval_c", u64::from(n) * 16);
     let mut worst_d = 0.0f32;
     let mut worst_c = 0.0f32;
     for i in 0..n as usize {
@@ -1578,18 +1478,13 @@ fn the_herds_grazer_is_field_wgsls_near_the_surface() {
     assert!(worst_c <= 1e-5, "a channel {worst_c:.2e} off");
 }
 
-/// The `.wrela` files of `dir` (and its subdirectories but `build/`), each with its text.
-fn wrela_files(dir: &std::path::Path) -> Vec<(PathBuf, String)> {
-    let mut out = Vec::new();
-    for e in std::fs::read_dir(dir).expect("a directory").flatten() {
-        let p = e.path();
-        if p.is_dir() && p.file_name().is_some_and(|n| n != "build") {
-            out.extend(wrela_files(&p));
-        } else if p.extension().is_some_and(|x| x == "wrela") {
-            out.push((p.clone(), std::fs::read_to_string(&p).expect("read")));
-        }
-    }
-    out
+/// The `.wrela` files of `dir` ([`files_under`] it), each with its text.
+fn wrela_files(dir: &Path) -> Vec<(PathBuf, String)> {
+    let with_text = |p: PathBuf| {
+        let text = std::fs::read_to_string(&p).expect("read");
+        (p, text)
+    };
+    files_under(dir, &["wrela"]).into_iter().map(with_text).collect()
 }
 
 /// A file's text without its comments (`//` to the line's end; wrela has no others).
@@ -1631,21 +1526,13 @@ fn the_engine_and_the_herd_keep_their_layers() {
         assert!(!code_of(&text).contains("unsafe"), "{} uses `unsafe`", path.display());
     }
     for krate in ["syntax", "sema", "lower", "ir", "wasm", "wgsl", "driver", "diag"] {
-        let mut stack = vec![root.join("compiler").join(krate).join("src")];
-        while let Some(dir) = stack.pop() {
-            for e in std::fs::read_dir(&dir).expect("a directory").flatten() {
-                let p = e.path();
-                if p.is_dir() {
-                    stack.push(p);
-                } else if p.extension().is_some_and(|x| x == "rs") {
-                    let text = std::fs::read_to_string(&p).expect("read");
-                    assert!(
-                        !text.contains("engine::") && !text.contains("\"engine\""),
-                        "{} names the engine",
-                        p.display()
-                    );
-                }
-            }
+        for p in files_under(&root.join("compiler").join(krate).join("src"), &["rs"]) {
+            let text = std::fs::read_to_string(&p).expect("read");
+            assert!(
+                !text.contains("engine::") && !text.contains("\"engine\""),
+                "{} names the engine",
+                p.display()
+            );
         }
     }
 }
@@ -1655,7 +1542,7 @@ fn the_engine_and_the_herd_keep_their_layers() {
 /// median and 99th percentile within 1 ms of a run with normal ticks. (Each frame reads the
 /// latest complete snapshot: threads::a_hand_off_is_never_read_torn.)
 #[test]
-#[ignore = "long: needs Chrome, python3 and a GPU"]
+#[ignore = "long: alone: needs Chrome, python3 and a GPU"]
 fn frames_dont_wait_for_slow_ticks() {
     let (_, rel) = wrela_tests::page("examples/herd", "herd-slow-ticks");
     let intervals = |tickdelay: u32| {
@@ -1668,9 +1555,8 @@ fn frames_dont_wait_for_slow_ticks() {
         };
         let chrome = wrela_tests::run_in_chrome_with(&rel, run);
         let ticks = chrome.ticks.as_ref().map_or(0, |t| t.cpu_ms.len());
-        let mut d: Vec<f64> = chrome.began_ms.windows(2).skip(30).map(|w| w[1] - w[0]).collect();
-        d.sort_by(f64::total_cmp);
-        (d[d.len() / 2], d[(d.len() * 99 / 100).min(d.len() - 1)], ticks)
+        let d: Vec<f64> = chrome.began_ms.windows(2).skip(30).map(|w| w[1] - w[0]).collect();
+        (median(&d), percentile(&d, 0.99), ticks)
     };
     let (m0, p0, t0) = intervals(0);
     let (m1, p1, t1) = intervals(30);

@@ -58,6 +58,15 @@ pub fn first_light_with(name: &str, wasm: &[u8]) -> TempDir {
     dir
 }
 
+/// A manifest of this ABI's versions for `game.wasm`, with `pipelines` (a JSON array).
+pub fn manifest(pipelines: &str) -> String {
+    format!(
+        r#"{{ "manifest_version": {}, "stream_version": {}, "wasm": "game.wasm", "pipelines": {pipelines} }}"#,
+        wrela_abi::manifest::VERSION,
+        wrela_abi::stream::VERSION,
+    )
+}
+
 /// A build directory with the given manifest, WGSL files and WASM.
 pub fn build(name: &str, manifest: &str, shaders: &[(&str, &str)], wasm: &[u8]) -> TempDir {
     let dir = temp_dir(name);

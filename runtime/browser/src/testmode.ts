@@ -18,8 +18,8 @@
 // before frame i, the ticks up to ⌊(i + 1)·hz/fps⌋ run, and the frame waits for them, as on
 // the native host. With `paced=1`, ticks run on the ticker's own clock instead and neither waits
 // for the other, as in normal play: for time budgets. Either way, `ticks.json` has each tick's
-// time and records, and, unless `nohash=1`, each state hash; `ticks.log` is the tick log
-// (runtime/abi `ticks`), which `wrela-host --replay` replays. With `tickdelay=ms`, each tick is
+// CPU time, and, unless `nohash=1`, `ticks.log` is the tick log (runtime/abi `ticks`: each
+// tick's records and state hash), which `wrela-host --replay` replays. With `tickdelay=ms`, each tick is
 // held that much longer; with `framedelay=ms`, each frame. With `salt=n`, each shader gets a
 // comment that makes it unique, so no cache serves its pipelines, and `pipelines.json` has how
 // long creating them all, at once, took (#42 AC4's cold pipelines). `load.json` has when the page opened
@@ -27,6 +27,8 @@
 // the end, and at most) and of its WASM memory (reserved, and grown to). It's part of the shipped bundle, so the agreement test runs
 // the exact bytes a game ships, but only a page served from this machine (tools/serve.py and
 // tools/headless.py bind 127.0.0.1) enters it: a game's public URL ignores `#test`.
+
+import type { Loaded } from "./messages.ts";
 
 export interface TestParams {
   frames: number;
@@ -113,7 +115,8 @@ export function parseTestParams(hash: string): TestParams | null {
   return params;
 }
 
-/** The time of frame `i`, as both hosts compute it: `i / fps` (the WASM call rounds it to f32). */
+/** The time of frame `i`, as both hosts compute it (runtime/abi `ticks`' `frame_time`, which the
+ * vectors check): `i / fps` (the WASM call rounds it to f32). */
 export const frameTime = (i: number, fps: number) => i / fps;
 
 /** PUTs a file into the page's `results/` directory (see tools/serve.py). */
@@ -121,4 +124,28 @@ export async function putResult(base: string, name: string, body: BodyInit): Pro
   const url = new URL(`results/${name}`, base);
   const response = await fetch(url, { method: "PUT", body });
   if (!response.ok) throw new Error(`PUT ${url} failed: ${response.status} ${response.statusText}`);
+}
+
+/** What this thread loaded, for `load.json`: its performance entries of `types` ("navigation",
+ * "resource"), in that order. */
+export function loaded(types: string[]): Loaded[] {
+  return types
+    .flatMap((type) => performance.getEntriesByType(type) as PerformanceResourceTiming[])
+    .map((e) => ({
+      name: e.name,
+      bytes: e.transferSize > 0 ? e.transferSize : e.encodedBodySize,
+      end_ms: performance.timeOrigin + e.responseEnd,
+    }));
+}
+
+/** Resolves at `ms` (`performance.now()`'s clock), or at once if that's past. */
+export async function sleepUntil(ms: number): Promise<void> {
+  const wait = ms - performance.now();
+  if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
+}
+
+/** Blocks this thread for `ms`, as if its work took that long (`tickdelay`, `framedelay`). */
+export function holdFor(ms: number): void {
+  // Nothing wakes this word.
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }

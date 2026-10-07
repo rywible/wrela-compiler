@@ -3,8 +3,8 @@
 //!
 //! The fixtures are spike 01's files at the `design-archive-2026-10` tag, unchanged:
 //! `fixtures/spike01/field.wgsl` (the hand-written field) and `params-seed1.f32` (grazer.js's
-//! `makeGrazer(1)`, the `Grazer` uniform). The harness kernels below are appended to field.wgsl,
-//! as the spike's own extract.wgsl and draw.wgsl are.
+//! `makeGrazer(1)`, the `Grazer` uniform). The harness kernels (`wrela_tests::spike01`'s) are
+//! appended to field.wgsl, as the spike's own extract.wgsl and draw.wgsl are.
 //!
 //! GPU time is compared in one harness ([`RawGpu`]): the WGSL `wrela build` emitted, with the
 //! uniform bytes the program submitted, against the hand-written kernel, alternating, after a
@@ -14,69 +14,18 @@
 //! These need a GPU: `cargo test -p wrela-tests --test suite grazer:: -- --ignored --nocapture`.
 
 use crate::built;
-use wrela_abi::Manifest;
-use wrela_abi::manifest::Stage;
-use wrela_abi::stream::{Command, decode};
 use wrela_host::{Host, Options, Value};
-use wrela_tests::{Bind, RawGpu, bytes_of, f32s, median, one_f32, one_u32, repo_root, u32s, worse};
+use wrela_tests::spike01::{HARNESS_D, compiled_kernel, fixture, harness, params_seed1};
+use wrela_tests::{Bind, RawGpu, bytes_of, f32s, median, one_f32, one_u32, u32s, worse};
 
 /// 2²⁰ points ("1M").
 const POINTS: u32 = 1 << 20;
 const REPS: u32 = 20;
 const ROUNDS: usize = 5;
 
-const HARNESS_D: &str = "
-@group(0) @binding(0) var<uniform> G: Grazer;
-@group(0) @binding(1) var<storage, read> points: array<vec4f>;
-@group(0) @binding(2) var<storage, read_write> dist: array<f32>;
-
-@compute @workgroup_size(64)
-fn eval_d(@builtin(global_invocation_id) id: vec3u) {
-  dist[id.x] = grazer_d(points[id.x].xyz, ALL_PARTS, 0.0);
-}
-";
-
-const HARNESS_G: &str = "
-@group(0) @binding(0) var<uniform> G: Grazer;
-@group(0) @binding(1) var<storage, read> points: array<vec4f>;
-@group(0) @binding(2) var<storage, read_write> samp: array<vec4f>;
-
-@compute @workgroup_size(64)
-fn eval_g(@builtin(global_invocation_id) id: vec3u) {
-  let s = grazer_g(points[id.x].xyz, ALL_PARTS, 0.0);
-  samp[id.x] = vec4f(s.d, s.g);
-}
-";
-
 fn load() -> Host {
     Host::load_with(built("fields"), &Options { record: true, ..Options::default() })
         .expect("load the grazer")
-}
-
-/// A compute pipeline of the build: its WGSL and entry point, and the uniform bytes of its
-/// first dispatch in `batches`.
-fn compiled_kernel(name: &str, batches: &[Vec<u8>]) -> (String, String, Vec<u8>) {
-    let dir = built("fields");
-    let manifest = std::fs::read_to_string(dir.join("manifest.json")).expect("manifest");
-    let manifest = Manifest::parse(&manifest).expect("a valid manifest");
-    let (index, p) = manifest
-        .pipelines
-        .iter()
-        .enumerate()
-        .find(|(_, p)| p.name == name)
-        .unwrap_or_else(|| panic!("no pipeline `{name}`"));
-    let Stage::Compute { entry, .. } = &p.stage else { panic!("`{name}` isn't a kernel") };
-    let wgsl = std::fs::read_to_string(dir.join(&p.shader)).expect("the shader");
-    for batch in batches {
-        for cmd in decode(batch).expect("a valid batch") {
-            if let Command::Dispatch { pipeline, uniforms, .. } = cmd
-                && pipeline as usize == index
-            {
-                return (wgsl, entry.clone(), uniforms.to_vec());
-            }
-        }
-    }
-    panic!("nothing dispatched `{name}`")
 }
 
 fn spike_params(host: &mut Host, seed: u32) -> Vec<f32> {
@@ -105,12 +54,9 @@ fn the_compiled_grazer_matches_the_hand_written_one() {
     let mut host = load();
 
     // The same numbers: wrela's `params` is grazer.js's `makeGrazer`, bit for bit.
-    let fixture =
-        std::fs::read(repo_root().join("compiler/tests/fixtures/spike01/params-seed1.f32"))
-            .expect("read params-seed1.f32");
-    let (fixture, params) = (f32s(&fixture), spike_params(&mut host, 1));
+    let (theirs, params) = (params_seed1(), spike_params(&mut host, 1));
     let mismatched: Vec<usize> =
-        (0..328).filter(|&i| params[i].to_bits() != fixture[i].to_bits()).collect();
+        (0..328).filter(|&i| params[i].to_bits() != theirs[i].to_bits()).collect();
     assert!(mismatched.is_empty(), "parameters differ from the spike's at {mismatched:?}");
 
     // The compiled field: points over the grazer's bounds, the distance, and the distance and
@@ -125,9 +71,7 @@ fn the_compiled_grazer_matches_the_hand_written_one() {
     drop(host);
 
     // The hand-written field, on the same points.
-    let field =
-        std::fs::read_to_string(repo_root().join("compiler/tests/fixtures/spike01/field.wgsl"))
-            .expect("read field.wgsl");
+    let field = fixture("field.wgsl");
     let gpu = RawGpu::new().expect("a GPU");
     let spike_uniform = bytes_of(&params);
     let n = u64::from(POINTS);
@@ -139,18 +83,17 @@ fn the_compiled_grazer_matches_the_hand_written_one() {
             POINTS / 64,
             REPS,
         )
-        .expect(entry)
     };
     let hand_d = format!("{field}{HARNESS_D}");
-    let hand_g = format!("{field}{HARNESS_G}");
+    let hand_g = format!("{field}{}", harness("eval_g", "vec4f(s.d, s.g)"));
     let (_, out_d) = run(&hand_d, "eval_d", &spike_uniform, n * 4);
     let (_, out_g) = run(&hand_g, "eval_g", &spike_uniform, n * 16);
     let (hd, hg) = (f32s(&out_d[0]), f32s(&out_g[0]));
 
     // GPU time: the compiled kernels (the build's WGSL, the program's uniforms) and the
     // hand-written ones, alternating; the first round warms the GPU up and isn't counted.
-    let (ours_dw, ours_de, ours_du) = compiled_kernel("distances", &batches);
-    let (ours_gw, ours_ge, ours_gu) = compiled_kernel("samples", &batches);
+    let (ours_dw, ours_de, ours_du) = compiled_kernel(&built("fields"), "distances", &batches);
+    let (ours_gw, ours_ge, ours_gu) = compiled_kernel(&built("fields"), "samples", &batches);
     let (mut ours_d, mut ours_g, mut theirs_d, mut theirs_g) =
         (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for round in 0..=ROUNDS {

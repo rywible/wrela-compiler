@@ -419,7 +419,7 @@ fn sum_of_squares(fe: &mut Fe, x: ir::ValueId, minus: Option<ir::ValueId>, n: u3
 fn dims(fe: &Fe, t: ir::TypeId) -> Option<(bool, u8)> {
     match fe.m.types.get(t) {
         // Only f32 vectors reach the back end's arithmetic: the others' is done a component
-        // at a time before it (`wrela_ir::opt::scalarize_vectors`).
+        // at a time before it (`wrela_ir::scalarize::scalarize_vectors`).
         ir::TypeDef::Vector(ir::Scalar::F32, n) => Some((false, *n)),
         ir::TypeDef::Matrix(n) => Some((true, *n)),
         _ => None,
@@ -1397,17 +1397,17 @@ pub(super) fn host(
                 None => fe.ins.push(I::Drop),
             }
         }
-        ir::HostOp::Audio | ir::HostOp::RequestTake => {
+        ir::HostOp::Audio | ir::HostOp::RequestTake | ir::HostOp::Tick => {
             let h = fe.at.helpers;
-            let helper = if matches!(op, ir::HostOp::Audio) { h.audio } else { h.request_take };
-            fe.ins.extend([I::LocalGet(fe.v(args[0])), I::LocalGet(fe.v(args[1]))]);
-            fe.ins.push(I::Call(helper));
-        }
-        ir::HostOp::Tick => {
+            let helper = match op {
+                ir::HostOp::Audio => h.audio,
+                ir::HostOp::RequestTake => h.request_take,
+                _ => h.tick,
+            };
             for &a in args {
                 fe.ins.push(I::LocalGet(fe.v(a)));
             }
-            fe.ins.push(I::Call(fe.at.helpers.tick));
+            fe.ins.push(I::Call(helper));
         }
     }
     Ok(())
@@ -1648,17 +1648,10 @@ pub(crate) fn canonicalize(fe: &mut Fe, t: ir::TypeId, addr: u32, off: u32) {
         fe.ins.push(store);
     };
     match types.get(t).clone() {
-        ir::TypeDef::Scalar(s) => float(fe, s == ir::Scalar::F64, off),
-        ir::TypeDef::Vector(s, n) if s.is_float() => {
-            let size = crate::scalar_size(s);
-            for k in 0..u32::from(n) {
-                float(fe, s == ir::Scalar::F64, off + size * k);
-            }
-        }
-        ir::TypeDef::Matrix(n) => {
-            for c in 0..u32::from(n) {
-                for k in 0..u32::from(n) {
-                    float(fe, false, off + column_stride(n) * c + 4 * k);
+        ir::TypeDef::Scalar(_) | ir::TypeDef::Vector(..) | ir::TypeDef::Matrix(_) => {
+            for (o, s) in ir::layout::scalars(types, t) {
+                if s.is_float() {
+                    float(fe, s == ir::Scalar::F64, off + o);
                 }
             }
         }
@@ -1694,9 +1687,10 @@ pub(crate) fn canonicalize(fe: &mut Fe, t: ir::TypeId, addr: u32, off: u32) {
                 fe.ins.push(I::End);
             }
         }
-        ir::TypeDef::Run(_) | ir::TypeDef::RuntimeArray(_) | ir::TypeDef::Ptr(_) => {}
-        // An integer vector holds no float.
-        ir::TypeDef::Atomic(_) | ir::TypeDef::Vector(..) => {}
+        ir::TypeDef::Run(_)
+        | ir::TypeDef::RuntimeArray(_)
+        | ir::TypeDef::Ptr(_)
+        | ir::TypeDef::Atomic(_) => {}
     }
 }
 

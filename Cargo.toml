@@ -39,6 +39,7 @@ wrela-wfont = { path = "tools/wfont" }
 wasmtime = { version = "49", default-features = false, features = ["cranelift", "parallel-compilation", "runtime", "std", "threads"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
+mimalloc = { version = "0.1", default-features = false }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

@@ -28,6 +28,7 @@ export interface Vectors {
   lines: { name: string; bytes: string; at: [number, string | null][]; error: string | null }[];
   input: { name: string; script: string; at?: string[]; events?: string[]; error?: string }[];
   tick_logs: { wasm_hash: string; hz: number; first: string; ticks: { records: string[]; hash: string }[]; bytes: string }[];
+  lockstep: { hz: number; fps: number; frames: number[]; ticks: number[]; times: number[] }[];
 }
 
 /** The ABI's test vectors (runtime/abi/vectors.json). */

@@ -557,13 +557,11 @@ pub struct FnAttrs {
     pub audio: Option<Span>,
     /// `@test`: a test `wrela test` runs, as the build runs constants (§10).
     pub test: Option<Span>,
-    /// `@test(frames: n)`: the program's frames the test runs first (§10).
-    pub test_frames: Option<u32>,
+    /// `@test(frames: n)` or `@test(ticks: n)`: what of the program the test runs first (§10).
+    pub test_run: Option<TestRun>,
     /// `@test(frames: n, input: "script.json")`: a script of input events the frames get, by
     /// its path in the package, and where the path is written.
     pub test_input: Option<(String, Span)>,
-    /// `@test(ticks: n)`: the program's ticks the test runs first, with no frames (§10).
-    pub test_ticks: Option<u32>,
     /// `@thread_entry` (std's unsafe core): a host calls it on a thread of its own, with that
     /// thread's number first (wrela_abi `memory`'s threads); exported as `__` and its name.
     pub thread_entry: Option<Span>,
@@ -572,12 +570,13 @@ pub struct FnAttrs {
     pub effects: Vec<crate::effects::Effect>,
 }
 
-impl FnAttrs {
-    /// Whether it's a test that runs the program first: its frames (`@test(frames: n)`) or its
-    /// ticks (`@test(ticks: n)`).
-    pub fn runs_program(&self) -> bool {
-        self.test_frames.is_some() || self.test_ticks.is_some()
-    }
+/// What of the program a test runs before it (§10).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TestRun {
+    /// `@test(frames: n)`: `n` frames, with the program's ticks in lockstep.
+    Frames(u32),
+    /// `@test(ticks: n)`: `n` ticks, with no frames.
+    Ticks(u32),
 }
 
 /// std's unsafe core (language.md §17, §6.14): the only modules that use `unsafe`, and the

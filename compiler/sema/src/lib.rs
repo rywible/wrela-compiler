@@ -54,6 +54,7 @@ pub const STD_SOURCES: &[(&str, &str)] = &[
     ("std::math", include_str!("../../std/math.wrela")),
     ("std::quat", include_str!("../../std/quat.wrela")),
     ("std::transform", include_str!("../../std/transform.wrela")),
+    ("std::abi", include_str!("../../std/abi.wrela")),
 ];
 
 /// A checked program: its definitions, every function body's MIR, and every constant.

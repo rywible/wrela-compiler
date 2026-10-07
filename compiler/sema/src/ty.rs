@@ -105,6 +105,8 @@ pub enum VecElem {
 }
 
 impl VecElem {
+    pub const ALL: [VecElem; 4] = [VecElem::F32, VecElem::I32, VecElem::U32, VecElem::F64];
+
     /// What follows `vecN` in the type's name.
     pub fn suffix(self) -> &'static str {
         match self {
@@ -132,17 +134,6 @@ impl VecElem {
     /// Whether WGSL has it: all but f64's.
     pub fn on_gpu(self) -> bool {
         self != VecElem::F64
-    }
-
-    /// The vector element a scalar type is, if it's one.
-    pub fn of(k: &TyKind) -> Option<VecElem> {
-        match k {
-            TyKind::Float(FloatTy::F32) => Some(VecElem::F32),
-            TyKind::Int(IntTy::I32) => Some(VecElem::I32),
-            TyKind::Int(IntTy::U32) => Some(VecElem::U32),
-            TyKind::Float(FloatTy::F64) => Some(VecElem::F64),
-            _ => None,
-        }
     }
 }
 
@@ -180,6 +171,22 @@ pub struct FnFlags {
 impl FnFlags {
     /// The most parameters a function type can give a mode.
     pub const MAX_MODES: usize = 32;
+
+    /// Its attributes (§9) by name, each with whether it has it, in the order they're shown.
+    pub fn attrs(self) -> [(&'static str, bool); 3] {
+        [("deterministic", self.deterministic), ("parallel", self.parallel), ("audio", self.audio)]
+    }
+
+    /// It with attribute `name` too, if a function type takes an attribute of that name.
+    pub fn with_attr(mut self, name: &str) -> Option<FnFlags> {
+        match name {
+            "deterministic" => self.deterministic = true,
+            "parallel" => self.parallel = true,
+            "audio" => self.audio = true,
+            _ => return None,
+        }
+        Some(self)
+    }
 
     pub fn mode(self, i: usize) -> wrela_syntax::ast::Mode {
         use wrela_syntax::ast::Mode;

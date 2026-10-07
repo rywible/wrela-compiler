@@ -10,8 +10,16 @@ use crate::*;
 pub fn scalarize_vectors(m: &mut Module) {
     for i in 0..m.functions.len() {
         let mut f = std::mem::take(&mut m.functions[i]);
-        let body = std::mem::take(&mut f.body);
-        f.body = block(m, &mut f, body);
+        let mut body = std::mem::take(&mut f.body);
+        visit::expand(&mut body, &mut |s, out| match s {
+            Stmt::Let(v, e) => {
+                if !scalarize_let(m, &mut f, v, &e, out) {
+                    out.push(Stmt::Let(v, e));
+                }
+            }
+            s => out.push(s),
+        });
+        f.body = body;
         m.functions[i] = f;
     }
 }
@@ -24,25 +32,6 @@ fn other_vector(m: &Module, t: TypeId) -> Option<(Scalar, u8)> {
     }
 }
 
-fn block(m: &mut Module, f: &mut Function, b: Block) -> Block {
-    let mut out = Vec::with_capacity(b.len());
-    for mut s in b {
-        for inner in s.blocks_mut() {
-            let taken = std::mem::take(inner);
-            *inner = block(m, f, taken);
-        }
-        match s {
-            Stmt::Let(v, e) => {
-                if !expand(m, f, v, &e, &mut out) {
-                    out.push(Stmt::Let(v, e));
-                }
-            }
-            s => out.push(s),
-        }
-    }
-    out
-}
-
 struct Emit<'a> {
     m: &'a mut Module,
     f: &'a mut Function,
@@ -51,9 +40,7 @@ struct Emit<'a> {
 
 impl Emit<'_> {
     fn let_(&mut self, t: TypeId, e: Expr) -> ValueId {
-        let v = self.f.new_value(t);
-        self.out.push(Stmt::Let(v, e));
-        v
+        self.f.let_(self.out, t, e)
     }
 
     /// Component `i` of `x`, or `x` itself if it's a scalar.
@@ -73,71 +60,71 @@ impl Emit<'_> {
         &mut self,
         s: Scalar,
         n: u8,
-        mut f: impl FnMut(&mut Self, TypeId, u32) -> Expr,
+        mut f: impl FnMut(&mut Self, u32) -> Expr,
     ) -> Vec<ValueId> {
         let ct = self.m.types.scalar(s);
         (0..u32::from(n))
             .map(|i| {
-                let e = f(self, ct, i);
+                let e = f(self, i);
                 self.let_(ct, e)
             })
             .collect()
     }
 
+    /// `op` of each pair of components of `a` and `b`, of type `t`, joined by `join` in order.
+    fn fold(
+        &mut self,
+        a: ValueId,
+        b: ValueId,
+        n: u8,
+        t: TypeId,
+        op: BinOp,
+        join: BinOp,
+    ) -> ValueId {
+        let mut acc = None;
+        for i in 0..u32::from(n) {
+            let (x, y) = (self.comp(a, i), self.comp(b, i));
+            let p = self.let_(t, Expr::Binary(op, x, y));
+            acc = Some(match acc {
+                None => p,
+                Some(acc) => self.let_(t, Expr::Binary(join, acc, p)),
+            });
+        }
+        acc.expect("a vector has components")
+    }
+
     /// The sum of the components' products of `a` and `b`, in order: WGSL's `dot`.
     fn dot(&mut self, a: ValueId, b: ValueId, s: Scalar, n: u8) -> ValueId {
         let ct = self.m.types.scalar(s);
-        let mut sum = None;
-        for i in 0..u32::from(n) {
-            let (x, y) = (self.comp(a, i), self.comp(b, i));
-            let p = self.let_(ct, Expr::Binary(BinOp::Mul, x, y));
-            sum = Some(match sum {
-                None => p,
-                Some(acc) => self.let_(ct, Expr::Binary(BinOp::Add, acc, p)),
-            });
-        }
-        sum.expect("a vector has components")
+        self.fold(a, b, n, ct, BinOp::Mul, BinOp::Add)
     }
 }
 
-/// Expands `let v = e` if it computes with a vector whose components aren't `f32`s; whether it
-/// did.
-fn expand(m: &mut Module, f: &mut Function, v: ValueId, e: &Expr, out: &mut Block) -> bool {
+/// Expands `let v = e` into scalar code if it computes with a vector whose components aren't
+/// `f32`s; whether it did.
+fn scalarize_let(m: &mut Module, f: &mut Function, v: ValueId, e: &Expr, out: &mut Block) -> bool {
     let vt = f.value_ty(v);
     let result = other_vector(m, vt);
     let operand = |x: ValueId| other_vector(m, f.value_ty(x));
-    let (s, n) = match e {
-        Expr::Binary(_, a, b) => match result.or_else(|| operand(*a)).or_else(|| operand(*b)) {
-            Some(d) => d,
-            None => return false,
-        },
-        Expr::Unary(_, a) => match result.or_else(|| operand(*a)) {
-            Some(d) => d,
-            None => return false,
-        },
-        Expr::Convert(x, _) | Expr::Swizzle(x, _) => match result.or_else(|| operand(*x)) {
-            Some(d) => d,
-            None => return false,
-        },
-        Expr::Splat(..) => match result {
-            Some(d) => d,
-            None => return false,
-        },
-        Expr::Builtin(_, args) => match args.iter().find_map(|&a| operand(a)).or(result) {
-            Some(d) => d,
-            None => return false,
-        },
-        _ => return false,
+    let found = match e {
+        Expr::Binary(_, a, b) => result.or_else(|| operand(*a)).or_else(|| operand(*b)),
+        Expr::Unary(_, x) | Expr::Convert(x, _) | Expr::Swizzle(x, _) => {
+            result.or_else(|| operand(*x))
+        }
+        Expr::Splat(..) => result,
+        Expr::Builtin(_, args) => args.iter().find_map(|&a| operand(a)).or(result),
+        _ => None,
     };
+    let Some((s, n)) = found else { return false };
     let mut em = Emit { m, f, out };
     let e = match e {
         // A comparison of vectors is `AllEqual`'s: only arithmetic here.
         Expr::Binary(op, a, b) => {
-            let parts = em.each(s, n, |em, _, i| Expr::Binary(*op, em.comp(*a, i), em.comp(*b, i)));
+            let parts = em.each(s, n, |em, i| Expr::Binary(*op, em.comp(*a, i), em.comp(*b, i)));
             Expr::Construct(vt, parts)
         }
         Expr::Unary(op, a) => {
-            let parts = em.each(s, n, |em, _, i| Expr::Unary(*op, em.comp(*a, i)));
+            let parts = em.each(s, n, |em, i| Expr::Unary(*op, em.comp(*a, i)));
             Expr::Construct(vt, parts)
         }
         // To or from another vector: each component converted.
@@ -157,7 +144,7 @@ fn expand(m: &mut Module, f: &mut Function, v: ValueId, e: &Expr, out: &mut Bloc
             Expr::Construct(vt, parts)
         }
         Expr::Builtin(b, args) if b.is_elementwise() => {
-            let parts = em.each(s, n, |em, _, i| {
+            let parts = em.each(s, n, |em, i| {
                 Expr::Builtin(*b, args.iter().map(|&a| em.comp(a, i)).collect())
             });
             Expr::Construct(vt, parts)
@@ -170,16 +157,8 @@ fn expand(m: &mut Module, f: &mut Function, v: ValueId, e: &Expr, out: &mut Bloc
         }
         Expr::Builtin(Builtin::AllEqual, args) => {
             let bt = em.m.types.bool();
-            let mut all = None;
-            for i in 0..u32::from(n) {
-                let (x, y) = (em.comp(args[0], i), em.comp(args[1], i));
-                let eq = em.let_(bt, Expr::Binary(BinOp::Eq, x, y));
-                all = Some(match all {
-                    None => eq,
-                    Some(acc) => em.let_(bt, Expr::Binary(BinOp::And, acc, eq)),
-                });
-            }
-            rename_last(em.out, all.expect("a vector has components"), v);
+            let all = em.fold(args[0], args[1], n, bt, BinOp::Eq, BinOp::And);
+            rename_last(em.out, all, v);
             return true;
         }
         // f64 vectors' geometry.
@@ -188,7 +167,7 @@ fn expand(m: &mut Module, f: &mut Function, v: ValueId, e: &Expr, out: &mut Bloc
             Expr::Builtin(Builtin::Sqrt, vec![d])
         }
         Expr::Builtin(Builtin::Distance, args) => {
-            let parts = em.each(s, n, |em, _, i| {
+            let parts = em.each(s, n, |em, i| {
                 Expr::Binary(BinOp::Sub, em.comp(args[0], i), em.comp(args[1], i))
             });
             let diff_t = em.f.value_ty(args[0]);
@@ -200,8 +179,7 @@ fn expand(m: &mut Module, f: &mut Function, v: ValueId, e: &Expr, out: &mut Bloc
             let d = em.dot(args[0], args[0], s, n);
             let ct = em.m.types.scalar(s);
             let len = em.let_(ct, Expr::Builtin(Builtin::Sqrt, vec![d]));
-            let parts =
-                em.each(s, n, |em, _, i| Expr::Binary(BinOp::Div, em.comp(args[0], i), len));
+            let parts = em.each(s, n, |em, i| Expr::Binary(BinOp::Div, em.comp(args[0], i), len));
             Expr::Construct(vt, parts)
         }
         Expr::Builtin(Builtin::Cross, args) => {

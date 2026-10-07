@@ -45,6 +45,18 @@ pub fn value_and_gradient(
     ad::value_and_gradient(m, cache, f, ncap, target, with)
 }
 
+/// The type [`value_and_gradient`]'s function returns for an input of type `x`: `(f32, X)`, or
+/// with the type `T` of `with`, `(f32, X, T)`.
+pub fn value_gradient_ty(types: &mut Types, x: TypeId, with: Option<TypeId>) -> TypeId {
+    let f32 = types.f32();
+    let mut fields = vec![("_0".into(), f32), ("_1".into(), x)];
+    if let Some(t) = with {
+        fields.push(("_2".into(), t));
+    }
+    let names: Vec<String> = fields.iter().map(|(_, t)| types.display(*t)).collect();
+    types.intern(TypeDef::Struct { name: format!("({})", names.join(", ")), fields })
+}
+
 /// A function of `f`'s captures and a box (`box_ty`, with fields `lo` and `hi`) returning an
 /// interval (`interval_ty`, likewise) that contains `f(x)`, as the target computes it, for every
 /// `x` in the box. On the GPU each operation's result is widened by its WGSL error bound

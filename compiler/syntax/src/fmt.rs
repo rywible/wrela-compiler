@@ -1051,17 +1051,14 @@ impl<'a> Builder<'a> {
                 concat([self.expr(target), self.tok(&format!(" {} ", op.text())), self.expr(value)])
             }
             StmtKind::Expr(e) => self.expr(e),
-            StmtKind::While { cond, body } => {
-                concat([self.tok("while "), self.expr(cond), text(" "), self.block(body, true)])
+            StmtKind::While { pat, cond, body } => {
+                let mut out = match pat {
+                    Some(p) => vec![self.tok("while let "), self.pat(p), self.tok(" = ")],
+                    None => vec![self.tok("while ")],
+                };
+                out.extend([self.expr(cond), text(" "), self.block(body, true)]);
+                concat(out)
             }
-            StmtKind::WhileLet { pat, init, body } => concat([
-                self.tok("while let "),
-                self.pat(pat),
-                self.tok(" = "),
-                self.expr(init),
-                text(" "),
-                self.block(body, true),
-            ]),
             StmtKind::Loop { body } => concat([self.tok("loop "), self.block(body, true)]),
             StmtKind::For { mutable, pat, iter, body } => {
                 let mut out = vec![self.tok(if *mutable { "for mut " } else { "for " })];

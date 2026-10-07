@@ -340,8 +340,7 @@ impl Serialize for f64 {
 
 impl Serialize for vec2 {
     fn serialize(self, w: mut Writer) {
-        self.x.serialize(mut w)
-        self.y.serialize(mut w)
+        Serialize::serialize([self.x, self.y], mut w)
     }
 
     fn deserialize(r: mut Reader) -> Result<vec2, LoadError> {
@@ -353,9 +352,7 @@ impl Serialize for vec2 {
 
 impl Serialize for vec3 {
     fn serialize(self, w: mut Writer) {
-        self.x.serialize(mut w)
-        self.y.serialize(mut w)
-        self.z.serialize(mut w)
+        Serialize::serialize([self.x, self.y, self.z], mut w)
     }
 
     fn deserialize(r: mut Reader) -> Result<vec3, LoadError> {
@@ -368,10 +365,7 @@ impl Serialize for vec3 {
 
 impl Serialize for vec4 {
     fn serialize(self, w: mut Writer) {
-        self.x.serialize(mut w)
-        self.y.serialize(mut w)
-        self.z.serialize(mut w)
-        self.w.serialize(mut w)
+        Serialize::serialize([self.x, self.y, self.z, self.w], mut w)
     }
 
     fn deserialize(r: mut Reader) -> Result<vec4, LoadError> {
@@ -385,8 +379,7 @@ impl Serialize for vec4 {
 
 impl Serialize for vec2i {
     fn serialize(self, w: mut Writer) {
-        self.x.serialize(mut w)
-        self.y.serialize(mut w)
+        Serialize::serialize([self.x, self.y], mut w)
     }
 
     fn deserialize(r: mut Reader) -> Result<vec2i, LoadError> {
@@ -398,9 +391,7 @@ impl Serialize for vec2i {
 
 impl Serialize for vec3i {
     fn serialize(self, w: mut Writer) {
-        self.x.serialize(mut w)
-        self.y.serialize(mut w)
-        self.z.serialize(mut w)
+        Serialize::serialize([self.x, self.y, self.z], mut w)
     }
 
     fn deserialize(r: mut Reader) -> Result<vec3i, LoadError> {
@@ -413,10 +404,7 @@ impl Serialize for vec3i {
 
 impl Serialize for vec4i {
     fn serialize(self, w: mut Writer) {
-        self.x.serialize(mut w)
-        self.y.serialize(mut w)
-        self.z.serialize(mut w)
-        self.w.serialize(mut w)
+        Serialize::serialize([self.x, self.y, self.z, self.w], mut w)
     }
 
     fn deserialize(r: mut Reader) -> Result<vec4i, LoadError> {
@@ -430,8 +418,7 @@ impl Serialize for vec4i {
 
 impl Serialize for vec2u {
     fn serialize(self, w: mut Writer) {
-        self.x.serialize(mut w)
-        self.y.serialize(mut w)
+        Serialize::serialize([self.x, self.y], mut w)
     }
 
     fn deserialize(r: mut Reader) -> Result<vec2u, LoadError> {
@@ -443,9 +430,7 @@ impl Serialize for vec2u {
 
 impl Serialize for vec3u {
     fn serialize(self, w: mut Writer) {
-        self.x.serialize(mut w)
-        self.y.serialize(mut w)
-        self.z.serialize(mut w)
+        Serialize::serialize([self.x, self.y, self.z], mut w)
     }
 
     fn deserialize(r: mut Reader) -> Result<vec3u, LoadError> {
@@ -458,10 +443,7 @@ impl Serialize for vec3u {
 
 impl Serialize for vec4u {
     fn serialize(self, w: mut Writer) {
-        self.x.serialize(mut w)
-        self.y.serialize(mut w)
-        self.z.serialize(mut w)
-        self.w.serialize(mut w)
+        Serialize::serialize([self.x, self.y, self.z, self.w], mut w)
     }
 
     fn deserialize(r: mut Reader) -> Result<vec4u, LoadError> {
@@ -475,8 +457,7 @@ impl Serialize for vec4u {
 
 impl Serialize for vec2d {
     fn serialize(self, w: mut Writer) {
-        self.x.serialize(mut w)
-        self.y.serialize(mut w)
+        Serialize::serialize([self.x, self.y], mut w)
     }
 
     fn deserialize(r: mut Reader) -> Result<vec2d, LoadError> {
@@ -488,9 +469,7 @@ impl Serialize for vec2d {
 
 impl Serialize for vec3d {
     fn serialize(self, w: mut Writer) {
-        self.x.serialize(mut w)
-        self.y.serialize(mut w)
-        self.z.serialize(mut w)
+        Serialize::serialize([self.x, self.y, self.z], mut w)
     }
 
     fn deserialize(r: mut Reader) -> Result<vec3d, LoadError> {
@@ -503,10 +482,7 @@ impl Serialize for vec3d {
 
 impl Serialize for vec4d {
     fn serialize(self, w: mut Writer) {
-        self.x.serialize(mut w)
-        self.y.serialize(mut w)
-        self.z.serialize(mut w)
-        self.w.serialize(mut w)
+        Serialize::serialize([self.x, self.y, self.z, self.w], mut w)
     }
 
     fn deserialize(r: mut Reader) -> Result<vec4d, LoadError> {
@@ -552,8 +528,6 @@ impl<T: Serialize> Serialize for Vec<T> {
     }
 }
 
-/// A fixed array of `Copy` elements, each in order. (Its elements are read into an array the
-/// first one's copies fill, so they must be `Copy`.)
 /// The elements in use, as a `Vec`'s are: a `u32` count, then each.
 impl<T: Serialize + Copy, const N: u32> Serialize for Bounded<T, N> {
     fn serialize(self, w: mut Writer) {

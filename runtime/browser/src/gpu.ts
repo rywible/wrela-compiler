@@ -2,33 +2,35 @@
 // commands with WebGPU. The same mapping as the native host (runtime/native/src/gpu.rs):
 //
 // - Work is recorded into one pending command encoder and submitted ("flushed") at the end of a
-//   pass on the screen, before a WriteBuffer or WriteTexture (so earlier work sees the old
-//   contents), before a readback, and at the end of each call. Each dispatch gets its own
-//   compute pass.
+//   pass on the screen, before a WriteTexture or a WriteBuffer over UPLOAD_MAX bytes (so earlier
+//   work sees the old contents), before a readback, and at the end of each call. Each dispatch
+//   gets its own compute pass.
+// - Any other WriteBuffer is staged in an upload ring, written just before the flush, and a copy
+//   from there is recorded where the write is: it splits no work into submissions (as the native
+//   host's upload `Ring`).
 // - A pass's draws are collected and recorded into one render pass when it ends (Present or
 //   EndPass), since a pass can span batches.
 // - A render pipeline is made for each combination of target formats it's drawn with: the
-//   screen's or a texture's colour format, and a depth format or none. With depth, a fragment
-//   is kept where its depth is less than what's there, which it replaces.
+//   screen's or a texture's colour format, and a depth format or none. Three are made at load
+//   (the screen, the screen with depth, depth alone); the others at their first draw. With
+//   depth, a fragment is kept where its depth is less than what's there, which it replaces.
 // - Uniform bytes go into a ring buffer bound with dynamic offsets (256-byte aligned by
 //   default), staged on the CPU and written just before each flush, so every command in a
-//   submission has its own slice. It grows (after a flush) when a submission needs more.
+//   submission has its own slice.
+// - Both rings grow (after a flush) when a submission needs more.
 // - Bind group 0 of each pipeline is laid out from the manifest: the uniform block (dynamic
 //   offset), then the bindings in order. Bind groups are cached per (pipeline, bindings), until
 //   one of their resources is destroyed.
 // - A destroyed buffer or texture is released after the next flush: work recorded before it
 //   still uses it.
 
-import { NONE, SCREEN, SCREEN_FORMAT, TEXTURE_FORMATS } from "./abi.gen.ts";
-import { CommandError, isDepth } from "./check.ts";
+import { NONE, SCREEN, SCREEN_FORMAT, UPLOAD_MAX, UPLOAD_START } from "./abi.gen.ts";
+import { bytesPerTexel, CommandError, isDepth } from "./check.ts";
 import { errorMessage } from "./errors.ts";
 import type { Manifest, Pipeline, ResourceBinding, UniformBlock } from "./manifest.ts";
 import type { Binding, Bytes, Command, OpcodeName, Pass, TextureFormat } from "./stream.ts";
 
 const RING_START = 64 * 1024;
-/** The upload ring's starting size, and the largest write it takes (as the native host's). */
-const UPLOAD_START = 256 * 1024;
-const UPLOAD_MAX = 16 * 1024 * 1024;
 
 /** A pipeline failed to build: its WGSL didn't compile, or its layout or entry points are wrong. */
 export class ShaderError extends Error {
@@ -238,16 +240,8 @@ export function buildPipelines(device: GPUDevice, manifest: Manifest, shaders: s
   return Promise.all(manifest.pipelines.map((p, i) => buildPipeline(device, p, shaders[i]!)));
 }
 
-/** A draw waiting for its pass to end. */
-interface PendingDraw {
-  pipeline: number;
-  how:
-    | { vertices: number; instances: number }
-    | { buffer: number; offset: number }
-    | { indices: number; indexOffset: number; indexSize: number; buffer: number; offset: number };
-  bindings: Binding[];
-  uniforms: Bytes;
-}
+/** A draw waiting for its pass to end, with its own copy of its uniform bytes. */
+type PendingDraw = Extract<Command, { op: "Draw" | "DrawIndirect" | "DrawIndexedIndirect" }>;
 
 /** A live resource the program made. */
 type Resource =
@@ -265,9 +259,49 @@ export interface GpuTiming {
   /** The dispatch's pipeline name, or `screen pass` or `pass`. */
   label: string;
   nanos: number;
-  /** When it began, in nanoseconds on the GPU's clock (a frame's time is from its first start to
-   * its last end: passes overlap). */
-  start: number;
+}
+
+/** `capacity` doubled until it's at least `n`. */
+function doubled(capacity: number, n: number): number {
+  let c = capacity * 2;
+  while (c < n) c *= 2;
+  return c;
+}
+
+/** A GPU buffer and this submission's bytes for it, staged on the CPU and written to it just
+ * before the submission (`write`): the uniform ring, and the upload ring (as the native host's
+ * `Ring`). */
+class Ring {
+  buffer: GPUBuffer;
+  bytes: Bytes;
+  /** The bytes staged so far. */
+  used = 0;
+
+  constructor(
+    readonly device: GPUDevice,
+    readonly label: string,
+    readonly usage: GPUBufferUsageFlags,
+    capacity: number,
+  ) {
+    this.buffer = device.createBuffer({ label, size: capacity, usage });
+    this.bytes = new Uint8Array(capacity);
+  }
+
+  /** Room for `n` bytes: a new buffer, its size `doubled` until they fit. Call it only after a
+   * flush, which submitted the last work that used the old buffer. */
+  grow(n: number): void {
+    const capacity = doubled(this.bytes.length, n);
+    this.buffer.destroy();
+    this.buffer = this.device.createBuffer({ label: this.label, size: capacity, usage: this.usage });
+    this.bytes = new Uint8Array(capacity);
+  }
+
+  /** Writes the staged bytes to the buffer, and starts again from 0. */
+  write(queue: GPUQueue): void {
+    if (this.used === 0) return;
+    queue.writeBuffer(this.buffer, 0, this.bytes, 0, this.used);
+    this.used = 0;
+  }
 }
 
 /** Most passes timed in one submission: more flush first. */
@@ -317,9 +351,7 @@ class Timer {
       this.#reading.push(
         staging.mapAsync(GPUMapMode.READ).then(() => {
           const t = new BigUint64Array(staging.getMappedRange());
-          passes.forEach((p, i) =>
-            this.results.push({ ...p, nanos: Number(t[2 * i + 1]! - t[2 * i]!), start: Number(t[2 * i]!) }),
-          );
+          passes.forEach((p, i) => this.results.push({ ...p, nanos: Number(t[2 * i + 1]! - t[2 * i]!) }));
           staging.unmap();
           staging.destroy();
         }),
@@ -347,15 +379,12 @@ export class GpuExecutor {
   /** Buffers and textures destroyed by the program, released once the work recorded before is
    * submitted. */
   readonly #doomed: (GPUBuffer | GPUTexture)[] = [];
-  #ring: GPUBuffer;
-  #staging: Bytes = new Uint8Array(RING_START);
-  #staged = 0;
-  /** This submission's buffer writes: their bytes, written to `#upload` at the flush, and a copy
-   * of each from there recorded where the write is, so a write splits no work into submissions
-   * (as the native host's `UploadRing`). */
-  #upload: GPUBuffer;
-  #uploadBytes: Bytes = new Uint8Array(UPLOAD_START);
-  #uploaded = 0;
+  /** The uniform ring: this submission's uniform bytes. */
+  readonly #uniforms: Ring;
+  /** The upload ring: this submission's buffer writes, a copy of each from there recorded where
+   * the write is, so a write splits no work into submissions (as the native host's upload
+   * `Ring`). */
+  readonly #uploads: Ring;
   #encoder: GPUCommandEncoder | null = null;
   #pass: { pass: Pass; draws: PendingDraw[] } | null = null;
   readonly #timer: Timer | null;
@@ -375,8 +404,13 @@ export class GpuExecutor {
   ) {
     const l = device.limits;
     this.#align = Math.max(l.minUniformBufferOffsetAlignment, l.minStorageBufferOffsetAlignment);
-    this.#ring = this.#createRing(RING_START);
-    this.#upload = this.#createUpload(UPLOAD_START);
+    this.#uniforms = new Ring(
+      device,
+      "uniform ring",
+      GPUBufferUsage.UNIFORM | GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+      RING_START,
+    );
+    this.#uploads = new Ring(device, "upload ring", GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST, UPLOAD_START);
     this.#timer = timestamps && device.features.has("timestamp-query") ? new Timer(device) : null;
     this.#debugFlag = pipelines.some((p) => p.debugFlag !== null)
       ? {
@@ -456,7 +490,7 @@ export class GpuExecutor {
             GPUTextureUsage.COPY_SRC |
             (depth ? 0 : GPUTextureUsage.COPY_DST),
         });
-        const bytes = cmd.width * cmd.height * TEXTURE_FORMATS.find((f) => f.name === cmd.format)!.bytes;
+        const bytes = cmd.width * cmd.height * bytesPerTexel(cmd.format);
         this.#resources.set(cmd.handle, { kind: "texture", texture, view: texture.createView(), format: cmd.format, bytes });
         this.#allocated(bytes);
         return;
@@ -519,23 +553,10 @@ export class GpuExecutor {
         return;
       case "Draw":
       case "DrawIndirect":
-      case "DrawIndexedIndirect": {
-        const how =
-          cmd.op === "Draw"
-            ? { vertices: cmd.vertices, instances: cmd.instances }
-            : cmd.op === "DrawIndirect"
-              ? { buffer: cmd.arguments, offset: cmd.offset }
-              : {
-                  indices: cmd.indices,
-                  indexOffset: cmd.index_offset,
-                  indexSize: cmd.index_size,
-                  buffer: cmd.arguments,
-                  offset: cmd.offset,
-                };
+      case "DrawIndexedIndirect":
         // The uniform bytes are a view into the program's memory: copy them.
-        this.#pass?.draws.push({ pipeline: cmd.pipeline, how, bindings: cmd.bindings, uniforms: cmd.uniforms.slice() });
+        this.#pass?.draws.push({ ...cmd, uniforms: cmd.uniforms.slice() });
         return;
-      }
       case "Present":
       case "EndPass":
         this.#endPass(cmd.op);
@@ -558,14 +579,8 @@ export class GpuExecutor {
    * resources the program destroyed (WebGPU waits for submitted work that uses them). */
   flush(): void {
     if (this.#encoder !== null) {
-      if (this.#staged > 0) {
-        this.device.queue.writeBuffer(this.#ring, 0, this.#staging, 0, this.#staged);
-        this.#staged = 0;
-      }
-      if (this.#uploaded > 0) {
-        this.device.queue.writeBuffer(this.#upload, 0, this.#uploadBytes, 0, this.#uploaded);
-        this.#uploaded = 0;
-      }
+      this.#uniforms.write(this.device.queue);
+      this.#uploads.write(this.device.queue);
       const read = this.#timer?.resolve(this.#encoder) ?? null;
       this.device.queue.submit([this.#encoder.finish()]);
       this.#encoder = null;
@@ -647,7 +662,7 @@ export class GpuExecutor {
     return p;
   }
 
-  /** A copy from the upload ring (`#upload`): the stream's writes are whole words, as a copy
+  /** A copy from the upload ring (`#uploads`): the stream's writes are whole words, as a copy
    * moves. A very big one goes through the queue after what's recorded is submitted. */
   #write(handle: number, offset: number, data: Bytes): void {
     const len = data.length;
@@ -658,37 +673,16 @@ export class GpuExecutor {
       this.device.queue.writeBuffer(this.#buffer(handle), offset, data);
       return;
     }
-    if (this.#uploaded + len > this.#uploadBytes.length) {
+    const up = this.#uploads;
+    if (up.used + len > up.bytes.length) {
       this.flush();
-      if (len > this.#uploadBytes.length) {
-        let capacity = this.#uploadBytes.length * 2;
-        while (capacity < len) capacity *= 2;
-        this.#upload.destroy(); // the flush above submitted the last work that used it
-        this.#upload = this.#createUpload(capacity);
-        this.#uploadBytes = new Uint8Array(capacity);
-      }
+      if (len > up.bytes.length) up.grow(len);
     }
-    const at = this.#uploaded;
+    const at = up.used;
     // The bytes are a view into the program's memory: copied now.
-    this.#uploadBytes.set(data, at);
-    this.#uploaded += len;
-    this.#encoderNow().copyBufferToBuffer(this.#upload, at, this.#buffer(handle), offset, len);
-  }
-
-  #createUpload(capacity: number): GPUBuffer {
-    return this.device.createBuffer({
-      label: "upload ring",
-      size: capacity,
-      usage: GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
-    });
-  }
-
-  #createRing(capacity: number): GPUBuffer {
-    return this.device.createBuffer({
-      label: "uniform ring",
-      size: capacity,
-      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-    });
+    up.bytes.set(data, at);
+    up.used += len;
+    this.#encoderNow().copyBufferToBuffer(up.buffer, at, this.#buffer(handle), offset, len);
   }
 
   #encoderNow(): GPUCommandEncoder {
@@ -699,17 +693,14 @@ export class GpuExecutor {
   /** Makes room for `bytes` more uniform bytes (counted aligned) in this submission, flushing
    * first or growing the ring if it must. Call before recording the work that uses them. */
   #reserve(op: OpcodeName, bytes: number): void {
-    if (alignTo(this.#staged, this.#align) + bytes <= this.#staging.length) return;
+    const ring = this.#uniforms;
+    if (alignTo(ring.used, this.#align) + bytes <= ring.bytes.length) return;
     this.flush();
-    if (bytes > this.#staging.length) {
-      let capacity = this.#staging.length * 2;
-      while (capacity < bytes) capacity *= 2;
-      if (capacity > this.device.limits.maxBufferSize) {
+    if (bytes > ring.bytes.length) {
+      if (doubled(ring.bytes.length, bytes) > this.device.limits.maxBufferSize) {
         throw new CommandError(op, `${bytes} uniform bytes in one submission is over the limit`);
       }
-      this.#ring.destroy(); // the flush above submitted the last work that used it
-      this.#ring = this.#createRing(capacity);
-      this.#staging = new Uint8Array(capacity);
+      ring.grow(bytes);
       this.#bindGroups.clear(); // they point at the old ring
       this.#groupsOf.clear();
     }
@@ -718,10 +709,11 @@ export class GpuExecutor {
   /** Appends uniform bytes to this submission's slice of the ring; returns their offsets. */
   #push(bytes: Bytes): number[] {
     if (bytes.length === 0) return [];
-    const offset = alignTo(this.#staged, this.#align);
-    this.#staging.fill(0, this.#staged, offset);
-    this.#staging.set(bytes, offset);
-    this.#staged = offset + bytes.length;
+    const ring = this.#uniforms;
+    const offset = alignTo(ring.used, this.#align);
+    ring.bytes.fill(0, ring.used, offset);
+    ring.bytes.set(bytes, offset);
+    ring.used = offset + bytes.length;
     return [offset];
   }
 
@@ -739,7 +731,7 @@ export class GpuExecutor {
     const p = this.#pipeline(index);
     const entries: GPUBindGroupEntry[] = [];
     if (p.uniform !== null) {
-      entries.push({ binding: p.uniform.binding, resource: { buffer: this.#ring, offset: 0, size: p.uniform.size } });
+      entries.push({ binding: p.uniform.binding, resource: { buffer: this.#uniforms.buffer, offset: 0, size: p.uniform.size } });
     }
     bindings.forEach((b, i) => {
       const r = this.#resources.get(b.handle);
@@ -831,8 +823,8 @@ export class GpuExecutor {
       draw: d,
       pipeline: this.#variant(d.pipeline, colorFormat, depth?.format ?? null),
       group: this.#bindGroup(d.pipeline, d.bindings),
-      args: "buffer" in d.how ? this.#buffer(d.how.buffer) : null,
-      indices: "indices" in d.how ? this.#buffer(d.how.indices) : null,
+      args: d.op === "Draw" ? null : this.#buffer(d.arguments),
+      indices: d.op === "DrawIndexedIndirect" ? this.#buffer(d.indices) : null,
     }));
     const [r, g, b, a] = pass.clear;
     const label = onScreen ? "screen pass" : "pass";
@@ -867,11 +859,18 @@ export class GpuExecutor {
       const offsets = this.#push(d.uniforms);
       rp.setPipeline(pipeline);
       rp.setBindGroup(0, group, offsets);
-      if ("vertices" in d.how) rp.draw(d.how.vertices, d.how.instances);
-      else if ("indices" in d.how) {
-        rp.setIndexBuffer(indices!, "uint32", d.how.indexOffset, d.how.indexSize);
-        rp.drawIndexedIndirect(args!, d.how.offset);
-      } else rp.drawIndirect(args!, d.how.offset);
+      switch (d.op) {
+        case "Draw":
+          rp.draw(d.vertices, d.instances);
+          break;
+        case "DrawIndirect":
+          rp.drawIndirect(args!, d.offset);
+          break;
+        case "DrawIndexedIndirect":
+          rp.setIndexBuffer(indices!, "uint32", d.index_offset, d.index_size);
+          rp.drawIndexedIndirect(args!, d.offset);
+          break;
+      }
     }
     rp.end();
     if (onScreen) {

@@ -22,18 +22,20 @@ fn package() -> PathBuf {
 
 /// The program, built lifted (`shapes`) or not, into a scratch directory `name`.
 fn built(name: &str, lift: bool) -> PathBuf {
-    build_into(name, &package(), if lift { &["shapes"] } else { &[] })
+    build_into(name, &package(), if lift { &["shapes"] } else { &[] }, false)
 }
 
-/// The program at `pkg`, built with the packages `lift` lifted (none: a normal build), into a
-/// scratch directory `name`.
-pub(crate) fn build_into(name: &str, pkg: &Path, lift: &[&str]) -> PathBuf {
+/// The program at `pkg`, built with the packages `lift` lifted (none: a normal build), in debug
+/// mode if `debug`, into a scratch directory `name`.
+pub(crate) fn build_into(name: &str, pkg: &Path, lift: &[&str], debug: bool) -> PathBuf {
     let dir = super::scratch(name);
-    let out = if lift.is_empty() {
-        wrela_driver::build(pkg)
-    } else {
+    let out = if !lift.is_empty() {
         let names: Vec<String> = lift.iter().map(|s| s.to_string()).collect();
-        wrela_driver::build_lifted(pkg, &names, false).expect("--lift")
+        wrela_driver::build_lifted(pkg, &names, debug).expect("--lift")
+    } else if debug {
+        wrela_driver::build_debug(pkg)
+    } else {
+        wrela_driver::build(pkg)
     };
     assert!(
         !out.has_errors(),

@@ -91,16 +91,10 @@ fn the_corpus_bounds_at_10_cm() {
 /// A release build trusts a stated bound; a debug build checks it when `to_bound` uses it.
 #[test]
 fn a_debug_build_catches_a_wrong_bound() {
-    let src = wrela_tests::repo_root().join("compiler/tests/lipschitz");
-    let tmp = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
-    let release = tmp.join("lipschitz-release");
-    wrela_tests::must_build(&src, &release);
+    let release = crate::built("lipschitz");
     let mut host = CpuBuild::load(&release).expect("load").start_with(1).expect("start");
     assert_eq!(one_f32(&mut host, "bound_at", &[]), 0.2);
-    let debug = tmp.join("lipschitz-debug");
-    let built = wrela_driver::build_debug(&src);
-    assert!(!built.has_errors(), "the debug build fails");
-    built.write_to(&debug).expect("write");
+    let debug = crate::built_debug("lipschitz");
     let mut host = CpuBuild::load(&debug).expect("load").start_with(1).expect("start");
     let err = host.call_export("bound_at", &[]).expect_err("a panic").to_string();
     assert!(err.contains("a Lipschitz bound of 0.5 for |distance| < 0.1 is too small"), "{err}");

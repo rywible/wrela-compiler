@@ -423,13 +423,11 @@ impl AstWalker {
                 self.expr(value);
             }
             StmtKind::Expr(e) => self.expr(e),
-            StmtKind::While { cond, body } => {
+            StmtKind::While { pat, cond, body } => {
+                if let Some(p) = pat {
+                    self.pat(p);
+                }
                 self.expr(cond);
-                self.block(body);
-            }
-            StmtKind::WhileLet { pat, init, body } => {
-                self.pat(pat);
-                self.expr(init);
                 self.block(body);
             }
             StmtKind::Loop { body } => self.block(body),

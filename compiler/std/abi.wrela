@@ -1,0 +1,122 @@
+// The ABI's numbers that std shares with the hosts (runtime/abi), for std's modules alone.
+// Generated from the wrela-abi crate: don't edit; run `cargo run -p wrela-abi --bin generate`.
+
+/// The allocator's state: std's own words, from here on.
+pub(package) const ALLOC_STATE: u32 = 16
+
+/// Bumped whenever work appears: the helpers wait on it.
+pub(package) const PAR_WAKE: u32 = 256
+
+/// Nonzero once the host wants its helpers to return.
+pub(package) const PAR_SHUTDOWN: u32 = 260
+
+/// How many chunks the helpers have run, ever.
+pub(package) const PAR_HELPED: u32 = 264
+
+/// Microseconds a helper holds back each long job's result (tests).
+pub(package) const PAR_HOLD: u32 = 268
+
+/// Nonzero when the host wants the ticker's state hash.
+pub(package) const TICK_WANT_HASH: u32 = 512
+
+/// The state hash the ticker reported last, a `u64`.
+pub(package) const TICK_HASH: u32 = 520
+
+/// The sim clock's origin, an `f64`: when tick 0 was due.
+pub(package) const TICK_ORIGIN: u32 = 528
+
+/// The most threads a program runs on.
+pub(package) const THREADS: u32 = 11
+
+/// The threads' blocks, one after another.
+pub(package) const THREAD_BLOCKS: u32 = 1114112
+
+/// The bytes of each thread's block.
+pub(package) const THREAD_BLOCK_SIZE: u32 = 8192
+
+/// A block's parallel job: its generation.
+pub(package) const JOB_GENERATION: u32 = 0
+
+/// Its ticket: the generation's low 16 bits, then the next chunk.
+pub(package) const JOB_TICKET: u32 = 4
+
+/// Its task.
+pub(package) const JOB_TASK: u32 = 8
+
+/// Its task's context.
+pub(package) const JOB_CONTEXT: u32 = 12
+
+/// How many chunks it has.
+pub(package) const JOB_CHUNKS: u32 = 16
+
+/// How many of its chunks are done: its thread waits on it.
+pub(package) const JOB_DONE: u32 = 20
+
+/// 0, or 1 + the number of a helper that trapped in a chunk.
+pub(package) const JOB_FAILED: u32 = 24
+
+/// The bit a host sets in `JOB_DONE` when a helper traps.
+pub(package) const JOB_DONE_FAILED: u32 = 2147483648
+
+/// How many chunks of other threads' jobs a thread runs, one inside another.
+pub(package) const DEPTH: u32 = 28
+
+/// What a thread runs for another: a block's job, a slot, or 0.
+pub(package) const RUNNING: u32 = 32
+
+/// How many blocks a thread has allocated.
+pub(package) const ALLOCATIONS: u32 = 36
+
+/// How many times a thread waited at a join for a job a helper ran.
+pub(package) const JOIN_WAITS: u32 = 40
+
+/// How many times a thread found the allocator's lock taken.
+pub(package) const LOCK_WAITS: u32 = 44
+
+/// How many tries a thread spun on the allocator's lock.
+pub(package) const LOCK_SPINS: u32 = 48
+
+/// Where in a block a panic's message is: a `u32` byte count, then UTF-8.
+pub(package) const PANIC: u32 = 4096
+
+/// The long jobs' slots.
+pub(package) const JOB_SLOTS: u32 = 1212416
+
+/// How many slots there are.
+pub(package) const JOB_SLOT_COUNT: u32 = 256
+
+/// The bytes of each slot.
+pub(package) const JOB_SLOT_SIZE: u32 = 16
+
+/// The thread a slot's job ran on: the host writes it on a trap.
+pub(package) const SLOT_THREAD: u32 = 12
+
+/// A slot's state when it holds no job.
+pub(package) const SLOT_FREE: u32 = 0
+
+/// A slot's state when its job trapped: the host writes it.
+pub(package) const SLOT_FAILED: u32 = 5
+
+/// The next tick's records: a `u32` count, then input events.
+pub(package) const TICK_RECORDS: u32 = 1228800
+
+/// The most records a tick takes.
+pub(package) const MAX_TICK_RECORDS: u32 = 256
+
+/// The bytes of an input event.
+pub(package) const EVENT_SIZE: u32 = 24
+
+/// Where `__audio` leaves a quantum's samples.
+pub(package) const AUDIO_OUT: u32 = 1245184
+
+/// The audio thread's sample rate, in hertz.
+pub(package) const AUDIO_SAMPLE_RATE: u32 = 48000
+
+/// How many samples one `__audio` call renders.
+pub(package) const AUDIO_QUANTUM: u32 = 128
+
+/// A request's status while it isn't answered.
+pub(package) const REQUEST_PENDING: i32 = -1
+
+/// A request's status once it has failed.
+pub(package) const REQUEST_FAILED: i32 = -2

@@ -30,6 +30,23 @@ pub(crate) fn param_passing(
     }
 }
 
+/// The IR scalar of a number type's kind (an integer's or a float's).
+fn scalar_of(k: &TyKind) -> Option<ir::Scalar> {
+    Some(match k {
+        TyKind::Int(IntTy::I8) => ir::Scalar::I8,
+        TyKind::Int(IntTy::U8) => ir::Scalar::U8,
+        TyKind::Int(IntTy::I16) => ir::Scalar::I16,
+        TyKind::Int(IntTy::U16) => ir::Scalar::U16,
+        TyKind::Int(IntTy::I32) => ir::Scalar::I32,
+        TyKind::Int(IntTy::U32) => ir::Scalar::U32,
+        TyKind::Int(IntTy::I64) => ir::Scalar::I64,
+        TyKind::Int(IntTy::U64) => ir::Scalar::U64,
+        TyKind::Float(FloatTy::F32) => ir::Scalar::F32,
+        TyKind::Float(FloatTy::F64) => ir::Scalar::F64,
+        _ => return None,
+    })
+}
+
 /// How a capture of a closure crosses into the closure's lifted function.
 pub(crate) fn capture_passing(
     target: ir::Target,
@@ -74,41 +91,18 @@ impl<'a> Cx<'a> {
         let gpu = mb.target() == ir::Target::Gpu;
         let out = match k {
             TyKind::Bool => Some(mb.m.types.bool()),
-            TyKind::Int(i) => {
-                let s = match i {
-                    IntTy::I8 => ir::Scalar::I8,
-                    IntTy::U8 => ir::Scalar::U8,
-                    IntTy::I16 => ir::Scalar::I16,
-                    IntTy::U16 => ir::Scalar::U16,
-                    IntTy::I32 => ir::Scalar::I32,
-                    IntTy::U32 => ir::Scalar::U32,
-                    IntTy::I64 => ir::Scalar::I64,
-                    IntTy::U64 => ir::Scalar::U64,
-                };
+            TyKind::Int(_) | TyKind::Float(_) => scalar_of(k).map(|s| {
                 if gpu && !s.on_gpu() {
                     self.cpu_only(mb, s.name(), span);
                 }
-                Some(mb.m.types.scalar(s))
-            }
-            TyKind::Float(f) => {
-                let s = if *f == FloatTy::F32 { ir::Scalar::F32 } else { ir::Scalar::F64 };
-                if gpu && !s.on_gpu() {
-                    self.cpu_only(mb, s.name(), span);
-                }
-                Some(mb.m.types.scalar(s))
-            }
-            &TyKind::Vec(e, n) => {
-                let s = match e {
-                    VecElem::F32 => ir::Scalar::F32,
-                    VecElem::I32 => ir::Scalar::I32,
-                    VecElem::U32 => ir::Scalar::U32,
-                    VecElem::F64 => ir::Scalar::F64,
-                };
+                mb.m.types.scalar(s)
+            }),
+            &TyKind::Vec(e, n) => scalar_of(&e.kind()).map(|s| {
                 if gpu && !e.on_gpu() {
-                    self.cpu_only(mb, &format!("vec{n}d"), span);
+                    self.cpu_only(mb, &format!("vec{n}{}", e.suffix()), span);
                 }
-                Some(mb.m.types.vector_of(s, n))
-            }
+                mb.m.types.vector_of(s, n)
+            }),
             TyKind::Mat(n) => Some(mb.m.types.intern(ir::TypeDef::Matrix(*n))),
             // A run of UTF-8: a run of bytes, on the CPU.
             TyKind::Str => {

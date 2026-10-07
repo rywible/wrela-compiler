@@ -1,58 +1,16 @@
-// Sketch 03's program (compiler/tests/tests/suite/sketches.rs): the sketch is `sketch.wrela`;
-// this module is the program's interface to the host. A herd of 40 grazers and a player who
-// walks in a circle and digs now and then, ticked through the engine's `Timeline` one tick per
-// frame.
+// Sketch 03's program (compiler/tests/tests/suite/sketches.rs): the sketch is `sketch.wrela`,
+// and its world at tick 0 is `start.wrela`; this module is the program's interface to the host.
+// A herd of 40 grazers and a player who walks in a circle and digs now and then, ticked through
+// the engine's `Timeline` one tick per frame.
 
-use engine::rng::{Rng, seed}
-use engine::sim::{CreatureKey, GaitState, Mode, SimTier, Tick, Transform}
+use engine::sim::{Mode, Tick}
 use engine::timeline::Timeline
-use grazer::sketch::GrazerSim
-use sketch::{
-    Edit, PlayerSim, SaveError, Terrain, TerrainField, TickInput, World, load_save, save_game,
-    scare, spook, tick,
-}
-use std::arena::Arena
+use sketch::{SaveError, TickInput, World, load_save, save_game, scare, spook, tick}
+use start::world
 use std::hash::state_hash
 
 pub struct Game {
     timeline: Timeline<World, TickInput>,
-}
-
-const HERD: u32 = 40
-
-/// The world at tick 0: grazers in a ring of 20 m, the player in its middle.
-fn world() -> World {
-    var grazers: Arena<GrazerSim> = Arena::new()
-    let rng = Rng::new(seed(3))
-    for i in 0..HERD {
-        let a = 6.2831853 * f32(i) / f32(HERD)
-        let gait = GaitState { phase: f32(i % 7) / 7.0, speed: 0.5, turn: 0.0, mode: Mode::Walk }
-        let _ = grazers.insert(
-            GrazerSim {
-                kind: CreatureKey { kind: 1, seed: seed(i + 1) },
-                tier: if i % 4 == 0 { SimTier::Full } else { SimTier::Ambient },
-                rng: rng.split(i),
-                root: Transform {
-                    pos: vec3(20.0 * cos(a), 0.0, 20.0 * sin(a)),
-                    heading: a + 1.5707964,
-                },
-                gait,
-                pose: gait.pose(),
-            },
-        )
-    }
-    var players: Arena<PlayerSim> = Arena::new()
-    let _ = players.insert(PlayerSim { root: Transform { pos: vec3(0.0, 0.0, 0.0), heading: 0.0 } })
-    World {
-        tick: 0,
-        seed: seed(3),
-        terrain: Terrain {
-            base: TerrainField { height: 0.0, roll: 0.5, wavelength: 8.0 },
-            edits: Vec::new(),
-        },
-        grazers,
-        players,
-    }
 }
 
 /// The input for tick `t`: the player walks a circle of 25 m, and digs every 30 ticks.

@@ -238,13 +238,6 @@ impl Event {
         Event { kind: EventKind::Text, modifiers: 0, words: [c as u32, 0, 0, 0] }
     }
 
-    /// An event from its bytes: `None` for a kind this ABI doesn't know.
-    pub fn from_bytes(b: &[u8; EVENT_SIZE as usize]) -> Option<Event> {
-        let w = |i: usize| u32::from_le_bytes([b[4 * i], b[4 * i + 1], b[4 * i + 2], b[4 * i + 3]]);
-        let kind = EventKind::ALL.into_iter().find(|k| *k as u32 == w(0))?;
-        Some(Event { kind, modifiers: w(1), words: [w(2), w(3), w(4), w(5)] })
-    }
-
     /// Its [`EVENT_SIZE`] bytes, as the program reads them.
     pub fn bytes(&self) -> [u8; EVENT_SIZE as usize] {
         let mut out = [0u8; EVENT_SIZE as usize];

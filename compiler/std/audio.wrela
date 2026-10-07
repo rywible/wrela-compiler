@@ -7,24 +7,21 @@
 // makes the voice a task (`std::mem::task`), with the voice's address as its context, which
 // the host's audio thread runs a quantum at a time through `audio` (wrela_abi's `__audio`).
 
-use std::alloc::alloc
-use std::mem::{align_of, atomic_load, atomic_store, read, run_task, size_of, store_u32, task, write}
+use std::abi::{AUDIO_OUT, AUDIO_QUANTUM, AUDIO_SAMPLE_RATE}
+use std::alloc::{alloc, place}
+use std::mem::{atomic_load, atomic_store, read, run_task, size_of, store_u32, task, write}
 
-/// The audio thread's sample rate, in hertz.
-pub const SAMPLE_RATE: u32 = 48000
+/// The audio thread's sample rate, in hertz: 48000.
+pub const SAMPLE_RATE: u32 = AUDIO_SAMPLE_RATE
 
-/// How many samples a voice renders per call: one Web Audio render quantum.
-pub const QUANTUM: u32 = 128
-
-/// Where a quantum's samples go for the host: wrela_abi::memory::AUDIO_OUT. (This and the rate
-/// and quantum above are copies of wrela_abi's, and a test there checks them.)
-const OUT: u32 = 1245184
+/// How many samples a voice renders per call: one Web Audio render quantum, 128.
+pub const QUANTUM: u32 = AUDIO_QUANTUM
 
 /// A voice's state, how it renders, and its quantum's samples: what the audio thread owns.
 pub(package) struct Voice<S, R> {
     state: S,
     render: R,
-    out: [f32; 128],
+    out: [f32; QUANTUM],
 }
 
 /// Starts the program's voice. From now on the audio thread calls `render(mut state, mut out)`
@@ -34,8 +31,7 @@ pub(package) struct Voice<S, R> {
 /// program has one voice: a second `play` traps.
 pub fn play<S, R: @audio fn(mut S, mut [f32])>(state: take S, render: R) {
     unsafe {
-        let voice = alloc(size_of::<Voice<S, R>>(), align_of::<Voice<S, R>>())
-        write(voice, Voice { state: take state, render, out: [0.0; QUANTUM] })
+        let voice = place(Voice { state: take state, render, out: [0.0; QUANTUM] })
         start_voice(task(render_quantum::<S, R>), voice)
     }
 }
@@ -46,14 +42,14 @@ pub fn play<S, R: @audio fn(mut S, mut [f32])>(state: take S, render: R) {
 @effects(io)
 pub(package) fn start_voice(task: u32, voice: u32) {}
 
-/// One quantum of the voice: its samples, rendered and left at `OUT`. (`quantum` is the task's
-/// chunk, unused.)
+/// One quantum of the voice: its samples, rendered and left at `AUDIO_OUT`. (`quantum` is the
+/// task's chunk, unused.)
 fn render_quantum<S, R: @audio fn(mut S, mut [f32])>(quantum: u32, voice: mut Voice<S, R>) {
     borrow render = voice.render
     render(mut voice.state, mut voice.out)
     unsafe {
         for i in 0..QUANTUM {
-            write(OUT + 4 * i, voice.out[i])
+            write(AUDIO_OUT + 4 * i, voice.out[i])
         }
     }
 }

@@ -115,6 +115,21 @@ impl Fl<'_, '_> {
         self.emit(ir::Stmt::Eval(ir::Expr::Mem(ir::MemOp::Panic, vec![addr, len])));
     }
 
+    /// Panics with `s` if `cond` holds.
+    fn panic_if(&mut self, cond: ir::ValueId, s: &str) {
+        self.push_block();
+        self.panic_text(s);
+        let then = self.pop_block();
+        self.emit(ir::Stmt::If { cond, then, else_: Vec::new() });
+    }
+
+    /// Panics with `s` if the `u32` `i` isn't below `len`.
+    fn check_below(&mut self, i: ir::ValueId, len: ir::ValueId, s: &str) {
+        let b = self.mb.m.types.bool();
+        let past = self.value(b, ir::Expr::Binary(ir::BinOp::Ge, i, len));
+        self.panic_if(past, s);
+    }
+
     /// The run a place passes as for a `[T]` or `str` parameter (`run_t`): an array's, a
     /// `Vec`'s elements, a `Text`'s or a `String`'s UTF-8, or the run it is.
     pub fn run_of(&mut self, p: &mir::Place, run_t: ir::TypeId) -> Option<ir::ValueId> {
@@ -167,12 +182,7 @@ impl Fl<'_, '_> {
         let (fl, _) = self.cx.field(self.mb, vec_ty, None, 1, span)?;
         let data = self.load(vec.with(ir::Proj::Field(fd)), u);
         let len = self.load(vec.with(ir::Proj::Field(fl)), u);
-        let b = self.mb.m.types.bool();
-        let past = self.value(b, ir::Expr::Binary(ir::BinOp::Ge, i, len));
-        self.push_block();
-        self.panic_text("index out of range: past the end of a `Vec`");
-        let then = self.pop_block();
-        self.emit(ir::Stmt::If { cond: past, then, else_: Vec::new() });
+        self.check_below(i, len, "index out of range: past the end of a `Vec`");
         let stride = ir::layout::array_stride(&self.mb.m.types, et);
         let s = self.u32c(stride);
         let off = self.value(u, ir::Expr::Binary(ir::BinOp::Mul, i, s));
@@ -191,12 +201,7 @@ impl Fl<'_, '_> {
             let (fl, _) = self.cx.field(self.mb, b_ty, None, 1, span)?;
             let u = self.u32_ty();
             let len = self.load(b.clone().with(ir::Proj::Field(fl)), u);
-            let bt = self.mb.m.types.bool();
-            let past = self.value(bt, ir::Expr::Binary(ir::BinOp::Ge, i, len));
-            self.push_block();
-            self.panic_text("index out of range: past the elements of a `Bounded`");
-            let then = self.pop_block();
-            self.emit(ir::Stmt::If { cond: past, then, else_: Vec::new() });
+            self.check_below(i, len, "index out of range: past the elements of a `Bounded`");
         }
         Some(b.with(ir::Proj::Field(fi)).with(ir::Proj::Index(i)))
     }
@@ -230,10 +235,7 @@ impl Fl<'_, '_> {
             let live = self.load(slot.with(ir::Proj::Field(sg)), u);
             let b = self.mb.m.types.bool();
             let stale = self.value(b, ir::Expr::Binary(ir::BinOp::Ne, live, generation));
-            self.push_block();
-            self.panic_text("a stale handle: its value was removed from the arena");
-            let then = self.pop_block();
-            self.emit(ir::Stmt::If { cond: stale, then, else_: Vec::new() });
+            self.panic_if(stale, "a stale handle: its value was removed from the arena");
             self.load(slot.with(ir::Proj::Field(sa)), u)
         } else {
             index
@@ -482,15 +484,14 @@ impl Fl<'_, '_> {
             Lang::MemWaitFor => mem(self, M::WaitFor, 3, Some(u)),
             Lang::MemTask => crate::task::task(self, substs, c),
             Lang::StartVoice | Lang::StartTicker => {
-                let n = if lang == Lang::StartVoice { 2 } else { 3 };
-                let args: Option<Vec<ir::ValueId>> = (0..n).map(|k| arg(self, k)).collect();
-                let op = if lang == Lang::StartVoice {
+                let (op, n) = if lang == Lang::StartVoice {
                     self.mb.m.audio = true;
-                    ir::HostOp::Audio
+                    (ir::HostOp::Audio, 2)
                 } else {
                     self.mb.m.tick = true;
-                    ir::HostOp::Tick
+                    (ir::HostOp::Tick, 3)
                 };
+                let args: Option<Vec<ir::ValueId>> = (0..n).map(|k| arg(self, k)).collect();
                 self.emit(ir::Stmt::Eval(ir::Expr::Host(op, args?)));
                 None
             }

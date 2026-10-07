@@ -21,7 +21,9 @@
 
 use crate::single_exit::single_exit;
 use crate::*;
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 
 /// Flattens a GPU module (see the module docs).
 pub fn flatten_gpu(m: &mut Module) -> Result<()> {
@@ -70,25 +72,15 @@ const MERGE_SIZE: usize = 3 * SELECT_SIZE;
 /// there).
 fn if_convert(m: &Module, f: &mut Function) {
     let mut body = std::mem::take(&mut f.body);
-    if_convert_block(m, f, &mut body);
+    // The innermost first: a converted `if` makes the one around it straight too.
+    visit::expand(&mut body, &mut |s, b| match s {
+        Stmt::If { cond, then, else_ } => match as_selects(m, f, cond, &then, &else_) {
+            Some(straight) => b.extend(straight),
+            None => b.push(Stmt::If { cond, then, else_ }),
+        },
+        s => b.push(s),
+    });
     f.body = body;
-}
-
-fn if_convert_block(m: &Module, f: &mut Function, b: &mut Block) {
-    let old = std::mem::take(b);
-    for mut s in old {
-        // The innermost first: a converted `if` makes the one around it straight too.
-        for inner in s.blocks_mut() {
-            if_convert_block(m, f, inner);
-        }
-        match s {
-            Stmt::If { cond, then, else_ } => match as_selects(m, f, cond, &then, &else_) {
-                Some(straight) => b.extend(straight),
-                None => b.push(Stmt::If { cond, then, else_ }),
-            },
-            s => b.push(s),
-        }
-    }
 }
 
 /// `if cond { then } else { else_ }` as straight-line code, if its sides only compute (pure
@@ -104,9 +96,27 @@ fn as_selects(
     // A small branch's size counts its sides' `At`s too, though they compute nothing: the
     // GPU ratios were measured with that count. A larger one's counts what its sides compute.
     let size = then.len() + else_.len();
-    let computed = then.iter().chain(else_).filter(|st| !matches!(st, Stmt::At(_))).count();
-    if size == 0 || computed > MERGE_SIZE {
+    if size == 0 || size_of(then) + size_of(else_) > MERGE_SIZE {
         return None;
+    }
+    // Sides that only compute and set whole scalar or vector locals: the locals, in the order
+    // first set.
+    let mut stored: Vec<LocalId> = Vec::new();
+    for st in then.iter().chain(else_) {
+        match st {
+            Stmt::Store(p, _) => {
+                let l = p.root_local().filter(|_| p.path.is_empty())?;
+                if !selectable(m, f.locals[l.index()].ty) {
+                    return None;
+                }
+                if !stored.contains(&l) {
+                    stored.push(l);
+                }
+            }
+            Stmt::Let(_, e) if select_safe(m, e) => {}
+            Stmt::At(_) => {}
+            _ => return None,
+        }
     }
     // A side's load of what it stored before reads that value.
     let forward = |side: &Block| -> Block {
@@ -139,29 +149,15 @@ fn as_selects(
         out
     };
     let (then, else_) = (&forward(then), &forward(else_));
-    let register = |t: TypeId| matches!(m.types.get(t), TypeDef::Scalar(_) | TypeDef::Vector(..));
-    // What each side stores: its last value for each local, in the order first stored.
-    let mut stored: Vec<LocalId> = Vec::new();
-    let mut sides: [HashMap<LocalId, ValueId>; 2] = [HashMap::new(), HashMap::new()];
-    for (k, side) in [then, else_].into_iter().enumerate() {
-        for st in side {
-            match st {
-                Stmt::Store(p, v) => {
-                    let l = p.root_local().filter(|_| p.path.is_empty())?;
-                    if !register(f.locals[l.index()].ty) {
-                        return None;
-                    }
-                    if !stored.contains(&l) {
-                        stored.push(l);
-                    }
-                    sides[k].insert(l, *v);
-                }
-                Stmt::Let(_, e) if select_safe(m, e) => {}
-                Stmt::At(_) => {}
-                _ => return None,
-            }
-        }
-    }
+    // What each side stores: its last value for each local.
+    let sides: [HashMap<LocalId, ValueId>; 2] = [then, else_].map(|side| {
+        side.iter()
+            .filter_map(|st| match st {
+                Stmt::Store(p, v) => Some((p.root_local()?, *v)),
+                _ => None,
+            })
+            .collect()
+    });
     // A side's load of a local either side stores would read it too soon.
     let reads_stored = [then, else_].into_iter().flatten().any(|st| match st {
         Stmt::Let(_, Expr::Load(p)) => p.root_local().is_some_and(|l| stored.contains(&l)),
@@ -180,17 +176,16 @@ fn as_selects(
     let side = |f: &mut Function, k: usize, l: LocalId, out: &mut Block| match sides[k].get(&l) {
         Some(&v) => v,
         None => {
-            let old = f.new_value(f.locals[l.index()].ty);
-            out.push(Stmt::Let(old, Expr::Load(Place::local(l))));
-            old
+            let t = f.locals[l.index()].ty;
+            f.let_(out, t, Expr::Load(Place::local(l)))
         }
     };
     if size <= SELECT_SIZE {
         // Both sides whole, each local set to a select of its two values.
         for l in stored {
             let (yes, no) = (side(f, 0, l, &mut out), side(f, 1, l, &mut out));
-            let v = f.new_value(f.locals[l.index()].ty);
-            out.push(Stmt::Let(v, Expr::Select { cond, if_true: yes, if_false: no }));
+            let t = f.locals[l.index()].ty;
+            let v = f.let_(&mut out, t, Expr::Select { cond, if_true: yes, if_false: no });
             out.push(Stmt::Store(Place::local(l), v));
         }
         return Some(out);
@@ -199,8 +194,7 @@ fn as_selects(
     // at least two thirds of the smaller side ([`Merger`]), and the straight-line code computes
     // at most a small branch's worth more than the larger side alone (what a SIMD group whose
     // invocations agree runs). A guard's sides share nothing: it stays a branch.
-    let computes = |side: &Block| side.iter().filter(|st| !matches!(st, Stmt::At(_))).count();
-    let (a, b) = (computes(then), computes(else_));
+    let (a, b) = (size_of(then), size_of(else_));
     let (larger, smaller) = (a.max(b), a.min(b));
     let mark = f.values.len();
     let mut merger = Merger {
@@ -209,7 +203,7 @@ fn as_selects(
         defs: [then, else_].map(|side| {
             side.iter()
                 .filter_map(|st| match st {
-                    Stmt::Let(v, e) => Some((*v, e.clone())),
+                    Stmt::Let(v, e) => Some((*v, e)),
                     _ => None,
                 })
                 .collect()
@@ -240,6 +234,11 @@ fn as_selects(
     }
 }
 
+/// Whether a select can choose between values of type `t`: scalars and vectors.
+fn selectable(m: &Module, t: TypeId) -> bool {
+    matches!(m.types.get(t), TypeDef::Scalar(_) | TypeDef::Vector(..))
+}
+
 /// Matches up the two sides of a branch made into selects: a value of each side, defined by the
 /// same expression of (possibly) different operands, is that expression of their operands
 /// matched up, computed once; values that differ otherwise are selected between.
@@ -247,7 +246,7 @@ struct Merger<'a> {
     m: &'a Module,
     cond: ValueId,
     /// Each side's definitions.
-    defs: [HashMap<ValueId, Expr>; 2],
+    defs: [HashMap<ValueId, &'a Expr>; 2],
     /// The value made for each pair already matched up.
     done: HashMap<(ValueId, ValueId), ValueId>,
     /// How many expressions the two sides share (each computed once, not twice).
@@ -275,17 +274,18 @@ impl Merger<'_> {
         if f.values[no.index()] != t {
             return None;
         }
-        let float = matches!(self.m.types.get(t), TypeDef::Scalar(Scalar::F32 | Scalar::F64));
-        let shared = match (self.defs[0].get(&yes), self.defs[1].get(&no)) {
+        // GPU code has no `f64`s.
+        let float = self.m.types.as_scalar(t) == Some(Scalar::F32);
+        let shared = match (self.defs[0].get(&yes).copied(), self.defs[1].get(&no).copied()) {
             (Some(a), Some(b)) if same_shape(a, b) => Some((a.clone(), operands(a), operands(b))),
             // `-y` is `-0.0 - y`, exactly: a side that subtracts from what the other negates
             // (a derived gradient's `0 - y`, simplified) matches it.
             (Some(Expr::Unary(UnOp::Neg, y)), Some(Expr::Binary(BinOp::Sub, x2, y2))) if float => {
-                let zero = negative_zero(self.m, f, out, t);
+                let zero = f.let_(out, t, Expr::Const(Const::F32(-0.0)));
                 Some((Expr::Binary(BinOp::Sub, zero, *y), vec![zero, *y], vec![*x2, *y2]))
             }
             (Some(Expr::Binary(BinOp::Sub, x1, y1)), Some(Expr::Unary(UnOp::Neg, y))) if float => {
-                let zero = negative_zero(self.m, f, out, t);
+                let zero = f.let_(out, t, Expr::Const(Const::F32(-0.0)));
                 Some((Expr::Binary(BinOp::Sub, *x1, *y1), vec![*x1, *y1], vec![zero, *y]))
             }
             _ => None,
@@ -301,27 +301,15 @@ impl Merger<'_> {
                 self.shared += 1;
                 e
             }
-            None if matches!(self.m.types.get(t), TypeDef::Scalar(_) | TypeDef::Vector(..)) => {
+            None if selectable(self.m, t) => {
                 Expr::Select { cond: self.cond, if_true: yes, if_false: no }
             }
             None => return None,
         };
-        let v = f.new_value(t);
-        out.push(Stmt::Let(v, e));
+        let v = f.let_(out, t, e);
         self.done.insert((yes, no), v);
         Some(v)
     }
-}
-
-/// `-0.0` of the float type `t`, defined at the end of `out`.
-fn negative_zero(m: &Module, f: &mut Function, out: &mut Block, t: TypeId) -> ValueId {
-    let c = match m.types.get(t) {
-        TypeDef::Scalar(Scalar::F64) => Const::F64(-0.0),
-        _ => Const::F32(-0.0),
-    };
-    let v = f.new_value(t);
-    out.push(Stmt::Let(v, Expr::Const(c)));
-    v
 }
 
 /// An expression's operands, in order.
@@ -340,9 +328,17 @@ fn same_shape(a: &Expr, b: &Expr) -> bool {
         e
     };
     match (a, b) {
-        (Expr::Const(Const::F32(x)), Expr::Const(Const::F32(y))) => x.to_bits() == y.to_bits(),
-        (Expr::Const(Const::F64(x)), Expr::Const(Const::F64(y))) => x.to_bits() == y.to_bits(),
+        (Expr::Const(x), Expr::Const(y)) => same_const(x, y),
         _ => blank(a) == blank(b),
+    }
+}
+
+/// Whether two constants are the same, floats bit for bit (`0.0` isn't `-0.0`).
+fn same_const(a: &Const, b: &Const) -> bool {
+    match (a, b) {
+        (Const::F32(x), Const::F32(y)) => x.to_bits() == y.to_bits(),
+        (Const::F64(x), Const::F64(y)) => x.to_bits() == y.to_bits(),
+        _ => a == b,
     }
 }
 
@@ -371,19 +367,7 @@ fn live(code: Block) -> Block {
 /// control flow it's in).
 fn select_safe(m: &Module, e: &Expr) -> bool {
     match e {
-        Expr::Const(_)
-        | Expr::Zero(_)
-        | Expr::Unary(..)
-        | Expr::Binary(..)
-        | Expr::Construct(..)
-        | Expr::Extract(..)
-        | Expr::ExtractDyn(..)
-        | Expr::Splat(..)
-        | Expr::Swizzle(..)
-        | Expr::Convert(..)
-        | Expr::Bitcast(..)
-        | Expr::Select { .. } => true,
-        Expr::Builtin(b, _) => !matches!(b, Builtin::Dpdx | Builtin::Dpdy | Builtin::Fwidth),
+        Expr::Builtin(Builtin::Dpdx | Builtin::Dpdy | Builtin::Fwidth, _) => false,
         Expr::Load(p) => match p.root {
             PlaceRoot::Local(_) => true,
             PlaceRoot::Resource(r) => {
@@ -391,7 +375,7 @@ fn select_safe(m: &Module, e: &Expr) -> bool {
             }
             _ => false,
         },
-        _ => false,
+        e => e.only_computes(),
     }
 }
 
@@ -423,13 +407,7 @@ fn collapse_rebuilds(f: &mut Function) {
         return;
     }
     // A rebuilt value of a rebuilt value is the first.
-    let resolve = |mut v: ValueId| {
-        while let Some(Some(y)) = rename.get(v.index()) {
-            v = *y;
-        }
-        v
-    };
-    visit::walk_mut(&mut f.body, &mut |s| s.for_each_value_mut(&mut |x| *x = resolve(*x)));
+    visit::walk_mut(&mut f.body, &mut |s| s.for_each_value_mut(&mut |x| *x = resolve(&rename, *x)));
 }
 
 // ---- common subexpressions -------------------------------------------------------------------
@@ -444,28 +422,45 @@ fn cse(f: &mut Function) {
     f.body = body;
 }
 
-fn cse_key(e: &Expr) -> Option<String> {
-    match e {
-        Expr::Const(_)
-        | Expr::Zero(_)
-        | Expr::Unary(..)
-        | Expr::Binary(..)
-        | Expr::Builtin(..)
-        | Expr::Construct(..)
-        | Expr::Extract(..)
-        | Expr::ExtractDyn(..)
-        | Expr::Splat(..)
-        | Expr::Swizzle(..)
-        | Expr::Convert(..)
-        | Expr::Bitcast(..)
-        | Expr::Select { .. } => Some(format!("{e:?}")),
-        _ => None,
+/// An expression as `cse` tells them apart: as `==` does, but with float constants the same bit
+/// for bit (`0.0` isn't `-0.0`).
+struct CseKey(Expr);
+
+impl PartialEq for CseKey {
+    fn eq(&self, other: &CseKey) -> bool {
+        match (&self.0, &other.0) {
+            (Expr::Const(a), Expr::Const(b)) => same_const(a, b),
+            (a, b) => a == b,
+        }
+    }
+}
+
+impl Eq for CseKey {}
+
+impl Hash for CseKey {
+    fn hash<H: Hasher>(&self, h: &mut H) {
+        std::mem::discriminant(&self.0).hash(h);
+        match &self.0 {
+            Expr::Const(c) => match *c {
+                Const::Bool(b) => b.hash(h),
+                Const::I32(x) => x.hash(h),
+                Const::U32(x) => x.hash(h),
+                Const::I64(x) => x.hash(h),
+                Const::U64(x) => x.hash(h),
+                Const::Small(s, x) => (s, x).hash(h),
+                Const::F32(x) => x.to_bits().hash(h),
+                Const::F64(x) => x.to_bits().hash(h),
+            },
+            Expr::Zero(t) => t.hash(h),
+            Expr::Extract(x, k) => (x, k).hash(h),
+            e => e.for_each_value(&mut |v| v.hash(h)),
+        }
     }
 }
 
 /// `seen`: the expressions computed in `b` and in the blocks around it, which its statements can
 /// use. What `b` adds goes again when it ends.
-fn cse_block(b: &mut Block, rename: &mut [Option<ValueId>], seen: &mut HashMap<String, ValueId>) {
+fn cse_block(b: &mut Block, rename: &mut [Option<ValueId>], seen: &mut HashMap<CseKey, ValueId>) {
     let mut added = Vec::new();
     let old = std::mem::take(b);
     for mut s in old {
@@ -475,16 +470,13 @@ fn cse_block(b: &mut Block, rename: &mut [Option<ValueId>], seen: &mut HashMap<S
             }
         });
         match s {
-            Stmt::Let(v, ref e) if !e.has_effect() => match cse_key(e) {
-                Some(k) => match seen.get(&k) {
-                    Some(&w) => rename[v.index()] = Some(w),
-                    None => {
-                        seen.insert(k.clone(), v);
-                        added.push(k);
-                        b.push(s);
-                    }
-                },
-                None => b.push(s),
+            Stmt::Let(v, ref e) if e.only_computes() => match seen.entry(CseKey(e.clone())) {
+                Entry::Occupied(o) => rename[v.index()] = Some(*o.get()),
+                Entry::Vacant(slot) => {
+                    added.push(CseKey(e.clone()));
+                    slot.insert(v);
+                    b.push(s);
+                }
             },
             Stmt::If { cond, mut then, mut else_ } => {
                 cse_block(&mut then, rename, seen);
@@ -557,7 +549,7 @@ fn promote_block(
                 if p.root_local()
                     .and_then(|l| stored.get(&l))
                     .is_some_and(|&x| visible.contains(&renamed(rename, x)))
-                    && p.path.iter().all(|x| !matches!(x, Proj::Index(_))) =>
+                    && !p.has_index() =>
             {
                 let l = p.root_local().expect("a local");
                 let mut at = renamed(rename, stored[&l]);
@@ -649,17 +641,18 @@ fn scalars(m: &Module, t: TypeId, depth: u32) -> Option<usize> {
     }
 }
 
-/// Callees first: an order in which every function comes after those it calls.
-fn callee_order(m: &Module) -> Result<(Vec<usize>, Vec<bool>)> {
+/// Callees first: an order in which every function comes after those it calls; and how many
+/// calls each function has.
+fn callee_order(m: &Module) -> Result<(Vec<usize>, Vec<u32>)> {
     let n = m.functions.len();
     let mut order = Vec::new();
     let mut state = vec![0u8; n]; // 0 new, 1 visiting, 2 done
-    let mut called = vec![false; n];
+    let mut calls = vec![0u32; n];
     fn visit(
         m: &Module,
         f: usize,
         state: &mut [u8],
-        called: &mut [bool],
+        calls: &mut [u32],
         order: &mut Vec<usize>,
     ) -> Result<()> {
         match state[f] {
@@ -674,39 +667,41 @@ fn callee_order(m: &Module) -> Result<(Vec<usize>, Vec<bool>)> {
         }
         state[f] = 1;
         for g in visit::calls(&m.functions[f].body) {
-            called[g.index()] = true;
-            visit(m, g.index(), state, called, order)?;
+            calls[g.index()] += 1;
+            visit(m, g.index(), state, calls, order)?;
         }
         state[f] = 2;
         order.push(f);
         Ok(())
     }
     for f in 0..n {
-        visit(m, f, &mut state, &mut called, &mut order)?;
+        visit(m, f, &mut state, &mut calls, &mut order)?;
     }
-    Ok((order, called))
+    Ok((order, calls))
 }
 
 /// Which functions stay calls: big interval derivations that take and return only values a
 /// call passes in registers (scalars, vectors, and structs of them without arrays), and whose
-/// code, with
-/// what it inlines, only computes: no entry point's inputs, resources, barriers, atomics or
-/// textures. (Entry points are written whole.)
+/// code, with what it inlines, only computes: no entry point's inputs, barriers, atomics or
+/// textures, and no resources but the uniform data a specialized copy reads
+/// (`specialize_uniform_calls`). (Entry points are written whole.)
 fn outlined(m: &mut Module) -> Vec<bool> {
     // Small arguments' functions stay calls only where the inlined shader would be too big
     // to write (a creature's, the lens's): elsewhere every call is inlined, as M1 measured
     // fastest (a branch-free kernel the GPU compiler sees whole). There, a function given the
     // same uniform data from several places is specialized to it first, so it can stay a call.
-    let (keep, biggest) = outlined_with(m, false, &[]);
+    let Ok((order, calls)) = callee_order(m) else { return vec![false; m.functions.len()] };
+    let (keep, biggest) = outlined_with(m, &order, &calls, false, &[]);
     if biggest <= INLINE_LIMIT {
         return keep;
     }
-    let (keep, _) = outlined_with(m, true, &[]);
-    if flattened_size(m, &keep) <= SPECIALIZE_LIMIT {
+    let (keep, _) = outlined_with(m, &order, &calls, true, &[]);
+    if flattened_size(m, &order, &keep) <= SPECIALIZE_LIMIT {
         return keep;
     }
     let copies = specialize_uniform_calls(m);
-    outlined_with(m, true, &copies).0
+    let Ok((order, calls)) = callee_order(m) else { return vec![false; m.functions.len()] };
+    outlined_with(m, &order, &calls, true, &copies).0
 }
 
 /// Where a module calls a function with uniform data (a `load` of a read-only resource at a
@@ -718,11 +713,8 @@ fn outlined(m: &mut Module) -> Vec<bool> {
 /// each edge's root search, with the creature's numbers in the uniform.
 fn specialize_uniform_calls(m: &mut Module) -> Vec<bool> {
     type Key = (usize, Vec<(usize, Place)>);
-    let fixed = |m: &Module, p: &Place| {
-        matches!(p.root, PlaceRoot::Resource(r)
-            if matches!(m.resources[r.index()].kind, ResourceKind::Uniform { .. } | ResourceKind::StorageRead))
-            && p.path.iter().all(|x| !matches!(x, Proj::Index(_)))
-    };
+    // Whether the copy for a key reads parameter `i` from uniform data.
+    let gone = |k: &Key, i: usize| k.1.iter().any(|(j, _)| *j == i);
     // A call's key: its callee, and its arguments that are uniform data too big to pass in
     // registers, by position. (A function given a few numbers, a part's shape, is one function
     // for every part already.)
@@ -750,38 +742,22 @@ fn specialize_uniform_calls(m: &mut Module) -> Vec<bool> {
     // a load from a local that holds one (a parameter kept in a local: stored once, whole, and
     // never written again or lent).
     let loads_of = |m: &Module, f: &Function| {
+        let lent = address_taken(f);
         let mut stores = vec![0u32; f.locals.len()];
-        let mut lent = vec![false; f.locals.len()];
         visit::walk(&f.body, &mut |s| {
             if let Stmt::Store(p, _) = s
                 && let PlaceRoot::Local(l) = p.root
             {
                 stores[l.index()] += 1;
             }
-            if let Some(e) = s.expr() {
-                let by_place = match e {
-                    Expr::Call(_, args) => args.iter().any(|a| matches!(a, Arg::Place(_))),
-                    Expr::Addr(_) | Expr::Run(_) | Expr::Atomic(..) => true,
-                    _ => false,
-                };
-                if by_place {
-                    e.for_each_place(&mut |p| {
-                        if let PlaceRoot::Local(l) = p.root {
-                            lent[l.index()] = true;
-                        }
-                    });
-                }
-            }
         });
-        let constant = |p: &Place| p.path.iter().all(|x| !matches!(x, Proj::Index(_)));
         let mut loads: HashMap<ValueId, Place> = HashMap::new();
         let mut held: HashMap<LocalId, Place> = HashMap::new();
         visit::walk(&f.body, &mut |s| match s {
-            Stmt::Let(v, Expr::Load(p)) if fixed(m, p) => {
-                loads.insert(*v, p.clone());
-            }
-            Stmt::Let(v, Expr::Load(p)) if constant(p) => {
-                if let PlaceRoot::Local(l) = p.root
+            Stmt::Let(v, Expr::Load(p)) if !p.has_index() => {
+                if read_only(m, p) {
+                    loads.insert(*v, p.clone());
+                } else if let PlaceRoot::Local(l) = p.root
                     && let Some(at) = held.get(&l)
                 {
                     let mut at = at.clone();
@@ -809,75 +785,63 @@ fn specialize_uniform_calls(m: &mut Module) -> Vec<bool> {
         });
         loads
     };
+    // Each function's, found once: a call changed to call a copy leaves them as they were.
+    let mut loads: Vec<HashMap<ValueId, Place>> =
+        m.functions.iter().map(|f| loads_of(m, f)).collect();
     let mut made: HashMap<Key, FuncId> = HashMap::new();
     // GPU code doesn't recurse, and each copy has a parameter fewer: this ends.
     loop {
-        let mut fresh: Vec<Key> = Vec::new();
-        for f in &m.functions {
-            let loads = loads_of(m, f);
-            visit::walk(&f.body, &mut |s| {
-                if let Some(Expr::Call(g, args)) = s.expr()
-                    && let Some(k) = key(m, &loads, *g, args)
-                    && !made.contains_key(&k)
-                    && !fresh.contains(&k)
-                {
-                    fresh.push(k);
+        // Each call given uniform data calls its copy, if one is made; else a copy is made for
+        // it, which the next round calls. The keys new this round, in the order first found.
+        let mut fresh: HashMap<Key, usize> = HashMap::new();
+        for (i, loads) in loads.iter().enumerate() {
+            let mut body = std::mem::take(&mut m.functions[i].body);
+            visit::walk_mut(&mut body, &mut |s| {
+                let (Stmt::Let(_, e) | Stmt::Eval(e)) = s else { return };
+                let Expr::Call(g, args) = e else { return };
+                let Some(k) = key(m, loads, *g, args) else { return };
+                match made.get(&k) {
+                    Some(&h) => {
+                        retain_by_index(args, |j| !gone(&k, j));
+                        *g = h;
+                    }
+                    None => {
+                        let next = fresh.len();
+                        fresh.entry(k).or_insert(next);
+                    }
                 }
             });
+            m.functions[i].body = body;
         }
         if fresh.is_empty() {
             break;
         }
-        for k in fresh {
+        let mut fresh: Vec<(Key, usize)> = fresh.into_iter().collect();
+        fresh.sort_unstable_by_key(|(_, at)| *at);
+        for (k, _) in fresh {
             let mut g = m.functions[k.0].clone();
-            let gone: Vec<usize> = k.1.iter().map(|(i, _)| *i).collect();
-            let renumber = |j: u32| j - gone.iter().filter(|&&x| (x as u32) < j).count() as u32;
+            let kept = retain_by_index(&mut g.params, |i| !gone(&k, i));
+            let kept = |j: u32| kept[j as usize].expect("a kept parameter");
             visit::walk_mut(&mut g.body, &mut |s| {
                 if let Stmt::Let(_, e) = s
                     && let Expr::Param(j) = *e
                 {
                     *e = match k.1.iter().find(|(i, _)| *i as u32 == j) {
                         Some((_, p)) => Expr::Load(p.clone()),
-                        None => Expr::Param(renumber(j)),
+                        None => Expr::Param(kept(j)),
                     };
                 }
                 // By-reference parameters are places, named by number too.
                 s.for_each_place_mut(&mut |p| {
-                    if let PlaceRoot::Param(j) = p.root {
-                        p.root = PlaceRoot::Param(renumber(j));
+                    if let PlaceRoot::Param(j) = &mut p.root {
+                        *j = kept(*j);
                     }
                 });
             });
-            g.params = g
-                .params
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| !gone.contains(i))
-                .map(|(_, p)| p.clone())
-                .collect();
             g.name = format!("{}_u", g.name);
+            loads.push(loads_of(m, &g));
             m.functions.push(g);
             made.insert(k, FuncId(m.functions.len() as u32 - 1));
-        }
-        for i in 0..m.functions.len() {
-            let loads = loads_of(m, &m.functions[i]);
-            let mut body = std::mem::take(&mut m.functions[i].body);
-            visit::walk_mut(&mut body, &mut |s| {
-                let (Stmt::Let(_, e) | Stmt::Eval(e)) = s else { return };
-                let Expr::Call(g, args) = e else { return };
-                let Some(k) = key(m, &loads, *g, args) else { return };
-                if let Some(&h) = made.get(&k) {
-                    let gone: Vec<usize> = k.1.iter().map(|(i, _)| *i).collect();
-                    let rest = args
-                        .iter()
-                        .enumerate()
-                        .filter(|(i, _)| !gone.contains(i))
-                        .map(|(_, a)| a.clone())
-                        .collect();
-                    *e = Expr::Call(h, rest);
-                }
-            });
-            m.functions[i].body = body;
         }
     }
     let mut copies = vec![false; m.functions.len()];
@@ -900,26 +864,24 @@ const INLINE_LIMIT: usize = 16000;
 const SPECIALIZE_LIMIT: usize = 25000;
 
 /// Which functions stay calls (see `outlined`), with small arguments' functions too if
-/// `small_calls`; and the biggest entry point's size with what it inlines. A copy specialized
-/// to uniform data (`copies`) stays a call only where two calls or more share it: called once,
-/// it's inlined, as the function it copies would have been.
-fn outlined_with(m: &Module, small_calls: bool, copies: &[bool]) -> (Vec<bool>, usize) {
+/// `small_calls`; and the biggest entry point's size with what it inlines. `order` and `calls`
+/// are `callee_order`'s. A copy specialized to uniform data (`copies`) stays a call only where
+/// two calls or more share it: called once, it's inlined, as the function it copies would have
+/// been.
+fn outlined_with(
+    m: &Module,
+    order: &[usize],
+    calls: &[u32],
+    small_calls: bool,
+    copies: &[bool],
+) -> (Vec<bool>, usize) {
     let n = m.functions.len();
     let mut keep = vec![false; n];
-    let Ok((order, _)) = callee_order(m) else { return (keep, 0) };
     let entry: HashSet<usize> = m.entry_points.iter().map(|e| e.function.index()).collect();
     // A body's size with its inlined callees, and whether it only computes.
     let mut size = vec![0usize; n];
     let mut pure = vec![false; n];
-    let mut calls = vec![0u32; n];
-    for f in &m.functions {
-        visit::walk(&f.body, &mut |s| {
-            if let Some(Expr::Call(g, _)) = s.expr() {
-                calls[g.index()] += 1;
-            }
-        });
-    }
-    for f in order {
+    for &f in order {
         let func = &m.functions[f];
         let (mut sz, mut ok) = (0usize, true);
         visit::walk(&func.body, &mut |s| {
@@ -948,24 +910,15 @@ fn outlined_with(m: &Module, small_calls: bool, copies: &[bool]) -> (Vec<bool>, 
                     | Expr::ArrayLength(_) => ok = false,
                     _ => {}
                 }
-                e.for_each_place(&mut |p| {
+                e.for_each_place(&mut |p| match p.root {
+                    PlaceRoot::Local(_) | PlaceRoot::Data(_) => {}
+                    // A by-reference parameter is the caller's place, which the caller's call
+                    // checks (a kept function has none: `signature`).
+                    PlaceRoot::Param(_) => {}
                     // A copy specialized to uniform data reads it (`specialize_uniform_calls`).
-                    let readable = |r: ResourceId| {
-                        small_calls
-                            && matches!(e, Expr::Load(_))
-                            && matches!(
-                                m.resources[r.index()].kind,
-                                ResourceKind::Uniform { .. } | ResourceKind::StorageRead
-                            )
-                    };
-                    match p.root {
-                        PlaceRoot::Local(_) | PlaceRoot::Data(_) => {}
-                        // A by-reference parameter is the caller's place, which the caller's
-                        // call checks (a kept function has none: `signature`).
-                        PlaceRoot::Param(_) => {}
-                        PlaceRoot::Resource(r) if readable(r) => {}
-                        _ => ok = false,
-                    }
+                    PlaceRoot::Resource(_)
+                        if small_calls && matches!(e, Expr::Load(_)) && read_only(m, p) => {}
+                    _ => ok = false,
                 });
             }
         });
@@ -999,12 +952,12 @@ fn outlined_with(m: &Module, small_calls: bool, copies: &[bool]) -> (Vec<bool>, 
 
 /// Inlines every call but those to `keep`'s functions, callees first.
 fn inline_all(m: &mut Module, keep: &[bool]) -> Result<()> {
-    let (order, called) = callee_order(m)?;
+    let (order, calls) = callee_order(m)?;
     let n = m.functions.len();
     let mut exits: Vec<Option<Function>> = vec![None; n];
     for f in order {
         inline_into(m, f, &mut exits, keep, &[], None)?;
-        if called[f] {
+        if calls[f] > 0 {
             exits[f] = exit_form(m, f);
         }
     }
@@ -1171,23 +1124,13 @@ impl Inliner<'_> {
         };
         out.extend(copied);
         // The result, if a call inlined just now gave it.
-        let result = result.map(|mut r| {
-            while let Some(Some(w)) = self.rename.get(r.index()) {
-                r = *w;
-            }
-            r
-        });
+        let result = result.map(|r| resolve(&self.rename, r));
         // A body that never ends (it loops forever, or traps) has no `return` to take the
         // result from: what follows the call never runs, but needs a value.
-        let result = match (result, ty) {
-            (None, Some(t)) => {
-                let v = self.f.new_value(t);
-                out.push(Stmt::Let(v, Expr::Zero(t)));
-                Some(v)
-            }
+        Ok(match (result, ty) {
+            (None, Some(t)) => Some(self.f.let_(out, t, Expr::Zero(t))),
             (r, _) => r,
-        };
-        Ok(result)
+        })
     }
 }
 
@@ -1446,7 +1389,7 @@ fn split_locals(m: &Module, f: &mut Function) {
             parts[i] = ps.into_iter().map(|(n, t)| f.new_local(format!("{name}.{n}"), t)).collect();
         }
         let mut body = std::mem::take(&mut f.body);
-        split_block(m, f, &mut body, &parts);
+        split_block(f, &mut body, &parts);
         f.body = body;
     }
 }
@@ -1469,7 +1412,7 @@ fn split_parts(m: &Module, t: TypeId) -> Option<Vec<(String, TypeId)>> {
     }
 }
 
-fn split_block(m: &Module, f: &mut Function, b: &mut Block, parts: &[Vec<LocalId>]) {
+fn split_block(f: &mut Function, b: &mut Block, parts: &[Vec<LocalId>]) {
     // The split local a place is in, and the place in its field's (or component's) local.
     let inner = |p: &Place| -> Option<Place> {
         let l = p.root_local()?;
@@ -1485,42 +1428,29 @@ fn split_block(m: &Module, f: &mut Function, b: &mut Block, parts: &[Vec<LocalId
         let l = p.root_local()?;
         parts.get(l.index()).filter(|ls| !ls.is_empty() && p.path.is_empty())
     };
-    let old = std::mem::take(b);
-    for mut s in old {
-        for inner_block in s.blocks_mut() {
-            split_block(m, f, inner_block, parts);
+    visit::expand(b, &mut |s, b| match s {
+        Stmt::Store(ref p, v) if whole(p).is_some() => {
+            for (k, &l) in whole(p).expect("checked").iter().enumerate() {
+                let x = f.let_(b, f.locals[l.index()].ty, Expr::Extract(v, k as u32));
+                b.push(Stmt::Store(Place::local(l), x));
+            }
         }
-        match s {
-            Stmt::Store(ref p, v) if whole(p).is_some() => {
-                let ls = whole(p).expect("checked").clone();
-                for (k, l) in ls.into_iter().enumerate() {
-                    let x = f.new_value(f.locals[l.index()].ty);
-                    b.push(Stmt::Let(x, Expr::Extract(v, k as u32)));
-                    b.push(Stmt::Store(Place::local(l), x));
-                }
-            }
-            Stmt::Store(ref p, v) if inner(p).is_some() => {
-                b.push(Stmt::Store(inner(p).expect("checked"), v));
-            }
-            Stmt::Let(v, Expr::Load(ref p)) if whole(p).is_some() => {
-                let ls = whole(p).expect("checked").clone();
-                let xs: Vec<ValueId> = ls
-                    .into_iter()
-                    .map(|l| {
-                        let x = f.new_value(f.locals[l.index()].ty);
-                        b.push(Stmt::Let(x, Expr::Load(Place::local(l))));
-                        x
-                    })
-                    .collect();
-                b.push(Stmt::Let(v, Expr::Construct(f.value_ty(v), xs)));
-            }
-            Stmt::Let(v, Expr::Load(ref p)) if inner(p).is_some() => {
-                b.push(Stmt::Let(v, Expr::Load(inner(p).expect("checked"))));
-            }
-            s => b.push(s),
+        Stmt::Store(ref p, v) if inner(p).is_some() => {
+            b.push(Stmt::Store(inner(p).expect("checked"), v));
         }
-    }
-    let _ = m;
+        Stmt::Let(v, Expr::Load(ref p)) if whole(p).is_some() => {
+            let xs = whole(p)
+                .expect("checked")
+                .iter()
+                .map(|&l| f.let_(b, f.locals[l.index()].ty, Expr::Load(Place::local(l))))
+                .collect();
+            b.push(Stmt::Let(v, Expr::Construct(f.value_ty(v), xs)));
+        }
+        Stmt::Let(v, Expr::Load(ref p)) if inner(p).is_some() => {
+            b.push(Stmt::Let(v, Expr::Load(inner(p).expect("checked"))));
+        }
+        s => b.push(s),
+    });
 }
 
 /// Reads a part of a value built from its parts as that part: `Extract(Construct(t, xs), i)` is
@@ -1543,17 +1473,7 @@ fn forward_extracts(m: &Module, f: &mut Function) {
         return;
     }
     let mut rename: Vec<Option<ValueId>> = vec![None; f.values.len()];
-    fn go(
-        b: &mut Block,
-        built: &HashMap<ValueId, Vec<ValueId>>,
-        rename: &mut Vec<Option<ValueId>>,
-    ) {
-        let resolve = |rename: &[Option<ValueId>], mut v: ValueId| {
-            while let Some(Some(w)) = rename.get(v.index()) {
-                v = *w;
-            }
-            v
-        };
+    fn go(b: &mut Block, built: &HashMap<ValueId, Vec<ValueId>>, rename: &mut [Option<ValueId>]) {
         b.retain_mut(|s| {
             s.for_each_value_mut(&mut |x| *x = resolve(rename, *x));
             if let Stmt::Let(w, Expr::Extract(x, i)) = s
@@ -1568,19 +1488,10 @@ fn forward_extracts(m: &Module, f: &mut Function) {
             true
         });
     }
-    // The parts a construct holds are renamed as they're reached: each is defined before it.
+    // The parts a construct holds are renamed as they're reached: each is defined before it, so
+    // its renaming is known by then.
     let mut body = std::mem::take(&mut f.body);
     go(&mut body, &built, &mut rename);
-    // A construct's parts were recorded before renaming: read them through it again.
-    if rename.iter().any(Option::is_some) {
-        visit::walk_mut(&mut body, &mut |s| {
-            s.for_each_value_mut(&mut |x| {
-                while let Some(Some(w)) = rename.get(x.index()) {
-                    *x = *w;
-                }
-            })
-        });
-    }
     f.body = body;
 }
 
@@ -1608,11 +1519,7 @@ fn inert(m: &Module, f: &Function, e: &Expr) -> bool {
     if huge(m, e, f) {
         return false;
     }
-    let is_float = |v: ValueId| match m.types.get(f.value_ty(v)) {
-        TypeDef::Scalar(s) | TypeDef::Vector(s, _) => s.is_float(),
-        TypeDef::Matrix(_) => true,
-        _ => false,
-    };
+    let is_float = |v: ValueId| m.types.element_scalar(f.value_ty(v)).is_some_and(Scalar::is_float);
     let float = |v: ValueId| m.nan_message.is_none() && is_float(v);
     match e {
         Expr::Const(_)
@@ -1655,35 +1562,25 @@ fn drop_dead_values(m: &Module, f: &mut Function) {
         let mut uses = vec![0u32; f.values.len()];
         visit::walk(&f.body, &mut |s| s.for_each_value(&mut |v| uses[v.index()] += 1));
         let removable = |e: &Expr| match e {
-            Expr::Load(p) => {
-                m.local_storage(f, p).is_some()
-                    && p.path.iter().all(|x| !matches!(x, Proj::Index(_)))
-            }
+            Expr::Load(p) => m.local_storage(f, p).is_some() && !p.has_index(),
             e => inert(m, f, e),
         };
-        let mut dead = vec![false; f.values.len()];
+        let mut used = vec![true; f.values.len()];
         let mut any = false;
         visit::walk(&f.body, &mut |s| {
             if let Stmt::Let(v, e) = s
                 && uses[v.index()] == 0
                 && removable(e)
             {
-                dead[v.index()] = true;
+                used[v.index()] = false;
                 any = true;
             }
         });
         if !any {
             break;
         }
-        fn sweep(b: &mut Block, dead: &[bool]) {
-            b.retain_mut(|s| {
-                for inner in s.blocks_mut() {
-                    sweep(inner, dead);
-                }
-                !matches!(s, Stmt::Let(v, _) if dead[v.index()])
-            });
-        }
-        sweep(&mut f.body, &dead);
+        // A removable value has no effect, so `sweep` drops it; every store stays.
+        sweep(&mut f.body, &used, &vec![true; f.locals.len()]);
     }
     drop_dead_stores(m, f);
 }
@@ -1703,30 +1600,21 @@ fn sink_values(m: &Module, f: &mut Function) {
 type Arm = (HashSet<ValueId>, Vec<Stmt>);
 
 fn sink_block(m: &Module, f: &Function, b: &mut Block) {
-    fn deep(s: &Stmt, into: &mut HashSet<ValueId>) {
-        s.for_each_value(&mut |v| {
-            into.insert(v);
-        });
-        for inner in s.blocks() {
-            for t in inner {
-                deep(t, into);
-            }
-        }
-    }
-    fn deep_block(b: &Block) -> HashSet<ValueId> {
+    // The values statements and the blocks nested in them use.
+    let uses = |b: &[Stmt]| {
         let mut out = HashSet::new();
-        for s in b {
-            deep(s, &mut out);
-        }
+        visit::walk(b, &mut |s| {
+            s.for_each_value(&mut |v| {
+                out.insert(v);
+            })
+        });
         out
-    }
+    };
     let n = b.len();
     // Each value's users among the block's statements (counting what's nested in them).
     let mut users: HashMap<ValueId, Vec<usize>> = HashMap::new();
     for (j, s) in b.iter().enumerate() {
-        let mut u = HashSet::new();
-        deep(s, &mut u);
-        for v in u {
+        for v in uses(std::slice::from_ref(s)) {
             users.entry(v).or_default().push(j);
         }
     }
@@ -1735,7 +1623,7 @@ fn sink_block(m: &Module, f: &Function, b: &mut Block) {
         .iter()
         .map(|s| match s {
             Stmt::If { then, else_, .. } => {
-                Some([(deep_block(then), Vec::new()), (deep_block(else_), Vec::new())])
+                Some([(uses(then), Vec::new()), (uses(else_), Vec::new())])
             }
             _ => None,
         })
@@ -1849,29 +1737,31 @@ fn fold_block(b: Block, known: &mut HashMap<ValueId, bool>) -> Block {
 /// loads from that local. Any other write (through a pointer, a by-reference parameter or a
 /// run; a call; a host or memory operation) may change every other load.
 fn reuse_loads(m: &Module, f: &mut Function) {
-    let mut taken = vec![false; f.locals.len()];
-    visit::walk(&f.body, &mut |s| {
-        let mut mark = |p: &Place| {
-            if let Some(l) = p.root_local() {
-                taken[l.index()] = true;
-            }
-        };
-        match s.expr() {
-            Some(Expr::Addr(p) | Expr::Run(p) | Expr::Atomic(_, p, _)) => mark(p),
-            Some(Expr::Call(_, args)) => args.iter().for_each(|a| {
-                if let Arg::Place(p) = a {
-                    mark(p);
-                }
-            }),
-            _ => {}
-        }
-    });
+    let taken = address_taken(f);
     let mut cx = Reuse { m, f, taken, rename: Vec::new() };
     cx.rename = vec![None; cx.f.values.len()];
     let mut body = std::mem::take(&mut cx.f.body);
     cx.block(&mut body, &mut HashMap::new());
     cx.f.body = body;
     drop_dead_stores(m, f);
+}
+
+/// Which locals' addresses are taken: places in them that a pointer, a run, an atomic or a
+/// by-reference argument points to.
+fn address_taken(f: &Function) -> Vec<bool> {
+    let mut taken = vec![false; f.locals.len()];
+    visit::walk(&f.body, &mut |s| {
+        if let Some(e @ (Expr::Addr(_) | Expr::Run(_) | Expr::Atomic(..) | Expr::Call(..))) =
+            s.expr()
+        {
+            e.for_each_place(&mut |p| {
+                if let Some(l) = p.root_local() {
+                    taken[l.index()] = true;
+                }
+            });
+        }
+    });
+    taken
 }
 
 /// A load whose value is known: its value, and whether its place is in a local's own storage
@@ -2003,8 +1893,7 @@ fn drop_dead_stores(m: &Module, f: &mut Function) {
                 sweep(inner, read);
             }
             !matches!(s, Stmt::Store(p, _)
-                if p.root_local().is_some_and(|l| !read[l.index()])
-                    && p.path.iter().all(|x| !matches!(x, Proj::Index(_))))
+                if p.root_local().is_some_and(|l| !read[l.index()]) && !p.has_index())
         });
     }
     sweep(&mut f.body, &read);
@@ -2385,6 +2274,14 @@ fn keep_reachable(m: &mut Module, outlined: &[bool]) {
     }
 }
 
+/// `v` renamed, through each renaming in turn: a value may be renamed to one renamed again.
+fn resolve(rename: &[Option<ValueId>], mut v: ValueId) -> ValueId {
+    while let Some(Some(w)) = rename.get(v.index()) {
+        v = *w;
+    }
+    v
+}
+
 /// Keeps the items whose index `keep` holds for, in order: each one's new index, by its old one.
 fn retain_by_index<T>(items: &mut Vec<T>, keep: impl Fn(usize) -> bool) -> Vec<Option<u32>> {
     let mut remap = vec![None; items.len()];
@@ -2400,11 +2297,10 @@ fn retain_by_index<T>(items: &mut Vec<T>, keep: impl Fn(usize) -> bool) -> Vec<O
 }
 
 /// The statements a module flattened with `keep` holds: each entry point with what it inlines,
-/// and each kept function once, with what it inlines.
-fn flattened_size(m: &Module, keep: &[bool]) -> usize {
-    let Ok((order, _)) = callee_order(m) else { return 0 };
+/// and each kept function once, with what it inlines. `order` is `callee_order`'s.
+fn flattened_size(m: &Module, order: &[usize], keep: &[bool]) -> usize {
     let mut size = vec![0usize; m.functions.len()];
-    for f in order {
+    for &f in order {
         let mut sz = 0;
         visit::walk(&m.functions[f].body, &mut |s| {
             sz += 1;

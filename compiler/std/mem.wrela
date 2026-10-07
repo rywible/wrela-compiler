@@ -2,6 +2,8 @@
 // nothing here is checked: a wrong address or size breaks the program's memory. Each function
 // can be called only inside `unsafe`, which only std's core uses.
 
+use std::abi::{PANIC, THREAD_BLOCKS, THREAD_BLOCK_SIZE}
+
 /// A destructor: what dropping a value does besides dropping its fields. Only std's core
 /// implements it (§18), for the types that own memory: `Vec`, `Box`.
 pub trait Drop {
@@ -143,19 +145,21 @@ pub fn run_task(task: u32, ctx: u32, chunk: u32) {}
 @intrinsic
 pub fn task<C>(run: fn(u32, mut C)) -> u32 {}
 
-/// The threads' blocks: each thread's parallel job, what it runs for others, its allocations
-/// and its panic message (wrela_abi::memory's threads; these are copies of its numbers, which a
-/// test there checks).
-pub const THREAD_BLOCKS: u32 = 1114112
-/// The bytes of each thread's block.
-pub const THREAD_BLOCK_SIZE: u32 = 8192
-/// Where in a block a panic's message is: a `u32` byte count, then UTF-8.
-pub const PANIC: u32 = 4096
-
 /// The running thread's block's address: the program's thread's, or the one a thread entry
-/// was given.
+/// was given. A block holds the thread's parallel job, what it runs for others, its counts and
+/// its panic message (wrela_abi::memory's threads).
 @intrinsic
 pub fn thread_block() -> u32 {}
+
+/// Adds `by` to the count at `word` in this thread's block, wrapping at 2³²: only this thread
+/// writes its counts. (`word` is taken, so a constant comes as its value: one that's borrowed is
+/// read from memory.)
+pub(package) fn count(word: take u32, by: u32) {
+    unsafe {
+        let at = thread_block() + word
+        store_u32(at, load_u32(at).wrapping_add(by))
+    }
+}
 
 /// Waits as `wait` does, for at most `micros` microseconds: 0 when woken, 1 when it wasn't
 /// `expected`, 2 when the time ran out.

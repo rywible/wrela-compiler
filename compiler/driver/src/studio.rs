@@ -403,17 +403,19 @@ pub fn build(pkg: &Path, debug: bool) -> Result<(crate::Output, PathBuf), String
 }
 
 /// Empties the page at `page` for a new build, but for the compiled code `wrela_host` keeps of
-/// the build's WASM `wasm` (`.native/game-<hash>.cwasm`, the hash the WASM's): the next build of
-/// the same program has the same WASM, and loading it then needn't compile it again.
+/// the build's WASM `wasm` (`.native/game-<hash>-*.cwasm`, the hash the WASM's): the next build
+/// of the same program has the same WASM, and loading it then needn't compile it again.
 fn clear(page: &Path, wasm: Option<&[u8]>) {
-    let keep = wasm.map(wrela_host::compiled_code_name);
+    let keep = wasm.map(wrela_host::compiled_code_prefix);
     let Ok(entries) = std::fs::read_dir(page) else { return };
     for e in entries.flatten() {
         let path = e.path();
         let dir = e.file_type().is_ok_and(|t| t.is_dir());
         if dir && e.file_name() == ".native" {
             for c in std::fs::read_dir(&path).into_iter().flatten().flatten() {
-                if keep.as_deref() != c.file_name().to_str() {
+                let kept =
+                    keep.as_deref().is_some_and(|k| c.file_name().to_string_lossy().starts_with(k));
+                if !kept {
                     let _ = std::fs::remove_file(c.path());
                 }
             }

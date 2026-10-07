@@ -3,12 +3,11 @@
 // reads the mesh's buffers back (the newest the program holds: the vertices' count and items,
 // the quads' count and items, and the draw's arguments) and times the passes.
 
-use engine::creature::{ALL, Creature, Parts}
+use engine::creature::{ALL, Parts}
 use engine::realize::{Grid, Mesh, Room, Scratch, record, record_cull, record_finish, record_slice}
-use herd::grazer::grazer
+use herd::grazer::{FALLOFF, Grazer, field_of, grazer}
+use herd::herd::HERD
 use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch, write}
-use std::field::Field
-use std::derive::value_and_gradient
 
 pub struct Game {
     scratch: Scratch,
@@ -38,34 +37,6 @@ fn distances<C, F: Parts<C>>(field: F, points: [vec4], out: mut Slots<f32>, id: 
     out[id] = field.distance_masked(points[id.x].xyz, ALL, 0.0)
 }
 
-/// The distance at each point from the items in a mask alone, seen `fp` wide.
-@compute(64)
-fn masked<C, F: Parts<C>>(
-    field: F,
-    mask: engine::creature::PartMask,
-    fp: f32,
-    points: [vec4],
-    out: mut Slots<f32>,
-    id: GlobalId,
-) {
-    out[id] = field.distance_masked(points[id.x].xyz, mask, fp)
-}
-
-/// The distance and gradient at each point from the items in a mask alone, seen `fp` wide.
-@compute(64)
-fn masked_gradients<C, F: Parts<C>>(
-    field: F,
-    mask: engine::creature::PartMask,
-    fp: f32,
-    points: [vec4],
-    out: mut Slots<vec4>,
-    id: GlobalId,
-) {
-    let p = points[id.x].xyz
-    let (d, g) = value_and_gradient(|q: vec3| field.distance_masked(q, mask, fp), p)
-    out[id] = vec4(d, g)
-}
-
 /// The distance and gradient at each point.
 @compute(64)
 fn samples<C, F: Parts<C>>(field: F, points: [vec4], out: mut Slots<vec4>, id: GlobalId) {
@@ -82,12 +53,8 @@ pub fn evaluate(game: mut Game, s: u32, n: u32) {
     let b = g.bounds()
     var r = herd::terrain::XorShift { state: 12345 }
     var pts: Vec<vec4> = Vec::new()
-    let e = b.hi - b.lo
     for _ in 0..n {
-        let x = r.unit()
-        let y = r.unit()
-        let z = r.unit()
-        pts.push(vec4(b.lo + vec3(x * e.x, y * e.y, z * e.z), 0.0))
+        pts.push(vec4(r.point(b.lo, b.hi), 0.0))
     }
     game.points = buffer(n)
     write(mut game.points, 0, pts)
@@ -100,36 +67,6 @@ pub fn evaluate(game: mut Game, s: u32, n: u32) {
     )
     dispatch(
         samples.bind(field: field, points: game.points.span(0, n), out: mut game.samp),
-        groups: n / 64,
-    )
-}
-
-/// `evaluate`'s points, the distance from the items in `lo`'s bits alone at each (a block's
-/// mask), seen `fp` wide; and the distance and gradient so.
-pub fn evaluate_masked(game: mut Game, s: u32, n: u32, lo: u32, fp: f32) {
-    evaluate(mut game, s, n)
-    let field = grazer(s).field()
-    let mask = engine::creature::PartMask { lo, hi: 0 }
-    game.dist = buffer(n)
-    game.samp = buffer(n)
-    dispatch(
-        masked.bind(
-            field: field,
-            mask: mask,
-            fp: fp,
-            points: game.points.span(0, n),
-            out: mut game.dist,
-        ),
-        groups: n / 64,
-    )
-    dispatch(
-        masked_gradients.bind(
-            field: field,
-            mask: mask,
-            fp: fp,
-            points: game.points.span(0, n),
-            out: mut game.samp,
-        ),
         groups: n / 64,
     )
 }
@@ -165,7 +102,7 @@ pub fn near_surface(game: mut Game, s: u32, n: u32) {
     write(mut game.points, 0, pts)
     game.dist = buffer(n)
     game.samp = buffer(n)
-    let field = herd::grazer::grazer_field(s)
+    let field = field_of(g)
     dispatch(
         distances.bind(field: field, points: game.points.span(0, n), out: mut game.dist),
         groups: n / 64,
@@ -182,28 +119,26 @@ pub fn grid(s: u32, cell: f32) -> (vec3u, f32) {
     (g.size, g.cell)
 }
 
-/// Its grid's origin.
-pub fn origin(s: u32, cell: f32) -> vec3 {
-    Grid::around(grazer(s).bounds(), cell).origin
-}
-
-/// Realizes seed `s` at `cell` into a mesh of its own: the scratch first, so the mesh's buffers
-/// are the newest.
-pub fn realize(game: mut Game, s: u32, cell: f32) {
+/// Seed `s` and its grid at `cell`, with a new mesh that has room for the most the grid could
+/// hold: the scratch fitted first, so the mesh's buffers are the newest.
+fn prepare(game: mut Game, s: u32, cell: f32) -> (Grazer, Grid) {
     let g = grazer(s)
     let grid = Grid::around(g.bounds(), cell)
     game.scratch.fit(grid.blocks)
     game.mesh = Mesh::new(Room { vertices: grid.blocks * 8, quads: grid.blocks * 8 })
-    record(g.field(), grid, 0.06, mut game.scratch, mut game.mesh)
+    (g, grid)
+}
+
+/// Realizes seed `s` at `cell` into a mesh of its own: the mesh's buffers are the newest.
+pub fn realize(game: mut Game, s: u32, cell: f32) {
+    let (g, grid) = prepare(mut game, s, cell)
+    record(g.field(), grid, FALLOFF, mut game.scratch, mut game.mesh)
 }
 
 /// Realizes seed `s` at `cell` as a `Realizer` spreads a level change over frames, in `slices`
 /// slices of its live blocks, into a mesh of its own: the mesh's buffers are the newest.
 pub fn realize_sliced(game: mut Game, s: u32, cell: f32, slices: u32) {
-    let g = grazer(s)
-    let grid = Grid::around(g.bounds(), cell)
-    game.scratch.fit(grid.blocks)
-    game.mesh = Mesh::new(Room { vertices: grid.blocks * 8, quads: grid.blocks * 8 })
+    let (g, grid) = prepare(mut game, s, cell)
     let field = g.field()
     record_cull(field, grid, mut game.scratch, mut game.mesh)
     for k in 0..slices {
@@ -216,32 +151,18 @@ pub fn realize_sliced(game: mut Game, s: u32, cell: f32, slices: u32) {
             mesh: mut game.mesh,
         )
     }
-    record_finish(field, grid, 0.06, mut game.scratch, mut game.mesh)
+    record_finish(field, grid, FALLOFF, mut game.scratch, mut game.mesh)
 }
 
 /// Realizes seed `s` at `cell` into scratch of its own, whose probe, in a debug build, holds each
 /// boundary corner's value as each live block evaluated it (#42 AC2): the probe is the sixth
 /// newest buffer (the mesh's five are newer).
 pub fn probe_corners(game: mut Game, s: u32, cell: f32) {
-    let g = grazer(s)
-    let grid = Grid::around(g.bounds(), cell)
-    game.scratch = Scratch::new(grid.blocks)
-    game.mesh = Mesh::new(Room { vertices: grid.blocks * 8, quads: grid.blocks * 8 })
-    record(g.field(), grid, 0.06, mut game.scratch, mut game.mesh)
+    game.scratch = Scratch::new(Grid::around(grazer(s).bounds(), cell).blocks)
+    realize(mut game, s, cell)
 }
 
 pub fn frame(game: mut Game, time: f32, width: u32, height: u32) {}
-
-/// Realizes seed `s` at `cell` `n` times over, back to back: for timing, the GPU kept busy.
-pub fn realize_n(game: mut Game, s: u32, cell: f32, n: u32) {
-    let g = grazer(s)
-    let grid = Grid::around(g.bounds(), cell)
-    game.scratch.fit(grid.blocks)
-    game.mesh = Mesh::new(Room { vertices: grid.blocks * 8, quads: grid.blocks * 8 })
-    for _ in 0..n {
-        record(g.field(), grid, 0.06, mut game.scratch, mut game.mesh)
-    }
-}
 
 /// Seeds 1 to 40 realized at `cell` back to back, each into a mesh of its own with room for
 /// `vertices` and `quads` (the spike's harness sizes them by a calibration): the 40 meshes are the
@@ -249,15 +170,15 @@ pub fn realize_n(game: mut Game, s: u32, cell: f32, n: u32) {
 /// draw's arguments), in seed order.
 pub fn realize_herd(game: mut Game, cell: f32, vertices: u32, quads: u32) {
     var most = 0
-    for s in 1..41 {
+    for s in 1..=HERD {
         most = max(most, Grid::around(grazer(s).bounds(), cell).blocks)
     }
     game.scratch.fit(most)
     var meshes: Vec<Mesh> = Vec::new()
-    for s in 1..41 {
+    for s in 1..=HERD {
         var mesh = Mesh::new(Room { vertices, quads })
         let g = grazer(s)
-        record(g.field(), Grid::around(g.bounds(), cell), 0.06, mut game.scratch, mut mesh)
+        record(g.field(), Grid::around(g.bounds(), cell), FALLOFF, mut game.scratch, mut mesh)
         meshes.push(take mesh)
     }
     game.herd = take meshes

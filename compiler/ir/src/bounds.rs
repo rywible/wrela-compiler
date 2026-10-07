@@ -17,7 +17,7 @@ pub fn add_checks(m: &mut Module, binding: u32, code: u32) -> Option<ResourceId>
     let any = (0..m.functions.len()).any(|i| {
         let mut found = false;
         visit::walk(&m.functions[i].body, &mut |s| {
-            s.for_each_place(&mut |p| found |= p.path.iter().any(|x| matches!(x, Proj::Index(_))));
+            s.for_each_place(&mut |p| found |= p.has_index());
             found |= matches!(s.expr(), Some(Expr::ExtractDyn(..)));
         });
         found && !skip.contains(&FuncId(i as u32))
@@ -38,9 +38,9 @@ pub fn add_checks(m: &mut Module, binding: u32, code: u32) -> Option<ResourceId>
             continue;
         }
         let mut f = std::mem::take(&mut m.functions[i]);
-        let body = std::mem::take(&mut f.body);
+        let mut body = std::mem::take(&mut f.body);
         let mut cx = Checks { m, f: &mut f, flag, code, u32_ty };
-        let body = cx.block(body);
+        visit::expand(&mut body, &mut |s, out| cx.stmt(s, out));
         f.body = body;
         m.functions[i] = f;
     }
@@ -80,38 +80,24 @@ enum Len {
 }
 
 impl Checks<'_> {
-    fn block(&mut self, b: Block) -> Block {
-        let mut out = Vec::with_capacity(b.len());
-        for mut s in b {
-            let mut checks = Vec::new();
-            s.for_each_place(&mut |p| self.place_checks(p, &mut checks));
-            if let Some(Expr::ExtractDyn(x, i)) = s.expr() {
-                let n = match self.m.types.get(self.f.value_ty(*x)) {
-                    TypeDef::Array(_, n) => Some(*n),
-                    TypeDef::Vector(_, n) | TypeDef::Matrix(n) => Some(u32::from(*n)),
-                    _ => None,
-                };
-                if let Some(n) = n {
-                    checks.push((*i, Len::Const(n)));
-                }
+    /// `s`, after a check of each index it takes.
+    fn stmt(&mut self, s: Stmt, out: &mut Block) {
+        let mut checks = Vec::new();
+        s.for_each_place(&mut |p| self.place_checks(p, &mut checks));
+        if let Some(Expr::ExtractDyn(x, i)) = s.expr() {
+            let n = match self.m.types.get(self.f.value_ty(*x)) {
+                TypeDef::Array(_, n) => Some(*n),
+                TypeDef::Vector(_, n) | TypeDef::Matrix(n) => Some(u32::from(*n)),
+                _ => None,
+            };
+            if let Some(n) = n {
+                checks.push((*i, Len::Const(n)));
             }
-            for (i, len) in checks {
-                self.check(&mut out, i, len);
-            }
-            match &mut s {
-                Stmt::If { then, else_, .. } => {
-                    *then = self.block(std::mem::take(then));
-                    *else_ = self.block(std::mem::take(else_));
-                }
-                Stmt::Loop { body, continuing } => {
-                    *body = self.block(std::mem::take(body));
-                    *continuing = self.block(std::mem::take(continuing));
-                }
-                _ => {}
-            }
-            out.push(s);
         }
-        out
+        for (i, len) in checks {
+            self.check(out, i, len);
+        }
+        out.push(s);
     }
 
     /// The indices a place takes, each with its array's length.
@@ -141,30 +127,24 @@ impl Checks<'_> {
         }
     }
 
-    fn value(&mut self, out: &mut Block, ty: TypeId, e: Expr) -> ValueId {
-        let v = self.f.new_value(ty);
-        out.push(Stmt::Let(v, e));
-        v
-    }
-
     /// `if i >= len { atomicMax(&flag[0], code) }`, with `i` as a `u32` (a negative `i32`
     /// is then out of range too).
     fn check(&mut self, out: &mut Block, i: ValueId, len: Len) {
         let u = self.u32_ty;
         let i = match self.m.types.get(self.f.value_ty(i)) {
             TypeDef::Scalar(Scalar::U32) => i,
-            TypeDef::Scalar(Scalar::I32) => self.value(out, u, Expr::Bitcast(i, Scalar::U32)),
-            _ => self.value(out, u, Expr::Convert(i, Scalar::U32)),
+            TypeDef::Scalar(Scalar::I32) => self.f.let_(out, u, Expr::Bitcast(i, Scalar::U32)),
+            _ => self.f.let_(out, u, Expr::Convert(i, Scalar::U32)),
         };
         let len = match len {
-            Len::Const(n) => self.value(out, u, Expr::Const(Const::U32(n))),
-            Len::Of(root) => self.value(out, u, Expr::ArrayLength(Place::root(root))),
+            Len::Const(n) => self.f.let_(out, u, Expr::Const(Const::U32(n))),
+            Len::Of(root) => self.f.let_(out, u, Expr::ArrayLength(Place::root(root))),
         };
         let b = self.m.types.bool();
-        let bad = self.value(out, b, Expr::Binary(BinOp::Ge, i, len));
+        let bad = self.f.let_(out, b, Expr::Binary(BinOp::Ge, i, len));
         let mut then = Vec::new();
-        let zero = self.value(&mut then, u, Expr::Const(Const::U32(0)));
-        let code = self.value(&mut then, u, Expr::Const(Const::U32(self.code)));
+        let zero = self.f.let_(&mut then, u, Expr::Const(Const::U32(0)));
+        let code = self.f.let_(&mut then, u, Expr::Const(Const::U32(self.code)));
         let at = Place { root: PlaceRoot::Resource(self.flag), path: vec![Proj::Index(zero)] };
         then.push(Stmt::Eval(Expr::Atomic(AtomicOp::Max, at, vec![code])));
         out.push(Stmt::If { cond: bad, then, else_: Vec::new() });

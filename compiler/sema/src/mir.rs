@@ -547,14 +547,9 @@ pub fn place_ty(p: &Program, locals: &[LocalDecl], place: &Place) -> TyId {
     t
 }
 
-/// [`proj_ty`], for the memory checker.
-pub(crate) fn proj_ty_pub(p: &Program, t: TyId, variant: &mut Option<u32>, proj: &Proj) -> TyId {
-    proj_ty(p, t, variant, proj)
-}
-
 /// The type of projection `proj` of a place of type `t`. `variant` is the variant a `Downcast`
 /// chose, for the `Field` after it.
-fn proj_ty(p: &Program, t: TyId, variant: &mut Option<u32>, proj: &Proj) -> TyId {
+pub fn proj_ty(p: &Program, t: TyId, variant: &mut Option<u32>, proj: &Proj) -> TyId {
     match (proj, p.types.kind(t)) {
         (Proj::Downcast(v), _) => {
             *variant = Some(*v);
@@ -566,14 +561,15 @@ fn proj_ty(p: &Program, t: TyId, variant: &mut Option<u32>, proj: &Proj) -> TyId
         (Proj::Field(i), TyKind::Tuple(ts)) => {
             ts.get(*i as usize).copied().unwrap_or(p.types.error)
         }
-        (Proj::Comp(_), &TyKind::Vec(e, _)) => p.types.elem(e),
+        (Proj::Comp(_) | Proj::Index(_), &TyKind::Vec(e, _)) => p.types.elem(e),
         (Proj::Comp(_), _) => p.types.f32,
         (Proj::Swizzle(cs), &TyKind::Vec(e, _)) => p.types.vec_of(e, cs.len() as u8),
         (Proj::Swizzle(cs), _) => p.types.vec(cs.len() as u8),
         (Proj::Index(_), TyKind::Array(e, _) | TyKind::ArrayN(e, _) | TyKind::Slice(e)) => *e,
-        (Proj::Index(_), &TyKind::Vec(e, _)) => p.types.elem(e),
         (Proj::Index(_), TyKind::Mat(n)) => p.types.vec(*n),
-        (Proj::Index(_), TyKind::Adt(_, args)) if !args.is_empty() => args[0], // `Slots<T>`
+        // A lang container's element (`Slots`, `Arena`, `Bounded`, `Vec`): its first type
+        // argument.
+        (Proj::Index(_), TyKind::Adt(_, args)) if !args.is_empty() => args[0],
         _ => p.types.error,
     }
 }

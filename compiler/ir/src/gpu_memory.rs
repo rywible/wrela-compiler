@@ -15,7 +15,6 @@
 //! holds (a function's `(vec3, bool)`) keeps its `bool`s, and an enum only code holds is a WGSL
 //! struct with a member for each payload.
 
-use crate::layout::{column_stride, field_offsets};
 use crate::*;
 use std::collections::{HashMap, HashSet};
 
@@ -39,9 +38,8 @@ pub fn lay_out_gpu_memory(m: &mut Module) -> Result<()> {
                 consts.insert(*v, *x);
             }
         });
-        let body = std::mem::take(&mut f.body);
-        let mut rw = Rewriter { m, tm: &mut tm, f: &mut f, consts };
-        let body = rw.block(body)?;
+        let mut body = std::mem::take(&mut f.body);
+        Rewriter { m, tm: &mut tm, f: &mut f, consts }.block(&mut body)?;
         f.body = body;
         for t in &mut f.values {
             *t = tm.stored(&mut m.types, *t);
@@ -111,8 +109,7 @@ impl TypeMap {
         }
         let s = match types.get(t).clone() {
             TypeDef::Enum { name, .. } if self.words.contains(&t) => {
-                let (w, k) = words_shape(types, t);
-                let words = types.intern(TypeDef::Array(w, k));
+                let words = words_shape(types, t).array;
                 let tag = types.u32();
                 types.intern(TypeDef::Struct {
                     name,
@@ -169,17 +166,29 @@ impl TypeMap {
     }
 }
 
-/// The words of enum `t` as memory holds it: their type (a `u32` or a vector of them, as wide
-/// as the enum's alignment) and how many, after its tag (which the first takes the alignment
-/// of): its layout, as the CPU's (`layout::compute`).
-fn words_shape(types: &mut Types, t: TypeId) -> (TypeId, u32) {
+/// The words that memory holds an enum's payload in, after its tag (which the first takes the
+/// alignment of): its layout, as the CPU's (`layout::compute`).
+struct WordsShape {
+    /// A word's type: a `u32`, or a vector of them as wide as the enum's alignment.
+    word: TypeId,
+    /// The array of them.
+    array: TypeId,
+    /// How many words there are.
+    count: u32,
+    /// How many `u32`s a word holds: the enum's alignment's.
+    per: u32,
+}
+
+/// The words of enum `t` as memory holds it.
+fn words_shape(types: &mut Types, t: TypeId) -> WordsShape {
     let l = types.layout(t);
-    let w = match l.align {
+    let word = match l.align {
         16 => types.vector_of(Scalar::U32, 4),
         8 => types.vector_of(Scalar::U32, 2),
         _ => types.u32(),
     };
-    (w, (l.size - l.align) / l.align)
+    let count = (l.size - l.align) / l.align;
+    WordsShape { word, array: types.intern(TypeDef::Array(word, count)), count, per: l.align / 4 }
 }
 
 fn is_bool(types: &Types, t: TypeId) -> bool {
@@ -193,72 +202,6 @@ fn in_memory(kind: ResourceKind) -> bool {
         kind,
         ResourceKind::Uniform { .. } | ResourceKind::StorageRead | ResourceKind::StorageReadWrite
     )
-}
-
-/// A step from a value to a part of it: `Expr::Extract` (a field, a component, a column), or
-/// `Expr::ExtractDyn` at a constant (an array's element).
-#[derive(Clone, Copy)]
-enum Step {
-    Extract(u32),
-    Elem(u32),
-}
-
-/// A scalar in a value of a type memory holds: its byte offset, its type, and where it is.
-struct Leaf {
-    offset: u32,
-    scalar: Scalar,
-    path: Vec<Step>,
-}
-
-/// The scalars of a value of type `t` (as memory holds it: no enum but as its words), at
-/// `offset` and below `path`.
-fn leaves(types: &Types, t: TypeId, offset: u32, path: &mut Vec<Step>, out: &mut Vec<Leaf>) {
-    let mut leaf = |offset, scalar, path: &Vec<Step>| {
-        out.push(Leaf { offset, scalar, path: path.clone() });
-    };
-    match types.get(t) {
-        TypeDef::Scalar(s) => leaf(offset, *s, path),
-        TypeDef::Vector(s, n) => {
-            for c in 0..u32::from(*n) {
-                path.push(Step::Extract(c));
-                leaf(offset + 4 * c, *s, path);
-                path.pop();
-            }
-        }
-        TypeDef::Matrix(n) => {
-            for col in 0..u32::from(*n) {
-                path.push(Step::Extract(col));
-                for r in 0..u32::from(*n) {
-                    path.push(Step::Extract(r));
-                    leaf(offset + col * column_stride(*n) + 4 * r, Scalar::F32, path);
-                    path.pop();
-                }
-                path.pop();
-            }
-        }
-        TypeDef::Array(e, n) => {
-            let stride = types.layout(*e).stride();
-            for i in 0..*n {
-                path.push(Step::Elem(i));
-                leaves(types, *e, offset + i * stride, path, out);
-                path.pop();
-            }
-        }
-        TypeDef::Struct { fields, .. } => {
-            let offsets = field_offsets(types, t);
-            for (k, (_, f)) in fields.iter().enumerate() {
-                path.push(Step::Extract(k as u32));
-                leaves(types, *f, offset + offsets[k], path, out);
-                path.pop();
-            }
-        }
-        // None of these is in memory, so none is in an enum's payload there.
-        TypeDef::Enum { .. }
-        | TypeDef::RuntimeArray(_)
-        | TypeDef::Run(_)
-        | TypeDef::Ptr(_)
-        | TypeDef::Atomic(_) => {}
-    }
 }
 
 /// Where a word of an enum's payload is: from its enum's place or value.
@@ -288,6 +231,20 @@ impl Rewriter<'_> {
         self.val(out, t, Expr::Const(Const::U32(x)))
     }
 
+    /// `e`, a `u32` that memory holds a `bool` as, read as the `bool`.
+    fn word_to_bool(&mut self, e: Expr, out: &mut Block) -> Expr {
+        let u32t = self.m.types.u32();
+        let w = self.val(out, u32t, e);
+        let zero = self.u32_const(out, 0);
+        Expr::Binary(BinOp::Ne, w, zero)
+    }
+
+    /// `x`, a `bool`, as the `u32` that memory holds it as: 0 or 1.
+    fn bool_to_word(&mut self, x: ValueId, out: &mut Block) -> ValueId {
+        let u32t = self.m.types.u32();
+        self.val(out, u32t, Expr::Convert(x, Scalar::U32))
+    }
+
     fn is_words(&self, t: TypeId) -> bool {
         self.tm.words.contains(&t)
     }
@@ -297,23 +254,18 @@ impl Rewriter<'_> {
         self.tm.stored(&mut self.m.types, t)
     }
 
-    fn block(&mut self, b: Block) -> Result<Block> {
-        let mut out = Vec::with_capacity(b.len());
-        for mut s in b {
-            for inner in s.blocks_mut() {
-                let taken = std::mem::take(inner);
-                *inner = self.block(taken)?;
-            }
+    fn block(&mut self, b: &mut Block) -> Result<()> {
+        visit::try_expand(b, &mut |s, out| {
             match s {
                 Stmt::Let(v, e) => {
-                    let e = self.expr(e, &mut out)?;
+                    let e = self.expr(e, out)?;
                     out.push(Stmt::Let(v, e));
                 }
-                Stmt::Store(p, x) => self.store(p, x, &mut out)?,
+                Stmt::Store(p, x) => self.store(p, x, out)?,
                 s => out.push(s),
             }
-        }
-        Ok(out)
+            Ok(())
+        })
     }
 
     /// `p` split where it goes into the payload of an enum memory holds as its words: the
@@ -352,8 +304,7 @@ impl Rewriter<'_> {
 
     /// Word `i` of the payload of the enum (of type `t`) that `words` holds, a `u32`.
     fn word(&mut self, words: &Words, t: TypeId, i: u32, out: &mut Block) -> Expr {
-        let align = self.m.types.layout(t).align;
-        let per = align / 4;
+        let per = self.m.types.layout(t).align / 4;
         let (e, c) = (i / per, i % per);
         let at = self.u32_const(out, e);
         match words {
@@ -366,13 +317,12 @@ impl Rewriter<'_> {
                 Expr::Load(Place { root: p.root.clone(), path })
             }
             Words::Value(x) => {
-                let (w, k) = words_shape(&mut self.m.types, t);
-                let arr = self.m.types.intern(TypeDef::Array(w, k));
-                let all = self.val(out, arr, Expr::Extract(*x, 1));
+                let shape = words_shape(&mut self.m.types, t);
+                let all = self.val(out, shape.array, Expr::Extract(*x, 1));
                 if per == 1 {
                     return Expr::ExtractDyn(all, at);
                 }
-                let elem = self.val(out, w, Expr::ExtractDyn(all, at));
+                let elem = self.val(out, shape.word, Expr::ExtractDyn(all, at));
                 Expr::Extract(elem, c)
             }
         }
@@ -388,36 +338,22 @@ impl Rewriter<'_> {
         offset: u32,
         out: &mut Block,
     ) -> Result<Expr> {
-        let u32t = self.m.types.u32();
-        let parts: Vec<(TypeId, u32)> = match self.m.types.get(t).clone() {
+        let parts = match self.m.types.get(t) {
             TypeDef::Scalar(Scalar::U32) => return Ok(self.word(words, et, offset / 4, out)),
-            TypeDef::Scalar(s @ (Scalar::I32 | Scalar::F32)) => {
+            &TypeDef::Scalar(s @ (Scalar::I32 | Scalar::F32)) => {
                 let w = self.word(words, et, offset / 4, out);
+                let u32t = self.m.types.u32();
                 let w = self.val(out, u32t, w);
                 return Ok(Expr::Bitcast(w, s));
             }
             TypeDef::Scalar(Scalar::Bool) => {
                 let w = self.word(words, et, offset / 4, out);
-                let w = self.val(out, u32t, w);
-                let zero = self.u32_const(out, 0);
-                return Ok(Expr::Binary(BinOp::Ne, w, zero));
+                return Ok(self.word_to_bool(w, out));
             }
-            TypeDef::Vector(s, n) => {
-                let ct = self.m.types.scalar(s);
-                (0..u32::from(n)).map(|c| (ct, offset + 4 * c)).collect()
-            }
-            TypeDef::Matrix(n) => {
-                let col = self.m.types.vector(n);
-                (0..u32::from(n)).map(|c| (col, offset + c * column_stride(n))).collect()
-            }
-            TypeDef::Array(e, n) => {
-                let stride = self.m.types.layout(e).stride();
-                (0..n).map(|i| (e, offset + i * stride)).collect()
-            }
-            TypeDef::Struct { fields, .. } => {
-                let offsets = field_offsets(&self.m.types, t).to_vec();
-                fields.iter().zip(offsets).map(|((_, f), o)| (*f, offset + o)).collect()
-            }
+            TypeDef::Vector(..)
+            | TypeDef::Matrix(_)
+            | TypeDef::Array(..)
+            | TypeDef::Struct { .. } => layout::parts(&self.m.types, t),
             other => {
                 return Err(Error::internal(format!(
                     "a `{other:?}` in an enum's payload in GPU memory"
@@ -426,85 +362,77 @@ impl Rewriter<'_> {
         };
         let mut xs = Vec::with_capacity(parts.len());
         for (pt, o) in parts {
-            let e = self.decode(words, et, pt, o, out)?;
+            let e = self.decode(words, et, pt, offset + o, out)?;
             xs.push(self.val(out, pt, e));
         }
         Ok(Expr::Construct(t, xs))
     }
 
     /// The scalars of `x`, a value of type `t` (as memory holds it), at byte `offset`: each
-    /// one's word index and value as a `u32`.
+    /// one's word index and value as a `u32`, added to `words`. Each part on the way is taken
+    /// out once.
     fn encode(
         &mut self,
         x: ValueId,
         t: TypeId,
         offset: u32,
         out: &mut Block,
-    ) -> Vec<(u32, ValueId)> {
-        let mut ls = Vec::new();
-        leaves(&self.m.types, t, offset, &mut Vec::new(), &mut ls);
-        let u32t = self.m.types.u32();
-        let mut words = Vec::with_capacity(ls.len());
-        for l in ls {
-            let (mut v, mut vt) = (x, t);
-            for step in &l.path {
-                let (part_t, e) = match *step {
-                    Step::Extract(k) => {
-                        let pt = match self.m.types.get(vt) {
-                            TypeDef::Vector(s, _) => self.m.types.scalar(*s),
-                            TypeDef::Matrix(n) => self.m.types.vector(*n),
-                            _ => self.m.types.field(vt, k).expect("a leaf's path is in its value"),
-                        };
-                        (pt, Expr::Extract(v, k))
-                    }
-                    Step::Elem(i) => {
-                        let TypeDef::Array(e, _) = *self.m.types.get(vt) else {
-                            unreachable!("a leaf's element is an array's")
-                        };
-                        let at = self.u32_const(out, i);
-                        (e, Expr::ExtractDyn(v, at))
-                    }
-                };
-                v = self.val(out, part_t, e);
-                vt = part_t;
+        words: &mut Vec<(u32, ValueId)>,
+    ) {
+        let w = match *self.m.types.get(t) {
+            TypeDef::Scalar(Scalar::U32) => x,
+            TypeDef::Scalar(Scalar::Bool) => self.bool_to_word(x, out),
+            TypeDef::Scalar(_) => {
+                let u32t = self.m.types.u32();
+                self.val(out, u32t, Expr::Bitcast(x, Scalar::U32))
             }
-            let w = match l.scalar {
-                Scalar::U32 => v,
-                Scalar::Bool => self.val(out, u32t, Expr::Convert(v, Scalar::U32)),
-                _ => self.val(out, u32t, Expr::Bitcast(v, Scalar::U32)),
-            };
-            words.push((l.offset / 4, w));
-        }
-        words
+            // An array's element is taken out at a constant index. (No enum, run, pointer or
+            // atomic is in memory, so none is in an enum's payload there: they have no parts.)
+            ref d => {
+                let array = matches!(d, TypeDef::Array(..));
+                for (k, (pt, o)) in (0..).zip(layout::parts(&self.m.types, t)) {
+                    let e = if array {
+                        let at = self.u32_const(out, k);
+                        Expr::ExtractDyn(x, at)
+                    } else {
+                        Expr::Extract(x, k)
+                    };
+                    let part = self.val(out, pt, e);
+                    self.encode(part, pt, offset + o, out, words);
+                }
+                return;
+            }
+        };
+        words.push((offset / 4, w));
     }
 
     /// `Variant(t, v, payload)` for an enum memory holds as its words.
     fn variant(&mut self, t: TypeId, v: u32, payload: Option<ValueId>, out: &mut Block) -> Expr {
         let st = self.stored(t);
-        let (w, k) = words_shape(&mut self.m.types, t);
-        let arr = self.m.types.intern(TypeDef::Array(w, k));
+        let shape = words_shape(&mut self.m.types, t);
         let tag = self.u32_const(out, v);
         let words = match payload {
-            None => self.val(out, arr, Expr::Zero(arr)),
+            None => self.val(out, shape.array, Expr::Zero(shape.array)),
             Some(x) => {
                 // Values hold their types as memory does (`stored`), as this pass leaves them.
                 let pt = self.m.types.field(t, v + 1).expect("the variant has a payload");
                 let pt = self.stored(pt);
-                let per = self.m.types.layout(t).align / 4;
-                let mut all = vec![None; (k * per) as usize];
-                for (i, w) in self.encode(x, pt, 0, out) {
+                let mut encoded = Vec::new();
+                self.encode(x, pt, 0, out, &mut encoded);
+                let mut all = vec![None; (shape.count * shape.per) as usize];
+                for (i, w) in encoded {
                     all[i as usize] = Some(w);
                 }
                 let zero = self.u32_const(out, 0);
                 let all: Vec<ValueId> = all.into_iter().map(|w| w.unwrap_or(zero)).collect();
-                let elems = if per == 1 {
+                let elems = if shape.per == 1 {
                     all
                 } else {
-                    all.chunks(per as usize)
-                        .map(|c| self.val(out, w, Expr::Construct(w, c.to_vec())))
+                    all.chunks(shape.per as usize)
+                        .map(|c| self.val(out, shape.word, Expr::Construct(shape.word, c.to_vec())))
                         .collect()
                 };
-                self.val(out, arr, Expr::Construct(arr, elems))
+                self.val(out, shape.array, Expr::Construct(shape.array, elems))
             }
         };
         Expr::Construct(st, vec![tag, words])
@@ -538,10 +466,7 @@ impl Rewriter<'_> {
             return self.decode(&Words::Value(x), t, pt, 0, out);
         }
         if self.tm.bool_member(&self.m.types, t, k) {
-            let u32t = self.m.types.u32();
-            let w = self.val(out, u32t, Expr::Extract(x, k));
-            let zero = self.u32_const(out, 0);
-            return Ok(Expr::Binary(BinOp::Ne, w, zero));
+            return Ok(self.word_to_bool(Expr::Extract(x, k), out));
         }
         Ok(Expr::Extract(x, k))
     }
@@ -549,10 +474,7 @@ impl Rewriter<'_> {
     /// `ExtractDyn(x, i)` of `x`, a value of type `t` (as it was).
     fn extract_dyn(&mut self, x: ValueId, t: TypeId, i: ValueId, out: &mut Block) -> Expr {
         if self.tm.bool_member(&self.m.types, t, 0) {
-            let u32t = self.m.types.u32();
-            let w = self.val(out, u32t, Expr::ExtractDyn(x, i));
-            let zero = self.u32_const(out, 0);
-            return Expr::Binary(BinOp::Ne, w, zero);
+            return self.word_to_bool(Expr::ExtractDyn(x, i), out);
         }
         Expr::ExtractDyn(x, i)
     }
@@ -560,7 +482,6 @@ impl Rewriter<'_> {
     /// `e` with its types as memory holds them, reading what memory holds as this pass lays it
     /// out; what it needs computed first goes in `out`.
     fn expr(&mut self, e: Expr, out: &mut Block) -> Result<Expr> {
-        let u32t = self.m.types.u32();
         Ok(match e {
             Expr::Load(p) => {
                 if let Some((ep, et, v, rest)) = self.through_payload(&p) {
@@ -578,9 +499,7 @@ impl Rewriter<'_> {
                         self.project(x, pt, &rest, out)?
                     }
                 } else if self.stored_bool(&p) {
-                    let w = self.val(out, u32t, Expr::Load(p));
-                    let zero = self.u32_const(out, 0);
-                    Expr::Binary(BinOp::Ne, w, zero)
+                    self.word_to_bool(Expr::Load(p), out)
                 } else {
                     Expr::Load(p)
                 }
@@ -599,7 +518,7 @@ impl Rewriter<'_> {
                     .zip(0..)
                     .map(|(x, k)| {
                         if self.tm.bool_member(&self.m.types, t, k) {
-                            self.val(out, u32t, Expr::Convert(x, Scalar::U32))
+                            self.bool_to_word(x, out)
                         } else {
                             x
                         }
@@ -611,7 +530,7 @@ impl Rewriter<'_> {
             Expr::Variant(t, v, payload) => {
                 let payload = payload.map(|x| {
                     if self.tm.bool_member(&self.m.types, t, v + 1) {
-                        self.val(out, u32t, Expr::Convert(x, Scalar::U32))
+                        self.bool_to_word(x, out)
                     } else {
                         x
                     }
@@ -630,18 +549,13 @@ impl Rewriter<'_> {
         let mut t = types.field(et, v + 1)?;
         let mut offset = 0;
         for proj in rest {
-            offset += match (types.get(t), proj) {
-                (TypeDef::Struct { .. }, Proj::Field(k)) => field_offsets(types, t)[*k as usize],
-                (TypeDef::Enum { .. }, Proj::Field(0)) => 0,
-                // A payload is after the tag, at the enum's alignment.
-                (TypeDef::Enum { .. }, Proj::Field(_)) => types.layout(t).align,
-                (TypeDef::Vector(..), Proj::Comp(c)) => 4 * u32::from(*c),
-                (TypeDef::Matrix(n), Proj::Index(i)) => self.consts.get(i)? * column_stride(*n),
-                (TypeDef::Array(e, _), Proj::Index(i)) => {
-                    self.consts.get(i)? * types.layout(*e).stride()
-                }
+            let k = match (types.get(t), proj) {
+                (TypeDef::Struct { .. } | TypeDef::Enum { .. }, Proj::Field(k)) => *k,
+                (TypeDef::Vector(..), Proj::Comp(c)) => u32::from(*c),
+                (TypeDef::Matrix(_) | TypeDef::Array(..), Proj::Index(i)) => *self.consts.get(i)?,
                 _ => return None,
             };
+            offset += layout::part_offset(types, t, k)?;
             t = self.m.proj_ty(t, proj)?;
         }
         Some((offset, t))
@@ -657,15 +571,16 @@ impl Rewriter<'_> {
             };
             let st = self.stored(t);
             let words = Words::Place(ep);
-            for (i, w) in self.encode(x, st, offset, out) {
+            let mut encoded = Vec::new();
+            self.encode(x, st, offset, out, &mut encoded);
+            for (i, w) in encoded {
                 let Expr::Load(wp) = self.word(&words, et, i, out) else {
                     unreachable!("a place's word is a load")
                 };
                 out.push(Stmt::Store(wp, w));
             }
         } else if self.stored_bool(&p) {
-            let u32t = self.m.types.u32();
-            let w = self.val(out, u32t, Expr::Convert(x, Scalar::U32));
+            let w = self.bool_to_word(x, out);
             out.push(Stmt::Store(p, w));
         } else {
             out.push(Stmt::Store(p, x));

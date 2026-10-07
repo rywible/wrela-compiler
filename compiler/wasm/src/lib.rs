@@ -74,7 +74,8 @@ pub(crate) mod globals {
     /// The next request number: from 1. Requests are numbered in the order they're made, and a
     /// number is never used twice.
     pub const NEXT_REQUEST: u32 = 5;
-    /// The lowest address the shadow stack may reach: the main stack's, or a worker's.
+    /// The lowest address the shadow stack may reach: the running thread's stack's (each
+    /// thread entry sets it).
     pub const STACK_FLOOR: u32 = 6;
     /// The running thread's block (wrela_abi `memory`): the program's thread's, until a thread
     /// entry sets its own.
@@ -90,13 +91,11 @@ pub(crate) fn valtype(s: ir::Scalar) -> ValType {
     }
 }
 
-/// The bytes of a scalar in memory.
-pub(crate) fn scalar_size(s: ir::Scalar) -> u32 {
-    match s {
-        ir::Scalar::I8 | ir::Scalar::U8 => 1,
-        ir::Scalar::I16 | ir::Scalar::U16 => 2,
-        ir::Scalar::I64 | ir::Scalar::U64 | ir::Scalar::F64 => 8,
-        _ => 4,
+/// The lanes of a value of type `t` that is a `v128`: an f32 vector's components, with SIMD.
+pub(crate) fn v128_lanes(types: &ir::Types, t: ir::TypeId, simd: bool) -> Option<u8> {
+    match types.get(t) {
+        ir::TypeDef::Vector(ir::Scalar::F32, n) if simd => Some(*n),
+        _ => None,
     }
 }
 
@@ -105,7 +104,7 @@ pub(crate) fn scalar_size(s: ir::Scalar) -> u32 {
 pub(crate) fn repr(types: &ir::Types, t: ir::TypeId, simd: bool) -> ValType {
     match types.get(t) {
         ir::TypeDef::Scalar(s) => valtype(*s),
-        ir::TypeDef::Vector(ir::Scalar::F32, _) if simd => ValType::V128,
+        _ if v128_lanes(types, t, simd).is_some() => ValType::V128,
         _ => ValType::I32,
     }
 }
@@ -114,7 +113,7 @@ pub(crate) fn repr(types: &ir::Types, t: ir::TypeId, simd: bool) -> ValType {
 /// (Other vectors are in memory, their arithmetic done a component at a time: checked, for an
 /// integer's, as a scalar's is.)
 pub(crate) fn in_memory(types: &ir::Types, t: ir::TypeId, simd: bool) -> bool {
-    types.is_aggregate(t) && !(simd && types.is_f32_vector(t))
+    types.is_aggregate(t) && v128_lanes(types, t, simd).is_none()
 }
 
 /// Function types, deduplicated.
@@ -283,7 +282,7 @@ pub fn emit_with(m: &ir::Module, options: Options) -> Result<Emitted, String> {
         code.function(&body);
         body_lines.push(lines);
     }
-    // Export wrappers: plain scalars in, scalars or a flattened vector out, then a flush.
+    // Export wrappers: scalars and flattened vectors in, a result's scalars out, then a flush.
     let mut exports = ExportSection::new();
     exports.export(wrela_abi::EXPORT_MEMORY, ExportKind::Memory, 0);
     let wrappers = first_fn + m.functions.len() as u32..;
@@ -337,7 +336,7 @@ pub fn emit_with(m: &ir::Module, options: Options) -> Result<Emitted, String> {
     let g = |mutable| GlobalType { val_type: ValType::I32, mutable, shared: false };
     globals.global(g(true), &ConstExpr::i32_const(memory::STACK_TOP as i32));
     // CMD_LEN starts at 0, NEXT_HANDLE and SUBMITTED_TO at 1, DEPTH at 0, NEXT_REQUEST at 1,
-    // and the stack's floor is the main stack's (a worker sets its own).
+    // and the stack's floor is the main stack's (each thread entry sets its own).
     for (i, start) in [
         (globals::CMD_LEN, 0),
         (globals::NEXT_HANDLE, 1),
@@ -439,10 +438,9 @@ fn write_const(
     out: &mut [u8],
     at: usize,
 ) -> Result<(), String> {
-    use ir::layout::{array_stride, column_stride, field_offsets, layout};
     let mut put = |b: &[u8]| out[at..at + b.len()].copy_from_slice(b);
     match (types.get(t), v) {
-        (ir::TypeDef::Scalar(_), ir::ConstValue::Scalar(c)) => match *c {
+        (ir::TypeDef::Scalar(s), ir::ConstValue::Scalar(c)) => match *c {
             ir::Const::Bool(b) => put(&u32::from(b).to_le_bytes()),
             ir::Const::I32(x) => put(&x.to_le_bytes()),
             ir::Const::U32(x) => put(&x.to_le_bytes()),
@@ -451,32 +449,20 @@ fn write_const(
             ir::Const::F32(x) => put(&x.to_le_bytes()),
             ir::Const::F64(x) => put(&x.to_le_bytes()),
             // 8- and 16-bit integers: their low bytes.
-            ir::Const::Small(_, x) => put(&x.to_le_bytes()[..layout(types, t).size as usize]),
+            ir::Const::Small(_, x) => put(&x.to_le_bytes()[..s.bytes() as usize]),
         },
-        (&ir::TypeDef::Vector(s, _), ir::ConstValue::Parts(ps)) => {
-            let c = types.lookup(&ir::TypeDef::Scalar(s)).ok_or("no component type")?;
-            let size = layout(types, c).size as usize;
-            for (k, p) in ps.iter().enumerate() {
-                write_const(types, c, p, addrs, out, at + size * k)?;
-            }
-        }
-        (&ir::TypeDef::Matrix(n), ir::ConstValue::Parts(ps)) => {
-            let col =
-                types.lookup(&ir::TypeDef::Vector(ir::Scalar::F32, n)).ok_or("no column type")?;
-            for (k, p) in ps.iter().enumerate() {
-                write_const(types, col, p, addrs, out, at + (column_stride(n) as usize) * k)?;
-            }
-        }
-        (&ir::TypeDef::Array(e, _), ir::ConstValue::Parts(ps)) => {
-            let stride = array_stride(types, e) as usize;
-            for (k, p) in ps.iter().enumerate() {
-                write_const(types, e, p, addrs, out, at + stride * k)?;
-            }
-        }
-        (ir::TypeDef::Struct { fields, .. }, ir::ConstValue::Parts(ps)) => {
-            let offsets = field_offsets(types, t);
-            for ((&(_, ft), p), &off) in fields.iter().zip(ps).zip(offsets) {
-                write_const(types, ft, p, addrs, out, at + off as usize)?;
+        (
+            ir::TypeDef::Vector(..)
+            | ir::TypeDef::Matrix(_)
+            | ir::TypeDef::Array(..)
+            | ir::TypeDef::Struct { .. },
+            ir::ConstValue::Parts(ps),
+        ) => {
+            for (k, p) in (0..).zip(ps) {
+                let pt = types.part(t, k).ok_or("internal: a constant with too many parts")?;
+                let off =
+                    ir::layout::part_offset(types, t, k).ok_or("internal: a part's offset")?;
+                write_const(types, pt, p, addrs, out, at + off as usize)?;
             }
         }
         (&ir::TypeDef::Array(..), ir::ConstValue::Bytes(bs)) => put(bs),
@@ -488,7 +474,7 @@ fn write_const(
             put(&k.to_le_bytes());
             if let Some(p) = payload {
                 let pt = types.field(t, 1 + k).ok_or("internal: a variant with no payload")?;
-                let off = field_offsets(types, t)[1 + *k as usize] as usize;
+                let off = ir::layout::field_offsets(types, t)[1 + *k as usize] as usize;
                 write_const(types, pt, p, addrs, out, at + off)?;
             }
         }

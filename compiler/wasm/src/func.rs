@@ -1,10 +1,10 @@
 //! One IR function to one WASM function, plus the generated helpers and export wrappers.
 
-use crate::{Helpers, globals, in_memory, memory, repr, sret, valtype};
+use crate::{Helpers, globals, in_memory, memory, repr, sret, v128_lanes, valtype};
 use std::collections::{HashMap, HashSet};
 use wasm_encoder::{BlockType, Function, Instruction as I, MemArg, ValType};
 use wrela_ir as ir;
-use wrela_ir::layout::{array_stride, column_stride, field_offsets, layout, round_up};
+use wrela_ir::layout::{array_stride, column_stride, field_offsets, layout, part_offset, round_up};
 
 type R<T> = Result<T, String>;
 
@@ -97,14 +97,6 @@ impl Width {
             Width::I32 => I::I32Store(m),
             Width::I16 => I::I32Store16(m),
             Width::I8 => I::I32Store8(m),
-        }
-    }
-
-    fn zero(self) -> I<'static> {
-        match self {
-            Width::V128 => I::V128Const(0),
-            Width::I64 => I::I64Const(0),
-            _ => I::I32Const(0),
         }
     }
 }
@@ -313,7 +305,7 @@ pub(crate) fn emit_function(
         // constants).
         s.for_each_place(&mut |p| {
             if let Some(l) = p.root_local()
-                && p.path.iter().any(|x| matches!(x, ir::Proj::Index(_)))
+                && p.has_index()
             {
                 addressed[l.index()] = true;
             }
@@ -670,18 +662,7 @@ impl<'m> Fe<'m> {
 
     /// A vector type's components, when its values are `v128`s.
     fn vec_n(&self, t: ir::TypeId) -> Option<u8> {
-        match self.ty(t) {
-            ir::TypeDef::Vector(ir::Scalar::F32, n) if self.at.simd => Some(*n),
-            _ => None,
-        }
-    }
-
-    /// The bytes of a component of the vector type `t`.
-    fn comp_size(&self, t: ir::TypeId) -> u32 {
-        match self.ty(t) {
-            ir::TypeDef::Vector(s, _) => crate::scalar_size(*s),
-            _ => 4,
-        }
+        v128_lanes(&self.m.types, t, self.at.simd)
     }
 
     /// Pushes, as a `v128`, the vector of `n` components at the address on top of the stack
@@ -817,7 +798,7 @@ impl<'m> Fe<'m> {
             return;
         }
         for (off, w) in chunks(size, self.at.simd) {
-            self.ins.extend([I::LocalGet(a), w.zero(), w.store(off, 0)]);
+            self.ins.extend([I::LocalGet(a), zero(w.val_type()), w.store(off, 0)]);
         }
     }
 
@@ -882,14 +863,14 @@ impl<'m> Fe<'m> {
     fn project(&mut self, t: ir::TypeId, proj: &ir::Proj) -> R<ir::TypeId> {
         match (self.ty(t), proj) {
             (ir::TypeDef::Struct { .. } | ir::TypeDef::Enum { .. }, ir::Proj::Field(k)) => {
-                self.add_offset(field_offsets(&self.m.types, t)[*k as usize]);
+                self.add_offset(self.part_offset(t, *k)?);
             }
             (ir::TypeDef::Vector(..), ir::Proj::Comp(c)) => {
-                self.add_offset(self.comp_size(t) * u32::from(*c))
+                self.add_offset(self.part_offset(t, u32::from(*c))?)
             }
-            (&ir::TypeDef::Vector(_, n), ir::Proj::Index(i)) => {
+            (&ir::TypeDef::Vector(s, n), ir::Proj::Index(i)) => {
                 self.bounds_check(*i, n as u32);
-                let size = self.comp_size(t) as i32;
+                let size = s.bytes() as i32;
                 self.ins.extend([I::LocalGet(self.v(*i)), I::I32Const(size), I::I32Mul, I::I32Add]);
             }
             (ir::TypeDef::Matrix(n), ir::Proj::Index(i)) => {
@@ -944,9 +925,10 @@ impl<'m> Fe<'m> {
         self.trap_if();
     }
 
-    /// A type the module must already have (a vector's component, a matrix's column).
-    fn find_type(&self, d: &ir::TypeDef) -> R<ir::TypeId> {
-        self.m.types.lookup(d).ok_or_else(|| format!("internal: the type {d:?} isn't interned"))
+    /// The byte offset of constant part `k` of a value of type `t` (`ir::layout::part_offset`).
+    fn part_offset(&self, t: ir::TypeId, k: u32) -> R<u32> {
+        part_offset(&self.m.types, t, k)
+            .ok_or_else(|| format!("internal: part {k} of {:?}", self.ty(t)))
     }
 
     fn load_place(&mut self, p: &ir::Place, dst: ir::ValueId) -> R<()> {
@@ -1605,42 +1587,12 @@ impl<'m> Fe<'m> {
             self.ins.push(I::LocalSet(self.v(v)));
             return Ok(());
         }
-        // A vector's parts are its components; other types can have padding.
+        // A vector's parts are its components; other types can have padding. An array's
+        // offsets saturate: an array of 4 GiB or more has a function that traps on entry (its
+        // frame saturates too), so this code never runs.
         let a = self.fresh_slot(v, !self.m.types.is_vector(t))?;
-        match *self.ty(t) {
-            ir::TypeDef::Struct { .. } => {
-                let offs = field_offsets(&self.m.types, t);
-                for (k, &p) in parts.iter().enumerate() {
-                    self.store_at(a, offs[k], p)?;
-                }
-            }
-            ir::TypeDef::Vector(..) => {
-                let size = self.comp_size(t);
-                for (k, &p) in parts.iter().enumerate() {
-                    self.store_at(a, size * k as u32, p)?;
-                }
-            }
-            ir::TypeDef::Matrix(n) => {
-                let stride = column_stride(n);
-                for (k, &p) in parts.iter().enumerate() {
-                    self.store_at(a, stride * k as u32, p)?;
-                }
-            }
-            ir::TypeDef::Array(e, _) => {
-                // Saturating: an array of 4 GiB or more has a function that traps on entry (its
-                // frame saturates too), so this code never runs.
-                let stride = array_stride(&self.m.types, e);
-                for (k, &p) in parts.iter().enumerate() {
-                    self.store_at(a, stride.saturating_mul(k as u32), p)?;
-                }
-            }
-            // A run's address, then its length.
-            ir::TypeDef::Run(_) => {
-                for (k, &p) in parts.iter().enumerate() {
-                    self.store_at(a, 4 * k as u32, p)?;
-                }
-            }
-            ref d => return Err(format!("internal: construct {d:?}")),
+        for (k, &p) in parts.iter().enumerate() {
+            self.store_at(a, self.part_offset(t, k as u32)?, p)?;
         }
         Ok(())
     }
@@ -1656,22 +1608,8 @@ impl<'m> Fe<'m> {
             ]);
             return Ok(());
         }
-        let (off, et) = match *self.ty(xt) {
-            ir::TypeDef::Struct { .. } | ir::TypeDef::Enum { .. } => {
-                let ft = self.m.types.field(xt, i).ok_or("internal: a missing field")?;
-                (field_offsets(&self.m.types, xt)[i as usize], ft)
-            }
-            ir::TypeDef::Vector(s, _) => {
-                (crate::scalar_size(s) * i, self.find_type(&ir::TypeDef::Scalar(s))?)
-            }
-            ir::TypeDef::Matrix(n) => {
-                (column_stride(n) * i, self.find_type(&ir::TypeDef::Vector(ir::Scalar::F32, n))?)
-            }
-            // Saturating, as in `construct`.
-            ir::TypeDef::Array(e, _) => (array_stride(&self.m.types, e).saturating_mul(i), e),
-            ir::TypeDef::Run(_) => (4 * i, self.find_type(&ir::TypeDef::Scalar(ir::Scalar::U32))?),
-            ref d => return Err(format!("internal: extract from {d:?}")),
-        };
+        let off = self.part_offset(xt, i)?;
+        let et = self.m.types.part(xt, i).ok_or("internal: a part with no type")?;
         self.ins.push(I::LocalGet(self.v(x)));
         if let Some(n) = self.vec_n(et) {
             self.vec_load(n, off);
@@ -1788,11 +1726,12 @@ pub(crate) fn thread_entry_wrapper(entry: u32, params: u32) -> Function {
     function([], &ins)
 }
 
-/// An export's wrapper: scalars and flattened vectors in, a scalar or a flattened vector out,
-/// then a flush. A vector crosses as its components; inside, it's in memory on the shadow stack
-/// (the result's room first, then each vector parameter's). A host passes an 8- or 16-bit
-/// integer or a `bool` as any i32: it's brought into range as a conversion would (the low bits;
-/// any nonzero `bool` is true), since the code inside assumes it is.
+/// An export's wrapper: scalars and flattened vectors in, a result's scalars out (a struct's,
+/// a tuple's or an array's in order), then a flush. A vector crosses as its components;
+/// inside, it's in memory on the shadow stack (the result's room first, then each vector
+/// parameter's). A host passes an 8- or 16-bit integer or a `bool` as any i32: it's brought
+/// into range as a conversion would (the low bits; any nonzero `bool` is true), since the code
+/// inside assumes it is.
 pub(crate) fn export_wrapper(
     m: &ir::Module,
     f: ir::FuncId,
@@ -1801,25 +1740,24 @@ pub(crate) fn export_wrapper(
     stack_top: u32,
     simd: bool,
 ) -> R<(Vec<ValType>, Vec<ValType>, Function)> {
-    const VEC: i32 = 16;
     let func = &m.functions[f.index()];
+    // The bytes of a value's slot in the wrapper's frame: a multiple of 16, so each slot is
+    // aligned.
+    let slot_bytes = |t| round_up(16, layout(&m.types, t).size) as i32;
     // A result: a scalar; an f32 vector as a `v128`, with SIMD (`comps` lanes); or anything
     // else in memory (`sret`), returned as its scalars in order (`leaves`).
     let (results, sret, comps, leaves, ret_bytes) = match func.ret {
         None => (Vec::new(), false, 0, Vec::new(), 0),
-        Some(t) => match m.types.get(t) {
-            ir::TypeDef::Scalar(s) => (vec![valtype(*s)], false, 0, Vec::new(), 0),
-            &ir::TypeDef::Vector(ir::Scalar::F32, n) if simd => {
-                (vec![ValType::F32; n as usize], false, u32::from(n), Vec::new(), 0)
-            }
+        Some(t) => match (m.types.get(t), v128_lanes(&m.types, t, simd)) {
+            (ir::TypeDef::Scalar(s), _) => (vec![valtype(*s)], false, 0, Vec::new(), 0),
+            (_, Some(n)) => (vec![ValType::F32; n as usize], false, u32::from(n), Vec::new(), 0),
             _ => {
                 let leaves = ir::layout::scalars(&m.types, t);
                 if leaves.is_empty() {
                     return Err(format!("internal: export {} returns no numbers", func.name));
                 }
                 let results = leaves.iter().map(|&(_, s)| valtype(s)).collect();
-                let size = ir::layout::layout(&m.types, t).size;
-                (results, true, 0, leaves, ir::layout::round_up(16, size) as i32)
+                (results, true, 0, leaves, slot_bytes(t))
             }
         },
     };
@@ -1831,17 +1769,17 @@ pub(crate) fn export_wrapper(
     let mut size = ret_bytes;
     for p in &func.params {
         let at = params.len() as u32;
-        match m.types.get(p.ty) {
-            ir::TypeDef::Vector(ir::Scalar::F32, n) if simd && !p.by_ref => {
-                params.extend(std::iter::repeat_n(ValType::F32, *n as usize));
-                ins_args.push((at, Some((u32::from(*n), None, ir::Scalar::F32))));
+        match (m.types.get(p.ty), v128_lanes(&m.types, p.ty, simd)) {
+            (_, Some(n)) if !p.by_ref => {
+                params.extend(std::iter::repeat_n(ValType::F32, n as usize));
+                ins_args.push((at, Some((u32::from(n), None))));
             }
             // As a place (or by value, without SIMD, or not f32s), a vector parameter is its
             // address.
-            &ir::TypeDef::Vector(s, n) => {
+            (&ir::TypeDef::Vector(s, n), _) => {
                 params.extend(std::iter::repeat_n(valtype(s), n as usize));
-                ins_args.push((at, Some((u32::from(n), Some(size), s))));
-                size += VEC.max(32 * i32::from(s == ir::Scalar::F64));
+                ins_args.push((at, Some((u32::from(n), Some(size)))));
+                size += slot_bytes(p.ty);
             }
             _ if in_memory(&m.types, p.ty, simd) => {
                 return Err(format!("internal: export {} takes an aggregate", func.name));
@@ -1902,15 +1840,10 @@ pub(crate) fn export_wrapper(
             I::GlobalSet(globals::SP),
         ]);
     }
-    for &(at, vector) in &ins_args {
-        if let Some((comps, Some(off), s)) = vector {
-            let cs = crate::scalar_size(s);
-            for c in 0..comps {
-                ins.extend([
-                    I::LocalGet(frame),
-                    I::LocalGet(at + c),
-                    store_op(s, off as u32 + cs * c),
-                ]);
+    for (p, &(at, vector)) in func.params.iter().zip(&ins_args) {
+        if let Some((_, Some(off))) = vector {
+            for (c, (o, s)) in (at..).zip(ir::layout::scalars(&m.types, p.ty)) {
+                ins.extend([I::LocalGet(frame), I::LocalGet(c), store_op(s, off as u32 + o)]);
             }
         }
     }
@@ -1919,10 +1852,8 @@ pub(crate) fn export_wrapper(
     }
     for &(at, vector) in &ins_args {
         match vector {
-            Some((_, Some(off), _)) => {
-                ins.extend([I::LocalGet(frame), I::I32Const(off), I::I32Add])
-            }
-            Some((comps, None, _)) => {
+            Some((_, Some(off))) => ins.extend([I::LocalGet(frame), I::I32Const(off), I::I32Add]),
+            Some((comps, None)) => {
                 ins.extend([I::LocalGet(at), I::F32x4Splat]);
                 for c in 1..comps {
                     ins.extend([I::LocalGet(at + c), I::F32x4ReplaceLane(c as u8)]);

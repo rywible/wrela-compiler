@@ -371,7 +371,7 @@ impl<'p> Checker<'p> {
             }
             // An alias that names traits: one function decides its type (§4).
             (_, TyKind::Opaque(f, args))
-                if args.is_empty() && self.p.aliases.iter().any(|al| al.defined_by == Some(*f)) =>
+                if args.is_empty() && self.p.alias_defined_by(*f).is_some() =>
             {
                 let name = &self.p.func(*f).name;
                 d = d
@@ -438,7 +438,8 @@ impl<'p> Checker<'p> {
                 let (ty, init) = self.check_init(ty.as_ref(), init);
                 let keyword = Span::new(s.span.file, s.span.start, s.span.start + 3);
                 let Some(else_) = else_ else {
-                    let p = self.check_let_pattern(pat, ty, &init);
+                    let help = "use `match` to handle the other cases";
+                    let p = self.check_let_pattern(pat, ty, &init, "`let`", help);
                     if let PatKind::Bind(id) = p.kind {
                         self.locals[id.index()].keyword = Some(keyword);
                         // `let` owns its value (§6.3): a place it would share is an error,
@@ -557,14 +558,14 @@ impl<'p> Checker<'p> {
                 let ex = self.check_expr(e, None);
                 StmtKind::Expr(ex)
             }
-            ast::StmtKind::While { cond, body } => {
+            ast::StmtKind::While { pat: None, cond, body } => {
                 let bool_ty = self.p.types.bool;
                 let c = self.check_expr(cond, Some(bool_ty));
                 self.expect_cond(&c);
                 let b = self.check_loop_body(body);
                 StmtKind::While { cond: c, body: b }
             }
-            ast::StmtKind::WhileLet { pat, init, body } => {
+            ast::StmtKind::While { pat: Some(pat), cond: init, body } => {
                 // `loop { let pat = init else { break }; body }` (`stmt.while-let`).
                 let env_len = self.env.len();
                 let (ty, init) = self.check_init(None, init);
@@ -868,15 +869,9 @@ impl<'p> Checker<'p> {
                 let destructure = parts.map(|pat| {
                     let init = Expr { ty: elem, span: pat.span, kind: ExprKind::Local(var) };
                     let outer = std::mem::replace(&mut self.binding_mut, mutable);
-                    let p = self.check_pat(pat, elem, true);
+                    let help = "loop over each element and `match` it, or skip the others with `let ... else { continue }`";
+                    let p = self.check_let_pattern(pat, elem, &init, "a `for` loop", help);
                     self.binding_mut = outer;
-                    self.bound_once(&p);
-                    if !self.irrefutable(&p) {
-                        self.err(
-                            Diagnostic::new(codes::E0309, pat.span, "this pattern might not match, so a `for` loop can't use it")
-                                .with_help("loop over each element and `match` it, or skip the others with `let ... else { continue }`"),
-                        );
-                    }
                     Stmt { kind: StmtKind::Bind { pat: p, init, else_: None }, span: pat.span }
                 });
                 let mut b = self.check_loop_body(body);

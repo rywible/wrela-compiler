@@ -6,16 +6,17 @@
  * the next frame. The render worker writes it, as the page shows and hides; the ticker's thread
  * reads it too (#43 §2.1), so a frame's time and the ticks' clock agree. It's in a
  * SharedArrayBuffer: words, a sequence count (odd while it's written) and whether the page is
- * visible; then float64s, the hidden time before the page last hid and when it hid.
+ * visible; then float64s, the hidden time before the page last hid, when it hid, and the visible
+ * time the program started at, which frames and ticks count from.
  */
 export class VisibleClock {
-  static readonly BYTES = 24;
+  static readonly BYTES = 32;
   readonly #words: Int32Array;
   readonly #floats: Float64Array;
 
   constructor(readonly buffer: SharedArrayBuffer) {
     this.#words = new Int32Array(buffer, 0, 2);
-    this.#floats = new Float64Array(buffer, 8, 2);
+    this.#floats = new Float64Array(buffer, 8, 3);
   }
 
   static create(): VisibleClock {
@@ -32,7 +33,6 @@ export class VisibleClock {
     else this.#floats[1] = now;
     Atomics.store(this.#words, 1, visible ? 1 : 0);
     Atomics.add(this.#words, 0, 1);
-    Atomics.notify(this.#words, 1);
   }
 
   get visible(): boolean {
@@ -44,29 +44,28 @@ export class VisibleClock {
     for (;;) {
       const seq = Atomics.load(this.#words, 0);
       if (seq % 2 !== 0) continue;
-      const [hidden, hiddenAt] = [this.#floats[0]!, this.#floats[1]!];
+      const hidden = this.#floats[0]!;
+      const hiddenAt = this.#floats[1]!;
       const visible = Atomics.load(this.#words, 1) !== 0;
       if (Atomics.load(this.#words, 0) === seq) return visible ? now - hidden : hiddenAt - hidden;
     }
   }
 
-  /** Waits up to `ms` for the page to show, if it's hidden. */
-  waitVisible(ms: number): void {
-    Atomics.wait(this.#words, 1, 0, ms);
+  /** The program starts at `now` (ms since 1970): frames and ticks count visible time from it.
+   * The render worker calls it before anything reads `seconds`. */
+  startAt(now: number): void {
+    this.#floats[2] = this.at(now);
   }
 
-  /** Wakes a thread that waits for the page to show (`waitVisible`), to see something else. */
-  wake(): void {
-    Atomics.notify(this.#words, 1);
+  /** Seconds of visible time at `now` (ms since 1970) since the program started. */
+  seconds(now: number): number {
+    return (this.at(now) - this.#floats[2]!) / 1000;
   }
 }
 
-/** Seconds of visible running since `start` (visible ms, `VisibleClock.at`), for each frame;
- * null while the page is hidden (run no frame). */
-export function frameSeconds(clock: VisibleClock, start: number, now: number): number | null {
-  if (!clock.visible) return null;
-  return (clock.at(now) - start) / 1000;
-}
+/** Seconds of visible running at `now` (ms since 1970), for each frame; null while the page is
+ * hidden (run no frame). */
+export const frameSeconds = (clock: VisibleClock, now: number) => (clock.visible ? clock.seconds(now) : null);
 
 /** A canvas size in device pixels that fits the device's largest texture (`max` on each
  * side): scaled down as a whole when it doesn't, so the picture keeps its shape. */

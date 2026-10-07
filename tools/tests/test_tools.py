@@ -118,12 +118,16 @@ class HeadlessTest(PageDir, unittest.TestCase):
         self.assert_chrome_gone()
 
     def test_a_stale_done_doesnt_pass_a_run(self):
-        os.makedirs(os.path.join(self.page_dir, "results"))
-        with open(os.path.join(self.page_dir, "results", "DONE"), "w") as f:
-            f.write("ok")
+        results = os.path.join(self.page_dir, "results")
+        os.makedirs(results)
+        for stale in ("DONE", "hash.txt"):
+            with open(os.path.join(results, stale), "w") as f:
+                f.write("ok")
         status, _, err = self.run_headless("hang", timeout="1")
         self.assertEqual(status, 1)
         self.assertIn("timed out after 1s", err)
+        # An earlier run's results are gone.
+        self.assertFalse(os.path.exists(os.path.join(results, "hash.txt")))
         self.assert_chrome_gone()
 
     def test_chrome_exiting_early_fails(self):

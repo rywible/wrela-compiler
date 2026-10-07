@@ -159,11 +159,7 @@ impl<T> Arena<T> {
 
     /// Every value's handle, in iteration order.
     pub fn handles(self) -> Vec<Handle<T>> {
-        var out = Vec::with_capacity(self.values.len())
-        for i in 0..self.values.len() {
-            out.push(self.handle_at(i))
-        }
-        out
+        Vec::from_fn(self.values.len(), |i| self.handle_at(i))
     }
 }
 

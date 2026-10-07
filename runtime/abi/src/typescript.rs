@@ -40,7 +40,7 @@ pub fn typescript() -> String {
     let [size_x, size_y, size_z] = manifest::MAX_WORKGROUP_SIZE;
     format!(
         r#"// Generated from the wrela-abi crate (runtime/abi): the one definition of the
-// command stream and manifest. Don't edit; run `cargo run -p wrela-abi --bin gen-ts`.
+// command stream and manifest. Don't edit; run `cargo run -p wrela-abi --bin generate`.
 
 export const STREAM_VERSION = {stream_version};
 export const MANIFEST_VERSION = {manifest_version};
@@ -51,6 +51,10 @@ export const COMMAND_HEADER_LEN = {command_header_len};
 /** A pass's attachment that isn't there, and a pass's colour attachment that is the screen. */
 export const NONE = 0x{none:08x};
 export const SCREEN = 0x{screen:08x};
+/** The upload ring's starting size, and the largest write it takes: a bigger one goes through
+ * the queue, between submissions. */
+export const UPLOAD_START = {upload_start};
+export const UPLOAD_MAX = {upload_max};
 
 export const Opcode = {{
 {opcodes}}} as const;
@@ -98,7 +102,6 @@ export const AUDIO_QUANTUM = {audio_quantum};
 export const AUDIO_OUT = {audio_out};
 /** The threads (runtime/abi `memory`): their numbers, their blocks, and the words of a block and
  * of a job slot a host reads and writes. */
-export const THREADS = {threads};
 export const THREAD_MAIN = {thread_main};
 export const THREAD_TICK = {thread_tick};
 export const THREAD_AUDIO = {thread_audio};
@@ -106,29 +109,27 @@ export const THREAD_HELPER0 = {thread_helper0};
 export const MAX_WORKERS = {max_workers};
 export const THREAD_BLOCKS = {thread_blocks};
 export const THREAD_BLOCK_SIZE = {thread_block_size};
+export const THREAD_BLOCKS_END = {thread_blocks_end};
 export const JOB_DONE = {job_done};
 export const JOB_FAILED = {job_failed};
 export const JOB_DONE_FAILED = {job_done_failed};
 export const RUNNING = {running};
 export const JOB_SLOTS = {job_slots};
-export const JOB_SLOT_COUNT = {job_slot_count};
-export const JOB_SLOT_SIZE = {job_slot_size};
+export const JOB_SLOTS_END = {job_slots_end};
 export const SLOT_STATE = {slot_state};
 export const SLOT_THREAD = {slot_thread};
 export const SLOT_FAILED = {slot_failed};
-/** The helpers' shared words: their wake-up, the host's shutdown, how many chunks they ran, and
- * how long they hold a job's result back (tests). */
-export const PAR_WAKE = {par_wake};
-export const PAR_SHUTDOWN = {par_shutdown};
+/** How many chunks the helpers have run (one of their shared words). */
 export const PAR_HELPED = {par_helped};
-export const PAR_HOLD = {par_hold};
 /** The ticker's words (runtime/abi `memory`), and its records' region. */
 export const TICK_WANT_HASH = {tick_want_hash};
 export const TICK_HASH = {tick_hash};
 export const TICK_ORIGIN = {tick_origin};
 export const TICK_RECORDS = {tick_records};
 export const MAX_TICK_RECORDS = {max_tick_records};
-/** The tick log (runtime/abi `ticks`). */
+/** The tick log (runtime/abi `ticks`): its magic, the bytes `WRTL` read as a little-endian
+ * u32. */
+export const TICK_LOG_MAGIC = 0x{tick_log_magic:08x};
 export const TICK_LOG_VERSION = {tick_log_version};
 export const TICK_LOG_HEADER_LEN = {tick_log_header_len};
 export const REQUEST_PENDING = {request_pending};
@@ -163,6 +164,8 @@ export const PANIC_CAP = {panic_cap};
         command_header_len = stream::COMMAND_HEADER_LEN,
         none = stream::NONE,
         screen = stream::SCREEN,
+        upload_start = stream::UPLOAD_START,
+        upload_max = stream::UPLOAD_MAX,
         import_module = crate::IMPORT_MODULE,
         import_submit = crate::IMPORT_SUBMIT,
         import_request_status = crate::IMPORT_REQUEST_STATUS,
@@ -183,7 +186,6 @@ export const PANIC_CAP = {panic_cap};
         audio_sample_rate = crate::AUDIO_SAMPLE_RATE,
         audio_quantum = crate::AUDIO_QUANTUM,
         audio_out = crate::memory::AUDIO_OUT,
-        threads = crate::memory::THREADS,
         thread_main = crate::memory::THREAD_MAIN,
         thread_tick = crate::memory::THREAD_TICK,
         thread_audio = crate::memory::THREAD_AUDIO,
@@ -191,25 +193,23 @@ export const PANIC_CAP = {panic_cap};
         max_workers = crate::memory::MAX_WORKERS,
         thread_blocks = crate::memory::THREAD_BLOCKS,
         thread_block_size = crate::memory::THREAD_BLOCK_SIZE,
+        thread_blocks_end = crate::memory::THREAD_BLOCKS_END,
         job_done = crate::memory::JOB_DONE,
         job_failed = crate::memory::JOB_FAILED,
         job_done_failed = crate::memory::JOB_DONE_FAILED,
         running = crate::memory::RUNNING,
         job_slots = crate::memory::JOB_SLOTS,
-        job_slot_count = crate::memory::JOB_SLOT_COUNT,
-        job_slot_size = crate::memory::JOB_SLOT_SIZE,
+        job_slots_end = crate::memory::JOB_SLOTS_END,
         slot_state = crate::memory::SLOT_STATE,
         slot_thread = crate::memory::SLOT_THREAD,
         slot_failed = crate::memory::SLOT_FAILED,
-        par_wake = crate::memory::PAR_WAKE,
-        par_shutdown = crate::memory::PAR_SHUTDOWN,
         par_helped = crate::memory::PAR_HELPED,
-        par_hold = crate::memory::PAR_HOLD,
         tick_want_hash = crate::memory::TICK_WANT_HASH,
         tick_hash = crate::memory::TICK_HASH,
         tick_origin = crate::memory::TICK_ORIGIN,
         tick_records = crate::memory::TICK_RECORDS,
         max_tick_records = crate::memory::MAX_TICK_RECORDS,
+        tick_log_magic = u32::from_le_bytes(crate::ticks::MAGIC),
         tick_log_version = crate::ticks::VERSION,
         tick_log_header_len = crate::ticks::HEADER_LEN,
         request_pending = crate::REQUEST_PENDING,

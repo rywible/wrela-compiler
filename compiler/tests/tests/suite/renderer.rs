@@ -92,9 +92,7 @@ fn both_hosts_time_each_pass() {
 #[ignore = "long: needs Chrome, python3 and a GPU"]
 fn indexed_draws_cull_and_bias_in_both_hosts() {
     let (dir, rel) = page("compiler/tests/indexed", "indexed-hosts");
-    let manifest = std::fs::read_to_string(dir.join("manifest.json")).expect("manifest");
-    let manifest = wrela_abi::Manifest::parse(&manifest).expect("valid");
-    let states: Vec<String> = manifest
+    let states: Vec<String> = wrela_tests::manifest(&dir)
         .pipelines
         .iter()
         .map(|p| match &p.stage {

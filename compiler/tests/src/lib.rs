@@ -4,7 +4,8 @@
 //!
 //! The GPU tests are `#[ignore]`d: they need a GPU and take the GPU lock (`wrela_host::lock`).
 //! `tools/check.sh` runs them, but those whose reason starts `long:` (Chrome, timing and soak
-//! runs), which `tools/check.sh --long` runs.
+//! runs), which `tools/check.sh --long` runs: those whose reason goes on `alone:` (the time
+//! budgets) one at a time.
 //!
 //! Sampled tests have two sizes: small by default, so `cargo test` stays fast, and the size the
 //! acceptance criteria name when `WRELA_FULL` is set ([`sized`]), as `tools/check.sh --long`
@@ -12,13 +13,38 @@
 
 pub mod spike01;
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 use wrela_diag::{Diagnostic, Edit, FileId};
-use wrela_host::{CpuHost, Host, Value, map_read};
+use wrela_host::{CpuHost, Host, TickLog, Value, map_read};
 
 /// SplitMix64, for tests' random inputs.
 pub use wrela_grammar::rng::Rng;
-pub use wrela_grammar::testing::{files_under, par_each, repo_root, sized};
+pub use wrela_grammar::testing::{files_under, par_each, par_map, repo_root, sized};
+
+/// Work done once per process for each key: a second caller with a key waits for the first's
+/// work rather than racing it, and work for other keys runs at the same time.
+pub struct OncePerKey(Mutex<BTreeMap<String, Arc<OnceLock<()>>>>);
+
+impl OncePerKey {
+    pub const fn new() -> OncePerKey {
+        OncePerKey(Mutex::new(BTreeMap::new()))
+    }
+
+    /// Does `work` for `key` unless it's done (or another thread is doing it: this waits).
+    pub fn run(&self, key: &str, work: impl FnOnce()) {
+        let once =
+            self.0.lock().unwrap_or_else(|p| p.into_inner()).entry(key.into()).or_default().clone();
+        once.get_or_init(work);
+    }
+}
+
+impl Default for OncePerKey {
+    fn default() -> OncePerKey {
+        OncePerKey::new()
+    }
+}
 
 /// Builds the package in `pkg` as `wrela build` does, without writing its files: the output,
 /// or the errors rendered.
@@ -115,6 +141,14 @@ pub fn one_u32(host: &mut impl Exports, name: &str, args: &[Value]) -> u32 {
     }
 }
 
+/// Calls the export `name`, which must return one `vec3` (three `f32`s).
+pub fn one_vec3(host: &mut impl Exports, name: &str, args: &[Value]) -> [f32; 3] {
+    match host.call(name, args).expect(name).as_slice() {
+        [Value::F32(x), Value::F32(y), Value::F32(z)] => [*x, *y, *z],
+        other => panic!("{name} returned {other:?}"),
+    }
+}
+
 /// A little-endian `f32` array from bytes.
 pub fn f32s(bytes: &[u8]) -> Vec<f32> {
     bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
@@ -128,37 +162,10 @@ pub fn bytes_of(xs: &[f32]) -> Vec<u8> {
     xs.iter().flat_map(|x| x.to_le_bytes()).collect()
 }
 
-/// `f` of each item, on every core at once (each item once), in the items' order: for a test
-/// that checks many independent cases. Each thread has a 64 MiB stack, as deep programs need.
-pub fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    let next = AtomicUsize::new(0);
-    let threads =
-        std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(1, items.len().max(1));
-    let mut done: Vec<(usize, R)> = std::thread::scope(|s| {
-        let workers: Vec<_> = (0..threads)
-            .map(|_| {
-                std::thread::Builder::new()
-                    .stack_size(64 << 20)
-                    .spawn_scoped(s, || {
-                        let mut mine = Vec::new();
-                        loop {
-                            let i = next.fetch_add(1, Ordering::Relaxed);
-                            let Some(item) = items.get(i) else { break };
-                            mine.push((i, f(item)));
-                        }
-                        mine
-                    })
-                    .expect("spawn a worker")
-            })
-            .collect();
-        workers
-            .into_iter()
-            .flat_map(|w| w.join().unwrap_or_else(|e| std::panic::resume_unwind(e)))
-            .collect()
-    });
-    done.sort_by_key(|(i, _)| *i);
-    done.into_iter().map(|(_, r)| r).collect()
+/// The rest positions of the first `n` of a buffer's skinned vertices (`SkinVertex`, as the
+/// spike wrote them too): 48 bytes each, the position first.
+pub fn positions(bytes: &[u8], n: usize) -> Vec<[f32; 3]> {
+    bytes.chunks_exact(48).take(n).map(|v| f32s(&v[..12]).try_into().expect("3 floats")).collect()
 }
 
 /// The larger error; NaN if either is (`f64::max` drops a NaN, which would pass every check).
@@ -168,9 +175,21 @@ pub fn worse(a: f64, b: f64) -> f64 {
 
 /// The median of some durations.
 pub fn median(xs: &[f64]) -> f64 {
+    percentile(xs, 0.5)
+}
+
+/// The `p` quantile of some durations (0.99: the 99th percentile): the ⌊n·p⌋th of the n
+/// sorted (from 0), or the last.
+pub fn percentile(xs: &[f64], p: f64) -> f64 {
     let mut v = xs.to_vec();
     v.sort_by(f64::total_cmp);
-    v[v.len() / 2]
+    v[((v.len() as f64 * p) as usize).min(v.len() - 1)]
+}
+
+/// The manifest of the build in `dir`.
+pub fn manifest(dir: &Path) -> wrela_abi::Manifest {
+    let text = std::fs::read_to_string(dir.join("manifest.json")).expect("manifest.json");
+    wrela_abi::Manifest::parse(&text).expect("a valid manifest")
 }
 
 /// One binding of a hand-written kernel, at group 0 and the binding's index in the list.
@@ -199,9 +218,31 @@ impl RawGpu {
         Ok(RawGpu { device, queue, _lock: lock })
     }
 
+    pub fn device(&self) -> &wgpu::Device {
+        &self.device
+    }
+
+    pub fn queue(&self) -> &wgpu::Queue {
+        &self.queue
+    }
+
+    /// The first `size` bytes of `src` (a `COPY_SRC` buffer), after the work submitted so far.
+    pub fn read(&self, src: &wgpu::Buffer, size: u64) -> Vec<u8> {
+        let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("readback"),
+            size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        encoder.copy_buffer_to_buffer(src, 0, &readback, 0, size);
+        self.queue.submit([encoder.finish()]);
+        map_read(&self.device, &readback).expect("read back")
+    }
+
     /// Runs `entry` of `wgsl` over `groups` workgroups (in x), `reps` times, each in its own
     /// timed compute pass. Returns each run's GPU nanoseconds and the `Write` buffers'
-    /// contents after the last.
+    /// contents after the last. Panics if the WGSL isn't valid or the GPU fails.
     pub fn run(
         &self,
         wgsl: &str,
@@ -209,7 +250,7 @@ impl RawGpu {
         binds: &[Bind],
         groups: u32,
         reps: u32,
-    ) -> Result<(Vec<f64>, Vec<Vec<u8>>), String> {
+    ) -> (Vec<f64>, Vec<Vec<u8>>) {
         use wgpu::util::DeviceExt;
         let (device, queue) = (&self.device, &self.queue);
         let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
@@ -283,76 +324,72 @@ impl RawGpu {
         }
         queue.submit([encoder.finish()]);
         if let Some(e) = pollster::block_on(scope.pop()) {
-            return Err(e.to_string());
+            panic!("`{entry}`: {e}");
         }
         let times = wrela_host::read_timestamps(device, queue, &queries, reps)
-            .map_err(|e| e.to_string())?;
-        let mut encoder = device.create_command_encoder(&Default::default());
-        let mut readbacks = Vec::new();
-        for (b, buf) in binds.iter().zip(&buffers) {
-            if let Bind::Write(n) = b {
-                let rb = device.create_buffer(&wgpu::BufferDescriptor {
-                    label: None,
-                    size: *n,
-                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                });
-                encoder.copy_buffer_to_buffer(buf, 0, &rb, 0, *n);
-                readbacks.push(rb);
-            }
-        }
-        queue.submit([encoder.finish()]);
-        let mut outs = Vec::new();
-        for rb in &readbacks {
-            outs.push(map_read(device, rb).map_err(|e| e.to_string())?);
-        }
-        Ok((times, outs))
+            .unwrap_or_else(|e| panic!("`{entry}`'s timestamps: {e}"));
+        let outs = binds
+            .iter()
+            .zip(&buffers)
+            .filter_map(|(b, buf)| match b {
+                Bind::Write(n) => Some(self.read(buf, *n)),
+                _ => None,
+            })
+            .collect();
+        (times, outs)
     }
 }
 
 /// Builds the package at `pkg` (a path from the repo root) into `target/tmp/<name>`, where
-/// tools/headless.py can serve it as a page, with an empty `results/`. Returns the directory
-/// and its path from the repo root.
+/// tools/headless.py can serve it as a page (its runs write `results/` there). Returns the
+/// directory and its path from the repo root. Each package is built once per process, and each
+/// page is a copy of that build.
 pub fn page(pkg: &str, name: &str) -> (PathBuf, String) {
-    let rel = format!("target/tmp/{name}");
-    let dir = repo_root().join(&rel);
-    let _ = std::fs::remove_dir_all(&dir);
-    must_build(&repo_root().join(pkg), &dir);
-    std::fs::create_dir_all(dir.join("results")).expect("results dir");
-    (dir, rel)
+    page_built_by(pkg, name, "release", wrela_driver::build)
 }
 
 /// [`page`] with a debug build (language.md §11's checks).
 pub fn debug_page(pkg: &str, name: &str) -> (PathBuf, String) {
-    page_built_by(pkg, name, wrela_driver::build_debug)
+    page_built_by(pkg, name, "debug", wrela_driver::build_debug)
 }
 
 /// [`page`] with a build whose WASM uses no SIMD (language.md §11).
 pub fn scalar_page(pkg: &str, name: &str) -> (PathBuf, String) {
-    page_built_by(pkg, name, wrela_driver::build_without_simd)
+    page_built_by(pkg, name, "scalar", wrela_driver::build_without_simd)
 }
 
+/// [`page`], the package built by `build` (`kind` names it).
 fn page_built_by(
     pkg: &str,
     name: &str,
+    kind: &str,
     build: fn(&Path) -> wrela_driver::Output,
 ) -> (PathBuf, String) {
+    static BUILDS: OncePerKey = OncePerKey::new();
+    // No host loads the build here (it would keep its compiled code beside it), only copies.
+    let base = repo_root()
+        .join("target/tmp/page-builds")
+        .join(format!("{}-{kind}", pkg.replace('/', "-")));
+    BUILDS.run(&base.display().to_string(), || {
+        let _ = std::fs::remove_dir_all(&base);
+        let built = build(&repo_root().join(pkg));
+        if built.has_errors() {
+            panic!(
+                "{pkg} doesn't build:\n{}",
+                wrela_diag::render::render_all(&built.sources, &built.diagnostics)
+            );
+        }
+        built.write_to(&base).expect("write the build");
+    });
     let rel = format!("target/tmp/{name}");
     let dir = repo_root().join(&rel);
     let _ = std::fs::remove_dir_all(&dir);
-    let built = build(&repo_root().join(pkg));
-    if built.has_errors() {
-        panic!(
-            "{pkg} doesn't build:\n{}",
-            wrela_diag::render::render_all(&built.sources, &built.diagnostics)
-        );
-    }
-    built.write_to(&dir).expect("write the build");
-    std::fs::create_dir_all(dir.join("results")).expect("results dir");
+    copy_dir(&base, &dir);
     (dir, rel)
 }
 
-/// Runs tools/headless.py, from the repo root, with `args`: whether the run passed.
+/// Runs tools/headless.py, from the repo root, with `args`: whether the run passed. It empties
+/// the page's `results/` first.
 fn headless<S: AsRef<std::ffi::OsStr>>(args: impl IntoIterator<Item = S>) -> bool {
     std::process::Command::new("python3")
         .arg(repo_root().join("tools/headless.py"))
@@ -366,16 +403,12 @@ fn headless<S: AsRef<std::ffi::OsStr>>(args: impl IntoIterator<Item = S>) -> boo
 /// Runs a plain page (no wrela build) at `rel` in headless Chrome with URL fragment
 /// `fragment`: whether it wrote `ok` to `results/DONE` within `timeout` seconds.
 pub fn run_page_in_chrome(rel: &str, fragment: &str, timeout: u32) -> bool {
-    let _ = std::fs::remove_dir_all(repo_root().join(rel).join("results"));
     headless([rel, fragment, &timeout.to_string()])
 }
 
 /// A test-mode run in headless Chrome that must fail: the message the page failed with.
 pub fn chrome_failure(rel: &str, run: ChromeRun) -> String {
-    assert!(
-        !headless([rel, &run.fragment(), &run.timeout().to_string()]),
-        "the browser run passed; it should have failed"
-    );
+    assert!(!run.run(rel), "the browser run passed; it should have failed");
     let done = repo_root().join(rel).join("results/DONE");
     std::fs::read_to_string(done).expect("results/DONE")
 }
@@ -394,9 +427,8 @@ pub struct BrowserRun {
     pub timings: Vec<(usize, String, f64)>,
     /// The ticker's ticks, when the program started one.
     pub ticks: Option<ChromeTicks>,
-    /// Each frame's CPU time (ms), when it began (ms since 1970), and the frame each printed
-    /// line came in (`results/frames.json`), with the lines (`results/log.txt`).
-    pub cpu_ms: Vec<f64>,
+    /// When each frame began (ms since 1970), and the frame each printed line came in
+    /// (`results/frames.json`), with the lines (`results/log.txt`).
     pub began_ms: Vec<f64>,
     pub printed: Vec<(usize, String)>,
 }
@@ -404,20 +436,19 @@ pub struct BrowserRun {
 /// What the ticker's thread did in a test-mode run in Chrome (`results/ticks.json`).
 pub struct ChromeTicks {
     pub hz: u32,
-    /// When each tick began (ms since 1970), and its CPU time (ms).
-    pub began_ms: Vec<f64>,
+    /// Each tick's CPU time (ms).
     pub cpu_ms: Vec<f64>,
-    /// Each tick's state hash (16 hex digits), unless the run kept none.
-    pub hashes: Vec<String>,
-    /// Ticks the clock dropped, catching up.
-    pub dropped: u64,
-    /// The tick log (runtime/abi `ticks`), unless the run kept no hashes.
-    pub log: Option<Vec<u8>>,
+    /// The tick log (`results/ticks.log`), with each tick's state hash, unless the run kept no
+    /// hashes.
+    pub log: Option<TickLog>,
 }
+
+/// The script of input events a [`ChromeRun`] writes beside the page.
+const SCRIPT: &str = "input.json";
 
 /// How [`run_in_chrome_with`] runs a page: test mode's parameters (runtime/browser's
 /// testmode.ts).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct ChromeRun {
     pub frames: u32,
     pub width: u32,
@@ -429,8 +460,8 @@ pub struct ChromeRun {
     pub audio: u32,
     /// Time each pass on the GPU.
     pub timestamps: bool,
-    /// A script of input events, relative to the page (runtime/abi `input`); "" for none.
-    pub input: String,
+    /// A script of input events (runtime/abi `input`), which the run writes beside the page.
+    pub script: Option<String>,
     /// Pointer events the page sends through the DOM while the frames run (0: none):
     /// `results/latency.json` says when each reached the program.
     pub latency: u32,
@@ -450,23 +481,7 @@ pub struct ChromeRun {
 
 impl ChromeRun {
     pub fn new(frames: u32, width: u32, height: u32, fps: f64) -> ChromeRun {
-        ChromeRun {
-            frames,
-            width,
-            height,
-            fps,
-            workers: 1,
-            audio: 0,
-            timestamps: false,
-            input: String::new(),
-            latency: 0,
-            keylatency: 0,
-            paced: false,
-            tickdelay: 0,
-            framedelay: 0,
-            nohash: false,
-            salt: 0,
-        }
+        ChromeRun { frames, width, height, fps, workers: 1, ..ChromeRun::default() }
     }
 
     /// Seconds the run may take: 300, or three times its frames' paced time and two minutes
@@ -485,7 +500,7 @@ impl ChromeRun {
             workers,
             audio,
             timestamps,
-            input,
+            script,
             latency,
             keylatency,
             paced,
@@ -494,20 +509,39 @@ impl ChromeRun {
             nohash,
             salt,
         } = self;
-        let count = |name: &str, n: u32| if n > 0 { format!("&{name}={n}") } else { String::new() };
-        format!(
-            "#test&frames={frames}&width={width}&height={height}&fps={fps}&workers={workers}{}{}{}{}{}{}{}{}{}{}",
-            count("audio", *audio),
-            if *timestamps { "&timestamps=1" } else { "" },
-            if input.is_empty() { String::new() } else { format!("&input={input}") },
-            count("latency", *latency),
-            count("keylatency", *keylatency),
-            if *paced { "&paced=1" } else { "" },
-            count("tickdelay", *tickdelay),
-            count("framedelay", *framedelay),
-            if *nohash { "&nohash=1" } else { "" },
-            count("salt", *salt),
-        )
+        let mut fragment = format!(
+            "#test&frames={frames}&width={width}&height={height}&fps={fps}&workers={workers}"
+        );
+        // Test mode takes no zeros: a parameter that's off is left out.
+        let flag = |on: &bool| u32::from(*on);
+        for (name, n) in [
+            ("audio", *audio),
+            ("timestamps", flag(timestamps)),
+            ("latency", *latency),
+            ("keylatency", *keylatency),
+            ("paced", flag(paced)),
+            ("tickdelay", *tickdelay),
+            ("framedelay", *framedelay),
+            ("nohash", flag(nohash)),
+            ("salt", *salt),
+        ] {
+            if n > 0 {
+                fragment += &format!("&{name}={n}");
+            }
+        }
+        if script.is_some() {
+            fragment += &format!("&input={SCRIPT}");
+        }
+        fragment
+    }
+
+    /// Runs the page at `rel` in headless Chrome this way, its script written beside it first:
+    /// whether the run passed.
+    fn run(&self, rel: &str) -> bool {
+        if let Some(script) = &self.script {
+            std::fs::write(repo_root().join(rel).join(SCRIPT), script).expect("write the script");
+        }
+        headless([rel, &self.fragment(), &self.timeout().to_string()])
     }
 }
 
@@ -519,12 +553,8 @@ pub fn run_in_chrome(rel: &str, frames: u32, width: u32, height: u32, fps: f64) 
 
 /// [`run_in_chrome`], with all of test mode's parameters.
 pub fn run_in_chrome_with(rel: &str, run: ChromeRun) -> BrowserRun {
+    assert!(run.run(rel), "the browser run failed; see {rel}/results/console.log");
     let results = repo_root().join(rel).join("results");
-    // A run before this one, on the same page, left its own results.
-    let _ = std::fs::remove_dir_all(&results);
-    std::fs::create_dir_all(&results).expect("results dir");
-    let passed = headless([rel, &run.fragment(), &run.timeout().to_string()]);
-    assert!(passed, "the browser run failed; see {rel}/results/console.log");
     let frames = result_json(&results, "frames.json");
     let log = std::fs::read_to_string(results.join("log.txt")).expect("log.txt");
     BrowserRun {
@@ -536,14 +566,12 @@ pub fn run_in_chrome_with(rel: &str, run: ChromeRun) -> BrowserRun {
             .parse()
             .expect("a count"),
         audio: if run.audio > 0 {
-            let bytes = std::fs::read(results.join("audio.f32")).expect("audio.f32");
-            bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect()
+            f32s(&std::fs::read(results.join("audio.f32")).expect("audio.f32"))
         } else {
             Vec::new()
         },
         timings: if run.timestamps { timings(&results) } else { Vec::new() },
         ticks: chrome_ticks(&results),
-        cpu_ms: frames["cpu_ms"].as_array().expect("cpu_ms").iter().map(number).collect(),
         began_ms: frames["began_ms"].as_array().expect("began_ms").iter().map(number).collect(),
         printed: frames["printed_in"]
             .as_array()
@@ -572,27 +600,18 @@ fn chrome_ticks(results: &Path) -> Option<ChromeTicks> {
         return None;
     }
     let v = result_json(results, "ticks.json");
-    let numbers = |key: &str| v[key].as_array().expect(key).iter().map(number).collect();
+    let log = std::fs::read(results.join("ticks.log")).ok();
     Some(ChromeTicks {
         hz: v["hz"].as_u64().expect("hz") as u32,
-        began_ms: numbers("began_ms"),
-        cpu_ms: numbers("cpu_ms"),
-        hashes: v["hashes"]
-            .as_array()
-            .expect("hashes")
-            .iter()
-            .map(|h| h.as_str().expect("a hash").to_string())
-            .collect(),
-        dropped: v["dropped"].as_u64().expect("dropped"),
-        log: std::fs::read(results.join("ticks.log")).ok(),
+        cpu_ms: v["cpu_ms"].as_array().expect("cpu_ms").iter().map(number).collect(),
+        log: log.map(|bytes| TickLog::decode(&bytes).expect("Chrome's tick log reads")),
     })
 }
 
 /// Each pass's GPU time in a test-mode run's `results/` (its `timings.json`): its frame, its
 /// label (as the native host's `GpuTiming`) and nanoseconds.
 pub fn timings(results: &Path) -> Vec<(usize, String, f64)> {
-    let text = std::fs::read_to_string(results.join("timings.json")).expect("timings.json");
-    let v: serde_json::Value = serde_json::from_str(&text).expect("timings.json is JSON");
+    let v = result_json(results, "timings.json");
     let entries = v.as_array().expect("an array").iter();
     entries
         .map(|t| {
@@ -607,15 +626,12 @@ pub fn timings(results: &Path) -> Vec<(usize, String, f64)> {
 /// (tools/headless.py --url): its results go to `page/results/`. Panics, pointing at the
 /// console log, if the run fails.
 pub fn run_url_in_chrome(url: &str, page: &Path, timeout: u32) {
-    let results = page.join("results");
-    let _ = std::fs::remove_dir_all(&results);
-    std::fs::create_dir_all(&results).expect("results dir");
     let timeout = timeout.to_string();
     let args: [&std::ffi::OsStr; 4] =
         ["--url".as_ref(), url.as_ref(), page.as_os_str(), timeout.as_ref()];
     assert!(
         headless(args),
         "the browser run failed; see {}",
-        results.join("console.log").display()
+        page.join("results/console.log").display()
     );
 }

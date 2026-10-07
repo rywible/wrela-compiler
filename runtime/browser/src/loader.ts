@@ -109,5 +109,5 @@ export async function startProgram(
   const [pipelines, compiled] = await Promise.all([built, Program.compile(build.wasm)]);
   const executor = new GpuExecutor(device, pipelines, screen, timestamps);
   const checker = new Checker(build.manifest, limitsOf(device.limits));
-    return Program.instantiate(compiled, checker, executor, options);
+  return Program.instantiate(compiled, checker, executor, options);
 }

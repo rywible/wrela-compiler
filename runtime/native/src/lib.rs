@@ -33,13 +33,13 @@ pub mod lock;
 mod program;
 mod shared;
 
-pub use cache::compiled_code_name;
+pub use cache::compiled_code_prefix;
 pub use error::{Error, Result};
 #[cfg(feature = "gpu")]
 pub use gpu::{GpuTiming, map_read, open_device, read_timestamps};
 pub use program::{Failure, PostHandler, Ticked, Value};
-pub use wrela_abi::input::{At, Event, Scripted, parse_script};
-pub use wrela_abi::ticks::TickLog;
+pub use wrela_abi::input::{Event, Scripted, parse_script};
+pub use wrela_abi::ticks::{TickLog, frame_time, lockstep_ticks};
 
 #[cfg(feature = "gpu")]
 use gpu::Gpu;
@@ -121,19 +121,6 @@ impl RunResult {
     }
 }
 
-/// The time of frame `i` at `fps` frames a second, as both hosts compute it: `i / fps` in f64,
-/// rounded to f32.
-pub fn frame_time(i: u32, fps: f64) -> f32 {
-    (f64::from(i) / fps) as f32
-}
-
-/// How many ticks have run before frame `i` in lockstep (test mode, #43 §2.3), as both hosts
-/// compute it: ⌊(i + 1) · hz / fps⌋, in f64. Frame `i` waits for them, and the ticker waits for
-/// frame `i` before the next, so the frame draws the same snapshot in both hosts.
-pub fn lockstep_ticks(i: u32, hz: u32, fps: f64) -> u32 {
-    ((f64::from(i) + 1.0) * f64::from(hz) / fps).floor() as u32
-}
-
 /// Why a tick log didn't replay.
 #[derive(Debug)]
 pub enum ReplayError {
@@ -147,8 +134,9 @@ pub enum ReplayError {
     FirstWorld { log: u64, replayed: u64 },
     /// Tick `tick`'s hash isn't the log's: the first that differs.
     Tick { tick: u32, log: u64, replayed: u64 },
-    /// The program failed: it trapped, or the host couldn't run it.
-    Failed(Error),
+    /// The program failed, in tick `tick` if it was in one: it trapped, or the host couldn't
+    /// run it.
+    Failed { tick: Option<u32>, error: Error },
 }
 
 impl std::fmt::Display for ReplayError {
@@ -177,7 +165,7 @@ impl std::fmt::Display for ReplayError {
                 hex(*log),
                 hex(*replayed)
             ),
-            ReplayError::Failed(e) => write!(f, "{e}"),
+            ReplayError::Failed { error, .. } => write!(f, "{error}"),
         }
     }
 }
@@ -187,8 +175,10 @@ impl std::error::Error for ReplayError {}
 /// Compiles the build in `dir` and keeps its compiled code beside it, so the loads that follow
 /// don't compile it again (`cache`).
 pub fn precompile(dir: impl AsRef<Path>) -> Result<()> {
-    let (_, wasm, _) = read_build(dir.as_ref())?;
-    program::compile_cached(&wasm, dir.as_ref()).map(|_| ())
+    let dir = dir.as_ref();
+    let (_, wasm, _) = read_build(dir)?;
+    let hash = wrela_abi::ticks::wasm_hash(&wasm);
+    program::compile_cached(&wasm, hash, Some(dir), None).map(|_| ())
 }
 
 /// Reads a build's manifest, WASM and WGSL from `dir`.
@@ -230,8 +220,9 @@ impl Host {
     pub fn load_with(dir: impl AsRef<Path>, options: &Options) -> Result<Host> {
         let dir = dir.as_ref();
         let (manifest, wasm, shaders) = read_build(dir)?;
+        let wasm_hash = wrela_abi::ticks::wasm_hash(&wasm);
         // Everything that can be checked without the GPU is, before taking it.
-        let compiled = program::compile_cached(&wasm, dir)?;
+        let compiled = program::compile_cached(&wasm, wasm_hash, Some(dir), None)?;
         let lock = lock::GpuLock::acquire(&format!("wrela-host {}", dir.display()))?;
         let gpu = Gpu::new(&manifest, &shaders, options.timestamps)?;
         let io = io(dir, options.storage.as_deref(), options.post.clone(), options.quiet);
@@ -245,7 +236,6 @@ impl Host {
             n,
             !options.defer_init,
         )?;
-        let wasm_hash = wrela_abi::ticks::wasm_hash(&wasm);
         Ok(Host { program, wasm_hash, _lock: lock })
     }
 
@@ -257,9 +247,10 @@ impl Host {
 
     /// Runs `frames` frames at `fps` in lockstep with the program's ticker, if it has one
     /// (test mode, #43 §2.3; [`CpuHost::lockstep_frame`]), then reads the screen back. With
-    /// `log`, each tick's records and state hash go into it (its header filled in here; ask for
-    /// the first world's hash with [`Host::want_hashes`] before the program's `init`, which a
-    /// [`Options::defer_init`] load leaves to [`Host::init`]).
+    /// `log`, each tick's records and state hash go into a tick log, which it gives too (an
+    /// error if the program has no ticker): ask for the first world's hash with
+    /// [`Host::want_hashes`] before the program's `init`, which a [`Options::defer_init`] load
+    /// leaves to [`Host::init`].
     pub fn run_lockstep(
         &mut self,
         frames: u32,
@@ -267,20 +258,20 @@ impl Host {
         width: u32,
         height: u32,
         script: &[Scripted],
-        mut log: Option<&mut TickLog>,
-    ) -> Result<RunResult> {
+        log: bool,
+    ) -> Result<(RunResult, Option<TickLog>)> {
         self.program.executor().set_screen(width, height)?;
-        if let (Some(log), Some(hz)) = (log.as_deref_mut(), self.program.ticker_hz()) {
-            log.hz = hz;
-        }
+        let mut log = if log {
+            self.program.want_hashes(true);
+            Some(self.program.tick_log(self.wasm_hash)?)
+        } else {
+            None
+        };
         for i in 0..frames {
             self.program.executor().set_frame(i as usize);
-            self.program.lockstep_frame(i, fps, width, height, script, log.as_deref_mut())?;
+            self.program.lockstep_frame(i, fps, width, height, script, log.as_mut())?;
         }
-        let gpu = self.program.executor();
-        let frame = gpu.read_screen()?;
-        let timings = gpu.take_timings();
-        Ok(RunResult { hash: self.program.hash().value(), width, height, frame, timings })
+        Ok((self.result(width, height)?, log))
     }
 
     /// [`CpuHost::ticks_beside_frames`], with the GPU: the frames draw.
@@ -306,21 +297,6 @@ impl Host {
         self.program.want_hashes(on);
     }
 
-    /// The state hash the ticker reported last.
-    pub fn reported_hash(&self) -> u64 {
-        self.program.reported_hash()
-    }
-
-    /// The ticker's rate, once the program has started one.
-    pub fn ticker_hz(&self) -> Option<u32> {
-        self.program.ticker_hz()
-    }
-
-    /// FNV-1a 64 of the build's WASM ([`wrela_abi::ticks::wasm_hash`]).
-    pub fn wasm_hash(&self) -> u64 {
-        self.wasm_hash
-    }
-
     /// [`Host::run_frames`], with `script`'s events queued before the frames they're for
     /// (wrela_abi `input`).
     pub fn run_frames_with(
@@ -338,6 +314,11 @@ impl Host {
             self.program.executor().set_frame(i);
             self.program.frame(time, width, height)?;
         }
+        self.result(width, height)
+    }
+
+    /// The outcome of a run: the screen, read back, and the GPU durations recorded.
+    fn result(&mut self, width: u32, height: u32) -> Result<RunResult> {
         let gpu = self.program.executor();
         let frame = gpu.read_screen()?;
         let timings = gpu.take_timings();
@@ -441,15 +422,18 @@ impl CpuBuild {
 
     /// [`CpuBuild::load`], with each call (`init`, a frame, a tick, an export) given `fuel`
     /// units of work (about one per WASM instruction): a call that does more traps, after the
-    /// same work on every machine. For tests that run a program's frames.
+    /// same work on every machine. For tests that run a program's frames, whose build is made
+    /// for the run: its compiled code isn't kept beside it, only in the directory every build
+    /// shares, if there is one (`WRELA_NATIVE_CACHE`).
     pub fn load_metered(dir: impl AsRef<Path>, fuel: u64) -> Result<CpuBuild> {
         CpuBuild::load_compiled(dir.as_ref(), Some(fuel))
     }
 
     fn load_compiled(dir: &Path, fuel: Option<u64>) -> Result<CpuBuild> {
         let (manifest, wasm, _) = read_build(dir)?;
-        let compiled = program::compile_cached_with(&wasm, dir, fuel)?;
         let wasm_hash = wrela_abi::ticks::wasm_hash(&wasm);
+        let beside = fuel.is_none().then_some(dir);
+        let compiled = program::compile_cached(&wasm, wasm_hash, beside, fuel)?;
         Ok(CpuBuild { compiled, manifest, dir: dir.to_path_buf(), wasm_hash, record: false })
     }
 
@@ -469,52 +453,32 @@ impl CpuBuild {
     /// ticks with `script`'s records (its tick-keyed events), each tick's state hash asked
     /// for: the tick log they make. Parallel work runs on `workers` threads (0 for the default).
     pub fn record_ticks(&self, ticks: u32, script: &[Scripted], workers: u32) -> Result<TickLog> {
-        let mut host = self.instantiate_in(workers, None)?;
-        host.want_hashes(true);
-        host.init()?;
-        let Some(hz) = host.ticker_hz() else {
-            return Err(Error::Program(
-                "it starts no ticker in `init` (`std::tick::start`)".into(),
-            ));
-        };
-        let mut log = TickLog::new(self.wasm_hash, hz, host.reported_hash());
-        for k in 0..ticks {
-            host.push_records(wrela_abi::input::records_at(script, k));
-            let t = host.tick(true)?;
-            log.ticks.push(wrela_abi::ticks::Tick {
-                records: t.records,
-                hash: t.hash.expect("asked for"),
-            });
+        let mut host = self.hashing_host(workers)?;
+        let mut log = host.program.tick_log(self.wasm_hash)?;
+        for _ in 0..ticks {
+            host.program.scripted_tick(script, Some(&mut log))?;
         }
         Ok(log)
     }
 
-    /// Replays a tick log (`wrela-host --replay`): `init`, then each of the log's ticks with
-    /// its records, checking the first world's hash and each tick's against the log's. Stops at
-    /// the first that differs, and names it. How many ticks replayed.
+    /// Replays a tick log (`wrela-host --replay`): `init`, then each of the log's ticks
+    /// ([`CpuHost::replay_ticks`]). How many ticks replayed.
     pub fn replay(&self, log: &TickLog, workers: u32) -> Result<u32, ReplayError> {
-        if log.wasm_hash != self.wasm_hash {
-            return Err(ReplayError::OtherBuild { log: log.wasm_hash, build: self.wasm_hash });
-        }
-        let mut host = self.instantiate_in(workers, None).map_err(ReplayError::Failed)?;
+        let mut host = self
+            .hashing_host(workers)
+            .map_err(|error| ReplayError::Failed { tick: None, error })?;
+        let n = log.ticks.len() as u32;
+        host.replay_ticks(log, n)?;
+        Ok(n)
+    }
+
+    /// A new instance after `init`, its ticker asked for each state's hash, the first world's
+    /// too.
+    fn hashing_host(&self, workers: u32) -> Result<CpuHost> {
+        let mut host = self.instantiate_in(workers, None)?;
         host.want_hashes(true);
-        host.init().map_err(ReplayError::Failed)?;
-        let hz = host.ticker_hz().ok_or(ReplayError::NoTicker)?;
-        if hz != log.hz {
-            return Err(ReplayError::OtherRate { log: log.hz, ticker: hz });
-        }
-        if host.reported_hash() != log.first {
-            return Err(ReplayError::FirstWorld { log: log.first, replayed: host.reported_hash() });
-        }
-        for (k, t) in log.ticks.iter().enumerate() {
-            host.push_raw_records(&t.records);
-            let got = host.tick(true).map_err(ReplayError::Failed)?;
-            let replayed = got.hash.expect("asked for");
-            if replayed != t.hash {
-                return Err(ReplayError::Tick { tick: k as u32, log: t.hash, replayed });
-            }
-        }
-        Ok(log.ticks.len() as u32)
+        host.init()?;
+        Ok(host)
     }
 
     /// A new instance of the program: its own memory, batches and hash, and its parallel jobs
@@ -540,7 +504,7 @@ impl CpuBuild {
         let (compiled, manifest) = (&self.compiled, &self.manifest);
         let program =
             Program::instantiate_with(compiled, manifest, NoGpu, io, self.record, n, false)?;
-        Ok(CpuHost { program })
+        Ok(CpuHost { program, wasm_hash: self.wasm_hash })
     }
 }
 
@@ -548,6 +512,8 @@ impl CpuBuild {
 /// sequenced and checked like a [`Host`]'s, then dropped. No GPU, no lock.
 pub struct CpuHost {
     program: Program<NoGpu>,
+    /// Its build's ([`CpuBuild::wasm_hash`]).
+    wasm_hash: u64,
 }
 
 impl CpuHost {
@@ -623,31 +589,46 @@ impl CpuHost {
         self.program.want_hashes(on);
     }
 
-    /// The state hash the ticker reported last.
-    pub fn reported_hash(&self) -> u64 {
-        self.program.reported_hash()
-    }
-
     /// Queues input events as the ticker's records: the next ticks take them, at most
     /// `wrela_abi::memory::MAX_TICK_RECORDS` each.
     pub fn push_records(&mut self, events: impl IntoIterator<Item = Event>) {
         self.program.push_records(events);
     }
 
-    /// Queues records exactly as a tick log has them (`TickLog`'s ticks' `records`).
-    pub fn push_raw_records(&mut self, records: &[[u8; wrela_abi::input::EVENT_SIZE as usize]]) {
-        self.program.push_raw_records(records);
-    }
-
     /// Runs the ticker's next tick with the queued records: what it was given, and its state's
-    /// hash if `hash`. An error if there's no ticker, or the tick trapped (the program's panic).
-    pub fn tick(&mut self, hash: bool) -> Result<Ticked> {
-        self.program.tick(hash)
+    /// hash if [`CpuHost::want_hashes`] asked for it. An error if there's no ticker, or the tick
+    /// trapped (the program's panic).
+    pub fn tick(&mut self) -> Result<Ticked> {
+        self.program.tick()
     }
 
-    /// The next tick's number.
-    pub fn next_tick(&self) -> u32 {
-        self.program.next_tick()
+    /// Replays a tick log's first `ticks` ticks (all it has, if fewer), after `init`: checks the
+    /// build, the ticker's rate and the first world's hash against the log's, then runs each
+    /// tick with its records and checks its state hash. Stops at the first that differs, and
+    /// names it. Ask for hashes before `init` ([`CpuHost::want_hashes`]), or the first world's
+    /// has none.
+    pub fn replay_ticks(&mut self, log: &TickLog, ticks: u32) -> Result<(), ReplayError> {
+        if log.wasm_hash != self.wasm_hash {
+            return Err(ReplayError::OtherBuild { log: log.wasm_hash, build: self.wasm_hash });
+        }
+        let hz = self.ticker_hz().ok_or(ReplayError::NoTicker)?;
+        if hz != log.hz {
+            return Err(ReplayError::OtherRate { log: log.hz, ticker: hz });
+        }
+        let first = self.program.reported_hash();
+        if first != log.first {
+            return Err(ReplayError::FirstWorld { log: log.first, replayed: first });
+        }
+        self.want_hashes(true);
+        for (k, t) in (0..ticks).zip(&log.ticks) {
+            self.program.push_raw_records(&t.records);
+            let got = self.tick().map_err(|error| ReplayError::Failed { tick: Some(k), error })?;
+            let replayed = got.hash.expect("hashes asked for");
+            if replayed != t.hash {
+                return Err(ReplayError::Tick { tick: k, log: t.hash, replayed });
+            }
+        }
+        Ok(())
     }
 
     /// Runs frame `i` of a lockstep schedule at `fps` (test mode, #43 §2.3): the ticks that

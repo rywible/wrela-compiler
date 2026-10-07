@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use wrela_diag::{Diagnostic, SourceMap, codes, has_errors};
 use wrela_lower::BuildData;
 use wrela_sema::Checked;
+use wrela_sema::defs::TestRun;
 use wrela_sema::ty::FnId;
 
 /// Frames a second, and the screen's size in pixels, that a frame test's frames get.
@@ -23,8 +24,8 @@ pub const FPS: f64 = 60.0;
 pub const WIDTH: u32 = 640;
 pub const HEIGHT: u32 = 480;
 
-/// Runs frame tests `tests` (§10), given the constants computed into `data`: each test's
-/// failure, if it failed, with the errors building them found.
+/// Runs frame and tick tests `tests` (§10), given the constants computed into `data`: each
+/// test's failure, if it failed, with the errors building them found.
 pub fn run(
     checked: &Checked,
     sources: &SourceMap,
@@ -47,27 +48,24 @@ pub fn run(
     let dir = Scratch::new();
     for (path, bytes) in &out.files {
         if let Err(e) = std::fs::write(dir.0.join(path), bytes) {
-            diags.push(Diagnostic::internal(format!("writing a frame test's build: {e}")));
+            diags.push(Diagnostic::internal(format!("writing a test's build: {e}")));
             return (Vec::new(), diags);
         }
     }
     let built = match wrela_host::CpuBuild::load_metered(&dir.0, fuel) {
         Ok(b) => b,
         Err(e) => {
-            diags.push(Diagnostic::internal(format!("loading a frame test's build: {e}")));
+            diags.push(Diagnostic::internal(format!("loading a test's build: {e}")));
             return (Vec::new(), diags);
         }
     };
     let mut results = Vec::new();
     for (i, &f) in tests.iter().enumerate() {
         let attrs = &checked.program.func(f).attrs;
-        let run = match attrs.test_ticks {
-            Some(n) => Run::Ticks(n),
-            None => Run::Frames(attrs.test_frames.unwrap_or(1)),
-        };
+        let run = attrs.test_run.unwrap_or(TestRun::Frames(1));
         let input = match &attrs.test_input {
             None => Input::Script(Vec::new()),
-            Some((path, span)) => match read_input(root, path, matches!(run, Run::Ticks(_))) {
+            Some((path, span)) => match read_input(root, path, matches!(run, TestRun::Ticks(_))) {
                 Ok(s) => s,
                 Err(why) => {
                     let d = Diagnostic::new(
@@ -110,19 +108,12 @@ pub fn run(
     (results, diags)
 }
 
-/// Why a frame test failed: the host's error, the fault behind it if it was a trap, and in
-/// which call.
+/// Why a test failed: the host's error, the fault behind it if it was a trap, and in which
+/// call.
 struct Failed {
     error: wrela_host::Error,
     fault: Option<Fault>,
     phase: String,
-}
-
-/// What a test runs before it.
-#[derive(Clone, Copy)]
-enum Run {
-    Frames(u32),
-    Ticks(u32),
 }
 
 /// What a test's runs get: a script of input events, or (a tick test) a tick log.
@@ -153,7 +144,7 @@ fn run_one(
     built: &wrela_host::CpuBuild,
     storage: &Path,
     i: usize,
-    run: Run,
+    run: TestRun,
     input: &Input,
 ) -> Option<Failed> {
     let failed = |error, host: Option<&wrela_host::CpuHost>, phase: String| {
@@ -171,13 +162,9 @@ fn run_one(
         Ok(h) => h,
         Err(e) => return failed(e, None, "as it started".to_string()),
     };
-    let log = match input {
-        Input::Log(log) => Some(log),
-        Input::Script(_) => None,
-    };
-    let script: &[wrela_host::Scripted] = match input {
-        Input::Script(s) => s,
-        Input::Log(_) => &[],
+    let (log, script): (_, &[wrela_host::Scripted]) = match input {
+        Input::Log(log) => (Some(log), &[]),
+        Input::Script(s) => (None, s),
     };
     host.want_hashes(log.is_some());
     if let Err(e) = host.init() {
@@ -187,7 +174,7 @@ fn run_one(
         Some(Failed { error: wrela_host::Error::Program(why), fault: None, phase: String::new() })
     };
     let after = match run {
-        Run::Frames(frames) => {
+        TestRun::Frames(frames) => {
             for k in 0..frames {
                 if let Err(e) = host.lockstep_frame(k, FPS, WIDTH, HEIGHT, script) {
                     return failed(e, Some(&host), format!("in frame {k} of {frames}"));
@@ -195,40 +182,34 @@ fn run_one(
             }
             format!("after {frames} frames")
         }
-        Run::Ticks(ticks) => {
+        TestRun::Ticks(ticks) => {
             if host.ticker_hz().is_none() {
                 return mismatch(
                     "in `init`: the program starts no ticker (`std::tick::start`)".into(),
                 );
             }
-            if let Some(log) = log {
-                if log.wasm_hash != built.wasm_hash() || log.hz != host.ticker_hz().unwrap_or(0) {
-                    return mismatch("its tick log is for another build, or another rate".into());
+            let in_tick = |k| format!("in tick {k} of {ticks}");
+            match log {
+                // The log's records, each tick's state hash checked against the log's.
+                Some(log) => {
+                    if log.ticks.len() < ticks as usize {
+                        let n = log.ticks.len();
+                        return mismatch(format!("its tick log has {n} ticks, not {ticks}"));
+                    }
+                    if let Err(e) = host.replay_ticks(log, ticks) {
+                        return match e {
+                            wrela_host::ReplayError::Failed { tick, error } => {
+                                failed(error, Some(&host), tick.map_or_else(String::new, in_tick))
+                            }
+                            why => mismatch(format!("its tick log doesn't replay: {why}")),
+                        };
+                    }
                 }
-                if host.reported_hash() != log.first {
-                    return mismatch("the first world's state hash isn't its tick log's".into());
-                }
-                if log.ticks.len() < ticks as usize {
-                    let n = log.ticks.len();
-                    return mismatch(format!("its tick log has {n} ticks, not {ticks}"));
-                }
-            }
-            for k in 0..ticks {
-                match log {
-                    Some(log) => host.push_raw_records(&log.ticks[k as usize].records),
-                    None => host.push_records(wrela_abi::input::records_at(script, k)),
-                }
-                match host.tick(log.is_some()) {
-                    Err(e) => return failed(e, Some(&host), format!("in tick {k} of {ticks}")),
-                    Ok(t) => {
-                        if let (Some(log), Some(h)) = (log, t.hash)
-                            && log.ticks[k as usize].hash != h
-                        {
-                            return mismatch(format!(
-                                "tick {k}'s state hash isn't its tick log's: the log has {}, the test {}",
-                                wrela_abi::hash::hex(log.ticks[k as usize].hash),
-                                wrela_abi::hash::hex(h)
-                            ));
+                None => {
+                    for k in 0..ticks {
+                        host.push_records(wrela_abi::input::records_at(script, k));
+                        if let Err(e) = host.tick() {
+                            return failed(e, Some(&host), in_tick(k));
                         }
                     }
                 }

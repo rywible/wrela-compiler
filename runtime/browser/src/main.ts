@@ -3,10 +3,10 @@
 
 import { AUDIO_QUANTUM, AUDIO_SAMPLE_RATE } from "./abi.gen.ts";
 import { errorMessage } from "./errors.ts";
-import { InputRing } from "./input.ts";
+import { epochNow, InputRing } from "./input.ts";
 import { listen } from "./listen.ts";
-import { type FromWorker, type Loaded, type ToWorker, VOICE_PROCESSOR, type VoiceOptions } from "./messages.ts";
-import { asksForTest, isLoopback, parseTestParams, putResult, type TestParams } from "./testmode.ts";
+import { type FromWorker, type ToWorker, VOICE_PROCESSOR, type VoiceOptions } from "./messages.ts";
+import { asksForTest, isLoopback, loaded, parseTestParams, putResult, sleepUntil, type TestParams } from "./testmode.ts";
 
 let shown = false;
 
@@ -89,17 +89,13 @@ async function playVoice(voice: VoiceOptions, test: TestParams | null, worker: W
   }
 }
 
-/** The clock input events are stamped with, which the worker shares: ms since 1970. */
-const now = () => performance.timeOrigin + performance.now();
-
 /** Test mode, `latency`: `n` pointer moves sent through the DOM at random times over `ms`. */
 async function sendLatencyEvents(canvas: HTMLCanvasElement, n: number, ms: number): Promise<void> {
   const r = canvas.getBoundingClientRect();
   const times = Array.from({ length: n }, () => Math.random() * ms).sort((a, b) => a - b);
   const start = performance.now();
   for (const t of times) {
-    const wait = start + t - performance.now();
-    if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
+    await sleepUntil(start + t);
     const x = r.left + Math.random() * r.width;
     const y = r.top + Math.random() * r.height;
     canvas.dispatchEvent(new PointerEvent("pointermove", { clientX: x, clientY: y, bubbles: true }));
@@ -112,28 +108,14 @@ async function sendLatencyEvents(canvas: HTMLCanvasElement, n: number, ms: numbe
 async function sendKeyPresses(n: number, ms: number): Promise<void> {
   const slot = Math.max(ms / Math.max(n, 1), 250);
   const start = performance.now();
-  const at = async (t: number) => {
-    const wait = start + t - performance.now();
-    if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
-  };
   const key = (type: string) => window.dispatchEvent(new KeyboardEvent(type, { code: "ArrowRight", key: "ArrowRight", bubbles: true }));
   for (let i = 0; i < n; i++) {
     const t = i * slot + Math.random() * (slot - 150);
-    await at(t);
+    await sleepUntil(start + t);
     key("keydown");
-    await at(t + 100);
+    await sleepUntil(start + t + 100);
     key("keyup");
   }
-}
-
-/** What the page loaded so far, for test mode's `load.json`: the page itself and each file. */
-function loaded(): Loaded[] {
-  const entries = [...performance.getEntriesByType("navigation"), ...performance.getEntriesByType("resource")] as PerformanceResourceTiming[];
-  return entries.map((e) => ({
-    name: e.name,
-    bytes: e.transferSize > 0 ? e.transferSize : e.encodedBodySize,
-    end_ms: performance.timeOrigin + e.responseEnd,
-  }));
 }
 
 function start(): void {
@@ -160,7 +142,7 @@ function start(): void {
       if (msg.type === "audio") {
         playVoice(msg.voice, test, worker).catch((e: unknown) => failEarly(e, testing));
       } else if (msg.type === "load-query") {
-        worker.postMessage({ type: "load", opened_ms: performance.timeOrigin, resources: loaded() } satisfies ToWorker);
+        worker.postMessage({ type: "load", opened_ms: performance.timeOrigin, resources: loaded(["navigation", "resource"]) } satisfies ToWorker);
       } else if (msg.type === "latency-start") {
         const sent = test?.keylatency ? sendKeyPresses(test.keylatency, msg.ms) : sendLatencyEvents(canvas, test?.latency ?? 0, msg.ms);
         sent.then(
@@ -180,7 +162,7 @@ function start(): void {
     const offscreen = canvas.transferControlToOffscreen();
     const { width, height } = devicePixels(canvas);
     const sized = { width, height };
-    listen(canvas, ring, now, () => sized);
+    listen(canvas, ring, epochNow, () => sized);
     const msg: ToWorker = { type: "start", canvas: offscreen, base: document.baseURI, width, height, test, input: ring.buffer };
     worker.postMessage(msg, [offscreen]);
     if (!test) {

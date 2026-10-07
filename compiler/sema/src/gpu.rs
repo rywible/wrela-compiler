@@ -48,24 +48,13 @@ pub fn is_varying(p: &Program, t: TyId) -> bool {
 /// in a `Flat<T>`, not. `None` if it can't pass.
 pub fn varying_count(p: &Program, t: TyId) -> Option<usize> {
     match p.types.kind(t) {
-        TyKind::Float(FloatTy::F32)
-        | TyKind::Int(IntTy::I32 | IntTy::U32)
-        | TyKind::Vec(VecElem::F32 | VecElem::I32 | VecElem::U32, _) => Some(1),
+        TyKind::Float(FloatTy::F32) | TyKind::Int(IntTy::I32 | IntTy::U32) => Some(1),
+        TyKind::Vec(e, _) if e.on_gpu() => Some(1),
         TyKind::Mat(n) => Some(usize::from(*n)),
         TyKind::Adt(_, args) if p.lang_of_ty(t) == Some(Lang::Flat) => {
             varying_count(p, *args.first()?)
         }
-        TyKind::Adt(a, args)
-            if p.lang_of_ty(t).is_none() && !p.adt(*a).is_enum() && !p.adt(*a).borrow =>
-        {
-            let fields = p.fields_of(*a, args, None);
-            if fields.is_empty() {
-                return None;
-            }
-            fields.into_iter().map(|f| varying_count(p, f)).sum()
-        }
-        TyKind::Tuple(ts) if !ts.is_empty() => ts.iter().map(|&f| varying_count(p, f)).sum(),
-        _ => None,
+        _ => p.plain_parts(t)?.into_iter().map(|f| varying_count(p, f)).sum(),
     }
 }
 
@@ -176,15 +165,16 @@ fn check_entry(p: &Program, f: FnId, entry: Entry, out: &mut Vec<Diagnostic>) {
             if let TyKind::Adt(a, _) = p.types.kind(def.ret) {
                 // What it passes on (a generic field's type is checked where it's drawn).
                 let fields = p.adt(*a).fields();
-                let varyings =
-                    fields.iter().filter(|f| p.lang_of_ty(f.ty) != Some(Lang::ClipPosition));
-                for f in varyings.clone() {
-                    if !p.types.has_params(f.ty) && !is_varying(p, f.ty) {
-                        out.push(not_varying(p, &f.name, f.ty, f.span));
+                let mut count = 0;
+                for f in fields.iter().filter(|f| p.lang_of_ty(f.ty) != Some(Lang::ClipPosition)) {
+                    match varying_count(p, f.ty) {
+                        Some(n) => count += n,
+                        None if !p.types.has_params(f.ty) => {
+                            out.push(not_varying(p, &f.name, f.ty, f.span));
+                        }
+                        None => {}
                     }
                 }
-                let count: usize =
-                    varyings.filter_map(|f| varying_count(p, f.ty)).sum();
                 if count > MAX_VARYINGS {
                     out.push(
                         Diagnostic::new(

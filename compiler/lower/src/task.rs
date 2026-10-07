@@ -5,17 +5,13 @@
 
 use crate::body::{Fl, Repr};
 use crate::instance::Callable;
-use wrela_diag::{Diagnostic, codes};
+use wrela_diag::Diagnostic;
 use wrela_ir as ir;
 use wrela_sema::mir;
 use wrela_sema::ty::TyId;
 
 pub(crate) fn task(fl: &mut Fl, substs: &[TyId], c: &mir::Call) -> Option<ir::ValueId> {
     let span = c.span;
-    if fl.is_gpu() {
-        fl.cx.err(Diagnostic::new(codes::E0607, span, "a task is CPU code"));
-        return None;
-    }
     let ([run], [_context]) = (&c.args[..], substs) else {
         fl.cx.err(Diagnostic::internal("`task` takes a function, with its context's type"));
         return None;

@@ -434,34 +434,26 @@ impl<'m> Cx<'m> {
     }
 }
 
-/// An expression that only computes from values: written where it's used.
+/// An expression that only computes from values: written where it's used. Not a constant
+/// (naga's own expression, or a float WGSL can't write, made from its bits), an element at a
+/// dynamic index, or a derivative (which wants the uniform control flow it's in).
 fn pure(e: &ir::Expr) -> bool {
-    match e {
-        ir::Expr::Builtin(b, _) => {
-            !matches!(b, ir::Builtin::Dpdx | ir::Builtin::Dpdy | ir::Builtin::Fwidth)
-        }
-        ir::Expr::Unary(..)
-        | ir::Expr::Binary(..)
-        | ir::Expr::Construct(..)
-        | ir::Expr::Extract(..)
-        | ir::Expr::Splat(..)
-        | ir::Expr::Swizzle(..)
-        | ir::Expr::Convert(..)
-        | ir::Expr::Bitcast(..)
-        | ir::Expr::Select { .. } => true,
-        _ => false,
-    }
+    e.only_computes()
+        && !matches!(
+            e,
+            ir::Expr::Const(_)
+                | ir::Expr::Zero(_)
+                | ir::Expr::ExtractDyn(..)
+                | ir::Expr::Builtin(ir::Builtin::Dpdx | ir::Builtin::Dpdy | ir::Builtin::Fwidth, _)
+        )
 }
 
 /// The type of the part of a value of type `t` at `path`: field indexes, then a matrix
 /// column's.
 fn part_ty(types: &ir::Types, t: ir::TypeId, path: &[u32]) -> R<ir::TypeId> {
-    path.iter().try_fold(t, |t, &k| match types.get(t) {
-        ir::TypeDef::Matrix(n) => types
-            .lookup(&ir::TypeDef::Vector(ir::Scalar::F32, *n))
-            .ok_or_else(|| "internal: a matrix's column type".to_string()),
-        _ => types.field(t, k).ok_or_else(|| "internal: a varying's path".to_string()),
-    })
+    path.iter()
+        .try_fold(t, |t, &k| types.part(t, k))
+        .ok_or_else(|| "internal: a varying's path".to_string())
 }
 
 /// Builds one naga function.
@@ -473,9 +465,8 @@ struct Fb<'a, 'm> {
     locals: Vec<Handle<LocalVariable>>,
     /// The entry point being written, or `None` for a function that stays a call.
     entry: Option<&'m ir::EntryPoint>,
-    /// For a vertex entry: the output struct and how its members map to the IR struct's.
     /// The vertex output (fragment input) struct, its members, and the IR type they're parts of.
-    io: Option<(Handle<Type>, Vec<ir::Varying>, ir::TypeId)>,
+    io: Option<(Handle<Type>, &'m [ir::Varying], ir::TypeId)>,
     /// Where the IR's parameters start among the naga arguments: after the builtin inputs.
     param_base: u32,
     /// For each builtin input, its naga argument; `None` for a fragment's position when it
@@ -560,7 +551,7 @@ impl<'a, 'm> Fb<'a, 'm> {
                 let rt = self.f.ret.ok_or("internal: a vertex shader with no output")?;
                 let io = self.cx.io_struct(rt, varyings)?;
                 self.func.result = Some(FunctionResult { ty: io, binding: None });
-                self.io = Some((io, varyings.clone(), rt));
+                self.io = Some((io, varyings, rt));
             }
             ir::Stage::Fragment { varyings } => {
                 if let Some((vt, map)) = varyings {
@@ -570,7 +561,7 @@ impl<'a, 'm> Fb<'a, 'm> {
                         ty: io,
                         binding: None,
                     });
-                    self.io = Some((io, map.clone(), *vt));
+                    self.io = Some((io, map, *vt));
                 }
                 let v4 = self.cx.ty_vec4();
                 self.func.result = Some(FunctionResult {
@@ -839,7 +830,7 @@ impl<'a, 'm> Fb<'a, 'm> {
 
     /// A vertex shader's return value, rebuilt as the output struct.
     fn output(&mut self, h: Handle<Expression>, out: &mut Block) -> R<Handle<Expression>> {
-        let Some((io, map, _)) = self.io.clone() else { return Ok(h) };
+        let Some((io, map, _)) = self.io else { return Ok(h) };
         let Some(ir::EntryPoint { stage: ir::Stage::Vertex { .. }, .. }) = self.entry else {
             return Ok(h);
         };
@@ -868,16 +859,15 @@ impl<'a, 'm> Fb<'a, 'm> {
             return Ok(self.expr(Expression::AccessIndex { base: arg, index: k as u32 }, out));
         }
         let types = &self.cx.m.types;
-        let parts: Vec<ir::TypeId> = match types.get(t) {
-            ir::TypeDef::Struct { fields, .. } => fields.iter().map(|f| f.1).collect(),
-            ir::TypeDef::Matrix(n) => {
-                vec![part_ty(types, t, &[0])?; usize::from(*n)]
-            }
+        let n = match types.get(t) {
+            ir::TypeDef::Struct { fields, .. } => fields.len() as u32,
+            ir::TypeDef::Matrix(n) => u32::from(*n),
             _ => return Err("internal: a varying's part that no member holds".into()),
         };
         let mut comps = Vec::new();
-        for (k, pt) in parts.into_iter().enumerate() {
-            path.push(k as u32);
+        for k in 0..n {
+            let pt = part_ty(types, t, &[k])?;
+            path.push(k);
             comps.push(self.rebuild(arg, map, pt, path, out)?);
             path.pop();
         }
@@ -936,12 +926,12 @@ impl<'a, 'm> Fb<'a, 'm> {
             }
             ir::Expr::Param(i) => {
                 // In a fragment shader, parameter 0 is the varyings: rebuild the IR struct.
-                if let Some((_, map, vt)) = self.io.clone()
+                if let Some((_, map, vt)) = self.io
                     && let Some(ir::EntryPoint { stage: ir::Stage::Fragment { .. }, .. }) =
                         self.entry
                 {
                     let arg = self.expr(Expression::FunctionArgument(self.param_base + *i), out);
-                    self.rebuild(arg, &map, vt, &mut Vec::new(), out)?
+                    self.rebuild(arg, map, vt, &mut Vec::new(), out)?
                 } else {
                     self.expr(Expression::FunctionArgument(self.param_base + *i), out)
                 }
@@ -1242,7 +1232,8 @@ impl<'a, 'm> Fb<'a, 'm> {
             (Some(r), true, Some(t)) => {
                 let old = self.expr(Expression::AccessIndex { base: r, index: 0 }, out);
                 let mut stored = self.expr(Expression::AccessIndex { base: r, index: 1 }, out);
-                // A struct's `bool` is a `u32` (`ir::gpu_memory`).
+                // The IR's struct holds its `bool` as a `u32` if it's a type memory holds
+                // (`ir::gpu_memory`).
                 let types = &self.cx.m.types;
                 if types.field(t, 1).and_then(|b| types.as_scalar(b)) == Some(ir::Scalar::U32) {
                     let (kind, width) = (ScalarKind::Uint, 4);
@@ -1501,8 +1492,6 @@ mod tests {
         m
     }
 
-    /// A tiny compute module round-trips through naga's validator and back through its WGSL
-    /// parser.
     /// The text has no indentation, and a struct's name is cut to 32 characters (#42 AC9's size
     /// budget for a large creature's shaders).
     #[test]
@@ -1525,6 +1514,8 @@ mod tests {
         assert!(!w.text.contains(long));
     }
 
+    /// A tiny compute module round-trips through naga's validator and back through its WGSL
+    /// parser.
     #[test]
     fn a_minimal_kernel_is_valid_wgsl() {
         let wgsl = emit(&kernel("k")).expect("valid").text;

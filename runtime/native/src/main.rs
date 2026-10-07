@@ -126,8 +126,7 @@ impl From<wrela_host::Error> for Failure {
 fn read_script(args: &Args) -> Result<Vec<wrela_host::Scripted>, wrela_host::Error> {
     match &args.input {
         Some(path) => {
-            let text = std::fs::read_to_string(path)
-                .map_err(|e| wrela_host::Error::Io { path: path.clone(), source: e })?;
+            let text = std::fs::read_to_string(path).map_err(|e| wrela_host::Error::io(path, e))?;
             wrela_host::parse_script(&text)
                 .map_err(|why| wrela_host::Error::Program(format!("{}: {why}", path.display())))
         }
@@ -136,14 +135,12 @@ fn read_script(args: &Args) -> Result<Vec<wrela_host::Scripted>, wrela_host::Err
 }
 
 fn write_log(path: &PathBuf, log: &TickLog) -> Result<(), wrela_host::Error> {
-    std::fs::write(path, log.encode())
-        .map_err(|e| wrela_host::Error::Io { path: path.clone(), source: e })
+    std::fs::write(path, log.encode()).map_err(|e| wrela_host::Error::io(path, e))
 }
 
 /// `--replay`: a tick log's ticks, each hash checked.
 fn replay(args: &Args, path: &PathBuf) -> Result<(), Failure> {
-    let bytes =
-        std::fs::read(path).map_err(|e| wrela_host::Error::Io { path: path.clone(), source: e })?;
+    let bytes = std::fs::read(path).map_err(|e| wrela_host::Error::io(path, e))?;
     let log = TickLog::decode(&bytes)
         .map_err(|e| wrela_host::Error::Program(format!("{}: {e}", path.display())))?;
     let built = CpuBuild::load(&args.dir)?;
@@ -178,23 +175,20 @@ fn frames(args: &Args) -> Result<(), Failure> {
         ..Options::default()
     };
     let mut host = Host::load_with(&args.dir, &options)?;
-    host.want_hashes(args.log.is_some());
+    let logging = args.log.is_some();
+    host.want_hashes(logging);
     host.init()?;
-    let mut log = TickLog::new(host.wasm_hash(), 0, host.reported_hash());
     let (w, h) = args.size;
-    let recording = args.log.is_some() && host.ticker_hz().is_some();
-    let run =
-        host.run_lockstep(args.frames, args.fps, w, h, &script, recording.then_some(&mut log))?;
+    let (run, log) = host.run_lockstep(args.frames, args.fps, w, h, &script, logging)?;
     drop(host); // release the GPU (and its lock) before writing files
     if let Some(path) = &args.png {
         run.write_png(path)?;
     }
     if let Some(path) = &args.rgba {
-        std::fs::write(path, &run.frame)
-            .map_err(|e| wrela_host::Error::Io { path: path.clone(), source: e })?;
+        std::fs::write(path, &run.frame).map_err(|e| wrela_host::Error::io(path, e))?;
     }
-    if let Some(path) = &args.log {
-        write_log(path, &log)?;
+    if let (Some(path), Some(log)) = (&args.log, &log) {
+        write_log(path, log)?;
     }
     for t in &run.timings {
         eprintln!("frame {:>4}  {:<24} {:>10.3} us", t.frame, t.label, t.nanos / 1000.0);

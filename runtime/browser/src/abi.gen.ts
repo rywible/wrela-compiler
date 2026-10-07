@@ -1,5 +1,5 @@
 // Generated from the wrela-abi crate (runtime/abi): the one definition of the
-// command stream and manifest. Don't edit; run `cargo run -p wrela-abi --bin gen-ts`.
+// command stream and manifest. Don't edit; run `cargo run -p wrela-abi --bin generate`.
 
 export const STREAM_VERSION = 6;
 export const MANIFEST_VERSION = 4;
@@ -10,6 +10,10 @@ export const COMMAND_HEADER_LEN = 8;
 /** A pass's attachment that isn't there, and a pass's colour attachment that is the screen. */
 export const NONE = 0xffffffff;
 export const SCREEN = 0xfffffffe;
+/** The upload ring's starting size, and the largest write it takes: a bigger one goes through
+ * the queue, between submissions. */
+export const UPLOAD_START = 262144;
+export const UPLOAD_MAX = 16777216;
 
 export const Opcode = {
   CreateBuffer: 1,
@@ -98,7 +102,6 @@ export const AUDIO_QUANTUM = 128;
 export const AUDIO_OUT = 1245184;
 /** The threads (runtime/abi `memory`): their numbers, their blocks, and the words of a block and
  * of a job slot a host reads and writes. */
-export const THREADS = 11;
 export const THREAD_MAIN = 0;
 export const THREAD_TICK = 1;
 export const THREAD_AUDIO = 2;
@@ -106,29 +109,27 @@ export const THREAD_HELPER0 = 3;
 export const MAX_WORKERS = 8;
 export const THREAD_BLOCKS = 1114112;
 export const THREAD_BLOCK_SIZE = 8192;
+export const THREAD_BLOCKS_END = 1204224;
 export const JOB_DONE = 20;
 export const JOB_FAILED = 24;
 export const JOB_DONE_FAILED = 2147483648;
 export const RUNNING = 32;
 export const JOB_SLOTS = 1212416;
-export const JOB_SLOT_COUNT = 256;
-export const JOB_SLOT_SIZE = 16;
+export const JOB_SLOTS_END = 1216512;
 export const SLOT_STATE = 0;
 export const SLOT_THREAD = 12;
 export const SLOT_FAILED = 5;
-/** The helpers' shared words: their wake-up, the host's shutdown, how many chunks they ran, and
- * how long they hold a job's result back (tests). */
-export const PAR_WAKE = 256;
-export const PAR_SHUTDOWN = 260;
+/** How many chunks the helpers have run (one of their shared words). */
 export const PAR_HELPED = 264;
-export const PAR_HOLD = 268;
 /** The ticker's words (runtime/abi `memory`), and its records' region. */
 export const TICK_WANT_HASH = 512;
 export const TICK_HASH = 520;
 export const TICK_ORIGIN = 528;
 export const TICK_RECORDS = 1228800;
 export const MAX_TICK_RECORDS = 256;
-/** The tick log (runtime/abi `ticks`). */
+/** The tick log (runtime/abi `ticks`): its magic, the bytes `WRTL` read as a little-endian
+ * u32. */
+export const TICK_LOG_MAGIC = 0x4c545257;
 export const TICK_LOG_VERSION = 1;
 export const TICK_LOG_HEADER_LEN = 32;
 export const REQUEST_PENDING = -1;

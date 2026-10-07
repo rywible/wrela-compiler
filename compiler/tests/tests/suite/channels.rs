@@ -3,7 +3,7 @@
 
 use crate::built;
 use wrela_host::{CpuBuild, CpuHost, Host, Value};
-use wrela_tests::{f32s, one_f32, one_u32, u32s};
+use wrela_tests::{f32s, one_f32, one_u32, one_vec3, u32s};
 
 fn host() -> CpuHost {
     CpuBuild::load(built("channels")).expect("load").start_with(1).expect("start")
@@ -13,13 +13,6 @@ fn at(x: f32, y: f32, z: f32) -> [Value; 3] {
     [Value::F32(x), Value::F32(y), Value::F32(z)]
 }
 
-fn vec3_of(v: &[Value]) -> [f32; 3] {
-    match v {
-        [Value::F32(x), Value::F32(y), Value::F32(z)] => [*x, *y, *z],
-        other => panic!("returned {other:?}"),
-    }
-}
-
 #[test]
 fn each_part_carries_its_own_channels() {
     let mut host = host();
@@ -27,13 +20,13 @@ fn each_part_carries_its_own_channels() {
     let body = at(0.0, 0.3, 0.0);
     assert!((one_f32(&mut host, "albedo_r", &body) - 0.39).abs() < 1e-6);
     assert_eq!(one_f32(&mut host, "roughness", &body), 0.7);
-    assert_eq!(vec3_of(&host.call_export("bias", &body).expect("bias")), [0.0, 1.0, 0.0]);
+    assert_eq!(one_vec3(&mut host, "bias", &body), [0.0, 1.0, 0.0]);
     assert_eq!(one_u32(&mut host, "material", &body), 0);
     // At the hoof's tip: HOOF.
     let hoof = at(0.9, 0.0, 0.0);
     assert_eq!(one_f32(&mut host, "albedo_r", &hoof), 0.12);
     assert_eq!(one_f32(&mut host, "roughness", &hoof), 0.35);
-    assert_eq!(vec3_of(&host.call_export("bias", &hoof).expect("bias")), [1.0, 0.0, 0.0]);
+    assert_eq!(one_vec3(&mut host, "bias", &hoof), [1.0, 0.0, 0.0]);
     assert_eq!(one_u32(&mut host, "material", &hoof), 1);
 }
 
@@ -52,7 +45,7 @@ fn channels_blend_where_the_parts_blend() {
             mixed += 1;
         }
         last = r;
-        let b = vec3_of(&host.call_export("bias", &p).expect("bias"));
+        let b = one_vec3(&mut host, "bias", &p);
         let len = (b[0] * b[0] + b[1] * b[1] + b[2] * b[2]).sqrt();
         assert!((len - 1.0).abs() < 1e-5, "the bias isn't unit length: {b:?}");
         let m = one_u32(&mut host, "material", &p);

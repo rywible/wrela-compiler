@@ -10,8 +10,9 @@ posts): Chrome opens the URL, and the run is done when the page's `results/DONE`
 (the page-dir may then be any directory).
 
 The page finishes by PUTting `results/DONE`: the body `ok` means it passed, anything else is the
-failure message. Its other PUTs land in `<page-dir>/results/`, and its console output (exceptions
-and WGSL compile errors included) goes to `<page-dir>/results/console.log`.
+failure message. Its other PUTs land in `<page-dir>/results/`, which each run empties first, and
+its console output (exceptions and WGSL compile errors included) goes to
+`<page-dir>/results/console.log`.
 
 Each run serves the repo on its own free port (tools/serve.py's handler, cross-origin isolated),
 so concurrent runs don't need a server and can't collide on one.
@@ -189,13 +190,13 @@ def main(argv):
         signal.signal(sig, interrupt)
 
     lock = acquire_gpu_lock(page)
+    # What an earlier run left (a stale DONE above all) isn't this run's.
     results = os.path.join(page_dir, "results")
-    os.makedirs(results, exist_ok=True)
-    for stale in ("DONE", "console.log"):
-        try:
-            os.remove(os.path.join(results, stale))
-        except FileNotFoundError:
-            pass
+    try:
+        shutil.rmtree(results)
+    except FileNotFoundError:
+        pass
+    os.makedirs(results)
 
     done = []
     server = None

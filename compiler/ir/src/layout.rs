@@ -33,14 +33,7 @@ pub fn round_up(align: u32, n: u32) -> u32 {
 }
 
 fn scalar_layout(s: Scalar) -> Layout {
-    let n = match s {
-        Scalar::Bool => 4,
-        Scalar::I8 | Scalar::U8 => 1,
-        Scalar::I16 | Scalar::U16 => 2,
-        Scalar::I32 | Scalar::U32 | Scalar::F32 => 4,
-        Scalar::I64 | Scalar::U64 | Scalar::F64 => 8,
-    };
-    Layout { size: n, align: n }
+    Layout { size: s.bytes(), align: s.bytes() }
 }
 
 /// WGSL's vector layout (a `vec3` aligned as a `vec4`), for components of `c` bytes.
@@ -153,6 +146,35 @@ pub fn field_offsets(types: &Types, t: TypeId) -> &[u32] {
     types.field_offsets(t)
 }
 
+/// The byte offset of constant part `k` of a value of type `t` (see [`Types::part`]): a
+/// struct's or an enum's field, a vector's component, a matrix's column, an array's element, or
+/// a run's word. `None` for other types.
+pub fn part_offset(types: &Types, t: TypeId, k: u32) -> Option<u32> {
+    match types.get(t) {
+        TypeDef::Struct { .. } | TypeDef::Enum { .. } => {
+            types.field_offsets(t).get(k as usize).copied()
+        }
+        TypeDef::Vector(s, _) => Some(s.bytes() * k),
+        TypeDef::Matrix(n) => Some(column_stride(*n) * k),
+        TypeDef::Array(e, _) => Some(array_stride(types, *e).saturating_mul(k)),
+        TypeDef::Run(_) => Some(4 * k),
+        _ => None,
+    }
+}
+
+/// The parts a value of type `t` is built of, in order, with their byte offsets: a struct's
+/// fields, a vector's components, a matrix's columns, an array's elements. None for other
+/// types.
+pub fn parts(types: &Types, t: TypeId) -> Vec<(TypeId, u32)> {
+    let n = match types.get(t) {
+        TypeDef::Struct { fields, .. } => fields.len() as u32,
+        TypeDef::Vector(_, n) | TypeDef::Matrix(n) => u32::from(*n),
+        TypeDef::Array(_, n) => *n,
+        _ => 0,
+    };
+    (0..n).map_while(|k| Some((types.part(t, k)?, part_offset(types, t, k)?))).collect()
+}
+
 /// The scalars a value of type `t` holds, in order (fields, then elements, then components;
 /// a matrix's columns), with their byte offsets: how an export returns it (each one a WASM
 /// result). An enum's, a run's or a pointer's aren't listed.
@@ -160,31 +182,11 @@ pub fn scalars(types: &Types, t: TypeId) -> Vec<(u32, Scalar)> {
     fn go(types: &Types, t: TypeId, at: u32, out: &mut Vec<(u32, Scalar)>) {
         match types.get(t) {
             TypeDef::Scalar(s) => out.push((at, *s)),
-            TypeDef::Vector(s, n) => {
-                let size = scalar_layout(*s).size;
-                out.extend((0..u32::from(*n)).map(|c| (at + c * size, *s)));
-            }
-            TypeDef::Matrix(n) => {
-                for c in 0..u32::from(*n) {
-                    out.extend(
-                        (0..u32::from(*n))
-                            .map(|r| (at + c * column_stride(*n) + 4 * r, Scalar::F32)),
-                    );
+            _ => {
+                for (pt, o) in parts(types, t) {
+                    go(types, pt, at + o, out);
                 }
             }
-            TypeDef::Array(e, n) => {
-                let stride = array_stride(types, *e);
-                for i in 0..*n {
-                    go(types, *e, at + i * stride, out);
-                }
-            }
-            TypeDef::Struct { fields, .. } => {
-                let offsets = field_offsets(types, t);
-                for (k, (_, f)) in fields.iter().enumerate() {
-                    go(types, *f, at + offsets[k], out);
-                }
-            }
-            _ => {}
         }
     }
     let mut out = Vec::new();

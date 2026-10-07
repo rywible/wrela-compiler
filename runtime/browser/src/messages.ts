@@ -1,7 +1,8 @@
-// Messages between the main thread (main.ts) and the render worker (worker.ts).
+// Messages between the threads: the main thread (main.ts), the render worker (worker.ts), and the
+// threads the render worker starts (the ticker's, ticker.ts, and the helpers).
 
-import type { TestParams } from "./testmode.ts";
 import type { Scripted } from "./input.ts";
+import type { TestParams } from "./testmode.ts";
 
 export type ToWorker =
   | {
@@ -60,13 +61,19 @@ export interface VoiceOptions {
 /** The audio worklet's processor (worklet.ts). */
 export const VOICE_PROCESSOR = "wrela-voice";
 
-/** What the ticker's thread is given (the `ticker` message). */
-export interface TickerStart {
+/** The program's ticker, as its thread gets it: the module and memory to run it with, and the
+ * task, context and rate `__tick` takes (wrela_abi's `IMPORT_TICK`). */
+export interface TickerOptions {
   module: WebAssembly.Module;
   memory: WebAssembly.Memory;
   task: number;
   context: number;
   hz: number;
+}
+
+/** What the ticker's thread is given (the `ticker` message): the program's ticker, and how to
+ * run it. */
+export interface TickerStart extends TickerOptions {
   control: SharedArrayBuffer;
   clock: SharedArrayBuffer;
   /** The input ring (input.ts), whose ticker reader the render worker has attached. */
@@ -83,3 +90,15 @@ export interface TickerStart {
   delay: number;
 }
 
+/** What the ticks did, for test mode's results (`ticks.json`; their records and state hashes
+ * are in the tick log, `ticks.log`). */
+export interface TickReport {
+  /** How long each tick took (ms). */
+  cpu_ms: number[];
+}
+
+/** What the ticker's thread tells the render worker. */
+export type FromTicker =
+  | { type: "fatal"; message: string }
+  /** Stopped (test mode): the ticks, and the tick log when hashes were kept. */
+  | { type: "ticks"; report: TickReport; log: Uint8Array<ArrayBuffer> | null };

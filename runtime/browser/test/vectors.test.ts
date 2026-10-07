@@ -8,10 +8,13 @@ import { Lines } from "../src/lines.ts";
 import { parseManifest } from "../src/manifest.ts";
 import { parseScript } from "../src/input.ts";
 import { decode, Sequencer, StreamError } from "../src/stream.ts";
+import { frameTime } from "../src/testmode.ts";
+import { lockstepTicks } from "../src/ticker.ts";
 import { TickLogWriter, wasmHash } from "../src/ticks.ts";
 import { type ErrorVector, vectors } from "./fixtures.ts";
 
 const bytes = (hex: string) => Uint8Array.from(hex.match(/../g) ?? [], (b) => Number.parseInt(b, 16));
+const hex = (b: Uint8Array) => Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
 
 /** What a call throws, as the vectors record it. */
 function thrown(f: () => unknown): ErrorVector | null {
@@ -119,7 +122,6 @@ describe("line tables", () => {
 });
 
 describe("input scripts", () => {
-  const hex = (b: Uint8Array) => Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
   for (const v of vectors.input) {
     test(v.name, () => {
       if (v.error !== undefined) {
@@ -136,7 +138,6 @@ describe("input scripts", () => {
 });
 
 describe("tick logs", () => {
-  const hex = (b: Uint8Array) => Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
   test("a build's WASM hash", () => {
     expect(wasmHash(new Uint8Array([0, 0x61, 0x73, 0x6d])).toString(16).padStart(16, "0")).toBe(vectors.tick_logs[0]!.wasm_hash);
   });
@@ -145,6 +146,16 @@ describe("tick logs", () => {
       const log = new TickLogWriter(BigInt(`0x${v.wasm_hash}`), v.hz, BigInt(`0x${v.first}`));
       for (const t of v.ticks) log.push(bytes(t.records.join("")), BigInt(`0x${t.hash}`));
       expect(hex(log.encode())).toBe(v.bytes);
+    });
+  }
+});
+
+describe("lockstep schedule", () => {
+  for (const v of vectors.lockstep) {
+    test(`${v.hz} Hz at ${v.fps} fps`, () => {
+      expect(v.frames.map((i) => lockstepTicks(i, v.hz, v.fps))).toEqual(v.ticks);
+      // The WASM call rounds a frame's time to f32.
+      expect(v.frames.map((i) => Math.fround(frameTime(i, v.fps)))).toEqual(v.times);
     });
   }
 });

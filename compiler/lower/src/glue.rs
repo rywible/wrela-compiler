@@ -32,22 +32,37 @@ impl<'a> Cx<'a> {
         traits::implements_builtin(&self.checked.program, t, Lang::Copy)
     }
 
+    /// The function trait method `method` runs for the concrete `self_ty` (an impl's, or the
+    /// trait's default), with all its type arguments, given the trait's (`trait_args`) and the
+    /// method's own (`method_args`). `None` if nothing implements it.
+    pub fn resolve_impl(
+        &self,
+        method: FnId,
+        self_ty: TyId,
+        trait_args: &[TyId],
+        method_args: &[TyId],
+    ) -> Option<(FnId, Vec<TyId>)> {
+        let program = &self.checked.program;
+        let (func, subst) =
+            traits::resolve_trait_method(program, method, self_ty, trait_args, method_args)?;
+        let substs = program
+            .fn_all_generics(func)
+            .iter()
+            .map(|g| self.checked.reveal(subst.get(*g).unwrap_or(program.types.error)))
+            .collect();
+        Some((func, substs))
+    }
+
     /// The instance a trait method `name` of lang trait `lang` runs for `self_ty`, if an impl
     /// (or the trait's default) has one: `Drop::drop`, `Clone::clone_into`.
     pub fn lang_method(&mut self, lang: Lang, name: &str, self_ty: TyId) -> Option<InstanceKey> {
         let program = &self.checked.program;
         let tr = program.lang_trait(lang)?;
         let method = traits::trait_method(program, tr, name)?;
-        let (func, subst) = traits::resolve_trait_method(program, method, self_ty, &[], &[])?;
+        let (func, substs) = self.resolve_impl(method, self_ty, &[], &[])?;
         if program.func(func).attrs.intrinsic || !self.checked.mir.contains_key(&func) {
             return None;
         }
-        let substs: Vec<TyId> = program
-            .fn_all_generics(func)
-            .iter()
-            .map(|g| subst.get(*g).unwrap_or(program.types.error))
-            .collect();
-        let substs = substs.into_iter().map(|t| self.checked.reveal(t)).collect();
         Some(InstanceKey::plain(func, substs))
     }
 

@@ -4,7 +4,7 @@
 
 use std::time::Instant;
 use wrela_host::{CpuBuild, CpuHost, Value};
-use wrela_tests::page;
+use wrela_tests::{median, one_u32, page};
 
 fn call(host: &mut CpuHost, name: &str, args: &[Value]) -> Vec<Value> {
     host.call_export(name, args).unwrap_or_else(|e| panic!("{name}: {e}"))
@@ -13,13 +13,6 @@ fn call(host: &mut CpuHost, name: &str, args: &[Value]) -> Vec<Value> {
 fn u64_of(v: &[Value]) -> u64 {
     match v {
         [Value::I64(x)] => *x as u64,
-        other => panic!("returned {other:?}"),
-    }
-}
-
-fn u32_of(v: &[Value]) -> u32 {
-    match v {
-        [Value::I32(x)] => *x as u32,
         other => panic!("returned {other:?}"),
     }
 }
@@ -52,7 +45,7 @@ fn replayed_ticks_give_the_same_hashes() {
     let mut host = CpuBuild::load(&dir).expect("load").start_with(1).expect("start");
     let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
     // The count works: a clone allocates its 3 `Vec`s and 4 strings' buffers.
-    assert_eq!(u32_of(&call(&mut host, "clone_allocations", &[])), 7);
+    assert_eq!(one_u32(&mut host, "clone_allocations", &[]), 7);
     let initial = u64_of(&call(&mut host, "hash", &[]));
     // `inputs[t]` is tick t's input; `hashes[t]` the hash after it.
     let mut inputs: Vec<u32> = Vec::new();
@@ -61,11 +54,11 @@ fn replayed_ticks_give_the_same_hashes() {
     let mut slots: [Option<u32>; SLOTS] = [None; SLOTS];
     let (mut ticks, mut replayed, mut restores) = (0u32, 0u32, 0u32);
     while ticks < 10_000 {
-        let t = u32_of(&call(&mut host, "tick_count", &[]));
+        let t = one_u32(&mut host, "tick_count", &[]);
         if t.is_multiple_of(EVERY) {
             let slot = (t / EVERY) as usize % SLOTS;
             call(&mut host, "keyframe", &[Value::I32(slot as i32)]);
-            assert_eq!(u32_of(&call(&mut host, "allocated", &[])), 0, "a keyframe at tick {t}");
+            assert_eq!(one_u32(&mut host, "allocated", &[]), 0, "a keyframe at tick {t}");
             let kept = u64_of(&call(&mut host, "keyframe_hash", &[Value::I32(slot as i32)]));
             assert_eq!(kept, hash_at(&hashes, t), "the keyframe of tick {t}");
             slots[slot] = Some(t);
@@ -86,7 +79,7 @@ fn replayed_ticks_give_the_same_hashes() {
             let kept: Vec<usize> = (0..SLOTS).filter(|&s| slots[s].is_some()).collect();
             let slot = kept[rng.below(kept.len() as u64) as usize];
             call(&mut host, "restore", &[Value::I32(slot as i32)]);
-            assert_eq!(u32_of(&call(&mut host, "allocated", &[])), 0, "a restore");
+            assert_eq!(one_u32(&mut host, "allocated", &[]), 0, "a restore");
             let k = slots[slot].expect("kept");
             assert_eq!(
                 u64_of(&call(&mut host, "hash", &[])),
@@ -112,15 +105,14 @@ fn snapshot_costs() {
     let mut time = |name: &str| {
         let args = [Value::I32(N)];
         call(&mut host, name, &args); // warm-up, not counted
-        let mut runs: Vec<f64> = (0..9)
+        let runs: Vec<f64> = (0..9)
             .map(|_| {
                 let t = Instant::now();
                 call(&mut host, name, &args);
                 t.elapsed().as_secs_f64() * 1e3 / f64::from(N)
             })
             .collect();
-        runs.sort_by(f64::total_cmp);
-        runs[4]
+        median(&runs)
     };
     let copy = time("copy_big");
     let clone = time("clone_big");

@@ -26,6 +26,7 @@ pub mod studio;
 pub use wrela_sema::STD_SOURCES;
 
 use std::path::Path;
+use std::sync::Arc;
 use wrela_diag::{Diagnostic, SourceMap, Span, codes, has_errors, sort_and_dedup};
 use wrela_sema::SourceUnit;
 use wrela_sema::defs::PackageKind;
@@ -313,7 +314,7 @@ fn run_tests(root: &Path, filter: Option<&str>, kind: PackageKind, fuel: u64) ->
         filtered_out = all - tests.len();
         // Tests of code run as constants are computed; frame tests run the program first.
         let (framed, plain): (Vec<_>, Vec<_>) =
-            tests.iter().partition(|&&f| p.func(f).attrs.runs_program());
+            tests.iter().partition(|&&f| p.func(f).attrs.test_run.is_some());
         let mut ran = Vec::new();
         if !plain.is_empty() {
             let (r, d) = consts::run_tests(&checked, &sources, &data, &plain, fuel);
@@ -554,15 +555,15 @@ fn load_with(root: &Path, overlay: &Overlay) -> (SourceMap, Vec<Diagnostic>, Opt
         // std's files come first in every compile, so their file ids, and what parsing them
         // gives, are the same each time: parsed once a process.
         let file = l.sources.add(format!("<{name}>"), text.to_string());
-        let (ast, diags) = &std_parsed()[k];
+        let (ast, text, diags) = &std_parsed()[k];
         assert_eq!(ast.span.file, file, "std's files are added first, in order");
         l.diags.extend(diags.iter().cloned());
         l.units.push(SourceUnit {
             path: name.split("::").map(String::from).collect(),
-            ast: ast.clone(),
+            ast: Arc::clone(ast),
             package: 0,
             syntax_errors: Vec::new(),
-            text: l.sources.file(file).text.as_str().into(),
+            text: Arc::clone(text),
         });
     }
     l.package(root, None, PackageKind::Program, None);
@@ -788,22 +789,23 @@ impl Loader {
     }
 }
 
-/// std's files, parsed as the first files of a source map: each one's tree and diagnostics.
-fn std_parsed() -> &'static [(wrela_syntax::ast::File, Vec<Diagnostic>)] {
-    static PARSED: std::sync::OnceLock<Vec<(wrela_syntax::ast::File, Vec<Diagnostic>)>> =
-        std::sync::OnceLock::new();
+/// One of std's files, parsed: its tree, its text, and its diagnostics.
+type StdParsed = (Arc<wrela_syntax::ast::File>, Arc<str>, Vec<Diagnostic>);
+
+/// std's files, parsed as the first files of a source map (file `k` is std's `k`th).
+fn std_parsed() -> &'static [StdParsed] {
+    static PARSED: std::sync::OnceLock<Vec<StdParsed>> = std::sync::OnceLock::new();
     PARSED.get_or_init(|| {
-        let mut sources = SourceMap::new();
         STD_SOURCES
             .iter()
-            .map(|(name, text)| {
-                let file = sources.add(format!("<{name}>"), text.to_string());
-                let parsed = wrela_syntax::parse(file, text);
+            .enumerate()
+            .map(|(k, (name, text))| {
+                let parsed = wrela_syntax::parse(wrela_diag::FileId(k as u32), text);
                 assert!(
                     !parsed.diagnostics.iter().any(Diagnostic::is_error),
                     "std's {name} has syntax errors"
                 );
-                (parsed.file, parsed.diagnostics)
+                (Arc::new(parsed.file), Arc::from(*text), parsed.diagnostics)
             })
             .collect()
     })
@@ -825,7 +827,7 @@ fn add_unit(
         parsed.diagnostics.iter().filter(|d| d.is_error()).filter_map(Diagnostic::span).collect();
     diags.extend(parsed.diagnostics);
     let text = sources.file(file).text.as_str().into();
-    SourceUnit { path, ast: parsed.file, package, syntax_errors, text }
+    SourceUnit { path, ast: Arc::new(parsed.file), package, syntax_errors, text }
 }
 
 #[cfg(test)]

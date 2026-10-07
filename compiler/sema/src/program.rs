@@ -102,6 +102,11 @@ impl Program {
         &self.params[p.index()]
     }
 
+    /// The alias that names traits whose type `f`'s result is (§4), if one is.
+    pub fn alias_defined_by(&self, f: FnId) -> Option<&AliasDef> {
+        self.aliases.iter().find(|a| a.defined_by == Some(f))
+    }
+
     pub fn lang_adt(&self, l: Lang) -> Option<AdtId> {
         match self.lang.get(&l) {
             Some(LangRes::Adt(a)) => Some(*a),
@@ -285,7 +290,7 @@ impl Program {
             // An alias that names traits shows as its name.
             TyKind::Opaque(f, args)
                 if args.is_empty()
-                    && let Some(a) = self.aliases.iter().find(|a| a.defined_by == Some(*f)) =>
+                    && let Some(a) = self.alias_defined_by(*f) =>
             {
                 s.push_str(&a.name);
             }
@@ -300,14 +305,10 @@ impl Program {
                 }
             },
             TyKind::FnPtr(ps, r, flags) => {
-                if flags.deterministic {
-                    s.push_str("@deterministic ");
-                }
-                if flags.parallel {
-                    s.push_str("@parallel ");
-                }
-                if flags.audio {
-                    s.push_str("@audio ");
+                for (name, has) in flags.attrs() {
+                    if has {
+                        let _ = write!(s, "@{name} ");
+                    }
                 }
                 s.push_str("fn(");
                 for (i, &t) in ps.iter().enumerate() {
@@ -364,6 +365,24 @@ impl Program {
     pub fn fields_of(&self, a: AdtId, args: &[TyId], variant: Option<u32>) -> Vec<TyId> {
         let subst = Subst::from_pairs(&self.adt(a).generics, args);
         self.adt_fields(a, variant).iter().map(|f| self.field_under(f.ty, &subst)).collect()
+    }
+
+    /// The parts of a plain aggregate of type `t`: a tuple's elements, or the fields of a
+    /// struct that isn't a borrow struct or a type the language or std gives a meaning
+    /// (`Text`, `Vec`, `Flat<T>`, ...). `None` for other types, and for one with no parts.
+    pub fn plain_parts(&self, t: TyId) -> Option<Vec<TyId>> {
+        let parts = match self.types.kind(t) {
+            TyKind::Tuple(ts) => ts.clone(),
+            TyKind::Adt(a, args)
+                if self.lang_of_ty(t).is_none()
+                    && !self.adt(*a).is_enum()
+                    && !self.adt(*a).borrow =>
+            {
+                self.fields_of(*a, args, None)
+            }
+            _ => return None,
+        };
+        (!parts.is_empty()).then_some(parts)
     }
 
     /// The `variant` that `fields_of` takes for each of `a`'s field lists: each variant's

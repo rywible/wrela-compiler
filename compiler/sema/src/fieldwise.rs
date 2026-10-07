@@ -266,21 +266,18 @@ fn bad_hook(p: &Program, h: FnId, want: &str) -> Diagnostic {
 pub fn derive(p: &Program, f: FnId) -> (Option<Body>, Vec<Diagnostic>) {
     let def = p.func(f);
     let Some(d) = &def.derived else { return (None, Vec::new()) };
-    let span = match def.owner {
-        FnOwner::Impl(i) => p.impl_(i).span,
-        _ => def.span,
-    };
+    let FnOwner::Impl(imp) = def.owner else { return (None, Vec::new()) };
+    let span = p.impl_(imp).span;
     let tr = d.trait_ref.trait_;
     let shape = match shape(p, tr, d.method) {
         Ok(s) => s,
         Err(_) => return (None, Vec::new()), // reported at the trait
     };
-    let FnOwner::Impl(imp) = def.owner else { return (None, Vec::new()) };
     let self_ty = p.impl_(imp).self_ty;
     let of = match p.types.kind(self_ty) {
         TyKind::Adt(a, args) => Of::Adt(*a, args.clone()),
         TyKind::Tuple(ts) => Of::Tuple(ts.clone()),
-        TyKind::ArrayN(e, n) => Of::Array(*e, *n),
+        &TyKind::ArrayN(e, n) if let &TyKind::Param(g) = p.types.kind(n) => Of::Array(e, g),
         _ => return (None, Vec::new()),
     };
     let method_args: Vec<TyId> = def.generics.iter().map(|&g| p.types.param(g)).collect();
@@ -322,8 +319,8 @@ pub fn derive(p: &Program, f: FnId) -> (Option<Body>, Vec<Diagnostic>) {
 enum Of {
     Adt(AdtId, Vec<TyId>),
     Tuple(Vec<TyId>),
-    /// `[T; N]`: the element type, and the length (a `const` parameter).
-    Array(TyId, TyId),
+    /// `[T; N]`: the element type, and the `const` parameter that is its length.
+    Array(TyId, ParamId),
 }
 
 struct Builder<'p> {
@@ -361,6 +358,14 @@ impl Builder<'_> {
             closure: None,
         });
         id
+    }
+
+    /// `let name = init;`: a new local, and the statement that binds it.
+    fn bind(&mut self, name: &str, init: Expr, mutable: bool) -> (LocalId, Stmt) {
+        let ty = init.ty;
+        let l = self.local(name, ty, LocalKind::Owned { mutable });
+        let pat = Pat { ty, kind: PatKind::Bind(l), span: self.span };
+        (l, Stmt { kind: StmtKind::Bind { pat, init, else_: None }, span: self.span })
     }
 
     fn var(&self, l: LocalId) -> Expr {
@@ -605,10 +610,7 @@ impl Builder<'_> {
             }
             // A tuple's fields have no names: the hooks aren't called for them.
             Of::Tuple(ts) => (ts.clone(), None),
-            Of::Array(e, n) => {
-                let (e, n) = (*e, *n);
-                return Some(self.array_body(e, n));
-            }
+            &Of::Array(e, n) => return Some(self.array_body(e, n)),
         };
         let parts: Vec<Vec<Expr>> = (0..fields.len())
             .map(|i| {
@@ -652,10 +654,10 @@ impl Builder<'_> {
                     if let Some(h) = hk {
                         stmts.push(self.stmt(h));
                     }
-                    let call = if self.shape == Shape::TryUnit { self.try_(call) } else { call };
+                    let call = if self.shape.tries() { self.try_(call) } else { call };
                     stmts.push(self.stmt(call));
                 }
-                let tail = (self.shape == Shape::TryUnit).then(|| {
+                let tail = self.shape.tries().then(|| {
                     let unit = self.e(self.p.types.unit, ExprKind::Tuple(Vec::new()));
                     self.ok(unit)
                 });
@@ -679,15 +681,7 @@ impl Builder<'_> {
                 let mut acc = self.ordering(1);
                 for (_, call) in calls.into_iter().rev() {
                     let ty = call.ty;
-                    let o = self.local("order", ty, LocalKind::Owned { mutable: false });
-                    let bind = Stmt {
-                        kind: StmtKind::Bind {
-                            pat: Pat { ty, kind: PatKind::Bind(o), span: self.span },
-                            init: call,
-                            else_: None,
-                        },
-                        span: self.span,
-                    };
+                    let (o, bind) = self.bind("order", call, false);
                     let decided = self.e(
                         bool_ty,
                         ExprKind::Binary(
@@ -713,7 +707,7 @@ impl Builder<'_> {
             Shape::Build | Shape::TryBuild => {
                 let mut vals = Vec::new();
                 for (hk, call) in calls {
-                    let call = if self.shape == Shape::TryBuild { self.try_(call) } else { call };
+                    let call = if self.shape.tries() { self.try_(call) } else { call };
                     vals.push(match hk {
                         Some(h) => {
                             let s = self.stmt(h);
@@ -738,7 +732,7 @@ impl Builder<'_> {
                     }
                 };
                 let built = self.e(self.self_ty, kind);
-                if self.shape == Shape::TryBuild { self.ok(built) } else { built }
+                if self.shape.tries() { self.ok(built) } else { built }
             }
         }
     }
@@ -747,14 +741,10 @@ impl Builder<'_> {
     /// `const` parameter), in order. A method that builds one starts from the first element's
     /// result, copied to every element (`implements_fieldwise` wants a `Copy` element then), and
     /// builds an empty one zeroed, calling nothing.
-    fn array_body(&mut self, e: TyId, n: TyId) -> Expr {
+    fn array_body(&mut self, e: TyId, n: ParamId) -> Expr {
         let (u, bool_ty, unit, never) =
             (self.p.types.u32, self.p.types.bool, self.p.types.unit, self.p.types.never);
-        let len = match self.p.types.kind(n) {
-            TyKind::Param(g) => self.e(u, ExprKind::ConstParam(*g)),
-            TyKind::ConstU32(k) => self.u32_lit(*k),
-            _ => self.e(u, ExprKind::Error),
-        };
+        let len = self.e(u, ExprKind::ConstParam(n));
         let i = self.local("i", u, LocalKind::Owned { mutable: false });
         // The method's call on element `at` of each `Self` parameter.
         let call_at = |b: &mut Self, at: &Expr| -> Expr {
@@ -791,9 +781,9 @@ impl Builder<'_> {
         match self.shape {
             Shape::Unit | Shape::TryUnit => {
                 let call = call_at(self, &at_i);
-                let call = if self.shape == Shape::TryUnit { self.try_(call) } else { call };
+                let call = if self.shape.tries() { self.try_(call) } else { call };
                 let l = each(self, self.u32_lit(0), vec![self.stmt(call)]);
-                let tail = (self.shape == Shape::TryUnit).then(|| {
+                let tail = self.shape.tries().then(|| {
                     let unit = self.e(unit, ExprKind::Tuple(Vec::new()));
                     self.ok(unit)
                 });
@@ -811,16 +801,7 @@ impl Builder<'_> {
             }
             Shape::Order => {
                 let call = call_at(self, &at_i);
-                let ty = call.ty;
-                let o = self.local("order", ty, LocalKind::Owned { mutable: false });
-                let bind = Stmt {
-                    kind: StmtKind::Bind {
-                        pat: Pat { ty, kind: PatKind::Bind(o), span: self.span },
-                        init: call,
-                        else_: None,
-                    },
-                    span: self.span,
-                };
+                let (o, bind) = self.bind("order", call, false);
                 let decided = self.e(
                     bool_ty,
                     ExprKind::Binary(
@@ -835,7 +816,7 @@ impl Builder<'_> {
                 self.block(vec![l], Some(equal))
             }
             Shape::Build | Shape::TryBuild => {
-                let tries = self.shape == Shape::TryBuild;
+                let tries = self.shape.tries();
                 // Empty: zeroed, with no call.
                 let empty = self.e(
                     bool_ty,
@@ -846,33 +827,18 @@ impl Builder<'_> {
                     ),
                 );
                 let zeroed = match self.p.lang_fn(Lang::MemZeroed) {
-                    Some(z) => self.e(
-                        self.self_ty,
-                        ExprKind::Call(Call {
-                            callee: Callee::Fn { func: z, args: vec![self.self_ty] },
-                            args: Vec::new(),
-                            modes: Vec::new(),
-                            receiver: false,
-                            order: Vec::new(),
-                            ret_mode: RetMode::Owned,
-                        }),
-                    ),
+                    Some(z) => {
+                        let callee = Callee::Fn { func: z, args: vec![self.self_ty] };
+                        plain_call(callee, Vec::new(), false, self.self_ty, self.span)
+                    }
                     None => self.e(self.self_ty, ExprKind::Error),
                 };
                 let zeroed = if tries { self.ok(zeroed) } else { zeroed };
                 let early = return_if(self, empty, zeroed);
                 let first = call_at(self, &self.u32_lit(0));
                 let first = if tries { self.try_(first) } else { first };
-                let out = self.local("out", self.self_ty, LocalKind::Owned { mutable: true });
                 let filled = self.e(self.self_ty, ExprKind::ArrayRepeat(Box::new(first), 0));
-                let bind = Stmt {
-                    kind: StmtKind::Bind {
-                        pat: Pat { ty: self.self_ty, kind: PatKind::Bind(out), span: self.span },
-                        init: filled,
-                        else_: None,
-                    },
-                    span: self.span,
-                };
+                let (out, bind) = self.bind("out", filled, true);
                 let next = call_at(self, &at_i);
                 let next = if tries { self.try_(next) } else { next };
                 let place =
@@ -1000,23 +966,13 @@ impl Builder<'_> {
                 let b = self.self_params[1];
                 let da = self.e(u, ExprKind::Discriminant(Box::new(self.var(self.params[a]))));
                 let db = self.e(u, ExprKind::Discriminant(Box::new(self.var(self.params[b]))));
-                let def = self.p.func(cmp);
-                Some(self.e(
-                    def.ret,
-                    ExprKind::Call(Call {
-                        callee: Callee::TraitMethod {
-                            method: cmp,
-                            self_ty: u,
-                            trait_args: Vec::new(),
-                            method_args: Vec::new(),
-                        },
-                        args: vec![da, db],
-                        modes: vec![Mode::Borrow, Mode::Borrow],
-                        receiver: true,
-                        order: vec![0, 1],
-                        ret_mode: RetMode::Owned,
-                    }),
-                ))
+                let callee = Callee::TraitMethod {
+                    method: cmp,
+                    self_ty: u,
+                    trait_args: Vec::new(),
+                    method_args: Vec::new(),
+                };
+                Some(plain_call(callee, vec![da, db], true, self.p.func(cmp).ret, self.span))
             }
             _ => {
                 // The trait's default body.
@@ -1066,31 +1022,12 @@ impl Builder<'_> {
         let arr_ty = self.p.types.array(text_ty, names.len() as u32);
         let arr = self.e(arr_ty, ExprKind::Array(names));
         let index = self.hook_call(h, vec![arr]);
-        let u = self.p.types.u32;
-        let k = self.local("variant", u, LocalKind::Owned { mutable: false });
-        let bind = Stmt {
-            kind: StmtKind::Bind {
-                pat: Pat { ty: u, kind: PatKind::Bind(k), span: self.span },
-                init: index,
-                else_: None,
-            },
-            span: self.span,
-        };
+        let (k, bind) = self.bind("variant", index, false);
         // `if k == 0 { .. } else if k == 1 { .. } else { panic }`.
         let msg = self.text("the variant index is past the enum's variants");
         let never = self.p.types.never;
-        let panic = self.e(
-            never,
-            ExprKind::Call(Call {
-                callee: Callee::Builtin(crate::builtins::BuiltinFn::Panic),
-                args: vec![msg],
-                modes: vec![Mode::Borrow],
-                receiver: false,
-                order: vec![0],
-                ret_mode: RetMode::Owned,
-            }),
-        );
-        let mut acc = panic;
+        let panic = Callee::Builtin(crate::builtins::BuiltinFn::Panic);
+        let mut acc = plain_call(panic, vec![msg], false, never, self.span);
         for (v, (_, fields, names)) in variants.iter().enumerate().rev() {
             let parts = vec![Vec::new(); fields.len()];
             let built = self.combine(Some(v as u32), fields, Some(names), parts);

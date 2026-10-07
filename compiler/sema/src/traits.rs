@@ -596,11 +596,9 @@ pub fn can_hold(p: &Program, holder: TyId, target: TyId) -> bool {
                 go(p, *e, target, seen)
             }
             TyKind::Str => target == p.types.int(IntTy::U8),
-            &TyKind::Vec(e, _) => {
-                target == p.types.elem(e) || matches!(p.types.kind(target), TyKind::Vec(..))
-            }
-            TyKind::Mat(_) => {
-                target == p.types.f32 || matches!(p.types.kind(target), TyKind::Vec(..))
+            TyKind::Vec(..) | TyKind::Mat(_) => {
+                target == crate::builtins::scalar_of(&p.types, holder)
+                    || matches!(p.types.kind(target), TyKind::Vec(..))
             }
             TyKind::Tuple(ts) => ts.iter().any(|&t| go(p, t, target, seen)),
             TyKind::Adt(a, args) => {

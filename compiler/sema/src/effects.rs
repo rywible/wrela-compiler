@@ -760,7 +760,7 @@ fn index_panics(p: &Program, body: &Body, place: &mir::Place, span: Span, n: &mu
             n.direct.push((Effect::Panic, span, "index can be past the end".into()));
             return;
         }
-        t = mir::proj_ty_pub(p, t, &mut variant, proj);
+        t = mir::proj_ty(p, t, &mut variant, proj);
     }
 }
 

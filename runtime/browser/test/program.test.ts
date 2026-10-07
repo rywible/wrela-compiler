@@ -66,7 +66,7 @@ describe("the ABI check", () => {
       buildModule({ imports: [wrongType], memory: 1, funcs: [frameOnly] }),
       "its import `wrela.submit` must be a function (i32, i32) -> (), not a function (i32) -> ()",
     );
-        await rejects(
+    await rejects(
       buildModule({ imports: [{ module: "wrela", name: "memory", kind: "memory" }], funcs: [frameOnly] }),
       "its import `wrela.memory` must be a shared memory, not a memory",
     );

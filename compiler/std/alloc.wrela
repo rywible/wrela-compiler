@@ -11,27 +11,21 @@
 // allocation), where the memory ends, a lock word, the large blocks' list, and one list head
 // per size class. How many blocks `alloc` has returned is counted in each thread's block, so
 // what one thread counts doesn't depend on another's timing. So are the times a thread found the
-// lock taken, and the tries it spun before it got it: hosts measure the waits with them. A test
-// in wrela_abi checks that STATE and BUMP are ALLOC_STATE, and that ALLOCATIONS, LOCK_WAITS and
-// LOCK_SPINS are the block's words.
+// lock taken, and the tries it spun before it got it: hosts measure the waits with them.
 
+use std::abi::{ALLOCATIONS, ALLOC_STATE, LOCK_SPINS, LOCK_WAITS}
 use std::mem::{
-    compare_swap, copy, heap_base, load_u32, memory_grow, memory_pages, store_u32, thread_block,
+    align_of, compare_swap, copy, count, heap_base, load_u32, memory_grow, memory_pages, size_of,
+    store_u32, thread_block, write,
 }
 
-const STATE: u32 = 16
-const BUMP: u32 = 16
-const END: u32 = 20
-const LOCK: u32 = 24
-const LARGE: u32 = 28
-const HEADS: u32 = 32
+// The allocator's words, from ALLOC_STATE on.
+const BUMP: u32 = ALLOC_STATE
+const END: u32 = ALLOC_STATE + 4
+const LOCK: u32 = ALLOC_STATE + 8
+const LARGE: u32 = ALLOC_STATE + 12
+const HEADS: u32 = ALLOC_STATE + 16
 const CLASSES: u32 = 17
-/// A thread's count of the blocks it has allocated, in its block.
-const ALLOCATIONS: u32 = 36
-/// A thread's count of the times it found the lock taken, in its block.
-const LOCK_WAITS: u32 = 44
-/// A thread's count of the tries it spun on the lock, in its block.
-const LOCK_SPINS: u32 = 48
 const SMALLEST: u32 = 16
 const PAGE: u32 = 65536
 
@@ -61,11 +55,19 @@ pub fn alloc(size: u32, align: u32) -> u32 {
     }
     unlock()
     unsafe {
-        // Only this thread writes its count.
-        let count = thread_block() + ALLOCATIONS
-        store_u32(count, load_u32(count).wrapping_add(1))
+        count(ALLOCATIONS, 1)
     }
     block
+}
+
+/// Moves `value` to a block of its own: the block's address. Whoever frees the block, with
+/// `size_of::<T>()`, moves the value out or drops it first.
+pub(package) fn place<T>(value: take T) -> u32 {
+    unsafe {
+        let at = alloc(size_of::<T>(), align_of::<T>())
+        write(at, take value)
+        at
+    }
 }
 
 /// How many blocks the allocator has handed out to this thread since the program started,
@@ -175,10 +177,8 @@ fn lock() {
             while compare_swap(LOCK, expected: 0, new: 1) != 0 {
                 spins += 1
             }
-            let waits = thread_block() + LOCK_WAITS
-            store_u32(waits, load_u32(waits).wrapping_add(1))
-            let tries = thread_block() + LOCK_SPINS
-            store_u32(tries, load_u32(tries).wrapping_add(spins))
+            count(LOCK_WAITS, 1)
+            count(LOCK_SPINS, spins)
         }
     }
 }

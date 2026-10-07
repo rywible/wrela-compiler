@@ -1457,7 +1457,8 @@ impl<'a> Parser<'a> {
         self.nested(Self::parse_type_inner)
     }
 
-    /// A parameter's or a function's return type, where a trait names a type.
+    /// A parameter's type, a function's return type or a type alias's type, where a trait names
+    /// a type.
     fn parse_trait_position_type(&mut self) -> PResult<TypeExpr> {
         self.trait_type_here = true;
         let ty = self.parse_type();

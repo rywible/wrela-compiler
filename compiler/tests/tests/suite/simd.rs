@@ -16,7 +16,7 @@
 
 use std::path::Path;
 use wrela_host::{CpuBuild, CpuHost, Error, Value, frame_time};
-use wrela_tests::{page, scalar_page, sized};
+use wrela_tests::{median, one_u32, page, scalar_page, sized};
 
 fn simd_instructions(dir: &Path) -> usize {
     let wasm = std::fs::read(dir.join("game.wasm")).expect("game.wasm");
@@ -33,20 +33,13 @@ fn both(pkg: &str, test: &str) -> (std::path::PathBuf, std::path::PathBuf) {
     (simd, scalar)
 }
 
-fn u32_of(v: &[Value]) -> u32 {
-    match v {
-        [Value::I32(x)] => *x as u32,
-        other => panic!("returned {other:?}"),
-    }
-}
-
 #[test]
 fn every_vector_operation_has_the_same_bits_with_simd() {
     let (simd, scalar) = both("compiler/tests/simd", "ops");
     assert!(simd_instructions(&simd) > 500, "the SIMD build has little SIMD");
     let mut a = CpuHost::load(&simd).expect("load");
     let mut b = CpuHost::load(&scalar).expect("load");
-    let cases = u32_of(&a.call_export("cases", &[]).expect("cases"));
+    let cases = one_u32(&mut a, "cases", &[]);
     let seeds: u32 = sized(2_000, 50_000);
     let chunk: u32 = 500;
     for from in (0..seeds).step_by(chunk as usize) {
@@ -219,7 +212,7 @@ fn simd_speed() {
         let mut host = CpuHost::load(dir).expect("load");
         let args = [Value::I32(n)];
         let first = host.call_export(name, &args).expect(name); // warm-up
-        let mut runs: Vec<f64> = (0..9)
+        let runs: Vec<f64> = (0..9)
             .map(|_| {
                 let t = std::time::Instant::now();
                 let r = host.call_export(name, &args).expect(name);
@@ -227,8 +220,7 @@ fn simd_speed() {
                 t.elapsed().as_secs_f64() * 1e3
             })
             .collect();
-        runs.sort_by(f64::total_cmp);
-        (runs[4], first)
+        (median(&runs), first)
     };
     let ((on, x), (off, y)) = (time(&simd, "vec4_math", 2000), time(&scalar, "vec4_math", 2000));
     assert_eq!(x, y, "the result differs with SIMD");

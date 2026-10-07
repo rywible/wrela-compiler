@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { MANIFEST_VERSION } from "../src/abi.gen.ts";
 import { type Fetch, loadBuild } from "../src/loader.ts";
 import { ManifestError } from "../src/manifest.ts";
 import { FIRST_LIGHT, readFixture, readFixtureText } from "./fixtures.ts";
@@ -35,11 +36,15 @@ test("loads a build's manifest, WASM and shaders", async () => {
 });
 
 test("rejects a manifest of another version, loudly", async () => {
-  const manifest = readFixtureText("manifest.json").replace('"manifest_version": 4', '"manifest_version": 5');
+  const other = MANIFEST_VERSION + 1;
+  const manifest = readFixtureText("manifest.json").replace(
+    `"manifest_version": ${MANIFEST_VERSION}`,
+    `"manifest_version": ${other}`,
+  );
   const load = loadBuild(BASE, server({ "manifest.json": manifest }).fetch);
   await expect(load).rejects.toThrow(ManifestError);
   await expect(loadBuild(BASE, server({ "manifest.json": manifest }).fetch)).rejects.toThrow(
-    "invalid manifest: manifest version 5, but this host reads version 4",
+    `invalid manifest: manifest version ${other}, but this host reads version ${MANIFEST_VERSION}`,
   );
 });
 

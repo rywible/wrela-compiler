@@ -99,10 +99,7 @@ pub fn walk_tys(e: &mut Expr, f: &mut impl FnMut(&mut TyId)) {
             d.fragment.1.iter_mut().for_each(&mut *f);
             walk_tys(&mut d.vertices, f);
             walk_tys(&mut d.instances, f);
-            if let Some(i) = &mut d.indirect {
-                walk_tys(i, f);
-            }
-            if let Some(i) = &mut d.indices {
+            for i in d.indirect.iter_mut().chain(&mut d.indices) {
                 walk_tys(i, f);
             }
             for (_, _, a) in &mut d.args {
@@ -287,6 +284,8 @@ pub(super) fn finish_common(c: &mut Checker) {
             continue;
         }
         match b.result(c.p, &tys) {
+            // Only a scalar settles late: a vector result was known, and reported, when the
+            // call was checked.
             Ok(ty) if b.cpu_impl().is_some() && ty == c.p.types.f64 => {
                 c.err(crate::builtins::f64_math(b.name(), span));
             }
@@ -300,7 +299,7 @@ pub(super) fn finish_common(c: &mut Checker) {
     // `**` whose base's type settled later.
     for (base, exp, span) in std::mem::take(&mut c.pows) {
         let (b, e) = (c.infer.resolve(&c.p.types, base), c.infer.resolve(&c.p.types, exp));
-        if crate::builtins::scalar_of(&c.p.types, b) == c.p.types.f64 {
+        if crate::builtins::is_f64_math(&c.p.types, b) {
             c.err(crate::builtins::f64_math("**", span));
         }
         let ok = match c.p.types.kind(b) {

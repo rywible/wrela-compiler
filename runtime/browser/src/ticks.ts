@@ -1,7 +1,7 @@
 // The tick log (runtime/abi `ticks`): the ticks the ticker's thread ran in test mode, as bytes a
 // native host replays (`wrela-host --replay`). The same bytes as the Rust writer's (vectors).
 
-import { EVENT_SIZE, TICK_LOG_HEADER_LEN, TICK_LOG_VERSION } from "./abi.gen.ts";
+import { EVENT_SIZE, TICK_LOG_HEADER_LEN, TICK_LOG_MAGIC, TICK_LOG_VERSION } from "./abi.gen.ts";
 import { StateHash } from "./hash.ts";
 
 /** FNV-1a 64 of a build's WASM: which build a log is for. */
@@ -21,13 +21,10 @@ export class TickLogWriter {
     readonly first: bigint,
   ) {}
 
-  /** The next tick: its records (EVENT_SIZE bytes each, oldest first) and its state hash. */
+  /** The next tick: its records (EVENT_SIZE bytes each, oldest first), which the log keeps, and
+   * its state hash. */
   push(records: Uint8Array, hash: bigint): void {
-    this.#ticks.push({ records: records.slice(), hash });
-  }
-
-  get length(): number {
-    return this.#ticks.length;
+    this.#ticks.push({ records, hash });
   }
 
   /** The log's bytes. */
@@ -35,7 +32,7 @@ export class TickLogWriter {
     const size = this.#ticks.reduce((n, t) => n + 16 + t.records.length, TICK_LOG_HEADER_LEN);
     const out = new Uint8Array(size);
     const view = new DataView(out.buffer);
-    out.set([0x57, 0x52, 0x54, 0x4c], 0); // "WRTL"
+    view.setUint32(0, TICK_LOG_MAGIC, true);
     view.setUint32(4, TICK_LOG_VERSION, true);
     view.setBigUint64(8, this.wasmHash, true);
     view.setUint32(16, this.hz, true);

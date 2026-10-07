@@ -382,8 +382,8 @@ impl<'c, 'a> Fl<'c, 'a> {
             // one that captures projections has none, and a function-typed parameter is its
             // caller's. Checked here, on concrete types: a capture of a generic type may be a
             // closure in one instance and a named function, which isn't passed, in another.
-            match self.types().kind(t).clone() {
-                TyKind::Closure(c, env) if self.cx.closure_fields(self.mb, c, &env).is_none() => {
+            match self.types().kind(t) {
+                TyKind::Closure(c, env) if self.cx.closure_fields(self.mb, *c, env).is_none() => {
                     self.cx.err(
                         Diagnostic::new(
                             codes::E0702,
@@ -408,9 +408,9 @@ impl<'c, 'a> Fl<'c, 'a> {
             // Bound below if the closure takes it as a parameter; a buffer is its resource; a
             // named function is its type, so it isn't passed.
             self.locals[l.index()] =
-                match (self.types().kind(t).clone(), self.cx.capture_resource(&owner, l)) {
+                match (self.types().kind(t), self.cx.capture_resource(&owner, l)) {
                     (TyKind::FnDef(func, substs), _) => {
-                        Repr::Callable(self.func_callable(func, substs), Vec::new())
+                        Repr::Callable(self.func_callable(*func, substs.clone()), Vec::new())
                     }
                     (_, Some(r)) => Repr::Place(ir::Place::root(ir::PlaceRoot::Resource(r))),
                     (_, None) => Repr::Erased,
@@ -736,22 +736,8 @@ impl<'c, 'a> Fl<'c, 'a> {
         };
         let n = 1 + program.trait_(t).generics.len();
         let substs: Vec<TyId> = substs.iter().map(|&a| self.concrete(a)).collect();
-        let program = &self.cx.checked.program;
-        match wrela_sema::traits::resolve_trait_method(
-            program,
-            func,
-            substs[0],
-            &substs[1..n],
-            &substs[n..],
-        ) {
-            Some((f, subst)) => {
-                let substs = program
-                    .fn_all_generics(f)
-                    .iter()
-                    .map(|g| self.cx.checked.reveal(subst.get(*g).unwrap_or(program.types.error)))
-                    .collect();
-                Callable::Func { func: f, substs }
-            }
+        match self.cx.resolve_impl(func, substs[0], &substs[1..n], &substs[n..]) {
+            Some((func, substs)) => Callable::Func { func, substs },
             None => {
                 let shown = program.display_ty(substs[0]);
                 self.cx.err(Diagnostic::internal(format!(
@@ -762,20 +748,9 @@ impl<'c, 'a> Fl<'c, 'a> {
         }
     }
 
-    /// A component's type of the vector type `t`.
-    fn comp_ty(&self, t: TyId) -> TyId {
-        match *self.types().kind(t) {
-            TyKind::Vec(e, _) => self.types().elem(e),
-            _ => self.types().f32,
-        }
-    }
-
-    /// The type of `n` of the vector type `t`'s components, a swizzle's.
-    fn swizzled_ty(&self, t: TyId, n: usize) -> TyId {
-        match *self.types().kind(t) {
-            TyKind::Vec(e, _) => self.types().vec_of(e, n as u8),
-            _ => self.types().vec(n as u8),
-        }
+    /// The type of projection `proj` (not a `Downcast` or a `Field`) of a value of type `t`.
+    fn proj_ty(&self, t: TyId, proj: &mir::Proj) -> TyId {
+        mir::proj_ty(&self.cx.checked.program, t, &mut None, proj)
     }
 
     /// Whether `v` is a run.
@@ -959,21 +934,18 @@ impl<'c, 'a> Fl<'c, 'a> {
                     mir::Proj::Comp(c) => {
                         path.push(ir::Proj::Comp(cs[*c as usize]));
                         swizzle = None;
-                        ty = self.comp_ty(ty);
                     }
                     mir::Proj::Swizzle(more) => {
-                        let picked: Vec<u8> = more.iter().map(|&c| cs[c as usize]).collect();
-                        ty = self.swizzled_ty(ty, picked.len());
-                        swizzle = Some(picked);
+                        swizzle = Some(more.iter().map(|&c| cs[c as usize]).collect());
                     }
                     mir::Proj::Index(t) => {
                         let iv = self.local_value(*t)?;
                         path.push(ir::Proj::Index(self.swizzle_index(cs, iv)));
                         swizzle = None;
-                        ty = self.comp_ty(ty);
                     }
                     _ => return None,
                 }
+                ty = self.proj_ty(ty, proj);
                 continue;
             }
             match proj {
@@ -1000,70 +972,43 @@ impl<'c, 'a> Fl<'c, 'a> {
                 }
                 mir::Proj::Comp(c) => {
                     path.push(ir::Proj::Comp(*c));
-                    ty = self.comp_ty(ty);
+                    ty = self.proj_ty(ty, proj);
                 }
                 mir::Proj::Swizzle(cs) => {
                     swizzle = Some(cs.clone());
-                    ty = self.swizzled_ty(ty, cs.len());
+                    ty = self.proj_ty(ty, proj);
                 }
                 mir::Proj::Index(t) => {
                     let iv = self.local_value(*t)?;
-                    let k = self.types().kind(ty);
-                    if let TyKind::Adt(_, args) = k
-                        && self.cx.checked.program.lang_of_ty(ty) == Some(Lang::Slots)
-                    {
-                        let idx = crate::gpu::slot_index(self, iv)?;
-                        path.push(ir::Proj::Index(idx));
-                        ty = args[0];
-                        continue;
-                    }
-                    if let TyKind::Adt(_, args) = k
-                        && self.cx.checked.program.lang_of_ty(ty) == Some(Lang::Arena)
-                    {
+                    // The element's type: a lang type's is its first type argument.
+                    let elem = self.proj_ty(ty, proj);
+                    let lang = self.cx.checked.program.lang_of_ty(ty);
+                    let whole = ir::Place { root: root.clone(), path: std::mem::take(&mut path) };
+                    let at = match lang {
+                        Some(Lang::Slots) => {
+                            let idx = crate::gpu::slot_index(self, iv)?;
+                            whole.with(ir::Proj::Index(idx))
+                        }
                         // A value in an arena: by a handle (checked), or by position (a loop).
-                        let elem = args[0];
-                        let arena =
-                            ir::Place { root: root.clone(), path: std::mem::take(&mut path) };
-                        let index_ty = self.concrete(self.mir.local(*t).ty);
-                        let at = self.arena_elem(arena, ty, elem, iv, index_ty)?;
-                        root = at.root;
-                        path = at.path;
-                        ty = elem;
-                        continue;
-                    }
-                    if let TyKind::Adt(_, args) = k
-                        && self.cx.checked.program.lang_of_ty(ty) == Some(Lang::Bounded)
-                    {
+                        Some(Lang::Arena) => {
+                            let index_ty = self.concrete(self.mir.local(*t).ty);
+                            self.arena_elem(whole, ty, elem, iv, index_ty)?
+                        }
                         // An element in use of the array it holds in place.
-                        let elem = args[0];
-                        let b = ir::Place { root: root.clone(), path: std::mem::take(&mut path) };
-                        let iv = self.index_u32(iv);
-                        let at = self.bounded_elem(b, ty, iv)?;
-                        root = at.root;
-                        path = at.path;
-                        ty = elem;
-                        continue;
-                    }
-                    if let TyKind::Adt(_, args) = k
-                        && self.cx.checked.program.lang_of_ty(ty) == Some(Lang::Vec)
-                    {
+                        Some(Lang::Bounded) => {
+                            let iv = self.index_u32(iv);
+                            self.bounded_elem(whole, ty, iv)?
+                        }
                         // An element on the heap: a place at its address.
-                        let elem = args[0];
-                        let vec = ir::Place { root: root.clone(), path: std::mem::take(&mut path) };
-                        let iv = self.index_u32(iv);
-                        let at = self.vec_elem(vec, ty, elem, iv)?;
-                        root = at.root;
-                        path = at.path;
-                        ty = elem;
-                        continue;
-                    }
-                    path.push(ir::Proj::Index(iv));
-                    ty = match k {
-                        TyKind::Array(e, _) | TyKind::Slice(e) => *e,
-                        &TyKind::Vec(e, _) => self.types().elem(e),
-                        TyKind::Mat(n) => self.types().vec(*n),
-                        _ => self.types().error,
+                        Some(Lang::Vec) => {
+                            let iv = self.index_u32(iv);
+                            self.vec_elem(whole, ty, elem, iv)?
+                        }
+                        _ => whole.with(ir::Proj::Index(iv)),
                     };
+                    root = at.root;
+                    path = at.path;
+                    ty = elem;
                 }
             }
         }
@@ -1211,12 +1156,12 @@ impl<'c, 'a> Fl<'c, 'a> {
                     v = self.value(it, ir::Expr::Extract(v, fi));
                 }
                 mir::Proj::Comp(c) => {
-                    ty = self.comp_ty(ty);
+                    ty = self.proj_ty(ty, proj);
                     let ct = self.cx.lower_ty(self.mb, ty, self.code.span)?;
                     v = self.value(ct, ir::Expr::Extract(v, *c as u32));
                 }
                 mir::Proj::Swizzle(cs) => {
-                    ty = self.swizzled_ty(ty, cs.len());
+                    ty = self.proj_ty(ty, proj);
                     let vt = self.cx.lower_ty(self.mb, ty, self.code.span)?;
                     v = self.value(vt, ir::Expr::Swizzle(v, cs.clone()));
                 }
@@ -1508,28 +1453,16 @@ impl<'c, 'a> Fl<'c, 'a> {
             }
             _ => return None,
         };
-        let vals: Vec<(ir::ValueId, TyId)> =
-            xs.iter().filter_map(|x| self.operand(x).map(|v| (v, x.ty))).collect();
-        let first_is_scalar = vals.len() == 1 && {
-            let st = self.concrete(vals[0].1);
-            matches!(self.types().kind(st), TyKind::Float(_) | TyKind::Int(_))
-        };
-        if first_is_scalar && n > 1 {
-            return Some(self.value(t, ir::Expr::Splat(vals[0].0, n)));
+        let vals: Vec<ir::ValueId> = xs.iter().filter_map(|x| self.operand(x)).collect();
+        if let [v] = vals[..]
+            && n > 1
+            && self.mb.m.types.as_scalar(self.f.value_ty(v)).is_some()
+        {
+            return Some(self.value(t, ir::Expr::Splat(v, n)));
         }
-        // Flatten vectors into components.
         let mut comps = Vec::new();
-        for (v, vt) in vals {
-            let vt = self.concrete(vt);
-            match self.types().kind(vt) {
-                &TyKind::Vec(e, m) => {
-                    let ct = self.ty(self.types().elem(e), span)?;
-                    for c in 0..m {
-                        comps.push(self.value(ct, ir::Expr::Extract(v, c as u32)));
-                    }
-                }
-                _ => comps.push(v),
-            }
+        for v in vals {
+            self.push_components(v, &mut comps);
         }
         Some(self.value(t, ir::Expr::Construct(t, comps)))
     }
@@ -1747,21 +1680,13 @@ impl<'c, 'a> Fl<'c, 'a> {
                 }
                 let ta: Vec<TyId> = trait_args.iter().map(|&a| self.concrete(a)).collect();
                 let ma: Vec<TyId> = method_args.iter().map(|&a| self.concrete(a)).collect();
-                let program = &self.cx.checked.program;
-                let Some((func, subst)) =
-                    wrela_sema::traits::resolve_trait_method(program, *method, st, &ta, &ma)
-                else {
+                let Some((func, substs)) = self.cx.resolve_impl(*method, st, &ta, &ma) else {
                     let shown = program.display_ty(st);
                     self.cx.err(Diagnostic::internal(format!(
                         "no implementation of a trait method for `{shown}` at lowering"
                     )));
                     return None;
                 };
-                let substs: Vec<TyId> = program
-                    .fn_all_generics(func)
-                    .iter()
-                    .map(|g| self.cx.checked.reveal(subst.get(*g).unwrap_or(program.types.error)))
-                    .collect();
                 if program.func(func).attrs.intrinsic {
                     return crate::gpu::intrinsic(self, func, &substs, c, ty);
                 }

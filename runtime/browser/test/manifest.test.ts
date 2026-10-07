@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { MANIFEST_VERSION, STREAM_VERSION } from "../src/abi.gen.ts";
 import { type Manifest, ManifestError, parseManifest } from "../src/manifest.ts";
 import { readFixtureText } from "./fixtures.ts";
 
@@ -7,8 +8,8 @@ import { readFixtureText } from "./fixtures.ts";
 
 /** The Rust crate's golden manifest (runtime/abi/src/manifest.rs, `golden_json`). */
 const GOLDEN = `{
-  "manifest_version": 4,
-  "stream_version": 6,
+  "manifest_version": ${MANIFEST_VERSION},
+  "stream_version": ${STREAM_VERSION},
   "wasm": "game.wasm",
   "pipelines": [
     {
@@ -41,8 +42,8 @@ function expectInvalid(f: () => unknown, text: string): void {
 
 test("parses the Rust crate's golden manifest", () => {
   expect(sample()).toEqual({
-    manifest_version: 4,
-    stream_version: 6,
+    manifest_version: MANIFEST_VERSION,
+    stream_version: STREAM_VERSION,
     wasm: "game.wasm",
     pipelines: [
       {

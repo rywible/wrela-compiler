@@ -9,8 +9,10 @@
 //! Its frames are drawn as the spike's are: into an `rgba8unorm-srgb` target, then `blit.wgsl`
 //! raises each value to 1/2.2 into the canvas (here an `rgba8unorm` texture, read back).
 
-use crate::repo_root;
-use std::sync::OnceLock;
+use crate::{RawGpu, bytes_of, f32s, repo_root, u32s};
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 use wgpu::util::DeviceExt;
 
 /// The spike's screen, and its herd.
@@ -24,26 +26,85 @@ const TERRAIN_VERTS: u32 = 256 * 256 * 6;
 const ITERS: u32 = 4;
 const FALLOFF: f32 = 0.06;
 
-/// One seed's numbers, as `makeGrazer` gives them.
-#[derive(Clone, Debug)]
-pub struct Seed {
-    pub seed: u32,
-    /// The `Grazer` uniform: 328 floats.
-    pub params: Vec<f32>,
-    /// Its rest-space bounds, in f64 as JavaScript computed them.
-    pub min: [f64; 3],
-    pub max: [f64; 3],
+/// A file of the spike's (compiler/tests/fixtures/spike01).
+pub fn fixture_path(name: &str) -> PathBuf {
+    repo_root().join("compiler/tests/fixtures/spike01").join(name)
 }
 
-/// Where a grazer stands (main.js's instances).
-#[derive(Clone, Copy, Debug)]
-pub struct Placed {
-    pub x: f64,
-    pub y: f64,
-    pub z: f64,
-    pub yaw: f64,
-    pub phase: f64,
-    pub head_down: f64,
+/// A text file of the spike's ([`fixture_path`]).
+pub fn fixture(name: &str) -> String {
+    std::fs::read_to_string(fixture_path(name)).unwrap_or_else(|e| panic!("{name}: {e}"))
+}
+
+/// Seed 1's parameters: the spike's `Grazer` uniform, 328 f32s.
+pub fn params_seed1() -> Vec<f32> {
+    f32s(&std::fs::read(fixture_path("params-seed1.f32")).expect("params-seed1.f32"))
+}
+
+/// A kernel to append to field.wgsl: each point's distance (`eval_d`), every part in. Its
+/// bindings: the `Grazer` uniform, the points (vec4s) and the distances.
+pub const HARNESS_D: &str = "
+@group(0) @binding(0) var<uniform> G: Grazer;
+@group(0) @binding(1) var<storage, read> points: array<vec4f>;
+@group(0) @binding(2) var<storage, read_write> dist: array<f32>;
+
+@compute @workgroup_size(64)
+fn eval_d(@builtin(global_invocation_id) id: vec3u) {
+  dist[id.x] = grazer_d(points[id.x].xyz, ALL_PARTS, 0.0);
+}
+";
+
+/// A kernel `entry` to append to field.wgsl: `store` (a `vec4f` of `s`, the point's
+/// `grazer_g` sample, every part in) for each point. Bound as [`HARNESS_D`] is, with vec4s out.
+pub fn harness(entry: &str, store: &str) -> String {
+    format!(
+        "
+@group(0) @binding(0) var<uniform> G: Grazer;
+@group(0) @binding(1) var<storage, read> points: array<vec4f>;
+@group(0) @binding(2) var<storage, read_write> samp: array<vec4f>;
+
+@compute @workgroup_size(64)
+fn {entry}(@builtin(global_invocation_id) id: vec3u) {{
+  let s = grazer_g(points[id.x].xyz, ALL_PARTS, 0.0);
+  samp[id.x] = {store};
+}}
+"
+    )
+}
+
+/// A compute pipeline of the build in `dir`: its WGSL and entry point, and the uniform bytes of
+/// its first dispatch in `batches`.
+pub fn compiled_kernel(dir: &Path, name: &str, batches: &[Vec<u8>]) -> (String, String, Vec<u8>) {
+    use wrela_abi::manifest::Stage;
+    use wrela_abi::stream::{Command, decode};
+    let manifest = crate::manifest(dir);
+    let (index, p) = manifest
+        .pipelines
+        .iter()
+        .enumerate()
+        .find(|(_, p)| p.name == name)
+        .unwrap_or_else(|| panic!("no pipeline `{name}`"));
+    let Stage::Compute { entry, .. } = &p.stage else { panic!("`{name}` isn't a kernel") };
+    let wgsl = std::fs::read_to_string(dir.join(&p.shader)).expect("the shader");
+    for batch in batches {
+        for cmd in decode(batch).expect("a valid batch") {
+            if let Command::Dispatch { pipeline, uniforms, .. } = cmd
+                && pipeline as usize == index
+            {
+                return (wgsl, entry.clone(), uniforms.to_vec());
+            }
+        }
+    }
+    panic!("nothing dispatched `{name}`")
+}
+
+/// One seed's numbers, as `makeGrazer` gives them.
+struct Seed {
+    /// The `Grazer` uniform: 328 floats.
+    params: Vec<f32>,
+    /// Its rest-space bounds, in f64 as JavaScript computed them.
+    min: [f64; 3],
+    max: [f64; 3],
 }
 
 /// A scene: the herd (seeds 1 to 40, as placed) or the close-up (seed 1 at the origin).
@@ -62,17 +123,15 @@ impl SceneKind {
     }
 }
 
-/// Everything `grazer.js` gives: the seeds, the placements, and each scene's `View` uniform at
-/// t = 0 (its fourth vec4's w is t).
-pub struct SpikeData {
-    pub seeds: Vec<Seed>,
-    pub herd: Vec<Placed>,
-    pub closeup: Vec<Placed>,
-    pub herd_view: Vec<f32>,
-    pub closeup_view: Vec<f32>,
+/// What `grazer.js` gives: the seeds, and each scene's `View` uniform at t = 0 (its fourth
+/// vec4's w is t).
+struct SpikeData {
+    seeds: Vec<Seed>,
+    herd_view: Vec<f32>,
+    closeup_view: Vec<f32>,
 }
 
-fn bun(args: &[&str]) -> Vec<u8> {
+fn bun<S: AsRef<std::ffi::OsStr>>(args: &[S]) -> Vec<u8> {
     let dir = repo_root().join("compiler/tests/spike01");
     let out = std::process::Command::new("bun")
         .arg("data.mjs")
@@ -85,7 +144,7 @@ fn bun(args: &[&str]) -> Vec<u8> {
 }
 
 /// `grazer.js`'s numbers, once per process.
-pub fn data() -> &'static SpikeData {
+fn data() -> &'static SpikeData {
     static DATA: OnceLock<SpikeData> = OnceLock::new();
     DATA.get_or_init(|| {
         let v: serde_json::Value = serde_json::from_slice(&bun(&["seeds"])).expect("JSON");
@@ -94,20 +153,6 @@ pub fn data() -> &'static SpikeData {
             let a = x.as_array().expect("a vector");
             [f(&a[0]), f(&a[1]), f(&a[2])]
         };
-        let placed = |x: &serde_json::Value| {
-            x.as_array()
-                .expect("placements")
-                .iter()
-                .map(|p| Placed {
-                    x: f(&p["x"]),
-                    y: f(&p["y"]),
-                    z: f(&p["z"]),
-                    yaw: f(&p["yaw"]),
-                    phase: f(&p["phase"]),
-                    head_down: f(&p["headDown"]),
-                })
-                .collect()
-        };
         let floats = |x: &serde_json::Value| {
             x.as_array().expect("floats").iter().map(|n| f(n) as f32).collect::<Vec<f32>>()
         };
@@ -115,17 +160,10 @@ pub fn data() -> &'static SpikeData {
             .as_array()
             .expect("seeds")
             .iter()
-            .map(|s| Seed {
-                seed: s["seed"].as_u64().expect("a seed") as u32,
-                params: floats(&s["params"]),
-                min: v3(&s["min"]),
-                max: v3(&s["max"]),
-            })
+            .map(|s| Seed { params: floats(&s["params"]), min: v3(&s["min"]), max: v3(&s["max"]) })
             .collect();
         SpikeData {
             seeds,
-            herd: placed(&v["herd"]),
-            closeup: placed(&v["closeup"]),
             herd_view: floats(&v["views"]["herd"]),
             closeup_view: floats(&v["views"]["closeup"]),
         }
@@ -133,31 +171,31 @@ pub fn data() -> &'static SpikeData {
 }
 
 /// Bone palettes for `scene` at each time in `times`: for each time, each instance's 29 mat4s.
-pub fn palettes(scene: SceneKind, times: &[f64]) -> Vec<f32> {
-    let ts: Vec<String> = times.iter().map(|t| format!("{t}")).collect();
-    let mut args = vec!["palettes", scene.name()];
-    args.extend(ts.iter().map(String::as_str));
-    let bytes = bun(&args);
-    bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect()
+/// `grazer.js` computes each scene's at each list of times once per process.
+fn palettes(scene: SceneKind, times: &[f64]) -> Arc<[f32]> {
+    static MADE: Mutex<BTreeMap<Vec<String>, Arc<[f32]>>> = Mutex::new(BTreeMap::new());
+    let mut args = vec!["palettes".to_string(), scene.name().to_string()];
+    args.extend(times.iter().map(f64::to_string));
+    let mut made = MADE.lock().unwrap_or_else(|p| p.into_inner());
+    made.entry(args).or_insert_with_key(|args| f32s(&bun(args)).into()).clone()
 }
 
 /// A grid for one individual at one cell size (main.js's `gridFor`), in f64 as JavaScript.
 #[derive(Clone, Copy, Debug)]
-pub struct Grid {
-    pub origin: [f64; 3],
-    pub cell: f64,
-    pub dims: [u32; 3],
-    pub blocks: u32,
+struct Grid {
+    origin: [f64; 3],
+    dims: [u32; 3],
+    blocks: u32,
 }
 
-pub fn grid_for(s: &Seed, cell: f64) -> Grid {
+fn grid_for(s: &Seed, cell: f64) -> Grid {
     let pad = 2.0 * cell;
     let origin = [s.min[0] - pad, s.min[1] - pad, s.min[2] - pad];
     let dims = [0, 1, 2].map(|a| ((s.max[a] + pad - origin[a]) / (4.0 * cell)).ceil() as u32);
-    Grid { origin, cell, dims, blocks: dims[0] * dims[1] * dims[2] }
+    Grid { origin, dims, blocks: dims[0] * dims[1] * dims[2] }
 }
 
-/// One individual's extraction: its counts, and its GPU time per pass (ms).
+/// One individual's extraction: its counts, and its GPU time (its three passes'), ms.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Extracted {
     pub blocks: u32,
@@ -166,21 +204,12 @@ pub struct Extracted {
     pub tris: u32,
     pub holes: u32,
     pub flags: u32,
-    pub cull_ms: f64,
-    pub place_ms: f64,
-    pub emit_ms: f64,
-}
-
-impl Extracted {
-    pub fn total_ms(&self) -> f64 {
-        self.cull_ms + self.place_ms + self.emit_ms
-    }
+    pub gpu_ms: f64,
 }
 
 /// An individual's buffers (main.js's `individual`).
 pub struct Individual {
-    pub seed: usize,
-    pub grid: Grid,
+    grid: Grid,
     pub vcap: u32,
     pub icap: u32,
     params: wgpu::Buffer,
@@ -203,8 +232,6 @@ struct Scratch {
 
 /// The spike's GPU work, on a device of its own: its pipelines and frame resources.
 pub struct Spike {
-    pub device: wgpu::Device,
-    pub queue: wgpu::Queue,
     cull_layout: wgpu::BindGroupLayout,
     place_layout: wgpu::BindGroupLayout,
     frame_layout: wgpu::BindGroupLayout,
@@ -219,8 +246,8 @@ pub struct Spike {
     terrain: wgpu::RenderPipeline,
     blit: wgpu::RenderPipeline,
     frame: Option<FrameResources>,
-    // Declared last: dropped after the device.
-    _lock: wrela_host::lock::GpuLock,
+    // Declared last: dropped after what it made.
+    gpu: RawGpu,
 }
 
 struct FrameResources {
@@ -240,71 +267,17 @@ pub struct Scene<'a> {
     pub kind: SceneKind,
     inds: Vec<&'a Individual>,
     draws: Vec<wgpu::BindGroup>,
-    pub tris: u64,
 }
 
-/// One frame's GPU times, ms: the shadow pass, the terrain, the creatures' shading, the two
-/// creature passes, and the whole frame (first pass's start to the last's end).
+/// One frame's GPU times, ms: the shadow pass, the terrain, the two creature passes (shadow and
+/// shading), and the three passes' own times summed: the frame's GPU work, however they overlap
+/// (on the native host the terrain's runs beside the shadow pass).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FrameTimes {
     pub shadow: f64,
     pub terrain: f64,
-    pub shade: f64,
     pub creatures: f64,
-    /// From the shadow pass's start to the shading pass's end: passes overlap here (on the
-    /// native host the terrain's runs beside the shadow pass).
-    pub frame: f64,
-    /// The three passes' own times summed: the frame's GPU work, however it overlaps.
     pub passes: f64,
-}
-
-fn read(device: &wgpu::Device, queue: &wgpu::Queue, src: &wgpu::Buffer, size: u64) -> Vec<u8> {
-    let rb = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("readback"),
-        size,
-        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    let mut enc = device.create_command_encoder(&Default::default());
-    enc.copy_buffer_to_buffer(src, 0, &rb, 0, size);
-    queue.submit([enc.finish()]);
-    wrela_host::map_read(device, &rb).expect("read back")
-}
-
-fn u32s(bytes: &[u8]) -> Vec<u32> {
-    bytes.chunks_exact(4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect()
-}
-
-/// Each timestamp of a query set, in ns from the first.
-fn stamps(device: &wgpu::Device, queue: &wgpu::Queue, qs: &wgpu::QuerySet, n: u32) -> Vec<f64> {
-    let size = u64::from(n) * 8;
-    let resolve = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("timestamps"),
-        size,
-        usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
-        mapped_at_creation: false,
-    });
-    let mut enc = device.create_command_encoder(&Default::default());
-    enc.resolve_query_set(qs, 0..n, &resolve, 0);
-    queue.submit([enc.finish()]);
-    let raw = read(device, queue, &resolve, size);
-    let period = f64::from(queue.get_timestamp_period());
-    raw.chunks_exact(8)
-        .map(|b| u64::from_le_bytes(b.try_into().expect("8 bytes")) as f64 * period)
-        .collect()
-}
-
-fn fixture(name: &str) -> String {
-    std::fs::read_to_string(repo_root().join("compiler/tests/fixtures/spike01").join(name))
-        .unwrap_or_else(|e| panic!("{name}: {e}"))
-}
-
-/// The salted field (main.js's `salted`): unique source, so no cache serves it.
-fn salted(field: &str, salt: Option<f64>) -> String {
-    match salt {
-        None => field.to_string(),
-        Some(s) => field.replace("const SALT: f32 = 0.0;", &format!("const SALT: f32 = {s:.4};")),
-    }
 }
 
 fn vertex_layout() -> [wgpu::VertexAttribute; 5] {
@@ -341,31 +314,9 @@ impl Spike {
     /// Opens a device (with timestamps) and builds the spike's pipelines: the scene's seven
     /// (cull, place, emit, shadow, field shading without a prepass, terrain) and the blit.
     pub fn new() -> Spike {
-        Spike::with_extract(&fixture("extract.wgsl"))
-    }
-
-    /// [`Spike::new`], with `extract` in place of the spike's extract.wgsl: for measuring what
-    /// a part of its extraction costs.
-    pub fn with_extract(extract: &str) -> Spike {
-        let lock = wrela_host::lock::GpuLock::acquire("spike 01").expect("the GPU lock");
-        let (device, queue) = wrela_host::open_device("spike 01", wgpu::Features::TIMESTAMP_QUERY)
-            .expect("a GPU with timestamps");
-        Spike::build(device, queue, None, extract, lock)
-    }
-
-    /// The spike's extract.wgsl.
-    pub fn extract_source() -> String {
-        fixture("extract.wgsl")
-    }
-
-    fn build(
-        device: wgpu::Device,
-        queue: wgpu::Queue,
-        salt: Option<f64>,
-        extract: &str,
-        lock: wrela_host::lock::GpuLock,
-    ) -> Spike {
         use wgpu::{BindGroupLayoutEntry as E, BindingType as B, ShaderStages as S};
+        let gpu = RawGpu::new().expect("a GPU with timestamps");
+        let device = gpu.device();
         let buf = |binding, visibility, ty| E {
             binding,
             visibility,
@@ -456,14 +407,14 @@ impl Spike {
                 },
             ],
         });
-        let field = salted(&fixture("field.wgsl"), salt);
+        let field = fixture("field.wgsl");
         let module = |label: &str, code: String| {
             device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some(label),
                 source: wgpu::ShaderSource::Wgsl(code.into()),
             })
         };
-        let em = module("extract", format!("{field}{extract}"));
+        let em = module("extract", format!("{field}{}", fixture("extract.wgsl")));
         let dm = module("draw", format!("{field}{}", fixture("draw.wgsl")));
         let bm = module("blit", fixture("blit.wgsl"));
         let layout = |bgls: &[&wgpu::BindGroupLayout]| {
@@ -593,8 +544,6 @@ impl Spike {
             cache: None,
         });
         Spike {
-            device,
-            queue,
             cull_layout,
             place_layout,
             frame_layout,
@@ -609,7 +558,7 @@ impl Spike {
             terrain,
             blit,
             frame: None,
-            _lock: lock,
+            gpu,
         }
     }
 
@@ -619,13 +568,13 @@ impl Spike {
             Some(bytes) => {
                 let mut padded = bytes.to_vec();
                 padded.resize(size as usize, 0);
-                self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                self.gpu.device().create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: None,
                     contents: &padded,
                     usage,
                 })
             }
-            None => self.device.create_buffer(&wgpu::BufferDescriptor {
+            None => self.gpu.device().create_buffer(&wgpu::BufferDescriptor {
                 label: None,
                 size,
                 usage,
@@ -664,7 +613,7 @@ impl Spike {
             raw.extend(w.to_le_bytes());
         }
         raw.extend(FALLOFF.to_le_bytes());
-        let params: Vec<u8> = s.params.iter().flat_map(|x| x.to_le_bytes()).collect();
+        let params = bytes_of(&s.params);
         let params = self.buffer(params.len() as u64, U::UNIFORM, Some(&params));
         let grid_buf = self.buffer(48, U::UNIFORM, Some(&raw));
         let verts = self.buffer(u64::from(vcap) * 48, U::STORAGE | U::VERTEX | U::COPY_SRC, None);
@@ -691,7 +640,7 @@ impl Spike {
                     resource: buf.as_entire_binding(),
                 })
                 .collect();
-            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            self.gpu.device().create_bind_group(&wgpu::BindGroupDescriptor {
                 label: None,
                 layout,
                 entries: &entries,
@@ -699,7 +648,7 @@ impl Spike {
         };
         let cull_bg = group(&self.cull_layout, 99);
         let place_bg = group(&self.place_layout, 3);
-        Individual { seed, grid, vcap, icap, params, verts, indices, draw, cull_bg, place_bg }
+        Individual { grid, vcap, icap, params, verts, indices, draw, cull_bg, place_bg }
     }
 
     /// main.js's `encodeExtract`: three passes, each timed at `q0..q0 + 6` if `qs` is given.
@@ -741,8 +690,10 @@ impl Spike {
     }
 
     /// main.js's `extractHerd`: seeds 1 to `count` at `cell`, sized by a calibration on the
-    /// largest grid, extracted three times; the last run's counts and times.
+    /// largest grid, extracted three times, each run's counts and times read back at once; the
+    /// last run's.
     pub fn extract_herd(&self, cell: f64, count: usize) -> (Vec<Extracted>, Vec<Individual>) {
+        use wgpu::BufferUsages as U;
         let seeds = &data().seeds[..count];
         let grids: Vec<Grid> = seeds.iter().map(|s| grid_for(s, cell)).collect();
         let max_blocks = grids.iter().map(|g| g.blocks).max().expect("a grid");
@@ -750,102 +701,78 @@ impl Spike {
         let largest = grids.iter().position(|g| g.blocks == max_blocks).expect("the largest");
         let cal_cap = (max_blocks * 64).div_ceil(8).min(2_000_000);
         let cal = self.individual(largest, cell, cal_cap, cal_cap * 6, &ex);
-        let mut enc = self.device.create_command_encoder(&Default::default());
+        let mut enc = self.gpu.device().create_command_encoder(&Default::default());
         self.encode_extract(&mut enc, &ex, &cal, None);
-        self.queue.submit([enc.finish()]);
-        let c = u32s(&read(&self.device, &self.queue, &cal.draw, 32));
+        self.gpu.queue().submit([enc.finish()]);
+        let c = self.draw_args(&cal);
         let vcap = (f64::from(c[5]) * 1.25).ceil() as u32 + 1024;
         let icap = (f64::from(c[0]) * 1.25).ceil() as u32 + 6144;
         let inds: Vec<Individual> =
             (0..count).map(|i| self.individual(i, cell, vcap, icap, &ex)).collect();
-        let n = (count * 6) as u32;
-        let mut out = Vec::new();
+        let passes = (count * 3) as u32;
+        let (mut times, mut stats, mut draws) = (Vec::new(), Vec::new(), Vec::new());
         for _ in 0..3 {
-            let qs = self.device.create_query_set(&wgpu::QuerySetDescriptor {
+            let qs = self.gpu.device().create_query_set(&wgpu::QuerySetDescriptor {
                 label: None,
                 ty: wgpu::QueryType::Timestamp,
-                count: n,
+                count: passes * 2,
             });
-            let stats = self.buffer(
-                count as u64 * 16,
-                wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
-                None,
-            );
-            let mut enc = self.device.create_command_encoder(&Default::default());
+            // Each individual's live block count (`live_args`, which the next one's extraction
+            // reuses) and draw arguments.
+            let stats_buf = self.buffer(count as u64 * 16, U::COPY_DST | U::COPY_SRC, None);
+            let draws_buf = self.buffer(count as u64 * 32, U::COPY_DST | U::COPY_SRC, None);
+            let mut enc = self.gpu.device().create_command_encoder(&Default::default());
             for (i, ind) in inds.iter().enumerate() {
                 self.encode_extract(&mut enc, &ex, ind, Some((&qs, (i * 6) as u32)));
-                enc.copy_buffer_to_buffer(&ex.live_args, 0, &stats, i as u64 * 16, 12);
+                enc.copy_buffer_to_buffer(&ex.live_args, 0, &stats_buf, i as u64 * 16, 12);
+                enc.copy_buffer_to_buffer(&ind.draw, 0, &draws_buf, i as u64 * 32, 32);
             }
-            self.queue.submit([enc.finish()]);
-            let ts = stamps(&self.device, &self.queue, &qs, n);
-            let stats = u32s(&read(&self.device, &self.queue, &stats, count as u64 * 16));
-            let ms = |i: usize, k: usize| (ts[i * 6 + 2 * k + 1] - ts[i * 6 + 2 * k]) / 1e6;
-            out = inds
-                .iter()
-                .enumerate()
-                .map(|(i, ind)| {
-                    let d = u32s(&read(&self.device, &self.queue, &ind.draw, 32));
-                    Extracted {
-                        blocks: ind.grid.blocks,
-                        live: stats[i * 4],
-                        verts: d[5],
-                        tris: d[0] / 3,
-                        holes: d[6],
-                        flags: d[7],
-                        cull_ms: ms(i, 0),
-                        place_ms: ms(i, 1),
-                        emit_ms: ms(i, 2),
-                    }
-                })
-                .collect();
+            self.gpu.queue().submit([enc.finish()]);
+            times = wrela_host::read_timestamps(self.gpu.device(), self.gpu.queue(), &qs, passes)
+                .expect("the timestamps");
+            stats = u32s(&self.gpu.read(&stats_buf, count as u64 * 16));
+            draws = u32s(&self.gpu.read(&draws_buf, count as u64 * 32));
         }
+        let out = inds
+            .iter()
+            .enumerate()
+            .map(|(i, ind)| {
+                let d = &draws[i * 8..i * 8 + 8];
+                Extracted {
+                    blocks: ind.grid.blocks,
+                    live: stats[i * 4],
+                    verts: d[5],
+                    tris: d[0] / 3,
+                    holes: d[6],
+                    flags: d[7],
+                    gpu_ms: times[i * 3..i * 3 + 3].iter().sum::<f64>() / 1e6,
+                }
+            })
+            .collect();
         (out, inds)
     }
 
-    /// Seed `seed`'s live blocks at `cell`, from a fresh extraction: each block and its mask.
-    pub fn live_masks(&self, seed: usize, cell: f64) -> Vec<(u32, u32)> {
-        let grid = grid_for(&data().seeds[seed], cell);
-        let ex = self.scratch(grid.blocks);
-        let ind = self.individual(seed, cell, grid.blocks * 8, grid.blocks * 48, &ex);
-        let mut enc = self.device.create_command_encoder(&Default::default());
-        self.encode_extract(&mut enc, &ex, &ind, None);
-        self.queue.submit([enc.finish()]);
-        let n = u32s(&read(&self.device, &self.queue, &ex.live_args, 16))[0];
-        let live = u32s(&read(&self.device, &self.queue, &ex.live, u64::from(n.max(2)) * 8));
-        live.chunks_exact(2).take(n as usize).map(|c| (c[0], c[1])).collect()
+    /// An individual's draw arguments (main.js's): its index count first, its vertex count
+    /// sixth.
+    fn draw_args(&self, ind: &Individual) -> Vec<u32> {
+        u32s(&self.gpu.read(&ind.draw, 32))
     }
 
     /// An individual's mesh: its vertices' rest positions and its triangles' indices.
     pub fn mesh(&self, ind: &Individual) -> (Vec<[f32; 3]>, Vec<u32>) {
-        let d = u32s(&read(&self.device, &self.queue, &ind.draw, 32));
-        let (nv, ni) = (u64::from(d[5].min(ind.vcap)), u64::from(d[0].min(ind.icap)));
-        let v = read(&self.device, &self.queue, &ind.verts, (nv * 48).max(16));
-        let positions = v
-            .chunks_exact(48)
-            .take(nv as usize)
-            .map(|c| {
-                let f = |k: usize| f32::from_le_bytes(c[4 * k..4 * k + 4].try_into().expect("4"));
-                [f(0), f(1), f(2)]
-            })
-            .collect();
-        let i = read(&self.device, &self.queue, &ind.indices, (ni * 4).max(16));
-        (positions, u32s(&i)[..ni as usize].to_vec())
+        let positions =
+            self.vertices(ind).iter().map(|v| [v[0], v[1], v[2]].map(f32::from_bits)).collect();
+        let ni = self.draw_args(ind)[0].min(ind.icap) as usize;
+        let indices = u32s(&self.gpu.read(&ind.indices, (ni as u64 * 4).max(16)));
+        (positions, indices[..ni].to_vec())
     }
 
     /// An individual's vertices as the spike wrote them: 48 bytes each (position, four bones a
     /// byte each, normal, four weights a byte each, the part mask, padding).
     pub fn vertices(&self, ind: &Individual) -> Vec<[u32; 12]> {
-        let d = u32s(&read(&self.device, &self.queue, &ind.draw, 32));
-        let nv = u64::from(d[5].min(ind.vcap));
-        let v = read(&self.device, &self.queue, &ind.verts, (nv * 48).max(16));
-        v.chunks_exact(48)
-            .take(nv as usize)
-            .map(|c| {
-                std::array::from_fn(|k| {
-                    u32::from_le_bytes(c[4 * k..4 * k + 4].try_into().expect("4"))
-                })
-            })
-            .collect()
+        let nv = self.draw_args(ind)[5].min(ind.vcap) as usize;
+        let words = u32s(&self.gpu.read(&ind.verts, (nv as u64 * 48).max(16)));
+        words.chunks_exact(12).take(nv).map(|v| v.try_into().expect("12 words")).collect()
     }
 
     fn frame_resources(&mut self) {
@@ -854,7 +781,7 @@ impl Spike {
         }
         use wgpu::{BufferUsages as U, TextureUsages as T};
         let tex = |w, h, format, usage| {
-            self.device.create_texture(&wgpu::TextureDescriptor {
+            self.gpu.device().create_texture(&wgpu::TextureDescriptor {
                 label: None,
                 size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
                 mip_level_count: 1,
@@ -884,7 +811,8 @@ impl Spike {
         let canvas = tex(W, H, wgpu::TextureFormat::Rgba8Unorm, T::RENDER_ATTACHMENT | T::COPY_SRC);
         // Only the lookup mode samples the detail texture: field shading binds it unread.
         let detail = self
-            .device
+            .gpu
+            .device()
             .create_texture(&wgpu::TextureDescriptor {
                 label: Some("detail"),
                 size: wgpu::Extent3d { width: 4, height: 4, depth_or_array_layers: 4 },
@@ -898,18 +826,18 @@ impl Spike {
             .create_view(&Default::default());
         let view = self.buffer(160, U::UNIFORM | U::COPY_DST, None);
         let palette = self.buffer(HERD as u64 * PALETTE_STRIDE, U::STORAGE | U::COPY_DST, None);
-        let shadow_sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
+        let shadow_sampler = self.gpu.device().create_sampler(&wgpu::SamplerDescriptor {
             compare: Some(wgpu::CompareFunction::Less),
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
-        let linear = self.device.create_sampler(&wgpu::SamplerDescriptor {
+        let linear = self.gpu.device().create_sampler(&wgpu::SamplerDescriptor {
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
-        let frame_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let frame_bg = self.gpu.device().create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &self.frame_layout,
             entries: &[
@@ -932,12 +860,12 @@ impl Spike {
                 },
             ],
         });
-        let shadow_frame_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let shadow_frame_bg = self.gpu.device().create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &self.shadow_frame_layout,
             entries: &[wgpu::BindGroupEntry { binding: 0, resource: view.as_entire_binding() }],
         });
-        let blit_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let blit_bg = self.gpu.device().create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &self.blit_layout,
             entries: &[
@@ -972,7 +900,7 @@ impl Spike {
             .iter()
             .enumerate()
             .map(|(slot, ind)| {
-                self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                self.gpu.device().create_bind_group(&wgpu::BindGroupDescriptor {
                     label: None,
                     layout: &self.grazer_layout,
                     entries: &[
@@ -992,16 +920,12 @@ impl Spike {
                 })
             })
             .collect();
-        let tris = inds
-            .iter()
-            .map(|i| u64::from(u32s(&read(&self.device, &self.queue, &i.draw, 32))[0] / 3))
-            .sum();
-        Scene { kind, inds, draws, tris }
+        Scene { kind, inds, draws }
     }
 
     /// main.js's `update`: the view at time `t`, and the palettes `pal` (one time's, from
     /// [`palettes`]).
-    pub fn update(&self, scene: &Scene, t: f64, pal: &[f32]) {
+    fn update(&self, scene: &Scene, t: f64, pal: &[f32]) {
         let fr = self.frame.as_ref().expect("frame resources");
         let d = data();
         let mut v = match scene.kind {
@@ -1009,8 +933,7 @@ impl Spike {
             SceneKind::CloseUp => d.closeup_view.clone(),
         };
         v[35] = t as f32;
-        let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
-        self.queue.write_buffer(&fr.view, 0, &bytes);
+        self.gpu.queue().write_buffer(&fr.view, 0, &bytes_of(&v));
         let mut out = vec![0u8; scene.inds.len() * PALETTE_STRIDE as usize];
         for (i, m) in pal.chunks_exact(BONES * 16).enumerate().take(scene.inds.len()) {
             let at = i * PALETTE_STRIDE as usize;
@@ -1018,12 +941,12 @@ impl Spike {
                 out[at + 4 * k..at + 4 * k + 4].copy_from_slice(&x.to_le_bytes());
             }
         }
-        self.queue.write_buffer(&fr.palette, 0, &out);
+        self.gpu.queue().write_buffer(&fr.palette, 0, &out);
     }
 
     /// main.js's `encodeFrame` in field mode with no prepass: the shadow pass, the terrain and
     /// the creatures, timed at `q0..q0 + 6` (pass 0, 1 and 2) if `qs` is given.
-    pub fn encode_frame(
+    fn encode_frame(
         &self,
         enc: &mut wgpu::CommandEncoder,
         scene: &Scene,
@@ -1116,7 +1039,7 @@ impl Spike {
         let pal = palettes(scene.kind, &[t]);
         self.update(scene, t, &pal);
         let fr = self.frame.as_ref().expect("frame resources");
-        let mut enc = self.device.create_command_encoder(&Default::default());
+        let mut enc = self.gpu.device().create_command_encoder(&Default::default());
         self.encode_frame(&mut enc, scene, None);
         {
             let view = fr.canvas.create_view(&Default::default());
@@ -1141,7 +1064,7 @@ impl Spike {
             p.draw(0..3, 0..1);
         }
         let size = u64::from(W) * u64::from(H) * 4;
-        let rb = self.device.create_buffer(&wgpu::BufferDescriptor {
+        let rb = self.gpu.device().create_buffer(&wgpu::BufferDescriptor {
             label: Some("canvas"),
             size,
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
@@ -1164,8 +1087,8 @@ impl Spike {
             },
             wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
         );
-        self.queue.submit([enc.finish()]);
-        wrela_host::map_read(&self.device, &rb).expect("the canvas")
+        self.gpu.queue().submit([enc.finish()]);
+        wrela_host::map_read(self.gpu.device(), &rb).expect("the canvas")
     }
 
     /// main.js's `measure`: `warm` untimed frames, then `frames` timed ones, back to back, at
@@ -1177,34 +1100,34 @@ impl Spike {
         let frame = |f: usize| &pal[f * per..(f + 1) * per];
         for (f, &t) in times.iter().enumerate().take(warm as usize) {
             self.update(scene, t, frame(f));
-            let mut enc = self.device.create_command_encoder(&Default::default());
+            let mut enc = self.gpu.device().create_command_encoder(&Default::default());
             self.encode_frame(&mut enc, scene, None);
-            self.queue.submit([enc.finish()]);
+            self.gpu.queue().submit([enc.finish()]);
         }
         let q = 6;
-        let qs = self.device.create_query_set(&wgpu::QuerySetDescriptor {
+        let qs = self.gpu.device().create_query_set(&wgpu::QuerySetDescriptor {
             label: None,
             ty: wgpu::QueryType::Timestamp,
             count: frames * q,
         });
         for (f, &t) in times.iter().enumerate().take(frames as usize) {
             self.update(scene, t, frame(f));
-            let mut enc = self.device.create_command_encoder(&Default::default());
+            let mut enc = self.gpu.device().create_command_encoder(&Default::default());
             self.encode_frame(&mut enc, scene, Some((&qs, f as u32 * q)));
-            self.queue.submit([enc.finish()]);
+            self.gpu.queue().submit([enc.finish()]);
         }
-        let ts = stamps(&self.device, &self.queue, &qs, frames * q);
-        (0..frames as usize)
-            .map(|f| {
-                let t = &ts[f * q as usize..(f + 1) * q as usize];
-                let d = |i: usize| (t[2 * i + 1] - t[2 * i]) / 1e6;
+        let nanos =
+            wrela_host::read_timestamps(self.gpu.device(), self.gpu.queue(), &qs, frames * 3)
+                .expect("the timestamps");
+        nanos
+            .chunks_exact(3)
+            .map(|t| {
+                let ms = |i: usize| t[i] / 1e6;
                 FrameTimes {
-                    shadow: d(0),
-                    terrain: d(1),
-                    shade: d(2),
-                    creatures: d(0) + d(2),
-                    frame: (t[5] - t[0]) / 1e6,
-                    passes: d(0) + d(1) + d(2),
+                    shadow: ms(0),
+                    terrain: ms(1),
+                    creatures: ms(0) + ms(2),
+                    passes: ms(0) + ms(1) + ms(2),
                 }
             })
             .collect()

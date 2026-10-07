@@ -72,6 +72,9 @@ pub enum TyPos<'a> {
     Param(&'a mut ImplicitParams),
     /// A return type: `-> Surface` names the one concrete type the body returns.
     Return(&'a mut Option<Vec<TraitRef>>),
+    /// A type alias's type: one that names traits names the type a function returns
+    /// (`ty.opaque-alias`); any other is as `Normal`.
+    Alias(&'a mut Option<Vec<TraitRef>>),
     /// A local binding's type: a run may be one (§6.6), a trait may not.
     Local,
     /// A generic parameter's bound: a function type may be one (`F: fn(vec3) -> f32`).
@@ -82,7 +85,7 @@ impl TyPos<'_> {
     /// Whether a projection type (a run, `str`) may be written here: a parameter's, a
     /// result's or a local binding's type, never a field's or a type argument (§6.6).
     fn allows_runs(&self) -> bool {
-        !matches!(self, TyPos::Normal)
+        !matches!(self, TyPos::Normal | TyPos::Alias(_))
     }
 }
 
@@ -684,12 +687,8 @@ pub fn resolve_type(
             }
             let mut flags = FnFlags::default();
             for a in &f.attrs {
-                if a.name == "deterministic" {
-                    flags.deterministic = true;
-                } else if a.name == "parallel" {
-                    flags.parallel = true;
-                } else if a.name == "audio" {
-                    flags.audio = true;
+                if let Some(with) = flags.with_attr(&a.name) {
+                    flags = with;
                 } else {
                     diags.push(
                         Diagnostic::new(
@@ -751,7 +750,7 @@ pub fn resolve_type(
                     });
                     p.types.param(id)
                 }
-                TyPos::Return(opaque) => {
+                TyPos::Return(opaque) | TyPos::Alias(opaque) => {
                     *opaque = Some(refs);
                     p.types.error // replaced by the caller with the opaque type
                 }
@@ -812,38 +811,40 @@ pub fn length_error(p: &Program, module: ModuleId, len: &ast::Expr) -> Diagnosti
 /// `module`; a constant's own value is resolved in the module that defines it. `None` for
 /// anything else, including a constant whose value refers back to itself.
 pub fn const_u32(p: &Program, module: ModuleId, e: &ast::Expr) -> Option<u32> {
-    fn go(
-        p: &Program,
-        module: ModuleId,
-        e: &ast::Expr,
-        visiting: &mut Vec<ConstId>,
-    ) -> Option<u32> {
-        match &e.kind {
-            ast::ExprKind::Lit(ast::Lit { kind: ast::LitKind::Int(v), .. }) => {
-                v.ok().and_then(|v| u32::try_from(v).ok())
+    length(p, module, e, &mut Vec::new())
+}
+
+/// The value of constant `c` as an array length: [`const_u32`] of its value.
+fn const_value_u32(p: &Program, c: ConstId) -> Option<u32> {
+    let def = p.const_(c);
+    length(p, def.module, &def.value, &mut vec![c])
+}
+
+/// [`const_u32`]; `visiting` holds the constants whose values are being read.
+fn length(
+    p: &Program,
+    module: ModuleId,
+    e: &ast::Expr,
+    visiting: &mut Vec<ConstId>,
+) -> Option<u32> {
+    match &e.kind {
+        ast::ExprKind::Lit(ast::Lit { kind: ast::LitKind::Int(v), .. }) => {
+            v.ok().and_then(|v| u32::try_from(v).ok())
+        }
+        ast::ExprKind::Paren(inner) => length(p, module, inner, visiting),
+        ast::ExprKind::Path(path) => {
+            let Res::Const(c) = resolve_value_item(p, module, path)? else { return None };
+            if visiting.contains(&c) {
+                return None;
             }
-            ast::ExprKind::Paren(inner) => go(p, module, inner, visiting),
-            ast::ExprKind::Path(path) => const_path(p, module, path, visiting),
-            _ => None,
+            visiting.push(c);
+            let def = p.const_(c);
+            let v = length(p, def.module, &def.value, visiting);
+            visiting.pop();
+            v
         }
+        _ => None,
     }
-    fn const_path(
-        p: &Program,
-        module: ModuleId,
-        path: &ast::Path,
-        visiting: &mut Vec<ConstId>,
-    ) -> Option<u32> {
-        let Res::Const(c) = resolve_value_item(p, module, path)? else { return None };
-        if visiting.contains(&c) {
-            return None;
-        }
-        visiting.push(c);
-        let def = p.const_(c);
-        let v = go(p, def.module, &def.value, visiting);
-        visiting.pop();
-        v
-    }
-    go(p, module, e, &mut Vec::new())
 }
 
 /// The item a value path names from `module` (`N`, `a::inner::N`), if it names one; generic
@@ -954,12 +955,12 @@ fn resolve_type_path(
                 if const_at(i)
                     && !(path.is_single()
                         && scope.param(&path.segments[0].ident.name).is_some())
-                    && matches!(resolve_value_item(p, scope.module, path), Some(Res::Const(_))) =>
+                    && let Some(Res::Const(c)) = resolve_value_item(p, scope.module, path) =>
             {
-                let e = ast::Expr::new(ast::ExprKind::Path(path.clone()), path.span);
-                match const_u32(p, scope.module, &e) {
+                match const_value_u32(p, c) {
                     Some(n) => p.types.intern(TyKind::ConstU32(n)),
                     None => {
+                        let e = ast::Expr::new(ast::ExprKind::Path(path.clone()), path.span);
                         diags.push(length_error(p, scope.module, &e));
                         p.types.error
                     }
@@ -1035,7 +1036,7 @@ fn resolve_type_path(
                     });
                     p.types.param(id)
                 }
-                TyPos::Return(opaque) => {
+                TyPos::Return(opaque) | TyPos::Alias(opaque) => {
                     *opaque = Some(refs);
                     p.types.error // replaced by the caller with the opaque type
                 }
@@ -1068,7 +1069,7 @@ fn resolve_type_path(
                     });
                     p.types.param(id)
                 }
-                TyPos::Return(opaque) => {
+                TyPos::Return(opaque) | TyPos::Alias(opaque) => {
                     *opaque = Some(vec![r]);
                     p.types.error // replaced by the caller with the opaque type
                 }

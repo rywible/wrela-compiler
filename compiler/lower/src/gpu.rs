@@ -74,8 +74,6 @@ pub struct PipelineOut {
     /// A render pipeline whose fragment shader returns `Over`: its colour is blended over the
     /// target's.
     pub blend: bool,
-    /// A render pipeline's cull mode and depth bias.
-    pub state: wrela_sema::thir::RenderState,
     /// The functions its module instantiates, with their type arguments (`wrela query`).
     pub instances: Vec<(FnId, Vec<TyId>)>,
 }
@@ -1314,9 +1312,6 @@ pub(crate) fn lower_pipeline(
         PipelineKey::Compute { .. } => lower_compute(cx, iface),
         PipelineKey::Render { .. } => lower_render(cx, iface),
     }?;
-    if let PipelineKey::Render { state, .. } = key {
-        out.state = *state;
-    }
     out.key = key.clone();
     out.sites = sites;
     Some(out)
@@ -1638,7 +1633,6 @@ fn lower_compute(cx: &mut Cx, iface: Rc<Interface>) -> Option<PipelineOut> {
         sites: Vec::new(),
         debug_flag: None,
         blend: false,
-        state: Default::default(),
         instances,
     })
 }
@@ -1705,7 +1699,6 @@ fn lower_render(cx: &mut Cx, iface: Rc<Interface>) -> Option<PipelineOut> {
         sites: Vec::new(),
         debug_flag: None,
         blend,
-        state: Default::default(),
         instances,
     })
 }

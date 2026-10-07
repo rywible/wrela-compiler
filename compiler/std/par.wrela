@@ -1,4 +1,4 @@
-// Parallel work (language.md §6.12, D-062). A parallel job's chunks run on the thread that
+// Parallel work (language.md §6.12, §6.17, D-062). A parallel job's chunks run on the thread that
 // starts it and on the program's helpers; a long job (`job`) runs on a helper, or on the thread
 // that takes it. Every thread runs its own instance of the program, and they share memory
 // (wrela_abi::memory's threads).
@@ -13,53 +13,28 @@
 // - A long job waits in a slot until a helper starts it, or the thread that joins it does. A
 //   trap in a long job on a helper is kept in its slot, and `join` raises it.
 //
-// The words hosts use are copies of wrela_abi's, and a test there checks them.
+// The words hosts use are wrela_abi's (`std::abi`).
 
-use std::alloc::{alloc, free}
+use std::abi::{
+    DEPTH, JOB_CHUNKS, JOB_CONTEXT, JOB_DONE, JOB_DONE_FAILED, JOB_FAILED, JOB_GENERATION,
+    JOB_SLOTS, JOB_SLOT_COUNT, JOB_SLOT_SIZE, JOB_TASK, JOB_TICKET, JOIN_WAITS, PAR_HELPED,
+    PAR_HOLD, PAR_SHUTDOWN, PAR_WAKE, RUNNING, SLOT_FAILED, SLOT_FREE, SLOT_THREAD, THREADS,
+    THREAD_BLOCKS, THREAD_BLOCK_SIZE,
+}
+use std::alloc::{free, place}
 use std::collections::replace
 use std::mem::{
-    THREAD_BLOCKS, THREAD_BLOCK_SIZE, abort_from, align_of, atomic_add, atomic_load, atomic_store,
-    compare_swap, load_u32, notify, read, run_task, size_of, store_u32, task, thread_block, wait,
-    wait_for, write,
+    abort_from, atomic_add, atomic_load, atomic_store, compare_swap, count, load_u32, notify, read,
+    run_task, size_of, store_u32, task, thread_block, wait, wait_for, write,
 }
 
-// The helpers' shared words.
-const WAKE: u32 = 256
-const SHUTDOWN: u32 = 260
-const HELPED: u32 = 264
-const HOLD: u32 = 268
-const THREADS: u32 = 11
-
-// A thread's parallel job, in its block.
-const GENERATION: u32 = 0
-const TICKET: u32 = 4
-const TASK: u32 = 8
-const CONTEXT: u32 = 12
-const CHUNKS: u32 = 16
-const DONE: u32 = 20
-const FAILED: u32 = 24
-// The bit a host sets in DONE when a helper traps.
-const DONE_FAILED: u32 = 2147483648
-// How many other threads' chunks this thread is running, one inside another.
-const DEPTH: u32 = 28
-// What this thread is running for another: a block's job, or a slot.
-const RUNNING: u32 = 32
-// How many times this thread has waited at a join for a job a helper was running.
-const JOIN_WAITS: u32 = 40
-
-// The long jobs' slots, and a slot's words and states.
-const SLOTS: u32 = 1212416
-const SLOT_COUNT: u32 = 256
-const SLOT_SIZE: u32 = 16
+// A long job's slot: its words and states that are std's own (the state is its first word).
 const SLOT_TASK: u32 = 4
 const SLOT_CONTEXT: u32 = 8
-const SLOT_THREAD: u32 = 12
-const FREE: u32 = 0
 const FILLING: u32 = 1
 const QUEUED: u32 = 2
 const STARTED: u32 = 3
 const FINISHED: u32 = 4
-const FAILED_JOB: u32 = 5
 
 /// The most chunks a job has: the ticket counts them in 16 bits.
 pub(package) const MAX_CHUNKS: u32 = 4096
@@ -116,8 +91,8 @@ pub(package) fn par_map_reduce_chunk<T, R: Clone>(
 /// Wakes the helpers: work has appeared.
 fn wake() {
     unsafe {
-        let _ = atomic_add(WAKE, 1)
-        let _ = notify(WAKE, 4294967295)
+        let _ = atomic_add(PAR_WAKE, 1)
+        let _ = notify(PAR_WAKE, 4294967295)
     }
 }
 
@@ -136,28 +111,28 @@ pub(package) fn run_chunks(task: u32, ctx: u32, n: u32) {
             }
             return
         }
-        let gen = atomic_load(me + GENERATION) + 1
+        let gen = atomic_load(me + JOB_GENERATION) + 1
         // The new ticket first: a late helper's claim on this thread's last job fails from
         // here on.
-        atomic_store(me + TICKET, (gen & 65535) << 16)
-        atomic_store(me + TASK, task)
-        atomic_store(me + CONTEXT, ctx)
-        atomic_store(me + CHUNKS, n)
-        atomic_store(me + DONE, 0)
-        atomic_store(me + GENERATION, gen)
+        atomic_store(me + JOB_TICKET, (gen & 65535) << 16)
+        atomic_store(me + JOB_TASK, task)
+        atomic_store(me + JOB_CONTEXT, ctx)
+        atomic_store(me + JOB_CHUNKS, n)
+        atomic_store(me + JOB_DONE, 0)
+        atomic_store(me + JOB_GENERATION, gen)
         wake()
         let _ = claim(me, helping: false)
         loop {
-            let done = atomic_load(me + DONE)
-            // A helper trapped: its host set FAILED, then the top bit of DONE, so this sees it
-            // before it could wait. Its panic message is the program's.
-            if done >= DONE_FAILED {
-                abort_from(atomic_load(me + FAILED) - 1)
+            let done = atomic_load(me + JOB_DONE)
+            // A helper trapped: its host set JOB_FAILED, then the top bit of JOB_DONE, so this
+            // sees it before it could wait. Its panic message is the program's.
+            if done >= JOB_DONE_FAILED {
+                abort_from(atomic_load(me + JOB_FAILED) - 1)
             }
             if done >= n {
                 return
             }
-            let _ = wait(me + DONE, done)
+            let _ = wait(me + JOB_DONE, done)
         }
     }
 }
@@ -167,25 +142,25 @@ pub(package) fn run_chunks(task: u32, ctx: u32, n: u32) {
 fn claim(owner: u32, helping: bool) -> bool {
     unsafe {
         let me = thread_block()
-        let g16 = atomic_load(owner + GENERATION) & 65535
+        let g16 = atomic_load(owner + JOB_GENERATION) & 65535
         var ran = false
         loop {
-            let t = atomic_load(owner + TICKET)
-            if t >> 16 != g16 || t & 65535 >= atomic_load(owner + CHUNKS) {
+            let t = atomic_load(owner + JOB_TICKET)
+            if t >> 16 != g16 || t & 65535 >= atomic_load(owner + JOB_CHUNKS) {
                 return ran
             }
-            if compare_swap(owner + TICKET, t, t + 1) == t {
+            if compare_swap(owner + JOB_TICKET, t, t + 1) == t {
                 // Only this thread writes its own depth.
                 store_u32(me + DEPTH, load_u32(me + DEPTH) + 1)
                 atomic_store(me + RUNNING, owner)
-                run_task(atomic_load(owner + TASK), atomic_load(owner + CONTEXT), t & 65535)
+                run_task(atomic_load(owner + JOB_TASK), atomic_load(owner + JOB_CONTEXT), t & 65535)
                 atomic_store(me + RUNNING, 0)
                 store_u32(me + DEPTH, load_u32(me + DEPTH) - 1)
                 if helping {
-                    let _ = atomic_add(HELPED, 1)
+                    let _ = atomic_add(PAR_HELPED, 1)
                 }
-                let _ = atomic_add(owner + DONE, 1)
-                let _ = notify(owner + DONE, 1)
+                let _ = atomic_add(owner + JOB_DONE, 1)
+                let _ = notify(owner + JOB_DONE, 1)
                 ran = true
             }
         }
@@ -200,15 +175,15 @@ pub(package) fn worker(thread: u32) {
         loop {
             // Before each wait too: a helper that starts after the host shut it down would
             // otherwise wait for good.
-            if atomic_load(SHUTDOWN) != 0 {
+            if atomic_load(PAR_SHUTDOWN) != 0 {
                 return
             }
-            let seen = atomic_load(WAKE)
+            let seen = atomic_load(PAR_WAKE)
             if !find_work() {
-                if atomic_load(SHUTDOWN) != 0 {
+                if atomic_load(PAR_SHUTDOWN) != 0 {
                     return
                 }
-                let _ = wait(WAKE, seen)
+                let _ = wait(PAR_WAKE, seen)
             }
         }
     }
@@ -225,8 +200,8 @@ fn find_work() -> bool {
         return true
     }
     unsafe {
-        for s in 0..SLOT_COUNT {
-            let slot = SLOTS + s * SLOT_SIZE
+        for s in 0..JOB_SLOT_COUNT {
+            let slot = JOB_SLOTS + s * JOB_SLOT_SIZE
             if atomic_load(slot) == QUEUED && compare_swap(slot, QUEUED, STARTED) == QUEUED {
                 run_job(slot, held: true)
                 return true
@@ -237,7 +212,7 @@ fn find_work() -> bool {
 }
 
 /// Runs the long job in `slot`, which this thread has started, and marks it finished. A helper
-/// holds its result back for as long as the host asks (`HOLD`, microseconds: tests slow jobs).
+/// holds its result back for as long as the host asks (`PAR_HOLD`, microseconds: tests slow jobs).
 fn run_job(slot: u32, held: bool) {
     unsafe {
         let me = thread_block()
@@ -245,7 +220,7 @@ fn run_job(slot: u32, held: bool) {
         atomic_store(me + RUNNING, slot)
         run_task(atomic_load(slot + SLOT_TASK), atomic_load(slot + SLOT_CONTEXT), 0)
         atomic_store(me + RUNNING, 0)
-        let hold = atomic_load(HOLD)
+        let hold = atomic_load(PAR_HOLD)
         if held && hold > 0 {
             // Nothing notifies the slot while it's started: a sleep.
             let _ = wait_for(slot, STARTED, hold)
@@ -299,17 +274,15 @@ pub struct Job<O> {
 /// ```
 pub fn job<I, O, F: @deterministic fn(take I) -> O>(input: take I, f: F) -> Job<O> {
     unsafe {
-        let out = alloc(size_of::<Option<O>>(), align_of::<Option<O>>())
         let none: Option<O> = None
-        write(out, take none)
-        let size = size_of::<JobContext<I, O, F>>()
-        let context = alloc(size, align_of::<JobContext<I, O, F>>())
+        let out = place(take none)
         let c: JobContext<I, O, F> = JobContext { input: Some(take input), f: Some(f), out }
-        write(context, take c)
+        let context = place(take c)
+        let size = size_of::<JobContext<I, O, F>>()
         let t = task(run_job_context::<I, O, F>)
-        for s in 0..SLOT_COUNT {
-            let slot = SLOTS + s * SLOT_SIZE
-            if compare_swap(slot, FREE, FILLING) == FREE {
+        for s in 0..JOB_SLOT_COUNT {
+            let slot = JOB_SLOTS + s * JOB_SLOT_SIZE
+            if compare_swap(slot, SLOT_FREE, FILLING) == SLOT_FREE {
                 atomic_store(slot + SLOT_TASK, t)
                 atomic_store(slot + SLOT_CONTEXT, context)
                 atomic_store(slot, QUEUED)
@@ -361,12 +334,10 @@ impl<O> Job<O> {
                             run_job(self.slot, held: false)
                         }
                     } else if state == STARTED {
-                        // Counted for the hosts, which log a ticker's waits (wrela_abi
-                        // `JOIN_WAITS`): only this thread writes its count.
-                        let waits = thread_block() + JOIN_WAITS
-                        store_u32(waits, load_u32(waits).wrapping_add(1))
+                        // Counted for the hosts, which log a ticker's waits.
+                        count(JOIN_WAITS, 1)
                         let _ = wait(self.slot, STARTED)
-                    } else if state == FAILED_JOB {
+                    } else if state == SLOT_FAILED {
                         // Its host wrote the helper's number, and the helper's panic message is
                         // still in its block: it runs nothing more.
                         abort_from(atomic_load(self.slot + SLOT_THREAD))
@@ -374,7 +345,7 @@ impl<O> Job<O> {
                         break
                     }
                 }
-                atomic_store(self.slot, FREE)
+                atomic_store(self.slot, SLOT_FREE)
             }
             let result = read::<Option<O>>(self.out)
             free(self.out, size_of::<Option<O>>())

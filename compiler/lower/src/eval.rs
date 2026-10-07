@@ -200,26 +200,29 @@ pub fn lower_tests(
     (module, diags)
 }
 
+/// A zero of scalar type `s`.
+fn zero_scalar(s: ir::Scalar) -> ir::Const {
+    match s {
+        ir::Scalar::Bool => ir::Const::Bool(false),
+        ir::Scalar::I32 => ir::Const::I32(0),
+        ir::Scalar::U32 => ir::Const::U32(0),
+        ir::Scalar::I64 => ir::Const::I64(0),
+        ir::Scalar::U64 => ir::Const::U64(0),
+        ir::Scalar::F32 => ir::Const::F32(0.0),
+        ir::Scalar::F64 => ir::Const::F64(0.0),
+        s => ir::Const::Small(s, 0),
+    }
+}
+
 /// A zero of IR type `t`, as constant data.
 pub(crate) fn zero(types: &ir::Types, t: ir::TypeId) -> ir::ConstValue {
     use ir::ConstValue as V;
     match types.get(t) {
-        &ir::TypeDef::Scalar(s) => V::Scalar(match s {
-            ir::Scalar::Bool => ir::Const::Bool(false),
-            ir::Scalar::I32 => ir::Const::I32(0),
-            ir::Scalar::U32 => ir::Const::U32(0),
-            ir::Scalar::I64 => ir::Const::I64(0),
-            ir::Scalar::U64 => ir::Const::U64(0),
-            ir::Scalar::F32 => ir::Const::F32(0.0),
-            ir::Scalar::F64 => ir::Const::F64(0.0),
-            s => ir::Const::Small(s, 0),
-        }),
-        &ir::TypeDef::Vector(s, n) => {
-            let c = types.lookup(&ir::TypeDef::Scalar(s)).expect("a vector's component type");
-            V::Parts(vec![zero(types, c); n as usize])
-        }
+        &ir::TypeDef::Scalar(s) | &ir::TypeDef::Atomic(s) => V::Scalar(zero_scalar(s)),
+        &ir::TypeDef::Vector(s, n) => V::Parts(vec![V::Scalar(zero_scalar(s)); n as usize]),
         &ir::TypeDef::Matrix(n) => {
-            V::Parts(vec![V::Parts(vec![V::Scalar(ir::Const::F32(0.0)); n as usize]); n as usize])
+            let col = V::Parts(vec![V::Scalar(zero_scalar(ir::Scalar::F32)); n as usize]);
+            V::Parts(vec![col; n as usize])
         }
         &ir::TypeDef::Array(e, n) => V::Parts(vec![zero(types, e); n as usize]),
         ir::TypeDef::Struct { fields, .. } => {
@@ -230,9 +233,6 @@ pub(crate) fn zero(types: &ir::Types, t: ir::TypeId) -> ir::ConstValue {
         }
         ir::TypeDef::Run(_) | ir::TypeDef::RuntimeArray(_) | ir::TypeDef::Ptr(_) => {
             V::Scalar(ir::Const::U32(0))
-        }
-        &ir::TypeDef::Atomic(s) => {
-            V::Scalar(if s == ir::Scalar::I32 { ir::Const::I32(0) } else { ir::Const::U32(0) })
         }
     }
 }
@@ -334,16 +334,11 @@ impl Cx<'_> {
             ir::TypeDef::Scalar(s) | ir::TypeDef::Atomic(s) => {
                 Value::Scalar(read_scalar(mem, s, at)?)
             }
-            ir::TypeDef::Vector(s, n) => {
-                let types = &mb.m.types;
-                let c = types.lookup(&ir::TypeDef::Scalar(s)).ok_or("a vector's component type")?;
-                let size = ir::layout::layout(types, c).size;
-                Value::Parts(
-                    (0..u32::from(n))
-                        .map(|k| read_scalar(mem, s, at + size * k).map(Value::Scalar))
-                        .collect::<Result<_, _>>()?,
-                )
-            }
+            ir::TypeDef::Vector(s, n) => Value::Parts(
+                (0..u32::from(n))
+                    .map(|k| read_scalar(mem, s, at + s.bytes() * k).map(Value::Scalar))
+                    .collect::<Result<_, _>>()?,
+            ),
             ir::TypeDef::Matrix(n) => {
                 let mut cols = Vec::new();
                 for c in 0..u32::from(n) {

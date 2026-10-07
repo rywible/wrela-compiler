@@ -37,6 +37,15 @@ impl Scalar {
             Scalar::I64 | Scalar::U64 | Scalar::F64 => 64,
         }
     }
+    /// The bytes it takes in memory: 4 for a `bool`, as the `u32` that GPU memory holds one as.
+    pub fn bytes(self) -> u32 {
+        match self {
+            Scalar::I8 | Scalar::U8 => 1,
+            Scalar::I16 | Scalar::U16 => 2,
+            Scalar::Bool | Scalar::I32 | Scalar::U32 | Scalar::F32 => 4,
+            Scalar::I64 | Scalar::U64 | Scalar::F64 => 8,
+        }
+    }
     pub fn name(self) -> &'static str {
         match self {
             Scalar::Bool => "bool",
@@ -192,13 +201,25 @@ impl Types {
         }
     }
 
-    pub fn is_vector(&self, t: TypeId) -> bool {
-        matches!(self.get(t), TypeDef::Vector(..))
+    /// The type of constant part `k` of a value of type `t`: a struct's or an enum's field (see
+    /// [`TypeDef::Enum`]), a vector's component, a matrix's column, an array's element, or a
+    /// run's word (its address, then its length). `None` if `t` has no such part, or its type
+    /// was never interned.
+    pub fn part(&self, t: TypeId, k: u32) -> Option<TypeId> {
+        match self.get(t) {
+            TypeDef::Struct { .. } | TypeDef::Enum { .. } => self.field(t, k),
+            TypeDef::Vector(s, n) if k < u32::from(*n) => self.lookup(&TypeDef::Scalar(*s)),
+            TypeDef::Matrix(n) if k < u32::from(*n) => {
+                self.lookup(&TypeDef::Vector(Scalar::F32, *n))
+            }
+            TypeDef::Array(e, n) if k < *n => Some(*e),
+            TypeDef::Run(_) if k < 2 => self.lookup(&TypeDef::Scalar(Scalar::U32)),
+            _ => None,
+        }
     }
 
-    /// Whether it's an f32 vector: what derivations, intervals and the CPU's SIMD handle.
-    pub fn is_f32_vector(&self, t: TypeId) -> bool {
-        matches!(self.get(t), TypeDef::Vector(Scalar::F32, _))
+    pub fn is_vector(&self, t: TypeId) -> bool {
+        matches!(self.get(t), TypeDef::Vector(..))
     }
 
     /// Whether the type lives in memory on the CPU (everything but scalars and pointers).

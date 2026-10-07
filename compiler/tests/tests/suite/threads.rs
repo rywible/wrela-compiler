@@ -3,23 +3,12 @@
 //! with 1, 2 and 8 threads (the program's own and its helpers). compiler/tests/jobs is the
 //! program.
 
-use crate::built;
+use crate::{a_flipped_record_fails_at_its_tick, built, replays_with_any_helpers};
 use wrela_host::{CpuBuild, CpuHost, Value};
-use wrela_tests::sized;
+use wrela_tests::{one_u32, one_vec3, sized};
 
 fn start(workers: u32) -> CpuHost {
     CpuBuild::load(built("jobs")).expect("load").start_with(workers).expect("start")
-}
-
-fn u32_of(v: &[Value]) -> u32 {
-    match v {
-        [Value::I32(x)] => *x as u32,
-        other => panic!("expected a u32, got {other:?}"),
-    }
-}
-
-fn call(host: &mut CpuHost, name: &str, args: &[Value]) -> u32 {
-    u32_of(&host.call_export(name, args).unwrap_or_else(|e| panic!("{name}: {e}")))
 }
 
 /// A job's result is a function of its input alone, whichever thread runs it: twelve jobs at
@@ -30,14 +19,13 @@ fn call(host: &mut CpuHost, name: &str, args: &[Value]) -> u32 {
 fn jobs_give_the_same_results_with_any_helpers() {
     let results = |workers| {
         let mut host = start(workers);
-        let many = call(&mut host, "many", &[Value::I32(12), Value::I32(200_000)]);
-        let nested = call(&mut host, "nested_jobs", &[Value::I32(300_000)]);
-        (many, nested, host.worker_chunks())
+        let many = one_u32(&mut host, "many", &[Value::I32(12), Value::I32(200_000)]);
+        let nested = one_u32(&mut host, "nested_jobs", &[Value::I32(300_000)]);
+        (many, nested)
     };
-    let (many, nested, _) = results(1);
+    let one = results(1);
     for workers in [2, 8] {
-        let (m, n, _) = results(workers);
-        assert_eq!((m, n), (many, nested), "with {workers} threads");
+        assert_eq!(results(workers), one, "with {workers} threads");
     }
 }
 
@@ -49,7 +37,7 @@ fn a_trapping_job_traps_at_its_join() {
     for (workers, hold) in [(1, 0), (2, 0), (8, 0), (2, 50_000), (8, 50_000)] {
         let mut host = start(workers);
         host.hold_jobs(hold);
-        assert_eq!(call(&mut host, "trap_at_join", &[Value::I32(4)]), 8);
+        assert_eq!(one_u32(&mut host, "trap_at_join", &[Value::I32(4)]), 8);
         let e = host.call_export("trap_at_join", &[Value::I32(13)]).expect_err("13 traps");
         let msg = e.to_string();
         assert!(msg.contains("a job's input was 13"), "{workers} threads, held {hold}: {msg}");
@@ -62,7 +50,7 @@ fn a_trapping_job_traps_at_its_join() {
 /// chunk: the results are the same with any helpers, and nothing deadlocks.
 #[test]
 fn parallel_work_inside_parallel_work_runs_inline() {
-    let run = |workers| call(&mut start(workers), "nested_parallel", &[Value::I32(64)]);
+    let run = |workers| one_u32(&mut start(workers), "nested_parallel", &[Value::I32(64)]);
     let one = run(1);
     assert_eq!(run(2), one);
     assert_eq!(run(8), one);
@@ -72,7 +60,8 @@ fn parallel_work_inside_parallel_work_runs_inline() {
 /// whether helpers run them (and allocate) or it does.
 #[test]
 fn allocations_are_counted_per_thread() {
-    let run = |workers| call(&mut start(workers), "allocations_while_helping", &[Value::I32(16)]);
+    let run =
+        |workers| one_u32(&mut start(workers), "allocations_while_helping", &[Value::I32(16)]);
     let alone = run(1);
     assert!(alone > 0);
     assert_eq!(run(8), alone);
@@ -85,10 +74,7 @@ fn allocations_are_counted_per_thread() {
 /// reads.
 #[test]
 fn a_hand_off_is_never_read_torn() {
-    let dir = crate::scratch("threads-handoff");
-    let built = wrela_driver::build_debug(&wrela_tests::repo_root().join("compiler/tests/jobs"));
-    assert!(!built.has_errors(), "{:?}", built.diagnostics);
-    built.write_to(&dir).expect("write");
+    let dir = crate::built_debug("jobs");
     let mut host = CpuBuild::load(&dir).expect("load").start_with(2).expect("start");
     let (values, reads) = (sized(20_000, 1_000_000), sized(100_000, 1_000_000));
     let r = host
@@ -102,13 +88,6 @@ fn a_hand_off_is_never_read_torn() {
 
 fn ticker(workers: u32) -> CpuHost {
     CpuBuild::load(built("ticker")).expect("load").start_with(workers).expect("start")
-}
-
-fn vec3_of(v: &[Value]) -> [f32; 3] {
-    match v {
-        [Value::F32(a), Value::F32(b), Value::F32(c)] => [*a, *b, *c],
-        other => panic!("expected a vec3, got {other:?}"),
-    }
 }
 
 /// A ticker (`std::tick`) in lockstep with the frames (#43 §2.3): before frame i, a 60 Hz
@@ -130,7 +109,7 @@ fn a_ticker_takes_its_records_and_publishes_to_the_frames() {
     for i in 0..30 {
         host.lockstep_frame(i, 60.0, 64, 64, &script).expect("a frame");
     }
-    let [tick, keys, _] = vec3_of(&host.call_export("newest", &[]).expect("newest"));
+    let [tick, keys, _] = one_vec3(&mut host, "newest", &[]);
     assert_eq!((tick, keys), (29.0, 3.0));
     let e = host.call_export("start_again", &[]).expect_err("a second ticker");
     assert!(e.to_string().contains("a program starts one ticker"), "{e}");
@@ -145,17 +124,17 @@ fn parallel_work_from_ticks_and_frames_doesnt_collide() {
     let built = CpuBuild::load(built("ticker")).expect("load");
     let alone = built.record_ticks(ticks, &[], 1).expect("ticks alone");
     let alone: Vec<u64> = alone.ticks.iter().map(|t| t.hash).collect();
-    let mut frames_alone = ticker(1);
+    let mut frames_alone = built.start_with(1).expect("start");
     for i in 0..frames {
         frames_alone.frame(wrela_host::frame_time(i, 60.0), 64, 64).expect("a frame");
     }
-    let work = u32_of(&frames_alone.call_export("work", &[]).expect("work"));
+    let work = one_u32(&mut frames_alone, "work", &[]);
     for round in 0..sized(20, 1000) {
-        let mut host = ticker(8);
+        let mut host = built.start_with(8).expect("start");
         let ticked = host.ticks_beside_frames(ticks, frames, 60.0, 64, 64).expect("both");
         let hashes: Vec<u64> = ticked.iter().map(|(t, _)| t.hash.expect("asked for")).collect();
         assert_eq!(hashes, alone, "round {round}: the ticks' hashes");
-        assert_eq!(u32_of(&host.call_export("work", &[]).expect("work")), work, "round {round}");
+        assert_eq!(one_u32(&mut host, "work", &[]), work, "round {round}");
     }
 }
 
@@ -173,18 +152,9 @@ fn a_tick_log_replays_and_a_changed_record_fails_at_its_tick() {
     .expect("a script");
     let built = CpuBuild::load(built("ticker")).expect("load");
     let log = built.record_ticks(60, &script, 1).expect("record");
-    let bytes = log.encode();
-    let read = wrela_host::TickLog::decode(&bytes).expect("reads back");
-    for workers in [1, 2, 8] {
-        assert_eq!(built.replay(&read, workers).expect("replays"), 60);
-    }
+    let read = replays_with_any_helpers(&built, &log);
     // A key going down at tick 10 becomes one going up: tick 10's hash differs.
-    let mut changed = read.clone();
-    changed.ticks[10].records[0][0] = wrela_abi::input::EventKind::KeyUp as u8;
-    match built.replay(&changed, 2) {
-        Err(wrela_host::ReplayError::Tick { tick, .. }) => assert_eq!(tick, 10),
-        other => panic!("expected tick 10 to differ: {other:?}"),
-    }
+    a_flipped_record_fails_at_its_tick(&built, &read, 10);
     let mut other = read.clone();
     other.wasm_hash ^= 1;
     assert!(matches!(built.replay(&other, 1), Err(wrela_host::ReplayError::OtherBuild { .. })));
@@ -199,16 +169,12 @@ fn a_tick_log_replays_and_a_changed_record_fails_at_its_tick() {
 #[ignore = "long: needs Chrome, python3 and a GPU"]
 fn the_ticker_in_chrome_agrees_with_the_native_host() {
     let (dir, rel) = wrela_tests::page("compiler/tests/ticker", "ticker-chrome");
-    std::fs::copy(
-        wrela_tests::repo_root().join("compiler/tests/ticker/keys.json"),
-        dir.join("keys.json"),
-    )
-    .expect("copy the script");
-    let text = std::fs::read_to_string(dir.join("keys.json")).expect("the script");
+    let text =
+        std::fs::read_to_string(wrela_tests::repo_root().join("compiler/tests/ticker/keys.json"))
+            .expect("the script");
     let script = wrela_host::parse_script(&text).expect("a script");
     let built = CpuBuild::load(&dir).expect("load");
     let native = built.record_ticks(300, &script, 2).expect("native ticks");
-    let hex = |h: u64| format!("{h:016x}");
     let frames = 120;
     for (fps, workers, paced) in
         [(60.0, 4, false), (30.0, 1, false), (144.0, 4, false), (60.0, 4, true)]
@@ -216,24 +182,24 @@ fn the_ticker_in_chrome_agrees_with_the_native_host() {
         let run = wrela_tests::ChromeRun {
             workers,
             paced,
-            input: "keys.json".into(),
+            script: Some(text.clone()),
             ..wrela_tests::ChromeRun::new(frames, 16, 16, fps)
         };
         let chrome = wrela_tests::run_in_chrome_with(&rel, run);
         let ticks = chrome.ticks.expect("the ticker's ticks");
         let what = format!("{fps} fps, {workers} threads{}", if paced { ", paced" } else { "" });
         assert_eq!(ticks.hz, 60, "{what}");
+        let log = ticks.log.expect("a tick log");
         if !paced {
             let n = wrela_host::lockstep_ticks(frames - 1, 60, fps) as usize;
-            assert_eq!(ticks.hashes.len(), n, "{what}: the ticks before the last frame");
+            assert_eq!(log.ticks.len(), n, "{what}: the ticks before the last frame");
         }
-        assert!(ticks.hashes.len() > 30, "{what}: {} ticks", ticks.hashes.len());
-        for (k, h) in ticks.hashes.iter().enumerate() {
-            assert_eq!(*h, hex(native.ticks[k].hash), "{what}: tick {k}");
+        assert!(log.ticks.len() > 30, "{what}: {} ticks", log.ticks.len());
+        for (k, t) in log.ticks.iter().enumerate() {
+            assert_eq!(t.hash, native.ticks[k].hash, "{what}: tick {k}");
         }
-        let log = wrela_host::TickLog::decode(&ticks.log.expect("a tick log")).expect("reads");
         assert_eq!(log.first, native.first, "{what}: the first world");
-        assert_eq!(built.replay(&log, 2).expect("replays") as usize, ticks.hashes.len(), "{what}");
+        assert_eq!(built.replay(&log, 2).expect("replays") as usize, log.ticks.len(), "{what}");
     }
 }
 
@@ -245,9 +211,7 @@ fn the_ticker_in_chrome_agrees_with_the_native_host() {
 #[test]
 fn a_trapping_job_traps_at_the_tick_that_takes_it() {
     let dir = super::engine_package("threads-due-trap", "due", DUE_TRAP);
-    let built = wrela_driver::build(&dir);
-    assert!(!built.has_errors(), "{:?}", built.diagnostics);
-    built.write_to(&dir).expect("write");
+    wrela_tests::must_build(&dir, &dir);
     let build = CpuBuild::load(&dir).expect("load");
     for (workers, hold) in [(1, 0), (2, 0), (8, 0), (2, 100_000), (8, 100_000)] {
         let mut host = build.instantiate_in(workers, None).expect("instantiate");
@@ -255,15 +219,14 @@ fn a_trapping_job_traps_at_the_tick_that_takes_it() {
         host.init().expect("init");
         for k in 0..20 {
             let t = std::time::Instant::now();
-            host.tick(false)
-                .unwrap_or_else(|e| panic!("{workers} threads, held {hold}: tick {k}: {e}"));
+            host.tick().unwrap_or_else(|e| panic!("{workers} threads, held {hold}: tick {k}: {e}"));
             if k == 10 && hold > 0 {
                 let waited = t.elapsed().as_secs_f64() * 1000.0;
                 assert!(waited > 50.0, "{workers} threads: tick 10 took {waited:.1} ms");
             }
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
-        let e = host.tick(false).expect_err("tick 20 takes the trapping job");
+        let e = host.tick().expect_err("tick 20 takes the trapping job");
         let msg = e.to_string();
         assert!(
             msg.contains("in tick 20") && msg.contains("a job's input was 13"),

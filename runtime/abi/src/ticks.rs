@@ -18,8 +18,14 @@
 //!
 //! A tick's records are the input events the host stamped at its start (at most
 //! [`crate::memory::MAX_TICK_RECORDS`]), in the layout `wrela.input` gives them.
+//!
+//! ## Test mode's schedule
+//!
+//! A host in test mode runs frame `i` at [`frame_time`], and in lockstep (#43 §2.3) runs the
+//! ticks before it first ([`lockstep_ticks`]). Both hosts compute these the same way: the
+//! vectors check them.
 
-use crate::hash::{FNV_OFFSET, FNV_PRIME};
+use crate::hash::StateHash;
 use crate::input::EVENT_SIZE;
 use std::fmt;
 
@@ -84,7 +90,21 @@ impl std::error::Error for TickLogError {}
 
 /// FNV-1a 64 of a build's WASM: which build a log is for.
 pub fn wasm_hash(wasm: &[u8]) -> u64 {
-    wasm.iter().fold(FNV_OFFSET, |h, &b| (h ^ u64::from(b)).wrapping_mul(FNV_PRIME))
+    let mut hash = StateHash::new();
+    hash.update(wasm);
+    hash.value()
+}
+
+/// The time of frame `i` at `fps` frames a second: `i / fps` in f64, rounded to f32.
+pub fn frame_time(i: u32, fps: f64) -> f32 {
+    (f64::from(i) / fps) as f32
+}
+
+/// How many ticks have run before frame `i` in lockstep: ⌊(i + 1) · hz / fps⌋, in f64. Frame `i`
+/// waits for them, and the ticker waits for frame `i` before the next, so the frame draws the
+/// same snapshot in both hosts.
+pub fn lockstep_ticks(i: u32, hz: u32, fps: f64) -> u32 {
+    ((f64::from(i) + 1.0) * f64::from(hz) / fps).floor() as u32
 }
 
 impl TickLog {
@@ -208,7 +228,7 @@ mod tests {
 
     #[test]
     fn the_wasm_hash_is_fnv_1a() {
-        assert_eq!(wasm_hash(b""), FNV_OFFSET);
+        assert_eq!(wasm_hash(b""), crate::hash::FNV_OFFSET);
         assert_eq!(wasm_hash(b"a"), 0xaf63_dc4c_8601_ec8c);
     }
 }

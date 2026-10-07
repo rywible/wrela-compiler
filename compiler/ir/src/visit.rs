@@ -1,6 +1,6 @@
-//! Walking IR code: the statements of a block and its nested blocks, the values an expression
-//! reads and the places it touches, the function a call calls, and the functions a function
-//! reaches.
+//! Walking IR code: the statements of a block and its nested blocks (and rebuilding them), the
+//! values an expression reads and the places it touches, the function a call calls, and the
+//! functions a function reaches.
 //!
 //! Every match here names every variant, so a new statement or expression has to say what it
 //! uses here, once, rather than in each pass that walks code.
@@ -42,6 +42,15 @@ impl Place {
             | PlaceRoot::Ptr(_)
             | PlaceRoot::Data(_) => None,
         }
+    }
+
+    /// Whether the place's path has an element index (which a value gives, and which is
+    /// checked on the CPU).
+    pub fn has_index(&self) -> bool {
+        self.path.iter().any(|p| match p {
+            Proj::Index(_) => true,
+            Proj::Field(_) | Proj::Comp(_) => false,
+        })
     }
 }
 
@@ -228,6 +237,41 @@ impl Expr {
         )
     }
 
+    /// Whether it only computes from its operands, reading no memory and doing nothing else:
+    /// constants, arithmetic and math, and building vectors, matrices, structs and arrays or
+    /// taking them apart. (An enum's variant isn't counted: the passes that ask leave it where
+    /// it is.) A derivative counts, though it also wants the uniform control flow it's in.
+    pub fn only_computes(&self) -> bool {
+        match self {
+            Expr::Const(_)
+            | Expr::Zero(_)
+            | Expr::Unary(..)
+            | Expr::Binary(..)
+            | Expr::Builtin(..)
+            | Expr::Construct(..)
+            | Expr::Extract(..)
+            | Expr::ExtractDyn(..)
+            | Expr::Splat(..)
+            | Expr::Swizzle(..)
+            | Expr::Convert(..)
+            | Expr::Bitcast(..)
+            | Expr::Select { .. } => true,
+            Expr::Load(_)
+            | Expr::Call(..)
+            | Expr::Variant(..)
+            | Expr::Run(_)
+            | Expr::Addr(_)
+            | Expr::Host(..)
+            | Expr::Mem(..)
+            | Expr::ArrayLength(_)
+            | Expr::Texture(..)
+            | Expr::Atomic(..)
+            | Expr::Barrier
+            | Expr::EntryInput(_)
+            | Expr::Param(_) => false,
+        }
+    }
+
     /// The function a call calls.
     pub fn callee(&self) -> Option<FuncId> {
         match self {
@@ -356,7 +400,7 @@ impl Stmt {
 
 /// Calls `f` on every statement of `b` and of the blocks nested in it, each statement before
 /// those nested in it.
-pub fn walk(b: &Block, f: &mut impl FnMut(&Stmt)) {
+pub fn walk(b: &[Stmt], f: &mut impl FnMut(&Stmt)) {
     for s in b {
         f(s);
         for inner in s.blocks() {
@@ -372,6 +416,28 @@ pub fn walk_mut(b: &mut Block, f: &mut impl FnMut(&mut Stmt)) {
             walk_mut(inner, f);
         }
     }
+}
+
+/// Rebuilds `b` and the blocks nested in it: `f` is given each statement, after the blocks
+/// nested in it are rebuilt, and appends what replaces it to the block being rebuilt.
+pub fn expand(b: &mut Block, f: &mut impl FnMut(Stmt, &mut Block)) {
+    for mut s in std::mem::take(b) {
+        for inner in s.blocks_mut() {
+            expand(inner, f);
+        }
+        f(s, b);
+    }
+}
+
+/// [`expand`], with an `f` that can fail: the first error stops it.
+pub fn try_expand(b: &mut Block, f: &mut impl FnMut(Stmt, &mut Block) -> Result<()>) -> Result<()> {
+    for mut s in std::mem::take(b) {
+        for inner in s.blocks_mut() {
+            try_expand(inner, f)?;
+        }
+        f(s, b)?;
+    }
+    Ok(())
 }
 
 /// Whether `f` holds for a statement of `b` or of the blocks nested in it.
