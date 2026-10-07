@@ -2,16 +2,18 @@
 //! there, but WGSL's `bool` has no layout and WGSL has no unions. This pass rewrites a flattened
 //! GPU module so that its memory holds:
 //!
-//! - a `bool` that's a member of a struct, an enum's payload, an array or a buffer as a `u32`,
-//!   0 or 1: the 4 bytes the CPU holds for one;
-//! - an enum that memory holds (one in the type of a buffer, a uniform block or workgroup
-//!   memory) as its `u32` tag and its payload's words: `struct { tag: u32, words: array<W, K> }`,
-//!   `W` a `u32`, `vec2<u32>` or `vec4<u32>` as the enum is aligned, which WGSL lays out as the
-//!   CPU lays out the enum. Building a variant writes its payload's words (bit casts); reading a
-//!   payload reads them back.
+//! - a `bool` in a buffer, or a member of a type memory holds (a struct's field, an enum's
+//!   payload, an array's element), as a `u32`, 0 or 1: the 4 bytes the CPU holds for one;
+//! - an enum that memory holds as its `u32` tag and its payload's words:
+//!   `struct { tag: u32, words: array<W, K> }`, `W` a `u32`, `vec2<u32>` or `vec4<u32>` as the
+//!   enum is aligned, which WGSL lays out as the CPU lays out the enum. Building a variant writes
+//!   its payload's words (bit casts); reading a payload reads them back.
 //!
-//! A `bool` value, local or parameter stays a `bool`, and an enum that only code holds stays a
-//! WGSL struct with a member for each payload.
+//! The types memory holds are those in the type of a buffer, a uniform block or workgroup
+//! memory, at any depth; code uses them as memory holds them, wherever it holds them. Other
+//! types stay as they are: a `bool` value, local or parameter is a `bool`, a struct only code
+//! holds (a function's `(vec3, bool)`) keeps its `bool`s, and an enum only code holds is a WGSL
+//! struct with a member for each payload.
 
 use crate::layout::{column_stride, field_offsets};
 use crate::*;
@@ -19,7 +21,15 @@ use std::collections::{HashMap, HashSet};
 
 /// Rewrites a flattened GPU module's memory as the module docs say.
 pub fn lay_out_gpu_memory(m: &mut Module) -> Result<()> {
-    let mut tm = TypeMap { map: HashMap::new(), words: memory_enums(m) };
+    let memory = memory_types(m);
+    let words = memory
+        .iter()
+        .copied()
+        .filter(|&t| {
+            matches!(m.types.get(t), TypeDef::Enum { variants, .. } if variants.iter().any(|(_, p)| p.is_some()))
+        })
+        .collect();
+    let mut tm = TypeMap { map: HashMap::new(), words, memory };
     for i in 0..m.functions.len() {
         let mut f = std::mem::take(&mut m.functions[i]);
         // The code first, from the types as they were (a place's, a value's); then the types.
@@ -60,47 +70,41 @@ pub fn lay_out_gpu_memory(m: &mut Module) -> Result<()> {
     Ok(())
 }
 
-/// The enums with payloads that a resource's type holds, at any depth.
-fn memory_enums(m: &Module) -> HashSet<TypeId> {
-    fn walk(types: &Types, t: TypeId, out: &mut HashSet<TypeId>, seen: &mut HashSet<TypeId>) {
-        if !seen.insert(t) {
-            return;
-        }
-        match types.get(t) {
-            TypeDef::Struct { fields, .. } => {
-                for (_, f) in fields {
-                    walk(types, *f, out, seen);
-                }
+/// The aggregates memory holds: those in a resource's type, at any depth.
+fn memory_types(m: &Module) -> HashSet<TypeId> {
+    fn walk(types: &Types, t: TypeId, out: &mut HashSet<TypeId>) {
+        let parts: Vec<TypeId> = match types.get(t) {
+            TypeDef::Struct { fields, .. } => fields.iter().map(|(_, f)| *f).collect(),
+            TypeDef::Enum { variants, .. } => variants.iter().filter_map(|(_, p)| *p).collect(),
+            TypeDef::Array(e, _) | TypeDef::RuntimeArray(e) => vec![*e],
+            _ => return,
+        };
+        if out.insert(t) {
+            for p in parts {
+                walk(types, p, out);
             }
-            TypeDef::Enum { variants, .. } => {
-                if variants.iter().any(|(_, p)| p.is_some()) {
-                    out.insert(t);
-                }
-                for p in variants.iter().filter_map(|(_, p)| *p) {
-                    walk(types, p, out, seen);
-                }
-            }
-            TypeDef::Array(e, _) | TypeDef::RuntimeArray(e) => walk(types, *e, out, seen),
-            _ => {}
         }
     }
-    let (mut out, mut seen) = (HashSet::new(), HashSet::new());
+    let mut out = HashSet::new();
     for r in &m.resources {
-        walk(&m.types, r.ty, &mut out, &mut seen);
+        walk(&m.types, r.ty, &mut out);
     }
     out
 }
 
-/// Each type as GPU memory holds it.
+/// Each type as code uses it: as memory holds it, if memory holds it.
 struct TypeMap {
     map: HashMap<TypeId, TypeId>,
-    /// The enums memory holds as their tag and their payload's words.
+    /// The aggregates memory holds.
+    memory: HashSet<TypeId>,
+    /// Of those, the enums with payloads: memory holds them as their tag and their payload's
+    /// words.
     words: HashSet<TypeId>,
 }
 
 impl TypeMap {
-    /// `t` with each `bool` member a `u32`, and each enum memory holds as its words; a `bool`
-    /// itself stays one.
+    /// `t` as code uses it: each type memory holds as memory holds it, its `bool` members
+    /// `u32`s and its enums their words; a `bool` itself stays one.
     fn stored(&mut self, types: &mut Types, t: TypeId) -> TypeId {
         if let Some(&s) = self.map.get(&t) {
             return s;
@@ -116,22 +120,22 @@ impl TypeMap {
                 })
             }
             TypeDef::Struct { name, fields } => {
-                let fields = fields.into_iter().map(|(n, f)| (n, self.member(types, f))).collect();
+                let fields = fields.into_iter().map(|(n, f)| (n, self.part(types, t, f))).collect();
                 types.intern(TypeDef::Struct { name, fields })
             }
             TypeDef::Enum { name, variants } => {
                 let variants = variants
                     .into_iter()
-                    .map(|(n, p)| (n, p.map(|p| self.member(types, p))))
+                    .map(|(n, p)| (n, p.map(|p| self.part(types, t, p))))
                     .collect();
                 types.intern(TypeDef::Enum { name, variants })
             }
             TypeDef::Array(e, n) => {
-                let e = self.member(types, e);
+                let e = self.part(types, t, e);
                 types.intern(TypeDef::Array(e, n))
             }
             TypeDef::RuntimeArray(e) => {
-                let e = self.member(types, e);
+                let e = self.part(types, t, e);
                 types.intern(TypeDef::RuntimeArray(e))
             }
             _ => t,
@@ -143,6 +147,25 @@ impl TypeMap {
     /// A member of type `t` as GPU memory holds it: a `bool` is a `u32`.
     fn member(&mut self, types: &mut Types, t: TypeId) -> TypeId {
         if is_bool(types, t) { types.u32() } else { self.stored(types, t) }
+    }
+
+    /// A part of type `t` of a value of type `whole`: a member of it if memory holds it.
+    fn part(&mut self, types: &mut Types, whole: TypeId, t: TypeId) -> TypeId {
+        if self.memory.contains(&whole) { self.member(types, t) } else { self.stored(types, t) }
+    }
+
+    /// Whether member `k` of a value of type `t` (a struct's field, an enum's tag or payload,
+    /// an array's element) is a `bool` memory holds as a `u32`. A vector's or a matrix's never
+    /// is.
+    fn bool_member(&self, types: &Types, t: TypeId, k: u32) -> bool {
+        self.memory.contains(&t)
+            && match types.get(t) {
+                TypeDef::Struct { .. } | TypeDef::Enum { .. } => {
+                    types.field(t, k).is_some_and(|ft| is_bool(types, ft))
+                }
+                TypeDef::Array(e, _) => is_bool(types, *e),
+                _ => false,
+            }
     }
 }
 
@@ -170,18 +193,6 @@ fn in_memory(kind: ResourceKind) -> bool {
         kind,
         ResourceKind::Uniform { .. } | ResourceKind::StorageRead | ResourceKind::StorageReadWrite
     )
-}
-
-/// Whether member `k` of a value of type `t` (a struct's field, an enum's tag or payload, an
-/// array's element) is a `bool`. A vector's or a matrix's never is.
-fn bool_member(types: &Types, t: TypeId, k: u32) -> bool {
-    match types.get(t) {
-        TypeDef::Struct { .. } | TypeDef::Enum { .. } => {
-            types.field(t, k).is_some_and(|ft| is_bool(types, ft))
-        }
-        TypeDef::Array(e, _) => is_bool(types, *e),
-        _ => false,
-    }
 }
 
 /// A step from a value to a part of it: `Expr::Extract` (a field, a component, a column), or
@@ -324,13 +335,19 @@ impl Rewriter<'_> {
         None
     }
 
-    /// Whether `p` is a `bool` that memory holds as a `u32`: a member of something, or a
-    /// buffer's.
+    /// Whether `p` is a `bool` that memory holds as a `u32`: a buffer's, or a member of a type
+    /// memory holds.
     fn stored_bool(&self, p: &Place) -> bool {
-        let buffer =
-            matches!(p.root, PlaceRoot::Resource(r) if in_memory(self.m.resources[r.index()].kind));
-        (buffer || !p.path.is_empty())
-            && self.m.place_ty(self.f, p).is_some_and(|t| is_bool(&self.m.types, t))
+        let Some((t, path)) = self.m.place_start(self.f, p) else { return false };
+        let Some((last, rest)) = path.split_last() else {
+            let buffer = matches!(p.root, PlaceRoot::Resource(r) if in_memory(self.m.resources[r.index()].kind));
+            return buffer && is_bool(&self.m.types, t);
+        };
+        let Some(parent) = rest.iter().try_fold(t, |t, proj| self.m.proj_ty(t, proj)) else {
+            return false;
+        };
+        self.tm.memory.contains(&parent)
+            && self.m.proj_ty(parent, last).is_some_and(|t| is_bool(&self.m.types, t))
     }
 
     /// Word `i` of the payload of the enum (of type `t`) that `words` holds, a `u32`.
@@ -520,7 +537,7 @@ impl Rewriter<'_> {
             let pt = self.stored(pt);
             return self.decode(&Words::Value(x), t, pt, 0, out);
         }
-        if bool_member(&self.m.types, t, k) {
+        if self.tm.bool_member(&self.m.types, t, k) {
             let u32t = self.m.types.u32();
             let w = self.val(out, u32t, Expr::Extract(x, k));
             let zero = self.u32_const(out, 0);
@@ -531,7 +548,7 @@ impl Rewriter<'_> {
 
     /// `ExtractDyn(x, i)` of `x`, a value of type `t` (as it was).
     fn extract_dyn(&mut self, x: ValueId, t: TypeId, i: ValueId, out: &mut Block) -> Expr {
-        if bool_member(&self.m.types, t, 0) {
+        if self.tm.bool_member(&self.m.types, t, 0) {
             let u32t = self.m.types.u32();
             let w = self.val(out, u32t, Expr::ExtractDyn(x, i));
             let zero = self.u32_const(out, 0);
@@ -581,7 +598,7 @@ impl Rewriter<'_> {
                     .into_iter()
                     .zip(0..)
                     .map(|(x, k)| {
-                        if bool_member(&self.m.types, t, k) {
+                        if self.tm.bool_member(&self.m.types, t, k) {
                             self.val(out, u32t, Expr::Convert(x, Scalar::U32))
                         } else {
                             x
@@ -593,7 +610,7 @@ impl Rewriter<'_> {
             Expr::Variant(t, v, payload) if self.is_words(t) => self.variant(t, v, payload, out),
             Expr::Variant(t, v, payload) => {
                 let payload = payload.map(|x| {
-                    if bool_member(&self.m.types, t, v + 1) {
+                    if self.tm.bool_member(&self.m.types, t, v + 1) {
                         self.val(out, u32t, Expr::Convert(x, Scalar::U32))
                     } else {
                         x
