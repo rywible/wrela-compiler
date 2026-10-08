@@ -1,0 +1,29 @@
+// An enum discriminant that isn't valid. An enum whose variants hold nothing has
+// discriminants: each variant's tag, its `u32` (`u32(e)`), and what `E::from_u32(n)` reads back.
+// A variant's is written (`Hidden = 99`) or one past the variant's before it, the first's 0.
+// Each is a `u32`, and each is past the one before it, so the variants are ordered as they're
+// declared. An enum with a variant that holds fields has none.
+// ---- wrong
+enum Way {
+    Near,
+    Far,
+    Hidden = 1,
+}
+
+pub fn hidden() -> u32 {
+    u32(Way::Hidden)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+enum Way {
+    Near,
+    Far,
+    Hidden = 99,
+}
+
+pub fn hidden() -> u32 {
+    u32(Way::Hidden)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

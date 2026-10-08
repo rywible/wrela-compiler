@@ -142,6 +142,9 @@ pub struct VariantDef {
     /// Tuple variants' fields are named "0", "1", …
     pub fields: Vec<FieldDef>,
     pub span: Span,
+    /// Its tag, and an enum of fieldless variants' `u32`: written (`Hidden = 99`), or one past
+    /// the variant's before it, the first's 0 (§3).
+    pub discriminant: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -252,6 +255,7 @@ lang_items! {
     Copy = "std::prelude::Copy",
     Clone = "std::prelude::Clone",
     GpuData = "std::prelude::GpuData",
+    Fieldless = "std::prelude::Fieldless",
     GpuBuffer = "std::gpu::GpuBuffer",
     Slots = "std::gpu::Slots",
     GlobalId = "std::gpu::GlobalId",
@@ -458,7 +462,7 @@ lang_items! {
 impl Lang {
     /// `Copy`, `Clone` and `GpuData`: traits a type has through its fields, by opting in.
     pub fn is_structural(self) -> bool {
-        matches!(self, Lang::Copy | Lang::Clone | Lang::GpuData)
+        matches!(self, Lang::Copy | Lang::Clone | Lang::GpuData | Lang::Fieldless)
     }
 }
 

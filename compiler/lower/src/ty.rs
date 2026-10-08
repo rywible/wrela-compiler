@@ -172,7 +172,8 @@ impl<'a> Cx<'a> {
                         });
                         variants.push((vname, pt));
                     }
-                    Some(mb.m.types.intern(ir::TypeDef::Enum { name, variants }))
+                    let tags = p.adt(*a).variants().iter().map(|v| v.discriminant).collect();
+                    Some(mb.m.types.intern(ir::TypeDef::Enum { name, variants, tags }))
                 } else {
                     let borrow = p.adt(*a).borrow;
                     if borrow && gpu {

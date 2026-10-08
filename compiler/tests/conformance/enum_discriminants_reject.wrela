@@ -1,0 +1,34 @@
+// rejects: enum.discriminants
+// Discriminants are an enum's whose variants hold nothing; each is a `u32`, past the variant's
+// before it. `Fieldless` is such an enum's.
+enum Shape {
+    Ball(f32),
+    Empty = 3, //~ E0334
+}
+
+enum Back {
+    A = 5,
+    B = 2, //~ E0334
+}
+
+enum Huge {
+    A = 4294967296, //~ E0334
+}
+
+enum Last {
+    A = 4294967295,
+    B, //~ E0334
+}
+
+struct Plain: Fieldless { //~ E0407
+    x: u32,
+}
+
+enum Held: Fieldless { //~ E0407
+    One(u32),
+    Two,
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    let s = Shape::from_u32(1) //~ E0207
+}

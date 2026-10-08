@@ -1,0 +1,61 @@
+// run: a fieldless enum's variants are their discriminants, written or one past the variant's
+// before: `u32(e)` gives one, `E::from_u32(n)` reads one back, a `Flags` holds one a bit, and an
+// export takes the enum as its number (a number no variant has traps)
+// expect: tag(0) = 0
+// expect: tag(2) = 7
+// expect: tag(3) = 8
+// expect: tag(4) = 30
+// expect: back(30) = 4
+// expect: back(8) = 3
+// expect: back(9) = 100
+// expect: named(7) = 3
+// expect: named(30) = 5
+// expect: named(2) traps
+// expect: flags(30) = 1073741826
+// expect: flags(1) = 2
+use std::collections::Flags
+
+enum Way: Copy + Eq + Fieldless {
+    Near,
+    Far,
+    Volume = 7,
+    Gone,
+    Hidden = 30,
+}
+
+const WAYS: [Way; 5] = [Way::Near, Way::Far, Way::Volume, Way::Gone, Way::Hidden]
+
+/// Way `i`'s discriminant.
+pub fn tag(i: u32) -> u32 {
+    u32(WAYS[i])
+}
+
+/// Which of `WAYS` has discriminant `n`, or 100 for none.
+pub fn back(n: u32) -> u32 {
+    match Way::from_u32(n) {
+        Some(w) => {
+            var i = 0
+            while WAYS[i] != w {
+                i += 1
+            }
+            i
+        }
+        None => 100,
+    }
+}
+
+/// The way, by its number from the host.
+pub fn named(w: Way) -> u32 {
+    match w {
+        Way::Near => 1,
+        Way::Far => 2,
+        Way::Volume => 3,
+        Way::Gone => 4,
+        Way::Hidden => 5,
+    }
+}
+
+/// `w` and `Far`, as bits.
+pub fn flags(w: Way) -> u32 {
+    Flags::none().with(w).with(Way::Far).bits()
+}

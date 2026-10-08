@@ -35,6 +35,10 @@ pub const RULES: &[(&str, &str)] = &[
     ("struct.opt-in", "a struct opts in to Copy, Clone and GpuData in its declaration"),
     ("struct.base", "`..base` fills the remaining fields from another value"),
     ("enum.match", "enums with payloads, matched exhaustively"),
+    (
+        "enum.discriminants",
+        "a fieldless enum's variants are its discriminants: `u32(e)`, `E::from_u32(n)`, `Flags<E>`",
+    ),
     ("trait.items", "traits with associated types and default methods; impls provide the rest"),
     ("trait.orphan", "an impl lives with its trait or its type"),
     (

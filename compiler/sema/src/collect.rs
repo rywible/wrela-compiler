@@ -407,7 +407,13 @@ impl<'d, 'u> Collector<'d, 'u> {
                         ast::VariantKind::Struct(_) => VariantShape::Struct,
                     };
                     let name = v.name.name.clone();
-                    variants.push(VariantDef { name, shape, fields: Vec::new(), span: v.span });
+                    variants.push(VariantDef {
+                        name,
+                        shape,
+                        fields: Vec::new(),
+                        span: v.span,
+                        discriminant: 0,
+                    });
                 }
                 let kind = AdtKind::Enum(variants);
                 let a = self.declare_adt(m, item, &e.name, &e.generics, kind, vis);
@@ -1770,7 +1776,74 @@ impl<'d, 'u> Collector<'d, 'u> {
             }
             ast::ItemKind::Enum(e) => {
                 let mut variants: Vec<VariantDef> = Vec::new();
+                let mut next = Some(0u32);
+                // An enum with discriminants is an enum of fieldless variants (§3).
+                let written = e.variants.iter().find_map(|v| v.discriminant.as_ref());
+                if let Some(d) = written
+                    && let Some(v) = e.variants.iter().find(|v| v.kind != ast::VariantKind::Unit)
+                {
+                    self.diags.push(
+                        Diagnostic::new(
+                            codes::E0334,
+                            d.span,
+                            format!("`{}` holds fields, so its enum's variants have no discriminants", v.name.name),
+                        )
+                        .with_secondary(v.span, "holds fields")
+                        .with_note("a discriminant is a variant's tag and its `u32`: an enum whose variants hold nothing has them (§3)"),
+                    );
+                }
                 for v in &e.variants {
+                    let discriminant = match &v.discriminant {
+                        Some(lit) => match lit.kind {
+                            ast::LitKind::Int(ast::IntValue::Ok(x)) if x <= u64::from(u32::MAX) => {
+                                Some(x as u32)
+                            }
+                            _ => {
+                                self.diags.push(Diagnostic::new(
+                                    codes::E0334,
+                                    lit.span,
+                                    format!(
+                                        "`{}`'s discriminant is a `u32`, and `{}` isn't one",
+                                        v.name.name, lit.text
+                                    ),
+                                ));
+                                None
+                            }
+                        },
+                        None => next,
+                    };
+                    let discriminant = match discriminant {
+                        Some(d) => d,
+                        None => {
+                            if v.discriminant.is_none() {
+                                self.diags.push(Diagnostic::new(
+                                    codes::E0334,
+                                    v.name.span,
+                                    format!("`{}`'s discriminant, one past the variant's before it, is past `u32`'s range", v.name.name),
+                                ));
+                            }
+                            0
+                        }
+                    };
+                    next = discriminant.checked_add(1);
+                    // Discriminants increase, so the variants compare as they're declared.
+                    if let (Some(lit), Some(prev)) = (&v.discriminant, variants.last())
+                        && discriminant <= prev.discriminant
+                    {
+                        let (ps, pd) = (prev.span, prev.discriminant);
+                        self.diags.push(
+                            Diagnostic::new(
+                                codes::E0334,
+                                lit.span,
+                                format!(
+                                    "`{}`'s discriminant, {discriminant}, isn't past `{}`'s, {pd}",
+                                    v.name.name, prev.name
+                                ),
+                            )
+                            .with_secondary(ps, "the variant before it")
+                            .with_note("discriminants increase down the enum, so its variants are ordered as they're declared, and each has its own (§3)"),
+                        );
+                    }
                     if let Some(prev) = variants.iter().find(|p| p.name == v.name.name) {
                         let ps = prev.span;
                         self.diags.push(
@@ -1815,6 +1888,7 @@ impl<'d, 'u> Collector<'d, 'u> {
                         shape,
                         fields,
                         span: v.span,
+                        discriminant,
                     });
                 }
                 (&e.traits, AdtKind::Enum(variants))
@@ -2966,6 +3040,25 @@ fn check_structural_opt_in(p: &Program, diags: &mut Vec<Diagnostic>, imp: &ImplD
     let lang = tr.lang;
     // A `Clone` std's core writes by hand checks the fields itself.
     if lang == Some(Lang::Clone) && crate::traits::explicit_clone(p, a).is_some() {
+        return;
+    }
+    // `Fieldless` is an enum's whose variants hold nothing (§3).
+    if lang == Some(Lang::Fieldless) {
+        let held = adt.variants().iter().find(|v| !v.fields.is_empty());
+        if !adt.is_enum() || held.is_some() {
+            let why = match held {
+                Some(v) => format!("its variant `{}` holds fields", v.name),
+                None => "it's a struct".to_string(),
+            };
+            diags.push(
+                Diagnostic::new(
+                    codes::E0407,
+                    imp.span,
+                    format!("`{}` can't be `Fieldless`: {why}", adt.name),
+                )
+                .with_note("`Fieldless` is an enum's whose variants hold nothing: each is its discriminant (§3)"),
+            );
+        }
         return;
     }
     // An enum is its `u32` tag and its payloads' bytes, laid out as the CPU lays it out, on

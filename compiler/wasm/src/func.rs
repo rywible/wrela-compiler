@@ -1432,7 +1432,8 @@ impl<'m> Fe<'m> {
             ir::Expr::Variant(_, k, payload) => {
                 // The tag, and the payload where every variant's starts.
                 let a = self.fresh_slot(v, true)?;
-                self.ins.extend([I::LocalGet(a), I::I32Const(*k as i32), I::I32Store(mem(0, 2))]);
+                let tag = self.m.types.tag(t, *k);
+                self.ins.extend([I::LocalGet(a), I::I32Const(tag as i32), I::I32Store(mem(0, 2))]);
                 if let Some(p) = payload {
                     let off = field_offsets(&self.m.types, t)[1 + *k as usize];
                     self.store_at(a, off, *p)?;

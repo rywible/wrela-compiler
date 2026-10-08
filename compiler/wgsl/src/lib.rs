@@ -1063,7 +1063,7 @@ impl<'a, 'm> Fb<'a, 'm> {
                     return Err("internal: a variant of a type that isn't an enum".into());
                 };
                 let ty = self.cx.ty(*t)?;
-                let tag = self.lit(Literal::U32(*k), out);
+                let tag = self.lit(Literal::U32(types.tag(*t, *k)), out);
                 self.const_if_all(v, payload.as_slice());
                 let mut components = vec![tag];
                 for (v, (_, p)) in variants.iter().enumerate() {

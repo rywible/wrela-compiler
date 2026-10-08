@@ -1677,12 +1677,16 @@ impl<'p> Checker<'p> {
                     }
                 }
                 // An enum whose variants hold nothing converts to an integer: its variant's
-                // index, in declaration order (§21's "an enum's integer value").
-                if let &TyKind::Adt(a, _) = self.kind(x.ty)
-                    && self.p.adt(a).is_enum()
-                    && self.p.adt(a).variants().iter().all(|v| v.fields.is_empty())
-                    && matches!(t, BuiltinTy::Int(_))
-                {
+                // discriminant (§3), as a `Fieldless` parameter's value does.
+                let fieldless = match self.kind(x.ty) {
+                    &TyKind::Adt(a, _) => {
+                        self.p.adt(a).is_enum()
+                            && self.p.adt(a).variants().iter().all(|v| v.fields.is_empty())
+                    }
+                    TyKind::Param(_) => traits::implements_builtin(self.p, x.ty, Lang::Fieldless),
+                    _ => false,
+                };
+                if fieldless && matches!(t, BuiltinTy::Int(_)) {
                     let u = self.p.types.u32;
                     let index = Expr { ty: u, span, kind: ExprKind::Discriminant(Box::new(x)) };
                     if ty == u {
@@ -1881,6 +1885,9 @@ impl<'p> Checker<'p> {
                 self.call_trait_method(m, ty, r.args, generics, None, args, span)
             }
             Assoc::Ambiguous => self.failed_call(args, span),
+            Assoc::Missing if name.name == "from_u32" && self.fieldless_enum(ty).is_some() => {
+                self.enum_from_u32(ty, args, span)
+            }
             Assoc::Missing => {
                 let shown = self.display(ty);
                 self.err(Diagnostic::new(
@@ -1890,6 +1897,112 @@ impl<'p> Checker<'p> {
                 ));
                 self.failed_call(args, span)
             }
+        }
+    }
+
+    /// The enum `ty` is, if its variants hold nothing.
+    fn fieldless_enum(&self, ty: TyId) -> Option<AdtId> {
+        let &TyKind::Adt(a, _) = self.kind(ty) else { return None };
+        let adt = self.p.adt(a);
+        (adt.is_enum() && adt.variants().iter().all(|v| v.fields.is_empty())).then_some(a)
+    }
+
+    /// `E::from_u32(n)`, for an enum `ty` whose variants hold nothing (§3): `Some` of the variant
+    /// whose discriminant `n` is, or `None`. A chain of comparisons, one a variant.
+    fn enum_from_u32(&mut self, ty: TyId, args: &[ast::Arg], span: Span) -> Expr {
+        let u32_ty = self.p.types.u32;
+        let [arg] = args else {
+            self.err(Diagnostic::new(
+                codes::E0301,
+                span,
+                format!("`from_u32` takes one argument, a `u32`; this call has {}", args.len()),
+            ));
+            return self.failed_call(args, span);
+        };
+        let n = self.check_expect(&arg.value, u32_ty);
+        let (Some(a), Some(option)) = (self.fieldless_enum(ty), self.p.lang_adt(Lang::Option))
+        else {
+            return self.error_expr(span);
+        };
+        let targs = match self.kind(ty) {
+            TyKind::Adt(_, args) => args.clone(),
+            _ => Vec::new(),
+        };
+        let out = self.p.types.adt(option, vec![ty]);
+        let bool_ty = self.p.types.bool;
+        // `n` once, in a local the comparisons read.
+        let at = n.span;
+        let l = self.declare_unnamed(u32_ty, LocalKind::Owned { mutable: false }, at);
+        let pat = Pat { ty: u32_ty, kind: PatKind::Bind(l), span: at };
+        let bind = Stmt { kind: StmtKind::Bind { pat, init: n, else_: None }, span: at };
+        let read = |at: Span| Expr { ty: u32_ty, span: at, kind: ExprKind::Local(l) };
+        let none = Expr {
+            ty: out,
+            span,
+            kind: ExprKind::Adt {
+                adt: option,
+                args: vec![ty],
+                variant: Some(0),
+                fields: Vec::new(),
+                order: Vec::new(),
+                base: None,
+            },
+        };
+        let mut chain = none;
+        for (k, v) in self.p.adt(a).variants().iter().enumerate().rev() {
+            let value = Expr {
+                ty,
+                span,
+                kind: ExprKind::Adt {
+                    adt: a,
+                    args: targs.clone(),
+                    variant: Some(k as u32),
+                    fields: Vec::new(),
+                    order: Vec::new(),
+                    base: None,
+                },
+            };
+            let some = Expr {
+                ty: out,
+                span,
+                kind: ExprKind::Adt {
+                    adt: option,
+                    args: vec![ty],
+                    variant: Some(1),
+                    fields: vec![value],
+                    order: vec![0],
+                    base: None,
+                },
+            };
+            let d = Expr {
+                ty: u32_ty,
+                span,
+                kind: ExprKind::Lit(Lit::Int(i128::from(v.discriminant))),
+            };
+            let cond = Expr {
+                ty: bool_ty,
+                span,
+                kind: ExprKind::Binary(ast::BinOp::Eq, Box::new(read(span)), Box::new(d)),
+            };
+            chain = Expr {
+                ty: out,
+                span,
+                kind: ExprKind::If {
+                    cond: Box::new(cond),
+                    then: Block { stmts: Vec::new(), tail: Some(Box::new(some)), ty: out, span },
+                    else_: Some(Box::new(chain)),
+                },
+            };
+        }
+        Expr {
+            ty: out,
+            span,
+            kind: ExprKind::Block(Block {
+                stmts: vec![bind],
+                tail: Some(Box::new(chain)),
+                ty: out,
+                span,
+            }),
         }
     }
 

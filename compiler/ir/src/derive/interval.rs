@@ -2698,7 +2698,7 @@ fn float_int_range(from: Scalar, to: Scalar) -> (f64, f64) {
 /// each variant's payload (a `u32` zero for none), in the enum's field order.
 fn range_ty(types: &mut Types, ty: TypeId) -> TypeId {
     match types.get(ty).clone() {
-        TypeDef::Enum { name, variants } => {
+        TypeDef::Enum { name, variants, .. } => {
             let u32t = types.u32();
             let mut fields = vec![("tag".to_string(), u32t)];
             for (v, p) in variants {

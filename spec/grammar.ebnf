@@ -64,7 +64,7 @@ borrow_struct    ::= "borrow" "struct" IDENT generic_params? "{" (borrow_field (
 borrow_field     ::= vis? IDENT ":" ("borrow" | "mut")? type
 
 enum_item        ::= "enum" IDENT generic_params? (":" bounds)? "{" (variant ("," variant)* ","?)? NEWLINE? "}"
-variant          ::= IDENT ("(" (type ("," type)* ","?)? ")" | field_block)?
+variant          ::= IDENT ("(" (type ("," type)* ","?)? ")" | field_block | "=" INT)?
 
 # `trait Sim = Clone + StateHash` names a set of traits (language.md §7).
 trait_item       ::= "trait" IDENT generic_params? ((":" bounds)? "{" sep* (trait_member (sep+ trait_member)* sep*)? "}" | "=" bounds)

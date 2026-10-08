@@ -165,6 +165,7 @@ codes! {
     E0331 = "E0331", "a `const` generic parameter that isn't a `u32`";
     E0332 = "E0332", "a constant of a type that can't live as long as the program";
     E0333 = "E0333", "a call's result thrown away, where the call does nothing else";
+    E0334 = "E0334", "an enum discriminant that isn't valid";
 
     // ---- E04xx: traits and generics --------------------------------------------------------
     E0400 = "E0400", "a type that doesn't implement a trait";

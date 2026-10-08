@@ -1,0 +1,50 @@
+// accepts: enum.discriminants
+// An enum whose variants hold nothing has discriminants, written or one past the variant's
+// before: its tag on the CPU and the GPU, and its `u32`. `E::from_u32` reads one back, a
+// `Fieldless` enum's generic code converts it too (`Flags`), and an export takes one as its
+// number.
+use std::collections::Flags
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch}
+
+enum Way: Copy + Eq + Ord + GpuData + Fieldless {
+    Near,
+    Far,
+    Volume = 7,
+    Gone,
+    Hidden = 30,
+}
+
+struct Pick: Copy + GpuData {
+    way: Way,
+    seen: Flags<Way>,
+}
+
+/// Each way's number, and whether it was seen.
+@compute(64)
+fn number(picks: [Pick], out: mut Slots<u32>, id: GlobalId) {
+    let p = picks[id.x]
+    out[id] = u32(p.way) + if p.seen.has(p.way) { 100 } else { 0 }
+}
+
+/// The largest discriminant of `ways`.
+fn largest<E: Fieldless + Copy>(ways: [E]) -> u32 {
+    var most = 0
+    for w in ways {
+        most = max(most, u32(w))
+    }
+    most
+}
+
+pub fn back(n: u32) -> bool {
+    Way::from_u32(n) == Some(Way::Hidden) && Way::Near < Way::Hidden
+}
+
+pub fn shown(w: Way) -> u32 {
+    largest([w, Way::Gone])
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    let picks: GpuBuffer<Pick> = buffer(64)
+    var out: GpuBuffer<u32> = buffer(64)
+    dispatch(number.bind(picks, mut out), over: 64)
+}

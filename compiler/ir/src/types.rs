@@ -78,13 +78,15 @@ pub enum TypeDef {
         name: String,
         fields: Vec<(String, TypeId)>,
     },
-    /// A tag and one variant's payload. Field 0 is the tag (a `u32`, the variant's index) and
-    /// field `1 + v` variant `v`'s payload, if it has one. On the CPU the payloads share their
-    /// memory, so the size is the tag's and the largest payload's; WGSL has no unions, so on
-    /// the GPU each payload has its own member (an enum never crosses between them).
+    /// A tag and one variant's payload. Field 0 is the tag (a `u32`: variant `v`'s is
+    /// `tags[v]`, its discriminant) and field `1 + v` variant `v`'s payload, if it has one. On
+    /// the CPU the payloads share their memory, so the size is the tag's and the largest
+    /// payload's; WGSL has no unions, so on the GPU each payload has its own member (an enum
+    /// never crosses between them).
     Enum {
         name: String,
         variants: Vec<(String, Option<TypeId>)>,
+        tags: Vec<u32>,
     },
     Array(TypeId, u32),
     /// `array<T>` in a storage buffer (GPU only).
@@ -188,6 +190,14 @@ impl Types {
             TypeDef::Scalar(s) | TypeDef::Vector(s, _) => Some(*s),
             TypeDef::Matrix(_) => Some(Scalar::F32),
             _ => None,
+        }
+    }
+
+    /// The tag variant `k` of enum `t` writes: its discriminant.
+    pub fn tag(&self, t: TypeId, k: u32) -> u32 {
+        match self.get(t) {
+            TypeDef::Enum { tags, .. } => tags.get(k as usize).copied().unwrap_or(k),
+            _ => k,
         }
     }
 

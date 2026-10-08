@@ -12,7 +12,7 @@ pub fn print(m: &Module) -> String {
                 fields.iter().map(|(n, t)| format!("{n}: {}", m.types.display(*t))).collect();
             let _ = writeln!(s, "type %{i} = struct {name} {{ {} }}", fs.join(", "));
         }
-        if let TypeDef::Enum { name, variants } = d {
+        if let TypeDef::Enum { name, variants, .. } = d {
             let vs: Vec<String> = variants
                 .iter()
                 .map(|(n, p)| match p {

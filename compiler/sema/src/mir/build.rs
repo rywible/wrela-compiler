@@ -1557,7 +1557,17 @@ impl<'a> Builder<'a> {
                         let u32_ty = self.p.types.u32;
                         let d =
                             self.temp_of(Rvalue::Discriminant(place.clone()), u32_ty, pat.span)?;
-                        let k = constant(Lit::Int(i128::from(*v)), u32_ty, pat.span);
+                        // The variant's tag: its discriminant (§3).
+                        let tag = match self.p.types.kind(pat.ty) {
+                            TyKind::Adt(a, _) => self
+                                .p
+                                .adt(*a)
+                                .variants()
+                                .get(*v as usize)
+                                .map_or(*v, |d| d.discriminant),
+                            _ => *v,
+                        };
+                        let k = constant(Lit::Int(i128::from(tag)), u32_ty, pat.span);
                         tests.push(self.temp_of(
                             Rvalue::Binary(BinOp::Eq, d, k),
                             bool_ty,

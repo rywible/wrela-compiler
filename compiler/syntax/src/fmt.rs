@@ -861,7 +861,11 @@ impl<'a> Builder<'a> {
                 concat([text(" "), self.fields(fields, false, v.span.end)])
             }
         };
-        concat([name, kind])
+        let discriminant = match &v.discriminant {
+            Some(d) => concat([text(" "), self.tok("="), text(" "), self.tok(&d.text)]),
+            None => nil(),
+        };
+        concat([name, kind, discriminant])
     }
 
     fn fn_decl(&mut self, f: &FnDecl) -> Doc {

@@ -538,6 +538,82 @@ impl<T: Eq, const N: u32> Eq for Bounded<T, N> {
     }
 }
 
+/// A set of an enum's variants, whose variants hold nothing (`Fieldless`, §3): one bit a
+/// variant, bit `u32(e)` for `e`, so an enum whose discriminants are below 32 (one past it traps
+/// on the CPU). One `u32`, which crosses to a host or the GPU as itself (`bits()`, `of_bits`),
+/// and GPU code reads and changes it as CPU code does.
+///
+/// ```wrela
+/// use std::collections::Flags
+///
+/// enum System: Copy + Eq + Fieldless {
+///     Trees,
+///     Grass,
+///     Sky,
+/// }
+///
+/// let off = Flags::none().with(System::Grass).with(System::Sky)
+/// assert(off.has(System::Sky) && !off.has(System::Trees))
+/// assert(off.bits() == 6 && off.without(System::Sky).bits() == 2)
+/// ```
+pub struct Flags<E: Fieldless>: Copy + Plain + GpuData {
+    bits: u32,
+}
+
+impl<E: Fieldless> Flags<E> {
+    /// No variant.
+    pub fn none() -> Flags<E> {
+        Flags { bits: 0 }
+    }
+
+    /// The set whose bits are `bits`: a host's or a test's, which crosses as one `u32`.
+    pub fn of_bits(bits: u32) -> Flags<E> {
+        Flags { bits }
+    }
+
+    /// Its bits: variant `e`'s is `1 << u32(e)`.
+    pub fn bits(self) -> u32 {
+        self.bits
+    }
+
+    /// Whether `e` is in it.
+    pub fn has(self, e: E) -> bool {
+        self.bits & bit(e) != 0
+    }
+
+    /// It with `e`.
+    pub fn with(self, e: E) -> Flags<E> {
+        Flags { bits: self.bits | bit(e) }
+    }
+
+    /// It without `e`.
+    pub fn without(self, e: E) -> Flags<E> {
+        Flags { bits: self.bits & !bit(e) }
+    }
+
+    /// It with `e` if it hasn't `e`, and without it if it has.
+    pub fn toggled(self, e: E) -> Flags<E> {
+        Flags { bits: self.bits ^ bit(e) }
+    }
+
+    /// The variants in one of it and `other` but not both.
+    pub fn changed(self, other: Flags<E>) -> Flags<E> {
+        Flags { bits: self.bits ^ other.bits }
+    }
+}
+
+impl<E: Fieldless> Eq for Flags<E> {
+    fn eq(self, other: Flags<E>) -> bool {
+        self.bits == other.bits
+    }
+}
+
+/// Variant `e`'s bit in a `Flags`. A discriminant past 31 has none: the shift traps on the CPU,
+/// as any shift by 32 or more does (§11), and GPU code may use it.
+fn bit<E: Fieldless>(e: E) -> u32 {
+    1 << u32(e)
+}
+
 /// Sorts `xs`, an array's elements or a run's, by `before`, which says whether its first
 /// argument goes before its second. Stable, O(n log n): it sorts a copy of the elements, a
 /// `Vec` allocated for the call, with `Vec::sort_by`, which sorts a `Vec` of any `T`.

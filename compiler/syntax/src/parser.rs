@@ -1250,6 +1250,7 @@ impl<'a> Parser<'a> {
     }
 
     /// enum_item ::= "enum" IDENT generic_params? (":" bounds)? "{" (variant ("," variant)* ","?)? NEWLINE? "}"
+    /// variant ::= IDENT ("(" (type ("," type)* ","?)? ")" | field_block | "=" INT)?
     fn parse_enum(&mut self) -> PResult<EnumDecl> {
         self.expect(T::Enum, "`enum`")?;
         let name = self.ident("an enum name")?;
@@ -1273,7 +1274,13 @@ impl<'a> Parser<'a> {
                 } else {
                     VariantKind::Unit
                 };
-                Ok(Variant { name, kind, span: start.to(p.prev_span()) })
+                let discriminant = if kind == VariantKind::Unit && p.eat(T::Eq) {
+                    let t = p.expect(T::Int, "an integer, the variant's discriminant")?;
+                    Some(p.lit_of(t))
+                } else {
+                    None
+                };
+                Ok(Variant { name, kind, discriminant, span: start.to(p.prev_span()) })
             },
             // A variant whose name parsed is kept, with fields of unknown types.
             |p, first, span| {
@@ -1287,7 +1294,7 @@ impl<'a> Parser<'a> {
                     Some(T::LBrace) => VariantKind::Struct(Vec::new()),
                     _ => VariantKind::Unit,
                 };
-                Some(Variant { name, kind, span })
+                Some(Variant { name, kind, discriminant: None, span })
             },
         );
         self.close_list(T::RBrace, "`,` or `}`");

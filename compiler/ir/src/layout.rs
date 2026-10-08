@@ -300,6 +300,7 @@ mod tests {
                 ("Small".into(), Some(small)),
                 ("Wide".into(), Some(wide)),
             ],
+            tags: vec![0, 1, 2],
         });
         // The payloads overlap after the tag, aligned for the most aligned one: 16 + 48.
         assert_eq!(layout(&t, e), Layout { size: 64, align: 16 });

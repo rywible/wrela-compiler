@@ -243,6 +243,8 @@ pub enum VariantKind {
 pub struct Variant {
     pub name: Ident,
     pub kind: VariantKind,
+    /// `Hidden = 99`: a fieldless variant's discriminant, its tag and its `u32` (§3).
+    pub discriminant: Option<Lit>,
     pub span: Span,
 }
 

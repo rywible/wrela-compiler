@@ -483,7 +483,7 @@ fn write_const(
             put(&a.to_le_bytes())
         }
         (ir::TypeDef::Enum { .. }, ir::ConstValue::Variant(k, payload)) => {
-            put(&k.to_le_bytes());
+            put(&types.tag(t, *k).to_le_bytes());
             if let Some(p) = payload {
                 let pt = types.field(t, 1 + k).ok_or("internal: a variant with no payload")?;
                 let off = ir::layout::field_offsets(types, t)[1 + *k as usize] as usize;

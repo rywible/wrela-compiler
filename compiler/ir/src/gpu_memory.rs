@@ -120,12 +120,12 @@ impl TypeMap {
                 let fields = fields.into_iter().map(|(n, f)| (n, self.part(types, t, f))).collect();
                 types.intern(TypeDef::Struct { name, fields })
             }
-            TypeDef::Enum { name, variants } => {
+            TypeDef::Enum { name, variants, tags } => {
                 let variants = variants
                     .into_iter()
                     .map(|(n, p)| (n, p.map(|p| self.part(types, t, p))))
                     .collect();
-                types.intern(TypeDef::Enum { name, variants })
+                types.intern(TypeDef::Enum { name, variants, tags })
             }
             TypeDef::Array(e, n) => {
                 let e = self.part(types, t, e);
@@ -410,7 +410,8 @@ impl Rewriter<'_> {
     fn variant(&mut self, t: TypeId, v: u32, payload: Option<ValueId>, out: &mut Block) -> Expr {
         let st = self.stored(t);
         let shape = words_shape(&mut self.m.types, t);
-        let tag = self.u32_const(out, v);
+        let tag = self.m.types.tag(t, v);
+        let tag = self.u32_const(out, tag);
         let words = match payload {
             None => self.val(out, shape.array, Expr::Zero(shape.array)),
             Some(x) => {

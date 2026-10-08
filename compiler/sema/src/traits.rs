@@ -450,6 +450,23 @@ pub fn implements_builtin(p: &Program, ty: TyId, lang: Lang) -> bool {
 }
 
 fn implements_builtin_uncached(p: &Program, ty: TyId, lang: Lang) -> bool {
+    // An enum whose variants hold nothing, which declares it.
+    if lang == Lang::Fieldless {
+        return match p.types.kind(ty) {
+            TyKind::Error | TyKind::Never => true,
+            TyKind::Adt(a, _) => {
+                let adt = p.adt(*a);
+                adt.is_enum()
+                    && adt.variants().iter().all(|v| v.fields.is_empty())
+                    && implements_builtin_declared(p, *a, lang)
+            }
+            TyKind::Param(_) | TyKind::Opaque(..) | TyKind::Projection { .. } => {
+                let Some(want) = p.lang_trait(lang) else { return false };
+                declared_bounds(p, ty).is_some_and(|bs| bs.iter().any(|b| b.trait_ == want))
+            }
+            _ => false,
+        };
+    }
     match p.types.kind(ty) {
         TyKind::Error | TyKind::Never => true,
         // GPU memory holds one as a `u32` (`ir::gpu_memory`).

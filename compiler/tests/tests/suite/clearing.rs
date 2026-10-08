@@ -24,7 +24,8 @@ const LEAVES: u32 = 3;
 const BARK: u32 = 4;
 const CREATURE: u32 = 5;
 
-/// What frames leave out and how they're shown (main.wrela's and testing.wrela's constants).
+/// What frames leave out and how they're shown: main.wrela's `System`, each its discriminant's
+/// bit, and testing.wrela's `View`, each its discriminant.
 mod off {
     pub const TREES: i32 = 1;
     pub const GRASS: i32 = 2;

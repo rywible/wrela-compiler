@@ -369,6 +369,7 @@ pub fn lower(
         let name = cx.checked.program.func(f).name.clone();
         has_frame |= name == wrela_abi::EXPORT_FRAME;
         if cx.check_export(f, state.map(|s| s.1)) {
+            let id = enum_wrapper(&cx, &mut cpu, f, id);
             let id = match (cpu.m.state, state) {
                 (Some(d), Some((init, _))) if f == init => state_wrapper(&mut cpu, id, d, true),
                 (Some(d), Some((_, s)))
@@ -700,11 +701,13 @@ impl<'a> Cx<'a> {
         let skip = usize::from(takes_state);
         for p in &def.params[skip..] {
             let k = self.checked.program.types.kind(p.ty);
-            if !matches!(k, TyKind::Bool | TyKind::Int(_) | TyKind::Float(_) | TyKind::Vec(..)) {
+            let scalar =
+                matches!(k, TyKind::Bool | TyKind::Int(_) | TyKind::Float(_) | TyKind::Vec(..));
+            if !scalar && fieldless_enum(&self.checked.program, p.ty).is_none() {
                 ok = false;
                 let shown = self.checked.program.display_ty(p.ty);
                 self.err(
-                    Diagnostic::new(wrela_diag::codes::E0703, p.span, format!("`{}` is exported from the program, so its parameters are numbers, bools or vectors; `{}` is a `{shown}`", def.name, p.name))
+                    Diagnostic::new(wrela_diag::codes::E0703, p.span, format!("`{}` is exported from the program, so its parameters are numbers, bools, vectors or enums whose variants hold nothing; `{}` is a `{shown}`", def.name, p.name))
                         .with_note("the entry module's `pub fn`s are the program's exports, called by the host")
                         .with_help("make it private (drop `pub`) if the host doesn't call it"),
                 );
@@ -825,6 +828,92 @@ fn state_type(checked: &Checked) -> Option<(FnId, TyId)> {
             && !p.types.is_unit(f.ret))
         .then_some((FnId(i as u32), f.ret))
     })
+}
+
+/// The enum `t` is, if its variants hold nothing: it crosses the WASM boundary as its `u32`
+/// discriminant (§3).
+fn fieldless_enum(p: &wrela_sema::program::Program, t: TyId) -> Option<wrela_sema::ty::AdtId> {
+    let &TyKind::Adt(a, _) = p.types.kind(t) else { return None };
+    let adt = p.adt(a);
+    (adt.is_enum() && adt.variants().iter().all(|v| v.fields.is_empty())).then_some(a)
+}
+
+/// An export whose enum parameters cross as their `u32` discriminants: it makes each enum from
+/// its discriminant (a trap, for a number no variant has) and runs `inner`, export `f`'s code.
+/// `inner` itself, if `f` takes no enum.
+fn enum_wrapper(cx: &Cx, mb: &mut ModuleBuilder, f: FnId, inner: ir::FuncId) -> ir::FuncId {
+    let p = &cx.checked.program;
+    let enums: Vec<Option<Vec<u32>>> = p
+        .func(f)
+        .params
+        .iter()
+        .map(|ps| {
+            let a = fieldless_enum(p, ps.ty)?;
+            Some(p.adt(a).variants().iter().map(|v| v.discriminant).collect())
+        })
+        .collect();
+    if enums.iter().all(Option::is_none) {
+        return inner;
+    }
+    let u32_ty = mb.m.types.u32();
+    let bool_ty = mb.m.types.bool();
+    let g = &mb.m.functions[inner.index()];
+    let name = format!("{}_enums", g.name);
+    let (inner_params, ret, ret_ref) = (g.params.clone(), g.ret, g.ret_ref);
+    let params: Vec<ir::Param> = inner_params
+        .iter()
+        .zip(&enums)
+        .map(|(q, e)| match e {
+            Some(_) => {
+                ir::Param { name: q.name.clone(), ty: u32_ty, by_ref: false, mutable: false }
+            }
+            None => q.clone(),
+        })
+        .collect();
+    let mut w = ir::Function::new(name, params, ret);
+    w.ret_ref = ret_ref;
+    let mut body = Vec::new();
+    let mut args = Vec::new();
+    for (i, (q, tags)) in inner_params.iter().zip(&enums).enumerate() {
+        let Some(tags) = tags else {
+            args.push(w.param_arg(i as u32, &mut body));
+            continue;
+        };
+        // The variant whose discriminant the number is, into a local: a chain of tests, the
+        // last a trap.
+        let n = w.let_(&mut body, u32_ty, ir::Expr::Param(i as u32));
+        let local = w.new_local(q.name.clone(), q.ty);
+        let mut chain = vec![ir::Stmt::Trap];
+        for (k, &tag) in tags.iter().enumerate().rev() {
+            let mut test = Vec::new();
+            let d = w.let_(&mut test, u32_ty, ir::Expr::Const(ir::Const::U32(tag)));
+            let eq = w.let_(&mut test, bool_ty, ir::Expr::Binary(ir::BinOp::Eq, n, d));
+            let mut then = Vec::new();
+            let v = w.let_(&mut then, q.ty, ir::Expr::Variant(q.ty, k as u32, None));
+            then.push(ir::Stmt::Store(ir::Place::local(local), v));
+            test.push(ir::Stmt::If { cond: eq, then, else_: chain });
+            chain = test;
+        }
+        body.extend(chain);
+        if q.by_ref {
+            args.push(ir::Arg::Place(ir::Place::local(local)));
+        } else {
+            let v = w.let_(&mut body, q.ty, ir::Expr::Load(ir::Place::local(local)));
+            args.push(ir::Arg::Value(v));
+        }
+    }
+    match ret {
+        Some(t) => {
+            let r = w.let_(&mut body, t, ir::Expr::Call(inner, args));
+            body.push(ir::Stmt::Return(Some(r)));
+        }
+        None => {
+            body.push(ir::Stmt::Eval(ir::Expr::Call(inner, args)));
+            body.push(ir::Stmt::Return(None));
+        }
+    }
+    w.body = body;
+    mb.m.add_function(w)
 }
 
 /// An export that runs `inner` on the program's state, in data `state`: with `init`, it stores

@@ -118,6 +118,11 @@ pub trait Copy: Clone {}
 /// (§6.10). Opted in; every field must be `GpuData`.
 pub trait GpuData {}
 
+/// An enum whose variants hold nothing: each is its discriminant, which `u32(e)` gives and
+/// `E::from_u32(n)` reads back (§3). Declared like `Copy`, and checked: no variant has fields.
+/// Generic code over one (`std::collections::Flags`) converts it as a concrete one does.
+pub trait Fieldless {}
+
 /// Data that can be handled as raw bytes: no pointers, padding zeroed, NaNs canonical, so a
 /// value's bytes are a function of its fields (§6.10). Declared like `Copy`, and checked: every
 /// field must be `Plain`. `Vec`, `String` and `Box` aren't.
