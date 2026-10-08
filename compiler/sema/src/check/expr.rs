@@ -1517,6 +1517,8 @@ impl<'p> Checker<'p> {
             TyKind::Error => self.p.types.error,
             _ if let Some(t) = self.vec_elem(b.ty) => t,
             TyKind::Adt(a, args) if self.p.is_lang_adt(*a, Lang::Bounded) => args[0],
+            // A buffer's elements, in GPU code (§12; CPU code can't read them, E0607).
+            TyKind::Adt(a, args) if self.p.is_lang_adt(*a, Lang::GpuSpan) => args[0],
             _ => {
                 let shown = self.display(b.ty);
                 self.err(Diagnostic::new(

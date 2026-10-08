@@ -54,6 +54,11 @@ pub const MAX_WORKGROUP_INVOCATIONS: u32 = Limits::DEFAULT.max_workgroup_invocat
 pub const MAX_STORAGE_BUFFERS_PER_STAGE: usize =
     Limits::DEFAULT.max_storage_buffers_per_stage as usize;
 pub const MAX_UNIFORM_BUFFER_BINDING_SIZE: u32 = Limits::DEFAULT.max_uniform_buffer_binding_size;
+/// WebGPU's default limits on what one shader stage binds (`maxSampledTexturesPerShaderStage`,
+/// `maxSamplersPerShaderStage`, `maxStorageTexturesPerShaderStage`).
+pub const MAX_SAMPLED_TEXTURES_PER_STAGE: usize = 16;
+pub const MAX_SAMPLERS_PER_STAGE: usize = 16;
+pub const MAX_STORAGE_TEXTURES_PER_STAGE: usize = 4;
 
 /// Whether a file the manifest names is one in the build directory, as both hosts read it: a
 /// name of letters, digits, `_`, `-` and `.`, not starting with `.`. Not a path that leaves

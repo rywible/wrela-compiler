@@ -301,6 +301,7 @@ lang_items! {
     TextureWidth = "std::gpu::texture_width",
     TextureHeight = "std::gpu::texture_height",
     TextureDepth = "std::gpu::texture_depth",
+    SpanLen = "std::gpu::span_len",
     ReadBufferCommand = "std::gpu::read_buffer_command",
     NextRequest = "std::io::next_request",
     RequestStatus = "std::io::request_status",

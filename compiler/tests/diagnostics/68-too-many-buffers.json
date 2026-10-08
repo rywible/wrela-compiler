@@ -12,7 +12,8 @@
       "labels": [],
       "message": "the `@compute` kernel `sum` binds 9 storage buffers, and a WebGPU stage can have at most 8",
       "notes": [
-        "each `[T]` and `Slots<T>` parameter is a storage buffer"
+        "each `[T]`, `GpuSpan<T>` and `Slots<T>` it takes is a storage buffer, in a group too",
+        "`out` is the first past the limit"
       ],
       "severity": "error",
       "span": {

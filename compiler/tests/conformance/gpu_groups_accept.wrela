@@ -1,0 +1,90 @@
+// accepts: gpu.groups gpu.textures
+// A group of textures, a sampler, a buffer's span and values is one parameter of a shader, which
+// passes it on whole, passes its fields on, and builds a group of its own; CPU code builds it
+// once and binds it to each draw.
+use std::gpu::{
+    ClipPosition, FragCoord, GpuBuffer, GpuSpan, Sampler, Texture, VertexIndex, begin_screen_pass,
+    buffer, draw, present, sampler, texture, write,
+}
+
+struct Tint: Copy + GpuData {
+    colour: vec3,
+    strength: f32,
+}
+
+/// What every surface reads.
+borrow struct Shading {
+    tint: Tint,
+    albedo: borrow Texture,
+    s: borrow Sampler,
+    weights: GpuSpan<f32>,
+    detail: Detail,
+}
+
+borrow struct Detail {
+    noise: borrow Texture,
+    scale: f32,
+}
+
+struct State {
+    albedo: Texture,
+    noise: Texture,
+    s: Sampler,
+    weights: GpuBuffer<f32>,
+}
+
+@vertex
+fn cover(v: VertexIndex) -> ClipPosition {
+    let x = f32((v.index << 1) & 2) * 2.0 - 1.0
+    let y = f32(v.index & 2) * 2.0 - 1.0
+    ClipPosition { position: vec4(x, y, 0.5, 1.0) }
+}
+
+/// A run's sum, as a `[f32]` takes it.
+@gpu
+fn total(xs: [f32]) -> f32 {
+    var t = 0.0
+    for x in xs {
+        t += x
+    }
+    t
+}
+
+@gpu
+fn detail_at(d: Detail, s: Sampler, uv: vec2) -> f32 {
+    d.noise.sample_level(s, uv * d.scale, level: 0.0).r
+}
+
+@gpu
+fn shade_at(sh: Shading, uv: vec2) -> vec3 {
+    let base = sh.albedo.sample_level(sh.s, uv, level: 0.0).rgb
+    let w = total(sh.weights) / f32(sh.weights.len()) + sh.weights[0]
+    let coarser = Detail { noise: sh.detail.noise, scale: sh.detail.scale * 0.5 }
+    base * w * detail_at(sh.detail, sh.s, uv) * detail_at(coarser, sh.s, uv) +
+        sh.tint.colour * sh.tint.strength
+}
+
+@fragment
+fn surface(p: FragCoord, sh: Shading) -> vec4 {
+    vec4(shade_at(sh, p.position.xy / 64.0), 1.0)
+}
+
+pub fn init() -> State {
+    var weights = buffer(4)
+    write(mut weights, 0, [0.25, 0.25, 0.25, 0.25])
+    State { albedo: texture(width: 4, height: 4), noise: texture(width: 4, height: 4), s: sampler(), weights }
+}
+
+pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
+    let sh = Shading {
+        tint: Tint { colour: vec3(0.1, 0.0, 0.0), strength: time },
+        albedo: s.albedo,
+        s: s.s,
+        weights: s.weights.span(start: 0, count: 4),
+        detail: Detail { noise: s.noise, scale: 2.0 },
+    }
+    begin_screen_pass(clear: vec4(0.0, 0.0, 0.0, 1.0))
+    draw(cover, surface.bind(sh), vertices: 3)
+    draw(cover, surface.bind(sh: sh), vertices: 3)
+    present()
+}

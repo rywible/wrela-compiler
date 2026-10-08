@@ -1,6 +1,6 @@
 //! Types: from the checker's to the IR's, and instance signatures.
 
-use crate::instance::{Callable, InstanceKey};
+use crate::instance::{Bound, Callable, InstanceKey};
 use crate::{Cx, ModuleBuilder};
 use wrela_diag::{Diagnostic, Span, codes};
 use wrela_ir as ir;
@@ -434,10 +434,44 @@ impl<'a> Cx<'a> {
 
     /// The resource a closure's capture `l` is, on the GPU: a buffer parameter of `owner`, which
     /// the closure's instance names as its owner's does, rather than taking it.
-    pub fn capture_resource(&self, owner: &InstanceKey, l: Local) -> Option<ir::ResourceId> {
+    pub fn capture_resource(&self, owner: &InstanceKey, l: Local) -> Option<Bound> {
         let body = self.checked.mir.get(&owner.source_fn()?)?;
         let i = body.fns[0].params.iter().position(|&p| p == l)?;
-        owner.resources().get(i).copied().flatten()
+        owner.resources().get(i).cloned().flatten()
+    }
+
+    /// The IR parameters a group parameter (§12) adds, bound as `b` binds it: one for each
+    /// value field, in order, through its group fields (`Fl::pass_group`).
+    fn group_params(
+        &mut self,
+        mb: &mut ModuleBuilder,
+        ty: TyId,
+        b: &Bound,
+        name: &str,
+        span: Span,
+    ) -> Vec<ir::Param> {
+        let Bound::Group(bs) = b else { return Vec::new() };
+        let names: Vec<String> = match self.checked.program.types.kind(ty) {
+            TyKind::Adt(a, _) => {
+                self.checked.program.adt_fields(*a, None).iter().map(|f| f.name.clone()).collect()
+            }
+            _ => Vec::new(),
+        };
+        let mut out = Vec::new();
+        for (j, ft) in crate::gpu::group_fields(self, ty).into_iter().enumerate() {
+            let field = format!("{name}_{}", names.get(j).map_or("", String::as_str));
+            match bs.get(j).cloned().flatten() {
+                Some(Bound::One(_)) => {}
+                Some(g @ Bound::Group(_)) => {
+                    out.extend(self.group_params(mb, ft, &g, &field, span));
+                }
+                None => {
+                    let Some(t) = self.lower_ty(mb, ft, span) else { continue };
+                    out.push(ir::Param { name: field, ty: t, by_ref: false, mutable: false });
+                }
+            }
+        }
+        out
     }
 
     /// The parameters a callable adds to a function it's passed to: its captures.
@@ -471,8 +505,14 @@ impl<'a> Cx<'a> {
                         }
                         continue;
                     }
-                    if resources.get(i).is_some_and(|r| r.is_some()) {
-                        continue;
+                    match resources.get(i) {
+                        Some(Some(Bound::One(_))) => continue,
+                        Some(Some(b @ Bound::Group(_))) => {
+                            let b = b.clone();
+                            params.extend(self.group_params(mb, t, &b, &p.name, p.span));
+                            continue;
+                        }
+                        _ => {}
                     }
                     let Some(ty) = self.lower_ty(mb, t, p.span) else { continue };
                     let (by_ref, mutable) =

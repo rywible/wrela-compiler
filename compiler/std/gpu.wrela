@@ -57,6 +57,16 @@ pub borrow struct GpuSpan<T> {
     pub count: u32,
 }
 
+impl<T: GpuData> GpuSpan<T> {
+    /// How many elements it holds: in GPU code too, where it's read as a `[T]` (§12).
+    pub fn len(self) -> u32 {
+        span_len(self)
+    }
+}
+
+@intrinsic
+fn span_len<T>(s: GpuSpan<T>) -> u32 {}
+
 /// A run of a GPU buffer's elements, to change.
 pub borrow struct GpuSpanMut<T> {
     pub buffer: mut GpuBuffer<T>,

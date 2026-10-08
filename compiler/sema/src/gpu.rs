@@ -2,7 +2,7 @@
 //! what each stage may take and return, and that a kernel's `mut` parameters are safe to share
 //! across invocations. Lowering then only sees signatures it can map to WGSL.
 
-use crate::defs::{Entry, FieldDef, Lang, Mode};
+use crate::defs::{Entry, FieldDef, Lang, Mode, RetMode};
 use crate::program::Program;
 use crate::ty::{FloatTy, FnId, IntTy, TyId, TyKind, VecElem};
 use wrela_diag::{Diagnostic, codes};
@@ -139,6 +139,84 @@ pub fn not_gpu_data(p: &Program, param: &str, ty: TyId, span: wrela_diag::Span) 
     d
 }
 
+/// Whether `t` is a group (§12): a borrow struct (not one std gives a meaning, as `GpuSpan`),
+/// which GPU code takes as its fields: their bindings and values.
+pub fn is_group(p: &Program, t: TyId) -> bool {
+    matches!(p.types.kind(t), TyKind::Adt(a, _) if p.adt(*a).borrow && p.adt(*a).lang.is_none())
+}
+
+/// What an entry point can't take in group `t`, reached as `path` (`lit.probes`): each field
+/// is a texture or sampler, borrowed; a `GpuSpan<T>` of `GpuData`; a `GpuData` value; or a
+/// group. A group passes what the GPU reads, so nothing in it is `mut`.
+fn check_group(
+    p: &Program,
+    path: &str,
+    t: TyId,
+    span: wrela_diag::Span,
+    stage: &str,
+    out: &mut Vec<Diagnostic>,
+) {
+    let TyKind::Adt(a, args) = p.types.kind(t) else { return };
+    let defs = p.adt_fields(*a, None);
+    let tys = p.fields_of(*a, args, None);
+    for (d, &ft) in defs.iter().zip(&tys) {
+        let at = format!("{path}.{}", d.name);
+        let lang = p.lang_of_ty(ft);
+        if d.mode == RetMode::Mut || lang == Some(Lang::GpuSpanMut) {
+            out.push(
+                Diagnostic::new(
+                    codes::E0602,
+                    span,
+                    format!("{stage} can't take `{at}`: a group passes what the GPU reads, and `{at}` is written"),
+                )
+                .with_help("pass what the GPU writes as a parameter of its own"),
+            );
+        } else if lang.is_some_and(Lang::is_texture_or_sampler) {
+            if d.mode == RetMode::Owned {
+                out.push(Diagnostic::new(
+                    codes::E0602,
+                    span,
+                    format!("`{at}` holds a `{}` by value; a group borrows it", p.display_ty(ft)),
+                ));
+            }
+        } else if lang == Some(Lang::GpuSpan) {
+            if let TyKind::Adt(_, sargs) = p.types.kind(ft)
+                && let Some(&elem) = sargs.first()
+                && !p.types.has_params(elem)
+                && !crate::traits::implements_builtin(p, elem, Lang::GpuData)
+            {
+                let mut d = not_gpu_data(p, &at, elem, span);
+                d.message = format!(
+                    "`{at}` is a span of `{}`, which isn't `GpuData`, so its elements can't go to the GPU",
+                    p.display_ty(elem)
+                );
+                out.push(d);
+            }
+        } else if lang.is_some_and(Lang::is_invocation_safe) {
+            out.push(Diagnostic::new(
+                codes::E0602,
+                span,
+                format!("{stage} can't take `{at}` in a group: it's written through"),
+            ));
+        } else if is_group(p, ft) {
+            check_group(p, &at, ft, span, stage, out);
+        } else if let TyKind::Slice(_) = p.types.kind(ft) {
+            out.push(
+                Diagnostic::new(
+                    codes::E0602,
+                    span,
+                    format!("`{at}` is a run of the CPU's memory, which the GPU can't read"),
+                )
+                .with_help("hold the buffer's elements as a `GpuSpan<T>`"),
+            );
+        } else if !p.types.has_params(ft)
+            && !crate::traits::implements_builtin(p, ft, Lang::GpuData)
+        {
+            out.push(not_gpu_data(p, &at, ft, span));
+        }
+    }
+}
+
 fn check_entry(p: &Program, f: FnId, entry: Entry, out: &mut Vec<Diagnostic>) {
     let def = p.func(f);
     let stage = entry.describe();
@@ -262,10 +340,15 @@ fn check_entry(p: &Program, f: FnId, entry: Entry, out: &mut Vec<Diagnostic>) {
         // Data passed by value travels as a uniform, so its layout must be the GPU's. Only a
         // fragment shader takes the vertex output.
         let varyings = entry == Entry::Fragment && clip_position_fields(p, ps.ty).next().is_some();
-        let resource = lang.is_some_and(Lang::is_texture_or_sampler);
+        let resource = lang.is_some_and(Lang::is_texture_or_sampler) || lang == Some(Lang::GpuSpan);
+        let group = is_group(p, ps.ty);
+        if group {
+            check_group(p, &ps.name, ps.ty, ps.span, stage, out);
+        }
         let passed = builtin_stage.is_none()
             && !slots
             && !resource
+            && !group
             && !varyings
             && !matches!(p.types.kind(ps.ty), TyKind::Slice(_))
             && !p.types.has_params(ps.ty);

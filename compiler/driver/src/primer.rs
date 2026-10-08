@@ -177,6 +177,10 @@ pub const RULES: &[(&str, &str)] = &[
         "gpu.textures",
         "textures are sampled in fragment shaders, read anywhere on the GPU, drawn into in passes",
     ),
+    (
+        "gpu.groups",
+        "a borrow struct of textures, samplers, spans and `GpuData` values is one GPU parameter",
+    ),
     ("gpu.cpu", "GPU builtins and derivatives only in GPU code"),
     ("gpu.workgroup", "workgroup sizes within WebGPU's limits"),
     ("gpu.uniformity", "derivatives only where every pixel reaches them (uniform control flow)"),

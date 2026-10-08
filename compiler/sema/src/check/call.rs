@@ -973,9 +973,17 @@ impl<'p> Checker<'p> {
     }
 
     /// Argument coercions: an array or a `Vec` passes as a run (`[T; N]` and `Vec<T>` to
-    /// `[T]`), and a `Text` or a `String` as a `str`; otherwise unify.
+    /// `[T]`), a `GpuSpan<T>` too (in GPU code, where it's its buffer's elements, §12; CPU code
+    /// can't read them, E0607), and a `Text` or a `String` as a `str`; otherwise unify.
     fn coerce_arg(&mut self, e: &Expr, param_ty: TyId) {
         if matches!(self.kind(param_ty), TyKind::Str) && self.is_stringy(e.ty) {
+            return;
+        }
+        if let TyKind::Slice(b) = *self.kind(param_ty)
+            && let TyKind::Adt(a, args) = self.kind(e.ty).clone()
+            && self.p.is_lang_adt(a, Lang::GpuSpan)
+        {
+            self.expect(args[0], b, e.span);
             return;
         }
         if let TyKind::Slice(b) = *self.kind(param_ty)

@@ -78,6 +78,27 @@ fn a_kernel_writes_a_textures_texels() {
     }
 }
 
+/// Groups (§12): a kernel and a fragment shader each take one parameter of textures, a sampler,
+/// a buffer's span and values (compiler/tests/groups). The left half, drawn from a group, is the
+/// right half, drawn from the same inputs one by one, to the bit; the kernel's group filled the
+/// texture they read.
+#[test]
+#[ignore = "needs a GPU"]
+fn a_group_draws_what_its_fields_draw_one_by_one() {
+    let (dir, _) = page("compiler/tests/groups", "groups-native");
+    let run = native(&dir);
+    let half = SIZE / 2;
+    let mut lit = 0;
+    for y in 0..SIZE {
+        for x in 0..half {
+            let (l, r) = (pixel(&run.frame, x, y), pixel(&run.frame, x + half, y));
+            assert_eq!(l, r, "pixel ({x}, {y}) against ({}, {y})", x + half);
+            lit += usize::from(l[0] > 60 && l[1] > 30);
+        }
+    }
+    assert!(lit > (half * SIZE / 4) as usize, "only {lit} pixels show the filled texture");
+}
+
 /// A kernel writes a 3D texture's texels (`std::gpu::Texels3d`), and a pass loads and samples
 /// them (compiler/tests/volume): texel (x, y, z) of 4 × 4 × 4 is red x / 3, green y / 3, blue
 /// z / 3. The top half loads texel ((x / 8) % 4, (y / 8) % 4, x / 32); the bottom half samples

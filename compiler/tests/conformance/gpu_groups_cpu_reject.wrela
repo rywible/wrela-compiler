@@ -1,0 +1,21 @@
+// rejects: gpu.groups
+// A span's elements are its buffer's, which CPU code can't read: it can't index a span, or pass
+// one as a run.
+use std::gpu::{GpuBuffer, GpuSpan, buffer}
+
+fn sum(xs: [f32]) -> f32 {
+    var t = 0.0
+    for x in xs {
+        t += x
+    }
+    t
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    let b: GpuBuffer<f32> = buffer(4)
+    let xs = b.span(start: 0, count: 4)
+    let n = xs.len()
+    let first = xs[0] //~ E0607
+    let all = sum(xs) //~ E0607
+    assert(first + all >= 0.0 && n == 4)
+}

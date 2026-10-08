@@ -1,0 +1,146 @@
+// Groups (language.md §12): a kernel and a fragment shader each take a group of what they read
+// as one parameter. The left half of the screen is drawn from a group, the right from the same
+// textures, sampler, buffer and values passed one by one: renderer.rs checks they match.
+
+use std::gpu::{
+    ClipPosition, FragCoord, GlobalId, GpuBuffer, GpuSpan, Sampler, Texels, Texture, TextureFormat,
+    VertexIndex, begin_screen_pass, buffer, dispatch, draw, present, sampler, texture, write,
+}
+
+struct Tint: Copy + GpuData {
+    colour: vec3,
+    strength: f32,
+}
+
+/// Where the albedo is read: a group of values alone.
+borrow struct Detail {
+    scale: f32,
+    shift: vec2,
+}
+
+/// What the surface reads.
+borrow struct Inputs {
+    tint: Tint,
+    albedo: borrow Texture,
+    s: borrow Sampler,
+    weights: GpuSpan<f32>,
+    detail: Detail,
+}
+
+/// What the fill reads.
+borrow struct Fill {
+    weights: GpuSpan<f32>,
+    blue: f32,
+}
+
+struct State {
+    albedo: Texture,
+    s: Sampler,
+    weights: GpuBuffer<f32>,
+}
+
+fn total(xs: [f32]) -> f32 {
+    var t = 0.0
+    for x in xs {
+        t += x
+    }
+    t
+}
+
+/// Texel (x, y) of 16 × 16: red x / 15 times the weights' sum over 4, green y / 15.
+@compute(8, 8)
+fn fill(g: Fill, out: mut Texels, id: GlobalId) {
+    let w = total(g.weights) / 4.0
+    out.store(id, vec4(f32(id.x) / 15.0 * w, f32(id.y) / 15.0, g.blue, 1.0))
+}
+
+/// The left half of the screen (`left` -1) or the right (0): two triangles.
+@vertex
+fn half(v: VertexIndex, left: f32) -> ClipPosition {
+    let corners = [
+        vec2(0.0, -1.0),
+        vec2(1.0, -1.0),
+        vec2(0.0, 1.0),
+        vec2(0.0, 1.0),
+        vec2(1.0, -1.0),
+        vec2(1.0, 1.0),
+    ]
+    let c = corners[v.index]
+    ClipPosition { position: vec4(c.x + left, c.y, 0.5, 1.0) }
+}
+
+fn shade(
+    tint: Tint,
+    albedo: Texture,
+    s: Sampler,
+    weights: [f32],
+    scale: f32,
+    shift: vec2,
+    uv: vec2,
+) -> vec4 {
+    let base = albedo.sample_level(s, uv * scale + shift, level: 0.0)
+    let w = total(weights) / f32(weights.len())
+    vec4(base.rgb * w + tint.colour * tint.strength, 1.0)
+}
+
+/// The group passed on to a function of its own, and its fields to `shade`.
+fn shade_group(g: Inputs, uv: vec2) -> vec4 {
+    let d = Detail { scale: g.detail.scale, shift: g.detail.shift }
+    shade(g.tint, g.albedo, g.s, g.weights, d.scale, d.shift, uv)
+}
+
+@fragment
+fn grouped(p: FragCoord, g: Inputs, width: f32) -> vec4 {
+    shade_group(g, vec2(p.position.x % width, p.position.y) / width)
+}
+
+@fragment
+fn separate(
+    p: FragCoord,
+    tint: Tint,
+    albedo: Texture,
+    s: Sampler,
+    weights: [f32],
+    scale: f32,
+    shift: vec2,
+    width: f32,
+) -> vec4 {
+    shade(tint, albedo, s, weights, scale, shift, vec2(p.position.x % width, p.position.y) / width)
+}
+
+pub fn init() -> State {
+    var weights = buffer(4)
+    write(mut weights, 0, [0.5, 1.0, 1.5, 1.0])
+    let albedo = texture(width: 16, height: 16, format: TextureFormat::Rgba16Float, writable: true)
+    State { albedo, s: sampler(), weights }
+}
+
+pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
+    let f = Fill { weights: s.weights.span(start: 0, count: 4), blue: 0.25 }
+    dispatch(fill.bind(f, out: mut s.albedo), groups: (2, 2, 1))
+    let tint = Tint { colour: vec3(0.1, 0.05, 0.0), strength: 0.5 }
+    let w = f32(width / 2)
+    let g = Inputs {
+        tint,
+        albedo: s.albedo,
+        s: s.s,
+        weights: s.weights.span(start: 0, count: 4),
+        detail: Detail { scale: 0.75, shift: vec2(0.1, 0.0) },
+    }
+    begin_screen_pass(clear: vec4(0.0))
+    draw(half.bind(left: -1.0), grouped.bind(g, width: w), vertices: 6)
+    draw(
+        half.bind(left: 0.0),
+        separate.bind(
+            tint,
+            s.albedo,
+            s.s,
+            s.weights.span(start: 0, count: 4),
+            scale: 0.75,
+            shift: vec2(0.1, 0.0),
+            width: w,
+        ),
+        vertices: 6,
+    )
+    present()
+}

@@ -13,8 +13,9 @@ pub enum InstanceKey {
         substs: Vec<TyId>,
         /// For each parameter of function type: what's passed for it.
         callables: Vec<Option<Callable>>,
-        /// GPU only: for each run or `Slots` parameter, the resource it's bound to.
-        resources: Vec<Option<ir::ResourceId>>,
+        /// GPU only: for each parameter bound to resources (a run, a span, a `Slots`, a
+        /// texture, a sampler, or a group of them), what it's bound to.
+        resources: Vec<Option<Bound>>,
     },
     /// A closure in `owner`'s body, lifted to a function of its captures and parameters.
     Closure { owner: Rc<InstanceKey>, id: ClosureId },
@@ -37,6 +38,25 @@ pub enum DeriveKind {
     Literals,
     /// The lifted literals the callable can read (§22): `output` is the run's type.
     Reads,
+}
+
+/// GPU only: what a parameter is bound to.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Bound {
+    /// A run, a span, a `Slots`, a texture or a sampler: its resource.
+    One(ir::ResourceId),
+    /// A group (a borrow struct, §12): each field's, `None` for a field passed as a value.
+    Group(Vec<Option<Bound>>),
+}
+
+impl Bound {
+    /// The resource it is, if it's one.
+    pub fn one(&self) -> Option<ir::ResourceId> {
+        match self {
+            Bound::One(r) => Some(*r),
+            Bound::Group(_) => None,
+        }
+    }
 }
 
 /// What's passed for a parameter of function type.
@@ -81,7 +101,7 @@ impl InstanceKey {
         }
     }
 
-    pub fn resources(&self) -> &[Option<ir::ResourceId>] {
+    pub fn resources(&self) -> &[Option<Bound>] {
         match self {
             InstanceKey::Fn { resources, .. } => resources,
             InstanceKey::Closure { owner, .. } => owner.resources(),

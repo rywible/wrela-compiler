@@ -9,7 +9,7 @@
 //! assigned on several paths), places (a projection aliases its place; lowering substitutes
 //! it), or callables (closures and functions, inlined per instance).
 
-use crate::instance::{Callable, InstanceKey};
+use crate::instance::{Bound, Callable, InstanceKey};
 use crate::{Cx, ModuleBuilder};
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -39,6 +39,9 @@ pub(crate) enum Repr {
     Swizzle(ir::Place, Vec<u8>),
     /// A closure or function, with where its captures are in this function.
     Callable(Callable, Vec<CaptureSrc>),
+    /// In GPU code, a group (a borrow struct, §12): each field's representation. It has no
+    /// runtime value: its resources are the module's, and its values are where its fields are.
+    Group(Vec<Repr>),
     /// No runtime value.
     Erased,
 }
@@ -248,6 +251,16 @@ impl<'c, 'a> Fl<'c, 'a> {
         }
     }
 
+    /// Where the statement being lowered is in the source: the latest `at`.
+    pub(crate) fn here(&self) -> Span {
+        let at =
+            self.blocks.iter().rev().flat_map(|b| b.stmts.iter().rev()).find_map(|s| match s {
+                ir::Stmt::At(s) => Some(*s),
+                _ => None,
+            });
+        at.unwrap_or(self.code.span)
+    }
+
     pub fn push_block(&mut self) {
         self.blocks.push(Open::new(self.next_block));
         self.next_block += 1;
@@ -358,10 +371,17 @@ impl<'c, 'a> Fl<'c, 'a> {
                 }
                 continue;
             }
-            if let Some(Some(r)) = resources.get(i) {
-                self.locals[local.index()] =
-                    Repr::Place(ir::Place::root(ir::PlaceRoot::Resource(*r)));
-                continue;
+            match resources.get(i) {
+                Some(Some(Bound::One(r))) => {
+                    self.locals[local.index()] =
+                        Repr::Place(ir::Place::root(ir::PlaceRoot::Resource(*r)));
+                    continue;
+                }
+                Some(Some(b @ Bound::Group(_))) => {
+                    self.locals[local.index()] = self.group_params(t, b, &mut k);
+                    continue;
+                }
+                _ => {}
             }
             if self.cx.lower_ty(self.mb, t, p.span).is_none() {
                 self.locals[local.index()] = Repr::Erased;
@@ -412,7 +432,20 @@ impl<'c, 'a> Fl<'c, 'a> {
                     (TyKind::FnDef(func, substs), _) => {
                         Repr::Callable(self.func_callable(*func, substs.clone()), Vec::new())
                     }
-                    (_, Some(r)) => Repr::Place(ir::Place::root(ir::PlaceRoot::Resource(r))),
+                    (_, Some(Bound::One(r))) => {
+                        Repr::Place(ir::Place::root(ir::PlaceRoot::Resource(r)))
+                    }
+                    (_, Some(Bound::Group(_))) => {
+                        self.cx.err(
+                            Diagnostic::new(
+                                codes::E0702,
+                                decl.span,
+                                "a closure in GPU code can't capture a group yet",
+                            )
+                            .with_help("pass the group to the closure as a parameter"),
+                        );
+                        Repr::Erased
+                    }
                     (_, None) => Repr::Erased,
                 };
         }
@@ -432,6 +465,30 @@ impl<'c, 'a> Fl<'c, 'a> {
             self.bind_param(l, k);
             k += 1;
         }
+    }
+
+    /// A group parameter (§12), bound as `b` binds it: each resource field its resource, each
+    /// group field a group, and each value field the next IR parameter from `k`.
+    fn group_params(&mut self, ty: TyId, b: &Bound, k: &mut u32) -> Repr {
+        let Bound::Group(bs) = b else { return Repr::Erased };
+        let mut out = Vec::new();
+        for (j, ft) in crate::gpu::group_fields(self.cx, ty).into_iter().enumerate() {
+            out.push(match bs.get(j).cloned().flatten() {
+                Some(Bound::One(r)) => Repr::Place(ir::Place::root(ir::PlaceRoot::Resource(r))),
+                Some(g @ Bound::Group(_)) => self.group_params(ft, &g, k),
+                None if self.cx.lower_ty(self.mb, ft, self.code.span).is_none() => Repr::Erased,
+                None => {
+                    let r = if self.f.params[*k as usize].by_ref {
+                        Repr::Place(ir::Place::root(ir::PlaceRoot::Param(*k)))
+                    } else {
+                        Repr::Var(self.param_local(*k))
+                    };
+                    *k += 1;
+                    r
+                }
+            });
+        }
+        Repr::Group(out)
     }
 
     /// Binds MIR local `l` to IR parameter `k`: a by-reference parameter is its place; a value
@@ -615,6 +672,7 @@ impl<'c, 'a> Fl<'c, 'a> {
             StatementKind::Bind { local, place, .. } => {
                 let repr = match self.callable_of(place) {
                     Some(r) => r,
+                    None if let Some(g) = self.group_of(place) => Repr::Group(g),
                     None => match self.place_parts(place) {
                         Some((p, _, None)) => Repr::Place(p),
                         Some((p, _, Some(cs))) => Repr::Swizzle(p, cs),
@@ -639,6 +697,13 @@ impl<'c, 'a> Fl<'c, 'a> {
         let l = place.local;
         if let (true, Rvalue::Const(c)) = (place.proj.is_empty(), r) {
             self.locals[l.index()] = self.table(*c);
+            return;
+        }
+        if place.proj.is_empty()
+            && self.is_gpu()
+            && let Some(g) = self.group_rvalue(r)
+        {
+            self.locals[l.index()] = g;
             return;
         }
         if place.proj.is_empty() {
@@ -708,6 +773,42 @@ impl<'c, 'a> Fl<'c, 'a> {
         let ty = mir::place_ty(&self.cx.checked.program, &self.mir.locals, place);
         let Some(v) = self.rvalue(r, Some(ty), span) else { return };
         self.store(place, v);
+    }
+
+    /// A group built or copied in GPU code (§12): its fields' representations, with no value.
+    /// A value field's is a local holding it.
+    fn group_rvalue(&mut self, r: &Rvalue) -> Option<Repr> {
+        match r {
+            Rvalue::Use(o) => match &o.kind {
+                mir::OperandKind::Copy(p) | mir::OperandKind::Move(p, _) => {
+                    self.group_of(p).map(Repr::Group)
+                }
+                mir::OperandKind::Const(_) => None,
+            },
+            Rvalue::BorrowStruct { adt, fields, .. }
+                if self.cx.checked.program.adt(*adt).lang.is_none() =>
+            {
+                let mut out = Vec::new();
+                for a in fields {
+                    out.push(match a {
+                        mir::Arg::Borrow(p, _) | mir::Arg::Mut(p, _) => match self.group_of(p) {
+                            Some(g) => Repr::Group(g),
+                            None => match self.place_parts(p) {
+                                Some((pl, _, None)) => Repr::Place(pl),
+                                Some((pl, _, Some(cs))) => Repr::Swizzle(pl, cs),
+                                None => Repr::Erased,
+                            },
+                        },
+                        mir::Arg::Take(o) => match self.operand(o) {
+                            Some(v) => Repr::Var(self.local_of("field", v)),
+                            None => Repr::Erased,
+                        },
+                    });
+                }
+                Some(Repr::Group(out))
+            }
+            _ => None,
+        }
     }
 
     /// A table's value (`mir::Rvalue::Const`): on the CPU its constant data, read in place; GPU
@@ -914,20 +1015,21 @@ impl<'c, 'a> Fl<'c, 'a> {
     /// The IR place of a MIR place, its type, and a trailing swizzle (which no IR place can
     /// name). `None` when it has no runtime value.
     fn place_parts(&mut self, p: &mir::Place) -> Option<(ir::Place, TyId, Option<Vec<u8>>)> {
-        let mut ty = self.concrete(self.local_ty(p.local));
+        let (base, mut ty, skip) = self.base_of(p);
         let mut swizzle = None;
-        let ir::Place { mut root, mut path } = match self.locals[p.local.index()].clone() {
+        let ir::Place { mut root, mut path } = match base {
             Repr::Var(v) => ir::Place::local(v),
             Repr::Place(ip) => ip,
             Repr::Swizzle(ip, cs) => {
                 swizzle = Some(cs);
                 ip
             }
-            Repr::Value(v) => self.spill(p.local, v),
-            Repr::Unbound | Repr::Callable(..) | Repr::Erased => return None,
+            Repr::Value(v) if skip == 0 => self.spill(p.local, v),
+            Repr::Value(v) => ir::Place::local(self.local_of("field", v)),
+            Repr::Unbound | Repr::Callable(..) | Repr::Group(_) | Repr::Erased => return None,
         };
         let mut variant: Option<u32> = None;
-        for proj in &p.proj {
+        for proj in &p.proj[skip..] {
             if let Some(cs) = &swizzle {
                 // Through an alias of components: they pick from its vector.
                 match proj {
@@ -985,6 +1087,17 @@ impl<'c, 'a> Fl<'c, 'a> {
                     let lang = self.cx.checked.program.lang_of_ty(ty);
                     let whole = ir::Place { root: root.clone(), path: std::mem::take(&mut path) };
                     let at = match lang {
+                        Some(Lang::GpuSpan) if !self.is_gpu() => {
+                            self.cx.err(
+                                Diagnostic::new(
+                                    codes::E0607,
+                                    self.here(),
+                                    "a `GpuSpan`'s elements are read in GPU code, and this is CPU code",
+                                )
+                                .with_note("CPU code can't read through a GPU buffer; `std::gpu::read` asks for its elements (§6.13)"),
+                            );
+                            return None;
+                        }
                         Some(Lang::Slots) => {
                             let idx = crate::gpu::slot_index(self, iv)?;
                             whole.with(ir::Proj::Index(idx))
@@ -1013,6 +1126,82 @@ impl<'c, 'a> Fl<'c, 'a> {
             }
         }
         Some((ir::Place { root, path }, ty, swizzle))
+    }
+
+    /// Where place `p` starts: its local's representation or, through a group's fields (§12),
+    /// the field's; with that start's type, and how many of `p`'s projections it took.
+    fn base_of(&mut self, p: &mir::Place) -> (Repr, TyId, usize) {
+        let mut r = self.locals[p.local.index()].clone();
+        let mut ty = self.concrete(self.local_ty(p.local));
+        let mut n = 0;
+        while let Repr::Group(fields) = &r
+            && let Some(proj @ mir::Proj::Field(k)) = p.proj.get(n)
+        {
+            let next = fields.get(*k as usize).cloned().unwrap_or(Repr::Erased);
+            let ft = self.proj_ty(ty, proj);
+            ty = self.concrete(ft);
+            r = next;
+            n += 1;
+        }
+        (r, ty, n)
+    }
+
+    /// The fields of the group `p` names whole, in GPU code (§12).
+    pub(crate) fn group_of(&mut self, p: &mir::Place) -> Option<Vec<Repr>> {
+        match self.base_of(p) {
+            (Repr::Group(fields), _, n) if n == p.proj.len() => Some(fields),
+            _ => None,
+        }
+    }
+
+    /// The value a representation holds, of IR type `t`.
+    fn repr_read(&mut self, r: &Repr, t: ir::TypeId) -> Option<ir::ValueId> {
+        match r {
+            Repr::Value(v) => Some(*v),
+            Repr::Var(l) => Some(self.load(ir::Place::local(*l), t)),
+            Repr::Place(p) => Some(self.load(p.clone(), t)),
+            Repr::Swizzle(p, cs) => {
+                let vt = self.place_ty(p)?;
+                let v = self.load(p.clone(), vt);
+                Some(self.value(t, ir::Expr::Swizzle(v, cs.clone())))
+            }
+            _ => None,
+        }
+    }
+
+    /// A group passed to a GPU function (§12): what it binds, each resource field's resource,
+    /// with each value field's value added to `out`, as the callee's `group_params` takes them.
+    /// `None` if a field isn't one the callee can be bound to.
+    fn pass_group(
+        &mut self,
+        fields: &[Repr],
+        ty: TyId,
+        out: &mut Vec<ir::Arg>,
+        span: Span,
+    ) -> Option<Bound> {
+        let mut bs = Vec::new();
+        let tys = crate::gpu::group_fields(self.cx, ty);
+        for (r, ft) in fields.iter().zip(tys) {
+            let p = &self.cx.checked.program;
+            if crate::gpu::is_resource_ty(p, ft) {
+                match r {
+                    Repr::Place(ir::Place { root: ir::PlaceRoot::Resource(id), path })
+                        if path.is_empty() =>
+                    {
+                        bs.push(Some(Bound::One(*id)));
+                    }
+                    _ => return None,
+                }
+            } else if wrela_sema::gpu::is_group(p, ft) {
+                let Repr::Group(sub) = r else { return None };
+                bs.push(Some(self.pass_group(sub, ft, out, span)?));
+            } else {
+                bs.push(None);
+                let Some(t) = self.cx.lower_ty(self.mb, ft, span) else { continue };
+                out.push(ir::Arg::Value(self.repr_read(r, t)?));
+            }
+        }
+        Some(Bound::Group(bs))
     }
 
     /// Whether field `i` of type `t` is a borrow struct's projection field: a pointer.
@@ -1738,6 +1927,40 @@ impl<'c, 'a> Fl<'c, 'a> {
                 continue;
             }
             callables.push(None);
+            if self.is_gpu() && wrela_sema::gpu::is_group(&self.cx.checked.program, pt) {
+                let fields = a.place().and_then(|pl| self.group_of(pl));
+                let bound = fields.and_then(|f| self.pass_group(&f, pt, &mut out, a.span()));
+                if bound.is_none() {
+                    self.cx.err(
+                        Diagnostic::new(
+                            codes::E0702,
+                            a.span(),
+                            "GPU code passes a group on as it received it or built it, with its resources as the shader received them",
+                        )
+                        .with_note("a group has no value on the GPU: its fields are the shader's bindings and values (§12)"),
+                    );
+                    return None;
+                }
+                resources.push(bound);
+                continue;
+            }
+            if !self.is_gpu()
+                && matches!(self.types().kind(pt), TyKind::Slice(_))
+                && a.place().is_some_and(|pl| {
+                    let t = self.place_src_ty(pl);
+                    self.cx.checked.program.lang_of_ty(t) == Some(Lang::GpuSpan)
+                })
+            {
+                self.cx.err(
+                    Diagnostic::new(
+                        codes::E0607,
+                        a.span(),
+                        "a `GpuSpan`'s elements are read in GPU code, and this is CPU code",
+                    )
+                    .with_note("a `GpuSpan` passes as a `[T]` on the GPU, where its buffer is; CPU code can't read through it (§6.13)"),
+                );
+                return None;
+            }
             if self.is_gpu() && crate::gpu::is_resource_param(self, pt) {
                 let r = a.place().and_then(|pl| self.place(pl)).and_then(|pl| {
                     match (pl.root, pl.path.is_empty()) {
@@ -1752,7 +1975,7 @@ impl<'c, 'a> Fl<'c, 'a> {
                         "GPU code can pass a buffer on only as the kernel received it",
                     ));
                 }
-                resources.push(r);
+                resources.push(r.map(Bound::One));
                 continue;
             }
             resources.push(None);
