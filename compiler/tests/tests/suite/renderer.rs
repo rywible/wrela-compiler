@@ -63,6 +63,33 @@ fn the_browser_draws_the_native_hosts_frame() {
     assert!(diff.mean <= MEAN_LIMIT, "mean difference {:.4} over {MEAN_LIMIT}", diff.mean);
 }
 
+/// A kernel writes a texture's texels (`std::gpu::Texels`), each invocation its own, and a pass
+/// draws them (compiler/tests/texels): texel (x, y) of 16 × 16 is red x / 15, green y / 15,
+/// blue a half, 8 × 8 pixels a texel.
+#[test]
+#[ignore = "needs a GPU"]
+fn a_kernel_writes_a_textures_texels() {
+    let (dir, _) = page("compiler/tests/texels", "texels-native");
+    let run = native(&dir);
+    for (x, y) in [(0u32, 0u32), (3, 9), (15, 15), (7, 0)] {
+        let got = pixel(&run.frame, x * 8 + 4, y * 8 + 4);
+        let want = [(x * 255 + 7) / 15, (y * 255 + 7) / 15, 128, 255].map(|c| c as u8);
+        near(got, want, &format!("texel ({x}, {y})"));
+    }
+}
+
+#[test]
+#[ignore = "long: needs Chrome, python3 and a GPU"]
+fn the_browser_writes_texels_as_the_native_host_does() {
+    let (dir, rel) = page("compiler/tests/texels", "texels-browser");
+    let browser = run_in_chrome(&rel, 2, SIZE, SIZE, 60.0);
+    let run = native(&dir);
+    assert_eq!(browser.hash, run.hash_hex(), "the hosts' state hashes differ");
+    let diff = image::compare(&browser.frame, &run.frame).expect("same size");
+    eprintln!("Chrome against the native host: mean {:.4}/255, max {}/255", diff.mean, diff.max);
+    assert!(diff.mean <= MEAN_LIMIT, "mean difference {:.4} over {MEAN_LIMIT}", diff.mean);
+}
+
 /// Chrome's test mode times each pass on the GPU, as the native host does: the same passes, in
 /// the same frames, with the same labels.
 #[test]

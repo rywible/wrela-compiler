@@ -1642,7 +1642,7 @@ impl<'a> Ivx<'a> {
                     "an interval can't go through a run (`[T]`) of values that depend on the input yet: pass the array itself (`[f32; N]`)",
                 ));
             }
-            Expr::Texture(..) => {
+            Expr::Texture(..) | Expr::TextureStore(..) => {
                 return Err(Error::not_derivable(
                     "an interval can't go through a texture read: its texels are data, not code",
                 ));

@@ -2788,6 +2788,10 @@ impl<'p> Checker<'p> {
             TyKind::Adt(s, _) if self.p.is_lang_adt(*s, Lang::AtomicMap) => {
                 Some((Lang::AtomicMapBuffer, Vec::new()))
             }
+            // `Texels` takes `mut` a texture made `writable`.
+            TyKind::Adt(s, _) if self.p.is_lang_adt(*s, Lang::Texels) => {
+                Some((Lang::Texture, Vec::new()))
+            }
             _ => None,
         };
         if let Some((l, args)) = container {

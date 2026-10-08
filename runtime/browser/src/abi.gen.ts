@@ -50,6 +50,8 @@ export const TEXTURE_FORMATS = [
   { name: "rgba16float", bytes: 8, depth: false },
   { name: "depth32float", bytes: 4, depth: true },
 ] as const;
+/** `CreateTexture`'s format word with this bit set: kernels write the texture. */
+export const TEXTURE_WRITABLE = 65536;
 /** A comparison sampler's test, by its number in the stream: WebGPU's name (0 is a sampler that
  * doesn't compare). */
 export const COMPARES = [null, "less", "less-equal", "greater", "greater-equal", "equal", "not-equal", "always", "never"] as const;
@@ -149,7 +151,7 @@ export const EXPORT_INIT = "init";
 export const EXPORT_MEMORY = "memory";
 export const SCREEN_FORMAT = "rgba8unorm";
 /** What a pipeline binds at a binding, as the manifest names it. */
-export const BINDING_KINDS = ["read", "read_write", "texture", "depth_texture", "sampler", "comparison_sampler"] as const;
+export const BINDING_KINDS = ["read", "read_write", "texture", "depth_texture", "sampler", "comparison_sampler", "storage_texture"] as const;
 /** `minStorageBufferOffsetAlignment`: where a bound range of a buffer may start. */
 export const BINDING_OFFSET_ALIGNMENT = 256;
 export const MAX_WORKGROUP_SIZE = [256, 256, 64];

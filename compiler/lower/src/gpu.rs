@@ -145,9 +145,11 @@ pub(crate) enum ParamClass {
         elem: TyId,
         len: u32,
     },
-    /// A `Texture` or a `DepthTexture`, bound by its handle.
+    /// A `Texture` or a `DepthTexture`, bound by its handle; or a kernel's `Texels`
+    /// (`storage`), bound by its texture's.
     Texture {
         depth: bool,
+        storage: bool,
     },
     /// A `Sampler` or a `ComparisonSampler`, bound by its handle.
     Sampler {
@@ -192,8 +194,9 @@ fn classify(cx: &Cx, f: FnId, param: usize, ty: TyId, varyings: Option<TyId>) ->
         });
     }
     match p.lang_of_ty(ty) {
-        Some(Lang::Texture) => return ParamClass::Texture { depth: false },
-        Some(Lang::DepthTexture) => return ParamClass::Texture { depth: true },
+        Some(Lang::Texture) => return ParamClass::Texture { depth: false, storage: false },
+        Some(Lang::DepthTexture) => return ParamClass::Texture { depth: true, storage: false },
+        Some(Lang::Texels) => return ParamClass::Texture { depth: false, storage: true },
         Some(Lang::Sampler) => return ParamClass::Sampler { comparison: false },
         Some(Lang::ComparisonSampler) => return ParamClass::Sampler { comparison: true },
         _ => {}
@@ -893,7 +896,8 @@ pub(crate) fn intrinsic(
             | Lang::AtomicXor
             | Lang::AtomicExchange
             | Lang::AtomicCompareExchange
-            | Lang::AppendPush),
+            | Lang::AppendPush
+            | Lang::TexelsStore),
         ) => shared_op(fl, l, c, ty),
         Some(Lang::Discard) => {
             // A fragment shader's, or a `@gpu` function's checked on its own (its callers'
@@ -1043,6 +1047,15 @@ fn shared_op(fl: &mut Fl, l: Lang, c: &mir::Call, ty: Option<TyId>) -> Option<ir
         Lang::WorkgroupBarrier => {
             resource_arg(fl, c, 0, msg)?;
             fl.emit(ir::Stmt::Eval(ir::Expr::Barrier));
+            None
+        }
+        Lang::TexelsStore => {
+            let r = resource_arg(fl, c, 0, msg)?;
+            let mut vals = Vec::new();
+            for a in &c.args[1..] {
+                vals.push(fl.arg_value(a)?);
+            }
+            fl.emit(ir::Stmt::Eval(ir::Expr::TextureStore(r, vals)));
             None
         }
         Lang::SharedGet | Lang::SharedSet | Lang::AtomicLoad | Lang::AtomicStore => {
@@ -1443,7 +1456,10 @@ fn entry_module(cx: &mut Cx, iface: Rc<Interface>, stage: Entry) -> EntryModule 
                     (ir::ResourceKind::StorageRead, ty, BindingKind::Read)
                 }
             }
-            ParamClass::Texture { depth } => {
+            ParamClass::Texture { storage: true, .. } => {
+                (ir::ResourceKind::StorageTexture, mb.m.types.u32(), BindingKind::StorageTexture)
+            }
+            ParamClass::Texture { depth, .. } => {
                 let bk = if depth { BindingKind::DepthTexture } else { BindingKind::Texture };
                 (ir::ResourceKind::Texture { depth }, mb.m.types.u32(), bk)
             }

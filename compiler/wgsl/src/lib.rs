@@ -300,6 +300,15 @@ impl<'m> Cx<'m> {
                     TypeInner::Image { dim: naga::ImageDimension::D2, arrayed: false, class };
                 (AddressSpace::Handle, self.ty_inner(inner))
             }
+            ir::ResourceKind::StorageTexture => {
+                let class = naga::ImageClass::Storage {
+                    format: naga::StorageFormat::Rgba16Float,
+                    access: StorageAccess::STORE,
+                };
+                let inner =
+                    TypeInner::Image { dim: naga::ImageDimension::D2, arrayed: false, class };
+                (AddressSpace::Handle, self.ty_inner(inner))
+            }
             ir::ResourceKind::Sampler { comparison } => {
                 (AddressSpace::Handle, self.ty_inner(TypeInner::Sampler { comparison }))
             }
@@ -780,6 +789,7 @@ impl<'a, 'm> Fb<'a, 'm> {
                 ir::Expr::Atomic(op, p, args) => {
                     self.atomic(*op, p, args, None, out)?;
                 }
+                ir::Expr::TextureStore(tex, args) => self.texture_store(*tex, args, out)?,
                 _ => {}
             },
             ir::Stmt::Store(p, v) => {
@@ -1020,6 +1030,7 @@ impl<'a, 'm> Fb<'a, 'm> {
                 self.atomic(*op, p, args, Some(t), out)?.ok_or("internal: an atomic's value")?
             }
             ir::Expr::Barrier => return Err("internal: a barrier's value".into()),
+            ir::Expr::TextureStore(..) => return Err("internal: a texel write's value".into()),
             ir::Expr::Discard => return Err("internal: a discard's value".into()),
             ir::Expr::Call(g, args) => self
                 .call(*g, args, out)?
@@ -1360,6 +1371,34 @@ impl<'a, 'm> Fb<'a, 'm> {
                 self.expr(Expression::AccessIndex { base: size, index }, out)
             }
         })
+    }
+
+    /// A texel's write (`ir::Expr::TextureStore`): `textureStore` at x and y.
+    fn texture_store(
+        &mut self,
+        tex: ir::ResourceId,
+        args: &[ir::ValueId],
+        out: &mut Block,
+    ) -> R<()> {
+        let g = *self.cx.globals.get(tex.index()).ok_or("internal: a missing resource")?;
+        let image = self.expr(Expression::GlobalVariable(g), out);
+        let arg = |fb: &Self, i: usize| -> R<Handle<Expression>> {
+            fb.val(*args.get(i).ok_or("internal: a texel's write without its arguments")?)
+        };
+        let mut signed = Vec::new();
+        for i in 0..2 {
+            let x = arg(self, i)?;
+            let kind = ScalarKind::Sint;
+            signed.push(self.expr(Expression::As { expr: x, kind, convert: Some(4) }, out));
+        }
+        let ty = self.cx.ty_inner(TypeInner::Vector { size: VectorSize::Bi, scalar: Scalar::I32 });
+        let coordinate = self.expr(Expression::Compose { ty, components: signed }, out);
+        let value = arg(self, 2)?;
+        out.push(
+            Statement::ImageStore { image, coordinate, array_index: None, value },
+            Span::UNDEFINED,
+        );
+        Ok(())
     }
 
     fn builtin(

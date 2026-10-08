@@ -340,7 +340,7 @@ fn indexed_indirect_draws_cull_and_bias() {
         .write_buffer(2, 0, &words(&indices))
         .create_buffer(3, 32)
         .write_buffer(3, 0, &words(&[12, 1, 0, 0, 0, 0, 0, 0]))
-        .create_texture(9, w, h, TextureFormat::Depth32Float)
+        .create_texture(9, w, h, TextureFormat::Depth32Float, false)
         .begin_pass(Pass {
             color: stream::SCREEN,
             keep_color: false,

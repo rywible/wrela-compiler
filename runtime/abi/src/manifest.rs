@@ -202,16 +202,19 @@ pub enum BindingKind {
     Sampler,
     /// A comparison sampler.
     ComparisonSampler,
+    /// An `rgba16float` texture a kernel writes (a storage texture, written only).
+    StorageTexture,
 }
 
 impl BindingKind {
-    pub const ALL: [BindingKind; 6] = [
+    pub const ALL: [BindingKind; 7] = [
         BindingKind::Read,
         BindingKind::ReadWrite,
         BindingKind::Texture,
         BindingKind::DepthTexture,
         BindingKind::Sampler,
         BindingKind::ComparisonSampler,
+        BindingKind::StorageTexture,
     ];
 
     pub fn is_buffer(self) -> bool {
@@ -235,6 +238,7 @@ impl BindingKind {
             BindingKind::DepthTexture => "depth_texture",
             BindingKind::Sampler => "sampler",
             BindingKind::ComparisonSampler => "comparison_sampler",
+            BindingKind::StorageTexture => "storage_texture",
         }
     }
 }
@@ -502,14 +506,7 @@ mod read {
         let Value::Array(list) = field(o, "bindings", &place)? else {
             return fail(format!("{place}.bindings must be an array"));
         };
-        let kinds = [
-            ("read", BindingKind::Read),
-            ("read_write", BindingKind::ReadWrite),
-            ("texture", BindingKind::Texture),
-            ("depth_texture", BindingKind::DepthTexture),
-            ("sampler", BindingKind::Sampler),
-            ("comparison_sampler", BindingKind::ComparisonSampler),
-        ];
+        let kinds = BindingKind::ALL.map(|k| (k.name(), k));
         let bindings = list
             .iter()
             .enumerate()

@@ -71,9 +71,9 @@ fn command(c: &Command) -> Value {
                 "destination": destination, "destinationOffset": destination_offset, "size": size,
             })
         }
-        Command::CreateTexture { handle, width, height, format } => json!({
+        Command::CreateTexture { handle, width, height, format, writable } => json!({
             "op": "CreateTexture", "handle": handle, "width": width, "height": height,
-            "format": format.name(),
+            "format": format.name(), "writable": writable,
         }),
         Command::WriteTexture { handle, x, y, width, height, data } => json!({
             "op": "WriteTexture", "handle": handle, "x": x, "y": y, "width": width,
@@ -168,7 +168,7 @@ pub(crate) fn golden_batch() -> Vec<u8> {
         .present()
         .destroy_buffer(7)
         .copy_buffer(1, 4, 2, 8, 12)
-        .create_texture(8, 2, 1, TextureFormat::Rgba8)
+        .create_texture(8, 2, 1, TextureFormat::Rgba8, false)
         .write_texture(8, [0, 0], [2, 1], &[1, 2, 3, 4, 5, 6, 7, 8])
         .destroy_texture(8)
         .create_sampler(10, true, false, Some(Compare::Less))
@@ -244,7 +244,7 @@ fn batches() -> Vec<Value> {
         batch(
             "an unknown texture format",
             &edit(
-                Encoder::new().create_texture(1, 4, 4, TextureFormat::Rgba8).finish(),
+                Encoder::new().create_texture(1, 4, 4, TextureFormat::Rgba8, false).finish(),
                 h + 8 + 12,
                 9,
             ),
@@ -252,7 +252,7 @@ fn batches() -> Vec<Value> {
         batch(
             "a zero-width texture",
             &edit(
-                Encoder::new().create_texture(1, 4, 4, TextureFormat::Rgba8).finish(),
+                Encoder::new().create_texture(1, 4, 4, TextureFormat::Rgba8, false).finish(),
                 h + 8 + 4,
                 0,
             ),
@@ -437,8 +437,8 @@ fn checks() -> Value {
     // Also texture 8 (4x4, rgba8), depth texture 9 (4x4), sampler 10 and comparison sampler 11.
     let with_textures = |f: &dyn Fn(&mut Encoder)| {
         with_buffers(&|e| {
-            e.create_texture(8, 4, 4, TextureFormat::Rgba8)
-                .create_texture(9, 4, 4, TextureFormat::Depth32Float)
+            e.create_texture(8, 4, 4, TextureFormat::Rgba8, false)
+                .create_texture(9, 4, 4, TextureFormat::Depth32Float, false)
                 .create_sampler(10, true, false, None)
                 .create_sampler(11, false, false, Some(Compare::Less));
             f(e);
@@ -670,7 +670,7 @@ fn checks() -> Value {
         check(
             "a texture over the size limit",
             &m,
-            &Encoder::new().create_texture(1, 8193, 1, TextureFormat::Rgba8).finish(),
+            &Encoder::new().create_texture(1, 8193, 1, TextureFormat::Rgba8, false).finish(),
         ),
         check(
             "a texture write past the edge",
@@ -747,7 +747,7 @@ fn checks() -> Value {
             "targets of different sizes",
             &m,
             &with_textures(&|e| {
-                e.create_texture(12, 2, 2, TextureFormat::Rgba8)
+                e.create_texture(12, 2, 2, TextureFormat::Rgba8, false)
                     .begin_pass(Pass { color: 12, ..pass });
             }),
         ),
@@ -1036,7 +1036,7 @@ fn manifests() -> Vec<Value> {
         manifest("a small number", golden.replace("\"size\": 32", "\"size\": 1.5e-7")),
         manifest("a negative zero", golden.replace("\"binding\": 0", "\"binding\": -0.0")),
         manifest("a wrong kind", golden.replace("\"kind\": \"render\"", "\"kind\": \"draw\\n\"")),
-        manifest("an unknown binding kind", golden.replace("\"kind\": \"sampler\"", "\"kind\": \"storage_texture\"")),
+        manifest("an unknown binding kind", golden.replace("\"kind\": \"sampler\"", "\"kind\": \"cube_texture\"")),
         malformed("not JSON", golden.replace("}\n", "")),
         malformed("a byte-order mark", format!("\u{feff}{golden}")),
         malformed("a lone surrogate", golden.replace("\"sample\"", "\"\\ud800\"")),

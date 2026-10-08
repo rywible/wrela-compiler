@@ -87,7 +87,8 @@ impl Expr {
             | Expr::Construct(_, xs)
             | Expr::Host(_, xs)
             | Expr::Mem(_, xs)
-            | Expr::Texture(_, _, _, xs) => xs.iter().for_each(|x| f(*x)),
+            | Expr::Texture(_, _, _, xs)
+            | Expr::TextureStore(_, xs) => xs.iter().for_each(|x| f(*x)),
             Expr::Select { cond, if_true, if_false } => {
                 f(*cond);
                 f(*if_true);
@@ -135,7 +136,8 @@ impl Expr {
             | Expr::Construct(_, xs)
             | Expr::Host(_, xs)
             | Expr::Mem(_, xs)
-            | Expr::Texture(_, _, _, xs) => xs.iter_mut().for_each(f),
+            | Expr::Texture(_, _, _, xs)
+            | Expr::TextureStore(_, xs) => xs.iter_mut().for_each(f),
             Expr::Select { cond, if_true, if_false } => {
                 f(cond);
                 f(if_true);
@@ -187,6 +189,7 @@ impl Expr {
             | Expr::Host(..)
             | Expr::Mem(..)
             | Expr::Texture(..)
+            | Expr::TextureStore(..)
             | Expr::Barrier
             | Expr::Discard
             | Expr::Select { .. } => {}
@@ -226,6 +229,7 @@ impl Expr {
             | Expr::Host(..)
             | Expr::Mem(..)
             | Expr::Texture(..)
+            | Expr::TextureStore(..)
             | Expr::Barrier
             | Expr::Discard
             | Expr::Select { .. } => {}
@@ -241,6 +245,7 @@ impl Expr {
                 | Expr::Host(..)
                 | Expr::Mem(..)
                 | Expr::Atomic(..)
+                | Expr::TextureStore(..)
                 | Expr::Barrier
                 | Expr::Discard
         )
@@ -274,6 +279,7 @@ impl Expr {
             | Expr::Mem(..)
             | Expr::ArrayLength(_)
             | Expr::Texture(..)
+            | Expr::TextureStore(..)
             | Expr::Atomic(..)
             | Expr::Barrier
             | Expr::Discard

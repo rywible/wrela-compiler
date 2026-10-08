@@ -912,6 +912,7 @@ fn outlined_with(
                     | Expr::Discard
                     | Expr::Atomic(..)
                     | Expr::Texture(..)
+                    | Expr::TextureStore(..)
                     | Expr::Host(..)
                     | Expr::Mem(..)
                     | Expr::Addr(_)

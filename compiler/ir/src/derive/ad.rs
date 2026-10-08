@@ -653,7 +653,7 @@ impl Ad<'_> {
                     "can't differentiate through a run (`[T]`) of values that depend on the input yet: pass the array itself (`[f32; N]`)",
                 ));
             }
-            Expr::Texture(..) => {
+            Expr::Texture(..) | Expr::TextureStore(..) => {
                 return Err(Error::not_derivable(
                     "can't differentiate through a texture read: its texels are data, not code",
                 ));

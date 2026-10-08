@@ -305,6 +305,7 @@ impl Fa<'_, '_> {
                 ResourceKind::Uniform { .. }
                 | ResourceKind::StorageRead
                 | ResourceKind::Texture { .. }
+                | ResourceKind::StorageTexture
                 | ResourceKind::Sampler { .. } => false,
                 // Workgroup memory is written by other invocations (WGSL: non-uniform loads).
                 ResourceKind::StorageReadWrite

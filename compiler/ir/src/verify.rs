@@ -210,6 +210,20 @@ impl Verifier<'_> {
                 };
                 types.lookup(&out)
             }
+            Expr::TextureStore(t, xs) => {
+                let kind = self.m.resources.get(t.index()).map(|r| r.kind);
+                if kind != Some(ResourceKind::StorageTexture) {
+                    return Err(bug("a texel written to something that isn't a storage texture"));
+                }
+                let u32_ = TypeDef::Scalar(Scalar::U32);
+                let want = [u32_.clone(), u32_, TypeDef::Vector(Scalar::F32, 4)];
+                if xs.len() != want.len()
+                    || xs.iter().zip(&want).any(|(x, w)| self.def(self.ty(*x)) != w)
+                {
+                    return Err(bug("a texel's write with the wrong arguments"));
+                }
+                return Ok(None);
+            }
             Expr::ArrayLength(p) => {
                 let storage = matches!(&p.root, PlaceRoot::Resource(r)
                     if matches!(self.m.resources.get(r.index()).map(|r| r.kind),

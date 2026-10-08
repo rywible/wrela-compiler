@@ -69,7 +69,7 @@ interface Shape {
 /** A live resource. */
 type Resource =
   | { kind: "buffer"; size: number }
-  | { kind: "texture"; width: number; height: number; format: TextureFormat }
+  | { kind: "texture"; width: number; height: number; format: TextureFormat; writable: boolean }
   | { kind: "sampler"; comparison: boolean };
 
 export class Checker {
@@ -113,12 +113,12 @@ export class Checker {
         return;
       }
       case "CreateTexture": {
-        const { handle, width, height, format } = cmd;
+        const { handle, width, height, format, writable } = cmd;
         const max = this.#limits[0]!;
         if (width > max || height > max) {
           throw err(`texture ${handle} is ${width}x${height}; the limit is ${max} a side`);
         }
-        this.#create(op, handle, { kind: "texture", width, height, format });
+        this.#create(op, handle, { kind: "texture", width, height, format, writable });
         return;
       }
       case "CreateSampler":
@@ -258,7 +258,7 @@ export class Checker {
     return r.size;
   }
 
-  #texture(op: OpcodeName, handle: number): { width: number; height: number; format: TextureFormat } {
+  #texture(op: OpcodeName, handle: number): { width: number; height: number; format: TextureFormat; writable: boolean } {
     const r = this.#resources.get(handle);
     if (r?.kind !== "texture") throw new CommandError(op, `there's no texture ${handle}`);
     return r;
@@ -352,6 +352,12 @@ export class Checker {
             throw err(`texture ${b.handle} is bound where ${depth ? "a depth texture" : "a colour texture"} goes`);
           }
           this.#used(op, "texture", b.handle, false);
+          return;
+        }
+        case "storage_texture": {
+          const t = this.#texture(op, b.handle);
+          if (!t.writable) throw err(`texture ${b.handle} is bound where a kernel writes it, but wasn't made writable`);
+          this.#used(op, "texture", b.handle, true);
           return;
         }
         case "sampler":

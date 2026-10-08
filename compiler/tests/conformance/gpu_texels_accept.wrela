@@ -1,0 +1,39 @@
+// accepts: gpu.textures gpu.kernel-mut
+// A kernel writes a texture made `writable`, each invocation its own texel, and a pass reads
+// it.
+use std::gpu::{
+    ClipPosition, FragCoord, GlobalId, Texels, Texture, TextureFormat, VertexIndex,
+    begin_screen_pass, dispatch, draw, present, texture,
+}
+
+struct State {
+    t: Texture,
+}
+
+@compute(8, 8)
+fn fill(out: mut Texels, id: GlobalId) {
+    out.store(id, vec4(f32(id.x) / 16.0, f32(id.y) / 16.0, 0.5, 1.0))
+}
+
+@vertex
+fn cover(v: VertexIndex) -> ClipPosition {
+    let x = f32((v.index << 1) & 2) * 2.0 - 1.0
+    let y = f32(v.index & 2) * 2.0 - 1.0
+    ClipPosition { position: vec4(x, y, 0.5, 1.0) }
+}
+
+@fragment
+fn show(p: FragCoord, t: Texture) -> vec4 {
+    t.load(x: u32(p.position.x) % 16, y: u32(p.position.y) % 16)
+}
+
+pub fn init() -> State {
+    State { t: texture(width: 16, height: 16, format: TextureFormat::Rgba16Float, writable: true) }
+}
+
+pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
+    dispatch(fill.bind(mut s.t), groups: (2, 2, 1))
+    begin_screen_pass(clear: vec4(0.0))
+    draw(cover, show.bind(s.t), vertices: 3)
+    present()
+}

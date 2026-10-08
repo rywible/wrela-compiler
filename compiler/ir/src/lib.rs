@@ -465,6 +465,9 @@ pub enum Expr {
     ArrayLength(Place),
     /// A read of a texture resource (GPU only), with a sampler resource for the sampling ops.
     Texture(TextureOp, ResourceId, Option<ResourceId>, Vec<ValueId>),
+    /// A write of a texel of a storage texture resource (GPU only, a kernel's). Args: x and y
+    /// (`u32`s) and the value (a `vec4`). Gives nothing.
+    TextureStore(ResourceId, Vec<ValueId>),
     /// An atomic read-modify-write of the atomic at the place (GPU only): the value that was
     /// there. Args: the operand (for `CompareExchange`, the expected value then the new one).
     Atomic(AtomicOp, Place, Vec<ValueId>),
@@ -622,6 +625,8 @@ pub enum ResourceKind {
     Workgroup,
     /// `texture_2d<f32>`, or `texture_depth_2d`.
     Texture { depth: bool },
+    /// `texture_storage_2d<rgba16float, write>`: a kernel's texels to write.
+    StorageTexture,
     /// `sampler`, or `sampler_comparison`.
     Sampler { comparison: bool },
 }
@@ -787,6 +792,7 @@ impl Module {
                     | ResourceKind::Private
                     | ResourceKind::Workgroup
                     | ResourceKind::Texture { .. }
+                    | ResourceKind::StorageTexture
                     | ResourceKind::Sampler { .. } => res.ty,
                     ResourceKind::StorageRead | ResourceKind::StorageReadWrite => {
                         match p.path.as_slice() {

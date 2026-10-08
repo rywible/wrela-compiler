@@ -119,6 +119,7 @@ fn expr(m: &Module, e: &Expr) -> String {
             Some(s) => format!("texture {op:?} r{}, r{}, {}", t.0, s.0, vals(xs)),
             None => format!("texture {op:?} r{}, {}", t.0, vals(xs)),
         },
+        Expr::TextureStore(t, xs) => format!("texture_store r{}, {}", t.0, vals(xs)),
         Expr::Unary(op, v) => format!("{op:?} v{}", v.0),
         Expr::Binary(op, a, b) => format!("{op:?} v{}, v{}", a.0, b.0),
         Expr::Call(f, args) => {

@@ -216,7 +216,12 @@ macro_rules! lang_items {
             pub fn is_invocation_safe(self) -> bool {
                 matches!(
                     self,
-                    Lang::Slots | Lang::Shared | Lang::Atomics | Lang::Append | Lang::AtomicMap
+                    Lang::Slots
+                        | Lang::Shared
+                        | Lang::Atomics
+                        | Lang::Append
+                        | Lang::AtomicMap
+                        | Lang::Texels
                 )
             }
 
@@ -300,6 +305,8 @@ lang_items! {
     Limit = "std::gpu::limit",
     Shared = "std::gpu::Shared",
     Atomics = "std::gpu::Atomics",
+    Texels = "std::gpu::Texels",
+    TexelsStore = "std::gpu::texels_store",
     Append = "std::gpu::Append",
     AtomicMap = "std::gpu::AtomicMap",
     AppendBuffer = "std::gpu::AppendBuffer",

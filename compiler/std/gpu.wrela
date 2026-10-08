@@ -408,14 +408,25 @@ fn check_texture_size(width: u32, height: u32) {
     }
 }
 
-/// A new colour texture, zeroed.
-pub fn texture(width: u32, height: u32, format: TextureFormat = TextureFormat::Rgba8) -> Texture {
+/// A new colour texture, zeroed. A `writable` one (`Rgba16Float` only) can also be a kernel's
+/// `Texels` to write.
+pub fn texture(
+    width: u32,
+    height: u32,
+    format: TextureFormat = TextureFormat::Rgba8,
+    writable: bool = false,
+) -> Texture {
     check_texture_size(width, height)
     let code: u32 = match format {
         TextureFormat::Rgba8 => 0,
         TextureFormat::Rgba16Float => 1,
     }
-    Texture { handle: create_texture(width, height, code), width, height, format }
+    if writable && code != 1 {
+        panic("texture: only an Rgba16Float texture can be written by kernels")
+    }
+    // The stream's flag for a texture kernels write: bit 16 of the format.
+    let flags: u32 = if writable { 65536 } else { 0 }
+    Texture { handle: create_texture(width, height, code | flags), width, height, format }
 }
 
 /// A new depth texture, zeroed.
@@ -879,6 +890,21 @@ pub fn barrier<T, const N: u32>(shared: mut Shared<T, N>) {
     workgroup_barrier(mut shared)
 }
 
+/// A texture a kernel writes, each invocation only its own texel: (`id.x`, `id.y`) of its
+/// `GlobalId` (§6.13). A kernel's `mut Texels` parameter, for which CPU code passes `mut tex`
+/// of a texture made `writable` (an `Rgba16Float` one). A kernel reads what it writes only
+/// through another pass's binding of the texture, never in the same dispatch.
+pub struct Texels {
+    unused: u32,
+}
+
+impl Texels {
+    /// Writes `value` to the invocation's own texel, (`id.x`, `id.y`).
+    pub fn store(mut self, id: GlobalId, value: vec4) {
+        texels_store(mut self, id.x, id.y, value)
+    }
+}
+
 /// Integers that every invocation of a dispatch may change at once: a kernel's `mut
 /// Atomics<u32>` or `mut Atomics<i32>` parameter, for which CPU code passes `mut buf` of a
 /// `GpuBuffer<u32>` (or `<i32>`). Each operation on an element happens whole, before or after
@@ -1126,6 +1152,9 @@ fn shared_set<T, const N: u32>(shared: mut Shared<T, N>, i: u32, value: T) {}
 
 @intrinsic
 fn workgroup_barrier<T, const N: u32>(shared: mut Shared<T, N>) {}
+
+@intrinsic
+fn texels_store(t: mut Texels, x: u32, y: u32, value: vec4) {}
 
 @intrinsic
 fn atomic_len<A>(a: A) -> u32 {}

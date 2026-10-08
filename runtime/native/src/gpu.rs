@@ -521,6 +521,15 @@ impl Gpu {
                 BindingKind::ComparisonSampler => {
                     (wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison), all)
                 }
+                // Only a kernel writes a texture's texels.
+                BindingKind::StorageTexture => {
+                    let ty = wgpu::BindingType::StorageTexture {
+                        access: wgpu::StorageTextureAccess::WriteOnly,
+                        format: wgpu::TextureFormat::Rgba16Float,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                    };
+                    (ty, wgpu::ShaderStages::COMPUTE)
+                }
             };
             entries.push(wgpu::BindGroupLayoutEntry {
                 binding: b.binding,
@@ -809,12 +818,24 @@ impl Gpu {
         self.resources.insert(handle, Resource::Buffer(buffer));
     }
 
-    fn create_texture(&mut self, handle: u32, width: u32, height: u32, format: TextureFormat) {
+    fn create_texture(
+        &mut self,
+        handle: u32,
+        width: u32,
+        height: u32,
+        format: TextureFormat,
+        writable: bool,
+    ) {
         let mut usage = wgpu::TextureUsages::TEXTURE_BINDING
             | wgpu::TextureUsages::RENDER_ATTACHMENT
             | wgpu::TextureUsages::COPY_SRC;
         if !format.is_depth() {
             usage |= wgpu::TextureUsages::COPY_DST;
+        }
+        // Only where kernels write it: a storage texture may give up the GPU's compression of
+        // what's drawn into it.
+        if writable {
+            usage |= wgpu::TextureUsages::STORAGE_BINDING;
         }
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some(&format!("texture {handle}")),
@@ -1244,8 +1265,8 @@ impl Executor for Gpu {
     fn execute(&mut self, cmd: &Command<'_>) -> Result<()> {
         match cmd {
             Command::CreateBuffer { handle, size } => self.create_buffer(*handle, *size),
-            Command::CreateTexture { handle, width, height, format } => {
-                self.create_texture(*handle, *width, *height, *format)
+            Command::CreateTexture { handle, width, height, format, writable } => {
+                self.create_texture(*handle, *width, *height, *format, *writable)
             }
             Command::CreateSampler { handle, linear, repeat, compare } => {
                 self.create_sampler(*handle, *linear, *repeat, *compare)

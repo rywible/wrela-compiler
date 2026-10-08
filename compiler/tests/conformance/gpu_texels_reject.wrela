@@ -1,0 +1,22 @@
+// rejects: gpu.textures gpu.kernel-mut
+// Texels are written through, so they're `mut`, passed `mut`, and a kernel's.
+use std::gpu::{ClipPosition, GlobalId, Texels, TextureFormat, VertexIndex, dispatch, texture}
+
+@compute(8, 8)
+fn read_only(out: Texels, id: GlobalId) { //~ E0602
+}
+
+@compute(8, 8)
+fn fill(out: mut Texels, id: GlobalId) {
+    out.store(id, vec4(1.0))
+}
+
+@vertex
+fn corner(v: VertexIndex, out: mut Texels) -> ClipPosition { //~ E0602
+    ClipPosition { position: vec4(0.0, 0.0, 0.0, 1.0) }
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    let t = texture(width: 8, height: 8, format: TextureFormat::Rgba16Float, writable: true)
+    dispatch(fill.bind(t), groups: 1) //~ E0503
+}

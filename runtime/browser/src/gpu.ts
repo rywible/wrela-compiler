@@ -186,6 +186,14 @@ async function buildPipeline(device: GPUDevice, p: Pipeline, source: string): Pr
           sampler: { type: b.kind === "sampler" ? "filtering" : "comparison" },
         });
         break;
+      // Only a kernel writes a texture's texels.
+      case "storage_texture":
+        entries.push({
+          binding: b.binding,
+          visibility: GPUShaderStage.COMPUTE,
+          storageTexture: { access: "write-only", format: "rgba16float", viewDimension: "2d" },
+        });
+        break;
     }
   }
 
@@ -595,7 +603,9 @@ export class GpuExecutor {
             GPUTextureUsage.TEXTURE_BINDING |
             GPUTextureUsage.RENDER_ATTACHMENT |
             GPUTextureUsage.COPY_SRC |
-            (depth ? 0 : GPUTextureUsage.COPY_DST),
+            (depth ? 0 : GPUTextureUsage.COPY_DST) |
+            // Only where kernels write it: a storage texture may give up the GPU's compression.
+            (cmd.writable ? GPUTextureUsage.STORAGE_BINDING : 0),
         });
         const bytes = cmd.width * cmd.height * bytesPerTexel(cmd.format);
         this.#resources.set(cmd.handle, { kind: "texture", texture, view: texture.createView(), format: cmd.format, bytes });

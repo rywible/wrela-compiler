@@ -37,6 +37,7 @@ pub fn typescript() -> String {
         input::EventKind::ALL.iter().map(|&k| format!("  {}: {},\n", k.name(), k as u32)).collect();
     let keys = list(input::KEYS.iter().map(|k| format!("{k:?}")));
     let buttons = list(input::BUTTONS.iter().map(|b| format!("{b:?}")));
+    let texture_writable = stream::WRITABLE;
     let [size_x, size_y, size_z] = manifest::MAX_WORKGROUP_SIZE;
     format!(
         r#"// Generated from the wrela-abi crate (runtime/abi): the one definition of the
@@ -63,6 +64,8 @@ export const Opcode = {{
  * whether it's a depth format. */
 export const TEXTURE_FORMATS = [
 {texture_formats}] as const;
+/** `CreateTexture`'s format word with this bit set: kernels write the texture. */
+export const TEXTURE_WRITABLE = {texture_writable};
 /** A comparison sampler's test, by its number in the stream: WebGPU's name (0 is a sampler that
  * doesn't compare). */
 export const COMPARES = [null{compares}] as const;

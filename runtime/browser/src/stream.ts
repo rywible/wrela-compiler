@@ -12,6 +12,7 @@ import {
   STREAM_MAGIC,
   STREAM_VERSION,
   TEXTURE_FORMATS,
+  TEXTURE_WRITABLE,
 } from "./abi.gen.ts";
 
 export type OpcodeName = keyof typeof Opcode;
@@ -49,7 +50,7 @@ export type Command =
   | { op: "Present" }
   | { op: "DestroyBuffer"; handle: number }
   | { op: "CopyBuffer"; source: number; sourceOffset: number; destination: number; destinationOffset: number; size: number }
-  | { op: "CreateTexture"; handle: number; width: number; height: number; format: TextureFormat }
+  | { op: "CreateTexture"; handle: number; width: number; height: number; format: TextureFormat; writable: boolean }
   | { op: "WriteTexture"; handle: number; x: number; y: number; width: number; height: number; data: Bytes }
   | { op: "DestroyTexture"; handle: number }
   | { op: "CreateSampler"; handle: number; linear: boolean; repeat: boolean; compare: Compare | null }
@@ -285,10 +286,13 @@ export function decode(batch: Bytes): Command[] {
       }
       case "CreateTexture": {
         exactly(4);
-        const format = TEXTURE_FORMATS[w(3)];
+        // Bit 16 of the format word: kernels write it (an rgba16float storage texture too).
+        const writable = (w(3) & TEXTURE_WRITABLE) !== 0;
+        const format = TEXTURE_FORMATS[w(3) & ~TEXTURE_WRITABLE];
         if (format === undefined) throw bad("unknown texture format");
         if (w(1) === 0 || w(2) === 0) throw bad("a texture's width and height are positive");
-        cmd = { op: name, handle: w(0), width: w(1), height: w(2), format: format.name };
+        if (writable && format.name !== "rgba16float") throw bad("only an rgba16float texture can be written by kernels");
+        cmd = { op: name, handle: w(0), width: w(1), height: w(2), format: format.name, writable };
         break;
       }
       case "WriteTexture": {

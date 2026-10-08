@@ -77,7 +77,7 @@ struct Shape {
 #[derive(Clone, Copy, Debug)]
 enum Resource {
     Buffer { size: u32 },
-    Texture { width: u32, height: u32, format: TextureFormat },
+    Texture { width: u32, height: u32, format: TextureFormat, writable: bool },
     Sampler { comparison: bool },
 }
 
@@ -143,14 +143,19 @@ impl Checker {
                 }
                 self.create(op, *handle, Resource::Buffer { size: *size })?;
             }
-            Command::CreateTexture { handle, width, height, format } => {
+            Command::CreateTexture { handle, width, height, format, writable } => {
                 let max = self.limits.max_texture_size;
                 if *width > max || *height > max {
                     return err(format!(
                         "texture {handle} is {width}x{height}; the limit is {max} a side"
                     ));
                 }
-                let t = Resource::Texture { width: *width, height: *height, format: *format };
+                let t = Resource::Texture {
+                    width: *width,
+                    height: *height,
+                    format: *format,
+                    writable: *writable,
+                };
                 self.create(op, *handle, t)?;
             }
             Command::CreateSampler { handle, compare, .. } => {
@@ -342,7 +347,7 @@ impl Checker {
 
     fn texture(&self, op: Opcode, handle: u32) -> Result<(u32, u32, TextureFormat)> {
         match self.resources.get(&handle) {
-            Some(Resource::Texture { width, height, format }) => Ok((*width, *height, *format)),
+            Some(Resource::Texture { width, height, format, .. }) => Ok((*width, *height, *format)),
             _ => Err(Self::missing(op, "texture", handle)),
         }
     }
@@ -491,6 +496,20 @@ impl Checker {
                         return err(format!("texture {} is bound where {want} goes", b.handle));
                     }
                     Self::used(&mut self.scope, op, "texture", b.handle, false)?;
+                }
+                BindingKind::StorageTexture => {
+                    let writable = matches!(
+                        self.resources.get(&b.handle),
+                        Some(Resource::Texture { writable: true, .. })
+                    );
+                    if !writable {
+                        self.texture(op, b.handle)?;
+                        return err(format!(
+                            "texture {} is bound where a kernel writes it, but wasn't made writable",
+                            b.handle
+                        ));
+                    }
+                    Self::used(&mut self.scope, op, "texture", b.handle, true)?;
                 }
                 BindingKind::Sampler | BindingKind::ComparisonSampler => {
                     let comparison = self.sampler(op, b.handle)?;
