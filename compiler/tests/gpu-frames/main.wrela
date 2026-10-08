@@ -1,0 +1,54 @@
+// Frame tests on the GPU (language.md §10, `@test(frames: n, gpu: true)`): the first frame has
+// a kernel square 64 numbers and reads them back; later frames take what came back, and the
+// tests check it. `squares_come_back` passes; `a_wrong_square_fails` fails, as a test that
+// finds a mistake should (compiler/tests/tests/suite/test_items.rs).
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch, read, write}
+use std::io::Pending
+
+@compute(64)
+fn square(xs: [u32], out: mut Slots<u32>, id: GlobalId) {
+    out[id] = xs[id.x] * xs[id.x]
+}
+
+pub struct State {
+    xs: GpuBuffer<u32>,
+    squares: GpuBuffer<u32>,
+    pending: Option<Pending<u32>>,
+    got: Vec<u32>,
+}
+
+pub fn init() -> State {
+    var xs: GpuBuffer<u32> = buffer(64)
+    write(mut xs, 0, Vec::from_fn(64, |i| i))
+    State { xs, squares: buffer(64), pending: None, got: Vec::new() }
+}
+
+pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
+    if s.got.len() > 0 {
+        return
+    }
+    match mut s.pending {
+        Some(p) => {
+            if let Some(Ok(v)) = p.poll() {
+                s.got = take v
+            }
+        }
+        None => {
+            dispatch(square.bind(s.xs, mut s.squares), over: 64)
+            s.pending = Some(read(s.squares.items()))
+        }
+    }
+}
+
+@test(frames: 4, gpu: true)
+fn squares_come_back(s: State) {
+    assert(s.got.len() == 64)
+    for i in 0..64 {
+        assert(s.got[i] == i * i)
+    }
+}
+
+@test(frames: 4, gpu: true)
+fn a_wrong_square_fails(s: State) {
+    assert(s.got[3] == 10)
+}

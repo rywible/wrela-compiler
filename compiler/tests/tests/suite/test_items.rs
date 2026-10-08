@@ -555,3 +555,18 @@ pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
         "a shipped build exports the test's"
     );
 }
+
+/// Frame tests on the GPU (§10, `@test(frames: n, gpu: true)`): compiler/tests/gpu-frames has a
+/// kernel square numbers and reads them back between frames; one test finds the squares, and
+/// one that expects a wrong square fails with the values it compared.
+#[test]
+#[ignore = "needs a GPU"]
+fn gpu_frame_tests_read_back_what_the_gpu_wrote() {
+    let dir = wrela_tests::repo_root().join("compiler/tests/gpu-frames");
+    let out = wrela_driver::test(&dir, None);
+    assert!(out.diagnostics.iter().all(|d| !d.is_error()), "{:?}", out.diagnostics);
+    let ran: Vec<_> = out.results.iter().map(|r| (r.name.as_str(), r.failure.is_none())).collect();
+    assert_eq!(ran, [("squares_come_back", true), ("a_wrong_square_fails", false)]);
+    let why = out.results[1].failure.as_ref().map(|d| d.message.clone()).unwrap_or_default();
+    assert!(why.contains("9"), "{why}");
+}

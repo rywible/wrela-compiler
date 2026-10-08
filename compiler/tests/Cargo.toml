@@ -13,7 +13,7 @@ doctest = false
 
 [dependencies]
 wrela-diag.workspace = true
-wrela-driver.workspace = true
+wrela-driver = { workspace = true, features = ["gpu"] }
 wrela-wasm.workspace = true
 wrela-sema.workspace = true
 wrela-syntax.workspace = true

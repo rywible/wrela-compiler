@@ -638,6 +638,9 @@ pub struct FnAttrs {
     /// `@test(frames: n, input: "script.json")`: a script of input events the frames get, by
     /// its path in the package, and where the path is written.
     pub test_input: Option<(String, Span)>,
+    /// `@test(frames: n, gpu: true)`: the frames run on the native host's GPU, which answers
+    /// their readbacks (§10).
+    pub test_gpu: bool,
     /// `@thread_entry` (std's unsafe core): a host calls it on a thread of its own, with that
     /// thread's number first (wrela_abi `memory`'s threads); exported as `__` and its name.
     pub thread_entry: Option<Span>,

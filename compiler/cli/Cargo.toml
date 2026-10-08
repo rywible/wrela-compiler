@@ -13,7 +13,7 @@ path = "src/main.rs"
 [dependencies]
 wrela-diag.workspace = true
 wrela-syntax.workspace = true
-wrela-driver.workspace = true
+wrela-driver = { workspace = true, features = ["gpu"] }
 wrela-host.workspace = true
 wrela-abi.workspace = true
 serde_json.workspace = true

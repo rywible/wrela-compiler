@@ -80,29 +80,26 @@ pub fn run(
             },
         };
         let storage = dir.0.join(format!("storage.{i}"));
-        let failed =
-            run_one(&built, &storage, i, run, &input).map(|Failed { error, fault, phase }| {
-                match fault {
-                    Some(fault) => failure(
-                        checked,
-                        sources,
-                        &out.lines,
-                        Item::Test(f, fuel),
-                        &fault,
-                        Some(&phase),
-                    ),
-                    // Not a trap: a command the host can't carry out, say.
-                    None => Diagnostic::new(
-                        codes::E0706,
-                        checked.program.func(f).span,
-                        format!(
-                            "the test `{}` failed {phase}: {error}",
-                            checked.program.func(f).name
-                        ),
-                    )
-                    .with_note("a frame test passes unless its frames or the test fail (§10)"),
+        let ran = match (attrs.test_gpu, run, &input) {
+            (true, TestRun::Frames(n), Input::Script(script)) => {
+                run_gpu(&dir.0, &storage, i, n, script)
+            }
+            _ => run_one(&built, &storage, i, run, &input),
+        };
+        let failed = ran.map(|Failed { error, fault, phase }| {
+            match fault {
+                Some(fault) => {
+                    failure(checked, sources, &out.lines, Item::Test(f, fuel), &fault, Some(&phase))
                 }
-            });
+                // Not a trap: a command the host can't carry out, say.
+                None => Diagnostic::new(
+                    codes::E0706,
+                    checked.program.func(f).span,
+                    format!("the test `{}` failed {phase}: {error}", checked.program.func(f).name),
+                )
+                .with_note("a frame test passes unless its frames or the test fail (§10)"),
+            }
+        });
         results.push((f, failed));
     }
     (results, diags)
@@ -136,6 +133,64 @@ fn read_input(root: &Path, path: &str, ticks: bool) -> Result<Input, String> {
     }
     let text = String::from_utf8(bytes).map_err(|_| "isn't UTF-8".to_string())?;
     wrela_host::parse_script(&text).map(Input::Script).map_err(|e| format!("isn't a script: {e}"))
+}
+
+/// Runs GPU frame test `i` (`@test(frames: n, gpu: true)`, §10) on the native host's GPU:
+/// `init`, its `frames` with `script`'s events, each frame's readbacks answered before the next,
+/// then the test. Why it failed, if it did. The GPU host meters no fuel: it runs the program as
+/// `wrela run` does.
+#[cfg(feature = "gpu")]
+fn run_gpu(
+    dir: &Path,
+    storage: &Path,
+    i: usize,
+    frames: u32,
+    script: &[wrela_host::Scripted],
+) -> Option<Failed> {
+    let failed = |error, host: Option<&wrela_host::Host>, phase: String| {
+        let fault = host.and_then(|h| h.last_failure()).map(|f| Fault {
+            frames: f.frames.clone(),
+            trap: f.trap,
+            panic: f.panic.clone(),
+            text: String::new(),
+        });
+        Some(Failed { error, fault, phase })
+    };
+    let _ = std::fs::create_dir_all(storage);
+    let options = wrela_host::Options {
+        storage: Some(storage.to_path_buf()),
+        workers: 1,
+        quiet: true,
+        defer_init: true,
+        ..Default::default()
+    };
+    let mut host = match wrela_host::Host::load_with(dir, &options) {
+        Ok(h) => h,
+        Err(e) => return failed(e, None, "as it started".to_string()),
+    };
+    if let Err(e) = host.init() {
+        return failed(e, Some(&host), "in `init`".to_string());
+    }
+    for k in 0..frames {
+        if let Err(e) = host.lockstep_frame(k, FPS, WIDTH, HEIGHT, script) {
+            return failed(e, Some(&host), format!("in frame {k} of {frames}"));
+        }
+    }
+    match host.call_export(&format!("test.{i}"), &[]) {
+        Ok(_) => None,
+        Err(e) => failed(e, Some(&host), format!("after {frames} frames")),
+    }
+}
+
+/// [`run_gpu`], in a compiler built without the GPU host: the test can't run.
+#[cfg(not(feature = "gpu"))]
+fn run_gpu(_: &Path, _: &Path, _: usize, _: u32, _: &[wrela_host::Scripted]) -> Option<Failed> {
+    let why = "its frames run on the GPU, and this build of the compiler has no GPU host";
+    Some(Failed {
+        error: wrela_host::Error::Program(why.into()),
+        fault: None,
+        phase: String::new(),
+    })
 }
 
 /// Runs test `i`: `init`, its frames (and ticks in lockstep) or its ticks, with `input`, then

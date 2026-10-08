@@ -384,6 +384,11 @@ impl Host {
         self.p().run_init()
     }
 
+    /// The last trap or panic, where it happened: [`CpuHost::last_failure`], on the GPU.
+    pub fn last_failure(&self) -> Option<&Failure> {
+        self.program.as_ref().and_then(|p| p.last_failure())
+    }
+
     /// Whether the ticker reports its state's hash ([`CpuHost::want_hashes`]).
     pub fn want_hashes(&mut self, on: bool) {
         self.p().want_hashes(on);

@@ -27,5 +27,10 @@ wasmtime.workspace = true
 # Frame tests run the program's frames on the native host's CPU, without its GPU (§10).
 wrela-host = { path = "../../runtime/native", default-features = false }
 
+[features]
+# `@test(frames: n, gpu: true)` runs on the native host's GPU (§10): `wrela`'s and the test
+# suite's builds have it; the compiler alone doesn't need wgpu.
+gpu = ["wrela-host/gpu"]
+
 [lints]
 workspace = true
