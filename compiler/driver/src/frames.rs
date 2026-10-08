@@ -40,7 +40,7 @@ pub fn run(
     if has_errors(&diags) {
         return (Vec::new(), diags);
     }
-    let out = build::emit(&lowered, sources, !data.no_simd);
+    let out = build::emit(&lowered, sources, !data.no_simd, false);
     diags.extend(out.diagnostics);
     if has_errors(&diags) {
         return (Vec::new(), diags);

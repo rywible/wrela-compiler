@@ -15,6 +15,9 @@ const UNTESTED: &[&str] = &[
 /// The codes only `wrela test` reports: their programs are run as tests, not only checked.
 const FROM_TESTS: &[&str] = &["E0706"];
 
+/// The codes only a shipped build reports: their programs are built, not only checked.
+const FROM_BUILDS: &[&str] = &["E0707"];
+
 /// A program's diagnostics: `wrela check`'s, or for a code only tests report, `wrela test`'s
 /// with each failed test's.
 fn diagnose(
@@ -26,6 +29,9 @@ fn diagnose(
         let mut all = out.diagnostics;
         all.extend(out.results.into_iter().filter_map(|r| r.failure));
         (out.sources, all)
+    } else if FROM_BUILDS.contains(&code) {
+        let out = wrela_driver::build(dir);
+        (out.sources, out.diagnostics)
     } else {
         let out = wrela_driver::check(dir);
         (out.sources, out.diagnostics)

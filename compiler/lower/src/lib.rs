@@ -423,6 +423,11 @@ pub fn lower(
         }
         cx.err(Diagnostic::internal(format!("the CPU module's IR is malformed: {e}")));
     }
+    // A pipeline no command left in the CPU code records isn't built: behind a constant branch
+    // (`if test_build()`), it's out of the build with the code that recorded it.
+    if emit && !wrela_diag::has_errors(&cx.diags) {
+        recorded_pipelines_only(&mut cx, &mut cpu.m);
+    }
     // Pipelines: those CPU code records, then the standalone GPU checks.
     let mut pipelines = Vec::new();
     let mut i = 0;
@@ -458,6 +463,47 @@ pub fn lower(
     let mut diags = cx.diags;
     wrela_diag::sort_and_dedup(&mut diags);
     (lowered, diags)
+}
+
+/// Drops the pipelines no dispatch or draw in `cpu` records, and numbers the rest in order.
+fn recorded_pipelines_only(cx: &mut Cx, cpu: &mut ir::Module) {
+    let mut used = vec![false; cx.pipelines.len()];
+    for f in &cpu.functions {
+        ir::visit::walk(&f.body, &mut |s| {
+            if let Some(ir::Expr::Host(
+                ir::HostOp::Dispatch { pipeline, .. } | ir::HostOp::Draw { pipeline, .. },
+                _,
+            )) = s.expr()
+            {
+                used[*pipeline as usize] = true;
+            }
+        });
+    }
+    if used.iter().all(|&u| u) {
+        return;
+    }
+    let mut renumber = vec![0u32; used.len()];
+    let mut next = 0;
+    for (i, &u) in used.iter().enumerate() {
+        renumber[i] = next;
+        next += u32::from(u);
+    }
+    for f in &mut cpu.functions {
+        ir::visit::walk_mut(&mut f.body, &mut |s| {
+            if let ir::Stmt::Let(_, e) | ir::Stmt::Eval(e) = s
+                && let ir::Expr::Host(
+                    ir::HostOp::Dispatch { pipeline, .. } | ir::HostOp::Draw { pipeline, .. },
+                    _,
+                ) = e
+            {
+                *pipeline = renumber[*pipeline as usize];
+            }
+        });
+    }
+    let mut keep = used.iter();
+    cx.pipelines.retain(|_| *keep.next().unwrap_or(&false));
+    let mut keep = used.iter();
+    cx.pipeline_sites.retain(|_| *keep.next().unwrap_or(&false));
 }
 
 impl<'a> Cx<'a> {

@@ -231,6 +231,7 @@ codes! {
     E0704 = "E0704", "a constant whose computation panicked or trapped";
     E0705 = "E0705", "a constant whose computation ran past the build's fuel limit";
     E0706 = "E0706", "a `@test` that fails";
+    E0707 = "E0707", "a shipped build over a budget: its pipelines, or a pipeline's WGSL";
 
     // ---- E09xx: not in tier 0 --------------------------------------------------------------
 

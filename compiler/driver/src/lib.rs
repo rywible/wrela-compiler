@@ -461,7 +461,9 @@ fn compile_loaded(
         diagnostics.extend(d);
         pipelines = summarize(&checked, &sources, &lowered);
         if ok && emit {
-            let out = build::emit(&lowered, &sources, !data.no_simd);
+            // A shipped build keeps its budgets; a test's, a debug or a lifted one may go over.
+            let budgets = mode == Mode::Release && lift.is_empty();
+            let out = build::emit(&lowered, &sources, !data.no_simd, budgets);
             diagnostics.extend(out.diagnostics);
             files = out.files;
             if let Some(t) = &data.lift {

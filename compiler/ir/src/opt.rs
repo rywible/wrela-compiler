@@ -1696,37 +1696,91 @@ fn sink_block(m: &Module, f: &Function, b: &mut Block) {
 
 /// Replaces each `if` whose condition is a constant `bool` with the branch it takes. Code
 /// behind `if debug_build()` is then not in a release build, and neither are the functions
-/// only it calls (a failed `assert`'s formatted values, std's checks of declared bounds).
+/// only it calls (a failed `assert`'s formatted values, std's checks of declared bounds). A
+/// condition read from a local that only known values were stored in is known too: `a && b`
+/// and `a || b` hold their value in one, so `if test_build() && counting` is folded as well.
 fn fold_constant_branches(f: &mut Function) {
+    let taken = address_taken(f);
     let body = std::mem::take(&mut f.body);
-    f.body = fold_block(body, &mut HashMap::new());
+    f.body = fold_block(body, &mut HashMap::new(), &mut HashMap::new(), &taken);
 }
 
-fn fold_block(b: Block, known: &mut HashMap<ValueId, bool>) -> Block {
+/// Folds `b`. `values` are the `bool` values known; `locals` the `bool` each local holds where
+/// that's known (a local whose address isn't `taken`, which only its own stores write).
+fn fold_block(
+    b: Block,
+    values: &mut HashMap<ValueId, bool>,
+    locals: &mut HashMap<LocalId, bool>,
+    taken: &[bool],
+) -> Block {
     let mut out = Vec::with_capacity(b.len());
     for s in b {
         match s {
             Stmt::Let(v, Expr::Const(Const::Bool(c))) => {
-                known.insert(v, c);
+                values.insert(v, c);
                 out.push(Stmt::Let(v, Expr::Const(Const::Bool(c))));
             }
-            Stmt::Let(v, Expr::Unary(UnOp::Not, x)) if known.contains_key(&x) => {
-                let c = !known[&x];
-                known.insert(v, c);
+            Stmt::Let(v, Expr::Unary(UnOp::Not, x)) if values.contains_key(&x) => {
+                let c = !values[&x];
+                values.insert(v, c);
                 out.push(Stmt::Let(v, Expr::Const(Const::Bool(c))));
             }
-            Stmt::If { cond, then, else_ } => match known.get(&cond).copied() {
-                Some(c) => out.extend(fold_block(if c { then } else { else_ }, known)),
-                None => out.push(Stmt::If {
-                    cond,
-                    then: fold_block(then, known),
-                    else_: fold_block(else_, known),
-                }),
+            Stmt::Let(v, Expr::Load(p))
+                if p.path.is_empty()
+                    && let Some(&c) = p.root_local().and_then(|l| locals.get(&l)) =>
+            {
+                values.insert(v, c);
+                out.push(Stmt::Let(v, Expr::Const(Const::Bool(c))));
+            }
+            Stmt::Store(p, v) => {
+                if let Some(l) = p.root_local() {
+                    match values.get(&v) {
+                        Some(&c) if p.path.is_empty() && !taken[l.index()] => {
+                            locals.insert(l, c);
+                        }
+                        _ => {
+                            locals.remove(&l);
+                        }
+                    }
+                }
+                out.push(Stmt::Store(p, v));
+            }
+            Stmt::If { cond, then, else_ } => match values.get(&cond).copied() {
+                Some(c) => {
+                    out.extend(fold_block(if c { then } else { else_ }, values, locals, taken))
+                }
+                None => {
+                    // A local is known after the `if` where both branches leave it the same.
+                    let mut on_else = locals.clone();
+                    let then = fold_block(then, values, locals, taken);
+                    let else_ = fold_block(else_, values, &mut on_else, taken);
+                    locals.retain(|l, c| on_else.get(l) == Some(c));
+                    out.push(Stmt::If { cond, then, else_ });
+                }
             },
-            Stmt::Loop { body, continuing } => out.push(Stmt::Loop {
-                body: fold_block(body, known),
-                continuing: fold_block(continuing, known),
-            }),
+            Stmt::Loop { body, continuing } => {
+                // A local the loop stores to holds what the pass before left, in it and after
+                // it: unknown.
+                let mut stored = Vec::new();
+                for b in [&body, &continuing] {
+                    visit::walk(b, &mut |s| {
+                        if let Stmt::Store(p, _) = s
+                            && let Some(l) = p.root_local()
+                        {
+                            stored.push(l);
+                        }
+                    });
+                }
+                stored.iter().for_each(|l| {
+                    locals.remove(l);
+                });
+                let body = fold_block(body, values, locals, taken);
+                let continuing = fold_block(continuing, values, locals, taken);
+                stored.iter().for_each(|l| {
+                    locals.remove(l);
+                });
+                out.push(Stmt::Loop { body, continuing });
+            }
             s => out.push(s),
         }
         // What follows a branch that always leaves the block never runs.

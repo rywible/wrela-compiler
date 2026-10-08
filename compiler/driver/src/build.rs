@@ -23,8 +23,17 @@ pub struct BuildOutput {
     pub lines: Vec<(u32, Option<wrela_diag::Span>)>,
 }
 
+/// A scene's pipelines at most (vision.md's budget, D-068), counting those that run only at
+/// load.
+pub const MAX_PIPELINES: usize = 64;
+
+/// A pipeline's WGSL at most, in bytes: what a browser compiles while the scene loads (spike 13).
+pub const MAX_WGSL_BYTES: usize = 256 * 1024;
+
 /// Runs the back ends over a lowered program. `sources` names the locations a trap reports.
-pub fn emit(l: &Lowered, sources: &SourceMap, simd: bool) -> BuildOutput {
+/// With `budgets`, a shipped build's, it's E0707 to have more than `MAX_PIPELINES` pipelines,
+/// or a pipeline whose WGSL is over `MAX_WGSL_BYTES`.
+pub fn emit(l: &Lowered, sources: &SourceMap, simd: bool, budgets: bool) -> BuildOutput {
     let mut diagnostics = Vec::new();
     let mut files = Vec::new();
     let mut code_lines = Vec::new();
@@ -91,6 +100,22 @@ pub fn emit(l: &Lowered, sources: &SourceMap, simd: bool) -> BuildOutput {
                 continue;
             }
         };
+        if budgets
+            && wgsl.text.len() > MAX_WGSL_BYTES
+            && let Some(&at) = p.sites.first()
+        {
+            diagnostics.push(over_budget(
+                at,
+                format!(
+                    "`{}`'s WGSL is {} KiB, over the {} KiB a pipeline's shader may be",
+                    p.name,
+                    wgsl.text.len().div_ceil(1024),
+                    MAX_WGSL_BYTES / 1024
+                ),
+                "a browser compiles each pipeline's WGSL while the scene loads",
+                "move work that its own pass can do there, or keep a big function a call (`ir::opt`)",
+            ));
+        }
         files.push((shader.clone(), wgsl.text.into_bytes()));
         manifest.pipelines.push(wrela_abi::manifest::Pipeline {
             name: p.name.clone(),
@@ -109,6 +134,18 @@ pub fn emit(l: &Lowered, sources: &SourceMap, simd: bool) -> BuildOutput {
             debug_flag: p.debug_flag,
         });
     }
+    if budgets
+        && l.pipelines.len() > MAX_PIPELINES
+        && let Some(&at) = l.pipelines[MAX_PIPELINES].sites.first()
+    {
+        let n = l.pipelines.len();
+        diagnostics.push(over_budget(
+            at,
+            format!("this build has {n} pipelines, over the {MAX_PIPELINES} a scene may have: this command's is pipeline {}", MAX_PIPELINES + 1),
+            "a scene's pipelines are made while it loads, those it runs only then too (vision.md's budget)",
+            "record work with fewer entry points, or the same ones with different arguments",
+        ));
+    }
     if let Err(e) = manifest.validate() {
         diagnostics.push(Diagnostic::internal(e.to_string()));
     }
@@ -117,4 +154,9 @@ pub fn emit(l: &Lowered, sources: &SourceMap, simd: bool) -> BuildOutput {
         files.push((path.to_string(), bytes.to_vec()));
     }
     BuildOutput { files, diagnostics, lines: code_lines }
+}
+
+/// E0707: a shipped build over one of its budgets, at the command that records what's over.
+fn over_budget(at: wrela_diag::Span, message: String, note: &str, help: &str) -> Diagnostic {
+    Diagnostic::new(wrela_diag::codes::E0707, at, message).with_note(note).with_help(help)
 }
