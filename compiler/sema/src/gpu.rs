@@ -467,6 +467,26 @@ fn check_entry(p: &Program, f: FnId, entry: Entry, out: &mut Vec<Diagnostic>) {
             );
             out.push(d);
         }
+        // So are a span's and a buffer-backed kernel output's elements: every way to make one
+        // bounds them `GpuData`, and this keeps it so whatever makes one. (Workgroup memory,
+        // `Shared<T, N>`, is the GPU's alone, so its elements needn't be.)
+        if let TyKind::Adt(_, args) = p.types.kind(ps.ty)
+            && matches!(
+                lang,
+                Some(Lang::GpuSpan | Lang::Slots | Lang::Atomics | Lang::One | Lang::Append)
+            )
+            && let Some(&elem) = args.first()
+            && !p.types.has_params(elem)
+            && !crate::traits::implements_builtin(p, elem, Lang::GpuData)
+        {
+            let mut d = not_gpu_data(p, &ps.name, elem, ps.span);
+            d.message = format!(
+                "`{}` holds `{}`s, which aren't `GpuData`, so they can't be on the GPU",
+                ps.name,
+                p.display_ty(elem)
+            );
+            out.push(d);
+        }
         // A fragment shader may count into atomics (a test's tally of what it shaded, say);
         // WebGPU forbids a vertex shader writable storage.
         let fragment_atomics = entry == Entry::Fragment && lang == Some(Lang::Atomics);

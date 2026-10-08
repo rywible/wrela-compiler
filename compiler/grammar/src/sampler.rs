@@ -165,15 +165,22 @@ impl Reader<'_> {
                             } else {
                                 lo
                             };
+                        if hi < lo {
+                            return Err(self.err("a range whose end is before its start"));
+                        }
                         ranges.push((lo, hi));
                     }
                     self.pos += 1;
                     let inside = |c: char| ranges.iter().any(|(lo, hi)| (*lo..=*hi).contains(&c));
-                    let pool = if negated {
+                    let pool: Vec<char> = if negated {
                         NEGATED_POOL.chars().filter(|c| !inside(*c)).collect()
                     } else {
                         ranges.iter().flat_map(|(lo, hi)| *lo..=*hi).collect()
                     };
+                    // A sample draws one of its characters: a class with none can't be sampled.
+                    if pool.is_empty() {
+                        return Err(self.err("a class that matches no character"));
+                    }
                     Atom::Class { negated, ranges, pool }
                 }
                 Some('(') => {
@@ -523,6 +530,25 @@ mod tests {
         ] {
             assert_eq!(g.recognizes(g.root, s), ok, "{s:?}");
         }
+    }
+
+    /// A class that matches no character can't be sampled: an empty one, a reversed range, or
+    /// one negated over everything sampling draws from.
+    #[test]
+    fn rejects_classes_that_match_nothing() {
+        assert!(Gbnf::parse("root ::= []\n").unwrap_err().contains("matches no character"));
+        assert!(Gbnf::parse("root ::= [z-a]\n").unwrap_err().contains("end is before its start"));
+        let all: String = NEGATED_POOL
+            .chars()
+            .map(|c| match c {
+                '\\' | ']' | '-' | '^' => format!("\\{c}"),
+                '\n' => "\\n".into(),
+                '\t' => "\\t".into(),
+                c => c.to_string(),
+            })
+            .collect();
+        let err = Gbnf::parse(&format!("root ::= [^{all}]\n")).unwrap_err();
+        assert!(err.contains("matches no character"), "{err}");
     }
 
     #[test]

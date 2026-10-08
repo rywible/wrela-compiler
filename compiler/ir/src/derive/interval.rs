@@ -1959,6 +1959,7 @@ impl<'a> Ivx<'a> {
     }
 
     /// `a - b trunc(a / b)`: the sign of `a`, smaller than `|b|`, and within rounding of that.
+    /// A divisor that could be zero gives a NaN there (`a % 0`): unbounded, as `div`'s is.
     fn rem(&mut self, out: &mut Block, ty: TypeId, x: &[Iv]) -> R<Iv> {
         let (a, b) = (x[0], x[1]);
         let bm = self.magnitude(out, b, ty);
@@ -1975,7 +1976,13 @@ impl<'a> Ivx<'a> {
         let am = self.magnitude(out, a, ty);
         let mag = self.bin(out, BinOp::Add, am, bm, ty);
         let ulps = if self.gpu() { 16.0 } else { 4.0 };
-        Ok(self.widen_mag(out, (lo, hi), ty, (mag, mag), ulps, 0.0))
+        let r = self.widen_mag(out, (lo, hi), ty, (mag, mag), ulps, 0.0);
+        let le = self.cmp(out, BinOp::Le, b.0, z);
+        let ge = self.cmp(out, BinOp::Ge, b.1, z);
+        let bt = self.bool_ty();
+        let zero_in = self.bin(out, BinOp::And, le, ge, bt);
+        let (fl, fh) = self.full(out, ty);
+        Ok((self.select(out, zero_in, fl, r.0), self.select(out, zero_in, fh, r.1)))
     }
 
     fn compare(&mut self, out: &mut Block, op: BinOp, a: Iv, b: Iv, s: Scalar) -> Iv {

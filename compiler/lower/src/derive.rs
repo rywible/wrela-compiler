@@ -93,7 +93,7 @@ pub(crate) fn signature(cx: &mut Cx, mb: &mut ModuleBuilder, key: &InstanceKey) 
             // `T`'s type, with `value_gradient_with`: one with no value (`()`) leaves the
             // function no result.
             let with = match output {
-                Some(t) => cx.lower_ty(mb, *t, span).map(Some),
+                Some(t) => Some(cx.lower_ty(mb, *t, span)),
                 None => Some(None),
             };
             if let (Some(x), Some(with)) = (x, with) {
@@ -334,19 +334,23 @@ fn build(
         }
         // The captures are every parameter but the last, the input.
         DeriveKind::ValueAndGradient => {
-            let ncap = mb.m.functions[id.index()].params.len() as u32 - 1;
-            ir::derive::value_and_gradient(
-                &mut mb.m,
-                &mut mb.derived,
-                inner,
-                ncap,
-                target,
-                output.is_some(),
-            )
+            // The captures are every parameter but the last, the input; a signature without
+            // one (which `derived_signature` couldn't make) has no derivation.
+            match (mb.m.functions[id.index()].params.len() as u32).checked_sub(1) {
+                Some(ncap) => ir::derive::value_and_gradient(
+                    &mut mb.m,
+                    &mut mb.derived,
+                    inner,
+                    ncap,
+                    target,
+                    output.is_some(),
+                ),
+                None => Err(ir::Error::internal("a gradient's signature has no input")),
+            }
         }
         DeriveKind::Interval => {
             let sig = &mb.m.functions[id.index()];
-            let ncap = sig.params.len() as u32 - 1;
+            let ncap = (sig.params.len() as u32).saturating_sub(1);
             match (sig.params.last().map(|p| p.ty), sig.ret) {
                 (Some(box_ty), Some(interval_ty)) => ir::derive::interval(
                     &mut mb.m,

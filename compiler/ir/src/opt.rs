@@ -749,7 +749,8 @@ fn specialize_uniform_calls(m: &mut Module) -> Vec<bool> {
     };
     // The values that are uniform data at a fixed place: a load, a struct's field of one, or
     // a load from a local that holds one (a parameter kept in a local: stored once, whole, and
-    // never written again or lent).
+    // never written again or lent). A local holds it only after its store: in the rest of the
+    // store's block and the blocks in it, which control flow can't reach without the store.
     let loads_of = |m: &Module, f: &Function| {
         let lent = address_taken(f);
         let mut stores = vec![0u32; f.locals.len()];
@@ -761,37 +762,7 @@ fn specialize_uniform_calls(m: &mut Module) -> Vec<bool> {
             }
         });
         let mut loads: HashMap<ValueId, Place> = HashMap::new();
-        let mut held: HashMap<LocalId, Place> = HashMap::new();
-        visit::walk(&f.body, &mut |s| match s {
-            Stmt::Let(v, Expr::Load(p)) if !p.has_index() => {
-                if read_only(m, p) {
-                    loads.insert(*v, p.clone());
-                } else if let PlaceRoot::Local(l) = p.root
-                    && let Some(at) = held.get(&l)
-                {
-                    let mut at = at.clone();
-                    at.path.extend(p.path.iter().cloned());
-                    loads.insert(*v, at);
-                }
-            }
-            Stmt::Let(v, Expr::Extract(base, k))
-                if matches!(m.types.get(f.values[base.index()]), TypeDef::Struct { .. }) =>
-            {
-                if let Some(p) = loads.get(base).map(|p| p.with(Proj::Field(*k))) {
-                    loads.insert(*v, p);
-                }
-            }
-            Stmt::Store(p, v) if p.path.is_empty() => {
-                if let PlaceRoot::Local(l) = p.root
-                    && stores[l.index()] == 1
-                    && !lent[l.index()]
-                    && let Some(at) = loads.get(v)
-                {
-                    held.insert(l, at.clone());
-                }
-            }
-            _ => {}
-        });
+        uniform_loads(m, f, &f.body, &lent, &stores, &mut loads, &mut HashMap::new());
         loads
     };
     // Each function's, found once: a call changed to call a copy leaves them as they were.
@@ -858,6 +829,56 @@ fn specialize_uniform_calls(m: &mut Module) -> Vec<bool> {
         copies[h.index()] = true;
     }
     copies
+}
+
+/// `specialize_uniform_calls`' scan of block `b`: each value that's uniform data at a fixed
+/// place into `loads`, with `held` the locals that hold some where `b` starts. What a store in
+/// `b` makes a local hold, it holds in the rest of `b` and the blocks in it, not after `b`.
+fn uniform_loads(
+    m: &Module,
+    f: &Function,
+    b: &Block,
+    lent: &[bool],
+    stores: &[u32],
+    loads: &mut HashMap<ValueId, Place>,
+    held: &mut HashMap<LocalId, Place>,
+) {
+    for s in b {
+        match s {
+            Stmt::Let(v, Expr::Load(p)) if !p.has_index() => {
+                if read_only(m, p) {
+                    loads.insert(*v, p.clone());
+                } else if let PlaceRoot::Local(l) = p.root
+                    && let Some(at) = held.get(&l)
+                {
+                    let mut at = at.clone();
+                    at.path.extend(p.path.iter().cloned());
+                    loads.insert(*v, at);
+                }
+            }
+            Stmt::Let(v, Expr::Extract(base, k))
+                if matches!(m.types.get(f.values[base.index()]), TypeDef::Struct { .. }) =>
+            {
+                if let Some(p) = loads.get(base).map(|p| p.with(Proj::Field(*k))) {
+                    loads.insert(*v, p);
+                }
+            }
+            Stmt::Store(p, v) if p.path.is_empty() => {
+                if let PlaceRoot::Local(l) = p.root
+                    && stores[l.index()] == 1
+                    && !lent[l.index()]
+                    && let Some(at) = loads.get(v)
+                {
+                    held.insert(l, at.clone());
+                }
+            }
+            _ => {}
+        }
+        for inner in s.blocks() {
+            let mut inside = held.clone();
+            uniform_loads(m, f, inner, lent, stores, loads, &mut inside);
+        }
+    }
 }
 
 /// The size of an entry point inlined whole, in statements, past which functions that take
@@ -2570,6 +2591,72 @@ mod tests {
             out
         };
         assert_eq!(calls, [(twice, 2), (twice, 2), (FuncId(3), 1), (FuncId(3), 1)]);
+    }
+
+    /// A local stored with uniform data inside a branch holds it only there: a load after the
+    /// branch, which control flow reaches without the store, isn't uniform data, so a call given
+    /// it stays a call of the function it calls (`uniform_loads`). One in the branch is.
+    #[test]
+    fn a_store_in_a_branch_holds_uniform_data_only_in_it() {
+        let mut m = Module::default();
+        let f32t = m.types.f32();
+        let boolt = m.types.bool();
+        let table = m.types.intern(TypeDef::Array(f32t, 64));
+        let block = m.types.intern(TypeDef::Struct {
+            name: "Block".into(),
+            fields: vec![("table".into(), table)],
+        });
+        let u = m.add_resource(Resource {
+            name: "u".into(),
+            binding: 0,
+            kind: ResourceKind::Uniform { storage: true },
+            ty: block,
+        });
+        let whole = Place::root(PlaceRoot::Resource(u)).with(Proj::Field(0));
+        // fn pick(t: [f32; 64]) -> f32 { 1.0 }
+        let ps = vec![Param { name: "t".into(), ty: table, by_ref: false, mutable: false }];
+        let mut pick = Function::new("pick", ps, Some(f32t));
+        let (t, one) = (pick.new_value(table), pick.new_value(f32t));
+        pick.body = vec![
+            Stmt::Let(t, Expr::Param(0)),
+            Stmt::Let(one, Expr::Const(Const::F32(1.0))),
+            Stmt::Return(Some(one)),
+        ];
+        let pick = m.add_function(pick);
+        // fn main(c: bool) -> f32 { var l; if c { l = u.table; pick(l) } ; pick(l) }
+        let ps = vec![Param { name: "c".into(), ty: boolt, by_ref: false, mutable: false }];
+        let mut main = Function::new("main", ps, Some(f32t));
+        let l = main.new_local("l", table);
+        let c = main.new_value(boolt);
+        let (d, inside, inner) =
+            (main.new_value(table), main.new_value(table), main.new_value(f32t));
+        let (after, outer) = (main.new_value(table), main.new_value(f32t));
+        main.body = vec![
+            Stmt::Let(c, Expr::Param(0)),
+            Stmt::If {
+                cond: c,
+                then: vec![
+                    Stmt::Let(d, Expr::Load(whole.clone())),
+                    Stmt::Store(Place::local(l), d),
+                    Stmt::Let(inside, Expr::Load(Place::local(l))),
+                    Stmt::Let(inner, Expr::Call(pick, vec![Arg::Value(inside)])),
+                ],
+                else_: Vec::new(),
+            },
+            Stmt::Let(after, Expr::Load(Place::local(l))),
+            Stmt::Let(outer, Expr::Call(pick, vec![Arg::Value(after)])),
+            Stmt::Return(Some(outer)),
+        ];
+        let main = m.add_function(main);
+        specialize_uniform_calls(&mut m);
+        let mut calls = Vec::new();
+        visit::walk(&m.functions[main.index()].body, &mut |s| {
+            if let Some(Expr::Call(g, args)) = s.expr() {
+                calls.push((*g, args.len()));
+            }
+        });
+        // The call in the branch reads the uniform in a copy; the one after it doesn't.
+        assert_eq!(calls, [(FuncId(2), 0), (pick, 1)], "{:?}", m.functions[main.index()].body);
     }
 
     fn param(m: &mut Module, by_ref: bool) -> Param {

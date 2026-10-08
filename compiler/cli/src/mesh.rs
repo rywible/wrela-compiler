@@ -107,6 +107,9 @@ pub fn parse_stl(bytes: &[u8]) -> Result<Mesh, String> {
     if bytes.len() != 84 + 50 * n {
         return Err("the STL isn't a binary STL (ASCII STL isn't read)".to_string());
     }
+    if n == 0 {
+        return Err("the STL has no triangles".to_string());
+    }
     let mut index = std::collections::HashMap::new();
     let mut vertices = Vec::new();
     let mut triangles = Vec::with_capacity(n);
@@ -602,6 +605,10 @@ pub(crate) mod tests {
         assert_eq!(m.vertices.len(), 4);
         assert_eq!(m.triangles.len(), 2);
         assert!(parse_stl(&bytes[..100]).is_err());
+        // A header that counts no triangles is no mesh, as an OBJ without faces isn't.
+        let mut empty = vec![0u8; 80];
+        empty.extend(0u32.to_le_bytes());
+        assert!(parse_stl(&empty).is_err_and(|e| e.contains("no triangles")));
     }
 
     #[test]

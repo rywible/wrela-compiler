@@ -279,7 +279,30 @@ impl Verifier<'_> {
                     let (x, y) = (self.show(self.ty(*first)), self.show(self.ty(*odd)));
                     return Err(bug(format!("{b:?} of `{x}` and `{y}`")));
                 }
-                return Ok(None);
+                if args.len() != b.arity() {
+                    return Err(bug(format!(
+                        "{b:?} given {} arguments, not {}",
+                        args.len(),
+                        b.arity()
+                    )));
+                }
+                // Its result: its arguments' type, elementwise; a bit count's `u32`; a
+                // reduction's scalar; `AllEqual`'s `bool`.
+                let t = self.ty(args[0]);
+                let result = match b {
+                    Builtin::CountOnes | Builtin::LeadingZeros | Builtin::TrailingZeros => {
+                        types.lookup(&TypeDef::Scalar(Scalar::U32))
+                    }
+                    Builtin::Length | Builtin::Distance | Builtin::Dot => match self.def(t) {
+                        TypeDef::Vector(s, _) | TypeDef::Scalar(s) => {
+                            types.lookup(&TypeDef::Scalar(*s))
+                        }
+                        _ => None,
+                    },
+                    Builtin::AllEqual => types.lookup(&TypeDef::Scalar(Scalar::Bool)),
+                    _ => Some(t),
+                };
+                return Ok(result);
             }
             Expr::Construct(t, parts) => {
                 self.construct(*t, parts)?;

@@ -30,13 +30,19 @@ pub(super) fn value_and_gradient(
     let x_ty = func.params.get(xi).ok_or_else(|| Error::internal("no input parameter"))?.ty;
     let n = dims(m, x_ty)?;
     let f32 = m.types.f32();
-    // With a payload: `f` returns `(f32, T)`; the value is its first field.
-    let payload = match (with, func.ret.map(|r| m.types.get(r).clone())) {
-        (false, _) if func.ret == Some(f32) && !func.ret_ref => None,
+    // With a payload: `f` returns `(f32, T)`; the value is its first field. A `T` with no value
+    // (`()`) leaves the value alone in it.
+    let (wrapped, payload) = match (with, func.ret.map(|r| m.types.get(r).clone())) {
+        (false, _) if func.ret == Some(f32) && !func.ret_ref => (false, None),
         (true, Some(TypeDef::Struct { fields, .. }))
             if fields.len() == 2 && fields[0].1 == f32 && !func.ret_ref =>
         {
-            Some(fields[1].1)
+            (true, Some(fields[1].1))
+        }
+        (true, Some(TypeDef::Struct { fields, .. }))
+            if fields.len() == 1 && fields[0].1 == f32 && !func.ret_ref =>
+        {
+            (true, None)
         }
         (false, _) => {
             return Err(Error::not_derivable("a gradient needs a function that returns an `f32`"));
@@ -86,9 +92,8 @@ pub(super) fn value_and_gradient(
     let r = g.let_(&mut body, dual_ty, Expr::Call(d, args));
     // The value (with a payload, the first field of `f`'s result), and the payload.
     let ret = func.ret.ok_or_else(|| Error::internal("no result"))?;
-    let first = |g: &mut Function, body: &mut Block, of: ValueId| match payload {
-        None => of,
-        Some(_) => g.let_(body, f32, Expr::Extract(of, 0)),
+    let first = |g: &mut Function, body: &mut Block, of: ValueId| {
+        if wrapped { g.let_(body, f32, Expr::Extract(of, 0)) } else { of }
     };
     let (value, parts, result) = if returns {
         let whole = g.let_(&mut body, ret, Expr::Extract(r, 0));

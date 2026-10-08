@@ -179,6 +179,17 @@ pub enum Builtin {
 }
 
 impl Builtin {
+    /// How many arguments it takes.
+    pub fn arity(self) -> usize {
+        use Builtin as B;
+        match self {
+            B::Atan2 | B::Pow | B::Min | B::Max | B::Step | B::Distance | B::Dot | B::Cross => 2,
+            B::AllEqual => 2,
+            B::Clamp | B::Mix | B::Smoothstep => 3,
+            _ => 1,
+        }
+    }
+
     /// Applies to each component of its arguments, which are all of one type: everything but
     /// the geometric functions and `AllEqual`.
     pub fn is_elementwise(self) -> bool {

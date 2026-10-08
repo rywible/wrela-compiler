@@ -307,15 +307,13 @@ pub fn make(ttf: &[u8], o: &Options) -> Result<Vec<u8>, String> {
         });
         fields.extend(bytes);
     }
-    let by_id: BTreeMap<u16, u32> =
+    let glyph_codepoints: Vec<(u16, u32)> =
         ids.iter().zip(latin1()).map(|(id, c)| (id.0, c as u32)).collect();
-    let mut kerning = BTreeMap::new();
-    for ((a, b), v) in gpos_kerning(&face, &ids) {
+    let quantized = gpos_kerning(&face, &ids).into_iter().filter_map(|(pair, v)| {
         let q = (f64::from(v) / upem * f64::from(KERN_UNIT)).round() as f32 / KERN_UNIT;
-        if q != 0.0 {
-            kerning.insert((by_id[&a], by_id[&b]), q);
-        }
-    }
+        (q != 0.0).then_some((pair, q))
+    });
+    let kerning = by_codepoint(&glyph_codepoints, quantized);
     let font = Font {
         em: o.em,
         spread: o.spread,
@@ -451,9 +449,42 @@ impl Font {
     }
 }
 
+/// Kerning by codepoint pair, from kerning by glyph pair and each codepoint's glyph: a glyph
+/// that stands for more than one codepoint (the soft hyphen's `-`) kerns as each of them.
+fn by_codepoint(
+    glyphs: &[(u16, u32)],
+    pairs: impl IntoIterator<Item = ((u16, u16), f32)>,
+) -> BTreeMap<(u32, u32), f32> {
+    let mut codepoints: BTreeMap<u16, Vec<u32>> = BTreeMap::new();
+    for &(id, c) in glyphs {
+        codepoints.entry(id).or_default().push(c);
+    }
+    let mut out = BTreeMap::new();
+    for ((a, b), v) in pairs {
+        let (Some(ca), Some(cb)) = (codepoints.get(&a), codepoints.get(&b)) else { continue };
+        for &x in ca {
+            for &y in cb {
+                out.insert((x, y), v);
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A hyphen's glyph standing in for the soft hyphen kerns as both: the hyphen's kerning
+    /// isn't lost to the soft hyphen's.
+    #[test]
+    fn a_glyph_for_two_codepoints_kerns_as_both() {
+        let glyphs = [(7, 'T' as u32), (9, '-' as u32), (9, 0xAD)];
+        let k = by_codepoint(&glyphs, [((7, 9), -0.05)]);
+        assert_eq!(k.get(&('T' as u32, '-' as u32)), Some(&-0.05));
+        assert_eq!(k.get(&('T' as u32, 0xAD)), Some(&-0.05));
+        assert_eq!(k.len(), 2);
+    }
 
     /// A square, wound as TrueType winds an outer contour: its field is positive inside,
     /// negative outside, and half-way at the edge.

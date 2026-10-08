@@ -96,23 +96,34 @@ pub fn could_unify(p: &Program, a: TyId, b: TyId) -> bool {
 /// variables could be anything.
 pub fn impls_could_meet(p: &Program, a: &[TyId], b: &[TyId]) -> bool {
     let mut bound = HashMap::new();
-    a.len() == b.len() && a.iter().zip(b).all(|(&x, &y)| meet(p, x, y, &mut bound, 0))
+    // Deeper than both heads together, a walk goes round a parameter bound to a type that
+    // holds it (`T` against `(T, T)`): then they could meet, as far as this can tell.
+    let size = |ts: &[TyId]| ts.iter().fold(0u32, |n, &t| n.saturating_add(p.types.size(t)));
+    let limit = size(a).saturating_add(size(b)).saturating_add(64);
+    a.len() == b.len() && a.iter().zip(b).all(|(&x, &y)| meet(p, x, y, &mut bound, 0, limit))
 }
 
-fn meet(p: &Program, a: TyId, b: TyId, bound: &mut HashMap<ParamId, TyId>, depth: u32) -> bool {
-    if a == b || depth > 64 {
+fn meet(
+    p: &Program,
+    a: TyId,
+    b: TyId,
+    bound: &mut HashMap<ParamId, TyId>,
+    depth: u32,
+    limit: u32,
+) -> bool {
+    if a == b || depth > limit {
         return true;
     }
     match (p.types.kind(a), p.types.kind(b)) {
         (&TyKind::Param(x), _) => match bound.get(&x) {
-            Some(&t) => meet(p, t, b, bound, depth + 1),
+            Some(&t) => meet(p, t, b, bound, depth + 1, limit),
             None => {
                 bound.insert(x, b);
                 true
             }
         },
         (_, &TyKind::Param(y)) => match bound.get(&y) {
-            Some(&t) => meet(p, a, t, bound, depth + 1),
+            Some(&t) => meet(p, a, t, bound, depth + 1, limit),
             None => {
                 bound.insert(y, a);
                 true
@@ -124,22 +135,24 @@ fn meet(p: &Program, a: TyId, b: TyId, bound: &mut HashMap<ParamId, TyId>, depth
         (TyKind::Adt(x, xs), TyKind::Adt(y, ys)) => {
             x == y
                 && xs.len() == ys.len()
-                && xs.iter().zip(ys).all(|(&s, &t)| meet(p, s, t, bound, depth + 1))
+                && xs.iter().zip(ys).all(|(&s, &t)| meet(p, s, t, bound, depth + 1, limit))
         }
         (TyKind::Tuple(xs), TyKind::Tuple(ys)) => {
             xs.len() == ys.len()
-                && xs.iter().zip(ys).all(|(&s, &t)| meet(p, s, t, bound, depth + 1))
+                && xs.iter().zip(ys).all(|(&s, &t)| meet(p, s, t, bound, depth + 1, limit))
         }
-        (TyKind::Array(x, n), TyKind::Array(y, m)) => n == m && meet(p, *x, *y, bound, depth + 1),
+        (TyKind::Array(x, n), TyKind::Array(y, m)) => {
+            n == m && meet(p, *x, *y, bound, depth + 1, limit)
+        }
         (TyKind::ArrayN(x, n), TyKind::ArrayN(y, m)) => {
-            meet(p, *x, *y, bound, depth + 1) && meet(p, *n, *m, bound, depth + 1)
+            meet(p, *x, *y, bound, depth + 1, limit) && meet(p, *n, *m, bound, depth + 1, limit)
         }
         (TyKind::ArrayN(x, n), &TyKind::Array(y, m))
         | (&TyKind::Array(y, m), TyKind::ArrayN(x, n)) => {
             let len = p.types.intern(TyKind::ConstU32(m));
-            meet(p, *x, y, bound, depth + 1) && meet(p, *n, len, bound, depth + 1)
+            meet(p, *x, y, bound, depth + 1, limit) && meet(p, *n, len, bound, depth + 1, limit)
         }
-        (TyKind::Slice(x), TyKind::Slice(y)) => meet(p, *x, *y, bound, depth + 1),
+        (TyKind::Slice(x), TyKind::Slice(y)) => meet(p, *x, *y, bound, depth + 1, limit),
         _ => false,
     }
 }

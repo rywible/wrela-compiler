@@ -971,7 +971,8 @@ impl PartsFile {
     pub fn solid(&self) -> Result<Solid, String> {
         let m = mesh::load(&self.mesh)?;
         let pieces = m.pieces();
-        let mut corners = m.corners(&pieces[0]);
+        let largest = pieces.first().ok_or("the mesh has no triangles")?;
+        let mut corners = m.corners(largest);
         for t in &mut corners {
             for p in t.iter_mut() {
                 *p = self.registration.place(*p);

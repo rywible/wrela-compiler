@@ -61,7 +61,8 @@ fn name(d: Dim) -> String {
 }
 
 /// An expression's dimension, when it's built from unit suffixes and numbers alone: `None`
-/// for anything else, and `Some(None)` for a bare number (which fits any).
+/// for anything else (or one whose exponents are past an `i8`'s, `1J ** 100`), and
+/// `Some(None)` for a bare number (which fits any).
 fn dim(e: &ast::Expr) -> Option<Option<Dim>> {
     match &e.kind {
         ExprKind::Lit(l) => match l.kind {
@@ -79,10 +80,17 @@ fn dim(e: &ast::Expr) -> Option<Option<Dim>> {
                 (None, None) => None,
                 (Some(d), None) => Some(d),
                 (None, Some(d)) if *op == BinOp::Mul => Some(d),
-                (None, Some(d)) => Some(d.map(|e| -e)),
+                (None, Some(d)) => Some(each(d, |e| e.checked_neg())?),
                 (Some(p), Some(q)) => {
-                    let s = if *op == BinOp::Mul { 1 } else { -1 };
-                    Some([p[0] + s * q[0], p[1] + s * q[1], p[2] + s * q[2]])
+                    let mut out = [0i8; 3];
+                    for k in 0..3 {
+                        out[k] = if *op == BinOp::Mul {
+                            p[k].checked_add(q[k])?
+                        } else {
+                            p[k].checked_sub(q[k])?
+                        };
+                    }
+                    Some(out)
                 }
             })
         }
@@ -90,11 +98,14 @@ fn dim(e: &ast::Expr) -> Option<Option<Dim>> {
         ExprKind::Binary(BinOp::Pow, a, b) => {
             let n = match &b.kind {
                 ExprKind::Lit(ast::Lit { kind: LitKind::Int(ast::IntValue::Ok(n)), .. }) => {
-                    *n as i8
+                    i8::try_from(*n).ok()?
                 }
                 _ => return None,
             };
-            Some(dim(a)?.map(|d| d.map(|e| e * n)))
+            Some(match dim(a)? {
+                Some(d) => Some(each(d, |e| e.checked_mul(n))?),
+                None => None,
+            })
         }
         ExprKind::Binary(BinOp::Add | BinOp::Sub, a, b) => match (dim(a)?, dim(b)?) {
             (Some(p), Some(q)) if p != q => None,
@@ -103,6 +114,11 @@ fn dim(e: &ast::Expr) -> Option<Option<Dim>> {
         },
         _ => None,
     }
+}
+
+/// `f` of each exponent of `d`, or `None` if one is past an `i8`'s.
+fn each(d: Dim, f: impl Fn(i8) -> Option<i8>) -> Option<Dim> {
+    Some([f(d[0])?, f(d[1])?, f(d[2])?])
 }
 
 /// The expression as written, for the forms `dim` reads: literals exactly as written.
