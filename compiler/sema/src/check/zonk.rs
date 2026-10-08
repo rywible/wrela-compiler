@@ -9,6 +9,14 @@ use crate::traits;
 use crate::ty::*;
 use wrela_diag::{Diagnostic, Span, codes};
 
+/// A command's entry point's types: its generic arguments, or its value's.
+fn shader_tys(sh: &mut Shader, f: &mut impl FnMut(&mut TyId)) {
+    match sh {
+        Shader::Named(_, args) => args.iter_mut().for_each(&mut *f),
+        Shader::Value(e) => walk_tys(e, f),
+    }
+}
+
 /// Applies `f` to every type in an expression tree.
 pub fn walk_tys(e: &mut Expr, f: &mut impl FnMut(&mut TyId)) {
     f(&mut e.ty);
@@ -88,15 +96,15 @@ pub fn walk_tys(e: &mut Expr, f: &mut impl FnMut(&mut TyId)) {
             }
         }
         ExprKind::Dispatch(d) => {
-            d.kernel_args.iter_mut().for_each(&mut *f);
+            shader_tys(&mut d.kernel, f);
             walk_tys(&mut d.groups, f);
             for (_, a) in &mut d.args {
                 walk_tys(a, f);
             }
         }
         ExprKind::Draw(d) => {
-            d.vertex.1.iter_mut().for_each(&mut *f);
-            d.fragment.1.iter_mut().for_each(&mut *f);
+            shader_tys(&mut d.vertex, f);
+            shader_tys(&mut d.fragment, f);
             walk_tys(&mut d.vertices, f);
             walk_tys(&mut d.instances, f);
             for i in d.indirect.iter_mut().chain(&mut d.indices) {
@@ -540,12 +548,16 @@ impl Markers<'_> {
                 }
             }
             ExprKind::Dispatch(d) => {
+                d.kernel.value().into_iter().for_each(|v| self.expr(v, false, out));
                 self.expr(&d.groups, false, out);
                 d.args.iter().for_each(|(_, a)| self.expr(a, true, out));
             }
             // A shader's arguments are checked against its parameters where it's bound (E0503,
             // E0504): a fragment shader's atomics are passed `mut`.
             ExprKind::Draw(d) => {
+                for v in [&d.vertex, &d.fragment].into_iter().filter_map(Shader::value) {
+                    self.expr(v, false, out);
+                }
                 self.expr(&d.vertices, false, out);
                 self.expr(&d.instances, false, out);
                 for e in d.indirect.iter().chain(&d.indices) {

@@ -1,0 +1,19 @@
+// rejects: gpu.bound gpu.domains
+// A kernel that shares workgroup memory isn't dispatched over a domain, even through a
+// function generic over the kernel it dispatches: lowering, which knows the kernel, says so.
+use std::gpu::{GlobalId, GpuBuffer, Kernel, Shared, Slots, buffer, dispatch}
+
+@compute(64)
+fn sum(xs: [f32], partial: mut Shared<f32, 64>, out: mut Slots<f32>, id: GlobalId) {
+    out[id] = xs[id.x]
+}
+
+fn run<K: Kernel>(k: K) {
+    dispatch(k, over: 64) //~ E0603
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    let xs: GpuBuffer<f32> = buffer(64)
+    var out: GpuBuffer<f32> = buffer(64)
+    run(sum.bind(xs, mut out))
+}

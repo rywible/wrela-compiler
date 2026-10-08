@@ -1,0 +1,103 @@
+// rejects: gpu.bound
+// A command takes a bound entry point of its own stage; a fragment shader takes what its
+// vertex shader gives; a generic function's bound says what it takes; a bound entry point holds
+// its loans while it lives; a value it borrows is a place; and nothing implements a bound entry
+// point's trait but a bound entry point.
+use std::gpu::{
+    ClipPosition, FragCoord, FragmentShader, GlobalId, GpuBuffer, Kernel, Slots,
+    VertexIndex, begin_screen_pass, buffer, dispatch, draw, present, write,
+}
+
+struct Big: GpuData {
+    a: vec4,
+}
+
+struct Quad: Copy {
+    pos: ClipPosition,
+    uv: vec2,
+}
+
+struct Wedge: Copy {
+    pos: ClipPosition,
+    w: f32,
+}
+
+@compute(64)
+fn fill(value: f32, out: mut Slots<f32>, id: GlobalId) {
+    out[id] = value
+}
+
+@compute(64)
+fn big(b: Big, out: mut Slots<f32>, id: GlobalId) {
+    out[id] = b.a.x
+}
+
+@vertex
+fn cover(v: VertexIndex) -> ClipPosition {
+    ClipPosition { position: vec4(f32(v.index), 0.0, 0.5, 1.0) }
+}
+
+@fragment
+fn flat(p: FragCoord, colour: vec4) -> vec4 {
+    colour
+}
+
+@fragment
+fn uv(q: Quad) -> vec4 {
+    vec4(q.uv, 0.0, 1.0)
+}
+
+@fragment
+fn weight(w: Wedge) -> vec4 {
+    vec4(w.w)
+}
+
+fn quads<F: FragmentShader<Quad>>(fs: F) {
+    draw(cover, fs, vertices: 3) //~ E0603
+}
+
+struct Mine {}
+
+impl Kernel for Mine {} //~ E0415
+
+fn stages(out: mut GpuBuffer<f32>) {
+    let fs = flat.bind(colour: vec4(1.0))
+    dispatch(fs, over: 64) //~ E0603
+    dispatch(3, over: 64) //~ E0603
+    let k = fill.bind(1.0, mut out)
+    begin_screen_pass(clear: vec4(0.0))
+    draw(cover, k, vertices: 3) //~ E0603
+    let f = uv.bind()
+    draw(cover, f, vertices: 3) //~ E0603
+    present()
+}
+
+fn bounds(out: mut GpuBuffer<f32>) {
+    begin_screen_pass(clear: vec4(0.0))
+    quads(flat.bind(colour: vec4(1.0)))
+    quads(weight.bind()) //~ E0400
+    present()
+}
+
+fn loans(out: mut GpuBuffer<f32>) {
+    let k = fill.bind(1.0, mut out)
+    write(mut out, 0, [1.0]) //~ E0506
+    dispatch(k, over: 64)
+}
+
+fn places(out: mut GpuBuffer<f32>) {
+    dispatch(big.bind(Big { a: vec4(1.0) }, mut out), over: 64)
+    let k = big.bind(Big { a: vec4(1.0) }, mut out) //~ E0508
+    dispatch(k, over: 64)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    var out: GpuBuffer<f32> = buffer(64)
+    stages(mut out)
+    bounds(mut out)
+    loans(mut out)
+    places(mut out)
+    let k = fill.bind(1.0, mut out)
+    dispatch(fill.bind(2.0, mut out), over: 64) //~ E0506
+    dispatch(k, over: 64)
+}

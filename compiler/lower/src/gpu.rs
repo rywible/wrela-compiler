@@ -678,13 +678,79 @@ fn recorded(fl: &mut Fl, span: Span, what: &str, record: impl FnOnce(&mut Fl) ->
     }
 }
 
+/// A command's entry point, as this instance records it: the function, its generic arguments,
+/// and where each parameter's argument is.
+struct Recorded {
+    func: FnId,
+    substs: Vec<TyId>,
+    /// A bound entry point's value, and the parameter each of its fields binds; `None` for an
+    /// entry point named where it's recorded, whose arguments are the command's.
+    value: Option<(mir::Place, Span, Vec<usize>)>,
+}
+
+impl Recorded {
+    /// The place of parameter `param`'s argument: a field of the value, or one of the
+    /// command's `args`.
+    fn arg<'d>(
+        &self,
+        param: usize,
+        args: impl IntoIterator<Item = (usize, &'d mir::Place, Span)>,
+    ) -> Option<(mir::Place, Span)> {
+        match &self.value {
+            Some((place, at, params)) => {
+                let k = params.iter().position(|&p| p == param)?;
+                Some((place.with(mir::Proj::Field(k as u32)), *at))
+            }
+            None => args.into_iter().find(|a| a.0 == param).map(|(_, p, s)| (p.clone(), s)),
+        }
+    }
+}
+
+/// What `s` records in this instance: a bound entry point's value is of its entry point's
+/// bound type here, whose fields hold the arguments (`gpu::bound_fields`).
+fn recorded_shader(fl: &mut Fl, s: &mir::Shader) -> Option<Recorded> {
+    match s {
+        mir::Shader::Named(f, args) => {
+            let substs = args.iter().map(|&a| fl.concrete(a)).collect();
+            Some(Recorded { func: *f, substs, value: None })
+        }
+        mir::Shader::Value(place, at) => {
+            let t = fl.place_src_ty(place);
+            let program = &fl.cx.checked.program;
+            let TyKind::Adt(a, args) = program.types.kind(t) else { return None };
+            let func = program.adt(*a).entry?;
+            let params =
+                wrela_sema::gpu::bound_fields(program, func).iter().map(|b| b.param).collect();
+            Some(Recorded { func, substs: args.clone(), value: Some((place.clone(), *at, params)) })
+        }
+    }
+}
+
 fn record_dispatch(fl: &mut Fl, d: &mir::Dispatch, span: Span) -> Option<()> {
     if fl.is_gpu() {
         host_effect(fl, "`dispatch`", span);
         return None;
     }
-    let substs: Vec<TyId> = d.kernel_args.iter().map(|&a| fl.concrete(a)).collect();
-    let key = PipelineKey::Compute { kernel: d.kernel, substs, over: d.over };
+    let kernel = recorded_shader(fl, &d.kernel)?;
+    // A kernel a generic function dispatches over a domain is known here (§12, E0603).
+    if d.over
+        && kernel.value.is_some()
+        && wrela_sema::gpu::shares_memory(&fl.cx.checked.program, kernel.func)
+    {
+        let name = fl.cx.checked.program.func(kernel.func).name.clone();
+        fl.cx.err(
+            Diagnostic::new(
+                codes::E0603,
+                span,
+                format!("`{name}` shares workgroup memory, so it isn't dispatched over a domain"),
+            )
+            .with_note("its invocations past the domain would still reach its barriers, and what they add to the memory is the kernel's to decide")
+            .with_help("dispatch it by `groups:`, and check its `GlobalId` against what it covers"),
+        );
+        return None;
+    }
+    let key =
+        PipelineKey::Compute { kernel: kernel.func, substs: kernel.substs.clone(), over: d.over };
     let (pindex, iface) = pipeline(fl.cx, key, span);
     let mut groups = Vec::new();
     match &d.indirect {
@@ -704,7 +770,7 @@ fn record_dispatch(fl: &mut Fl, d: &mir::Dispatch, span: Span) -> Option<()> {
     // Over a domain: `groups` is its size, which the groups cover, each a workgroup's.
     let domain = d.over.then(|| groups.clone());
     if let Some(size) = &domain {
-        let wg = match fl.cx.entry_of(d.kernel) {
+        let wg = match fl.cx.entry_of(kernel.func) {
             Some(Entry::Compute(wg)) => wg,
             _ => [1, 1, 1],
         };
@@ -719,7 +785,7 @@ fn record_dispatch(fl: &mut Fl, d: &mir::Dispatch, span: Span) -> Option<()> {
             })
             .collect();
     }
-    let arg = |i: usize| d.args.iter().find(|a| a.0 == i).map(|(_, p, s)| (p, *s));
+    let arg = |i: usize| kernel.arg(i, d.args.iter().map(|(i, p, s)| (*i, p, *s)));
     let (mut uniform_fields, mut uniform_vals) = uniforms(fl, &iface, |_, i| arg(i))?;
     if let Some(size) = domain {
         let v3 = fl.mb.m.types.intern(ir::TypeDef::Vector(ir::Scalar::U32, 3));
@@ -752,10 +818,10 @@ const DOMAIN: &str = "domain";
 /// The uniform block's fields and their values: each uniform leaf whose argument (`arg` of an
 /// entry point's parameter) has a runtime value, as `bind_uniform` makes the block. `None` if
 /// one can't be read.
-fn uniforms<'d>(
+fn uniforms(
     fl: &mut Fl,
     iface: &Interface,
-    arg: impl Fn(usize, usize) -> Option<(&'d mir::Place, Span)>,
+    arg: impl Fn(usize, usize) -> Option<(mir::Place, Span)>,
 ) -> Option<(UniformFields, Vec<ir::ValueId>)> {
     let mut fields = Vec::new();
     let mut vals = Vec::new();
@@ -763,7 +829,7 @@ fn uniforms<'d>(
         let Some((place, at)) = arg(u.entry, u.param) else { continue };
         // A value with no runtime value isn't in the block (`bind_uniform`).
         let Some(t) = fl.cx.lower_ty(fl.mb, u.ty, at) else { continue };
-        vals.push(fl.read(&u.arg_place(place))?);
+        vals.push(fl.read(&u.arg_place(&place))?);
         fields.push((u.field_name(), t));
     }
     Some((fields, vals))
@@ -771,15 +837,15 @@ fn uniforms<'d>(
 
 /// The bindings of the interface's resources, in its order, from each entry point's
 /// parameter's argument (`arg`). `None` if one can't be read.
-fn bound<'d>(
+fn bound(
     fl: &mut Fl,
     iface: &Interface,
-    arg: impl Fn(usize, usize) -> Option<(&'d mir::Place, Span)>,
+    arg: impl Fn(usize, usize) -> Option<(mir::Place, Span)>,
 ) -> Option<Vec<ir::ValueId>> {
     let mut handles = Vec::new();
     for b in &iface.bound {
         let (place, at) = arg(b.entry, b.param)?;
-        handles.extend(bindings_for(fl, b.ty, &b.class, &b.arg_place(place), at)?);
+        handles.extend(bindings_for(fl, b.ty, &b.class, &b.arg_place(&place), at)?);
     }
     Some(handles)
 }
@@ -829,8 +895,9 @@ fn record_draw(fl: &mut Fl, d: &mir::Draw, span: Span) -> Option<()> {
         host_effect(fl, "`draw`", span);
         return None;
     }
-    let vs = (d.vertex.0, d.vertex.1.iter().map(|&a| fl.concrete(a)).collect::<Vec<_>>());
-    let fs = (d.fragment.0, d.fragment.1.iter().map(|&a| fl.concrete(a)).collect::<Vec<_>>());
+    let shaders = [recorded_shader(fl, &d.vertex)?, recorded_shader(fl, &d.fragment)?];
+    let vs = (shaders[0].func, shaders[0].substs.clone());
+    let fs = (shaders[1].func, shaders[1].substs.clone());
     let key = PipelineKey::Render { vertex: vs, fragment: fs, state: d.state };
     let (pindex, iface) = pipeline(fl.cx, key, span);
     // An indexed draw's indices: their buffer's handle, and the byte offset and size, by its
@@ -857,8 +924,10 @@ fn record_draw(fl: &mut Fl, d: &mir::Draw, span: Span) -> Option<()> {
             counts.extend([vertices, instances]);
         }
     };
-    let arg =
-        |e: usize, i: usize| d.args.iter().find(|a| a.0 == e && a.1 == i).map(|(.., p, s)| (p, *s));
+    let arg = |e: usize, i: usize| {
+        let args = d.args.iter().filter(|a| a.0 == e).map(|(_, i, p, s)| (*i, p, *s));
+        shaders[e].arg(i, args)
+    };
     let (fields, vals) = uniforms(fl, &iface, arg)?;
     // Buffers, textures and samplers, in the order the pipeline binds them.
     let mut handles = bound(fl, &iface, arg)?;

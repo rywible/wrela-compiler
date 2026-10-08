@@ -1,0 +1,41 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0506",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [
+        {
+          "file": "main.wrela",
+          "message": "`job` borrows `out` here",
+          "span": {
+            "column": 5,
+            "end": 410,
+            "end_column": 39,
+            "end_line": 13,
+            "line": 13,
+            "start": 376
+          }
+        }
+      ],
+      "message": "`out` overlaps `out`, which `job` is borrowing mutably",
+      "notes": [
+        "`job` is used later, so the borrow is still live"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 34,
+        "end": 447,
+        "end_column": 37,
+        "end_line": 14,
+        "line": 14,
+        "start": 444
+      },
+      "title": "an access that overlaps a live `mut` access"
+    }
+  ],
+  "version": 2
+}

@@ -2176,21 +2176,13 @@ impl<'p> Checker<'p> {
         expected: Option<TyId>,
         span: Span,
     ) -> Expr {
-        // `k.bind(...)` outside `dispatch` and `draw`: a bound entry point isn't a value.
+        // `k.bind(...)` outside `dispatch` and `draw`: a value of `k`'s bound type.
         if name.name == "bind"
             && let Some(f) = self.fn_named(receiver)
             && self.p.func(f).attrs.entry.is_some()
+            && let ast::ExprKind::Path(path) = &receiver.kind
         {
-            let n = &self.p.func(f).name;
-            self.err(
-                Diagnostic::new(
-                    codes::E0603,
-                    span,
-                    format!("`{n}.bind(...)` goes straight into `dispatch` or `draw`"),
-                )
-                .with_note("an entry point bound to its arguments is recorded where it's bound; it isn't a value to keep (§12)"),
-            );
-            return self.failed_call(args, span);
+            return self.bind_value(f, path, args, span);
         }
         let recv = self.check_expr(receiver, None);
         let rt = self.shallow(recv.ty);
@@ -2528,6 +2520,74 @@ impl<'p> Checker<'p> {
 
     // ---- GPU intrinsics --------------------------------------------------------------------
 
+    /// A `dispatch` or `draw` argument, the entry point of stage `want` it records (§12): one
+    /// named (`cover`), bound where it's recorded (`shade.bind(scene)`), or a bound entry
+    /// point's value (`let k = fill.bind(...)`, a parameter `K: Kernel`).
+    fn command_shader<'a>(&mut self, e: &'a ast::Expr, want: Entry) -> Option<Recorded<'a>> {
+        let local = |this: &Self, e: &ast::Expr| match &e.kind {
+            ast::ExprKind::Path(path) => {
+                path.segments.len() == 1 && this.env.lookup(&path.segments[0].ident.name).is_some()
+            }
+            _ => false,
+        };
+        let named = match &e.kind {
+            ast::ExprKind::Path(_) => !local(self, e),
+            ast::ExprKind::MethodCall { receiver, name, .. } => {
+                name.name == "bind" && matches!(receiver.kind, ast::ExprKind::Path(_))
+            }
+            _ => false,
+        };
+        if named {
+            return self.bound_entry(e, want).map(Recorded::Named);
+        }
+        let x = self.check_expr(e, None);
+        let t = self.infer.resolve(&self.p.types, x.ty);
+        if matches!(self.kind(t), TyKind::Error) {
+            return None;
+        }
+        let what = want.describe();
+        match self.bound_value_of(t) {
+            Some(v) if std::mem::discriminant(&v.stage) == std::mem::discriminant(&want) => {
+                Some(Recorded::Value(x, v))
+            }
+            _ => {
+                let shown = self.display(t);
+                self.err(
+                    Diagnostic::new(
+                        codes::E0603,
+                        e.span,
+                        format!("expected {what}, named or bound to its arguments, not `{shown}`"),
+                    )
+                    .with_help("write `name` for one that takes nothing, or `name.bind(...)`, or pass a value `name.bind(...)` made"),
+                );
+                None
+            }
+        }
+    }
+
+    /// What a value of type `t` records, if it's a bound entry point's: its entry point's type
+    /// (§12), or a parameter bounded by `Kernel`, `VertexShader<V>` or `FragmentShader<V>`.
+    fn bound_value_of(&self, t: TyId) -> Option<BoundValue> {
+        match self.kind(t) {
+            TyKind::Adt(a, args) => {
+                let f = self.p.adt(*a).entry?;
+                let (stage, _) = self.p.func(f).attrs.entry?;
+                let varyings = crate::gpu::bound_varyings(self.p, f, args);
+                Some(BoundValue { stage, func: Some(f), varyings })
+            }
+            TyKind::Param(g) => self.p.param(*g).bounds.iter().find_map(|b| {
+                let stage = match self.p.trait_(b.trait_).lang? {
+                    Lang::Kernel => Entry::Compute([1, 1, 1]),
+                    Lang::VertexShader => Entry::Vertex,
+                    Lang::FragmentShader => Entry::Fragment,
+                    _ => return None,
+                };
+                Some(BoundValue { stage, func: None, varyings: b.args.first().copied() })
+            }),
+            _ => None,
+        }
+    }
+
     /// What a `dispatch` or `draw` argument binds (§12): an entry point of stage `want`, named
     /// alone when it takes nothing (`cover`) or bound to its arguments (`shade.bind(scene,
     /// field)`). Its generic arguments are fresh, and its arguments aren't checked yet.
@@ -2596,6 +2656,101 @@ impl<'p> Checker<'p> {
         };
         let gen_args = self.fresh_fn_args(func, path, path.span);
         Some(Bound { func, gen_args, args, span: e.span })
+    }
+
+    /// `k.bind(...)` as a value (§12): a literal of `k`'s bound type, a borrow struct whose
+    /// fields hold the arguments as `gpu::bound_fields` says (a buffer given whole as a span
+    /// of it). A command takes it in place of a named entry point.
+    fn bind_value(&mut self, func: FnId, path: &ast::Path, args: &[ast::Arg], span: Span) -> Expr {
+        let Some(&adt) = self.p.bound_types.get(&func) else {
+            return self.failed_call(args, span);
+        };
+        let gen_args = self.fresh_fn_args(func, path, path.span);
+        // A fragment shader's input from the vertex shader is the draw's to give.
+        let def = self.p.func(func);
+        let entry = def.attrs.entry.map_or(Entry::Vertex, |e| e.0);
+        let (params, _, _) = self.fn_params(func, &gen_args);
+        let skip = def
+            .params
+            .iter()
+            .zip(&params)
+            .find(|(d, _)| crate::gpu::is_varyings(self.p, entry, d.ty))
+            .map(|(_, c)| c.ty);
+        let bound = Bound { func, gen_args: gen_args.clone(), args: Some(args), span };
+        let xs = self.bind_args(&bound, skip);
+        let fields = crate::gpu::bound_fields(self.p, func);
+        let subst = Subst::from_pairs(&self.p.fn_all_generics(func), &gen_args);
+        let mut held: Vec<Option<Expr>> = vec![None; fields.len()];
+        let mut order = Vec::new();
+        for (param, x) in xs {
+            let Some(j) = fields.iter().position(|f| f.param == param) else { continue };
+            let fty = self.p.types.subst(fields[j].ty, &subst);
+            let name = &self.p.func(func).params[param].name;
+            held[j] = Some(self.held_arg(x, fty, fields[j].mode, name));
+            order.push(j as u32);
+        }
+        // An argument that's missing is reported already.
+        let fields: Vec<Expr> =
+            held.into_iter().map(|x| x.unwrap_or_else(|| self.error_expr(span))).collect();
+        let ty = self.p.types.adt(adt, gen_args.clone());
+        let kind = ExprKind::Adt { adt, args: gen_args, variant: None, fields, order, base: None };
+        Expr { ty, span, kind }
+    }
+
+    /// Argument `x` of parameter `name`, as a bound entry point's field of type `fty` and mode
+    /// `mode` holds it: a buffer given for a `[T]` as a `GpuSpan<T>` of all of it, and one given
+    /// `mut` for a `mut Slots<T>` as a `GpuSpanMut<T>`. A projection field takes a place (E0508).
+    fn held_arg(&mut self, x: Expr, fty: TyId, mode: RetMode, name: &str) -> Expr {
+        let xt = self.infer.resolve(&self.p.types, x.ty);
+        let whole = match (self.p.lang_of_ty(fty), self.p.lang_of_ty(xt)) {
+            (Some(Lang::GpuSpan), Some(Lang::GpuBuffer)) => Some(("items", Mode::Borrow)),
+            (Some(Lang::GpuSpanMut), Some(Lang::GpuBuffer)) => Some(("items_mut", Mode::Mut)),
+            _ => None,
+        };
+        if let Some((method, m)) = whole
+            && let Some(func) = self.buffer_method(method)
+            && let TyKind::Adt(_, targs) = self.kind(fty)
+        {
+            let (span, ty) = (x.span, fty);
+            let args = targs.clone();
+            let call = Call {
+                callee: Callee::Fn { func, args },
+                args: vec![x],
+                modes: vec![m],
+                receiver: true,
+                order: vec![0],
+                ret_mode: RetMode::Owned,
+            };
+            return Expr { ty, span, kind: ExprKind::Call(call) };
+        }
+        if mode != RetMode::Owned {
+            let inner = match &x.kind {
+                ExprKind::MutArg(i) => i.as_ref(),
+                _ => &x,
+            };
+            if !inner.is_place() && !matches!(inner.kind, ExprKind::Error) {
+                self.err(
+                    Diagnostic::new(
+                        codes::E0508,
+                        x.span,
+                        format!("a bound entry point holds `{name}` as a projection, so it's given a place, and this is a temporary"),
+                    )
+                    .with_help("bind the value to a name first, and give the name"),
+                );
+            }
+        }
+        x
+    }
+
+    /// `GpuBuffer`'s method `name`.
+    fn buffer_method(&self, name: &str) -> Option<FnId> {
+        let a = self.p.lang_adt(Lang::GpuBuffer)?;
+        let impls = self.p.inherent_impls.get(&a)?;
+        impls
+            .iter()
+            .flat_map(|&i| &self.p.impl_(i).methods)
+            .copied()
+            .find(|&f| self.p.func(f).name == name)
     }
 
     /// Arguments checked by themselves, for what they say, when there's no function to check
@@ -2988,11 +3143,17 @@ impl<'p> Checker<'p> {
             self.check_args_alone(args);
             return self.error_expr(span);
         };
-        let Some(bound) = self.bound_entry(&first.value, Entry::Compute([1, 1, 1])) else {
+        let Some(recorded) = self.command_shader(&first.value, Entry::Compute([1, 1, 1])) else {
             self.check_args_alone(&args[1..]);
             return self.error_expr(span);
         };
-        let kernel_args = self.bind_args(&bound, None);
+        let (kernel, kernel_fn, kernel_args) = match recorded {
+            Recorded::Named(b) => {
+                let xs = self.bind_args(&b, None);
+                (Shader::Named(b.func, b.gen_args), Some(b.func), xs)
+            }
+            Recorded::Value(x, v) => (Shader::Value(Box::new(x)), v.func, Vec::new()),
+        };
         let mut groups: Option<Expr> = None;
         let mut indirect = false;
         let mut over = false;
@@ -3011,7 +3172,7 @@ impl<'p> Checker<'p> {
             }
             if a.name.as_ref().is_some_and(|n| n.name == "over") {
                 over = true;
-                self.check_over(&e, bound.func);
+                self.check_over(&e, kernel_fn);
                 groups = Some(e);
                 continue;
             }
@@ -3044,8 +3205,7 @@ impl<'p> Checker<'p> {
         };
         let groups_at = kernel_args.len();
         let d = Dispatch {
-            kernel: bound.func,
-            kernel_args: bound.gen_args,
+            kernel,
             groups: Box::new(groups),
             indirect,
             over,
@@ -3059,7 +3219,7 @@ impl<'p> Checker<'p> {
     /// A kernel that shares workgroup memory isn't dispatched over one (E0603): its invocations
     /// past the domain must still reach its barriers, and what they add to the memory is its
     /// own to decide.
-    fn check_over(&mut self, e: &Expr, kernel: FnId) {
+    fn check_over(&mut self, e: &Expr, kernel: Option<FnId>) {
         let u32_ty = self.p.types.u32;
         let ok = match self.kind(e.ty).clone() {
             TyKind::Tuple(ts) if ts.len() == 2 || ts.len() == 3 => {
@@ -3083,10 +3243,9 @@ impl<'p> Checker<'p> {
                 format!("`over:` is a count, a `(u32, u32)`, a `(u32, u32, u32)` or a texture, not `{shown}`"),
             ));
         }
-        let shares = self.p.func(kernel).params.iter().any(
-            |p| matches!(self.kind(p.ty), TyKind::Adt(a, _) if self.p.is_lang_adt(*a, Lang::Shared)),
-        );
-        if shares {
+        // A kernel known only as a bound kernel's type is checked when lowering knows it.
+        let Some(kernel) = kernel else { return };
+        if crate::gpu::shares_memory(self.p, kernel) {
             let name = self.p.func(kernel).name.clone();
             self.err(
                 Diagnostic::new(
@@ -3151,32 +3310,62 @@ impl<'p> Checker<'p> {
             self.check_args_alone(args);
             return self.error_expr(span);
         }
-        let vs = self.bound_entry(&args[0].value, Entry::Vertex);
-        let fs = self.bound_entry(&args[1].value, Entry::Fragment);
+        let vs = self.command_shader(&args[0].value, Entry::Vertex);
+        let fs = self.command_shader(&args[1].value, Entry::Fragment);
         let (Some(vs), Some(fs)) = (vs, fs) else {
             self.check_args_alone(&args[2..]);
             return self.error_expr(span);
         };
-        // The fragment shader's parameter of the vertex output's struct is the vertex output,
-        // whatever its generic arguments are inferred to be (`draw(half, shade, ...)`); the
-        // pipeline passes it, not the draw.
-        let (_, vret, _) = self.fn_params(vs.func, &vs.gen_args);
-        let (fparams, _, _) = self.fn_params(fs.func, &fs.gen_args);
+        // What the vertex shader gives the fragment shader.
+        let vret = match &vs {
+            Recorded::Named(b) => self.fn_params(b.func, &b.gen_args).1,
+            Recorded::Value(_, v) => v.varyings.unwrap_or(self.p.types.error),
+        };
         let mut varyings = None;
-        if let &TyKind::Adt(out, _) = self.kind(vret)
-            && let Some(p) =
-                fparams.iter().find(|p| matches!(self.kind(p.ty), &TyKind::Adt(a, _) if a == out))
-        {
-            let _ = self.try_unify(p.ty, vret);
-            varyings = Some(vret);
+        match &fs {
+            // The fragment shader's parameter of the vertex output's struct is the vertex
+            // output, whatever its generic arguments are inferred to be (`draw(half, shade,
+            // ...)`); the pipeline passes it, not the draw.
+            Recorded::Named(b) => {
+                let (fparams, _, _) = self.fn_params(b.func, &b.gen_args);
+                if let &TyKind::Adt(out, _) = self.kind(vret)
+                    && let Some(p) = fparams
+                        .iter()
+                        .find(|p| matches!(self.kind(p.ty), &TyKind::Adt(a, _) if a == out))
+                {
+                    let _ = self.try_unify(p.ty, vret);
+                    varyings = Some(vret);
+                }
+            }
+            // A bound fragment shader takes what its type says, or nothing.
+            Recorded::Value(x, v) => {
+                if let Some(input) = v.varyings
+                    && !self.try_unify(input, vret)
+                {
+                    let (gives, takes) = (self.display(vret), self.display(input));
+                    self.err(Diagnostic::new(
+                        codes::E0603,
+                        x.span,
+                        format!("this fragment shader takes `{takes}` from the vertex shader, which gives `{gives}`"),
+                    ));
+                }
+            }
         }
         let mut bound: Vec<(usize, usize, Expr)> = Vec::new();
-        for (e, i, x) in self.bind_args(&vs, None).into_iter().map(|(i, x)| (0, i, x)) {
-            bound.push((e, i, x));
-        }
-        for (i, x) in self.bind_args(&fs, varyings) {
-            bound.push((1, i, x));
-        }
+        let vertex = match vs {
+            Recorded::Named(b) => {
+                bound.extend(self.bind_args(&b, None).into_iter().map(|(i, x)| (0, i, x)));
+                Shader::Named(b.func, b.gen_args)
+            }
+            Recorded::Value(x, _) => Shader::Value(Box::new(x)),
+        };
+        let fragment = match fs {
+            Recorded::Named(b) => {
+                bound.extend(self.bind_args(&b, varyings).into_iter().map(|(i, x)| (1, i, x)));
+                Shader::Named(b.func, b.gen_args)
+            }
+            Recorded::Value(x, _) => Shader::Value(Box::new(x)),
+        };
         let mut vertices = None;
         let mut instances = None;
         let mut indirect: Option<Box<Expr>> = None;
@@ -3315,8 +3504,8 @@ impl<'p> Checker<'p> {
         let instances =
             instances.unwrap_or(Expr { ty: u32_ty, span, kind: ExprKind::Lit(Lit::Int(1)) });
         let d = Draw {
-            vertex: (vs.func, vs.gen_args),
-            fragment: (fs.func, fs.gen_args),
+            vertex,
+            fragment,
             vertices,
             instances,
             indirect,
@@ -3519,6 +3708,22 @@ struct Bound<'a> {
     gen_args: Vec<TyId>,
     args: Option<&'a [ast::Arg]>,
     span: Span,
+}
+
+/// A `dispatch` or `draw` argument (§12): an entry point named where it's recorded, or a
+/// bound entry point's value.
+enum Recorded<'a> {
+    Named(Bound<'a>),
+    Value(Expr, BoundValue),
+}
+
+/// What a bound entry point's value records, as far as its type says: its stage, its entry
+/// point (unless the type is a parameter), and what it passes between a draw's shaders (a
+/// vertex shader's output; a fragment shader's input, `None` for none).
+struct BoundValue {
+    stage: Entry,
+    func: Option<FnId>,
+    varyings: Option<TyId>,
 }
 
 /// Whether `e` is a bare literal: `Some(true)` for a `bool`, `Some(false)` for a number (with a

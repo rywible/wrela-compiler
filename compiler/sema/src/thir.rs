@@ -199,10 +199,30 @@ pub enum ExprKind {
     Error,
 }
 
+/// What a command records (§12): an entry point named where it's recorded, or a bound entry
+/// point's value.
+#[derive(Clone, Debug)]
+pub enum Shader {
+    /// `k` or `k.bind(...)`, with its generic arguments: its arguments are the command's.
+    Named(FnId, Vec<TyId>),
+    /// A value of a bound entry point's type (`let k = k.bind(...)`, or a parameter bounded by
+    /// `Kernel`): the type names the entry point once it's known, and its fields hold the
+    /// arguments.
+    Value(Box<Expr>),
+}
+
+impl Shader {
+    pub fn value(&self) -> Option<&Expr> {
+        match self {
+            Shader::Value(e) => Some(e),
+            Shader::Named(..) => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Dispatch {
-    pub kernel: FnId,
-    pub kernel_args: Vec<TyId>,
+    pub kernel: Shader,
     /// The workgroup count: a `u32` (in x; y and z are 1), or a `(u32, u32, u32)`; or, when
     /// `indirect`, a `GpuBuffer<u32>` or `GpuSpan<u32>` whose first three elements hold it.
     pub groups: Box<Expr>,
@@ -212,7 +232,7 @@ pub struct Dispatch {
     /// nothing (§12).
     pub over: bool,
     /// One per kernel parameter that isn't a builtin, as (parameter index, argument), in the
-    /// order written.
+    /// order written; none for a bound kernel's value.
     pub args: Vec<(usize, Expr)>,
     /// How many of `args` are written before `groups`: it's evaluated after them.
     pub groups_at: usize,
@@ -242,8 +262,8 @@ pub struct RenderState {
 
 #[derive(Clone, Debug)]
 pub struct Draw {
-    pub vertex: (FnId, Vec<TyId>),
-    pub fragment: (FnId, Vec<TyId>),
+    pub vertex: Shader,
+    pub fragment: Shader,
     pub vertices: Expr,
     pub instances: Expr,
     /// Instead of the counts: a `GpuBuffer<u32>` or `GpuSpan<u32>` holding the vertex count,
@@ -457,10 +477,15 @@ impl Expr {
                 }
             }
             ExprKind::Dispatch(d) => {
+                d.kernel.value().into_iter().for_each(|v| f(Child::Expr(v)));
                 f(Child::Expr(&d.groups));
                 d.args.iter().for_each(|(_, a)| f(Child::Expr(a)));
             }
             ExprKind::Draw(d) => {
+                [&d.vertex, &d.fragment]
+                    .into_iter()
+                    .filter_map(Shader::value)
+                    .for_each(|v| f(Child::Expr(v)));
                 f(Child::Expr(&d.vertices));
                 f(Child::Expr(&d.instances));
                 d.indirect.iter().chain(&d.indices).for_each(|i| f(Child::Expr(i)));

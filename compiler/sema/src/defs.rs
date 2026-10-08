@@ -332,6 +332,9 @@ lang_items! {
     DrawArgs = "std::gpu::DrawArgs",
     DrawIndexedArgs = "std::gpu::DrawIndexedArgs",
     DispatchArgs = "std::gpu::DispatchArgs",
+    Kernel = "std::gpu::Kernel",
+    VertexShader = "std::gpu::VertexShader",
+    FragmentShader = "std::gpu::FragmentShader",
     Texels = "std::gpu::Texels",
     TexelsStore = "std::gpu::texels_store",
     Texels3d = "std::gpu::Texels3d",
@@ -475,6 +478,10 @@ pub struct AdtDef {
     pub diagnostic: Option<String>,
     /// `borrow struct`: a named group of projections (§6.6).
     pub borrow: bool,
+    /// A bound entry point's type (§12): the borrow struct of this entry point's arguments,
+    /// which the compiler makes. Its generics are the entry point's, and its fields its
+    /// parameters that a command binds (`gpu::bound_params`), in order.
+    pub entry: Option<FnId>,
 }
 
 impl AdtDef {

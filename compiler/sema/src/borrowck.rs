@@ -232,11 +232,16 @@ fn rvalue_uses(body: &Body, r: &Rvalue, out: &mut Vec<Local>) {
             }
         }
         Rvalue::Dispatch(d) => {
+            d.kernel.value().into_iter().for_each(|p| place_uses(p, out));
             d.groups.iter().for_each(|g| operand_uses(g, out));
             d.args.iter().for_each(|(_, p, _)| place_uses(p, out));
             d.indirect.iter().for_each(|(p, _)| place_uses(p, out));
         }
         Rvalue::Draw(d) => {
+            [&d.vertex, &d.fragment]
+                .into_iter()
+                .filter_map(Shader::value)
+                .for_each(|p| place_uses(p, out));
             operand_uses(&d.vertices, out);
             operand_uses(&d.instances, out);
             d.args.iter().for_each(|(_, _, p, _)| place_uses(p, out));
@@ -1972,6 +1977,9 @@ fn rvalue_places(body: &Body, r: &Rvalue, add: &mut dyn FnMut(&Place, bool)) {
             }
         }
         Rvalue::Dispatch(d) => {
+            if let Some(p) = d.kernel.value() {
+                add(p, false);
+            }
             for o in &d.groups {
                 operand(o, add);
             }
@@ -1983,6 +1991,9 @@ fn rvalue_places(body: &Body, r: &Rvalue, add: &mut dyn FnMut(&Place, bool)) {
             }
         }
         Rvalue::Draw(d) => {
+            for p in [&d.vertex, &d.fragment].into_iter().filter_map(Shader::value) {
+                add(p, false);
+            }
             operand(&d.vertices, add);
             operand(&d.instances, add);
             for (_, _, p, _) in &d.args {

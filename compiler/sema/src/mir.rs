@@ -279,14 +279,32 @@ pub struct Call {
     pub span: Span,
 }
 
+/// What a command records (§12): an entry point named where it's recorded, its arguments the
+/// command's, or a bound entry point's value, borrowed, whose type names it once it's known
+/// (`gpu::bound_fields` says which parameter each field binds).
+#[derive(Clone, Debug)]
+pub enum Shader {
+    Named(FnId, Vec<TyId>),
+    Value(Place, Span),
+}
+
+impl Shader {
+    pub fn value(&self) -> Option<&Place> {
+        match self {
+            Shader::Value(p, _) => Some(p),
+            Shader::Named(..) => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Dispatch {
-    pub kernel: FnId,
-    pub kernel_args: Vec<TyId>,
+    pub kernel: Shader,
     /// The workgroup counts; or, `over` a domain, its size (lowering covers it with groups).
     pub groups: [Operand; 3],
     pub over: bool,
-    /// One per kernel parameter that isn't a builtin, in parameter order: borrowed.
+    /// One per kernel parameter that isn't a builtin, in parameter order: borrowed. None for
+    /// a bound kernel's value.
     pub args: Vec<(usize, Place, Span)>,
     /// The buffer (or span) holding the group counts, in place of `groups`: borrowed.
     pub indirect: Option<(Place, Span)>,
@@ -294,8 +312,8 @@ pub struct Dispatch {
 
 #[derive(Clone, Debug)]
 pub struct Draw {
-    pub vertex: (FnId, Vec<TyId>),
-    pub fragment: (FnId, Vec<TyId>),
+    pub vertex: Shader,
+    pub fragment: Shader,
     pub vertices: Operand,
     pub instances: Operand,
     /// (entry point: 0 the vertex shader, 1 the fragment shader; parameter index; argument).

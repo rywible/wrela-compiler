@@ -159,8 +159,9 @@ pub(crate) fn rvalues(body: &mir::Body) -> impl Iterator<Item = (&mir::Statement
     })
 }
 
-/// Each use `body` makes of a function, and where.
-fn uses(body: &mir::Body) -> Vec<(Use, Span)> {
+/// Each use `body` makes of a function, and where. An entry point bound as a value
+/// (`k.bind(...)`) is used where it's bound, by the command it's for.
+fn uses(p: &Program, body: &mir::Body) -> Vec<(Use, Span)> {
     let mut out = Vec::new();
     for (s, r) in rvalues(body) {
         match r {
@@ -172,10 +173,22 @@ fn uses(body: &mir::Body) -> Vec<(Use, Span)> {
                 _ => {}
             },
             Rvalue::FnRef(f, _) => out.push((Use::Value(*f), s.span)),
-            Rvalue::Dispatch(d) => out.push((Use::Dispatch(d.kernel), s.span)),
+            Rvalue::Dispatch(d) => {
+                if let mir::Shader::Named(f, _) = d.kernel {
+                    out.push((Use::Dispatch(f), s.span));
+                }
+            }
             Rvalue::Draw(d) => {
-                out.push((Use::Draw(d.vertex.0), s.span));
-                out.push((Use::Draw(d.fragment.0), s.span));
+                for sh in [&d.vertex, &d.fragment] {
+                    if let mir::Shader::Named(f, _) = sh {
+                        out.push((Use::Draw(*f), s.span));
+                    }
+                }
+            }
+            Rvalue::BorrowStruct { adt, .. } if let Some(f) = p.adt(*adt).entry => {
+                let kernel =
+                    matches!(p.func(f).attrs.entry, Some((wrela_sema::defs::Entry::Compute(_), _)));
+                out.push((if kernel { Use::Dispatch(f) } else { Use::Draw(f) }, s.span));
             }
             _ => {}
         }
@@ -628,7 +641,7 @@ impl<'a> Index<'a> {
         };
         let mut out = Vec::new();
         for (&caller, body) in &self.checked.mir {
-            for (u, span) in uses(body) {
+            for (u, span) in uses(p, body) {
                 let hit = match &u {
                     Use::Trait(m, self_ty) => {
                         *m == f
@@ -669,7 +682,7 @@ impl<'a> Index<'a> {
         let body = self.checked.mir.get(&f).ok_or_else(|| format!("`{path}` has no body here"))?;
         let mut seen: Vec<(String, Option<String>)> = Vec::new();
         let mut out = Vec::new();
-        for (u, span) in uses(body) {
+        for (u, span) in uses(self.p, body) {
             let on = match &u {
                 Use::Trait(_, t) => Some(self.p.display_ty(*t)),
                 _ => None,
@@ -894,7 +907,7 @@ impl<'a> Index<'a> {
         let Item::Fn(f) = item else { return Vec::new() };
         let mut fns = Vec::new();
         if let Some(body) = self.checked.mir.get(&f) {
-            for (u, _) in uses(body) {
+            for (u, _) in uses(self.p, body) {
                 if !fns.contains(&u.func()) && u.func() != f {
                     fns.push(u.func());
                 }

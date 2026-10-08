@@ -28,9 +28,17 @@ impl<T: GpuData> GpuBuffer<T> {
         self.count
     }
 
-    /// All its elements, read-only: a `GpuSpan<T>` of them.
+    /// All its elements, read-only: a `GpuSpan<T>` of them. A bound entry point holds a buffer
+    /// given for a `[T]` so (§12).
     pub fn items(self) -> GpuSpan<T> {
         GpuSpan { buffer: self, start: 0, count: self.count }
+    }
+
+    /// All its elements, to change: a `GpuSpanMut<T>` of them. A bound entry point holds a
+    /// buffer given `mut` for a `mut Slots<T>` so (§12).
+    pub fn items_mut(mut self) -> GpuSpanMut<T> {
+        let count = self.count
+        GpuSpanMut { buffer: mut self, start: 0, count }
     }
 
     /// Element `i`, where it is (a `GpuField`): for a command that reads it there, or, through
@@ -229,6 +237,19 @@ pub fn write<T: GpuData>(buf: mut GpuBuffer<T>, at: u32, values: [T]) {
 
 @intrinsic
 fn write_buffer<T: GpuData>(handle: u32, at: u32, values: [T]) {}
+
+/// A kernel bound to its arguments, as a value: `let k = fill.bind(0.5, mut out)` (§12). Each
+/// entry point has a borrow struct of its arguments, which the compiler makes and which has
+/// this trait; a function generic over `K: Kernel` takes any of them and passes it to
+/// `dispatch`, each kernel's instance its own pipeline.
+pub trait Kernel {}
+
+/// A vertex shader bound to its arguments, as a value, whose output is `V` (§12).
+pub trait VertexShader<V> {}
+
+/// A fragment shader bound to its arguments, as a value, whose input from the vertex shader is
+/// `V` (§12). One that takes no input from it has the trait for every `V`.
+pub trait FragmentShader<V> {}
 
 /// Records a dispatch of a `@compute` kernel bound to its arguments: `dispatch(kernel.bind(a,
 /// b), groups: n)`. The arguments are the kernel's, without its builtins, matched as a call's

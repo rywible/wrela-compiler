@@ -99,6 +99,28 @@ fn a_group_draws_what_its_fields_draw_one_by_one() {
     assert!(lit > (half * SIZE / 4) as usize, "only {lit} pixels show the filled texture");
 }
 
+/// Bound entry points as values (§12): the right half is drawn by entry points bound first, as
+/// values, and recorded by functions generic over `Kernel`, `VertexShader<V>` and
+/// `FragmentShader<V>` (compiler/tests/bound), with a buffer given whole where the left half
+/// gives a span of it. It's the left half, drawn by the same entry points bound where they're
+/// recorded, to the bit; the kernels filled the textures they read.
+#[test]
+#[ignore = "needs a GPU"]
+fn bound_entry_points_draw_what_named_ones_draw() {
+    let (dir, _) = page("compiler/tests/bound", "bound-native");
+    let run = native(&dir);
+    let half = SIZE / 2;
+    let mut lit = 0;
+    for y in 0..SIZE {
+        for x in 0..half {
+            let (l, r) = (pixel(&run.frame, x, y), pixel(&run.frame, x + half, y));
+            assert_eq!(l, r, "pixel ({x}, {y}) against ({}, {y})", x + half);
+            lit += usize::from(l[0] > 60 && l[1] > 30);
+        }
+    }
+    assert!(lit > (half * SIZE / 4) as usize, "only {lit} pixels show the filled texture");
+}
+
 /// A kernel writes a 3D texture's texels (`std::gpu::Texels3d`), and a pass loads and samples
 /// them (compiler/tests/volume): texel (x, y, z) of 4 × 4 × 4 is red x / 3, green y / 3, blue
 /// z / 3. The top half loads texel ((x / 8) % 4, (y / 8) % 4, x / 32); the bottom half samples

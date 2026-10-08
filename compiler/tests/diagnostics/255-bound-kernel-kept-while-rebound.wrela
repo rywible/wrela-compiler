@@ -1,5 +1,5 @@
-// mistake: a kernel bound to its arguments, kept to dispatch later
-// expect: E0603
+// mistake: a kernel bound to its arguments, kept, while its buffer is bound to another dispatch
+// expect: E0506
 // fix: no
 use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch}
 
@@ -12,4 +12,5 @@ pub fn frame(time: f32, width: u32, height: u32) {
     var out: GpuBuffer<f32> = buffer(64)
     let job = fill.bind(time, mut out)
     dispatch(fill.bind(time, mut out), groups: 1)
+    dispatch(job, groups: 1)
 }

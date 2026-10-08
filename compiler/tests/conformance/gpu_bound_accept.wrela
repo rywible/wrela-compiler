@@ -1,0 +1,119 @@
+// accepts: gpu.bound gpu.dispatch
+// An entry point bound to its arguments is a value: kept in a local and recorded twice, and
+// passed to functions generic over the stage's trait, through two of them. A buffer is given
+// whole or as a span; what the GPU writes is given `mut` (a buffer, a texture, an append
+// buffer); a generic entry point is bound with its format inferred; and a fragment shader that
+// takes nothing from the vertex shader goes with any.
+use std::gpu::{
+    Append, AppendBuffer, ClipPosition, Filtered, FragCoord, FragmentShader, GlobalId, GpuBuffer,
+    Kernel, Rgba8, Rgba16Float, Sampler, Slots, Texels, Texture, VertexIndex, VertexShader,
+    append_buffer, begin_screen_pass, buffer, dispatch, draw, present, sampler, texture,
+    writable_texture,
+}
+
+struct Tint: Copy + GpuData {
+    colour: vec4,
+}
+
+@compute(64)
+fn double(xs: [f32], out: mut Slots<f32>, id: GlobalId) {
+    out[id] = 2.0 * xs[id.x]
+}
+
+@compute(64)
+fn keep(xs: [f32], kept: mut Append<f32>, id: GlobalId) {
+    if xs[id.x] > 0.5 {
+        kept.push(xs[id.x])
+    }
+}
+
+@compute(8, 8)
+fn paint(t: Tint, out: mut Texels<Rgba16Float>, id: GlobalId) {
+    out.store(id, t.colour)
+}
+
+struct Quad: Copy {
+    pos: ClipPosition,
+    uv: vec2,
+}
+
+@vertex
+fn cover(v: VertexIndex, z: f32) -> ClipPosition {
+    let x = f32((v.index << 1) & 2) * 2.0 - 1.0
+    let y = f32(v.index & 2) * 2.0 - 1.0
+    ClipPosition { position: vec4(x, y, z, 1.0) }
+}
+
+@vertex
+fn quad(v: VertexIndex) -> Quad {
+    let c = vec2(f32(v.index & 1), f32((v.index >> 1) & 1))
+    Quad { pos: ClipPosition { position: vec4(c * 2.0 - 1.0, 0.5, 1.0) }, uv: c }
+}
+
+@fragment
+fn flat(p: FragCoord, t: Tint) -> vec4 {
+    t.colour
+}
+
+@fragment
+fn textured<F: Filtered>(q: Quad, image: Texture<F>, s: Sampler) -> vec4 {
+    F::rgba(image.sample(s, q.uv))
+}
+
+/// Any kernel, over `n`.
+fn run<K: Kernel>(k: K, n: u32) {
+    dispatch(k, over: n)
+}
+
+/// Any kernel, twice: through `run`.
+fn run_twice<K: Kernel>(k: K, n: u32) {
+    run(k, n)
+    run(k, n)
+}
+
+/// Any fragment shader over the whole target.
+fn fullscreen<F: FragmentShader<ClipPosition>>(fs: F) {
+    draw(cover.bind(z: 0.5), fs, vertices: 3)
+}
+
+/// Any pair of shaders that pass a `Quad`.
+fn quads<V: VertexShader<Quad>, F: FragmentShader<Quad>>(vs: V, fs: F) {
+    draw(vs, fs, vertices: 4)
+}
+
+struct State {
+    xs: GpuBuffer<f32>,
+    doubled: GpuBuffer<f32>,
+    kept: AppendBuffer<f32>,
+    painted: Texture<Rgba16Float>,
+    board: Texture<Rgba8>,
+    s: Sampler,
+}
+
+pub fn init() -> State {
+    State {
+        xs: buffer(64),
+        doubled: buffer(64),
+        kept: append_buffer(64),
+        painted: writable_texture::<Rgba16Float>(width: 8, height: 8),
+        board: texture::<Rgba8>(width: 4, height: 4),
+        s: sampler(),
+    }
+}
+
+pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
+    let k = double.bind(s.xs, mut s.doubled)
+    dispatch(k, over: 64)
+    dispatch(k, over: 64)
+    run_twice(double.bind(s.xs.span(start: 0, count: 64), mut s.doubled), 64)
+    run(keep.bind(s.doubled, mut s.kept), 64)
+    run(paint.bind(Tint { colour: vec4(1.0) }, mut s.painted), 64)
+    begin_screen_pass(clear: vec4(0.0))
+    let red = flat.bind(Tint { colour: vec4(1.0, 0.0, 0.0, 1.0) })
+    fullscreen(red)
+    draw(cover.bind(z: 0.5), red, vertices: 3)
+    // A fragment shader that takes nothing from the vertex shader goes with a `Quad`'s too.
+    quads(quad.bind(), red)
+    quads(quad.bind(), textured.bind(image: s.board, s: s.s))
+    present()
+}

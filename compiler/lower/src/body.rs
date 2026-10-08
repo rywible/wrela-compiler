@@ -1285,7 +1285,13 @@ impl<'c, 'a> Fl<'c, 'a> {
 
     /// A MIR place's type, concrete.
     pub fn place_src_ty(&mut self, p: &mir::Place) -> TyId {
-        let t = mir::place_ty(&self.cx.checked.program, &self.mir.locals, p);
+        // Projected from the local's type in this instance: a field of a generic local (a bound
+        // entry point's, §12) is known only once the local's type is.
+        let mut t = self.concrete(self.mir.locals[p.local.index()].ty);
+        let mut variant = None;
+        for proj in &p.proj {
+            t = mir::proj_ty(&self.cx.checked.program, t, &mut variant, proj);
+        }
         self.concrete(t)
     }
 

@@ -28,6 +28,104 @@ fn clip_position_fields(p: &Program, t: TyId) -> impl Iterator<Item = &FieldDef>
     fields.iter().filter(|f| p.lang_of_ty(f.ty) == Some(Lang::ClipPosition))
 }
 
+/// Whether kernel `f` shares workgroup memory (a `Shared` parameter).
+pub fn shares_memory(p: &Program, f: FnId) -> bool {
+    p.func(f).params.iter().any(|ps| p.lang_of_ty(ps.ty) == Some(Lang::Shared))
+}
+
+/// Whether parameter `t` of an entry point of stage `entry` is a fragment shader's input from
+/// the vertex shader: a struct with a `ClipPosition` field.
+pub fn is_varyings(p: &Program, entry: Entry, t: TyId) -> bool {
+    entry == Entry::Fragment && clip_position_fields(p, t).next().is_some()
+}
+
+/// A field of a bound entry point's type (§12): the parameter it binds, and how it holds its
+/// argument.
+#[derive(Clone, Copy, Debug)]
+pub struct BoundField {
+    pub param: usize,
+    pub ty: TyId,
+    pub mode: RetMode,
+}
+
+/// The parameters of entry point `f` that a command binds, in order, as a bound entry point's
+/// fields hold their arguments: every parameter but the GPU's builtins, workgroup memory and a
+/// fragment shader's input from the vertex shader. A buffer the GPU reads is held as a
+/// `GpuSpan<T>` and one it writes as a `GpuSpanMut<T>`; what the GPU writes through a container
+/// (`Append<T>`'s `AppendBuffer<T>`, `Texels<F>`'s `Texture<F>`) is held `mut`; a texture, a
+/// sampler and a value that isn't `Copy` are borrowed; and anything else is held by value.
+pub fn bound_fields(p: &Program, f: FnId) -> Vec<BoundField> {
+    let Some((entry, _)) = p.func(f).attrs.entry else { return Vec::new() };
+    let of = |l: Lang, args: Vec<TyId>| p.lang_adt(l).map(|a| p.types.adt(a, args));
+    let mut out = Vec::new();
+    for (param, ps) in p.func(f).params.iter().enumerate() {
+        let ty = ps.ty;
+        let lang = p.lang_of_ty(ty);
+        if BuiltinInput::of(p, ty).is_some()
+            || lang == Some(Lang::Shared)
+            || is_varyings(p, entry, ty)
+        {
+            continue;
+        }
+        let args = match p.types.kind(ty) {
+            TyKind::Adt(_, args) => args.clone(),
+            _ => Vec::new(),
+        };
+        let held = match (p.types.kind(ty), lang) {
+            (&TyKind::Slice(elem), _) => of(Lang::GpuSpan, vec![elem]).map(|t| (t, RetMode::Owned)),
+            (_, Some(Lang::Slots | Lang::Atomics | Lang::One)) => {
+                of(Lang::GpuSpanMut, args).map(|t| (t, RetMode::Owned))
+            }
+            (_, Some(Lang::Append)) => of(Lang::AppendBuffer, args).map(|t| (t, RetMode::Mut)),
+            (_, Some(Lang::AtomicMap)) => {
+                of(Lang::AtomicMapBuffer, Vec::new()).map(|t| (t, RetMode::Mut))
+            }
+            (_, Some(Lang::Texels)) => of(Lang::Texture, args).map(|t| (t, RetMode::Mut)),
+            (_, Some(Lang::Texels3d)) => of(Lang::Texture3d, args).map(|t| (t, RetMode::Mut)),
+            (_, Some(l)) if l.is_texture_or_sampler() => Some((ty, RetMode::Borrow)),
+            _ if p.is_borrow_struct(ty) || crate::traits::implements_builtin(p, ty, Lang::Copy) => {
+                Some((ty, RetMode::Owned))
+            }
+            _ => Some((ty, RetMode::Borrow)),
+        };
+        let (ty, mode) = held.unwrap_or((p.types.error, RetMode::Owned));
+        out.push(BoundField { param, ty, mode });
+    }
+    out
+}
+
+/// What a bound entry point's type passes between a draw's shaders: a vertex shader's output,
+/// or a fragment shader's input from the vertex shader (`None` for one that takes none). Of
+/// entry point `f` with generic arguments `args`.
+pub fn bound_varyings(p: &Program, f: FnId, args: &[TyId]) -> Option<TyId> {
+    let def = p.func(f);
+    let (entry, _) = def.attrs.entry?;
+    let subst = crate::ty::Subst::from_pairs(&p.fn_all_generics(f), args);
+    let t = match entry {
+        Entry::Vertex => def.ret,
+        Entry::Fragment => def.params.iter().find(|ps| is_varyings(p, entry, ps.ty))?.ty,
+        Entry::Compute(_) => return None,
+    };
+    Some(p.types.subst(t, &subst))
+}
+
+/// Whether entry point `f`, bound with generic arguments `args`, has the bound entry point's
+/// trait `l` with arguments `targs` (§12): a kernel `Kernel`, a vertex shader whose output is
+/// `V` `VertexShader<V>`, and a fragment shader whose input is `V`, or that takes none,
+/// `FragmentShader<V>`.
+pub fn bound_has(p: &Program, f: FnId, args: &[TyId], l: Lang, targs: &[TyId]) -> bool {
+    let Some((entry, _)) = p.func(f).attrs.entry else { return false };
+    let varyings = bound_varyings(p, f, args);
+    match (l, entry) {
+        (Lang::Kernel, Entry::Compute(_)) => true,
+        (Lang::VertexShader, Entry::Vertex) => varyings == targs.first().copied(),
+        (Lang::FragmentShader, Entry::Fragment) => {
+            varyings.is_none() || varyings == targs.first().copied()
+        }
+        _ => false,
+    }
+}
+
 /// Whether a type is a vertex shader's output: a `ClipPosition`, or a struct with one.
 pub fn is_vertex_output(p: &Program, t: TyId) -> bool {
     p.lang_of_ty(t) == Some(Lang::ClipPosition) || clip_position_fields(p, t).next().is_some()
@@ -142,7 +240,7 @@ pub fn not_gpu_data(p: &Program, param: &str, ty: TyId, span: wrela_diag::Span) 
 /// Whether `t` is a group (§12): a borrow struct (not one std gives a meaning, as `GpuSpan`),
 /// which GPU code takes as its fields: their bindings and values.
 pub fn is_group(p: &Program, t: TyId) -> bool {
-    matches!(p.types.kind(t), TyKind::Adt(a, _) if p.adt(*a).borrow && p.adt(*a).lang.is_none())
+    matches!(p.types.kind(t), TyKind::Adt(a, _) if p.adt(*a).borrow && p.adt(*a).lang.is_none() && p.adt(*a).entry.is_none())
 }
 
 /// What an entry point can't take in group `t`, reached as `path` (`lit.probes`): each field
@@ -340,7 +438,7 @@ fn check_entry(p: &Program, f: FnId, entry: Entry, out: &mut Vec<Diagnostic>) {
         }
         // Data passed by value travels as a uniform, so its layout must be the GPU's. Only a
         // fragment shader takes the vertex output.
-        let varyings = entry == Entry::Fragment && clip_position_fields(p, ps.ty).next().is_some();
+        let varyings = is_varyings(p, entry, ps.ty);
         let resource = lang.is_some_and(Lang::is_texture_or_sampler) || lang == Some(Lang::GpuSpan);
         let group = is_group(p, ps.ty);
         if group {

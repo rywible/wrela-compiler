@@ -45,11 +45,6 @@ fn direct() {
     fill(1.0) //~ E0606
 }
 
-// A bound entry point is recorded where it's bound; it isn't a value to keep.
-fn kept(out: mut GpuBuffer<f32>) {
-    let job = fill.bind(1.0, mut out) //~ E0603
-}
-
 // An entry point runs on the GPU; one passed as a function would run on the CPU.
 
 fn call_fs(f: fn(FragCoord, P) -> vec4) -> f32 {

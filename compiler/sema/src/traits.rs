@@ -350,6 +350,14 @@ pub fn implements(p: &Program, ty: TyId, r: &TraitRef) -> bool {
     {
         return implements_builtin(p, ty, l);
     }
+    // A bound entry point's type has its stage's trait (§12); nothing else has one but a
+    // parameter bounded by it.
+    if let Some(l @ (Lang::Kernel | Lang::VertexShader | Lang::FragmentShader)) =
+        p.trait_(r.trait_).lang
+        && let TyKind::Adt(a, args) = p.types.kind(ty)
+    {
+        return p.adt(*a).entry.is_some_and(|f| crate::gpu::bound_has(p, f, args, l, &r.args));
+    }
     if let Some(bounds) = declared_bounds(p, ty) {
         return bounds.iter().any(|b| b == r);
     }

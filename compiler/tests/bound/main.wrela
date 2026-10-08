@@ -1,0 +1,109 @@
+// Bound entry points as values (language.md §12): the left half of the screen is drawn by
+// entry points named and bound where they're recorded, the right by the same entry points
+// bound first, as values, and recorded by functions generic over them. renderer.rs checks
+// the halves match, to the bit.
+
+use std::gpu::{
+    ClipPosition, FragmentShader, GlobalId, GpuBuffer, Kernel, Rgba16Float, Sampler, Slots,
+    Texels, Texture, VertexIndex, VertexShader, begin_screen_pass, buffer, dispatch, draw,
+    present, sampler, writable_texture, write,
+}
+
+struct State {
+    left: Texture<Rgba16Float>,
+    right: Texture<Rgba16Float>,
+    s: Sampler,
+    weights: GpuBuffer<f32>,
+    left_scales: GpuBuffer<f32>,
+    right_scales: GpuBuffer<f32>,
+}
+
+/// Each weight times `k`, into `out`.
+@compute(64)
+fn scale(weights: [f32], k: f32, out: mut Slots<f32>, id: GlobalId) {
+    out[id] = weights[id.x] * k
+}
+
+fn total(xs: [f32]) -> f32 {
+    var t = 0.0
+    for x in xs {
+        t += x
+    }
+    t
+}
+
+/// Texel (x, y) of 16 × 16: red x / 15 times the scaled weights' sum over 4, green y / 15.
+@compute(8, 8)
+fn fill(scales: [f32], blue: f32, out: mut Texels<Rgba16Float>, id: GlobalId) {
+    let w = total(scales) / 4.0
+    out.store(id, vec4(f32(id.x) / 15.0 * w, f32(id.y) / 15.0, blue, 1.0))
+}
+
+struct Quad: Copy {
+    pos: ClipPosition,
+    uv: vec2,
+}
+
+/// The left half of the screen (`left` -1) or the right (0): two triangles.
+@vertex
+fn half(v: VertexIndex, left: f32) -> Quad {
+    let corners = [
+        vec2(0.0, -1.0),
+        vec2(1.0, -1.0),
+        vec2(0.0, 1.0),
+        vec2(0.0, 1.0),
+        vec2(1.0, -1.0),
+        vec2(1.0, 1.0),
+    ]
+    let c = corners[v.index]
+    Quad { pos: ClipPosition { position: vec4(c.x + left, c.y, 0.5, 1.0) }, uv: c }
+}
+
+@fragment
+fn textured(q: Quad, image: Texture<Rgba16Float>, s: Sampler, weights: [f32]) -> vec4 {
+    let base = image.sample_level(s, q.uv * 0.75 + vec2(0.1, 0.0), level: 0.0)
+    vec4(base.rgb * total(weights) / f32(weights.len()), 1.0)
+}
+
+/// Any kernel bound to its arguments, run over 16 × 16.
+fn cover<K: Kernel>(k: K) {
+    dispatch(k, over: (16, 16))
+}
+
+/// Any pair of shaders bound to their arguments, drawn over a half.
+fn paint<V: VertexShader<Quad>, F: FragmentShader<Quad>>(vs: V, fs: F) {
+    draw(vs, fs, vertices: 6)
+}
+
+pub fn init() -> State {
+    var weights = buffer(4)
+    write(mut weights, 0, [0.5, 1.0, 1.5, 1.0])
+    State {
+        left: writable_texture::<Rgba16Float>(width: 16, height: 16),
+        right: writable_texture::<Rgba16Float>(width: 16, height: 16),
+        s: sampler(),
+        weights,
+        left_scales: buffer(4),
+        right_scales: buffer(4),
+    }
+}
+
+pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
+    // Named where recorded.
+    dispatch(scale.bind(s.weights, k: 2.0, out: mut s.left_scales), over: 4)
+    dispatch(fill.bind(s.left_scales, blue: 0.25, out: mut s.left), over: (16, 16))
+    // As values: a local, and a function generic over a kernel.
+    let k = scale.bind(s.weights, k: 2.0, out: mut s.right_scales)
+    dispatch(k, over: 4)
+    cover(fill.bind(s.right_scales, blue: 0.25, out: mut s.right))
+    begin_screen_pass(clear: vec4(0.0))
+    draw(
+        half.bind(left: -1.0),
+        textured.bind(image: s.left, s: s.s, weights: s.weights.span(start: 0, count: 4)),
+        vertices: 6,
+    )
+    let vs = half.bind(left: 0.0)
+    let fs = textured.bind(image: s.right, s: s.s, weights: s.weights)
+    paint(vs, fs)
+    present()
+}

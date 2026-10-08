@@ -194,6 +194,10 @@ pub const RULES: &[(&str, &str)] = &[
         "gpu.groups",
         "a borrow struct of textures, samplers, spans and `GpuData` values is one GPU parameter",
     ),
+    (
+        "gpu.bound",
+        "`k.bind(...)` is a value a command takes; code is generic over `Kernel`, `VertexShader<V>` and `FragmentShader<V>`",
+    ),
     ("gpu.cpu", "GPU builtins and derivatives only in GPU code"),
     ("gpu.workgroup", "workgroup sizes within WebGPU's limits"),
     ("gpu.uniformity", "derivatives only where every pixel reaches them (uniform control flow)"),

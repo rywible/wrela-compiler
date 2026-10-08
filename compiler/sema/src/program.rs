@@ -35,6 +35,8 @@ pub struct Program {
     pub inherent_impls: HashMap<AdtId, Vec<ImplId>>,
     /// Std's inherent impls of built-in types (`impl str`).
     pub builtin_inherent: Vec<ImplId>,
+    /// Each entry point's bound type (§12), `AdtDef::entry`'s other way.
+    pub bound_types: HashMap<FnId, AdtId>,
     /// Whether dropping a type may do something: worked out once per type.
     pub(crate) drop_cache: std::cell::RefCell<HashMap<TyId, bool>>,
     /// Each closure's parameter and return types, in its owner's generic terms, for whether
@@ -274,7 +276,8 @@ impl Program {
             TyKind::Str => s.push_str("str"),
             TyKind::Adt(a, args) => {
                 s.push_str(&self.adt(*a).name);
-                if !args.is_empty() {
+                // A bound entry point's type shows as its entry point bound: `shade.bind(...)`.
+                if !args.is_empty() && self.adt(*a).entry.is_none() {
                     s.push('<');
                     self.write_list(args, s);
                     s.push('>');

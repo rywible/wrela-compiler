@@ -1192,7 +1192,8 @@ impl<'a> Builder<'a> {
     }
 
     fn dispatch(&mut self, d: &thir::Dispatch) -> Option<Rvalue> {
-        // In the order written: the arguments before `groups`, `groups`, the rest.
+        // In the order written: the kernel, the arguments before `groups`, `groups`, the rest.
+        let kernel = self.shader(&d.kernel)?;
         let mut args = Vec::new();
         for (i, a) in &d.args[..d.groups_at] {
             let p = self.gpu_arg(a)?;
@@ -1236,20 +1237,19 @@ impl<'a> Builder<'a> {
             let p = self.gpu_arg(a)?;
             args.push((*i, p, a.span));
         }
-        Some(Rvalue::Dispatch(Box::new(Dispatch {
-            kernel: d.kernel,
-            kernel_args: d.kernel_args.clone(),
-            groups,
-            over: d.over,
-            args,
-            indirect,
-        })))
+        Some(Rvalue::Dispatch(Box::new(Dispatch { kernel, groups, over: d.over, args, indirect })))
     }
 
     fn draw(&mut self, d: &thir::Draw) -> Option<Rvalue> {
-        // In the order written: the shaders' bound arguments, then the counts.
+        // In the order written: each shader (a value, or its bound arguments), then the counts.
+        let vertex = self.shader(&d.vertex)?;
         let mut args = Vec::new();
-        for (e, i, a) in &d.args {
+        for (e, i, a) in d.args.iter().filter(|a| a.0 == 0) {
+            let p = self.gpu_arg(a)?;
+            args.push((*e, *i, p, a.span));
+        }
+        let fragment = self.shader(&d.fragment)?;
+        for (e, i, a) in d.args.iter().filter(|a| a.0 == 1) {
             let p = self.gpu_arg(a)?;
             args.push((*e, *i, p, a.span));
         }
@@ -1280,8 +1280,8 @@ impl<'a> Builder<'a> {
             instances = Some(self.value(&d.instances, Want::Read)?);
         }
         Some(Rvalue::Draw(Box::new(Draw {
-            vertex: d.vertex.clone(),
-            fragment: d.fragment.clone(),
+            vertex,
+            fragment,
             vertices: vertices?,
             instances: instances?,
             args,
@@ -1289,6 +1289,15 @@ impl<'a> Builder<'a> {
             indices,
             state: d.state,
         })))
+    }
+
+    /// A command's entry point: a bound entry point's value is borrowed, as its arguments are
+    /// where they're held.
+    fn shader(&mut self, s: &thir::Shader) -> Option<Shader> {
+        Some(match s {
+            thir::Shader::Named(f, args) => Shader::Named(*f, args.clone()),
+            thir::Shader::Value(e) => Shader::Value(self.borrowed_place(e)?, e.span),
+        })
     }
 
     /// A dispatch's or draw's argument: a buffer passed `mut buf` is bound mutably, so while

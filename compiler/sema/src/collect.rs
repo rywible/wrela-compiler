@@ -119,6 +119,7 @@ pub fn collect(
     c.resolve_imports();
     c.find_lang_items();
     c.resolve_signatures();
+    c.make_bound_types();
     c.index_impls();
     c.check_recursive_types();
     c.check_impls();
@@ -668,6 +669,7 @@ impl<'d, 'u> Collector<'d, 'u> {
             lang: None,
             diagnostic: None,
             borrow: matches!(&item.kind, ast::ItemKind::Struct(s) if s.borrow),
+            entry: None,
         });
         self.bind(m, name, Res::Adt(id), vis);
         self.pending.push((m, PendingItem::Adt(id, item)));
@@ -1178,6 +1180,51 @@ impl<'d, 'u> Collector<'d, 'u> {
     }
 
     // ---- signatures ------------------------------------------------------------------------
+
+    /// Each entry point's bound type (§12): the borrow struct of its arguments that
+    /// `name.bind(...)` makes, generic over the entry point's generics.
+    fn make_bound_types(&mut self) {
+        for i in 0..self.p.fns.len() {
+            let f = FnId(i as u32);
+            let def = self.p.func(f);
+            if def.attrs.entry.is_none() {
+                continue;
+            }
+            let (name, module, span, name_span) =
+                (def.name.clone(), def.module, def.sig_span, def.name_span);
+            let fields = crate::gpu::bound_fields(&self.p, f)
+                .into_iter()
+                .map(|b| {
+                    let ps = &self.p.func(f).params[b.param];
+                    FieldDef {
+                        name: ps.name.clone(),
+                        ty: b.ty,
+                        public: false,
+                        package_only: false,
+                        default: None,
+                        span: ps.span,
+                        mode: b.mode,
+                    }
+                })
+                .collect();
+            let id = AdtId(self.p.adts.len() as u32);
+            self.p.adts.push(AdtDef {
+                name: format!("{name}.bind(...)"),
+                module,
+                generics: self.p.fn_all_generics(f),
+                kind: AdtKind::Struct(fields),
+                opt_in: Vec::new(),
+                public: false,
+                span,
+                name_span,
+                lang: None,
+                diagnostic: None,
+                borrow: true,
+                entry: Some(f),
+            });
+            self.p.bound_types.insert(f, id);
+        }
+    }
 
     fn resolve_signatures(&mut self) {
         let pending = std::mem::take(&mut self.pending);
@@ -2491,6 +2538,23 @@ fn check_impl(p: &Program, diags: &mut Vec<Diagnostic>, imp: &ImplDef) {
             )
             .with_note("wrela has no user-defined destructors: a value's fields are dropped when it is (§18)")
             .with_help("to run code when something ends, call it where it ends"),
+        );
+        return;
+    }
+    // A bound entry point's traits are its own (§12).
+    if let Some(l @ (Lang::Kernel | Lang::VertexShader | Lang::FragmentShader)) = tr.lang {
+        let what = match l {
+            Lang::Kernel => "a kernel",
+            Lang::VertexShader => "a vertex shader",
+            _ => "a fragment shader",
+        };
+        diags.push(
+            Diagnostic::new(
+                codes::E0415,
+                imp.span,
+                format!("`{}` isn't implemented with an `impl`: {what} bound to its arguments has it", tr.name),
+            )
+            .with_note("`name.bind(...)` makes a value of the entry point's bound type, which has the trait (§12)"),
         );
         return;
     }
