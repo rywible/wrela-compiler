@@ -88,8 +88,13 @@ fn explanations_programs_do_what_they_say() {
                     wrela_diag::render::render_all(&wrong.0, &wrong.1)
                 ));
             }
-            let fixed = diagnose(e.code, &write("fixed", &e.fixed));
+            let mut fixed = diagnose(e.code, &write("fixed", &e.fixed));
             // No diagnostic at all: a warning in a fixed program would teach the wrong thing.
+            // But W0008: an explanation's program shows a function, which nothing need call
+            // (W0008's own program shows one that something does).
+            if e.code != "W0008" {
+                fixed.1.retain(|d| d.code != wrela_diag::codes::W0008);
+            }
             if !fixed.1.is_empty() {
                 problems.push(format!(
                     "the fixed program doesn't compile:\n{}",

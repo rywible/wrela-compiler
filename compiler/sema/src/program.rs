@@ -37,6 +37,9 @@ pub struct Program {
     pub builtin_inherent: Vec<ImplId>,
     /// Each entry point's bound type (§12), `AdtDef::entry`'s other way.
     pub bound_types: HashMap<FnId, AdtId>,
+    /// The constants code names, where the name resolves: a literal one is folded before the
+    /// memory IR, which so doesn't show its uses (W0008).
+    pub(crate) used_consts: std::cell::RefCell<HashSet<ConstId>>,
     /// Whether dropping a type may do something: worked out once per type.
     pub(crate) drop_cache: std::cell::RefCell<HashMap<TyId, bool>>,
     /// Each closure's parameter and return types, in its owner's generic terms, for whether
@@ -202,6 +205,16 @@ impl Program {
             }
             FnOwner::Trait(t) => format!("{}::{}", self.trait_(t).name, def.name),
         }
+    }
+
+    /// Notes that code names constant `c` (W0008).
+    pub(crate) fn note_const_use(&self, c: ConstId) {
+        self.used_consts.borrow_mut().insert(c);
+    }
+
+    /// Whether code names constant `c`.
+    pub(crate) fn const_used(&self, c: ConstId) -> bool {
+        self.used_consts.borrow().contains(&c)
     }
 
     /// A type as diagnostics show it; a long one is cut short.

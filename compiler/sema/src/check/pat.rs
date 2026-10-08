@@ -297,6 +297,7 @@ impl<'p> Checker<'p> {
 
     /// A constant used as a pattern: its value, which must be a number or a `bool`.
     fn const_pat(&mut self, c: ConstId, ty: TyId, span: Span) -> Option<Lit> {
+        self.p.note_const_use(c);
         let ct = self.const_ty(c);
         self.expect(ct, ty, span);
         let p = self.p;

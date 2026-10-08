@@ -1,11 +1,17 @@
 //! Warnings: W0001 (a local bound and never used), W0002 (an arm that can't match), W0004
 //! (`Clone` declared beside `Copy`), W0005 (a bare literal by position where a swap would
-//! compile, or a `select` by position) and W0006 (a `var` that never changes). The conformance
-//! suite checks errors only.
+//! compile, or a `select` by position), W0006 (a `var` that never changes), W0007 (a `GpuData`
+//! struct's padding that another order saves) and W0008 (a private function or constant that
+//! nothing uses). The conformance suite checks errors only.
 
 use crate::package;
 
 fn warnings(name: &str, text: &str) -> Vec<(String, usize)> {
+    all_warnings(name, text).into_iter().filter(|(c, _)| c != "W0008").collect()
+}
+
+/// [`warnings`], W0008 too: the cases above show functions nothing calls.
+fn all_warnings(name: &str, text: &str) -> Vec<(String, usize)> {
     let out = wrela_driver::check(&package(&format!("warnings/{name}"), text));
     assert!(!out.has_errors(), "{:?}", out.diagnostics);
     out.diagnostics
@@ -285,4 +291,83 @@ fn std_has_no_warnings() {
     let shown = wrela_diag::render::render_all(&out.sources, &out.std_warnings);
     assert!(out.std_warnings.is_empty(), "std's warnings:\n{shown}");
     assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+}
+
+/// A private function or constant that no other code uses is W0008: one that calls only itself
+/// too. One that's used, `pub`, a trait's, a test, or named `_...` isn't, and neither is a
+/// constant used only in a type, a pattern or another constant's value.
+#[test]
+fn unused_functions_and_constants_are_reported() {
+    let src = "const USED: u32 = 3
+const UNUSED: u32 = 4
+const IN_TYPE: u32 = 2
+const IN_PATTERN: u32 = 7
+const _KEPT: u32 = 5
+pub const SHARED: u32 = 6
+
+fn helper() -> u32 {
+    USED
+}
+
+fn lonely() -> u32 {
+    1
+}
+
+fn spins(n: u32) -> u32 {
+    if n == 0 { 0 } else { spins(n - 1) }
+}
+
+fn _kept() -> u32 {
+    2
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    let xs: [u32; IN_TYPE] = [helper(), 0]
+    let k = match xs[0] {
+        IN_PATTERN => 1,
+        _ => 0,
+    }
+}
+";
+    let w = all_warnings("unused", src);
+    let found: Vec<(&str, usize)> =
+        w.iter().filter(|(c, _)| c == "W0008").map(|(c, l)| (c.as_str(), *l)).collect();
+    assert_eq!(found, [("W0008", 2), ("W0008", 12), ("W0008", 16)], "{w:?}");
+}
+
+/// A `GpuData` struct whose fields another order would lay out in fewer bytes is W0007, with
+/// that order; one already as small isn't.
+#[test]
+fn gpu_data_padding_is_reported() {
+    let src = "struct Padded: Copy + GpuData {
+    a: f32,
+    b: vec3,
+    c: f32,
+    d: vec3,
+}
+
+struct Tight: Copy + GpuData {
+    b: vec3,
+    a: f32,
+    d: vec3,
+    c: f32,
+}
+
+pub fn sizes() -> u32 {
+    let p = Padded { a: 1.0, b: vec3(0.0), c: 2.0, d: vec3(1.0) }
+    let t = Tight { a: 1.0, b: vec3(0.0), c: 2.0, d: vec3(1.0) }
+    u32(p.a + t.c)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+";
+    let out = wrela_driver::check(&package("warnings/padding", src));
+    let w: Vec<&wrela_diag::Diagnostic> =
+        out.diagnostics.iter().filter(|d| d.code == wrela_diag::codes::W0007).collect();
+    assert_eq!(w.len(), 1, "{:?}", out.diagnostics);
+    assert!(
+        w[0].message.contains("take 48 bytes") && w[0].message.contains("they'd take 32"),
+        "{}",
+        w[0].message
+    );
 }

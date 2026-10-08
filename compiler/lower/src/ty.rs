@@ -4,7 +4,7 @@ use crate::instance::{Bound, Callable, InstanceKey};
 use crate::{Cx, ModuleBuilder};
 use wrela_diag::{Diagnostic, Span, codes};
 use wrela_ir as ir;
-use wrela_sema::defs::{Mode, RetMode};
+use wrela_sema::defs::{Lang, Mode, RetMode};
 use wrela_sema::mir::Local;
 use wrela_sema::ty::*;
 
@@ -197,7 +197,11 @@ impl<'a> Cx<'a> {
                     if fields.is_empty() {
                         None
                     } else {
-                        Some(mb.m.types.intern(ir::TypeDef::Struct { name, fields }))
+                        let t = mb.m.types.intern(ir::TypeDef::Struct { name, fields });
+                        if !borrow {
+                            self.check_padding(mb, *a, t);
+                        }
+                        Some(t)
                     }
                 }
             }
@@ -590,4 +594,105 @@ impl<'a> Cx<'a> {
             None => format!("fn_{n}"),
         }
     }
+}
+
+impl Cx<'_> {
+    /// W0007: a `GpuData` struct whose fields, in another order, take fewer bytes as WGSL lays
+    /// them out (each at a multiple of its alignment, the whole a multiple of the largest).
+    /// Once a struct, for its first instance; the order is the smallest found, every order for
+    /// a struct of up to `EVERY_ORDER` fields.
+    fn check_padding(&mut self, mb: &ModuleBuilder, a: AdtId, t: ir::TypeId) {
+        let p = &self.checked.program;
+        if !wrela_sema::traits::implements_builtin_declared(p, a, Lang::GpuData)
+            || !self.padded.insert(a)
+        {
+            return;
+        }
+        let ir::TypeDef::Struct { fields, .. } = mb.m.types.get(t) else { return };
+        let mut wgsl = ir::layout::WgslLayouts::default();
+        let layouts: Vec<ir::layout::Layout> =
+            fields.iter().map(|(_, f)| wgsl.get(&mb.m.types, *f).0).collect();
+        let size =
+            |order: &[usize]| ir::layout::pack_layouts(order.iter().map(|&i| layouts[i])).1.size;
+        let declared: Vec<usize> = (0..fields.len()).collect();
+        let now = size(&declared);
+        let best = smallest_order(&layouts, &size);
+        let then = size(&best);
+        if then >= now {
+            return;
+        }
+        let names: Vec<&str> = best.iter().map(|&i| fields[i].0.as_str()).collect();
+        let adt = p.adt(a);
+        self.diags.push(
+            Diagnostic::new(
+                wrela_diag::codes::W0007,
+                adt.name_span,
+                format!(
+                    "`{}`'s fields take {now} bytes as WGSL lays them out; ordered `{}`, they'd take {then}",
+                    adt.name,
+                    names.join(", ")
+                ),
+            )
+            .with_note("each field starts at a multiple of its alignment (a `vec3`'s and a `vec4`'s are 16), and the struct's size is a multiple of the largest: the rest is padding, in every buffer and uniform block that holds it (§6.10)")
+            .with_help("declare the fields in that order, if nothing reads them by their offsets"),
+        );
+    }
+}
+
+/// The most fields whose every order `smallest_order` tries.
+const EVERY_ORDER: usize = 7;
+
+/// The order of fields of `layouts` that `size` finds smallest: every order, for up to
+/// `EVERY_ORDER` fields; otherwise the most aligned first, each gap filled by the first smaller
+/// field that fits it.
+fn smallest_order(layouts: &[ir::layout::Layout], size: &dyn Fn(&[usize]) -> u32) -> Vec<usize> {
+    let n = layouts.len();
+    if n <= EVERY_ORDER {
+        let mut order: Vec<usize> = (0..n).collect();
+        let mut best = order.clone();
+        let mut best_size = size(&order);
+        // Heap's algorithm: each order once.
+        let mut c = vec![0usize; n];
+        let mut i = 0;
+        while i < n {
+            if c[i] < i {
+                if i % 2 == 0 {
+                    order.swap(0, i)
+                } else {
+                    order.swap(c[i], i)
+                }
+                let s = size(&order);
+                if s < best_size {
+                    best_size = s;
+                    best = order.clone();
+                }
+                c[i] += 1;
+                i = 0;
+            } else {
+                c[i] = 0;
+                i += 1;
+            }
+        }
+        return best;
+    }
+    let mut left: Vec<usize> = (0..n).collect();
+    left.sort_by_key(|&i| std::cmp::Reverse(layouts[i].align));
+    let round = |align: u32, x: u32| x.div_ceil(align.max(1)) * align.max(1);
+    let mut out = Vec::new();
+    let mut end = 0u32;
+    while !left.is_empty() {
+        let next = left.remove(0);
+        // Fill the gap before it with the first fields that fit.
+        let target = round(layouts[next].align, end);
+        while let Some(k) =
+            left.iter().position(|&i| round(layouts[i].align, end) + layouts[i].size <= target)
+        {
+            let i = left.remove(k);
+            end = round(layouts[i].align, end) + layouts[i].size;
+            out.push(i);
+        }
+        end = round(layouts[next].align, end) + layouts[next].size;
+        out.push(next);
+    }
+    out
 }

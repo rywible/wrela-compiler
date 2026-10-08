@@ -211,6 +211,108 @@ fn check(
     for i in 0..p.adts.len() {
         diags.extend(check::check_field_defaults(p, &const_tys, ty::AdtId(i as u32)));
     }
+    if !wrela_diag::has_errors(diags) {
+        diags.extend(unused_items(p, &mir));
+    }
     let hidden = hidden.into_iter().collect();
     Checked { program, mir, consts, hidden }
+}
+
+/// W0008: a private function or constant that no other code uses (a function that only calls
+/// itself counts as unused). Std's items, trait methods, tests, intrinsics, and names that
+/// start with `_` aren't reported. Run only on a program with no errors, whose every body has
+/// its memory IR, which says what it uses.
+fn unused_items(p: &Program, mir: &BTreeMap<ty::FnId, mir::Body>) -> Vec<Diagnostic> {
+    use mir::{Callee, Rvalue, Shader, StatementKind};
+    let mut fns = std::collections::HashSet::new();
+    let mut consts = std::collections::HashSet::new();
+    for (&owner, body) in mir {
+        for code in &body.fns {
+            for s in code.blocks.iter().flat_map(|b| &b.stmts) {
+                let r = match &s.kind {
+                    StatementKind::Assign(_, r) | StatementKind::Eval(r) => r,
+                    _ => continue,
+                };
+                let mut used = |f: ty::FnId| {
+                    if f != owner {
+                        fns.insert(f);
+                    }
+                };
+                match r {
+                    Rvalue::Call(c) => match &c.callee {
+                        Callee::Fn { func, .. } => used(*func),
+                        Callee::TraitMethod { method, .. } => used(*method),
+                        _ => {}
+                    },
+                    Rvalue::FnRef(f, _) => used(*f),
+                    Rvalue::Dispatch(d) => {
+                        if let Shader::Named(f, _) = d.kernel {
+                            used(f);
+                        }
+                    }
+                    Rvalue::Draw(d) => {
+                        for sh in [&d.vertex, &d.fragment] {
+                            if let Shader::Named(f, _) = sh {
+                                used(*f);
+                            }
+                        }
+                    }
+                    Rvalue::BorrowStruct { adt, .. } => {
+                        if let Some(f) = p.adt(*adt).entry {
+                            used(f);
+                        }
+                    }
+                    Rvalue::Const(c) => {
+                        consts.insert(*c);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    let unused = |name: &str, kind: &str, span| {
+        Diagnostic::new(
+            wrela_diag::codes::W0008,
+            span,
+            format!("the {kind} `{name}` is never used"),
+        )
+        .with_help(format!("remove it, or name it `_{name}` if it's kept on purpose"))
+    };
+    for (i, f) in p.fns.iter().enumerate() {
+        let id = ty::FnId(i as u32);
+        let inherent = match f.owner {
+            defs::FnOwner::Free => true,
+            defs::FnOwner::Impl(im) => p.impl_(im).trait_ref.is_none(),
+            defs::FnOwner::Trait(_) | defs::FnOwner::Const(_) => false,
+        };
+        if !inherent
+            || f.public
+            || p.is_std(f.module)
+            || f.attrs.test.is_some()
+            || f.attrs.intrinsic
+            || f.lang.is_some()
+            || f.derived.is_some()
+            || f.name.starts_with('_')
+            || fns.contains(&id)
+        {
+            continue;
+        }
+        let kind = if f.attrs.entry.is_some() { "entry point" } else { "function" };
+        out.push(unused(&f.name, kind, f.name_span));
+    }
+    for (i, c) in p.consts.iter().enumerate() {
+        let id = ty::ConstId(i as u32);
+        if c.public
+            || c.default
+            || p.is_std(c.module)
+            || c.name.starts_with('_')
+            || consts.contains(&id)
+            || p.const_used(id)
+        {
+            continue;
+        }
+        out.push(unused(&c.name, "constant", c.span));
+    }
+    out
 }

@@ -1,0 +1,23 @@
+// A private function or constant that no other code uses: dead code, which the reader must
+// still read. A function that only calls itself is unused too. A `pub` item, a trait's method,
+// a test and a name that starts with `_` aren't reported.
+// ---- wrong
+const STEP: f32 = 0.5
+
+fn halve(x: f32) -> f32 {
+    x * 0.5
+}
+
+pub fn walk(x: f32) -> f32 {
+    x + 1.0
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+const STEP: f32 = 0.5
+
+pub fn walk(x: f32) -> f32 {
+    x + STEP
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

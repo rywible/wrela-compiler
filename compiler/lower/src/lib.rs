@@ -246,6 +246,8 @@ pub(crate) struct Cx<'a> {
     pub explain: bool,
     /// Computed constants whose values were needed but aren't in `values` yet.
     pub missing: std::collections::BTreeSet<wrela_sema::ty::ConstId>,
+    /// The `GpuData` structs whose padding is checked (W0007), once each.
+    pub padded: std::collections::HashSet<wrela_sema::ty::AdtId>,
     /// Whether the modules will be emitted; only then are GPU modules flattened.
     pub emit: bool,
     pub diags: Vec<Diagnostic>,
@@ -514,6 +516,7 @@ impl<'a> Cx<'a> {
             data,
             explain: data.debug,
             missing: Default::default(),
+            padded: Default::default(),
             emit,
             diags: Vec::new(),
             pipelines: Vec::new(),

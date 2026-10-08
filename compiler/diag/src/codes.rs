@@ -243,6 +243,8 @@ codes! {
     W0004 = "W0004", "`Clone` declared beside `Copy`, which implies it";
     W0005 = "W0005", "an argument passed by position where a swap would compile";
     W0006 = "W0006", "a `var` that never changes";
+    W0007 = "W0007", "a `GpuData` struct whose fields would take fewer bytes in another order";
+    W0008 = "W0008", "a private function or constant that nothing uses";
 
     // ---- I0xxx: bugs in the compiler -------------------------------------------------------
     I0001 = "I0001", "an internal compiler error";

@@ -499,6 +499,7 @@ impl<'p> Checker<'p> {
                 Expr { ty: self.p.types.u32, span, kind: ExprKind::ConstParam(g) }
             }
             ValueRes::Item(Res::Const(c)) => {
+                self.p.note_const_use(c);
                 Expr { ty: self.const_ty(c), span, kind: ExprKind::Const(c) }
             }
             ValueRes::Item(Res::Variant(a, v)) => {

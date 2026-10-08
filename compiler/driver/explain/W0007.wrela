@@ -1,0 +1,33 @@
+// A `GpuData` struct whose fields, in another order, would take fewer bytes: WGSL starts each
+// field at a multiple of its alignment (a `vec3`'s and a `vec4`'s are 16) and makes the struct's
+// size a multiple of the largest, and the rest is padding, in every buffer and uniform block
+// that holds it. The warning names the smallest order it found. A `vec3` followed by a 4-byte
+// field fills its 16 bytes.
+// ---- wrong
+struct Light: Copy + GpuData {
+    strength: f32,
+    colour: vec3,
+    range: f32,
+    at: vec3,
+}
+
+pub fn reach() -> f32 {
+    let l = Light { strength: 1.0, colour: vec3(1.0), range: 5.0, at: vec3(0.0) }
+    l.strength * l.range
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+struct Light: Copy + GpuData {
+    colour: vec3,
+    strength: f32,
+    at: vec3,
+    range: f32,
+}
+
+pub fn reach() -> f32 {
+    let l = Light { strength: 1.0, colour: vec3(1.0), range: 5.0, at: vec3(0.0) }
+    l.strength * l.range
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

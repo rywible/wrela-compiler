@@ -834,6 +834,7 @@ fn length(
         ast::ExprKind::Paren(inner) => length(p, module, inner, visiting),
         ast::ExprKind::Path(path) => {
             let Res::Const(c) = resolve_value_item(p, module, path)? else { return None };
+            p.note_const_use(c);
             if visiting.contains(&c) {
                 return None;
             }
@@ -957,6 +958,7 @@ fn resolve_type_path(
                         && scope.param(&path.segments[0].ident.name).is_some())
                     && let Some(Res::Const(c)) = resolve_value_item(p, scope.module, path) =>
             {
+                p.note_const_use(c);
                 match const_value_u32(p, c) {
                     Some(n) => p.types.intern(TyKind::ConstU32(n)),
                     None => {
