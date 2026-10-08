@@ -283,7 +283,9 @@ pub struct Call {
 pub struct Dispatch {
     pub kernel: FnId,
     pub kernel_args: Vec<TyId>,
+    /// The workgroup counts; or, `over` a domain, its size (lowering covers it with groups).
     pub groups: [Operand; 3],
+    pub over: bool,
     /// One per kernel parameter that isn't a builtin, in parameter order: borrowed.
     pub args: Vec<(usize, Place, Span)>,
     /// The buffer (or span) holding the group counts, in place of `groups`: borrowed.

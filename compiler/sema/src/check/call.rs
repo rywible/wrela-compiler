@@ -2907,8 +2907,9 @@ impl<'p> Checker<'p> {
     fn check_dispatch(&mut self, args: &[ast::Arg], span: Span) -> Expr {
         let unit = self.p.types.unit;
         let u32_ty = self.p.types.u32;
-        let is_groups =
-            |i: usize, a: &ast::Arg| a.name.as_ref().map_or(i == 1, |n| n.name == "groups");
+        let is_groups = |i: usize, a: &ast::Arg| {
+            a.name.as_ref().map_or(i == 1, |n| n.name == "groups" || n.name == "over")
+        };
         // The form before binding: the kernel's arguments among `dispatch`'s own.
         let extra: Vec<&ast::Arg> = args
             .iter()
@@ -2952,13 +2953,24 @@ impl<'p> Checker<'p> {
         let kernel_args = self.bind_args(&bound, None);
         let mut groups: Option<Expr> = None;
         let mut indirect = false;
+        let mut over = false;
         for (i, a) in args.iter().enumerate().skip(1) {
             if !is_groups(i, a) {
                 continue;
             }
             let e = self.check_expr(&a.value, None);
             if groups.is_some() {
-                self.err(Diagnostic::new(codes::E0304, a.span, "`groups` is given twice"));
+                self.err(Diagnostic::new(
+                    codes::E0304,
+                    a.span,
+                    "`dispatch` takes `groups:` or `over:`, once",
+                ));
+                continue;
+            }
+            if a.name.as_ref().is_some_and(|n| n.name == "over") {
+                over = true;
+                self.check_over(&e, bound.func);
+                groups = Some(e);
                 continue;
             }
             match self.kind(e.ty) {
@@ -2979,9 +2991,9 @@ impl<'p> Checker<'p> {
                 Diagnostic::new(
                     codes::E0603,
                     span,
-                    "`dispatch` needs `groups:`, the number of workgroups",
+                    "`dispatch` needs `over:`, what its invocations cover, or `groups:`, the number of workgroups",
                 )
-                .with_help("e.g. `groups: (n + 63) / 64` for a `@compute(64)` kernel"),
+                .with_help("e.g. `over: n` for one invocation per element of `n`, or `over: (width, height)`"),
             );
             return self.error_expr(span);
         };
@@ -2991,10 +3003,56 @@ impl<'p> Checker<'p> {
             kernel_args: bound.gen_args,
             groups: Box::new(groups),
             indirect,
+            over,
             args: kernel_args,
             groups_at,
         };
         Expr { ty: unit, span, kind: ExprKind::Dispatch(Box::new(d)) }
+    }
+
+    /// `over:`'s domain: a `u32`, a `(u32, u32)`, a `(u32, u32, u32)`, or a texture (its size).
+    /// A kernel that shares workgroup memory isn't dispatched over one (E0603): its invocations
+    /// past the domain must still reach its barriers, and what they add to the memory is its
+    /// own to decide.
+    fn check_over(&mut self, e: &Expr, kernel: FnId) {
+        let u32_ty = self.p.types.u32;
+        let ok = match self.kind(e.ty).clone() {
+            TyKind::Tuple(ts) if ts.len() == 2 || ts.len() == 3 => {
+                for t in ts {
+                    self.expect(t, u32_ty, e.span);
+                }
+                true
+            }
+            TyKind::Adt(a, _) => matches!(
+                self.p.adt(a).lang,
+                Some(Lang::Texture | Lang::Texture3d | Lang::DepthTexture)
+            ),
+            TyKind::Error => true,
+            _ => self.try_unify(e.ty, u32_ty),
+        };
+        if !ok {
+            let shown = self.display(e.ty);
+            self.err(Diagnostic::new(
+                codes::E0300,
+                e.span,
+                format!("`over:` is a count, a `(u32, u32)`, a `(u32, u32, u32)` or a texture, not `{shown}`"),
+            ));
+        }
+        let shares = self.p.func(kernel).params.iter().any(
+            |p| matches!(self.kind(p.ty), TyKind::Adt(a, _) if self.p.is_lang_adt(*a, Lang::Shared)),
+        );
+        if shares {
+            let name = self.p.func(kernel).name.clone();
+            self.err(
+                Diagnostic::new(
+                    codes::E0603,
+                    e.span,
+                    format!("`{name}` shares workgroup memory, so it isn't dispatched over a domain"),
+                )
+                .with_note("its invocations past the domain would still reach its barriers, and what they add to the memory is the kernel's to decide")
+                .with_help("dispatch it by `groups:`, and check its `GlobalId` against what it covers"),
+            );
+        }
     }
 
     /// `draw(vs.bind(...), fs.bind(...), vertices: n)`, with `instances: m` or, for both,

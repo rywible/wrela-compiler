@@ -22,6 +22,9 @@ pub enum PipelineKey {
     Compute {
         kernel: FnId,
         substs: Vec<TyId>,
+        /// Dispatched over a domain (`over:`): its uniform block holds the domain, and
+        /// invocations past it return at once.
+        over: bool,
     },
     Render {
         vertex: (FnId, Vec<TyId>),
@@ -98,6 +101,8 @@ pub(crate) struct GpuCx {
     pub uniform: Option<ir::ResourceId>,
     /// For each of the interface's uniforms, its field in the block (`None`: no runtime value).
     pub uniform_fields: Vec<Option<u32>>,
+    /// Over a domain: the block's field holding the domain's size.
+    pub domain_field: Option<u32>,
     /// A lifted build's literal table (§22): the storage buffer every pipeline binds last.
     pub literals: Option<ir::ResourceId>,
 }
@@ -118,6 +123,7 @@ impl GpuCx {
             num_workgroups: None,
             uniform: None,
             uniform_fields: Vec::new(),
+            domain_field: None,
             literals: None,
         }
     }
@@ -401,6 +407,9 @@ pub(crate) struct Interface {
     pub uniforms: Vec<Leaf>,
     /// A render pipeline's vertex output: what the fragment shader's varyings are.
     pub vertex_ret: Option<TyId>,
+    /// A kernel dispatched over a domain (`over:`): its uniform block ends with the domain's
+    /// size (`DOMAIN`), and invocations past it return at once.
+    pub over: bool,
 }
 
 impl Interface {
@@ -478,9 +487,10 @@ impl Leaf {
 /// A pipeline's interface.
 fn interface(cx: &mut Cx, key: &PipelineKey) -> Interface {
     match key {
-        PipelineKey::Compute { kernel, substs } => {
-            Interface::of(cx, &[(*kernel, substs.as_slice())], None, None)
-        }
+        PipelineKey::Compute { kernel, substs, over } => Interface {
+            over: *over,
+            ..Interface::of(cx, &[(*kernel, substs.as_slice())], None, None)
+        },
         PipelineKey::Render { vertex, fragment, .. } => {
             let vret = ret_type(cx, vertex.0, &vertex.1);
             let entries = [(vertex.0, vertex.1.as_slice()), (fragment.0, fragment.1.as_slice())];
@@ -644,7 +654,7 @@ pub(crate) fn lower_dispatch(fl: &mut Fl, d: &mir::Dispatch, span: Span) {
         return;
     }
     let substs: Vec<TyId> = d.kernel_args.iter().map(|&a| fl.concrete(a)).collect();
-    let key = PipelineKey::Compute { kernel: d.kernel, substs };
+    let key = PipelineKey::Compute { kernel: d.kernel, substs, over: d.over };
     let (pindex, iface) = pipeline(fl.cx, key, span);
     let mut groups = Vec::new();
     match &d.indirect {
@@ -661,10 +671,33 @@ pub(crate) fn lower_dispatch(fl: &mut Fl, d: &mir::Dispatch, span: Span) {
             }
         }
     }
+    // Over a domain: `groups` is its size, which the groups cover, each a workgroup's.
+    let domain = d.over.then(|| groups.clone());
+    if let Some(size) = &domain {
+        let wg = match fl.cx.entry_of(d.kernel) {
+            Some(Entry::Compute(wg)) => wg,
+            _ => [1, 1, 1],
+        };
+        let u = fl.mb.m.types.u32();
+        groups = size
+            .iter()
+            .zip(wg)
+            .map(|(&n, w)| {
+                let (wv, w1) = (fl.u32c(w), fl.u32c(w - 1));
+                let up = fl.value(u, ir::Expr::Binary(ir::BinOp::WrappingAdd, n, w1));
+                fl.value(u, ir::Expr::Binary(ir::BinOp::Div, up, wv))
+            })
+            .collect();
+    }
     let arg = |i: usize| d.args.iter().find(|a| a.0 == i).map(|(_, p, s)| (p, *s));
-    let Some((uniform_fields, uniform_vals)) = uniforms(fl, &iface, |_, i| arg(i)) else {
+    let Some((mut uniform_fields, mut uniform_vals)) = uniforms(fl, &iface, |_, i| arg(i)) else {
         return;
     };
+    if let Some(size) = domain {
+        let v3 = fl.mb.m.types.intern(ir::TypeDef::Vector(ir::Scalar::U32, 3));
+        uniform_fields.push((DOMAIN.to_string(), v3));
+        uniform_vals.push(fl.value(v3, ir::Expr::Construct(v3, size)));
+    }
     let Some(mut handles) = bound(fl, &iface, |_, i| arg(i)) else { return };
     // A lifted build's literal table (only a build with literals has one).
     handles.extend(fl.literal_binding(true).into_iter().flatten());
@@ -683,6 +716,9 @@ pub(crate) fn lower_dispatch(fl: &mut Fl, d: &mir::Dispatch, span: Span) {
 
 /// A uniform block's fields: each one's name and type.
 type UniformFields = Vec<(String, ir::TypeId)>;
+
+/// The uniform block's last field, of a kernel dispatched over a domain: the domain's size.
+const DOMAIN: &str = "domain";
 
 /// The uniform block's fields and their values: each uniform leaf whose argument (`arg` of an
 /// entry point's parameter) has a runtime value, as `bind_uniform` makes the block. `None` if
@@ -1891,8 +1927,15 @@ fn bind_uniform(cx: &mut Cx, mb: &mut ModuleBuilder, iface: &Interface) -> Optio
             None => map.push(None),
         }
     }
+    // Over a domain, its size last.
+    let domain = iface.over.then(|| {
+        let v3 = mb.m.types.intern(ir::TypeDef::Vector(ir::Scalar::U32, 3));
+        fields.push((DOMAIN.to_string(), v3));
+        fields.len() as u32 - 1
+    });
     if let Some(g) = mb.gpu.as_mut() {
         g.uniform_fields = map;
+        g.domain_field = domain;
     }
     if fields.is_empty() {
         return None;
@@ -2043,12 +2086,12 @@ fn lower_compute(cx: &mut Cx, iface: Rc<Interface>) -> Option<PipelineOut> {
     let entry = entry_function(&mut mb, &keys[0], name, None, None);
     cx.drain(&mut mb);
     check_recursion(cx, &mb);
-    check_workgroup(cx, &mb, entry, &entry_inputs(&iface.entries[0], true));
+    check_workgroup(cx, &mb, entry, &entry_inputs(&iface.entries[0], true, iface.over));
     mb.m.entry_points.push(ir::EntryPoint {
         name: ir::ident(name),
         stage: ir::Stage::Compute { workgroup_size: wg },
         function: entry,
-        inputs: entry_inputs(&iface.entries[0], true),
+        inputs: entry_inputs(&iface.entries[0], true, iface.over),
     });
     verify(cx, &mut mb, name)?;
     let instances = mb.fn_instances();
@@ -2058,7 +2101,7 @@ fn lower_compute(cx: &mut Cx, iface: Rc<Interface>) -> Option<PipelineOut> {
         kind: PipelineKind::Compute { workgroup_size: wg },
         uniform,
         bindings,
-        key: PipelineKey::Compute { kernel: FnId(0), substs: Vec::new() },
+        key: PipelineKey::Compute { kernel: FnId(0), substs: Vec::new(), over: false },
         sites: Vec::new(),
         debug_flag: None,
         blend: false,
@@ -2105,13 +2148,13 @@ fn lower_render(cx: &mut Cx, iface: Rc<Interface>) -> Option<PipelineOut> {
         unwrap_returns(f, v4);
     }
     check_recursion(cx, &mb);
-    check_uniformity(cx, &mb, fentry, &entry_inputs(fragment, false));
+    check_uniformity(cx, &mb, fentry, &entry_inputs(fragment, false, false));
     let varyings = varying_layout(cx, &mut mb, vret, vdef.sig_span)?;
     mb.m.entry_points.push(ir::EntryPoint {
         name: ir::ident(&vdef.name),
         stage: ir::Stage::Vertex { varyings: varyings.clone() },
         function: ventry,
-        inputs: entry_inputs(vertex, false),
+        inputs: entry_inputs(vertex, false, false),
     });
     mb.m.entry_points.push(ir::EntryPoint {
         name: ir::ident(&fdef.name),
@@ -2121,7 +2164,7 @@ fn lower_render(cx: &mut Cx, iface: Rc<Interface>) -> Option<PipelineOut> {
             uint,
         },
         function: fentry,
-        inputs: entry_inputs(fragment, false),
+        inputs: entry_inputs(fragment, false, false),
     });
     let name = format!("{}_{}", ir::ident(&vdef.name), ir::ident(&fdef.name));
     verify(cx, &mut mb, &name)?;
@@ -2132,7 +2175,7 @@ fn lower_render(cx: &mut Cx, iface: Rc<Interface>) -> Option<PipelineOut> {
         kind: PipelineKind::Render,
         uniform,
         bindings,
-        key: PipelineKey::Compute { kernel: FnId(0), substs: Vec::new() },
+        key: PipelineKey::Compute { kernel: FnId(0), substs: Vec::new(), over: false },
         sites: Vec::new(),
         debug_flag: None,
         blend,
@@ -2256,8 +2299,9 @@ fn varying_leaves(
 }
 
 /// The builtins an entry point reads: its builtin parameters' inputs in order, each once (WGSL
-/// takes each once; two parameters of one type both read it), then (compute) `num_workgroups`.
-fn entry_inputs(entry: &EntryParams, compute: bool) -> Vec<ir::BuiltinInput> {
+/// takes each once; two parameters of one type both read it), then (compute) `num_workgroups`,
+/// and over a domain (`over`) the invocation's id, if no parameter reads it.
+fn entry_inputs(entry: &EntryParams, compute: bool, over: bool) -> Vec<ir::BuiltinInput> {
     let mut out: Vec<ir::BuiltinInput> = Vec::new();
     for (_, class) in &entry.params {
         if let ParamClass::Builtin(b) = class
@@ -2268,6 +2312,9 @@ fn entry_inputs(entry: &EntryParams, compute: bool) -> Vec<ir::BuiltinInput> {
     }
     if compute {
         out.push(ir::BuiltinInput::NumWorkgroups);
+    }
+    if over && !out.contains(&ir::BuiltinInput::GlobalInvocationId) {
+        out.push(ir::BuiltinInput::GlobalInvocationId);
     }
     out
 }
@@ -2299,7 +2346,7 @@ pub(crate) fn bind_entry_params(fl: &mut Fl, func: FnId, entry: Entry) {
     let (iface, uniform, fields) = (g.iface.clone(), g.uniform, g.uniform_fields.clone());
     let checked = fl.cx.checked;
     let params = &checked.program.func(func).params;
-    let inputs = entry_inputs(&iface.entries[e], matches!(entry, Entry::Compute(_)));
+    let inputs = entry_inputs(&iface.entries[e], matches!(entry, Entry::Compute(_)), iface.over);
     let input = |b: ir::BuiltinInput| inputs.iter().position(|&x| x == b).unwrap_or(0) as u32;
     for (i, (t, class)) in iface.entries[e].params.iter().enumerate() {
         let local = fl.code.params[i];
@@ -2350,6 +2397,30 @@ pub(crate) fn bind_entry_params(fl: &mut Fl, func: FnId, entry: Entry) {
         let t = fl.mb.m.resources[nwg.index()].ty;
         let v = fl.value(t, ir::Expr::EntryInput(input(ir::BuiltinInput::NumWorkgroups)));
         fl.emit(ir::Stmt::Store(ir::Place::root(ir::PlaceRoot::Resource(nwg)), v));
+    }
+    // Over a domain: an invocation past it returns at once.
+    if let Some(g) = fl.mb.gpu.as_ref()
+        && let (Some(u), Some(field)) = (g.uniform, g.domain_field)
+    {
+        let types = &mut fl.mb.m.types;
+        let (b, u32_ty) = (types.bool(), types.u32());
+        let v3 = types.intern(ir::TypeDef::Vector(ir::Scalar::U32, 3));
+        let id = fl.value(v3, ir::Expr::EntryInput(input(ir::BuiltinInput::GlobalInvocationId)));
+        let at = ir::Place { root: ir::PlaceRoot::Resource(u), path: vec![ir::Proj::Field(field)] };
+        let size = fl.load(at, v3);
+        let mut past = None;
+        for k in 0..3 {
+            let i = fl.value(u32_ty, ir::Expr::Extract(id, k));
+            let n = fl.value(u32_ty, ir::Expr::Extract(size, k));
+            let out = fl.value(b, ir::Expr::Binary(ir::BinOp::Ge, i, n));
+            past = Some(match past {
+                None => out,
+                Some(p) => fl.value(b, ir::Expr::Binary(ir::BinOp::Or, p, out)),
+            });
+        }
+        if let Some(cond) = past {
+            fl.emit(ir::Stmt::If { cond, then: vec![ir::Stmt::Return(None)], else_: Vec::new() });
+        }
     }
 }
 
@@ -2555,8 +2626,8 @@ pub(crate) fn check_standalone(cx: &mut Cx, f: FnId, entry: Option<Entry>, subst
             };
             let varyings = varyings.and_then(|t| cx.lower_ty(&mut mb, t, def.sig_span));
             let id = entry_function(&mut mb, &keys[0], &def.name, ret, varyings);
-            fragment =
-                (stage == Entry::Fragment).then(|| (id, entry_inputs(&iface.entries[0], false)));
+            fragment = (stage == Entry::Fragment)
+                .then(|| (id, entry_inputs(&iface.entries[0], false, false)));
             mb
         }
         None => {

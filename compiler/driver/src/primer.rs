@@ -178,6 +178,10 @@ pub const RULES: &[(&str, &str)] = &[
         "textures are sampled in fragment shaders, read anywhere on the GPU, drawn into in passes",
     ),
     (
+        "gpu.domains",
+        "`over:` dispatches a kernel over a count, a size or a texture: its groups and its bounds the compiler's",
+    ),
+    (
         "gpu.formats",
         "a texture's format is a type: its texel, and whether it's filtered, written by kernels, drawn into",
     ),

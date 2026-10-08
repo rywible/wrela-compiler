@@ -1200,19 +1200,33 @@ impl<'a> Builder<'a> {
         }
         let u32_ty = self.p.types.u32;
         let mut indirect = None;
+        let one = constant(Lit::Int(1), u32_ty, d.groups.span);
         let groups = if d.indirect {
             // The counts are in a buffer, which the dispatch reads.
             let p = self.borrowed_place(&d.groups)?;
             indirect = Some((p, d.groups.span));
             let zero = constant(Lit::Int(0), u32_ty, d.groups.span);
             [zero.clone(), zero.clone(), zero]
-        } else if matches!(self.p.types.kind(d.groups.ty), TyKind::Tuple(_)) {
+        } else if let TyKind::Tuple(ts) = self.p.types.kind(d.groups.ty) {
+            let n = ts.len() as u32;
             let g = self.value(&d.groups, Want::Read)?;
             let gp = self.operand_place(g);
             let f = |k: u32, b: &mut Self| {
+                if k >= n {
+                    return one.clone();
+                }
                 b.materialize(OperandKind::Copy(gp.with(Proj::Field(k))), u32_ty, d.groups.span)
             };
             [f(0, self), f(1, self), f(2, self)]
+        } else if d.over && matches!(self.p.types.kind(d.groups.ty), TyKind::Adt(..)) {
+            // A texture's size: its width, height and (a 3D one's) depth, its fields after its
+            // handle, read before the kernel's arguments are borrowed.
+            let p = self.borrowed_place(&d.groups)?;
+            let three = self.p.lang_of_ty(d.groups.ty) == Some(Lang::Texture3d);
+            let f = |k: u32, b: &mut Self| {
+                b.materialize(OperandKind::Copy(p.with(Proj::Field(k))), u32_ty, d.groups.span)
+            };
+            [f(1, self), f(2, self), if three { f(3, self) } else { one.clone() }]
         } else {
             let g = self.value(&d.groups, Want::Read)?;
             let one = constant(Lit::Int(1), u32_ty, d.groups.span);
@@ -1226,6 +1240,7 @@ impl<'a> Builder<'a> {
             kernel: d.kernel,
             kernel_args: d.kernel_args.clone(),
             groups,
+            over: d.over,
             args,
             indirect,
         })))

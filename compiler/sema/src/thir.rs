@@ -207,6 +207,10 @@ pub struct Dispatch {
     /// `indirect`, a `GpuBuffer<u32>` or `GpuSpan<u32>` whose first three elements hold it.
     pub groups: Box<Expr>,
     pub indirect: bool,
+    /// `groups` is the domain (`over:`): a `u32`, a `(u32, u32)` or `(u32, u32, u32)`, or a
+    /// texture, whose size it is. The workgroup counts cover it, and invocations past it do
+    /// nothing (§12).
+    pub over: bool,
     /// One per kernel parameter that isn't a builtin, as (parameter index, argument), in the
     /// order written.
     pub args: Vec<(usize, Expr)>,

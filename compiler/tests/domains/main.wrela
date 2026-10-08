@@ -1,0 +1,106 @@
+// Dispatch over a domain (language.md §12): kernels with no bounds check of their own write
+// exactly what they cover, the compiler sizing their groups and returning the invocations past
+// it. The screen shows a band a dispatch, green where it holds what it should and red where it
+// doesn't: renderer.rs checks them.
+
+use std::gpu::{
+    Atomics, ClipPosition, FragCoord, GlobalId, GpuBuffer, R32Uint, Texels, Texture, VertexIndex,
+    begin_screen_pass, buffer, dispatch, draw, present, writable_texture,
+}
+
+/// Elements of the count buffer, past the 100 the first dispatch covers.
+const COUNTS: u32 = 192
+
+struct State {
+    counts: GpuBuffer<u32>,
+    image: Texture<R32Uint>,
+    exact: Texture<R32Uint>,
+    seen: GpuBuffer<u32>,
+}
+
+/// Over 100 of `COUNTS`: each element it covers counted once.
+@compute(64)
+fn mark(out: mut Atomics<u32>, id: GlobalId) {
+    let _ = out.add(i: id.x, value: 1)
+}
+
+/// Over (13, 7) of a 16 × 16 texture: each texel it covers written its own number.
+@compute(8, 8)
+fn number(out: mut Texels<R32Uint>, id: GlobalId) {
+    out.store(id, id.x + id.y * 100 + 1)
+}
+
+/// Over its texture, 12 × 5: each texel written, and each invocation counted.
+@compute(8, 8)
+fn every(out: mut Texels<R32Uint>, seen: mut Atomics<u32>, id: GlobalId) {
+    out.store(id, 7)
+    let _ = seen.add(i: 0, value: 1)
+}
+
+@vertex
+fn cover(v: VertexIndex) -> ClipPosition {
+    let x = f32((v.index << 1) & 2) * 2.0 - 1.0
+    let y = f32(v.index & 2) * 2.0 - 1.0
+    ClipPosition { position: vec4(x, y, 0.5, 1.0) }
+}
+
+fn mark_ok(ok: bool) -> vec4 {
+    if ok { vec4(0.0, 1.0, 0.0, 1.0) } else { vec4(1.0, 0.0, 0.0, 1.0) }
+}
+
+/// Band 0 checks the counts, band 1 the numbered texture, band 2 the texture covered whole.
+@fragment
+fn check(
+    p: FragCoord,
+    counts: [u32],
+    image: Texture<R32Uint>,
+    exact: Texture<R32Uint>,
+    seen: [u32],
+    size: vec2,
+) -> vec4 {
+    let band = u32(p.position.y / size.y * 3.0)
+    let f = p.position.x / size.x
+    if band == 0 {
+        let i = min(u32(f * f32(COUNTS)), COUNTS - 1)
+        mark_ok(counts[i] == select(if_false: 0, if_true: 1, cond: i < 100))
+    } else if band == 1 {
+        let x = min(u32(f * 16.0), 15)
+        let y = u32(p.position.y / size.y * 48.0) % 16
+        let want = select(if_false: 0, if_true: x + y * 100 + 1, cond: x < 13 && y < 7)
+        mark_ok(image.load(x, y) == want)
+    } else {
+        let x = min(u32(f * 12.0), 11)
+        let y = u32(p.position.y / size.y * 15.0) % 5
+        mark_ok(exact.load(x, y) == 7 && seen[0] == 60)
+    }
+}
+
+pub fn init() -> State {
+    State {
+        counts: buffer(COUNTS),
+        image: writable_texture(width: 16, height: 16),
+        exact: writable_texture(width: 12, height: 5),
+        seen: buffer(1),
+    }
+}
+
+pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
+    if time == 0.0 {
+        dispatch(mark.bind(mut s.counts), over: 100)
+        dispatch(number.bind(mut s.image), over: (13, 7))
+        dispatch(every.bind(mut s.exact, mut s.seen), over: s.exact)
+    }
+    begin_screen_pass(clear: vec4(0.0))
+    draw(
+        cover,
+        check.bind(
+            s.counts.span(start: 0, count: COUNTS),
+            s.image,
+            s.exact,
+            s.seen.span(start: 0, count: 1),
+            vec2(f32(width), f32(height)),
+        ),
+        vertices: 3,
+    )
+    present()
+}

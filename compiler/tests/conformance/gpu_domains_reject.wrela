@@ -1,0 +1,25 @@
+// rejects: gpu.domains
+// A dispatch takes `over:` or `groups:`, not both; `over:` is a count, a size or a texture; and
+// a kernel that shares workgroup memory isn't dispatched over a domain, since its invocations
+// past it must still reach its barriers.
+use std::gpu::{GlobalId, GpuBuffer, LocalId, Shared, Slots, barrier, buffer, dispatch}
+
+@compute(64)
+fn line(out: mut Slots<f32>, id: GlobalId) {
+    out[id] = 1.0
+}
+
+@compute(64)
+fn total(out: mut Slots<f32>, part: mut Shared<f32, 64>, lid: LocalId, id: GlobalId) {
+    let c = part.chunk(lid)
+    part.write(c, 0, 1.0)
+    barrier(mut part)
+    out[id] = part.get(0)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    var out: GpuBuffer<f32> = buffer(64)
+    dispatch(line.bind(mut out), over: 64, groups: 1) //~ E0304
+    dispatch(line.bind(mut out), over: 1.5) //~ E0300
+    dispatch(total.bind(mut out), over: 64) //~ E0603
+}

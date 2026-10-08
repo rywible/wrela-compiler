@@ -518,7 +518,7 @@ fn summarize(
         .iter()
         .map(|out| {
             let (kind, parts) = match &out.key {
-                wrela_lower::PipelineKey::Compute { kernel, substs } => {
+                wrela_lower::PipelineKey::Compute { kernel, substs, .. } => {
                     ("compute", vec![entry(*kernel, substs)])
                 }
                 wrela_lower::PipelineKey::Render { vertex, fragment, .. } => {

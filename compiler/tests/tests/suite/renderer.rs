@@ -169,15 +169,15 @@ fn the_browser_writes_texels_as_the_native_host_does() {
 fn each_format_holds_what_was_written() {
     let (dir, _) = page("compiler/tests/formats", "formats-native");
     let run = native(&dir);
-    every_band_green(&run.frame);
+    bands_green(&run.frame, 6);
 }
 
-/// Each of the formats test's six bands green, at every pixel.
-fn every_band_green(frame: &[u8]) {
-    for band in 0..6u32 {
+/// Each of a test's `n` bands, top to bottom, green at every pixel.
+fn bands_green(frame: &[u8], n: u32) {
+    for band in 0..n {
         let red = (0..SIZE)
             .flat_map(|x| (0..SIZE).map(move |y| (x, y)))
-            .filter(|&(_, y)| y * 6 / SIZE == band)
+            .filter(|&(_, y)| y * n / SIZE == band)
             .filter(|&(x, y)| pixel(frame, x, y) != [0, 255, 0, 255])
             .count();
         assert_eq!(red, 0, "band {band}: {red} pixels don't hold what was written");
@@ -191,7 +191,28 @@ fn the_browser_holds_each_format_as_the_native_host_does() {
     let browser = run_in_chrome(&rel, 2, SIZE, SIZE, 60.0);
     let run = native(&dir);
     assert_eq!(browser.hash, run.hash_hex(), "the hosts' state hashes differ");
-    every_band_green(&browser.frame);
+    bands_green(&browser.frame, 6);
+}
+
+/// Dispatch over a domain (§12, compiler/tests/domains): kernels with no bounds check of their
+/// own, over 100, over (13, 7) and over a texture, each write exactly what they cover: the
+/// screen's three bands are each a dispatch's results checked, green throughout.
+#[test]
+#[ignore = "needs a GPU"]
+fn a_dispatch_over_a_domain_covers_it_exactly() {
+    let (dir, _) = page("compiler/tests/domains", "domains-native");
+    let run = native(&dir);
+    bands_green(&run.frame, 3);
+}
+
+#[test]
+#[ignore = "long: needs Chrome, python3 and a GPU"]
+fn the_browser_covers_a_domain_as_the_native_host_does() {
+    let (dir, rel) = page("compiler/tests/domains", "domains-browser");
+    let browser = run_in_chrome(&rel, 2, SIZE, SIZE, 60.0);
+    let run = native(&dir);
+    assert_eq!(browser.hash, run.hash_hex(), "the hosts' state hashes differ");
+    bands_green(&browser.frame, 3);
 }
 
 /// Chrome's test mode times each pass on the GPU, as the native host does: the same passes, in

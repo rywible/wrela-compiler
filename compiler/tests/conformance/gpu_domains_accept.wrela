@@ -1,0 +1,45 @@
+// accepts: gpu.domains gpu.dispatch
+// A kernel is dispatched over a count, a size of two or three, or a texture (its size): the
+// compiler sizes its groups from its workgroup and returns the invocations past the domain, so
+// the kernel checks no bounds. A texture it covers can be one it writes.
+use std::gpu::{
+    GlobalId, GpuBuffer, Rgba16Float, Slots, Texels, Texels3d, Texture, Texture3d, buffer,
+    dispatch, texture3d, writable_texture,
+}
+
+struct State {
+    out: GpuBuffer<f32>,
+    image: Texture<Rgba16Float>,
+    volume: Texture3d<Rgba16Float>,
+}
+
+@compute(64)
+fn line(out: mut Slots<f32>, id: GlobalId) {
+    out[id] = f32(id.x)
+}
+
+@compute(8, 8)
+fn plane(out: mut Texels<Rgba16Float>, id: GlobalId) {
+    out.store(id, vec4(1.0))
+}
+
+@compute(4, 4, 4)
+fn space(out: mut Texels3d<Rgba16Float>, id: GlobalId) {
+    out.store(id, vec4(f32(id.z)))
+}
+
+pub fn init() -> State {
+    State {
+        out: buffer(100),
+        image: writable_texture(width: 13, height: 7),
+        volume: texture3d(width: 5, height: 6, depth: 7),
+    }
+}
+
+pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
+    dispatch(line.bind(mut s.out), over: 100)
+    dispatch(plane.bind(mut s.image), over: (13, 7))
+    dispatch(plane.bind(mut s.image), over: s.image)
+    dispatch(space.bind(mut s.volume), over: (5, 6, 7))
+    dispatch(space.bind(mut s.volume), over: s.volume)
+}
