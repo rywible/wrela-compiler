@@ -126,6 +126,11 @@ fn floats(v: &[Value]) -> Vec<f64> {
 
 impl Clearing {
     fn load(name: &str) -> Clearing {
+        Clearing::load_with(name, &Options::default())
+    }
+
+    /// [`Clearing::load`], keeping each frame's command batch for [`Clearing::batches`].
+    fn load_recording(name: &str) -> Clearing {
         Clearing::load_with(name, &Options { record: true, ..Options::default() })
     }
 
@@ -1186,7 +1191,7 @@ fn draws_after(batch: &[u8], name: &str) -> usize {
 #[test]
 #[ignore = "needs a GPU"]
 fn static_shadows_are_drawn_once_and_again_when_the_sun_moves() {
-    let mut c = Clearing::load("clearing-static");
+    let mut c = Clearing::load_recording("clearing-static");
     let mut drawn = Vec::new();
     for _ in 0..30 {
         c.step();
