@@ -26,7 +26,8 @@ struct Spike {
 impl Spike {
     fn new() -> Spike {
         let mut config = wasmtime::Config::new();
-        config.wasm_threads(true).shared_memory(true);
+        // As the native host's engine, so the two are timed alike.
+        config.wasm_threads(true).shared_memory(true).native_unwind_info(false);
         let engine = wasmtime::Engine::new(&config).expect("an engine");
         let module =
             wasmtime::Module::from_file(&engine, fixture_path("cpu.wasm")).expect("cpu.wasm");
@@ -202,7 +203,7 @@ fn the_physique_gives_each_bone_its_mass_and_moments() {
 /// AC6's timings on the CPU (WASM), in one harness, alternating: the physique at 2 cm (≤ 1.25×
 /// the spike's), the grazer's field per evaluation whole and pruned, and a raycast (each ≤ 1.25×).
 #[test]
-#[ignore = "long: alone: a timing run: cargo test -p wrela-tests --test suite herd:: -- --ignored --nocapture"]
+#[ignore = "measure: a timing run: cargo test -p wrela-tests --test suite herd:: -- --ignored --nocapture"]
 fn the_cpu_side_costs_what_the_spikes_did() {
     let mut spike = Spike::new();
     let mut host = ours();
@@ -514,7 +515,7 @@ fn realize_herd(host: &mut wrela_host::Host, cell: f32) -> (Vec<Ours>, Vec<f64>)
 /// against the spike's extraction, run beside it in one process, alternating (the spike's
 /// harness runs its batch three times and keeps the last).
 #[test]
-#[ignore = "long: alone: needs a GPU and bun"]
+#[ignore = "measure: needs a GPU and bun"]
 fn realization_matches_the_spikes() {
     let dir = built("herd-realize");
     let options = wrela_host::Options { timestamps: true, ..wrela_host::Options::default() };
@@ -611,7 +612,7 @@ fn grazer_points(
 /// its bounds: distances and gradients (every part in, unfiltered), and GPU time per evaluation
 /// in one harness, alternating.
 #[test]
-#[ignore = "long: alone: needs a GPU"]
+#[ignore = "measure: needs a GPU"]
 fn the_herds_grazer_field_costs_what_field_wgsl_does() {
     use wrela_tests::spike01::compiled_kernel;
     use wrela_tests::{Bind, RawGpu, f32s};
@@ -785,7 +786,7 @@ fn frame_ms(timings: &[wrela_host::GpuTiming], from: usize, passes: bool) -> Vec
 /// and the whole frame, its passes' times summed (ours poses on the GPU; the spike posed on the
 /// CPU). Each ≤ 1.25×.
 #[test]
-#[ignore = "long: alone: needs a GPU and bun"]
+#[ignore = "measure: needs a GPU and bun"]
 fn drawing_the_herd_costs_what_the_spikes_did() {
     use wrela_tests::spike01::{H, SceneKind, W};
     let mut spike = wrela_tests::spike01::Spike::new();
@@ -888,7 +889,7 @@ fn paced_herd(name: &str, script: &str) -> (PathBuf, wrela_tests::BrowserRun, Ve
 /// all 40 grazers, the bytes downloaded before it, and the memory: the program's GPU buffers and
 /// textures at most, and its WASM memory used and reserved.
 #[test]
-#[ignore = "long: alone: needs Chrome, python3 and a GPU"]
+#[ignore = "measure: needs Chrome, python3 and a GPU"]
 fn the_herd_keeps_its_frames_in_chrome() {
     let (dir, chrome, ms) = paced_herd("herd-paced", "[]");
     let missed = ms.iter().filter(|&&m| m > 16.7).count();
@@ -948,7 +949,7 @@ fn the_herd_keeps_its_frames_in_chrome() {
 /// the herd's grazers are drawn and refined for the herd's view. (The others, off screen in the
 /// close-up, were realized at their coarsest level meanwhile, one a frame: `Realizer::spend`.)
 #[test]
-#[ignore = "long: alone: needs Chrome, python3 and a GPU"]
+#[ignore = "measure: needs Chrome, python3 and a GPU"]
 fn moving_to_the_herd_keeps_the_frames_in_chrome() {
     let script =
         r#"[{"frame":0,"type":"key","key":"KeyC"},{"frame":300,"type":"key","key":"KeyH"}]"#;
@@ -1070,7 +1071,7 @@ fn shared_corners_have_one_value() {
 /// creatures' GPU time (shadow and shading, the terrain left out) is ≤ 1.25× the spike's herd
 /// at 3 cm, run by the harness, alternating.
 #[test]
-#[ignore = "long: alone: needs a GPU and bun"]
+#[ignore = "measure: needs a GPU and bun"]
 fn lod_looks_like_the_finest_and_costs_like_the_coarsest() {
     use wrela_tests::spike01::{H, SceneKind, W, image_difference};
     let frames = 241;
@@ -1207,7 +1208,7 @@ fn a_ten_minute_tour_leaks_no_mesh_memory() {
 /// all at once, in Chrome takes ≤ 1.5× creating spike 01's 12 cold, all at once, as its main.js
 /// did (compiler/tests/spike01/pipelines), alternating, three of each.
 #[test]
-#[ignore = "long: alone: needs Chrome, python3 and a GPU"]
+#[ignore = "measure: needs Chrome, python3 and a GPU"]
 fn the_herds_pipelines_load_cold_as_fast() {
     let (dir, rel) = wrela_tests::page("examples/herd", "herd-cold");
     let spike = "compiler/tests/spike01/pipelines";
@@ -1249,11 +1250,16 @@ fn the_herds_pipelines_load_cold_as_fast() {
 /// its jobs (the grazers' physiques) slowed tenfold, which makes the sim wait (AC6); the native
 /// host with the GPU, ticking in lockstep with its frames; the native host built for x86-64, under
 /// Rosetta, replaying the log; and Chrome on the lockstep schedule at 30, 60 and 144 frames a
-/// second, and at 60 with each frame held 20 ms longer.
+/// second, and at 60 with each frame held 20 ms longer. The variations (the slowed jobs; Chrome
+/// at 30 and 144, and with its frames held) run the first 1,000 ticks, past the jobs the herd
+/// starts with; all 10,000 at full size. Chrome's frames run back to back, not at their times:
+/// in lockstep, a frame's ticks follow its number, not the clock, so the schedule is a paced
+/// run's.
 #[test]
 #[ignore = "long: needs Chrome, python3, a GPU and Rosetta"]
 fn the_herds_ticks_hash_the_same_everywhere() {
     const TICKS: u32 = 10_000;
+    let part = wrela_tests::sized(1_000, TICKS);
     let (dir, rel) = wrela_tests::page("examples/herd", "herd-hashes");
     let hashes =
         |log: &wrela_host::TickLog| -> Vec<u64> { log.ticks.iter().map(|t| t.hash).collect() };
@@ -1272,11 +1278,11 @@ fn the_herds_ticks_hash_the_same_everywhere() {
     slow.want_hashes(true);
     slow.init().expect("init");
     let slowed: Vec<u64> =
-        (0..TICKS).map(|_| slow.tick().expect("a tick").hash.expect("a hash")).collect();
+        (0..part).map(|_| slow.tick().expect("a tick").hash.expect("a hash")).collect();
     let waits = slow.take_logs().into_iter().filter(|l| l.contains("waited for a job")).count();
-    assert_eq!(slowed, reference, "jobs slowed tenfold");
+    assert_eq!(slowed, reference[..part as usize], "jobs slowed tenfold");
     assert!(waits > 0, "the slowed run never waited for a job");
-    eprintln!("jobs slowed tenfold agree over {TICKS} ticks; the sim waited at {waits} ticks");
+    eprintln!("jobs slowed tenfold agree over {part} ticks; the sim waited at {waits} ticks");
     // With the GPU, in lockstep with 60 frames a second. The host holds the GPU lock until it's
     // dropped, which it must be before Chrome waits for the lock.
     let gpu = {
@@ -1298,10 +1304,12 @@ fn the_herds_ticks_hash_the_same_everywhere() {
     assert!(text.contains(&format!("{TICKS} ticks replayed")), "{text}");
     eprintln!("x86-64 under Rosetta replays {TICKS} ticks");
     for (fps, delay) in [(60.0, 0), (30.0, 0), (144.0, 0), (60.0, 20)] {
-        let frames = (f64::from(TICKS) * fps / 60.0).ceil() as u32 + 1;
+        let n = if fps == 60.0 && delay == 0 { TICKS } else { part };
+        let frames = (f64::from(n) * fps / 60.0).ceil() as u32 + 1;
         let run = wrela_tests::ChromeRun {
             workers: 8,
             framedelay: delay,
+            saturate: true,
             ..wrela_tests::ChromeRun::new(frames, 64, 64, fps)
         };
         let chrome = wrela_tests::run_in_chrome_with(&rel, run);
@@ -1310,9 +1318,9 @@ fn the_herds_ticks_hash_the_same_everywhere() {
             "Chrome at {fps} fps{}",
             if delay > 0 { ", each frame 20 ms longer" } else { "" }
         );
-        assert!(ticks.len() >= TICKS as usize, "{what}: {} ticks", ticks.len());
-        assert_eq!(ticks[..TICKS as usize], reference[..], "{what}");
-        eprintln!("{what} agrees over {TICKS} ticks");
+        assert!(ticks.len() >= n as usize, "{what}: {} ticks", ticks.len());
+        assert_eq!(ticks[..n as usize], reference[..n as usize], "{what}");
+        eprintln!("{what} agrees over {n} ticks");
     }
 }
 
@@ -1348,7 +1356,7 @@ fn spin_ns() -> f64 {
 /// the lock taken and the tries it spun; a try's cost is [`spin_ns`]'s). A steady tick reuses
 /// its buffers (#43 §5.2), so it allocates nothing: that's asserted.
 #[test]
-#[ignore = "long: a measurement: needs a GPU"]
+#[ignore = "measure: the ticks' lock waits and times, beside 1,500 frames at 1080p; needs a GPU"]
 fn the_herds_ticks_beside_frames_allocate_and_wait() {
     let dir = herd();
     let options = wrela_host::Options { defer_init: true, ..wrela_host::Options::default() };
@@ -1542,7 +1550,7 @@ fn the_engine_and_the_herd_keep_their_layers() {
 /// median and 99th percentile within 1 ms of a run with normal ticks. (Each frame reads the
 /// latest complete snapshot: threads::a_hand_off_is_never_read_torn.)
 #[test]
-#[ignore = "long: alone: needs Chrome, python3 and a GPU"]
+#[ignore = "measure: needs Chrome, python3 and a GPU"]
 fn frames_dont_wait_for_slow_ticks() {
     let (_, rel) = wrela_tests::page("examples/herd", "herd-slow-ticks");
     let intervals = |tickdelay: u32| {

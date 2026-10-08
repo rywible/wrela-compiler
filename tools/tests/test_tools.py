@@ -3,6 +3,7 @@
     python3 -m unittest discover -s tools/tests
 """
 
+import fcntl
 import json
 import os
 import shutil
@@ -58,8 +59,10 @@ class HeadlessTest(PageDir, unittest.TestCase):
         super().tearDown()
 
     def start(self, mode, timeout="20", **env):
+        # Alone unless a test shares the GPU (WRELA_GPU_SHARED), whatever the shell says.
+        inherited = {k: v for k, v in os.environ.items() if k != "WRELA_GPU_SHARED"}
         env = {
-            **os.environ,
+            **inherited,
             "TMPDIR": self.tmp,
             "WRELA_CHROME": os.path.join(TESTS, "fake_chrome.py"),
             "FAKE_MODE": mode,
@@ -157,6 +160,31 @@ class HeadlessTest(PageDir, unittest.TestCase):
         for (_, end), (start, _) in zip(intervals, intervals[1:]):
             self.assertLessEqual(end, start, "two runs held the GPU at once")
 
+    def test_shared_runs_go_beside_a_native_sharer_and_one_at_a_time(self):
+        # A native run that shares the GPU holds its lock shared: runs that share it start beside
+        # it, one Chrome at a time, and a run alone waits for it.
+        spans = os.path.join(self.tmp, "spans")
+        native = os.open(headless.lock_path({"TMPDIR": self.tmp}), os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(native, fcntl.LOCK_SH)
+        try:
+            shared = {"FAKE_HOLD": "0.3", "FAKE_SPANS": spans, "WRELA_GPU_SHARED": "4"}
+            procs = [self.start("ok", **shared) for _ in range(3)]
+            for proc in procs:
+                _, err = proc.communicate(timeout=60)
+                self.assertEqual(proc.returncode, 0, err)
+            alone = self.start("ok")
+            time.sleep(0.5)
+            self.assertIsNone(alone.poll(), "a run alone took the GPU beside a native sharer")
+        finally:
+            os.close(native)
+        _, err = alone.communicate(timeout=30)
+        self.assertEqual(alone.returncode, 0, err)
+        with open(spans) as f:
+            intervals = sorted(tuple(map(float, line.split())) for line in f)
+        self.assertEqual(len(intervals), 3)
+        for (_, end), (start, _) in zip(intervals, intervals[1:]):
+            self.assertLessEqual(end, start, "two Chromes ran at once")
+
     def test_an_orphaned_chrome_keeps_the_gpu_until_it_dies(self):
         proc = self.start("hang")
         chrome, _ = self.chrome_pids()
@@ -195,6 +223,7 @@ class LockPathTest(unittest.TestCase):
         self.assertEqual(headless.lock_path({"TMPDIR": "/t/x"}), "/t/x/wrela-gpu.lock")
         self.assertEqual(headless.lock_path({"TMPDIR": ""}), os.path.join(home, ".wrela-gpu.lock"))
         self.assertEqual(headless.lock_path({}), os.path.join(home, ".wrela-gpu.lock"))
+        self.assertEqual(headless.lock_path({"TMPDIR": "/t/x"}, "chrome"), "/t/x/wrela-chrome.lock")
 
 
 class ConsoleTest(unittest.TestCase):

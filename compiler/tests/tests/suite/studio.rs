@@ -837,7 +837,7 @@ const LONGER_NECK: [(&str, &str); 2] = [
 /// most (on a separate CPU build: the head's scale and pitch have no millimetres of their own),
 /// and the fit takes 10 s at most.
 #[test]
-#[ignore = "long: alone: needs a GPU"]
+#[ignore = "measure: needs a GPU"]
 fn fits_recover_the_wolfs_longer_neck_and_bigger_ears() {
     const RES: u32 = 512;
     let target = Subject::shared("wolf", "longer-neck", &LONGER_NECK);
@@ -1205,7 +1205,7 @@ fn agree(a: &serde_json::Value, b: &serde_json::Value) -> bool {
 /// files written, and last frames within a mean of 0.5/255. Chrome's times are reported: a
 /// click's frame (AC5: ≤ 50 ms), a drag's updates (AC9: ≤ 33 ms with a 512² view).
 #[test]
-#[ignore = "long: alone: needs Chrome, python3 and a GPU"]
+#[ignore = "measure: needs Chrome, python3 and a GPU"]
 fn a_session_gives_the_same_results_headless_and_in_chrome() {
     const SIZE2: (u32, u32) = (512, 512);
     const RES: u32 = 256;
@@ -1330,7 +1330,7 @@ fn a_session_gives_the_same_results_headless_and_in_chrome() {
 /// of 0.5/255; and a headless view takes ≤ 1 s after a build (loading the lens, its first
 /// frame, and reading the screen, natively). Times are medians of 20.
 #[test]
-#[ignore = "long: alone: needs Chrome, python3 and a GPU"]
+#[ignore = "measure: needs Chrome, python3 and a GPU"]
 fn the_lens_is_fast_enough_and_the_same_in_both_hosts() {
     let subject = Subject::new("wolf", "speed");
     // The sheet's screen: 1024² of views beside the panel (400 wide).
@@ -1705,7 +1705,7 @@ fn the_grazers_description_agrees_with_its_diagnosis() {
 /// what's new (every 250 ms) and types `set` into the lens, and the lens draws its views again.
 /// Timed from the file's write to the start of the frame that set the literal.
 #[test]
-#[ignore = "long: alone: needs Chrome, python3 and a GPU"]
+#[ignore = "measure: needs Chrome, python3 and a GPU"]
 fn an_edit_by_another_tool_shows_in_the_open_lens_within_2_s() {
     let subject = Subject::for_chrome("wolf", "external-edit");
     let file = subject.files.iter().find(|(p, _)| p.ends_with("creature.wrela")).unwrap().0.clone();

@@ -11,9 +11,9 @@
 //!
 //! `WRELA_FUZZ_ITERS` sets the cases (default 100, or 1000 with `WRELA_FULL`),
 //! `WRELA_FUZZ_SEED` the run's seed (default 1), and `WRELA_FUZZ_JOBS` how many workers run at
-//! once (default one per core). `tools/check.sh --long` runs 10^6 cases. The seeds include
-//! every tier 1 and 2 program in the repository (the run-pass suite, the sketches, the
-//! conformance suite), so most cases use tiers 1 and 2.
+//! once (default one per core). `tools/check.sh --long` runs 20,000 cases from a new seed each
+//! run, and `--full` 10^6. The seeds include every tier 1 and 2 program in the repository (the
+//! run-pass suite, the sketches, the conformance suite), so most cases use tiers 1 and 2.
 
 use crate::scratch;
 use std::io::{BufRead, BufReader, Write};

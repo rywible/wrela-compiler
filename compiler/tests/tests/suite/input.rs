@@ -64,7 +64,7 @@ fn both_hosts_read_the_same_events() {
 /// through the DOM at random times, while frames run at 60 a second, each arrive in the first
 /// frame that starts after them.
 #[test]
-#[ignore = "long: alone: needs Chrome, python3 and a GPU"]
+#[ignore = "measure: needs Chrome, python3 and a GPU"]
 fn events_reach_the_program_by_the_next_frame() {
     let (dir, rel) = wrela_tests::page("compiler/tests/input", "input-latency");
     let run =

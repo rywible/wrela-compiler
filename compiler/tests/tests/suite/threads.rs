@@ -179,9 +179,12 @@ fn the_ticker_in_chrome_agrees_with_the_native_host() {
     for (fps, workers, paced) in
         [(60.0, 4, false), (30.0, 1, false), (144.0, 4, false), (60.0, 4, true)]
     {
+        // In lockstep, the frames run back to back (a frame's ticks follow its number, not the
+        // clock); paced, the ticker keeps its own clock, so they run at their times.
         let run = wrela_tests::ChromeRun {
             workers,
             paced,
+            saturate: !paced,
             script: Some(text.clone()),
             ..wrela_tests::ChromeRun::new(frames, 16, 16, fps)
         };

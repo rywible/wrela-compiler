@@ -218,7 +218,7 @@ fn press(key: &str) -> String {
 /// frame's passes could start before the last frame's were run, which kept the GPU busy, and
 /// could run a frame's commands out of order: no longer.) Chrome's are printed.
 #[test]
-#[ignore = "long: alone: needs Chrome, python3 and a GPU"]
+#[ignore = "measure: needs Chrome, python3 and a GPU"]
 fn each_pass_times_as_it_does_alone_in_both_hosts() {
     use std::collections::BTreeMap;
     let (dir, rel) = page("compiler/tests/timing", "timing");

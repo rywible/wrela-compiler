@@ -49,8 +49,11 @@ fn a_keyed_run_replays_and_a_changed_record_fails_at_its_tick() {
 fn a_run_recorded_in_chrome_replays_on_arm64_and_x86_64() {
     let (dir, rel) = wrela_tests::page("compiler/tests/sketches/03-keys", "keys-chrome");
     // Lockstep at 60 frames a second: frame i follows i + 1 ticks, so 2,000 frames run 2,000.
+    // The frames run back to back: in lockstep, the ticks and the script's events follow the
+    // frames' numbers, not the clock.
     let run = wrela_tests::ChromeRun {
         workers: 4,
+        saturate: true,
         script: Some(script(TICKS)),
         ..wrela_tests::ChromeRun::new(TICKS, 64, 64, 60.0)
     };
@@ -85,7 +88,7 @@ fn a_run_recorded_in_chrome_replays_on_arm64_and_x86_64() {
 /// the first frame that draws its effect, in Chrome at 60 frames a second, paced. Each press
 /// is matched with the first frame after it that printed `moved`.
 #[test]
-#[ignore = "long: needs Chrome, python3 and a GPU"]
+#[ignore = "measure: the input latency through the sim, paced in real time; needs Chrome, python3 and a GPU"]
 fn key_presses_reach_the_screen_through_the_sim() {
     let (dir, rel) = wrela_tests::page("compiler/tests/sketches/03-keys", "keys-latency");
     let presses = 40;

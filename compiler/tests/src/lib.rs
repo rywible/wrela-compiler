@@ -3,13 +3,14 @@
 //! the same GPU for comparison.
 //!
 //! The GPU tests are `#[ignore]`d: they need a GPU and take the GPU lock (`wrela_host::lock`).
-//! `tools/check.sh` runs them, but those whose reason starts `long:` (Chrome, timing and soak
-//! runs), which `tools/check.sh --long` runs: those whose reason goes on `alone:` (the time
-//! budgets) one at a time.
+//! `tools/check.sh` runs them (four at a time share the GPU), but not those whose reason starts
+//! `long:` (headless Chrome, the clearing's camera path, soak runs), which `tools/check.sh
+//! --long` runs, nor `measure:` (time budgets and comparisons), which `tools/check.sh --full`
+//! runs one at a time, the GPU theirs alone.
 //!
-//! Sampled tests have two sizes: small by default, so `cargo test` stays fast, and the size the
-//! acceptance criteria name when `WRELA_FULL` is set ([`sized`]), as `tools/check.sh --long`
-//! does.
+//! Sampled tests have two sizes: small by default, so `cargo test` and the long checks stay
+//! fast, and the size the acceptance criteria name when `WRELA_FULL` is set ([`sized`]), as
+//! `tools/check.sh --full` does.
 
 pub mod spike01;
 

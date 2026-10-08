@@ -119,11 +119,11 @@ fn the_browser_matches_the_golden_and_the_native_host() {
 const LOAD_BUDGET_SECONDS: f64 = 1.0;
 
 #[test]
-#[ignore = "long: alone: needs a GPU"]
+#[ignore = "measure: needs a GPU"]
 fn loading_creates_the_pipelines_within_budget() {
     let (dir, _) = page("load");
     // Held across the loads (each takes it again), so the time doesn't count a wait for it.
-    let _gpu = wrela_host::lock::GpuLock::acquire("wrela-tests: load budget").expect("lock");
+    let _gpu = wrela_host::lock::GpuLock::alone("wrela-tests: load budget").expect("lock");
     let mut slowest = 0.0f64;
     for _ in 0..3 {
         let started = std::time::Instant::now();
@@ -133,8 +133,8 @@ fn loading_creates_the_pipelines_within_budget() {
     }
     eprintln!("hello-field loads in at most {slowest:.3} s (budget {LOAD_BUDGET_SECONDS} s)");
     // A debug build's wgpu validates as it goes (its first device takes seconds to open), and
-    // its wasmtime compiles slowly: the budget is the release host's (`tools/check.sh --long`
-    // runs the GPU tests in release).
+    // its wasmtime compiles slowly: the budget is the release host's (`tools/check.sh --full`
+    // runs the measurements in release).
     if !cfg!(debug_assertions) {
         assert!(slowest <= LOAD_BUDGET_SECONDS, "loading took {slowest:.3} s");
     }

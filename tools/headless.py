@@ -18,9 +18,10 @@ Each run serves the repo on its own free port (tools/serve.py's handler, cross-o
 so concurrent runs don't need a server and can't collide on one.
 
 Exit status: 0 the page wrote `ok`; 1 it failed, timed out, or Chrome exited; 2 a setup error;
-3 the GPU lock wasn't free within an hour.
+3 the GPU lock (or the Chrome lock) wasn't free within an hour.
 
-Environment: WRELA_CHROME overrides the Chrome binary.
+Environment: WRELA_CHROME overrides the Chrome binary; WRELA_GPU_SHARED (2 or more) shares the
+GPU with native runs (below).
 """
 
 import fcntl
@@ -40,23 +41,37 @@ CHROME = os.environ.get(
 )
 LOCK_WAIT_LIMIT = 3600  # seconds
 
-# One GPU user at a time. On 2026-10-01, ~12 concurrent headless runs starved WindowServer of GPU
-# time for over 5 s; macOS's watchdog killed it and the whole desktop reset. Runs queue on an
+# One headless Chrome at a time. On 2026-10-01, ~12 concurrent headless runs starved WindowServer
+# of GPU time for over 5 s; macOS's watchdog killed it and the whole desktop reset. Runs queue on an
 # flock(2), which the kernel releases when its holder dies, so a crashed run never leaves a stale
 # lock. Chrome inherits the descriptor: if this script is SIGKILLed, the lock stays held until
 # Chrome is gone too. The lock lives in $TMPDIR (a per-user directory on macOS) when that's set,
 # else in the home directory; never in world-writable /tmp. The native host
 # (runtime/native/src/lock.rs) picks it by the same rule.
+#
+# Runs that check what's drawn, not how long it takes, share the GPU (`WRELA_GPU_SHARED` of 2 or
+# more, as tools/check.sh sets for its tests): a run takes the GPU lock shared, beside native
+# runs that share it too, and a Chrome lock beside it alone, so headless Chromes still run one at
+# a time. A run that times the GPU (no variable) still takes the GPU lock alone.
 
 
-def lock_path(env=os.environ):
+def lock_path(env=os.environ, name="gpu"):
     tmpdir = env.get("TMPDIR")
     if tmpdir:
-        return os.path.join(tmpdir, "wrela-gpu.lock")
-    return os.path.join(os.path.expanduser("~"), ".wrela-gpu.lock")
+        return os.path.join(tmpdir, f"wrela-{name}.lock")
+    return os.path.join(os.path.expanduser("~"), f".wrela-{name}.lock")
 
 
 LOCK_PATH = lock_path()
+CHROME_LOCK_PATH = lock_path(name="chrome")
+
+
+def sharing(env=os.environ):
+    """Whether this run shares the GPU: `WRELA_GPU_SHARED` is 2 or more."""
+    try:
+        return int(env.get("WRELA_GPU_SHARED", "1").strip()) >= 2
+    except ValueError:
+        return False
 
 
 def fail(status, message):
@@ -64,31 +79,40 @@ def fail(status, message):
     sys.exit(status)
 
 
-def acquire_gpu_lock(page):
+def take_lock(path, what, page, shared):
+    """The lock file at `path`, flocked shared or alone, waiting (up to an hour) for its holders."""
     try:
-        fd = os.open(LOCK_PATH, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
     except OSError as e:
-        fail(2, f"can't open the GPU lock {LOCK_PATH}: {e}")
+        fail(2, f"can't open {what} {path}: {e}")
     start = time.monotonic()
     waited = 0.0
     while True:
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fd, (fcntl.LOCK_SH if shared else fcntl.LOCK_EX) | fcntl.LOCK_NB)
             break
         except BlockingIOError:
             if waited == 0:
                 holder = os.pread(fd, 512, 0).decode(errors="replace").strip() or "unknown"
-                print(f"waiting for the GPU lock, held by: {holder}", file=sys.stderr)
+                print(f"waiting for {what}, held by: {holder}", file=sys.stderr)
             if waited >= LOCK_WAIT_LIMIT:
-                fail(3, f"gave up waiting for the GPU lock ({LOCK_PATH}) after an hour")
+                fail(3, f"gave up waiting for {what} ({path}) after an hour")
             # Often: a run that queues starts as soon as the lock is free.
             time.sleep(0.05)
             waited = time.monotonic() - start
     if waited:
-        print(f"got the GPU lock after {waited:.0f}s", file=sys.stderr)
+        print(f"got {what} after {waited:.0f}s", file=sys.stderr)
     os.ftruncate(fd, 0)
     os.pwrite(fd, f"pid {os.getpid()}, {page}\n".encode(), 0)
     return fd
+
+
+def acquire_gpu_lock(page):
+    """The locks this run holds while Chrome runs (Chrome inherits them)."""
+    if sharing():
+        chrome = take_lock(CHROME_LOCK_PATH, "the Chrome lock", page, shared=False)
+        return (chrome, take_lock(LOCK_PATH, "the GPU lock", page, shared=True))
+    return (take_lock(LOCK_PATH, "the GPU lock", page, shared=False),)
 
 
 def start_server(page, done):
@@ -189,7 +213,7 @@ def main(argv):
     for sig in (signal.SIGTERM, signal.SIGHUP):
         signal.signal(sig, interrupt)
 
-    lock = acquire_gpu_lock(page)
+    locks = acquire_gpu_lock(page)
     # What an earlier run left (a stale DONE above all) isn't this run's.
     results = os.path.join(page_dir, "results")
     try:
@@ -231,7 +255,7 @@ def main(argv):
                 stdin=subprocess.DEVNULL,
                 stdout=log,
                 stderr=log,
-                pass_fds=(lock,),
+                pass_fds=locks,
                 start_new_session=True,
             )
         while True:
@@ -257,7 +281,8 @@ def main(argv):
             server.shutdown()
         lines = extract_console(chrome_log, os.path.join(results, "console.log"))
         shutil.rmtree(profile, ignore_errors=True)
-        os.close(lock)
+        for fd in locks:
+            os.close(fd)
 
     print(f"elapsed {time.monotonic() - start:.1f}s; console: {os.path.relpath(results)}/console.log")
     for line in lines[-20:]:

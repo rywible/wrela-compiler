@@ -14,6 +14,7 @@
 //! These need a GPU: `cargo test -p wrela-tests --test suite grazer:: -- --ignored --nocapture`.
 
 use crate::built;
+use wrela_host::lock::GpuLock;
 use wrela_host::{Host, Options, Value};
 use wrela_tests::spike01::{HARNESS_D, compiled_kernel, fixture, harness, params_seed1};
 use wrela_tests::{Bind, RawGpu, bytes_of, f32s, median, one_f32, one_u32, u32s, worse};
@@ -51,6 +52,9 @@ fn angle(a: [f32; 3], b: [f32; 3]) -> f64 {
 #[test]
 #[ignore = "needs a GPU"]
 fn the_compiled_grazer_matches_the_hand_written_one() {
+    // Its GPU times are compared, so the GPU is this test's alone, though the gate shares it
+    // (the host and the device below take it again, on this thread).
+    let _gpu = GpuLock::alone("wrela-tests: the grazer's GPU times").expect("the GPU lock");
     let mut host = load();
 
     // The same numbers: wrela's `params` is grazer.js's `makeGrazer`, bit for bit.

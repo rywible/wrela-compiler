@@ -105,10 +105,12 @@ impl Cam {
     }
 }
 
-/// The clearing, loaded on the native host and driven a frame at a time.
+/// The clearing, loaded on the native host and driven a frame at a time, `fps` frames a second
+/// (60 unless a test walks the path more coarsely).
 struct Clearing {
     host: Host,
     frame: u32,
+    fps: f64,
     script: Vec<Scripted>,
 }
 
@@ -127,10 +129,16 @@ impl Clearing {
         Clearing::load_with(name, &Options { record: true, ..Options::default() })
     }
 
+    /// [`Clearing::load`], run at `fps` frames a second from its first frame (a frame's time and
+    /// its ticks follow its number at that rate).
+    fn load_at(name: &str, fps: f64) -> Clearing {
+        Clearing { fps, ..Clearing::load(name) }
+    }
+
     fn load_with(name: &str, options: &Options) -> Clearing {
         let (dir, _) = built(name);
         let host = Host::load_with(&dir, options).expect("load the clearing");
-        Clearing { host, frame: 0, script: Vec::new() }
+        Clearing { host, frame: 0, fps: 60.0, script: Vec::new() }
     }
 
     /// Space pressed at the next frame: the creature walks and the camera's path starts (once
@@ -142,7 +150,7 @@ impl Clearing {
 
     fn step(&mut self) {
         self.host
-            .lockstep_frame(self.frame, 60.0, W, H, &self.script)
+            .lockstep_frame(self.frame, self.fps, W, H, &self.script)
             .unwrap_or_else(|e| panic!("frame {}: {e}", self.frame));
         self.frame += 1;
     }
@@ -318,24 +326,62 @@ const FIELD_HASHES: [&str; 6] =
 
 /// Every function `f` calls, through any depth (the compiler's `callees` query).
 fn callees(f: &str) -> BTreeSet<String> {
+    callees_of_each(&[f]).remove(0)
+}
+
+/// [`callees`] of each of `fs`. The graphs are walked together a level at a time, each level's
+/// queries in one run (one check of the package, where a query a function took one each), and
+/// each function's direct callees are kept for the process: the tests walk overlapping graphs.
+fn callees_of_each(fs: &[&str]) -> Vec<BTreeSet<String>> {
+    static DIRECT: std::sync::Mutex<BTreeMap<String, Vec<String>>> =
+        std::sync::Mutex::new(BTreeMap::new());
+    let direct = || DIRECT.lock().unwrap_or_else(|p| p.into_inner());
     let root = repo_root().join("examples/clearing");
-    let mut seen = BTreeSet::new();
-    let mut todo = vec![f.to_string()];
-    while let Some(next) = todo.pop() {
-        let text = format!("callees {next}");
-        let q = wrela_driver::query::parse(&text).expect("a query");
-        let out = wrela_driver::query::run(&root, &[(text, q)]).expect("run the query");
-        let Some(list) = out[0]["callees"].as_array() else {
-            continue;
-        };
-        for c in list {
-            let callee = c["callee"].as_str().expect("a callee").to_string();
-            if seen.insert(callee.clone()) {
-                todo.push(callee);
+    let mut level: BTreeSet<String> = fs.iter().map(|f| f.to_string()).collect();
+    let mut walked = BTreeSet::new();
+    while !level.is_empty() {
+        let asked: Vec<String> =
+            level.iter().filter(|f| !direct().contains_key(*f)).cloned().collect();
+        if !asked.is_empty() {
+            let queries: Vec<_> = asked
+                .iter()
+                .map(|f| {
+                    let text = format!("callees {f}");
+                    let q = wrela_driver::query::parse(&text).expect("a query");
+                    (text, q)
+                })
+                .collect();
+            let out = wrela_driver::query::run(&root, &queries).expect("run the queries");
+            let mut d = direct();
+            for (f, answer) in asked.iter().zip(&out) {
+                let list = answer["callees"].as_array().map_or(Vec::new(), |list| {
+                    list.iter()
+                        .map(|c| c["callee"].as_str().expect("a callee").to_string())
+                        .collect()
+                });
+                d.insert(f.clone(), list);
             }
         }
+        walked.extend(level.iter().cloned());
+        let d = direct();
+        level =
+            level.iter().flat_map(|f| &d[f]).filter(|c| !walked.contains(*c)).cloned().collect();
     }
-    seen
+    let d = direct();
+    fs.iter()
+        .map(|f| {
+            let mut seen = BTreeSet::new();
+            let mut todo = vec![f.to_string()];
+            while let Some(next) = todo.pop() {
+                for c in &d[&next] {
+                    if seen.insert(c.clone()) {
+                        todo.push(c.clone());
+                    }
+                }
+            }
+            seen
+        })
+        .collect()
 }
 
 /// AC3: the terrain's vertex shader reads the clipmap and never evaluates the terrain field:
@@ -382,6 +428,12 @@ fn no_field_is_evaluated_per_vertex_or_per_pixel() {
         ("blade", "blade_shade"),
         ("flower", "flower_shade"),
     ];
+    let paths: Vec<String> = drawn.iter().flat_map(|(v, f)| [ps_path(v), ps_path(f)]).collect();
+    let calls: BTreeMap<&str, BTreeSet<String>> = paths
+        .iter()
+        .map(String::as_str)
+        .zip(callees_of_each(&paths.iter().map(String::as_str).collect::<Vec<_>>()))
+        .collect();
     for (v, f) in drawn {
         let p = ps
             .iter()
@@ -393,8 +445,7 @@ fn no_field_is_evaluated_per_vertex_or_per_pixel() {
             }
         }
         for entry in [v, f] {
-            let path = ps_path(entry);
-            for c in callees(&path) {
+            for c in &calls[ps_path(entry).as_str()] {
                 let field = c.starts_with("std::field::") && !c.ends_with("hash_u32")
                     || c.contains("::crown")
                     || c.contains("::wood")
@@ -671,14 +722,23 @@ fn the_clipmap_holds_the_fields_heights_and_the_raycasts_meet_it() {
     println!("raycasts against the drawn clipmap: at most {worst_hit} m apart");
 }
 
+/// The frame rate the checks along the camera's path walk it at. Each looks at what's drawn
+/// where the camera is, not at what changes from frame to frame (the clipmap and the plants
+/// follow the eye's place, and their cross-fades take seconds, not frames), so 15 frames a
+/// second reach the same places in a quarter of the frames; at full size, 60.
+fn path_fps() -> f64 {
+    wrela_tests::sized(15.0, 60.0)
+}
+
 /// AC3's cracks: over the camera's path, the terrain drawn alone against a key colour shows
 /// the key through it nowhere: no pixel of the key has terrain above it in its column (the
-/// sky is above the land; a crack between levels is a hole below the horizon). Every 20th
-/// frame of the path's 60 s.
+/// sky is above the land; a crack between levels is a hole below the horizon). Every third of
+/// a second of the path's 60 s.
 #[test]
 #[ignore = "long: the camera's path, needs a GPU"]
 fn no_pixel_sees_through_the_terrain_between_levels() {
-    let mut c = Clearing::load("clearing-cracks");
+    let mut c = Clearing::load_at("clearing-cracks", path_fps());
+    let every = (c.fps / 3.0) as u32;
     c.until_ready(0);
     c.off(off::TREES | off::GRASS | off::CREATURE | off::STONES | off::SKY);
     c.view(VIEW_SCENE);
@@ -687,7 +747,7 @@ fn no_pixel_sees_through_the_terrain_between_levels() {
     let mut checked = 0;
     while c.path_time() < 60.0 {
         c.step();
-        if !c.frame.is_multiple_of(20) {
+        if !c.frame.is_multiple_of(every) {
             continue;
         }
         let s = c.screen();
@@ -801,7 +861,8 @@ fn the_walks_own_tests_pass() {
 #[test]
 #[ignore = "long: the camera's path, needs a GPU"]
 fn the_grass_never_thins_along_the_path() {
-    let mut c = Clearing::load("clearing-grass");
+    let mut c = Clearing::load_at("clearing-grass", path_fps());
+    let every = c.fps as u32;
     c.until_ready(8);
     let start = grass_coverage(&mut c);
     println!("grass coverage at the start: near {:.3}, far {:.3}", start[0], start[1]);
@@ -813,7 +874,7 @@ fn the_grass_never_thins_along_the_path() {
     let mut measured = [0; 2];
     while c.path_time() < 60.0 {
         c.step();
-        if !c.frame.is_multiple_of(60) {
+        if !c.frame.is_multiple_of(every) {
             continue;
         }
         let now = grass_coverage(&mut c);
@@ -853,7 +914,7 @@ fn the_grass_never_thins_along_the_path() {
 #[test]
 #[ignore = "long: the camera's path, needs a GPU"]
 fn the_cards_shade_each_pixel_once() {
-    let mut c = Clearing::load("clearing-counts");
+    let mut c = Clearing::load_at("clearing-counts", path_fps());
     c.until_ready(4);
     c.walk();
     c.step();
@@ -1404,7 +1465,7 @@ fn the_probes_match_a_brute_force_reference() {
 /// every frame until the clearing's ready takes under 100 ms of GPU time (its span, in the
 /// native host and in Chrome), and the clouds' strips each well under it.
 #[test]
-#[ignore = "long: alone: a GPU time budget, needs Chrome, python3 and a GPU"]
+#[ignore = "measure: a GPU time budget, needs Chrome, python3 and a GPU"]
 fn loading_never_submits_more_than_100_ms() {
     let mut c =
         Clearing::load_with("clearing-load", &Options { timestamps: true, ..Options::default() });
@@ -1630,8 +1691,9 @@ impl SubAbs for f64 {
 /// sees the same surface, its depth within 2%, the creature and the sky left out). `real`: the
 /// same content drawn as plain rendering, at the output's size, with no temporal AA, no jitter
 /// and no look. The mean warp error (/255), the share of pixels over 8/255, and each class's
-/// mean.
+/// mean. A frame and the next every 4 frames (every frame at full size).
 fn flicker(real: bool) -> (f64, f64, [f64; 8]) {
+    let every = wrela_tests::sized(4, 1);
     let mut c = Clearing::load(if real { "clearing-flicker-real" } else { "clearing-flicker" });
     c.until_ready(16);
     c.off(off::WIND);
@@ -1655,6 +1717,13 @@ fn flicker(real: bool) -> (f64, f64, [f64; 8]) {
     let mut by = [(0.0f64, 0usize); 8];
     while c.path_time() < 10.0 {
         c.step();
+        if !c.frame.is_multiple_of(every) {
+            // The first frame of the next pair.
+            if (c.frame + 1).is_multiple_of(every) {
+                last = grab(&mut c);
+            }
+            continue;
+        }
         let now = grab(&mut c);
         let (m, o, n, mv) = warp_error(
             (&last.0, &last.1, &last.2, &last.3),
@@ -1682,7 +1751,7 @@ fn flicker(real: bool) -> (f64, f64, [f64; 8]) {
         worst.0,
         worst.2
     );
-    assert!(pairs > 500, "only {pairs} frames compared");
+    assert!(pairs > 500 / every as usize, "only {pairs} frames compared");
     (mean, share, by.map(|(s, n)| s / n.max(1) as f64))
 }
 
@@ -1836,7 +1905,7 @@ fn the_walking_creature_leaves_no_trail() {
 /// (`examples/clearing/stills/c-gouache-and-light.png` at `cfc521a`), the creature's pixels
 /// (and 24 px round them) left out; both, and their difference, are written to target/tmp.
 #[test]
-#[ignore = "long: the start settled at 1080p against spike 15's still, needs git and a GPU"]
+#[ignore = "measure: reported, not gated: the start settled at 1080p against spike 15's still; needs git and a GPU"]
 fn the_start_against_spike_15s_still() {
     let out = std::process::Command::new("git")
         .args(["show", "cfc521a:examples/clearing/stills/c-gouache-and-light.png"])
@@ -1930,7 +1999,9 @@ fn mean_change(a: &[[u8; 3]], b: &[[u8; 3]]) -> f64 {
 /// impostor to its volume (at 1 km). No quarter of a second (16 frames, the same jitter: a
 /// still frame repeats) changes the crown by more than a quarter of the whole change from one
 /// level to the other (and a fifth of a step, and a still frame's noise): a level switched at
-/// once puts all of it in one. The great tree, an edge tree and a far tree.
+/// once puts all of it in one. The great tree, an edge tree and a far tree. Every 4th frame is
+/// read back (every one at full size): four of the quarter seconds read hold any one frame's
+/// change.
 #[test]
 #[ignore = "long: twelve sweeps, needs a GPU"]
 fn trees_change_level_without_popping() {
@@ -1978,6 +2049,9 @@ fn trees_change_level_without_popping() {
             c.steps(16);
             let still_b = crown_pixels(&mut c, centre, reach);
             let noise = mean_change(&still_a, &still_b);
+            // The crown every `every`th frame of the sweep; a quarter second is `gap` of them.
+            let every = wrela_tests::sized(4, 1);
+            let gap = 16 / every as usize;
             let mut seen: Vec<Vec<[u8; 3]>> = vec![still_b];
             for f in 1..=frames {
                 let t = f as f32 / frames as f32;
@@ -1986,19 +2060,22 @@ fn trees_change_level_without_popping() {
                 let card_px = px * from[2] * (to[2] / from[2]).powf(t);
                 lod(&mut c, lerp(0), lerp(1), card_px);
                 c.step();
-                seen.push(crown_pixels(&mut c, centre, reach));
+                if f.is_multiple_of(every) {
+                    seen.push(crown_pixels(&mut c, centre, reach));
+                }
             }
+            let swept = seen.len();
             c.steps(48);
             seen.push(crown_pixels(&mut c, centre, reach));
             let whole = mean_change(&seen[0], seen.last().expect("frames"));
             if std::env::var("CLEARING_SERIES").is_ok() && kind == 0 {
-                let series: Vec<String> = (0..seen.len() - 17)
-                    .step_by(8)
+                let series: Vec<String> = (0..swept - gap)
+                    .step_by(gap / 2)
                     .map(|f| {
                         format!(
                             "{:.2}/{:.2}",
                             mean_change(&seen[0], &seen[f]),
-                            mean_change(&seen[f], &seen[f + 16])
+                            mean_change(&seen[f], &seen[f + gap])
                         )
                     })
                     .collect();
@@ -2007,9 +2084,8 @@ fn trees_change_level_without_popping() {
                     series.join(" ")
                 );
             }
-            let worst = (0..seen.len() - 17)
-                .map(|f| mean_change(&seen[f], &seen[f + 16]))
-                .fold(0.0, f64::max);
+            let worst =
+                (0..swept - gap).map(|f| mean_change(&seen[f], &seen[f + gap])).fold(0.0, f64::max);
             println!(
                 "kind {kind:2}, {what:20} at {distance:5} m: the whole change {whole:.2}/255, the most in a quarter second {worst:.2}/255 (a still frame's noise {noise:.2})"
             );
@@ -2081,7 +2157,7 @@ fn system_medians(
 /// back take what Chrome's do (a median of 6.2 ms against 6.3 over the path). Chrome's serial
 /// times are printed beside.
 #[test]
-#[ignore = "long: alone: the path twice, in serial timing, needs Chrome and a GPU"]
+#[ignore = "measure: the path twice, in serial timing, needs Chrome and a GPU"]
 fn each_system_keeps_its_slice() {
     let (dir, rel) = built("clearing-systems");
     let script = r#"[{"frame":1,"type":"key","key":"Space"}]"#;
@@ -2149,7 +2225,7 @@ fn each_system_keeps_its_slice() {
 /// full frame (the clearing's cooking done), the bytes downloaded before it, and the GPU memory
 /// at most.
 #[test]
-#[ignore = "long: alone: three runs of the path in Chrome and one paced, needs a GPU"]
+#[ignore = "measure: three runs of the path in Chrome and one paced, needs a GPU"]
 fn sixty_frames_a_second_over_the_path_in_chrome() {
     let script = r#"[{"frame":1,"type":"key","key":"Space"}]"#;
     let path_spans = |r: &wrela_tests::BrowserRun| -> Vec<f64> {
@@ -2269,7 +2345,7 @@ fn mean_difference(a: &[u8], b: &[u8]) -> f64 {
 /// the old one was: the camera on its path and the creature on its walk as an unbroken run of
 /// the new build has them.
 #[test]
-#[ignore = "long: alone: the clearing built and run three times, needs a GPU"]
+#[ignore = "measure: the clearing built and run three times, needs a GPU"]
 fn hot_reload_in_the_native_host() {
     let pkg = clearing_copy("clearing-hot-native-src");
     let out = super::scratch("clearing-hot-native");
@@ -2280,6 +2356,7 @@ fn hot_reload_in_the_native_host() {
     let mut c = Clearing {
         host: Host::load_with(watcher.dir(), &options).expect("load"),
         frame: 0,
+        fps: 60.0,
         script: Vec::new(),
     };
     c.walk();
@@ -2361,6 +2438,7 @@ fn hot_reload_in_the_native_host() {
     let mut fresh = Clearing {
         host: Host::load_with(watcher.dir(), &options).expect("load"),
         frame: 0,
+        fps: 60.0,
         script: Vec::new(),
     };
     fresh.walk();
@@ -2404,7 +2482,7 @@ fn shown_by(
 /// in the same page: each timed from the file's write to the page's report of the first frame
 /// that drew it.
 #[test]
-#[ignore = "long: alone: the clearing in Chrome for 25 s, needs a GPU"]
+#[ignore = "measure: the clearing in Chrome for 25 s, needs a GPU"]
 fn hot_reload_in_chrome() {
     let pkg = clearing_copy("clearing-hot-chrome-src");
     let out = super::scratch("clearing-hot-chrome");

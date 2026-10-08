@@ -61,7 +61,7 @@ fn every_public_std_item_has_a_page() {
 
 /// Each page in under 100 ms, one at a time.
 #[test]
-#[ignore = "long: alone: a timing run"]
+#[ignore = "measure: a timing run"]
 fn every_page_takes_under_a_tenth_of_a_second() {
     let mut slowest = 0.0f64;
     for path in std_items() {
