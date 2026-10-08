@@ -28,6 +28,20 @@ impl<T: GpuData> GpuBuffer<T> {
         self.count
     }
 
+    /// All its elements, read-only: a `GpuSpan<T>` of them.
+    pub fn items(self) -> GpuSpan<T> {
+        GpuSpan { buffer: self, start: 0, count: self.count }
+    }
+
+    /// Element `i`, where it is (a `GpuField`): for a command that reads it there, or, through
+    /// its fields, a field of it (`buf.at(i).draw`). An element past the end panics.
+    pub fn at(self, i: u32) -> GpuField<T, T> {
+        if i >= self.count {
+            panic("at: the element is past the end of the buffer")
+        }
+        GpuField { buffer: self, offset: i * size_of::<T>() }
+    }
+
     /// Elements `start` to `start + count`, read-only: to bind for a `[T]` parameter, or to
     /// copy from. A range past the end panics.
     pub fn span(self, start: u32, count: u32) -> GpuSpan<T> {
@@ -66,6 +80,19 @@ impl<T: GpuData> GpuSpan<T> {
 
 @intrinsic
 fn span_len<T>(s: GpuSpan<T>) -> u32 {}
+
+/// One value in a `GpuBuffer<S>`, where it is: an element (`buf.at(i)`) or, through the
+/// element's fields, a field of it (`buf.at(i).draw`, a `GpuField<S, DrawIndexedArgs>`; §12).
+/// CPU code names it without reading it, for a command that reads it there (`indirect:`,
+/// `groups:`). It borrows its buffer, as a span does.
+pub borrow struct GpuField<S, T> {
+    buffer: borrow GpuBuffer<S>,
+    offset: u32,
+}
+
+/// Field `K` of the struct `f` names, where it is: what `f.name` is.
+@intrinsic
+fn field_at<S, T, U, const K: u32>(f: GpuField<S, T>) -> GpuField<S, U> {}
 
 /// A run of a GPU buffer's elements, to change.
 pub borrow struct GpuSpanMut<T> {
@@ -1118,6 +1145,70 @@ impl<T, const N: u32> Shared<T, N> {
 pub fn barrier<T, const N: u32>(shared: mut Shared<T, N>) {
     workgroup_barrier(mut shared)
 }
+
+/// An indirect draw's arguments (`draw(vs, fs, indirect: buf)`, of a `GpuBuffer` or span of
+/// these): its vertices and instances, its first vertex and first instance. GPU code writes
+/// them; the draw reads them.
+pub struct DrawArgs: Copy + GpuData {
+    pub vertices: u32,
+    pub instances: u32,
+    pub first_vertex: u32,
+    pub first_instance: u32,
+}
+
+/// An indexed indirect draw's arguments (`draw(vs, fs, indices: idx, indirect: buf)`): its
+/// indices and instances, its first index, the vertex its indices count from, and its first
+/// instance.
+pub struct DrawIndexedArgs: Copy + GpuData {
+    pub indices: u32,
+    pub instances: u32,
+    pub first_index: u32,
+    pub base_vertex: i32,
+    pub first_instance: u32,
+}
+
+/// An indirect dispatch's workgroup counts (`dispatch(k.bind(...), groups: buf)`).
+pub struct DispatchArgs: Copy + GpuData {
+    pub x: u32,
+    pub y: u32,
+    pub z: u32,
+}
+
+/// One value a kernel writes, from one invocation: the dispatch's first, (0, 0, 0) of its
+/// `GlobalId`. A kernel's `mut One<T>` parameter, for which CPU code passes `mut buf` of a
+/// `GpuBuffer<T>` (its first element) or a `GpuSpanMut<T>` (its first). Any invocation may
+/// call `set` and `update`; only the first's does anything, so invocations never race for it.
+pub struct One<T> {
+    unused: u32,
+}
+
+impl<T: GpuData> One<T> {
+    /// Writes `value`, in the dispatch's first invocation.
+    pub fn set(mut self, id: GlobalId, value: T) {
+        if first(id) {
+            one_set(mut self, value)
+        }
+    }
+
+    /// Writes `f` of the value before, in the dispatch's first invocation: a value kept from
+    /// dispatch to dispatch (a running mean).
+    pub fn update(mut self, id: GlobalId, f: fn(T) -> T) {
+        if first(id) {
+            one_set(mut self, f(one_get(self)))
+        }
+    }
+}
+
+/// Whether `id` is the dispatch's first invocation's.
+fn first(id: GlobalId) -> bool {
+    id.x == 0 && id.y == 0 && id.z == 0
+}
+
+@intrinsic
+fn one_get<T>(o: One<T>) -> T {}
+
+@intrinsic
+fn one_set<T>(o: mut One<T>, value: T) {}
 
 /// A texture of format `F` that a kernel writes, each invocation only its own texel: (`id.x`,
 /// `id.y`) of its `GlobalId` (§6.13). A kernel's `mut Texels<F>` parameter, for which CPU code

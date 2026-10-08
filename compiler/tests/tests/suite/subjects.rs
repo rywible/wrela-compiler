@@ -108,12 +108,12 @@ fn the_grazer_matches_round_1s() {
 /// The mesh the engine's realization makes of a subject (its program realizes it in `init`):
 /// the vertices' rest positions and the quads, read back after a frame. After `init` the
 /// program holds the mesh's buffers first, oldest first: the vertices' count and the vertices
-/// (an append buffer makes its count first), the quads' count and the quads, and the draw's
-/// arguments; then the palette's.
+/// (an append buffer makes its count first), the quads' count and the quads, the draw's and the
+/// skin pass's arguments, the holes and the tally; then the palette's.
 fn mesh(host: &mut wrela_host::Host) -> (Vec<[f32; 3]>, Vec<[u32; 6]>) {
     let held = host.buffers();
-    let [vcount, verts, qcount, quads, _args, _palettes] = held[..] else {
-        panic!("the program holds {} buffers, not the mesh's five and a palette", held.len())
+    let [vcount, verts, qcount, quads, _draw, _skin, _holes, _tally, _palettes] = held[..] else {
+        panic!("the program holds {} buffers, not the mesh's eight and a palette", held.len())
     };
     let count = |h: u32, host: &mut wrela_host::Host| {
         wrela_tests::u32s(&host.read_buffer(h).expect("a count"))[0] as usize

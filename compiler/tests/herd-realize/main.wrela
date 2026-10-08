@@ -1,7 +1,8 @@
 // The herd's grazers realized one at a time, at any cell size, by the engine's `record` (#42
 // AC2): into a mesh with room for the most its grid could hold, so nothing overflows. The test
 // reads the mesh's buffers back (the newest the program holds: the vertices' count and items,
-// the quads' count and items, and the draw's arguments) and times the passes.
+// the quads' count and items, the draw's and the skin pass's arguments, the holes and the
+// tally) and times the passes.
 
 use engine::creature::{ALL, Parts}
 use engine::realize::{Grid, Mesh, Room, Scratch, record, record_cull, record_finish, record_slice}
@@ -155,8 +156,8 @@ pub fn realize_sliced(game: mut Game, s: u32, cell: f32, slices: u32) {
 }
 
 /// Realizes seed `s` at `cell` into scratch of its own, whose probe, in a debug build, holds each
-/// boundary corner's value as each live block evaluated it (#42 AC2): the probe is the sixth
-/// newest buffer (the mesh's five are newer).
+/// boundary corner's value as each live block evaluated it (#42 AC2): the probe is the ninth
+/// newest buffer (the mesh's eight are newer).
 pub fn probe_corners(game: mut Game, s: u32, cell: f32) {
     game.scratch = Scratch::new(Grid::around(grazer(s).bounds(), cell).blocks)
     realize(mut game, s, cell)

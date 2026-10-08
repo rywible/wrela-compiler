@@ -2754,6 +2754,10 @@ impl<'p> Checker<'p> {
             {
                 args.first().map(|&e| self.infer.resolve(&self.p.types, e))
             }
+            // A `GpuField<S, T>` holds one `T`.
+            TyKind::Adt(a, args) if self.p.adt(*a).lang == Some(Lang::GpuField) => {
+                args.get(1).map(|&e| self.infer.resolve(&self.p.types, e))
+            }
             _ => None,
         }
     }
@@ -2763,6 +2767,9 @@ impl<'p> Checker<'p> {
     /// can append whole ones), which the draw reads as consecutive `u32` indices.
     fn index_buffer(&self, t: TyId) -> bool {
         let u32_ty = self.p.types.u32;
+        if self.p.lang_of_ty(self.infer.resolve(&self.p.types, t)) == Some(Lang::GpuField) {
+            return false;
+        }
         let Some(elem) = self.gpu_buffer_elem(t) else { return false };
         if elem == u32_ty {
             return true;
@@ -2778,9 +2785,42 @@ impl<'p> Checker<'p> {
         }
     }
 
-    /// Whether `t` holds a dispatch's or draw's counts: a `GpuBuffer<u32>` or `GpuSpan<u32>`.
+    /// Whether `t` holds a dispatch's or draw's counts: a `GpuBuffer` or `GpuSpan` of `u32`s,
+    /// or of `DispatchArgs`, `DrawArgs` or `DrawIndexedArgs` (which of them fits is checked
+    /// where the command's other arguments are known: `args_kind`).
     fn counts_buffer(&self, t: TyId) -> bool {
-        self.gpu_buffer_elem(t) == Some(self.p.types.u32)
+        self.gpu_buffer_elem(t).is_some_and(|e| {
+            e == self.p.types.u32
+                || matches!(
+                    self.p.lang_of_ty(e),
+                    Some(Lang::DispatchArgs | Lang::DrawArgs | Lang::DrawIndexedArgs)
+                )
+        })
+    }
+
+    /// E0603 when a counts buffer `e` holds another command's typed arguments than `want`
+    /// (`DispatchArgs` for a dispatch, `DrawArgs` for a draw, `DrawIndexedArgs` for an indexed
+    /// one). A buffer of `u32`s is any command's words.
+    fn args_kind(&mut self, e: &Expr, want: Lang) {
+        let Some(elem) = self.gpu_buffer_elem(e.ty) else { return };
+        let Some(got) = self.p.lang_of_ty(elem) else { return };
+        if got != want {
+            let name = |l: Lang| match l {
+                Lang::DispatchArgs => "`DispatchArgs`",
+                Lang::DrawArgs => "`DrawArgs`",
+                _ => "`DrawIndexedArgs`",
+            };
+            let what = match want {
+                Lang::DispatchArgs => "a dispatch's",
+                Lang::DrawArgs => "a draw's",
+                _ => "an indexed draw's",
+            };
+            self.err(Diagnostic::new(
+                codes::E0603,
+                e.span,
+                format!("{what} arguments are {}, and these are {}", name(want), name(got)),
+            ));
+        }
     }
 
     /// A dispatch's or draw's argument for an entry point's parameter `p` (§6.13). A buffer
@@ -2825,7 +2865,9 @@ impl<'p> Checker<'p> {
         let elem = match self.kind(p.ty) {
             TyKind::Slice(t) => Some(*t),
             TyKind::Adt(s, args)
-                if self.p.is_lang_adt(*s, Lang::Slots) || self.p.is_lang_adt(*s, Lang::Atomics) =>
+                if self.p.is_lang_adt(*s, Lang::Slots)
+                    || self.p.is_lang_adt(*s, Lang::Atomics)
+                    || self.p.is_lang_adt(*s, Lang::One) =>
             {
                 args.first().copied()
             }
@@ -2979,7 +3021,10 @@ impl<'p> Checker<'p> {
                         self.expect(t, u32_ty, e.span);
                     }
                 }
-                _ if self.counts_buffer(e.ty) => indirect = true,
+                _ if self.counts_buffer(e.ty) => {
+                    self.args_kind(&e, Lang::DispatchArgs);
+                    indirect = true;
+                }
                 _ => {
                     self.expect(e.ty, u32_ty, e.span);
                 }
@@ -3169,8 +3214,8 @@ impl<'p> Checker<'p> {
                         "indirect",
                         &a.value,
                         Self::counts_buffer,
-                        "a `GpuBuffer<u32>` or a `GpuSpan<u32>` of the counts",
-                        "the buffer holds the vertex count, the instance count, the first vertex and the first instance",
+                        "a `GpuBuffer` or a `GpuSpan` of `DrawArgs`, `DrawIndexedArgs` or `u32` counts",
+                        "a draw's arguments are a `DrawArgs`, an indexed draw's a `DrawIndexedArgs`, or their words as `u32`s",
                     );
                     if !twice {
                         indirect = Some(Box::new(e));
@@ -3232,6 +3277,11 @@ impl<'p> Checker<'p> {
                 }
                 _ => unreachable!("the shaders' arguments are bound (above)"),
             }
+        }
+        if let Some(e) = &indirect {
+            let want = if indices.is_some() { Lang::DrawIndexedArgs } else { Lang::DrawArgs };
+            let e = (**e).clone();
+            self.args_kind(&e, want);
         }
         if indices.is_some() && indirect.is_none() {
             self.err(

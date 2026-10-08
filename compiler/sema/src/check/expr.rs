@@ -1279,6 +1279,14 @@ impl<'p> Checker<'p> {
         let b = self.check_expr(base, None);
         // Resolved through: a field `T::Out` normalizes only once `T` is known.
         let bt = self.infer.resolve(&self.p.types, b.ty);
+        // A field of the value a `GpuField` names, where it is: a `GpuField` of the field (§12).
+        if let (&TyKind::Adt(a, ref args), ast::FieldName::Ident(n)) = (self.kind(bt), name)
+            && self.p.is_lang_adt(a, Lang::GpuField)
+            && args.len() == 2
+        {
+            let (outer, inner) = (args[0], self.infer.resolve(&self.p.types, args[1]));
+            return self.gpu_field(b, outer, inner, n, span);
+        }
         match (self.kind(bt), name) {
             // Its error is reported.
             (TyKind::Error, _) | (_, ast::FieldName::BadIndex(_)) => self.error_expr(span),
@@ -1413,6 +1421,61 @@ impl<'p> Checker<'p> {
                 ));
                 self.error_expr(span)
             }
+        }
+    }
+
+    /// `f.name`, `f` a `GpuField<S, T>` and `T` a struct: its field's `GpuField`, through
+    /// `std::gpu::field_at`, which adds the field's offset in `T`'s layout.
+    fn gpu_field(&mut self, f: Expr, outer: TyId, inner: TyId, n: &ast::Ident, span: Span) -> Expr {
+        let TyKind::Adt(a, targs) = self.kind(inner).clone() else {
+            let shown = self.display(inner);
+            self.err(Diagnostic::new(
+                codes::E0206,
+                n.span,
+                format!("a `GpuField` of `{shown}` has no fields to name"),
+            ));
+            return self.error_expr(span);
+        };
+        let fields = self.p.adt(a).fields();
+        let Some(i) =
+            fields.iter().position(|f| f.name == n.name).filter(|_| !self.p.adt(a).is_enum())
+        else {
+            let name = self.p.adt(a).name.clone();
+            self.err(Diagnostic::new(
+                codes::E0206,
+                n.span,
+                format!("`{name}` has no field `{}`", n.name),
+            ));
+            return self.error_expr(span);
+        };
+        if self.field_hidden(self.p.adt(a).module, &fields[i]) {
+            let name = self.p.adt(a).name.clone();
+            self.err(Diagnostic::new(
+                codes::E0210,
+                n.span,
+                format!("the field `{}` of `{name}` is private", n.name),
+            ));
+        }
+        let ft = self.p.field_ty(a, &targs, None, i).unwrap_or(self.p.types.error);
+        let (Some(at), Some(gf)) =
+            (self.p.lang_fn(Lang::GpuFieldAt), self.p.lang_adt(Lang::GpuField))
+        else {
+            return self.error_expr(span);
+        };
+        let ty = self.p.types.adt(gf, vec![outer, ft]);
+        // The field's index is a type argument, so lowering knows it as it does the types.
+        let k = self.p.types.intern(TyKind::ConstU32(i as u32));
+        Expr {
+            ty,
+            span,
+            kind: ExprKind::Call(Call {
+                callee: Callee::Fn { func: at, args: vec![outer, inner, ft, k] },
+                args: vec![f],
+                modes: vec![Mode::Borrow],
+                order: vec![0],
+                receiver: false,
+                ret_mode: RetMode::Owned,
+            }),
         }
     }
 

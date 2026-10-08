@@ -178,6 +178,10 @@ pub const RULES: &[(&str, &str)] = &[
         "textures are sampled in fragment shaders, read anywhere on the GPU, drawn into in passes",
     ),
     (
+        "gpu.outputs",
+        "indirect work takes typed arguments; a `One<T>` is written by a kernel's first invocation",
+    ),
+    (
         "gpu.domains",
         "`over:` dispatches a kernel over a count, a size or a texture: its groups and its bounds the compiler's",
     ),

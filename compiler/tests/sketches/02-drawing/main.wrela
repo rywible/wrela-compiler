@@ -139,7 +139,7 @@ pub fn frame(state: mut Scene, time: f32, width: u32, height: u32) {
                 shadow_sampler: state.shadow_sampler,
             ),
             indices: mesh.quads.items(),
-            indirect: mesh.args.span(start: 0, count: 5),
+            indirect: mesh.draw.items(),
             cull: Cull::Back,
         )
         i += 1

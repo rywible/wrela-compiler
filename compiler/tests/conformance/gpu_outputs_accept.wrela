@@ -1,0 +1,79 @@
+// accepts: gpu.outputs gpu.dispatch
+// A kernel writes a draw's and a dispatch's typed arguments, each from its first invocation
+// (`One<T>`), and a value it keeps from dispatch to dispatch (`update`); the draw and the
+// dispatch read them. A draw reads one field of a buffer's element (a `GpuField`).
+use std::gpu::{
+    ClipPosition, DispatchArgs, DrawArgs, DrawIndexedArgs, GlobalId, GpuBuffer, One, Slots,
+    VertexIndex, begin_screen_pass, buffer, dispatch, draw, present,
+}
+
+/// Two draws a list, as a forest's lists have.
+struct ListDraws: Copy + GpuData {
+    cards: DrawIndexedArgs,
+    limbs: DrawIndexedArgs,
+}
+
+struct State {
+    lists: GpuBuffer<ListDraws>,
+    draws: GpuBuffer<DrawArgs>,
+    indexed: GpuBuffer<DrawIndexedArgs>,
+    groups: GpuBuffer<DispatchArgs>,
+    total: GpuBuffer<f32>,
+    out: GpuBuffer<f32>,
+    indices: GpuBuffer<u32>,
+}
+
+@compute(64)
+fn plan(
+    draws: mut One<DrawArgs>,
+    indexed: mut Slots<DrawIndexedArgs>,
+    groups: mut One<DispatchArgs>,
+    total: mut One<f32>,
+    id: GlobalId,
+) {
+    draws.set(id, DrawArgs { vertices: 3, instances: 1, first_vertex: 0, first_instance: 0 })
+    indexed[id] =
+        DrawIndexedArgs { indices: 3, instances: 1, first_index: 0, base_vertex: 0, first_instance: 0 }
+    groups.set(id, DispatchArgs { x: 2, y: 1, z: 1 })
+    total.update(id, |t| t + 1.0)
+}
+
+@compute(64)
+fn fill(out: mut Slots<f32>, id: GlobalId) {
+    out[id] = 1.0
+}
+
+@vertex
+fn corner(v: VertexIndex) -> ClipPosition {
+    ClipPosition { position: vec4(f32(v.index), 0.0, 0.5, 1.0) }
+}
+
+@fragment
+fn red() -> vec4 {
+    vec4(1.0, 0.0, 0.0, 1.0)
+}
+
+pub fn init() -> State {
+    State {
+        lists: buffer(2),
+        draws: buffer(1),
+        indexed: buffer(2),
+        groups: buffer(1),
+        total: buffer(1),
+        out: buffer(128),
+        indices: buffer(3),
+    }
+}
+
+pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
+    dispatch(
+        plan.bind(mut s.draws, mut s.indexed, mut s.groups, mut s.total),
+        groups: 1,
+    )
+    dispatch(fill.bind(mut s.out), groups: s.groups.items())
+    begin_screen_pass(clear: vec4(0.0))
+    draw(corner, red, indirect: s.draws.items())
+    draw(corner, red, indices: s.indices.items(), indirect: s.indexed.span(start: 1, count: 1))
+    draw(corner, red, indices: s.indices.items(), indirect: s.lists.at(1).limbs)
+    present()
+}

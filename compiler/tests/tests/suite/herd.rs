@@ -411,17 +411,24 @@ struct Ours {
     mesh: Tris,
 }
 
-/// A mesh's counts and geometry from its five buffers (`herd-realize`'s order).
-fn read_mesh(host: &mut wrela_host::Host, five: &[u32]) -> Ours {
-    let args = wrela_tests::u32s(&host.read_buffer(five[4]).expect("args"));
-    let (nv, ni) = (args[5] as usize, args[0] as usize);
-    let verts = wrela_tests::positions(&host.read_buffer(five[1]).expect("vertices"), nv);
-    let indices = wrela_tests::u32s(&host.read_buffer(five[3]).expect("quads"));
+/// A mesh's buffers, in the order `Mesh::new` makes them: the vertices' count and items, the
+/// quads' count and items, the draw's arguments, the skin pass's, the holes and the tally.
+const MESH_BUFFERS: usize = 8;
+
+/// A mesh's counts and geometry from its buffers (`MESH_BUFFERS`). The draw's arguments begin
+/// with its index count; the tally holds the vertices, holes, flags, vertices and quads pushed,
+/// and live blocks.
+fn read_mesh(host: &mut wrela_host::Host, mesh: &[u32]) -> Ours {
+    let draw = wrela_tests::u32s(&host.read_buffer(mesh[4]).expect("the draw's arguments"));
+    let tally = wrela_tests::u32s(&host.read_buffer(mesh[7]).expect("the tally"));
+    let (nv, ni) = (tally[0] as usize, draw[0] as usize);
+    let verts = wrela_tests::positions(&host.read_buffer(mesh[1]).expect("vertices"), nv);
+    let indices = wrela_tests::u32s(&host.read_buffer(mesh[3]).expect("quads"));
     Ours {
-        live: args[10],
-        tris: args[0] / 3,
-        holes: args[6],
-        flags: args[7],
+        live: tally[5],
+        tris: draw[0] / 3,
+        holes: tally[1],
+        flags: tally[2],
         mesh: Tris::new(verts, &indices[..ni]),
     }
 }
@@ -436,7 +443,7 @@ fn a_realization_in_slices_is_the_whole_ones() {
     let mut host = wrela_host::Host::load(&dir).expect("load");
     let newest = |host: &mut wrela_host::Host| {
         let b = host.buffers();
-        b[b.len() - 5..].to_vec()
+        b[b.len() - MESH_BUFFERS..].to_vec()
     };
     // Each triangle as its corners' bits, from its lowest corner on (so the vertices' order in
     // the buffer, which slices change, doesn't matter, but the winding does).
@@ -492,8 +499,8 @@ fn realize_herd(host: &mut wrela_host::Host, cell: f32) -> (Vec<Ours>, Vec<f64>)
     let largest = (1..=40).max_by_key(|&s| blocks(host, s)).expect("a seed");
     host.call_export("realize", &[Value::I32(largest as i32), Value::F32(cell)]).expect("realize");
     let b = host.buffers();
-    let args = wrela_tests::u32s(&host.read_buffer(b[b.len() - 1]).expect("args"));
-    let (v, q) = (args[8], args[9]);
+    let tally = wrela_tests::u32s(&host.read_buffer(b[b.len() - 1]).expect("the tally"));
+    let (v, q) = (tally[3], tally[4]);
     let room = [Value::I32((v + v / 4 + 1024) as i32), Value::I32((q + q / 4 + 1024) as i32)];
     let _ = host.take_timings();
     let mut times = Vec::new();
@@ -506,8 +513,8 @@ fn realize_herd(host: &mut wrela_host::Host, cell: f32) -> (Vec<Ours>, Vec<f64>)
         times = t.chunks_exact(5).map(|c| c.iter().map(|t| t.nanos).sum::<f64>() / 1e6).collect();
     }
     let b = host.buffers();
-    let meshes = &b[b.len() - 200..];
-    let ours = meshes.chunks_exact(5).map(|five| read_mesh(host, five)).collect();
+    let meshes = &b[b.len() - 40 * MESH_BUFFERS..];
+    let ours = meshes.chunks_exact(MESH_BUFFERS).map(|mesh| read_mesh(host, mesh)).collect();
     (ours, times)
 }
 
@@ -1033,7 +1040,8 @@ fn shared_corners_have_one_value() {
         for s in 1..=40 {
             host.call_export("probe_corners", &[Value::I32(s), Value::F32(cell)]).expect("probe");
             let b = host.buffers();
-            let words = wrela_tests::u32s(&host.read_buffer(b[b.len() - 6]).expect("the probe"));
+            let at = b.len() - MESH_BUFFERS - 1;
+            let words = wrela_tests::u32s(&host.read_buffer(b[at]).expect("the probe"));
             let mut seen: std::collections::HashMap<u32, (u32, u32)> =
                 std::collections::HashMap::new();
             let mut n = 0;

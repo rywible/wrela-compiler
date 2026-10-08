@@ -1,0 +1,42 @@
+// rejects: gpu.outputs
+// Each command takes its own typed arguments: a draw's aren't an indexed draw's, nor a
+// dispatch's; a `GpuField` names a field its element has; and a `One<T>` is a kernel's, passed
+// `mut`.
+use std::gpu::{
+    ClipPosition, DispatchArgs, DrawArgs, FragCoord, GlobalId, GpuBuffer, One, VertexIndex,
+    begin_screen_pass, buffer, dispatch, draw, present,
+}
+
+@compute(64)
+fn count(n: mut One<u32>, id: GlobalId) {
+    n.set(id, 1)
+}
+
+@fragment
+fn shade(p: FragCoord, n: mut One<u32>) -> vec4 { //~ E0602
+    vec4(1.0)
+}
+
+@vertex
+fn corner(v: VertexIndex) -> ClipPosition {
+    ClipPosition { position: vec4(f32(v.index), 0.0, 0.5, 1.0) }
+}
+
+@fragment
+fn red() -> vec4 {
+    vec4(1.0, 0.0, 0.0, 1.0)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    let draws: GpuBuffer<DrawArgs> = buffer(1)
+    let groups: GpuBuffer<DispatchArgs> = buffer(1)
+    let indices: GpuBuffer<u32> = buffer(3)
+    var n: GpuBuffer<u32> = buffer(1)
+    dispatch(count.bind(n), groups: 1) //~ E0503
+    dispatch(count.bind(mut n), groups: draws.items()) //~ E0603
+    begin_screen_pass(clear: vec4(0.0))
+    draw(corner, red, indirect: groups.items()) //~ E0603
+    draw(corner, red, indices: indices.items(), indirect: draws.items()) //~ E0603
+    draw(corner, red, indirect: draws.at(0).nope) //~ E0206
+    present()
+}

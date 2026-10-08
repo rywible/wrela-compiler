@@ -219,7 +219,7 @@ fn class_of(cx: &Cx, ty: TyId, mode: Mode, varyings: Option<TyId>) -> ParamClass
         _ => {}
     }
     match p.types.kind(ty) {
-        TyKind::Adt(_, args) if p.lang_of_ty(ty) == Some(Lang::Slots) => {
+        TyKind::Adt(_, args) if matches!(p.lang_of_ty(ty), Some(Lang::Slots | Lang::One)) => {
             ParamClass::Buffer { elem: args[0], read_write: true, atomic: false }
         }
         TyKind::Adt(_, args) if p.lang_of_ty(ty) == Some(Lang::Atomics) => {
@@ -618,6 +618,15 @@ fn buffer_binding(
     let stride_v = fl.u32c(stride);
     let mul =
         |fl: &mut Fl, a: ir::ValueId| fl.value(u, ir::Expr::Binary(ir::BinOp::Mul, a, stride_v));
+    if lang == Some(Lang::GpuField) {
+        // One element (or a field of one): its buffer's handle, its offset, its size.
+        let pt = fl.mb.m.types.field(fl.f.value_ty(v), 0)?;
+        let ptr = fl.value(pt, ir::Expr::Extract(v, 0));
+        let at = ir::Place { root: ir::PlaceRoot::Ptr(ptr), path: vec![ir::Proj::Field(0)] };
+        let handle = fl.value(u, ir::Expr::Load(at));
+        let offset = fl.value(u, ir::Expr::Extract(v, 1));
+        return Some([handle, offset, stride_v]);
+    }
     if matches!(lang, Some(Lang::GpuSpan | Lang::GpuSpanMut)) {
         // Through the span's projection of its buffer.
         let pt = fl.mb.m.types.field(fl.f.value_ty(v), 0)?;
@@ -643,15 +652,36 @@ fn buffer_binding(
 /// An indirect dispatch's or draw's counts: their buffer's handle, and the byte offset where
 /// they start.
 fn indirect_binding(fl: &mut Fl, place: &mir::Place, span: Span) -> Option<[ir::ValueId; 2]> {
-    let u32_ty = fl.cx.checked.program.types.u32;
-    let [handle, offset, _] = buffer_binding(fl, place, u32_ty, span)?;
+    // Its elements: `u32` words, or a command's typed arguments (`DrawArgs`, ...).
+    let t = fl.place_src_ty(place);
+    let elem = match fl.cx.checked.program.types.kind(t) {
+        TyKind::Adt(_, args) if !args.is_empty() => args[0],
+        _ => fl.cx.checked.program.types.u32,
+    };
+    let [handle, offset, _] = buffer_binding(fl, place, elem, span)?;
     Some([handle, offset])
 }
 
 pub(crate) fn lower_dispatch(fl: &mut Fl, d: &mir::Dispatch, span: Span) {
+    recorded(fl, span, "dispatch", |fl| record_dispatch(fl, d, span));
+}
+
+/// Records a command with `record`, which is `None` when it couldn't: then, if the build has
+/// no error that explains it, an internal error says so, rather than the command going missing
+/// without a word.
+fn recorded(fl: &mut Fl, span: Span, what: &str, record: impl FnOnce(&mut Fl) -> Option<()>) {
+    if record(fl).is_none() && !fl.cx.diags.iter().any(|d| d.is_error()) {
+        fl.cx.err(Diagnostic::internal(format!(
+            "a {what} couldn't be recorded, at {}..{}",
+            span.start, span.end
+        )));
+    }
+}
+
+fn record_dispatch(fl: &mut Fl, d: &mir::Dispatch, span: Span) -> Option<()> {
     if fl.is_gpu() {
         host_effect(fl, "`dispatch`", span);
-        return;
+        return None;
     }
     let substs: Vec<TyId> = d.kernel_args.iter().map(|&a| fl.concrete(a)).collect();
     let key = PipelineKey::Compute { kernel: d.kernel, substs, over: d.over };
@@ -659,14 +689,14 @@ pub(crate) fn lower_dispatch(fl: &mut Fl, d: &mir::Dispatch, span: Span) {
     let mut groups = Vec::new();
     match &d.indirect {
         Some((place, at)) => {
-            let Some(b) = indirect_binding(fl, place, *at) else { return };
+            let b = indirect_binding(fl, place, *at)?;
             groups.extend(b);
         }
         None => {
             for g in &d.groups {
-                match fl.operand(g) {
-                    Some(v) => groups.push(v),
-                    None => return,
+                {
+                    let v = fl.operand(g)?;
+                    groups.push(v)
                 }
             }
         }
@@ -690,15 +720,13 @@ pub(crate) fn lower_dispatch(fl: &mut Fl, d: &mir::Dispatch, span: Span) {
             .collect();
     }
     let arg = |i: usize| d.args.iter().find(|a| a.0 == i).map(|(_, p, s)| (p, *s));
-    let Some((mut uniform_fields, mut uniform_vals)) = uniforms(fl, &iface, |_, i| arg(i)) else {
-        return;
-    };
+    let (mut uniform_fields, mut uniform_vals) = uniforms(fl, &iface, |_, i| arg(i))?;
     if let Some(size) = domain {
         let v3 = fl.mb.m.types.intern(ir::TypeDef::Vector(ir::Scalar::U32, 3));
         uniform_fields.push((DOMAIN.to_string(), v3));
         uniform_vals.push(fl.value(v3, ir::Expr::Construct(v3, size)));
     }
-    let Some(mut handles) = bound(fl, &iface, |_, i| arg(i)) else { return };
+    let mut handles = bound(fl, &iface, |_, i| arg(i))?;
     // A lifted build's literal table (only a build with literals has one).
     handles.extend(fl.literal_binding(true).into_iter().flatten());
     let bindings = handles.len() as u32 / 3;
@@ -712,6 +740,7 @@ pub(crate) fn lower_dispatch(fl: &mut Fl, d: &mir::Dispatch, span: Span) {
         indirect: d.indirect.is_some(),
     };
     fl.emit(ir::Stmt::Eval(ir::Expr::Host(op, args)));
+    Some(())
 }
 
 /// A uniform block's fields: each one's name and type.
@@ -792,9 +821,13 @@ fn uniform_block(
 }
 
 pub(crate) fn lower_draw(fl: &mut Fl, d: &mir::Draw, span: Span) {
+    recorded(fl, span, "draw", |fl| record_draw(fl, d, span));
+}
+
+fn record_draw(fl: &mut Fl, d: &mir::Draw, span: Span) -> Option<()> {
     if fl.is_gpu() {
         host_effect(fl, "`draw`", span);
-        return;
+        return None;
     }
     let vs = (d.vertex.0, d.vertex.1.iter().map(|&a| fl.concrete(a)).collect::<Vec<_>>());
     let fs = (d.fragment.0, d.fragment.1.iter().map(|&a| fl.concrete(a)).collect::<Vec<_>>());
@@ -809,26 +842,26 @@ pub(crate) fn lower_draw(fl: &mut Fl, d: &mir::Draw, span: Span) {
             TyKind::Adt(_, args) if !args.is_empty() => args[0],
             _ => fl.cx.checked.program.types.u32,
         };
-        let Some(b) = buffer_binding(fl, place, elem, *at) else { return };
+        let b = buffer_binding(fl, place, elem, *at)?;
         counts.extend(b);
     }
     // The counts, or where their buffer holds them.
     match &d.indirect {
         Some((place, at)) => {
-            let Some([handle, offset]) = indirect_binding(fl, place, *at) else { return };
+            let [handle, offset] = indirect_binding(fl, place, *at)?;
             counts.extend([handle, offset]);
         }
         None => {
-            let Some(vertices) = fl.operand(&d.vertices) else { return };
-            let Some(instances) = fl.operand(&d.instances) else { return };
+            let vertices = fl.operand(&d.vertices)?;
+            let instances = fl.operand(&d.instances)?;
             counts.extend([vertices, instances]);
         }
     };
     let arg =
         |e: usize, i: usize| d.args.iter().find(|a| a.0 == e && a.1 == i).map(|(.., p, s)| (p, *s));
-    let Some((fields, vals)) = uniforms(fl, &iface, arg) else { return };
+    let (fields, vals) = uniforms(fl, &iface, arg)?;
     // Buffers, textures and samplers, in the order the pipeline binds them.
-    let Some(mut handles) = bound(fl, &iface, arg) else { return };
+    let mut handles = bound(fl, &iface, arg)?;
     handles.extend(fl.literal_binding(false).into_iter().flatten());
     let bindings = handles.len() as u32 / 3;
     let mut args = counts;
@@ -842,6 +875,7 @@ pub(crate) fn lower_draw(fl: &mut Fl, d: &mir::Draw, span: Span) {
         indexed: d.indices.is_some(),
     };
     fl.emit(ir::Stmt::Eval(ir::Expr::Host(op, args)));
+    Some(())
 }
 
 /// `std::gpu`'s and `std::derive`'s intrinsics.
@@ -1117,7 +1151,9 @@ pub(crate) fn intrinsic(
             | Lang::AtomicCompareExchange
             | Lang::AppendPush
             | Lang::TexelsStore
-            | Lang::Texels3dStore),
+            | Lang::Texels3dStore
+            | Lang::OneGet
+            | Lang::OneSet),
         ) => shared_op(fl, l, c, ty),
         Some(Lang::Discard) => {
             // A fragment shader's, or a `@gpu` function's checked on its own (its callers'
@@ -1155,6 +1191,33 @@ pub(crate) fn intrinsic(
             | Lang::TextureHeight
             | Lang::TextureDepth),
         ) => texture_read(fl, l, c, ty),
+        // A field of what a `GpuField` names: its offset moved by the field's in the struct's
+        // layout. CPU code only (GPU code doesn't name buffers).
+        Some(Lang::GpuFieldAt) => {
+            if fl.is_gpu() {
+                let at = user_span(fl, c.span);
+                fl.cx.err(Diagnostic::new(
+                    codes::E0607,
+                    at,
+                    "a `GpuField` names a value in a buffer for CPU code's commands, and this is GPU code",
+                ));
+                return None;
+            }
+            let u = fl.mb.m.types.u32();
+            let f = fl.arg_value(&c.args[0])?;
+            let k = match fl.cx.checked.program.types.kind(substs[3]) {
+                TyKind::ConstU32(k) => *k as usize,
+                _ => return None,
+            };
+            let inner = fl.cx.lower_ty(fl.mb, substs[1], c.span)?;
+            let off = ir::layout::field_offsets(&fl.mb.m.types, inner).get(k).copied()?;
+            let off = fl.u32c(off);
+            let base = fl.value(u, ir::Expr::Extract(f, 1));
+            let moved = fl.value(u, ir::Expr::Binary(ir::BinOp::Add, base, off));
+            let t = fl.ty(ty?, c.span)?;
+            let ptr = fl.value(fl.mb.m.types.field(t, 0)?, ir::Expr::Extract(f, 0));
+            Some(fl.value(t, ir::Expr::Construct(t, vec![ptr, moved])))
+        }
         // A span's length: its count on the CPU, its binding's on the GPU (bound to its range).
         Some(Lang::SpanLen) => {
             let u = fl.mb.m.types.u32();
@@ -1325,6 +1388,20 @@ fn shared_op(fl: &mut Fl, l: Lang, c: &mir::Call, ty: Option<TyId>) -> Option<ir
                     None
                 }
             }
+        }
+        // A `One<T>`'s value: its buffer's first element (std guards who sets it).
+        Lang::OneGet | Lang::OneSet => {
+            let r = resource_arg(fl, c, 0, msg)?;
+            let zero = fl.u32c(0);
+            let place =
+                ir::Place { root: ir::PlaceRoot::Resource(r), path: vec![ir::Proj::Index(zero)] };
+            if l == Lang::OneGet {
+                let t = fl.ty(ty?, span)?;
+                return Some(fl.value(t, ir::Expr::Load(place)));
+            }
+            let v = fl.arg_value(&c.args[1])?;
+            fl.emit(ir::Stmt::Store(place, v));
+            None
         }
         Lang::AtomicLen => {
             let r = resource_arg(fl, c, 0, msg)?;

@@ -375,6 +375,7 @@ fn check_entry(p: &Program, f: FnId, entry: Entry, out: &mut Vec<Diagnostic>) {
         if slots && !matches!(entry, Entry::Compute(_)) && !fragment_atomics {
             let why = match lang {
                 Some(Lang::Slots) => "slots are indexed by a kernel's `GlobalId`",
+                Some(Lang::One) => "one invocation of a kernel writes it",
                 Some(Lang::Shared) => "workgroup memory is a kernel's",
                 Some(Lang::Atomics) => "WebGPU gives a vertex shader no writable buffers",
                 Some(Lang::Texels | Lang::Texels3d) => {

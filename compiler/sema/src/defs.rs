@@ -218,6 +218,7 @@ macro_rules! lang_items {
                 matches!(
                     self,
                     Lang::Slots
+                        | Lang::One
                         | Lang::Shared
                         | Lang::Atomics
                         | Lang::Append
@@ -273,6 +274,8 @@ lang_items! {
     DestroyBuffer = "std::gpu::destroy_buffer",
     CopyBuffer = "std::gpu::copy_buffer",
     GpuSpan = "std::gpu::GpuSpan",
+    GpuField = "std::gpu::GpuField",
+    GpuFieldAt = "std::gpu::field_at",
     GpuSpanMut = "std::gpu::GpuSpanMut",
     BeginScreenPass = "std::gpu::begin_screen_pass",
     Present = "std::gpu::present",
@@ -323,6 +326,12 @@ lang_items! {
     Limit = "std::gpu::limit",
     Shared = "std::gpu::Shared",
     Atomics = "std::gpu::Atomics",
+    One = "std::gpu::One",
+    OneGet = "std::gpu::one_get",
+    OneSet = "std::gpu::one_set",
+    DrawArgs = "std::gpu::DrawArgs",
+    DrawIndexedArgs = "std::gpu::DrawIndexedArgs",
+    DispatchArgs = "std::gpu::DispatchArgs",
     Texels = "std::gpu::Texels",
     TexelsStore = "std::gpu::texels_store",
     Texels3d = "std::gpu::Texels3d",
