@@ -4,7 +4,7 @@
 // buffer of bools; then structs holding enums (`item`) and what a kernel reads from the CPU's
 // (`measure`). GPU memory holds a bool as a `u32`, 0 or 1, and an enum as its tag and its
 // payload's words, as the CPU does: a variant's tag is its discriminant (`Way::Hidden`'s 30), and
-// a `std::collections::Flags` is its `u32` of bits.
+// a `std::collections::Flags` is its `u32` of bits, and a `Packed` struct its word.
 
 use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch, write}
 
@@ -57,12 +57,19 @@ enum Way: Copy + Eq + GpuData + Fieldless {
     Hidden = 30,
 }
 
+/// A vertex and its corners' signs, packed into one word (§3).
+struct Cell: Packed + Copy + GpuData {
+    vertex: Bits<24>,
+    signs: Bits<8>,
+}
+
 struct Item: Copy + GpuData {
     id: u32,
     shape: Shape,
     on: bool,
     way: Way,
     seen: std::collections::Flags<Way>,
+    cell: Cell,
 }
 
 fn item(i: u32) -> Item {
@@ -79,7 +86,9 @@ fn item(i: u32) -> Item {
         _ => Way::Hidden,
     }
     let seen = std::collections::Flags::none().with(way).with(Way::Near)
-    var it = Item { id: i, shape, on: i % 3 == 0, way, seen }
+    var cell = Cell { vertex: i * 4099, signs: i % 7 }
+    cell.signs += 1
+    var it = Item { id: i, shape, on: i % 3 == 0, way, seen, cell }
     tweak(mut it)
     it
 }
@@ -110,7 +119,8 @@ fn measure(it: Item) -> u32 {
         Shape::Pair(a, b) => u32(a) ^ (b << 4),
     }
     let far: u32 = if it.seen.has(Way::Far) { 1 } else { 0 }
-    m ^ (u32(it.on) << 31) ^ (it.id << 20) ^ (u32(it.way) << 8) ^ it.seen.bits() ^ (far << 14)
+    let cell = it.cell.vertex ^ (it.cell.signs << 3) ^ u32(it.cell)
+    m ^ (u32(it.on) << 31) ^ (it.id << 20) ^ (u32(it.way) << 8) ^ it.seen.bits() ^ (far << 14) ^ cell
 }
 
 @compute(64)

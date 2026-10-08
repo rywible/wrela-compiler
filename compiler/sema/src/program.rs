@@ -37,6 +37,8 @@ pub struct Program {
     pub builtin_inherent: Vec<ImplId>,
     /// Each entry point's bound type (§12), `AdtDef::entry`'s other way.
     pub bound_types: HashMap<FnId, AdtId>,
+    /// Each `Packed` struct's fields, in its word (§3). Its one real field is the word.
+    pub packed: HashMap<AdtId, Vec<PackedField>>,
     /// The constants code names, where the name resolves: a literal one is folded before the
     /// memory IR, which so doesn't show its uses (W0008).
     pub(crate) used_consts: std::cell::RefCell<HashSet<ConstId>>,

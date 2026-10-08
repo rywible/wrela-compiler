@@ -1,0 +1,23 @@
+// rejects: mem.bindings gpu.cpu
+// GPU code can't choose between places at run time: WGSL has no pointer to keep.
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch}
+
+struct Pair: Copy + GpuData {
+    a: vec4,
+    b: vec4,
+}
+
+fn pick(p: Pair, first: bool) -> f32 {
+    borrow v = if first { p.a } else { p.b } //~ E0702
+    v.x
+}
+
+@compute(64)
+fn fill(p: Pair, out: mut Slots<f32>, id: GlobalId) {
+    out[id] = pick(p, id.x == 0)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    var out: GpuBuffer<f32> = buffer(64)
+    dispatch(fill.bind(Pair { a: vec4(1.0), b: vec4(2.0) }, mut out), over: 64)
+}

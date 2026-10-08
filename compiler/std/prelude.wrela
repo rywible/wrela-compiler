@@ -123,6 +123,20 @@ pub trait GpuData {}
 /// Generic code over one (`std::collections::Flags`) converts it as a concrete one does.
 pub trait Fieldless {}
 
+/// A struct packed into one `u32` (§3): each field a `Bits<N>`, the first in the low bits. A
+/// field reads as a `u32`, and takes one that fits its bits: one that doesn't traps on the CPU,
+/// and the GPU keeps its low bits, as its integers wrap. `u32(p)` is its word, and
+/// `T::of_bits(w)` the struct a word holds. Declared like `Copy`, and checked (E0407).
+pub trait Packed {}
+
+/// `N` bits of a `Packed` struct's word: a field's width, 1 to 32 (§3).
+pub struct Bits<const N: u32> {}
+
+/// `v`, which fits in `n` bits: a `Packed` field's value. One that doesn't traps on the CPU; the
+/// GPU keeps its low `n` bits.
+@intrinsic
+fn packed_fit(v: u32, n: u32) -> u32 {}
+
 /// Data that can be handled as raw bytes: no pointers, padding zeroed, NaNs canonical, so a
 /// value's bytes are a function of its fields (§6.10). Declared like `Copy`, and checked: every
 /// field must be `Plain`. `Vec`, `String` and `Box` aren't.

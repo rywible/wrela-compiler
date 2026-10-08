@@ -1686,6 +1686,18 @@ impl<'p> Checker<'p> {
                     TyKind::Param(_) => traits::implements_builtin(self.p, x.ty, Lang::Fieldless),
                     _ => false,
                 };
+                // A `Packed` struct converts to its word (§3).
+                if let &TyKind::Adt(a, _) = self.kind(x.ty)
+                    && self.p.packed.contains_key(&a)
+                    && matches!(t, BuiltinTy::Int(_))
+                {
+                    let u = self.p.types.u32;
+                    let word = Expr { ty: u, span, kind: ExprKind::Field(Box::new(x), 0) };
+                    if ty == u {
+                        return word;
+                    }
+                    return Expr { ty, span, kind: ExprKind::Convert(Box::new(word)) };
+                }
                 if fieldless && matches!(t, BuiltinTy::Int(_)) {
                     let u = self.p.types.u32;
                     let index = Expr { ty: u, span, kind: ExprKind::Discriminant(Box::new(x)) };
@@ -1887,6 +1899,35 @@ impl<'p> Checker<'p> {
             Assoc::Ambiguous => self.failed_call(args, span),
             Assoc::Missing if name.name == "from_u32" && self.fieldless_enum(ty).is_some() => {
                 self.enum_from_u32(ty, args, span)
+            }
+            // `T::of_bits(w)`: the `Packed` struct word `w` holds (§3).
+            Assoc::Missing
+                if name.name == "of_bits"
+                    && matches!(self.kind(ty), TyKind::Adt(a, _) if self.p.packed.contains_key(a)) =>
+            {
+                let u = self.p.types.u32;
+                let (&TyKind::Adt(a, ref targs), [arg]) = (self.kind(ty), args) else {
+                    self.err(Diagnostic::new(
+                        codes::E0301,
+                        span,
+                        format!(
+                            "`of_bits` takes one argument, a `u32`; this call has {}",
+                            args.len()
+                        ),
+                    ));
+                    return self.failed_call(args, span);
+                };
+                let targs = targs.clone();
+                let w = self.check_expect(&arg.value, u);
+                let kind = ExprKind::Adt {
+                    adt: a,
+                    args: targs,
+                    variant: None,
+                    fields: vec![w],
+                    order: vec![0],
+                    base: None,
+                };
+                Expr { ty, span, kind }
             }
             Assoc::Missing => {
                 let shown = self.display(ty);

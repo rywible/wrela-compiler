@@ -1,0 +1,30 @@
+// rejects: mem.bindings
+// A chosen projection holds the loans of every place its `if` may pick, while it lives; and an
+// `if` with a branch that makes a value, or a `match`, gives a value, not a place.
+struct Log: Clone {
+    lines: Vec<u32>,
+}
+
+struct World {
+    day: Log,
+    night: Log,
+}
+
+fn add(w: mut World, dark: bool) {
+    mut log = if dark { w.night } else { w.day }
+    w.day.lines.push(2) //~ E0506
+    log.lines.push(1)
+}
+
+fn made(w: World, dark: bool) -> u32 {
+    borrow log = if dark { w.night } else { Log { lines: Vec::new() } } //~ E0502
+    log.lines.len()
+}
+
+fn matched(w: World, k: u32) -> u32 {
+    borrow log = match k { //~ E0502
+        0 => w.night,
+        _ => w.day,
+    }
+    log.lines.len()
+}

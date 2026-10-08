@@ -1347,6 +1347,45 @@ impl<'a> Builder<'a> {
         }
     }
 
+    /// Binds projection `l` to the place `e` names, or, where `e` chooses (`if`), to the one each
+    /// branch names: a `Bind` in each.
+    fn bind_chosen(&mut self, l: Local, e: &thir::Expr, mutable: bool) {
+        match &e.kind {
+            ExprKind::If { cond, then, else_: Some(else_) } => {
+                let Some(c) = self.value(cond, Want::Read) else { return };
+                self.diamond(
+                    c,
+                    e.span,
+                    |this| this.bind_chosen_block(l, then, mutable),
+                    |this| this.bind_chosen(l, else_, mutable),
+                );
+            }
+            ExprKind::Block(b) => self.bind_chosen_block(l, b, mutable),
+            ExprKind::MutArg(x) => self.bind_chosen(l, x, mutable),
+            _ => {
+                let Some(p) = self.place(e) else { return };
+                self.check_indices(&p, e.span);
+                self.push(StatementKind::Bind { local: l, place: p, mutable }, e.span);
+            }
+        }
+    }
+
+    /// [`Self::bind_chosen`] to the place block `b` ends in, after its statements.
+    fn bind_chosen_block(&mut self, l: Local, b: &thir::Block, mutable: bool) {
+        self.open_scope(ScopeKind::Block);
+        let mut declared = Vec::new();
+        for s in &b.stmts {
+            self.stmt(s, &mut declared);
+        }
+        if let Some(t) = &b.tail {
+            self.bind_chosen(l, t, mutable);
+        }
+        self.close_scope();
+        for d in declared.into_iter().rev() {
+            self.push(StatementKind::Dead(d), b.span);
+        }
+    }
+
     fn if_(
         &mut self,
         cond: &thir::Expr,
@@ -1864,6 +1903,11 @@ impl<'a> Builder<'a> {
             return;
         }
         match kind {
+            // `borrow x = if c { a } else { b }`: the place each branch names (§6.3).
+            LocalKind::User(thir::LocalKind::Projection { mutable }) if init.chooses_places() => {
+                self.push(StatementKind::Live(l), span);
+                self.bind_chosen(l, init, mutable);
+            }
             LocalKind::User(thir::LocalKind::Projection { mutable }) => {
                 let inner = match &init.kind {
                     ExprKind::MutArg(x) => x.as_ref(),

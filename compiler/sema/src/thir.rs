@@ -400,6 +400,43 @@ impl Expr {
         }
     }
 
+    /// Whether this chooses between places (§6.3: `borrow x = if c { a } else { b }`): an `if`
+    /// with an `else` each of whose branches ends in a place, or chooses again.
+    pub fn chooses_places(&self) -> bool {
+        fn ends_in_place(e: &Expr) -> bool {
+            match &e.kind {
+                ExprKind::Block(b) => b.tail.as_deref().is_some_and(ends_in_place),
+                ExprKind::If { .. } => e.chooses_places(),
+                ExprKind::MutArg(x) => x.is_place(),
+                _ => e.is_place(),
+            }
+        }
+        match &self.kind {
+            ExprKind::If { then, else_: Some(else_), .. } => {
+                then.tail.as_deref().is_some_and(ends_in_place) && ends_in_place(else_)
+            }
+            _ => false,
+        }
+    }
+
+    /// The places this chooses between (`chooses_places`): each branch's.
+    pub fn chosen_places(&self) -> Vec<&Expr> {
+        let mut out = Vec::new();
+        fn walk<'e>(e: &'e Expr, out: &mut Vec<&'e Expr>) {
+            match &e.kind {
+                ExprKind::Block(b) => b.tail.iter().for_each(|t| walk(t, out)),
+                ExprKind::If { then, else_, .. } => {
+                    then.tail.iter().for_each(|t| walk(t, out));
+                    else_.iter().for_each(|x| walk(x, out));
+                }
+                ExprKind::MutArg(x) => out.push(x),
+                _ => out.push(e),
+            }
+        }
+        walk(self, &mut out);
+        out
+    }
+
     /// What a place expression is a part of: this expression without its fields, components
     /// and elements.
     pub fn place_root(&self) -> &Expr {

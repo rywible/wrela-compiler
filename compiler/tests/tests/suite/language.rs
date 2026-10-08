@@ -75,6 +75,11 @@ const CONTEXTS: &[Context] = &[
     Context { first: "use std::derive::Box3", ..NONE },
     Context { first: "pub struct Game {", ..NONE },
     Context { first: "pub enum Edit: Copy {", ..NONE },
+    Context {
+        first: "struct Cell: Packed + Copy + GpuData {",
+        params: "vi: u32, signs: u32",
+        ..NONE
+    },
     Context { first: "@fieldwise", items: "use std::hash::{Hasher, canonical_bits}", ..NONE },
     Context {
         first: "const HIDE_DENSITY = 1050 * kg/m**3                       // 1050.0, in kg/m³ (§5)",

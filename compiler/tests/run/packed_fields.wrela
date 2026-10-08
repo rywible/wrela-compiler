@@ -1,0 +1,40 @@
+// run: a `Packed` struct's fields are bits of one `u32`, the first in the low bits: each reads
+// as a `u32`, and is written, added to or given in a literal; `u32(p)` is the word and
+// `T::of_bits(w)` the struct a word holds; a value past a field's bits panics on the CPU
+// expect: word(5, 3) = 50331653
+// expect: read(50331653) = (5, 3)
+// expect: bumped(5, 3) = (6, 3, 50331654)
+// expect: set(255) = 4278190085
+// expect: set(256) panics "a value past its packed field's bits"
+// expect: based(9) = (9, 3)
+struct Cell: Packed + Copy + Eq {
+    vertex: Bits<24>,
+    signs: Bits<8>,
+}
+
+pub fn word(vertex: u32, signs: u32) -> u32 {
+    u32(Cell { vertex, signs })
+}
+
+pub fn read(w: u32) -> (u32, u32) {
+    let c = Cell::of_bits(w)
+    (c.vertex, c.signs)
+}
+
+pub fn bumped(vertex: u32, signs: u32) -> (u32, u32, u32) {
+    var c = Cell { vertex, signs }
+    c.vertex += 1
+    (c.vertex, c.signs, u32(c))
+}
+
+pub fn set(signs: u32) -> u32 {
+    var c = Cell { vertex: 5, signs: 3 }
+    c.signs = signs
+    u32(c)
+}
+
+pub fn based(vertex: u32) -> (u32, u32) {
+    let a = Cell { vertex: 5, signs: 3 }
+    let b = Cell { vertex, ..a }
+    (b.vertex, b.signs)
+}

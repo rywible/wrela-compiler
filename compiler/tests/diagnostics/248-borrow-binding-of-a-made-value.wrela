@@ -1,4 +1,4 @@
-// mistake: a `borrow` binding that picks one of two places with `if`
+// mistake: a `borrow` binding whose `if` makes a value in one branch, not a place
 // expect: E0502
 // fix: no
 struct Log: Clone {
@@ -11,6 +11,6 @@ struct World {
 }
 
 fn count(w: World, dark: bool) -> u32 {
-    borrow log = if dark { w.night } else { w.day }
+    borrow log = if dark { w.night } else { Log { lines: Vec::new() } }
     log.lines.len()
 }

@@ -1,0 +1,64 @@
+// run: `borrow x = if c { a } else { b }` projects the place the `if` picks, without copying
+// it; `mut` writes through to it; an `else if` chain picks among more
+// expect: lines(1) = 3
+// expect: lines(0) = 1
+// expect: bump(1) = (11, 20)
+// expect: bump(0) = (10, 21)
+// expect: among(0) = 10
+// expect: among(1) = 20
+// expect: among(2) = 30
+// expect: element(3) = 7
+// expect: element(1) = 2
+struct Log: Clone {
+    lines: Vec<u32>,
+}
+
+struct Pair: Copy {
+    v: u32,
+}
+
+fn log(n: u32) -> Log {
+    var lines: Vec<u32> = Vec::new()
+    for i in 0..n {
+        lines.push(i)
+    }
+    Log { lines }
+}
+
+/// The night's lines, or the day's: a `Log` isn't `Copy`, so the binding projects it.
+pub fn lines(dark: bool) -> u32 {
+    let night = log(3)
+    let day = log(1)
+    borrow l = if dark { night } else { day }
+    l.lines.len()
+}
+
+/// One of two counters, through a `mut` binding.
+pub fn bump(first: bool) -> (u32, u32) {
+    var a = Pair { v: 10 }
+    var b = Pair { v: 20 }
+    mut p = if first { a } else { b }
+    p.v += 1
+    (a.v, b.v)
+}
+
+/// The `k`th of three, through `else if`.
+pub fn among(k: u32) -> u32 {
+    let (a, b, c) = (Pair { v: 10 }, Pair { v: 20 }, Pair { v: 30 })
+    borrow p = if k == 0 {
+        a
+    } else if k == 1 {
+        b
+    } else {
+        c
+    }
+    p.v
+}
+
+/// An element of one array, or another's first.
+pub fn element(i: u32) -> u32 {
+    let xs = [1, 2, 5, 7]
+    let ys = [2, 9]
+    borrow x = if i > 1 { xs[i] } else { ys[0] }
+    x
+}

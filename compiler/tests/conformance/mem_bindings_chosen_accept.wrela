@@ -1,0 +1,22 @@
+// accepts: mem.bindings
+// A `borrow` or `mut` binding whose `if` names a place in each branch projects the place it
+// picks; the binding holds both loans while it lives, and a place used after it's done is free.
+struct Log: Clone {
+    lines: Vec<u32>,
+}
+
+struct World {
+    day: Log,
+    night: Log,
+}
+
+fn count(w: World, dark: bool) -> u32 {
+    borrow log = if dark { w.night } else { w.day }
+    log.lines.len()
+}
+
+fn add(w: mut World, dark: bool) {
+    mut log = if dark { w.night } else { w.day }
+    log.lines.push(1)
+    w.day.lines.push(2)
+}

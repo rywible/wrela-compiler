@@ -508,16 +508,17 @@ impl<'p> Checker<'p> {
                     self.infer.resolve(&self.p.types, ty),
                     Lang::Copy,
                 );
-                if chooses && !copy && !self.has_error(ty) {
+                // An `if` whose branches name places binds the place it picks (§6.3).
+                if chooses && !copy && !self.has_error(ty) && !checked.chooses_places() {
                     let kw = if *kind == ast::VarKind::Mut { "mut" } else { "borrow" };
                     self.err(
                         Diagnostic::new(
                             codes::E0502,
                             init.span,
-                            format!("a `{kw}` binding names one place, and this chooses between places"),
+                            format!("a `{kw}` binding names one place, and this chooses between values"),
                         )
-                        .with_note("an `if` or a `match` gives a value, which would move out of the place it picks")
-                        .with_help(format!("choose in a function that returns `-> {kw} T`, whose `if` picks the place it returns, and bind its result: `{kw} x = pick(...)`")),
+                        .with_note("an `if` whose branches each name a place picks one; this `match`, or a branch that makes a value, gives a value, which would move out of the place it picks")
+                        .with_help(format!("choose with `if c {{ a }} else {{ b }}`, each branch a place, or in a function that returns `-> {kw} T`: `{kw} x = pick(...)`")),
                     );
                     let err = self.p.types.error;
                     let id = self.declare_local(
@@ -537,8 +538,14 @@ impl<'p> Checker<'p> {
                 let lk = match kind {
                     ast::VarKind::Var => LocalKind::Owned { mutable: true },
                     ast::VarKind::Mut => {
-                        // Writes through it write the place it projects.
-                        self.mark_written(&init);
+                        // Writes through it write the place it projects, or each it may.
+                        if init.chooses_places() {
+                            for p in init.chosen_places() {
+                                self.mark_written(p);
+                            }
+                        } else {
+                            self.mark_written(&init);
+                        }
                         LocalKind::Projection { mutable: true }
                     }
                     ast::VarKind::Borrow => LocalKind::Projection { mutable: false },
@@ -601,6 +608,9 @@ impl<'p> Checker<'p> {
         value: &ast::Expr,
         span: Span,
     ) -> Stmt {
+        if let Some(s) = self.packed_assign(target, op, value, span) {
+            return s;
+        }
         let place = self.check_expr(target, None);
         self.check_assign_target(&place);
         self.mark_written(&place);
@@ -612,6 +622,98 @@ impl<'p> Checker<'p> {
                 let hint = self.right_hint(b, place.ty);
                 let v = self.check_expr(value, Some(hint));
                 let result = self.binary_result(b, place.ty, v.ty, span);
+                if let Some(r) = result {
+                    self.expect(r, place.ty, span);
+                }
+                v
+            }
+        };
+        Stmt { kind: StmtKind::Assign { place, op: bin, value }, span }
+    }
+
+    /// `p.f = v` or `p.f op= v` for a `Packed` struct's field `f` (§3): the word, projected
+    /// once, with `f`'s bits replaced. `None` if `target` isn't one.
+    fn packed_assign(
+        &mut self,
+        target: &ast::Expr,
+        op: ast::AssignOp,
+        value: &ast::Expr,
+        span: Span,
+    ) -> Option<Stmt> {
+        let ast::ExprKind::Field { base, name: ast::FieldName::Ident(n) } = &target.kind else {
+            return None;
+        };
+        // Only a `Packed` struct's: a quiet look at the base's type first.
+        let b = self.check_expr(base, None);
+        let bt = self.infer.resolve(&self.p.types, b.ty);
+        let &TyKind::Adt(a, _) = self.kind(bt) else {
+            return Some(self.assign_checked_base(b, n, op, value, span));
+        };
+        if !self.p.packed.contains_key(&a) {
+            return Some(self.assign_checked_base(b, n, op, value, span));
+        }
+        let f = self.packed_field(a, n)?;
+        self.check_assign_target(&b);
+        self.mark_written(&b);
+        let u = self.p.types.u32;
+        // The base, projected once: `mut p = base`.
+        let at = b.span;
+        let l = self.declare_unnamed(bt, LocalKind::Projection { mutable: true }, at);
+        let pat = Pat { ty: bt, kind: PatKind::Bind(l), span: at };
+        let bind = Stmt { kind: StmtKind::Bind { pat, init: b, else_: None }, span: at };
+        let p = || Expr { ty: bt, span: at, kind: ExprKind::Local(l) };
+        let v = match op.binop() {
+            None => self.check_expect(value, u),
+            Some(bin) => {
+                let v = self.check_expect(value, u);
+                let old = self.packed_read(p(), &f, span);
+                Expr { ty: u, span, kind: ExprKind::Binary(bin, Box::new(old), Box::new(v)) }
+            }
+        };
+        let bits = self.packed_bits(v, f.width, f.shift, span);
+        let cleared = !((((1u64 << f.width) - 1) << f.shift) & 0xffff_ffff) & 0xffff_ffff;
+        let word = || Expr { ty: u, span: at, kind: ExprKind::Field(Box::new(p()), 0) };
+        let k = Expr { ty: u, span, kind: ExprKind::Lit(Lit::Int(i128::from(cleared))) };
+        let kept = Expr {
+            ty: u,
+            span,
+            kind: ExprKind::Binary(ast::BinOp::BitAnd, Box::new(word()), Box::new(k)),
+        };
+        let new = Expr {
+            ty: u,
+            span,
+            kind: ExprKind::Binary(ast::BinOp::BitOr, Box::new(kept), Box::new(bits)),
+        };
+        let assign = Stmt { kind: StmtKind::Assign { place: word(), op: None, value: new }, span };
+        let unit = self.p.types.unit;
+        let block = Block { stmts: vec![bind, assign], tail: None, ty: unit, span };
+        Some(Stmt {
+            kind: StmtKind::Expr(Expr { ty: unit, span, kind: ExprKind::Block(block) }),
+            span,
+        })
+    }
+
+    /// An assignment to field `n` of `b`, whose base is checked already: as `check_assign`
+    /// does, for a base that isn't a `Packed` struct.
+    fn assign_checked_base(
+        &mut self,
+        b: Expr,
+        n: &ast::Ident,
+        op: ast::AssignOp,
+        value: &ast::Expr,
+        span: Span,
+    ) -> Stmt {
+        let fname = ast::FieldName::Ident(n.clone());
+        let place = self.field_of_checked(b, &fname, span);
+        self.check_assign_target(&place);
+        self.mark_written(&place);
+        let bin = op.binop();
+        let value = match bin {
+            None => self.check_expect(value, place.ty),
+            Some(bop) => {
+                let hint = self.right_hint(bop, place.ty);
+                let v = self.check_expr(value, Some(hint));
+                let result = self.binary_result(bop, place.ty, v.ty, span);
                 if let Some(r) = result {
                     self.expect(r, place.ty, span);
                 }

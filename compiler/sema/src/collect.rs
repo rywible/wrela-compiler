@@ -119,6 +119,7 @@ pub fn collect(
     c.resolve_imports();
     c.find_lang_items();
     c.resolve_signatures();
+    c.make_packed();
     c.make_bound_types();
     c.index_impls();
     c.check_recursive_types();
@@ -1186,6 +1187,89 @@ impl<'d, 'u> Collector<'d, 'u> {
     }
 
     // ---- signatures ------------------------------------------------------------------------
+
+    /// Each `Packed` struct (§3): its fields, each a `Bits<N>`, become bits of its one real
+    /// field, a `u32` word, the first in the low bits. E0407 for a field of another type, a
+    /// width outside 1 to 32, bits past 32 in all, a default, or an enum.
+    fn make_packed(&mut self) {
+        let Some(packed) = self.p.lang_trait(Lang::Packed) else { return };
+        let bits = self.p.lang_adt(Lang::Bits);
+        for i in 0..self.p.adts.len() {
+            let a = AdtId(i as u32);
+            let adt = &self.p.adts[i];
+            let Some((_, at)) = adt.opt_in.iter().find(|(r, _)| r.trait_ == packed) else {
+                continue;
+            };
+            let at = *at;
+            let name = adt.name.clone();
+            let mut problems = Vec::new();
+            let mut out = Vec::new();
+            let mut shift = 0u32;
+            if adt.is_enum() {
+                problems.push((at, format!("`{name}` can't be `Packed`: it's an enum")));
+            }
+            for f in adt.fields() {
+                let width = match self.p.types.kind(f.ty) {
+                    TyKind::Adt(b, args) if Some(*b) == bits => {
+                        match args.first().map(|&t| self.p.types.kind(t)) {
+                            Some(&TyKind::ConstU32(n)) => Some(n),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+                match width {
+                    Some(n) if (1..=32).contains(&n) => {
+                        if f.default.is_some() {
+                            problems.push((
+                                f.span,
+                                format!("`{}` is packed, so it has no default", f.name),
+                            ));
+                        }
+                        if shift + n > 32 {
+                            problems.push((f.span, format!("`{}`'s {n} bits are past the word's 32: the fields before it take {shift}", f.name)));
+                        }
+                        out.push(PackedField {
+                            name: f.name.clone(),
+                            shift,
+                            width: n,
+                            public: f.public,
+                            span: f.span,
+                        });
+                        shift += n;
+                    }
+                    Some(n) => problems.push((
+                        f.span,
+                        format!("`{}` is {n} bits wide; a packed field is 1 to 32", f.name),
+                    )),
+                    None => {
+                        let shown = self.p.display_ty(f.ty);
+                        problems.push((f.span, format!("`{name}` can't be `Packed`: the field `{}` is a `{shown}`, not a `Bits<N>`", f.name)));
+                    }
+                }
+            }
+            for (span, msg) in problems.iter().cloned() {
+                self.diags.push(
+                    Diagnostic::new(codes::E0407, span, msg)
+                        .with_note("a `Packed` struct's fields are `Bits<N>`, packed into one `u32`, the first in the low bits (§3)"),
+                );
+            }
+            if !problems.is_empty() {
+                continue;
+            }
+            let word = FieldDef {
+                name: "bits".into(),
+                ty: self.p.types.u32,
+                public: false,
+                package_only: false,
+                default: None,
+                span: at,
+                mode: RetMode::Owned,
+            };
+            self.p.adts[i].kind = AdtKind::Struct(vec![word]);
+            self.p.packed.insert(a, out);
+        }
+    }
 
     /// Each entry point's bound type (§12): the borrow struct of its arguments that
     /// `name.bind(...)` makes, generic over the entry point's generics.
@@ -3040,6 +3124,10 @@ fn check_structural_opt_in(p: &Program, diags: &mut Vec<Diagnostic>, imp: &ImplD
     let lang = tr.lang;
     // A `Clone` std's core writes by hand checks the fields itself.
     if lang == Some(Lang::Clone) && crate::traits::explicit_clone(p, a).is_some() {
+        return;
+    }
+    // `Packed` is checked where its fields become its word's bits (`make_packed`).
+    if lang == Some(Lang::Packed) {
         return;
     }
     // `Fieldless` is an enum's whose variants hold nothing (§3).

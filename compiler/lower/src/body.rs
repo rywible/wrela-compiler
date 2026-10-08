@@ -42,6 +42,9 @@ pub(crate) enum Repr {
     /// In GPU code, a group (a borrow struct, §12): each field's representation. It has no
     /// runtime value: its resources are the module's, and its values are where its fields are.
     Group(Vec<Repr>),
+    /// A projection chosen at run time (`borrow x = if c { a } else { b }`, §6.3): an IR local
+    /// holding a pointer (of the IR type given) to the place each branch bound.
+    Chosen(ir::LocalId, ir::TypeId),
     /// No runtime value.
     Erased,
 }
@@ -76,6 +79,22 @@ pub(crate) struct Fl<'c, 'a> {
     matched: HashMap<BlockId, ir::LocalId>,
     /// Each `Match` block whose last arm can fail: the block after it (no arm matched).
     unmatched: HashMap<BlockId, BlockId>,
+    /// The projections bound in more than one place: in each branch of an `if` (§6.3).
+    rebound: std::collections::HashSet<Local>,
+}
+
+/// The projections `code` binds in more than one place: in each branch of an `if` (§6.3).
+fn rebound(code: &mir::FnBody) -> std::collections::HashSet<Local> {
+    let mut seen = std::collections::HashSet::new();
+    let mut twice = std::collections::HashSet::new();
+    for s in code.blocks.iter().flat_map(|b| &b.stmts) {
+        if let StatementKind::Bind { local, .. } = &s.kind
+            && !seen.insert(*local)
+        {
+            twice.insert(*local);
+        }
+    }
+    twice
 }
 
 /// A block being emitted.
@@ -152,6 +171,7 @@ pub(crate) fn lower_body(cx: &mut Cx, mb: &mut ModuleBuilder, key: &InstanceKey,
         preds: reachable_preds(code),
         matched: HashMap::new(),
         unmatched: HashMap::new(),
+        rebound: rebound(code),
     };
     fl.unmatched = unmatched(code, &fl.preds);
     // The constants this code names: places that live as long as the program (§10).
@@ -669,6 +689,9 @@ impl<'c, 'a> Fl<'c, 'a> {
             StatementKind::Eval(r) => {
                 let _ = self.rvalue(r, None, s.span);
             }
+            StatementKind::Bind { local, place, .. } if self.rebound.contains(local) => {
+                self.bind_chosen(*local, place, s.span);
+            }
             StatementKind::Bind { local, place, .. } => {
                 let repr = match self.callable_of(place) {
                     Some(r) => r,
@@ -727,9 +750,10 @@ impl<'c, 'a> Fl<'c, 'a> {
                 return;
             }
             let kind = self.mir.local(l).kind;
-            let through_alias =
-                matches!(self.locals[l.index()], Repr::Place(_) | Repr::Swizzle(..))
-                    && !matches!(r, Rvalue::Call(c) if c.ret_mode != RetMode::Owned);
+            let through_alias = matches!(
+                self.locals[l.index()],
+                Repr::Place(_) | Repr::Swizzle(..) | Repr::Chosen(..)
+            ) && !matches!(r, Rvalue::Call(c) if c.ret_mode != RetMode::Owned);
             if !through_alias {
                 let ty = self.local_ty(l);
                 let v = self.rvalue(r, Some(ty), span);
@@ -968,7 +992,8 @@ impl<'c, 'a> Fl<'c, 'a> {
                 out.push(CaptureSrc { place: ir::Place::local(copy), by_ref });
                 continue;
             }
-            let place = match self.locals[l.index()].clone() {
+            let r = self.locals[l.index()].clone();
+            let place = match self.resolved(r) {
                 Repr::Var(v) => ir::Place::local(v),
                 Repr::Place(p) => p,
                 Repr::Value(v) => self.spill(l, v),
@@ -1026,7 +1051,14 @@ impl<'c, 'a> Fl<'c, 'a> {
             }
             Repr::Value(v) if skip == 0 => self.spill(p.local, v),
             Repr::Value(v) => ir::Place::local(self.local_of("field", v)),
-            Repr::Unbound | Repr::Callable(..) | Repr::Group(_) | Repr::Erased => return None,
+            // `base_of` reads a chosen projection's pointer.
+            Repr::Unbound
+            | Repr::Callable(..)
+            | Repr::Group(_)
+            | Repr::Erased
+            | Repr::Chosen(..) => {
+                return None;
+            }
         };
         let mut variant: Option<u32> = None;
         for proj in &p.proj[skip..] {
@@ -1131,7 +1163,8 @@ impl<'c, 'a> Fl<'c, 'a> {
     /// Where place `p` starts: its local's representation or, through a group's fields (§12),
     /// the field's; with that start's type, and how many of `p`'s projections it took.
     fn base_of(&mut self, p: &mir::Place) -> (Repr, TyId, usize) {
-        let mut r = self.locals[p.local.index()].clone();
+        let r = self.locals[p.local.index()].clone();
+        let mut r = self.resolved(r);
         let mut ty = self.concrete(self.local_ty(p.local));
         let mut n = 0;
         while let Repr::Group(fields) = &r
@@ -1154,8 +1187,52 @@ impl<'c, 'a> Fl<'c, 'a> {
         }
     }
 
+    /// `r`, with a chosen projection's pointer read: the place it points at.
+    fn resolved(&mut self, r: Repr) -> Repr {
+        match r {
+            Repr::Chosen(var, pt) => {
+                let v = self.load(ir::Place::local(var), pt);
+                Repr::Place(ir::Place { root: ir::PlaceRoot::Ptr(v), path: Vec::new() })
+            }
+            r => r,
+        }
+    }
+
+    /// A projection bound in each branch of an `if` (§6.3): its IR local holds a pointer to the
+    /// place this branch binds, which its uses read through. GPU code has no pointers to choose
+    /// between (E0702), nor do vector components.
+    fn bind_chosen(&mut self, l: Local, place: &mir::Place, span: Span) {
+        let parts = if self.is_gpu() { None } else { self.place_parts(place) };
+        let Some((p, _, None)) = parts else {
+            if !matches!(self.locals[l.index()], Repr::Erased) {
+                let why = if self.is_gpu() {
+                    "GPU code can't choose between places at run time: WGSL has no pointer to keep"
+                } else {
+                    "a projection of vector components can't be chosen at run time"
+                };
+                self.cx.err(
+                    Diagnostic::new(codes::E0702, span, why)
+                        .with_help("choose the value instead: `let x = if c { a } else { b }`"),
+                );
+            }
+            self.locals[l.index()] = Repr::Erased;
+            return;
+        };
+        let t = self.concrete(self.local_ty(l));
+        let Some(it) = self.cx.lower_ty(self.mb, t, span) else { return };
+        let pt = self.mb.m.types.intern(ir::TypeDef::Ptr(it));
+        let var = match self.locals[l.index()] {
+            Repr::Chosen(v, _) => v,
+            _ => self.new_local("chosen", pt),
+        };
+        let a = self.value(pt, ir::Expr::Addr(p));
+        self.emit(ir::Stmt::Store(ir::Place::local(var), a));
+        self.locals[l.index()] = Repr::Chosen(var, pt);
+    }
+
     /// The value a representation holds, of IR type `t`.
     fn repr_read(&mut self, r: &Repr, t: ir::TypeId) -> Option<ir::ValueId> {
+        let r = &self.resolved(r.clone());
         match r {
             Repr::Value(v) => Some(*v),
             Repr::Var(l) => Some(self.load(ir::Place::local(*l), t)),
@@ -1299,7 +1376,9 @@ impl<'c, 'a> Fl<'c, 'a> {
     fn local_value(&mut self, l: Local) -> Option<ir::ValueId> {
         match self.locals[l.index()].clone() {
             Repr::Value(v) => Some(v),
-            Repr::Var(_) | Repr::Place(_) | Repr::Swizzle(..) => self.read(&mir::Place::local(l)),
+            Repr::Var(_) | Repr::Place(_) | Repr::Swizzle(..) | Repr::Chosen(..) => {
+                self.read(&mir::Place::local(l))
+            }
             _ => None,
         }
     }

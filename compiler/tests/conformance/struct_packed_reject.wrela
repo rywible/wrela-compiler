@@ -1,0 +1,36 @@
+// rejects: struct.packed
+// A `Packed` struct's fields are `Bits<N>`, 1 to 32 bits each and at most 32 in all, with no
+// defaults; a literal gives each, once; and only its fields are named.
+struct NotBits: Packed {
+    x: u32, //~ E0407
+}
+
+struct Empty: Packed {
+    x: Bits<0>, //~ E0407
+}
+
+struct TooMany: Packed {
+    x: Bits<20>,
+    y: Bits<20>, //~ E0407
+}
+
+struct Defaulted: Packed {
+    x: Bits<4> = Bits {}, //~ E0407
+}
+
+enum Packing: Packed { //~ E0407
+    A,
+}
+
+struct Cell: Packed + Copy {
+    vertex: Bits<24>,
+    signs: Bits<8>,
+}
+
+fn uses() -> u32 {
+    let a = Cell { vertex: 1 } //~ E0307
+    let b = Cell { vertex: 1, signs: 2, vertex: 3 } //~ E0308
+    b.bits //~ E0206
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

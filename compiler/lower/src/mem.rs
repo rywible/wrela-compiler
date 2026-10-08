@@ -388,6 +388,7 @@ impl Fl<'_, '_> {
                     | L::Replace
                     | L::DebugBuild
                     | L::TestBuild
+                    | L::PackedFit
             );
         if !known {
             return None;
@@ -498,6 +499,25 @@ impl Fl<'_, '_> {
             }
             Lang::DebugBuild => Some(self.konst(ir::Const::Bool(self.cx.data.debug))),
             Lang::TestBuild => Some(self.konst(ir::Const::Bool(self.cx.data.testing))),
+            // `v` in `n` bits (1 to 31) of a `Packed` field (§3): past them, a panic on the CPU;
+            // the GPU keeps the low bits, as its integers wrap.
+            Lang::PackedFit => {
+                let v = arg(self, 0)?;
+                let n = arg(self, 1)?;
+                if self.is_gpu() {
+                    let one = self.u32c(1);
+                    let top = self.value(u, ir::Expr::Binary(ir::BinOp::Shl, one, n));
+                    let mask = self.value(u, ir::Expr::Binary(ir::BinOp::WrappingSub, top, one));
+                    Some(self.value(u, ir::Expr::Binary(ir::BinOp::BitAnd, v, mask)))
+                } else {
+                    let over = self.value(u, ir::Expr::Binary(ir::BinOp::Shr, v, n));
+                    let zero = self.u32c(0);
+                    let b = self.mb.m.types.bool();
+                    let big = self.value(b, ir::Expr::Binary(ir::BinOp::Ne, over, zero));
+                    self.panic_if(big, "a value past its packed field's bits");
+                    Some(v)
+                }
+            }
             Lang::MemAbort => {
                 // A trap that keeps the panic message a worker left.
                 self.emit(ir::Stmt::Trap);

@@ -165,6 +165,18 @@ fn reach(e: Edit) -> f32 {
 let e = Edit::Dig { at: vec3(), radius: 1.5 }
 ```
 
+**A `Packed` struct is bits of one `u32`** (M5, `struct.packed`): each field is a `Bits<N>`, `N` of the word's bits (1 to 32, the first field in the low bits, at most 32 in all; E0407 for another field, a default, or an enum). A field reads as a `u32` (`cell.vertex`), and is written, added to (`cell.signs += 1`) and given in a literal (`Cell { vertex: v, signs: s }`, `..base` too) as one. A value past its field's bits panics on the CPU, and the GPU keeps its low bits, as its integers wrap. `u32(p)` is the word and `T::of_bits(w)` the struct a word holds, which crosses to the GPU and to a host as a `u32` does. A field isn't a place of its own: it can't be lent `mut` or projected (`run/packed_fields`; `gpu-data`, where the GPU packs and reads them as the CPU does).
+
+```wrela
+struct Cell: Packed + Copy + GpuData {
+    vertex: Bits<24>,
+    signs: Bits<8>,
+}
+
+let c = Cell { vertex: vi, signs }
+let word = u32(c)                     // the vertex in bits 0 to 23, the signs in 24 to 31
+```
+
 **An enum whose variants hold nothing has discriminants** (M5, `enum.discriminants`): each variant's tag, on the CPU and the GPU, and its number. A variant's is written (`Hidden = 99`) or one past the variant's before it, the first's 0; each is a `u32`, past the one before it, so the variants are ordered as they're declared (E0334, as is a discriminant in an enum with a variant that holds fields). `u32(e)` gives it, and `E::from_u32(n)` reads it back: `Some` of the variant whose it is, or `None`. An enum that declares `Fieldless` (declared like `Copy`, and checked: E0407 on a struct, or for a variant with fields) converts in generic code too, so `std::collections::Flags<E>` holds a set of its variants as one `u32`, bit `u32(e)` for `e` (`has`, `with`, `without`, `toggled`, `changed`; `bits()` and `of_bits` cross to a host or the GPU), for an enum whose discriminants are below 32. An export takes such an enum as its number, and a number no variant has traps (§12's exports, `run/enum_discriminants`).
 
 ### Traits and impls
@@ -363,6 +375,7 @@ Bindings use the vocabulary of parameters (§6.2): a binding either owns its val
 - **`let` and `var` own.** Their value is a temporary, `take place`, `place.clone()`, or a place whose type is `Copy`, which is copied.
 - **`let x = place` is an error when the type isn't `Copy`,** and the diagnostic offers three fixes: `borrow x = place` to read it in place, `let x = place.clone()` for a copy, or `let x = take place` to move it. So adding `Copy` to a type never changes what a binding borrows.
 - **Names bound inside a pattern or a loop project the matched place,** read-only: `match e { Some(log) => … }`, `for g in world.grazers`. `match mut place { … }` (`mem.match-mut`) and `for mut g in world.grazers` make them mutable projections, so a payload can change in place: `match mut slot { Some(s) => s.count += 1, None => {} }`. Matching a temporary owns. A loop borrows its container for the whole loop, so there a copy and a projection can't be told apart.
+- **A projection can choose its place** (M5): `borrow log = if dark { w.night } else { w.day }` projects the place the `if` picks, and `mut` writes through to it; each branch, `else if` too, names a place. The binding holds the loans of every place it may pick while it lives (E0506 for a use of one meanwhile). A branch that makes a value, or a `match`, gives a value: E0502, unless the type is `Copy`, which copies it. GPU code can't choose a place at run time (E0702): WGSL has no pointer to keep (`run/borrow_chosen`).
 - **Closures capture by projection or by value** (§6.7).
 
 ```wrela
@@ -1003,7 +1016,7 @@ The sim/presentation split is an engine pattern built on this, not a language fe
 
 - **The compiler knows three things** (D-050): the language, a closed list of stdlib items, and the execution targets.
 - **The closed list** (D-081) is every std item the compiler knows by its path, and nothing else: the traits it derives or checks by structure, the types its code has a shape for, the GPU, IO and memory operations it lowers itself (`@intrinsic` in std), and the transcendentals it compiles from std's code. A program can't add to it. `Plain`, `StateHash`, `Serialize`, `Blend`, `Surface` and `Lipschitz` aren't on it: they're ordinary std traits, `@fieldwise` or written by hand (`closed_list.rs` checks this list against the compiler's):
-  - `std::prelude`: `Option`, `Result`, `Copy`, `Clone`, `GpuData`, `Fieldless`
+  - `std::prelude`: `Option`, `Result`, `Copy`, `Clone`, `GpuData`, `Fieldless`, `Packed`, `Bits`, `packed_fit`
   - `std::gpu`: `GpuBuffer`, `Slots`, `GlobalId`, `LocalId`, `WorkgroupId`, `VertexIndex`, `InstanceIndex`, `FragCoord`, `ClipPosition`, `Flat`, `Over`, `WithDepth`, `Cull`, `DepthBias`, `Depth`, `dispatch`, `draw`, `buffer`, `write_buffer`, `destroy_buffer`, `copy_buffer`, `GpuSpan`, `GpuSpanMut`, `GpuField`, `field_at`, `begin_screen_pass`, `present`, `Texture`, `DepthTexture`, `Sampler`, `ComparisonSampler`, `create_texture`, `write_texture_rows`, `destroy_texture`, `create_sampler`, `destroy_sampler`, `begin_pass_command`, `end_pass_command`, `label_command`, `texture_sample`, `texture_sample_level`, `texture_sample_compare`, `texture_sample_compare_level`, `texture_load`, `depth_load`, `Texture3d`, `Rgba8`, `Rgba16Float`, `R16Float`, `Rg16Float`, `R32Float`, `R32Uint`, `create_texture_3d`, `texture3d_sample_level`, `texture3d_load`, `texture_width`, `texture_height`, `texture_depth`, `span_len`, `read_buffer_command`, `limit`, `Shared`, `Atomics`, `Append`, `AtomicMap`, `AppendBuffer`, `AtomicMapBuffer`, `local_index`, `workgroup_invocations`, `shared_get`, `shared_set`, `workgroup_barrier`, `discard`, `atomic_len`, `atomic_load`, `atomic_store`, `atomic_add`, `atomic_sub`, `atomic_min`, `atomic_max`, `atomic_and`, `atomic_or`, `atomic_xor`, `atomic_exchange`, `atomic_compare_exchange`, `append_push`, `One`, `one_get`, `one_set`, `DrawArgs`, `DrawIndexedArgs`, `DispatchArgs`, `Texels`, `texels_store`, `Texels3d`, `texels3d_store`, `Kernel`, `VertexShader`, `FragmentShader`
   - `std::io`: `next_request`, `request_status`, `storage_read_command`, `storage_write_command`, `fetch_command`, `print_command`, `post_command`
   - `std::mem`: `take_answer`, `take_input`, `keep_bytes`, `kept_bytes`, `Drop`, `size_of`, `align_of`, `needs_drop`, `read`, `zeroed`, `write`, `drop_at`, `at`, `at_mut`, `at_mut_pair`, `heap_base`, `memory_pages`, `memory_grow`, `load_u32`, `store_u32`, `load_u8`, `store_u8`, `copy`, `fill`, `compare_swap`, `atomic_add`, `atomic_load`, `atomic_store`, `wait`, `notify`, `run_task`, `task`, `thread_block`, `wait_for`, `abort`, `debug_build`, `test_build`

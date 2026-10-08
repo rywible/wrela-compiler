@@ -34,6 +34,10 @@ pub const RULES: &[(&str, &str)] = &[
     ("struct.defaults", "struct fields may have constant defaults a literal may omit"),
     ("struct.opt-in", "a struct opts in to Copy, Clone and GpuData in its declaration"),
     ("struct.base", "`..base` fills the remaining fields from another value"),
+    (
+        "struct.packed",
+        "a `Packed` struct's `Bits<N>` fields are bits of one `u32`, read and written as `u32`s",
+    ),
     ("enum.match", "enums with payloads, matched exhaustively"),
     (
         "enum.discriminants",

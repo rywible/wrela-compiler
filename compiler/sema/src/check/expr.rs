@@ -1278,6 +1278,11 @@ impl<'p> Checker<'p> {
 
     fn check_field(&mut self, base: &ast::Expr, name: &ast::FieldName, span: Span) -> Expr {
         let b = self.check_expr(base, None);
+        self.field_of_checked(b, name, span)
+    }
+
+    /// Field `name` of `b`, whose expression is checked already.
+    pub(crate) fn field_of_checked(&mut self, b: Expr, name: &ast::FieldName, span: Span) -> Expr {
         // Resolved through: a field `T::Out` normalizes only once `T` is known.
         let bt = self.infer.resolve(&self.p.types, b.ty);
         // A field of the value a `GpuField` names, where it is: a `GpuField` of the field (§12).
@@ -1287,6 +1292,15 @@ impl<'p> Checker<'p> {
         {
             let (outer, inner) = (args[0], self.infer.resolve(&self.p.types, args[1]));
             return self.gpu_field(b, outer, inner, n, span);
+        }
+        // A `Packed` struct's field: its bits of the word (§3).
+        if let (&TyKind::Adt(a, _), ast::FieldName::Ident(n)) = (self.kind(bt), name)
+            && self.p.packed.contains_key(&a)
+        {
+            return match self.packed_field(a, n) {
+                Some(f) => self.packed_read(b, &f, span),
+                None => self.error_expr(span),
+            };
         }
         match (self.kind(bt), name) {
             // Its error is reported.
@@ -1658,6 +1672,194 @@ impl<'p> Checker<'p> {
         }
     }
 
+    /// `Packed` struct `a`'s field `n` (§3), or E0206 (E0210 for a private one elsewhere).
+    pub(crate) fn packed_field(&mut self, a: AdtId, n: &ast::Ident) -> Option<PackedField> {
+        let fields = self.p.packed.get(&a)?;
+        let adt = self.p.adt(a);
+        match fields.iter().find(|f| f.name == n.name) {
+            Some(f) => {
+                if !f.public && adt.module != self.scope.module {
+                    self.err(
+                        Diagnostic::new(
+                            codes::E0210,
+                            n.span,
+                            format!("the field `{}` of `{}` is private", n.name, adt.name),
+                        )
+                        .with_secondary(f.span, "declared here without `pub`"),
+                    );
+                }
+                Some(f.clone())
+            }
+            None => {
+                let names: Vec<String> = fields.iter().map(|f| format!("`{}`", f.name)).collect();
+                self.err(
+                    Diagnostic::new(
+                        codes::E0206,
+                        n.span,
+                        format!("`{}` has no field `{}`", adt.name, n.name),
+                    )
+                    .with_note(format!("its fields: {}", names.join(", "))),
+                );
+                None
+            }
+        }
+    }
+
+    /// Field `f` of `base`, a `Packed` struct (§3): its bits of the word, as a `u32`.
+    pub(crate) fn packed_read(&self, base: Expr, f: &PackedField, span: Span) -> Expr {
+        let u = self.p.types.u32;
+        let word = Expr { ty: u, span: base.span, kind: ExprKind::Field(Box::new(base), 0) };
+        let lit = |v: u64| Expr { ty: u, span, kind: ExprKind::Lit(Lit::Int(i128::from(v))) };
+        let shifted = if f.shift == 0 {
+            word
+        } else {
+            let k = lit(u64::from(f.shift));
+            Expr {
+                ty: u,
+                span,
+                kind: ExprKind::Binary(ast::BinOp::Shr, Box::new(word), Box::new(k)),
+            }
+        };
+        if f.width == 32 {
+            return shifted;
+        }
+        let mask = lit((1u64 << f.width) - 1);
+        Expr {
+            ty: u,
+            span,
+            kind: ExprKind::Binary(ast::BinOp::BitAnd, Box::new(shifted), Box::new(mask)),
+        }
+    }
+
+    /// `v`, a `u32`, fitted to `width` bits of a `Packed` field and moved to `shift` (§3).
+    pub(crate) fn packed_bits(&self, v: Expr, width: u32, shift: u32, span: Span) -> Expr {
+        let u = self.p.types.u32;
+        let lit = |v: u64| Expr { ty: u, span, kind: ExprKind::Lit(Lit::Int(i128::from(v))) };
+        let fit = match self.p.lang_fn(Lang::PackedFit) {
+            Some(func) if width < 32 => Expr {
+                ty: u,
+                span,
+                kind: ExprKind::Call(Call {
+                    callee: Callee::Fn { func, args: Vec::new() },
+                    args: vec![v, lit(u64::from(width))],
+                    modes: vec![Mode::Borrow, Mode::Borrow],
+                    receiver: false,
+                    order: vec![0, 1],
+                    ret_mode: RetMode::Owned,
+                }),
+            },
+            _ => v,
+        };
+        if shift == 0 {
+            return fit;
+        }
+        let k = lit(u64::from(shift));
+        Expr { ty: u, span, kind: ExprKind::Binary(ast::BinOp::Shl, Box::new(fit), Box::new(k)) }
+    }
+
+    /// A `Packed` struct's literal (§3): its word, each field's bits in it, in the order written.
+    /// With `..base`, the fields not given are the base's.
+    fn packed_lit(
+        &mut self,
+        adt: AdtId,
+        args: Vec<TyId>,
+        fields: &[ast::FieldInit],
+        base: Option<&ast::Expr>,
+        span: Span,
+    ) -> Expr {
+        let u = self.p.types.u32;
+        let ty = self.p.types.adt(adt, args.clone());
+        let views = self.p.packed.get(&adt).cloned().unwrap_or_default();
+        let mut word: Option<Expr> = None;
+        let mut given = Vec::new();
+        for f in fields {
+            let Some(view) = self.packed_field(adt, &f.name) else {
+                if let Some(v) = &f.value {
+                    self.check_expr(v, None);
+                }
+                continue;
+            };
+            if given.contains(&view.name) {
+                self.err(Diagnostic::new(
+                    codes::E0308,
+                    f.name.span,
+                    format!("the field `{}` is given twice", view.name),
+                ));
+                continue;
+            }
+            given.push(view.name.clone());
+            let v = match &f.value {
+                Some(v) => self.check_expect(v, u),
+                // `S { x }`: the local of the field's name.
+                None => {
+                    let path = ast::Path {
+                        segments: vec![ast::PathSegment { ident: f.name.clone(), generics: None }],
+                        span: f.name.span,
+                    };
+                    let e = ast::Expr { kind: ast::ExprKind::Path(path), span: f.name.span };
+                    self.check_expect(&e, u)
+                }
+            };
+            let bits = self.packed_bits(v, view.width, view.shift, f.span);
+            word = Some(match word {
+                None => bits,
+                Some(w) => Expr {
+                    ty: u,
+                    span,
+                    kind: ExprKind::Binary(ast::BinOp::BitOr, Box::new(w), Box::new(bits)),
+                },
+            });
+        }
+        let lit = |v: u64| Expr { ty: u, span, kind: ExprKind::Lit(Lit::Int(i128::from(v))) };
+        let missing: Vec<&PackedField> =
+            views.iter().filter(|v| !given.contains(&v.name)).collect();
+        let word = match base {
+            Some(b) => {
+                // The base's word, with the given fields' bits cleared.
+                let b = self.check_expect(b, ty);
+                let kept: u64 = missing
+                    .iter()
+                    .map(|v| (((1u64 << v.width) - 1) << v.shift) & 0xffff_ffff)
+                    .fold(0, |a, m| a | m);
+                let bw = Expr { ty: u, span: b.span, kind: ExprKind::Field(Box::new(b), 0) };
+                let base_bits = Expr {
+                    ty: u,
+                    span,
+                    kind: ExprKind::Binary(ast::BinOp::BitAnd, Box::new(bw), Box::new(lit(kept))),
+                };
+                match word {
+                    None => base_bits,
+                    Some(w) => Expr {
+                        ty: u,
+                        span,
+                        kind: ExprKind::Binary(ast::BinOp::BitOr, Box::new(w), Box::new(base_bits)),
+                    },
+                }
+            }
+            None => {
+                if !missing.is_empty() {
+                    let names: Vec<String> =
+                        missing.iter().map(|v| format!("`{}`", v.name)).collect();
+                    self.err(Diagnostic::new(
+                        codes::E0307,
+                        span,
+                        format!("this `{}` is missing {}", self.p.adt(adt).name, names.join(", ")),
+                    ));
+                }
+                word.unwrap_or_else(|| lit(0))
+            }
+        };
+        let kind = ExprKind::Adt {
+            adt,
+            args,
+            variant: None,
+            fields: vec![word],
+            order: vec![0],
+            base: None,
+        };
+        Expr { ty, span, kind }
+    }
+
     fn check_struct_lit(
         &mut self,
         path: &ast::Path,
@@ -1718,6 +1920,9 @@ impl<'p> Checker<'p> {
             self.adt_args(adt, path, expected, span)
         };
         let ty = self.p.types.adt(adt, args.clone());
+        if self.p.packed.contains_key(&adt) {
+            return self.packed_lit(adt, args, fields, base, span);
+        }
         if self.p.is_lang_adt(adt, Lang::GlobalId) || self.p.is_lang_adt(adt, Lang::LocalId) {
             let name = &self.p.adt(adt).name;
             self.err(

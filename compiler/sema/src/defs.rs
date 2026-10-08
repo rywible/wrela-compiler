@@ -128,6 +128,17 @@ pub struct FieldDef {
     pub mode: RetMode,
 }
 
+/// A field of a `Packed` struct (§3): `width` bits of its word, from bit `shift`. Its value is a
+/// `u32`; the struct's one real field is the word.
+#[derive(Clone, Debug)]
+pub struct PackedField {
+    pub name: String,
+    pub shift: u32,
+    pub width: u32,
+    pub public: bool,
+    pub span: Span,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VariantShape {
     Unit,
@@ -256,6 +267,9 @@ lang_items! {
     Clone = "std::prelude::Clone",
     GpuData = "std::prelude::GpuData",
     Fieldless = "std::prelude::Fieldless",
+    Packed = "std::prelude::Packed",
+    Bits = "std::prelude::Bits",
+    PackedFit = "std::prelude::packed_fit",
     GpuBuffer = "std::gpu::GpuBuffer",
     Slots = "std::gpu::Slots",
     GlobalId = "std::gpu::GlobalId",
@@ -462,7 +476,7 @@ lang_items! {
 impl Lang {
     /// `Copy`, `Clone` and `GpuData`: traits a type has through its fields, by opting in.
     pub fn is_structural(self) -> bool {
-        matches!(self, Lang::Copy | Lang::Clone | Lang::GpuData | Lang::Fieldless)
+        matches!(self, Lang::Copy | Lang::Clone | Lang::GpuData | Lang::Fieldless | Lang::Packed)
     }
 }
 

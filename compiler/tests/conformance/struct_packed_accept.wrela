@@ -1,0 +1,34 @@
+// accepts: struct.packed
+// A `Packed` struct's fields are `Bits<N>`, bits of one `u32`, the first in the low bits: read
+// as `u32`s, written and added to, given in a literal (with `..base` too); `u32(p)` is the word
+// and `T::of_bits(w)` the struct a word holds. It's GPU data as a `u32` is.
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch}
+
+pub struct Cell: Packed + Copy + Eq + GpuData {
+    pub vertex: Bits<24>,
+    pub signs: Bits<8>,
+}
+
+struct Wide: Packed + Copy {
+    all: Bits<32>,
+}
+
+@compute(64)
+fn mark(cells: [Cell], out: mut Slots<u32>, id: GlobalId) {
+    var c = cells[id.x]
+    c.signs += 1
+    out[id] = c.vertex + c.signs + u32(c)
+}
+
+pub fn round(w: u32) -> u32 {
+    let c = Cell::of_bits(w)
+    let d = Cell { signs: 1, ..c }
+    let e = Wide { all: w }
+    u32(d) ^ e.all ^ if d == c { 1 } else { 0 }
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    let cells: GpuBuffer<Cell> = buffer(64)
+    var out: GpuBuffer<u32> = buffer(64)
+    dispatch(mark.bind(cells, mut out), over: 64)
+}
