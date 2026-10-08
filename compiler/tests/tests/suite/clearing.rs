@@ -858,6 +858,12 @@ fn the_walks_own_tests_pass() {
     assert_eq!(super::tests_pass(&repo_root().join("examples/clearing")), 2);
 }
 
+/// The engine's own tests (`@test`s in engine/), on the CPU.
+#[test]
+fn the_engines_own_tests_pass() {
+    assert_eq!(super::tests_pass(&repo_root().join("engine")), 1);
+}
+
 /// AC4: the grass is placed on the GPU round the eye and follows it: over the camera's path
 /// (every second), the share of the meadow's pixels its blades cover, near and far, stays
 /// within 10% of the path's start (a ring's edge that thinned would show as a drop). A band
@@ -2117,13 +2123,26 @@ fn trees_change_level_without_popping() {
 
 // ---- 60 fps (AC2) -----------------------------------------------------------------------------
 
-/// The systems of #28 §11, their slices (ms), and the timed passes and dispatches that are each.
+/// The systems of #28 §11, their slices (ms), and the labels their passes and dispatches are
+/// timed under (a label names everything up to the next, `std::gpu::label`). A label no system
+/// claims fails the test, so a system's work can't drop out of its slice unseen.
 const SYSTEMS: [(&str, f64, &[&str]); 7] = [
     ("terrain", 1.5, &["terrain", "terrain cook"]),
-    ("vegetation", 4.0, &["vegetation prepass", "vegetation", "place", "draw_counts"]),
+    ("vegetation", 4.0, &["grass", "vegetation prepass", "vegetation"]),
     ("creature", 1.5, &["creature", "motion"]),
-    ("light", 3.0, &["shadow moving", "shadows static"]),
-    ("sky", 1.0, &["sky", "clouds cook"]),
+    (
+        "light",
+        3.0,
+        &[
+            "shadow moving",
+            "shadows static",
+            "probes occluders",
+            "probes open sky",
+            "probes bake",
+            "probes again",
+        ],
+    ),
+    ("sky", 1.0, &["sky", "clouds", "air", "clouds noise", "clouds weather", "clouds shadow"]),
     ("temporal AA", 1.0, &["temporal"]),
     ("look", 2.0, &["look", "look glow", "look develop"]),
 ];
@@ -2143,6 +2162,14 @@ fn system_medians(
     timings: &[(usize, String, f64)],
     frames: std::ops::Range<usize>,
 ) -> Vec<(&'static str, f64, f64)> {
+    let unclaimed: BTreeSet<&str> = timings
+        .iter()
+        .filter(|(f, l, _)| {
+            frames.contains(f) && !SYSTEMS.iter().any(|(_, _, ls)| ls.contains(&l.as_str()))
+        })
+        .map(|(_, l, _)| l.as_str())
+        .collect();
+    assert!(unclaimed.is_empty(), "timed under labels no system claims: {unclaimed:?}");
     SYSTEMS
         .iter()
         .map(|(name, slice, labels)| {

@@ -797,9 +797,10 @@ fn begin_pass_command(
 @intrinsic
 fn end_pass_command() {}
 
-/// Names the next pass or dispatch in the host's timings (language.md §12): `label("terrain")`
-/// before `begin_pass_with_depth(...)`. A pass that isn't named is `pass` (`screen pass` on the
-/// screen), and a dispatch its kernel's pipeline.
+/// Names the passes and dispatches after it in the hosts' timings, up to the next label or the
+/// frame's end (language.md §12): `label("terrain")` before `begin_pass_with_depth(...)`. Before
+/// a frame's first label, a pass is `pass` (`screen pass` on the screen), and a dispatch its
+/// kernel's pipeline.
 pub fn label(name: str) {
     label_command(name)
 }

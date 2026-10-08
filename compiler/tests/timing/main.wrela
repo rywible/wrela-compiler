@@ -87,6 +87,7 @@ pub fn frame(w: mut Work, time: f32, width: u32, height: u32) {
         draw(cover, busy.bind(steps: 100, seed: 0.7), vertices: 3)
         p.end()
     }
+    label("show")
     begin_screen_pass(clear: vec4(0.0, 0.0, 0.0, 1.0))
     draw(cover, show.bind(target: w.a), vertices: 3)
     present()

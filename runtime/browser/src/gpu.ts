@@ -476,15 +476,23 @@ export class GpuExecutor {
   /** A debug build's: the flag its pipelines' bounds checks set (the manifest's `debug_flag`),
    * and the buffer it's read back through, made once. */
   readonly #debugFlag: { buffer: GPUBuffer; readback: GPUBuffer } | null;
-  /** The frame being recorded, for timings. */
-  frame = 0;
+  #frame = 0;
   /** The serial mode: the frame whose command `drain` is running, which its timings take. */
   #running: number | null = null;
   /** Whether a pass on the screen has ended since this was last cleared: a frame that drew
    * nothing there leaves the screen as it was. */
   presented = false;
-  /** The name the program gave the next pass or dispatch (`Label`). */
+  /** The name the program gave the passes and dispatches after it in this frame (`Label`). */
   #label: string | null = null;
+  /** The frame being recorded, for timings. */
+  get frame(): number {
+    return this.#frame;
+  }
+  /** A frame begins: no label carries over from the last one. */
+  set frame(i: number) {
+    this.#frame = i;
+    this.#label = null;
+  }
   /** The serial timing mode's commands, waiting for `drain` to run them each pass and dispatch
    * alone; null in the other modes, which run each command as it comes. */
   readonly #deferred: Deferred[] | null;
@@ -598,7 +606,7 @@ export class GpuExecutor {
         this.#ended = null;
         return;
       }
-      // A label names the next pass, which may yet continue this one.
+      // A label names the passes after it, the next of which may yet continue this one.
       if (cmd.op !== "Label") this.#recordEnded();
     }
     switch (cmd.op) {
@@ -692,11 +700,11 @@ export class GpuExecutor {
         this.#pass = {
           pass: { color: SCREEN, keepColor: false, join: false, clear: cmd.clear, depth: NONE, keepDepth: false, clearDepth: 1 },
           draws: [],
-          label: this.#takeLabel(),
+          label: this.#label,
         };
         return;
       case "BeginPass":
-        this.#pass = { pass: cmd.pass, draws: [], label: this.#takeLabel() };
+        this.#pass = { pass: cmd.pass, draws: [], label: this.#label };
         return;
       case "Draw":
       case "DrawIndirect":
@@ -948,7 +956,6 @@ export class GpuExecutor {
     const offsets = this.#push(uniforms);
     const bindGroup = this.#bindGroup(index, bindings);
     const label = this.#label ?? p.name;
-    this.#label = null;
     const timed = this.#timestamps(label);
     const pass = this.#encoderNow().beginComputePass({ label, ...timed });
     pass.setPipeline(p.compute);
@@ -974,12 +981,6 @@ export class GpuExecutor {
       p.render.variants.set(key, v);
     }
     return v;
-  }
-
-  #takeLabel(): string | null {
-    const label = this.#label;
-    this.#label = null;
-    return label;
   }
 
   /** Ends the open pass: on the screen (Present) it's recorded; into textures (EndPass), it

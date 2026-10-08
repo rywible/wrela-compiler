@@ -47,6 +47,8 @@ export interface FakeBindGroup {
 
 export class FakeDevice {
   readonly events: Event[] = [];
+  /** Each compute and render pass's label, in the order they began. */
+  readonly passLabels: string[] = [];
   readonly buffers: FakeBuffer[] = [];
   readonly textures: FakeTexture[] = [];
   readonly samplers: GPUSamplerDescriptor[] = [];
@@ -199,6 +201,7 @@ export class FakeDevice {
 
   createCommandEncoder() {
     const events = this.events;
+    const labels = this.passLabels;
     const pass = () => {
       let pipeline = "";
       let bindGroup: FakeBindGroup | null = null;
@@ -227,8 +230,12 @@ export class FakeDevice {
       };
     };
     return {
-      beginComputePass: () => pass(),
+      beginComputePass: (desc?: GPUComputePassDescriptor) => {
+        labels.push(desc?.label ?? "");
+        return pass();
+      },
       beginRenderPass: (desc: GPURenderPassDescriptor) => {
+        labels.push(desc.label ?? "");
         const [attachment] = Array.from(desc.colorAttachments);
         const view = (attachment?.view as unknown as { label: string } | undefined)?.label ?? "none";
         const event: Event = { kind: "renderPass", clear: attachment?.clearValue ?? { r: 0, g: 0, b: 0, a: 0 }, view };

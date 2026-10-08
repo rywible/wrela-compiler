@@ -278,7 +278,7 @@ pub(crate) struct Gpu {
     ended: Option<OpenPass>,
     screen: Option<Screen>,
     timer: Option<Timer>,
-    /// The name the program gave the next pass or dispatch (`Label`).
+    /// The name the program gave the passes and dispatches after it in this frame (`Label`).
     label: Option<String>,
     errors: Arc<Mutex<Vec<String>>>,
     frame: usize,
@@ -658,8 +658,10 @@ impl Gpu {
         Ok(())
     }
 
+    /// A frame begins: no label carries over from the last one.
     pub(crate) fn set_frame(&mut self, frame: usize) {
         self.frame = frame;
+        self.label = None;
     }
 
     pub(crate) fn take_timings(&mut self) -> Vec<GpuTiming> {
@@ -1000,7 +1002,7 @@ impl Gpu {
         let bind_group = self.bind_group(pipeline, bindings);
         let mut encoder = self.take_encoder();
         let p = &self.pipelines[pipeline as usize];
-        let label = self.label.take();
+        let label = self.label.clone();
         let timestamps =
             self.timer.as_mut().map(|t| t.next(self.frame, label.as_deref().unwrap_or(&p.name)));
         let Kind::Compute(compute) = &p.kind else {
@@ -1317,7 +1319,7 @@ impl Executor for Gpu {
     fn execute(&mut self, cmd: &Command<'_>) -> Result<()> {
         if let Some(ended) = &self.ended {
             match cmd {
-                // A label names the next pass, which may yet continue this one.
+                // A label names the passes after it, the next of which may yet continue this one.
                 Command::Label { .. } => {}
                 Command::BeginPass(next) if fuses(&ended.pass, next) => {
                     self.pass = self.ended.take();
@@ -1365,11 +1367,11 @@ impl Executor for Gpu {
                     keep_depth: false,
                     clear_depth: 1.0,
                 };
-                let label = self.label.take();
+                let label = self.label.clone();
                 self.pass = Some(OpenPass { pass, draws: Vec::new(), label });
             }
             Command::BeginPass(pass) => {
-                let label = self.label.take();
+                let label = self.label.clone();
                 self.pass = Some(OpenPass { pass: *pass, draws: Vec::new(), label })
             }
             Command::Draw { pipeline, vertices, instances, bindings, uniforms } => {

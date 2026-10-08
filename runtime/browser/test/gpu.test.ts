@@ -361,6 +361,30 @@ test("a pass that may join the one before, on the same targets kept, runs as par
   expect(device.events.filter((e) => e.kind === "draw").length).toBe(3);
 });
 
+test("a label names the passes and dispatches after it, until the next label or frame", async () => {
+  const { device, run, executor } = await setup();
+  run(
+    new Encoder()
+      .createBuffer(1, 64)
+      .createBuffer(2, 64)
+      .createTexture(3, 8, 8, "rgba8unorm")
+      .dispatch(1, [1, 1, 1], [[1, 0, 64], [2, 0, 64]], u(0))
+      .label("look")
+      .dispatch(1, [1, 1, 1], [[1, 0, 64], [2, 0, 64]], u(0))
+      .beginPass(offscreen(3, NONE))
+      .draw(0, 3, 1, [1, 2], u(1))
+      .endPass()
+      .label("glow")
+      .beginPass(offscreen(3, NONE))
+      .draw(0, 3, 1, [1, 2], u(2))
+      .endPass(),
+  );
+  executor.frame = 1;
+  run(new Encoder().beginPass(offscreen(3, NONE)).draw(0, 3, 1, [1, 2], u(3)).endPass());
+  executor.flush();
+  expect(device.passLabels).toEqual(["compute", "look", "look", "glow", "pass"]);
+});
+
 test("copies and indirect work are recorded in order", async () => {
   const { device, run } = await setup();
   run(

@@ -254,6 +254,7 @@ async function run(canvas: OffscreenCanvas, device: GPUDevice, build: Build, liv
         }
         deliverInput(program);
         executor.presented = false;
+        executor.frame = frames;
         program.frame(time, width, height);
         // A change is shown by the first frame that draws after it.
         if (executor.presented) live?.drawn(frames);
