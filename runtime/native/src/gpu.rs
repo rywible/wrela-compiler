@@ -519,15 +519,20 @@ impl Gpu {
                     };
                     (ty, visibility)
                 }
-                BindingKind::Texture | BindingKind::DepthTexture => {
-                    let sample_type = if b.kind == BindingKind::Texture {
-                        wgpu::TextureSampleType::Float { filterable: true }
-                    } else {
+                BindingKind::Texture | BindingKind::DepthTexture | BindingKind::Texture3d => {
+                    let sample_type = if b.kind == BindingKind::DepthTexture {
                         wgpu::TextureSampleType::Depth
+                    } else {
+                        wgpu::TextureSampleType::Float { filterable: true }
+                    };
+                    let view_dimension = if b.kind == BindingKind::Texture3d {
+                        wgpu::TextureViewDimension::D3
+                    } else {
+                        wgpu::TextureViewDimension::D2
                     };
                     let ty = wgpu::BindingType::Texture {
                         sample_type,
-                        view_dimension: wgpu::TextureViewDimension::D2,
+                        view_dimension,
                         multisampled: false,
                     };
                     (ty, all)
@@ -539,11 +544,16 @@ impl Gpu {
                     (wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison), all)
                 }
                 // Only a kernel writes a texture's texels.
-                BindingKind::StorageTexture => {
+                BindingKind::StorageTexture | BindingKind::StorageTexture3d => {
+                    let view_dimension = if b.kind == BindingKind::StorageTexture3d {
+                        wgpu::TextureViewDimension::D3
+                    } else {
+                        wgpu::TextureViewDimension::D2
+                    };
                     let ty = wgpu::BindingType::StorageTexture {
                         access: wgpu::StorageTextureAccess::WriteOnly,
                         format: wgpu::TextureFormat::Rgba16Float,
-                        view_dimension: wgpu::TextureViewDimension::D2,
+                        view_dimension,
                     };
                     (ty, wgpu::ShaderStages::COMPUTE)
                 }
@@ -837,17 +847,21 @@ impl Gpu {
         self.resources.insert(handle, Resource::Buffer(buffer));
     }
 
+    /// A texture `size[0]` × `size[1]`, and `size[2]` deep for a 3D one (0 for a 2D one). A 3D
+    /// one is never a pass's target.
     fn create_texture(
         &mut self,
         handle: u32,
-        width: u32,
-        height: u32,
+        size: [u32; 3],
         format: TextureFormat,
         writable: bool,
     ) {
-        let mut usage = wgpu::TextureUsages::TEXTURE_BINDING
-            | wgpu::TextureUsages::RENDER_ATTACHMENT
-            | wgpu::TextureUsages::COPY_SRC;
+        let [width, height, depth] = size;
+        let three = depth > 0;
+        let mut usage = wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC;
+        if !three {
+            usage |= wgpu::TextureUsages::RENDER_ATTACHMENT;
+        }
         if !format.is_depth() {
             usage |= wgpu::TextureUsages::COPY_DST;
         }
@@ -858,10 +872,10 @@ impl Gpu {
         }
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some(&format!("texture {handle}")),
-            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            size: wgpu::Extent3d { width, height, depth_or_array_layers: depth.max(1) },
             mip_level_count: 1,
             sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
+            dimension: if three { wgpu::TextureDimension::D3 } else { wgpu::TextureDimension::D2 },
             format: wgpu_format(format),
             usage,
             view_formats: &[],
@@ -1314,8 +1328,8 @@ impl Executor for Gpu {
         }
         match cmd {
             Command::CreateBuffer { handle, size } => self.create_buffer(*handle, *size),
-            Command::CreateTexture { handle, width, height, format, writable } => {
-                self.create_texture(*handle, *width, *height, *format, *writable)
+            Command::CreateTexture { handle, width, height, format, writable, depth } => {
+                self.create_texture(*handle, [*width, *height, *depth], *format, *writable)
             }
             Command::CreateSampler { handle, linear, repeat, compare } => {
                 self.create_sampler(*handle, *linear, *repeat, *compare)

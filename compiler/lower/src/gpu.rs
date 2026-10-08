@@ -145,11 +145,12 @@ pub(crate) enum ParamClass {
         elem: TyId,
         len: u32,
     },
-    /// A `Texture` or a `DepthTexture`, bound by its handle; or a kernel's `Texels`
-    /// (`storage`), bound by its texture's.
+    /// A `Texture`, a `DepthTexture` or a `Texture3d` (`three`), bound by its handle; or a
+    /// kernel's `Texels` or `Texels3d` (`storage`), bound by its texture's.
     Texture {
         depth: bool,
         storage: bool,
+        three: bool,
     },
     /// A `Sampler` or a `ComparisonSampler`, bound by its handle.
     Sampler {
@@ -181,9 +182,14 @@ fn classify(cx: &Cx, f: FnId, param: usize, ty: TyId, varyings: Option<TyId>) ->
         });
     }
     match p.lang_of_ty(ty) {
-        Some(Lang::Texture) => return ParamClass::Texture { depth: false, storage: false },
-        Some(Lang::DepthTexture) => return ParamClass::Texture { depth: true, storage: false },
-        Some(Lang::Texels) => return ParamClass::Texture { depth: false, storage: true },
+        Some(l @ (Lang::Texture | Lang::DepthTexture | Lang::Texels)) => {
+            let (depth, storage) = (l == Lang::DepthTexture, l == Lang::Texels);
+            return ParamClass::Texture { depth, storage, three: false };
+        }
+        Some(l @ (Lang::Texture3d | Lang::Texels3d)) => {
+            let storage = l == Lang::Texels3d;
+            return ParamClass::Texture { depth: false, storage, three: true };
+        }
         Some(Lang::Sampler) => return ParamClass::Sampler { comparison: false },
         Some(Lang::ComparisonSampler) => return ParamClass::Sampler { comparison: true },
         _ => {}
@@ -719,6 +725,7 @@ pub(crate) fn intrinsic(
         }
         Some(
             l @ (Lang::CreateTexture
+            | Lang::CreateTexture3d
             | Lang::DestroyTexture
             | Lang::CreateSampler
             | Lang::DestroySampler
@@ -728,6 +735,7 @@ pub(crate) fn intrinsic(
             // (opcode, payload words, whether the first is a new handle)
             let (opcode, words, handle) = match l {
                 Lang::CreateTexture => (Opcode::CreateTexture, 4, true),
+                Lang::CreateTexture3d => (Opcode::CreateTexture, 5, true),
                 Lang::DestroyTexture => (Opcode::DestroyTexture, 1, false),
                 Lang::CreateSampler => (Opcode::CreateSampler, 4, true),
                 Lang::DestroySampler => (Opcode::DestroySampler, 1, false),
@@ -884,7 +892,8 @@ pub(crate) fn intrinsic(
             | Lang::AtomicExchange
             | Lang::AtomicCompareExchange
             | Lang::AppendPush
-            | Lang::TexelsStore),
+            | Lang::TexelsStore
+            | Lang::Texels3dStore),
         ) => shared_op(fl, l, c, ty),
         Some(Lang::Discard) => {
             // A fragment shader's, or a `@gpu` function's checked on its own (its callers'
@@ -916,8 +925,11 @@ pub(crate) fn intrinsic(
             | Lang::TextureSampleCompareLevel
             | Lang::TextureLoad
             | Lang::DepthLoad
+            | Lang::Texture3dSampleLevel
+            | Lang::Texture3dLoad
             | Lang::TextureWidth
-            | Lang::TextureHeight),
+            | Lang::TextureHeight
+            | Lang::TextureDepth),
         ) => texture_read(fl, l, c, ty),
         _ => {
             let name = fl.cx.checked.program.func(func).name.clone();
@@ -1036,7 +1048,7 @@ fn shared_op(fl: &mut Fl, l: Lang, c: &mir::Call, ty: Option<TyId>) -> Option<ir
             fl.emit(ir::Stmt::Eval(ir::Expr::Barrier));
             None
         }
-        Lang::TexelsStore => {
+        Lang::TexelsStore | Lang::Texels3dStore => {
             let r = resource_arg(fl, c, 0, msg)?;
             let mut vals = Vec::new();
             for a in &c.args[1..] {
@@ -1156,18 +1168,25 @@ fn texture_read(fl: &mut Fl, l: Lang, c: &mir::Call, ty: Option<TyId>) -> Option
     let u = fl.mb.m.types.u32();
     let op = match l {
         Lang::TextureSample => T::Sample,
-        Lang::TextureSampleLevel => T::SampleLevel,
+        Lang::TextureSampleLevel | Lang::Texture3dSampleLevel => T::SampleLevel,
         Lang::TextureSampleCompare => T::SampleCompare,
         Lang::TextureSampleCompareLevel => T::SampleCompareLevel,
-        Lang::TextureLoad | Lang::DepthLoad => T::Load,
+        Lang::TextureLoad | Lang::DepthLoad | Lang::Texture3dLoad => T::Load,
         Lang::TextureWidth => T::Width,
+        Lang::TextureDepth => T::Depth,
         _ => T::Height,
     };
     if !fl.is_gpu() {
-        if matches!(op, T::Width | T::Height) {
-            // `Texture` and `DepthTexture` hold their handle, width and height first.
+        if matches!(op, T::Width | T::Height | T::Depth) {
+            // `Texture`, `DepthTexture` and `Texture3d` hold their handle, width and height
+            // first (and a `Texture3d` its depth next).
+            let field = match op {
+                T::Width => 1,
+                T::Height => 2,
+                _ => 3,
+            };
             let v = fl.arg_value(&c.args[0])?;
-            return Some(fl.value(u, ir::Expr::Extract(v, if op == T::Width { 1 } else { 2 })));
+            return Some(fl.value(u, ir::Expr::Extract(v, field)));
         }
         let d = Diagnostic::new(
             codes::E0607,
@@ -1180,7 +1199,7 @@ fn texture_read(fl: &mut Fl, l: Lang, c: &mir::Call, ty: Option<TyId>) -> Option
     }
     let msg = "GPU code can pass a texture or sampler on only as the shader received it";
     let texture = resource_arg(fl, c, 0, msg)?;
-    let sampled = !matches!(op, T::Load | T::Width | T::Height);
+    let sampled = !matches!(op, T::Load | T::Width | T::Height | T::Depth);
     let sampler = if sampled { Some(resource_arg(fl, c, 1, msg)?) } else { None };
     let mut vals = Vec::new();
     for a in &c.args[1 + usize::from(sampled)..] {
@@ -1452,12 +1471,18 @@ fn entry_module(cx: &mut Cx, iface: Rc<Interface>, stage: Entry) -> EntryModule 
                     (ir::ResourceKind::StorageRead, ty, BindingKind::Read)
                 }
             }
-            ParamClass::Texture { storage: true, .. } => {
-                (ir::ResourceKind::StorageTexture, mb.m.types.u32(), BindingKind::StorageTexture)
+            ParamClass::Texture { storage: true, three, .. } => {
+                let bk =
+                    if three { BindingKind::StorageTexture3d } else { BindingKind::StorageTexture };
+                (ir::ResourceKind::StorageTexture { three }, mb.m.types.u32(), bk)
             }
-            ParamClass::Texture { depth, .. } => {
-                let bk = if depth { BindingKind::DepthTexture } else { BindingKind::Texture };
-                (ir::ResourceKind::Texture { depth }, mb.m.types.u32(), bk)
+            ParamClass::Texture { depth, three, .. } => {
+                let bk = match (depth, three) {
+                    (true, _) => BindingKind::DepthTexture,
+                    (false, true) => BindingKind::Texture3d,
+                    (false, false) => BindingKind::Texture,
+                };
+                (ir::ResourceKind::Texture { depth, three }, mb.m.types.u32(), bk)
             }
             ParamClass::Sampler { comparison } => {
                 let bk =

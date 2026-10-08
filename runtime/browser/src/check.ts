@@ -3,7 +3,7 @@
 // both hosts reject the same programs at the command that's wrong, rather than with an
 // asynchronous WebGPU error that names no command.
 
-import { BINDING_OFFSET_ALIGNMENT, DEFAULT_LIMITS, NONE, SCREEN, TEXTURE_FORMATS } from "./abi.gen.ts";
+import { BINDING_OFFSET_ALIGNMENT, DEFAULT_LIMITS, MAX_TEXTURE_3D, NONE, SCREEN, TEXTURE_FORMATS } from "./abi.gen.ts";
 import type { BindingKind, Manifest } from "./manifest.ts";
 import type { Binding, Command, OpcodeName, TextureFormat } from "./stream.ts";
 
@@ -69,7 +69,7 @@ interface Shape {
 /** A live resource. */
 type Resource =
   | { kind: "buffer"; size: number }
-  | { kind: "texture"; width: number; height: number; format: TextureFormat; writable: boolean }
+  | { kind: "texture"; width: number; height: number; depth: number; format: TextureFormat; writable: boolean }
   | { kind: "sampler"; comparison: boolean };
 
 export class Checker {
@@ -113,12 +113,15 @@ export class Checker {
         return;
       }
       case "CreateTexture": {
-        const { handle, width, height, format, writable } = cmd;
+        const { handle, width, height, format, writable, depth } = cmd;
         const max = this.#limits[0]!;
         if (width > max || height > max) {
           throw err(`texture ${handle} is ${width}x${height}; the limit is ${max} a side`);
         }
-        this.#create(op, handle, { kind: "texture", width, height, format, writable });
+        if (depth > 0 && [width, height, depth].some((s) => s > MAX_TEXTURE_3D)) {
+          throw err(`3D texture ${handle} is ${width}x${height}x${depth}; the limit is ${MAX_TEXTURE_3D} a side`);
+        }
+        this.#create(op, handle, { kind: "texture", width, height, depth, format, writable });
         return;
       }
       case "CreateSampler":
@@ -152,6 +155,7 @@ export class Checker {
       case "WriteTexture": {
         const { handle, x, y, width, height, data } = cmd;
         const t = this.#texture(op, handle);
+        if (t.depth > 0) throw err(`texture ${handle} is a 3D texture, whose texels kernels write`);
         if (x + width > t.width || y + height > t.height) {
           throw err(`writing ${width}x${height} texels at (${x}, ${y}) overruns texture ${handle} (${t.width}x${t.height})`);
         }
@@ -187,6 +191,11 @@ export class Checker {
         if (!Number.isFinite(pass.clearDepth)) throw err("the clear depth isn't a finite number");
         this.#scope.clear();
         this.#attachments = [];
+        for (const t of [pass.color, pass.depth]) {
+          if (t !== SCREEN && t !== NONE && this.#depthOf(t) > 0) {
+            throw err(`texture ${t} is a 3D texture, so it can't be a target`);
+          }
+        }
         let size: [number, number] | undefined;
         if (pass.color !== SCREEN && pass.color !== NONE) {
           const t = this.#texture(op, pass.color);
@@ -258,10 +267,27 @@ export class Checker {
     return r.size;
   }
 
-  #texture(op: OpcodeName, handle: number): { width: number; height: number; format: TextureFormat; writable: boolean } {
+  #texture(
+    op: OpcodeName,
+    handle: number,
+  ): { width: number; height: number; depth: number; format: TextureFormat; writable: boolean } {
     const r = this.#resources.get(handle);
     if (r?.kind !== "texture") throw new CommandError(op, `there's no texture ${handle}`);
     return r;
+  }
+
+  /** A texture's depth: a 3D texture's, else 0 (and 0 for what isn't a texture). */
+  #depthOf(handle: number): number {
+    const r = this.#resources.get(handle);
+    return r?.kind === "texture" ? r.depth : 0;
+  }
+
+  /** That a bound texture is 3D where the binding is (`three`), and 2D where it isn't. */
+  #dimensions(op: OpcodeName, handle: number, three: boolean): void {
+    const is = this.#depthOf(handle) > 0;
+    if (is === three) return;
+    const [what, want] = is ? ["a 3D", "a 2D"] : ["a 2D", "a 3D"];
+    throw new CommandError(op, `texture ${handle} is ${what} texture, bound where ${want} texture goes`);
   }
 
   #sampler(op: OpcodeName, handle: number): boolean {
@@ -345,18 +371,22 @@ export class Checker {
           return;
         }
         case "texture":
-        case "depth_texture": {
+        case "depth_texture":
+        case "texture_3d": {
           const t = this.#texture(op, b.handle);
           const depth = kind === "depth_texture";
           if (isDepth(t.format) !== depth) {
             throw err(`texture ${b.handle} is bound where ${depth ? "a depth texture" : "a colour texture"} goes`);
           }
+          this.#dimensions(op, b.handle, kind === "texture_3d");
           this.#used(op, "texture", b.handle, false);
           return;
         }
-        case "storage_texture": {
+        case "storage_texture":
+        case "storage_texture_3d": {
           const t = this.#texture(op, b.handle);
           if (!t.writable) throw err(`texture ${b.handle} is bound where a kernel writes it, but wasn't made writable`);
+          this.#dimensions(op, b.handle, kind === "storage_texture_3d");
           this.#used(op, "texture", b.handle, true);
           return;
         }

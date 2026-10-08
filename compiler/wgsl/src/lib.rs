@@ -290,23 +290,21 @@ impl<'m> Cx<'m> {
             }
             ir::ResourceKind::Private => (AddressSpace::Private, self.ty(r.ty)?),
             ir::ResourceKind::Workgroup => (AddressSpace::WorkGroup, self.ty(r.ty)?),
-            ir::ResourceKind::Texture { depth } => {
+            ir::ResourceKind::Texture { depth, three } => {
                 let class = if depth {
                     naga::ImageClass::Depth { multi: false }
                 } else {
                     naga::ImageClass::Sampled { kind: ScalarKind::Float, multi: false }
                 };
-                let inner =
-                    TypeInner::Image { dim: naga::ImageDimension::D2, arrayed: false, class };
+                let inner = TypeInner::Image { dim: image_dim(three), arrayed: false, class };
                 (AddressSpace::Handle, self.ty_inner(inner))
             }
-            ir::ResourceKind::StorageTexture => {
+            ir::ResourceKind::StorageTexture { three } => {
                 let class = naga::ImageClass::Storage {
                     format: naga::StorageFormat::Rgba16Float,
                     access: StorageAccess::STORE,
                 };
-                let inner =
-                    TypeInner::Image { dim: naga::ImageDimension::D2, arrayed: false, class };
+                let inner = TypeInner::Image { dim: image_dim(three), arrayed: false, class };
                 (AddressSpace::Handle, self.ty_inner(inner))
             }
             ir::ResourceKind::Sampler { comparison } => {
@@ -1341,17 +1339,7 @@ impl<'a, 'm> Fb<'a, 'm> {
                 )
             }
             T::Load => {
-                // A texel's coordinates are signed in naga's IR.
-                let mut signed = Vec::new();
-                for i in 0..2 {
-                    let x = arg(self, i)?;
-                    let kind = ScalarKind::Sint;
-                    signed.push(self.expr(Expression::As { expr: x, kind, convert: Some(4) }, out));
-                }
-                let ty = self
-                    .cx
-                    .ty_inner(TypeInner::Vector { size: VectorSize::Bi, scalar: Scalar::I32 });
-                let coordinate = self.expr(Expression::Compose { ty, components: signed }, out);
+                let coordinate = self.texel(&args[..args.len().min(3)], out)?;
                 let level = self.lit(Literal::I32(0), out);
                 self.expr(
                     Expression::ImageLoad {
@@ -1364,13 +1352,34 @@ impl<'a, 'm> Fb<'a, 'm> {
                     out,
                 )
             }
-            T::Width | T::Height => {
+            T::Width | T::Height | T::Depth => {
                 let query = naga::ImageQuery::Size { level: None };
                 let size = self.expr(Expression::ImageQuery { image, query }, out);
-                let index = u32::from(op == T::Height);
+                let index = match op {
+                    T::Width => 0,
+                    T::Height => 1,
+                    _ => 2,
+                };
                 self.expr(Expression::AccessIndex { base: size, index }, out)
             }
         })
+    }
+
+    /// A texel's coordinates, `xs` (2 or 3 `u32`s), as naga's IR has them: signed.
+    fn texel(&mut self, xs: &[ir::ValueId], out: &mut Block) -> R<Handle<Expression>> {
+        let mut signed = Vec::new();
+        for &x in xs {
+            let x = self.val(x)?;
+            let kind = ScalarKind::Sint;
+            signed.push(self.expr(Expression::As { expr: x, kind, convert: Some(4) }, out));
+        }
+        let size = match xs.len() {
+            2 => VectorSize::Bi,
+            3 => VectorSize::Tri,
+            _ => return Err("internal: a texel's coordinates aren't 2 or 3".into()),
+        };
+        let ty = self.cx.ty_inner(TypeInner::Vector { size, scalar: Scalar::I32 });
+        Ok(self.expr(Expression::Compose { ty, components: signed }, out))
     }
 
     /// A texel's write (`ir::Expr::TextureStore`): `textureStore` at x and y.
@@ -1382,18 +1391,12 @@ impl<'a, 'm> Fb<'a, 'm> {
     ) -> R<()> {
         let g = *self.cx.globals.get(tex.index()).ok_or("internal: a missing resource")?;
         let image = self.expr(Expression::GlobalVariable(g), out);
-        let arg = |fb: &Self, i: usize| -> R<Handle<Expression>> {
-            fb.val(*args.get(i).ok_or("internal: a texel's write without its arguments")?)
+        // The coordinates, then the value.
+        let Some((&value, xs)) = args.split_last() else {
+            return Err("internal: a texel's write without its arguments".into());
         };
-        let mut signed = Vec::new();
-        for i in 0..2 {
-            let x = arg(self, i)?;
-            let kind = ScalarKind::Sint;
-            signed.push(self.expr(Expression::As { expr: x, kind, convert: Some(4) }, out));
-        }
-        let ty = self.cx.ty_inner(TypeInner::Vector { size: VectorSize::Bi, scalar: Scalar::I32 });
-        let coordinate = self.expr(Expression::Compose { ty, components: signed }, out);
-        let value = arg(self, 2)?;
+        let coordinate = self.texel(xs, out)?;
+        let value = self.val(value)?;
         out.push(
             Statement::ImageStore { image, coordinate, array_index: None, value },
             Span::UNDEFINED,
@@ -1521,6 +1524,11 @@ impl<'a, 'm> Fb<'a, 'm> {
         };
         Ok(self.expr(e, out))
     }
+}
+
+/// A texture's dimension: 3D when `three`, else 2D.
+fn image_dim(three: bool) -> naga::ImageDimension {
+    if three { naga::ImageDimension::D3 } else { naga::ImageDimension::D2 }
 }
 
 #[cfg(test)]

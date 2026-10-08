@@ -170,12 +170,19 @@ impl Verifier<'_> {
             }
             Expr::Texture(op, t, s, xs) => {
                 let kind = |r: &ResourceId| self.m.resources.get(r.index()).map(|r| r.kind);
-                let Some(ResourceKind::Texture { depth }) = kind(t) else {
+                let Some(ResourceKind::Texture { depth, three }) = kind(t) else {
                     return Err(bug("a texture read of something that isn't a texture"));
                 };
                 let comparison =
                     matches!(op, TextureOp::SampleCompare | TextureOp::SampleCompareLevel);
-                let sampled = !matches!(op, TextureOp::Load | TextureOp::Width | TextureOp::Height);
+                let size = matches!(op, TextureOp::Width | TextureOp::Height | TextureOp::Depth);
+                let sampled = !size && *op != TextureOp::Load;
+                if (depth && three) || (*op == TextureOp::Depth && !three) {
+                    return Err(bug(format!("{op:?} of a texture that's 3D: {three}")));
+                }
+                if three && matches!(op, TextureOp::Sample) {
+                    return Err(bug("a 3D texture sampled with derivatives"));
+                }
                 match (sampled, s.as_ref().map(kind)) {
                     (false, None) => {}
                     (true, Some(Some(ResourceKind::Sampler { comparison: c })))
@@ -186,14 +193,16 @@ impl Verifier<'_> {
                     return Err(bug(format!("{op:?} of a texture that's depth: {depth}")));
                 }
                 let (f32_, u32_) = (TypeDef::Scalar(Scalar::F32), TypeDef::Scalar(Scalar::U32));
+                let n = if three { 3 } else { 2 };
+                let at = TypeDef::Vector(Scalar::F32, n);
                 let want: Vec<TypeDef> = match op {
-                    TextureOp::Sample => vec![TypeDef::Vector(Scalar::F32, 2)],
+                    TextureOp::Sample => vec![at],
                     // The level, or the reference depth.
                     TextureOp::SampleLevel
                     | TextureOp::SampleCompare
-                    | TextureOp::SampleCompareLevel => vec![TypeDef::Vector(Scalar::F32, 2), f32_],
-                    TextureOp::Load => vec![u32_.clone(), u32_],
-                    TextureOp::Width | TextureOp::Height => Vec::new(),
+                    | TextureOp::SampleCompareLevel => vec![at, f32_],
+                    TextureOp::Load => vec![u32_; n as usize],
+                    TextureOp::Width | TextureOp::Height | TextureOp::Depth => Vec::new(),
                 };
                 if xs.len() != want.len()
                     || xs.iter().zip(&want).any(|(x, w)| self.def(self.ty(*x)) != w)
@@ -201,7 +210,9 @@ impl Verifier<'_> {
                     return Err(bug(format!("{op:?} with the wrong arguments")));
                 }
                 let out = match op {
-                    TextureOp::Width | TextureOp::Height => TypeDef::Scalar(Scalar::U32),
+                    TextureOp::Width | TextureOp::Height | TextureOp::Depth => {
+                        TypeDef::Scalar(Scalar::U32)
+                    }
                     TextureOp::SampleCompare | TextureOp::SampleCompareLevel => {
                         TypeDef::Scalar(Scalar::F32)
                     }
@@ -212,11 +223,12 @@ impl Verifier<'_> {
             }
             Expr::TextureStore(t, xs) => {
                 let kind = self.m.resources.get(t.index()).map(|r| r.kind);
-                if kind != Some(ResourceKind::StorageTexture) {
+                let Some(ResourceKind::StorageTexture { three }) = kind else {
                     return Err(bug("a texel written to something that isn't a storage texture"));
-                }
+                };
                 let u32_ = TypeDef::Scalar(Scalar::U32);
-                let want = [u32_.clone(), u32_, TypeDef::Vector(Scalar::F32, 4)];
+                let mut want = vec![u32_; if three { 3 } else { 2 }];
+                want.push(TypeDef::Vector(Scalar::F32, 4));
                 if xs.len() != want.len()
                     || xs.iter().zip(&want).any(|(x, w)| self.def(self.ty(*x)) != w)
                 {

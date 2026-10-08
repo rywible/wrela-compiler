@@ -171,6 +171,7 @@ macro_rules! lang_items {
                         | Lang::BeginScreenPass
                         | Lang::Present
                         | Lang::CreateTexture
+                        | Lang::CreateTexture3d
                         | Lang::WriteTexture
                         | Lang::DestroyTexture
                         | Lang::CreateSampler
@@ -222,6 +223,7 @@ macro_rules! lang_items {
                         | Lang::Append
                         | Lang::AtomicMap
                         | Lang::Texels
+                        | Lang::Texels3d
                 )
             }
 
@@ -229,7 +231,11 @@ macro_rules! lang_items {
             pub fn is_texture_or_sampler(self) -> bool {
                 matches!(
                     self,
-                    Lang::Texture | Lang::DepthTexture | Lang::Sampler | Lang::ComparisonSampler
+                    Lang::Texture
+                        | Lang::DepthTexture
+                        | Lang::Texture3d
+                        | Lang::Sampler
+                        | Lang::ComparisonSampler
                 )
             }
 
@@ -272,9 +278,11 @@ lang_items! {
     Present = "std::gpu::present",
     Texture = "std::gpu::Texture",
     DepthTexture = "std::gpu::DepthTexture",
+    Texture3d = "std::gpu::Texture3d",
     Sampler = "std::gpu::Sampler",
     ComparisonSampler = "std::gpu::ComparisonSampler",
     CreateTexture = "std::gpu::create_texture",
+    CreateTexture3d = "std::gpu::create_texture_3d",
     WriteTexture = "std::gpu::write_texture_rows",
     DestroyTexture = "std::gpu::destroy_texture",
     CreateSampler = "std::gpu::create_sampler",
@@ -288,8 +296,11 @@ lang_items! {
     TextureSampleCompareLevel = "std::gpu::texture_sample_compare_level",
     TextureLoad = "std::gpu::texture_load",
     DepthLoad = "std::gpu::depth_load",
+    Texture3dSampleLevel = "std::gpu::texture3d_sample_level",
+    Texture3dLoad = "std::gpu::texture3d_load",
     TextureWidth = "std::gpu::texture_width",
     TextureHeight = "std::gpu::texture_height",
+    TextureDepth = "std::gpu::texture_depth",
     ReadBufferCommand = "std::gpu::read_buffer_command",
     NextRequest = "std::io::next_request",
     RequestStatus = "std::io::request_status",
@@ -307,6 +318,8 @@ lang_items! {
     Atomics = "std::gpu::Atomics",
     Texels = "std::gpu::Texels",
     TexelsStore = "std::gpu::texels_store",
+    Texels3d = "std::gpu::Texels3d",
+    Texels3dStore = "std::gpu::texels3d_store",
     Append = "std::gpu::Append",
     AtomicMap = "std::gpu::AtomicMap",
     AppendBuffer = "std::gpu::AppendBuffer",

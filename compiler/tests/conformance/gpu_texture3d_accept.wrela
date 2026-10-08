@@ -1,0 +1,44 @@
+// accepts: gpu.textures gpu.kernel-mut
+// A kernel writes a 3D texture, each invocation its own texel; a pass loads and samples it; CPU
+// code reads its size.
+use std::gpu::{
+    ClipPosition, FragCoord, GlobalId, Sampler, Texels3d, Texture3d, VertexIndex,
+    begin_screen_pass, dispatch, draw, present, sampler, texture3d,
+}
+
+struct State {
+    t: Texture3d,
+    s: Sampler,
+}
+
+@compute(4, 4, 4)
+fn fill(out: mut Texels3d, id: GlobalId) {
+    out.store(id, vec4(f32(id.x) / 8.0, f32(id.y) / 8.0, f32(id.z) / 8.0, 1.0))
+}
+
+@vertex
+fn cover(v: VertexIndex) -> ClipPosition {
+    let x = f32((v.index << 1) & 2) * 2.0 - 1.0
+    let y = f32(v.index & 2) * 2.0 - 1.0
+    ClipPosition { position: vec4(x, y, 0.5, 1.0) }
+}
+
+@fragment
+fn show(p: FragCoord, t: Texture3d, s: Sampler) -> vec4 {
+    let n = vec3(f32(t.width()), f32(t.height()), f32(t.depth()))
+    let near = t.load(x: u32(p.position.x) % 8, y: u32(p.position.y) % 8, z: 3)
+    near + t.sample_level(s, p.position.xyz / n, level: 0.0)
+}
+
+pub fn init() -> State {
+    let t = texture3d(width: 8, height: 8, depth: 8)
+    assert(t.depth() == 8 && t.width() == 8 && t.height() == 8)
+    State { t, s: sampler() }
+}
+
+pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
+    dispatch(fill.bind(mut s.t), groups: (2, 2, 2))
+    begin_screen_pass(clear: vec4(0.0))
+    draw(cover, show.bind(s.t, s.s), vertices: 3)
+    present()
+}

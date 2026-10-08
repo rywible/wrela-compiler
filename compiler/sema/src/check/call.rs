@@ -2792,6 +2792,10 @@ impl<'p> Checker<'p> {
             TyKind::Adt(s, _) if self.p.is_lang_adt(*s, Lang::Texels) => {
                 Some((Lang::Texture, Vec::new()))
             }
+            // `Texels3d`, a `Texture3d`.
+            TyKind::Adt(s, _) if self.p.is_lang_adt(*s, Lang::Texels3d) => {
+                Some((Lang::Texture3d, Vec::new()))
+            }
             _ => None,
         };
         if let Some((l, args)) = container {

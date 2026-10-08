@@ -1,6 +1,7 @@
 // GPU resources, entry-point builtins, and the CPU calls that record GPU work (language.md
 // §12, §6.13, D-102). Every function here that CPU code calls carries the `host` effect.
 
+use std::abi::MAX_TEXTURE_3D
 use std::io::{Pending, next_request}
 use std::mem::{Drop, size_of}
 
@@ -344,6 +345,24 @@ impl Drop for DepthTexture {
     }
 }
 
+/// A 3D colour texture on the GPU (four 16-bit floats a texel): an owned value, like a
+/// `Texture`. CPU code makes one and passes it to kernels, which write its texels
+/// (`Texels3d`), and to shaders, which sample it. Dropping it releases it.
+pub struct Texture3d {
+    handle: u32,
+    width: u32,
+    height: u32,
+    depth: u32,
+}
+
+impl Drop for Texture3d {
+    fn drop(mut self) {
+        if self.handle != 0 {
+            destroy_texture(self.handle)
+        }
+    }
+}
+
 /// How a `Sampler` filters.
 pub enum Filter: Copy {
     /// The nearest texel.
@@ -427,6 +446,17 @@ pub fn texture(
     // The stream's flag for a texture kernels write: bit 16 of the format.
     let flags: u32 = if writable { 65536 } else { 0 }
     Texture { handle: create_texture(width, height, code | flags), width, height, format }
+}
+
+/// A new 3D texture, `width` × `height` × `depth` texels (each 1 to 2048), zeroed. Kernels
+/// write its texels (`Texels3d`): CPU code can't.
+pub fn texture3d(width: u32, height: u32, depth: u32) -> Texture3d {
+    let max = MAX_TEXTURE_3D
+    if width == 0 || height == 0 || depth == 0 || width > max || height > max || depth > max {
+        panic(f"texture3d: a side is 1 to {max} texels")
+    }
+    // `Rgba16Float` (1), which kernels write (bit 16).
+    Texture3d { handle: create_texture_3d(width, height, 1 | 65536, depth), width, height, depth }
 }
 
 /// A new depth texture, zeroed.
@@ -548,6 +578,34 @@ impl DepthTexture {
     /// The depth at (`x`, `y`): any GPU code.
     pub fn load(self, x: u32, y: u32) -> f32 {
         depth_load(self, x, y)
+    }
+}
+
+impl Texture3d {
+    /// Its width in texels. In GPU code too.
+    pub fn width(self) -> u32 {
+        texture_width(self)
+    }
+
+    /// Its height in texels. In GPU code too.
+    pub fn height(self) -> u32 {
+        texture_height(self)
+    }
+
+    /// Its depth in texels. In GPU code too.
+    pub fn depth(self) -> u32 {
+        texture_depth(self)
+    }
+
+    /// The texel at (`u`, `v`, `w`) in [0, 1], filtered by `s`: any GPU code. 3D textures have
+    /// one mip level, 0.
+    pub fn sample_level(self, s: Sampler, uvw: vec3, level: f32 = 0.0) -> vec4 {
+        texture3d_sample_level(self, s, uvw, level)
+    }
+
+    /// The texel at (`x`, `y`, `z`), unfiltered: any GPU code.
+    pub fn load(self, x: u32, y: u32, z: u32) -> vec4 {
+        texture3d_load(self, x, y, z)
     }
 }
 
@@ -700,6 +758,9 @@ pub fn begin_screen_pass_with_depth(
 fn create_texture(width: u32, height: u32, format: u32) -> u32 {}
 
 @intrinsic
+fn create_texture_3d(width: u32, height: u32, format: u32, depth: u32) -> u32 {}
+
+@intrinsic
 fn write_texture_rows(
     handle: u32,
     x: u32,
@@ -770,10 +831,19 @@ fn texture_load(t: Texture, x: u32, y: u32) -> vec4 {}
 fn depth_load(t: DepthTexture, x: u32, y: u32) -> f32 {}
 
 @intrinsic
+fn texture3d_sample_level(t: Texture3d, s: Sampler, uvw: vec3, level: f32) -> vec4 {}
+
+@intrinsic
+fn texture3d_load(t: Texture3d, x: u32, y: u32, z: u32) -> vec4 {}
+
+@intrinsic
 fn texture_width<T>(t: T) -> u32 {}
 
 @intrinsic
 fn texture_height<T>(t: T) -> u32 {}
+
+@intrinsic
+fn texture_depth<T>(t: T) -> u32 {}
 
 // ---- readback, indirect work and limits -------------------------------------------------------
 
@@ -907,6 +977,21 @@ impl Texels {
     /// Writes `value` to the invocation's own texel, (`id.x`, `id.y`).
     pub fn store(mut self, id: GlobalId, value: vec4) {
         texels_store(mut self, id.x, id.y, value)
+    }
+}
+
+/// A 3D texture a kernel writes, each invocation only its own texel: (`id.x`, `id.y`, `id.z`)
+/// of its `GlobalId`. A kernel's `mut Texels3d` parameter, for which CPU code passes `mut tex`
+/// of a `Texture3d`. As with `Texels`, a kernel reads what it writes only through another
+/// pass's binding of the texture.
+pub struct Texels3d {
+    unused: u32,
+}
+
+impl Texels3d {
+    /// Writes `value` to the invocation's own texel, (`id.x`, `id.y`, `id.z`).
+    pub fn store(mut self, id: GlobalId, value: vec4) {
+        texels3d_store(mut self, id.x, id.y, id.z, value)
     }
 }
 
@@ -1160,6 +1245,9 @@ fn workgroup_barrier<T, const N: u32>(shared: mut Shared<T, N>) {}
 
 @intrinsic
 fn texels_store(t: mut Texels, x: u32, y: u32, value: vec4) {}
+
+@intrinsic
+fn texels3d_store(t: mut Texels3d, x: u32, y: u32, z: u32, value: vec4) {}
 
 @intrinsic
 fn atomic_len<A>(a: A) -> u32 {}

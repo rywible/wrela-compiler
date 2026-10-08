@@ -46,6 +46,11 @@ const NUMBERS: &[(&str, u32, &str)] = &[
     ("AUDIO_OUT", AUDIO_OUT, "Where `__audio` leaves a quantum's samples."),
     ("AUDIO_SAMPLE_RATE", crate::AUDIO_SAMPLE_RATE, "The audio thread's sample rate, in hertz."),
     ("AUDIO_QUANTUM", crate::AUDIO_QUANTUM, "How many samples one `__audio` call renders."),
+    (
+        "MAX_TEXTURE_3D",
+        crate::stream::MAX_TEXTURE_3D,
+        "The widest, tallest and deepest 3D texture.",
+    ),
 ];
 
 /// The same, for the `i32`s.

@@ -207,10 +207,16 @@ pub enum BindingKind {
     ComparisonSampler,
     /// An `rgba16float` texture a kernel writes (a storage texture, written only).
     StorageTexture,
+    /// A filterable float 3D texture.
+    #[serde(rename = "texture_3d")]
+    Texture3d,
+    /// An `rgba16float` 3D texture a kernel writes.
+    #[serde(rename = "storage_texture_3d")]
+    StorageTexture3d,
 }
 
 impl BindingKind {
-    pub const ALL: [BindingKind; 7] = [
+    pub const ALL: [BindingKind; 9] = [
         BindingKind::Read,
         BindingKind::ReadWrite,
         BindingKind::Texture,
@@ -218,6 +224,8 @@ impl BindingKind {
         BindingKind::Sampler,
         BindingKind::ComparisonSampler,
         BindingKind::StorageTexture,
+        BindingKind::Texture3d,
+        BindingKind::StorageTexture3d,
     ];
 
     pub fn is_buffer(self) -> bool {
@@ -225,7 +233,7 @@ impl BindingKind {
     }
 
     pub fn is_texture(self) -> bool {
-        matches!(self, BindingKind::Texture | BindingKind::DepthTexture)
+        matches!(self, BindingKind::Texture | BindingKind::DepthTexture | BindingKind::Texture3d)
     }
 
     pub fn is_sampler(self) -> bool {
@@ -242,6 +250,8 @@ impl BindingKind {
             BindingKind::Sampler => "sampler",
             BindingKind::ComparisonSampler => "comparison_sampler",
             BindingKind::StorageTexture => "storage_texture",
+            BindingKind::Texture3d => "texture_3d",
+            BindingKind::StorageTexture3d => "storage_texture_3d",
         }
     }
 }

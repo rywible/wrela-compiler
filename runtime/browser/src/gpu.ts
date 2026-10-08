@@ -176,10 +176,14 @@ async function buildPipeline(device: GPUDevice, p: Pipeline, source: string): Pr
       }
       case "texture":
       case "depth_texture":
+      case "texture_3d":
         entries.push({
           binding: b.binding,
           visibility: seen,
-          texture: { sampleType: b.kind === "texture" ? "float" : "depth", viewDimension: "2d" },
+          texture: {
+            sampleType: b.kind === "depth_texture" ? "depth" : "float",
+            viewDimension: b.kind === "texture_3d" ? "3d" : "2d",
+          },
         });
         break;
       case "sampler":
@@ -192,10 +196,15 @@ async function buildPipeline(device: GPUDevice, p: Pipeline, source: string): Pr
         break;
       // Only a kernel writes a texture's texels.
       case "storage_texture":
+      case "storage_texture_3d":
         entries.push({
           binding: b.binding,
           visibility: GPUShaderStage.COMPUTE,
-          storageTexture: { access: "write-only", format: "rgba16float", viewDimension: "2d" },
+          storageTexture: {
+            access: "write-only",
+            format: "rgba16float",
+            viewDimension: b.kind === "storage_texture_3d" ? "3d" : "2d",
+          },
         });
         break;
     }
@@ -611,19 +620,23 @@ export class GpuExecutor {
         return;
       case "CreateTexture": {
         const depth = isDepth(cmd.format);
+        // A 3D texture (`cmd.depth` texels deep) is sampled and written by kernels, never drawn
+        // into.
+        const three = cmd.depth > 0;
         const texture = this.device.createTexture({
           label: `texture ${cmd.handle}`,
-          size: [cmd.width, cmd.height],
+          size: three ? [cmd.width, cmd.height, cmd.depth] : [cmd.width, cmd.height],
+          dimension: three ? "3d" : "2d",
           format: cmd.format,
           usage:
             GPUTextureUsage.TEXTURE_BINDING |
-            GPUTextureUsage.RENDER_ATTACHMENT |
+            (three ? 0 : GPUTextureUsage.RENDER_ATTACHMENT) |
             GPUTextureUsage.COPY_SRC |
             (depth ? 0 : GPUTextureUsage.COPY_DST) |
             // Only where kernels write it: a storage texture may give up the GPU's compression.
             (cmd.writable ? GPUTextureUsage.STORAGE_BINDING : 0),
         });
-        const bytes = cmd.width * cmd.height * bytesPerTexel(cmd.format);
+        const bytes = cmd.width * cmd.height * Math.max(cmd.depth, 1) * bytesPerTexel(cmd.format);
         this.#resources.set(cmd.handle, { kind: "texture", texture, view: texture.createView(), format: cmd.format, bytes });
         this.#allocated(bytes);
         return;

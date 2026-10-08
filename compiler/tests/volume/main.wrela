@@ -1,0 +1,49 @@
+// A kernel writes a 3D texture's texels (`std::gpu::Texels3d`), each invocation its own, and a
+// pass shows them on the screen: renderer.rs checks them in both hosts. The top half loads
+// texels; the bottom half samples between the layers.
+
+use std::gpu::{
+    ClipPosition, FragCoord, GlobalId, Sampler, Texels3d, Texture3d, VertexIndex,
+    begin_screen_pass, dispatch, draw, present, sampler, texture3d,
+}
+
+struct State {
+    t: Texture3d,
+    s: Sampler,
+}
+
+/// Texel (x, y, z) of 4 × 4 × 4: red x / 3, green y / 3, blue z / 3, alpha 1.
+@compute(4, 4, 4)
+fn fill(out: mut Texels3d, id: GlobalId) {
+    out.store(id, vec4(f32(id.x) / 3.0, f32(id.y) / 3.0, f32(id.z) / 3.0, 1.0))
+}
+
+@vertex
+fn cover(v: VertexIndex) -> ClipPosition {
+    let x = f32((v.index << 1) & 2) * 2.0 - 1.0
+    let y = f32(v.index & 2) * 2.0 - 1.0
+    ClipPosition { position: vec4(x, y, 0.5, 1.0) }
+}
+
+/// Top half: texel ((x / 8) % 4, (y / 8) % 4, x / 32). Bottom half: the texture at
+/// (1/8, 1/8, x / 128), blended between layers, with green its depth over 4.
+@fragment
+fn show(p: FragCoord, t: Texture3d, s: Sampler) -> vec4 {
+    let (x, y) = (u32(p.position.x), u32(p.position.y))
+    if y < 64 {
+        return t.load(x: (x / 8) % 4, y: (y / 8) % 4, z: x / 32)
+    }
+    let c = t.sample_level(s, vec3(0.125, 0.125, p.position.x / 128.0))
+    vec4(c.r, f32(t.depth()) / 4.0, c.b, 1.0)
+}
+
+pub fn init() -> State {
+    State { t: texture3d(width: 4, height: 4, depth: 4), s: sampler() }
+}
+
+pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
+    dispatch(fill.bind(mut s.t), groups: (1, 1, 1))
+    begin_screen_pass(clear: vec4(0.0))
+    draw(cover, show.bind(s.t, s.s), vertices: 3)
+    present()
+}

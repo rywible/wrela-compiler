@@ -52,7 +52,16 @@ export type Command =
   | { op: "Present" }
   | { op: "DestroyBuffer"; handle: number }
   | { op: "CopyBuffer"; source: number; sourceOffset: number; destination: number; destinationOffset: number; size: number }
-  | { op: "CreateTexture"; handle: number; width: number; height: number; format: TextureFormat; writable: boolean }
+  | {
+      op: "CreateTexture";
+      handle: number;
+      width: number;
+      height: number;
+      format: TextureFormat;
+      writable: boolean;
+      /** A 3D texture's depth; 0 for a 2D texture. */
+      depth: number;
+    }
   | { op: "WriteTexture"; handle: number; x: number; y: number; width: number; height: number; data: Bytes }
   | { op: "DestroyTexture"; handle: number }
   | { op: "CreateSampler"; handle: number; linear: boolean; repeat: boolean; compare: Compare | null }
@@ -287,14 +296,18 @@ export function decode(batch: Bytes): Command[] {
         break;
       }
       case "CreateTexture": {
-        exactly(4);
+        if (words !== 4 && words !== 5) throw bad("expected 4 or 5 words");
+        // A fifth word: a 3D texture's depth.
+        const depth = words === 5 ? w(4) : 0;
+        if (words === 5 && depth === 0) throw bad("a 3D texture's depth is positive");
         // Bit 16 of the format word: kernels write it (an rgba16float storage texture too).
         const writable = (w(3) & TEXTURE_WRITABLE) !== 0;
         const format = TEXTURE_FORMATS[w(3) & ~TEXTURE_WRITABLE];
         if (format === undefined) throw bad("unknown texture format");
         if (w(1) === 0 || w(2) === 0) throw bad("a texture's width and height are positive");
         if (writable && format.name !== "rgba16float") throw bad("only an rgba16float texture can be written by kernels");
-        cmd = { op: name, handle: w(0), width: w(1), height: w(2), format: format.name, writable };
+        if (depth > 0 && format.depth) throw bad("a 3D texture holds colours");
+        cmd = { op: name, handle: w(0), width: w(1), height: w(2), format: format.name, writable, depth };
         break;
       }
       case "WriteTexture": {

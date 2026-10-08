@@ -26,7 +26,7 @@
 //! | 6 | `Present` | none. Ends the screen pass and shows it. |
 //! | 7 | `DestroyBuffer` | `handle`. Later commands can't use the buffer; work already recorded still can. |
 //! | 8 | `CopyBuffer` | `source`, `source offset`, `destination`, `destination offset`, `size` (bytes, multiples of 4) |
-//! | 9 | `CreateTexture` | `handle`, `width`, `height`, `format` ([`TextureFormat`]; bit 16 set: kernels write it, an `rgba16float` storage texture too). It starts zeroed. |
+//! | 9 | `CreateTexture` | `handle`, `width`, `height`, `format` ([`TextureFormat`]; bit 16 set: kernels write it, an `rgba16float` storage texture too), and for a 3D texture its `depth` (a fifth word, at least 1). It starts zeroed. |
 //! | 10 | `WriteTexture` | `handle`, `x`, `y`, `width`, `height`, `length`, then `length` bytes: rows of `width` texels, top to bottom, no padding |
 //! | 11 | `DestroyTexture` | `handle` |
 //! | 12 | `CreateSampler` | `handle`, `filter` (0 nearest, 1 linear), `address` (0 clamp, 1 repeat), `compare` ([`Compare`]; 0 for a sampler that doesn't compare) |
@@ -188,6 +188,9 @@ impl Opcode {
 
 /// `CreateTexture`'s format word with this bit set: kernels write the texture's texels.
 pub const WRITABLE: u32 = 1 << 16;
+
+/// The most texels a side of a 3D texture: WebGPU's default `maxTextureDimension3D`.
+pub const MAX_TEXTURE_3D: u32 = 2048;
 
 /// A texture's format: how its texels are stored and sampled.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -362,6 +365,8 @@ pub enum Command<'a> {
         format: TextureFormat,
         /// Kernels write its texels (a storage texture): `Rgba16Float` only.
         writable: bool,
+        /// A 3D texture's depth in texels; 0 for a 2D texture.
+        depth: u32,
     },
     WriteTexture {
         handle: u32,
@@ -736,7 +741,13 @@ pub fn decode(batch: &[u8]) -> Result<Vec<Command<'_>>, StreamError> {
                 }
             }
             Opcode::CreateTexture => {
-                exactly(4)?;
+                if words != 4 && words != 5 {
+                    return Err(bad("expected 4 or 5 words"));
+                }
+                let depth = if words == 5 { w(4) } else { 0 };
+                if words == 5 && depth == 0 {
+                    return Err(bad("a 3D texture's depth is positive"));
+                }
                 let writable = w(3) & WRITABLE != 0;
                 let Some(format) = TextureFormat::from_u32(w(3) & !WRITABLE) else {
                     return Err(bad("unknown texture format"));
@@ -747,7 +758,17 @@ pub fn decode(batch: &[u8]) -> Result<Vec<Command<'_>>, StreamError> {
                 if writable && format != TextureFormat::Rgba16Float {
                     return Err(bad("only an rgba16float texture can be written by kernels"));
                 }
-                Command::CreateTexture { handle: w(0), width: w(1), height: w(2), format, writable }
+                if depth > 0 && format.is_depth() {
+                    return Err(bad("a 3D texture holds colours"));
+                }
+                Command::CreateTexture {
+                    handle: w(0),
+                    width: w(1),
+                    height: w(2),
+                    format,
+                    writable,
+                    depth,
+                }
             }
             Opcode::WriteTexture => {
                 if words < 6 {
@@ -1057,6 +1078,21 @@ impl Encoder {
     ) -> &mut Self {
         let f = format as u32 | if writable { WRITABLE } else { 0 };
         self.command(Opcode::CreateTexture, &[handle, width, height, f], &[]);
+        self
+    }
+
+    /// A 3D texture: `create_texture`'s, with its depth.
+    pub fn create_texture_3d(
+        &mut self,
+        handle: u32,
+        width: u32,
+        height: u32,
+        depth: u32,
+        format: TextureFormat,
+        writable: bool,
+    ) -> &mut Self {
+        let f = format as u32 | if writable { WRITABLE } else { 0 };
+        self.command(Opcode::CreateTexture, &[handle, width, height, f, depth], &[]);
         self
     }
 

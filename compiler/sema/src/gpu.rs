@@ -293,7 +293,9 @@ fn check_entry(p: &Program, f: FnId, entry: Entry, out: &mut Vec<Diagnostic>) {
                 Some(Lang::Slots) => "slots are indexed by a kernel's `GlobalId`",
                 Some(Lang::Shared) => "workgroup memory is a kernel's",
                 Some(Lang::Atomics) => "WebGPU gives a vertex shader no writable buffers",
-                Some(Lang::Texels) => "texels are written by a kernel's `GlobalId`",
+                Some(Lang::Texels | Lang::Texels3d) => {
+                    "texels are written by a kernel's `GlobalId`"
+                }
                 _ => "a draw's shaders don't write buffers yet",
             };
             out.push(Diagnostic::new(

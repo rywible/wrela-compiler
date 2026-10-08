@@ -78,6 +78,41 @@ fn a_kernel_writes_a_textures_texels() {
     }
 }
 
+/// A kernel writes a 3D texture's texels (`std::gpu::Texels3d`), and a pass loads and samples
+/// them (compiler/tests/volume): texel (x, y, z) of 4 × 4 × 4 is red x / 3, green y / 3, blue
+/// z / 3. The top half loads texel ((x / 8) % 4, (y / 8) % 4, x / 32); the bottom half samples
+/// at (1/8, 1/8, x / 128), so its blue is blended between layers, and its green is the depth.
+#[test]
+#[ignore = "needs a GPU"]
+fn a_kernel_writes_a_3d_textures_texels() {
+    let (dir, _) = page("compiler/tests/volume", "volume-native");
+    let run = native(&dir);
+    let c = |k: u32| ((k * 255 + 1) / 3) as u8;
+    for (x, y) in [(4u32, 4u32), (12, 20), (60, 28), (100, 4), (124, 60)] {
+        let want = [c((x / 8) % 4), c((y / 8) % 4), c(x / 32), 255];
+        near(pixel(&run.frame, x, y), want, &format!("pixel ({x}, {y})"));
+    }
+    // Layer k's centre is at w = (k + 1/2) / 4, so blue is (4w - 1/2) / 3, within [0, 1].
+    for x in [4u32, 40, 64, 100, 124] {
+        let w = (x as f32 + 0.5) / 128.0;
+        let blue = ((4.0 * w - 0.5) / 3.0).clamp(0.0, 1.0);
+        let want = [0, 255, (blue * 255.0).round() as u8, 255];
+        near(pixel(&run.frame, x, 100), want, &format!("sampled at pixel ({x}, 100)"));
+    }
+}
+
+#[test]
+#[ignore = "long: needs Chrome, python3 and a GPU"]
+fn the_browser_writes_3d_texels_as_the_native_host_does() {
+    let (dir, rel) = page("compiler/tests/volume", "volume-browser");
+    let browser = run_in_chrome(&rel, 2, SIZE, SIZE, 60.0);
+    let run = native(&dir);
+    assert_eq!(browser.hash, run.hash_hex(), "the hosts' state hashes differ");
+    let diff = image::compare(&browser.frame, &run.frame).expect("same size");
+    eprintln!("Chrome against the native host: mean {:.4}/255, max {}/255", diff.mean, diff.max);
+    assert!(diff.mean <= MEAN_LIMIT, "mean difference {:.4} over {MEAN_LIMIT}", diff.mean);
+}
+
 /// A vertex shader and a fragment shader with parameters of the same name read their own
 /// buffers (compiler/tests/shader_params): the vertex shader's, 1, scales its triangle to cover
 /// the screen, and the fragment shader's, 0.25, is its red. (Each read the fragment shader's

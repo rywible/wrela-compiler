@@ -27,7 +27,7 @@
 
 use crate::Manifest;
 use crate::manifest::{BindingKind, Stage};
-use crate::stream::{Binding, Command, NONE, Opcode, SCREEN, TextureFormat};
+use crate::stream::{Binding, Command, MAX_TEXTURE_3D, NONE, Opcode, SCREEN, TextureFormat};
 use std::collections::HashMap;
 use std::fmt;
 
@@ -76,9 +76,20 @@ struct Shape {
 /// A live resource.
 #[derive(Clone, Copy, Debug)]
 enum Resource {
-    Buffer { size: u32 },
-    Texture { width: u32, height: u32, format: TextureFormat, writable: bool },
-    Sampler { comparison: bool },
+    Buffer {
+        size: u32,
+    },
+    /// `depth`: a 3D texture's, or 0 for a 2D texture.
+    Texture {
+        width: u32,
+        height: u32,
+        depth: u32,
+        format: TextureFormat,
+        writable: bool,
+    },
+    Sampler {
+        comparison: bool,
+    },
 }
 
 impl Resource {
@@ -143,16 +154,22 @@ impl Checker {
                 }
                 self.create(op, *handle, Resource::Buffer { size: *size })?;
             }
-            Command::CreateTexture { handle, width, height, format, writable } => {
+            Command::CreateTexture { handle, width, height, format, writable, depth } => {
                 let max = self.limits.max_texture_size;
                 if *width > max || *height > max {
                     return err(format!(
                         "texture {handle} is {width}x{height}; the limit is {max} a side"
                     ));
                 }
+                if [*width, *height, *depth].iter().any(|&s| s > MAX_TEXTURE_3D) && *depth > 0 {
+                    return err(format!(
+                        "3D texture {handle} is {width}x{height}x{depth}; the limit is {MAX_TEXTURE_3D} a side"
+                    ));
+                }
                 let t = Resource::Texture {
                     width: *width,
                     height: *height,
+                    depth: *depth,
                     format: *format,
                     writable: *writable,
                 };
@@ -196,6 +213,11 @@ impl Checker {
             }
             Command::WriteTexture { handle, x, y, width, height, data } => {
                 let (w, h, format) = self.texture(op, *handle)?;
+                if self.depth_of(*handle) > 0 {
+                    return err(format!(
+                        "texture {handle} is a 3D texture, whose texels kernels write"
+                    ));
+                }
                 if u64::from(*x) + u64::from(*width) > u64::from(w)
                     || u64::from(*y) + u64::from(*height) > u64::from(h)
                 {
@@ -247,6 +269,13 @@ impl Checker {
                 self.scope.clear();
                 self.attachments.clear();
                 let mut size = None;
+                for t in [pass.color, pass.depth] {
+                    if t != SCREEN && t != NONE && self.depth_of(t) > 0 {
+                        return err(format!(
+                            "texture {t} is a 3D texture, so it can't be a target"
+                        ));
+                    }
+                }
                 if pass.color != SCREEN && pass.color != NONE {
                     let (w, h, f) = self.texture(op, pass.color)?;
                     if f.is_depth() {
@@ -349,6 +378,25 @@ impl Checker {
         match self.resources.get(&handle) {
             Some(Resource::Texture { width, height, format, .. }) => Ok((*width, *height, *format)),
             _ => Err(Self::missing(op, "texture", handle)),
+        }
+    }
+
+    /// That a bound texture is 3D where the binding is (`three`), and 2D where it isn't.
+    fn dimensions(&self, op: Opcode, handle: u32, three: bool) -> Result<()> {
+        let is = self.depth_of(handle) > 0;
+        if is == three {
+            return Ok(());
+        }
+        let (what, want) = if is { ("a 3D", "a 2D") } else { ("a 2D", "a 3D") };
+        let why = format!("texture {handle} is {what} texture, bound where {want} texture goes");
+        Err(CommandError { opcode: op, why })
+    }
+
+    /// A texture's depth: a 3D texture's, else 0 (and 0 for what isn't a texture).
+    fn depth_of(&self, handle: u32) -> u32 {
+        match self.resources.get(&handle) {
+            Some(Resource::Texture { depth, .. }) => *depth,
+            _ => 0,
         }
     }
 
@@ -488,16 +536,17 @@ impl Checker {
                     }
                     Self::used(&mut self.scope, op, "buffer", b.handle, write)?;
                 }
-                BindingKind::Texture | BindingKind::DepthTexture => {
+                BindingKind::Texture | BindingKind::DepthTexture | BindingKind::Texture3d => {
                     let (_, _, f) = self.texture(op, b.handle)?;
                     let depth = kind == BindingKind::DepthTexture;
                     if f.is_depth() != depth {
                         let want = if depth { "a depth texture" } else { "a colour texture" };
                         return err(format!("texture {} is bound where {want} goes", b.handle));
                     }
+                    self.dimensions(op, b.handle, kind == BindingKind::Texture3d)?;
                     Self::used(&mut self.scope, op, "texture", b.handle, false)?;
                 }
-                BindingKind::StorageTexture => {
+                BindingKind::StorageTexture | BindingKind::StorageTexture3d => {
                     let writable = matches!(
                         self.resources.get(&b.handle),
                         Some(Resource::Texture { writable: true, .. })
@@ -509,6 +558,7 @@ impl Checker {
                             b.handle
                         ));
                     }
+                    self.dimensions(op, b.handle, kind == BindingKind::StorageTexture3d)?;
                     Self::used(&mut self.scope, op, "texture", b.handle, true)?;
                 }
                 BindingKind::Sampler | BindingKind::ComparisonSampler => {

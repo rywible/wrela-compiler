@@ -115,6 +115,9 @@ pub(package) const AUDIO_SAMPLE_RATE: u32 = 48000
 /// How many samples one `__audio` call renders.
 pub(package) const AUDIO_QUANTUM: u32 = 128
 
+/// The widest, tallest and deepest 3D texture.
+pub(package) const MAX_TEXTURE_3D: u32 = 2048
+
 /// A request's status while it isn't answered.
 pub(package) const REQUEST_PENDING: i32 = -1
 

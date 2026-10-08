@@ -89,6 +89,7 @@
             "sourceOffset": 4
           },
           {
+            "depth": 0,
             "format": "rgba8unorm",
             "handle": 8,
             "height": 1,
@@ -425,6 +426,26 @@
       }
     },
     {
+      "bytes": "57524353070000001c00000009000000140000000100000004000000040000000000000000000000",
+      "name": "a 3D texture of no depth",
+      "outcome": {
+        "error": {
+          "kind": "BadPayload",
+          "message": "malformed CreateTexture at byte 12: a 3D texture's depth is positive"
+        }
+      }
+    },
+    {
+      "bytes": "57524353070000001c00000009000000140000000100000004000000040000000200000004000000",
+      "name": "a 3D depth texture",
+      "outcome": {
+        "error": {
+          "kind": "BadPayload",
+          "message": "malformed CreateTexture at byte 12: a 3D texture holds colours"
+        }
+      }
+    },
+    {
       "bytes": "575243530700000018000000090000001000000001000000000000000400000000000000",
       "name": "a zero-width texture",
       "outcome": {
@@ -636,7 +657,7 @@
       {
         "bytes": "5752435307000000680000000100000008000000010000000002000001000000080000000200000000020000030000004000000007000000010000000100000001000000020000000100000000000000000200000200000000000000000200001000000000000000000000000000000000000000",
         "error": {
-          "message": "Dispatch failed: there's no pipeline 7 (the manifest has 6)",
+          "message": "Dispatch failed: there's no pipeline 7 (the manifest has 7)",
           "opcode": "Dispatch"
         },
         "name": "no such pipeline"
@@ -817,6 +838,51 @@
         "name": "a texture over the size limit"
       },
       {
+        "bytes": "5752435307000000fc00000001000000080000000100000000020000010000000800000002000000000200000900000010000000080000000400000004000000000000000900000010000000090000000400000004000000020000000c000000100000000a0000000100000000000000000000000c000000100000000b00000000000000000000000100000009000000140000000d0000000400000004000000000000000400000009000000140000000e00000004000000040000000100010004000000030000003c00000006000000010000000100000001000000030000000d00000000000000000000000a00000000000000000000000e000000000000000000000000000000",
+        "error": null,
+        "name": "a 3D texture sampled and another written"
+      },
+      {
+        "bytes": "5752435307000000e000000001000000080000000100000000020000010000000800000002000000000200000900000010000000080000000400000004000000000000000900000010000000090000000400000004000000020000000c000000100000000a0000000100000000000000000000000c000000100000000b00000000000000000000000100000009000000140000000e00000004000000040000000100010004000000030000003c00000006000000010000000100000001000000030000000800000000000000000000000a00000000000000000000000e000000000000000000000000000000",
+        "error": {
+          "message": "Dispatch failed: texture 8 is a 2D texture, bound where a 3D texture goes",
+          "opcode": "Dispatch"
+        },
+        "name": "a 2D texture where a 3D texture goes"
+      },
+      {
+        "bytes": "57524353070000001401000001000000080000000100000000020000010000000800000002000000000200000900000010000000080000000400000004000000000000000900000010000000090000000400000004000000020000000c000000100000000a0000000100000000000000000000000c000000100000000b00000000000000000000000100000009000000140000000d000000040000000400000000000000040000000e0000002400000008000000000000000000000000000000000000000000000009000000000000000000803f0500000044000000050000000300000001000000040000000d00000000000000000000000a00000000000000000000000900000000000000000000000b000000000000000000000000000000",
+        "error": {
+          "message": "Draw failed: texture 13 is a 3D texture, bound where a 2D texture goes",
+          "opcode": "Draw"
+        },
+        "name": "a 3D texture where a 2D texture goes"
+      },
+      {
+        "bytes": "5752435307000000c000000001000000080000000100000000020000010000000800000002000000000200000900000010000000080000000400000004000000000000000900000010000000090000000400000004000000020000000c000000100000000a0000000100000000000000000000000c000000100000000b00000000000000000000000100000009000000140000000d000000040000000400000000000000040000000a0000001c0000000d000000000000000000000001000000010000000400000000000000",
+        "error": {
+          "message": "WriteTexture failed: texture 13 is a 3D texture, whose texels kernels write",
+          "opcode": "WriteTexture"
+        },
+        "name": "a write to a 3D texture"
+      },
+      {
+        "bytes": "5752435307000000c800000001000000080000000100000000020000010000000800000002000000000200000900000010000000080000000400000004000000000000000900000010000000090000000400000004000000020000000c000000100000000a0000000100000000000000000000000c000000100000000b00000000000000000000000100000009000000140000000d000000040000000400000000000000040000000e000000240000000d0000000000000000000000000000000000000000000000ffffffff000000000000803f",
+        "error": {
+          "message": "BeginPass failed: texture 13 is a 3D texture, so it can't be a target",
+          "opcode": "BeginPass"
+        },
+        "name": "a 3D texture as a pass's target"
+      },
+      {
+        "bytes": "57524353070000001c00000009000000140000000100000004000000040000000000000001080000",
+        "error": {
+          "message": "CreateTexture failed: 3D texture 1 is 4x4x2049; the limit is 2048 a side",
+          "opcode": "CreateTexture"
+        },
+        "name": "a 3D texture over the size limit"
+      },
+      {
         "bytes": "5752435307000000a800000001000000080000000100000000020000010000000800000002000000000200000900000010000000080000000400000004000000000000000900000010000000090000000400000004000000020000000c000000100000000a0000000100000000000000000000000c000000100000000b0000000000000000000000010000000a000000200000000800000003000000000000000200000001000000080000000000000000000000",
         "error": {
           "message": "WriteTexture failed: writing 2x1 texels at (3, 0) overruns texture 8 (4x4)",
@@ -958,7 +1024,7 @@
         "name": "requests, made rightly"
       }
     ],
-    "manifest": "{\n  \"manifest_version\": 6,\n  \"stream_version\": 7,\n  \"wasm\": \"game.wasm\",\n  \"pipelines\": [\n    {\n      \"name\": \"draw\",\n      \"shader\": \"draw.wgsl\",\n      \"kind\": \"render\",\n      \"vertex_entry\": \"vs\",\n      \"fragment_entry\": \"fs\",\n      \"uniform\": {\n        \"binding\": 0,\n        \"size\": 16,\n        \"space\": \"uniform\"\n      },\n      \"bindings\": [\n        {\n          \"binding\": 1,\n          \"kind\": \"read\"\n        },\n        {\n          \"binding\": 2,\n          \"kind\": \"read_write\"\n        }\n      ]\n    },\n    {\n      \"name\": \"compute\",\n      \"shader\": \"compute.wgsl\",\n      \"kind\": \"compute\",\n      \"entry\": \"main\",\n      \"workgroup_size\": [\n        64,\n        1,\n        1\n      ],\n      \"uniform\": {\n        \"binding\": 0,\n        \"size\": 16,\n        \"space\": \"uniform\"\n      },\n      \"bindings\": [\n        {\n          \"binding\": 1,\n          \"kind\": \"read\"\n        },\n        {\n          \"binding\": 2,\n          \"kind\": \"read_write\"\n        }\n      ]\n    },\n    {\n      \"name\": \"draw2\",\n      \"shader\": \"draw2.wgsl\",\n      \"kind\": \"render\",\n      \"vertex_entry\": \"vs\",\n      \"fragment_entry\": \"fs\",\n      \"uniform\": {\n        \"binding\": 0,\n        \"size\": 16,\n        \"space\": \"uniform\"\n      },\n      \"bindings\": [\n        {\n          \"binding\": 1,\n          \"kind\": \"read_write\"\n        },\n        {\n          \"binding\": 2,\n          \"kind\": \"read_write\"\n        }\n      ]\n    },\n    {\n      \"name\": \"compute2\",\n      \"shader\": \"compute2.wgsl\",\n      \"kind\": \"compute\",\n      \"entry\": \"main\",\n      \"workgroup_size\": [\n        64,\n        1,\n        1\n      ],\n      \"uniform\": {\n        \"binding\": 0,\n        \"size\": 16,\n        \"space\": \"uniform\"\n      },\n      \"bindings\": [\n        {\n          \"binding\": 1,\n          \"kind\": \"read_write\"\n        },\n        {\n          \"binding\": 2,\n          \"kind\": \"read_write\"\n        }\n      ]\n    },\n    {\n      \"name\": \"bare\",\n      \"shader\": \"bare.wgsl\",\n      \"kind\": \"compute\",\n      \"entry\": \"main\",\n      \"workgroup_size\": [\n        64,\n        1,\n        1\n      ],\n      \"uniform\": null,\n      \"bindings\": []\n    },\n    {\n      \"name\": \"textured\",\n      \"shader\": \"textured.wgsl\",\n      \"kind\": \"render\",\n      \"vertex_entry\": \"vs\",\n      \"fragment_entry\": \"fs\",\n      \"uniform\": null,\n      \"bindings\": [\n        {\n          \"binding\": 0,\n          \"kind\": \"texture\"\n        },\n        {\n          \"binding\": 1,\n          \"kind\": \"sampler\"\n        },\n        {\n          \"binding\": 2,\n          \"kind\": \"depth_texture\"\n        },\n        {\n          \"binding\": 3,\n          \"kind\": \"comparison_sampler\"\n        }\n      ]\n    }\n  ]\n}\n"
+    "manifest": "{\n  \"manifest_version\": 6,\n  \"stream_version\": 7,\n  \"wasm\": \"game.wasm\",\n  \"pipelines\": [\n    {\n      \"name\": \"draw\",\n      \"shader\": \"draw.wgsl\",\n      \"kind\": \"render\",\n      \"vertex_entry\": \"vs\",\n      \"fragment_entry\": \"fs\",\n      \"uniform\": {\n        \"binding\": 0,\n        \"size\": 16,\n        \"space\": \"uniform\"\n      },\n      \"bindings\": [\n        {\n          \"binding\": 1,\n          \"kind\": \"read\"\n        },\n        {\n          \"binding\": 2,\n          \"kind\": \"read_write\"\n        }\n      ]\n    },\n    {\n      \"name\": \"compute\",\n      \"shader\": \"compute.wgsl\",\n      \"kind\": \"compute\",\n      \"entry\": \"main\",\n      \"workgroup_size\": [\n        64,\n        1,\n        1\n      ],\n      \"uniform\": {\n        \"binding\": 0,\n        \"size\": 16,\n        \"space\": \"uniform\"\n      },\n      \"bindings\": [\n        {\n          \"binding\": 1,\n          \"kind\": \"read\"\n        },\n        {\n          \"binding\": 2,\n          \"kind\": \"read_write\"\n        }\n      ]\n    },\n    {\n      \"name\": \"draw2\",\n      \"shader\": \"draw2.wgsl\",\n      \"kind\": \"render\",\n      \"vertex_entry\": \"vs\",\n      \"fragment_entry\": \"fs\",\n      \"uniform\": {\n        \"binding\": 0,\n        \"size\": 16,\n        \"space\": \"uniform\"\n      },\n      \"bindings\": [\n        {\n          \"binding\": 1,\n          \"kind\": \"read_write\"\n        },\n        {\n          \"binding\": 2,\n          \"kind\": \"read_write\"\n        }\n      ]\n    },\n    {\n      \"name\": \"compute2\",\n      \"shader\": \"compute2.wgsl\",\n      \"kind\": \"compute\",\n      \"entry\": \"main\",\n      \"workgroup_size\": [\n        64,\n        1,\n        1\n      ],\n      \"uniform\": {\n        \"binding\": 0,\n        \"size\": 16,\n        \"space\": \"uniform\"\n      },\n      \"bindings\": [\n        {\n          \"binding\": 1,\n          \"kind\": \"read_write\"\n        },\n        {\n          \"binding\": 2,\n          \"kind\": \"read_write\"\n        }\n      ]\n    },\n    {\n      \"name\": \"bare\",\n      \"shader\": \"bare.wgsl\",\n      \"kind\": \"compute\",\n      \"entry\": \"main\",\n      \"workgroup_size\": [\n        64,\n        1,\n        1\n      ],\n      \"uniform\": null,\n      \"bindings\": []\n    },\n    {\n      \"name\": \"textured\",\n      \"shader\": \"textured.wgsl\",\n      \"kind\": \"render\",\n      \"vertex_entry\": \"vs\",\n      \"fragment_entry\": \"fs\",\n      \"uniform\": null,\n      \"bindings\": [\n        {\n          \"binding\": 0,\n          \"kind\": \"texture\"\n        },\n        {\n          \"binding\": 1,\n          \"kind\": \"sampler\"\n        },\n        {\n          \"binding\": 2,\n          \"kind\": \"depth_texture\"\n        },\n        {\n          \"binding\": 3,\n          \"kind\": \"comparison_sampler\"\n        }\n      ]\n    },\n    {\n      \"name\": \"volume\",\n      \"shader\": \"volume.wgsl\",\n      \"kind\": \"compute\",\n      \"entry\": \"main\",\n      \"workgroup_size\": [\n        4,\n        4,\n        4\n      ],\n      \"uniform\": null,\n      \"bindings\": [\n        {\n          \"binding\": 0,\n          \"kind\": \"texture_3d\"\n        },\n        {\n          \"binding\": 1,\n          \"kind\": \"sampler\"\n        },\n        {\n          \"binding\": 2,\n          \"kind\": \"storage_texture_3d\"\n        }\n      ]\n    }\n  ]\n}\n"
   },
   "comment": "Generated by the wrela-abi crate (runtime/abi/src/vectors.rs); don't edit. Run `cargo run -p wrela-abi --bin generate`.",
   "hashes": [
@@ -1649,7 +1715,7 @@
       "name": "a wrong kind"
     },
     {
-      "error": "invalid manifest: pipelines[1].bindings[1].kind must be one of read, read_write, texture, depth_texture, sampler, comparison_sampler, storage_texture, not \"cube_texture\"",
+      "error": "invalid manifest: pipelines[1].bindings[1].kind must be one of read, read_write, texture, depth_texture, sampler, comparison_sampler, storage_texture, texture_3d, storage_texture_3d, not \"cube_texture\"",
       "json": "{\n  \"manifest_version\": 6,\n  \"stream_version\": 7,\n  \"wasm\": \"game.wasm\",\n  \"pipelines\": [\n    {\n      \"name\": \"sample\",\n      \"shader\": \"pipeline_0.wgsl\",\n      \"kind\": \"compute\",\n      \"entry\": \"main\",\n      \"workgroup_size\": [\n        64,\n        1,\n        1\n      ],\n      \"uniform\": {\n        \"binding\": 0,\n        \"size\": 32,\n        \"space\": \"uniform\"\n      },\n      \"bindings\": [\n        {\n          \"binding\": 1,\n          \"kind\": \"read_write\"\n        }\n      ]\n    },\n    {\n      \"name\": \"cover+shade\",\n      \"shader\": \"pipeline_1.wgsl\",\n      \"kind\": \"render\",\n      \"vertex_entry\": \"vs\",\n      \"fragment_entry\": \"fs\",\n      \"uniform\": null,\n      \"bindings\": [\n        {\n          \"binding\": 0,\n          \"kind\": \"texture\"\n        },\n        {\n          \"binding\": 1,\n          \"kind\": \"cube_texture\"\n        }\n      ]\n    }\n  ]\n}\n",
       "name": "an unknown binding kind"
     },

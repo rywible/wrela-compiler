@@ -71,9 +71,9 @@ fn command(c: &Command) -> Value {
                 "destination": destination, "destinationOffset": destination_offset, "size": size,
             })
         }
-        Command::CreateTexture { handle, width, height, format, writable } => json!({
+        Command::CreateTexture { handle, width, height, format, writable, depth } => json!({
             "op": "CreateTexture", "handle": handle, "width": width, "height": height,
-            "format": format.name(), "writable": writable,
+            "format": format.name(), "writable": writable, "depth": depth,
         }),
         Command::WriteTexture { handle, x, y, width, height, data } => json!({
             "op": "WriteTexture", "handle": handle, "x": x, "y": y, "width": width,
@@ -251,6 +251,20 @@ fn batches() -> Vec<Value> {
             ),
         ),
         batch(
+            "a 3D texture of no depth",
+            &edit(
+                Encoder::new().create_texture_3d(1, 4, 4, 4, TextureFormat::Rgba8, false).finish(),
+                h + 8 + 16,
+                0,
+            ),
+        ),
+        batch(
+            "a 3D depth texture",
+            &Encoder::new()
+                .create_texture_3d(1, 4, 4, 4, TextureFormat::Depth32Float, false)
+                .finish(),
+        ),
+        batch(
             "a zero-width texture",
             &edit(
                 Encoder::new().create_texture(1, 4, 4, TextureFormat::Rgba8, false).finish(),
@@ -405,6 +419,16 @@ pub fn check_manifest() -> Manifest {
             bind(3, BindingKind::ComparisonSampler),
         ],
         ..shape("textured", render)
+    });
+    // A kernel that samples one 3D texture and writes another.
+    m.pipelines.push(Pipeline {
+        uniform: None,
+        bindings: vec![
+            bind(0, BindingKind::Texture3d),
+            bind(1, BindingKind::Sampler),
+            bind(2, BindingKind::StorageTexture3d),
+        ],
+        ..shape("volume", Stage::Compute { entry: "main".into(), workgroup_size: [4, 4, 4] })
     });
     m
 }
@@ -673,6 +697,75 @@ fn checks() -> Value {
             "a texture over the size limit",
             &m,
             &Encoder::new().create_texture(1, 8193, 1, TextureFormat::Rgba8, false).finish(),
+        ),
+        check(
+            "a 3D texture sampled and another written",
+            &m,
+            &with_textures(&|e| {
+                e.create_texture_3d(13, 4, 4, 4, TextureFormat::Rgba8, false)
+                    .create_texture_3d(14, 4, 4, 4, TextureFormat::Rgba16Float, true)
+                    .dispatch(
+                        6,
+                        [1, 1, 1],
+                        &[Binding::of(13), Binding::of(10), Binding::of(14)],
+                        &[],
+                    );
+            }),
+        ),
+        check(
+            "a 2D texture where a 3D texture goes",
+            &m,
+            &with_textures(&|e| {
+                e.create_texture_3d(14, 4, 4, 4, TextureFormat::Rgba16Float, true).dispatch(
+                    6,
+                    [1, 1, 1],
+                    &[Binding::of(8), Binding::of(10), Binding::of(14)],
+                    &[],
+                );
+            }),
+        ),
+        check(
+            "a 3D texture where a 2D texture goes",
+            &m,
+            &with_textures(&|e| {
+                e.create_texture_3d(13, 4, 4, 4, TextureFormat::Rgba8, false)
+                    .begin_pass(pass)
+                    .draw(
+                        5,
+                        3,
+                        1,
+                        &[Binding::of(13), Binding::of(10), Binding::of(9), Binding::of(11)],
+                        &[],
+                    );
+            }),
+        ),
+        check(
+            "a write to a 3D texture",
+            &m,
+            &with_textures(&|e| {
+                e.create_texture_3d(13, 4, 4, 4, TextureFormat::Rgba8, false).write_texture(
+                    13,
+                    [0, 0],
+                    [1, 1],
+                    &[0; 4],
+                );
+            }),
+        ),
+        check(
+            "a 3D texture as a pass's target",
+            &m,
+            &with_textures(&|e| {
+                e.create_texture_3d(13, 4, 4, 4, TextureFormat::Rgba8, false).begin_pass(Pass {
+                    color: 13,
+                    depth: stream::NONE,
+                    ..pass
+                });
+            }),
+        ),
+        check(
+            "a 3D texture over the size limit",
+            &m,
+            &Encoder::new().create_texture_3d(1, 4, 4, 2049, TextureFormat::Rgba8, false).finish(),
         ),
         check(
             "a texture write past the edge",

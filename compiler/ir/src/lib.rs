@@ -409,11 +409,13 @@ pub enum TextureOp {
     SampleCompare,
     /// As `SampleCompare`, at level 0: any stage.
     SampleCompareLevel,
-    /// Args: x and y. The texel at level 0: a `vec4`, or an `f32` of a depth texture.
+    /// Args: x and y (and z, of a 3D texture). The texel at level 0: a `vec4`, or an `f32` of a
+    /// depth texture.
     Load,
-    /// The width or height, a `u32`.
+    /// The width, height or depth (of a 3D texture), a `u32`.
     Width,
     Height,
+    Depth,
 }
 
 impl TextureOp {
@@ -624,10 +626,12 @@ pub enum ResourceKind {
     Private,
     /// `var<workgroup>` holding `ty` (an array): one per workgroup, shared by its invocations.
     Workgroup,
-    /// `texture_2d<f32>`, or `texture_depth_2d`.
-    Texture { depth: bool },
-    /// `texture_storage_2d<rgba16float, write>`: a kernel's texels to write.
-    StorageTexture,
+    /// `texture_2d<f32>`, `texture_depth_2d`, or `texture_3d<f32>` when `three`. Sampled with
+    /// a `vec2`, or a `vec3` when `three`.
+    Texture { depth: bool, three: bool },
+    /// `texture_storage_2d<rgba16float, write>`, or `texture_storage_3d` when `three`: a
+    /// kernel's texels to write.
+    StorageTexture { three: bool },
     /// `sampler`, or `sampler_comparison`.
     Sampler { comparison: bool },
 }
@@ -793,7 +797,7 @@ impl Module {
                     | ResourceKind::Private
                     | ResourceKind::Workgroup
                     | ResourceKind::Texture { .. }
-                    | ResourceKind::StorageTexture
+                    | ResourceKind::StorageTexture { .. }
                     | ResourceKind::Sampler { .. } => res.ty,
                     ResourceKind::StorageRead | ResourceKind::StorageReadWrite => {
                         match p.path.as_slice() {
