@@ -8,7 +8,7 @@ import { vectors } from "./fixtures.ts";
 
 test("the test encoder writes the vectors' golden batch", () => {
   const golden = vectors.batches.find((b) => b.name === "golden")!.bytes;
-  const offscreen = { color: 8, keepColor: false, clear: [0, 0, 0, 1] as [number, number, number, number], depth: 9, keepDepth: false, clearDepth: 1 };
+  const offscreen = { color: 8, keepColor: false, join: false, clear: [0, 0, 0, 1] as [number, number, number, number], depth: 9, keepDepth: false, clearDepth: 1 };
   const batch = new Encoder()
     .createBuffer(7, 16)
     .writeBuffer(7, 4, Uint8Array.of(1, 2, 3, 4, 5, 6, 7, 8))

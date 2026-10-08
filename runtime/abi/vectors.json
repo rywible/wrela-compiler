@@ -141,6 +141,7 @@
               "clearDepth": 1.0,
               "color": 8,
               "depth": 9,
+              "join": false,
               "keepColor": false,
               "keepDepth": false
             }
@@ -447,10 +448,25 @@
       "bytes": "57524353070000002c0000000e0000002400000008000000020000000000000000000000000000000000803f09000000000000000000803f",
       "name": "a load that isn't 0 or 1",
       "outcome": {
-        "error": {
-          "kind": "BadPayload",
-          "message": "malformed BeginPass at byte 12: a load is 0 (clear) or 1 (keep)"
-        }
+        "commands": [
+          {
+            "op": "BeginPass",
+            "pass": {
+              "clear": [
+                0.0,
+                0.0,
+                0.0,
+                1.0
+              ],
+              "clearDepth": 1.0,
+              "color": 8,
+              "depth": 9,
+              "join": true,
+              "keepColor": false,
+              "keepDepth": false
+            }
+          }
+        ]
       }
     },
     {

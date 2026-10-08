@@ -35,6 +35,8 @@ export type Binding = { handle: number; offset: number; size: number };
 export type Pass = {
   color: number;
   keepColor: boolean;
+  /** It may run as part of the pass before it (`Pass::join`). */
+  join: boolean;
   clear: [number, number, number, number];
   depth: number;
   keepDepth: boolean;
@@ -315,10 +317,11 @@ export function decode(batch: Bytes): Command[] {
       }
       case "BeginPass": {
         exactly(9);
-        if (w(1) > 1 || w(7) > 1) throw bad("a load is 0 (clear) or 1 (keep)");
+        if (w(1) > 3 || w(7) > 1) throw bad("a load is 0 (clear) or 1 (keep); the colour's may add 2 (join)");
         const pass: Pass = {
           color: w(0),
-          keepColor: w(1) === 1,
+          keepColor: (w(1) & 1) === 1,
+          join: (w(1) & 2) === 2,
           clear: [f(2), f(3), f(4), f(5)],
           depth: w(6),
           keepDepth: w(7) === 1,

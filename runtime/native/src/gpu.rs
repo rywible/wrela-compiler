@@ -8,7 +8,11 @@
 //!   contents), before a readback, and at the end of each call. Each dispatch gets its own
 //!   compute pass.
 //! - A pass's draws are collected and recorded into one render pass when it ends (`Present` or
-//!   `EndPass`), since a pass can span batches.
+//!   `EndPass`), since a pass can span batches. A pass that may join the one before (`join`), and
+//!   begins right after it ended on the same targets, keeping what's in them, runs as part of
+//!   it, unless the timing is serial: on a tile-based GPU each pass stores its targets to memory
+//!   and the next loads them back. Only a pass the program marks: a pass's geometry is binned
+//!   before its tiles are drawn, so two heavy passes made one wait longer than they save.
 //! - A render pipeline is made for each combination of target formats it's drawn with: the
 //!   screen's or a texture's colour format, and a depth format or none. With depth, a fragment
 //!   is kept where its depth is less than what's there, which it replaces.
@@ -175,10 +179,11 @@ struct PendingDraw {
     uniforms: Vec<u8>,
 }
 
-/// A pass between its beginning and `Present` or `EndPass`.
+/// A pass between its beginning and `Present` or `EndPass`, and the name the program gave it.
 struct OpenPass {
     pass: Pass,
     draws: Vec<PendingDraw>,
+    label: Option<String>,
 }
 
 struct Screen {
@@ -267,6 +272,9 @@ pub(crate) struct Gpu {
     upload: Ring,
     encoder: Option<wgpu::CommandEncoder>,
     pass: Option<OpenPass>,
+    /// A pass that ended, not yet recorded: the next pass continues it if it begins on the same
+    /// targets and keeps them (`fuses`).
+    ended: Option<OpenPass>,
     screen: Option<Screen>,
     timer: Option<Timer>,
     /// The name the program gave the next pass or dispatch (`Label`).
@@ -382,6 +390,7 @@ impl Gpu {
             upload,
             encoder: None,
             pass: None,
+            ended: None,
             screen: None,
             timer,
             label: None,
@@ -767,8 +776,10 @@ impl Gpu {
         })
     }
 
-    /// Submits everything recorded so far, after writing its uniform bytes.
+    /// Submits everything recorded so far, after writing its uniform bytes (a pass that ended
+    /// and waits is recorded first).
     pub(crate) fn flush(&mut self) -> Result<()> {
+        self.record_ended()?;
         let Some(encoder) = self.encoder.take() else {
             debug_assert!(self.ring.staging.is_empty() && self.upload.staging.is_empty());
             return Ok(());
@@ -1014,11 +1025,31 @@ impl Gpu {
         self.pass.as_mut().expect("the sequencer checked a pass is open").draws.push(draw);
     }
 
-    /// Records the open pass's draws: on the screen (`Present`) or into textures (`EndPass`).
+    /// Ends the open pass: on the screen (`Present`) it's recorded; into textures (`EndPass`),
+    /// it waits for the next command, which may continue it (`fuses`), unless the timing is
+    /// serial.
     fn end_pass(&mut self, op: Opcode) -> Result<()> {
         let Some(open) = self.pass.take() else {
             unreachable!("the sequencer checked a pass is open");
         };
+        let serial = self.timer.as_ref().is_some_and(|t| t.serial);
+        if op == Opcode::EndPass && !serial {
+            self.ended = Some(open);
+            return Ok(());
+        }
+        self.record_pass(op, open)
+    }
+
+    /// Records the pass that ended and waits (`ended`), if there is one.
+    fn record_ended(&mut self) -> Result<()> {
+        match self.ended.take() {
+            Some(open) => self.record_pass(Opcode::EndPass, open),
+            None => Ok(()),
+        }
+    }
+
+    /// Records a pass's draws into one render pass.
+    fn record_pass(&mut self, op: Opcode, open: OpenPass) -> Result<()> {
         let pass = open.pass;
         let on_screen = pass.color == stream::SCREEN;
         if on_screen && self.screen.is_none() {
@@ -1055,8 +1086,7 @@ impl Gpu {
         let total = open.draws.iter().map(|d| self.aligned(d.uniforms.len())).sum();
         self.reserve_uniforms(op, total)?;
         self.reserve_timestamps()?;
-        let named = self.label.take();
-        let label = named.as_deref().unwrap_or(if on_screen { "screen pass" } else { "pass" });
+        let label = open.label.as_deref().unwrap_or(if on_screen { "screen pass" } else { "pass" });
         let timestamps = self.timer.as_mut().map(|t| t.next(self.frame, label));
         let [r, g, b, a] = pass.clear.map(f64::from);
         let mut bind_groups = Vec::new();
@@ -1263,6 +1293,17 @@ impl Gpu {
 
 impl Executor for Gpu {
     fn execute(&mut self, cmd: &Command<'_>) -> Result<()> {
+        if let Some(ended) = &self.ended {
+            match cmd {
+                // A label names the next pass, which may yet continue this one.
+                Command::Label { .. } => {}
+                Command::BeginPass(next) if fuses(&ended.pass, next) => {
+                    self.pass = self.ended.take();
+                    return Ok(());
+                }
+                _ => self.record_ended()?,
+            }
+        }
         match cmd {
             Command::CreateBuffer { handle, size } => self.create_buffer(*handle, *size),
             Command::CreateTexture { handle, width, height, format, writable } => {
@@ -1296,15 +1337,18 @@ impl Executor for Gpu {
                 let pass = Pass {
                     color: stream::SCREEN,
                     keep_color: false,
+                    join: false,
                     clear: *clear,
                     depth: stream::NONE,
                     keep_depth: false,
                     clear_depth: 1.0,
                 };
-                self.pass = Some(OpenPass { pass, draws: Vec::new() });
+                let label = self.label.take();
+                self.pass = Some(OpenPass { pass, draws: Vec::new(), label });
             }
             Command::BeginPass(pass) => {
-                self.pass = Some(OpenPass { pass: *pass, draws: Vec::new() })
+                let label = self.label.take();
+                self.pass = Some(OpenPass { pass: *pass, draws: Vec::new(), label })
             }
             Command::Draw { pipeline, vertices, instances, bindings, uniforms } => {
                 let how = DrawHow::Direct { vertices: *vertices, instances: *instances };
@@ -1553,4 +1597,15 @@ pub fn read_timestamp_spans(
             (a as f64 * period, a.max(b) as f64 * period)
         })
         .collect())
+}
+
+/// Whether pass `next`, beginning right after `ended` ended, continues it as one render pass:
+/// it may join, on the same targets, kept (not cleared), and not the screen.
+fn fuses(ended: &Pass, next: &Pass) -> bool {
+    next.join
+        && next.color != stream::SCREEN
+        && next.color == ended.color
+        && next.depth == ended.depth
+        && (next.color == stream::NONE || next.keep_color)
+        && (next.depth == stream::NONE || next.keep_depth)
 }

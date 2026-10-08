@@ -31,7 +31,7 @@
 //! | 11 | `DestroyTexture` | `handle` |
 //! | 12 | `CreateSampler` | `handle`, `filter` (0 nearest, 1 linear), `address` (0 clamp, 1 repeat), `compare` ([`Compare`]; 0 for a sampler that doesn't compare) |
 //! | 13 | `DestroySampler` | `handle` |
-//! | 14 | `BeginPass` | `colour` (a texture, [`SCREEN`] or [`NONE`]), `load` (0 clear, 1 keep), the clear colour `r`, `g`, `b`, `a` as f32, `depth` (a depth texture or [`NONE`]), `depth load`, `clear depth` as f32 |
+//! | 14 | `BeginPass` | `colour` (a texture, [`SCREEN`] or [`NONE`]), `load` (0 clear, 1 keep; plus 2: it may join the pass before, `Pass::join`), the clear colour `r`, `g`, `b`, `a` as f32, `depth` (a depth texture or [`NONE`]), `depth load`, `clear depth` as f32 |
 //! | 15 | `EndPass` | none. Ends a pass that isn't on the screen. |
 //! | 16 | `DispatchIndirect` | `pipeline`, `arguments buffer`, `offset` (three `u32` group counts there), the bindings, the uniforms |
 //! | 17 | `DrawIndirect` | `pipeline`, `arguments buffer`, `offset` (vertex count, instance count, first vertex, first instance there), the bindings, the uniforms |
@@ -306,6 +306,9 @@ pub struct Pass {
     pub color: u32,
     /// Keep what's there rather than clear it.
     pub keep_color: bool,
+    /// It may run as part of the pass before it, if that one ended right before it on the
+    /// same targets and this one keeps them (the host's choice; serial timing times it alone).
+    pub join: bool,
     pub clear: [f32; 4],
     /// A depth texture, or [`NONE`].
     pub depth: u32,
@@ -784,12 +787,15 @@ pub fn decode(batch: &[u8]) -> Result<Vec<Command<'_>>, StreamError> {
             }
             Opcode::BeginPass => {
                 exactly(9)?;
-                if w(1) > 1 || w(7) > 1 {
-                    return Err(bad("a load is 0 (clear) or 1 (keep)"));
+                if w(1) > 3 || w(7) > 1 {
+                    return Err(bad(
+                        "a load is 0 (clear) or 1 (keep); the colour's may add 2 (join)",
+                    ));
                 }
                 Command::BeginPass(Pass {
                     color: w(0),
-                    keep_color: w(1) == 1,
+                    keep_color: w(1) & 1 == 1,
+                    join: w(1) & 2 == 2,
                     clear: [2, 3, 4, 5].map(|i| f32::from_bits(w(i))),
                     depth: w(6),
                     keep_depth: w(7) == 1,
@@ -1092,7 +1098,7 @@ impl Encoder {
         let c = pass.clear.map(f32::to_bits);
         let words = [
             pass.color,
-            u32::from(pass.keep_color),
+            u32::from(pass.keep_color) | u32::from(pass.join) << 1,
             c[0],
             c[1],
             c[2],

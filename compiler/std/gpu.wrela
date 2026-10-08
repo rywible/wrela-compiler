@@ -626,7 +626,11 @@ pub fn begin_pass(
 }
 
 /// Starts a pass that draws into `target`, keeping each fragment nearer than what `depth`
-/// holds. The two must be the same size. Depths are cleared to `clear_depth`, or kept.
+/// holds. The two must be the same size. Depths are cleared to `clear_depth`, or kept. A pass
+/// that keeps both may `join` the pass before it, if that one ended right before it on the
+/// same targets: the host may run the two as one (on a tile-based GPU, the targets aren't
+/// stored and loaded again between them), which pays when this one is light; its timing
+/// alone (the serial mode) is its own.
 pub fn begin_pass_with_depth(
     target: mut Texture,
     depth: mut DepthTexture,
@@ -634,11 +638,12 @@ pub fn begin_pass_with_depth(
     keep: bool = false,
     clear_depth: f32 = 1.0,
     keep_depth: bool = false,
+    join: bool = false,
 ) -> DepthPass {
     let (c, d) = (target.handle, depth.handle)
     begin_pass_command(
         c,
-        u32(keep),
+        u32(keep) | u32(join) << 1,
         clear.x,
         clear.y,
         clear.z,

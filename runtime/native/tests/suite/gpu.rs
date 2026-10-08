@@ -344,6 +344,7 @@ fn indexed_indirect_draws_cull_and_bias() {
         .begin_pass(Pass {
             color: stream::SCREEN,
             keep_color: false,
+            join: false,
             clear: [0.0, 0.0, 0.0, 1.0],
             depth: 9,
             keep_depth: false,

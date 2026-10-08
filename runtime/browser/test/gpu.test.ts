@@ -264,7 +264,7 @@ function sampled(): Manifest {
 
 const offscreen = (color: number, depth: number, keep = false) => ({
   color,
-  keepColor: keep,
+  keepColor: keep, join: false,
   clear: [0, 0, 0, 1] as [number, number, number, number],
   depth,
   keepDepth: false,
@@ -322,6 +322,10 @@ test("a pass into textures draws with the pipeline made for their formats, and i
       .draw(0, 3, 1, [1, 2], u(3))
       .endPass(),
   );
+  expect(kinds(device.events)).not.toContain("submit");
+  // The last pass waits for what follows (it may be joined) and is recorded at the flush.
+  executor.flush();
+  expect(kinds(device.events).at(-1)).toBe("submit");
   // The screen's format with and without a depth target, and a depth pass, were made at load;
   // another format's variant is made at its first draw.
   expect(device.variants).toEqual(["draw rgba16float|none"]);
@@ -330,9 +334,31 @@ test("a pass into textures draws with the pipeline made for their formats, and i
     { kind: "renderPass", clear: { r: 0, g: 0, b: 0, a: 0 }, view: "none", depth: "texture 4 clear" },
     { kind: "renderPass", clear: { r: 0, g: 0, b: 0, a: 1 }, view: "texture 3", load: "load" },
   ]);
-  expect(kinds(device.events)).not.toContain("submit");
+});
+
+test("a pass that may join the one before, on the same targets kept, runs as part of it", async () => {
+  const { device, run, executor } = await setup();
+  run(
+    new Encoder()
+      .createBuffer(1, 64)
+      .createBuffer(2, 64)
+      .createTexture(3, 8, 8, "rgba8unorm")
+      .createTexture(4, 8, 8, "depth32float")
+      .beginPass(offscreen(3, 4))
+      .draw(0, 3, 1, [1, 2], u(0))
+      .endPass()
+      .label("joins")
+      .beginPass({ ...offscreen(3, 4, true), keepDepth: true, join: true })
+      .draw(0, 3, 1, [1, 2], u(1))
+      .endPass()
+      .beginPass({ ...offscreen(3, 4, true), keepDepth: true })
+      .draw(0, 3, 1, [1, 2], u(2))
+      .endPass(),
+  );
   executor.flush();
-  expect(kinds(device.events).at(-1)).toBe("submit");
+  // The second runs in the first's render pass; the third, which may not join, is its own.
+  expect(device.events.filter((e) => e.kind === "renderPass").length).toBe(2);
+  expect(device.events.filter((e) => e.kind === "draw").length).toBe(3);
 });
 
 test("copies and indirect work are recorded in order", async () => {

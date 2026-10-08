@@ -88,7 +88,7 @@ fn command(c: &Command) -> Value {
         Command::BeginPass(p) => json!({
             "op": "BeginPass",
             "pass": {
-                "color": p.color, "keepColor": p.keep_color, "clear": p.clear, "depth": p.depth,
+                "color": p.color, "keepColor": p.keep_color, "join": p.join, "clear": p.clear, "depth": p.depth,
                 "keepDepth": p.keep_depth, "clearDepth": p.clear_depth,
             },
         }),
@@ -150,6 +150,7 @@ fn offscreen() -> Pass {
     Pass {
         color: 8,
         keep_color: false,
+        join: false,
         clear: [0.0, 0.0, 0.0, 1.0],
         depth: 9,
         keep_depth: false,
@@ -452,6 +453,7 @@ fn checks() -> Value {
     let pass = Pass {
         color: 8,
         keep_color: false,
+        join: false,
         clear: [0.0; 4],
         depth: 9,
         keep_depth: false,

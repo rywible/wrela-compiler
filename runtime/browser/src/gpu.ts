@@ -455,7 +455,10 @@ export class GpuExecutor {
    * `Ring`). */
   readonly #uploads: Ring;
   #encoder: GPUCommandEncoder | null = null;
-  #pass: { pass: Pass; draws: PendingDraw[] } | null = null;
+  #pass: OpenPass | null = null;
+  /** A pass that ended, not yet recorded: the next pass continues it if it may join it, on the
+   * same targets, keeping them (`fuses`). Not in the serial mode, which times each alone. */
+  #ended: OpenPass | null = null;
   readonly #timer: Timer | null;
   /** A debug build's: the flag its pipelines' bounds checks set (the manifest's `debug_flag`),
    * and the buffer it's read back through, made once. */
@@ -576,6 +579,15 @@ export class GpuExecutor {
   }
 
   #run(cmd: Command): void {
+    if (this.#ended !== null) {
+      if (cmd.op === "BeginPass" && fuses(this.#ended.pass, cmd.pass)) {
+        this.#pass = this.#ended;
+        this.#ended = null;
+        return;
+      }
+      // A label names the next pass, which may yet continue this one.
+      if (cmd.op !== "Label") this.#recordEnded();
+    }
     switch (cmd.op) {
       case "CreateBuffer":
         this.#allocated(cmd.size);
@@ -661,12 +673,13 @@ export class GpuExecutor {
         return;
       case "BeginScreenPass":
         this.#pass = {
-          pass: { color: SCREEN, keepColor: false, clear: cmd.clear, depth: NONE, keepDepth: false, clearDepth: 1 },
+          pass: { color: SCREEN, keepColor: false, join: false, clear: cmd.clear, depth: NONE, keepDepth: false, clearDepth: 1 },
           draws: [],
+          label: this.#takeLabel(),
         };
         return;
       case "BeginPass":
-        this.#pass = { pass: cmd.pass, draws: [] };
+        this.#pass = { pass: cmd.pass, draws: [], label: this.#takeLabel() };
         return;
       case "Draw":
       case "DrawIndirect":
@@ -701,6 +714,7 @@ export class GpuExecutor {
   /** Submits everything recorded so far, after writing its uniform bytes, then destroys the
    * resources the program destroyed (WebGPU waits for submitted work that uses them). */
   flush(): void {
+    this.#recordEnded();
     if (this.#encoder !== null) {
       this.#uniforms.write(this.device.queue);
       this.#uploads.write(this.device.queue);
@@ -945,11 +959,34 @@ export class GpuExecutor {
     return v;
   }
 
-  /** Records the open pass's draws: on the screen (Present) or into textures (EndPass). */
+  #takeLabel(): string | null {
+    const label = this.#label;
+    this.#label = null;
+    return label;
+  }
+
+  /** Ends the open pass: on the screen (Present) it's recorded; into textures (EndPass), it
+   * waits for the next command, which may continue it (`fuses`), unless the mode is serial. */
   #endPass(op: OpcodeName): void {
     const open = this.#pass;
     this.#pass = null;
     if (open === null) throw new Error(`host bug: ${op} without a pass`);
+    if (op === "EndPass" && this.#deferred === null) {
+      this.#ended = open;
+      return;
+    }
+    this.#recordPass(op, open);
+  }
+
+  /** Records the pass that ended and waits, if there is one. */
+  #recordEnded(): void {
+    const open = this.#ended;
+    this.#ended = null;
+    if (open !== null) this.#recordPass("EndPass", open);
+  }
+
+  /** Records a pass's draws into one render pass. */
+  #recordPass(op: OpcodeName, open: OpenPass): void {
     const pass = open.pass;
     const onScreen = pass.color === SCREEN;
     const colorView = onScreen ? this.screen.texture().createView() : pass.color === NONE ? null : this.#texture(pass.color).view;
@@ -971,8 +1008,7 @@ export class GpuExecutor {
       indices: d.op === "DrawIndexedIndirect" ? this.#buffer(d.indices) : null,
     }));
     const [r, g, b, a] = pass.clear;
-    const label = this.#label ?? (onScreen ? "screen pass" : "pass");
-    this.#label = null;
+    const label = open.label ?? (onScreen ? "screen pass" : "pass");
     const timed = this.#timestamps(label);
     const encoder = this.#encoderNow();
     const rp = encoder.beginRenderPass({
@@ -1023,4 +1059,20 @@ export class GpuExecutor {
       this.flush();
     }
   }
+}
+
+/** A pass between its beginning and `Present` or `EndPass`, and the name the program gave it. */
+type OpenPass = { pass: Pass; draws: PendingDraw[]; label: string | null };
+
+/** Whether pass `next`, beginning right after `ended` ended, continues it as one render pass: it
+ * may join, on the same targets, kept (not cleared), and not the screen. */
+function fuses(ended: Pass, next: Pass): boolean {
+  return (
+    next.join &&
+    next.color !== SCREEN &&
+    next.color === ended.color &&
+    next.depth === ended.depth &&
+    (next.color === NONE || next.keepColor) &&
+    (next.depth === NONE || next.keepDepth)
+  );
 }

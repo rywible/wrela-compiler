@@ -98,7 +98,7 @@ export class Encoder {
   }
 
   beginPass(p: Pass): this {
-    const ws = [p.color, Number(p.keepColor), ...p.clear.map(f32bits), p.depth, Number(p.keepDepth), f32bits(p.clearDepth)];
+    const ws = [p.color, Number(p.keepColor) | (Number(p.join) << 1), ...p.clear.map(f32bits), p.depth, Number(p.keepDepth), f32bits(p.clearDepth)];
     return this.#command(Opcode.BeginPass, ws);
   }
 
