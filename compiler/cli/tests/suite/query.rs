@@ -2,7 +2,7 @@
 //! queries about a program (types, callers, callees, impls, effects, borrows, instantiations,
 //! signatures), and `context` gives an item's source and what's around it within a budget.
 
-mod common;
+use crate::common;
 
 use std::io::Write;
 use std::path::PathBuf;

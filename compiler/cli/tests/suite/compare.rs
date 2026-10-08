@@ -2,7 +2,7 @@
 //! disc drawn where the ball is, registered), two balls side by side, and one literal swept.
 //! They need a GPU.
 
-mod common;
+use crate::common;
 
 use std::path::{Path, PathBuf};
 

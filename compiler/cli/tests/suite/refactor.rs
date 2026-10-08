@@ -3,7 +3,7 @@
 //! errors) when the program wouldn't check, when a call would quietly change its target, or
 //! when a plan is applied to a file that changed since.
 
-mod common;
+use crate::common;
 
 use std::path::{Path, PathBuf};
 

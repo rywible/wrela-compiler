@@ -1,7 +1,7 @@
 //! `wrela doc` (AC13): every public item of std is found by its path, with its signature, in
 //! under 100 ms (timed in a release build: a debug build's parser is slower).
 
-mod common;
+use crate::common;
 
 use std::time::Instant;
 

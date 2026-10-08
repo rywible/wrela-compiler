@@ -1,6 +1,5 @@
 //! What the command's tests share: a package in a scratch directory, the `wrela` command, and
-//! what it prints. Each test file uses some of it.
-#![allow(dead_code)]
+//! what it prints. Each module uses some of it.
 
 use std::path::PathBuf;
 use std::process::Command;

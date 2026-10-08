@@ -53,6 +53,10 @@ large_enum_variant = "allow"
 
 [profile.release]
 overflow-checks = true
+# Release is what the tests and the gate build, so it's the edit loop's: incrementally, a change
+# to sema rebuilds every test program in 4.6 s instead of 21, and `wrela check` and `build` run
+# 2–4% slower (measured on the clearing and the herd). Dependencies aren't affected.
+incremental = true
 
 # Tests are most of what runs in dev builds: opt-level 1 runs them several times faster and
 # rebuilds no slower than 0 (measured on the workspace). Dependencies are built once, at 2.

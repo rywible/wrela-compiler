@@ -2,7 +2,7 @@
 //! by frame; the first frame it's below the ground; and a debug build that stops where a
 //! simulation makes a NaN, where a release build goes on with one.
 
-mod common;
+use crate::common;
 
 use std::path::PathBuf;
 use std::process::Output;

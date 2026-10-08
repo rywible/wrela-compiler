@@ -10,7 +10,8 @@
 
 use std::collections::BTreeSet;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
 use wrela_diag::{Diagnostic, SourceMap, Span, codes};
 use wrela_lower::{BuildData, ConstLowering, ConstModule, Embeds, Memory};
 use wrela_sema::Checked;
@@ -71,7 +72,6 @@ pub fn compute(checked: &Checked, sources: &SourceMap, data: &mut BuildData) -> 
         .map(|i| ConstId(i as u32))
         .filter(|&c| wrela_lower::is_computed(checked, c))
         .collect();
-    let mut engine = None;
     let mut failed = BTreeSet::new();
     while !pending.is_empty() {
         let (lowering, d) = wrela_lower::lower_consts(checked, &pending, data);
@@ -111,8 +111,7 @@ pub fn compute(checked: &Checked, sources: &SourceMap, data: &mut BuildData) -> 
         if errors {
             break;
         }
-        let engine = engine.get_or_insert_with(new_engine);
-        for (c, result) in run(engine, checked, sources, &module, !data.no_simd) {
+        for (c, result) in run(&ENGINE, checked, sources, &module, !data.no_simd) {
             match result {
                 Ok(v) => {
                     data.values.insert(c, Rc::new(v));
@@ -128,13 +127,17 @@ pub fn compute(checked: &Checked, sources: &SourceMap, data: &mut BuildData) -> 
     diags
 }
 
-fn new_engine() -> wasmtime::Engine {
+/// The process's one engine for the code builds run (constants and tests), as wasmtime intends:
+/// an engine is costly to make, and cheap to share.
+static ENGINE: LazyLock<wasmtime::Engine> = LazyLock::new(|| {
     let mut config = wasmtime::Config::new();
     config.consume_fuel(true);
     // A program's code uses atomics (its memory is shared with workers when it runs).
     config.wasm_threads(true);
+    // As the native host's engine: no native unwind info (macOS registers it under a lock).
+    config.native_unwind_info(false);
     wasmtime::Engine::new(&config).expect("wasmtime's configuration is valid")
-}
+});
 
 /// E0328 for constants that read each other, through the functions that compute them: one
 /// cycle among `blocked` (each with the constants it needs).
@@ -312,26 +315,54 @@ pub fn run_tests(
     let Some(module) = module.filter(|_| !wrela_diag::has_errors(&diags)) else {
         return (Vec::new(), diags);
     };
-    let engine = new_engine();
-    let compiled = match compile(&engine, &module.module, !data.no_simd) {
+    let compiled = match compile(&ENGINE, &module.module, !data.no_simd) {
         Ok(c) => c,
         Err(msg) => return (Vec::new(), vec![Diagnostic::internal(msg)]),
     };
-    let mut results = Vec::new();
-    for (f, name) in &module.exports {
-        let ran = compiled.start(&engine).map_err(Diagnostic::internal);
-        let failed = match ran.map(|mut r| r.call(name, fuel)) {
-            Ok(Ok(_)) => None,
-            Err(d) => Some(d),
-            Ok(Err(CallError::Internal(e))) => Some(Diagnostic::internal(format!("{e:#}"))),
-            Ok(Err(CallError::Failed(e, panic))) => {
-                let fault = Fault::of(&e, panic);
-                Some(failure(checked, sources, &compiled.lines, Item::Test(*f, fuel), &fault, None))
-            }
-        };
-        results.push((*f, failed));
-    }
+    let names: Vec<&str> = module.exports.iter().map(|(_, name)| name.as_str()).collect();
+    let ran = each_at_once(&names, |name| compiled.start(&ENGINE).map(|mut r| r.call(name, fuel)));
+    let results = module
+        .exports
+        .iter()
+        .zip(ran)
+        .map(|((f, _), ran)| {
+            let failed = match ran {
+                Ok(Ok(_)) => None,
+                Err(msg) => Some(Diagnostic::internal(msg)),
+                Ok(Err(CallError::Internal(e))) => Some(Diagnostic::internal(format!("{e:#}"))),
+                Ok(Err(CallError::Failed(e, panic))) => {
+                    let fault = Fault::of(&e, panic);
+                    let item = Item::Test(*f, fuel);
+                    Some(failure(checked, sources, &compiled.lines, item, &fault, None))
+                }
+            };
+            (*f, failed)
+        })
+        .collect();
     (results, diags)
+}
+
+/// `run` of each of `items`, on as many threads as the machine has cores: the results in the
+/// items' order. Each test runs in an instance of its own, so one doesn't wait on another.
+fn each_at_once<T: Sync, R: Send>(items: &[T], run: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(items.len());
+    let next = AtomicUsize::new(0);
+    let done = Mutex::new(Vec::with_capacity(items.len()));
+    std::thread::scope(|s| {
+        for _ in 0..threads {
+            s.spawn(|| {
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(item) = items.get(i) else { break };
+                    let r = run(item);
+                    done.lock().unwrap_or_else(|p| p.into_inner()).push((i, r));
+                }
+            });
+        }
+    });
+    let mut done = done.into_inner().unwrap_or_else(|p| p.into_inner());
+    done.sort_by_key(|(i, _)| *i);
+    done.into_iter().map(|(_, r)| r).collect()
 }
 
 /// What failed: computing a constant, or a test (with the fuel it ran with).

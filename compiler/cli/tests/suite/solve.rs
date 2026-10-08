@@ -2,7 +2,7 @@
 //! literals on the lines named, which end rounded to their decimals, and `--write` writes them
 //! back through `wrela edit`: only those literals' characters change.
 
-mod common;
+use crate::common;
 
 use std::path::PathBuf;
 

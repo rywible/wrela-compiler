@@ -3,7 +3,7 @@
 //! changes nothing. Only the package's own files change, and every place the report names is
 //! in the files as they are after.
 
-mod common;
+use crate::common;
 
 use std::path::{Path, PathBuf};
 

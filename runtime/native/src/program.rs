@@ -40,6 +40,10 @@ fn engine(fuel: bool) -> Engine {
     // A program's memory is shared with its workers (wrela_abi::memory). Wasmtime's threads are
     // a tier 2 feature: no security updates for old releases.
     config.wasm_threads(true).shared_memory(true).consume_fuel(fuel);
+    // No native unwind info: wasmtime's backtraces and its handling of a panic in a host
+    // function don't need it, and macOS registers it for every function under one lock per
+    // process, so a test binary's threads queued on it as they loaded programs.
+    config.native_unwind_info(false);
     Engine::new(&config).expect("wasmtime's configuration is valid")
 }
 
