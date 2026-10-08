@@ -76,6 +76,9 @@ pub struct PipelineOut {
     pub blend: bool,
     /// A render pipeline whose fragment shader gives its depth (`WithDepth`).
     pub writes_depth: bool,
+    /// A render pipeline whose fragment shader returns a `u32`: drawn into an `R32Uint`
+    /// texture.
+    pub uint: bool,
     /// The functions its module instantiates, with their type arguments (`wrela query`).
     pub instances: Vec<(FnId, Vec<TyId>)>,
 }
@@ -146,11 +149,13 @@ pub(crate) enum ParamClass {
         len: u32,
     },
     /// A `Texture`, a `DepthTexture` or a `Texture3d` (`three`), bound by its handle; or a
-    /// kernel's `Texels` or `Texels3d` (`storage`), bound by its texture's.
+    /// kernel's `Texels` or `Texels3d` (`storage`), bound by its texture's. Its texels' format
+    /// (a depth texture's is `R32Float`).
     Texture {
         depth: bool,
         storage: bool,
         three: bool,
+        format: ir::TexFormat,
     },
     /// A `Sampler` or a `ComparisonSampler`, bound by its handle.
     Sampler {
@@ -195,11 +200,13 @@ fn class_of(cx: &Cx, ty: TyId, mode: Mode, varyings: Option<TyId>) -> ParamClass
     match p.lang_of_ty(ty) {
         Some(l @ (Lang::Texture | Lang::DepthTexture | Lang::Texels)) => {
             let (depth, storage) = (l == Lang::DepthTexture, l == Lang::Texels);
-            return ParamClass::Texture { depth, storage, three: false };
+            let format = texture_format(cx, ty);
+            return ParamClass::Texture { depth, storage, three: false, format };
         }
         Some(l @ (Lang::Texture3d | Lang::Texels3d)) => {
             let storage = l == Lang::Texels3d;
-            return ParamClass::Texture { depth: false, storage, three: true };
+            let format = texture_format(cx, ty);
+            return ParamClass::Texture { depth: false, storage, three: true, format };
         }
         Some(Lang::Sampler) => return ParamClass::Sampler { comparison: false },
         Some(Lang::ComparisonSampler) => return ParamClass::Sampler { comparison: true },
@@ -239,11 +246,24 @@ fn class_of(cx: &Cx, ty: TyId, mode: Mode, varyings: Option<TyId>) -> ParamClass
 fn resource_class(cx: &Cx, ty: TyId) -> Option<ParamClass> {
     let p = &cx.checked.program;
     Some(match (p.lang_of_ty(ty)?, p.types.kind(ty)) {
-        (Lang::Texture, _) => ParamClass::Texture { depth: false, storage: false, three: false },
-        (Lang::DepthTexture, _) => {
-            ParamClass::Texture { depth: true, storage: false, three: false }
-        }
-        (Lang::Texture3d, _) => ParamClass::Texture { depth: false, storage: false, three: true },
+        (Lang::Texture, _) => ParamClass::Texture {
+            depth: false,
+            storage: false,
+            three: false,
+            format: texture_format(cx, ty),
+        },
+        (Lang::DepthTexture, _) => ParamClass::Texture {
+            depth: true,
+            storage: false,
+            three: false,
+            format: ir::TexFormat::R32Float,
+        },
+        (Lang::Texture3d, _) => ParamClass::Texture {
+            depth: false,
+            storage: false,
+            three: true,
+            format: texture_format(cx, ty),
+        },
         (Lang::Sampler, _) => ParamClass::Sampler { comparison: false },
         (Lang::ComparisonSampler, _) => ParamClass::Sampler { comparison: true },
         (Lang::GpuSpan, TyKind::Adt(_, args)) => {
@@ -251,6 +271,34 @@ fn resource_class(cx: &Cx, ty: TyId) -> Option<ParamClass> {
         }
         _ => return None,
     })
+}
+
+/// The format of a texture type's texels (`Texture<F>`, `Texels<F>`, ...): its first type
+/// argument's; a depth texture's, `R32Float`.
+pub(crate) fn texture_format(cx: &Cx, ty: TyId) -> ir::TexFormat {
+    let p = &cx.checked.program;
+    let TyKind::Adt(_, args) = p.types.kind(ty) else { return ir::TexFormat::R32Float };
+    match args.first().and_then(|&f| p.lang_of_ty(f)) {
+        Some(Lang::Rgba8) => ir::TexFormat::Rgba8Unorm,
+        Some(Lang::Rgba16Float) => ir::TexFormat::Rgba16Float,
+        Some(Lang::R16Float) => ir::TexFormat::R16Float,
+        Some(Lang::Rg16Float) => ir::TexFormat::Rg16Float,
+        Some(Lang::R32Uint) => ir::TexFormat::R32Uint,
+        _ => ir::TexFormat::R32Float,
+    }
+}
+
+/// The stream's and the manifest's format for an IR one.
+pub(crate) fn stream_format(f: ir::TexFormat) -> wrela_abi::stream::TextureFormat {
+    use wrela_abi::stream::TextureFormat as T;
+    match f {
+        ir::TexFormat::Rgba8Unorm => T::Rgba8,
+        ir::TexFormat::Rgba16Float => T::Rgba16Float,
+        ir::TexFormat::R16Float => T::R16Float,
+        ir::TexFormat::Rg16Float => T::Rg16Float,
+        ir::TexFormat::R32Float => T::R32Float,
+        ir::TexFormat::R32Uint => T::R32Uint,
+    }
 }
 
 /// How a group's field of type `ty` is passed: bound, a group of its own, or a value in the
@@ -1205,6 +1253,13 @@ fn shared_op(fl: &mut Fl, l: Lang, c: &mir::Call, ty: Option<TyId>) -> Option<ir
             for a in &c.args[1..] {
                 vals.push(fl.arg_value(a)?);
             }
+            // The texel, written as four of its format's scalar (the channels it lacks, 0).
+            if let ir::ResourceKind::StorageTexture { format, .. } =
+                fl.mb.m.resources[r.index()].kind
+                && let Some(last) = vals.pop()
+            {
+                vals.push(widen(fl, last, format.scalar()));
+            }
             fl.emit(ir::Stmt::Eval(ir::Expr::TextureStore(r, vals)));
             None
         }
@@ -1357,7 +1412,18 @@ fn texture_read(fl: &mut Fl, l: Lang, c: &mir::Call, ty: Option<TyId>) -> Option
         vals.push(fl.arg_value(a)?);
     }
     let t = fl.ty(ty?, span)?;
-    let v = fl.value(t, ir::Expr::Texture(op, texture, sampler, vals));
+    // A colour texel is read as four of its format's scalar: the format's texel is their first.
+    let colour = match fl.mb.m.resources[texture.index()].kind {
+        ir::ResourceKind::Texture { depth: false, format, .. } => Some(format),
+        _ => None,
+    };
+    let texel = !matches!(op, T::Width | T::Height | T::Depth);
+    let read = match colour {
+        Some(f) if texel => fl.mb.m.types.intern(ir::TypeDef::Vector(f.scalar(), 4)),
+        _ => t,
+    };
+    let v = fl.value(read, ir::Expr::Texture(op, texture, sampler, vals));
+    let v = narrow(fl, v, t);
     if op.uses_derivatives() {
         // `sample` and `sample_compare` pick a texture's detail from neighbouring pixels, as
         // derivatives do.
@@ -1372,6 +1438,46 @@ fn texture_read(fl: &mut Fl, l: Lang, c: &mir::Call, ty: Option<TyId>) -> Option
         });
     }
     Some(v)
+}
+
+/// `v`, a vector of four, as a value of type `t`: its first component, or first components, if
+/// `t` has fewer (a format's texel, read as four of its scalar).
+fn narrow(fl: &mut Fl, v: ir::ValueId, t: ir::TypeId) -> ir::ValueId {
+    if fl.f.value_ty(v) == t {
+        return v;
+    }
+    match *fl.mb.m.types.get(t) {
+        ir::TypeDef::Scalar(_) => fl.value(t, ir::Expr::Extract(v, 0)),
+        ir::TypeDef::Vector(_, n) => fl.value(t, ir::Expr::Swizzle(v, (0..n).collect())),
+        _ => v,
+    }
+}
+
+/// `v`, a format's texel (a scalar or a vector of `s`), as four of `s`: the components it lacks
+/// 0, as a texture's write takes it.
+fn widen(fl: &mut Fl, v: ir::ValueId, s: ir::Scalar) -> ir::ValueId {
+    let four = fl.mb.m.types.intern(ir::TypeDef::Vector(s, 4));
+    let vt = fl.f.value_ty(v);
+    if vt == four {
+        return v;
+    }
+    let st = fl.mb.m.types.intern(ir::TypeDef::Scalar(s));
+    let zero = fl.value(
+        st,
+        ir::Expr::Const(match s {
+            ir::Scalar::U32 => ir::Const::U32(0),
+            ir::Scalar::I32 => ir::Const::I32(0),
+            _ => ir::Const::F32(0.0),
+        }),
+    );
+    let mut parts = match *fl.mb.m.types.get(vt) {
+        ir::TypeDef::Vector(_, n) => {
+            (0..u32::from(n)).map(|k| fl.value(st, ir::Expr::Extract(v, k))).collect()
+        }
+        _ => vec![v],
+    };
+    parts.resize(4, zero);
+    fl.value(four, ir::Expr::Construct(four, parts))
 }
 
 /// E0607 for a derivative outside a fragment shader. In one, where it is (`v`), for E0608.
@@ -1591,8 +1697,8 @@ fn entry_module(cx: &mut Cx, iface: Rc<Interface>, stage: Entry) -> EntryModule 
         else {
             continue;
         };
-        for (k, kind) in kinds.into_iter().enumerate() {
-            bindings.push(ResourceBinding { binding: binding + k as u32, kind, stage });
+        for (k, (kind, format)) in kinds.into_iter().enumerate() {
+            bindings.push(ResourceBinding { binding: binding + k as u32, kind, stage, format });
         }
         bind(&mut resources, leaf, id);
     }
@@ -1607,6 +1713,7 @@ fn entry_module(cx: &mut Cx, iface: Rc<Interface>, stage: Entry) -> EntryModule 
             binding,
             kind: BindingKind::Read,
             stage: BindingStage::Both,
+            format: None,
         });
         if let Some(g) = mb.gpu.as_mut() {
             g.literals = Some(id);
@@ -1683,10 +1790,13 @@ fn entry_module(cx: &mut Cx, iface: Rc<Interface>, stage: Entry) -> EntryModule 
     EntryModule { mb, keys, bindings, uniform }
 }
 
+/// What a resource binding is in the manifest: its kind, and a colour texture's format.
+type Binds = Vec<(BindingKind, Option<wrela_abi::stream::TextureFormat>)>;
+
 /// Adds the resource what's of `class` (a parameter, or a group's field) is bound to, at
-/// `binding`, named `name`: its id, and the manifest's kind of each binding it takes (an
-/// `Append` takes two: its items, then its count). `None` for a class that isn't bound, or a
-/// buffer of what has no runtime value (reported).
+/// `binding`, named `name`: its id, and the manifest's kind (and format) of each binding it
+/// takes (an `Append` takes two: its items, then its count). `None` for a class that isn't
+/// bound, or a buffer of what has no runtime value (reported).
 fn add_bound(
     cx: &mut Cx,
     mb: &mut ModuleBuilder,
@@ -1694,8 +1804,8 @@ fn add_bound(
     name: &str,
     binding: u32,
     span: Span,
-) -> Option<(ir::ResourceId, Vec<BindingKind>)> {
-    let (kind, ty, bk) = match *class {
+) -> Option<(ir::ResourceId, Binds)> {
+    let (kind, ty, bk, format) = match *class {
         ParamClass::Append { elem } => {
             let Some(ty) = cx.lower_ty(mb, elem, span) else {
                 cx.holds_nothing("buffer", elem, span);
@@ -1706,7 +1816,10 @@ fn add_bound(
             let count = mb.m.types.intern(ir::TypeDef::Atomic(ir::Scalar::U32));
             let name = format!("{name}_count");
             mb.m.add_resource(ir::Resource { name, binding: binding + 1, kind, ty: count });
-            return Some((id, vec![BindingKind::ReadWrite, BindingKind::ReadWrite]));
+            return Some((
+                id,
+                vec![(BindingKind::ReadWrite, None), (BindingKind::ReadWrite, None)],
+            ));
         }
         ParamClass::Buffer { elem, read_write, atomic } => {
             let Some(ty) = cx.lower_ty(mb, elem, span) else {
@@ -1727,32 +1840,34 @@ fn add_bound(
                 ty
             };
             if read_write {
-                (ir::ResourceKind::StorageReadWrite, ty, BindingKind::ReadWrite)
+                (ir::ResourceKind::StorageReadWrite, ty, BindingKind::ReadWrite, None)
             } else {
-                (ir::ResourceKind::StorageRead, ty, BindingKind::Read)
+                (ir::ResourceKind::StorageRead, ty, BindingKind::Read, None)
             }
         }
-        ParamClass::Texture { storage: true, three, .. } => {
+        ParamClass::Texture { storage: true, three, format, .. } => {
             let bk =
                 if three { BindingKind::StorageTexture3d } else { BindingKind::StorageTexture };
-            (ir::ResourceKind::StorageTexture { three }, mb.m.types.u32(), bk)
+            let kind = ir::ResourceKind::StorageTexture { three, format };
+            (kind, mb.m.types.u32(), bk, Some(stream_format(format)))
         }
-        ParamClass::Texture { depth, three, .. } => {
+        ParamClass::Texture { depth, three, format, .. } => {
             let bk = match (depth, three) {
                 (true, _) => BindingKind::DepthTexture,
                 (false, true) => BindingKind::Texture3d,
                 (false, false) => BindingKind::Texture,
             };
-            (ir::ResourceKind::Texture { depth, three }, mb.m.types.u32(), bk)
+            let kind = ir::ResourceKind::Texture { depth, three, format };
+            (kind, mb.m.types.u32(), bk, (!depth).then(|| stream_format(format)))
         }
         ParamClass::Sampler { comparison } => {
             let bk = if comparison { BindingKind::ComparisonSampler } else { BindingKind::Sampler };
-            (ir::ResourceKind::Sampler { comparison }, mb.m.types.u32(), bk)
+            (ir::ResourceKind::Sampler { comparison }, mb.m.types.u32(), bk, None)
         }
         _ => return None,
     };
     let id = mb.m.add_resource(ir::Resource { name: name.to_string(), binding, kind, ty });
-    Some((id, vec![bk]))
+    Some((id, vec![(bk, format)]))
 }
 
 /// The uniform block resource (binding 0), from the interface's uniforms: those with a runtime
@@ -1948,6 +2063,7 @@ fn lower_compute(cx: &mut Cx, iface: Rc<Interface>) -> Option<PipelineOut> {
         debug_flag: None,
         blend: false,
         writes_depth: false,
+        uint: false,
         instances,
     })
 }
@@ -1970,6 +2086,7 @@ fn lower_render(cx: &mut Cx, iface: Rc<Interface>) -> Option<PipelineOut> {
     let fret_t = ret_type(cx, fragment.func, &fragment.substs);
     let blend = checked.program.lang_of_ty(fret_t) == Some(Lang::Over);
     let writes_depth = checked.program.lang_of_ty(fret_t) == Some(Lang::WithDepth);
+    let uint = fret_t == checked.program.types.u32;
     let fret = cx.lower_ty(&mut mb, fret_t, fdef.sig_span);
     let takes_varyings =
         fragment.params.iter().any(|&(t, _)| t == vret) && !is_clip_position(cx, vret);
@@ -2001,6 +2118,7 @@ fn lower_render(cx: &mut Cx, iface: Rc<Interface>) -> Option<PipelineOut> {
         stage: ir::Stage::Fragment {
             varyings: takes_varyings.then_some((vret_ir, varyings)),
             depth: writes_depth,
+            uint,
         },
         function: fentry,
         inputs: entry_inputs(fragment, false),
@@ -2019,6 +2137,7 @@ fn lower_render(cx: &mut Cx, iface: Rc<Interface>) -> Option<PipelineOut> {
         debug_flag: None,
         blend,
         writes_depth,
+        uint,
         instances,
     })
 }

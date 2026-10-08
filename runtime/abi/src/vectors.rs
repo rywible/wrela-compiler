@@ -378,9 +378,26 @@ fn sequences() -> Vec<Value> {
 /// render, 1, 3 and 4 compute; 0 to 3 take 16 uniform bytes, 0 and 1 bind a read-only buffer
 /// then a read-write one, 2 and 3 two read-write ones; 4 takes nothing; 5 renders with a
 /// texture, a sampler, a depth texture and a comparison sampler.
+/// The format a hand-made binding of `kind` names: the vectors' sampled textures are `Rgba8`,
+/// and their storage textures `Rgba16Float`.
+fn format_of(kind: BindingKind) -> Option<TextureFormat> {
+    match kind {
+        BindingKind::Texture | BindingKind::Texture3d => Some(TextureFormat::Rgba8),
+        BindingKind::StorageTexture | BindingKind::StorageTexture3d => {
+            Some(TextureFormat::Rgba16Float)
+        }
+        _ => None,
+    }
+}
+
 pub fn check_manifest() -> Manifest {
     let mut m = Manifest::new("game.wasm");
-    let bind = |binding, kind| ResourceBinding { binding, kind, stage: BindingStage::Both };
+    let bind = |binding, kind| ResourceBinding {
+        binding,
+        kind,
+        stage: BindingStage::Both,
+        format: format_of(kind),
+    };
     let shape = |name: &str, stage| Pipeline {
         name: name.into(),
         shader: format!("{name}.wgsl"),
@@ -397,6 +414,7 @@ pub fn check_manifest() -> Manifest {
         depth_bias: DepthBias::default(),
         depth: DepthState::default(),
         writes_depth: false,
+        uint: false,
     };
     m.pipelines.push(shape("draw", render.clone()));
     let compute = Stage::Compute { entry: "main".into(), workgroup_size: [64, 1, 1] };
@@ -899,6 +917,7 @@ pub(crate) fn sample_manifest() -> Manifest {
             binding: 1,
             kind: BindingKind::ReadWrite,
             stage: BindingStage::Both,
+            format: None,
         }],
         debug_flag: None,
     });
@@ -913,11 +932,22 @@ pub(crate) fn sample_manifest() -> Manifest {
             depth_bias: DepthBias::default(),
             depth: DepthState::default(),
             writes_depth: false,
+            uint: false,
         },
         uniform: None,
         bindings: vec![
-            ResourceBinding { binding: 0, kind: BindingKind::Texture, stage: BindingStage::Both },
-            ResourceBinding { binding: 1, kind: BindingKind::Sampler, stage: BindingStage::Both },
+            ResourceBinding {
+                binding: 0,
+                kind: BindingKind::Texture,
+                stage: BindingStage::Both,
+                format: Some(TextureFormat::Rgba8),
+            },
+            ResourceBinding {
+                binding: 1,
+                kind: BindingKind::Sampler,
+                stage: BindingStage::Both,
+                format: None,
+            },
         ],
         debug_flag: None,
     });
@@ -1065,7 +1095,7 @@ fn manifests() -> Vec<Value> {
             "too many storage buffers",
             edited(&|m| {
                 m.pipelines[1].bindings = (0..9)
-                    .map(|i| ResourceBinding { binding: i, kind: BindingKind::Read, stage: BindingStage::Both })
+                    .map(|i| ResourceBinding { binding: i, kind: BindingKind::Read, stage: BindingStage::Both, format: None })
                     .collect()
             }),
         ),
@@ -1076,8 +1106,7 @@ fn manifests() -> Vec<Value> {
                     .map(|i| ResourceBinding {
                         binding: i,
                         kind: BindingKind::Read,
-                        stage: if i < 8 { BindingStage::Vertex } else { BindingStage::Fragment },
-                    })
+                        stage: if i < 8 { BindingStage::Vertex } else { BindingStage::Fragment }, format: None })
                     .collect()
             }),
         ),
@@ -1088,8 +1117,7 @@ fn manifests() -> Vec<Value> {
                     .map(|i| ResourceBinding {
                         binding: i,
                         kind: BindingKind::Read,
-                        stage: if i < 4 { BindingStage::Both } else { BindingStage::Vertex },
-                    })
+                        stage: if i < 4 { BindingStage::Both } else { BindingStage::Vertex }, format: None })
                     .collect()
             }),
         ),
@@ -1103,8 +1131,7 @@ fn manifests() -> Vec<Value> {
                 m.pipelines[1].bindings.push(ResourceBinding {
                     binding: 2,
                     kind: BindingKind::ReadWrite,
-                    stage: BindingStage::Vertex,
-                })
+                    stage: BindingStage::Vertex, format: None })
             }),
         ),
         manifest(
@@ -1115,7 +1142,7 @@ fn manifests() -> Vec<Value> {
             "too many storage buffers with a debug flag",
             edited(&|m| {
                 m.pipelines[1].bindings = (0..8)
-                    .map(|i| ResourceBinding { binding: i, kind: BindingKind::Read, stage: BindingStage::Both })
+                    .map(|i| ResourceBinding { binding: i, kind: BindingKind::Read, stage: BindingStage::Both, format: None })
                     .collect();
                 m.pipelines[1].debug_flag = Some(8);
             }),

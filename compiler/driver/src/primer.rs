@@ -178,6 +178,10 @@ pub const RULES: &[(&str, &str)] = &[
         "textures are sampled in fragment shaders, read anywhere on the GPU, drawn into in passes",
     ),
     (
+        "gpu.formats",
+        "a texture's format is a type: its texel, and whether it's filtered, written by kernels, drawn into",
+    ),
+    (
         "gpu.groups",
         "a borrow struct of textures, samplers, spans and `GpuData` values is one GPU parameter",
     ),

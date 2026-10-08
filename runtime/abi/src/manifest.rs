@@ -41,11 +41,12 @@
 
 use crate::Limits;
 pub use crate::stream::Compare;
+use crate::stream::TextureFormat;
 use serde::Serialize;
 use serde_json::{Map, Value};
 use std::fmt;
 
-pub const VERSION: u32 = 6;
+pub const VERSION: u32 = 7;
 /// The screen's texture format, in WebGPU's spelling.
 pub const SCREEN_FORMAT: &str = "rgba8unorm";
 /// WebGPU's default limits that the manifest is checked against ([`Limits::DEFAULT`]).
@@ -115,6 +116,10 @@ pub enum Stage {
         /// Gives each fragment its own depth: drawn only in a pass with a depth target.
         #[serde(skip_serializing_if = "std::ops::Not::not")]
         writes_depth: bool,
+        /// Its fragment shader returns a `u32`: drawn only into an `r32uint` target, which a
+        /// `vec4` colour isn't drawn into.
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        uint: bool,
     },
 }
 
@@ -202,7 +207,7 @@ pub enum BindingKind {
     Read,
     /// A storage buffer it reads and writes.
     ReadWrite,
-    /// A filterable float texture.
+    /// A colour texture (its `format` says what its texels are read as).
     Texture,
     /// A depth texture, for comparison sampling.
     DepthTexture,
@@ -210,12 +215,12 @@ pub enum BindingKind {
     Sampler,
     /// A comparison sampler.
     ComparisonSampler,
-    /// An `rgba16float` texture a kernel writes (a storage texture, written only).
+    /// A colour texture a kernel writes, of its `format` (a storage texture, written only).
     StorageTexture,
-    /// A filterable float 3D texture.
+    /// A colour 3D texture.
     #[serde(rename = "texture_3d")]
     Texture3d,
-    /// An `rgba16float` 3D texture a kernel writes.
+    /// A colour 3D texture a kernel writes.
     #[serde(rename = "storage_texture_3d")]
     StorageTexture3d,
 }
@@ -268,6 +273,10 @@ pub struct ResourceBinding {
     /// Which of a render pipeline's shaders reads it; both, if not given.
     #[serde(skip_serializing_if = "BindingStage::is_both")]
     pub stage: BindingStage,
+    /// A colour texture's format (`texture`, `texture_3d`, `storage_texture`,
+    /// `storage_texture_3d`): what its texels are read as, and a storage texture's format.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format: Option<TextureFormat>,
 }
 
 /// The shaders of a pipeline that see a binding.
@@ -588,9 +597,45 @@ mod read {
             .map(|(j, b)| {
                 let bp = format!("{place}.bindings[{j}]");
                 let bo = object(b, &bp)?;
+                let kind = one_of(bo, "kind", &bp, &kinds)?;
+                // A colour texture's format.
+                let colour = matches!(
+                    kind,
+                    BindingKind::Texture
+                        | BindingKind::Texture3d
+                        | BindingKind::StorageTexture
+                        | BindingKind::StorageTexture3d
+                );
+                let format = match (colour, bo.get("format")) {
+                    (false, None) => None,
+                    (false, Some(_)) => {
+                        return fail(format!("{bp}: only a colour texture has a `format`"));
+                    }
+                    (true, _) => {
+                        let names = TextureFormat::ALL.map(|f| (f.name(), f));
+                        let f = one_of(bo, "format", &bp, &names)?;
+                        if f.is_depth() {
+                            return fail(format!(
+                                "{bp}: a colour texture's format isn't a depth one"
+                            ));
+                        }
+                        let storage = matches!(
+                            kind,
+                            BindingKind::StorageTexture | BindingKind::StorageTexture3d
+                        );
+                        if storage && !f.storable() {
+                            return fail(format!(
+                                "{bp}: kernels can't write {} textures",
+                                f.name()
+                            ));
+                        }
+                        Some(f)
+                    }
+                };
                 Ok(ResourceBinding {
                     binding: u32(bo, "binding", &bp)?,
-                    kind: one_of(bo, "kind", &bp, &kinds)?,
+                    kind,
+                    format,
                     // A missing `stage` is both.
                     stage: match bo.get("stage") {
                         None => BindingStage::Both,
@@ -683,6 +728,11 @@ mod read {
                     Value::Bool(b) => *b,
                     _ => return fail(format!("{place}.writes_depth must be true or false")),
                 },
+                // A missing `uint` is false.
+                uint: match o.get("uint").unwrap_or(&Value::Bool(false)) {
+                    Value::Bool(b) => *b,
+                    _ => return fail(format!("{place}.uint must be true or false")),
+                },
             },
         };
         // A missing `debug_flag` is read as null.
@@ -722,7 +772,7 @@ mod tests {
     fn golden_json() {
         let json = sample().to_json();
         let expected = r#"{
-  "manifest_version": 6,
+  "manifest_version": 7,
   "stream_version": 7,
   "wasm": "game.wasm",
   "pipelines": [
@@ -758,7 +808,8 @@ mod tests {
       "bindings": [
         {
           "binding": 0,
-          "kind": "texture"
+          "kind": "texture",
+          "format": "rgba8unorm"
         },
         {
           "binding": 1,

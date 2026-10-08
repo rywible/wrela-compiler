@@ -12,7 +12,9 @@ import {
   MAX_WORKGROUP_INVOCATIONS,
   MAX_WORKGROUP_SIZE,
   STREAM_VERSION,
+  TEXTURE_FORMATS,
 } from "./abi.gen.ts";
+import type { TextureFormat } from "./stream.ts";
 import { errorMessage } from "./errors.ts";
 
 export type UniformSpace = "uniform" | "storage";
@@ -38,6 +40,8 @@ export interface ResourceBinding {
   binding: number;
   kind: BindingKind;
   stage: BindingStage;
+  /** A colour texture's format: what its texels are read as, and a storage texture's format. */
+  format: TextureFormat | null;
 }
 
 export type Stage =
@@ -53,6 +57,8 @@ export type Stage =
       depth: DepthState;
       /** Gives each fragment its own depth: drawn only in a pass with a depth target. */
       writes_depth: boolean;
+      /** Its fragment shader returns a `u32`: drawn only into an `r32uint` target. */
+      uint: boolean;
     };
 
 export type Cull = "none" | "front" | "back";
@@ -164,7 +170,21 @@ function pipeline(v: unknown, i: number): Pipeline {
     const bo = object(b, bw);
     // A missing `stage` is both.
     const stage: BindingStage = bo["stage"] === undefined ? "both" : oneOf(bo, "stage", bw, ["vertex", "fragment"] as const);
-    return { binding: u32(bo, "binding", bw), kind: oneOf(bo, "kind", bw, BINDING_KINDS), stage };
+    const kind = oneOf(bo, "kind", bw, BINDING_KINDS);
+    // A colour texture's format.
+    const colour = kind === "texture" || kind === "texture_3d" || kind === "storage_texture" || kind === "storage_texture_3d";
+    let format: TextureFormat | null = null;
+    if (!colour) {
+      if (bo["format"] !== undefined) throw new ManifestError(`${bw}: only a colour texture has a \`format\``);
+    } else {
+      const f = TEXTURE_FORMATS.find((t) => t.name === oneOf(bo, "format", bw, TEXTURE_FORMATS.map((t) => t.name)))!;
+      if (f.depth) throw new ManifestError(`${bw}: a colour texture's format isn't a depth one`);
+      if ((kind === "storage_texture" || kind === "storage_texture_3d") && !f.storable) {
+        throw new ManifestError(`${bw}: kernels can't write ${f.name} textures`);
+      }
+      format = f.name;
+    }
+    return { binding: u32(bo, "binding", bw), kind, stage, format };
   });
   const kind = oneOf(o, "kind", where, ["compute", "render"] as const);
   let stage: Stage;
@@ -211,7 +231,10 @@ function pipeline(v: unknown, i: number): Pipeline {
     // A missing `writes_depth` is false.
     const writes_depth = o["writes_depth"] ?? false;
     if (typeof writes_depth !== "boolean") throw new ManifestError(`${where}.writes_depth must be true or false`);
-    stage = { kind, vertex_entry, fragment_entry, blend: b, cull, depth_bias, depth, writes_depth };
+    // A missing `uint` is false.
+    const uint = o["uint"] ?? false;
+    if (typeof uint !== "boolean") throw new ManifestError(`${where}.uint must be true or false`);
+    stage = { kind, vertex_entry, fragment_entry, blend: b, cull, depth_bias, depth, writes_depth, uint };
   }
   // A missing `debug_flag` is read as null.
   const d = o["debug_flag"] ?? null;

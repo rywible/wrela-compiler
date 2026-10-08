@@ -80,6 +80,7 @@ pub fn emit(l: &Lowered, sources: &SourceMap, simd: bool) -> BuildOutput {
                     },
                     depth: state.depth,
                     writes_depth: p.writes_depth,
+                    uint: p.uint,
                 }
             }
             _ => {

@@ -54,6 +54,19 @@ export function pathProblem(path: string): string | undefined {
 }
 
 const formatOf = (f: TextureFormat) => TEXTURE_FORMATS.find((t) => t.name === f)!;
+/** That texture `handle`, of format `got`, is of the format its binding names. */
+function sameFormat(err: (why: string) => Error, handle: number, got: TextureFormat, want: TextureFormat | null): void {
+  if (want !== null && want !== got) throw err(`texture ${handle} is ${got}, and it's bound where a ${want} texture goes`);
+}
+
+/** How a shader reads a colour texture of format `f`: filtered floats, unfiltered floats, or
+ * unsigned integers. */
+export function sampleType(f: TextureFormat | null): GPUTextureSampleType {
+  if (f === null) return "float";
+  const t = formatOf(f);
+  return t.uint ? "uint" : t.filterable ? "float" : "unfilterable-float";
+}
+
 /** Whether a texture format is a depth format. */
 export const isDepth = (f: TextureFormat) => formatOf(f).depth;
 /** The bytes of one texel of a texture format. */
@@ -63,7 +76,8 @@ interface Shape {
   name: string;
   compute: boolean;
   uniformSize: number;
-  bindings: BindingKind[];
+  /** Each binding's kind, and a colour texture's format. */
+  bindings: { kind: BindingKind; format: TextureFormat | null }[];
 }
 
 /** A live resource. */
@@ -96,7 +110,7 @@ export class Checker {
       name: p.name,
       compute: p.kind === "compute",
       uniformSize: p.uniform?.size ?? 0,
-      bindings: p.bindings.map((b) => b.kind),
+      bindings: p.bindings.map((b) => ({ kind: b.kind, format: b.format })),
     }));
   }
 
@@ -344,7 +358,7 @@ export class Checker {
     }
     const written: number[] = [];
     bindings.forEach((b, i) => {
-      const kind = p.bindings[i]!;
+      const { kind, format } = p.bindings[i]!;
       if (this.#attachments.includes(b.handle)) {
         throw err(`texture ${b.handle} is the pass's target, so its draws can't bind it`);
       }
@@ -378,6 +392,7 @@ export class Checker {
           if (isDepth(t.format) !== depth) {
             throw err(`texture ${b.handle} is bound where ${depth ? "a depth texture" : "a colour texture"} goes`);
           }
+          sameFormat(err, b.handle, t.format, format);
           this.#dimensions(op, b.handle, kind === "texture_3d");
           this.#used(op, "texture", b.handle, false);
           return;
@@ -386,6 +401,7 @@ export class Checker {
         case "storage_texture_3d": {
           const t = this.#texture(op, b.handle);
           if (!t.writable) throw err(`texture ${b.handle} is bound where a kernel writes it, but wasn't made writable`);
+          sameFormat(err, b.handle, t.format, format);
           this.#dimensions(op, b.handle, kind === "storage_texture_3d");
           this.#used(op, "texture", b.handle, true);
           return;

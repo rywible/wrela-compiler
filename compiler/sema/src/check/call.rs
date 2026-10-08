@@ -2796,13 +2796,13 @@ impl<'p> Checker<'p> {
             TyKind::Adt(s, _) if self.p.is_lang_adt(*s, Lang::AtomicMap) => {
                 Some((Lang::AtomicMapBuffer, Vec::new()))
             }
-            // `Texels` takes `mut` a texture made `writable`.
-            TyKind::Adt(s, _) if self.p.is_lang_adt(*s, Lang::Texels) => {
-                Some((Lang::Texture, Vec::new()))
+            // `Texels<F>` takes `mut` a `Texture<F>` made by `writable_texture`.
+            TyKind::Adt(s, args) if self.p.is_lang_adt(*s, Lang::Texels) => {
+                Some((Lang::Texture, args.clone()))
             }
-            // `Texels3d`, a `Texture3d`.
-            TyKind::Adt(s, _) if self.p.is_lang_adt(*s, Lang::Texels3d) => {
-                Some((Lang::Texture3d, Vec::new()))
+            // `Texels3d<F>`, a `Texture3d<F>`.
+            TyKind::Adt(s, args) if self.p.is_lang_adt(*s, Lang::Texels3d) => {
+                Some((Lang::Texture3d, args.clone()))
             }
             _ => None,
         };

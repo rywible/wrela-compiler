@@ -2,19 +2,16 @@
 // pass shows them on the screen: renderer.rs checks them in both hosts. The top half loads
 // texels; the bottom half samples between the layers.
 
-use std::gpu::{
-    ClipPosition, FragCoord, GlobalId, Sampler, Texels3d, Texture3d, VertexIndex,
-    begin_screen_pass, dispatch, draw, present, sampler, texture3d,
-}
+use std::gpu::{ClipPosition, FragCoord, GlobalId, Rgba16Float, Sampler, Texels3d, Texture3d, VertexIndex, begin_screen_pass, dispatch, draw, present, sampler, texture3d}
 
 struct State {
-    t: Texture3d,
+    t: Texture3d<Rgba16Float>,
     s: Sampler,
 }
 
 /// Texel (x, y, z) of 4 × 4 × 4: red x / 3, green y / 3, blue z / 3, alpha 1.
 @compute(4, 4, 4)
-fn fill(out: mut Texels3d, id: GlobalId) {
+fn fill(out: mut Texels3d<Rgba16Float>, id: GlobalId) {
     out.store(id, vec4(f32(id.x) / 3.0, f32(id.y) / 3.0, f32(id.z) / 3.0, 1.0))
 }
 
@@ -28,7 +25,7 @@ fn cover(v: VertexIndex) -> ClipPosition {
 /// Top half: texel ((x / 8) % 4, (y / 8) % 4, x / 32). Bottom half: the texture at
 /// (1/8, 1/8, x / 128), blended between layers, with green its depth over 4.
 @fragment
-fn show(p: FragCoord, t: Texture3d, s: Sampler) -> vec4 {
+fn show(p: FragCoord, t: Texture3d<Rgba16Float>, s: Sampler) -> vec4 {
     let (x, y) = (u32(p.position.x), u32(p.position.y))
     if y < 64 {
         return t.load(x: (x / 8) % 4, y: (y / 8) % 4, z: x / 32)
@@ -38,7 +35,7 @@ fn show(p: FragCoord, t: Texture3d, s: Sampler) -> vec4 {
 }
 
 pub fn init() -> State {
-    State { t: texture3d(width: 4, height: 4, depth: 4), s: sampler() }
+    State { t: texture3d::<Rgba16Float>(width: 4, height: 4, depth: 4), s: sampler() }
 }
 
 pub fn frame(s: mut State, time: f32, width: u32, height: u32) {

@@ -1,0 +1,152 @@
+// Texture formats (language.md §12): a kernel writes r32uint, r32float and rgba8 textures, and
+// passes draw into r16float, rg16float and r32uint ones (the last from a `u32` output). The
+// screen shows one band a texture, green where each texel holds what was written and red where
+// it doesn't: renderer.rs checks them in both hosts.
+
+use std::gpu::{
+    ClipPosition, FragCoord, GlobalId, R16Float, R32Float, R32Uint, Rg16Float, Rgba8, Sampler,
+    Texels, Texture, VertexIndex, begin_pass, begin_screen_pass, dispatch, draw, present, sampler,
+    texture, writable_texture,
+}
+
+/// Each texture's side, in texels.
+const SIDE: u32 = 16
+
+struct State {
+    ids: Texture<R32Uint>,
+    depths: Texture<R32Float>,
+    bytes: Texture<Rgba8>,
+    half: Texture<R16Float>,
+    pair: Texture<Rg16Float>,
+    drawn: Texture<R32Uint>,
+    s: Sampler,
+}
+
+/// What a kernel writes at texel (`x`, `y`): integers past an `f32`'s 24 bits, and an `f32`
+/// past an `f16`'s precision.
+fn id_at(x: u32, y: u32) -> u32 {
+    x * 100000000 + y * 7 + 1
+}
+
+fn depth_at(x: u32, y: u32) -> f32 {
+    f32(x) * 0.25 + f32(y) * 1000.0 + 0.125
+}
+
+fn bytes_at(x: u32, y: u32) -> vec4 {
+    vec4(f32(x) / 15.0, f32(y) / 15.0, 0.5, 1.0)
+}
+
+/// What a pass draws at texel (`x`, `y`): an `f16`'s and an integer.
+fn half_at(x: u32, y: u32) -> vec2 {
+    vec2(f32(x) * 0.5 + 0.25, f32(y) * -2.0 - 0.5)
+}
+
+fn drawn_at(x: u32, y: u32) -> u32 {
+    x * 65536 + y + 123456789
+}
+
+@compute(8, 8)
+fn fill(
+    ids: mut Texels<R32Uint>,
+    depths: mut Texels<R32Float>,
+    bytes: mut Texels<Rgba8>,
+    id: GlobalId,
+) {
+    ids.store(id, id_at(id.x, id.y))
+    depths.store(id, depth_at(id.x, id.y))
+    bytes.store(id, bytes_at(id.x, id.y))
+}
+
+@vertex
+fn cover(v: VertexIndex) -> ClipPosition {
+    let x = f32((v.index << 1) & 2) * 2.0 - 1.0
+    let y = f32(v.index & 2) * 2.0 - 1.0
+    ClipPosition { position: vec4(x, y, 0.5, 1.0) }
+}
+
+/// A texel's value as a colour, into the r16float and rg16float targets (each keeps its first
+/// channels).
+@fragment
+fn halves(p: FragCoord) -> vec4 {
+    let h = half_at(u32(p.position.x), u32(p.position.y))
+    vec4(h, 7.0, 1.0)
+}
+
+/// A texel's integer, into the r32uint target.
+@fragment
+fn integers(p: FragCoord) -> u32 {
+    drawn_at(u32(p.position.x), u32(p.position.y))
+}
+
+/// Green where texel `t` holds what it should (`ok`), else red.
+fn mark(ok: bool) -> vec4 {
+    if ok { vec4(0.0, 1.0, 0.0, 1.0) } else { vec4(1.0, 0.0, 0.0, 1.0) }
+}
+
+/// Band `k` of six, top to bottom, checks one texture at the texel under each pixel: loaded
+/// (the integers and the r32float) or sampled at its centre (the filtered formats).
+@fragment
+fn check(
+    p: FragCoord,
+    ids: Texture<R32Uint>,
+    depths: Texture<R32Float>,
+    bytes: Texture<Rgba8>,
+    half: Texture<R16Float>,
+    pair: Texture<Rg16Float>,
+    drawn: Texture<R32Uint>,
+    s: Sampler,
+    size: vec2,
+) -> vec4 {
+    let x = min(u32(p.position.x / size.x * f32(SIDE)), SIDE - 1)
+    let y = min(u32(p.position.y / size.y * 6.0 * f32(SIDE)) % SIDE, SIDE - 1)
+    let band = u32(p.position.y / size.y * 6.0)
+    let uv = (vec2(f32(x), f32(y)) + vec2(0.5)) / f32(SIDE)
+    if band == 0 {
+        mark(ids.load(x, y) == id_at(x, y))
+    } else if band == 1 {
+        mark(depths.load(x, y) == depth_at(x, y))
+    } else if band == 2 {
+        let d = abs(bytes.sample_level(s, uv) - bytes_at(x, y))
+        mark(max(max(d.x, d.y), max(d.z, d.w)) < 1.0 / 255.0)
+    } else if band == 3 {
+        mark(abs(half.sample_level(s, uv) - half_at(x, y).x) < 1.0e-3)
+    } else if band == 4 {
+        let d = abs(pair.sample_level(s, uv) - half_at(x, y))
+        mark(max(d.x, d.y) < 1.0e-2)
+    } else {
+        mark(drawn.load(x, y) == drawn_at(x, y))
+    }
+}
+
+pub fn init() -> State {
+    State {
+        ids: writable_texture(width: SIDE, height: SIDE),
+        depths: writable_texture(width: SIDE, height: SIDE),
+        bytes: writable_texture(width: SIDE, height: SIDE),
+        half: texture(width: SIDE, height: SIDE),
+        pair: texture(width: SIDE, height: SIDE),
+        drawn: texture(width: SIDE, height: SIDE),
+        s: sampler(),
+    }
+}
+
+pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
+    dispatch(fill.bind(mut s.ids, mut s.depths, mut s.bytes), groups: (2, 2, 1))
+    let a = begin_pass(mut s.half)
+    draw(cover, halves, vertices: 3)
+    a.end()
+    let b = begin_pass(mut s.pair)
+    draw(cover, halves, vertices: 3)
+    b.end()
+    let c = begin_pass(mut s.drawn)
+    draw(cover, integers, vertices: 3)
+    c.end()
+    begin_screen_pass(clear: vec4(0.0))
+    let size = vec2(f32(width), f32(height))
+    draw(
+        cover,
+        check.bind(s.ids, s.depths, s.bytes, s.half, s.pair, s.drawn, s.s, size),
+        vertices: 3,
+    )
+    present()
+}

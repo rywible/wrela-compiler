@@ -25,7 +25,7 @@
 //   still uses it.
 
 import { NONE, SCREEN, SCREEN_FORMAT, UPLOAD_MAX, UPLOAD_START } from "./abi.gen.ts";
-import { bytesPerTexel, CommandError, isDepth } from "./check.ts";
+import { bytesPerTexel, CommandError, isDepth, sampleType } from "./check.ts";
 import { errorMessage } from "./errors.ts";
 import type { Manifest, Pipeline, ResourceBinding, UniformBlock } from "./manifest.ts";
 import type { Binding, Bytes, Command, OpcodeName, Pass, TextureFormat } from "./stream.ts";
@@ -59,6 +59,8 @@ interface RenderParts {
   depth: { compare: GPUCompareFunction; write: boolean };
   /** Its fragments give their own depth: drawn only in a pass with a depth target. */
   writesDepth: boolean;
+  /** Its fragment shader returns a `u32`: drawn only into an `r32uint` target. */
+  uint: boolean;
   /** By target formats: `colour|depth`, each a format or `none`. */
   variants: Map<string, GPURenderPipeline>;
 }
@@ -181,7 +183,7 @@ async function buildPipeline(device: GPUDevice, p: Pipeline, source: string): Pr
           binding: b.binding,
           visibility: seen,
           texture: {
-            sampleType: b.kind === "depth_texture" ? "depth" : "float",
+            sampleType: b.kind === "depth_texture" ? "depth" : sampleType(b.format),
             viewDimension: b.kind === "texture_3d" ? "3d" : "2d",
           },
         });
@@ -202,7 +204,7 @@ async function buildPipeline(device: GPUDevice, p: Pipeline, source: string): Pr
           visibility: GPUShaderStage.COMPUTE,
           storageTexture: {
             access: "write-only",
-            format: "rgba16float",
+            format: b.format ?? "rgba16float",
             viewDimension: b.kind === "storage_texture_3d" ? "3d" : "2d",
           },
         });
@@ -241,15 +243,18 @@ async function buildPipeline(device: GPUDevice, p: Pipeline, source: string): Pr
         depthBias: p.depth_bias,
         depth: p.depth,
         writesDepth: p.writes_depth,
+        uint: p.uint,
         variants: new Map(),
       };
       // The variants a pass is likeliest to draw it into, now and side by side: the screen, the
       // screen with a depth target, a depth pass alone. A shader's errors then come at load, and
       // no frame waits to compile these (a texture's other formats are made at a first draw).
-      // (One that gives its fragments their depth is drawn only with a depth target.)
+      // (One that gives its fragments their depth is drawn only with a depth target; one that
+      // returns a `u32`, only into an r32uint target.)
+      const colour: GPUTextureFormat = p.uint ? "r32uint" : SCREEN_FORMAT;
       const targets: [GPUTextureFormat | null, GPUTextureFormat | null][] = [
-        [SCREEN_FORMAT, null],
-        [SCREEN_FORMAT, "depth32float"],
+        [colour, null],
+        [colour, "depth32float"],
         [null, "depth32float"],
       ].filter(([, d]) => d !== null || !p.writes_depth) as [GPUTextureFormat | null, GPUTextureFormat | null][];
       const made = await Promise.all(
@@ -973,6 +978,10 @@ export class GpuExecutor {
       throw new Error(
         `\`${p.name}\` gives its fragments their depth, so it's drawn in a pass with a depth target, and this pass has none`,
       );
+    }
+    if (color !== null && p.render.uint !== (color === "r32uint")) {
+      const [gives, wants] = p.render.uint ? ["a `u32`", "an r32uint target"] : ["a colour", "a colour target, not an integer one"];
+      throw new Error(`\`${p.name}\`'s fragment shader returns ${gives}, so it's drawn into ${wants}`);
     }
     const key = targetsKey(color, depth);
     let v = p.render.variants.get(key);

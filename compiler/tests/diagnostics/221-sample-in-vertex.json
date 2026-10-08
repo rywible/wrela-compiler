@@ -12,16 +12,16 @@
       "labels": [],
       "message": "sampling picks its detail from neighbouring pixels, so it's in fragment shaders only, and this is the vertex shader `cover`",
       "notes": [
-        "called through `cover` → `Texture::sample`"
+        "called through `cover` → `Texture<F>::sample`"
       ],
       "severity": "error",
       "span": {
         "column": 13,
-        "end": 339,
+        "end": 353,
         "end_column": 46,
         "end_line": 11,
         "line": 11,
-        "start": 306
+        "start": 320
       },
       "title": "a GPU feature where it doesn't exist"
     }

@@ -290,20 +290,30 @@ impl<'m> Cx<'m> {
             }
             ir::ResourceKind::Private => (AddressSpace::Private, self.ty(r.ty)?),
             ir::ResourceKind::Workgroup => (AddressSpace::WorkGroup, self.ty(r.ty)?),
-            ir::ResourceKind::Texture { depth, three } => {
+            ir::ResourceKind::Texture { depth, three, format } => {
                 let class = if depth {
                     naga::ImageClass::Depth { multi: false }
                 } else {
-                    naga::ImageClass::Sampled { kind: ScalarKind::Float, multi: false }
+                    let kind = match format.scalar() {
+                        ir::Scalar::U32 => ScalarKind::Uint,
+                        _ => ScalarKind::Float,
+                    };
+                    naga::ImageClass::Sampled { kind, multi: false }
                 };
                 let inner = TypeInner::Image { dim: image_dim(three), arrayed: false, class };
                 (AddressSpace::Handle, self.ty_inner(inner))
             }
-            ir::ResourceKind::StorageTexture { three } => {
-                let class = naga::ImageClass::Storage {
-                    format: naga::StorageFormat::Rgba16Float,
-                    access: StorageAccess::STORE,
+            ir::ResourceKind::StorageTexture { three, format } => {
+                let format = match format {
+                    ir::TexFormat::Rgba8Unorm => naga::StorageFormat::Rgba8Unorm,
+                    ir::TexFormat::Rgba16Float => naga::StorageFormat::Rgba16Float,
+                    ir::TexFormat::R32Float => naga::StorageFormat::R32Float,
+                    ir::TexFormat::R32Uint => naga::StorageFormat::R32Uint,
+                    f @ (ir::TexFormat::R16Float | ir::TexFormat::Rg16Float) => {
+                        return Err(format!("internal: kernels can't write a {f:?} texture"));
+                    }
                 };
+                let class = naga::ImageClass::Storage { format, access: StorageAccess::STORE };
                 let inner = TypeInner::Image { dim: image_dim(three), arrayed: false, class };
                 (AddressSpace::Handle, self.ty_inner(inner))
             }
@@ -563,7 +573,7 @@ impl<'a, 'm> Fb<'a, 'm> {
                 self.func.result = Some(FunctionResult { ty: io, binding: None });
                 self.io = Some((io, varyings, rt));
             }
-            ir::Stage::Fragment { varyings, depth } => {
+            ir::Stage::Fragment { varyings, depth, uint } => {
                 if let Some((vt, map)) = varyings {
                     let io = self.cx.io_struct(*vt, map)?;
                     self.func.arguments.push(FunctionArgument {
@@ -607,6 +617,9 @@ impl<'a, 'm> Fb<'a, 'm> {
                     );
                     self.frag_out = Some(out);
                     self.func.result = Some(FunctionResult { ty: out, binding: None });
+                } else if *uint {
+                    let u = self.cx.ty_inner(TypeInner::Scalar(Scalar::U32));
+                    self.func.result = Some(FunctionResult { ty: u, binding: Some(colour) });
                 } else {
                     self.func.result = Some(FunctionResult { ty: v4, binding: Some(colour) });
                 }

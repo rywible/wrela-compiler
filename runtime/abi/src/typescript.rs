@@ -17,7 +17,10 @@ pub fn typescript() -> String {
         .map(|(i, &f)| {
             assert_eq!(f as usize, i, "texture formats are numbered from 0");
             let (name, bytes, depth) = (f.name(), f.bytes_per_texel(), f.is_depth());
-            format!("  {{ name: {name:?}, bytes: {bytes}, depth: {depth} }},\n")
+            let (storable, filterable, uint) = (f.storable(), f.filterable(), f.is_uint());
+            format!(
+                "  {{ name: {name:?}, bytes: {bytes}, depth: {depth}, storable: {storable}, filterable: {filterable}, uint: {uint} }},\n"
+            )
         })
         .collect();
     let compares: String = stream::Compare::ALL

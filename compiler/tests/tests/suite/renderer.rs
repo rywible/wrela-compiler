@@ -160,6 +160,40 @@ fn the_browser_writes_texels_as_the_native_host_does() {
     assert!(diff.mean <= MEAN_LIMIT, "mean difference {:.4} over {MEAN_LIMIT}", diff.mean);
 }
 
+/// Texture formats (§12, compiler/tests/formats): a kernel writes r32uint, r32float and rgba8
+/// textures, passes draw into r16float, rg16float and r32uint ones (the last a fragment
+/// shader's `u32`), and each texel holds what was written. The screen's six bands are each a
+/// texture's texels checked against what they should be: green throughout.
+#[test]
+#[ignore = "needs a GPU"]
+fn each_format_holds_what_was_written() {
+    let (dir, _) = page("compiler/tests/formats", "formats-native");
+    let run = native(&dir);
+    every_band_green(&run.frame);
+}
+
+/// Each of the formats test's six bands green, at every pixel.
+fn every_band_green(frame: &[u8]) {
+    for band in 0..6u32 {
+        let red = (0..SIZE)
+            .flat_map(|x| (0..SIZE).map(move |y| (x, y)))
+            .filter(|&(_, y)| y * 6 / SIZE == band)
+            .filter(|&(x, y)| pixel(frame, x, y) != [0, 255, 0, 255])
+            .count();
+        assert_eq!(red, 0, "band {band}: {red} pixels don't hold what was written");
+    }
+}
+
+#[test]
+#[ignore = "long: needs Chrome, python3 and a GPU"]
+fn the_browser_holds_each_format_as_the_native_host_does() {
+    let (dir, rel) = page("compiler/tests/formats", "formats-browser");
+    let browser = run_in_chrome(&rel, 2, SIZE, SIZE, 60.0);
+    let run = native(&dir);
+    assert_eq!(browser.hash, run.hash_hex(), "the hosts' state hashes differ");
+    every_band_green(&browser.frame);
+}
+
 /// Chrome's test mode times each pass on the GPU, as the native host does: the same passes, in
 /// the same frames, with the same labels.
 #[test]

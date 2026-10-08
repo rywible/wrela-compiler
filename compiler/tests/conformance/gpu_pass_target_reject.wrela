@@ -1,7 +1,8 @@
 // rejects: gpu.textures
 // A pass borrows its target until it ends, so its draws can't bind it.
 use std::gpu::{
-    ClipPosition, FragCoord, Sampler, Texture, VertexIndex, begin_pass, draw, sampler, texture,
+    ClipPosition, FragCoord, Rgba8, Sampler, Texture, VertexIndex, begin_pass, draw, sampler,
+    texture,
 }
 
 @vertex
@@ -10,12 +11,12 @@ fn cover(v: VertexIndex) -> ClipPosition {
 }
 
 @fragment
-fn paint(pixel: FragCoord, image: Texture, s: Sampler) -> vec4 {
+fn paint(pixel: FragCoord, image: Texture<Rgba8>, s: Sampler) -> vec4 {
     image.sample(s, vec2(0.5, 0.5))
 }
 
 pub fn frame(time: f32, width: u32, height: u32) {
-    var target = texture(width: 4, height: 4)
+    var target = texture::<Rgba8>(width: 4, height: 4)
     let s = sampler()
     let pass = begin_pass(mut target)
     draw(cover, paint.bind(image: target, s: s), vertices: 3) //~ E0506

@@ -1,0 +1,99 @@
+// accepts: gpu.formats gpu.textures
+// Each format's texel is its own type: loads and samples give it, a kernel stores it, and a
+// fragment shader that returns a `u32` draws into an r32uint texture.
+use std::gpu::{
+    ClipPosition, FragCoord, GlobalId, R16Float, R32Float, R32Uint, Rg16Float, Rgba8, Sampler,
+    Texels, Texels3d, Texture, Texture3d, VertexIndex, begin_pass, begin_screen_pass, dispatch,
+    draw, present, sampler, texture, texture3d, writable_texture,
+}
+
+struct State {
+    ids: Texture<R32Uint>,
+    heights: Texture<R32Float>,
+    colours: Texture<Rgba8>,
+    half: Texture<R16Float>,
+    pair: Texture<Rg16Float>,
+    volume: Texture3d<R32Float>,
+    s: Sampler,
+}
+
+@compute(4, 4, 4)
+fn fill(
+    ids: mut Texels<R32Uint>,
+    heights: mut Texels<R32Float>,
+    colours: mut Texels<Rgba8>,
+    volume: mut Texels3d<R32Float>,
+    id: GlobalId,
+) {
+    ids.store(id, id.x + id.y)
+    heights.store(id, f32(id.x))
+    colours.store(id, vec4(1.0))
+    volume.store(id, f32(id.z))
+}
+
+@vertex
+fn cover(v: VertexIndex) -> ClipPosition {
+    let x = f32((v.index << 1) & 2) * 2.0 - 1.0
+    let y = f32(v.index & 2) * 2.0 - 1.0
+    ClipPosition { position: vec4(x, y, 0.5, 1.0) }
+}
+
+@fragment
+fn integers(p: FragCoord) -> u32 {
+    u32(p.position.x)
+}
+
+@fragment
+fn colour(p: FragCoord) -> vec4 {
+    vec4(p.position.xy, 0.0, 1.0)
+}
+
+@fragment
+fn show(
+    p: FragCoord,
+    ids: Texture<R32Uint>,
+    heights: Texture<R32Float>,
+    colours: Texture<Rgba8>,
+    half: Texture<R16Float>,
+    pair: Texture<Rg16Float>,
+    volume: Texture3d<R32Float>,
+    s: Sampler,
+) -> vec4 {
+    let id: u32 = ids.load(x: 0, y: 0)
+    let h: f32 = heights.load(x: 0, y: 0)
+    let c: vec4 = colours.sample(s, p.position.xy)
+    let a: f32 = half.sample(s, p.position.xy)
+    let b: vec2 = pair.sample_level(s, p.position.xy)
+    let v: f32 = volume.load(x: 0, y: 0, z: 0)
+    c * (f32(id) + h + a + b.x + v)
+}
+
+pub fn init() -> State {
+    State {
+        ids: writable_texture(width: 4, height: 4),
+        heights: writable_texture(width: 4, height: 4),
+        colours: writable_texture(width: 4, height: 4),
+        half: texture(width: 4, height: 4),
+        pair: texture::<Rg16Float>(width: 4, height: 4),
+        volume: texture3d(width: 4, height: 4, depth: 4),
+        s: sampler(),
+    }
+}
+
+pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
+    dispatch(fill.bind(mut s.ids, mut s.heights, mut s.colours, mut s.volume), groups: 1)
+    var drawn: Texture<R32Uint> = texture(width: 4, height: 4)
+    let a = begin_pass(mut drawn)
+    draw(cover, integers, vertices: 3)
+    a.end()
+    let b = begin_pass(mut s.half)
+    draw(cover, colour, vertices: 3)
+    b.end()
+    begin_screen_pass(clear: vec4(0.0))
+    draw(
+        cover,
+        show.bind(s.ids, s.heights, s.colours, s.half, s.pair, s.volume, s.s),
+        vertices: 3,
+    )
+    present()
+}

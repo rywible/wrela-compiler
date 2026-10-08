@@ -2,17 +2,17 @@
 // A pass draws into a texture, which a screen pass then samples.
 
 use std::gpu::{
-    ClipPosition, FragCoord, Sampler, Texture, VertexIndex, begin_pass, begin_screen_pass, draw,
-    present, sampler, texture,
+    ClipPosition, FragCoord, Rgba8, Sampler, Texture, VertexIndex, begin_pass, begin_screen_pass,
+    draw, present, sampler, texture,
 }
 
 pub struct Scene {
-    target: Texture,
+    target: Texture<Rgba8>,
     linear: Sampler,
 }
 
 pub fn init() -> Scene {
-    Scene { target: texture(width: 256, height: 256), linear: sampler() }
+    Scene { target: texture::<Rgba8>(width: 256, height: 256), linear: sampler() }
 }
 
 pub struct Out: Copy {
@@ -33,7 +33,7 @@ fn gradient(pixel: FragCoord, input: Out) -> vec4 {
 }
 
 @fragment
-fn copy(pixel: FragCoord, input: Out, image: Texture, s: Sampler) -> vec4 {
+fn copy(pixel: FragCoord, input: Out, image: Texture<Rgba8>, s: Sampler) -> vec4 {
     image.sample(s, input.uv)
 }
 

@@ -1,0 +1,31 @@
+// rejects: gpu.formats
+// An r32float texture isn't filtered; kernels don't write 16-bit float formats; a texel is its
+// format's type; and a fragment shader returns a colour or a `u32`, nothing else.
+use std::gpu::{
+    FragCoord, GlobalId, R16Float, R32Float, R32Uint, Rg16Float, Sampler, Texels, Texture,
+    texture3d, writable_texture,
+}
+
+@fragment
+fn unfiltered(p: FragCoord, t: Texture<R32Float>, s: Sampler) -> vec4 {
+    vec4(t.sample(s, p.position.xy)) //~ E0400
+}
+
+@compute(4, 4)
+fn halves(out: mut Texels<R16Float>, id: GlobalId) { //~ E0400
+}
+
+@compute(4, 4)
+fn integers(out: mut Texels<R32Uint>, id: GlobalId) {
+    out.store(id, vec4(1.0)) //~ E0300
+}
+
+@fragment
+fn pair(p: FragCoord) -> vec2 { //~ E0602
+    p.position.xy
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    let a: Texture<Rg16Float> = writable_texture(width: 4, height: 4) //~ E0400
+    let b = texture3d::<R16Float>(width: 4, height: 4, depth: 4) //~ E0400
+}

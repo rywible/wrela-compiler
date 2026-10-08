@@ -170,7 +170,7 @@ impl Verifier<'_> {
             }
             Expr::Texture(op, t, s, xs) => {
                 let kind = |r: &ResourceId| self.m.resources.get(r.index()).map(|r| r.kind);
-                let Some(ResourceKind::Texture { depth, three }) = kind(t) else {
+                let Some(ResourceKind::Texture { depth, three, format }) = kind(t) else {
                     return Err(bug("a texture read of something that isn't a texture"));
                 };
                 let comparison =
@@ -182,6 +182,11 @@ impl Verifier<'_> {
                 }
                 if three && matches!(op, TextureOp::Sample) {
                     return Err(bug("a 3D texture sampled with derivatives"));
+                }
+                if !depth && sampled && !format.filterable() {
+                    return Err(bug(format!(
+                        "{op:?} of a {format:?} texture, which isn't filtered"
+                    )));
                 }
                 match (sampled, s.as_ref().map(kind)) {
                     (false, None) => {}
@@ -217,18 +222,18 @@ impl Verifier<'_> {
                         TypeDef::Scalar(Scalar::F32)
                     }
                     TextureOp::Load if depth => TypeDef::Scalar(Scalar::F32),
-                    _ => TypeDef::Vector(Scalar::F32, 4),
+                    _ => TypeDef::Vector(format.scalar(), 4),
                 };
                 types.lookup(&out)
             }
             Expr::TextureStore(t, xs) => {
                 let kind = self.m.resources.get(t.index()).map(|r| r.kind);
-                let Some(ResourceKind::StorageTexture { three }) = kind else {
+                let Some(ResourceKind::StorageTexture { three, format }) = kind else {
                     return Err(bug("a texel written to something that isn't a storage texture"));
                 };
                 let u32_ = TypeDef::Scalar(Scalar::U32);
                 let mut want = vec![u32_; if three { 3 } else { 2 }];
-                want.push(TypeDef::Vector(Scalar::F32, 4));
+                want.push(TypeDef::Vector(format.scalar(), 4));
                 if xs.len() != want.len()
                     || xs.iter().zip(&want).any(|(x, w)| self.def(self.ty(*x)) != w)
                 {

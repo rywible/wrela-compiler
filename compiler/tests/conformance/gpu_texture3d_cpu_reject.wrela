@@ -1,9 +1,9 @@
 // rejects: gpu.textures
 // CPU code reads a 3D texture's size, but not its texels.
-use std::gpu::texture3d
+use std::gpu::{Rgba16Float, texture3d}
 
 pub fn frame(time: f32, width: u32, height: u32) {
-    let t = texture3d(width: 4, height: 4, depth: 4)
+    let t = texture3d::<Rgba16Float>(width: 4, height: 4, depth: 4)
     let n = t.width() * t.height() * t.depth()
     let c = t.load(x: 0, y: 0, z: 0) //~ E0607
 }

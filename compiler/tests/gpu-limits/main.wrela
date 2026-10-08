@@ -1,17 +1,16 @@
 // The GPU's real limits (compiler/tests/tests/suite/gpu_limits.rs): what `limits()` says, and a
 // texture as wide as the GPU allows, which may be wider than WebGPU's default 8192.
-use std::gpu::{Texture, limits, texture}
+use std::gpu::{Rgba8, Texture, limits, texture}
 
 pub struct Wide {
-    texture: Texture,
+    texture: Texture<Rgba8>,
 }
 
 pub fn init() -> Wide {
-    Wide { texture: texture(limits().max_texture_size, 1) }
+    Wide { texture: texture::<Rgba8>(width: limits().max_texture_size, height: 1) }
 }
 
-pub fn frame(state: mut Wide, time: f32, width: u32, height: u32) {
-}
+pub fn frame(state: mut Wide, time: f32, width: u32, height: u32) {}
 
 pub fn max_texture_size() -> u32 {
     limits().max_texture_size

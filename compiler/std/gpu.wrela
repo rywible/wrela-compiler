@@ -312,26 +312,168 @@ pub fn present() {}
 
 // ---- textures, samplers and passes (§12) ------------------------------------------------------
 
-/// How a colour texture stores its texels.
-pub enum TextureFormat: Copy {
-    /// Four 8-bit channels, read as floats in [0, 1]: 4 bytes a texel. The screen's format.
-    Rgba8,
-    /// Four 16-bit floats: 8 bytes a texel.
-    Rgba16Float,
+/// How a colour texture stores its texels (§12): each format is a type, which says what a texel
+/// is in GPU code (`Texel`). What else textures of it can do is a trait each format has or
+/// hasn't: GPU code filters between texels of a `Filtered` format, kernels write a `Storage`
+/// one, and passes draw into a `Target` one.
+pub trait Format {
+    /// A texel, as GPU code reads and writes it.
+    type Texel
+    /// The command stream's code for the format.
+    fn code() -> u32
+    /// Its bytes a texel, as CPU code writes texels.
+    fn bytes() -> u32
+    /// A texel as four channels, as WGSL reads it: those the format lacks 0, and alpha 1. For
+    /// code generic over formats: `F::rgba(t.sample(s, uv))` is a `vec4` whatever `F` is.
+    fn rgba(t: Self::Texel) -> vec4
 }
 
-/// A 2D colour texture on the GPU: an owned value, like a `GpuBuffer`. CPU code makes one,
-/// writes texels into it, draws into it in a pass and passes it to shaders, which sample it.
-/// Dropping it releases it.
-pub struct Texture {
+/// Formats GPU code can filter between texels of (`sample`, `sample_level`).
+pub trait Filtered: Format {}
+
+/// Formats kernels can write (`Texels`; `writable_texture`, `texture3d`).
+pub trait Storage: Format {}
+
+/// Formats a pass can draw into (`begin_pass`).
+pub trait Target: Format {}
+
+/// Four 8-bit channels, read as floats in [0, 1]: 4 bytes a texel. The screen's format.
+pub struct Rgba8 {}
+
+/// Four 16-bit floats: 8 bytes a texel.
+pub struct Rgba16Float {}
+
+/// One 16-bit float: 2 bytes a texel. Kernels can't write it (WebGPU's core formats).
+pub struct R16Float {}
+
+/// Two 16-bit floats: 4 bytes a texel. Kernels can't write it.
+pub struct Rg16Float {}
+
+/// One 32-bit float: 4 bytes a texel. GPU code loads it (`load`) and doesn't filter it
+/// (WebGPU's core formats).
+pub struct R32Float {}
+
+/// One 32-bit unsigned integer: 4 bytes a texel, loaded whole (`load`), never filtered. Drawn
+/// into by a fragment shader that returns a `u32`.
+pub struct R32Uint {}
+
+impl Format for Rgba8 {
+    type Texel = vec4
+    fn code() -> u32 {
+        0
+    }
+    fn bytes() -> u32 {
+        4
+    }
+    fn rgba(t: vec4) -> vec4 {
+        t
+    }
+}
+
+impl Filtered for Rgba8 {}
+
+impl Storage for Rgba8 {}
+
+impl Target for Rgba8 {}
+
+impl Format for Rgba16Float {
+    type Texel = vec4
+    fn code() -> u32 {
+        1
+    }
+    fn bytes() -> u32 {
+        8
+    }
+    fn rgba(t: vec4) -> vec4 {
+        t
+    }
+}
+
+impl Filtered for Rgba16Float {}
+
+impl Storage for Rgba16Float {}
+
+impl Target for Rgba16Float {}
+
+impl Format for R16Float {
+    type Texel = f32
+    fn code() -> u32 {
+        3
+    }
+    fn bytes() -> u32 {
+        2
+    }
+    fn rgba(t: f32) -> vec4 {
+        vec4(t, 0.0, 0.0, 1.0)
+    }
+}
+
+impl Filtered for R16Float {}
+
+impl Target for R16Float {}
+
+impl Format for Rg16Float {
+    type Texel = vec2
+    fn code() -> u32 {
+        4
+    }
+    fn bytes() -> u32 {
+        4
+    }
+    fn rgba(t: vec2) -> vec4 {
+        vec4(t, 0.0, 1.0)
+    }
+}
+
+impl Filtered for Rg16Float {}
+
+impl Target for Rg16Float {}
+
+impl Format for R32Float {
+    type Texel = f32
+    fn code() -> u32 {
+        5
+    }
+    fn bytes() -> u32 {
+        4
+    }
+    fn rgba(t: f32) -> vec4 {
+        vec4(t, 0.0, 0.0, 1.0)
+    }
+}
+
+impl Storage for R32Float {}
+
+impl Target for R32Float {}
+
+impl Format for R32Uint {
+    type Texel = u32
+    fn code() -> u32 {
+        6
+    }
+    fn bytes() -> u32 {
+        4
+    }
+    fn rgba(t: u32) -> vec4 {
+        vec4(f32(t), 0.0, 0.0, 1.0)
+    }
+}
+
+impl Storage for R32Uint {}
+
+impl Target for R32Uint {}
+
+/// A 2D colour texture on the GPU, its texels of format `F`: an owned value, like a
+/// `GpuBuffer`. CPU code makes one, writes texels into it, draws into it in a pass and passes
+/// it to shaders, which read it. Dropping it releases it.
+pub struct Texture<F: Format> {
     // The compiler binds a texture by its handle, the first field.
     handle: u32,
     width: u32,
     height: u32,
-    format: TextureFormat,
 }
 
-impl Drop for Texture {
+impl<F: Format> Drop for Texture<F> {
     fn drop(mut self) {
         if self.handle != 0 {
             destroy_texture(self.handle)
@@ -355,17 +497,17 @@ impl Drop for DepthTexture {
     }
 }
 
-/// A 3D colour texture on the GPU (four 16-bit floats a texel): an owned value, like a
-/// `Texture`. CPU code makes one and passes it to kernels, which write its texels
-/// (`Texels3d`), and to shaders, which sample it. Dropping it releases it.
-pub struct Texture3d {
+/// A 3D colour texture on the GPU, its texels of format `F` (a `Storage` one): an owned value,
+/// like a `Texture`. CPU code makes one and passes it to kernels, which write its texels
+/// (`Texels3d`), and to shaders, which read it. Dropping it releases it.
+pub struct Texture3d<F: Storage> {
     handle: u32,
     width: u32,
     height: u32,
     depth: u32,
 }
 
-impl Drop for Texture3d {
+impl<F: Storage> Drop for Texture3d<F> {
     fn drop(mut self) {
         if self.handle != 0 {
             destroy_texture(self.handle)
@@ -437,36 +579,32 @@ fn check_texture_size(width: u32, height: u32) {
     }
 }
 
-/// A new colour texture, zeroed. A `writable` one (`Rgba16Float` only) can also be a kernel's
-/// `Texels` to write.
-pub fn texture(
-    width: u32,
-    height: u32,
-    format: TextureFormat = TextureFormat::Rgba8,
-    writable: bool = false,
-) -> Texture {
+/// A new colour texture of format `F`, zeroed: `texture::<Rgba8>(width: 4, height: 4)`, or
+/// with `F` from where it goes.
+pub fn texture<F: Format>(width: u32, height: u32) -> Texture<F> {
     check_texture_size(width, height)
-    let code: u32 = match format {
-        TextureFormat::Rgba8 => 0,
-        TextureFormat::Rgba16Float => 1,
-    }
-    if writable && code != 1 {
-        panic("texture: only an Rgba16Float texture can be written by kernels")
-    }
-    // The stream's flag for a texture kernels write: bit 16 of the format.
-    let flags: u32 = if writable { 65536 } else { 0 }
-    Texture { handle: create_texture(width, height, code | flags), width, height, format }
+    Texture { handle: create_texture(width, height, F::code()), width, height }
 }
 
-/// A new 3D texture, `width` × `height` × `depth` texels (each 1 to 2048), zeroed. Kernels
-/// write its texels (`Texels3d`): CPU code can't.
-pub fn texture3d(width: u32, height: u32, depth: u32) -> Texture3d {
+/// A new colour texture of format `F`, zeroed, that kernels can also write (a `Texels`): a
+/// `Storage` format. Storage can cost a drawn texture its compression, so only textures kernels
+/// write are made this way.
+pub fn writable_texture<F: Storage>(width: u32, height: u32) -> Texture<F> {
+    check_texture_size(width, height)
+    // The stream's flag for a texture kernels write: bit 16 of the format.
+    Texture { handle: create_texture(width, height, F::code() | 65536), width, height }
+}
+
+/// A new 3D texture of format `F`, `width` × `height` × `depth` texels (each 1 to 2048),
+/// zeroed. Kernels write its texels (`Texels3d`): CPU code can't.
+pub fn texture3d<F: Storage>(width: u32, height: u32, depth: u32) -> Texture3d<F> {
     let max = MAX_TEXTURE_3D
     if width == 0 || height == 0 || depth == 0 || width > max || height > max || depth > max {
         panic(f"texture3d: a side is 1 to {max} texels")
     }
-    // `Rgba16Float` (1), which kernels write (bit 16).
-    Texture3d { handle: create_texture_3d(width, height, 1 | 65536, depth), width, height, depth }
+    // Kernels write it: bit 16.
+    let code = F::code() | 65536
+    Texture3d { handle: create_texture_3d(width, height, code, depth), width, height, depth }
 }
 
 /// A new depth texture, zeroed.
@@ -506,7 +644,7 @@ pub fn comparison_sampler(compare: Compare = Compare::LessEqual) -> ComparisonSa
 /// The most bytes one texture write command carries: writes are split into rows that fit.
 const TEXTURE_WRITE_BYTES: u32 = 512 * 1024
 
-impl Texture {
+impl<F: Format> Texture<F> {
     /// Its width in texels. In GPU code too.
     pub fn width(self) -> u32 {
         texture_width(self)
@@ -518,18 +656,13 @@ impl Texture {
     }
 
     /// Copies texels into the rectangle at (`x`, `y`) of `width` by `height` texels: `bytes`
-    /// holds its rows, top to bottom, 4 bytes a texel for `Rgba8` and 8 for `Rgba16Float`. It
-    /// happens in recorded order with dispatches and draws. A rectangle past the edge, or the
-    /// wrong number of bytes, panics.
+    /// holds its rows, top to bottom, `F::bytes()` a texel. It happens in recorded order with
+    /// dispatches and draws. A rectangle past the edge, or the wrong number of bytes, panics.
     pub fn write(mut self, x: u32, y: u32, width: u32, height: u32, bytes: [u8]) {
         if x > self.width || width > self.width - x || y > self.height || height > self.height - y {
             panic("write: the rectangle runs past the texture's edge")
         }
-        let texel: u32 = match self.format {
-            TextureFormat::Rgba8 => 4,
-            TextureFormat::Rgba16Float => 8,
-        }
-        let row = width * texel
+        let row = width * F::bytes()
         if bytes.len() != row * height {
             panic("write: the bytes aren't `width * height` texels")
         }
@@ -545,21 +678,23 @@ impl Texture {
         }
     }
 
+    /// The texel at (`x`, `y`), unfiltered: any GPU code.
+    pub fn load(self, x: u32, y: u32) -> F::Texel {
+        texture_load(self, x, y)
+    }
+}
+
+impl<F: Filtered> Texture<F> {
     /// The texel at (`u`, `v`) in [0, 1], filtered by `s`: fragment shaders only, since it picks
     /// the detail from neighbouring pixels (as `dpdx` does).
-    pub fn sample(self, s: Sampler, uv: vec2) -> vec4 {
+    pub fn sample(self, s: Sampler, uv: vec2) -> F::Texel {
         texture_sample(self, s, uv)
     }
 
     /// The texel at (`u`, `v`) in [0, 1] of mip level `level`, filtered by `s`: any GPU code.
     /// Textures have one level, 0.
-    pub fn sample_level(self, s: Sampler, uv: vec2, level: f32 = 0.0) -> vec4 {
+    pub fn sample_level(self, s: Sampler, uv: vec2, level: f32 = 0.0) -> F::Texel {
         texture_sample_level(self, s, uv, level)
-    }
-
-    /// The texel at (`x`, `y`), unfiltered: any GPU code.
-    pub fn load(self, x: u32, y: u32) -> vec4 {
-        texture_load(self, x, y)
     }
 }
 
@@ -591,7 +726,7 @@ impl DepthTexture {
     }
 }
 
-impl Texture3d {
+impl<F: Storage> Texture3d<F> {
     /// Its width in texels. In GPU code too.
     pub fn width(self) -> u32 {
         texture_width(self)
@@ -607,25 +742,27 @@ impl Texture3d {
         texture_depth(self)
     }
 
+    /// The texel at (`x`, `y`, `z`), unfiltered: any GPU code.
+    pub fn load(self, x: u32, y: u32, z: u32) -> F::Texel {
+        texture3d_load(self, x, y, z)
+    }
+}
+
+impl<F: Storage + Filtered> Texture3d<F> {
     /// The texel at (`u`, `v`, `w`) in [0, 1], filtered by `s`: any GPU code. 3D textures have
     /// one mip level, 0.
-    pub fn sample_level(self, s: Sampler, uvw: vec3, level: f32 = 0.0) -> vec4 {
+    pub fn sample_level(self, s: Sampler, uvw: vec3, level: f32 = 0.0) -> F::Texel {
         texture3d_sample_level(self, s, uvw, level)
-    }
-
-    /// The texel at (`x`, `y`, `z`), unfiltered: any GPU code.
-    pub fn load(self, x: u32, y: u32, z: u32) -> vec4 {
-        texture3d_load(self, x, y, z)
     }
 }
 
 /// An open pass that draws into a texture: what `begin_pass` gives. It borrows its target until
 /// `end()`, so the pass's draws can't bind it.
-pub borrow struct Pass {
-    pub target: mut Texture,
+pub borrow struct Pass<F: Target> {
+    pub target: mut Texture<F>,
 }
 
-impl Pass {
+impl<F: Target> Pass<F> {
     /// Ends the pass.
     pub fn end(self) {
         end_pass_command()
@@ -633,12 +770,12 @@ impl Pass {
 }
 
 /// An open pass with a colour target and a depth target.
-pub borrow struct DepthPass {
-    pub target: mut Texture,
+pub borrow struct DepthPass<F: Target> {
+    pub target: mut Texture<F>,
     pub depth: mut DepthTexture,
 }
 
-impl DepthPass {
+impl<F: Target> DepthPass<F> {
     /// Ends the pass.
     pub fn end(self) {
         end_pass_command()
@@ -673,12 +810,13 @@ impl ScreenDepthPass {
 const NO_TARGET: u32 = 4294967295
 const SCREEN_TARGET: u32 = 4294967294
 
-/// Starts a pass that draws into `target`: cleared to `clear`, or keeping what's there.
-pub fn begin_pass(
-    target: mut Texture,
+/// Starts a pass that draws into `target`: cleared to `clear` (its first channels, for a
+/// format of fewer), or keeping what's there.
+pub fn begin_pass<F: Target>(
+    target: mut Texture<F>,
     clear: vec4 = vec4(0.0, 0.0, 0.0, 1.0),
     keep: bool = false,
-) -> Pass {
+) -> Pass<F> {
     begin_pass_command(
         target.handle,
         u32(keep),
@@ -699,15 +837,15 @@ pub fn begin_pass(
 /// same targets: the host may run the two as one (on a tile-based GPU, the targets aren't
 /// stored and loaded again between them), which pays when this one is light; its timing
 /// alone (the serial mode) is its own.
-pub fn begin_pass_with_depth(
-    target: mut Texture,
+pub fn begin_pass_with_depth<F: Target>(
+    target: mut Texture<F>,
     depth: mut DepthTexture,
     clear: vec4 = vec4(0.0, 0.0, 0.0, 1.0),
     keep: bool = false,
     clear_depth: f32 = 1.0,
     keep_depth: bool = false,
     join: bool = false,
-) -> DepthPass {
+) -> DepthPass<F> {
     let (c, d) = (target.handle, depth.handle)
     begin_pass_command(
         c,
@@ -819,10 +957,10 @@ pub fn label(name: str) {
 fn label_command(name: str) {}
 
 @intrinsic
-fn texture_sample(t: Texture, s: Sampler, uv: vec2) -> vec4 {}
+fn texture_sample<F: Filtered>(t: Texture<F>, s: Sampler, uv: vec2) -> F::Texel {}
 
 @intrinsic
-fn texture_sample_level(t: Texture, s: Sampler, uv: vec2, level: f32) -> vec4 {}
+fn texture_sample_level<F: Filtered>(t: Texture<F>, s: Sampler, uv: vec2, level: f32) -> F::Texel {}
 
 @intrinsic
 fn texture_sample_compare(t: DepthTexture, s: ComparisonSampler, uv: vec2, reference: f32) -> f32 {}
@@ -836,16 +974,21 @@ fn texture_sample_compare_level(
 ) -> f32 {}
 
 @intrinsic
-fn texture_load(t: Texture, x: u32, y: u32) -> vec4 {}
+fn texture_load<F: Format>(t: Texture<F>, x: u32, y: u32) -> F::Texel {}
 
 @intrinsic
 fn depth_load(t: DepthTexture, x: u32, y: u32) -> f32 {}
 
 @intrinsic
-fn texture3d_sample_level(t: Texture3d, s: Sampler, uvw: vec3, level: f32) -> vec4 {}
+fn texture3d_sample_level<F: Storage + Filtered>(
+    t: Texture3d<F>,
+    s: Sampler,
+    uvw: vec3,
+    level: f32,
+) -> F::Texel {}
 
 @intrinsic
-fn texture3d_load(t: Texture3d, x: u32, y: u32, z: u32) -> vec4 {}
+fn texture3d_load<F: Storage>(t: Texture3d<F>, x: u32, y: u32, z: u32) -> F::Texel {}
 
 @intrinsic
 fn texture_width<T>(t: T) -> u32 {}
@@ -976,32 +1119,32 @@ pub fn barrier<T, const N: u32>(shared: mut Shared<T, N>) {
     workgroup_barrier(mut shared)
 }
 
-/// A texture a kernel writes, each invocation only its own texel: (`id.x`, `id.y`) of its
-/// `GlobalId` (§6.13). A kernel's `mut Texels` parameter, for which CPU code passes `mut tex`
-/// of a texture made `writable` (an `Rgba16Float` one). A kernel reads what it writes only
-/// through another pass's binding of the texture, never in the same dispatch.
-pub struct Texels {
+/// A texture of format `F` that a kernel writes, each invocation only its own texel: (`id.x`,
+/// `id.y`) of its `GlobalId` (§6.13). A kernel's `mut Texels<F>` parameter, for which CPU code
+/// passes `mut tex` of a `Texture<F>` made by `writable_texture`. A kernel reads what it writes
+/// only through another pass's binding of the texture, never in the same dispatch.
+pub struct Texels<F: Storage> {
     unused: u32,
 }
 
-impl Texels {
+impl<F: Storage> Texels<F> {
     /// Writes `value` to the invocation's own texel, (`id.x`, `id.y`).
-    pub fn store(mut self, id: GlobalId, value: vec4) {
+    pub fn store(mut self, id: GlobalId, value: F::Texel) {
         texels_store(mut self, id.x, id.y, value)
     }
 }
 
-/// A 3D texture a kernel writes, each invocation only its own texel: (`id.x`, `id.y`, `id.z`)
-/// of its `GlobalId`. A kernel's `mut Texels3d` parameter, for which CPU code passes `mut tex`
-/// of a `Texture3d`. As with `Texels`, a kernel reads what it writes only through another
-/// pass's binding of the texture.
-pub struct Texels3d {
+/// A 3D texture of format `F` that a kernel writes, each invocation only its own texel:
+/// (`id.x`, `id.y`, `id.z`) of its `GlobalId`. A kernel's `mut Texels3d<F>` parameter, for which
+/// CPU code passes `mut tex` of a `Texture3d<F>`. As with `Texels`, a kernel reads what it
+/// writes only through another pass's binding of the texture.
+pub struct Texels3d<F: Storage> {
     unused: u32,
 }
 
-impl Texels3d {
+impl<F: Storage> Texels3d<F> {
     /// Writes `value` to the invocation's own texel, (`id.x`, `id.y`, `id.z`).
-    pub fn store(mut self, id: GlobalId, value: vec4) {
+    pub fn store(mut self, id: GlobalId, value: F::Texel) {
         texels3d_store(mut self, id.x, id.y, id.z, value)
     }
 }
@@ -1255,10 +1398,10 @@ fn shared_set<T, const N: u32>(shared: mut Shared<T, N>, i: u32, value: T) {}
 fn workgroup_barrier<T, const N: u32>(shared: mut Shared<T, N>) {}
 
 @intrinsic
-fn texels_store(t: mut Texels, x: u32, y: u32, value: vec4) {}
+fn texels_store<F: Storage>(t: mut Texels<F>, x: u32, y: u32, value: F::Texel) {}
 
 @intrinsic
-fn texels3d_store(t: mut Texels3d, x: u32, y: u32, z: u32, value: vec4) {}
+fn texels3d_store<F: Storage>(t: mut Texels3d<F>, x: u32, y: u32, z: u32, value: F::Texel) {}
 
 @intrinsic
 fn atomic_len<A>(a: A) -> u32 {}

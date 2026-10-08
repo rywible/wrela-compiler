@@ -2,10 +2,7 @@
 // as one parameter. The left half of the screen is drawn from a group, the right from the same
 // textures, sampler, buffer and values passed one by one: renderer.rs checks they match.
 
-use std::gpu::{
-    ClipPosition, FragCoord, GlobalId, GpuBuffer, GpuSpan, Sampler, Texels, Texture, TextureFormat,
-    VertexIndex, begin_screen_pass, buffer, dispatch, draw, present, sampler, texture, write,
-}
+use std::gpu::{ClipPosition, FragCoord, GlobalId, GpuBuffer, GpuSpan, Rgba16Float, Sampler, Texels, Texture, VertexIndex, begin_screen_pass, buffer, dispatch, draw, present, sampler, texture, writable_texture, write}
 
 struct Tint: Copy + GpuData {
     colour: vec3,
@@ -21,7 +18,7 @@ borrow struct Detail {
 /// What the surface reads.
 borrow struct Inputs {
     tint: Tint,
-    albedo: borrow Texture,
+    albedo: borrow Texture<Rgba16Float>,
     s: borrow Sampler,
     weights: GpuSpan<f32>,
     detail: Detail,
@@ -34,7 +31,7 @@ borrow struct Fill {
 }
 
 struct State {
-    albedo: Texture,
+    albedo: Texture<Rgba16Float>,
     s: Sampler,
     weights: GpuBuffer<f32>,
 }
@@ -49,7 +46,7 @@ fn total(xs: [f32]) -> f32 {
 
 /// Texel (x, y) of 16 × 16: red x / 15 times the weights' sum over 4, green y / 15.
 @compute(8, 8)
-fn fill(g: Fill, out: mut Texels, id: GlobalId) {
+fn fill(g: Fill, out: mut Texels<Rgba16Float>, id: GlobalId) {
     let w = total(g.weights) / 4.0
     out.store(id, vec4(f32(id.x) / 15.0 * w, f32(id.y) / 15.0, g.blue, 1.0))
 }
@@ -71,7 +68,7 @@ fn half(v: VertexIndex, left: f32) -> ClipPosition {
 
 fn shade(
     tint: Tint,
-    albedo: Texture,
+    albedo: Texture<Rgba16Float>,
     s: Sampler,
     weights: [f32],
     scale: f32,
@@ -98,7 +95,7 @@ fn grouped(p: FragCoord, g: Inputs, width: f32) -> vec4 {
 fn separate(
     p: FragCoord,
     tint: Tint,
-    albedo: Texture,
+    albedo: Texture<Rgba16Float>,
     s: Sampler,
     weights: [f32],
     scale: f32,
@@ -111,7 +108,7 @@ fn separate(
 pub fn init() -> State {
     var weights = buffer(4)
     write(mut weights, 0, [0.5, 1.0, 1.5, 1.0])
-    let albedo = texture(width: 16, height: 16, format: TextureFormat::Rgba16Float, writable: true)
+    let albedo = writable_texture::<Rgba16Float>(width: 16, height: 16)
     State { albedo, s: sampler(), weights }
 }
 

@@ -26,7 +26,7 @@
 //! | 6 | `Present` | none. Ends the screen pass and shows it. |
 //! | 7 | `DestroyBuffer` | `handle`. Later commands can't use the buffer; work already recorded still can. |
 //! | 8 | `CopyBuffer` | `source`, `source offset`, `destination`, `destination offset`, `size` (bytes, multiples of 4) |
-//! | 9 | `CreateTexture` | `handle`, `width`, `height`, `format` ([`TextureFormat`]; bit 16 set: kernels write it, an `rgba16float` storage texture too), and for a 3D texture its `depth` (a fifth word, at least 1). It starts zeroed. |
+//! | 9 | `CreateTexture` | `handle`, `width`, `height`, `format` ([`TextureFormat`]; bit 16 set: kernels write it, a storage texture too, of a format [`TextureFormat::storable`]), and for a 3D texture its `depth` (a fifth word, at least 1). It starts zeroed. |
 //! | 10 | `WriteTexture` | `handle`, `x`, `y`, `width`, `height`, `length`, then `length` bytes: rows of `width` texels, top to bottom, no padding |
 //! | 11 | `DestroyTexture` | `handle` |
 //! | 12 | `CreateSampler` | `handle`, `filter` (0 nearest, 1 linear), `address` (0 clamp, 1 repeat), `compare` ([`Compare`]; 0 for a sampler that doesn't compare) |
@@ -202,14 +202,34 @@ pub enum TextureFormat {
     Rgba16Float = 1,
     /// A 32-bit float depth, for depth testing and comparison sampling.
     Depth32Float = 2,
+    /// One 16-bit float.
+    R16Float = 3,
+    /// Two 16-bit floats.
+    Rg16Float = 4,
+    /// One 32-bit float, not filtered.
+    R32Float = 5,
+    /// One 32-bit unsigned integer, not filtered.
+    R32Uint = 6,
 }
 
 impl TextureFormat {
-    pub const ALL: [TextureFormat; 3] =
-        [TextureFormat::Rgba8, TextureFormat::Rgba16Float, TextureFormat::Depth32Float];
+    pub const ALL: [TextureFormat; 7] = [
+        TextureFormat::Rgba8,
+        TextureFormat::Rgba16Float,
+        TextureFormat::Depth32Float,
+        TextureFormat::R16Float,
+        TextureFormat::Rg16Float,
+        TextureFormat::R32Float,
+        TextureFormat::R32Uint,
+    ];
 
     pub fn from_u32(v: u32) -> Option<TextureFormat> {
         TextureFormat::ALL.iter().copied().find(|f| *f as u32 == v)
+    }
+
+    /// The format WebGPU names `name`.
+    pub fn named(name: &str) -> Option<TextureFormat> {
+        TextureFormat::ALL.iter().copied().find(|f| f.name() == name)
     }
 
     /// WebGPU's name for it.
@@ -218,19 +238,62 @@ impl TextureFormat {
             TextureFormat::Rgba8 => "rgba8unorm",
             TextureFormat::Rgba16Float => "rgba16float",
             TextureFormat::Depth32Float => "depth32float",
+            TextureFormat::R16Float => "r16float",
+            TextureFormat::Rg16Float => "rg16float",
+            TextureFormat::R32Float => "r32float",
+            TextureFormat::R32Uint => "r32uint",
         }
     }
 
     /// The bytes of one texel.
     pub fn bytes_per_texel(self) -> u32 {
         match self {
-            TextureFormat::Rgba8 | TextureFormat::Depth32Float => 4,
+            TextureFormat::R16Float => 2,
+            TextureFormat::Rgba8
+            | TextureFormat::Depth32Float
+            | TextureFormat::Rg16Float
+            | TextureFormat::R32Float
+            | TextureFormat::R32Uint => 4,
             TextureFormat::Rgba16Float => 8,
         }
     }
 
     pub fn is_depth(self) -> bool {
         self == TextureFormat::Depth32Float
+    }
+
+    /// Whether kernels can write it: a storage format in WebGPU's core.
+    pub fn storable(self) -> bool {
+        matches!(
+            self,
+            TextureFormat::Rgba8
+                | TextureFormat::Rgba16Float
+                | TextureFormat::R32Float
+                | TextureFormat::R32Uint
+        )
+    }
+
+    /// Whether a shader can filter between its texels (a colour format's sample type is then
+    /// `float`, else `unfilterable-float` or `uint`).
+    pub fn filterable(self) -> bool {
+        matches!(
+            self,
+            TextureFormat::Rgba8
+                | TextureFormat::Rgba16Float
+                | TextureFormat::R16Float
+                | TextureFormat::Rg16Float
+        )
+    }
+
+    /// Whether its texels are integers, read and written as `u32`s.
+    pub fn is_uint(self) -> bool {
+        self == TextureFormat::R32Uint
+    }
+}
+
+impl serde::Serialize for TextureFormat {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.name())
     }
 }
 
@@ -363,7 +426,7 @@ pub enum Command<'a> {
         width: u32,
         height: u32,
         format: TextureFormat,
-        /// Kernels write its texels (a storage texture): `Rgba16Float` only.
+        /// Kernels write its texels (a storage texture): a format [`TextureFormat::storable`].
         writable: bool,
         /// A 3D texture's depth in texels; 0 for a 2D texture.
         depth: u32,
@@ -755,8 +818,10 @@ pub fn decode(batch: &[u8]) -> Result<Vec<Command<'_>>, StreamError> {
                 if w(1) == 0 || w(2) == 0 {
                     return Err(bad("a texture's width and height are positive"));
                 }
-                if writable && format != TextureFormat::Rgba16Float {
-                    return Err(bad("only an rgba16float texture can be written by kernels"));
+                if writable && !format.storable() {
+                    return Err(bad(
+                        "kernels write only rgba8unorm, rgba16float, r32float and r32uint textures",
+                    ));
                 }
                 if depth > 0 && format.is_depth() {
                     return Err(bad("a 3D texture holds colours"));

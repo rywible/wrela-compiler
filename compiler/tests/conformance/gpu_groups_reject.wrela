@@ -1,7 +1,9 @@
 // rejects: gpu.groups
 // A group passes what the GPU reads: a field it writes, a run of the CPU's memory and a value
 // that isn't `GpuData` can't be in one an entry point takes.
-use std::gpu::{ClipPosition, FragCoord, GpuSpan, GpuSpanMut, Sampler, Texture, VertexIndex}
+use std::gpu::{
+    ClipPosition, FragCoord, GpuSpan, GpuSpanMut, Rgba16Float, Sampler, Texture, VertexIndex,
+}
 
 struct Plain: Copy {
     on: bool,
@@ -20,7 +22,7 @@ borrow struct NotData {
 }
 
 borrow struct Fine {
-    t: borrow Texture,
+    t: borrow Texture<Rgba16Float>,
     s: borrow Sampler,
     xs: GpuSpan<f32>,
 }

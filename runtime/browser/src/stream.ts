@@ -300,12 +300,12 @@ export function decode(batch: Bytes): Command[] {
         // A fifth word: a 3D texture's depth.
         const depth = words === 5 ? w(4) : 0;
         if (words === 5 && depth === 0) throw bad("a 3D texture's depth is positive");
-        // Bit 16 of the format word: kernels write it (an rgba16float storage texture too).
+        // Bit 16 of the format word: kernels write it (a storage texture too).
         const writable = (w(3) & TEXTURE_WRITABLE) !== 0;
         const format = TEXTURE_FORMATS[w(3) & ~TEXTURE_WRITABLE];
         if (format === undefined) throw bad("unknown texture format");
         if (w(1) === 0 || w(2) === 0) throw bad("a texture's width and height are positive");
-        if (writable && format.name !== "rgba16float") throw bad("only an rgba16float texture can be written by kernels");
+        if (writable && !format.storable) throw bad("kernels write only rgba8unorm, rgba16float, r32float and r32uint textures");
         if (depth > 0 && format.depth) throw bad("a 3D texture holds colours");
         cmd = { op: name, handle: w(0), width: w(1), height: w(2), format: format.name, writable, depth };
         break;

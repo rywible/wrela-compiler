@@ -1,22 +1,22 @@
 // rejects: gpu.textures gpu.kernel-mut
 // A 3D texture's texels are written through, so they're `mut`, passed `mut`, and a kernel's.
-use std::gpu::{ClipPosition, GlobalId, Texels3d, VertexIndex, dispatch, texture3d}
+use std::gpu::{ClipPosition, GlobalId, Rgba16Float, Texels3d, VertexIndex, dispatch, texture3d}
 
 @compute(4, 4, 4)
-fn read_only(out: Texels3d, id: GlobalId) { //~ E0602
+fn read_only(out: Texels3d<Rgba16Float>, id: GlobalId) { //~ E0602
 }
 
 @compute(4, 4, 4)
-fn fill(out: mut Texels3d, id: GlobalId) {
+fn fill(out: mut Texels3d<Rgba16Float>, id: GlobalId) {
     out.store(id, vec4(1.0))
 }
 
 @vertex
-fn corner(v: VertexIndex, out: mut Texels3d) -> ClipPosition { //~ E0602
+fn corner(v: VertexIndex, out: mut Texels3d<Rgba16Float>) -> ClipPosition { //~ E0602
     ClipPosition { position: vec4(0.0, 0.0, 0.0, 1.0) }
 }
 
 pub fn frame(time: f32, width: u32, height: u32) {
-    let t = texture3d(width: 4, height: 4, depth: 4)
+    let t = texture3d::<Rgba16Float>(width: 4, height: 4, depth: 4)
     dispatch(fill.bind(t), groups: 1) //~ E0503
 }

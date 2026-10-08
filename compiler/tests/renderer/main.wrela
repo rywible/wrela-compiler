@@ -4,10 +4,10 @@
 // writes the counts the offscreen pass's far quad is drawn with. Each capability fills one
 // quarter of the screen, so both hosts' frames show every one.
 use std::gpu::{
-    Address, ClipPosition, Compare, ComparisonSampler, DepthTexture, Filter, FragCoord, GlobalId,
-    GpuBuffer, Sampler, Slots, Texture, TextureFormat, VertexIndex, begin_depth_pass, begin_pass,
-    begin_pass_with_depth, begin_screen_pass, buffer, comparison_sampler, depth_texture, dispatch,
-    draw, present, sampler, texture, write,
+    Address, ClipPosition, Compare, ComparisonSampler, DepthTexture, Filter, Filtered, FragCoord,
+    GlobalId, GpuBuffer, Rgba16Float, Rgba8, Sampler, Slots, Texture, VertexIndex, begin_depth_pass,
+    begin_pass, begin_pass_with_depth, begin_screen_pass, buffer, comparison_sampler, depth_texture,
+    dispatch, draw, present, sampler, texture, write,
 }
 
 /// A draw's counts for a quad: 6 vertices, 1 instance, from vertex 0 and instance 0.
@@ -45,10 +45,10 @@ fn quad(v: VertexIndex, rect: Rect, z: f32) -> Quad {
     Quad { pos: ClipPosition { position: vec4(p, z, 1.0) }, uv: vec2(c.x, 1.0 - c.y) }
 }
 
-/// A texture's texels, nearest or blended.
+/// A texture's texels, nearest or blended, whatever its format.
 @fragment
-fn textured(q: Quad, image: Texture, s: Sampler) -> vec4 {
-    image.sample(s, q.uv)
+fn textured<F: Filtered>(q: Quad, image: Texture<F>, s: Sampler) -> vec4 {
+    F::rgba(image.sample(s, q.uv))
 }
 
 /// A flat colour.
@@ -83,8 +83,8 @@ fn checker() -> [u8; 64] {
 pub struct Scene {
     groups: GpuBuffer<u32>,
     counts: GpuBuffer<u32>,
-    board: Texture,
-    target: Texture,
+    board: Texture<Rgba8>,
+    target: Texture<Rgba16Float>,
     depth: DepthTexture,
     shadow: DepthTexture,
     nearest: Sampler,
@@ -93,7 +93,7 @@ pub struct Scene {
 }
 
 pub fn init() -> Scene {
-    var board = texture(width: 4, height: 4)
+    var board = texture::<Rgba8>(width: 4, height: 4)
     board.write(x: 0, y: 0, width: 4, height: 4, bytes: CHECKER)
     var groups: GpuBuffer<u32> = buffer(3)
     write(mut groups, 0, [1, 1, 1])
@@ -101,7 +101,7 @@ pub fn init() -> Scene {
         groups,
         counts: buffer(64),
         board,
-        target: texture(width: 64, height: 64, format: TextureFormat::Rgba16Float),
+        target: texture::<Rgba16Float>(width: 64, height: 64),
         depth: depth_texture(width: 64, height: 64),
         shadow: depth_texture(width: 32, height: 32),
         nearest: sampler(Filter::Nearest, Address::Repeat),

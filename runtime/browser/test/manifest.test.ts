@@ -28,7 +28,7 @@ const GOLDEN = `{
       "vertex_entry": "vs",
       "fragment_entry": "fs",
       "uniform": null,
-      "bindings": [{ "binding": 0, "kind": "texture" }, { "binding": 1, "kind": "sampler" }]
+      "bindings": [{ "binding": 0, "kind": "texture", "format": "rgba8unorm" }, { "binding": 1, "kind": "sampler" }]
     }
   ]
 }`;
@@ -53,7 +53,7 @@ test("parses the Rust crate's golden manifest", () => {
         entry: "main",
         workgroup_size: [64, 1, 1],
         uniform: { binding: 0, size: 32, space: "uniform" },
-        bindings: [{ binding: 1, kind: "read_write", stage: "both" }],
+        bindings: [{ binding: 1, kind: "read_write", stage: "both", format: null }],
         debug_flag: null,
       },
       {
@@ -67,10 +67,11 @@ test("parses the Rust crate's golden manifest", () => {
         depth_bias: { constant: 0, slope_scale: 0, clamp: 0 },
         depth: { compare: "less", write: true },
         writes_depth: false,
+        uint: false,
         uniform: null,
         bindings: [
-          { binding: 0, kind: "texture", stage: "both" },
-          { binding: 1, kind: "sampler", stage: "both" },
+          { binding: 0, kind: "texture", stage: "both", format: "rgba8unorm" },
+          { binding: 1, kind: "sampler", stage: "both", format: null },
         ],
         debug_flag: null,
       },

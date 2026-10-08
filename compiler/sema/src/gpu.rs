@@ -267,6 +267,7 @@ fn check_entry(p: &Program, f: FnId, entry: Entry, out: &mut Vec<Diagnostic>) {
         }
         Entry::Fragment
             if !matches!(p.types.kind(def.ret), TyKind::Vec(VecElem::F32, 4))
+                && def.ret != p.types.u32
                 && !matches!(p.lang_of_ty(def.ret), Some(Lang::Over | Lang::WithDepth)) =>
         {
             out.push(
@@ -274,11 +275,11 @@ fn check_entry(p: &Program, f: FnId, entry: Entry, out: &mut Vec<Diagnostic>) {
                     codes::E0602,
                     def.sig_span,
                     format!(
-                        "{stage} returns a `vec4` colour, an `Over` colour to blend, or a \
-                         `WithDepth` colour and depth"
+                        "{stage} returns a `vec4` colour, an `Over` colour to blend, a \
+                         `WithDepth` colour and depth, or a `u32`"
                     ),
                 )
-                .with_note("it writes one colour to its target: a `vec4` replaces what's there, `std::gpu::Over` is drawn over it, and `std::gpu::WithDepth` replaces it with a depth of its own"),
+                .with_note("it writes one colour to its target: a `vec4` replaces what's there, `std::gpu::Over` is drawn over it, `std::gpu::WithDepth` replaces it with a depth of its own, and a `u32` is an `R32Uint` texture's texel"),
             )
         }
         _ => {}

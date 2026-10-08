@@ -94,6 +94,20 @@ fn wgpu_format(f: TextureFormat) -> wgpu::TextureFormat {
         TextureFormat::Rgba8 => wgpu::TextureFormat::Rgba8Unorm,
         TextureFormat::Rgba16Float => wgpu::TextureFormat::Rgba16Float,
         TextureFormat::Depth32Float => wgpu::TextureFormat::Depth32Float,
+        TextureFormat::R16Float => wgpu::TextureFormat::R16Float,
+        TextureFormat::Rg16Float => wgpu::TextureFormat::Rg16Float,
+        TextureFormat::R32Float => wgpu::TextureFormat::R32Float,
+        TextureFormat::R32Uint => wgpu::TextureFormat::R32Uint,
+    }
+}
+
+/// How a shader reads a colour texture of format `f`: filtered floats, unfiltered floats, or
+/// unsigned integers.
+fn sample_type(f: TextureFormat) -> wgpu::TextureSampleType {
+    if f.is_uint() {
+        wgpu::TextureSampleType::Uint
+    } else {
+        wgpu::TextureSampleType::Float { filterable: f.filterable() }
     }
 }
 
@@ -147,6 +161,8 @@ enum Kind {
         depth: DepthState,
         /// Each fragment gives its own depth: drawn only in a pass with a depth target.
         writes_depth: bool,
+        /// Its fragment shader returns a `u32`: drawn only into an `r32uint` target.
+        uint: bool,
         variants: HashMap<Targets, wgpu::RenderPipeline>,
     },
 }
@@ -520,10 +536,10 @@ impl Gpu {
                     (ty, visibility)
                 }
                 BindingKind::Texture | BindingKind::DepthTexture | BindingKind::Texture3d => {
-                    let sample_type = if b.kind == BindingKind::DepthTexture {
-                        wgpu::TextureSampleType::Depth
-                    } else {
-                        wgpu::TextureSampleType::Float { filterable: true }
+                    let sample_type = match b.format {
+                        _ if b.kind == BindingKind::DepthTexture => wgpu::TextureSampleType::Depth,
+                        Some(f) => sample_type(f),
+                        None => wgpu::TextureSampleType::Float { filterable: true },
                     };
                     let view_dimension = if b.kind == BindingKind::Texture3d {
                         wgpu::TextureViewDimension::D3
@@ -552,7 +568,7 @@ impl Gpu {
                     };
                     let ty = wgpu::BindingType::StorageTexture {
                         access: wgpu::StorageTextureAccess::WriteOnly,
-                        format: wgpu::TextureFormat::Rgba16Float,
+                        format: wgpu_format(b.format.unwrap_or(TextureFormat::Rgba16Float)),
                         view_dimension,
                     };
                     (ty, wgpu::ShaderStages::COMPUTE)
@@ -599,6 +615,7 @@ impl Gpu {
                 depth_bias,
                 depth,
                 writes_depth,
+                uint,
             } => {
                 let mut kind = Kind::Render {
                     module,
@@ -610,12 +627,15 @@ impl Gpu {
                     depth_bias: *depth_bias,
                     depth: *depth,
                     writes_depth: *writes_depth,
+                    uint: *uint,
                     variants: HashMap::new(),
                 };
-                // The screen's variant now, so a shader's errors come at load (with a depth
-                // target, for one that writes its fragments' depth).
+                // The screen's variant now (an integer target's, for a `u32` output), so a
+                // shader's errors come at load (with a depth target, for one that writes its
+                // fragments' depth).
                 let depth = writes_depth.then_some(wgpu::TextureFormat::Depth32Float);
-                render_variant(&self.device, &p.name, &mut kind, (Some(SCREEN_FORMAT), depth));
+                let colour = if *uint { wgpu::TextureFormat::R32Uint } else { SCREEN_FORMAT };
+                render_variant(&self.device, &p.name, &mut kind, (Some(colour), depth));
                 kind
             }
         };
@@ -1102,6 +1122,19 @@ impl Gpu {
                 return Err(Error::Gpu(format!(
                     "`{name}` gives its fragments their depth, so it's drawn in a pass with a \
                      depth target, and this pass has none"
+                )));
+            }
+            if let Kind::Render { uint, .. } = kind
+                && let Some(c) = color_format
+                && *uint != (c == wgpu::TextureFormat::R32Uint)
+            {
+                let (gives, wants) = if *uint {
+                    ("a `u32`", "an r32uint target")
+                } else {
+                    ("a colour", "a colour target, not an integer one")
+                };
+                return Err(Error::Gpu(format!(
+                    "`{name}`'s fragment shader returns {gives}, so it's drawn into {wants}"
                 )));
             }
             render_variant(&self.device, name, kind, targets);

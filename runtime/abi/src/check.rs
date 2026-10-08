@@ -70,7 +70,8 @@ struct Shape {
     name: String,
     compute: bool,
     uniform_size: usize,
-    bindings: Vec<BindingKind>,
+    /// Each binding's kind, and a colour texture's format.
+    bindings: Vec<(BindingKind, Option<TextureFormat>)>,
 }
 
 /// A live resource.
@@ -129,7 +130,7 @@ impl Checker {
                 name: p.name.clone(),
                 compute: matches!(p.stage, Stage::Compute { .. }),
                 uniform_size: p.uniform.as_ref().map_or(0, |u| u.size as usize),
-                bindings: p.bindings.iter().map(|b| b.kind).collect(),
+                bindings: p.bindings.iter().map(|b| (b.kind, b.format)).collect(),
             })
             .collect();
         Checker {
@@ -374,6 +375,26 @@ impl Checker {
         }
     }
 
+    /// That texture `handle`, of format `got`, is of the format its binding names.
+    fn format(
+        op: Opcode,
+        handle: u32,
+        got: TextureFormat,
+        want: Option<TextureFormat>,
+    ) -> Result<()> {
+        match want {
+            Some(w) if w != got => Err(CommandError {
+                opcode: op,
+                why: format!(
+                    "texture {handle} is {}, and it's bound where a {} texture goes",
+                    got.name(),
+                    w.name()
+                ),
+            }),
+            _ => Ok(()),
+        }
+    }
+
     fn texture(&self, op: Opcode, handle: u32) -> Result<(u32, u32, TextureFormat)> {
         match self.resources.get(&handle) {
             Some(Resource::Texture { width, height, format, .. }) => Ok((*width, *height, *format)),
@@ -501,7 +522,7 @@ impl Checker {
             ));
         }
         let mut written = Vec::new();
-        for (b, &kind) in bindings.iter().zip(&p.bindings) {
+        for (b, &(kind, format)) in bindings.iter().zip(&p.bindings) {
             if self.attachments.contains(&b.handle) {
                 return err(format!(
                     "texture {} is the pass's target, so its draws can't bind it",
@@ -543,6 +564,7 @@ impl Checker {
                         let want = if depth { "a depth texture" } else { "a colour texture" };
                         return err(format!("texture {} is bound where {want} goes", b.handle));
                     }
+                    Self::format(op, b.handle, f, format)?;
                     self.dimensions(op, b.handle, kind == BindingKind::Texture3d)?;
                     Self::used(&mut self.scope, op, "texture", b.handle, false)?;
                 }
@@ -558,6 +580,8 @@ impl Checker {
                             b.handle
                         ));
                     }
+                    let (_, _, f) = self.texture(op, b.handle)?;
+                    Self::format(op, b.handle, f, format)?;
                     self.dimensions(op, b.handle, kind == BindingKind::StorageTexture3d)?;
                     Self::used(&mut self.scope, op, "texture", b.handle, true)?;
                 }

@@ -3,10 +3,7 @@
 // fragments that each loop; `simulate`, a kernel whose invocations each loop; `blur`, another
 // pass. Keys choose what a frame draws: 0 all three (the default), 1 `shade` alone, 2
 // `simulate` alone, 3 `blur` alone.
-use std::gpu::{
-    ClipPosition, FragCoord, GlobalId, GpuBuffer, Slots, Texture, TextureFormat, VertexIndex,
-    begin_pass, begin_screen_pass, buffer, dispatch, draw, label, present, texture,
-}
+use std::gpu::{ClipPosition, FragCoord, GlobalId, GpuBuffer, Rgba16Float, Slots, Texture, VertexIndex, begin_pass, begin_screen_pass, buffer, dispatch, draw, label, present, texture}
 use std::input::{Event, Key, events}
 
 @vertex
@@ -36,13 +33,13 @@ fn simulate(steps: u32, out: mut Slots<vec2>, id: GlobalId) {
 }
 
 @fragment
-fn show(target: Texture) -> vec4 {
+fn show(target: Texture<Rgba16Float>) -> vec4 {
     vec4(target.load(x: 0, y: 0).xy, 0.0, 1.0)
 }
 
 pub struct Work {
-    a: Texture,
-    c: Texture,
+    a: Texture<Rgba16Float>,
+    c: Texture<Rgba16Float>,
     points: GpuBuffer<vec2>,
     only: u32,
 }
@@ -52,8 +49,8 @@ const POINTS: u32 = 262144
 
 pub fn init() -> Work {
     Work {
-        a: texture(width: SIDE, height: SIDE, format: TextureFormat::Rgba16Float),
-        c: texture(width: SIDE, height: SIDE, format: TextureFormat::Rgba16Float),
+        a: texture::<Rgba16Float>(width: SIDE, height: SIDE),
+        c: texture::<Rgba16Float>(width: SIDE, height: SIDE),
         points: buffer(POINTS),
         only: 0,
     }

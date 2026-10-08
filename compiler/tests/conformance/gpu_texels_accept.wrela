@@ -2,16 +2,16 @@
 // A kernel writes a texture made `writable`, each invocation its own texel, and a pass reads
 // it.
 use std::gpu::{
-    ClipPosition, FragCoord, GlobalId, Texels, Texture, TextureFormat, VertexIndex,
-    begin_screen_pass, dispatch, draw, present, texture,
+    ClipPosition, FragCoord, GlobalId, Rgba16Float, Texels, Texture, VertexIndex, begin_screen_pass,
+    dispatch, draw, present, texture, writable_texture,
 }
 
 struct State {
-    t: Texture,
+    t: Texture<Rgba16Float>,
 }
 
 @compute(8, 8)
-fn fill(out: mut Texels, id: GlobalId) {
+fn fill(out: mut Texels<Rgba16Float>, id: GlobalId) {
     out.store(id, vec4(f32(id.x) / 16.0, f32(id.y) / 16.0, 0.5, 1.0))
 }
 
@@ -23,12 +23,12 @@ fn cover(v: VertexIndex) -> ClipPosition {
 }
 
 @fragment
-fn show(p: FragCoord, t: Texture) -> vec4 {
+fn show(p: FragCoord, t: Texture<Rgba16Float>) -> vec4 {
     t.load(x: u32(p.position.x) % 16, y: u32(p.position.y) % 16)
 }
 
 pub fn init() -> State {
-    State { t: texture(width: 16, height: 16, format: TextureFormat::Rgba16Float, writable: true) }
+    State { t: writable_texture::<Rgba16Float>(width: 16, height: 16) }
 }
 
 pub fn frame(s: mut State, time: f32, width: u32, height: u32) {

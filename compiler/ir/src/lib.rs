@@ -626,14 +626,69 @@ pub enum ResourceKind {
     Private,
     /// `var<workgroup>` holding `ty` (an array): one per workgroup, shared by its invocations.
     Workgroup,
-    /// `texture_2d<f32>`, `texture_depth_2d`, or `texture_3d<f32>` when `three`. Sampled with
-    /// a `vec2`, or a `vec3` when `three`.
-    Texture { depth: bool, three: bool },
-    /// `texture_storage_2d<rgba16float, write>`, or `texture_storage_3d` when `three`: a
-    /// kernel's texels to write.
-    StorageTexture { three: bool },
+    /// `texture_2d<f32>` (`texture_2d<u32>` of a `u32` format), `texture_depth_2d`, or
+    /// `texture_3d<..>` when `three`. Sampled with a `vec2`, or a `vec3` when `three`. A depth
+    /// texture's `format` is `R32Float`, its depths'.
+    Texture { depth: bool, three: bool, format: TexFormat },
+    /// `texture_storage_2d<format, write>`, or `texture_storage_3d` when `three`: a kernel's
+    /// texels to write.
+    StorageTexture { three: bool, format: TexFormat },
     /// `sampler`, or `sampler_comparison`.
     Sampler { comparison: bool },
+}
+
+/// A colour texture's format (`std::gpu`'s format types, language.md §12): what a texel holds,
+/// and how GPU code reads it. It reads and writes four of the format's scalar, the channels it
+/// lacks ignored when written and 0 (alpha 1) when read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TexFormat {
+    Rgba8Unorm,
+    Rgba16Float,
+    R16Float,
+    Rg16Float,
+    R32Float,
+    R32Uint,
+}
+
+impl TexFormat {
+    /// The scalar GPU code reads and writes it in.
+    pub fn scalar(self) -> Scalar {
+        match self {
+            TexFormat::R32Uint => Scalar::U32,
+            _ => Scalar::F32,
+        }
+    }
+
+    /// Its channels.
+    pub fn channels(self) -> u8 {
+        match self {
+            TexFormat::Rgba8Unorm | TexFormat::Rgba16Float => 4,
+            TexFormat::Rg16Float => 2,
+            TexFormat::R16Float | TexFormat::R32Float | TexFormat::R32Uint => 1,
+        }
+    }
+
+    /// Whether GPU code can filter between its texels (WebGPU's core formats).
+    pub fn filterable(self) -> bool {
+        !matches!(self, TexFormat::R32Float | TexFormat::R32Uint)
+    }
+
+    /// Whether kernels can write it (WebGPU's core storage formats).
+    pub fn storable(self) -> bool {
+        !matches!(self, TexFormat::R16Float | TexFormat::Rg16Float)
+    }
+
+    /// Its WebGPU name.
+    pub fn name(self) -> &'static str {
+        match self {
+            TexFormat::Rgba8Unorm => "rgba8unorm",
+            TexFormat::Rgba16Float => "rgba16float",
+            TexFormat::R16Float => "r16float",
+            TexFormat::Rg16Float => "rg16float",
+            TexFormat::R32Float => "r32float",
+            TexFormat::R32Uint => "r32uint",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -669,11 +724,12 @@ pub enum Stage {
         varyings: Vec<Varying>,
     },
     /// Takes the vertex's output (if it reads it) as its last argument: its type, and its
-    /// members. Returns a vec4 colour, or (`depth`) a struct of a vec4 colour and an f32 depth
-    /// (`@builtin(frag_depth)`).
+    /// members. Returns a vec4 colour, a `u32` (`uint`: into an integer target), or (`depth`)
+    /// a struct of a vec4 colour and an f32 depth (`@builtin(frag_depth)`).
     Fragment {
         varyings: Option<(TypeId, Vec<Varying>)>,
         depth: bool,
+        uint: bool,
     },
 }
 

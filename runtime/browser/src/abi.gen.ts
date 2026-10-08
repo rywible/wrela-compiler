@@ -2,7 +2,7 @@
 // command stream and manifest. Don't edit; run `cargo run -p wrela-abi --bin generate`.
 
 export const STREAM_VERSION = 7;
-export const MANIFEST_VERSION = 6;
+export const MANIFEST_VERSION = 7;
 /** The bytes `WRCS`, read as a little-endian u32. */
 export const STREAM_MAGIC = 0x53435257;
 export const HEADER_LEN = 12;
@@ -46,9 +46,13 @@ export const Opcode = {
 /** A texture's format, by its number in the stream: WebGPU's name, the bytes of one texel, and
  * whether it's a depth format. */
 export const TEXTURE_FORMATS = [
-  { name: "rgba8unorm", bytes: 4, depth: false },
-  { name: "rgba16float", bytes: 8, depth: false },
-  { name: "depth32float", bytes: 4, depth: true },
+  { name: "rgba8unorm", bytes: 4, depth: false, storable: true, filterable: true, uint: false },
+  { name: "rgba16float", bytes: 8, depth: false, storable: true, filterable: true, uint: false },
+  { name: "depth32float", bytes: 4, depth: true, storable: false, filterable: false, uint: false },
+  { name: "r16float", bytes: 2, depth: false, storable: false, filterable: true, uint: false },
+  { name: "rg16float", bytes: 4, depth: false, storable: false, filterable: true, uint: false },
+  { name: "r32float", bytes: 4, depth: false, storable: true, filterable: false, uint: false },
+  { name: "r32uint", bytes: 4, depth: false, storable: true, filterable: false, uint: true },
 ] as const;
 /** `CreateTexture`'s format word with this bit set: kernels write the texture. */
 export const TEXTURE_WRITABLE = 65536;
