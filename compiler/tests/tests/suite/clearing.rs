@@ -1045,10 +1045,7 @@ fn blocked(a: &[u8], b: &[u8], ta: &[bool], tb: &[bool], block: usize) -> (f64, 
 }
 
 /// AC4's levels: each kind's crown drawn as cards and as an impostor where they meet (150 m),
-/// and as an impostor and as a volume where they meet (1 km), matches within a mean of 4.25/255
-/// (4 until the gloss: seen against the sun, the ground behind a crown glints, and where the two
-/// levels' silhouettes differ, about 5% of their pixels, that brightness counts; the crowns' own
-/// light matches as before, as the bias where both show it says):
+/// and as an impostor and as a volume where they meet (1 km), matches within a mean of 4/255:
 /// its silhouette and its light through it (spike 03), seen against the sun, over the crown's
 /// box at the coarser level's own resolution (blocks two of its texels, or voxels, wide on
 /// screen: the finest detail it holds). The final frames compared, converged (spike 03: each
@@ -1161,7 +1158,7 @@ fn a_crown_matches_where_its_levels_meet() {
             println!("kind {kind} at {distance} m: drawn neither way (under a few pixels)");
             continue;
         }
-        assert!(mean <= 4.25, "kind {kind} at {distance} m: its levels differ by {mean}/255");
+        assert!(mean <= 4.0, "kind {kind} at {distance} m: its levels differ by {mean}/255");
     }
 }
 
