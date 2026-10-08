@@ -912,8 +912,9 @@ tuple-index ::= [0-9] [0-9]? [0-9]? [0-9]?
 float ::= [0-9] [0-9_]* \".\" [0-9] [0-9_]* exponent? | [0-9] [0-9_]* exponent
 exponent ::= [eE] [+-]? [0-9] [0-9_]*
 # SUFFIXED (L13): a decimal number and a unit of letters, not starting with `e` (never a type
-# suffix, which has digits; nor `x`, `b` or `o`, which after a `0` read as a radix prefix).
-suffixed ::= ( [0-9] [0-9_]* ( \".\" [0-9] [0-9_]* )? exponent? ) [acdf-np-wyzACDF-NP-WYZ] [a-zA-Z]*
+# suffix, which has digits; nor `x`, `b` or `o`, which after a `0` read as a radix prefix), and
+# not ending with `e`: the token would take a `+` or `-` and a digit after it (L12).
+suffixed ::= ( [0-9] [0-9_]* ( \".\" [0-9] [0-9_]* )? exponent? ) [acdf-np-wyzACDF-NP-WYZ] ( [a-zA-Z]* [a-df-zA-DF-Z] )?
 
 # STRING (L14), and the f-string tokens (L22).
 string ::= \"\\\"\" string-char* \"\\\"\"
