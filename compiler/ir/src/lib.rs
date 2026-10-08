@@ -23,6 +23,7 @@ pub mod scalarize;
 mod single_exit;
 mod types;
 pub mod uniformity;
+mod unroll;
 mod verify;
 pub mod visit;
 pub mod workgroup;

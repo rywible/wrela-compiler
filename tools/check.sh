@@ -74,7 +74,7 @@ PY
 # are malformed on purpose, and their annotations are part of their layout.
 WRELA_SOURCES=(examples engine compiler/std compiler/tests/fields compiler/tests/math compiler/tests/sketches
   compiler/tests/numerics compiler/tests/render compiler/tests/queries compiler/tests/simd
-  compiler/tests/input compiler/tests/lift compiler/tests/texels compiler/tests/shader_params ui studio)
+  compiler/tests/input compiler/tests/lift compiler/tests/texels compiler/tests/shader_params compiler/tests/unroll ui studio)
 
 logs=$(mktemp -d)
 side_jobs=()

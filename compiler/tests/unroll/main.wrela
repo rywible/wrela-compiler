@@ -1,0 +1,85 @@
+// Loops a shader has written out (compiler/ir/src/unroll.rs) and loops it keeps, each kernel's
+// results read back and summed: tests/suite/unroll.rs checks the WGSL's loops and the sums.
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch, read}
+use std::io::Pending
+
+/// A 3 × 3 count, written out: (j × 3 + i) × (id + 1) summed.
+@compute(64)
+fn grid(out: mut Slots<u32>, id: GlobalId) {
+    var s: u32 = 0
+    for j in 0..3 {
+        for i in 0..3 {
+            s += (j * 3 + i) * (id.x + 1)
+        }
+    }
+    out[id] = s
+}
+
+/// A count to a value the invocation has: kept, its end isn't a constant.
+@compute(64)
+fn up_to(n: u32, out: mut Slots<u32>, id: GlobalId) {
+    var s: u32 = 0
+    for i in 0..id.x % n {
+        s += i
+    }
+    out[id] = s
+}
+
+/// A loop left early: kept.
+@compute(64)
+fn first_over(out: mut Slots<u32>, id: GlobalId) {
+    var found: u32 = 99
+    for i in 0..8 {
+        if i * i > id.x {
+            found = i
+            break
+        }
+    }
+    out[id] = found
+}
+
+/// Twenty passes: kept (more than unroll.rs writes out).
+@compute(64)
+fn long(out: mut Slots<u32>, id: GlobalId) {
+    var s: u32 = 0
+    for i in 0..20 {
+        s += i ^ id.x
+    }
+    out[id] = s
+}
+
+pub struct Work {
+    backs: [Pending<u32>; 4],
+    /// Each kernel's results summed: 0 until they arrive.
+    sums: [u32; 4],
+}
+
+pub fn init() -> Work {
+    var outs: [GpuBuffer<u32>; 4] = [buffer(64), buffer(64), buffer(64), buffer(64)]
+    dispatch(grid.bind(out: mut outs[0]), groups: 1)
+    dispatch(up_to.bind(5, out: mut outs[1]), groups: 1)
+    dispatch(first_over.bind(out: mut outs[2]), groups: 1)
+    dispatch(long.bind(out: mut outs[3]), groups: 1)
+    let backs = [
+        read(outs[0].span(start: 0, count: 64)),
+        read(outs[1].span(start: 0, count: 64)),
+        read(outs[2].span(start: 0, count: 64)),
+        read(outs[3].span(start: 0, count: 64)),
+    ]
+    Work { backs, sums: [0; 4] }
+}
+
+pub fn frame(state: mut Work, time: f32, width: u32, height: u32) {
+    for k in 0..4 {
+        if let Some(Ok(xs)) = state.backs[k].poll() {
+            for x in xs {
+                state.sums[k] += x
+            }
+        }
+    }
+}
+
+/// Kernel `k`'s results summed (`grid`, `up_to`, `first_over`, `long`).
+pub fn sum(state: Work, k: u32) -> u32 {
+    state.sums[k]
+}

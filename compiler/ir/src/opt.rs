@@ -34,6 +34,7 @@ pub fn flatten_gpu(m: &mut Module) -> Result<()> {
     keep_reachable(m, &keep);
     for i in 0..m.functions.len() {
         let mut f = std::mem::take(&mut m.functions[i]);
+        crate::unroll::unroll(&mut f);
         forward(m, &mut f);
         promote(m, &mut f);
         dce(&mut f);

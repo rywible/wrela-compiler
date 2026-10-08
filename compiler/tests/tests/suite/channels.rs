@@ -145,6 +145,7 @@ pub fn frame(time: f32, width: u32, height: u32) {
         .map(|(_, bytes)| String::from_utf8_lossy(bytes).matches("1.375").count())
         .collect();
     counts.sort();
-    // The array's union loops over its parts: one evaluation in the loop, one for the first.
-    assert_eq!(counts, [2, 8], "evaluations of a part's distance in each pipeline's WGSL");
+    // The array's union loops over its parts, written out (a loop of a few passes is,
+    // compiler/ir/src/unroll.rs): one evaluation a part, as the chain's.
+    assert_eq!(counts, [6, 8], "evaluations of a part's distance in each pipeline's WGSL");
 }

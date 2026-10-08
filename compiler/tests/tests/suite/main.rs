@@ -54,6 +54,7 @@ mod sweep;
 mod test_items;
 mod text;
 mod threads;
+mod unroll;
 mod warnings;
 mod workgroup;
 
