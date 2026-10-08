@@ -479,15 +479,14 @@ fn ps_path(entry: &str) -> String {
     format!("engine::{module}::{entry}")
 }
 
-/// AC6: the sky's pass reads the cooked clouds and marches nothing (its WGSL has no loop),
-/// where the cooking marches.
+/// AC6: the sky's pass reads the cooked clouds and marches nothing (its WGSL, with the functions
+/// it calls, has no loop), where the cooking marches.
 #[test]
 fn the_sky_pass_reads_the_cooked_clouds_and_marches_nothing() {
     let ps = pipelines();
     let sky = ps.iter().find(|p| p.fragment == "sky_shade").expect("the sky's pipeline");
-    let body = wgsl_function(&sky.wgsl, "sky_shade");
-    assert!(!body.contains("loop"), "the sky's pass loops:\n{body}");
-    assert!(body.contains("textureSampleLevel"), "the sky's pass reads no texture");
+    assert!(!sky.wgsl.contains("loop"), "the sky's pass loops:\n{}", sky.wgsl);
+    assert!(sky.wgsl.contains("textureSampleLevel"), "the sky's pass reads no texture");
     let cook = ps.iter().find(|p| p.fragment == "cook_clouds").expect("the clouds' cooking");
     assert!(cook.wgsl.contains("loop"), "the cooking doesn't march");
 }
@@ -1885,7 +1884,10 @@ fn the_walking_creature_leaves_no_trail() {
             left += 1;
             let ca = [0, 1, 2].map(|ch| f64::from(a[4 * i + ch]));
             let cb = [0, 1, 2].map(|ch| f64::from(b[4 * i + ch]));
-            if like(ca) && !like(cb) {
+            // A pixel all but the same in both (within 8/255 each channel) is no trail, though
+            // noise flips its likeness: the dirt path's colour is near the creature's.
+            let differs = (0..3).any(|ch| (ca[ch] - cb[ch]).abs() > 8.0);
+            if like(ca) && !like(cb) && differs {
                 let (x, y) = ((i % W as usize) as f64, (i / W as usize) as f64);
                 let d = outline
                     .iter()
@@ -2528,4 +2530,42 @@ fn hot_reload_in_chrome() {
     assert!(structural_ms <= 3000.0, "a structural edit took {structural_ms:.0} ms");
     let log = std::fs::read_to_string(out.join("results/log.txt")).expect("log.txt");
     assert_eq!(log.lines().filter(|l| l.starts_with("clearing ready")).count(), 2, "{log}");
+}
+
+// TEMPORARY (SKY-TASKS.md): the sheets' shots, deleted with the task file.
+#[test]
+#[ignore = "measure: temporary, the sky work's shots"]
+fn zz_sky_shots() {
+    let Ok(dir) = std::env::var("SHOTS") else { return };
+    let mut c = Clearing::load("clearing-shots");
+    c.until_ready(0);
+    c.off(off::WIND);
+    let eye = c.camera().eye.map(|x| x as f32);
+    let toward = |d: [f32; 3]| [eye[0] + d[0] * 20.0, eye[1] + d[1] * 20.0, eye[2] + d[2] * 20.0];
+    let views: [(&str, [f32; 3], [f32; 3]); 5] = [
+        ("start", eye, [0.0, 7.5, 40.0]),
+        ("sun", eye, toward([0.9, 0.25, -0.159])),
+        ("valley", eye, toward([-0.75, 0.04, 1.0])),
+        ("up", eye, toward([0.2, 1.0, 0.6])),
+        ("shade", [2.0, 6.5, 9.5], [-3.2, 3.0, 14.5]),
+    ];
+    for (name, e, at) in views {
+        c.hold(e, at);
+        c.steps(40);
+        let s = c.screen();
+        let path = std::path::Path::new(&dir).join(format!("{name}.png"));
+        wrela_host::image::write_png(&path, W, H, &s).expect("write");
+        // The scene's mean luminance as `paint::meter` takes it.
+        let size = c.camera().screen;
+        let scene = c.scene();
+        let mut sum = 0.0;
+        for i in 0..1024 {
+            let x = ((i % 32) as f64 + 0.5) / 32.0 * size[0];
+            let y = ((i / 32) as f64 + 0.5) / 32.0 * size[1];
+            let p = scene[y as usize * size[0] as usize + x as usize];
+            let l = 0.2126 * p[0] as f64 + 0.7152 * p[1] as f64 + 0.0722 * p[2] as f64;
+            sum += l.max(1e-4).log2();
+        }
+        println!("wrote {} (mean luminance {:.4})", path.display(), (sum / 1024.0).exp2());
+    }
 }
