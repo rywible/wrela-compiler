@@ -158,6 +158,10 @@ async function buildPipeline(device: GPUDevice, p: Pipeline, source: string): Pr
     });
   }
   for (const b of p.bindings) {
+    // A render pipeline's binding one shader reads is that shader's alone, so each stage counts
+    // only its own against WebGPU's limits.
+    const seen =
+      b.stage === "vertex" ? GPUShaderStage.VERTEX : b.stage === "fragment" ? GPUShaderStage.FRAGMENT : visibility;
     switch (b.kind) {
       case "read":
       case "read_write": {
@@ -165,7 +169,7 @@ async function buildPipeline(device: GPUDevice, p: Pipeline, source: string): Pr
         entries.push({
           binding: b.binding,
           // WebGPU forbids writable storage in vertex shaders.
-          visibility: readOnly || p.kind === "compute" ? visibility : GPUShaderStage.FRAGMENT,
+          visibility: readOnly || p.kind === "compute" ? seen : GPUShaderStage.FRAGMENT,
           buffer: { type: readOnly ? "read-only-storage" : "storage" },
         });
         break;
@@ -174,7 +178,7 @@ async function buildPipeline(device: GPUDevice, p: Pipeline, source: string): Pr
       case "depth_texture":
         entries.push({
           binding: b.binding,
-          visibility,
+          visibility: seen,
           texture: { sampleType: b.kind === "texture" ? "float" : "depth", viewDimension: "2d" },
         });
         break;
@@ -182,7 +186,7 @@ async function buildPipeline(device: GPUDevice, p: Pipeline, source: string): Pr
       case "comparison_sampler":
         entries.push({
           binding: b.binding,
-          visibility,
+          visibility: seen,
           sampler: { type: b.kind === "sampler" ? "filtering" : "comparison" },
         });
         break;

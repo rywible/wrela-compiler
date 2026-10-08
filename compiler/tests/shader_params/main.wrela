@@ -1,0 +1,41 @@
+// A vertex shader and a fragment shader with parameters of the same name, given different
+// buffers: each reads its own (§12). The vertex shader's covers the screen; the fragment
+// shader's colours it a quarter red. renderer.rs checks a pixel the vertex shader would leave
+// empty if it read the fragment shader's buffer.
+
+use std::gpu::{
+    ClipPosition, GpuBuffer, VertexIndex, begin_screen_pass, buffer, draw, present, write,
+}
+
+struct State {
+    scale: GpuBuffer<f32>,
+    red: GpuBuffer<f32>,
+}
+
+/// A triangle round the screen, scaled by `values[0]`.
+@vertex
+fn cover(v: VertexIndex, values: [f32]) -> ClipPosition {
+    let x = f32((v.index << 1) & 2) * 2.0 - 1.0
+    let y = f32(v.index & 2) * 2.0 - 1.0
+    ClipPosition { position: vec4(vec2(x, y) * values[0], 0.5, 1.0) }
+}
+
+/// Red `values[0]`.
+@fragment
+fn paint(values: [f32]) -> vec4 {
+    vec4(values[0], 0.0, 0.0, 1.0)
+}
+
+pub fn init() -> State {
+    var scale: GpuBuffer<f32> = buffer(1)
+    write(mut scale, 0, [1.0])
+    var red: GpuBuffer<f32> = buffer(1)
+    write(mut red, 0, [0.25])
+    State { scale: take scale, red: take red }
+}
+
+pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
+    begin_screen_pass(clear: vec4(0.0))
+    draw(cover.bind(values: s.scale), paint.bind(values: s.red), vertices: 3)
+    present()
+}

@@ -53,7 +53,7 @@ test("parses the Rust crate's golden manifest", () => {
         entry: "main",
         workgroup_size: [64, 1, 1],
         uniform: { binding: 0, size: 32, space: "uniform" },
-        bindings: [{ binding: 1, kind: "read_write" }],
+        bindings: [{ binding: 1, kind: "read_write", stage: "both" }],
         debug_flag: null,
       },
       {
@@ -69,8 +69,8 @@ test("parses the Rust crate's golden manifest", () => {
         writes_depth: false,
         uniform: null,
         bindings: [
-          { binding: 0, kind: "texture" },
-          { binding: 1, kind: "sampler" },
+          { binding: 0, kind: "texture", stage: "both" },
+          { binding: 1, kind: "sampler", stage: "both" },
         ],
         debug_flag: null,
       },

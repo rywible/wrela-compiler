@@ -78,6 +78,20 @@ fn a_kernel_writes_a_textures_texels() {
     }
 }
 
+/// A vertex shader and a fragment shader with parameters of the same name read their own
+/// buffers (compiler/tests/shader_params): the vertex shader's, 1, scales its triangle to cover
+/// the screen, and the fragment shader's, 0.25, is its red. (Each read the fragment shader's
+/// once: the triangle, a quarter the size, left the right of the screen empty.)
+#[test]
+#[ignore = "needs a GPU"]
+fn each_shader_reads_its_own_parameters() {
+    let (dir, _) = page("compiler/tests/shader_params", "shader-params-native");
+    let run = native(&dir);
+    for (x, y) in [(4, 4), (64, 64), (124, 64), (124, 124)] {
+        near(pixel(&run.frame, x, y), [64, 0, 0, 255], &format!("pixel ({x}, {y})"));
+    }
+}
+
 #[test]
 #[ignore = "long: needs Chrome, python3 and a GPU"]
 fn the_browser_writes_texels_as_the_native_host_does() {

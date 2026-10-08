@@ -31,9 +31,13 @@ export interface UniformBlock {
   space: UniformSpace;
 }
 
+/** Which of a render pipeline's shaders reads a binding: both, if the manifest doesn't say. */
+export type BindingStage = "both" | "vertex" | "fragment";
+
 export interface ResourceBinding {
   binding: number;
   kind: BindingKind;
+  stage: BindingStage;
 }
 
 export type Stage =
@@ -158,7 +162,9 @@ function pipeline(v: unknown, i: number): Pipeline {
   const bindings = list.map((b, j) => {
     const bw = `${where}.bindings[${j}]`;
     const bo = object(b, bw);
-    return { binding: u32(bo, "binding", bw), kind: oneOf(bo, "kind", bw, BINDING_KINDS) };
+    // A missing `stage` is both.
+    const stage: BindingStage = bo["stage"] === undefined ? "both" : oneOf(bo, "stage", bw, ["vertex", "fragment"] as const);
+    return { binding: u32(bo, "binding", bw), kind: oneOf(bo, "kind", bw, BINDING_KINDS), stage };
   });
   const kind = oneOf(o, "kind", where, ["compute", "render"] as const);
   let stage: Stage;
@@ -310,12 +316,29 @@ export function validateManifest(m: Manifest): void {
     }
     if (p.debug_flag !== null) bindings.push(p.debug_flag);
     if (new Set(bindings).size !== bindings.length) throw err(`pipeline ${i} uses a binding twice`);
-    const storage =
-      p.bindings.filter((b) => isBuffer(b.kind)).length + (u?.space === "storage" ? 1 : 0) + (p.debug_flag !== null ? 1 : 0);
-    if (storage > MAX_STORAGE_BUFFERS_PER_STAGE) {
-      throw err(
-        `pipeline ${i} has ${storage} storage buffers; WebGPU's default limit is ${MAX_STORAGE_BUFFERS_PER_STAGE}`,
-      );
+    const render = p.kind === "render";
+    for (const b of p.bindings) {
+      if (!render && b.stage !== "both") {
+        throw err(`pipeline ${i}'s binding ${b.binding} names a stage, but it's a kernel's`);
+      }
+      if (b.stage === "vertex" && b.kind === "read_write") {
+        throw err(`pipeline ${i}'s binding ${b.binding} is written, and a vertex shader can't write`);
+      }
+    }
+    // Each stage's storage buffers: its bindings', the uniform block's when it's in storage, and
+    // the debug flag (a fragment shader's or a kernel's).
+    const stages: BindingStage[] = render ? ["vertex", "fragment"] : ["both"];
+    for (const stage of stages) {
+      const storage =
+        p.bindings.filter((b) => isBuffer(b.kind) && (b.stage === "both" || b.stage === stage)).length +
+        (u?.space === "storage" ? 1 : 0) +
+        (p.debug_flag !== null && stage !== "vertex" ? 1 : 0);
+      if (storage > MAX_STORAGE_BUFFERS_PER_STAGE) {
+        const what = stage === "vertex" ? " in its vertex shader" : stage === "fragment" ? " in its fragment shader" : "";
+        throw err(
+          `pipeline ${i} has ${storage} storage buffers${what}; WebGPU's default limit is ${MAX_STORAGE_BUFFERS_PER_STAGE}`,
+        );
+      }
     }
     if (p.kind === "compute") {
       if (p.entry === "") throw err(`pipeline ${i} has no entry point`);

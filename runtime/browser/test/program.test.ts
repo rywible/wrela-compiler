@@ -289,8 +289,8 @@ test("writable aliases and clear colours", async () => {
   for (const p of m.pipelines) {
     p.uniform = null;
     p.bindings = [
-      { binding: 1, kind: "read_write" },
-      { binding: 2, kind: "read_write" },
+      { binding: 1, kind: "read_write", stage: "both" },
+      { binding: 2, kind: "read_write", stage: "both" },
     ];
   }
   const why = async (manifest: typeof m, batch: Uint8Array) => {

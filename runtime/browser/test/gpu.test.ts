@@ -256,8 +256,8 @@ test("a screen target can copy each pass out (test mode)", async () => {
 function sampled(): Manifest {
   const m = shapes();
   m.pipelines[0]!.bindings = [
-    { binding: 1, kind: "texture" },
-    { binding: 2, kind: "comparison_sampler" },
+    { binding: 1, kind: "texture", stage: "both" },
+    { binding: 2, kind: "comparison_sampler", stage: "both" },
   ];
   return m;
 }

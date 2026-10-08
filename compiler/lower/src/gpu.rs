@@ -6,7 +6,7 @@ use crate::body::{Fl, Repr};
 use crate::instance::InstanceKey;
 use crate::{Cx, ModuleBuilder};
 use std::rc::Rc;
-use wrela_abi::manifest::{BindingKind, ResourceBinding};
+use wrela_abi::manifest::{BindingKind, BindingStage, ResourceBinding};
 use wrela_abi::stream::Opcode;
 use wrela_diag::{Diagnostic, Span, codes};
 use wrela_ir as ir;
@@ -158,19 +158,6 @@ pub(crate) enum ParamClass {
     /// The vertex shader's output, read by the fragment shader.
     Varyings,
     Uniform,
-}
-
-impl ParamClass {
-    /// Whether it's bound to a resource: a buffer, a texture or a sampler.
-    pub fn is_bound(&self) -> bool {
-        matches!(
-            self,
-            ParamClass::Buffer { .. }
-                | ParamClass::Append { .. }
-                | ParamClass::Texture { .. }
-                | ParamClass::Sampler { .. }
-        )
-    }
 }
 
 /// How parameter `param` of `f`, of type `ty`, is supplied. `varyings` is the vertex output a
@@ -1409,6 +1396,12 @@ fn entry_module(cx: &mut Cx, iface: Rc<Interface>, stage: Entry) -> EntryModule 
         let entry = &iface.entries[e];
         let param = &program.func(entry.func).params[i];
         let binding = 1 + bindings.len() as u32;
+        // A render pipeline's binding is its own shader's (`Interface::bound`).
+        let stage = match stage {
+            Entry::Compute(_) => BindingStage::Both,
+            _ if e == 0 => BindingStage::Vertex,
+            _ => BindingStage::Fragment,
+        };
         let (kind, ty, bk) = match entry.params[i].1 {
             ParamClass::Append { elem } => {
                 // The items, then the count: two bindings, the count's resource just after.
@@ -1422,9 +1415,12 @@ fn entry_module(cx: &mut Cx, iface: Rc<Interface>, stage: Entry) -> EntryModule 
                 let count = mb.m.types.intern(ir::TypeDef::Atomic(ir::Scalar::U32));
                 let name = format!("{}_count", param.name);
                 mb.m.add_resource(ir::Resource { name, binding: binding + 1, kind, ty: count });
-                bindings.push(ResourceBinding { binding, kind: BindingKind::ReadWrite });
-                bindings
-                    .push(ResourceBinding { binding: binding + 1, kind: BindingKind::ReadWrite });
+                bindings.push(ResourceBinding { binding, kind: BindingKind::ReadWrite, stage });
+                bindings.push(ResourceBinding {
+                    binding: binding + 1,
+                    kind: BindingKind::ReadWrite,
+                    stage,
+                });
                 resources[e][i] = Some(id);
                 continue;
             }
@@ -1471,17 +1467,8 @@ fn entry_module(cx: &mut Cx, iface: Rc<Interface>, stage: Entry) -> EntryModule 
             _ => continue,
         };
         let id = mb.m.add_resource(ir::Resource { name: param.name.clone(), binding, kind, ty });
-        bindings.push(ResourceBinding { binding, kind: bk });
-        // Every entry point's parameter of this name is this binding.
-        for (e2, other) in iface.entries.iter().enumerate() {
-            for (i2, _) in other.params.iter().enumerate() {
-                if program.func(other.func).params[i2].name == param.name
-                    && other.params[i2].1.is_bound()
-                {
-                    resources[e2][i2] = Some(id);
-                }
-            }
-        }
+        bindings.push(ResourceBinding { binding, kind: bk, stage });
+        resources[e][i] = Some(id);
     }
     // A lifted build's literals: a buffer every pipeline binds, after the others (§22).
     let literals = crate::lift::len(cx);
@@ -1490,7 +1477,11 @@ fn entry_module(cx: &mut Cx, iface: Rc<Interface>, stage: Entry) -> EntryModule 
         let ty = mb.m.types.f32();
         let kind = ir::ResourceKind::StorageRead;
         let id = mb.m.add_resource(ir::Resource { name: "literals".into(), binding, kind, ty });
-        bindings.push(ResourceBinding { binding, kind: BindingKind::Read });
+        bindings.push(ResourceBinding {
+            binding,
+            kind: BindingKind::Read,
+            stage: BindingStage::Both,
+        });
         if let Some(g) = mb.gpu.as_mut() {
             g.literals = Some(id);
         }
@@ -1616,54 +1607,60 @@ fn bind_uniform(cx: &mut Cx, mb: &mut ModuleBuilder, iface: &Interface) -> Optio
     Some(UniformOut { binding: 0, size, storage })
 }
 
-/// E0602 when a pipeline binds more storage buffers than a WebGPU stage may: its buffers, and
-/// its uniform block when that's in storage space.
+/// E0602 when a shader of a pipeline binds more storage buffers than a WebGPU stage may: its
+/// own buffers (each shader's are its own bindings, which the other doesn't see), and the
+/// uniform block when that's in storage space and a lifted build's literals, which both see.
 fn check_storage_buffers(cx: &mut Cx, iface: &Interface, uniform: Option<&UniformOut>) {
     let max = wrela_abi::manifest::MAX_STORAGE_BUFFERS_PER_STAGE;
     let in_storage = uniform.is_some_and(|u| u.storage);
-    // An `Append` is two buffers.
-    let buffers: Vec<(usize, usize)> = iface
-        .bound
-        .iter()
-        .copied()
-        .flat_map(|(e, i)| match iface.entries[e].params[i].1 {
-            ParamClass::Buffer { .. } => vec![(e, i)],
-            ParamClass::Append { .. } => vec![(e, i), (e, i)],
-            _ => Vec::new(),
-        })
-        .collect();
-    let n = buffers.len() + usize::from(in_storage) + usize::from(crate::lift::len(cx) > 0);
-    if n <= max {
-        return;
+    let shared = usize::from(in_storage) + usize::from(crate::lift::len(cx) > 0);
+    for e in 0..iface.entries.len() {
+        // An `Append` is two buffers.
+        let buffers: Vec<(usize, usize)> = iface
+            .bound
+            .iter()
+            .copied()
+            .filter(|&(e2, _)| e2 == e)
+            .flat_map(|(e, i)| match iface.entries[e].params[i].1 {
+                ParamClass::Buffer { .. } => vec![(e, i)],
+                ParamClass::Append { .. } => vec![(e, i), (e, i)],
+                _ => Vec::new(),
+            })
+            .collect();
+        let n = buffers.len() + shared;
+        if n <= max {
+            continue;
+        }
+        let checked = cx.checked;
+        let program = &checked.program;
+        let func = program.func(iface.entries[e].func);
+        // Where it goes over: the first buffer past the limit, else the uniform block's first
+        // value.
+        let span = match buffers.get(max) {
+            Some(&(e, i)) => program.func(iface.entries[e].func).params[i].span,
+            None => iface
+                .uniforms
+                .first()
+                .map_or(func.sig_span, |u| program.func(iface.entries[u.0].func).params[u.1].span),
+        };
+        let what = match cx.entry_of(iface.entries[e].func) {
+            Some(stage) => describe_entry(stage, &func.name),
+            None => format!("`{}`", func.name),
+        };
+        let mut d = Diagnostic::new(
+            codes::E0602,
+            span,
+            format!("{what} binds {n} storage buffers, and a WebGPU stage can have at most {max}"),
+        )
+        .with_note("each `[T]` and `Slots<T>` parameter is a storage buffer");
+        if in_storage {
+            d = d.with_note(
+                "the uniform values take one more: their layout doesn't meet WGSL's uniform \
+                 rules, or they're over 64 KiB",
+            );
+        }
+        cx.err(d.with_help("pass fewer buffers: put data that's read together in one buffer"));
     }
-    let checked = cx.checked;
-    let program = &checked.program;
-    let param = |(e, i): (usize, usize)| &program.func(iface.entries[e].func).params[i];
-    // Where it goes over: the first buffer past the limit, else the uniform block's first value.
-    let span = match buffers.get(max) {
-        Some(&at) => param(at).span,
-        None => iface.uniforms.first().map_or(program.func(iface.entries[0].func).sig_span, |u| {
-            program.func(iface.entries[u.0].func).params[u.1].span
-        }),
-    };
-    let names: Vec<String> =
-        iface.entries.iter().map(|e| format!("`{}`", program.func(e.func).name)).collect();
-    let mut d = Diagnostic::new(
-        codes::E0602,
-        span,
-        format!(
-            "{} binds {n} storage buffers, and a WebGPU stage can have at most {max}",
-            names.join(" with ")
-        ),
-    )
-    .with_note("each `[T]` and `Slots<T>` parameter is a storage buffer");
-    if in_storage {
-        d = d.with_note(
-            "the uniform values take one more: their layout doesn't meet WGSL's uniform rules, \
-             or they're over 64 KiB",
-        );
-    }
-    cx.err(d.with_help("pass fewer buffers: put data that's read together in one buffer"));
 }
 
 fn lower_compute(cx: &mut Cx, iface: Rc<Interface>) -> Option<PipelineOut> {

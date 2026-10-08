@@ -11,7 +11,10 @@
 //! - Its other **bindings** are, in parameter order, what its entry points take besides
 //!   uniforms and builtins: buffers for `[T]` (read) and `Slots<T>` (read-write) parameters,
 //!   textures, depth textures, samplers and comparison samplers. A dispatch or draw lists one
-//!   binding of the command stream for each, in the same order.
+//!   binding of the command stream for each, in the same order. A render pipeline's binding
+//!   that only one of its shaders reads says which (`"stage"`: `"vertex"` or `"fragment"`);
+//!   one without is visible to both. WebGPU limits the storage buffers each stage sees, so a
+//!   pipeline's vertex and fragment shaders may bind up to that many each.
 //! - A debug build's pipeline may have a **debug flag**: a read-write storage buffer of one
 //!   `atomic<u32>` at the binding `debug_flag` names, which no command lists. The host makes
 //!   one 4-byte buffer for the program, binds it there in every dispatch and draw, and reads it
@@ -247,6 +250,31 @@ impl BindingKind {
 pub struct ResourceBinding {
     pub binding: u32,
     pub kind: BindingKind,
+    /// Which of a render pipeline's shaders reads it; both, if not given.
+    #[serde(skip_serializing_if = "BindingStage::is_both")]
+    pub stage: BindingStage,
+}
+
+/// The shaders of a pipeline that see a binding.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BindingStage {
+    /// Every shader of the pipeline: its kernel, or its vertex and fragment shaders.
+    #[default]
+    Both,
+    Vertex,
+    Fragment,
+}
+
+impl BindingStage {
+    pub fn is_both(&self) -> bool {
+        *self == BindingStage::Both
+    }
+
+    /// Whether a shader of `stage` sees it.
+    pub fn sees(self, stage: BindingStage) -> bool {
+        self == BindingStage::Both || self == stage
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -349,13 +377,45 @@ impl Manifest {
             if bindings.len() != n {
                 return err(format!("pipeline {i} uses a binding twice"));
             }
-            let storage = p.bindings.iter().filter(|b| b.kind.is_buffer()).count()
-                + usize::from(p.uniform.as_ref().is_some_and(|u| u.space == UniformSpace::Storage))
-                + usize::from(p.debug_flag.is_some());
-            if storage > MAX_STORAGE_BUFFERS_PER_STAGE {
-                return err(format!(
-                    "pipeline {i} has {storage} storage buffers; WebGPU's default limit is {MAX_STORAGE_BUFFERS_PER_STAGE}"
-                ));
+            let render = matches!(p.stage, Stage::Render { .. });
+            for b in &p.bindings {
+                if !render && !b.stage.is_both() {
+                    return err(format!(
+                        "pipeline {i}'s binding {} names a stage, but it's a kernel's",
+                        b.binding
+                    ));
+                }
+                if b.stage == BindingStage::Vertex && b.kind == BindingKind::ReadWrite {
+                    return err(format!(
+                        "pipeline {i}'s binding {} is written, and a vertex shader can't write",
+                        b.binding
+                    ));
+                }
+            }
+            // Each stage's storage buffers: its bindings', the uniform block's when it's in
+            // storage, and the debug flag (a fragment shader's or a kernel's).
+            let in_storage =
+                usize::from(p.uniform.as_ref().is_some_and(|u| u.space == UniformSpace::Storage));
+            let stages: &[BindingStage] = if render {
+                &[BindingStage::Vertex, BindingStage::Fragment]
+            } else {
+                &[BindingStage::Both]
+            };
+            for &stage in stages {
+                let storage =
+                    p.bindings.iter().filter(|b| b.kind.is_buffer() && b.stage.sees(stage)).count()
+                        + in_storage
+                        + usize::from(p.debug_flag.is_some() && stage != BindingStage::Vertex);
+                if storage > MAX_STORAGE_BUFFERS_PER_STAGE {
+                    let what = match stage {
+                        BindingStage::Vertex => " in its vertex shader",
+                        BindingStage::Fragment => " in its fragment shader",
+                        BindingStage::Both => "",
+                    };
+                    return err(format!(
+                        "pipeline {i} has {storage} storage buffers{what}; WebGPU's default limit is {MAX_STORAGE_BUFFERS_PER_STAGE}"
+                    ));
+                }
             }
             match &p.stage {
                 Stage::Compute { entry, workgroup_size } => {
@@ -516,6 +576,19 @@ mod read {
                 Ok(ResourceBinding {
                     binding: u32(bo, "binding", &bp)?,
                     kind: one_of(bo, "kind", &bp, &kinds)?,
+                    // A missing `stage` is both.
+                    stage: match bo.get("stage") {
+                        None => BindingStage::Both,
+                        Some(_) => one_of(
+                            bo,
+                            "stage",
+                            &bp,
+                            &[
+                                ("vertex", BindingStage::Vertex),
+                                ("fragment", BindingStage::Fragment),
+                            ],
+                        )?,
+                    },
                 })
             })
             .collect::<Result<_>>()?;

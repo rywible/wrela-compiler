@@ -55,8 +55,8 @@ export function shapes(): Manifest {
         writes_depth: false,
         uniform: { binding: 0, size: 16, space: "uniform" },
         bindings: [
-          { binding: 1, kind: "read" },
-          { binding: 2, kind: "read_write" },
+          { binding: 1, kind: "read", stage: "both" },
+          { binding: 2, kind: "read_write", stage: "both" },
         ],
         debug_flag: null,
       },
@@ -68,8 +68,8 @@ export function shapes(): Manifest {
         workgroup_size: [64, 1, 1],
         uniform: { binding: 0, size: 16, space: "uniform" },
         bindings: [
-          { binding: 1, kind: "read" },
-          { binding: 2, kind: "read_write" },
+          { binding: 1, kind: "read", stage: "both" },
+          { binding: 2, kind: "read_write", stage: "both" },
         ],
         debug_flag: null,
       },

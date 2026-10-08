@@ -1,7 +1,9 @@
 // rejects: gpu.entry
 // A WebGPU stage has at most eight storage buffers: each `[T]` and `Slots<T>` is one, and so are
 // the uniform values when they're over 64 KiB.
-use std::gpu::{GlobalId, Slots}
+use std::gpu::{
+    ClipPosition, GlobalId, GpuBuffer, Slots, VertexIndex, begin_screen_pass, buffer, draw, present,
+}
 
 @compute(64)
 fn many(
@@ -37,4 +39,34 @@ fn wide(
     id: GlobalId,
 ) {
     out[id] = a[0] + b[0] + c[0] + d[0] + e[0] + f[0] + g[0] + table.rows[id.x].x
+}
+
+// Each of a render pipeline's shaders counts its own.
+@vertex
+fn spread(
+    v: VertexIndex,
+    a: [f32],
+    b: [f32],
+    c: [f32],
+    d: [f32],
+    e: [f32],
+    f: [f32],
+    g: [f32],
+    h: [f32],
+    i: [f32], //~ E0602
+) -> ClipPosition {
+    let x = a[0] + b[0] + c[0] + d[0] + e[0] + f[0] + g[0] + h[0] + i[0]
+    ClipPosition { position: vec4(x, f32(v.index), 0.5, 1.0) }
+}
+
+@fragment
+fn white() -> vec4 {
+    vec4(1.0)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    let x: GpuBuffer<f32> = buffer(1)
+    begin_screen_pass(clear: vec4(0.0, 0.0, 0.0, 1.0))
+    draw(spread.bind(x, x, x, x, x, x, x, x, x), white, vertices: 3)
+    present()
 }

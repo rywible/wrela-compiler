@@ -36,7 +36,8 @@ use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex};
 use wgpu::util::align_to;
 use wrela_abi::manifest::{
-    BindingKind, Cull, DepthBias, DepthState, Manifest, ResourceBinding, Stage, UniformSpace,
+    BindingKind, BindingStage, Cull, DepthBias, DepthState, Manifest, ResourceBinding, Stage,
+    UniformSpace,
 };
 use wrela_abi::stream::{self, Binding, Command, Compare, Opcode, Pass, TextureFormat};
 
@@ -498,6 +499,13 @@ impl Gpu {
             });
         }
         for b in &p.bindings {
+            // A render pipeline's binding one shader reads is that shader's alone, so each
+            // stage counts only its own against WebGPU's limits.
+            let all = match b.stage {
+                BindingStage::Both => all,
+                BindingStage::Vertex => wgpu::ShaderStages::VERTEX,
+                BindingStage::Fragment => wgpu::ShaderStages::FRAGMENT,
+            };
             let (ty, visibility) = match b.kind {
                 BindingKind::Read | BindingKind::ReadWrite => {
                     let read_only = b.kind == BindingKind::Read;

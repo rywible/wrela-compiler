@@ -8,8 +8,8 @@ use crate::check::Checker;
 use crate::hash::StateHash;
 use crate::lines::Lines;
 use crate::manifest::{
-    BindingKind, Cull, DepthBias, DepthState, Manifest, Pipeline, ResourceBinding, Stage,
-    UniformBlock, UniformSpace,
+    BindingKind, BindingStage, Cull, DepthBias, DepthState, Manifest, Pipeline, ResourceBinding,
+    Stage, UniformBlock, UniformSpace,
 };
 use crate::stream::{
     self, Binding, Command, Compare, Encoder, NONE, Pass, SCREEN, Sequencer, StreamError,
@@ -366,7 +366,7 @@ fn sequences() -> Vec<Value> {
 /// texture, a sampler, a depth texture and a comparison sampler.
 pub fn check_manifest() -> Manifest {
     let mut m = Manifest::new("game.wasm");
-    let bind = |binding, kind| ResourceBinding { binding, kind };
+    let bind = |binding, kind| ResourceBinding { binding, kind, stage: BindingStage::Both };
     let shape = |name: &str, stage| Pipeline {
         name: name.into(),
         shader: format!("{name}.wgsl"),
@@ -802,7 +802,11 @@ pub(crate) fn sample_manifest() -> Manifest {
         shader: "pipeline_0.wgsl".into(),
         stage: Stage::Compute { entry: "main".into(), workgroup_size: [64, 1, 1] },
         uniform: Some(UniformBlock { binding: 0, size: 32, space: UniformSpace::Uniform }),
-        bindings: vec![ResourceBinding { binding: 1, kind: BindingKind::ReadWrite }],
+        bindings: vec![ResourceBinding {
+            binding: 1,
+            kind: BindingKind::ReadWrite,
+            stage: BindingStage::Both,
+        }],
         debug_flag: None,
     });
     m.pipelines.push(Pipeline {
@@ -819,8 +823,8 @@ pub(crate) fn sample_manifest() -> Manifest {
         },
         uniform: None,
         bindings: vec![
-            ResourceBinding { binding: 0, kind: BindingKind::Texture },
-            ResourceBinding { binding: 1, kind: BindingKind::Sampler },
+            ResourceBinding { binding: 0, kind: BindingKind::Texture, stage: BindingStage::Both },
+            ResourceBinding { binding: 1, kind: BindingKind::Sampler, stage: BindingStage::Both },
         ],
         debug_flag: None,
     });
@@ -968,15 +972,57 @@ fn manifests() -> Vec<Value> {
             "too many storage buffers",
             edited(&|m| {
                 m.pipelines[1].bindings = (0..9)
-                    .map(|i| ResourceBinding { binding: i, kind: BindingKind::Read })
+                    .map(|i| ResourceBinding { binding: i, kind: BindingKind::Read, stage: BindingStage::Both })
                     .collect()
             }),
+        ),
+        manifest(
+            "eight storage buffers in each stage, sixteen in all",
+            edited(&|m| {
+                m.pipelines[1].bindings = (0..16)
+                    .map(|i| ResourceBinding {
+                        binding: i,
+                        kind: BindingKind::Read,
+                        stage: if i < 8 { BindingStage::Vertex } else { BindingStage::Fragment },
+                    })
+                    .collect()
+            }),
+        ),
+        manifest(
+            "too many storage buffers in a vertex shader",
+            edited(&|m| {
+                m.pipelines[1].bindings = (0..9)
+                    .map(|i| ResourceBinding {
+                        binding: i,
+                        kind: BindingKind::Read,
+                        stage: if i < 4 { BindingStage::Both } else { BindingStage::Vertex },
+                    })
+                    .collect()
+            }),
+        ),
+        manifest(
+            "a kernel's binding with a stage",
+            edited(&|m| m.pipelines[0].bindings[0].stage = BindingStage::Fragment),
+        ),
+        manifest(
+            "a written binding in a vertex shader",
+            edited(&|m| {
+                m.pipelines[1].bindings.push(ResourceBinding {
+                    binding: 2,
+                    kind: BindingKind::ReadWrite,
+                    stage: BindingStage::Vertex,
+                })
+            }),
+        ),
+        manifest(
+            "a binding stage that isn't one",
+            golden.replace("\"kind\": \"sampler\"", "\"kind\": \"sampler\",\n          \"stage\": \"geometry\""),
         ),
         manifest(
             "too many storage buffers with a debug flag",
             edited(&|m| {
                 m.pipelines[1].bindings = (0..8)
-                    .map(|i| ResourceBinding { binding: i, kind: BindingKind::Read })
+                    .map(|i| ResourceBinding { binding: i, kind: BindingKind::Read, stage: BindingStage::Both })
                     .collect();
                 m.pipelines[1].debug_flag = Some(8);
             }),
