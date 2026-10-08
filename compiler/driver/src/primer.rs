@@ -153,6 +153,7 @@ pub const RULES: &[(&str, &str)] = &[
     // §9 attributes
     ("attr.closed", "attributes are a closed set; tier-1 ones aren't available"),
     ("attr.gpu", "`@gpu` asserts a function is GPU-safe, checked at its definition"),
+    ("attr.testing", "`@testing` marks an export only a test build has"),
     // §12 GPU code
     ("gpu.entry", "entry points' signatures: builtins, uniforms, buffers, varyings"),
     ("gpu.kernel-mut", "a kernel's `mut` parameters are invocation-safe (`Slots<T>`)"),

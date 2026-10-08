@@ -422,6 +422,7 @@ lang_items! {
     MemWaitFor = "std::mem::wait_for",
     MemAbort = "std::mem::abort",
     DebugBuild = "std::mem::debug_build",
+    TestBuild = "std::mem::test_build",
     ParEach = "std::par::par_each",
     ParEachChunk = "std::par::par_each_chunk",
     ParMapReduce = "std::par::par_map_reduce",
@@ -604,6 +605,9 @@ pub struct FnAttrs {
     pub audio: Option<Span>,
     /// `@test`: a test `wrela test` runs, as the build runs constants (§10).
     pub test: Option<Span>,
+    /// `@testing`: an export only a test build has (§9): what tests and tools call, which a
+    /// shipped build leaves out, with all that only it reaches.
+    pub testing: Option<Span>,
     /// `@test(frames: n)` or `@test(ticks: n)`: what of the program the test runs first (§10).
     pub test_run: Option<TestRun>,
     /// `@test(frames: n, input: "script.json")`: a script of input events the frames get, by

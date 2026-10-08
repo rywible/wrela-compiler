@@ -115,6 +115,13 @@ pub fn build_debug(root: &Path) -> Output {
     on_compiler_thread(|| compile(root, Mode::Debug, wrela_lower::Roots::of, &[]))
 }
 
+/// A test build of the package (§9): [`build`], or [`build_debug`] if `debug`, with the
+/// program's `@testing` exports, and `std::mem::test_build()` true. What a test harness runs.
+pub fn build_for_tests(root: &Path, debug: bool) -> Output {
+    let mode = if debug { Mode::TestingDebug } else { Mode::Testing };
+    on_compiler_thread(|| compile(root, mode, wrela_lower::Roots::of, &[]))
+}
+
 /// [`build`], lowering every function of the package that can be lowered on its own, exported
 /// or not ([`wrela_lower::Roots::every_fn`]): for tests of code that nothing calls.
 pub fn build_every_fn(root: &Path) -> Output {
@@ -308,7 +315,7 @@ fn run_tests(root: &Path, filter: Option<&str>, kind: PackageKind, fuel: u64) ->
         wrela_sema::check_packages(units, &packages, &mut diagnostics)
     };
     // A debug build's checks, as `wrela build --debug` makes them (§11).
-    let mut data = wrela_lower::BuildData { debug: true, ..Default::default() };
+    let mut data = wrela_lower::BuildData { debug: true, testing: true, ..Default::default() };
     let mut filtered_out = 0;
     prepare(&checked, &sources, &dirs, &mut data, &mut diagnostics);
     let mut results = Vec::new();
@@ -362,6 +369,9 @@ enum Mode {
     Debug,
     /// A release build whose WASM has no SIMD.
     NoSimd,
+    /// A test build (§9): release, or debug, with the program's `@testing` exports.
+    Testing,
+    TestingDebug,
 }
 
 /// Runs `f` on a thread with the compiler's stack ([`STACK_SIZE`]), and gives back what it
@@ -435,8 +445,9 @@ fn compile_loaded(
     let mut files = Vec::new();
     let mut pipelines = Vec::new();
     let mut data = wrela_lower::BuildData {
-        debug: mode == Mode::Debug,
+        debug: matches!(mode, Mode::Debug | Mode::TestingDebug),
         no_simd: mode == Mode::NoSimd,
+        testing: matches!(mode, Mode::Testing | Mode::TestingDebug),
         ..Default::default()
     };
     prepare(&checked, &sources, &dirs, &mut data, &mut diagnostics);

@@ -32,10 +32,9 @@ pub(crate) fn build_into(name: &str, pkg: &Path, lift: &[&str], debug: bool) -> 
     let out = if !lift.is_empty() {
         let names: Vec<String> = lift.iter().map(|s| s.to_string()).collect();
         wrela_driver::build_lifted(pkg, &names, debug).expect("--lift")
-    } else if debug {
-        wrela_driver::build_debug(pkg)
     } else {
-        wrela_driver::build(pkg)
+        // A test build: with the program's `@testing` exports.
+        wrela_driver::build_for_tests(pkg, debug)
     };
     assert!(
         !out.has_errors(),

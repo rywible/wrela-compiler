@@ -23,6 +23,8 @@ pub fn run(args: &[String]) -> ExitCode {
                 return ExitCode::from(2);
             }
         }
+    } else if args.testing {
+        wrela_driver::build_for_tests(dir, args.debug)
     } else if args.debug {
         wrela_driver::build_debug(dir)
     } else {

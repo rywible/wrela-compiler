@@ -47,10 +47,10 @@ impl Default for OncePerKey {
     }
 }
 
-/// Builds the package in `pkg` as `wrela build` does, without writing its files: the output,
-/// or the errors rendered.
+/// Builds the package in `pkg` as `wrela build --testing` does (with its `@testing` exports),
+/// without writing its files: the output, or the errors rendered.
 pub fn build(pkg: &Path) -> Result<wrela_driver::Output, String> {
-    let built = wrela_driver::build(pkg);
+    let built = wrela_driver::build_for_tests(pkg, false);
     if built.has_errors() {
         return Err(wrela_diag::render::render_all(&built.sources, &built.diagnostics));
     }
@@ -346,12 +346,12 @@ impl RawGpu {
 /// directory and its path from the repo root. Each package is built once per process, and each
 /// page is a copy of that build.
 pub fn page(pkg: &str, name: &str) -> (PathBuf, String) {
-    page_built_by(pkg, name, "release", wrela_driver::build)
+    page_built_by(pkg, name, "release", |p| wrela_driver::build_for_tests(p, false))
 }
 
 /// [`page`] with a debug build (language.md §11's checks).
 pub fn debug_page(pkg: &str, name: &str) -> (PathBuf, String) {
-    page_built_by(pkg, name, "debug", wrela_driver::build_debug)
+    page_built_by(pkg, name, "debug", |p| wrela_driver::build_for_tests(p, true))
 }
 
 /// [`page`] with a build whose WASM uses no SIMD (language.md §11).

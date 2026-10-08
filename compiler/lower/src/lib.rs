@@ -355,6 +355,10 @@ pub fn lower(
         }
     }
     for &f in &roots.exports {
+        // A `@testing` export is a test build's only (§9).
+        if checked.program.func(f).attrs.testing.is_some() && !data.testing {
+            continue;
+        }
         if !checked.program.fn_all_generics(f).is_empty() {
             // Reported; it has no types to be lowered with.
             cx.check_export(f, state.map(|s| s.1));

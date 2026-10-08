@@ -331,7 +331,12 @@ impl<'d, 'u> Collector<'d, 'u> {
             && matches!(self.p.module(m).path.get(1).map(String::as_str), Some("mem" | "alloc"))
             && !matches!(
                 f.name.name.as_str(),
-                "size_of" | "align_of" | "needs_drop" | "allocations" | "debug_build"
+                "size_of"
+                    | "align_of"
+                    | "needs_drop"
+                    | "allocations"
+                    | "debug_build"
+                    | "test_build"
             );
         self.p.fns.push(FnDef {
             name: f.name.name.clone(),
@@ -741,6 +746,10 @@ impl<'d, 'u> Collector<'d, 'u> {
                         (out.test_run, out.test_input) = self.test_run(a, args);
                     }
                     out.test = Some(a.span);
+                }
+                "testing" => {
+                    self.no_args(a, codes::E0222);
+                    out.testing = Some(a.span);
                 }
                 "deterministic" | "audio" => {
                     self.no_args(a, codes::E0204);
@@ -1204,6 +1213,7 @@ impl<'d, 'u> Collector<'d, 'u> {
                 PendingItem::Fn(id, f) => {
                     self.fn_signature(*id, f);
                     self.test_signature(*id);
+                    self.testing_export(*id);
                 }
                 PendingItem::Adt(id, item) => self.adt_body(*m, *id, item),
                 PendingItem::Alias(..) | PendingItem::TraitSet(..) => {}
@@ -1438,6 +1448,27 @@ impl<'d, 'u> Collector<'d, 'u> {
             }
             self.implied_clone(&scope, &t.traits);
             self.p.trait_sets[id.index()].traits = traits;
+        }
+    }
+
+    /// E0222: `@testing` marks an export, a `pub fn` of `main.wrela` (§9), which only a test
+    /// build has.
+    fn testing_export(&mut self, id: FnId) {
+        let def = self.p.func(id);
+        let Some(at) = def.attrs.testing else { return };
+        let export = Some(def.module) == self.p.main
+            && def.public
+            && def.owner == FnOwner::Free
+            && def.attrs.entry.is_none();
+        if !export {
+            self.diags.push(
+                Diagnostic::new(
+                    codes::E0222,
+                    at,
+                    "`@testing` marks an export, a `pub fn` of `main.wrela`, which only a test build has",
+                )
+                .with_note("what only a test export calls is left out of a shipped build with it; elsewhere, `std::mem::test_build()` asks"),
+            );
         }
     }
 

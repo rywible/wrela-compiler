@@ -494,3 +494,64 @@ fn spins() {
     assert_eq!(d.code, wrela_diag::codes::E0705);
     assert_eq!(d.message, "the test `spins` ran past a test's fuel limit in frame 0 of 1");
 }
+
+/// `@testing` (§9): a test build has the program's `@testing` export, the kernel only it
+/// dispatches, and the path only `test_build()` takes; a shipped build has none of them.
+#[test]
+fn a_shipped_build_has_no_testing_exports() {
+    let src = r#"
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch}
+use std::mem::test_build
+
+struct State {
+    out: GpuBuffer<f32>,
+    frames: u32,
+}
+
+@compute(64)
+fn probe(out: mut Slots<f32>, id: GlobalId) {
+    out[id] = f32(id.x)
+}
+
+pub fn init() -> State {
+    State { out: buffer(64), frames: 0 }
+}
+
+@testing
+pub fn test_frames(s: mut State) -> u32 {
+    dispatch(probe.bind(mut s.out), over: 64)
+    s.frames
+}
+
+pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
+    if test_build() {
+        s.frames += 1
+    }
+}
+"#;
+    let dir = scratch("test_items/testing");
+    std::fs::write(dir.join("main.wrela"), src).expect("write main.wrela");
+    let shipped = wrela_driver::build(&dir);
+    let tested = wrela_driver::build_for_tests(&dir, false);
+    for out in [&shipped, &tested] {
+        assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    }
+    assert_eq!(shipped.pipelines.len(), 0, "a shipped build records the test's kernel");
+    assert_eq!(tested.pipelines.len(), 1, "a test build doesn't record the test's kernel");
+    let load = |out: &wrela_driver::Output, name: &str| {
+        let at = dir.join(name);
+        out.write_to(&at).expect("write the build");
+        CpuHost::load(&at).expect("load")
+    };
+    let mut host = load(&tested, "tested");
+    host.init().expect("init");
+    host.frame(0.0, 4, 4).expect("a frame");
+    let frames = wrela_tests::one_u32(&mut host, "test_frames", &[]);
+    assert_eq!(frames, 1, "test_build() was false in a test build");
+    let shipped = load(&shipped, "shipped");
+    let exports = shipped.exports();
+    assert!(
+        !exports.iter().any(|(n, ..)| n == "test_frames"),
+        "a shipped build exports the test's"
+    );
+}

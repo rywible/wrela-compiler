@@ -387,6 +387,7 @@ impl Fl<'_, '_> {
                     | L::Swap
                     | L::Replace
                     | L::DebugBuild
+                    | L::TestBuild
             );
         if !known {
             return None;
@@ -496,6 +497,7 @@ impl Fl<'_, '_> {
                 None
             }
             Lang::DebugBuild => Some(self.konst(ir::Const::Bool(self.cx.data.debug))),
+            Lang::TestBuild => Some(self.konst(ir::Const::Bool(self.cx.data.testing))),
             Lang::MemAbort => {
                 // A trap that keeps the panic message a worker left.
                 self.emit(ir::Stmt::Trap);

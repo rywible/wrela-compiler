@@ -198,3 +198,9 @@ pub fn abort_from(thread: u32) {
 /// nor of the functions only they call. GPU code can ask too.
 @intrinsic
 pub fn debug_build() -> bool {}
+
+/// Whether this is a test build (`wrela build --testing`, a test harness's, and `wrela test`),
+/// which has the program's `@testing` exports (§9): a constant, so a shipped build has no trace
+/// of what only tests do, such as a view only tests show, nor of the pipelines only it draws.
+@intrinsic
+pub fn test_build() -> bool {}

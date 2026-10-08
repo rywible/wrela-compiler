@@ -50,6 +50,8 @@ pub struct BuildData {
     pub embeds: Embeds,
     /// A debug build: it pays for checks a release build doesn't make (language.md §11).
     pub debug: bool,
+    /// A test build: it has the program's `@testing` exports, and `test_build()` is true (§9).
+    pub testing: bool,
     /// A build whose WASM uses no SIMD (`wrela_wasm::Options::simd`): its results are the same,
     /// bit for bit, which a test checks.
     pub no_simd: bool,

@@ -1,0 +1,14 @@
+// rejects: attr.testing
+// `@testing` marks an export: a `pub fn` of main.wrela, not a private one, and with no
+// arguments.
+@testing //~ E0222
+fn helper() -> u32 {
+    1
+}
+
+@testing(frames: 2) //~ E0222
+pub fn test_twice() -> u32 {
+    2
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

@@ -1,0 +1,32 @@
+// accepts: attr.testing
+// An export only a test build has, and a path only a test build takes: a shipped build has
+// neither, nor the kernel only they reach.
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch}
+use std::mem::test_build
+
+struct State {
+    out: GpuBuffer<f32>,
+    shown: u32,
+}
+
+@compute(64)
+fn probe(out: mut Slots<f32>, id: GlobalId) {
+    out[id] = f32(id.x)
+}
+
+pub fn init() -> State {
+    State { out: buffer(64), shown: 0 }
+}
+
+/// What a test reads: in a test build only.
+@testing
+pub fn test_probe(s: mut State) -> u32 {
+    dispatch(probe.bind(mut s.out), over: 64)
+    s.shown
+}
+
+pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
+    if test_build() {
+        s.shown += 1
+    }
+}
