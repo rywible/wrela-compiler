@@ -226,6 +226,15 @@ pub struct Flat<T>: Copy {
 @intrinsic
 pub fn buffer<T: GpuData>(count: u32) -> GpuBuffer<T> {}
 
+/// Creates a GPU buffer holding `values`, at least `at_least` elements long (the rest zeroed: a
+/// list that can be empty still makes a buffer that can be bound, with `at_least: 1`), and
+/// copies them in (`write`).
+pub fn buffer_of<T: GpuData>(values: [T], at_least: u32 = 0) -> GpuBuffer<T> {
+    var b: GpuBuffer<T> = buffer(max(values.len(), at_least))
+    write(mut b, 0, values)
+    b
+}
+
 /// Copies `values` into `buf`, starting at element `at`. The copy happens in recorded order
 /// with dispatches and draws. Writing past the end panics.
 pub fn write<T: GpuData>(buf: mut GpuBuffer<T>, at: u32, values: [T]) {
