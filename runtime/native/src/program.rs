@@ -399,8 +399,7 @@ pub struct Ticked {
 pub(crate) struct Program<E: 'static> {
     store: Store<State<E>>,
     /// The worker threads, which return when the program is dropped (or retired).
-    #[allow(dead_code)]
-    threads: Helpers,
+    _helpers: Helpers,
     memory: SharedMemory,
     module: Module,
     /// The audio thread's instance, once [`Program::render_audio`] has made it.
@@ -419,8 +418,9 @@ pub(crate) struct Program<E: 'static> {
     /// Why the last call failed, if it did.
     last_failure: Option<Failure>,
     /// The records of each tick run that had any, by tick: what a build that replaces this one
-    /// replays (hot reload).
-    ran: Vec<(u32, Vec<[u8; EVENT_SIZE as usize]>)>,
+    /// replays (hot reload). Kept only for a program that may be replaced
+    /// ([`Program::keep_ticks`]).
+    ran: Option<Vec<(u32, Vec<[u8; EVENT_SIZE as usize]>)>>,
     /// Hot reload: the ticks the replaced build ran, which this one runs again first, each with
     /// the records it had.
     replay: Option<Replay>,
@@ -441,7 +441,8 @@ pub(crate) struct Retired<E> {
     pub executor: E,
     kept: Vec<u8>,
     ticks: u32,
-    ran: Vec<(u32, Vec<[u8; EVENT_SIZE as usize]>)>,
+    /// None for a program that kept none (it wasn't to be replaced).
+    ran: Option<Vec<(u32, Vec<[u8; EVENT_SIZE as usize]>)>>,
     input: Queue,
     records: std::collections::VecDeque<[u8; EVENT_SIZE as usize]>,
     logs: Vec<String>,
@@ -632,7 +633,7 @@ impl<E: Executor> Program<E> {
             executor,
             kept: Vec::new(),
             ticks: 0,
-            ran: Vec::new(),
+            ran: None,
             input: Queue::default(),
             records: Default::default(),
             logs: Vec::new(),
@@ -705,7 +706,7 @@ impl<E: Executor> Program<E> {
                 spawn_worker(compiled.module.clone(), memory.clone(), memory::THREAD_HELPER0 + i)
             })
             .collect();
-        let threads = Helpers { memory: memory.clone(), threads };
+        let helpers = Helpers { memory: memory.clone(), threads };
         let frame = instance
             .get_typed_func::<(f32, u32, u32), ()>(&mut store, EXPORT_FRAME)
             .map_err(|e| Error::Program(format!("{e:#}")))?;
@@ -714,7 +715,7 @@ impl<E: Executor> Program<E> {
             instance,
             frame,
             lines: compiled.lines.clone(),
-            threads,
+            _helpers: helpers,
             memory,
             module: compiled.module.clone(),
             audio: None,
@@ -722,13 +723,22 @@ impl<E: Executor> Program<E> {
             records,
             fuel: compiled.fuel,
             last_failure: None,
-            ran: Vec::new(),
-            replay: (ticks > 0).then(|| Replay { upto: ticks, records: ran.into_iter().collect() }),
+            // A program that replaces one may be replaced in turn.
+            ran: ran.as_ref().map(|_| Vec::new()),
+            replay: (ticks > 0)
+                .then(|| Replay { upto: ticks, records: ran.into_iter().flatten().collect() }),
         };
         if run_init {
             program.init()?;
         }
         Ok(program)
+    }
+
+    /// Keeps each tick's records from now on (before any tick runs): what a build that
+    /// replaces this one replays (hot reload, [`Program::retire`]).
+    #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+    pub(crate) fn keep_ticks(&mut self) {
+        self.ran.get_or_insert_with(Vec::new);
     }
 
     /// Ends this program for a build that replaces it while it runs (hot reload): its helpers
@@ -737,17 +747,19 @@ impl<E: Executor> Program<E> {
     /// next build too.
     #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
     pub(crate) fn retire(self) -> Retired<E> {
-        let Program { store, threads, ticker, ran, replay, records, .. } = self;
-        drop(threads);
+        let Program { store, _helpers: helpers, ticker, ran, replay, records, .. } = self;
+        drop(helpers);
         let state = store.into_data();
         let ticks = ticker.map_or(0, |t| t.next).max(replay.as_ref().map_or(0, |r| r.upto));
-        let mut ran = ran;
-        if let Some(r) = replay {
-            // The ticks it hadn't replayed yet: what the build before it ran.
-            let done: std::collections::HashSet<u32> = ran.iter().map(|t| t.0).collect();
-            ran.extend(r.records.into_iter().filter(|(k, _)| !done.contains(k)));
-        }
-        ran.sort_by_key(|t| t.0);
+        let ran = ran.map(|mut ran| {
+            if let Some(r) = replay {
+                // The ticks it hadn't replayed yet: what the build before it ran.
+                let done: std::collections::HashSet<u32> = ran.iter().map(|t| t.0).collect();
+                ran.extend(r.records.into_iter().filter(|(k, _)| !done.contains(k)));
+            }
+            ran.sort_by_key(|t| t.0);
+            ran
+        });
         Retired {
             executor: state.executor,
             kept: state.keeping,
@@ -1006,8 +1018,10 @@ impl<E: Executor> Program<E> {
                 self.records.drain(..n).collect()
             }
         };
-        if !records.is_empty() {
-            self.ran.push((k, records.clone()));
+        if let Some(ran) = &mut self.ran
+            && !records.is_empty()
+        {
+            ran.push((k, records.clone()));
         }
         let mut thread = self.take_tick_thread()?;
         let result = thread.run(records);
@@ -1317,12 +1331,14 @@ fn keep<E: Executor>(
 ) -> wasmtime::Result<()> {
     let state = caller.data_mut();
     check_started(state)?;
-    let Some(bytes) = shared::read(&state.memory, ptr as usize, len as usize) else {
+    let Some(bytes) = shared::slice(&state.memory, ptr as usize, len as usize) else {
         return Err(wasmtime::format_err!(
             "keep({ptr}, {len}) reaches past the end of the program's memory"
         ));
     };
-    state.keeping = bytes;
+    // A program may keep its state every frame: the buffer is reused.
+    state.keeping.clear();
+    state.keeping.extend_from_slice(bytes);
     Ok(())
 }
 
@@ -1336,13 +1352,11 @@ fn kept<E: Executor>(
     let state = caller.data_mut();
     check_started(state)?;
     let n = (cap as usize).min(state.kept.len());
-    let fits = (ptr as usize).checked_add(n).is_some_and(|end| end <= state.memory.data().len());
-    if !fits {
+    if !shared::write(&state.memory, ptr as usize, &state.kept[..n]) {
         return Err(wasmtime::format_err!(
             "kept({ptr}, {cap}) reaches past the end of the program's memory"
         ));
     }
-    shared::write(&state.memory, ptr as usize, &state.kept[..n]);
     Ok(state.kept.len() as i32)
 }
 

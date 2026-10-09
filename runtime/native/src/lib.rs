@@ -87,6 +87,17 @@ pub struct Options {
     /// Don't run the program's `init` while loading: the caller runs it ([`Host::init`]),
     /// after asking for the ticker's first hash, say.
     pub defer_init: bool,
+    /// The host may hot reload ([`Host::reload`]): it keeps each tick's records for the new
+    /// build to run again. (Without it, nothing grows tick by tick.)
+    pub reloadable: bool,
+}
+
+impl Options {
+    /// Where a build in `dir` loaded this way reads and writes ([`io`]).
+    #[cfg(feature = "gpu")]
+    fn io(&self, dir: &Path) -> program::Io {
+        io(dir, self.storage.as_deref(), self.post.clone(), self.quiet)
+    }
 }
 
 /// The threads a program's parallel jobs run on by default: one per core, at most
@@ -200,10 +211,28 @@ fn same_build(log: &TickLog, build: u64) -> Result<(), ReplayError> {
 /// Compiles the build in `dir` and keeps its compiled code beside it, so the loads that follow
 /// don't compile it again (`cache`).
 pub fn precompile(dir: impl AsRef<Path>) -> Result<()> {
-    let dir = dir.as_ref();
-    let (_, wasm, _) = read_build(dir)?;
-    let hash = wrela_abi::ticks::wasm_hash(&wasm);
-    program::compile_cached(&wasm, hash, Some(dir), None).map(|_| ())
+    compile_build(dir.as_ref(), None).map(|_| ())
+}
+
+/// A build read from its directory, its WASM compiled.
+struct Build {
+    manifest: Manifest,
+    #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+    shaders: Vec<String>,
+    /// FNV-1a 64 of the WASM: which build a tick log is for.
+    wasm_hash: u64,
+    compiled: program::Compiled,
+}
+
+/// Reads the build in `dir` and compiles its WASM, each call given `fuel` if it's metered. An
+/// unmetered build's compiled code is kept beside it (`cache`): the loads that follow read it
+/// back.
+fn compile_build(dir: &Path, fuel: Option<u64>) -> Result<Build> {
+    let (manifest, wasm, shaders) = read_build(dir)?;
+    let wasm_hash = wrela_abi::ticks::wasm_hash(&wasm);
+    let beside = fuel.is_none().then_some(dir);
+    let compiled = program::compile_cached(&wasm, wasm_hash, beside, fuel)?;
+    Ok(Build { manifest, shaders, wasm_hash, compiled })
 }
 
 /// Reads a build's manifest, WASM and WGSL from `dir`.
@@ -251,27 +280,24 @@ impl Host {
     /// its ticker, if it starts one, runs the old one's ticks again first, each with the
     /// records it had, so the sim is where the old one was (as the new code runs it); input
     /// the old one hadn't read is the new one's. A pipeline whose WGSL and manifest entry
-    /// are unchanged is kept.
+    /// are unchanged is kept. Panics unless the host was loaded [`Options::reloadable`].
     pub fn reload(&mut self, dir: Option<&Path>) -> Result<()> {
+        assert!(self.options.reloadable, "a hot reload needs a host loaded `reloadable`");
         let dir = dir.map_or_else(|| self.dir.clone(), Path::to_path_buf);
-        let (manifest, wasm, shaders) = read_build(&dir)?;
-        let wasm_hash = wrela_abi::ticks::wasm_hash(&wasm);
-        let compiled = program::compile_cached(&wasm, wasm_hash, Some(&dir), None)?;
+        let build = compile_build(&dir, None)?;
         let old = self.program.take().expect("the host has a program");
         let mut carried = old.retire();
-        program::Executor::reload(&mut carried.executor, &manifest, &shaders)?;
-        let options = &self.options;
-        let io = io(&dir, options.storage.as_deref(), options.post.clone(), options.quiet);
+        program::Executor::reload(&mut carried.executor, &build.manifest, &build.shaders)?;
         let program = Program::instantiate_carrying(
-            &compiled,
-            &manifest,
+            &build.compiled,
+            &build.manifest,
             carried,
-            io,
-            workers(options.workers),
+            self.options.io(&dir),
+            workers(self.options.workers),
             true,
         )?;
         self.program = Some(program);
-        self.wasm_hash = wasm_hash;
+        self.wasm_hash = build.wasm_hash;
         self.dir = dir;
         Ok(())
     }
@@ -291,23 +317,23 @@ impl Host {
 
     pub fn load_with(dir: impl AsRef<Path>, options: &Options) -> Result<Host> {
         let dir = dir.as_ref();
-        let (manifest, wasm, shaders) = read_build(dir)?;
-        let wasm_hash = wrela_abi::ticks::wasm_hash(&wasm);
         // Everything that can be checked without the GPU is, before taking it.
-        let compiled = program::compile_cached(&wasm, wasm_hash, Some(dir), None)?;
+        let Build { manifest, shaders, wasm_hash, compiled } = compile_build(dir, None)?;
         let lock = lock::GpuLock::acquire(&format!("wrela-host {}", dir.display()))?;
         let gpu = Gpu::new(&manifest, &shaders, options.timing)?;
-        let io = io(dir, options.storage.as_deref(), options.post.clone(), options.quiet);
         let n = workers(options.workers);
-        let program = Program::instantiate_with(
+        let mut program = Program::instantiate_with(
             &compiled,
             &manifest,
             gpu,
-            io,
+            options.io(dir),
             options.record,
             n,
             !options.defer_init,
         )?;
+        if options.reloadable {
+            program.keep_ticks();
+        }
         Ok(Host {
             program: Some(program),
             wasm_hash,
@@ -542,10 +568,7 @@ impl CpuBuild {
     }
 
     fn load_compiled(dir: &Path, fuel: Option<u64>) -> Result<CpuBuild> {
-        let (manifest, wasm, _) = read_build(dir)?;
-        let wasm_hash = wrela_abi::ticks::wasm_hash(&wasm);
-        let beside = fuel.is_none().then_some(dir);
-        let compiled = program::compile_cached(&wasm, wasm_hash, beside, fuel)?;
+        let Build { manifest, wasm_hash, compiled, .. } = compile_build(dir, fuel)?;
         Ok(CpuBuild { compiled, manifest, dir: dir.to_path_buf(), wasm_hash, record: false })
     }
 

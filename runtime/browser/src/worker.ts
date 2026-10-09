@@ -95,11 +95,12 @@ const ticker = {
   thread: null as Worker | null,
 };
 
-/** How the ticker's thread runs the ticks: test mode's settings, or none (`NORMAL_TICKS`). */
-type TickSettings = Pick<TickerStart, "script" | "hashes" | "timing" | "delay">;
+/** How the ticker's thread runs the ticks: test mode's settings, or none (`NORMAL_TICKS`), and
+ * whether the page is live. */
+type TickSettings = Pick<TickerStart, "script" | "hashes" | "timing" | "delay" | "replayable">;
 
 /** A normal run's: no script, nothing kept, no delay. */
-const NORMAL_TICKS: TickSettings = { script: [], hashes: false, timing: false, delay: 0 };
+const NORMAL_TICKS: TickSettings = { script: [], hashes: false, timing: false, delay: 0, replayable: false };
 
 /** What starts the program's ticker on its own thread, with `settings`: this script again, told
  * to run it. `wasm` is the build's, whose hash heads the tick log when hashes are kept. With
@@ -212,7 +213,7 @@ async function run(canvas: OffscreenCanvas, device: GPUDevice, build: Build, liv
       device,
       b,
       screen,
-      { ...programOptions(b, NORMAL_TICKS, carried), workers: normalWorkers() },
+      { ...programOptions(b, { ...NORMAL_TICKS, replayable: live !== null }, carried), workers: normalWorkers() },
       { cache: live ? pipelineCache : undefined },
     );
   let program = await start(build, null);
@@ -358,7 +359,7 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
       b,
       target,
       {
-        ...programOptions(b, { script, hashes, timing: true, delay: params.tickdelay }, carried),
+        ...programOptions(b, { script, hashes, timing: true, delay: params.tickdelay, replayable: live !== null }, carried),
         hash: hashes,
         workers: params.workers,
         tickHashes: hashes,

@@ -525,7 +525,9 @@ export class Program {
     this.#starting();
     const memory = new Uint8Array(this.#memory!.buffer);
     if (ptr + len > memory.length) throw new TrapError(`keep(${ptr}, ${len}) reaches past the end of the program's memory`);
-    this.#keeping = memory.slice(ptr, ptr + len);
+    // A program may keep its state every frame: the same length reuses the copy.
+    if (this.#keeping.length === len) this.#keeping.set(memory.subarray(ptr, ptr + len));
+    else this.#keeping = memory.slice(ptr, ptr + len);
   }
 
   /** `wrela.kept(ptr, cap) -> length`: copies up to `cap` bytes of what the replaced build
@@ -550,12 +552,10 @@ export class Program {
   }
 
   /** Hot reload of a literal: in a lifted build, literal `i` takes `value` from the next call
-   * on (`__lift_set`). False if the build isn't lifted. */
-  setLiteral(i: number, value: number): boolean {
+   * on (`__lift_set`). A build that isn't lifted has none to set. */
+  setLiteral(i: number, value: number): void {
     const f = this.#instance?.exports[EXPORT_LIFT_SET];
-    if (typeof f !== "function") return false;
-    this.#call(() => (f as (i: number, v: number) => void)(i, value));
-    return true;
+    if (typeof f === "function") this.#call(() => (f as (i: number, v: number) => void)(i, value));
   }
 
   /** Stops the program's helpers (they see the flag when they wake): the program runs no

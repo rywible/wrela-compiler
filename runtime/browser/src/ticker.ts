@@ -201,7 +201,8 @@ class Ticker {
   t0: number | null = null;
   readonly log: TickLogWriter | null;
   readonly report: TickReport = { cpu_ms: [] };
-  /** The records of each tick run that had any: what a build that replaces this one replays. */
+  /** The records of each tick run that had any: what a build that replaces this one replays.
+   * Kept only on a live page (`TickerStart.replayable`). */
   readonly ran: [number, Uint8Array<ArrayBuffer>][] = [];
   /** Hot reload: the ticks the replaced build ran, run again first with their records. */
   readonly replay: { upto: number; ticks: Map<number, Uint8Array<ArrayBuffer>> } | null;
@@ -322,9 +323,11 @@ class Ticker {
       n = this.#stamp(this.script.ticks.get(k) ?? NONE, n);
     }
     this.#view.setUint32(TICK_RECORDS, n, true);
-    // The records, taken before the tick runs: for the log, and for a build that replaces this.
-    const records = this.#bytes.slice(RECORDS, RECORDS + n * EVENT_SIZE);
-    if (n > 0) this.ran.push([k, records]);
+    // The records, taken before the tick runs, where they're kept: for the log, and for a build
+    // that replaces this one.
+    const replayed = start.replayable && n > 0;
+    const records = this.log !== null || replayed ? this.#bytes.slice(RECORDS, RECORDS + n * EVENT_SIZE) : null;
+    if (replayed) this.ran.push([k, records!]);
     const began = epochNow();
     try {
       this.tick(THREAD_TICK, start.task, start.context, k);
@@ -335,7 +338,7 @@ class Ticker {
     const cpu = epochNow() - began;
     if (start.delay > 0) holdFor(start.delay);
     if (start.timing) this.report.cpu_ms.push(cpu);
-    if (this.log) this.log.push(records, this.#view.getBigUint64(TICK_HASH, true));
+    if (this.log) this.log.push(records!, this.#view.getBigUint64(TICK_HASH, true));
     this.next = k + 1;
     control.ran(this.next);
   }

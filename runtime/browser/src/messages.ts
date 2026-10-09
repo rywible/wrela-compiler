@@ -93,6 +93,9 @@ export interface TickerStart extends TickerOptions {
   wasmHash: bigint;
   /** Test mode: each tick is held this many ms more, as if it took that long. */
   delay: number;
+  /** The page is live (hot reload): keep each tick's records, for a build that replaces this
+   * one to run them again. */
+  replayable: boolean;
   /** Hot reload: the ticks the replaced build ran, to run again first, and its clock's origin. */
   replay: Replay | null;
 }

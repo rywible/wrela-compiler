@@ -31,6 +31,12 @@ fn unedited() -> PathBuf {
     super::built_lifted("reload", &["main"])
 }
 
+/// The build in `dir`, loaded to be hot reloaded.
+fn reloadable(dir: &Path) -> Host {
+    let options = wrela_host::Options { reloadable: true, ..wrela_host::Options::default() };
+    Host::load_with(dir, &options).expect("load")
+}
+
 /// A literal's index in the build at `dir`: the first on `line` of main.wrela, `nth` along.
 fn literal(dir: &Path, line: u64, nth: usize) -> u32 {
     let r = super::lift::report(dir);
@@ -125,7 +131,7 @@ fn a_new_build_takes_over_where_the_old_one_was() {
             + "\npub fn version() -> u32 {\n    2\n}\n"
     });
     let new = built("reload-new", &pkg);
-    let mut host = Host::load(&old).expect("load");
+    let mut host = reloadable(&old);
     frames(&mut host, 0, 120, &s);
     host.call_export("set_mark", &[Value::F32(3.5)]).expect("set_mark");
     frames(&mut host, 120, 121, &s);
@@ -160,7 +166,7 @@ fn a_new_sim_replays_the_old_ones_input() {
         src.replace("const WEIGHT: u32 = 7", "const WEIGHT: u32 = 11")
     });
     let new = built("reload-sim-new", &pkg);
-    let mut host = Host::load(&old).expect("load");
+    let mut host = reloadable(&old);
     frames(&mut host, 0, 90, &s);
     host.reload(Some(&new)).expect("reload");
     frames(&mut host, 90, 91, &s);

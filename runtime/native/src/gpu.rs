@@ -36,6 +36,7 @@ use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex};
 use wgpu::util::align_to;
+use wrela_abi::hash::StateHash;
 use wrela_abi::manifest::{
     BindingKind, BindingStage, Cull, DepthBias, DepthState, Manifest, ResourceBinding, Stage,
     UniformSpace,
@@ -88,6 +89,15 @@ fn wgpu_format(f: TextureFormat) -> wgpu::TextureFormat {
         TextureFormat::R32Float => wgpu::TextureFormat::R32Float,
         TextureFormat::R32Uint => wgpu::TextureFormat::R32Uint,
     }
+}
+
+/// FNV-1a 64 of a pipeline's manifest entry and its WGSL: what a hot reload compares, rather
+/// than keeping a copy of every shader.
+fn pipeline_key(p: &wrela_abi::manifest::Pipeline, source: &str) -> u64 {
+    let mut hash = StateHash::new();
+    hash.update(format!("{p:?}\n").as_bytes());
+    hash.update(source.as_bytes());
+    hash.value()
 }
 
 /// A colour texture binding's format, which the manifest's parser requires of it.
@@ -195,7 +205,7 @@ struct PendingDraw {
 struct OpenPass {
     pass: Pass,
     draws: Vec<PendingDraw>,
-    label: Option<String>,
+    label: Option<Arc<str>>,
 }
 
 struct Screen {
@@ -271,9 +281,9 @@ pub(crate) struct Gpu {
     limits: wgpu::Limits,
     align: u64,
     pipelines: Vec<Pipeline>,
-    /// Each pipeline's manifest entry and WGSL, as text: a hot reload keeps a pipeline whose
-    /// both are the same.
-    pipeline_keys: Vec<String>,
+    /// Each pipeline's key (`pipeline_key`): a hot reload keeps a pipeline whose manifest entry
+    /// and WGSL are the same.
+    pipeline_keys: Vec<u64>,
     resources: HashMap<u32, Resource>,
     /// Each pipeline's cached bind groups, by the bindings they hold.
     bind_groups: Vec<HashMap<Box<[Binding]>, wgpu::BindGroup>>,
@@ -290,7 +300,7 @@ pub(crate) struct Gpu {
     screen: Option<Screen>,
     timer: Option<Timer>,
     /// The name the program gave the passes and dispatches after it in this frame (`Label`).
-    label: Option<String>,
+    label: Option<Arc<str>>,
     errors: Arc<Mutex<Vec<String>>>,
     frame: usize,
     /// A debug build's: the flag its pipelines' bounds checks set (the manifest's
@@ -429,10 +439,10 @@ impl Gpu {
             });
         }
         let old_keys = std::mem::take(&mut self.pipeline_keys);
-        let mut old: HashMap<String, Pipeline> =
+        let mut old: HashMap<u64, Pipeline> =
             old_keys.into_iter().zip(std::mem::take(&mut self.pipelines)).collect();
         for (p, source) in manifest.pipelines.iter().zip(shaders) {
-            let key = format!("{p:?}\n{source}");
+            let key = pipeline_key(p, source);
             let pipeline = match old.remove(&key) {
                 Some(kept) => kept,
                 None => self.build_pipeline(p, source)?,
@@ -1005,9 +1015,8 @@ impl Gpu {
         let bind_group = self.bind_group(pipeline, bindings);
         let mut encoder = self.take_encoder();
         let p = &self.pipelines[pipeline as usize];
-        let label = self.label.clone();
-        let timestamps =
-            self.timer.as_mut().map(|t| t.next(self.frame, label.as_deref().unwrap_or(&p.name)));
+        let label = self.label.as_deref().unwrap_or(&p.name);
+        let timestamps = self.timer.as_mut().map(|t| t.next(self.frame, label));
         let Kind::Compute(compute) = &p.kind else {
             unreachable!("the checker checked the kind");
         };
@@ -1435,7 +1444,12 @@ impl Executor for Gpu {
             | Command::Fetch { .. }
             | Command::Post { .. }
             | Command::Log { .. } => {}
-            Command::Label { name } => self.label = Some(name.to_string()),
+            // The passes and dispatches after it share it; a name given again is kept.
+            Command::Label { name } => {
+                if self.label.as_deref() != Some(*name) {
+                    self.label = Some(Arc::from(*name));
+                }
+            }
         }
         Ok(())
     }

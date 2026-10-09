@@ -2410,7 +2410,7 @@ fn hot_reload_in_the_native_host() {
     let _ = std::fs::remove_dir_all(&out);
     let mut watcher =
         wrela_driver::live::Watcher::start(&pkg, &out, &[], false).expect("the first build");
-    let options = Options { quiet: true, ..Options::default() };
+    let options = Options { quiet: true, reloadable: true, ..Options::default() };
     let mut c = Clearing::on(Host::load_with(watcher.dir(), &options).expect("load"));
     c.walk();
     c.until_ready(0);
