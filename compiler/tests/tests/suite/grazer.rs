@@ -14,7 +14,6 @@
 //! These need a GPU: `cargo test -p wrela-tests --test suite grazer:: -- --ignored --nocapture`.
 
 use crate::built;
-use wrela_host::lock::GpuLock;
 use wrela_host::{Host, Options, Value};
 use wrela_tests::spike01::{HARNESS_D, compiled_kernel, fixture, harness, params_seed1};
 use wrela_tests::{Bind, RawGpu, bytes_of, f32s, median, one_f32, one_u32, u32s, worse};
@@ -49,72 +48,76 @@ fn angle(a: [f32; 3], b: [f32; 3]) -> f64 {
     (cross[0].hypot(cross[1]).hypot(cross[2])).atan2(dot)
 }
 
-#[test]
-#[ignore = "needs a GPU"]
-fn the_compiled_grazer_matches_the_hand_written_one() {
-    // Its GPU times are compared, so the GPU is this test's alone, though the gate shares it
-    // (the host and the device below take it again, on this thread).
-    let _gpu = GpuLock::alone("wrela-tests: the grazer's GPU times").expect("the GPU lock");
+/// The compiled field on [`POINTS`] points over grazer 1's bounds: the points, the distances,
+/// the distances and gradients, and the uniform bytes the program submitted.
+struct Compiled {
+    params: Vec<f32>,
+    points: Vec<u8>,
+    dist: Vec<f32>,
+    samp: Vec<f32>,
+    batches: Vec<Vec<u8>>,
+}
+
+fn compiled() -> Compiled {
     let mut host = load();
-
-    // The same numbers: wrela's `params` is grazer.js's `makeGrazer`, bit for bit.
-    let (theirs, params) = (params_seed1(), spike_params(&mut host, 1));
-    let mismatched: Vec<usize> =
-        (0..328).filter(|&i| params[i].to_bits() != theirs[i].to_bits()).collect();
-    assert!(mismatched.is_empty(), "parameters differ from the spike's at {mismatched:?}");
-
-    // The compiled field: points over the grazer's bounds, the distance, and the distance and
-    // gradient: the newest three buffers, which the program's state holds.
+    let params = spike_params(&mut host, 1);
+    // The newest three buffers, which the program's state holds.
     host.call_export("evaluate", &[Value::I32(1), Value::I32(POINTS as i32)]).expect("evaluate");
     let made = host.buffers();
     let [.., p, d, s] = made[..] else { panic!("evaluate made {made:?}") };
     let points = host.read_buffer(p).expect("points");
     let dist = f32s(&host.read_buffer(d).expect("distances"));
     let samp = f32s(&host.read_buffer(s).expect("samples"));
-    let batches = host.take_batches();
-    drop(host);
+    Compiled { params, points, dist, samp, batches: host.take_batches() }
+}
+
+/// The hand-written field's two kernels: the distance, and the distance and gradient.
+fn hand_written() -> (String, String) {
+    let field = fixture("field.wgsl");
+    (format!("{field}{HARNESS_D}"), format!("{field}{}", harness("eval_g", "vec4f(s.d, s.g)")))
+}
+
+/// Runs `wgsl`'s `entry` over the points (the uniform, the points, and `out` bytes written),
+/// `reps` times: their GPU times and the bytes written after the last.
+fn run_on(
+    gpu: &RawGpu,
+    points: &[u8],
+    wgsl: &str,
+    entry: &str,
+    uniform: &[u8],
+    out: u64,
+    reps: u32,
+) -> (Vec<f64>, Vec<Vec<u8>>) {
+    gpu.run(
+        wgsl,
+        entry,
+        &[Bind::Uniform(uniform), Bind::Read(points), Bind::Write(out)],
+        POINTS / 64,
+        reps,
+    )
+}
+
+#[test]
+#[ignore = "needs a GPU"]
+fn the_compiled_grazer_matches_the_hand_written_one() {
+    let c = compiled();
+
+    // The same numbers: wrela's `params` is grazer.js's `makeGrazer`, bit for bit.
+    let theirs = params_seed1();
+    let mismatched: Vec<usize> =
+        (0..328).filter(|&i| c.params[i].to_bits() != theirs[i].to_bits()).collect();
+    assert!(mismatched.is_empty(), "parameters differ from the spike's at {mismatched:?}");
 
     // The hand-written field, on the same points.
-    let field = fixture("field.wgsl");
     let gpu = RawGpu::new().expect("a GPU");
-    let spike_uniform = bytes_of(&params);
+    let (hand_d, hand_g) = hand_written();
     let n = u64::from(POINTS);
-    let run = |wgsl: &str, entry: &str, uniform: &[u8], out: u64| {
-        gpu.run(
-            wgsl,
-            entry,
-            &[Bind::Uniform(uniform), Bind::Read(&points), Bind::Write(out)],
-            POINTS / 64,
-            REPS,
-        )
-    };
-    let hand_d = format!("{field}{HARNESS_D}");
-    let hand_g = format!("{field}{}", harness("eval_g", "vec4f(s.d, s.g)"));
-    let (_, out_d) = run(&hand_d, "eval_d", &spike_uniform, n * 4);
-    let (_, out_g) = run(&hand_g, "eval_g", &spike_uniform, n * 16);
+    let uniform = bytes_of(&c.params);
+    let (_, out_d) = run_on(&gpu, &c.points, &hand_d, "eval_d", &uniform, n * 4, 1);
+    let (_, out_g) = run_on(&gpu, &c.points, &hand_g, "eval_g", &uniform, n * 16, 1);
     let (hd, hg) = (f32s(&out_d[0]), f32s(&out_g[0]));
 
-    // GPU time: the compiled kernels (the build's WGSL, the program's uniforms) and the
-    // hand-written ones, alternating; the first round warms the GPU up and isn't counted.
-    let (ours_dw, ours_de, ours_du) = compiled_kernel(&built("fields"), "distances", &batches);
-    let (ours_gw, ours_ge, ours_gu) = compiled_kernel(&built("fields"), "samples", &batches);
-    let (mut ours_d, mut ours_g, mut theirs_d, mut theirs_g) =
-        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-    for round in 0..=ROUNDS {
-        let t = [
-            run(&ours_dw, &ours_de, &ours_du, n * 4).0,
-            run(&hand_d, "eval_d", &spike_uniform, n * 4).0,
-            run(&ours_gw, &ours_ge, &ours_gu, n * 16).0,
-            run(&hand_g, "eval_g", &spike_uniform, n * 16).0,
-        ];
-        if round > 0 {
-            ours_d.extend(&t[0]);
-            theirs_d.extend(&t[1]);
-            ours_g.extend(&t[2]);
-            theirs_g.extend(&t[3]);
-        }
-    }
-
+    let (dist, samp) = (&c.dist, &c.samp);
     let mut worst_d = 0.0f64;
     let mut worst_sd = 0.0f64;
     let mut worst_angle = 0.0f64;
@@ -140,15 +143,61 @@ fn the_compiled_grazer_matches_the_hand_written_one() {
             worst_angle = worst_angle.max(a);
         }
     }
-    let (md, mg) = (median(&ours_d), median(&ours_g));
-    let (hmd, hmg) = (median(&theirs_d), median(&theirs_g));
     println!("AC2: {POINTS} points over grazer 1's bounds");
     println!(
         "  distance: worst |Δ| {worst_d:.3e} m (distance kernel), {worst_sd:.3e} m (gradient kernel)"
     );
     println!("  gradient: worst angle {worst_angle:.3e} rad; over 0.01 rad: {}", over_angle.len());
+    for &i in over_angle.iter().take(5) {
+        let p = f32s(&c.points[16 * i..16 * i + 12]);
+        println!(
+            "    {p:?}: ours {:?}, theirs {:?}",
+            &samp[4 * i..4 * i + 4],
+            &hg[4 * i..4 * i + 4]
+        );
+    }
+    assert_eq!(over_d, 0, "distances differ by more than 1e-5 m");
+    assert!(over_angle.is_empty(), "gradients differ by more than 0.01 rad");
+}
+
+/// AC2's speed: the compiled kernels (the build's WGSL, the program's uniforms) take at most
+/// 1.25× the hand-written ones' GPU time. A measurement: it compares two timings taken side by
+/// side, and another test's work on the GPU skews one of them.
+#[test]
+#[ignore = "measure: needs a GPU"]
+fn the_compiled_grazer_is_as_fast_as_the_hand_written_one() {
+    let c = compiled();
+    let gpu = RawGpu::new().expect("a GPU");
+    let (hand_d, hand_g) = hand_written();
+    let n = u64::from(POINTS);
+    let uniform = bytes_of(&c.params);
+    let run = |wgsl: &str, entry: &str, uniform: &[u8], out: u64| {
+        run_on(&gpu, &c.points, wgsl, entry, uniform, out, REPS).0
+    };
+
+    // Alternating; the first round warms the GPU up and isn't counted.
+    let (ours_dw, ours_de, ours_du) = compiled_kernel(&built("fields"), "distances", &c.batches);
+    let (ours_gw, ours_ge, ours_gu) = compiled_kernel(&built("fields"), "samples", &c.batches);
+    let (mut ours_d, mut ours_g, mut theirs_d, mut theirs_g) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for round in 0..=ROUNDS {
+        let t = [
+            run(&ours_dw, &ours_de, &ours_du, n * 4),
+            run(&hand_d, "eval_d", &uniform, n * 4),
+            run(&ours_gw, &ours_ge, &ours_gu, n * 16),
+            run(&hand_g, "eval_g", &uniform, n * 16),
+        ];
+        if round > 0 {
+            ours_d.extend(&t[0]);
+            theirs_d.extend(&t[1]);
+            ours_g.extend(&t[2]);
+            theirs_g.extend(&t[3]);
+        }
+    }
+    let (md, mg) = (median(&ours_d), median(&ours_g));
+    let (hmd, hmg) = (median(&theirs_d), median(&theirs_g));
     println!(
-        "  GPU time, median of {}: distance {:.3} ms vs hand-written {:.3} ms ({:.2}x); \
+        "AC2: GPU time, median of {}: distance {:.3} ms vs hand-written {:.3} ms ({:.2}x); \
          distance and gradient {:.3} ms vs {:.3} ms ({:.2}x)",
         ours_d.len(),
         md / 1e6,
@@ -158,14 +207,6 @@ fn the_compiled_grazer_matches_the_hand_written_one() {
         hmg / 1e6,
         mg / hmg
     );
-    for &i in over_angle.iter().take(5) {
-        let p = f32s(&points[16 * i..16 * i + 12]);
-        println!(
-            "    {p:?}: ours {:?}, theirs {:?}",
-            &samp[4 * i..4 * i + 4],
-            &hg[4 * i..4 * i + 4]
-        );
-    }
     // A GPU without timestamps gives zeros, which would pass the time gates.
     for (what, t) in
         [("ours", &ours_d), ("theirs", &theirs_d), ("ours", &ours_g), ("theirs", &theirs_g)]
@@ -175,8 +216,6 @@ fn the_compiled_grazer_matches_the_hand_written_one() {
             "{what}: GPU times {t:?} aren't all positive"
         );
     }
-    assert_eq!(over_d, 0, "distances differ by more than 1e-5 m");
-    assert!(over_angle.is_empty(), "gradients differ by more than 0.01 rad");
     assert!(md <= 1.25 * hmd, "the distance kernel is {:.2}x the hand-written one", md / hmd);
     assert!(mg <= 1.25 * hmg, "the gradient kernel is {:.2}x the hand-written one", mg / hmg);
 }

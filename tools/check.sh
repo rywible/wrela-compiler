@@ -290,8 +290,8 @@ PY
   # 0.8 s), and Chrome's input latency and text budgets measure real time (under the other
   # tests' load, an event missed its next frame, and 10,000 glyphs took 0.52 ms instead of
   # 0.23). So do the lens's: its frames' and clicks' times in Chrome, its drags in a session, its
-  # fits' 10 s, and an edit's 2 s to show. So do the herd's ratios to spike 01 (#42): each
-  # compares two timings taken side by side, and another test's load skews one of them.
+  # fits' 10 s, and an edit's 2 s to show. So do the herd's and the grazer's ratios to spike 01
+  # (#42): each compares two timings taken side by side, and another test's load skews one of them.
   step "full: the measurements, one at a time"
   cargo test -q --release --workspace -- --ignored --exact --test-threads=1 "${measures[@]}"
 fi
