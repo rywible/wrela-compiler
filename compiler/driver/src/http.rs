@@ -1,8 +1,9 @@
 //! The little HTTP the toolchain's servers speak (the studio's, `serve.rs`, and `wrela run`'s,
 //! `live.rs`): one request per connection, on 127.0.0.1 only. A request must name this machine
-//! as its host (so a page elsewhere can't reach a server through DNS rebinding), and a post or a
-//! put must come from the server's own pages (their `Origin`), so another site open in the
-//! browser can't change files.
+//! as its host (so a page elsewhere can't reach a server through DNS rebinding), and a post must
+//! come from the server's own pages (their `Origin`), so another site open in the browser can't
+//! change files. A put (test mode's results) isn't checked for its origin: a browser asks a
+//! server before another site's page may put, and these servers answer no such question.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};

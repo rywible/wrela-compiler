@@ -164,7 +164,9 @@ export function carried<R>(
   next: number,
 ): { upto: number; ticks: [number, R][] } {
   const ticks: [number, R][] = [...ran];
-  for (const [k, r] of replay?.ticks ?? []) if (!ran.some(([t]) => t === k)) ticks.push([k, r]);
+  // A set of the ticks run: a session's reloads each carry all its ticks so far.
+  const run = new Set(ran.map(([t]) => t));
+  for (const [k, r] of replay?.ticks ?? []) if (!run.has(k)) ticks.push([k, r]);
   ticks.sort((a, b) => a[0] - b[0]);
   return { upto: Math.max(next, replay?.upto ?? 0), ticks };
 }

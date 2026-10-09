@@ -2714,9 +2714,6 @@ fn verify(cx: &mut Cx, mb: &mut ModuleBuilder, name: &str) -> Option<()> {
     Some(())
 }
 
-/// A GPU entry point or `@gpu` function that nothing dispatches: lowered for the GPU anyway
-/// (a generic `@gpu` function with `substs`, stand-ins for its generics), so its effects are
-/// checked where it's defined. Only to check: the module isn't emitted, so it isn't flattened.
 /// What a `@gpu` function's parameter of type `t` is bound to for its check: a resource of its
 /// own for a buffer, texture or sampler, and for each of a group's (`check_standalone`); `None`
 /// for a value. `next` is the next binding.
@@ -2756,6 +2753,9 @@ fn stand_in(
     Some(Bound::One(id))
 }
 
+/// A GPU entry point or `@gpu` function that nothing dispatches: lowered for the GPU anyway
+/// (a generic `@gpu` function with `substs`, stand-ins for its generics), so its effects are
+/// checked where it's defined. Only to check: the module isn't emitted, so it isn't flattened.
 pub(crate) fn check_standalone(cx: &mut Cx, f: FnId, entry: Option<Entry>, substs: &[TyId]) {
     let checked = cx.checked;
     let def = checked.program.func(f);

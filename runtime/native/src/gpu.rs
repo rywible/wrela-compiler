@@ -108,8 +108,11 @@ fn wgpu_format(f: TextureFormat) -> wgpu::TextureFormat {
 }
 
 /// FNV-1a 64 of a pipeline's manifest entry and its WGSL: what a hot reload compares, rather
-/// than keeping a copy of every shader.
+/// than keeping a copy of every shader. Not its WGSL file's name, which is its place among the
+/// build's pipelines (`pipeline_3.wgsl`): a pipeline added or dropped before it moves it, and the
+/// next build keeps it all the same.
 fn pipeline_key(p: &wrela_abi::manifest::Pipeline, source: &str) -> u64 {
+    let p = wrela_abi::manifest::Pipeline { shader: String::new(), ..p.clone() };
     let mut hash = StateHash::new();
     hash.update(format!("{p:?}\n").as_bytes());
     hash.update(source.as_bytes());
@@ -1693,4 +1696,28 @@ fn read_timestamp_spans(
             (a as f64 * period, a.max(b) as f64 * period)
         })
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wrela_abi::manifest::Pipeline;
+
+    /// A hot reload keeps a pipeline wherever its WGSL file is: a pipeline added before it
+    /// renumbers its file, not its entry or its code.
+    #[test]
+    fn a_pipelines_key_is_its_entry_and_code_not_its_files_name() {
+        let p = |shader: &str, entry: &str| Pipeline {
+            name: "fill".into(),
+            shader: shader.into(),
+            stage: Stage::Compute { entry: entry.into(), workgroup_size: [64, 1, 1] },
+            uniform: None,
+            bindings: Vec::new(),
+            debug_flag: None,
+        };
+        let key = pipeline_key(&p("pipeline_0.wgsl", "main"), "fn main() {}");
+        assert_eq!(key, pipeline_key(&p("pipeline_3.wgsl", "main"), "fn main() {}"));
+        assert_ne!(key, pipeline_key(&p("pipeline_0.wgsl", "main"), "fn main() { }"));
+        assert_ne!(key, pipeline_key(&p("pipeline_0.wgsl", "fill"), "fn main() {}"));
+    }
 }

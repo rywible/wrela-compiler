@@ -81,7 +81,7 @@ export interface RenderTarget {
 /** A target as errors name it: `rgba16float with depth`, `depth alone` (runtime/abi
  * `RenderTarget`'s `Display`). */
 export const targetName = (t: RenderTarget) =>
-  t.color === null ? "depth alone" : t.depth ? `${t.color} with depth` : t.color;
+  t.color === null ? (t.depth ? "depth alone" : "nothing") : t.depth ? `${t.color} with depth` : t.color;
 
 export type Cull = "none" | "front" | "back";
 
@@ -423,6 +423,9 @@ export function validateManifest(m: Manifest): void {
         }
         const format = TEXTURE_FORMATS.find((f) => f.name === t.color);
         const integer = format?.uint ?? false;
+        if (t.color === null && !t.depth) {
+          throw err(`pipeline ${i}'s target ${k} draws into nothing: a target has a colour, a depth, or both`);
+        }
         const why =
           p.writes_depth && !t.depth
             ? "its fragments give their depth, so a target has depth"

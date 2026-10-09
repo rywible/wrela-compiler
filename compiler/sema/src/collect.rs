@@ -120,8 +120,10 @@ pub fn collect(
     c.find_lang_items();
     c.resolve_signatures();
     c.make_packed();
-    c.make_bound_types();
     c.index_impls();
+    // After the impls: a bound type's fields ask which types are `Copy`, an answer kept for the
+    // rest of the compile, and a field's `T::Out` is known only through its impl.
+    c.make_bound_types();
     c.check_recursive_types();
     c.check_impls();
     c.p
@@ -810,6 +812,7 @@ impl<'d, 'u> Collector<'d, 'u> {
                         "deterministic",
                         "audio",
                         "test",
+                        "testing",
                         "job",
                     ];
                     let mut d = Diagnostic::new(

@@ -1228,9 +1228,14 @@ impl<'p> Checker<'p> {
                 if self.infer.unify(&self.p.types, a, b).is_err() {
                     return fail(self);
                 }
-                match self.kind(a) {
+                match *self.kind(a) {
                     TyKind::Int(_) | TyKind::Float(_) | TyKind::Vec(..) => Some(a),
-                    TyKind::Mat(..) if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul) => {
+                    // A product of one type is a square matrix's (`A * B` above, its type
+                    // unified with the other's here).
+                    TyKind::Mat(c, r)
+                        if matches!(op, BinOp::Add | BinOp::Sub)
+                            || (op == BinOp::Mul && c == r) =>
+                    {
                         Some(a)
                     }
                     TyKind::Var(_) if self.is_number_var(a) => Some(a),

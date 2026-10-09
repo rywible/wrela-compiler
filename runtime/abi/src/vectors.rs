@@ -1159,6 +1159,14 @@ fn manifests() -> Vec<Value> {
             }),
         ),
         manifest(
+            "a target with neither a colour nor a depth",
+            edited(&|m| {
+                if let Stage::Render { targets, .. } = &mut m.pipelines[1].stage {
+                    targets[0] = RenderTarget { color: None, depth: false };
+                }
+            }),
+        ),
+        manifest(
             "a target whose colour isn't a format",
             golden.replace("\"color\": \"rgba8unorm\"", "\"color\": \"rgb8\""),
         ),

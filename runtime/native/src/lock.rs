@@ -16,10 +16,11 @@
 //!
 //! **Sharing.** Runs that check what the GPU computes, not how long it takes, can share it:
 //! with `WRELA_GPU_SHARED=n` (n ≥ 2), up to n of a process's threads hold the lock at once, and
-//! the process takes the `flock` shared, so other sharing processes hold it beside it. A run
-//! that takes it alone (headless Chrome, which always does; a process without the variable; a
-//! [`GpuLock::alone`]) still waits for every sharer, and they for it. `tools/check.sh` shares
-//! the GPU in its tests and never in its timing runs.
+//! the process takes the `flock` shared, so other sharing processes hold it beside it (so does
+//! `tools/headless.py` with the variable, which runs one headless Chrome at a time by a lock of
+//! its own). A run that takes it alone (a process without the variable; a [`GpuLock::alone`])
+//! still waits for every sharer, and they for it. `tools/check.sh` shares the GPU in its tests
+//! and never in its timing runs.
 
 use crate::error::{Error, Result};
 use std::ffi::OsString;

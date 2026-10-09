@@ -1796,6 +1796,11 @@ fn fold_block(
                     locals.remove(l);
                 });
                 let body = fold_block(body, values, locals, taken);
+                // The continuing block is reached by each `continue` too, not only from the
+                // body's end, so what the body's end knows of them isn't known there.
+                stored.iter().for_each(|l| {
+                    locals.remove(l);
+                });
                 let continuing = fold_block(continuing, values, locals, taken);
                 stored.iter().for_each(|l| {
                     locals.remove(l);
@@ -2432,6 +2437,40 @@ mod tests {
         dce(&mut f);
         assert_eq!(f.body, vec![Stmt::Let(x, Expr::Param(0)), Stmt::Return(Some(x))]);
         assert!(f.locals.is_empty());
+    }
+
+    /// A `bool` local the loop's body stores late isn't known in its continuing block, which a
+    /// `continue` before the store reaches too; one stored before the loop and not in it is.
+    #[test]
+    fn a_continue_keeps_a_local_unknown_in_the_continuing_block() {
+        let mut m = Module::default();
+        let boolt = m.types.bool();
+        let param = Param { name: "c".into(), ty: boolt, by_ref: false, mutable: false };
+        let mut f = Function::new("f", vec![param], None);
+        let (flag, fixed) = (f.new_local("flag", boolt), f.new_local("fixed", boolt));
+        let [c, yes, no, late, same] = [(); 5].map(|_| f.new_value(boolt));
+        f.body = vec![
+            Stmt::Let(c, Expr::Param(0)),
+            Stmt::Let(no, Expr::Const(Const::Bool(false))),
+            Stmt::Store(Place::local(flag), no),
+            Stmt::Store(Place::local(fixed), no),
+            Stmt::Loop {
+                body: vec![
+                    Stmt::If { cond: c, then: vec![Stmt::Continue], else_: Vec::new() },
+                    Stmt::Let(yes, Expr::Const(Const::Bool(true))),
+                    Stmt::Store(Place::local(flag), yes),
+                ],
+                continuing: vec![
+                    Stmt::Let(late, Expr::Load(Place::local(flag))),
+                    Stmt::Let(same, Expr::Load(Place::local(fixed))),
+                ],
+            },
+            Stmt::Return(None),
+        ];
+        fold_constant_branches(&mut f);
+        let Stmt::Loop { continuing, .. } = &f.body[4] else { panic!("{:?}", f.body) };
+        assert_eq!(continuing[0], Stmt::Let(late, Expr::Load(Place::local(flag))));
+        assert_eq!(continuing[1], Stmt::Let(same, Expr::Const(Const::Bool(false))));
     }
 
     /// A large branch whose sides compute the same expressions of different operands becomes

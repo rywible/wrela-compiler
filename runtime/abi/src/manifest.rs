@@ -190,7 +190,8 @@ impl fmt::Display for RenderTarget {
         match (self.color, self.depth) {
             (Some(c), true) => write!(f, "{} with depth", c.name()),
             (Some(c), false) => write!(f, "{}", c.name()),
-            (None, _) => write!(f, "depth alone"),
+            (None, true) => write!(f, "depth alone"),
+            (None, false) => write!(f, "nothing"),
         }
     }
 }
@@ -589,6 +590,11 @@ impl Manifest {
                     for (k, t) in targets.iter().enumerate() {
                         if targets[..k].contains(t) {
                             return err(format!("pipeline {i} names the target {t} twice"));
+                        }
+                        if t.color.is_none() && !t.depth {
+                            return err(format!(
+                                "pipeline {i}'s target {k} draws into nothing: a target has a colour, a depth, or both"
+                            ));
                         }
                         let integer = t.color.is_some_and(|c| c.is_uint());
                         let why = if *writes_depth && !t.depth {

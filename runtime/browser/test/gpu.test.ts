@@ -2,8 +2,8 @@
 // the same behaviour on a real GPU).
 
 import { describe, expect, test } from "bun:test";
-import { type BuiltPipeline, buildPipelines, GpuExecutor, ShaderError } from "../src/gpu.ts";
-import type { Manifest } from "../src/manifest.ts";
+import { type BuiltPipeline, buildPipelines, GpuExecutor, type PipelineCache, ShaderError } from "../src/gpu.ts";
+import type { Manifest, Pipeline } from "../src/manifest.ts";
 import { NONE } from "../src/abi.gen.ts";
 import { decode } from "../src/stream.ts";
 import { Encoder, words } from "./encoder.ts";
@@ -462,6 +462,60 @@ test("a command whose pipeline is still being built waits for it, and the comman
   // The readback after them copies once they're submitted.
   expect(kinds(device.events)).toEqual(["dispatch", "copyBuffer", "writeBuffer", "writeBuffer", "submit", "copyBuffer", "submit"]);
   expect((await answer).length).toBe(4);
+});
+
+test("commands that wait for a pipeline keep their frame's label; the next frame's start with none", async () => {
+  const device = new FakeDevice();
+  const m = shapes();
+  const [draw, compute] = await Promise.all(buildPipelines(device.gpu, m, m.pipelines.map(() => SHADER)));
+  const later = Promise.withResolvers<BuiltPipeline>();
+  const executor = new GpuExecutor(device.gpu, [draw!, later.promise], { texture: () => fakeTexture("screen") });
+  const run = (e: Encoder) => {
+    for (const cmd of decode(e.finish())) executor.execute(cmd);
+  };
+  const dispatch = (e: Encoder) => e.dispatch(1, [1, 1, 1], [1, 2], u(0));
+  run(dispatch(dispatch(new Encoder().createBuffer(1, 64).createBuffer(2, 64).label("look"))));
+  // The next frame begins while the last one's dispatches still wait.
+  executor.frame = 1;
+  run(dispatch(new Encoder()));
+  const caughtUp = executor.caughtUp();
+  later.resolve(compute!);
+  await caughtUp;
+  expect(device.passLabels).toEqual(["look", "look", "compute"]);
+});
+
+test("a command that waited for a pipeline, then fails, fails the program", async () => {
+  const device = new FakeDevice();
+  const m = shapes();
+  const [draw, compute] = await Promise.all(buildPipelines(device.gpu, m, m.pipelines.map(() => SHADER)));
+  const later = Promise.withResolvers<BuiltPipeline>();
+  const executor = new GpuExecutor(device.gpu, [draw!, later.promise], { texture: () => fakeTexture("screen") });
+  // Buffers that don't exist: what no checked command binds, so it fails when it runs.
+  for (const cmd of decode(new Encoder().dispatch(1, [1, 1, 1], [8, 9], u(0)).finish())) executor.execute(cmd);
+  const caughtUp = executor.caughtUp().then(
+    () => "caught up",
+    (e: Error) => e.message,
+  );
+  later.resolve(compute!);
+  expect(await caughtUp).toBe("host bug: resource 8 passed the checks but doesn't exist");
+  expect(() => executor.waiting).toThrow("host bug: resource 8 passed the checks but doesn't exist");
+});
+
+test("a hot reload keeps the pipelines whose entries and WGSL are the same, wherever their files are", async () => {
+  const device = new FakeDevice();
+  const cache: PipelineCache = new Map();
+  const numbered = (ps: Pipeline[]) => ps.map((p, i) => ({ ...p, shader: `pipeline_${i}.wgsl` }));
+  const m = shapes();
+  m.pipelines = numbered(m.pipelines);
+  const first = buildPipelines(device.gpu, m, [SHADER, SHADER], cache);
+  // The next build has a pipeline before them: each of their files is one further on.
+  const next = shapes();
+  next.pipelines = numbered([{ ...next.pipelines[1]!, name: "another" }, ...next.pipelines]);
+  const second = buildPipelines(device.gpu, next, [SHADER, SHADER, SHADER], cache);
+  expect(second[1]).toBe(first[0]!);
+  expect(second[2]).toBe(first[1]!);
+  expect(second[0]).not.toBe(first[1]!);
+  await Promise.all(second);
 });
 
 test("a pipeline that can't be built fails the program: caughtUp and built reject", async () => {

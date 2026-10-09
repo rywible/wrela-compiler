@@ -284,10 +284,12 @@ export async function timeEachPipeline(
  * what the next build keeps, in a hot reload. */
 export type PipelineCache = Map<string, Promise<BuiltPipeline>>;
 
-/** FNV-1a 64 of a pipeline's manifest entry and its WGSL, as hex. */
+/** FNV-1a 64 of a pipeline's manifest entry and its WGSL, as hex. Not its WGSL file's name,
+ * which is its place among the build's pipelines (`pipeline_3.wgsl`): a pipeline added or
+ * dropped before it moves it, and the next build keeps it all the same. */
 function pipelineKey(p: Pipeline, source: string): string {
   const hash = new StateHash();
-  hash.update(new TextEncoder().encode(`${JSON.stringify(p)}\n${source}`));
+  hash.update(new TextEncoder().encode(`${JSON.stringify({ ...p, shader: "" })}\n${source}`));
   return hash.hex();
 }
 
@@ -330,9 +332,13 @@ type Resource =
   | { kind: "texture"; texture: GPUTexture; view: GPUTextureView; format: TextureFormat; bytes: number }
   | { kind: "sampler"; sampler: GPUSampler };
 
+/** Where a command was recorded: its frame, and which `frame` it came after (`Label`s name the
+ * passes after them in that frame alone). */
+type RecordedIn = { frame: number; generation: number };
+
 /** A command kept for the serial mode's `drain`, or a readback waiting its turn. */
 type Deferred =
-  | { cmd: Command; frame: number }
+  | { cmd: Command; at: RecordedIn }
   | { handle: number; offset: number; size: number; answer: PromiseWithResolvers<Bytes> };
 
 /** `cmd` with its bytes copied out of the program's memory, which the program reuses. */
@@ -523,21 +529,27 @@ export class GpuExecutor {
    * and the buffer it's read back through, made once. */
   readonly #debugFlag: { buffer: GPUBuffer; readback: GPUBuffer } | null;
   #frame = 0;
-  /** The serial mode: the frame whose command `drain` is running, which its timings take. */
-  #running: number | null = null;
+  /** How many times `frame` has been set: a command's label is its own frame's. */
+  #generation = 0;
+  /** Where the command running late (behind a pipeline being built, or in the serial mode's
+   * `drain`) was recorded: its timings are that frame's, and so is its label. */
+  #running: RecordedIn | null = null;
   /** Whether a pass on the screen has ended since this was last cleared: a frame that drew
    * nothing there leaves the screen as it was. */
   presented = false;
-  /** The name the program gave the passes and dispatches after it in this frame (`Label`). */
+  /** The name the program gave the passes and dispatches after it in this frame (`Label`), and
+   * the frame it was given in (its `generation`). */
   #label: string | null = null;
+  #labelGeneration = 0;
   /** The frame being recorded, for timings. */
   get frame(): number {
     return this.#frame;
   }
-  /** A frame begins: no label carries over from the last one. */
+  /** A frame begins: no label carries over from the last one to its commands (`#run`), even
+   * while the last one's commands still run late. */
   set frame(i: number) {
     this.#frame = i;
-    this.#label = null;
+    this.#generation++;
   }
   /** The serial timing mode's commands, waiting for `drain` to run them each pass and dispatch
    * alone; null in the other modes, which run each command as it comes. */
@@ -550,7 +562,8 @@ export class GpuExecutor {
   readonly #waiting: Deferred[] = [];
   /** Resolved when no command waits any more (`caughtUp`). */
   #idle: PromiseWithResolvers<void> | null = null;
-  /** Why a pipeline couldn't be built: the program has failed (`caughtUp` rejects with it). */
+  /** Why a pipeline couldn't be built, or a command that waited for one failed when it ran:
+   * the program has failed (`caughtUp` rejects with it, and `waiting` throws it). */
   #failed: unknown = null;
   /** Resolved when every pipeline is built; rejected, with why, if one can't be. */
   readonly built: Promise<void>;
@@ -574,12 +587,15 @@ export class GpuExecutor {
       p.then(
         (built) => {
           this.#pipelines[i] = built;
-          this.#resume();
+          // A command that waited and then fails fails the program, as it would have had it
+          // run when it came: not lost in this callback, with the commands behind it waiting.
+          try {
+            this.#resume();
+          } catch (e) {
+            this.#fail(e);
+          }
         },
-        (e) => {
-          this.#failed ??= e;
-          this.#idle?.reject(e);
-        },
+        (e) => this.#fail(e),
       );
     });
     const l = device.limits;
@@ -635,21 +651,31 @@ export class GpuExecutor {
 
   /** The timestamp writes for a pass about to be recorded; never flushes. */
   #timestamps(label: string): { timestampWrites?: GPUComputePassTimestampWrites } {
-    return this.#timer === null ? {} : { timestampWrites: this.#timer.next(this.#running ?? this.frame, label) };
+    return this.#timer === null ? {} : { timestampWrites: this.#timer.next(this.#running?.frame ?? this.frame, label) };
   }
 
   /** Carries out a command that has been decoded, sequenced and checked, or keeps a copy of it
    * for `drain` in the serial mode. Requests are the program's business, except a readback's
    * copy (`readBack`). */
   execute(cmd: Command): void {
-    if (this.#deferred !== null) this.#deferred.push({ cmd: copied(cmd), frame: this.frame });
-    else if (this.#waiting.length > 0 || !this.#ready(cmd)) this.#waiting.push({ cmd: copied(cmd), frame: this.frame });
+    const at = { frame: this.#frame, generation: this.#generation };
+    if (this.#deferred !== null) this.#deferred.push({ cmd: copied(cmd), at });
+    else if (this.#waiting.length > 0 || !this.#ready(cmd)) this.#waiting.push({ cmd: copied(cmd), at });
     else this.#run(cmd);
   }
 
-  /** Whether a command waits for a pipeline being built. */
+  /** Whether a command waits for a pipeline being built. Throws why the program failed, if a
+   * pipeline couldn't be built or a command that waited for one failed. */
   get waiting(): boolean {
+    if (this.#failed !== null) throw this.#failed;
     return this.#waiting.length > 0;
+  }
+
+  /** The program has failed, as `e` says (`#failed`). */
+  #fail(e: unknown): void {
+    this.#failed ??= e;
+    this.#idle?.reject(e);
+    this.#idle = null;
   }
 
   /** Resolves once no command waits for a pipeline being built (at once, if none does); rejects
@@ -674,7 +700,7 @@ export class GpuExecutor {
       const d = this.#waiting[0]!;
       if ("cmd" in d && !this.#ready(d.cmd)) return;
       this.#waiting.shift();
-      if ("cmd" in d) this.#runAs(d.frame, d.cmd);
+      if ("cmd" in d) this.#runAs(d.at, d.cmd);
       else this.readBack(d.handle, d.offset, d.size, true).then(d.answer.resolve, d.answer.reject);
     }
     this.flush();
@@ -682,9 +708,10 @@ export class GpuExecutor {
     this.#idle = null;
   }
 
-  /** Runs `cmd` as part of `frame`: its timings are that frame's. */
-  #runAs(frame: number, cmd: Command): void {
-    this.#running = frame;
+  /** Runs `cmd` as part of the frame it was recorded in (`at`): its timings and its label are
+   * that frame's. */
+  #runAs(at: RecordedIn, cmd: Command): void {
+    this.#running = at;
     try {
       this.#run(cmd);
     } finally {
@@ -699,9 +726,9 @@ export class GpuExecutor {
     for (const d of this.#deferred.splice(0)) {
       if ("cmd" in d && "pipeline" in d.cmd) await this.#building[d.cmd.pipeline];
       if ("cmd" in d) {
-        // Its timings are the frame's that recorded it, which may have been before the one
-        // being recorded now.
-        this.#running = d.frame;
+        // Its timings and its label are the frame's that recorded it, which may have been
+        // before the one being recorded now.
+        this.#running = d.at;
         try {
           this.#run(d.cmd);
         } catch (e) {
@@ -721,6 +748,13 @@ export class GpuExecutor {
   }
 
   #run(cmd: Command): void {
+    // A label names the passes and dispatches after it in its own frame: the first command of
+    // another frame starts with none.
+    const generation = this.#running?.generation ?? this.#generation;
+    if (generation !== this.#labelGeneration) {
+      this.#label = null;
+      this.#labelGeneration = generation;
+    }
     if (this.#ended !== null) {
       if (cmd.op === "BeginPass" && joins(cmd.pass, this.#ended.pass)) {
         this.#pass = this.#ended;

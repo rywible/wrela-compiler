@@ -119,8 +119,9 @@ pub fn carried<R: Clone>(
 ) -> (u32, Vec<(u32, R)>) {
     let mut ticks = ran.to_vec();
     if let Some((_, pending)) = replay {
-        let more = pending.iter().filter(|(k, _)| !ran.iter().any(|(t, _)| t == k));
-        ticks.extend(more.cloned());
+        // A set of the ticks run: a session's reloads each carry all its ticks so far.
+        let run: std::collections::HashSet<u32> = ran.iter().map(|(t, _)| *t).collect();
+        ticks.extend(pending.iter().filter(|(k, _)| !run.contains(k)).cloned());
     }
     ticks.sort_by_key(|t| t.0);
     (next.max(replay.map_or(0, |r| r.0)), ticks)
