@@ -1,4 +1,4 @@
-//! `wrela build <package-dir> [-o <out-dir>] [--debug] [--json]`: checks and builds a package, writing
+//! `wrela build <package-dir> [-o <out-dir>] [--debug] [--testing] [--lift <package>]... [--json]`: checks and builds a package, writing
 //! `game.wasm`, the WGSL, `manifest.json` and the runtime into the output directory (default
 //! `<package>/build`). The output is the same bytes for the same input (AC9). A file an earlier
 //! build wrote there and this one doesn't (every one, when the build fails) is removed; other
@@ -16,7 +16,8 @@ pub fn run(args: &[String]) -> ExitCode {
     let dir = &args.dir;
     let out = args.out.unwrap_or_else(|| dir.join("build"));
     let output = if !args.lift.is_empty() {
-        match wrela_driver::build_lifted(dir, &args.lift, args.debug) {
+        let kind = wrela_driver::BuildKind { debug: args.debug, testing: args.testing };
+        match wrela_driver::build_lifted(dir, &args.lift, kind) {
             Ok(o) => o,
             Err(why) => {
                 eprintln!("error: {why}");

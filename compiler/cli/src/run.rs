@@ -33,7 +33,8 @@ pub fn run(args: &[String]) -> ExitCode {
         return ExitCode::from(2);
     }
     let out = args.dir.join("build").join("run");
-    match wrela_driver::live::serve(&args.dir, &out, port, &args.lift, args.debug, false) {
+    let kind = wrela_driver::BuildKind { debug: args.debug, testing: false };
+    match wrela_driver::live::serve(&args.dir, &out, port, &args.lift, kind, false) {
         Ok(server) => {
             println!(
                 "`{}` with hot reload: http://127.0.0.1:{}/ (edits to its files show as you save them)",

@@ -2407,8 +2407,10 @@ fn hot_reload_in_the_native_host() {
     let pkg = clearing_copy("clearing-hot-native-src");
     let out = super::scratch("clearing-hot-native");
     let _ = std::fs::remove_dir_all(&out);
+    // A test build: the harness reads the clearing through its `@testing` exports.
+    let kind = wrela_driver::BuildKind { debug: false, testing: true };
     let mut watcher =
-        wrela_driver::live::Watcher::start(&pkg, &out, &[], false).expect("the first build");
+        wrela_driver::live::Watcher::start(&pkg, &out, &[], kind).expect("the first build");
     let options = Options { quiet: true, reloadable: true, ..Options::default() };
     let mut c = Clearing::on(Host::load_with(watcher.dir(), &options).expect("load"));
     c.walk();
@@ -2512,7 +2514,8 @@ fn hot_reload_in_the_native_host() {
 fn hot_reload_in_chrome() {
     let pkg = clearing_copy("clearing-hot-chrome-src");
     let out = super::scratch("clearing-hot-chrome");
-    let server = wrela_driver::live::serve(&pkg, &out, 0, &[], false, true).expect("serve");
+    let server =
+        wrela_driver::live::serve(&pkg, &out, 0, &[], Default::default(), true).expect("serve");
     std::fs::write(out.join("1/script.json"), r#"[{"frame":1,"type":"key","key":"Space"}]"#)
         .expect("the script");
     let url = format!(

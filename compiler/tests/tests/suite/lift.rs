@@ -31,7 +31,8 @@ pub(crate) fn build_into(name: &str, pkg: &Path, lift: &[&str], debug: bool) -> 
     let dir = super::scratch(name);
     let out = if !lift.is_empty() {
         let names: Vec<String> = lift.iter().map(|s| s.to_string()).collect();
-        wrela_driver::build_lifted(pkg, &names, debug).expect("--lift")
+        let kind = wrela_driver::BuildKind { debug, testing: false };
+        wrela_driver::build_lifted(pkg, &names, kind).expect("--lift")
     } else {
         // A test build: with the program's `@testing` exports.
         wrela_driver::build_for_tests(pkg, debug)
@@ -321,7 +322,7 @@ fn edits_round_trip_through_the_source() {
     let mut stale = edits[i].clone();
     stale.value = 0.3;
     assert!(plan(&copy, &[stale]).is_err(), "an edit of a changed file is refused");
-    let out = wrela_driver::build_lifted(&copy, &["shapes".into()], false).unwrap();
+    let out = wrela_driver::build_lifted(&copy, &["shapes".into()], Default::default()).unwrap();
     assert!(!out.has_errors());
     let rebuilt = super::scratch("lift-edit-rebuilt");
     out.write_to(&rebuilt).unwrap();

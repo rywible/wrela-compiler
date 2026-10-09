@@ -108,7 +108,7 @@ pub enum Change {
 pub struct Watcher {
     pkg: PathBuf,
     lift: Vec<String>,
-    debug: bool,
+    kind: crate::BuildKind,
     /// Where the builds go: `out/<version>`.
     out: PathBuf,
     version: u64,
@@ -129,15 +129,20 @@ pub struct Watcher {
 
 impl Watcher {
     /// Builds the program at `pkg` lifted (the packages `lift` names, by default the program's
-    /// own) into `out/1`, and starts watching its files.
-    pub fn start(pkg: &Path, out: &Path, lift: &[String], debug: bool) -> Result<Watcher, String> {
+    /// own), as `kind` says, into `out/1`, and starts watching its files.
+    pub fn start(
+        pkg: &Path,
+        out: &Path,
+        lift: &[String],
+        kind: crate::BuildKind,
+    ) -> Result<Watcher, String> {
         let packages = crate::packages(pkg)?;
         let lift = if lift.is_empty() { vec![packages[0].0.clone()] } else { lift.to_vec() };
         let dirs: Vec<PathBuf> = packages.into_iter().map(|(_, d)| d).collect();
         let mut w = Watcher {
             pkg: pkg.to_path_buf(),
             lift,
-            debug,
+            kind,
             out: out.to_path_buf(),
             version: 0,
             seen: scan(&dirs, &Files::new()),
@@ -189,7 +194,7 @@ impl Watcher {
 
     /// Builds the program as its files are now, into the next version's directory.
     fn build(&mut self) -> Change {
-        let out = match crate::build_lifted(&self.pkg, &self.lift, self.debug) {
+        let out = match crate::build_lifted(&self.pkg, &self.lift, self.kind) {
             Ok(out) => out,
             Err(why) => return Change::Failed(why),
         };
@@ -296,19 +301,19 @@ impl Drop for Server {
     }
 }
 
-/// Builds the program at `pkg` lifted (`lift`, by default its own package) into `out`, serves
-/// it on 127.0.0.1:`port` (0: a free port), and watches its files: the server, or why it
-/// couldn't start. `quiet`: print nothing.
+/// Builds the program at `pkg` lifted (`lift`, by default its own package), as `kind` says,
+/// into `out`, serves it on 127.0.0.1:`port` (0: a free port), and watches its files: the
+/// server, or why it couldn't start. `quiet`: print nothing.
 pub fn serve(
     pkg: &Path,
     out: &Path,
     port: u16,
     lift: &[String],
-    debug: bool,
+    kind: crate::BuildKind,
     quiet: bool,
 ) -> Result<Server, String> {
     let _ = std::fs::remove_dir_all(out);
-    let mut watcher = Watcher::start(pkg, out, lift, debug)?;
+    let mut watcher = Watcher::start(pkg, out, lift, kind)?;
     let (listener, port) = http::listen(port)?;
     let state = Arc::new(State {
         out: out.to_path_buf(),

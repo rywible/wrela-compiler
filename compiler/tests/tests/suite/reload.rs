@@ -189,7 +189,8 @@ fn wrela_run_reloads_the_page_in_place() {
     let pkg = edited("reload-chrome-src", |src| src.to_string() + "\n");
     let out = super::scratch("reload-chrome");
     let server =
-        wrela_driver::live::serve(&pkg, &out, 0, &["main".into()], false, true).expect("serve");
+        wrela_driver::live::serve(&pkg, &out, 0, &["main".into()], Default::default(), true)
+            .expect("serve");
     std::fs::write(
         out.join("1/script.json"),
         r#"[{"frame":10,"type":"key","key":"Space"},{"frame":50,"type":"key","key":"Space"}]"#,

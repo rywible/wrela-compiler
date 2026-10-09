@@ -181,7 +181,8 @@ fn solve(
     .map_err(|e| e.to_string())?;
     std::fs::write(glue_dir.join("main.wrela"), glue(&package, module, function, spec))
         .map_err(|e| e.to_string())?;
-    let out = wrela_driver::build_lifted(&glue_dir, std::slice::from_ref(&package), false)?;
+    let out =
+        wrela_driver::build_lifted(&glue_dir, std::slice::from_ref(&package), Default::default())?;
     let built = glue_dir.join("out");
     crate::write_build(&out, &built)?;
     let report: serde_json::Value = serde_json::from_str(

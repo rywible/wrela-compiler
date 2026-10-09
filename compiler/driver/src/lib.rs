@@ -138,12 +138,21 @@ pub fn build_without_simd(root: &Path) -> Output {
     })
 }
 
+/// What a lifted or watched build is besides lifted: a debug build ([`build_debug`]), a test
+/// build ([`build_for_tests`]), or both.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BuildKind {
+    pub debug: bool,
+    pub testing: bool,
+}
+
 /// A lifted build (language.md §22): [`build`], with each `f32` literal of the packages named
 /// `lift` (the program's own, or its dependencies', by the names their manifests give) read
 /// from a table the program can change while it runs. The build's files include `lift.json`,
 /// which says where each literal is and why any float literal of those packages isn't lifted.
-/// `debug` makes it a debug build. An error if a name isn't one of the program's packages.
-pub fn build_lifted(root: &Path, lift: &[String], debug: bool) -> Result<Output, String> {
+/// `kind` makes it a debug build, a test build, or both. An error if a name isn't one of the
+/// program's packages.
+pub fn build_lifted(root: &Path, lift: &[String], kind: BuildKind) -> Result<Output, String> {
     on_compiler_thread(|| {
         let loaded = load(root);
         if let Some(l) = &loaded.2 {
@@ -155,7 +164,7 @@ pub fn build_lifted(root: &Path, lift: &[String], debug: bool) -> Result<Output,
                 ));
             }
         }
-        let mode = Mode { debug, ..Mode::RELEASE };
+        let mode = Mode { debug: kind.debug, testing: kind.testing, ..Mode::RELEASE };
         Ok(compile_loaded(root, mode, wrela_lower::Roots::of, lift, loaded))
     })
 }

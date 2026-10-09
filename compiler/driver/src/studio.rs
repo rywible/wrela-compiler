@@ -395,7 +395,8 @@ fn write_if_changed(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 pub fn build(pkg: &Path, debug: bool) -> Result<(crate::Output, PathBuf), String> {
     let s = subject(pkg)?;
     let lens = write_lens(pkg, &s).map_err(|e| format!("can't write the lens's program: {e}"))?;
-    let out = crate::build_lifted(&lens, std::slice::from_ref(&s.name), debug)?;
+    let kind = crate::BuildKind { debug, testing: false };
+    let out = crate::build_lifted(&lens, std::slice::from_ref(&s.name), kind)?;
     let page = dir(pkg).join("page");
     if !out.has_errors() {
         let wasm = out.files.iter().find(|(p, _)| p == "game.wasm").map(|(_, w)| w.as_slice());
