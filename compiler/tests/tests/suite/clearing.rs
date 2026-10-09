@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use wrela_abi::manifest::{Compare, DepthState, Stage};
-use wrela_host::{Host, Options, Scripted, Value, parse_script};
+use wrela_host::{GpuTiming, Host, Options, Scripted, Timing, Value, parse_script};
 use wrela_tests::{f32s, page, repo_root, u32s};
 
 /// The output's size, and the scene's (half each way).
@@ -1482,8 +1482,10 @@ fn the_probes_match_a_brute_force_reference() {
 #[test]
 #[ignore = "measure: a GPU time budget, needs Chrome, python3 and a GPU"]
 fn loading_never_submits_more_than_100_ms() {
-    let mut c =
-        Clearing::load_with("clearing-load", &Options { timestamps: true, ..Options::default() });
+    let mut c = Clearing::load_with(
+        "clearing-load",
+        &Options { timing: Timing::Span, ..Options::default() },
+    );
     c.until_ready(0);
     let ready = c.frame;
     let timings = c.host.take_timings().expect("timings");
@@ -1502,7 +1504,7 @@ fn loading_never_submits_more_than_100_ms() {
     drop(c);
     let (_, rel) = built("clearing-load-chrome");
     let run = wrela_tests::ChromeRun {
-        timestamps: true,
+        timing: Timing::Span,
         ..wrela_tests::ChromeRun::new(ready + 5, W, H, 60.0)
     };
     let r = wrela_tests::run_in_chrome_with(&rel, run);
@@ -2160,26 +2162,27 @@ fn path_start(printed: &[(usize, String)]) -> usize {
 
 /// Each system's time (ms) in each of `frames`, from a run's timings: the medians over them.
 fn system_medians(
-    timings: &[(usize, String, f64)],
+    timings: &[GpuTiming],
     frames: std::ops::Range<usize>,
 ) -> Vec<(&'static str, f64, f64)> {
     let unclaimed: BTreeSet<&str> = timings
         .iter()
-        .filter(|(f, l, _)| {
-            frames.contains(f) && !SYSTEMS.iter().any(|(_, _, ls)| ls.contains(&l.as_str()))
+        .filter(|t| {
+            frames.contains(&t.frame)
+                && !SYSTEMS.iter().any(|(_, _, ls)| ls.contains(&t.label.as_str()))
         })
-        .map(|(_, l, _)| l.as_str())
+        .map(|t| t.label.as_str())
         .collect();
     assert!(unclaimed.is_empty(), "timed under labels no system claims: {unclaimed:?}");
     SYSTEMS
         .iter()
         .map(|(name, slice, labels)| {
             let mut per_frame: BTreeMap<usize, f64> = frames.clone().map(|f| (f, 0.0)).collect();
-            for (f, l, ns) in timings {
-                if let Some(t) = per_frame.get_mut(f)
-                    && labels.contains(&l.as_str())
+            for t in timings {
+                if let Some(ms) = per_frame.get_mut(&t.frame)
+                    && labels.contains(&t.label.as_str())
                 {
-                    *t += ns / 1e6;
+                    *ms += t.nanos / 1e6;
                 }
             }
             let v: Vec<f64> = per_frame.into_values().collect();
@@ -2201,10 +2204,10 @@ fn system_medians(
 #[test]
 #[ignore = "measure: the path twice, in serial timing, needs Chrome and a GPU"]
 fn each_system_keeps_its_slice() {
-    let (dir, rel) = built("clearing-systems");
+    let (_, rel) = built("clearing-systems");
     let script = r#"[{"frame":1,"type":"key","key":"Space"}]"#;
     // Native: the path's frames in lockstep, each pass alone.
-    let options = Options { timestamps: true, serial: true, ..Options::default() };
+    let options = Options { timing: Timing::Serial, ..Options::default() };
     let mut c = Clearing::load_with("clearing-systems-native", &options);
     c.script = parse_script(script).expect("a script");
     while c.path_time() < 0.0 {
@@ -2216,21 +2219,12 @@ fn each_system_keeps_its_slice() {
         c.step();
     }
     let to = c.frame as usize;
-    let timings: Vec<(usize, String, f64)> = c
-        .host
-        .take_timings()
-        .expect("timings")
-        .into_iter()
-        .map(|t| (t.frame, t.label, t.nanos))
-        .collect();
-    let native = system_medians(&timings, from..to);
+    let native = system_medians(&c.host.take_timings().expect("timings"), from..to);
     drop(c);
-    let _ = dir;
     // Chrome: the same, each frame as soon as the last, each pass alone.
     let run = wrela_tests::ChromeRun {
         script: Some(script.into()),
-        timestamps: true,
-        serial: true,
+        timing: Timing::Serial,
         saturate: true,
         nohash: true,
         ..wrela_tests::ChromeRun::new(3600 + 120, W, H, 60.0)
@@ -2279,7 +2273,7 @@ fn sixty_frames_a_second_over_the_path_in_chrome() {
         let (_dir, rel) = built(&format!("clearing-frames-{k}"));
         let run = wrela_tests::ChromeRun {
             script: Some(script.into()),
-            timestamps: true,
+            timing: Timing::Span,
             saturate: true,
             nohash: true,
             ..wrela_tests::ChromeRun::new(3600 + 120, W, H, 60.0)
@@ -2302,7 +2296,7 @@ fn sixty_frames_a_second_over_the_path_in_chrome() {
     let (dir, rel) = built("clearing-paced");
     let run = wrela_tests::ChromeRun {
         script: Some(script.into()),
-        timestamps: true,
+        timing: Timing::Span,
         paced: true,
         nohash: true,
         ..wrela_tests::ChromeRun::new(3600 + 120, W, H, 60.0)

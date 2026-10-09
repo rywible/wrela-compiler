@@ -8,7 +8,7 @@
 use crate::built;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
-use wrela_host::{CpuBuild, CpuHost, Host, RunResult, Value};
+use wrela_host::{CpuBuild, CpuHost, Host, RunResult, Timing, Value};
 use wrela_tests::spike01::{HARNESS_D, fixture, fixture_path, harness, params_seed1};
 use wrela_tests::{files_under, median, percentile, repo_root};
 
@@ -525,7 +525,7 @@ fn realize_herd(host: &mut wrela_host::Host, cell: f32) -> (Vec<Ours>, Vec<f64>)
 #[ignore = "measure: needs a GPU and bun"]
 fn realization_matches_the_spikes() {
     let dir = built("herd-realize");
-    let options = wrela_host::Options { timestamps: true, ..wrela_host::Options::default() };
+    let options = wrela_host::Options { timing: Timing::Span, ..wrela_host::Options::default() };
     let mut host = wrela_host::Host::load_with(&dir, &options).expect("load herd-realize");
     let spike = wrela_tests::spike01::Spike::new();
     let recorded_live = [2156.0, 4700.0, 8210.0, 18603.0];
@@ -702,7 +702,8 @@ fn still(
 ) -> (Host, RunResult) {
     let times: Vec<f32> = (0..frames).map(|i| wrela_host::frame_time(i, 60.0)).collect();
     let script = wrela_host::parse_script(script).expect("a script");
-    let options = wrela_host::Options { timestamps, ..wrela_host::Options::default() };
+    let timing = if timestamps { Timing::Span } else { Timing::Off };
+    let options = wrela_host::Options { timing, ..wrela_host::Options::default() };
     let mut host = Host::load_with(herd(), &options).expect("load the herd");
     let run = host.run_frames_with(&times, width, height, &script).expect("run the herd");
     (host, run)
@@ -873,15 +874,15 @@ fn paced_herd(name: &str, script: &str) -> (PathBuf, wrela_tests::BrowserRun, Ve
     let run = wrela_tests::ChromeRun {
         script: Some(script.into()),
         workers: 8,
-        timestamps: true,
+        timing: Timing::Span,
         paced: true,
         nohash: true,
         ..wrela_tests::ChromeRun::new(600, 1920, 1080, 60.0)
     };
     let chrome = wrela_tests::run_in_chrome_with(&rel, run);
     let mut per_frame = std::collections::BTreeMap::new();
-    for (f, _, ns) in &chrome.timings {
-        *per_frame.entry(*f).or_insert(0.0) += ns / 1e6;
+    for t in &chrome.timings {
+        *per_frame.entry(t.frame).or_insert(0.0) += t.nanos / 1e6;
     }
     // The program's `init` records the shadow map's first clear before frame 0: not a frame's.
     let ms: Vec<f64> = per_frame.iter().filter(|(f, _)| **f > 0).map(|(_, m)| *m).collect();

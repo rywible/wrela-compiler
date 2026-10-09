@@ -3,7 +3,7 @@
 
 import { Checker, limitsOf } from "./check.ts";
 import { errorMessage } from "./errors.ts";
-import { type BuiltPipeline, buildPipelines, GpuExecutor, type ScreenTarget } from "./gpu.ts";
+import { buildPipelines, GpuExecutor, type PipelineCache, type ScreenTarget, type Timing } from "./gpu.ts";
 import { type Manifest, parseManifest } from "./manifest.ts";
 import { type Io, Program, type ProgramOptions } from "./program.ts";
 import type { Bytes } from "./stream.ts";
@@ -91,6 +91,17 @@ export function browserIo(base: string, fetchFn: Fetch = (url, init) => fetch(ur
   };
 }
 
+/** How a program's GPU side is made. */
+export interface GpuOptions {
+  /** Whether passes and dispatches are timed, and how. */
+  timing?: Timing;
+  /** Called with how long building every pipeline took (ms). */
+  onPipelines?: (ms: number) => void;
+  /** Hot reload: the pipelines built so far, which the build keeps where they're the same
+   * (`buildPipelines`). */
+  cache?: PipelineCache | undefined;
+}
+
 /** Builds every pipeline while the WASM compiles, then instantiates the program with the
  * decoder behind its import. */
 export async function startProgram(
@@ -98,18 +109,15 @@ export async function startProgram(
   build: Build,
   screen: ScreenTarget,
   options: ProgramOptions = {},
-  timestamps = false,
-  onPipelines?: (ms: number) => void,
-  serial = false,
-  cache?: Map<string, Promise<BuiltPipeline>>,
+  gpu: GpuOptions = {},
 ): Promise<Program> {
   const started = performance.now();
-  const built = buildPipelines(device, build.manifest, build.shaders, cache).then((p) => {
-    onPipelines?.(performance.now() - started);
+  const built = buildPipelines(device, build.manifest, build.shaders, gpu.cache).then((p) => {
+    gpu.onPipelines?.(performance.now() - started);
     return p;
   });
   const [pipelines, compiled] = await Promise.all([built, Program.compile(build.wasm)]);
-  const executor = new GpuExecutor(device, pipelines, screen, timestamps, serial);
+  const executor = new GpuExecutor(device, pipelines, screen, gpu.timing);
   const checker = new Checker(build.manifest, limitsOf(device.limits));
   return Program.instantiate(compiled, checker, executor, options);
 }

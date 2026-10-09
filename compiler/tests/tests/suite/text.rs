@@ -4,6 +4,7 @@
 //! glyphs at the same places, and its drawing is timed.
 
 use std::path::Path;
+use wrela_host::{GpuTiming, Timing};
 use wrela_wfont::{Font, Options};
 
 const FONTS: [(&str, &str); 2] = [
@@ -166,8 +167,9 @@ fn text_matches_a_reference_rasterizer() {
 }
 
 /// The median of each frame's screen-pass time, from timings of label `label`.
-fn median_pass(timings: &[(usize, String, f64)], label: &str) -> f64 {
-    let ns: Vec<f64> = timings.iter().filter(|t| t.1.contains(label)).map(|t| t.2).collect();
+fn median_pass(timings: &[GpuTiming], label: &str) -> f64 {
+    let ns: Vec<f64> =
+        timings.iter().filter(|t| t.label.contains(label)).map(|t| t.nanos).collect();
     assert!(!ns.is_empty(), "no `{label}` timings");
     wrela_tests::median(&ns)
 }
@@ -179,7 +181,7 @@ fn median_pass(timings: &[(usize, String, f64)], label: &str) -> f64 {
 fn a_screen_of_code_draws_within_half_a_millisecond() {
     const FRAMES: u32 = 30;
     let (dir, rel) = wrela_tests::page("ui/tests/code", "code-screen");
-    let options = wrela_host::Options { timestamps: true, ..wrela_host::Options::default() };
+    let options = wrela_host::Options { timing: Timing::Span, ..wrela_host::Options::default() };
     let mut host = wrela_host::Host::load_with(&dir, &options).expect("load");
     let times: Vec<f32> = (0..FRAMES).map(|i| wrela_host::frame_time(i, 60.0)).collect();
     let native = host.run_frames(&times, 1920, 1080).expect("run");
@@ -188,15 +190,13 @@ fn a_screen_of_code_draws_within_half_a_millisecond() {
         other => panic!("glyphs returned {other:?}"),
     };
     assert!(glyphs >= 10_000, "only {glyphs} glyphs");
-    let native: Vec<(usize, String, f64)> =
-        native.timings.iter().map(|t| (t.frame, t.label.clone(), t.nanos)).collect();
     drop(host); // the GPU lock, which Chrome's run takes next
     let run = wrela_tests::ChromeRun {
-        timestamps: true,
+        timing: Timing::Span,
         ..wrela_tests::ChromeRun::new(FRAMES, 1920, 1080, 60.0)
     };
     let chrome = wrela_tests::run_in_chrome_with(&rel, run).timings;
-    let (n, c) = (median_pass(&native, "screen"), median_pass(&chrome, "screen"));
+    let (n, c) = (median_pass(&native.timings, "screen"), median_pass(&chrome, "screen"));
     println!(
         "{glyphs} glyphs at 1920x1080: native {:.3} ms, Chrome {:.3} ms (medians of {FRAMES})",
         n / 1e6,

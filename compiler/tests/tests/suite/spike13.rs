@@ -265,7 +265,8 @@ fn the_gpu_certificate_is_small_quick_and_right() {
         }
     }
     let start = std::time::Instant::now();
-    let options = wrela_host::Options { timestamps: true, ..wrela_host::Options::default() };
+    let options =
+        wrela_host::Options { timing: wrela_host::Timing::Span, ..wrela_host::Options::default() };
     let mut gpu = wrela_host::Host::load_with(&cold, &options).expect("load");
     let load = start.elapsed().as_secs_f64();
     println!("load, with pipeline compilation, cold: {load:.2} s");

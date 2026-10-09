@@ -7,7 +7,7 @@ use crate::common::{self, TempDir};
 
 use wrela_abi::hash::StateHash;
 use wrela_abi::stream::{self, Binding, Encoder, Pass, TextureFormat};
-use wrela_host::{Error, Host, Options, Value, frame_time, image};
+use wrela_host::{Error, Host, Options, Timing, Value, frame_time, image};
 
 const SEEDS: [u32; 4] = [0xff30_1810, 0xff20_70e0, 0xff40_1030, 0xff60_c0f0];
 const STEP: u32 = 0x0002_0408;
@@ -254,7 +254,7 @@ fn times_dispatches_and_passes_with_timestamps() {
     };
     let frames: Vec<_> = (0..5).map(frame).collect();
     let (_dir, mut host) =
-        store_host("timestamps", &frames, &Options { timestamps: true, ..Options::default() });
+        store_host("timestamps", &frames, &Options { timing: Timing::Span, ..Options::default() });
     let run = host.run_frames(&[0.0; 5], 64, 64).expect("runs");
     assert_eq!(run.timings.len(), 15, "{:?}", run.timings);
     for (i, t) in run.timings.iter().enumerate() {
@@ -277,7 +277,7 @@ fn times_more_passes_than_one_query_set_holds() {
     let (_dir, mut host) = store_host(
         "many-timestamps",
         &[vec![e.finish()]],
-        &Options { timestamps: true, ..Options::default() },
+        &Options { timing: Timing::Span, ..Options::default() },
     );
     let run = host.run_frames(&[0.0], 4, 4).expect("runs");
     assert_eq!(run.timings.len(), 300);

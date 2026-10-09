@@ -3,7 +3,7 @@
 //! same frame as the native host (a mean within 0.5/255) and the same state hash.
 //! `cargo test -p wrela-tests --test suite renderer:: -- --ignored`.
 
-use wrela_host::{Host, RunResult, image};
+use wrela_host::{GpuTiming, Host, RunResult, Timing, image};
 use wrela_tests::{page, run_in_chrome};
 
 const SIZE: u32 = 128;
@@ -244,19 +244,20 @@ fn the_browser_covers_a_domain_as_the_native_host_does() {
 fn both_hosts_time_each_pass() {
     let (dir, rel) = page("compiler/tests/renderer", "renderer-timings");
     let run = wrela_tests::ChromeRun {
-        timestamps: true,
+        timing: Timing::Span,
         ..wrela_tests::ChromeRun::new(2, SIZE, SIZE, 60.0)
     };
     let browser = wrela_tests::run_in_chrome_with(&rel, run).timings;
-    let options = wrela_host::Options { timestamps: true, ..wrela_host::Options::default() };
+    let options = wrela_host::Options { timing: Timing::Span, ..wrela_host::Options::default() };
     let mut host = Host::load_with(&dir, &options).expect("load");
     let native = host.run_frames(&[0.0, 1.0 / 60.0], SIZE, SIZE).expect("run").timings;
-    let want: Vec<(usize, String)> = native.iter().map(|t| (t.frame, t.label.clone())).collect();
-    let got: Vec<(usize, String)> = browser.iter().map(|(f, l, _)| (*f, l.clone())).collect();
-    assert!(!want.is_empty(), "the native host timed no passes");
-    assert_eq!(got, want, "the passes each host timed");
-    assert!(browser.iter().all(|(_, _, n)| n.is_finite() && *n >= 0.0), "{browser:?}");
-    assert!(browser.iter().any(|(_, _, n)| *n > 0.0), "every pass took no time: {browser:?}");
+    let passes = |ts: &[GpuTiming]| -> Vec<(usize, String)> {
+        ts.iter().map(|t| (t.frame, t.label.clone())).collect()
+    };
+    assert!(!native.is_empty(), "the native host timed no passes");
+    assert_eq!(passes(&browser), passes(&native), "the passes each host timed");
+    assert!(browser.iter().all(|t| t.nanos.is_finite() && t.nanos >= 0.0), "{browser:?}");
+    assert!(browser.iter().any(|t| t.nanos > 0.0), "every pass took no time: {browser:?}");
 }
 
 /// Indexed indirect draws, each pipeline with the cull mode and depth bias its draw states
@@ -356,13 +357,11 @@ const PIECES: [&str; 3] = ["shade", "simulate", "blur"];
 
 /// Each piece's median GPU time (ms) over a run's second half, by label: the GPU's clocks
 /// settle over its first frames (the same kernel took 8 ms, then 2 ms from frame 20 on).
-fn medians(timings: &[(usize, String, f64)]) -> std::collections::BTreeMap<String, f64> {
-    let half = timings.iter().map(|t| t.0).max().unwrap_or(0) / 2;
+fn medians(timings: &[GpuTiming]) -> std::collections::BTreeMap<String, f64> {
+    let half = timings.iter().map(|t| t.frame).max().unwrap_or(0) / 2;
     let mut by: std::collections::BTreeMap<String, Vec<f64>> = Default::default();
-    for (f, l, ns) in timings {
-        if *f >= half {
-            by.entry(l.clone()).or_default().push(ns / 1e6);
-        }
+    for t in timings.iter().filter(|t| t.frame >= half) {
+        by.entry(t.label.clone()).or_default().push(t.nanos / 1e6);
     }
     by.into_iter().map(|(l, v)| (l, wrela_tests::median(&v))).collect()
 }
@@ -398,57 +397,48 @@ fn each_pass_times_as_it_does_alone_in_both_hosts() {
     let (dir, rel) = page("compiler/tests/timing", "timing");
     let frames = 160;
     let times: Vec<f32> = (0..frames).map(|i| wrela_host::frame_time(i, 1000.0)).collect();
-    let native = |script: &str, serial: bool| {
-        let options = wrela_host::Options { timestamps: true, serial, ..Default::default() };
+    let native = |script: &str, timing: Timing| {
+        let options = wrela_host::Options { timing, ..Default::default() };
         let mut host = Host::load_with(&dir, &options).expect("load");
         let script = wrela_host::parse_script(script).expect("a script");
-        let t = host.run_frames_with(&times, 256, 256, &script).expect("run").timings;
-        let tuples: Vec<(usize, String, f64)> =
-            t.iter().map(|t| (t.frame, t.label.clone(), t.nanos)).collect();
-        (medians(&tuples), wrela_host::frame_spans(&t), t)
+        host.run_frames_with(&times, 256, 256, &script).expect("run").timings
     };
-    let chrome = |script: &str, serial: bool| {
+    let chrome = |script: &str, timing: Timing| {
         let run = wrela_tests::ChromeRun {
-            timestamps: true,
-            serial,
+            timing,
             script: Some(script.into()),
             ..wrela_tests::ChromeRun::new(frames, 256, 256, 1000.0)
         };
-        let r = wrela_tests::run_in_chrome_with(&rel, run);
-        (medians(&r.timings), r.spans, r.timings)
+        wrela_tests::run_in_chrome_with(&rel, run).timings
     };
     let mut report = Vec::new();
     for (h, host) in ["the native host", "Chrome"].into_iter().enumerate() {
-        let run = |script: &str, serial: bool| {
-            let (m, spans, timings) = if h == 0 {
-                let (m, s, t) = native(script, serial);
-                (m, s, t.into_iter().map(|t| (t.frame, t.label, t.nanos)).collect())
-            } else {
-                chrome(script, serial)
-            };
-            (m, spans, timings)
+        let run = |script: &str, timing: Timing| {
+            let timings = if h == 0 { native(script, timing) } else { chrome(script, timing) };
+            (medians(&timings), wrela_host::frame_spans(&timings), timings)
         };
         // A span for every frame, at least as long as any piece in it; each piece named.
-        let (_, spans, timings) = run("[]", false);
+        let (_, spans, timings) = run("[]", Timing::Span);
         assert_eq!(spans.len(), frames as usize, "{host}: a span for every frame");
         for (f, span) in &spans {
-            let longest = timings.iter().filter(|t| t.0 == *f).map(|t| t.2).fold(0.0, f64::max);
+            let longest =
+                timings.iter().filter(|t| t.frame == *f).map(|t| t.nanos).fold(0.0, f64::max);
             assert!(
                 *span >= longest / 1e6 - 1e-6,
                 "{host}, frame {f}: span {span} ms, a piece {longest} ns"
             );
         }
         for p in PIECES {
-            assert!(timings.iter().any(|t| t.1 == p), "{host} timed no `{p}`");
+            assert!(timings.iter().any(|t| t.label == p), "{host} timed no `{p}`");
         }
         let mut serial: BTreeMap<String, f64> = BTreeMap::new();
         let mut alone: BTreeMap<String, f64> = BTreeMap::new();
         for _ in 0..2 {
             for (k, piece) in PIECES.iter().enumerate() {
-                let (s, _, _) = run("[]", true);
+                let (s, _, _) = run("[]", Timing::Serial);
                 let e = serial.entry(piece.to_string()).or_insert(f64::INFINITY);
                 *e = e.min(s[*piece]);
-                let (a, _, _) = run(&press(&format!("Digit{}", k + 1)), true);
+                let (a, _, _) = run(&press(&format!("Digit{}", k + 1)), Timing::Serial);
                 let e = alone.entry(piece.to_string()).or_insert(f64::INFINITY);
                 *e = e.min(a[*piece]);
             }

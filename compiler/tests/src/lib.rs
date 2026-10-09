@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use wrela_diag::{Diagnostic, Edit, FileId};
-use wrela_host::{CpuHost, Host, TickLog, Value, map_read};
+use wrela_host::{CpuHost, GpuTiming, Host, TickLog, Timing, Value, map_read};
 
 /// SplitMix64, for tests' random inputs.
 pub use wrela_grammar::rng::Rng;
@@ -423,11 +423,11 @@ pub struct BrowserRun {
     pub worker_chunks: u32,
     /// The voice's samples, when [`ChromeRun::audio`] asked for them.
     pub audio: Vec<f32>,
-    /// Each pass's GPU time, when [`ChromeRun::timestamps`] asked for them: its frame, its
-    /// label (as the native host's `GpuTiming`) and nanoseconds.
-    pub timings: Vec<(usize, String, f64)>,
-    /// Each frame's span (ms), when [`ChromeRun::timestamps`] asked for them: from its first
-    /// timed pass's start to its last's end.
+    /// Each pass's GPU time, when [`ChromeRun::timing`] asked for them, as the native host
+    /// records them.
+    pub timings: Vec<GpuTiming>,
+    /// Each frame's span (ms), when [`ChromeRun::timing`] asked for them: from its first timed
+    /// pass's start to its last's end ([`wrela_host::frame_spans`]).
     pub spans: Vec<(usize, f64)>,
     /// The ticker's ticks, when the program started one.
     pub ticks: Option<ChromeTicks>,
@@ -462,11 +462,9 @@ pub struct ChromeRun {
     pub workers: u32,
     /// Quanta of the program's voice to render offline (0: none).
     pub audio: u32,
-    /// Time each pass on the GPU.
-    pub timestamps: bool,
-    /// With `timestamps`, each pass and dispatch run alone, one at a time (`timestamps=2`), so
-    /// each time is its own.
-    pub serial: bool,
+    /// Time each pass on the GPU (`timestamps=1`), or each pass and dispatch run alone, one at a
+    /// time, so each time is its own (`timestamps=2`).
+    pub timing: Timing,
     /// A script of input events (runtime/abi `input`), which the run writes beside the page.
     pub script: Option<String>,
     /// Pointer events the page sends through the DOM while the frames run (0: none):
@@ -508,8 +506,7 @@ impl ChromeRun {
             fps,
             workers,
             audio,
-            timestamps,
-            serial,
+            timing,
             script,
             latency,
             keylatency,
@@ -525,9 +522,14 @@ impl ChromeRun {
         );
         // Test mode takes no zeros: a parameter that's off is left out.
         let flag = |on: &bool| u32::from(*on);
+        let timestamps = match timing {
+            Timing::Off => 0,
+            Timing::Span => 1,
+            Timing::Serial => 2,
+        };
         for (name, n) in [
             ("audio", *audio),
-            ("timestamps", flag(timestamps) * (1 + flag(serial))),
+            ("timestamps", timestamps),
             ("latency", *latency),
             ("keylatency", *keylatency),
             ("paced", flag(paced)),
@@ -569,6 +571,7 @@ pub fn run_in_chrome_with(rel: &str, run: ChromeRun) -> BrowserRun {
     let results = repo_root().join(rel).join("results");
     let frames = result_json(&results, "frames.json");
     let log = std::fs::read_to_string(results.join("log.txt")).expect("log.txt");
+    let timings = if run.timing == Timing::Off { Vec::new() } else { timings(&results) };
     BrowserRun {
         hash: std::fs::read_to_string(results.join("hash.txt")).expect("hash.txt").trim().into(),
         frame: std::fs::read(results.join("frame.rgba")).expect("frame.rgba"),
@@ -582,8 +585,8 @@ pub fn run_in_chrome_with(rel: &str, run: ChromeRun) -> BrowserRun {
         } else {
             Vec::new()
         },
-        timings: if run.timestamps { timings(&results) } else { Vec::new() },
-        spans: if run.timestamps { spans(&results) } else { Vec::new() },
+        spans: wrela_host::frame_spans(&timings),
+        timings,
         ticks: chrome_ticks(&results),
         began_ms: frames["began_ms"].as_array().expect("began_ms").iter().map(number).collect(),
         printed: frames["printed_in"]
@@ -621,33 +624,20 @@ fn chrome_ticks(results: &Path) -> Option<ChromeTicks> {
     })
 }
 
-/// Each pass's GPU time in a test-mode run's `results/` (its `timings.json`): its frame, its
-/// label (as the native host's `GpuTiming`) and nanoseconds.
-pub fn timings(results: &Path) -> Vec<(usize, String, f64)> {
+/// Each pass's GPU time in a test-mode run's `results/` (its `timings.json`), as the native
+/// host records them.
+pub fn timings(results: &Path) -> Vec<GpuTiming> {
     let v = result_json(results, "timings.json");
     let entries = v.as_array().expect("an array").iter();
     entries
-        .map(|t| {
-            let frame = t["frame"].as_u64().expect("a frame") as usize;
-            let label = t["label"].as_str().expect("a label").to_string();
-            (frame, label, t["nanos"].as_f64().expect("nanoseconds"))
+        .map(|t| GpuTiming {
+            frame: t["frame"].as_u64().expect("a frame") as usize,
+            label: t["label"].as_str().expect("a label").to_string(),
+            nanos: number(&t["nanos"]),
+            start: number(&t["start"]),
+            end: number(&t["end"]),
         })
         .collect()
-}
-
-/// Each frame's span in a test-mode run's `results/` (its `timings.json`): from its first
-/// timed pass's start to its last's end, in ms, by frame.
-pub fn spans(results: &Path) -> Vec<(usize, f64)> {
-    let v = result_json(results, "timings.json");
-    let mut by_frame: BTreeMap<usize, (f64, f64)> = BTreeMap::new();
-    for t in v.as_array().expect("an array") {
-        let frame = t["frame"].as_u64().expect("a frame") as usize;
-        let (a, b) = (number(&t["start"]), number(&t["end"]));
-        let e = by_frame.entry(frame).or_insert((a, b));
-        e.0 = e.0.min(a);
-        e.1 = e.1.max(b);
-    }
-    by_frame.into_iter().map(|(f, (a, b))| (f, (b - a) / 1e6)).collect()
 }
 
 /// Runs the page another server serves at `url` (the studio server) in headless Chrome

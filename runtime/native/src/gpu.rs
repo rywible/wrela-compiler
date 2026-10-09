@@ -29,6 +29,7 @@
 //! Commands arrive decoded, sequenced and checked ([`wrela_abi::check`]); a wgpu validation error
 //! here is a host bug, reported as [`Error::Gpu`].
 
+use crate::Timing;
 use crate::error::{Error, Result};
 use crate::program::Executor;
 use std::collections::{HashMap, HashSet};
@@ -74,18 +75,6 @@ pub fn frame_spans(timings: &[GpuTiming]) -> Vec<(usize, f64)> {
         e.1 = e.1.max(t.end);
     }
     spans.into_iter().map(|(f, (a, b))| (f, (b - a) / 1e6)).collect()
-}
-
-/// Whether passes and dispatches are timed, and how.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Timing {
-    #[default]
-    Off,
-    /// Each timed as it runs, beside the others (a frame's span is its first start to its last
-    /// end).
-    Span,
-    /// Each submitted and waited for alone: its own time, with nothing beside it.
-    Serial,
 }
 
 /// A texture format in wgpu's spelling.
@@ -1587,8 +1576,9 @@ impl Timer {
         (self.pending.len() as u32 - 1) * 2
     }
 
-    /// Reads back the timestamps of the submission just made. This waits for the GPU at every
-    /// flush, so the timing mode measures GPU durations, not throughput.
+    /// Reads back the timestamps of the submissions made since the last call; waits for the GPU.
+    /// The span mode calls it at every flush, so it measures GPU durations, not throughput; the
+    /// serial mode, which waits after each pass anyway, once a frame.
     fn collect(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
         let times = read_timestamp_spans(device, queue, &self.queries, self.pending.len() as u32)?;
         for ((frame, label), (start, end)) in self.pending.drain(..).zip(times) {
@@ -1616,7 +1606,7 @@ pub fn read_timestamps(
 
 /// [`read_timestamps`]' passes' starts and ends, in nanoseconds on the GPU's clock (an end
 /// before its start, as a clock that wrapped, is taken as the start).
-pub fn read_timestamp_spans(
+fn read_timestamp_spans(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     queries: &wgpu::QuerySet,

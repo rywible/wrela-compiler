@@ -170,15 +170,15 @@ fn ticks_alone(args: &Args) -> Result<(), Failure> {
 
 #[cfg(feature = "gpu")]
 fn frames(args: &Args) -> Result<(), Failure> {
-    use wrela_host::{Host, Options};
+    use wrela_host::{Host, Options, Timing};
     let script = read_script(args)?;
-    let options = Options {
-        timestamps: args.timestamps,
-        serial: args.serial,
-        workers: args.workers,
-        defer_init: true,
-        ..Options::default()
+    let timing = match (args.timestamps, args.serial) {
+        (true, true) => Timing::Serial,
+        (true, false) => Timing::Span,
+        // --serial says how --timestamps times: alone, it asks for nothing.
+        (false, _) => Timing::Off,
     };
+    let options = Options { timing, workers: args.workers, defer_init: true, ..Options::default() };
     let mut host = Host::load_with(&args.dir, &options)?;
     let logging = args.log.is_some();
     host.want_hashes(logging);

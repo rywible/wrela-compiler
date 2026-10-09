@@ -4,7 +4,7 @@
 //! alternating, after a warm-up round that isn't counted; the median of the rounds' ratios.
 
 use crate::built;
-use wrela_host::{CpuBuild, Host, Options, Value};
+use wrela_host::{CpuBuild, Host, Options, Timing, Value};
 use wrela_tests::median;
 
 const ROUNDS: usize = 15;
@@ -59,7 +59,7 @@ fn a_closure_query_costs_what_the_hand_written_loop_does_on_the_cpu() {
 #[test]
 #[ignore = "measure: a GPU time ratio; needs a GPU"]
 fn a_closure_query_costs_what_the_hand_written_loop_does_on_the_gpu() {
-    let options = Options { timestamps: true, ..Options::default() };
+    let options = Options { timing: Timing::Span, ..Options::default() };
     let mut host = Host::load_with(built("queries"), &options).expect("load");
     // A warm-up frame, then the rounds: each frame dispatches both kernels.
     host.run_frames(&[0.0], 16, 16).expect("warm up");

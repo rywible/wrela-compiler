@@ -24,7 +24,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
-use wrela_host::{CpuHost, Host, Value};
+use wrela_host::{CpuHost, Host, Timing, Value};
 use wrela_tests::{median, one_f32, one_u32, percentile, repo_root};
 
 /// The lens's screen in these runs.
@@ -1178,7 +1178,7 @@ fn chrome_session_with(
         cpu: times["cpu_ms"].as_array().unwrap().iter().map(|t| t.as_f64().unwrap()).collect(),
         gpu: wrela_tests::timings(&results)
             .into_iter()
-            .map(|(f, l, ns)| (f, l, ns / 1e6))
+            .map(|t| (t.frame, t.label, t.nanos / 1e6))
             .collect(),
     }
 }
@@ -1875,7 +1875,7 @@ fn lifted_sheets_match(
     let normal = normal_lens(&subject, "ac4-normal");
     // The sheet, and the GPU time of 20 draws of it (a change of mode each).
     let draw = |dir: &Path| -> (Vec<u8>, f64) {
-        let options = wrela_host::Options { timestamps: true, ..Default::default() };
+        let options = wrela_host::Options { timing: Timing::Span, ..Default::default() };
         let mut host = Host::load_with(dir, &options).expect("the lens loads");
         host.frame(0.0, SCREEN.0, SCREEN.1).expect("a frame");
         let sheet = host.read_screen().expect("the screen");

@@ -7,11 +7,11 @@ import { MAX_WORKERS, SCREEN_FORMAT } from "./abi.gen.ts";
 import { LIMIT_SOURCES } from "./check.ts";
 import { errorMessage } from "./errors.ts";
 import { fitSize, frameSeconds, VisibleClock } from "./frame.ts";
-import { alignTo, type BuiltPipeline, type GpuExecutor } from "./gpu.ts";
+import { alignTo, type GpuExecutor, type PipelineCache, type Timing } from "./gpu.ts";
 import { arrivals, epochNow, InputRing, parseScript, type Scripted } from "./input.ts";
 import { browserIo, type Build, loadBuild, startProgram } from "./loader.ts";
 import { Live } from "./live.ts";
-import { type Program, runWorker, type SpawnWorker } from "./program.ts";
+import { type Program, type ProgramOptions, runWorker, type SpawnWorker } from "./program.ts";
 import type { FromTicker, FromWorker, Loaded, Replay, TickerOptions, TickerStart, TickReport, ToWorker, VoiceOptions } from "./messages.ts";
 import { encodePng } from "./png.ts";
 import { frameTime, holdFor, loaded, putResult, sleepUntil, type TestParams } from "./testmode.ts";
@@ -136,9 +136,8 @@ function tickerStarter(wasm: Uint8Array, settings: TickSettings, replay: Replay 
 
 // ---- Hot reload ----
 
-/** The pipelines built so far, by their manifest entry and WGSL: a new build keeps those that
- * are the same. */
-const pipelineCache = new Map<string, Promise<BuiltPipeline>>();
+/** The running build's pipelines: the next build keeps those that are the same. */
+const pipelineCache: PipelineCache = new Map();
 
 /** The helper threads the running program started: a hot reload stops them. */
 const helpers: Worker[] = [];
@@ -149,6 +148,20 @@ interface Carried {
   kept: Uint8Array;
   input: Uint8Array[];
   replay: Replay | null;
+}
+
+/** The options both ways of running give the program of build `b`: its requests, helpers,
+ * voice and ticker (with `ticks`' settings), and what the build it replaces, if it does, hands
+ * on (`carried`). */
+function programOptions(b: Build, ticks: TickSettings, carried: Carried | null): ProgramOptions {
+  return {
+    io: browserIo(base),
+    spawnWorker,
+    startVoice,
+    startTicker: tickerStarter(b.wasm, ticks, carried?.replay ?? null),
+    kept: carried?.kept,
+    input: carried?.input,
+  };
 }
 
 /** Stops `old` for the build at `base` (hot reload): its ticker stops and reports its ticks,
@@ -199,19 +212,8 @@ async function run(canvas: OffscreenCanvas, device: GPUDevice, build: Build, liv
       device,
       b,
       screen,
-      {
-        io: browserIo(base),
-        workers: normalWorkers(),
-        spawnWorker,
-        startVoice,
-        startTicker: tickerStarter(b.wasm, NORMAL_TICKS, carried?.replay ?? null),
-        kept: carried?.kept,
-        input: carried?.input,
-      },
-      false,
-      undefined,
-      false,
-      pipelineCache,
+      { ...programOptions(b, NORMAL_TICKS, carried), workers: normalWorkers() },
+      { cache: live ? pipelineCache : undefined },
     );
   let program = await start(build, null);
   ticker.control.go(TickerMode.CLOCK);
@@ -348,36 +350,34 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
       }
     },
   };
+  // `timestamps=1` times each pass; `timestamps=2` runs each alone too (testmode.ts).
+  const timing: Timing = params.timestamps === 2 ? "serial" : params.timestamps > 0 ? "span" : "off";
   const start = (b: Build, carried: Carried | null) =>
     startProgram(
       device,
       b,
       target,
       {
+        ...programOptions(b, { script, hashes, timing: true, delay: params.tickdelay }, carried),
         hash: hashes,
-        io: browserIo(base),
         workers: params.workers,
-        spawnWorker,
-        startVoice,
-        startTicker: tickerStarter(b.wasm, { script, hashes, timing: true, delay: params.tickdelay }, carried?.replay ?? null),
         tickHashes: hashes,
         onPrint: (line) => {
           printed.push(line);
           printed_in.push(frameNow);
         },
-        kept: carried?.kept,
-        input: carried?.input,
       },
-      params.timestamps > 0,
-      (ms) => {
-        pipelinesMs = ms;
+      {
+        timing,
+        onPipelines: (ms) => {
+          pipelinesMs = ms;
+        },
+        cache: live ? pipelineCache : undefined,
       },
-      params.timestamps === 2,
-      pipelineCache,
     );
   let program = await start(salted, null);
   let executor = program.executor as GpuExecutor;
-  if (params.timestamps > 0 && !executor.timed) throw new GpuError("the test asks for timestamps, but this device has no timestamp queries");
+  if (timing !== "off" && !executor.timed) throw new GpuError("the test asks for timestamps, but this device has no timestamp queries");
   let hz = program.ticker?.hz ?? 0;
   const schedule = params.paced > 0 ? TickerMode.CLOCK : TickerMode.LOCKSTEP;
   // The latency test: when each frame started, and which events (by when they were sent) it got.
@@ -433,12 +433,14 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
       if (params.framedelay > 0) holdFor(params.framedelay);
       cpu.push(performance.now() - began);
     });
-    // The serial timing mode runs the frame's passes now, one at a time.
-    draining = draining.then(() => scoped(device, () => executor.drain()));
-    draining.catch(fatal);
-    // At most two frames' passes waiting to run: recording stays near the GPU.
-    drains.push(draining);
-    if (drains.length > 2) await drains.shift()!.catch(() => {});
+    if (timing === "serial") {
+      // The serial timing mode runs the frame's passes now, one at a time.
+      draining = draining.then(() => scoped(device, () => executor.drain()));
+      draining.catch(fatal);
+      // At most two frames' passes waiting to run: recording stays near the GPU.
+      drains.push(draining);
+      if (drains.length > 2) await drains.shift()!.catch(() => {});
+    }
     if (params.saturate > 0) {
       inFlight.push(device.queue.onSubmittedWorkDone());
       if (inFlight.length > 2) await inFlight.shift();
@@ -465,7 +467,7 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
     putResult(base, "workers.txt", `${program.workerChunks()}\n`),
     putResult(base, "log.txt", printed.map((l) => `${l}\n`).join("")),
     putResult(base, "frames.json", JSON.stringify({ cpu_ms: cpu, began_ms, printed_in })),
-    params.timestamps > 0 ? executor.timings().then((t) => putResult(base, "timings.json", JSON.stringify(t))) : null,
+    timing !== "off" ? executor.timings().then((t) => putResult(base, "timings.json", JSON.stringify(t))) : null,
     params.salt > 0 ? putResult(base, "pipelines.json", JSON.stringify({ ms: pipelinesMs, count: build.manifest.pipelines.length })) : null,
     putResult(base, "memory.json", JSON.stringify({ gpu: executor.memory, wasm: program.memoryBytes })),
   ]);

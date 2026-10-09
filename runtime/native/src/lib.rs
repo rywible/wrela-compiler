@@ -36,9 +36,7 @@ mod shared;
 pub use cache::compiled_code_prefix;
 pub use error::{Error, Result};
 #[cfg(feature = "gpu")]
-pub use gpu::{
-    GpuTiming, Timing, frame_spans, map_read, open_device, read_timestamp_spans, read_timestamps,
-};
+pub use gpu::{GpuTiming, frame_spans, map_read, open_device, read_timestamps};
 pub use program::{Failure, PostHandler, Ticked, Value};
 pub use wrela_abi::input::{Event, Scripted, parse_script};
 pub use wrela_abi::ticks::{TickLog, frame_time, lockstep_ticks};
@@ -51,18 +49,27 @@ use std::path::Path;
 use std::path::PathBuf;
 use wrela_abi::Manifest;
 
+/// Whether passes and dispatches are timed with GPU timestamp queries, and how
+/// ([`RunResult::timings`]). Timed, the host waits for the GPU at every submission, so use it
+/// for durations, not throughput. A load fails if the adapter can't time.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Timing {
+    #[default]
+    Off,
+    /// Each one's start and end, beside the others, so a frame's span is its first start to its
+    /// last end (`frame_spans`).
+    Span,
+    /// Each pass and dispatch alone: submitted and waited for before the next is recorded, so
+    /// each one's time is its own (on Apple GPUs passes overlap, and one pass's start to end
+    /// holds others' work).
+    Serial,
+}
+
 /// How to run a program.
 #[derive(Clone, Debug, Default)]
 pub struct Options {
-    /// Time every dispatch and pass with GPU timestamp queries ([`RunResult::timings`]): each
-    /// one's start and end, beside the others, so a frame's span is its first start to its
-    /// last end ([`frame_spans`]). The host then waits for the GPU at every submission, so use
-    /// it for durations, not throughput. Fails to load if the adapter can't time.
-    pub timestamps: bool,
-    /// With `timestamps`, run each pass and dispatch alone: submitted and waited for before the
-    /// next is recorded, so each one's time is its own (on Apple GPUs passes overlap, and one
-    /// pass's start to end holds others' work).
-    pub serial: bool,
+    /// Whether every dispatch and pass is timed on the GPU, and how.
+    pub timing: Timing,
     /// Keep a copy of every batch the program submits ([`Host::take_batches`]): for tests
     /// that look at what a program recorded, such as a dispatch's uniform bytes.
     pub record: bool,
@@ -114,7 +121,7 @@ pub struct RunResult {
     pub height: u32,
     /// The screen after the last frame: RGBA8, rows top to bottom, no padding.
     pub frame: Vec<u8>,
-    /// GPU durations, with [`Options::timestamps`]; empty otherwise.
+    /// GPU durations, with [`Options::timing`]; empty otherwise.
     pub timings: Vec<GpuTiming>,
 }
 
@@ -289,12 +296,7 @@ impl Host {
         // Everything that can be checked without the GPU is, before taking it.
         let compiled = program::compile_cached(&wasm, wasm_hash, Some(dir), None)?;
         let lock = lock::GpuLock::acquire(&format!("wrela-host {}", dir.display()))?;
-        let timing = match (options.timestamps, options.serial) {
-            (false, _) => Timing::Off,
-            (true, false) => Timing::Span,
-            (true, true) => Timing::Serial,
-        };
-        let gpu = Gpu::new(&manifest, &shaders, timing)?;
+        let gpu = Gpu::new(&manifest, &shaders, options.timing)?;
         let io = io(dir, options.storage.as_deref(), options.post.clone(), options.quiet);
         let n = workers(options.workers);
         let program = Program::instantiate_with(
@@ -473,7 +475,7 @@ impl Host {
         self.p().take_batches()
     }
 
-    /// The GPU durations recorded since the last call (or load), with [`Options::timestamps`]:
+    /// The GPU durations recorded since the last call (or load), with [`Options::timing`]:
     /// for timing work an export submits. It waits for the GPU.
     pub fn take_timings(&mut self) -> Result<Vec<GpuTiming>> {
         let gpu = self.p().executor();

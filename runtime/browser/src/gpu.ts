@@ -27,6 +27,7 @@
 import { NONE, SCREEN, SCREEN_FORMAT, UPLOAD_MAX, UPLOAD_START } from "./abi.gen.ts";
 import { bytesPerTexel, CommandError, isDepth, sampleType } from "./check.ts";
 import { errorMessage } from "./errors.ts";
+import { StateHash } from "./hash.ts";
 import type { Manifest, Pipeline, ResourceBinding, UniformBlock } from "./manifest.ts";
 import type { Binding, Bytes, Command, OpcodeName, Pass, TextureFormat } from "./stream.ts";
 
@@ -268,26 +269,37 @@ async function buildPipeline(device: GPUDevice, p: Pipeline, source: string): Pr
   return { name: p.name, layout, compute, render, uniform: p.uniform, bindings: p.bindings, debugFlag: p.debug_flag };
 }
 
-/** Builds every pipeline up front. `shaders[i]` is pipeline `i`'s WGSL. */
+/** The pipelines a build has, by a hash of each one's manifest entry and WGSL (`pipelineKey`):
+ * what the next build keeps, in a hot reload. */
+export type PipelineCache = Map<string, Promise<BuiltPipeline>>;
+
+/** FNV-1a 64 of a pipeline's manifest entry and its WGSL, as hex. */
+function pipelineKey(p: Pipeline, source: string): string {
+  const hash = new StateHash();
+  hash.update(new TextEncoder().encode(`${JSON.stringify(p)}\n${source}`));
+  return hash.hex();
+}
+
+/** Builds every pipeline up front. `shaders[i]` is pipeline `i`'s WGSL. With `cache` (a hot
+ * reload), a pipeline whose manifest entry and WGSL are the same as one of the last build's is
+ * kept, and the cache then holds this build's pipelines alone. */
 export function buildPipelines(
   device: GPUDevice,
   manifest: Manifest,
   shaders: string[],
-  cache?: Map<string, Promise<BuiltPipeline>>,
+  cache?: PipelineCache,
 ): Promise<BuiltPipeline[]> {
-  return Promise.all(
-    manifest.pipelines.map((p, i) => {
-      if (!cache) return buildPipeline(device, p, shaders[i]!);
-      // A hot reload keeps a pipeline whose manifest entry and WGSL are the same.
-      const key = `${JSON.stringify(p)}\n${shaders[i]!}`;
-      let built = cache.get(key);
-      if (!built) {
-        built = buildPipeline(device, p, shaders[i]!);
-        cache.set(key, built);
-      }
-      return built;
-    }),
-  );
+  if (!cache) return Promise.all(manifest.pipelines.map((p, i) => buildPipeline(device, p, shaders[i]!)));
+  const used: PipelineCache = new Map();
+  const built = manifest.pipelines.map((p, i) => {
+    const key = pipelineKey(p, shaders[i]!);
+    const pipeline = used.get(key) ?? cache.get(key) ?? buildPipeline(device, p, shaders[i]!);
+    used.set(key, pipeline);
+    return pipeline;
+  });
+  cache.clear();
+  for (const [key, pipeline] of used) cache.set(key, pipeline);
+  return Promise.all(built);
 }
 
 /** A draw waiting for its pass to end, with its own copy of its uniform bytes. */
@@ -323,6 +335,10 @@ function copied(cmd: Command): Command {
 
 /** `n` rounded up to a multiple of `align`. */
 export const alignTo = (n: number, align: number) => Math.ceil(n / align) * align;
+
+/** Whether passes and dispatches are timed, and how (runtime/native `Timing`): not at all; each
+ * as it runs, beside the others; or each run alone, so its time is its own. */
+export type Timing = "off" | "span" | "serial";
 
 /** A pass's GPU time, as the native host records it (runtime/native `GpuTiming`). */
 export interface GpuTiming {
@@ -502,17 +518,16 @@ export class GpuExecutor {
    * alone; null in the other modes, which run each command as it comes. */
   readonly #deferred: Deferred[] | null;
 
-  /** With `timestamps`, on a device with "timestamp-query", each pass's GPU time is recorded
-   * (`timings`); with `serial` too, each pass and dispatch runs alone, so its time is its own
-   * (the program's commands then wait for `drain`, which test mode calls after each frame). */
+  /** Timed, on a device with "timestamp-query", each pass's GPU time is recorded (`timings`); in
+   * the serial mode each pass and dispatch runs alone, so its time is its own (the program's
+   * commands then wait for `drain`, which test mode calls after each frame). */
   constructor(
     readonly device: GPUDevice,
     readonly pipelines: BuiltPipeline[],
     readonly screen: ScreenTarget,
-    timestamps = false,
-    serial = false,
+    timing: Timing = "off",
   ) {
-    this.#deferred = timestamps && serial ? [] : null;
+    this.#deferred = timing === "serial" ? [] : null;
     const l = device.limits;
     this.#align = Math.max(l.minUniformBufferOffsetAlignment, l.minStorageBufferOffsetAlignment);
     this.#uniforms = new Ring(
@@ -522,7 +537,7 @@ export class GpuExecutor {
       RING_START,
     );
     this.#uploads = new Ring(device, "upload ring", GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST, UPLOAD_START);
-    this.#timer = timestamps && device.features.has("timestamp-query") ? new Timer(device) : null;
+    this.#timer = timing !== "off" && device.features.has("timestamp-query") ? new Timer(device) : null;
     this.#debugFlag = pipelines.some((p) => p.debugFlag !== null)
       ? {
           buffer: device.createBuffer({ label: "debug flag", size: 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC }),
