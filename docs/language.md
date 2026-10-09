@@ -737,7 +737,7 @@ A program can run a fixed-rate step on a thread of its own, hand its newest resu
 
 ### 6.18 Work over several frames (designed in M5; decided before M8)
 
-**The problem.** Work too long for one frame is split by hand. The clearing keeps a `bool` for each step of its loading (11 of its 14) and tests them in chains: `if !s.static_drawn {} else if !s.occluders_cooked { ... }`. `Realizing` splits `realize_once`'s cull, slices and finish into a step counter of its own. Each is the same state machine, written by hand, and each adds placeholders to `init` (23 in the clearing's).
+**The problem.** Work too long for one frame is split by hand. The clearing keeps a `bool` for most steps of its loading and tests them in nested chains: `if s.static_drawn { if !s.occluders_cooked { ... } else if ... }`. `Realizing` splits `realize_once`'s cull, slices and finish into a step counter of its own. Each is the same state machine, written by hand, and each adds placeholders to `init`.
 
 **The design: a job is a function whose body runs over several frames.**
 - `@job fn realize(creature: Fawn, scratch: mut Scratch) { cull(...); for i in 0..slices { place(i); yield } finish() }`. `yield` ends the job's work for this frame.
