@@ -374,28 +374,32 @@ impl Cx<'_> {
                 Value::Parts(out)
             }
             ir::TypeDef::Enum { variants, .. } => {
+                // Memory holds the variant's tag, its discriminant: its variant, by index.
                 let tag = mem.u32(at + offsets[0])?;
-                let Some((_, payload)) = variants.get(tag as usize) else {
-                    return Err(format!("an enum `{}` with variant {tag}", self.show(t)));
+                let variant = mb.m.types.variant_of(it, tag);
+                let Some((k, (_, payload))) =
+                    variant.and_then(|k| Some((k, variants.get(k as usize)?)))
+                else {
+                    return Err(format!("an enum `{}` with the tag {tag}", self.show(t)));
                 };
                 let payload = match payload {
                     Some(pt) => {
-                        let base = at + offsets[1 + tag as usize];
+                        let base = at + offsets[1 + k as usize];
                         let poffsets = field_offsets(&mb.m.types, *pt).to_vec();
                         let pfields = match mb.m.types.get(*pt) {
                             ir::TypeDef::Struct { fields, .. } => fields.clone(),
                             _ => Vec::new(),
                         };
                         let mut out = Vec::new();
-                        for (k, ft) in self.field_map(mb, t, Some(tag), span) {
-                            let Some(k) = k else { continue };
-                            let (_, fit) = pfields[k as usize];
+                        for (j, ft) in self.field_map(mb, t, Some(k), span) {
+                            let Some(j) = j else { continue };
+                            let (_, fit) = pfields[j as usize];
                             out.push(self.read(
                                 mb,
                                 ft,
                                 fit,
                                 mem,
-                                base + poffsets[k as usize],
+                                base + poffsets[j as usize],
                                 span,
                             )?);
                         }
@@ -403,7 +407,7 @@ impl Cx<'_> {
                     }
                     None => None,
                 };
-                Value::Variant(tag, payload)
+                Value::Variant(k, payload)
             }
             ir::TypeDef::Run(_) | ir::TypeDef::RuntimeArray(_) | ir::TypeDef::Ptr(_) => {
                 return Err(format!("a value of type {} points into memory", self.show(t)));

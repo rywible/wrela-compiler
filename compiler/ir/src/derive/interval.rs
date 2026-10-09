@@ -1678,7 +1678,8 @@ impl<'a> Ivx<'a> {
             let p = self.range(payload);
             let mut ends = [p.0, p.1];
             for end in &mut ends {
-                let mut parts = vec![self.emit(out, u32t, Expr::Const(Const::U32(k)))];
+                let tag = self.m.types.tag(et, k);
+                let mut parts = vec![self.emit(out, u32t, Expr::Const(Const::U32(tag)))];
                 for (j, (_, pt)) in variants.iter().enumerate() {
                     parts.push(match pt {
                         _ if j == k as usize => *end,

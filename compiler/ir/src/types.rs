@@ -194,11 +194,24 @@ impl Types {
         }
     }
 
-    /// The tag variant `k` of enum `t` writes: its discriminant.
+    /// The tag variant `k` of enum `t` writes: its discriminant. Memory holds this, never the
+    /// variant's index: what writes a tag goes through here, and what reads one through
+    /// [`Types::variant_of`].
     pub fn tag(&self, t: TypeId, k: u32) -> u32 {
         match self.get(t) {
             TypeDef::Enum { tags, .. } => tags.get(k as usize).copied().unwrap_or(k),
             _ => k,
+        }
+    }
+
+    /// The variant of enum `t` whose tag is `tag` (see [`Types::tag`]), if one is.
+    pub fn variant_of(&self, t: TypeId, tag: u32) -> Option<u32> {
+        match self.get(t) {
+            TypeDef::Enum { tags, variants, .. } if tags.is_empty() => {
+                ((tag as usize) < variants.len()).then_some(tag)
+            }
+            TypeDef::Enum { tags, .. } => tags.iter().position(|&d| d == tag).map(|k| k as u32),
+            _ => None,
         }
     }
 
