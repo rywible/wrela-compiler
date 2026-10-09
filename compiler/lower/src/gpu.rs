@@ -12,7 +12,7 @@ use wrela_diag::{Diagnostic, Span, codes};
 use wrela_ir as ir;
 use wrela_ir::uniformity::{Collective, NonUniform};
 use wrela_sema::defs::{Entry, Lang, Mode};
-use wrela_sema::gpu::BuiltinInput;
+use wrela_sema::gpu::{BuiltinInput, FragmentOutput};
 use wrela_sema::mir;
 use wrela_sema::ty::*;
 
@@ -44,11 +44,11 @@ impl PipelineKey {
 }
 
 /// A pipeline's kind. Its entry points are the module's, in order: a kernel, or a vertex shader
-/// then a fragment shader.
+/// then a fragment shader, and what that writes.
 #[derive(Clone, Debug, PartialEq)]
 pub enum PipelineKind {
     Compute { workgroup_size: [u32; 3] },
-    Render,
+    Render { output: FragmentOutput },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -74,14 +74,6 @@ pub struct PipelineOut {
     pub sites: Vec<Span>,
     /// A debug build's: the binding of the flag its bounds checks set (`ir::bounds`).
     pub debug_flag: Option<u32>,
-    /// A render pipeline whose fragment shader returns `Over`: its colour is blended over the
-    /// target's.
-    pub blend: bool,
-    /// A render pipeline whose fragment shader gives its depth (`WithDepth`).
-    pub writes_depth: bool,
-    /// A render pipeline whose fragment shader returns a `u32`: drawn into an `R32Uint`
-    /// texture.
-    pub uint: bool,
     /// A render pipeline's targets: what its draws' passes draw into, first drawn first.
     pub targets: Vec<wrela_abi::manifest::RenderTarget>,
     /// The functions its module instantiates, with their type arguments (`wrela query`).
@@ -958,8 +950,8 @@ fn draw_target(
     // What the fragment shader gives, against what the pass takes.
     let ret = ret_type(fl.cx, fragment.func, &fragment.substs);
     let p = &fl.cx.checked.program;
-    let writes_depth = p.lang_of_ty(ret) == Some(Lang::WithDepth);
-    let uint = ret == p.types.u32;
+    let output = FragmentOutput::of(p, ret)?;
+    let (writes_depth, uint) = (output.writes_depth(), output.uint());
     let integer = target.color == Some(ir::TexFormat::R32Uint);
     let pass = p.display_ty(t);
     let why = if writes_depth && !target.depth {
@@ -2287,9 +2279,6 @@ fn lower_compute(cx: &mut Cx, iface: Rc<Interface>) -> Option<PipelineOut> {
         key: PipelineKey::Compute { kernel: FnId(0), substs: Vec::new(), over: false },
         sites: Vec::new(),
         debug_flag: None,
-        blend: false,
-        writes_depth: false,
-        uint: false,
         targets: Vec::new(),
         instances,
     })
@@ -2311,9 +2300,11 @@ fn lower_render(cx: &mut Cx, iface: Rc<Interface>) -> Option<PipelineOut> {
         g.what = describe_entry(Entry::Fragment, &fdef.name);
     }
     let fret_t = ret_type(cx, fragment.func, &fragment.substs);
-    let blend = checked.program.lang_of_ty(fret_t) == Some(Lang::Over);
-    let writes_depth = checked.program.lang_of_ty(fret_t) == Some(Lang::WithDepth);
-    let uint = fret_t == checked.program.types.u32;
+    let Some(output) = FragmentOutput::of(&checked.program, fret_t) else {
+        let what = format!("`{}` returns what no fragment shader can", fdef.name);
+        cx.err(Diagnostic::internal(what));
+        return None;
+    };
     let fret = cx.lower_ty(&mut mb, fret_t, fdef.sig_span);
     let takes_varyings =
         fragment.params.iter().any(|&(t, _)| t == vret) && !is_clip_position(cx, vret);
@@ -2325,7 +2316,7 @@ fn lower_render(cx: &mut Cx, iface: Rc<Interface>) -> Option<PipelineOut> {
         if takes_varyings { Some(vret_ir) } else { None },
     );
     cx.drain(&mut mb);
-    if blend {
+    if output.blends() {
         // An `Over` is its colour: the entry point returns the `vec4` WGSL blends.
         let v4 = mb.m.types.vector(4);
         let f = &mut mb.m.functions[fentry.index()];
@@ -2344,8 +2335,8 @@ fn lower_render(cx: &mut Cx, iface: Rc<Interface>) -> Option<PipelineOut> {
         name: ir::ident(&fdef.name),
         stage: ir::Stage::Fragment {
             varyings: takes_varyings.then_some((vret_ir, varyings)),
-            depth: writes_depth,
-            uint,
+            depth: output.writes_depth(),
+            uint: output.uint(),
         },
         function: fentry,
         inputs: entry_inputs(fragment, false, false),
@@ -2356,15 +2347,12 @@ fn lower_render(cx: &mut Cx, iface: Rc<Interface>) -> Option<PipelineOut> {
     Some(PipelineOut {
         name: format!("{}+{}", vdef.name, fdef.name),
         module: mb.m,
-        kind: PipelineKind::Render,
+        kind: PipelineKind::Render { output },
         uniform,
         bindings,
         key: PipelineKey::Compute { kernel: FnId(0), substs: Vec::new(), over: false },
         sites: Vec::new(),
         debug_flag: None,
-        blend,
-        writes_depth,
-        uint,
         targets: Vec::new(),
         instances,
     })

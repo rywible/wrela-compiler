@@ -1,0 +1,51 @@
+// rejects: gpu.formats
+// A draw's pass takes what its fragment shader writes: a depth of its own (`WithDepth`) needs a
+// depth target, a `u32` an `R32Uint` texture, and a colour any target but that one.
+use std::gpu::{
+    ClipPosition, FragCoord, R32Uint, Rgba8, Texture, VertexIndex, WithDepth, begin_pass,
+    begin_pass_with_depth, depth_texture, draw, texture,
+}
+
+@vertex
+fn cover(v: VertexIndex) -> ClipPosition {
+    ClipPosition { position: vec4(f32(v.index), 0.0, 0.5, 1.0) }
+}
+
+@fragment
+fn colour(p: FragCoord) -> vec4 {
+    vec4(1.0)
+}
+
+@fragment
+fn id(p: FragCoord) -> u32 {
+    1
+}
+
+@fragment
+fn deep_colour(p: FragCoord) -> WithDepth<vec4> {
+    WithDepth { color: vec4(1.0), depth: 0.5 }
+}
+
+@fragment
+fn deep_id(p: FragCoord) -> WithDepth<u32> {
+    WithDepth { color: 1, depth: 0.5 }
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    var depth = depth_texture(width: 4, height: 4)
+    var colours: Texture<Rgba8> = texture(width: 4, height: 4)
+    var ids: Texture<R32Uint> = texture(width: 4, height: 4)
+    let a = begin_pass(mut colours, clear: vec4(0.0))
+    draw(a, cover, deep_colour, vertices: 3) //~ E0603
+    draw(a, cover, id, vertices: 3) //~ E0603
+    a.end()
+    let b = begin_pass_with_depth(mut colours, mut depth, clear: vec4(0.0))
+    draw(b, cover, deep_id, vertices: 3) //~ E0603
+    b.end()
+    let c = begin_pass_with_depth(mut ids, mut depth, clear: vec4(0.0))
+    draw(c, cover, colour, vertices: 3) //~ E0603
+    draw(c, cover, deep_colour, vertices: 3) //~ E0603
+    draw(c, cover, id, vertices: 3)
+    draw(c, cover, deep_id, vertices: 3)
+    c.end()
+}

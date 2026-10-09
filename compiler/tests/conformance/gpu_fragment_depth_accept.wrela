@@ -1,9 +1,10 @@
 // accepts: gpu.entry
 // A fragment shader may give its fragment's depth: it returns a `WithDepth`, its colour and
-// its depth (drawn in a pass with a depth target).
+// its depth (drawn in a pass with a depth target), the colour a `vec4` or, for an `R32Uint`
+// target, a `u32`.
 use std::gpu::{
-    ClipPosition, DepthTexture, FragCoord, VertexIndex, WithDepth, begin_screen_pass_with_depth,
-    depth_texture, draw,
+    ClipPosition, DepthTexture, FragCoord, R32Uint, Texture, VertexIndex, WithDepth,
+    begin_pass_with_depth, begin_screen_pass_with_depth, depth_texture, draw, texture,
 }
 
 @vertex
@@ -14,22 +15,33 @@ fn cover(v: VertexIndex) -> ClipPosition {
 }
 
 @fragment
-fn sloped(p: FragCoord) -> WithDepth {
+fn sloped(p: FragCoord) -> WithDepth<vec4> {
     if p.position.x < 8.0 {
         return WithDepth { color: vec4(1.0), depth: 0.0 }
     }
     WithDepth { color: vec4(0.5), depth: fract(p.position.x / 64.0) }
 }
 
+/// Which half a fragment is in, nearer on the left.
+@fragment
+fn halves(p: FragCoord) -> WithDepth<u32> {
+    let left = p.position.x < 32.0
+    WithDepth { color: if left { 1 } else { 2 }, depth: if left { 0.75 } else { 0.25 } }
+}
+
 pub struct S {
     depth: DepthTexture,
+    ids: Texture<R32Uint>,
 }
 
 pub fn init() -> S {
-    S { depth: depth_texture(width: 64, height: 64) }
+    S { depth: depth_texture(width: 64, height: 64), ids: texture(width: 64, height: 64) }
 }
 
 pub fn frame(s: mut S, time: f32, width: u32, height: u32) {
+    let ids = begin_pass_with_depth(mut s.ids, mut s.depth, clear: vec4(0.0), clear_depth: 0.0)
+    draw(ids, cover, halves, vertices: 3)
+    ids.end()
     let pass = begin_screen_pass_with_depth(mut s.depth, clear: vec4(0.0))
     draw(pass, cover, sloped, vertices: 3)
     pass.present()

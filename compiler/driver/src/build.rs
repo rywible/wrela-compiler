@@ -74,23 +74,25 @@ pub fn emit(l: &Lowered, sources: &SourceMap, simd: bool, budgets: bool) -> Buil
                     workgroup_size: *workgroup_size,
                 }
             }
-            (PipelineKind::Render, PipelineKey::Render { state, .. }, [vertex, fragment]) => {
-                wrela_abi::manifest::Stage::Render {
-                    vertex_entry: vertex.clone(),
-                    fragment_entry: fragment.clone(),
-                    blend: p.blend,
-                    cull: state.cull,
-                    depth_bias: wrela_abi::manifest::DepthBias {
-                        constant: state.bias_constant,
-                        slope_scale: f32::from_bits(state.bias_slope),
-                        clamp: f32::from_bits(state.bias_clamp),
-                    },
-                    depth: state.depth,
-                    writes_depth: p.writes_depth,
-                    uint: p.uint,
-                    targets: p.targets.clone(),
-                }
-            }
+            (
+                PipelineKind::Render { output },
+                PipelineKey::Render { state, .. },
+                [vertex, fragment],
+            ) => wrela_abi::manifest::Stage::Render {
+                vertex_entry: vertex.clone(),
+                fragment_entry: fragment.clone(),
+                blend: output.blends(),
+                cull: state.cull,
+                depth_bias: wrela_abi::manifest::DepthBias {
+                    constant: state.bias_constant,
+                    slope_scale: f32::from_bits(state.bias_slope),
+                    clamp: f32::from_bits(state.bias_clamp),
+                },
+                depth: state.depth,
+                writes_depth: output.writes_depth(),
+                uint: output.uint(),
+                targets: p.targets.clone(),
+            },
             _ => {
                 diagnostics.push(Diagnostic::internal(format!(
                     "the shader for `{}` has the wrong entry points",

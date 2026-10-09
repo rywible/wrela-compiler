@@ -37,7 +37,7 @@ fn flat(colour: vec4) -> vec4 {
 
 /// A colour at a depth of its own, whatever its triangle's.
 @fragment
-fn at_depth(colour: vec4, depth: f32) -> WithDepth {
+fn at_depth(colour: vec4, depth: f32) -> WithDepth<vec4> {
     WithDepth { color: colour, depth }
 }
 

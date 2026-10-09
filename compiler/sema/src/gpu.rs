@@ -224,6 +224,59 @@ impl BuiltinInput {
     }
 }
 
+/// What a fragment shader writes, by its return type (language.md §12).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FragmentOutput {
+    /// A `vec4`: it replaces the target's texel.
+    Colour,
+    /// `Over`: a colour drawn over the target's (alpha blending).
+    Over,
+    /// A `u32`: an `R32Uint` target's texel.
+    Uint,
+    /// `WithDepth<C>`: `C` (a `vec4`, or with `uint` a `u32`) and the fragment's own depth.
+    WithDepth { uint: bool },
+}
+
+impl FragmentOutput {
+    /// What a fragment shader returning `t` writes; `None` if it can't return `t`.
+    pub fn of(p: &Program, t: TyId) -> Option<FragmentOutput> {
+        let colour = |t: TyId| {
+            if matches!(p.types.kind(t), TyKind::Vec(VecElem::F32, 4)) {
+                Some(false)
+            } else if t == p.types.u32 {
+                Some(true)
+            } else {
+                None
+            }
+        };
+        if let Some(uint) = colour(t) {
+            return Some(if uint { FragmentOutput::Uint } else { FragmentOutput::Colour });
+        }
+        match (p.lang_of_ty(t)?, p.types.kind(t)) {
+            (Lang::Over, _) => Some(FragmentOutput::Over),
+            (Lang::WithDepth, TyKind::Adt(_, args)) => {
+                Some(FragmentOutput::WithDepth { uint: colour(*args.first()?)? })
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether its colour is blended over the target's (`Over`).
+    pub fn blends(self) -> bool {
+        self == FragmentOutput::Over
+    }
+
+    /// Whether it gives the fragment's depth (`WithDepth`).
+    pub fn writes_depth(self) -> bool {
+        matches!(self, FragmentOutput::WithDepth { .. })
+    }
+
+    /// Whether its colour is a `u32`, an `R32Uint` texel.
+    pub fn uint(self) -> bool {
+        matches!(self, FragmentOutput::Uint | FragmentOutput::WithDepth { uint: true })
+    }
+}
+
 /// E0604: data a GPU entry point receives by value (a uniform) whose type isn't `GpuData`.
 /// Reported where the entry point is declared, or, for a type a generic entry point is
 /// instantiated with, where it's dispatched.
@@ -390,20 +443,19 @@ fn check_entry(p: &Program, f: FnId, entry: Entry, out: &mut Vec<Diagnostic>) {
             }
         }
         Entry::Fragment
-            if !matches!(p.types.kind(def.ret), TyKind::Vec(VecElem::F32, 4))
-                && def.ret != p.types.u32
-                && !matches!(p.lang_of_ty(def.ret), Some(Lang::Over | Lang::WithDepth)) =>
+            if FragmentOutput::of(p, def.ret).is_none()
+                && !p.types.any(def.ret, &mut |k| matches!(k, TyKind::Error)) =>
         {
             out.push(
-                Diagnostic::new(
-                    codes::E0602,
-                    def.sig_span,
-                    format!(
-                        "{stage} returns a `vec4` colour, an `Over` colour to blend, a \
-                         `WithDepth` colour and depth, or a `u32`"
-                    ),
-                )
-                .with_note("it writes one colour to its target: a `vec4` replaces what's there, `std::gpu::Over` is drawn over it, `std::gpu::WithDepth` replaces it with a depth of its own, and a `u32` is an `R32Uint` texture's texel"),
+            Diagnostic::new(
+                codes::E0602,
+                def.sig_span,
+                format!(
+                    "{stage} returns a `vec4` colour, an `Over` colour to blend, a `u32`, or a \
+                     `WithDepth` of a `vec4` or a `u32` and a depth"
+                ),
+            )
+            .with_note("it writes one colour to its target: a `vec4` replaces what's there, `std::gpu::Over` is drawn over it, a `u32` is an `R32Uint` texture's texel, and `std::gpu::WithDepth<C>` writes its `C` with a depth of its own"),
             )
         }
         _ => {}

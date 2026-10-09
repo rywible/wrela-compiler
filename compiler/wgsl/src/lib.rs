@@ -583,7 +583,6 @@ impl<'a, 'm> Fb<'a, 'm> {
                     });
                     self.io = Some((io, map, *vt));
                 }
-                let v4 = self.cx.ty_vec4();
                 let colour = Binding::Location {
                     location: 0,
                     interpolation: None,
@@ -591,13 +590,19 @@ impl<'a, 'm> Fb<'a, 'm> {
                     blend_src: None,
                     per_primitive: false,
                 };
+                // A `u32` into an integer target, or a `vec4`.
+                let (ct, size) = if *uint {
+                    (self.cx.ty_inner(TypeInner::Scalar(Scalar::U32)), 4)
+                } else {
+                    (self.cx.ty_vec4(), 16)
+                };
                 if *depth {
                     // A `WithDepth`: its colour, and its depth as the fragment's.
                     let f = self.cx.ty_inner(TypeInner::Scalar(Scalar::F32));
                     let members = vec![
                         StructMember {
                             name: Some("color".into()),
-                            ty: v4,
+                            ty: ct,
                             binding: Some(colour),
                             offset: 0,
                         },
@@ -605,23 +610,20 @@ impl<'a, 'm> Fb<'a, 'm> {
                             name: Some("depth".into()),
                             ty: f,
                             binding: Some(Binding::BuiltIn(BuiltIn::FragDepth)),
-                            offset: 16,
+                            offset: size,
                         },
                     ];
                     let out = self.cx.out.types.insert(
                         Type {
                             name: Some(format!("{}_out", e.name)),
-                            inner: TypeInner::Struct { members, span: 32 },
+                            inner: TypeInner::Struct { members, span: 2 * size },
                         },
                         Span::UNDEFINED,
                     );
                     self.frag_out = Some(out);
                     self.func.result = Some(FunctionResult { ty: out, binding: None });
-                } else if *uint {
-                    let u = self.cx.ty_inner(TypeInner::Scalar(Scalar::U32));
-                    self.func.result = Some(FunctionResult { ty: u, binding: Some(colour) });
                 } else {
-                    self.func.result = Some(FunctionResult { ty: v4, binding: Some(colour) });
+                    self.func.result = Some(FunctionResult { ty: ct, binding: Some(colour) });
                 }
             }
         }
