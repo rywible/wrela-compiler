@@ -1,6 +1,6 @@
 // rejects: fn.jobs
 // `yield` is in a job's own body; a job is started and resumed, not called or passed; `Job<F>`
-// takes a job; and a job is a plain function that returns what it owns.
+// takes a job; and a job is a free function (not a method) that returns what it owns.
 use std::job::Job
 
 @job
@@ -16,9 +16,15 @@ fn plain() {
     yield //~ E0335
 }
 
-@job //~ E0336
-fn generic<T: Copy>(x: take T) -> T {
-    x
+struct Walker {
+    steps: u32,
+}
+
+impl Walker {
+    @job //~ E0336
+    fn walk_on(n: take u32) -> u32 {
+        n
+    }
 }
 
 @job //~ E0336

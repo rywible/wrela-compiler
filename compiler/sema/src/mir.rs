@@ -595,7 +595,9 @@ pub fn fn_uses(p: &Program, s: &Statement, r: &Rvalue, mut each: impl FnMut(FnUs
         Rvalue::Call(c) => match &c.callee {
             Callee::Fn { func, .. } => each(FnUse::Call(*func), c.span),
             // Resuming a job runs its body (§6.18); starting one makes its value.
-            Callee::JobStart(func) | Callee::JobResume(func) => each(FnUse::Call(*func), c.span),
+            Callee::JobStart { func, .. } | Callee::JobResume { func, .. } => {
+                each(FnUse::Call(*func), c.span)
+            }
             Callee::TraitMethod { method, self_ty, .. } => {
                 each(FnUse::Trait(*method, *self_ty), c.span)
             }

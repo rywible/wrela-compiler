@@ -540,7 +540,7 @@ impl<'p> Checker<'p> {
     }
 
     /// Bounds on `f`'s generics become obligations.
-    fn fn_obligations(&mut self, f: FnId, gen_args: &[TyId], span: Span) {
+    pub(crate) fn fn_obligations(&mut self, f: FnId, gen_args: &[TyId], span: Span) {
         let all = self.p.fn_all_generics(f);
         let subst = Subst::from_pairs(&all, gen_args);
         let name = self.p.fn_display_name(f);
@@ -2210,8 +2210,9 @@ impl<'p> Checker<'p> {
         if name.name == "start"
             && let Some(f) = self.fn_named(receiver)
             && self.p.func(f).attrs.job.is_some()
+            && let ast::ExprKind::Path(path) = &receiver.kind
         {
-            return self.job_start(f, args, span);
+            return self.job_start(f, path, args, span);
         }
         let recv = self.check_expr(receiver, None);
         let rt = self.shallow(recv.ty);
@@ -2219,9 +2220,9 @@ impl<'p> Checker<'p> {
             return self.failed_call(args, span);
         }
         if name.name == "resume"
-            && let Some(f) = self.job_of(rt)
+            && let Some((f, gen_args)) = self.job_of(rt)
         {
-            return self.job_resume(f, recv, args, span);
+            return self.job_resume(f, gen_args, recv, args, span);
         }
         // A built-in method on a literal (`x.sqrt()` after `let x = 2.0`) leaves its type open,
         // as `sqrt(x)` does, unless a trait has a method of that name.

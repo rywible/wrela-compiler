@@ -299,6 +299,20 @@ impl Program {
                 s.push(']');
             }
             TyKind::Str => s.push_str("str"),
+            // A job's value shows the job as it's written: `Job<realize<Coat, Fawn>>`.
+            TyKind::Adt(a, args)
+                if self.is_lang_adt(*a, Lang::Job)
+                    && let Some(TyKind::FnDef(f, fargs)) =
+                        args.first().map(|&t| self.types.kind(t)) =>
+            {
+                let _ = write!(s, "Job<{}", self.func(*f).name);
+                if !fargs.is_empty() {
+                    s.push('<');
+                    self.write_list(fargs, s);
+                    s.push('>');
+                }
+                s.push('>');
+            }
             TyKind::Adt(a, args) => {
                 s.push_str(&self.adt(*a).name);
                 // A bound entry point's type shows as its entry point bound: `shade.bind(...)`.

@@ -148,13 +148,13 @@ impl<'a> Cx<'a> {
                     ir::TypeDef::Run(e)
                 }))
             }
-            TyKind::Adt(..) if let Some(f) = self.job_of(t) => {
+            TyKind::Adt(..) if let Some((f, args)) = self.job_of(t) => {
                 if gpu {
                     let note = "a job runs on the CPU, over several frames (§6.18)";
                     self.not_on_gpu(mb, &self.checked.program.display_ty(t), note, span);
                     return None;
                 }
-                self.job_layout(mb, f).map(|l| l.ty)
+                self.job_layout(mb, f, &args).map(|l| l.ty)
             }
             TyKind::Adt(a, args) => {
                 let p = &self.checked.program;
@@ -330,8 +330,8 @@ impl<'a> Cx<'a> {
         variant: Option<u32>,
         span: Span,
     ) -> Vec<(Option<u32>, TyId)> {
-        if let Some(f) = self.job_of(t) {
-            return self.job_fields(mb, f);
+        if let Some((f, args)) = self.job_of(t) {
+            return self.job_fields(mb, f, &args);
         }
         let p = &self.checked.program;
         let fields: Vec<TyId> = match p.types.kind(t) {
@@ -585,7 +585,7 @@ impl<'a> Cx<'a> {
             }
             InstanceKey::Derived { .. } => crate::derive::signature(self, mb, key),
             InstanceKey::Glue { kind, ty } => self.glue_signature(mb, *kind, *ty),
-            InstanceKey::JobResume(f) => self.job_signature(mb, *f),
+            InstanceKey::JobResume { func, substs } => self.job_signature(mb, *func, substs),
         }
     }
 

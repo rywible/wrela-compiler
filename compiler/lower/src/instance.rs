@@ -26,8 +26,8 @@ pub enum InstanceKey {
     /// Drop or clone glue for a concrete type (`crate::glue`).
     Glue { kind: crate::glue::GlueKind, ty: TyId },
     /// A job's `resume` (§6.18): its body, from where its value says it stopped to its next
-    /// `yield` or its end (`crate::job`).
-    JobResume(FnId),
+    /// `yield` or its end (`crate::job`); `substs` are the job's generics.
+    JobResume { func: FnId, substs: Vec<TyId> },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -79,7 +79,7 @@ impl InstanceKey {
         match self {
             InstanceKey::Fn { func, .. } => Some(*func),
             InstanceKey::Closure { owner, .. } => owner.source_fn(),
-            InstanceKey::JobResume(func) => Some(*func),
+            InstanceKey::JobResume { func, .. } => Some(*func),
             InstanceKey::Derived { .. } | InstanceKey::Glue { .. } => None,
         }
     }
@@ -91,10 +91,10 @@ impl InstanceKey {
             InstanceKey::Fn { substs, callables, .. } => {
                 !substs.is_empty() || callables.iter().any(Option::is_some)
             }
+            InstanceKey::JobResume { substs, .. } => !substs.is_empty(),
             InstanceKey::Closure { .. }
             | InstanceKey::Derived { .. }
-            | InstanceKey::Glue { .. }
-            | InstanceKey::JobResume(_) => false,
+            | InstanceKey::Glue { .. } => false,
         }
     }
 
@@ -102,9 +102,8 @@ impl InstanceKey {
         match self {
             InstanceKey::Fn { substs, .. } => substs,
             InstanceKey::Closure { owner, .. } => owner.substs(),
-            InstanceKey::Derived { .. } | InstanceKey::Glue { .. } | InstanceKey::JobResume(_) => {
-                &[]
-            }
+            InstanceKey::JobResume { substs, .. } => substs,
+            InstanceKey::Derived { .. } | InstanceKey::Glue { .. } => &[],
         }
     }
 
@@ -112,9 +111,9 @@ impl InstanceKey {
         match self {
             InstanceKey::Fn { resources, .. } => resources,
             InstanceKey::Closure { owner, .. } => owner.resources(),
-            InstanceKey::Derived { .. } | InstanceKey::Glue { .. } | InstanceKey::JobResume(_) => {
-                &[]
-            }
+            InstanceKey::Derived { .. }
+            | InstanceKey::Glue { .. }
+            | InstanceKey::JobResume { .. } => &[],
         }
     }
 }

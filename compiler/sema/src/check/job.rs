@@ -40,19 +40,19 @@ impl<'p> Checker<'p> {
         );
     }
 
-    /// `Job<f>`.
-    pub(crate) fn job_ty(&self, f: FnId) -> TyId {
+    /// `Job<f>`, its generics `args`.
+    pub(crate) fn job_ty(&self, f: FnId, args: Vec<TyId>) -> TyId {
         let Some(job) = self.p.lang_adt(Lang::Job) else { return self.p.types.error };
-        let def = self.p.types.intern(TyKind::FnDef(f, Vec::new()));
+        let def = self.p.types.intern(TyKind::FnDef(f, args));
         self.p.types.adt(job, vec![def])
     }
 
-    /// The job a value of type `t` is of (`Job<f>`'s `f`).
-    pub(crate) fn job_of(&self, t: TyId) -> Option<FnId> {
+    /// The job a value of type `t` is of (`Job<f>`'s `f`), and its generics.
+    pub(crate) fn job_of(&self, t: TyId) -> Option<(FnId, Vec<TyId>)> {
         match self.kind(t) {
             TyKind::Adt(a, args) if self.p.is_lang_adt(*a, Lang::Job) => match args.first() {
                 Some(&f) => match self.kind(f) {
-                    TyKind::FnDef(f, _) => Some(*f),
+                    TyKind::FnDef(f, args) => Some((*f, args.clone())),
                     _ => None,
                 },
                 None => None,
@@ -62,27 +62,42 @@ impl<'p> Checker<'p> {
     }
 
     /// `f.start(...)`: its owned (`take`) parameters, matched as a call's arguments are; a
-    /// `Job<f>`.
-    pub(crate) fn job_start(&mut self, f: FnId, args: &[ast::Arg], span: Span) -> Expr {
-        let (params, _, _) = self.fn_params(f, &[]);
+    /// `Job<f>`. A generic job's types are given (`f::<T>.start(...)`) or inferred.
+    pub(crate) fn job_start(
+        &mut self,
+        f: FnId,
+        path: &ast::Path,
+        args: &[ast::Arg],
+        span: Span,
+    ) -> Expr {
+        let gen_args = self.fresh_fn_args(f, path, path.span);
+        self.fn_obligations(f, &gen_args, span);
+        let (params, _, _) = self.fn_params(f, &gen_args);
         let owned: Vec<CallParam> = params.into_iter().filter(|c| c.mode == Mode::Take).collect();
         let name = format!("{}.start", self.p.func(f).name);
         let (args, modes, order) = self.match_args(&name, &owned, None, args, span, f);
         let call = Call {
-            callee: Callee::JobStart(f),
+            callee: Callee::JobStart { func: f, args: gen_args.clone() },
             args,
             modes,
             receiver: false,
             order,
             ret_mode: RetMode::Owned,
         };
-        Expr { ty: self.job_ty(f), span, kind: ExprKind::Call(call) }
+        Expr { ty: self.job_ty(f, gen_args), span, kind: ExprKind::Call(call) }
     }
 
     /// `job.resume(...)`: the job (`mut`, as a receiver), then the job's `borrow` and `mut`
     /// parameters, matched as a call's arguments are; a `Step` of the job's result.
-    pub(crate) fn job_resume(&mut self, f: FnId, job: Expr, args: &[ast::Arg], span: Span) -> Expr {
-        let (params, ret, _) = self.fn_params(f, &[]);
+    pub(crate) fn job_resume(
+        &mut self,
+        f: FnId,
+        gen_args: Vec<TyId>,
+        job: Expr,
+        args: &[ast::Arg],
+        span: Span,
+    ) -> Expr {
+        let (params, ret, _) = self.fn_params(f, &gen_args);
         let module = self.p.func(f).module;
         let receiver = CallParam {
             name: "self",
@@ -98,7 +113,7 @@ impl<'p> Checker<'p> {
         let name = format!("{}.resume", self.p.func(f).name);
         let (args, modes, order) = self.match_args(&name, &lent, Some(job), args, span, f);
         let call = Call {
-            callee: Callee::JobResume(f),
+            callee: Callee::JobResume { func: f, args: gen_args },
             args,
             modes,
             receiver: true,
@@ -113,8 +128,8 @@ impl<'p> Checker<'p> {
     }
 }
 
-/// E0336 for each `@job fn` that can't be one: a job is a plain function (no generics, no
-/// `self`, no GPU or test attributes) that returns a value it owns.
+/// E0336 for each `@job fn` that can't be one: a job is a free function (not a method, no GPU
+/// or test attributes) that returns a value it owns.
 pub fn check_jobs(p: &crate::Program) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     for def in &p.fns {
@@ -130,8 +145,8 @@ pub fn check_jobs(p: &crate::Program) -> Vec<Diagnostic> {
         ];
         let why = if let Some((_, what)) = other.iter().find(|(s, _)| s.is_some()) {
             Some(format!("it's {what} too"))
-        } else if !def.generics.is_empty() || !matches!(def.owner, crate::defs::FnOwner::Free) {
-            Some("it's generic or a method: a job is a plain function, for now".to_string())
+        } else if !matches!(def.owner, crate::defs::FnOwner::Free) {
+            Some("it's a method: a job is a free function".to_string())
         } else if def.has_self() {
             Some("it takes `self`".to_string())
         } else if def.ret_mode != RetMode::Owned {

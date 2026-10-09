@@ -735,6 +735,11 @@ pub fn reveal(p: &Program, hidden: &HashMap<FnId, TyId>, t: TyId) -> TyId {
                 let ts = ts.iter().map(|&x| rev(x)).collect();
                 types.intern(TyKind::Adt(*a, ts))
             }
+            // A job's (`Job<realize<C, K>>`, §6.18).
+            TyKind::FnDef(f, ts) => {
+                let ts = ts.iter().map(|&x| rev(x)).collect();
+                types.intern(TyKind::FnDef(*f, ts))
+            }
             TyKind::Array(e, n) => types.intern(TyKind::Array(rev(*e), *n)),
             TyKind::ArrayN(e, n) => types.intern(TyKind::ArrayN(rev(*e), *n)),
             TyKind::Slice(e) => types.intern(TyKind::Slice(rev(*e))),

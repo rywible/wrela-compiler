@@ -300,8 +300,8 @@ pub(crate) struct ModuleBuilder {
     pub texts: HashMap<String, ir::DataId>,
     /// A lifted build's table of literals, and what keeps its GPU copy (CPU only).
     pub lift: Option<lift::CpuTable>,
-    /// Each job's value, as laid out (§6.18).
-    pub jobs: HashMap<FnId, job::JobLayout>,
+    /// Each job's value, as laid out (§6.18), by the job and its generics.
+    pub jobs: HashMap<(FnId, Vec<TyId>), job::JobLayout>,
 }
 
 impl ModuleBuilder {
@@ -355,7 +355,7 @@ pub fn lower(
     for &f in &roots.also {
         // A job's body is lowered as its `resume` (§6.18).
         let key = if checked.program.func(f).attrs.job.is_some() {
-            InstanceKey::JobResume(f)
+            InstanceKey::JobResume { func: f, substs: Vec::new() }
         } else {
             InstanceKey::plain(f, Vec::new())
         };
@@ -827,7 +827,7 @@ impl<'a> Cx<'a> {
             InstanceKey::Closure { owner, .. } => {
                 owner.source_fn().map(|f| format!("a closure in {}", p.fn_display_name(f)))
             }
-            InstanceKey::JobResume(f) => Some(p.fn_display_name(*f)),
+            InstanceKey::JobResume { func, .. } => Some(p.fn_display_name(*func)),
             InstanceKey::Derived { .. } | InstanceKey::Glue { .. } => None,
         }
     }

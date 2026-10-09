@@ -994,7 +994,21 @@ fn resolve_type_path(
                     ));
                     return p.types.error;
                 }
-                p.types.intern(TyKind::FnDef(f, Vec::new()))
+                // A generic job's types: `Job<realize<Coat, Fawn>>`.
+                let given: Vec<TyId> = path
+                    .segments
+                    .last()
+                    .and_then(|s| s.generics.as_deref())
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|t| resolve_type(p, diags, scope, t, TyPos::Normal))
+                    .collect();
+                let want = p.fn_all_generics(f).len();
+                if given.len() != want {
+                    diags.push(wrong_generic_count(a.span, &p.func(f).name, want, given.len()));
+                    return p.types.error;
+                }
+                p.types.intern(TyKind::FnDef(f, given))
             }
             _ => resolve_type(p, diags, scope, a, TyPos::Normal),
         })

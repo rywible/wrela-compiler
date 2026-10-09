@@ -110,10 +110,17 @@ pub enum Callee {
     Value(Box<Expr>),
     /// `.clone()`: structural.
     Clone,
-    /// `f.start(...)`: a `Job<f>` holding the job's owned parameters (§6.18).
-    JobStart(FnId),
+    /// `f.start(...)`: a `Job<f>` holding the job's owned parameters (§6.18); `args` are the
+    /// job's generics.
+    JobStart {
+        func: FnId,
+        args: Vec<TyId>,
+    },
     /// `job.resume(...)`: the job (`mut`), then the job's `borrow` and `mut` parameters.
-    JobResume(FnId),
+    JobResume {
+        func: FnId,
+        args: Vec<TyId>,
+    },
 }
 
 #[derive(Clone, Debug)]

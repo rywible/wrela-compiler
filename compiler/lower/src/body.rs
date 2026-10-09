@@ -149,8 +149,8 @@ pub(crate) fn lower_body(cx: &mut Cx, mb: &mut ModuleBuilder, key: &InstanceKey,
             crate::glue::lower(cx, mb, *kind, *ty, id);
             return;
         }
-        InstanceKey::JobResume(f) => {
-            lower_job(cx, mb, *f, key, id);
+        InstanceKey::JobResume { func, .. } => {
+            lower_job(cx, mb, *func, key, id);
             return;
         }
         _ => {}
@@ -198,7 +198,7 @@ pub(crate) fn lower_body(cx: &mut Cx, mb: &mut ModuleBuilder, key: &InstanceKey,
     match key {
         InstanceKey::Fn { .. } => fl.bind_fn_params(),
         InstanceKey::Closure { id: cid, .. } => fl.bind_closure_params(*cid),
-        InstanceKey::Derived { .. } | InstanceKey::Glue { .. } | InstanceKey::JobResume(_) => {}
+        InstanceKey::Derived { .. } | InstanceKey::Glue { .. } | InstanceKey::JobResume { .. } => {}
     }
     fl.region(mir::FnBody::ENTRY, None);
     if !fl.terminated() {
@@ -216,7 +216,8 @@ fn lower_job(cx: &mut Cx, mb: &mut ModuleBuilder, func: FnId, key: &InstanceKey,
     let checked = cx.checked;
     let Some(mir) = checked.mir.get(&func) else { return };
     let code = &mir.fns[0];
-    let Some(layout) = cx.job_layout(mb, func) else { return };
+    let substs = key.substs().to_vec();
+    let Some(layout) = cx.job_layout(mb, func, &substs) else { return };
     let subst = cx.instance_subst(key);
     let f = std::mem::take(&mut mb.m.functions[id.index()]);
     let mut fl = Fl {
@@ -261,6 +262,14 @@ fn lower_job(cx: &mut Cx, mb: &mut ModuleBuilder, func: FnId, key: &InstanceKey,
         fl.bind_param(local, k);
         k += 1;
     }
+    // A `take` parameter with no runtime value has no field: it's nothing, as a function's is.
+    for (i, p) in def.params.iter().enumerate() {
+        let local = code.params[i];
+        if p.mode == wrela_sema::defs::Mode::Take && !layout.fields.iter().any(|&(l, _)| l == local)
+        {
+            fl.locals[local.index()] = Repr::Erased;
+        }
+    }
     // Each local the job holds, moved out of it.
     let job = ir::Place::root(ir::PlaceRoot::Param(0));
     let mut held = Vec::new();
@@ -296,7 +305,7 @@ fn lower_job(cx: &mut Cx, mb: &mut ModuleBuilder, func: FnId, key: &InstanceKey,
         order.push(blk);
         work.extend(code.successors(blk).collect::<Vec<_>>().into_iter().rev());
     }
-    let step = fl.cx.step_ty(func);
+    let step = fl.cx.step_ty(func, &substs);
     let span = def.sig_span;
     let Some(step_ir) = fl.cx.lower_ty(fl.mb, step, span) else { return };
     let jb = JobBlocks { next, job, held, step: step_ir };
@@ -813,6 +822,13 @@ impl<'c, 'a> Fl<'c, 'a> {
         self.job
     }
 
+    /// Whether the place has a runtime value (its type lowers to one).
+    fn has_value(&mut self, p: &mir::Place) -> bool {
+        let t = self.place_src_ty(p);
+        let span = self.code.span;
+        self.cx.lower_ty(self.mb, t, span).is_some()
+    }
+
     /// Block `b` of a job's body as a case of its loop (see [`lower_job`]): its statements,
     /// then the block to run next, or the job's return.
     fn job_block(&mut self, b: BlockId, jb: &JobBlocks) {
@@ -914,7 +930,7 @@ impl<'c, 'a> Fl<'c, 'a> {
             }
             StatementKind::Bind { local, place, .. }
                 if self.rebound.contains(local)
-                    || (self.job && self.callable_of(place).is_none()) =>
+                    || (self.job && self.callable_of(place).is_none() && self.has_value(place)) =>
             {
                 self.bind_chosen(*local, place, s.span);
             }
@@ -2152,8 +2168,14 @@ impl<'c, 'a> Fl<'c, 'a> {
                 self.builtin(*b, args, t, span)
             }
             mir::Callee::Clone => self.clone_arg(c.args.first()?),
-            mir::Callee::JobStart(f) => crate::job::start(self, *f, &c.args),
-            mir::Callee::JobResume(f) => crate::job::resume(self, *f, &c.args, span),
+            mir::Callee::JobStart { func, args } => {
+                let substs: Vec<TyId> = args.iter().map(|&a| self.concrete(a)).collect();
+                crate::job::start(self, *func, &substs, &c.args)
+            }
+            mir::Callee::JobResume { func, args } => {
+                let substs: Vec<TyId> = args.iter().map(|&a| self.concrete(a)).collect();
+                crate::job::resume(self, *func, substs, &c.args, span)
+            }
             mir::Callee::Value(_) => {
                 self.cx.err(Diagnostic::internal("a call of a stored value reached lowering"));
                 None
