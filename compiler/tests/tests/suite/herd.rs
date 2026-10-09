@@ -489,8 +489,9 @@ fn a_realization_in_slices_is_the_whole_ones() {
 
 /// Ours at `cell`, as the spike's harness runs it: the room calibrated on the largest grid (a
 /// quarter more, and 1,024 to spare), then the 40 back to back, twice; the second run's counts
-/// and meshes, and each grazer's GPU time (its five dispatches), ms.
-fn realize_herd(host: &mut wrela_host::Host, cell: f32) -> (Vec<Ours>, Vec<f64>) {
+/// and meshes, each grazer's GPU time (its five dispatches), ms, and each dispatch's, a grazer's
+/// mean, by label.
+fn realize_herd(host: &mut wrela_host::Host, cell: f32) -> (Vec<Ours>, Vec<f64>, String) {
     let blocks = |host: &mut wrela_host::Host, s: u32| {
         let g = host.call_export("grid", &[Value::I32(s as i32), Value::F32(cell)]).expect("grid");
         let [Value::I32(x), Value::I32(y), Value::I32(z), _] = g[..] else { panic!("{g:?}") };
@@ -503,7 +504,7 @@ fn realize_herd(host: &mut wrela_host::Host, cell: f32) -> (Vec<Ours>, Vec<f64>)
     let (v, q) = (tally[3], tally[4]);
     let room = [Value::I32((v + v / 4 + 1024) as i32), Value::I32((q + q / 4 + 1024) as i32)];
     let _ = host.take_timings();
-    let mut times = Vec::new();
+    let (mut times, mut each) = (Vec::new(), Vec::new());
     for _ in 0..2 {
         let mut call = vec![Value::F32(cell)];
         call.extend(room);
@@ -511,11 +512,16 @@ fn realize_herd(host: &mut wrela_host::Host, cell: f32) -> (Vec<Ours>, Vec<f64>)
         let t = host.take_timings().expect("timings");
         assert!(t.is_empty() || t.len() == 200, "five dispatches a grazer");
         times = t.chunks_exact(5).map(|c| c.iter().map(|t| t.nanos).sum::<f64>() / 1e6).collect();
+        each = t[..5].iter().map(|d| (d.label.clone(), 0.0)).collect::<Vec<_>>();
+        for (i, d) in t.iter().enumerate() {
+            each[i % 5].1 += d.nanos / 1e6 / 40.0;
+        }
     }
     let b = host.buffers();
     let meshes = &b[b.len() - 40 * MESH_BUFFERS..];
     let ours = meshes.chunks_exact(MESH_BUFFERS).map(|mesh| read_mesh(host, mesh)).collect();
-    (ours, times)
+    let each = each.iter().map(|(l, ms)| format!("{l} {ms:.3}")).collect::<Vec<_>>().join(", ");
+    (ours, times, each)
 }
 
 /// AC2: over the 40 grazers at 3, 2, 1.5 and 1 cm cells, on the fixture's own grids, ours
@@ -532,14 +538,15 @@ fn realization_matches_the_spikes() {
     let mut report = Vec::new();
     for (k, cell) in [0.03, 0.02, 0.015, 0.01].into_iter().enumerate() {
         let (mut our_ms, mut their_ms) = (Vec::new(), Vec::new());
-        let (mut ours, mut theirs, mut inds) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut ours, mut theirs, mut inds, mut each) =
+            (Vec::new(), Vec::new(), Vec::new(), String::new());
         for _ in 0..3 {
             let (t, i) = spike.extract_herd(cell, 40);
             their_ms.push(median(&t.iter().map(|e| e.gpu_ms).collect::<Vec<_>>()));
             (theirs, inds) = (t, i);
-            let (o, times) = realize_herd(&mut host, cell as f32);
+            let (o, times, e) = realize_herd(&mut host, cell as f32);
             our_ms.push(median(&times));
-            ours = o;
+            (ours, each) = (o, e);
         }
         let mut hausdorff: f32 = 0.0;
         let mut tri_off: f64 = 0.0;
@@ -565,7 +572,7 @@ fn realization_matches_the_spikes() {
         let (ms, tms) = (median(&our_ms), median(&their_ms));
         let holes: u32 = ours.iter().map(|o| o.holes).sum();
         let line = format!(
-            "{cell} m: live blocks {live} (spike {their_live}), holes {holes} (spike {}), triangles within {:.2}%, Hausdorff {:.1}% of a cell (but {at_holes} vertices at the spike's holes, within a cell), GPU {ms:.2} ms (spike {tms:.2}): {:.2}x",
+            "{cell} m: live blocks {live} (spike {their_live}), holes {holes} (spike {}), triangles within {:.2}%, Hausdorff {:.1}% of a cell (but {at_holes} vertices at the spike's holes, within a cell), GPU {ms:.2} ms (spike {tms:.2}): {:.2}x ({each})",
             theirs.iter().map(|e| e.holes).sum::<u32>(),
             tri_off * 100.0,
             hausdorff * 100.0,
