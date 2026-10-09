@@ -7,7 +7,7 @@ import { MAX_WORKERS, SCREEN_FORMAT } from "./abi.gen.ts";
 import { LIMIT_SOURCES } from "./check.ts";
 import { errorMessage } from "./errors.ts";
 import { fitSize, frameSeconds, VisibleClock } from "./frame.ts";
-import { alignTo, type GpuExecutor, type PipelineCache, type Timing } from "./gpu.ts";
+import { alignTo, type GpuExecutor, type PipelineCache, type Timing, timeEachPipeline } from "./gpu.ts";
 import { arrivals, epochNow, InputRing, parseScript, type Scripted } from "./input.ts";
 import { browserIo, type Build, loadBuild, startProgram } from "./loader.ts";
 import { Live } from "./live.ts";
@@ -19,6 +19,26 @@ import { lockstepTicks, runTicker, TickerControl, TickerMode } from "./ticker.ts
 import { wasmHash } from "./ticks.ts";
 
 declare const self: DedicatedWorkerGlobalScope;
+
+/** `build` with code no cache has seen: each pipeline's entry points start by storing `n` in a
+ * variable of their own, so the shaders the GPU's compiler gets differ from any it compiled
+ * before. A comment or a new name wouldn't do: the WGSL compiler drops comments and renames
+ * every symbol, so its output, which the GPU's compiler caches by, would be the same. */
+function salt(build: Build, n: number): Build {
+  const shaders = build.shaders.map((wgsl, i) => {
+    const p = build.manifest.pipelines[i]!;
+    const entries = p.kind === "compute" ? [p.entry] : [p.vertex_entry, p.fragment_entry];
+    let out = wgsl;
+    for (const entry of entries) {
+      const at = out.search(new RegExp(`\\bfn ${entry}\\(`));
+      const body = at < 0 ? -1 : out.indexOf("{", at);
+      if (body < 0) throw new Error(`pipeline ${i} declares no entry point \`${entry}\``);
+      out = `${out.slice(0, body + 1)}\n    wrela_salt = ${n}u;${out.slice(body + 1)}`;
+    }
+    return `${out}\nvar<private> wrela_salt: u32;\n`;
+  });
+  return { ...build, shaders };
+}
 
 /** The GPU, its adapter or device failed, or reported an error. */
 class GpuError extends Error {
@@ -217,6 +237,7 @@ async function run(canvas: OffscreenCanvas, device: GPUDevice, build: Build, liv
       { cache: live ? pipelineCache : undefined },
     );
   let program = await start(build, null);
+  (program.executor as GpuExecutor).built.catch(fatal);
   ticker.control.go(TickerMode.CLOCK);
   const max = device.limits.maxTextureDimension2D;
   // A debug build's bounds checks: the flag is read after a frame, one read at a time.
@@ -238,16 +259,19 @@ async function run(canvas: OffscreenCanvas, device: GPUDevice, build: Build, liv
         swapping = true;
         swap(program, next, frames, start).then((p) => {
           program = p;
+          (p.executor as GpuExecutor).built.catch(fatal);
           ticker.control.go(TickerMode.CLOCK);
           live!.swapped();
           swapping = false;
         }, fatal);
       }
-      if (swapping) {
+      const executor = program.executor as GpuExecutor;
+      // A frame waits while the last one's commands wait for a pipeline being built (the
+      // program starts as its pipelines build): the canvas keeps the last frame meanwhile.
+      if (swapping || executor.waiting) {
         self.requestAnimationFrame(tick);
         return;
       }
-      const executor = program.executor as GpuExecutor;
       const time = frameSeconds(clock, performance.timeOrigin + now);
       if (time !== null) {
         const { width, height } = fitSize(size.width, size.height, max);
@@ -337,10 +361,7 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
   const frameEvents = arrivals(script).frames;
   const hashes = params.nohash === 0;
   let pipelinesMs: number | null = null;
-  const salted =
-    params.salt > 0
-      ? { ...build, shaders: build.shaders.map((s, i) => `${s}\n// salt ${params.salt} ${i}\n`) }
-      : build;
+  const salted = params.salt > 0 ? salt(build, params.salt) : build;
   const target = {
     texture: () => screen,
       // Saturated, the canvas is left alone: it shows a frame per display refresh, and would
@@ -378,6 +399,7 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
     );
   let program = await start(salted, null);
   let executor = program.executor as GpuExecutor;
+  executor.built.catch(fatal);
   if (timing !== "off" && !executor.timed) throw new GpuError("the test asks for timestamps, but this device has no timestamp queries");
   let hz = program.ticker?.hz ?? 0;
   const schedule = params.paced > 0 ? TickerMode.CLOCK : TickerMode.LOCKSTEP;
@@ -408,6 +430,7 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
     if (next !== null) {
       program = await swap(program, next, i, start);
       executor = program.executor as GpuExecutor;
+      executor.built.catch(fatal);
       hz = program.ticker?.hz ?? 0;
       if (hz > 0) ticker.control.go(schedule);
       live!.swapped();
@@ -434,6 +457,8 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
       if (params.framedelay > 0) holdFor(params.framedelay);
       cpu.push(performance.now() - began);
     });
+    // The frame's commands that wait for a pipeline being built run once it is.
+    await executor.caughtUp();
     if (timing === "serial") {
       // The serial timing mode runs the frame's passes now, one at a time.
       draining = draining.then(() => scoped(device, () => executor.drain()));
@@ -451,6 +476,9 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
     executor.presented = false;
   }
   await draining;
+  // Where the pipelines' time went: each built again alone, from code no cache has seen.
+  const again = params.salt > 0 ? salt(build, params.salt + 7919) : null;
+  const each = again ? await timeEachPipeline(device, again.manifest, again.shaders) : [];
   const hash = program.hash;
   if (hz > 0) {
     ticker.control.stop();
@@ -469,7 +497,7 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
     putResult(base, "log.txt", printed.map((l) => `${l}\n`).join("")),
     putResult(base, "frames.json", JSON.stringify({ cpu_ms: cpu, began_ms, printed_in })),
     timing !== "off" ? executor.timings().then((t) => putResult(base, "timings.json", JSON.stringify(t))) : null,
-    params.salt > 0 ? putResult(base, "pipelines.json", JSON.stringify({ ms: pipelinesMs, count: build.manifest.pipelines.length })) : null,
+    params.salt > 0 ? putResult(base, "pipelines.json", JSON.stringify({ ms: pipelinesMs, count: build.manifest.pipelines.length, each })) : null,
     putResult(base, "memory.json", JSON.stringify({ gpu: executor.memory, wasm: program.memoryBytes })),
   ]);
   if (params.audio > 0) {

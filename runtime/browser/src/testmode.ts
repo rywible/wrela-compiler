@@ -25,8 +25,8 @@
 // held that much longer; with `framedelay=ms`, each frame. With `saturate=1`, each frame starts
 // as soon as the last is recorded, not at its time, with at most two frames on the GPU and the
 // canvas left alone (it would pace them by the display): a GPU that sets its clock by its load
-// stays busy, so a frame's GPU time is its work (GPU budgets). With `salt=n`, each shader gets a
-// comment that makes it unique, so no cache serves its pipelines, and `pipelines.json` has how
+// stays busy, so a frame's GPU time is its work (GPU budgets). With `salt=n`, each pipeline's entry points
+// store n first, so no cache serves its pipelines (worker.ts `salt`), and `pipelines.json` has how
 // long creating them all, at once, took (#42 AC4's cold pipelines). `load.json` has when the page opened
 // and each file it loaded; `memory.json` the bytes of the program's GPU buffers and textures (at
 // the end, and at most) and of its WASM memory (reserved, and grown to). It's part of the shipped bundle, so the agreement test runs

@@ -1524,6 +1524,74 @@ fn the_probes_match_a_brute_force_reference() {
     assert!(share <= 0.025, "{:.2}% of pixels are over 8/255 from the reference", share * 100.0);
 }
 
+// ---- the cold start's budget -----------------------------------------------------------------
+
+/// A salt for a cold run (test mode's `salt`): new each time, so no cache has seen the code.
+fn fresh_salt(k: u32) -> u32 {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).expect("a clock");
+    now.as_secs() as u32 % 1_000_000 + k + 1
+}
+
+/// The cold start's budget (vision.md: playable within 5 s of opening the page, at most 8 MB
+/// downloaded): the clearing's shipped build, served from this machine, every pipeline created
+/// cold (no cache has seen its code: test mode's `salt`), draws its first frame after its load
+/// within `PLAYABLE_MS` of the page's opening, at 1080p in Chrome on the reference device.
+/// `PLAYABLE_MS` leaves 1 s of the 5 for the download (8 MB at 64 Mbit/s). Reported beside:
+/// how long creating the pipelines took, and the costliest of them, each built again alone.
+#[test]
+#[ignore = "measure: a cold start's time budget, needs Chrome, python3 and a GPU"]
+fn the_clearing_is_playable_cold_within_its_budget() {
+    const PLAYABLE_MS: f64 = 4000.0;
+    let (dir, rel) = wrela_tests::shipped_page("examples/clearing", "clearing-cold");
+    let mut playable = Vec::new();
+    let (mut pipelines_ms, mut count, mut each) = (Vec::new(), 0, Vec::new());
+    for k in 0..3u32 {
+        let run = wrela_tests::ChromeRun {
+            salt: fresh_salt(k),
+            nohash: true,
+            ..wrela_tests::ChromeRun::new(240, W, H, 60.0)
+        };
+        let r = wrela_tests::run_in_chrome_with(&rel, run);
+        let results = dir.join("results");
+        let opened = wrela_tests::result_json(&results, "load.json")["opened_ms"]
+            .as_f64()
+            .expect("opened_ms");
+        let ready = r
+            .printed
+            .iter()
+            .find_map(|(_, l)| {
+                l.strip_prefix("clearing ready at frame ")
+                    .and_then(|n| n.trim().parse::<usize>().ok())
+            })
+            .expect("the clearing got ready");
+        playable.push(r.began_ms[ready + 1] - opened);
+        let p = wrela_tests::result_json(&results, "pipelines.json");
+        pipelines_ms.push(p["ms"].as_f64().expect("ms"));
+        count = p["count"].as_u64().expect("count");
+        each = p["each"].as_array().expect("each").clone();
+    }
+    let ms = wrela_tests::median(&playable);
+    eprintln!(
+        "cold: the clearing playable {ms:.0} ms after the page opened (runs {playable:.0?}); its {count} pipelines created in {:.0} ms",
+        wrela_tests::median(&pipelines_ms)
+    );
+    // Where the pipelines' time goes: each built alone (the last run's), the costliest first.
+    let mut alone: Vec<(f64, &str, &str)> = each
+        .iter()
+        .map(|e| {
+            let ms = e["ms"].as_f64().expect("ms");
+            (ms, e["name"].as_str().expect("name"), e["kind"].as_str().expect("kind"))
+        })
+        .collect();
+    alone.sort_by(|a, b| b.0.total_cmp(&a.0));
+    let sum: f64 = alone.iter().map(|a| a.0).sum();
+    eprintln!("the pipelines alone, one after another: {sum:.0} ms; the costliest:");
+    for (ms, name, kind) in alone.iter().take(8) {
+        eprintln!("  {ms:6.0} ms  {kind:7}  {name}");
+    }
+    assert!(ms <= PLAYABLE_MS, "playable {ms:.0} ms after the page opened, over {PLAYABLE_MS} ms");
+}
+
 // ---- the sky (AC6) ---------------------------------------------------------------------------
 
 /// AC6: the clouds and the probes are cooked at load in strips, so no submission runs long:

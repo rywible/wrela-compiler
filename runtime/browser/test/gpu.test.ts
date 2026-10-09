@@ -2,7 +2,7 @@
 // the same behaviour on a real GPU).
 
 import { describe, expect, test } from "bun:test";
-import { buildPipelines, GpuExecutor, ShaderError } from "../src/gpu.ts";
+import { type BuiltPipeline, buildPipelines, GpuExecutor, ShaderError } from "../src/gpu.ts";
 import type { Manifest } from "../src/manifest.ts";
 import { NONE } from "../src/abi.gen.ts";
 import { decode } from "../src/stream.ts";
@@ -15,7 +15,7 @@ const SHADER = "// fine\n";
 
 async function setup(manifest: Manifest = shapes(), screen: ScreenTarget = { texture: () => fakeTexture("screen") }) {
   const device = new FakeDevice();
-  const pipelines = await buildPipelines(device.gpu, manifest, manifest.pipelines.map(() => SHADER));
+  const pipelines = await Promise.all(buildPipelines(device.gpu, manifest, manifest.pipelines.map(() => SHADER)));
   const executor = new GpuExecutor(device.gpu, pipelines, screen);
   /** Runs a batch's commands (already valid: these tests are about the mapping). */
   const run = (e: Encoder) => {
@@ -44,9 +44,9 @@ describe("pipelines", () => {
   test("report WGSL errors with the pipeline, shader and line", async () => {
     const device = new FakeDevice();
     const m = shapes();
-    const build = buildPipelines(device.gpu, m, [SHADER, "fn main() {\n  ERROR;\n}"]);
+    const build = Promise.all(buildPipelines(device.gpu, m, [SHADER, "fn main() {\n  ERROR;\n}"]));
     await expect(build).rejects.toThrow(ShaderError);
-    await expect(buildPipelines(device.gpu, m, [SHADER, "\nERROR"])).rejects.toThrow(
+    await expect(Promise.all(buildPipelines(device.gpu, m, [SHADER, "\nERROR"]))).rejects.toThrow(
       "pipeline `compute` (shader compute.wgsl) failed to build:\n2:3: unresolved identifier",
     );
   });
@@ -54,7 +54,7 @@ describe("pipelines", () => {
   test("report validation errors from building", async () => {
     const device = new FakeDevice();
     device.pipelineErrors.set("compute", "entry point `main` not found");
-    await expect(buildPipelines(device.gpu, shapes(), [SHADER, SHADER])).rejects.toThrow(
+    await expect(Promise.all(buildPipelines(device.gpu, shapes(), [SHADER, SHADER]))).rejects.toThrow(
       "pipeline `compute` (shader compute.wgsl) failed to build:\nentry point `main` not found",
     );
   });
@@ -62,14 +62,14 @@ describe("pipelines", () => {
   test("report each layout's validation error against its own pipeline, though they build at once", async () => {
     const device = new FakeDevice();
     device.layoutErrors.set("draw", "binding 1 is used twice");
-    const build = buildPipelines(device.gpu, shapes(), [SHADER, SHADER]);
+    const build = Promise.all(buildPipelines(device.gpu, shapes(), [SHADER, SHADER]));
     await expect(build).rejects.toThrow("pipeline `draw` (shader draw.wgsl) failed to build:\nbinding 1 is used twice");
   });
 
   test("reject uniform blocks over the device's limit", async () => {
     const m = shapes();
     m.pipelines[0]!.uniform = { binding: 0, size: 65_552, space: "uniform" };
-    await expect(buildPipelines(new FakeDevice().gpu, m, [SHADER, SHADER])).rejects.toThrow(
+    await expect(Promise.all(buildPipelines(new FakeDevice().gpu, m, [SHADER, SHADER]))).rejects.toThrow(
       "its uniform block is 65552 bytes; the limit is 65536",
     );
   });
@@ -426,6 +426,45 @@ test("a readback submits the work before it, then copies its range out", async (
   readback.contents = Uint8Array.of(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12);
   expect(Array.from(await staging)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
   expect(readback.destroyed).toBe(true);
+});
+
+test("a command whose pipeline is still being built waits for it, and the commands after it wait behind it", async () => {
+  const device = new FakeDevice();
+  const m = shapes();
+  const [draw, compute] = await Promise.all(buildPipelines(device.gpu, m, m.pipelines.map(() => SHADER)));
+  const later = Promise.withResolvers<BuiltPipeline>();
+  const executor = new GpuExecutor(device.gpu, [draw!, later.promise], { texture: () => fakeTexture("screen") });
+  const e = new Encoder().createBuffer(1, 64).createBuffer(2, 64).dispatch(1, [1, 1, 1], [1, 2], u(0)).writeBuffer(1, 0, words([7]));
+  for (const cmd of decode(e.finish())) executor.execute(cmd);
+  const answer = executor.readBack(2, 0, 4);
+  executor.flush();
+  // The buffers are made; the dispatch, the write after it and the readback wait.
+  expect(executor.waiting).toBe(true);
+  expect(kinds(device.events)).toEqual([]);
+  const caughtUp = executor.caughtUp();
+  later.resolve(compute!);
+  await caughtUp;
+  expect(executor.waiting).toBe(false);
+  // The readback after them copies once they're submitted.
+  expect(kinds(device.events)).toEqual(["dispatch", "copyBuffer", "writeBuffer", "writeBuffer", "submit", "copyBuffer", "submit"]);
+  expect((await answer).length).toBe(4);
+});
+
+test("a pipeline that can't be built fails the program: caughtUp and built reject", async () => {
+  const device = new FakeDevice();
+  const m = shapes();
+  const [draw] = await Promise.all(buildPipelines(device.gpu, m, m.pipelines.map(() => SHADER)));
+  const failing = Promise.withResolvers<BuiltPipeline>();
+  const executor = new GpuExecutor(device.gpu, [draw!, failing.promise], { texture: () => fakeTexture("screen") });
+  for (const cmd of decode(new Encoder().createBuffer(1, 64).createBuffer(2, 64).dispatch(1, [1, 1, 1], [1, 2], u(0)).finish())) {
+    executor.execute(cmd);
+  }
+  const why = (p: Promise<void>) => p.then(() => "built", (e: Error) => e.message);
+  const caughtUp = why(executor.caughtUp());
+  const built = why(executor.built);
+  failing.reject(new Error("pipeline `compute` failed to build"));
+  expect(await caughtUp).toBe("pipeline `compute` failed to build");
+  expect(await built).toBe("pipeline `compute` failed to build");
 });
 
 test("the program's buffers and textures are counted in bytes, now and at most", async () => {

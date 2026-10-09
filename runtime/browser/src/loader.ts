@@ -102,8 +102,11 @@ export interface GpuOptions {
   cache?: PipelineCache | undefined;
 }
 
-/** Builds every pipeline while the WASM compiles, then instantiates the program with the
- * decoder behind its import. */
+/** Starts building every pipeline, compiles the WASM meanwhile, then instantiates the program
+ * with the decoder behind its import. The program starts while its pipelines build: a command
+ * that needs one waits for it (`GpuExecutor`), and the frames wait for the commands
+ * (`GpuExecutor.caughtUp`). A pipeline that can't be built fails the program, through the
+ * executor's `built`. */
 export async function startProgram(
   device: GPUDevice,
   build: Build,
@@ -112,12 +115,11 @@ export async function startProgram(
   gpu: GpuOptions = {},
 ): Promise<Program> {
   const started = performance.now();
-  const built = buildPipelines(device, build.manifest, build.shaders, gpu.cache).then((p) => {
-    gpu.onPipelines?.(performance.now() - started);
-    return p;
-  });
-  const [pipelines, compiled] = await Promise.all([built, Program.compile(build.wasm)]);
-  const executor = new GpuExecutor(device, pipelines, screen, gpu.timing);
+  const pipelines = buildPipelines(device, build.manifest, build.shaders, gpu.cache);
+  const compiled = await Program.compile(build.wasm);
+  const debug = build.manifest.pipelines.some((p) => p.debug_flag !== null);
+  const executor = new GpuExecutor(device, pipelines, screen, gpu.timing, debug);
+  executor.built.then(() => gpu.onPipelines?.(performance.now() - started), () => {});
   const checker = new Checker(build.manifest, limitsOf(device.limits));
   return Program.instantiate(compiled, checker, executor, options);
 }

@@ -433,6 +433,12 @@ pub fn page(pkg: &str, name: &str) -> (PathBuf, String) {
     page_built_by(pkg, name, "release", |p| wrela_driver::build_for_tests(p, false))
 }
 
+/// [`page`] with the build a player loads: a release build, not a test build (no `@testing`
+/// exports, and none of the pipelines only tests reach).
+pub fn shipped_page(pkg: &str, name: &str) -> (PathBuf, String) {
+    page_built_by(pkg, name, "shipped", wrela_driver::build)
+}
+
 /// [`page`] with a debug build (language.md §11's checks).
 pub fn debug_page(pkg: &str, name: &str) -> (PathBuf, String) {
     page_built_by(pkg, name, "debug", |p| wrela_driver::build_for_tests(p, true))

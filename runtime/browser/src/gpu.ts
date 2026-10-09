@@ -269,6 +269,22 @@ async function buildPipeline(device: GPUDevice, p: Pipeline, source: string): Pr
   return { name: p.name, layout, compute, render, uniform: p.uniform, bindings: p.bindings, debugFlag: p.debug_flag };
 }
 
+/** How long building each pipeline of `manifest` alone took (ms), one after another: where a
+ * build's time to create its pipelines goes (test mode's `salt`). */
+export async function timeEachPipeline(
+  device: GPUDevice,
+  manifest: Manifest,
+  shaders: string[],
+): Promise<{ name: string; kind: "compute" | "render"; ms: number }[]> {
+  const each = [];
+  for (const [i, p] of manifest.pipelines.entries()) {
+    const started = performance.now();
+    await buildPipeline(device, p, shaders[i]!);
+    each.push({ name: p.name, kind: p.kind, ms: performance.now() - started });
+  }
+  return each;
+}
+
 /** The pipelines a build has, by a hash of each one's manifest entry and WGSL (`pipelineKey`):
  * what the next build keeps, in a hot reload. */
 export type PipelineCache = Map<string, Promise<BuiltPipeline>>;
@@ -280,26 +296,34 @@ function pipelineKey(p: Pipeline, source: string): string {
   return hash.hex();
 }
 
-/** Builds every pipeline up front. `shaders[i]` is pipeline `i`'s WGSL. With `cache` (a hot
- * reload), a pipeline whose manifest entry and WGSL are the same as one of the last build's is
- * kept, and the cache then holds this build's pipelines alone. */
+/** Starts building every pipeline, all at once: each one's promise. `shaders[i]` is pipeline
+ * `i`'s WGSL. With `cache` (a hot reload), a pipeline whose manifest entry and WGSL are the same
+ * as one of the last build's is kept, and the cache then holds this build's pipelines alone. */
 export function buildPipelines(
   device: GPUDevice,
   manifest: Manifest,
   shaders: string[],
   cache?: PipelineCache,
-): Promise<BuiltPipeline[]> {
-  if (!cache) return Promise.all(manifest.pipelines.map((p, i) => buildPipeline(device, p, shaders[i]!)));
+): Promise<BuiltPipeline>[] {
+  // The biggest shaders start first: they take longest to compile, and the GPU process
+  // compiles a few at a time, so started last they'd finish last of all.
+  const order = manifest.pipelines.map((_, i) => i).sort((a, b) => shaders[b]!.length - shaders[a]!.length);
+  const built: Promise<BuiltPipeline>[] = [];
+  if (!cache) {
+    for (const i of order) built[i] = buildPipeline(device, manifest.pipelines[i]!, shaders[i]!);
+    return built;
+  }
   const used: PipelineCache = new Map();
-  const built = manifest.pipelines.map((p, i) => {
+  for (const i of order) {
+    const p = manifest.pipelines[i]!;
     const key = pipelineKey(p, shaders[i]!);
     const pipeline = used.get(key) ?? cache.get(key) ?? buildPipeline(device, p, shaders[i]!);
     used.set(key, pipeline);
-    return pipeline;
-  });
+    built[i] = pipeline;
+  }
   cache.clear();
   for (const [key, pipeline] of used) cache.set(key, pipeline);
-  return Promise.all(built);
+  return built;
 }
 
 /** A draw waiting for its pass to end, with its own copy of its uniform bytes. */
@@ -517,17 +541,46 @@ export class GpuExecutor {
   /** The serial timing mode's commands, waiting for `drain` to run them each pass and dispatch
    * alone; null in the other modes, which run each command as it comes. */
   readonly #deferred: Deferred[] | null;
+  /** Each pipeline once it's built; `undefined` until then. The program starts while its
+   * pipelines build: a command that needs one not built yet waits for it in `#waiting`, and
+   * every command after it waits behind it, so they run in order. */
+  readonly #pipelines: (BuiltPipeline | undefined)[];
+  readonly #building: Promise<BuiltPipeline>[];
+  readonly #waiting: Deferred[] = [];
+  /** Resolved when no command waits any more (`caughtUp`). */
+  #idle: PromiseWithResolvers<void> | null = null;
+  /** Why a pipeline couldn't be built: the program has failed (`caughtUp` rejects with it). */
+  #failed: unknown = null;
+  /** Resolved when every pipeline is built; rejected, with why, if one can't be. */
+  readonly built: Promise<void>;
 
   /** Timed, on a device with "timestamp-query", each pass's GPU time is recorded (`timings`); in
    * the serial mode each pass and dispatch runs alone, so its time is its own (the program's
    * commands then wait for `drain`, which test mode calls after each frame). */
   constructor(
     readonly device: GPUDevice,
-    readonly pipelines: BuiltPipeline[],
+    pipelines: (BuiltPipeline | Promise<BuiltPipeline>)[],
     readonly screen: ScreenTarget,
     timing: Timing = "off",
+    debug = pipelines.some((p) => !(p instanceof Promise) && p.debugFlag !== null),
   ) {
     this.#deferred = timing === "serial" ? [] : null;
+    this.#pipelines = pipelines.map((p) => (p instanceof Promise ? undefined : p));
+    this.#building = pipelines.map((p) => Promise.resolve(p));
+    this.built = Promise.all(this.#building).then(() => {});
+    pipelines.forEach((p, i) => {
+      if (!(p instanceof Promise)) return;
+      p.then(
+        (built) => {
+          this.#pipelines[i] = built;
+          this.#resume();
+        },
+        (e) => {
+          this.#failed ??= e;
+          this.#idle?.reject(e);
+        },
+      );
+    });
     const l = device.limits;
     this.#align = Math.max(l.minUniformBufferOffsetAlignment, l.minStorageBufferOffsetAlignment);
     this.#uniforms = new Ring(
@@ -538,7 +591,7 @@ export class GpuExecutor {
     );
     this.#uploads = new Ring(device, "upload ring", GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST, UPLOAD_START);
     this.#timer = timing !== "off" && device.features.has("timestamp-query") ? new Timer(device) : null;
-    this.#debugFlag = pipelines.some((p) => p.debugFlag !== null)
+    this.#debugFlag = debug
       ? {
           buffer: device.createBuffer({ label: "debug flag", size: 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC }),
           readback: this.#readbackBuffer(4),
@@ -555,7 +608,7 @@ export class GpuExecutor {
     const bytes = await this.#copyBack(this.#debugFlag.buffer, 0, 4, this.#debugFlag.readback);
     const code = new DataView(bytes.buffer).getUint32(0, true);
     if (code === 0) return;
-    const p = this.pipelines[code - 1];
+    const p = this.#pipelines[code - 1];
     const name = p === undefined ? `number ${code}` : `\`${p.name}\``;
     throw new Error(
       `GPU error: debug build: pipeline ${name} indexed an array out of range (in this frame, or a call before it); WGSL then reads or writes an element in range, or a zero`,
@@ -589,7 +642,53 @@ export class GpuExecutor {
    * copy (`readBack`). */
   execute(cmd: Command): void {
     if (this.#deferred !== null) this.#deferred.push({ cmd: copied(cmd), frame: this.frame });
+    else if (this.#waiting.length > 0 || !this.#ready(cmd)) this.#waiting.push({ cmd: copied(cmd), frame: this.frame });
     else this.#run(cmd);
+  }
+
+  /** Whether a command waits for a pipeline being built. */
+  get waiting(): boolean {
+    return this.#waiting.length > 0;
+  }
+
+  /** Resolves once no command waits for a pipeline being built (at once, if none does); rejects
+   * if a pipeline couldn't be built. */
+  caughtUp(): Promise<void> {
+    if (this.#failed !== null) return Promise.reject(this.#failed);
+    if (this.#waiting.length === 0) return Promise.resolve();
+    this.#idle ??= Promise.withResolvers<void>();
+    return this.#idle.promise;
+  }
+
+  /** Whether `cmd`'s pipeline, if it has one, is built. */
+  #ready(cmd: Command): boolean {
+    return !("pipeline" in cmd) || this.#pipelines[cmd.pipeline] !== undefined;
+  }
+
+  /** A pipeline was built: the commands waiting run, up to the next that needs one not built,
+   * and what they recorded is submitted. */
+  #resume(): void {
+    if (this.#waiting.length === 0) return;
+    while (this.#waiting.length > 0) {
+      const d = this.#waiting[0]!;
+      if ("cmd" in d && !this.#ready(d.cmd)) return;
+      this.#waiting.shift();
+      if ("cmd" in d) this.#runAs(d.frame, d.cmd);
+      else this.readBack(d.handle, d.offset, d.size, true).then(d.answer.resolve, d.answer.reject);
+    }
+    this.flush();
+    this.#idle?.resolve();
+    this.#idle = null;
+  }
+
+  /** Runs `cmd` as part of `frame`: its timings are that frame's. */
+  #runAs(frame: number, cmd: Command): void {
+    this.#running = frame;
+    try {
+      this.#run(cmd);
+    } finally {
+      this.#running = null;
+    }
   }
 
   /** The serial mode: runs the commands kept since the last call, submitting each pass and
@@ -597,6 +696,7 @@ export class GpuExecutor {
   async drain(): Promise<void> {
     if (this.#deferred === null) return;
     for (const d of this.#deferred.splice(0)) {
+      if ("cmd" in d && "pipeline" in d.cmd) await this.#building[d.cmd.pipeline];
       if ("cmd" in d) {
         // Its timings are the frame's that recorded it, which may have been before the one
         // being recorded now.
@@ -775,9 +875,10 @@ export class GpuExecutor {
    * a `ReadBuffer` request's answer. In the serial mode it waits its turn behind the commands
    * kept for `drain`, unless `now`. */
   readBack(handle: number, offset: number, size: number, now = false): Promise<Bytes> {
-    if (this.#deferred !== null && !now) {
+    const queue = this.#deferred ?? (this.#waiting.length > 0 ? this.#waiting : null);
+    if (queue !== null && !now) {
       const answer = Promise.withResolvers<Bytes>();
-      this.#deferred.push({ handle, offset, size, answer });
+      queue.push({ handle, offset, size, answer });
       return answer.promise;
     }
     this.flush();
@@ -853,8 +954,8 @@ export class GpuExecutor {
   }
 
   #pipeline(index: number): BuiltPipeline {
-    const p = this.pipelines[index];
-    if (p === undefined) throw new Error(`host bug: pipeline ${index} passed the checks but doesn't exist`);
+    const p = this.#pipelines[index];
+    if (p === undefined) throw new Error(`host bug: pipeline ${index} passed the checks but isn't built`);
     return p;
   }
 
