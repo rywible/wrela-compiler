@@ -22,6 +22,10 @@ pub mod print;
 pub mod scalarize;
 mod single_exit;
 mod types;
+
+/// Texture formats and render targets are the ABI's: what the manifest and the stream carry.
+pub use wrela_abi::manifest::RenderTarget;
+pub use wrela_abi::stream::TextureFormat;
 pub mod uniformity;
 mod unroll;
 mod verify;
@@ -331,18 +335,11 @@ pub enum HostOp {
         uniform: Option<TypeId>,
         indirect: bool,
         indexed: bool,
-        /// What its pass draws into: one of the pipeline's targets (the manifest's).
-        target: DrawTarget,
+        /// What its pass draws into, as its type says: one of the pipeline's targets (the
+        /// manifest's).
+        target: RenderTarget,
     },
     Present,
-}
-
-/// What a draw's pass draws into, as its type says: a colour target of a format (none in a pass
-/// that draws only depths; the screen's is `Rgba8Unorm`), and a depth target or none.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct DrawTarget {
-    pub color: Option<TexFormat>,
-    pub depth: bool,
 }
 
 /// Raw memory (CPU only): what std's unsafe core is built on (language.md §6.14). Addresses are
@@ -650,40 +647,19 @@ pub enum ResourceKind {
     /// `texture_2d<f32>` (`texture_2d<u32>` of a `u32` format), `texture_depth_2d`, or
     /// `texture_3d<..>` when `three`. Sampled with a `vec2`, or a `vec3` when `three`. A depth
     /// texture's `format` is `R32Float`, its depths'.
-    Texture { depth: bool, three: bool, format: TexFormat },
+    Texture { depth: bool, three: bool, format: TextureFormat },
     /// `texture_storage_2d<format, write>`, or `texture_storage_3d` when `three`: a kernel's
     /// texels to write.
-    StorageTexture { three: bool, format: TexFormat },
+    StorageTexture { three: bool, format: TextureFormat },
     /// `sampler`, or `sampler_comparison`.
     Sampler { comparison: bool },
 }
 
-/// A colour texture's format (`std::gpu`'s format types, language.md §12): what a texel holds,
-/// and how GPU code reads it. It reads and writes four of the format's scalar, the channels it
-/// lacks ignored when written and 0 (alpha 1) when read.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum TexFormat {
-    Rgba8Unorm,
-    Rgba16Float,
-    R16Float,
-    Rg16Float,
-    R32Float,
-    R32Uint,
-}
-
-impl TexFormat {
-    /// The scalar GPU code reads and writes it in.
-    pub fn scalar(self) -> Scalar {
-        match self {
-            TexFormat::R32Uint => Scalar::U32,
-            _ => Scalar::F32,
-        }
-    }
-
-    /// Whether GPU code can filter between its texels (WebGPU's core formats).
-    pub fn filterable(self) -> bool {
-        !matches!(self, TexFormat::R32Float | TexFormat::R32Uint)
-    }
+/// The scalar GPU code reads and writes a colour texture of format `f` in (`std::gpu`'s format
+/// types, language.md §12): four of it, the channels the format lacks ignored when written and
+/// 0 (alpha 1) when read.
+pub fn texel_scalar(f: TextureFormat) -> Scalar {
+    if f.is_uint() { Scalar::U32 } else { Scalar::F32 }
 }
 
 #[derive(Clone, Debug, PartialEq)]

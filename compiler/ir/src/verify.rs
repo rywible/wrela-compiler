@@ -222,7 +222,7 @@ impl Verifier<'_> {
                         TypeDef::Scalar(Scalar::F32)
                     }
                     TextureOp::Load if depth => TypeDef::Scalar(Scalar::F32),
-                    _ => TypeDef::Vector(format.scalar(), 4),
+                    _ => TypeDef::Vector(crate::texel_scalar(format), 4),
                 };
                 types.lookup(&out)
             }
@@ -233,7 +233,7 @@ impl Verifier<'_> {
                 };
                 let u32_ = TypeDef::Scalar(Scalar::U32);
                 let mut want = vec![u32_; if three { 3 } else { 2 }];
-                want.push(TypeDef::Vector(format.scalar(), 4));
+                want.push(TypeDef::Vector(crate::texel_scalar(format), 4));
                 if xs.len() != want.len()
                     || xs.iter().zip(&want).any(|(x, w)| self.def(self.ty(*x)) != w)
                 {

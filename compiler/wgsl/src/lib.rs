@@ -294,7 +294,7 @@ impl<'m> Cx<'m> {
                 let class = if depth {
                     naga::ImageClass::Depth { multi: false }
                 } else {
-                    let kind = match format.scalar() {
+                    let kind = match ir::texel_scalar(format) {
                         ir::Scalar::U32 => ScalarKind::Uint,
                         _ => ScalarKind::Float,
                     };
@@ -305,11 +305,13 @@ impl<'m> Cx<'m> {
             }
             ir::ResourceKind::StorageTexture { three, format } => {
                 let format = match format {
-                    ir::TexFormat::Rgba8Unorm => naga::StorageFormat::Rgba8Unorm,
-                    ir::TexFormat::Rgba16Float => naga::StorageFormat::Rgba16Float,
-                    ir::TexFormat::R32Float => naga::StorageFormat::R32Float,
-                    ir::TexFormat::R32Uint => naga::StorageFormat::R32Uint,
-                    f @ (ir::TexFormat::R16Float | ir::TexFormat::Rg16Float) => {
+                    ir::TextureFormat::Rgba8 => naga::StorageFormat::Rgba8Unorm,
+                    ir::TextureFormat::Rgba16Float => naga::StorageFormat::Rgba16Float,
+                    ir::TextureFormat::R32Float => naga::StorageFormat::R32Float,
+                    ir::TextureFormat::R32Uint => naga::StorageFormat::R32Uint,
+                    f @ (ir::TextureFormat::R16Float
+                    | ir::TextureFormat::Rg16Float
+                    | ir::TextureFormat::Depth32Float) => {
                         return Err(format!("internal: kernels can't write a {f:?} texture"));
                     }
                 };

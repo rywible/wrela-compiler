@@ -12,6 +12,7 @@ publish.workspace = true
 doctest = false
 
 [dependencies]
+wrela-abi.workspace = true
 wrela-diag.workspace = true
 
 [lints]

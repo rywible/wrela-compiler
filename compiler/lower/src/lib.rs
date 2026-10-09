@@ -261,7 +261,7 @@ pub(crate) struct Cx<'a> {
     pub pipeline_sites: Vec<Vec<Span>>,
     /// What each render pipeline of `pipelines` is drawn into, first drawn first (the
     /// manifest's `targets`): from the draws left in the optimized CPU code, once it's emitted.
-    pub pipeline_targets: Vec<Vec<ir::DrawTarget>>,
+    pub pipeline_targets: Vec<Vec<ir::RenderTarget>>,
     /// A lifted build's literals (§22): only the program's own modules read them, never the
     /// modules that compute constants or run tests.
     pub lift: Option<&'a LiftTable>,
@@ -488,7 +488,7 @@ fn recorded_pipelines_only(cx: &mut Cx, cpu: &mut ir::Module) {
     let mut used = vec![false; cx.pipelines.len()];
     // Each render pipeline's targets, from the draws left: one a draw that's gone drew into
     // isn't made.
-    let mut targets: Vec<Vec<ir::DrawTarget>> = vec![Vec::new(); cx.pipelines.len()];
+    let mut targets: Vec<Vec<ir::RenderTarget>> = vec![Vec::new(); cx.pipelines.len()];
     for f in &cpu.functions {
         ir::visit::walk(&f.body, &mut |s| match s.expr() {
             Some(ir::Expr::Host(ir::HostOp::Dispatch { pipeline, .. }, _)) => {

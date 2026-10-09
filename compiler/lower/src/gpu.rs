@@ -155,7 +155,7 @@ pub(crate) enum ParamClass {
         depth: bool,
         storage: bool,
         three: bool,
-        format: ir::TexFormat,
+        format: ir::TextureFormat,
     },
     /// A `Sampler` or a `ComparisonSampler`, bound by its handle.
     Sampler {
@@ -246,7 +246,7 @@ fn resource_class(cx: &Cx, ty: TyId) -> Option<ParamClass> {
             depth: true,
             storage: false,
             three: false,
-            format: ir::TexFormat::R32Float,
+            format: ir::TextureFormat::R32Float,
         },
         (Lang::Texture3d, _) => ParamClass::Texture {
             depth: false,
@@ -265,29 +265,16 @@ fn resource_class(cx: &Cx, ty: TyId) -> Option<ParamClass> {
 
 /// The format of a texture type's texels (`Texture<F>`, `Texels<F>`, ...): its first type
 /// argument's; a depth texture's, `R32Float`.
-pub(crate) fn texture_format(cx: &Cx, ty: TyId) -> ir::TexFormat {
+pub(crate) fn texture_format(cx: &Cx, ty: TyId) -> ir::TextureFormat {
     let p = &cx.checked.program;
-    let TyKind::Adt(_, args) = p.types.kind(ty) else { return ir::TexFormat::R32Float };
+    let TyKind::Adt(_, args) = p.types.kind(ty) else { return ir::TextureFormat::R32Float };
     match args.first().and_then(|&f| p.lang_of_ty(f)) {
-        Some(Lang::Rgba8) => ir::TexFormat::Rgba8Unorm,
-        Some(Lang::Rgba16Float) => ir::TexFormat::Rgba16Float,
-        Some(Lang::R16Float) => ir::TexFormat::R16Float,
-        Some(Lang::Rg16Float) => ir::TexFormat::Rg16Float,
-        Some(Lang::R32Uint) => ir::TexFormat::R32Uint,
-        _ => ir::TexFormat::R32Float,
-    }
-}
-
-/// The stream's and the manifest's format for an IR one.
-pub(crate) fn stream_format(f: ir::TexFormat) -> wrela_abi::stream::TextureFormat {
-    use wrela_abi::stream::TextureFormat as T;
-    match f {
-        ir::TexFormat::Rgba8Unorm => T::Rgba8,
-        ir::TexFormat::Rgba16Float => T::Rgba16Float,
-        ir::TexFormat::R16Float => T::R16Float,
-        ir::TexFormat::Rg16Float => T::Rg16Float,
-        ir::TexFormat::R32Float => T::R32Float,
-        ir::TexFormat::R32Uint => T::R32Uint,
+        Some(Lang::Rgba8) => ir::TextureFormat::Rgba8,
+        Some(Lang::Rgba16Float) => ir::TextureFormat::Rgba16Float,
+        Some(Lang::R16Float) => ir::TextureFormat::R16Float,
+        Some(Lang::Rg16Float) => ir::TextureFormat::Rg16Float,
+        Some(Lang::R32Uint) => ir::TextureFormat::R32Uint,
+        _ => ir::TextureFormat::R32Float,
     }
 }
 
@@ -928,19 +915,19 @@ fn draw_target(
     d: &mir::Draw,
     fragment: &Recorded,
     span: Span,
-) -> Option<ir::DrawTarget> {
+) -> Option<ir::RenderTarget> {
     let t = fl.place_src_ty(&d.pass.0);
     let t = fl.concrete(t);
     let p = &fl.cx.checked.program;
     // `Pass<F>`'s and `DepthPass<F>`'s `F` is the target texture's format, as `Texture<F>`'s.
     let format = Some(texture_format(fl.cx, t));
-    let screen = Some(ir::TexFormat::Rgba8Unorm);
+    let screen = Some(ir::TextureFormat::Rgba8);
     let target = match p.lang_of_ty(t) {
-        Some(Lang::Pass) => ir::DrawTarget { color: format, depth: false },
-        Some(Lang::DepthPass) => ir::DrawTarget { color: format, depth: true },
-        Some(Lang::DepthOnlyPass) => ir::DrawTarget { color: None, depth: true },
-        Some(Lang::ScreenPass) => ir::DrawTarget { color: screen, depth: false },
-        Some(Lang::ScreenDepthPass) => ir::DrawTarget { color: screen, depth: true },
+        Some(Lang::Pass) => ir::RenderTarget { color: format, depth: false },
+        Some(Lang::DepthPass) => ir::RenderTarget { color: format, depth: true },
+        Some(Lang::DepthOnlyPass) => ir::RenderTarget { color: None, depth: true },
+        Some(Lang::ScreenPass) => ir::RenderTarget { color: screen, depth: false },
+        Some(Lang::ScreenDepthPass) => ir::RenderTarget { color: screen, depth: true },
         _ => {
             let what = format!("a draw's pass is a `{}`, not a pass", p.display_ty(t));
             fl.cx.err(Diagnostic::internal(what));
@@ -952,7 +939,7 @@ fn draw_target(
     let p = &fl.cx.checked.program;
     let output = FragmentOutput::of(p, ret)?;
     let (writes_depth, uint) = (output.writes_depth(), output.uint());
-    let integer = target.color == Some(ir::TexFormat::R32Uint);
+    let integer = target.color == Some(ir::TextureFormat::R32Uint);
     let pass = p.display_ty(t);
     let why = if writes_depth && !target.depth {
         Some(format!(
@@ -1452,7 +1439,7 @@ fn shared_op(fl: &mut Fl, l: Lang, c: &mir::Call, ty: Option<TyId>) -> Option<ir
                 fl.mb.m.resources[r.index()].kind
                 && let Some(last) = vals.pop()
             {
-                vals.push(widen(fl, last, format.scalar()));
+                vals.push(widen(fl, last, ir::texel_scalar(format)));
             }
             fl.emit(ir::Stmt::Eval(ir::Expr::TextureStore(r, vals)));
             None
@@ -1627,7 +1614,7 @@ fn texture_read(fl: &mut Fl, l: Lang, c: &mir::Call, ty: Option<TyId>) -> Option
     };
     let texel = !matches!(op, T::Width | T::Height | T::Depth);
     let read = match colour {
-        Some(f) if texel => fl.mb.m.types.vector_of(f.scalar(), 4),
+        Some(f) if texel => fl.mb.m.types.vector_of(ir::texel_scalar(f), 4),
         _ => t,
     };
     let v = fl.value(read, ir::Expr::Texture(op, texture, sampler, vals));
@@ -1832,7 +1819,7 @@ pub(crate) fn lower_pipeline(
     key: &PipelineKey,
     iface: Rc<Interface>,
     sites: Vec<Span>,
-    targets: Vec<ir::DrawTarget>,
+    targets: Vec<ir::RenderTarget>,
 ) -> Option<PipelineOut> {
     let mut out = match key {
         PipelineKey::Compute { .. } => lower_compute(cx, iface),
@@ -1840,13 +1827,7 @@ pub(crate) fn lower_pipeline(
     }?;
     out.key = key.clone();
     out.sites = sites;
-    out.targets = targets
-        .into_iter()
-        .map(|t| wrela_abi::manifest::RenderTarget {
-            color: t.color.map(stream_format),
-            depth: t.depth,
-        })
-        .collect();
+    out.targets = targets;
     Some(out)
 }
 
@@ -2060,7 +2041,7 @@ fn add_bound(
             let bk =
                 if three { BindingKind::StorageTexture3d } else { BindingKind::StorageTexture };
             let kind = ir::ResourceKind::StorageTexture { three, format };
-            (kind, mb.m.types.u32(), bk, Some(stream_format(format)))
+            (kind, mb.m.types.u32(), bk, Some(format))
         }
         ParamClass::Texture { depth, three, format, .. } => {
             let bk = match (depth, three) {
@@ -2069,7 +2050,7 @@ fn add_bound(
                 (false, false) => BindingKind::Texture,
             };
             let kind = ir::ResourceKind::Texture { depth, three, format };
-            (kind, mb.m.types.u32(), bk, (!depth).then(|| stream_format(format)))
+            (kind, mb.m.types.u32(), bk, (!depth).then_some(format))
         }
         ParamClass::Sampler { comparison } => {
             let bk = if comparison { BindingKind::ComparisonSampler } else { BindingKind::Sampler };
