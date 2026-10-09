@@ -244,9 +244,9 @@ impl Clearing {
         self.rgba(2)
     }
 
-    /// Temporal AA's output (linear colour, and the nearest sample's tag), at the output's size.
-    fn output(&mut self) -> Vec<[f32; 4]> {
-        self.rgba(3)
+    /// The tag of temporal AA's output (its nearest sample's) at each pixel, at the output's size.
+    fn tags(&mut self) -> Vec<f32> {
+        f32s(&self.capture(7))
     }
 
     fn screen(&mut self) -> Vec<u8> {
@@ -1059,8 +1059,8 @@ fn solo(
         for (s, v) in sum.iter_mut().zip(c.screen()) {
             *s += u32::from(v);
         }
-        for (t, p) in count.iter_mut().zip(c.output()) {
-            *t += u8::from(matches!(class(p[3]), LEAVES | BARK));
+        for (t, p) in count.iter_mut().zip(c.tags()) {
+            *t += u8::from(matches!(class(p), LEAVES | BARK));
         }
     }
     let screen = sum.iter().map(|s| ((s + 8) / 16) as u8).collect();
@@ -1596,15 +1596,15 @@ fn the_clouds_shadows_fall_on_the_valley() {
 // ---- temporal AA, upscaling and the look (AC7, AC1) -------------------------------------------
 
 /// The start's frame settled (64 frames, the wind still), at scale `scale` (2: from 960×540).
-fn settled_start(name: &str, scale: i32, view: i32) -> (Vec<u8>, Vec<[f32; 4]>) {
+fn settled_start(name: &str, scale: i32, view: i32) -> (Vec<u8>, Vec<f32>) {
     let mut c = Clearing::load(name);
     c.call("test_scale", &[Value::I32(scale)]);
     c.view(view);
     c.until_ready(0);
     c.off(off::WIND);
     c.steps(64);
-    let out = c.output();
-    (c.screen(), out)
+    let tags = c.tags();
+    (c.screen(), tags)
 }
 
 /// AC7: the start's frame upscaled from 960×540 against the same frame drawn at 1920×1080, each
@@ -1621,7 +1621,7 @@ fn the_upscaled_frame_matches_the_native_one() {
             let (m, o, n) = image_difference_over(
                 &half,
                 &native,
-                (0..(W * H) as usize).filter(|&i| class(tags[i][3]) == k),
+                (0..(W * H) as usize).filter(|&i| class(tags[i]) == k),
             );
             if n > 0 {
                 println!("  class {k}: {n} pixels, mean {m:.2}/255, {:.1}% over 8/255", o * 100.0);
@@ -1666,8 +1666,8 @@ fn the_upscaled_frame_matches_the_native_one() {
 /// The mean warp error (/255), the share over 8/255, the pixels compared, and the mean motion
 /// (output pixels).
 fn warp_error(
-    a: (&[u8], &[f32], &Cam, &[[f32; 4]]),
-    b: (&[u8], &[f32], &Cam, &[[f32; 4]]),
+    a: (&[u8], &[f32], &Cam, &[f32]),
+    b: (&[u8], &[f32], &Cam, &[f32]),
     by: &mut [(f64, usize); 8],
 ) -> (f64, f64, usize, f64) {
     let (sa, da, ca, ta) = a;
@@ -1680,7 +1680,7 @@ fn warp_error(
     for y in (0..H as usize).step_by(2) {
         for x in (0..W as usize).step_by(2) {
             let o = y * W as usize + x;
-            if class(tb[o][3]) == CREATURE || class(tb[o][3]) == SKY {
+            if class(tb[o]) == CREATURE || class(tb[o]) == SKY {
                 continue;
             }
             // The output pixel's point in b: its unjittered ray at the nearest sample's depth.
@@ -1697,7 +1697,7 @@ fn warp_error(
                 continue;
             }
             let ia = ay as usize * W as usize + ax as usize;
-            if class(ta[ia][3]) == CREATURE || class(ta[ia][3]) == SKY {
+            if class(ta[ia]) == CREATURE || class(ta[ia]) == SKY {
                 continue;
             }
             // A sees the same surface there (its depth within 2%), as spike 12 asks.
@@ -1727,7 +1727,7 @@ fn warp_error(
             if most > 8.0 {
                 over += 1;
             }
-            let k = class(tb[o][3]) as usize;
+            let k = class(tb[o]) as usize;
             by[k].0 += d3 / 3.0;
             by[k].1 += 1;
             n += 1;
@@ -1760,8 +1760,8 @@ fn flicker(real: bool) -> (f64, f64, [f64; 8]) {
     let grab = |c: &mut Clearing| {
         let cam = c.camera();
         let depth = c.depth();
-        let out = c.output();
-        (c.screen(), depth, cam, out)
+        let tags = c.tags();
+        (c.screen(), depth, cam, tags)
     };
     let mut last = grab(&mut c);
     let (mut sum, mut over, mut motion, mut pairs) = (0.0, 0.0, 0.0, 0usize);
@@ -1889,13 +1889,13 @@ fn the_walking_creature_leaves_no_trail() {
             while c.frame < from + f {
                 c.step();
                 if c.frame + 8 >= from + f && c.frame < from + f && creature {
-                    for (i, t) in c.output().iter().enumerate() {
-                        recent[i] |= class(t[3]) == CREATURE;
+                    for (i, &t) in c.tags().iter().enumerate() {
+                        recent[i] |= class(t) == CREATURE;
                     }
                 }
             }
-            let o = c.output();
-            out.push((c.screen(), o, recent));
+            let tags = c.tags();
+            out.push((c.screen(), tags, recent));
         }
         out
     };
@@ -1903,7 +1903,7 @@ fn the_walking_creature_leaves_no_trail() {
     let without = run("clearing-ghost-b", false);
     let mut longest = 0.0f64;
     for (k, ((a, tags, recent), (b, _, _))) in with.iter().zip(&without).enumerate() {
-        let is = |i: usize| class(tags[i][3]) == CREATURE;
+        let is = |i: usize| class(tags[i]) == CREATURE;
         let outline: Vec<(f64, f64)> = (0..tags.len())
             .filter(|&i| is(i))
             .map(|i| ((i % W as usize) as f64, (i / W as usize) as f64))
@@ -1977,11 +1977,10 @@ fn the_start_against_spike_15s_still() {
     std::fs::write(&theirs_path, &out.stdout).expect("write");
     let (tw, th, theirs) = wrela_host::image::read_png(&theirs_path).expect("read the still");
     assert_eq!((tw, th), (W, H));
-    let (ours, output) = settled_start("clearing-still", 2, VIEW_LOOK);
+    let (ours, tags) = settled_start("clearing-still", 2, VIEW_LOOK);
     wrela_host::image::write_png(&dir.join("clearing-m5-start.png"), W, H, &ours).expect("write");
-    let creature: Vec<usize> =
-        (0..output.len()).filter(|&i| class(output[i][3]) == CREATURE).collect();
-    let mut apart = vec![false; output.len()];
+    let creature: Vec<usize> = (0..tags.len()).filter(|&i| class(tags[i]) == CREATURE).collect();
+    let mut apart = vec![false; tags.len()];
     for &i in &creature {
         let (x, y) = ((i % W as usize) as i64, (i / W as usize) as i64);
         for dy in -24..=24i64 {
@@ -1994,7 +1993,7 @@ fn the_start_against_spike_15s_still() {
         }
     }
     let (mean, over, n) =
-        image_difference_over(&ours, &theirs, (0..output.len()).filter(|&i| !apart[i]));
+        image_difference_over(&ours, &theirs, (0..tags.len()).filter(|&i| !apart[i]));
     let diff = diff_image(&ours, &theirs, 4);
     wrela_host::image::write_png(&dir.join("clearing-m5-start-diff.png"), W, H, &diff)
         .expect("write");
