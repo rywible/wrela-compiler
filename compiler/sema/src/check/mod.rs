@@ -609,17 +609,19 @@ impl<'p> Checker<'p> {
         value: &ast::Expr,
         span: Span,
     ) -> Stmt {
-        if let Some(s) = self.packed_assign(target, op, value, span) {
-            return s;
-        }
         let place = self.check_expr(target, None);
         self.assign_to(place, op, value, span)
     }
 
-    /// `place op value`, its place checked already.
+    /// `place op value`, its place checked already. A `Packed` struct's field is its word's
+    /// bits, which the assignment writes (`mir::build`): the word is the place written.
     fn assign_to(&mut self, place: Expr, op: ast::AssignOp, value: &ast::Expr, span: Span) -> Stmt {
-        self.check_assign_target(&place);
-        self.mark_written(&place);
+        let written = match &place.kind {
+            ExprKind::PackedField { base, .. } => base.as_ref(),
+            _ => &place,
+        };
+        self.check_assign_target(written);
+        self.mark_written(written);
         let bin = op.binop();
         let value = match bin {
             None => self.check_expect(value, place.ty),
@@ -635,66 +637,6 @@ impl<'p> Checker<'p> {
             }
         };
         Stmt { kind: StmtKind::Assign { place, op: bin, value }, span }
-    }
-
-    /// `p.f = v` or `p.f op= v` for a `Packed` struct's field `f` (§3): the word, projected
-    /// once, with `f`'s bits replaced. A field of any other base is assigned as
-    /// [`Self::check_assign`] assigns it. `None` if `target` isn't a named field, or names one
-    /// the `Packed` struct doesn't have (reported).
-    fn packed_assign(
-        &mut self,
-        target: &ast::Expr,
-        op: ast::AssignOp,
-        value: &ast::Expr,
-        span: Span,
-    ) -> Option<Stmt> {
-        let ast::ExprKind::Field { base, name: ast::FieldName::Ident(n) } = &target.kind else {
-            return None;
-        };
-        // Only a `Packed` struct's: a quiet look at the base's type first.
-        let b = self.check_expr(base, None);
-        let bt = self.infer.resolve(&self.p.types, b.ty);
-        let a = match self.kind(bt) {
-            &TyKind::Adt(a, _) if self.p.packed.contains_key(&a) => a,
-            _ => {
-                let place = self.field_of_checked(b, &ast::FieldName::Ident(n.clone()), span);
-                return Some(self.assign_to(place, op, value, span));
-            }
-        };
-        let f = self.packed_field(a, n)?;
-        self.check_assign_target(&b);
-        self.mark_written(&b);
-        let u = self.p.types.u32;
-        // The base, projected once: `mut p = base`.
-        let at = b.span;
-        let l = self.declare_unnamed(bt, LocalKind::Projection { mutable: true }, at);
-        let pat = Pat { ty: bt, kind: PatKind::Bind(l), span: at };
-        let bind = Stmt { kind: StmtKind::Bind { pat, init: b, else_: None }, span: at };
-        let p = || Expr { ty: bt, span: at, kind: ExprKind::Local(l) };
-        let v = match op.binop() {
-            None => self.check_expect(value, u),
-            Some(bin) => {
-                let v = self.check_expect(value, u);
-                let old = self.packed_read(p(), &f, span);
-                self.u32_bin(bin, old, v, span)
-            }
-        };
-        let bits = self.packed_bits(v, f.width, f.shift, span);
-        let word = || Expr { ty: u, span: at, kind: ExprKind::Field(Box::new(p()), 0) };
-        let kept = self.u32_bin(
-            ast::BinOp::BitAnd,
-            word(),
-            self.u32_lit(u64::from(!f.mask()), span),
-            span,
-        );
-        let new = self.u32_bin(ast::BinOp::BitOr, kept, bits, span);
-        let assign = Stmt { kind: StmtKind::Assign { place: word(), op: None, value: new }, span };
-        let unit = self.p.types.unit;
-        let block = Block { stmts: vec![bind, assign], tail: None, ty: unit, span };
-        Some(Stmt {
-            kind: StmtKind::Expr(Expr { ty: unit, span, kind: ExprKind::Block(block) }),
-            span,
-        })
     }
 
     /// The locals the environment has bound after its first `len` names, in order.

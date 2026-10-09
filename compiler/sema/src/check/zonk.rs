@@ -40,7 +40,8 @@ pub fn walk_tys(e: &mut Expr, f: &mut impl FnMut(&mut TyId)) {
         | ExprKind::Convert(x)
         | ExprKind::Discriminant(x)
         | ExprKind::Take(x)
-        | ExprKind::MutArg(x) => walk_tys(x, f),
+        | ExprKind::MutArg(x)
+        | ExprKind::PackedField { base: x, .. } => walk_tys(x, f),
         ExprKind::Binary(_, a, b) | ExprKind::Index(a, b) => {
             walk_tys(a, f);
             walk_tys(b, f);

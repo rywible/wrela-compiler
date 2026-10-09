@@ -1713,20 +1713,12 @@ impl<'p> Checker<'p> {
         Expr { ty: self.p.types.u32, span, kind: ExprKind::Binary(op, Box::new(a), Box::new(b)) }
     }
 
-    /// Field `f` of `base`, a `Packed` struct (§3): its bits of the word, as a `u32`.
+    /// Field `f` of `base`, a `Packed` struct (§3): its bits of the word, as a `u32`, which an
+    /// assignment may write (`mir::build` reads them, and writes the word again).
     pub(crate) fn packed_read(&self, base: Expr, f: &PackedField, span: Span) -> Expr {
-        let u = self.p.types.u32;
-        let word = Expr { ty: u, span: base.span, kind: ExprKind::Field(Box::new(base), 0) };
-        let shifted = if f.shift == 0 {
-            word
-        } else {
-            self.u32_bin(ast::BinOp::Shr, word, self.u32_lit(u64::from(f.shift), span), span)
-        };
-        if f.width == 32 {
-            return shifted;
-        }
-        let mask = self.u32_lit(u64::from(f.mask() >> f.shift), span);
-        self.u32_bin(ast::BinOp::BitAnd, shifted, mask, span)
+        let (shift, width) = (f.shift, f.width);
+        let kind = ExprKind::PackedField { base: Box::new(base), shift, width };
+        Expr { ty: self.p.types.u32, span, kind }
     }
 
     /// `v`, a `u32`, fitted to `width` bits of a `Packed` field and moved to `shift` (§3).

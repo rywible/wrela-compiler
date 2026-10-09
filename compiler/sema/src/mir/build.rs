@@ -603,6 +603,10 @@ impl<'a> Builder<'a> {
                 }
                 None
             }
+            ExprKind::PackedField { base, shift, width } => {
+                let word = self.packed_word(base)?;
+                self.packed_bits(&word, *shift, *width, span)
+            }
             ExprKind::Yield => {
                 // The job stops here; resumed, it goes on in a block of its own.
                 let at = self.fs.cur.index();
@@ -2001,6 +2005,10 @@ impl<'a> Builder<'a> {
     }
 
     fn assign(&mut self, place: &thir::Expr, op: Option<BinOp>, value: &thir::Expr, span: Span) {
+        if let ExprKind::PackedField { base, shift, width } = &place.kind {
+            self.packed_assign(base, *shift, *width, op, value, span);
+            return;
+        }
         // The value first, then the place's indices, then the old value for `op=`.
         let v = self.value(value, if op.is_some() { Want::Read } else { Want::Move });
         let Some(p) = self.place(place) else { return };
@@ -2022,6 +2030,77 @@ impl<'a> Builder<'a> {
             }
         };
         self.push(StatementKind::Assign(p, Rvalue::Use(v)), place.span);
+    }
+
+    /// A `Packed` struct's word (§3), where `base` is: the field its bits are in.
+    fn packed_word(&mut self, base: &thir::Expr) -> Option<Place> {
+        Some(self.place(base)?.with(Proj::Field(0)))
+    }
+
+    /// `width` bits of the word at `word`, from bit `shift`: a `u32`.
+    fn packed_bits(&mut self, word: &Place, shift: u32, width: u32, span: Span) -> Option<Operand> {
+        let u = self.p.types.u32;
+        let w = Operand { kind: OperandKind::Copy(word.clone()), ty: u, span };
+        let k = |v: u32| constant(Lit::Int(i128::from(v)), u, span);
+        let shifted = if shift == 0 {
+            w
+        } else {
+            self.temp_of(Rvalue::Binary(BinOp::Shr, w, k(shift)), u, span)?
+        };
+        if width == 32 {
+            return Some(shifted);
+        }
+        let mask = ((1u64 << width) - 1) as u32;
+        self.temp_of(Rvalue::Binary(BinOp::BitAnd, shifted, k(mask)), u, span)
+    }
+
+    /// `p.f op= value` for a `Packed` struct's field (§3): the value first, then the word's
+    /// place; the field's bits of the word replaced (the value fitted to them, a panic past
+    /// them), the rest kept.
+    fn packed_assign(
+        &mut self,
+        base: &thir::Expr,
+        shift: u32,
+        width: u32,
+        op: Option<BinOp>,
+        value: &thir::Expr,
+        span: Span,
+    ) -> Option<()> {
+        let v = self.value(value, Want::Read)?;
+        let word = self.packed_word(base)?;
+        let u = self.p.types.u32;
+        let k = |v: u32| constant(Lit::Int(i128::from(v)), u, span);
+        let v = match op {
+            None => v,
+            Some(op) => {
+                let old = self.packed_bits(&word, shift, width, span)?;
+                self.temp_of(Rvalue::Binary(op, old, v), u, span)?
+            }
+        };
+        let fitted = match self.p.lang_fn(crate::defs::Lang::PackedFit) {
+            Some(func) if width < 32 => {
+                let call = Call {
+                    callee: Callee::Fn { func, args: Vec::new() },
+                    args: vec![Arg::Take(v), Arg::Take(k(width))],
+                    receiver: false,
+                    ret_mode: RetMode::Owned,
+                    span,
+                };
+                self.temp_of(Rvalue::Call(call), u, span)?
+            }
+            _ => v,
+        };
+        let bits = if shift == 0 {
+            fitted
+        } else {
+            self.temp_of(Rvalue::Binary(BinOp::Shl, fitted, k(shift)), u, span)?
+        };
+        let mask = ((((1u64 << width) - 1) << shift) & 0xffff_ffff) as u32;
+        let w = Operand { kind: OperandKind::Copy(word.clone()), ty: u, span };
+        let kept = self.temp_of(Rvalue::Binary(BinOp::BitAnd, w, k(!mask)), u, span)?;
+        let new = self.temp_of(Rvalue::Binary(BinOp::BitOr, kept, bits), u, span)?;
+        self.push(StatementKind::Assign(word, Rvalue::Use(new)), span);
+        Some(())
     }
 
     /// Starts a loop at the current block; returns (loop block, body, continuing, exit), with

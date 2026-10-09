@@ -160,6 +160,14 @@ pub enum ExprKind {
     Field(Box<Expr>, u32),
     /// Vector components: one index is a component, more make a vector.
     Swizzle(Box<Expr>, Vec<u8>),
+    /// A `Packed` struct's field (§3): `width` bits of its word, from bit `shift`, a `u32`. A
+    /// value, and an assignment's target (its word written again, the other bits kept): no
+    /// place of its own to project.
+    PackedField {
+        base: Box<Expr>,
+        shift: u32,
+        width: u32,
+    },
     Index(Box<Expr>, Box<Expr>),
     /// A struct (`variant: None`) or an enum variant. `fields` is complete and in declaration
     /// order; a field `..base` supplies is [`ExprKind::FromBase`]. The fields given are evaluated
@@ -487,7 +495,8 @@ impl Expr {
             | ExprKind::Convert(x)
             | ExprKind::Discriminant(x)
             | ExprKind::Take(x)
-            | ExprKind::MutArg(x) => f(Child::Expr(x)),
+            | ExprKind::MutArg(x)
+            | ExprKind::PackedField { base: x, .. } => f(Child::Expr(x)),
             ExprKind::Binary(_, a, b) | ExprKind::Index(a, b) => {
                 f(Child::Expr(a));
                 f(Child::Expr(b));
