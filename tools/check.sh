@@ -83,6 +83,13 @@ side() { # name, command...: runs in the background, its output and status kept
   side_jobs+=("$name")
   (set +e; "$@" > "$logs/$name" 2>&1; echo $? > "$logs/$name.status") &
 }
+# Waits for the side jobs: each that failed shows its output and fails the checks (`tests`).
+side_results() {
+  wait
+  for job in "${side_jobs[@]}"; do
+    if [ "$(cat "$logs/$job.status")" != 0 ]; then cat "$logs/$job"; echo "the $job checks failed" >&2; tests=1; fi
+  done
+}
 # The tools' tests (the dev server, the headless-Chrome driver with a fake Chrome, the agent
 # test's scorer) mostly wait on processes, so each runs in a process of its own, all at once.
 # Each takes a lock file of its own (its TMPDIR), so they queue neither on the GPU nor together.
@@ -108,12 +115,12 @@ TOOLS
 
 # Runs every test program at once, each with `args` (its tests filtered and skipped), in its
 # package's directory as cargo does; prints each one's time, and the output of each that fails,
-# and fails if no test ran. `sharers`: how many of a program's GPU tests share the GPU (empty:
-# one at a time).
-run_tests() { # sharers, args...
+# and fails if no test ran. Four of a program's GPU tests share the GPU at a time: they check
+# what the GPU computes, not how long it takes (the measurements run alone, below).
+run_tests() { # args...
   python3 - "$logs" "${CARGO_TARGET_DIR:-target}/native-cache" "$@" <<'PY'
 import json, os, re, subprocess, sys, time
-logs, native_cache, sharers, *args = sys.argv[1:]
+logs, native_cache, *args = sys.argv[1:]
 native_cache = os.path.abspath(native_cache)
 runs = []
 for line in open(f"{logs}/tests.json"):
@@ -123,9 +130,8 @@ for line in open(f"{logs}/tests.json"):
         pkg = os.path.dirname(m["manifest_path"])
         # Compiled code is kept across runs (wrela_host's cache): a test's build is made afresh
         # each run, and its WASM is mostly the same.
-        env = {**os.environ, "CARGO_MANIFEST_DIR": pkg, "WRELA_NATIVE_CACHE": native_cache}
-        if sharers:
-            env["WRELA_GPU_SHARED"] = sharers
+        env = {**os.environ, "CARGO_MANIFEST_DIR": pkg, "WRELA_NATIVE_CACHE": native_cache,
+               "WRELA_GPU_SHARED": "4"}
         out = open(f"{logs}/run-{len(runs)}", "w+")
         name = f"{m['target']['name']} ({m['target']['kind'][0]})"
         proc = subprocess.Popen([m["executable"], "-q", *args], cwd=pkg, env=env,
@@ -167,7 +173,7 @@ if [ "${#filters[@]}" -gt 0 ]; then
     for t in "${measures[@]}"; do skips+=(--skip "$t"); done
   fi
   step "the tests whose names hold ${filters[*]}"
-  run_tests 4 --include-ignored "${skips[@]}" "${filters[@]}"
+  run_tests --include-ignored "${skips[@]}" "${filters[@]}"
   rm -rf "$logs"
   exit 0
 fi
@@ -192,13 +198,8 @@ tests_started=$SECONDS
 side doc cargo test -q --release --workspace --doc
 side wgsl python3 tools/wgsl_budgets.py "$wrela"
 tests=0
-# These tests check what the GPU computes, not how long it takes (the one that compares GPU
-# times takes the GPU alone), so four at a time share it.
-run_tests 4 --include-ignored "${skips[@]}" || tests=1
-wait
-for job in "${side_jobs[@]}"; do
-  if [ "$(cat "$logs/$job.status")" != 0 ]; then cat "$logs/$job"; echo "the $job checks failed" >&2; tests=1; fi
-done
+run_tests --include-ignored "${skips[@]}" || tests=1
+side_results
 [ "$tests" = 0 ] || exit 1
 grep -h "pipelines in" "$logs/wgsl" || true
 took=$((SECONDS - tests_started))
@@ -217,15 +218,11 @@ if [ "$long" = 1 ]; then
   side differential cargo run -q --release -p wrela-grammar --bin differential -- 1000000 --seed "$seed"
   side gbnf cargo run -q --release -p wrela-grammar --bin gbnf-sample -- 200000 --seed "$seed"
   # More threads than cores: a test waiting for its turn at Chrome (one at a time) holds one.
-  if [ "$full" = 1 ]; then
-    WRELA_FULL=1 run_tests 4 --ignored --test-threads 16 --exact "${long_tests[@]}" || tests=1
-  else
-    run_tests 4 --ignored --test-threads 16 --exact "${long_tests[@]}" || tests=1
-  fi
-  wait
-  for job in "${side_jobs[@]}"; do
-    if [ "$(cat "$logs/$job.status")" != 0 ]; then cat "$logs/$job"; echo "the $job checks failed" >&2; tests=1; fi
-  done
+  # With --full, at full size.
+  if [ "$full" = 1 ]; then export WRELA_FULL=1; fi
+  run_tests --ignored --test-threads 16 --exact "${long_tests[@]}" || tests=1
+  unset WRELA_FULL
+  side_results
   [ "$tests" = 0 ] || exit 1
 
   fuzz=$( [ "$full" = 1 ] && echo 1000000 || echo 20000 )
@@ -236,11 +233,13 @@ fi
 
 if [ "$full" = 1 ]; then
   step "full: every test of the gate at full size"
-  WRELA_FULL=1 run_tests 4 --include-ignored "${skips[@]}"
+  WRELA_FULL=1 run_tests --include-ignored "${skips[@]}"
 
   step "full: the CLI's speed, cold processes: hello field's check < 200 ms and build < 2 s, sketch 03's, the herd's, the clearing's and the lens's (on each subject) < 500 ms and < 5 s"
   python3 - "$wrela" <<'PY'
 import shutil, subprocess, sys, tempfile, time
+sys.path.insert(0, "tools")
+from subjects import SUBJECTS, lens, package
 wrela = sys.argv[1]
 def best(args, n=5, cold=None):
     times = []
@@ -255,13 +254,10 @@ def best(args, n=5, cold=None):
 out = tempfile.mkdtemp()
 try:
     hello, sketch = "examples/hello-field", "compiler/tests/sketches/03-simulation"
-    # The lens on each subject (AC12 of #39; the great tree and the fawn, #51): `wrela studio`
-    # writes its program beside the subject (build/studio/lens) and builds it lifted, then
-    # keeps its compiled code. Each subject's directory, and its package's name.
-    subjects = [("wolf", "wolf"), ("grazer", "grazer"), ("great-tree", "great_tree"), ("fawn", "fawn")]
-    for s, _ in subjects:
+    # The lens on each subject (tools/subjects.py): `wrela studio` builds it lifted, then keeps
+    # its compiled code.
+    for s in SUBJECTS:
         subprocess.run([wrela, "studio", f"examples/{s}", "build"], check=True, capture_output=True)
-    lens = lambda s: f"examples/{s}/build/studio/lens"
     runs = [
         ("check hello field", ["check", hello], 0.2),
         ("build hello field", ["build", hello, "-o", f"{out}/speed-hello"], 2.0),
@@ -272,10 +268,10 @@ try:
         ("check the clearing", ["check", "examples/clearing"], 0.5),
         ("build the clearing", ["build", "examples/clearing", "-o", f"{out}/speed-clearing"], 5.0),
     ]
-    for s, name in subjects:
+    for s in SUBJECTS:
         runs += [
             (f"check the lens on the {s}", ["check", lens(s)], 0.5),
-            (f"build the lens on the {s}", ["build", lens(s), "--lift", name, "-o", f"{out}/speed-lens-{s}"], 5.0),
+            (f"build the lens on the {s}", ["build", lens(s), "--lift", package(s), "-o", f"{out}/speed-lens-{s}"], 5.0),
             (f"studio build on the {s} (and its compiled code)", ["studio", f"examples/{s}", "build"], 5.0,
              f"examples/{s}/build/studio/page/.native"),
         ]

@@ -3,23 +3,20 @@
 each built (in parallel) by the wrela CLI given, `tools/wgsl_budgets.py <wrela>`."""
 
 import concurrent.futures, gzip, pathlib, shutil, subprocess, sys, tempfile
+from subjects import SUBJECTS, lens, package
 wrela = sys.argv[1]
 out = tempfile.mkdtemp()
 try:
     hello = "examples/hello-field"
-    # The lens on each subject (AC12 of #39; the great tree and the fawn, #51): `wrela studio`
-    # writes its program beside the subject (build/studio/lens), which builds lifted. Each
-    # subject's directory, and its package's name.
-    subjects = [("wolf", "wolf"), ("grazer", "grazer"), ("great-tree", "great_tree"), ("fawn", "fawn")]
-    lens = lambda s: f"examples/{s}/build/studio/lens"
+    # The lens on each subject (tools/subjects.py).
     list(concurrent.futures.ThreadPoolExecutor().map(
-        lambda s: subprocess.run([wrela, "studio", f"examples/{s[0]}", "build"], check=True, capture_output=True), subjects))
+        lambda s: subprocess.run([wrela, "studio", f"examples/{s}", "build"], check=True, capture_output=True), SUBJECTS))
     # Each package, where it's built, and how: a lens is built lifted, into a directory named
     # for its subject.
     packages = [(p, pathlib.Path(out) / p.name, [])
                 for p in sorted(m.parent for root in ["examples", "compiler/tests/sketches", "ui/tests"]
                                 for m in pathlib.Path(root).glob("*/main.wrela"))]
-    packages += [(pathlib.Path(lens(s)), pathlib.Path(out) / s / "lens", ["--lift", name]) for s, name in subjects]
+    packages += [(pathlib.Path(lens(s)), pathlib.Path(out) / s / "lens", ["--lift", package(s)]) for s in SUBJECTS]
     def build(package):
         pkg, built, lift = package
         subprocess.run([wrela, "build", str(pkg), "-o", str(built), *lift], check=True, capture_output=True)
