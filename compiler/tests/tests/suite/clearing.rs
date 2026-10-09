@@ -954,6 +954,36 @@ fn the_grass_never_thins_along_the_path() {
     );
 }
 
+/// AC4: no blade grows under a boulder (the placement tests each blade against every stone's
+/// footprint, `Grass::place`): over the camera's path (each second), no blade of any tier is
+/// rooted within 0.8 of a boulder's reach. (The ground's cover can't hold the footprints: the
+/// clipmap cooks the boulders' ground at 0.25 to 1 m a texel, and with the grass cleared there
+/// instead, 21 blades grew under them at the start.)
+#[test]
+#[ignore = "long: the camera's path, needs a GPU"]
+fn no_blade_grows_under_a_boulder() {
+    let mut c = Clearing::load_at("clearing-boulders", path_fps());
+    let every = c.fps as u32;
+    c.until_ready(1);
+    c.walk();
+    let mut seen = 0;
+    loop {
+        c.step();
+        if !c.frame.is_multiple_of(every) {
+            continue;
+        }
+        c.call("test_under_boulders", &[]);
+        let newest = *c.host.buffers().last().expect("a buffer");
+        let under = u32s(&c.host.read_buffer(newest).expect("the count"))[0];
+        assert_eq!(under, 0, "at {:.1} s, {under} blades grow under the boulders", c.path_time());
+        seen += 1;
+        if c.path_time() >= 60.0 {
+            break;
+        }
+    }
+    println!("no blade under a boulder in {seen} frames of the path");
+}
+
 /// AC4's early depth: in the cards' shading pass (equal depth, after the prepass), no pixel is
 /// shaded by more cards than cover it, and over the pixels it shades, each is shaded no more
 /// than 1.5 times on average (counted by an atomic, `test_count`). Beside it, how many times
