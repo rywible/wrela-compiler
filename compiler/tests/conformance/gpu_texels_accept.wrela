@@ -3,7 +3,7 @@
 // it.
 use std::gpu::{
     ClipPosition, FragCoord, GlobalId, Rgba16Float, Texels, Texture, VertexIndex, begin_screen_pass,
-    dispatch, draw, present, texture, writable_texture,
+    dispatch, draw, texture, writable_texture,
 }
 
 struct State {
@@ -33,7 +33,7 @@ pub fn init() -> State {
 
 pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
     dispatch(fill.bind(mut s.t), groups: (2, 2, 1))
-    begin_screen_pass(clear: vec4(0.0))
-    draw(cover, show.bind(s.t), vertices: 3)
-    present()
+    let screen = begin_screen_pass(clear: vec4(0.0))
+    draw(screen, cover, show.bind(s.t), vertices: 3)
+    screen.present()
 }

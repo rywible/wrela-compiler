@@ -9,7 +9,7 @@ use engine::run::{Asks, TickInput, run}
 use engine::sim::{Sim, Tick}
 use simulation::sketch::{World, tick}
 use simulation::start::world
-use std::gpu::{ClipPosition, VertexIndex, begin_screen_pass, draw, present}
+use std::gpu::{ClipPosition, VertexIndex, begin_screen_pass, draw}
 use std::input::{Event, Key}
 use std::io::print
 
@@ -135,11 +135,11 @@ pub fn frame(game: mut Game, time: f32, width: u32, height: u32) {
     game.still = !moving
     game.drawn = p
     // The map: 60 m across, the player a square.
-    begin_screen_pass(clear: vec4(0.1, 0.12, 0.1, 1.0))
+    let screen = begin_screen_pass(clear: vec4(0.1, 0.12, 0.1, 1.0))
     let at = p / 30.0
     let shade = 0.5 + 0.5 * f32(b.b.digs % 2)
-    draw(square.bind(at, 0.03), flat.bind(vec4(1.0, shade, 0.2, 1.0)), vertices: 6)
-    present()
+    draw(screen, square.bind(at, 0.03), flat.bind(vec4(1.0, shade, 0.2, 1.0)), vertices: 6)
+    screen.present()
 }
 
 /// The newest snapshot's player, and its ticks run (for the tests).

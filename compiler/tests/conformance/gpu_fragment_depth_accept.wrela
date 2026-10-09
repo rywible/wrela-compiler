@@ -31,6 +31,6 @@ pub fn init() -> S {
 
 pub fn frame(s: mut S, time: f32, width: u32, height: u32) {
     let pass = begin_screen_pass_with_depth(mut s.depth, clear: vec4(0.0))
-    draw(cover, sloped, vertices: 3)
+    draw(pass, cover, sloped, vertices: 3)
     pass.present()
 }

@@ -2,11 +2,11 @@
 
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { MANIFEST_VERSION, STREAM_VERSION } from "../src/abi.gen.ts";
+import { MANIFEST_VERSION, STREAM_VERSION, TEXTURE_FORMATS } from "../src/abi.gen.ts";
 import { Checker } from "../src/check.ts";
-import { type Manifest, validateManifest } from "../src/manifest.ts";
+import { type Manifest, type RenderTarget, validateManifest } from "../src/manifest.ts";
 import type { Executor } from "../src/program.ts";
-import type { Command, Pass } from "../src/stream.ts";
+import type { Command, Pass, TextureFormat } from "../src/stream.ts";
 
 export const FIRST_LIGHT = join(import.meta.dir, "../../fixtures/first-light");
 
@@ -37,6 +37,13 @@ export const vectors: Vectors = JSON.parse(readFileSync(join(import.meta.dir, ".
 
 /** Pipeline 0 renders and pipeline 1 computes; each takes 16 uniform bytes and binds a read-only
  * buffer then a read-write one (runtime/native/src/program/tests.rs uses the same shapes). */
+/** Every target a render pipeline whose fragment shader returns a colour may be drawn into:
+ * each colour format, with depth or without, and depth alone. */
+export function everyTarget(): RenderTarget[] {
+  const colours = TEXTURE_FORMATS.filter((f) => !f.depth && !f.uint).map((f) => f.name as TextureFormat);
+  return [...colours.flatMap((color) => [false, true].map((depth) => ({ color, depth }))), { color: null, depth: true }];
+}
+
 export function shapes(): Manifest {
   const m: Manifest = {
     manifest_version: MANIFEST_VERSION,
@@ -55,6 +62,7 @@ export function shapes(): Manifest {
         depth: { compare: "less", write: true },
         writes_depth: false,
         uint: false,
+        targets: everyTarget(),
         uniform: { binding: 0, size: 16, space: "uniform" },
         bindings: [
           { binding: 1, kind: "read", stage: "both", format: null },

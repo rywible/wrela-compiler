@@ -6,7 +6,7 @@
 
 use std::gpu::{
     ClipPosition, FragCoord, GlobalId, GpuBuffer, Slots, VertexIndex, begin_screen_pass, buffer,
-    dispatch, draw, present,
+    dispatch, draw,
 }
 
 struct P: Copy + GpuData {
@@ -69,8 +69,8 @@ pub fn dispatch_order() -> u32 {
 
 pub fn draw_order() -> u32 {
     var log = 0
-    begin_screen_pass(clear: vec4(0.0, 0.0, 0.0, 1.0))
-    draw(vs, fs.bind(p: p(mut log, 1.0)), instances: note(mut log, 4), vertices: note(mut log, 2))
-    present()
+    let screen = begin_screen_pass(clear: vec4(0.0, 0.0, 0.0, 1.0))
+    draw(screen, vs, fs.bind(p: p(mut log, 1.0)), instances: note(mut log, 4), vertices: note(mut log, 2))
+    screen.present()
     log
 }

@@ -4,7 +4,7 @@
 // asynchronous WebGPU error that names no command.
 
 import { BINDING_OFFSET_ALIGNMENT, DEFAULT_LIMITS, MAX_TEXTURE_3D, NONE, SCREEN, SCREEN_FORMAT, TEXTURE_FORMATS } from "./abi.gen.ts";
-import { type BindingKind, is3d, isStorage, type Manifest } from "./manifest.ts";
+import { type BindingKind, is3d, isStorage, type Manifest, type RenderTarget, targetName } from "./manifest.ts";
 import type { Binding, Command, OpcodeName, TextureFormat } from "./stream.ts";
 
 /** The limits a program sees, in `wrela.limit`'s order (runtime/abi `Limits`). */
@@ -77,10 +77,8 @@ interface Shape {
   uniformSize: number;
   /** Each binding's kind, and a colour texture's format. */
   bindings: { kind: BindingKind; format: TextureFormat | null }[];
-  /** A render pipeline's: each fragment gives its own depth (drawn only with a depth target),
-   * and its fragment shader returns a `u32` (drawn only into an `r32uint` target). */
-  writesDepth: boolean;
-  uint: boolean;
+  /** A render pipeline's targets: the passes it may be drawn in. */
+  targets: RenderTarget[];
 }
 
 /** A live texture: `depth` is a 3D texture's, or 0 for a 2D one. */
@@ -117,8 +115,7 @@ export class Checker {
       compute: p.kind === "compute",
       uniformSize: p.uniform?.size ?? 0,
       bindings: p.bindings.map((b) => ({ kind: b.kind, format: b.format })),
-      writesDepth: p.kind === "render" && p.writes_depth,
-      uint: p.kind === "render" && p.uint,
+      targets: p.kind === "render" ? p.targets : [],
     }));
   }
 
@@ -352,14 +349,10 @@ export class Checker {
       const [is, needs] = p.compute ? ["compute", "render"] : ["render", "compute"];
       throw err(`pipeline ${pipeline} (${name}) is a ${is} pipeline; ${op} needs a ${needs} pipeline`);
     }
-    // A draw's pipeline is one the pass's targets take.
-    const { colour, depth } = this.#targets;
-    if (!dispatch && p.writesDepth && !depth) {
-      throw err(`\`${name}\` gives its fragments their depth, so it's drawn in a pass with a depth target, and this pass has none`);
-    }
-    if (!dispatch && colour !== null && p.uint !== (colour === "r32uint")) {
-      const [gives, wants] = p.uint ? ["a `u32`", "an r32uint target"] : ["a colour", "a colour target, not an integer one"];
-      throw err(`\`${name}\`'s fragment shader returns ${gives}, so it's drawn into ${wants}`);
+    // A draw's pass's targets are one of its pipeline's.
+    const here = { color: this.#targets.colour, depth: this.#targets.depth };
+    if (!dispatch && !p.targets.some((t) => t.color === here.color && t.depth === here.depth)) {
+      throw err(`\`${name}\` is drawn into ${targetName(here)}, which isn't one of its targets (${p.targets.map(targetName).join(", ")})`);
     }
     if (bindings.length !== p.bindings.length) {
       throw err(

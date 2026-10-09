@@ -3,7 +3,7 @@
 
 use std::gpu::{
     ClipPosition, FragCoord, Rgba8, Sampler, Texture, VertexIndex, begin_pass, begin_screen_pass,
-    draw, present, sampler, texture,
+    draw, sampler, texture,
 }
 
 pub struct Scene {
@@ -39,9 +39,9 @@ fn copy(pixel: FragCoord, input: Out, image: Texture<Rgba8>, s: Sampler) -> vec4
 
 pub fn frame(state: mut Scene, time: f32, width: u32, height: u32) {
     let pass = begin_pass(mut state.target, clear: vec4(0.0, 0.0, 0.0, 1.0))
-    draw(cover, gradient, vertices: 3)
+    draw(pass, cover, gradient, vertices: 3)
     pass.end()
-    begin_screen_pass(clear: vec4(0.0, 0.0, 0.0, 1.0))
-    draw(cover, copy.bind(image: state.target, s: state.linear), vertices: 3)
-    present()
+    let screen = begin_screen_pass(clear: vec4(0.0, 0.0, 0.0, 1.0))
+    draw(screen, cover, copy.bind(image: state.target, s: state.linear), vertices: 3)
+    screen.present()
 }

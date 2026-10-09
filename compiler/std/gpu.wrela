@@ -288,9 +288,12 @@ pub trait FragmentShader<V> {}
 @intrinsic
 pub fn dispatch() {}
 
-/// Records a draw into the current pass: `draw(vs.bind(...), fs.bind(...), vertices: n)`, with
-/// `instances: m`, or `indirect: buf` for both counts. Each shader is bound to its own
-/// arguments, as `dispatch`'s kernel is; one that takes nothing is named alone.
+/// Records a draw into an open pass: `draw(pass, vs.bind(...), fs.bind(...), vertices: n)`,
+/// with `instances: m`, or `indirect: buf` for both counts. The pass is the value its `begin_`
+/// function gave (or a parameter bounded by `RenderPass`): its type says what the draw draws
+/// into, so the pipeline is made at load for each kind of pass it's drawn in, and a fragment
+/// shader's output the pass can't take is an error where it's drawn. Each shader is bound to
+/// its own arguments, as `dispatch`'s kernel is; one that takes nothing is named alone.
 ///
 /// `indices: buf` (a `GpuBuffer<u32>` or a `GpuSpan<u32>`) draws indexed, with `indirect:`
 /// holding the index count, the instance count, the first index, the base vertex and the first
@@ -299,7 +302,10 @@ pub fn dispatch() {}
 /// part of the draw's pipeline, so they're build-time constants, written out where it draws.
 ///
 /// ```wrela
-/// use std::gpu::{ClipPosition, Compare, Cull, Depth, DepthBias, GpuBuffer, VertexIndex, buffer, draw}
+/// use std::gpu::{
+///     ClipPosition, Compare, Cull, Depth, DepthBias, DepthPass, GpuBuffer, Rgba8, VertexIndex,
+///     draw,
+/// }
 ///
 /// @vertex
 /// fn corner(points: [vec2], i: VertexIndex) -> ClipPosition {
@@ -311,8 +317,14 @@ pub fn dispatch() {}
 ///     vec4(1.0, 1.0, 1.0, 1.0)
 /// }
 ///
-/// fn quad(points: GpuBuffer<vec2>, indices: GpuBuffer<u32>, counts: GpuBuffer<u32>) {
+/// fn quad(
+///     pass: DepthPass<Rgba8>,
+///     points: GpuBuffer<vec2>,
+///     indices: GpuBuffer<u32>,
+///     counts: GpuBuffer<u32>,
+/// ) {
 ///     draw(
+///         pass,
 ///         corner.bind(points),
 ///         white,
 ///         indices: indices,
@@ -322,6 +334,7 @@ pub fn dispatch() {}
 ///     )
 ///     // Again where the first drew, with no depth written.
 ///     draw(
+///         pass,
 ///         corner.bind(points),
 ///         white,
 ///         indices: indices,
@@ -367,12 +380,37 @@ pub struct Depth: Copy {
 pub fn discard() {}
 
 /// Starts drawing to the screen, cleared to `clear`.
+pub fn begin_screen_pass(clear: vec4) -> ScreenPass {
+    begin_screen_pass_command(clear)
+    ScreenPass { open: true }
+}
+
 @intrinsic
-pub fn begin_screen_pass(clear: vec4) {}
+fn begin_screen_pass_command(clear: vec4) {}
 
 /// Ends the screen pass and shows it.
 @intrinsic
 pub fn present() {}
+
+/// An open pass: what a `draw` draws into (§12). Each kind of pass has it: `Pass<F>`,
+/// `DepthPass<F>`, `DepthOnlyPass`, `ScreenPass` and `ScreenDepthPass`, and only they do (an
+/// `impl` elsewhere is E0415). A function that draws into whatever pass it's given takes one
+/// bounded by it: `fn shade<P: RenderPass>(pass: P, ...)`.
+pub trait RenderPass {}
+
+/// An open pass on the screen.
+pub struct ScreenPass {
+    open: bool,
+}
+
+impl ScreenPass {
+    /// Ends the pass and shows it.
+    pub fn present(self) {
+        present()
+    }
+}
+
+impl RenderPass for ScreenPass {}
 
 // ---- textures, samplers and passes (§12) ------------------------------------------------------
 
@@ -831,6 +869,8 @@ impl<F: Target> Pass<F> {
     }
 }
 
+impl<F: Target> RenderPass for Pass<F> {}
+
 /// An open pass with a colour target and a depth target.
 pub borrow struct DepthPass<F: Target> {
     pub target: mut Texture<F>,
@@ -844,6 +884,8 @@ impl<F: Target> DepthPass<F> {
     }
 }
 
+impl<F: Target> RenderPass for DepthPass<F> {}
+
 /// An open pass that draws only depths, into its depth target (a shadow map).
 pub borrow struct DepthOnlyPass {
     pub depth: mut DepthTexture,
@@ -856,6 +898,8 @@ impl DepthOnlyPass {
     }
 }
 
+impl RenderPass for DepthOnlyPass {}
+
 /// An open pass on the screen with a depth target.
 pub borrow struct ScreenDepthPass {
     pub depth: mut DepthTexture,
@@ -867,6 +911,8 @@ impl ScreenDepthPass {
         present()
     }
 }
+
+impl RenderPass for ScreenDepthPass {}
 
 /// The pass attachment that isn't there, and the one that's the screen (stream v3).
 const NO_TARGET: u32 = 4294967295
@@ -1181,7 +1227,7 @@ pub fn barrier<T, const N: u32>(shared: mut Shared<T, N>) {
     workgroup_barrier(mut shared)
 }
 
-/// An indirect draw's arguments (`draw(vs, fs, indirect: buf)`, of a `GpuBuffer` or span of
+/// An indirect draw's arguments (`draw(pass, vs, fs, indirect: buf)`, of a `GpuBuffer` or span of
 /// these): its vertices and instances, its first vertex and first instance. GPU code writes
 /// them; the draw reads them.
 pub struct DrawArgs: Copy + GpuData {
@@ -1191,7 +1237,7 @@ pub struct DrawArgs: Copy + GpuData {
     pub first_instance: u32,
 }
 
-/// An indexed indirect draw's arguments (`draw(vs, fs, indices: idx, indirect: buf)`): its
+/// An indexed indirect draw's arguments (`draw(pass, vs, fs, indices: idx, indirect: buf)`): its
 /// indices and instances, its first index, the vertex its indices count from, and its first
 /// instance.
 pub struct DrawIndexedArgs: Copy + GpuData {

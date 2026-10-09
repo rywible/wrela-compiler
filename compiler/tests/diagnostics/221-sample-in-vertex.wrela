@@ -2,7 +2,7 @@
 // expect: E0607
 // fix: no
 use std::gpu::{
-    ClipPosition, FragCoord, Rgba8, Sampler, Texture, VertexIndex, begin_screen_pass, draw, present,
+    ClipPosition, FragCoord, Rgba8, Sampler, Texture, VertexIndex, begin_screen_pass, draw,
     sampler, texture,
 }
 
@@ -20,7 +20,7 @@ fn paint(pixel: FragCoord) -> vec4 {
 pub fn frame(time: f32, width: u32, height: u32) {
     let heights = texture::<Rgba8>(width: 4, height: 4)
     let s = sampler()
-    begin_screen_pass(clear: vec4(0.0))
-    draw(cover.bind(heights: heights, s: s), paint, vertices: 3)
-    present()
+    let screen = begin_screen_pass(clear: vec4(0.0))
+    draw(screen, cover.bind(heights: heights, s: s), paint, vertices: 3)
+    screen.present()
 }

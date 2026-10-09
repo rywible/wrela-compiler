@@ -4,7 +4,7 @@
 // dispatch read them. A draw reads one field of a buffer's element (a `GpuField`).
 use std::gpu::{
     ClipPosition, DispatchArgs, DrawArgs, DrawIndexedArgs, GlobalId, GpuBuffer, One, Slots,
-    VertexIndex, begin_screen_pass, buffer, dispatch, draw, present,
+    VertexIndex, begin_screen_pass, buffer, dispatch, draw,
 }
 
 /// Two draws a list, as a forest's lists have.
@@ -71,9 +71,9 @@ pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
         groups: 1,
     )
     dispatch(fill.bind(mut s.out), groups: s.groups.items())
-    begin_screen_pass(clear: vec4(0.0))
-    draw(corner, red, indirect: s.draws.items())
-    draw(corner, red, indices: s.indices.items(), indirect: s.indexed.span(start: 1, count: 1))
-    draw(corner, red, indices: s.indices.items(), indirect: s.lists.at(1).limbs)
-    present()
+    let screen = begin_screen_pass(clear: vec4(0.0))
+    draw(screen, corner, red, indirect: s.draws.items())
+    draw(screen, corner, red, indices: s.indices.items(), indirect: s.indexed.span(start: 1, count: 1))
+    draw(screen, corner, red, indices: s.indices.items(), indirect: s.lists.at(1).limbs)
+    screen.present()
 }

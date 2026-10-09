@@ -2,7 +2,7 @@
 // A fragment shader drops a fragment with `discard()`: a card cut to a disc. The invocation goes
 // on as a helper, so a derivative after it is still defined; a `@gpu` function that a fragment
 // shader calls may discard too.
-use std::gpu::{ClipPosition, VertexIndex, begin_screen_pass, discard, draw, present}
+use std::gpu::{ClipPosition, VertexIndex, begin_screen_pass, discard, draw}
 
 struct Card: Copy {
     clip: ClipPosition,
@@ -34,7 +34,7 @@ fn disc(c: Card) -> vec4 {
 }
 
 pub fn frame(time: f32, width: u32, height: u32) {
-    begin_screen_pass(clear: vec4(0.0, 0.0, 0.0, 1.0))
-    draw(card, disc, vertices: 3)
-    present()
+    let screen = begin_screen_pass(clear: vec4(0.0, 0.0, 0.0, 1.0))
+    draw(screen, card, disc, vertices: 3)
+    screen.present()
 }

@@ -12,7 +12,7 @@ use std::derive::{Box3, interval}
 use std::field::{Lipschitz, Surface, check_lipschitz, hash_u32}
 use std::gpu::{
     ClipPosition, FragCoord, GlobalId, GpuBuffer, Slots, VertexIndex, begin_screen_pass, buffer,
-    dispatch, draw, present,
+    dispatch, draw,
 }
 
 // ---- the program's state: the buffers the tests read back --------------------------------------
@@ -87,9 +87,9 @@ pub fn frame(state: mut Results, time: f32, width: u32, height: u32) {
         resolution: vec2(f32(width), f32(height)),
         eye: vec3(4.0 * sin(a), 1.6, 0.6 + 4.0 * cos(a)),
     }
-    begin_screen_pass(clear: vec4(0.0, 0.0, 0.0, 1.0))
-    draw(cover, shade.bind(camera: camera, field: grazer(1)), vertices: 3)
-    present()
+    let screen = begin_screen_pass(clear: vec4(0.0, 0.0, 0.0, 1.0))
+    draw(screen, cover, shade.bind(camera: camera, field: grazer(1)), vertices: 3)
+    screen.present()
 }
 
 // ---- the tests' exports -----------------------------------------------------------------------

@@ -247,17 +247,13 @@ async function buildPipeline(device: GPUDevice, p: Pipeline, source: string): Pr
         depth: p.depth,
         variants: new Map(),
       };
-      // The variants a pass is likeliest to draw it into, now and side by side: the screen, the
-      // screen with a depth target, a depth pass alone. A shader's errors then come at load, and
-      // no frame waits to compile these (a texture's other formats are made at a first draw).
-      // (One that gives its fragments their depth is drawn only with a depth target; one that
-      // returns a `u32`, only into an r32uint target.)
-      const colour: GPUTextureFormat = p.uint ? "r32uint" : SCREEN_FORMAT;
-      const targets: [GPUTextureFormat | null, GPUTextureFormat | null][] = [
-        [colour, null],
-        [colour, "depth32float"],
-        [null, "depth32float"],
-      ].filter(([, d]) => d !== null || !p.writes_depth) as [GPUTextureFormat | null, GPUTextureFormat | null][];
+      // A variant for each of its targets (the passes the program draws it in, which the
+      // compiler knows), side by side: a shader's errors come at load, and no frame waits to
+      // compile one.
+      const targets = p.targets.map((t): [GPUTextureFormat | null, GPUTextureFormat | null] => [
+        t.color,
+        t.depth ? "depth32float" : null,
+      ]);
       const made = await Promise.all(
         targets.map(([c, d]) => device.createRenderPipelineAsync(renderDescriptor(p.name, render!, c, d))),
       );
@@ -1086,17 +1082,12 @@ export class GpuExecutor {
     pass.end();
   }
 
-  /** The render pipeline of `index` for these targets, made now if it isn't yet. */
+  /** The render pipeline of `index` for these targets: one of the manifest's for it, which the
+   * checker checked, made at load. */
   #variant(index: number, color: GPUTextureFormat | null, depth: GPUTextureFormat | null): GPURenderPipeline {
     const p = this.#pipeline(index);
-    if (p.render === null) throw new Error(`host bug: pipeline ${index} isn't a render pipeline`);
-    // (The checker checked the pass's targets take the pipeline.)
-    const key = targetsKey(color, depth);
-    let v = p.render.variants.get(key);
-    if (v === undefined) {
-      v = this.device.createRenderPipeline(renderDescriptor(p.name, p.render, color, depth));
-      p.render.variants.set(key, v);
-    }
+    const v = p.render?.variants.get(targetsKey(color, depth));
+    if (v === undefined) throw new Error(`host bug: pipeline ${index} has no variant for its pass's targets`);
     return v;
   }
 

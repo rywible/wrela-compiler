@@ -7,7 +7,7 @@ use std::gpu::{
     Address, ClipPosition, Compare, ComparisonSampler, DepthTexture, Filter, Filtered, FragCoord,
     GlobalId, GpuBuffer, Rgba16Float, Rgba8, Sampler, Slots, Texture, VertexIndex, begin_depth_pass,
     begin_pass, begin_pass_with_depth, begin_screen_pass, buffer, comparison_sampler, depth_texture,
-    dispatch, draw, present, sampler, texture, write,
+    dispatch, draw, sampler, texture, write,
 }
 
 /// A draw's counts for a quad: 6 vertices, 1 instance, from vertex 0 and instance 0.
@@ -122,49 +122,49 @@ pub fn frame(state: mut Scene, time: f32, width: u32, height: u32) {
         mut state.depth,
         clear: vec4(0.0, 0.0, 0.0, 1.0),
     )
-    draw(
+    draw(pass,
         quad.bind(rect: WHOLE, z: 0.8),
         flat.bind(colour: vec4(0.0, 1.0, 0.0, 1.0)),
         indirect: state.counts.span(start: 0, count: 4),
     )
-    draw(
+    draw(pass,
         quad.bind(rect: Rect { lo: vec2(-1.0, -1.0), size: vec2(1.0, 2.0) }, z: 0.2),
         flat.bind(colour: vec4(0.0, 0.0, 1.0, 1.0)),
         vertices: 6,
     )
-    draw(quad.bind(rect: WHOLE, z: 0.9), flat.bind(colour: vec4(1.0, 0.0, 0.0, 1.0)), vertices: 6)
+    draw(pass, quad.bind(rect: WHOLE, z: 0.9), flat.bind(colour: vec4(1.0, 0.0, 0.0, 1.0)), vertices: 6)
     pass.end()
     // A shadow map: the left half of it near the light.
     let shadow = begin_depth_pass(mut state.shadow)
-    draw(
+    draw(shadow,
         quad.bind(rect: Rect { lo: vec2(-1.0, -1.0), size: vec2(1.0, 2.0) }, z: 0.25),
         flat.bind(colour: vec4(0.0)),
         vertices: 6,
     )
     shadow.end()
-    begin_screen_pass(clear: vec4(0.1, 0.1, 0.1, 1.0))
+    let screen = begin_screen_pass(clear: vec4(0.1, 0.1, 0.1, 1.0))
     // Top left: the checkerboard, nearest. Top right: blended.
-    draw(
+    draw(screen,
         quad.bind(rect: Rect { lo: vec2(-1.0, 0.0), size: vec2(1.0, 1.0) }, z: 0.5),
         textured.bind(image: state.board, s: state.nearest),
         vertices: 6,
     )
-    draw(
+    draw(screen,
         quad.bind(rect: Rect { lo: vec2(0.0, 0.0), size: vec2(1.0, 1.0) }, z: 0.5),
         textured.bind(image: state.board, s: state.linear),
         vertices: 6,
     )
     // Bottom left: the offscreen pass's colours.
-    draw(
+    draw(screen,
         quad.bind(rect: Rect { lo: vec2(-1.0, -1.0), size: vec2(1.0, 1.0) }, z: 0.5),
         textured.bind(image: state.target, s: state.linear),
         vertices: 6,
     )
     // Bottom right: the shadow map's test at depth 0.5.
-    draw(
+    draw(screen,
         quad.bind(rect: Rect { lo: vec2(0.0, -1.0), size: vec2(1.0, 1.0) }, z: 0.5),
         shadowed.bind(shadow: state.shadow, cmp: state.cmp, depth: 0.5),
         vertices: 6,
     )
-    present()
+    screen.present()
 }

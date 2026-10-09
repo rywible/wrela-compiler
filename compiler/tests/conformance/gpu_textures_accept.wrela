@@ -4,7 +4,7 @@
 use std::gpu::{
     ClipPosition, ComparisonSampler, DepthTexture, FragCoord, GlobalId, Rgba8, Sampler, Slots,
     Texture, VertexIndex, begin_depth_pass, begin_pass, begin_screen_pass, buffer,
-    comparison_sampler, depth_texture, dispatch, draw, present, sampler, texture,
+    comparison_sampler, depth_texture, dispatch, draw, sampler, texture,
 }
 
 @vertex
@@ -39,23 +39,23 @@ pub fn frame(time: f32, width: u32, height: u32) {
     let s = sampler()
     let cmp = comparison_sampler()
     let pass = begin_depth_pass(mut shadow)
-    draw(cover.bind(heights: image, s: s), paint_depth, vertices: 3)
+    draw(pass, cover.bind(heights: image, s: s), paint_depth, vertices: 3)
     pass.end()
     var target = texture::<Rgba8>(width: 16, height: 16)
     let p = begin_pass(mut target)
-    draw(
+    draw(p,
         cover.bind(heights: image, s: s),
         paint.bind(s: s, image: image, shadow: shadow, cmp: cmp),
         vertices: 3,
     )
     p.end()
-    begin_screen_pass(clear: vec4(0.0))
-    draw(
+    let screen = begin_screen_pass(clear: vec4(0.0))
+    draw(screen,
         cover.bind(heights: target, s: s),
         paint.bind(s: s, image: target, shadow: shadow, cmp: cmp),
         vertices: 3,
     )
-    present()
+    screen.present()
     var out = buffer(64)
     dispatch(texels.bind(image: image, out: mut out), groups: 1)
     let _n = image.width() + shadow.height()

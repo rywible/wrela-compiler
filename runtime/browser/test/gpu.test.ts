@@ -326,14 +326,28 @@ test("a pass into textures draws with the pipeline made for their formats, and i
   // The last pass waits for what follows (it may be joined) and is recorded at the flush.
   executor.flush();
   expect(kinds(device.events).at(-1)).toBe("submit");
-  // The screen's format with and without a depth target, and a depth pass, were made at load;
-  // another format's variant is made at its first draw.
-  expect(device.variants).toEqual(["draw rgba16float|none"]);
+  // Each of the pipeline's targets' variants was made at load: none at a draw.
+  expect(device.variants).toEqual([]);
+  expect(device.made).toContain("draw rgba16float|none");
+  expect(device.made).toContain("draw none|depth32float");
   expect(device.events.filter((e) => e.kind === "renderPass").slice(0, 3)).toEqual([
     { kind: "renderPass", clear: { r: 0, g: 0, b: 0, a: 1 }, view: "texture 3", depth: "texture 4 clear" },
     { kind: "renderPass", clear: { r: 0, g: 0, b: 0, a: 0 }, view: "none", depth: "texture 4 clear" },
     { kind: "renderPass", clear: { r: 0, g: 0, b: 0, a: 1 }, view: "texture 3", load: "load" },
   ]);
+});
+
+test("a render pipeline's variants are its manifest's targets, made at load", async () => {
+  const device = new FakeDevice();
+  const m = shapes();
+  const draw = m.pipelines[0]!;
+  if (draw.kind !== "render") throw new Error("the shapes' pipeline 0 renders");
+  draw.targets = [
+    { color: "rgba16float", depth: true },
+    { color: null, depth: true },
+  ];
+  await Promise.all(buildPipelines(device.gpu, m, m.pipelines.map(() => SHADER)));
+  expect(device.made).toEqual(["draw rgba16float|depth32float", "draw none|depth32float"]);
 });
 
 test("a pass that may join the one before, on the same targets kept, runs as part of it", async () => {

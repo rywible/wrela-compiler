@@ -312,6 +312,8 @@ pub struct Dispatch {
 
 #[derive(Clone, Debug)]
 pub struct Draw {
+    /// The open pass it draws into, borrowed: its type says the pass's targets.
+    pub pass: (Place, Span),
     pub vertex: Shader,
     pub fragment: Shader,
     pub vertices: Operand,

@@ -33,12 +33,12 @@ pub fn frame(time: f32, width: u32, height: u32) {
     dispatch(fill, groups: 1) //~ E0303
     // The form before binding: the fix binds the arguments.
     dispatch(fill, groups: 1, scale: 1.0, out: mut out) //~ E0603
-    begin_screen_pass(clear: vec4(0.0, 0.0, 0.0, 1.0))
-    draw(vs, fs.bind(p: P { s: 1.0 }), vertices: 3, vertices: 6) //~ E0304
-    draw(vs, fs.bind(p: P { s: 1.0 }), vertices: 3, instances: 1, instances: 2) //~ E0304
-    draw(vs, fs.bind(p: P { s: 1.0 }, p: P { s: 2.0 }), vertices: 3) //~ E0304
-    draw(vs, fs, vertices: 3, p: P { s: 1.0 }) //~ E0603
-    present()
+    let screen = begin_screen_pass(clear: vec4(0.0, 0.0, 0.0, 1.0))
+    draw(screen, vs, fs.bind(p: P { s: 1.0 }), vertices: 3, vertices: 6) //~ E0304
+    draw(screen, vs, fs.bind(p: P { s: 1.0 }), vertices: 3, instances: 1, instances: 2) //~ E0304
+    draw(screen, vs, fs.bind(p: P { s: 1.0 }, p: P { s: 2.0 }), vertices: 3) //~ E0304
+    draw(screen, vs, fs, vertices: 3, p: P { s: 1.0 }) //~ E0603
+    screen.present()
 }
 
 fn direct() {

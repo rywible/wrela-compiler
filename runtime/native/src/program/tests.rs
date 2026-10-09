@@ -262,11 +262,11 @@ fn checks_buffers() {
 #[test]
 fn checks_dispatches() {
     let (op, why) = command_err(with_buffers(|e| {
-        e.dispatch(9, [1; 3], &[b(1), b(2)], &U16);
+        e.dispatch(10, [1; 3], &[b(1), b(2)], &U16);
     }));
     assert_eq!(
         (op, why.as_str()),
-        (Opcode::Dispatch, "there's no pipeline 9 (the manifest has 9)")
+        (Opcode::Dispatch, "there's no pipeline 10 (the manifest has 10)")
     );
     let (_, why) = command_err(with_buffers(|e| {
         e.dispatch(0, [1; 3], &[b(1), b(2)], &U16);

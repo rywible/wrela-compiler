@@ -17,11 +17,11 @@
       "severity": "error",
       "span": {
         "column": 13,
-        "end": 353,
+        "end": 344,
         "end_column": 46,
         "end_line": 11,
         "line": 11,
-        "start": 320
+        "start": 311
       },
       "title": "a GPU feature where it doesn't exist"
     }

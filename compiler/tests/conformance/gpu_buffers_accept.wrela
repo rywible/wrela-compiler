@@ -1,7 +1,7 @@
 // accepts: gpu.entry
 // A WebGPU stage has at most eight storage buffers, and a render pipeline's two shaders each
 // have their own: a vertex shader and a fragment shader may take eight each.
-use std::gpu::{ClipPosition, GpuBuffer, VertexIndex, begin_screen_pass, buffer, draw, present}
+use std::gpu::{ClipPosition, GpuBuffer, VertexIndex, begin_screen_pass, buffer, draw}
 
 @vertex
 fn spread(
@@ -26,11 +26,11 @@ fn mix_all(a: [f32], b: [f32], c: [f32], d: [f32], e: [f32], f: [f32], g: [f32],
 
 pub fn frame(time: f32, width: u32, height: u32) {
     let x: GpuBuffer<f32> = buffer(1)
-    begin_screen_pass(clear: vec4(0.0, 0.0, 0.0, 1.0))
-    draw(
+    let screen = begin_screen_pass(clear: vec4(0.0, 0.0, 0.0, 1.0))
+    draw(screen,
         spread.bind(x, x, x, x, x, x, x, x),
         mix_all.bind(x, x, x, x, x, x, x, x),
         vertices: 3,
     )
-    present()
+    screen.present()
 }

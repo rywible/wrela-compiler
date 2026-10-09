@@ -6,8 +6,8 @@
 // takes nothing from the vertex shader goes with any.
 use std::gpu::{
     Append, AppendBuffer, ClipPosition, Filtered, FragCoord, FragmentShader, GlobalId, GpuBuffer,
-    Kernel, Rgba8, Rgba16Float, Sampler, Slots, Texels, Texture, VertexIndex, VertexShader,
-    append_buffer, begin_screen_pass, buffer, dispatch, draw, present, sampler, texture,
+    Kernel, RenderPass, Rgba8, Rgba16Float, Sampler, Slots, Texels, Texture, VertexIndex,
+    VertexShader, append_buffer, begin_screen_pass, buffer, dispatch, draw, sampler, texture,
     writable_texture,
 }
 
@@ -72,13 +72,13 @@ fn run_twice<K: Kernel>(k: K, n: u32) {
 }
 
 /// Any fragment shader over the whole target.
-fn fullscreen<F: FragmentShader<ClipPosition>>(fs: F) {
-    draw(cover.bind(z: 0.5), fs, vertices: 3)
+fn fullscreen<P: RenderPass, F: FragmentShader<ClipPosition>>(pass: P, fs: F) {
+    draw(pass, cover.bind(z: 0.5), fs, vertices: 3)
 }
 
 /// Any pair of shaders that pass a `Quad`.
-fn quads<V: VertexShader<Quad>, F: FragmentShader<Quad>>(vs: V, fs: F) {
-    draw(vs, fs, vertices: 4)
+fn quads<P: RenderPass, V: VertexShader<Quad>, F: FragmentShader<Quad>>(pass: P, vs: V, fs: F) {
+    draw(pass, vs, fs, vertices: 4)
 }
 
 struct State {
@@ -108,12 +108,12 @@ pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
     run_twice(double.bind(s.xs.span(start: 0, count: 64), mut s.doubled), 64)
     run(keep.bind(s.doubled, mut s.kept), 64)
     run(paint.bind(Tint { colour: vec4(1.0) }, mut s.painted), 64)
-    begin_screen_pass(clear: vec4(0.0))
+    let screen = begin_screen_pass(clear: vec4(0.0))
     let red = flat.bind(Tint { colour: vec4(1.0, 0.0, 0.0, 1.0) })
-    fullscreen(red)
-    draw(cover.bind(z: 0.5), red, vertices: 3)
+    fullscreen(screen, red)
+    draw(screen, cover.bind(z: 0.5), red, vertices: 3)
     // A fragment shader that takes nothing from the vertex shader goes with a `Quad`'s too.
-    quads(quad.bind(), red)
-    quads(quad.bind(), textured.bind(image: s.board, s: s.s))
-    present()
+    quads(screen, quad.bind(), red)
+    quads(screen, quad.bind(), textured.bind(image: s.board, s: s.s))
+    screen.present()
 }

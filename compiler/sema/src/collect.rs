@@ -2724,6 +2724,18 @@ fn check_impl(p: &Program, diags: &mut Vec<Diagnostic>, imp: &ImplDef) {
         );
         return;
     }
+    // A pass's trait is std's passes' own (§12).
+    if tr.lang == Some(Lang::RenderPass) && !p.is_std(imp.module) {
+        diags.push(
+            Diagnostic::new(
+                codes::E0415,
+                imp.span,
+                format!("`{}` isn't implemented with an `impl`: std's passes have it", tr.name),
+            )
+            .with_note("a draw draws into the pass a `begin_` function gives, and its type says the pass's targets (§12)"),
+        );
+        return;
+    }
     // `Clone`'s leaves: std's core clones what owns memory by hand (`Vec`, `Box`), for a type
     // that declares `Clone`.
     let clone_leaf = tr.lang == Some(Lang::Clone)

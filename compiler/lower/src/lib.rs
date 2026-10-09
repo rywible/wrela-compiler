@@ -256,6 +256,9 @@ pub(crate) struct Cx<'a> {
     pub pipelines: Vec<(gpu::PipelineKey, Rc<gpu::Interface>)>,
     /// Where CPU code dispatches or draws each of `pipelines`.
     pub pipeline_sites: Vec<Vec<Span>>,
+    /// What each render pipeline of `pipelines` is drawn into, first drawn first (the
+    /// manifest's `targets`): from the draws left in the optimized CPU code, once it's emitted.
+    pub pipeline_targets: Vec<Vec<ir::DrawTarget>>,
     /// A lifted build's literals (§22): only the program's own modules read them, never the
     /// modules that compute constants or run tests.
     pub lift: Option<&'a LiftTable>,
@@ -437,7 +440,8 @@ pub fn lower(
     while i < cx.pipelines.len() {
         let (key, iface) = cx.pipelines[i].clone();
         let sites = cx.pipeline_sites[i].clone();
-        if let Some(mut out) = gpu::lower_pipeline(&mut cx, &key, iface, sites) {
+        let targets = cx.pipeline_targets[i].clone();
+        if let Some(mut out) = gpu::lower_pipeline(&mut cx, &key, iface, sites, targets) {
             if data.debug && cx.emit {
                 gpu::debug_checks(&mut cx, &mut out, pipelines.len() as u32 + 1);
             }
@@ -471,17 +475,25 @@ pub fn lower(
 /// Drops the pipelines no dispatch or draw in `cpu` records, and numbers the rest in order.
 fn recorded_pipelines_only(cx: &mut Cx, cpu: &mut ir::Module) {
     let mut used = vec![false; cx.pipelines.len()];
+    // Each render pipeline's targets, from the draws left: one a draw that's gone drew into
+    // isn't made.
+    let mut targets: Vec<Vec<ir::DrawTarget>> = vec![Vec::new(); cx.pipelines.len()];
     for f in &cpu.functions {
-        ir::visit::walk(&f.body, &mut |s| {
-            if let Some(ir::Expr::Host(
-                ir::HostOp::Dispatch { pipeline, .. } | ir::HostOp::Draw { pipeline, .. },
-                _,
-            )) = s.expr()
-            {
+        ir::visit::walk(&f.body, &mut |s| match s.expr() {
+            Some(ir::Expr::Host(ir::HostOp::Dispatch { pipeline, .. }, _)) => {
                 used[*pipeline as usize] = true;
             }
+            Some(ir::Expr::Host(ir::HostOp::Draw { pipeline, target, .. }, _)) => {
+                used[*pipeline as usize] = true;
+                let ts = &mut targets[*pipeline as usize];
+                if !ts.contains(target) {
+                    ts.push(*target);
+                }
+            }
+            _ => {}
         });
     }
+    cx.pipeline_targets = targets;
     if used.iter().all(|&u| u) {
         return;
     }
@@ -507,6 +519,8 @@ fn recorded_pipelines_only(cx: &mut Cx, cpu: &mut ir::Module) {
     cx.pipelines.retain(|_| *keep.next().unwrap_or(&false));
     let mut keep = used.iter();
     cx.pipeline_sites.retain(|_| *keep.next().unwrap_or(&false));
+    let mut keep = used.iter();
+    cx.pipeline_targets.retain(|_| *keep.next().unwrap_or(&false));
 }
 
 impl<'a> Cx<'a> {
@@ -521,6 +535,7 @@ impl<'a> Cx<'a> {
             diags: Vec::new(),
             pipelines: Vec::new(),
             pipeline_sites: Vec::new(),
+            pipeline_targets: Vec::new(),
             lift: None,
         }
     }

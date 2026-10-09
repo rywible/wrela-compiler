@@ -74,11 +74,11 @@ pub fn frame(s: mut Scene, time: f32, width: u32, height: u32) {
     }
     let pass = begin_screen_pass_with_depth(mut s.depth, clear: vec4(0.0, 0.0, 0.0, 1.0))
     for k in 0..10 {
-        draw(quad.bind(cell(k, 0.5)), flat.bind(GREY), vertices: 6)
+        draw(pass, quad.bind(cell(k, 0.5)), flat.bind(GREY), vertices: 6)
     }
     // 0: nearer, `Less`: drawn, and its depth written (the probe at 0.45 is behind it).
     let red = vec4(1.0, 0.0, 0.0, 1.0)
-    draw(
+    draw(pass,
         quad.bind(cell(0, 0.4)),
         flat.bind(red),
         vertices: 6,
@@ -86,7 +86,7 @@ pub fn frame(s: mut Scene, time: f32, width: u32, height: u32) {
     )
     // 1: as near, `LessEqual`: drawn, its depth the same.
     let green = vec4(0.0, 1.0, 0.0, 1.0)
-    draw(
+    draw(pass,
         quad.bind(cell(1, 0.5)),
         flat.bind(green),
         vertices: 6,
@@ -94,7 +94,7 @@ pub fn frame(s: mut Scene, time: f32, width: u32, height: u32) {
     )
     // 2: as near, `Equal`, no writes: drawn.
     let blue = vec4(0.0, 0.0, 1.0, 1.0)
-    draw(
+    draw(pass,
         quad.bind(cell(2, 0.5)),
         flat.bind(blue),
         vertices: 6,
@@ -102,7 +102,7 @@ pub fn frame(s: mut Scene, time: f32, width: u32, height: u32) {
     )
     // 3: farther, `Greater`: drawn, and its depth written (the probe at 0.55 is in front).
     let yellow = vec4(1.0, 1.0, 0.0, 1.0)
-    draw(
+    draw(pass,
         quad.bind(cell(3, 0.6)),
         flat.bind(yellow),
         vertices: 6,
@@ -110,7 +110,7 @@ pub fn frame(s: mut Scene, time: f32, width: u32, height: u32) {
     )
     // 4: far, `Always`, no writes: drawn, and the depth stays 0.5 (the probe at 0.7 fails).
     let magenta = vec4(1.0, 0.0, 1.0, 1.0)
-    draw(
+    draw(pass,
         quad.bind(cell(4, 0.9)),
         flat.bind(magenta),
         vertices: 6,
@@ -118,16 +118,16 @@ pub fn frame(s: mut Scene, time: f32, width: u32, height: u32) {
     )
     // 5: far, `Always`, writing: drawn, and the depth 0.9 (the probe at 0.7 passes).
     let cyan = vec4(0.0, 1.0, 1.0, 1.0)
-    draw(
+    draw(pass,
         quad.bind(cell(5, 0.9)),
         flat.bind(cyan),
         vertices: 6,
         depth: Depth { compare: Compare::Always, write: true },
     )
     // 6: farther, `Less`: hidden.
-    draw(quad.bind(cell(6, 0.6)), flat.bind(red), vertices: 6)
+    draw(pass, quad.bind(cell(6, 0.6)), flat.bind(red), vertices: 6)
     // 7: farther, `Equal`: hidden.
-    draw(
+    draw(pass,
         quad.bind(cell(7, 0.6)),
         flat.bind(green),
         vertices: 6,
@@ -136,12 +136,12 @@ pub fn frame(s: mut Scene, time: f32, width: u32, height: u32) {
     // 8: drawn far (0.9), its fragments at 0.4: drawn, and their depth written (the probe at
     // 0.45 is behind it).
     let orange = vec4(1.0, 0.5, 0.0, 1.0)
-    draw(quad.bind(cell(8, 0.9)), at_depth.bind(orange, depth: 0.4), vertices: 6)
+    draw(pass, quad.bind(cell(8, 0.9)), at_depth.bind(orange, depth: 0.4), vertices: 6)
     // 9: drawn near (0.1), its fragments at 0.6: hidden.
-    draw(quad.bind(cell(9, 0.1)), at_depth.bind(orange, depth: 0.6), vertices: 6)
+    draw(pass, quad.bind(cell(9, 0.1)), at_depth.bind(orange, depth: 0.6), vertices: 6)
     let probes = [0.45, 0.45, 0.45, 0.55, 0.7, 0.7, 0.45, 0.45, 0.45, 0.45]
     for k in 0..10 {
-        draw(quad.bind(right(k, probes[k])), flat.bind(WHITE), vertices: 6)
+        draw(pass, quad.bind(right(k, probes[k])), flat.bind(WHITE), vertices: 6)
     }
     pass.present()
 }

@@ -2974,7 +2974,7 @@ impl<'p> Checker<'p> {
             )
         } else {
             (
-                "`draw(vs.bind(...), fs.bind(...), vertices: n)`",
+                "`draw(pass, vs.bind(...), fs.bind(...), vertices: n)`",
                 "each shader's arguments go in its own `.bind(...)`, matched as a call's are; one that takes nothing is named alone",
             )
         };
@@ -3408,6 +3408,45 @@ impl<'p> Checker<'p> {
     /// `draw(vs.bind(...), fs.bind(...), vertices: n)`, with `instances: m` or, for both,
     /// `indirect: buf`; `indices: buf` with `indirect:` for an indexed draw; and the render
     /// state, `cull:`, `depth_bias:` and `depth:`, build-time constants.
+    /// A draw's pass: an open pass's value, which its `begin_` function gave, or a parameter
+    /// bounded by `RenderPass` (§12). Its type says what the draw draws into.
+    fn render_pass(&mut self, e: &ast::Expr) -> Option<Expr> {
+        let x = self.check_expr(e, None);
+        let is_pass = match self.kind(x.ty) {
+            TyKind::Error => return None,
+            TyKind::Adt(a, _) => matches!(
+                self.p.adt(*a).lang,
+                Some(
+                    Lang::Pass
+                        | Lang::DepthPass
+                        | Lang::DepthOnlyPass
+                        | Lang::ScreenPass
+                        | Lang::ScreenDepthPass
+                )
+            ),
+            TyKind::Param(g) => self
+                .p
+                .param(*g)
+                .bounds
+                .iter()
+                .any(|b| self.p.trait_(b.trait_).lang == Some(Lang::RenderPass)),
+            _ => false,
+        };
+        if !is_pass {
+            let ty = self.display(x.ty);
+            self.err(
+                Diagnostic::new(
+                    codes::E0603,
+                    x.span,
+                    format!("`draw` draws into the pass it's given first, and this is a `{ty}`"),
+                )
+                .with_help("start a pass with `begin_pass(...)`, `begin_pass_with_depth(...)`, `begin_depth_pass(...)` or `begin_screen_pass(...)`, and give the value it returns"),
+            );
+            return None;
+        }
+        Some(x)
+    }
+
     fn check_draw(&mut self, args: &[ast::Arg], span: Span) -> Expr {
         let unit = self.p.types.unit;
         let u32_ty = self.p.types.u32;
@@ -3417,9 +3456,9 @@ impl<'p> Checker<'p> {
         let own = |a: &ast::Arg| a.name.as_ref().is_some_and(|n| OWN.contains(&n.name.as_str()));
         // The form before binding: the shaders' arguments among `draw`'s own, by name.
         let extra: Vec<&ast::Arg> =
-            args.iter().skip(2).filter(|a| a.name.is_some() && !own(a)).collect();
-        if !extra.is_empty() && args.len() >= 2 {
-            let shaders = (self.fn_named(&args[0].value), self.fn_named(&args[1].value));
+            args.iter().skip(3).filter(|a| a.name.is_some() && !own(a)).collect();
+        if !extra.is_empty() && args.len() >= 3 {
+            let shaders = (self.fn_named(&args[1].value), self.fn_named(&args[2].value));
             let rewrite = (|| {
                 let (Some(vs), Some(fs)) = shaders else { return None };
                 let (mut vargs, mut fargs) = (Vec::new(), Vec::new());
@@ -3437,10 +3476,11 @@ impl<'p> Checker<'p> {
                         fargs.push(text);
                     }
                 }
-                let rest: Vec<&ast::Arg> = args.iter().skip(2).filter(|a| own(a)).collect();
+                let rest: Vec<&ast::Arg> = args.iter().skip(3).filter(|a| own(a)).collect();
                 let mut parts = vec![
-                    Self::bound_text(self.p.text(args[0].value.span)?, &vargs),
-                    Self::bound_text(self.p.text(args[1].value.span)?, &fargs),
+                    self.p.text(args[0].value.span)?.to_string(),
+                    Self::bound_text(self.p.text(args[1].value.span)?, &vargs),
+                    Self::bound_text(self.p.text(args[2].value.span)?, &fargs),
                 ];
                 parts.extend(self.texts(&rest)?);
                 let first = args[0].span;
@@ -3448,18 +3488,19 @@ impl<'p> Checker<'p> {
                 Some((Span::new(first.file, first.start, last.end), parts.join(", ")))
             })();
             self.unbound_gpu_call("draw", rewrite, span);
-            self.check_args_alone(&args[2..]);
+            self.check_args_alone(&args[3..]);
             return self.error_expr(span);
         }
-        if args.len() < 2 || args[0].name.is_some() || args[1].name.is_some() {
-            self.err(Diagnostic::new(codes::E0603, span, "`draw` takes the vertex and fragment shaders first: `draw(vs, fs.bind(...), vertices: n)`"));
+        if args.len() < 3 || args[..3].iter().any(|a| a.name.is_some()) {
+            self.err(Diagnostic::new(codes::E0603, span, "`draw` takes the pass, then the vertex and fragment shaders: `draw(pass, vs, fs.bind(...), vertices: n)`"));
             self.check_args_alone(args);
             return self.error_expr(span);
         }
-        let vs = self.command_shader(&args[0].value, Entry::Vertex);
-        let fs = self.command_shader(&args[1].value, Entry::Fragment);
-        let (Some(vs), Some(fs)) = (vs, fs) else {
-            self.check_args_alone(&args[2..]);
+        let pass = self.render_pass(&args[0].value);
+        let vs = self.command_shader(&args[1].value, Entry::Vertex);
+        let fs = self.command_shader(&args[2].value, Entry::Fragment);
+        let (Some(pass), Some(vs), Some(fs)) = (pass, vs, fs) else {
+            self.check_args_alone(&args[3..]);
             return self.error_expr(span);
         };
         // What the vertex shader gives the fragment shader.
@@ -3510,7 +3551,7 @@ impl<'p> Checker<'p> {
         let mut state = RenderState::default();
         let mut counts = Vec::new();
         let mut seen: Vec<&str> = Vec::new();
-        for a in &args[2..] {
+        for a in &args[3..] {
             let Some(n) = &a.name else {
                 self.err(
                     Diagnostic::new(
@@ -3641,6 +3682,7 @@ impl<'p> Checker<'p> {
         let instances =
             instances.unwrap_or(Expr { ty: u32_ty, span, kind: ExprKind::Lit(Lit::Int(1)) });
         let d = Draw {
+            pass: Box::new(pass),
             vertex,
             fragment,
             vertices,

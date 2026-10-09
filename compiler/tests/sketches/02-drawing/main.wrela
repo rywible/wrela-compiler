@@ -124,6 +124,7 @@ pub fn frame(state: mut Scene, time: f32, width: u32, height: u32) {
         // herd's.
         let field = grazer(seed(i + 1)).field()
         draw(
+            pass,
             skin.bind(
                 verts: mesh.verts.items(),
                 palettes: state.palettes.span(start: 0, count: 2 * MAX_BONES),

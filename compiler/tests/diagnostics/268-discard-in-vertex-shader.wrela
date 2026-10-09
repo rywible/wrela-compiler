@@ -24,7 +24,7 @@ fn leaf(c: Card) -> vec4 {
 }
 
 pub fn frame(time: f32, width: u32, height: u32) {
-    std::gpu::begin_screen_pass(clear: vec4(0.0, 0.0, 0.0, 1.0))
-    std::gpu::draw(card.bind(cut: 1.2), leaf, vertices: 3)
-    std::gpu::present()
+    let screen = std::gpu::begin_screen_pass(clear: vec4(0.0, 0.0, 0.0, 1.0))
+    std::gpu::draw(screen, card.bind(cut: 1.2), leaf, vertices: 3)
+    screen.present()
 }

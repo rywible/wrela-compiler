@@ -82,6 +82,8 @@ pub struct PipelineOut {
     /// A render pipeline whose fragment shader returns a `u32`: drawn into an `R32Uint`
     /// texture.
     pub uint: bool,
+    /// A render pipeline's targets: what its draws' passes draw into, first drawn first.
+    pub targets: Vec<wrela_abi::manifest::RenderTarget>,
     /// The functions its module instantiates, with their type arguments (`wrela query`).
     pub instances: Vec<(FnId, Vec<TyId>)>,
 }
@@ -579,6 +581,7 @@ fn pipeline(cx: &mut Cx, key: PipelineKey, site: Span) -> (u32, Rc<Interface>) {
     let iface = Rc::new(interface(cx, &key));
     cx.pipelines.push((key, iface.clone()));
     cx.pipeline_sites.push(vec![site]);
+    cx.pipeline_targets.push(Vec::new());
     (cx.pipelines.len() as u32 - 1, iface)
 }
 
@@ -867,10 +870,15 @@ fn record_draw(fl: &mut Fl, d: &mir::Draw, span: Span) -> Option<()> {
         return None;
     }
     let shaders = [recorded_shader(fl, &d.vertex)?, recorded_shader(fl, &d.fragment)?];
+    let target = draw_target(fl, d, &shaders[1], span)?;
     let vs = (shaders[0].func, shaders[0].substs.clone());
     let fs = (shaders[1].func, shaders[1].substs.clone());
     let key = PipelineKey::Render { vertex: vs, fragment: fs, state: d.state };
     let (pindex, iface) = pipeline(fl.cx, key, span);
+    let targets = &mut fl.cx.pipeline_targets[pindex as usize];
+    if !targets.contains(&target) {
+        targets.push(target);
+    }
     // An indexed draw's indices: their buffer's handle, and the byte offset and size, by its
     // elements' stride (`u32`s, or structs of them).
     let mut counts = Vec::new();
@@ -913,9 +921,83 @@ fn record_draw(fl: &mut Fl, d: &mir::Draw, span: Span) -> Option<()> {
         uniform,
         indirect: d.indirect.is_some(),
         indexed: d.indices.is_some(),
+        target,
     };
     fl.emit(ir::Stmt::Eval(ir::Expr::Host(op, args)));
     Some(())
+}
+
+/// What a draw draws into: its pass's targets, as the pass's type says (§12). A draw whose
+/// fragment shader's output its pass's targets can't take is E0603: one that gives its
+/// fragments their depth (`WithDepth`) needs a depth target, one that returns a `u32` an
+/// `R32Uint` texture, which nothing else is drawn into.
+fn draw_target(
+    fl: &mut Fl,
+    d: &mir::Draw,
+    fragment: &Recorded,
+    span: Span,
+) -> Option<ir::DrawTarget> {
+    let t = fl.place_src_ty(&d.pass.0);
+    let t = fl.concrete(t);
+    let p = &fl.cx.checked.program;
+    let (lang, format) = match p.types.kind(t) {
+        // `Pass<F>`'s and `DepthPass<F>`'s `F`: the target texture's format.
+        TyKind::Adt(a, args) => (p.adt(*a).lang, args.first().and_then(|&f| p.lang_of_ty(f))),
+        _ => (None, None),
+    };
+    let format = match format {
+        Some(Lang::Rgba8) => Some(ir::TexFormat::Rgba8Unorm),
+        Some(Lang::Rgba16Float) => Some(ir::TexFormat::Rgba16Float),
+        Some(Lang::R16Float) => Some(ir::TexFormat::R16Float),
+        Some(Lang::Rg16Float) => Some(ir::TexFormat::Rg16Float),
+        Some(Lang::R32Float) => Some(ir::TexFormat::R32Float),
+        Some(Lang::R32Uint) => Some(ir::TexFormat::R32Uint),
+        _ => None,
+    };
+    let screen = Some(ir::TexFormat::Rgba8Unorm);
+    let target = match (lang, format) {
+        (Some(Lang::Pass), Some(_)) => ir::DrawTarget { color: format, depth: false },
+        (Some(Lang::DepthPass), Some(_)) => ir::DrawTarget { color: format, depth: true },
+        (Some(Lang::DepthOnlyPass), _) => ir::DrawTarget { color: None, depth: true },
+        (Some(Lang::ScreenPass), _) => ir::DrawTarget { color: screen, depth: false },
+        (Some(Lang::ScreenDepthPass), _) => ir::DrawTarget { color: screen, depth: true },
+        _ => {
+            let what = format!("a draw's pass is a `{}`, not a pass", p.display_ty(t));
+            fl.cx.err(Diagnostic::internal(what));
+            return None;
+        }
+    };
+    // What the fragment shader gives, against what the pass takes.
+    let ret = ret_type(fl.cx, fragment.func, &fragment.substs);
+    let p = &fl.cx.checked.program;
+    let writes_depth = p.lang_of_ty(ret) == Some(Lang::WithDepth);
+    let uint = ret == p.types.u32;
+    let integer = target.color == Some(ir::TexFormat::R32Uint);
+    let pass = p.display_ty(t);
+    let why = if writes_depth && !target.depth {
+        Some(format!(
+            "its fragment shader gives its fragments their depth (`WithDepth`), so it draws in a pass with a depth target, and a `{pass}` has none"
+        ))
+    } else if uint && target.color.is_some() && !integer {
+        Some(format!(
+            "its fragment shader returns a `u32`, so it draws into an `R32Uint` texture, and a `{pass}` draws into another format"
+        ))
+    } else if !uint && integer {
+        Some(format!(
+            "its fragment shader returns a colour, which an `R32Uint` texture doesn't take, and a `{pass}` draws into one"
+        ))
+    } else {
+        None
+    };
+    if let Some(why) = why {
+        fl.cx.err(Diagnostic::new(
+            codes::E0603,
+            span,
+            format!("this draw's pass can't take it: {why}"),
+        ));
+        return None;
+    }
+    Some(target)
 }
 
 /// `std::gpu`'s and `std::derive`'s intrinsics.
@@ -1770,6 +1852,7 @@ pub(crate) fn lower_pipeline(
     key: &PipelineKey,
     iface: Rc<Interface>,
     sites: Vec<Span>,
+    targets: Vec<ir::DrawTarget>,
 ) -> Option<PipelineOut> {
     let mut out = match key {
         PipelineKey::Compute { .. } => lower_compute(cx, iface),
@@ -1777,6 +1860,13 @@ pub(crate) fn lower_pipeline(
     }?;
     out.key = key.clone();
     out.sites = sites;
+    out.targets = targets
+        .into_iter()
+        .map(|t| wrela_abi::manifest::RenderTarget {
+            color: t.color.map(stream_format),
+            depth: t.depth,
+        })
+        .collect();
     Some(out)
 }
 
@@ -2212,6 +2302,7 @@ fn lower_compute(cx: &mut Cx, iface: Rc<Interface>) -> Option<PipelineOut> {
         blend: false,
         writes_depth: false,
         uint: false,
+        targets: Vec::new(),
         instances,
     })
 }
@@ -2286,6 +2377,7 @@ fn lower_render(cx: &mut Cx, iface: Rc<Interface>) -> Option<PipelineOut> {
         blend,
         writes_depth,
         uint,
+        targets: Vec::new(),
         instances,
     })
 }

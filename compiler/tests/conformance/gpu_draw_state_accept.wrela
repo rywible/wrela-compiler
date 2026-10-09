@@ -4,7 +4,7 @@
 // float, the defaults; each comparison, depth writes off), there or in a `const`.
 use std::gpu::{
     ClipPosition, Compare, Cull, Depth, DepthBias, GpuBuffer, VertexIndex, begin_screen_pass,
-    begin_screen_pass_with_depth, buffer, depth_texture, draw, present,
+    begin_screen_pass_with_depth, buffer, depth_texture, draw,
 }
 
 const SHADOW_BIAS = DepthBias { slope: 2.0, constant: 4, clamp: 0.0 }
@@ -27,10 +27,10 @@ pub fn frame(time: f32, width: u32, height: u32) {
     let points: GpuBuffer<vec2> = buffer(4)
     let indices: GpuBuffer<u32> = buffer(6)
     let counts: GpuBuffer<u32> = buffer(5)
-    begin_screen_pass(clear: vec4(0.0, 0.0, 0.0, 1.0))
-    draw(corner.bind(points), white, indices: indices, indirect: counts)
-    draw(corner.bind(points), white, indices: indices, indirect: counts, cull: Cull::Back)
-    draw(
+    let screen = begin_screen_pass(clear: vec4(0.0, 0.0, 0.0, 1.0))
+    draw(screen, corner.bind(points), white, indices: indices, indirect: counts)
+    draw(screen, corner.bind(points), white, indices: indices, indirect: counts, cull: Cull::Back)
+    draw(screen,
         corner.bind(points),
         white,
         indirect: counts,
@@ -38,18 +38,18 @@ pub fn frame(time: f32, width: u32, height: u32) {
         cull: Cull::Front,
         depth_bias: DepthBias { constant: -4, slope: 2, clamp: 0.5 },
     )
-    draw(corner.bind(points), white, vertices: 3, cull: Cull::None, depth_bias: DepthBias { constant: 1, slope: -1.5, clamp: 0.0 })
-    draw(corner.bind(points), white, vertices: 3, cull: FACES, depth_bias: SHADOW_BIAS)
-    present()
+    draw(screen, corner.bind(points), white, vertices: 3, cull: Cull::None, depth_bias: DepthBias { constant: 1, slope: -1.5, clamp: 0.0 })
+    draw(screen, corner.bind(points), white, vertices: 3, cull: FACES, depth_bias: SHADOW_BIAS)
+    screen.present()
     var depth = depth_texture(width, height)
     let pass = begin_screen_pass_with_depth(mut depth)
-    draw(corner.bind(points), white, vertices: 3, depth: Depth { compare: Compare::Less, write: true })
-    draw(corner.bind(points), white, vertices: 3, depth: Depth { compare: Compare::LessEqual })
-    draw(corner.bind(points), white, vertices: 3, depth: Depth { compare: Compare::Equal, write: false })
-    draw(corner.bind(points), white, vertices: 3, depth: Depth { compare: Compare::Greater })
-    draw(corner.bind(points), white, vertices: 3, depth: Depth { compare: Compare::Always, write: false })
-    draw(corner.bind(points), white, vertices: 3, depth: Depth {}, cull: Cull::Back)
-    draw(corner.bind(points), white, vertices: 3, depth: SHADE_CARDS)
-    draw(corner.bind(points), white, vertices: 3, depth: UNDER)
+    draw(pass, corner.bind(points), white, vertices: 3, depth: Depth { compare: Compare::Less, write: true })
+    draw(pass, corner.bind(points), white, vertices: 3, depth: Depth { compare: Compare::LessEqual })
+    draw(pass, corner.bind(points), white, vertices: 3, depth: Depth { compare: Compare::Equal, write: false })
+    draw(pass, corner.bind(points), white, vertices: 3, depth: Depth { compare: Compare::Greater })
+    draw(pass, corner.bind(points), white, vertices: 3, depth: Depth { compare: Compare::Always, write: false })
+    draw(pass, corner.bind(points), white, vertices: 3, depth: Depth {}, cull: Cull::Back)
+    draw(pass, corner.bind(points), white, vertices: 3, depth: SHADE_CARDS)
+    draw(pass, corner.bind(points), white, vertices: 3, depth: UNDER)
     pass.present()
 }

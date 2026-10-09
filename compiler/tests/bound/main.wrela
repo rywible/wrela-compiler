@@ -4,9 +4,9 @@
 // the halves match, to the bit.
 
 use std::gpu::{
-    ClipPosition, FragmentShader, GlobalId, GpuBuffer, Kernel, Rgba16Float, Sampler, Slots,
-    Texels, Texture, VertexIndex, VertexShader, begin_screen_pass, buffer, dispatch, draw,
-    present, sampler, writable_texture, write,
+    ClipPosition, FragmentShader, GlobalId, GpuBuffer, Kernel, RenderPass, Rgba16Float, Sampler,
+    Slots, Texels, Texture, VertexIndex, VertexShader, begin_screen_pass, buffer, dispatch, draw,
+    sampler, writable_texture, write,
 }
 
 struct State {
@@ -71,8 +71,8 @@ fn cover<K: Kernel>(k: K) {
 }
 
 /// Any pair of shaders bound to their arguments, drawn over a half.
-fn paint<V: VertexShader<Quad>, F: FragmentShader<Quad>>(vs: V, fs: F) {
-    draw(vs, fs, vertices: 6)
+fn paint<P: RenderPass, V: VertexShader<Quad>, F: FragmentShader<Quad>>(pass: P, vs: V, fs: F) {
+    draw(pass, vs, fs, vertices: 6)
 }
 
 pub fn init() -> State {
@@ -96,14 +96,14 @@ pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
     let k = scale.bind(s.weights, k: 2.0, out: mut s.right_scales)
     dispatch(k, over: 4)
     cover(fill.bind(s.right_scales, blue: 0.25, out: mut s.right))
-    begin_screen_pass(clear: vec4(0.0))
-    draw(
+    let screen = begin_screen_pass(clear: vec4(0.0))
+    draw(screen,
         half.bind(left: -1.0),
         textured.bind(image: s.left, s: s.s, weights: s.weights.span(start: 0, count: 4)),
         vertices: 6,
     )
     let vs = half.bind(left: 0.0)
     let fs = textured.bind(image: s.right, s: s.s, weights: s.weights)
-    paint(vs, fs)
-    present()
+    paint(screen, vs, fs)
+    screen.present()
 }

@@ -19,6 +19,6 @@ pub fn frame(time: f32, width: u32, height: u32) {
     var target = texture::<Rgba8>(width: 4, height: 4)
     let s = sampler()
     let pass = begin_pass(mut target)
-    draw(cover, paint.bind(image: target, s: s), vertices: 3) //~ E0506
+    draw(pass, cover, paint.bind(image: target, s: s), vertices: 3) //~ E0506
     pass.end()
 }

@@ -3,7 +3,6 @@
 // CPU code passes the buffer `mut` in the shader's `.bind(...)`.
 use std::gpu::{
     Atomics, ClipPosition, FragCoord, GpuBuffer, VertexIndex, begin_screen_pass, buffer, draw,
-    present,
 }
 
 @vertex
@@ -21,7 +20,7 @@ fn counted(p: FragCoord, shaded: mut Atomics<u32>) -> vec4 {
 
 pub fn frame(time: f32, width: u32, height: u32) {
     var shaded: GpuBuffer<u32> = buffer(64)
-    begin_screen_pass(clear: vec4(0.0))
-    draw(cover, counted.bind(shaded: mut shaded), vertices: 3)
-    present()
+    let screen = begin_screen_pass(clear: vec4(0.0))
+    draw(screen, cover, counted.bind(shaded: mut shaded), vertices: 3)
+    screen.present()
 }

@@ -5,13 +5,13 @@
 use shapes::blob::{AROUND, blob}
 use std::derive::Box3
 use std::field::Surface
-use std::gpu::{ClipPosition, FragCoord, VertexIndex, begin_screen_pass, draw, present}
+use std::gpu::{ClipPosition, FragCoord, VertexIndex, begin_screen_pass, draw}
 use std::lift::{Literal, count, gradient, literal}
 
 pub fn frame(time: f32, width: u32, height: u32) {
-    begin_screen_pass(clear: vec4(0.1, 0.1, 0.12, 1.0))
-    draw(cover, side.bind(field: blob(), size: vec2(f32(width), f32(height))), vertices: 3)
-    present()
+    let screen = begin_screen_pass(clear: vec4(0.1, 0.1, 0.12, 1.0))
+    draw(screen, cover, side.bind(field: blob(), size: vec2(f32(width), f32(height))), vertices: 3)
+    screen.present()
 }
 
 @vertex

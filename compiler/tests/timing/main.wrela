@@ -3,7 +3,10 @@
 // fragments that each loop; `simulate`, a kernel whose invocations each loop; `blur`, another
 // pass. Keys choose what a frame draws: 0 all three (the default), 1 `shade` alone, 2
 // `simulate` alone, 3 `blur` alone.
-use std::gpu::{ClipPosition, FragCoord, GlobalId, GpuBuffer, Rgba16Float, Slots, Texture, VertexIndex, begin_pass, begin_screen_pass, buffer, dispatch, draw, label, present, texture}
+use std::gpu::{
+    ClipPosition, FragCoord, GlobalId, GpuBuffer, Rgba16Float, Slots, Texture, VertexIndex,
+    begin_pass, begin_screen_pass, buffer, dispatch, draw, label, texture,
+}
 use std::input::{Event, Key, events}
 
 @vertex
@@ -71,7 +74,7 @@ pub fn frame(w: mut Work, time: f32, width: u32, height: u32) {
     if w.only == 0 || w.only == 1 {
         label("shade")
         let p = begin_pass(mut w.a)
-        draw(cover, busy.bind(steps: 160, seed: 0.1), vertices: 3)
+        draw(p, cover, busy.bind(steps: 160, seed: 0.1), vertices: 3)
         p.end()
     }
     if w.only == 0 || w.only == 2 {
@@ -81,11 +84,11 @@ pub fn frame(w: mut Work, time: f32, width: u32, height: u32) {
     if w.only == 0 || w.only == 3 {
         label("blur")
         let p = begin_pass(mut w.c)
-        draw(cover, busy.bind(steps: 100, seed: 0.7), vertices: 3)
+        draw(p, cover, busy.bind(steps: 100, seed: 0.7), vertices: 3)
         p.end()
     }
     label("show")
-    begin_screen_pass(clear: vec4(0.0, 0.0, 0.0, 1.0))
-    draw(cover, show.bind(target: w.a), vertices: 3)
-    present()
+    let screen = begin_screen_pass(clear: vec4(0.0, 0.0, 0.0, 1.0))
+    draw(screen, cover, show.bind(target: w.a), vertices: 3)
+    screen.present()
 }

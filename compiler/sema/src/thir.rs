@@ -262,6 +262,8 @@ pub struct RenderState {
 
 #[derive(Clone, Debug)]
 pub struct Draw {
+    /// The open pass it draws into (§12): its type says the pass's targets.
+    pub pass: Box<Expr>,
     pub vertex: Shader,
     pub fragment: Shader,
     pub vertices: Expr,
@@ -519,6 +521,7 @@ impl Expr {
                 d.args.iter().for_each(|(_, a)| f(Child::Expr(a)));
             }
             ExprKind::Draw(d) => {
+                f(Child::Expr(&d.pass));
                 [&d.vertex, &d.fragment]
                     .into_iter()
                     .filter_map(Shader::value)

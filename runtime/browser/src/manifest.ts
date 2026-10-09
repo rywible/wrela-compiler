@@ -67,7 +67,21 @@ export type Stage =
       writes_depth: boolean;
       /** Its fragment shader returns a `u32`: drawn only into an `r32uint` target. */
       uint: boolean;
+      /** Every combination of targets it's drawn into, first drawn first. */
+      targets: RenderTarget[];
     };
+
+/** What a render pipeline draws into: a colour target's format (null in a pass that draws only
+ * depths; the screen's is `SCREEN_FORMAT`), and a depth target (`depth32float`) or none. */
+export interface RenderTarget {
+  color: TextureFormat | null;
+  depth: boolean;
+}
+
+/** A target as errors name it: `rgba16float with depth`, `depth alone` (runtime/abi
+ * `RenderTarget`'s `Display`). */
+export const targetName = (t: RenderTarget) =>
+  t.color === null ? "depth alone" : t.depth ? `${t.color} with depth` : t.color;
 
 export type Cull = "none" | "front" | "back";
 
@@ -160,6 +174,21 @@ function oneOfOr<T extends string, F extends string>(o: Json, key: string, where
   return o[key] === undefined ? fallback : oneOf(o, key, where, options);
 }
 
+/** A render pipeline's `targets`: each a colour format or null, and whether it has depth. */
+function renderTargets(o: Json, where: string): RenderTarget[] {
+  const ts = o["targets"];
+  if (!Array.isArray(ts)) throw new ManifestError(`${where}.targets must be an array`);
+  const names = TEXTURE_FORMATS.map((t) => t.name);
+  return ts.map((v: unknown, k) => {
+    const tw = `${where}.targets[${k}]`;
+    const to = object(v, tw);
+    if (!("color" in to)) throw new ManifestError(`${tw}.color must be a format or null`);
+    const color = to["color"] === null ? null : (oneOf(to, "color", tw, names) as TextureFormat);
+    if (typeof to["depth"] !== "boolean") throw new ManifestError(`${tw}.depth must be true or false`);
+    return { color, depth: to["depth"] };
+  });
+}
+
 /** `true` or `false`, or `fallback` where the key is missing. */
 function flag(o: Json, key: string, where: string, fallback: boolean): boolean {
   const v = o[key] === undefined ? fallback : o[key];
@@ -247,7 +276,7 @@ function pipeline(v: unknown, i: number): Pipeline {
     // A missing `writes_depth` is false, and a missing `uint`.
     const writes_depth = flag(o, "writes_depth", where, false);
     const uint = flag(o, "uint", where, false);
-    stage = { kind, vertex_entry, fragment_entry, blend: b, cull, depth_bias, depth, writes_depth, uint };
+    stage = { kind, vertex_entry, fragment_entry, blend: b, cull, depth_bias, depth, writes_depth, uint, targets: renderTargets(o, where) };
   }
   // A missing `debug_flag` is read as null.
   const d = o["debug_flag"] ?? null;
@@ -384,8 +413,28 @@ export function validateManifest(m: Manifest): void {
         ws.every((s, k) => s >= 1 && s <= MAX_WORKGROUP_SIZE[k]!) &&
         ws[0] * ws[1] * ws[2] <= MAX_WORKGROUP_INVOCATIONS;
       if (!ok) throw err(`pipeline ${i}'s workgroup size [${ws.join(", ")}] is outside WebGPU's limits`);
-    } else if (p.vertex_entry === "" || p.fragment_entry === "") {
-      throw err(`pipeline ${i} is missing an entry point`);
+    } else {
+      if (p.vertex_entry === "" || p.fragment_entry === "") throw err(`pipeline ${i} is missing an entry point`);
+      if (p.targets.length === 0) throw err(`pipeline ${i} names no targets`);
+      p.targets.forEach((t, k) => {
+        const name = targetName(t);
+        if (p.targets.slice(0, k).some((s) => s.color === t.color && s.depth === t.depth)) {
+          throw err(`pipeline ${i} names the target ${name} twice`);
+        }
+        const format = TEXTURE_FORMATS.find((f) => f.name === t.color);
+        const integer = format?.uint ?? false;
+        const why =
+          p.writes_depth && !t.depth
+            ? "its fragments give their depth, so a target has depth"
+            : p.uint && t.color !== null && !integer
+              ? "its fragment shader returns a `u32`, so a colour target is r32uint"
+              : !p.uint && integer
+                ? "its fragment shader returns a colour, which an r32uint target isn't"
+                : format?.depth
+                  ? "a colour target's format isn't a depth one"
+                  : null;
+        if (why !== null) throw err(`pipeline ${i}'s target ${name} can't be one: ${why}`);
+      });
     }
   });
 }

@@ -55,8 +55,8 @@ pub fn frame(scene: mut Scene, time: f32, width: u32, height: u32) {
     let red = vec4(1.0, 0.0, 0.0, 1.0)
     let green = vec4(0.0, 1.0, 0.0, 1.0)
     let blue = vec4(0.0, 0.0, 1.0, 1.0)
-    draw(corner.bind(scene.points, 0.5), flat.bind(red), indices: scene.indices, indirect: scene.counts)
-    draw(
+    draw(pass, corner.bind(scene.points, 0.5), flat.bind(red), indices: scene.indices, indirect: scene.counts)
+    draw(pass,
         corner.bind(scene.points, 0.5),
         flat.bind(green),
         indices: scene.indices,
@@ -64,7 +64,7 @@ pub fn frame(scene: mut Scene, time: f32, width: u32, height: u32) {
         cull: Cull::Back,
         depth_bias: DepthBias { constant: -1000, slope: 0.0, clamp: 0.0 },
     )
-    draw(
+    draw(pass,
         corner.bind(scene.points, 0.5),
         flat.bind(blue),
         indices: scene.indices,

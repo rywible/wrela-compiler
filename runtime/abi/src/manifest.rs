@@ -1,4 +1,4 @@
-//! # The manifest, version 7
+//! # The manifest, version 8
 //!
 //! `manifest.json` describes everything game-specific a host needs besides the WASM: each
 //! pipeline's shader, entry points and bindings (D-099). The runtime reads it at load; nothing
@@ -25,13 +25,17 @@
 //!   texture. With a depth target, a fragment is kept where its depth is less than what's
 //!   there, which it replaces, unless its `"depth"` says otherwise: `"compare"`, how its depth
 //!   compares with what's there for it to be kept (WebGPU's names, `"less"` by default), and
-//!   `"write"`, whether it replaces it (`true` by default). Hosts make one pipeline per combination of target formats a
-//!   pipeline is drawn with. A render pipeline with `"blend": true` draws its colour over what's
+//!   `"write"`, whether it replaces it (`true` by default). A render pipeline's `"targets"`
+//!   are every combination of targets the program draws it into, as the compiler knows them
+//!   from each draw's pass: each a colour format (`null` in a pass that draws only depths; the
+//!   screen's is [`SCREEN_FORMAT`]) and whether there's a depth target (`depth32float`), at
+//!   least one. Hosts make one pipeline for each when the program loads, and refuse a draw into
+//!   any other. A render pipeline with `"blend": true` draws its colour over what's
 //!   in the target (alpha blending, straight alpha: `src × src.a + dst × (1 − src.a)` for the
 //!   colour, `src.a + dst.a × (1 − src.a)` for alpha); without it, its colour replaces it. One
-//!   with `"writes_depth": true` gives each fragment its own depth (WGSL's `frag_depth`), so it
-//!   is drawn only in a pass with a depth target: hosts make no variant of it without one, and
-//!   refuse a draw of it in a pass without one.
+//!   with `"writes_depth": true` gives each fragment its own depth (WGSL's `frag_depth`), so its
+//!   targets all have depth; one with `"uint": true` returns a `u32`, so its targets' colour, if
+//!   they have one, is `r32uint`, which no other's is.
 //! - A render pipeline's `"cull"` drops triangles by facing (`"none"`, the default, `"front"`
 //!   or `"back"`; a triangle whose vertices run counter-clockwise on the target faces the
 //!   front). Its `"depth_bias"` moves each fragment's depth by `constant` steps of the depth
@@ -46,7 +50,7 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 use std::fmt;
 
-pub const VERSION: u32 = 7;
+pub const VERSION: u32 = 8;
 /// The screen's texture format, in WebGPU's spelling.
 pub const SCREEN_FORMAT: &str = "rgba8unorm";
 /// WebGPU's default limits that the manifest is checked against ([`Limits::DEFAULT`]).
@@ -158,7 +162,47 @@ pub enum Stage {
         /// `vec4` colour isn't drawn into.
         #[serde(skip_serializing_if = "std::ops::Not::not")]
         uint: bool,
+        /// Every combination of targets it's drawn into, first drawn first.
+        targets: Vec<RenderTarget>,
     },
+}
+
+/// What a render pipeline draws into: a colour target of a format (none in a pass that draws
+/// only depths; the screen's is [`SCREEN_FORMAT`]), and a depth target (`depth32float`) or
+/// none.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct RenderTarget {
+    pub color: Option<TextureFormat>,
+    pub depth: bool,
+}
+
+impl RenderTarget {
+    /// The screen's target, with depth or without.
+    pub fn screen(depth: bool) -> RenderTarget {
+        let color = TextureFormat::ALL.into_iter().find(|f| f.name() == SCREEN_FORMAT);
+        RenderTarget { color, depth }
+    }
+}
+
+impl fmt::Display for RenderTarget {
+    /// As errors name it: `rgba16float with depth`, `depth alone`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match (self.color, self.depth) {
+            (Some(c), true) => write!(f, "{} with depth", c.name()),
+            (Some(c), false) => write!(f, "{}", c.name()),
+            (None, _) => write!(f, "depth alone"),
+        }
+    }
+}
+
+impl Serialize for RenderTarget {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut o = s.serialize_struct("RenderTarget", 2)?;
+        o.serialize_field("color", &self.color.map(TextureFormat::name))?;
+        o.serialize_field("depth", &self.depth)?;
+        o.end()
+    }
 }
 
 /// How a render pipeline tests and writes depth, in a pass with a depth target: WebGPU's
@@ -533,9 +577,38 @@ impl Manifest {
                         ));
                     }
                 }
-                Stage::Render { vertex_entry, fragment_entry, .. } => {
+                Stage::Render {
+                    vertex_entry, fragment_entry, writes_depth, uint, targets, ..
+                } => {
                     if vertex_entry.is_empty() || fragment_entry.is_empty() {
                         return err(format!("pipeline {i} is missing an entry point"));
+                    }
+                    if targets.is_empty() {
+                        return err(format!("pipeline {i} names no targets"));
+                    }
+                    for (k, t) in targets.iter().enumerate() {
+                        if targets[..k].contains(t) {
+                            return err(format!("pipeline {i} names the target {t} twice"));
+                        }
+                        let integer = t.color.is_some_and(|c| c.is_uint());
+                        let why = if *writes_depth && !t.depth {
+                            Some("its fragments give their depth, so a target has depth")
+                        } else if *uint && t.color.is_some() && !integer {
+                            Some(
+                                "its fragment shader returns a `u32`, so a colour target is r32uint",
+                            )
+                        } else if !*uint && integer {
+                            Some(
+                                "its fragment shader returns a colour, which an r32uint target isn't",
+                            )
+                        } else if t.color.is_some_and(|c| c.is_depth()) {
+                            Some("a colour target's format isn't a depth one")
+                        } else {
+                            None
+                        };
+                        if let Some(why) = why {
+                            return err(format!("pipeline {i}'s target {t} can't be one: {why}"));
+                        }
                     }
                 }
             }
@@ -651,6 +724,31 @@ mod read {
         default: T,
     ) -> Result<T> {
         if o.contains_key(key) { one_of(o, key, place, options) } else { Ok(default) }
+    }
+
+    /// A render pipeline's `targets`: each a colour format or `null`, and whether it has depth.
+    fn render_targets(o: &Json, place: &str) -> Result<Vec<RenderTarget>> {
+        let Some(Value::Array(ts)) = o.get("targets") else {
+            return fail(format!("{place}.targets must be an array"));
+        };
+        let names = TextureFormat::ALL.map(|f| (f.name(), f));
+        ts.iter()
+            .enumerate()
+            .map(|(k, v)| {
+                let tp = format!("{place}.targets[{k}]");
+                let to = object(v, &tp)?;
+                let color = match to.get("color") {
+                    Some(Value::Null) => None,
+                    Some(_) => Some(one_of(to, "color", &tp, &names)?),
+                    None => return fail(format!("{tp}.color must be a format or null")),
+                };
+                let depth = match to.get("depth") {
+                    Some(Value::Bool(b)) => *b,
+                    _ => return fail(format!("{tp}.depth must be true or false")),
+                };
+                Ok(RenderTarget { color, depth })
+            })
+            .collect()
     }
 
     /// `true` or `false`, or `default` where the key is missing.
@@ -794,6 +892,7 @@ mod read {
                 // A missing `writes_depth` is false, and a missing `uint`.
                 writes_depth: flag(o, "writes_depth", &place, false)?,
                 uint: flag(o, "uint", &place, false)?,
+                targets: render_targets(o, &place)?,
             },
         };
         // A missing `debug_flag` is read as null.
@@ -833,7 +932,7 @@ mod tests {
     fn golden_json() {
         let json = sample().to_json();
         let expected = r#"{
-  "manifest_version": 7,
+  "manifest_version": 8,
   "stream_version": 7,
   "wasm": "game.wasm",
   "pipelines": [
@@ -865,6 +964,12 @@ mod tests {
       "kind": "render",
       "vertex_entry": "vs",
       "fragment_entry": "fs",
+      "targets": [
+        {
+          "color": "rgba8unorm",
+          "depth": false
+        }
+      ],
       "uniform": null,
       "bindings": [
         {

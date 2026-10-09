@@ -53,7 +53,10 @@ export class FakeDevice {
   readonly textures: FakeTexture[] = [];
   readonly samplers: GPUSamplerDescriptor[] = [];
   /** Render pipelines made on demand (not at load), by label and target formats. */
+  /** The render pipelines made at a draw (`createRenderPipeline`), and those made at load
+   * (`createRenderPipelineAsync`): each `label colour|depth`. */
   readonly variants: string[] = [];
+  readonly made: string[] = [];
   readonly layouts: GPUBindGroupLayoutDescriptor[] = [];
   /** Validation errors by label, which creating a bind group layout raises into the innermost
    * error scope. */
@@ -165,6 +168,8 @@ export class FakeDevice {
 
   async createRenderPipelineAsync(desc: GPURenderPipelineDescriptor) {
     this.#reject(desc.label);
+    const targets = Array.from(desc.fragment?.targets ?? []).map((t) => t?.format ?? "none");
+    this.made.push(`${desc.label} ${targets.join(",") || "none"}|${desc.depthStencil?.format ?? "none"}`);
     return { label: desc.label, kind: "render", desc };
   }
 

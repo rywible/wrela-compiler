@@ -5,8 +5,8 @@
 
 use std::gpu::{
     ClipPosition, FragCoord, GlobalId, R16Float, R32Float, R32Uint, Rg16Float, Rgba8, Sampler,
-    Texels, Texture, VertexIndex, begin_pass, begin_screen_pass, dispatch, draw, present, sampler,
-    texture, writable_texture,
+    Texels, Texture, VertexIndex, begin_pass, begin_screen_pass, dispatch, draw, sampler, texture,
+    writable_texture,
 }
 
 /// Each texture's side, in texels.
@@ -133,20 +133,20 @@ pub fn init() -> State {
 pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
     dispatch(fill.bind(mut s.ids, mut s.depths, mut s.bytes), groups: (2, 2, 1))
     let a = begin_pass(mut s.half)
-    draw(cover, halves, vertices: 3)
+    draw(a, cover, halves, vertices: 3)
     a.end()
     let b = begin_pass(mut s.pair)
-    draw(cover, halves, vertices: 3)
+    draw(b, cover, halves, vertices: 3)
     b.end()
     let c = begin_pass(mut s.drawn)
-    draw(cover, integers, vertices: 3)
+    draw(c, cover, integers, vertices: 3)
     c.end()
-    begin_screen_pass(clear: vec4(0.0))
+    let screen = begin_screen_pass(clear: vec4(0.0))
     let size = vec2(f32(width), f32(height))
-    draw(
+    draw(screen,
         cover,
         check.bind(s.ids, s.depths, s.bytes, s.half, s.pair, s.drawn, s.s, size),
         vertices: 3,
     )
-    present()
+    screen.present()
 }

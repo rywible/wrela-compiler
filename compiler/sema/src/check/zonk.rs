@@ -103,6 +103,7 @@ pub fn walk_tys(e: &mut Expr, f: &mut impl FnMut(&mut TyId)) {
             }
         }
         ExprKind::Draw(d) => {
+            walk_tys(&mut d.pass, f);
             shader_tys(&mut d.vertex, f);
             shader_tys(&mut d.fragment, f);
             walk_tys(&mut d.vertices, f);
@@ -555,6 +556,7 @@ impl Markers<'_> {
             // A shader's arguments are checked against its parameters where it's bound (E0503,
             // E0504): a fragment shader's atomics are passed `mut`.
             ExprKind::Draw(d) => {
+                self.expr(&d.pass, false, out);
                 for v in [&d.vertex, &d.fragment].into_iter().filter_map(Shader::value) {
                     self.expr(v, false, out);
                 }

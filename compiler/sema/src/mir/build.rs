@@ -1240,7 +1240,9 @@ impl<'a> Builder<'a> {
     }
 
     fn draw(&mut self, d: &thir::Draw) -> Option<Rvalue> {
-        // In the order written: each shader (a value, or its bound arguments), then the counts.
+        // In the order written: the pass, each shader (a value, or its bound arguments), then
+        // the counts.
+        let pass = (self.borrowed_place(&d.pass)?, d.pass.span);
         let vertex = self.shader(&d.vertex)?;
         let mut args = Vec::new();
         for (e, i, a) in d.args.iter().filter(|a| a.0 == 0) {
@@ -1279,6 +1281,7 @@ impl<'a> Builder<'a> {
             instances = Some(self.value(&d.instances, Want::Read)?);
         }
         Some(Rvalue::Draw(Box::new(Draw {
+            pass,
             vertex,
             fragment,
             vertices: vertices?,

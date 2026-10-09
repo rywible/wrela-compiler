@@ -27,6 +27,7 @@ const GOLDEN = `{
       "kind": "render",
       "vertex_entry": "vs",
       "fragment_entry": "fs",
+      "targets": [{ "color": "rgba8unorm", "depth": false }],
       "uniform": null,
       "bindings": [{ "binding": 0, "kind": "texture", "format": "rgba8unorm" }, { "binding": 1, "kind": "sampler" }]
     }
@@ -68,6 +69,7 @@ test("parses the Rust crate's golden manifest", () => {
         depth: { compare: "less", write: true },
         writes_depth: false,
         uint: false,
+        targets: [{ color: "rgba8unorm", depth: false }],
         uniform: null,
         bindings: [
           { binding: 0, kind: "texture", stage: "both", format: "rgba8unorm" },

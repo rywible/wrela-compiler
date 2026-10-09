@@ -609,8 +609,8 @@ impl Gpu {
                 cull,
                 depth_bias,
                 depth,
-                writes_depth,
-                uint,
+                targets,
+                ..
             } => {
                 let mut kind = Kind::Render {
                     module,
@@ -623,12 +623,18 @@ impl Gpu {
                     depth: *depth,
                     variants: HashMap::new(),
                 };
-                // The screen's variant now (an integer target's, for a `u32` output), so a
-                // shader's errors come at load (with a depth target, for one that writes its
-                // fragments' depth).
-                let depth = writes_depth.then_some(wgpu::TextureFormat::Depth32Float);
-                let colour = if *uint { wgpu::TextureFormat::R32Uint } else { SCREEN_FORMAT };
-                render_variant(&self.device, &p.name, &mut kind, (Some(colour), depth));
+                // A variant for each of its targets (the passes the program draws it in, which
+                // the compiler knows), now: a shader's errors come at load, and no pass waits to
+                // compile one.
+                for t in targets {
+                    let depth = t.depth.then_some(wgpu::TextureFormat::Depth32Float);
+                    render_variant(
+                        &self.device,
+                        &p.name,
+                        &mut kind,
+                        (t.color.map(wgpu_format), depth),
+                    );
+                }
                 kind
             }
         };
@@ -1104,13 +1110,9 @@ impl Gpu {
             h => Some(format_of(self, h)),
         };
         let depth_format = (pass.depth != stream::NONE).then(|| format_of(self, pass.depth));
+        // Each draw's pipeline has a variant for these targets, made at load: the checker
+        // checked they're among its manifest's.
         let targets = (color_format, depth_format);
-        // Every pipeline variant the pass needs, made before anything is recorded. (The checker
-        // checked each draw's pipeline is one these targets take.)
-        for d in &open.draws {
-            let Pipeline { name, kind, .. } = &mut self.pipelines[d.pipeline as usize];
-            render_variant(&self.device, name, kind, targets);
-        }
         // Everything that can flush happens before anything is recorded for this pass.
         let total = open.draws.iter().map(|d| self.aligned(d.uniforms.len())).sum();
         self.reserve_uniforms(op, total)?;

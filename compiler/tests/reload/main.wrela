@@ -3,7 +3,7 @@
 // cooked again when one it reads changes (`std::lift::Watch`); what the program carries across a
 // reload (`std::reload`); and a ticker, whose ticks a new build runs again with their records.
 
-use std::gpu::{ClipPosition, VertexIndex, begin_screen_pass, draw, present}
+use std::gpu::{ClipPosition, VertexIndex, begin_screen_pass, draw}
 use std::handoff::{Latest, Publisher, handoff}
 use std::hash::{StateHash, state_hash}
 use std::input::{Event, Key}
@@ -118,9 +118,9 @@ pub fn frame(g: mut Game, time: f32, width: u32, height: u32) {
     }
     let bytes = save(g.carried)
     keep(bytes)
-    begin_screen_pass(clear: vec4(tint() * 0.5, 1.0))
-    draw(half, tinted, vertices: 6)
-    present()
+    let screen = begin_screen_pass(clear: vec4(tint() * 0.5, 1.0))
+    draw(screen, half, tinted, vertices: 6)
+    screen.present()
 }
 
 /// The sim's newest snapshot and the table's changes: ticks, Space presses, the sum (its low

@@ -1,7 +1,7 @@
 // accepts: gpu.entry gpu.kernel-mut gpu.data gpu.dispatch gpu.workgroup eff.gpu attr.gpu attr.closed
 use std::gpu::{
     ClipPosition, FragCoord, Flat, GlobalId, GpuBuffer, Slots, VertexIndex, begin_screen_pass,
-    buffer, dispatch, draw, present, write,
+    buffer, dispatch, draw, write,
 }
 
 // A bool is GPU data: a `u32` in GPU memory.
@@ -90,8 +90,8 @@ pub fn frame(time: f32, width: u32, height: u32) {
     dispatch(fill.bind(p: p, input: input, out: mut out), groups: 1)
     var cells: GpuBuffer<u32> = buffer(64)
     dispatch(grid.bind(out: mut cells), groups: (1, 1, 1))
-    begin_screen_pass(clear: vec4(0.0, 0.0, 0.0, 1.0))
-    draw(cover, paint.bind(p: p), vertices: 3)
-    draw(spot, glow, vertices: 3)
-    present()
+    let screen = begin_screen_pass(clear: vec4(0.0, 0.0, 0.0, 1.0))
+    draw(screen, cover, paint.bind(p: p), vertices: 3)
+    draw(screen, spot, glow, vertices: 3)
+    screen.present()
 }

@@ -4,7 +4,7 @@
 // once and binds it to each draw.
 use std::gpu::{
     ClipPosition, FragCoord, GpuBuffer, GpuSpan, Rgba8, Sampler, Texture, VertexIndex,
-    begin_screen_pass, buffer, draw, present, sampler, texture, write,
+    begin_screen_pass, buffer, draw, sampler, texture, write,
 }
 
 struct Tint: Copy + GpuData {
@@ -88,8 +88,8 @@ pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
         weights: s.weights.span(start: 0, count: 4),
         detail: Detail { noise: s.noise, scale: 2.0 },
     }
-    begin_screen_pass(clear: vec4(0.0, 0.0, 0.0, 1.0))
-    draw(cover, surface.bind(sh), vertices: 3)
-    draw(cover, surface.bind(sh: sh), vertices: 3)
-    present()
+    let screen = begin_screen_pass(clear: vec4(0.0, 0.0, 0.0, 1.0))
+    draw(screen, cover, surface.bind(sh), vertices: 3)
+    draw(screen, cover, surface.bind(sh: sh), vertices: 3)
+    screen.present()
 }

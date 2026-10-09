@@ -3,7 +3,7 @@
 // code have no fragment to drop (E0607), nor does a function they call.
 use std::gpu::{
     ClipPosition, GlobalId, GpuBuffer, Slots, VertexIndex, begin_screen_pass, buffer, discard,
-    dispatch, draw, present,
+    dispatch, draw,
 }
 
 @compute(64)
@@ -46,8 +46,8 @@ fn cpu(x: f32) -> f32 {
 pub fn frame(time: f32, width: u32, height: u32) {
     var out: GpuBuffer<f32> = buffer(64)
     dispatch(kernel.bind(mut out), groups: 1)
-    begin_screen_pass(clear: vec4(0.0, 0.0, 0.0, 1.0))
-    draw(corner, white, vertices: 3)
-    present()
+    let screen = begin_screen_pass(clear: vec4(0.0, 0.0, 0.0, 1.0))
+    draw(screen, corner, white, vertices: 3)
+    screen.present()
     let _ = cpu(time)
 }

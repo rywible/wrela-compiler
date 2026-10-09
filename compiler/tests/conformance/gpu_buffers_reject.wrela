@@ -2,7 +2,7 @@
 // A WebGPU stage has at most eight storage buffers: each `[T]` and `Slots<T>` is one, and so are
 // the uniform values when they're over 64 KiB.
 use std::gpu::{
-    ClipPosition, GlobalId, GpuBuffer, Slots, VertexIndex, begin_screen_pass, buffer, draw, present,
+    ClipPosition, GlobalId, GpuBuffer, Slots, VertexIndex, begin_screen_pass, buffer, draw,
 }
 
 @compute(64)
@@ -66,7 +66,7 @@ fn white() -> vec4 {
 
 pub fn frame(time: f32, width: u32, height: u32) {
     let x: GpuBuffer<f32> = buffer(1)
-    begin_screen_pass(clear: vec4(0.0, 0.0, 0.0, 1.0))
-    draw(spread.bind(x, x, x, x, x, x, x, x, x), white, vertices: 3)
-    present()
+    let screen = begin_screen_pass(clear: vec4(0.0, 0.0, 0.0, 1.0))
+    draw(screen, spread.bind(x, x, x, x, x, x, x, x, x), white, vertices: 3)
+    screen.present()
 }

@@ -3,9 +3,7 @@
 // shader's colours it a quarter red. renderer.rs checks a pixel the vertex shader would leave
 // empty if it read the fragment shader's buffer.
 
-use std::gpu::{
-    ClipPosition, GpuBuffer, VertexIndex, begin_screen_pass, buffer, draw, present, write,
-}
+use std::gpu::{ClipPosition, GpuBuffer, VertexIndex, begin_screen_pass, buffer, draw, write}
 
 struct State {
     scale: GpuBuffer<f32>,
@@ -35,7 +33,7 @@ pub fn init() -> State {
 }
 
 pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
-    begin_screen_pass(clear: vec4(0.0))
-    draw(cover.bind(values: s.scale), paint.bind(values: s.red), vertices: 3)
-    present()
+    let screen = begin_screen_pass(clear: vec4(0.0))
+    draw(screen, cover.bind(values: s.scale), paint.bind(values: s.red), vertices: 3)
+    screen.present()
 }

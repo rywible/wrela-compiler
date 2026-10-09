@@ -6,7 +6,7 @@
 // in. Each frame runs the UI, then one tick with the commands it made, and draws the UI.
 
 use dialogue::MIRA_START
-use std::gpu::{begin_screen_pass, present}
+use std::gpu::{begin_screen_pass}
 use std::input::{Button, Event, Mods}
 use ui::draw::Renderer
 use ui::text::Fonts
@@ -256,9 +256,9 @@ pub fn frame(state: mut Game, time: f32, width: u32, height: u32) {
     state.ui.end()
     tick(mut state.world, TickInput { commands: take cmds, dt: 1.0 / 60.0 })
     state.renderer.upload(state.ui.draw)
-    begin_screen_pass(clear: vec4(0.2, 0.25, 0.2, 1.0))
-    state.renderer.draw(screen)
-    present()
+    let screen_pass = begin_screen_pass(clear: vec4(0.2, 0.25, 0.2, 1.0))
+    state.renderer.draw(screen_pass, screen)
+    screen_pass.present()
 }
 
 // ---- tests (`wrela test`) ------------------------------------------------------------------------

@@ -238,6 +238,7 @@ fn rvalue_uses(body: &Body, r: &Rvalue, out: &mut Vec<Local>) {
             d.indirect.iter().for_each(|(p, _)| place_uses(p, out));
         }
         Rvalue::Draw(d) => {
+            place_uses(&d.pass.0, out);
             [&d.vertex, &d.fragment]
                 .into_iter()
                 .filter_map(Shader::value)
@@ -1991,6 +1992,7 @@ fn rvalue_places(body: &Body, r: &Rvalue, add: &mut dyn FnMut(&Place, bool)) {
             }
         }
         Rvalue::Draw(d) => {
+            add(&d.pass.0, false);
             for p in [&d.vertex, &d.fragment].into_iter().filter_map(Shader::value) {
                 add(p, false);
             }

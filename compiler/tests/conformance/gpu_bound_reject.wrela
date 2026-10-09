@@ -4,8 +4,8 @@
 // its loans while it lives; a value it borrows is a place; and nothing implements a bound entry
 // point's trait but a bound entry point.
 use std::gpu::{
-    ClipPosition, FragCoord, FragmentShader, GlobalId, GpuBuffer, Kernel, Slots,
-    VertexIndex, begin_screen_pass, buffer, dispatch, draw, present, write,
+    ClipPosition, FragCoord, FragmentShader, GlobalId, GpuBuffer, Kernel, RenderPass, Slots,
+    VertexIndex, begin_screen_pass, buffer, dispatch, draw, write,
 }
 
 struct Big: GpuData {
@@ -52,8 +52,8 @@ fn weight(w: Wedge) -> vec4 {
     vec4(w.w)
 }
 
-fn quads<F: FragmentShader<Quad>>(fs: F) {
-    draw(cover, fs, vertices: 3) //~ E0603
+fn quads<P: RenderPass, F: FragmentShader<Quad>>(pass: P, fs: F) {
+    draw(pass, cover, fs, vertices: 3) //~ E0603
 }
 
 struct Mine {}
@@ -65,18 +65,18 @@ fn stages(out: mut GpuBuffer<f32>) {
     dispatch(fs, over: 64) //~ E0603
     dispatch(3, over: 64) //~ E0603
     let k = fill.bind(1.0, mut out)
-    begin_screen_pass(clear: vec4(0.0))
-    draw(cover, k, vertices: 3) //~ E0603
+    let screen = begin_screen_pass(clear: vec4(0.0))
+    draw(screen, cover, k, vertices: 3) //~ E0603
     let f = uv.bind()
-    draw(cover, f, vertices: 3) //~ E0603
-    present()
+    draw(screen, cover, f, vertices: 3) //~ E0603
+    screen.present()
 }
 
 fn bounds(out: mut GpuBuffer<f32>) {
-    begin_screen_pass(clear: vec4(0.0))
-    quads(flat.bind(colour: vec4(1.0)))
-    quads(weight.bind()) //~ E0400
-    present()
+    let screen = begin_screen_pass(clear: vec4(0.0))
+    quads(screen, flat.bind(colour: vec4(1.0)))
+    quads(screen, weight.bind()) //~ E0400
+    screen.present()
 }
 
 fn loans(out: mut GpuBuffer<f32>) {

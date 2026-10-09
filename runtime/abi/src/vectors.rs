@@ -8,8 +8,8 @@ use crate::check::Checker;
 use crate::hash::StateHash;
 use crate::lines::Lines;
 use crate::manifest::{
-    BindingKind, BindingStage, Cull, DepthBias, DepthState, Manifest, Pipeline, ResourceBinding,
-    Stage, UniformBlock, UniformSpace,
+    BindingKind, BindingStage, Cull, DepthBias, DepthState, Manifest, Pipeline, RenderTarget,
+    ResourceBinding, Stage, UniformBlock, UniformSpace,
 };
 use crate::stream::{
     self, Binding, Command, Compare, Encoder, NONE, Pass, SCREEN, Sequencer, StreamError,
@@ -389,8 +389,9 @@ fn bind(binding: u32, kind: BindingKind) -> ResourceBinding {
 /// render, 1, 3 and 4 compute; 0 to 3 take 16 uniform bytes, 0 and 1 bind a read-only buffer
 /// then a read-write one, 2 and 3 two read-write ones; 4 takes nothing; 5 renders with a
 /// texture, a sampler, a depth texture and a comparison sampler; 6 samples a 3D texture and
-/// writes another; 7 renders giving its fragments their depth, and 8 renders `u32`s, neither
-/// taking anything.
+/// writes another; 7 renders giving its fragments their depth, 8 renders `u32`s, and 9 is drawn
+/// only on the screen, none of them taking anything. The other render pipelines may be drawn
+/// into any targets their kind takes.
 pub fn check_manifest() -> Manifest {
     let mut m = Manifest::new("game.wasm");
     let shape = |name: &str, stage| Pipeline {
@@ -435,17 +436,32 @@ pub fn check_manifest() -> Manifest {
         ..shape("volume", Stage::Compute { entry: "main".into(), workgroup_size: [4, 4, 4] })
     });
     // Render pipelines that only some passes' targets take.
-    for (name, stage) in
-        [("with_depth", target_bound(true, false)), ("ids", target_bound(false, true))]
-    {
+    let screen_only = render_stage(false, false, vec![RenderTarget::screen(false)]);
+    for (name, stage) in [
+        ("with_depth", target_bound(true, false)),
+        ("ids", target_bound(false, true)),
+        ("screen_only", screen_only),
+    ] {
         m.pipelines.push(Pipeline { uniform: None, bindings: Vec::new(), ..shape(name, stage) });
     }
     m
 }
 
 /// A render stage (`vs`, `fs`, the defaults) whose fragments give their own depth
-/// (`writes_depth`) or whose fragment shader returns a `u32` (`uint`).
+/// (`writes_depth`) or whose fragment shader returns a `u32` (`uint`), with every target its
+/// kind takes.
 fn target_bound(writes_depth: bool, uint: bool) -> Stage {
+    let colors = TextureFormat::ALL.into_iter().filter(|f| !f.is_depth() && f.is_uint() == uint);
+    let mut targets: Vec<RenderTarget> = colors
+        .flat_map(|c| [false, true].map(|depth| RenderTarget { color: Some(c), depth }))
+        .collect();
+    targets.push(RenderTarget { color: None, depth: true });
+    targets.retain(|t| t.depth || !writes_depth);
+    render_stage(writes_depth, uint, targets)
+}
+
+/// A render stage (`vs`, `fs`, the defaults) with these targets.
+fn render_stage(writes_depth: bool, uint: bool, targets: Vec<RenderTarget>) -> Stage {
     Stage::Render {
         vertex_entry: "vs".into(),
         fragment_entry: "fs".into(),
@@ -455,6 +471,7 @@ fn target_bound(writes_depth: bool, uint: bool) -> Stage {
         depth: DepthState::default(),
         writes_depth,
         uint,
+        targets,
     }
 }
 
@@ -919,6 +936,25 @@ fn checks() -> Value {
                     .draw_indirect(0, 2, 0, &rw, &u);
             }),
         ),
+        check(
+            "a pipeline drawn on the screen, its one target",
+            &m,
+            &with_textures(&|e| _ = e.begin_screen_pass([0.0; 4]).draw(9, 3, 1, &[], &[])),
+        ),
+        check(
+            "a pipeline drawn into a texture, which isn't one of its targets",
+            &m,
+            &with_textures(&|e| {
+                _ = e.begin_pass(Pass { depth: stream::NONE, ..pass }).draw(9, 3, 1, &[], &[])
+            }),
+        ),
+        check(
+            "a pipeline drawn on the screen with depth, which isn't one of its targets",
+            &m,
+            &with_textures(&|e| {
+                _ = e.begin_pass(Pass { color: SCREEN, ..pass }).draw(9, 3, 1, &[], &[])
+            }),
+        ),
         check("a readback past the end", &m, &with_buffers(&|e| _ = e.read_buffer(0, 1, 256, 260))),
         check(
             "a storage path out of storage",
@@ -962,7 +998,7 @@ pub(crate) fn sample_manifest() -> Manifest {
     m.pipelines.push(Pipeline {
         name: "cover+shade".into(),
         shader: "pipeline_1.wgsl".into(),
-        stage: target_bound(false, false),
+        stage: render_stage(false, false, vec![RenderTarget::screen(false)]),
         uniform: None,
         bindings: vec![bind(0, BindingKind::Texture), bind(1, BindingKind::Sampler)],
         debug_flag: None,
@@ -1073,6 +1109,63 @@ fn manifests() -> Vec<Value> {
         ),
         manifest("a blend that isn't a bool", golden.replace("\"fragment_entry\": \"fs\",", "\"fragment_entry\": \"fs\",\n      \"blend\": 1,")),
         manifest("a blend that's null", golden.replace("\"fragment_entry\": \"fs\",", "\"fragment_entry\": \"fs\",\n      \"blend\": null,")),
+        manifest(
+            "a render pipeline with no targets",
+            edited(&|m| {
+                if let Stage::Render { targets, .. } = &mut m.pipelines[1].stage {
+                    targets.clear();
+                }
+            }),
+        ),
+        manifest(
+            "a render pipeline's target named twice",
+            edited(&|m| {
+                if let Stage::Render { targets, .. } = &mut m.pipelines[1].stage {
+                    targets.push(RenderTarget::screen(false));
+                }
+            }),
+        ),
+        manifest(
+            "fragments with their own depth, and a target without depth",
+            edited(&|m| {
+                if let Stage::Render { writes_depth, targets, .. } = &mut m.pipelines[1].stage {
+                    *writes_depth = true;
+                    *targets = vec![RenderTarget::screen(true), RenderTarget::screen(false)];
+                }
+            }),
+        ),
+        manifest(
+            "u32 fragments with a colour target",
+            edited(&|m| {
+                if let Stage::Render { uint, .. } = &mut m.pipelines[1].stage {
+                    *uint = true;
+                }
+            }),
+        ),
+        manifest(
+            "colour fragments with an r32uint target",
+            edited(&|m| {
+                if let Stage::Render { targets, .. } = &mut m.pipelines[1].stage {
+                    targets[0].color = Some(TextureFormat::R32Uint);
+                }
+            }),
+        ),
+        manifest(
+            "a target whose colour is a depth format",
+            edited(&|m| {
+                if let Stage::Render { targets, .. } = &mut m.pipelines[1].stage {
+                    targets[0].color = Some(TextureFormat::Depth32Float);
+                }
+            }),
+        ),
+        manifest(
+            "a target whose colour isn't a format",
+            golden.replace("\"color\": \"rgba8unorm\"", "\"color\": \"rgb8\""),
+        ),
+        manifest(
+            "a target without its depth",
+            golden.replace("\"depth\": false", "\"deep\": false"),
+        ),
         // Each of WebGPU's per-stage limits, one past it: in a fragment shader, in a vertex
         // shader (not counting what the other stage binds), and in a kernel.
         manifest(

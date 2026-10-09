@@ -1,5 +1,5 @@
 {
-  "manifest_version": 7,
+  "manifest_version": 8,
   "stream_version": 7,
   "wasm": "game.wasm",
   "pipelines": [
@@ -9,6 +9,12 @@
       "kind": "render",
       "vertex_entry": "vs",
       "fragment_entry": "fs",
+      "targets": [
+        {
+          "color": "rgba8unorm",
+          "depth": false
+        }
+      ],
       "uniform": {
         "binding": 0,
         "size": 32,

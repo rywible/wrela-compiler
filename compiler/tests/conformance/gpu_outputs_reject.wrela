@@ -4,7 +4,7 @@
 // `mut`.
 use std::gpu::{
     ClipPosition, DispatchArgs, DrawArgs, FragCoord, GlobalId, GpuBuffer, One, VertexIndex,
-    begin_screen_pass, buffer, dispatch, draw, present,
+    begin_screen_pass, buffer, dispatch, draw,
 }
 
 @compute(64)
@@ -34,9 +34,9 @@ pub fn frame(time: f32, width: u32, height: u32) {
     var n: GpuBuffer<u32> = buffer(1)
     dispatch(count.bind(n), groups: 1) //~ E0503
     dispatch(count.bind(mut n), groups: draws.items()) //~ E0603
-    begin_screen_pass(clear: vec4(0.0))
-    draw(corner, red, indirect: groups.items()) //~ E0603
-    draw(corner, red, indices: indices.items(), indirect: draws.items()) //~ E0603
-    draw(corner, red, indirect: draws.at(0).nope) //~ E0206
-    present()
+    let screen = begin_screen_pass(clear: vec4(0.0))
+    draw(screen, corner, red, indirect: groups.items()) //~ E0603
+    draw(screen, corner, red, indices: indices.items(), indirect: draws.items()) //~ E0603
+    draw(screen, corner, red, indirect: draws.at(0).nope) //~ E0206
+    screen.present()
 }

@@ -88,6 +88,7 @@ pub fn emit(l: &Lowered, sources: &SourceMap, simd: bool, budgets: bool) -> Buil
                     depth: state.depth,
                     writes_depth: p.writes_depth,
                     uint: p.uint,
+                    targets: p.targets.clone(),
                 }
             }
             _ => {

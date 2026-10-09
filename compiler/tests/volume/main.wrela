@@ -2,7 +2,10 @@
 // pass shows them on the screen: renderer.rs checks them in both hosts. The top half loads
 // texels; the bottom half samples between the layers.
 
-use std::gpu::{ClipPosition, FragCoord, GlobalId, Rgba16Float, Sampler, Texels3d, Texture3d, VertexIndex, begin_screen_pass, dispatch, draw, present, sampler, texture3d}
+use std::gpu::{
+    ClipPosition, FragCoord, GlobalId, Rgba16Float, Sampler, Texels3d, Texture3d, VertexIndex,
+    begin_screen_pass, dispatch, draw, sampler, texture3d,
+}
 
 struct State {
     t: Texture3d<Rgba16Float>,
@@ -40,7 +43,7 @@ pub fn init() -> State {
 
 pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
     dispatch(fill.bind(mut s.t), groups: (1, 1, 1))
-    begin_screen_pass(clear: vec4(0.0))
-    draw(cover, show.bind(s.t, s.s), vertices: 3)
-    present()
+    let screen = begin_screen_pass(clear: vec4(0.0))
+    draw(screen, cover, show.bind(s.t, s.s), vertices: 3)
+    screen.present()
 }

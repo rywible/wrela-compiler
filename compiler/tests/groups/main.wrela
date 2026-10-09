@@ -2,7 +2,11 @@
 // as one parameter. The left half of the screen is drawn from a group, the right from the same
 // textures, sampler, buffer and values passed one by one: renderer.rs checks they match.
 
-use std::gpu::{ClipPosition, FragCoord, GlobalId, GpuBuffer, GpuSpan, Rgba16Float, Sampler, Texels, Texture, VertexIndex, begin_screen_pass, buffer, dispatch, draw, present, sampler, texture, writable_texture, write}
+use std::gpu::{
+    ClipPosition, FragCoord, GlobalId, GpuBuffer, GpuSpan, Rgba16Float, Sampler, Texels, Texture,
+    VertexIndex, begin_screen_pass, buffer, dispatch, draw, sampler, texture, writable_texture,
+    write,
+}
 
 struct Tint: Copy + GpuData {
     colour: vec3,
@@ -124,9 +128,9 @@ pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
         weights: s.weights.span(start: 0, count: 4),
         detail: Detail { scale: 0.75, shift: vec2(0.1, 0.0) },
     }
-    begin_screen_pass(clear: vec4(0.0))
-    draw(half.bind(left: -1.0), grouped.bind(g, width: w), vertices: 6)
-    draw(
+    let screen = begin_screen_pass(clear: vec4(0.0))
+    draw(screen, half.bind(left: -1.0), grouped.bind(g, width: w), vertices: 6)
+    draw(screen,
         half.bind(left: 0.0),
         separate.bind(
             tint,
@@ -139,5 +143,5 @@ pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
         ),
         vertices: 6,
     )
-    present()
+    screen.present()
 }

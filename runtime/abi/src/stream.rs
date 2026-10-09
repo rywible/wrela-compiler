@@ -197,7 +197,7 @@ pub const PASS_JOIN: u32 = 2;
 pub const MAX_TEXTURE_3D: u32 = 2048;
 
 /// A texture's format: how its texels are stored and sampled.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(u32)]
 pub enum TextureFormat {
     /// Four 8-bit channels, read as floats in [0, 1]: the screen's format.

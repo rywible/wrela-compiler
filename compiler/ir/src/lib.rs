@@ -331,8 +331,18 @@ pub enum HostOp {
         uniform: Option<TypeId>,
         indirect: bool,
         indexed: bool,
+        /// What its pass draws into: one of the pipeline's targets (the manifest's).
+        target: DrawTarget,
     },
     Present,
+}
+
+/// What a draw's pass draws into, as its type says: a colour target of a format (none in a pass
+/// that draws only depths; the screen's is `Rgba8Unorm`), and a depth target or none.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct DrawTarget {
+    pub color: Option<TexFormat>,
+    pub depth: bool,
 }
 
 /// Raw memory (CPU only): what std's unsafe core is built on (language.md §6.14). Addresses are

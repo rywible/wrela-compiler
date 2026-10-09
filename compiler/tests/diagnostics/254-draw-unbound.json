@@ -7,10 +7,10 @@
         {
           "edits": [
             {
-              "end": 730,
+              "end": 742,
               "file": "main.wrela",
-              "replacement": "cover.bind(size: 1.0), sky.bind(top: vec4(0.1, 0.2, 0.6, 1.0), bottom: vec4(1.0)), vertices: 3",
-              "start": 646
+              "replacement": "screen, cover.bind(size: 1.0), sky.bind(top: vec4(0.1, 0.2, 0.6, 1.0), bottom: vec4(1.0)), vertices: 3",
+              "start": 650
             }
           ],
           "message": "bind the arguments"
@@ -20,18 +20,18 @@
       "internal": false,
       "label": null,
       "labels": [],
-      "message": "`draw` takes its entry points bound to their arguments: `draw(vs.bind(...), fs.bind(...), vertices: n)`",
+      "message": "`draw` takes its entry points bound to their arguments: `draw(pass, vs.bind(...), fs.bind(...), vertices: n)`",
       "notes": [
         "each shader's arguments go in its own `.bind(...)`, matched as a call's are; one that takes nothing is named alone (§12)"
       ],
       "severity": "error",
       "span": {
         "column": 5,
-        "end": 731,
-        "end_column": 95,
+        "end": 743,
+        "end_column": 103,
         "end_line": 20,
         "line": 20,
-        "start": 641
+        "start": 645
       },
       "title": "a dispatch or draw whose entry points, binding or counts are wrong"
     }

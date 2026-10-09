@@ -2,8 +2,8 @@
 // Sampling picks its detail from neighbouring pixels: fragment shaders only, in uniform
 // control flow. CPU code can't read texels.
 use std::gpu::{
-    ClipPosition, FragCoord, Rgba8, Sampler, Texture, VertexIndex, begin_screen_pass, draw, present,
-    sampler, texture,
+    ClipPosition, FragCoord, Rgba8, Sampler, Texture, VertexIndex, begin_screen_pass, draw, sampler,
+    texture,
 }
 
 @vertex
@@ -23,8 +23,8 @@ fn paint(pixel: FragCoord, image: Texture<Rgba8>, s: Sampler) -> vec4 {
 pub fn frame(time: f32, width: u32, height: u32) {
     let image = texture::<Rgba8>(width: 4, height: 4)
     let s = sampler()
-    begin_screen_pass(clear: vec4(0.0))
-    draw(cover.bind(heights: image, s: s), paint.bind(image: image, s: s), vertices: 3)
-    present()
+    let screen = begin_screen_pass(clear: vec4(0.0))
+    draw(screen, cover.bind(heights: image, s: s), paint.bind(image: image, s: s), vertices: 3)
+    screen.present()
     let texel = image.load(x: 0, y: 0) //~ E0607
 }

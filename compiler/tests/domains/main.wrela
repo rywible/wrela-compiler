@@ -5,7 +5,7 @@
 
 use std::gpu::{
     Atomics, ClipPosition, FragCoord, GlobalId, GpuBuffer, R32Uint, Texels, Texture, VertexIndex,
-    begin_screen_pass, buffer, dispatch, draw, present, writable_texture,
+    begin_screen_pass, buffer, dispatch, draw, writable_texture,
 }
 
 /// Elements of the count buffer, past the 100 the first dispatch covers.
@@ -90,8 +90,8 @@ pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
         dispatch(number.bind(mut s.image), over: (13, 7))
         dispatch(every.bind(mut s.exact, mut s.seen), over: s.exact)
     }
-    begin_screen_pass(clear: vec4(0.0))
-    draw(
+    let screen = begin_screen_pass(clear: vec4(0.0))
+    draw(screen,
         cover,
         check.bind(
             s.counts.span(start: 0, count: COUNTS),
@@ -102,5 +102,5 @@ pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
         ),
         vertices: 3,
     )
-    present()
+    screen.present()
 }

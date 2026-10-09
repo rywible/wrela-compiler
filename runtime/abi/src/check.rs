@@ -15,9 +15,8 @@
 //!   (WebGPU's default `minStorageBufferOffsetAlignment`), and exactly the uniform block's size
 //!   in uniform bytes; a dispatch's group counts are within the limit; an indirect command's
 //!   arguments fit in their buffer; an indexed draw's indices are a non-empty range of `u32`s
-//!   inside their buffer; a draw's pipeline is one its pass's targets take (one that gives its
-//!   fragments their depth needs a depth target, and one whose fragment shader returns a `u32`
-//!   an `r32uint` colour target, which no other is drawn into).
+//!   inside their buffer; a draw's pass's targets are one of its pipeline's (the manifest's
+//!   `targets`).
 //! - **Usage scopes** (WebGPU's rule): no buffer or texture is used both read-only and
 //!   read-write in one dispatch or one pass, none is bound read-write twice by one command, and
 //!   a pass's attachments aren't bound by its draws. An indirect command's arguments buffer and
@@ -28,7 +27,7 @@
 //!   `..` parts ([`path_problem`]).
 
 use crate::Manifest;
-use crate::manifest::{BindingKind, Stage};
+use crate::manifest::{BindingKind, RenderTarget, Stage};
 use crate::stream::{Binding, Command, MAX_TEXTURE_3D, NONE, Opcode, SCREEN, TextureFormat};
 use std::collections::HashMap;
 use std::fmt;
@@ -77,10 +76,8 @@ struct Shape {
     uniform_size: usize,
     /// Each binding's kind, and a colour texture's format.
     bindings: Vec<(BindingKind, Option<TextureFormat>)>,
-    /// A render pipeline's: each fragment gives its own depth (drawn only with a depth target),
-    /// and its fragment shader returns a `u32` (drawn only into an `r32uint` target).
-    writes_depth: bool,
-    uint: bool,
+    /// A render pipeline's targets: the passes it may be drawn in.
+    targets: Vec<RenderTarget>,
 }
 
 /// A live texture.
@@ -140,17 +137,16 @@ impl Checker {
             .pipelines
             .iter()
             .map(|p| {
-                let (writes_depth, uint) = match p.stage {
-                    Stage::Render { writes_depth, uint, .. } => (writes_depth, uint),
-                    Stage::Compute { .. } => (false, false),
+                let targets = match &p.stage {
+                    Stage::Render { targets, .. } => targets.clone(),
+                    Stage::Compute { .. } => Vec::new(),
                 };
                 Shape {
                     name: p.name.clone(),
                     compute: matches!(p.stage, Stage::Compute { .. }),
                     uniform_size: p.uniform.as_ref().map_or(0, |u| u.size as usize),
                     bindings: p.bindings.iter().map(|b| (b.kind, b.format)).collect(),
-                    writes_depth,
-                    uint,
+                    targets,
                 }
             })
             .collect();
@@ -530,25 +526,14 @@ impl Checker {
                 op.name()
             ));
         }
-        // A draw's pipeline is one the pass's targets take.
-        let (colour, depth) = self.targets;
-        if !dispatch && p.writes_depth && !depth {
+        // A draw's pass's targets are one of its pipeline's.
+        let (color, depth) = self.targets;
+        let here = RenderTarget { color, depth };
+        if !dispatch && !p.targets.contains(&here) {
+            let theirs: Vec<String> = p.targets.iter().map(|t| t.to_string()).collect();
             return err(format!(
-                "`{name}` gives its fragments their depth, so it's drawn in a pass with a depth \
-                 target, and this pass has none"
-            ));
-        }
-        if !dispatch
-            && let Some(c) = colour
-            && p.uint != (c == TextureFormat::R32Uint)
-        {
-            let (gives, wants) = if p.uint {
-                ("a `u32`", "an r32uint target")
-            } else {
-                ("a colour", "a colour target, not an integer one")
-            };
-            return err(format!(
-                "`{name}`'s fragment shader returns {gives}, so it's drawn into {wants}"
+                "`{name}` is drawn into {here}, which isn't one of its targets ({})",
+                theirs.join(", ")
             ));
         }
         if bindings.len() != p.bindings.len() {

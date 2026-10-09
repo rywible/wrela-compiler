@@ -5,7 +5,7 @@
 // with different type arguments, and constants the build computed (§10).
 use std::gpu::{
     ClipPosition, FragCoord, GlobalId, GpuBuffer, Slots, VertexIndex, begin_screen_pass, buffer,
-    dispatch, draw, present, write,
+    dispatch, draw, write,
 }
 
 struct Nothing: Copy + GpuData {}
@@ -184,18 +184,18 @@ pub fn frame(state: mut Kept, time: f32, width: u32, height: u32) {
         step.bind(out: mut state.out, xs: xs, nothing: Nothing {}, scale: s, table: table),
         groups: 1,
     )
-    begin_screen_pass(clear: vec4(0.0, 0.0, 0.0, 1.0))
-    draw(cover, blue, vertices: 3)
-    draw(
+    let screen = begin_screen_pass(clear: vec4(0.0, 0.0, 0.0, 1.0))
+    draw(screen, cover, blue, vertices: 3)
+    draw(screen,
         half::<f32>.bind(left: -1.0, tint: 1.0),
         shade::<f32>.bind(nothing: Nothing {}),
         vertices: 6,
     )
     let green = vec4(0.0, 1.0, 0.0, 1.0)
-    draw(
+    draw(screen,
         half::<vec4>.bind(left: 0.0, tint: green),
         shade::<vec4>.bind(nothing: Nothing {}),
         vertices: 6,
     )
-    present()
+    screen.present()
 }
