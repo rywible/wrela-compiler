@@ -13,9 +13,10 @@
 //!   it, unless the timing is serial: on a tile-based GPU each pass stores its targets to memory
 //!   and the next loads them back. Only a pass the program marks: a pass's geometry is binned
 //!   before its tiles are drawn, so two heavy passes made one wait longer than they save.
-//! - A render pipeline is made for each combination of target formats it's drawn with: the
-//!   screen's or a texture's colour format, and a depth format or none. With depth, a fragment
-//!   is kept where its depth is less than what's there, which it replaces.
+//! - A render pipeline is made at load for each of its manifest's `targets` (the passes the
+//!   program draws it in): the screen's or a texture's colour format, and a depth format or
+//!   none. With depth, a fragment is kept where its depth is less than what's there, which it
+//!   replaces.
 //! - Uniform bytes go into a ring buffer bound with dynamic offsets (aligned to the device's
 //!   offset alignment, 256 by default). The ring is staged on the CPU and written just before
 //!   each flush, so every command in a submission has its own slice. It grows (after a flush)
@@ -64,18 +65,33 @@ pub struct GpuTiming {
     /// a frame's span is its first start to its last end.
     pub start: f64,
     pub end: f64,
+    /// Which submission it ran in, counted from 0 over the run (the serial mode submits each
+    /// pass alone).
+    pub submission: usize,
 }
 
 /// Each frame's span in `timings` (ms): from its first timed piece's start to its last's end,
 /// by frame, for the frames that have any.
 pub fn frame_spans(timings: &[GpuTiming]) -> Vec<(usize, f64)> {
+    spans_by(timings, |t| t.frame)
+}
+
+/// Each submission's span in `timings` (ms), by submission: what the GPU safety rule bounds (no
+/// submission over 100 ms). A frame can be several submissions with time between them: in the
+/// browser host, a frame whose commands wait for a pipeline being built.
+pub fn submission_spans(timings: &[GpuTiming]) -> Vec<(usize, f64)> {
+    spans_by(timings, |t| t.submission)
+}
+
+/// The span of each group of `timings` with the same `key` (ms), by key.
+fn spans_by(timings: &[GpuTiming], key: impl Fn(&GpuTiming) -> usize) -> Vec<(usize, f64)> {
     let mut spans: std::collections::BTreeMap<usize, (f64, f64)> = Default::default();
     for t in timings {
-        let e = spans.entry(t.frame).or_insert((t.start, t.end));
+        let e = spans.entry(key(t)).or_insert((t.start, t.end));
         e.0 = e.0.min(t.start);
         e.1 = e.1.max(t.end);
     }
-    spans.into_iter().map(|(f, (a, b))| (f, (b - a) / 1e6)).collect()
+    spans.into_iter().map(|(k, (a, b))| (k, (b - a) / 1e6)).collect()
 }
 
 /// A texture format in wgpu's spelling.
@@ -273,6 +289,8 @@ struct Timer {
     /// Each pass and dispatch submitted and waited for alone, so none overlaps another: each
     /// one's own time (the serial mode).
     serial: bool,
+    /// The submissions timed so far.
+    submissions: usize,
 }
 
 pub(crate) struct Gpu {
@@ -1582,6 +1600,7 @@ impl Timer {
             }),
             pending: Vec::new(),
             results: Vec::new(),
+            submissions: 0,
         }
     }
 
@@ -1598,7 +1617,21 @@ impl Timer {
     fn collect(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
         let times = read_timestamp_spans(device, queue, &self.queries, self.pending.len() as u32)?;
         for ((frame, label), (start, end)) in self.pending.drain(..).zip(times) {
-            self.results.push(GpuTiming { frame, label, nanos: end - start, start, end });
+            let submission = self.submissions;
+            self.results.push(GpuTiming {
+                frame,
+                label,
+                nanos: end - start,
+                start,
+                end,
+                submission,
+            });
+            if self.serial {
+                self.submissions += 1;
+            }
+        }
+        if !self.serial {
+            self.submissions += 1;
         }
         Ok(())
     }

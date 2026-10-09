@@ -10,10 +10,9 @@
 //   host's upload `Ring`).
 // - A pass's draws are collected and recorded into one render pass when it ends (Present or
 //   EndPass), since a pass can span batches.
-// - A render pipeline is made for each combination of target formats it's drawn with: the
-//   screen's or a texture's colour format, and a depth format or none. Three are made at load
-//   (the screen, the screen with depth, depth alone); the others at their first draw. With
-//   depth, a fragment is kept where its depth is less than what's there, which it replaces.
+// - A render pipeline is made at load for each of its manifest's `targets` (the passes the
+//   program draws it in): the screen's or a texture's colour format, and a depth format or none.
+//   With depth, a fragment is kept where its depth is less than what's there, which it replaces.
 // - Uniform bytes go into a ring buffer bound with dynamic offsets (256-byte aligned by
 //   default), staged on the CPU and written just before each flush, so every command in a
 //   submission has its own slice.
@@ -373,6 +372,9 @@ export interface GpuTiming {
    * read: a frame's span is its first start to its last end. */
   start: number;
   end: number;
+  /** Which submission it ran in, counted from 0 over the run (the serial mode submits each pass
+   * alone). */
+  submission: number;
 }
 
 /** `capacity` doubled until it's at least `n`. */
@@ -430,6 +432,8 @@ class Timer {
   #pending: { frame: number; label: string }[] = [];
   /** The first timestamp read, which the others are measured from. */
   #origin: bigint | null = null;
+  /** The submissions timed so far. */
+  #submissions = 0;
   /** The readbacks under way. */
   readonly #reading: Promise<void>[] = [];
   readonly results: GpuTiming[] = [];
@@ -459,6 +463,7 @@ class Timer {
   resolve(encoder: GPUCommandEncoder): (() => void) | null {
     const passes = this.#pending.splice(0);
     if (passes.length === 0) return null;
+    const submission = this.#submissions++;
     const bytes = 16 * passes.length;
     const staging = this.device.createBuffer({ label: "timestamps", size: bytes, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
     encoder.resolveQuerySet(this.#queries, 0, 2 * passes.length, this.#resolve, 0);
@@ -473,7 +478,7 @@ class Timer {
             const start = Number(a - this.#origin);
             // An end before its start (a clock that wrapped) is taken as the start.
             const end = Math.max(start, Number(b - this.#origin));
-            this.results.push({ ...p, nanos: end - start, start, end });
+            this.results.push({ ...p, nanos: end - start, start, end, submission });
           });
           staging.unmap();
           staging.destroy();

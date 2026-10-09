@@ -738,6 +738,7 @@ pub fn timings(results: &Path) -> Vec<GpuTiming> {
             nanos: number(&t["nanos"]),
             start: number(&t["start"]),
             end: number(&t["end"]),
+            submission: t["submission"].as_u64().expect("a submission") as usize,
         })
         .collect()
 }

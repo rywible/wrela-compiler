@@ -1648,8 +1648,10 @@ fn the_clearing_is_playable_cold_within_its_budget() {
 // ---- the sky (AC6) ---------------------------------------------------------------------------
 
 /// AC6: the clouds and the probes are cooked at load in strips, so no submission runs long:
-/// every frame until the clearing's ready takes under 100 ms of GPU time (its span, in the
-/// native host and in Chrome), and the clouds' strips each well under it.
+/// every submission until the clearing's ready takes under 100 ms of GPU time (its span, in the
+/// native host and in Chrome), and the clouds' strips each well under it. (A frame can be more
+/// than one: in Chrome, a frame whose commands wait for a pipeline being built is submitted in
+/// parts, with the pipeline's compile between them.)
 #[test]
 #[ignore = "measure: a GPU time budget, needs Chrome, python3 and a GPU"]
 fn loading_never_submits_more_than_100_ms() {
@@ -1660,17 +1662,16 @@ fn loading_never_submits_more_than_100_ms() {
     c.until_ready(0);
     let ready = c.frame;
     let timings = c.host.take_timings().expect("timings");
-    let spans = wrela_host::frame_spans(&timings);
-    let longest = spans.iter().map(|s| s.1).fold(0.0, f64::max);
     let noise = timings
         .iter()
         .filter(|t| t.label == "clouds noise")
         .map(|t| t.nanos / 1e6)
         .fold(0.0, f64::max);
+    let (longest, what) = longest_submission(&timings);
     println!(
-        "native: {ready} frames to ready, the longest frame {longest:.1} ms, the clouds' noise {noise:.1} ms"
+        "native: {ready} frames to ready, the longest submission {longest:.1} ms ({what}), the clouds' noise {noise:.1} ms"
     );
-    assert!(longest < 100.0, "a loading frame took {longest} ms of GPU time");
+    assert!(longest < 100.0, "a loading submission took {longest:.1} ms of GPU time: {what}");
     // The native host's GPU lock goes before Chrome takes it.
     drop(c);
     let (_, rel) = built("clearing-load-chrome");
@@ -1679,9 +1680,21 @@ fn loading_never_submits_more_than_100_ms() {
         ..wrela_tests::ChromeRun::new(ready + 5, W, H, 60.0)
     };
     let r = wrela_tests::run_in_chrome_with(&rel, run);
-    let longest = r.spans.iter().map(|s| s.1).fold(0.0, f64::max);
-    println!("Chrome: the longest of {} frames {longest:.1} ms", r.spans.len());
-    assert!(longest < 100.0, "a loading frame took {longest} ms of GPU time in Chrome");
+    let (longest, what) = longest_submission(&r.timings);
+    println!("Chrome: the longest submission of {} frames {longest:.1} ms ({what})", r.spans.len());
+    assert!(longest < 100.0, "a loading submission took {longest:.1} ms in Chrome: {what}");
+}
+
+/// The longest submission's span in `timings` (ms), and its frame and costliest pieces.
+fn longest_submission(timings: &[GpuTiming]) -> (f64, String) {
+    let spans = wrela_host::submission_spans(timings);
+    let (at, longest) = spans.iter().copied().fold((0, 0.0), |a, s| if s.1 > a.1 { s } else { a });
+    let mut pieces: Vec<_> = timings.iter().filter(|t| t.submission == at).collect();
+    pieces.sort_by(|a, b| b.nanos.total_cmp(&a.nanos));
+    let frame = pieces.first().map_or(0, |t| t.frame);
+    let costliest: Vec<String> =
+        pieces.iter().take(4).map(|t| format!("{} {:.1} ms", t.label, t.nanos / 1e6)).collect();
+    (longest, format!("frame {frame}: {}", costliest.join(", ")))
 }
 
 /// AC6: the clouds' shadows fall on the valley from the cooked map: the start's frame with the

@@ -36,7 +36,7 @@ mod shared;
 pub use cache::compiled_code_prefix;
 pub use error::{Error, Result};
 #[cfg(feature = "gpu")]
-pub use gpu::{GpuTiming, frame_spans, map_read, open_device, read_timestamps};
+pub use gpu::{GpuTiming, frame_spans, map_read, open_device, read_timestamps, submission_spans};
 pub use program::{Failure, PostHandler, Ticked, Value, metered_engine};
 pub use wrela_abi::input::{Event, Scripted, parse_script};
 pub use wrela_abi::ticks::{TickLog, frame_time, lockstep_ticks};
