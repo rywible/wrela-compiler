@@ -1,8 +1,17 @@
 // accepts: build.budget
-// A shipped build has at most 64 pipelines: 64 is within the budget.
+// A shipped build's pipeline has at most 256 KiB of WGSL: a table of 30,000 numbers (about 180
+// KiB) is within it. There's no limit on how many pipelines a build has: how long they take to
+// create is measured (clearing.rs).
 use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch}
 
-/// The sum of `xs`: a pipeline for each length.
+const TABLE: [f32; 30000] = [0.5; 30000]
+
+@compute(64)
+fn look(out: mut Slots<f32>, id: GlobalId) {
+    out[id] = TABLE[id.x % 30000]
+}
+
+/// The sum of `xs`: a pipeline for each length, 65 of them.
 @compute(64)
 fn sum<const N: u32>(xs: [u32; N], out: mut Slots<u32>, id: GlobalId) {
     var t = 0
@@ -14,6 +23,8 @@ fn sum<const N: u32>(xs: [u32; N], out: mut Slots<u32>, id: GlobalId) {
 
 pub fn frame(time: f32, width: u32, height: u32) {
     var out: GpuBuffer<u32> = buffer(64)
+    var looked: GpuBuffer<f32> = buffer(64)
+    dispatch(look.bind(mut looked), over: 64)
     dispatch(sum.bind([1; 1], mut out), over: 64)
     dispatch(sum.bind([1; 2], mut out), over: 64)
     dispatch(sum.bind([1; 3], mut out), over: 64)
@@ -78,4 +89,5 @@ pub fn frame(time: f32, width: u32, height: u32) {
     dispatch(sum.bind([1; 62], mut out), over: 64)
     dispatch(sum.bind([1; 63], mut out), over: 64)
     dispatch(sum.bind([1; 64], mut out), over: 64)
+    dispatch(sum.bind([1; 65], mut out), over: 64)
 }

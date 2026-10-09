@@ -1,82 +1,17 @@
 // rejects: build.budget
-// A shipped build has at most 64 pipelines: the 65th is E0707, at the command that records it.
+// A shipped build's pipeline has at most 256 KiB of WGSL: one over it is E0707, at the command
+// that records it.
 use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch}
 
-/// The sum of `xs`: a pipeline for each length.
+/// A table the kernel reads, each of its numbers written out in the WGSL: about 300 KiB.
+const TABLE: [f32; 50000] = [0.5; 50000]
+
 @compute(64)
-fn sum<const N: u32>(xs: [u32; N], out: mut Slots<u32>, id: GlobalId) {
-    var t = 0
-    for x in xs {
-        t += x
-    }
-    out[id] = t
+fn look(out: mut Slots<f32>, id: GlobalId) {
+    out[id] = TABLE[id.x % 50000]
 }
 
 pub fn frame(time: f32, width: u32, height: u32) {
-    var out: GpuBuffer<u32> = buffer(64)
-    dispatch(sum.bind([1; 1], mut out), over: 64)
-    dispatch(sum.bind([1; 2], mut out), over: 64)
-    dispatch(sum.bind([1; 3], mut out), over: 64)
-    dispatch(sum.bind([1; 4], mut out), over: 64)
-    dispatch(sum.bind([1; 5], mut out), over: 64)
-    dispatch(sum.bind([1; 6], mut out), over: 64)
-    dispatch(sum.bind([1; 7], mut out), over: 64)
-    dispatch(sum.bind([1; 8], mut out), over: 64)
-    dispatch(sum.bind([1; 9], mut out), over: 64)
-    dispatch(sum.bind([1; 10], mut out), over: 64)
-    dispatch(sum.bind([1; 11], mut out), over: 64)
-    dispatch(sum.bind([1; 12], mut out), over: 64)
-    dispatch(sum.bind([1; 13], mut out), over: 64)
-    dispatch(sum.bind([1; 14], mut out), over: 64)
-    dispatch(sum.bind([1; 15], mut out), over: 64)
-    dispatch(sum.bind([1; 16], mut out), over: 64)
-    dispatch(sum.bind([1; 17], mut out), over: 64)
-    dispatch(sum.bind([1; 18], mut out), over: 64)
-    dispatch(sum.bind([1; 19], mut out), over: 64)
-    dispatch(sum.bind([1; 20], mut out), over: 64)
-    dispatch(sum.bind([1; 21], mut out), over: 64)
-    dispatch(sum.bind([1; 22], mut out), over: 64)
-    dispatch(sum.bind([1; 23], mut out), over: 64)
-    dispatch(sum.bind([1; 24], mut out), over: 64)
-    dispatch(sum.bind([1; 25], mut out), over: 64)
-    dispatch(sum.bind([1; 26], mut out), over: 64)
-    dispatch(sum.bind([1; 27], mut out), over: 64)
-    dispatch(sum.bind([1; 28], mut out), over: 64)
-    dispatch(sum.bind([1; 29], mut out), over: 64)
-    dispatch(sum.bind([1; 30], mut out), over: 64)
-    dispatch(sum.bind([1; 31], mut out), over: 64)
-    dispatch(sum.bind([1; 32], mut out), over: 64)
-    dispatch(sum.bind([1; 33], mut out), over: 64)
-    dispatch(sum.bind([1; 34], mut out), over: 64)
-    dispatch(sum.bind([1; 35], mut out), over: 64)
-    dispatch(sum.bind([1; 36], mut out), over: 64)
-    dispatch(sum.bind([1; 37], mut out), over: 64)
-    dispatch(sum.bind([1; 38], mut out), over: 64)
-    dispatch(sum.bind([1; 39], mut out), over: 64)
-    dispatch(sum.bind([1; 40], mut out), over: 64)
-    dispatch(sum.bind([1; 41], mut out), over: 64)
-    dispatch(sum.bind([1; 42], mut out), over: 64)
-    dispatch(sum.bind([1; 43], mut out), over: 64)
-    dispatch(sum.bind([1; 44], mut out), over: 64)
-    dispatch(sum.bind([1; 45], mut out), over: 64)
-    dispatch(sum.bind([1; 46], mut out), over: 64)
-    dispatch(sum.bind([1; 47], mut out), over: 64)
-    dispatch(sum.bind([1; 48], mut out), over: 64)
-    dispatch(sum.bind([1; 49], mut out), over: 64)
-    dispatch(sum.bind([1; 50], mut out), over: 64)
-    dispatch(sum.bind([1; 51], mut out), over: 64)
-    dispatch(sum.bind([1; 52], mut out), over: 64)
-    dispatch(sum.bind([1; 53], mut out), over: 64)
-    dispatch(sum.bind([1; 54], mut out), over: 64)
-    dispatch(sum.bind([1; 55], mut out), over: 64)
-    dispatch(sum.bind([1; 56], mut out), over: 64)
-    dispatch(sum.bind([1; 57], mut out), over: 64)
-    dispatch(sum.bind([1; 58], mut out), over: 64)
-    dispatch(sum.bind([1; 59], mut out), over: 64)
-    dispatch(sum.bind([1; 60], mut out), over: 64)
-    dispatch(sum.bind([1; 61], mut out), over: 64)
-    dispatch(sum.bind([1; 62], mut out), over: 64)
-    dispatch(sum.bind([1; 63], mut out), over: 64)
-    dispatch(sum.bind([1; 64], mut out), over: 64)
-    dispatch(sum.bind([1; 65], mut out), over: 64) //~ E0707
+    var out: GpuBuffer<f32> = buffer(64)
+    dispatch(look.bind(mut out), over: 64) //~ E0707
 }

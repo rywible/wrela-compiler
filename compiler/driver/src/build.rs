@@ -23,16 +23,14 @@ pub struct BuildOutput {
     pub lines: Vec<(u32, Option<wrela_diag::Span>)>,
 }
 
-/// A scene's pipelines at most (vision.md's budget, D-068), counting those that run only at
-/// load.
-pub const MAX_PIPELINES: usize = 64;
-
 /// A pipeline's WGSL at most, in bytes: what a browser compiles while the scene loads (spike 13).
+/// How long a scene's pipelines take to create isn't counted here but measured, cold, in Chrome
+/// (`clearing::the_clearing_is_playable_cold_within_its_budget`).
 pub const MAX_WGSL_BYTES: usize = 256 * 1024;
 
 /// Runs the back ends over a lowered program. `sources` names the locations a trap reports.
-/// With `budgets`, a shipped build's, it's E0707 to have more than `MAX_PIPELINES` pipelines,
-/// or a pipeline whose WGSL is over `MAX_WGSL_BYTES`.
+/// With `budgets`, a shipped build's, it's E0707 to have a pipeline whose WGSL is over
+/// `MAX_WGSL_BYTES`.
 pub fn emit(l: &Lowered, sources: &SourceMap, simd: bool, budgets: bool) -> BuildOutput {
     let mut diagnostics = Vec::new();
     let mut files = Vec::new();
@@ -133,18 +131,6 @@ pub fn emit(l: &Lowered, sources: &SourceMap, simd: bool, budgets: bool) -> Buil
             bindings: p.bindings.clone(),
             debug_flag: p.debug_flag,
         });
-    }
-    if budgets
-        && l.pipelines.len() > MAX_PIPELINES
-        && let Some(&at) = l.pipelines[MAX_PIPELINES].sites.first()
-    {
-        let n = l.pipelines.len();
-        diagnostics.push(over_budget(
-            at,
-            format!("this build has {n} pipelines, over the {MAX_PIPELINES} a scene may have: this command's is pipeline {}", MAX_PIPELINES + 1),
-            "a scene's pipelines are made while it loads, those it runs only then too (vision.md's budget)",
-            "record work with fewer entry points, or the same ones with different arguments",
-        ));
     }
     if let Err(e) = manifest.validate() {
         diagnostics.push(Diagnostic::internal(e.to_string()));

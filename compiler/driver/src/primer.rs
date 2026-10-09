@@ -67,7 +67,7 @@ pub const RULES: &[(&str, &str)] = &[
         "const.tests",
         "a `@test` is a free function of no parameters and no result, run as constants are",
     ),
-    ("build.budget", "a shipped build has at most 64 pipelines, each with at most 256 KiB of WGSL"),
+    ("build.budget", "a shipped build's pipelines have at most 256 KiB of WGSL each"),
     ("mod.use", "a file is a module; `use` imports; `pub` exports"),
     (
         "mod.packages",
