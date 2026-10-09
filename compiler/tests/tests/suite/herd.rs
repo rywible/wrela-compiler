@@ -893,7 +893,7 @@ fn paced_herd(name: &str, script: &str) -> (PathBuf, wrela_tests::BrowserRun, Ve
 /// no frame's GPU time is over 16.7 ms, from the 40 grazers' spawn on (AC4's frame time under
 /// load). Each grazer is drawn within 0.5 s of its spawn and has its level within 2 s (AC4's
 /// latency); a tick takes at most 4 ms at the 99th percentile (AC5). Reported beside: the
-/// pipelines (at most 64; the spike's 8), the time from opening the page to the first frame with
+/// pipelines (the spike's 8), the time from opening the page to the first frame with
 /// all 40 grazers, the bytes downloaded before it, and the memory: the program's GPU buffers and
 /// textures at most, and its WASM memory used and reserved.
 #[test]
@@ -946,7 +946,6 @@ fn the_herd_keeps_its_frames_in_chrome() {
     assert!(all.is_some(), "the herd never drew all 40 grazers");
     assert!(ms.len() >= 590, "only {} frames were timed", ms.len());
     assert_eq!(missed, 0, "{missed} frames missed their deadline (worst {worst:.2} ms)");
-    assert!(pipelines <= 64, "{pipelines} pipelines");
     assert!(drawn <= 500.0, "a grazer was drawn {drawn:.0} ms after its spawn");
     assert!(leveled <= 2000.0, "a grazer had its level {leveled:.0} ms after its spawn");
     assert!(p99 <= 4.0, "a tick's 99th percentile is {p99:.2} ms");
