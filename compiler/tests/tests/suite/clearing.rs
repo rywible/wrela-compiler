@@ -1939,7 +1939,9 @@ fn the_motion_target_marks_the_creature() {
 /// ground it walks over as it is). A pixel the creature covered in the last 8 frames and
 /// doesn't now (its tags), whose colour is the creature's with it (its chromaticity within 0.04
 /// of the creature's mean, its brightness alike) and not without it, is its trail; the farthest
-/// such pixel from the creature's outline is the trail's length.
+/// such pixel from the creature's outline is the trail's length. Each of those frames, every
+/// pixel of the creature is within the box where temporal AA looks for what moved
+/// (`Resolve::moving`, from the creature's bounds).
 #[test]
 #[ignore = "needs a GPU"]
 fn the_walking_creature_leaves_no_trail() {
@@ -1957,8 +1959,18 @@ fn the_walking_creature_leaves_no_trail() {
             while c.frame < from + f {
                 c.step();
                 if c.frame + 8 >= from + f && c.frame < from + f && creature {
+                    let b = c.call("test_moving", &[]);
                     for (i, &t) in c.tags().iter().enumerate() {
-                        recent[i] |= class(t) == CREATURE;
+                        if class(t) != CREATURE {
+                            continue;
+                        }
+                        recent[i] = true;
+                        let (x, y) = ((i % W as usize) as f64 + 0.5, (i / W as usize) as f64 + 0.5);
+                        assert!(
+                            x >= b[0] && y >= b[1] && x <= b[2] && y <= b[3],
+                            "frame {}: the creature's pixel ({x}, {y}) is outside {b:?}",
+                            c.frame
+                        );
                     }
                 }
             }
