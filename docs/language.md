@@ -737,7 +737,7 @@ A program can run a fixed-rate step on a thread of its own, hand its newest resu
 
 ### 6.18 Work over several frames (M5)
 
-**The problem.** Work too long for one frame is split by hand: a `bool` for each step of a load, tested in nested chains (`if s.static_drawn { if !s.occluders_cooked { ... } else if ... }`), or a step counter of its own (`engine::realize::Realizing`). Each is the same state machine, written by hand.
+**The problem.** Work too long for one frame was split by hand: a step counter of its own, kept in the state and stepped each frame (the creature's realization, `engine::realize::realizing` now). Each is the same state machine, written by hand. (A cache that edits make stale a part at a time, as the clearing's sky is, its air's tables and its clouds' maps each cooked in a frame of its own, stays a flag a part: a job is one run from its start to its end, and one restarted by an edit would have to know what the last hadn't done.)
 
 **A job is a function whose body runs over several frames** (`fn.jobs`; `run/jobs`).
 - `@job fn realize(creature: take Fawn, scratch: mut Scratch) -> Mesh { cull(...); for i in 0..slices { place(i); yield } finish() }`. `yield` ends the job's work for this frame. It's written in a job's own body, not in a closure's or another function's (E0335).
