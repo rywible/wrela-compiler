@@ -925,7 +925,7 @@ impl<'a> Builder<'a> {
         };
         match p.types.kind(t) {
             TyKind::Vec(_, n) => u64::from(*n),
-            TyKind::Mat(n) => u64::from(*n) * u64::from(*n),
+            TyKind::Mat(c, r) => u64::from(*c) * u64::from(*r),
             TyKind::Array(e, n) => self.scalars(*e).saturating_mul(u64::from(*n)),
             TyKind::Tuple(ts) => sum(&mut ts.iter().copied()),
             TyKind::Adt(a, args) if p.adt(*a).is_enum() => {

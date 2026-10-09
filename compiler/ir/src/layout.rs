@@ -58,7 +58,7 @@ pub(crate) fn compute(types: &Types, d: &TypeDef) -> (Layout, Box<[u32]>) {
         TypeDef::Vector(Scalar::F64, n) => scalar_layout(Scalar::F64).array(u32::from(*n)),
         TypeDef::Vector(s, n) => vector_layout(*n, scalar_layout(*s).size),
         // Its columns, as an array.
-        TypeDef::Matrix(n) => vector_layout(*n, 4).array(u32::from(*n)),
+        TypeDef::Matrix(c, r) => vector_layout(*r, 4).array(u32::from(*c)),
         TypeDef::Array(e, n) => types.layout(*e).array(*n),
         TypeDef::RuntimeArray(e) => types.layout(*e).array(1),
         TypeDef::Struct { fields, .. } => {
@@ -155,7 +155,7 @@ pub fn part_offset(types: &Types, t: TypeId, k: u32) -> Option<u32> {
             types.field_offsets(t).get(k as usize).copied()
         }
         TypeDef::Vector(s, _) => Some(s.bytes() * k),
-        TypeDef::Matrix(n) => Some(column_stride(*n) * k),
+        TypeDef::Matrix(_, r) => Some(column_stride(*r) * k),
         TypeDef::Array(e, _) => Some(array_stride(types, *e).saturating_mul(k)),
         TypeDef::Run(_) => Some(4 * k),
         _ => None,
@@ -168,7 +168,7 @@ pub fn part_offset(types: &Types, t: TypeId, k: u32) -> Option<u32> {
 pub fn parts(types: &Types, t: TypeId) -> Vec<(TypeId, u32)> {
     let n = match types.get(t) {
         TypeDef::Struct { fields, .. } => fields.len() as u32,
-        TypeDef::Vector(_, n) | TypeDef::Matrix(n) => u32::from(*n),
+        TypeDef::Vector(_, n) | TypeDef::Matrix(n, _) => u32::from(*n),
         TypeDef::Array(_, n) => *n,
         _ => 0,
     };
@@ -194,9 +194,9 @@ pub fn scalars(types: &Types, t: TypeId) -> Vec<(u32, Scalar)> {
     out
 }
 
-/// The distance between a `matN`'s columns.
-pub fn column_stride(n: u8) -> u32 {
-    vector_layout(n, 4).stride()
+/// The distance between the columns of a matrix of `rows` rows.
+pub fn column_stride(rows: u8) -> u32 {
+    vector_layout(rows, 4).stride()
 }
 
 /// The distance between consecutive elements of an array of `elem`.
@@ -217,7 +217,7 @@ pub fn uniform_compatible(types: &Types, t: TypeId) -> bool {
         // A `bool` is a `u32` there (`gpu_memory`).
         TypeDef::Scalar(s) => s.on_gpu(),
         TypeDef::Vector(s, _) => s.on_gpu(),
-        TypeDef::Matrix(_) => true,
+        TypeDef::Matrix(..) => true,
         TypeDef::Array(e, _) => {
             array_stride(types, *e).is_multiple_of(16) && uniform_compatible(types, *e)
         }
@@ -271,8 +271,16 @@ mod tests {
         });
         assert_eq!(field_offsets(&t, b), [0, 12]);
         assert_eq!(layout(&t, b).size, 16);
-        let m3 = t.intern(TypeDef::Matrix(3));
+        let m3 = t.intern(TypeDef::Matrix(3, 3));
         assert_eq!(layout(&t, m3), Layout { size: 48, align: 16 });
+        // Four columns of `vec3`s, each padded to 16 bytes; three of `vec4`s, the same data
+        // without the padding.
+        let m43 = t.intern(TypeDef::Matrix(4, 3));
+        assert_eq!(layout(&t, m43), Layout { size: 64, align: 16 });
+        let m34 = t.intern(TypeDef::Matrix(3, 4));
+        assert_eq!(layout(&t, m34), Layout { size: 48, align: 16 });
+        let m32 = t.intern(TypeDef::Matrix(3, 2));
+        assert_eq!(layout(&t, m32), Layout { size: 24, align: 8 });
         let arr = t.intern(TypeDef::Array(f32, 4));
         assert_eq!(layout(&t, arr).size, 16);
         assert!(!uniform_compatible(&t, arr), "an f32 array has a 4-byte stride");

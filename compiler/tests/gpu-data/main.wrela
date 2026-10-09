@@ -70,6 +70,8 @@ struct Item: Copy + GpuData {
     way: Way,
     seen: std::collections::Flags<Way>,
     cell: Cell,
+    /// Three columns of `vec4`s: laid out as WGSL lays a `mat3x4` out, on both.
+    sh: mat3x4,
 }
 
 fn item(i: u32) -> Item {
@@ -88,7 +90,9 @@ fn item(i: u32) -> Item {
     let seen = std::collections::Flags::none().with(way).with(Way::Near)
     var cell = Cell { vertex: i * 4099, signs: i % 7 }
     cell.signs += 1
-    var it = Item { id: i, shape, on: i % 3 == 0, way, seen, cell }
+    let k = f32(i)
+    let sh = mat3x4(vec4(k, 1.0, 2.0, 3.0), vec4(4.0, k, 5.0, 6.0), vec4(7.0, 8.0, k, 9.0))
+    var it = Item { id: i, shape, on: i % 3 == 0, way, seen, cell, sh }
     tweak(mut it)
     it
 }
@@ -119,7 +123,8 @@ fn measure(it: Item) -> u32 {
         Shape::Pair(a, b) => u32(a) ^ (b << 4),
     }
     let far: u32 = if it.seen.has(Way::Far) { 1 } else { 0 }
-    let cell = it.cell.vertex ^ (it.cell.signs << 3) ^ u32(it.cell)
+    let cell = it.cell.vertex ^ (it.cell.signs << 3) ^ u32(it.cell) ^ bitcast_u32(it.sh[2].w) ^
+        bitcast_u32(it.sh[it.id % 3].x)
     m ^ (u32(it.on) << 31) ^ (it.id << 20) ^ (u32(it.way) << 8) ^ it.seen.bits() ^ (far << 14) ^ cell
 }
 

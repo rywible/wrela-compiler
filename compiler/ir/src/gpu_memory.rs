@@ -351,7 +351,7 @@ impl Rewriter<'_> {
                 return Ok(self.word_to_bool(w, out));
             }
             TypeDef::Vector(..)
-            | TypeDef::Matrix(_)
+            | TypeDef::Matrix(..)
             | TypeDef::Array(..)
             | TypeDef::Struct { .. } => layout::parts(&self.m.types, t),
             other => {
@@ -553,7 +553,9 @@ impl Rewriter<'_> {
             let k = match (types.get(t), proj) {
                 (TypeDef::Struct { .. } | TypeDef::Enum { .. }, Proj::Field(k)) => *k,
                 (TypeDef::Vector(..), Proj::Comp(c)) => u32::from(*c),
-                (TypeDef::Matrix(_) | TypeDef::Array(..), Proj::Index(i)) => *self.consts.get(i)?,
+                (TypeDef::Matrix(..) | TypeDef::Array(..), Proj::Index(i)) => {
+                    *self.consts.get(i)?
+                }
                 _ => return None,
             };
             offset += layout::part_offset(types, t, k)?;

@@ -589,9 +589,9 @@ impl<'a> Ivx<'a> {
         let mut arrays = false;
         match self.m.types.get(ty).clone() {
             TypeDef::Scalar(_) | TypeDef::Vector(..) => return f(self, out, ty, vals),
-            TypeDef::Matrix(n) => {
-                let col = self.m.types.vector(n);
-                parts = vec![col; n as usize];
+            TypeDef::Matrix(c, r) => {
+                let col = self.m.types.vector(r);
+                parts = vec![col; c as usize];
             }
             TypeDef::Struct { fields, .. } => {
                 parts = fields.iter().map(|(_, t)| *t).collect();
@@ -1776,7 +1776,7 @@ impl<'a> Ivx<'a> {
 
     fn binary(&mut self, out: &mut Block, op: BinOp, a: ValueId, b: ValueId, ty: TypeId) -> R<Iv> {
         let (ta, tb) = (self.ty(a), self.ty(b));
-        if [ta, tb, ty].iter().any(|t| matches!(self.m.types.get(*t), TypeDef::Matrix(_))) {
+        if [ta, tb, ty].iter().any(|t| matches!(self.m.types.get(*t), TypeDef::Matrix(..))) {
             return Err(Error::not_derivable("an interval over matrix arithmetic isn't supported"));
         }
         let (ra, rb) = (self.range(a), self.range(b));

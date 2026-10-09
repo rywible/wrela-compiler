@@ -586,7 +586,7 @@ pub fn proj_ty(p: &Program, t: TyId, variant: &mut Option<u32>, proj: &Proj) -> 
         (Proj::Swizzle(cs), &TyKind::Vec(e, _)) => p.types.vec_of(e, cs.len() as u8),
         (Proj::Swizzle(cs), _) => p.types.vec(cs.len() as u8),
         (Proj::Index(_), TyKind::Array(e, _) | TyKind::ArrayN(e, _) | TyKind::Slice(e)) => *e,
-        (Proj::Index(_), TyKind::Mat(n)) => p.types.vec(*n),
+        (Proj::Index(_), TyKind::Mat(_, r)) => p.types.vec(*r),
         // A lang container's element (`Slots`, `Arena`, `Bounded`, `Vec`): its first type
         // argument.
         (Proj::Index(_), TyKind::Adt(_, args)) if !args.is_empty() => args[0],

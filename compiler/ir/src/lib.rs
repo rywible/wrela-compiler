@@ -887,8 +887,8 @@ impl Module {
             }
             (TypeDef::Vector(..), Proj::Comp(c)) => self.types.part(t, u32::from(*c)),
             (TypeDef::Vector(s, _), Proj::Index(_)) => self.types.lookup(&TypeDef::Scalar(*s)),
-            (TypeDef::Matrix(n), Proj::Index(_)) => {
-                self.types.lookup(&TypeDef::Vector(Scalar::F32, *n))
+            (TypeDef::Matrix(_, r), Proj::Index(_)) => {
+                self.types.lookup(&TypeDef::Vector(Scalar::F32, *r))
             }
             (TypeDef::Array(e, _) | TypeDef::RuntimeArray(e) | TypeDef::Run(e), Proj::Index(_)) => {
                 Some(*e)
@@ -963,10 +963,13 @@ mod tests {
     #[test]
     fn a_matrix_brings_its_parts() {
         let mut m = Module::default();
-        let mat = m.types.intern(TypeDef::Matrix(3));
+        let mat = m.types.intern(TypeDef::Matrix(3, 3));
         assert!(m.types.lookup(&TypeDef::Vector(Scalar::F32, 3)).is_some());
         assert!(m.types.lookup(&TypeDef::Scalar(Scalar::F32)).is_some());
-        assert_eq!(m.types.lookup(&TypeDef::Matrix(3)), Some(mat));
+        assert_eq!(m.types.lookup(&TypeDef::Matrix(3, 3)), Some(mat));
+        // A `mat4x3`'s columns are `vec3`s.
+        m.types.intern(TypeDef::Matrix(4, 3));
+        assert!(m.types.lookup(&TypeDef::Vector(Scalar::F32, 4)).is_none());
     }
 
     #[test]

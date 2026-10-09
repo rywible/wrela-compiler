@@ -1,0 +1,57 @@
+// run: matrices of C columns of R rows (WGSL's `matCxR`): built from C column vectors, a
+// column by index, `M * v` (C components in, R out), `v * M` (R in, C out), `A * B` (A's
+// columns are B's rows), sums and scalings; square ones as before; in constants too
+// expect: times_vector() = (14.0, 38.0, 62.0)
+// expect: vector_times() = (38.0, 44.0, 50.0, 56.0)
+// expect: product() = (30.0, 70.0, 110.0, 70.0, 174.0, 278.0)
+// expect: column(2) = (3.0, 7.0, 11.0)
+// expect: sum_scaled() = (4.0, 8.0)
+// expect: from_constant() = 6.0
+// expect: square() = (7.0, 10.0)
+
+/// Columns (1, 5, 9), (2, 6, 10), (3, 7, 11), (4, 8, 12): rows (1 2 3 4), (5 6 7 8),
+/// (9 10 11 12).
+fn m43() -> mat4x3 {
+    mat4x3(vec3(1.0, 5.0, 9.0), vec3(2.0, 6.0, 10.0), vec3(3.0, 7.0, 11.0), vec3(4.0, 8.0, 12.0))
+}
+
+const PICK: mat2x3 = mat2x3(vec3(1.0, 2.0, 3.0), vec3(4.0, 5.0, 6.0))
+
+/// 1 c0 + 2 c1 + 3 c2: (1 + 4 + 9, 5 + 12 + 21, 9 + 20 + 33).
+pub fn times_vector() -> vec3 {
+    m43() * vec4(1.0, 2.0, 3.0, 0.0)
+}
+
+/// (1, 2, 3) times each column: its dot with each, 1 + 10 + 27 first.
+pub fn vector_times() -> vec4 {
+    vec3(1.0, 2.0, 3.0) * m43()
+}
+
+/// A `mat4x3` times a `mat2x4` (its columns (1, 2, 3, 4) and (5, 6, 7, 8)): a `mat2x3`, whose
+/// columns are m43 × (1, 2, 3, 4) and m43 × (5, 6, 7, 8).
+pub fn product() -> (f32, f32, f32, f32, f32, f32) {
+    let b = mat2x4(vec4(1.0, 2.0, 3.0, 4.0), vec4(5.0, 6.0, 7.0, 8.0))
+    let p = m43() * b
+    let (a, c) = (p[0], p[1])
+    (a.x, a.y, a.z, c.x, c.y, c.z)
+}
+
+pub fn column(i: u32) -> vec3 {
+    m43()[i]
+}
+
+/// Two `mat3x2`s added, then scaled: the first column of (m + m) * 2 where m's first column
+/// is (1, 2).
+pub fn sum_scaled() -> vec2 {
+    let m = mat3x2(vec2(1.0, 2.0), vec2(3.0, 4.0), vec2(5.0, 6.0))
+    ((m + m) * 2.0)[0]
+}
+
+pub fn from_constant() -> f32 {
+    let c = PICK[1]
+    c.z
+}
+
+pub fn square() -> vec2 {
+    mat2(vec2(1.0, 2.0), vec2(3.0, 4.0)) * vec2(1.0, 2.0)
+}

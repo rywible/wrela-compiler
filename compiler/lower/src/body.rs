@@ -1721,7 +1721,7 @@ impl<'c, 'a> Fl<'c, 'a> {
         let t = self.ty(ty, span)?;
         let n = match self.mb.m.types.get(t) {
             ir::TypeDef::Vector(_, n) => *n,
-            ir::TypeDef::Matrix(_) => {
+            ir::TypeDef::Matrix(..) => {
                 let cols: Vec<ir::ValueId> = xs.iter().filter_map(|x| self.operand(x)).collect();
                 return Some(self.value(t, ir::Expr::Construct(t, cols)));
             }

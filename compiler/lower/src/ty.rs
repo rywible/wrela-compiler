@@ -103,7 +103,7 @@ impl<'a> Cx<'a> {
                 }
                 mb.m.types.vector_of(s, n)
             }),
-            TyKind::Mat(n) => Some(mb.m.types.intern(ir::TypeDef::Matrix(*n))),
+            TyKind::Mat(c, r) => Some(mb.m.types.intern(ir::TypeDef::Matrix(*c, *r))),
             // A run of UTF-8: a run of bytes, on the CPU.
             TyKind::Str => {
                 if gpu {

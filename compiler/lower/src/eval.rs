@@ -222,9 +222,9 @@ pub(crate) fn zero(types: &ir::Types, t: ir::TypeId) -> ir::ConstValue {
     match types.get(t) {
         &ir::TypeDef::Scalar(s) | &ir::TypeDef::Atomic(s) => V::Scalar(zero_scalar(s)),
         &ir::TypeDef::Vector(s, n) => V::Parts(vec![V::Scalar(zero_scalar(s)); n as usize]),
-        &ir::TypeDef::Matrix(n) => {
-            let col = V::Parts(vec![V::Scalar(zero_scalar(ir::Scalar::F32)); n as usize]);
-            V::Parts(vec![col; n as usize])
+        &ir::TypeDef::Matrix(c, r) => {
+            let col = V::Parts(vec![V::Scalar(zero_scalar(ir::Scalar::F32)); r as usize]);
+            V::Parts(vec![col; c as usize])
         }
         &ir::TypeDef::Array(e, n) => V::Parts(vec![zero(types, e); n as usize]),
         ir::TypeDef::Struct { fields, .. } => {
@@ -341,11 +341,11 @@ impl Cx<'_> {
                     .map(|k| read_scalar(mem, s, at + s.bytes() * k).map(Value::Scalar))
                     .collect::<Result<_, _>>()?,
             ),
-            ir::TypeDef::Matrix(n) => {
+            ir::TypeDef::Matrix(columns, rows) => {
                 let mut cols = Vec::new();
-                for c in 0..u32::from(n) {
-                    let base = at + column_stride(n) * c;
-                    let col = (0..u32::from(n))
+                for c in 0..u32::from(columns) {
+                    let base = at + column_stride(rows) * c;
+                    let col = (0..u32::from(rows))
                         .map(|k| read_scalar(mem, ir::Scalar::F32, base + 4 * k).map(Value::Scalar))
                         .collect::<Result<_, _>>()?;
                     cols.push(Value::Parts(col));
@@ -473,7 +473,7 @@ impl Cx<'_> {
         let def = mb.m.types.get(it).clone();
         Some(match (def, v) {
             (ir::TypeDef::Scalar(_), Value::Scalar(c)) => ir::ConstValue::Scalar(c.clone()),
-            (ir::TypeDef::Vector(..) | ir::TypeDef::Matrix(_), Value::Parts(_)) => to_plain(v)?,
+            (ir::TypeDef::Vector(..) | ir::TypeDef::Matrix(..), Value::Parts(_)) => to_plain(v)?,
             (ir::TypeDef::Array(e, _), Value::Parts(xs)) => {
                 let elem = match self.checked.program.types.kind(t) {
                     TyKind::Array(x, _) | TyKind::ArrayN(x, _) => *x,

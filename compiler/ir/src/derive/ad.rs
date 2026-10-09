@@ -277,7 +277,7 @@ impl Ad<'_> {
     }
 
     fn is_matrix(&self, v: ValueId) -> bool {
-        matches!(self.m.types.get(self.ty(v)), TypeDef::Matrix(_))
+        matches!(self.m.types.get(self.ty(v)), TypeDef::Matrix(..))
     }
 
     /// The tangent `t` as an operand of type `ty`, or a zero for a structurally zero one.

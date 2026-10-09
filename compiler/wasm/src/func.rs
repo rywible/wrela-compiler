@@ -873,11 +873,11 @@ impl<'m> Fe<'m> {
                 let size = s.bytes() as i32;
                 self.ins.extend([I::LocalGet(self.v(*i)), I::I32Const(size), I::I32Mul, I::I32Add]);
             }
-            (ir::TypeDef::Matrix(n), ir::Proj::Index(i)) => {
-                self.bounds_check(*i, *n as u32);
+            (ir::TypeDef::Matrix(c, r), ir::Proj::Index(i)) => {
+                self.bounds_check(*i, *c as u32);
                 self.ins.extend([
                     I::LocalGet(self.v(*i)),
-                    I::I32Const(column_stride(*n) as i32),
+                    I::I32Const(column_stride(*r) as i32),
                     I::I32Mul,
                     I::I32Add,
                 ]);

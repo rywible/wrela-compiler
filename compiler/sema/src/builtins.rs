@@ -11,7 +11,8 @@ pub enum BuiltinTy {
     Int(IntTy),
     Float(FloatTy),
     Vec(VecElem, u8),
-    Mat(u8),
+    /// `matC` and `matCxR`: C columns of R `f32`s (WGSL's names).
+    Mat(u8, u8),
     /// `str`: a borrowed run of UTF-8.
     Str,
 }
@@ -30,9 +31,15 @@ impl BuiltinTy {
             "u64" => BuiltinTy::Int(IntTy::U64),
             "f32" => BuiltinTy::Float(FloatTy::F32),
             "f64" => BuiltinTy::Float(FloatTy::F64),
-            "mat2" => BuiltinTy::Mat(2),
-            "mat3" => BuiltinTy::Mat(3),
-            "mat4" => BuiltinTy::Mat(4),
+            "mat2" => BuiltinTy::Mat(2, 2),
+            "mat3" => BuiltinTy::Mat(3, 3),
+            "mat4" => BuiltinTy::Mat(4, 4),
+            "mat2x3" => BuiltinTy::Mat(2, 3),
+            "mat2x4" => BuiltinTy::Mat(2, 4),
+            "mat3x2" => BuiltinTy::Mat(3, 2),
+            "mat3x4" => BuiltinTy::Mat(3, 4),
+            "mat4x2" => BuiltinTy::Mat(4, 2),
+            "mat4x3" => BuiltinTy::Mat(4, 3),
             "str" => BuiltinTy::Str,
             _ => return Self::vec(name),
         })
@@ -52,7 +59,7 @@ impl BuiltinTy {
             BuiltinTy::Int(i) => TyKind::Int(i),
             BuiltinTy::Float(f) => TyKind::Float(f),
             BuiltinTy::Vec(e, n) => TyKind::Vec(e, n),
-            BuiltinTy::Mat(n) => TyKind::Mat(n),
+            BuiltinTy::Mat(c, r) => TyKind::Mat(c, r),
             BuiltinTy::Str => TyKind::Str,
         })
     }
@@ -372,7 +379,7 @@ impl BuiltinFn {
 pub fn scalar_of(types: &Types, t: TyId) -> TyId {
     match types.kind(t) {
         &TyKind::Vec(e, _) => types.elem(e),
-        TyKind::Mat(_) => types.f32,
+        TyKind::Mat(..) => types.f32,
         _ => t,
     }
 }

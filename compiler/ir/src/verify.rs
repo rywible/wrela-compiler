@@ -332,7 +332,7 @@ impl Verifier<'_> {
                 match self.def(self.ty(*x)) {
                     TypeDef::Array(e, _) => Some(*e),
                     TypeDef::Vector(s, _) => types.lookup(&TypeDef::Scalar(*s)),
-                    TypeDef::Matrix(n) => types.lookup(&TypeDef::Vector(Scalar::F32, *n)),
+                    TypeDef::Matrix(_, r) => types.lookup(&TypeDef::Vector(Scalar::F32, *r)),
                     d => return Err(bug(format!("a dynamic extract from a `{d:?}`"))),
                 }
             }
@@ -423,20 +423,34 @@ impl Verifier<'_> {
                     }
                 }
                 TypeDef::Scalar(_) | TypeDef::Vector(..) => Ok(ta),
-                TypeDef::Matrix(_) if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul) => Ok(ta),
+                // A product of one type is a square matrix's.
+                TypeDef::Matrix(c, r) if matches!(op, BinOp::Add | BinOp::Sub) || c == r => Ok(ta),
                 d => Err(bug(format!("{op:?} of `{d:?}`"))),
             };
         }
         // A matrix with a scalar (each element) or a vector. A vector with a scalar is splatted
         // first.
+        // `M * v`: C components in, R out; `v * M`: R in, C out; `A * B`: A's columns are B's
+        // rows, giving B's columns of A's rows.
+        let types = &self.m.types;
+        let made = |t: Option<TypeId>| t.ok_or_else(|| bug("a matrix product's type isn't made"));
         match (self.def(ta), self.def(tb)) {
-            (TypeDef::Matrix(_), TypeDef::Scalar(Scalar::F32)) => Ok(ta),
-            (TypeDef::Scalar(Scalar::F32), TypeDef::Matrix(_)) => Ok(tb),
-            (TypeDef::Matrix(n), TypeDef::Vector(Scalar::F32, k))
-            | (TypeDef::Vector(Scalar::F32, k), TypeDef::Matrix(n))
-                if op == BinOp::Mul && n == k =>
+            (TypeDef::Matrix(..), TypeDef::Scalar(Scalar::F32)) => Ok(ta),
+            (TypeDef::Scalar(Scalar::F32), TypeDef::Matrix(..)) => Ok(tb),
+            (&TypeDef::Matrix(c, r), &TypeDef::Vector(Scalar::F32, k))
+                if op == BinOp::Mul && k == c =>
             {
-                Ok(if matches!(self.def(ta), TypeDef::Matrix(_)) { tb } else { ta })
+                made(types.lookup(&TypeDef::Vector(Scalar::F32, r)))
+            }
+            (&TypeDef::Vector(Scalar::F32, k), &TypeDef::Matrix(c, r))
+                if op == BinOp::Mul && k == r =>
+            {
+                made(types.lookup(&TypeDef::Vector(Scalar::F32, c)))
+            }
+            (&TypeDef::Matrix(c1, r1), &TypeDef::Matrix(c2, r2))
+                if op == BinOp::Mul && c1 == r2 =>
+            {
+                made(types.lookup(&TypeDef::Matrix(c2, r1)))
             }
             _ => Err(bug(format!("{op:?} of `{}` and `{}`", self.show(ta), self.show(tb)))),
         }
@@ -515,10 +529,10 @@ impl Verifier<'_> {
                     return Err(bug(format!("a vec{n} built from {} parts", parts.len())));
                 }
             }
-            TypeDef::Matrix(n) => {
-                let col = self.m.types.lookup(&TypeDef::Vector(Scalar::F32, *n));
-                if parts.len() != *n as usize || !parts.iter().all(|p| Some(self.ty(*p)) == col) {
-                    return Err(bug(format!("a mat{n} built from the wrong columns")));
+            TypeDef::Matrix(c, r) => {
+                let col = self.m.types.lookup(&TypeDef::Vector(Scalar::F32, *r));
+                if parts.len() != *c as usize || !parts.iter().all(|p| Some(self.ty(*p)) == col) {
+                    return Err(bug(format!("a mat{c}x{r} built from the wrong columns")));
                 }
             }
             TypeDef::Array(e, n) => {
@@ -552,6 +566,25 @@ impl Verifier<'_> {
                 Stmt::Let(v, e) => {
                     if let Some(t) = self.expr(e)? {
                         self.expect(&format!("v{}", v.0), self.ty(*v), t)?;
+                    } else if let Expr::Atomic(AtomicOp::CompareExchange, p, _) = e {
+                        // A struct of the old value and whether it stored, whatever its name.
+                        let at = self.place(p)?;
+                        let old = match self.def(at) {
+                            TypeDef::Atomic(s) => *s,
+                            _ => return Err(bug("a compare-exchange of something not atomic")),
+                        };
+                        let shape = match self.def(self.ty(*v)) {
+                            TypeDef::Struct { fields, .. } => {
+                                fields.iter().map(|(_, f)| self.def(*f).clone()).collect()
+                            }
+                            _ => Vec::new(),
+                        };
+                        if shape != [TypeDef::Scalar(old), TypeDef::Scalar(Scalar::Bool)] {
+                            return Err(bug(format!(
+                                "v{} isn't a compare-exchange's old value and whether it stored",
+                                v.0
+                            )));
+                        }
                     }
                     if self.defined[v.index()] {
                         return Err(bug(format!("v{} is defined twice", v.0)));

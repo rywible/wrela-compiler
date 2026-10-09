@@ -793,7 +793,7 @@ impl<'p> Checker<'p> {
             UnOp::Neg => match k {
                 TyKind::Int(it) => it.signed(),
                 TyKind::Vec(e, _) => *e != VecElem::U32,
-                TyKind::Float(_) | TyKind::Mat(_) | TyKind::Error | TyKind::Never => true,
+                TyKind::Float(_) | TyKind::Mat(..) | TyKind::Error | TyKind::Never => true,
                 TyKind::Var(_) => vk != Some(VarKind::General),
                 _ => false,
             },
@@ -1174,7 +1174,7 @@ impl<'p> Checker<'p> {
                 let scalar =
                     |k: &TyKind| matches!(k, TyKind::Float(_) | TyKind::Int(_) | TyKind::Var(_));
                 match (&ka, &kb) {
-                    (TyKind::Vec(..) | TyKind::Mat(_), _)
+                    (TyKind::Vec(..) | TyKind::Mat(..), _)
                         if scalar(kb)
                             && (!matches!(kb, TyKind::Var(_)) || self.is_number_var(b)) =>
                     {
@@ -1185,12 +1185,12 @@ impl<'p> Checker<'p> {
                         if self.shallow(b) != c {
                             return fail(self);
                         }
-                        if matches!(ka, TyKind::Mat(_)) && !matches!(op, BinOp::Mul) {
+                        if matches!(ka, TyKind::Mat(..)) && !matches!(op, BinOp::Mul) {
                             return fail(self);
                         }
                         return Some(a);
                     }
-                    (_, TyKind::Vec(..) | TyKind::Mat(_))
+                    (_, TyKind::Vec(..) | TyKind::Mat(..))
                         if scalar(ka)
                             && (!matches!(ka, TyKind::Var(_)) || self.is_number_var(a)) =>
                     {
@@ -1199,23 +1199,35 @@ impl<'p> Checker<'p> {
                             let _ = self.infer.unify(&self.p.types, a, c);
                         }
                         if self.shallow(a) != c
-                            || matches!(op, BinOp::Div | BinOp::Rem) && matches!(kb, TyKind::Mat(_))
+                            || matches!(op, BinOp::Div | BinOp::Rem)
+                                && matches!(kb, TyKind::Mat(..))
                         {
                             return fail(self);
                         }
-                        if matches!(kb, TyKind::Mat(_)) && !matches!(op, BinOp::Mul) {
+                        if matches!(kb, TyKind::Mat(..)) && !matches!(op, BinOp::Mul) {
                             return fail(self);
                         }
                         return Some(b);
                     }
-                    (TyKind::Mat(n), TyKind::Vec(VecElem::F32, m))
-                    | (TyKind::Vec(VecElem::F32, m), TyKind::Mat(n))
-                        if op == BinOp::Mul =>
-                    {
-                        if n != m {
+                    // `M * v`: C components in, R out; `v * M`: R in, C out (WGSL's).
+                    (&TyKind::Mat(c, r), &TyKind::Vec(VecElem::F32, m)) if op == BinOp::Mul => {
+                        if c != m {
                             return fail(self);
                         }
-                        return Some(if matches!(ka, TyKind::Mat(_)) { b } else { a });
+                        return Some(self.p.types.vec(*r));
+                    }
+                    (&TyKind::Vec(VecElem::F32, m), &TyKind::Mat(c, r)) if op == BinOp::Mul => {
+                        if r != m {
+                            return fail(self);
+                        }
+                        return Some(self.p.types.vec(*c));
+                    }
+                    // `A * B`: A's columns are B's rows; B's columns of A's rows.
+                    (&TyKind::Mat(c1, r1), &TyKind::Mat(c2, r2)) if op == BinOp::Mul => {
+                        if c1 != r2 {
+                            return fail(self);
+                        }
+                        return Some(self.p.types.intern(TyKind::Mat(*c2, *r1)));
                     }
                     _ => {}
                 }
@@ -1224,7 +1236,9 @@ impl<'p> Checker<'p> {
                 }
                 match self.kind(a) {
                     TyKind::Int(_) | TyKind::Float(_) | TyKind::Vec(..) => Some(a),
-                    TyKind::Mat(_) if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul) => Some(a),
+                    TyKind::Mat(..) if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul) => {
+                        Some(a)
+                    }
                     TyKind::Var(_) if self.is_number_var(a) => Some(a),
                     _ => fail(self),
                 }
@@ -1577,7 +1591,7 @@ impl<'p> Checker<'p> {
         }
         // A vector's or matrix's components are fixed: a literal index past them is caught here
         // (a computed one traps at run time, like an array's).
-        if let (TyKind::Vec(_, n) | TyKind::Mat(n), ExprKind::Lit(Lit::Int(v))) = (&k, &i.kind)
+        if let (TyKind::Vec(_, n) | TyKind::Mat(n, _), ExprKind::Lit(Lit::Int(v))) = (&k, &i.kind)
             && *v >= i128::from(*n)
         {
             let shown = self.display(b.ty);
@@ -1591,7 +1605,8 @@ impl<'p> Checker<'p> {
         let elem = match k {
             TyKind::Array(t, _) | TyKind::ArrayN(t, _) | TyKind::Slice(t) => *t,
             &TyKind::Vec(e, _) => self.p.types.elem(e),
-            TyKind::Mat(n) => self.p.types.vec(*n),
+            // A column.
+            TyKind::Mat(_, r) => self.p.types.vec(*r),
             TyKind::Error => self.p.types.error,
             _ if let Some(t) = self.vec_elem(b.ty) => t,
             TyKind::Adt(a, args) if self.p.is_lang_adt(*a, Lang::Bounded) => args[0],

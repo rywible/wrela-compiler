@@ -465,7 +465,7 @@ fn write_const(
         },
         (
             ir::TypeDef::Vector(..)
-            | ir::TypeDef::Matrix(_)
+            | ir::TypeDef::Matrix(..)
             | ir::TypeDef::Array(..)
             | ir::TypeDef::Struct { .. },
             ir::ConstValue::Parts(ps),

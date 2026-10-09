@@ -1623,24 +1623,26 @@ impl<'p> Checker<'p> {
                 self.error_expr(span)
             }
             BuiltinTy::Vec(e, n) => self.vec_ctor(e, n, ty, args, span),
-            BuiltinTy::Mat(n) => {
-                let col = self.p.types.vec(n);
-                if args.len() != n as usize {
+            BuiltinTy::Mat(c, r) => {
+                let col = self.p.types.vec(r);
+                let n = c;
+                let name = self.display(ty);
+                if args.len() != c as usize {
                     self.err(Diagnostic::new(
                         codes::E0323,
                         span,
-                        format!("`mat{n}` is built from {n} column vectors"),
+                        format!("`{name}` is built from {c} column vectors, each a `vec{r}`"),
                     ));
                     return self.error_expr(span);
                 }
                 let mut cols = Vec::new();
                 for a in args {
                     // Columns are positional: a name would read as a choice of column.
-                    if let Some(name) = &a.name {
+                    if let Some(label) = &a.name {
                         self.err(Diagnostic::new(
                             codes::E0302,
-                            name.span,
-                            format!("`mat{n}` takes its columns as positional arguments"),
+                            label.span,
+                            format!("`{name}` takes its {n} columns as positional arguments"),
                         ));
                     }
                     cols.push(self.check_expect(&a.value, col));
@@ -2420,7 +2422,7 @@ impl<'p> Checker<'p> {
         let pick = pick.or_else(|| {
             let builtin_ok = matches!(
                 self.p.types.kind(rt),
-                TyKind::Int(_) | TyKind::Float(_) | TyKind::Vec(..) | TyKind::Mat(_)
+                TyKind::Int(_) | TyKind::Float(_) | TyKind::Vec(..) | TyKind::Mat(..)
             );
             let sequence = matches!(
                 self.p.types.kind(rt),

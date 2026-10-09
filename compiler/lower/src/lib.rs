@@ -167,7 +167,7 @@ fn on_gpu_in(p: &Program, t: TyId, known: &mut HashMap<TyId, bool>) -> bool {
         return k;
     }
     let ok = match p.types.kind(t) {
-        TyKind::Bool | TyKind::Mat(_) => true,
+        TyKind::Bool | TyKind::Mat(..) => true,
         TyKind::Vec(e, _) => e.on_gpu(),
         TyKind::Int(i) => i.on_gpu(),
         TyKind::Float(f) => *f == wrela_sema::ty::FloatTy::F32,
@@ -1092,7 +1092,7 @@ fn export_values(p: &wrela_sema::program::Program, t: TyId) -> Option<usize> {
     match p.types.kind(t) {
         TyKind::Bool | TyKind::Int(_) | TyKind::Float(_) => Some(1),
         TyKind::Vec(_, n) => Some(usize::from(*n)),
-        TyKind::Mat(n) => Some(usize::from(*n) * usize::from(*n)),
+        TyKind::Mat(c, r) => Some(usize::from(*c) * usize::from(*r)),
         TyKind::Array(e, n) if *n > 0 => Some(export_values(p, *e)? * *n as usize),
         _ => p.plain_parts(t)?.into_iter().map(|e| export_values(p, e)).sum(),
     }

@@ -148,7 +148,8 @@ pub fn varying_count(p: &Program, t: TyId) -> Option<usize> {
     match p.types.kind(t) {
         TyKind::Float(FloatTy::F32) | TyKind::Int(IntTy::I32 | IntTy::U32) => Some(1),
         TyKind::Vec(e, _) if e.on_gpu() => Some(1),
-        TyKind::Mat(n) => Some(usize::from(*n)),
+        // A column a location.
+        TyKind::Mat(c, _) => Some(usize::from(*c)),
         TyKind::Adt(_, args) if p.lang_of_ty(t) == Some(Lang::Flat) => {
             varying_count(p, *args.first()?)
         }

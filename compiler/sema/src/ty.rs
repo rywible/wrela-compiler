@@ -242,8 +242,9 @@ pub enum TyKind {
     /// `vec2`, `vec3`, `vec4`: f32 vectors; `vec3i`, `vec3u` and (CPU only) `vec3d`: i32, u32
     /// and f64 vectors.
     Vec(VecElem, u8),
-    /// `mat2`, `mat3`, `mat4`: square f32 matrices, column-major.
-    Mat(u8),
+    /// `mat2` to `mat4`, and `matCxR`: f32 matrices of C columns of R components each,
+    /// column-major (WGSL's).
+    Mat(u8, u8),
     /// `()` is the empty tuple.
     Tuple(Vec<TyId>),
     Array(TyId, u32),
@@ -609,7 +610,7 @@ pub fn children(kind: &TyKind, f: &mut impl FnMut(TyId)) {
         | TyKind::Int(_)
         | TyKind::Float(_)
         | TyKind::Vec(..)
-        | TyKind::Mat(_)
+        | TyKind::Mat(..)
         | TyKind::Str
         | TyKind::ConstU32(_)
         | TyKind::Param(_)

@@ -1493,7 +1493,7 @@ fn forward_extracts(m: &Module, f: &mut Function) {
         if let Stmt::Let(v, Expr::Construct(t, xs)) = s {
             let whole = match m.types.get(*t) {
                 TypeDef::Struct { .. } => true,
-                TypeDef::Vector(_, n) | TypeDef::Matrix(n) => xs.len() == *n as usize,
+                TypeDef::Vector(_, n) | TypeDef::Matrix(n, _) => xs.len() == *n as usize,
                 _ => false,
             };
             if whole {

@@ -293,7 +293,7 @@ impl<'c, 'a> Fl<'c, 'a> {
             ir::ConstValue::Parts(ps) => {
                 let part_ty: Vec<ir::TypeId> = match *types.get(t) {
                     ir::TypeDef::Vector(s, _) => vec![types.scalar(s); ps.len()],
-                    ir::TypeDef::Matrix(n) => vec![types.vector(n); ps.len()],
+                    ir::TypeDef::Matrix(_, r) => vec![types.vector(r); ps.len()],
                     ir::TypeDef::Array(e, _) => vec![e; ps.len()],
                     ir::TypeDef::Struct { ref fields, .. } => fields.iter().map(|f| f.1).collect(),
                     _ => return None,

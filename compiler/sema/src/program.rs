@@ -257,8 +257,11 @@ impl Program {
             TyKind::Vec(e, n) => {
                 let _ = write!(s, "vec{n}{}", e.suffix());
             }
-            TyKind::Mat(n) => {
-                let _ = write!(s, "mat{n}");
+            TyKind::Mat(c, r) if c == r => {
+                let _ = write!(s, "mat{c}");
+            }
+            TyKind::Mat(c, r) => {
+                let _ = write!(s, "mat{c}x{r}");
             }
             TyKind::Tuple(ts) => {
                 s.push('(');

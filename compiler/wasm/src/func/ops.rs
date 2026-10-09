@@ -375,15 +375,16 @@ fn elem_local(fe: &mut Fe, x: ir::ValueId, off: u32) -> u32 {
     l
 }
 
-/// The byte offset of the element at column `j`, row `i` of a `matN`.
-fn mat_elem(n: u8, j: u32, i: u32) -> u32 {
-    column_stride(n) * j + 4 * i
+/// The byte offset of the element at column `j`, row `i` of a matrix of `rows` rows.
+fn mat_elem(rows: u8, j: u32, i: u32) -> u32 {
+    column_stride(rows) * j + 4 * i
 }
 
-/// The byte offset of each f32 of a vector of `n` components, or of a `matN` column by column.
-fn components(is_mat: bool, n: u8) -> impl Iterator<Item = u32> {
-    let cols = if is_mat { u32::from(n) } else { 1 };
-    (0..cols).flat_map(move |j| (0..u32::from(n)).map(move |i| mat_elem(n, j, i)))
+/// The byte offset of each f32 of a value of dimensions `d`: a vector's components, or a
+/// matrix's column by column.
+fn components(d: Dims) -> impl Iterator<Item = u32> {
+    (0..u32::from(d.cols))
+        .flat_map(move |j| (0..u32::from(d.rows)).map(move |i| mat_elem(d.rows, j, i)))
 }
 
 /// Pushes the sum of `n` products, each of the two f32s `factors(fe, k)` pushes, added in order:
@@ -416,12 +417,20 @@ fn sum_of_squares(fe: &mut Fe, x: ir::ValueId, minus: Option<ir::ValueId>, n: u3
     });
 }
 
-fn dims(fe: &Fe, t: ir::TypeId) -> Option<(bool, u8)> {
+/// A float vector's or matrix's shape: a vector is one column of its components.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Dims {
+    mat: bool,
+    cols: u8,
+    rows: u8,
+}
+
+fn dims(fe: &Fe, t: ir::TypeId) -> Option<Dims> {
     match fe.m.types.get(t) {
         // Only f32 vectors reach the back end's arithmetic: the others' is done a component
         // at a time before it (`wrela_ir::scalarize::scalarize_vectors`).
-        ir::TypeDef::Vector(ir::Scalar::F32, n) => Some((false, *n)),
-        ir::TypeDef::Matrix(n) => Some((true, *n)),
+        ir::TypeDef::Vector(ir::Scalar::F32, n) => Some(Dims { mat: false, cols: 1, rows: *n }),
+        ir::TypeDef::Matrix(c, r) => Some(Dims { mat: true, cols: *c, rows: *r }),
         _ => None,
     }
 }
@@ -487,11 +496,11 @@ fn vec_binary(
     use ir::BinOp as B;
     match (dims(fe, fe.vty(a)), dims(fe, fe.vty(b))) {
         // matrix × vector: r = Σ_j m[j] b[j], from zero, which is each component's sum.
-        (Some((true, m)), Some((false, _))) if op == B::Mul => {
+        (Some(Dims { mat: true, cols, rows }), Some(Dims { mat: false, .. })) if op == B::Mul => {
             fe.ins.push(I::V128Const(0));
-            for j in 0..m {
+            for j in 0..cols {
                 fe.ins.push(I::LocalGet(fe.v(a)));
-                fe.vec_load(m, column_stride(m) * u32::from(j));
+                fe.vec_load(rows, column_stride(rows) * u32::from(j));
                 fe.ins.extend([
                     I::LocalGet(fe.v(b)),
                     I::F32x4ExtractLane(j),
@@ -503,16 +512,16 @@ fn vec_binary(
             fe.ins.push(I::LocalSet(fe.v(v)));
         }
         // vector × matrix: r_j = Σ_i a[i] m[j][i], from zero.
-        (Some((false, _)), Some((true, m))) if op == B::Mul => {
-            assemble(fe, v, m, |fe, j| {
+        (Some(Dims { mat: false, .. }), Some(Dims { mat: true, cols, rows })) if op == B::Mul => {
+            assemble(fe, v, cols, |fe, j| {
                 fe.ins.extend([I::LocalGet(fe.v(a)), I::LocalGet(fe.v(b))]);
-                fe.vec_load(m, column_stride(m) * u32::from(j));
+                fe.vec_load(rows, column_stride(rows) * u32::from(j));
                 fe.ins.push(I::F32x4Mul);
-                sum_lanes_from_zero(fe, m);
+                sum_lanes_from_zero(fe, rows);
                 Ok(())
             })?;
         }
-        (Some((true, _)), _) | (_, Some((true, _))) => {
+        (Some(Dims { mat: true, .. }), _) | (_, Some(Dims { mat: true, .. })) => {
             return Err(format!("internal: {op:?} of a matrix to a vector"));
         }
         // `%` calls the `fmod` helper for each component.
@@ -700,43 +709,49 @@ pub(super) fn binary(
     let out = fe.fresh_slot(v, !fe.m.types.is_vector(t))?;
     match (dims(fe, ta), dims(fe, tb), dims(fe, t)) {
         // matrix × vector: r_i = Σ_j m[j][i] v[j]
-        (Some((true, n)), Some((false, _)), _) if op == ir::BinOp::Mul => {
-            for i in 0..n as u32 {
+        (Some(Dims { mat: true, cols, rows }), Some(Dims { mat: false, .. }), _)
+            if op == ir::BinOp::Mul =>
+        {
+            for i in 0..u32::from(rows) {
                 fe.ins.push(I::LocalGet(out));
-                sum_of_products(fe, n as u32, true, |fe, j| {
-                    load_f32(fe, a, mat_elem(n, j, i));
+                sum_of_products(fe, u32::from(cols), true, |fe, j| {
+                    load_f32(fe, a, mat_elem(rows, j, i));
                     load_f32(fe, b, 4 * j);
                 });
                 fe.ins.push(I::F32Store(mem(4 * i, 2)));
             }
         }
         // vector × matrix: r_j = Σ_i v[i] m[j][i]
-        (Some((false, _)), Some((true, n)), _) if op == ir::BinOp::Mul => {
-            for j in 0..n as u32 {
+        (Some(Dims { mat: false, .. }), Some(Dims { mat: true, cols, rows }), _)
+            if op == ir::BinOp::Mul =>
+        {
+            for j in 0..u32::from(cols) {
                 fe.ins.push(I::LocalGet(out));
-                sum_of_products(fe, n as u32, true, |fe, i| {
+                sum_of_products(fe, u32::from(rows), true, |fe, i| {
                     load_f32(fe, a, 4 * i);
-                    load_f32(fe, b, mat_elem(n, j, i));
+                    load_f32(fe, b, mat_elem(rows, j, i));
                 });
                 fe.ins.push(I::F32Store(mem(4 * j, 2)));
             }
         }
-        // matrix × matrix: column j of the result is a × b[j].
-        (Some((true, n)), Some((true, _)), _) if op == ir::BinOp::Mul => {
-            for j in 0..n as u32 {
-                for i in 0..n as u32 {
+        // matrix × matrix, (C1 × R1)(C2 × C1): column j of the result is a × b[j].
+        (Some(da @ Dims { mat: true, .. }), Some(db @ Dims { mat: true, .. }), _)
+            if op == ir::BinOp::Mul =>
+        {
+            for j in 0..u32::from(db.cols) {
+                for i in 0..u32::from(da.rows) {
                     fe.ins.push(I::LocalGet(out));
-                    sum_of_products(fe, n as u32, true, |fe, k| {
-                        load_f32(fe, a, mat_elem(n, k, i));
-                        load_f32(fe, b, mat_elem(n, j, k));
+                    sum_of_products(fe, u32::from(da.cols), true, |fe, k| {
+                        load_f32(fe, a, mat_elem(da.rows, k, i));
+                        load_f32(fe, b, mat_elem(db.rows, j, k));
                     });
-                    fe.ins.push(I::F32Store(mem(mat_elem(n, j, i), 2)));
+                    fe.ins.push(I::F32Store(mem(mat_elem(da.rows, j, i), 2)));
                 }
             }
         }
         // Elementwise: vector op vector, matrix ± matrix, matrix × scalar.
-        (_, _, Some((is_mat, n))) => {
-            for off in components(is_mat, n) {
+        (_, _, Some(d)) => {
+            for off in components(d) {
                 fe.ins.push(I::LocalGet(out));
                 elem_or_scalar(fe, a, off);
                 elem_or_scalar(fe, b, off);
@@ -761,9 +776,9 @@ pub(super) fn unary(fe: &mut Fe, v: ir::ValueId, op: ir::UnOp, x: ir::ValueId) -
         fe.ins.extend([I::LocalGet(fe.v(x)), I::F32x4Neg, I::LocalSet(fe.v(v))]);
         return Ok(());
     }
-    if let Some((is_mat, n)) = dims(fe, t) {
-        let out = fe.fresh_slot(v, is_mat)?;
-        for off in components(is_mat, n) {
+    if let Some(d) = dims(fe, t) {
+        let out = fe.fresh_slot(v, d.mat)?;
+        for off in components(d) {
             fe.ins.extend([
                 I::LocalGet(out),
                 I::LocalGet(fe.v(x)),
@@ -1075,7 +1090,7 @@ pub(super) fn builtin(fe: &mut Fe, v: ir::ValueId, b: ir::Builtin, args: &[ir::V
         return Ok(());
     }
     // Vector reductions. A sum starts from its first product, as WGSL's do.
-    if let Some((false, n)) = dims(fe, arg0) {
+    if let Some(Dims { mat: false, rows: n, .. }) = dims(fe, arg0) {
         let n = n as u32;
         match b {
             B::Dot => {
@@ -1140,7 +1155,7 @@ pub(super) fn builtin(fe: &mut Fe, v: ir::ValueId, b: ir::Builtin, args: &[ir::V
     }
     // Componentwise on vectors (all the arguments are), or plain scalars.
     match dims(fe, t) {
-        Some((false, n)) => {
+        Some(Dims { mat: false, rows: n, .. }) => {
             let out = fe.fresh_slot(v, false)?;
             for c in 0..n as u32 {
                 // In locals: `scalar_builtin` reads locals, some more than once.
@@ -1150,7 +1165,7 @@ pub(super) fn builtin(fe: &mut Fe, v: ir::ValueId, b: ir::Builtin, args: &[ir::V
                 fe.ins.push(I::F32Store(mem(4 * c, 2)));
             }
         }
-        Some((true, _)) => return Err(format!("internal: {b:?} on a matrix")),
+        Some(Dims { mat: true, .. }) => return Err(format!("internal: {b:?} on a matrix")),
         None => {
             let s = fe.scalar(arg0)?;
             let xs: Vec<u32> = args.iter().map(|&a| fe.v(a)).collect();
@@ -1556,8 +1571,12 @@ fn float_parts(types: &ir::Types, t: ir::TypeId) -> Option<(Option<bool>, Vec<u3
     match types.get(t) {
         ir::TypeDef::Scalar(ir::Scalar::F32) => Some((Some(false), Vec::new())),
         ir::TypeDef::Scalar(ir::Scalar::F64) => Some((Some(true), Vec::new())),
-        ir::TypeDef::Vector(ir::Scalar::F32, n) => Some((None, components(false, *n).collect())),
-        ir::TypeDef::Matrix(n) => Some((None, components(true, *n).collect())),
+        &ir::TypeDef::Vector(ir::Scalar::F32, n) => {
+            Some((None, components(Dims { mat: false, cols: 1, rows: n }).collect()))
+        }
+        &ir::TypeDef::Matrix(cols, rows) => {
+            Some((None, components(Dims { mat: true, cols, rows }).collect()))
+        }
         _ => None,
     }
 }
@@ -1653,7 +1672,7 @@ pub(crate) fn canonicalize(fe: &mut Fe, t: ir::TypeId, addr: u32, off: u32) {
         fe.ins.push(store);
     };
     match types.get(t).clone() {
-        ir::TypeDef::Scalar(_) | ir::TypeDef::Vector(..) | ir::TypeDef::Matrix(_) => {
+        ir::TypeDef::Scalar(_) | ir::TypeDef::Vector(..) | ir::TypeDef::Matrix(..) => {
             for (o, s) in ir::layout::scalars(types, t) {
                 if s.is_float() {
                     float(fe, s == ir::Scalar::F64, off + o);

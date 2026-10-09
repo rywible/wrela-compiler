@@ -72,8 +72,9 @@ pub enum TypeDef {
     Scalar(Scalar),
     /// A vector of 2 to 4 components: f32s, i32s, u32s, or (CPU only) f64s.
     Vector(Scalar, u8),
-    /// A square f32 matrix of 2 to 4 columns.
-    Matrix(u8),
+    /// An f32 matrix of 2 to 4 columns (the first) of 2 to 4 rows each (the second): WGSL's
+    /// `matCxR`.
+    Matrix(u8, u8),
     Struct {
         name: String,
         fields: Vec<(String, TypeId)>,
@@ -118,8 +119,8 @@ impl Types {
         // A matrix's columns and a vector's components are types too: projecting one (`m[c]`,
         // `v[i]`) looks them up.
         match d {
-            TypeDef::Matrix(n) => {
-                self.intern(TypeDef::Vector(Scalar::F32, n));
+            TypeDef::Matrix(_, r) => {
+                self.intern(TypeDef::Vector(Scalar::F32, r));
             }
             TypeDef::Vector(s, _) => {
                 self.intern(TypeDef::Scalar(s));
@@ -188,7 +189,7 @@ impl Types {
     pub fn element_scalar(&self, t: TypeId) -> Option<Scalar> {
         match self.get(t) {
             TypeDef::Scalar(s) | TypeDef::Vector(s, _) => Some(*s),
-            TypeDef::Matrix(_) => Some(Scalar::F32),
+            TypeDef::Matrix(..) => Some(Scalar::F32),
             _ => None,
         }
     }
@@ -219,8 +220,8 @@ impl Types {
         match self.get(t) {
             TypeDef::Struct { .. } | TypeDef::Enum { .. } => self.field(t, k),
             TypeDef::Vector(s, n) if k < u32::from(*n) => self.lookup(&TypeDef::Scalar(*s)),
-            TypeDef::Matrix(n) if k < u32::from(*n) => {
-                self.lookup(&TypeDef::Vector(Scalar::F32, *n))
+            TypeDef::Matrix(c, r) if k < u32::from(*c) => {
+                self.lookup(&TypeDef::Vector(Scalar::F32, *r))
             }
             TypeDef::Array(e, n) if k < *n => Some(*e),
             TypeDef::Run(_) if k < 2 => self.lookup(&TypeDef::Scalar(Scalar::U32)),
@@ -244,7 +245,7 @@ impl Types {
             TypeDef::Scalar(s) => s.is_float(),
             TypeDef::Atomic(_) => false,
             TypeDef::Vector(s, _) => s.is_float(),
-            TypeDef::Matrix(_) => true,
+            TypeDef::Matrix(..) => true,
             TypeDef::Struct { fields, .. } => fields.iter().any(|(_, f)| self.has_float(*f)),
             TypeDef::Enum { variants, .. } => {
                 variants.iter().any(|(_, p)| p.is_some_and(|p| self.has_float(p)))
@@ -265,7 +266,8 @@ impl Types {
                 Scalar::U32 => format!("vec{n}u"),
                 _ => format!("vec{n}<{}>", s.name()),
             },
-            TypeDef::Matrix(n) => format!("mat{n}"),
+            TypeDef::Matrix(c, r) if c == r => format!("mat{c}"),
+            TypeDef::Matrix(c, r) => format!("mat{c}x{r}"),
             TypeDef::Struct { name, .. } | TypeDef::Enum { name, .. } => name.clone(),
             TypeDef::Array(e, n) => format!("[{}; {n}]", self.display(*e)),
             TypeDef::RuntimeArray(e) => format!("[{}]", self.display(*e)),

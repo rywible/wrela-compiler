@@ -2425,8 +2425,9 @@ fn varying_leaves(
     let p = &cx.checked.program;
     let leaf = |path, flat| ir::Varying { path, position: false, flat };
     match p.types.kind(t) {
-        TyKind::Mat(n) => {
-            for c in 0..u32::from(*n) {
+        // A column a location.
+        TyKind::Mat(cols, _) => {
+            for c in 0..u32::from(*cols) {
                 out.push(leaf([path.clone(), vec![c]].concat(), flat));
             }
         }
