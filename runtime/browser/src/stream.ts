@@ -9,6 +9,7 @@ import {
   HEADER_LEN,
   NONE,
   Opcode,
+  PASS_JOIN,
   SCREEN,
   STREAM_MAGIC,
   STREAM_VERSION,
@@ -349,7 +350,7 @@ export function decode(batch: Bytes): Command[] {
         const pass: Pass = {
           color: w(0),
           keepColor: (w(1) & 1) === 1,
-          join: (w(1) & 2) === 2,
+          join: (w(1) & PASS_JOIN) !== 0,
           clear: [f(2), f(3), f(4), f(5)],
           depth: w(6),
           keepDepth: w(7) === 1,

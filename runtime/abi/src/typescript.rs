@@ -48,6 +48,7 @@ pub fn typescript() -> String {
     let keys = list(input::KEYS.iter().map(|k| format!("{k:?}")));
     let buttons = list(input::BUTTONS.iter().map(|b| format!("{b:?}")));
     let texture_writable = stream::WRITABLE;
+    let pass_join = stream::PASS_JOIN;
     let max_texture_3d = stream::MAX_TEXTURE_3D;
     let [size_x, size_y, size_z] = manifest::MAX_WORKGROUP_SIZE;
     format!(
@@ -77,6 +78,8 @@ export const TEXTURE_FORMATS = [
 {texture_formats}] as const;
 /** `CreateTexture`'s format word with this bit set: kernels write the texture. */
 export const TEXTURE_WRITABLE = {texture_writable};
+/** `BeginPass`'s colour load word with this bit set: the pass may join the one before it. */
+export const PASS_JOIN = {pass_join};
 /** The most texels a side of a 3D texture. */
 export const MAX_TEXTURE_3D = {max_texture_3d};
 /** A comparison sampler's test, by its number in the stream: WebGPU's name (0 is a sampler that

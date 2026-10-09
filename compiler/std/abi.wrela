@@ -121,6 +121,9 @@ pub(package) const MAX_TEXTURE_3D: u32 = 2048
 /// A texture's format code with this bit set: kernels write its texels.
 pub(package) const TEXTURE_WRITABLE: u32 = 65536
 
+/// A pass's colour load word with this bit set: it may join the pass before it.
+pub(package) const PASS_JOIN: u32 = 2
+
 /// A request's status while it isn't answered.
 pub(package) const REQUEST_PENDING: i32 = -1
 

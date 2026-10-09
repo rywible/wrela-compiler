@@ -56,6 +56,8 @@ export const TEXTURE_FORMATS = [
 ] as const;
 /** `CreateTexture`'s format word with this bit set: kernels write the texture. */
 export const TEXTURE_WRITABLE = 65536;
+/** `BeginPass`'s colour load word with this bit set: the pass may join the one before it. */
+export const PASS_JOIN = 2;
 /** The most texels a side of a 3D texture. */
 export const MAX_TEXTURE_3D = 2048;
 /** A comparison sampler's test, by its number in the stream: WebGPU's name (0 is a sampler that

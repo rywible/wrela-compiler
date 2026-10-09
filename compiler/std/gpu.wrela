@@ -6,7 +6,7 @@ use std::abi::{
     COMPARE_LESS_EQUAL, COMPARE_NEVER, COMPARE_NOT_EQUAL, FORMAT_DEPTH32FLOAT, FORMAT_R16FLOAT,
     FORMAT_R16FLOAT_BYTES, FORMAT_R32FLOAT, FORMAT_R32FLOAT_BYTES, FORMAT_R32UINT,
     FORMAT_R32UINT_BYTES, FORMAT_RG16FLOAT, FORMAT_RG16FLOAT_BYTES, FORMAT_RGBA16FLOAT,
-    FORMAT_RGBA16FLOAT_BYTES, FORMAT_RGBA8UNORM, FORMAT_RGBA8UNORM_BYTES, MAX_TEXTURE_3D,
+    FORMAT_RGBA16FLOAT_BYTES, FORMAT_RGBA8UNORM, FORMAT_RGBA8UNORM_BYTES, MAX_TEXTURE_3D, PASS_JOIN,
     TEXTURE_WRITABLE,
 }
 use std::io::{Pending, next_request}
@@ -911,7 +911,7 @@ pub fn begin_pass_with_depth<F: Target>(
     let (c, d) = (target.handle, depth.handle)
     begin_pass_command(
         c,
-        u32(keep) | u32(join) << 1,
+        u32(keep) | if join { PASS_JOIN } else { 0 },
         clear.x,
         clear.y,
         clear.z,

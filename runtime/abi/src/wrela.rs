@@ -57,6 +57,11 @@ const NUMBERS: &[(&str, u32, &str)] = &[
         crate::stream::WRITABLE,
         "A texture's format code with this bit set: kernels write its texels.",
     ),
+    (
+        "PASS_JOIN",
+        crate::stream::PASS_JOIN,
+        "A pass's colour load word with this bit set: it may join the pass before it.",
+    ),
 ];
 
 /// The same, for the `i32`s.

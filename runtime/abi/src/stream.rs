@@ -189,6 +189,10 @@ impl Opcode {
 /// `CreateTexture`'s format word with this bit set: kernels write the texture's texels.
 pub const WRITABLE: u32 = 1 << 16;
 
+/// `BeginPass`'s colour load word with this bit set: the pass may join the one before it
+/// ([`Pass::join`]).
+pub const PASS_JOIN: u32 = 2;
+
 /// The most texels a side of a 3D texture: WebGPU's default `maxTextureDimension3D`.
 pub const MAX_TEXTURE_3D: u32 = 2048;
 
@@ -889,7 +893,7 @@ pub fn decode(batch: &[u8]) -> Result<Vec<Command<'_>>, StreamError> {
                 Command::BeginPass(Pass {
                     color: w(0),
                     keep_color: w(1) & 1 == 1,
-                    join: w(1) & 2 == 2,
+                    join: w(1) & PASS_JOIN != 0,
                     clear: [2, 3, 4, 5].map(|i| f32::from_bits(w(i))),
                     depth: w(6),
                     keep_depth: w(7) == 1,
@@ -1207,7 +1211,7 @@ impl Encoder {
         let c = pass.clear.map(f32::to_bits);
         let words = [
             pass.color,
-            u32::from(pass.keep_color) | u32::from(pass.join) << 1,
+            u32::from(pass.keep_color) | if pass.join { PASS_JOIN } else { 0 },
             c[0],
             c[1],
             c[2],
