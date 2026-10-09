@@ -220,10 +220,15 @@ impl Clearing {
 
     /// What the last frame drew (`test_capture`'s `what`), from the newest buffer.
     fn capture(&mut self, what: i32) -> Vec<u8> {
+        self.capture_counted(what).0
+    }
+
+    /// [`Self::capture`], and how many elements it holds.
+    fn capture_counted(&mut self, what: i32) -> (Vec<u8>, usize) {
         let n = self.call("test_capture", &[Value::I32(what)]);
         assert!(n[0] > 0.0, "nothing to capture");
         let newest = *self.host.buffers().last().expect("a buffer");
-        self.host.read_buffer(newest).expect("read the capture")
+        (self.host.read_buffer(newest).expect("read the capture"), n[0] as usize)
     }
 
     /// A capture (`what`) of four floats a pixel.
@@ -579,27 +584,37 @@ fn the_wind_is_a_function_of_time_and_place() {
 // ---- the terrain (AC3) -----------------------------------------------------------------------
 
 /// The clipmap's texels (`TEXEL_BYTES` each), their heights, and its levels: each (x, z of
-/// texel 0, spacing).
+/// texel 0, spacing); and its layout, as the clearing reports it (`test_clip_layout`): a
+/// level's texels and quads a side, a row's texels in the buffer, and a level's.
 struct Clip {
     texels: Vec<u8>,
     heights: Vec<f32>,
     levels: Vec<[f64; 3]>,
+    side: u32,
+    quads: u32,
+    row: u32,
+    stride: u32,
 }
 
-/// engine::terrain's layout.
-const SIDE: u32 = 129;
-const QUADS: u32 = 128;
-const ROW: u32 = 136;
-const STRIDE: u32 = 17600;
+/// A texel's bytes as the test reads them (`engine::terrain::Texel`): its height (an `f32`) in
+/// the first four, its cover's grass (a `Unorm8x4`'s last byte) in byte 11.
 const TEXEL_BYTES: usize = 20;
+const GRASS_BYTE: usize = 11;
 
 impl Clip {
     fn read(c: &mut Clearing) -> Clip {
-        let texels = c.capture(6);
+        let (texels, count) = c.capture_counted(6);
+        assert_eq!(
+            texels.len(),
+            count * TEXEL_BYTES,
+            "a clipmap texel isn't the {TEXEL_BYTES} bytes this test reads (engine::terrain::Texel changed?)"
+        );
         let heights = texels
             .chunks(TEXEL_BYTES)
             .map(|t| f32::from_le_bytes(t[0..4].try_into().unwrap()))
             .collect();
+        let layout = c.call("test_clip_layout", &[]);
+        let [side, quads, row, stride] = [0, 1, 2, 3].map(|k| layout[k] as u32);
         let count = c.call("test_level", &[Value::I32(0)])[3] as u32;
         let levels = (0..count)
             .map(|l| {
@@ -607,17 +622,17 @@ impl Clip {
                 [v[0], v[1], v[2]]
             })
             .collect();
-        Clip { texels, heights, levels }
+        Clip { texels, heights, levels, side, quads, row, stride }
     }
 
     fn texel(&self, l: usize, i: u32, j: u32) -> f64 {
-        f64::from(self.heights[(l as u32 * STRIDE + j * ROW + i) as usize])
+        f64::from(self.heights[(l as u32 * self.stride + j * self.row + i) as usize])
     }
 
     /// How far into level `l` a point is, as a share of its half side (1 at its edge).
     fn reach(&self, l: usize, x: f64, z: f64) -> f64 {
         let [ax, az, s] = self.levels[l];
-        let half = f64::from(QUADS / 2) * s;
+        let half = f64::from(self.quads / 2) * s;
         ((x - ax - half).abs()).max((z - az - half).abs()) / half
     }
 
@@ -636,8 +651,8 @@ impl Clip {
         let l = self.level_at(x, z);
         let [ax, az, s] = self.levels[l];
         let g = [
-            ((x - ax) / s).clamp(0.0, f64::from(QUADS) - 0.001),
-            ((z - az) / s).clamp(0.0, f64::from(QUADS) - 0.001),
+            ((x - ax) / s).clamp(0.0, f64::from(self.quads) - 0.001),
+            ((z - az) / s).clamp(0.0, f64::from(self.quads) - 0.001),
         ];
         let (i, j) = (g[0].floor(), g[1].floor());
         let (fx, fz) = (g[0] - i, g[1] - j);
@@ -653,10 +668,10 @@ impl Clip {
     fn grass_at(&self, x: f64, z: f64) -> f64 {
         let l = self.level_at(x, z);
         let [ax, az, s] = self.levels[l];
-        let i = (((x - ax) / s).round().clamp(0.0, f64::from(QUADS))) as u32;
-        let j = (((z - az) / s).round().clamp(0.0, f64::from(QUADS))) as u32;
-        let t = (l as u32 * STRIDE + j * ROW + i) as usize;
-        f64::from(self.texels[t * TEXEL_BYTES + 11]) / 255.0
+        let i = (((x - ax) / s).round().clamp(0.0, f64::from(self.quads))) as u32;
+        let j = (((z - az) / s).round().clamp(0.0, f64::from(self.quads))) as u32;
+        let t = (l as u32 * self.stride + j * self.row + i) as usize;
+        f64::from(self.texels[t * TEXEL_BYTES + GRASS_BYTE]) / 255.0
     }
 }
 
@@ -681,6 +696,7 @@ fn the_clipmap_holds_the_fields_heights_and_the_raycasts_meet_it() {
     let mut c = Clearing::load("clearing-clipmap");
     c.until_ready(2);
     let clip = Clip::read(&mut c);
+    let (side, quads) = (clip.side, clip.quads);
     let (dir, _) = built("clearing-clipmap-cpu");
     let mut cpu = wrela_host::CpuHost::load(&dir).expect("load on the CPU");
     let mut worst: BTreeMap<usize, (f64, f64)> = BTreeMap::new();
@@ -692,18 +708,18 @@ fn the_clipmap_holds_the_fields_heights_and_the_raycasts_meet_it() {
         // The nearest level's field at each of its texels, evaluated once: a cell's corners are
         // texels too.
         let grid: Vec<(f64, f64)> = if l == 0 {
-            let texels = (0..SIDE).flat_map(|j| (0..SIDE).map(move |i| at(i, j)));
+            let texels = (0..side).flat_map(|j| (0..side).map(move |i| at(i, j)));
             texels.map(|(x, z)| field(&mut cpu, x, z)).collect()
         } else {
             Vec::new()
         };
-        for j in (0..SIDE).step_by(every) {
-            for i in (0..SIDE).step_by(every) {
+        for j in (0..side).step_by(every) {
+            for i in (0..side).step_by(every) {
                 let (x, z) = at(i, j);
                 // The field at texel (i + di, j + dj).
                 let field_at = |cpu: &mut wrela_host::CpuHost, di: u32, dj: u32| {
                     if l == 0 {
-                        grid[((j + dj) * SIDE + i + di) as usize]
+                        grid[((j + dj) * side + i + di) as usize]
                     } else {
                         field(cpu, x + f64::from(di) * s, z + f64::from(dj) * s)
                     }
@@ -717,7 +733,7 @@ fn the_clipmap_holds_the_fields_heights_and_the_raycasts_meet_it() {
                     "level {l}, texel ({i}, {j}) at ({x}, {z}): {} against the field's {h}, bound {bound}",
                     clip.texel(l, i, j)
                 );
-                if i < QUADS && j < QUADS {
+                if i < quads && j < quads {
                     // The cell's middle, read between its four texels: within the cell's
                     // width times its steepest slope (at its corners and middle) of the field.
                     let (xm, zm) = (x + 0.5 * s, z + 0.5 * s);
@@ -1463,6 +1479,13 @@ fn the_probes_match_a_brute_force_reference() {
         );
         let newest = *c.host.buffers().last().expect("a buffer");
         let r = f32s(&c.host.read_buffer(newest).expect("read"));
+        // An `engine::probes::Reference` as this test reads it: the probes' estimate (three
+        // `vec4`s), the traced light (three more), and where (`at`, a `vec4`), 28 floats.
+        assert_eq!(
+            r.len(),
+            count as usize * 28,
+            "a probes Reference isn't the 28 floats this test reads (engine::probes::Reference changed?)"
+        );
         for (k, p) in r.chunks(28).enumerate() {
             let at = first + k as u32;
             let (x, y) = ((at % cols) * step + step / 2, (at / cols) * step + step / 2);
