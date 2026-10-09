@@ -940,27 +940,15 @@ fn draw_target(
     let t = fl.place_src_ty(&d.pass.0);
     let t = fl.concrete(t);
     let p = &fl.cx.checked.program;
-    let (lang, format) = match p.types.kind(t) {
-        // `Pass<F>`'s and `DepthPass<F>`'s `F`: the target texture's format.
-        TyKind::Adt(a, args) => (p.adt(*a).lang, args.first().and_then(|&f| p.lang_of_ty(f))),
-        _ => (None, None),
-    };
-    let format = match format {
-        Some(Lang::Rgba8) => Some(ir::TexFormat::Rgba8Unorm),
-        Some(Lang::Rgba16Float) => Some(ir::TexFormat::Rgba16Float),
-        Some(Lang::R16Float) => Some(ir::TexFormat::R16Float),
-        Some(Lang::Rg16Float) => Some(ir::TexFormat::Rg16Float),
-        Some(Lang::R32Float) => Some(ir::TexFormat::R32Float),
-        Some(Lang::R32Uint) => Some(ir::TexFormat::R32Uint),
-        _ => None,
-    };
+    // `Pass<F>`'s and `DepthPass<F>`'s `F` is the target texture's format, as `Texture<F>`'s.
+    let format = Some(texture_format(fl.cx, t));
     let screen = Some(ir::TexFormat::Rgba8Unorm);
-    let target = match (lang, format) {
-        (Some(Lang::Pass), Some(_)) => ir::DrawTarget { color: format, depth: false },
-        (Some(Lang::DepthPass), Some(_)) => ir::DrawTarget { color: format, depth: true },
-        (Some(Lang::DepthOnlyPass), _) => ir::DrawTarget { color: None, depth: true },
-        (Some(Lang::ScreenPass), _) => ir::DrawTarget { color: screen, depth: false },
-        (Some(Lang::ScreenDepthPass), _) => ir::DrawTarget { color: screen, depth: true },
+    let target = match p.lang_of_ty(t) {
+        Some(Lang::Pass) => ir::DrawTarget { color: format, depth: false },
+        Some(Lang::DepthPass) => ir::DrawTarget { color: format, depth: true },
+        Some(Lang::DepthOnlyPass) => ir::DrawTarget { color: None, depth: true },
+        Some(Lang::ScreenPass) => ir::DrawTarget { color: screen, depth: false },
+        Some(Lang::ScreenDepthPass) => ir::DrawTarget { color: screen, depth: true },
         _ => {
             let what = format!("a draw's pass is a `{}`, not a pass", p.display_ty(t));
             fl.cx.err(Diagnostic::internal(what));

@@ -109,7 +109,7 @@ pub struct Watcher {
     pkg: PathBuf,
     lift: Vec<String>,
     kind: crate::BuildKind,
-    /// Where the builds go: `out/<version>`.
+    /// Where the builds go: `out/<version>`, the last two kept.
     out: PathBuf,
     version: u64,
     /// The packages' directories.
@@ -221,6 +221,11 @@ impl Watcher {
         self.literals = report.literals;
         self.built = self.seen.clone();
         self.version = version;
+        // The build before the last goes: a page still swapping to the last one fetches its
+        // files, and nothing reads an older one (a session's builds would fill the disk).
+        if version > 2 {
+            let _ = std::fs::remove_dir_all(self.out.join((version - 2).to_string()));
+        }
         Change::Built { version, dir }
     }
 }

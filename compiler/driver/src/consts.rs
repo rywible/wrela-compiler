@@ -11,7 +11,7 @@
 use std::collections::BTreeSet;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, Mutex};
 use wrela_diag::{Diagnostic, SourceMap, Span, codes};
 use wrela_lower::{BuildData, ConstLowering, ConstModule, Embeds, Memory};
 use wrela_sema::Checked;
@@ -111,7 +111,7 @@ pub fn compute(checked: &Checked, sources: &SourceMap, data: &mut BuildData) -> 
         if errors {
             break;
         }
-        for (c, result) in run(&ENGINE, checked, sources, &module, !data.no_simd) {
+        for (c, result) in run(engine(), checked, sources, &module, !data.no_simd) {
             match result {
                 Ok(v) => {
                     data.values.insert(c, Rc::new(v));
@@ -127,17 +127,12 @@ pub fn compute(checked: &Checked, sources: &SourceMap, data: &mut BuildData) -> 
     diags
 }
 
-/// The process's one engine for the code builds run (constants and tests), as wasmtime intends:
-/// an engine is costly to make, and cheap to share.
-static ENGINE: LazyLock<wasmtime::Engine> = LazyLock::new(|| {
-    let mut config = wasmtime::Config::new();
-    config.consume_fuel(true);
-    // A program's code uses atomics (its memory is shared with workers when it runs).
-    config.wasm_threads(true);
-    // As the native host's engine: no native unwind info (macOS registers it under a lock).
-    config.native_unwind_info(false);
-    wasmtime::Engine::new(&config).expect("wasmtime's configuration is valid")
-});
+/// The engine for the code builds run (constants and tests): the native host's that counts
+/// fuel, one for the process, as wasmtime intends (an engine is costly to make, and cheap to
+/// share).
+fn engine() -> &'static wasmtime::Engine {
+    wrela_host::metered_engine()
+}
 
 /// E0328 for constants that read each other, through the functions that compute them: one
 /// cycle among `blocked` (each with the constants it needs).
@@ -315,12 +310,12 @@ pub fn run_tests(
     let Some(module) = module.filter(|_| !wrela_diag::has_errors(&diags)) else {
         return (Vec::new(), diags);
     };
-    let compiled = match compile(&ENGINE, &module.module, !data.no_simd) {
+    let compiled = match compile(engine(), &module.module, !data.no_simd) {
         Ok(c) => c,
         Err(msg) => return (Vec::new(), vec![Diagnostic::internal(msg)]),
     };
     let names: Vec<&str> = module.exports.iter().map(|(_, name)| name.as_str()).collect();
-    let ran = each_at_once(&names, |name| compiled.start(&ENGINE).map(|mut r| r.call(name, fuel)));
+    let ran = each_at_once(&names, |name| compiled.start(engine()).map(|mut r| r.call(name, fuel)));
     let results = module
         .exports
         .iter()

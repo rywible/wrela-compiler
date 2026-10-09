@@ -37,7 +37,7 @@ pub use cache::compiled_code_prefix;
 pub use error::{Error, Result};
 #[cfg(feature = "gpu")]
 pub use gpu::{GpuTiming, frame_spans, map_read, open_device, read_timestamps};
-pub use program::{Failure, PostHandler, Ticked, Value};
+pub use program::{Failure, PostHandler, Ticked, Value, metered_engine};
 pub use wrela_abi::input::{Event, Scripted, parse_script};
 pub use wrela_abi::ticks::{TickLog, frame_time, lockstep_ticks};
 
@@ -299,6 +299,32 @@ impl Host {
         self.program = Some(program);
         self.wasm_hash = build.wasm_hash;
         self.dir = dir;
+        Ok(())
+    }
+
+    /// The same build again from its start, on the same device, as `options` says (its
+    /// storage, its workers, whether `init` waits): a new program, with nothing of the last
+    /// one's (its buffers and textures released; nothing kept, no ticks carried). The pipelines
+    /// are kept. For tests that each start fresh on one host (`wrela test`'s GPU frame tests).
+    pub fn restart_with(&mut self, options: &Options) -> Result<()> {
+        let build = compile_build(&self.dir, None)?;
+        let old = self.program.take().expect("the host has a program");
+        let mut executor = old.retire().executor;
+        program::Executor::reload(&mut executor, &build.manifest, &build.shaders)?;
+        let mut program = Program::instantiate_with(
+            &build.compiled,
+            &build.manifest,
+            executor,
+            options.io(&self.dir),
+            options.record,
+            workers(options.workers),
+            !options.defer_init,
+        )?;
+        if options.reloadable {
+            program.keep_ticks();
+        }
+        self.program = Some(program);
+        self.options = options.clone();
         Ok(())
     }
 

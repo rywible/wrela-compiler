@@ -60,6 +60,8 @@ pub fn run(
         }
     };
     let mut results = Vec::new();
+    // The GPU tests share one host: each starts a new program on its device and pipelines.
+    let mut gpu = GpuHost::default();
     for (i, &f) in tests.iter().enumerate() {
         let attrs = &checked.program.func(f).attrs;
         let run = attrs.test_run.unwrap_or(TestRun::Frames(1));
@@ -82,7 +84,7 @@ pub fn run(
         let storage = dir.0.join(format!("storage.{i}"));
         let ran = match (attrs.test_gpu, run, &input) {
             (true, TestRun::Frames(n), Input::Script(script)) => {
-                run_gpu(&dir.0, &storage, i, n, script)
+                run_gpu(&mut gpu, &dir.0, &storage, i, n, script)
             }
             _ => run_one(&built, &storage, i, run, &input),
         };
@@ -151,12 +153,19 @@ fn read_input(root: &Path, path: &str, ticks: bool) -> Result<Input, String> {
     wrela_host::parse_script(&text).map(Input::Script).map_err(|e| format!("isn't a script: {e}"))
 }
 
+/// The native host the GPU frame tests of a run share (none yet, or none after one failed):
+/// loading the build and opening the device and its pipelines once.
+#[derive(Default)]
+struct GpuHost(#[cfg(feature = "gpu")] Option<wrela_host::Host>);
+
 /// Runs GPU frame test `i` (`@test(frames: n, gpu: true)`, §10) on the native host's GPU:
 /// `init`, its `frames` with `script`'s events, each frame's readbacks answered before the next,
 /// then the test. Why it failed, if it did. The GPU host meters no fuel: it runs the program as
-/// `wrela run` does.
+/// `wrela run` does. Each test is a new program, nothing of the last one's left; the host is
+/// `gpu`'s, loaded for the first, and loaded again after one that failed.
 #[cfg(feature = "gpu")]
 fn run_gpu(
+    gpu: &mut GpuHost,
     dir: &Path,
     storage: &Path,
     i: usize,
@@ -171,10 +180,29 @@ fn run_gpu(
         defer_init: true,
         ..Default::default()
     };
-    let mut host = match wrela_host::Host::load_with(dir, &options) {
+    let started = match gpu.0.take() {
+        Some(mut host) => host.restart_with(&options).map(|()| host),
+        None => wrela_host::Host::load_with(dir, &options),
+    };
+    let mut host = match started {
         Ok(h) => h,
         Err(e) => return failed(e, None, "as it started".to_string()),
     };
+    let ran = run_gpu_frames(&mut host, i, frames, script);
+    if ran.is_none() {
+        gpu.0 = Some(host);
+    }
+    ran
+}
+
+/// [`run_gpu`]'s test, on its host.
+#[cfg(feature = "gpu")]
+fn run_gpu_frames(
+    host: &mut wrela_host::Host,
+    i: usize,
+    frames: u32,
+    script: &[wrela_host::Scripted],
+) -> Option<Failed> {
     if let Err(e) = host.init() {
         return failed(e, host.last_failure(), "in `init`".to_string());
     }
@@ -191,7 +219,14 @@ fn run_gpu(
 
 /// [`run_gpu`], in a compiler built without the GPU host: the test can't run.
 #[cfg(not(feature = "gpu"))]
-fn run_gpu(_: &Path, _: &Path, _: usize, _: u32, _: &[wrela_host::Scripted]) -> Option<Failed> {
+fn run_gpu(
+    _: &mut GpuHost,
+    _: &Path,
+    _: &Path,
+    _: usize,
+    _: u32,
+    _: &[wrela_host::Scripted],
+) -> Option<Failed> {
     let why = "its frames run on the GPU, and this build of the compiler has no GPU host";
     Some(Failed {
         error: wrela_host::Error::Program(why.into()),
