@@ -1,7 +1,14 @@
 // GPU resources, entry-point builtins, and the CPU calls that record GPU work (language.md
 // §12, §6.13, D-102). Every function here that CPU code calls carries the `host` effect.
 
-use std::abi::MAX_TEXTURE_3D
+use std::abi::{
+    COMPARE_ALWAYS, COMPARE_EQUAL, COMPARE_GREATER, COMPARE_GREATER_EQUAL, COMPARE_LESS,
+    COMPARE_LESS_EQUAL, COMPARE_NEVER, COMPARE_NOT_EQUAL, FORMAT_DEPTH32FLOAT, FORMAT_R16FLOAT,
+    FORMAT_R16FLOAT_BYTES, FORMAT_R32FLOAT, FORMAT_R32FLOAT_BYTES, FORMAT_R32UINT,
+    FORMAT_R32UINT_BYTES, FORMAT_RG16FLOAT, FORMAT_RG16FLOAT_BYTES, FORMAT_RGBA16FLOAT,
+    FORMAT_RGBA16FLOAT_BYTES, FORMAT_RGBA8UNORM, FORMAT_RGBA8UNORM_BYTES, MAX_TEXTURE_3D,
+    TEXTURE_WRITABLE,
+}
 use std::io::{Pending, next_request}
 use std::mem::{Drop, size_of}
 
@@ -417,10 +424,10 @@ pub struct R32Uint {}
 impl Format for Rgba8 {
     type Texel = vec4
     fn code() -> u32 {
-        0
+        FORMAT_RGBA8UNORM
     }
     fn bytes() -> u32 {
-        4
+        FORMAT_RGBA8UNORM_BYTES
     }
     fn rgba(t: vec4) -> vec4 {
         t
@@ -436,10 +443,10 @@ impl Target for Rgba8 {}
 impl Format for Rgba16Float {
     type Texel = vec4
     fn code() -> u32 {
-        1
+        FORMAT_RGBA16FLOAT
     }
     fn bytes() -> u32 {
-        8
+        FORMAT_RGBA16FLOAT_BYTES
     }
     fn rgba(t: vec4) -> vec4 {
         t
@@ -455,10 +462,10 @@ impl Target for Rgba16Float {}
 impl Format for R16Float {
     type Texel = f32
     fn code() -> u32 {
-        3
+        FORMAT_R16FLOAT
     }
     fn bytes() -> u32 {
-        2
+        FORMAT_R16FLOAT_BYTES
     }
     fn rgba(t: f32) -> vec4 {
         vec4(t, 0.0, 0.0, 1.0)
@@ -472,10 +479,10 @@ impl Target for R16Float {}
 impl Format for Rg16Float {
     type Texel = vec2
     fn code() -> u32 {
-        4
+        FORMAT_RG16FLOAT
     }
     fn bytes() -> u32 {
-        4
+        FORMAT_RG16FLOAT_BYTES
     }
     fn rgba(t: vec2) -> vec4 {
         vec4(t, 0.0, 1.0)
@@ -489,10 +496,10 @@ impl Target for Rg16Float {}
 impl Format for R32Float {
     type Texel = f32
     fn code() -> u32 {
-        5
+        FORMAT_R32FLOAT
     }
     fn bytes() -> u32 {
-        4
+        FORMAT_R32FLOAT_BYTES
     }
     fn rgba(t: f32) -> vec4 {
         vec4(t, 0.0, 0.0, 1.0)
@@ -506,10 +513,10 @@ impl Target for R32Float {}
 impl Format for R32Uint {
     type Texel = u32
     fn code() -> u32 {
-        6
+        FORMAT_R32UINT
     }
     fn bytes() -> u32 {
-        4
+        FORMAT_R32UINT_BYTES
     }
     fn rgba(t: u32) -> vec4 {
         vec4(f32(t), 0.0, 0.0, 1.0)
@@ -648,8 +655,7 @@ pub fn texture<F: Format>(width: u32, height: u32) -> Texture<F> {
 /// write are made this way.
 pub fn writable_texture<F: Storage>(width: u32, height: u32) -> Texture<F> {
     check_texture_size(width, height)
-    // The stream's flag for a texture kernels write: bit 16 of the format.
-    Texture { handle: create_texture(width, height, F::code() | 65536), width, height }
+    Texture { handle: create_texture(width, height, F::code() | TEXTURE_WRITABLE), width, height }
 }
 
 /// A new 3D texture of format `F`, `width` × `height` × `depth` texels (each 1 to 2048),
@@ -659,15 +665,14 @@ pub fn texture3d<F: Storage>(width: u32, height: u32, depth: u32) -> Texture3d<F
     if width == 0 || height == 0 || depth == 0 || width > max || height > max || depth > max {
         panic(f"texture3d: a side is 1 to {max} texels")
     }
-    // Kernels write it: bit 16.
-    let code = F::code() | 65536
+    let code = F::code() | TEXTURE_WRITABLE
     Texture3d { handle: create_texture_3d(width, height, code, depth), width, height, depth }
 }
 
 /// A new depth texture, zeroed.
 pub fn depth_texture(width: u32, height: u32) -> DepthTexture {
     check_texture_size(width, height)
-    DepthTexture { handle: create_texture(width, height, 2), width, height }
+    DepthTexture { handle: create_texture(width, height, FORMAT_DEPTH32FLOAT), width, height }
 }
 
 /// A new sampler.
@@ -686,14 +691,14 @@ pub fn sampler(filter: Filter = Filter::Linear, address: Address = Address::Clam
 /// A new comparison sampler: linear, so each comparison blends four texels' results.
 pub fn comparison_sampler(compare: Compare = Compare::LessEqual) -> ComparisonSampler {
     let code: u32 = match compare {
-        Compare::Less => 1,
-        Compare::LessEqual => 2,
-        Compare::Greater => 3,
-        Compare::GreaterEqual => 4,
-        Compare::Equal => 5,
-        Compare::NotEqual => 6,
-        Compare::Always => 7,
-        Compare::Never => 8,
+        Compare::Less => COMPARE_LESS,
+        Compare::LessEqual => COMPARE_LESS_EQUAL,
+        Compare::Greater => COMPARE_GREATER,
+        Compare::GreaterEqual => COMPARE_GREATER_EQUAL,
+        Compare::Equal => COMPARE_EQUAL,
+        Compare::NotEqual => COMPARE_NOT_EQUAL,
+        Compare::Always => COMPARE_ALWAYS,
+        Compare::Never => COMPARE_NEVER,
     }
     ComparisonSampler { handle: create_sampler(linear: 1, repeat: 0, compare: code) }
 }

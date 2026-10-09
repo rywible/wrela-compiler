@@ -124,12 +124,11 @@ pub struct Watch {
 impl Watch {
     /// Watches `literals`, at their values now.
     pub fn new(literals: [Literal]) -> Watch {
-        var w = Watch { literals: Vec::new(), values: Vec::new(), generation: generation() }
-        for l in literals {
-            w.literals.push(l)
-            w.values.push(l.value())
+        Watch {
+            literals: Vec::from(literals),
+            values: Vec::from_fn(literals.len(), |i| literals[i].value()),
+            generation: generation(),
         }
-        w
     }
 
     /// Whether a literal it watches has a new value since it was made or last changed: then it

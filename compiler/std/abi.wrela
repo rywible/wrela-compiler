@@ -118,8 +118,77 @@ pub(package) const AUDIO_QUANTUM: u32 = 128
 /// The widest, tallest and deepest 3D texture.
 pub(package) const MAX_TEXTURE_3D: u32 = 2048
 
+/// A texture's format code with this bit set: kernels write its texels.
+pub(package) const TEXTURE_WRITABLE: u32 = 65536
+
 /// A request's status while it isn't answered.
 pub(package) const REQUEST_PENDING: i32 = -1
 
 /// A request's status once it has failed.
 pub(package) const REQUEST_FAILED: i32 = -2
+
+/// The stream's code for the texture format `rgba8unorm`.
+pub(package) const FORMAT_RGBA8UNORM: u32 = 0
+
+/// The bytes of a texel of `rgba8unorm`.
+pub(package) const FORMAT_RGBA8UNORM_BYTES: u32 = 4
+
+/// The stream's code for the texture format `rgba16float`.
+pub(package) const FORMAT_RGBA16FLOAT: u32 = 1
+
+/// The bytes of a texel of `rgba16float`.
+pub(package) const FORMAT_RGBA16FLOAT_BYTES: u32 = 8
+
+/// The stream's code for the texture format `depth32float`.
+pub(package) const FORMAT_DEPTH32FLOAT: u32 = 2
+
+/// The bytes of a texel of `depth32float`.
+pub(package) const FORMAT_DEPTH32FLOAT_BYTES: u32 = 4
+
+/// The stream's code for the texture format `r16float`.
+pub(package) const FORMAT_R16FLOAT: u32 = 3
+
+/// The bytes of a texel of `r16float`.
+pub(package) const FORMAT_R16FLOAT_BYTES: u32 = 2
+
+/// The stream's code for the texture format `rg16float`.
+pub(package) const FORMAT_RG16FLOAT: u32 = 4
+
+/// The bytes of a texel of `rg16float`.
+pub(package) const FORMAT_RG16FLOAT_BYTES: u32 = 4
+
+/// The stream's code for the texture format `r32float`.
+pub(package) const FORMAT_R32FLOAT: u32 = 5
+
+/// The bytes of a texel of `r32float`.
+pub(package) const FORMAT_R32FLOAT_BYTES: u32 = 4
+
+/// The stream's code for the texture format `r32uint`.
+pub(package) const FORMAT_R32UINT: u32 = 6
+
+/// The bytes of a texel of `r32uint`.
+pub(package) const FORMAT_R32UINT_BYTES: u32 = 4
+
+/// The stream's code for the comparison `less`.
+pub(package) const COMPARE_LESS: u32 = 1
+
+/// The stream's code for the comparison `less-equal`.
+pub(package) const COMPARE_LESS_EQUAL: u32 = 2
+
+/// The stream's code for the comparison `greater`.
+pub(package) const COMPARE_GREATER: u32 = 3
+
+/// The stream's code for the comparison `greater-equal`.
+pub(package) const COMPARE_GREATER_EQUAL: u32 = 4
+
+/// The stream's code for the comparison `equal`.
+pub(package) const COMPARE_EQUAL: u32 = 5
+
+/// The stream's code for the comparison `not-equal`.
+pub(package) const COMPARE_NOT_EQUAL: u32 = 6
+
+/// The stream's code for the comparison `always`.
+pub(package) const COMPARE_ALWAYS: u32 = 7
+
+/// The stream's code for the comparison `never`.
+pub(package) const COMPARE_NEVER: u32 = 8

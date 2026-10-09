@@ -2,6 +2,7 @@
 //! std is wrela, and can't import this crate.
 
 use crate::memory::*;
+use crate::stream::{Compare, TextureFormat};
 
 /// The checked-in wrela module, relative to the repository root.
 pub const WRELA_PATH: &str = "compiler/std/abi.wrela";
@@ -51,6 +52,11 @@ const NUMBERS: &[(&str, u32, &str)] = &[
         crate::stream::MAX_TEXTURE_3D,
         "The widest, tallest and deepest 3D texture.",
     ),
+    (
+        "TEXTURE_WRITABLE",
+        crate::stream::WRITABLE,
+        "A texture's format code with this bit set: kernels write its texels.",
+    ),
 ];
 
 /// The same, for the `i32`s.
@@ -71,6 +77,26 @@ pub fn wrela() -> String {
     }
     for (name, value, doc) in SIGNED {
         out += &format!("\n/// {doc}\npub(package) const {name}: i32 = {value}\n");
+    }
+    // Each texture format's code and its bytes a texel, and each comparison's code, named as
+    // WebGPU names them (`rgba8unorm` is `FORMAT_RGBA8UNORM`, `less-equal` `COMPARE_LESS_EQUAL`).
+    let upper = |name: &str| name.replace('-', "_").to_uppercase();
+    for f in TextureFormat::ALL {
+        let (name, code, bytes) = (f.name(), f as u32, f.bytes_per_texel());
+        let n = upper(name);
+        out += &format!(
+            "\n/// The stream's code for the texture format `{name}`.\npub(package) const FORMAT_{n}: u32 = {code}\n"
+        );
+        out += &format!(
+            "\n/// The bytes of a texel of `{name}`.\npub(package) const FORMAT_{n}_BYTES: u32 = {bytes}\n"
+        );
+    }
+    for c in Compare::ALL {
+        let (name, code) = (c.name(), c as u32);
+        let n = upper(name);
+        out += &format!(
+            "\n/// The stream's code for the comparison `{name}`.\npub(package) const COMPARE_{n}: u32 = {code}\n"
+        );
     }
     out
 }
