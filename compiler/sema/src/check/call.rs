@@ -1681,10 +1681,7 @@ impl<'p> Checker<'p> {
                 // An enum whose variants hold nothing converts to an integer: its variant's
                 // discriminant (§3), as a `Fieldless` parameter's value does.
                 let fieldless = match self.kind(x.ty) {
-                    &TyKind::Adt(a, _) => {
-                        self.p.adt(a).is_enum()
-                            && self.p.adt(a).variants().iter().all(|v| v.fields.is_empty())
-                    }
+                    &TyKind::Adt(a, _) => self.p.adt(a).is_fieldless_enum(),
                     TyKind::Param(_) => traits::implements_builtin(self.p, x.ty, Lang::Fieldless),
                     _ => false,
                 };
@@ -1946,8 +1943,7 @@ impl<'p> Checker<'p> {
     /// The enum `ty` is, if its variants hold nothing.
     fn fieldless_enum(&self, ty: TyId) -> Option<AdtId> {
         let &TyKind::Adt(a, _) = self.kind(ty) else { return None };
-        let adt = self.p.adt(a);
-        (adt.is_enum() && adt.variants().iter().all(|v| v.fields.is_empty())).then_some(a)
+        self.p.adt(a).is_fieldless_enum().then_some(a)
     }
 
     /// `E::from_u32(n)`, for an enum `ty` whose variants hold nothing (§3): `Some` of the variant
@@ -2900,13 +2896,7 @@ impl<'p> Checker<'p> {
 
     /// `GpuBuffer`'s method `name`.
     fn buffer_method(&self, name: &str) -> Option<FnId> {
-        let a = self.p.lang_adt(Lang::GpuBuffer)?;
-        let impls = self.p.inherent_impls.get(&a)?;
-        impls
-            .iter()
-            .flat_map(|&i| &self.p.impl_(i).methods)
-            .copied()
-            .find(|&f| self.p.func(f).name == name)
+        self.p.inherent_method(self.p.lang_adt(Lang::GpuBuffer)?, name)
     }
 
     /// Arguments checked by themselves, for what they say, when there's no function to check
@@ -2914,6 +2904,18 @@ impl<'p> Checker<'p> {
     fn check_args_alone(&mut self, args: &[ast::Arg]) {
         for a in args {
             self.check_expr(&a.value, None);
+        }
+    }
+
+    /// What a command records of `r` (§12): its shader, and for an entry point named there, the
+    /// arguments it binds ([`Self::bind_args`], which `skip` is for).
+    fn record(&mut self, r: Recorded, skip: Option<TyId>) -> (Shader, Vec<(usize, Expr)>) {
+        match r {
+            Recorded::Named(b) => {
+                let args = self.bind_args(&b, skip);
+                (Shader::Named(b.func, b.gen_args), args)
+            }
+            Recorded::Value(x, _) => (Shader::Value(Box::new(x)), Vec::new()),
         }
     }
 
@@ -3303,13 +3305,11 @@ impl<'p> Checker<'p> {
             self.check_args_alone(&args[1..]);
             return self.error_expr(span);
         };
-        let (kernel, kernel_fn, kernel_args) = match recorded {
-            Recorded::Named(b) => {
-                let xs = self.bind_args(&b, None);
-                (Shader::Named(b.func, b.gen_args), Some(b.func), xs)
-            }
-            Recorded::Value(x, v) => (Shader::Value(Box::new(x)), v.func, Vec::new()),
+        let kernel_fn = match &recorded {
+            Recorded::Named(b) => Some(b.func),
+            Recorded::Value(_, v) => v.func,
         };
+        let (kernel, kernel_args) = self.record(recorded, None);
         let mut groups: Option<Expr> = None;
         let mut indirect = false;
         let mut over = false;
@@ -3402,16 +3402,7 @@ impl<'p> Checker<'p> {
         // A kernel known only as a bound kernel's type is checked when lowering knows it.
         let Some(kernel) = kernel else { return };
         if crate::gpu::shares_memory(self.p, kernel) {
-            let name = self.p.func(kernel).name.clone();
-            self.err(
-                Diagnostic::new(
-                    codes::E0603,
-                    e.span,
-                    format!("`{name}` shares workgroup memory, so it isn't dispatched over a domain"),
-                )
-                .with_note("its invocations past the domain would still reach its barriers, and what they add to the memory is the kernel's to decide")
-                .with_help("dispatch it by `groups:`, and check its `GlobalId` against what it covers"),
-            );
+            self.err(crate::gpu::shared_over_domain(self.p, kernel, e.span));
         }
     }
 
@@ -3507,21 +3498,12 @@ impl<'p> Checker<'p> {
                 }
             }
         }
-        let mut bound: Vec<(usize, usize, Expr)> = Vec::new();
-        let vertex = match vs {
-            Recorded::Named(b) => {
-                bound.extend(self.bind_args(&b, None).into_iter().map(|(i, x)| (0, i, x)));
-                Shader::Named(b.func, b.gen_args)
-            }
-            Recorded::Value(x, _) => Shader::Value(Box::new(x)),
-        };
-        let fragment = match fs {
-            Recorded::Named(b) => {
-                bound.extend(self.bind_args(&b, varyings).into_iter().map(|(i, x)| (1, i, x)));
-                Shader::Named(b.func, b.gen_args)
-            }
-            Recorded::Value(x, _) => Shader::Value(Box::new(x)),
-        };
+        let (vertex, vargs) = self.record(vs, None);
+        let (fragment, fargs) = self.record(fs, varyings);
+        // Each argument with its entry point (0 the vertex shader, 1 the fragment shader).
+        let bound: Vec<(usize, usize, Expr)> = (vargs.into_iter().map(|(i, x)| (0, i, x)))
+            .chain(fargs.into_iter().map(|(i, x)| (1, i, x)))
+            .collect();
         let mut vertices = None;
         let mut instances = None;
         let mut indirect: Option<Box<Expr>> = None;
@@ -3602,9 +3584,10 @@ impl<'p> Checker<'p> {
                 }
                 "depth" => {
                     if let Some(c) = self.render_constant(&a.value, Lang::Depth) {
-                        use wrela_abi::manifest::DepthState;
-                        // `std::gpu::Compare`'s variants, in order, then the write flag.
-                        let compare = DEPTH_COMPARES[(c[0] as usize).min(DEPTH_COMPARES.len() - 1)];
+                        use wrela_abi::manifest::{Compare, DepthState};
+                        // `std::gpu::Compare`'s variants, in the order std declares them (as
+                        // the manifest's), then the write flag.
+                        let compare = Compare::ALL[(c[0] as usize).min(Compare::ALL.len() - 1)];
                         state.depth = DepthState { compare, write: c[1] != 0.0 };
                     }
                 }
@@ -3774,12 +3757,6 @@ impl<'p> Checker<'p> {
     }
 }
 
-/// `std::gpu::Compare`'s variants, in the order std declares them, as the manifest names them.
-const DEPTH_COMPARES: [wrela_abi::manifest::Compare; 8] = {
-    use wrela_abi::manifest::Compare::*;
-    [Less, LessEqual, Greater, GreaterEqual, Equal, NotEqual, Always, Never]
-};
-
 /// A `const` of a draw's state type (`Lang::Cull`, `Lang::DepthBias` or `Lang::Depth`, the ADT
 /// `a`), as its declaration writes it: a variant, a struct of number literals, maybe negated,
 /// or a `Depth` of a `Compare` variant and a bool, its defaults filling what it leaves out
@@ -3808,29 +3785,23 @@ fn declared_render_constant(
             Some([v as f64, 0.0, 0.0])
         }
         (ast::ExprKind::StructLit { fields, base: None, .. }, Lang::Depth) => {
-            /// A `Compare` variant's index, or a bool literal as 0 or 1.
-            fn plain(e: &ast::Expr) -> Option<f64> {
-                match &e.kind {
-                    ast::ExprKind::Path(path) => {
-                        let name = &path.segments.last()?.ident.name;
-                        let names = [
-                            "Less",
-                            "LessEqual",
-                            "Greater",
-                            "GreaterEqual",
-                            "Equal",
-                            "NotEqual",
-                            "Always",
-                            "Never",
-                        ];
-                        names.iter().position(|n| n == name).map(|i| i as f64)
-                    }
-                    ast::ExprKind::Lit(ast::Lit { kind: ast::LitKind::Bool(b), .. }) => {
-                        Some(if *b { 1.0 } else { 0.0 })
-                    }
-                    _ => None,
+            // `Compare`: the type of the field that's an enum.
+            let compare = adt.fields().iter().find_map(|f| match p.types.kind(f.ty) {
+                &TyKind::Adt(e, _) if p.adt(e).is_enum() => Some(p.adt(e)),
+                _ => None,
+            })?;
+            // A `Compare` variant's index, or a bool literal as 0 or 1.
+            let plain = |e: &ast::Expr| match &e.kind {
+                ast::ExprKind::Path(path) => {
+                    let name = &path.segments.last()?.ident.name;
+                    let v = compare.variants().iter().position(|v| &v.name == name)?;
+                    Some(v as f64)
                 }
-            }
+                ast::ExprKind::Lit(ast::Lit { kind: ast::LitKind::Bool(b), .. }) => {
+                    Some(if *b { 1.0 } else { 0.0 })
+                }
+                _ => None,
+            };
             let mut out = [0.0; 3];
             for (k, d) in adt.fields().iter().enumerate() {
                 let given = fields.iter().find(|f| f.name.name == d.name);

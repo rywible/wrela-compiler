@@ -690,11 +690,7 @@ impl<'p> Checker<'p> {
 
     /// Whether a type has an inherent associated function or method of this name.
     pub(crate) fn has_associated_fn(&self, a: AdtId, name: &str) -> bool {
-        self.p.inherent_impls.get(&a).is_some_and(|impls| {
-            impls
-                .iter()
-                .any(|&i| self.p.impl_(i).methods.iter().any(|&f| self.p.func(f).name == name))
-        })
+        self.p.inherent_method(a, name).is_some()
     }
 
     /// An ADT's generic arguments for a path: explicit (`Option::<u32>::None`), or fresh
@@ -913,10 +909,7 @@ impl<'p> Checker<'p> {
             self.p.types.intern(TyKind::Str)
         } else {
             let builtin = match self.kind(ta) {
-                TyKind::Adt(adt, _) => {
-                    let def = self.p.adt(*adt);
-                    !ordered && def.is_enum() && def.variants().iter().all(|v| v.fields.is_empty())
-                }
+                TyKind::Adt(adt, _) => !ordered && self.p.adt(*adt).is_fieldless_enum(),
                 TyKind::Param(_) | TyKind::Tuple(_) | TyKind::Array(..) | TyKind::ArrayN(..) => {
                     false
                 }
@@ -1082,11 +1075,7 @@ impl<'p> Checker<'p> {
                     TyKind::Int(_) | TyKind::Float(_) => true,
                     TyKind::Var(_) => self.is_number_var(a),
                     TyKind::Bool | TyKind::Vec(..) => !ordered,
-                    &TyKind::Adt(adt, _) => {
-                        !ordered
-                            && self.p.adt(adt).is_enum()
-                            && self.p.adt(adt).variants().iter().all(|v| v.fields.is_empty())
-                    }
+                    &TyKind::Adt(adt, _) => !ordered && self.p.adt(adt).is_fieldless_enum(),
                     _ => false,
                 };
                 if !ok {
@@ -1320,48 +1309,12 @@ impl<'p> Checker<'p> {
             // Its error is reported.
             (TyKind::Error, _) | (_, ast::FieldName::BadIndex(_)) => self.error_expr(span),
             (&TyKind::Adt(a, ref args), ast::FieldName::Ident(n)) if !self.p.adt(a).is_enum() => {
-                let fields = self.p.adt(a).fields();
-                match fields.iter().position(|f| f.name == n.name) {
+                match self.struct_field(a, n) {
                     Some(i) => {
-                        let f = &fields[i];
-                        let adt_mod = self.p.adt(a).module;
-                        if self.field_hidden(adt_mod, f) {
-                            self.err(
-                                Diagnostic::new(
-                                    codes::E0210,
-                                    n.span,
-                                    format!(
-                                        "the field `{}` of `{}` is private",
-                                        n.name,
-                                        self.p.adt(a).name
-                                    ),
-                                )
-                                .with_secondary(f.span, "declared here without `pub`"),
-                            );
-                        }
                         let ty = self.p.field_ty(a, args, None, i).unwrap_or(self.p.types.error);
                         Expr { ty, span, kind: ExprKind::Field(Box::new(b), i as u32) }
                     }
-                    None => {
-                        let mut d = Diagnostic::new(
-                            codes::E0206,
-                            n.span,
-                            format!("`{}` has no field `{}`", self.p.adt(a).name, n.name),
-                        );
-                        if let Some(s) =
-                            resolve::closest(&n.name, fields.iter().map(|f| f.name.as_str()))
-                        {
-                            d = d.with_fix(format!("did you mean `{s}`?"), n.span, s);
-                        } else {
-                            let names: Vec<String> =
-                                fields.iter().map(|f| format!("`{}`", f.name)).collect();
-                            if !names.is_empty() {
-                                d = d.with_note(format!("its fields are {}", names.join(", ")));
-                            }
-                        }
-                        self.err(d);
-                        self.error_expr(span)
-                    }
+                    None => self.error_expr(span),
                 }
             }
             (TyKind::Tuple(ts), ast::FieldName::Index(i, s)) => match ts.get(*i as usize) {
@@ -1453,6 +1406,41 @@ impl<'p> Checker<'p> {
         }
     }
 
+    /// Field `n` of struct `a`: its index, or `None` if it has none (E0206, reported). A field
+    /// hidden from here is reported (E0210), and its index given.
+    fn struct_field(&mut self, a: AdtId, n: &ast::Ident) -> Option<usize> {
+        let fields = self.p.adt(a).fields();
+        let Some(i) = fields.iter().position(|f| f.name == n.name) else {
+            let mut d = Diagnostic::new(
+                codes::E0206,
+                n.span,
+                format!("`{}` has no field `{}`", self.p.adt(a).name, n.name),
+            );
+            if let Some(s) = resolve::closest(&n.name, fields.iter().map(|f| f.name.as_str())) {
+                d = d.with_fix(format!("did you mean `{s}`?"), n.span, s);
+            } else {
+                let names: Vec<String> = fields.iter().map(|f| format!("`{}`", f.name)).collect();
+                if !names.is_empty() {
+                    d = d.with_note(format!("its fields are {}", names.join(", ")));
+                }
+            }
+            self.err(d);
+            return None;
+        };
+        let f = &fields[i];
+        if self.field_hidden(self.p.adt(a).module, f) {
+            self.err(
+                Diagnostic::new(
+                    codes::E0210,
+                    n.span,
+                    format!("the field `{}` of `{}` is private", n.name, self.p.adt(a).name),
+                )
+                .with_secondary(f.span, "declared here without `pub`"),
+            );
+        }
+        Some(i)
+    }
+
     /// `f.name`, `f` a `GpuField<S, T>` and `T` a struct: its field's `GpuField`, through
     /// `std::gpu::field_at`, which adds the field's offset in `T`'s layout.
     fn gpu_field(&mut self, f: Expr, outer: TyId, inner: TyId, n: &ast::Ident, span: Span) -> Expr {
@@ -1465,10 +1453,7 @@ impl<'p> Checker<'p> {
             ));
             return self.error_expr(span);
         };
-        let fields = self.p.adt(a).fields();
-        let Some(i) =
-            fields.iter().position(|f| f.name == n.name).filter(|_| !self.p.adt(a).is_enum())
-        else {
+        if self.p.adt(a).is_enum() {
             let name = self.p.adt(a).name.clone();
             self.err(Diagnostic::new(
                 codes::E0206,
@@ -1476,15 +1461,8 @@ impl<'p> Checker<'p> {
                 format!("`{name}` has no field `{}`", n.name),
             ));
             return self.error_expr(span);
-        };
-        if self.field_hidden(self.p.adt(a).module, &fields[i]) {
-            let name = self.p.adt(a).name.clone();
-            self.err(Diagnostic::new(
-                codes::E0210,
-                n.span,
-                format!("the field `{}` of `{name}` is private", n.name),
-            ));
         }
+        let Some(i) = self.struct_field(a, n) else { return self.error_expr(span) };
         let ft = self.p.field_ty(a, &targs, None, i).unwrap_or(self.p.types.error);
         let (Some(at), Some(gf)) =
             (self.p.lang_fn(Lang::GpuFieldAt), self.p.lang_adt(Lang::GpuField))
@@ -1720,43 +1698,41 @@ impl<'p> Checker<'p> {
         }
     }
 
+    /// The `u32` literal `v`, at `span`.
+    pub(crate) fn u32_lit(&self, v: u64, span: Span) -> Expr {
+        Expr { ty: self.p.types.u32, span, kind: ExprKind::Lit(Lit::Int(i128::from(v))) }
+    }
+
+    /// `a op b`, `u32`s both, at `span`.
+    pub(crate) fn u32_bin(&self, op: ast::BinOp, a: Expr, b: Expr, span: Span) -> Expr {
+        Expr { ty: self.p.types.u32, span, kind: ExprKind::Binary(op, Box::new(a), Box::new(b)) }
+    }
+
     /// Field `f` of `base`, a `Packed` struct (§3): its bits of the word, as a `u32`.
     pub(crate) fn packed_read(&self, base: Expr, f: &PackedField, span: Span) -> Expr {
         let u = self.p.types.u32;
         let word = Expr { ty: u, span: base.span, kind: ExprKind::Field(Box::new(base), 0) };
-        let lit = |v: u64| Expr { ty: u, span, kind: ExprKind::Lit(Lit::Int(i128::from(v))) };
         let shifted = if f.shift == 0 {
             word
         } else {
-            let k = lit(u64::from(f.shift));
-            Expr {
-                ty: u,
-                span,
-                kind: ExprKind::Binary(ast::BinOp::Shr, Box::new(word), Box::new(k)),
-            }
+            self.u32_bin(ast::BinOp::Shr, word, self.u32_lit(u64::from(f.shift), span), span)
         };
         if f.width == 32 {
             return shifted;
         }
-        let mask = lit((1u64 << f.width) - 1);
-        Expr {
-            ty: u,
-            span,
-            kind: ExprKind::Binary(ast::BinOp::BitAnd, Box::new(shifted), Box::new(mask)),
-        }
+        let mask = self.u32_lit(u64::from(f.mask() >> f.shift), span);
+        self.u32_bin(ast::BinOp::BitAnd, shifted, mask, span)
     }
 
     /// `v`, a `u32`, fitted to `width` bits of a `Packed` field and moved to `shift` (§3).
     pub(crate) fn packed_bits(&self, v: Expr, width: u32, shift: u32, span: Span) -> Expr {
-        let u = self.p.types.u32;
-        let lit = |v: u64| Expr { ty: u, span, kind: ExprKind::Lit(Lit::Int(i128::from(v))) };
         let fit = match self.p.lang_fn(Lang::PackedFit) {
             Some(func) if width < 32 => Expr {
-                ty: u,
+                ty: self.p.types.u32,
                 span,
                 kind: ExprKind::Call(Call {
                     callee: Callee::Fn { func, args: Vec::new() },
-                    args: vec![v, lit(u64::from(width))],
+                    args: vec![v, self.u32_lit(u64::from(width), span)],
                     modes: vec![Mode::Borrow, Mode::Borrow],
                     receiver: false,
                     order: vec![0, 1],
@@ -1768,8 +1744,7 @@ impl<'p> Checker<'p> {
         if shift == 0 {
             return fit;
         }
-        let k = lit(u64::from(shift));
-        Expr { ty: u, span, kind: ExprKind::Binary(ast::BinOp::Shl, Box::new(fit), Box::new(k)) }
+        self.u32_bin(ast::BinOp::Shl, fit, self.u32_lit(u64::from(shift), span), span)
     }
 
     /// A `Packed` struct's literal (§3): its word, each field's bits in it, in the order written.
@@ -1818,37 +1793,22 @@ impl<'p> Checker<'p> {
             let bits = self.packed_bits(v, view.width, view.shift, f.span);
             word = Some(match word {
                 None => bits,
-                Some(w) => Expr {
-                    ty: u,
-                    span,
-                    kind: ExprKind::Binary(ast::BinOp::BitOr, Box::new(w), Box::new(bits)),
-                },
+                Some(w) => self.u32_bin(ast::BinOp::BitOr, w, bits, span),
             });
         }
-        let lit = |v: u64| Expr { ty: u, span, kind: ExprKind::Lit(Lit::Int(i128::from(v))) };
         let missing: Vec<&PackedField> =
             views.iter().filter(|v| !given.contains(&v.name)).collect();
         let word = match base {
             Some(b) => {
                 // The base's word, with the given fields' bits cleared.
                 let b = self.check_expect(b, ty);
-                let kept: u64 = missing
-                    .iter()
-                    .map(|v| (((1u64 << v.width) - 1) << v.shift) & 0xffff_ffff)
-                    .fold(0, |a, m| a | m);
+                let kept = missing.iter().fold(0, |a, v| a | v.mask());
                 let bw = Expr { ty: u, span: b.span, kind: ExprKind::Field(Box::new(b), 0) };
-                let base_bits = Expr {
-                    ty: u,
-                    span,
-                    kind: ExprKind::Binary(ast::BinOp::BitAnd, Box::new(bw), Box::new(lit(kept))),
-                };
+                let kept = self.u32_lit(u64::from(kept), span);
+                let base_bits = self.u32_bin(ast::BinOp::BitAnd, bw, kept, span);
                 match word {
                     None => base_bits,
-                    Some(w) => Expr {
-                        ty: u,
-                        span,
-                        kind: ExprKind::Binary(ast::BinOp::BitOr, Box::new(w), Box::new(base_bits)),
-                    },
+                    Some(w) => self.u32_bin(ast::BinOp::BitOr, w, base_bits, span),
                 }
             }
             None => {
@@ -1861,7 +1821,7 @@ impl<'p> Checker<'p> {
                         format!("this `{}` is missing {}", self.p.adt(adt).name, names.join(", ")),
                     ));
                 }
-                word.unwrap_or_else(|| lit(0))
+                word.unwrap_or_else(|| self.u32_lit(0, span))
             }
         };
         let kind = ExprKind::Adt {
@@ -2200,15 +2160,11 @@ impl<'p> Checker<'p> {
         else {
             return self.error_expr(span);
         };
-        let method =
-            |name: &str| {
-                p.inherent_impls.get(&string).into_iter().flatten().find_map(|&i| {
-                    p.impl_(i).methods.iter().copied().find(|&f| p.func(f).name == name)
-                })
-            };
-        let (Some(new_fn), Some(push_fn), Some(format_fn)) =
-            (method("new"), method("push_str"), crate::traits::trait_method(p, format, "format"))
-        else {
+        let (Some(new_fn), Some(push_fn), Some(format_fn)) = (
+            p.inherent_method(string, "new"),
+            p.inherent_method(string, "push_str"),
+            crate::traits::trait_method(p, format, "format"),
+        ) else {
             return self.error_expr(span);
         };
         let string_ty = p.types.adt(string, Vec::new());

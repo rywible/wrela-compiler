@@ -837,8 +837,7 @@ fn state_type(checked: &Checked) -> Option<(FnId, TyId)> {
 /// discriminant (§3).
 fn fieldless_enum(p: &wrela_sema::program::Program, t: TyId) -> Option<wrela_sema::ty::AdtId> {
     let &TyKind::Adt(a, _) = p.types.kind(t) else { return None };
-    let adt = p.adt(a);
-    (adt.is_enum() && adt.variants().iter().all(|v| v.fields.is_empty())).then_some(a)
+    p.adt(a).is_fieldless_enum().then_some(a)
 }
 
 /// An export whose enum parameters cross as their `u32` discriminants: it makes each enum from

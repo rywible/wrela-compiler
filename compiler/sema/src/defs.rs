@@ -139,6 +139,13 @@ pub struct PackedField {
     pub span: Span,
 }
 
+impl PackedField {
+    /// Its bits of the word: `width` ones from bit `shift`.
+    pub fn mask(&self) -> u32 {
+        ((((1u64 << self.width) - 1) << self.shift) & 0xffff_ffff) as u32
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VariantShape {
     Unit,
@@ -505,6 +512,10 @@ pub struct AdtDef {
 impl AdtDef {
     pub fn is_enum(&self) -> bool {
         matches!(self.kind, AdtKind::Enum(_))
+    }
+    /// Whether it's an enum whose variants hold nothing (§3).
+    pub fn is_fieldless_enum(&self) -> bool {
+        self.is_enum() && self.variants().iter().all(|v| v.fields.is_empty())
     }
     pub fn fields(&self) -> &[FieldDef] {
         match &self.kind {

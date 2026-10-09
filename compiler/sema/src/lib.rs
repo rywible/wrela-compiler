@@ -223,51 +223,22 @@ fn check(
 /// start with `_` aren't reported. Run only on a program with no errors, whose every body has
 /// its memory IR, which says what it uses.
 fn unused_items(p: &Program, mir: &BTreeMap<ty::FnId, mir::Body>) -> Vec<Diagnostic> {
-    use mir::{Callee, Rvalue, Shader, StatementKind};
     let mut fns = std::collections::HashSet::new();
     let mut consts = std::collections::HashSet::new();
     for (&owner, body) in mir {
-        for code in &body.fns {
-            for s in code.blocks.iter().flat_map(|b| &b.stmts) {
-                let r = match &s.kind {
-                    StatementKind::Assign(_, r) | StatementKind::Eval(r) => r,
-                    _ => continue,
-                };
-                let mut used = |f: ty::FnId| {
-                    if f != owner {
-                        fns.insert(f);
-                    }
-                };
-                match r {
-                    Rvalue::Call(c) => match &c.callee {
-                        Callee::Fn { func, .. } => used(*func),
-                        Callee::TraitMethod { method, .. } => used(*method),
-                        _ => {}
-                    },
-                    Rvalue::FnRef(f, _) => used(*f),
-                    Rvalue::Dispatch(d) => {
-                        if let Shader::Named(f, _) = d.kernel {
-                            used(f);
-                        }
-                    }
-                    Rvalue::Draw(d) => {
-                        for sh in [&d.vertex, &d.fragment] {
-                            if let Shader::Named(f, _) = sh {
-                                used(*f);
-                            }
-                        }
-                    }
-                    Rvalue::BorrowStruct { adt, .. } => {
-                        if let Some(f) = p.adt(*adt).entry {
-                            used(f);
-                        }
-                    }
-                    Rvalue::Const(c) => {
-                        consts.insert(*c);
-                    }
-                    _ => {}
-                }
+        // Std's code can't name the program's private items.
+        if p.is_std(p.func(owner).module) {
+            continue;
+        }
+        for (s, r) in mir::rvalues(body) {
+            if let mir::Rvalue::Const(c) = r {
+                consts.insert(*c);
             }
+            mir::fn_uses(p, s, r, |u, _| {
+                if u.func() != owner {
+                    fns.insert(u.func());
+                }
+            });
         }
     }
     let mut out = Vec::new();

@@ -271,6 +271,12 @@ fn buffer_helper(
     mb.m.add_function(f)
 }
 
+/// The literal buffer's generation, in its state `state` (`LiteralBuffer`): one more each time
+/// the table changes.
+fn generation(state: ir::DataId) -> ir::Place {
+    ir::Place { root: ir::PlaceRoot::Data(state), path: vec![ir::Proj::Field(1)] }
+}
+
 /// `__lift_set(i, value)`, exported: what a host calls to change literal `i` (a tool's edit,
 /// hot reload), as `std::lift::set` does. An index past the last changes nothing.
 fn set_export(mb: &mut ModuleBuilder, table: ir::DataId, state: ir::DataId, n: u32) -> ir::FuncId {
@@ -292,7 +298,7 @@ fn set_export(mb: &mut ModuleBuilder, table: ir::DataId, state: ir::DataId, n: u
         ir::Place { root: ir::PlaceRoot::Data(table), path: vec![ir::Proj::Index(i)] },
         v,
     ));
-    let counter = ir::Place { root: ir::PlaceRoot::Data(state), path: vec![ir::Proj::Field(1)] };
+    let counter = generation(state);
     let g = f.let_(&mut set, u, ir::Expr::Load(counter.clone()));
     let one = f.let_(&mut set, u, ir::Expr::Const(ir::Const::U32(1)));
     let next = f.let_(&mut set, u, ir::Expr::Binary(ir::BinOp::WrappingAdd, g, one));
@@ -339,10 +345,7 @@ pub(crate) fn intrinsic(
             if let Some(t) = table {
                 fl.emit(ir::Stmt::Store(at(ir::PlaceRoot::Data(t.table), i), v));
                 // One more change for the GPU's copy to catch up with.
-                let counter = ir::Place {
-                    root: ir::PlaceRoot::Data(t.state),
-                    path: vec![ir::Proj::Field(1)],
-                };
+                let counter = generation(t.state);
                 let g = fl.value(u, ir::Expr::Load(counter.clone()));
                 let one = fl.u32c(1);
                 let next = fl.value(u, ir::Expr::Binary(ir::BinOp::WrappingAdd, g, one));
@@ -353,11 +356,7 @@ pub(crate) fn intrinsic(
         Lang::LiftGeneration => match table {
             // The state's counter starts at 1, so the first upload happens.
             Some(t) => {
-                let counter = ir::Place {
-                    root: ir::PlaceRoot::Data(t.state),
-                    path: vec![ir::Proj::Field(1)],
-                };
-                let g = fl.value(u, ir::Expr::Load(counter));
+                let g = fl.value(u, ir::Expr::Load(generation(t.state)));
                 let one = fl.u32c(1);
                 Some(fl.value(u, ir::Expr::Binary(ir::BinOp::WrappingSub, g, one)))
             }

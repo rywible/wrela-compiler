@@ -774,7 +774,7 @@ fn calls_of(root: &Path, func: &str) -> Result<Calls, Refusal> {
         let mut calls = Vec::new();
         let mut values = Vec::new();
         for body in checked.mir.values() {
-            for (s, r) in crate::query::rvalues(body) {
+            for (s, r) in wrela_sema::mir::rvalues(body) {
                 match r {
                     Rvalue::Call(c) => {
                         let hit = match &c.callee {

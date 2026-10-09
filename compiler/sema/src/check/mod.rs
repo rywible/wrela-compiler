@@ -612,6 +612,11 @@ impl<'p> Checker<'p> {
             return s;
         }
         let place = self.check_expr(target, None);
+        self.assign_to(place, op, value, span)
+    }
+
+    /// `place op value`, its place checked already.
+    fn assign_to(&mut self, place: Expr, op: ast::AssignOp, value: &ast::Expr, span: Span) -> Stmt {
         self.check_assign_target(&place);
         self.mark_written(&place);
         let bin = op.binop();
@@ -632,7 +637,9 @@ impl<'p> Checker<'p> {
     }
 
     /// `p.f = v` or `p.f op= v` for a `Packed` struct's field `f` (§3): the word, projected
-    /// once, with `f`'s bits replaced. `None` if `target` isn't one.
+    /// once, with `f`'s bits replaced. A field of any other base is assigned as
+    /// [`Self::check_assign`] assigns it. `None` if `target` isn't a named field, or names one
+    /// the `Packed` struct doesn't have (reported).
     fn packed_assign(
         &mut self,
         target: &ast::Expr,
@@ -646,12 +653,13 @@ impl<'p> Checker<'p> {
         // Only a `Packed` struct's: a quiet look at the base's type first.
         let b = self.check_expr(base, None);
         let bt = self.infer.resolve(&self.p.types, b.ty);
-        let &TyKind::Adt(a, _) = self.kind(bt) else {
-            return Some(self.assign_checked_base(b, n, op, value, span));
+        let a = match self.kind(bt) {
+            &TyKind::Adt(a, _) if self.p.packed.contains_key(&a) => a,
+            _ => {
+                let place = self.field_of_checked(b, &ast::FieldName::Ident(n.clone()), span);
+                return Some(self.assign_to(place, op, value, span));
+            }
         };
-        if !self.p.packed.contains_key(&a) {
-            return Some(self.assign_checked_base(b, n, op, value, span));
-        }
         let f = self.packed_field(a, n)?;
         self.check_assign_target(&b);
         self.mark_written(&b);
@@ -667,23 +675,18 @@ impl<'p> Checker<'p> {
             Some(bin) => {
                 let v = self.check_expect(value, u);
                 let old = self.packed_read(p(), &f, span);
-                Expr { ty: u, span, kind: ExprKind::Binary(bin, Box::new(old), Box::new(v)) }
+                self.u32_bin(bin, old, v, span)
             }
         };
         let bits = self.packed_bits(v, f.width, f.shift, span);
-        let cleared = !((((1u64 << f.width) - 1) << f.shift) & 0xffff_ffff) & 0xffff_ffff;
         let word = || Expr { ty: u, span: at, kind: ExprKind::Field(Box::new(p()), 0) };
-        let k = Expr { ty: u, span, kind: ExprKind::Lit(Lit::Int(i128::from(cleared))) };
-        let kept = Expr {
-            ty: u,
+        let kept = self.u32_bin(
+            ast::BinOp::BitAnd,
+            word(),
+            self.u32_lit(u64::from(!f.mask()), span),
             span,
-            kind: ExprKind::Binary(ast::BinOp::BitAnd, Box::new(word()), Box::new(k)),
-        };
-        let new = Expr {
-            ty: u,
-            span,
-            kind: ExprKind::Binary(ast::BinOp::BitOr, Box::new(kept), Box::new(bits)),
-        };
+        );
+        let new = self.u32_bin(ast::BinOp::BitOr, kept, bits, span);
         let assign = Stmt { kind: StmtKind::Assign { place: word(), op: None, value: new }, span };
         let unit = self.p.types.unit;
         let block = Block { stmts: vec![bind, assign], tail: None, ty: unit, span };
@@ -691,36 +694,6 @@ impl<'p> Checker<'p> {
             kind: StmtKind::Expr(Expr { ty: unit, span, kind: ExprKind::Block(block) }),
             span,
         })
-    }
-
-    /// An assignment to field `n` of `b`, whose base is checked already: as `check_assign`
-    /// does, for a base that isn't a `Packed` struct.
-    fn assign_checked_base(
-        &mut self,
-        b: Expr,
-        n: &ast::Ident,
-        op: ast::AssignOp,
-        value: &ast::Expr,
-        span: Span,
-    ) -> Stmt {
-        let fname = ast::FieldName::Ident(n.clone());
-        let place = self.field_of_checked(b, &fname, span);
-        self.check_assign_target(&place);
-        self.mark_written(&place);
-        let bin = op.binop();
-        let value = match bin {
-            None => self.check_expect(value, place.ty),
-            Some(bop) => {
-                let hint = self.right_hint(bop, place.ty);
-                let v = self.check_expr(value, Some(hint));
-                let result = self.binary_result(bop, place.ty, v.ty, span);
-                if let Some(r) = result {
-                    self.expect(r, place.ty, span);
-                }
-                v
-            }
-        };
-        Stmt { kind: StmtKind::Assign { place, op: bin, value }, span }
     }
 
     /// The locals the environment has bound after its first `len` names, in order.

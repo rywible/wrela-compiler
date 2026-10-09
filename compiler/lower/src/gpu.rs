@@ -737,16 +737,7 @@ fn record_dispatch(fl: &mut Fl, d: &mir::Dispatch, span: Span) -> Option<()> {
         && kernel.value.is_some()
         && wrela_sema::gpu::shares_memory(&fl.cx.checked.program, kernel.func)
     {
-        let name = fl.cx.checked.program.func(kernel.func).name.clone();
-        fl.cx.err(
-            Diagnostic::new(
-                codes::E0603,
-                span,
-                format!("`{name}` shares workgroup memory, so it isn't dispatched over a domain"),
-            )
-            .with_note("its invocations past the domain would still reach its barriers, and what they add to the memory is the kernel's to decide")
-            .with_help("dispatch it by `groups:`, and check its `GlobalId` against what it covers"),
-        );
+        fl.cx.err(wrela_sema::gpu::shared_over_domain(&fl.cx.checked.program, kernel.func, span));
         return None;
     }
     let key =

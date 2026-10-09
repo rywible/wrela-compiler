@@ -33,6 +33,19 @@ pub fn shares_memory(p: &Program, f: FnId) -> bool {
     p.func(f).params.iter().any(|ps| p.lang_of_ty(ps.ty) == Some(Lang::Shared))
 }
 
+/// E0603: kernel `f`, which shares workgroup memory ([`shares_memory`]), dispatched over a
+/// domain at `span`.
+pub fn shared_over_domain(p: &Program, f: FnId, span: wrela_diag::Span) -> Diagnostic {
+    let name = &p.func(f).name;
+    Diagnostic::new(
+        codes::E0603,
+        span,
+        format!("`{name}` shares workgroup memory, so it isn't dispatched over a domain"),
+    )
+    .with_note("its invocations past the domain would still reach its barriers, and what they add to the memory is the kernel's to decide")
+    .with_help("dispatch it by `groups:`, and check its `GlobalId` against what it covers")
+}
+
 /// Whether parameter `t` of an entry point of stage `entry` is a fragment shader's input from
 /// the vertex shader: a struct with a `ClipPosition` field.
 pub fn is_varyings(p: &Program, entry: Entry, t: TyId) -> bool {
@@ -238,6 +251,23 @@ pub fn not_gpu_data(p: &Program, param: &str, ty: TyId, span: wrela_diag::Span) 
     d
 }
 
+/// E0604 for the elements `param` holds, of type `elem`, unless they're `GpuData` (or the type
+/// waits on type parameters): `message` says what holds them, from `elem` as shown.
+fn elems_not_gpu_data(
+    p: &Program,
+    param: &str,
+    elem: TyId,
+    span: wrela_diag::Span,
+    message: impl FnOnce(&str) -> String,
+) -> Option<Diagnostic> {
+    if p.types.has_params(elem) || crate::traits::implements_builtin(p, elem, Lang::GpuData) {
+        return None;
+    }
+    let mut d = not_gpu_data(p, param, elem, span);
+    d.message = message(&p.display_ty(elem));
+    Some(d)
+}
+
 /// Whether `t` is a group (§12): a borrow struct (not one std gives a meaning, as `GpuSpan`),
 /// which GPU code takes as its fields: their bindings and values.
 pub fn is_group(p: &Program, t: TyId) -> bool {
@@ -281,15 +311,10 @@ fn check_group(
         } else if lang == Some(Lang::GpuSpan) {
             if let TyKind::Adt(_, sargs) = p.types.kind(ft)
                 && let Some(&elem) = sargs.first()
-                && !p.types.has_params(elem)
-                && !crate::traits::implements_builtin(p, elem, Lang::GpuData)
             {
-                let mut d = not_gpu_data(p, &at, elem, span);
-                d.message = format!(
-                    "`{at}` is a span of `{}`, which isn't `GpuData`, so its elements can't go to the GPU",
-                    p.display_ty(elem)
-                );
-                out.push(d);
+                out.extend(elems_not_gpu_data(p, &at, elem, span, |e| {
+                    format!("`{at}` is a span of `{e}`, which isn't `GpuData`, so its elements can't go to the GPU")
+                }));
             }
         } else if lang.is_some_and(Lang::is_invocation_safe) {
             out.push(Diagnostic::new(
@@ -456,17 +481,13 @@ fn check_entry(p: &Program, f: FnId, entry: Entry, out: &mut Vec<Diagnostic>) {
             out.push(not_gpu_data(p, &ps.name, ps.ty, ps.span));
         }
         // A run is a buffer's elements, which cross to the GPU too.
-        if let TyKind::Slice(elem) = *p.types.kind(ps.ty)
-            && !p.types.has_params(elem)
-            && !crate::traits::implements_builtin(p, elem, Lang::GpuData)
-        {
-            let mut d = not_gpu_data(p, &ps.name, elem, ps.span);
-            d.message = format!(
-                "`{}` is a run of `{}`, which isn't `GpuData`, so its elements can't go to the GPU",
-                ps.name,
-                p.display_ty(elem)
-            );
-            out.push(d);
+        if let TyKind::Slice(elem) = *p.types.kind(ps.ty) {
+            out.extend(elems_not_gpu_data(p, &ps.name, elem, ps.span, |e| {
+                format!(
+                    "`{}` is a run of `{e}`, which isn't `GpuData`, so its elements can't go to the GPU",
+                    ps.name
+                )
+            }));
         }
         // So are a span's and a buffer-backed kernel output's elements: every way to make one
         // bounds them `GpuData`, and this keeps it so whatever makes one. (Workgroup memory,
@@ -477,16 +498,13 @@ fn check_entry(p: &Program, f: FnId, entry: Entry, out: &mut Vec<Diagnostic>) {
                 Some(Lang::GpuSpan | Lang::Slots | Lang::Atomics | Lang::One | Lang::Append)
             )
             && let Some(&elem) = args.first()
-            && !p.types.has_params(elem)
-            && !crate::traits::implements_builtin(p, elem, Lang::GpuData)
         {
-            let mut d = not_gpu_data(p, &ps.name, elem, ps.span);
-            d.message = format!(
-                "`{}` holds `{}`s, which aren't `GpuData`, so they can't be on the GPU",
-                ps.name,
-                p.display_ty(elem)
-            );
-            out.push(d);
+            out.extend(elems_not_gpu_data(p, &ps.name, elem, ps.span, |e| {
+                format!(
+                    "`{}` holds `{e}`s, which aren't `GpuData`, so they can't be on the GPU",
+                    ps.name
+                )
+            }));
         }
         // A fragment shader may count into atomics (a test's tally of what it shaded, say);
         // WebGPU forbids a vertex shader writable storage.

@@ -3140,9 +3140,8 @@ fn check_structural_opt_in(p: &Program, diags: &mut Vec<Diagnostic>, imp: &ImplD
     }
     // `Fieldless` is an enum's whose variants hold nothing (§3).
     if lang == Some(Lang::Fieldless) {
-        let held = adt.variants().iter().find(|v| !v.fields.is_empty());
-        if !adt.is_enum() || held.is_some() {
-            let why = match held {
+        if !adt.is_fieldless_enum() {
+            let why = match adt.variants().iter().find(|v| !v.fields.is_empty()) {
                 Some(v) => format!("its variant `{}` holds fields", v.name),
                 None => "it's a struct".to_string(),
             };

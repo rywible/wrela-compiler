@@ -1120,14 +1120,10 @@ impl<'c, 'a> Fl<'c, 'a> {
                     let whole = ir::Place { root: root.clone(), path: std::mem::take(&mut path) };
                     let at = match lang {
                         Some(Lang::GpuSpan) if !self.is_gpu() => {
-                            self.cx.err(
-                                Diagnostic::new(
-                                    codes::E0607,
-                                    self.here(),
-                                    "a `GpuSpan`'s elements are read in GPU code, and this is CPU code",
-                                )
-                                .with_note("CPU code can't read through a GPU buffer; `std::gpu::read` asks for its elements (§6.13)"),
-                            );
+                            self.cx.err(span_read_on_cpu(
+                                self.here(),
+                                "CPU code can't read through a GPU buffer; `std::gpu::read` asks for its elements (§6.13)",
+                            ));
                             return None;
                         }
                         Some(Lang::Slots) => {
@@ -2036,14 +2032,10 @@ impl<'c, 'a> Fl<'c, 'a> {
                     self.cx.checked.program.lang_of_ty(t) == Some(Lang::GpuSpan)
                 })
             {
-                self.cx.err(
-                    Diagnostic::new(
-                        codes::E0607,
-                        a.span(),
-                        "a `GpuSpan`'s elements are read in GPU code, and this is CPU code",
-                    )
-                    .with_note("a `GpuSpan` passes as a `[T]` on the GPU, where its buffer is; CPU code can't read through it (§6.13)"),
-                );
+                self.cx.err(span_read_on_cpu(
+                    a.span(),
+                    "a `GpuSpan` passes as a `[T]` on the GPU, where its buffer is; CPU code can't read through it (§6.13)",
+                ));
                 return None;
             }
             if self.is_gpu() && crate::gpu::is_resource_param(self, pt) {
@@ -2250,6 +2242,16 @@ impl<'c, 'a> Fl<'c, 'a> {
         };
         Some(self.value(ty, ir::Expr::Builtin(b, args)))
     }
+}
+
+/// E0607: CPU code reads a `GpuSpan`'s elements, at `span`; `note` says why it can't.
+fn span_read_on_cpu(span: Span, note: &str) -> Diagnostic {
+    Diagnostic::new(
+        codes::E0607,
+        span,
+        "a `GpuSpan`'s elements are read in GPU code, and this is CPU code",
+    )
+    .with_note(note)
 }
 
 /// A literal as a constant of the IR type `ty` (a scalar).

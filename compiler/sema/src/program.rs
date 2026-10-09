@@ -174,6 +174,13 @@ impl Program {
         self.impls_of_trait.get(&t).map_or(&[], Vec::as_slice)
     }
 
+    /// `a`'s inherent associated function or method named `name`: the first impl's that has one.
+    pub fn inherent_method(&self, a: AdtId, name: &str) -> Option<FnId> {
+        self.inherent_impls.get(&a).into_iter().flatten().find_map(|&i| {
+            self.impl_(i).methods.iter().copied().find(|&f| self.func(f).name == name)
+        })
+    }
+
     pub fn new_param(&mut self, def: ParamDef) -> ParamId {
         self.params.push(def);
         ParamId(self.params.len() as u32 - 1)

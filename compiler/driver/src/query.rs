@@ -21,7 +21,9 @@ use std::path::Path;
 use wrela_diag::{FileId, SourceFile, Span};
 use wrela_sema::Checked;
 use wrela_sema::defs::{AdtKind, FnOwner};
-use wrela_sema::mir::{self, Arg, Callee, Operand, OperandKind, Rvalue, StatementKind};
+use wrela_sema::mir::{
+    self, Arg, FnUse as Use, Operand, OperandKind, Rvalue, StatementKind, rvalues,
+};
 use wrela_sema::program::Program;
 use wrela_sema::ty::{AdtId, FnId, ModuleId, TraitId, TyId, TyKind};
 
@@ -118,80 +120,22 @@ pub fn run(root: &Path, queries: &[(String, Query)]) -> Result<Vec<Value>, Strin
     })
 }
 
-/// What a function calls, as the queries see it.
-#[derive(Clone, Debug)]
-pub(crate) enum Use {
-    Call(FnId),
-    /// A trait method, on a type.
-    Trait(FnId, TyId),
-    /// The function as a value.
-    Value(FnId),
-    Dispatch(FnId),
-    Draw(FnId),
-}
-
-impl Use {
-    fn func(&self) -> FnId {
-        match *self {
-            Use::Call(f) | Use::Trait(f, _) | Use::Value(f) | Use::Dispatch(f) | Use::Draw(f) => f,
-        }
-    }
-
-    fn how(&self) -> &'static str {
-        match self {
-            Use::Call(_) => "call",
-            Use::Trait(..) => "trait call",
-            Use::Value(_) => "as a value",
-            Use::Dispatch(_) => "dispatch",
-            Use::Draw(_) => "draw",
-        }
+/// How a use is named in the queries' answers.
+fn how(u: &Use) -> &'static str {
+    match u {
+        Use::Call(_) => "call",
+        Use::Trait(..) => "trait call",
+        Use::Value(_) => "as a value",
+        Use::Dispatch(_) => "dispatch",
+        Use::Draw(_) => "draw",
     }
 }
 
-/// Each statement of `body` that computes a value, with the value: what it assigns, or what
-/// it evaluates for its effects.
-pub(crate) fn rvalues(body: &mir::Body) -> impl Iterator<Item = (&mir::Statement, &Rvalue)> {
-    body.fns.iter().flat_map(|code| &code.blocks).flat_map(|b| &b.stmts).filter_map(|s| {
-        match &s.kind {
-            StatementKind::Assign(_, r) | StatementKind::Eval(r) => Some((s, r)),
-            _ => None,
-        }
-    })
-}
-
-/// Each use `body` makes of a function, and where. An entry point bound as a value
-/// (`k.bind(...)`) is used where it's bound, by the command it's for.
+/// Each use `body` makes of a function, and where ([`mir::fn_uses`]).
 fn uses(p: &Program, body: &mir::Body) -> Vec<(Use, Span)> {
     let mut out = Vec::new();
     for (s, r) in rvalues(body) {
-        match r {
-            Rvalue::Call(c) => match &c.callee {
-                Callee::Fn { func, .. } => out.push((Use::Call(*func), c.span)),
-                Callee::TraitMethod { method, self_ty, .. } => {
-                    out.push((Use::Trait(*method, *self_ty), c.span))
-                }
-                _ => {}
-            },
-            Rvalue::FnRef(f, _) => out.push((Use::Value(*f), s.span)),
-            Rvalue::Dispatch(d) => {
-                if let mir::Shader::Named(f, _) = d.kernel {
-                    out.push((Use::Dispatch(f), s.span));
-                }
-            }
-            Rvalue::Draw(d) => {
-                for sh in [&d.vertex, &d.fragment] {
-                    if let mir::Shader::Named(f, _) = sh {
-                        out.push((Use::Draw(*f), s.span));
-                    }
-                }
-            }
-            Rvalue::BorrowStruct { adt, .. } if let Some(f) = p.adt(*adt).entry => {
-                let kernel =
-                    matches!(p.func(f).attrs.entry, Some((wrela_sema::defs::Entry::Compute(_), _)));
-                out.push((if kernel { Use::Dispatch(f) } else { Use::Draw(f) }, s.span));
-            }
-            _ => {}
-        }
+        mir::fn_uses(p, s, r, |u, span| out.push((u, span)));
     }
     out
 }
@@ -665,7 +609,7 @@ impl<'a> Index<'a> {
             .uses_of(f)
             .into_iter()
             .map(|(caller, u, span)| {
-                json!({ "caller": self.fn_path(caller), "how": u.how(), "at": self.at(span), "line": self.line(span) })
+                json!({ "caller": self.fn_path(caller), "how": how(&u), "at": self.at(span), "line": self.line(span) })
             })
             .collect();
         let mut v = json!({ "function": path, "callers": calls });
@@ -692,7 +636,7 @@ impl<'a> Index<'a> {
                 continue;
             }
             seen.push(key.clone());
-            let mut v = json!({ "callee": key.0, "how": u.how(), "at": self.at(span), "signature": self.signature(u.func()) });
+            let mut v = json!({ "callee": key.0, "how": how(&u), "at": self.at(span), "signature": self.signature(u.func()) });
             if let Some(t) = on {
                 v["on"] = Value::String(t);
             }

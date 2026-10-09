@@ -544,6 +544,74 @@ impl FnBody {
     }
 }
 
+/// Each statement of `body` that computes a value, with the value: what it assigns, or what
+/// it evaluates for its effects.
+pub fn rvalues(body: &Body) -> impl Iterator<Item = (&Statement, &Rvalue)> {
+    body.fns.iter().flat_map(|code| &code.blocks).flat_map(|b| &b.stmts).filter_map(|s| {
+        match &s.kind {
+            StatementKind::Assign(_, r) | StatementKind::Eval(r) => Some((s, r)),
+            _ => None,
+        }
+    })
+}
+
+/// A use a value makes of a function ([`fn_uses`]).
+#[derive(Clone, Debug)]
+pub enum FnUse {
+    Call(FnId),
+    /// A trait method, on a type.
+    Trait(FnId, TyId),
+    /// The function as a value.
+    Value(FnId),
+    Dispatch(FnId),
+    Draw(FnId),
+}
+
+impl FnUse {
+    pub fn func(&self) -> FnId {
+        match *self {
+            FnUse::Call(f)
+            | FnUse::Trait(f, _)
+            | FnUse::Value(f)
+            | FnUse::Dispatch(f)
+            | FnUse::Draw(f) => f,
+        }
+    }
+}
+
+/// Each use the value `r` of statement `s` makes of a function, to `each`, with where it is: a
+/// call's span, or else the statement's. An entry point bound as a value (`k.bind(...)`) is
+/// used where it's bound, by the command it's for.
+pub fn fn_uses(p: &Program, s: &Statement, r: &Rvalue, mut each: impl FnMut(FnUse, Span)) {
+    match r {
+        Rvalue::Call(c) => match &c.callee {
+            Callee::Fn { func, .. } => each(FnUse::Call(*func), c.span),
+            Callee::TraitMethod { method, self_ty, .. } => {
+                each(FnUse::Trait(*method, *self_ty), c.span)
+            }
+            _ => {}
+        },
+        Rvalue::FnRef(f, _) => each(FnUse::Value(*f), s.span),
+        Rvalue::Dispatch(d) => {
+            if let Shader::Named(f, _) = d.kernel {
+                each(FnUse::Dispatch(f), s.span);
+            }
+        }
+        Rvalue::Draw(d) => {
+            for sh in [&d.vertex, &d.fragment] {
+                if let Shader::Named(f, _) = sh {
+                    each(FnUse::Draw(*f), s.span);
+                }
+            }
+        }
+        Rvalue::BorrowStruct { adt, .. } if let Some(f) = p.adt(*adt).entry => {
+            let kernel = matches!(p.func(f).attrs.entry, Some((crate::defs::Entry::Compute(_), _)));
+            each(if kernel { FnUse::Dispatch(f) } else { FnUse::Draw(f) }, s.span);
+        }
+        _ => {}
+    }
+}
+
 /// Whether `l` is outside the body of `closure` (a capture). Nothing is outside the function's
 /// own body (`closure` is `None`).
 pub(crate) fn is_capture(locals: &[LocalDecl], closure: Option<ClosureId>, l: Local) -> bool {
