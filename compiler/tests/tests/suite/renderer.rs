@@ -3,6 +3,7 @@
 //! same frame as the native host (a mean within 0.5/255) and the same state hash.
 //! `cargo test -p wrela-tests --test suite renderer:: -- --ignored`.
 
+use std::path::Path;
 use wrela_host::{GpuTiming, Host, RunResult, Timing, image};
 use wrela_tests::{page, run_in_chrome};
 
@@ -10,8 +11,38 @@ const SIZE: u32 = 128;
 /// The largest mean absolute difference between the hosts' frames, in 8-bit steps.
 const MEAN_LIMIT: f64 = 0.5;
 
-fn native(dir: &std::path::Path) -> RunResult {
-    Host::load(dir).expect("load").run_frames(&[0.0, 1.0 / 60.0], SIZE, SIZE).expect("run")
+fn native(dir: &Path) -> RunResult {
+    native_at(dir, SIZE, SIZE)
+}
+
+/// Two frames of the build in `dir`, `w` × `h`, in the native host.
+fn native_at(dir: &Path, w: u32, h: u32) -> RunResult {
+    Host::load(dir).expect("load").run_frames(&[0.0, 1.0 / 60.0], w, h).expect("run")
+}
+
+/// Two frames of the build in `dir` (its page at `rel`), `w` × `h`, in Chrome and in the native
+/// host, which give the same state hash: Chrome's last frame and the native host's.
+fn both_hosts(dir: &Path, rel: &str, w: u32, h: u32) -> (Vec<u8>, Vec<u8>) {
+    // The browser first: this thread holds no GPU lock while Chrome runs.
+    let browser = run_in_chrome(rel, 2, w, h, 60.0);
+    let run = native_at(dir, w, h);
+    assert_eq!(browser.hash, run.hash_hex(), "the hosts' state hashes differ");
+    (browser.frame, run.frame)
+}
+
+/// Chrome's frame against the native host's: within a mean of `MEAN_LIMIT`.
+fn frames_match(chrome: &[u8], native: &[u8]) {
+    let diff = image::compare(chrome, native).expect("same size");
+    eprintln!("Chrome against the native host: mean {:.4}/255, max {}/255", diff.mean, diff.max);
+    assert!(diff.mean <= MEAN_LIMIT, "mean difference {:.4} over {MEAN_LIMIT}", diff.mean);
+}
+
+/// The package at `pkg` (a page `name`) in both hosts: the same state hash, and frames that
+/// match.
+fn hosts_agree_on(pkg: &str, name: &str) {
+    let (dir, rel) = page(pkg, name);
+    let (chrome, native) = both_hosts(&dir, &rel, SIZE, SIZE);
+    frames_match(&chrome, &native);
 }
 
 fn pixel(frame: &[u8], x: u32, y: u32) -> [u8; 4] {
@@ -53,14 +84,7 @@ fn each_capability_draws_what_it_should() {
 #[test]
 #[ignore = "long: needs Chrome, python3 and a GPU"]
 fn the_browser_draws_the_native_hosts_frame() {
-    let (dir, rel) = page("compiler/tests/renderer", "renderer-browser");
-    // The browser first: this thread holds no GPU lock while Chrome runs.
-    let browser = run_in_chrome(&rel, 2, SIZE, SIZE, 60.0);
-    let run = native(&dir);
-    assert_eq!(browser.hash, run.hash_hex(), "the hosts' state hashes differ");
-    let diff = image::compare(&browser.frame, &run.frame).expect("same size");
-    eprintln!("Chrome against the native host: mean {:.4}/255, max {}/255", diff.mean, diff.max);
-    assert!(diff.mean <= MEAN_LIMIT, "mean difference {:.4} over {MEAN_LIMIT}", diff.mean);
+    hosts_agree_on("compiler/tests/renderer", "renderer-browser");
 }
 
 /// A kernel writes a texture's texels (`std::gpu::Texels`), each invocation its own, and a pass
@@ -85,7 +109,13 @@ fn a_kernel_writes_a_textures_texels() {
 #[test]
 #[ignore = "needs a GPU"]
 fn a_group_draws_what_its_fields_draw_one_by_one() {
-    let (dir, _) = page("compiler/tests/groups", "groups-native");
+    halves_alike("compiler/tests/groups", "groups-native");
+}
+
+/// The package at `pkg` (a page `name`) in the native host: the frame's left half is its right
+/// half, to the bit, and shows the texture a kernel filled.
+fn halves_alike(pkg: &str, name: &str) {
+    let (dir, _) = page(pkg, name);
     let run = native(&dir);
     let half = SIZE / 2;
     let mut lit = 0;
@@ -107,18 +137,7 @@ fn a_group_draws_what_its_fields_draw_one_by_one() {
 #[test]
 #[ignore = "needs a GPU"]
 fn bound_entry_points_draw_what_named_ones_draw() {
-    let (dir, _) = page("compiler/tests/bound", "bound-native");
-    let run = native(&dir);
-    let half = SIZE / 2;
-    let mut lit = 0;
-    for y in 0..SIZE {
-        for x in 0..half {
-            let (l, r) = (pixel(&run.frame, x, y), pixel(&run.frame, x + half, y));
-            assert_eq!(l, r, "pixel ({x}, {y}) against ({}, {y})", x + half);
-            lit += usize::from(l[0] > 60 && l[1] > 30);
-        }
-    }
-    assert!(lit > (half * SIZE / 4) as usize, "only {lit} pixels show the filled texture");
+    halves_alike("compiler/tests/bound", "bound-native");
 }
 
 /// A kernel writes a 3D texture's texels (`std::gpu::Texels3d`), and a pass loads and samples
@@ -147,13 +166,7 @@ fn a_kernel_writes_a_3d_textures_texels() {
 #[test]
 #[ignore = "long: needs Chrome, python3 and a GPU"]
 fn the_browser_writes_3d_texels_as_the_native_host_does() {
-    let (dir, rel) = page("compiler/tests/volume", "volume-browser");
-    let browser = run_in_chrome(&rel, 2, SIZE, SIZE, 60.0);
-    let run = native(&dir);
-    assert_eq!(browser.hash, run.hash_hex(), "the hosts' state hashes differ");
-    let diff = image::compare(&browser.frame, &run.frame).expect("same size");
-    eprintln!("Chrome against the native host: mean {:.4}/255, max {}/255", diff.mean, diff.max);
-    assert!(diff.mean <= MEAN_LIMIT, "mean difference {:.4} over {MEAN_LIMIT}", diff.mean);
+    hosts_agree_on("compiler/tests/volume", "volume-browser");
 }
 
 /// A vertex shader and a fragment shader with parameters of the same name read their own
@@ -173,13 +186,7 @@ fn each_shader_reads_its_own_parameters() {
 #[test]
 #[ignore = "long: needs Chrome, python3 and a GPU"]
 fn the_browser_writes_texels_as_the_native_host_does() {
-    let (dir, rel) = page("compiler/tests/texels", "texels-browser");
-    let browser = run_in_chrome(&rel, 2, SIZE, SIZE, 60.0);
-    let run = native(&dir);
-    assert_eq!(browser.hash, run.hash_hex(), "the hosts' state hashes differ");
-    let diff = image::compare(&browser.frame, &run.frame).expect("same size");
-    eprintln!("Chrome against the native host: mean {:.4}/255, max {}/255", diff.mean, diff.max);
-    assert!(diff.mean <= MEAN_LIMIT, "mean difference {:.4} over {MEAN_LIMIT}", diff.mean);
+    hosts_agree_on("compiler/tests/texels", "texels-browser");
 }
 
 /// Texture formats (§12, compiler/tests/formats): a kernel writes r32uint, r32float and rgba8
@@ -210,10 +217,8 @@ fn bands_green(frame: &[u8], n: u32) {
 #[ignore = "long: needs Chrome, python3 and a GPU"]
 fn the_browser_holds_each_format_as_the_native_host_does() {
     let (dir, rel) = page("compiler/tests/formats", "formats-browser");
-    let browser = run_in_chrome(&rel, 2, SIZE, SIZE, 60.0);
-    let run = native(&dir);
-    assert_eq!(browser.hash, run.hash_hex(), "the hosts' state hashes differ");
-    bands_green(&browser.frame, 6);
+    let (chrome, _) = both_hosts(&dir, &rel, SIZE, SIZE);
+    bands_green(&chrome, 6);
 }
 
 /// Dispatch over a domain (§12, compiler/tests/domains): kernels with no bounds check of their
@@ -231,10 +236,8 @@ fn a_dispatch_over_a_domain_covers_it_exactly() {
 #[ignore = "long: needs Chrome, python3 and a GPU"]
 fn the_browser_covers_a_domain_as_the_native_host_does() {
     let (dir, rel) = page("compiler/tests/domains", "domains-browser");
-    let browser = run_in_chrome(&rel, 2, SIZE, SIZE, 60.0);
-    let run = native(&dir);
-    assert_eq!(browser.hash, run.hash_hex(), "the hosts' state hashes differ");
-    bands_green(&browser.frame, 3);
+    let (chrome, _) = both_hosts(&dir, &rel, SIZE, SIZE);
+    bands_green(&chrome, 3);
 }
 
 /// Chrome's test mode times each pass on the GPU, as the native host does: the same passes, in
@@ -278,15 +281,12 @@ fn indexed_draws_cull_and_bias_in_both_hosts() {
         })
         .collect();
     assert_eq!(states, ["None 0", "Back -1000", "Back 0"]);
-    let browser = run_in_chrome(&rel, 2, SIZE, SIZE, 60.0);
-    let run = native(&dir);
+    let (chrome, native) = both_hosts(&dir, &rel, SIZE, SIZE);
     for (x, want) in [(8, [0, 255, 0, 255]), (SIZE - 8, [255, 0, 0, 255])] {
-        near(pixel(&run.frame, x, SIZE / 2), want, "the native host");
-        near(pixel(&browser.frame, x, SIZE / 2), want, "Chrome");
+        near(pixel(&native, x, SIZE / 2), want, "the native host");
+        near(pixel(&chrome, x, SIZE / 2), want, "Chrome");
     }
-    assert_eq!(browser.hash, run.hash_hex(), "the hosts' state hashes differ");
-    let diff = image::compare(&browser.frame, &run.frame).expect("same size");
-    assert!(diff.mean <= MEAN_LIMIT, "mean difference {:.4} over {MEAN_LIMIT}", diff.mean);
+    frames_match(&chrome, &native);
 }
 
 /// A draw's depth test and depth writes (compiler/tests/depth-state, §10.2 of #28): eight cells,
@@ -319,9 +319,8 @@ fn each_depth_test_and_write_draws_the_same_in_both_hosts() {
         let want = DepthState { compare, write };
         assert!(states.contains(&want), "no pipeline has {want:?}: {states:?}");
     }
-    let (w, h) = (SIZE, SIZE * 3 / 4);
-    let browser = run_in_chrome(&rel, 2, w, h, 60.0);
-    let run = Host::load(&dir).expect("load").run_frames(&[0.0, 1.0 / 60.0], w, h).expect("run");
+    // As wide as the others (`pixel`), and less tall.
+    let (chrome, native) = both_hosts(&dir, &rel, SIZE, SIZE * 3 / 4);
     let (grey, white) = ([128, 128, 128, 255], [255, 255, 255, 255]);
     let orange = [255, 128, 0, 255];
     let cases: [(&str, [u8; 4], [u8; 4]); 10] = [
@@ -336,20 +335,14 @@ fn each_depth_test_and_write_draws_the_same_in_both_hosts() {
         ("drawn far, its fragments nearer", orange, orange),
         ("drawn near, its fragments farther", grey, white),
     ];
-    let px = |frame: &[u8], x: u32, y: u32| -> [u8; 4] {
-        let i = (4 * (y * w + x)) as usize;
-        frame[i..i + 4].try_into().expect("4 bytes")
-    };
     for (k, (what, left, right)) in cases.iter().enumerate() {
         let (x0, y0) = (32 * (k as u32 % 4), 32 * (k as u32 / 4));
-        for (host, frame) in [("the native host", &run.frame), ("Chrome", &browser.frame)] {
-            near(px(frame, x0 + 8, y0 + 16), *left, &format!("{what}: the quad, {host}"));
-            near(px(frame, x0 + 24, y0 + 16), *right, &format!("{what}: the probe, {host}"));
+        for (host, frame) in [("the native host", &native), ("Chrome", &chrome)] {
+            near(pixel(frame, x0 + 8, y0 + 16), *left, &format!("{what}: the quad, {host}"));
+            near(pixel(frame, x0 + 24, y0 + 16), *right, &format!("{what}: the probe, {host}"));
         }
     }
-    assert_eq!(browser.hash, run.hash_hex(), "the hosts' state hashes differ");
-    let diff = image::compare(&browser.frame, &run.frame).expect("same size");
-    assert!(diff.mean <= MEAN_LIMIT, "mean difference {:.4} over {MEAN_LIMIT}", diff.mean);
+    frames_match(&chrome, &native);
 }
 
 /// The labelled pieces of compiler/tests/timing.

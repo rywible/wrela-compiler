@@ -5,15 +5,14 @@
 //! `cargo test -p wrela-tests --test suite unroll:: -- --ignored`.
 
 use wrela_host::{Host, Value, frame_time};
-use wrela_tests::page;
+use wrela_tests::{one_u32, page};
 
 #[test]
 #[ignore = "needs a GPU"]
 fn small_counted_loops_are_written_out_and_give_the_same_results() {
     let (dir, _) = page("compiler/tests/unroll", "unroll-native");
     // The loops left in each kernel's WGSL.
-    let manifest = std::fs::read_to_string(dir.join("manifest.json")).expect("manifest");
-    let manifest = wrela_abi::Manifest::parse(&manifest).expect("parses");
+    let manifest = wrela_tests::manifest(&dir);
     let loops = |name: &str| {
         let p = manifest.pipelines.iter().find(|p| p.name == name).expect(name);
         let wgsl = std::fs::read_to_string(dir.join(&p.shader)).expect("wgsl");
@@ -27,11 +26,7 @@ fn small_counted_loops_are_written_out_and_give_the_same_results() {
     let mut host = Host::load(&dir).expect("load");
     let times: Vec<f32> = (0..4).map(|i| frame_time(i, 60.0)).collect();
     host.run_frames(&times, 16, 16).expect("run");
-    let mut sum = |k: u32| match host.call_export("sum", &[Value::I32(k as i32)]).expect("sum")[..]
-    {
-        [Value::I32(v)] => v as u32,
-        ref other => panic!("sum({k}) returned {other:?}"),
-    };
+    let mut sum = |k: u32| one_u32(&mut host, "sum", &[Value::I32(k as i32)]);
     let ids = 0..64u32;
     let grid: u32 = ids.clone().map(|id| 36 * (id + 1)).sum();
     let up_to: u32 = ids.clone().map(|id| (0..id % 5).sum::<u32>()).sum();

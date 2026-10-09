@@ -5,7 +5,7 @@
 //! `cargo test -p wrela-tests --test suite requests:: -- --ignored`.
 
 use std::path::Path;
-use wrela_host::{Host, Options, Value, frame_time};
+use wrela_host::{Host, Options, frame_time};
 use wrela_tests::{page, run_in_chrome};
 
 const FRAMES: u32 = 41;
@@ -24,10 +24,7 @@ fn native(dir: &Path) -> (String, [f32; 4]) {
     let mut host = Host::load_with(dir, &options).expect("load");
     let times: Vec<f32> = (0..FRAMES).map(|i| frame_time(i, 60.0)).collect();
     let run = host.run_frames(&times, 16, 16).expect("run");
-    let answers = match host.call_export("answers", &[]).expect("answers").as_slice() {
-        [Value::F32(a), Value::F32(b), Value::F32(c), Value::F32(d)] => [*a, *b, *c, *d],
-        other => panic!("answers returned {other:?}"),
-    };
+    let answers = wrela_tests::one_vec4(&mut host, "answers", &[]);
     (run.hash_hex(), answers)
 }
 

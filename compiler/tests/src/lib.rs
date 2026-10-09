@@ -73,6 +73,59 @@ pub fn copy_dir(from: &Path, to: &Path) {
     }
 }
 
+/// Copies the package at `from` to `to` ([`copy_dir`]), each relative `path = "…"` in its
+/// wrela.toml made absolute against `from`: its dependencies are found from the copy too.
+pub fn copy_package(from: &Path, to: &Path) {
+    copy_dir(from, to);
+    let manifest = to.join("wrela.toml");
+    let text = std::fs::read_to_string(&manifest).expect("wrela.toml");
+    const KEY: &str = "path = \"";
+    let (mut out, mut rest) = (String::new(), text.as_str());
+    while let Some(at) = rest.find(KEY) {
+        let start = at + KEY.len();
+        let end = start + rest[start..].find('"').expect("a path's closing quote");
+        let path = Path::new(&rest[start..end]);
+        let path = if path.is_absolute() { path.to_path_buf() } else { from.join(path) };
+        out += &format!("{}path = {:?}", &rest[..at], path.display().to_string());
+        rest = &rest[end + 1..];
+    }
+    out += rest;
+    std::fs::write(&manifest, out).expect("write wrela.toml");
+}
+
+/// Writes `edit` of the file `file` of the package at `pkg`, which must change it: when it was
+/// written.
+pub fn write_edit(pkg: &Path, file: &str, edit: impl Fn(&str) -> String) -> std::time::Instant {
+    let path = pkg.join(file);
+    let src = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{file}: {e}"));
+    let new = edit(&src);
+    assert_ne!(new, src, "the edit changes {file}");
+    std::fs::write(&path, new).unwrap_or_else(|e| panic!("write {file}: {e}"));
+    std::time::Instant::now()
+}
+
+/// Waits until the `wrela run` server has had `n` changes shown: the `n`th. Panics after
+/// `limit`.
+pub fn wait_shown(
+    server: &wrela_driver::live::Server,
+    n: usize,
+    limit: std::time::Duration,
+) -> wrela_driver::live::Shown {
+    let began = std::time::Instant::now();
+    loop {
+        let shown = server.shown();
+        if shown.len() >= n {
+            return shown[n - 1].clone();
+        }
+        assert!(
+            began.elapsed() < limit,
+            "change {n} wasn't shown in {limit:?}: {:?}",
+            server.changes()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+}
+
 /// The cases of a case-file suite: the `.wrela` files and the directories in `dir`, sorted.
 pub fn cases(dir: &Path) -> Vec<PathBuf> {
     let mut cases: Vec<PathBuf> = std::fs::read_dir(dir)
@@ -148,6 +201,37 @@ pub fn one_vec3(host: &mut impl Exports, name: &str, args: &[Value]) -> [f32; 3]
         [Value::F32(x), Value::F32(y), Value::F32(z)] => [*x, *y, *z],
         other => panic!("{name} returned {other:?}"),
     }
+}
+
+/// Calls the export `name`, which must return one `vec4` (four `f32`s).
+pub fn one_vec4(host: &mut impl Exports, name: &str, args: &[Value]) -> [f32; 4] {
+    match host.call(name, args).expect(name).as_slice() {
+        [Value::F32(x), Value::F32(y), Value::F32(z), Value::F32(w)] => [*x, *y, *z, *w],
+        other => panic!("{name} returned {other:?}"),
+    }
+}
+
+/// The mean of |a − b| over the colour channels of some pixels (`pixels`, their indices) of two
+/// RGBA8 images, in /255; the share of those pixels with a channel more than 8/255 apart; and
+/// how many pixels there were.
+pub fn image_difference_over(
+    a: &[u8],
+    b: &[u8],
+    pixels: impl IntoIterator<Item = usize>,
+) -> (f64, f64, usize) {
+    let (mut sum, mut over, mut n) = (0.0, 0usize, 0usize);
+    for p in pixels {
+        let mut most = 0u8;
+        for c in 0..3 {
+            let d = a[4 * p + c].abs_diff(b[4 * p + c]);
+            sum += f64::from(d);
+            most = most.max(d);
+        }
+        over += usize::from(most > 8);
+        n += 1;
+    }
+    let n_f = n.max(1) as f64;
+    (sum / (3.0 * n_f), over as f64 / n_f, n)
 }
 
 /// A little-endian `f32` array from bytes.
@@ -359,6 +443,12 @@ pub fn scalar_page(pkg: &str, name: &str) -> (PathBuf, String) {
     page_built_by(pkg, name, "scalar", wrela_driver::build_without_simd)
 }
 
+/// The build of the package at `pkg` that [`page`] copies, made once per process: for a test
+/// that only reads its files (its manifest, its WGSL). Nothing may load it or write beside it.
+pub fn page_build(pkg: &str) -> PathBuf {
+    built_once(pkg, "release", |p| wrela_driver::build_for_tests(p, false))
+}
+
 /// [`page`], the package built by `build` (`kind` names it).
 fn page_built_by(
     pkg: &str,
@@ -366,6 +456,16 @@ fn page_built_by(
     kind: &str,
     build: fn(&Path) -> wrela_driver::Output,
 ) -> (PathBuf, String) {
+    let base = built_once(pkg, kind, build);
+    let rel = format!("target/tmp/{name}");
+    let dir = repo_root().join(&rel);
+    let _ = std::fs::remove_dir_all(&dir);
+    copy_dir(&base, &dir);
+    (dir, rel)
+}
+
+/// The package at `pkg` built by `build` (`kind` names it), once per process: its directory.
+fn built_once(pkg: &str, kind: &str, build: fn(&Path) -> wrela_driver::Output) -> PathBuf {
     static BUILDS: OncePerKey = OncePerKey::new();
     // No host loads the build here (it would keep its compiled code beside it), only copies.
     let base = repo_root()
@@ -382,11 +482,7 @@ fn page_built_by(
         }
         built.write_to(&base).expect("write the build");
     });
-    let rel = format!("target/tmp/{name}");
-    let dir = repo_root().join(&rel);
-    let _ = std::fs::remove_dir_all(&dir);
-    copy_dir(&base, &dir);
-    (dir, rel)
+    base
 }
 
 /// Runs tools/headless.py, from the repo root, with `args`: whether the run passed. It empties

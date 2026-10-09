@@ -12,7 +12,7 @@
 
 use std::path::{Path, PathBuf};
 use wrela_host::{Host, Scripted, Value, parse_script};
-use wrela_tests::{copy_dir, repo_root};
+use wrela_tests::{copy_dir, one_vec4, repo_root, wait_shown, write_edit};
 
 const SIZE: u32 = 64;
 const FPS: f64 = 60.0;
@@ -24,6 +24,11 @@ fn package() -> PathBuf {
 /// The program at `pkg`, built lifted, into a scratch directory `name`.
 fn built(name: &str, pkg: &Path) -> PathBuf {
     super::lift::build_into(name, pkg, &["main"], false)
+}
+
+/// The program as it is, built lifted once per process (the tests only load it).
+fn unedited() -> PathBuf {
+    super::built_lifted("reload", &["main"])
 }
 
 /// A literal's index in the build at `dir`: the first on `line` of main.wrela, `nth` along.
@@ -54,10 +59,7 @@ fn script() -> Vec<Scripted> {
 }
 
 fn vec4(host: &mut Host, name: &str) -> [f32; 4] {
-    match host.call_export(name, &[]).expect(name).as_slice() {
-        [Value::F32(a), Value::F32(b), Value::F32(c), Value::F32(d)] => [*a, *b, *c, *d],
-        other => panic!("{name} returned {other:?}"),
-    }
+    one_vec4(host, name, &[])
 }
 
 /// The screen's pixel at (x, y), RGB.
@@ -78,7 +80,7 @@ fn frames(host: &mut Host, from: u32, to: u32, script: &[Scripted]) {
 #[test]
 #[ignore = "needs a GPU"]
 fn a_literal_set_by_the_host_reaches_the_next_frame_and_what_was_cooked_from_it() {
-    let dir = built("reload-literal", &package());
+    let dir = unedited();
     let mut host = Host::load(&dir).expect("load");
     let s = script();
     frames(&mut host, 0, 5, &s);
@@ -107,11 +109,7 @@ fn a_literal_set_by_the_host_reaches_the_next_frame_and_what_was_cooked_from_it(
 fn edited(name: &str, edit: impl Fn(&str) -> String) -> PathBuf {
     let dir = super::scratch(name);
     copy_dir(&package(), &dir);
-    let main = dir.join("main.wrela");
-    let src = std::fs::read_to_string(&main).expect("main.wrela");
-    let new = edit(&src);
-    assert_ne!(new, src, "the edit changes the source");
-    std::fs::write(&main, new).expect("write main.wrela");
+    write_edit(&dir, "main.wrela", edit);
     dir
 }
 
@@ -119,7 +117,7 @@ fn edited(name: &str, edit: impl Fn(&str) -> String) -> PathBuf {
 #[ignore = "needs a GPU"]
 fn a_new_build_takes_over_where_the_old_one_was() {
     let s = script();
-    let old = built("reload-old", &package());
+    let old = unedited();
     // A structural edit that leaves the sim alone: the CPU's clear swizzles the tint, and a new
     // export.
     let pkg = edited("reload-new-src", |src| {
@@ -157,7 +155,7 @@ fn a_new_build_takes_over_where_the_old_one_was() {
 #[ignore = "needs a GPU"]
 fn a_new_sim_replays_the_old_ones_input() {
     let s = script();
-    let old = built("reload-sim-old", &package());
+    let old = unedited();
     let pkg = edited("reload-sim-src", |src| {
         src.replace("const WEIGHT: u32 = 7", "const WEIGHT: u32 = 11")
     });
@@ -174,37 +172,6 @@ fn a_new_sim_replays_the_old_ones_input() {
     let mut unchanged = Host::load(&old).expect("load");
     frames(&mut unchanged, 0, 91, &s);
     assert_ne!(vec4(&mut unchanged, "report")[2], a[2], "the new weight changed the sum");
-}
-
-/// Waits until the server has had `n` changes shown, or panics after `limit`.
-fn wait_shown(
-    server: &wrela_driver::live::Server,
-    n: usize,
-    limit: std::time::Duration,
-) -> wrela_driver::live::Shown {
-    let began = std::time::Instant::now();
-    loop {
-        let shown = server.shown();
-        if shown.len() >= n {
-            return shown[n - 1].clone();
-        }
-        assert!(
-            began.elapsed() < limit,
-            "change {n} wasn't shown in {limit:?}: {:?}",
-            server.changes()
-        );
-        std::thread::sleep(std::time::Duration::from_millis(5));
-    }
-}
-
-/// Writes `edit` of main.wrela at `pkg`: when it was written.
-fn write_edit(pkg: &Path, edit: impl Fn(&str) -> String) -> std::time::Instant {
-    let main = pkg.join("main.wrela");
-    let src = std::fs::read_to_string(&main).expect("main.wrela");
-    let new = edit(&src);
-    assert_ne!(new, src);
-    std::fs::write(&main, new).expect("write main.wrela");
-    std::time::Instant::now()
 }
 
 /// `wrela run` in Chrome: the page takes a literal edit at its next frame and swaps a new
@@ -230,12 +197,16 @@ fn wrela_run_reloads_the_page_in_place() {
     let chrome = std::thread::spawn(move || wrela_tests::run_url_in_chrome(&url, &page, 180));
     let limit = std::time::Duration::from_secs(60);
     // A first edit, shown once the page runs.
-    write_edit(&pkg, |s| s.replacen("vec3(0.25, 0.5, 0.75)", "vec3(0.3, 0.5, 0.75)", 1));
+    write_edit(&pkg, "main.wrela", |s| {
+        s.replacen("vec3(0.25, 0.5, 0.75)", "vec3(0.3, 0.5, 0.75)", 1)
+    });
     wait_shown(&server, 1, limit);
-    let t = write_edit(&pkg, |s| s.replacen("vec3(0.3, 0.5, 0.75)", "vec3(1.0, 0.5, 0.75)", 1));
+    let t = write_edit(&pkg, "main.wrela", |s| {
+        s.replacen("vec3(0.3, 0.5, 0.75)", "vec3(1.0, 0.5, 0.75)", 1)
+    });
     let literal = wait_shown(&server, 2, limit);
     let literal_ms = t.elapsed().as_secs_f64() * 1000.0;
-    let t = write_edit(&pkg, |s| {
+    let t = write_edit(&pkg, "main.wrela", |s| {
         s.replace("clear: vec4(tint() * 0.5, 1.0)", "clear: vec4(tint().zyx * 0.5, 1.0)")
             + "\npub fn version() -> u32 {\n    2\n}\n"
     });
@@ -262,7 +233,7 @@ fn wrela_run_reloads_the_page_in_place() {
     let lines: Vec<&str> = printed.lines().filter(|l| l.starts_with("frame ")).collect();
     assert!(lines.len() >= 25, "{printed}");
     let mut native = Host::load_with(
-        built("reload-chrome-native", &package()),
+        unedited(),
         &wrela_host::Options { quiet: true, ..wrela_host::Options::default() },
     )
     .expect("load");

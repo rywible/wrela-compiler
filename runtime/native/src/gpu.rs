@@ -1278,13 +1278,39 @@ impl Gpu {
         let screen =
             self.screen.as_ref().ok_or_else(|| Error::Gpu("there's no screen yet".into()))?;
         let (width, height) = (screen.width, screen.height);
+        self.read_screen_region([0, 0], [width, height])
+    }
+
+    /// Copies the screen's pixels from `corner` (x, y), `size` (width, height) of them, back:
+    /// RGBA8, rows top to bottom, no padding (waits for the GPU).
+    pub(crate) fn read_screen_region(
+        &mut self,
+        corner: [u32; 2],
+        size: [u32; 2],
+    ) -> Result<Vec<u8>> {
+        self.flush()?;
+        let screen =
+            self.screen.as_ref().ok_or_else(|| Error::Gpu("there's no screen yet".into()))?;
+        let ([x, y], [width, height]) = (corner, size);
+        let inside = |at: u32, n: u32, of: u32| n > 0 && at.checked_add(n).is_some_and(|e| e <= of);
+        if !inside(x, width, screen.width) || !inside(y, height, screen.height) {
+            return Err(Error::Gpu(format!(
+                "{width}x{height} pixels at ({x}, {y}) aren't all on the {}x{} screen",
+                screen.width, screen.height
+            )));
+        }
         let row = u64::from(width) * 4;
         let padded = align_to(row, u64::from(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT));
         let staging = self.readback_buffer(padded * u64::from(height));
         let mut encoder =
             self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         encoder.copy_texture_to_buffer(
-            screen.texture.as_image_copy(),
+            wgpu::TexelCopyTextureInfo {
+                texture: &screen.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x, y, z: 0 },
+                aspect: wgpu::TextureAspect::All,
+            },
             wgpu::TexelCopyBufferInfo {
                 buffer: &staging,
                 layout: wgpu::TexelCopyBufferLayout {

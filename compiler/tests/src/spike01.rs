@@ -1144,16 +1144,6 @@ impl Default for Spike {
 /// pixels with a channel more than 8/255 apart (#42's image comparison).
 pub fn image_difference(a: &[u8], b: &[u8]) -> (f64, f64) {
     assert_eq!(a.len(), b.len(), "the images differ in size");
-    let (mut sum, mut far, mut n) = (0u64, 0u64, 0u64);
-    for (p, q) in a.chunks_exact(4).zip(b.chunks_exact(4)) {
-        let mut most = 0;
-        for c in 0..3 {
-            let d = u64::from(p[c].abs_diff(q[c]));
-            sum += d;
-            most = most.max(d);
-        }
-        far += u64::from(most > 8);
-        n += 1;
-    }
-    (sum as f64 / (3 * n) as f64, far as f64 / n as f64)
+    let (mean, far, _) = crate::image_difference_over(a, b, 0..a.len() / 4);
+    (mean, far)
 }

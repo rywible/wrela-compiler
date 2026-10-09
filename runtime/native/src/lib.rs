@@ -453,6 +453,18 @@ impl Host {
         self.p().executor().read_screen()
     }
 
+    /// The screen's pixels from (`x`, `y`), `width` × `height` of them, after the last frame:
+    /// RGBA8, rows top to bottom. An error unless all are on the screen.
+    pub fn read_screen_region(
+        &mut self,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+    ) -> Result<Vec<u8>> {
+        self.p().executor().read_screen_region([x, y], [width, height])
+    }
+
     /// The lines the program printed (`std::io::print`) since the last call.
     pub fn take_logs(&mut self) -> Vec<String> {
         self.p().take_logs()

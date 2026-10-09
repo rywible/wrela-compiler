@@ -39,13 +39,6 @@ fn one(host: &mut CpuHost, name: &str, args: &[Value]) -> Vec<Value> {
     host.call_export(name, args).unwrap_or_else(|e| panic!("{name}: {e}"))
 }
 
-fn vec4_of(v: &[Value]) -> [f32; 4] {
-    match v {
-        [Value::F32(a), Value::F32(b), Value::F32(c), Value::F32(d)] => [*a, *b, *c, *d],
-        other => panic!("expected a vec4, got {other:?}"),
-    }
-}
-
 /// Sketch 01 §4: the physique is computed by `@deterministic` code from the field. The mass is
 /// the grazer's volume times its tissue's density (hide 1050 kg/m³, hooves 1300): about a
 /// tonne, a bison's. Measured: the 1 cm integration and capsule fit take about 10 s in
@@ -56,7 +49,8 @@ fn vec4_of(v: &[Value]) -> [f32; 4] {
 fn sketch_01s_physique() {
     let mut host = cpu("sketches/01-creature");
     let started = std::time::Instant::now();
-    let [mass, bones, capsules, radius] = vec4_of(&one(&mut host, "physique", &[Value::I32(1)]));
+    let [mass, bones, capsules, radius] =
+        wrela_tests::one_vec4(&mut host, "physique", &[Value::I32(1)]);
     println!(
         "grazer 1: {mass:.1} kg over {bones} bones, {capsules} capsules (the first {radius:.3} m); {:.2} s",
         started.elapsed().as_secs_f64()

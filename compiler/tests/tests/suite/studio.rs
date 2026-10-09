@@ -91,27 +91,15 @@ impl Subject {
         edits: &[(&str, &str)],
     ) -> (PathBuf, Vec<(PathBuf, String)>) {
         let pkg = super::scratch(&format!("studio-{name}-{tag}"));
-        let from = repo_root().join("examples").join(name);
+        wrela_tests::copy_package(&repo_root().join("examples").join(name), &pkg);
         let mut files = Vec::new();
-        for e in std::fs::read_dir(&from).expect("the subject's directory") {
-            let path = e.expect("an entry").path();
-            let file = path.file_name().unwrap().to_string_lossy().into_owned();
-            if !path.is_file() || !(file.ends_with(".wrela") || file == "wrela.toml") {
-                continue;
-            }
+        for path in wrela_tests::files_under(&pkg, &["wrela"]) {
             let mut text = std::fs::read_to_string(&path).expect("read");
-            if file == "wrela.toml" {
-                let abs = |rel: &str| repo_root().join(rel).display().to_string();
-                text = text
-                    .replace("\"../../engine\"", &format!("{:?}", abs("engine")))
-                    .replace("\"../round1\"", &format!("{:?}", abs("examples/round1")));
-            } else {
-                for (a, b) in edits {
-                    text = text.replace(a, b);
-                }
-                files.push((pkg.join(&file), text.clone()));
+            for (a, b) in edits {
+                text = text.replace(a, b);
             }
-            std::fs::write(pkg.join(&file), text).expect("write");
+            std::fs::write(&path, &text).expect("write");
+            files.push((path, text));
         }
         (pkg, files)
     }

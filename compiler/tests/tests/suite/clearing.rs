@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use wrela_abi::manifest::{Compare, DepthState, Stage};
 use wrela_host::{GpuTiming, Host, Options, Scripted, Timing, Value, parse_script};
-use wrela_tests::{f32s, page, repo_root, u32s};
+use wrela_tests::{f32s, image_difference_over, page, repo_root, u32s};
 
 /// The output's size, and the scene's (half each way).
 const W: u32 = 1920;
@@ -143,7 +143,11 @@ impl Clearing {
 
     fn load_with(name: &str, options: &Options) -> Clearing {
         let (dir, _) = built(name);
-        let host = Host::load_with(&dir, options).expect("load the clearing");
+        Clearing::on(Host::load_with(&dir, options).expect("load the clearing"))
+    }
+
+    /// The clearing loaded in `host`, from its first frame, at 60 frames a second.
+    fn on(host: Host) -> Clearing {
         Clearing { host, frame: 0, fps: 60.0, script: Vec::new() }
     }
 
@@ -222,9 +226,14 @@ impl Clearing {
         self.host.read_buffer(newest).expect("read the capture")
     }
 
+    /// A capture (`what`) of four floats a pixel.
+    fn rgba(&mut self, what: i32) -> Vec<[f32; 4]> {
+        f32s(&self.capture(what)).chunks(4).map(|c| [c[0], c[1], c[2], c[3]]).collect()
+    }
+
     /// The scene's colour and tag at each of its pixels.
     fn scene(&mut self) -> Vec<[f32; 4]> {
-        f32s(&self.capture(0)).chunks(4).map(|c| [c[0], c[1], c[2], c[3]]).collect()
+        self.rgba(0)
     }
 
     fn depth(&mut self) -> Vec<f32> {
@@ -232,12 +241,12 @@ impl Clearing {
     }
 
     fn motion(&mut self) -> Vec<[f32; 4]> {
-        f32s(&self.capture(2)).chunks(4).map(|c| [c[0], c[1], c[2], c[3]]).collect()
+        self.rgba(2)
     }
 
     /// Temporal AA's output (linear colour, and the nearest sample's tag), at the output's size.
     fn output(&mut self) -> Vec<[f32; 4]> {
-        f32s(&self.capture(3)).chunks(4).map(|c| [c[0], c[1], c[2], c[3]]).collect()
+        self.rgba(3)
     }
 
     fn screen(&mut self) -> Vec<u8> {
@@ -255,33 +264,26 @@ fn class(tag: f32) -> u32 {
     (tag.max(0.0) / 64.0 + 0.001) as u32
 }
 
-/// The mean of |a − b| over a set of pixels' channels (RGBA8 screens, alpha left out), in
-/// 8-bit steps, and the share of those pixels that differ by more than 8 in a channel.
-fn compare(a: &[u8], b: &[u8], pixels: impl Iterator<Item = usize>) -> (f64, f64, usize) {
-    let (mut sum, mut over, mut n) = (0.0, 0usize, 0usize);
-    for p in pixels {
-        let mut most = 0u8;
-        for c in 0..3 {
-            let d = a[4 * p + c].abs_diff(b[4 * p + c]);
-            sum += f64::from(d);
-            most = most.max(d);
-        }
-        if most > 8 {
-            over += 1;
-        }
-        n += 1;
-    }
-    let n_f = n.max(1) as f64;
-    (sum / (3.0 * n_f), over as f64 / n_f, n)
+/// Two frames' difference, `gain` times larger, as a picture (RGBA8).
+fn diff_image(a: &[u8], b: &[u8], gain: u32) -> Vec<u8> {
+    a.chunks(4)
+        .zip(b.chunks(4))
+        .flat_map(|(p, q)| {
+            let d = |c: usize| (u32::from(p[c].abs_diff(q[c])) * gain).min(255) as u8;
+            [d(0), d(1), d(2), 255]
+        })
+        .collect()
 }
 
 // ---- the source and its WGSL (no GPU) ---------------------------------------------------------
 
-/// The clearing's pipelines: each one's name, entry points and WGSL.
+/// The clearing's pipelines: each one's name, entry points, depth state (a render pipeline's)
+/// and WGSL.
 struct Pipeline {
     name: String,
     vertex: String,
     fragment: String,
+    depth: Option<DepthState>,
     wgsl: String,
 }
 
@@ -295,21 +297,21 @@ fn entries(p: &wrela_abi::manifest::Pipeline) -> (String, String, Option<DepthSt
     }
 }
 
-/// The clearing's pipelines, read once: the tests that check them run at the same time, and each
-/// copy of the build would empty the one another test reads.
+/// The clearing's pipelines, read once from the build its pages copy (which only they write).
 fn pipelines() -> &'static [Pipeline] {
     static PIPELINES: std::sync::OnceLock<Vec<Pipeline>> = std::sync::OnceLock::new();
     PIPELINES.get_or_init(|| {
-        let (dir, _) = built("clearing-wgsl");
+        let dir = wrela_tests::page_build("examples/clearing");
         let m = wrela_tests::manifest(&dir);
         m.pipelines
             .iter()
             .map(|p| {
-                let (vertex, fragment, _) = entries(p);
+                let (vertex, fragment, depth) = entries(p);
                 Pipeline {
                     name: p.name.clone(),
                     vertex,
                     fragment,
+                    depth,
                     wgsl: std::fs::read_to_string(dir.join(&p.shader)).expect("read the WGSL"),
                 }
             })
@@ -330,64 +332,93 @@ fn wgsl_function<'a>(wgsl: &'a str, name: &str) -> &'a str {
 const FIELD_HASHES: [&str; 6] =
     ["747796405u", "2891336453u", "277803737u", "1597334677u", "3812015801u", "2798796415u"];
 
-/// Every function `f` calls, through any depth (the compiler's `callees` query).
-fn callees(f: &str) -> BTreeSet<String> {
-    callees_of_each(&[f]).remove(0)
+/// Answers `queries` (the compiler's, as `wrela query` takes them) on the clearing, in one run:
+/// one check of the package.
+fn query(queries: &[String]) -> Vec<serde_json::Value> {
+    let queries: Vec<_> = queries
+        .iter()
+        .map(|text| (text.clone(), wrela_driver::query::parse(text).expect("a query")))
+        .collect();
+    let root = repo_root().join("examples/clearing");
+    wrela_driver::query::run(&root, &queries).expect("run the queries")
 }
 
-/// [`callees`] of each of `fs`. The graphs are walked together a level at a time, each level's
-/// queries in one run (one check of the package, where a query a function took one each), and
-/// each function's direct callees are kept for the process: the tests walk overlapping graphs.
-fn callees_of_each(fs: &[&str]) -> Vec<BTreeSet<String>> {
-    static DIRECT: std::sync::Mutex<BTreeMap<String, Vec<String>>> =
-        std::sync::Mutex::new(BTreeMap::new());
-    let direct = || DIRECT.lock().unwrap_or_else(|p| p.into_inner());
-    let root = repo_root().join("examples/clearing");
-    let mut level: BTreeSet<String> = fs.iter().map(|f| f.to_string()).collect();
-    let mut walked = BTreeSet::new();
-    while !level.is_empty() {
-        let asked: Vec<String> =
-            level.iter().filter(|f| !direct().contains_key(*f)).cloned().collect();
-        if !asked.is_empty() {
-            let queries: Vec<_> = asked
+/// The functions whose callees the tests check through any depth: the terrain's vertex shader,
+/// and the entry points of the pipelines that draw each frame.
+fn walked() -> Vec<String> {
+    let drawn = DRAWN.iter().flat_map(|(v, f)| [ps_path(v), ps_path(f)]);
+    ["engine::terrain::ground".to_string()].into_iter().chain(drawn).collect()
+}
+
+/// What the tests ask of the clearing's call graph, worked out once for the process.
+struct Calls {
+    /// Every function each of `walked()` calls, through any depth.
+    closures: BTreeMap<String, BTreeSet<String>>,
+    /// What the grass's placing calls (not through any depth).
+    place: Vec<String>,
+}
+
+/// The compiler's `callees` query gives what a function calls directly; the graph is walked
+/// from all of `walked()` together, a level at a time, each level's queries in one run (where a
+/// query a function took a check of the package each). The grass's placing is asked with the
+/// first level.
+fn calls() -> &'static Calls {
+    static CALLS: std::sync::OnceLock<Calls> = std::sync::OnceLock::new();
+    CALLS.get_or_init(|| {
+        let place = "engine::grass::place".to_string();
+        let roots = walked();
+        let mut direct: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut level: BTreeSet<String> = roots.iter().cloned().collect();
+        let mut seen = BTreeSet::new();
+        let mut also = Some(place.clone());
+        while !level.is_empty() {
+            let asked: Vec<String> = level
                 .iter()
-                .map(|f| {
-                    let text = format!("callees {f}");
-                    let q = wrela_driver::query::parse(&text).expect("a query");
-                    (text, q)
-                })
+                .filter(|f| !direct.contains_key(*f))
+                .cloned()
+                .chain(also.take())
                 .collect();
-            let out = wrela_driver::query::run(&root, &queries).expect("run the queries");
-            let mut d = direct();
-            for (f, answer) in asked.iter().zip(&out) {
-                let list = answer["callees"].as_array().map_or(Vec::new(), |list| {
-                    list.iter()
-                        .map(|c| c["callee"].as_str().expect("a callee").to_string())
-                        .collect()
-                });
-                d.insert(f.clone(), list);
-            }
-        }
-        walked.extend(level.iter().cloned());
-        let d = direct();
-        level =
-            level.iter().flat_map(|f| &d[f]).filter(|c| !walked.contains(*c)).cloned().collect();
-    }
-    let d = direct();
-    fs.iter()
-        .map(|f| {
-            let mut seen = BTreeSet::new();
-            let mut todo = vec![f.to_string()];
-            while let Some(next) = todo.pop() {
-                for c in &d[&next] {
-                    if seen.insert(c.clone()) {
-                        todo.push(c.clone());
-                    }
+            if !asked.is_empty() {
+                let texts: Vec<String> = asked.iter().map(|f| format!("callees {f}")).collect();
+                for (f, answer) in asked.iter().zip(query(&texts)) {
+                    let list = answer["callees"].as_array().map_or(Vec::new(), |list| {
+                        list.iter()
+                            .map(|c| c["callee"].as_str().expect("a callee").to_string())
+                            .collect()
+                    });
+                    direct.insert(f.clone(), list);
                 }
             }
-            seen
-        })
-        .collect()
+            seen.extend(level.iter().cloned());
+            level = level
+                .iter()
+                .flat_map(|f| &direct[f])
+                .filter(|c| !seen.contains(*c))
+                .cloned()
+                .collect();
+        }
+        let closures = roots
+            .into_iter()
+            .map(|f| {
+                let mut reached = BTreeSet::new();
+                let mut todo = vec![f.clone()];
+                while let Some(next) = todo.pop() {
+                    for c in &direct[&next] {
+                        if reached.insert(c.clone()) {
+                            todo.push(c.clone());
+                        }
+                    }
+                }
+                (f, reached)
+            })
+            .collect();
+        Calls { closures, place: direct[&place].clone() }
+    })
+}
+
+/// Every function `f` (one of `walked()`) calls, through any depth.
+fn callees(f: &str) -> &'static BTreeSet<String> {
+    &calls().closures[f]
 }
 
 /// AC3: the terrain's vertex shader reads the clipmap and never evaluates the terrain field:
@@ -397,7 +428,7 @@ fn callees_of_each(fs: &[&str]) -> Vec<BTreeSet<String>> {
 fn the_terrain_vertex_shader_reads_the_clipmap_not_the_field() {
     let calls = callees("engine::terrain::ground");
     assert!(calls.contains("engine::terrain::level_height"), "it reads the clipmap: {calls:?}");
-    for c in &calls {
+    for c in calls {
         assert!(
             !c.contains("height(") && !c.starts_with("scene::") && !c.starts_with("engine::noise"),
             "the terrain's vertex shader calls {c}"
@@ -424,23 +455,7 @@ fn the_terrain_vertex_shader_reads_the_clipmap_not_the_field() {
 #[test]
 fn no_field_is_evaluated_per_vertex_or_per_pixel() {
     let ps = pipelines();
-    let drawn = [
-        ("stone_vertex", "stone_shade"),
-        ("character", "character_shade"),
-        ("card", "leaf_shade"),
-        ("limb", "bark_shade"),
-        ("far_quad", "far_shade"),
-        ("far_quad", "volume_shade"),
-        ("blade", "blade_shade"),
-        ("flower", "flower_shade"),
-    ];
-    let paths: Vec<String> = drawn.iter().flat_map(|(v, f)| [ps_path(v), ps_path(f)]).collect();
-    let calls: BTreeMap<&str, BTreeSet<String>> = paths
-        .iter()
-        .map(String::as_str)
-        .zip(callees_of_each(&paths.iter().map(String::as_str).collect::<Vec<_>>()))
-        .collect();
-    for (v, f) in drawn {
+    for (v, f) in DRAWN {
         let p = ps
             .iter()
             .find(|p| p.vertex == v && p.fragment == f)
@@ -451,7 +466,7 @@ fn no_field_is_evaluated_per_vertex_or_per_pixel() {
             }
         }
         for entry in [v, f] {
-            for c in &calls[ps_path(entry).as_str()] {
+            for c in callees(&ps_path(entry)) {
                 let field = c.starts_with("std::field::") && !c.ends_with("hash_u32")
                     || c.contains("::crown")
                     || c.contains("::wood")
@@ -465,6 +480,19 @@ fn no_field_is_evaluated_per_vertex_or_per_pixel() {
         }
     }
 }
+
+/// The entry points (vertex, fragment) of the pipelines that draw the stones, the creature and
+/// the plants each frame.
+const DRAWN: [(&str, &str); 8] = [
+    ("stone_vertex", "stone_shade"),
+    ("character", "character_shade"),
+    ("card", "leaf_shade"),
+    ("limb", "bark_shade"),
+    ("far_quad", "far_shade"),
+    ("far_quad", "volume_shade"),
+    ("blade", "blade_shade"),
+    ("flower", "flower_shade"),
+];
 
 /// An entry point's path in the engine.
 fn ps_path(entry: &str) -> String {
@@ -498,31 +526,23 @@ fn the_sky_pass_reads_the_cooked_clouds_and_marches_nothing() {
 /// kernel appends them).
 #[test]
 fn flowers_are_cut_cards_in_the_prepass_placed_with_the_grass() {
-    let (dir, _) = built("clearing-flowers");
-    let m = wrela_tests::manifest(&dir);
+    let ps = pipelines();
     let find = |f: &str| {
-        m.pipelines
-            .iter()
-            .find(|p| entries(p).1 == f)
-            .unwrap_or_else(|| panic!("no pipeline shades with {f}"))
+        ps.iter().find(|p| p.fragment == f).unwrap_or_else(|| panic!("no pipeline shades with {f}"))
     };
     let cut = find("flower_cut");
     let shade = find("flower_shade");
-    let wgsl = |p: &wrela_abi::manifest::Pipeline| {
-        std::fs::read_to_string(dir.join(&p.shader)).expect("read the WGSL")
-    };
-    assert!(wgsl(cut).contains("discard"), "the flowers' cut doesn't discard");
-    assert!(!wgsl(shade).contains("discard"), "the flowers' shading discards");
-    let (cs, ss) = (entries(cut).2, entries(shade).2);
+    assert!(cut.wgsl.contains("discard"), "the flowers' cut doesn't discard");
+    assert!(!shade.wgsl.contains("discard"), "the flowers' shading discards");
+    let (cs, ss) = (cut.depth, shade.depth);
     assert!(cs.is_some_and(|d| d.write), "the cut writes no depth: {cs:?}");
     assert!(
         ss.is_some_and(|d| !d.write && d.compare == Compare::Equal),
         "the shading isn't at equal depth without writes: {ss:?}"
     );
-    let place = callees("engine::grass::place");
     let pushes = std::fs::read_to_string(repo_root().join("engine/grass.wrela")).expect("read");
     assert!(pushes.contains("flowers.push("), "the grass's placing appends no flowers");
-    assert!(!place.is_empty());
+    assert!(!calls().place.is_empty(), "the grass's placing calls nothing");
 }
 
 /// AC4: the wind's sway is a function of time and place only: `sway` is pure (its effects are
@@ -530,16 +550,10 @@ fn flowers_are_cut_cards_in_the_prepass_placed_with_the_grass() {
 /// place sway the same, and a different time or place differently.
 #[test]
 fn the_wind_is_a_function_of_time_and_place() {
-    let root = repo_root().join("examples/clearing");
-    let text = "effects engine::plant::sway".to_string();
-    let q = wrela_driver::query::parse(&text).expect("a query");
-    let out = wrela_driver::query::run(&root, &[(text, q)]).expect("run the query");
+    let out = query(&["effects engine::plant::sway".into(), "callers engine::plant::sway".into()]);
     let effects = out[0]["effects"].as_array().map(Vec::len).unwrap_or(usize::MAX);
     assert_eq!(effects, 0, "sway has effects: {}", out[0]);
-    let text = "callers engine::plant::sway".to_string();
-    let q = wrela_driver::query::parse(&text).expect("a query");
-    let out = wrela_driver::query::run(&root, &[(text, q)]).expect("run the query");
-    let callers: Vec<String> = out[0]["callers"]
+    let callers: Vec<String> = out[1]["callers"]
         .as_array()
         .expect("callers")
         .iter()
@@ -564,8 +578,10 @@ fn the_wind_is_a_function_of_time_and_place() {
 
 // ---- the terrain (AC3) -----------------------------------------------------------------------
 
-/// The clipmap's texels (heights), and its levels: each (x, z of texel 0, spacing).
+/// The clipmap's texels (`TEXEL_BYTES` each), their heights, and its levels: each (x, z of
+/// texel 0, spacing).
 struct Clip {
+    texels: Vec<u8>,
     heights: Vec<f32>,
     levels: Vec<[f64; 3]>,
 }
@@ -579,8 +595,8 @@ const TEXEL_BYTES: usize = 20;
 
 impl Clip {
     fn read(c: &mut Clearing) -> Clip {
-        let bytes = c.capture(6);
-        let heights = bytes
+        let texels = c.capture(6);
+        let heights = texels
             .chunks(TEXEL_BYTES)
             .map(|t| f32::from_le_bytes(t[0..4].try_into().unwrap()))
             .collect();
@@ -591,7 +607,7 @@ impl Clip {
                 [v[0], v[1], v[2]]
             })
             .collect();
-        Clip { heights, levels }
+        Clip { texels, heights, levels }
     }
 
     fn texel(&self, l: usize, i: u32, j: u32) -> f64 {
@@ -605,13 +621,19 @@ impl Clip {
         ((x - ax - half).abs()).max((z - az - half).abs()) / half
     }
 
-    /// The finest level holding (x, z), and its height there between its texels (the engine's
-    /// `height_at`).
-    fn height_at(&self, x: f64, z: f64) -> (usize, f64) {
+    /// The finest level holding (x, z).
+    fn level_at(&self, x: f64, z: f64) -> usize {
         let mut l = 0;
         while l + 1 < self.levels.len() && self.reach(l, x, z) > 0.98 {
             l += 1;
         }
+        l
+    }
+
+    /// The finest level holding (x, z), and its height there between its texels (the engine's
+    /// `height_at`).
+    fn height_at(&self, x: f64, z: f64) -> (usize, f64) {
+        let l = self.level_at(x, z);
         let [ax, az, s] = self.levels[l];
         let g = [
             ((x - ax) / s).clamp(0.0, f64::from(QUADS) - 0.001),
@@ -624,6 +646,17 @@ impl Clip {
         let top = h(i, j) * (1.0 - fx) + h(i + 1, j) * fx;
         let bottom = h(i, j + 1) * (1.0 - fx) + h(i + 1, j + 1) * fx;
         (l, top * (1.0 - fz) + bottom * fz)
+    }
+
+    /// The finest level's grass at (x, z): how much of the meadow grows there (its nearest
+    /// texel's cover).
+    fn grass_at(&self, x: f64, z: f64) -> f64 {
+        let l = self.level_at(x, z);
+        let [ax, az, s] = self.levels[l];
+        let i = (((x - ax) / s).round().clamp(0.0, f64::from(QUADS))) as u32;
+        let j = (((z - az) / s).round().clamp(0.0, f64::from(QUADS))) as u32;
+        let t = (l as u32 * STRIDE + j * ROW + i) as usize;
+        f64::from(self.texels[t * TEXEL_BYTES + 11]) / 255.0
     }
 }
 
@@ -655,10 +688,27 @@ fn the_clipmap_holds_the_fields_heights_and_the_raycasts_meet_it() {
         let (mut at_texels, mut between) = (0.0f64, 0.0f64);
         // Every texel of the nearest level, and of the others every 4th each way.
         let every = if l == 0 { 1 } else { 4 };
+        let at = |i: u32, j: u32| (ax + f64::from(i) * s, az + f64::from(j) * s);
+        // The nearest level's field at each of its texels, evaluated once: a cell's corners are
+        // texels too.
+        let grid: Vec<(f64, f64)> = if l == 0 {
+            let texels = (0..SIDE).flat_map(|j| (0..SIDE).map(move |i| at(i, j)));
+            texels.map(|(x, z)| field(&mut cpu, x, z)).collect()
+        } else {
+            Vec::new()
+        };
         for j in (0..SIDE).step_by(every) {
             for i in (0..SIDE).step_by(every) {
-                let (x, z) = (ax + f64::from(i) * s, az + f64::from(j) * s);
-                let (h, slope) = field(&mut cpu, x, z);
+                let (x, z) = at(i, j);
+                // The field at texel (i + di, j + dj).
+                let field_at = |cpu: &mut wrela_host::CpuHost, di: u32, dj: u32| {
+                    if l == 0 {
+                        grid[((j + dj) * SIDE + i + di) as usize]
+                    } else {
+                        field(cpu, x + f64::from(di) * s, z + f64::from(dj) * s)
+                    }
+                };
+                let (h, slope) = field_at(&mut cpu, 0, 0);
                 let bound = if l == 0 { 0.02 } else { (s * slope).max(0.02) };
                 let e = (clip.texel(l, i, j) - h).abs();
                 at_texels = at_texels.max(e / bound);
@@ -673,8 +723,8 @@ fn the_clipmap_holds_the_fields_heights_and_the_raycasts_meet_it() {
                     let (xm, zm) = (x + 0.5 * s, z + 0.5 * s);
                     let (hm, slope_m) = field(&mut cpu, xm, zm);
                     let mut steepest = slope.max(slope_m);
-                    for (dx, dz) in [(s, 0.0), (0.0, s), (s, s)] {
-                        steepest = steepest.max(field(&mut cpu, x + dx, z + dz).1);
+                    for (di, dj) in [(1, 0), (0, 1), (1, 1)] {
+                        steepest = steepest.max(field_at(&mut cpu, di, dj).1);
                     }
                     let quad = (clip.texel(l, i, j)
                         + clip.texel(l, i + 1, j)
@@ -793,19 +843,6 @@ fn no_pixel_sees_through_the_terrain_between_levels() {
 
 const FLOWER: u32 = 7;
 
-/// The finest level's grass at (x, z): how much of the meadow grows there (its texel's cover).
-fn grass_at(cover: &[u8], clip: &Clip, x: f64, z: f64) -> f64 {
-    let mut l = 0;
-    while l + 1 < clip.levels.len() && clip.reach(l, x, z) > 0.98 {
-        l += 1;
-    }
-    let [ax, az, s] = clip.levels[l];
-    let i = (((x - ax) / s).round().clamp(0.0, f64::from(QUADS))) as u32;
-    let j = (((z - az) / s).round().clamp(0.0, f64::from(QUADS))) as u32;
-    let t = (l as u32 * STRIDE + j * ROW + i) as usize;
-    f64::from(cover[t * TEXEL_BYTES + 11]) / 255.0
-}
-
 /// The share of the meadow's pixels that show grass (or its flowers), near (within 25 m) and
 /// far (25 to 80 m; the blades reach 92 m): of the pixels that show the ground or grass where
 /// the clipmap's meadow grows at least half its grass.
@@ -813,7 +850,6 @@ fn grass_coverage(c: &mut Clearing) -> [f64; 2] {
     let cam = c.camera();
     let scene = c.scene();
     let depth = c.depth();
-    let texels = c.capture(6);
     let clip = Clip::read(c);
     let (w, h) = (cam.screen[0] as usize, cam.screen[1] as usize);
     let mut grass = [0usize; 2];
@@ -834,7 +870,7 @@ fn grass_coverage(c: &mut Clearing) -> [f64; 2] {
             } else {
                 continue;
             };
-            if grass_at(&texels, &clip, p[0], p[2]) < 0.5 {
+            if clip.grass_at(p[0], p[2]) < 0.5 {
                 continue;
             }
             all[band] += 1;
@@ -973,9 +1009,26 @@ fn the_cards_shade_each_pixel_once() {
     }
 }
 
+/// Where a tree alone stands (x, z), on the valley's floor, and the way from it to the camera
+/// that looks at it against the sun (so its light through counts).
+const TREE_AT: [f32; 2] = [-260.0, 520.0];
+const TREE_TOWARD: [f32; 2] = [-0.62, 0.78];
+
+/// Holds the camera `distance` m from the tree alone (`TREE_AT`), looking at it 6 m above the
+/// ground, from at least 4 m above the ground under the eye: the ground's height at the tree.
+fn face_tree(c: &mut Clearing, cpu: &mut wrela_host::CpuHost, distance: f32) -> f32 {
+    let (at, toward) = (TREE_AT, TREE_TOWARD);
+    let ground = field(cpu, f64::from(at[0]), f64::from(at[1])).0 as f32;
+    let eye = [at[0] + toward[0] * distance, at[1] + toward[1] * distance];
+    let under = field(cpu, f64::from(eye[0]), f64::from(eye[1])).0 as f32;
+    let eye_y = (ground + 6.0 + distance * 0.08).max(under + 4.0);
+    c.hold([eye[0], eye_y, eye[1]], [at[0], ground + 6.0, at[1]]);
+    ground
+}
+
 /// A tree alone, `kind`, drawn one way (`cards_to`, `impostors_to`), from `distance` m away
-/// across the valley's floor, against the sun (so its light through counts): the screen, and
-/// which of its pixels show the tree.
+/// across the valley's floor, against the sun (`face_tree`): the screen, and which of its
+/// pixels show the tree.
 fn solo(
     c: &mut Clearing,
     cpu: &mut wrela_host::CpuHost,
@@ -984,7 +1037,7 @@ fn solo(
     cards_to: f32,
     impostors_to: f32,
 ) -> (Vec<u8>, Vec<u8>) {
-    let at = [-260.0f32, 520.0];
+    let at = TREE_AT;
     c.call(
         "test_solo",
         &[
@@ -995,12 +1048,7 @@ fn solo(
             Value::F32(impostors_to),
         ],
     );
-    let ground = field(cpu, f64::from(at[0]), f64::from(at[1])).0 as f32;
-    let toward = [-0.62f32, 0.78];
-    let eye = [at[0] + toward[0] * distance, at[1] + toward[1] * distance];
-    let under = field(cpu, f64::from(eye[0]), f64::from(eye[1])).0 as f32;
-    let eye_y = (ground + 6.0 + distance * 0.08).max(under + 4.0);
-    c.hold([eye[0], eye_y, eye[1]], [at[0], ground + 6.0, at[1]]);
+    face_tree(c, cpu, distance);
     // Settled (the static shadows redrawn, temporal AA's history full), then converged: the
     // mean of the 16 frames of the jitter's cycle; the tree where any of them shows it.
     c.steps(48);
@@ -1017,6 +1065,19 @@ fn solo(
     }
     let screen = sum.iter().map(|s| ((s + 8) / 16) as u8).collect();
     (screen, count)
+}
+
+/// How much brighter frame `b` is than `a` over some of their pixels (RGBA8), on average over
+/// the colour channels (/255), and over how many pixels.
+fn brighter(a: &[u8], b: &[u8], pixels: impl Iterator<Item = usize>) -> (f64, usize) {
+    let (mut sum, mut n) = (0.0, 0);
+    for i in pixels {
+        for ch in 0..3 {
+            sum += f64::from(b[4 * i + ch]) - f64::from(a[4 * i + ch]);
+        }
+        n += 1;
+    }
+    (sum / (3 * n) as f64, n)
 }
 
 /// Two frames compared over a crown's box (the pixels either shows it in, and round them),
@@ -1088,34 +1149,19 @@ fn a_crown_matches_where_its_levels_meet() {
             let (b, cb) = solo(&mut c, &mut cpu, kind, distance, far.0, far.1);
             let (ta, tb): (Vec<bool>, Vec<bool>) =
                 (ca.iter().map(|&n| n > 0).collect(), cb.iter().map(|&n| n > 0).collect());
-            let mut solid = (0.0, 0.0);
-            for i in (0..ca.len()).filter(|&i| ca[i] == 16 && cb[i] == 16) {
-                for ch in 0..3 {
-                    solid.0 += f64::from(b[4 * i + ch]) - f64::from(a[4 * i + ch]);
-                }
-                solid.1 += 3.0;
-            }
+            let (solid, n_solid) =
+                brighter(&a, &b, (0..ca.len()).filter(|&i| ca[i] == 16 && cb[i] == 16));
             println!(
-                "  where both always show it: the farther level brighter by {:.2}/255 over {} pixels",
-                solid.0 / solid.1,
-                solid.1 / 3.0
+                "  where both always show it: the farther level brighter by {solid:.2}/255 over {n_solid} pixels"
             );
             let union = (0..ta.len()).filter(|&i| ta[i] || tb[i]);
-            let (raw, over, n) = compare(&a, &b, union);
+            let (raw, over, n) = image_difference_over(&a, &b, union);
             let (mean, blocks) = blocked(&a, &b, &ta, &tb, block);
             let (m8, _) = blocked(&a, &b, &ta, &tb, 8);
             let (m16, _) = blocked(&a, &b, &ta, &tb, 16);
-            let mut bias = 0.0;
-            let mut nb_ = 0.0;
-            for i in (0..ta.len()).filter(|&i| ta[i] && tb[i]) {
-                for ch in 0..3 {
-                    bias += f64::from(b[4 * i + ch]) - f64::from(a[4 * i + ch]);
-                }
-                nb_ += 3.0;
-            }
+            let (bias, _) = brighter(&a, &b, (0..ta.len()).filter(|&i| ta[i] && tb[i]));
             println!(
-                "  blocks of 8: {m8:.2}, of 16: {m16:.2}; the farther level brighter by {:.2}/255",
-                bias / nb_
+                "  blocks of 8: {m8:.2}, of 16: {m16:.2}; the farther level brighter by {bias:.2}/255"
             );
             let (na, nb) = (ta.iter().filter(|x| **x).count(), tb.iter().filter(|x| **x).count());
             report.push((kind, distance, mean, n));
@@ -1198,11 +1244,15 @@ fn draws_after(batch: &[u8], name: &str) -> usize {
 #[test]
 #[ignore = "needs a GPU"]
 fn static_shadows_are_drawn_once_and_again_when_the_sun_moves() {
+    // The draws into the static cascades in each batch since the last call.
+    let statics = |c: &mut Clearing| -> Vec<usize> {
+        c.batches().iter().map(|b| draws_after(b, "shadows static")).collect()
+    };
     let mut c = Clearing::load_recording("clearing-static");
     let mut drawn = Vec::new();
     for _ in 0..30 {
         c.step();
-        drawn.push(c.batches().iter().map(|b| draws_after(b, "shadows static")).sum::<usize>());
+        drawn.push(statics(&mut c).iter().sum::<usize>());
     }
     let frames: Vec<usize> = (0..drawn.len()).filter(|&i| drawn[i] > 0).collect();
     assert_eq!(frames.len(), 1, "the frames that drew static shadows at load: {drawn:?}");
@@ -1211,7 +1261,7 @@ fn static_shadows_are_drawn_once_and_again_when_the_sun_moves() {
     c.until_ready(2);
     c.batches();
     c.steps(30);
-    let steady: Vec<usize> = c.batches().iter().map(|b| draws_after(b, "shadows static")).collect();
+    let steady = statics(&mut c);
     assert!(steady.iter().all(|&n| n == 0), "steady frames draw static shadows: {steady:?}");
     let sun = [0.85f32, 0.45, -0.25];
     c.call(
@@ -1219,10 +1269,10 @@ fn static_shadows_are_drawn_once_and_again_when_the_sun_moves() {
         &[Value::F32(sun[0]), Value::F32(sun[1]), Value::F32(sun[2]), Value::F32(1.0)],
     );
     c.step();
-    let moved: usize = c.batches().iter().map(|b| draws_after(b, "shadows static")).sum();
+    let moved: usize = statics(&mut c).iter().sum();
     assert_eq!(moved, first, "moving the sun drew {moved} times, the first frame {first}");
     c.steps(5);
-    let after: usize = c.batches().iter().map(|b| draws_after(b, "shadows static")).sum();
+    let after: usize = statics(&mut c).iter().sum();
     assert_eq!(after, 0, "frames after the sun moved still draw static shadows");
 }
 
@@ -1566,10 +1616,13 @@ fn the_upscaled_frame_matches_the_native_one() {
     for (view, what) in [(VIEW_LOOK, "the look"), (VIEW_TEMPORAL, "temporal AA's output")] {
         let (half, tags) = settled_start("clearing-upscaled", 2, view);
         let (native, _) = settled_start("clearing-native", 1, view);
-        let (mean, over, _) = compare(&half, &native, 0..(W * H) as usize);
+        let (mean, over, _) = image_difference_over(&half, &native, 0..(W * H) as usize);
         for k in 0..8 {
-            let (m, o, n) =
-                compare(&half, &native, (0..(W * H) as usize).filter(|&i| class(tags[i][3]) == k));
+            let (m, o, n) = image_difference_over(
+                &half,
+                &native,
+                (0..(W * H) as usize).filter(|&i| class(tags[i][3]) == k),
+            );
             if n > 0 {
                 println!("  class {k}: {n} pixels, mean {m:.2}/255, {:.1}% over 8/255", o * 100.0);
             }
@@ -1593,19 +1646,11 @@ fn the_upscaled_frame_matches_the_native_one() {
             &native,
         )
         .expect("write");
-        let diff: Vec<u8> = half
-            .chunks(4)
-            .zip(native.chunks(4))
-            .flat_map(|(a, b)| {
-                let d = |c: usize| (u32::from(a[c].abs_diff(b[c])) * 8).min(255) as u8;
-                [d(0), d(1), d(2), 255]
-            })
-            .collect();
         wrela_host::image::write_png(
             &dir.join(format!("clearing-upscaled-diff-{view}.png")),
             W,
             H,
-            &diff,
+            &diff_image(&half, &native, 8),
         )
         .expect("write");
         means.push((what, mean));
@@ -1674,7 +1719,7 @@ fn warp_error(
                 let top = at(x0, y0, ch) * (1.0 - tx) + at(x1, y0, ch) * tx;
                 let bottom = at(x0, y1, ch) * (1.0 - tx) + at(x1, y1, ch) * tx;
                 let a = top * (1.0 - ty) + bottom * ty;
-                let d = a.sub_abs(f64::from(sb[4 * o + ch]));
+                let d = (a - f64::from(sb[4 * o + ch])).abs();
                 d3 += d;
                 most = most.max(d);
             }
@@ -1691,16 +1736,6 @@ fn warp_error(
     }
     let nf = n.max(1) as f64;
     (sum / nf, over as f64 / nf, n, motion / nf)
-}
-
-trait SubAbs {
-    fn sub_abs(self, other: f64) -> f64;
-}
-
-impl SubAbs for f64 {
-    fn sub_abs(self, other: f64) -> f64 {
-        (self - other).abs()
-    }
 }
 
 /// The look's flicker over the camera path's first 10 s (the wind still): each frame warped
@@ -1958,15 +1993,9 @@ fn the_start_against_spike_15s_still() {
             }
         }
     }
-    let (mean, over, n) = compare(&ours, &theirs, (0..output.len()).filter(|&i| !apart[i]));
-    let diff: Vec<u8> = ours
-        .chunks(4)
-        .zip(theirs.chunks(4))
-        .flat_map(|(a, b)| {
-            let d = |c: usize| (a[c].abs_diff(b[c]) as u32 * 4).min(255) as u8;
-            [d(0), d(1), d(2), 255]
-        })
-        .collect();
+    let (mean, over, n) =
+        image_difference_over(&ours, &theirs, (0..output.len()).filter(|&i| !apart[i]));
+    let diff = diff_image(&ours, &theirs, 4);
     wrela_host::image::write_png(&dir.join("clearing-m5-start-diff.png"), W, H, &diff)
         .expect("write");
     println!(
@@ -1978,41 +2007,60 @@ fn the_start_against_spike_15s_still() {
 
 // ---- zero pop-in (the owner's ask) ---------------------------------------------------------
 
-/// A frame's pixels within the circle a crown covers on screen (its middle `centre` and its
-/// reach `r` projected), as display values.
-fn crown_pixels(c: &mut Clearing, centre: [f64; 3], r: f64) -> Vec<[u8; 3]> {
-    let cam = Cam { jitter: [0.0, 0.0], ..c.camera() };
-    let Some((px, _)) = cam.project(centre, [f64::from(W), f64::from(H)]) else {
-        return Vec::new();
-    };
-    let d = len(sub(centre, cam.eye));
-    let radius = r / (d * 2.0 * cam.tan_half) * f64::from(H);
-    let screen = c.screen();
-    let mut out = Vec::new();
-    let x0 = (px[0] - radius).max(0.0) as usize;
-    let x1 = (px[0] + radius).min(f64::from(W) - 1.0) as usize;
-    let y0 = (px[1] - radius).max(0.0) as usize;
-    let y1 = (px[1] + radius).min(f64::from(H) - 1.0) as usize;
-    for y in y0..=y1 {
-        for x in x0..=x1 {
-            let (dx, dy) = (x as f64 + 0.5 - px[0], y as f64 + 0.5 - px[1]);
-            if dx * dx + dy * dy <= radius * radius {
-                let i = 4 * (y * W as usize + x);
-                out.push([screen[i], screen[i + 1], screen[i + 2]]);
-            }
-        }
-    }
-    out
+/// The pixels within the circle a crown covers on screen (its middle and its reach projected by
+/// the held camera, unjittered): found once while the camera is held, then read from each frame.
+struct Crown {
+    /// The circle's box on the screen: its top left corner and its size.
+    corner: [u32; 2],
+    size: [u32; 2],
+    /// The circle's pixels, as indices into the box.
+    pixels: Vec<usize>,
 }
 
-/// The mean of |a − b| over two lists of pixels' channels (/255).
-fn mean_change(a: &[[u8; 3]], b: &[[u8; 3]]) -> f64 {
-    let sum: f64 = a
-        .iter()
-        .zip(b)
-        .map(|(p, q)| (0..3).map(|ch| f64::from(p[ch].abs_diff(q[ch]))).sum::<f64>())
-        .sum();
-    sum / (3.0 * a.len().max(1) as f64)
+impl Crown {
+    /// The circle of the crown whose middle is `centre`, `r` its reach.
+    fn new(c: &mut Clearing, centre: [f64; 3], r: f64) -> Crown {
+        let none = Crown { corner: [0, 0], size: [0, 0], pixels: Vec::new() };
+        let cam = Cam { jitter: [0.0, 0.0], ..c.camera() };
+        let Some((px, _)) = cam.project(centre, [f64::from(W), f64::from(H)]) else {
+            return none;
+        };
+        let d = len(sub(centre, cam.eye));
+        let radius = r / (d * 2.0 * cam.tan_half) * f64::from(H);
+        let x0 = (px[0] - radius).max(0.0) as u32;
+        let x1 = (px[0] + radius).min(f64::from(W) - 1.0) as u32;
+        let y0 = (px[1] - radius).max(0.0) as u32;
+        let y1 = (px[1] + radius).min(f64::from(H) - 1.0) as u32;
+        if x1 < x0 || y1 < y0 {
+            return none;
+        }
+        let w = x1 - x0 + 1;
+        let mut pixels = Vec::new();
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                let (dx, dy) = (f64::from(x) + 0.5 - px[0], f64::from(y) + 0.5 - px[1]);
+                if dx * dx + dy * dy <= radius * radius {
+                    pixels.push(((y - y0) * w + x - x0) as usize);
+                }
+            }
+        }
+        Crown { corner: [x0, y0], size: [w, y1 - y0 + 1], pixels }
+    }
+
+    /// The circle's pixels in the last frame, as display values (RGBA8).
+    fn read(&self, c: &mut Clearing) -> Vec<u8> {
+        if self.pixels.is_empty() {
+            return Vec::new();
+        }
+        let ([x, y], [w, h]) = (self.corner, self.size);
+        let region = c.host.read_screen_region(x, y, w, h).expect("read the crown's pixels");
+        self.pixels.iter().flat_map(|&i| &region[4 * i..4 * i + 4]).copied().collect()
+    }
+}
+
+/// The mean of |a − b| over the channels of two reads of a crown's pixels (/255).
+fn mean_change(a: &[u8], b: &[u8]) -> f64 {
+    image_difference_over(a, b, 0..a.len() / 4).0
 }
 
 /// Zero pop-in: a lone tree changes level smoothly. The camera is held and the wind still, and
@@ -2033,9 +2081,7 @@ fn trees_change_level_without_popping() {
     c.off(off::GRASS | off::CREATURE | off::STONES | off::WIND);
     let (dir, _) = built("clearing-pop-cpu");
     let mut cpu = wrela_host::CpuHost::load(&dir).expect("load on the CPU");
-    let at = [-260.0f32, 520.0];
-    let toward = [-0.62f32, 0.78];
-    let ground = field(&mut cpu, f64::from(at[0]), f64::from(at[1])).0 as f32;
+    let at = TREE_AT;
     let lod = |c: &mut Clearing, cards_to: f32, impostors_to: f32, card_px: f32| {
         c.call("test_lod", &[Value::F32(cards_to), Value::F32(impostors_to), Value::F32(card_px)]);
     };
@@ -2057,10 +2103,7 @@ fn trees_change_level_without_popping() {
             let solo = [kind as i32].map(Value::I32);
             let place = [at[0], at[1], from[0], from[1]].map(Value::F32);
             c.call("test_solo", &[solo[0], place[0], place[1], place[2], place[3]]);
-            let eye = [at[0] + toward[0] * distance, at[1] + toward[1] * distance];
-            let under = field(&mut cpu, f64::from(eye[0]), f64::from(eye[1])).0 as f32;
-            let eye_y = (ground + 6.0 + distance * 0.08).max(under + 4.0);
-            c.hold([eye[0], eye_y, eye[1]], [at[0], ground + 6.0, at[1]]);
+            let ground = face_tree(&mut c, &mut cpu, distance);
             c.step();
             let args = [Value::I32(kind as i32), Value::F32(at[0]), Value::F32(at[1])];
             let px = c.call("test_card_px", &args)[0] as f32;
@@ -2068,14 +2111,15 @@ fn trees_change_level_without_popping() {
             let centre = [f64::from(at[0]), f64::from(ground) + 6.0, f64::from(at[1])];
             c.steps(64);
             // A still frame's noise: the same jitter, 16 frames on.
-            let still_a = crown_pixels(&mut c, centre, reach);
+            let crown = Crown::new(&mut c, centre, reach);
+            let still_a = crown.read(&mut c);
             c.steps(16);
-            let still_b = crown_pixels(&mut c, centre, reach);
+            let still_b = crown.read(&mut c);
             let noise = mean_change(&still_a, &still_b);
             // The crown every `every`th frame of the sweep; a quarter second is `gap` of them.
             let every = wrela_tests::sized(4, 1);
             let gap = 16 / every as usize;
-            let mut seen: Vec<Vec<[u8; 3]>> = vec![still_b];
+            let mut seen: Vec<Vec<u8>> = vec![still_b];
             for f in 1..=frames {
                 let t = f as f32 / frames as f32;
                 let lerp = |k: usize| from[k] + (to[k] - from[k]) * t;
@@ -2084,12 +2128,12 @@ fn trees_change_level_without_popping() {
                 lod(&mut c, lerp(0), lerp(1), card_px);
                 c.step();
                 if f.is_multiple_of(every) {
-                    seen.push(crown_pixels(&mut c, centre, reach));
+                    seen.push(crown.read(&mut c));
                 }
             }
             let swept = seen.len();
             c.steps(48);
-            seen.push(crown_pixels(&mut c, centre, reach));
+            seen.push(crown.read(&mut c));
             let whole = mean_change(&seen[0], seen.last().expect("frames"));
             if std::env::var("CLEARING_SERIES").is_ok() && kind == 0 {
                 let series: Vec<String> = (0..swept - gap)
@@ -2342,35 +2386,13 @@ fn sixty_frames_a_second_over_the_path_in_chrome() {
 /// for edits that leave the repository's files alone.
 fn clearing_copy(name: &str) -> PathBuf {
     let dir = super::scratch(name);
-    wrela_tests::copy_dir(&repo_root().join("examples/clearing"), &dir);
-    let manifest = dir.join("wrela.toml");
-    let text = std::fs::read_to_string(&manifest).expect("wrela.toml");
-    let abs = |p: &str| repo_root().join(p).display().to_string();
-    let text = text
-        .replace("\"../../engine\"", &format!("{:?}", abs("engine")))
-        .replace("\"../fawn\"", &format!("{:?}", abs("examples/fawn")))
-        .replace("\"../great-tree\"", &format!("{:?}", abs("examples/great-tree")));
-    std::fs::write(&manifest, text).expect("write wrela.toml");
+    wrela_tests::copy_package(&repo_root().join("examples/clearing"), &dir);
     dir
 }
 
-/// Edits `file` of the package at `pkg`: replaces `from` with `to`, once.
+/// Edits `file` of the package at `pkg`: replaces `from` with `to`, once. When it was written.
 fn edit_file(pkg: &std::path::Path, file: &str, from: &str, to: &str) -> std::time::Instant {
-    let path = pkg.join(file);
-    let text = std::fs::read_to_string(&path).expect("the file");
-    assert!(text.contains(from), "{file} has no `{from}`");
-    std::fs::write(&path, text.replacen(from, to, 1)).expect("write the file");
-    std::time::Instant::now()
-}
-
-/// The mean difference of two frames (RGBA8), over RGB, in /255.
-fn mean_difference(a: &[u8], b: &[u8]) -> f64 {
-    let sum: u64 = a
-        .chunks(4)
-        .zip(b.chunks(4))
-        .map(|(p, q)| (0..3).map(|c| p[c].abs_diff(q[c]) as u64).sum::<u64>())
-        .sum();
-    sum as f64 / (a.len() / 4 * 3) as f64
+    wrela_tests::write_edit(pkg, file, |text| text.replacen(from, to, 1))
 }
 
 /// AC9's hot reload in the native host: the clearing, built lifted and watched
@@ -2389,12 +2411,7 @@ fn hot_reload_in_the_native_host() {
     let mut watcher =
         wrela_driver::live::Watcher::start(&pkg, &out, &[], false).expect("the first build");
     let options = Options { quiet: true, ..Options::default() };
-    let mut c = Clearing {
-        host: Host::load_with(watcher.dir(), &options).expect("load"),
-        frame: 0,
-        fps: 60.0,
-        script: Vec::new(),
-    };
+    let mut c = Clearing::on(Host::load_with(watcher.dir(), &options).expect("load"));
     c.walk();
     c.until_ready(0);
     while c.path_time() < 2.0 {
@@ -2422,7 +2439,7 @@ fn hot_reload_in_the_native_host() {
         }
     }
     let after = c.host.read_screen().expect("the screen");
-    let changed = mean_difference(&before, &after);
+    let changed = wrela_tests::spike01::image_difference(&before, &after).0;
     // A structural edit: the field of view narrowed by a new factor in the code.
     let cam_before = c.camera();
     let t = edit_file(
@@ -2471,12 +2488,7 @@ fn hot_reload_in_the_native_host() {
         (ratio - (0.8f64 * 21f64.to_radians()).tan() / 21f64.to_radians().tan()).abs() < 1e-4,
         "{ratio}"
     );
-    let mut fresh = Clearing {
-        host: Host::load_with(watcher.dir(), &options).expect("load"),
-        frame: 0,
-        fps: 60.0,
-        script: Vec::new(),
-    };
+    let mut fresh = Clearing::on(Host::load_with(watcher.dir(), &options).expect("load"));
     fresh.walk();
     while fresh.frame < c.frame {
         fresh.step();
@@ -2489,27 +2501,6 @@ fn hot_reload_in_the_native_host() {
         b.eye,
         a.eye
     );
-}
-
-/// Waits until the `wrela run` server has had `n` changes shown, or panics after `limit`.
-fn shown_by(
-    server: &wrela_driver::live::Server,
-    n: usize,
-    limit: std::time::Duration,
-) -> wrela_driver::live::Shown {
-    let began = std::time::Instant::now();
-    loop {
-        let shown = server.shown();
-        if shown.len() >= n {
-            return shown[n - 1].clone();
-        }
-        assert!(
-            began.elapsed() < limit,
-            "change {n} wasn't shown in {limit:?}: {:?}",
-            server.changes()
-        );
-        std::thread::sleep(std::time::Duration::from_millis(2));
-    }
 }
 
 /// AC9's hot reload in Chrome: the clearing served by `wrela run` (`wrela_driver::live`), at
@@ -2534,11 +2525,11 @@ fn hot_reload_in_chrome() {
     let limit = std::time::Duration::from_secs(60);
     // A first edit, shown once the page draws: temporal AA's blend, read each frame.
     edit_file(&pkg, "main.wrela", "blend: 0.12,", "blend: 0.121,");
-    shown_by(&server, 1, limit);
+    wrela_tests::wait_shown(&server, 1, limit);
     std::thread::sleep(std::time::Duration::from_secs(2));
     let t =
         edit_file(&pkg, "scene.wrela", "vec3(0.900, 0.407, -0.159)", "vec3(0.900, 0.250, -0.159)");
-    let literal = shown_by(&server, 2, limit);
+    let literal = wrela_tests::wait_shown(&server, 2, limit);
     let literal_ms = t.elapsed().as_secs_f64() * 1000.0;
     std::thread::sleep(std::time::Duration::from_secs(2));
     let t = edit_file(
@@ -2547,7 +2538,7 @@ fn hot_reload_in_chrome() {
         "        FOVY,\n        width: w,",
         "        FOVY * 0.8,\n        width: w,",
     );
-    let structural = shown_by(&server, 3, limit);
+    let structural = wrela_tests::wait_shown(&server, 3, limit);
     let structural_ms = t.elapsed().as_secs_f64() * 1000.0;
     chrome.join().expect("the Chrome run");
     println!(
