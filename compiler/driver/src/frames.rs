@@ -113,6 +113,22 @@ struct Failed {
     phase: String,
 }
 
+/// A test failed `phase` (where in its run) with `error`, the host's last failure `failure`
+/// behind it.
+fn failed(
+    error: wrela_host::Error,
+    failure: Option<&wrela_host::Failure>,
+    phase: String,
+) -> Option<Failed> {
+    let fault = failure.map(|f| Fault {
+        frames: f.frames.clone(),
+        trap: f.trap,
+        panic: f.panic.clone(),
+        text: String::new(),
+    });
+    Some(Failed { error, fault, phase })
+}
+
 /// What a test's runs get: a script of input events, or (a tick test) a tick log.
 enum Input {
     Script(Vec<wrela_host::Scripted>),
@@ -147,15 +163,6 @@ fn run_gpu(
     frames: u32,
     script: &[wrela_host::Scripted],
 ) -> Option<Failed> {
-    let failed = |error, host: Option<&wrela_host::Host>, phase: String| {
-        let fault = host.and_then(|h| h.last_failure()).map(|f| Fault {
-            frames: f.frames.clone(),
-            trap: f.trap,
-            panic: f.panic.clone(),
-            text: String::new(),
-        });
-        Some(Failed { error, fault, phase })
-    };
     let _ = std::fs::create_dir_all(storage);
     let options = wrela_host::Options {
         storage: Some(storage.to_path_buf()),
@@ -169,16 +176,16 @@ fn run_gpu(
         Err(e) => return failed(e, None, "as it started".to_string()),
     };
     if let Err(e) = host.init() {
-        return failed(e, Some(&host), "in `init`".to_string());
+        return failed(e, host.last_failure(), "in `init`".to_string());
     }
     for k in 0..frames {
         if let Err(e) = host.lockstep_frame(k, FPS, WIDTH, HEIGHT, script) {
-            return failed(e, Some(&host), format!("in frame {k} of {frames}"));
+            return failed(e, host.last_failure(), format!("in frame {k} of {frames}"));
         }
     }
     match host.call_export(&format!("test.{i}"), &[]) {
         Ok(_) => None,
-        Err(e) => failed(e, Some(&host), format!("after {frames} frames")),
+        Err(e) => failed(e, host.last_failure(), format!("after {frames} frames")),
     }
 }
 
@@ -202,15 +209,6 @@ fn run_one(
     run: TestRun,
     input: &Input,
 ) -> Option<Failed> {
-    let failed = |error, host: Option<&wrela_host::CpuHost>, phase: String| {
-        let fault = host.and_then(|h| h.last_failure()).map(|f| Fault {
-            frames: f.frames.clone(),
-            trap: f.trap,
-            panic: f.panic.clone(),
-            text: String::new(),
-        });
-        Some(Failed { error, fault, phase })
-    };
     let _ = std::fs::create_dir_all(storage);
     // One thread: a parallel job's chunks all run on it, and the result is the same (§6.12).
     let mut host = match built.instantiate_in(1, Some(storage)) {
@@ -223,7 +221,7 @@ fn run_one(
     };
     host.want_hashes(log.is_some());
     if let Err(e) = host.init() {
-        return failed(e, Some(&host), "in `init`".to_string());
+        return failed(e, host.last_failure(), "in `init`".to_string());
     }
     let mismatch = |why: String| {
         Some(Failed { error: wrela_host::Error::Program(why), fault: None, phase: String::new() })
@@ -232,7 +230,7 @@ fn run_one(
         TestRun::Frames(frames) => {
             for k in 0..frames {
                 if let Err(e) = host.lockstep_frame(k, FPS, WIDTH, HEIGHT, script) {
-                    return failed(e, Some(&host), format!("in frame {k} of {frames}"));
+                    return failed(e, host.last_failure(), format!("in frame {k} of {frames}"));
                 }
             }
             format!("after {frames} frames")
@@ -250,9 +248,11 @@ fn run_one(
                 Some(log) => {
                     if let Err(e) = host.replay_ticks(log, ticks) {
                         return match e {
-                            wrela_host::ReplayError::Failed { tick, error } => {
-                                failed(error, Some(&host), tick.map_or_else(String::new, in_tick))
-                            }
+                            wrela_host::ReplayError::Failed { tick, error } => failed(
+                                error,
+                                host.last_failure(),
+                                tick.map_or_else(String::new, in_tick),
+                            ),
                             why => mismatch(format!("its tick log doesn't replay: {why}")),
                         };
                     }
@@ -265,7 +265,7 @@ fn run_one(
                     for k in 0..ticks {
                         host.push_records(wrela_abi::input::records_at(script, k));
                         if let Err(e) = host.tick() {
-                            return failed(e, Some(&host), in_tick(k));
+                            return failed(e, host.last_failure(), in_tick(k));
                         }
                     }
                 }
@@ -275,7 +275,7 @@ fn run_one(
     };
     match host.call_export(&format!("test.{i}"), &[]) {
         Ok(_) => None,
-        Err(e) => failed(e, Some(&host), after),
+        Err(e) => failed(e, host.last_failure(), after),
     }
 }
 

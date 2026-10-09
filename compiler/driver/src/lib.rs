@@ -92,7 +92,7 @@ pub const STACK_SIZE: usize = 256 << 20;
 
 /// Checks the package at `root`: every diagnostic, including those lowering finds.
 pub fn check(root: &Path) -> Output {
-    on_compiler_thread(|| compile(root, Mode::Check, wrela_lower::Roots::of, &[]))
+    on_compiler_thread(|| compile(root, Mode::CHECK, wrela_lower::Roots::of, &[]))
 }
 
 /// Files' texts that stand in for what's on disk, by their canonical paths: for checking a
@@ -101,37 +101,41 @@ pub type Overlay = std::collections::HashMap<std::path::PathBuf, String>;
 
 /// [`check`], with `overlay`'s texts in place of those files' on disk.
 pub fn check_with(root: &Path, overlay: &Overlay) -> Output {
-    on_compiler_thread(|| compile_with(root, Mode::Check, wrela_lower::Roots::of, &[], overlay))
+    on_compiler_thread(|| compile_with(root, Mode::CHECK, wrela_lower::Roots::of, &[], overlay))
 }
 
 /// Builds the package at `root`: its diagnostics, and its files when there are no errors.
 pub fn build(root: &Path) -> Output {
-    on_compiler_thread(|| compile(root, Mode::Release, wrela_lower::Roots::of, &[]))
+    on_compiler_thread(|| compile(root, Mode::RELEASE, wrela_lower::Roots::of, &[]))
 }
 
 /// [`build`] in debug mode: the build pays for checks a release build doesn't make, such as a
 /// trap where a float operation creates a NaN (language.md §11).
 pub fn build_debug(root: &Path) -> Output {
-    on_compiler_thread(|| compile(root, Mode::Debug, wrela_lower::Roots::of, &[]))
+    on_compiler_thread(|| {
+        compile(root, Mode { debug: true, ..Mode::RELEASE }, wrela_lower::Roots::of, &[])
+    })
 }
 
 /// A test build of the package (§9): [`build`], or [`build_debug`] if `debug`, with the
 /// program's `@testing` exports, and `std::mem::test_build()` true. What a test harness runs.
 pub fn build_for_tests(root: &Path, debug: bool) -> Output {
-    let mode = if debug { Mode::TestingDebug } else { Mode::Testing };
+    let mode = Mode { debug, testing: true, ..Mode::RELEASE };
     on_compiler_thread(|| compile(root, mode, wrela_lower::Roots::of, &[]))
 }
 
 /// [`build`], lowering every function of the package that can be lowered on its own, exported
 /// or not ([`wrela_lower::Roots::every_fn`]): for tests of code that nothing calls.
 pub fn build_every_fn(root: &Path) -> Output {
-    on_compiler_thread(|| compile(root, Mode::Release, wrela_lower::Roots::every_fn, &[]))
+    on_compiler_thread(|| compile(root, Mode::RELEASE, wrela_lower::Roots::every_fn, &[]))
 }
 
 /// [`build`], with no SIMD in the WASM (language.md §11): for the test that a build with SIMD
 /// gives the same results, bit for bit.
 pub fn build_without_simd(root: &Path) -> Output {
-    on_compiler_thread(|| compile(root, Mode::NoSimd, wrela_lower::Roots::of, &[]))
+    on_compiler_thread(|| {
+        compile(root, Mode { no_simd: true, ..Mode::RELEASE }, wrela_lower::Roots::of, &[])
+    })
 }
 
 /// A lifted build (language.md §22): [`build`], with each `f32` literal of the packages named
@@ -151,7 +155,7 @@ pub fn build_lifted(root: &Path, lift: &[String], debug: bool) -> Result<Output,
                 ));
             }
         }
-        let mode = if debug { Mode::Debug } else { Mode::Release };
+        let mode = Mode { debug, ..Mode::RELEASE };
         Ok(compile_loaded(root, mode, wrela_lower::Roots::of, lift, loaded))
     })
 }
@@ -360,18 +364,21 @@ fn run_tests(root: &Path, filter: Option<&str>, kind: PackageKind, fuel: u64) ->
     TestOutput { sources, diagnostics, results, filtered_out }
 }
 
-/// What a compile makes.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Mode {
-    /// Diagnostics only.
-    Check,
-    Release,
-    Debug,
-    /// A release build whose WASM has no SIMD.
-    NoSimd,
-    /// A test build (§9): release, or debug, with the program's `@testing` exports.
-    Testing,
-    TestingDebug,
+/// What a compile makes: diagnostics only, or a build (`emit`), of these kinds (as
+/// [`wrela_lower::BuildData`] says them).
+#[derive(Clone, Copy)]
+struct Mode {
+    emit: bool,
+    debug: bool,
+    /// WASM with no SIMD.
+    no_simd: bool,
+    /// A test build (§9), with the program's `@testing` exports.
+    testing: bool,
+}
+
+impl Mode {
+    const CHECK: Mode = Mode { emit: false, debug: false, no_simd: false, testing: false };
+    const RELEASE: Mode = Mode { emit: true, ..Mode::CHECK };
 }
 
 /// Runs `f` on a thread with the compiler's stack ([`STACK_SIZE`]), and gives back what it
@@ -414,7 +421,6 @@ fn compile_loaded(
     lift: &[String],
     (sources, mut diagnostics, loaded): (SourceMap, Vec<Diagnostic>, Option<Loaded>),
 ) -> Output {
-    let emit = mode != Mode::Check;
     let Some(Loaded { units, mut packages, dirs, files: all_files }) = loaded else {
         let std_warnings = split_std_warnings(&sources, &mut diagnostics);
         return Output {
@@ -445,9 +451,9 @@ fn compile_loaded(
     let mut files = Vec::new();
     let mut pipelines = Vec::new();
     let mut data = wrela_lower::BuildData {
-        debug: matches!(mode, Mode::Debug | Mode::TestingDebug),
-        no_simd: mode == Mode::NoSimd,
-        testing: matches!(mode, Mode::Testing | Mode::TestingDebug),
+        debug: mode.debug,
+        no_simd: mode.no_simd,
+        testing: mode.testing,
         ..Default::default()
     };
     prepare(&checked, &sources, &dirs, &mut data, &mut diagnostics);
@@ -456,13 +462,14 @@ fn compile_loaded(
     }
     if !has_errors(&diagnostics) {
         let roots = roots(&checked);
-        let (lowered, d) = wrela_lower::lower(&checked, &roots, &data, emit);
+        let (lowered, d) = wrela_lower::lower(&checked, &roots, &data, mode.emit);
         let ok = !has_errors(&d);
         diagnostics.extend(d);
         pipelines = summarize(&checked, &sources, &lowered);
-        if ok && emit {
-            // A shipped build keeps its budgets; a test's, a debug or a lifted one may go over.
-            let budgets = mode == Mode::Release && lift.is_empty();
+        if ok && mode.emit {
+            // A shipped build keeps its budgets; a test's, a debug, a lifted or a SIMD-less
+            // one may go over.
+            let budgets = !(mode.debug || mode.no_simd || mode.testing) && lift.is_empty();
             let out = build::emit(&lowered, &sources, !data.no_simd, budgets);
             diagnostics.extend(out.diagnostics);
             files = out.files;
