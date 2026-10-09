@@ -7,6 +7,7 @@ import {
   COMMAND_HEADER_LEN,
   COMPARES,
   HEADER_LEN,
+  NONE,
   Opcode,
   SCREEN,
   STREAM_MAGIC,
@@ -42,6 +43,20 @@ export type Pass = {
   keepDepth: boolean;
   clearDepth: number;
 };
+
+/** Whether pass `next`, beginning right after `ended` ended, may run as part of it, as one
+ * render pass (`Pass::joins`, which the vectors check): it may join, on the same targets, kept
+ * (not cleared), and not the screen. */
+export function joins(next: Pass, ended: Pass): boolean {
+  return (
+    next.join &&
+    next.color !== SCREEN &&
+    next.color === ended.color &&
+    next.depth === ended.depth &&
+    (next.color === NONE || next.keepColor) &&
+    (next.depth === NONE || next.keepDepth)
+  );
+}
 
 export type Command =
   | { op: "CreateBuffer"; handle: number; size: number }

@@ -655,9 +655,9 @@
         "name": "a buffer used after it's destroyed"
       },
       {
-        "bytes": "5752435307000000680000000100000008000000010000000002000001000000080000000200000000020000030000004000000007000000010000000100000001000000020000000100000000000000000200000200000000000000000200001000000000000000000000000000000000000000",
+        "bytes": "5752435307000000680000000100000008000000010000000002000001000000080000000200000000020000030000004000000009000000010000000100000001000000020000000100000000000000000200000200000000000000000200001000000000000000000000000000000000000000",
         "error": {
-          "message": "Dispatch failed: there's no pipeline 7 (the manifest has 7)",
+          "message": "Dispatch failed: there's no pipeline 9 (the manifest has 9)",
           "opcode": "Dispatch"
         },
         "name": "no such pipeline"
@@ -979,6 +979,40 @@
         "name": "a clear depth that isn't finite"
       },
       {
+        "bytes": "57524353070000001801000001000000080000000100000000020000010000000800000002000000000200000900000010000000080000000400000004000000000000000900000010000000090000000400000004000000020000000c000000100000000a0000000100000000000000000000000c000000100000000b0000000000000000000000010000000e0000002400000008000000000000000000000000000000000000000000000009000000000000000000803f050000001400000007000000030000000100000000000000000000000f000000000000000e00000024000000ffffffff000000000000000000000000000000000000000009000000000000000000803f05000000140000000700000003000000010000000000000000000000",
+        "error": null,
+        "name": "fragments with their own depth, drawn with a depth target"
+      },
+      {
+        "bytes": "5752435307000000b400000001000000080000000100000000020000010000000800000002000000000200000900000010000000080000000400000004000000000000000900000010000000090000000400000004000000020000000c000000100000000a0000000100000000000000000000000c000000100000000b00000000000000000000000100000004000000100000000000000000000000000000000000000005000000140000000700000003000000010000000000000000000000",
+        "error": {
+          "message": "Draw failed: `with_depth` gives its fragments their depth, so it's drawn in a pass with a depth target, and this pass has none",
+          "opcode": "Draw"
+        },
+        "name": "fragments with their own depth, drawn without a depth target"
+      },
+      {
+        "bytes": "5752435307000000e000000001000000080000000100000000020000010000000800000002000000000200000900000010000000080000000400000004000000000000000900000010000000090000000400000004000000020000000c000000100000000a0000000100000000000000000000000c000000100000000b00000000000000000000000100000009000000100000000c0000000400000004000000060000000e000000240000000c000000000000000000000000000000000000000000000009000000000000000000803f05000000140000000800000003000000010000000000000000000000",
+        "error": null,
+        "name": "u32 fragments drawn into an r32uint target"
+      },
+      {
+        "bytes": "5752435307000000b400000001000000080000000100000000020000010000000800000002000000000200000900000010000000080000000400000004000000000000000900000010000000090000000400000004000000020000000c000000100000000a0000000100000000000000000000000c000000100000000b00000000000000000000000100000004000000100000000000000000000000000000000000000005000000140000000800000003000000010000000000000000000000",
+        "error": {
+          "message": "Draw failed: `ids`'s fragment shader returns a `u32`, so it's drawn into an r32uint target",
+          "opcode": "Draw"
+        },
+        "name": "u32 fragments drawn on the screen"
+      },
+      {
+        "bytes": "57524353070000000801000001000000080000000100000000020000010000000800000002000000000200000900000010000000080000000400000004000000000000000900000010000000090000000400000004000000020000000c000000100000000a0000000100000000000000000000000c000000100000000b00000000000000000000000100000009000000100000000c0000000400000004000000060000000e000000240000000c0000000000000000000000000000000000000000000000ffffffff000000000000803f110000003c000000000000000200000000000000020000000200000000010000040000000100000000000000000200001000000000000000000000000000000000000000",
+        "error": {
+          "message": "DrawIndirect failed: `draw`'s fragment shader returns a colour, so it's drawn into a colour target, not an integer one",
+          "opcode": "DrawIndirect"
+        },
+        "name": "colour fragments drawn into an r32uint target"
+      },
+      {
         "bytes": "5752435307000000380000000100000008000000010000000002000001000000080000000200000000020000120000001000000000000000010000000001000004010000",
         "error": {
           "message": "ReadBuffer failed: reading 260 bytes at offset 256 overruns buffer 1 (512 bytes)",
@@ -1024,7 +1058,7 @@
         "name": "requests, made rightly"
       }
     ],
-    "manifest": "{\n  \"manifest_version\": 7,\n  \"stream_version\": 7,\n  \"wasm\": \"game.wasm\",\n  \"pipelines\": [\n    {\n      \"name\": \"draw\",\n      \"shader\": \"draw.wgsl\",\n      \"kind\": \"render\",\n      \"vertex_entry\": \"vs\",\n      \"fragment_entry\": \"fs\",\n      \"uniform\": {\n        \"binding\": 0,\n        \"size\": 16,\n        \"space\": \"uniform\"\n      },\n      \"bindings\": [\n        {\n          \"binding\": 1,\n          \"kind\": \"read\"\n        },\n        {\n          \"binding\": 2,\n          \"kind\": \"read_write\"\n        }\n      ]\n    },\n    {\n      \"name\": \"compute\",\n      \"shader\": \"compute.wgsl\",\n      \"kind\": \"compute\",\n      \"entry\": \"main\",\n      \"workgroup_size\": [\n        64,\n        1,\n        1\n      ],\n      \"uniform\": {\n        \"binding\": 0,\n        \"size\": 16,\n        \"space\": \"uniform\"\n      },\n      \"bindings\": [\n        {\n          \"binding\": 1,\n          \"kind\": \"read\"\n        },\n        {\n          \"binding\": 2,\n          \"kind\": \"read_write\"\n        }\n      ]\n    },\n    {\n      \"name\": \"draw2\",\n      \"shader\": \"draw2.wgsl\",\n      \"kind\": \"render\",\n      \"vertex_entry\": \"vs\",\n      \"fragment_entry\": \"fs\",\n      \"uniform\": {\n        \"binding\": 0,\n        \"size\": 16,\n        \"space\": \"uniform\"\n      },\n      \"bindings\": [\n        {\n          \"binding\": 1,\n          \"kind\": \"read_write\"\n        },\n        {\n          \"binding\": 2,\n          \"kind\": \"read_write\"\n        }\n      ]\n    },\n    {\n      \"name\": \"compute2\",\n      \"shader\": \"compute2.wgsl\",\n      \"kind\": \"compute\",\n      \"entry\": \"main\",\n      \"workgroup_size\": [\n        64,\n        1,\n        1\n      ],\n      \"uniform\": {\n        \"binding\": 0,\n        \"size\": 16,\n        \"space\": \"uniform\"\n      },\n      \"bindings\": [\n        {\n          \"binding\": 1,\n          \"kind\": \"read_write\"\n        },\n        {\n          \"binding\": 2,\n          \"kind\": \"read_write\"\n        }\n      ]\n    },\n    {\n      \"name\": \"bare\",\n      \"shader\": \"bare.wgsl\",\n      \"kind\": \"compute\",\n      \"entry\": \"main\",\n      \"workgroup_size\": [\n        64,\n        1,\n        1\n      ],\n      \"uniform\": null,\n      \"bindings\": []\n    },\n    {\n      \"name\": \"textured\",\n      \"shader\": \"textured.wgsl\",\n      \"kind\": \"render\",\n      \"vertex_entry\": \"vs\",\n      \"fragment_entry\": \"fs\",\n      \"uniform\": null,\n      \"bindings\": [\n        {\n          \"binding\": 0,\n          \"kind\": \"texture\",\n          \"format\": \"rgba8unorm\"\n        },\n        {\n          \"binding\": 1,\n          \"kind\": \"sampler\"\n        },\n        {\n          \"binding\": 2,\n          \"kind\": \"depth_texture\"\n        },\n        {\n          \"binding\": 3,\n          \"kind\": \"comparison_sampler\"\n        }\n      ]\n    },\n    {\n      \"name\": \"volume\",\n      \"shader\": \"volume.wgsl\",\n      \"kind\": \"compute\",\n      \"entry\": \"main\",\n      \"workgroup_size\": [\n        4,\n        4,\n        4\n      ],\n      \"uniform\": null,\n      \"bindings\": [\n        {\n          \"binding\": 0,\n          \"kind\": \"texture_3d\",\n          \"format\": \"rgba8unorm\"\n        },\n        {\n          \"binding\": 1,\n          \"kind\": \"sampler\"\n        },\n        {\n          \"binding\": 2,\n          \"kind\": \"storage_texture_3d\",\n          \"format\": \"rgba16float\"\n        }\n      ]\n    }\n  ]\n}\n"
+    "manifest": "{\n  \"manifest_version\": 7,\n  \"stream_version\": 7,\n  \"wasm\": \"game.wasm\",\n  \"pipelines\": [\n    {\n      \"name\": \"draw\",\n      \"shader\": \"draw.wgsl\",\n      \"kind\": \"render\",\n      \"vertex_entry\": \"vs\",\n      \"fragment_entry\": \"fs\",\n      \"uniform\": {\n        \"binding\": 0,\n        \"size\": 16,\n        \"space\": \"uniform\"\n      },\n      \"bindings\": [\n        {\n          \"binding\": 1,\n          \"kind\": \"read\"\n        },\n        {\n          \"binding\": 2,\n          \"kind\": \"read_write\"\n        }\n      ]\n    },\n    {\n      \"name\": \"compute\",\n      \"shader\": \"compute.wgsl\",\n      \"kind\": \"compute\",\n      \"entry\": \"main\",\n      \"workgroup_size\": [\n        64,\n        1,\n        1\n      ],\n      \"uniform\": {\n        \"binding\": 0,\n        \"size\": 16,\n        \"space\": \"uniform\"\n      },\n      \"bindings\": [\n        {\n          \"binding\": 1,\n          \"kind\": \"read\"\n        },\n        {\n          \"binding\": 2,\n          \"kind\": \"read_write\"\n        }\n      ]\n    },\n    {\n      \"name\": \"draw2\",\n      \"shader\": \"draw2.wgsl\",\n      \"kind\": \"render\",\n      \"vertex_entry\": \"vs\",\n      \"fragment_entry\": \"fs\",\n      \"uniform\": {\n        \"binding\": 0,\n        \"size\": 16,\n        \"space\": \"uniform\"\n      },\n      \"bindings\": [\n        {\n          \"binding\": 1,\n          \"kind\": \"read_write\"\n        },\n        {\n          \"binding\": 2,\n          \"kind\": \"read_write\"\n        }\n      ]\n    },\n    {\n      \"name\": \"compute2\",\n      \"shader\": \"compute2.wgsl\",\n      \"kind\": \"compute\",\n      \"entry\": \"main\",\n      \"workgroup_size\": [\n        64,\n        1,\n        1\n      ],\n      \"uniform\": {\n        \"binding\": 0,\n        \"size\": 16,\n        \"space\": \"uniform\"\n      },\n      \"bindings\": [\n        {\n          \"binding\": 1,\n          \"kind\": \"read_write\"\n        },\n        {\n          \"binding\": 2,\n          \"kind\": \"read_write\"\n        }\n      ]\n    },\n    {\n      \"name\": \"bare\",\n      \"shader\": \"bare.wgsl\",\n      \"kind\": \"compute\",\n      \"entry\": \"main\",\n      \"workgroup_size\": [\n        64,\n        1,\n        1\n      ],\n      \"uniform\": null,\n      \"bindings\": []\n    },\n    {\n      \"name\": \"textured\",\n      \"shader\": \"textured.wgsl\",\n      \"kind\": \"render\",\n      \"vertex_entry\": \"vs\",\n      \"fragment_entry\": \"fs\",\n      \"uniform\": null,\n      \"bindings\": [\n        {\n          \"binding\": 0,\n          \"kind\": \"texture\",\n          \"format\": \"rgba8unorm\"\n        },\n        {\n          \"binding\": 1,\n          \"kind\": \"sampler\"\n        },\n        {\n          \"binding\": 2,\n          \"kind\": \"depth_texture\"\n        },\n        {\n          \"binding\": 3,\n          \"kind\": \"comparison_sampler\"\n        }\n      ]\n    },\n    {\n      \"name\": \"volume\",\n      \"shader\": \"volume.wgsl\",\n      \"kind\": \"compute\",\n      \"entry\": \"main\",\n      \"workgroup_size\": [\n        4,\n        4,\n        4\n      ],\n      \"uniform\": null,\n      \"bindings\": [\n        {\n          \"binding\": 0,\n          \"kind\": \"texture_3d\",\n          \"format\": \"rgba8unorm\"\n        },\n        {\n          \"binding\": 1,\n          \"kind\": \"sampler\"\n        },\n        {\n          \"binding\": 2,\n          \"kind\": \"storage_texture_3d\",\n          \"format\": \"rgba16float\"\n        }\n      ]\n    },\n    {\n      \"name\": \"with_depth\",\n      \"shader\": \"with_depth.wgsl\",\n      \"kind\": \"render\",\n      \"vertex_entry\": \"vs\",\n      \"fragment_entry\": \"fs\",\n      \"writes_depth\": true,\n      \"uniform\": null,\n      \"bindings\": []\n    },\n    {\n      \"name\": \"ids\",\n      \"shader\": \"ids.wgsl\",\n      \"kind\": \"render\",\n      \"vertex_entry\": \"vs\",\n      \"fragment_entry\": \"fs\",\n      \"uint\": true,\n      \"uniform\": null,\n      \"bindings\": []\n    }\n  ]\n}\n"
   },
   "comment": "Generated by the wrela-abi crate (runtime/abi/src/vectors.rs); don't edit. Run `cargo run -p wrela-abi --bin generate`.",
   "hashes": [
@@ -1156,6 +1190,328 @@
       "error": "event 0: `text` is missing",
       "name": "text that's missing",
       "script": "[{\"frame\": 0, \"type\": \"text\"}]"
+    }
+  ],
+  "joins": [
+    {
+      "ended": {
+        "clear": [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ],
+        "clearDepth": 1.0,
+        "color": 8,
+        "depth": 9,
+        "join": false,
+        "keepColor": true,
+        "keepDepth": true
+      },
+      "joins": true,
+      "name": "the same targets, kept",
+      "next": {
+        "clear": [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ],
+        "clearDepth": 1.0,
+        "color": 8,
+        "depth": 9,
+        "join": true,
+        "keepColor": true,
+        "keepDepth": true
+      }
+    },
+    {
+      "ended": {
+        "clear": [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ],
+        "clearDepth": 1.0,
+        "color": 8,
+        "depth": 9,
+        "join": false,
+        "keepColor": true,
+        "keepDepth": true
+      },
+      "joins": false,
+      "name": "one that may not join",
+      "next": {
+        "clear": [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ],
+        "clearDepth": 1.0,
+        "color": 8,
+        "depth": 9,
+        "join": false,
+        "keepColor": true,
+        "keepDepth": true
+      }
+    },
+    {
+      "ended": {
+        "clear": [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ],
+        "clearDepth": 1.0,
+        "color": 4294967294,
+        "depth": 9,
+        "join": false,
+        "keepColor": true,
+        "keepDepth": true
+      },
+      "joins": false,
+      "name": "on the screen",
+      "next": {
+        "clear": [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ],
+        "clearDepth": 1.0,
+        "color": 4294967294,
+        "depth": 9,
+        "join": true,
+        "keepColor": true,
+        "keepDepth": true
+      }
+    },
+    {
+      "ended": {
+        "clear": [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ],
+        "clearDepth": 1.0,
+        "color": 8,
+        "depth": 9,
+        "join": false,
+        "keepColor": true,
+        "keepDepth": true
+      },
+      "joins": false,
+      "name": "another colour target",
+      "next": {
+        "clear": [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ],
+        "clearDepth": 1.0,
+        "color": 12,
+        "depth": 9,
+        "join": true,
+        "keepColor": true,
+        "keepDepth": true
+      }
+    },
+    {
+      "ended": {
+        "clear": [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ],
+        "clearDepth": 1.0,
+        "color": 8,
+        "depth": 9,
+        "join": false,
+        "keepColor": true,
+        "keepDepth": true
+      },
+      "joins": false,
+      "name": "another depth target",
+      "next": {
+        "clear": [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ],
+        "clearDepth": 1.0,
+        "color": 8,
+        "depth": 12,
+        "join": true,
+        "keepColor": true,
+        "keepDepth": true
+      }
+    },
+    {
+      "ended": {
+        "clear": [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ],
+        "clearDepth": 1.0,
+        "color": 8,
+        "depth": 9,
+        "join": false,
+        "keepColor": true,
+        "keepDepth": true
+      },
+      "joins": false,
+      "name": "its colour cleared",
+      "next": {
+        "clear": [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ],
+        "clearDepth": 1.0,
+        "color": 8,
+        "depth": 9,
+        "join": true,
+        "keepColor": false,
+        "keepDepth": true
+      }
+    },
+    {
+      "ended": {
+        "clear": [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ],
+        "clearDepth": 1.0,
+        "color": 8,
+        "depth": 9,
+        "join": false,
+        "keepColor": true,
+        "keepDepth": true
+      },
+      "joins": false,
+      "name": "its depth cleared",
+      "next": {
+        "clear": [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ],
+        "clearDepth": 1.0,
+        "color": 8,
+        "depth": 9,
+        "join": true,
+        "keepColor": true,
+        "keepDepth": false
+      }
+    },
+    {
+      "ended": {
+        "clear": [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ],
+        "clearDepth": 1.0,
+        "color": 4294967295,
+        "depth": 9,
+        "join": false,
+        "keepColor": true,
+        "keepDepth": true
+      },
+      "joins": true,
+      "name": "depth alone, kept",
+      "next": {
+        "clear": [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ],
+        "clearDepth": 1.0,
+        "color": 4294967295,
+        "depth": 9,
+        "join": true,
+        "keepColor": false,
+        "keepDepth": true
+      }
+    },
+    {
+      "ended": {
+        "clear": [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ],
+        "clearDepth": 1.0,
+        "color": 8,
+        "depth": 4294967295,
+        "join": false,
+        "keepColor": true,
+        "keepDepth": true
+      },
+      "joins": true,
+      "name": "colour alone, kept",
+      "next": {
+        "clear": [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ],
+        "clearDepth": 1.0,
+        "color": 8,
+        "depth": 4294967295,
+        "join": true,
+        "keepColor": true,
+        "keepDepth": false
+      }
+    },
+    {
+      "ended": {
+        "clear": [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ],
+        "clearDepth": 1.0,
+        "color": 8,
+        "depth": 9,
+        "join": false,
+        "keepColor": false,
+        "keepDepth": false
+      },
+      "joins": true,
+      "name": "the one before cleared what it drew into",
+      "next": {
+        "clear": [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ],
+        "clearDepth": 1.0,
+        "color": 8,
+        "depth": 9,
+        "join": true,
+        "keepColor": true,
+        "keepDepth": true
+      }
     }
   ],
   "lines": [

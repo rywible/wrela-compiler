@@ -4,6 +4,7 @@
 // parse is reported in each host's own words.)
 
 import {
+  BINDING_KIND_TRAITS,
   BINDING_KINDS,
   COMPARES,
   MANIFEST_VERSION,
@@ -25,6 +26,14 @@ export type BindingKind = (typeof BINDING_KINDS)[number];
 
 /** Whether a binding is a storage buffer. */
 export const isBuffer = (k: BindingKind) => k === "read" || k === "read_write";
+
+const traitsOf = (k: BindingKind) => BINDING_KIND_TRAITS.find((t) => t.name === k)!;
+/** Whether a binding is a colour texture, which names its format. */
+export const hasFormat = (k: BindingKind) => traitsOf(k).has_format;
+/** Whether kernels write it: a storage texture. */
+export const isStorage = (k: BindingKind) => traitsOf(k).is_storage;
+/** Whether it's a 3D texture. */
+export const is3d = (k: BindingKind) => traitsOf(k).is_3d;
 
 export interface UniformBlock {
   binding: number;
@@ -147,6 +156,18 @@ function oneOf<T extends string>(o: Json, key: string, where: string, options: r
   return v as T;
 }
 
+/** `oneOf`, or `fallback` where the key is missing. */
+function oneOfOr<T extends string, F extends string>(o: Json, key: string, where: string, options: readonly T[], fallback: F): T | F {
+  return o[key] === undefined ? fallback : oneOf(o, key, where, options);
+}
+
+/** `true` or `false`, or `fallback` where the key is missing. */
+function flag(o: Json, key: string, where: string, fallback: boolean): boolean {
+  const v = o[key] ?? fallback;
+  if (typeof v !== "boolean") throw new ManifestError(`${where}.${key} must be true or false`);
+  return v;
+}
+
 function pipeline(v: unknown, i: number): Pipeline {
   const where = `pipelines[${i}]`;
   const o = object(v, where);
@@ -169,17 +190,16 @@ function pipeline(v: unknown, i: number): Pipeline {
     const bw = `${where}.bindings[${j}]`;
     const bo = object(b, bw);
     // A missing `stage` is both.
-    const stage: BindingStage = bo["stage"] === undefined ? "both" : oneOf(bo, "stage", bw, ["vertex", "fragment"] as const);
+    const stage: BindingStage = oneOfOr(bo, "stage", bw, ["vertex", "fragment"] as const, "both");
     const kind = oneOf(bo, "kind", bw, BINDING_KINDS);
     // A colour texture's format.
-    const colour = kind === "texture" || kind === "texture_3d" || kind === "storage_texture" || kind === "storage_texture_3d";
     let format: TextureFormat | null = null;
-    if (!colour) {
+    if (!hasFormat(kind)) {
       if (bo["format"] !== undefined) throw new ManifestError(`${bw}: only a colour texture has a \`format\``);
     } else {
       const f = TEXTURE_FORMATS.find((t) => t.name === oneOf(bo, "format", bw, TEXTURE_FORMATS.map((t) => t.name)))!;
       if (f.depth) throw new ManifestError(`${bw}: a colour texture's format isn't a depth one`);
-      if ((kind === "storage_texture" || kind === "storage_texture_3d") && !f.storable) {
+      if (isStorage(kind) && !f.storable) {
         throw new ManifestError(`${bw}: kernels can't write ${f.name} textures`);
       }
       format = f.name;
@@ -199,10 +219,9 @@ function pipeline(v: unknown, i: number): Pipeline {
     const vertex_entry = str(o, "vertex_entry", where);
     const fragment_entry = str(o, "fragment_entry", where);
     // A missing `blend` is false.
-    const b = o["blend"] ?? false;
-    if (typeof b !== "boolean") throw new ManifestError(`${where}.blend must be true or false`);
+    const b = flag(o, "blend", where, false);
     // A missing `cull` is none, and a missing `depth_bias` none.
-    const cull = o["cull"] === undefined ? "none" : oneOf(o, "cull", where, ["none", "front", "back"] as const);
+    const cull = oneOfOr(o, "cull", where, ["none", "front", "back"] as const, "none");
     let depth_bias: DepthBias = { constant: 0, slope_scale: 0, clamp: 0 };
     if (o["depth_bias"] !== undefined) {
       const bw = `${where}.depth_bias`;
@@ -223,17 +242,12 @@ function pipeline(v: unknown, i: number): Pipeline {
     if (o["depth"] !== undefined) {
       const dw = `${where}.depth`;
       const d = object(o["depth"], dw);
-      const compare = d["compare"] === undefined ? "less" : oneOf(d, "compare", dw, COMPARES.filter((c): c is Compare => c !== null));
-      const write = d["write"] ?? true;
-      if (typeof write !== "boolean") throw new ManifestError(`${dw}.write must be true or false`);
-      depth = { compare, write };
+      const compare = oneOfOr(d, "compare", dw, COMPARES.filter((c): c is Compare => c !== null), "less");
+      depth = { compare, write: flag(d, "write", dw, true) };
     }
-    // A missing `writes_depth` is false.
-    const writes_depth = o["writes_depth"] ?? false;
-    if (typeof writes_depth !== "boolean") throw new ManifestError(`${where}.writes_depth must be true or false`);
-    // A missing `uint` is false.
-    const uint = o["uint"] ?? false;
-    if (typeof uint !== "boolean") throw new ManifestError(`${where}.uint must be true or false`);
+    // A missing `writes_depth` is false, and a missing `uint`.
+    const writes_depth = flag(o, "writes_depth", where, false);
+    const uint = flag(o, "uint", where, false);
     stage = { kind, vertex_entry, fragment_entry, blend: b, cull, depth_bias, depth, writes_depth, uint };
   }
   // A missing `debug_flag` is read as null.

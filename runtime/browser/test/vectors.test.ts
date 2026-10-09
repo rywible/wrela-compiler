@@ -7,7 +7,7 @@ import { StateHash } from "../src/hash.ts";
 import { Lines } from "../src/lines.ts";
 import { parseManifest } from "../src/manifest.ts";
 import { parseScript } from "../src/input.ts";
-import { decode, Sequencer, StreamError } from "../src/stream.ts";
+import { decode, joins, Sequencer, StreamError } from "../src/stream.ts";
 import { frameTime } from "../src/testmode.ts";
 import { lockstepTicks } from "../src/ticker.ts";
 import { TickLogWriter, wasmHash } from "../src/ticks.ts";
@@ -66,6 +66,12 @@ describe("sequences", () => {
       });
       expect(error).toEqual(v.error);
     });
+  }
+});
+
+describe("pass joins", () => {
+  for (const v of vectors.joins) {
+    test(v.name, () => expect(joins(v.next, v.ended)).toBe(v.joins));
   }
 });
 

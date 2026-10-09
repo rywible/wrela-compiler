@@ -85,13 +85,7 @@ fn command(c: &Command) -> Value {
             "compare": compare.map(Compare::name),
         }),
         Command::DestroySampler { handle } => json!({ "op": "DestroySampler", "handle": handle }),
-        Command::BeginPass(p) => json!({
-            "op": "BeginPass",
-            "pass": {
-                "color": p.color, "keepColor": p.keep_color, "join": p.join, "clear": p.clear, "depth": p.depth,
-                "keepDepth": p.keep_depth, "clearDepth": p.clear_depth,
-            },
-        }),
+        Command::BeginPass(p) => json!({ "op": "BeginPass", "pass": pass_json(p) }),
         Command::EndPass => json!({ "op": "EndPass" }),
         Command::DispatchIndirect { pipeline, arguments, offset, bindings: bs, uniforms } => {
             json!({
@@ -374,10 +368,6 @@ fn sequences() -> Vec<Value> {
     ]
 }
 
-/// The manifest the check vectors (and the native host's tests) run against: pipelines 0 and 2
-/// render, 1, 3 and 4 compute; 0 to 3 take 16 uniform bytes, 0 and 1 bind a read-only buffer
-/// then a read-write one, 2 and 3 two read-write ones; 4 takes nothing; 5 renders with a
-/// texture, a sampler, a depth texture and a comparison sampler.
 /// The format a hand-made binding of `kind` names: the vectors' sampled textures are `Rgba8`,
 /// and their storage textures `Rgba16Float`.
 fn format_of(kind: BindingKind) -> Option<TextureFormat> {
@@ -390,14 +380,19 @@ fn format_of(kind: BindingKind) -> Option<TextureFormat> {
     }
 }
 
+/// A hand-made binding at `binding` of `kind`, seen by every shader (its format `format_of`).
+fn bind(binding: u32, kind: BindingKind) -> ResourceBinding {
+    ResourceBinding { binding, kind, stage: BindingStage::Both, format: format_of(kind) }
+}
+
+/// The manifest the check vectors (and the native host's tests) run against: pipelines 0 and 2
+/// render, 1, 3 and 4 compute; 0 to 3 take 16 uniform bytes, 0 and 1 bind a read-only buffer
+/// then a read-write one, 2 and 3 two read-write ones; 4 takes nothing; 5 renders with a
+/// texture, a sampler, a depth texture and a comparison sampler; 6 samples a 3D texture and
+/// writes another; 7 renders giving its fragments their depth, and 8 renders `u32`s, neither
+/// taking anything.
 pub fn check_manifest() -> Manifest {
     let mut m = Manifest::new("game.wasm");
-    let bind = |binding, kind| ResourceBinding {
-        binding,
-        kind,
-        stage: BindingStage::Both,
-        format: format_of(kind),
-    };
     let shape = |name: &str, stage| Pipeline {
         name: name.into(),
         shader: format!("{name}.wgsl"),
@@ -406,16 +401,7 @@ pub fn check_manifest() -> Manifest {
         bindings: vec![bind(1, BindingKind::Read), bind(2, BindingKind::ReadWrite)],
         debug_flag: None,
     };
-    let render = Stage::Render {
-        vertex_entry: "vs".into(),
-        fragment_entry: "fs".into(),
-        blend: false,
-        cull: Cull::None,
-        depth_bias: DepthBias::default(),
-        depth: DepthState::default(),
-        writes_depth: false,
-        uint: false,
-    };
+    let render = target_bound(false, false);
     m.pipelines.push(shape("draw", render.clone()));
     let compute = Stage::Compute { entry: "main".into(), workgroup_size: [64, 1, 1] };
     m.pipelines.push(shape("compute", compute.clone()));
@@ -448,7 +434,28 @@ pub fn check_manifest() -> Manifest {
         ],
         ..shape("volume", Stage::Compute { entry: "main".into(), workgroup_size: [4, 4, 4] })
     });
+    // Render pipelines that only some passes' targets take.
+    for (name, stage) in
+        [("with_depth", target_bound(true, false)), ("ids", target_bound(false, true))]
+    {
+        m.pipelines.push(Pipeline { uniform: None, bindings: Vec::new(), ..shape(name, stage) });
+    }
     m
+}
+
+/// A render stage (`vs`, `fs`, the defaults) whose fragments give their own depth
+/// (`writes_depth`) or whose fragment shader returns a `u32` (`uint`).
+fn target_bound(writes_depth: bool, uint: bool) -> Stage {
+    Stage::Render {
+        vertex_entry: "vs".into(),
+        fragment_entry: "fs".into(),
+        blend: false,
+        cull: Cull::None,
+        depth_bias: DepthBias::default(),
+        depth: DepthState::default(),
+        writes_depth,
+        uint,
+    }
 }
 
 /// A batch's commands, which pass the sequencer, run through a [`Checker`]: the first error.
@@ -589,7 +596,7 @@ fn checks() -> Value {
             &m,
             &with_buffers(&|e| _ = e.destroy_buffer(1).dispatch(1, [1; 3], &ab, &u)),
         ),
-        check("no such pipeline", &m, &with_buffers(&|e| _ = e.dispatch(7, [1; 3], &ab, &u))),
+        check("no such pipeline", &m, &with_buffers(&|e| _ = e.dispatch(9, [1; 3], &ab, &u))),
         check(
             "a pipeline without uniforms",
             &m,
@@ -876,6 +883,42 @@ fn checks() -> Value {
             &m,
             &with_textures(&|e| _ = e.begin_pass(Pass { clear_depth: f32::NAN, ..pass })),
         ),
+        check(
+            "fragments with their own depth, drawn with a depth target",
+            &m,
+            &with_textures(&|e| {
+                e.begin_pass(pass).draw(7, 3, 1, &[], &[]).end_pass();
+                e.begin_pass(Pass { color: stream::NONE, ..pass }).draw(7, 3, 1, &[], &[]);
+            }),
+        ),
+        check(
+            "fragments with their own depth, drawn without a depth target",
+            &m,
+            &with_textures(&|e| _ = e.begin_screen_pass([0.0; 4]).draw(7, 3, 1, &[], &[])),
+        ),
+        check(
+            "u32 fragments drawn into an r32uint target",
+            &m,
+            &with_textures(&|e| {
+                e.create_texture(12, 4, 4, TextureFormat::R32Uint, false)
+                    .begin_pass(Pass { color: 12, ..pass })
+                    .draw(8, 3, 1, &[], &[]);
+            }),
+        ),
+        check(
+            "u32 fragments drawn on the screen",
+            &m,
+            &with_textures(&|e| _ = e.begin_screen_pass([0.0; 4]).draw(8, 3, 1, &[], &[])),
+        ),
+        check(
+            "colour fragments drawn into an r32uint target",
+            &m,
+            &with_textures(&|e| {
+                e.create_texture(12, 4, 4, TextureFormat::R32Uint, false)
+                    .begin_pass(Pass { color: 12, depth: stream::NONE, ..pass })
+                    .draw_indirect(0, 2, 0, &rw, &u);
+            }),
+        ),
         check("a readback past the end", &m, &with_buffers(&|e| _ = e.read_buffer(0, 1, 256, 260))),
         check(
             "a storage path out of storage",
@@ -913,42 +956,15 @@ pub(crate) fn sample_manifest() -> Manifest {
         shader: "pipeline_0.wgsl".into(),
         stage: Stage::Compute { entry: "main".into(), workgroup_size: [64, 1, 1] },
         uniform: Some(UniformBlock { binding: 0, size: 32, space: UniformSpace::Uniform }),
-        bindings: vec![ResourceBinding {
-            binding: 1,
-            kind: BindingKind::ReadWrite,
-            stage: BindingStage::Both,
-            format: None,
-        }],
+        bindings: vec![bind(1, BindingKind::ReadWrite)],
         debug_flag: None,
     });
     m.pipelines.push(Pipeline {
         name: "cover+shade".into(),
         shader: "pipeline_1.wgsl".into(),
-        stage: Stage::Render {
-            vertex_entry: "vs".into(),
-            fragment_entry: "fs".into(),
-            blend: false,
-            cull: Cull::None,
-            depth_bias: DepthBias::default(),
-            depth: DepthState::default(),
-            writes_depth: false,
-            uint: false,
-        },
+        stage: target_bound(false, false),
         uniform: None,
-        bindings: vec![
-            ResourceBinding {
-                binding: 0,
-                kind: BindingKind::Texture,
-                stage: BindingStage::Both,
-                format: Some(TextureFormat::Rgba8),
-            },
-            ResourceBinding {
-                binding: 1,
-                kind: BindingKind::Sampler,
-                stage: BindingStage::Both,
-                format: None,
-            },
-        ],
+        bindings: vec![bind(0, BindingKind::Texture), bind(1, BindingKind::Sampler)],
         debug_flag: None,
     });
     m
@@ -1093,20 +1109,16 @@ fn manifests() -> Vec<Value> {
         ),
         manifest(
             "too many storage buffers",
-            edited(&|m| {
-                m.pipelines[1].bindings = (0..9)
-                    .map(|i| ResourceBinding { binding: i, kind: BindingKind::Read, stage: BindingStage::Both, format: None })
-                    .collect()
-            }),
+            edited(&|m| m.pipelines[1].bindings = (0..9).map(|i| bind(i, BindingKind::Read)).collect()),
         ),
         manifest(
             "eight storage buffers in each stage, sixteen in all",
             edited(&|m| {
                 m.pipelines[1].bindings = (0..16)
                     .map(|i| ResourceBinding {
-                        binding: i,
-                        kind: BindingKind::Read,
-                        stage: if i < 8 { BindingStage::Vertex } else { BindingStage::Fragment }, format: None })
+                        stage: if i < 8 { BindingStage::Vertex } else { BindingStage::Fragment },
+                        ..bind(i, BindingKind::Read)
+                    })
                     .collect()
             }),
         ),
@@ -1115,9 +1127,9 @@ fn manifests() -> Vec<Value> {
             edited(&|m| {
                 m.pipelines[1].bindings = (0..9)
                     .map(|i| ResourceBinding {
-                        binding: i,
-                        kind: BindingKind::Read,
-                        stage: if i < 4 { BindingStage::Both } else { BindingStage::Vertex }, format: None })
+                        stage: if i < 4 { BindingStage::Both } else { BindingStage::Vertex },
+                        ..bind(i, BindingKind::Read)
+                    })
                     .collect()
             }),
         ),
@@ -1129,9 +1141,9 @@ fn manifests() -> Vec<Value> {
             "a written binding in a vertex shader",
             edited(&|m| {
                 m.pipelines[1].bindings.push(ResourceBinding {
-                    binding: 2,
-                    kind: BindingKind::ReadWrite,
-                    stage: BindingStage::Vertex, format: None })
+                    stage: BindingStage::Vertex,
+                    ..bind(2, BindingKind::ReadWrite)
+                })
             }),
         ),
         manifest(
@@ -1141,9 +1153,7 @@ fn manifests() -> Vec<Value> {
         manifest(
             "too many storage buffers with a debug flag",
             edited(&|m| {
-                m.pipelines[1].bindings = (0..8)
-                    .map(|i| ResourceBinding { binding: i, kind: BindingKind::Read, stage: BindingStage::Both, format: None })
-                    .collect();
+                m.pipelines[1].bindings = (0..8).map(|i| bind(i, BindingKind::Read)).collect();
                 m.pipelines[1].debug_flag = Some(8);
             }),
         ),
@@ -1376,6 +1386,52 @@ fn lockstep() -> Value {
         .collect()
 }
 
+/// A pass as the browser runtime decodes it.
+fn pass_json(p: &Pass) -> Value {
+    json!({
+        "color": p.color, "keepColor": p.keep_color, "join": p.join, "clear": p.clear,
+        "depth": p.depth, "keepDepth": p.keep_depth, "clearDepth": p.clear_depth,
+    })
+}
+
+/// Pairs of passes, one ended and the next beginning right after it: whether the next runs as
+/// part of the one before ([`Pass::joins`]).
+fn joins() -> Vec<Value> {
+    let ended = Pass { keep_color: true, keep_depth: true, ..offscreen() };
+    let next = Pass { join: true, ..ended };
+    let pairs = [
+        ("the same targets, kept", ended, next),
+        ("one that may not join", ended, Pass { join: false, ..next }),
+        ("on the screen", Pass { color: SCREEN, ..ended }, Pass { color: SCREEN, ..next }),
+        ("another colour target", ended, Pass { color: 12, ..next }),
+        ("another depth target", ended, Pass { depth: 12, ..next }),
+        ("its colour cleared", ended, Pass { keep_color: false, ..next }),
+        ("its depth cleared", ended, Pass { keep_depth: false, ..next }),
+        (
+            "depth alone, kept",
+            Pass { color: NONE, ..ended },
+            Pass { color: NONE, keep_color: false, ..next },
+        ),
+        (
+            "colour alone, kept",
+            Pass { depth: NONE, ..ended },
+            Pass { depth: NONE, keep_depth: false, ..next },
+        ),
+        ("the one before cleared what it drew into", offscreen(), next),
+    ];
+    pairs
+        .iter()
+        .map(|(name, ended, next)| {
+            json!({
+                "name": name,
+                "ended": pass_json(ended),
+                "next": pass_json(next),
+                "joins": next.joins(ended),
+            })
+        })
+        .collect()
+}
+
 /// Every vector, as `runtime/abi/vectors.json` holds them.
 pub fn vectors() -> String {
     let v = json!({
@@ -1384,6 +1440,7 @@ pub fn vectors() -> String {
         "hashes": hashes(),
         "batches": batches(),
         "sequences": sequences(),
+        "joins": joins(),
         "checks": checks(),
         "manifests": manifests(),
         "lines": line_tables(),

@@ -90,6 +90,16 @@ fn wgpu_format(f: TextureFormat) -> wgpu::TextureFormat {
     }
 }
 
+/// A colour texture binding's format, which the manifest's parser requires of it.
+fn colour_format(b: &ResourceBinding) -> TextureFormat {
+    b.format.expect("the manifest's parser gives every colour texture binding its format")
+}
+
+/// A texture binding's view: 3D or 2D.
+fn view_dimension(kind: BindingKind) -> wgpu::TextureViewDimension {
+    if kind.is_3d() { wgpu::TextureViewDimension::D3 } else { wgpu::TextureViewDimension::D2 }
+}
+
 /// How a shader reads a colour texture of format `f`: filtered floats, unfiltered floats, or
 /// unsigned integers.
 fn sample_type(f: TextureFormat) -> wgpu::TextureSampleType {
@@ -148,10 +158,6 @@ enum Kind {
         cull: Cull,
         depth_bias: DepthBias,
         depth: DepthState,
-        /// Each fragment gives its own depth: drawn only in a pass with a depth target.
-        writes_depth: bool,
-        /// Its fragment shader returns a `u32`: drawn only into an `r32uint` target.
-        uint: bool,
         variants: HashMap<Targets, wgpu::RenderPipeline>,
     },
 }
@@ -279,7 +285,7 @@ pub(crate) struct Gpu {
     encoder: Option<wgpu::CommandEncoder>,
     pass: Option<OpenPass>,
     /// A pass that ended, not yet recorded: the next pass continues it if it begins on the same
-    /// targets and keeps them (`fuses`).
+    /// targets and keeps them (`Pass::joins`).
     ended: Option<OpenPass>,
     screen: Option<Screen>,
     timer: Option<Timer>,
@@ -525,19 +531,14 @@ impl Gpu {
                     (ty, visibility)
                 }
                 BindingKind::Texture | BindingKind::DepthTexture | BindingKind::Texture3d => {
-                    let sample_type = match b.format {
-                        _ if b.kind == BindingKind::DepthTexture => wgpu::TextureSampleType::Depth,
-                        Some(f) => sample_type(f),
-                        None => wgpu::TextureSampleType::Float { filterable: true },
-                    };
-                    let view_dimension = if b.kind == BindingKind::Texture3d {
-                        wgpu::TextureViewDimension::D3
+                    let sample_type = if b.kind == BindingKind::DepthTexture {
+                        wgpu::TextureSampleType::Depth
                     } else {
-                        wgpu::TextureViewDimension::D2
+                        sample_type(colour_format(b))
                     };
                     let ty = wgpu::BindingType::Texture {
                         sample_type,
-                        view_dimension,
+                        view_dimension: view_dimension(b.kind),
                         multisampled: false,
                     };
                     (ty, all)
@@ -550,15 +551,10 @@ impl Gpu {
                 }
                 // Only a kernel writes a texture's texels.
                 BindingKind::StorageTexture | BindingKind::StorageTexture3d => {
-                    let view_dimension = if b.kind == BindingKind::StorageTexture3d {
-                        wgpu::TextureViewDimension::D3
-                    } else {
-                        wgpu::TextureViewDimension::D2
-                    };
                     let ty = wgpu::BindingType::StorageTexture {
                         access: wgpu::StorageTextureAccess::WriteOnly,
-                        format: wgpu_format(b.format.unwrap_or(TextureFormat::Rgba16Float)),
-                        view_dimension,
+                        format: wgpu_format(colour_format(b)),
+                        view_dimension: view_dimension(b.kind),
                     };
                     (ty, wgpu::ShaderStages::COMPUTE)
                 }
@@ -615,8 +611,6 @@ impl Gpu {
                     cull: *cull,
                     depth_bias: *depth_bias,
                     depth: *depth,
-                    writes_depth: *writes_depth,
-                    uint: *uint,
                     variants: HashMap::new(),
                 };
                 // The screen's variant now (an integer target's, for a `u32` output), so a
@@ -1059,7 +1053,7 @@ impl Gpu {
     }
 
     /// Ends the open pass: on the screen (`Present`) it's recorded; into textures (`EndPass`),
-    /// it waits for the next command, which may continue it (`fuses`), unless the timing is
+    /// it waits for the next command, which may continue it (`Pass::joins`), unless the timing is
     /// serial.
     fn end_pass(&mut self, op: Opcode) -> Result<()> {
         let Some(open) = self.pass.take() else {
@@ -1102,30 +1096,10 @@ impl Gpu {
         };
         let depth_format = (pass.depth != stream::NONE).then(|| format_of(self, pass.depth));
         let targets = (color_format, depth_format);
-        // Every pipeline variant the pass needs, made before anything is recorded.
+        // Every pipeline variant the pass needs, made before anything is recorded. (The checker
+        // checked each draw's pipeline is one these targets take.)
         for d in &open.draws {
             let Pipeline { name, kind, .. } = &mut self.pipelines[d.pipeline as usize];
-            if let Kind::Render { writes_depth: true, .. } = kind
-                && depth_format.is_none()
-            {
-                return Err(Error::Gpu(format!(
-                    "`{name}` gives its fragments their depth, so it's drawn in a pass with a \
-                     depth target, and this pass has none"
-                )));
-            }
-            if let Kind::Render { uint, .. } = kind
-                && let Some(c) = color_format
-                && *uint != (c == wgpu::TextureFormat::R32Uint)
-            {
-                let (gives, wants) = if *uint {
-                    ("a `u32`", "an r32uint target")
-                } else {
-                    ("a colour", "a colour target, not an integer one")
-                };
-                return Err(Error::Gpu(format!(
-                    "`{name}`'s fragment shader returns {gives}, so it's drawn into {wants}"
-                )));
-            }
             render_variant(&self.device, name, kind, targets);
         }
         // Everything that can flush happens before anything is recorded for this pass.
@@ -1369,7 +1343,7 @@ impl Executor for Gpu {
             match cmd {
                 // A label names the passes after it, the next of which may yet continue this one.
                 Command::Label { .. } => {}
-                Command::BeginPass(next) if fuses(&ended.pass, next) => {
+                Command::BeginPass(next) if next.joins(&ended.pass) => {
                     self.pass = self.ended.take();
                     return Ok(());
                 }
@@ -1670,15 +1644,4 @@ fn read_timestamp_spans(
             (a as f64 * period, a.max(b) as f64 * period)
         })
         .collect())
-}
-
-/// Whether pass `next`, beginning right after `ended` ended, continues it as one render pass:
-/// it may join, on the same targets, kept (not cleared), and not the screen.
-fn fuses(ended: &Pass, next: &Pass) -> bool {
-    next.join
-        && next.color != stream::SCREEN
-        && next.color == ended.color
-        && next.depth == ended.depth
-        && (next.color == stream::NONE || next.keep_color)
-        && (next.depth == stream::NONE || next.keep_depth)
 }

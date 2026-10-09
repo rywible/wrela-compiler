@@ -6,7 +6,7 @@ import { MANIFEST_VERSION, STREAM_VERSION } from "../src/abi.gen.ts";
 import { Checker } from "../src/check.ts";
 import { type Manifest, validateManifest } from "../src/manifest.ts";
 import type { Executor } from "../src/program.ts";
-import type { Command } from "../src/stream.ts";
+import type { Command, Pass } from "../src/stream.ts";
 
 export const FIRST_LIGHT = join(import.meta.dir, "../../fixtures/first-light");
 
@@ -22,6 +22,7 @@ export interface Vectors {
   hashes: { bytes: string; hash: string }[];
   batches: { name: string; bytes: string; outcome: { commands?: unknown[]; error?: ErrorVector } }[];
   sequences: { name: string; bytes: string; error: ErrorVector | null }[];
+  joins: { name: string; ended: Pass; next: Pass; joins: boolean }[];
   checks: { manifest: string; batches: { name: string; bytes: string; error: { opcode: string; message: string } | null }[] };
   /** `malformed`: JSON that doesn't parse, which each host rejects in its own words. */
   manifests: { name: string; json: string; error: string | null; malformed?: boolean }[];

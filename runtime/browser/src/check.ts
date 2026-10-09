@@ -3,8 +3,8 @@
 // both hosts reject the same programs at the command that's wrong, rather than with an
 // asynchronous WebGPU error that names no command.
 
-import { BINDING_OFFSET_ALIGNMENT, DEFAULT_LIMITS, MAX_TEXTURE_3D, NONE, SCREEN, TEXTURE_FORMATS } from "./abi.gen.ts";
-import type { BindingKind, Manifest } from "./manifest.ts";
+import { BINDING_OFFSET_ALIGNMENT, DEFAULT_LIMITS, MAX_TEXTURE_3D, NONE, SCREEN, SCREEN_FORMAT, TEXTURE_FORMATS } from "./abi.gen.ts";
+import { type BindingKind, is3d, isStorage, type Manifest } from "./manifest.ts";
 import type { Binding, Command, OpcodeName, TextureFormat } from "./stream.ts";
 
 /** The limits a program sees, in `wrela.limit`'s order (runtime/abi `Limits`). */
@@ -61,8 +61,7 @@ function sameFormat(err: (why: string) => Error, handle: number, got: TextureFor
 
 /** How a shader reads a colour texture of format `f`: filtered floats, unfiltered floats, or
  * unsigned integers. */
-export function sampleType(f: TextureFormat | null): GPUTextureSampleType {
-  if (f === null) return "float";
+export function sampleType(f: TextureFormat): GPUTextureSampleType {
   const t = formatOf(f);
   return t.uint ? "uint" : t.filterable ? "float" : "unfilterable-float";
 }
@@ -78,13 +77,17 @@ interface Shape {
   uniformSize: number;
   /** Each binding's kind, and a colour texture's format. */
   bindings: { kind: BindingKind; format: TextureFormat | null }[];
+  /** A render pipeline's: each fragment gives its own depth (drawn only with a depth target),
+   * and its fragment shader returns a `u32` (drawn only into an `r32uint` target). */
+  writesDepth: boolean;
+  uint: boolean;
 }
 
+/** A live texture: `depth` is a 3D texture's, or 0 for a 2D one. */
+type Texture = { kind: "texture"; width: number; height: number; depth: number; format: TextureFormat; writable: boolean };
+
 /** A live resource. */
-type Resource =
-  | { kind: "buffer"; size: number }
-  | { kind: "texture"; width: number; height: number; depth: number; format: TextureFormat; writable: boolean }
-  | { kind: "sampler"; comparison: boolean };
+type Resource = { kind: "buffer"; size: number } | Texture | { kind: "sampler"; comparison: boolean };
 
 export class Checker {
   readonly #pipelines: Shape[];
@@ -95,6 +98,9 @@ export class Checker {
   readonly #scope = new Map<number, [boolean, boolean]>();
   /** The open pass's attachments. */
   #attachments: number[] = [];
+  /** The open pass's colour target's format (the screen's, a texture's, or none), and whether it
+   * has a depth target: which pipelines its draws may draw with. */
+  #targets: { colour: TextureFormat | null; depth: boolean } = { colour: null, depth: false };
 
   readonly #limits: Limits;
 
@@ -111,6 +117,8 @@ export class Checker {
       compute: p.kind === "compute",
       uniformSize: p.uniform?.size ?? 0,
       bindings: p.bindings.map((b) => ({ kind: b.kind, format: b.format })),
+      writesDepth: p.kind === "render" && p.writes_depth,
+      uint: p.kind === "render" && p.uint,
     }));
   }
 
@@ -198,6 +206,7 @@ export class Checker {
         this.#clearColour(op, cmd.clear);
         this.#scope.clear();
         this.#attachments = [];
+        this.#targets = { colour: SCREEN_FORMAT, depth: false };
         return;
       case "BeginPass": {
         const pass = cmd.pass;
@@ -206,15 +215,18 @@ export class Checker {
         this.#scope.clear();
         this.#attachments = [];
         for (const t of [pass.color, pass.depth]) {
-          if (t !== SCREEN && t !== NONE && this.#depthOf(t) > 0) {
+          const r = this.#resources.get(t);
+          if (t !== SCREEN && t !== NONE && r?.kind === "texture" && r.depth > 0) {
             throw err(`texture ${t} is a 3D texture, so it can't be a target`);
           }
         }
         let size: [number, number] | undefined;
+        let colour: TextureFormat | null = pass.color === SCREEN ? SCREEN_FORMAT : null;
         if (pass.color !== SCREEN && pass.color !== NONE) {
           const t = this.#texture(op, pass.color);
           if (isDepth(t.format)) throw err(`texture ${pass.color} is a depth texture, so it can't be a colour target`);
           size = [t.width, t.height];
+          colour = t.format;
           this.#attachments.push(pass.color);
         }
         if (pass.depth !== NONE) {
@@ -226,6 +238,7 @@ export class Checker {
           this.#attachments.push(pass.depth);
         }
         if (pass.color === NONE && pass.depth === NONE) throw err("a pass needs a colour target or a depth target");
+        this.#targets = { colour, depth: pass.depth !== NONE };
         return;
       }
       case "Draw":
@@ -281,24 +294,15 @@ export class Checker {
     return r.size;
   }
 
-  #texture(
-    op: OpcodeName,
-    handle: number,
-  ): { width: number; height: number; depth: number; format: TextureFormat; writable: boolean } {
+  #texture(op: OpcodeName, handle: number): Texture {
     const r = this.#resources.get(handle);
     if (r?.kind !== "texture") throw new CommandError(op, `there's no texture ${handle}`);
     return r;
   }
 
-  /** A texture's depth: a 3D texture's, else 0 (and 0 for what isn't a texture). */
-  #depthOf(handle: number): number {
-    const r = this.#resources.get(handle);
-    return r?.kind === "texture" ? r.depth : 0;
-  }
-
-  /** That a bound texture is 3D where the binding is (`three`), and 2D where it isn't. */
-  #dimensions(op: OpcodeName, handle: number, three: boolean): void {
-    const is = this.#depthOf(handle) > 0;
+  /** That texture `handle`, 3D or not (`is`), is 3D where the binding is (`three`), and 2D where
+   * it isn't. */
+  #dimensions(op: OpcodeName, handle: number, is: boolean, three: boolean): void {
     if (is === three) return;
     const [what, want] = is ? ["a 3D", "a 2D"] : ["a 2D", "a 3D"];
     throw new CommandError(op, `texture ${handle} is ${what} texture, bound where ${want} texture goes`);
@@ -348,6 +352,15 @@ export class Checker {
       const [is, needs] = p.compute ? ["compute", "render"] : ["render", "compute"];
       throw err(`pipeline ${pipeline} (${name}) is a ${is} pipeline; ${op} needs a ${needs} pipeline`);
     }
+    // A draw's pipeline is one the pass's targets take.
+    const { colour, depth } = this.#targets;
+    if (!dispatch && p.writesDepth && !depth) {
+      throw err(`\`${name}\` gives its fragments their depth, so it's drawn in a pass with a depth target, and this pass has none`);
+    }
+    if (!dispatch && colour !== null && p.uint !== (colour === "r32uint")) {
+      const [gives, wants] = p.uint ? ["a `u32`", "an r32uint target"] : ["a colour", "a colour target, not an integer one"];
+      throw err(`\`${name}\`'s fragment shader returns ${gives}, so it's drawn into ${wants}`);
+    }
     if (bindings.length !== p.bindings.length) {
       throw err(
         `pipeline ${pipeline} (${name}) binds ${p.bindings.length} resources, but the command lists ${bindings.length}`,
@@ -386,24 +399,19 @@ export class Checker {
         }
         case "texture":
         case "depth_texture":
-        case "texture_3d": {
-          const t = this.#texture(op, b.handle);
-          const depth = kind === "depth_texture";
-          if (isDepth(t.format) !== depth) {
-            throw err(`texture ${b.handle} is bound where ${depth ? "a depth texture" : "a colour texture"} goes`);
-          }
-          sameFormat(err, b.handle, t.format, format);
-          this.#dimensions(op, b.handle, kind === "texture_3d");
-          this.#used(op, "texture", b.handle, false);
-          return;
-        }
+        case "texture_3d":
         case "storage_texture":
         case "storage_texture_3d": {
           const t = this.#texture(op, b.handle);
-          if (!t.writable) throw err(`texture ${b.handle} is bound where a kernel writes it, but wasn't made writable`);
+          const write = isStorage(kind);
+          if (write && !t.writable) throw err(`texture ${b.handle} is bound where a kernel writes it, but wasn't made writable`);
+          const depth = kind === "depth_texture";
+          if (!write && isDepth(t.format) !== depth) {
+            throw err(`texture ${b.handle} is bound where ${depth ? "a depth texture" : "a colour texture"} goes`);
+          }
           sameFormat(err, b.handle, t.format, format);
-          this.#dimensions(op, b.handle, kind === "storage_texture_3d");
-          this.#used(op, "texture", b.handle, true);
+          this.#dimensions(op, b.handle, t.depth > 0, is3d(kind));
+          this.#used(op, "texture", b.handle, write);
           return;
         }
         case "sampler":

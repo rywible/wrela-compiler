@@ -158,6 +158,19 @@ export const EXPORT_MEMORY = "memory";
 export const SCREEN_FORMAT = "rgba8unorm";
 /** What a pipeline binds at a binding, as the manifest names it. */
 export const BINDING_KINDS = ["read", "read_write", "texture", "depth_texture", "sampler", "comparison_sampler", "storage_texture", "texture_3d", "storage_texture_3d"] as const;
+/** What each binding kind is (runtime/abi `BindingKind`): a colour texture, which names its
+ * format; a texture kernels write (a storage texture); a 3D texture. */
+export const BINDING_KIND_TRAITS = [
+  { name: "read", has_format: false, is_storage: false, is_3d: false },
+  { name: "read_write", has_format: false, is_storage: false, is_3d: false },
+  { name: "texture", has_format: true, is_storage: false, is_3d: false },
+  { name: "depth_texture", has_format: false, is_storage: false, is_3d: false },
+  { name: "sampler", has_format: false, is_storage: false, is_3d: false },
+  { name: "comparison_sampler", has_format: false, is_storage: false, is_3d: false },
+  { name: "storage_texture", has_format: true, is_storage: true, is_3d: false },
+  { name: "texture_3d", has_format: true, is_storage: false, is_3d: true },
+  { name: "storage_texture_3d", has_format: true, is_storage: true, is_3d: true },
+] as const;
 /** `minStorageBufferOffsetAlignment`: where a bound range of a buffer may start. */
 export const BINDING_OFFSET_ALIGNMENT = 256;
 export const MAX_WORKGROUP_SIZE = [256, 256, 64];

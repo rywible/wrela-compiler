@@ -227,11 +227,6 @@ impl TextureFormat {
         TextureFormat::ALL.iter().copied().find(|f| *f as u32 == v)
     }
 
-    /// The format WebGPU names `name`.
-    pub fn named(name: &str) -> Option<TextureFormat> {
-        TextureFormat::ALL.iter().copied().find(|f| f.name() == name)
-    }
-
     /// WebGPU's name for it.
     pub fn name(self) -> &'static str {
         match self {
@@ -380,6 +375,19 @@ pub struct Pass {
     pub depth: u32,
     pub keep_depth: bool,
     pub clear_depth: f32,
+}
+
+impl Pass {
+    /// Whether this pass, beginning right after `ended` ended, may run as part of it, as one
+    /// render pass: it may join, on the same targets, kept (not cleared), and not the screen.
+    pub fn joins(&self, ended: &Pass) -> bool {
+        self.join
+            && self.color != SCREEN
+            && self.color == ended.color
+            && self.depth == ended.depth
+            && (self.color == NONE || self.keep_color)
+            && (self.depth == NONE || self.keep_depth)
+    }
 }
 
 /// A decoded command. Byte payloads borrow from the batch.

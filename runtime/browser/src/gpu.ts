@@ -28,8 +28,8 @@ import { NONE, SCREEN, SCREEN_FORMAT, UPLOAD_MAX, UPLOAD_START } from "./abi.gen
 import { bytesPerTexel, CommandError, isDepth, sampleType } from "./check.ts";
 import { errorMessage } from "./errors.ts";
 import { StateHash } from "./hash.ts";
-import type { Manifest, Pipeline, ResourceBinding, UniformBlock } from "./manifest.ts";
-import type { Binding, Bytes, Command, OpcodeName, Pass, TextureFormat } from "./stream.ts";
+import { is3d, type Manifest, type Pipeline, type ResourceBinding, type UniformBlock } from "./manifest.ts";
+import { type Binding, type Bytes, type Command, joins, type OpcodeName, type Pass, type TextureFormat } from "./stream.ts";
 
 const RING_START = 64 * 1024;
 
@@ -58,10 +58,6 @@ interface RenderParts {
   depthBias: { constant: number; slope_scale: number; clamp: number };
   /** The manifest's `depth`: how fragments' depths are tested, and whether they're kept. */
   depth: { compare: GPUCompareFunction; write: boolean };
-  /** Its fragments give their own depth: drawn only in a pass with a depth target. */
-  writesDepth: boolean;
-  /** Its fragment shader returns a `u32`: drawn only into an `r32uint` target. */
-  uint: boolean;
   /** By target formats: `colour|depth`, each a format or `none`. */
   variants: Map<string, GPURenderPipeline>;
 }
@@ -132,6 +128,12 @@ function renderDescriptor(
   };
 }
 
+/** A colour texture binding's format, which the manifest's parser requires of it. */
+function colourFormat(b: ResourceBinding): TextureFormat {
+  if (b.format === null) throw new Error(`host bug: colour texture binding ${b.binding} has no format`);
+  return b.format;
+}
+
 async function buildPipeline(device: GPUDevice, p: Pipeline, source: string): Promise<BuiltPipeline> {
   const fail = (message: string) => new ShaderError(p.name, p.shader, message);
   const visibility =
@@ -184,8 +186,8 @@ async function buildPipeline(device: GPUDevice, p: Pipeline, source: string): Pr
           binding: b.binding,
           visibility: seen,
           texture: {
-            sampleType: b.kind === "depth_texture" ? "depth" : sampleType(b.format),
-            viewDimension: b.kind === "texture_3d" ? "3d" : "2d",
+            sampleType: b.kind === "depth_texture" ? "depth" : sampleType(colourFormat(b)),
+            viewDimension: is3d(b.kind) ? "3d" : "2d",
           },
         });
         break;
@@ -205,8 +207,8 @@ async function buildPipeline(device: GPUDevice, p: Pipeline, source: string): Pr
           visibility: GPUShaderStage.COMPUTE,
           storageTexture: {
             access: "write-only",
-            format: b.format ?? "rgba16float",
-            viewDimension: b.kind === "storage_texture_3d" ? "3d" : "2d",
+            format: colourFormat(b),
+            viewDimension: is3d(b.kind) ? "3d" : "2d",
           },
         });
         break;
@@ -243,8 +245,6 @@ async function buildPipeline(device: GPUDevice, p: Pipeline, source: string): Pr
         cull: p.cull,
         depthBias: p.depth_bias,
         depth: p.depth,
-        writesDepth: p.writes_depth,
-        uint: p.uint,
         variants: new Map(),
       };
       // The variants a pass is likeliest to draw it into, now and side by side: the screen, the
@@ -491,7 +491,7 @@ export class GpuExecutor {
   #encoder: GPUCommandEncoder | null = null;
   #pass: OpenPass | null = null;
   /** A pass that ended, not yet recorded: the next pass continues it if it may join it, on the
-   * same targets, keeping them (`fuses`). Not in the serial mode, which times each alone. */
+   * same targets, keeping them (`joins`). Not in the serial mode, which times each alone. */
   #ended: OpenPass | null = null;
   readonly #timer: Timer | null;
   /** A debug build's: the flag its pipelines' bounds checks set (the manifest's `debug_flag`),
@@ -621,7 +621,7 @@ export class GpuExecutor {
 
   #run(cmd: Command): void {
     if (this.#ended !== null) {
-      if (cmd.op === "BeginPass" && fuses(this.#ended.pass, cmd.pass)) {
+      if (cmd.op === "BeginPass" && joins(cmd.pass, this.#ended.pass)) {
         this.#pass = this.#ended;
         this.#ended = null;
         return;
@@ -989,15 +989,7 @@ export class GpuExecutor {
   #variant(index: number, color: GPUTextureFormat | null, depth: GPUTextureFormat | null): GPURenderPipeline {
     const p = this.#pipeline(index);
     if (p.render === null) throw new Error(`host bug: pipeline ${index} isn't a render pipeline`);
-    if (depth === null && p.render.writesDepth) {
-      throw new Error(
-        `\`${p.name}\` gives its fragments their depth, so it's drawn in a pass with a depth target, and this pass has none`,
-      );
-    }
-    if (color !== null && p.render.uint !== (color === "r32uint")) {
-      const [gives, wants] = p.render.uint ? ["a `u32`", "an r32uint target"] : ["a colour", "a colour target, not an integer one"];
-      throw new Error(`\`${p.name}\`'s fragment shader returns ${gives}, so it's drawn into ${wants}`);
-    }
+    // (The checker checked the pass's targets take the pipeline.)
     const key = targetsKey(color, depth);
     let v = p.render.variants.get(key);
     if (v === undefined) {
@@ -1008,7 +1000,7 @@ export class GpuExecutor {
   }
 
   /** Ends the open pass: on the screen (Present) it's recorded; into textures (EndPass), it
-   * waits for the next command, which may continue it (`fuses`), unless the mode is serial. */
+   * waits for the next command, which may continue it (`joins`), unless the mode is serial. */
   #endPass(op: OpcodeName): void {
     const open = this.#pass;
     this.#pass = null;
@@ -1105,16 +1097,3 @@ export class GpuExecutor {
 
 /** A pass between its beginning and `Present` or `EndPass`, and the name the program gave it. */
 type OpenPass = { pass: Pass; draws: PendingDraw[]; label: string | null };
-
-/** Whether pass `next`, beginning right after `ended` ended, continues it as one render pass: it
- * may join, on the same targets, kept (not cleared), and not the screen. */
-function fuses(ended: Pass, next: Pass): boolean {
-  return (
-    next.join &&
-    next.color !== SCREEN &&
-    next.color === ended.color &&
-    next.depth === ended.depth &&
-    (next.color === NONE || next.keepColor) &&
-    (next.depth === NONE || next.keepDepth)
-  );
-}

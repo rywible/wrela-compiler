@@ -1,4 +1,4 @@
-//! # The manifest, version 6
+//! # The manifest, version 7
 //!
 //! `manifest.json` describes everything game-specific a host needs besides the WASM: each
 //! pipeline's shader, entry points and bindings (D-099). The runtime reads it at load; nothing
@@ -248,6 +248,27 @@ impl BindingKind {
 
     pub fn is_sampler(self) -> bool {
         matches!(self, BindingKind::Sampler | BindingKind::ComparisonSampler)
+    }
+
+    /// Whether it's a colour texture, which names its format (`ResourceBinding::format`).
+    pub fn has_format(self) -> bool {
+        matches!(
+            self,
+            BindingKind::Texture
+                | BindingKind::Texture3d
+                | BindingKind::StorageTexture
+                | BindingKind::StorageTexture3d
+        )
+    }
+
+    /// Whether kernels write it: a storage texture.
+    pub fn is_storage(self) -> bool {
+        matches!(self, BindingKind::StorageTexture | BindingKind::StorageTexture3d)
+    }
+
+    /// Whether it's a 3D texture.
+    pub fn is_3d(self) -> bool {
+        matches!(self, BindingKind::Texture3d | BindingKind::StorageTexture3d)
     }
 
     /// The name the manifest gives it.
@@ -567,6 +588,26 @@ mod read {
         }
     }
 
+    /// [`one_of`], or `default` where the key is missing.
+    fn one_of_or<T: Copy>(
+        o: &Json,
+        key: &str,
+        place: &str,
+        options: &[(&str, T)],
+        default: T,
+    ) -> Result<T> {
+        if o.contains_key(key) { one_of(o, key, place, options) } else { Ok(default) }
+    }
+
+    /// `true` or `false`, or `default` where the key is missing.
+    fn flag(o: &Json, key: &str, place: &str, default: bool) -> Result<bool> {
+        match o.get(key) {
+            None => Ok(default),
+            Some(Value::Bool(b)) => Ok(*b),
+            Some(_) => fail(format!("{place}.{key} must be true or false")),
+        }
+    }
+
     fn pipeline(v: &Value, i: usize) -> Result<Pipeline> {
         let place = format!("pipelines[{i}]");
         let o = object(v, &place)?;
@@ -599,14 +640,7 @@ mod read {
                 let bo = object(b, &bp)?;
                 let kind = one_of(bo, "kind", &bp, &kinds)?;
                 // A colour texture's format.
-                let colour = matches!(
-                    kind,
-                    BindingKind::Texture
-                        | BindingKind::Texture3d
-                        | BindingKind::StorageTexture
-                        | BindingKind::StorageTexture3d
-                );
-                let format = match (colour, bo.get("format")) {
+                let format = match (kind.has_format(), bo.get("format")) {
                     (false, None) => None,
                     (false, Some(_)) => {
                         return fail(format!("{bp}: only a colour texture has a `format`"));
@@ -619,11 +653,7 @@ mod read {
                                 "{bp}: a colour texture's format isn't a depth one"
                             ));
                         }
-                        let storage = matches!(
-                            kind,
-                            BindingKind::StorageTexture | BindingKind::StorageTexture3d
-                        );
-                        if storage && !f.storable() {
+                        if kind.is_storage() && !f.storable() {
                             return fail(format!(
                                 "{bp}: kernels can't write {} textures",
                                 f.name()
@@ -637,18 +667,13 @@ mod read {
                     kind,
                     format,
                     // A missing `stage` is both.
-                    stage: match bo.get("stage") {
-                        None => BindingStage::Both,
-                        Some(_) => one_of(
-                            bo,
-                            "stage",
-                            &bp,
-                            &[
-                                ("vertex", BindingStage::Vertex),
-                                ("fragment", BindingStage::Fragment),
-                            ],
-                        )?,
-                    },
+                    stage: one_of_or(
+                        bo,
+                        "stage",
+                        &bp,
+                        &[("vertex", BindingStage::Vertex), ("fragment", BindingStage::Fragment)],
+                        BindingStage::Both,
+                    )?,
                 })
             })
             .collect::<Result<_>>()?;
@@ -668,20 +693,15 @@ mod read {
                 vertex_entry: string(o, "vertex_entry", &place)?,
                 fragment_entry: string(o, "fragment_entry", &place)?,
                 // A missing `blend` is false.
-                blend: match o.get("blend").unwrap_or(&Value::Bool(false)) {
-                    Value::Bool(b) => *b,
-                    _ => return fail(format!("{place}.blend must be true or false")),
-                },
+                blend: flag(o, "blend", &place, false)?,
                 // A missing `cull` is none, and a missing `depth_bias` none.
-                cull: match o.get("cull") {
-                    None => Cull::None,
-                    Some(_) => one_of(
-                        o,
-                        "cull",
-                        &place,
-                        &[("none", Cull::None), ("front", Cull::Front), ("back", Cull::Back)],
-                    )?,
-                },
+                cull: one_of_or(
+                    o,
+                    "cull",
+                    &place,
+                    &[("none", Cull::None), ("front", Cull::Front), ("back", Cull::Back)],
+                    Cull::None,
+                )?,
                 depth_bias: match o.get("depth_bias") {
                     None => DepthBias::default(),
                     Some(v) => {
@@ -712,27 +732,14 @@ mod read {
                         let compares: Vec<(&str, Compare)> =
                             Compare::ALL.iter().map(|c| (c.name(), *c)).collect();
                         DepthState {
-                            compare: match d.get("compare") {
-                                None => Compare::Less,
-                                Some(_) => one_of(d, "compare", &dp, &compares)?,
-                            },
-                            write: match d.get("write").unwrap_or(&Value::Bool(true)) {
-                                Value::Bool(b) => *b,
-                                _ => return fail(format!("{dp}.write must be true or false")),
-                            },
+                            compare: one_of_or(d, "compare", &dp, &compares, Compare::Less)?,
+                            write: flag(d, "write", &dp, true)?,
                         }
                     }
                 },
-                // A missing `writes_depth` is false.
-                writes_depth: match o.get("writes_depth").unwrap_or(&Value::Bool(false)) {
-                    Value::Bool(b) => *b,
-                    _ => return fail(format!("{place}.writes_depth must be true or false")),
-                },
-                // A missing `uint` is false.
-                uint: match o.get("uint").unwrap_or(&Value::Bool(false)) {
-                    Value::Bool(b) => *b,
-                    _ => return fail(format!("{place}.uint must be true or false")),
-                },
+                // A missing `writes_depth` is false, and a missing `uint`.
+                writes_depth: flag(o, "writes_depth", &place, false)?,
+                uint: flag(o, "uint", &place, false)?,
             },
         };
         // A missing `debug_flag` is read as null.
