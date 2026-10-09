@@ -9,6 +9,7 @@ use std::mem::{
     take_answer, take_input, write, zeroed,
 }
 pub use std::mem::Pair
+use std::serialize::Serialize
 
 /// The runs a sort sorts by insertion before it merges them.
 const SORT_RUN: u32 = 16
@@ -540,8 +541,8 @@ impl<T: Eq, const N: u32> Eq for Bounded<T, N> {
 
 /// A set of an enum's variants, whose variants hold nothing (`Fieldless`, §3): one bit a
 /// variant, bit `u32(e)` for `e`, so an enum whose discriminants are below 32 (one past it traps
-/// on the CPU). One `u32`, which crosses to a host or the GPU as itself (`bits()`, `of_bits`),
-/// and GPU code reads and changes it as CPU code does.
+/// on the CPU). One `u32`, which crosses to a host or the GPU as itself (`bits()`, `of_bits`)
+/// and is saved as one (`Serialize`), and GPU code reads and changes it as CPU code does.
 ///
 /// ```wrela
 /// use std::collections::Flags
@@ -556,7 +557,7 @@ impl<T: Eq, const N: u32> Eq for Bounded<T, N> {
 /// assert(off.has(System::Sky) && !off.has(System::Trees))
 /// assert(off.bits() == 6 && off.without(System::Sky).bits() == 2)
 /// ```
-pub struct Flags<E: Fieldless>: Copy + Plain + GpuData {
+pub struct Flags<E: Fieldless>: Copy + Plain + GpuData + Serialize {
     bits: u32,
 }
 
