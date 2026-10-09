@@ -154,6 +154,21 @@ export class TickerControl {
  * `lockstep_ticks`, which the vectors check). */
 export const lockstepTicks = (i: number, hz: number, fps: number) => Math.floor(((i + 1) * hz) / fps);
 
+/** What a build hands the build that replaces it while it runs (hot reload): the ticks to run
+ * again, each with its records, by tick (those it ran, and those it was still to replay and hadn't
+ * reached), and how many ticks there were. As runtime/abi's `ticks::carried`; the vectors check
+ * both. */
+export function carried<R>(
+  ran: readonly [number, R][],
+  replay: { upto: number; ticks: readonly [number, R][] } | null,
+  next: number,
+): { upto: number; ticks: [number, R][] } {
+  const ticks: [number, R][] = [...ran];
+  for (const [k, r] of replay?.ticks ?? []) if (!ran.some(([t]) => t === k)) ticks.push([k, r]);
+  ticks.sort((a, b) => a[0] - b[0]);
+  return { upto: Math.max(next, replay?.upto ?? 0), ticks };
+}
+
 type TickFn = (thread: number, task: number, context: number, tick: number) => void;
 
 /** Runs the ticker until it's stopped, or a tick traps; `post` tells the render worker. */
@@ -241,10 +256,8 @@ class Ticker {
   /** What a build that replaces this one replays: the ticks run (and those still to replay),
    * with their records, and the clock's origin. */
   replayed(): Replay {
-    const ticks = new Map(this.ran);
-    if (this.replay) for (const [k, r] of this.replay.ticks) if (!ticks.has(k)) ticks.set(k, r);
-    const upto = Math.max(this.next, this.replay?.upto ?? 0);
-    return { upto, ticks: [...ticks].sort((a, b) => a[0] - b[0]), origin: this.t0 };
+    const replay = this.replay && { upto: this.replay.upto, ticks: [...this.replay.ticks] };
+    return { ...carried(this.ran, replay, this.next), origin: this.t0 };
   }
 
   loop(): void {

@@ -551,6 +551,163 @@
       }
     }
   ],
+  "carried": [
+    {
+      "name": "no replay",
+      "next": 5,
+      "ran": [
+        [
+          0,
+          [
+            1
+          ]
+        ],
+        [
+          3,
+          [
+            2,
+            3
+          ]
+        ]
+      ],
+      "replay": null,
+      "ticks": [
+        [
+          0,
+          [
+            1
+          ]
+        ],
+        [
+          3,
+          [
+            2,
+            3
+          ]
+        ]
+      ],
+      "upto": 5
+    },
+    {
+      "name": "nothing ran",
+      "next": 0,
+      "ran": [],
+      "replay": null,
+      "ticks": [],
+      "upto": 0
+    },
+    {
+      "name": "a replay it finished",
+      "next": 7,
+      "ran": [
+        [
+          1,
+          [
+            4
+          ]
+        ],
+        [
+          6,
+          [
+            5
+          ]
+        ]
+      ],
+      "replay": {
+        "ticks": [
+          [
+            1,
+            [
+              4
+            ]
+          ]
+        ],
+        "upto": 4
+      },
+      "ticks": [
+        [
+          1,
+          [
+            4
+          ]
+        ],
+        [
+          6,
+          [
+            5
+          ]
+        ]
+      ],
+      "upto": 7
+    },
+    {
+      "name": "a replay it hadn't reached the end of",
+      "next": 3,
+      "ran": [
+        [
+          0,
+          [
+            1
+          ]
+        ]
+      ],
+      "replay": {
+        "ticks": [
+          [
+            0,
+            [
+              1
+            ]
+          ],
+          [
+            2,
+            [
+              6
+            ]
+          ],
+          [
+            8,
+            [
+              7
+            ]
+          ]
+        ],
+        "upto": 9
+      },
+      "ticks": [
+        [
+          0,
+          [
+            1
+          ]
+        ],
+        [
+          2,
+          [
+            6
+          ]
+        ],
+        [
+          8,
+          [
+            7
+          ]
+        ]
+      ],
+      "upto": 9
+    },
+    {
+      "name": "a replay past its next tick, with no records",
+      "next": 2,
+      "ran": [],
+      "replay": {
+        "ticks": [],
+        "upto": 12
+      },
+      "ticks": [],
+      "upto": 12
+    }
+  ],
   "checks": {
     "batches": [
       {

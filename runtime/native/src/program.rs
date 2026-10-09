@@ -35,6 +35,12 @@ static ENGINE: LazyLock<Engine> = LazyLock::new(|| engine(false));
 /// does too much work fails rather than hangs, after the same work on every machine.
 static METERED: LazyLock<Engine> = LazyLock::new(|| engine(true));
 
+/// The engine that counts fuel ([`METERED`]): the compiler runs a build's constants and tests
+/// under it too, so a process that builds and runs programs makes one.
+pub fn metered_engine() -> &'static Engine {
+    &METERED
+}
+
 fn engine(fuel: bool) -> Engine {
     let mut config = wasmtime::Config::new();
     // A program's memory is shared with its workers (wrela_abi::memory). Wasmtime's threads are
@@ -750,16 +756,19 @@ impl<E: Executor> Program<E> {
         let Program { store, _helpers: helpers, ticker, ran, replay, records, .. } = self;
         drop(helpers);
         let state = store.into_data();
-        let ticks = ticker.map_or(0, |t| t.next).max(replay.as_ref().map_or(0, |r| r.upto));
-        let ran = ran.map(|mut ran| {
-            if let Some(r) = replay {
-                // The ticks it hadn't replayed yet: what the build before it ran.
-                let done: std::collections::HashSet<u32> = ran.iter().map(|t| t.0).collect();
-                ran.extend(r.records.into_iter().filter(|(k, _)| !done.contains(k)));
+        // The ticks it hadn't replayed yet, what the build before it ran, carry over too.
+        let pending: Option<(u32, Vec<_>)> =
+            replay.map(|r| (r.upto, r.records.into_iter().collect()));
+        let replay = pending.as_ref().map(|(upto, records)| (*upto, records.as_slice()));
+        let next = ticker.map_or(0, |t| t.next);
+        let (ticks, ran) = match ran {
+            Some(ran) => {
+                let (ticks, ran) = wrela_abi::ticks::carried(&ran, replay, next);
+                (ticks, Some(ran))
             }
-            ran.sort_by_key(|t| t.0);
-            ran
-        });
+            // One that kept none wasn't to be replaced: only how many ticks there were.
+            None => (next.max(replay.map_or(0, |r| r.0)), None),
+        };
         Retired {
             executor: state.executor,
             kept: state.keeping,

@@ -9,7 +9,7 @@ import { parseManifest } from "../src/manifest.ts";
 import { parseScript } from "../src/input.ts";
 import { decode, joins, Sequencer, StreamError } from "../src/stream.ts";
 import { frameTime } from "../src/testmode.ts";
-import { lockstepTicks } from "../src/ticker.ts";
+import { carried, lockstepTicks } from "../src/ticker.ts";
 import { TickLogWriter, wasmHash } from "../src/ticks.ts";
 import { type ErrorVector, vectors } from "./fixtures.ts";
 
@@ -163,5 +163,11 @@ describe("lockstep schedule", () => {
       // The WASM call rounds a frame's time to f32.
       expect(v.frames.map((i) => Math.fround(frameTime(i, v.fps)))).toEqual(v.times);
     });
+  }
+});
+
+describe("ticks carried over a hot reload", () => {
+  for (const v of vectors.carried) {
+    test(v.name, () => expect(carried(v.ran, v.replay, v.next)).toEqual({ upto: v.upto, ticks: v.ticks }));
   }
 });

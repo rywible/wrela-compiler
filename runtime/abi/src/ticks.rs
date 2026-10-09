@@ -107,6 +107,25 @@ pub fn lockstep_ticks(i: u32, hz: u32, fps: f64) -> u32 {
     ((f64::from(i) + 1.0) * f64::from(hz) / fps).floor() as u32
 }
 
+/// What a build hands the build that replaces it while it runs (hot reload): the ticks to run
+/// again, each with its records, by tick (those it ran, and those it was still to replay from
+/// the build before it and hadn't reached), and how many ticks there were: its next, or as far
+/// as its replay went, whichever is further. Both hosts carry ticks over by this: the vectors
+/// check it.
+pub fn carried<R: Clone>(
+    ran: &[(u32, R)],
+    replay: Option<(u32, &[(u32, R)])>,
+    next: u32,
+) -> (u32, Vec<(u32, R)>) {
+    let mut ticks = ran.to_vec();
+    if let Some((_, pending)) = replay {
+        let more = pending.iter().filter(|(k, _)| !ran.iter().any(|(t, _)| t == k));
+        ticks.extend(more.cloned());
+    }
+    ticks.sort_by_key(|t| t.0);
+    (next.max(replay.map_or(0, |r| r.0)), ticks)
+}
+
 impl TickLog {
     /// A log of no ticks yet.
     pub fn new(wasm_hash: u64, hz: u32, first: u64) -> TickLog {

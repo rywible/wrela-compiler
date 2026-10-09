@@ -30,6 +30,14 @@ export interface Vectors {
   input: { name: string; script: string; at?: string[]; events?: string[]; error?: string }[];
   tick_logs: { wasm_hash: string; hz: number; first: string; ticks: { records: string[]; hash: string }[]; bytes: string }[];
   lockstep: { hz: number; fps: number; frames: number[]; ticks: number[]; times: number[] }[];
+  carried: {
+    name: string;
+    ran: [number, number[]][];
+    replay: { upto: number; ticks: [number, number[]][] } | null;
+    next: number;
+    upto: number;
+    ticks: [number, number[]][];
+  }[];
 }
 
 /** The ABI's test vectors (runtime/abi/vectors.json). */

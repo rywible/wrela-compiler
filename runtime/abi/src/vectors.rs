@@ -1562,6 +1562,46 @@ fn joins() -> Vec<Value> {
         .collect()
 }
 
+/// What a build hands the next in a hot reload ([`crate::ticks::carried`]): the ticks it ran
+/// with their records (a tick's records here, numbers standing for its events), those it was
+/// still to replay from the build before it, and its next tick.
+fn carried() -> Vec<Value> {
+    type Ticks = Vec<(u32, Vec<u32>)>;
+    type Case = (&'static str, Ticks, Option<(u32, Ticks)>, u32);
+    let cases: [Case; 5] = [
+        ("no replay", vec![(0, vec![1]), (3, vec![2, 3])], None, 5),
+        ("nothing ran", vec![], None, 0),
+        (
+            "a replay it finished",
+            vec![(1, vec![4]), (6, vec![5])],
+            Some((4, vec![(1, vec![4])])),
+            7,
+        ),
+        (
+            "a replay it hadn't reached the end of",
+            vec![(0, vec![1])],
+            Some((9, vec![(0, vec![1]), (2, vec![6]), (8, vec![7])])),
+            3,
+        ),
+        ("a replay past its next tick, with no records", vec![], Some((12, vec![])), 2),
+    ];
+    cases
+        .into_iter()
+        .map(|(name, ran, replay, next)| {
+            let r = replay.as_ref().map(|(upto, ticks)| (*upto, ticks.as_slice()));
+            let (upto, ticks) = crate::ticks::carried(&ran, r, next);
+            json!({
+                "name": name,
+                "ran": ran,
+                "replay": replay.map(|(upto, ticks)| json!({ "upto": upto, "ticks": ticks })),
+                "next": next,
+                "upto": upto,
+                "ticks": ticks,
+            })
+        })
+        .collect()
+}
+
 /// Every vector, as `runtime/abi/vectors.json` holds them.
 pub fn vectors() -> String {
     let v = json!({
@@ -1577,6 +1617,7 @@ pub fn vectors() -> String {
         "input": input_scripts(),
         "tick_logs": tick_logs(),
         "lockstep": lockstep(),
+        "carried": carried(),
     });
     let mut s = serde_json::to_string_pretty(&v).expect("vectors serialize");
     s.push('\n');
