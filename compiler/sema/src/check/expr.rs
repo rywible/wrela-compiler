@@ -1670,6 +1670,38 @@ impl<'p> Checker<'p> {
         }
     }
 
+    /// The struct a type alias names (not one that names traits), and its type arguments: the
+    /// alias's own, given in `path` or inferred, substituted.
+    fn alias_struct(
+        &mut self,
+        al: crate::ty::AliasId,
+        path: &ast::Path,
+        span: Span,
+    ) -> Option<(AdtId, Vec<TyId>)> {
+        let def = &self.p.aliases[al.index()];
+        if def.defined_by.is_some() {
+            return None;
+        }
+        let (generics, ty) = (def.generics.clone(), def.ty);
+        let given = path.segments.last().and_then(|s| s.generics.as_deref());
+        let args: Vec<TyId> = match given {
+            Some(g) if g.len() == generics.len() => {
+                g.iter().map(|t| self.resolve_type(t)).collect()
+            }
+            Some(g) => {
+                let name = self.p.aliases[al.index()].name.clone();
+                self.err(resolve::wrong_generic_count(span, &name, generics.len(), g.len()));
+                return None;
+            }
+            None => generics.iter().map(|_| self.new_var(VarKind::General, span)).collect(),
+        };
+        let t = self.p.types.subst(ty, &Subst::from_pairs(&generics, &args));
+        match self.kind(t) {
+            TyKind::Adt(a, args) if !self.p.adt(*a).is_enum() => Some((*a, args.clone())),
+            _ => None,
+        }
+    }
+
     /// `Packed` struct `a`'s field `n` (§3), or E0206 (E0210 for a private one elsewhere).
     pub(crate) fn packed_field(&mut self, a: AdtId, n: &ast::Ident) -> Option<PackedField> {
         let fields = self.p.packed.get(&a)?;
@@ -1854,8 +1886,14 @@ impl<'p> Checker<'p> {
                 PathLookup::NotYet(..) | PathLookup::Broken => None,
             }
         };
+        // A type alias of a struct names it as the struct does, its types the alias's (§4).
+        let mut alias_args = None;
         let (adt, variant) = match res {
             Some(Res::Adt(a)) if !self.p.adt(a).is_enum() => (a, None),
+            Some(Res::Alias(al)) if let Some((a, args)) = self.alias_struct(al, path, span) => {
+                alias_args = Some(args);
+                (a, None)
+            }
             Some(Res::Variant(a, v))
                 if self.p.adt(a).variants()[v as usize].shape == VariantShape::Struct =>
             {
@@ -1888,6 +1926,8 @@ impl<'p> Checker<'p> {
                 Some(TyKind::Adt(_, args)) => args.clone(),
                 _ => Vec::new(),
             }
+        } else if let Some(args) = alias_args {
+            args
         } else {
             self.adt_args(adt, path, expected, span)
         };

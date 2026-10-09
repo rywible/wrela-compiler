@@ -1,7 +1,11 @@
 // accepts: ty.alias
+// An alias names a type wherever a type goes, and a struct's names it in a literal too.
 type Tick = u64
+
 type Pair<T> = (T, T)
+
 type Grid = [Row; 2]
+
 type Row = [f32; 3]
 
 fn next(t: Tick) -> Tick {
@@ -14,4 +18,21 @@ fn swap(p: Pair<f32>) -> Pair<f32> {
 
 fn corner(g: Grid) -> f32 {
     g[1][2]
+}
+
+struct Span2<T> {
+    lo: T,
+    hi: T,
+}
+
+type Range = Span2<f32>
+
+type Same<T> = Span2<T>
+
+fn unit() -> Range {
+    Range { lo: 0.0, hi: 1.0 }
+}
+
+fn both(x: u32) -> Same<u32> {
+    Same { lo: x, hi: x }
 }
