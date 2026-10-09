@@ -160,7 +160,7 @@ pub fn format_like(old: &str, v: f32) -> Option<String> {
 }
 
 /// The tokens of `text` but its line breaks and its end.
-fn lex(text: &str) -> impl Iterator<Item = Token> {
+pub(crate) fn lex(text: &str) -> impl Iterator<Item = Token> {
     let tokens = wrela_syntax::lexer::lex(wrela_diag::FileId(0), text).tokens;
     tokens.into_iter().filter(|t| !matches!(t.kind, TokenKind::Newline | TokenKind::Eof))
 }

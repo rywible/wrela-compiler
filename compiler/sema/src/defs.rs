@@ -498,7 +498,7 @@ pub struct AdtDef {
     pub borrow: bool,
     /// A bound entry point's type (§12): the borrow struct of this entry point's arguments,
     /// which the compiler makes. Its generics are the entry point's, and its fields its
-    /// parameters that a command binds (`gpu::bound_params`), in order.
+    /// parameters that a command binds (`gpu::bound_fields`), in order.
     pub entry: Option<FnId>,
 }
 

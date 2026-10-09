@@ -11,14 +11,15 @@
 //!                            └──anything else──build──▶ Change::Built ──▶ the program swapped
 //! ```
 //!
-//! The server's paths: `/` and the build's files (the newest build), `/v<n>/...` (build `n`),
+//! The server's paths: `/` and the build's files (the newest build), `/<n>/...` (build `n`),
 //! `/live/next?after=<seq>` (a long poll: the changes after `seq`, as JSON), `/live/shown` (the
 //! page says which frame first showed a change), `/results/<file>` (test mode's results).
 
 use crate::http;
-use crate::studio::{Numbers, moved, same_but_numbers};
+use crate::lift::{Report, ReportLiteral};
+use crate::studio::{Numbers, lifted_files, literal_values};
 use std::collections::BTreeMap;
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -27,15 +28,70 @@ use std::time::{Duration, Instant, SystemTime};
 /// How often the watcher looks at the files.
 pub const SCAN: Duration = Duration::from_millis(20);
 
-/// A file as the watcher saw it: when it was last changed, its length, and its text.
-#[derive(Clone, Debug, PartialEq)]
-struct Seen {
+/// A file as a watcher saw it: when it was last changed, its length, and its text.
+#[derive(Clone, Debug)]
+pub(crate) struct Seen {
     modified: SystemTime,
     len: u64,
-    text: String,
+    /// Shared with the scans after, until the file is read again.
+    pub text: Arc<str>,
 }
 
-type Files = BTreeMap<PathBuf, Seen>;
+impl Seen {
+    /// Whether `other`'s text is this one's: the same text, unless one of them was read again.
+    pub fn same_text(&self, other: &Seen) -> bool {
+        Arc::ptr_eq(&self.text, &other.text) || self.text == other.text
+    }
+}
+
+/// Watched files as a scan found them, by path.
+pub(crate) type Files = BTreeMap<PathBuf, Seen>;
+
+/// The source files (modules and manifests, not build output) of the packages in `dirs`, each
+/// read again only where its time or length has changed since `before`.
+pub(crate) fn scan(dirs: &[PathBuf], before: &Files) -> Files {
+    fn walk(dir: &Path, top: bool, before: &Files, out: &mut Files) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for e in entries.flatten() {
+            let path = e.path();
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') {
+                continue;
+            }
+            let Ok(meta) = e.metadata() else { continue };
+            if meta.is_dir() {
+                if !(top && ["build", "results", "target"].contains(&name.as_str())) {
+                    walk(&path, false, before, out);
+                }
+            } else if name.ends_with(".wrela") || name == "wrela.toml" {
+                let modified = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+                let len = meta.len();
+                let seen = match before.get(&path) {
+                    Some(s) if s.modified == modified && s.len == len => s.clone(),
+                    _ => Seen {
+                        modified,
+                        len,
+                        text: std::fs::read_to_string(&path).unwrap_or_default().into(),
+                    },
+                };
+                out.insert(path, seen);
+            }
+        }
+    }
+    let mut out = Files::new();
+    for d in dirs {
+        walk(d, true, before, &mut out);
+    }
+    out
+}
+
+/// The files whose texts differ between `before` and `now`, and those only one of them has.
+pub(crate) fn changed<'a>(before: &'a Files, now: &'a Files) -> impl Iterator<Item = &'a PathBuf> {
+    now.iter()
+        .filter(|(p, s)| before.get(*p).is_none_or(|old| !old.same_text(s)))
+        .map(|(p, _)| p)
+        .chain(before.keys().filter(|p| !now.contains_key(*p)))
+}
 
 /// What changed in the program's files.
 #[derive(Clone, Debug, PartialEq)]
@@ -46,28 +102,6 @@ pub enum Change {
     Built { version: u64, dir: PathBuf },
     /// Anything else, and the program doesn't build: why, rendered.
     Failed(String),
-}
-
-/// The lifted build's report, as far as the watcher reads it (`lift.json`).
-#[derive(serde::Deserialize)]
-struct Report {
-    files: Vec<ReportFile>,
-    literals: Vec<ReportLiteral>,
-}
-
-#[derive(serde::Deserialize)]
-struct ReportFile {
-    /// Relative to the program's package.
-    path: String,
-    text: String,
-}
-
-#[derive(serde::Deserialize)]
-struct ReportLiteral {
-    file: u32,
-    start: u32,
-    end: u32,
-    value: f32,
 }
 
 /// A program, built lifted, and its files watched (see the module's docs).
@@ -83,7 +117,10 @@ pub struct Watcher {
     /// The files when last looked at, and as the newest build saw them.
     seen: Files,
     built: Files,
-    report: Report,
+    /// The newest build's literals, and the files it lifted as it saw them ([`lifted_files`]):
+    /// `None` if one of those isn't among the files watched.
+    literals: Vec<ReportLiteral>,
+    lifted: Option<Vec<(PathBuf, Numbers)>>,
     /// Each literal's value now: the build's, then each change's.
     values: Vec<f32>,
     /// When the newest change was saved: the newest time a changed file was modified.
@@ -96,21 +133,21 @@ impl Watcher {
     pub fn start(pkg: &Path, out: &Path, lift: &[String], debug: bool) -> Result<Watcher, String> {
         let packages = crate::packages(pkg)?;
         let lift = if lift.is_empty() { vec![packages[0].0.clone()] } else { lift.to_vec() };
-        let dirs = packages.into_iter().map(|(_, d)| d).collect();
+        let dirs: Vec<PathBuf> = packages.into_iter().map(|(_, d)| d).collect();
         let mut w = Watcher {
             pkg: pkg.to_path_buf(),
             lift,
             debug,
             out: out.to_path_buf(),
             version: 0,
+            seen: scan(&dirs, &Files::new()),
             dirs,
-            seen: Files::new(),
             built: Files::new(),
-            report: Report { files: Vec::new(), literals: Vec::new() },
+            literals: Vec::new(),
+            lifted: None,
             values: Vec::new(),
             saved: None,
         };
-        w.seen = w.scan(&Files::new());
         match w.build() {
             Change::Failed(why) => Err(why),
             _ => Ok(w),
@@ -126,77 +163,28 @@ impl Watcher {
         self.version
     }
 
-    /// The program's files and its dependencies' (modules and manifests, not build output),
-    /// read again only where a file's time or length has changed since `before`.
-    fn scan(&self, before: &Files) -> Files {
-        let mut out = Files::new();
-        fn walk(dir: &Path, top: bool, before: &Files, out: &mut Files) {
-            let Ok(entries) = std::fs::read_dir(dir) else { return };
-            for e in entries.flatten() {
-                let path = e.path();
-                let name = e.file_name().to_string_lossy().into_owned();
-                if name.starts_with('.') {
-                    continue;
-                }
-                let Ok(meta) = e.metadata() else { continue };
-                if meta.is_dir() {
-                    if !(top && ["build", "results", "target"].contains(&name.as_str())) {
-                        walk(&path, false, before, out);
-                    }
-                } else if name.ends_with(".wrela") || name == "wrela.toml" {
-                    let modified = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-                    let len = meta.len();
-                    let seen = match before.get(&path) {
-                        Some(s) if s.modified == modified && s.len == len => s.clone(),
-                        _ => Seen {
-                            modified,
-                            len,
-                            text: std::fs::read_to_string(&path).unwrap_or_default(),
-                        },
-                    };
-                    out.insert(path, seen);
-                }
-            }
-        }
-        for d in &self.dirs {
-            walk(d, true, before, &mut out);
-        }
-        out
-    }
-
     /// Looks at the files once: what's changed since the last look, if anything.
     pub fn poll(&mut self) -> Option<Change> {
-        let now = self.scan(&self.seen);
-        let changed: Vec<&PathBuf> = now
-            .iter()
-            .filter(|(p, s)| self.seen.get(*p).is_none_or(|old| old.text != s.text))
-            .map(|(p, _)| p)
-            .chain(self.seen.keys().filter(|p| !now.contains_key(*p)))
-            .collect();
+        let now = scan(&self.dirs, &self.seen);
+        let changed: Vec<&PathBuf> = changed(&self.seen, &now).collect();
         if changed.is_empty() {
             self.seen = now;
             return None;
         }
         self.saved = changed.iter().filter_map(|p| now.get(*p)).map(|s| s.modified).max();
-        let change = match self.literal_values(&now) {
-            Some(values) => {
-                let edits: Vec<(u32, f32)> = values
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, v)| self.values[*i].to_bits() != v.to_bits())
-                    .map(|(i, v)| (i as u32, *v))
-                    .collect();
-                self.values = values;
-                // A change of a literal back and forth since the last look is no change.
-                (!edits.is_empty()).then_some(Change::Literals(edits))
-            }
-            None => {
-                self.seen = now.clone();
-                Some(self.build())
-            }
-        };
+        let values = (self.lifted.as_deref())
+            .and_then(|lifted| literal_values(lifted, &self.literals, &now, &self.built));
         self.seen = now;
-        change
+        let Some(values) = values else { return Some(self.build()) };
+        let edits: Vec<(u32, f32)> = values
+            .iter()
+            .enumerate()
+            .filter(|(i, v)| self.values[*i].to_bits() != v.to_bits())
+            .map(|(i, v)| (i as u32, *v))
+            .collect();
+        self.values = values;
+        // A change of a literal back and forth since the last look is no change.
+        (!edits.is_empty()).then_some(Change::Literals(edits))
     }
 
     /// Builds the program as its files are now, into the next version's directory.
@@ -213,9 +201,10 @@ impl Watcher {
         if let Err(e) = out.write_to(&dir) {
             return Change::Failed(format!("can't write the build to {}: {e}", dir.display()));
         }
-        let report = std::fs::read_to_string(dir.join("lift.json"))
-            .map_err(|e| e.to_string())
-            .and_then(|t| serde_json::from_str::<Report>(&t).map_err(|e| e.to_string()));
+        let report = match out.files.iter().find(|(p, _)| p == "lift.json") {
+            Some((_, json)) => serde_json::from_slice::<Report>(json).map_err(|e| e.to_string()),
+            None => Err("the build has none".to_string()),
+        };
         let report = match report {
             Ok(r) => r,
             Err(why) => {
@@ -223,50 +212,18 @@ impl Watcher {
             }
         };
         self.values = report.literals.iter().map(|l| l.value).collect();
-        self.report = report;
+        self.lifted = lifted_files(&self.pkg, &report, &self.seen);
+        self.literals = report.literals;
         self.built = self.seen.clone();
         self.version = version;
         Change::Built { version, dir }
-    }
-
-    /// The build's literals' values in the files as they are (`now`), if what changed since
-    /// the build is literals alone: each lifted file's tokens are the build's but for numbers,
-    /// and every other file is as the build saw it.
-    fn literal_values(&self, now: &Files) -> Option<Vec<f32>> {
-        if !now.keys().eq(self.built.keys()) {
-            return None;
-        }
-        let canonical: BTreeMap<PathBuf, &PathBuf> =
-            now.keys().filter_map(|p| Some((p.canonicalize().ok()?, p))).collect();
-        let mut texts = Vec::new();
-        let mut lifted = Vec::new();
-        for f in &self.report.files {
-            let path = *canonical.get(&self.pkg.join(&f.path).canonicalize().ok()?)?;
-            let current = &now[path].text;
-            if !same_but_numbers(&f.text, current) {
-                return None;
-            }
-            texts.push((Numbers::new(f.text.clone()), Numbers::new(current.clone())));
-            lifted.push(path);
-        }
-        if now.iter().any(|(p, s)| !lifted.contains(&p) && self.built[p].text != s.text) {
-            return None;
-        }
-        let mut values = Vec::with_capacity(self.report.literals.len());
-        for l in &self.report.literals {
-            let (built, current) = texts.get(l.file as usize)?;
-            let (s, e) = moved(built, current, l.start, l.end)?;
-            values.push(crate::edit::signed_value(&current.text()[s as usize..e as usize])?);
-        }
-        Some(values)
     }
 }
 
 // ---- the server ---------------------------------------------------------------------------------
 
-/// A change as the page gets it, numbered.
+/// A change as the page gets it, numbered (its `seq`, from 1: its place in [`Live::events`]).
 struct Event {
-    seq: u64,
     json: serde_json::Value,
     /// When the watcher saw it, and when its files were saved.
     seen: Instant,
@@ -303,8 +260,6 @@ struct Live {
 /// A running `wrela run` server: its port, and its threads, which stop when it's dropped.
 pub struct Server {
     pub port: u16,
-    /// Where the builds are (`<n>/`), and test mode's results (`results/`).
-    pub out: PathBuf,
     state: Arc<State>,
     stopping: Arc<AtomicBool>,
 }
@@ -328,10 +283,9 @@ impl Server {
     }
 
     pub fn stop(&self) {
-        if !self.stopping.swap(true, Ordering::SeqCst) {
+        if http::stop(self.port, &self.stopping) {
+            // Long polls end too.
             self.state.changed.notify_all();
-            // Wakes the accepting thread, which then sees it's stopping.
-            let _ = TcpStream::connect(("127.0.0.1", self.port));
         }
     }
 }
@@ -355,9 +309,7 @@ pub fn serve(
 ) -> Result<Server, String> {
     let _ = std::fs::remove_dir_all(out);
     let mut watcher = Watcher::start(pkg, out, lift, debug)?;
-    let listener = TcpListener::bind(("127.0.0.1", port))
-        .map_err(|e| format!("can't listen on 127.0.0.1:{port}: {e}"))?;
-    let port = listener.local_addr().map_err(|e| e.to_string())?.port();
+    let (listener, port) = http::listen(port)?;
     let state = Arc::new(State {
         out: out.to_path_buf(),
         port,
@@ -399,26 +351,17 @@ pub fn serve(
             if let Change::Built { version, .. } = change {
                 s.version = version;
             }
-            let seq = s.events.len() as u64 + 1;
             let mut json = json;
-            json["seq"] = seq.into();
-            s.events.push(Event { seq, json, seen, saved: watcher.saved });
+            json["seq"] = (s.events.len() as u64 + 1).into();
+            s.events.push(Event { json, seen, saved: watcher.saved });
             watching.changed.notify_all();
         }
     });
     let (accepting, stop_accepting) = (Arc::clone(&state), Arc::clone(&stopping));
-    std::thread::spawn(move || {
-        for stream in listener.incoming().flatten() {
-            if stop_accepting.load(Ordering::SeqCst) {
-                break;
-            }
-            let (state, stopping) = (Arc::clone(&accepting), Arc::clone(&stop_accepting));
-            std::thread::spawn(move || {
-                let _ = handle(stream, &state, &stopping, quiet);
-            });
-        }
+    http::accept(listener, Arc::clone(&stopping), move |stream| {
+        let _ = handle(stream, &accepting, &stop_accepting, quiet);
     });
-    Ok(Server { port, out: out.to_path_buf(), state, stopping })
+    Ok(Server { port, state, stopping })
 }
 
 /// What `/` and a build's `index.html` get: the mark that tells the runtime the page is live.
@@ -447,8 +390,9 @@ fn handle(
                 }
                 s = state.changed.wait_timeout(s, left).expect("the state").0;
             }
+            let after = usize::try_from(after).unwrap_or(usize::MAX);
             let events: Vec<&serde_json::Value> =
-                s.events.iter().filter(|e| e.seq > after).map(|e| &e.json).collect();
+                s.events.iter().skip(after).map(|e| &e.json).collect();
             let body = serde_json::to_vec(&events).unwrap_or_default();
             drop(s);
             http::respond(&mut out, 200, "application/json", &body)
@@ -459,7 +403,8 @@ fn handle(
                 return http::respond(&mut out, 403, "text/plain", b"a report is {seq, frame}");
             };
             let mut s = state.live.lock().expect("the state");
-            if let Some(e) = s.events.iter().find(|e| e.seq == seq) {
+            let event = seq.checked_sub(1).and_then(|i| s.events.get(usize::try_from(i).ok()?));
+            if let Some(e) = event {
                 let shown = Shown {
                     seq,
                     kind: e.json["kind"].as_str().unwrap_or("").to_string(),
@@ -495,23 +440,9 @@ fn handle(
                 _ => (state.out.join(version.to_string()), trimmed),
             };
             let rel = if rel.is_empty() { "index.html" } else { rel };
-            if wrela_abi::check::path_problem(rel).is_some() {
-                return http::respond(&mut out, 404, "text/plain", b"not found");
-            }
-            match std::fs::read(dir.join(rel)) {
-                Ok(mut bytes) => {
-                    if rel == "index.html" {
-                        let html = String::from_utf8_lossy(&bytes).replacen(
-                            "<head>",
-                            &format!("<head>{MARK}"),
-                            1,
-                        );
-                        bytes = html.into_bytes();
-                    }
-                    http::respond(&mut out, 200, http::mime(rel), &bytes)
-                }
-                Err(_) => http::respond(&mut out, 404, "text/plain", b"not found"),
-            }
+            http::get_file(&mut out, &dir, rel, |html| {
+                html.replacen("<head>", &format!("<head>{MARK}"), 1)
+            })
         }
         _ => http::respond(&mut out, 405, "text/plain", b"not allowed"),
     }

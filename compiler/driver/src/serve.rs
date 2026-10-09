@@ -14,13 +14,13 @@
 //! another site open in the browser can't edit the files. Test mode's results (`PUT
 //! /results/<file>`) go to the page's `results/`.
 
+use crate::live::{Files, changed, scan};
 use crate::{http, studio};
-use std::collections::BTreeMap;
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 /// What the server knows, shared by its threads: what it was started with, and what changes.
 struct Shared {
@@ -46,9 +46,6 @@ struct Live {
     error: Option<String>,
 }
 
-/// The subject's source files, with their times and texts, by path.
-type Files = BTreeMap<PathBuf, (SystemTime, String)>;
-
 /// A running studio server: its port, and its threads, which stop when it's dropped (or
 /// `stop`ped).
 pub struct Server {
@@ -65,10 +62,7 @@ impl Server {
     }
 
     pub fn stop(&self) {
-        if !self.stopping.swap(true, Ordering::SeqCst) {
-            // Wakes the accepting thread, which then sees it's stopping.
-            let _ = TcpStream::connect(("127.0.0.1", self.port));
-        }
+        http::stop(self.port, &self.stopping);
     }
 }
 
@@ -88,9 +82,7 @@ pub fn start(
     debug: bool,
     reference: Option<Vec<u8>>,
 ) -> Result<Server, String> {
-    let listener = TcpListener::bind(("127.0.0.1", port))
-        .map_err(|e| format!("can't listen on 127.0.0.1:{port}: {e}"))?;
-    let port = listener.local_addr().map_err(|e| e.to_string())?.port();
+    let (listener, port) = http::listen(port)?;
     let state = Arc::new(Shared {
         pkg: pkg.to_path_buf(),
         page: page.to_path_buf(),
@@ -105,19 +97,11 @@ pub fn start(
         }),
     });
     let stopping = Arc::new(AtomicBool::new(false));
-    let (watcher, stop_watching, seen) = (Arc::clone(&state), Arc::clone(&stopping), scan(pkg));
+    let seen = scan(std::slice::from_ref(&state.pkg), &Files::new());
+    let (watcher, stop_watching) = (Arc::clone(&state), Arc::clone(&stopping));
     std::thread::spawn(move || watch(&watcher, &stop_watching, seen));
-    let stop_accepting = Arc::clone(&stopping);
-    std::thread::spawn(move || {
-        for stream in listener.incoming().flatten() {
-            if stop_accepting.load(Ordering::SeqCst) {
-                break;
-            }
-            let state = Arc::clone(&state);
-            std::thread::spawn(move || {
-                let _ = handle(stream, &state);
-            });
-        }
+    http::accept(listener, Arc::clone(&stopping), move |stream| {
+        let _ = handle(stream, &state);
     });
     Ok(Server { port, stopping })
 }
@@ -127,38 +111,9 @@ fn build_values(page: &Path) -> Vec<f32> {
     studio::report(page).map(|r| r.literals.iter().map(|l| l.value).collect()).unwrap_or_default()
 }
 
-/// The subject's source files (its modules and manifests, not its build output), with their
-/// times and texts.
-fn scan(pkg: &Path) -> Files {
-    let mut out = BTreeMap::new();
-    fn walk(dir: &Path, out: &mut Files, top: bool) {
-        let Ok(entries) = std::fs::read_dir(dir) else { return };
-        for e in entries.flatten() {
-            let path = e.path();
-            let name = e.file_name().to_string_lossy().into_owned();
-            if name.starts_with('.') {
-                continue;
-            }
-            if path.is_dir() {
-                if !(top && ["build", "results", "target"].contains(&name.as_str())) {
-                    walk(&path, out, false);
-                }
-            } else if name.ends_with(".wrela") || name == "wrela.toml" {
-                let time =
-                    e.metadata().and_then(|m| m.modified()).unwrap_or(SystemTime::UNIX_EPOCH);
-                out.insert(
-                    path.clone(),
-                    (time, std::fs::read_to_string(&path).unwrap_or_default()),
-                );
-            }
-        }
-    }
-    walk(pkg, &mut out, true);
-    out
-}
-
-/// Every 200 ms: what changed in the subject's files since `seen`. Literals only: new values for
-/// the lens. Anything else: a rebuild, and a new version.
+/// Every 200 ms: what changed in the subject's files (its modules and manifests, not its build
+/// output) since `seen`. Literals only: new values for the lens. Anything else: a rebuild, and
+/// a new version.
 fn watch(state: &Shared, stopping: &AtomicBool, mut seen: Files) {
     // The files as the lens's build saw them: as the server first found them (the build is of
     // what was there when it started), then as each rebuild found them.
@@ -168,10 +123,9 @@ fn watch(state: &Shared, stopping: &AtomicBool, mut seen: Files) {
         if stopping.load(Ordering::SeqCst) {
             return;
         }
-        let now = scan(&state.pkg);
-        let changed = now.iter().any(|(p, (_, t))| seen.get(p).is_none_or(|(_, old)| old != t))
-            || seen.keys().any(|p| !now.contains_key(p));
-        if !changed {
+        let now = scan(std::slice::from_ref(&state.pkg), &seen);
+        if changed(&seen, &now).next().is_none() {
+            seen = now;
             continue;
         }
         match literal_values(&state.pkg, &state.page, &now, &built) {
@@ -213,40 +167,12 @@ fn watch(state: &Shared, stopping: &AtomicBool, mut seen: Files) {
 }
 
 /// The build's literals' values in the files as they are (`now`), if what changed since the
-/// build (which saw the files as `built`) is literals alone: each changed file's tokens are the
-/// build's but for numbers.
+/// build (which saw the files as `built`) is literals alone ([`studio::literal_values`]).
 fn literal_values(pkg: &Path, page: &Path, now: &Files, built: &Files) -> Option<Vec<f32>> {
     let r = studio::report(page).ok()?;
-    let lens = studio::dir(pkg).join("lens");
-    // The files by their canonical paths, as the build's report names them from the lens.
-    let canonical: BTreeMap<PathBuf, &PathBuf> =
-        now.keys().filter_map(|p| Some((p.canonicalize().ok()?, p))).collect();
-    // Every file the build lifted, as it is now (each lexed once for its literals); a file it
-    // didn't lift must be as it was.
-    let mut texts = Vec::new();
-    let mut lifted = Vec::new();
-    for f in r.files {
-        let path = *canonical.get(&lens.join(&f.path).canonicalize().ok()?)?;
-        let current = &now[path].1;
-        if !studio::same_but_numbers(&f.text, current) {
-            return None;
-        }
-        texts.push((studio::Numbers::new(f.text), studio::Numbers::new(current.clone())));
-        lifted.push(path);
-    }
-    // A file added or deleted since the build changes the program, lifted or not.
-    if !now.keys().eq(built.keys())
-        || now.iter().any(|(p, (_, t))| !lifted.contains(&p) && built[p].1 != *t)
-    {
-        return None;
-    }
-    let mut values = Vec::new();
-    for l in &r.literals {
-        let (built, current) = texts.get(l.file as usize)?;
-        let (s, e) = studio::moved(built, current, l.start, l.end)?;
-        values.push(crate::edit::signed_value(&current.text()[s as usize..e as usize])?);
-    }
-    Some(values)
+    // The build's report names its files from the lens.
+    let lifted = studio::lifted_files(&studio::dir(pkg).join("lens"), &r, built)?;
+    studio::literal_values(&lifted, &r.literals, now, built)
 }
 
 // ---- HTTP -----------------------------------------------------------------------------------------
@@ -314,22 +240,10 @@ fn handle(stream: TcpStream, state: &Shared) -> std::io::Result<()> {
             }
         },
         ("GET", path) => {
-            let page = &state.page;
             let rel = if path == "/" { "index.html" } else { path.trim_start_matches('/') };
-            if wrela_abi::check::path_problem(rel).is_some() {
-                return http::respond(&mut out, 404, "text/plain", b"not found");
-            }
-            match std::fs::read(page.join(rel)) {
-                Ok(mut bytes) => {
-                    if rel == "index.html" {
-                        let html = String::from_utf8_lossy(&bytes)
-                            .replace("</body>", &format!("{SCRIPT}</body>"));
-                        bytes = html.into_bytes();
-                    }
-                    http::respond(&mut out, 200, http::mime(rel), &bytes)
-                }
-                Err(_) => http::respond(&mut out, 404, "text/plain", b"not found"),
-            }
+            http::get_file(&mut out, &state.page, rel, |html| {
+                html.replace("</body>", &format!("{SCRIPT}</body>"))
+            })
         }
         _ => http::respond(&mut out, 405, "text/plain", b"not allowed"),
     }

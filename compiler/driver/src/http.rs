@@ -5,7 +5,10 @@
 //! browser can't change files.
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpListener, TcpStream};
+use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// The largest request body a server takes (a test's frame, an edit's JSON).
 pub(crate) const MAX_BODY: usize = 16 << 20;
@@ -23,6 +26,43 @@ impl Request {
     pub fn param(&self, key: &str) -> Option<&str> {
         self.query.split('&').find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))
     }
+}
+
+/// Listens on 127.0.0.1:`port` (0: a free port): the listener, and its port.
+pub(crate) fn listen(port: u16) -> Result<(TcpListener, u16), String> {
+    let listener = TcpListener::bind(("127.0.0.1", port))
+        .map_err(|e| format!("can't listen on 127.0.0.1:{port}: {e}"))?;
+    let port = listener.local_addr().map_err(|e| e.to_string())?.port();
+    Ok((listener, port))
+}
+
+/// Answers `listener`'s connections from a thread of its own, each with `handle` on a thread of
+/// its own, until `stopping` is set ([`stop`] sets it).
+pub(crate) fn accept(
+    listener: TcpListener,
+    stopping: Arc<AtomicBool>,
+    handle: impl Fn(TcpStream) + Clone + Send + 'static,
+) {
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            if stopping.load(Ordering::SeqCst) {
+                break;
+            }
+            let handle = handle.clone();
+            std::thread::spawn(move || handle(stream));
+        }
+    });
+}
+
+/// Stops the server on `port` whose connections [`accept`] answers until `stopping`: false if
+/// it was stopped already.
+pub(crate) fn stop(port: u16, stopping: &AtomicBool) -> bool {
+    if stopping.swap(true, Ordering::SeqCst) {
+        return false;
+    }
+    // Wakes the accepting thread, which then sees it's stopping.
+    let _ = TcpStream::connect(("127.0.0.1", port));
+    true
 }
 
 /// Reads a request from `stream`, for a server on `port`: `None` if it was refused (the
@@ -97,7 +137,29 @@ pub(crate) fn put_result(
     respond(out, 201, "text/plain", b"")
 }
 
-pub(crate) fn mime(path: &str) -> &'static str {
+/// Answers a GET of the file at `rel` in `dir`, an `index.html` as `page` makes it of the
+/// file's text: not found if there's none, or `rel` isn't a plain path in `dir`.
+pub(crate) fn get_file(
+    out: &mut TcpStream,
+    dir: &Path,
+    rel: &str,
+    page: impl FnOnce(&str) -> String,
+) -> std::io::Result<()> {
+    if wrela_abi::check::path_problem(rel).is_some() {
+        return respond(out, 404, "text/plain", b"not found");
+    }
+    match std::fs::read(dir.join(rel)) {
+        Ok(mut bytes) => {
+            if rel == "index.html" {
+                bytes = page(&String::from_utf8_lossy(&bytes)).into_bytes();
+            }
+            respond(out, 200, mime(rel), &bytes)
+        }
+        Err(_) => respond(out, 404, "text/plain", b"not found"),
+    }
+}
+
+fn mime(path: &str) -> &'static str {
     match path.rsplit('.').next() {
         Some("html") => "text/html; charset=utf-8",
         Some("js") => "text/javascript",

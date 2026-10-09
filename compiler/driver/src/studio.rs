@@ -9,11 +9,14 @@
 //! `pub fn subject()`, which returns a `Surface + Lipschitz`; if it's a `Field<C>` too, the glue
 //! writes each of the channels' public float fields into the lens's probes.
 
+use crate::live::Files;
 use std::collections::BTreeMap;
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use wrela_sema::Checked;
 use wrela_sema::ty::{TyId, TyKind};
+use wrela_syntax::token::TokenKind;
 
 mod embedded {
     include!(concat!(env!("OUT_DIR"), "/packages.rs"));
@@ -437,51 +440,51 @@ pub(crate) fn report(page: &Path) -> Result<crate::lift::Report, String> {
 }
 
 /// A file's text, lexed once for finding literals in it: its number tokens, in order, as byte
-/// ranges (a minus before one, taken into a lifted literal, isn't a separate token here).
+/// ranges (a minus before one, taken into a lifted literal, isn't a separate token here), and
+/// what an edit of literals keeps of its tokens (its shape).
 pub struct Numbers {
-    text: String,
+    text: Arc<str>,
     tokens: Vec<(u32, u32)>,
+    /// Its tokens but its line breaks and its end, each number a `Float` with no text, and the
+    /// minus signs before a number (an edit of a literal may add, drop or move one) left out.
+    /// A minus before anything else is the code's.
+    shape: Vec<(TokenKind, u32, u32)>,
 }
 
 impl Numbers {
-    pub fn new(text: String) -> Numbers {
-        let tokens = wrela_syntax::lexer::lex(wrela_diag::FileId(0), &text)
-            .tokens
-            .iter()
-            .filter(|t| t.kind.is_number())
-            .map(|t| (t.span.start, t.span.end))
-            .collect();
-        Numbers { text, tokens }
+    pub fn new(text: impl Into<Arc<str>>) -> Numbers {
+        let text = text.into();
+        let lexed: Vec<_> = crate::edit::lex(&text).collect();
+        let mut tokens = Vec::new();
+        let mut shape = Vec::with_capacity(lexed.len());
+        for (i, t) in lexed.iter().enumerate() {
+            if t.kind.is_number() {
+                tokens.push((t.span.start, t.span.end));
+                shape.push((TokenKind::Float, 0, 0));
+            } else if t.kind != TokenKind::Minus
+                || !lexed[i + 1..]
+                    .iter()
+                    .find(|t| t.kind != TokenKind::Minus)
+                    .is_some_and(|t| t.kind.is_number())
+            {
+                shape.push((t.kind, t.span.start, t.span.end));
+            }
+        }
+        Numbers { text, tokens, shape }
     }
 
     pub fn text(&self) -> &str {
         &self.text
     }
-}
 
-/// Whether `a` and `b` lex to the same tokens but for numbers, and the minus signs before a
-/// number (an edit of a literal may add, drop or move one): what an edit of literals changes,
-/// and nothing else. A minus before anything else is the code's.
-pub(crate) fn same_but_numbers(a: &str, b: &str) -> bool {
-    use wrela_syntax::token::TokenKind;
-    let shape = |text: &str| -> Vec<(TokenKind, String)> {
-        let tokens = crate::edit::tokens(text);
-        let mut out = Vec::with_capacity(tokens.len());
-        for (i, (k, t)) in tokens.iter().enumerate() {
-            if k.is_number() {
-                out.push((TokenKind::Float, String::new()));
-            } else if *k != TokenKind::Minus
-                || !tokens[i + 1..]
-                    .iter()
-                    .find(|(k, _)| *k != TokenKind::Minus)
-                    .is_some_and(|(k, _)| k.is_number())
-            {
-                out.push((*k, t.clone()));
-            }
-        }
-        out
-    };
-    shape(a) == shape(b)
+    /// Whether `other` lexes to the same tokens but for numbers, and the minus signs before a
+    /// number: what an edit of literals changes, and nothing else.
+    pub(crate) fn same_but_numbers(&self, other: &Numbers) -> bool {
+        self.shape.len() == other.shape.len()
+            && self.shape.iter().zip(&other.shape).all(|(&(k, s, e), &(l, t, u))| {
+                k == l && self.text[s as usize..e as usize] == other.text[t as usize..u as usize]
+            })
+    }
 }
 
 /// Where literal `start..end` of the build's text (`then`) is in the file's text `now`: the
@@ -505,6 +508,58 @@ pub fn moved(then: &Numbers, now: &Numbers, start: u32, end: u32) -> Option<(u32
         Some(m) if minus || !had => Some((m as u32, e)),
         _ => Some((s, e)),
     }
+}
+
+/// Each file of a lifted build's report `r` (its paths relative to `base`) as a watcher found
+/// it among `files`, with its text when built, lexed: `None` if one isn't among them.
+pub(crate) fn lifted_files(
+    base: &Path,
+    r: &crate::lift::Report,
+    files: &Files,
+) -> Option<Vec<(PathBuf, Numbers)>> {
+    // The files by their canonical paths, as the report names them from `base`.
+    let canonical: BTreeMap<PathBuf, &PathBuf> =
+        files.keys().filter_map(|p| Some((p.canonicalize().ok()?, p))).collect();
+    r.files
+        .iter()
+        .map(|f| {
+            let path = canonical.get(&base.join(&f.path).canonicalize().ok()?)?;
+            Some((path.to_path_buf(), Numbers::new(f.text.as_str())))
+        })
+        .collect()
+}
+
+/// The build's literals' values (`literals`) in the files as they are (`now`), if what changed
+/// since the build is literals alone: each file it lifted (`lifted`, from [`lifted_files`]) has
+/// the build's tokens but for numbers, and every other file is as the build saw it (`built`).
+pub(crate) fn literal_values(
+    lifted: &[(PathBuf, Numbers)],
+    literals: &[crate::lift::ReportLiteral],
+    now: &Files,
+    built: &Files,
+) -> Option<Vec<f32>> {
+    // A file added or deleted since the build changes the program, lifted or not.
+    let other = |p: &PathBuf| !lifted.iter().any(|(l, _)| l == p);
+    if !now.keys().eq(built.keys()) || now.iter().any(|(p, s)| other(p) && !s.same_text(&built[p]))
+    {
+        return None;
+    }
+    // Every file the build lifted, as it is now, each lexed once.
+    let mut texts = Vec::with_capacity(lifted.len());
+    for (path, then) in lifted {
+        let current = Numbers::new(Arc::clone(&now[path].text));
+        if !then.same_but_numbers(&current) {
+            return None;
+        }
+        texts.push(current);
+    }
+    let mut values = Vec::with_capacity(literals.len());
+    for l in literals {
+        let current = texts.get(l.file as usize)?;
+        let (s, e) = moved(&lifted[l.file as usize].1, current, l.start, l.end)?;
+        values.push(crate::edit::signed_value(&current.text()[s as usize..e as usize])?);
+    }
+    Some(values)
 }
 
 /// Edits of the build's literals, each by its index in the build and its new value, planned
@@ -534,17 +589,18 @@ fn plan_edits(
                 let path = lens.join(rel);
                 let now = std::fs::read_to_string(&path)
                     .map_err(|e| refused(format!("can't read {}: {e}", path.display())))?;
-                let then = r.files[l.file as usize].text.clone();
+                let (then, now) =
+                    (Numbers::new(r.files[l.file as usize].text.as_str()), Numbers::new(now));
                 // A literal is found by its place among the file's numbers, which only an edit
                 // of literals keeps: any other change since the build and it could be another.
-                if !same_but_numbers(&then, &now) {
+                if !then.same_but_numbers(&now) {
                     return Err(crate::edit::Refused {
                         file: rel.clone(),
                         why: "it has changed past its literals since the lens was built: rebuild"
                             .into(),
                     });
                 }
-                v.insert((Numbers::new(then), Numbers::new(now)))
+                v.insert((then, now))
             }
         };
         let Some((s, e)) = moved(then, now, l.start, l.end) else {
@@ -631,6 +687,10 @@ pub fn reference_mask(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>, S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn same_but_numbers(a: &str, b: &str) -> bool {
+        Numbers::new(a).same_but_numbers(&Numbers::new(b))
+    }
 
     #[test]
     fn only_numbers_and_the_minus_signs_before_them_may_change() {
