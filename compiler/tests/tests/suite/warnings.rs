@@ -295,7 +295,7 @@ fn std_has_no_warnings() {
 
 /// A private function or constant that no other code uses is W0008: one that calls only itself
 /// too. One that's used, `pub`, a trait's, a test, or named `_...` isn't, and neither is a
-/// constant used only in a type, a pattern or another constant's value.
+/// constant used only in a type, a pattern, another constant's value or a draw's render state.
 #[test]
 fn unused_functions_and_constants_are_reported() {
     let src = "const USED: u32 = 3
@@ -321,12 +321,36 @@ fn _kept() -> u32 {
     2
 }
 
+const WG: u32 = 64
+const DOUBLED: u32 = WG * 2
+const SHADED = std::gpu::Depth { compare: std::gpu::Compare::Equal, write: false }
+
+@compute(64)
+fn fill(out: mut std::gpu::Slots<f32>, id: std::gpu::GlobalId) {
+    out[id] = 1.0
+}
+
+@vertex
+fn cover(v: std::gpu::VertexIndex) -> std::gpu::ClipPosition {
+    std::gpu::ClipPosition { position: vec4(0.0) }
+}
+
+@fragment
+fn white() -> vec4 {
+    vec4(1.0)
+}
+
 pub fn frame(time: f32, width: u32, height: u32) {
     let xs: [u32; IN_TYPE] = [helper(), 0]
     let k = match xs[0] {
         IN_PATTERN => 1,
         _ => 0,
     }
+    var out: std::gpu::GpuBuffer<f32> = std::gpu::buffer(DOUBLED)
+    std::gpu::dispatch(fill.bind(mut out), groups: 1)
+    let screen = std::gpu::begin_screen_pass(vec4(0.0))
+    std::gpu::draw(screen, cover, white, vertices: 3, depth: SHADED)
+    screen.present()
 }
 ";
     let w = all_warnings("unused", src);

@@ -834,7 +834,6 @@ fn length(
         ast::ExprKind::Paren(inner) => length(p, module, inner, visiting),
         ast::ExprKind::Path(path) => {
             let Res::Const(c) = resolve_value_item(p, module, path)? else { return None };
-            p.note_const_use(c);
             if visiting.contains(&c) {
                 return None;
             }
@@ -849,15 +848,21 @@ fn length(
 }
 
 /// The item a value path names from `module` (`N`, `a::inner::N`), if it names one; generic
-/// arguments are ignored.
+/// arguments are ignored. A constant it names is used (W0008): every caller is code that
+/// names it, in an expression, a type, a length, an attribute or another constant's value.
 pub fn resolve_value_item(p: &Program, module: ModuleId, path: &ast::Path) -> Option<Res> {
-    if path.is_single() {
-        return lookup_name(p, module, &path.segments[0].ident.name);
+    let r = if path.is_single() {
+        lookup_name(p, module, &path.segments[0].ident.name)
+    } else {
+        match resolve_module_path_in(p, module, &path.segments, true) {
+            PathLookup::Found(r) => Some(r),
+            _ => None,
+        }
+    };
+    if let Some(Res::Const(c)) = r {
+        p.note_const_use(c);
     }
-    match resolve_module_path_in(p, module, &path.segments, true) {
-        PathLookup::Found(r) => Some(r),
-        _ => None,
-    }
+    r
 }
 
 fn resolve_type_path(
@@ -958,7 +963,6 @@ fn resolve_type_path(
                         && scope.param(&path.segments[0].ident.name).is_some())
                     && let Some(Res::Const(c)) = resolve_value_item(p, scope.module, path) =>
             {
-                p.note_const_use(c);
                 match const_value_u32(p, c) {
                     Some(n) => p.types.intern(TyKind::ConstU32(n)),
                     None => {
