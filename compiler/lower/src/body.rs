@@ -695,12 +695,7 @@ impl<'c, 'a> Fl<'c, 'a> {
             StatementKind::Bind { local, place, .. } => {
                 let repr = match self.callable_of(place) {
                     Some(r) => r,
-                    None if let Some(g) = self.group_of(place) => Repr::Group(g),
-                    None => match self.place_parts(place) {
-                        Some((p, _, None)) => Repr::Place(p),
-                        Some((p, _, Some(cs))) => Repr::Swizzle(p, cs),
-                        None => Repr::Erased,
-                    },
+                    None => self.alias_of(place),
                 };
                 self.locals[local.index()] = repr;
             }
@@ -815,14 +810,7 @@ impl<'c, 'a> Fl<'c, 'a> {
                 let mut out = Vec::new();
                 for a in fields {
                     out.push(match a {
-                        mir::Arg::Borrow(p, _) | mir::Arg::Mut(p, _) => match self.group_of(p) {
-                            Some(g) => Repr::Group(g),
-                            None => match self.place_parts(p) {
-                                Some((pl, _, None)) => Repr::Place(pl),
-                                Some((pl, _, Some(cs))) => Repr::Swizzle(pl, cs),
-                                None => Repr::Erased,
-                            },
-                        },
+                        mir::Arg::Borrow(p, _) | mir::Arg::Mut(p, _) => self.alias_of(p),
                         mir::Arg::Take(o) => match self.operand(o) {
                             Some(v) => Repr::Var(self.local_of("field", v)),
                             None => Repr::Erased,
@@ -1173,6 +1161,23 @@ impl<'c, 'a> Fl<'c, 'a> {
             n += 1;
         }
         (r, ty, n)
+    }
+
+    /// What a projection of place `p` is: the group `p` names whole (§12), or else its place,
+    /// with a trailing swizzle; `Erased` if it has no runtime value.
+    fn alias_of(&mut self, p: &mir::Place) -> Repr {
+        // Only a group's local starts a group (GPU code makes them), and `group_of` would read
+        // a chosen projection's pointer that `place_parts` reads again.
+        if matches!(self.locals[p.local.index()], Repr::Group(_))
+            && let Some(g) = self.group_of(p)
+        {
+            return Repr::Group(g);
+        }
+        match self.place_parts(p) {
+            Some((pl, _, None)) => Repr::Place(pl),
+            Some((pl, _, Some(cs))) => Repr::Swizzle(pl, cs),
+            None => Repr::Erased,
+        }
     }
 
     /// The fields of the group `p` names whole, in GPU code (§12).
@@ -2038,7 +2043,7 @@ impl<'c, 'a> Fl<'c, 'a> {
                 ));
                 return None;
             }
-            if self.is_gpu() && crate::gpu::is_resource_param(self, pt) {
+            if self.is_gpu() && crate::gpu::is_resource_ty(&self.cx.checked.program, pt) {
                 let r = a.place().and_then(|pl| self.place(pl)).and_then(|pl| {
                     match (pl.root, pl.path.is_empty()) {
                         (ir::PlaceRoot::Resource(r), true) => Some(r),

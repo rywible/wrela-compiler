@@ -1625,7 +1625,6 @@ impl<'p> Checker<'p> {
             BuiltinTy::Vec(e, n) => self.vec_ctor(e, n, ty, args, span),
             BuiltinTy::Mat(c, r) => {
                 let col = self.p.types.vec(r);
-                let n = c;
                 let name = self.display(ty);
                 if args.len() != c as usize {
                     self.err(Diagnostic::new(
@@ -1642,7 +1641,7 @@ impl<'p> Checker<'p> {
                         self.err(Diagnostic::new(
                             codes::E0302,
                             label.span,
-                            format!("`{name}` takes its {n} columns as positional arguments"),
+                            format!("`{name}` takes its {c} columns as positional arguments"),
                         ));
                     }
                     cols.push(self.check_expect(&a.value, col));
@@ -3608,8 +3607,7 @@ impl<'p> Checker<'p> {
         }
         if let Some(e) = &indirect {
             let want = if indices.is_some() { Lang::DrawIndexedArgs } else { Lang::DrawArgs };
-            let e = (**e).clone();
-            self.args_kind(&e, want);
+            self.args_kind(e, want);
         }
         if indices.is_some() && indirect.is_none() {
             self.err(

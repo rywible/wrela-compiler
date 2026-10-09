@@ -456,12 +456,7 @@ impl<'a> Cx<'a> {
         span: Span,
     ) -> Vec<ir::Param> {
         let Bound::Group(bs) = b else { return Vec::new() };
-        let names: Vec<String> = match self.checked.program.types.kind(ty) {
-            TyKind::Adt(a, _) => {
-                self.checked.program.adt_fields(*a, None).iter().map(|f| f.name.clone()).collect()
-            }
-            _ => Vec::new(),
-        };
+        let names = crate::gpu::group_field_names(self, ty);
         let mut out = Vec::new();
         for (j, ft) in crate::gpu::group_fields(self, ty).into_iter().enumerate() {
             let field = format!("{name}_{}", names.get(j).map_or("", String::as_str));
@@ -616,6 +611,12 @@ impl Cx<'_> {
             |order: &[usize]| ir::layout::pack_layouts(order.iter().map(|&i| layouts[i])).1.size;
         let declared: Vec<usize> = (0..fields.len()).collect();
         let now = size(&declared);
+        // No order takes less than the fields' bytes, rounded up to the largest alignment.
+        let bytes = layouts.iter().fold(0u32, |n, l| n.saturating_add(l.size));
+        let align = layouts.iter().fold(1, |a, l| a.max(l.align));
+        if now <= ir::layout::round_up(align, bytes.max(1)) {
+            return;
+        }
         let best = smallest_order(&layouts, &size);
         let then = size(&best);
         if then >= now {
@@ -646,6 +647,7 @@ const EVERY_ORDER: usize = 7;
 /// `EVERY_ORDER` fields; otherwise the most aligned first, each gap filled by the first smaller
 /// field that fits it.
 fn smallest_order(layouts: &[ir::layout::Layout], size: &dyn Fn(&[usize]) -> u32) -> Vec<usize> {
+    use ir::layout::round_up;
     let n = layouts.len();
     if n <= EVERY_ORDER {
         let mut order: Vec<usize> = (0..n).collect();
@@ -677,21 +679,20 @@ fn smallest_order(layouts: &[ir::layout::Layout], size: &dyn Fn(&[usize]) -> u32
     }
     let mut left: Vec<usize> = (0..n).collect();
     left.sort_by_key(|&i| std::cmp::Reverse(layouts[i].align));
-    let round = |align: u32, x: u32| x.div_ceil(align.max(1)) * align.max(1);
     let mut out = Vec::new();
     let mut end = 0u32;
     while !left.is_empty() {
         let next = left.remove(0);
         // Fill the gap before it with the first fields that fit.
-        let target = round(layouts[next].align, end);
+        let target = round_up(layouts[next].align, end);
         while let Some(k) =
-            left.iter().position(|&i| round(layouts[i].align, end) + layouts[i].size <= target)
+            left.iter().position(|&i| round_up(layouts[i].align, end) + layouts[i].size <= target)
         {
             let i = left.remove(k);
-            end = round(layouts[i].align, end) + layouts[i].size;
+            end = round_up(layouts[i].align, end) + layouts[i].size;
             out.push(i);
         }
-        end = round(layouts[next].align, end) + layouts[next].size;
+        end = round_up(layouts[next].align, end) + layouts[next].size;
         out.push(next);
     }
     out

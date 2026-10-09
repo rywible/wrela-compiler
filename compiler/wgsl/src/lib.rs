@@ -642,6 +642,12 @@ impl<'a, 'm> Fb<'a, 'm> {
         self.expr(Expression::Literal(l), block)
     }
 
+    /// Resource `r`'s global, as an expression.
+    fn resource(&mut self, r: ir::ResourceId, block: &mut Block) -> R<Handle<Expression>> {
+        let g = *self.cx.globals.get(r.index()).ok_or("internal: a missing resource")?;
+        Ok(self.expr(Expression::GlobalVariable(g), block))
+    }
+
     /// `h`'s value, read back from a new variable: never a const-expression.
     fn through_variable(
         &mut self,
@@ -728,10 +734,7 @@ impl<'a, 'm> Fb<'a, 'm> {
             ir::PlaceRoot::Param(i) => {
                 self.expr(Expression::FunctionArgument(self.param_base + *i), block)
             }
-            ir::PlaceRoot::Resource(r) => {
-                let g = *self.cx.globals.get(r.index()).ok_or("internal: a missing resource")?;
-                self.expr(Expression::GlobalVariable(g), block)
-            }
+            ir::PlaceRoot::Resource(r) => self.resource(*r, block)?,
             ir::PlaceRoot::Ptr(_) => {
                 return Err(
                     "projections returned from functions aren't supported on the GPU".into()
@@ -1317,18 +1320,14 @@ impl<'a, 'm> Fb<'a, 'm> {
         out: &mut Block,
     ) -> R<Handle<Expression>> {
         use ir::TextureOp as T;
-        let global = |fb: &mut Self, r: ir::ResourceId, out: &mut Block| -> R<Handle<Expression>> {
-            let g = *fb.cx.globals.get(r.index()).ok_or("internal: a missing resource")?;
-            Ok(fb.expr(Expression::GlobalVariable(g), out))
-        };
-        let image = global(self, tex, out)?;
+        let image = self.resource(tex, out)?;
         let arg = |fb: &Self, i: usize| -> R<Handle<Expression>> {
             fb.val(*args.get(i).ok_or("internal: a texture read without its arguments")?)
         };
         Ok(match op {
             T::Sample | T::SampleLevel | T::SampleCompare | T::SampleCompareLevel => {
                 let s = sampler.ok_or("internal: sampling without a sampler")?;
-                let sampler = global(self, s, out)?;
+                let sampler = self.resource(s, out)?;
                 let coordinate = arg(self, 0)?;
                 let (level, depth_ref) = match op {
                     T::Sample => (naga::SampleLevel::Auto, None),
@@ -1402,8 +1401,7 @@ impl<'a, 'm> Fb<'a, 'm> {
         args: &[ir::ValueId],
         out: &mut Block,
     ) -> R<()> {
-        let g = *self.cx.globals.get(tex.index()).ok_or("internal: a missing resource")?;
-        let image = self.expr(Expression::GlobalVariable(g), out);
+        let image = self.resource(tex, out)?;
         // The coordinates, then the value.
         let Some((&value, xs)) = args.split_last() else {
             return Err("internal: a texel's write without its arguments".into());

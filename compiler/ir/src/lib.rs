@@ -670,35 +670,9 @@ impl TexFormat {
         }
     }
 
-    /// Its channels.
-    pub fn channels(self) -> u8 {
-        match self {
-            TexFormat::Rgba8Unorm | TexFormat::Rgba16Float => 4,
-            TexFormat::Rg16Float => 2,
-            TexFormat::R16Float | TexFormat::R32Float | TexFormat::R32Uint => 1,
-        }
-    }
-
     /// Whether GPU code can filter between its texels (WebGPU's core formats).
     pub fn filterable(self) -> bool {
         !matches!(self, TexFormat::R32Float | TexFormat::R32Uint)
-    }
-
-    /// Whether kernels can write it (WebGPU's core storage formats).
-    pub fn storable(self) -> bool {
-        !matches!(self, TexFormat::R16Float | TexFormat::Rg16Float)
-    }
-
-    /// Its WebGPU name.
-    pub fn name(self) -> &'static str {
-        match self {
-            TexFormat::Rgba8Unorm => "rgba8unorm",
-            TexFormat::Rgba16Float => "rgba16float",
-            TexFormat::R16Float => "r16float",
-            TexFormat::Rg16Float => "rg16float",
-            TexFormat::R32Float => "r32float",
-            TexFormat::R32Uint => "r32uint",
-        }
     }
 }
 

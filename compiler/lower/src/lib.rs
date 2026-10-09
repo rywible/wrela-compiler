@@ -904,7 +904,19 @@ fn enum_wrapper(cx: &Cx, mb: &mut ModuleBuilder, f: FnId, inner: ir::FuncId) -> 
             args.push(ir::Arg::Value(v));
         }
     }
-    match ret {
+    add_wrapper(mb, w, body, inner, args)
+}
+
+/// Adds wrapper `w` to the module, its body `body` and then a call of `inner` with `args`,
+/// returning what that returns: its id.
+fn add_wrapper(
+    mb: &mut ModuleBuilder,
+    mut w: ir::Function,
+    mut body: Vec<ir::Stmt>,
+    inner: ir::FuncId,
+    args: Vec<ir::Arg>,
+) -> ir::FuncId {
+    match w.ret {
         Some(t) => {
             let r = w.let_(&mut body, t, ir::Expr::Call(inner, args));
             body.push(ir::Stmt::Return(Some(r)));
@@ -957,19 +969,7 @@ fn state_wrapper(
     for i in 0..params.len() {
         args.push(w.param_arg(i as u32, &mut body));
     }
-    match ret {
-        Some(t) => {
-            let r = w.new_value(t);
-            body.push(ir::Stmt::Let(r, ir::Expr::Call(inner, args)));
-            body.push(ir::Stmt::Return(Some(r)));
-        }
-        None => {
-            body.push(ir::Stmt::Eval(ir::Expr::Call(inner, args)));
-            body.push(ir::Stmt::Return(None));
-        }
-    }
-    w.body = body;
-    mb.m.add_function(w)
+    add_wrapper(mb, w, body, inner, args)
 }
 
 /// Marks the recursive functions `@deterministic` code reaches (language.md §8): their depth is

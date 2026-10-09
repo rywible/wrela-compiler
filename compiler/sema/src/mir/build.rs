@@ -1230,7 +1230,6 @@ impl<'a> Builder<'a> {
             [f(1, self), f(2, self), if three { f(3, self) } else { one.clone() }]
         } else {
             let g = self.value(&d.groups, Want::Read)?;
-            let one = constant(Lit::Int(1), u32_ty, d.groups.span);
             [g, one.clone(), one]
         };
         for (i, a) in &d.args[d.groups_at..] {

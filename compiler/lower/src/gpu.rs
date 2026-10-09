@@ -203,20 +203,10 @@ fn class_of(cx: &Cx, ty: TyId, mode: Mode, varyings: Option<TyId>) -> ParamClass
     if let Some(class) = resource_class(cx, ty) {
         return class;
     }
-    match p.lang_of_ty(ty) {
-        Some(l @ (Lang::Texture | Lang::DepthTexture | Lang::Texels)) => {
-            let (depth, storage) = (l == Lang::DepthTexture, l == Lang::Texels);
-            let format = texture_format(cx, ty);
-            return ParamClass::Texture { depth, storage, three: false, format };
-        }
-        Some(l @ (Lang::Texture3d | Lang::Texels3d)) => {
-            let storage = l == Lang::Texels3d;
-            let format = texture_format(cx, ty);
-            return ParamClass::Texture { depth: false, storage, three: true, format };
-        }
-        Some(Lang::Sampler) => return ParamClass::Sampler { comparison: false },
-        Some(Lang::ComparisonSampler) => return ParamClass::Sampler { comparison: true },
-        _ => {}
+    // A kernel's texels to write (the textures it reads are `resource_class`'s).
+    if let Some(l @ (Lang::Texels | Lang::Texels3d)) = p.lang_of_ty(ty) {
+        let (three, format) = (l == Lang::Texels3d, texture_format(cx, ty));
+        return ParamClass::Texture { depth: false, storage: true, three, format };
     }
     match p.types.kind(ty) {
         TyKind::Adt(_, args) if matches!(p.lang_of_ty(ty), Some(Lang::Slots | Lang::One)) => {
@@ -327,7 +317,7 @@ pub(crate) fn group_fields(cx: &mut Cx, ty: TyId) -> Vec<TyId> {
 }
 
 /// A group's fields' names.
-fn group_field_names(cx: &Cx, ty: TyId) -> Vec<String> {
+pub(crate) fn group_field_names(cx: &Cx, ty: TyId) -> Vec<String> {
     let p = &cx.checked.program;
     let TyKind::Adt(a, _) = p.types.kind(ty) else { return Vec::new() };
     p.adt_fields(*a, None).iter().map(|f| f.name.clone()).collect()
@@ -389,6 +379,19 @@ impl Leaf {
     pub fn is(&self, entry: usize, param: usize, path: &[u32]) -> bool {
         self.entry == entry && self.param == param && self.path == path
     }
+
+    /// Its name as a WGSL identifier: `lit.probes` is `lit_probes`.
+    pub fn field_name(&self) -> String {
+        ir::ident(&self.name.replace('.', "_"))
+    }
+
+    /// The place of its argument, given its parameter's argument `arg`: through the group's
+    /// fields, on the CPU.
+    fn arg_place(&self, arg: &mir::Place) -> mir::Place {
+        let mut p = arg.clone();
+        p.proj.extend(self.path.iter().map(|&k| mir::Proj::Field(k)));
+        p
+    }
 }
 
 /// How a pipeline's entry points receive their parameters. CPU code that records the pipeline
@@ -437,8 +440,8 @@ impl Interface {
         // A field name both shaders have is told apart by the shader's.
         let program = &cx.checked.program;
         let names: Vec<String> = iface.uniforms.iter().map(|u| u.field_name()).collect();
-        for u in &mut iface.uniforms {
-            if names.iter().filter(|n| **n == u.field_name()).count() > 1 {
+        for (k, u) in iface.uniforms.iter_mut().enumerate() {
+            if names.iter().filter(|n| **n == names[k]).count() > 1 {
                 let shader = ir::ident(&program.func(entries[u.entry].0).name);
                 u.name = format!("{shader}.{}", u.name);
             }
@@ -469,21 +472,6 @@ impl Interface {
     }
 }
 
-impl Leaf {
-    /// Its name as a WGSL identifier: `lit.probes` is `lit_probes`.
-    pub fn field_name(&self) -> String {
-        ir::ident(&self.name.replace('.', "_"))
-    }
-
-    /// The place of its argument, given its parameter's argument `arg`: through the group's
-    /// fields, on the CPU.
-    fn arg_place(&self, arg: &mir::Place) -> mir::Place {
-        let mut p = arg.clone();
-        p.proj.extend(self.path.iter().map(|&k| mir::Proj::Field(k)));
-        p
-    }
-}
-
 /// A pipeline's interface.
 fn interface(cx: &mut Cx, key: &PipelineKey) -> Interface {
     match key {
@@ -497,11 +485,6 @@ fn interface(cx: &mut Cx, key: &PipelineKey) -> Interface {
             Interface::of(cx, &entries, Some(vret), Some(vret))
         }
     }
-}
-
-/// Whether a parameter type is bound to a resource on the GPU (rather than passed).
-pub(crate) fn is_resource_param(fl: &Fl, t: TyId) -> bool {
-    is_resource_ty(&fl.cx.checked.program, t)
 }
 
 /// Whether a parameter or group field of type `t` is bound to a resource on the GPU: a run, a
@@ -670,7 +653,7 @@ pub(crate) fn lower_dispatch(fl: &mut Fl, d: &mir::Dispatch, span: Span) {
 /// no error that explains it, an internal error says so, rather than the command going missing
 /// without a word.
 fn recorded(fl: &mut Fl, span: Span, what: &str, record: impl FnOnce(&mut Fl) -> Option<()>) {
-    if record(fl).is_none() && !fl.cx.diags.iter().any(|d| d.is_error()) {
+    if record(fl).is_none() && !wrela_diag::has_errors(&fl.cx.diags) {
         fl.cx.err(Diagnostic::internal(format!(
             "a {what} couldn't be recorded, at {}..{}",
             span.start, span.end
@@ -751,10 +734,7 @@ fn record_dispatch(fl: &mut Fl, d: &mir::Dispatch, span: Span) -> Option<()> {
         }
         None => {
             for g in &d.groups {
-                {
-                    let v = fl.operand(g)?;
-                    groups.push(v)
-                }
+                groups.push(fl.operand(g)?);
             }
         }
     }
@@ -779,7 +759,7 @@ fn record_dispatch(fl: &mut Fl, d: &mir::Dispatch, span: Span) -> Option<()> {
     let arg = |i: usize| kernel.arg(i, d.args.iter().map(|(i, p, s)| (*i, p, *s)));
     let (mut uniform_fields, mut uniform_vals) = uniforms(fl, &iface, |_, i| arg(i))?;
     if let Some(size) = domain {
-        let v3 = fl.mb.m.types.intern(ir::TypeDef::Vector(ir::Scalar::U32, 3));
+        let v3 = fl.mb.m.types.vector_of(ir::Scalar::U32, 3);
         uniform_fields.push((DOMAIN.to_string(), v3));
         uniform_vals.push(fl.value(v3, ir::Expr::Construct(v3, size)));
     }
@@ -1173,7 +1153,7 @@ pub(crate) fn intrinsic(
             for a in &c.args[..5] {
                 args.push(fl.arg_value(a)?);
             }
-            let u8_ = fl.mb.m.types.intern(ir::TypeDef::Scalar(ir::Scalar::U8));
+            let u8_ = fl.mb.m.types.scalar(ir::Scalar::U8);
             let run_t = fl.mb.m.types.intern(ir::TypeDef::Run(u8_));
             let run = fl.run_arg(c.args[5].place()?, run_t)?;
             let from = fl.arg_value(&c.args[6])?;
@@ -1216,26 +1196,19 @@ pub(crate) fn intrinsic(
             | Lang::OneSet),
         ) => shared_op(fl, l, c, ty),
         Some(Lang::Discard) => {
-            // A fragment shader's, or a `@gpu` function's checked on its own (its callers'
-            // pipelines decide).
-            let ok = fl
-                .mb
-                .gpu
-                .as_ref()
-                .is_some_and(|g| g.stage.is_none() || g.stage == Some(Entry::Fragment));
-            if !ok {
-                let what = fl.mb.gpu.as_ref().map_or("CPU code", |g| g.what.as_str()).to_string();
-                let d = Diagnostic::new(
+            let at = user_span(fl, c.span);
+            let ok = fragment_only(fl, None, at, |what| {
+                Diagnostic::new(
                     codes::E0607,
-                    user_span(fl, c.span),
+                    at,
                     format!("`discard` is for fragment shaders, and this is {what}"),
                 )
                 .with_note("`discard` drops the fragment a fragment shader is shading; a kernel, a vertex shader and CPU code have no fragment to drop")
-                .with_help("make the test in the fragment shader, passing it what it needs from the vertex shader");
-                fl.cx.err(with_call_chain(fl, d));
-                return None;
+                .with_help("make the test in the fragment shader, passing it what it needs from the vertex shader")
+            });
+            if ok {
+                fl.emit(ir::Stmt::Eval(ir::Expr::Discard));
             }
-            fl.emit(ir::Stmt::Eval(ir::Expr::Discard));
             None
         }
         Some(
@@ -1592,7 +1565,7 @@ fn texture_read(fl: &mut Fl, l: Lang, c: &mir::Call, ty: Option<TyId>) -> Option
     };
     let texel = !matches!(op, T::Width | T::Height | T::Depth);
     let read = match colour {
-        Some(f) if texel => fl.mb.m.types.intern(ir::TypeDef::Vector(f.scalar(), 4)),
+        Some(f) if texel => fl.mb.m.types.vector_of(f.scalar(), 4),
         _ => t,
     };
     let v = fl.value(read, ir::Expr::Texture(op, texture, sampler, vals));
@@ -1629,20 +1602,13 @@ fn narrow(fl: &mut Fl, v: ir::ValueId, t: ir::TypeId) -> ir::ValueId {
 /// `v`, a format's texel (a scalar or a vector of `s`), as four of `s`: the components it lacks
 /// 0, as a texture's write takes it.
 fn widen(fl: &mut Fl, v: ir::ValueId, s: ir::Scalar) -> ir::ValueId {
-    let four = fl.mb.m.types.intern(ir::TypeDef::Vector(s, 4));
+    let four = fl.mb.m.types.vector_of(s, 4);
     let vt = fl.f.value_ty(v);
     if vt == four {
         return v;
     }
-    let st = fl.mb.m.types.intern(ir::TypeDef::Scalar(s));
-    let zero = fl.value(
-        st,
-        ir::Expr::Const(match s {
-            ir::Scalar::U32 => ir::Const::U32(0),
-            ir::Scalar::I32 => ir::Const::I32(0),
-            _ => ir::Const::F32(0.0),
-        }),
-    );
+    let st = fl.mb.m.types.scalar(s);
+    let zero = fl.value(st, ir::Expr::Const(crate::eval::zero_scalar(s)));
     let mut parts = match *fl.mb.m.types.get(vt) {
         ir::TypeDef::Vector(_, n) => {
             (0..u32::from(n)).map(|k| fl.value(st, ir::Expr::Extract(v, k))).collect()
@@ -1665,27 +1631,29 @@ pub(crate) fn check_derivative(fl: &mut Fl, v: Option<ir::ValueId>, span: Span) 
     });
 }
 
-/// An operation that compares neighbouring pixels, defining `v`, at `span`: in a fragment
-/// shader, noted for E0608; elsewhere, the error `err` makes from what the code is.
+/// An operation for fragment shaders only (one that compares neighbouring pixels, defining `v`,
+/// at `span`): in a fragment shader, `v` is noted for E0608; elsewhere, the error `err` makes
+/// from what the code is. Whether the code may do it.
 fn fragment_only(
     fl: &mut Fl,
     v: Option<ir::ValueId>,
     span: Span,
     err: impl FnOnce(&str) -> Diagnostic,
-) {
+) -> bool {
     // A `@gpu` function checked on its own has no stage: its callers' decide, and each
     // pipeline that calls it checks it there.
     if fl.mb.gpu.as_ref().is_some_and(|g| g.stage.is_none()) {
-        return;
+        return true;
     }
     if fl.mb.gpu.as_ref().is_some_and(|g| g.stage == Some(Entry::Fragment)) {
         if let Some(v) = v {
             fl.mb.derivatives.insert((fl.id, v), span);
         }
-        return;
+        return true;
     }
     let d = err(fl.mb.gpu.as_ref().map_or("CPU code", |g| g.what.as_str()));
     fl.cx.err(with_call_chain(fl, d));
+    false
 }
 
 /// A kernel's workgroup memory: E0610 for a barrier that its workgroup's invocations may not
@@ -2066,7 +2034,7 @@ fn bind_uniform(cx: &mut Cx, mb: &mut ModuleBuilder, iface: &Interface) -> Optio
     }
     // Over a domain, its size last.
     let domain = iface.over.then(|| {
-        let v3 = mb.m.types.intern(ir::TypeDef::Vector(ir::Scalar::U32, 3));
+        let v3 = mb.m.types.vector_of(ir::Scalar::U32, 3);
         fields.push((DOMAIN.to_string(), v3));
         fields.len() as u32 - 1
     });
@@ -2489,6 +2457,7 @@ pub(crate) fn bind_entry_params(fl: &mut Fl, func: FnId, entry: Entry) {
     for (i, (t, class)) in iface.entries[e].params.iter().enumerate() {
         let local = fl.code.params[i];
         let p = &params[i];
+        let at = GroupAt { iface: &iface, e, i, uniform, fields: &fields };
         fl.locals[local.index()] = match class {
             ParamClass::Builtin(b) => {
                 let Some(it) = fl.cx.lower_ty(fl.mb, *t, p.span) else { continue };
@@ -2499,27 +2468,13 @@ pub(crate) fn bind_entry_params(fl: &mut Fl, func: FnId, entry: Entry) {
             | ParamClass::Workgroup { .. }
             | ParamClass::Texture { .. }
             | ParamClass::Sampler { .. } => {
-                match fl.key.resources().get(i).cloned().flatten().and_then(|b| b.one()) {
-                    Some(r) => Repr::Place(ir::Place::root(ir::PlaceRoot::Resource(r))),
-                    None => Repr::Erased,
-                }
+                resource_repr(fl.key.resources().get(i).and_then(Option::as_ref))
             }
             ParamClass::Group => {
                 let b = fl.key.resources().get(i).cloned().flatten();
-                let at = GroupAt { iface: &iface, e, i, uniform, fields: &fields };
                 entry_group(fl, &at, &[], *t, b.as_ref())
             }
-            ParamClass::Uniform => {
-                let k = iface.uniforms.iter().position(|u| u.is(e, i, &[]));
-                match (uniform, k.and_then(|k| fields.get(k).copied().flatten())) {
-                    (Some(u), Some(field)) => Repr::Place(ir::Place {
-                        root: ir::PlaceRoot::Resource(u),
-                        path: vec![ir::Proj::Field(field)],
-                    }),
-                    // No runtime value.
-                    _ => Repr::Erased,
-                }
-            }
+            ParamClass::Uniform => at.uniform_repr(&[]),
             ParamClass::Varyings if entry == Entry::Fragment => {
                 let Some(it) = fl.cx.lower_ty(fl.mb, *t, p.span) else { continue };
                 Repr::Var(fl.bind_local("varyings", it, ir::Expr::Param(0)))
@@ -2542,7 +2497,7 @@ pub(crate) fn bind_entry_params(fl: &mut Fl, func: FnId, entry: Entry) {
     {
         let types = &mut fl.mb.m.types;
         let (b, u32_ty) = (types.bool(), types.u32());
-        let v3 = types.intern(ir::TypeDef::Vector(ir::Scalar::U32, 3));
+        let v3 = types.vector_of(ir::Scalar::U32, 3);
         let id = fl.value(v3, ir::Expr::EntryInput(input(ir::BuiltinInput::GlobalInvocationId)));
         let at = ir::Place { root: ir::PlaceRoot::Resource(u), path: vec![ir::Proj::Field(field)] };
         let size = fl.load(at, v3);
@@ -2583,23 +2538,35 @@ fn entry_group(fl: &mut Fl, at: &GroupAt, path: &[u32], ty: TyId, b: Option<&Bou
         let inner = bs.get(k).and_then(Option::as_ref);
         out.push(match field_class(fl.cx, ft) {
             ParamClass::Group => entry_group(fl, at, &here, ft, inner),
-            ParamClass::Uniform => {
-                let u = at.iface.uniforms.iter().position(|u| u.is(at.e, at.i, &here));
-                match (at.uniform, u.and_then(|u| at.fields.get(u).copied().flatten())) {
-                    (Some(u), Some(f)) => Repr::Place(ir::Place {
-                        root: ir::PlaceRoot::Resource(u),
-                        path: vec![ir::Proj::Field(f)],
-                    }),
-                    _ => Repr::Erased,
-                }
-            }
-            _ => match inner.and_then(Bound::one) {
-                Some(r) => Repr::Place(ir::Place::root(ir::PlaceRoot::Resource(r))),
-                None => Repr::Erased,
-            },
+            ParamClass::Uniform => at.uniform_repr(&here),
+            _ => resource_repr(inner),
         });
     }
     Repr::Group(out)
+}
+
+impl GroupAt<'_> {
+    /// The value at `path` in the parameter, in the uniform block: its field there, or
+    /// `Erased` if it has no runtime value.
+    fn uniform_repr(&self, path: &[u32]) -> Repr {
+        let u = self.iface.uniforms.iter().position(|u| u.is(self.e, self.i, path));
+        match (self.uniform, u.and_then(|u| self.fields.get(u).copied().flatten())) {
+            (Some(u), Some(f)) => Repr::Place(ir::Place {
+                root: ir::PlaceRoot::Resource(u),
+                path: vec![ir::Proj::Field(f)],
+            }),
+            _ => Repr::Erased,
+        }
+    }
+}
+
+/// What a parameter (or a group's field) bound to one resource, `b`, is: the resource; or
+/// `Erased` if it's bound to none.
+fn resource_repr(b: Option<&Bound>) -> Repr {
+    match b.and_then(Bound::one) {
+        Some(r) => Repr::Place(ir::Place::root(ir::PlaceRoot::Resource(r))),
+        None => Repr::Erased,
+    }
 }
 
 /// Recursion on the GPU: WGSL has none (§8: GPU code forbids the `recursion` effect).

@@ -203,7 +203,7 @@ pub fn lower_tests(
 }
 
 /// A zero of scalar type `s`.
-fn zero_scalar(s: ir::Scalar) -> ir::Const {
+pub(crate) fn zero_scalar(s: ir::Scalar) -> ir::Const {
     match s {
         ir::Scalar::Bool => ir::Const::Bool(false),
         ir::Scalar::I32 => ir::Const::I32(0),

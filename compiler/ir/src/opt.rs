@@ -1038,7 +1038,7 @@ fn inline_into(
 }
 
 /// A body's size: its statements, at every depth, but source locations.
-fn size_of(b: &Block) -> usize {
+pub(crate) fn size_of(b: &Block) -> usize {
     let mut n = 0;
     visit::walk(b, &mut |s| n += usize::from(!matches!(s, Stmt::At(_))));
     n

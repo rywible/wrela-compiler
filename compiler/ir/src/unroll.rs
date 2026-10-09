@@ -158,7 +158,7 @@ fn plan(
             _ => None,
         })
         .collect();
-    let size = size_of(body) + size_of(continuing);
+    let size = crate::opt::size_of(body) + crate::opt::size_of(continuing);
     let mut passes = 0;
     loop {
         match eval(*cond, &k, counter, &defs, consts)? {
@@ -215,12 +215,6 @@ fn mentions(s: &Stmt, l: LocalId) -> bool {
 /// What the exit test and the step may compute: loads, constants, arithmetic, comparisons.
 fn pure(e: &Expr) -> bool {
     matches!(e, Expr::Load(_) | Expr::Const(_) | Expr::Binary(..) | Expr::Unary(..))
-}
-
-fn size_of(b: &Block) -> usize {
-    let mut n = 0;
-    visit::walk(b, &mut |s| n += usize::from(!matches!(s, Stmt::At(_))));
-    n
 }
 
 /// Value `v` when the counter holds `k`.
