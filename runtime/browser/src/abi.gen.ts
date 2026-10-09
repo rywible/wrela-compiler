@@ -161,17 +161,26 @@ export const SCREEN_FORMAT = "rgba8unorm";
 /** What a pipeline binds at a binding, as the manifest names it. */
 export const BINDING_KINDS = ["read", "read_write", "texture", "depth_texture", "sampler", "comparison_sampler", "storage_texture", "texture_3d", "storage_texture_3d"] as const;
 /** What each binding kind is (runtime/abi `BindingKind`): a colour texture, which names its
- * format; a texture kernels write (a storage texture); a 3D texture. */
+ * format; a texture kernels write (a storage texture); a 3D texture; and the per-stage limit it
+ * counts against. */
 export const BINDING_KIND_TRAITS = [
-  { name: "read", has_format: false, is_storage: false, is_3d: false },
-  { name: "read_write", has_format: false, is_storage: false, is_3d: false },
-  { name: "texture", has_format: true, is_storage: false, is_3d: false },
-  { name: "depth_texture", has_format: false, is_storage: false, is_3d: false },
-  { name: "sampler", has_format: false, is_storage: false, is_3d: false },
-  { name: "comparison_sampler", has_format: false, is_storage: false, is_3d: false },
-  { name: "storage_texture", has_format: true, is_storage: true, is_3d: false },
-  { name: "texture_3d", has_format: true, is_storage: false, is_3d: true },
-  { name: "storage_texture_3d", has_format: true, is_storage: true, is_3d: true },
+  { name: "read", has_format: false, is_storage: false, is_3d: false, limit: "storage buffers" },
+  { name: "read_write", has_format: false, is_storage: false, is_3d: false, limit: "storage buffers" },
+  { name: "texture", has_format: true, is_storage: false, is_3d: false, limit: "sampled textures" },
+  { name: "depth_texture", has_format: false, is_storage: false, is_3d: false, limit: "sampled textures" },
+  { name: "sampler", has_format: false, is_storage: false, is_3d: false, limit: "samplers" },
+  { name: "comparison_sampler", has_format: false, is_storage: false, is_3d: false, limit: "samplers" },
+  { name: "storage_texture", has_format: true, is_storage: true, is_3d: false, limit: "storage textures" },
+  { name: "texture_3d", has_format: true, is_storage: false, is_3d: true, limit: "sampled textures" },
+  { name: "storage_texture_3d", has_format: true, is_storage: true, is_3d: true, limit: "storage textures" },
+] as const;
+/** WebGPU's default per-stage limits (runtime/abi `StageLimit`): what each counts, and the most a
+ * shader stage may have. */
+export const STAGE_LIMITS = [
+  { name: "storage buffers", max: 8 },
+  { name: "sampled textures", max: 16 },
+  { name: "samplers", max: 16 },
+  { name: "storage textures", max: 4 },
 ] as const;
 /** `minStorageBufferOffsetAlignment`: where a bound range of a buffer may start. */
 export const BINDING_OFFSET_ALIGNMENT = 256;

@@ -8,10 +8,10 @@ import {
   BINDING_KINDS,
   COMPARES,
   MANIFEST_VERSION,
-  MAX_STORAGE_BUFFERS_PER_STAGE,
   MAX_UNIFORM_BUFFER_BINDING_SIZE,
   MAX_WORKGROUP_INVOCATIONS,
   MAX_WORKGROUP_SIZE,
+  STAGE_LIMITS,
   STREAM_VERSION,
   TEXTURE_FORMATS,
 } from "./abi.gen.ts";
@@ -24,9 +24,6 @@ export type Compare = Exclude<(typeof COMPARES)[number], null>;
 /** What a binding binds: a storage buffer read or read-write, a texture, or a sampler. */
 export type BindingKind = (typeof BINDING_KINDS)[number];
 
-/** Whether a binding is a storage buffer. */
-export const isBuffer = (k: BindingKind) => k === "read" || k === "read_write";
-
 const traitsOf = (k: BindingKind) => BINDING_KIND_TRAITS.find((t) => t.name === k)!;
 /** Whether a binding is a colour texture, which names its format. */
 export const hasFormat = (k: BindingKind) => traitsOf(k).has_format;
@@ -34,6 +31,8 @@ export const hasFormat = (k: BindingKind) => traitsOf(k).has_format;
 export const isStorage = (k: BindingKind) => traitsOf(k).is_storage;
 /** Whether it's a 3D texture. */
 export const is3d = (k: BindingKind) => traitsOf(k).is_3d;
+/** The per-stage limit it counts against (`STAGE_LIMITS`). */
+export const limitOf = (k: BindingKind) => traitsOf(k).limit;
 
 export interface UniformBlock {
   binding: number;
@@ -163,7 +162,7 @@ function oneOfOr<T extends string, F extends string>(o: Json, key: string, where
 
 /** `true` or `false`, or `fallback` where the key is missing. */
 function flag(o: Json, key: string, where: string, fallback: boolean): boolean {
-  const v = o[key] ?? fallback;
+  const v = o[key] === undefined ? fallback : o[key];
   if (typeof v !== "boolean") throw new ManifestError(`${where}.${key} must be true or false`);
   return v;
 }
@@ -362,19 +361,20 @@ export function validateManifest(m: Manifest): void {
         throw err(`pipeline ${i}'s binding ${b.binding} is written, and a vertex shader can't write`);
       }
     }
-    // Each stage's storage buffers: its bindings', the uniform block's when it's in storage, and
-    // the debug flag (a fragment shader's or a kernel's).
+    // What each stage binds, against WebGPU's per-stage limits: its bindings, and among its
+    // storage buffers the uniform block's when it's in storage, and the debug flag (a fragment
+    // shader's or a kernel's).
     const stages: BindingStage[] = render ? ["vertex", "fragment"] : ["both"];
     for (const stage of stages) {
-      const storage =
-        p.bindings.filter((b) => isBuffer(b.kind) && (b.stage === "both" || b.stage === stage)).length +
-        (u?.space === "storage" ? 1 : 0) +
-        (p.debug_flag !== null && stage !== "vertex" ? 1 : 0);
-      if (storage > MAX_STORAGE_BUFFERS_PER_STAGE) {
-        const what = stage === "vertex" ? " in its vertex shader" : stage === "fragment" ? " in its fragment shader" : "";
-        throw err(
-          `pipeline ${i} has ${storage} storage buffers${what}; WebGPU's default limit is ${MAX_STORAGE_BUFFERS_PER_STAGE}`,
-        );
+      for (const limit of STAGE_LIMITS) {
+        let n = p.bindings.filter((b) => limitOf(b.kind) === limit.name && (b.stage === "both" || b.stage === stage)).length;
+        if (limit.name === "storage buffers") {
+          n += (u?.space === "storage" ? 1 : 0) + (p.debug_flag !== null && stage !== "vertex" ? 1 : 0);
+        }
+        if (n > limit.max) {
+          const what = stage === "vertex" ? " in its vertex shader" : stage === "fragment" ? " in its fragment shader" : "";
+          throw err(`pipeline ${i} has ${n} ${limit.name}${what}; WebGPU's default limit is ${limit.max}`);
+        }
       }
     }
     if (p.kind === "compute") {

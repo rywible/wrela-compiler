@@ -32,11 +32,16 @@ pub fn typescript() -> String {
         })
         .collect();
     let binding_kinds = list(manifest::BindingKind::ALL.iter().map(|k| format!("{:?}", k.name())));
+    let stage_limits: String = manifest::StageLimit::ALL
+        .iter()
+        .map(|l| format!("  {{ name: {:?}, max: {} }},\n", l.name(), l.max()))
+        .collect();
     let binding_kind_traits: String = manifest::BindingKind::ALL
         .iter()
         .map(|k| {
             let (name, format, storage, three) = (k.name(), k.has_format(), k.is_storage(), k.is_3d());
-            format!("  {{ name: {name:?}, has_format: {format}, is_storage: {storage}, is_3d: {three} }},\n")
+            let limit = k.limit().name();
+            format!("  {{ name: {name:?}, has_format: {format}, is_storage: {storage}, is_3d: {three}, limit: {limit:?} }},\n")
         })
         .collect();
     let host_functions: String = crate::HOST_FUNCTIONS
@@ -167,9 +172,14 @@ export const SCREEN_FORMAT = {screen_format:?};
 /** What a pipeline binds at a binding, as the manifest names it. */
 export const BINDING_KINDS = [{binding_kinds}] as const;
 /** What each binding kind is (runtime/abi `BindingKind`): a colour texture, which names its
- * format; a texture kernels write (a storage texture); a 3D texture. */
+ * format; a texture kernels write (a storage texture); a 3D texture; and the per-stage limit it
+ * counts against. */
 export const BINDING_KIND_TRAITS = [
 {binding_kind_traits}] as const;
+/** WebGPU's default per-stage limits (runtime/abi `StageLimit`): what each counts, and the most a
+ * shader stage may have. */
+export const STAGE_LIMITS = [
+{stage_limits}] as const;
 /** `minStorageBufferOffsetAlignment`: where a bound range of a buffer may start. */
 export const BINDING_OFFSET_ALIGNMENT = {binding_offset_alignment};
 export const MAX_WORKGROUP_SIZE = [{size_x}, {size_y}, {size_z}];

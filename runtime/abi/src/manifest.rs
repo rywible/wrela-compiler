@@ -61,6 +61,44 @@ pub const MAX_SAMPLED_TEXTURES_PER_STAGE: usize = 16;
 pub const MAX_SAMPLERS_PER_STAGE: usize = 16;
 pub const MAX_STORAGE_TEXTURES_PER_STAGE: usize = 4;
 
+/// What a binding counts against in its shader stage: one of WebGPU's per-stage limits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StageLimit {
+    StorageBuffers,
+    SampledTextures,
+    Samplers,
+    StorageTextures,
+}
+
+impl StageLimit {
+    pub const ALL: [StageLimit; 4] = [
+        StageLimit::StorageBuffers,
+        StageLimit::SampledTextures,
+        StageLimit::Samplers,
+        StageLimit::StorageTextures,
+    ];
+
+    /// What it counts, as a manifest's error names it.
+    pub fn name(self) -> &'static str {
+        match self {
+            StageLimit::StorageBuffers => "storage buffers",
+            StageLimit::SampledTextures => "sampled textures",
+            StageLimit::Samplers => "samplers",
+            StageLimit::StorageTextures => "storage textures",
+        }
+    }
+
+    /// The most a stage may have: WebGPU's default.
+    pub fn max(self) -> usize {
+        match self {
+            StageLimit::StorageBuffers => MAX_STORAGE_BUFFERS_PER_STAGE,
+            StageLimit::SampledTextures => MAX_SAMPLED_TEXTURES_PER_STAGE,
+            StageLimit::Samplers => MAX_SAMPLERS_PER_STAGE,
+            StageLimit::StorageTextures => MAX_STORAGE_TEXTURES_PER_STAGE,
+        }
+    }
+}
+
 /// Whether a file the manifest names is one in the build directory, as both hosts read it: a
 /// name of letters, digits, `_`, `-` and `.`, not starting with `.`. Not a path that leaves
 /// the directory (`/`, `..`), nor anything a browser would read as a URL (`:`, `#`, `?`, `\`).
@@ -242,14 +280,6 @@ impl BindingKind {
         matches!(self, BindingKind::Read | BindingKind::ReadWrite)
     }
 
-    pub fn is_texture(self) -> bool {
-        matches!(self, BindingKind::Texture | BindingKind::DepthTexture | BindingKind::Texture3d)
-    }
-
-    pub fn is_sampler(self) -> bool {
-        matches!(self, BindingKind::Sampler | BindingKind::ComparisonSampler)
-    }
-
     /// Whether it's a colour texture, which names its format (`ResourceBinding::format`).
     pub fn has_format(self) -> bool {
         matches!(
@@ -269,6 +299,20 @@ impl BindingKind {
     /// Whether it's a 3D texture.
     pub fn is_3d(self) -> bool {
         matches!(self, BindingKind::Texture3d | BindingKind::StorageTexture3d)
+    }
+
+    /// The per-stage limit it counts against.
+    pub fn limit(self) -> StageLimit {
+        match self {
+            BindingKind::Read | BindingKind::ReadWrite => StageLimit::StorageBuffers,
+            BindingKind::Texture | BindingKind::DepthTexture | BindingKind::Texture3d => {
+                StageLimit::SampledTextures
+            }
+            BindingKind::Sampler | BindingKind::ComparisonSampler => StageLimit::Samplers,
+            BindingKind::StorageTexture | BindingKind::StorageTexture3d => {
+                StageLimit::StorageTextures
+            }
+        }
     }
 
     /// The name the manifest gives it.
@@ -437,8 +481,9 @@ impl Manifest {
                     ));
                 }
             }
-            // Each stage's storage buffers: its bindings', the uniform block's when it's in
-            // storage, and the debug flag (a fragment shader's or a kernel's).
+            // What each stage binds, against WebGPU's per-stage limits: its bindings, and among
+            // its storage buffers the uniform block's when it's in storage, and the debug flag
+            // (a fragment shader's or a kernel's).
             let in_storage =
                 usize::from(p.uniform.as_ref().is_some_and(|u| u.space == UniformSpace::Storage));
             let stages: &[BindingStage] = if render {
@@ -447,19 +492,28 @@ impl Manifest {
                 &[BindingStage::Both]
             };
             for &stage in stages {
-                let storage =
-                    p.bindings.iter().filter(|b| b.kind.is_buffer() && b.stage.sees(stage)).count()
-                        + in_storage
-                        + usize::from(p.debug_flag.is_some() && stage != BindingStage::Vertex);
-                if storage > MAX_STORAGE_BUFFERS_PER_STAGE {
-                    let what = match stage {
-                        BindingStage::Vertex => " in its vertex shader",
-                        BindingStage::Fragment => " in its fragment shader",
-                        BindingStage::Both => "",
-                    };
-                    return err(format!(
-                        "pipeline {i} has {storage} storage buffers{what}; WebGPU's default limit is {MAX_STORAGE_BUFFERS_PER_STAGE}"
-                    ));
+                for limit in StageLimit::ALL {
+                    let mut n = p
+                        .bindings
+                        .iter()
+                        .filter(|b| b.kind.limit() == limit && b.stage.sees(stage))
+                        .count();
+                    if limit == StageLimit::StorageBuffers {
+                        n += in_storage
+                            + usize::from(p.debug_flag.is_some() && stage != BindingStage::Vertex);
+                    }
+                    if n > limit.max() {
+                        let what = match stage {
+                            BindingStage::Vertex => " in its vertex shader",
+                            BindingStage::Fragment => " in its fragment shader",
+                            BindingStage::Both => "",
+                        };
+                        return err(format!(
+                            "pipeline {i} has {n} {}{what}; WebGPU's default limit is {}",
+                            limit.name(),
+                            limit.max()
+                        ));
+                    }
                 }
             }
             match &p.stage {

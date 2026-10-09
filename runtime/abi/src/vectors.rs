@@ -1072,6 +1072,43 @@ fn manifests() -> Vec<Value> {
             }),
         ),
         manifest("a blend that isn't a bool", golden.replace("\"fragment_entry\": \"fs\",", "\"fragment_entry\": \"fs\",\n      \"blend\": 1,")),
+        manifest("a blend that's null", golden.replace("\"fragment_entry\": \"fs\",", "\"fragment_entry\": \"fs\",\n      \"blend\": null,")),
+        // Each of WebGPU's per-stage limits, one past it: in a fragment shader, in a vertex
+        // shader (not counting what the other stage binds), and in a kernel.
+        manifest(
+            "too many sampled textures in a fragment shader",
+            edited(&|m| {
+                m.pipelines[1].bindings = (0..17)
+                    .map(|b| ResourceBinding { stage: BindingStage::Fragment, ..bind(b, BindingKind::Texture) })
+                    .collect()
+            }),
+        ),
+        manifest(
+            "sampled textures at the limit in each of two stages",
+            edited(&|m| {
+                m.pipelines[1].bindings = (0..32)
+                    .map(|b| {
+                        let stage = if b < 16 { BindingStage::Vertex } else { BindingStage::Fragment };
+                        ResourceBinding { stage, ..bind(b, BindingKind::Texture) }
+                    })
+                    .collect()
+            }),
+        ),
+        manifest(
+            "too many samplers in a vertex shader",
+            edited(&|m| {
+                m.pipelines[1].bindings = (0..17)
+                    .map(|b| ResourceBinding { stage: BindingStage::Vertex, ..bind(b, BindingKind::Sampler) })
+                    .collect()
+            }),
+        ),
+        manifest(
+            "too many storage textures in a kernel",
+            edited(&|m| {
+                m.pipelines[0].bindings =
+                    (1..6).map(|b| bind(b, BindingKind::StorageTexture)).collect()
+            }),
+        ),
         manifest(
             "a uniform block that isn't a multiple of 16",
             edited(&|m| {
