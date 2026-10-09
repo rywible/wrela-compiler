@@ -1,0 +1,207 @@
+// run: jobs (§6.18): a `@job fn` runs to each `yield` per `resume`, keeping its owned locals
+// (numbers, a `Vec`, a `String`) between them; its `take` parameters go to `start`, its `borrow`
+// and `mut` ones to each `resume`; it yields inside loops, `if`s and `match` arms, and a closure
+// it makes is called after a `yield`; a job dropped half done, or run to its end, frees what it
+// holds, once
+// expect: counted(4) = 4010
+// expect: counted(0) = 0
+// expect: gathered(5) = 31020
+// expect: arms(6) = 221
+// expect: closure_after_yield(3) = 38
+// expect: dropped_half_done(2048) = 2048
+// expect: finished(2048) = 2048
+// expect: resumed_after_done() traps
+use std::job::{Job, Step}
+
+struct Scratch {
+    total: u32,
+}
+
+/// Adds 0 to n - 1 into the scratch, one a step; its result is the steps it took times 1000.
+@job
+fn count(n: take u32, scratch: mut Scratch) -> u32 {
+    var steps = 0
+    for i in 0..n {
+        scratch.total += i
+        steps += 1
+        yield
+    }
+    steps * 1000
+}
+
+/// Runs `job` to its end: the result, and how many times it yielded.
+fn run_count(job: take Job<count>, scratch: mut Scratch) -> (u32, u32) {
+    var j = take job
+    var yields = 0
+    loop {
+        match j.resume(mut scratch) {
+            Step::Yielded => yields += 1,
+            Step::Done(r) => return (r, yields),
+        }
+    }
+}
+
+pub fn counted(n: u32) -> u32 {
+    var s = Scratch { total: 0 }
+    let (r, yields) = run_count(count.start(n), mut s)
+    r + yields + s.total
+}
+
+/// Gathers into a `Vec` it keeps, a part a frame: rows of `n` (each a nested loop, yielding on
+/// the odd ones), its text growing; it reads `scale` (lent at each `resume`) after a `yield`.
+@job
+fn gather(n: take u32, scale: u32) -> u32 {
+    var kept: Vec<u32> = Vec::new()
+    var text = String::new()
+    for row in 0..n {
+        for col in 0..row {
+            kept.push(row * scale + col)
+        }
+        if row % 2 == 1 {
+            yield
+            text.push_str("r")
+        }
+    }
+    yield
+    var sum = 0
+    for x in kept {
+        sum += x
+    }
+    sum * 100 + text.len() * 10
+}
+
+pub fn gathered(n: u32) -> u32 {
+    var j = gather.start(n)
+    var frames = 0
+    loop {
+        frames += 1
+        match j.resume(10) {
+            Step::Yielded => {},
+            Step::Done(r) => return r + frames - 4,
+        }
+    }
+}
+
+enum Phase: Copy {
+    Grow(u32),
+    Wait,
+    Stop,
+}
+
+/// Steps through phases, yielding inside `match` arms.
+@job
+fn phases(n: take u32) -> u32 {
+    var total = 0
+    var i = 0
+    loop {
+        let p = if i < n { Phase::Grow(i) } else if i == n { Phase::Wait } else { Phase::Stop }
+        match p {
+            Phase::Grow(k) => {
+                total += k
+                yield
+                total += 1
+            },
+            Phase::Wait => {
+                yield
+                yield
+                total += 100
+            },
+            Phase::Stop => break,
+        }
+        i += 1
+    }
+    total + 100
+}
+
+pub fn arms(n: u32) -> u32 {
+    var j = phases.start(n)
+    loop {
+        match j.resume() {
+            Step::Yielded => {},
+            Step::Done(r) => return r,
+        }
+    }
+}
+
+/// A closure it makes before a `yield`, which reads a `mut` parameter, called after it.
+@job
+fn closing(n: take u32, s: mut Scratch) -> u32 {
+    let k = n * 2
+    let add = |x: u32| x * k
+    s.total += 1
+    yield
+    if n > 1 {
+        s.total += add(n)
+    }
+    yield
+    s.total * 2
+}
+
+pub fn closure_after_yield(n: u32) -> u32 {
+    var s = Scratch { total: 0 }
+    var j = closing.start(n)
+    loop {
+        match j.resume(mut s) {
+            Step::Yielded => {},
+            Step::Done(r) => return r,
+        }
+    }
+}
+
+/// Holds a megabyte between frames.
+@job
+fn heavy(tag: take u32) -> u32 {
+    var v: Vec<u8> = Vec::with_capacity(1048576)
+    v.push(1)
+    yield
+    v.push(2)
+    yield
+    tag + v.len() - 2
+}
+
+/// Jobs started and stopped half done, then dropped: what they hold is freed.
+pub fn dropped_half_done(n: u32) -> u32 {
+    var count = 0
+    for i in 0..n {
+        var j = heavy.start(i)
+        match j.resume() {
+            Step::Yielded => count += 1,
+            Step::Done(_) => {},
+        }
+    }
+    count
+}
+
+/// Jobs run to their end: what they held is freed by their body.
+pub fn finished(n: u32) -> u32 {
+    var count = 0
+    for i in 0..n {
+        var j = heavy.start(i)
+        loop {
+            match j.resume() {
+                Step::Yielded => {},
+                Step::Done(r) => {
+                    count += r - i + 1
+                    break
+                },
+            }
+        }
+    }
+    count
+}
+
+pub fn resumed_after_done() -> u32 {
+    var j = heavy.start(1)
+    loop {
+        match j.resume() {
+            Step::Yielded => {},
+            Step::Done(_) => break,
+        }
+    }
+    match j.resume() {
+        Step::Yielded => 0,
+        Step::Done(r) => r,
+    }
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

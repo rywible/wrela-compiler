@@ -31,6 +31,10 @@ pub const RULES: &[(&str, &str)] = &[
     ("fn.return", "a function that returns a value ends with one, or returns one, on every path"),
     ("fn.return-trait", "a trait in return position names one inferred concrete type"),
     ("fn.values", "a named function is a value, and so is a type's associated function: `W::work`"),
+    (
+        "fn.jobs",
+        "a `@job fn` runs over several frames, to each `yield`: `f.start(...)` takes its `take` parameters, `job.resume(...)` its `borrow` and `mut` ones",
+    ),
     ("struct.defaults", "struct fields may have constant defaults a literal may omit"),
     ("struct.opt-in", "a struct opts in to Copy, Clone and GpuData in its declaration"),
     ("struct.base", "`..base` fills the remaining fields from another value"),
@@ -119,6 +123,7 @@ pub const RULES: &[(&str, &str)] = &[
     ("mem.loops", "a value from outside a loop can't be moved inside it"),
     ("mem.no-globals", "no mutable globals"),
     ("mem.closures", "closures are non-escaping: passed down, never returned or stored"),
+    ("mem.jobs", "a job keeps only owned values across a `yield`: no projection or loan"),
     (
         "mem.arenas",
         "an arena's values are named by handles: `arena[h]` projects, a stale handle panics",

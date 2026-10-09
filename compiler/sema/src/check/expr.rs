@@ -226,6 +226,7 @@ impl<'p> Checker<'p> {
                 self.check_closure(params, ret.as_ref(), body, expected, span)
             }
             ast::ExprKind::Return(value) => self.check_return(value.as_deref(), span),
+            ast::ExprKind::Yield => self.check_yield(span),
             ast::ExprKind::Break | ast::ExprKind::Continue => {
                 let (what, kind) = match e.kind {
                     ast::ExprKind::Break => ("break", ExprKind::Break),
@@ -539,6 +540,10 @@ impl<'p> Checker<'p> {
             }
             ValueRes::Item(Res::Fn(f)) => {
                 let def = self.p.func(f);
+                if def.attrs.job.is_some() {
+                    self.job_not_a_function(f, span);
+                    return self.error_expr(span);
+                }
                 // Only a call reaches what the compiler does for these, not the function's body.
                 if def.attrs.entry.is_some() {
                     self.err(

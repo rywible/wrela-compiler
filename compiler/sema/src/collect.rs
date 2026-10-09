@@ -760,6 +760,10 @@ impl<'d, 'u> Collector<'d, 'u> {
                     self.no_args(a, codes::E0222);
                     out.testing = Some(a.span);
                 }
+                "job" => {
+                    self.no_args(a, codes::E0336);
+                    out.job = Some(a.span);
+                }
                 "deterministic" | "audio" => {
                     self.no_args(a, codes::E0204);
                     if name == "deterministic" {
@@ -798,8 +802,16 @@ impl<'d, 'u> Collector<'d, 'u> {
                     );
                 }
                 _ => {
-                    let known =
-                        ["compute", "vertex", "fragment", "gpu", "deterministic", "audio", "test"];
+                    let known = [
+                        "compute",
+                        "vertex",
+                        "fragment",
+                        "gpu",
+                        "deterministic",
+                        "audio",
+                        "test",
+                        "job",
+                    ];
                     let mut d = Diagnostic::new(
                         codes::E0204,
                         a.name.span,

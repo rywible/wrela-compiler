@@ -115,11 +115,11 @@ loop_stmt        ::= "loop" block
 for_stmt         ::= "for" "mut"? pattern "in" expr_ns ((".." | "..=") expr_ns)? block
 
 # ---------------------------------------------------------------------------------------------
-# Expressions, loosest-binding first. A closure, `return`, `break` and `continue` are expressions
-# on their own, never operands: `f(|x| x + 1)`, not `a + |x| x`.
+# Expressions, loosest-binding first. A closure, `return`, `break`, `continue` and `yield` are
+# expressions on their own, never operands: `f(|x| x + 1)`, not `a + |x| x`.
 
 expr             ::= closure | jump | or_expr
-jump             ::= "return" expr? | "break" | "continue"
+jump             ::= "return" expr? | "break" | "continue" | "yield"
 closure          ::= ("|" (closure_param ("," closure_param)* ","?)? "|" | "||") ("->" type block | expr)
 closure_param    ::= (IDENT | "_") (":" type)?
 

@@ -491,6 +491,11 @@ pub enum TerminatorKind {
     Return(Option<Operand>),
     /// A projection-returning function returns this place.
     ReturnPlace(Place),
+    /// A job's `yield` (§6.18): its work stops here for this frame. Resumed, it goes on at
+    /// `resume`, with the owned locals it had.
+    Yield {
+        resume: BlockId,
+    },
     /// Unreachable: after an expression of type `!`, or no arm matched.
     Unreachable,
 }
@@ -533,6 +538,7 @@ impl FnBody {
                 _ => [None, None],
             },
             TerminatorKind::ArmFailed { next, .. } => one(*next),
+            TerminatorKind::Yield { resume } => one(*resume),
             TerminatorKind::Return(_)
             | TerminatorKind::ReturnPlace(_)
             | TerminatorKind::Unreachable => [None, None],
@@ -588,6 +594,8 @@ pub fn fn_uses(p: &Program, s: &Statement, r: &Rvalue, mut each: impl FnMut(FnUs
     match r {
         Rvalue::Call(c) => match &c.callee {
             Callee::Fn { func, .. } => each(FnUse::Call(*func), c.span),
+            // Resuming a job runs its body (§6.18); starting one makes its value.
+            Callee::JobStart(func) | Callee::JobResume(func) => each(FnUse::Call(*func), c.span),
             Callee::TraitMethod { method, self_ty, .. } => {
                 each(FnUse::Trait(*method, *self_ty), c.span)
             }

@@ -1244,6 +1244,7 @@ impl<'a> Builder<'a> {
             },
             ExprKind::Break => self.tok("break"),
             ExprKind::Continue => self.tok("continue"),
+            ExprKind::Yield => self.tok("yield"),
             ExprKind::Try(inner) => concat([self.expr(inner), self.tok("?")]),
             ExprKind::Assign { target, op, value } => {
                 concat([self.expr(target), self.tok(&format!(" {} ", op.text())), self.expr(value)])

@@ -798,10 +798,43 @@ impl<'a> FnCheck<'a> {
                 self.returned_borrow_struct(&st, o);
             }
             TerminatorKind::ReturnPlace(place) => self.return_place(&mut st, at, place),
+            TerminatorKind::Yield { resume } => self.yield_(&st, *resume, block.term.span),
             _ => {}
         }
         self.end_loans(&mut st, at);
         st
+    }
+
+    /// A job's `yield` (§6.18): nothing that holds a loan may be live across it (a projection,
+    /// a closure that captures one, a borrow struct), as a stopped job holds only owned values.
+    /// The job's own `borrow` and `mut` parameters are given again at each `resume`.
+    fn yield_(&mut self, st: &State, resume: BlockId, span: Span) {
+        let Some(live) = self.live_in.get(resume.index()) else { return };
+        let lent = |l: Local| {
+            matches!(
+                self.local(l).kind,
+                LocalKind::User(thir::LocalKind::Param(Mode::Borrow | Mode::Mut))
+            ) && self.local(l).closure.is_none()
+        };
+        let holds = |l: Local| st.loans.iter().any(|i| self.loans[i].holder == l);
+        let held: Vec<Local> = live
+            .iter()
+            .map(|i| Local(i as u32))
+            .filter(|&l| !lent(l) && (self.is_alias(l) || holds(l)))
+            .collect();
+        for l in held {
+            let what = self.holder_text(l);
+            self.err(
+                Diagnostic::new(
+                    codes::E0521,
+                    span,
+                    format!("{what} is used after this `yield`, but a stopped job holds no projections or loans"),
+                )
+                .with_secondary(self.local(l).span, "declared here")
+                .with_note("a job keeps only owned values from one frame to the next; its `borrow` and `mut` parameters are given again at each `resume` (§6.18)")
+                .with_help("keep an owned value (`take` it, or `.clone()` it), or find the place again after the `yield`"),
+            );
+        }
     }
 
     /// The loans of the holders `at` uses for the last time end after it.

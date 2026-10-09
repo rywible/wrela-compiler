@@ -4,6 +4,7 @@
 mod call;
 mod expr;
 pub mod infer;
+pub mod job;
 mod pat;
 mod units;
 mod zonk;

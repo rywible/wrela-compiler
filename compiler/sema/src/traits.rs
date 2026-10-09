@@ -586,6 +586,8 @@ pub fn may_need_drop(p: &Program, ty: TyId) -> bool {
         TyKind::ArrayN(e, _) => may_need_drop(p, *e),
         // A borrow struct owns nothing: its fields are borrows, or `Copy` (§6.4).
         TyKind::Adt(a, _) if p.adt(*a).borrow => false,
+        // A job's value holds its body's owned locals, which only its MIR says (§6.18).
+        TyKind::Adt(a, _) if p.is_lang_adt(*a, Lang::Job) => true,
         TyKind::Adt(a, args) => {
             explicit_drop(p, *a).is_some()
                 || p.field_lists(*a)

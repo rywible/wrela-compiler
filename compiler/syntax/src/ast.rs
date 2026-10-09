@@ -754,6 +754,8 @@ pub enum ExprKind {
     Return(Option<Box<Expr>>),
     Break,
     Continue,
+    /// `yield`: a job's work stops here for this frame (language.md §6.18).
+    Yield,
     /// `x?`: the value of an `Ok` or `Some`, or a return of the error or `None`.
     Try(Box<Expr>),
     /// An assignment as a match arm's body: `Some(s) => s.count += 1`.
@@ -839,6 +841,7 @@ impl Expr {
             | ExprKind::Path(_)
             | ExprKind::Break
             | ExprKind::Continue
+            | ExprKind::Yield
             | ExprKind::Error => {}
             ExprKind::Unary(_, x)
             | ExprKind::Take(x)

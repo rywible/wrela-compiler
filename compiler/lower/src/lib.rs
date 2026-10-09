@@ -18,6 +18,7 @@ mod eval;
 mod glue;
 mod gpu;
 mod instance;
+mod job;
 mod lift;
 mod mem;
 mod par;
@@ -81,11 +82,13 @@ impl Roots {
                 continue;
             }
             let generic = !p.fn_all_generics(id).is_empty();
-            // A generic one too: it's reported (the host can't choose its types).
+            // A generic one too: it's reported (the host can't choose its types). Not a job,
+            // which the program starts and resumes (§6.18).
             if Some(f.module) == p.main
                 && f.public
                 && f.owner == wrela_sema::defs::FnOwner::Free
                 && f.attrs.entry.is_none()
+                && f.attrs.job.is_none()
             {
                 exports.push(id);
             }
@@ -297,6 +300,8 @@ pub(crate) struct ModuleBuilder {
     pub texts: HashMap<String, ir::DataId>,
     /// A lifted build's table of literals, and what keeps its GPU copy (CPU only).
     pub lift: Option<lift::CpuTable>,
+    /// Each job's value, as laid out (§6.18).
+    pub jobs: HashMap<FnId, job::JobLayout>,
 }
 
 impl ModuleBuilder {
@@ -348,7 +353,13 @@ pub fn lower(
     cx.make_table(&mut cpu);
     let mut has_frame = false;
     for &f in &roots.also {
-        cx.instance(&mut cpu, InstanceKey::plain(f, Vec::new()), None);
+        // A job's body is lowered as its `resume` (§6.18).
+        let key = if checked.program.func(f).attrs.job.is_some() {
+            InstanceKey::JobResume(f)
+        } else {
+            InstanceKey::plain(f, Vec::new())
+        };
+        cx.instance(&mut cpu, key, None);
     }
     // The program's state (§12): what `init` returns, which the other exports take first.
     let state = state_type(checked);
@@ -816,6 +827,7 @@ impl<'a> Cx<'a> {
             InstanceKey::Closure { owner, .. } => {
                 owner.source_fn().map(|f| format!("a closure in {}", p.fn_display_name(f)))
             }
+            InstanceKey::JobResume(f) => Some(p.fn_display_name(*f)),
             InstanceKey::Derived { .. } | InstanceKey::Glue { .. } => None,
         }
     }

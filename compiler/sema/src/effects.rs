@@ -686,6 +686,10 @@ fn node(
             match r {
                 Rvalue::Call(c) => match &c.callee {
                     Callee::Fn { func, .. } => call_to(&mut n, *func, c.span),
+                    // Resuming a job runs its body to its next `yield`; starting one moves its
+                    // arguments into its value.
+                    Callee::JobResume(func) => call_to(&mut n, *func, c.span),
+                    Callee::JobStart(_) => {}
                     Callee::TraitMethod { method, self_ty, trait_args, method_args } => {
                         // Resolved here only when the type is known; otherwise lowering checks
                         // each instantiation.

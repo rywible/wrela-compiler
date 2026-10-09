@@ -1,0 +1,16 @@
+// Work over several frames (language.md §6.18): a `@job fn` whose body runs a part a frame, to
+// each `yield`. `f.start(...)` takes its owned parameters and makes a `Job<f>`;
+// `job.resume(...)` takes its `borrow` and `mut` parameters, runs it to its next `yield` or its
+// end, and says which (`Step`).
+
+/// A job of the `@job fn` `F` (`Job<realize>`, from `realize.start(...)`): where it stopped, and
+/// the locals it needs after that point. An owned value with no projections in it, which a
+/// field of the program's state holds.
+pub struct Job<F> {}
+
+/// What a job's `resume` did: it stopped at a `yield` (its work for this frame), or it ran to
+/// its end, and gave its result.
+pub enum Step<R> {
+    Yielded,
+    Done(R),
+}

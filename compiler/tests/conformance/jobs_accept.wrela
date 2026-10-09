@@ -1,0 +1,42 @@
+// accepts: fn.jobs mem.jobs
+// A job runs to each `yield` per `resume`: its `take` parameters go to `start`, its `borrow` and
+// `mut` ones to each `resume`, which it may use after a `yield`; it keeps owned values across
+// one, and a closure that copies what it captures.
+use std::job::{Job, Step}
+
+struct Scratch {
+    rows: Vec<u32>,
+}
+
+@job
+fn fill(n: take u32, step: u32, scratch: mut Scratch) -> u32 {
+    var made: Vec<u32> = Vec::new()
+    let scaled = |x: u32| x * n
+    for i in 0..n {
+        made.push(scaled(i))
+        scratch.rows.push(i * step)
+        yield
+    }
+    while made.len() > 2 {
+        let _ = made.pop()
+        yield
+    }
+    made.len() + scratch.rows.len()
+}
+
+struct State {
+    job: Job<fill>,
+    scratch: Scratch,
+    result: u32,
+}
+
+pub fn init() -> State {
+    State { job: fill.start(4), scratch: Scratch { rows: Vec::new() }, result: 0 }
+}
+
+pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
+    match s.job.resume(2, mut s.scratch) {
+        Step::Yielded => {},
+        Step::Done(r) => s.result = r,
+    }
+}

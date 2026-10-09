@@ -25,6 +25,9 @@ pub enum InstanceKey {
     Derived { of: Callable, kind: DeriveKind, input: TyId, output: Option<TyId> },
     /// Drop or clone glue for a concrete type (`crate::glue`).
     Glue { kind: crate::glue::GlueKind, ty: TyId },
+    /// A job's `resume` (§6.18): its body, from where its value says it stopped to its next
+    /// `yield` or its end (`crate::job`).
+    JobResume(FnId),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -76,6 +79,7 @@ impl InstanceKey {
         match self {
             InstanceKey::Fn { func, .. } => Some(*func),
             InstanceKey::Closure { owner, .. } => owner.source_fn(),
+            InstanceKey::JobResume(func) => Some(*func),
             InstanceKey::Derived { .. } | InstanceKey::Glue { .. } => None,
         }
     }
@@ -89,7 +93,8 @@ impl InstanceKey {
             }
             InstanceKey::Closure { .. }
             | InstanceKey::Derived { .. }
-            | InstanceKey::Glue { .. } => false,
+            | InstanceKey::Glue { .. }
+            | InstanceKey::JobResume(_) => false,
         }
     }
 
@@ -97,7 +102,9 @@ impl InstanceKey {
         match self {
             InstanceKey::Fn { substs, .. } => substs,
             InstanceKey::Closure { owner, .. } => owner.substs(),
-            InstanceKey::Derived { .. } | InstanceKey::Glue { .. } => &[],
+            InstanceKey::Derived { .. } | InstanceKey::Glue { .. } | InstanceKey::JobResume(_) => {
+                &[]
+            }
         }
     }
 
@@ -105,7 +112,9 @@ impl InstanceKey {
         match self {
             InstanceKey::Fn { resources, .. } => resources,
             InstanceKey::Closure { owner, .. } => owner.resources(),
-            InstanceKey::Derived { .. } | InstanceKey::Glue { .. } => &[],
+            InstanceKey::Derived { .. } | InstanceKey::Glue { .. } | InstanceKey::JobResume(_) => {
+                &[]
+            }
         }
     }
 }

@@ -381,6 +381,10 @@ impl<'a> Parser<'a> {
                     let s = self.bump().span;
                     return Ok(Expr::new(ExprKind::Continue, s));
                 }
+                T::Yield => {
+                    let s = self.bump().span;
+                    return Ok(Expr::new(ExprKind::Yield, s));
+                }
                 _ => {}
             }
         }
@@ -417,6 +421,7 @@ impl<'a> Parser<'a> {
                 | T::Return
                 | T::Break
                 | T::Continue
+                | T::Yield
         )
     }
 
@@ -1375,6 +1380,7 @@ fn is_postfix_shaped(e: &Expr) -> bool {
             | ExprKind::Return(_)
             | ExprKind::Break
             | ExprKind::Continue
+            | ExprKind::Yield
             | ExprKind::Assign { .. }
     )
 }

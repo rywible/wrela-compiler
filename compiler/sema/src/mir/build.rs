@@ -603,6 +603,15 @@ impl<'a> Builder<'a> {
                 }
                 None
             }
+            ExprKind::Yield => {
+                // The job stops here; resumed, it goes on in a block of its own.
+                let at = self.fs.cur.index();
+                let resume = self.new_block();
+                self.fs.blocks[at].term =
+                    Terminator { kind: TerminatorKind::Yield { resume }, span };
+                self.fs.cur = resume;
+                self.temp_of(Rvalue::Tuple(Vec::new()), e.ty, span)
+            }
             ExprKind::Call(c) => self.call_value(c, e, false, want),
             ExprKind::Error | ExprKind::FromBase => None,
             _ => {

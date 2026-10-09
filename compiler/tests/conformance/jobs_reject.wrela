@@ -1,0 +1,40 @@
+// rejects: fn.jobs
+// `yield` is in a job's own body; a job is started and resumed, not called or passed; `Job<F>`
+// takes a job; and a job is a plain function that returns what it owns.
+use std::job::Job
+
+@job
+fn walk(n: take u32) -> u32 {
+    let f = |x: u32| {
+        yield //~ E0335
+        x
+    }
+    f(n)
+}
+
+fn plain() {
+    yield //~ E0335
+}
+
+@job //~ E0336
+fn generic<T: Copy>(x: take T) -> T {
+    x
+}
+
+@job //~ E0336
+fn pointing(xs: [u32]) -> borrow u32 {
+    xs[0]
+}
+
+struct Holder {
+    job: Job<plain>, //~ E0336
+}
+
+fn apply(f: fn(u32) -> u32) -> u32 {
+    f(1)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    let _ = walk(1) //~ E0336
+    let _ = apply(walk) //~ E0336
+}

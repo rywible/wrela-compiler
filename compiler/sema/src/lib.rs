@@ -48,6 +48,7 @@ pub const STD_SOURCES: &[(&str, &str)] = &[
     ("std::input", include_str!("../../std/input.wrela")),
     ("std::lift", include_str!("../../std/lift.wrela")),
     ("std::reload", include_str!("../../std/reload.wrela")),
+    ("std::job", include_str!("../../std/job.wrela")),
     ("std::gpu", include_str!("../../std/gpu.wrela")),
     ("std::derive", include_str!("../../std/derive.wrela")),
     ("std::field", include_str!("../../std/field.wrela")),
@@ -157,6 +158,7 @@ fn check(
     let consts = {
         let p = &program;
         diags.extend(gpu::check_entries(p));
+        diags.extend(check::job::check_jobs(p));
         for t in 0..p.traits.len() {
             diags.extend(fieldwise::check_trait(p, ty::TraitId(t as u32)));
         }

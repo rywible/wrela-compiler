@@ -981,6 +981,21 @@ fn resolve_type_path(
                     p.types.error
                 }
             },
+            // `Job<f>` takes a job, a function (§6.18): its type is the function's.
+            ast::TypeExprKind::Path(path)
+                if matches!(res, Res::Adt(j) if p.is_lang_adt(j, Lang::Job))
+                    && let Some(Res::Fn(f)) = resolve_value_item(p, scope.module, path) =>
+            {
+                if p.func(f).attrs.job.is_none() {
+                    diags.push(Diagnostic::new(
+                        codes::E0336,
+                        a.span,
+                        format!("`{}` isn't a job: `Job<F>` takes a `@job fn`", p.func(f).name),
+                    ));
+                    return p.types.error;
+                }
+                p.types.intern(TyKind::FnDef(f, Vec::new()))
+            }
             _ => resolve_type(p, diags, scope, a, TyPos::Normal),
         })
         .collect();

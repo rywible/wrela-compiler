@@ -137,6 +137,10 @@ impl<'p> Checker<'p> {
                     Some(Lang::Draw) => return self.check_draw(args, span),
                     _ => {}
                 }
+                if self.p.func(f).attrs.job.is_some() {
+                    self.job_not_a_function(f, callee.span);
+                    return self.failed_call(args, span);
+                }
                 if let Some((e, _)) = self.p.func(f).attrs.entry {
                     let kind = match e {
                         Entry::Compute(_) => {
@@ -525,7 +529,11 @@ impl<'p> Checker<'p> {
     }
 
     /// The parameters of `f`, with its generics substituted by `gen_args`.
-    fn fn_params(&self, f: FnId, gen_args: &[TyId]) -> (Vec<CallParam<'p>>, TyId, RetMode) {
+    pub(crate) fn fn_params(
+        &self,
+        f: FnId,
+        gen_args: &[TyId],
+    ) -> (Vec<CallParam<'p>>, TyId, RetMode) {
         let subst = Subst::from_pairs(&self.p.fn_all_generics(f), gen_args);
         let (params, ret) = self.sig_under(f, &subst);
         (params, ret, self.p.func(f).ret_mode)
@@ -2198,10 +2206,22 @@ impl<'p> Checker<'p> {
         {
             return self.bind_value(f, path, args, span);
         }
+        // `job.start(...)`: a `Job<job>` (§6.18).
+        if name.name == "start"
+            && let Some(f) = self.fn_named(receiver)
+            && self.p.func(f).attrs.job.is_some()
+        {
+            return self.job_start(f, args, span);
+        }
         let recv = self.check_expr(receiver, None);
         let rt = self.shallow(recv.ty);
         if matches!(self.p.types.kind(rt), TyKind::Error) {
             return self.failed_call(args, span);
+        }
+        if name.name == "resume"
+            && let Some(f) = self.job_of(rt)
+        {
+            return self.job_resume(f, recv, args, span);
         }
         // A built-in method on a literal (`x.sqrt()` after `let x = 2.0`) leaves its type open,
         // as `sqrt(x)` does, unless a trait has a method of that name.

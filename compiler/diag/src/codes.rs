@@ -166,6 +166,8 @@ codes! {
     E0332 = "E0332", "a constant of a type that can't live as long as the program";
     E0333 = "E0333", "a call's result thrown away, where the call does nothing else";
     E0334 = "E0334", "an enum discriminant that isn't valid";
+    E0335 = "E0335", "`yield` outside a job";
+    E0336 = "E0336", "a `@job fn` that can't be a job, or a job used as a function";
 
     // ---- E04xx: traits and generics --------------------------------------------------------
     E0400 = "E0400", "a type that doesn't implement a trait";
@@ -210,6 +212,7 @@ codes! {
     E0518 = "E0518", "`let` of a place whose type isn't `Copy`";
     E0519 = "E0519", "a projection as a field of an ordinary type";
     E0520 = "E0520", "a parallel closure that writes data it captures";
+    E0521 = "E0521", "a projection or a loan live across a `yield`";
 
     // ---- E06xx: effects and GPU rules ------------------------------------------------------
     E0600 = "E0600", "an effect a context forbids";

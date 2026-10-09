@@ -1,0 +1,41 @@
+// A `@job fn` that can't be a job, or a job used as a function. A job runs over several frames
+// (§6.18): it's started (`f.start(...)`, with its `take` parameters) and resumed
+// (`job.resume(...)`, with its `borrow` and `mut` ones), never called or passed. It's a plain
+// function: not generic, not a method, not an entry point, and it returns what it owns.
+// ---- wrong
+@job
+fn count(n: take u32) -> u32 {
+    var total = 0
+    for i in 0..n {
+        total += i
+        yield
+    }
+    total
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    let total = count(10)
+}
+
+// ---- fixed
+use std::job::Step
+
+@job
+fn count(n: take u32) -> u32 {
+    var total = 0
+    for i in 0..n {
+        total += i
+        yield
+    }
+    total
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    var job = count.start(10)
+    loop {
+        match job.resume() {
+            Step::Yielded => {},
+            Step::Done(_) => break,
+        }
+    }
+}

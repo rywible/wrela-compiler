@@ -248,7 +248,9 @@ impl Fl<'_, '_> {
     /// A move out of `p`, after it's read: zeros there, so its owner's drop finds nothing. A
     /// whole temporary passed on isn't dropped at all, so it needs none.
     pub fn moved(&mut self, p: &mir::Place, kind: MoveKind) {
-        if self.is_gpu() || (kind == MoveKind::Temp && p.proj.is_empty()) {
+        // A temporary is a value (its new owner has it), except in a job's `resume`, whose
+        // temporaries are IR locals it keeps.
+        if self.is_gpu() || (kind == MoveKind::Temp && p.proj.is_empty() && !self.is_job()) {
             return;
         }
         let t = self.place_src_ty(p);

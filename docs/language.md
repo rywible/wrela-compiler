@@ -735,20 +735,22 @@ A program can run a fixed-rate step on a thread of its own, hand its newest resu
 - **The native host without a GPU:** `wrela-host --no-gpu <build> --ticks N` runs the ticker alone, no frames, and prints each tick's hash; `--log out.ticks` writes the log. `wrela-host --replay <log> [--no-gpu] <build>` replays a log's records and fails at the first tick whose hash differs, naming it. A build of `wrela-host` without its `gpu` feature has these two only: an x86-64 one under Rosetta checks the sim's bits on x86's code generation (`keys/a_run_recorded_in_chrome_replays_on_arm64_and_x86_64`).
 - **Test mode's two schedules** (#43 §2.3): in **lockstep**, before frame i the ticks up to ⌊(i + 1)·hz/fps⌋ run and the frame waits for them, the same in both hosts, so frames and hashes compare across hosts; **paced** (`#test&paced=1`), ticks run on the ticker's own clock and neither waits for the other, as in play. A GPU that sets its clock by its load stretches a paced frame's work to fill most of its interval, so GPU budgets are measured with the frames back to back (`#test&saturate=1`, in lockstep): two frames in flight, the canvas left alone, the GPU busy and its clock high.
 
-### 6.18 Work over several frames (designed in M5; decided before M8)
+### 6.18 Work over several frames (M5)
 
-**The problem.** Work too long for one frame is split by hand. The clearing keeps a `bool` for most steps of its loading and tests them in nested chains: `if s.static_drawn { if !s.occluders_cooked { ... } else if ... }`. `Realizing` splits `realize_once`'s cull, slices and finish into a step counter of its own. Each is the same state machine, written by hand, and each adds placeholders to `init`.
+**The problem.** Work too long for one frame is split by hand: a `bool` for each step of a load, tested in nested chains (`if s.static_drawn { if !s.occluders_cooked { ... } else if ... }`), or a step counter of its own (`engine::realize::Realizing`). Each is the same state machine, written by hand.
 
-**The design: a job is a function whose body runs over several frames.**
-- `@job fn realize(creature: Fawn, scratch: mut Scratch) { cull(...); for i in 0..slices { place(i); yield } finish() }`. `yield` ends the job's work for this frame.
-- `realize.start(creature)` takes the job's owned parameters and makes a `Job<realize>`: an owned value that holds where the job stopped and the locals it needs after that point. It's an ordinary field of the state: `Clone`, `Serialize` (a hot reload carries a half-done load), and with no `Pin`.
-- `job.resume(mut s.scratch)` takes its projections (its `borrow` and `mut` parameters), runs the job to its next `yield` or its end, and gives `Step::Yielded` or `Step::Done(result)`. A projection is given at each `resume`, so a stopped job holds none.
-- A local that is live across a `yield` is owned: a projection or a run there is an error, as one in a stored closure is (§6.7). The memory checker already knows which locals are live at each point, so the compiler moves those into the job's value, and lowering resumes at the stopped point with a `match` on it, as it lowers a loop.
-- There is no executor and no IO of its own. The program resumes a job where it tests a flag today, and requests stay polled values (§6.15): `while p.poll().is_none() { yield }`.
+**A job is a function whose body runs over several frames** (`fn.jobs`; `run/jobs`).
+- `@job fn realize(creature: take Fawn, scratch: mut Scratch) -> Mesh { cull(...); for i in 0..slices { place(i); yield } finish() }`. `yield` ends the job's work for this frame. It's written in a job's own body, not in a closure's or another function's (E0335).
+- `realize.start(creature)` takes the job's `take` parameters, matched as a call's arguments are, and makes a `Job<realize>` (`std::job`): an owned value that holds where the job stopped and the owned locals of its body. It's an ordinary field of the state.
+- `job.resume(mut s.scratch)` lends it the job's `borrow` and `mut` parameters, runs it to its next `yield` or its end, and gives `Step::Yielded` or `Step::Done(result)`. Each `resume` lends them again, so the job may use them after a `yield`, and a stopped job holds none. Resuming a job that has ended traps.
+- A job is a plain function: not generic, not a method, not an entry point or a test, and it returns a value it owns (E0336). It isn't called or passed as a value (E0336): it's started. A `pub` job isn't an export.
+- **Nothing that holds a loan lives across a `yield`** (`mem.jobs`): not a projection (of a lent parameter, which the next `resume` may lend from another place, or of anything else), nor a closure or borrow struct that holds one (E0521). Owned values live across it, and so does a closure that copies what it captures.
+- There's no executor and no IO of its own. The program resumes a job where it would test a flag, and a request stays a polled value (§6.15): `while p.poll().is_none() { yield }`.
+- **Not yet:** a job's value isn't `Clone` or `Serialize`. It holds its body's locals as this build lays them out, and a new build lays them out anew: a hot reload starts a job again rather than carrying it.
 
-**Why it fits wrela.** Projections can't be stored, so a stopped job holds only owned values, and its value is plain data. The frame is already the suspension point (§6.15).
+**How it's built.** The memory checker already knows what's live at each `yield`. Lowering gives the job's value a field for each owned local of its body (its `take` parameters among them); `resume` moves the fields into its locals, runs its blocks from the one the value names, as cases of a loop, and at a `yield` moves the locals back. Its locals live in IR locals and its projections in pointers, as a projection chosen at run time does (§6.3), since no IR value flows between its blocks.
 
-**Against the decision about `async`** (§18, 2026-10-02): a job has no futures, no executor and no IO; it's a loop body that the compiler splits at its `yield`s, and the program calls it. It's decided before M8, whose streaming floors make the pattern central. Until then, a step counter in the state (`Realizing`) is the form. Its cost is about that of closures' captures: the checker's rules for `yield`, and lowering a job's locals into its value.
+**Why it fits wrela.** Projections can't be stored, so a stopped job holds only owned values, and its value is plain data. The frame is already the suspension point (§6.15). Against the decision about `async` (§18, 2026-10-02): a job has no futures, no executor and no IO; it's a loop body that the compiler splits at its `yield`s, and the program calls it.
 
 ## 7. Generics and traits
 
@@ -1046,6 +1048,7 @@ The sim/presentation split is an engine pattern built on this, not a language fe
   - `std::fmt`: `Format`, `Spec`, `assert_failed1`, `assert_failed2`
   - `std::arena`: `Arena`, `Handle`
   - `std::lift`: `gradient`, `reads`, `literal_count`, `literal_value`, `literal_built_value`, `set_literal`, `literal_generation`, `literal_source`, `lifted_files`, `lifted_file`
+  - `std::job`: `Job`, `Step`
 - **Stdlib modules pass an admission test** (D-081): each would make sense in a program that isn't a game. Acoustics, creatures, terrain and timelines are engine code, in a package of their own (the sketches' `engine`), not in std.
 - **The stdlib is written in wrela** with a small unsafe core (§6.14). These files are the core, and the only ones with `unsafe`: `std::mem` (raw memory), `std::alloc` (the allocator), `std::collections` (`Vec` and `Box`), `std::string`, `std::par` (the helpers and jobs), `std::audio` (the voice and its ring), `std::tick` (the ticker) and `std::handoff` (the triple buffer). `closed_list.rs` checks it.
 - **The core states what inference can't see** (`closed_list.rs` checks that only the core's files use these two attributes, and the compiler rejects them anywhere else, E0204):
@@ -1077,6 +1080,7 @@ The sim/presentation split is an engine pattern built on this, not a language fe
 | `std::input` | `events`, `Event`, `Key`, `Button`, `Mods`, and `Input`, what's held (§6.15) |
 | `std::lift` | A lifted build's literals: `Literal`, `count`, `literal`, their values, sources and files, `set`, `generation` and `Watch`; `gradient` by literals and `reads`; specs' `Checks`, `Loss` and `Report` (§22) |
 | `std::reload` | Hot reload: `keep` bytes for the build that replaces this one, which its `kept` gives (§22) |
+| `std::job` | Work over several frames: `Job<f>`, a `@job fn` started and resumed to each `yield`, and `Step`, what a `resume` did (§6.18) |
 | `std::audio` | `play`, the program's voice, and `ring`, a queue to it (§6.13) |
 | `std::par` | The workers' protocol behind `par_each_mut` and `par_map_reduce` (§6.12); nothing public |
 | `std::mem`, `std::alloc` | The unsafe core: raw memory and the allocator (§6.14) |

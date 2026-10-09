@@ -81,6 +81,10 @@ pub(crate) struct Fl<'c, 'a> {
     unmatched: HashMap<BlockId, BlockId>,
     /// The projections bound in more than one place: in each branch of an `if` (§6.3).
     rebound: std::collections::HashSet<Local>,
+    /// Lowering a job's `resume` (§6.18, `crate::job`): its blocks aren't nested, so nothing
+    /// may flow between them in IR values. Every owned local is an IR local, every projection
+    /// a pointer in one, and a closure's captures are found where it's called.
+    job: bool,
 }
 
 /// The projections `code` binds in more than one place: in each branch of an `if` (§6.3).
@@ -145,6 +149,10 @@ pub(crate) fn lower_body(cx: &mut Cx, mb: &mut ModuleBuilder, key: &InstanceKey,
             crate::glue::lower(cx, mb, *kind, *ty, id);
             return;
         }
+        InstanceKey::JobResume(f) => {
+            lower_job(cx, mb, *f, key, id);
+            return;
+        }
         _ => {}
     }
     let checked = cx.checked;
@@ -172,6 +180,7 @@ pub(crate) fn lower_body(cx: &mut Cx, mb: &mut ModuleBuilder, key: &InstanceKey,
         matched: HashMap::new(),
         unmatched: HashMap::new(),
         rebound: rebound(code),
+        job: false,
     };
     fl.unmatched = unmatched(code, &fl.preds);
     // The constants this code names: places that live as long as the program (§10).
@@ -189,7 +198,7 @@ pub(crate) fn lower_body(cx: &mut Cx, mb: &mut ModuleBuilder, key: &InstanceKey,
     match key {
         InstanceKey::Fn { .. } => fl.bind_fn_params(),
         InstanceKey::Closure { id: cid, .. } => fl.bind_closure_params(*cid),
-        InstanceKey::Derived { .. } | InstanceKey::Glue { .. } => {}
+        InstanceKey::Derived { .. } | InstanceKey::Glue { .. } | InstanceKey::JobResume(_) => {}
     }
     fl.region(mir::FnBody::ENTRY, None);
     if !fl.terminated() {
@@ -198,6 +207,124 @@ pub(crate) fn lower_body(cx: &mut Cx, mb: &mut ModuleBuilder, key: &InstanceKey,
         fl.emit(s);
     }
     fl.finish();
+}
+
+/// A job's `resume` (§6.18, `crate::job`): the job's fields moved into its locals, then its
+/// blocks from the one its `at` names, each a case of a loop round a choice of block, to a
+/// `yield` (its locals moved back into the job, `Step::Yielded`) or its end (`Step::Done`).
+fn lower_job(cx: &mut Cx, mb: &mut ModuleBuilder, func: FnId, key: &InstanceKey, id: ir::FuncId) {
+    let checked = cx.checked;
+    let Some(mir) = checked.mir.get(&func) else { return };
+    let code = &mir.fns[0];
+    let Some(layout) = cx.job_layout(mb, func) else { return };
+    let subst = cx.instance_subst(key);
+    let f = std::mem::take(&mut mb.m.functions[id.index()]);
+    let mut fl = Fl {
+        cx,
+        mb,
+        key: key.clone(),
+        id,
+        f,
+        mir,
+        code,
+        subst,
+        locals: vec![Repr::Unbound; mir.locals.len()],
+        blocks: vec![Open::new(0)],
+        defined: HashMap::new(),
+        next_block: 1,
+        preds: reachable_preds(code),
+        matched: HashMap::new(),
+        unmatched: HashMap::new(),
+        rebound: rebound(code),
+        job: true,
+    };
+    for (i, d) in mir.locals.iter().enumerate() {
+        if let LocalKind::Const(c) = d.kind
+            && d.closure.is_none()
+        {
+            fl.locals[i] = fl.table(c);
+        }
+    }
+    // The job's `borrow` and `mut` parameters: this function's, after the job.
+    let def = checked.program.func(func);
+    let mut k = 1u32;
+    for (i, p) in def.params.iter().enumerate() {
+        if p.mode == wrela_sema::defs::Mode::Take {
+            continue;
+        }
+        let local = code.params[i];
+        let t = fl.concrete(p.ty);
+        if fl.cx.lower_ty(fl.mb, t, p.span).is_none() {
+            fl.locals[local.index()] = Repr::Erased;
+            continue;
+        }
+        fl.bind_param(local, k);
+        k += 1;
+    }
+    // Each local the job holds, moved out of it.
+    let job = ir::Place::root(ir::PlaceRoot::Param(0));
+    let mut held = Vec::new();
+    for &(l, field) in &layout.fields {
+        let Some(ty) = fl.mb.m.types.field(layout.ty, field) else { continue };
+        let name = fl.mir.local(l).name.clone();
+        let var = fl.new_local(&name, ty);
+        fl.locals[l.index()] = Repr::Var(var);
+        let at = job.with(ir::Proj::Field(field));
+        let v = fl.load(at.clone(), ty);
+        fl.emit(ir::Stmt::Store(ir::Place::local(var), v));
+        let zero = fl.value(ty, ir::Expr::Zero(ty));
+        fl.emit(ir::Stmt::Store(at, zero));
+        held.push((var, field, ty));
+    }
+    let u = fl.mb.m.types.u32();
+    let b = fl.mb.m.types.bool();
+    let at = fl.load(job.with(ir::Proj::Field(0)), u);
+    // Resumed after its end: a trap.
+    let done = fl.u32c(crate::job::DONE);
+    let over = fl.value(b, ir::Expr::Binary(ir::BinOp::Eq, at, done));
+    fl.emit(ir::Stmt::If { cond: over, then: vec![ir::Stmt::Trap], else_: Vec::new() });
+    let next = fl.new_local("next", u);
+    fl.emit(ir::Stmt::Store(ir::Place::local(next), at));
+    // The blocks the entry reaches, through each `yield`'s resume too.
+    let mut order = Vec::new();
+    let mut seen = vec![false; code.blocks.len()];
+    let mut work = vec![mir::FnBody::ENTRY];
+    while let Some(blk) = work.pop() {
+        if std::mem::replace(&mut seen[blk.index()], true) {
+            continue;
+        }
+        order.push(blk);
+        work.extend(code.successors(blk).collect::<Vec<_>>().into_iter().rev());
+    }
+    let step = fl.cx.step_ty(func);
+    let span = def.sig_span;
+    let Some(step_ir) = fl.cx.lower_ty(fl.mb, step, span) else { return };
+    let jb = JobBlocks { next, job, held, step: step_ir };
+    fl.push_block();
+    for blk in order {
+        let n = fl.load(ir::Place::local(next), u);
+        let c = fl.u32c(blk.0);
+        let here = fl.value(b, ir::Expr::Binary(ir::BinOp::Eq, n, c));
+        fl.push_block();
+        fl.job_block(blk, &jb);
+        let case = fl.pop_block();
+        fl.emit(ir::Stmt::If { cond: here, then: case, else_: Vec::new() });
+    }
+    fl.emit(ir::Stmt::Trap);
+    let body = fl.pop_block();
+    fl.emit(ir::Stmt::Loop { body, continuing: Vec::new() });
+    fl.emit(ir::Stmt::Trap);
+    fl.finish();
+}
+
+/// What a job's blocks need beside the code (see [`lower_job`]): the local naming the block to
+/// run next, the job's place, the IR locals holding its fields (with each field and type), and
+/// `Step`'s IR type.
+struct JobBlocks {
+    next: ir::LocalId,
+    job: ir::Place,
+    held: Vec<(ir::LocalId, u32, ir::TypeId)>,
+    step: ir::TypeId,
 }
 
 /// For each block, how many reachable blocks lead to it.
@@ -671,8 +798,104 @@ impl<'c, 'a> Fl<'c, 'a> {
                     self.emit(ir::Stmt::Trap);
                     return;
                 }
+                // Only a job's body has one, and it's lowered by `lower_job`.
+                TerminatorKind::Yield { .. } => {
+                    self.cx.err(Diagnostic::internal("a `yield` outside a job reached lowering"));
+                    self.emit(ir::Stmt::Trap);
+                    return;
+                }
             }
         }
+    }
+
+    /// Whether this is a job's `resume` (see [`Fl::job`]).
+    pub(crate) fn is_job(&self) -> bool {
+        self.job
+    }
+
+    /// Block `b` of a job's body as a case of its loop (see [`lower_job`]): its statements,
+    /// then the block to run next, or the job's return.
+    fn job_block(&mut self, b: BlockId, jb: &JobBlocks) {
+        let block = self.code.block(b);
+        for s in &block.stmts {
+            self.statement(s);
+        }
+        if self.terminated() {
+            return;
+        }
+        self.at(block.term.span);
+        let code = self.code;
+        let loop_part = |l: BlockId, pick: fn(&BlockId, &BlockId, &BlockId) -> BlockId| match &code
+            .block(l)
+            .term
+            .kind
+        {
+            TerminatorKind::Loop { body, continuing, merge } => Some(pick(body, continuing, merge)),
+            _ => None,
+        };
+        let to = match &block.term.kind {
+            TerminatorKind::Goto(t) => Some(*t),
+            TerminatorKind::If { cond, then, else_, .. } => {
+                let Some(c) = self.operand(cond) else { return };
+                self.push_block();
+                self.job_goto(*then, jb);
+                let tb = self.pop_block();
+                self.push_block();
+                self.job_goto(*else_, jb);
+                let eb = self.pop_block();
+                self.emit(ir::Stmt::If { cond: c, then: tb, else_: eb });
+                return;
+            }
+            TerminatorKind::Loop { body, .. } => Some(*body),
+            TerminatorKind::LoopBack(l) => loop_part(*l, |b, _, _| *b),
+            TerminatorKind::Break(l) => loop_part(*l, |_, _, m| *m),
+            TerminatorKind::Continue(l) => loop_part(*l, |_, c, _| *c),
+            TerminatorKind::Match { arms, merge } => Some(*arms.first().unwrap_or(merge)),
+            TerminatorKind::ArmMatched(m) => match &code.block(*m).term.kind {
+                TerminatorKind::Match { merge, .. } => Some(*merge),
+                _ => None,
+            },
+            TerminatorKind::ArmFailed { next, .. } => Some(*next),
+            TerminatorKind::Return(o) => {
+                let v = o.as_ref().and_then(|o| self.operand(o));
+                self.job_return(crate::job::DONE, 1, v, jb);
+                return;
+            }
+            TerminatorKind::Yield { resume } => {
+                // Each local back into the job, for its next `resume`.
+                for &(var, field, ty) in &jb.held {
+                    let v = self.load(ir::Place::local(var), ty);
+                    self.emit(ir::Stmt::Store(jb.job.with(ir::Proj::Field(field)), v));
+                }
+                self.job_return(resume.0, 0, None, jb);
+                return;
+            }
+            TerminatorKind::ReturnPlace(_) | TerminatorKind::Unreachable => None,
+        };
+        match to {
+            Some(t) => self.job_goto(t, jb),
+            None => self.emit(ir::Stmt::Trap),
+        }
+    }
+
+    /// On to block `t` of a job's body.
+    fn job_goto(&mut self, t: BlockId, jb: &JobBlocks) {
+        let c = self.u32c(t.0);
+        self.emit(ir::Stmt::Store(ir::Place::local(jb.next), c));
+        self.emit(ir::Stmt::Continue);
+    }
+
+    /// A job's `resume` returns: `at` stored in the job, and `Step`'s variant `variant`
+    /// (`Yielded` 0, `Done` 1, with its result `v`).
+    fn job_return(&mut self, at: u32, variant: u32, v: Option<ir::ValueId>, jb: &JobBlocks) {
+        let a = self.u32c(at);
+        self.emit(ir::Stmt::Store(jb.job.with(ir::Proj::Field(0)), a));
+        let payload = match (v, self.mb.m.types.field(jb.step, 1 + variant)) {
+            (Some(v), Some(pt)) => Some(self.value(pt, ir::Expr::Construct(pt, vec![v]))),
+            _ => None,
+        };
+        let s = self.value(jb.step, ir::Expr::Variant(jb.step, variant, payload));
+        self.emit(ir::Stmt::Return(Some(s)));
     }
 
     // ---- statements ------------------------------------------------------------------------
@@ -689,7 +912,10 @@ impl<'c, 'a> Fl<'c, 'a> {
             StatementKind::Eval(r) => {
                 let _ = self.rvalue(r, None, s.span);
             }
-            StatementKind::Bind { local, place, .. } if self.rebound.contains(local) => {
+            StatementKind::Bind { local, place, .. }
+                if self.rebound.contains(local)
+                    || (self.job && self.callable_of(place).is_none()) =>
+            {
                 self.bind_chosen(*local, place, s.span);
             }
             StatementKind::Bind { local, place, .. } => {
@@ -753,8 +979,27 @@ impl<'c, 'a> Fl<'c, 'a> {
                 let ty = self.local_ty(l);
                 let v = self.rvalue(r, Some(ty), span);
                 match kind {
-                    LocalKind::Temp => {
+                    LocalKind::Temp if !self.job => {
                         self.locals[l.index()] = v.map_or(Repr::Erased, Repr::Value);
+                    }
+                    LocalKind::TempProjection { .. } if self.job => {
+                        // A pointer or a run, kept in an IR local of its own.
+                        self.locals[l.index()] = match v {
+                            Some(v) if self.is_run(v) => {
+                                let var = self.local_of(&self.mir.local(l).name.clone(), v);
+                                Repr::Var(var)
+                            }
+                            Some(p) => {
+                                let pt = self.f.value_ty(p);
+                                let var = match self.locals[l.index()] {
+                                    Repr::Chosen(var, _) => var,
+                                    _ => self.new_local("chosen", pt),
+                                };
+                                self.emit(ir::Stmt::Store(ir::Place::local(var), p));
+                                Repr::Chosen(var, pt)
+                            }
+                            None => Repr::Erased,
+                        };
                     }
                     LocalKind::TempProjection { .. } => {
                         // What a projection-returning call returned: a pointer to its place,
@@ -932,6 +1177,20 @@ impl<'c, 'a> Fl<'c, 'a> {
                 ..
             }) => self.callable_of(p),
             _ => None,
+        }
+    }
+
+    /// A callable as this code calls it here: in a job's `resume`, a closure's captures found
+    /// again where it's called (its locals' places, and the pointers its projections hold, are
+    /// the same wherever it's made; the values in IR values aren't).
+    fn fresh(&mut self, r: Repr) -> Repr {
+        match r {
+            Repr::Callable(c @ Callable::Closure { .. }, _) if self.job => {
+                let Callable::Closure { owner, id } = &c else { unreachable!() };
+                let srcs = self.capture_sources(&owner.clone(), *id);
+                Repr::Callable(c, srcs)
+            }
+            r => r,
         }
     }
 
@@ -1893,6 +2152,8 @@ impl<'c, 'a> Fl<'c, 'a> {
                 self.builtin(*b, args, t, span)
             }
             mir::Callee::Clone => self.clone_arg(c.args.first()?),
+            mir::Callee::JobStart(f) => crate::job::start(self, *f, &c.args),
+            mir::Callee::JobResume(f) => crate::job::resume(self, *f, &c.args, span),
             mir::Callee::Value(_) => {
                 self.cx.err(Diagnostic::internal("a call of a stored value reached lowering"));
                 None
@@ -1903,7 +2164,8 @@ impl<'c, 'a> Fl<'c, 'a> {
                 {
                     return self.call_callable(&callable, &srcs, &c.args, span);
                 }
-                let Repr::Callable(callable, srcs) = self.locals[l.index()].clone() else {
+                let repr = self.fresh(self.locals[l.index()].clone());
+                let Repr::Callable(callable, srcs) = repr else {
                     // Its callable was given up on with an error (E0702); without one,
                     // dropping the call would be a silent miscompile.
                     if !wrela_diag::has_errors(&self.cx.diags) {
@@ -2002,7 +2264,8 @@ impl<'c, 'a> Fl<'c, 'a> {
         for (p, a) in def.params.iter().zip(args) {
             let pt = self.cx.concrete(p.ty, &subst);
             if let TyKind::FnPtr(..) = self.types().kind(pt) {
-                match self.callable_arg(a) {
+                let arg = self.callable_arg(a).map(|r| self.fresh(r));
+                match arg {
                     Some(Repr::Callable(callable, srcs)) => {
                         out.extend(self.capture_args(&srcs)?);
                         callables.push(Some(callable));

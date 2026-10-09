@@ -104,6 +104,7 @@ token_kinds! {
         Use = "use",
         Var = "var",
         While = "while",
+        Yield = "yield",
     }
     punct {
         StarStarEq = "**=",
@@ -184,6 +185,7 @@ impl TokenKind {
                 | Return
                 | Break
                 | Continue
+                | Yield
                 | RParen
                 | RBracket
                 | RBrace

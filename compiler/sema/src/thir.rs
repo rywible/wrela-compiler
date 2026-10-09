@@ -110,6 +110,10 @@ pub enum Callee {
     Value(Box<Expr>),
     /// `.clone()`: structural.
     Clone,
+    /// `f.start(...)`: a `Job<f>` holding the job's owned parameters (§6.18).
+    JobStart(FnId),
+    /// `job.resume(...)`: the job (`mut`), then the job's `borrow` and `mut` parameters.
+    JobResume(FnId),
 }
 
 #[derive(Clone, Debug)]
@@ -194,6 +198,8 @@ pub enum ExprKind {
     Return(Option<Box<Expr>>),
     Break,
     Continue,
+    /// `yield`, in a job's body: its work stops here for this frame (§6.18).
+    Yield,
     Dispatch(Box<Dispatch>),
     Draw(Box<Draw>),
     Error,
@@ -464,6 +470,7 @@ impl Expr {
             | ExprKind::FnRef(..)
             | ExprKind::Break
             | ExprKind::Continue
+            | ExprKind::Yield
             | ExprKind::FromBase
             | ExprKind::Error => {}
             ExprKind::Unary(_, x)

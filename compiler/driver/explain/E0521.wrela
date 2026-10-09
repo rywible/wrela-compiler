@@ -1,0 +1,36 @@
+// A projection or a loan live across a job's `yield`. A stopped job holds only owned values
+// (§6.18): each `resume` lends its `borrow` and `mut` parameters again, maybe from other
+// places, so a projection of one (or a closure that captures one) can't wait across a
+// `yield`. Use the parameter itself after the `yield`, or keep an owned copy.
+// ---- wrong
+struct Scratch {
+    rows: Vec<u32>,
+}
+
+@job
+fn fill(n: take u32, scratch: mut Scratch) -> u32 {
+    mut rows = scratch.rows
+    for i in 0..n {
+        rows.push(i)
+        yield
+    }
+    rows.len()
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+
+// ---- fixed
+struct Scratch {
+    rows: Vec<u32>,
+}
+
+@job
+fn fill(n: take u32, scratch: mut Scratch) -> u32 {
+    for i in 0..n {
+        scratch.rows.push(i)
+        yield
+    }
+    scratch.rows.len()
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

@@ -1,0 +1,43 @@
+// `yield` outside a job. `yield` ends a `@job fn`'s work for this frame (§6.18), in the job's
+// own body: not in an ordinary function, nor in a closure the job makes (a closure is called
+// where it's made, and can't stop the job).
+// ---- wrong
+fn count(n: u32) -> u32 {
+    var total = 0
+    for i in 0..n {
+        total += i
+        yield
+    }
+    total
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+
+// ---- fixed
+use std::job::{Job, Step}
+
+@job
+fn count(n: take u32) -> u32 {
+    var total = 0
+    for i in 0..n {
+        total += i
+        yield
+    }
+    total
+}
+
+struct State {
+    job: Job<count>,
+    total: u32,
+}
+
+pub fn init() -> State {
+    State { job: count.start(10), total: 0 }
+}
+
+pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
+    match s.job.resume() {
+        Step::Yielded => {},
+        Step::Done(t) => s.total = t,
+    }
+}

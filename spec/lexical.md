@@ -40,7 +40,7 @@ Error codes come from the lexical range E0001–E0099.
 
   ```
   as borrow break const continue dyn else enum false fn for if impl in let loop match mut package
-  pub return self Self struct take trait true type unsafe use var while
+  pub return self Self struct take trait true type unsafe use var while yield
   ```
 
   This is the final list: each word has a use. Type names (`f32`, `u32`, `vec3`, `bool`, …) and
@@ -113,8 +113,8 @@ Error codes come from the lexical range E0001–E0099.
 - **L17.** A line break produces a NEWLINE token only when all three hold:
   1. the innermost open bracket (L19), if there is one, is `{`, not `(` or `[`;
   2. the previous token can end a statement: an identifier, INT, FLOAT, SUFFIXED, STRING,
-     `true`, `false`, `self`, `Self`, `return`, `break`, `continue`, `)`, `]`, `}`, `>`, `>>` or
-     `?`;
+     `true`, `false`, `self`, `Self`, `return`, `break`, `continue`, `yield`, `)`, `]`, `}`, `>`,
+     `>>` or `?`;
   3. the next token is not `.` (the single dot; `..` and `..=` don't count).
 
   "Previous" and "next" skip comments and line breaks (L8). Otherwise the line break is

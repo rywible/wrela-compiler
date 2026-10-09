@@ -1,0 +1,28 @@
+// rejects: mem.jobs
+// Across a job's `yield`, nothing that holds a loan: not a projection of a parameter lent to
+// `resume` (the next one may lend another place), nor a closure that captures one. (The
+// parameter itself is lent again at each `resume`.)
+struct Scratch {
+    rows: Vec<u32>,
+    count: u32,
+}
+
+@job
+fn held(scratch: mut Scratch) -> u32 {
+    mut rows = scratch.rows
+    yield //~ E0521
+    rows.len()
+}
+
+@job
+fn captured(scratch: mut Scratch) -> u32 {
+    let bump = || {
+        scratch.count += 1
+    }
+    bump()
+    yield //~ E0521
+    bump()
+    scratch.count
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

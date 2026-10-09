@@ -471,6 +471,7 @@ impl AstWalker {
             ExprKind::Lit(_)
             | ExprKind::Break
             | ExprKind::Continue
+            | ExprKind::Yield
             | ExprKind::Error
             | ExprKind::Assign { .. } => {}
             ExprKind::Path(p) => self.path(p),

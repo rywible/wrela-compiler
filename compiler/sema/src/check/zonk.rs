@@ -31,6 +31,7 @@ pub fn walk_tys(e: &mut Expr, f: &mut impl FnMut(&mut TyId)) {
         | ExprKind::FromBase
         | ExprKind::Break
         | ExprKind::Continue
+        | ExprKind::Yield
         | ExprKind::Error => {}
         ExprKind::Unary(_, x)
         | ExprKind::Field(x, _)
@@ -539,7 +540,10 @@ impl Markers<'_> {
             // E0504); a built-in's or a closure's are checked here.
             ExprKind::Call(c) => {
                 let checked = match c.callee {
-                    Callee::Fn { .. } | Callee::TraitMethod { .. } => true,
+                    Callee::Fn { .. }
+                    | Callee::TraitMethod { .. }
+                    | Callee::JobStart(_)
+                    | Callee::JobResume(_) => true,
                     // A call through a local is checked against the modes its type gives.
                     Callee::Local(_) | Callee::Value(_) => true,
                     Callee::Builtin(_) | Callee::Clone => false,

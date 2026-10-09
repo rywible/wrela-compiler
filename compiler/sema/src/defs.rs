@@ -290,6 +290,8 @@ lang_items! {
     FragCoord = "std::gpu::FragCoord",
     ClipPosition = "std::gpu::ClipPosition",
     Flat = "std::gpu::Flat",
+    Job = "std::job::Job",
+    Step = "std::job::Step",
     Over = "std::gpu::Over",
     WithDepth = "std::gpu::WithDepth",
     Cull = "std::gpu::Cull",
@@ -667,6 +669,8 @@ pub struct FnAttrs {
     /// `@effects(...)` (std's unsafe core): effects it has that inference can't see, because
     /// another thread or the host decides them through memory (§8).
     pub effects: Vec<crate::effects::Effect>,
+    /// `@job`: a job, whose body runs over several frames, to each `yield` (§6.18).
+    pub job: Option<Span>,
 }
 
 /// What of the program a test runs before it (§10).
