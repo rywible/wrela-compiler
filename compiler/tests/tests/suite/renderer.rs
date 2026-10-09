@@ -378,11 +378,13 @@ fn press(key: &str) -> String {
 /// lowers its clock, so like is measured against like, and what's compared is whether the
 /// frame's other pieces change a piece's time.
 ///
-/// The gate is the native host's. In Chrome the wait goes through the GPU process, and the
-/// clock falls further and by more from run to run: the same pass 2% to 31% over its time alone
-/// in runs of the same build. (Chrome's serial mode had matched within 1% only while the next
-/// frame's passes could start before the last frame's were run, which kept the GPU busy, and
-/// could run a frame's commands out of order: no longer.) Chrome's are printed.
+/// In Chrome the wait goes through the GPU process, and the clock falls further and by more
+/// from run to run: the same pass 2% to 31% over its time alone in runs of the same build. So
+/// Chrome's are held to what the spec says of them: from 10% under to 40% over the piece alone,
+/// a serial mode that ran pieces side by side (under) or timed another's work in one (over)
+/// still caught. (Chrome's serial mode had matched within 1% only while the next frame's passes
+/// could start before the last frame's were run, which kept the GPU busy, and could run a
+/// frame's commands out of order: no longer.)
 #[test]
 #[ignore = "measure: needs Chrome, python3 and a GPU"]
 fn each_pass_times_as_it_does_alone_in_both_hosts() {
@@ -443,10 +445,16 @@ fn each_pass_times_as_it_does_alone_in_both_hosts() {
                 (s / a - 1.0) * 100.0
             );
             eprintln!("{line}");
-            report.push(((s / a - 1.0).abs() <= 0.10 || h == 1, line));
+            let ratio = s / a;
+            let within =
+                if h == 0 { (0.9..=1.1).contains(&ratio) } else { (0.9..=1.4).contains(&ratio) };
+            report.push((within, line));
         }
     }
     for (ok, line) in report {
-        assert!(ok, "over 10% from the piece alone: {line}");
+        assert!(
+            ok,
+            "outside the bound from the piece alone (natively 10%, in Chrome 10% under to 40% over): {line}"
+        );
     }
 }
