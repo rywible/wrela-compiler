@@ -12,8 +12,9 @@
 #                           `#[ignore]` reason starts `long:` (headless Chrome against the native
 #                           host, the clearing's camera path, soak runs, images against spike
 #                           01's), sharing the GPU; the grammar's 10^6 programs and 200,000 GBNF
-#                           samples; 20,000 fuzz cases from a new seed. About ten minutes: before
-#                           a branch is merged, in the background.
+#                           samples; 20,000 fuzz cases from a new seed; and two of the
+#                           measurements, in turn, reported but not gated. About ten minutes,
+#                           plus the two: before a branch is merged, in the background.
 #   tools/check.sh --full   also everything at full size, and the measurements: the long checks
 #                           with `WRELA_FULL`, every test at full size, the tests whose reason
 #                           starts `measure:` (time budgets and comparisons with spike 01) one at
@@ -229,6 +230,24 @@ if [ "$long" = 1 ]; then
   step "long: fuzz: $fuzz mutated programs of tiers 1 and 2, one worker per core (seed $seed)"
   WRELA_FUZZ_ITERS=$fuzz WRELA_FUZZ_TIERS=12 WRELA_FUZZ_SEED=$seed \
     cargo test -q --release -p wrela-tests --test suite fuzz::
+
+  # The measurements otherwise run only with --full, a milestone apart: two each long run, in
+  # turn by the seed, alone on the GPU as --full runs them, so one that no longer runs (an
+  # export it reads renamed, a budget long missed) shows between milestones. Reported, not
+  # gated: a time budget can miss on a busy machine.
+  if [ "$full" = 0 ] && [ "${#measures[@]}" -gt 1 ]; then
+    n=${#measures[@]}
+    picked=("${measures[$((seed % n))]}" "${measures[$(((seed + n / 2) % n))]}")
+    step "long: two of the $n measurements, in turn by the seed, reported, not gated"
+    for m in "${picked[@]}"; do
+      if out=$(cargo test -q --release --workspace -- --ignored --exact --test-threads=1 "$m" 2>&1); then
+        echo "  $m: passed"
+      else
+        echo "  $m: FAILED (reported, not gated): $(grep -m1 -E 'panicked at|^error' <<<"$out")"
+        echo "    alone: cargo test --release --workspace -- --ignored --exact --nocapture $m"
+      fi
+    done
+  fi
 fi
 
 if [ "$full" = 1 ]; then
