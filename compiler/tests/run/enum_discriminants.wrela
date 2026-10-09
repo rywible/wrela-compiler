@@ -1,6 +1,8 @@
 // run: a fieldless enum's variants are their discriminants, written or one past the variant's
 // before: `u32(e)` gives one, `E::from_u32(n)` reads one back, a `Flags` holds one a bit, and an
-// export takes the enum as its number (a number no variant has traps)
+// export takes the enum as its number (a number no variant has traps); generic code over
+// `T: Fieldless` reads one back with `T::from_u32`, and over `T: Packed` a word with `T::of_bits`;
+// a constant computed at build time holds a variant by its discriminant
 // expect: tag(0) = 0
 // expect: tag(2) = 7
 // expect: tag(3) = 8
@@ -13,6 +15,10 @@
 // expect: named(2) traps
 // expect: flags(30) = 1073741826
 // expect: flags(1) = 2
+// expect: generic(7) = 7
+// expect: generic(9) = 100
+// expect: packed(1027) = 515
+// expect: picked() = 30
 use std::collections::Flags
 
 enum Way: Copy + Eq + Fieldless {
@@ -58,4 +64,42 @@ pub fn named(w: Way) -> u32 {
 /// `w` and `Far`, as bits.
 pub fn flags(w: Way) -> u32 {
     Flags::none().with(w).with(Way::Far).bits()
+}
+
+/// `T::from_u32(n)` in code generic over `T`: its discriminant back, or 100 for none.
+fn decode<T: Copy + Fieldless>(n: u32) -> u32 {
+    match T::from_u32(n) {
+        Some(t) => u32(t),
+        None => 100,
+    }
+}
+
+pub fn generic(n: u32) -> u32 {
+    decode::<Way>(n)
+}
+
+struct Pair: Copy + Packed {
+    low: Bits<9>,
+    high: Bits<23>,
+}
+
+/// `T::of_bits(w)` in code generic over `T`, as a `Pair`: its high half, then its low.
+fn unpack<T: Packed>(w: u32) -> T {
+    T::of_bits(w)
+}
+
+pub fn packed(w: u32) -> u32 {
+    let p = unpack::<Pair>(w)
+    p.high * 256 + p.low
+}
+
+/// The variant a build-time computation chose: memory holds its discriminant, 30.
+fn pick() -> Way {
+    WAYS[4]
+}
+
+const PICKED: Way = pick()
+
+pub fn picked() -> u32 {
+    u32(PICKED)
 }

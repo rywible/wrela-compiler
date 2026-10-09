@@ -389,6 +389,9 @@ impl Fl<'_, '_> {
                     | L::DebugBuild
                     | L::TestBuild
                     | L::PackedFit
+                    | L::IsDiscriminant
+                    | L::OfDiscriminant
+                    | L::PackedOf
             );
         if !known {
             return None;
@@ -517,6 +520,57 @@ impl Fl<'_, '_> {
                     self.panic_if(big, "a value past its packed field's bits");
                     Some(v)
                 }
+            }
+            // What `Fieldless::from_u32` is made of (§3): whether `n` is the discriminant of one
+            // of `E`'s variants, and the variant it is (the last, for one that isn't: `from_u32`
+            // asks first).
+            Lang::IsDiscriminant | Lang::OfDiscriminant => {
+                let n = arg(self, 0)?;
+                let e = *substs.first()?;
+                let TyKind::Adt(a, _) = self.types().kind(e) else { return Some(None) };
+                let ds: Vec<u32> = (self.cx.checked.program.adt(*a).variants().iter())
+                    .map(|v| v.discriminant)
+                    .collect();
+                let b = self.mb.m.types.bool();
+                let is = |fl: &mut Self, d: u32| {
+                    let d = fl.u32c(d);
+                    fl.value(b, ir::Expr::Binary(ir::BinOp::Eq, n, d))
+                };
+                if lang == Lang::IsDiscriminant {
+                    // Discriminants 0 to N - 1 in order: one comparison.
+                    if ds.iter().enumerate().all(|(k, &d)| d == k as u32) {
+                        let len = self.u32c(ds.len() as u32);
+                        Some(self.value(b, ir::Expr::Binary(ir::BinOp::Lt, n, len)))
+                    } else {
+                        let mut any = self.konst(ir::Const::Bool(false));
+                        for &d in &ds {
+                            let c = is(self, d);
+                            any = self.value(b, ir::Expr::Binary(ir::BinOp::Or, any, c));
+                        }
+                        Some(any)
+                    }
+                } else {
+                    let et = self.cx.lower_ty(self.mb, e, span)?;
+                    let last = ds.len().checked_sub(1)? as u32;
+                    let out = self.new_local("variant", et);
+                    let v = self.value(et, ir::Expr::Variant(et, last, None));
+                    self.emit(ir::Stmt::Store(ir::Place::local(out), v));
+                    for (k, &d) in ds.iter().enumerate().take(last as usize) {
+                        let cond = is(self, d);
+                        self.push_block();
+                        let v = self.value(et, ir::Expr::Variant(et, k as u32, None));
+                        self.emit(ir::Stmt::Store(ir::Place::local(out), v));
+                        let then = self.pop_block();
+                        self.emit(ir::Stmt::If { cond, then, else_: Vec::new() });
+                    }
+                    Some(self.load(ir::Place::local(out), et))
+                }
+            }
+            // `packed_of::<P>(w)`: the `Packed` struct whose word `w` is, its one field (§3).
+            Lang::PackedOf => {
+                let w = arg(self, 0)?;
+                let t = self.cx.lower_ty(self.mb, *substs.first()?, span)?;
+                Some(self.value(t, ir::Expr::Construct(t, vec![w])))
             }
             Lang::MemAbort => {
                 // A trap that keeps the panic message a worker left.

@@ -120,14 +120,37 @@ pub trait GpuData {}
 
 /// An enum whose variants hold nothing: each is its discriminant, which `u32(e)` gives and
 /// `E::from_u32(n)` reads back (§3). Declared like `Copy`, and checked: no variant has fields.
-/// Generic code over one (`std::collections::Flags`) converts it as a concrete one does.
-pub trait Fieldless {}
+/// Generic code over one (`std::collections::Flags`) converts it as a concrete one does, both
+/// ways: `u32(t)` and `T::from_u32(n)`.
+pub trait Fieldless {
+    /// The variant whose discriminant `n` is, or `None`.
+    fn from_u32(n: u32) -> Option<Self> {
+        if is_discriminant::<Self>(n) { Some(of_discriminant::<Self>(n)) } else { None }
+    }
+}
+
+/// Whether `n` is the discriminant of one of `E`'s variants.
+@intrinsic
+fn is_discriminant<E: Fieldless>(n: u32) -> bool {}
+
+/// `E`'s variant whose discriminant `n` is (`is_discriminant::<E>(n)`).
+@intrinsic
+fn of_discriminant<E: Fieldless>(n: u32) -> E {}
 
 /// A struct packed into one `u32` (§3): each field a `Bits<N>`, the first in the low bits. A
 /// field reads as a `u32`, and takes one that fits its bits: one that doesn't traps on the CPU,
 /// and the GPU keeps its low bits, as its integers wrap. `u32(p)` is its word, and
 /// `T::of_bits(w)` the struct a word holds. Declared like `Copy`, and checked (E0407).
-pub trait Packed {}
+pub trait Packed {
+    /// The struct the word `w` holds.
+    fn of_bits(w: u32) -> Self {
+        packed_of::<Self>(w)
+    }
+}
+
+/// The `Packed` struct `P` whose word `w` is.
+@intrinsic
+fn packed_of<P: Packed>(w: u32) -> P {}
 
 /// `N` bits of a `Packed` struct's word: a field's width, 1 to 32 (§3).
 pub struct Bits<const N: u32> {}

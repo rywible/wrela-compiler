@@ -463,18 +463,12 @@ pub fn implements_builtin(p: &Program, ty: TyId, lang: Lang) -> bool {
 }
 
 fn implements_builtin_uncached(p: &Program, ty: TyId, lang: Lang) -> bool {
-    // A struct whose fields are its word's bits, which declares it.
-    if lang == Lang::Packed {
+    // A struct whose fields are its word's bits, or an enum whose variants hold nothing, which
+    // declares it; or a type parameter bounded by it (a trait's `Self` in its default methods).
+    if matches!(lang, Lang::Packed | Lang::Fieldless) {
         return match p.types.kind(ty) {
             TyKind::Error | TyKind::Never => true,
-            TyKind::Adt(a, _) => p.packed.contains_key(a),
-            _ => false,
-        };
-    }
-    // An enum whose variants hold nothing, which declares it.
-    if lang == Lang::Fieldless {
-        return match p.types.kind(ty) {
-            TyKind::Error | TyKind::Never => true,
+            TyKind::Adt(a, _) if lang == Lang::Packed => p.packed.contains_key(a),
             TyKind::Adt(a, _) => {
                 p.adt(*a).is_fieldless_enum() && implements_builtin_declared(p, *a, lang)
             }
