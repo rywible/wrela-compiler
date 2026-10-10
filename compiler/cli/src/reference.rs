@@ -2445,8 +2445,11 @@ mod tests {
 
     /// The ball again, as a sweep through a bent path, 5 sections of 2 bumps: each section a
     /// circle whose centre is off the path where the path bends away. Fitted, built and
-    /// measured, it's the ball within 1.5 mm on average (0.7 mm when written), nothing to see
-    /// through.
+    /// measured, it's the ball within 1.5 mm on average, nothing to see through. A circle's
+    /// bumps have no best place, so where the fit puts them turns on the last bits of the
+    /// arithmetic, which differ between machines: radii nudged by 1e-15 of themselves give a
+    /// mean of 0.84 to 1.02 mm, and 81% to 85% of points within 2 mm. The bars are below that
+    /// spread.
     #[test]
     fn a_sphere_s_sweep_replica_builds_and_matches() {
         let (dir, file, solid) = ball(
@@ -2463,10 +2466,12 @@ mod tests {
         let engine = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../engine");
         write_package(&file, &sampled, &out, &engine).unwrap();
         let source = std::fs::read_to_string(out.join("replica.wrela")).unwrap();
-        assert!(source.contains("sweep(") && source.contains("section(up:"), "{source}");
+        // A section's numbers go on lines of their own when they don't fit on one.
+        let compact: String = source.split_whitespace().collect();
+        assert!(compact.contains("sweep(") && compact.contains("section(up:"), "{source}");
         let report = deviation(&file, &solid, &out, 2000).unwrap();
         let Stats { mean, within_2mm, .. } = report.stats(None);
-        assert!(mean < 0.0015 && within_2mm > 0.85, "mean {mean}, within 2 mm {within_2mm}");
+        assert!(mean < 0.0015 && within_2mm > 0.78, "mean {mean}, within 2 mm {within_2mm}");
         assert_eq!(report.see_through.iter().filter(|r| r.inside).count(), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
