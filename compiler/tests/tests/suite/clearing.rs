@@ -2065,8 +2065,14 @@ fn the_walking_creature_leaves_no_trail() {
         }
         out
     };
-    let with = run("clearing-ghost-a", true);
-    let without = run("clearing-ghost-b", false);
+    // The two runs at once: on a GPU of the CPU (lavapipe), a run keeps about one core busy.
+    let (with, without) = std::thread::scope(|s| {
+        let without = s.spawn(|| run("clearing-ghost-b", false));
+        (
+            run("clearing-ghost-a", true),
+            without.join().unwrap_or_else(|p| std::panic::resume_unwind(p)),
+        )
+    });
     let mut longest = 0.0f64;
     for (k, ((a, tags, recent), (b, _, _))) in with.iter().zip(&without).enumerate() {
         let is = |i: usize| class(tags[i]) == CREATURE;
