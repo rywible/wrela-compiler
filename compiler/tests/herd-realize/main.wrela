@@ -4,10 +4,13 @@
 // the quads' count and items, the draw's and the skin pass's arguments, the holes and the
 // tally) and times the passes.
 
-use engine::creature::{ALL, Parts}
+use engine::creature::{ALL, Creature, Parts, Skeleton, creature}
+use engine::stone::Rock
 use engine::realize::{Grid, Mesh, Room, Scratch, record, record_cull, record_finish, record_slice}
 use herd::grazer::{FALLOFF, Grazer, field_of, grazer}
 use herd::herd::HERD
+use std::derive::Box3
+use std::field::cuboid
 use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch, write}
 
 pub struct Game {
@@ -141,6 +144,45 @@ pub fn realize(game: mut Game, s: u32, cell: f32) {
 pub fn realize_sliced(game: mut Game, s: u32, cell: f32, slices: u32) {
     let (g, grid) = prepare(mut game, s, cell)
     let field = g.field()
+    record_cull(field, grid, mut game.scratch, mut game.mesh)
+    for k in 0..slices {
+        record_slice(
+            field,
+            grid,
+            slice: k,
+            slices: slices,
+            scratch: mut game.scratch,
+            mesh: mut game.mesh,
+        )
+    }
+    record_finish(field, grid, FALLOFF, mut game.scratch, mut game.mesh)
+}
+
+/// A slab 7.5 m square and 3 cm thick, a creature of one bone (at its centre).
+fn slab() -> Creature<Rock> {
+    var s = Skeleton::new()
+    let root = s.root("slab", vec3(0.0))
+    let half = vec3(3.75, 3.75, 0.015)
+    // Its box grown by half a cell at 1 cm, so its faces lie halfway between the lattice's planes.
+    creature(s)
+        .part(root, cuboid(half).with_at(|p| Rock { albedo: vec3(0.5) }))
+        .bounded(Box3 { lo: -half - vec3(5mm), hi: half + vec3(5mm) })
+}
+
+/// The slab realized at 1 cm: its faces cross more live blocks (about 70,000) than WebGPU
+/// dispatches workgroups along x (65,535), so the passes over them go in chunks. Whole, or
+/// (`slices` > 0) as a `Realizer` spreads it over frames, into a mesh of its own with room for
+/// 1.25 million vertices and quads: the mesh's buffers are the newest.
+pub fn realize_slab(game: mut Game, slices: u32) {
+    let slab = slab()
+    let grid = Grid::around(slab.bounds(), 1cm)
+    game.scratch.fit(grid.blocks)
+    game.mesh = Mesh::new(Room { vertices: 1250000, quads: 1250000 })
+    let field = slab.field()
+    if slices == 0 {
+        record(field, grid, FALLOFF, mut game.scratch, mut game.mesh)
+        return
+    }
     record_cull(field, grid, mut game.scratch, mut game.mesh)
     for k in 0..slices {
         record_slice(

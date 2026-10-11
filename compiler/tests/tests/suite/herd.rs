@@ -448,6 +448,47 @@ fn a_realization_in_slices_is_the_whole_ones() {
     }
 }
 
+/// More live blocks than WebGPU dispatches workgroups along x (65,535): herd-realize's slab,
+/// 750 × 750 × 3 cells, about 70,000 live blocks. Its passes go in chunks, so its mesh is whole:
+/// a quad for each lattice edge its faces cross (2 × 750² + 4 × 750 × 3), no holes, and the same
+/// triangles in 2 slices (the second past 65,535 blocks on its own). It can't be smaller.
+#[test]
+#[ignore = "long: realizes a 7.5 m slab at 1 cm, past 65,535 live blocks"]
+fn a_realization_past_65535_live_blocks_is_whole() {
+    let mut host = wrela_host::Host::load(crate::built("herd-realize")).expect("load");
+    let realize = |host: &mut wrela_host::Host, slices: i32| {
+        host.call_export("realize_slab", &[Value::I32(slices)]).expect("realize_slab");
+        let b = host.buffers();
+        let mesh = b[b.len() - MESH_BUFFERS..].to_vec();
+        read_mesh(host, &mesh)
+    };
+    let whole = realize(&mut host, 0);
+    let quads = 2 * 750 * 750 + 4 * 750 * 3;
+    assert!(whole.live > 65_535, "only {} live blocks", whole.live);
+    assert_eq!((whole.tris, whole.holes, whole.flags), (2 * quads, 0, 0));
+    let corners = |o: &Ours| {
+        let mut t: Vec<[[u32; 3]; 3]> = o
+            .mesh
+            .tris
+            .iter()
+            .map(|&t| {
+                let c = o.mesh.corners(t).map(|p| p.map(f32::to_bits));
+                let k = (0..3).min_by_key(|&k| c[k]).expect("a corner");
+                [c[k], c[(k + 1) % 3], c[(k + 2) % 3]]
+            })
+            .collect();
+        t.sort();
+        t
+    };
+    let sliced = realize(&mut host, 2);
+    assert_eq!(
+        (sliced.live, sliced.tris, sliced.holes, sliced.flags),
+        (whole.live, whole.tris, whole.holes, whole.flags)
+    );
+    assert!(corners(&sliced) == corners(&whole), "the triangles differ in 2 slices");
+    eprintln!("{} live blocks, {} triangles", whole.live, whole.tris);
+}
+
 /// Ours at `cell`, as the spike's harness runs it: the room calibrated on the largest grid (a
 /// quarter more, and 1,024 to spare), then the 40 back to back, twice; the second run's counts
 /// and meshes, each grazer's GPU time (its five dispatches), ms, and each dispatch's, a grazer's

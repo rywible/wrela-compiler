@@ -77,9 +77,9 @@ fn sketch_02_draws_the_grazer_in_both_hosts() {
 }
 
 /// Sketch 02 §5: a herd shares its pipelines. The program draws two grazers of two seeds: one
-/// type, so each entry point has one instantiation (6 pipelines: realization's five passes, its
-/// skin weights one of them, and the draw's two shaders in one), and the seeds' numbers travel
-/// as uniforms. Without a GPU.
+/// type, so each entry point has one instantiation (7 pipelines: realization's five passes, its
+/// skin weights one of them, the group counts of a pass past 65,535 live blocks, and the draw's
+/// two shaders in one), and the seeds' numbers travel as uniforms. Without a GPU.
 #[test]
 fn sketch_02s_herd_shares_its_pipelines() {
     let out =
@@ -91,7 +91,7 @@ fn sketch_02s_herd_shares_its_pipelines() {
         names.len(),
         names.iter().map(|n| n.split("::").next().unwrap_or("")).collect::<Vec<_>>().join(", ")
     );
-    assert_eq!(out.pipelines.len(), 6, "{names:#?}");
+    assert_eq!(out.pipelines.len(), 7, "{names:#?}");
     let draws = out.pipelines.iter().find(|p| p.names.contains(&"skin".to_string())).expect("skin");
     assert_eq!(draws.sites.len(), 1, "drawn from one site: {:?}", draws.sites);
 }
