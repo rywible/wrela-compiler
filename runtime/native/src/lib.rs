@@ -398,7 +398,7 @@ impl Host {
         }
         program.hand_over_here();
         self.program = Some(program);
-        self.wasm_hash = build.wasm_hash;
+        self.build = build;
         self.dir = dir.to_path_buf();
         self.options = options.clone();
         Ok(())
