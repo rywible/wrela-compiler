@@ -133,3 +133,15 @@ fn many_stray_closers_and_split_tokens_parse_quickly() {
     assert_eq!(body.stmts.len(), 2 * n);
     fn_named(&p.file, "last");
 }
+
+#[test]
+fn print_fix_keeps_a_leading_bom_first() {
+    let src = "\u{feff}fn f() { println!(\"hello\") }\n";
+    let p = parse(FileId(0), src);
+    let d = p.diagnostics.iter().find(|d| d.code.as_str() == "E0115").expect("macro error");
+    let fix = &d.fixes[0];
+    assert_eq!(fix.edits[0].span.start, 3);
+    let fixed = wrela_diag::apply_edits(src, &fix.edits);
+    assert!(fixed.starts_with("\u{feff}use std::io::print"));
+    assert!(!parse(FileId(0), &fixed).has_errors());
+}

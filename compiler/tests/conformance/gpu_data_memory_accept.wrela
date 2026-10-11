@@ -1,0 +1,40 @@
+// accepts: gpu.data
+// Enums use the CPU's layout in GPU memory. A payload can be changed through a computed index,
+// and a fieldless enum can itself be copied as a payload.
+use std::gpu::{GlobalId, Slots, buffer, dispatch}
+
+enum Flag: Copy + GpuData + Fieldless {
+    Off,
+    On,
+}
+
+enum Payload: Copy + GpuData {
+    Values([f32; 4]),
+    Flag(Flag),
+}
+
+@compute(1)
+fn update(out: mut Slots<Payload>, id: GlobalId) {
+    var value = Payload::Values([1.0, 2.0, 3.0, 4.0])
+    match mut value {
+        Payload::Values(xs) => xs[id.x % 4] += 1.0,
+        _ => {},
+    }
+    out[id] = value
+}
+
+@compute(1)
+fn copy_flag(out: mut Slots<Flag>, id: GlobalId) {
+    let value = Payload::Flag(Flag::On)
+    out[id] = match value {
+        Payload::Flag(flag) => flag,
+        _ => Flag::Off,
+    }
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    var values = buffer(1)
+    var flags = buffer(1)
+    dispatch(update.bind(out: mut values), groups: 1)
+    dispatch(copy_flag.bind(out: mut flags), groups: 1)
+}

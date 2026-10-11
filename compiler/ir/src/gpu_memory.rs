@@ -4,10 +4,10 @@
 //!
 //! - a `bool` in a buffer, or a member of a type memory holds (a struct's field, an enum's
 //!   payload, an array's element), as a `u32`, 0 or 1: the 4 bytes the CPU holds for one;
-//! - an enum that memory holds as its `u32` tag and its payload's words:
-//!   `struct { tag: u32, words: array<W, K> }`, `W` a `u32`, `vec2<u32>` or `vec4<u32>` as the
-//!   enum is aligned, which WGSL lays out as the CPU lays out the enum. Building a variant writes
-//!   its payload's words (bit casts); reading a payload reads them back.
+//! - an enum that memory holds as a struct with its `u32` tag and, when it has payloads, their
+//!   words: `struct { tag: u32, words: array<W, K> }`, `W` a `u32`, `vec2<u32>` or `vec4<u32>`
+//!   as the enum is aligned, which WGSL lays out as the CPU lays out the enum. Building a variant
+//!   writes its payload's words (bit casts); reading a payload reads them back.
 //!
 //! The types memory holds are those in the type of a buffer, a uniform block or workgroup
 //! memory, at any depth; code uses them as memory holds them, wherever it holds them. Other
@@ -108,13 +108,13 @@ impl TypeMap {
             return s;
         }
         let s = match types.get(t).clone() {
-            TypeDef::Enum { name, .. } if self.words.contains(&t) => {
-                let words = words_shape(types, t).array;
+            TypeDef::Enum { name, .. } if self.memory.contains(&t) => {
                 let tag = types.u32();
-                types.intern(TypeDef::Struct {
-                    name,
-                    fields: vec![("tag".into(), tag), ("words".into(), words)],
-                })
+                let mut fields = vec![("tag".into(), tag)];
+                if self.words.contains(&t) {
+                    fields.push(("words".into(), words_shape(types, t).array));
+                }
+                types.intern(TypeDef::Struct { name, fields })
             }
             TypeDef::Struct { name, fields } => {
                 let fields = fields.into_iter().map(|(n, f)| (n, self.part(types, t, f))).collect();
@@ -528,6 +528,12 @@ impl Rewriter<'_> {
                 Expr::Construct(self.stored(t), xs)
             }
             Expr::Variant(t, v, payload) if self.is_words(t) => self.variant(t, v, payload, out),
+            Expr::Variant(t, v, None) if self.tm.memory.contains(&t) => {
+                let st = self.stored(t);
+                let tag = self.m.types.tag(t, v);
+                let tag = self.u32_const(out, tag);
+                Expr::Construct(st, vec![tag])
+            }
             Expr::Variant(t, v, payload) => {
                 let payload = payload.map(|x| {
                     if self.tm.bool_member(&self.m.types, t, v + 1) {
@@ -567,15 +573,29 @@ impl Rewriter<'_> {
     /// `Store(p, x)`, writing what memory holds as this pass lays it out.
     fn store(&mut self, p: Place, x: ValueId, out: &mut Block) -> Result<()> {
         if let Some((ep, et, v, rest)) = self.through_payload(&p) {
-            let Some((offset, t)) = self.payload_part(et, v, &rest) else {
-                return Err(Error::internal(
-                    "GPU code writes an enum's payload in memory at an index it computes",
-                ));
-            };
-            let st = self.stored(t);
             let words = Words::Place(ep);
+            let (value, st, offset) = if let Some((offset, t)) = self.payload_part(et, v, &rest) {
+                (x, self.stored(t), offset)
+            } else {
+                // The word offset of a computed index isn't known while compiling. Decode the
+                // payload into a temporary, make the original store there, then write all of
+                // its words back. This also lets `store` convert a bool member or recursively
+                // update a nested enum payload.
+                let pt = self.m.types.field(et, v + 1).expect("the variant has a payload");
+                let spt = self.stored(pt);
+                let whole = self.decode(&words, et, spt, 0, out)?;
+                let whole = self.val(out, spt, whole);
+                let local = self.f.new_local("enum_payload", pt);
+                let root = Place { root: PlaceRoot::Local(local), path: Vec::new() };
+                out.push(Stmt::Store(root.clone(), whole));
+                let mut part = root.clone();
+                part.path = rest;
+                self.store(part, x, out)?;
+                let updated = self.val(out, spt, Expr::Load(root));
+                (updated, spt, 0)
+            };
             let mut encoded = Vec::new();
-            self.encode(x, st, offset, out, &mut encoded);
+            self.encode(value, st, offset, out, &mut encoded);
             for (i, w) in encoded {
                 let Expr::Load(wp) = self.word(&words, et, i, out) else {
                     unreachable!("a place's word is a load")

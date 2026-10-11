@@ -48,6 +48,8 @@ enum Shape: Copy + GpuData {
     Box { half: vec3, round: f32 },
     Tag(bool),
     Pair(i32, u32),
+    Series([f32; 3]),
+    Direction(Way),
 }
 
 /// Where an item is: a variant's discriminant is its tag, on both (`Hidden`'s is 30).
@@ -75,12 +77,14 @@ struct Item: Copy + GpuData {
 }
 
 fn item(i: u32) -> Item {
-    let shape = match i % 5 {
+    let shape = match i % 7 {
         0 => Shape::Empty,
         1 => Shape::Ball(f32(i) * 0.5),
         2 => Shape::Box { half: vec3(f32(i), 1.0, -2.0), round: 0.25 },
         3 => Shape::Tag(i % 2 == 1),
-        _ => Shape::Pair(-i32(i), i * 3),
+        4 => Shape::Pair(-i32(i), i * 3),
+        5 => Shape::Series([f32(i), 2.0, 3.0]),
+        _ => Shape::Direction(Way::Hidden),
     }
     let way = match i % 3 {
         0 => Way::Near,
@@ -103,6 +107,7 @@ fn tweak(it: mut Item) {
         Shape::Ball(r) => r += 1.0,
         Shape::Box { half, round } => half.y = round * 4.0,
         Shape::Pair(_, b) => b += 1,
+        Shape::Series(xs) => xs[it.id % 3] += 1.0,
         _ => {},
     }
 }
@@ -121,11 +126,22 @@ fn measure(it: Item) -> u32 {
         },
         Shape::Tag(b) => if b { 2 } else { 3 },
         Shape::Pair(a, b) => u32(a) ^ (b << 4),
+        Shape::Series(xs) => bitcast_u32(xs[it.id % 3]),
+        Shape::Direction(way) => u32(way),
     }
     let far: u32 = if it.seen.has(Way::Far) { 1 } else { 0 }
-    let cell = it.cell.vertex ^ (it.cell.signs << 3) ^ u32(it.cell) ^ bitcast_u32(it.sh[2].w) ^
+    let cell = it.cell.vertex ^
+        (it.cell.signs << 3) ^
+        u32(it.cell) ^
+        bitcast_u32(it.sh[2].w) ^
         bitcast_u32(it.sh[it.id % 3].x)
-    m ^ (u32(it.on) << 31) ^ (it.id << 20) ^ (u32(it.way) << 8) ^ it.seen.bits() ^ (far << 14) ^ cell
+    m ^
+        (u32(it.on) << 31) ^
+        (it.id << 20) ^
+        (u32(it.way) << 8) ^
+        it.seen.bits() ^
+        (far << 14) ^
+        cell
 }
 
 @compute(64)
@@ -136,6 +152,18 @@ fn items_on_gpu(out: mut Slots<Item>, id: GlobalId) {
 @compute(64)
 fn measure_on_gpu(items: [Item], out: mut Slots<u32>, id: GlobalId) {
     out[id] = measure(items[id.x])
+}
+
+fn direction(shape: Shape) -> Way {
+    match shape {
+        Shape::Direction(way) => way,
+        _ => Way::Near,
+    }
+}
+
+@compute(64)
+fn directions_on_gpu(items: [Item], out: mut Slots<Way>, id: GlobalId) {
+    out[id] = direction(items[id.x].shape)
 }
 
 @compute(64)
@@ -167,6 +195,8 @@ pub struct Game {
     items_gpu: GpuBuffer<Item>,
     measures_cpu: GpuBuffer<u32>,
     measures_gpu: GpuBuffer<u32>,
+    directions_cpu: GpuBuffer<Way>,
+    directions_gpu: GpuBuffer<Way>,
     done: bool,
 }
 
@@ -183,6 +213,8 @@ pub fn init() -> Game {
         items_gpu: buffer(N),
         measures_cpu: buffer(N),
         measures_gpu: buffer(N),
+        directions_cpu: buffer(N),
+        directions_gpu: buffer(N),
         done: false,
     }
 }
@@ -207,6 +239,11 @@ pub fn frame(game: mut Game, time: f32, width: u32, height: u32) {
     write(mut game.measures_cpu, 0, Vec::from_fn(N, |i| measure(item(i))))
     dispatch(
         measure_on_gpu.bind(items: game.items_cpu, out: mut game.measures_gpu),
+        groups: N / 64,
+    )
+    write(mut game.directions_cpu, 0, Vec::from_fn(N, |i| direction(item(i).shape)))
+    dispatch(
+        directions_on_gpu.bind(items: game.items_cpu, out: mut game.directions_gpu),
         groups: N / 64,
     )
     game.done = true

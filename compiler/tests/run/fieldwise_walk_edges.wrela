@@ -1,0 +1,61 @@
+// run: a fieldwise walk that returns visits the first element in its written order, an empty
+// array reaches the code after it, and a closure elsewhere in the method remains callable
+// expect: returning_walks() = true
+// expect: empty_walks() = true
+// expect: closure_outside_walk() = 6
+
+@fieldwise
+trait WalkValue {
+    fn first_or(self, fallback: u32) -> u32 {
+        for item in fields(self) {
+            return item.first_or(fallback)
+        }
+        fallback
+    }
+
+    fn last_or(self, fallback: u32) -> u32 {
+        for item in fields(self).rev() {
+            return item.last_or(fallback)
+        }
+        fallback
+    }
+
+    fn sum_with_closure(self) -> u32 {
+        let one = || 1
+        let wrapped = (one,)
+        var sum = 0
+        for item in fields(self) {
+            sum += item.sum_with_closure()
+        }
+        sum + (wrapped.0)()
+    }
+}
+
+impl WalkValue for u32 {
+    fn first_or(self, fallback: u32) -> u32 {
+        self
+    }
+
+    fn last_or(self, fallback: u32) -> u32 {
+        self
+    }
+
+    fn sum_with_closure(self) -> u32 {
+        self
+    }
+}
+
+pub fn returning_walks() -> bool {
+    let values: [u32; 2] = [10, 20]
+    values.first_or(99) == 10 && values.last_or(99) == 20
+}
+
+pub fn empty_walks() -> bool {
+    let values: [u32; 0] = [0; 0]
+    values.first_or(98) == 98 && values.last_or(99) == 99
+}
+
+pub fn closure_outside_walk() -> u32 {
+    let values: (u32, u32) = (2, 3)
+    values.sum_with_closure()
+}

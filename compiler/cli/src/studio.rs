@@ -142,11 +142,15 @@ fn compare(
         _ => {
             let Some((literal, values)) = plain.split_first() else { return crate::usage() };
             let (Ok(literal), Ok(values)) = (
-                literal.parse::<u32>(),
+                literal.parse::<i32>(),
                 values.iter().map(|v| v.parse::<f32>()).collect::<Result<Vec<_>, _>>(),
             ) else {
                 return crate::usage();
             };
+            if literal < 0 || values.iter().any(|v| !v.is_finite()) {
+                return crate::usage();
+            }
+            let literal = literal as u32;
             finish(crate::compare::sweep(pkg, page, n, literal, &values, facing, &png))
         }
     }
@@ -402,19 +406,21 @@ fn parse_action<'a>(
     }
     let mut literals = Vec::new();
     for a in named {
-        match a.parse::<u32>() {
-            Ok(n) => literals.push(Value::I32(n as i32)),
-            Err(_) => {
-                eprintln!("error: `{a}` isn't a literal's index");
-                return Err(ExitCode::from(2));
-            }
+        let Ok(n) = a.parse::<i32>() else {
+            eprintln!("error: `{a}` isn't a literal's index");
+            return Err(ExitCode::from(2));
+        };
+        if n < 0 {
+            eprintln!("error: `{a}` isn't a literal's index");
+            return Err(ExitCode::from(2));
         }
+        literals.push(Value::I32(n));
     }
     let mut values = Vec::new();
     for (a, k) in args.iter().zip(kinds.chars()) {
         let v = match k {
-            'u' => a.parse::<u32>().ok().map(|n| Value::I32(n as i32)),
-            _ => a.parse::<f32>().ok().map(Value::F32),
+            'u' => a.parse::<i32>().ok().filter(|n| *n >= 0).map(Value::I32),
+            _ => a.parse::<f32>().ok().filter(|n| n.is_finite()).map(Value::F32),
         };
         let Some(v) = v else {
             eprintln!("error: `{a}` isn't a number");
@@ -478,4 +484,29 @@ fn session(
         lens.print_logs();
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn action_arguments_fit_the_values_the_host_receives() {
+        for value in ["2147483648", "4294967295", "-1"] {
+            assert!(
+                parse_action(studio::ACTIONS, "view", &[value.into()]).is_err(),
+                "accepted {value}"
+            );
+            let args = ["0", "0", "0", "0", "0", "0", value].map(String::from);
+            assert!(
+                parse_action(studio::ACTIONS, "move", &args).is_err(),
+                "accepted literal {value}"
+            );
+        }
+        for value in ["nan", "inf", "-inf"] {
+            let args = [value, "0", "0", "0"].map(String::from);
+            assert!(parse_action(studio::ACTIONS, "zoom", &args).is_err(), "accepted {value}");
+        }
+        assert!(parse_action(studio::ACTIONS, "view", &["2147483647".into()]).is_ok());
+    }
 }

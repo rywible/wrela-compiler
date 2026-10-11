@@ -382,7 +382,7 @@ impl<'p> Checker<'p> {
     /// both are decimals, as every unit in std is, the product is exact and rounded once to
     /// each float type, so `15cm` is `0.15`, as an `f32` and as an `f64`. Otherwise it's worked
     /// out in `f64` and rounded once to an `f32`.
-    fn check_suffixed(&mut self, lit: &ast::Lit, expected: Option<TyId>) -> Expr {
+    pub(super) fn check_suffixed(&mut self, lit: &ast::Lit, expected: Option<TyId>) -> Expr {
         let span = lit.span;
         let (digits, suffix) = wrela_syntax::lexer::split_suffix(&lit.text);
         let Some(&c) = self.p.units.get(suffix) else {
@@ -487,6 +487,13 @@ impl<'p> Checker<'p> {
                 ));
                 return None;
             }
+            if segs[0].generics.is_some() {
+                self.err(Diagnostic::new(
+                    codes::E0322,
+                    first.span,
+                    format!("`{}` takes no generic arguments", first.name),
+                ));
+            }
             let base = if first.name == "Self" {
                 match self.scope.self_ty {
                     Some(t) => t,
@@ -501,6 +508,14 @@ impl<'p> Checker<'p> {
                 }
             } else {
                 let Some(p) = param else { unreachable!("checked above") };
+                if self.p.param(p).is_const {
+                    self.err(Diagnostic::new(
+                        codes::E0212,
+                        first.span,
+                        format!("`{}` is a constant parameter, not a type", first.name),
+                    ));
+                    return None;
+                }
                 self.p.types.param(p)
             };
             return Some(ValueRes::TypeRelative(base, segs[1].ident.clone()));
@@ -517,9 +532,24 @@ impl<'p> Checker<'p> {
                 {
                     match r {
                         Res::Adt(a) => {
-                            let n = self.p.adt(a).generics.len();
+                            let params = self.p.adt(a).generics.clone();
+                            let n = params.len();
                             let args: Vec<TyId> = match &segs[segs.len() - 2].generics {
-                                Some(g) => g.iter().map(|t| self.resolve_type(t)).collect(),
+                                Some(g) if g.len() == n => g
+                                    .iter()
+                                    .zip(&params)
+                                    .map(|(t, &param)| self.resolve_generic_arg(t, param))
+                                    .collect(),
+                                Some(g) => {
+                                    let name = &self.p.adt(a).name;
+                                    self.err(resolve::wrong_generic_count(
+                                        path.span,
+                                        name,
+                                        n,
+                                        g.len(),
+                                    ));
+                                    (0..n).map(|_| self.p.types.error).collect()
+                                }
                                 None => (0..n)
                                     .map(|_| self.new_var(VarKind::General, path.span))
                                     .collect(),
@@ -548,9 +578,15 @@ impl<'p> Checker<'p> {
                 Expr { ty: self.locals[l.index()].ty, span, kind: ExprKind::Local(l) }
             }
             ValueRes::ConstParam(g) => {
+                if self.reject_const_path_generics(path) {
+                    return self.error_expr(span);
+                }
                 Expr { ty: self.p.types.u32, span, kind: ExprKind::ConstParam(g) }
             }
             ValueRes::Item(Res::Const(c)) => {
+                if self.reject_const_path_generics(path) {
+                    return self.error_expr(span);
+                }
                 self.p.note_const_use(c);
                 Expr { ty: self.const_ty(c), span, kind: ExprKind::Const(c) }
             }
@@ -744,6 +780,18 @@ impl<'p> Checker<'p> {
         }
     }
 
+    /// Constants and const parameters take no generic arguments; module resolution otherwise
+    /// deliberately ignores the generic syntax attached to path segments.
+    fn reject_const_path_generics(&mut self, path: &ast::Path) -> bool {
+        let Some(seg) = path.segments.iter().find(|s| s.generics.is_some()) else { return false };
+        self.err(Diagnostic::new(
+            codes::E0322,
+            seg.ident.span,
+            format!("`{}` takes no generic arguments", seg.ident.name),
+        ));
+        true
+    }
+
     /// Whether a type has an inherent associated function or method of this name.
     pub(crate) fn has_associated_fn(&self, a: AdtId, name: &str) -> bool {
         self.p.inherent_method(a, name).is_some()
@@ -758,10 +806,15 @@ impl<'p> Checker<'p> {
         expected: Option<TyId>,
         span: Span,
     ) -> Vec<TyId> {
-        let n = self.p.adt(a).generics.len();
+        let params = self.p.adt(a).generics.clone();
+        let n = params.len();
         let explicit = path.segments.iter().rev().find_map(|s| s.generics.as_deref());
         let args: Vec<TyId> = match explicit {
-            Some(g) if g.len() == n => g.iter().map(|t| self.resolve_type(t)).collect(),
+            Some(g) if g.len() == n => g
+                .iter()
+                .zip(&params)
+                .map(|(t, &param)| self.resolve_generic_arg(t, param))
+                .collect(),
             Some(g) => {
                 let name = &self.p.adt(a).name;
                 self.err(resolve::wrong_generic_count(span, name, n, g.len()));
@@ -816,7 +869,7 @@ impl<'p> Checker<'p> {
                 self.err(resolve::wrong_generic_count(span, name, declared.len(), g.len()));
             } else {
                 for (q, t) in declared.iter().zip(g) {
-                    let ty = self.resolve_type(t);
+                    let ty = self.resolve_generic_arg(t, *q);
                     if let Some(i) = params.iter().position(|x| x == q) {
                         given[i] = Some(ty);
                     }
@@ -1753,9 +1806,11 @@ impl<'p> Checker<'p> {
         let (generics, ty) = (def.generics.clone(), def.ty);
         let given = path.segments.last().and_then(|s| s.generics.as_deref());
         let args: Vec<TyId> = match given {
-            Some(g) if g.len() == generics.len() => {
-                g.iter().map(|t| self.resolve_type(t)).collect()
-            }
+            Some(g) if g.len() == generics.len() => g
+                .iter()
+                .zip(&generics)
+                .map(|(t, &param)| self.resolve_generic_arg(t, param))
+                .collect(),
             Some(g) => {
                 let name = self.p.aliases[al.index()].name.clone();
                 self.err(resolve::wrong_generic_count(span, &name, generics.len(), g.len()));
@@ -2046,7 +2101,10 @@ impl<'p> Checker<'p> {
                 self.err(d);
                 continue;
             };
-            if self.field_hidden(adt_mod, &decls[i]) && variant.is_none() {
+            // An unmarked enum payload inherits its enum's visibility. `pub(package)` can
+            // explicitly narrow one field of a public enum.
+            if self.field_hidden(adt_mod, &decls[i]) && (variant.is_none() || decls[i].package_only)
+            {
                 self.err(
                     Diagnostic::new(
                         codes::E0210,

@@ -35,3 +35,17 @@ fn builtins(x: f32) -> f32 {
     let b = f32::<i32>(2) //~ E0322
     a + b
 }
+
+const N: u32 = 3
+
+fn const_arguments_are_not_ignored(x: [u8; N::<bool>]) -> u32 { //~ E0322
+    N::<bool> //~ E0322
+}
+
+trait Has {
+    type Out
+}
+
+fn projection_arguments_are_not_ignored<T: Has>(x: T<bool>::Out<u32>) -> T::Out { //~ E0322 E0322
+    panic("not called")
+}

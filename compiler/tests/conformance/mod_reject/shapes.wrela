@@ -7,3 +7,7 @@ fn helper(r: f32) -> f32 {
 }
 
 const SIDES: u32 = 4
+
+pub struct S {
+    pub x: f32,
+}

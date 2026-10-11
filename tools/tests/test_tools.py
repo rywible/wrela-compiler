@@ -11,6 +11,7 @@ import os
 import random
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -138,6 +139,22 @@ class HeadlessTest(PageDir, unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(results, "hash.txt")))
         self.assert_chrome_gone()
 
+    def test_a_stale_results_symlink_is_replaced_without_touching_its_target(self):
+        outside = tempfile.mkdtemp()
+        try:
+            marker = os.path.join(outside, "mine")
+            with open(marker, "w") as f:
+                f.write("keep")
+            results = os.path.join(self.page_dir, "results")
+            os.symlink(outside, results)
+            status, _, err = self.run_headless("ok")
+            self.assertEqual(status, 0, err)
+            self.assertFalse(os.path.islink(results))
+            self.assertTrue(os.path.isfile(marker))
+            self.assert_chrome_gone()
+        finally:
+            shutil.rmtree(outside, ignore_errors=True)
+
     def test_chrome_exiting_early_fails(self):
         status, _, err = self.run_headless("exit")
         self.assertEqual(status, 1)
@@ -214,11 +231,43 @@ class HeadlessTest(PageDir, unittest.TestCase):
             ([], "usage"),
             (["no/such/page"], "no page directory"),
             ([self.page, "#run", "soon"], "timeout must be a number"),
+            ([self.page, "#run", "nan"], "timeout must be a positive finite number"),
+            ([self.page, "#run", "inf"], "timeout must be a positive finite number"),
+            ([self.page, "#run", "0"], "timeout must be a positive finite number"),
         ]
         for args, message in cases:
             r = subprocess.run([sys.executable, headless, *args], env=env, capture_output=True, text=True)
             self.assertEqual(r.returncode, 2, args)
             self.assertIn(message, r.stderr)
+
+    def test_a_page_path_cant_escape_and_clear_results_outside_the_repo(self):
+        outside = tempfile.mkdtemp()
+        try:
+            results = os.path.join(outside, "results")
+            os.makedirs(results)
+            marker = os.path.join(results, "mine")
+            with open(marker, "w") as f:
+                f.write("keep")
+            env = {
+                **os.environ,
+                "TMPDIR": self.tmp,
+                "WRELA_CHROME": os.path.join(TESTS, "fake_chrome.py"),
+            }
+            r = subprocess.run(
+                [
+                    sys.executable,
+                    os.path.join(TOOLS, "headless.py"),
+                    os.path.relpath(outside, ROOT),
+                ],
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(r.returncode, 2)
+            self.assertIn("must be inside the repository", r.stderr)
+            self.assertTrue(os.path.isfile(marker))
+        finally:
+            shutil.rmtree(outside, ignore_errors=True)
 
 
 class LockPathTest(unittest.TestCase):
@@ -345,6 +394,12 @@ class ServeTest(PageDir, unittest.TestCase):
             e.close()
             return e.code
 
+    def raw(self, request):
+        with socket.create_connection(("127.0.0.1", self.server.server_address[1])) as sock:
+            sock.sendall(request)
+            sock.shutdown(socket.SHUT_WR)
+            return sock.recv(4096)
+
     def test_put_into_results(self):
         self.assertEqual(self.put(f"{self.page}/results/out.json", b"{}"), 201)
         with open(os.path.join(self.page_dir, "results", "out.json"), "rb") as f:
@@ -372,6 +427,18 @@ class ServeTest(PageDir, unittest.TestCase):
         ]:
             self.assertEqual(self.put(path), 403, path)
 
+    def test_put_rejects_an_invalid_content_length(self):
+        port = self.server.server_address[1]
+        for value in [b"nope", b"-1"]:
+            response = self.raw(
+                b"PUT /tools/results/x HTTP/1.1\r\n"
+                + f"Host: localhost:{port}\r\n".encode()
+                + b"Content-Length: "
+                + value
+                + b"\r\nConnection: close\r\n\r\n"
+            )
+            self.assertIn(b" 400 ", response, value)
+
     def test_put_through_a_symlink_out_of_the_repo_is_refused(self):
         outside = tempfile.mkdtemp()
         try:
@@ -392,12 +459,13 @@ class ServeTest(PageDir, unittest.TestCase):
         req = urllib.request.Request(f"{self.base}/LICENSE", headers={"Host": f"localhost:{port}"})
         with urllib.request.urlopen(req) as r:
             self.assertEqual(r.status, 200)
-        for path in [".git/HEAD", "%2egit/HEAD"]:
+        for path in [".git/HEAD", ".GIT/HEAD", "%2egit/HEAD"]:
             with self.assertRaises(urllib.error.HTTPError) as e:
                 urllib.request.urlopen(f"{self.base}/{path}")
             self.assertEqual(e.exception.code, 404, path)
             e.exception.close()
         self.assertEqual(self.put(".git/results/x"), 404)
+        self.assertEqual(self.put(".GIT/results/x"), 404)
 
     def test_pages_are_cross_origin_isolated_with_the_right_types(self):
         with open(os.path.join(self.page_dir, "m.wasm"), "wb") as f:

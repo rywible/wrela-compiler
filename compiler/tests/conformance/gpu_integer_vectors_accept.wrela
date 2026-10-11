@@ -1,0 +1,14 @@
+// accepts: gpu.entry
+// Integer vector division with a constant zero lane isn't a WGSL const-expression.
+use std::gpu::{GlobalId, Slots, buffer, dispatch}
+
+@compute(1)
+fn operate(out: mut Slots<u32>, id: GlobalId) {
+    let value = vec2u(id.x, 8) / vec2u(0, 2)
+    out[id] = value.x
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    var out = buffer(1)
+    dispatch(operate.bind(out: mut out), groups: 1)
+}

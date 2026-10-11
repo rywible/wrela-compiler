@@ -28,6 +28,8 @@ export type ToWorker =
   | { type: "thread"; module: WebAssembly.Module; memory: WebAssembly.Memory; index: number }
   /** Test mode: the main thread has rendered the voice and saved its samples. */
   | { type: "audio-rendered" }
+  /** A line the audio thread printed, relayed by the main thread. */
+  | PrintMessage
   /** Test mode, `latency` or `keylatency`: the main thread has sent its events. */
   | { type: "latency-sent" }
   /** Test mode, `clip`: the main thread has saved the clip (`clip.webm`). */
@@ -72,8 +74,25 @@ export interface VoiceOptions {
   context: number;
 }
 
+/** What the audio processor receives: in an offline test, how many quanta it renders. */
+export interface VoiceProcessorOptions extends VoiceOptions {
+  quanta: number | null;
+}
+
 /** The audio worklet's processor (worklet.ts). */
 export const VOICE_PROCESSOR = "wrela-voice";
+
+/** A line one of the program's other threads printed, relayed to its render thread. */
+export interface PrintMessage {
+  type: "print";
+  line: string;
+}
+
+/** What the audio worklet tells the main thread. */
+export type FromVoice = PrintMessage | { type: "trap"; message: string } | { type: "rendered" };
+
+/** What a helper tells the render worker. */
+export type FromHelper = PrintMessage;
 
 /** The program's ticker, as its thread gets it: the module and memory to run it with, and the
  * task, context and rate `__tick` takes (wrela_abi's `IMPORT_TICK`). */
@@ -127,6 +146,7 @@ export interface TickReport {
 /** What the ticker's thread tells the render worker. */
 export type FromTicker =
   | { type: "fatal"; message: string }
+  | PrintMessage
   /** Stopped (test mode, or a hot reload): the ticks, the tick log when hashes were kept, and
    * what a build that replaces this one replays. */
   | { type: "ticks"; report: TickReport; log: Uint8Array<ArrayBuffer> | null; replay: Replay };

@@ -21,9 +21,31 @@ fn read_len(x: u32) -> u32 {
     x
 }
 
+struct Keep<F> {
+    f: F,
+}
+
+fn stored() -> u32 {
+    let held = Keep { f: |x: u32| { let _ = load("stored"); x } } //~ E0600
+    keep(held.f, 3)
+}
+
+trait DeterministicCallable {
+    fn tag(self) -> u32
+}
+
+impl<F: @deterministic fn(u32) -> u32> DeterministicCallable for F {
+    fn tag(self) -> u32 { 1 }
+}
+
+fn trait_io(x: u32) -> u32 {
+    let _ = load("trait") //~ E0600
+    x
+}
+
 pub fn run() -> u32 {
     let a = apply(|x| { let _ = load("b"); x }, 1) //~ E0600
-    a + apply(read_len, 2)
+    a + apply(read_len, 2) + stored() + trait_io.tag()
 }
 
 pub fn frame(time: f32, width: u32, height: u32) {

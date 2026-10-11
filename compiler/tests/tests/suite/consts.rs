@@ -139,7 +139,8 @@ pub fn frame(time: f32, width: u32, height: u32) {
 }
 
 /// Two constants that ship files into one directory of the build (`std::io::Shipped`) are E0704;
-/// a file's name that isn't one fails the build that computes the constant.
+/// a file's name that isn't one fails the build that computes the constant, and two files of one
+/// constant can't have the same name (one would overwrite the other).
 #[test]
 fn shipped_files_need_a_directory_each_and_plain_names() {
     let program = r#"
@@ -170,4 +171,16 @@ pub fn frame(time: f32, width: u32, height: u32) {
     let out = wrela_driver::build(&dir);
     let text = wrela_diag::render::render_all(&out.sources, &out.diagnostics);
     assert!(text.contains("isn't a file's name") || text.contains("has a character"), "{text}");
+
+    let dir = scratch("consts/shipped-name-twice");
+    let twice = program
+        .replace("const B: Shipped = ship(\"data\", one(\"b.bin\"))", "")
+        .replace(
+            "Vec::from([(String::from(name), Vec::from([1, 2, 3]))])",
+            "Vec::from([(String::from(name), Vec::from([1])), (String::from(name), Vec::from([2, 3]))])",
+        );
+    std::fs::write(dir.join("main.wrela"), twice).expect("write");
+    let out = wrela_driver::build(&dir);
+    let text = wrela_diag::render::render_all(&out.sources, &out.diagnostics);
+    assert!(text.contains("ships more than one file named `a.bin`"), "{text}");
 }

@@ -21,3 +21,33 @@ fn values() -> f32 {
     let b = apply(Sim::per_minute, 1) //~ E0207
     a + b
 }
+
+trait TakesCallable {
+    fn tag(self) -> u32
+}
+
+impl<F: fn(take u32)> TakesCallable for F {
+    fn tag(self) -> u32 { 1 }
+}
+
+fn borrows(x: u32) {}
+
+fn callable_modes_must_match() -> u32 {
+    borrows.tag() //~ E0207
+}
+
+fn bounded_modes_must_match(g: fn(u32)) -> u32 {
+    g.tag() //~ E0207
+}
+
+trait DeterministicCallable {
+    fn deterministic_tag(self) -> u32
+}
+
+impl<F: @deterministic fn(u32) -> u32> DeterministicCallable for F {
+    fn deterministic_tag(self) -> u32 { 1 }
+}
+
+fn weaker_attributes_do_not_fit(g: fn(u32) -> u32) -> u32 {
+    g.deterministic_tag() //~ E0207
+}

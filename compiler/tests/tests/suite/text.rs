@@ -26,6 +26,41 @@ fn the_fonts_are_baked_small() {
     }
 }
 
+/// The baker rejects invalid sampling geometry before it tries to read the font. The former
+/// `tools/wfont` command enforced the same boundary before baking moved into `ui::ttf`.
+#[test]
+fn font_baking_needs_positive_finite_geometry() {
+    let ui = wrela_tests::repo_root().join("ui");
+    for (name, em, spread, option) in [
+        ("zero-em", "0.0", "4.0", "`em`"),
+        ("negative-spread", "32.0", "-1.0", "`spread`"),
+        ("infinite-em", "bitcast_f32(0x7f800000)", "4.0", "`em`"),
+        ("nan-spread", "32.0", "bitcast_f32(0x7fc00000)", "`spread`"),
+    ] {
+        let dir = crate::scratch(&format!("text/font-geometry-{name}"));
+        std::fs::write(
+            dir.join("wrela.toml"),
+            format!(
+                "[package]\nname = \"font_geometry\"\n\n[dependencies]\nui = {{ path = {:?} }}\n",
+                ui.display().to_string()
+            ),
+        )
+        .expect("manifest");
+        std::fs::write(dir.join("empty.ttf"), []).expect("empty font");
+        std::fs::write(
+            dir.join("main.wrela"),
+            format!(
+                "use ui::ttf::{{Baked, bake}}\n\nconst FONT: Baked = bake(embed(\"empty.ttf\"), em: {em}, spread: {spread})\n\npub fn frame(time: f32, width: u32, height: u32) {{\n    let _ = FONT.fields.len()\n}}\n"
+            ),
+        )
+        .expect("program");
+        let out = wrela_driver::build(&dir);
+        let rendered = wrela_diag::render::render_all(&out.sources, &out.diagnostics);
+        assert!(out.has_errors() && rendered.contains(option), "{name}: {rendered}");
+        assert!(rendered.contains("positive finite number"), "{name}: {rendered}");
+    }
+}
+
 /// Every widget's frame test, each driven by a script of input (ui/tests/widgets/scripts).
 #[test]
 fn the_widgets_pass_their_frame_tests() {

@@ -1096,6 +1096,16 @@ impl<'p> Checker<'p> {
         ty
     }
 
+    /// One explicit generic argument, checked against whether its parameter is a type or const.
+    pub(crate) fn resolve_generic_arg(&mut self, t: &ast::TypeExpr, param: ParamId) -> TyId {
+        let ty =
+            crate::resolve::resolve_generic_arg(self.p, &mut self.diags, &self.scope, t, param);
+        if !self.p.param(param).is_const {
+            adt_bounds(self.p, ty, t.span, &mut self.diags);
+        }
+        ty
+    }
+
     pub(crate) fn obligation(&mut self, ty: TyId, trait_ref: TraitRef, span: Span, why: String) {
         self.obligation_coded(codes::E0400, ty, trait_ref, span, why);
     }
@@ -1170,8 +1180,19 @@ impl<'p> Checker<'p> {
             .iter()
             .map(|p| self.infer.resolve(&self.p.types, self.locals[p.index()].ty))
             .collect();
+        let modes: Vec<Mode> = params
+            .iter()
+            .map(|p| match self.locals[p.index()].kind {
+                LocalKind::Param(m) => m,
+                LocalKind::ClosureParam => Mode::Borrow,
+                _ => Mode::Borrow,
+            })
+            .collect();
         let r = self.infer.resolve(&self.p.types, ret);
-        self.p.closure_sigs.borrow_mut().insert(ClosureRef { owner: self.fn_id, id }, (sig, r));
+        self.p
+            .closure_sigs
+            .borrow_mut()
+            .insert(ClosureRef { owner: self.fn_id, id }, (sig, r, modes));
         self.closures[id.0 as usize] =
             Some(ClosureDef { params, ret, body, captures: frame.captures, span });
         id

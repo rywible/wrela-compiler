@@ -249,12 +249,7 @@ fn run_gpu_frames(
 #[cfg(feature = "gpu")]
 fn against_golden(g: &Golden, root: &Path, screen: &[u8], bless: bool) -> Result<(), String> {
     let path = &g.path;
-    if wrela_abi::check::path_problem(path).is_some() {
-        return Err(format!(
-            "its golden `{path}` must be a path inside the package, with `/` between its parts"
-        ));
-    }
-    let full = root.join(path);
+    let full = golden_path(root, path)?;
     if bless {
         if let Some(dir) = full.parent() {
             let _ = std::fs::create_dir_all(dir);
@@ -278,6 +273,23 @@ fn against_golden(g: &Golden, root: &Path, screen: &[u8], bless: bool) -> Result
         ));
     }
     Ok(())
+}
+
+/// A golden's path inside the package, with no symbolic link through which reading or blessing
+/// it could escape. The package root itself may have been named through a link.
+fn golden_path(root: &Path, path: &str) -> Result<PathBuf, String> {
+    if wrela_abi::check::path_problem(path).is_some() {
+        return Err(format!(
+            "its golden `{path}` must be a path inside the package, with `/` between its parts"
+        ));
+    }
+    let root = root
+        .canonicalize()
+        .map_err(|e| format!("can't resolve the package for its golden `{path}`: {e}"))?;
+    let full = root.join(path);
+    crate::ensure_no_symlink_path(&root, &full)
+        .map_err(|e| format!("its golden `{path}` isn't a plain path in the package: {e}"))?;
+    Ok(full)
 }
 
 /// [`run_gpu`], in a compiler built without the GPU host: the test can't run.
@@ -408,5 +420,29 @@ impl Scratch {
 impl Drop for Scratch {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_golden_cannot_escape_the_package_through_a_symbolic_link() {
+        use std::os::unix::fs::symlink;
+
+        let scratch = Scratch::new();
+        let pkg = scratch.0.join("package");
+        let outside = scratch.0.join("outside");
+        std::fs::create_dir_all(&pkg).expect("package");
+        std::fs::create_dir_all(&outside).expect("outside");
+        symlink(&outside, pkg.join("shots")).expect("symlink");
+
+        assert!(golden_path(&pkg, "shots/frame.png").is_err());
+        assert_eq!(
+            golden_path(&pkg, "goldens/frame.png").expect("ordinary path"),
+            pkg.canonicalize().expect("canonical package").join("goldens/frame.png")
+        );
     }
 }

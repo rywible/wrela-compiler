@@ -120,12 +120,21 @@ impl Trace {
 
     /// Ends every thread's phase.
     pub fn end_all(&self) {
-        let now = Instant::now();
-        let mut s = self.state();
-        let threads: Vec<ThreadId> = s.open.keys().copied().collect();
-        for t in threads {
-            s.end(t, now);
+        self.state().end_all(Instant::now());
+    }
+
+    /// Runs `call`, then ends the phase it may have started on this thread, even if it panics.
+    pub(crate) fn end_phase_after<T>(&self, call: impl FnOnce() -> T) -> T {
+        struct End<'a>(&'a Trace);
+
+        impl Drop for End<'_> {
+            fn drop(&mut self) {
+                self.0.end_phase();
+            }
         }
+
+        let _end = End(self);
+        call()
     }
 
     /// The lines kept since the last call.
@@ -146,8 +155,21 @@ impl Trace {
 
     /// Everything traced, every phase ended.
     pub fn take(&self) -> Traced {
-        self.end_all();
-        std::mem::take(&mut self.state().traced)
+        self.take_while_locked(|| {})
+    }
+
+    /// Ends and empties the trace under one lock. `between` exists so the lock boundary can be
+    /// tested deterministically; production calls it with a no-op.
+    fn take_while_locked(&self, between: impl FnOnce()) -> Traced {
+        let mut s = self.state();
+        s.end_all(Instant::now());
+        between();
+        std::mem::take(&mut s.traced)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_phases(&self) -> usize {
+        self.state().open.len()
     }
 
     /// Links `wrela.print` and `wrela.phase` to this trace. The program's lines and names are
@@ -185,6 +207,13 @@ impl State {
     fn end(&mut self, thread: ThreadId, now: Instant) {
         if let Some((i, start)) = self.open.remove(&thread) {
             self.traced.phases[i].seconds += (now - start).as_secs_f64();
+        }
+    }
+
+    fn end_all(&mut self, now: Instant) {
+        let threads: Vec<ThreadId> = self.open.keys().copied().collect();
+        for t in threads {
+            self.end(t, now);
         }
     }
 }
@@ -245,5 +274,21 @@ mod tests {
             phases.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
             vec!["main", "helper"]
         );
+    }
+
+    #[test]
+    fn take_keeps_the_lock_while_ending_and_emptying() {
+        let t = Trace::new(None);
+        t.phase("before");
+        let probe = t.clone();
+        let traced = t.take_while_locked(|| {
+            assert!(probe.0.try_lock().is_err(), "trace state was unlocked mid-take");
+        });
+        assert_eq!(traced.phases[0].name, "before");
+        assert_eq!(t.open_phases(), 0);
+
+        // Taking a trace leaves it ready for a new phase rather than with a stale phase index.
+        t.phase("after");
+        assert_eq!(t.take().phases[0].name, "after");
     }
 }

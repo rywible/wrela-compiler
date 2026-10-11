@@ -758,8 +758,11 @@ impl<'a> Parser<'a> {
                 k => k.name().into_iter().for_each(|n| name(&[], &n.name)),
             }
         }
+        // L2 permits a UTF-8 BOM only at the start of a file. Imports inserted by a fix belong
+        // after it; inserting at byte zero would make the BOM an invalid character on line two.
+        let start = if self.text.starts_with('\u{feff}') { 3 } else { 0 };
         let import = wrela_diag::Edit {
-            span: Span::new(self.file, 0, 0),
+            span: Span::new(self.file, start, start),
             replacement: "use std::io::print\n\n".into(),
         };
         for &i in &self.print_fixes {

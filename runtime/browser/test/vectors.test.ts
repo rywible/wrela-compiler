@@ -11,7 +11,7 @@ import { decode, joins, Sequencer, StreamError } from "../src/stream.ts";
 import { frameTime } from "../src/testmode.ts";
 import { carried, lockstepTicks } from "../src/ticker.ts";
 import { TickLogWriter, wasmHash } from "../src/ticks.ts";
-import { type ErrorVector, vectors } from "./fixtures.ts";
+import { checker, type ErrorVector, vectors } from "./fixtures.ts";
 
 const bytes = (hex: string) => Uint8Array.from(hex.match(/../g) ?? [], (b) => Number.parseInt(b, 16));
 const hex = (b: Uint8Array) => Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
@@ -94,6 +94,79 @@ describe("checks", () => {
       expect(error).toEqual(v.error);
     });
   }
+});
+
+test("rejected draws and passes leave checker state unchanged", () => {
+  const c = checker();
+  c.check({ op: "CreateBuffer", handle: 1, size: 64 });
+  c.check({ op: "CreateBuffer", handle: 2, size: 64 });
+  c.check({ op: "BeginScreenPass", clear: [0, 0, 0, 0] });
+  expect(() =>
+    c.check({
+      op: "Draw",
+      pipeline: 0,
+      vertices: 3,
+      instances: 1,
+      bindings: [
+        { handle: 1, offset: 0, size: 64 },
+        { handle: 99, offset: 0, size: 64 },
+      ],
+      uniforms: new Uint8Array(16),
+    }),
+  ).toThrow("there's no buffer 99");
+  expect(() =>
+    c.check({
+      op: "Draw",
+      pipeline: 0,
+      vertices: 3,
+      instances: 1,
+      bindings: [
+        { handle: 2, offset: 0, size: 64 },
+        { handle: 1, offset: 0, size: 64 },
+      ],
+      uniforms: new Uint8Array(16),
+    }),
+  ).not.toThrow();
+
+  c.check({ op: "Present" });
+  c.check({
+    op: "CreateTexture",
+    handle: 3,
+    width: 8,
+    height: 8,
+    format: "rgba8unorm",
+    writable: false,
+    depth: 0,
+  });
+  c.check({ op: "BeginScreenPass", clear: [0, 0, 0, 0] });
+  c.check({ op: "Present" });
+  expect(() =>
+    c.check({
+      op: "BeginPass",
+      pass: {
+        color: 3,
+        keepColor: false,
+        join: false,
+        clear: [0, 0, 0, 0],
+        depth: 99,
+        keepDepth: false,
+        clearDepth: 1,
+      },
+    }),
+  ).toThrow("there's no texture 99");
+  expect(() =>
+    c.check({
+      op: "Draw",
+      pipeline: 0,
+      vertices: 3,
+      instances: 1,
+      bindings: [
+        { handle: 3, offset: 0, size: 64 },
+        { handle: 2, offset: 0, size: 64 },
+      ],
+      uniforms: new Uint8Array(16),
+    }),
+  ).toThrow("there's no buffer 3");
 });
 
 describe("manifests", () => {

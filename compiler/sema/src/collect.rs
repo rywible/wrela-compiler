@@ -454,6 +454,7 @@ impl<'d, 'u> Collector<'d, 'u> {
                     assoc_types: Vec::new(),
                     methods: Vec::new(),
                     public,
+                    package_only: vis.package_only,
                     span: item.span,
                     lang: None,
                     fieldwise,
@@ -1158,6 +1159,44 @@ impl<'d, 'u> Collector<'d, 'u> {
 
     // ---- imports ---------------------------------------------------------------------------
 
+    /// The binding made by an item's declaration, rather than an import that happens to name
+    /// it. A private local alias does not make a public item private, but a public import must
+    /// not expose an item whose declaration itself is private.
+    fn declared_binding(&self, res: Res) -> Option<Binding> {
+        let (module, name, declared) = match res {
+            Res::Adt(a) => {
+                let d = self.p.adt(a);
+                (d.module, d.name.as_str(), Res::Adt(a))
+            }
+            Res::Variant(a, _) => {
+                let d = self.p.adt(a);
+                (d.module, d.name.as_str(), Res::Adt(a))
+            }
+            Res::Trait(t) => {
+                let d = self.p.trait_(t);
+                (d.module, d.name.as_str(), Res::Trait(t))
+            }
+            Res::Fn(f) => {
+                let d = self.p.func(f);
+                (d.module, d.name.as_str(), Res::Fn(f))
+            }
+            Res::Const(c) => {
+                let d = self.p.const_(c);
+                (d.module, d.name.as_str(), Res::Const(c))
+            }
+            Res::Alias(a) => {
+                let d = &self.p.aliases[a.index()];
+                (d.module, d.name.as_str(), Res::Alias(a))
+            }
+            Res::TraitSet(s) => {
+                let d = &self.p.trait_sets[s.index()];
+                (d.module, d.name.as_str(), Res::TraitSet(s))
+            }
+            Res::Module(_) | Res::BuiltinTy(_) | Res::BuiltinFn(_) => return None,
+        };
+        self.p.module(module).scope.get(name).filter(|b| b.res == declared).cloned()
+    }
+
     fn resolve_imports(&mut self) {
         let mut pending: Vec<PendingUse> = std::mem::take(&mut self.uses);
         loop {
@@ -1193,6 +1232,38 @@ impl<'d, 'u> Collector<'d, 'u> {
                 }
                 match resolve::resolve_module_path_in(&self.p, u.module, &u.path, false) {
                     resolve::PathLookup::Found(res) => {
+                        // A public import must not turn a less-visible binding into public API.
+                        // The resolver deliberately lets a module name its own private bindings;
+                        // imports need this separate check because their new binding can be wider.
+                        let widened = if u.vis.public {
+                            self.declared_binding(res)
+                                .filter(|b| !b.public || !u.vis.package_only && b.package_only)
+                        } else {
+                            None
+                        };
+                        if let Some(b) = widened {
+                            let visibility = if b.package_only {
+                                "visible only inside this package"
+                            } else {
+                                "private to this module"
+                            };
+                            self.diags.push(
+                                Diagnostic::new(
+                                    codes::E0203,
+                                    u.alias.span,
+                                    format!(
+                                        "`{}` can't be re-exported: it is {visibility}",
+                                        u.path.last().map_or(&u.alias.name, |name| &name.name)
+                                    ),
+                                )
+                                .with_secondary(b.span, "the less-visible binding is here")
+                                .with_help(
+                                    "give the original item at least the re-export's visibility",
+                                ),
+                            );
+                            self.p.modules[u.module.index()].broken.insert(u.alias.name.clone());
+                            continue;
+                        }
                         self.bind(u.module, &u.alias, res, u.vis);
                     }
                     resolve::PathLookup::NotYet(m, name) => still.push((u, m, name)),

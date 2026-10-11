@@ -589,8 +589,17 @@ pub(super) fn finish(
         resolve(&mut cl.ret);
         walk_tys(&mut cl.body, &mut resolve);
         let sig = cl.params.iter().map(|p| locals[p.index()].ty).collect();
+        let modes = cl
+            .params
+            .iter()
+            .map(|p| match locals[p.index()].kind {
+                LocalKind::Param(m) => m,
+                LocalKind::ClosureParam => Mode::Borrow,
+                _ => Mode::Borrow,
+            })
+            .collect();
         let id = ClosureRef { owner: c.fn_id, id: ClosureId(k as u32) };
-        c.p.closure_sigs.borrow_mut().insert(id, (sig, cl.ret));
+        c.p.closure_sigs.borrow_mut().insert(id, (sig, cl.ret, modes));
         closures.push(cl);
     }
     let hidden_ret = hidden.map(|h| infer.resolve(types, h));

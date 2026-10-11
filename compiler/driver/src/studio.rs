@@ -381,18 +381,22 @@ fn write_map_lens(pkg: &Path, name: &str) -> Result<PathBuf, String> {
     let io = |e: std::io::Error| format!("can't write the map lens's program: {e}");
     let floor_deps = dependencies(pkg)?;
     let base = dir(pkg);
+    let build = pkg.join("build");
+    crate::ensure_no_symlink_path(&build, &base).map_err(io)?;
+    let write = |path: &Path, bytes: &[u8]| -> Result<(), String> {
+        crate::ensure_no_symlink_path(&build, path).map_err(io)?;
+        write_if_changed(path, bytes).map_err(io)
+    };
     let program = base.join("map");
     let mut maplens_deps = vec![("studio".to_string(), "../studio".to_string())];
     maplens_deps.push(("ui".to_string(), "../ui".to_string()));
     for (rel, bytes) in embedded::STUDIO {
         if let Some(rest) = rel.strip_prefix("maplens/") {
             match rest {
-                "glue/main.wrela" => {
-                    write_if_changed(&program.join("main.wrela"), bytes).map_err(io)?
-                }
+                "glue/main.wrela" => write(&program.join("main.wrela"), bytes)?,
                 "glue/floor.wrela" => {
                     let text = String::from_utf8_lossy(bytes).replace("last_green", name);
-                    write_if_changed(&program.join("floor.wrela"), text.as_bytes()).map_err(io)?
+                    write(&program.join("floor.wrela"), text.as_bytes())?
                 }
                 "wrela.toml" => {
                     // The maplens package's own dependencies, beyond studio and ui, as the floor
@@ -411,20 +415,20 @@ fn write_map_lens(pkg: &Path, name: &str) -> Result<PathBuf, String> {
                     }
                 }
                 _ if rest.starts_with("glue/") => {}
-                _ => write_if_changed(&base.join("maplens").join(rest), bytes).map_err(io)?,
+                _ => write(&base.join("maplens").join(rest), bytes)?,
             }
         } else if !rel.starts_with("glue/") {
-            write_if_changed(&base.join("studio").join(rel), bytes).map_err(io)?;
+            write(&base.join("studio").join(rel), bytes)?;
         }
     }
     for (rel, bytes) in embedded::UI {
-        write_if_changed(&base.join("ui").join(rel), bytes).map_err(io)?;
+        write(&base.join("ui").join(rel), bytes)?;
     }
     let maplens = format!(
         "# Written by `wrela studio`: the map lens, for the floor `{name}`.\n[package]\nname = \"maplens\"\n\n[dependencies]\n{}",
         dependency_lines(&maplens_deps)
     );
-    write_if_changed(&base.join("maplens").join("wrela.toml"), maplens.as_bytes()).map_err(io)?;
+    write(&base.join("maplens").join("wrela.toml"), maplens.as_bytes())?;
     let mut deps = vec![("maplens".to_string(), "../maplens".to_string())];
     deps.extend(floor_deps.iter().map(|(n, p)| (n.clone(), p.display().to_string())));
     deps.push((name.to_string(), "../../..".to_string()));
@@ -432,7 +436,7 @@ fn write_map_lens(pkg: &Path, name: &str) -> Result<PathBuf, String> {
         "# Written by `wrela studio`: the map lens on `{name}`.\n[package]\nname = \"map\"\n\n[dependencies]\n{}",
         dependency_lines(&deps)
     );
-    write_if_changed(&program.join("wrela.toml"), manifest.as_bytes()).map_err(io)?;
+    write(&program.join("wrela.toml"), manifest.as_bytes())?;
     Ok(program)
 }
 
@@ -441,15 +445,21 @@ fn write_map_lens(pkg: &Path, name: &str) -> Result<PathBuf, String> {
 /// they'd be: the program's directory.
 fn write_lens(pkg: &Path, s: &Subject) -> std::io::Result<PathBuf> {
     let base = dir(pkg);
+    let build = pkg.join("build");
+    crate::ensure_no_symlink_path(&build, &base)?;
+    let write = |path: &Path, bytes: &[u8]| -> std::io::Result<()> {
+        crate::ensure_no_symlink_path(&build, path)?;
+        write_if_changed(path, bytes)
+    };
     let lens = base.join("lens");
     for (sub, files) in [("studio", embedded::STUDIO), ("ui", embedded::UI)] {
         for (rel, bytes) in files {
             match rel.strip_prefix("glue/") {
                 // The program: its main module as it is; its manifest and `subject` are the
                 // subject's (below).
-                Some("main.wrela") => write_if_changed(&lens.join("main.wrela"), bytes)?,
+                Some("main.wrela") => write(&lens.join("main.wrela"), bytes)?,
                 Some(_) => {}
-                None => write_if_changed(&base.join(sub).join(rel), bytes)?,
+                None => write(&base.join(sub).join(rel), bytes)?,
             }
         }
     }
@@ -457,8 +467,8 @@ fn write_lens(pkg: &Path, s: &Subject) -> std::io::Result<PathBuf> {
         "# Written by `wrela studio`: the lens on `{}`.\n[package]\nname = \"lens\"\n\n[dependencies]\nstudio = {{ path = \"../studio\" }}\n{} = {{ path = \"../../..\" }}\n",
         s.name, s.name
     );
-    write_if_changed(&lens.join("wrela.toml"), manifest.as_bytes())?;
-    write_if_changed(&lens.join("subject.wrela"), glue(s).as_bytes())?;
+    write(&lens.join("wrela.toml"), manifest.as_bytes())?;
+    write(&lens.join("subject.wrela"), glue(s).as_bytes())?;
     Ok(lens)
 }
 
@@ -475,6 +485,9 @@ fn write_if_changed(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// Builds the lens on the subject at `pkg`, lifting the subject's literals, into
 /// `<pkg>/build/studio/page/`: the build's output, and that directory.
 pub fn build(pkg: &Path, debug: bool) -> Result<(crate::Output, PathBuf), String> {
+    let build = pkg.join("build");
+    crate::ensure_no_symlink_path(&build, &dir(pkg))
+        .map_err(|e| format!("can't use the lens's output: {e}"))?;
     let kind = crate::BuildKind { debug, testing: false };
     let out = if is_floor(pkg) {
         let name = crate::manifest::name_in(pkg).unwrap_or_else(|| {
@@ -492,6 +505,8 @@ pub fn build(pkg: &Path, debug: bool) -> Result<(crate::Output, PathBuf), String
     };
     let page = dir(pkg).join("page");
     if !out.has_errors() {
+        crate::ensure_no_symlink_path(&build, &page)
+            .map_err(|e| format!("can't use the lens's build: {e}"))?;
         let wasm = out.files.iter().find(|(p, _)| p == "game.wasm").map(|(_, w)| w.as_slice());
         clear(&page, wasm);
         out.write_to(&page).map_err(|e| format!("can't write the build: {e}"))?;

@@ -233,9 +233,10 @@ pub(crate) fn zero(types: &ir::Types, t: ir::TypeId) -> ir::ConstValue {
         ir::TypeDef::Struct { fields, .. } => {
             V::Parts(fields.iter().map(|&(_, f)| zero(types, f)).collect())
         }
-        ir::TypeDef::Enum { variants, .. } => {
-            V::Variant(0, variants[0].1.map(|p| Box::new(zero(types, p))))
-        }
+        ir::TypeDef::Enum { variants, .. } => V::Variant(
+            0,
+            variants.first().and_then(|(_, payload)| *payload).map(|p| Box::new(zero(types, p))),
+        ),
         ir::TypeDef::Run(_) | ir::TypeDef::RuntimeArray(_) | ir::TypeDef::Ptr(_) => {
             V::Scalar(ir::Const::U32(0))
         }

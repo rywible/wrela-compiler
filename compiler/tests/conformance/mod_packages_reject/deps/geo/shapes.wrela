@@ -13,3 +13,23 @@ fn secret(x: f32) -> f32 {
 pub(package) fn squared(x: f32) -> f32 {
     x * x
 }
+
+pub struct Thing: Copy {
+    pub n: i32,
+}
+
+pub(package) trait HiddenTrait {
+    fn secret(self) -> i32
+}
+
+impl HiddenTrait for Thing {
+    fn secret(self) -> i32 { self.n }
+}
+
+pub enum Choice: Copy {
+    Named { pub(package) hidden: i32, shown: i32 },
+}
+
+pub fn choose() -> Choice {
+    Choice::Named { hidden: 1, shown: 2 }
+}

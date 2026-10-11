@@ -29,10 +29,30 @@ pub fn dir_of(root: &Path) -> Option<PathBuf> {
 }
 
 fn dir_in(root: &Path, shared: Option<std::ffi::OsString>) -> Option<PathBuf> {
-    match shared.filter(|d| !d.is_empty()) {
-        Some(dir) => Some(PathBuf::from(dir)),
-        None => root.is_dir().then(|| root.join("build").join("consts")),
-    }
+    let dir = match shared.filter(|d| !d.is_empty()) {
+        Some(dir) => PathBuf::from(dir),
+        None => root.canonicalize().ok()?.join("build").join("consts"),
+    };
+    safe(&dir)?;
+    Some(dir)
+}
+
+/// Refuses a link in a cache path. For the package-owned `<package>/build/consts`, checks from
+/// the package; an explicitly configured shared directory is itself the ownership root. This
+/// is a preflight; [`crate::ensure_no_symlink_path`] documents its unavoidable replacement race.
+fn safe(dir: &Path) -> Option<()> {
+    let root = package_root(dir).unwrap_or(dir);
+    crate::ensure_no_symlink_path(root, dir).ok()
+}
+
+fn safe_file(dir: &Path, path: &Path) -> Option<()> {
+    safe(dir)?;
+    crate::ensure_no_symlink_path(dir, path).ok()
+}
+
+fn package_root(dir: &Path) -> Option<&Path> {
+    let build = dir.parent()?;
+    (dir.file_name()? == "consts" && build.file_name()? == "build").then(|| build.parent())?
 }
 
 /// A constant's key: its module's WASM and the fuel it may use, with the compiler's version.
@@ -51,6 +71,7 @@ pub fn key(wasm: &[u8], fuel: u64) -> String {
 /// file used now, so it's kept.
 pub fn get(dir: &Path, key: &str) -> Option<Value> {
     let path = dir.join(format!("{key}.wcv"));
+    safe_file(dir, &path)?;
     let bytes = std::fs::read(&path).ok()?;
     let value = decode(&bytes)?;
     // Touched, so cleaning keeps it.
@@ -63,7 +84,13 @@ pub fn get(dir: &Path, key: &str) -> Option<Value> {
 
 /// Stores `value` under `key` in `dir`. Failing to is no error: the next build computes it again.
 pub fn put(dir: &Path, key: &str, value: &Value) {
+    if safe(dir).is_none() {
+        return;
+    }
     if std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    if safe(dir).is_none() {
         return;
     }
     let bytes = encode(value);
@@ -72,6 +99,9 @@ pub fn put(dir: &Path, key: &str, value: &Value) {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.subsec_nanos());
     let tmp = dir.join(format!("{key}.{}-{nanos}.tmp", std::process::id()));
+    if safe_file(dir, &tmp).is_none() {
+        return;
+    }
     if std::fs::write(&tmp, &bytes).is_ok()
         && std::fs::rename(&tmp, dir.join(format!("{key}.wcv"))).is_err()
     {
@@ -82,26 +112,51 @@ pub fn put(dir: &Path, key: &str, value: &Value) {
 /// Removes the entries in `dir` that no build has used for [`KEEP_FOR`], and temporary files
 /// left by a build that stopped.
 pub fn clean(dir: &Path) {
+    if safe(dir).is_none() {
+        return;
+    }
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     let now = std::time::SystemTime::now();
     for e in entries.flatten() {
+        let name = e.file_name();
+        let Some(temporary) = cache_name(&name) else { continue };
+        if !e.file_type().is_ok_and(|t| t.is_file()) {
+            continue;
+        }
         let path = e.path();
-        let old = e
+        let age = e
             .metadata()
             .and_then(|m| m.modified())
             .ok()
             .and_then(|t| now.duration_since(t).ok())
-            .is_some_and(|age| age > KEEP_FOR);
-        let stale_tmp = path.extension().is_some_and(|x| x == "tmp")
-            && e.metadata()
-                .and_then(|m| m.modified())
-                .ok()
-                .and_then(|t| now.duration_since(t).ok())
-                .is_some_and(|age| age.as_secs() > 3600);
-        if old || stale_tmp {
+            .unwrap_or_default();
+        if (!temporary && age > KEEP_FOR) || (temporary && age.as_secs() > 3600) {
             let _ = std::fs::remove_file(path);
         }
     }
+}
+
+/// Whether `name` belongs to this cache: a 64-hex-digit key and `.wcv` (false), or its
+/// `<key>.<pid>-<nanos>.tmp` temporary (true). The earlier `<key>.<pid>.tmp` form is owned too,
+/// so an old interrupted build's temporary can still be removed. Anything else is somebody
+/// else's.
+fn cache_name(name: &std::ffi::OsStr) -> Option<bool> {
+    let name = name.to_str()?;
+    let key = name.get(..64)?;
+    if !key.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let rest = &name[64..];
+    if rest == ".wcv" {
+        return Some(false);
+    }
+    let unique = rest.strip_prefix('.')?.strip_suffix(".tmp")?;
+    let numeric = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let owned = match unique.split_once('-') {
+        Some((pid, nanos)) => numeric(pid) && numeric(nanos) && !nanos.contains('-'),
+        None => numeric(unique),
+    };
+    owned.then_some(true)
 }
 
 /// A value as bytes: [`MAGIC`], then the value, each node a tag and its payload.
@@ -342,8 +397,9 @@ mod tests {
     #[test]
     fn the_cache_is_the_shared_directory_else_the_packages() {
         let root = std::env::temp_dir();
-        assert_eq!(dir_in(&root, None), Some(root.join("build/consts")));
-        assert_eq!(dir_in(&root, Some("".into())), Some(root.join("build/consts")));
+        let canonical = root.canonicalize().expect("temporary directory");
+        assert_eq!(dir_in(&root, None), Some(canonical.join("build/consts")));
+        assert_eq!(dir_in(&root, Some("".into())), Some(canonical.join("build/consts")));
         assert_eq!(dir_in(&root, Some("/s/c".into())), Some(PathBuf::from("/s/c")));
         assert_eq!(dir_in(Path::new("/no/such/package"), None), None);
     }
@@ -362,5 +418,56 @@ mod tests {
         clean(&dir);
         assert!(get(&dir, &k).is_some(), "a value used today is kept");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cleaning_removes_only_old_cache_owned_files() {
+        let pkg = std::env::temp_dir().join(format!("wrela-consts-clean-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&pkg);
+        std::fs::create_dir_all(&pkg).expect("package");
+        let dir = dir_in(&pkg, None).expect("cache path");
+        std::fs::create_dir_all(&dir).expect("cache directory");
+        let key = "1".repeat(64);
+        let entry = dir.join(format!("{key}.wcv"));
+        let temporary = dir.join(format!("{key}.123-456.tmp"));
+        let old_temporary = dir.join(format!("{key}.123.tmp"));
+        let other = dir.join("important.txt");
+        let old = std::time::SystemTime::now()
+            .checked_sub(KEEP_FOR + std::time::Duration::from_secs(3600))
+            .expect("an old time");
+        for path in [&entry, &temporary, &old_temporary, &other] {
+            let file = std::fs::File::create(path).expect("file");
+            file.set_modified(old).expect("old");
+        }
+        clean(&dir);
+        assert!(!entry.exists(), "an old cache entry is removed");
+        assert!(!temporary.exists(), "an old cache temporary is removed");
+        assert!(!old_temporary.exists(), "an old-format cache temporary is removed");
+        assert!(other.exists(), "a file the cache doesn't own is left alone");
+        let _ = std::fs::remove_dir_all(pkg);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_cache_cannot_escape_through_a_symbolic_link() {
+        use std::os::unix::fs::symlink;
+
+        let base = std::env::temp_dir().join(format!("wrela-consts-link-{}", std::process::id()));
+        let pkg = base.join("package");
+        let outside = base.join("outside");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(pkg.join("build")).expect("package build");
+        std::fs::create_dir_all(&outside).expect("outside");
+        std::fs::write(outside.join("important.txt"), "keep").expect("outside file");
+        symlink(&outside, pkg.join("build/consts")).expect("symlink");
+
+        assert!(dir_in(&pkg, None).is_none());
+        assert!(dir_in(&pkg, Some(pkg.join("build/consts").into_os_string())).is_none());
+        clean(&pkg.join("build/consts"));
+        assert_eq!(
+            std::fs::read_to_string(outside.join("important.txt")).expect("outside file remains"),
+            "keep"
+        );
+        let _ = std::fs::remove_dir_all(base);
     }
 }

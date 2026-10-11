@@ -272,9 +272,9 @@ export class InputRing {
 
   /** Writes an event, stamped with `time` (`epochNow`). */
   write(event: Uint8Array, time: number): boolean {
-    const written = Atomics.load(this.#counts, 0);
-    const slowest = Atomics.load(this.#counts, 3) !== 0 ? Atomics.load(this.#counts, 2) : Atomics.load(this.#counts, 1);
-    if (written - slowest >= InputRing.CAPACITY) return false;
+    const written = Atomics.load(this.#counts, 0) >>> 0;
+    const slowest = (Atomics.load(this.#counts, 3) !== 0 ? Atomics.load(this.#counts, 2) : Atomics.load(this.#counts, 1)) >>> 0;
+    if (((written - slowest) >>> 0) >= InputRing.CAPACITY) return false;
     const at = (written % InputRing.CAPACITY) * InputRing.SLOT;
     this.#bytes.set(event, at);
     this.#view.setFloat64(at + EVENT_SIZE, time, true);
@@ -288,15 +288,20 @@ export class InputRing {
     Atomics.store(this.#counts, 3, 1);
   }
 
+  /** The running program has no ticker: only frames hold the writer back from now on. */
+  detachTicker(): void {
+    Atomics.store(this.#counts, 3, 0);
+  }
+
   /** Every event written and not yet read by the frames, oldest first, each with its time. A
    * reader that's fallen a full ring behind skips the events written over. */
   read(): { events: Uint8Array; times: readonly number[] } {
-    const written = Atomics.load(this.#counts, 0);
-    let read = Atomics.load(this.#counts, 1);
+    const written = Atomics.load(this.#counts, 0) >>> 0;
+    let read = Atomics.load(this.#counts, 1) >>> 0;
     // A margin, so the slot the writer fills next isn't one this reads.
     const room = InputRing.CAPACITY - 64;
-    if (Atomics.load(this.#counts, 3) !== 0 && written - read > room) read = written - room;
-    const n = written - read;
+    if (Atomics.load(this.#counts, 3) !== 0 && ((written - read) >>> 0) > room) read = (written - room) >>> 0;
+    const n = (written - read) >>> 0;
     if (n === 0) return NO_EVENTS;
     const events = new Uint8Array(n * EVENT_SIZE);
     this.#copy(read, n, events, 0);
@@ -308,8 +313,8 @@ export class InputRing {
   /** Copies the events written and not yet read by the ticker, at most `cap`, oldest first, into
    * `out` from byte `at`; the rest wait for the next read. Returns how many. */
   readTicker(out: Uint8Array, at: number, cap: number): number {
-    const read = Atomics.load(this.#counts, 2);
-    const n = Math.min(Atomics.load(this.#counts, 0) - read, cap);
+    const read = Atomics.load(this.#counts, 2) >>> 0;
+    const n = Math.min(((Atomics.load(this.#counts, 0) >>> 0) - read) >>> 0, cap);
     this.#copy(read, n, out, at);
     Atomics.store(this.#counts, 2, read + n);
     return n;

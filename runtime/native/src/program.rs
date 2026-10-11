@@ -156,8 +156,12 @@ struct State<E> {
     started: bool,
     /// The voice `wrela.audio` started: its task and context.
     voice: Option<(u32, u32)>,
+    /// Whether the module has the audio thread entry that starting a voice requires.
+    has_audio_entry: bool,
     /// The ticker `wrela.tick` started: its task, context and rate.
     ticker: Option<(u32, u32, u32)>,
+    /// Whether the module has the ticker thread entry that starting a ticker requires.
+    has_tick_entry: bool,
     /// What the program printed and timed, on any of its threads (`std::io::print`,
     /// `std::time::phase`): each line also shown on stderr unless quiet.
     trace: Trace,
@@ -251,7 +255,22 @@ impl Requests {
     /// The file a storage path or a URL names, under `dir`.
     fn file(dir: &Option<PathBuf>, path: &str, what: &str) -> std::result::Result<PathBuf, String> {
         match dir {
-            Some(d) => Ok(d.join(path)),
+            Some(d) => {
+                let file = d.join(path);
+                let mut prefix = d.clone();
+                for part in path.split('/') {
+                    prefix.push(part);
+                    match std::fs::symlink_metadata(&prefix) {
+                        Ok(metadata) if metadata.file_type().is_symlink() => {
+                            return Err(format!("the path `{path}` crosses a symbolic link"));
+                        }
+                        Ok(_) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+                        Err(e) => return Err(e.to_string()),
+                    }
+                }
+                Ok(file)
+            }
             None => Err(format!("this host has no {what}")),
         }
     }
@@ -600,6 +619,18 @@ pub(crate) fn check_abi(module: &Module) -> Result<wasmtime::MemoryType> {
             "its `{EXPORT_INIT}` export must be a function with no parameters and no results"
         )));
     }
+    for (name, params) in [
+        (EXPORT_WORKER, &["i32"][..]),
+        (EXPORT_AUDIO, &["i32", "i32", "i32"][..]),
+        (EXPORT_TICK, &["i32", "i32", "i32", "i32"][..]),
+    ] {
+        if module.get_export(name).is_some_and(|t| !is_func(&t, params)) {
+            return Err(Error::Program(format!(
+                "its `{name}` export must be a function ({}) -> ()",
+                params.join(", ")
+            )));
+        }
+    }
     Ok(memory)
 }
 
@@ -760,7 +791,15 @@ impl<E: Executor> Program<E> {
             requests: Requests { io, ..Requests::default() },
             started: false,
             voice: None,
+            has_audio_entry: compiled
+                .module
+                .get_export(EXPORT_AUDIO)
+                .is_some_and(|t| is_func(&t, &["i32", "i32", "i32"])),
             ticker: None,
+            has_tick_entry: compiled
+                .module
+                .get_export(EXPORT_TICK)
+                .is_some_and(|t| is_func(&t, &["i32", "i32", "i32", "i32"])),
             trace: trace.clone(),
             input,
             kept,
@@ -1056,13 +1095,14 @@ impl<E: Executor> Program<E> {
                 .map_err(wrap)?;
             self.audio = Some((store, render));
         }
+        let trace = self.trace();
         let (store, render) = self.audio.as_mut().expect("made above");
         let n = AUDIO_QUANTUM as usize;
         let channels = wrela_abi::AUDIO_CHANNELS as usize;
         let mut out = Vec::with_capacity(channels * n * quanta as usize);
         for _ in 0..quanta {
-            render
-                .call(&mut *store, (memory::THREAD_AUDIO, task, context))
+            trace
+                .end_phase_after(|| render.call(&mut *store, (memory::THREAD_AUDIO, task, context)))
                 .map_err(|e| Error::Trap(format!("the voice trapped: {}", e.root_cause())))?;
             let at = wrela_abi::memory::AUDIO_OUT as usize;
             let bytes = shared::read(&self.memory, at, channels * n * 4)
@@ -1195,6 +1235,7 @@ impl<E: Executor> Program<E> {
         script: &[Scripted],
         mut log: Option<&mut TickLog>,
     ) -> Result<()> {
+        valid_fps(fps)?;
         let events: Vec<Event> = wrela_abi::input::events_at(script, i).collect();
         for &e in &events {
             self.push_input(e);
@@ -1242,6 +1283,7 @@ impl<E: Executor> Program<E> {
         width: u32,
         height: u32,
     ) -> Result<Vec<(Ticked, f64)>> {
+        valid_fps(fps)?;
         self.want_hashes(true);
         let mut thread = self.take_tick_thread()?;
         let (ticked, framed) = std::thread::scope(|s| {
@@ -1303,6 +1345,14 @@ impl<E: Executor> Program<E> {
     #[cfg_attr(not(feature = "gpu"), expect(dead_code, reason = "only `Host` reaches its GPU"))]
     pub(crate) fn executor(&mut self) -> &mut E {
         &mut self.store.data_mut().executor
+    }
+}
+
+pub(crate) fn valid_fps(fps: f64) -> Result<()> {
+    if fps.is_finite() && fps > 0.0 {
+        Ok(())
+    } else {
+        Err(Error::Program(format!("fps must be finite and greater than zero, not {fps:?}")))
     }
 }
 
@@ -1395,7 +1445,7 @@ impl BuildHelpers {
                         }
                         result
                     };
-                    if run(&mut used).is_err() {
+                    if trace.end_phase_after(|| run(&mut used)).is_err() {
                         helper_trapped(&memory, thread);
                     }
                     used
@@ -1465,7 +1515,7 @@ fn spawn_worker(
             let worker = instance.get_typed_func::<u32, ()>(&mut store, EXPORT_WORKER)?;
             worker.call(&mut store, thread)
         };
-        if run().is_err() {
+        if trace.end_phase_after(run).is_err() {
             helper_trapped(&memory, thread);
         }
     })
@@ -1540,6 +1590,20 @@ fn audio<E: Executor>(
         let e = Error::Trap("a program starts one voice, and this one started a second".into());
         return Err(fail(state, e));
     }
+    if !state.has_audio_entry {
+        let e = Error::Trap(format!(
+            "it starts a voice but doesn't export `{EXPORT_AUDIO}(thread, task, context)`"
+        ));
+        return Err(fail(state, e));
+    }
+    let need = memory::AUDIO_OUT as usize + AUDIO_QUANTUM as usize * 4;
+    if state.memory.data().len() < need {
+        let got = state.memory.data().len();
+        let e = Error::Trap(format!(
+            "it starts a voice but its memory is {got} bytes; the audio thread needs at least {need}"
+        ));
+        return Err(fail(state, e));
+    }
     state.voice = Some((task, context));
     Ok(())
 }
@@ -1557,6 +1621,21 @@ fn tick<E: Executor>(
     if state.ticker.is_some() {
         let e =
             Error::Trap("panic: a program starts one ticker, and this one started a second".into());
+        return Err(fail(state, e));
+    }
+    if !state.has_tick_entry {
+        let e = Error::Trap(format!(
+            "it starts a ticker but doesn't export `{EXPORT_TICK}(thread, task, context, tick)`"
+        ));
+        return Err(fail(state, e));
+    }
+    let need =
+        memory::TICK_RECORDS as usize + 4 + memory::MAX_TICK_RECORDS as usize * EVENT_SIZE as usize;
+    if state.memory.data().len() < need {
+        let got = state.memory.data().len();
+        let e = Error::Trap(format!(
+            "it starts a ticker but its memory is {got} bytes; the ticker needs at least {need}"
+        ));
         return Err(fail(state, e));
     }
     state.ticker = Some((task, context, hz));

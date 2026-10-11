@@ -9,13 +9,35 @@
 // Nothing depends on an address.
 
 use std::hash::StateHash
-use std::serialize::Serialize
+use std::serialize::{LoadError, Reader, Serialize, Writer, load, save}
 use std::collections::Pair
 
 /// A value in an `Arena<T>`: which slot, and which use of that slot.
-pub struct Handle<T>: Copy + Eq + Ord + StateHash + Serialize + Plain {
+pub struct Handle<T>: Copy + Eq + Ord + StateHash + Plain {
     index: u32,
     gen: u32,
+}
+
+impl<T> Serialize for Handle<T> {
+    fn serialize(self, w: mut Writer) {
+        w.write_str("index")
+        self.index.serialize(mut w)
+        w.write_str("gen")
+        self.gen.serialize(mut w)
+    }
+
+    fn deserialize(r: mut Reader) -> Result<Handle<T>, LoadError> {
+        r.expect_name("index")?
+        let index = u32::deserialize(mut r)?
+        r.expect_name("gen")?
+        let gen = u32::deserialize(mut r)?
+        // Arenas use odd generations only while a slot owns a value. An even generation can
+        // otherwise make `contains` accept a free slot after a hostile save is loaded.
+        if gen & 1 == 0 {
+            return Err(r.fail("a handle's saved generation isn't occupied"))
+        }
+        Ok(Handle { index, gen })
+    }
 }
 
 impl<T> Handle<T> {
@@ -48,7 +70,7 @@ struct Slot: Copy + Eq + StateHash + Serialize {
 /// let gone = herd.remove(h)
 /// assert(gone.age == 2.0 && herd.is_empty())
 /// ```
-pub struct Arena<T>: Clone + StateHash + Serialize {
+pub struct Arena<T>: Clone + StateHash {
     // The compiler indexes an arena in place: these fields, in this order.
     values: Vec<T>,
     slots: Vec<Slot>,
@@ -56,6 +78,66 @@ pub struct Arena<T>: Clone + StateHash + Serialize {
     owners: Vec<u32>,
     /// The first free slot plus one; 0 when there's none.
     free: u32,
+}
+
+impl<T: Serialize> Serialize for Arena<T> {
+    fn serialize(self, w: mut Writer) {
+        w.write_str("values")
+        self.values.serialize(mut w)
+        w.write_str("slots")
+        self.slots.serialize(mut w)
+        w.write_str("owners")
+        self.owners.serialize(mut w)
+        w.write_str("free")
+        self.free.serialize(mut w)
+    }
+
+    fn deserialize(r: mut Reader) -> Result<Arena<T>, LoadError> {
+        r.expect_name("values")?
+        let values = Vec::<T>::deserialize(mut r)?
+        r.expect_name("slots")?
+        let slots = Vec::<Slot>::deserialize(mut r)?
+        r.expect_name("owners")?
+        let owners = Vec::<u32>::deserialize(mut r)?
+        r.expect_name("free")?
+        let free = u32::deserialize(mut r)?
+
+        if values.len() != owners.len() || free > slots.len() {
+            return Err(r.fail("the arena's saved indexes are inconsistent"))
+        }
+        for at in 0..owners.len() {
+            let i = owners[at]
+            if i >= slots.len() || slots[i].gen & 1 == 0 || slots[i].at != at {
+                return Err(r.fail("the arena's saved indexes are inconsistent"))
+            }
+        }
+        // Every occupied slot names its owner. Every free slot occurs exactly once in the
+        // free-list chain: a repeated link eventually takes more steps than there are slots.
+        var free_slots = 0
+        for i in 0..slots.len() {
+            if slots[i].gen & 1 != 0 {
+                if slots[i].at >= owners.len() || owners[slots[i].at] != i {
+                    return Err(r.fail("the arena's saved indexes are inconsistent"))
+                }
+            } else {
+                free_slots += 1
+            }
+        }
+        var linked = 0
+        var next = free
+        while next != 0 {
+            let i = next - 1
+            if i >= slots.len() || slots[i].gen & 1 != 0 || linked == slots.len() {
+                return Err(r.fail("the arena's saved free list is inconsistent"))
+            }
+            linked += 1
+            next = slots[i].at
+        }
+        if linked != free_slots {
+            return Err(r.fail("the arena's saved free list is inconsistent"))
+        }
+        Ok(Arena { values, slots, owners, free })
+    }
 }
 
 impl<T> Arena<T> {
@@ -94,7 +176,7 @@ impl<T> Arena<T> {
 
     /// Whether `h`'s value is still here.
     pub fn contains(self, h: Handle<T>) -> bool {
-        h.index < self.slots.len() && self.slots[h.index].gen == h.gen
+        h.gen & 1 != 0 && h.index < self.slots.len() && self.slots[h.index].gen == h.gen
     }
 
     /// Takes `h`'s value out. A handle whose value is gone panics.
@@ -172,9 +254,34 @@ impl<T> Arena<T> {
 /// let _ = scores.insert(1, 0.25)
 /// assert(scores.keys()[0] == 1 && scores.at(3) == 0.5)
 /// ```
-pub struct SortedMap<K, V>: Clone + StateHash + Serialize {
+pub struct SortedMap<K, V>: Clone + StateHash {
     keys: Vec<K>,
     values: Vec<V>,
+}
+
+impl<K: Ord + Serialize, V: Serialize> Serialize for SortedMap<K, V> {
+    fn serialize(self, w: mut Writer) {
+        w.write_str("keys")
+        self.keys.serialize(mut w)
+        w.write_str("values")
+        self.values.serialize(mut w)
+    }
+
+    fn deserialize(r: mut Reader) -> Result<SortedMap<K, V>, LoadError> {
+        r.expect_name("keys")?
+        let keys = Vec::<K>::deserialize(mut r)?
+        r.expect_name("values")?
+        let values = Vec::<V>::deserialize(mut r)?
+        if keys.len() != values.len() {
+            return Err(r.fail("the sorted map's saved keys and values have different lengths"))
+        }
+        for i in 1..keys.len() {
+            if keys[i - 1].cmp(keys[i]) != Ordering::Less {
+                return Err(r.fail("the sorted map's saved keys aren't strictly ordered"))
+            }
+        }
+        Ok(SortedMap { keys, values })
+    }
 }
 
 impl<K: Ord, V> SortedMap<K, V> {
@@ -288,5 +395,74 @@ impl<K: Ord, V: Clone> SortedMap<K, V> {
     pub fn get(self, key: K) -> Option<V> {
         let (i, found) = self.search(key)
         if found { Some(self.values[i].clone()) } else { None }
+    }
+}
+
+// ---- tests ------------------------------------------------------------------------------------
+
+@test
+fn saved_arenas_validate_their_indexes() {
+    var original = Arena::new()
+    let removed = original.insert(5)
+    let kept = original.insert(7)
+    let _ = original.remove(removed)
+    let round_trip: Result<Arena<u32>, LoadError> = load(save(original))
+    match take round_trip {
+        Ok(a) => {
+            var loaded = take a
+            assert(loaded.len() == 1 && loaded.contains(kept) && loaded[kept] == 7)
+            let added = loaded.insert(9)
+            assert(loaded.len() == 2 && loaded[added] == 9)
+        },
+        Err(e) => panic(e.what),
+    }
+
+    var w = Writer::new()
+    w.write_str("values")
+    Vec::from([7]).serialize(mut w)
+    w.write_str("slots")
+    Vec::from([Slot { gen: 1, at: 0 }]).serialize(mut w)
+    w.write_str("owners")
+    Vec::from([1]).serialize(mut w)
+    w.write_str("free")
+    0.serialize(mut w)
+    let loaded: Result<Arena<u32>, LoadError> = load(take w.into_bytes())
+    match loaded {
+        Ok(_) => panic("an arena with a dangling owner was loaded"),
+        Err(_) => {},
+    }
+
+    var handle = Writer::new()
+    handle.write_str("index")
+    handle.write_u32(0)
+    handle.write_str("gen")
+    handle.write_u32(0)
+    let loaded_handle: Result<Handle<u32>, LoadError> = load(take handle.into_bytes())
+    match loaded_handle {
+        Ok(_) => panic("a handle with a free generation was loaded"),
+        Err(_) => {},
+    }
+}
+
+@test
+fn saved_sorted_maps_validate_their_order() {
+    var original = SortedMap::new()
+    let _ = original.insert(2, 20)
+    let _ = original.insert(1, 10)
+    let round_trip: Result<SortedMap<u32, u32>, LoadError> = load(save(original))
+    match round_trip {
+        Ok(m) => assert(m.len() == 2 && m.at(1) == 10 && m.at(2) == 20),
+        Err(e) => panic(e.what),
+    }
+
+    var w = Writer::new()
+    w.write_str("keys")
+    Vec::from([2, 1]).serialize(mut w)
+    w.write_str("values")
+    Vec::from([20, 10]).serialize(mut w)
+    let loaded: Result<SortedMap<u32, u32>, LoadError> = load(take w.into_bytes())
+    match loaded {
+        Ok(_) => panic("an out-of-order sorted map was loaded"),
+        Err(_) => {},
     }
 }

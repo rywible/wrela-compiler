@@ -21,7 +21,7 @@ impl IoError {
 /// A request the host answers on a later call. Its answer is a run of `T`s: bytes (`T` is
 /// `u8`) for storage and fetch, a buffer's elements for a readback. A `Pending` is an ordinary
 /// value: keep it in the program's state and poll it each frame.
-pub struct Pending<T>: Clone {
+pub struct Pending<T> {
     request: u32,
     done: bool,
 }

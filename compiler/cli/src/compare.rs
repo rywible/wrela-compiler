@@ -33,7 +33,10 @@ fn registered(manifest: &Path) -> Result<Registered, String> {
     let value = |key: &str| tables.iter().find_map(|t| t.get(key));
     let number = |key: &str| -> Result<f32, String> {
         match value(key) {
-            Some(Toml::Num(x)) => Ok(*x as f32),
+            Some(Toml::Num(x)) if (*x as f32).is_finite() => Ok(*x as f32),
+            Some(Toml::Num(_)) => {
+                Err(format!("{}: `{key}` is too large for an f32", manifest.display()))
+            }
             _ => Err(format!(
                 "{} has no `{key}` (a photo's registration: ground_px, metres_per_px, z0_px, faces)",
                 manifest.display()
@@ -48,12 +51,16 @@ fn registered(manifest: &Path) -> Result<Registered, String> {
             png.display()
         )
     })?;
+    let metres_per_px = number("metres_per_px")?;
+    if !metres_per_px.is_finite() || metres_per_px <= 0.0 {
+        return Err(format!("{}: `metres_per_px` must be finite and positive", manifest.display()));
+    }
     Ok(Registered {
         width,
         height,
         rgba,
         ground_px: number("ground_px")?,
-        metres_per_px: number("metres_per_px")?,
+        metres_per_px,
         z0_px: number("z0_px")?,
         faces_right: !matches!(value("faces"), Some(Toml::Str(f)) if f == "left"),
     })
@@ -351,4 +358,38 @@ pub fn sweep(
     let answer = serde_json::json!({ "action": "sweep", "literal": literal, "png": png.display().to_string(), "panels": legend });
     println!("{answer}");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_photo_registration_needs_a_positive_scale() {
+        let dir = std::env::temp_dir().join(format!("wrela-registration-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let manifest = dir.join("photo.toml");
+        wrela_host::image::write_png(&dir.join("photo.png"), 1, 1, &[0, 0, 0, 255])
+            .expect("write png");
+        for scale in ["0", "-0.1"] {
+            std::fs::write(
+                &manifest,
+                format!("ground_px = 0\nmetres_per_px = {scale}\nz0_px = 0\n"),
+            )
+            .expect("write manifest");
+            assert!(
+                registered(&manifest).is_err_and(|e| e.contains("must be finite and positive"))
+            );
+        }
+        for text in [
+            "ground_px = 1e300\nmetres_per_px = 0.1\nz0_px = 0\n",
+            "ground_px = 0\nmetres_per_px = 1e300\nz0_px = 0\n",
+            "ground_px = 0\nmetres_per_px = 0.1\nz0_px = 1e300\n",
+        ] {
+            std::fs::write(&manifest, text).expect("write manifest");
+            assert!(registered(&manifest).is_err_and(|e| e.contains("too large for an f32")));
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

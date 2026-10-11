@@ -62,6 +62,10 @@ export function browserIo(
   files: string = base,
 ): Io {
   const root = ["wrela", ...new URL(base).pathname.split("/").filter((p) => p !== "")];
+  // `pathProblem` permits a literal `%`, as the native host's file paths do. URL parsing would
+  // interpret percent escapes before resolving dot segments (`%2e%2e` is `..`), so quote each
+  // percent first: the server receives the program's path literally, still under the build.
+  const relativeUrl = (path: string, at: string) => new URL(path.replaceAll("%", "%25"), at);
   const dir = async (parts: string[], create: boolean) => {
     let d = await navigator.storage.getDirectory();
     for (const p of parts) d = await d.getDirectoryHandle(p, { create });
@@ -74,7 +78,7 @@ export function browserIo(
   };
   return {
     async fetch(url) {
-      const response = await get(fetchFn, new URL(url, files));
+      const response = await get(fetchFn, relativeUrl(url, files));
       return new Uint8Array(await response.arrayBuffer());
     },
     async storageRead(path) {
@@ -88,7 +92,7 @@ export function browserIo(
     },
     async post(url, body) {
       // Only to the build's own origin: the path is relative (`pathProblem`).
-      const response = await fetchFn(new URL(url, base), { method: "POST", body });
+      const response = await fetchFn(relativeUrl(url, base), { method: "POST", body });
       if (!response.ok) throw new Error(`POST ${url} failed: ${response.status} ${response.statusText}`);
       return new Uint8Array(await response.arrayBuffer());
     },

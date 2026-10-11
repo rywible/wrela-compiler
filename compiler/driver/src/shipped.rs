@@ -85,6 +85,17 @@ pub fn take(checked: &Checked, data: &mut BuildData) -> (Vec<(String, Vec<u8>)>,
             )));
             continue;
         };
+        if let Some(name) = duplicate_name(&names) {
+            diags.push(
+                Diagnostic::new(
+                    wrela_diag::codes::E0704,
+                    p.const_(c).span,
+                    format!("{} ships more than one file named `{name}`", p.const_(c).shown()),
+                )
+                .with_help("give every file the constant ships a different name"),
+            );
+            continue;
+        }
         if !dirs.insert(dir.clone()) {
             diags.push(
                 Diagnostic::new(
@@ -108,4 +119,27 @@ pub fn take(checked: &Checked, data: &mut BuildData) -> (Vec<(String, Vec<u8>)>,
     }
     files.sort_by(|a, b| a.0.cmp(&b.0));
     (files, diags)
+}
+
+/// A name that occurs more than once, if one does.
+fn duplicate_name(names: &[String]) -> Option<&str> {
+    let mut seen = BTreeSet::new();
+    for name in names {
+        if !seen.insert(name.as_str()) {
+            return Some(name);
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_shipped_files_name_is_unique() {
+        let names = ["a.bin", "b.bin", "a.bin"].map(String::from);
+        assert_eq!(duplicate_name(&names), Some("a.bin"));
+        assert_eq!(duplicate_name(&names[..2]), None);
+    }
 }

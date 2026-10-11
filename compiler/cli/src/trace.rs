@@ -52,7 +52,12 @@ fn parse(args: &[String], bisect: bool) -> Option<Args> {
             }
             "--until" if bisect => a.until = Some(it.next()?.clone()),
             "--frames" => a.frames = it.next()?.parse().ok()?,
-            "--fps" => a.fps = it.next()?.parse().ok()?,
+            "--fps" => {
+                a.fps = it.next()?.parse().ok()?;
+                if !a.fps.is_finite() || a.fps <= 0.0 {
+                    return None;
+                }
+            }
             "--size" => a.size = crate::parse_size(it.next()?)?,
             "--input" => a.input = Some(PathBuf::from(it.next()?)),
             "--release" => a.release = true,
@@ -114,6 +119,7 @@ fn start(a: &Args) -> Result<(Runner, Vec<wrela_abi::input::Scripted>), String> 
     let out =
         if a.release { wrela_driver::build(&a.dir) } else { wrela_driver::build_debug(&a.dir) };
     let built = a.dir.join("build").join(if a.release { "trace" } else { "trace-debug" });
+    crate::generated_path(&a.dir, &built)?;
     crate::write_build(&out, &built)?;
     let manifest =
         std::fs::read_to_string(built.join("manifest.json")).map_err(|e| e.to_string())?;
@@ -307,4 +313,19 @@ fn run_bisect(a: &Args, until: &Until, text: &str) -> Result<ExitCode, String> {
         println!("`{text}` never held in {} frames", a.frames);
     }
     Ok(ExitCode::from(1))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trace_rejects_non_positive_and_non_finite_frame_rates() {
+        for fps in ["0", "-1", "nan", "inf"] {
+            let args = [".", "--watch", "answer", "--fps", fps].map(str::to_string);
+            assert!(parse(&args, false).is_none(), "accepted {fps}");
+        }
+        let args = [".", "--watch", "answer", "--fps", "60"].map(str::to_string);
+        assert_eq!(parse(&args, false).map(|a| a.fps), Some(60.0));
+    }
 }

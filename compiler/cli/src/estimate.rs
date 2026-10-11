@@ -78,8 +78,17 @@ fn parse(args: &[String]) -> Option<Args> {
     (a.skip < a.frames).then_some(a)
 }
 
+fn pair_problem(a: &Args) -> Option<&'static str> {
+    (a.pair.is_some() && a.skip != 0)
+        .then_some("`--pair` requires `--skip 0` so both runs measure the same frames")
+}
+
 pub fn run(args: &[String]) -> ExitCode {
     let Some(a) = parse(args) else { return crate::usage() };
+    if let Some(why) = pair_problem(&a) {
+        eprintln!("error: {why}");
+        return ExitCode::from(2);
+    }
     let calibration = match Calibration::parse(CALIBRATION) {
         Ok(c) => c,
         Err(why) => {
@@ -685,6 +694,20 @@ impl Report {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pairing_counts_every_profiled_frame() {
+        let strings = |xs: &[&str]| xs.iter().map(|x| (*x).to_string()).collect::<Vec<_>>();
+        let paired = parse(&strings(&["package", "--pair", "m4.json"])).expect("valid arguments");
+        assert_eq!(
+            pair_problem(&paired),
+            Some("`--pair` requires `--skip 0` so both runs measure the same frames")
+        );
+
+        let all = parse(&strings(&["package", "--pair", "m4.json", "--skip", "0"])).expect("valid");
+        assert_eq!(pair_problem(&all), None);
+        assert_eq!(pair_problem(&parse(&strings(&["package"])).expect("valid")), None);
+    }
 
     fn point(name: &str, m4_ms: f64, items: f64, lvp_ms: f64, fragments: f64) -> Point {
         let features = Features { items, lvp_ms, fragments, ..Features::default() };

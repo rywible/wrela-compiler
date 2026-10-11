@@ -173,7 +173,17 @@ fn solve(
     let package = wrela_driver::manifest::name_in(dir)
         .ok_or_else(|| format!("`{}` has no wrela.toml with a package name", dir.display()))?;
     let glue_dir = dir.join("build").join("solve");
+    crate::generated_path(dir, &glue_dir)?;
+    if crate::is_symlink(&glue_dir) {
+        return Err(format!("{} is a symbolic link, so it won't be used", glue_dir.display()));
+    }
     std::fs::create_dir_all(&glue_dir).map_err(|e| e.to_string())?;
+    if let Some(name) = crate::symlink_in(&glue_dir, ["wrela.toml", "main.wrela"]) {
+        return Err(format!(
+            "{} is a symbolic link, so it won't be replaced",
+            glue_dir.join(name).display()
+        ));
+    }
     std::fs::write(
         glue_dir.join("wrela.toml"),
         format!(
@@ -238,6 +248,15 @@ fn solve(
         [Value::F32(a), Value::F32(b), Value::F32(c)] => (*a, *b, *c),
         other => return Err(format!("`losses` returned {other:?}")),
     };
+    if !before.is_finite() {
+        return Err("the function's loss is not finite at the literals' starting values".into());
+    }
+    if !solved_loss.is_finite() {
+        return Err("the function's loss is not finite at the solved values".into());
+    }
+    if !after.is_finite() {
+        return Err("the function's loss is not finite at the rounded solution".into());
+    }
     let taken = match call(&mut host, "steps", &[])?.as_slice() {
         [Value::I32(n)] => *n as u32,
         other => return Err(format!("`steps` returned {other:?}")),

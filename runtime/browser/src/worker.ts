@@ -12,8 +12,8 @@ import { arrivals, epochNow, InputRing, parseScript, type Scripted } from "./inp
 import { type Asked, HandOvers } from "./handover.ts";
 import { browserIo, type Build, loadBuild, startProgram } from "./loader.ts";
 import { Live } from "./live.ts";
-import { type Program, type ProgramOptions, runWorker, type SpawnWorker } from "./program.ts";
-import type { FromTicker, FromWorker, Loaded, Replay, TickerOptions, TickerStart, TickReport, ToWorker, VoiceOptions } from "./messages.ts";
+import { type PrintSink, type Program, type ProgramOptions, runWorker, type SpawnWorker } from "./program.ts";
+import type { FromHelper, FromTicker, FromWorker, Loaded, Replay, TickerOptions, TickerStart, TickReport, ToWorker, VoiceOptions } from "./messages.ts";
 import { encodePng } from "./png.ts";
 import { frameTime, holdFor, loaded, putResult, sleepUntil, type TestParams } from "./testmode.ts";
 import { lockstepTicks, runTicker, TickerControl, TickerMode } from "./ticker.ts";
@@ -130,8 +130,12 @@ const NORMAL_TICKS: TickSettings = { script: [], hashes: false, timing: false, d
  * to run it. `wasm` is the build's, whose hash heads the tick log when hashes are kept. With
  * `replay`, a hot reload's: the ticker runs the replaced build's ticks again first, and reads
  * the input ring on from where the replaced one stopped. */
-function tickerStarter(wasm: Uint8Array, settings: TickSettings, replay: Replay | null = null): (options: TickerOptions) => void {
-  return (options) => {
+function tickerStarter(
+  wasm: Uint8Array,
+  settings: TickSettings,
+  replay: Replay | null = null,
+): (options: TickerOptions, onPrint: PrintSink) => void {
+  return (options, onPrint) => {
     if (replay === null) ring?.attachTicker();
     const thread = new Worker(self.location.href, { type: "module", name: "wrela sim" });
     ticker.thread = thread;
@@ -139,6 +143,7 @@ function tickerStarter(wasm: Uint8Array, settings: TickSettings, replay: Replay 
       thread.onmessage = (event: MessageEvent<FromTicker>) => {
         const msg = event.data;
         if (msg.type === "fatal") fatal(new Error(msg.message));
+        else if (msg.type === "print") onPrint(msg.line);
         else resolve(msg);
       };
     });
@@ -233,7 +238,11 @@ async function swap(old: Program, base: string, frames: number, start: Start): P
   const build = await loadBuild(base);
   buildBase = base;
   running = build;
-  return start(build, await stop(old, frames, true));
+  const program = await start(build, await stop(old, frames, true));
+  // A ticker may disappear across a reload. Its reader must then stop holding the shared input
+  // ring back; a replacement ticker attaches itself during its `init` instead.
+  if (program.ticker === null) ring?.detachTicker();
+  return program;
 }
 
 // ---- Hand-over ----
@@ -273,6 +282,7 @@ async function handOver(old: Program, asked: Asked, frames: number, start: Start
   buildBase = asked.base;
   try {
     const program = await start(ready, carried);
+    if (program.ticker === null) ring?.detachTicker();
     running = ready;
     leftovers = new Map([...before].filter(([key]) => !pipelineCache.has(key)));
     return program;
@@ -289,7 +299,9 @@ async function handOver(old: Program, asked: Asked, frames: number, start: Start
     buildBase = back.base;
     pipelineCache.clear();
     for (const [key, p] of before) pipelineCache.set(key, p);
-    return start(back.build, carried);
+    const program = await start(back.build, carried);
+    if (program.ticker === null) ring?.detachTicker();
+    return program;
   }
 }
 
@@ -299,7 +311,11 @@ let size = { width: 1, height: 1 };
 
 /** Hands the program's voice to the main thread, which plays it in an AudioWorklet: an
  * AudioContext exists only there. */
-const startVoice = (voice: VoiceOptions) => self.postMessage({ type: "audio", voice } satisfies FromWorker);
+let voicePrint: PrintSink = () => {};
+const startVoice = (voice: VoiceOptions, onPrint: PrintSink) => {
+  voicePrint = onPrint;
+  self.postMessage({ type: "audio", voice } satisfies FromWorker);
+};
 
 /** Helpers for parallel work and jobs: one per core beyond the main thread, the render worker
  * and the ticker's thread, at most MAX_WORKERS (#43 §2.1). The program's own thread counts too. */
@@ -612,17 +628,6 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
     ]);
   }
   const rgba = await readTexture(device, screen);
-  await Promise.all([
-    putResult(base, "frame.rgba", rgba),
-    putResult(base, "frame.png", encodePng(width, height, rgba)),
-    putResult(base, "hash.txt", `${hash ? hash.hex() : "none"}\n`),
-    putResult(base, "workers.txt", `${program.workerChunks()}\n`),
-    putResult(base, "log.txt", printed.map((l) => `${l}\n`).join("")),
-    putResult(base, "frames.json", JSON.stringify({ cpu_ms: cpu, began_ms, printed_in })),
-    timing !== "off" ? executor.timings().then((t) => putResult(base, "timings.json", JSON.stringify(t))) : null,
-    params.salt > 0 ? putResult(base, "pipelines.json", JSON.stringify({ ms: pipelinesMs, count: build.manifest.pipelines.length, each })) : null,
-    putResult(base, "memory.json", JSON.stringify({ gpu: executor.memory, wasm: program.memoryBytes })),
-  ]);
   if (params.audio > 0 || params.live > 0) {
     if (!program.hasVoice) throw new Error("the test asks for audio, but the program started no voice");
     await audioRendered.promise;
@@ -635,6 +640,19 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
     if (params.clipfrom + params.clip >= frames) self.postMessage({ type: "clip-stop" } satisfies FromWorker);
     await clipSaved.promise;
   }
+  // The audio and ticker threads' print messages precede their completion messages, so their
+  // lines are in the program's print sink before its log is serialized here.
+  await Promise.all([
+    putResult(base, "frame.rgba", rgba),
+    putResult(base, "frame.png", encodePng(width, height, rgba)),
+    putResult(base, "hash.txt", `${hash ? hash.hex() : "none"}\n`),
+    putResult(base, "workers.txt", `${program.workerChunks()}\n`),
+    putResult(base, "log.txt", printed.map((l) => `${l}\n`).join("")),
+    putResult(base, "frames.json", JSON.stringify({ cpu_ms: cpu, began_ms, printed_in })),
+    timing !== "off" ? executor.timings().then((t) => putResult(base, "timings.json", JSON.stringify(t))) : null,
+    params.salt > 0 ? putResult(base, "pipelines.json", JSON.stringify({ ms: pipelinesMs, count: build.manifest.pipelines.length, each })) : null,
+    putResult(base, "memory.json", JSON.stringify({ gpu: executor.memory, wasm: program.memoryBytes })),
+  ]);
   self.postMessage({ type: "load-query" } satisfies FromWorker);
   const page = await pageLoaded.promise;
   const resources = [...page.resources, ...loaded(["resource"])];
@@ -645,9 +663,10 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
 }
 
 /** Starts a worker thread for the program's parallel jobs: this script again, told to run them. */
-const spawnWorker: SpawnWorker = (module, memory, index) => {
+const spawnWorker: SpawnWorker = (module, memory, index, onPrint) => {
   const thread = new Worker(self.location.href, { type: "module", name: `wrela thread ${index}` });
   helpers.push(thread);
+  thread.onmessage = (event: MessageEvent<FromHelper>) => onPrint(event.data.line);
   thread.postMessage({ type: "thread", module, memory, index } satisfies ToWorker);
 };
 
@@ -678,6 +697,9 @@ self.onmessage = (event: MessageEvent<ToWorker>) => {
     case "audio-rendered":
       audioRendered.resolve();
       return;
+    case "print":
+      voicePrint(msg.line);
+      return;
     case "latency-sent":
       latencySent.resolve();
       return;
@@ -686,7 +708,9 @@ self.onmessage = (event: MessageEvent<ToWorker>) => {
       return;
     case "thread":
       // It runs until the program shuts it down, or the page goes away.
-      void runWorker(msg.module, msg.memory, msg.index);
+      void runWorker(msg.module, msg.memory, msg.index, (line) => {
+        self.postMessage({ type: "print", line } satisfies FromHelper);
+      });
       return;
     case "start": {
       base = msg.base;

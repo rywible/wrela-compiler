@@ -71,11 +71,11 @@ fn replica_command(args: &[String]) -> Result<ExitCode, String> {
                 None => return Ok(crate::usage()),
             },
             "--sections-every" => match it.next().and_then(|m| m.parse::<f64>().ok()) {
-                Some(m) if m > 0.0 => every = Some(m),
+                Some(m) if m.is_finite() && m > 0.0 => every = Some(m),
                 _ => return Ok(crate::usage()),
             },
             "--seam" => match it.next().and_then(|m| m.parse::<f64>().ok()) {
-                Some(m) if m >= 0.0 => seam = Some(m),
+                Some(m) if m.is_finite() && m >= 0.0 => seam = Some(m),
                 _ => return Ok(crate::usage()),
             },
             "-o" | "--out" => match it.next() {
@@ -671,6 +671,9 @@ pub(crate) fn parse_toml(text: &str) -> Result<Vec<Table>, String> {
             return Err(at("something follows the value (a list stays on one line)".into()));
         }
         if let Some(t) = tables.last_mut() {
+            if t.entries.iter().any(|(k, _)| k == &key) {
+                return Err(at(format!("`{key}` is given twice in this table")));
+            }
             t.entries.push((key, value));
         }
     }
@@ -727,19 +730,33 @@ fn read_value(chars: &[char], start: usize) -> Result<(Value, usize), String> {
         '[' => {
             let mut items = Vec::new();
             i += 1;
+            while chars[i] == ' ' {
+                i += 1;
+            }
+            if chars[i] == ']' {
+                return Ok((Value::List(items), i + 1));
+            }
             loop {
-                while chars[i] == ' ' || chars[i] == ',' {
-                    i += 1;
-                }
-                if chars[i] == ']' {
-                    return Ok((Value::List(items), i + 1));
-                }
-                if chars[i] == '\n' {
-                    return Err("a list doesn't end on its line".into());
-                }
                 let (v, n) = read_value(chars, i)?;
                 items.push(v);
                 i = n;
+                while chars[i] == ' ' {
+                    i += 1;
+                }
+                match chars[i] {
+                    ']' => return Ok((Value::List(items), i + 1)),
+                    ',' => {
+                        i += 1;
+                        while chars[i] == ' ' {
+                            i += 1;
+                        }
+                        if chars[i] == ']' {
+                            return Ok((Value::List(items), i + 1));
+                        }
+                    }
+                    '\n' => return Err("a list doesn't end on its line".into()),
+                    _ => return Err("a list's items are separated by commas".into()),
+                }
             }
         }
         _ => {
@@ -747,10 +764,11 @@ fn read_value(chars: &[char], start: usize) -> Result<(Value, usize), String> {
                 .find(|&k| matches!(chars[k], ',' | ']' | '\n' | ' '))
                 .unwrap_or(chars.len());
             let word: String = chars[i..end].iter().collect();
-            word.replace('_', "")
-                .parse::<f64>()
-                .map(|x| (Value::Num(x), end))
-                .map_err(|_| format!("`{word}` isn't a string, a number or a list"))
+            match word.replace('_', "").parse::<f64>() {
+                Ok(x) if x.is_finite() => Ok((Value::Num(x), end)),
+                Ok(_) => Err(format!("`{word}` isn't a finite number")),
+                Err(_) => Err(format!("`{word}` isn't a string, a number or a list")),
+            }
         }
     }
 }
@@ -845,6 +863,13 @@ impl PartsFile {
             };
             if parts.iter().any(|p| p.name == name) {
                 return Err(format!("two parts are named `{name}`"));
+            }
+            if let Some(other) = parts.iter().find(|p| ident(&p.name) == ident(&name)) {
+                return Err(format!(
+                    "parts `{}` and `{name}` both become the identifier `{}`",
+                    other.name,
+                    ident(&name)
+                ));
             }
             let from = resolve(t.get("from"), "from", &name)?;
             let to = resolve(t.get("to"), "to", &name)?;
@@ -1427,7 +1452,13 @@ fn ident(name: &str) -> String {
         s = s.replace("__", "_");
     }
     let s = s.trim_matches('_').to_string();
-    if s.starts_with(|c: char| c.is_ascii_digit()) { format!("part_{s}") } else { s }
+    if wrela_syntax::lexer::is_name(&s) {
+        s
+    } else if s.is_empty() {
+        "part".into()
+    } else {
+        format!("part_{s}")
+    }
 }
 
 /// The engine package: the nearest `engine/` with a `wrela.toml` above `start`.
@@ -1451,6 +1482,9 @@ pub fn write_package(
     out: &Path,
     engine: &Path,
 ) -> Result<(), String> {
+    if crate::is_symlink(out) {
+        return Err(format!("{} is a symbolic link, so it won't be used", out.display()));
+    }
     std::fs::create_dir_all(out).map_err(|e| format!("can't make {}: {e}", out.display()))?;
     let out_abs = out.canonicalize().map_err(|e| e.to_string())?;
     let engine = engine.canonicalize().map_err(|e| format!("{}: {e}", engine.display()))?;
@@ -1467,6 +1501,12 @@ pub fn write_package(
         ("subject.wrela", SUBJECT.to_string()),
         ("main.wrela", MAIN.to_string()),
     ];
+    if let Some(name) = crate::symlink_in(out, files.iter().map(|(name, _)| *name)) {
+        return Err(format!(
+            "{} is a symbolic link, so it won't be replaced",
+            out.join(name).display()
+        ));
+    }
     for (f, text) in files {
         let formatted = if f.ends_with(".wrela") {
             wrela_driver::on_compiler_thread(|| crate::fmt::format_text(&text))
@@ -1736,8 +1776,8 @@ fn deviation_command(args: &[String]) -> Result<ExitCode, String> {
     while let Some(a) = it.next() {
         match a.as_str() {
             "--points" => match it.next().and_then(|n| n.parse().ok()) {
-                Some(n) => points = n,
-                None => return Ok(crate::usage()),
+                Some(n) if n > 0 => points = n,
+                _ => return Ok(crate::usage()),
             },
             "--json" => json = true,
             _ if parts.is_none() && !a.starts_with('-') => parts = Some(PathBuf::from(a)),
@@ -1774,6 +1814,7 @@ impl Replica {
             return Err(wrela_diag::render::render_all(&out.sources, &out.diagnostics));
         }
         let built = package.join("build").join("cpu");
+        crate::generated_path(package, &built)?;
         out.write_to(&built).map_err(|e| e.to_string())?;
         let build = CpuBuild::load(&built).map_err(cant_run)?;
         let probe = Probe(build.start().map_err(cant_run)?);
@@ -2345,6 +2386,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn deviation_needs_at_least_one_sample_point() {
+        let args = ["parts.toml", "package", "--points", "0"].map(String::from);
+        assert!(deviation_command(&args).is_ok_and(|code| code == ExitCode::from(2)));
+    }
+
+    #[test]
+    fn generated_identifiers_are_never_empty_or_keywords() {
+        assert_eq!(ident("front leg"), "front_leg");
+        assert_eq!(ident("123"), "part_123");
+        assert_eq!(ident("!!!"), "part");
+        assert_eq!(ident("struct"), "part_struct");
+    }
+
+    #[test]
     fn the_toml_subset_reads_tables_arrays_quotes_and_lists() {
         let t = parse_toml(
             "# a comment\nreference = \"a \\\"b\\\" # c\" # d\n[landmarks]\n\"elbow left\" = [0.1, -2, 3_000.5]\n[[part]]\nname = \"x\"\n[[part]]\nname = \"y\"\nangles = 32\n",
@@ -2359,6 +2414,14 @@ mod tests {
         assert_eq!(t[3].get("angles"), Some(&Value::Num(32.0)));
         assert!(parse_toml("x = [1, 2\n").is_err());
         assert!(parse_toml("x = 1 2\n").is_err());
+        for list in ["[1 2]", "[, 1]", "[1,, 2]"] {
+            assert!(parse_toml(&format!("x = {list}\n")).is_err(), "accepted {list}");
+        }
+        assert!(parse_toml("x = [1, 2,]\n").is_ok());
+        assert!(parse_toml("x = 1\nx = 2\n").is_err());
+        for number in ["inf", "-inf", "NaN"] {
+            assert!(parse_toml(&format!("x = {number}\n")).is_err(), "accepted {number}");
+        }
     }
 
     /// A sphere mesh (radius 0.1 m at (0, 0.2, 0) once placed) and its manifest in a new

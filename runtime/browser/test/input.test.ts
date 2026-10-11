@@ -29,6 +29,30 @@ test("a full ring drops what's written until it's read", () => {
   expect(ring.write(textEvent(1), 0)).toBe(true);
 });
 
+test("the ring's unsigned counters cross the signed boundary", () => {
+  const ring = InputRing.create();
+  const counts = new Int32Array(ring.buffer, 0, 4);
+  Atomics.store(counts, 0, 0x7fff_ffff);
+  Atomics.store(counts, 1, 0x7fff_ffff);
+  expect(ring.write(textEvent(1), 1)).toBe(true);
+  expect(ring.write(textEvent(2), 2)).toBe(true);
+  expect(ring.write(textEvent(3), 3)).toBe(true);
+  const read = ring.read();
+  expect(read.events.length).toBe(3 * EVENT_SIZE);
+  expect([read.events[8], read.events[EVENT_SIZE + 8], read.events[2 * EVENT_SIZE + 8]]).toEqual([1, 2, 3]);
+  expect(read.times).toEqual([1, 2, 3]);
+});
+
+test("detaching a replaced ticker lets frames release ring space", () => {
+  const ring = InputRing.create();
+  ring.attachTicker();
+  for (let i = 0; i < InputRing.CAPACITY; i++) expect(ring.write(textEvent(i), i)).toBe(true);
+  ring.read();
+  expect(ring.write(textEvent(1), 0)).toBe(false);
+  ring.detachTicker();
+  expect(ring.write(textEvent(1), 0)).toBe(true);
+});
+
 test("text is characters: a lone surrogate is refused, as the native host refuses it", () => {
   expect(parseScript('[{"frame": 0, "type": "text", "text": "a\\ud83d\\ude00"}]').length).toBe(2);
   expect(() => parseScript('[{"frame": 0, "type": "text", "text": "\\ud800"}]')).toThrow("lone surrogate");

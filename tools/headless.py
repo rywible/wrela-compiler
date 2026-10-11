@@ -27,11 +27,13 @@ request sharing the rate (tools/serve.py).
 """
 
 import fcntl
+import math
 import os
 import re
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -204,10 +206,15 @@ def main(argv):
         fragment = argv[2] if len(argv) > 2 else "#run"
         timeout_arg = argv[3] if len(argv) > 3 else None
         page_dir = os.path.join(serve.ROOT, page)
+        root = os.path.realpath(serve.ROOT)
+        if os.path.commonpath([os.path.realpath(page_dir), root]) != root:
+            fail(2, f"page directory must be inside the repository, not {argv[1]}")
     try:
         timeout = float(timeout_arg) if timeout_arg else 120.0
     except ValueError:
         fail(2, f"timeout must be a number of seconds, not {timeout_arg!r}")
+    if not math.isfinite(timeout) or timeout <= 0:
+        fail(2, f"timeout must be a positive finite number of seconds, not {timeout_arg!r}")
     if not os.path.isdir(page_dir):
         fail(2, f"no page directory at {page_dir}")
     if not os.access(CHROME, os.X_OK):
@@ -220,10 +227,19 @@ def main(argv):
     # What an earlier run left (a stale DONE above all) isn't this run's.
     results = os.path.join(page_dir, "results")
     try:
-        shutil.rmtree(results)
+        mode = os.lstat(results).st_mode
+        if stat.S_ISDIR(mode) and not stat.S_ISLNK(mode):
+            shutil.rmtree(results)
+        else:
+            os.unlink(results)
     except FileNotFoundError:
         pass
-    os.makedirs(results)
+    except OSError as e:
+        fail(2, f"can't clear {results}: {e}")
+    try:
+        os.makedirs(results)
+    except OSError as e:
+        fail(2, f"can't make {results}: {e}")
 
     done = []
     server = None

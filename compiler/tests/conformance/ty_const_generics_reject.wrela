@@ -22,3 +22,23 @@ fn window() -> u32 {
     let w: Window<TWICE> = Window { xs: [0.0; 8] } //~ E0325
     8
 }
+
+struct Holder<T> {
+    value: T,
+}
+
+fn kind_mismatches<T, const M: u32>(a: Window<T>, b: Holder<M>) { //~ E0212 E0212
+}
+
+fn value<const M: u32>() -> u32 {
+    M
+}
+
+fn explicit_kind_mismatch() -> u32 {
+    let a = value::<u32>() //~ E0212
+    a + Window::<u32>::length() //~ E0212
+}
+
+impl<const N: u32> Window<N> {
+    fn length() -> u32 { N }
+}

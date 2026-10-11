@@ -27,6 +27,7 @@
 
 use crate::hash::StateHash;
 use crate::input::EVENT_SIZE;
+use crate::memory::MAX_TICK_RECORDS;
 use std::fmt;
 
 pub const VERSION: u32 = 1;
@@ -64,6 +65,11 @@ pub enum TickLogError {
         at: u32,
         tick: u32,
     },
+    /// Tick `at` has more records than one tick can consume.
+    TooManyRecords {
+        at: u32,
+        count: u32,
+    },
     /// The log ends inside tick `at`.
     Truncated {
         at: u32,
@@ -81,6 +87,10 @@ impl fmt::Display for TickLogError {
             TickLogError::OutOfOrder { at, tick } => {
                 write!(f, "the log's tick {at} is numbered {tick}: ticks go from 0 in order")
             }
+            TickLogError::TooManyRecords { at, count } => write!(
+                f,
+                "the log's tick {at} has {count} records; a tick takes at most {MAX_TICK_RECORDS}"
+            ),
             TickLogError::Truncated { at } => write!(f, "the log ends inside tick {at}"),
         }
     }
@@ -176,10 +186,14 @@ impl TickLog {
             if bytes.len() - at < 8 {
                 return Err(truncated);
             }
-            let (tick, count) = (u32_at(at), u32_at(at + 4) as usize);
+            let (tick, count) = (u32_at(at), u32_at(at + 4));
             if tick != k {
                 return Err(TickLogError::OutOfOrder { at: k, tick });
             }
+            if count > MAX_TICK_RECORDS {
+                return Err(TickLogError::TooManyRecords { at: k, count });
+            }
+            let count = count as usize;
             at += 8;
             let need =
                 count.checked_mul(event).and_then(|n| n.checked_add(8)).ok_or(truncated.clone())?;
@@ -243,6 +257,15 @@ mod tests {
         assert_eq!(
             TickLog::decode(&good[..good.len() - 3]),
             Err(TickLogError::Truncated { at: 1 })
+        );
+        let mut oversized = TickLog::new(1, 60, 2);
+        oversized.ticks.push(Tick {
+            records: vec![Event::text('x').bytes(); MAX_TICK_RECORDS as usize + 1],
+            hash: 3,
+        });
+        assert_eq!(
+            TickLog::decode(&oversized.encode()),
+            Err(TickLogError::TooManyRecords { at: 0, count: MAX_TICK_RECORDS + 1 })
         );
     }
 

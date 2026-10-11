@@ -65,7 +65,10 @@ pub fn parse_obj(text: &str) -> Result<Mesh, String> {
                     *c = words
                         .next()
                         .and_then(|w| w.parse().ok())
-                        .ok_or_else(|| format!("line {}: a vertex has three numbers", n + 1))?;
+                        .filter(|x: &f64| x.is_finite())
+                        .ok_or_else(|| {
+                            format!("line {}: a vertex has three finite numbers", n + 1)
+                        })?;
                 }
                 vertices.push(p);
             }
@@ -124,6 +127,9 @@ pub fn parse_stl(bytes: &[u8]) -> Result<Mesh, String> {
                 let bits = u32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]]);
                 key[k] = bits;
                 p[k] = f64::from(f32::from_bits(bits));
+                if !p[k].is_finite() {
+                    return Err("an STL vertex has a non-finite coordinate".to_string());
+                }
             }
             *corner = *index.entry(key).or_insert_with(|| {
                 vertices.push(p);
@@ -583,6 +589,7 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(m.triangles, vec![[0, 1, 2], [0, 2, 3], [3, 2, 1]]);
         assert!(parse_obj("v 0 0 0\nf 1 2 3\n").is_err());
+        assert!(parse_obj("v NaN 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n").is_err());
     }
 
     #[test]
@@ -609,6 +616,9 @@ pub(crate) mod tests {
         let mut empty = vec![0u8; 80];
         empty.extend(0u32.to_le_bytes());
         assert!(parse_stl(&empty).is_err_and(|e| e.contains("no triangles")));
+        let mut non_finite = bytes;
+        non_finite[96..100].copy_from_slice(&f32::INFINITY.to_le_bytes());
+        assert!(parse_stl(&non_finite).is_err_and(|e| e.contains("non-finite")));
     }
 
     #[test]

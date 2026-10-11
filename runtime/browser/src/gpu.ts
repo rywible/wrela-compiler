@@ -583,6 +583,8 @@ export class GpuExecutor {
   /** Why a pipeline couldn't be built, or a command that waited for one failed when it ran:
    * the program has failed (`caughtUp` rejects with it, and `waiting` throws it). */
   #failed: unknown = null;
+  /** Hot reload retired this executor: no asynchronous pipeline completion may run more work. */
+  #retired = false;
   /** Resolved when every pipeline is built; rejected, with why, if one can't be. */
   readonly built: Promise<void>;
 
@@ -599,11 +601,18 @@ export class GpuExecutor {
     this.#deferred = timing === "serial" ? [] : null;
     this.#pipelines = pipelines.map((p) => (p instanceof Promise ? undefined : p));
     this.#building = pipelines.map((p) => Promise.resolve(p));
-    this.built = Promise.all(this.#building).then(() => {});
+    this.built = Promise.all(this.#building).then(
+      () => {},
+      (e: unknown) => {
+        // A superseded build's late shader failure belongs to it, not to the running build.
+        if (!this.#retired) throw e;
+      },
+    );
     pipelines.forEach((p, i) => {
       if (!(p instanceof Promise)) return;
       p.then(
         (built) => {
+          if (this.#retired || this.#failed !== null) return;
           this.#pipelines[i] = built;
           // A command that waited and then fails fails the program, as it would have had it
           // run when it came: not lost in this callback, with the commands behind it waiting.
@@ -676,6 +685,7 @@ export class GpuExecutor {
    * for `drain` in the serial mode. Requests are the program's business, except a readback's
    * copy (`readBack`). */
   execute(cmd: Command): void {
+    if (this.#retired) throw new Error("host bug: a retired GPU executor received a command");
     const at = { frame: this.#frame, generation: this.#generation };
     if (this.#deferred !== null) this.#deferred.push({ cmd: copied(cmd), at });
     else if (this.#waiting.length > 0 || !this.#ready(cmd)) this.#waiting.push({ cmd: copied(cmd), at });
@@ -691,9 +701,17 @@ export class GpuExecutor {
 
   /** The program has failed, as `e` says (`#failed`). */
   #fail(e: unknown): void {
-    this.#failed ??= e;
+    if (this.#retired || this.#failed !== null) return;
+    this.#failed = e;
+    this.#rejectDeferred(this.#waiting, e);
+    if (this.#deferred !== null) this.#rejectDeferred(this.#deferred, e);
     this.#idle?.reject(e);
     this.#idle = null;
+  }
+
+  /** Drops queued commands and rejects queued readbacks with `e`. */
+  #rejectDeferred(queue: Deferred[], e: unknown): void {
+    for (const d of queue.splice(0)) if (!("cmd" in d)) d.answer.reject(e);
   }
 
   /** Resolves once no command waits for a pipeline being built (at once, if none does); rejects
@@ -713,7 +731,7 @@ export class GpuExecutor {
   /** A pipeline was built: the commands waiting run, up to the next that needs one not built,
    * and what they recorded is submitted. */
   #resume(): void {
-    if (this.#waiting.length === 0) return;
+    if (this.#retired || this.#failed !== null || this.#waiting.length === 0) return;
     while (this.#waiting.length > 0) {
       const d = this.#waiting[0]!;
       if ("cmd" in d && !this.#ready(d.cmd)) return;
@@ -927,6 +945,7 @@ export class GpuExecutor {
    * a `ReadBuffer` request's answer. In the serial mode it waits its turn behind the commands
    * kept for `drain`, unless `now`. */
   readBack(handle: number, offset: number, size: number, now = false): Promise<Bytes> {
+    if (this.#retired) return Promise.reject(new Error("the GPU executor was retired"));
     const queue = this.#deferred ?? (this.#waiting.length > 0 ? this.#waiting : null);
     if (queue !== null && !now) {
       const answer = Promise.withResolvers<Bytes>();
@@ -971,6 +990,13 @@ export class GpuExecutor {
   /** Hot reload: every buffer and texture the program made, destroyed, after what's recorded
    * is submitted; the executor is used no more. */
   destroyAll(): void {
+    if (this.#retired) return;
+    this.#retired = true;
+    const retired = new Error("the GPU executor was retired");
+    this.#rejectDeferred(this.#waiting, retired);
+    if (this.#deferred !== null) this.#rejectDeferred(this.#deferred, retired);
+    this.#idle?.reject(retired);
+    this.#idle = null;
     this.#pass = null;
     for (const handle of [...this.#resources.keys()]) this.#destroy(handle);
     this.flush();

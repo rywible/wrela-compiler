@@ -7,3 +7,9 @@ fn f(l: Log) -> u32 {
     let c = l.clone() //~ E0514
     c.count
 }
+
+// A pending request is a one-shot owned handle: cloning it would leave the copy pending
+// forever after the first handle takes the host's answer.
+fn pending_request(p: std::io::Pending<u8>) {
+    let copy = p.clone() //~ E0514
+}

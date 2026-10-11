@@ -1,0 +1,27 @@
+// rejects: mem.modes
+
+struct Log {
+    n: u32,
+}
+
+struct Keep<F> {
+    f: F,
+}
+
+fn keep_mut<F: fn(mut Log) -> u32>(f: F) -> Keep<F> {
+    Keep { f }
+}
+
+fn apply_read(f: fn(Log) -> u32, log: Log) -> u32 {
+    f(log)
+}
+
+fn probe(log: mut Log) -> u32 {
+    log.n = 1
+    log.n
+}
+
+fn run(log: Log) -> u32 {
+    let held = keep_mut(|log| probe(mut log))
+    apply_read(held.f, log) //~ E0300
+}

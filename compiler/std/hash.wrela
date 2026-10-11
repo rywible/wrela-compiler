@@ -92,6 +92,9 @@ pub fn state_hash<T: StateHash>(x: T) -> u64 {
 pub fn canonical_bits(x: f32) -> u32 {
     if x != x {
         0x7fc00000
+    } else if x == 0.0 {
+        // `0.0 == -0.0`, so they must hash alike too.
+        0
     } else {
         bitcast_u32(x)
     }
@@ -101,6 +104,8 @@ pub fn canonical_bits(x: f32) -> u32 {
 pub fn canonical_bits64(x: f64) -> u64 {
     if x != x {
         0x7ff8000000000000
+    } else if x == 0.0 {
+        0
     } else {
         bitcast_u64(x)
     }
@@ -294,4 +299,14 @@ impl<T: StateHash> StateHash for Box<T> {
             self.get().state_hash(mut h)
         }
     }
+}
+
+// ---- tests ------------------------------------------------------------------------------------
+
+@test
+fn equal_signed_zeros_hash_alike() {
+    assert(0.0 == -0.0 && state_hash(0.0) == state_hash(-0.0))
+    let positive: f64 = 0.0
+    let negative: f64 = -0.0
+    assert(positive == negative && state_hash(positive) == state_hash(negative))
 }

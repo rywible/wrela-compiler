@@ -80,6 +80,31 @@ fn a_loss_is_minimized_over_the_literals_named_and_written_back() {
     );
 }
 
+#[test]
+fn a_negative_loss_uses_its_magnitude_for_rounding_tolerance() {
+    let fit = "pub const X: f32 = 1.0\n\npub fn miss() -> f32 {\n    let d = X - 1.25\n    d * d - 100.0\n}\n";
+    let dir = common::package(
+        "solve-negative-loss",
+        &[
+            ("wrela.toml", &common::manifest("negative_loss")),
+            ("fit.wrela", fit),
+            ("main.wrela", common::FRAME),
+        ],
+    );
+    let answer = common::answer(common::wrela().arg("solve").arg(&dir).args([
+        "--minimize",
+        "fit::miss",
+        "--free",
+        "fit.wrela:1",
+        "--json",
+    ]));
+    let solved = answer["loss_solved"].as_f64().unwrap();
+    let after = answer["loss_after"].as_f64().unwrap();
+    let x = answer["literals"][0]["after"].as_f64().unwrap();
+    assert!(solved < -99.9999 && after < -99.99, "{answer}");
+    assert!((x - 1.3).abs() < 1e-6, "the source-precision value is kept: {answer}");
+}
+
 const BALL: &str = "use std::field::{Surface, sphere}
 
 /// A ball on the ground.
@@ -128,4 +153,26 @@ fn a_spec_is_solved_over_a_files_literals() {
         .map(|c| c["name"].as_str().unwrap())
         .collect();
     assert_eq!(names, ["height", "width"]);
+}
+
+#[test]
+fn a_non_finite_loss_is_not_reported_as_solved() {
+    let dir = common::package(
+        "solve-non-finite",
+        &[
+            ("wrela.toml", &common::manifest("bad_loss")),
+            ("fit.wrela", "pub const X: f32 = 1.0\n\npub fn miss() -> f32 {\n    sqrt(-X)\n}\n"),
+            ("main.wrela", common::FRAME),
+        ],
+    );
+    let out = common::wrela()
+        .arg("solve")
+        .arg(&dir)
+        .args(["--minimize", "fit::miss", "--free", "fit.wrela:1", "--json"])
+        .output()
+        .expect("run wrela");
+    assert_eq!(out.status.code(), Some(1));
+    let answer: serde_json::Value = serde_json::from_slice(&out.stdout).expect("JSON");
+    assert_eq!(answer["solved"], false);
+    assert!(answer["why"].as_str().is_some_and(|w| w.contains("not finite")), "{answer}");
 }

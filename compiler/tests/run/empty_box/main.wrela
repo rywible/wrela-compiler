@@ -1,0 +1,36 @@
+// run: a serialized empty `Box` remains a valid nullable job-local representation, but its
+// safe value accessors never read or take ownership from address zero
+// expect: compare_empty() = true
+// expect: get_empty() panics "get: an empty `Box` has no value"
+// expect: get_mut_empty() panics "get_mut: an empty `Box` has no value"
+// expect: take_empty() panics "into_inner: an empty `Box` has no value"
+
+use std::serialize::{LoadError, load}
+
+fn empty_owned() -> Box<Vec<u32>> {
+    let loaded: Result<Box<Vec<u32>>, LoadError> = load(Vec::from([0]))
+    take loaded.unwrap()
+}
+
+pub fn compare_empty() -> bool {
+    let a = empty_owned()
+    let b = empty_owned()
+    let full = Box::new(Vec::from([1]))
+    a == b && a < full && full > b
+}
+
+pub fn get_empty() -> u32 {
+    empty_owned().get().len()
+}
+
+pub fn get_mut_empty() -> u32 {
+    var b = empty_owned()
+    b.get_mut().push(1)
+    b.get().len()
+}
+
+pub fn take_empty() -> u32 {
+    empty_owned().into_inner().len()
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

@@ -596,6 +596,8 @@ pub struct TraitDef {
     pub assoc_types: Vec<AssocTypeDef>,
     pub methods: Vec<FnId>,
     pub public: bool,
+    /// `pub(package)`: visible only inside the trait's package.
+    pub package_only: bool,
     pub span: Span,
     pub lang: Option<Lang>,
     /// `@fieldwise`: derived field by field for every type that declares it (§3).

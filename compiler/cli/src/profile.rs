@@ -125,6 +125,20 @@ impl Baseline {
     }
 }
 
+/// A serial profile times each pass on its own; a non-serial profile times them together in a
+/// frame. Their label times are therefore not a like-for-like comparison.
+fn baseline_problem(serial: bool, baseline: &Baseline) -> Option<String> {
+    if serial == baseline.serial {
+        return None;
+    }
+    let mode = |serial| if serial { "with `--serial`" } else { "without `--serial`" };
+    Some(format!(
+        "the baseline ran {}, but this profile would run {}; compare profiles made in the same mode",
+        mode(baseline.serial),
+        mode(serial)
+    ))
+}
+
 pub fn run(args: &[String]) -> ExitCode {
     let Some(a) = parse(args) else { return crate::usage() };
     // The baseline is read first, so a wrong path doesn't wait for a profile.
@@ -135,6 +149,10 @@ pub fn run(args: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    if let Some(why) = baseline.as_ref().and_then(|b| baseline_problem(a.serial, b)) {
+        eprintln!("error: {why}");
+        return ExitCode::from(2);
+    }
     match profile(&a) {
         Ok(p) => {
             if a.json {
@@ -427,6 +445,35 @@ fn json(a: &Args, p: &Profile, baseline: Option<&Baseline>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn baseline(serial: bool) -> Baseline {
+        Baseline {
+            frames: 120,
+            size: (1280, 720),
+            serial,
+            span: None,
+            frame: None,
+            labels: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn a_baseline_must_use_the_same_serial_mode() {
+        assert_eq!(baseline_problem(false, &baseline(false)), None);
+        assert_eq!(baseline_problem(true, &baseline(true)), None);
+        assert_eq!(
+            baseline_problem(false, &baseline(true)).as_deref(),
+            Some(
+                "the baseline ran with `--serial`, but this profile would run without `--serial`; compare profiles made in the same mode"
+            )
+        );
+        assert_eq!(
+            baseline_problem(true, &baseline(false)).as_deref(),
+            Some(
+                "the baseline ran without `--serial`, but this profile would run with `--serial`; compare profiles made in the same mode"
+            )
+        );
+    }
 
     /// The 95th percentile by nearest rank: of 120 frames the seventh slowest, of one frame
     /// that frame, of none nothing.

@@ -515,12 +515,14 @@ impl<T: Serialize> Serialize for Vec<T> {
     fn deserialize(r: mut Reader) -> Result<Vec<T>, LoadError> {
         let at = r.at
         let n = r.read_u32()?
-        // Each element takes at least a byte: a count past that is a corrupt save, not a reason
-        // to allocate.
-        if n > r.left() {
-            return Err(LoadError { at, what: "a count is larger than the bytes left" })
+        // An element can write no bytes (`[T; 0]`, an empty tuple or a hand-written
+        // `Serialize`). Permit a reasonable number of those, without letting four corrupt
+        // bytes make the loader loop billions of times. Beyond a million, require at least one
+        // byte per element: that also bounds allocation by the input's size.
+        if n > r.left() && n > 1048576 {
+            return Err(LoadError { at, what: "a count is implausibly larger than the bytes left" })
         }
-        var out = Vec::with_capacity(n)
+        var out = Vec::with_capacity(min(n, r.left()))
         for _ in 0..n {
             out.push(T::deserialize(mut r)?)
         }
@@ -567,4 +569,35 @@ impl<T: Serialize> Serialize for Box<T> {
         }
         Ok(Box::new(T::deserialize(mut r)?))
     }
+}
+
+// ---- tests ------------------------------------------------------------------------------------
+
+@test
+fn a_vector_of_zero_byte_values_round_trips() {
+    let before: Vec<[u32; 0]> = Vec::filled(3, [0; 0])
+    let loaded: Result<Vec<[u32; 0]>, LoadError> = load(save(before))
+    match loaded {
+        Ok(v) => assert(v.len() == 3),
+        Err(e) => panic(e.what),
+    }
+
+    let hostile: Vec<u8> = Vec::filled(4, 255)
+    let refused: Result<Vec<[u32; 0]>, LoadError> = load(take hostile)
+    match refused {
+        Ok(_) => panic("a hostile zero-byte vector count was accepted"),
+        Err(e) => assert(e.at == 0),
+    }
+}
+
+@test
+fn an_empty_box_round_trips_without_reading_address_zero() {
+    let a: Box<Vec<u32>> = load(Vec::from([0])).unwrap()
+    let b: Box<Vec<u32>> = load(save(a.clone())).unwrap()
+    let full = Box::new(Vec::from([7, 9]))
+    assert(a.is_empty() && b.is_empty())
+    assert(a == b && a < full && full > b)
+    assert(a.clone().is_empty())
+    let values = take full.into_inner()
+    assert(values.len() == 2 && values[0] == 7 && values[1] == 9)
 }

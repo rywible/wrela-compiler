@@ -29,7 +29,7 @@ pub mod studio;
 /// std's modules: each one's path and source.
 pub use wrela_sema::STD_SOURCES;
 
-use std::path::Path;
+use std::path::{Component, Path};
 use std::sync::Arc;
 use wrela_diag::{Diagnostic, SourceMap, Span, codes, has_errors, sort_and_dedup};
 use wrela_sema::SourceUnit;
@@ -78,15 +78,55 @@ impl Output {
 
     /// Writes the build's files into `dir`, and makes the directories they need.
     pub fn write_to(&self, dir: &Path) -> std::io::Result<()> {
+        ensure_no_symlink_path(dir, dir)?;
         std::fs::create_dir_all(dir)?;
         for (path, bytes) in &self.files {
             let p = dir.join(path);
+            ensure_no_symlink_path(dir, &p)?;
             if let Some(parent) = p.parent() {
                 std::fs::create_dir_all(parent)?;
             }
             std::fs::write(p, bytes)?;
         }
         Ok(())
+    }
+}
+
+/// Refuses a symbolic link at `root`, or in any component from `root` through `path`.
+/// Generated-output callers pass the directory they own as `root`, so creating a child cannot
+/// escape through an existing link. This is a preflight; concurrent replacement still needs
+/// OS-specific no-follow handles to close its TOCTOU window completely.
+pub fn ensure_no_symlink_path(root: &Path, path: &Path) -> std::io::Result<()> {
+    let relative = path.strip_prefix(root).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} is outside {}", path.display(), root.display()),
+        )
+    })?;
+    let mut at = root.to_path_buf();
+    reject_symlink(&at)?;
+    for component in relative.components() {
+        let Component::Normal(name) = component else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("{} isn't a direct output path", path.display()),
+            ));
+        };
+        at.push(name);
+        reject_symlink(&at)?;
+    }
+    Ok(())
+}
+
+fn reject_symlink(path: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(std::io::Error::other(format!(
+            "{} is a symbolic link, so it won't be used",
+            path.display()
+        ))),
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
     }
 }
 
@@ -808,12 +848,25 @@ impl Loader {
         let prefix = if program { String::new() } else { format!("[{}] ", name.unwrap_or("?")) };
         let manifest_path = dir.join("wrela.toml");
         let manifest = if manifest_path.is_file() {
-            let text = std::fs::read_to_string(&manifest_path).unwrap_or_default();
-            let f = self.sources.add(format!("{prefix}wrela.toml"), text);
-            match manifest::parse(f, &self.sources.file(f).text.clone()) {
-                Ok(m) => m,
-                Err(errors) => {
-                    self.diags.extend(errors);
+            let display = format!("{prefix}wrela.toml");
+            match std::fs::read_to_string(&manifest_path) {
+                Ok(text) => {
+                    let f = self.sources.add(display, text);
+                    match manifest::parse(f, &self.sources.file(f).text.clone()) {
+                        Ok(m) => m,
+                        Err(errors) => {
+                            self.diags.extend(errors);
+                            manifest::Manifest::default()
+                        }
+                    }
+                }
+                Err(why) => {
+                    let f = self.sources.add(display.clone(), "");
+                    self.diags.push(Diagnostic::new(
+                        codes::E0205,
+                        Span::new(f, 0, 0),
+                        format!("can't read `{display}`: {why}"),
+                    ));
                     manifest::Manifest::default()
                 }
             }
@@ -959,6 +1012,26 @@ fn add_unit(
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn generated_paths_reject_symbolic_link_components() {
+        use std::os::unix::fs::symlink;
+
+        let d =
+            std::env::temp_dir().join(format!("wrela-driver-output-link-{}", std::process::id()));
+        let outside =
+            std::env::temp_dir().join(format!("wrela-driver-output-out-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::create_dir_all(&d).expect("output root");
+        std::fs::create_dir_all(&outside).expect("outside");
+        symlink(&outside, d.join("nested")).expect("symlink");
+        assert!(ensure_no_symlink_path(&d, &d.join("nested/file")).is_err());
+        assert!(ensure_no_symlink_path(&d, &d.join("ordinary/file")).is_ok());
+        let _ = std::fs::remove_dir_all(d);
+        let _ = std::fs::remove_dir_all(outside);
+    }
+
     /// A module file that can't be read, or a file whose name can't be a module, is E0205.
     #[test]
     fn unreadable_module_files_are_e0205() {
@@ -977,6 +1050,54 @@ mod tests {
         let out = check(&d);
         let codes: Vec<&str> = out.diagnostics.iter().map(|x| x.code.as_str()).collect();
         assert_eq!(codes, ["E0205"], "{:?}", out.diagnostics);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A manifest that doesn't read as text is an error, not an absent, empty manifest.
+    #[test]
+    fn unreadable_manifest_is_e0205() {
+        let d = std::env::temp_dir().join(format!("wrela-driver-manifest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).expect("temp dir");
+        std::fs::write(
+            d.join("main.wrela"),
+            "pub fn frame(time: f32, width: u32, height: u32) {}\n",
+        )
+        .expect("write");
+        std::fs::write(d.join("wrela.toml"), [0xff, 0xfe]).expect("write");
+
+        let out = check(&d);
+        let errors: Vec<_> = out.diagnostics.iter().filter(|d| d.is_error()).collect();
+        assert_eq!(errors.len(), 1, "{:?}", out.diagnostics);
+        assert_eq!(errors[0].code.as_str(), "E0205");
+        assert!(errors[0].message.contains("can't read `wrela.toml`"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A computed constant that can never return reports its panic even when its type has no
+    /// possible values. Its result slot still needs a harmless placeholder during evaluation.
+    #[test]
+    fn panicking_constant_of_empty_enum_is_e0704() {
+        let d =
+            std::env::temp_dir().join(format!("wrela-driver-empty-enum-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).expect("temp dir");
+        std::fs::write(
+            d.join("main.wrela"),
+            concat!(
+                "enum Never {}\n\n",
+                "const IMPOSSIBLE: Never = never()\n\n",
+                "fn never() -> Never {\n",
+                "    panic(\"no value\")\n",
+                "}\n",
+            ),
+        )
+        .expect("write");
+
+        let out = check(&d);
+        let errors: Vec<_> = out.diagnostics.iter().filter(|d| d.is_error()).collect();
+        assert_eq!(errors.len(), 1, "{:?}", out.diagnostics);
+        assert_eq!(errors[0].code.as_str(), "E0704");
         let _ = std::fs::remove_dir_all(&d);
     }
 

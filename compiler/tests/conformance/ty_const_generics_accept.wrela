@@ -28,6 +28,10 @@ struct Window<const N: u32> {
     xs: [f32; N],
 }
 
+impl<const N: u32> Window<N> {
+    fn length() -> u32 { N }
+}
+
 fn widest<const M: u32>(w: Window<M>) -> u32 {
     M
 }
@@ -35,5 +39,7 @@ fn widest<const M: u32>(w: Window<M>) -> u32 {
 fn g() -> u32 {
     let a: Window<KEPT> = Window { xs: [0.0; 8] }
     let b: Bounded<u32, KEPT> = Bounded::new()
-    widest(a) + b.capacity()
+    let c = Window::<3> { xs: [1.0, 2.0, 3.0] }
+    let _ = sum::<3>(c.xs)
+    widest(a) + b.capacity() + Window::<3>::length()
 }

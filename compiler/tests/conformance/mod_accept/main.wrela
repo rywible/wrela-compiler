@@ -1,5 +1,6 @@
 // accepts: mod.use mod.names
-use shapes::blob::{Blob, blob}
+use shapes::blob::{Choice, blob, shapes}
+pub use shapes::blob::Blob
 use std::field::sphere
 
 fn f() -> f32 {
@@ -12,5 +13,12 @@ fn kind(n: i32) -> u32 {
     match n {
         shapes::blob::SIDES => 1,
         _ => 2,
+    }
+}
+
+fn public_enum_payloads_are_public() -> i32 {
+    let choice = Choice::Named { hidden: 1, shown: 2 }
+    match choice {
+        Choice::Named { hidden, shown } => hidden + shown,
     }
 }

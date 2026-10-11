@@ -63,3 +63,8 @@ fn range_settles_float() -> f32 {
     let c: f32 = b
     c
 }
+
+// Unit checking follows ordinary written integer powers, including negative and parenthesized
+// exponents.
+const INVERSE_LENGTH: f32 = 2.0m ** -1 + 3.0s //~ E0305
+const AREA: f32 = 2.0m ** (2) + 3.0s //~ E0305

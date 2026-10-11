@@ -343,9 +343,11 @@ pub fn bits64() -> u64 {
 #[test]
 #[ignore = "needs a GPU"]
 fn gpu_data_has_the_cpus_bytes() {
-    // The game's buffers, in the order `init` makes them: three pairs, `ons`, two pairs.
-    let b = crate::first_frame_buffers("gpu-data", 11);
-    for (name, at) in [("flags", 0), ("read", 2), ("picks", 4), ("items", 7), ("measures", 9)] {
+    // The game's buffers, in the order `init` makes them: three pairs, `ons`, three pairs.
+    let b = crate::first_frame_buffers("gpu-data", 13);
+    for (name, at) in
+        [("flags", 0), ("read", 2), ("picks", 4), ("items", 7), ("measures", 9), ("directions", 11)]
+    {
         crate::same_words(name, &b[at], &b[at + 1]);
     }
 }

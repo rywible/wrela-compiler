@@ -94,14 +94,9 @@ fn dim(e: &ast::Expr) -> Option<Option<Dim>> {
                 }
             })
         }
-        // `m**3`: an integer power.
+        // `m**3`: an integer power (including the usual parenthesized and negative forms).
         ExprKind::Binary(BinOp::Pow, a, b) => {
-            let n = match &b.kind {
-                ExprKind::Lit(ast::Lit { kind: LitKind::Int(ast::IntValue::Ok(n)), .. }) => {
-                    i8::try_from(*n).ok()?
-                }
-                _ => return None,
-            };
+            let n = int_exponent(b)?;
             Some(match dim(a)? {
                 Some(d) => Some(each(d, |e| e.checked_mul(n))?),
                 None => None,
@@ -114,6 +109,23 @@ fn dim(e: &ast::Expr) -> Option<Option<Dim>> {
         },
         _ => None,
     }
+}
+
+/// The constant integer shapes accepted as a written exponent. Arithmetic expressions stay
+/// unknown here: this unit pass deliberately doesn't evaluate general constant expressions.
+fn int_exponent(e: &ast::Expr) -> Option<i8> {
+    fn value(e: &ast::Expr) -> Option<i128> {
+        match &e.kind {
+            ExprKind::Paren(x) => value(x),
+            ExprKind::Unary(ast::UnOp::Neg, x) => value(x)?.checked_neg(),
+            ExprKind::Lit(ast::Lit { kind: LitKind::Int(ast::IntValue::Ok(n)), .. }) => {
+                Some(i128::from(*n))
+            }
+            _ => None,
+        }
+    }
+    let n = value(e)?;
+    i8::try_from(n).ok()
 }
 
 /// `f` of each exponent of `d`, or `None` if one is past an `i8`'s.

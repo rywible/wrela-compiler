@@ -535,6 +535,55 @@ test("a pipeline that can't be built fails the program: caughtUp and built rejec
   expect(await built).toBe("pipeline `compute` failed to build");
 });
 
+test("a late pipeline success runs no commands after another pipeline failed", async () => {
+  const device = new FakeDevice();
+  const failed = Promise.withResolvers<BuiltPipeline>();
+  const later = Promise.withResolvers<BuiltPipeline>();
+  const executor = new GpuExecutor(device.gpu, [failed.promise, later.promise], { texture: () => fakeTexture("screen") });
+  const compute: BuiltPipeline = {
+    name: "compute",
+    layout: {} as GPUBindGroupLayout,
+    compute: { label: "compute" } as GPUComputePipeline,
+    render: null,
+    uniform: null,
+    bindings: [],
+    debugFlag: null,
+  };
+  executor.execute({ op: "Dispatch", pipeline: 1, groups: [1, 1, 1], bindings: [], uniforms: new Uint8Array() });
+  const readback = executor.readBack(7, 0, 4);
+  failed.reject(new Error("pipeline 0 failed"));
+  await executor.built.catch(() => {});
+  await expect(readback).rejects.toThrow("pipeline 0 failed");
+  later.resolve(compute);
+  await later.promise;
+  await Promise.resolve();
+  expect(kinds(device.events)).toEqual([]);
+  await expect(executor.caughtUp()).rejects.toThrow("pipeline 0 failed");
+});
+
+test("a retired executor runs no commands when a pipeline finishes late", async () => {
+  const device = new FakeDevice();
+  const later = Promise.withResolvers<BuiltPipeline>();
+  const executor = new GpuExecutor(device.gpu, [later.promise], { texture: () => fakeTexture("screen") });
+  const compute: BuiltPipeline = {
+    name: "compute",
+    layout: {} as GPUBindGroupLayout,
+    compute: { label: "compute" } as GPUComputePipeline,
+    render: null,
+    uniform: null,
+    bindings: [],
+    debugFlag: null,
+  };
+  executor.execute({ op: "Dispatch", pipeline: 0, groups: [1, 1, 1], bindings: [], uniforms: new Uint8Array() });
+  const readback = executor.readBack(7, 0, 4);
+  executor.destroyAll();
+  await expect(readback).rejects.toThrow("the GPU executor was retired");
+  later.resolve(compute);
+  await executor.built;
+  await Promise.resolve();
+  expect(kinds(device.events)).toEqual([]);
+});
+
 test("the program's buffers and textures are counted in bytes, now and at most", async () => {
   const { run, executor } = await setup();
   run(new Encoder().createBuffer(1, 1000).createTexture(2, 8, 4, "rgba16float").createTexture(3, 8, 8, "depth32float"));

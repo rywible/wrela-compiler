@@ -236,28 +236,50 @@ fn impl_for(p: &Program, i: ImplId, ty: TyId, r: &TraitRef) -> Option<Subst> {
 /// a parameter with the same bound. A closure not checked yet fits (its call is checked where
 /// it's made).
 pub fn fits_fn_bound(p: &Program, ty: TyId, bound: TyId) -> bool {
-    let TyKind::FnPtr(want, want_ret, _) = p.types.kind(bound) else { return false };
-    let (params, ret) = match p.types.kind(ty) {
-        TyKind::FnPtr(ps, r, _) => (ps.clone(), *r),
+    let TyKind::FnPtr(want, want_ret, want_flags) = p.types.kind(bound) else { return false };
+    let (params, ret, modes, attrs_fit) = match p.types.kind(ty) {
+        TyKind::FnPtr(ps, r, flags) => {
+            let attrs_fit = want_flags
+                .attrs()
+                .into_iter()
+                .zip(flags.attrs())
+                .all(|((_, want), (_, have))| !want || have);
+            let modes = (0..ps.len()).map(|i| flags.mode(i)).collect();
+            (ps.clone(), *r, modes, attrs_fit)
+        }
         TyKind::FnDef(f, args) => {
             let subst = Subst::from_pairs(&p.fn_all_generics(*f), args);
             let def = p.func(*f);
+            if def.ret_mode != RetMode::Owned {
+                return false;
+            }
             let ps = def.params.iter().map(|q| p.types.subst(q.ty, &subst)).collect();
-            (ps, p.types.subst(def.ret, &subst))
+            let modes = def.params.iter().map(|q| q.mode).collect();
+            // A concrete function's attributed constraints are checked by the effects pass.
+            (ps, p.types.subst(def.ret, &subst), modes, true)
         }
         TyKind::Closure(c, env) => {
-            let Some((ps, r)) = p.closure_sigs.borrow().get(c).cloned() else { return true };
+            let Some((ps, r, modes)) = p.closure_sigs.borrow().get(c).cloned() else {
+                return true;
+            };
             let generics = c.owner.map(|f| p.fn_all_generics(f)).unwrap_or_default();
             let subst = Subst::from_pairs(&generics, env);
-            (ps.iter().map(|&t| p.types.subst(t, &subst)).collect(), p.types.subst(r, &subst))
+            (
+                ps.iter().map(|&t| p.types.subst(t, &subst)).collect(),
+                p.types.subst(r, &subst),
+                modes,
+                true,
+            )
         }
         TyKind::Param(g) => {
-            return p.param(*g).fn_bound.is_some_and(|b| could_unify(p, b, bound));
+            return p.param(*g).fn_bound.is_some_and(|b| fits_fn_bound(p, b, bound));
         }
         TyKind::Error => return true,
         _ => return false,
     };
-    params.len() == want.len()
+    attrs_fit
+        && params.len() == want.len()
+        && modes.iter().enumerate().all(|(i, &mode)| mode == want_flags.mode(i))
         && params.iter().zip(want).all(|(&a, &b)| could_unify(p, a, b))
         && could_unify(p, ret, *want_ret)
 }

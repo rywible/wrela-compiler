@@ -209,6 +209,31 @@ struct TypedArg {
     callee: String,
 }
 
+/// The body a callable place holds. Its resolved type keeps a closure's or named function's
+/// identity through aggregate fields (`held.f`) and other projections; `held` covers the
+/// temporaries that MIR assigned a callable value directly.
+fn callable_type_body(p: &Program, f: FnId, ty: TyId) -> Option<BodyId> {
+    match p.types.kind(ty) {
+        TyKind::Closure(c, _) => Some(BodyId { func: c.owner.unwrap_or(f), closure: Some(c.id) }),
+        TyKind::FnDef(g, _) => Some(BodyId { func: *g, closure: None }),
+        _ => None,
+    }
+}
+
+fn callable_body(
+    p: &Program,
+    f: FnId,
+    body: &Body,
+    place: &mir::Place,
+    held: &HashMap<mir::Local, BodyId>,
+) -> Option<BodyId> {
+    match callable_type_body(p, f, mir::place_ty(p, &body.locals, place)) {
+        Some(target) => Some(target),
+        _ if place.proj.is_empty() => held.get(&place.local).copied(),
+        _ => None,
+    }
+}
+
 /// The closures and named functions a body passes to `@deterministic fn` and `@parallel fn`
 /// parameters.
 fn typed_callables(p: &Program, f: FnId, body: &Body) -> Vec<TypedArg> {
@@ -231,7 +256,8 @@ fn typed_callables(p: &Program, f: FnId, body: &Body) -> Vec<TypedArg> {
             if !(flags.deterministic || flags.parallel || flags.audio) {
                 continue;
             }
-            let Some(&target) = a.place().and_then(|pl| held.get(&pl.local)) else {
+            let Some(target) = a.place().and_then(|place| callable_body(p, f, body, place, held))
+            else {
                 continue;
             };
             out.push(TypedArg {
@@ -240,6 +266,34 @@ fn typed_callables(p: &Program, f: FnId, body: &Body) -> Vec<TypedArg> {
                 flags: *flags,
                 callee: def.name.clone(),
             });
+        }
+        // A callable may select a blanket impl because it meets an attributed function bound,
+        // even when the selected method never calls it. The bound is still an effect promise
+        // made by the concrete callable (`impl<F: @deterministic fn(..)> Trait for F`).
+        if let Callee::TraitMethod { method, self_ty, trait_args, .. } = &c.callee
+            && let FnOwner::Trait(t) = p.func(*method).owner
+            && let Some((i, subst)) =
+                traits::find_impl(p, *self_ty, &TraitRef { trait_: t, args: trait_args.clone() })
+        {
+            let imp = p.impl_(i);
+            for &g in &imp.generics {
+                let Some(bound) = p.param(g).fn_bound else { continue };
+                let TyKind::FnPtr(_, _, flags) = p.types.kind(p.types.subst(bound, &subst)) else {
+                    continue;
+                };
+                if !(flags.deterministic || flags.parallel || flags.audio) {
+                    continue;
+                }
+                let Some(target) = subst.get(g).and_then(|ty| callable_type_body(p, f, ty)) else {
+                    continue;
+                };
+                out.push(TypedArg {
+                    body: target,
+                    span: c.span,
+                    flags: *flags,
+                    callee: format!("{}'s impl", def.name),
+                });
+            }
         }
     });
     // A struct's function fields: each bounded by its field's type (`fn.fields`).
@@ -442,7 +496,7 @@ fn derived_callables(p: &Program, f: FnId, body: &Body) -> Vec<(BodyId, Span)> {
         );
         if derived
             && let Some(place) = c.args.first().and_then(|a| a.place())
-            && let Some(&target) = held.get(&place.local)
+            && let Some(target) = callable_body(p, f, body, place, held)
         {
             out.push((target, c.span));
         }

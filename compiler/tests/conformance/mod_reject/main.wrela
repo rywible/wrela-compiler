@@ -21,3 +21,7 @@ fn lengths() -> f32 {
 fn module_args() -> f32 {
     shapes::<i32>::blob(1.0) //~ E0322
 }
+
+fn module_type_args(s: shapes<bool>::S) -> f32 { //~ E0322
+    s.x
+}

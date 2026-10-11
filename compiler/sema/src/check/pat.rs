@@ -365,7 +365,15 @@ impl<'p> Checker<'p> {
                 let f = wrela_syntax::lexer::float_value_f32(&lit.text);
                 Some(if neg { Lit::Float(-v, -f) } else { Lit::Float(v, f) })
             }
-            _ => None,
+            ast::LitKind::Suffixed => {
+                let e = self.check_suffixed(&lit, Some(resolved));
+                let ExprKind::Lit(Lit::Float(v, f)) = e.kind else { return None };
+                Some(if neg { Lit::Float(-v, -f) } else { Lit::Float(v, f) })
+            }
+            _ => {
+                self.err(not_a_number());
+                None
+            }
         }
     }
 
@@ -552,7 +560,11 @@ impl<'p> Checker<'p> {
                 self.declare_unmatched_field(f);
                 continue;
             }
-            if v.is_none() && self.field_hidden(self.p.adt(a).module, &decls[i]) {
+            // An unmarked enum payload inherits its enum's visibility. `pub(package)` can
+            // explicitly narrow one field of a public enum.
+            if self.field_hidden(self.p.adt(a).module, &decls[i])
+                && (v.is_none() || decls[i].package_only)
+            {
                 self.err(
                     Diagnostic::new(
                         codes::E0210,

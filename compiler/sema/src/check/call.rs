@@ -174,7 +174,8 @@ impl<'p> Checker<'p> {
                 self.call_type_relative(ty, &name, generics, args, expected, span)
             }
             ValueRes::TraitRelative(t, name) => {
-                let ntraits = self.p.trait_(t).generics.len();
+                let trait_params = self.p.trait_(t).generics.clone();
+                let ntraits = trait_params.len();
                 // `Trait::<A>::method(x)` names the trait's arguments; without them they're
                 // inferred.
                 let written = path
@@ -183,9 +184,11 @@ impl<'p> Checker<'p> {
                     .checked_sub(2)
                     .and_then(|i| path.segments[i].generics.as_deref());
                 let trait_args: Vec<TyId> = match written {
-                    Some(g) if g.len() == ntraits => {
-                        g.iter().map(|t| self.resolve_type(t)).collect()
-                    }
+                    Some(g) if g.len() == ntraits => g
+                        .iter()
+                        .zip(&trait_params)
+                        .map(|(t, &param)| self.resolve_generic_arg(t, param))
+                        .collect(),
                     Some(g) => {
                         let tname = &self.p.trait_(t).name;
                         self.err(resolve::wrong_generic_count(span, tname, ntraits, g.len()));
@@ -1010,9 +1013,10 @@ impl<'p> Checker<'p> {
             (TyKind::Array(a, _) | TyKind::ArrayN(a, _), TyKind::Slice(b)) => {
                 self.expect(*a, *b, e.span);
             }
-            (TyKind::Closure(c, _), TyKind::FnPtr(ps, r, _)) => {
+            (TyKind::Closure(c, _), TyKind::FnPtr(ps, r, flags)) => {
                 let Some(def) = self.closure_def(c.id) else { return };
-                let (params, ret) = (def.params.clone(), def.ret);
+                let locals = def.params.clone();
+                let (params, ret, modes) = self.closure_sig(def);
                 if params.len() != ps.len() {
                     self.err(Diagnostic::new(
                         codes::E0301,
@@ -1025,9 +1029,26 @@ impl<'p> Checker<'p> {
                     ));
                     return;
                 }
+                if let Some((i, mode)) =
+                    modes.iter().enumerate().find(|(i, m)| **m != flags.mode(*i))
+                {
+                    let name = &self.locals[locals[i].index()].name;
+                    let want = match flags.mode(i) {
+                        Mode::Borrow => "by borrow".to_string(),
+                        m => format!("as `{}`", m.keyword()),
+                    };
+                    self.err(Diagnostic::new(
+                        codes::E0300,
+                        e.span,
+                        format!(
+                            "this closure takes `{name}` as `{}`, but the function type passes it {want}",
+                            mode.keyword()
+                        ),
+                    ));
+                    return;
+                }
                 for (l, &pt) in params.iter().zip(ps) {
-                    let lt = self.locals[l.index()].ty;
-                    self.expect(lt, pt, e.span);
+                    self.expect(*l, pt, e.span);
                 }
                 self.expect(ret, *r, e.span);
             }
@@ -2082,10 +2103,12 @@ impl<'p> Checker<'p> {
         Inherent::Missing
     }
 
-    /// Whether code being checked can see trait `t`: it's `pub`, or this module's own.
+    /// Whether code being checked can see trait `t`: it's this module's own, or its visibility
+    /// reaches this module (including `pub(package)`).
     fn trait_visible(&self, t: TraitId) -> bool {
         let tr = self.p.trait_(t);
-        tr.public || tr.module == self.scope.module
+        tr.module == self.scope.module
+            || tr.public && (!tr.package_only || self.p.same_package(tr.module, self.scope.module))
     }
 
     /// `ty` must implement `r`, the trait a call of its method `name` was found through, when

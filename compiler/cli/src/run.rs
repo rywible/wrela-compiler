@@ -33,6 +33,10 @@ pub fn run(args: &[String]) -> ExitCode {
         return ExitCode::from(2);
     }
     let out = args.dir.join("build").join("run");
+    if let Err(why) = crate::generated_path(&args.dir, &out) {
+        eprintln!("error: {why}");
+        return ExitCode::from(2);
+    }
     let kind = wrela_driver::BuildKind { debug: args.debug, testing: false };
     match wrela_driver::live::serve(&args.dir, &out, port, &args.lift, kind, false) {
         Ok(server) => {

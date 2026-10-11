@@ -1175,8 +1175,11 @@ impl<'a, 'm> Fb<'a, 'm> {
                 let ta = self.f.value_ty(*a);
                 let [left, mut right] = self.operands([*a, *b], out)?;
                 let is_bool = matches!(types.get(ta), ir::TypeDef::Scalar(ir::Scalar::Bool));
-                let is_int =
-                    matches!(types.get(ta), ir::TypeDef::Scalar(ir::Scalar::I32 | ir::Scalar::U32));
+                let is_int = matches!(
+                    types.get(ta),
+                    ir::TypeDef::Scalar(ir::Scalar::I32 | ir::Scalar::U32)
+                        | ir::TypeDef::Vector(ir::Scalar::I32 | ir::Scalar::U32, _)
+                );
                 // WGSL rejects a constant zero divisor or a constant shift past the width even
                 // when the other operand isn't constant.
                 if is_int

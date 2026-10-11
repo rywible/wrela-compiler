@@ -466,21 +466,53 @@ fn derive_walk(
         })
         .collect();
     let subst = Subst::from_pairs(&all, &args);
+    let closure_args: Vec<TyId> = p.fn_all_generics(f).iter().map(|&g| p.types.param(g)).collect();
+    // A closure cloned from the trait method belongs to this derived method. Its old owner has
+    // no MIR (a walk-shaped trait method is only a template), and its environment is now this
+    // method's generics rather than the trait method's `Self` and trait arguments.
+    let mut derive_ty = |t: &mut TyId| {
+        let substituted = p.types.subst(*t, &subst);
+        *t = p.types.map(substituted, &mut |types, x| match types.kind(x) {
+            TyKind::Closure(c, _) if c.owner == Some(d.method) => {
+                let c = ClosureRef { owner: Some(f), id: c.id };
+                Some(types.intern(TyKind::Closure(c, closure_args.clone())))
+            }
+            _ => None,
+        });
+    };
     let mut w = Walker { p, field, locals: body.locals.clone(), of, self_ty };
     for l in &mut w.locals {
-        l.ty = p.types.subst(l.ty, &subst);
+        derive_ty(&mut l.ty);
     }
     let mut value = body.value.clone();
-    crate::check::zonk::walk_tys(&mut value, &mut |t| *t = p.types.subst(*t, &subst));
+    crate::check::zonk::walk_tys(&mut value, &mut derive_ty);
     let self_local = body.params[0];
     w.expand_expr(&mut value, self_local);
-    let out = Body {
-        params: body.params.clone(),
-        locals: w.locals,
-        closures: Vec::new(),
-        value,
-        hidden_ret: None,
-    };
+    // A closure outside a walk is made once, so it stays a closure in the derived method. Its
+    // body may itself contain a walk over a captured `self`; expand that just as the method's
+    // body is, and keep the metadata MIR and the memory checker use for the closure value.
+    let mut closures = body.closures.clone();
+    for c in &mut closures {
+        derive_ty(&mut c.ret);
+        crate::check::zonk::walk_tys(&mut c.body, &mut derive_ty);
+        w.expand_expr(&mut c.body, self_local);
+    }
+    for (i, c) in closures.iter().enumerate() {
+        let sig = c.params.iter().map(|l| w.locals[l.index()].ty).collect();
+        let modes = c
+            .params
+            .iter()
+            .map(|l| match w.locals[l.index()].kind {
+                LocalKind::Param(m) => m,
+                LocalKind::ClosureParam => Mode::Borrow,
+                _ => Mode::Borrow,
+            })
+            .collect();
+        let id = ClosureRef { owner: Some(f), id: ClosureId(i as u32) };
+        p.closure_sigs.borrow_mut().insert(id, (sig, c.ret, modes));
+    }
+    let out =
+        Body { params: body.params.clone(), locals: w.locals, closures, value, hidden_ret: None };
     (Some(out), Vec::new())
 }
 
@@ -581,20 +613,6 @@ impl Walker<'_> {
         // A walk whose body always returns returns from its first field: that field's body
         // alone (an array's first element's), since nothing after it runs.
         let first_only = matches!(p.types.kind(body.ty), TyKind::Never);
-        if first_only && let &Of::Array(elem, _) = &self.of {
-            let u = p.types.u32;
-            let (v, mut b) = self.instance(var, &body, elem, me);
-            let zero = Expr { ty: u, span, kind: ExprKind::Lit(Lit::Int(0)) };
-            let init =
-                Expr { ty: elem, span, kind: ExprKind::Index(Box::new(me_expr), Box::new(zero)) };
-            let pat = Pat { ty: elem, kind: PatKind::Bind(v), span };
-            b.stmts.insert(0, Stmt { kind: StmtKind::Bind { pat, init, else_: None }, span });
-            let ty = b.ty;
-            return vec![Stmt {
-                kind: StmtKind::Expr(Expr { ty, span, kind: ExprKind::Block(b) }),
-                span,
-            }];
-        }
         let fields: Vec<TyId> = match &self.of {
             Of::Adt(a, args) => p.fields_of(*a, args, None),
             Of::Tuple(ts) => ts.clone(),

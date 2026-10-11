@@ -238,6 +238,45 @@ impl Report {
     }
 }
 
+/// Adds `s` as a JSON string, including its quotes.
+fn push_json_string(out: mut String, s: str) {
+    out.push_byte(34)
+    for i in 0..s.len() {
+        let b = s.byte(i)
+        if b == 34 || b == 92 {
+            out.push_byte(92)
+            out.push_byte(b)
+        } else if b == 8 {
+            out.push_str("\\b")
+        } else if b == 9 {
+            out.push_str("\\t")
+        } else if b == 10 {
+            out.push_str("\\n")
+        } else if b == 12 {
+            out.push_str("\\f")
+        } else if b == 13 {
+            out.push_str("\\r")
+        } else if b < 32 {
+            let hex = "0123456789abcdef"
+            out.push_str("\\u00")
+            out.push_byte(hex.byte(u32(b) >> 4))
+            out.push_byte(hex.byte(u32(b) & 15))
+        } else {
+            out.push_byte(b)
+        }
+    }
+    out.push_byte(34)
+}
+
+/// Adds a finite `f32` as a JSON number; JSON has no NaN or infinity, so those are `null`.
+fn push_json_number(out: mut String, x: f32) {
+    if x == x && abs(x) <= 340282346638528859811704183484516925440.0 {
+        out.push_str(f"{x}".as_str())
+    } else {
+        out.push_str("null")
+    }
+}
+
 impl Checks for Report {
     fn check(mut self, name: Text, kind: Text, value: f32, target: f32, miss: f32, within: f32) {
         let ok = abs(miss) <= within
@@ -249,8 +288,19 @@ impl Checks for Report {
         if self.json.len() > 0 {
             self.json.push_str(",")
         }
-        let line = f"{{\"name\":\"{name}\",\"check\":\"{kind}\",\"value\":{value},\"target\":{target},\"miss\":{miss},\"within\":{within},\"holds\":{ok}}}"
-        self.json.push_str(line.as_str())
+        self.json.push_str("{\"name\":")
+        push_json_string(mut self.json, name)
+        self.json.push_str(",\"check\":")
+        push_json_string(mut self.json, kind)
+        self.json.push_str(",\"value\":")
+        push_json_number(mut self.json, value)
+        self.json.push_str(",\"target\":")
+        push_json_number(mut self.json, target)
+        self.json.push_str(",\"miss\":")
+        push_json_number(mut self.json, miss)
+        self.json.push_str(",\"within\":")
+        push_json_number(mut self.json, within)
+        self.json.push_str(f",\"holds\":{ok}}}".as_str())
     }
 }
 
@@ -383,9 +433,9 @@ impl Minimize {
             let unit = self.units[k]
             var v = round_to(x[k], d, unit)
             let (enough, most) = if left == 0 {
-                (solved * 1.05 + 1.0e-9, 7)
+                (rounding_limit(solved), 7)
             } else {
-                (loss_at(self.free, f, x) * 1.05 + 1.0e-9, min(self.decimals[k] + 3, 7))
+                (rounding_limit(loss_at(self.free, f, x)), min(self.decimals[k] + 3, 7))
             }
             while d < most {
                 var trial = x.clone()
@@ -406,6 +456,13 @@ impl Minimize {
         }
         x
     }
+}
+
+/// The largest loss rounding may leave: five percent of the loss's magnitude above it. Using
+/// the magnitude matters when the objective is negative; multiplying it by 1.05 would instead
+/// demand an impossible five-percent improvement.
+fn rounding_limit(loss: f64) -> f64 {
+    loss + 0.05 * abs(loss) + 1.0e-9
 }
 
 /// Sets the literals `free` to `x`, and gives `f` there.
@@ -545,6 +602,25 @@ fn round_to(v: f32, decimals: u32, unit: f64) -> f32 {
     let whole = if scaled < 0.0 { -floor(-scaled + 0.5) } else { floor(scaled + 0.5) }
     let r = f32(whole / k * unit)
     if r == 0.0 { 0.0 } else { r }
+}
+
+@test
+fn reports_are_json_for_strings_and_nonfinite_numbers() {
+    var r = Report::new()
+    let nan = bitcast_f32(0x7fc00000)
+    let inf = bitcast_f32(0x7f800000)
+    r.check("quote\" slash\\ line\n", "near", nan, inf, nan, 0.5)
+    assert(
+        r.done() ==
+            "{\"checks\":[{\"name\":\"quote\\\" slash\\\\ line\\n\",\"check\":\"near\",\"value\":null,\"target\":null,\"miss\":null,\"within\":0.5,\"holds\":false}],\"held\":0,\"missed\":1}",
+    )
+}
+
+@test
+fn rounding_tolerance_is_sign_safe() {
+    assert(abs(rounding_limit(100.0) - 105.0) < 0.000001)
+    assert(abs(rounding_limit(-100.0) + 95.0) < 0.000001)
+    assert(rounding_limit(0.0) > 0.0)
 }
 
 @intrinsic

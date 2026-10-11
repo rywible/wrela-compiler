@@ -132,6 +132,51 @@ export class Checker {
 
   /** Checks a command that has passed the `Sequencer`, and records its effect. */
   check(cmd: Command): void {
+    // A rejected command leaves no trace. Binding checks add uses as they go, and a later
+    // binding (or an indirect range) may still reject the command.
+    // A draw can only change the entries it names, so don't clone a pass's whole (possibly
+    // large) scope for every draw. Commands that start a fresh scope keep the old small scope.
+    const clearsScope = cmd.op === "Dispatch" || cmd.op === "DispatchIndirect" || cmd.op === "BeginPass";
+    const scope = new Map<number, [boolean, boolean]>();
+    if (clearsScope) {
+      for (const [handle, [read, write]] of this.#scope) scope.set(handle, [read, write]);
+    }
+    const passState =
+      cmd.op === "BeginPass"
+        ? { attachments: [...this.#attachments], targets: { ...this.#targets } }
+        : undefined;
+    const entries = new Map<number, [boolean, boolean] | undefined>();
+    const remember = (handle: number) => {
+      if (entries.has(handle)) return;
+      const used = this.#scope.get(handle);
+      entries.set(handle, used === undefined ? undefined : [...used]);
+    };
+    if (cmd.op === "Draw" || cmd.op === "DrawIndirect" || cmd.op === "DrawIndexedIndirect") {
+      for (const binding of cmd.bindings) remember(binding.handle);
+      if (cmd.op !== "Draw") remember(cmd.arguments);
+      if (cmd.op === "DrawIndexedIndirect") remember(cmd.indices);
+    }
+    try {
+      this.#check(cmd);
+    } catch (e) {
+      if (clearsScope) {
+        this.#scope.clear();
+        for (const [handle, used] of scope) this.#scope.set(handle, used);
+      } else {
+        for (const [handle, used] of entries) {
+          if (used === undefined) this.#scope.delete(handle);
+          else this.#scope.set(handle, used);
+        }
+      }
+      if (passState !== undefined) {
+        this.#attachments = passState.attachments;
+        this.#targets = passState.targets;
+      }
+      throw e;
+    }
+  }
+
+  #check(cmd: Command): void {
     const op = cmd.op;
     const err = (why: string) => new CommandError(op, why);
     switch (cmd.op) {

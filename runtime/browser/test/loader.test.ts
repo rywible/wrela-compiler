@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { MANIFEST_VERSION } from "../src/abi.gen.ts";
-import { type Fetch, loadBuild } from "../src/loader.ts";
+import { browserIo, type Fetch, loadBuild } from "../src/loader.ts";
 import { ManifestError } from "../src/manifest.ts";
 import { FIRST_LIGHT, readFixture, readFixtureText } from "./fixtures.ts";
 
@@ -65,4 +65,19 @@ test("names a file it can't fetch", async () => {
     throw new TypeError("network down");
   };
   await expect(loadBuild(BASE, failing)).rejects.toThrow("can't fetch http://localhost/game/manifest.json: network down");
+});
+
+test("fetches and posts literal percent escapes inside the build", async () => {
+  const requested: { url: string; method: string }[] = [];
+  const fetch: Fetch = async (url, init) => {
+    requested.push({ url: url.href, method: init?.method ?? "GET" });
+    return new Response(Uint8Array.of(1));
+  };
+  const io = browserIo(BASE, fetch);
+  await io.fetch("%2e%2e/secret.bin");
+  await io.post(".%2E/admin", new Uint8Array());
+  expect(requested).toEqual([
+    { url: "http://localhost/game/%252e%252e/secret.bin", method: "GET" },
+    { url: "http://localhost/game/.%252E/admin", method: "POST" },
+  ]);
 });

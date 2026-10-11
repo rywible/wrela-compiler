@@ -11,3 +11,9 @@ fn helper(r: f32) -> f32 {
 }
 
 pub const SIDES: i32 = 4
+
+pub enum Choice: Copy {
+    Named { hidden: i32, shown: i32 },
+}
+
+pub fn shapes() {}

@@ -6,7 +6,7 @@
 
 import { AUDIO_OUT, AUDIO_QUANTUM, EXPORT_AUDIO, THREAD_AUDIO } from "./abi.gen.ts";
 import { refusingImports } from "./imports.ts";
-import { VOICE_PROCESSOR, type VoiceOptions } from "./messages.ts";
+import { type FromVoice, VOICE_PROCESSOR, type VoiceProcessorOptions } from "./messages.ts";
 
 // The AudioWorkletGlobalScope's own names, which TypeScript has no lib for.
 declare class AudioWorkletProcessor {
@@ -14,7 +14,7 @@ declare class AudioWorkletProcessor {
 }
 declare function registerProcessor(
   name: string,
-  processor: new (options: { processorOptions: VoiceOptions }) => AudioWorkletProcessor,
+  processor: new (options: { processorOptions: VoiceProcessorOptions }) => AudioWorkletProcessor,
 ): void;
 
 class Voice extends AudioWorkletProcessor {
@@ -23,18 +23,25 @@ class Voice extends AudioWorkletProcessor {
   readonly #right: Float32Array;
   readonly #task: number;
   readonly #context: number;
+  #remaining: number | null;
   #failed = false;
 
-  constructor(options: { processorOptions: VoiceOptions }) {
+  constructor(options: { processorOptions: VoiceProcessorOptions }) {
     super();
-    const { module, memory, task, context } = options.processorOptions;
-    const instance = new WebAssembly.Instance(module, refusingImports(memory, "the audio thread", Error));
+    const { module, memory, task, context, quanta } = options.processorOptions;
+    const instance = new WebAssembly.Instance(
+      module,
+      refusingImports(memory, "the audio thread", Error, (line) => {
+        this.port.postMessage({ type: "print", line } satisfies FromVoice);
+      }),
+    );
     this.#render = instance.exports[EXPORT_AUDIO] as (thread: number, task: number, context: number) => void;
     // The memory may grow, but a view of shared memory stays valid, and this one is below the heap.
     this.#left = new Float32Array(memory.buffer, AUDIO_OUT, AUDIO_QUANTUM);
     this.#right = new Float32Array(memory.buffer, AUDIO_OUT + 4 * AUDIO_QUANTUM, AUDIO_QUANTUM);
     this.#task = task;
     this.#context = context;
+    this.#remaining = quanta;
   }
 
   process(_inputs: Float32Array[][], outputs: Float32Array[][]): boolean {
@@ -44,11 +51,14 @@ class Voice extends AudioWorkletProcessor {
     } catch (e) {
       // A trap stops the voice: say so, and render silence from here on.
       this.#failed = true;
-      this.port.postMessage({ type: "trap", message: e instanceof Error ? e.message : String(e) });
+      this.port.postMessage({ type: "trap", message: e instanceof Error ? e.message : String(e) } satisfies FromVoice);
       return false;
     }
     outputs[0]?.[0]?.set(this.#left);
     outputs[0]?.[1]?.set(this.#right);
+    if (this.#remaining !== null && --this.#remaining === 0) {
+      this.port.postMessage({ type: "rendered" } satisfies FromVoice);
+    }
     return true;
   }
 }

@@ -11,6 +11,8 @@
 // expect: nested() = 42
 // expect: const_pat(255) = 1
 // expect: const_pat(3) = 0
+// expect: unit_const_pat(1.0) = 1
+// expect: unit_const_pat(2.0) = 0
 // expect: opt(1) = 11
 // expect: opt(0) = 0
 // expect: const_scrutinee() = 107
@@ -21,6 +23,7 @@
 // expect: arm_writes() = 2
 
 const LIMIT: u32 = 255
+const ONE_METRE: f32 = 1m
 
 struct Inner {
     v: u32,
@@ -95,6 +98,13 @@ pub fn nested() -> i32 {
 pub fn const_pat(n: u32) -> u32 {
     match n {
         LIMIT => 1,
+        _ => 0,
+    }
+}
+
+pub fn unit_const_pat(n: f32) -> u32 {
+    match n {
+        ONE_METRE => 1,
         _ => 0,
     }
 }

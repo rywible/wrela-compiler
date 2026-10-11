@@ -1,7 +1,7 @@
 // The main-thread shim (src/main.ts) on a fake page: each test loads a fresh copy of it.
 
 import { afterEach, expect, test } from "bun:test";
-import type { ToWorker } from "../src/messages.ts";
+import type { FromVoice, FromWorker, ToWorker, VoiceOptions } from "../src/messages.ts";
 
 const saved = new Map<string, PropertyDescriptor | undefined>();
 
@@ -29,6 +29,7 @@ interface Page {
   /** Fires the page's media query listeners (a pixel ratio change). */
   mediaListeners: (() => void)[];
   visibilityListeners: (() => void)[];
+  worker: { onmessage: ((event: MessageEvent<FromWorker>) => void) | null } | null;
 }
 
 let loads = 0;
@@ -36,7 +37,7 @@ let loads = 0;
 /** Loads main.ts on a page at `url`, hidden or not, whose ResizeObserver may lack
  * `device-pixel-content-box` (as Safari's does). */
 async function load(url: string, options: { hidden?: boolean; devicePixelBox?: boolean } = {}): Promise<Page> {
-  const page: Page = { posted: [], puts: [], shown: [], observed: [], mediaListeners: [], visibilityListeners: [] };
+  const page: Page = { posted: [], puts: [], shown: [], observed: [], mediaListeners: [], visibilityListeners: [], worker: null };
   const canvas = {
     style: {},
     clientWidth: 100,
@@ -66,8 +67,11 @@ async function load(url: string, options: { hidden?: boolean; devicePixelBox?: b
   fake(
     "Worker",
     class {
-      onmessage = null;
+      onmessage: ((event: MessageEvent<FromWorker>) => void) | null = null;
       onerror = null;
+      constructor() {
+        page.worker = this;
+      }
       postMessage(m: ToWorker) {
         page.posted.push(m);
       }
@@ -126,4 +130,65 @@ test("without device-pixel boxes, a pixel ratio change still resizes the canvas"
   expect(page.posted.at(-1)).toEqual({ type: "resize", width: 300, height: 150 });
   // It keeps watching at the new ratio.
   expect(page.mediaListeners.length).toBe(2);
+});
+
+test("audio print messages are relayed to the render worker and traps still fail the page", async () => {
+  let voicePort: { onmessage: ((event: MessageEvent<FromVoice>) => void) | null } | null = null;
+  fake(
+    "AudioContext",
+    class {
+      readonly audioWorklet = { addModule: async () => {} };
+      readonly destination = {};
+      readonly state = "running";
+    },
+  );
+  fake(
+    "AudioWorkletNode",
+    class {
+      readonly port = { onmessage: null as ((event: MessageEvent<FromVoice>) => void) | null };
+      constructor() {
+        voicePort = this.port;
+      }
+      connect() {}
+    },
+  );
+  const page = await load("https://example.com/game/");
+  const voice = {} as VoiceOptions;
+  page.worker!.onmessage!(new MessageEvent("message", { data: { type: "audio", voice } satisfies FromWorker }));
+  await Bun.sleep(1);
+  voicePort!.onmessage!(new MessageEvent("message", { data: { type: "print", line: "from voice" } satisfies FromVoice }));
+  expect(page.posted.at(-1)).toEqual({ type: "print", line: "from voice" });
+
+  voicePort!.onmessage!(new MessageEvent("message", { data: { type: "trap", message: "boom" } satisfies FromVoice }));
+  expect(page.shown).toEqual(["wrela stopped: the voice trapped: boom"]);
+});
+
+test("offline audio waits for the worklet's print marker before reporting it rendered", async () => {
+  let voicePort: { onmessage: ((event: MessageEvent<FromVoice>) => void) | null } | null = null;
+  fake(
+    "OfflineAudioContext",
+    class {
+      readonly audioWorklet = { addModule: async () => {} };
+      readonly destination = {};
+      async startRendering() {
+        voicePort!.onmessage!(new MessageEvent("message", { data: { type: "print", line: "offline voice" } satisfies FromVoice }));
+        voicePort!.onmessage!(new MessageEvent("message", { data: { type: "rendered" } satisfies FromVoice }));
+        return { getChannelData: () => new Float32Array(128) };
+      }
+    },
+  );
+  fake(
+    "AudioWorkletNode",
+    class {
+      readonly port = { onmessage: null as ((event: MessageEvent<FromVoice>) => void) | null };
+      constructor() {
+        voicePort = this.port;
+      }
+      connect() {}
+    },
+  );
+  const page = await load("http://127.0.0.1/game/#test&audio=1");
+  page.worker!.onmessage!(new MessageEvent("message", { data: { type: "audio", voice: {} as VoiceOptions } satisfies FromWorker }));
+  await Bun.sleep(5);
+  expect(page.posted.slice(-2)).toEqual([{ type: "print", line: "offline voice" }, { type: "audio-rendered" }]);
 });

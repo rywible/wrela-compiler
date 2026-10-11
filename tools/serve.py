@@ -46,7 +46,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             self.send_error(403, "this server answers only requests for this machine")
             return True
         path = urllib.parse.unquote(self.path.split("?", 1)[0].split("#", 1)[0])
-        if ".git" in path.split("/"):
+        if ".git" in (part.casefold() for part in path.split("/")):
             self.send_error(404, "the repository's history isn't served")
             return True
         return False
@@ -118,7 +118,14 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             self.send_error(403, "PUT is only allowed into a results/ directory")
             return
         os.makedirs(os.path.dirname(dest), exist_ok=True)
-        length = int(self.headers.get("Content-Length", 0))
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            self.send_error(400, "Content-Length must be a non-negative integer")
+            return
+        if length < 0:
+            self.send_error(400, "Content-Length must be a non-negative integer")
+            return
         body = self.rfile.read(length)
         tmp = f"{dest}.{os.getpid()}.{id(self)}.tmp"
         with open(tmp, "wb") as f:

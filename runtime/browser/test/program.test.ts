@@ -4,7 +4,7 @@ import { describe, expect, spyOn, test } from "bun:test";
 import { STREAM_VERSION } from "../src/abi.gen.ts";
 import { CommandError } from "../src/check.ts";
 import { parseManifest } from "../src/manifest.ts";
-import { checkAbi, Program, ProgramError, TrapError } from "../src/program.ts";
+import { checkAbi, otherInstance, Program, ProgramError, TrapError } from "../src/program.ts";
 import { StateHash } from "../src/hash.ts";
 import { type Command, StreamError } from "../src/stream.ts";
 import { wasmOffsets } from "../src/lines.ts";
@@ -105,6 +105,21 @@ describe("the ABI check", () => {
       "it must export `frame(",
     );
     await expect(load(Uint8Array.from([1, 2, 3]))).rejects.toThrow(ProgramError);
+  });
+
+  test("checks optional thread-entry export types", async () => {
+    const entries = [
+      ["__worker", ["i32"]],
+      ["__audio", ["i32", "i32", "i32"]],
+      ["__tick", ["i32", "i32", "i32", "i32"]],
+    ] as const;
+    for (const [name, params] of entries) {
+      const wasm = buildModule({
+        memory: 1,
+        funcs: [frameOnly, { type: { params: [], results: [] }, body: [], export: name }],
+      });
+      await rejects(wasm, `its \`${name}\` export must be a function (${params.join(", ")}) -> ()`);
+    }
   });
 
   test("a module that can't be instantiated is an invalid program, as natively", async () => {
@@ -464,7 +479,7 @@ describe("the voice", () => {
       frameOnly,
       { type: { params: [], results: [] }, body: start, export: "init" },
       { type: { params: [], results: [] }, body: start, export: "again" },
-      { type: { params: ["i32", "i32"], results: [] }, body: [], export: "__audio" },
+      { type: { params: ["i32", "i32", "i32"], results: [] }, body: [], export: "__audio" },
     ],
   });
 
@@ -502,6 +517,100 @@ test("a printed line goes to the console as it's made, prefixed, and a phase is 
     expect(() => program.frame(0, 64, 64)).toThrow();
     expect(log).toHaveBeenCalledWith("wrela: frame 1 é");
     expect(printedLines).toEqual(["frame 1 é"]);
+  } finally {
+    log.mockRestore();
+  }
+});
+
+test("printed lines are strict UTF-8 and keep a byte-order mark", async () => {
+  const PRINT: Import = { module: "wrela", name: "print", kind: "func", type: { params: ["i32", "i32"], results: [] } };
+  const program = async (bytes: Uint8Array) => {
+    const lines: string[] = [];
+    const p = await Program.load(
+      buildModule({
+        imports: [PRINT],
+        memory: 1,
+        funcs: [{ type: FRAME_TYPE, body: [...op.i32(16), ...op.i32(bytes.length), ...op.call(0)], export: "frame" }],
+        data: [{ offset: 16, bytes }],
+      }),
+      checker(),
+      new Recorder(),
+      { onPrint: (line) => lines.push(line) },
+    );
+    return { p, lines };
+  };
+  const log = spyOn(console, "log").mockImplementation(() => {});
+  try {
+    const marked = await program(Uint8Array.of(0xef, 0xbb, 0xbf, 0x78));
+    marked.p.frame(0, 1, 1);
+    expect(marked.lines).toEqual(["\uFEFFx"]);
+    expect(log).toHaveBeenCalledWith("wrela: \uFEFFx");
+
+    const malformed = await program(Uint8Array.of(0xff));
+    expect(() => malformed.p.frame(0, 1, 1)).toThrow("print: the text isn't UTF-8");
+    expect(malformed.lines).toEqual([]);
+  } finally {
+    log.mockRestore();
+  }
+});
+
+test("a phase validates its memory range and UTF-8 name even though the browser doesn't time it", async () => {
+  const PHASE: Import = { module: "wrela", name: "phase", kind: "func", type: { params: ["i32", "i32"], results: [] } };
+  const program = (ptr: number, len: number, data: Uint8Array[] = []) =>
+    Program.load(
+      buildModule({
+        imports: [PHASE],
+        memory: 1,
+        funcs: [{ type: FRAME_TYPE, body: [...op.i32(ptr), ...op.i32(len), ...op.call(0)], export: "frame" }],
+        data: data.map((bytes) => ({ offset: ptr, bytes })),
+      }),
+      checker(),
+      new Recorder(),
+    );
+  const past = await program(-1, 1);
+  expect(() => past.frame(0, 1, 1)).toThrow("phase(4294967295, 1) reaches past the end of the program's memory");
+  const malformed = await program(16, 1, [Uint8Array.of(0xff)]);
+  expect(() => malformed.frame(0, 1, 1)).toThrow("phase: the text isn't UTF-8");
+});
+
+test("another thread's printed line is relayed to its program", async () => {
+  const PRINT: Import = { module: "wrela", name: "print", kind: "func", type: { params: ["i32", "i32"], results: [] } };
+  const line = new TextEncoder().encode("from helper");
+  const wasm = buildModule({
+    imports: [PRINT],
+    memory: 1,
+    funcs: [
+      frameOnly,
+      {
+        type: { params: ["i32"], results: [] },
+        body: [...op.i32(16), ...op.i32(line.length), ...op.call(0)],
+        export: "__worker",
+      },
+    ],
+    data: [{ offset: 16, bytes: line }],
+  });
+  const lines: string[] = [];
+  let helper: {
+    module: WebAssembly.Module;
+    memory: WebAssembly.Memory;
+    thread: number;
+    onPrint: (line: string) => void;
+  } | null = null;
+  await Program.load(wasm, checker(), new Recorder(), {
+    workers: 2,
+    spawnWorker: (module, memory, thread, onPrint) => {
+      helper = { module, memory, thread, onPrint };
+    },
+    onPrint: (printed) => lines.push(printed),
+  });
+  expect(helper).not.toBeNull();
+  const log = spyOn(console, "log").mockImplementation(() => {});
+  try {
+    const { module, memory, thread, onPrint } = helper!;
+    const instance = await otherInstance(module, memory, "a helper", onPrint);
+    (instance.exports.__worker as (thread: number) => void)(thread);
+    expect(lines).toEqual(["from helper"]);
+    expect(log).toHaveBeenCalledWith("wrela: from helper");
   } finally {
     log.mockRestore();
   }

@@ -159,8 +159,12 @@ pub trait Surface: Copy + GpuData {
         Warp { inner: self, map: Turn { to_local: by.inverse().to_mat3() } }
     }
 
-    /// The same surface, `by` times the size, about the origin.
+    /// The same surface, `by` times the size, about the origin. `by` can be negative (which
+    /// reflects through the origin), but zero has no signed-distance transform and panics.
     fn scale(self, by: f32) -> Scale<Self> {
+        if by == 0.0 {
+            panic("scale: the factor is zero")
+        }
         Warp { inner: self, map: Size { by } }
     }
 
@@ -287,7 +291,10 @@ pub fn hit<S: Surface>(field: S, o: vec3, dir: vec3, far: f32 = 10.0) -> f32 {
             found = true
             break
         }
-        t += max(d * 0.8, 0.00005)
+        // From inside, `d` is negative but its magnitude is still the conservative step to
+        // the surface. Advancing by a fixed epsilon alone cannot leave a body more than 25.6
+        // mm thick before this search's 512-step limit.
+        t += max(abs(d) * 0.8, 0.00005)
         if t > far {
             break
         }
@@ -1354,7 +1361,7 @@ pub type Translate<S> = Warp<S, Shift>
 pub type Rotate<S> = Warp<S, Turn>
 
 /// A surface scaled about the origin: `s.scale(by)`. Distances scale with it, so a distance
-/// stays a distance.
+/// stays a distance. The scale is nonzero; `Surface::scale` enforces that invariant.
 pub type Scale<S> = Warp<S, Size>
 
 /// Moved by `by`.
@@ -1387,7 +1394,7 @@ impl PointMap for Turn {
 
 /// Scaled by `by` about the origin.
 pub struct Size: Copy + GpuData {
-    pub by: f32,
+    by: f32,
 }
 
 impl PointMap for Size {
@@ -1396,11 +1403,11 @@ impl PointMap for Size {
     }
 
     fn distance_out(self, d: f32) -> f32 {
-        d * self.by
+        d * abs(self.by)
     }
 
     fn distance_in(self, d: f32) -> f32 {
-        d / self.by
+        d / abs(self.by)
     }
 
     fn length_in(self, x: f32) -> f32 {
@@ -1523,11 +1530,12 @@ impl<A: Surface, B: Surface> Surface for SmoothSubtract<A, B> {
         pair_part_name(self.a, self.b, i)
     }
 
-    /// A smooth maximum's gradient is a weighted mean of its operands', so the larger bound,
-    /// each within `near` plus the blend's reach (`k / 4`).
+    /// A smooth maximum's gradient is a weighted mean of its operands', so the larger bound.
+    /// Where it's within `near`, its operands are within `near + 1.25 k`: it can be `k / 4`
+    /// above the larger, and the smaller contributes while they're less than `k` apart.
     fn lipschitz(self, near: f32) -> f32 {
-        let n = near + 0.25 * max(self.k, 0.0)
-        max(self.a.lipschitz(n), self.b.lipschitz(n))
+        let scope = near + 1.25 * max(self.k, 0.0)
+        max(self.a.lipschitz(scope), self.b.lipschitz(scope))
     }
 }
 
@@ -1572,8 +1580,8 @@ impl<A: Surface, B: Surface> Surface for SmoothIntersect<A, B> {
     }
 
     fn lipschitz(self, near: f32) -> f32 {
-        let n = near + 0.25 * max(self.k, 0.0)
-        max(self.a.lipschitz(n), self.b.lipschitz(n))
+        let scope = near + 1.25 * max(self.k, 0.0)
+        max(self.a.lipschitz(scope), self.b.lipschitz(scope))
     }
 }
 
@@ -2361,6 +2369,19 @@ impl<C, S: Field<C>> Field<C> for Named<S> {
 
 // ---- tests (the suite runs std's: `std_tests_pass`) --------------------------------------------
 
+@test
+fn a_hit_can_start_inside_the_surface() {
+    let t = hit(sphere(1.0), vec3(), vec3(1.0, 0.0, 0.0))
+    assert(abs(t - 1.0) < 0.0001)
+}
+
+@test
+fn a_negative_scale_keeps_inside_negative() {
+    let s = sphere(0.5).translate(vec3(1.0, 0.0, 0.0)).scale(-2.0)
+    assert(abs(s.distance(vec3(-2.0, 0.0, 0.0)) + 1.0) < 0.00001)
+    assert(abs(s.distance(vec3(0.0, 0.0, 0.0)) - 1.0) < 0.00001)
+}
+
 /// A blob of every primitive, smooth-unioned, and displaced by noise: what std's field tests
 /// check.
 fn test_blob() -> Surface {
@@ -2368,6 +2389,20 @@ fn test_blob() -> Surface {
     let limb = round_cone(vec3(0.5, -0.2, 0.0), vec3(1.4, 0.6, 0.2), r_top: 0.15, r_bottom: 0.3)
     let block = cuboid(vec3(0.3)).translate(vec3(-0.9, 0.4, 0.1))
     body.smooth_union(limb, k: 0.2).smooth_union(block, k: 0.1).displace(fbm(4.0, 3), amp: 0.01)
+}
+
+/// A test surface whose distance falls 100 times as fast past -1. It has one surface, at x = 0,
+/// so its Lipschitz bound is 1 within one unit of that surface and 100 any farther inside.
+struct SteepInside: Copy + GpuData {}
+
+impl Surface for SteepInside {
+    fn distance(self, p: vec3) -> f32 {
+        if p.x < -1.0 { 100.0 * (p.x + 1.0) - 1.0 } else { p.x }
+    }
+
+    fn lipschitz(self, near: f32) -> f32 {
+        if near <= 1.0 { 1.0 } else { 100.0 }
+    }
 }
 
 @test
@@ -2445,6 +2480,30 @@ fn stated_bounds_hold_near_the_surface() {
         }
     }
     assert(checked > 50, "too few samples near the surface")
+}
+
+@test
+fn smooth_max_bounds_include_an_operand_far_inside_its_surface() {
+    // A plane smoothly intersects SteepInside so a point 1.44 units inside that operand is on
+    // the result's surface. Looking only k / 4 from either operand's surface misses its slope.
+    let a = SteepInside {}
+    let p = vec3(x: -1.0044)
+    let b = half_space(vec3(x: 1.0), -0.9585)
+    let k = 2.0
+    let near = 0.0001
+    let s = a.smooth_intersect(b, k)
+    let g = length(gradient(|q: vec3| s.distance(q), p))
+    let old_scope = near + 0.25 * k
+    let too_narrow = max(a.lipschitz(old_scope), b.lipschitz(old_scope))
+    assert(abs(s.distance(p)) < near)
+    assert(g > 10.0 * too_narrow)
+    assert(g <= s.lipschitz(near))
+
+    // Subtraction is the same smooth maximum with the cutter's distance negated.
+    let cut = half_space(vec3(x: -1.0), 0.9585)
+    let subtracted = a.smooth_subtract(cut, k)
+    let cut_g = length(gradient(|q: vec3| subtracted.distance(q), p))
+    assert(abs(subtracted.distance(p)) < near && cut_g <= subtracted.lipschitz(near))
 }
 
 /// A body, a knob and its mirror image, and a cut: four parts, each found where it decides the

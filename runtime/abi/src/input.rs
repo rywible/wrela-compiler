@@ -349,7 +349,12 @@ pub fn parse_script(text: &str) -> Result<Vec<Scripted>, String> {
         let at = |why: &str| format!("event {i}: {why}");
         let o = item.as_object().ok_or_else(|| at("an event is a JSON object"))?;
         let number = |key: &str| {
-            o.get(key).map(|v| v.as_u64().filter(|&f| f <= u64::from(u32::MAX)).map(|f| f as u32))
+            o.get(key).map(|v| {
+                v.as_f64()
+                    .filter(|f| f.is_finite() && f.fract() == 0.0 && *f >= 0.0)
+                    .filter(|&f| f <= f64::from(u32::MAX))
+                    .map(|f| f as u32)
+            })
         };
         let when = match (number("frame"), number("tick")) {
             (Some(Some(f)), None) => {
@@ -575,6 +580,15 @@ mod tests {
         for (text, why) in bad {
             let e = parse_script(text).expect_err(text);
             assert!(e.contains(why), "{text}: {e}");
+        }
+    }
+
+    #[test]
+    fn whole_json_numbers_neednt_use_integer_syntax() {
+        for number in ["1.0", "1e0"] {
+            let script = format!(r#"[{{"frame": {number}, "type": "text", "text": "x"}}]"#);
+            let events = parse_script(&script).expect("a whole JSON number");
+            assert_eq!(events[0].at, At::Frame(1));
         }
     }
 

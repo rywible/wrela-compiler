@@ -64,6 +64,12 @@ pub(crate) fn scan(dirs: &[PathBuf], before: &Files) -> Files {
                     walk(&path, false, before, out);
                 }
             } else if name.ends_with(".wrela") || name == "wrela.toml" {
+                // Reading follows a file symlink, so its cache key must describe the target too.
+                // Keep using the entry's metadata above to avoid following directory symlinks.
+                let Ok(meta) = std::fs::metadata(&path) else { continue };
+                if !meta.is_file() {
+                    continue;
+                }
                 let modified = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
                 let len = meta.len();
                 let seen = match before.get(&path) {
@@ -136,6 +142,7 @@ impl Watcher {
         lift: &[String],
         kind: crate::BuildKind,
     ) -> Result<Watcher, String> {
+        check_output_path(pkg, out)?;
         let packages = crate::packages(pkg)?;
         let lift = if lift.is_empty() { vec![packages[0].0.clone()] } else { lift.to_vec() };
         let dirs: Vec<PathBuf> = packages.into_iter().map(|(_, d)| d).collect();
@@ -341,6 +348,7 @@ pub fn serve(
     kind: crate::BuildKind,
     quiet: bool,
 ) -> Result<Server, String> {
+    check_output_path(pkg, out)?;
     let _ = std::fs::remove_dir_all(out);
     let mut watcher = Watcher::start(pkg, out, lift, kind)?;
     let (listener, port) = http::listen(port)?;
@@ -397,6 +405,15 @@ pub fn serve(
         let _ = handle(stream, &accepting, &stop_accepting, quiet);
     });
     Ok(Server { port, state, stopping })
+}
+
+/// A live build owned below `<pkg>/build` must not escape through a link in that path. Other
+/// callers may choose an unrelated output directory; its final component is still never a link.
+fn check_output_path(pkg: &Path, out: &Path) -> Result<(), String> {
+    let build = pkg.join("build");
+    let root = if out.starts_with(&build) { build.as_path() } else { out };
+    crate::ensure_no_symlink_path(root, out)
+        .map_err(|e| format!("can't use {}: {e}", out.display()))
 }
 
 /// What `/` and a build's `index.html` get: the mark that tells the runtime the page is live.
@@ -492,7 +509,10 @@ fn handle(
             let trimmed = path.trim_start_matches('/');
             let (version, seq) = {
                 let s = state.live.lock().expect("the state");
-                (s.version, s.events.len() as u64)
+                let version = s.version;
+                // The newest build includes the changes through the event that made it, but
+                // not literal-only edits made since. A newly opened page must replay those.
+                (version, s.built_at(version))
             };
             let (dir, rel, version, seq) = match trimmed.split_once('/') {
                 // The runtime's own scripts are the same in every build, and a page's threads
@@ -516,5 +536,81 @@ fn handle(
             })
         }
         _ => http::respond(&mut out, 405, "text/plain", b"not allowed"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    /// A page opened after a literal-only edit loads the newest build, then receives that edit:
+    /// the build itself doesn't already hold it.
+    #[test]
+    fn a_new_page_replays_literals_changed_since_its_build() {
+        let out = std::env::temp_dir().join(format!("wrela-live-page-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&out);
+        std::fs::create_dir_all(out.join("1")).expect("build directory");
+        std::fs::write(out.join("1/index.html"), "<html><head></head></html>").expect("index.html");
+
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("listen");
+        let port = listener.local_addr().expect("address").port();
+        let state = State {
+            out: out.clone(),
+            port,
+            live: Mutex::new(Live {
+                version: 1,
+                events: vec![Event {
+                    json: serde_json::json!({
+                        "seq": 1,
+                        "kind": "literals",
+                        "values": [[0, 0.75]],
+                    }),
+                    seen: Instant::now(),
+                    saved: None,
+                }],
+                shown: Vec::new(),
+                polls: 0,
+            }),
+            changed: Condvar::new(),
+        };
+        let client = std::thread::spawn(move || {
+            let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+            write!(stream, "GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n").expect("request");
+            let mut response = String::new();
+            stream.read_to_string(&mut response).expect("response");
+            response
+        });
+        let (stream, _) = listener.accept().expect("accept");
+        handle(stream, &state, &AtomicBool::new(false), true).expect("serve the page");
+        let response = client.join().expect("client");
+        assert!(
+            response.contains(r#"<meta name="wrela-live" content="0"><base href="/1/">"#),
+            "{response}"
+        );
+        let _ = std::fs::remove_dir_all(out);
+    }
+
+    /// Source-file symlinks are package modules. A scan keys their cached contents by the
+    /// target's metadata, since that is also where `read_to_string` gets their contents.
+    #[cfg(unix)]
+    #[test]
+    fn scan_sees_a_symlinked_source_targets_change() {
+        let d = std::env::temp_dir().join(format!("wrela-live-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).expect("temp dir");
+        let target = d.join(".main-target");
+        let link = d.join("main.wrela");
+        std::fs::write(&target, "first\n").expect("write target");
+        std::os::unix::fs::symlink(&target, &link).expect("link");
+
+        let first = scan(std::slice::from_ref(&d), &Files::new());
+        assert_eq!(first[&link].text.as_ref(), "first\n");
+        std::fs::write(&target, "second, and longer\n").expect("rewrite target");
+        let second = scan(std::slice::from_ref(&d), &first);
+
+        assert_eq!(second[&link].text.as_ref(), "second, and longer\n");
+        assert_eq!(changed(&first, &second).collect::<Vec<_>>(), [&link]);
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

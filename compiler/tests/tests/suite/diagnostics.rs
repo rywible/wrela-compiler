@@ -116,6 +116,16 @@ fn diagnostics_meet_the_bar() {
     assert!(failures.is_empty(), "{} cases failed:\n{}", failures.len(), failures.join("\n"));
 }
 
+#[test]
+fn auto_import_fix_keeps_a_leading_bom_first() {
+    let text = "\u{feff}fn use_hasher(h: Hasher) {}\n";
+    let out = compile("bom-auto-import", text, None);
+    assert_eq!(out.codes, ["E0200"]);
+    let fixed = out.fixed.expect("the auto-import fix");
+    assert!(fixed.starts_with("\u{feff}use std::hash::Hasher"), "{fixed:?}");
+    assert!(compile("bom-auto-import-fixed", &fixed, None).codes.is_empty());
+}
+
 /// A golden's JSON with where it points in std left out: each span of a label in a `<std::…>`
 /// file, and the `:line:column` after `<std::…>` in its text.
 fn std_lines_aside(json: &str) -> serde_json::Value {

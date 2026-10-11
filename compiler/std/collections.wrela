@@ -736,13 +736,19 @@ impl<T> Box<T> {
         Box { addr: unsafe { place(take value) } }
     }
 
-    /// The value, in place.
+    /// The value, in place. Panics if the box is empty.
     pub fn get(self) -> borrow T {
+        if self.addr == 0 {
+            panic("get: an empty `Box` has no value")
+        }
         unsafe { at::<T, Box<T>>(self, self.addr) }
     }
 
-    /// The value, to change in place.
+    /// The value, to change in place. Panics if the box is empty.
     pub fn get_mut(mut self) -> mut T {
+        if self.addr == 0 {
+            panic("get_mut: an empty `Box` has no value")
+        }
         unsafe { mut at_mut::<T, Box<T>>(mut self, self.addr) }
     }
 
@@ -757,9 +763,12 @@ impl<T> Box<T> {
         Box { addr: 0 }
     }
 
-    /// The value, moved off the heap.
+    /// The value, moved off the heap. Panics if the box is empty.
     pub fn into_inner(take self) -> T {
         var b = take self
+        if b.addr == 0 {
+            panic("into_inner: an empty `Box` has no value")
+        }
         unsafe {
             let value = read::<T>(b.addr)
             free(b.addr, size_of::<T>())
@@ -800,12 +809,24 @@ impl<T: Clone> Clone for Box<T> {
 
 impl<T: Eq> Eq for Box<T> {
     fn eq(self, other: Box<T>) -> bool {
+        if self.is_empty() {
+            return other.is_empty()
+        }
+        if other.is_empty() {
+            return false
+        }
         self.get() == other.get()
     }
 }
 
 impl<T: Ord> Ord for Box<T> {
     fn cmp(self, other: Box<T>) -> Ordering {
+        if self.is_empty() {
+            return if other.is_empty() { Ordering::Equal } else { Ordering::Less }
+        }
+        if other.is_empty() {
+            return Ordering::Greater
+        }
         self.get().cmp(other.get())
     }
 }

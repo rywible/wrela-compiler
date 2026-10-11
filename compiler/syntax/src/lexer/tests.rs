@@ -28,6 +28,10 @@ fn l3_non_ascii_identifier_is_one_token_with_one_error() {
     assert_eq!(l.tokens.len(), 5);
     assert_eq!(l.diagnostics.len(), 1);
     assert_eq!(l.diagnostics[0].code.as_str(), "E0001");
+
+    // A bad character immediately before the name must not consume its non-ASCII start.
+    assert_eq!(texts("$éx"), ["éx", ""]);
+    assert_eq!(codes_of("$éx"), ["E0001", "E0001"]);
 }
 
 #[test]
@@ -156,6 +160,12 @@ fn l14_strings() {
     assert_eq!(kinds(r#""a\n\"b""#), [T::Str, T::Eof]);
     assert_eq!(codes_of("\"abc"), ["E0005"]);
     assert_eq!(codes_of(r#""\q""#), ["E0005"]);
+
+    // An unknown escape at the end of a line must not hide the line break from the string.
+    let src = "\"a\\\nnext";
+    assert_eq!(kinds(src), [T::Str, T::Newline, T::Ident, T::Eof]);
+    assert_eq!(texts(src), ["\"a\\", "", "next", ""]);
+    assert_eq!(codes_of(src), ["E0005", "E0005"]);
 }
 
 #[test]
@@ -286,6 +296,34 @@ fn fstrings_split_at_their_holes() {
         kinds(r#"f"{f"{x}"}""#),
         [T::FStringHead, T::FStringHead, T::Ident, T::FStringTail, T::FStringTail, T::Eof]
     );
+    // F-string holes follow L19's typed bracket recovery, not scalar nesting depth: `)` closes
+    // the `(` and the `[` opened after it, so the following `}` ends the hole.
+    assert_eq!(
+        kinds(r#"f"{([1) }""#),
+        [T::FStringHead, T::LParen, T::LBracket, T::Int, T::RParen, T::FStringTail, T::Eof]
+    );
+    assert!(codes_of(r#"f"{([1) }""#).is_empty());
+
+    // An unmatched closer changes nothing, just as it does outside an f-string hole.
+    assert_eq!(
+        kinds(r#"f"{(] : 1) }""#),
+        [
+            T::FStringHead,
+            T::LParen,
+            T::RBracket,
+            T::Colon,
+            T::Int,
+            T::RParen,
+            T::FStringTail,
+            T::Eof
+        ]
+    );
+    assert!(codes_of(r#"f"{(] : 1) }""#).is_empty());
+
+    let src = "f\"a\\\nnext";
+    assert_eq!(kinds(src), [T::FString, T::Newline, T::Ident, T::Eof]);
+    assert_eq!(texts(src), ["f\"a\\", "", "next", ""]);
+    assert_eq!(codes_of(src), ["E0005", "E0005"]);
     let (spec, text) = super::fstring_segment(":>8.2}, kg{{\"x\"}}{");
     assert_eq!((spec.as_deref(), text.as_str()), (Some(">8.2"), ", kg{\"x\"}"));
     assert_eq!(super::string_value(r#""a\tb\"""#), "a\tb\"");

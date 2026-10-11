@@ -179,7 +179,7 @@ export async function runTicker(start: TickerStart, post: (msg: FromTicker) => v
   let tick: TickFn;
   let lines: Lines | null = null;
   try {
-    const instance = await otherInstance(start.module, start.memory, "the ticker");
+    const instance = await otherInstance(start.module, start.memory, "the ticker", (line) => post({ type: "print", line }));
     tick = instance.exports[EXPORT_TICK] as TickFn;
     lines = Lines.of(start.module);
   } catch (e) {

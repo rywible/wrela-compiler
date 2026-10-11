@@ -136,6 +136,27 @@ fn needs_memory_and_frame_exports() {
     assert!(matches!(compile_with(b"not wasm", None).err(), Some(Error::Program(_))));
 }
 
+#[test]
+fn checks_optional_thread_entry_export_types() {
+    for (name, signature) in [
+        (EXPORT_WORKER, "(i32) -> ()"),
+        (EXPORT_AUDIO, "(i32, i32, i32) -> ()"),
+        (EXPORT_TICK, "(i32, i32, i32, i32) -> ()"),
+    ] {
+        let wat = format!(
+            r#"(module (import "wrela" "memory" (memory 1 16384 shared))
+                (export "memory" (memory 0))
+                (func (export "frame") (param f32 i32 i32))
+                (func (export "{name}")))"#
+        );
+        let err = load_wat(&wat).err().expect("wrong thread entry type");
+        assert_eq!(
+            err.to_string(),
+            format!("invalid program: its `{name}` export must be a function {signature}")
+        );
+    }
+}
+
 /// The ABI's default limits are WebGPU's, as wgpu has them (`wrela_abi` can't see wgpu).
 #[test]
 fn the_default_limits_are_webgpus() {
@@ -157,6 +178,119 @@ fn a_start_function_cant_call_the_host() {
         err.to_string(),
         "invalid program: its start function called the host; a wrela program calls the host only from an export"
     );
+}
+
+#[test]
+fn starting_a_voice_or_ticker_needs_its_thread_entry() {
+    let audio = r#"(module
+        (import "wrela" "audio" (func $start (param i32 i32)))
+        (import "wrela" "memory" (memory 20 16384 shared)) (export "memory" (memory 0))
+        (func (export "init") (call $start (i32.const 1) (i32.const 2)))
+        (func (export "frame") (param f32 i32 i32)))"#;
+    let err = load_wat(audio).err().expect("missing audio entry");
+    assert!(matches!(&err, Error::Trap(m) if m.contains("doesn't export `__audio")), "{err}");
+
+    let ticker = r#"(module
+        (import "wrela" "tick" (func $start (param i32 i32 i32)))
+        (import "wrela" "memory" (memory 20 16384 shared)) (export "memory" (memory 0))
+        (func (export "init") (call $start (i32.const 1) (i32.const 2) (i32.const 60)))
+        (func (export "frame") (param f32 i32 i32)))"#;
+    let err = load_wat(ticker).err().expect("missing ticker entry");
+    assert!(matches!(&err, Error::Trap(m) if m.contains("doesn't export `__tick")), "{err}");
+}
+
+fn audio_phase_wat(traps: bool) -> String {
+    let trap = if traps { "unreachable" } else { "" };
+    format!(
+        r#"(module
+        (import "wrela" "audio" (func $start (param i32 i32)))
+        (import "wrela" "phase" (func $phase (param i32 i32)))
+        (import "wrela" "memory" (memory 20 16384 shared)) (export "memory" (memory 0))
+        (data (i32.const 1024) "audio")
+        (func (export "init") (call $start (i32.const 1) (i32.const 2)))
+        (func (export "frame") (param f32 i32 i32))
+        (func (export "__audio") (param i32 i32 i32)
+            (call $phase (i32.const 1024) (i32.const 5))
+            {trap}))"#
+    )
+}
+
+fn worker_phase_wat(traps: bool) -> String {
+    let trap = if traps { "unreachable" } else { "" };
+    format!(
+        r#"(module
+        (import "wrela" "phase" (func $phase (param i32 i32)))
+        (import "wrela" "memory" (memory 20 16384 shared)) (export "memory" (memory 0))
+        (data (i32.const 1024) "worker")
+        (func (export "frame") (param f32 i32 i32))
+        (func (export "__worker") (param i32)
+            (call $phase (i32.const 1024) (i32.const 6))
+            {trap}))"#
+    )
+}
+
+fn assert_one_closed_phase(trace: &Trace, name: &str) {
+    assert_eq!(trace.open_phases(), 0, "{name} was left open");
+    let phases = trace.phases();
+    assert_eq!(phases.len(), 1);
+    assert_eq!((phases[0].name.as_str(), phases[0].times), (name, 1));
+}
+
+#[test]
+fn audio_calls_end_phases_on_success_and_trap() {
+    for traps in [false, true] {
+        let mut program = load_wat(&audio_phase_wat(traps)).expect("loads");
+        let trace = program.trace();
+        let result = program.render_audio(1);
+        assert_eq!(result.is_err(), traps, "traps={traps}: {result:?}");
+        assert_one_closed_phase(&trace, "audio");
+    }
+}
+
+#[test]
+fn runtime_helpers_end_phases_on_success_and_trap() {
+    for traps in [false, true] {
+        let wasm = wat::parse_str(worker_phase_wat(traps)).expect("test WAT compiles");
+        let compiled = compile_with(&wasm, None).expect("compiles");
+        let program = Program::instantiate(
+            &compiled,
+            &manifest(),
+            Recorder::default(),
+            Io::default(),
+            false,
+            2,
+        )
+        .expect("instantiates");
+        let trace = program.trace();
+        drop(program); // Stops and joins the helper.
+        assert_one_closed_phase(&trace, "worker");
+    }
+}
+
+#[test]
+fn build_helpers_end_phases_on_success_and_trap() {
+    for traps in [false, true] {
+        let wasm = wat::parse_str(worker_phase_wat(traps)).expect("test WAT compiles");
+        let compiled = compile_with(&wasm, None).expect("compiles");
+        let memory =
+            SharedMemory::new(compiled.module.engine(), compiled.memory.clone()).expect("memory");
+        let trace = Trace::new(None);
+        let ran = BuildHelpers::start(&compiled.module, &memory, 1, u64::MAX, &trace).finish();
+        assert_eq!(ran.len(), 1);
+        assert_one_closed_phase(&trace, "worker");
+    }
+}
+
+#[test]
+fn starting_a_ticker_with_too_little_memory_is_an_error_not_a_host_panic() {
+    let wat = r#"(module
+        (import "wrela" "tick" (func $start (param i32 i32 i32)))
+        (import "wrela" "memory" (memory 1 16384 shared)) (export "memory" (memory 0))
+        (func (export "init") (call $start (i32.const 1) (i32.const 2) (i32.const 60)))
+        (func (export "frame") (param f32 i32 i32))
+        (func (export "__tick") (param i32 i32 i32 i32)))"#;
+    let err = load_wat(wat).err().expect("too little memory");
+    assert!(matches!(&err, Error::Trap(m) if m.contains("ticker needs at least")), "{err}");
 }
 
 #[test]
@@ -234,6 +368,17 @@ fn reports_program_traps() {
     let wat = r#"(module (import "wrela" "memory" (memory 1 16384 shared)) (export "memory" (memory 0)) (func (export "frame") (param f32 i32 i32) unreachable))"#;
     let err = load_wat(wat).expect("loads").frame(0.0, 1, 1).expect_err("traps");
     assert!(matches!(&err, Error::Trap(m) if m.contains("unreachable")), "{err}");
+}
+
+#[test]
+fn lockstep_rejects_nonpositive_and_nonfinite_fps() {
+    let wat = r#"(module (import "wrela" "memory" (memory 1 16384 shared))
+        (export "memory" (memory 0)) (func (export "frame") (param f32 i32 i32)))"#;
+    let mut program = load_wat(wat).expect("loads");
+    for fps in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+        let err = program.lockstep_frame(0, fps, 1, 1, &[], None).expect_err("invalid fps");
+        assert!(matches!(&err, Error::Program(m) if m.contains("fps must be finite")), "{err}");
+    }
 }
 
 #[test]
@@ -503,6 +648,7 @@ fn requests_are_answered_from_the_next_call_then_taken_once() {
 #[test]
 fn storage_keeps_bytes_at_paths() {
     let storage = scratch_dir("storage");
+    assert!(!storage.join("saves").exists(), "the write must create missing parents");
     let io = Io { build: None, storage: Some(storage.clone()), post: None, quiet: false };
     let write = Encoder::new().storage_write(4, "saves/a", &[9, 8, 7, 6]).finish();
     let mut p = requester(&write, io.clone());
@@ -549,6 +695,26 @@ fn storage_paths_stay_inside_the_programs_storage() {
         err.to_string(),
         "StorageWrite failed: the storage path `../escape` has an empty, `.` or `..` part"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn storage_paths_cant_cross_symbolic_links() {
+    use std::os::unix::fs::symlink;
+
+    let root = scratch_dir("storage-symlink");
+    let storage = root.join("storage");
+    let outside = root.join("outside");
+    std::fs::create_dir_all(&storage).expect("storage");
+    std::fs::create_dir_all(&outside).expect("outside");
+    symlink(&outside, storage.join("link")).expect("link");
+
+    let batch = Encoder::new().storage_write(4, "link/escaped", b"outside").finish();
+    let io = Io { storage: Some(storage), ..Io::default() };
+    let mut p = requester(&batch, io);
+    p.call("ask", &[]).expect("the failed request arrives");
+    assert_eq!(call_i32(&mut p, "status"), REQUEST_FAILED);
+    assert!(!outside.join("escaped").exists());
 }
 
 #[test]

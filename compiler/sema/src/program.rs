@@ -6,6 +6,10 @@ use crate::ty::*;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 
+/// A checked closure's parameter types, result and parameter modes, in its owner's generic
+/// terms. Trait solving uses it to decide whether the closure meets a function-type bound.
+pub(crate) type ClosureSignature = (Vec<TyId>, TyId, Vec<Mode>);
+
 #[derive(Debug, Default)]
 pub struct Program {
     pub types: Types,
@@ -47,7 +51,7 @@ pub struct Program {
     /// Each closure's parameter and return types, in its owner's generic terms, for whether
     /// it fits a function-type bound (`impl<F: fn(vec3) -> f32> Tr for F`). Recorded when the
     /// closure is checked, and again when its body's types are final.
-    pub(crate) closure_sigs: std::cell::RefCell<HashMap<ClosureRef, (Vec<TyId>, TyId)>>,
+    pub(crate) closure_sigs: std::cell::RefCell<HashMap<ClosureRef, ClosureSignature>>,
     /// Whether a type implements a structural trait (`Copy`, `Clone`, `GpuData`): worked out
     /// once per type, since struct types share their fields' types.
     pub(crate) builtin_impls: std::cell::RefCell<HashMap<(TyId, Lang), bool>>,
