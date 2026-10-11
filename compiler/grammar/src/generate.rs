@@ -727,7 +727,7 @@ struct Renderer<'a, 'g> {
     newline_pending: bool,
     /// The f-string holes open, innermost last, each with the brackets open in it: a hole is
     /// on one line, so nothing in it breaks a line (L22).
-    holes: Vec<u32>,
+    holes: Vec<Brackets>,
 }
 
 impl Renderer<'_, '_> {
@@ -817,12 +817,12 @@ impl Renderer<'_, '_> {
 /// Follows f-string holes through a token (L22): returns false where the lexer would read the
 /// token otherwise, a `:` or `}` outside brackets in a hole (which end it), or an FSTRING_MID
 /// or FSTRING_TAIL outside one.
-fn track_hole(holes: &mut Vec<u32>, k: TokenKind) -> bool {
+fn track_hole(holes: &mut Vec<Brackets>, k: TokenKind) -> bool {
     use TokenKind as T;
     match k {
-        T::FStringHead => holes.push(0),
+        T::FStringHead => holes.push(Brackets::default()),
         T::FStringMid | T::FStringTail => {
-            if holes.last() != Some(&0) {
+            if holes.last().is_none_or(|b| b.depth() != 0) {
                 return false;
             }
             if k == T::FStringTail {
@@ -830,13 +830,13 @@ fn track_hole(holes: &mut Vec<u32>, k: TokenKind) -> bool {
             }
         }
         _ => {
-            if let Some(d) = holes.last_mut() {
-                match k {
-                    T::LParen | T::LBracket | T::LBrace => *d += 1,
-                    T::RBrace | T::Colon if *d == 0 => return false,
-                    T::RParen | T::RBracket | T::RBrace => *d = d.saturating_sub(1),
-                    _ => {}
+            if let Some(b) = holes.last_mut() {
+                if matches!(k, T::RBrace | T::Colon) && b.depth() == 0 {
+                    return false;
                 }
+                // A closer closes the innermost bracket of its kind and those opened after it,
+                // or nothing (L19), as the lexer tracks them.
+                b.track(k);
             }
         }
     }
@@ -917,5 +917,23 @@ mod tests {
             gen_.render(&m, &mut rng);
         }
         assert!(sizes / 200 < 400, "programs are too big on average: {}", sizes / 200);
+    }
+
+    /// In a hole, a `)` closes its `(` and a `{` opened after it (L19), so the `}` after them
+    /// ends the hole, as the lexer reads it; a `)` with no `(` open closes nothing. (Counting
+    /// brackets instead, the renderer wrote `f"{({)}:.2}"` meaning `}` closed the `{`.)
+    #[test]
+    fn a_hole_s_brackets_close_as_the_lexer_closes_them() {
+        use TokenKind as T;
+        let terms = |ks: &[TokenKind]| ks.iter().map(|k| Terminal::Token(*k)).collect::<Vec<_>>();
+        let crossed = [T::FStringHead, T::LParen, T::LBrace, T::RParen, T::RBrace, T::FStringTail];
+        assert!(!renderable(&terms(&crossed)), "the `}}` after `( {{ )` ends the hole");
+        let stray = [T::FStringHead, T::LBrace, T::RParen, T::RBrace, T::FStringTail];
+        assert!(renderable(&terms(&stray)), "a stray `)` leaves the `{{` open for the `}}`");
+        // The first `}` ends the hole, so the second is a lone `}` in the text (E0005).
+        for (text, lone) in [("f\"{({)}:.2}\"", true), ("f\"{ {)}:.2}\"", false)] {
+            let lexed = wrela_syntax::lex(FileId(0), text);
+            assert_eq!(!lexed.diagnostics.is_empty(), lone, "{text}: {:?}", lexed.diagnostics);
+        }
     }
 }
