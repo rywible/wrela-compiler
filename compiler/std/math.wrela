@@ -88,6 +88,11 @@ fn is_inf(x: f32) -> bool {
     abs(x) > F32_MAX
 }
 
+/// Whether `x` is a number: not a NaN, not an infinity.
+pub fn is_finite(x: f32) -> bool {
+    abs(x) <= F32_MAX
+}
+
 /// A finite `x` reduced to `y = x - n * pi/2` with |y| <= pi/4, and `n`: exact for |x| < 2^20,
 /// and beyond that only its last two bits (the quadrant), since `n` can be far beyond an i32.
 fn reduce(x: f32) -> (f64, i32) {

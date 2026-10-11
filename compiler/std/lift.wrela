@@ -8,6 +8,7 @@
 // each file's hash when it was built, so a tool can show a literal's line and write a change
 // back (`wrela edit`). In a build that isn't lifted there are no literals: `count()` is 0.
 
+use std::fmt::{json_number, json_text}
 use std::string::String
 
 /// A lifted literal: its place in the table.
@@ -241,40 +242,8 @@ impl Report {
 /// Adds `s` as a JSON string, including its quotes.
 fn push_json_string(out: mut String, s: str) {
     out.push_byte(34)
-    for i in 0..s.len() {
-        let b = s.byte(i)
-        if b == 34 || b == 92 {
-            out.push_byte(92)
-            out.push_byte(b)
-        } else if b == 8 {
-            out.push_str("\\b")
-        } else if b == 9 {
-            out.push_str("\\t")
-        } else if b == 10 {
-            out.push_str("\\n")
-        } else if b == 12 {
-            out.push_str("\\f")
-        } else if b == 13 {
-            out.push_str("\\r")
-        } else if b < 32 {
-            let hex = "0123456789abcdef"
-            out.push_str("\\u00")
-            out.push_byte(hex.byte(u32(b) >> 4))
-            out.push_byte(hex.byte(u32(b) & 15))
-        } else {
-            out.push_byte(b)
-        }
-    }
+    json_text(mut out, s)
     out.push_byte(34)
-}
-
-/// Adds a finite `f32` as a JSON number; JSON has no NaN or infinity, so those are `null`.
-fn push_json_number(out: mut String, x: f32) {
-    if x == x && abs(x) <= 340282346638528859811704183484516925440.0 {
-        out.push_str(f"{x}".as_str())
-    } else {
-        out.push_str("null")
-    }
 }
 
 impl Checks for Report {
@@ -293,13 +262,13 @@ impl Checks for Report {
         self.json.push_str(",\"check\":")
         push_json_string(mut self.json, kind)
         self.json.push_str(",\"value\":")
-        push_json_number(mut self.json, value)
+        json_number(mut self.json, value)
         self.json.push_str(",\"target\":")
-        push_json_number(mut self.json, target)
+        json_number(mut self.json, target)
         self.json.push_str(",\"miss\":")
-        push_json_number(mut self.json, miss)
+        json_number(mut self.json, miss)
         self.json.push_str(",\"within\":")
-        push_json_number(mut self.json, within)
+        json_number(mut self.json, within)
         self.json.push_str(f",\"holds\":{ok}}}".as_str())
     }
 }

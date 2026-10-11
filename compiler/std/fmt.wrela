@@ -11,6 +11,11 @@
 // many places, ties to even: `{0.125:.2}` is `0.12`. Both agree with Rust's `{}` and `{:.p}`,
 // which the tests check.
 // NaN is `NaN`, infinities are `inf` and `-inf`.
+//
+// `json_text` and `json_number` write text and floats as JSON, for tools that read a program's
+// answers (the studio's lens, a lifted build's checks).
+
+use std::math::is_finite
 
 /// How a value is to be written: what `{value:spec}`'s spec says.
 pub struct Spec: Copy {
@@ -714,4 +719,52 @@ fn assert_failed2<A: Format, B: Format>(
 fn shown<T: Format>(out: mut String, source: str, value: T, quoted: bool) {
     let q = if quoted { "\"" } else { "" }
     out.push_str(f"`{source}` is {q}{value}{q}")
+}
+
+/// `s` as the body of a JSON string: quotes, backslashes and control characters escaped.
+pub fn json_text(out: mut String, s: str) {
+    for i in 0..s.len() {
+        let b = s.byte(i)
+        if b == 34 || b == 92 {
+            out.push_byte(92)
+            out.push_byte(b)
+        } else if b == 10 {
+            out.push_str("\\n")
+        } else if b == 13 {
+            out.push_str("\\r")
+        } else if b == 9 {
+            out.push_str("\\t")
+        } else if b < 32 {
+            let hex = "0123456789abcdef"
+            out.push_str("\\u00")
+            out.push_byte(hex.byte(u32(b >> 4)))
+            out.push_byte(hex.byte(u32(b & 15)))
+        } else {
+            out.push_byte(b)
+        }
+    }
+}
+
+/// `x` as a JSON number, exact (it reads back as the same `f32`). JSON has no NaN or infinity,
+/// so those are `null`.
+pub fn json_number(out: mut String, x: f32) {
+    if is_finite(x) {
+        out.push_str(f"{x}")
+    } else {
+        out.push_str("null")
+    }
+}
+
+@test
+fn json_keeps_the_largest_float_and_escapes_control_characters() {
+    var out = String::new()
+    json_number(mut out, 340282346638528859811704183484516925440.0)
+    out.push_str(" ")
+    json_number(mut out, bitcast_f32(0x7f800000))
+    out.push_str(" ")
+    var text = String::new()
+    text.push_str("tab\t")
+    text.push_byte(1)
+    json_text(mut out, text.as_str())
+    assert(out == "340282350000000000000000000000000000000 null tab\\t\\u0001")
 }
