@@ -259,7 +259,7 @@ fn fields_near_and_pasture_beyond() {
 fn left_as_last_used_with_old_trees_in_the_pasture() {
     let l = land()
     let p = settle(l, ELVES, 0, 300)
-    let s = left_by(p, l, species::habits(), ELVES, 300)
+    let s = left_by(p, l, species::habits(), ELVES, 300, 0)
     var grazed = 0.0
     for c in 0..l.grid.cells() {
         let was = Left::from_u32(u32(s.left[c])).unwrap()
@@ -285,7 +285,7 @@ fn left_as_last_used_with_old_trees_in_the_pasture() {
 fn left_long_before_the_plague_is_wood_again() {
     let l = land()
     let p = settle(l, ELVES, 0, 200)
-    let s = left_by(p, l, species::habits(), ELVES, 400)
+    let s = left_by(p, l, species::habits(), ELVES, 400, 0)
     for b in s.left {
         assert(Left::from_u32(u32(b)).unwrap() == Left::Wild, "the wood has it back")
     }
@@ -296,6 +296,44 @@ fn left_long_before_the_plague_is_wood_again() {
     let floor = repo_root().join("examples/last-green");
     std::fs::copy(floor.join("peoples.wrela"), dir.join("peoples.wrela")).expect("copy the elves");
     assert_eq!(super::tests_pass(&dir), 4);
+}
+
+/// A world's seed (`Map::seed`): the same map grown with another seed is another world, and with
+/// the same seed, the same world. On a corner of the floor at the preview's grain.
+#[test]
+fn a_seed_grows_another_world_and_the_same_seed_the_same() {
+    let tests = r#"
+use engine::grow::{PREVIEW, Start, Tree, simulate}
+
+fn grown(seed: u32) -> Vec<Tree> {
+    var m = map::map()
+    m.seed = seed
+    let lo = vec2(500.0, -1100.0)
+    var h = simulate(ground::ground(), m, species::habits(), PREVIEW, lo, lo + vec2(160.0), stones::stones(m), |land, year| Start::wild(land))
+    take h.trees
+}
+
+fn same(a: [Tree], b: [Tree]) -> bool {
+    if a.len() != b.len() {
+        return false
+    }
+    for i in 0..a.len() {
+        if length(a[i].at - b[i].at) > 0.0 || a[i].tall != b[i].tall {
+            return false
+        }
+    }
+    true
+}
+
+@test
+fn seeds() {
+    let a = grown(0)
+    assert(same(a, grown(0)), "the same seed grows the same world")
+    assert(!same(a, grown(7)), "another seed grows another world")
+}
+"#;
+    let dir = map_package("last-green/seeds", tests);
+    assert_eq!(super::tests_pass(&dir), 1);
 }
 
 // ---- the bake --------------------------------------------------------------------------------
