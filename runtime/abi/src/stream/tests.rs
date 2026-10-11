@@ -49,6 +49,12 @@ fn golden_bytes() {
         words(&[24, 32, 1, 3, 0, 12, 3, 16, 0, 0]), // DrawIndexedIndirect
         words(&[25, 12, 7]),                        // Label
         b"terrain\0".to_vec(),
+        words(&[26, 16, 6, 8]), // Prepare
+        b"../floor".to_vec(),
+        words(&[27, 12, 8]), // Unprepare
+        b"../floor".to_vec(),
+        words(&[28, 12, 7, 4]), // HandOver
+        b"next".to_vec(),
     ]
     .concat();
     expected.extend(words(&[VERSION, body.len() as u32]));
@@ -108,8 +114,11 @@ fn the_golden_batch_round_trips() {
 #[test]
 fn rejects_another_version() {
     let mut batch = Encoder::new().present().finish();
-    batch[4] = 9;
-    assert_eq!(decode(&batch), Err(StreamError::WrongVersion { expected: VERSION, got: 9 }));
+    batch[4] = (VERSION + 1) as u8;
+    assert_eq!(
+        decode(&batch),
+        Err(StreamError::WrongVersion { expected: VERSION, got: VERSION + 1 })
+    );
 }
 
 #[test]

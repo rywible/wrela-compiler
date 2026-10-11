@@ -1,9 +1,11 @@
-// Hot reload (language.md §22): a tool replaces a running program's build with a new one, in
-// the same page or process, and the new build starts with `init`, as any program does. What
-// the old build kept with `keep` is what the new one's `kept` gives, so a program carries
-// across what it wants to: where the camera is, what the player chose. Bytes, so a program
-// says how (`std::serialize`'s `save` and `load`, which fail cleanly when the type has
-// changed). A program started anew kept nothing.
+// One build in place of another, in the same page or process (language.md §22). A tool does it
+// in a hot reload; a program does it itself with `hand_over`, to give its place to another
+// build: a game made of several builds, each loaded when the player reaches it. Either way the
+// new build starts with `init`, as any program does. What the old build kept with `keep` is
+// what the new one's `kept` gives, so a program carries across what it wants to: where the
+// camera is, what the player chose. Bytes, so a program says how (`std::serialize`'s `save`
+// and `load`, which fail cleanly when the type has changed). A program started anew kept
+// nothing.
 //
 // ```wrela
 // use std::reload::{keep, kept}
@@ -22,6 +24,8 @@
 // }
 // ```
 
+use std::io::{Pending, next_request, path_problem}
+
 /// Keeps `bytes` for the build that replaces this one: the host holds them, in place of what
 /// this build kept before. Cheap enough for each frame (a copy of the bytes).
 pub fn keep(bytes: [u8]) {
@@ -33,3 +37,68 @@ pub fn keep(bytes: [u8]) {
 pub fn kept() -> Vec<u8> {
     Vec::from_kept()
 }
+
+/// Gets the build at `path` (relative to this program's build, as `fetch`'s URLs are, but it
+/// may start with `..` parts) ready to take this program's place: its files fetched, its code
+/// compiled and its pipelines built, in the background, while this program runs. The answer
+/// is no bytes, when it's ready; a build that can't be got ready fails the request. A
+/// `hand_over` to a build that's ready starts it at once; to one that isn't, it gets it ready
+/// first, and the screen keeps this program's last frame meanwhile.
+pub fn prepare(path: str) -> Pending<u8> {
+    check_build_path("prepare", path)
+    let request = next_request()
+    prepare_command(request, path)
+    Pending::new(request)
+}
+
+/// Lets go of what `prepare` got ready for the build at `path`, if anything: the memory its
+/// code and pipelines hold, but for the pipelines the running build uses too.
+pub fn unprepare(path: str) {
+    check_build_path("unprepare", path)
+    unprepare_command(path)
+}
+
+/// Gives this program's place to the build at `path` (as `prepare` names it) after this call:
+/// the host stops this program, starts that build with `init`, and its `kept()` gives what this
+/// program kept last. Its ticker, if it starts one, starts from its first tick, and the input
+/// this program hadn't read is its. If the build can't be started (it isn't there, its code or
+/// a pipeline doesn't build), this program goes on, and the request fails: it's answered only
+/// then. If it starts and its `init` fails, the host starts this program's build again in its
+/// place, with the same bytes kept, so the screen never goes black.
+pub fn hand_over(path: str) -> Pending<u8> {
+    check_build_path("hand_over", path)
+    let request = next_request()
+    hand_over_command(request, path)
+    Pending::new(request)
+}
+
+/// What's wrong with the path of a build, if anything: as a fetched URL's, but it may start
+/// with `..` parts, to name a build beside this one (the hosts check the same).
+fn build_path_problem(path: str) -> Option<Text> {
+    var start = 0
+    while start + 3 <= path.len() &&
+        path.byte(start) == 46 &&
+        path.byte(start + 1) == 46 &&
+        path.byte(start + 2) == 47 {
+        start += 3
+    }
+    if start + 2 == path.len() && path.byte(start) == 46 && path.byte(start + 1) == 46 {
+        return Some("names no build: it ends in `..`")
+    }
+    path_problem(path.slice(start, path.len()))
+}
+
+fn check_build_path(what: Text, path: str) {
+    if let Some(why) = build_path_problem(path) {
+        panic(f"{what}: the build path `{path}` {why}")
+    }
+}
+
+@intrinsic
+fn prepare_command(request: u32, path: str) {}
+
+@intrinsic
+fn unprepare_command(path: str) {}
+
+@intrinsic
+fn hand_over_command(request: u32, path: str) {}

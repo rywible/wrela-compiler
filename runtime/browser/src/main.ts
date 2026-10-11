@@ -50,6 +50,19 @@ function onPixelRatioChange(f: () => void): void {
   );
 }
 
+/** The page's audio context, made for the first voice, and the voice playing in it: a build
+ * handed over to plays its voice in the same context (a browser starts a context only after the
+ * person interacts with the page, so a new one would be silent). */
+const audio: { context: Promise<AudioContext> | null; node: AudioWorkletNode | null } = { context: null, node: null };
+
+/** Stops the voice playing: its program handed its place to another build. */
+function stopVoice(): void {
+  if (!audio.node) return;
+  audio.node.port.onmessage = null;
+  audio.node.disconnect();
+  audio.node = null;
+}
+
 /** Plays the program's voice in an AudioWorklet (worklet.js), at the ABI's sample rate (the
  * browser resamples to the device's). In test mode it renders `test.audio` quanta offline
  * instead, saves the samples to `results/audio.f32`, and tells the worker. */
@@ -67,6 +80,7 @@ async function playVoice(voice: VoiceOptions, test: TestParams | null, worker: W
       failEarly(why, test !== null);
     };
     n.connect(ctx.destination);
+    return n;
   };
   if (test) {
     if (test.audio === 0) return;
@@ -78,15 +92,20 @@ async function playVoice(voice: VoiceOptions, test: TestParams | null, worker: W
     worker.postMessage({ type: "audio-rendered" } satisfies ToWorker);
     return;
   }
-  const ctx = new AudioContext({ sampleRate: AUDIO_SAMPLE_RATE, latencyHint: "interactive" });
-  await ctx.audioWorklet.addModule(url);
-  node(ctx);
-  // A browser starts audio only after the person interacts with the page.
-  if (ctx.state !== "running") {
-    const resume = () => void ctx.resume();
-    window.addEventListener("pointerdown", resume, { once: true });
-    window.addEventListener("keydown", resume, { once: true });
-  }
+  audio.context ??= (async () => {
+    const ctx = new AudioContext({ sampleRate: AUDIO_SAMPLE_RATE, latencyHint: "interactive" });
+    await ctx.audioWorklet.addModule(url);
+    // A browser starts audio only after the person interacts with the page.
+    if (ctx.state !== "running") {
+      const resume = () => void ctx.resume();
+      window.addEventListener("pointerdown", resume, { once: true });
+      window.addEventListener("keydown", resume, { once: true });
+    }
+    return ctx;
+  })();
+  const ctx = await audio.context;
+  stopVoice();
+  audio.node = node(ctx);
 }
 
 /** Test mode, `latency`: `n` pointer moves sent through the DOM at random times over `ms`. */
@@ -171,6 +190,8 @@ function start(): void {
         playVoice(msg.voice, test, worker).catch((e: unknown) => failEarly(e, testing));
       } else if (msg.type === "load-query") {
         worker.postMessage({ type: "load", opened_ms: performance.timeOrigin, resources: loaded(["navigation", "resource"]) } satisfies ToWorker);
+      } else if (msg.type === "audio-stop") {
+        stopVoice();
       } else if (msg.type === "reload") {
         location.reload();
       } else if (msg.type === "clip-start") {

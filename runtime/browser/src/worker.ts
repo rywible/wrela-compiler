@@ -9,6 +9,7 @@ import { errorMessage } from "./errors.ts";
 import { fitSize, frameSeconds, VisibleClock } from "./frame.ts";
 import { alignTo, type GpuExecutor, type PipelineCache, type Timing, timeEachPipeline } from "./gpu.ts";
 import { arrivals, epochNow, InputRing, parseScript, type Scripted } from "./input.ts";
+import { type Asked, HandOvers } from "./handover.ts";
 import { browserIo, type Build, loadBuild, startProgram } from "./loader.ts";
 import { Live } from "./live.ts";
 import { type Program, type ProgramOptions, runWorker, type SpawnWorker } from "./program.ts";
@@ -163,6 +164,9 @@ function tickerStarter(wasm: Uint8Array, settings: TickSettings, replay: Replay 
 /** The running build's pipelines: the next build keeps those that are the same. */
 const pipelineCache: PipelineCache = new Map();
 
+/** The running build: what a hot reload replaced it with, or a hand-over gave its place to. */
+let running: Build | null = null;
+
 /** The helper threads the running program started: a hot reload stops them. */
 const helpers: Worker[] = [];
 
@@ -180,6 +184,7 @@ interface Carried {
 function programOptions(b: Build, ticks: TickSettings, carried: Carried | null): ProgramOptions {
   return {
     io: browserIo(base, undefined, buildBase),
+    builds: handOvers ?? undefined,
     spawnWorker,
     startVoice,
     startTicker: tickerStarter(b.wasm, ticks, carried?.replay ?? null),
@@ -188,32 +193,104 @@ function programOptions(b: Build, ticks: TickSettings, carried: Carried | null):
   };
 }
 
-/** Stops `old` for the build at `base` (hot reload): its ticker stops and reports its ticks,
- * its helpers stop, and its buffers and textures go. `start` starts the new build with what
- * the old one hands on; the ticker's new words say `frames` frames have started. */
-async function swap(
-  old: Program,
-  base: string,
-  frames: number,
-  start: (build: Build, carried: Carried) => Promise<Program>,
-): Promise<Program> {
-  const build = await loadBuild(base);
-  buildBase = base;
+/** How a build is started, with what the program it replaces hands on, if it replaces one. */
+type Start = (build: Build, carried: Carried | null) => Promise<Program>;
+
+/** Stops `old`: its ticker stops (reporting its ticks, to run again, if `replaying`), its
+ * helpers stop, and its buffers and textures go. What it hands on; the ticker's new words say
+ * `frames` frames have started. */
+async function stop(old: Program, frames: number, replaying: boolean): Promise<Carried> {
   let replay: Replay | null = null;
-  if (old.ticker !== null && ticker.report !== null) {
+  if (ticker.report !== null) {
     const stopped = ticker.report;
     ticker.control.stop();
-    replay = (await stopped).replay;
+    if (replaying && old.ticker !== null) replay = (await stopped).replay;
     ticker.thread?.terminate();
   }
   old.shutdown();
-  for (const h of helpers.splice(0)) h.terminate();
+  stopHelpers();
   (old.executor as GpuExecutor).destroyAll();
+  newTicker(frames);
+  return { kept: old.keeping, input: old.unreadInput, replay };
+}
+
+function stopHelpers(): void {
+  for (const h of helpers.splice(0)) h.terminate();
+}
+
+/** A ticker's thread for the next program, none started yet: its words say `frames` frames have
+ * started. */
+function newTicker(frames: number): void {
   ticker.control = TickerControl.create();
   ticker.report = null;
   ticker.thread = null;
   ticker.control.framesStarted(frames);
-  return start(build, { kept: old.keeping, input: old.unreadInput, replay });
+}
+
+/** Stops `old` for the build at `base` (hot reload), which `start` starts with what the old one
+ * hands on, its ticks to run again among it. */
+async function swap(old: Program, base: string, frames: number, start: Start): Promise<Program> {
+  const build = await loadBuild(base);
+  buildBase = base;
+  running = build;
+  return start(build, await stop(old, frames, true));
+}
+
+// ---- Hand-over ----
+
+/** The builds the running program got ready, and the hand-over it asked for. */
+let handOvers: HandOvers | null = null;
+
+/** The pipelines of the build that handed over to the running one that the running one doesn't
+ * use: going back to it builds none. */
+let leftovers: PipelineCache = new Map();
+
+/** Test mode keeps what the host says, as the program's printed lines (`results/log.txt`). */
+let hostLine: ((line: string) => void) | null = null;
+
+/** Hands `old`'s place to the build it asked for after its last frame (`std::reload::hand_over`),
+ * once it's ready; `frames` frames have started. If it can't be got ready, the request fails
+ * and `old` goes on. The new build starts with what `old` kept and its input not yet read (no
+ * ticks: its sim is its own). If its `init` fails, `old`'s build starts again in its place with
+ * what it kept: the screen never goes black. The program that runs after. */
+async function handOver(old: Program, asked: Asked, frames: number, start: Start): Promise<Program> {
+  let ready;
+  try {
+    ready = await handOvers!.ready(asked.base);
+  } catch (e) {
+    asked.fail(e);
+    return old;
+  }
+  handOvers!.take(asked.base);
+  const back = { build: running!, base: buildBase };
+  const before = new Map(pipelineCache);
+  if (old.hasVoice) self.postMessage({ type: "audio-stop" } satisfies FromWorker);
+  const carried = await stop(old, frames, false);
+  // The cache narrows to the new build's pipelines (`buildPipelines`): it offers them all, its
+  // own got ready and those of the build before for the way back.
+  for (const [key, p] of leftovers) if (!pipelineCache.has(key)) pipelineCache.set(key, p);
+  for (const [key, p] of ready.pipelines) pipelineCache.set(key, p);
+  buildBase = asked.base;
+  try {
+    const program = await start(ready, carried);
+    running = ready;
+    leftovers = new Map([...before].filter(([key]) => !pipelineCache.has(key)));
+    return program;
+  } catch (e) {
+    // What its `init` started stops too.
+    self.postMessage({ type: "audio-stop" } satisfies FromWorker);
+    ticker.control.stop();
+    ticker.thread?.terminate();
+    stopHelpers();
+    newTicker(frames);
+    const line = `the hand-over to ${asked.base} failed: ${errorMessage(e)}; ${back.base} starts again`;
+    console.warn(`wrela: ${line}`);
+    hostLine?.(line);
+    buildBase = back.base;
+    pipelineCache.clear();
+    for (const [key, p] of before) pipelineCache.set(key, p);
+    return start(back.build, carried);
+  }
 }
 
 // ---- Running normally ----
@@ -232,22 +309,23 @@ async function run(canvas: OffscreenCanvas, device: GPUDevice, build: Build, liv
   const ctx = context(canvas, device, GPUTextureUsage.RENDER_ATTACHMENT);
   clock.startAt(epochNow());
   const screen = { texture: () => ctx.getCurrentTexture() };
-  const start = (b: Build, carried: Carried | null) =>
+  const start: Start = (b, carried) =>
     startProgram(
       device,
       b,
       screen,
       { ...programOptions(b, { ...NORMAL_TICKS, replayable: live !== null }, carried), workers: normalWorkers() },
-      { cache: live ? pipelineCache : undefined },
+      { cache: pipelineCache },
     );
+  running = build;
   let program = await start(build, null);
   (program.executor as GpuExecutor).built.catch(fatal);
   ticker.control.go(TickerMode.CLOCK);
   const max = device.limits.maxTextureDimension2D;
   // A debug build's bounds checks: the flag is read after a frame, one read at a time.
   let checking = false;
-  // Hot reload: the frames drawn, and whether a new build is being swapped in (the canvas
-  // keeps the last frame meanwhile).
+  // Hot reload and hand-over: the frames drawn, and whether a new build is being swapped in (the
+  // canvas keeps the last frame meanwhile).
   let frames = 0;
   let swapping = false;
   const tick = (now: number) => {
@@ -293,6 +371,18 @@ async function run(canvas: OffscreenCanvas, device: GPUDevice, build: Build, liv
         if (!checking) {
           checking = true;
           executor.checkDebugFlag().then(() => (checking = false), fatal);
+        }
+        const asked = handOvers!.takeAsked();
+        if (asked !== null) {
+          swapping = true;
+          handOver(program, asked, frames, start).then((p) => {
+            if (p !== program) {
+              program = p;
+              (p.executor as GpuExecutor).built.catch(fatal);
+              ticker.control.go(TickerMode.CLOCK);
+            }
+            swapping = false;
+          }, fatal);
         }
       }
       self.requestAnimationFrame(tick);
@@ -367,6 +457,11 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
   // The tick log needs only the ticks' hashes (the sim's state, cheap), not the frames'.
   const tickHashes = hashes || params.ticklog > 0;
   let pipelinesMs: number | null = null;
+  const print = (line: string) => {
+    printed.push(line);
+    printed_in.push(frameNow);
+  };
+  hostLine = print;
   const salted = params.salt > 0 ? salt(build, params.salt) : build;
   const target = {
     texture: () => screen,
@@ -380,7 +475,7 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
   };
   // `timestamps=1` times each pass; `timestamps=2` runs each alone too (testmode.ts).
   const timing: Timing = params.timestamps === 2 ? "serial" : params.timestamps > 0 ? "span" : "off";
-  const start = (b: Build, carried: Carried | null) =>
+  const start: Start = (b, carried) =>
     startProgram(
       device,
       b,
@@ -394,24 +489,24 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
         hash: hashes,
         workers: params.workers,
         tickHashes,
-        onPrint: (line) => {
-          printed.push(line);
-          printed_in.push(frameNow);
-        },
+        onPrint: print,
       },
       {
         timing,
         onPipelines: (ms) => {
           pipelinesMs = ms;
         },
-        cache: live ? pipelineCache : undefined,
+        cache: pipelineCache,
       },
     );
+  running = salted;
   let program = await start(salted, null);
   let executor = program.executor as GpuExecutor;
   executor.built.catch(fatal);
   if (timing !== "off" && !executor.timed) throw new GpuError("the test asks for timestamps, but this device has no timestamp queries");
   let hz = program.ticker?.hz ?? 0;
+  // The frame the running program's ticks count from: a build handed over to starts its own.
+  let tickFrom = 0;
   const schedule = params.paced > 0 ? TickerMode.CLOCK : TickerMode.LOCKSTEP;
   // The latency test: when each frame started, and which events (by when they were sent) it got.
   const latency = { frames: [] as number[], delivered: [] as { sent: number; frame: number }[] };
@@ -450,7 +545,7 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
     control.framesStarted(i + 1);
     if (hz > 0 && params.paced === 0) {
       // Lockstep: the ticks before this frame run first, as on the native host.
-      const target = lockstepTicks(i, hz, fps);
+      const target = lockstepTicks(i - tickFrom, hz, fps);
       control.runTo(target);
       await control.ranTo(target);
       // The ticker's thread reports its trap (`tickerStarter`).
@@ -489,6 +584,18 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
     // `snap=n`: the screen every n frames from `snapfrom`, a PNG each (`snap-<frame>.png`).
     if (params.snap > 0 && i >= params.snapfrom && (i - params.snapfrom) % params.snap === 0) {
       await putResult(base, `snap-${i}.png`, encodePng(width, height, await readTexture(device, screen)));
+    }
+    const asked = handOvers!.takeAsked();
+    if (asked !== null) {
+      const p = await handOver(program, asked, i + 1, start);
+      if (p !== program) {
+        program = p;
+        executor = program.executor as GpuExecutor;
+        executor.built.catch(fatal);
+        hz = program.ticker?.hz ?? 0;
+        tickFrom = i + 1;
+        if (hz > 0) ticker.control.go(schedule);
+      }
     }
   }
   await draining;
@@ -592,7 +699,10 @@ self.onmessage = (event: MessageEvent<ToWorker>) => {
       const live = msg.live !== null ? new Live(base, msg.live) : null;
       live?.start();
       Promise.all([openDevice((test?.timestamps ?? 0) > 0), loadBuild(base)])
-        .then(([device, build]) => (test ? runTest(msg.canvas, device, build, test, live) : run(msg.canvas, device, build, live)))
+        .then(([device, build]) => {
+          handOvers = new HandOvers(device, () => buildBase, () => [pipelineCache, leftovers]);
+          return test ? runTest(msg.canvas, device, build, test, live) : run(msg.canvas, device, build, live);
+        })
         .catch(fatal);
       return;
     }

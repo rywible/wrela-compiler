@@ -1,0 +1,102 @@
+// `first`, but driven by its frames, not by a test's calls: the same tour of hand-overs in both
+// hosts (compiler/tests/tests/suite/handover.rs), which print the same lines. It starts 1: gets
+// a build that isn't there ready (which fails), then `second` (which hands back on its third
+// frame, start 2); start 3 hands over to `broken`, whose `init` fails, so `tour` starts again
+// (4) with what it kept; start 4 hands over to a build that isn't there, and goes on.
+
+use std::gpu::{ClipPosition, VertexIndex, begin_screen_pass, draw}
+use std::io::{IoError, Pending, print}
+use std::reload::{hand_over, keep, kept, prepare}
+use std::serialize::{LoadError, Serialize, load, save}
+
+/// As `first`'s.
+struct Carried: Clone + Serialize {
+    starts: u32,
+    last: u32,
+    from: u32,
+}
+
+pub struct Game {
+    carried: Carried,
+    restored: bool,
+    /// The frames since this start.
+    frames: u32,
+    ready: Option<Pending<u8>>,
+    going: Option<Pending<u8>>,
+}
+
+pub fn init() -> Game {
+    let back: Result<Carried, LoadError> = load(kept())
+    let restored = back.is_ok()
+    var carried = match back {
+        Ok(c) => c.clone(),
+        Err(_) => Carried { starts: 0, last: 0, from: 3 },
+    }
+    carried.starts += 1
+    carried.last = 3
+    carried.from = 3
+    Game { carried, restored, frames: 0, ready: None, going: None }
+}
+
+/// What a request gave, if it has: 1 ready, 2 failed.
+fn outcome(p: mut Option<Pending<u8>>) -> u32 {
+    let answer: Option<Result<Vec<u8>, IoError>> = match mut p {
+        Some(r) => r.poll(),
+        None => None,
+    }
+    match answer {
+        Some(Ok(_)) => 1,
+        Some(Err(_)) => 2,
+        None => 0,
+    }
+}
+
+@vertex
+pub fn cover(v: VertexIndex) -> ClipPosition {
+    let x = f32(v.index % 2) * 4.0 - 1.0
+    let y = f32(v.index / 2) * 4.0 - 1.0
+    ClipPosition { position: vec4(x, y, 0.5, 1.0) }
+}
+
+@fragment
+pub fn red() -> vec4 {
+    vec4(1.0, 0.0, 0.0, 1.0)
+}
+
+pub fn frame(g: mut Game, time: f32, width: u32, height: u32) {
+    g.frames += 1
+    let starts = g.carried.starts
+    if g.frames == 1 {
+        let restored: u32 = if g.restored { 1 } else { 0 }
+        print(f"tour: start {starts}, restored {restored}")
+    }
+    if starts == 1 {
+        if g.frames == 1 {
+            g.ready = Some(prepare("../handover-missing"))
+        }
+        let r = outcome(mut g.ready)
+        if r == 2 {
+            print("tour: the missing build isn't ready")
+            g.ready = Some(prepare("../handover-second"))
+        } else if r == 1 {
+            print("tour: second is ready")
+            g.ready = None
+            g.going = Some(hand_over("../handover-second"))
+        }
+    } else if starts == 3 && g.frames == 2 {
+        g.going = Some(hand_over("../handover-broken"))
+    } else if starts == 4 && g.frames == 2 {
+        g.going = Some(hand_over("../handover-missing"))
+    }
+    if outcome(mut g.going) == 2 {
+        print("tour: the hand-over failed; it goes on")
+        g.going = None
+        if starts == 4 {
+            print("tour: done")
+        }
+    }
+    keep(save(g.carried))
+    let screen = begin_screen_pass(clear: vec4(0.0, 0.0, 0.0, 1.0))
+    draw(screen, cover, red, vertices: 3)
+    screen.present()
+}

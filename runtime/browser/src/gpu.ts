@@ -293,6 +293,26 @@ function pipelineKey(p: Pipeline, source: string): string {
   return hash.hex();
 }
 
+/** The pipelines' indices, the biggest shader first: those take longest to compile, and the GPU
+ * process compiles a few at a time, so started last they'd finish last of all. */
+function biggestFirst(shaders: string[]): number[] {
+  return shaders.map((_, i) => i).sort((a, b) => shaders[b]!.length - shaders[a]!.length);
+}
+
+/** Starts building the pipelines of a build got ready for a hand-over (`std::reload::prepare`)
+ * that none of `have` holds: the build's pipelines by key, those `have` holds taken from it. */
+export function preparePipelines(device: GPUDevice, manifest: Manifest, shaders: string[], have: readonly PipelineCache[]): PipelineCache {
+  const out: PipelineCache = new Map();
+  for (const i of biggestFirst(shaders)) {
+    const p = manifest.pipelines[i]!;
+    const key = pipelineKey(p, shaders[i]!);
+    if (out.has(key)) continue;
+    const held = have.map((c) => c.get(key)).find((b) => b !== undefined);
+    out.set(key, held ?? buildPipeline(device, p, shaders[i]!));
+  }
+  return out;
+}
+
 /** Starts building every pipeline, all at once: each one's promise. `shaders[i]` is pipeline
  * `i`'s WGSL. With `cache` (a hot reload), a pipeline whose manifest entry and WGSL are the same
  * as one of the last build's is kept, and the cache then holds this build's pipelines alone. */
@@ -302,9 +322,7 @@ export function buildPipelines(
   shaders: string[],
   cache?: PipelineCache,
 ): Promise<BuiltPipeline>[] {
-  // The biggest shaders start first: they take longest to compile, and the GPU process
-  // compiles a few at a time, so started last they'd finish last of all.
-  const order = manifest.pipelines.map((_, i) => i).sort((a, b) => shaders[b]!.length - shaders[a]!.length);
+  const order = biggestFirst(shaders);
   const built: Promise<BuiltPipeline>[] = [];
   if (!cache) {
     for (const i of order) built[i] = buildPipeline(device, manifest.pipelines[i]!, shaders[i]!);

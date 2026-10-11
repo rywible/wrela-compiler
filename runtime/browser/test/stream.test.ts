@@ -34,6 +34,9 @@ test("the test encoder writes the vectors' golden batch", () => {
     .post(5, "studio/edit", Uint8Array.of(123, 125))
     .drawIndexedIndirect(1, [3, 0, 12], 3, 16, [], new Uint8Array(0))
     .label("terrain")
+    .prepare(6, "../floor")
+    .unprepare("../floor")
+    .handOver(7, "next")
     .finish();
   expect(Buffer.from(batch).toString("hex")).toBe(golden);
   expect(NONE).toBe(0xffffffff);

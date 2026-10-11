@@ -1,0 +1,84 @@
+// The build `first` and `tour` hand over to (compiler/tests/tests/suite/handover.rs): green, with
+// a pipeline of its own, and it hands back: to `tour` by itself, on its third frame.
+
+use std::gpu::{ClipPosition, VertexIndex, begin_screen_pass, draw}
+use std::io::print
+use std::reload::{hand_over, keep, kept}
+use std::serialize::{LoadError, Serialize, load, save}
+
+/// As `first`'s: the bytes are the same type.
+struct Carried: Clone + Serialize {
+    starts: u32,
+    last: u32,
+    from: u32,
+}
+
+pub struct Game {
+    carried: Carried,
+    restored: bool,
+    frames: u32,
+}
+
+pub fn init() -> Game {
+    let back: Result<Carried, LoadError> = load(kept())
+    let restored = back.is_ok()
+    var carried = match back {
+        Ok(c) => c.clone(),
+        Err(_) => Carried { starts: 0, last: 0, from: 1 },
+    }
+    carried.starts += 1
+    carried.last = 2
+    Game { carried, restored, frames: 0 }
+}
+
+/// `first`'s: the same pipeline, which a hand-over keeps.
+@vertex
+pub fn cover(v: VertexIndex) -> ClipPosition {
+    let x = f32(v.index % 2) * 4.0 - 1.0
+    let y = f32(v.index / 2) * 4.0 - 1.0
+    ClipPosition { position: vec4(x, y, 0.5, 1.0) }
+}
+
+@fragment
+pub fn red() -> vec4 {
+    vec4(1.0, 0.0, 0.0, 1.0)
+}
+
+/// Its own: the right half green.
+@vertex
+pub fn right(v: VertexIndex) -> ClipPosition {
+    let x = if v.index == 1 || v.index == 3 || v.index == 4 { 1.0 } else { 0.0 }
+    let y = if v.index == 2 || v.index == 4 || v.index == 5 { 1.0 } else { -1.0 }
+    ClipPosition { position: vec4(x, y, 0.5, 1.0) }
+}
+
+@fragment
+pub fn green() -> vec4 {
+    vec4(0.0, 1.0, 0.0, 1.0)
+}
+
+pub fn frame(g: mut Game, time: f32, width: u32, height: u32) {
+    g.frames += 1
+    if g.frames == 1 {
+        let restored: u32 = if g.restored { 1 } else { 0 }
+        print(f"second: start {g.carried.starts}, restored {restored}")
+    }
+    if g.carried.from == 3 && g.frames == 3 {
+        back(g)
+    }
+    keep(save(g.carried))
+    let screen = begin_screen_pass(clear: vec4(0.0, 0.0, 0.0, 1.0))
+    draw(screen, cover, red, vertices: 3)
+    draw(screen, right, green, vertices: 6)
+    screen.present()
+}
+
+/// Hands back to the build that handed over to it.
+pub fn back(g: Game) {
+    let _ = hand_over(if g.carried.from == 3 { "../handover-tour" } else { "../handover-first" })
+}
+
+/// Starts, and whether `init` found what a build kept.
+pub fn report(g: Game) -> vec4 {
+    vec4(f32(g.carried.starts), if g.restored { 1.0 } else { 0.0 }, f32(g.carried.last), 0.0)
+}

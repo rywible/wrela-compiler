@@ -1,4 +1,4 @@
-//! # The command stream, version 7
+//! # The command stream, version 9
 //!
 //! A program records GPU work as commands in its own memory and hands them to the host in
 //! batches through `wrela.submit(ptr, len)` (D-099). The host decodes each batch in bulk into
@@ -43,6 +43,9 @@
 //! | 23 | `Post` | `request`, `url length`, `body length`, then the URL's UTF-8 and the body, each padded to 4 bytes: sends the body to the host that serves the build, at the URL relative to the build; the answer is the host's reply, a request |
 //! | 24 | `DrawIndexedIndirect` | `pipeline`, `index buffer`, `index offset`, `index size` (bytes of `u32` indices there, each a multiple of 4), `arguments buffer`, `offset` (index count, instance count, first index, base vertex, first instance there), the bindings, the uniforms |
 //! | 25 | `Label` | `length`, then a name of UTF-8, padded to 4 bytes: the name of the next pass or dispatch in the host's timings (`pass`, `screen pass` or the dispatch's pipeline when there's none). Outside a pass only. |
+//! | 26 | `Prepare` | `request`, `path length`, then the path's UTF-8, padded to 4 bytes: gets the build at the path, relative to the program's build, ready to start (its WASM compiled, its pipelines built), in the background; answered with no bytes when it is, a request |
+//! | 27 | `Unprepare` | `path length`, then the path's UTF-8, padded to 4 bytes: lets go of what `Prepare` got ready for that build (its pipelines that the running build doesn't use) |
+//! | 28 | `HandOver` | `request`, `path length`, then the path's UTF-8, padded to 4 bytes: after this call, the build at the path takes this program's place, with what it kept (`std::reload`). The request is answered only if the hand-over fails, and then this program goes on |
 //!
 //! **Requests** (language.md §6.15) are answered on a later call: the program polls each with
 //! the imports `wrela.request_status(request) -> i32` (-1 while it's pending, -2 if it failed,
@@ -75,7 +78,7 @@
 use std::fmt;
 
 /// The stream format's version. Bumped by any change a host could notice.
-pub const VERSION: u32 = 8;
+pub const VERSION: u32 = 9;
 pub const MAGIC: [u8; 4] = *b"WRCS";
 /// The batch header: magic, version, body length.
 pub const HEADER_LEN: usize = 12;
@@ -119,10 +122,13 @@ pub enum Opcode {
     Post = 23,
     DrawIndexedIndirect = 24,
     Label = 25,
+    Prepare = 26,
+    Unprepare = 27,
+    HandOver = 28,
 }
 
 impl Opcode {
-    pub const ALL: [Opcode; 24] = [
+    pub const ALL: [Opcode; 27] = [
         Opcode::CreateBuffer,
         Opcode::WriteBuffer,
         Opcode::Dispatch,
@@ -147,6 +153,9 @@ impl Opcode {
         Opcode::Post,
         Opcode::DrawIndexedIndirect,
         Opcode::Label,
+        Opcode::Prepare,
+        Opcode::Unprepare,
+        Opcode::HandOver,
     ];
 
     pub fn from_u32(v: u32) -> Option<Opcode> {
@@ -179,6 +188,9 @@ impl Opcode {
             Opcode::Post => "Post",
             Opcode::DrawIndexedIndirect => "DrawIndexedIndirect",
             Opcode::Label => "Label",
+            Opcode::Prepare => "Prepare",
+            Opcode::Unprepare => "Unprepare",
+            Opcode::HandOver => "HandOver",
         }
     }
 }
@@ -515,6 +527,19 @@ pub enum Command<'a> {
         url: &'a str,
         body: &'a [u8],
     },
+    /// Another build made ready to start (`std::reload::prepare`).
+    Prepare {
+        request: u32,
+        path: &'a str,
+    },
+    Unprepare {
+        path: &'a str,
+    },
+    /// Another build to take this program's place after this call (`std::reload::hand_over`).
+    HandOver {
+        request: u32,
+        path: &'a str,
+    },
 }
 
 impl Command<'_> {
@@ -544,6 +569,9 @@ impl Command<'_> {
             Command::Fetch { .. } => Opcode::Fetch,
             Command::Label { .. } => Opcode::Label,
             Command::Post { .. } => Opcode::Post,
+            Command::Prepare { .. } => Opcode::Prepare,
+            Command::Unprepare { .. } => Opcode::Unprepare,
+            Command::HandOver { .. } => Opcode::HandOver,
         }
     }
 }
@@ -900,7 +928,7 @@ pub fn decode(batch: &[u8]) -> Result<Vec<Command<'_>>, StreamError> {
                 }
                 Command::ReadBuffer { request: w(0), handle: w(1), offset: w(2), size: w(3) }
             }
-            Opcode::StorageRead | Opcode::Fetch => {
+            Opcode::StorageRead | Opcode::Fetch | Opcode::Prepare | Opcode::HandOver => {
                 if words < 2 {
                     return Err(bad("expected at least 2 words"));
                 }
@@ -909,13 +937,14 @@ pub fn decode(batch: &[u8]) -> Result<Vec<Command<'_>>, StreamError> {
                     return Err(bad("the text's length doesn't match the payload"));
                 }
                 let text = text(8, n, "the text isn't UTF-8")?;
-                if opcode == Opcode::Fetch {
-                    Command::Fetch { request: w(0), url: text }
-                } else {
-                    Command::StorageRead { request: w(0), path: text }
+                match opcode {
+                    Opcode::Fetch => Command::Fetch { request: w(0), url: text },
+                    Opcode::Prepare => Command::Prepare { request: w(0), path: text },
+                    Opcode::HandOver => Command::HandOver { request: w(0), path: text },
+                    _ => Command::StorageRead { request: w(0), path: text },
                 }
             }
-            Opcode::Label => {
+            Opcode::Label | Opcode::Unprepare => {
                 if words < 1 {
                     return Err(bad("expected at least 1 word"));
                 }
@@ -923,7 +952,12 @@ pub fn decode(batch: &[u8]) -> Result<Vec<Command<'_>>, StreamError> {
                 if padded(n) != len - 4 {
                     return Err(bad("the text's length doesn't match the payload"));
                 }
-                Command::Label { name: text(4, n, "the text isn't UTF-8")? }
+                let text = text(4, n, "the text isn't UTF-8")?;
+                if opcode == Opcode::Unprepare {
+                    Command::Unprepare { path: text }
+                } else {
+                    Command::Label { name: text }
+                }
             }
             Opcode::StorageWrite => {
                 let (path, data) = two_runs(
@@ -1299,6 +1333,24 @@ impl Encoder {
         bytes.extend(Self::pad(body));
         let words = [request, url.len() as u32, body.len() as u32];
         self.command(Opcode::Post, &words, &bytes);
+        self
+    }
+
+    pub fn prepare(&mut self, request: u32, path: &str) -> &mut Self {
+        let bytes = Self::pad(path.as_bytes());
+        self.command(Opcode::Prepare, &[request, path.len() as u32], &bytes);
+        self
+    }
+
+    pub fn unprepare(&mut self, path: &str) -> &mut Self {
+        let bytes = Self::pad(path.as_bytes());
+        self.command(Opcode::Unprepare, &[path.len() as u32], &bytes);
+        self
+    }
+
+    pub fn hand_over(&mut self, request: u32, path: &str) -> &mut Self {
+        let bytes = Self::pad(path.as_bytes());
+        self.command(Opcode::HandOver, &[request, path.len() as u32], &bytes);
         self
     }
 

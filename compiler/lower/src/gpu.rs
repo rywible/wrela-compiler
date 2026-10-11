@@ -1189,16 +1189,22 @@ pub(crate) fn intrinsic(
             | Lang::StorageWriteCommand
             | Lang::FetchCommand
             | Lang::LabelCommand
-            | Lang::PostCommand),
+            | Lang::PostCommand
+            | Lang::PrepareCommand
+            | Lang::UnprepareCommand
+            | Lang::HandOverCommand),
         ) => {
             // The request number and (a readback) the buffer's range, then the runs: a path or
-            // URL, the bytes to store, a line to print, a label.
+            // URL, the bytes to store, a line to print, a label, a build's path.
             let (opcode, words) = match l {
                 Lang::ReadBufferCommand => (Opcode::ReadBuffer, 4),
                 Lang::StorageReadCommand => (Opcode::StorageRead, 1),
                 Lang::StorageWriteCommand => (Opcode::StorageWrite, 1),
                 Lang::LabelCommand => (Opcode::Label, 0),
                 Lang::PostCommand => (Opcode::Post, 1),
+                Lang::PrepareCommand => (Opcode::Prepare, 1),
+                Lang::UnprepareCommand => (Opcode::Unprepare, 0),
+                Lang::HandOverCommand => (Opcode::HandOver, 1),
                 _ => (Opcode::Fetch, 1),
             };
             let mut args = Vec::new();

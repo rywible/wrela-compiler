@@ -102,7 +102,10 @@ export type Command =
   | { op: "StorageWrite"; request: number; path: string; data: Bytes }
   | { op: "Fetch"; request: number; url: string }
   | { op: "Label"; name: string }
-  | { op: "Post"; request: number; url: string; body: Bytes };
+  | { op: "Post"; request: number; url: string; body: Bytes }
+  | { op: "Prepare"; request: number; path: string }
+  | { op: "Unprepare"; path: string }
+  | { op: "HandOver"; request: number; path: string };
 
 const NAMES = new Map<number, OpcodeName>(
   (Object.entries(Opcode) as [OpcodeName, number][]).map(([name, value]) => [value, name]),
@@ -365,7 +368,9 @@ export function decode(batch: Bytes): Command[] {
         break;
       }
       case "StorageRead":
-      case "Fetch": {
+      case "Fetch":
+      case "Prepare":
+      case "HandOver": {
         if (words < 2) throw bad("expected at least 2 words");
         const n = w(1);
         if (padded(n) !== len - 8) throw bad("the text's length doesn't match the payload");
@@ -373,11 +378,13 @@ export function decode(batch: Bytes): Command[] {
         cmd = name === "Fetch" ? { op: name, request: w(0), url: t } : { op: name, request: w(0), path: t };
         break;
       }
-      case "Label": {
+      case "Label":
+      case "Unprepare": {
         if (words < 1) throw bad("expected at least 1 word");
         const n = w(0);
         if (padded(n) !== len - 4) throw bad("the text's length doesn't match the payload");
-        cmd = { op: name, name: text(4, n, "text") };
+        const t = text(4, n, "text");
+        cmd = name === "Label" ? { op: name, name: t } : { op: name, path: t };
         break;
       }
       case "StorageWrite": {

@@ -212,6 +212,9 @@ macro_rules! lang_items {
                         | Lang::StorageWriteCommand
                         | Lang::FetchCommand
                         | Lang::PostCommand
+                        | Lang::PrepareCommand
+                        | Lang::UnprepareCommand
+                        | Lang::HandOverCommand
                         | Lang::Keep
                         | Lang::Kept
                 )
@@ -367,6 +370,9 @@ lang_items! {
     PhaseCommand = "std::time::phase_command",
     PostCommand = "std::io::post_command",
     Shipped = "std::io::Shipped",
+    PrepareCommand = "std::reload::prepare_command",
+    UnprepareCommand = "std::reload::unprepare_command",
+    HandOverCommand = "std::reload::hand_over_command",
     Limit = "std::gpu::limit",
     Shared = "std::gpu::Shared",
     Atomics = "std::gpu::Atomics",

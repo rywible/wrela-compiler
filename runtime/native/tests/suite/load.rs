@@ -27,14 +27,15 @@ fn rejects_another_manifest_version() {
 
 #[test]
 fn rejects_another_stream_version() {
-    let err = load_with_manifest("stream-v9", |m| {
+    let other = wrela_abi::stream::VERSION + 1;
+    let err = load_with_manifest("stream-other", |m| {
         m.replace(
             &format!("\"stream_version\": {}", wrela_abi::stream::VERSION),
-            "\"stream_version\": 9",
+            &format!("\"stream_version\": {other}"),
         )
     });
     assert!(matches!(&err, Error::Manifest(_)), "{err}");
-    assert!(err.to_string().contains("command stream version 9"), "{err}");
+    assert!(err.to_string().contains(&format!("command stream version {other}")), "{err}");
 }
 
 #[test]

@@ -53,6 +53,17 @@ export function pathProblem(path: string): string | undefined {
   return undefined;
 }
 
+/**
+ * What's wrong with the path of a build to hand over to, if anything: as `pathProblem`'s, except
+ * that it may start with `..` parts, so a build can name one beside it.
+ */
+export function buildPathProblem(path: string): string | undefined {
+  let rest = path;
+  while (rest.startsWith("../")) rest = rest.slice(3);
+  if (rest === "..") return "names no build: it ends in `..`";
+  return pathProblem(rest);
+}
+
 const formatOf = (f: TextureFormat) => TEXTURE_FORMATS.find((t) => t.name === f)!;
 /** That texture `handle`, of format `got`, is of the format its binding names. */
 function sameFormat(err: (why: string) => Error, handle: number, got: TextureFormat, want: TextureFormat | null): void {
@@ -266,6 +277,13 @@ export class Checker {
       case "Post": {
         const why = pathProblem(cmd.url);
         if (why !== undefined) throw err(`the URL \`${cmd.url}\` ${why}`);
+        return;
+      }
+      case "Prepare":
+      case "Unprepare":
+      case "HandOver": {
+        const why = buildPathProblem(cmd.path);
+        if (why !== undefined) throw err(`the build path \`${cmd.path}\` ${why}`);
         return;
       }
       case "Label":

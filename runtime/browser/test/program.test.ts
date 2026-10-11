@@ -1,6 +1,7 @@
 // The program ABI without a GPU, mirroring runtime/native/src/program/tests.rs.
 
 import { describe, expect, spyOn, test } from "bun:test";
+import { STREAM_VERSION } from "../src/abi.gen.ts";
 import { CommandError } from "../src/check.ts";
 import { parseManifest } from "../src/manifest.ts";
 import { checkAbi, Program, ProgramError, TrapError } from "../src/program.ts";
@@ -136,7 +137,7 @@ test("hashes every submitted byte", async () => {
 
 test("rejects another stream version", async () => {
   const batch = new Encoder().present().finish();
-  batch[4] = 9;
+  batch[4] = STREAM_VERSION + 1;
   const e = await runError([[batch]]);
   expect(e).toBeInstanceOf(StreamError);
   expect((e as StreamError).kind).toBe("WrongVersion");
@@ -336,7 +337,7 @@ test("first-light's CPU side gives the native host's state hash", async () => {
   const manifest = parseManifest(readFixtureText("manifest.json"));
   const program = await Program.load(readFixture("game.wasm"), checker(manifest), new Recorder(), { hash: true });
   for (let i = 0; i < 60; i++) program.frame(i / 60, 640, 360);
-  expect(program.hash!.hex()).toBe("b0550120310e39f1");
+  expect(program.hash!.hex()).toBe("5c298bf6dfaa0338");
   const log = (program.executor as Recorder).log;
   expect(log.slice(0, 7)).toEqual(["CreateBuffer", "WriteBuffer", "Dispatch", "BeginScreenPass", "Draw", "Present", "end"]);
   expect(log.length).toBe(3 + 60 * 4);
@@ -414,6 +415,36 @@ describe("requests", () => {
     p.call("ask");
     await later();
     expect(p.call("status")).toBe(-2);
+  });
+
+  test("go to the host's other builds, and fail without them", async () => {
+    const asked: string[] = [];
+    const builds = {
+      prepare: async (path: string) => {
+        asked.push(`prepare ${path}`);
+      },
+      unprepare: (path: string) => asked.push(`unprepare ${path}`),
+      handOver: (path: string) => Promise.reject(new Error(`no build at ${path}`)),
+    };
+    const p = await program(new Encoder().prepare(4, "../floor-2").unprepare("../floor-2").finish(), { builds });
+    p.call("ask");
+    await later();
+    expect(asked).toEqual(["prepare ../floor-2", "unprepare ../floor-2"]);
+    expect(p.call("status")).toBe(0);
+    // A hand-over that can't be made fails its request, and the program goes on.
+    const q = await program(new Encoder().handOver(4, "../floor-3").finish(), { builds });
+    q.call("ask");
+    await later();
+    expect(q.call("status")).toBe(-2);
+    const none = await program(new Encoder().prepare(4, "../floor-2").finish());
+    none.call("ask");
+    await later();
+    expect(none.call("status")).toBe(-2);
+  });
+
+  test("a build's path stays on its site", async () => {
+    const p = await program(new Encoder().handOver(4, "https://example.com/floor").finish());
+    expect(() => p.call("ask")).toThrow("HandOver failed: the build path `https://example.com/floor`");
   });
 
   test("storage paths stay inside the program's storage", async () => {

@@ -1,0 +1,16 @@
+// A build whose `init` fails (compiler/tests/tests/suite/handover.rs): a hand-over to it gives
+// the place back to the build that asked.
+
+use std::reload::kept
+
+pub struct Game {
+    kept: u32,
+}
+
+pub fn init() -> Game {
+    let k = kept()
+    assert(k.is_empty(), "this build doesn't start: it was handed over to")
+    Game { kept: k.len() }
+}
+
+pub fn frame(g: mut Game, time: f32, width: u32, height: u32) {}

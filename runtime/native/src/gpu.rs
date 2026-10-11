@@ -35,6 +35,7 @@ use crate::error::{Error, Result};
 use crate::program::Executor;
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU64;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use wgpu::util::align_to;
 use wrela_abi::hash::StateHash;
@@ -152,7 +153,7 @@ fn wgpu_format(f: TextureFormat) -> wgpu::TextureFormat {
 /// than keeping a copy of every shader. Not its WGSL file's name, which is its place among the
 /// build's pipelines (`pipeline_3.wgsl`): a pipeline added or dropped before it moves it, and the
 /// next build keeps it all the same.
-fn pipeline_key(p: &wrela_abi::manifest::Pipeline, source: &str) -> u64 {
+pub(crate) fn pipeline_key(p: &wrela_abi::manifest::Pipeline, source: &str) -> u64 {
     let p = wrela_abi::manifest::Pipeline { shader: String::new(), ..p.clone() };
     let mut hash = StateHash::new();
     hash.update(format!("{p:?}\n").as_bytes());
@@ -204,7 +205,7 @@ enum Resource {
 /// format (or none).
 type Targets = (Option<wgpu::TextureFormat>, Option<wgpu::TextureFormat>);
 
-struct Pipeline {
+pub(crate) struct Pipeline {
     name: String,
     kind: Kind,
     layout: wgpu::BindGroupLayout,
@@ -366,6 +367,13 @@ pub(crate) struct Gpu {
     /// Each pipeline's key (`pipeline_key`): a hot reload keeps a pipeline whose manifest entry
     /// and WGSL are the same.
     pipeline_keys: Vec<u64>,
+    /// Pipelines no running build uses, by key, kept for the next: those another build was
+    /// got ready with (`std::reload::prepare`; `true`), kept until it starts or is let go, and
+    /// the last build's that the running one doesn't use (`false`), kept until the next swap.
+    spare: HashMap<u64, (Pipeline, bool)>,
+    /// How many pipelines it has built, here or on a [`Builder`]'s thread: for a test or a
+    /// timing of what a swap built.
+    built: Arc<AtomicUsize>,
     resources: HashMap<u32, Resource>,
     /// Each pipeline's cached bind groups, by the bindings they hold.
     bind_groups: Vec<HashMap<Box<[Binding]>, wgpu::BindGroup>>,
@@ -497,6 +505,8 @@ impl Gpu {
             align,
             pipelines: Vec::new(),
             pipeline_keys: Vec::new(),
+            spare: HashMap::new(),
+            built: Arc::new(AtomicUsize::new(0)),
             resources: HashMap::new(),
             bind_groups: vec![HashMap::new(); manifest.pipelines.len()],
             bound_in: HashMap::new(),
@@ -533,14 +543,19 @@ impl Gpu {
         let old_keys = std::mem::take(&mut self.pipeline_keys);
         let mut old: HashMap<u64, Pipeline> =
             old_keys.into_iter().zip(std::mem::take(&mut self.pipelines)).collect();
+        // The last build's spares go; those got ready for a build stay.
+        self.spare.retain(|_, (_, prepared)| *prepared);
         for (p, source) in manifest.pipelines.iter().zip(shaders) {
             let key = pipeline_key(p, source);
-            let pipeline = match old.remove(&key) {
+            let pipeline = match old.remove(&key).or_else(|| self.spare.remove(&key).map(|s| s.0)) {
                 Some(kept) => kept,
-                None => self.build_pipeline(p, source)?,
+                None => self.builder().build(p, source)?,
             };
             self.pipelines.push(pipeline);
             self.pipeline_keys.push(key);
+        }
+        for (key, pipeline) in old {
+            self.spare.entry(key).or_insert((pipeline, false));
         }
         self.bind_groups = vec![HashMap::new(); manifest.pipelines.len()];
         self.check_errors()
@@ -559,7 +574,80 @@ impl Gpu {
         self.take_pipelines(manifest, shaders)
     }
 
-    fn build_pipeline(&self, p: &wrela_abi::manifest::Pipeline, source: &str) -> Result<Pipeline> {
+    /// What builds pipelines on this device, on any thread.
+    pub(crate) fn builder(&self) -> Builder {
+        Builder {
+            device: self.device.clone(),
+            limits: self.limits.clone(),
+            built: self.built.clone(),
+        }
+    }
+
+    /// Keeps `ready`, pipelines got ready for another build (`std::reload::prepare`), until a
+    /// swap takes them or [`Gpu::let_go`] drops them; `keys` are all that build's pipelines',
+    /// so the spares it would use are kept as long. One the running build has is dropped.
+    pub(crate) fn keep_ready(&mut self, ready: Ready, keys: &[u64]) {
+        for (key, pipeline) in ready {
+            if !self.pipeline_keys.contains(&key) {
+                self.spare.insert(key, (pipeline, true));
+            }
+        }
+        for key in keys {
+            if let Some(s) = self.spare.get_mut(key) {
+                s.1 = true;
+            }
+        }
+    }
+
+    /// The keys of the pipelines it holds: the running build's and the spares.
+    pub(crate) fn pipeline_keys(&self) -> HashSet<u64> {
+        self.pipeline_keys.iter().chain(self.spare.keys()).copied().collect()
+    }
+
+    /// Drops the spare pipelines with these keys: those got ready for a build that's let go.
+    pub(crate) fn let_go(&mut self, keys: &[u64]) {
+        for key in keys {
+            self.spare.remove(key);
+        }
+    }
+
+    /// How many pipelines it has built since it was opened.
+    pub(crate) fn pipelines_built(&self) -> usize {
+        self.built.load(Ordering::Relaxed)
+    }
+}
+
+/// Pipelines built for another build, by key (`std::reload::prepare`).
+pub(crate) type Ready = Vec<(u64, Pipeline)>;
+
+/// Builds pipelines on a device: [`Gpu::builder`]'s, on a thread of its own while a program
+/// runs (`std::reload::prepare`).
+pub(crate) struct Builder {
+    device: wgpu::Device,
+    limits: wgpu::Limits,
+    built: Arc<AtomicUsize>,
+}
+
+impl Builder {
+    /// Each of the build's pipelines that `have` doesn't hold (by key), built: with its key.
+    pub(crate) fn build_all(
+        &self,
+        manifest: &Manifest,
+        shaders: &[String],
+        have: &HashSet<u64>,
+    ) -> Result<Ready> {
+        let mut out = Vec::new();
+        for (p, source) in manifest.pipelines.iter().zip(shaders) {
+            let key = pipeline_key(p, source);
+            if !have.contains(&key) && !out.iter().any(|(k, _)| *k == key) {
+                out.push((key, self.build(p, source)?));
+            }
+        }
+        Ok(out)
+    }
+
+    fn build(&self, p: &wrela_abi::manifest::Pipeline, source: &str) -> Result<Pipeline> {
+        self.built.fetch_add(1, Ordering::Relaxed);
         let shader_err = |message: String| Error::Shader {
             pipeline: p.name.clone(),
             shader: p.shader.clone(),
@@ -742,7 +830,9 @@ impl Gpu {
             debug_flag: p.debug_flag,
         })
     }
+}
 
+impl Gpu {
     /// Makes the screen `width` x `height` (a new, cleared texture if the size changed).
     pub(crate) fn set_screen(&mut self, width: u32, height: u32) -> Result<()> {
         let max = self.limits.max_texture_dimension_2d;
@@ -1608,7 +1698,10 @@ impl Executor for Gpu {
             | Command::StorageRead { .. }
             | Command::StorageWrite { .. }
             | Command::Fetch { .. }
-            | Command::Post { .. } => {}
+            | Command::Post { .. }
+            | Command::Prepare { .. }
+            | Command::Unprepare { .. }
+            | Command::HandOver { .. } => {}
             // The passes and dispatches after it share it; a name given again is kept.
             Command::Label { name } => {
                 if self.label.as_deref() != Some(*name) {

@@ -97,6 +97,19 @@ export interface Io {
   post(url: string, body: Bytes): Promise<Bytes>;
 }
 
+/** The other builds a program may hand its place to (`std::reload`), each named by its path from
+ * the program's own build. */
+export interface Builds {
+  /** Gets the build ready: fetched, compiled, and its pipelines built. */
+  prepare(path: string): Promise<void>;
+  /** Lets go of what was got ready for the build. */
+  unprepare(path: string): void;
+  /** Hands the program's place to the build after the call that asked. Rejected, with why, if
+   * the build can't be got ready, and the program goes on; never resolved if the hand-over is
+   * made, since the program stops. */
+  handOver(path: string): Promise<void>;
+}
+
 /** An answer: the bytes, or why the request failed. */
 type Answer = { bytes: Bytes } | { error: string };
 
@@ -135,6 +148,9 @@ class Requests {
     for (const [r, a] of this.#arriving.splice(0)) this.answered.set(r, a);
   }
 }
+
+/** What a host without `Builds` has none of (as the native host words it). */
+const OTHER_BUILD = "other build to hand over to";
 
 /** The imports a program may have, with their types as both hosts word them. */
 const IMPORTS = new Map<string, string>(HOST_FUNCTIONS);
@@ -253,6 +269,8 @@ export interface ProgramOptions {
   hash?: boolean;
   /** Where storage and fetch requests go; without it, they fail. */
   io?: Io;
+  /** The builds the program may hand over to; without it, those requests fail. */
+  builds?: Builds | undefined;
   /** Plays the voice the program starts (`std::audio::play`), on an audio thread; without
    * it, the voice is kept but not played. */
   startVoice?: (voice: VoiceOptions) => void;
@@ -302,6 +320,7 @@ export class Program {
   #failed: string | null = null;
   readonly #requests = new Requests();
   readonly #io: Io | null;
+  readonly #builds: Builds | null;
   readonly #onPrint: ((line: string) => void) | null;
   /** Input events not yet read (`wrela.input`), EVENT_SIZE bytes each, oldest first. */
   #input: Uint8Array[] = [];
@@ -316,6 +335,7 @@ export class Program {
   ) {
     this.hash = options.hash ? new StateHash() : null;
     this.#io = options.io ?? null;
+    this.#builds = options.builds ?? null;
     this.#startVoice = options.startVoice ?? null;
     this.#startTicker = options.startTicker ?? null;
     this.#onPrint = options.onPrint ?? null;
@@ -461,6 +481,21 @@ export class Program {
         // The body is a view into the program's memory: copy it.
         const body = cmd.body.slice();
         this.#requests.start(cmd.op, cmd.request, io ? () => io.post(cmd.url, body) : none("server to post to"));
+        return;
+      }
+      case "Prepare": {
+        const builds = this.#builds;
+        const prepare = builds ? () => builds.prepare(cmd.path).then(() => new Uint8Array(0)) : none(OTHER_BUILD);
+        this.#requests.start(cmd.op, cmd.request, prepare);
+        return;
+      }
+      case "Unprepare":
+        this.#builds?.unprepare(cmd.path);
+        return;
+      case "HandOver": {
+        const builds = this.#builds;
+        const go = builds ? () => builds.handOver(cmd.path).then(() => new Uint8Array(0)) : none(OTHER_BUILD);
+        this.#requests.start(cmd.op, cmd.request, go);
         return;
       }
       default:

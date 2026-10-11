@@ -181,10 +181,10 @@ fn hashes_every_submitted_byte() {
 #[test]
 fn rejects_another_stream_version() {
     let mut batch = Encoder::new().present().finish();
-    batch[4] = 9;
+    batch[4] = (VERSION + 1) as u8;
     let err = run_err(&[vec![batch]]);
     assert!(
-        matches!(err, Error::Stream(StreamError::WrongVersion { expected: VERSION, got: 9 })),
+        matches!(err, Error::Stream(StreamError::WrongVersion { expected: VERSION, got }) if got == VERSION + 1),
         "{err}"
     );
 }

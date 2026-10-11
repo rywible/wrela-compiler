@@ -1,0 +1,114 @@
+// A build that hands its place to another (`std::reload`), run by
+// compiler/tests/tests/suite/handover.rs. Built beside it are `second` (which hands back) and
+// `broken` (whose `init` panics); the tests build each package into `handover-<name>`, side by
+// side. The screen is red; what it carries across is how many times it has started.
+
+use std::gpu::{ClipPosition, VertexIndex, begin_screen_pass, draw}
+use std::io::{IoError, Pending}
+use std::reload::{hand_over, keep, kept, prepare, unprepare}
+use std::serialize::{LoadError, Serialize, load, save}
+
+/// What goes across each hand-over: how many times a build has started, which started last, and
+/// which of `first` (1) and `tour` (3) handed over to `second`, which hands back to it.
+struct Carried: Clone + Serialize {
+    starts: u32,
+    last: u32,
+    from: u32,
+}
+
+pub struct Game {
+    carried: Carried,
+    restored: bool,
+    /// The last `prepare` and `hand_over` requests, and what each gave: 0 not yet, 1 ready,
+    /// 2 failed.
+    ready: Option<Pending<u8>>,
+    readied: u32,
+    going: Option<Pending<u8>>,
+    failed: u32,
+}
+
+/// The build that target `to` names: 1 `second`, 2 `broken`, anything else one that isn't
+/// there.
+fn path_of(to: u32) -> Text {
+    if to == 1 {
+        "../handover-second"
+    } else if to == 2 {
+        "../handover-broken"
+    } else {
+        "../handover-missing"
+    }
+}
+
+pub fn init() -> Game {
+    let back: Result<Carried, LoadError> = load(kept())
+    let restored = back.is_ok()
+    var carried = match back {
+        Ok(c) => c.clone(),
+        Err(_) => Carried { starts: 0, last: 0, from: 1 },
+    }
+    carried.starts += 1
+    carried.last = 1
+    carried.from = 1
+    Game { carried, restored, ready: None, readied: 0, going: None, failed: 0 }
+}
+
+/// What a request gave, if it has: 1 ready, 2 failed.
+fn outcome(p: mut Option<Pending<u8>>) -> u32 {
+    let answer: Option<Result<Vec<u8>, IoError>> = match mut p {
+        Some(r) => r.poll(),
+        None => None,
+    }
+    match answer {
+        Some(Ok(_)) => 1,
+        Some(Err(_)) => 2,
+        None => 0,
+    }
+}
+
+@vertex
+pub fn cover(v: VertexIndex) -> ClipPosition {
+    let x = f32(v.index % 2) * 4.0 - 1.0
+    let y = f32(v.index / 2) * 4.0 - 1.0
+    ClipPosition { position: vec4(x, y, 0.5, 1.0) }
+}
+
+@fragment
+pub fn red() -> vec4 {
+    vec4(1.0, 0.0, 0.0, 1.0)
+}
+
+pub fn frame(g: mut Game, time: f32, width: u32, height: u32) {
+    let r = outcome(mut g.ready)
+    if r > 0 {
+        g.readied = r
+    }
+    if outcome(mut g.going) == 2 {
+        g.failed += 1
+    }
+    keep(save(g.carried))
+    let screen = begin_screen_pass(clear: vec4(0.0, 0.0, 0.0, 1.0))
+    draw(screen, cover, red, vertices: 3)
+    screen.present()
+}
+
+/// Gets target `to` ready (`path_of`).
+pub fn get_ready(g: mut Game, to: u32) {
+    g.readied = 0
+    g.ready = Some(prepare(path_of(to)))
+}
+
+/// Lets target `to` go.
+pub fn let_go(to: u32) {
+    unprepare(path_of(to))
+}
+
+/// Hands over to target `to`.
+pub fn go(g: mut Game, to: u32) {
+    g.going = Some(hand_over(path_of(to)))
+}
+
+/// Starts, whether `init` found what a build kept, what the last `prepare` gave, and how many
+/// hand-overs failed.
+pub fn report(g: Game) -> vec4 {
+    vec4(f32(g.carried.starts), if g.restored { 1.0 } else { 0.0 }, f32(g.readied), f32(g.failed))
+}

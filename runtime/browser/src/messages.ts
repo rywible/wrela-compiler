@@ -58,7 +58,10 @@ export type FromWorker =
   /** The program started its voice: the main thread plays it in an AudioWorklet. */
   | { type: "audio"; voice: VoiceOptions }
   /** Hot reload of a program whose voice plays: the page reloads. */
-  | { type: "reload" };
+  | { type: "reload" }
+  /** The program whose voice plays handed its place to another build: the voice stops (the
+   * new build's voice, if it starts one, plays in the same audio context). */
+  | { type: "audio-stop" };
 
 /** The program's voice, as the audio worklet's processor gets it: the module and memory to
  * run it with, and the task and context `__audio` takes (wrela_abi's `IMPORT_AUDIO`). */

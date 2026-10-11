@@ -62,7 +62,7 @@ impl<T: Plain> Pending<T> {
 
 /// What's wrong with a storage path or a URL, if anything: it's relative, with `/` between its
 /// parts, and none of them empty, `.` or `..` (the hosts check the same).
-fn path_problem(path: str) -> Option<Text> {
+pub(package) fn path_problem(path: str) -> Option<Text> {
     if path.is_empty() {
         return Some("is empty")
     }

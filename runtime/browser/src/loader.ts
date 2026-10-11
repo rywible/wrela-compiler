@@ -5,7 +5,7 @@ import { Checker, limitsOf } from "./check.ts";
 import { errorMessage } from "./errors.ts";
 import { buildPipelines, GpuExecutor, type PipelineCache, type ScreenTarget, type Timing } from "./gpu.ts";
 import { type Manifest, parseManifest } from "./manifest.ts";
-import { type Io, Program, type ProgramOptions } from "./program.ts";
+import { type Compiled, type Io, Program, type ProgramOptions } from "./program.ts";
 import type { Bytes } from "./stream.ts";
 import { UTF8 } from "./wasm.ts";
 
@@ -106,24 +106,30 @@ export interface GpuOptions {
   cache?: PipelineCache | undefined;
 }
 
-/** Starts building every pipeline, compiles the WASM meanwhile, then instantiates the program
- * with the decoder behind its import. The program starts while its pipelines build: a command
+/** Starts building every pipeline, compiles the WASM meanwhile (unless the build comes compiled:
+ * one got ready for a hand-over), then instantiates the program with the decoder behind its
+ * import. A program whose `init` fails leaves nothing on the GPU. The program starts while its pipelines build: a command
  * that needs one waits for it (`GpuExecutor`), and the frames wait for the commands
  * (`GpuExecutor.caughtUp`). A pipeline that can't be built fails the program, through the
  * executor's `built`. */
 export async function startProgram(
   device: GPUDevice,
-  build: Build,
+  build: Build & { compiled?: Compiled },
   screen: ScreenTarget,
   options: ProgramOptions = {},
   gpu: GpuOptions = {},
 ): Promise<Program> {
   const started = performance.now();
   const pipelines = buildPipelines(device, build.manifest, build.shaders, gpu.cache);
-  const compiled = await Program.compile(build.wasm);
+  const compiled = build.compiled ?? (await Program.compile(build.wasm));
   const debug = build.manifest.pipelines.some((p) => p.debug_flag !== null);
   const executor = new GpuExecutor(device, pipelines, screen, gpu.timing, debug);
   executor.built.then(() => gpu.onPipelines?.(performance.now() - started), () => {});
   const checker = new Checker(build.manifest, limitsOf(device.limits));
-  return Program.instantiate(compiled, checker, executor, options);
+  try {
+    return await Program.instantiate(compiled, checker, executor, options);
+  } catch (e) {
+    executor.destroyAll();
+    throw e;
+  }
 }

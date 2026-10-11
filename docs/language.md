@@ -1087,6 +1087,7 @@ The sim/presentation split is an engine pattern built on this, not a language fe
   - `std::audio`: `start_voice`
   - `std::time`: `phase_command`
   - `std::tick`: `start_ticker`
+  - `std::reload`: `prepare_command`, `unprepare_command`, `hand_over_command`
   - `std::collections`: `Vec`, `Bounded`, `Box`, `swap`, `replace`
   - `std::string`: `Text`, `Bytes`, `String`, `str_addr`, `str_len`, `str_part`
   - `std::cmp`: `Eq`, `Ord`, `Ordering`
@@ -1125,7 +1126,7 @@ The sim/presentation split is an engine pattern built on this, not a language fe
 | `std::input` | `events`, `Event`, `Key`, `Button`, `Mods`, and `Input`, what's held (§6.15) |
 | `std::time` | `now`, seconds on the host's clock, and `since`: how long work takes, read while the program runs; `nondet`, so not in `@deterministic` code, a constant or a test (§6.15, M6). `phase(name)`: a phase of the thread's work, which the host times and reports (`trace`, everywhere but GPU, `@audio` and derived code) |
 | `std::lift` | A lifted build's literals: `Literal`, `count`, `literal`, their values, sources and files, `set`, `generation` and `Watch`; `gradient` by literals and `reads`; specs' `Checks`, `Loss` and `Report`; `Minimize`, which makes a function of some of them as small as it gets, BFGS then rounding to their decimals (§22) |
-| `std::reload` | Hot reload: `keep` bytes for the build that replaces this one, which its `kept` gives (§22) |
+| `std::reload` | Hot reload: `keep` bytes for the build that replaces this one, which its `kept` gives; one build hands its place to another: `prepare`, `unprepare`, `hand_over` (§22) |
 | `std::job` | Work over several frames: `Job<f>`, a `@job fn` started and resumed to each `yield`, and `Step`, what a `resume` did (§6.18) |
 | `std::cache` | Results cooked from inputs, cooked again when they change: `Stale<K>`, what a result was cooked from, and `Cached<K, V>`, a value kept until its key changes (§6.19) |
 | `std::audio` | `play`, the program's voice, and `ring`, a queue to it (§6.13) |
@@ -1355,6 +1356,27 @@ An agent or a person changes a field by its numbers. Three things in the languag
   - **The ticker runs the old build's ticks again first,** each with the records it had, so the sim is where it was, or where the new code takes the same input.
   - Input the old build hadn't read is the new one's. A program that plays a voice (`std::audio`) is reloaded with its page.
 - The page tells the server the first frame that drew each change (`/live/shown`), and `wrela run` prints how long after the save it was: within 0.5 s for a literal edit and 3 s for a structural one, in both hosts, on the clearing (#51).
+
+### Hand-over: one build in place of another
+
+A game can be several builds, each its own program: a tower of floors, each built alone and started when the player reaches it. A program gives its place to another build in the same page (the same native process), on the same device:
+
+```text
+ prepare("../floor-2") ──▶ fetched, compiled, pipelines built ──▶ answered (the program runs meanwhile)
+ hand_over("../floor-2") ──after the call──▶ old program stops ──▶ floor-2's init, given kept()
+                                                    │
+                       init fails ──▶ the old build starts again, with what it kept
+```
+
+- **A build's path** names its directory from the running build's: relative, and its `..` parts may climb out of the build's directory but not off its site (`"../floor-2"`, built beside it). A path that breaks this is an invalid command.
+- **`std::reload::prepare(path)`** gets the build ready while the program runs: its files fetched, its WASM compiled, and the pipelines the device doesn't hold yet built (one whose WGSL and manifest entry are those of a pipeline the device holds is shared). It answers when the build is ready, or fails with why; asked again, it gives the same answer. **`unprepare(path)`** lets go of what was got ready.
+- **`hand_over(path)`** gives the program's place to the build after the call that asked (the last asked in a call; an earlier one fails). The host gets it ready if it isn't (the frames wait for it), then stops the program and starts the build with `init`:
+  - **`kept()`** gives what the old program kept (`keep`), and input it hadn't read is the new one's.
+  - **No ticks go across:** the new build's sim is its own, and in lockstep its ticks count from the frame it started at. The old program's voice stops.
+  - **Storage is the page's,** shared by every build the page runs; a fetch reads the running build's own files.
+  - A build that can't be got ready fails the request, and the program goes on. If the new build's `init` fails, the old build starts again in its place with what it had kept, and the host prints why: the screen never goes black.
+- The pipelines of the build that handed over, which the new one doesn't use, are kept until the next hand-over: going back builds none.
+- A host that runs one build alone (the CPU host) fails these requests.
 
 ### Provenance
 

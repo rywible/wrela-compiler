@@ -126,6 +126,13 @@ fn command(c: &Command) -> Value {
             json!({ "op": "Post", "request": request, "url": url, "body": body })
         }
         Command::Label { name } => json!({ "op": "Label", "name": name }),
+        Command::Prepare { request, path } => {
+            json!({ "op": "Prepare", "request": request, "path": path })
+        }
+        Command::Unprepare { path } => json!({ "op": "Unprepare", "path": path }),
+        Command::HandOver { request, path } => {
+            json!({ "op": "HandOver", "request": request, "path": path })
+        }
     }
 }
 
@@ -178,6 +185,9 @@ pub(crate) fn golden_batch() -> Vec<u8> {
         .post(5, "studio/edit", &[123, 125])
         .draw_indexed_indirect(1, [3, 0, 12], 3, 16, &[], &[])
         .label("terrain")
+        .prepare(6, "../floor")
+        .unprepare("../floor")
+        .hand_over(7, "next")
         .finish()
 }
 
@@ -970,6 +980,26 @@ fn checks() -> Value {
             "a post to another site",
             &m,
             &Encoder::new().post(1, "https://example.com/x", &[1]).finish(),
+        ),
+        check(
+            "a build path to another site",
+            &m,
+            &Encoder::new().hand_over(1, "https://example.com/x").finish(),
+        ),
+        check(
+            "a build path with `..` past its start",
+            &m,
+            &Encoder::new().prepare(1, "a/../b").finish(),
+        ),
+        check("a build path of `..` alone", &m, &Encoder::new().unprepare("../..").finish()),
+        check(
+            "builds beside this one, named rightly",
+            &m,
+            &Encoder::new()
+                .prepare(1, "../floor")
+                .unprepare("../floor")
+                .hand_over(2, "../../x/y")
+                .finish(),
         ),
         check(
             "requests, made rightly",

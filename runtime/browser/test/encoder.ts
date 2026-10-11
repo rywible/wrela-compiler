@@ -145,6 +145,21 @@ export class Encoder {
     return this.#command(Opcode.Post, [request, u.length, body.length], bytes);
   }
 
+  prepare(request: number, path: string): this {
+    const p = utf8(path);
+    return this.#command(Opcode.Prepare, [request, p.length], pad(p));
+  }
+
+  unprepare(path: string): this {
+    const p = utf8(path);
+    return this.#command(Opcode.Unprepare, [p.length], pad(p));
+  }
+
+  handOver(request: number, path: string): this {
+    const p = utf8(path);
+    return this.#command(Opcode.HandOver, [request, p.length], pad(p));
+  }
+
   label(name: string): this {
     const t = utf8(name);
     return this.#command(Opcode.Label, [t.length], pad(t));

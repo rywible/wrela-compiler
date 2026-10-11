@@ -70,6 +70,20 @@ pub fn path_problem(path: &str) -> Option<&'static str> {
     None
 }
 
+/// What's wrong with the path of a build to hand over to, if anything: as [`path_problem`]'s,
+/// except that it may start with `..` parts, so a build can name one beside it (a game's builds
+/// sit side by side under one origin).
+pub fn build_path_problem(path: &str) -> Option<&'static str> {
+    let mut rest = path;
+    while let Some(r) = rest.strip_prefix("../") {
+        rest = r;
+    }
+    if rest == ".." {
+        return Some("names no build: it ends in `..`");
+    }
+    path_problem(rest)
+}
+
 struct Shape {
     name: String,
     compute: bool,
@@ -360,6 +374,13 @@ impl Checker {
             Command::Fetch { url, .. } | Command::Post { url, .. } => {
                 if let Some(why) = path_problem(url) {
                     return err(format!("the URL `{url}` {why}"));
+                }
+            }
+            Command::Prepare { path, .. }
+            | Command::Unprepare { path }
+            | Command::HandOver { path, .. } => {
+                if let Some(why) = build_path_problem(path) {
+                    return err(format!("the build path `{path}` {why}"));
                 }
             }
             Command::Label { .. } => {}
