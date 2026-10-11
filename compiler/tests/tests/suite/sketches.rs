@@ -3,7 +3,7 @@
 //! against (the top-level `engine/` package). Each change from a sketch is noted next to its
 //! code ("Changed:"), with its reason.
 
-use crate::built;
+use crate::{built, tests_pass};
 use wrela_host::{CpuBuild, CpuHost, Value};
 
 fn cpu(pkg: &str) -> CpuHost {
@@ -119,35 +119,51 @@ fn sketch_03s_tick_doesnt_depend_on_the_workers() {
     assert_eq!(run(4), one_thread);
 }
 
-/// The programs' own tests (`@test`, `wrela test`): sketch 01's torso bound, hoof modes and
-/// physique, and its creature against M1's grazer, sketch 03's timeline replays and saves, the gameplay paper test's scripted player (a frame
-/// test of 360 frames), the examples': hello field's, and the wolf's and the grazer's walks
-/// (frame tests of 120 frames, AC7).
+/// A program's own tests (`@test`, `wrela test`) pass: each program's a test of its own, so the
+/// gate runs them side by side and remembers each by what it read.
+fn own_tests_pass(pkg: &str) {
+    assert!(tests_pass(&wrela_tests::repo_root().join(pkg)) > 0, "{pkg}: no tests ran");
+}
+
+/// Sketch 01's torso bound, hoof modes and physique.
 #[test]
-fn the_programs_own_tests_pass() {
-    let programs = [
-        "compiler/tests/sketches/01-creature",
-        "compiler/tests/sketches/01-check",
-        "compiler/tests/sketches/03-simulation",
-        "compiler/tests/sketches/gameplay",
-        "examples/hello-field",
-        "examples/wolf",
-        "examples/grazer",
-    ];
-    let outs = wrela_tests::par_map(&programs, |pkg| {
-        wrela_driver::test(&wrela_tests::repo_root().join(pkg), None)
-    });
-    for (pkg, out) in programs.iter().zip(outs) {
-        let shown = |ds: &[&wrela_diag::Diagnostic]| {
-            let ds: Vec<wrela_diag::Diagnostic> = ds.iter().map(|&d| d.clone()).collect();
-            wrela_diag::render::render_all(&out.sources, &ds)
-        };
-        let errors: Vec<_> = out.diagnostics.iter().filter(|d| d.is_error()).collect();
-        assert!(errors.is_empty(), "{pkg}:\n{}", shown(&errors));
-        let failed: Vec<_> = out.results.iter().filter_map(|r| r.failure.as_ref()).collect();
-        assert!(failed.is_empty(), "{pkg}:\n{}", shown(&failed));
-        assert!(!out.results.is_empty(), "{pkg}: no tests ran");
-    }
+fn the_creature_sketchs_own_tests_pass() {
+    own_tests_pass("compiler/tests/sketches/01-creature");
+}
+
+/// Sketch 01's creature against M1's grazer.
+#[test]
+fn the_creature_checks_own_tests_pass() {
+    own_tests_pass("compiler/tests/sketches/01-check");
+}
+
+/// Sketch 03's timeline replays and saves.
+#[test]
+fn the_simulation_sketchs_own_tests_pass() {
+    own_tests_pass("compiler/tests/sketches/03-simulation");
+}
+
+/// The gameplay paper test's scripted player (a frame test of 360 frames).
+#[test]
+fn the_gameplay_sketchs_own_tests_pass() {
+    own_tests_pass("compiler/tests/sketches/gameplay");
+}
+
+#[test]
+fn hello_fields_own_tests_pass() {
+    own_tests_pass("examples/hello-field");
+}
+
+/// The wolf's walk (frame tests of 120 frames, AC7).
+#[test]
+fn the_wolfs_own_tests_pass() {
+    own_tests_pass("examples/wolf");
+}
+
+/// The grazer's walk (frame tests of 120 frames, AC7).
+#[test]
+fn the_grazers_own_tests_pass() {
+    own_tests_pass("examples/grazer");
 }
 
 const GAMEPLAY_FRAMES: u32 = 360;

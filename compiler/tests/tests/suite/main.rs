@@ -110,17 +110,18 @@ fn with_frame(text: &str) -> String {
 }
 
 /// Runs the package's tests as `wrela test` does, which must all pass: panics with the errors
-/// or the failures if not. How many ran.
+/// or the failures, rendered, if not. How many ran.
 fn tests_pass(dir: &Path) -> usize {
     let out = wrela_driver::test(dir, None);
     if !out.passed() {
-        let errors: Vec<_> = out.diagnostics.iter().filter(|d| d.is_error()).collect();
-        let failed: Vec<String> = out
-            .results
-            .iter()
-            .filter_map(|r| r.failure.as_ref().map(|d| format!("{}: {}", r.name, d.message)))
-            .collect();
-        panic!("errors: {errors:#?}\nfailed: {failed:#?}");
+        let errors: Vec<_> = out.diagnostics.iter().filter(|d| d.is_error()).cloned().collect();
+        let failed: Vec<_> = out.results.iter().filter_map(|r| r.failure.clone()).collect();
+        panic!(
+            "{}:\n{}{}",
+            dir.display(),
+            wrela_diag::render::render_all(&out.sources, &errors),
+            wrela_diag::render::render_all(&out.sources, &failed)
+        );
     }
     out.results.len()
 }
