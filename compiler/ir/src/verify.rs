@@ -51,10 +51,15 @@ impl Verifier<'_> {
         self.m.types.display(t)
     }
 
-    fn visible(&self, v: ValueId) -> Result<()> {
+    fn exists(&self, v: ValueId) -> Result<()> {
         if v.index() >= self.f.values.len() {
             return Err(bug(format!("v{} doesn't exist", v.0)));
         }
+        Ok(())
+    }
+
+    fn visible(&self, v: ValueId) -> Result<()> {
+        self.exists(v)?;
         if !self.visible[v.index()] {
             return Err(bug(format!("v{} is used where its definition isn't visible", v.0)));
         }
@@ -564,6 +569,7 @@ impl Verifier<'_> {
         for s in b {
             match s {
                 Stmt::Let(v, e) => {
+                    self.exists(*v)?;
                     if let Some(t) = self.expr(e)? {
                         self.expect(&format!("v{}", v.0), self.ty(*v), t)?;
                     } else if let Expr::Atomic(AtomicOp::CompareExchange, p, _) = e {
@@ -654,5 +660,24 @@ impl Verifier<'_> {
             self.visible[v.index()] = false;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A malformed definition is an ordinary verifier error, not an out-of-bounds panic.
+    #[test]
+    fn definition_of_a_missing_value_is_an_error() {
+        let mut m = Module::default();
+        let u32_ty = m.types.u32();
+        let mut f = Function::new("malformed", Vec::new(), None);
+        f.new_value(u32_ty);
+        f.body = vec![Stmt::Let(ValueId(99), Expr::Const(Const::U32(1)))];
+        m.add_function(f);
+
+        let error = verify(&m).expect_err("the definition names no value");
+        assert!(error.message().contains("v99 doesn't exist"), "{error}");
     }
 }

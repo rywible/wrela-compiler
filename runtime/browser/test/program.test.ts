@@ -1,7 +1,7 @@
 // The program ABI without a GPU, mirroring runtime/native/src/program/tests.rs.
 
 import { describe, expect, spyOn, test } from "bun:test";
-import { STREAM_VERSION } from "../src/abi.gen.ts";
+import { AUDIO_CHANNELS, AUDIO_OUT, AUDIO_QUANTUM, EVENT_SIZE, MAX_TICK_RECORDS, PANIC, PAR_SHUTDOWN, STREAM_VERSION, THREAD_BLOCKS, TICK_RECORDS } from "../src/abi.gen.ts";
 import { CommandError } from "../src/check.ts";
 import { parseManifest } from "../src/manifest.ts";
 import { checkAbi, otherInstance, Program, ProgramError, TrapError } from "../src/program.ts";
@@ -48,6 +48,7 @@ const withBuffers = (f: (e: Encoder) => void) => {
 };
 
 const frameOnly = { type: FRAME_TYPE, body: [], export: "frame" };
+type FuncImport = Extract<Import, { kind: "func" }>;
 
 describe("the ABI check", () => {
   const rejects = async (wasm: Uint8Array<ArrayBuffer>, text: string) => {
@@ -87,14 +88,29 @@ describe("the ABI check", () => {
     );
   });
 
-  test("has a start function that doesn't call the host", async () => {
+  test("a start function can't call any host function", async () => {
     // It runs while the module is instantiated, outside any call the host makes.
-    const empty = new Encoder().finish();
-    const start = { type: { params: [], results: [] }, body: [...op.i32(16), ...op.i32(empty.length), ...op.call(0)] };
-    await rejects(
-      buildModule({ imports: [SUBMIT], memory: 1, funcs: [frameOnly, start], data: [{ offset: 16, bytes: empty }], start: 2 }),
-      "invalid program: its start function called the host; a wrela program calls the host only from an export",
-    );
+    const imports: { host: FuncImport; args: number[] }[] = [
+      { host: SUBMIT as FuncImport, args: [0, 0] },
+      { host: { module: "wrela", name: "request_status", kind: "func", type: { params: ["i32"], results: ["i32"] } }, args: [0] },
+      { host: { module: "wrela", name: "request_take", kind: "func", type: { params: ["i32", "i32"], results: [] } }, args: [0, 0] },
+      { host: { module: "wrela", name: "limit", kind: "func", type: { params: ["i32"], results: ["i32"] } }, args: [0] },
+      { host: { module: "wrela", name: "audio", kind: "func", type: { params: ["i32", "i32"], results: [] } }, args: [0, 0] },
+      { host: { module: "wrela", name: "input", kind: "func", type: { params: ["i32", "i32"], results: ["i32"] } }, args: [0, 0] },
+      { host: { module: "wrela", name: "tick", kind: "func", type: { params: ["i32", "i32", "i32"], results: [] } }, args: [0, 0, 0] },
+      { host: { module: "wrela", name: "keep", kind: "func", type: { params: ["i32", "i32"], results: [] } }, args: [0, 0] },
+      { host: { module: "wrela", name: "kept", kind: "func", type: { params: ["i32", "i32"], results: ["i32"] } }, args: [0, 0] },
+      { host: { module: "wrela", name: "clock", kind: "func", type: { params: ["i32"], results: [] } }, args: [0] },
+      { host: { module: "wrela", name: "print", kind: "func", type: { params: ["i32", "i32"], results: [] } }, args: [0, 0] },
+      { host: { module: "wrela", name: "phase", kind: "func", type: { params: ["i32", "i32"], results: [] } }, args: [0, 0] },
+    ];
+    for (const { host, args } of imports) {
+      const body = [...args.flatMap(op.i32), ...op.call(0), ...(host.type.results.length ? [0x1a] : [])];
+      await rejects(
+        buildModule({ imports: [host], memory: 1, funcs: [frameOnly, { type: { params: [], results: [] }, body }], start: 2 }),
+        "invalid program: its start function called the host; a wrela program calls the host only from an export",
+      );
+    }
   });
 
   test("needs memory and frame exports", async () => {
@@ -103,6 +119,10 @@ describe("the ABI check", () => {
     await rejects(
       buildModule({ memory: 1, funcs: [{ type: { params: ["f64"], results: [] }, body: [], export: "frame" }] }),
       "it must export `frame(",
+    );
+    await rejects(
+      buildModule({ memory: 1, exportOwnMemory: true, funcs: [frameOnly] }),
+      "its `memory` export isn't its imported shared memory",
     );
     await expect(load(Uint8Array.from([1, 2, 3]))).rejects.toThrow(ProgramError);
   });
@@ -232,9 +252,67 @@ test("a failed submit fails the call even if the module catches it", async () =>
   expect(() => program.frame(0, 64, 64)).toThrow(CommandError);
 });
 
+test("a failed audio or ticker start fails the call even if the module catches it", async () => {
+  const cases: { host: FuncImport; args: number[]; message: string }[] = [
+    {
+      host: { module: "wrela", name: "audio", kind: "func", type: { params: ["i32", "i32"], results: [] } },
+      args: [0, 0],
+      message: "the program trapped: it starts a voice but doesn't export `__audio`",
+    },
+    {
+      host: { module: "wrela", name: "tick", kind: "func", type: { params: ["i32", "i32", "i32"], results: [] } },
+      args: [0, 0, 60],
+      message: "the program trapped: it starts a ticker but doesn't export `__tick`",
+    },
+  ];
+  for (const { host, args, message } of cases) {
+    const body = [0x06, 0x40, ...args.flatMap(op.i32), ...op.call(0), 0x19, 0x0b];
+    const program = await Program.load(
+      buildModule({ imports: [host], memory: 1, funcs: [{ type: FRAME_TYPE, body, export: "frame" }] }),
+      checker(),
+      new Recorder(),
+    );
+    let error: unknown = null;
+    try {
+      program.frame(0, 1, 1);
+    } catch (e) {
+      error = e;
+    }
+    expect(error).toBeInstanceOf(TrapError);
+    expect((error as Error).message).toBe(message);
+  }
+});
+
 test("reports program traps", async () => {
   const program = await load(buildModule({ memory: 1, funcs: [{ type: FRAME_TYPE, body: op.unreachable, export: "frame" }] }));
   expect(() => program.frame(0, 1, 1)).toThrow(TrapError);
+});
+
+test("a host TrapError has one prefix and still yields to the program's panic message", async () => {
+  const KEEP: Import = { module: "wrela", name: "keep", kind: "func", type: { params: ["i32", "i32"], results: [] } };
+  const panic = new Uint8Array(8);
+  new DataView(panic.buffer).setUint32(0, 4, true);
+  panic.set(new TextEncoder().encode("oops"), 4);
+  const program = await Program.load(
+    buildModule({
+      imports: [KEEP],
+      memory: 20,
+      funcs: [{ type: FRAME_TYPE, body: [...op.i32(0xffff_ffff), ...op.i32(1), ...op.call(0)], export: "frame" }],
+      data: [{ offset: THREAD_BLOCKS + PANIC, bytes: panic }],
+    }),
+    checker(),
+    new Recorder(),
+  );
+  let error: unknown = null;
+  try {
+    program.frame(0, 1, 1);
+  } catch (e) {
+    error = e;
+  }
+  expect(error).toBeInstanceOf(TrapError);
+  expect((error as Error).message).toBe(
+    "the program trapped: panic: oops: keep(4294967295, 1) reaches past the end of the program's memory",
+  );
 });
 
 describe("the checks, with the native host's messages", () => {
@@ -474,7 +552,7 @@ describe("the voice", () => {
   const start = [...op.i32(3), ...op.i32(100), ...op.call(0)];
   const wasm = buildModule({
     imports: [AUDIO],
-    memory: 1,
+    memory: 20,
     funcs: [
       frameOnly,
       { type: { params: [], results: [] }, body: start, export: "init" },
@@ -492,6 +570,203 @@ describe("the voice", () => {
     expect(p.hasVoice).toBe(true);
     expect(() => p.call("again")).toThrow("a program starts one voice, and this one started a second");
   });
+
+  test("needs memory for both output channels before it starts", async () => {
+    const need = AUDIO_OUT + AUDIO_CHANNELS * AUDIO_QUANTUM * 4;
+    const tooSmall = buildModule({
+      imports: [AUDIO],
+      memory: 19,
+      funcs: [
+        frameOnly,
+        { type: { params: [], results: [] }, body: start, export: "init" },
+        { type: { params: ["i32", "i32", "i32"], results: [] }, body: [], export: "__audio" },
+      ],
+    });
+    let started = false;
+    await expect(
+      Program.load(tooSmall, checker(), new Recorder(), { startVoice: () => (started = true) }),
+    ).rejects.toThrow(`it starts a voice but its memory is ${19 * 65536} bytes; the audio thread needs at least ${need}`);
+    expect(started).toBe(false);
+  });
+});
+
+test("a ticker needs its record region before it starts", async () => {
+  const TICK: Import = {
+    module: "wrela",
+    name: "tick",
+    kind: "func",
+    type: { params: ["i32", "i32", "i32"], results: [] },
+  };
+  const need = TICK_RECORDS + 4 + MAX_TICK_RECORDS * EVENT_SIZE;
+  const wasm = buildModule({
+    imports: [TICK],
+    memory: 18,
+    funcs: [
+      frameOnly,
+      { type: { params: [], results: [] }, body: [...op.i32(3), ...op.i32(100), ...op.i32(60), ...op.call(0)], export: "init" },
+      { type: { params: ["i32", "i32", "i32", "i32"], results: [] }, body: [], export: "__tick" },
+    ],
+  });
+  let started = false;
+  await expect(
+    Program.load(wasm, checker(), new Recorder(), { startTicker: () => (started = true) }),
+  ).rejects.toThrow(`it starts a ticker but its memory is ${18 * 65536} bytes; the ticker needs at least ${need}`);
+  expect(started).toBe(false);
+});
+
+test("a ticker's rate is nonzero at the host boundary", async () => {
+  const TICK: FuncImport = {
+    module: "wrela",
+    name: "tick",
+    kind: "func",
+    type: { params: ["i32", "i32", "i32"], results: [] },
+  };
+  const wasm = buildModule({
+    imports: [TICK],
+    memory: 20,
+    funcs: [
+      frameOnly,
+      { type: { params: [], results: [] }, body: [...op.i32(3), ...op.i32(100), ...op.i32(0), ...op.call(0)], export: "init" },
+      { type: { params: ["i32", "i32", "i32", "i32"], results: [] }, body: [], export: "__tick" },
+    ],
+  });
+  let started = false;
+  let error: unknown = null;
+  try {
+    await Program.load(wasm, checker(), new Recorder(), { startTicker: () => (started = true) });
+  } catch (e) {
+    error = e;
+  }
+  expect(error).toBeInstanceOf(TrapError);
+  expect((error as Error).message).toBe(
+    "the program trapped: it starts a ticker at 0 Hz; a ticker ticks at least once a second",
+  );
+  expect(started).toBe(false);
+});
+
+test("a rejected init starts no voice or ticker and tells spawned helpers to stop", async () => {
+  const AUDIO: Import = {
+    module: "wrela",
+    name: "audio",
+    kind: "func",
+    type: { params: ["i32", "i32"], results: [] },
+  };
+  const TICK: Import = {
+    module: "wrela",
+    name: "tick",
+    kind: "func",
+    type: { params: ["i32", "i32", "i32"], results: [] },
+  };
+  const init = [
+    ...op.i32(1),
+    ...op.i32(2),
+    ...op.call(0),
+    ...op.i32(3),
+    ...op.i32(4),
+    ...op.i32(60),
+    ...op.call(1),
+    ...op.unreachable,
+  ];
+  const wasm = buildModule({
+    imports: [AUDIO, TICK],
+    memory: 20,
+    funcs: [
+      frameOnly,
+      { type: { params: ["i32", "i32", "i32"], results: [] }, body: [], export: "__audio" },
+      { type: { params: ["i32", "i32", "i32", "i32"], results: [] }, body: [], export: "__tick" },
+      { type: { params: ["i32"], results: [] }, body: [], export: "__worker" },
+      { type: { params: [], results: [] }, body: init, export: "init" },
+    ],
+  });
+  let memory: WebAssembly.Memory | null = null;
+  let voices = 0;
+  let tickers = 0;
+  await expect(
+    Program.load(wasm, checker(), new Recorder(), {
+      workers: 3,
+      spawnWorker: (_module, shared) => {
+        memory = shared;
+      },
+      startVoice: () => voices++,
+      startTicker: () => tickers++,
+    }),
+  ).rejects.toThrow("the program trapped");
+  expect(voices).toBe(0);
+  expect(tickers).toBe(0);
+  expect(memory).not.toBeNull();
+  expect(new DataView(memory!.buffer).getUint32(PAR_SHUTDOWN, true)).toBe(1);
+});
+
+test("rejecting an empty-memory program preserves its initialization trap", async () => {
+  const wasm = buildModule({
+    memory: 0,
+    funcs: [
+      frameOnly,
+      { type: { params: [], results: [] }, body: op.unreachable, export: "init" },
+    ],
+  });
+  let error: unknown = null;
+  try {
+    await Program.load(wasm, checker(), new Recorder());
+  } catch (e) {
+    error = e;
+  }
+  expect(error).toBeInstanceOf(TrapError);
+  expect((error as Error).message).toStartWith("the program trapped:");
+});
+
+test("another instance's start function cannot call its allowed host imports", async () => {
+  const PRINT: Import = {
+    module: "wrela",
+    name: "print",
+    kind: "func",
+    type: { params: ["i32", "i32"], results: [] },
+  };
+  const wasm = buildModule({
+    imports: [PRINT],
+    memory: 1,
+    funcs: [
+      frameOnly,
+      { type: { params: [], results: [] }, body: [...op.i32(0), ...op.i32(0), ...op.call(0)] },
+    ],
+    start: 2,
+  });
+  const module = new WebAssembly.Module(wasm);
+  const memory = new WebAssembly.Memory({ initial: 1, maximum: 16384, shared: true });
+  let printed = 0;
+  await expect(otherInstance(module, memory, "a helper", () => printed++)).rejects.toThrow(
+    "its start function called the host",
+  );
+  expect(printed).toBe(0);
+});
+
+test("catch_all cannot hide a start function's host call", async () => {
+  const PRINT: Import = {
+    module: "wrela",
+    name: "print",
+    kind: "func",
+    type: { params: ["i32", "i32"], results: [] },
+  };
+  // try (result void); call host; catch_all; end. Cover one import another thread normally
+  // answers and one it normally refuses: both must be remembered as start-time calls.
+  const caught = [0x06, 0x40, ...op.i32(0), ...op.i32(0), ...op.call(0), 0x19, 0x0b];
+  for (const host of [PRINT, SUBMIT]) {
+    const wasm = buildModule({
+      imports: [host],
+      memory: 20,
+      funcs: [frameOnly, { type: { params: [], results: [] }, body: caught }],
+      start: 2,
+    });
+    await expect(Program.load(wasm, checker(), new Recorder())).rejects.toThrow(
+      "its start function called the host",
+    );
+
+    const module = new WebAssembly.Module(wasm);
+    const memory = new WebAssembly.Memory({ initial: 20, maximum: 16384, shared: true });
+    await expect(otherInstance(module, memory, "a helper")).rejects.toThrow(
+      "its start function called the host",
+    );
+  }
 });
 
 test("a printed line goes to the console as it's made, prefixed, and a phase is ignored", async () => {

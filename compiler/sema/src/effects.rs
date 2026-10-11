@@ -869,6 +869,19 @@ fn node(
                             call_to(&mut n, g, c.span);
                         } else {
                             n.open = true;
+                            // A generic `T: Clone` may own heap memory: unlike `T: Copy`, its
+                            // bound does not prove that cloning is allocation-free. CPU effect
+                            // summaries are not keyed by substitutions, so keep that possible
+                            // allocation before the concrete caller loses it.
+                            if matches!(p.func(*method).owner, FnOwner::Trait(t) if Some(t) == p.lang_trait(Lang::Clone))
+                                && traits::may_need_drop(p, *self_ty)
+                            {
+                                n.direct.push((
+                                    Effect::Alloc,
+                                    c.span,
+                                    "a generic `Clone` call may copy heap memory".into(),
+                                ));
+                            }
                         }
                     }
                     Callee::Builtin(crate::builtins::BuiltinFn::Panic) => {

@@ -382,12 +382,12 @@ impl<E: Executor> State<E> {
 }
 
 /// The audio thread's instance of the program, and its `__audio(thread, task, context)`.
-type AudioThread = (Store<()>, TypedFunc<(u32, u32, u32), ()>);
+type AudioThread = (Store<bool>, TypedFunc<(u32, u32, u32), ()>);
 
 /// The ticker's thread's instance of the program, its `__tick(thread, task, context, tick)`,
 /// and the next tick's number.
 struct TickThread {
-    store: Store<()>,
+    store: Store<bool>,
     tick: TypedFunc<(u32, u32, u32, u32), ()>,
     next: u32,
     memory: SharedMemory,
@@ -777,7 +777,7 @@ impl<E: Executor> Program<E> {
         linker.func_wrap(IMPORT_MODULE, IMPORT_KEEP, keep::<E>).map_err(wrap)?;
         linker.func_wrap(IMPORT_MODULE, IMPORT_KEPT, self::kept::<E>).map_err(wrap)?;
         linker.func_wrap(IMPORT_MODULE, IMPORT_CLOCK, clock::<E>).map_err(wrap)?;
-        trace.link(&mut linker, Some(&memory)).map_err(wrap)?;
+        trace.link_checked(&mut linker, Some(&memory), check_started::<E>).map_err(wrap)?;
         let state = State {
             memory: memory.clone(),
             checker: Checker::with_limits(manifest, executor.limits()),
@@ -816,6 +816,14 @@ impl<E: Executor> Program<E> {
             let failure = store.data_mut().failure.take();
             failure.unwrap_or_else(|| Error::Program(format!("{e:#}")))
         })?;
+        let exports_imported_memory = instance
+            .get_shared_memory(&mut store, EXPORT_MEMORY)
+            .is_some_and(|exported| std::ptr::eq(exported.data().as_ptr(), memory.data().as_ptr()));
+        if !exports_imported_memory {
+            return Err(Error::Program(format!(
+                "its `{EXPORT_MEMORY}` export isn't its imported shared memory"
+            )));
+        }
         store.data_mut().started = true;
         // The helpers: each its own instance on its own thread, sharing the memory.
         let has_worker = compiled.module.get_export(EXPORT_WORKER).is_some();
@@ -1367,9 +1375,9 @@ fn other_instance(
     memory: &SharedMemory,
     who: &'static str,
     trace: &Trace,
-) -> wasmtime::Result<(Store<()>, Instance)> {
+) -> wasmtime::Result<(Store<bool>, Instance)> {
     let engine = module.engine();
-    let mut store = Store::new(engine, ());
+    let mut store = Store::new(engine, false);
     // On a metered engine, another thread's instance isn't what a call's fuel bounds.
     if engine.get_consume_fuel() {
         store.set_fuel(u64::MAX)?;
@@ -1379,8 +1387,15 @@ fn other_instance(
     // The clock answers on every thread (an `@audio` voice may read it), and so do a line
     // printed and a phase (a tick or a parallel job's chunk may print).
     let m = memory.clone();
-    linker.func_wrap(IMPORT_MODULE, IMPORT_CLOCK, move |ptr: u32| write_clock(&m, ptr))?;
-    trace.link(&mut linker, Some(memory))?;
+    linker.func_wrap(
+        IMPORT_MODULE,
+        IMPORT_CLOCK,
+        move |mut caller: wasmtime::Caller<'_, bool>, ptr: u32| {
+            check_thread_started(caller.data_mut())?;
+            write_clock(&m, ptr)
+        },
+    )?;
+    trace.link_checked(&mut linker, Some(memory), check_thread_started)?;
     let answered = [IMPORT_CLOCK, IMPORT_PRINT, IMPORT_PHASE];
     for f in HOST_FUNCTIONS.iter().filter(|f| !answered.contains(&f.name)) {
         let i32s = |n| std::iter::repeat_n(ValType::I32, n);
@@ -1390,6 +1405,7 @@ fn other_instance(
         })?;
     }
     let instance = linker.instantiate(&mut store, module)?;
+    *store.data_mut() = true;
     Ok((store, instance))
 }
 
@@ -1560,6 +1576,15 @@ fn check_started<E>(state: &mut State<E>) -> wasmtime::Result<()> {
     Err(fail(state, Error::Program(CALLED_WHILE_STARTING.into())))
 }
 
+/// [`check_started`] for another thread's instance, whose state only records whether its start
+/// function has finished.
+fn check_thread_started(started: &mut bool) -> wasmtime::Result<()> {
+    if *started {
+        return Ok(());
+    }
+    Err(wasmtime::format_err!("{CALLED_WHILE_STARTING}"))
+}
+
 /// `wrela.submit(ptr, len)`: decode and execute one batch of `len` bytes at `ptr`.
 fn submit<E: Executor>(
     mut caller: wasmtime::Caller<'_, State<E>>,
@@ -1624,6 +1649,11 @@ fn tick<E: Executor>(
     if state.ticker.is_some() {
         let e =
             Error::Trap("panic: a program starts one ticker, and this one started a second".into());
+        return Err(fail(state, e));
+    }
+    if hz == 0 {
+        let e =
+            Error::Trap("it starts a ticker at 0 Hz; a ticker ticks at least once a second".into());
         return Err(fail(state, e));
     }
     if !state.has_tick_entry {
@@ -1721,24 +1751,39 @@ fn write_clock(memory: &SharedMemory, ptr: u32) -> wasmtime::Result<()> {
 }
 
 /// `wrela.clock(ptr)`: the seconds since the host started its first program, at `ptr`.
-fn clock<E: Executor>(caller: wasmtime::Caller<'_, State<E>>, ptr: u32) -> wasmtime::Result<()> {
-    write_clock(&caller.data().memory, ptr)
+fn clock<E: Executor>(
+    mut caller: wasmtime::Caller<'_, State<E>>,
+    ptr: u32,
+) -> wasmtime::Result<()> {
+    let state = caller.data_mut();
+    check_started(state)?;
+    write_clock(&state.memory, ptr)
 }
 
 /// `wrela.limit(index) -> i32`: one of the device's limits ([`wrela_abi::Limits`]), as a `u32`'s
 /// bits; 0 past the last.
-fn limit<E: Executor>(caller: wasmtime::Caller<'_, State<E>>, index: u32) -> i32 {
-    caller.data().executor.limits().get(index) as i32
+fn limit<E: Executor>(
+    mut caller: wasmtime::Caller<'_, State<E>>,
+    index: u32,
+) -> wasmtime::Result<i32> {
+    let state = caller.data_mut();
+    check_started(state)?;
+    Ok(state.executor.limits().get(index) as i32)
 }
 
 /// `wrela.request_status(request) -> i32`: -1 while the request is pending, -2 if it failed,
 /// else its answer's length in bytes.
-fn request_status<E: Executor>(caller: wasmtime::Caller<'_, State<E>>, request: u32) -> i32 {
-    match caller.data().requests.answered.get(&request) {
+fn request_status<E: Executor>(
+    mut caller: wasmtime::Caller<'_, State<E>>,
+    request: u32,
+) -> wasmtime::Result<i32> {
+    let state = caller.data_mut();
+    check_started(state)?;
+    Ok(match state.requests.answered.get(&request) {
         None => REQUEST_PENDING,
         Some(Err(_)) => REQUEST_FAILED,
         Some(Ok(bytes)) => bytes.len() as i32,
-    }
+    })
 }
 
 /// `wrela.request_take(request, ptr)`: copies an answered request's bytes to `ptr` in the

@@ -8,6 +8,7 @@ import gzip
 import http.server
 import io
 import os
+import re
 import sys
 import threading
 import time
@@ -64,7 +65,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         """Sends the file gzipped (as a static host would) if the request accepts gzip and it's a
         kind a host compresses: whether it did. The test pages' load times and bytes then are
         what a player's would be."""
-        if "gzip" not in (self.headers.get("Accept-Encoding") or ""):
+        accepted = ",".join(self.headers.get_all("Accept-Encoding", []))
+        if not accepts_gzip(accepted):
             return False
         path = self.translate_path(self.path)
         if not path.endswith(self.GZIPPED) or not os.path.isfile(path):
@@ -75,7 +77,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         self.send_header("Content-Encoding", "gzip")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.copyfile(io.BytesIO(body), self.wfile)
+        if self.command != "HEAD":
+            self.copyfile(io.BytesIO(body), self.wfile)
         return True
 
     def copyfile(self, source, outputfile):
@@ -91,7 +94,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             outputfile.write(chunk)
 
     def do_HEAD(self):
-        if not self.refused():
+        if not self.refused() and not self.send_gzipped():
             super().do_HEAD()
 
     def results_path(self):
@@ -148,6 +151,29 @@ class _GzipFile:
 
 _GZIPPED = {}  # path -> the latest version of the file gzipped
 _GZIPPED_LOCK = threading.Lock()
+
+_QVALUE = re.compile(r"(?:0(?:\.[0-9]{0,3})?|1(?:\.0{0,3})?)\Z")
+
+
+def accepts_gzip(value):
+    """Whether an Accept-Encoding field allows gzip, including wildcard preferences."""
+    qualities = {}
+    for item in value.split(","):
+        parts = item.split(";")
+        coding = parts[0].strip().casefold()
+        if coding not in ("gzip", "*"):
+            continue
+        quality = 1.0
+        for parameter in parts[1:]:
+            name, separator, number = parameter.partition("=")
+            number = number.strip()
+            if name.strip().casefold() != "q" or not separator or not _QVALUE.fullmatch(number):
+                quality = None
+                break
+            quality = float(number)
+        if quality is not None:
+            qualities[coding] = max(quality, qualities.get(coding, 0.0))
+    return qualities.get("gzip", qualities.get("*", 0.0)) > 0
 
 
 def gzipped(path):

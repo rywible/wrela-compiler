@@ -3,6 +3,11 @@
 
 import { HOST_FUNCTIONS, IMPORT_CLOCK, IMPORT_MEMORY, IMPORT_MODULE, IMPORT_PHASE, IMPORT_PRINT } from "./abi.gen.ts";
 
+/** A Wasm start function runs while an instance is being made, before the host can safely
+ * expose any of its effects. This is the same program-ABI error as the native host reports. */
+export const CALLED_WHILE_STARTING =
+  "its start function called the host; a wrela program calls the host only from an export";
+
 // AudioWorkletGlobalScope has no TextDecoder. Other threads reuse a decoder, made only when
 // text is read; the worklet uses ECMAScript's strict UTF-8 decoding instead.
 let utf8: TextDecoder | null = null;
@@ -69,19 +74,29 @@ export function refusingImports(
   who: string,
   Refusal: new (message: string) => Error,
   onPrint: (line: string) => void = () => {},
+  started: () => boolean = () => true,
+  startFailed: (error: Error) => void = () => {},
 ): WebAssembly.Imports {
   const refuse = () => {
     throw new Refusal(`${who} can't call the host`);
+  };
+  const afterStart = <A extends unknown[], R>(f: (...args: A) => R) => (...args: A): R => {
+    if (!started()) {
+      const error = new Refusal(CALLED_WHILE_STARTING);
+      startFailed(error);
+      throw error;
+    }
+    return f(...args);
   };
   // The clock, a line printed and a phase answer on every thread (a voice may read the clock;
   // a tick and a parallel job's chunk may print).
   return {
     [IMPORT_MODULE]: {
       [IMPORT_MEMORY]: memory,
-      ...Object.fromEntries(HOST_FUNCTIONS.map(([name]) => [name, refuse])),
-      [IMPORT_CLOCK]: clockImport(memory),
-      [IMPORT_PRINT]: (ptr: number, len: number) => onPrint(printed(memory, ptr, len)),
-      [IMPORT_PHASE]: phaseImport(memory),
+      ...Object.fromEntries(HOST_FUNCTIONS.map(([name]) => [name, afterStart(refuse)])),
+      [IMPORT_CLOCK]: afterStart(clockImport(memory)),
+      [IMPORT_PRINT]: afterStart((ptr: number, len: number) => onPrint(printed(memory, ptr, len))),
+      [IMPORT_PHASE]: afterStart(phaseImport(memory)),
     },
   };
 }

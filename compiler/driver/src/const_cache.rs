@@ -19,7 +19,11 @@ use wrela_ir as ir;
 use wrela_lower::Value;
 
 /// The format's first bytes and version: a file of another version is a miss.
-const MAGIC: &[u8; 8] = b"wrelac\x00\x02";
+const MAGIC: &[u8; 8] = b"wrelac\x00\x03";
+
+/// A key's encoded bytes, and the checksum at the end of an entry.
+const KEY_BYTES: usize = 64;
+const CHECKSUM_BYTES: usize = 32;
 
 /// How long an entry no build has used is kept.
 const KEEP_FOR: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
@@ -99,7 +103,7 @@ pub fn get(dir: &Path, key: &str) -> Option<Value> {
     let path = dir.join(format!("{key}.wcv"));
     safe_file(dir, &path)?;
     let bytes = std::fs::read(&path).ok()?;
-    let value = decode(&bytes)?;
+    let value = decode(key, &bytes)?;
     // Touched, so cleaning keeps it.
     let _ = std::fs::File::options()
         .append(true)
@@ -119,7 +123,7 @@ pub fn put(dir: &Path, key: &str, value: &Value) {
     if safe(dir).is_none() {
         return;
     }
-    let bytes = encode(value);
+    let Some(bytes) = encode(key, value) else { return };
     // Unique across machines too, which share a directory but not their process ids.
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -185,16 +189,34 @@ fn cache_name(name: &std::ffi::OsStr) -> Option<bool> {
     owned.then_some(true)
 }
 
-/// A value as bytes: [`MAGIC`], then the value, each node a tag and its payload.
-pub fn encode(v: &Value) -> Vec<u8> {
+/// A value as bytes: [`MAGIC`], the key whose file may hold it, the value (each node a tag and
+/// its payload), and a checksum of all of those bytes. Binding the contents to the key makes a
+/// valid entry copied or renamed under another key a miss; the checksum makes a damaged entry
+/// one too.
+pub fn encode(key: &str, v: &Value) -> Option<Vec<u8>> {
+    if key.len() != KEY_BYTES || !key.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
     let mut out = MAGIC.to_vec();
+    out.extend_from_slice(key.as_bytes());
     put_value(&mut out, v);
-    out
+    let checksum = Sha256::digest(&out);
+    out.extend_from_slice(&checksum);
+    Some(out)
 }
 
-/// The value `bytes` hold, or none if they aren't one whole.
-pub fn decode(bytes: &[u8]) -> Option<Value> {
-    let rest = bytes.strip_prefix(MAGIC.as_slice())?;
+/// The value `bytes` hold for `key`, or none if they aren't one whole, intact entry for it.
+pub fn decode(key: &str, bytes: &[u8]) -> Option<Value> {
+    if key.len() != KEY_BYTES || !key.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let checksum_at = bytes.len().checked_sub(CHECKSUM_BYTES)?;
+    let (body, stored_checksum) = bytes.split_at(checksum_at);
+    let checksum: [u8; CHECKSUM_BYTES] = Sha256::digest(body).into();
+    if checksum.as_slice() != stored_checksum {
+        return None;
+    }
+    let rest = body.strip_prefix(MAGIC.as_slice())?.strip_prefix(key.as_bytes())?;
     let mut r = Reader { bytes: rest, at: 0 };
     let v = r.value(0)?;
     (r.at == r.bytes.len()).then_some(v)
@@ -400,6 +422,7 @@ mod tests {
 
     #[test]
     fn a_value_reads_back_as_it_was_stored() {
+        let cache_key = key(b"\0asm codec", 7);
         let v = Value::Parts(vec![
             Value::Scalar(ir::Const::F32(-0.0)),
             Value::Scalar(ir::Const::F64(f64::from_bits(0x7ff8000000000000))),
@@ -409,15 +432,16 @@ mod tests {
             Value::Points(vec![Value::Scalar(ir::Const::U64(u64::MAX)); 3]),
             Value::Scalar(ir::Const::Bool(true)),
         ]);
-        let bytes = encode(&v);
-        let back = decode(&bytes).expect("it reads back");
+        let bytes = encode(&cache_key, &v).expect("a valid key");
+        let back = decode(&cache_key, &bytes).expect("it reads back");
         // Compared by their bytes, as -0.0 == 0.0 and NaN != NaN.
-        assert_eq!(encode(&back), bytes);
+        assert_eq!(encode(&cache_key, &back).expect("a valid key"), bytes);
         // Cut short, or with a byte more, it's no value.
-        assert!(decode(&bytes[..bytes.len() - 1]).is_none());
+        assert!(decode(&cache_key, &bytes[..bytes.len() - 1]).is_none());
         let mut longer = bytes.clone();
         longer.push(0);
-        assert!(decode(&longer).is_none());
+        assert!(decode(&cache_key, &longer).is_none());
+        assert!(decode(&key(b"\0asm another", 7), &bytes).is_none());
     }
 
     #[test]
@@ -463,6 +487,30 @@ mod tests {
         assert_eq!(get(&dir, &k), Some(v));
         clean(&dir);
         assert!(get(&dir, &k).is_some(), "a value used today is kept");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A valid entry belongs only to the key encoded in it, and any damaged byte makes it a
+    /// miss. A miss is recomputed by the caller, so cache files cannot change program meaning.
+    #[test]
+    fn an_entry_is_bound_to_its_key_and_checksum() {
+        let dir =
+            std::env::temp_dir().join(format!("wrela-consts-integrity-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (seven, nine) = (key(b"\0asm seven", 1), key(b"\0asm nine", 1));
+        let value = Value::Scalar(ir::Const::U32(9));
+        put(&dir, &nine, &value);
+
+        let nine_file = dir.join(format!("{nine}.wcv"));
+        let seven_file = dir.join(format!("{seven}.wcv"));
+        std::fs::copy(&nine_file, &seven_file).expect("copy under another key");
+        assert!(get(&dir, &seven).is_none(), "an entry copied under another key misses");
+
+        let mut damaged = std::fs::read(&nine_file).expect("entry");
+        let payload = MAGIC.len() + KEY_BYTES + 2;
+        damaged[payload] ^= 1;
+        std::fs::write(&nine_file, damaged).expect("damage entry");
+        assert!(get(&dir, &nine).is_none(), "an entry whose payload changed misses");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

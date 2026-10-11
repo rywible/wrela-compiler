@@ -39,6 +39,15 @@ fn plain(s: mut Synth, left: mut [f32], right: mut [f32]) {
     var label = f"phase {s.phase}" //~ E0600
 }
 
+fn clone_generic<T: Clone>(x: T) {
+    let _copy = x.clone() //~ E0600
+}
+
+@audio
+fn clones_through_generic(s: mut Synth, left: mut [f32], right: mut [f32]) {
+    clone_generic(s.names)
+}
+
 pub fn init() -> u32 {
     let gain = 0.5
     play(Synth { phase: 0.0, names: Vec::new() }, plain)

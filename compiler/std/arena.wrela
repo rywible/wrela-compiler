@@ -168,7 +168,7 @@ impl<T> Arena<T> {
             self.slots.push(Slot { gen: 0, at: 0 })
             self.slots.len() - 1
         }
-        let gen = self.slots[index].gen + 1
+        let gen = self.slots[index].gen.wrapping_add(1)
         self.slots[index] = Slot { gen, at }
         self.owners.push(index)
         Handle { index, gen }
@@ -191,7 +191,7 @@ impl<T> Arena<T> {
         self.slots[moved].at = at
         self.owners[at] = moved
         let _ = self.owners.pop()
-        self.slots[h.index] = Slot { gen: h.gen + 1, at: self.free }
+        self.slots[h.index] = Slot { gen: h.gen.wrapping_add(1), at: self.free }
         self.free = h.index + 1
         self.values.swap_remove(at)
     }
@@ -426,8 +426,8 @@ fn saved_arenas_validate_their_indexes() {
     Vec::from([1]).serialize(mut w)
     w.write_str("free")
     0.serialize(mut w)
-    let loaded: Result<Arena<u32>, LoadError> = load(take w.into_bytes())
-    match loaded {
+    var loaded: Result<Arena<u32>, LoadError> = load(take w.into_bytes())
+    match take loaded {
         Ok(_) => panic("an arena with a dangling owner was loaded"),
         Err(_) => {},
     }
@@ -441,6 +441,31 @@ fn saved_arenas_validate_their_indexes() {
     match loaded_handle {
         Ok(_) => panic("a handle with a free generation was loaded"),
         Err(_) => {},
+    }
+}
+
+@test
+fn a_loaded_max_generation_can_be_removed_and_reused() {
+    var w = Writer::new()
+    w.write_str("values")
+    Vec::from([7]).serialize(mut w)
+    w.write_str("slots")
+    Vec::from([Slot { gen: 4294967295, at: 0 }]).serialize(mut w)
+    w.write_str("owners")
+    Vec::from([0]).serialize(mut w)
+    w.write_str("free")
+    0.serialize(mut w)
+
+    let loaded: Result<Arena<u32>, LoadError> = load(take w.into_bytes())
+    match loaded {
+        Ok(a) => {
+            var arena = a.clone()
+            let old = Handle { index: 0, gen: 4294967295 }
+            assert(arena.remove(old) == 7)
+            let fresh = arena.insert(9)
+            assert(arena.contains(fresh) && arena[fresh] == 9 && !arena.contains(old))
+        },
+        Err(e) => panic(e.what),
     }
 }
 

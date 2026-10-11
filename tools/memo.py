@@ -749,9 +749,15 @@ class Store:
                 t = json.load(f)
         except (OSError, ValueError):
             return None
-        if "alone" in t and time.time() - t.get("alone_when", 0) < KEEP_DAYS * 86400:
-            return t["alone"]
-        return t.get("shared")
+        if not isinstance(t, dict):
+            return None
+        valid = lambda n: isinstance(n, (int, float)) and not isinstance(n, bool) \
+            and 0 <= n < float("inf")
+        alone, alone_when = t.get("alone"), t.get("alone_when")
+        if valid(alone) and valid(alone_when) and time.time() - alone_when < KEEP_DAYS * 86400:
+            return alone
+        shared = t.get("shared")
+        return shared if valid(shared) else None
 
     def set_timing(self, test, seconds, alone):
         """Records a test's cost: the CPU time it took `alone`, or the time it took beside the
@@ -763,6 +769,8 @@ class Store:
             with open(path, encoding="utf-8") as f:
                 t = json.load(f)
         except (OSError, ValueError):
+            t = {}
+        if not isinstance(t, dict):
             t = {}
         if alone:
             t.update(alone=round(seconds, 2), alone_when=round(time.time()))
@@ -790,12 +798,18 @@ class Store:
                     entry = json.load(f)
             except (OSError, ValueError):
                 continue
-            if entry.get("test") != test:
+            if not isinstance(entry, dict) or entry.get("test") != test:
                 continue
-            if any(env(k) != v for k, v in entry["env"].items()):
+            saved_env, inputs = entry.get("env"), entry.get("inputs")
+            if not isinstance(saved_env, dict) or not isinstance(inputs, dict):
                 continue
-            if all(inputs_of(name, state) for name, state in entry["inputs"].items()) and \
-                    (also is None or also(entry)):
+            try:
+                matches = not any(env(k) != v for k, v in saved_env.items()) \
+                    and all(inputs_of(name, state) for name, state in inputs.items()) \
+                    and (also is None or also(entry))
+            except (KeyError, AttributeError, TypeError, ValueError):
+                continue
+            if matches:
                 try:
                     os.utime(os.path.join(d, n))
                 except OSError:
@@ -1397,7 +1411,12 @@ def run_tests(logs, native_cache, mode, dir, args, parent):
               f"{', '.join(sorted(by_builds))}")
     print(f"  {ran} tests passed")
     memo.store.prune()
-    return 1 if failed or ran + len(remembered) == 0 else 0
+    return tests_status(failed, ran, remembered, by_builds)
+
+
+def tests_status(failed, ran, remembered, by_builds):
+    """The gate's status after tests ran or were accepted from either kind of memory."""
+    return 1 if failed or ran + len(remembered) + len(by_builds) == 0 else 0
 
 
 def meaning():

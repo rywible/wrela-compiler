@@ -150,11 +150,12 @@ fn owned(out: &Path) -> std::io::Result<Vec<String>> {
 /// Nothing else in `out` is touched.
 fn remove_stale(out: &Path, owned: &[String], files: &[(String, Vec<u8>)]) -> std::io::Result<()> {
     let current: HashSet<&str> = files.iter().map(|(f, _)| f.as_str()).collect();
-    for name in owned {
+    let stale: Vec<&String> =
+        owned.iter().filter(|name| !current.contains(name.as_str())).collect();
+    wrela_driver::ensure_no_symlinks(out, stale.iter().map(|name| name.as_str()))?;
+    for name in stale {
         let path = out.join(name);
-        if !current.contains(name.as_str())
-            && std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_file())
-        {
+        if std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_file()) {
             std::fs::remove_file(path)?;
         }
     }
@@ -219,5 +220,27 @@ mod tests {
         assert!(refused.to_string().contains("game.wasm"), "{refused}");
         assert_eq!(std::fs::read_to_string(dir.join("victim")).unwrap(), "keep");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_files_arent_removed_through_a_linked_parent() {
+        use std::os::unix::fs::symlink;
+
+        let dir = std::env::temp_dir().join(format!("wrela-cli-stale-link-{}", std::process::id()));
+        let outside =
+            std::env::temp_dir().join(format!("wrela-cli-stale-out-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::create_dir_all(dir.join("files")).expect("output");
+        std::fs::create_dir_all(&outside).expect("outside");
+        std::fs::write(outside.join("small.bin"), "keep").expect("victim");
+        symlink(&outside, dir.join("files/data")).expect("symlink");
+        let owned = vec!["files/data/small.bin".to_string()];
+        let refused = remove_stale(&dir, &owned, &[]).expect_err("a symbolic-link parent");
+        assert!(refused.to_string().contains("files/data"), "{refused}");
+        assert_eq!(std::fs::read_to_string(outside.join("small.bin")).unwrap(), "keep");
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(outside);
     }
 }

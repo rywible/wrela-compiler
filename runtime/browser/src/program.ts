@@ -5,6 +5,9 @@
 // the program sees the answer from its next call on (language.md §6.15).
 
 import {
+  AUDIO_CHANNELS,
+  AUDIO_OUT,
+  AUDIO_QUANTUM,
   EXPORT_AUDIO,
   EXPORT_FRAME,
   EXPORT_INIT,
@@ -19,6 +22,7 @@ import {
   TASK_SLOTS,
   TASK_SLOTS_END,
   MAX_WORKERS,
+  MAX_TICK_RECORDS,
   PAR_HELPED,
   PAR_HELPERS,
   PAR_SHUTDOWN,
@@ -49,6 +53,7 @@ import {
   IMPORT_TICK,
   PANIC,
   TICK_WANT_HASH,
+  TICK_RECORDS,
   PANIC_CAP,
   REQUEST_FAILED,
   REQUEST_PENDING,
@@ -56,7 +61,7 @@ import {
 import { type Checker, CommandError } from "./check.ts";
 import { errorMessage } from "./errors.ts";
 import { StateHash } from "./hash.ts";
-import { clockImport, phaseImport, printed, refusingImports } from "./imports.ts";
+import { CALLED_WHILE_STARTING, clockImport, phaseImport, printed, refusingImports } from "./imports.ts";
 import { Lines, LINES_SECTION, wasmOffsets } from "./lines.ts";
 import { type Bytes, type Command, decode, type OpcodeName, Sequencer } from "./stream.ts";
 import type { TickerOptions, VoiceOptions } from "./messages.ts";
@@ -243,7 +248,16 @@ export function otherInstance(
   who: string,
   onPrint: PrintSink = () => {},
 ): Promise<WebAssembly.Instance> {
-  return WebAssembly.instantiate(module, refusingImports(memory, who, TrapError, onPrint));
+  let started = false;
+  let startFailure: Error | null = null;
+  return WebAssembly.instantiate(
+    module,
+    refusingImports(memory, who, TrapError, onPrint, () => started, (error) => (startFailure = error)),
+  ).then((instance) => {
+    if (startFailure !== null) throw startFailure;
+    started = true;
+    return instance;
+  });
 }
 
 /** On a helper thread, number `thread`: instantiates the program with the shared memory and
@@ -334,6 +348,8 @@ export class Program {
   #frame: FrameFn | null = null;
   #instance: WebAssembly.Instance | null = null;
   #module: WebAssembly.Module | null = null;
+  /** Initialization has finished: thread callbacks stay local until `init` succeeds. */
+  #ready = false;
   /** The voice the program started: its task and context. */
   #voice: { task: number; context: number } | null = null;
   readonly #startVoice: ((voice: VoiceOptions, onPrint: PrintSink) => void) | null;
@@ -402,6 +418,8 @@ export class Program {
       throw new ProgramError(`can't make its memory: ${errorMessage(e)}`);
     }
     const program = new Program(checker, executor, options);
+    const clock = clockImport(memory);
+    const phase = phaseImport(memory);
     try {
       program.#lines = Lines.of(module);
     } catch (e) {
@@ -414,19 +432,29 @@ export class Program {
         [IMPORT_REQUEST_STATUS]: (request: number) => program.#requestStatus(request >>> 0),
         [IMPORT_REQUEST_TAKE]: (request: number, ptr: number) => program.#requestTake(request >>> 0, ptr >>> 0),
         // One of the device's limits, a u32's bits; 0 past the last.
-        [IMPORT_LIMIT]: (index: number) => (checker.limits[index >>> 0] ?? 0) | 0,
+        [IMPORT_LIMIT]: (index: number) => {
+          program.#starting();
+          return (checker.limits[index >>> 0] ?? 0) | 0;
+        },
         [IMPORT_AUDIO]: (task: number, context: number) => program.#audioImport(task >>> 0, context >>> 0),
         [IMPORT_INPUT]: (ptr: number, cap: number) => program.#inputImport(ptr >>> 0, cap >>> 0),
         [IMPORT_TICK]: (task: number, context: number, hz: number) => program.#tickImport(task >>> 0, context >>> 0, hz >>> 0),
         [IMPORT_KEEP]: (ptr: number, len: number) => program.#keepImport(ptr >>> 0, len >>> 0),
         [IMPORT_KEPT]: (ptr: number, cap: number) => program.#keptImport(ptr >>> 0, cap >>> 0),
-        [IMPORT_CLOCK]: clockImport(memory),
+        [IMPORT_CLOCK]: (ptr: number) => {
+          program.#starting();
+          clock(ptr);
+        },
         // `std::io::print`: a line for whoever runs the program, shown as it's made.
         [IMPORT_PRINT]: (ptr: number, len: number) => {
+          program.#starting();
           const line = printed(memory, ptr, len);
           program.#printed(line);
         },
-        [IMPORT_PHASE]: phaseImport(memory),
+        [IMPORT_PHASE]: (ptr: number, len: number) => {
+          program.#starting();
+          phase(ptr, len);
+        },
       },
     };
     // As the native host words it: a module that can't be instantiated isn't a valid program.
@@ -434,27 +462,44 @@ export class Program {
     try {
       instance = await WebAssembly.instantiate(module, imports);
     } catch (e) {
-      throw new ProgramError(errorMessage(e));
+      const failure = program.#failure;
+      program.#failure = null;
+      throw failure ?? new ProgramError(errorMessage(e));
+    }
+    const startFailure = program.#failure;
+    program.#failure = null;
+    if (startFailure !== null) throw startFailure;
+    if (instance.exports[EXPORT_MEMORY] !== memory) {
+      throw new ProgramError(`its \`${EXPORT_MEMORY}\` export isn't its imported shared memory`);
     }
     program.#instance = instance;
     program.#module = module;
     program.#memory = memory;
     program.#reserved = (compiled.memory.maximum ?? compiled.memory.initial) * 65536;
     program.#frame = instance.exports[EXPORT_FRAME] as FrameFn;
-    // The helpers: each its own instance of the module on its own thread, with the memory.
-    if (EXPORT_WORKER in instance.exports) {
-      const spawn = options.spawnWorker;
-      const helpers = spawn ? Math.min(Math.max(options.workers ?? 1, 1), MAX_WORKERS + 1) - 1 : 0;
-      for (let i = 0; i < helpers; i++) {
-        spawn!(module, memory, THREAD_HELPER0 + i, (line) => program.#printed(line));
+    try {
+      // The helpers: each its own instance of the module on its own thread, with the memory.
+      if (EXPORT_WORKER in instance.exports) {
+        const spawn = options.spawnWorker;
+        const helpers = spawn ? Math.min(Math.max(options.workers ?? 1, 1), MAX_WORKERS + 1) - 1 : 0;
+        for (let i = 0; i < helpers; i++) {
+          spawn!(module, memory, THREAD_HELPER0 + i, (line) => program.#printed(line));
+        }
+        // How many helpers there are: with none, std runs a task when asked if it's done.
+        new DataView(memory.buffer).setUint32(PAR_HELPERS, helpers, true);
       }
-      // How many helpers there are: with none, std runs a task when asked if it's done.
-      new DataView(memory.buffer).setUint32(PAR_HELPERS, helpers, true);
+      if (options.tickHashes) new DataView(memory.buffer).setUint32(TICK_WANT_HASH, 1, true);
+      // A program with state makes it once, before anything else runs (language.md §12).
+      const init = instance.exports[EXPORT_INIT];
+      if (typeof init === "function") program.#call(() => (init as () => void)());
+      program.#ready = true;
+      program.#startThreads();
+    } catch (e) {
+      // Helpers may already be waiting in `__worker`; no thread started by a rejected program
+      // may outlive it. Voice and ticker callbacks haven't escaped yet.
+      program.shutdown();
+      throw e;
     }
-    if (options.tickHashes) new DataView(memory.buffer).setUint32(TICK_WANT_HASH, 1, true);
-    // A program with state makes it once, before anything else runs (language.md §12).
-    const init = instance.exports[EXPORT_INIT];
-    if (typeof init === "function") program.#call(() => (init as () => void)());
     return program;
   }
 
@@ -536,6 +581,7 @@ export class Program {
   /** `wrela.request_status(request)`: -1 while it's pending, -2 if it failed, else its
    * answer's length in bytes. */
   #requestStatus(request: number): number {
+    this.#starting();
     const a = this.#requests.answered.get(request);
     if (a === undefined) return REQUEST_PENDING;
     return "error" in a ? REQUEST_FAILED : a.bytes.length;
@@ -640,6 +686,10 @@ export class Program {
    * more (a hot reload replaces it). */
   shutdown(): void {
     if (!this.#memory) return;
+    // A valid ABI can import an empty memory. There cannot be a helper waiting in memory that
+    // does not contain the helper controls, and cleanup must not mask the error that rejected
+    // such a program's initialization.
+    if (this.#memory.buffer.byteLength <= PAR_WAKE) return;
     const words = new Int32Array(this.#memory.buffer);
     Atomics.store(words, PAR_SHUTDOWN / 4, 1);
     Atomics.add(words, PAR_WAKE / 4, 1);
@@ -649,13 +699,15 @@ export class Program {
   /** `wrela.audio(task, context)`: starts the program's voice, once. */
   #audioImport(task: number, context: number): void {
     this.#starting();
-    if (this.#voice !== null) throw new TrapError("a program starts one voice, and this one started a second");
-    if (!(EXPORT_AUDIO in this.#instance!.exports)) throw new TrapError(`it starts a voice but doesn't export \`${EXPORT_AUDIO}\``);
+    if (this.#voice !== null) this.#failTrap("a program starts one voice, and this one started a second");
+    if (!(EXPORT_AUDIO in this.#instance!.exports)) this.#failTrap(`it starts a voice but doesn't export \`${EXPORT_AUDIO}\``);
+    const need = AUDIO_OUT + AUDIO_CHANNELS * AUDIO_QUANTUM * 4;
+    const got = this.#memory!.buffer.byteLength;
+    if (got < need) {
+      this.#failTrap(`it starts a voice but its memory is ${got} bytes; the audio thread needs at least ${need}`);
+    }
     this.#voice = { task, context };
-    this.#startVoice?.(
-      { module: this.#module!, memory: this.#memory!, task, context },
-      (line) => this.#printed(line),
-    );
+    if (this.#ready) this.#startVoiceNow();
   }
 
   /** Whether the program has started its voice. */
@@ -666,13 +718,47 @@ export class Program {
   /** `wrela.tick(task, context, hz)`: starts the program's ticker, once: a second is its panic. */
   #tickImport(task: number, context: number, hz: number): void {
     this.#starting();
-    if (this.#ticker !== null) throw new TrapError("panic: a program starts one ticker, and this one started a second");
-    if (!(EXPORT_TICK in this.#instance!.exports)) throw new TrapError(`it starts a ticker but doesn't export \`${EXPORT_TICK}\``);
+    if (this.#ticker !== null) this.#failTrap("panic: a program starts one ticker, and this one started a second");
+    if (!(EXPORT_TICK in this.#instance!.exports)) this.#failTrap(`it starts a ticker but doesn't export \`${EXPORT_TICK}\``);
+    if (hz === 0) this.#failTrap("it starts a ticker at 0 Hz; a ticker ticks at least once a second");
+    const need = TICK_RECORDS + 4 + MAX_TICK_RECORDS * EVENT_SIZE;
+    const got = this.#memory!.buffer.byteLength;
+    if (got < need) {
+      this.#failTrap(`it starts a ticker but its memory is ${got} bytes; the ticker needs at least ${need}`);
+    }
     this.#ticker = { task, context, hz };
-    this.#startTicker?.(
-      { module: this.#module!, memory: this.#memory!, task, context, hz },
+    if (this.#ready) this.#startTickerNow();
+  }
+
+  /** Initialization committed: starts the other threads it requested, now that it can't be
+   * rejected with their side effects already outside the program. */
+  #startThreads(): void {
+    if (this.#voice !== null) this.#startVoiceNow();
+    if (this.#ticker !== null) this.#startTickerNow();
+  }
+
+  #startVoiceNow(): void {
+    const voice = this.#voice!;
+    this.#startVoice?.(
+      { module: this.#module!, memory: this.#memory!, ...voice },
       (line) => this.#printed(line),
     );
+  }
+
+  #startTickerNow(): void {
+    const ticker = this.#ticker!;
+    this.#startTicker?.(
+      { module: this.#module!, memory: this.#memory!, ...ticker },
+      (line) => this.#printed(line),
+    );
+  }
+
+  /** Records a typed host failure before throwing it into Wasm, so `catch_all` can't make the
+   * call appear to have succeeded (the native host's `fail`). */
+  #failTrap(why: string): never {
+    const failure = new TrapError(why);
+    this.#failure = failure;
+    throw failure;
   }
 
   /** A line printed on this program's thread, or relayed from one of its other threads. */
@@ -689,7 +775,9 @@ export class Program {
    * compiler's copies the constants into the memory, wrela_abi memory's `DATA_READY`). */
   #starting(): void {
     if (this.#instance === null) {
-      throw new Error("its start function called the host; a wrela program calls the host only from an export");
+      const failure = new ProgramError(CALLED_WHILE_STARTING);
+      this.#failure = failure;
+      throw failure;
     }
   }
 
@@ -750,7 +838,10 @@ export function trapMessage(e: unknown, memory: WebAssembly.Memory | null, threa
 /** What trapped, and where in the source if the program says (`lines`) and the engine's stack
  * trace gives offsets: the location of the innermost frame that has one. */
 function describeTrap(e: unknown, lines: Lines | null): string {
-  const what = errorMessage(e);
+  // A host import's TrapError crosses the Wasm boundary unchanged. Its prefix is this class's
+  // presentation, not part of the trap reason that the outer TrapError presents again.
+  const prefix = "the program trapped: ";
+  const what = e instanceof TrapError && e.message.startsWith(prefix) ? e.message.slice(prefix.length) : errorMessage(e);
   const stack = e instanceof Error ? (e.stack ?? "") : "";
   const at = wasmOffsets(stack)
     .map((offset) => lines?.at(offset) ?? null)

@@ -90,7 +90,7 @@ export class TickerControl {
   }
 
   get frames(): number {
-    return Atomics.load(this.#words, FRAMES);
+    return Atomics.load(this.#words, FRAMES) >>> 0;
   }
 
   /** Lockstep: run ticks until `target` have run. */
@@ -99,7 +99,7 @@ export class TickerControl {
   }
 
   get target(): number {
-    return Atomics.load(this.#words, TARGET);
+    return Atomics.load(this.#words, TARGET) >>> 0;
   }
 
   /** Stops the ticks; in test mode the ticker's thread then reports them. */
@@ -141,10 +141,11 @@ export class TickerControl {
   /** On the render worker, without blocking it: resolves when `n` ticks have run, or a tick
    * trapped. */
   async ranTo(n: number): Promise<void> {
+    n >>>= 0;
     for (;;) {
-      const done = Atomics.load(this.#words, DONE);
+      const done = Atomics.load(this.#words, DONE) >>> 0;
       if (done >= n || this.failed) return;
-      const { async, value } = Atomics.waitAsync(this.#words, DONE, done);
+      const { async, value } = Atomics.waitAsync(this.#words, DONE, done | 0);
       if (async) await value;
     }
   }

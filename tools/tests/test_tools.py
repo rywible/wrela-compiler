@@ -33,6 +33,15 @@ import serve  # noqa: E402
 
 
 def alive(pid):
+    # A killed grandchild can remain as a zombie when a container's PID 1 does not reap it.
+    # It has exited and holds no resources, so it did not outlive the run in the sense checked
+    # here. Normal hosts reap it before this distinction matters.
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            if f.read().split()[2] == "Z":
+                return False
+    except (FileNotFoundError, IndexError, OSError):
+        pass
     try:
         os.kill(pid, 0)
         return True
@@ -490,6 +499,40 @@ class ServeTest(PageDir, unittest.TestCase):
             self.assertEqual(r.headers["Cross-Origin-Opener-Policy"], "same-origin")
             self.assertEqual(r.headers["Cross-Origin-Embedder-Policy"], "require-corp")
             self.assertEqual(r.headers["Content-Type"], "application/wasm")
+
+    def test_gzip_respects_accept_encoding_quality(self):
+        path = os.path.join(self.page_dir, "app.js")
+        with open(path, "w") as f:
+            f.write("const payload = '" + "a" * 1000 + "';")
+        url = f"{self.base}/{self.page}/app.js"
+        cases = [
+            ("gzip;q=0", None),
+            ("xgzip", None),
+            ("*;q=0", None),
+            ("gzip;q=0, *", None),
+            ("GZIP", "gzip"),
+            ("br, gzip;q=0.5", "gzip"),
+            ("br, *;q=0.5", "gzip"),
+        ]
+        for accepted, expected in cases:
+            req = urllib.request.Request(url, headers={"Accept-Encoding": accepted})
+            with urllib.request.urlopen(req) as response:
+                self.assertEqual(response.headers.get("Content-Encoding"), expected, accepted)
+
+    def test_gzipped_head_has_gets_representation_headers_and_no_body(self):
+        path = os.path.join(self.page_dir, "app.js")
+        with open(path, "w") as f:
+            f.write("const payload = '" + "a" * 1000 + "';")
+        url = f"{self.base}/{self.page}/app.js"
+        headers = {"Accept-Encoding": "gzip"}
+        with urllib.request.urlopen(urllib.request.Request(url, headers=headers)) as get:
+            get_headers = (get.headers["Content-Encoding"], get.headers["Content-Length"])
+        request = urllib.request.Request(url, headers=headers, method="HEAD")
+        with urllib.request.urlopen(request) as head:
+            self.assertEqual(
+                (head.headers["Content-Encoding"], head.headers["Content-Length"]), get_headers
+            )
+            self.assertEqual(head.read(), b"")
 
 
 class ListeningTest(unittest.TestCase):

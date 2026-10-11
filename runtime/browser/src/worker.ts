@@ -18,6 +18,7 @@ import { encodePng } from "./png.ts";
 import { frameTime, holdFor, loaded, putResult, sleepUntil, type TestParams } from "./testmode.ts";
 import { lockstepTicks, runTicker, TickerControl, TickerMode } from "./ticker.ts";
 import { wasmHash } from "./ticks.ts";
+import { failAudioRender } from "./worker-audio.ts";
 
 declare const self: DedicatedWorkerGlobalScope;
 
@@ -709,6 +710,9 @@ const spawnWorker: SpawnWorker = (module, memory, index, onPrint) => {
 
 /** Test mode: resolved when the main thread has rendered the voice and saved its samples. */
 const audioRendered = Promise.withResolvers<void>();
+// Its failure can arrive before saveResults waits for it. Keep it handled from creation while
+// preserving the rejection for that later await.
+void audioRendered.promise.catch(() => {});
 
 /** Test mode, `latency`: resolved when the main thread has sent its events. */
 const latencySent = Promise.withResolvers<void>();
@@ -733,6 +737,9 @@ self.onmessage = (event: MessageEvent<ToWorker>) => {
     }
     case "audio-rendered":
       audioRendered.resolve();
+      return;
+    case "audio-failed":
+      fatal(failAudioRender(audioRendered, msg.message));
       return;
     case "print":
       voicePrint(msg.line);

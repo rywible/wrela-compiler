@@ -27,6 +27,9 @@ export interface ModuleSpec {
    * unshared), and exported as `memory` unless `exportMemory` is false. */
   memory?: number;
   ownMemory?: boolean;
+  /** Additionally defines a memory and exports it instead of the imported one (a malformed
+   * program ABI used to check that the `memory` export is the import itself). */
+  exportOwnMemory?: boolean;
   exportMemory?: boolean;
   data?: { offset: number; bytes: Uint8Array }[];
   /** The start function's index (imports first). */
@@ -91,7 +94,9 @@ export function buildModule(spec: ModuleSpec): Uint8Array<ArrayBuffer> {
   const funcEntries = funcs.map((f) => uleb(typeIndex(f.type)));
   const importedFuncs = imports.filter((i) => i.kind === "func").length;
   const exports: number[][] = [];
-  if (spec.memory !== undefined && spec.exportMemory !== false) exports.push([...name("memory"), 0x02, 0x00]);
+  if (spec.memory !== undefined && spec.exportMemory !== false) {
+    exports.push([...name("memory"), 0x02, spec.exportOwnMemory ? 0x01 : 0x00]);
+  }
   funcs.forEach((f, i) => {
     if (f.export) exports.push([...name(f.export), 0x00, ...uleb(importedFuncs + i)]);
   });
@@ -109,7 +114,12 @@ export function buildModule(spec: ModuleSpec): Uint8Array<ArrayBuffer> {
     ...section(1, typeEntries.length ? vec(typeEntries) : []),
     ...section(2, importEntries.length ? vec(importEntries) : []),
     ...section(3, funcEntries.length ? vec(funcEntries) : []),
-    ...section(5, spec.memory !== undefined && spec.ownMemory ? vec([[0x00, ...uleb(spec.memory)]]) : []),
+    ...section(
+      5,
+      spec.memory !== undefined && (spec.ownMemory || spec.exportOwnMemory)
+        ? vec([[0x00, ...uleb(spec.memory)]])
+        : [],
+    ),
     ...section(7, exports.length ? vec(exports) : []),
     ...section(8, spec.start !== undefined ? uleb(spec.start) : []),
     ...section(10, code.length ? vec(code) : []),

@@ -150,6 +150,7 @@ test("audio print messages are relayed to the render worker and traps still fail
         voicePort = this.port;
       }
       connect() {}
+      disconnect() {}
     },
   );
   const page = await load("https://example.com/game/");
@@ -161,6 +162,7 @@ test("audio print messages are relayed to the render worker and traps still fail
 
   voicePort!.onmessage!(new MessageEvent("message", { data: { type: "trap", message: "boom" } satisfies FromVoice }));
   expect(page.shown).toEqual(["wrela stopped: the voice trapped: boom"]);
+  expect(page.posted.at(-1)).toEqual({ type: "audio-failed", message: "boom" });
 });
 
 test("offline audio waits for the worklet's print marker before reporting it rendered", async () => {
@@ -185,10 +187,77 @@ test("offline audio waits for the worklet's print marker before reporting it ren
         voicePort = this.port;
       }
       connect() {}
+      disconnect() {}
     },
   );
   const page = await load("http://127.0.0.1/game/#test&audio=1");
   page.worker!.onmessage!(new MessageEvent("message", { data: { type: "audio", voice: {} as VoiceOptions } satisfies FromWorker }));
   await Bun.sleep(5);
   expect(page.posted.slice(-2)).toEqual([{ type: "print", line: "offline voice" }, { type: "audio-rendered" }]);
+});
+
+test("an offline audio trap fails the render worker without waiting for a rendered marker", async () => {
+  let voicePort: { onmessage: ((event: MessageEvent<FromVoice>) => void) | null } | null = null;
+  fake(
+    "OfflineAudioContext",
+    class {
+      readonly audioWorklet = { addModule: async () => {} };
+      readonly destination = {};
+      async startRendering() {
+        voicePort!.onmessage!(new MessageEvent("message", { data: { type: "trap", message: "offline boom" } satisfies FromVoice }));
+        return { getChannelData: () => new Float32Array(128) };
+      }
+    },
+  );
+  fake(
+    "AudioWorkletNode",
+    class {
+      readonly port = { onmessage: null as ((event: MessageEvent<FromVoice>) => void) | null };
+      constructor() {
+        voicePort = this.port;
+      }
+      connect() {}
+      disconnect() {}
+    },
+  );
+  const page = await load("http://127.0.0.1/game/#test&audio=1");
+  page.worker!.onmessage!(new MessageEvent("message", { data: { type: "audio", voice: {} as VoiceOptions } satisfies FromWorker }));
+  await Bun.sleep(5);
+  expect(page.shown).toEqual(["wrela stopped: the voice trapped: offline boom"]);
+  expect(page.posted.at(-1)).toEqual({ type: "audio-failed", message: "offline boom" });
+  expect(page.posted.some((message) => message.type === "audio-rendered")).toBe(false);
+});
+
+test("an audio processor construction error fails an offline render instead of leaving it pending", async () => {
+  let processorError: ((event: Event) => void) | null = null;
+  fake(
+    "OfflineAudioContext",
+    class {
+      readonly audioWorklet = { addModule: async () => {} };
+      readonly destination = {};
+      async startRendering() {
+        processorError!(new Event("processorerror"));
+        return { getChannelData: () => new Float32Array(128) };
+      }
+    },
+  );
+  fake(
+    "AudioWorkletNode",
+    class {
+      readonly port = { onmessage: null as ((event: MessageEvent<FromVoice>) => void) | null };
+      onprocessorerror: ((event: Event) => void) | null = null;
+      constructor() {
+        processorError = (event) => this.onprocessorerror?.(event);
+      }
+      connect() {}
+      disconnect() {}
+    },
+  );
+  const page = await load("http://127.0.0.1/game/#test&audio=1");
+  page.worker!.onmessage!(new MessageEvent("message", { data: { type: "audio", voice: {} as VoiceOptions } satisfies FromWorker }));
+  await Bun.sleep(5);
+  const message = "the audio processor failed during initialization or rendering";
+  expect(page.shown).toEqual([`wrela stopped: the voice trapped: ${message}`]);
+  expect(page.posted.at(-1)).toEqual({ type: "audio-failed", message });
+  expect(page.posted.some((posted) => posted.type === "audio-rendered")).toBe(false);
 });

@@ -187,6 +187,14 @@ class Store(Files):
         self.assertIsNone(find(now={"repo:x": "file:2"}))  # a file it read
         self.assertIsNone(store.find("p:suite:test:a::c", "rust1", lambda k: None, lambda n, s: True))
 
+    def test_a_wrong_schema_entry_is_a_cache_miss(self):
+        store = memo.Store(self.root)
+        directory = store.entries_dir("t", "rust")
+        os.makedirs(directory)
+        with open(os.path.join(directory, "bad.json"), "w") as f:
+            json.dump({"test": "t"}, f)
+        self.assertIsNone(store.find("t", "rust", lambda k: None, lambda n, s: True))
+
     def test_a_time_beside_the_other_tests_counts_only_until_the_test_runs_alone(self):
         store = memo.Store(self.root)
         self.assertIsNone(store.timing("t"))
@@ -203,6 +211,16 @@ class Store(Files):
         with open(path, "w") as f:
             memo.json.dump(t, f)
         self.assertEqual(store.timing("t"), 300.0)
+
+    def test_a_wrong_schema_timing_is_a_cache_miss(self):
+        store = memo.Store(self.root)
+        path = os.path.join(store.dir, "timings", memo.sha("t")[:24] + ".json")
+        os.makedirs(os.path.dirname(path))
+        with open(path, "w") as f:
+            json.dump([], f)
+        self.assertIsNone(store.timing("t"))
+        store.set_timing("t", 2.0, alone=False)
+        self.assertEqual(store.timing("t"), 2.0)
 
     def test_old_entries_are_pruned(self):
         store = memo.Store(self.root)
@@ -504,6 +522,11 @@ FILES_HASH = "8410ef328ec8af3db236a70a705c1c9c7746bdc9695323b3e5bb56ef647fdf28"
 
 
 class Ending(unittest.TestCase):
+    def test_a_test_remembered_by_its_rebuilt_outputs_is_a_pass(self):
+        self.assertEqual(memo.tests_status(False, 0, [], ["rebuilt"]), 0)
+        self.assertEqual(memo.tests_status(False, 0, [], []), 1)
+        self.assertEqual(memo.tests_status(True, 1, [], []), 1)
+
     def test_stopping_kills_every_process_under_the_runner_and_the_ones_that_escaped(self):
         # A process orphaned under the runner (as a test is when strace, its parent, dies first)
         # comes back to it as its subreaper.

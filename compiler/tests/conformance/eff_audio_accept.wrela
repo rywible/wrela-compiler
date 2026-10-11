@@ -10,8 +10,13 @@ struct Tone {
     pitches: RingReader<f32>,
 }
 
+fn clone_copy<T: Copy>(x: T) -> T {
+    x.clone()
+}
+
 @audio
 fn tone(t: mut Tone, left: mut [f32], right: mut [f32]) {
+    t.phase = clone_copy(t.phase)
     if let Some(p) = t.pitches.pop() {
         t.pitch = p
     }

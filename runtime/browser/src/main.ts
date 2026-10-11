@@ -59,6 +59,7 @@ const audio: { context: Promise<AudioContext> | null; node: AudioWorkletNode | n
 function stopVoice(): void {
   if (!audio.node) return;
   audio.node.port.onmessage = null;
+  audio.node.onprocessorerror = null;
   audio.node.disconnect();
   audio.node = null;
 }
@@ -68,36 +69,60 @@ function stopVoice(): void {
  * instead, saves the samples to `results/audio.f32`, and tells the worker. */
 async function playVoice(voice: VoiceOptions, test: TestParams | null, worker: Worker): Promise<void> {
   const url = new URL("worklet.js", import.meta.url);
-  const node = (ctx: BaseAudioContext, quanta: number | null): { node: AudioWorkletNode; rendered: Promise<void> } => {
+  const node = (
+    ctx: BaseAudioContext,
+    quanta: number | null,
+  ): { node: AudioWorkletNode; rendered: Promise<void>; failed: Promise<Error> } => {
     const rendered = quanta === null ? null : Promise.withResolvers<void>();
+    const failed = Promise.withResolvers<Error>();
     const n = new AudioWorkletNode(ctx, VOICE_PROCESSOR, {
       numberOfInputs: 0,
       numberOfOutputs: 1,
       outputChannelCount: [AUDIO_CHANNELS],
       processorOptions: { ...voice, quanta },
     });
+    let stopped = false;
+    const fail = (message: string): void => {
+      if (stopped) return;
+      stopped = true;
+      const why = new Error(`the voice trapped: ${message}`);
+      n.port.onmessage = null;
+      n.onprocessorerror = null;
+      n.disconnect();
+      if (audio.node === n) audio.node = null;
+      showFatal(why.message);
+      worker.postMessage({ type: "audio-failed", message } satisfies ToWorker);
+      failed.resolve(why);
+    };
+    n.onprocessorerror = () => fail("the audio processor failed during initialization or rendering");
     n.port.onmessage = (e: MessageEvent<FromVoice>) => {
       const msg = e.data;
       if (msg.type === "print") {
         worker.postMessage(msg satisfies ToWorker);
       } else if (msg.type === "trap") {
-        const why = new Error(`the voice trapped: ${msg.message}`);
-        failEarly(why, test !== null);
+        fail(msg.message);
       } else {
         rendered?.resolve();
       }
     };
     n.connect(ctx.destination);
-    return { node: n, rendered: rendered?.promise ?? Promise.resolve() };
+    return { node: n, rendered: rendered?.promise ?? Promise.resolve(), failed: failed.promise };
   };
   if (test && test.live > 0) {
     // Real time: the voice plays for `live` seconds, then the browser's playback statistics
     // (Chrome's `AudioContext.playbackStats`, where it has them) say whether it kept up.
     const ctx = new AudioContext({ sampleRate: AUDIO_SAMPLE_RATE, latencyHint: "interactive" });
     await ctx.audioWorklet.addModule(url);
-    node(ctx, null);
+    const playing = node(ctx, null);
     await ctx.resume();
-    await new Promise((resolve) => setTimeout(resolve, test.live * 1000));
+    const failure = await Promise.race([
+      new Promise<null>((resolve) => setTimeout(() => resolve(null), test.live * 1000)),
+      playing.failed,
+    ]);
+    if (failure !== null) {
+      await ctx.close();
+      return;
+    }
     const stats = (ctx as unknown as { playbackStats?: Record<string, unknown> }).playbackStats;
     const reported = stats ? Object.fromEntries(Object.keys(Object.getPrototypeOf(stats)).concat(Object.keys(stats)).map((k) => [k, (stats as Record<string, unknown>)[k]]).filter(([, v]) => typeof v === "number")) : null;
     await putResult(document.baseURI, "live.json", JSON.stringify({ seconds: test.live, played: ctx.currentTime, state: ctx.state, baseLatency: ctx.baseLatency, outputLatency: ctx.outputLatency, playbackStats: reported }));
@@ -109,13 +134,15 @@ async function playVoice(voice: VoiceOptions, test: TestParams | null, worker: W
     if (test.audio === 0) return;
     const ctx = new OfflineAudioContext({ numberOfChannels: AUDIO_CHANNELS, length: test.audio * AUDIO_QUANTUM, sampleRate: AUDIO_SAMPLE_RATE });
     await ctx.audioWorklet.addModule(url);
-    const done = node(ctx, test.audio).rendered;
+    const playing = node(ctx, test.audio);
+    const done = Promise.race([playing.rendered.then(() => null), playing.failed]);
     const started = performance.now();
     const rendered = await ctx.startRendering();
     const ms = performance.now() - started;
     // The worklet's marker follows every print on its port, so all its lines reach the render
     // worker before `audio-rendered` lets the test save its log.
-    await done;
+    const failure = await done;
+    if (failure !== null) return;
     // The channels interleaved, as the native host gives them.
     const left = rendered.getChannelData(0);
     const right = rendered.getChannelData(1);

@@ -179,11 +179,34 @@ impl Trace {
         linker: &mut Linker<T>,
         memory: Option<&SharedMemory>,
     ) -> wasmtime::Result<()> {
+        self.link_with(linker, memory, None)
+    }
+
+    /// [`Trace::link`], checking `before` before either host call. Program instances use this
+    /// to reject a start function's calls before they can print or begin a phase.
+    pub(crate) fn link_checked<T: 'static>(
+        &self,
+        linker: &mut Linker<T>,
+        memory: Option<&SharedMemory>,
+        before: fn(&mut T) -> wasmtime::Result<()>,
+    ) -> wasmtime::Result<()> {
+        self.link_with(linker, memory, Some(before))
+    }
+
+    fn link_with<T: 'static>(
+        &self,
+        linker: &mut Linker<T>,
+        memory: Option<&SharedMemory>,
+        before: Option<fn(&mut T) -> wasmtime::Result<()>>,
+    ) -> wasmtime::Result<()> {
         let (t, m) = (self.clone(), memory.cloned());
         linker.func_wrap(
             IMPORT_MODULE,
             IMPORT_PRINT,
-            move |c: Caller<'_, T>, at: u32, len: u32| {
+            move |mut c: Caller<'_, T>, at: u32, len: u32| {
+                if let Some(before) = before {
+                    before(c.data_mut())?;
+                }
                 let line = text(c, m.as_ref(), at, len, "print")?;
                 t.print(line);
                 Ok(())
@@ -193,7 +216,10 @@ impl Trace {
         linker.func_wrap(
             IMPORT_MODULE,
             IMPORT_PHASE,
-            move |c: Caller<'_, T>, at: u32, len: u32| {
+            move |mut c: Caller<'_, T>, at: u32, len: u32| {
+                if let Some(before) = before {
+                    before(c.data_mut())?;
+                }
                 let name = text(c, m.as_ref(), at, len, "phase")?;
                 t.phase(&name);
                 Ok(())

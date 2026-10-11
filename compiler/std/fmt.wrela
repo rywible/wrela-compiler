@@ -723,7 +723,8 @@ fn shown<T: Format>(out: mut String, source: str, value: T, quoted: bool) {
 
 /// `s` as the body of a JSON string: quotes, backslashes and control characters escaped.
 pub fn json_text(out: mut String, s: str) {
-    for i in 0..s.len() {
+    var i = 0
+    while i < s.len() {
         let b = s.byte(i)
         if b == 34 || b == 92 {
             out.push_byte(92)
@@ -739,9 +740,15 @@ pub fn json_text(out: mut String, s: str) {
             out.push_str("\\u00")
             out.push_byte(hex.byte(u32(b >> 4)))
             out.push_byte(hex.byte(u32(b & 15)))
-        } else {
+        } else if b < 128 {
             out.push_byte(b)
+        } else {
+            let Some((cp, len)) = s.char_at(i) else { panic("a string is always UTF-8") }
+            out.push_char(cp)
+            i += len
+            continue
         }
+        i += 1
     }
 }
 
@@ -763,8 +770,8 @@ fn json_keeps_the_largest_float_and_escapes_control_characters() {
     json_number(mut out, bitcast_f32(0x7f800000))
     out.push_str(" ")
     var text = String::new()
-    text.push_str("tab\t")
+    text.push_str("tab\t é狼")
     text.push_byte(1)
     json_text(mut out, text.as_str())
-    assert(out == "340282350000000000000000000000000000000 null tab\\t\\u0001")
+    assert(out == "340282350000000000000000000000000000000 null tab\\t é狼\\u0001")
 }

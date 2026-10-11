@@ -857,9 +857,9 @@ impl Loader {
         // The manifest, if there is one: shown in diagnostics by its path in the package.
         let prefix = if program { String::new() } else { format!("[{}] ", name.unwrap_or("?")) };
         let manifest_path = dir.join("wrela.toml");
-        let manifest = if manifest_path.is_file() {
+        let manifest = if let Some(text) = optional_file(&manifest_path) {
             let display = format!("{prefix}wrela.toml");
-            match std::fs::read_to_string(&manifest_path) {
+            match text {
                 Ok(text) => {
                     let f = self.sources.add(display, text);
                     match manifest::parse(f, &self.sources.file(f).text.clone()) {
@@ -1022,6 +1022,27 @@ fn add_unit(
     SourceUnit { path, ast: Arc::new(parsed.file), package, syntax_errors, text }
 }
 
+/// A regular file's text, an error for anything present that cannot be read as one, or `None`
+/// only when no directory entry exists. Checking the entry before reading also keeps a pipe or
+/// device named `wrela.toml` from blocking the compiler.
+fn optional_file(path: &Path) -> Option<Result<String, std::io::Error>> {
+    let entry = match std::fs::symlink_metadata(path) {
+        Ok(entry) => entry,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => return Some(Err(e)),
+    };
+    let regular = if entry.file_type().is_symlink() {
+        std::fs::metadata(path).map(|target| target.is_file())
+    } else {
+        Ok(entry.is_file())
+    };
+    match regular {
+        Ok(true) => Some(std::fs::read_to_string(path)),
+        Ok(false) => Some(Err(std::io::Error::other("it isn't a regular file"))),
+        Err(e) => Some(Err(e)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1099,6 +1120,37 @@ mod tests {
         )
         .expect("write");
         std::fs::write(d.join("wrela.toml"), [0xff, 0xfe]).expect("write");
+
+        let out = check(&d);
+        let errors: Vec<_> = out.diagnostics.iter().filter(|d| d.is_error()).collect();
+        assert_eq!(errors.len(), 1, "{:?}", out.diagnostics);
+        assert_eq!(errors[0].code.as_str(), "E0205");
+        assert!(errors[0].message.contains("can't read `wrela.toml`"));
+
+        std::fs::remove_file(d.join("wrela.toml")).expect("remove manifest");
+        std::fs::create_dir(d.join("wrela.toml")).expect("manifest directory");
+        let out = check(&d);
+        let errors: Vec<_> = out.diagnostics.iter().filter(|d| d.is_error()).collect();
+        assert_eq!(errors.len(), 1, "{:?}", out.diagnostics);
+        assert_eq!(errors[0].code.as_str(), "E0205");
+        assert!(errors[0].message.contains("isn't a regular file"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A manifest entry whose symbolic-link target is missing is not an absent manifest.
+    #[cfg(unix)]
+    #[test]
+    fn dangling_manifest_link_is_e0205() {
+        let d =
+            std::env::temp_dir().join(format!("wrela-driver-manifest-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).expect("temp dir");
+        std::fs::write(
+            d.join("main.wrela"),
+            "pub fn frame(time: f32, width: u32, height: u32) {}\n",
+        )
+        .expect("write");
+        std::os::unix::fs::symlink("missing.toml", d.join("wrela.toml")).expect("symlink");
 
         let out = check(&d);
         let errors: Vec<_> = out.diagnostics.iter().filter(|d| d.is_error()).collect();

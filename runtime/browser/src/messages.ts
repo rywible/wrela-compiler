@@ -28,6 +28,8 @@ export type ToWorker =
   | { type: "thread"; module: WebAssembly.Module; memory: WebAssembly.Memory; index: number }
   /** Test mode: the main thread has rendered the voice and saved its samples. */
   | { type: "audio-rendered" }
+  /** The audio thread trapped: the render worker stops the program and reports the failure. */
+  | { type: "audio-failed"; message: string }
   /** A line the audio thread printed, relayed by the main thread. */
   | PrintMessage
   /** Test mode, `latency` or `keylatency`: the main thread has sent its events. */
