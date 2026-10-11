@@ -134,3 +134,10 @@ impl<T: Copy> RingReader<T> {
         }
     }
 }
+
+/// The decay per sample, as a rate (the natural log of the factor, negated), of a sound that
+/// falls 60 dB in `t60` seconds at `SAMPLE_RATE`.
+@audio
+pub fn decay_rate(t60: f32) -> f32 {
+    6.9078 / (t60 * f32(SAMPLE_RATE))
+}

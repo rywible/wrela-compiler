@@ -457,7 +457,7 @@ pub fn frame(time: f32, width: u32, height: u32) {
 #[ignore = "long: bakes the floor (minutes when the constants' cache is cold)"]
 fn the_floors_own_tests_pass() {
     let _ = floor();
-    assert_eq!(super::tests_pass(&repo_root().join("examples/last-green")), 20);
+    assert_eq!(super::tests_pass(&repo_root().join("examples/last-green")), 21);
 }
 
 /// The body of WGSL function `name` in `text` (to its closing brace at the line's start).
