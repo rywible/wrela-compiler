@@ -1424,7 +1424,18 @@ const CPU_LOOP_INLINE_SIZE: usize = 600;
 /// The most statements a CPU function grows to with what's inlined into it.
 const CPU_BUDGET: usize = 4000;
 
-/// Inlines calls on the CPU (AC12): calls to small functions, and the one call to a function
+/// The most statements a small function's copies may add up to, at all of its calls, for it to
+/// be inlined at each: past it, it's inlined only at its calls in a loop. Functions that many
+/// places call (`sin` and `cos` with their range reduction, `Vec::push`, `free`) were copied
+/// into each, and the copies were 0.6 MB of the Last Green's 8.8 MB of WASM; outside a loop a
+/// call costs little next to such a body, and the floor's CPU frame didn't change (2026-10-11).
+/// Bodies under `CPU_SPREAD_LEAST` statements are inlined however many places call them: a call
+/// and its arguments are about as big.
+const CPU_SPREAD: usize = 6000;
+const CPU_SPREAD_LEAST: usize = 32;
+
+/// Inlines calls on the CPU (AC12): calls to small functions (in a loop only, when the copies at
+/// all their calls would be too many statements: `CPU_SPREAD`), and the one call to a function
 /// that only one place calls. A closure is a function of its own, called by an instance of the
 /// function it's passed to that takes it alone; so a query that takes a closure, such as
 /// `each_within`, becomes the loop a hand-written query is. The closure's body is in the loop,
@@ -1465,7 +1476,8 @@ pub fn inline_cpu(m: &mut Module) -> Result<()> {
         sizes[f] = size_of(&m.functions[f].body);
         let once = sites[f] == 1 && !root[f];
         if !recursive[f] && !m.functions[f].counted {
-            if sizes[f] <= CPU_INLINE_SIZE || once {
+            let spread = sizes[f] >= CPU_SPREAD_LEAST && sizes[f] * sites[f] as usize > CPU_SPREAD;
+            if (sizes[f] <= CPU_INLINE_SIZE && !spread) || once {
                 keep[f] = false;
                 exits[f] = exit_form(m, f);
             } else if sizes[f] <= CPU_LOOP_INLINE_SIZE {
@@ -3230,5 +3242,76 @@ mod tests {
         assert!(visit::calls(body).is_empty(), "the loop's call is inlined: {body:?}");
         assert_eq!(visit::calls(&main.body).len(), 1, "the call outside the loop stays");
         crate::verify(&m).expect("a valid module");
+    }
+
+    /// A module in which `outside` exported functions each call `g`, a chain of `len`
+    /// multiplies, and `main` calls it once in a loop; after CPU inlining, how many calls the
+    /// exported functions keep, and whether the loop's call was inlined.
+    fn calls_kept(len: usize, outside: usize) -> (usize, bool) {
+        let mut m = Module::default();
+        let f32t = m.types.f32();
+        let p = Param { name: "x".into(), ty: f32t, by_ref: false, mutable: false };
+        let mut g = Function::new("g", vec![p], Some(f32t));
+        let x = g.new_value(f32t);
+        let mut body = vec![Stmt::Let(x, Expr::Param(0))];
+        let mut at = x;
+        for _ in 0..len {
+            let v = g.new_value(f32t);
+            body.push(Stmt::Let(v, Expr::Binary(BinOp::Mul, at, x)));
+            at = v;
+        }
+        body.push(Stmt::Return(Some(at)));
+        g.body = body;
+        let g = m.add_function(g);
+        for k in 0..outside {
+            let mut c = Function::new(format!("c{k}"), Vec::new(), Some(f32t));
+            let (a, r) = (c.new_value(f32t), c.new_value(f32t));
+            c.body = vec![
+                Stmt::Let(a, Expr::Const(Const::F32(k as f32))),
+                Stmt::Let(r, Expr::Call(g, vec![Arg::Value(a)])),
+                Stmt::Return(Some(r)),
+            ];
+            let c = m.add_function(c);
+            m.exports.push((format!("c{k}"), c));
+        }
+        let mut main = Function::new("main", Vec::new(), Some(f32t));
+        let (one, two, b) = (main.new_value(f32t), main.new_value(f32t), main.new_value(f32t));
+        main.body = vec![
+            Stmt::Let(one, Expr::Const(Const::F32(1.0))),
+            Stmt::Loop {
+                body: vec![
+                    Stmt::Let(two, Expr::Const(Const::F32(2.0))),
+                    Stmt::Let(b, Expr::Call(g, vec![Arg::Value(two)])),
+                    Stmt::Break,
+                ],
+                continuing: Vec::new(),
+            },
+            Stmt::Return(Some(one)),
+        ];
+        let main = m.add_function(main);
+        m.exports.push(("main".into(), main));
+        let _ = b;
+        inline_cpu(&mut m).expect("inline");
+        crate::verify(&m).expect("a valid module");
+        let kept = m.functions.iter().filter(|f| f.name.starts_with('c'));
+        let kept = kept.map(|f| visit::calls(&f.body).len()).sum();
+        let main = m.functions.iter().find(|f| f.name == "main").expect("main");
+        (kept, visit::calls(&main.body).is_empty())
+    }
+
+    /// A small function is inlined at each call, unless its copies would add up past
+    /// `CPU_SPREAD`: then only its calls in a loop are, and the rest stay calls. A body too small
+    /// to be worth a call is inlined however many places call it.
+    #[test]
+    fn a_small_function_called_from_many_places_stays_a_call_outside_loops() {
+        assert_eq!(calls_kept(40, 3), (0, true), "few calls: all inlined");
+        let many = CPU_SPREAD / 40 + 1;
+        assert_eq!(calls_kept(40, many), (many, true), "many calls: kept, but in the loop");
+        let tiny = CPU_SPREAD_LEAST - 3;
+        assert_eq!(
+            calls_kept(tiny, CPU_SPREAD / tiny + 1),
+            (0, true),
+            "a tiny body: always inlined"
+        );
     }
 }
