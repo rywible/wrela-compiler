@@ -189,17 +189,19 @@ pub fn closest<'a>(name: &str, candidates: impl Iterator<Item = &'a str>) -> Opt
 }
 
 fn edit_distance(a: &str, b: &str) -> usize {
-    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
-    let mut prev: Vec<usize> = (0..=b.len()).collect();
-    for i in 1..=a.len() {
-        let mut cur = vec![i; b.len() + 1];
-        for j in 1..=b.len() {
-            let cost = usize::from(a[i - 1] != b[j - 1]);
-            cur[j] = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + cost);
+    let b: Vec<char> = b.chars().collect();
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for (i, a) in a.chars().enumerate() {
+        let mut diagonal = row[0];
+        row[0] = i + 1;
+        for (j, &b) in b.iter().enumerate() {
+            let above = row[j + 1];
+            let cost = usize::from(a != b);
+            row[j + 1] = (above + 1).min(row[j] + 1).min(diagonal + cost);
+            diagonal = above;
         }
-        prev = cur;
     }
-    prev[b.len()]
+    row[b.len()]
 }
 
 /// The std prelude's module, once std is loaded.
@@ -1372,5 +1374,42 @@ fn projection(
             ));
             p.types.error
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frontend_perf_suggestions_preserve_unicode_distance_and_ties() {
+        fn reference(a: &[char], b: &[char]) -> usize {
+            let mut rows = vec![vec![0; b.len() + 1]; a.len() + 1];
+            for (i, row) in rows.iter_mut().enumerate() {
+                row[0] = i;
+            }
+            for (j, cell) in rows[0].iter_mut().enumerate() {
+                *cell = j;
+            }
+            for i in 1..=a.len() {
+                for j in 1..=b.len() {
+                    rows[i][j] = (rows[i - 1][j] + 1)
+                        .min(rows[i][j - 1] + 1)
+                        .min(rows[i - 1][j - 1] + usize::from(a[i - 1] != b[j - 1]));
+                }
+            }
+            rows[a.len()][b.len()]
+        }
+        let words = ["", "a", "b", "ab", "ba", "α", "αβ", "éa", "🦀x", "kitten", "sitting"];
+        for a in words {
+            for b in words {
+                let ac: Vec<_> = a.chars().collect();
+                let bc: Vec<_> = b.chars().collect();
+                assert_eq!(edit_distance(a, b), reference(&ac, &bc), "{a:?}, {b:?}");
+            }
+        }
+        assert_eq!(closest("cat", ["cut", "bat", "cat"].into_iter()), Some("bat"));
+        assert_eq!(closest("αβ", ["αa", "αβ"].into_iter()), Some("αa"));
+        assert_eq!(closest("cat", ["different"].into_iter()), None);
     }
 }

@@ -57,7 +57,7 @@ fn walk(
         }
     };
     let mut entries: Vec<_> = entries.filter_map(Result::ok).collect();
-    entries.sort_by_key(|e| e.file_name());
+    entries.sort_by_cached_key(|e| e.file_name());
     for entry in entries {
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().to_string();

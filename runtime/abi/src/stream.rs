@@ -1085,21 +1085,47 @@ impl Encoder {
 
     fn command(&mut self, op: Opcode, payload_words: &[u32], bytes: &[u8]) {
         assert!(bytes.len().is_multiple_of(4), "payload bytes must be a multiple of 4");
-        self.put(op as u32);
-        self.put((payload_words.len() * 4 + bytes.len()) as u32);
+        self.header(op, payload_words.len() * 4 + bytes.len());
         for &w in payload_words {
             self.put(w);
         }
         self.body.extend_from_slice(bytes);
     }
 
-    /// The words of a binding list and a uniform byte count.
-    fn bound(words: &mut Vec<u32>, bindings: &[Binding], uniforms: &[u8]) {
-        words.push(bindings.len() as u32);
-        for b in bindings {
-            words.extend([b.handle, b.offset, b.size]);
+    fn header(&mut self, op: Opcode, payload_len: usize) {
+        self.body.reserve(COMMAND_HEADER_LEN + payload_len);
+        self.put(op as u32);
+        self.put(payload_len as u32);
+    }
+
+    /// Writes a binding list directly into the batch, without a temporary word vector.
+    fn bound_command(&mut self, op: Opcode, words: &[u32], bindings: &[Binding], uniforms: &[u8]) {
+        assert!(uniforms.len().is_multiple_of(4), "payload bytes must be a multiple of 4");
+        self.header(op, (words.len() + 2 + 3 * bindings.len()) * 4 + uniforms.len());
+        for &word in words {
+            self.put(word);
         }
-        words.push(uniforms.len() as u32);
+        self.put(bindings.len() as u32);
+        for b in bindings {
+            self.put(b.handle);
+            self.put(b.offset);
+            self.put(b.size);
+        }
+        self.put(uniforms.len() as u32);
+        self.body.extend_from_slice(uniforms);
+    }
+
+    /// Writes each byte run with its own padding, directly into the batch.
+    fn padded_command(&mut self, op: Opcode, words: &[u32], runs: &[&[u8]]) {
+        let bytes: usize = runs.iter().map(|run| padded(run.len())).sum();
+        self.header(op, words.len() * 4 + bytes);
+        for &word in words {
+            self.put(word);
+        }
+        for run in runs {
+            self.body.extend_from_slice(run);
+            self.body.resize(self.body.len() + padded(run.len()) - run.len(), 0);
+        }
     }
 
     pub fn create_buffer(&mut self, handle: u32, size: u32) -> &mut Self {
@@ -1119,9 +1145,8 @@ impl Encoder {
         bindings: &[Binding],
         uniforms: &[u8],
     ) -> &mut Self {
-        let mut words = vec![pipeline, groups[0], groups[1], groups[2]];
-        Self::bound(&mut words, bindings, uniforms);
-        self.command(Opcode::Dispatch, &words, uniforms);
+        let words = [pipeline, groups[0], groups[1], groups[2]];
+        self.bound_command(Opcode::Dispatch, &words, bindings, uniforms);
         self
     }
 
@@ -1138,9 +1163,7 @@ impl Encoder {
         bindings: &[Binding],
         uniforms: &[u8],
     ) -> &mut Self {
-        let mut words = vec![pipeline, vertices, instances];
-        Self::bound(&mut words, bindings, uniforms);
-        self.command(Opcode::Draw, &words, uniforms);
+        self.bound_command(Opcode::Draw, &[pipeline, vertices, instances], bindings, uniforms);
         self
     }
 
@@ -1259,9 +1282,12 @@ impl Encoder {
         bindings: &[Binding],
         uniforms: &[u8],
     ) -> &mut Self {
-        let mut words = vec![pipeline, arguments, offset];
-        Self::bound(&mut words, bindings, uniforms);
-        self.command(Opcode::DispatchIndirect, &words, uniforms);
+        self.bound_command(
+            Opcode::DispatchIndirect,
+            &[pipeline, arguments, offset],
+            bindings,
+            uniforms,
+        );
         self
     }
 
@@ -1273,9 +1299,12 @@ impl Encoder {
         bindings: &[Binding],
         uniforms: &[u8],
     ) -> &mut Self {
-        let mut words = vec![pipeline, arguments, offset];
-        Self::bound(&mut words, bindings, uniforms);
-        self.command(Opcode::DrawIndirect, &words, uniforms);
+        self.bound_command(
+            Opcode::DrawIndirect,
+            &[pipeline, arguments, offset],
+            bindings,
+            uniforms,
+        );
         self
     }
 
@@ -1290,9 +1319,8 @@ impl Encoder {
         bindings: &[Binding],
         uniforms: &[u8],
     ) -> &mut Self {
-        let mut words = vec![pipeline, indices[0], indices[1], indices[2], arguments, offset];
-        Self::bound(&mut words, bindings, uniforms);
-        self.command(Opcode::DrawIndexedIndirect, &words, uniforms);
+        let words = [pipeline, indices[0], indices[1], indices[2], arguments, offset];
+        self.bound_command(Opcode::DrawIndexedIndirect, &words, bindings, uniforms);
         self
     }
 
@@ -1301,62 +1329,45 @@ impl Encoder {
         self
     }
 
-    /// Bytes padded with zeros to a multiple of 4.
-    fn pad(bytes: &[u8]) -> Vec<u8> {
-        let mut b = bytes.to_vec();
-        b.resize(padded(b.len()), 0);
-        b
-    }
-
     pub fn storage_read(&mut self, request: u32, path: &str) -> &mut Self {
-        let bytes = Self::pad(path.as_bytes());
-        self.command(Opcode::StorageRead, &[request, path.len() as u32], &bytes);
+        self.padded_command(Opcode::StorageRead, &[request, path.len() as u32], &[path.as_bytes()]);
         self
     }
 
     pub fn storage_write(&mut self, request: u32, path: &str, data: &[u8]) -> &mut Self {
-        let mut bytes = Self::pad(path.as_bytes());
-        bytes.extend(Self::pad(data));
         let words = [request, path.len() as u32, data.len() as u32];
-        self.command(Opcode::StorageWrite, &words, &bytes);
+        self.padded_command(Opcode::StorageWrite, &words, &[path.as_bytes(), data]);
         self
     }
 
     pub fn fetch(&mut self, request: u32, url: &str) -> &mut Self {
-        let bytes = Self::pad(url.as_bytes());
-        self.command(Opcode::Fetch, &[request, url.len() as u32], &bytes);
+        self.padded_command(Opcode::Fetch, &[request, url.len() as u32], &[url.as_bytes()]);
         self
     }
 
     pub fn post(&mut self, request: u32, url: &str, body: &[u8]) -> &mut Self {
-        let mut bytes = Self::pad(url.as_bytes());
-        bytes.extend(Self::pad(body));
         let words = [request, url.len() as u32, body.len() as u32];
-        self.command(Opcode::Post, &words, &bytes);
+        self.padded_command(Opcode::Post, &words, &[url.as_bytes(), body]);
         self
     }
 
     pub fn prepare(&mut self, request: u32, path: &str) -> &mut Self {
-        let bytes = Self::pad(path.as_bytes());
-        self.command(Opcode::Prepare, &[request, path.len() as u32], &bytes);
+        self.padded_command(Opcode::Prepare, &[request, path.len() as u32], &[path.as_bytes()]);
         self
     }
 
     pub fn unprepare(&mut self, path: &str) -> &mut Self {
-        let bytes = Self::pad(path.as_bytes());
-        self.command(Opcode::Unprepare, &[path.len() as u32], &bytes);
+        self.padded_command(Opcode::Unprepare, &[path.len() as u32], &[path.as_bytes()]);
         self
     }
 
     pub fn hand_over(&mut self, request: u32, path: &str) -> &mut Self {
-        let bytes = Self::pad(path.as_bytes());
-        self.command(Opcode::HandOver, &[request, path.len() as u32], &bytes);
+        self.padded_command(Opcode::HandOver, &[request, path.len() as u32], &[path.as_bytes()]);
         self
     }
 
     pub fn label(&mut self, name: &str) -> &mut Self {
-        let bytes = Self::pad(name.as_bytes());
-        self.command(Opcode::Label, &[name.len() as u32], &bytes);
+        self.padded_command(Opcode::Label, &[name.len() as u32], &[name.as_bytes()]);
         self
     }
 

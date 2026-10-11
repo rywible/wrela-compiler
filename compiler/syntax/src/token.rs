@@ -46,6 +46,14 @@ macro_rules! token_kinds {
                 }
             }
 
+            /// One complete punctuation spelling. The lexer tries lengths longest first.
+            pub(crate) fn punctuation(text: &str) -> Option<TokenKind> {
+                match text {
+                    $($ptext => Some(TokenKind::$pname),)*
+                    _ => None,
+                }
+            }
+
             /// Every token class (the tokens whose text varies, and NEWLINE and EOF), in spec
             /// order.
             pub const CLASSES: &'static [TokenKind] = &[$(TokenKind::$cname),*];

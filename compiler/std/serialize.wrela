@@ -53,10 +53,7 @@ impl Writer {
     pub fn write_str(mut self, s: str) {
         let n = s.len()
         self.write_u32(n)
-        self.bytes.reserve(n)
-        for i in 0..n {
-            self.bytes.push(s.byte(i))
-        }
+        self.bytes.append_text(s)
     }
 }
 

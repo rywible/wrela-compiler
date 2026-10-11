@@ -2,15 +2,31 @@
 // It needs only the ABI, so the audio worklet's small bundle can have it too.
 
 import { HOST_FUNCTIONS, IMPORT_CLOCK, IMPORT_MEMORY, IMPORT_MODULE, IMPORT_PHASE, IMPORT_PRINT } from "./abi.gen.ts";
-import { UTF8 } from "./wasm.ts";
+
+// AudioWorkletGlobalScope has no TextDecoder. Other threads reuse a decoder, made only when
+// text is read; the worklet uses ECMAScript's strict UTF-8 decoding instead.
+let utf8: TextDecoder | null = null;
+
+function decodeUtf8(bytes: Uint8Array): string {
+  if (typeof TextDecoder !== "undefined") {
+    return (utf8 ??= new TextDecoder("utf-8", { fatal: true, ignoreBOM: true })).decode(bytes);
+  }
+  let encoded = "";
+  for (const byte of bytes) encoded += `%${byte.toString(16).padStart(2, "0")}`;
+  return decodeURIComponent(encoded);
+}
 
 /** `wrela.clock(ptr)`: the seconds on this host's clock, an `f64`, written at `ptr`. A page's
  * workers share a time origin's scale (`performance.timeOrigin` is each context's start on one
  * clock), so every thread reads the same clock. */
 export function clockImport(memory: WebAssembly.Memory): (ptr: number) => void {
+  let view: DataView | null = null;
   return (ptr: number) => {
     const seconds = (performance.timeOrigin + performance.now()) / 1000;
-    new DataView(memory.buffer).setFloat64(ptr >>> 0, seconds, true);
+    // A grow replaces the buffer (and detaches an unshared one); otherwise reuse the view.
+    const buffer = memory.buffer;
+    if (view?.buffer !== buffer) view = new DataView(buffer);
+    view.setFloat64(ptr >>> 0, seconds, true);
   };
 }
 
@@ -25,7 +41,7 @@ function text(memory: WebAssembly.Memory, ptr: number, len: number, what: string
     throw new Error(`${what}(${at}, ${size}) reaches past the end of the program's memory`);
   }
   try {
-    return UTF8.decode(bytes);
+    return decodeUtf8(bytes);
   } catch {
     throw new Error(`${what}: the text isn't UTF-8`);
   }

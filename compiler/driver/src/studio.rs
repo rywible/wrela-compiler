@@ -566,18 +566,27 @@ impl Numbers {
         let lexed: Vec<_> = crate::edit::lex(&text).collect();
         let mut tokens = Vec::new();
         let mut shape = Vec::with_capacity(lexed.len());
-        for (i, t) in lexed.iter().enumerate() {
+        let mut i = 0;
+        while let Some(t) = lexed.get(i) {
+            if t.kind == TokenKind::Minus {
+                let start = i;
+                while lexed.get(i).is_some_and(|t| t.kind == TokenKind::Minus) {
+                    i += 1;
+                }
+                if !lexed.get(i).is_some_and(|t| t.kind.is_number()) {
+                    for t in &lexed[start..i] {
+                        shape.push((t.kind, t.span.start, t.span.end));
+                    }
+                }
+                continue;
+            }
             if t.kind.is_number() {
                 tokens.push((t.span.start, t.span.end));
                 shape.push((TokenKind::Float, 0, 0));
-            } else if t.kind != TokenKind::Minus
-                || !lexed[i + 1..]
-                    .iter()
-                    .find(|t| t.kind != TokenKind::Minus)
-                    .is_some_and(|t| t.kind.is_number())
-            {
+            } else {
                 shape.push((t.kind, t.span.start, t.span.end));
             }
+            i += 1;
         }
         Numbers { text, tokens, shape }
     }
@@ -836,5 +845,14 @@ mod tests {
         assert!(!same_but_numbers("x * y", "x * -y"));
         assert!(!same_but_numbers("a - 0.5", "a + 0.5"));
         assert!(!same_but_numbers("f(1.0)", "f(1.0, 2.0)"));
+    }
+
+    #[test]
+    fn perf_chains_of_minus_signs_keep_their_numbers_and_code_in_order() {
+        let chain = "-".repeat(4096);
+        assert!(same_but_numbers(&format!("a {chain} 1.0 + 2.0"), "a 3.0 + -4.0"));
+        assert!(!same_but_numbers(&format!("a {chain} b + 2.0"), "a -b + 2.0"));
+        let numbers = Numbers::new("1.0 - -2.0 + 3.0");
+        assert_eq!(numbers.tokens, [(0, 3), (7, 10), (13, 16)]);
     }
 }

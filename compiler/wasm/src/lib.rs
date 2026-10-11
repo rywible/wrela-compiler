@@ -840,6 +840,25 @@ mod tests {
         assert!(copies(&copy_of(256)) >= 1);
     }
 
+    /// Both copies read their whole source before they write, even when it is also the
+    /// destination. Repeating the chunk iterator must not interleave loads and stores.
+    #[test]
+    fn codegen_perf_small_copies_read_before_writing() {
+        for n in [4, 8, 32] {
+            let ops = copy_of(n);
+            let memory: Vec<_> = ops
+                .iter()
+                .filter(|o| o.starts_with("V128Load") || o.starts_with("V128Store"))
+                .map(|o| o.starts_with("V128Load"))
+                .collect();
+            let chunks = n as usize / 4;
+            let copy: Vec<_> = std::iter::repeat_n(true, chunks)
+                .chain(std::iter::repeat_n(false, chunks))
+                .collect();
+            assert_eq!(memory, copy.repeat(2), "{ops:?}");
+        }
+    }
+
     /// `fn f(x: f32) -> f32 { x + MARK }` has no frame: no stack check, and the stack pointer
     /// isn't touched. A function with a frame checks and moves it.
     #[test]

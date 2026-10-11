@@ -487,17 +487,54 @@ pub fn calls(b: &Block) -> Vec<FuncId> {
 /// depth-first walk comes to them. The walk doesn't look inside `stop`'s functions: they're
 /// reached, but not what they call.
 pub fn reachable(m: &Module, from: FuncId, stop: &[FuncId]) -> Vec<FuncId> {
-    let mut seen = vec![false; m.functions.len()];
+    // Bit 0: reached; bit 1: don't look inside. Indexing stops keeps a walk linear even
+    // when many derived functions are waiting, without a second set or a scan per function.
+    let mut seen = vec![0u8; m.functions.len()];
+    for f in stop {
+        if let Some(state) = seen.get_mut(f.index()) {
+            *state |= 2;
+        }
+    }
     let mut stack = vec![from];
     let mut out = Vec::new();
     while let Some(f) = stack.pop() {
-        if std::mem::replace(&mut seen[f.index()], true) {
+        let state = &mut seen[f.index()];
+        if *state & 1 != 0 {
             continue;
         }
+        *state |= 1;
         out.push(f);
-        if !stop.contains(&f) {
-            stack.extend(calls(&m.functions[f.index()].body));
+        if *state & 2 == 0 {
+            walk(&m.functions[f.index()].body, &mut |s| {
+                if let Some(g) = s.expr().and_then(Expr::callee) {
+                    stack.push(g);
+                }
+            });
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn codegen_perf_reachability_keeps_order_cycles_and_stop_boundaries() {
+        let mut m = Module::default();
+        for i in 0..4 {
+            m.add_function(Function::new(format!("f{i}"), Vec::new(), None));
+        }
+        let call = |f| Stmt::Eval(Expr::Call(FuncId(f), Vec::new()));
+        m.functions[0].body = vec![call(1), call(2), call(2)];
+        m.functions[1].body = vec![call(3)];
+        m.functions[2].body = vec![Stmt::Loop { body: vec![call(3)], continuing: vec![call(1)] }];
+        m.functions[3].body = vec![call(0)];
+        assert_eq!(reachable(&m, FuncId(0), &[]), [FuncId(0), FuncId(2), FuncId(1), FuncId(3)]);
+        assert_eq!(
+            reachable(&m, FuncId(0), &[FuncId(1), FuncId(2)]),
+            [FuncId(0), FuncId(2), FuncId(1)]
+        );
+        assert_eq!(reachable(&m, FuncId(0), &[FuncId(0), FuncId(0)]), [FuncId(0)]);
+    }
 }

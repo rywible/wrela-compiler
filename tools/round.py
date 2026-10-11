@@ -27,7 +27,7 @@ wildwood (travel, Y) for 10 minutes, and the floor's walk again. It saves:
 `--frames` cuts the round short (to try the tool).
 """
 
-import json, os, shutil, subprocess, sys
+import bisect, json, os, shutil, subprocess, sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILD = os.path.join(ROOT, "examples/last-green/build")
@@ -115,11 +115,21 @@ def summarize(out, frames_json, log_lines, printed_in, snaps=()):
             except json.JSONDecodeError:
                 pass
 
+    # A hitch needs only the report on either side. Keep the first report at each frame and
+    # its original position, so duplicates and equal distances choose what `min` chose.
+    by_frame = {}
+    for i, (frame, report) in enumerate(reports):
+        by_frame.setdefault(frame, (i, report))
+    ordered = sorted(by_frame.items())
+    report_frames = [frame for frame, _ in ordered]
+
     def where(frame):
-        best = min(reports, key=lambda r: abs(r[0] - frame), default=None)
+        at = bisect.bisect_left(report_frames, frame)
+        best = min(ordered[max(0, at - 1):at + 1],
+                   key=lambda r: (abs(r[0] - frame), r[1][0]), default=None)
         if not best:
             return "?"
-        r = best[1]
+        r = best[1][1]
         return f"{r['region']}, {r['site_m']:.0f} m from {r['site']} ({r['at'][0]:.0f}, {r['at'][1]:.0f})"
 
     # (A frame after a saved screen waited for its readback.)

@@ -234,7 +234,7 @@ enum Kind {
 }
 
 /// A cached bind group: its pipeline, and the bindings it holds.
-type BindGroupKey = (u32, Box<[Binding]>);
+type BindGroupKey = (u32, Arc<[Binding]>);
 
 enum DrawHow {
     Direct {
@@ -376,7 +376,7 @@ pub(crate) struct Gpu {
     built: Arc<AtomicUsize>,
     resources: HashMap<u32, Resource>,
     /// Each pipeline's cached bind groups, by the bindings they hold.
-    bind_groups: Vec<HashMap<Box<[Binding]>, wgpu::BindGroup>>,
+    bind_groups: Vec<HashMap<Arc<[Binding]>, wgpu::BindGroup>>,
     /// For each resource, the cached bind groups it's in: destroying it drops them.
     bound_in: HashMap<u32, HashSet<BindGroupKey>>,
     /// The uniform ring, bound with dynamic offsets, and the upload ring.
@@ -927,7 +927,9 @@ impl Gpu {
             return bg.clone();
         }
         let p = &self.pipelines[pipeline as usize];
-        let mut entries = Vec::new();
+        let mut entries = Vec::with_capacity(
+            bindings.len() + usize::from(p.uniform.is_some()) + usize::from(p.debug_flag.is_some()),
+        );
         if let Some((binding, size)) = p.uniform {
             entries.push(wgpu::BindGroupEntry {
                 binding,
@@ -959,7 +961,9 @@ impl Gpu {
             layout: &p.layout,
             entries: &entries,
         });
-        let key: Box<[Binding]> = bindings.into();
+        // The reverse index holds this key once per resource. Share its binding array rather
+        // than copying the whole array for every resource in it.
+        let key: Arc<[Binding]> = bindings.into();
         for b in bindings {
             self.bound_in.entry(b.handle).or_default().insert((pipeline, key.clone()));
         }
@@ -1358,20 +1362,14 @@ impl Gpu {
             });
         let moved = (targets[0].0.max(targets[1].0), targets[0].1 + targets[1].1);
         let timestamps = self.timer.as_mut().map(|t| t.next(self.frame, label, moved));
-        let counts: Vec<Option<u32>> = open
-            .draws
-            .iter()
-            .map(|d| {
-                let name = &self.pipelines[d.pipeline as usize].name;
-                self.timer.as_mut().and_then(|t| t.count(name))
-            })
-            .collect();
         let [r, g, b, a] = pass.clear.map(f64::from);
-        let mut bind_groups = Vec::new();
-        let mut offsets = Vec::new();
+        let mut prepared = Vec::with_capacity(open.draws.len());
         for d in &open.draws {
-            offsets.push(self.push_uniforms(&d.uniforms));
-            bind_groups.push(self.bind_group(d.pipeline, &d.bindings));
+            let name = &self.pipelines[d.pipeline as usize].name;
+            let count = self.timer.as_mut().and_then(|t| t.count(name));
+            let offset = self.push_uniforms(&d.uniforms);
+            let bind_group = self.bind_group(d.pipeline, &d.bindings);
+            prepared.push((bind_group, offset, count));
         }
         let mut encoder = self.take_encoder();
         let view_of = |gpu: &'_ Gpu, h: u32| -> wgpu::TextureView {
@@ -1426,8 +1424,7 @@ impl Gpu {
             occlusion_query_set: None,
             multiview_mask: None,
         });
-        let draws = open.draws.iter().zip(&bind_groups).zip(&offsets).zip(&counts);
-        for (((d, bind_group), offset), count) in draws {
+        for (d, (bind_group, offset, count)) in open.draws.iter().zip(&prepared) {
             let Kind::Render { variants, .. } = &self.pipelines[d.pipeline as usize].kind else {
                 unreachable!("the checker checked the kind");
             };
@@ -1561,15 +1558,17 @@ impl Gpu {
             wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
         );
         self.queue.submit([encoder.finish()]);
-        let bytes = map_read(&self.device, &staging)?;
+        let frame = map_read_with(&self.device, &staging, |bytes| {
+            if padded == row {
+                return bytes.to_vec();
+            }
+            let mut frame = Vec::with_capacity((row * u64::from(height)) as usize);
+            for padded_row in bytes.chunks_exact(padded as usize) {
+                frame.extend_from_slice(&padded_row[..row as usize]);
+            }
+            frame
+        })?;
         self.check_errors()?;
-        if padded == row {
-            return Ok(bytes);
-        }
-        let mut frame = Vec::with_capacity((row * u64::from(height)) as usize);
-        for padded_row in bytes.chunks_exact(padded as usize) {
-            frame.extend_from_slice(&padded_row[..row as usize]);
-        }
         Ok(frame)
     }
 
@@ -1815,6 +1814,16 @@ fn render_variant(device: &wgpu::Device, name: &str, kind: &mut Kind, targets: T
 
 /// Maps a `MAP_READ` buffer and copies it out, waiting for the GPU.
 pub fn map_read(device: &wgpu::Device, buffer: &wgpu::Buffer) -> Result<Vec<u8>> {
+    map_read_with(device, buffer, <[u8]>::to_vec)
+}
+
+/// Converts mapped bytes before unmapping, so callers can copy just the pixels or words they
+/// need without first copying the whole mapped range to a temporary byte vector.
+fn map_read_with<T>(
+    device: &wgpu::Device,
+    buffer: &wgpu::Buffer,
+    read: impl FnOnce(&[u8]) -> T,
+) -> Result<T> {
     let slice = buffer.slice(..);
     let (tx, rx) = std::sync::mpsc::channel();
     slice.map_async(wgpu::MapMode::Read, move |r| {
@@ -1822,9 +1831,11 @@ pub fn map_read(device: &wgpu::Device, buffer: &wgpu::Buffer) -> Result<Vec<u8>>
     });
     device.poll(wgpu::PollType::wait_indefinitely()).map_err(gpu_err)?;
     rx.recv().map_err(gpu_err)?.map_err(gpu_err)?;
-    let bytes = slice.get_mapped_range().map_err(gpu_err)?.to_vec();
+    let mapped = slice.get_mapped_range().map_err(gpu_err)?;
+    let out = read(&mapped);
+    drop(mapped);
     buffer.unmap();
-    Ok(bytes)
+    Ok(out)
 }
 
 impl Timer {
@@ -1987,8 +1998,9 @@ fn resolve(
     encoder.resolve_query_set(queries, 0..n, &resolved, 0);
     encoder.copy_buffer_to_buffer(&resolved, 0, &readback, 0, size);
     queue.submit([encoder.finish()]);
-    let bytes = map_read(device, &readback)?;
-    Ok(bytes.chunks_exact(8).map(|b| u64::from_le_bytes(b.try_into().expect("8 bytes"))).collect())
+    map_read_with(device, &readback, |bytes| {
+        bytes.chunks_exact(8).map(|b| u64::from_le_bytes(b.try_into().expect("8 bytes"))).collect()
+    })
 }
 
 #[cfg(test)]

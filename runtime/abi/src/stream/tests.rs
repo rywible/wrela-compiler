@@ -112,6 +112,45 @@ fn the_golden_batch_round_trips() {
 }
 
 #[test]
+fn byte_runs_keep_their_own_padding() {
+    for text_len in 1..=8 {
+        for data_len in 0..=8 {
+            let text = "abcdefgh"[..text_len].to_owned();
+            let data = vec![0x97; data_len];
+            let batch = Encoder::new()
+                .storage_read(1, &text)
+                .storage_write(2, &text, &data)
+                .fetch(3, &text)
+                .post(4, &text, &data)
+                .label(&text)
+                .finish();
+            assert_eq!(
+                decode(&batch).expect("padded runs decode"),
+                vec![
+                    Command::StorageRead { request: 1, path: &text },
+                    Command::StorageWrite { request: 2, path: &text, data: &data },
+                    Command::Fetch { request: 3, url: &text },
+                    Command::Post { request: 4, url: &text, body: &data },
+                    Command::Label { name: &text },
+                ]
+            );
+            let mut at = HEADER_LEN;
+            for words in [2, 3, 2, 3, 1] {
+                let payload = at + COMMAND_HEADER_LEN;
+                let text_at = payload + words * 4;
+                let end = text_at + padded(text_len);
+                assert!(batch[text_at + text_len..end].iter().all(|&b| b == 0));
+                if words == 3 {
+                    assert!(batch[end + data_len..end + padded(data_len)].iter().all(|&b| b == 0));
+                }
+                at = payload + word(&batch, at + 4) as usize;
+            }
+            assert_eq!(at, batch.len());
+        }
+    }
+}
+
+#[test]
 fn rejects_another_version() {
     let mut batch = Encoder::new().present().finish();
     batch[4] = (VERSION + 1) as u8;

@@ -175,6 +175,7 @@ pub fn frame(time: f32, width: u32, height: u32) {
     let dir = scratch("consts/shipped-name-twice");
     let twice = program
         .replace("const B: Shipped = ship(\"data\", one(\"b.bin\"))", "")
+        .replace("A.len() + B.len()", "A.len()")
         .replace(
             "Vec::from([(String::from(name), Vec::from([1, 2, 3]))])",
             "Vec::from([(String::from(name), Vec::from([1])), (String::from(name), Vec::from([2, 3]))])",

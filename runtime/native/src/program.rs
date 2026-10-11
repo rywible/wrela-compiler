@@ -1104,9 +1104,12 @@ impl<E: Executor> Program<E> {
             trace
                 .end_phase_after(|| render.call(&mut *store, (memory::THREAD_AUDIO, task, context)))
                 .map_err(|e| Error::Trap(format!("the voice trapped: {}", e.root_cause())))?;
-            let at = wrela_abi::memory::AUDIO_OUT as usize;
-            let bytes = shared::read(&self.memory, at, channels * n * 4)
-                .ok_or_else(|| Error::Program("the samples are past the memory's end".into()))?;
+            // The quantum finished writing these samples before returning. Convert them
+            // straight from shared memory, before the next quantum can overwrite them.
+            let bytes = shared::slice(&self.memory, memory::AUDIO_OUT as usize, channels * n * 4)
+                .ok_or_else(|| {
+                Error::Program("the samples are past the memory's end".into())
+            })?;
             let sample = |i: usize| {
                 let b = &bytes[4 * i..4 * i + 4];
                 f32::from_le_bytes([b[0], b[1], b[2], b[3]])

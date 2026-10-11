@@ -46,6 +46,7 @@ export interface FakeBindGroup {
 }
 
 export class FakeDevice {
+  readonly features = new Set<GPUFeatureName>();
   readonly events: Event[] = [];
   /** Each compute and render pass's label, in the order they began. */
   readonly passLabels: string[] = [];
@@ -83,6 +84,7 @@ export class FakeDevice {
     submit: () => {
       this.events.push({ kind: "submit" });
     },
+    onSubmittedWorkDone: async () => {},
     writeTexture: (dest: GPUTexelCopyTextureInfo, _data: Uint8Array, layout: GPUTexelCopyBufferLayout, size: GPUExtent3D) => {
       const texture = (dest.texture as unknown as FakeTexture).label;
       this.events.push({ kind: "writeTexture", texture, origin: dest.origin, bytesPerRow: layout.bytesPerRow!, size });

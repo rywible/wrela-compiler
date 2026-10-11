@@ -102,22 +102,51 @@ impl Width {
 }
 
 /// `size` bytes as loads or stores, widest first: each one's offset and width.
-fn chunks(size: u32, simd: bool) -> Vec<(u32, Width)> {
+fn chunks(size: u32, simd: bool) -> impl Iterator<Item = (u32, Width)> + Clone {
     let widths: &[Width] = if simd {
         &[Width::V128, Width::I64, Width::I32, Width::I16, Width::I8]
     } else {
         &[Width::I64, Width::I32, Width::I16, Width::I8]
     };
-    let mut out = Vec::new();
     let mut off = 0;
-    for &w in widths {
+    widths.iter().flat_map(move |&w| {
         let n = 1 << w.log2();
-        while size - off >= n {
-            out.push((off, w));
-            off += n;
+        let start = off;
+        let count = (size - off) / n;
+        off += count * n;
+        (0..count).map(move |i| (start + i * n, w))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn codegen_perf_copy_chunks_cover_every_byte_in_order() {
+        for simd in [false, true] {
+            for size in 0..=INLINE_ZERO_BYTES {
+                let mut end = 0;
+                let mut widths = Vec::new();
+                let mut parts = chunks(size, simd);
+                let first = parts.next().map(|(off, w)| (off, w.log2()));
+                let tail: Vec<_> = parts.clone().map(|(off, w)| (off, w.log2())).collect();
+                assert_eq!(parts.map(|(off, w)| (off, w.log2())).collect::<Vec<_>>(), tail);
+                for (off, log2) in first.into_iter().chain(tail) {
+                    assert_eq!(off, end);
+                    let max_log2 = if simd { 4 } else { 3 };
+                    let expected = (0..=max_log2).rev().find(|&w| 1 << w <= size - end).unwrap();
+                    assert_eq!(log2, expected);
+                    end += 1 << log2;
+                    widths.push(log2);
+                }
+                assert_eq!(end, size);
+                if size <= INLINE_BYTES {
+                    assert!(widths.len() <= (INLINE_BYTES / 8 + 3) as usize);
+                }
+            }
         }
     }
-    out
 }
 
 /// Zero, of WASM type `t`.
@@ -775,13 +804,14 @@ impl<'m> Fe<'m> {
         let (dst, src) = (self.new_local(ValType::I32), self.new_local(ValType::I32));
         self.ins.extend([I::LocalSet(src), I::LocalSet(dst)]);
         let chunks = chunks(l.size, self.at.simd);
-        let mut held = Vec::with_capacity(chunks.len());
-        for &(off, w) in &chunks {
+        // At most INLINE_BYTES / 8 wide chunks, then one each of 4, 2 and 1 bytes.
+        let mut held = [0; (INLINE_BYTES / 8 + 3) as usize];
+        for ((off, w), held) in chunks.clone().zip(&mut held) {
             let t = self.new_local(w.val_type());
             self.ins.extend([I::LocalGet(src), w.load(off, l.align), I::LocalSet(t)]);
-            held.push(t);
+            *held = t;
         }
-        for (&(off, w), t) in chunks.iter().zip(held) {
+        for ((off, w), t) in chunks.zip(held) {
             self.ins.extend([I::LocalGet(dst), I::LocalGet(t), w.store(off, l.align)]);
         }
     }

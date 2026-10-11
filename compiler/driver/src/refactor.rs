@@ -128,8 +128,9 @@ impl Texts {
     /// The plan: the files that changed, formatted where they were.
     fn plan(self, op: String, notes: Vec<String>) -> Result<Plan, Refusal> {
         let mut files = Vec::new();
+        let mut before = self.before;
         for (file, new) in self.now {
-            let old = self.before[&file].clone();
+            let old = before.remove(&file).expect("original text");
             if old == new {
                 continue;
             }
@@ -139,7 +140,7 @@ impl Texts {
                 } else {
                     None
                 };
-                formatted.unwrap_or_else(|| new.clone())
+                formatted.unwrap_or(new)
             });
             files.push(FileChange { file, old, new });
         }

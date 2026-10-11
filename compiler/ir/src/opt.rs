@@ -2224,7 +2224,11 @@ fn retain_reached(m: &mut Module, roots: Vec<usize>) -> Vec<Option<u32>> {
     let mut work = roots;
     while let Some(f) = work.pop() {
         if !std::mem::replace(&mut reached[f], true) {
-            work.extend(visit::calls(&m.functions[f].body).iter().map(|g| g.index()));
+            visit::walk(&m.functions[f].body, &mut |s| {
+                if let Some(g) = s.expr().and_then(Expr::callee) {
+                    work.push(g.index());
+                }
+            });
         }
     }
     let remap = retain_by_index(&mut m.functions, |i| reached[i]);
@@ -2503,14 +2507,21 @@ fn resolve(rename: &[Option<ValueId>], mut v: ValueId) -> ValueId {
 /// Keeps the items whose index `keep` holds for, in order: each one's new index, by its old one.
 fn retain_by_index<T>(items: &mut Vec<T>, keep: impl Fn(usize) -> bool) -> Vec<Option<u32>> {
     let mut remap = vec![None; items.len()];
-    let mut kept = Vec::new();
-    for (i, x) in std::mem::take(items).into_iter().enumerate() {
-        if keep(i) {
-            remap[i] = Some(kept.len() as u32);
-            kept.push(x);
+    let mut i = 0;
+    let mut next = 0;
+    items.retain(|_| {
+        let kept = keep(i);
+        if kept {
+            remap[i] = Some(next);
+            next += 1;
         }
+        i += 1;
+        kept
+    });
+    // Fully dead locals or specialized arguments need no backing storage any more.
+    if items.is_empty() {
+        items.shrink_to_fit();
     }
-    *items = kept;
     remap
 }
 
@@ -2538,6 +2549,22 @@ fn flattened_size(m: &Module, order: &[usize], keep: &[bool]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codegen_perf_compaction_keeps_order_indices_and_storage() {
+        let mut items = vec!["a", "b", "c", "d", "e"];
+        let ptr = items.as_ptr();
+        let capacity = items.capacity();
+        let remap = retain_by_index(&mut items, |i| i == 0 || i == 2 || i == 4);
+        assert_eq!(items, ["a", "c", "e"]);
+        assert_eq!(remap, [Some(0), None, Some(1), None, Some(2)]);
+        assert_eq!(items.as_ptr(), ptr);
+        assert_eq!(items.capacity(), capacity);
+        assert_eq!(retain_by_index(&mut items, |_| false), [None; 3]);
+        assert!(items.is_empty());
+        assert_eq!(items.capacity(), 0);
+        assert!(retain_by_index(&mut items, |_| true).is_empty());
+    }
 
     /// A dead chain through locals, as a run of `let`s makes it, goes in one pass; what the
     /// result needs stays.

@@ -1121,8 +1121,8 @@ pub(super) fn builtin(fe: &mut Fe, v: ir::ValueId, b: ir::Builtin, args: &[ir::V
             B::Cross => {
                 let out = fe.fresh_slot(v, false)?;
                 // Each component is read twice.
-                let a: Vec<u32> = (0..3).map(|c| elem_local(fe, args[0], 4 * c)).collect();
-                let bb: Vec<u32> = (0..3).map(|c| elem_local(fe, args[1], 4 * c)).collect();
+                let a: [u32; 3] = std::array::from_fn(|c| elem_local(fe, args[0], 4 * c as u32));
+                let bb: [u32; 3] = std::array::from_fn(|c| elem_local(fe, args[1], 4 * c as u32));
                 for (i, (j, k)) in [(1usize, 2usize), (2, 0), (0, 1)].into_iter().enumerate() {
                     fe.ins.extend([
                         I::LocalGet(out),

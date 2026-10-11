@@ -10,6 +10,7 @@ use std::mem::{
 }
 pub use std::mem::Pair
 use std::serialize::Serialize
+use std::string::str_addr
 
 /// The runs a sort sorts by insertion before it merges them.
 const SORT_RUN: u32 = 16
@@ -58,6 +59,18 @@ impl<T: Plain> Vec<T> {
 }
 
 impl Vec<u8> {
+    /// For strings and serialized text: adds UTF-8 in one copy, after making room for it.
+    pub(package) fn append_text(mut self, text: str) {
+        let n = text.len()
+        self.reserve(n)
+        if n > 0 {
+            unsafe {
+                copy(self.data + self.len, str_addr(text), n)
+            }
+            self.len += n
+        }
+    }
+
     /// For `std::reload`: the bytes the build this one replaced kept.
     pub(package) fn from_kept() -> Vec<u8> {
         let n = unsafe { kept_bytes(addr: 0, cap: 0) }

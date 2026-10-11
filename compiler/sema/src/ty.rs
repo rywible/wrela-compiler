@@ -581,8 +581,51 @@ const SHARING: u32 = 64;
 
 /// Each of `ts` mapped by `m`, in order; `None` when none of them changed.
 fn map_list(ts: &[TyId], m: &mut impl FnMut(TyId) -> TyId) -> Option<Vec<TyId>> {
-    let new: Vec<TyId> = ts.iter().map(|&x| m(x)).collect();
-    (new != ts).then_some(new)
+    // Most walks leave a list unchanged: don't allocate its replacement until the first
+    // change. Every element is still mapped exactly once, in the original order.
+    for (i, &x) in ts.iter().enumerate() {
+        let mapped = m(x);
+        if mapped != x {
+            let mut new = Vec::with_capacity(ts.len());
+            new.extend_from_slice(&ts[..i]);
+            new.push(mapped);
+            new.extend(ts[i + 1..].iter().map(|&x| m(x)));
+            return Some(new);
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frontend_perf_type_mapping_preserves_order_and_unchanged_ids() {
+        let types = Types::new();
+        let args = vec![types.i32, types.bool, types.f32];
+        for changed in 0..=args.len() {
+            let mut seen = Vec::new();
+            let mapped = map_list(&args, &mut |x| {
+                let i = seen.len();
+                seen.push(x);
+                if i == changed { types.u32 } else { x }
+            });
+            assert_eq!(seen, args);
+            if changed == args.len() {
+                assert!(mapped.is_none());
+            } else {
+                let mut expected = args.clone();
+                expected[changed] = types.u32;
+                assert_eq!(mapped, Some(expected));
+            }
+        }
+        let nested = types.tuple(vec![types.tuple(args), types.bool]);
+        let before = types.len();
+        assert_eq!(types.map(nested, &mut |_, _| None), nested);
+        assert_eq!(types.len(), before);
+        assert!(map_list(&[], &mut |_| panic!("empty list was mapped")).is_none());
+    }
 }
 
 /// Calls `f` on each type `kind` is made of.

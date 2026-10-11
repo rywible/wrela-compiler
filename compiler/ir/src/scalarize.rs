@@ -185,8 +185,8 @@ fn scalarize_let(m: &mut Module, f: &mut Function, v: ValueId, e: &Expr, out: &m
         Expr::Builtin(Builtin::Cross, args) => {
             let ct = em.m.types.scalar(s);
             let (a, b) = (args[0], args[1]);
-            let c: Vec<ValueId> = (0..3).map(|i| em.comp(a, i)).collect();
-            let d: Vec<ValueId> = (0..3).map(|i| em.comp(b, i)).collect();
+            let c: [ValueId; 3] = std::array::from_fn(|i| em.comp(a, i as u32));
+            let d: [ValueId; 3] = std::array::from_fn(|i| em.comp(b, i as u32));
             let part = |em: &mut Emit, i: usize, j: usize| {
                 let p = em.let_(ct, Expr::Binary(BinOp::Mul, c[i], d[j]));
                 let q = em.let_(ct, Expr::Binary(BinOp::Mul, c[j], d[i]));

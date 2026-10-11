@@ -911,7 +911,11 @@ impl Loader {
         let mut tops = std::collections::BTreeSet::new();
         for pf in &files {
             tops.insert(pf.module[0].clone());
-            let stand_in = std::fs::canonicalize(&pf.path).ok().and_then(|c| self.overlay.get(&c));
+            let stand_in = if self.overlay.is_empty() {
+                None
+            } else {
+                std::fs::canonicalize(&pf.path).ok().and_then(|c| self.overlay.get(&c))
+            };
             let text = match stand_in {
                 Some(t) => Ok(t.clone()),
                 None => std::fs::read(&pf.path).map_err(|e| e.to_string()).and_then(|b| {

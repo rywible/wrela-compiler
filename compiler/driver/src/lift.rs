@@ -97,6 +97,8 @@ fn why_not(checked: &Checked, file: FileId, start: u32, end: u32) -> &'static st
 /// isn't lifted.
 pub fn report(checked: &Checked, sources: &SourceMap, t: &LiftTable) -> String {
     use serde_json::json;
+    let lifted_ends: std::collections::HashSet<(u32, u32)> =
+        t.literals.iter().map(|l| (l.file, l.end)).collect();
     let literals: Vec<_> = t
         .literals
         .iter()
@@ -123,7 +125,7 @@ pub fn report(checked: &Checked, sources: &SourceMap, t: &LiftTable) -> String {
                 continue;
             }
             let (s, e) = (tok.span.start, tok.span.end);
-            let negated_lifted = t.literals.iter().any(|l| l.file as usize == fi && l.end == e);
+            let negated_lifted = lifted_ends.contains(&(fi as u32, e));
             if t.index.contains_key(&(f.id, s, e)) || negated_lifted {
                 continue;
             }

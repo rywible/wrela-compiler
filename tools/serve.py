@@ -139,22 +139,33 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         """Hook for tools/headless.py."""
 
 
-_GZIPPED = {}  # (path, size, mtime) -> the file gzipped
+class _GzipFile:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.version = None
+        self.body = None
+
+
+_GZIPPED = {}  # path -> the latest version of the file gzipped
 _GZIPPED_LOCK = threading.Lock()
 
 
 def gzipped(path):
     """The file at `path`, gzipped: once for each version of it."""
-    st = os.stat(path)
-    key = (path, st.st_size, st.st_mtime_ns)
     with _GZIPPED_LOCK:
-        body = _GZIPPED.get(key)
-    if body is None:
-        with open(path, "rb") as f:
-            body = gzip.compress(f.read(), compresslevel=6)
-        with _GZIPPED_LOCK:
-            _GZIPPED[key] = body
-    return body
+        cached = _GZIPPED.get(path)
+        if cached is None:
+            cached = _GZIPPED[path] = _GzipFile()
+    # One compression of this file at a time; other files can compress beside it. Discard
+    # its old bytes after a rebuild rather than keeping every version for the whole session.
+    with cached.lock:
+        st = os.stat(path)
+        version = (st.st_size, st.st_mtime_ns)
+        if cached.version != version:
+            with open(path, "rb") as f:
+                body = gzip.compress(f.read(), compresslevel=6)
+            cached.version, cached.body = version, body
+        return cached.body
 
 
 class Throttle:

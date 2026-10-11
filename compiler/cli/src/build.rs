@@ -5,6 +5,7 @@
 //! files are left alone, and the build stops rather than replace one. `.wrela-build` there
 //! lists the files the last build wrote.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::process::ExitCode;
 
@@ -59,8 +60,9 @@ pub fn run(args: &[String]) -> ExitCode {
     if failed {
         return ExitCode::from(1);
     }
+    let owned_names: HashSet<&str> = owned.iter().map(String::as_str).collect();
     if let Some((name, _)) =
-        output.files.iter().find(|(f, _)| !owned.contains(f) && out.join(f).exists())
+        output.files.iter().find(|(f, _)| !owned_names.contains(f.as_str()) && out.join(f).exists())
     {
         eprintln!(
             "error: `{}` is in the way: an earlier `wrela build` didn't write it, so it isn't replaced",
@@ -152,9 +154,10 @@ fn owned(out: &Path) -> std::io::Result<Vec<String>> {
 /// Removes the files in `out` that an earlier build wrote (`owned`) but `files` doesn't hold.
 /// Nothing else in `out` is touched.
 fn remove_stale(out: &Path, owned: &[String], files: &[(String, Vec<u8>)]) -> std::io::Result<()> {
+    let current: HashSet<&str> = files.iter().map(|(f, _)| f.as_str()).collect();
     for name in owned {
         let path = out.join(name);
-        if !files.iter().any(|(f, _)| f == name)
+        if !current.contains(name.as_str())
             && std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_file())
         {
             std::fs::remove_file(path)?;

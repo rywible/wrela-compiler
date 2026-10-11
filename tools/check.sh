@@ -76,43 +76,6 @@ fi
 
 step() { printf '\n== %s\n' "$*"; }
 
-# The long tests and the measurements, by name (`module::test`, or `test` in a test program of
-# one file): each test whose `#[ignore]` reason starts `long:` is in `long_tests`, `measure:` in
-# `measures`, and `heavy:` in `heavy_tests`.
-long_tests=() measures=() heavy_tests=()
-while read -r kind name; do
-  case $kind in
-    measure) measures+=("$name") ;;
-    heavy) heavy_tests+=("$name") ;;
-    *) long_tests+=("$name") ;;
-  esac
-done < <(python3 - <<'PY'
-import pathlib, re
-for f in sorted([*pathlib.Path("compiler").rglob("*.rs"), *pathlib.Path("runtime").rglob("*.rs")]):
-    if "target" in f.parts:
-        continue
-    lines = f.read_text().splitlines()
-    for i, line in enumerate(lines):
-        if m := re.search(r'#\[ignore = "(long|measure|heavy):', line):
-            name = next(re.search(r"fn (\w+)\(", l).group(1) for l in lines[i + 1:] if re.search(r"fn (\w+)\(", l))
-            # A test file at the top of `tests/` is a test program of its own (no module). A unit
-            # test in `src/` is in its file's module, under the directories it's in, and in its
-            # `mod tests` (a crate's root file names no module, nor does a `mod.rs`).
-            if f.parent.name == "tests":
-                print(m[1], name)
-            elif "src" in f.parts:
-                path = [*f.parts[f.parts.index("src") + 1 : -1], f.stem]
-                module = "".join(f"{p}::" for p in path if p not in ("lib", "main", "mod"))
-                inside = any(re.match(r"\s*mod tests\b", l) for l in lines[:i])
-                print(m[1], f"{module}{'tests::' if inside else ''}{name}")
-            else:
-                print(m[1], f"{f.stem}::{name}")
-PY
-)
-# A heavy test takes seconds on a GPU but minutes on a software one (lavapipe): there, it is a
-# long test, which main's long run checks every six hours.
-if [ -n "${WRELA_SOFTWARE_GPU:-}" ]; then long_tests+=("${heavy_tests[@]}"); fi
-
 # wrela sources the formatter owns. The conformance and diagnostics cases aren't here: some
 # are malformed on purpose, and their annotations are part of their layout.
 WRELA_SOURCES=(examples engine compiler/std compiler/tests/fields compiler/tests/math compiler/tests/sketches
@@ -131,6 +94,50 @@ if [ "$fmt" = 1 ]; then
   fi
   exit 0
 fi
+
+# Formatting does not need to scan the ignored tests. Their names are `module::test`, or
+# `test` in a test program of one file: `long:` tests are in `long_tests`, `measure:` in
+# `measures`, and `heavy:` in `heavy_tests`.
+long_tests=() measures=() heavy_tests=()
+while read -r kind name; do
+  case $kind in
+    measure) measures+=("$name") ;;
+    heavy) heavy_tests+=("$name") ;;
+    *) long_tests+=("$name") ;;
+  esac
+done < <(python3 - <<'PY'
+import pathlib, re
+for f in sorted([*pathlib.Path("compiler").rglob("*.rs"), *pathlib.Path("runtime").rglob("*.rs")]):
+    if "target" in f.parts:
+        continue
+    lines = f.read_text().splitlines()
+    next_functions = [None] * len(lines)
+    name = None
+    for i in range(len(lines) - 1, -1, -1):
+        next_functions[i] = name
+        if m := re.search(r"fn (\w+)\(", lines[i]):
+            name = m.group(1)
+    inside = False
+    for i, line in enumerate(lines):
+        if m := re.search(r'#\[ignore = "(long|measure|heavy):', line):
+            name = next_functions[i]
+            # A test file at the top of `tests/` is a test program of its own (no module). A unit
+            # test in `src/` is in its file's module, under the directories it's in, and in its
+            # `mod tests` (a crate's root file names no module, nor does a `mod.rs`).
+            if f.parent.name == "tests":
+                print(m[1], name)
+            elif "src" in f.parts:
+                path = [*f.parts[f.parts.index("src") + 1 : -1], f.stem]
+                module = "".join(f"{p}::" for p in path if p not in ("lib", "main", "mod"))
+                print(m[1], f"{module}{'tests::' if inside else ''}{name}")
+            else:
+                print(m[1], f"{f.stem}::{name}")
+        inside |= bool(re.match(r"\s*mod tests\b", line))
+PY
+)
+# A heavy test takes seconds on a GPU but minutes on a software one (lavapipe): there, it is a
+# long test, which main's long run checks every six hours.
+if [ -n "${WRELA_SOFTWARE_GPU:-}" ]; then long_tests+=("${heavy_tests[@]}"); fi
 
 logs=$(mktemp -d)
 side_jobs=()

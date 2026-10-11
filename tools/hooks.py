@@ -96,12 +96,13 @@ def measures(root):
                 continue
             with open(path, encoding="utf-8", errors="replace") as f:
                 lines = f.read().splitlines()
-            for i, line in enumerate(lines):
+            next_fn = None
+            for line in reversed(lines):
                 if '#[ignore = "measure:' in line:
-                    for later in lines[i + 1:]:
-                        if m := re.search(r"fn (\w+)\(", later):
-                            names.add(m.group(1))
-                            break
+                    if next_fn:
+                        names.add(next_fn)
+                if m := re.search(r"fn (\w+)\(", line):
+                    next_fn = m.group(1)
     return names
 
 

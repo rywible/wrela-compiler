@@ -1,6 +1,85 @@
 use super::*;
 use crate::token::TokenKind as T;
 
+#[test]
+fn frontend_perf_punctuation_dispatch_preserves_longest_match() {
+    fn check(text: &str) {
+        let lexer = Lexer {
+            file: FileId(0),
+            src: text.as_bytes(),
+            text,
+            pos: 0,
+            out: Lexed::default(),
+            holes: Vec::new(),
+        };
+        let expected = TokenKind::PUNCT
+            .iter()
+            .copied()
+            .find(|k| text.starts_with(k.fixed_text().unwrap()))
+            .filter(|k| {
+                *k != TokenKind::Underscore
+                    || !text.as_bytes().get(1).copied().is_some_and(is_ident_continue)
+            });
+        assert_eq!(lexer.punct(), expected, "{text:?}");
+    }
+    for &kind in TokenKind::PUNCT {
+        let text = kind.fixed_text().unwrap();
+        assert!(text.is_ascii() && text.len() <= 3, "{text:?}");
+        check(text);
+        for &next in TokenKind::PUNCT {
+            check(&format!("{text}{}", next.fixed_text().unwrap()));
+        }
+        for suffix in ["name", "42", " ", "\n", "é", "αβ", "🦀"] {
+            check(&format!("{text}{suffix}"));
+        }
+    }
+    for byte in 0..=127u8 {
+        for suffix in ["", "=", ">=", "ab", "_", "é", "🦀"] {
+            check(&format!("{}{suffix}", char::from(byte)));
+        }
+    }
+    for text in ["", "é", "🦀", "ident"] {
+        check(text);
+    }
+}
+
+#[test]
+fn frontend_perf_literal_decoding_preserves_values_and_float_rounding() {
+    for text in ["42", "0xff", "18446744073709551615", "1.5", "1e-300", "1.5f32"] {
+        assert!(matches!(number_digits(text), Cow::Borrowed(_)), "{text}");
+    }
+    for text in ["4_2", "0xf_f", "1_000u32", "1.000_000_059_604_644_8"] {
+        assert!(matches!(number_digits(text), Cow::Owned(_)), "{text}");
+    }
+    let ints = ["42", "0xff", "18446744073709551615", "4_2", "0xf_f", "1_000u32"];
+    for text in ints {
+        let clean: String = without_type_suffix(text).chars().filter(|c| *c != '_').collect();
+        let expected = if let Some(digits) = clean.strip_prefix("0x") {
+            u64::from_str_radix(digits, 16).unwrap()
+        } else {
+            clean.parse().unwrap()
+        };
+        assert_eq!(int_value(text), IntValue::Ok(expected));
+    }
+    for text in [
+        "1.5",
+        "1_000.0",
+        "1e-300",
+        "1.5f32",
+        "1.0000000596046448",
+        "1.000_000_059_604_644_8",
+        "invalid",
+    ] {
+        let clean: String = without_type_suffix(text).chars().filter(|c| *c != '_').collect();
+        let expected64: f64 = clean.parse().unwrap_or(f64::NAN);
+        let expected32: f32 = clean.parse().unwrap_or(f32::NAN);
+        assert_eq!(float_value(text).to_bits(), expected64.to_bits(), "{text}");
+        assert_eq!(float_value_f32(text).to_bits(), expected32.to_bits(), "{text}");
+    }
+    // This decimal is above an f32 midpoint but rounds to that midpoint in f64.
+    assert_ne!(float_value_f32("1.0000000596046448"), float_value("1.0000000596046448") as f32);
+}
+
 fn kinds(src: &str) -> Vec<TokenKind> {
     lex(FileId(0), src).tokens.iter().map(|t| t.kind).collect()
 }

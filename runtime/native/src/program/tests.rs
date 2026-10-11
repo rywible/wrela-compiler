@@ -164,6 +164,48 @@ fn the_default_limits_are_webgpus() {
 }
 
 #[test]
+fn audio_quanta_copy_samples_before_the_next_call_overwrites_them() {
+    let wat = format!(
+        r#"(module
+          (import "wrela" "memory" (memory 20 16384 shared))
+          (import "wrela" "audio" (func $audio (param i32 i32)))
+          (export "memory" (memory 0))
+          (global $quantum (mut i32) (i32.const 0))
+          (func (export "init") (call $audio (i32.const 1) (i32.const 0)))
+          (func (export "frame") (param f32 i32 i32))
+          (func (export "__audio") (param i32 i32 i32) (local $i i32)
+            (loop $samples
+              (f32.store
+                (i32.add (i32.const {audio_out}) (i32.mul (local.get $i) (i32.const 4)))
+                (f32.convert_i32_u
+                  (i32.add (global.get $quantum) (local.get $i))))
+              (f32.store
+                (i32.add (i32.const {right_out}) (i32.mul (local.get $i) (i32.const 4)))
+                (f32.neg (f32.convert_i32_u
+                  (i32.add (i32.add (global.get $quantum) (local.get $i)) (i32.const 1)))))
+              (local.set $i (i32.add (local.get $i) (i32.const 1)))
+              (br_if $samples (i32.lt_u (local.get $i) (i32.const {n}))))
+            (global.set $quantum (i32.add (global.get $quantum) (i32.const {n})))))"#,
+        audio_out = memory::AUDIO_OUT,
+        right_out = memory::AUDIO_OUT + 4 * AUDIO_QUANTUM,
+        n = AUDIO_QUANTUM,
+    );
+    let mut program = load_wat(&wat).expect("a voice");
+    assert!(program.render_audio(0).expect("no samples requested").is_empty());
+    let samples = program.render_audio(3).expect("three quanta");
+    assert_eq!(
+        samples,
+        (0..3 * AUDIO_QUANTUM).flat_map(|n| [n as f32, -(n as f32 + 1.0)]).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        program.render_audio(1).expect("the next quantum"),
+        (3 * AUDIO_QUANTUM..4 * AUDIO_QUANTUM)
+            .flat_map(|n| [n as f32, -(n as f32 + 1.0)])
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn a_start_function_cant_call_the_host() {
     let err = load_wat(
         r#"(module (import "wrela" "submit" (func $submit (param i32 i32)))

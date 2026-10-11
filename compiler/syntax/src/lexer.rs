@@ -3,6 +3,7 @@
 
 use crate::ast::IntValue;
 use crate::token::{Comment, Token, TokenKind};
+use std::borrow::Cow;
 use wrela_diag::{Diagnostic, Edit, FileId, Span, codes};
 
 /// The lexer's output: tokens (NEWLINEs inserted, EOF last), comments and diagnostics.
@@ -393,15 +394,16 @@ impl<'a> Lexer<'a> {
 
     /// L15: the longest punctuation token at the current position.
     fn punct(&self) -> Option<TokenKind> {
-        let rest = &self.src[self.pos..];
-        TokenKind::PUNCT
-            .iter()
-            .copied()
-            .find(|k| k.fixed_text().is_some_and(|t| rest.starts_with(t.as_bytes())))
-            .filter(|k| {
+        let rest = &self.text[self.pos..];
+        // Fixed spellings are at most three ASCII bytes. A match dispatches by length and
+        // spelling, rather than comparing every punctuation token at every source position.
+        [3, 2, 1].into_iter().find_map(|n| rest.get(..n).and_then(TokenKind::punctuation)).filter(
+            |k| {
                 // `_` followed by an identifier character is an identifier (L10).
-                *k != TokenKind::Underscore || !rest.get(1).copied().is_some_and(is_ident_continue)
-            })
+                *k != TokenKind::Underscore
+                    || !rest.as_bytes().get(1).copied().is_some_and(is_ident_continue)
+            },
+        )
     }
 
     fn ident(&mut self, line_break_before: bool) {
@@ -970,7 +972,7 @@ fn without_type_suffix(text: &str) -> &str {
 
 /// The value of an INT token's text, or `None` if it isn't a number that fits in a `u64`.
 fn u64_value(text: &str) -> Option<u64> {
-    let clean: String = without_type_suffix(text).chars().filter(|c| *c != '_').collect();
+    let clean = number_digits(text);
     let (digits, radix) = match clean.get(..2) {
         Some("0x") => (&clean[2..], 16),
         Some("0b") => (&clean[2..], 2),
@@ -982,15 +984,25 @@ fn u64_value(text: &str) -> Option<u64> {
 
 /// The value of a FLOAT token's text, `_` ignored.
 pub fn float_value(text: &str) -> f64 {
-    let clean: String = without_type_suffix(text).chars().filter(|c| *c != '_').collect();
+    let clean = number_digits(text);
     clean.parse().unwrap_or(f64::NAN)
 }
 
 /// [`float_value`] as an `f32`, rounded once from the decimal: rounding the `f64` again could
 /// land on the other side of a tie.
 pub fn float_value_f32(text: &str) -> f32 {
-    let clean: String = without_type_suffix(text).chars().filter(|c| *c != '_').collect();
+    let clean = number_digits(text);
     clean.parse().unwrap_or(f32::NAN)
+}
+
+/// Most literals have no separators; Rust's number parser can read the source directly.
+fn number_digits(text: &str) -> Cow<'_, str> {
+    let text = without_type_suffix(text);
+    if text.as_bytes().contains(&b'_') {
+        Cow::Owned(text.chars().filter(|c| *c != '_').collect())
+    } else {
+        Cow::Borrowed(text)
+    }
 }
 
 #[cfg(test)]

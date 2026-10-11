@@ -137,11 +137,7 @@ impl String {
 
     /// Adds `s` at the end.
     pub fn push_str(mut self, s: str) {
-        let n = s.len()
-        self.bytes.reserve(n)
-        for i in 0..n {
-            self.bytes.push(s.byte(i))
-        }
+        self.bytes.append_text(s)
     }
 
     /// Adds one byte, which must keep the text UTF-8: an ASCII character's code.
@@ -617,7 +613,7 @@ fn is_space(b: u8) -> bool {
 
 /// A run's address and length: the compiler lays a `str` out as these two words.
 @intrinsic
-fn str_addr(s: str) -> u32 {}
+pub(package) fn str_addr(s: str) -> u32 {}
 
 @intrinsic
 fn str_len(s: str) -> u32 {}

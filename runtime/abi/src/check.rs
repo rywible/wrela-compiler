@@ -134,6 +134,8 @@ pub struct Checker {
     scope: HashMap<u32, (bool, bool)>,
     /// The open pass's attachments.
     attachments: Vec<u32>,
+    /// Read-write buffers in this command: reused across draws and dispatches.
+    written: Vec<u32>,
     /// The open pass's colour target's format (the screen's, a texture's, or none), and whether
     /// it has a depth target: which pipelines its draws may draw with.
     targets: (Option<TextureFormat>, bool),
@@ -170,6 +172,7 @@ impl Checker {
             resources: HashMap::new(),
             scope: HashMap::new(),
             attachments: Vec::new(),
+            written: Vec::new(),
             targets: (None, false),
         }
     }
@@ -635,7 +638,7 @@ impl Checker {
                 "pipeline {pipeline} ({name}) takes {want} uniform bytes, but the command has {uniform_len}"
             ));
         }
-        let mut written = Vec::new();
+        self.written.clear();
         for (b, &(kind, format)) in bindings.iter().zip(&p.bindings) {
             if self.attachments.contains(&b.handle) {
                 return err(format!(
@@ -660,14 +663,14 @@ impl Checker {
                     }
                     let write = kind == BindingKind::ReadWrite;
                     if write {
-                        if written.contains(&b.handle) {
+                        if self.written.contains(&b.handle) {
                             let one = if dispatch { "dispatch" } else { "draw" };
                             return err(format!(
                                 "buffer {} is bound read-write twice in one {one}",
                                 b.handle
                             ));
                         }
-                        written.push(b.handle);
+                        self.written.push(b.handle);
                     }
                     Self::used(&mut self.scope, op, "buffer", b.handle, write)?;
                 }
@@ -712,6 +715,27 @@ impl Checker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn writable_bindings_are_checked_per_command_even_after_an_error() {
+        let mut checker = Checker::new(&crate::vectors::check_manifest());
+        for handle in 1..=2 {
+            checker.check(&Command::CreateBuffer { handle, size: 64 }).expect("created");
+        }
+        let dispatch = |bindings| Command::Dispatch {
+            pipeline: 3,
+            groups: [1; 3],
+            bindings,
+            uniforms: &[0; 16],
+        };
+        let a = Binding::range(1, 0, 64);
+        let b = Binding::range(2, 0, 64);
+        checker.check(&dispatch(vec![a, b])).expect("two distinct outputs");
+        checker.check(&dispatch(vec![a, b])).expect("the next dispatch can write them again");
+        let error = checker.check(&dispatch(vec![a, a])).expect_err("a duplicate output");
+        assert_eq!(error.why, "buffer 1 is bound read-write twice in one dispatch");
+        checker.check(&dispatch(vec![a, b])).expect("a rejected command does not retain outputs");
+    }
 
     #[test]
     fn rejected_draws_and_passes_leave_checker_state_unchanged() {

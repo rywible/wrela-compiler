@@ -277,27 +277,108 @@ fn binary(op: BinOp, a: Const, b: Const) -> Option<Const> {
 /// A copy of `s` whose values are new: each value it defines gets a new name, in `names`, and
 /// the values it uses go by theirs.
 fn copy(f: &mut Function, s: &Stmt, names: &mut HashMap<ValueId, ValueId>) -> Stmt {
-    let mut s = s.clone();
-    s.for_each_value_mut(&mut |x| {
+    // Copy control flow's children once. Cloning the whole statement before copying each
+    // child again would copy every nested block once for each block around it.
+    let mut out = match s {
+        Stmt::If { cond, .. } => Stmt::If { cond: *cond, then: Vec::new(), else_: Vec::new() },
+        Stmt::Loop { .. } => Stmt::Loop { body: Vec::new(), continuing: Vec::new() },
+        other => other.clone(),
+    };
+    out.for_each_value_mut(&mut |x| {
         if let Some(n) = names.get(x) {
             *x = *n;
         }
     });
-    match &mut s {
-        Stmt::Let(v, _) => {
+    match (s, &mut out) {
+        (_, Stmt::Let(v, _)) => {
             let n = f.new_value(f.value_ty(*v));
             names.insert(*v, n);
             *v = n;
         }
-        Stmt::If { then, else_, .. } => {
-            *then = then.iter().map(|s| copy(f, s, names)).collect();
-            *else_ = else_.iter().map(|s| copy(f, s, names)).collect();
+        (Stmt::If { then, else_, .. }, Stmt::If { then: out_then, else_: out_else, .. }) => {
+            *out_then = then.iter().map(|s| copy(f, s, names)).collect();
+            *out_else = else_.iter().map(|s| copy(f, s, names)).collect();
         }
-        Stmt::Loop { body, continuing } => {
-            *body = body.iter().map(|s| copy(f, s, names)).collect();
-            *continuing = continuing.iter().map(|s| copy(f, s, names)).collect();
+        (Stmt::Loop { body, continuing }, Stmt::Loop { body: out_body, continuing: out_cont }) => {
+            *out_body = body.iter().map(|s| copy(f, s, names)).collect();
+            *out_cont = continuing.iter().map(|s| copy(f, s, names)).collect();
         }
         _ => {}
     }
-    s
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn old_copy(
+        f: &mut Function,
+        s: &Stmt,
+        names: &mut HashMap<ValueId, ValueId>,
+        cloned: &mut usize,
+    ) -> Stmt {
+        visit::walk(std::slice::from_ref(s), &mut |_| *cloned += 1);
+        let mut s = s.clone();
+        s.for_each_value_mut(&mut |x| {
+            if let Some(n) = names.get(x) {
+                *x = *n;
+            }
+        });
+        match &mut s {
+            Stmt::Let(v, _) => {
+                let n = f.new_value(f.value_ty(*v));
+                names.insert(*v, n);
+                *v = n;
+            }
+            Stmt::If { then, else_, .. } => {
+                *then = then.iter().map(|s| old_copy(f, s, names, cloned)).collect();
+                *else_ = else_.iter().map(|s| old_copy(f, s, names, cloned)).collect();
+            }
+            Stmt::Loop { body, continuing } => {
+                *body = body.iter().map(|s| old_copy(f, s, names, cloned)).collect();
+                *continuing = continuing.iter().map(|s| old_copy(f, s, names, cloned)).collect();
+            }
+            _ => {}
+        }
+        s
+    }
+
+    #[test]
+    fn codegen_perf_unroll_copies_nested_control_flow_once() {
+        let mut types = Types::default();
+        let (u, b) = (types.u32(), types.bool());
+        let mut f = Function::new("nested", Vec::new(), None);
+        let local = f.new_local("counter", u);
+        let (cond, value) = (f.new_value(b), f.new_value(u));
+        let mut nested = Stmt::Store(Place::local(local), value);
+        for _ in 0..12 {
+            let next = f.new_value(u);
+            nested = Stmt::If {
+                cond,
+                then: vec![Stmt::Let(next, Expr::Binary(BinOp::Add, value, value)), nested],
+                else_: vec![Stmt::Store(Place::local(local), value)],
+            };
+        }
+        let source = Stmt::Loop {
+            body: vec![
+                Stmt::Let(cond, Expr::Const(Const::Bool(true))),
+                Stmt::Let(value, Expr::Const(Const::U32(3))),
+                nested,
+            ],
+            continuing: vec![Stmt::Store(Place::local(local), value)],
+        };
+        let mut expected_f = f.clone();
+        let (mut names, mut expected_names) = (HashMap::new(), HashMap::new());
+        let mut cloned = 0;
+        let expected = old_copy(&mut expected_f, &source, &mut expected_names, &mut cloned);
+        let actual = copy(&mut f, &source, &mut names);
+        assert_eq!(actual, expected);
+        assert_eq!(f, expected_f);
+        assert_eq!(names, expected_names);
+        let mut statements = 0;
+        visit::walk(std::slice::from_ref(&source), &mut |_| statements += 1);
+        assert_eq!(statements, 41);
+        assert_eq!(cloned, 315);
+    }
 }

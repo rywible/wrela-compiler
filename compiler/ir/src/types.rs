@@ -109,6 +109,8 @@ pub struct Types {
     /// parts' layouts (so a type that repeats a part is laid out once, not once per repetition).
     layouts: Vec<crate::layout::Layout>,
     offsets: Vec<Box<[u32]>>,
+    /// Whether a type contains a float, decided once from its already interned parts.
+    floats: Vec<bool>,
 }
 
 impl Types {
@@ -129,8 +131,21 @@ impl Types {
         }
         let t = TypeId(self.defs.len() as u32);
         let (layout, offsets) = crate::layout::compute(self, &d);
+        let floats = match &d {
+            TypeDef::Scalar(s) | TypeDef::Vector(s, _) => s.is_float(),
+            TypeDef::Atomic(_) => false,
+            TypeDef::Matrix(..) => true,
+            TypeDef::Struct { fields, .. } => fields.iter().any(|(_, t)| self.has_float(*t)),
+            TypeDef::Enum { variants, .. } => {
+                variants.iter().any(|(_, t)| t.is_some_and(|t| self.has_float(t)))
+            }
+            TypeDef::Array(t, _) | TypeDef::RuntimeArray(t) | TypeDef::Run(t) | TypeDef::Ptr(t) => {
+                self.has_float(*t)
+            }
+        };
         self.layouts.push(layout);
         self.offsets.push(offsets);
+        self.floats.push(floats);
         self.defs.push(d.clone());
         self.map.insert(d, t);
         t
@@ -254,19 +269,7 @@ impl Types {
     /// Whether any part of the type is a float (so a derivative or interval of it means
     /// something).
     pub fn has_float(&self, t: TypeId) -> bool {
-        match self.get(t) {
-            TypeDef::Scalar(s) => s.is_float(),
-            TypeDef::Atomic(_) => false,
-            TypeDef::Vector(s, _) => s.is_float(),
-            TypeDef::Matrix(..) => true,
-            TypeDef::Struct { fields, .. } => fields.iter().any(|(_, f)| self.has_float(*f)),
-            TypeDef::Enum { variants, .. } => {
-                variants.iter().any(|(_, p)| p.is_some_and(|p| self.has_float(p)))
-            }
-            TypeDef::Array(e, _) | TypeDef::RuntimeArray(e) | TypeDef::Run(e) | TypeDef::Ptr(e) => {
-                self.has_float(*e)
-            }
-        }
+        self.floats[t.index()]
     }
 
     pub fn display(&self, t: TypeId) -> String {
@@ -288,5 +291,82 @@ impl Types {
             TypeDef::Ptr(e) => format!("*{}", self.display(*e)),
             TypeDef::Atomic(s) => format!("atomic<{}>", s.name()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn recursive_float(types: &Types, t: TypeId, visits: &mut usize) -> bool {
+        *visits += 1;
+        match types.get(t) {
+            TypeDef::Scalar(s) | TypeDef::Vector(s, _) => s.is_float(),
+            TypeDef::Atomic(_) => false,
+            TypeDef::Matrix(..) => true,
+            TypeDef::Struct { fields, .. } => {
+                fields.iter().any(|(_, t)| recursive_float(types, *t, visits))
+            }
+            TypeDef::Enum { variants, .. } => {
+                variants.iter().any(|(_, t)| t.is_some_and(|t| recursive_float(types, t, visits)))
+            }
+            TypeDef::Array(t, _) | TypeDef::RuntimeArray(t) | TypeDef::Run(t) | TypeDef::Ptr(t) => {
+                recursive_float(types, *t, visits)
+            }
+        }
+    }
+
+    #[test]
+    fn codegen_perf_float_classification_matches_recursive_types() {
+        let mut types = Types::default();
+        let (f, u) = (types.f32(), types.u32());
+        for s in [Scalar::Bool, Scalar::I8, Scalar::U16, Scalar::I64, Scalar::U64, Scalar::F64] {
+            types.scalar(s);
+        }
+        types.intern(TypeDef::Atomic(Scalar::U32));
+        types.intern(TypeDef::Matrix(2, 3));
+        types.vector_of(Scalar::U32, 3);
+        types.vector_of(Scalar::F64, 2);
+        let mixed = types.intern(TypeDef::Struct {
+            name: "mixed".into(),
+            fields: vec![("integer".into(), u), ("float".into(), f)],
+        });
+        types.intern(TypeDef::Struct { name: "empty".into(), fields: Vec::new() });
+        for payload in [None, Some(u), Some(mixed)] {
+            types.intern(TypeDef::Enum {
+                name: format!("enum{payload:?}"),
+                variants: vec![("empty".into(), None), ("payload".into(), payload)],
+                tags: vec![4, 9],
+            });
+        }
+        for t in [f, u, mixed] {
+            for def in
+                [TypeDef::Array(t, 0), TypeDef::RuntimeArray(t), TypeDef::Run(t), TypeDef::Ptr(t)]
+            {
+                types.intern(def);
+            }
+        }
+        let cloned = types.clone();
+        for (t, def) in types.iter() {
+            assert_eq!(types.has_float(t), recursive_float(&types, t, &mut 0), "{def:?}");
+            assert_eq!(cloned.has_float(t), types.has_float(t));
+        }
+    }
+
+    #[test]
+    fn codegen_perf_shared_integer_parts_are_classified_once() {
+        let mut types = Types::default();
+        let mut t = types.u32();
+        for depth in 0..12 {
+            t = types.intern(TypeDef::Struct {
+                name: format!("layer{depth}"),
+                fields: vec![("left".into(), t), ("right".into(), t)],
+            });
+        }
+        let mut recursive_visits = 0;
+        assert!(!recursive_float(&types, t, &mut recursive_visits));
+        assert_eq!(recursive_visits, 8191);
+        assert_eq!(types.floats.len(), 13);
+        assert!(!types.has_float(t));
     }
 }

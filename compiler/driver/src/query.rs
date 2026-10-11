@@ -347,12 +347,12 @@ fn adts_in(p: &Program, t: TyId, out: &mut Vec<AdtId>) {
             if !out.contains(a) {
                 out.push(*a);
             }
-            for &x in args.clone().iter() {
+            for &x in args.iter() {
                 adts_in(p, x, out);
             }
         }
         TyKind::Tuple(ts) => {
-            for &x in ts.clone().iter() {
+            for &x in ts.iter() {
                 adts_in(p, x, out);
             }
         }
@@ -417,13 +417,26 @@ fn parse_signature(sig: &str) -> Result<(Vec<String>, Option<String>), String> {
 
 /// Whether `have` (a function's parameter types) fit `want` (a search's).
 fn params_fit(want: &[String], have: &[String]) -> bool {
-    match want.split_first() {
-        None => have.is_empty(),
-        Some((w, rest)) if w == ".." => (0..=have.len()).any(|k| params_fit(rest, &have[k..])),
-        Some((w, rest)) => {
-            have.split_first().is_some_and(|(h, hr)| (w == "_" || w == h) && params_fit(rest, hr))
+    if !want.iter().any(|w| w == "..") {
+        return want.len() == have.len() && want.iter().zip(have).all(|(w, h)| w == "_" || w == h);
+    }
+    // Each prefix of `have` is reachable once, rather than trying every way several `..`
+    // parameters could split it. A failed search stays bounded by the signature's size.
+    let mut fits = vec![false; have.len() + 1];
+    fits[0] = true;
+    for w in want {
+        if w == ".." {
+            for i in 1..fits.len() {
+                fits[i] |= fits[i - 1];
+            }
+        } else {
+            for i in (1..fits.len()).rev() {
+                fits[i] = fits[i - 1] && (w == "_" || w == &have[i - 1]);
+            }
+            fits[0] = false;
         }
     }
+    fits[have.len()]
 }
 
 /// The program's functions, types and traits by path, and how to show them.
@@ -593,9 +606,8 @@ impl<'a> Index<'a> {
 
     pub fn fn_path(&self, f: FnId) -> String {
         self.fns
-            .iter()
-            .find(|(g, _)| *g == f)
-            .map_or_else(|| self.p.fn_display_name(f), |(_, p)| p.join("::"))
+            .binary_search_by_key(&f, |(g, _)| *g)
+            .map_or_else(|_| self.p.fn_display_name(f), |i| self.fns[i].1.join("::"))
     }
 
     pub fn at(&self, span: Span) -> String {
@@ -633,10 +645,11 @@ impl<'a> Index<'a> {
     }
 
     fn file(&self, name: &str) -> Result<FileId, String> {
+        let suffix = format!("/{name}");
         let found: Vec<(FileId, &str)> = self
             .sources
             .files()
-            .filter(|(_, f)| f.name == name || f.name.ends_with(&format!("/{name}")))
+            .filter(|(_, f)| f.name == name || f.name.ends_with(&suffix))
             .map(|(id, f)| (id, f.name.as_str()))
             .collect();
         match found.as_slice() {
@@ -1246,5 +1259,46 @@ mod tests {
             ["Vec<u32,f32>", "f32"]
         );
         assert!(parse_signature("vec3 -> f32").is_err());
+    }
+
+    #[test]
+    fn perf_signature_wildcards_match_every_short_sequence() {
+        fn reference(want: &[String], have: &[String]) -> bool {
+            match want.split_first() {
+                None => have.is_empty(),
+                Some((w, rest)) if w == ".." => {
+                    (0..=have.len()).any(|k| reference(rest, &have[k..]))
+                }
+                Some((w, rest)) => have
+                    .split_first()
+                    .is_some_and(|(h, hr)| (w == "_" || w == h) && reference(rest, hr)),
+            }
+        }
+        fn sequences(alphabet: &[&str], max: usize) -> Vec<Vec<String>> {
+            let mut all = vec![Vec::new()];
+            for _ in 0..max {
+                let more = all
+                    .iter()
+                    .filter(|s| s.len() == all.last().unwrap().len())
+                    .flat_map(|s| {
+                        alphabet.iter().map(move |&a| {
+                            let mut next = s.clone();
+                            next.push(a.into());
+                            next
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                all.extend(more);
+            }
+            all
+        }
+        for want in sequences(&["f32", "u32", "_", ".."], 4) {
+            for have in sequences(&["f32", "u32"], 4) {
+                assert_eq!(params_fit(&want, &have), reference(&want, &have), "{want:?}, {have:?}");
+            }
+        }
+        let mut want = vec!["..".to_string(); 32];
+        want.push("missing".into());
+        assert!(!params_fit(&want, &vec!["f32".into(); 64]));
     }
 }

@@ -5,15 +5,18 @@ import { buildModule, type Import, op } from "./wasm-builder.ts";
 
 const oldProcessor = Object.getOwnPropertyDescriptor(globalThis, "AudioWorkletProcessor");
 const oldRegister = Object.getOwnPropertyDescriptor(globalThis, "registerProcessor");
+const oldDecoder = Object.getOwnPropertyDescriptor(globalThis, "TextDecoder");
 
 afterEach(() => {
   if (oldProcessor) Object.defineProperty(globalThis, "AudioWorkletProcessor", oldProcessor);
   else delete (globalThis as Record<string, unknown>).AudioWorkletProcessor;
   if (oldRegister) Object.defineProperty(globalThis, "registerProcessor", oldRegister);
   else delete (globalThis as Record<string, unknown>).registerProcessor;
+  if (oldDecoder) Object.defineProperty(globalThis, "TextDecoder", oldDecoder);
+  else delete (globalThis as Record<string, unknown>).TextDecoder;
 });
 
-test("the audio worklet discriminates a printed line from a trap", async () => {
+test.each(["with", "without"] as const)("the audio worklet %s TextDecoder discriminates a printed line from a trap", async (decoder) => {
   const messages: FromVoice[] = [];
   class Processor {
     readonly port = { postMessage: (message: FromVoice) => messages.push(message) };
@@ -29,7 +32,13 @@ test("the audio worklet discriminates a printed line from a trap", async () => {
     },
     configurable: true,
   });
-  await import(`../src/worklet.ts?print=${Date.now()}`);
+  if (decoder === "without") {
+    const bundle = await Bun.build({ entrypoints: [new URL("../src/worklet.ts", import.meta.url).pathname], target: "browser", format: "esm" });
+    expect(bundle.success).toBe(true);
+    const path = `data:text/javascript;base64,${Buffer.from(await bundle.outputs[0]!.text()).toString("base64")}`;
+    Reflect.deleteProperty(globalThis, "TextDecoder");
+    await import(path);
+  } else await import(`../src/worklet.ts?print=${Date.now()}`);
 
   const PRINT: Import = { module: "wrela", name: "print", kind: "func", type: { params: ["i32", "i32"], results: [] } };
   const line = new TextEncoder().encode("from voice");

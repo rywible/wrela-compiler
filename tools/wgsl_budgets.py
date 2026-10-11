@@ -41,7 +41,8 @@ try:
         for wgsl in sorted(built.glob("*.wgsl")):
             pipelines += 1
             text = wgsl.read_bytes()
-            raw, packed = len(text), len(gzip.compress(text))
+            raw = len(text)
+            packed = len(gzip.compress(text)) if gz_budget is not None or raw > raw_budget else 0
             if raw > raw_budget or (gz_budget and packed > gz_budget):
                 sys.exit(f"{pkg}/{wgsl.name} is {raw / 1024:.0f} KiB ({packed / 1024:.0f} gzipped), over its size budget")
             largest = max(largest, raw)

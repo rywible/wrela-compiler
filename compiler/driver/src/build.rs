@@ -38,7 +38,6 @@ pub fn emit(l: &Lowered, sources: &SourceMap, simd: bool, budgets: bool) -> Buil
     let options = wrela_wasm::Options { simd, ..wrela_wasm::Options::default() };
     match wrela_wasm::emit_with(&l.cpu, options) {
         Ok(out) => {
-            code_lines = out.lines.clone();
             // Where each part of the code came from, as `file:line:column`, for trap messages.
             let entries: Vec<(u32, Option<String>)> = out
                 .lines
@@ -49,6 +48,7 @@ pub fn emit(l: &Lowered, sources: &SourceMap, simd: bool, budgets: bool) -> Buil
                 .collect();
             let lines = wrela_abi::lines::Lines::new(entries).encode();
             let wasm = wrela_wasm::with_custom_section(out.wasm, wrela_abi::lines::SECTION, &lines);
+            code_lines = out.lines;
             files.push(("game.wasm".to_string(), wasm));
         }
         Err(e) => diagnostics.push(Diagnostic::internal(format!("the WASM back end failed: {e}"))),
