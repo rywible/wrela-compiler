@@ -42,7 +42,11 @@ const POLL: Duration = Duration::from_millis(500);
 /// that queue are those that see the same `$TMPDIR` (normally all of one user's); a run with
 /// another one, or another user's, takes a lock of its own.
 fn lock_path() -> PathBuf {
-    lock_path_in(std::env::var_os("TMPDIR"), std::env::home_dir())
+    let path = lock_path_in(std::env::var_os("TMPDIR"), std::env::home_dir());
+    // This crate's unit tests take the lock alone. On the real file they'd wait for every GPU
+    // test the checks run beside them, which share it (minutes on a software GPU). Nothing else
+    // in this crate's unit tests takes the lock.
+    if cfg!(test) { path.with_file_name("wrela-gpu-unit-tests.lock") } else { path }
 }
 
 fn lock_path_in(tmpdir: Option<OsString>, home: Option<PathBuf>) -> PathBuf {
