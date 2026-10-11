@@ -17,10 +17,11 @@ fn script() -> String {
 }
 
 /// The package's own tests (`wrela test examples/climber`: the fight's, the cape's, the
-/// darkness's, the figure's, the sounds'), on the CPU: about 2 s, so the gate runs them.
+/// darkness's, the figure's, the sounds', the look's), on the CPU: about 2 s, so the gate runs
+/// them.
 #[test]
 fn the_fights_own_tests_pass() {
-    assert_eq!(super::tests_pass(&repo_root().join("examples/climber")), 17);
+    assert_eq!(super::tests_pass(&repo_root().join("examples/climber")), 19);
 }
 
 /// The fight recorded natively replays to the same hashes: the same presses, the same fight.
