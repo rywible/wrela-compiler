@@ -1181,7 +1181,7 @@ const SYSTEMS: [(&str, f64, &[&str]); 9] = [
         ],
     ),
     ("temporal AA", 1.0, &["temporal"]),
-    ("look", 2.0, &["look"]),
+    ("look", 2.0, &["look", "lines"]),
 ];
 
 /// Each system's time (ms) in each of `frames` (its labels' times summed), from a run's timings.

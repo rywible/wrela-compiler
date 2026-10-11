@@ -2410,7 +2410,7 @@ const SYSTEMS: [(&str, f64, &[&str]); 7] = [
     ),
     ("sky", 1.0, &["sky", "clouds", "air", "clouds noise", "clouds weather", "clouds shadow"]),
     ("temporal AA", 1.0, &["temporal"]),
-    ("look", 2.0, &["look", "look glow", "look develop"]),
+    ("look", 2.0, &["look", "look glow", "look develop", "lines"]),
 ];
 
 /// The camera's path, from Space at frame 1: the frame it began at (the clearing prints it).
