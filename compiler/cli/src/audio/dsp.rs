@@ -46,17 +46,43 @@ pub fn read_wav(path: &Path) -> Result<(Vec<f32>, usize, f64), String> {
         let id = &bytes[at..at + 4];
         let len = u32_at(at + 4) as usize;
         let body = at + 8;
+        if len > bytes.len() - body {
+            return Err(format!("{} has a truncated WAV chunk", path.display()));
+        }
         if id == b"fmt " {
+            if len < 16 || (u16_at(body) == 0xFFFE && len < 40) {
+                return Err(format!("{} has a short `fmt ` chunk", path.display()));
+            }
             format = u16_at(body);
             channels = usize::from(u16_at(body + 2));
             rate = f64::from(u32_at(body + 4));
             bits = u16_at(body + 14);
+            if channels == 0 || rate == 0.0 {
+                return Err(format!("{} has no channels or sample rate", path.display()));
+            }
             if format == 0xFFFE {
                 // WAVE_FORMAT_EXTENSIBLE: the sub-format's first two bytes are the format.
                 format = u16_at(body + 24);
             }
         } else if id == b"data" {
-            let data = &bytes[body..(body + len).min(bytes.len())];
+            if channels == 0 {
+                return Err(format!("{}: no `fmt ` chunk before the data", path.display()));
+            }
+            let data = &bytes[body..body + len];
+            let sample_bytes = match (format, bits) {
+                (1, 16) => 2,
+                (1, 24) => 3,
+                (1 | 3, 32) => 4,
+                _ => {
+                    return Err(format!(
+                        "{}: WAV format {format} at {bits} bits isn't read",
+                        path.display()
+                    ));
+                }
+            };
+            if !len.is_multiple_of(sample_bytes * channels) {
+                return Err(format!("{} has an incomplete WAV sample frame", path.display()));
+            }
             let samples: Vec<f32> = match (format, bits) {
                 (1, 16) => data
                     .chunks_exact(2)
@@ -74,16 +100,8 @@ pub fn read_wav(path: &Path) -> Result<(Vec<f32>, usize, f64), String> {
                     .chunks_exact(4)
                     .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
                     .collect(),
-                _ => {
-                    return Err(format!(
-                        "{}: WAV format {format} at {bits} bits isn't read",
-                        path.display()
-                    ));
-                }
+                _ => unreachable!("the format was checked above"),
             };
-            if channels == 0 {
-                return Err(format!("{}: no `fmt ` chunk before the data", path.display()));
-            }
             return Ok((samples, channels, rate));
         }
         at = body + len + (len % 2);

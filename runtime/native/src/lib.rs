@@ -336,9 +336,13 @@ impl Host {
         dir: &Path,
         mut carried: program::Retired<Gpu>,
         run_init: bool,
-    ) -> Result<Program<Gpu>> {
-        program::Executor::reload(&mut carried.executor, &build.manifest, &build.shaders)?;
-        let mut program = Program::instantiate_carrying(
+    ) -> std::result::Result<Program<Gpu>, (Error, Box<program::Retired<Gpu>>)> {
+        if let Err(error) =
+            program::Executor::reload(&mut carried.executor, &build.manifest, &build.shaders)
+        {
+            return Err((error, Box::new(carried)));
+        }
+        let mut program = Program::instantiate_carrying_recover(
             &build.compiled,
             &build.manifest,
             carried,
@@ -348,6 +352,67 @@ impl Host {
         )?;
         program.hand_over_here();
         Ok(program)
+    }
+
+    /// Starts the old build again after a candidate failed, preserving the host for another call.
+    fn install_program(&mut self, program: Program<Gpu>) {
+        // Pending prepare request IDs belong to the retired Wasm instance. A new instance
+        // starts numbering them again; only the prepared builds themselves can carry over.
+        for prepared in self.prepared.values_mut() {
+            if let handover::Prepared::Going(_, waiting) = prepared {
+                waiting.clear();
+            }
+        }
+        self.program = Some(program);
+    }
+
+    fn restore_old(&mut self, carried: program::Retired<Gpu>, run_init: bool) -> Result<()> {
+        let checkpoint = carried.checkpoint();
+        match self.start_carrying(&self.build, &self.dir, carried, run_init) {
+            Ok(program) => {
+                self.install_program(program);
+                Ok(())
+            }
+            Err((error, failed)) if run_init => {
+                // `init` may have become fallible after the old build first started (for
+                // example, its storage changed). Keep the host callable so init can be retried.
+                let program = self
+                    .start_carrying(&self.build, &self.dir, checkpoint.restore(*failed), false)
+                    .map_err(|(retry, _)| {
+                        Error::Program(format!(
+                            "the old build could not restart ({error}); starting it without init also failed ({retry})"
+                        ))
+                    })?;
+                self.install_program(program);
+                Err(error)
+            }
+            Err((error, _)) => Err(error),
+        }
+    }
+
+    fn recover_failed(
+        &mut self,
+        carried: program::Retired<Gpu>,
+        run_init: bool,
+        error: Error,
+    ) -> Error {
+        match self.restore_old(carried, run_init) {
+            Ok(()) => error,
+            Err(restore) if self.program.is_some() => Error::Program(format!(
+                "the replacement failed ({error}); the old build's init failed ({restore}); the host resumed with init deferred"
+            )),
+            Err(restore) => Error::Program(format!(
+                "the replacement failed ({error}); the old build could not restart ({restore})"
+            )),
+        }
+    }
+
+    fn clear_prepared(&mut self) {
+        for prepared in std::mem::take(&mut self.prepared).into_values() {
+            if let handover::Prepared::Going(job, _) = prepared {
+                let _ = job.join();
+            }
+        }
     }
 
     /// Hot reload: replaces the running program with the build in `dir` (by default the one
@@ -362,7 +427,20 @@ impl Host {
         let dir = dir.map_or_else(|| self.dir.clone(), Path::to_path_buf);
         let build = compile_build(&dir, None)?;
         let old = self.program.take().expect("the host has a program");
-        self.program = Some(self.start_carrying(&build, &dir, old.retire(), true)?);
+        let old_init_done = old.init_done();
+        let carried = old.retire();
+        let checkpoint = carried.checkpoint();
+        let program = match self.start_carrying(&build, &dir, carried, true) {
+            Ok(program) => program,
+            Err((error, carried)) => {
+                return Err(self.recover_failed(
+                    checkpoint.restore(*carried),
+                    old_init_done,
+                    error,
+                ));
+            }
+        };
+        self.install_program(program);
         self.build = build;
         self.dir = dir;
         Ok(())
@@ -384,34 +462,55 @@ impl Host {
         let dir = dir.as_ref();
         let options = &options.homed(dir);
         let build = compile_build(dir, None)?;
-        // A preparation belongs to the retiring program. Let its GPU work finish before
-        // resetting the device's resources and dropping its prepared pipelines.
-        for prepared in std::mem::take(&mut self.prepared).into_values() {
-            if let handover::Prepared::Going(job, _) = prepared {
-                let _ = job.join();
+        let same_device =
+            options.timing == self.options.timing && options.counts == self.options.counts;
+        // A preparation belongs to the retiring program. On the same device, finish its GPU
+        // work before resetting resources. With a new device, keep it until the replacement
+        // starts, so a failed attempt leaves its pending requests intact.
+        if same_device {
+            self.clear_prepared();
+        }
+        let mut program = if same_device {
+            let old = self.program.take().expect("the host has a program");
+            let old_init_done = old.init_done();
+            let (mut fresh, saved) = old.retire().fresh_for_restart(options.record);
+            if let Err(error) = fresh.executor.restart_build(&build.manifest, &build.shaders) {
+                return Err(self.recover_failed(saved.restore(fresh), old_init_done, error));
             }
-        }
-        let old = self.program.take().expect("the host has a program");
-        let mut executor = old.retire().executor;
-        if options.timing == self.options.timing && options.counts == self.options.counts {
-            executor.restart_build(&build.manifest, &build.shaders)?;
+            match Program::instantiate_carrying_recover(
+                &build.compiled,
+                &build.manifest,
+                fresh,
+                options.io(dir),
+                workers(options.workers),
+                !options.defer_init,
+            ) {
+                Ok(program) => program,
+                Err((error, failed)) => {
+                    return Err(self.recover_failed(saved.restore(*failed), old_init_done, error));
+                }
+            }
         } else {
-            executor = Gpu::new(&build.manifest, &build.shaders, options.timing, options.counts)?;
+            let executor =
+                Gpu::new(&build.manifest, &build.shaders, options.timing, options.counts)?;
+            Program::instantiate_with(
+                &build.compiled,
+                &build.manifest,
+                executor,
+                options.io(dir),
+                options.record,
+                workers(options.workers),
+                !options.defer_init,
+            )?
+        };
+        if !same_device {
+            self.clear_prepared();
         }
-        let mut program = Program::instantiate_with(
-            &build.compiled,
-            &build.manifest,
-            executor,
-            options.io(dir),
-            options.record,
-            workers(options.workers),
-            !options.defer_init,
-        )?;
         if options.reloadable {
             program.keep_ticks();
         }
         program.hand_over_here();
-        self.program = Some(program);
+        self.install_program(program);
         self.build = build;
         self.dir = dir.to_path_buf();
         self.options = options.clone();

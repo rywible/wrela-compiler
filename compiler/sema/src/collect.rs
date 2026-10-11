@@ -115,8 +115,8 @@ pub fn collect(
     c.p.texts = units.iter().map(|u| (u.ast.span.file, u.text.clone())).collect();
     let modules = c.build_modules(&units, packages);
     c.declare_items(&units, &modules);
-    c.check_items_beside_modules();
     c.resolve_imports();
+    c.check_items_beside_modules();
     c.find_lang_items();
     c.resolve_signatures();
     c.make_packed();
@@ -3824,5 +3824,47 @@ fn fuel_value(e: &ast::Expr) -> Option<u64> {
             }
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use wrela_diag::FileId;
+
+    #[test]
+    fn import_alias_cannot_share_a_module_name() {
+        fn unit(file: u32, path: Vec<String>, text: &str, package: usize) -> SourceUnit {
+            let parsed = wrela_syntax::parse(FileId(file), text);
+            assert!(!parsed.has_errors(), "{:#?}", parsed.diagnostics);
+            SourceUnit {
+                path,
+                ast: Arc::new(parsed.file),
+                package,
+                syntax_errors: Vec::new(),
+                text: Arc::from(text),
+            }
+        }
+
+        let mut units: Vec<SourceUnit> = crate::STD_SOURCES
+            .iter()
+            .enumerate()
+            .map(|(i, &(name, text))| {
+                unit(i as u32, name.split("::").map(str::to_string).collect(), text, 0)
+            })
+            .collect();
+        let next = units.len() as u32;
+        units.push(unit(next, vec!["main".into()], "use std::units::m as shapes\n", 1));
+        units.push(unit(next + 1, vec!["main".into(), "shapes".into()], "pub const one = 1\n", 1));
+        let mut diagnostics = Vec::new();
+        collect(units, &PackageInfo::std_and_program(), &mut diagnostics);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| { d.code.as_str() == "E0201" && d.message.contains("also the module") }),
+            "{:?}",
+            diagnostics.iter().map(|d| (&d.code, &d.message)).collect::<Vec<_>>()
+        );
     }
 }

@@ -227,12 +227,9 @@ fn handle(stream: TcpStream, state: &Shared) -> std::io::Result<()> {
             let answer = edit(state, &req.body);
             http::respond(&mut out, 200, "application/json", answer.to_string().as_bytes())
         }
-        ("PUT", path) if path.starts_with("/results/") => http::put_result(
-            &mut out,
-            &state.page.join("results"),
-            &path["/results/".len()..],
-            &req.body,
-        ),
+        ("PUT", path) if path.starts_with("/results/") => {
+            http::put_result(&mut out, &state.page, &path["/results/".len()..], &req.body)
+        }
         ("POST", "/studio/reference") => match &state.reference {
             Some(mask) => http::respond(&mut out, 200, "application/octet-stream", mask),
             None => {

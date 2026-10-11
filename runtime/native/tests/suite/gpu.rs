@@ -302,6 +302,171 @@ fn restarting_in_another_build_reuses_pipelines_but_starts_fresh() {
     assert_eq!(pixel(&changed.frame, w, 1, 2), [0, 0, 255, 255]);
 }
 
+/// A bad replacement must leave the running host able to execute its old build.
+#[test]
+#[ignore = "needs a GPU"]
+fn failed_reload_and_restart_leave_the_old_build_usable() {
+    let old_dir = common::first_light_copy("recover-old");
+    let bad_shader = common::first_light_copy("recover-bad-shader");
+    std::fs::write(bad_shader.join("fill.wgsl"), "this is not WGSL;").expect("bad shader");
+    let bad_start = common::first_light_with(
+        "recover-bad-start",
+        &wat::parse_str(
+            r#"(module
+  (import "wrela" "memory" (memory 1 16384 shared))
+  (export "memory" (memory 0))
+  (func $start unreachable)
+  (start $start)
+  (func (export "frame") (param f32 i32 i32)))"#,
+        )
+        .expect("wasm"),
+    );
+    let options = Options { reloadable: true, ..Options::default() };
+    let mut host = Host::load_with(&old_dir, &options).expect("old build loads");
+    host.run_frames(&[0.0], 8, 8).expect("old build starts");
+
+    for candidate in [&bad_shader, &bad_start] {
+        assert!(host.reload(Some(candidate)).is_err(), "candidate must fail to reload");
+        assert_eq!(
+            host.call_export("tri", &[Value::F32(0.25)]).expect("old build is callable"),
+            [Value::F32(0.0)]
+        );
+        host.run_frames(&[0.1], 8, 8).expect("old build still draws");
+        assert!(host.restart_in(candidate, &options).is_err(), "candidate must fail to restart");
+        assert_eq!(
+            host.call_export("tri", &[Value::F32(0.25)]).expect("old build is callable"),
+            [Value::F32(0.0)]
+        );
+        host.run_frames(&[0.2], 8, 8).expect("old build still draws");
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU"]
+fn failed_restart_does_not_run_a_deferred_old_init() {
+    let old_dir = common::first_light_with(
+        "deferred-old",
+        &wat::parse_str(
+            r#"(module
+  (import "wrela" "memory" (memory 1 16384 shared))
+  (export "memory" (memory 0))
+  (func (export "init") unreachable)
+  (func (export "frame") (param f32 i32 i32))
+  (func (export "ping") (result i32) (i32.const 7)))"#,
+        )
+        .expect("wasm"),
+    );
+    let bad_start = common::first_light_with(
+        "deferred-bad-start",
+        &wat::parse_str(
+            r#"(module
+  (import "wrela" "memory" (memory 1 16384 shared))
+  (export "memory" (memory 0))
+  (func $start unreachable)
+  (start $start)
+  (func (export "frame") (param f32 i32 i32)))"#,
+        )
+        .expect("wasm"),
+    );
+    let options = Options { defer_init: true, ..Options::default() };
+    let mut host = Host::load_with(&old_dir, &options).expect("loads without running init");
+
+    assert!(host.restart_in(&bad_start, &options).is_err(), "new build fails");
+    assert_eq!(host.call_export("ping", &[]).expect("old build stays callable"), [Value::I32(7)]);
+    assert!(host.init().is_err(), "the old init is still deferred");
+}
+
+#[test]
+#[ignore = "needs a GPU"]
+fn failed_old_init_still_leaves_a_callable_host() {
+    let old_dir = common::first_light_with(
+        "recover-old-init-fails",
+        &wat::parse_str(
+            r#"(module
+  (import "wrela" "memory" (memory 1 16384 shared))
+  (export "memory" (memory 0))
+  (import "wrela" "keep" (func $keep (param i32 i32)))
+  (import "wrela" "kept" (func $kept (param i32 i32) (result i32)))
+  (data (i32.const 100) "x")
+  (func (export "init")
+    (if (i32.ne (call $kept (i32.const 0) (i32.const 1)) (i32.const 0))
+      (then unreachable))
+    (call $keep (i32.const 100) (i32.const 1)))
+  (func (export "frame") (param f32 i32 i32))
+  (func (export "ping") (result i32) (i32.const 7)))"#,
+        )
+        .expect("wasm"),
+    );
+    let bad_start = common::first_light_with(
+        "recover-init-bad-candidate",
+        &wat::parse_str(
+            r#"(module
+  (import "wrela" "memory" (memory 1 16384 shared))
+  (export "memory" (memory 0))
+  (func $start unreachable)
+  (start $start)
+  (func (export "frame") (param f32 i32 i32)))"#,
+        )
+        .expect("wasm"),
+    );
+    let options = Options { reloadable: true, ..Options::default() };
+    let mut host = Host::load_with(&old_dir, &options).expect("old init first succeeds");
+
+    assert!(host.reload(Some(&bad_start)).is_err(), "replacement fails");
+    assert_eq!(host.call_export("ping", &[]).expect("host remains callable"), [Value::I32(7)]);
+}
+
+#[test]
+#[ignore = "needs a GPU"]
+fn failed_hand_over_keeps_the_old_build_usable_with_fresh_request_numbers() {
+    let bad_start = common::first_light_with(
+        "hand-over-bad-start",
+        &wat::parse_str(
+            r#"(module
+  (import "wrela" "memory" (memory 1 16384 shared))
+  (export "memory" (memory 0))
+  (func $start unreachable)
+  (start $start)
+  (func (export "frame") (param f32 i32 i32)))"#,
+        )
+        .expect("wasm"),
+    );
+    let path = format!("../{}", bad_start.file_name().expect("name").to_string_lossy());
+    let command = Encoder::new().hand_over(1, &path).finish();
+    let next = Encoder::new().storage_read(1, "missing").finish();
+    let next_offset = command.len().next_multiple_of(4);
+    let wasm = wat::parse_str(format!(
+        r#"(module
+  (import "wrela" "memory" (memory 1 16384 shared))
+  (export "memory" (memory 0))
+  (import "wrela" "submit" (func $submit (param i32 i32)))
+  (import "wrela" "request_status" (func $status (param i32) (result i32)))
+  (data (i32.const 0) "{}")
+  (data (i32.const {next_offset}) "{}")
+  (func (export "frame") (param f32 i32 i32)
+    (call $submit (i32.const 0) (i32.const {})))
+  (func (export "request")
+    (call $submit (i32.const {next_offset}) (i32.const {})))
+  (func (export "status") (result i32) (call $status (i32.const 1))))"#,
+        common::wat::escape(&command),
+        common::wat::escape(&next),
+        command.len(),
+        next.len(),
+    ))
+    .expect("wasm");
+    let old_dir = common::first_light_with("hand-over-old", &wasm);
+    let mut host = Host::load(&old_dir).expect("old build loads");
+
+    host.run_frames(&[0.0], 8, 8).expect("failed hand-over returns to old build");
+    assert_eq!(host.call_export("status", &[]).expect("new request ID is free"), [Value::I32(-1)]);
+    host.call_export("request", &[]).expect("reuses request ID 1");
+    assert_eq!(
+        host.call_export("status", &[]).expect("old build remains callable"),
+        [Value::I32(-2)],
+        "the new request was answered"
+    );
+}
+
 /// More dispatches and draws in one submission than the uniform ring starts with room for
 /// (64 KiB at 256 bytes a slice): each must still see its own uniform bytes.
 #[test]

@@ -124,6 +124,66 @@ class LookbookCpuTest(unittest.TestCase):
 
 
 class RoundCpuTest(unittest.TestCase):
+    def test_successful_lookbook_with_no_output_does_not_crash(self):
+        with tempfile.TemporaryDirectory() as root:
+            build = Path(root, "build")
+            build.mkdir()
+
+            def run(args, **kwargs):
+                if args[1] == rounds.HEADLESS:
+                    results = Path(root, args[2], "results")
+                    results.mkdir()
+                    (results / "frames.json").write_text('{"began_ms": [0, 16], "printed_in": []}')
+                    (results / "log.txt").write_text("")
+                    return subprocess.CompletedProcess(args, 0, "", "")
+                return subprocess.CompletedProcess(args, 0, "", "")
+
+            with mock.patch.object(rounds, "ROOT", root), \
+                 mock.patch.object(rounds, "BUILD", str(build)), \
+                 mock.patch.object(rounds, "script", return_value=([], 60)), \
+                 mock.patch.object(rounds.subprocess, "run", side_effect=run), \
+                 mock.patch.object(sys, "argv", ["round.py", "0"]), \
+                 contextlib.redirect_stdout(io.StringIO()), self.assertRaises(SystemExit) as exit:
+                rounds.main()
+            self.assertEqual(exit.exception.code, 0)
+
+    def test_failed_round_without_frame_output_returns_its_failure(self):
+        with tempfile.TemporaryDirectory() as root:
+            build = Path(root, "build")
+            build.mkdir()
+            with mock.patch.object(rounds, "ROOT", root), \
+                 mock.patch.object(rounds, "BUILD", str(build)), \
+                 mock.patch.object(rounds, "script", return_value=([], 60)), \
+                 mock.patch.object(rounds.subprocess, "run", return_value=
+                                   subprocess.CompletedProcess([], 1, "", "render failed")), \
+                 mock.patch.object(sys, "argv", ["round.py", "0", "--no-lookbook"]), \
+                 contextlib.redirect_stdout(io.StringIO()), self.assertRaises(SystemExit) as exit:
+                rounds.main()
+            self.assertEqual(exit.exception.code, 1)
+
+    def test_failed_round_is_not_hidden_by_a_successful_lookbook(self):
+        with tempfile.TemporaryDirectory() as root:
+            build = Path(root, "build")
+            build.mkdir()
+
+            def run(args, **kwargs):
+                if args[1] == rounds.HEADLESS:
+                    results = Path(root, args[2], "results")
+                    results.mkdir()
+                    (results / "frames.json").write_text('{"began_ms": [0, 16], "printed_in": []}')
+                    (results / "log.txt").write_text("")
+                    return subprocess.CompletedProcess(args, 1, "", "render failed")
+                return subprocess.CompletedProcess(args, 0, "lookbook passed\n", "")
+
+            with mock.patch.object(rounds, "ROOT", root), \
+                 mock.patch.object(rounds, "BUILD", str(build)), \
+                 mock.patch.object(rounds, "script", return_value=([], 60)), \
+                 mock.patch.object(rounds.subprocess, "run", side_effect=run), \
+                 mock.patch.object(sys, "argv", ["round.py", "0"]), \
+                 contextlib.redirect_stdout(io.StringIO()), self.assertRaises(SystemExit) as exit:
+                rounds.main()
+            self.assertEqual(exit.exception.code, 1)
+
     def test_short_round_sizes_browser_workers_to_cpu_quota(self):
         for cores in (2, 4, 16):
             with self.subTest(cores=cores), tempfile.TemporaryDirectory() as root:

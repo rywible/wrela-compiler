@@ -479,6 +479,8 @@ pub(crate) struct Program<E: 'static> {
     fuel: Option<u64>,
     /// Why the last call failed, if it did.
     last_failure: Option<Failure>,
+    /// Whether `init` completed (or the module has no `init`).
+    init_done: bool,
     /// The records of each tick run that had any, by tick: what a build that replaces this one
     /// replays (hot reload). Kept only for a program that may be replaced
     /// ([`Program::keep_ticks`]).
@@ -515,7 +517,97 @@ pub(crate) struct Retired<E> {
     tick_from: Option<u32>,
 }
 
+/// The carried data kept aside while a restart starts a fresh program on the old device.
+pub(crate) struct RestartState {
+    kept: Vec<u8>,
+    ticks: u32,
+    ran: Option<Vec<(u32, Vec<[u8; EVENT_SIZE as usize]>)>>,
+    input: Queue,
+    records: std::collections::VecDeque<[u8; EVENT_SIZE as usize]>,
+    trace: Option<Trace>,
+    batches: Option<Vec<Vec<u8>>>,
+    tick_from: Option<u32>,
+}
+
+impl RestartState {
+    /// Reattaches the old program's data to the executor returned by a failed restart.
+    pub(crate) fn restore<E>(self, failed: Retired<E>) -> Retired<E> {
+        Retired {
+            executor: failed.executor,
+            kept: self.kept,
+            ticks: self.ticks,
+            ran: self.ran,
+            input: self.input,
+            records: self.records,
+            trace: self.trace,
+            batches: self.batches,
+            tick_from: self.tick_from,
+        }
+    }
+}
+
+/// What a failed replacement's `init` must not consume from the retiring program.
+pub(crate) struct CarryCheckpoint {
+    kept: Vec<u8>,
+    ticks: u32,
+    ran: Option<Vec<(u32, Vec<[u8; EVENT_SIZE as usize]>)>>,
+    input: Queue,
+    records: std::collections::VecDeque<[u8; EVENT_SIZE as usize]>,
+    batches_len: Option<usize>,
+    tick_from: Option<u32>,
+}
+
+impl CarryCheckpoint {
+    pub(crate) fn restore<E>(self, mut failed: Retired<E>) -> Retired<E> {
+        failed.kept = self.kept;
+        failed.ticks = self.ticks;
+        failed.ran = self.ran;
+        failed.input = self.input;
+        failed.records = self.records;
+        if let Some(len) = self.batches_len
+            && let Some(batches) = &mut failed.batches
+        {
+            batches.truncate(len);
+        }
+        failed.tick_from = self.tick_from;
+        failed
+    }
+}
+
 impl<E> Retired<E> {
+    /// Saves the bytes, unread input and recorded batches a replacement's `init` can change.
+    pub(crate) fn checkpoint(&self) -> CarryCheckpoint {
+        CarryCheckpoint {
+            kept: self.kept.clone(),
+            ticks: self.ticks,
+            ran: self.ran.clone(),
+            input: self.input.clone(),
+            records: self.records.clone(),
+            batches_len: self.batches.as_ref().map(Vec::len),
+            tick_from: self.tick_from,
+        }
+    }
+
+    /// Starts a fresh program on this executor while keeping the old program's data for
+    /// rollback if the restart fails.
+    pub(crate) fn fresh_for_restart(self, record: bool) -> (Retired<E>, RestartState) {
+        let Retired { executor, kept, ticks, ran, input, records, trace, batches, tick_from } =
+            self;
+        let saved = RestartState { kept, ticks, ran, input, records, trace, batches, tick_from };
+        let fresh = Retired {
+            executor,
+            kept: Vec::new(),
+            ticks: 0,
+            ran: None,
+            input: Queue::default(),
+            records: Default::default(),
+            trace: None,
+            batches: record.then(Vec::new),
+            tick_from: None,
+        };
+        (fresh, saved)
+    }
+
     /// What a build handed over to gets (`std::reload::hand_over`): the executor, what was
     /// kept, the input not yet read, the trace and batches; no ticks to replay, since the new
     /// build's sim is its own.
@@ -538,6 +630,13 @@ impl<E> Retired<E> {
     #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
     pub(crate) fn keeping(self, kept: Vec<u8>) -> Retired<E> {
         Retired { kept, ..self.handed_over() }
+    }
+
+    /// Restores the bytes a program kept before a replacement's `init` failed, without
+    /// discarding ticks that still need to be replayed.
+    #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+    pub(crate) fn with_kept(self, kept: Vec<u8>) -> Retired<E> {
+        Retired { kept, ..self }
     }
 }
 
@@ -758,26 +857,53 @@ impl<E: Executor> Program<E> {
         workers: u32,
         run_init: bool,
     ) -> Result<Program<E>> {
-        let Retired { executor, kept, ticks, ran, input, records, trace, batches, tick_from } =
-            carried;
-        let trace = trace.unwrap_or_else(|| Trace::new((!io.quiet).then(|| "wrela: ".to_string())));
+        Self::instantiate_carrying_recover(compiled, manifest, carried, io, workers, run_init)
+            .map_err(|(error, _)| error)
+    }
+
+    /// Like [`Program::instantiate_carrying`], but gives the carried state back when the
+    /// replacement cannot start, so its host can start the previous build again.
+    pub(crate) fn instantiate_carrying_recover(
+        compiled: &Compiled,
+        manifest: &Manifest,
+        carried: Retired<E>,
+        io: Io,
+        workers: u32,
+        run_init: bool,
+    ) -> std::result::Result<Program<E>, (Error, Box<Retired<E>>)> {
+        let prepared_trace = carried
+            .trace
+            .clone()
+            .unwrap_or_else(|| Trace::new((!io.quiet).then(|| "wrela: ".to_string())));
         let engine = compiled.module.engine();
         let mut linker = Linker::new(engine);
         let wrap = |e: wasmtime::Error| Error::Program(format!("{e:#}"));
-        let memory = SharedMemory::new(engine, compiled.memory.clone()).map_err(wrap)?;
-        linker.func_wrap(IMPORT_MODULE, IMPORT_SUBMIT, submit::<E>).map_err(wrap)?;
-        linker
-            .func_wrap(IMPORT_MODULE, IMPORT_REQUEST_STATUS, request_status::<E>)
-            .map_err(wrap)?;
-        linker.func_wrap(IMPORT_MODULE, IMPORT_REQUEST_TAKE, request_take::<E>).map_err(wrap)?;
-        linker.func_wrap(IMPORT_MODULE, IMPORT_LIMIT, limit::<E>).map_err(wrap)?;
-        linker.func_wrap(IMPORT_MODULE, IMPORT_AUDIO, audio::<E>).map_err(wrap)?;
-        linker.func_wrap(IMPORT_MODULE, IMPORT_INPUT, self::input::<E>).map_err(wrap)?;
-        linker.func_wrap(IMPORT_MODULE, IMPORT_TICK, tick::<E>).map_err(wrap)?;
-        linker.func_wrap(IMPORT_MODULE, IMPORT_KEEP, keep::<E>).map_err(wrap)?;
-        linker.func_wrap(IMPORT_MODULE, IMPORT_KEPT, self::kept::<E>).map_err(wrap)?;
-        linker.func_wrap(IMPORT_MODULE, IMPORT_CLOCK, clock::<E>).map_err(wrap)?;
-        trace.link_checked(&mut linker, Some(&memory), check_started::<E>).map_err(wrap)?;
+        let memory = match SharedMemory::new(engine, compiled.memory.clone()) {
+            Ok(memory) => memory,
+            Err(e) => return Err((wrap(e), Box::new(carried))),
+        };
+        macro_rules! link {
+            ($call:expr) => {
+                if let Err(e) = $call {
+                    return Err((wrap(e), Box::new(carried)));
+                }
+            };
+        }
+        link!(linker.func_wrap(IMPORT_MODULE, IMPORT_SUBMIT, submit::<E>));
+        link!(linker.func_wrap(IMPORT_MODULE, IMPORT_REQUEST_STATUS, request_status::<E>));
+        link!(linker.func_wrap(IMPORT_MODULE, IMPORT_REQUEST_TAKE, request_take::<E>));
+        link!(linker.func_wrap(IMPORT_MODULE, IMPORT_LIMIT, limit::<E>));
+        link!(linker.func_wrap(IMPORT_MODULE, IMPORT_AUDIO, audio::<E>));
+        link!(linker.func_wrap(IMPORT_MODULE, IMPORT_INPUT, self::input::<E>));
+        link!(linker.func_wrap(IMPORT_MODULE, IMPORT_TICK, tick::<E>));
+        link!(linker.func_wrap(IMPORT_MODULE, IMPORT_KEEP, keep::<E>));
+        link!(linker.func_wrap(IMPORT_MODULE, IMPORT_KEPT, self::kept::<E>));
+        link!(linker.func_wrap(IMPORT_MODULE, IMPORT_CLOCK, clock::<E>));
+        link!(prepared_trace.link_checked(&mut linker, Some(&memory), check_started::<E>));
+
+        let Retired { executor, kept, ticks, ran, input, records, trace, batches, tick_from } =
+            carried;
+        let trace = trace.unwrap_or(prepared_trace);
         let state = State {
             memory: memory.clone(),
             checker: Checker::with_limits(manifest, executor.limits()),
@@ -808,23 +934,56 @@ impl<E: Executor> Program<E> {
             hands_over: false,
         };
         let mut store = Store::new(engine, state);
-        if let Some(fuel) = compiled.fuel {
-            store.set_fuel(fuel).map_err(wrap)?;
+        macro_rules! fail_after_store {
+            ($error:expr) => {{
+                let error = $error;
+                let state = store.into_data();
+                let carried = Retired {
+                    executor: state.executor,
+                    kept: state.kept,
+                    ticks,
+                    ran,
+                    input: state.input,
+                    records,
+                    trace: Some(state.trace),
+                    batches: state.batches,
+                    tick_from,
+                };
+                return Err((error, Box::new(carried)));
+            }};
         }
-        linker.define(&store, IMPORT_MODULE, IMPORT_MEMORY, memory.clone()).map_err(wrap)?;
-        let instance = linker.instantiate(&mut store, &compiled.module).map_err(|e| {
-            let failure = store.data_mut().failure.take();
-            failure.unwrap_or_else(|| Error::Program(format!("{e:#}")))
-        })?;
+        if let Some(fuel) = compiled.fuel
+            && let Err(e) = store.set_fuel(fuel)
+        {
+            fail_after_store!(wrap(e));
+        }
+        if let Err(e) = linker.define(&store, IMPORT_MODULE, IMPORT_MEMORY, memory.clone()) {
+            fail_after_store!(wrap(e));
+        }
+        let instance = match linker.instantiate(&mut store, &compiled.module) {
+            Ok(instance) => instance,
+            Err(e) => {
+                let error = store
+                    .data_mut()
+                    .failure
+                    .take()
+                    .unwrap_or_else(|| Error::Program(format!("{e:#}")));
+                fail_after_store!(error);
+            }
+        };
         let exports_imported_memory = instance
             .get_shared_memory(&mut store, EXPORT_MEMORY)
             .is_some_and(|exported| std::ptr::eq(exported.data().as_ptr(), memory.data().as_ptr()));
         if !exports_imported_memory {
-            return Err(Error::Program(format!(
+            fail_after_store!(Error::Program(format!(
                 "its `{EXPORT_MEMORY}` export isn't its imported shared memory"
             )));
         }
         store.data_mut().started = true;
+        let frame = match instance.get_typed_func::<(f32, u32, u32), ()>(&mut store, EXPORT_FRAME) {
+            Ok(frame) => frame,
+            Err(e) => fail_after_store!(Error::Program(format!("{e:#}"))),
+        };
         // The helpers: each its own instance on its own thread, sharing the memory.
         let has_worker = compiled.module.get_export(EXPORT_WORKER).is_some();
         let n = if has_worker { workers.clamp(1, MAX_WORKERS + 1) - 1 } else { 0 };
@@ -838,9 +997,6 @@ impl<E: Executor> Program<E> {
             crate::shared::store_u32(&memory, memory::PAR_HELPERS, n);
         }
         let helpers = Helpers { memory: memory.clone(), threads };
-        let frame = instance
-            .get_typed_func::<(f32, u32, u32), ()>(&mut store, EXPORT_FRAME)
-            .map_err(|e| Error::Program(format!("{e:#}")))?;
         let mut program = Program {
             store,
             instance,
@@ -854,6 +1010,7 @@ impl<E: Executor> Program<E> {
             records,
             fuel: compiled.fuel,
             last_failure: None,
+            init_done: false,
             // A program that replaces one may be replaced in turn.
             ran: ran.as_ref().map(|_| Vec::new()),
             replay: (ticks > 0)
@@ -861,7 +1018,10 @@ impl<E: Executor> Program<E> {
             tick_from,
         };
         if run_init {
-            program.init()?;
+            let kept = program.store.data().kept.clone();
+            if let Err(e) = program.init() {
+                return Err((e, Box::new(program.retire().with_kept(kept))));
+            }
         }
         Ok(program)
     }
@@ -943,14 +1103,22 @@ impl<E: Executor> Program<E> {
         self.init()
     }
 
+    #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+    pub(crate) fn init_done(&self) -> bool {
+        self.init_done
+    }
+
     /// A program with state makes it once, before anything else runs (language.md §12).
     fn init(&mut self) -> Result<()> {
         let Ok(init) = self.instance.get_typed_func::<(), ()>(&mut self.store, EXPORT_INIT) else {
+            self.init_done = true;
             return Ok(());
         };
         self.refuel()?;
         let result = init.call(&mut self.store, ());
-        self.settle(result)
+        self.settle(result)?;
+        self.init_done = true;
+        Ok(())
     }
 
     /// A metered program's fuel, filled for the next call.
@@ -968,6 +1136,7 @@ impl<E: Executor> Program<E> {
 
     /// Calls `frame(time, width, height)`, then ends the frame.
     pub(crate) fn frame(&mut self, time: f32, width: u32, height: u32) -> Result<()> {
+        self.store.data_mut().checker.set_screen_size(width, height);
         self.refuel()?;
         let result = self.frame.call(&mut self.store, (time, width, height));
         self.settle(result)?;
@@ -1795,15 +1964,16 @@ fn request_take<E: Executor>(
 ) -> wasmtime::Result<()> {
     let state = caller.data_mut();
     check_started(state)?;
-    let Some(answer) = state.requests.answered.remove(&request) else {
+    let Some(answer) = state.requests.answered.get(&request) else {
         return Err(wasmtime::format_err!("request_take({request}): the request isn't answered"));
     };
-    let bytes = answer.unwrap_or_default();
-    if !shared::write(&state.memory, ptr as usize, &bytes) {
+    let bytes = answer.as_ref().map_or(&[][..], Vec::as_slice);
+    if !shared::write(&state.memory, ptr as usize, bytes) {
         return Err(wasmtime::format_err!(
             "request_take({request}, {ptr}) reaches past the end of the program's memory"
         ));
     }
+    state.requests.answered.remove(&request);
     Ok(())
 }
 

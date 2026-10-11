@@ -14,6 +14,7 @@
 //! and values that are strings, `true`, `false`, or an inline table of those. Anything else is
 //! E0219, at its place in the file.
 
+use std::collections::HashSet;
 use wrela_diag::{Diagnostic, FileId, Span, codes};
 
 /// What a manifest says.
@@ -52,6 +53,7 @@ pub fn parse(file: FileId, text: &str) -> Result<Manifest, Vec<Diagnostic>> {
     let mut out = Manifest::default();
     let mut errors = Vec::new();
     let mut section = String::new();
+    let mut keys = HashSet::new();
     let mut offset = 0u32;
     let bad = |at: u32, len: usize, msg: String| {
         Diagnostic::new(codes::E0219, Span::new(file, at, at + len as u32), msg)
@@ -89,6 +91,14 @@ pub fn parse(file: FileId, text: &str) -> Result<Manifest, Vec<Diagnostic>> {
             continue;
         };
         let key = key.trim();
+        if !keys.insert((section.clone(), key.to_string())) {
+            errors.push(bad(
+                at,
+                key.len(),
+                format!("`{key}` is declared more than once in `[{section}]`"),
+            ));
+            continue;
+        }
         let vat = at
             + (content.len() - content[content.find('=').unwrap_or(0) + 1..].trim_start().len())
                 as u32;
@@ -117,7 +127,14 @@ pub fn parse(file: FileId, text: &str) -> Result<Manifest, Vec<Diagnostic>> {
                 let mut other = false;
                 for (k, v, kspan) in fields {
                     match (k.as_str(), v) {
-                        ("path", Value::Str(p)) => path = Some(p),
+                        ("path", Value::Str(p)) if path.is_none() => path = Some(p),
+                        ("path", Value::Str(_)) => {
+                            errors.push(Diagnostic::new(
+                                codes::E0219,
+                                kspan,
+                                "a dependency's `path` is declared more than once",
+                            ));
+                        }
                         (k, _) => {
                             other = true;
                             errors.push(
@@ -258,6 +275,17 @@ mod tests {
             "[package]\nname = 3\n",
         ] {
             assert!(parse(file(), text).is_err(), "{text}");
+        }
+    }
+
+    #[test]
+    fn duplicate_manifest_keys_are_errors() {
+        for text in [
+            "[package]\nname = \"one\"\nname = \"two\"\n",
+            "[dependencies]\nmath = { path = \"../one\" }\nmath = { path = \"../two\" }\n",
+            "[dependencies]\nmath = { path = \"../one\", path = \"../two\" }\n",
+        ] {
+            assert!(parse(file(), text).is_err(), "accepted duplicate key in {text}");
         }
     }
 }

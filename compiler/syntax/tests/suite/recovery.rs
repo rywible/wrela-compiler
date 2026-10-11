@@ -157,3 +157,34 @@ fn print_fix_keeps_a_leading_bom_first() {
     assert!(fixed.starts_with("\u{feff}use std::io::print"));
     assert!(!parse(FileId(0), &fixed).has_errors());
 }
+
+#[test]
+fn macro_fix_does_not_change_debug_formatting_or_emit_an_unclosed_hole() {
+    for source in
+        ["fn f(x: str) { println!(\"{:?}\", x) }\n", "fn f(x: str) { format!(\"value {\", x) }\n"]
+    {
+        let parsed = parse(FileId(0), source);
+        let diagnostic =
+            parsed.diagnostics.iter().find(|d| d.code.as_str() == "E0115").expect("macro error");
+        assert!(diagnostic.fixes.is_empty(), "{source}: {diagnostic:#?}");
+    }
+}
+
+#[test]
+fn chained_comparison_does_not_duplicate_a_call() {
+    let source = "fn next() -> i32 { 1 }\nfn f(a: i32, b: i32) -> bool { a < next() < b }\n";
+    let parsed = parse(FileId(0), source);
+    let diagnostic = parsed
+        .diagnostics
+        .iter()
+        .find(|d| d.code.as_str() == "E0107")
+        .expect("chained comparison error");
+    assert!(diagnostic.fixes.is_empty(), "{diagnostic:#?}");
+}
+
+#[test]
+fn long_try_chain_is_bounded_while_parsing() {
+    let source = format!("fn f(x: i32) {{ x{} }}\n", "?".repeat(20_000));
+    let parsed = parse(FileId(0), &source);
+    assert!(parsed.diagnostics.iter().any(|d| d.code.as_str() == "E0112"));
+}

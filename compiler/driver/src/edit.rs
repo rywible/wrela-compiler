@@ -202,8 +202,8 @@ pub fn plan(root: &Path, edits: &[LiteralEdit]) -> Result<Vec<FileEdit>, Refused
             }
         }
         list.sort_by_key(|e| e.start);
-        if list.windows(2).any(|w| w[0].start == w[1].start) {
-            return Err(refuse("two edits of one literal".into()));
+        if list.windows(2).any(|w| w[0].start == w[1].start || w[0].end > w[1].start) {
+            return Err(refuse("overlapping literal edits".into()));
         }
         // Each edit's replacement: a minus before it moves with the sign.
         let bytes = text.as_bytes();
@@ -439,8 +439,10 @@ pub fn parse_edits(text: &str) -> Result<Vec<LiteralEdit>, String> {
                 .ok_or(format!("edit {i}: `value` is missing"))?;
             Ok(LiteralEdit {
                 file: s("file")?,
-                start: n("start")? as u32,
-                end: n("end")? as u32,
+                start: u32::try_from(n("start")?)
+                    .map_err(|_| format!("edit {i}: `start` is too large"))?,
+                end: u32::try_from(n("end")?)
+                    .map_err(|_| format!("edit {i}: `end` is too large"))?,
                 text: s("text")?,
                 hash: s("hash")?,
                 value: value as f32,
@@ -541,5 +543,33 @@ mod tests {
         stale.hash = "0000".into();
         assert!(plan(&dir, &[stale]).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn overlapping_literal_edits_are_refused() {
+        let dir = std::env::temp_dir().join(format!("wrela-edit-overlap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let text = "fn f() -> f32 { -0.5 }\n";
+        std::fs::write(dir.join("main.wrela"), text).expect("write");
+        let start = text.find("-0.5").expect("literal") as u32;
+        let hash = crate::lift::file_hash(text.as_bytes());
+        let edit = |start, end, value| LiteralEdit {
+            file: "main.wrela".into(),
+            start,
+            end,
+            text: text[start as usize..end as usize].into(),
+            hash: hash.clone(),
+            value,
+        };
+        let result = plan(&dir, &[edit(start, start + 4, -0.25), edit(start + 1, start + 4, 0.75)]);
+        assert!(result.is_err_and(|r| r.why.contains("overlapping")));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn edit_offsets_cannot_wrap() {
+        let edits = r#"{"edits":[{"file":"main.wrela","start":4294967296,"end":4294967300,"text":"0.5","hash":"abc","value":0.75}]}"#;
+        assert!(parse_edits(edits).is_err());
     }
 }

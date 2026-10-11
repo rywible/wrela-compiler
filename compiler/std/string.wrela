@@ -457,7 +457,7 @@ impl str {
         Some(i32(m))
     }
 
-    /// The `f32` it spells (digits, an optional `-`, `.` and exponent); `None` if it isn't one.
+    /// The `f32` it spells (digits, an optional `-`, `.` and signed exponent); `None` if it isn't one.
     /// Decimal digits are read into an `f64` and rounded once.
     pub fn parse_f32(self) -> Option<f32> {
         let n = self.len()
@@ -496,7 +496,11 @@ impl str {
             return None
         }
         if i < n && (self.byte(i) == 101 || self.byte(i) == 69) {
-            let e = self.slice(i + 1, n).parse_i32()?
+            let e = if i + 1 < n && self.byte(i + 1) == 43 {
+                self.slice(i + 2, n).parse_i32()?
+            } else {
+                self.slice(i + 1, n).parse_i32()?
+            }
             scale += i64(e)
             i = n
         }
@@ -600,6 +604,13 @@ fn extreme_float_exponents_finish_at_their_limits() {
     }
     compensated.push_str("e-400")
     assert(compensated.as_str().parse_f32() == Some(1.0))
+}
+
+@test
+fn float_parser_accepts_positive_exponent_sign() {
+    assert("1e+2".parse_f32() == Some(100.0))
+    assert("1.5E+3".parse_f32() == Some(1500.0))
+    assert("1e+".parse_f32() == None)
 }
 
 impl Eq for str {

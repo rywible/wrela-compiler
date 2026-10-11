@@ -1,0 +1,18 @@
+// accepts: eff.requests
+// Naming an IO function without calling or passing it does not do IO.
+use std::io::load
+
+fn reads() -> u32 {
+    let _ = load("unused")
+    2
+}
+
+@deterministic
+fn safe() -> u32 {
+    let _unused = reads
+    1
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    let _ = safe()
+}

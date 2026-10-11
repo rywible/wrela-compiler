@@ -465,6 +465,17 @@ class ServeTest(PageDir, unittest.TestCase):
             )
             self.assertIn(b" 400 ", response, value)
 
+    def test_put_rejects_a_truncated_body_without_saving_it(self):
+        port = self.server.server_address[1]
+        request = (
+            f"PUT /{self.page}/results/truncated.bin HTTP/1.1\r\n"
+            f"Host: localhost:{port}\r\n"
+            "Content-Length: 4\r\nConnection: close\r\n\r\n"
+        ).encode() + b"hi"
+        response = self.raw(request)
+        self.assertIn(b" 400 ", response)
+        self.assertFalse(os.path.exists(os.path.join(self.page_dir, "results", "truncated.bin")))
+
     def test_put_through_a_symlink_out_of_the_repo_is_refused(self):
         outside = tempfile.mkdtemp()
         try:

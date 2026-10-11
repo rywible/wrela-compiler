@@ -137,6 +137,8 @@ pub struct Checker {
     /// The open pass's colour target's format (the screen's, a texture's, or none), and whether
     /// it has a depth target: which pipelines its draws may draw with.
     targets: (Option<TextureFormat>, bool),
+    /// The current frame's screen size, when the host has begun a frame.
+    screen_size: Option<(u32, u32)>,
 }
 
 impl Checker {
@@ -172,7 +174,13 @@ impl Checker {
             attachments: Vec::new(),
             written: Vec::new(),
             targets: (None, false),
+            screen_size: None,
         }
+    }
+
+    /// The screen's dimensions for the next frame's pass checks.
+    pub fn set_screen_size(&mut self, width: u32, height: u32) {
+        self.screen_size = Some((width, height));
     }
 
     /// Checks a command that has passed the [`crate::stream::Sequencer`], and records its
@@ -370,7 +378,7 @@ impl Checker {
                 }
                 self.scope.clear();
                 self.attachments.clear();
-                let mut size = None;
+                let mut size = if pass.color == SCREEN { self.screen_size } else { None };
                 for t in [pass.color, pass.depth] {
                     let three =
                         matches!(self.resources.get(&t), Some(Resource::Texture(x)) if x.depth > 0);
@@ -713,6 +721,39 @@ impl Checker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::stream::Pass;
+
+    #[test]
+    fn screen_pass_depth_must_match_the_current_frame_size() {
+        let mut checker = Checker::new(&Manifest::new("game.wasm"));
+        checker
+            .check(&Command::CreateTexture {
+                handle: 1,
+                width: 8,
+                height: 8,
+                format: TextureFormat::Depth32Float,
+                writable: false,
+                depth: 0,
+            })
+            .expect("depth texture");
+        let pass = Command::BeginPass(Pass {
+            color: SCREEN,
+            keep_color: false,
+            join: false,
+            clear: [0.0; 4],
+            depth: 1,
+            keep_depth: false,
+            clear_depth: 1.0,
+        });
+        checker.set_screen_size(16, 8);
+        assert_eq!(
+            checker.check(&pass).expect_err("different attachment sizes").why,
+            "the pass's colour and depth targets differ in size"
+        );
+        checker.set_screen_size(8, 8);
+        checker.check(&pass).expect("matching attachment sizes");
+    }
 
     #[test]
     fn writable_bindings_are_checked_per_command_even_after_an_error() {

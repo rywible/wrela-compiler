@@ -593,13 +593,13 @@ export class Program {
     this.#starting();
     const a = this.#requests.answered.get(request);
     if (a === undefined) throw new TrapError(`request_take(${request}): the request isn't answered`);
-    this.#requests.answered.delete(request);
     const bytes = "bytes" in a ? a.bytes : new Uint8Array(0);
     const memory = new Uint8Array(this.#memory!.buffer);
     if (ptr + bytes.length > memory.length) {
       throw new TrapError(`request_take(${request}, ${ptr}) reaches past the end of the program's memory`);
     }
     memory.set(bytes, ptr);
+    this.#requests.answered.delete(request);
   }
 
   #submitImport(ptr: number, len: number): void {
@@ -783,6 +783,7 @@ export class Program {
 
   /** Calls `frame(time, width, height)`, then ends the frame. */
   frame(time: number, width: number, height: number): void {
+    this.checker.setScreenSize(width, height);
     this.#call(() => this.#frame!(time, width, height));
     this.#sequencer.endFrame();
     this.executor.flush();

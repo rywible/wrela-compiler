@@ -338,6 +338,17 @@ pub(super) fn array(source: &str, name: &str) -> Option<Vec<f64>> {
         .collect()
 }
 
+fn array_exact(source: &str, name: &str, expected: usize) -> Result<Vec<f64>, String> {
+    let values = array(source, name).ok_or_else(|| format!("the current model has no `{name}`"))?;
+    if values.len() != expected {
+        return Err(format!(
+            "the current model has {} `{name}` values, but needs {expected}",
+            values.len()
+        ));
+    }
+    Ok(values)
+}
+
 pub fn run(dir: &Path, out: &Path, against: Option<&Path>) -> Result<(), String> {
     let reference = read_notes(dir)?;
     let (mut t, report) = tables(&reference, None);
@@ -346,10 +357,12 @@ pub fn run(dir: &Path, out: &Path, against: Option<&Path>) -> Result<(), String>
         // notes' measurement from the recording's.
         let source = std::fs::read_to_string(out)
             .map_err(|e| format!("can't read the model now, {}: {e}", out.display()))?;
-        let now =
-            |name: &str| array(&source, name).ok_or(format!("{} has no `{name}`", out.display()));
-        let (levels, prompt, after, after_db) =
-            (now("levels")?, now("prompt")?, now("after")?, now("after_db")?);
+        let (levels, prompt, after, after_db) = (
+            array_exact(&source, "levels", t.levels.len())?,
+            array_exact(&source, "prompt", t.prompt.len())?,
+            array_exact(&source, "after", t.after.len())?,
+            array_exact(&source, "after_db", t.after_db.len())?,
+        );
         let (m, _) = tables(&read_notes(played)?, Some(&t.strike));
         t.levels = (0..levels.len())
             .map(|i| levels[i] + (t.levels[i] - m.levels[i]).clamp(-12.0, 12.0))
@@ -380,10 +393,9 @@ pub fn run(dir: &Path, out: &Path, against: Option<&Path>) -> Result<(), String>
     let source = format!(
         "// Written by `wrela audio model {dir}` (spike 14, #48); edit the tool, not this file.\n\
          //\n\
-         // engine::piano's model fitted to the Salamander Grand Piano V3 (a Yamaha C5, recorded by\n\
-         // Alexander Holm; CC BY 3.0), the whole instrument as FreePats' retuned SFZ, played by\n\
-         // sfizz: {n} notes, {k} keys at {v} velocities each. The numbers are measurements of\n\
-         // those recordings, moved by rounds of the model's own notes measured against them.\n\
+         // engine::piano's model fitted to the recordings in {dir}: {n} notes, {k} keys at {v}\n\
+         // velocities each. The numbers are measurements of those recordings, moved by rounds\n\
+         // of the model's own notes measured against them.\n\
          \n\
          use piano::Model\n\
          \n\
@@ -423,4 +435,16 @@ pub fn run(dir: &Path, out: &Path, against: Option<&Path>) -> Result<(), String>
         .expect("json")
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn current_model_tables_need_the_fitted_length() {
+        let source = "levels: [1.0, 2.0]";
+        assert_eq!(array_exact(source, "levels", 2).expect("matching table"), [1.0, 2.0]);
+        assert!(array_exact(source, "levels", 3).is_err());
+    }
 }

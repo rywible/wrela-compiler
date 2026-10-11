@@ -5,7 +5,10 @@ use std::path::Path;
 
 /// Writes RGBA8 pixels (rows top to bottom) as a PNG.
 pub fn write_png(path: &Path, width: u32, height: u32, rgba: &[u8]) -> Result<()> {
-    let expected = width as usize * height as usize * 4;
+    let expected = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| Error::Gpu(format!("a {width}x{height} frame is too large")))?;
     if rgba.len() != expected {
         return Err(Error::Gpu(format!(
             "a {width}x{height} frame has {expected} bytes, not {}",
@@ -103,6 +106,7 @@ mod tests {
         write_png(&path, 2, 3, &rgba).expect("written");
         assert_eq!(read_png(&path).expect("decodes"), (2, 3, rgba.clone()));
         assert!(write_png(&path, 2, 2, &rgba).is_err());
+        assert!(write_png(&path, u32::MAX, u32::MAX, &[]).is_err());
         // Multiple rows and changing channels exercise the fast compressor's filtering,
         // including alpha and widths that are not powers of two.
         let rgba: Vec<u8> = (0..31 * 19 * 4).map(|i| ((i * 73 + i / 31) % 256) as u8).collect();

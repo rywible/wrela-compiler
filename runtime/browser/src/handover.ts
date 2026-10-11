@@ -54,7 +54,9 @@ export class HandOvers implements Builds {
 
   /** The base of the build at `path`, from the running build's. */
   baseOf(path: string): string {
-    return new URL(`${path}/`, this.base()).href;
+    // The checked build path permits literal percent signs. Keep percent escapes from turning
+    // into `..` when URL parsing resolves the path.
+    return new URL(`${path.replaceAll("%", "%25")}/`, this.base()).href;
   }
 
   prepare(path: string): Promise<void> {

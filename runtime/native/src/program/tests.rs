@@ -3,7 +3,7 @@
 
 use super::*;
 use wrela_abi::check::CommandError;
-use wrela_abi::stream::{Binding, Encoder, Opcode, StreamError, VERSION};
+use wrela_abi::stream::{Binding, Encoder, Opcode, Pass, StreamError, TextureFormat, VERSION};
 use wrela_abi::vectors::check_manifest as manifest;
 
 #[path = "../../tests/suite/common/wat.rs"]
@@ -59,6 +59,26 @@ fn command_err(batch: Vec<u8>) -> (Opcode, String) {
         Error::Command(CommandError { opcode, why }) => (opcode, why),
         e => panic!("expected a command error, got {e}"),
     }
+}
+
+#[test]
+fn screen_pass_checks_depth_against_frame_dimensions() {
+    let batch = Encoder::new()
+        .create_texture(1, 8, 8, TextureFormat::Depth32Float, false)
+        .begin_pass(Pass {
+            color: wrela_abi::stream::SCREEN,
+            keep_color: false,
+            join: false,
+            clear: [0.0; 4],
+            depth: 1,
+            keep_depth: false,
+            clear_depth: 1.0,
+        })
+        .end_pass()
+        .finish();
+    let (opcode, why) = command_err(batch);
+    assert_eq!(opcode, Opcode::BeginPass);
+    assert_eq!(why, "the pass's colour and depth targets differ in size");
 }
 
 /// All of buffer `h`, as the buffers [`with_buffers`] makes are: 64 bytes.
@@ -700,7 +720,8 @@ fn requester(batch: &[u8], io: Io) -> Program<Recorder> {
   (func (export "status") (result i32) (call $status (i32.const 4)))
   (func (export "take") (result i32)
     (call $take (i32.const 4) (i32.const 1024))
-    (i32.load (i32.const 1024))))"#,
+    (i32.load (i32.const 1024)))
+  (func (export "take_at") (param i32) (call $take (i32.const 4) (local.get 0))))"#,
         wat_gen::escape(batch),
         batch.len()
     );
@@ -740,6 +761,20 @@ fn requests_are_answered_from_the_next_call_then_taken_once() {
     let mut p =
         requester(&batch, Io { build: Some(build), storage: None, post: None, quiet: false });
     p.call("ask", &[]).expect("ask");
+    assert_eq!(call_i32(&mut p, "status"), 5);
+    assert_eq!(call_i32(&mut p, "take"), 0x0403_0201);
+    assert_eq!(call_i32(&mut p, "status"), REQUEST_PENDING);
+}
+
+#[test]
+fn failed_request_take_keeps_the_answer_for_a_valid_destination() {
+    let build = scratch_dir("fetch-take-retry");
+    std::fs::write(build.join("answer.bin"), [1, 2, 3, 4, 5]).expect("write");
+    let batch = Encoder::new().fetch(4, "answer.bin").finish();
+    let mut p = requester(&batch, Io { build: Some(build), ..Io::default() });
+    p.call("ask", &[]).expect("ask");
+    let end = p.memory.data().len() as i32;
+    assert!(p.call("take_at", &[Value::I32(end - 4)]).is_err());
     assert_eq!(call_i32(&mut p, "status"), 5);
     assert_eq!(call_i32(&mut p, "take"), 0x0403_0201);
     assert_eq!(call_i32(&mut p, "status"), REQUEST_PENDING);

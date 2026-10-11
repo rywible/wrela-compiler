@@ -954,11 +954,9 @@ export class GpuExecutor {
       return answer.promise;
     }
     this.flush();
+    const source = this.#buffer(handle);
     const staging = this.#readbackBuffer(Math.max(size, 4));
-    return this.#copyBack(this.#buffer(handle), offset, size, staging).then((bytes) => {
-      staging.destroy();
-      return bytes;
-    });
+    return this.#copyBack(source, offset, size, staging).finally(() => staging.destroy());
   }
 
   /** Copies `source`'s bytes `offset..offset + size` to the CPU through `staging`, a readback

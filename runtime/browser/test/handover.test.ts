@@ -51,6 +51,13 @@ test("a build got ready builds only the pipelines the device doesn't hold, once"
   expect(ready.manifest.pipelines).toHaveLength(2);
 });
 
+test("a build path's percent escapes stay literal during resolution", () => {
+  const device = new FakeDevice();
+  const handOvers = new HandOvers(device.gpu, () => RUNNING, () => []);
+  expect(handOvers.baseOf("%2e%2e/second")).toBe("http://localhost/tower/first/%252e%252e/second/");
+  expect(handOvers.baseOf("../%2e%2e/second")).toBe("http://localhost/tower/%252e%252e/second/");
+});
+
 test("a build that isn't there fails, each time it's asked for", async () => {
   const { handOvers } = await running();
   const why = "the build at http://localhost/tower/missing/ isn't ready: can't fetch http://localhost/tower/missing/manifest.json: 404";

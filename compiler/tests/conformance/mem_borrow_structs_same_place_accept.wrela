@@ -1,0 +1,25 @@
+// accepts: mem.borrow-structs
+// A borrow struct may have two read-only fields on one source. Either field can return the
+// original parameter's place, including the first field created.
+struct Data {
+    n: u32,
+}
+
+borrow struct Both {
+    a: borrow Data,
+    b: borrow Data,
+}
+
+fn first(x: Data) -> borrow Data {
+    let both = Both { a: x, b: x }
+    both.a
+}
+
+fn second(x: Data) -> borrow Data {
+    let both = Both { a: x, b: x }
+    both.b
+}
+
+fn read(x: Data) -> u32 {
+    first(x).n + second(x).n
+}

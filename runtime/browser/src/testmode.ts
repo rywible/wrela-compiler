@@ -134,7 +134,12 @@ export function parseTestParams(hash: string): TestParams | null {
   for (const pair of pairs) {
     const [key, value = ""] = pair.split("=", 2);
     if (key === "input") {
-      if (value === "" || value.startsWith("/") || value.includes(":") || value.split("/").some((p) => p === "" || p === "." || p === "..")) {
+      if (
+        value === "" ||
+        value.startsWith("/") ||
+        /[\\:?#]/.test(value) ||
+        value.split("/").some((p) => p === "" || p === "." || p === "..")
+      ) {
         throw new Error(`test parameter input=${value} must be a path relative to the page`);
       }
       params.input = value;
@@ -151,6 +156,9 @@ export function parseTestParams(hash: string): TestParams | null {
   }
   return params;
 }
+
+/** A script's literal path under the page, including percent signs that look like URL escapes. */
+export const inputUrl = (base: string, path: string): URL => new URL(path.replaceAll("%", "%25"), base);
 
 /** The time of frame `i`, as both hosts compute it (runtime/abi `ticks`' `frame_time`, which the
  * vectors check): `i / fps` (the WASM call rounds it to f32). */

@@ -253,7 +253,12 @@ fn rvalue_uses(body: &Body, r: &Rvalue, out: &mut Vec<Local>) {
 
 /// Adds a statement's uses to `uses`; returns the local it defines (whose old value it's done
 /// with).
-fn stmt_uses_defs(p: &Program, body: &Body, s: &Statement, uses: &mut Vec<Local>) -> Option<Local> {
+pub(crate) fn stmt_uses_defs(
+    p: &Program,
+    body: &Body,
+    s: &Statement,
+    uses: &mut Vec<Local>,
+) -> Option<Local> {
     match &s.kind {
         StatementKind::Assign(place, r) => {
             rvalue_uses(body, r, uses);
@@ -294,7 +299,7 @@ fn is_bound_alias(p: &Program, body: &Body, l: Local, r: &Rvalue) -> bool {
         && !matches!(r, Rvalue::Call(c) if c.ret_mode != RetMode::Owned)
 }
 
-fn term_uses(t: &Terminator, out: &mut Vec<Local>) {
+pub(crate) fn term_uses(t: &Terminator, out: &mut Vec<Local>) {
     match &t.kind {
         TerminatorKind::If { cond, .. } => operand_uses(cond, out),
         TerminatorKind::Return(Some(o)) => operand_uses(o, out),
@@ -323,6 +328,21 @@ struct Loan {
     /// projection this loan is. Empty otherwise.
     field: Vec<u32>,
     span: Span,
+}
+
+/// A loan's identity across visits to the same MIR statement. A borrow struct can have
+/// multiple fields on the same place, and the route through a projection changes which
+/// accesses count as the holder's own.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct LoanKey {
+    at: Point,
+    place: Place,
+    holder: Local,
+    mutable: bool,
+    reserved: bool,
+    via: Vec<Local>,
+    exact: bool,
+    field: Vec<u32>,
 }
 
 /// A place an access through a projection reaches (see [`FnCheck::resolve`]).
@@ -473,7 +493,7 @@ struct FnCheck<'a> {
     dying: Vec<Vec<(u32, Local)>>,
     loans: Vec<Loan>,
     /// Loans by where they're made and what they're on, so a block revisited makes the same.
-    loan_ids: HashMap<(Point, Place, Local, bool), usize>,
+    loan_ids: HashMap<LoanKey, usize>,
     diags: Vec<Diagnostic>,
     emit: bool,
     /// Loans already reported in a conflict: one error per loan, at its first conflict (later
@@ -965,7 +985,16 @@ impl<'a> FnCheck<'a> {
 
     fn new_loan(&mut self, st: &mut State, at: Point, loan: Loan) {
         debug_assert!(self.holders[loan.holder.index()], "liveness tracks every loan's holder");
-        let key = (at, loan.place.clone(), loan.holder, loan.mutable);
+        let key = LoanKey {
+            at,
+            place: loan.place.clone(),
+            holder: loan.holder,
+            mutable: loan.mutable,
+            reserved: loan.reserved,
+            via: loan.via.clone(),
+            exact: loan.exact,
+            field: loan.field.clone(),
+        };
         let id = match self.loan_ids.get(&key) {
             Some(&i) => {
                 self.loans[i] = loan;

@@ -112,6 +112,8 @@ export class Checker {
   /** The open pass's colour target's format (the screen's, a texture's, or none), and whether it
    * has a depth target: which pipelines its draws may draw with. */
   #targets: { colour: TextureFormat | null; depth: boolean } = { colour: null, depth: false };
+  /** The current frame's screen size, when a frame has begun. */
+  #screenSize: [number, number] | undefined;
 
   readonly #limits: Limits;
 
@@ -130,6 +132,11 @@ export class Checker {
       bindings: p.bindings.map((b) => ({ kind: b.kind, format: b.format })),
       targets: p.kind === "render" ? p.targets : [],
     }));
+  }
+
+  /** Gives screen passes the frame's canvas size for attachment checks. */
+  setScreenSize(width: number, height: number): void {
+    this.#screenSize = [width, height];
   }
 
   /** Checks a command that has passed the `Sequencer`, and records its effect. */
@@ -274,7 +281,7 @@ export class Checker {
             throw err(`texture ${t} is a 3D texture, so it can't be a target`);
           }
         }
-        let size: [number, number] | undefined;
+        let size: [number, number] | undefined = pass.color === SCREEN ? this.#screenSize : undefined;
         let colour: TextureFormat | null = pass.color === SCREEN ? SCREEN_FORMAT : null;
         if (pass.color !== SCREEN && pass.color !== NONE) {
           const t = this.#texture(op, pass.color);

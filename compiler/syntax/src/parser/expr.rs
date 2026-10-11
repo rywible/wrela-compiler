@@ -563,9 +563,14 @@ impl<'a> Parser<'a> {
                         );
                         return Err(Failed);
                     }
-                    // `a < x < b` means `a < x && x < b`: repeat the middle operand.
+                    // `a < x < b` means `a < x && x < b`. Only repeat a value that
+                    // cannot have effects; a call or index could change on the second read.
                     let mid = match &lhs.kind {
-                        ExprKind::Binary(_, _, m) => self.text_of(m.span).to_string(),
+                        ExprKind::Binary(_, _, m)
+                            if matches!(&m.kind, ExprKind::Path(_) | ExprKind::Lit(_)) =>
+                        {
+                            self.text_of(m.span).to_string()
+                        }
                         _ => String::new(),
                     };
                     let mut d = Diagnostic::new(codes::E0107, t.span, "comparisons don't chain")
@@ -650,7 +655,7 @@ impl<'a> Parser<'a> {
         let mut links = 0;
         loop {
             // As in a chain of binary operators, each link makes the tree a level deeper.
-            if matches!(self.kind(), T::LParen | T::LBracket | T::Dot) {
+            if matches!(self.kind(), T::LParen | T::LBracket | T::Dot | T::Question) {
                 links += 1;
                 if links > super::MAX_EXPR_DEPTH {
                     self.too_deep_error(e.span.shrink_to_start());
@@ -1417,7 +1422,7 @@ fn is_postfix_shaped(e: &Expr) -> bool {
 }
 
 /// A Rust format string and its arguments (as written) as a wrela f-string: `{}` takes the
-/// next argument, `{name}` and `{0}` name one, `:?` is dropped, and a spec wrela has is kept. `None` when it
+/// next argument, `{name}` and `{0}` name one, and a spec wrela has is kept. `None` when it
 /// doesn't fit an f-string (another format spec, an argument with quotes or braces).
 fn f_string(literal: &str, args: &[String]) -> Option<String> {
     let inner = literal.strip_prefix('"')?.strip_suffix('"')?;
@@ -1439,11 +1444,16 @@ fn f_string(literal: &str, args: &[String]) -> Option<String> {
             }
             '{' => {
                 let mut hole = String::new();
+                let mut closed = false;
                 for c in chars.by_ref() {
                     if c == '}' {
+                        closed = true;
                         break;
                     }
                     hole.push(c);
+                }
+                if !closed {
+                    return None;
                 }
                 let (what, spec) = match hole.split_once(':') {
                     Some((w, s)) => (w, Some(s)),
@@ -1459,7 +1469,7 @@ fn f_string(literal: &str, args: &[String]) -> Option<String> {
                     what.to_string()
                 };
                 let spec = match spec {
-                    None | Some("?") | Some("") => String::new(),
+                    None | Some("") => String::new(),
                     Some(s) if crate::lexer::parse_spec(s).is_ok() => format!(":{s}"),
                     Some(_) => return None,
                 };

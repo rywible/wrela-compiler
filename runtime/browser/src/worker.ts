@@ -15,7 +15,7 @@ import { Live } from "./live.ts";
 import { type PrintSink, type Program, type ProgramOptions, runWorker, type SpawnWorker } from "./program.ts";
 import type { FromHelper, FromTicker, FromWorker, Loaded, Replay, TickerOptions, TickerStart, TickReport, ToWorker, VoiceOptions } from "./messages.ts";
 import { encodePng } from "./png.ts";
-import { frameTime, holdFor, loaded, putResult, sleepUntil, type TestParams } from "./testmode.ts";
+import { frameTime, holdFor, inputUrl, loaded, putResult, sleepUntil, type TestParams } from "./testmode.ts";
 import { lockstepTicks, runTicker, TickerControl, TickerMode } from "./ticker.ts";
 import { wasmHash } from "./ticks.ts";
 import { failAudioRender } from "./worker-audio.ts";
@@ -507,7 +507,7 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
     format: SCREEN_FORMAT,
     usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
   });
-  const script: Scripted[] = params.input ? parseScript(await (await fetch(new URL(params.input, base))).text()) : [];
+  const script: Scripted[] = params.input ? parseScript(await (await fetch(inputUrl(base, params.input))).text()) : [];
   const frameEvents = arrivals(script).frames;
   const hashes = params.nohash === 0;
   // The tick log needs only the ticks' hashes (the sim's state, cheap), not the frames'.

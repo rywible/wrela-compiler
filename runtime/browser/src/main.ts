@@ -53,10 +53,14 @@ function onPixelRatioChange(f: () => void): void {
 /** The page's audio context, made for the first voice, and the voice playing in it: a build
  * handed over to plays its voice in the same context (a browser starts a context only after the
  * person interacts with the page, so a new one would be silent). */
-const audio: { context: Promise<AudioContext> | null; node: AudioWorkletNode | null } = { context: null, node: null };
+const audio: { context: Promise<AudioContext> | null; node: AudioWorkletNode | null; generation: number } = {
+  context: null,
+  node: null,
+  generation: 0,
+};
 
-/** Stops the voice playing: its program handed its place to another build. */
-function stopVoice(): void {
+/** Disconnects the voice currently playing. */
+function disconnectVoice(): void {
   if (!audio.node) return;
   audio.node.port.onmessage = null;
   audio.node.onprocessorerror = null;
@@ -64,10 +68,17 @@ function stopVoice(): void {
   audio.node = null;
 }
 
+/** Stops the voice playing, including one still waiting for the worklet to load. */
+function stopVoice(): void {
+  audio.generation++;
+  disconnectVoice();
+}
+
 /** Plays the program's voice in an AudioWorklet (worklet.js), at the ABI's sample rate (the
  * browser resamples to the device's). In test mode it renders `test.audio` quanta offline
  * instead, saves the samples to `results/audio.f32`, and tells the worker. */
 async function playVoice(voice: VoiceOptions, test: TestParams | null, worker: Worker): Promise<void> {
+  const generation = audio.generation;
   const url = new URL("worklet.js", import.meta.url);
   const node = (
     ctx: BaseAudioContext,
@@ -169,7 +180,8 @@ async function playVoice(voice: VoiceOptions, test: TestParams | null, worker: W
     return ctx;
   })();
   const ctx = await audio.context;
-  stopVoice();
+  if (generation !== audio.generation) return;
+  disconnectVoice();
   audio.node = node(ctx, null).node;
 }
 

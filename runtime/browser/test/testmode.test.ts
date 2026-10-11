@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { asksForTest, frameTime, isLoopback, parseTestParams, TEST_DEFAULTS } from "../src/testmode.ts";
+import { asksForTest, frameTime, inputUrl, isLoopback, parseTestParams, TEST_DEFAULTS } from "../src/testmode.ts";
 
 test("only #test fragments ask for test mode", () => {
   expect(parseTestParams("")).toBeNull();
@@ -58,6 +58,13 @@ test("rejects unknown or invalid parameters", () => {
   expect(() => parseTestParams("#test&fps=-1")).toThrow("fps=-1 must be a positive number");
   expect(() => parseTestParams("#test&input=../x.json")).toThrow("must be a path relative to the page");
   expect(() => parseTestParams("#test&input=http://x/y")).toThrow("must be a path relative to the page");
+  expect(() => parseTestParams("#test&input=..\\x.json")).toThrow("must be a path relative to the page");
+  expect(() => parseTestParams("#test&input=x.json?other=1")).toThrow("must be a path relative to the page");
+});
+
+test("an input script's percent escapes stay literal and under the page", () => {
+  const path = parseTestParams("#test&input=%2e%2e/keys.json")!.input;
+  expect(inputUrl("http://localhost/game/index.html", path).href).toBe("http://localhost/game/%252e%252e/keys.json");
 });
 
 test("frame times are i / fps, rounded to f32 like the native host's", () => {

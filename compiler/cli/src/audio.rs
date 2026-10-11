@@ -139,8 +139,9 @@ fn load(a: &Args) -> Result<CpuHost, String> {
 }
 
 fn build(a: &Args) -> Result<CpuBuild, String> {
-    let out = wrela_driver::build(&a.dir);
     let built = a.dir.join("build").join("audio");
+    crate::generated_path(&a.dir, &built)?;
+    let out = wrela_driver::build(&a.dir);
     crate::write_build(&out, &built)?;
     CpuBuild::load(&built).map_err(|e| e.to_string())
 }
@@ -166,6 +167,17 @@ fn length(host: &mut CpuHost, a: &Args) -> Result<f64, String> {
     }
 }
 
+fn quanta(seconds: f64) -> Result<u32, String> {
+    let count = (seconds * RATE / f64::from(QUANTUM)).ceil();
+    if !seconds.is_finite() || seconds <= 0.0 || !count.is_finite() || count > f64::from(u32::MAX) {
+        return Err(
+            "audio length must be a positive, finite number of seconds within the render limit"
+                .into(),
+        );
+    }
+    Ok(count as u32)
+}
+
 /// The take's samples, the channels interleaved, and its length in seconds.
 fn render(a: &Args) -> Result<(Vec<f32>, f64), String> {
     let mut host = load(a)?;
@@ -175,7 +187,7 @@ fn render(a: &Args) -> Result<(Vec<f32>, f64), String> {
 fn render_host(host: &mut CpuHost, a: &Args) -> Result<(Vec<f32>, f64), String> {
     let seconds = length(host, a)?;
     host.frame(0.0, 16, 16).map_err(|e| format!("the first frame: {e}"))?;
-    let quanta = (seconds * RATE / f64::from(QUANTUM)).ceil() as u32;
+    let quanta = quanta(seconds)?;
     let samples = host.render_audio(quanta).map_err(|e| e.to_string())?;
     Ok((samples, seconds))
 }
@@ -419,7 +431,7 @@ fn speed(a: &Args) -> Result<(), String> {
     let mut host = load(a)?;
     let seconds = length(&mut host, a)?;
     host.frame(0.0, 16, 16).map_err(|e| format!("the first frame: {e}"))?;
-    let quanta = (seconds * RATE / f64::from(QUANTUM)).ceil() as u32;
+    let quanta = quanta(seconds)?;
     let mut times = Vec::with_capacity(quanta as usize);
     for _ in 0..quanta {
         let started = std::time::Instant::now();

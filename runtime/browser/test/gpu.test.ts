@@ -572,6 +572,22 @@ test("a readback submits the work before it, then copies its range out", async (
   expect(readback.destroyed).toBe(true);
 });
 
+test("a failed readback releases its staging buffer", async () => {
+  const { device, run, executor } = await setup();
+  run(new Encoder().createBuffer(1, 64));
+  const createBuffer = device.createBuffer.bind(device);
+  device.createBuffer = (desc) => {
+    const buffer = createBuffer(desc);
+    if (desc.label === "readback") buffer.mapAsync = async () => { throw new Error("map failed"); };
+    return buffer;
+  };
+  await expect(executor.readBack(1, 0, 4)).rejects.toThrow("map failed");
+  expect(device.buffers.find((b) => b.label === "readback")?.destroyed).toBe(true);
+  const before = device.buffers.length;
+  expect(() => executor.readBack(99, 0, 4)).toThrow("buffer 99 passed the checks but doesn't exist");
+  expect(device.buffers).toHaveLength(before);
+});
+
 test("a command whose pipeline is still being built waits for it, and the commands after it wait behind it", async () => {
   const device = new FakeDevice();
   const m = shapes();

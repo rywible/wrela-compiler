@@ -178,8 +178,9 @@ pub(crate) fn load(
     input: Option<&Path>,
     options: &Options,
 ) -> Result<(Host, Vec<Scripted>, PathBuf), String> {
-    let out = wrela_driver::build(dir);
     let built = dir.join("build").join(into);
+    crate::generated_path(dir, &built)?;
+    let out = wrela_driver::build(dir);
     crate::write_build(&out, &built)?;
     let script = match input {
         Some(p) => {
@@ -484,5 +485,24 @@ mod tests {
         assert_eq!(percentile(&[3.0], 95), Some(3.0));
         assert_eq!(percentile(&[], 95), None);
         assert_eq!(percentile(&[1.0, 2.0, 3.0, 4.0], 50), Some(2.0));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn profile_and_estimate_refuse_a_linked_build_directory() {
+        let dir = std::env::temp_dir().join(format!("wrela-profile-link-{}", std::process::id()));
+        let outside =
+            std::env::temp_dir().join(format!("wrela-profile-outside-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::create_dir_all(&dir).expect("package");
+        std::fs::create_dir_all(&outside).expect("outside");
+        std::os::unix::fs::symlink(&outside, dir.join("build")).expect("linked build");
+        for name in ["profile", "estimate"] {
+            assert!(load(&dir, name, None, &Options::default()).is_err());
+        }
+        assert!(std::fs::read_dir(&outside).expect("outside directory").next().is_none());
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(outside);
     }
 }

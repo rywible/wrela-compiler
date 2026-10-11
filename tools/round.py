@@ -199,6 +199,7 @@ def main():
     print(f"round {n}: {frames} frames ({frames / FPS / 60:.1f} min) in Chrome", flush=True)
     r = subprocess.run([sys.executable, HEADLESS, os.path.relpath(page, ROOT), hash_, str(timeout)],
                        capture_output=True, text=True)
+    round_status = r.returncode
     results = os.path.join(page, "results")
     for name in ["ticks.log", "log.txt", "console.log", "frames.json", "memory.json", "load.json"]:
         if os.path.exists(os.path.join(results, name)):
@@ -212,17 +213,29 @@ def main():
     if r.returncode != 0:
         print(r.stderr[-3000:])
         print(f"the round's run failed (see {out}/console.log)")
+    missing = [name for name in ("frames.json", "log.txt") if not os.path.isfile(os.path.join(out, name))]
+    if missing:
+        print(f"the round produced no {', '.join(missing)}")
+        shutil.rmtree(page, ignore_errors=True)
+        sys.exit(round_status or 1)
     with open(os.path.join(out, "frames.json")) as f:
         frames_json = json.load(f)
     with open(os.path.join(out, "log.txt")) as f:
         log_lines = f.read().splitlines()
     summarize(out, frames_json, log_lines, frames_json["printed_in"], set(snaps))
     shutil.rmtree(page, ignore_errors=True)
+    lookbook_status = 0
     if "--no-lookbook" not in args and not quick:
         r = subprocess.run([sys.executable, LOOKBOOK, os.path.join(out, "lookbook"), "--stills"],
                            capture_output=True, text=True)
-        print(r.stdout.strip().splitlines()[-1] if r.returncode == 0 else r.stderr[-2000:])
-    sys.exit(r.returncode)
+        lookbook_status = r.returncode
+        if r.returncode == 0:
+            lines = r.stdout.strip().splitlines()
+            if lines:
+                print(lines[-1])
+        else:
+            print(r.stderr[-2000:])
+    sys.exit(round_status or lookbook_status)
 
 
 if __name__ == "__main__":

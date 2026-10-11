@@ -1,7 +1,7 @@
 // The program ABI without a GPU, mirroring runtime/native/src/program/tests.rs.
 
 import { describe, expect, spyOn, test } from "bun:test";
-import { AUDIO_CHANNELS, AUDIO_OUT, AUDIO_QUANTUM, EVENT_SIZE, MAX_TICK_RECORDS, PANIC, PAR_SHUTDOWN, STREAM_VERSION, THREAD_BLOCKS, TICK_RECORDS } from "../src/abi.gen.ts";
+import { AUDIO_CHANNELS, AUDIO_OUT, AUDIO_QUANTUM, EVENT_SIZE, MAX_TICK_RECORDS, PANIC, PAR_SHUTDOWN, SCREEN, STREAM_VERSION, THREAD_BLOCKS, TICK_RECORDS } from "../src/abi.gen.ts";
 import { CommandError } from "../src/check.ts";
 import { parseManifest } from "../src/manifest.ts";
 import { checkAbi, otherInstance, Program, ProgramError, TrapError } from "../src/program.ts";
@@ -441,6 +441,13 @@ test("runs without the state hash unless asked", async () => {
   expect(program.hash).toBeNull();
 });
 
+test("a frame checks a screen depth target against its current size", async () => {
+  const pass = { color: SCREEN, keepColor: false, join: false, clear: [0, 0, 0, 1] as [number, number, number, number], depth: 3, keepDepth: false, clearDepth: 1 };
+  const batch = new Encoder().createTexture(3, 64, 63, "depth32float").beginPass(pass).present().finish();
+  const p = await load(batchProgram([[batch]]));
+  expect(() => p.frame(0, 64, 64)).toThrow("the pass's colour and depth targets differ in size");
+});
+
 test("reads the offsets of a stack trace's WASM frames", () => {
   // V8's form (Chrome), then SpiderMonkey's (Firefox).
   const v8 = "RuntimeError: divide by zero\n    at div (wasm://wasm/0a1b2c3d:wasm-function[7]:0x2f1)\n    at run (wasm://wasm/0a1b2c3d:wasm-function[9]:0x340)";
@@ -467,6 +474,7 @@ describe("requests", () => {
           { type: NONE_TYPE, body: [...op.i32(16), ...op.i32(batch.length), ...op.call(0)], export: "ask" },
           { type: I32, body: [...op.i32(4), ...op.call(1)], export: "status" },
           { type: I32, body: [...op.i32(4), ...op.i32(1024), ...op.call(2), ...op.i32(1024), 0x28, 0x02, 0x00], export: "take" },
+          { type: NONE_TYPE, body: [...op.i32(4), ...op.i32(65534), ...op.call(2)], export: "takePastEnd" },
         ],
         data: [{ offset: 16, bytes: batch }],
       }),
@@ -487,6 +495,22 @@ describe("requests", () => {
     p.call("ask");
     expect(p.call("status")).toBe(-1);
     await later();
+    expect(p.call("status")).toBe(5);
+    expect(p.call("take")).toBe(0x04030201);
+    expect(p.call("status")).toBe(-1);
+  });
+
+  test("an out-of-bounds take leaves the answer available for a valid take", async () => {
+    const io = {
+      fetch: async () => Uint8Array.of(1, 2, 3, 4, 5),
+      storageRead: async () => new Uint8Array(0),
+      storageWrite: async () => {},
+      post: async () => new Uint8Array(0),
+    };
+    const p = await program(new Encoder().fetch(4, "data/level.bin").finish(), { io });
+    p.call("ask");
+    await later();
+    expect(() => p.call("takePastEnd")).toThrow("request_take(4, 65534) reaches past the end of the program's memory");
     expect(p.call("status")).toBe(5);
     expect(p.call("take")).toBe(0x04030201);
     expect(p.call("status")).toBe(-1);

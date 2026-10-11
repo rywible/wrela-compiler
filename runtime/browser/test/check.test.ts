@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import { Checker } from "../src/check.ts";
+import { SCREEN } from "../src/abi.gen.ts";
 import type { Binding, Command } from "../src/stream.ts";
 import { shapes } from "./fixtures.ts";
 
@@ -38,4 +39,18 @@ test("usage conflicts persist within a pass and reset at the next pass", () => {
   checker.check({ op: "Present" });
   checker.check({ op: "BeginScreenPass", clear: [0, 0, 0, 1] });
   expect(() => checker.check(draw([b, a]))).not.toThrow();
+});
+
+test("a screen pass requires its depth target to fit the frame", () => {
+  const checker = new Checker(shapes());
+  checker.setScreenSize(640, 360);
+  checker.check({ op: "CreateTexture", handle: 3, width: 640, height: 359, depth: 0, format: "depth32float", writable: false });
+  checker.check({ op: "CreateTexture", handle: 4, width: 640, height: 360, depth: 0, format: "depth32float", writable: false });
+  const pass = (depth: number): Command => ({
+    op: "BeginPass",
+    pass: { color: SCREEN, keepColor: false, join: false, clear: [0, 0, 0, 1], depth, keepDepth: false, clearDepth: 1 },
+  });
+  expect(() => checker.check(pass(3))).toThrow("the pass's colour and depth targets differ in size");
+  expect(() => checker.check(pass(4))).not.toThrow();
+  checker.check({ op: "Present" });
 });

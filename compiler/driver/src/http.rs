@@ -120,10 +120,10 @@ pub(crate) fn read(stream: &TcpStream, port: u16) -> std::io::Result<Option<Requ
     Ok(Some(Request { method, path: path.to_string(), query: query.to_string(), body }))
 }
 
-/// Writes a test-mode result (`PUT /results/<name>`) into `results`: a plain file name only.
+/// Writes a test-mode result (`PUT /results/<name>`) under `root`: a plain file name only.
 pub(crate) fn put_result(
     out: &mut TcpStream,
-    results: &std::path::Path,
+    root: &Path,
     name: &str,
     body: &[u8],
 ) -> std::io::Result<()> {
@@ -133,7 +133,11 @@ pub(crate) fn put_result(
     if !plain {
         return respond(out, 403, "text/plain", b"a result is a plain file name");
     }
-    std::fs::create_dir_all(results)?;
+    let results = root.join("results");
+    if crate::ensure_no_symlink_path(root, &results.join(name)).is_err() {
+        return respond(out, 403, "text/plain", b"a result path cannot contain a symbolic link");
+    }
+    std::fs::create_dir_all(&results)?;
     crate::write_atomic(&results.join(name), body)?;
     respond(out, 201, "text/plain", b"")
 }
@@ -146,18 +150,52 @@ pub(crate) fn get_file(
     rel: &str,
     page: impl FnOnce(&str) -> String,
 ) -> std::io::Result<()> {
-    if wrela_abi::check::path_problem(rel).is_some() {
+    // Request paths still contain URL escapes. Decode once before checking or joining a path:
+    // checking the encoded spelling would let `%2e%2e` escape the build directory.
+    let Some(rel) = decode_path(rel) else {
+        return respond(out, 404, "text/plain", b"not found");
+    };
+    if wrela_abi::check::path_problem(&rel).is_some()
+        || crate::ensure_no_symlink_path(dir, &dir.join(&rel)).is_err()
+    {
         return respond(out, 404, "text/plain", b"not found");
     }
-    match std::fs::read(dir.join(rel)) {
+    match std::fs::read(dir.join(&rel)) {
         Ok(mut bytes) => {
             if rel == "index.html" {
                 bytes = page(&String::from_utf8_lossy(&bytes)).into_bytes();
             }
-            respond(out, 200, mime(rel), &bytes)
+            respond(out, 200, mime(&rel), &bytes)
         }
         Err(_) => respond(out, 404, "text/plain", b"not found"),
     }
+}
+
+fn decode_path(path: &str) -> Option<String> {
+    fn hex(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
+        }
+    }
+
+    let mut decoded = Vec::with_capacity(path.len());
+    let mut bytes = path.bytes();
+    while let Some(byte) = bytes.next() {
+        if byte == b'%' {
+            let value = hex(bytes.next()?)? * 16 + hex(bytes.next()?)?;
+            // A URL escape cannot introduce a new path part after routing has selected a file.
+            if value == b'/' || value == b'\\' {
+                return None;
+            }
+            decoded.push(value);
+        } else {
+            decoded.push(byte);
+        }
+    }
+    String::from_utf8(decoded).ok()
 }
 
 fn mime(path: &str) -> &'static str {
@@ -195,4 +233,105 @@ pub(crate) fn respond(
     )?;
     out.write_all(body)?;
     out.flush()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn percent_encoded_get_paths_are_decoded_once_and_checked() {
+        let root = std::env::temp_dir().join(format!("wrela-http-escapes-{}", std::process::id()));
+        let build = root.join("build");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&build).expect("build");
+        std::fs::write(build.join("game%logic.js"), "literal percent").expect("script");
+        std::fs::write(build.join("%2e%2e.txt"), "decoded once").expect("escaped name");
+        std::fs::write(build.join("..txt"), "decoded twice").expect("other name");
+        std::fs::write(root.join("secret.txt"), "private").expect("outside file");
+
+        let answer = |target: &str| {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listen");
+            let port = listener.local_addr().expect("port").port();
+            let target = target.to_string();
+            let client = std::thread::spawn(move || {
+                let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+                write!(stream, "GET /{target} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n")
+                    .expect("request");
+                let mut response = String::new();
+                stream.read_to_string(&mut response).expect("response");
+                response
+            });
+            let (mut stream, _) = listener.accept().expect("accept");
+            let request = read(&stream, port).expect("read request").expect("allowed request");
+            get_file(&mut stream, &build, request.path.trim_start_matches('/'), str::to_string)
+                .expect("answer GET");
+            drop(stream);
+            client.join().expect("response")
+        };
+
+        let script = answer("game%25logic.js");
+        assert!(script.starts_with("HTTP/1.1 200"), "{script}");
+        assert!(script.ends_with("literal percent"), "{script}");
+        let once = answer("%252e%252e.txt");
+        assert!(once.starts_with("HTTP/1.1 200"), "{once}");
+        assert!(once.ends_with("decoded once"), "{once}");
+        for target in ["%2e%2e/secret.txt", "%2e%2e%2fsecret.txt", "bad%escape.js"] {
+            let response = answer(target);
+            assert!(response.starts_with("HTTP/1.1 404"), "{target}: {response}");
+            assert!(!response.contains("private"), "{target}: {response}");
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_files_are_not_served_or_written() {
+        use std::os::unix::fs::symlink;
+
+        let dir = std::env::temp_dir().join(format!("wrela-http-links-{}", std::process::id()));
+        let outside =
+            std::env::temp_dir().join(format!("wrela-http-outside-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::create_dir_all(&dir).expect("page");
+        std::fs::create_dir_all(&outside).expect("outside");
+        std::fs::write(outside.join("secret.txt"), "private").expect("secret");
+        symlink(outside.join("secret.txt"), dir.join("visible.txt")).expect("linked file");
+        symlink(&outside, dir.join("results")).expect("linked results");
+
+        let answer = |serve: &dyn Fn(&mut TcpStream)| {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listen");
+            let port = listener.local_addr().expect("port").port();
+            let client = std::thread::spawn(move || {
+                let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+                let mut response = String::new();
+                stream.read_to_string(&mut response).expect("read response");
+                response
+            });
+            let (mut stream, _) = listener.accept().expect("accept");
+            serve(&mut stream);
+            drop(stream);
+            client.join().expect("response")
+        };
+        let served = answer(&|stream| {
+            get_file(stream, &dir, "visible.txt", str::to_string).expect("answer GET");
+        });
+        assert!(served.starts_with("HTTP/1.1 404"), "{served}");
+        assert!(!served.contains("private"));
+        let written = answer(&|stream| {
+            put_result(stream, &dir, "new.txt", b"bad").expect("answer PUT");
+        });
+        assert!(written.starts_with("HTTP/1.1 403"), "{written}");
+        assert!(!outside.join("new.txt").exists());
+        symlink(&outside, dir.join("linked-page")).expect("linked page");
+        let written = answer(&|stream| {
+            put_result(stream, &dir.join("linked-page"), "new.txt", b"bad")
+                .expect("answer PUT through linked page");
+        });
+        assert!(written.starts_with("HTTP/1.1 403"), "{written}");
+        assert!(!outside.join("new.txt").exists());
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(outside);
+    }
 }

@@ -366,6 +366,11 @@ impl Gbnf {
                     once.clear();
                     self.atom_ends(&it.atom, p, s, memo, &mut once);
                     for &e in &once {
+                        // One repetition can be empty. `+` accepts that empty derivation,
+                        // although an empty step must never re-enter the frontier.
+                        if it.rep == Rep::Plus && p == pos && e == pos {
+                            out.push(pos);
+                        }
                         if e > p && seen.insert(e) {
                             out.push(e);
                             frontier.push(e);
@@ -530,6 +535,15 @@ mod tests {
         ] {
             assert_eq!(g.recognizes(g.root, s), ok, "{s:?}");
         }
+    }
+
+    #[test]
+    fn recognizes_a_nullable_plus() {
+        let g = Gbnf::parse("root ::= (\"a\"?)+\n").unwrap();
+        for text in ["", "a", "aa"] {
+            assert!(g.recognizes(g.root, text), "{text:?}");
+        }
+        assert!(!g.recognizes(g.root, "b"));
     }
 
     /// A class that matches no character can't be sampled: an empty one, a reversed range, or

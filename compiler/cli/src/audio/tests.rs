@@ -3,10 +3,61 @@
 //! stages), and a sine with a click in it. The tools that render a piece (`wav`, `describe`,
 //! `numbers`, `midi`, `sheet`, `speed`) are tested on `examples/piano` by the command's tests.
 
-use super::{clicks, measure};
+use super::{clicks, dsp, measure, quanta};
 use std::f64::consts::{PI, TAU};
 
 const RATE: f64 = 48000.0;
+
+#[test]
+fn malformed_wav_chunks_return_errors_instead_of_panicking() {
+    let path = std::env::temp_dir().join(format!("wrela-audio-bad-wav-{}.wav", std::process::id()));
+    let header = b"RIFF\0\0\0\0WAVE";
+    let fmt = b"fmt \x10\0\0\0\x01\0\x02\0\x80\xbb\0\0\0\xee\x02\0\x04\0\x10\0";
+    let mut truncated_data = fmt.to_vec();
+    truncated_data.extend_from_slice(b"data\x04\0\0\0\0\0");
+    let mut incomplete_frame = fmt.to_vec();
+    incomplete_frame.extend_from_slice(b"data\x02\0\0\0\0\0");
+    for chunk in [
+        b"fmt \x02\0\0\0\x01\0".to_vec(),
+        b"fmt \x12\0\0\0\xfe\xff\x01\0\x80\xbb\0\0\0\xee\x02\0\x04\0\x20\0\0\0".to_vec(),
+        b"data\x04\0\0\0\0\0".to_vec(),
+        truncated_data,
+        incomplete_frame,
+    ] {
+        let mut bytes = header.to_vec();
+        bytes.extend_from_slice(&chunk);
+        std::fs::write(&path, bytes).expect("write WAV");
+        assert!(dsp::read_wav(&path).is_err(), "malformed chunk was accepted: {chunk:?}");
+    }
+    std::fs::remove_file(path).expect("remove WAV");
+}
+
+#[test]
+fn audio_length_rejects_values_that_cannot_be_rendered() {
+    assert_eq!(quanta(1.0).expect("one second"), 375);
+    for seconds in [0.0, -1.0, f64::NAN, f64::INFINITY, 1.0e12] {
+        assert!(quanta(seconds).is_err(), "accepted {seconds}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn audio_refuses_a_linked_build_directory() {
+    let dir = std::env::temp_dir().join(format!("wrela-audio-build-link-{}", std::process::id()));
+    let outside =
+        std::env::temp_dir().join(format!("wrela-audio-build-outside-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&outside);
+    std::fs::create_dir_all(&dir).expect("package");
+    std::fs::create_dir_all(&outside).expect("outside");
+    std::os::unix::fs::symlink(&outside, dir.join("build")).expect("linked build");
+    let args = [dir.display().to_string(), "wav".into(), "out.wav".into()];
+    let a = super::parse(&args).expect("audio arguments");
+    assert!(super::build(&a).is_err());
+    assert!(std::fs::read_dir(&outside).expect("outside directory").next().is_none());
+    let _ = std::fs::remove_dir_all(dir);
+    let _ = std::fs::remove_dir_all(outside);
+}
 
 /// What a made note's string is.
 #[derive(Clone, Copy)]
@@ -101,6 +152,15 @@ fn clicks_in_silence_keep_their_peak_times_and_levels() {
     let expected_db = 10.0 * (6.0 * 0.5f64.powi(2) / 8.0 / 1e-10).log10();
     assert_eq!(found[0].db, expected_db);
     assert_eq!(found[1].db, expected_db);
+}
+
+#[test]
+fn clicks_accepts_a_low_rate_wav() {
+    let mut samples = vec![0.0; 1000];
+    samples[500] = 0.5;
+    let found = clicks::clicks(&samples, 1000.0);
+    assert_eq!(found.len(), 1);
+    assert!((found[0].at - 0.5).abs() < 0.005);
 }
 
 #[test]

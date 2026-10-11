@@ -120,7 +120,6 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         if dest is None:
             self.send_error(403, "PUT is only allowed into a results/ directory")
             return
-        os.makedirs(os.path.dirname(dest), exist_ok=True)
         try:
             length = int(self.headers.get("Content-Length", 0))
         except ValueError:
@@ -130,6 +129,10 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             self.send_error(400, "Content-Length must be a non-negative integer")
             return
         body = self.rfile.read(length)
+        if len(body) != length:
+            self.send_error(400, "request body is shorter than Content-Length")
+            return
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
         tmp = f"{dest}.{os.getpid()}.{id(self)}.tmp"
         with open(tmp, "wb") as f:
             f.write(body)

@@ -20,8 +20,8 @@ pub(super) struct Click {
 
 /// The clicks in `mono` (at `rate`).
 pub(super) fn clicks(mono: &[f32], rate: f64) -> Vec<Click> {
-    let step = (rate / 2000.0) as usize; // 0.5 ms
-    let width = (rate / 1000.0) as usize; // 1 ms
+    let step = ((rate / 2000.0) as usize).max(1); // 0.5 ms, at least one sample
+    let width = ((rate / 1000.0) as usize).max(1); // 1 ms, at least one sample
     let d: Vec<f64> = (2..mono.len())
         .map(|i| f64::from(mono[i]) - 2.0 * f64::from(mono[i - 1]) + f64::from(mono[i - 2]))
         .collect();
@@ -31,7 +31,8 @@ pub(super) fn clicks(mono: &[f32], rate: f64) -> Vec<Click> {
             (w.iter().map(|x| x * x).sum::<f64>() / width as f64).max(1e-30)
         })
         .collect();
-    let around = 100; // 50 ms of half-millisecond frames
+    let around = ((rate * 0.05 / step as f64).round() as usize).max(1);
+    let local = ((rate * 0.002 / step as f64).round() as usize).max(1);
     let mut out = Vec::new();
     let mut near = Vec::with_capacity(2 * around);
     let mut i = 0;
@@ -41,8 +42,8 @@ pub(super) fn clicks(mono: &[f32], rate: f64) -> Vec<Click> {
             continue;
         }
         // Only a local peak can be a click. Most frames need no median at all.
-        let local_max =
-            (i.saturating_sub(4)..(i + 5).min(frames.len())).all(|j| frames[j] <= frames[i]);
+        let local_max = (i.saturating_sub(local)..(i + local + 1).min(frames.len()))
+            .all(|j| frames[j] <= frames[i]);
         if !local_max {
             i += 1;
             continue;
@@ -58,7 +59,7 @@ pub(super) fn clicks(mono: &[f32], rate: f64) -> Vec<Click> {
         let db = 10.0 * (frames[i] / median).log10();
         if db > DB_OVER {
             out.push(Click { at: (i * step) as f64 / rate, db });
-            i += 4;
+            i += local;
         } else {
             i += 1;
         }

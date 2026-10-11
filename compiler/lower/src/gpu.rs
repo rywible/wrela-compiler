@@ -732,9 +732,11 @@ fn record_dispatch(fl: &mut Fl, d: &mir::Dispatch, span: Span) -> Option<()> {
             .iter()
             .zip(wg)
             .map(|(&n, w)| {
-                let (wv, w1) = (fl.u32c(w), fl.u32c(w - 1));
-                let up = fl.value(u, ir::Expr::Binary(ir::BinOp::WrappingAdd, n, w1));
-                fl.value(u, ir::Expr::Binary(ir::BinOp::Div, up, wv))
+                let (wv, one) = (fl.u32c(w), fl.u32c(1));
+                let whole = fl.value(u, ir::Expr::Binary(ir::BinOp::Div, n, wv));
+                let rest = fl.value(u, ir::Expr::Binary(ir::BinOp::Rem, n, wv));
+                let extra = fl.value(u, ir::Expr::Builtin(ir::Builtin::Min, vec![rest, one]));
+                fl.value(u, ir::Expr::Binary(ir::BinOp::Add, whole, extra))
             })
             .collect();
     }
@@ -2837,5 +2839,101 @@ pub(crate) fn check_standalone(cx: &mut Cx, f: FnId, entry: Option<Entry>, subst
     check_recursion(cx, &mb);
     if let Some((id, inputs)) = fragment {
         check_uniformity(cx, &mb, id, &inputs);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use wrela_diag::FileId;
+    use wrela_sema::SourceUnit;
+
+    /// Evaluate the constant group-count expression in the lowered CPU function. This fixture
+    /// never submits the oversized dispatch to a GPU; it checks the arithmetic before the host
+    /// applies its device limits.
+    fn constant_u32(v: ir::ValueId, lets: &HashMap<ir::ValueId, &ir::Expr>) -> u32 {
+        match lets[&v] {
+            ir::Expr::Const(ir::Const::U32(n)) => *n,
+            ir::Expr::Binary(op, a, b) => {
+                let (a, b) = (constant_u32(*a, lets), constant_u32(*b, lets));
+                match op {
+                    ir::BinOp::Add | ir::BinOp::WrappingAdd => a.wrapping_add(b),
+                    ir::BinOp::Sub => a.wrapping_sub(b),
+                    ir::BinOp::Div => a / b,
+                    ir::BinOp::Rem => a % b,
+                    _ => panic!("unexpected group-count operation: {op:?}"),
+                }
+            }
+            ir::Expr::Builtin(ir::Builtin::Min, args) => {
+                constant_u32(args[0], lets).min(constant_u32(args[1], lets))
+            }
+            other => panic!("unexpected group-count expression: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn domain_group_count_does_not_wrap_at_u32_max() {
+        let source = r#"
+use std::gpu::{Atomics, GlobalId, buffer, dispatch}
+
+@compute(64)
+fn mark(out: mut Atomics<u32>, id: GlobalId) {
+    let _ = out.add(i: id.x, value: 1)
+}
+
+fn run() {
+    var out = buffer(1)
+    dispatch(mark.bind(out: mut out), over: 4294967295)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    run()
+}
+"#;
+        let mut diags = Vec::new();
+        let units: Vec<_> = wrela_sema::STD_SOURCES
+            .iter()
+            .map(|(name, text)| (0, *name, *text))
+            .chain(std::iter::once((1, "main", source)))
+            .enumerate()
+            .map(|(i, (package, name, text))| {
+                let parsed = wrela_syntax::parse(FileId(i as u32), text);
+                diags.extend(parsed.diagnostics);
+                SourceUnit {
+                    path: name.split("::").map(str::to_owned).collect(),
+                    ast: Arc::new(parsed.file),
+                    package,
+                    syntax_errors: Vec::new(),
+                    text: Arc::from(text),
+                }
+            })
+            .collect();
+        assert!(!wrela_diag::has_errors(&diags), "syntax: {diags:?}");
+        let checked = wrela_sema::check_program(units, &mut diags);
+        assert!(!wrela_diag::has_errors(&diags), "semantics: {diags:?}");
+        let roots = crate::Roots::of(&checked);
+        let (lowered, errors) = crate::lower(&checked, &roots, &crate::BuildData::default(), false);
+        assert!(!wrela_diag::has_errors(&errors), "lowering: {errors:?}");
+        let run =
+            lowered.cpu.functions.iter().find(|f| f.name.starts_with("run_")).expect("lowered run");
+        let lets: HashMap<_, _> = run
+            .body
+            .iter()
+            .filter_map(|s| match s {
+                ir::Stmt::Let(v, e) => Some((*v, e)),
+                _ => None,
+            })
+            .collect();
+        let groups = run
+            .body
+            .iter()
+            .find_map(|s| match s {
+                ir::Stmt::Eval(ir::Expr::Host(ir::HostOp::Dispatch { .. }, args)) => Some(args[0]),
+                _ => None,
+            })
+            .expect("dispatch");
+        assert_eq!(constant_u32(groups, &lets), 67_108_864);
     }
 }

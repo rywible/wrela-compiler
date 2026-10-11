@@ -91,3 +91,19 @@ test("a pad not in the standard mapping sends nothing", () => {
   expect(padChanges([raw], last)).toEqual([]);
   expect(last[0]).toBe(null);
 });
+
+test("a standard pad sends only ABI controls and releases controls missing from a later reading", () => {
+  const last: (PadState | null)[] = [null, null, null, null];
+  const button = (value: number) => ({ value, pressed: value > 0 });
+  const full = {
+    connected: true,
+    mapping: "standard",
+    buttons: Array.from({ length: 18 }, (_, i) => button(i === 16 || i === 17 ? 1 : 0)),
+    axes: [0, 0, 0, 0.5, 1],
+  };
+  expect(padChanges([full], last)).toEqual([padButtonEvent(0, 16, 1, true), padAxisEvent(0, 3, 0.5)]);
+  expect(padChanges([{ ...full, buttons: [], axes: [] }], last)).toEqual([
+    padButtonEvent(0, 16, 0, false),
+    padAxisEvent(0, 3, 0),
+  ]);
+});

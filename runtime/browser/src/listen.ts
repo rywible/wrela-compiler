@@ -1,7 +1,7 @@
 // The main thread's half of input (input.ts): the DOM's events, as the ABI's, into the ring the
 // render worker reads.
 
-import { EventKind, PADS } from "./abi.gen.ts";
+import { EventKind, PAD_AXES, PAD_BUTTONS, PADS } from "./abi.gen.ts";
 import {
   buttonOf,
   type InputRing,
@@ -122,21 +122,24 @@ export function padChanges(pads: readonly (PadReading | null)[], last: (PadState
       continue;
     }
     const state: PadState = was ?? { values: [], pressed: [], axes: [] };
-    pad.buttons.forEach((button, b) => {
-      const value = step(Math.min(Math.max(button.value, 0), 1));
-      if (value !== (state.values[b] ?? 0) || button.pressed !== (state.pressed[b] ?? false)) {
-        out.push(padButtonEvent(i, b, value, button.pressed));
+    for (let b = 0; b < PAD_BUTTONS.length; b++) {
+      const button = pad.buttons[b];
+      const value = button ? step(Math.min(Math.max(button.value, 0), 1)) : 0;
+      const pressed = button?.pressed ?? false;
+      if (value !== (state.values[b] ?? 0) || pressed !== (state.pressed[b] ?? false)) {
+        out.push(padButtonEvent(i, b, value, pressed));
         state.values[b] = value;
-        state.pressed[b] = button.pressed;
+        state.pressed[b] = pressed;
       }
-    });
-    pad.axes.forEach((raw, a) => {
-      const value = step(Math.min(Math.max(raw, -1), 1));
+    }
+    for (let a = 0; a < PAD_AXES.length; a++) {
+      const raw = pad.axes[a];
+      const value = raw === undefined ? 0 : step(Math.min(Math.max(raw, -1), 1));
       if (value !== (state.axes[a] ?? 0)) {
         out.push(padAxisEvent(i, a, value));
         state.axes[a] = value;
       }
-    });
+    }
     last[i] = state;
   }
   return out;

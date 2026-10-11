@@ -165,6 +165,41 @@ test("audio print messages are relayed to the render worker and traps still fail
   expect(page.posted.at(-1)).toEqual({ type: "audio-failed", message: "boom" });
 });
 
+test("stopping a voice while its worklet loads keeps it from starting later", async () => {
+  const moduleReady = Promise.withResolvers<void>();
+  let nodes = 0;
+  fake(
+    "AudioContext",
+    class {
+      readonly audioWorklet = { addModule: () => moduleReady.promise };
+      readonly destination = {};
+      readonly state = "running";
+    },
+  );
+  fake(
+    "AudioWorkletNode",
+    class {
+      readonly port = { onmessage: null };
+      onprocessorerror = null;
+      constructor() {
+        nodes++;
+      }
+      connect() {}
+      disconnect() {}
+    },
+  );
+  const page = await load("https://example.com/game/");
+  const voice = {} as VoiceOptions;
+  page.worker!.onmessage!(new MessageEvent("message", { data: { type: "audio", voice } satisfies FromWorker }));
+  page.worker!.onmessage!(new MessageEvent("message", { data: { type: "audio-stop" } satisfies FromWorker }));
+  moduleReady.resolve();
+  await Bun.sleep(1);
+  expect(nodes).toBe(0);
+  page.worker!.onmessage!(new MessageEvent("message", { data: { type: "audio", voice } satisfies FromWorker }));
+  await Bun.sleep(1);
+  expect(nodes).toBe(1);
+});
+
 test("offline audio waits for the worklet's print marker before reporting it rendered", async () => {
   let voicePort: { onmessage: ((event: MessageEvent<FromVoice>) => void) | null } | null = null;
   fake(

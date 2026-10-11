@@ -12,6 +12,7 @@
 //! those per instantiation. A closure's effects are its maker's (it runs when it's called, and
 //! it's called by the code it's passed to on the maker's behalf).
 
+use crate::borrowck;
 use crate::defs::*;
 use crate::mir::{self, Body, Callee, Rvalue, StatementKind, TerminatorKind};
 use crate::program::Program;
@@ -757,6 +758,72 @@ impl<'p> Effects<'p> {
     }
 }
 
+/// The function values that can reach a read. An unused `fn` value does not run its body, so
+/// merely naming an effectful function cannot give its maker that function's effects. We keep
+/// the usual conservative effect link for every value that may be read, passed or called.
+fn used_fn_refs(
+    p: &Program,
+    body: &Body,
+    code: &mir::FnBody,
+) -> std::collections::HashSet<(usize, usize)> {
+    use std::collections::HashSet;
+
+    if !code.blocks.iter().any(|b| {
+        b.stmts.iter().any(|s| matches!(&s.kind, StatementKind::Assign(_, Rvalue::FnRef(..))))
+    }) {
+        return HashSet::new();
+    }
+    let n = code.blocks.len();
+    let mut live_in: Vec<HashSet<mir::Local>> = vec![HashSet::new(); n];
+    let mut uses = Vec::new();
+    loop {
+        let mut changed = false;
+        for b in (0..n).rev() {
+            let id = mir::BlockId(b as u32);
+            let mut live: HashSet<_> =
+                code.successors(id).flat_map(|s| live_in[s.index()].iter().copied()).collect();
+            borrowck::term_uses(&code.blocks[b].term, &mut uses);
+            live.extend(uses.drain(..));
+            for s in code.blocks[b].stmts.iter().rev() {
+                let def = borrowck::stmt_uses_defs(p, body, s, &mut uses);
+                if let Some(d) = def {
+                    live.remove(&d);
+                }
+                live.extend(uses.drain(..));
+            }
+            if live != live_in[b] {
+                live_in[b] = live;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    let mut retained = HashSet::new();
+    for b in 0..n {
+        let id = mir::BlockId(b as u32);
+        let mut live: HashSet<_> =
+            code.successors(id).flat_map(|s| live_in[s.index()].iter().copied()).collect();
+        borrowck::term_uses(&code.blocks[b].term, &mut uses);
+        live.extend(uses.drain(..));
+        for (i, s) in code.blocks[b].stmts.iter().enumerate().rev() {
+            if let StatementKind::Assign(place, Rvalue::FnRef(..)) = &s.kind
+                && (!place.proj.is_empty() || live.contains(&place.local))
+            {
+                retained.insert((b, i));
+            }
+            let def = borrowck::stmt_uses_defs(p, body, s, &mut uses);
+            if let Some(d) = def {
+                live.remove(&d);
+            }
+            live.extend(uses.drain(..));
+        }
+    }
+    retained
+}
+
 /// A body's own effects and calls.
 fn node(
     p: &Program,
@@ -766,6 +833,7 @@ fn node(
     hidden: &HashMap<FnId, TyId>,
 ) -> Node {
     let mut n = Node::default();
+    let used_fn_refs = used_fn_refs(p, body, code);
     let std_module = |g: FnId| p.module(p.func(g).module).path.get(1).cloned();
     let call_to = |n: &mut Node, g: FnId, span: Span| {
         let def = p.func(g);
@@ -817,8 +885,8 @@ fn node(
             n.direct.push((e, def.sig_span, why));
         }
     }
-    for b in &code.blocks {
-        for s in &b.stmts {
+    for (block_idx, b) in code.blocks.iter().enumerate() {
+        for (stmt_idx, s) in b.stmts.iter().enumerate() {
             let r = match &s.kind {
                 StatementKind::Assign(place, r) => {
                     index_panics(p, body, place, s.span, &mut n);
@@ -914,7 +982,12 @@ fn node(
                 Rvalue::Closure(id) => {
                     n.calls.push((BodyId { func: f, closure: Some(*id) }, s.span));
                 }
-                Rvalue::FnRef(g, _) => call_to(&mut n, *g, s.span),
+                // Naming a function does not run it. Keep its effects only if the value can
+                // reach a use; then the usual call and higher-order checks remain conservative.
+                Rvalue::FnRef(g, _) if used_fn_refs.contains(&(block_idx, stmt_idx)) => {
+                    call_to(&mut n, *g, s.span)
+                }
+                Rvalue::FnRef(..) => {}
                 Rvalue::Use(o) => {
                     if let Some(place) = o.place() {
                         index_panics(p, body, place, s.span, &mut n);

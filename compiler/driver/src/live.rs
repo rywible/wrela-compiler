@@ -58,8 +58,8 @@ pub(crate) fn scan(dirs: &[PathBuf], before: &Files) -> Files {
             if name.starts_with('.') {
                 continue;
             }
-            let Ok(meta) = e.metadata() else { continue };
-            if meta.is_dir() {
+            let Ok(kind) = e.file_type() else { continue };
+            if kind.is_dir() {
                 if !(top && ["build", "results", "target"].contains(&name.as_str())) {
                     walk(&path, false, before, out);
                 }
@@ -499,7 +499,7 @@ fn handle(
         // `mark`) the build's.
         ("PUT", path) if results_file(path).is_some() => http::put_result(
             &mut out,
-            &state.out.join("results"),
+            &state.out,
             results_file(path).unwrap_or_default(),
             &req.body,
         ),
@@ -612,5 +612,26 @@ mod tests {
         assert_eq!(second[&link].text.as_ref(), "second, and longer\n");
         assert_eq!(changed(&first, &second).collect::<Vec<_>>(), [&link]);
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_does_not_follow_a_symlinked_directory() {
+        let d = std::env::temp_dir().join(format!("wrela-live-dir-link-{}", std::process::id()));
+        let outside =
+            std::env::temp_dir().join(format!("wrela-live-dir-outside-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::create_dir_all(&d).expect("package");
+        std::fs::create_dir_all(&outside).expect("outside");
+        std::fs::write(d.join("main.wrela"), "").expect("source");
+        std::fs::write(outside.join("other.wrela"), "").expect("outside source");
+        std::os::unix::fs::symlink(&outside, d.join("linked")).expect("directory symlink");
+
+        let found = scan(std::slice::from_ref(&d), &Files::new());
+        assert_eq!(found.len(), 1);
+        assert!(found.contains_key(&d.join("main.wrela")));
+        let _ = std::fs::remove_dir_all(d);
+        let _ = std::fs::remove_dir_all(outside);
     }
 }

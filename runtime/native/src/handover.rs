@@ -12,8 +12,8 @@
 //!   kept: the screen never goes black.
 
 use crate::gpu::{Builder, Gpu, Ready, pipeline_key};
-use crate::program::Handing;
-use crate::{Build, Host, Result, compile_build};
+use crate::program::{Handing, Retired};
+use crate::{Build, Error, Host, Result, compile_build};
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::thread::JoinHandle;
@@ -181,21 +181,55 @@ impl Host {
         };
         let kept = self.p().keeping().to_vec();
         let old = self.program.take().expect("the host has a program");
-        let mut program = self.start_carrying(&build, &dir, old.retire().handed_over(), false)?;
-        if let Err(e) = program.run_init() {
-            // Its `init` failed: the build that handed over starts again, with what it kept.
-            let mut carried = program.retire().keeping(kept);
-            carried.log(format!(
-                "the hand-over to {} failed: {e}; {} starts again",
-                dir.display(),
-                self.dir.display()
-            ));
-            self.program = Some(self.start_carrying(&self.build, &self.dir, carried, true)?);
-            return Ok(());
+        let old_init_done = old.init_done();
+        let carried = old.retire().handed_over();
+        let checkpoint = carried.checkpoint();
+        let mut program = match self.start_carrying(&build, &dir, carried, false) {
+            Ok(program) => program,
+            Err((error, failed)) => {
+                return self.resume_failed_hand_over(
+                    &dir,
+                    error,
+                    checkpoint.restore(*failed).keeping(kept),
+                    old_init_done,
+                );
+            }
+        };
+        if let Err(error) = program.run_init() {
+            return self.resume_failed_hand_over(
+                &dir,
+                error,
+                checkpoint.restore(program.retire()).keeping(kept),
+                old_init_done,
+            );
         }
-        self.program = Some(program);
+        self.install_program(program);
         self.build = build;
         self.dir = dir;
+        Ok(())
+    }
+
+    fn resume_failed_hand_over(
+        &mut self,
+        dir: &Path,
+        error: Error,
+        mut carried: Retired<Gpu>,
+        old_init_done: bool,
+    ) -> Result<()> {
+        carried.log(format!(
+            "the hand-over to {} failed: {error}; {} starts again",
+            dir.display(),
+            self.dir.display()
+        ));
+        if let Err(restore) = self.restore_old(carried, old_init_done) {
+            return Err(if self.program.is_some() {
+                Error::Program(format!(
+                    "the hand-over failed ({error}); the old build's init failed ({restore}); the host resumed with init deferred"
+                ))
+            } else {
+                restore
+            });
+        }
         Ok(())
     }
 }

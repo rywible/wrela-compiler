@@ -175,9 +175,9 @@ fn perf_ui_frame_buffers_and_typing_preserve_behavior() {
     for file in ["widgets.wrela", "draw.wrela", "text.wrela", "ttf.wrela"] {
         std::fs::write(dir.join(file), source(&format!("ui/{file}"))).expect("copy UI source");
     }
-    // This test exercises begin(), find() and Tab, with no glyphs drawn. Empty baked fonts
-    // keep it independent of font baking; the existing widget frame tests use the real fonts.
-    let empty = "Baked { em: 32.0, spread: 4.0, ascender: 0.0, descender: 0.0, line_gap: 0.0, glyphs: Vec::new(), kerning: Vec::new(), fields: Vec::new() }";
+    // A zero-area fallback glyph lays out text without a bake or draw; its self-kern also
+    // exercises the caret regression when both letters fall back to it.
+    let empty = "Baked { em: 32.0, spread: 4.0, ascender: 0.0, descender: 0.0, line_gap: 0.0, glyphs: Vec::from([ttf::BakedGlyph { codepoint: 63, advance: 1.0, left: 0.0, top: 0.0, width: 0, height: 0, offset: 0 }]), kerning: Vec::from([ttf::Kern { left: 0, right: 0, units: -4096 }]), fields: Vec::new() }";
     let text = source("ui/text.wrela")
         .replace("bake(embed(\"fonts/Inter-Regular-Latin1.ttf\"), em: 32.0, spread: 4.0)", empty)
         .replace(
@@ -326,7 +326,7 @@ fn typed_runs_and_keys_match_the_previous_editor() {
     let widgets = format!("{}\n{tests}", source("ui/widgets.wrela"));
     std::fs::write(dir.join("widgets.wrela"), widgets).expect("UI tests");
     // The two focused cases plus the production text, font-height, and widget regressions.
-    passes(&dir, 9);
+    passes(&dir, 13);
 }
 
 #[test]
