@@ -47,7 +47,9 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
+import sys
 import time
 
 # A test that took this long, or longer, runs alone and is remembered: CPU seconds alone, or
@@ -57,6 +59,10 @@ SLOW = 5.0
 KEEP_DAYS = 14
 
 VERSION = "v1"
+# Part of every entry's key. Change it with any change to what an entry keeps or how it is
+# matched (what a trace gives, which inputs and sources count, the keys, the builds' check), so
+# that the entries made before are not used; a change to anything else here keeps them.
+MEANING = "2026-10-11.1"
 
 
 def sha(data):
@@ -583,6 +589,56 @@ class Store:
 # ---- one test, alone and traced -------------------------------------------------------------
 
 
+def under(pid):
+    """The live processes under `pid`, from Linux's /proc."""
+    children = {}
+    for d in os.listdir("/proc"):
+        if not d.isdigit():
+            continue
+        try:
+            with open(f"/proc/{d}/stat") as f:
+                state, ppid = f.read().rsplit(")", 1)[1].split()[:2]
+        except (OSError, ValueError):
+            continue
+        if state != "Z":
+            children.setdefault(int(ppid), []).append(int(d))
+    found, todo = [], [pid]
+    while todo:
+        for c in children.get(todo.pop(), []):
+            found.append(c)
+            todo.append(c)
+    return found
+
+
+def stop_all():
+    """Kills every process under this one, and reaps them. A test's process escapes the tree when
+    strace, its parent, dies first, so this process is their subreaper: an orphan under it comes
+    back to it, and the next pass kills it."""
+    for _ in range(10):
+        pids = under(os.getpid())
+        if not pids:
+            return
+        for p in pids:
+            try:
+                os.kill(p, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        time.sleep(0.05)
+        try:
+            while os.waitpid(-1, os.WNOHANG)[0]:
+                pass
+        except ChildProcessError:
+            pass
+
+
+def subreaper():
+    """Makes this process the subreaper of the processes it starts (Linux's prctl)."""
+    import ctypes
+
+    PR_SET_CHILD_SUBREAPER = 36
+    ctypes.CDLL(None, use_errno=True).prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0)
+
+
 def isolated_command(exe, test, scratch, tmp, log):
     """The command that runs one test of the program `exe` alone: in a mount namespace of its
     own, where `tmp` (the test programs' scratch directory, target/tmp) is the empty directory
@@ -673,9 +729,9 @@ class Memo:
         return s.for_test(s.files_of(crates), program_dir, test)
 
     def rust(self, scope, test_id, program_dir, test):
-        # This file too: what an entry keeps and how it is matched are part of its meaning.
-        return sha(scope + "\n" + self.sources.key(
-            [*self.files(scope, test_id, program_dir, test), "tools/memo.py"]))
+        # MEANING too: what an entry keeps and how it is matched are part of its meaning.
+        return sha(f"{scope}\n{MEANING}\n" + self.sources.key(
+            self.files(scope, test_id, program_dir, test)))
 
     def env_of(self, names):
         return {n: os.environ.get(n) for n in sorted(names)}
@@ -785,6 +841,25 @@ def run(logs, native_cache, mode, dir, args):
     once for its quick tests, and each slow test alone, traced, the longest first, unless it is
     remembered (mode "on"; "fresh" runs every one and keeps what it learns). Prints what failed,
     what was remembered, and how many passed; returns the exit status."""
+    # A gate that ends early (its tools/check.sh killed, its terminal closed) takes its tests with
+    # it: left running, they'd keep the machine's cores busy for every later gate.
+    parent = os.getppid()
+    subreaper()
+
+    def end(signum, _frame):
+        stop_all()
+        sys.exit(128 + signum)
+
+    for signum in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(signum, end)
+    try:
+        return run_tests(logs, native_cache, mode, dir, args, parent)
+    except KeyboardInterrupt:
+        stop_all()
+        return 130
+
+
+def run_tests(logs, native_cache, mode, dir, args, parent):
     root = os.getcwd()
     target = os.path.abspath(os.environ.get("CARGO_TARGET_DIR", "target"))
     native_cache = os.path.abspath(native_cache)
@@ -902,6 +977,10 @@ def run(logs, native_cache, mode, dir, args):
 
     while waiting:
         time.sleep(0.05)
+        if os.getppid() != parent:
+            print("the gate that ran these tests has ended: stopping them", file=sys.stderr)
+            stop_all()
+            return 1
         for r in [r for r in waiting if done(r)]:
             waiting.remove(r)
             kind, name, proc, out, start, extra = r
@@ -971,8 +1050,6 @@ def run(logs, native_cache, mode, dir, args):
 
 
 if __name__ == "__main__":
-    import sys
-
     if len(sys.argv) >= 6 and sys.argv[1] == "run":
         _, _, logs, native_cache, mode, dir, *rest = sys.argv
         sys.exit(run(logs, native_cache, mode, dir, rest))

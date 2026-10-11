@@ -306,5 +306,27 @@ class Builds(Sources):
 FILES_HASH = "8410ef328ec8af3db236a70a705c1c9c7746bdc9695323b3e5bb56ef647fdf28"
 
 
+class Ending(unittest.TestCase):
+    def test_stopping_kills_every_process_under_the_runner_and_the_ones_that_escaped(self):
+        # A process orphaned under the runner (as a test is when strace, its parent, dies first)
+        # comes back to it as its subreaper.
+        script = f"""
+import os, subprocess, sys, time
+sys.path.insert(0, {TOOLS!r})
+import memo
+memo.subreaper()
+sh = subprocess.Popen(["sh", "-c", "sleep 60 & sleep 60"])
+time.sleep(0.5)
+sh.kill()
+sh.wait()
+escaped = len(memo.under(os.getpid()))
+memo.stop_all()
+print(escaped, len(memo.under(os.getpid())))
+"""
+        out = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True,
+                             timeout=30, check=True).stdout
+        self.assertEqual(out.split(), ["2", "0"])
+
+
 if __name__ == "__main__":
     unittest.main()
