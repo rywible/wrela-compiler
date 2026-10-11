@@ -31,6 +31,7 @@ $WRELA_REFERENCE_SFZ, or under ~/.cache/wrela/salamander-sfz/). Run from the rep
 """
 
 import json
+import itertools
 import math
 import os
 import secrets
@@ -181,7 +182,11 @@ def cut(samples, channels, rate, start, end):
     a, b = int(start * rate) * channels, min(int(end * rate) * channels, len(samples))
     out = samples[a:b]
     frames = len(out) // channels
-    for i in range(frames):
+    # Only the ends change. A long excerpt's middle has unit gain, so leave it in
+    # the slice instead of visiting every frame in Python.
+    fade_in_end = min(frames, math.ceil(FADE_IN * rate))
+    fade_out_start = max(fade_in_end, frames - 1 - math.ceil(FADE_OUT * rate))
+    for i in itertools.chain(range(fade_in_end), range(fade_out_start, frames)):
         t = i / rate
         g = min(1.0, t / FADE_IN, (frames - 1 - i) / rate / FADE_OUT)
         for c in range(channels):
@@ -221,8 +226,8 @@ def gate(out, rng=None):
         ours, theirs, described = takes[(piece, take)]
         start, end = excerpt_times(described, first, last)
         loaded = {
-            "wrela": cut(list(ours[0]), ours[1], ours[2], start, end + RING),
-            "reference": cut(list(theirs[0]), theirs[1], theirs[2], start, end + RING),
+            "wrela": cut(ours[0], ours[1], ours[2], start, end + RING),
+            "reference": cut(theirs[0], theirs[1], theirs[2], start, end + RING),
         }
         gains = matched(loaded)
         order = ["wrela", "reference"]

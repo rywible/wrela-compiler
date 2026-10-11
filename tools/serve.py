@@ -226,7 +226,9 @@ def start(handler=Handler, port=0):
     """Serves the repo with `handler` on 127.0.0.1:`port` (0: a free port) from a daemon thread.
     Returns the server: `server.server_address[1]` is the port, `server.shutdown()` stops it."""
     server = http.server.ThreadingHTTPServer(("127.0.0.1", port), handler)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+    # Headless runs stop this server after every page; the default 0.5 s poll makes each
+    # short check wait on teardown. Requests still wake the selector immediately.
+    threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
     return server
 
 

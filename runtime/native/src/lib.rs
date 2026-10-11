@@ -264,7 +264,12 @@ struct Build {
 /// unmetered build's compiled code is kept beside it (`cache`): the loads that follow read it
 /// back.
 fn compile_build(dir: &Path, fuel: Option<u64>) -> Result<Build> {
-    let (manifest, wasm, shaders) = read_build(dir)?;
+    compile_build_with_shaders(dir, fuel, true)
+}
+
+/// CPU frame tests emit only the manifest and WASM; other builds still check every file.
+fn compile_build_with_shaders(dir: &Path, fuel: Option<u64>, shaders: bool) -> Result<Build> {
+    let (manifest, wasm, shaders) = read_build(dir, shaders)?;
     let wasm_hash = wrela_abi::ticks::wasm_hash(&wasm);
     let beside = fuel.is_none().then_some(dir);
     let compiled = program::compile_cached(&wasm, wasm_hash, beside, fuel)?;
@@ -272,11 +277,15 @@ fn compile_build(dir: &Path, fuel: Option<u64>) -> Result<Build> {
 }
 
 /// Reads a build's manifest, WASM and WGSL from `dir`.
-fn read_build(dir: &Path) -> Result<(Manifest, Vec<u8>, Vec<String>)> {
+fn read_build(dir: &Path, shaders: bool) -> Result<(Manifest, Vec<u8>, Vec<String>)> {
     let text = |name: &str| read_file(dir, name, |path| std::fs::read_to_string(path));
     let manifest = Manifest::parse(&text("manifest.json")?)?;
     let wasm = read_file(dir, &manifest.wasm, |path| std::fs::read(path))?;
-    let shaders = manifest.pipelines.iter().map(|p| text(&p.shader)).collect::<Result<Vec<_>>>()?;
+    let shaders = if shaders {
+        manifest.pipelines.iter().map(|p| text(&p.shader)).collect::<Result<Vec<_>>>()?
+    } else {
+        Vec::new()
+    };
     Ok((manifest, wasm, shaders))
 }
 
@@ -484,6 +493,25 @@ impl Host {
         script: &[Scripted],
         log: bool,
         every: u32,
+        seen: impl FnMut(u32, &[u8]) -> Result<()>,
+    ) -> Result<(RunResult, Option<TickLog>)> {
+        self.run_lockstep_seen_from(frames, fps, width, height, script, log, every, 0, seen)
+    }
+
+    /// [`Host::run_lockstep_seen`], capturing only frames at or after `first`. Earlier frames
+    /// still run in full, so simulation and temporal rendering reach the same state, without
+    /// reading back screens the caller would discard. The `every` schedule stays based at 0.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_lockstep_seen_from(
+        &mut self,
+        frames: u32,
+        fps: f64,
+        width: u32,
+        height: u32,
+        script: &[Scripted],
+        log: bool,
+        every: u32,
+        first: u32,
         mut seen: impl FnMut(u32, &[u8]) -> Result<()>,
     ) -> Result<(RunResult, Option<TickLog>)> {
         program::valid_fps(fps)?;
@@ -499,7 +527,7 @@ impl Host {
             self.p().executor().set_frame(i as usize);
             self.p().lockstep_frame(i, fps, width, height, script, log.as_mut())?;
             self.settle_handing()?;
-            if every > 0 && i % every == 0 {
+            if every > 0 && i >= first && i % every == 0 {
                 let screen = self.p().executor().read_screen()?;
                 seen(i, &screen)?;
             }
@@ -748,6 +776,14 @@ impl CpuBuild {
         CpuBuild::load_compiled(dir.as_ref(), None)
     }
 
+    /// A partial build for CPU tools: manifest and WASM only. No shader files are needed;
+    /// submitted GPU commands are checked against the manifest and then discarded.
+    pub fn load_cpu(dir: impl AsRef<Path>) -> Result<CpuBuild> {
+        let dir = dir.as_ref();
+        let build = compile_build_with_shaders(dir, None, false)?;
+        Ok(Self::from_build(dir, build))
+    }
+
     /// [`CpuBuild::load`], with each call (`init`, a frame, a tick, an export) given `fuel`
     /// units of work (about one per WASM instruction): a call that does more traps, after the
     /// same work on every machine. For tests that run a program's frames, whose build is made
@@ -757,16 +793,29 @@ impl CpuBuild {
         CpuBuild::load_compiled(dir.as_ref(), Some(fuel))
     }
 
+    /// A CPU frame test's partial build: only manifest and WASM, with no emitted shader
+    /// files. Commands still undergo the manifest's resource and sequencing checks, but
+    /// no shader runs. The compiler checks shader source before emitting this build.
+    pub fn load_metered_cpu(dir: impl AsRef<Path>, fuel: u64) -> Result<CpuBuild> {
+        let dir = dir.as_ref();
+        let build = compile_build_with_shaders(dir, Some(fuel), false)?;
+        Ok(Self::from_build(dir, build))
+    }
+
     fn load_compiled(dir: &Path, fuel: Option<u64>) -> Result<CpuBuild> {
-        let Build { manifest, wasm_hash, compiled, .. } = compile_build(dir, fuel)?;
-        Ok(CpuBuild {
+        Ok(Self::from_build(dir, compile_build(dir, fuel)?))
+    }
+
+    fn from_build(dir: &Path, build: Build) -> CpuBuild {
+        let Build { manifest, wasm_hash, compiled, .. } = build;
+        CpuBuild {
             compiled,
             manifest,
             dir: dir.to_path_buf(),
             wasm_hash,
             record: false,
             quiet: false,
-        })
+        }
     }
 
     /// Its hosts keep a copy of every batch the program submits ([`CpuHost::take_batches`]):

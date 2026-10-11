@@ -390,6 +390,8 @@ pub(crate) struct Gpu {
     /// targets and keeps them (`Pass::joins`).
     ended: Option<OpenPass>,
     screen: Option<Screen>,
+    /// Reused between screen captures: mapping is finished before the next copy uses it.
+    screen_readback: Option<wgpu::Buffer>,
     timer: Option<Timer>,
     /// The name the program gave the passes and dispatches after it in this frame (`Label`).
     label: Option<Arc<str>>,
@@ -518,6 +520,7 @@ impl Gpu {
             pass: None,
             ended: None,
             screen: None,
+            screen_readback: None,
             timer,
             label: None,
             errors,
@@ -1639,7 +1642,15 @@ impl Gpu {
         }
         let row = u64::from(width) * 4;
         let padded = align_to(row, u64::from(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT));
-        let staging = self.readback_buffer(padded * u64::from(height));
+        let size = padded * u64::from(height);
+        let staging = match &self.screen_readback {
+            Some(buffer) if buffer.size() >= size => buffer.clone(),
+            _ => {
+                let buffer = self.readback_buffer(size);
+                self.screen_readback = Some(buffer.clone());
+                buffer
+            }
+        };
         let mut encoder =
             self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         encoder.copy_texture_to_buffer(
@@ -1661,6 +1672,7 @@ impl Gpu {
         );
         self.queue.submit([encoder.finish()]);
         let frame = map_read_with(&self.device, &staging, |bytes| {
+            let bytes = &bytes[..size as usize];
             if padded == row {
                 return bytes.to_vec();
             }

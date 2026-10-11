@@ -168,6 +168,18 @@ def extract_console(chrome_log, console_log):
     return lines
 
 
+def adopt_chrome_children():
+    """Reap Chrome's orphaned children ourselves on Linux, even with a non-reaping PID 1."""
+    if sys.platform == "linux":
+        import ctypes
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        # PR_SET_CHILD_SUBREAPER: descendants become our children when their parent exits.
+        if libc.prctl(36, 1, 0, 0, 0) != 0:
+            error = ctypes.get_errno()
+            raise OSError(error, os.strerror(error))
+
+
 def stop(proc):
     """Stops Chrome and every process it started (they share its process group), including any
     left behind when Chrome itself exits first."""
@@ -184,6 +196,13 @@ def stop(proc):
     except (ProcessLookupError, PermissionError):
         pass
     proc.wait()
+    if sys.platform == "linux":
+        # Only this Chrome's process group: leave any unrelated subprocesses to their owners.
+        while True:
+            try:
+                os.waitpid(-proc.pid, 0)
+            except ChildProcessError:
+                break
 
 
 def interrupt(signum, frame):
@@ -253,6 +272,7 @@ def main(argv):
     status, reason = 1, None
     proc = None
     try:
+        adopt_chrome_children()
         with open(chrome_log, "wb") as log:
             proc = subprocess.Popen(
                 [
@@ -301,6 +321,7 @@ def main(argv):
             stop(proc)
         if server is not None:
             server.shutdown()
+            server.server_close()
         lines = extract_console(chrome_log, os.path.join(results, "console.log"))
         shutil.rmtree(profile, ignore_errors=True)
         for fd in locks:

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """A play round of the floor (#55 AC5): examples/last-green played in headless Chrome stable at
-1080p, paced at 60 Hz as in play, eight threads, through the play harness's keys, then its
+1080p, paced at 60 Hz as in play, up to eight threads, through the play harness's keys, then its
 lookbook rendered again. Everything goes to target/rounds/round-<n>/.
 
     tools/round.py <n> [--quick [--every <k>] | --minutes 30|60] [--no-lookbook] [--frames <n>]
@@ -28,6 +28,8 @@ wildwood (travel, Y) for 10 minutes, and the floor's walk again. It saves:
 """
 
 import bisect, json, os, shutil, subprocess, sys
+
+from resources import cpu_count
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILD = os.path.join(ROOT, "examples/last-green/build")
@@ -191,7 +193,8 @@ def main():
         json.dump(events, f)
     timeout = frames // FPS * 2 + 600
     snap = f"&snap={SNAP}&snapfrom={SNAP}" if quick else ""
-    hash_ = (f"#test&frames={frames}&width=1920&height=1080&fps={FPS}&workers=8&paced=1&nohash=1&ticklog=1&inflight=2{snap}"
+    workers = min(8, cpu_count())
+    hash_ = (f"#test&frames={frames}&width=1920&height=1080&fps={FPS}&workers={workers}&paced=1&nohash=1&ticklog=1&inflight=2{snap}"
              f"&input=round-keys.json")
     print(f"round {n}: {frames} frames ({frames / FPS / 60:.1f} min) in Chrome", flush=True)
     r = subprocess.run([sys.executable, HEADLESS, os.path.relpath(page, ROOT), hash_, str(timeout)],
@@ -209,8 +212,10 @@ def main():
     if r.returncode != 0:
         print(r.stderr[-3000:])
         print(f"the round's run failed (see {out}/console.log)")
-    frames_json = json.load(open(os.path.join(out, "frames.json")))
-    log_lines = open(os.path.join(out, "log.txt")).read().splitlines()
+    with open(os.path.join(out, "frames.json")) as f:
+        frames_json = json.load(f)
+    with open(os.path.join(out, "log.txt")) as f:
+        log_lines = f.read().splitlines()
     summarize(out, frames_json, log_lines, frames_json["printed_in"], set(snaps))
     shutil.rmtree(page, ignore_errors=True)
     if "--no-lookbook" not in args and not quick:

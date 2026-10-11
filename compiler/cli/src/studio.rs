@@ -58,9 +58,14 @@ pub fn run(args: &[String]) -> ExitCode {
         eprintln!("error: `--artifacts-only` is only for `studio build`");
         return crate::usage();
     }
-    let page = match build_with_precompile(&pkg, debug, !artifacts_only) {
-        Ok(p) => p,
-        Err(code) => return code,
+    // Refuse an invalid action before compiling the lens. In particular, trying an action
+    // name or correcting a numeric argument must not cost a full build.
+    let requested = match action.as_str() {
+        "serve" | "build" | "look" | "beside" | "variants" | "sweep" | "run" => None,
+        name => match parse_action(studio::actions(&pkg), name, &rest[2..]) {
+            Ok(a) => Some(a),
+            Err(code) => return code,
+        },
     };
     let mask = match reference.as_deref().map(read_reference).transpose() {
         Ok(m) => m,
@@ -68,6 +73,13 @@ pub fn run(args: &[String]) -> ExitCode {
             eprintln!("error: {why}");
             return ExitCode::from(2);
         }
+    };
+    // An action's host compiles (or loads the cached code) itself. Preparing it here as well
+    // reads and deserializes the same program twice.
+    let precompile = !artifacts_only && matches!(action.as_str(), "build" | "serve");
+    let page = match build_with_precompile(&pkg, debug, precompile) {
+        Ok(p) => p,
+        Err(code) => return code,
     };
     match action.as_str() {
         "serve" => {
@@ -92,10 +104,14 @@ pub fn run(args: &[String]) -> ExitCode {
                 }
             }
         }
-        name => match parse_action(studio::actions(&pkg), name, &rest[2..]) {
-            Ok(a) => finish(one_action(&pkg, &page, &a, size, png.as_deref(), mask)),
-            Err(code) => code,
-        },
+        _ => finish(one_action(
+            &pkg,
+            &page,
+            requested.as_ref().expect("an action was parsed before building"),
+            size,
+            png.as_deref(),
+            mask,
+        )),
     }
 }
 
@@ -212,6 +228,7 @@ pub(crate) struct Lens {
     host: Host,
     size: (u32, u32),
     frame: u32,
+    field: bool,
 }
 
 impl Lens {
@@ -230,7 +247,7 @@ impl Lens {
         let mut host =
             Host::load_with(page, &options).map_err(|e| format!("can't run the lens: {e}"))?;
         host.frame(0.0, size.0, size.1).map_err(|e| e.to_string())?;
-        Ok(Lens { host, size, frame: 0 })
+        Ok(Lens { host, size, frame: 0, field: !studio::is_floor(pkg) })
     }
 
     /// A fresh lens for another package, reusing the previous one's unchanged pipelines.
@@ -239,6 +256,7 @@ impl Lens {
         let options = wrela_host::Options { post: Some(post), quiet: true, ..Default::default() };
         self.host.restart_in(page, &options).map_err(|e| format!("can't run the lens: {e}"))?;
         self.frame = 0;
+        self.field = !studio::is_floor(pkg);
         self.host.frame(0.0, self.size.0, self.size.1).map_err(|e| e.to_string())
     }
 
@@ -269,9 +287,31 @@ impl Lens {
     /// Export `name` called with `args`, the lens's lines before it dropped, and the frames
     /// after until it settles.
     pub(crate) fn call(&mut self, name: &str, args: &[Value]) -> Result<(), String> {
-        let _ = self.host.take_logs();
-        self.host.call_export(name, args).map_err(|e| e.to_string())?;
+        self.invoke(name, args)?;
         self.settle()
+    }
+
+    fn invoke(&mut self, name: &str, args: &[Value]) -> Result<(), String> {
+        let _ = self.host.take_logs();
+        self.host.call_export(name, args).map(|_| ()).map_err(|e| e.to_string())
+    }
+
+    /// Defer the field lens's synchronous view controls until the next `call`. Comparisons
+    /// need only the final image. Other actions (including `set`, whose changed field must
+    /// reach the GPU) and every map action still settle normally.
+    pub(crate) fn call_without_frame(&mut self, name: &str, args: &[Value]) -> Result<(), String> {
+        self.invoke(name, args)?;
+        if self.field && matches!(name, "zoom" | "mode" | "view") { Ok(()) } else { self.settle() }
+    }
+
+    /// The answer to a deferred view control, before its image is needed.
+    pub(crate) fn answer_without_frame(
+        &mut self,
+        name: &str,
+        args: &[Value],
+    ) -> Result<serde_json::Result<serde_json::Value>, String> {
+        self.call_without_frame(name, args)?;
+        Ok(serde_json::from_str(crate::last_json(&self.host.take_logs()).unwrap_or_default()))
     }
 
     /// [`Lens::call`], and its answer: the last JSON line the lens printed, read (which fails
@@ -451,6 +491,27 @@ fn parse_action<'a>(
     Ok(Action { name, args: values, literals })
 }
 
+/// Field lens actions whose answer depends only on CPU state after `init`, with no viewport,
+/// frame, GPU readback or post request. A PNG still uses the rendered host. Map actions with
+/// the same names have different implementations and are not covered by this list.
+fn cpu_action(name: &str) -> bool {
+    matches!(
+        name,
+        "literals"
+            | "parts"
+            | "probe"
+            | "ray"
+            | "measure"
+            | "spec"
+            | "view"
+            | "zoom"
+            | "mode"
+            | "set"
+            | "choose"
+            | "choose_none"
+    )
+}
+
 /// One action: its literals chosen, its export called, the answer printed, and with `png`, the
 /// screen after saved.
 fn one_action(
@@ -461,10 +522,10 @@ fn one_action(
     png: Option<&Path>,
     mask: Option<Vec<u8>>,
 ) -> Result<(), String> {
-    if a.name == "literals" && png.is_none() {
-        // This export reads the lifted table and prints its answer immediately. It does not
-        // need a frame, a screen, or GPU readbacks; keep using the program's own action.
-        let mut host = CpuBuild::load(page)
+    if png.is_none() && cpu_action(a.name) && !studio::is_floor(pkg) {
+        // These exports print their answer immediately. Run the program's own action while
+        // avoiding GPU setup, shader compilation and frames that only draw an unseen image.
+        let mut host = CpuBuild::load_cpu(page)
             .map_err(|e| format!("can't run the lens: {e}"))?
             .quiet()
             .start()

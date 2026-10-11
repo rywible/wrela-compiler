@@ -33,7 +33,7 @@ mod tests;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use wrela_host::{CpuHost, Value};
+use wrela_host::{CpuBuild, CpuHost, Value};
 
 struct Args {
     dir: PathBuf,
@@ -135,10 +135,18 @@ const QUANTUM: u32 = wrela_abi::AUDIO_QUANTUM;
 
 /// The piece, built and loaded, with its take chosen.
 fn load(a: &Args) -> Result<CpuHost, String> {
+    load_built(a, &build(a)?)
+}
+
+fn build(a: &Args) -> Result<CpuBuild, String> {
     let out = wrela_driver::build(&a.dir);
     let built = a.dir.join("build").join("audio");
     crate::write_build(&out, &built)?;
-    let mut host = CpuHost::load(&built).map_err(|e| e.to_string())?;
+    CpuBuild::load(&built).map_err(|e| e.to_string())
+}
+
+fn load_built(a: &Args, built: &CpuBuild) -> Result<CpuHost, String> {
+    let mut host = built.start().map_err(|e| e.to_string())?;
     if let Some(t) = &a.take {
         let args: Vec<Value> = t.iter().map(|n| Value::I32(*n as i32)).collect();
         host.call_export("choose", &args).map_err(|e| format!("`choose({t:?})`: {e}"))?;
@@ -161,7 +169,11 @@ fn length(host: &mut CpuHost, a: &Args) -> Result<f64, String> {
 /// The take's samples, the channels interleaved, and its length in seconds.
 fn render(a: &Args) -> Result<(Vec<f32>, f64), String> {
     let mut host = load(a)?;
-    let seconds = length(&mut host, a)?;
+    render_host(&mut host, a)
+}
+
+fn render_host(host: &mut CpuHost, a: &Args) -> Result<(Vec<f32>, f64), String> {
+    let seconds = length(host, a)?;
     host.frame(0.0, 16, 16).map_err(|e| format!("the first frame: {e}"))?;
     let quanta = (seconds * RATE / f64::from(QUANTUM)).ceil() as u32;
     let samples = host.render_audio(quanta).map_err(|e| e.to_string())?;
@@ -215,6 +227,10 @@ pub(crate) struct Played {
 
 fn take_of(a: &Args) -> Result<Take, String> {
     let mut host = load(a)?;
+    take_from_host(&mut host)
+}
+
+fn take_from_host(host: &mut CpuHost) -> Result<Take, String> {
     host.call_export("describe", &[]).map_err(|e| format!("`describe()`: {e}"))?;
     let mut take = Take {
         title: String::new(),
@@ -260,6 +276,15 @@ fn take_of(a: &Args) -> Result<Take, String> {
     Ok(take)
 }
 
+/// Build once for commands which need the description and the audio. Keep two
+/// fresh instances: `describe` is a program export and can mutate its state.
+fn take_and_samples(a: &Args) -> Result<(Take, Vec<f32>), String> {
+    let built = build(a)?;
+    let t = take_from_host(&mut load_built(a, &built)?)?;
+    let (samples, _) = render_host(&mut load_built(a, &built)?, a)?;
+    Ok((t, samples))
+}
+
 fn describe(a: &Args) -> Result<(), String> {
     let t = take_of(a)?;
     let notes: Vec<_> = t
@@ -287,8 +312,7 @@ fn describe(a: &Args) -> Result<(), String> {
 /// The take in numbers: per bar, its tempo, its loudness and each voice's mean velocity; and
 /// the whole take's level.
 fn numbers(a: &Args) -> Result<(), String> {
-    let t = take_of(a)?;
-    let (samples, _) = render(a)?;
+    let (t, samples) = take_and_samples(a)?;
     let per = t.beats_per_bar as usize;
     let mut bars = Vec::new();
     for b in 0..t.bars as usize {
@@ -383,8 +407,7 @@ fn midi(a: &Args) -> Result<(), String> {
 
 fn sheet_command(a: &Args) -> Result<(), String> {
     let out = a.rest.first().ok_or("sheet needs a PNG to write")?;
-    let t = take_of(a)?;
-    let (samples, _) = render(a)?;
+    let (t, samples) = take_and_samples(a)?;
     let png = sheet::draw(&t, &samples, a.bars)?;
     std::fs::write(out, png).map_err(|e| format!("can't write {out}: {e}"))?;
     println!("{}", serde_json::json!({ "sheet": out }));

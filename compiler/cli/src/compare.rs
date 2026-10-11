@@ -108,9 +108,13 @@ impl Framing {
     }
 }
 
-/// Runs `calls` (an export and its arguments, each) in the lens and returns the screen.
+/// Runs `calls` and returns their final screen. Consecutive field view controls need one
+/// image after their last call; changes to the field and async actions still settle normally.
 fn screen(lens: &mut Lens, calls: &[(&str, Vec<Value>)]) -> Result<Vec<u8>, String> {
-    for (name, args) in calls {
+    if let Some(((name, args), prepare)) = calls.split_last() {
+        for (name, args) in prepare {
+            lens.call_without_frame(name, args)?;
+        }
         lens.call(name, args)?;
     }
     lens.screen()
@@ -130,7 +134,7 @@ fn mode_call(mode: u32) -> (&'static str, Vec<Value>) {
 
 /// The side framing the lens gives the subject (its `view` answer's first framing).
 fn own_framing(lens: &mut Lens) -> Result<Framing, String> {
-    let a = lens.answer("view", &[Value::I32(0)])?.map_err(|e| e.to_string())?;
+    let a = lens.answer_without_frame("view", &[Value::I32(0)])?.map_err(|e| e.to_string())?;
     let side = &a["framings"][0];
     let c = |k: usize| side["centre"][k].as_f64().unwrap_or(0.0) as f32;
     Ok(Framing { z: c(2), y: c(1), half: side["half"].as_f64().unwrap_or(1.0) as f32 })
@@ -356,6 +360,55 @@ pub fn sweep(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "long: compares deferred view controls with separately rendered GPU frames"]
+    fn deferred_view_controls_keep_the_same_pixels_after_literal_changes() {
+        let dir =
+            std::env::temp_dir().join(format!("wrela-compare-batching-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(dir.join("wrela.toml"), "[package]\nname = \"batching\"\n").unwrap();
+        std::fs::write(
+            dir.join("main.wrela"),
+            "pub fn frame(time: f32, width: u32, height: u32) {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("subject.wrela"),
+            "use std::field::{Surface, sphere}\n\npub fn subject() -> Surface {\n    sphere(0.30).translate(vec3(0.0, 0.30, 0.0))\n}\n",
+        )
+        .unwrap();
+        let page = build(&dir, false).expect("build the lens");
+        let mut lens = Lens::start(&dir, &page, (64, 64), None).expect("start the lens");
+        for radius in [None, Some(0.15)] {
+            lens.restart(&dir, &page).expect("fresh reference state");
+            let answer = lens.answer("view", &[Value::I32(0)]).unwrap().unwrap();
+            let side = &answer["framings"][0];
+            let f = Framing {
+                z: side["centre"][2].as_f64().unwrap() as f32,
+                y: side["centre"][1].as_f64().unwrap() as f32,
+                half: side["half"].as_f64().unwrap() as f32,
+            };
+            let mut calls = Vec::new();
+            if let Some(radius) = radius {
+                calls.push(("set", vec![Value::I32(0), Value::F32(radius)]));
+            }
+            calls.extend([zoom_call(f), mode_call(2), view_call(0)]);
+            for (name, args) in &calls {
+                lens.call(name, args).expect("render each control separately");
+            }
+            let expected = lens.screen().expect("reference pixels");
+
+            lens.restart(&dir, &page).expect("fresh batched state");
+            let own = own_framing(&mut lens).expect("framing without an extra image");
+            assert_eq!((own.z, own.y, own.half), (f.z, f.y, f.half));
+            let actual = screen(&mut lens, &calls).expect("one image after view controls");
+            assert_eq!(actual, expected, "radius {radius:?}");
+        }
+        drop(lens);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn a_photo_registration_needs_a_positive_scale() {

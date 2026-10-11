@@ -294,20 +294,23 @@ pub fn draw(t: &Take, samples: &[f32], bars: Option<(u32, u32)>) -> Result<Vec<u
         let y = spec_top as f64 + (1.0 - (f / f_lo).ln() / (f_hi / f_lo).ln()) * spec_h as f64;
         img.text(30, y as usize, &format!("{f:.0}"), 1, LABEL);
     }
-    for px in 0..PLOT {
-        let s = t0 + (t1 - t0) * px as f64 / PLOT as f64;
-        let at = ((s * rate) as usize).saturating_sub(n / 2);
-        let mag = dsp::spectrum(&mono, at, n);
-        for py in 0..spec_h {
+    let mut spectrum = dsp::Spectrum::new(n);
+    let bands: Vec<_> = (0..spec_h)
+        .map(|py| {
             let u0 = 1.0 - (py + 1) as f64 / spec_h as f64;
             let u1 = 1.0 - py as f64 / spec_h as f64;
             let (fa, fb) = (f_lo * (f_hi / f_lo).powf(u0), f_lo * (f_hi / f_lo).powf(u1));
-            let (ka, kb) = (
-                (fa * n as f64 / rate) as usize,
-                ((fb * n as f64 / rate) as usize).max((fa * n as f64 / rate) as usize + 1),
-            );
-            let m =
-                mag[ka.min(mag.len() - 1)..kb.min(mag.len())].iter().copied().fold(0.0, f64::max);
+            let ka = (fa * n as f64 / rate) as usize;
+            let kb = ((fb * n as f64 / rate) as usize).max(ka + 1);
+            ka.min(n / 2 - 1)..kb.min(n / 2)
+        })
+        .collect();
+    for px in 0..PLOT {
+        let s = t0 + (t1 - t0) * px as f64 / PLOT as f64;
+        let at = ((s * rate) as usize).saturating_sub(n / 2);
+        let mag = spectrum.of(&mono, at);
+        for (py, band) in bands.iter().enumerate() {
+            let m = mag[band.clone()].iter().copied().fold(0.0, f64::max);
             let d = dsp::db(m);
             img.set(LEFT + px, spec_top + py, heat((d + 100.0) / 80.0));
         }

@@ -279,16 +279,42 @@ pub fn compress(sampled: &[Sampled], c: Compression) -> (Vec<(Sampled, usize)>, 
 /// How many rounds `compress` holds up radii the compressed parts don't reach, at most.
 const FLOOR_ROUNDS: usize = 64;
 
-/// `f(i)` for each `i` below `n`, each on a thread of its own: in order, and the same as one
-/// after another (the parts' fits don't depend on each other).
+/// Fits independent parts on the available CPUs, returning results in part order. A fitting
+/// round can have many parts: starting a thread for every part oversubscribes small containers.
 fn on_threads<U: Send>(n: usize, f: impl Fn(usize) -> U + Sync) -> Vec<U> {
+    let workers = std::thread::available_parallelism().map_or(1, |n| n.get());
+    on_workers(n, workers, f)
+}
+
+fn on_workers<U: Send>(n: usize, workers: usize, f: impl Fn(usize) -> U + Sync) -> Vec<U> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let workers = workers.max(1).min(n);
+    if workers <= 1 {
+        return (0..n).map(f).collect();
+    }
+    let next = AtomicUsize::new(0);
     let f = &f;
     std::thread::scope(|s| {
-        let threads: Vec<_> = (0..n).map(|i| s.spawn(move || f(i))).collect();
-        threads
+        let threads: Vec<_> = (0..workers)
+            .map(|_| {
+                s.spawn(|| {
+                    let mut out = Vec::new();
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        if i >= n {
+                            return out;
+                        }
+                        out.push((i, f(i)));
+                    }
+                })
+            })
+            .collect();
+        let mut results: Vec<_> = threads
             .into_iter()
-            .map(|t| t.join().unwrap_or_else(|e| std::panic::resume_unwind(e)))
-            .collect()
+            .flat_map(|t| t.join().unwrap_or_else(|e| std::panic::resume_unwind(e)))
+            .collect();
+        results.sort_unstable_by_key(|(i, _)| *i);
+        results.into_iter().map(|(_, value)| value).collect()
     })
 }
 
@@ -2377,6 +2403,31 @@ impl Deviation {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn reference_workers_are_bounded_and_keep_part_order() {
+        use std::sync::{
+            Barrier,
+            atomic::{AtomicUsize, Ordering},
+        };
+        for workers in [1, 2, 4, 8] {
+            let active = AtomicUsize::new(0);
+            let peak = AtomicUsize::new(0);
+            let first = Barrier::new(workers);
+            let values = super::on_workers(24, workers, |i| {
+                let running = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(running, Ordering::SeqCst);
+                if i < workers {
+                    first.wait();
+                }
+                active.fetch_sub(1, Ordering::SeqCst);
+                i * i
+            });
+            assert_eq!(values, (0..24).map(|i| i * i).collect::<Vec<_>>());
+            assert_eq!(peak.load(Ordering::SeqCst), workers);
+        }
+        assert!(super::on_workers(0, 4, |_| unreachable!()).is_empty());
+    }
+
     use super::*;
 
     #[test]

@@ -28,6 +28,8 @@ Each capture is kept as its frames (`<name>/NNNNN.png`, the frame's number), a c
 
 import json, os, shutil, subprocess, sys, tempfile
 
+from resources import cpu_count
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILD = os.path.join(ROOT, "examples/last-green/build")
 HOST = os.path.join(ROOT, "target/release/wrela-host")
@@ -71,13 +73,16 @@ def capture(name, out, size):
         json.dump(sorted(events, key=lambda e: e["frame"]), f)
         script = f.name
     os.makedirs(frames)
-    r = subprocess.run([HOST, BUILD, "--frames", str(last + 1), "--size", size, "--input", script,
-                        "--png", os.path.join(frames, "f.png"), "--every", "1"],
-                       capture_output=True, text=True)
-    os.unlink(script)
+    try:
+        r = subprocess.run([HOST, BUILD, "--frames", str(last + 1), "--size", size, "--input", script,
+                            "--png", os.path.join(frames, "f.png"), "--every", "1",
+                            "--png-from", str(first)], capture_output=True, text=True)
+    finally:
+        os.unlink(script)
     if r.returncode != 0:
         sys.exit(f"capture {name} failed:\n{r.stderr[-2000:]}")
-    # The host numbers every frame from 0 (f-NNNN.png); those kept are named by their frame.
+    # Pre-roll still renders so temporal history is unchanged; only saved frames cross back
+    # to the CPU and get encoded. The host keeps its original frame numbers (f-NNNN.png).
     for f in os.listdir(frames):
         if f.startswith("f-"):
             i = int(f[2:-4])
@@ -87,9 +92,11 @@ def capture(name, out, size):
             else:
                 os.unlink(path)
     clip = os.path.join(out, name + ".mp4")
-    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-framerate", "60", "-start_number",
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-threads", "1",
+                    "-framerate", "60", "-start_number",
                     str(first), "-i", os.path.join(frames, "%05d.png"), "-c:v", "libx264",
-                    "-crf", "12", "-pix_fmt", "yuv420p", clip], check=True)
+                    "-threads", str(cpu_count()), "-crf", "12", "-pix_fmt", "yuv420p", clip],
+                   check=True)
     sheet(frames, first, last, os.path.join(out, name + "-sheet.jpg"))
     return clip
 
@@ -99,14 +106,15 @@ def sheet(frames, first, last, path):
     picks = [first + (last - first) * k // 5 for k in range(6)]
     inputs = []
     for p in picks:
-        inputs += ["-i", os.path.join(frames, f"{p:05d}.png")]
+        inputs += ["-threads", "1", "-i", os.path.join(frames, f"{p:05d}.png")]
     labelled = ";".join(
         f"[{k}:v]scale=iw/2:ih/2,drawtext=text='{p}':x=8:y=8:fontsize=24:fontcolor=white:"
         f"box=1:boxcolor=black@0.5[v{k}]" for k, p in enumerate(picks))
     grid = "".join(f"[v{k}]" for k in range(6))
-    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", *inputs, "-filter_complex",
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", *inputs,
+                    "-filter_complex_threads", str(cpu_count()), "-filter_complex",
                     f"{labelled};{grid}xstack=inputs=6:layout=0_0|w0_0|w0+w1_0|0_h0|w0_h0|w0+w1_h0",
-                    "-q:v", "3", path], check=True)
+                    "-threads", str(cpu_count()), "-q:v", "3", path], check=True)
 
 
 def main():

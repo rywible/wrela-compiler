@@ -973,8 +973,9 @@ class Rebuilds:
     def prefetch(self, builds):
         """Makes `builds` ((package, args) pairs) not yet made, as many at once as there are cores."""
         from concurrent.futures import ThreadPoolExecutor
+        from resources import cpu_count
         todo = sorted({(p, tuple(a)) for p, a in builds} - set(self.known))
-        with ThreadPoolExecutor(max_workers=os.cpu_count() or 4) as pool:
+        with ThreadPoolExecutor(max_workers=cpu_count()) as pool:
             for key, h in zip(todo, pool.map(lambda k: self.make(k[0], list(k[1])), todo)):
                 self.known[key] = h
 
@@ -1210,13 +1211,14 @@ def run_tests(logs, native_cache, mode, dir, args, parent):
     target = os.path.abspath(os.environ.get("CARGO_TARGET_DIR", "target"))
     native_cache = os.path.abspath(native_cache)
     programs, cli = [], None
-    for line in open(f"{logs}/tests.json"):
-        m = json.loads(line)
-        if m.get("reason") == "compiler-artifact" and m.get("executable"):
-            if m["profile"]["test"]:
-                programs.append(m)
-            elif m["target"]["kind"] == ["bin"] and m["target"]["name"] == "wrela":
-                cli = m["executable"]  # built from the sources the tests are
+    with open(f"{logs}/tests.json") as artifacts:
+        for line in artifacts:
+            m = json.loads(line)
+            if m.get("reason") == "compiler-artifact" and m.get("executable"):
+                if m["profile"]["test"]:
+                    programs.append(m)
+                elif m["target"]["kind"] == ["bin"] and m["target"]["name"] == "wrela":
+                    cli = m["executable"]  # built from the sources the tests are
     memo = Memo(root, target, dir, cli)
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import runner
@@ -1259,18 +1261,20 @@ def run_tests(logs, native_cache, mode, dir, args, parent):
         return m, pkg, exe, program_dir, prefix, skips, kept, aside
 
     from concurrent.futures import ThreadPoolExecutor
-    with ThreadPoolExecutor(max_workers=os.cpu_count() or 4) as pool:
+    with ThreadPoolExecutor(max_workers=cores) as pool:
         split_programs = list(pool.map(split, programs))
 
-    # The quick tests: every program at once (tools/runner.py's way, the end-to-end suite first),
+    # The quick tests: bounded by the available CPUs, the end-to-end suite first,
     # each test's time in libtest's JSON (`--report-time`, a stable libtest's unstable option:
     # RUSTC_BOOTSTRAP). They start now, while the slow tests' memory is looked up beside them.
+    # This bounds processes, not every thread: runner.start keeps up to four test threads in
+    # each program, so work can continue while a test waits for its shared GPU slot.
     runs, scratch_root = [], runner.scratch_root()
     scratches = {}
-    for m, pkg, exe, _, prefix, skips, kept, _ in sorted(split_programs,
-                                                          key=lambda p: not runner.is_first(p[0])):
-        if not kept:
-            continue
+    quick = [p for p in sorted(split_programs, key=lambda p: not runner.is_first(p[0])) if p[6]]
+
+    def start_quick():
+        m, pkg, _, _, prefix, skips, _, _ = quick.pop(0)
         command, env, _, scratch = runner.start(m, scratch_root, logs, native_cache, cores)
         out = open(f"{logs}/run-{len(runs)}", "w+")
         proc = subprocess.Popen(
@@ -1279,6 +1283,9 @@ def run_tests(logs, native_cache, mode, dir, args, parent):
             stdout=out, stderr=subprocess.STDOUT)
         scratches[prefix] = scratch
         runs.append(("quick", runner.name_of(m), proc, out, time.monotonic(), prefix))
+
+    while quick and len(runs) < cores:
+        start_quick()
 
     # The slow tests remembered, or to run alone. Those remembered by their builds' files once the
     # builds are made again, all at once.
@@ -1300,7 +1307,7 @@ def run_tests(logs, native_cache, mode, dir, args, parent):
         else:
             alone.append(a)
 
-    # The slow tests: the longest first, as many at once as the machine has cores.
+    # The slow tests: the longest first, sharing the CPU process budget with quick programs.
     alone.sort(key=lambda a: -a[0])
     todo = list(alone)
     started = {}
@@ -1320,9 +1327,15 @@ def run_tests(logs, native_cache, mode, dir, args, parent):
 
     failed, ran = False, 0
     waiting = list(runs)
-    while todo and sum(1 for r in waiting if r[0] == "alone") < cores:
-        start_alone()
-        waiting.append(runs[-1])
+    def fill_workers():
+        while len(waiting) < cores and (todo or quick):
+            if todo:
+                start_alone()
+            else:
+                start_quick()
+            waiting.append(runs[-1])
+
+    fill_workers()
     cpu = {}
 
     def done(r):
@@ -1399,9 +1412,8 @@ def run_tests(logs, native_cache, mode, dir, args, parent):
                     shutil.rmtree(scratch, ignore_errors=True)
                     print(f"  {name}: {took:.1f}s, alone ({cpu[extra]:.0f}s of CPU)"
                           + ("" if kept else "; not remembered: a file it read changed as it ran"))
-                if todo:
-                    start_alone()
-                    waiting.append(runs[-1])
+            out.close()
+        fill_workers()
     if remembered or by_builds:
         print(f"  {len(remembered) + len(by_builds)} slow tests passed before with everything they read "
               f"as it is now, so they didn't run (tools/check.sh --fresh runs them): "

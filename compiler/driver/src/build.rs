@@ -32,6 +32,22 @@ pub const MAX_WGSL_BYTES: usize = 256 * 1024;
 /// With `budgets`, a shipped build's, it's E0707 to have a pipeline whose WGSL is over
 /// `MAX_WGSL_BYTES`.
 pub fn emit(l: &Lowered, sources: &SourceMap, simd: bool, budgets: bool) -> BuildOutput {
+    emit_in(l, sources, simd, budgets, true)
+}
+
+/// A CPU frame test's files: its WASM and the manifest the host uses to check its commands.
+/// There are no shader or browser files; `CpuBuild`'s explicit CPU-only loaders read it.
+pub(crate) fn emit_for_cpu(l: &Lowered, sources: &SourceMap, simd: bool) -> BuildOutput {
+    emit_in(l, sources, simd, false, false)
+}
+
+fn emit_in(
+    l: &Lowered,
+    sources: &SourceMap,
+    simd: bool,
+    budgets: bool,
+    shaders: bool,
+) -> BuildOutput {
     let mut diagnostics = Vec::new();
     let mut files = Vec::new();
     let mut code_lines = Vec::new();
@@ -56,18 +72,27 @@ pub fn emit(l: &Lowered, sources: &SourceMap, simd: bool, budgets: bool) -> Buil
     let mut manifest = wrela_abi::Manifest::new("game.wasm");
     for (i, p) in l.pipelines.iter().enumerate() {
         let shader = format!("pipeline_{i}.wgsl");
-        let wgsl = match wrela_wgsl::emit(&p.module) {
-            Ok(w) => w,
-            Err(e) => {
-                diagnostics.push(Diagnostic::internal(format!(
-                    "the WGSL back end failed for `{}`: {e}",
-                    p.name
-                )));
-                continue;
+        let wgsl = if shaders {
+            match wrela_wgsl::emit(&p.module) {
+                Ok(w) => Some(w),
+                Err(e) => {
+                    diagnostics.push(Diagnostic::internal(format!(
+                        "the WGSL back end failed for `{}`: {e}",
+                        p.name
+                    )));
+                    continue;
+                }
             }
+        } else {
+            None
         };
-        // The entry points by the names the shader has (the WGSL writer may rename them).
-        let stage = match (&p.kind, &p.key, wgsl.entry_points.as_slice()) {
+        // The CPU host checks stages and bindings without looking up shader entry points.
+        // A full build uses the names the WGSL writer gives them, which it may rename.
+        let entry_points = wgsl.as_ref().map_or_else(
+            || p.module.entry_points.iter().map(|e| e.name.clone()).collect(),
+            |w| w.entry_points.clone(),
+        );
+        let stage = match (&p.kind, &p.key, entry_points.as_slice()) {
             (PipelineKind::Compute { workgroup_size }, _, [entry]) => {
                 wrela_abi::manifest::Stage::Compute {
                     entry: entry.clone(),
@@ -102,6 +127,7 @@ pub fn emit(l: &Lowered, sources: &SourceMap, simd: bool, budgets: bool) -> Buil
             }
         };
         if budgets
+            && let Some(wgsl) = &wgsl
             && wgsl.text.len() > MAX_WGSL_BYTES
             && let Some(&at) = p.sites.first()
         {
@@ -117,7 +143,9 @@ pub fn emit(l: &Lowered, sources: &SourceMap, simd: bool, budgets: bool) -> Buil
                 "move work that its own pass can do there, or keep a big function a call (`ir::opt`)",
             ));
         }
-        files.push((shader.clone(), wgsl.text.into_bytes()));
+        if let Some(wgsl) = wgsl {
+            files.push((shader.clone(), wgsl.text.into_bytes()));
+        }
         manifest.pipelines.push(wrela_abi::manifest::Pipeline {
             name: p.name.clone(),
             shader,
@@ -139,8 +167,10 @@ pub fn emit(l: &Lowered, sources: &SourceMap, simd: bool, budgets: bool) -> Buil
         diagnostics.push(Diagnostic::internal(e.to_string()));
     }
     files.push(("manifest.json".to_string(), manifest.to_json().into_bytes()));
-    for (path, bytes) in RUNTIME_FILES {
-        files.push((path.to_string(), bytes.to_vec()));
+    if shaders {
+        for (path, bytes) in RUNTIME_FILES {
+            files.push((path.to_string(), bytes.to_vec()));
+        }
     }
     BuildOutput { files, diagnostics, lines: code_lines }
 }
@@ -148,4 +178,152 @@ pub fn emit(l: &Lowered, sources: &SourceMap, simd: bool, budgets: bool) -> Buil
 /// E0707: a shipped build over one of its budgets, at the command that records what's over.
 fn over_budget(at: wrela_diag::Span, message: String, note: &str, help: &str) -> Diagnostic {
     Diagnostic::new(wrela_diag::codes::E0707, at, message).with_note(note).with_help(help)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CPU_FRAMES: &str = r#"use std::gpu::{
+    ClipPosition, GlobalId, GpuBuffer, Slots, VertexIndex, begin_screen_pass, buffer,
+    dispatch, draw,
+}
+
+@compute(64)
+fn fill(out: mut Slots<f32>, id: GlobalId, value: f32) {
+    let values = [value, value + 1.0]
+    out[id] = values[id.x % 2]
+}
+
+@vertex
+fn cover(v: VertexIndex) -> ClipPosition {
+    let x = if v.index == 1 { 3.0 } else { -1.0 }
+    let y = if v.index == 2 { 3.0 } else { -1.0 }
+    ClipPosition { position: vec4(x, y, 0.0, 1.0) }
+}
+
+@fragment
+fn colour() -> vec4 {
+    vec4(1.0)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    var out: GpuBuffer<f32> = buffer(64)
+    dispatch(fill.bind(out: mut out, value: time), groups: 1)
+    let screen = begin_screen_pass(clear: vec4(0.0))
+    draw(screen, cover, colour, vertices: 3)
+    screen.present()
+}
+
+@test(frames: 2)
+fn records_commands() {}
+"#;
+
+    fn package(name: &str, source: &str) -> std::path::PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("wrela-cpu-build-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("package directory");
+        std::fs::write(root.join("main.wrela"), source).expect("source");
+        root
+    }
+
+    fn file<'a>(out: &'a BuildOutput, name: &str) -> &'a [u8] {
+        &out.files.iter().find(|(path, _)| path == name).expect("built file").1
+    }
+
+    #[test]
+    fn cpu_frame_build_keeps_wasm_and_pipeline_interfaces() {
+        let root = package("interfaces", CPU_FRAMES);
+        crate::with_checked(&root, |checked, sources| {
+            let roots = wrela_lower::Roots::of(checked);
+            for debug in [false, true] {
+                let data = wrela_lower::BuildData { debug, ..Default::default() };
+                let (full, errors) = wrela_lower::lower(checked, &roots, &data, true);
+                assert!(!wrela_diag::has_errors(&errors), "{errors:?}");
+                let (cpu, errors) = wrela_lower::lower_for_cpu(checked, &roots, &data);
+                assert!(!wrela_diag::has_errors(&errors), "{errors:?}");
+                assert!(cpu.pipelines.iter().all(|p| p.debug_flag.is_none()));
+                if debug {
+                    assert!(full.pipelines.iter().any(|p| p.debug_flag.is_some()));
+                }
+                let full = emit(&full, sources, true, false);
+                let cpu = emit_for_cpu(&cpu, sources, true);
+                assert!(!wrela_diag::has_errors(&full.diagnostics), "{:?}", full.diagnostics);
+                assert!(!wrela_diag::has_errors(&cpu.diagnostics), "{:?}", cpu.diagnostics);
+                assert_eq!(file(&full, "game.wasm"), file(&cpu, "game.wasm"));
+                assert_eq!(cpu.files.len(), 2, "only WASM and the command manifest");
+                let interfaces = |out: &BuildOutput| {
+                    let mut value: serde_json::Value =
+                        serde_json::from_slice(file(out, "manifest.json")).expect("manifest JSON");
+                    let pipelines = value["pipelines"].as_array_mut().expect("pipelines");
+                    assert_eq!(pipelines.len(), 2, "compute and render commands are checked");
+                    for pipeline in pipelines {
+                        let pipeline = pipeline.as_object_mut().expect("pipeline");
+                        // Naga may rename the entry points. The CPU host neither resolves them
+                        // nor runs a shader's debug checks; its own debug checks remain in WASM.
+                        for key in ["entry", "vertex_entry", "fragment_entry", "debug_flag"] {
+                            pipeline.remove(key);
+                        }
+                    }
+                    value
+                };
+                assert_eq!(interfaces(&full), interfaces(&cpu));
+            }
+        })
+        .expect("checked package");
+        let ran = crate::test(&root, None);
+        assert!(ran.passed(), "{:?}, {:?}", ran.diagnostics, ran.results);
+        assert_eq!(ran.results.len(), 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cpu_frame_build_still_checks_gpu_control_flow() {
+        let mut source =
+            include_str!("../../tests/conformance/gpu_uniformity_reject.wrela").to_string();
+        source.push_str("\n@test(frames: 1)\nfn checks_shaders() {}\n");
+        let root = package("uniformity", &source);
+        let out = crate::test(&root, None);
+        assert!(out.results.is_empty(), "invalid shader prevents the frame test");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == wrela_diag::codes::E0608),
+            "{:?}",
+            out.diagnostics
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cpu_frame_build_keeps_files_a_program_fetches() {
+        let root = package(
+            "fetch",
+            r#"use std::io::{Pending, fetch}
+
+pub struct State {
+    page: Pending<u8>,
+    length: u32,
+}
+
+pub fn init() -> State {
+    State { page: fetch("index.html"), length: 0 }
+}
+
+pub fn frame(state: mut State, time: f32, width: u32, height: u32) {
+    if let Some(Ok(bytes)) = state.page.poll() {
+        state.length = bytes.len()
+    }
+}
+
+@test(frames: 2)
+fn fetches_the_builds_browser_file(state: State) {
+    assert(state.length > 0)
+}
+"#,
+        );
+        let out = crate::test(&root, None);
+        assert!(out.passed(), "{:?}, {:?}", out.diagnostics, out.results);
+        assert_eq!(out.results.len(), 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

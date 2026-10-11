@@ -22,19 +22,21 @@ BAKED = {pathlib.Path("examples/last-green")}
 out = pathlib.Path(os.environ.get("CARGO_TARGET_DIR", "target")) / "wgsl-budgets"
 
 
-def sizes(built, compressed=False):
-    """Each pipeline's WGSL in `built`: {name: [bytes, bytes gzipped or 0]}.
+def sizes(built, compressed_budget=False):
+    """WGSL bytes and, only when budgeted or over budget, bytes gzipped.
 
-    Compression is comparatively expensive and only hello-field has a compressed budget.
+    Most pipelines have only a raw size budget. Compressing every successful shader spends
+    CPU time without checking anything; failures still include both sizes in their report.
     """
-    return {w.name: [len(t), len(gzip.compress(t)) if compressed else 0]
+    return {w.name: [len(t), len(gzip.compress(t))
+                     if compressed_budget or len(t) > 256 * 1024 else None]
             for w in sorted(built.glob("*.wgsl")) for t in [w.read_bytes()]}
 
 
 def build(package):
     """A package's pipelines' sizes, from the build `command` makes in `built`."""
     pkg, command, built = package
-    compressed = str(pkg) == "examples/hello-field"
+    compressed_budget = str(pkg) == "examples/hello-field"
 
     def run():
         if out in built.parents:
@@ -43,9 +45,9 @@ def build(package):
 
     if memo is None:
         subprocess.run(run(), check=True, capture_output=True)
-        return pkg, sizes(built, compressed)
+        return pkg, sizes(built, compressed_budget)
     key = memo.rebuilds.key(os.path.abspath(pkg), ["wgsl sizes", command[1]])
-    got = memo.traced(key, run, os.getcwd(), lambda: sizes(built, compressed), output=built)
+    got = memo.traced(key, run, os.getcwd(), lambda: sizes(built, compressed_budget), output=built)
     if got is None:
         sys.exit(f"{pkg}: `{' '.join(command)}` failed")
     return pkg, got

@@ -256,7 +256,7 @@ pub(crate) struct Cx<'a> {
     pub missing: std::collections::BTreeSet<wrela_sema::ty::ConstId>,
     /// The `GpuData` structs whose padding is checked (W0007), once each.
     pub padded: std::collections::HashSet<wrela_sema::ty::AdtId>,
-    /// Whether the modules will be emitted; only then are GPU modules flattened.
+    /// Whether GPU modules will be emitted; only then are they flattened and instrumented.
     pub emit: bool,
     pub diags: Vec<Diagnostic>,
     /// Pipelines discovered by CPU code, deduplicated, in discovery order, with their
@@ -352,7 +352,29 @@ pub fn lower(
     data: &BuildData,
     emit: bool,
 ) -> (Lowered, Vec<Diagnostic>) {
-    let mut cx = Cx::new(checked, data, emit);
+    lower_in(checked, roots, data, emit, emit)
+}
+
+/// Lowers a program for the CPU host's frame and tick tests. GPU code is still checked, and
+/// its pipeline interfaces describe the commands the host checks, but its modules need no
+/// optimization or GPU memory layout: no shader runs on that host. CPU code is emitted as in
+/// a full build, including its debug checks.
+pub fn lower_for_cpu(
+    checked: &Checked,
+    roots: &Roots,
+    data: &BuildData,
+) -> (Lowered, Vec<Diagnostic>) {
+    lower_in(checked, roots, data, true, false)
+}
+
+fn lower_in(
+    checked: &Checked,
+    roots: &Roots,
+    data: &BuildData,
+    emit: bool,
+    emit_gpu: bool,
+) -> (Lowered, Vec<Diagnostic>) {
+    let mut cx = Cx::new(checked, data, emit_gpu);
     cx.lift = data.lift.as_ref().filter(|t| !t.literals.is_empty());
     let mut cpu = ModuleBuilder::default();
     cx.make_table(&mut cpu);

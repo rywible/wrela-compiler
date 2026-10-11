@@ -1,7 +1,7 @@
 //! `wrela-host`: runs a build headless.
 //!
 //! - `wrela-host <build-dir> [--frames N] [--fps F] [--size WxH] [--input script.json]
-//!   [--png out.png [--every K]] [--rgba out.rgba] [--timestamps [--serial]] [--log out.ticks]
+//!   [--png out.png [--every K [--png-from N]]] [--rgba out.rgba] [--timestamps [--serial]] [--log out.ticks]
 //!   [--workers N]`: frames on the GPU (in lockstep with the program's ticker, if it has one),
 //!   then the state hash; the phases the program timed (`std::time::phase`), if any, on stderr.
 //! - `wrela-host <build-dir> --until TEXT [--input script.json] [--frames N] [--size WxH]
@@ -21,7 +21,7 @@ use std::process::ExitCode;
 use wrela_host::{CpuBuild, TickLog};
 
 const USAGE: &str = "usage:
-  wrela-host <build-dir> [--frames N] [--fps F] [--size WxH] [--input script.json] [--png out.png [--every K]] [--rgba out.rgba] [--timestamps [--serial]] [--log out.ticks] [--workers N]
+  wrela-host <build-dir> [--frames N] [--fps F] [--size WxH] [--input script.json] [--png out.png [--every K [--png-from N]]] [--rgba out.rgba] [--timestamps [--serial]] [--log out.ticks] [--workers N]
   wrela-host <build-dir> --until TEXT [--input script.json] [--frames N] [--fps F] [--size WxH] --png out.png [--workers N]
   wrela-host --no-gpu <build-dir> --ticks N [--input script.json] [--log out.ticks] [--workers N]
   wrela-host --replay <log> [--no-gpu] <build-dir> [--workers N]
@@ -31,7 +31,8 @@ fps, 640x360), its ticker (if it starts one) in lockstep, then prints the state 
 over every submitted byte, 16 hex digits. --input gives the program a script of input events
 (runtime/abi `input`). --png and --rgba write the last frame (raw RGBA8, rows top to bottom);
 with --every K, --png writes every Kth frame too, numbered (out-0000.png, out-0001.png, ...): a
-clip's frames.
+clip's frames. --png-from N omits numbered captures before frame N, while still running those
+frames; the capture schedule and numbering stay the same.
 --until runs frames until the program prints a line holding TEXT, and the frame that prints it
 is the PNG; it fails if none does within --frames.
 --timestamps prints each dispatch's and pass's GPU time to stderr, and each frame's span (its
@@ -50,6 +51,7 @@ struct Args {
     size: (u32, u32),
     png: Option<PathBuf>,
     every: Option<u32>,
+    png_from: Option<u32>,
     rgba: Option<PathBuf>,
     input: Option<PathBuf>,
     until: Option<String>,
@@ -71,6 +73,7 @@ fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
         size: (640, 360),
         png: None,
         every: None,
+        png_from: None,
         rgba: None,
         input: None,
         until: None,
@@ -107,6 +110,7 @@ fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
             }
             "--png" => args.png = Some(value("--png")?.into()),
             "--every" => args.every = Some(whole("--every", value("--every")?)?.max(1)),
+            "--png-from" => args.png_from = Some(whole("--png-from", value("--png-from")?)?),
             "--rgba" => args.rgba = Some(value("--rgba")?.into()),
             "--input" => args.input = Some(value("--input")?.into()),
             "--until" => args.until = Some(value("--until")?),
@@ -129,6 +133,9 @@ fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
     }
     if args.every.is_some() && args.png.is_none() {
         return Err(format!("--every needs --png\n\n{USAGE}"));
+    }
+    if args.png_from.is_some() && args.every.is_none() {
+        return Err(format!("--png-from needs --png and --every\n\n{USAGE}"));
     }
     if args.no_gpu && args.replay.is_none() && args.ticks.is_none() {
         return Err(format!("--no-gpu needs --ticks N\n\n{USAGE}"));
@@ -234,11 +241,20 @@ fn frames(args: &Args) -> Result<(), Failure> {
     // With --every, each Kth frame as it's drawn: a clip's frames.
     let stem = args.png.as_ref().map(|p| p.with_extension("")).unwrap_or_default();
     let every = args.every.unwrap_or(0);
-    let (run, log) =
-        host.run_lockstep_seen(args.frames, args.fps, w, h, &script, logging, every, |i, rgba| {
+    let (run, log) = host.run_lockstep_seen_from(
+        args.frames,
+        args.fps,
+        w,
+        h,
+        &script,
+        logging,
+        every,
+        args.png_from.unwrap_or(0),
+        |i, rgba| {
             let path = PathBuf::from(format!("{}-{:04}.png", stem.display(), i / every));
             wrela_host::image::write_png(&path, w, h, rgba)
-        })?;
+        },
+    )?;
     // The phases the program timed (`std::time::phase`), over every frame and tick.
     let traced = host.trace().take();
     drop(host); // release the GPU (and its lock) before writing files

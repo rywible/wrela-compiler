@@ -33,18 +33,30 @@ pub(super) fn clicks(mono: &[f32], rate: f64) -> Vec<Click> {
         .collect();
     let around = 100; // 50 ms of half-millisecond frames
     let mut out = Vec::new();
+    let mut near = Vec::with_capacity(2 * around);
     let mut i = 0;
     while i < frames.len() {
-        let lo = i.saturating_sub(around);
-        let hi = (i + around).min(frames.len());
-        let mut near: Vec<f64> = frames[lo..hi].to_vec();
-        near.sort_by(f64::total_cmp);
-        // Silence's median is no level to stand out from: a click must be over -100 dB too.
-        let median = near[near.len() / 2].max(1e-10);
-        let db = 10.0 * (frames[i] / median).log10();
+        if frames[i] <= 1e-10 {
+            i += 1;
+            continue;
+        }
+        // Only a local peak can be a click. Most frames need no median at all.
         let local_max =
             (i.saturating_sub(4)..(i + 5).min(frames.len())).all(|j| frames[j] <= frames[i]);
-        if db > DB_OVER && local_max {
+        if !local_max {
+            i += 1;
+            continue;
+        }
+        let lo = i.saturating_sub(around);
+        let hi = (i + around).min(frames.len());
+        near.clear();
+        near.extend_from_slice(&frames[lo..hi]);
+        let middle = near.len() / 2;
+        let (_, median, _) = near.select_nth_unstable_by(middle, f64::total_cmp);
+        // Silence's median is no level to stand out from: a click must be over -100 dB too.
+        let median = median.max(1e-10);
+        let db = 10.0 * (frames[i] / median).log10();
+        if db > DB_OVER {
             out.push(Click { at: (i * step) as f64 / rate, db });
             i += 4;
         } else {

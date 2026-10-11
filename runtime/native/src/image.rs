@@ -17,6 +17,9 @@ pub fn write_png(path: &Path, width: u32, height: u32, rgba: &[u8]) -> Result<()
     let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), width, height);
     encoder.set_color(png::ColorType::Rgba);
     encoder.set_depth(png::BitDepth::Eight);
+    // These are agent captures, often hundreds of frames. Keep the exact pixels while
+    // spending less CPU on compression; video encoding can compress the clip afterwards.
+    encoder.set_compression(png::Compression::Fast);
     let png_err = |e: png::EncodingError| Error::io(path, std::io::Error::other(e));
     let mut writer = encoder.write_header().map_err(png_err)?;
     writer.write_image_data(rgba).map_err(png_err)?;
@@ -100,6 +103,11 @@ mod tests {
         write_png(&path, 2, 3, &rgba).expect("written");
         assert_eq!(read_png(&path).expect("decodes"), (2, 3, rgba.clone()));
         assert!(write_png(&path, 2, 2, &rgba).is_err());
+        // Multiple rows and changing channels exercise the fast compressor's filtering,
+        // including alpha and widths that are not powers of two.
+        let rgba: Vec<u8> = (0..31 * 19 * 4).map(|i| ((i * 73 + i / 31) % 256) as u8).collect();
+        write_png(&path, 31, 19, &rgba).expect("fast compression");
+        assert_eq!(read_png(&path).expect("decodes"), (31, 19, rgba));
         std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 }

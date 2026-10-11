@@ -138,29 +138,11 @@ side_results() {
   side_jobs=()
 }
 # The tools' tests (the dev server, the headless-Chrome driver with a fake Chrome, the agent
-# test's scorer) mostly wait on processes, so each runs in a process of its own, with at most
-# two per available CPU (and eight in total).
+# test's scorer) mostly wait on processes, with at most two per available CPU (and eight in
+# total). Workers import their test modules once and run one test at a time with its fixtures.
 # Each takes a lock file of its own (its TMPDIR), so they queue neither on the GPU nor together.
 tools_tests() {
-  python3 - <<'TOOLS'
-import concurrent.futures, subprocess, sys, unittest
-sys.path.insert(0, "tools")
-from resources import cpu_count
-ids = []
-def walk(suite):
-    for t in suite:
-        walk(t) if isinstance(t, unittest.TestSuite) else ids.append(t.id())
-walk(unittest.defaultTestLoader.discover("tools/tests"))
-def run(i):
-    return subprocess.run([sys.executable, "-m", "unittest", "-q", i], cwd="tools/tests",
-                          capture_output=True, text=True)
-with concurrent.futures.ThreadPoolExecutor(min(8, max(1, cpu_count() * 2))) as pool:
-    failed = [p for p in pool.map(run, ids) if p.returncode != 0]
-for p in failed:
-    print(p.stderr)
-print(f"{len(ids)} tools tests, {len(failed)} failed")
-sys.exit(1 if failed else 0)
-TOOLS
+  python3 tools/runner.py --tools-tests
 }
 
 # Runs at most one test program per available CPU, each with `args` (its tests filtered and
@@ -310,6 +292,8 @@ if [ "$took" -gt 60 ]; then
   fi
   budget=$(python3 - "$logs" "$$" "$took" <<'PY'
 import os, sys
+sys.path.insert(0, "tools")
+from resources import cpu_count
 logs, me, took = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
 def read(name):
     ps = {}
@@ -329,7 +313,7 @@ def ours(pid):
 # The CPU each process outside the checks used while they ran (one that started or ended
 # meanwhile isn't counted: the share is a lower bound).
 other = sum(after[p][1] - before[p][1] for p in after if p in before and not ours(p))
-cores = os.cpu_count()
+cores = cpu_count()
 busy = min(other / max(took, 1), cores - 1)
 print(f"{busy:.1f} {60 * cores / (cores - busy):.0f}")
 PY

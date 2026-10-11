@@ -4,18 +4,19 @@
 //! frames until a condition holds, and says at which frame (`<op>` is `<`, `<=`, `>`, `>=`,
 //! `==` or `!=`; `nan <export>` holds when the export says NaN; `<export>.x` picks a vector's
 //! component, and `<export>.5` any value by its place, as a struct's are returned). Both take
-//! `[--fps f] [--size WxH] [--input script.json] [--release]`.
+//! `[--fps f] [--size WxH] [--input script.json] [--release] [--no-gpu] [--workers N]`.
 //!
 //! An export watched takes no arguments but the program's state (if it has one: the host passes
 //! it), and returns numbers. The program is a debug build (language.md §11's checks, so a
 //! simulation that indexes out of bounds stops at the frame it did), unless `--release`; it runs
-//! on the GPU if it has pipelines, else on the CPU. Frame `i` runs at time `i / fps` (60 unless
-//! said). Exit status: 0; for `bisect`, 1 if the condition never held; 2 a usage error or a
+//! on the GPU if it has pipelines, else on the CPU. `--no-gpu` checks submitted commands but
+//! skips their execution, for CPU state that needs no GPU readbacks. Frame `i` runs at time
+//! `i / fps` (60 unless said). Exit status: 0; for `bisect`, 1 if the condition never held; 2 a usage error or a
 //! failure to build or run.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
-use wrela_host::{CpuHost, Host, Value};
+use wrela_host::{CpuBuild, CpuHost, Host, Options, Value};
 
 struct Args {
     dir: PathBuf,
@@ -26,6 +27,8 @@ struct Args {
     size: (u32, u32),
     input: Option<PathBuf>,
     release: bool,
+    no_gpu: bool,
+    workers: u32,
     csv: bool,
     json: bool,
 }
@@ -40,6 +43,8 @@ fn parse(args: &[String], bisect: bool) -> Option<Args> {
         size: (640, 480),
         input: None,
         release: false,
+        no_gpu: false,
+        workers: 0,
         csv: false,
         json: false,
     };
@@ -61,6 +66,8 @@ fn parse(args: &[String], bisect: bool) -> Option<Args> {
             "--size" => a.size = crate::parse_size(it.next()?)?,
             "--input" => a.input = Some(PathBuf::from(it.next()?)),
             "--release" => a.release = true,
+            "--no-gpu" => a.no_gpu = true,
+            "--workers" => a.workers = it.next()?.parse().ok()?,
             "--csv" if !bisect => a.csv = true,
             "--json" if bisect => a.json = true,
             _ if dir.is_none() && !x.starts_with('-') => dir = Some(PathBuf::from(x)),
@@ -127,11 +134,16 @@ fn start(a: &Args) -> Result<(Runner, Vec<wrela_abi::input::Scripted>), String> 
         .ok()
         .and_then(|m| m["pipelines"].as_array().map(|p| !p.is_empty()))
         .unwrap_or(false);
-    let runner = if gpu {
-        Runner::Gpu(Box::new(Host::load(&built).map_err(|e| e.to_string())?))
+    let runner = if gpu && !a.no_gpu {
+        let options = Options { workers: a.workers, ..Options::default() };
+        Runner::Gpu(Box::new(Host::load_with(&built, &options).map_err(|e| e.to_string())?))
     } else {
         // Loading runs the program's `init`.
-        Runner::Cpu(Box::new(CpuHost::load(&built).map_err(|e| e.to_string())?))
+        Runner::Cpu(Box::new(
+            CpuBuild::load_cpu(&built)
+                .and_then(|build| build.start_with(a.workers))
+                .map_err(|e| e.to_string())?,
+        ))
     };
     let script = match &a.input {
         Some(p) => {

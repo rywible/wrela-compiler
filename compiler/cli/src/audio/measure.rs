@@ -2,7 +2,7 @@
 //! decays in two stages. `wrela audio partials` reports one note; `wrela audio model` fits
 //! engine::piano's tables to many.
 
-use super::dsp::{db, peak, spectrum};
+use super::dsp::{Spectrum, db, peak, spectrum};
 
 /// A partial of a recorded note: its number, its frequency, and its level (dB of full scale)
 /// every `Measured::dt` seconds.
@@ -69,8 +69,9 @@ pub fn measure(samples: &[f32], rate: f64, key: u32, from: f64, seconds: f64) ->
     let bin = rate / n as f64;
     let frames = ((seconds * rate) as usize / hop).max(1);
     let mut levels: Vec<Vec<f64>> = vec![Vec::with_capacity(frames); found.len()];
+    let mut spectrum = Spectrum::new(n);
     for t in 0..frames {
-        let mag = spectrum(samples, start + t * hop, n);
+        let mag = spectrum.of(samples, start + t * hop);
         for (i, (_, f)) in found.iter().enumerate() {
             let k = (f / bin).round() as usize;
             let a = (k.saturating_sub(2)..=(k + 2).min(mag.len() - 1))
@@ -184,31 +185,42 @@ pub fn two_stage(levels: &[f64], dt: f64) -> Option<Decay> {
     if pts.len() < 8 {
         return None;
     }
-    let cost = |t1: f64, t2: f64, r: f64| -> f64 {
-        let model = |t: f64| {
-            10.0 * ((1.0 - r) * 10f64.powf(-6.0 * t / t1) + r * 10f64.powf(-6.0 * t / t2))
-                .max(1e-30)
-                .log10()
-        };
+    // All mixtures on a grid share a small set of exponential curves. Compute
+    // each curve once, then reuse the model levels for both residual passes.
+    let curve = |log_seconds: f64| {
+        let seconds = 10f64.powf(log_seconds);
+        pts.iter().map(|(t, _)| 10f64.powf(-6.0 * t / seconds)).collect::<Vec<_>>()
+    };
+    let mut model = vec![0.0; pts.len()];
+    let mut cost = |prompt: &[f64], after: &[f64], r: f64| -> f64 {
+        for ((m, p), a) in model.iter_mut().zip(prompt).zip(after) {
+            *m = 10.0 * ((1.0 - r) * p + r * a).max(1e-30).log10();
+        }
         // L₀ is the mean residual.
-        let l0 = pts.iter().map(|(t, l)| l - model(*t)).sum::<f64>() / pts.len() as f64;
-        pts.iter().map(|(t, l)| (l - l0 - model(*t)).powi(2)).sum::<f64>()
+        let l0 = pts.iter().zip(&model).map(|((_, l), m)| l - m).sum::<f64>() / pts.len() as f64;
+        pts.iter().zip(&model).map(|((_, l), m)| (l - l0 - m).powi(2)).sum::<f64>()
     };
     // A coarse grid in logs, then finer ones around the best.
     let (mut lt1, mut lt2, mut lr) = (0.0f64, 1.0f64, -2.0f64);
     let mut best = f64::MAX;
+    let afters: Vec<_> = (0..14)
+        .map(|j| {
+            let b = -0.5 + 3.0 * f64::from(j) / 13.0;
+            (b, curve(b))
+        })
+        .collect();
     for i in 0..14 {
-        for j in 0..14 {
+        let a = -1.0 + 2.6 * f64::from(i) / 13.0;
+        let prompt = curve(a);
+        for (b, after) in &afters {
             for k in 0..10 {
-                let a = -1.0 + 2.6 * f64::from(i) / 13.0;
-                let b = -0.5 + 3.0 * f64::from(j) / 13.0;
                 let c = -4.0 + 3.7 * f64::from(k) / 9.0;
-                if b < a {
+                if *b < a {
                     continue;
                 }
-                let e = cost(10f64.powf(a), 10f64.powf(b), 10f64.powf(c));
+                let e = cost(&prompt, after, 10f64.powf(c));
                 if e < best {
-                    (best, lt1, lt2, lr) = (e, a, b, c);
+                    (best, lt1, lt2, lr) = (e, a, *b, c);
                 }
             }
         }
@@ -216,18 +228,24 @@ pub fn two_stage(levels: &[f64], dt: f64) -> Option<Decay> {
     let mut step = (0.2, 0.23, 0.4);
     for _ in 0..4 {
         let (c1, c2, c3) = (lt1, lt2, lr);
+        let afters: Vec<_> = (-2..=2)
+            .map(|j| {
+                let b = c2 + step.1 * f64::from(j) / 2.0;
+                (b, curve(b))
+            })
+            .collect();
         for i in -2..=2 {
-            for j in -2..=2 {
+            let a = c1 + step.0 * f64::from(i) / 2.0;
+            let prompt = curve(a);
+            for (b, after) in &afters {
                 for k in -2..=2 {
-                    let a = c1 + step.0 * f64::from(i) / 2.0;
-                    let b = c2 + step.1 * f64::from(j) / 2.0;
                     let c = (c3 + step.2 * f64::from(k) / 2.0).min(-0.01);
-                    if b < a {
+                    if *b < a {
                         continue;
                     }
-                    let e = cost(10f64.powf(a), 10f64.powf(b), 10f64.powf(c));
+                    let e = cost(&prompt, after, 10f64.powf(c));
                     if e < best {
-                        (best, lt1, lt2, lr) = (e, a, b, c);
+                        (best, lt1, lt2, lr) = (e, a, *b, c);
                     }
                 }
             }

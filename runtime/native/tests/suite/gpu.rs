@@ -133,6 +133,43 @@ fn runs_are_deterministic() {
 
 #[test]
 #[ignore = "needs a GPU"]
+fn captures_skip_preroll_and_reuse_readback_without_changing_frames() {
+    let mut host = Host::load(common::first_light()).expect("loads");
+    let mut all = Vec::new();
+    let (full, _) = host
+        .run_lockstep_seen(7, 60.0, 67, 41, &[], false, 2, |i, rgba| {
+            all.push((i, rgba.to_vec()));
+            Ok(())
+        })
+        .expect("captures every second frame");
+    host.restart_with(&Options::default()).expect("fresh program");
+    let mut kept = Vec::new();
+    let (window, _) = host
+        .run_lockstep_seen_from(7, 60.0, 67, 41, &[], false, 2, 3, |i, rgba| {
+            kept.push((i, rgba.to_vec()));
+            Ok(())
+        })
+        .expect("captures after warmup");
+    assert_eq!(kept, all[2..]);
+    assert_eq!(full.hash, window.hash, "every frame ran, including warmup");
+    assert_eq!(full.frame, window.frame);
+    // A smaller region reuses a larger allocation but must return just the requested pixels.
+    let region = host.read_screen_region(2, 3, 5, 7).expect("small region");
+    assert_eq!(region.len(), 5 * 7 * 4);
+    for y in 0..7 {
+        for x in 0..5 {
+            assert_eq!(pixel(&region, 5, x, y), pixel(&full.frame, 67, x + 2, y + 3));
+        }
+    }
+    // Growing the capture replaces the allocation; later smaller screens still decode cleanly.
+    host.frame(1.0, 80, 50).expect("larger screen");
+    assert_eq!(host.read_screen_region(0, 0, 80, 50).unwrap().len(), 80 * 50 * 4);
+    host.frame(2.0, 16, 12).expect("smaller screen");
+    assert_eq!(host.read_screen_region(0, 0, 16, 12).unwrap().len(), 16 * 12 * 4);
+}
+
+#[test]
+#[ignore = "needs a GPU"]
 fn shader_errors_name_the_pipeline_and_shader() {
     let dir = common::first_light_copy("bad-shader");
     std::fs::write(

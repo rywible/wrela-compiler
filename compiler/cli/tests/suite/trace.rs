@@ -77,6 +77,49 @@ fn trace_prints_the_watched_exports_after_each_frame() {
 }
 
 #[test]
+fn trace_and_bisect_can_check_rendering_programs_without_a_gpu() {
+    let dir = package("trace-ball-no-gpu");
+    let shaders = r#"
+@vertex
+fn cover(v: std::gpu::VertexIndex) -> std::gpu::ClipPosition {
+    std::gpu::ClipPosition { position: vec4(f32(v.index % 2) * 4.0 - 1.0, f32(v.index / 2) * 4.0 - 1.0, 0.0, 1.0) }
+}
+
+@fragment
+fn colour() -> vec4 { vec4(1.0, 0.0, 0.0, 1.0) }
+"#;
+    let source = BALL.replace(
+        "    b.y += b.v * dt",
+        "    b.y += b.v * dt\n    let screen = std::gpu::begin_screen_pass(clear: vec4())\n    std::gpu::draw(screen, cover, colour, vertices: 3)\n    screen.present()",
+    ) + shaders;
+    std::fs::write(dir.join("main.wrela"), source).expect("rendering ball");
+    let run = |command: &str, args: &[&str]| {
+        common::wrela()
+            .arg(command)
+            .arg(&dir)
+            .args(args)
+            .args(["--no-gpu", "--workers", "1"])
+            .env("VK_DRIVER_FILES", dir.join("no-vulkan.json"))
+            .env("VK_ICD_FILENAMES", dir.join("no-vulkan.json"))
+            .output()
+            .expect("runs without an adapter")
+    };
+    let out = run("trace", &["--watch", "height", "--frames", "4", "--csv"]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(String::from_utf8_lossy(&out.stdout).lines().count(), 5);
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(dir.join("build/trace-debug/manifest.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(!manifest["pipelines"].as_array().unwrap().is_empty());
+    let out = run("bisect", &["--until", "height < 9", "--frames", "60", "--json"]);
+    assert!(out.status.success(), "{}", text(&out));
+    let result: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(result["held"], true);
+    assert!(result["values"][0].as_f64().unwrap() < 9.0);
+}
+
+#[test]
 fn bisect_finds_the_first_frame_a_condition_holds() {
     let dir = package("trace-ball-bisect");
     let d = dir.to_str().unwrap();

@@ -2,7 +2,7 @@
 
 use crate::common;
 
-use wrela_host::{Error, Host};
+use wrela_host::{CpuBuild, Error, Host};
 
 fn load_with_manifest(name: &str, edit: impl Fn(&str) -> String) -> Error {
     let dir = common::first_light_copy(name);
@@ -44,6 +44,23 @@ fn reports_missing_files() {
     assert!(matches!(&err, Error::Io { path, .. } if path.ends_with("nope.wgsl")), "{err}");
     let err = Host::load(common::temp_dir("empty")).err().expect("rejected");
     assert!(matches!(&err, Error::Io { path, .. } if path.ends_with("manifest.json")), "{err}");
+}
+
+#[test]
+fn cpu_frame_builds_need_no_emitted_shaders() {
+    let dir = common::first_light_copy("cpu-without-shaders");
+    std::fs::remove_file(dir.join("fill.wgsl")).expect("remove compute shader");
+    std::fs::remove_file(dir.join("first-light.wgsl")).expect("remove render shader");
+    assert!(matches!(CpuBuild::load_metered(&dir, 1_000_000), Err(Error::Io { .. })));
+    let mut host = CpuBuild::load_metered_cpu(&dir, 1_000_000)
+        .expect("CPU build loads")
+        .start_with(1)
+        .expect("init's dispatch is checked without running a shader");
+    host.frame(0.0, 64, 48).expect("the frame's draw is checked without running a shader");
+    assert_eq!(
+        host.call_export("tri", &[wrela_host::Value::F32(0.25)]).unwrap(),
+        [wrela_host::Value::F32(0.0)]
+    );
 }
 
 #[test]

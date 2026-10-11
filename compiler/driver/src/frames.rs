@@ -37,11 +37,30 @@ pub fn run(
 ) -> (Vec<crate::consts::Ran>, Vec<Diagnostic>) {
     let mut roots = wrela_lower::Roots::of(checked);
     roots.tests = tests.to_vec();
-    let (lowered, mut diags) = wrela_lower::lower(checked, &roots, data, true);
+    let mut full_build = tests.iter().any(|&f| checked.program.func(f).attrs.test_gpu);
+    let (mut lowered, mut diags) = if full_build {
+        wrela_lower::lower(checked, &roots, data, true)
+    } else {
+        wrela_lower::lower_for_cpu(checked, &roots, data)
+    };
     if has_errors(&diags) {
         return (Vec::new(), diags);
     }
-    let out = build::emit(&lowered, sources, !data.no_simd, false);
+    // A CPU test can fetch the build's own manifest, shaders or browser files. Keep the full
+    // artifact set whenever its optimized code can fetch; looking at the lowered code avoids
+    // counting std's unused fetch function or a branch removed by `test_build()`.
+    if !full_build && fetches(&lowered.cpu) {
+        full_build = true;
+        (lowered, diags) = wrela_lower::lower(checked, &roots, data, true);
+        if has_errors(&diags) {
+            return (Vec::new(), diags);
+        }
+    }
+    let out = if full_build {
+        build::emit(&lowered, sources, !data.no_simd, false)
+    } else {
+        build::emit_for_cpu(&lowered, sources, !data.no_simd)
+    };
     diags.extend(out.diagnostics);
     if has_errors(&diags) {
         return (Vec::new(), diags);
@@ -53,7 +72,12 @@ pub fn run(
             return (Vec::new(), diags);
         }
     }
-    let built = match wrela_host::CpuBuild::load_metered(&dir.0, fuel) {
+    let loaded = if full_build {
+        wrela_host::CpuBuild::load_metered(&dir.0, fuel)
+    } else {
+        wrela_host::CpuBuild::load_metered_cpu(&dir.0, fuel)
+    };
+    let built = match loaded {
         Ok(b) => b,
         Err(e) => {
             diags.push(Diagnostic::internal(format!("loading a test's build: {e}")));
@@ -112,6 +136,19 @@ pub fn run(
         results.push((f, failed, traced));
     }
     (results, diags)
+}
+
+/// Whether the emitted CPU code can fetch a file from its build directory.
+fn fetches(module: &wrela_ir::Module) -> bool {
+    module.functions.iter().any(|f| {
+        wrela_ir::visit::any(&f.body, &mut |s| {
+            matches!(
+                s.expr(),
+                Some(wrela_ir::Expr::Host(wrela_ir::HostOp::Command { opcode, .. }, _))
+                    if *opcode == wrela_abi::stream::Opcode::Fetch as u32
+            )
+        })
+    })
 }
 
 /// Why a test failed (the fault behind it, if it was a trap), and in which call.

@@ -52,6 +52,46 @@ fn literals_answer_without_a_gpu_or_rendered_frame() {
     assert!(!String::from_utf8_lossy(&out.stderr).contains("wrela: "), "program logs echoed twice");
 }
 
+#[test]
+#[ignore = "long: builds a small lens and runs its CPU queries"]
+fn synchronous_answers_need_no_gpu_or_rendered_frame() {
+    let pkg = package("studio-cpu-queries");
+    let missing_driver = pkg.join("no-vulkan-driver.json");
+    let run = |args: &[&str]| {
+        common::answer(
+            common::wrela()
+                .arg("studio")
+                .arg(&pkg)
+                .args(args)
+                .env("VK_DRIVER_FILES", &missing_driver)
+                .env("VK_ICD_FILENAMES", &missing_driver),
+        )
+    };
+    let parts = run(&["parts"]);
+    assert_eq!(parts["action"], "parts");
+    assert_eq!(parts["count"], parts["parts"].as_array().unwrap().len());
+
+    let probe = run(&["probe", "1", "0", "0"]);
+    assert_eq!(probe["action"], "probe");
+    assert_eq!(probe["distance"], 0.625);
+    assert_eq!(probe["inside"], false);
+
+    let ray = run(&["ray", "1", "0", "0", "-1", "0", "0"]);
+    assert_eq!(ray["hit"], true);
+    assert!((ray["distance"].as_f64().unwrap() - 0.625).abs() < 0.001, "{ray}");
+
+    let measure = run(&["measure", "0", "0", "0", "3", "4", "0"]);
+    assert_eq!(measure["distance"], 5.0);
+
+    let spec = run(&["spec"]);
+    assert_eq!(spec["action"], "spec");
+    assert!(spec["error"].as_str().unwrap().contains("no spec"), "{spec}");
+
+    let view = run(&["view", "0"]);
+    assert_eq!(view["view"], "side");
+    assert_eq!(view["framings"].as_array().unwrap().len(), 4);
+}
+
 fn artifacts(page: &Path) -> BTreeMap<String, Vec<u8>> {
     fn walk(root: &Path, dir: &Path, files: &mut BTreeMap<String, Vec<u8>>) {
         for entry in std::fs::read_dir(dir).expect("the build's artifacts") {
@@ -118,6 +158,18 @@ fn artifacts_only_is_rejected_for_actions_before_building() {
 }
 
 #[test]
+fn invalid_actions_are_rejected_before_building() {
+    let pkg = package("studio-invalid-action");
+    for args in
+        [vec!["no-such-action"], vec!["probe"], vec!["probe", "NaN", "0", "0"], vec!["view", "-1"]]
+    {
+        let out = common::wrela().arg("studio").arg(&pkg).args(&args).output().expect("run wrela");
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {out:?}");
+    }
+    assert!(!pkg.join("build").exists(), "an invalid action must not start a build");
+}
+
+#[test]
 #[ignore = "long: compares metadata with and without a rendered lens, needs a GPU"]
 fn literals_with_a_png_keeps_the_same_answer_and_draws() {
     let pkg = package("studio-literals-png");
@@ -129,4 +181,9 @@ fn literals_with_a_png_keeps_the_same_answer_and_draws() {
     assert_eq!((w, h), (64, 64));
     let first = &pixels[..4];
     assert!(pixels.chunks_exact(4).any(|p| p != first), "the lens drew no subject");
+
+    let metadata = answer(&pkg, &["probe", "1", "0", "0"]);
+    let rendered =
+        answer(&pkg, &["probe", "1", "0", "0", "--png", png.to_str().unwrap(), "--size", "64x64"]);
+    assert_eq!(rendered, metadata, "a CPU field query must match the rendered lens");
 }

@@ -98,6 +98,67 @@ fn clicks_finds_a_click_and_only_it() {
 }
 
 #[test]
+fn clicks_in_silence_keep_their_peak_times_and_levels() {
+    let rate = 8000.0;
+    let mut samples = vec![0.0; 24000];
+    assert!(clicks::clicks(&samples, rate).is_empty());
+    samples[8000] = 0.5;
+    samples[16000] = 0.5;
+    let found = clicks::clicks(&samples, rate);
+    assert_eq!(found.len(), 2);
+    assert_eq!(found[0].at, 0.9995);
+    assert_eq!(found[1].at, 1.9995);
+    let expected_db = 10.0 * (6.0 * 0.5f64.powi(2) / 8.0 / 1e-10).log10();
+    assert_eq!(found[0].db, expected_db);
+    assert_eq!(found[1].db, expected_db);
+}
+
+#[test]
+fn spectrum_matches_a_direct_transform_and_clears_reused_windows() {
+    let n = 64;
+    let samples: Vec<f32> = (0..3 * n)
+        .map(|i| (0.4 * (TAU * 7.0 * i as f64 / n as f64).sin() + 0.1 * (i % 11) as f64) as f32)
+        .collect();
+    let mut spectrum = super::dsp::Spectrum::new(n);
+    for at in [0, 17, samples.len() - 11, samples.len() + 5, 0] {
+        let mag = spectrum.of(&samples, at);
+        for (k, actual) in mag.iter().enumerate() {
+            let (mut re, mut im) = (0.0, 0.0);
+            for i in 0..n {
+                let sample = f64::from(samples.get(at + i).copied().unwrap_or(0.0));
+                let window = 0.5 - 0.5 * (TAU * i as f64 / n as f64).cos();
+                let angle = -TAU * (i * k) as f64 / n as f64;
+                re += sample * window * angle.cos();
+                im += sample * window * angle.sin();
+            }
+            let expected = re.hypot(im) * 4.0 / n as f64;
+            assert!((actual - expected).abs() < 1e-12, "at {at}, bin {k}: {actual} vs {expected}");
+        }
+    }
+}
+
+#[test]
+fn two_stage_recovers_known_decay_and_ignores_the_floor() {
+    let dt = 0.02;
+    // Two seconds include both the prompt and the tail; a much longer tail can
+    // dominate this grid search's fit to the short prompt.
+    let levels: Vec<f64> = (0..100)
+        .map(|i| {
+            let t = f64::from(i) * dt;
+            -12.0
+                + 10.0
+                    * (0.9 * 10f64.powf(-6.0 * t / 0.6) + 0.1 * 10f64.powf(-6.0 * t / 6.0)).log10()
+        })
+        .collect();
+    let fit = measure::two_stage(&levels, dt).expect("a decay");
+    assert!((fit.prompt / 0.6 - 1.0).abs() < 0.05, "prompt {}", fit.prompt);
+    assert!((fit.after / 6.0 - 1.0).abs() < 0.05, "after {}", fit.after);
+    assert!((fit.after_db - 10.0 * (0.1f64 / 0.9).log10()).abs() < 0.5);
+    assert!(fit.error < 0.1, "error {}", fit.error);
+    assert!(measure::two_stage(&[-120.0; 20], dt).is_none());
+}
+
+#[test]
 #[ignore = "long: 80 notes made and fitted, about 20 s"]
 fn model_fits_a_piano_to_its_notes() {
     // 16 keys at 5 velocities, as the model wants, each B a grand's at its key.

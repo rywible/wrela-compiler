@@ -14,8 +14,9 @@ then for `lookbook::MOVE` seconds, paced as in play, recorded from Chrome's canv
 the look (F8 in the floor): `clay`, the scene's light on its forms all one matte grey, or
 `silhouette`, the sky white, the land light and the solid forms dark, a step lighter for each band
 of distance. `--size` renders the stills at another size than 1920x1080 (1280x720 while
-iterating). `--jobs` renders that many stills at once (by default 3 on a machine whose GPU is
-software, else 1), each process sharing the GPU lock (`WRELA_GPU_SHARED`), with the same pixels:
+iterating). `--jobs` renders that many stills at once (by default up to 3 on a machine whose GPU
+is software, bounded by its available CPUs, else 1), each process sharing the GPU lock
+(`WRELA_GPU_SHARED`), with the same pixels:
 on a 4-core cloud machine lavapipe leaves cores idle in a still's load frames, and shots 2, 7
 and 9 took 785 s at once, about 1400 s one by one. Each shot's numbers, the
 interest check's view at its eye (the build's `files/check/shots.json`), are printed beside it and saved as
@@ -31,6 +32,8 @@ the shots before it.)
 
 import json, os, re, shutil, subprocess, sys, tempfile
 from concurrent.futures import ThreadPoolExecutor
+
+from resources import cpu_count
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILD = os.path.join(ROOT, "examples/last-green/build")
@@ -75,24 +78,37 @@ def still(i, name, out, view="look", size="1920x1080", jobs=1, capture=False):
         json.dump(events, f)
         script = f.name
     png = os.path.join(out, stem(i, name) + ".png")
-    env = dict(os.environ, WRELA_GPU_SHARED=str(max(2, jobs))) if jobs > 1 else None
+    software = os.environ.get("WRELA_SOFTWARE_GPU") == "1"
+    env = dict(os.environ) if jobs > 1 or software else None
+    if jobs > 1:
+        env["WRELA_GPU_SHARED"] = str(jobs)
     frames = CAPTURE_FRAMES if capture else SETTLE_FRAMES + 1
     cmd = [HOST, BUILD, "--frames", str(frames), "--size", size, "--input", script, "--png", png]
-    r = subprocess.run(cmd + (["--until", STILL] if capture else []), capture_output=True,
-                       text=True, env=env)
-    os.unlink(script)
+    if software:
+        # Each concurrent shot gets a share of the CPU, including lavapipe's raster workers.
+        # Three processes keep the measured memory footprint; larger machines give each more
+        # workers instead of loading more copies of the scene. An explicit Mesa override wins.
+        cores = max(1, cpu_count() // jobs)
+        env.setdefault("LP_NUM_THREADS", str(cores))
+        cmd += ["--workers", str(min(9, cores))]  # native ABI: main thread plus eight helpers
+    try:
+        r = subprocess.run(cmd + (["--until", STILL] if capture else []), capture_output=True,
+                           text=True, env=env)
+    finally:
+        os.unlink(script)
     if r.returncode != 0:
         sys.exit(f"shot {i} ({name}) failed:\n{r.stderr[-2000:]}")
     return png
 
 
 def clip(i, name, out, view="look"):
-    """Shot `i`'s move as a 10 s clip in Chrome (1080p, paced, eight threads), into `out`."""
+    """Shot `i`'s move as a 10 s clip in Chrome (1080p, paced), into `out`."""
     script = os.path.join(BUILD, "lookbook-keys.json")
     with open(script, "w") as f:
         json.dump(keys(i, view), f)
     frames = SETTLE_FRAMES + MOVE_FRAMES + 30
-    hash = (f"#test&frames={frames}&width=1920&height=1080&fps=60&workers=8&paced=1&nohash=1"
+    workers = min(8, cpu_count())
+    hash = (f"#test&frames={frames}&width=1920&height=1080&fps=60&workers={workers}&paced=1&nohash=1"
             f"&input=lookbook-keys.json&clipfrom={SETTLE_FRAMES}&clip={MOVE_FRAMES}")
     r = subprocess.run([sys.executable, HEADLESS, os.path.relpath(BUILD, ROOT), hash, "600"],
                        capture_output=True, text=True)
@@ -126,7 +142,7 @@ def main():
         size = args[k + 1]
         del args[k:k + 2]
     software = os.environ.get("WRELA_SOFTWARE_GPU") == "1"
-    jobs = 3 if software else 1
+    jobs = min(3, cpu_count()) if software else 1
     if "--jobs" in args:
         k = args.index("--jobs")
         if k + 1 >= len(args) or not args[k + 1].isdigit() or int(args[k + 1]) < 1:
@@ -137,6 +153,7 @@ def main():
     os.makedirs(out, exist_ok=True)
     shots = names()
     pick = [int(a) for a in args[1:]] or range(len(shots))
+    jobs = min(jobs, max(1, len(pick)))
     numbers = os.path.join(BUILD, "files", "check", "shots.json")
     views = json.load(open(numbers)) if os.path.exists(numbers) else []
     if views:

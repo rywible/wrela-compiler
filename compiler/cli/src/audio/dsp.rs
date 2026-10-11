@@ -116,57 +116,93 @@ pub fn vlq(out: &mut Vec<u8>, mut n: u64) {
     out.extend_from_slice(&bytes);
 }
 
-/// The Fourier transform of `re` + i `im`, in place (radix 2: the length a power of two).
-pub fn fft(re: &mut [f64], im: &mut [f64]) {
-    let n = re.len();
-    let mut j = 0;
-    for i in 1..n {
-        let mut bit = n >> 1;
-        while j & bit != 0 {
-            j ^= bit;
-            bit >>= 1;
+/// A reusable Hann-windowed radix-2 transform. A sheet and a note measurement each
+/// transform hundreds of windows of the same size: keep their window, twiddles,
+/// bit-reversal swaps and scratch space for the whole scan.
+pub struct Spectrum {
+    window: Vec<f64>,
+    swaps: Vec<(usize, usize)>,
+    twiddles: Vec<Vec<(f64, f64)>>,
+    re: Vec<f64>,
+    im: Vec<f64>,
+    mag: Vec<f64>,
+}
+
+impl Spectrum {
+    pub fn new(n: usize) -> Self {
+        assert!(n >= 2 && n.is_power_of_two());
+        let window = (0..n)
+            .map(|i| 0.5 - 0.5 * (2.0 * std::f64::consts::PI * i as f64 / n as f64).cos())
+            .collect();
+        let mut swaps = Vec::new();
+        let mut j = 0;
+        for i in 1..n {
+            let mut bit = n >> 1;
+            while j & bit != 0 {
+                j ^= bit;
+                bit >>= 1;
+            }
+            j |= bit;
+            if i < j {
+                swaps.push((i, j));
+            }
         }
-        j |= bit;
-        if i < j {
-            re.swap(i, j);
-            im.swap(i, j);
-        }
-    }
-    let mut len = 2;
-    while len <= n {
-        let w = -2.0 * std::f64::consts::PI / len as f64;
-        let (wr, wi) = (w.cos(), w.sin());
-        for start in (0..n).step_by(len) {
+        let mut twiddles = Vec::new();
+        let mut len = 2;
+        while len <= n {
+            let w = -2.0 * std::f64::consts::PI / len as f64;
+            let (wr, wi) = (w.cos(), w.sin());
             let (mut cr, mut ci) = (1.0, 0.0);
-            for k in 0..len / 2 {
-                let (a, b) = (start + k, start + k + len / 2);
-                let tr = re[b] * cr - im[b] * ci;
-                let ti = re[b] * ci + im[b] * cr;
-                re[b] = re[a] - tr;
-                im[b] = im[a] - ti;
-                re[a] += tr;
-                im[a] += ti;
+            let mut stage = Vec::with_capacity(len / 2);
+            for _ in 0..len / 2 {
+                stage.push((cr, ci));
                 let next = cr * wr - ci * wi;
                 ci = cr * wi + ci * wr;
                 cr = next;
             }
+            twiddles.push(stage);
+            len <<= 1;
         }
-        len <<= 1;
+        Self { window, swaps, twiddles, re: vec![0.0; n], im: vec![0.0; n], mag: vec![0.0; n / 2] }
+    }
+
+    /// The magnitude of `n` samples from `at`, zero past the end: `n / 2` bins.
+    /// The returned slice is reused by the next transform.
+    pub fn of(&mut self, samples: &[f32], at: usize) -> &[f64] {
+        let n = self.re.len();
+        for (i, (r, w)) in self.re.iter_mut().zip(&self.window).enumerate() {
+            *r = samples.get(at + i).map_or(0.0, |s| f64::from(*s)) * w;
+        }
+        self.im.fill(0.0);
+        for &(i, j) in &self.swaps {
+            self.re.swap(i, j);
+            self.im.swap(i, j);
+        }
+        for stage in &self.twiddles {
+            let half = stage.len();
+            for start in (0..n).step_by(2 * half) {
+                for (k, &(cr, ci)) in stage.iter().enumerate() {
+                    let (a, b) = (start + k, start + k + half);
+                    let tr = self.re[b] * cr - self.im[b] * ci;
+                    let ti = self.re[b] * ci + self.im[b] * cr;
+                    self.re[b] = self.re[a] - tr;
+                    self.im[b] = self.im[a] - ti;
+                    self.re[a] += tr;
+                    self.im[a] += ti;
+                }
+            }
+        }
+        // A sine of amplitude 1 gives a peak of 1: the window's gain is n / 4.
+        for (k, mag) in self.mag.iter_mut().enumerate() {
+            *mag = (self.re[k] * self.re[k] + self.im[k] * self.im[k]).sqrt() * 4.0 / n as f64;
+        }
+        &self.mag
     }
 }
 
-/// The magnitude spectrum of `n` samples from `at` (zero past the end), Hann-windowed:
-/// `n / 2` bins.
+/// A single spectrum. Use `Spectrum` to reuse the work across a scan.
 pub fn spectrum(samples: &[f32], at: usize, n: usize) -> Vec<f64> {
-    let mut re = vec![0.0; n];
-    let mut im = vec![0.0; n];
-    for (i, r) in re.iter_mut().enumerate() {
-        let w = 0.5 - 0.5 * (2.0 * std::f64::consts::PI * i as f64 / n as f64).cos();
-        *r = samples.get(at + i).map_or(0.0, |s| f64::from(*s)) * w;
-    }
-    fft(&mut re, &mut im);
-    // A sine of amplitude 1 gives a peak of 1: the window's gain is n / 4.
-    (0..n / 2).map(|k| (re[k] * re[k] + im[k] * im[k]).sqrt() * 4.0 / n as f64).collect()
+    Spectrum::new(n).of(samples, at).to_vec()
 }
 
 /// The peak in `mag` between bins `lo` and `hi`: its bin, interpolated by a parabola through

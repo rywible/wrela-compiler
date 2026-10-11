@@ -17,6 +17,55 @@ import time
 KEEP_SCRATCH = 6 * 3600
 
 
+def _tool_test(test_id, directory):
+    """Run one unittest in a reusable worker, keeping each test's own fixtures and output."""
+    import contextlib
+    import io
+    import sys
+    import unittest
+
+    os.chdir(directory)
+    if directory not in sys.path:
+        sys.path.insert(0, directory)
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+        suite = unittest.defaultTestLoader.loadTestsFromName(test_id)
+        result = unittest.TextTestRunner(stream=output, verbosity=0).run(suite)
+    return result.wasSuccessful(), output.getvalue()
+
+
+def tools_tests(directory="tools/tests"):
+    """Run the tools' tests with bounded processes and import each module once per worker.
+
+    Each test still runs its setup and cleanup, and different tests never share a worker at the
+    same time. Reusing workers avoids paying Python startup and the memo's AST scan per test.
+    """
+    from concurrent.futures import ProcessPoolExecutor
+    import unittest
+    from resources import cpu_count
+
+    directory = os.path.abspath(directory)
+    ids = []
+
+    def walk(suite):
+        for test in suite:
+            if isinstance(test, unittest.TestSuite):
+                walk(test)
+            else:
+                ids.append(test.id())
+
+    walk(unittest.TestLoader().discover(directory))
+    failed = 0
+    with ProcessPoolExecutor(max_workers=min(8, cpu_count() * 2)) as pool:
+        results = pool.map(_tool_test, ids, [directory] * len(ids))
+        for passed, output in results:
+            if not passed:
+                failed += 1
+                print(output)
+    print(f"{len(ids)} tools tests, {failed} failed")
+    return 1 if failed or not ids else 0
+
+
 def scratch_root():
     """Where the programs' scratch directories are: beneath the checkout even when Cargo's target
     is elsewhere (browser pages are served from it), at target/tmp's depth (copied fixtures have
@@ -73,3 +122,10 @@ def start(program, root, logs, native_cache, cores):
 
 def name_of(program):
     return f"{program['target']['name']} ({program['target']['kind'][0]})"
+
+
+if __name__ == "__main__":
+    import sys
+    if sys.argv[1:] != ["--tools-tests"]:
+        sys.exit("usage: tools/runner.py --tools-tests")
+    sys.exit(tools_tests())
