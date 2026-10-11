@@ -7,8 +7,9 @@
     python3 tools/worktrees.py prune [--build-cache]
     python3 tools/worktrees.py env
 
-No build tree or node_modules is copied when creating a session. Removal refuses dirty trees
-and branches with commits not in main. Prune never deletes a worktree, source, or capture.
+No build tree or node_modules is copied when creating a session. Removal deletes the worktree
+and local branch only when merged, including squash merges; dirty trees and needed outputs
+are preserved. Prune never deletes a worktree, source, or capture.
 """
 
 import argparse
@@ -177,6 +178,21 @@ def remove(cwd, name):
         _remove(cwd, name)
 
 
+def merged_head(cwd, branch):
+    """Pin the branch and prove its sources occur in main before deleting a squash branch."""
+    head = subprocess.check_output(["git", "rev-parse", "--verify", f"refs/heads/{branch}"], cwd=cwd).strip().decode()
+    main = subprocess.check_output(["git", "rev-parse", "--verify", "refs/heads/main"], cwd=cwd).strip().decode()
+    if subprocess.run(["git", "merge-base", "--is-ancestor", head, main], cwd=cwd).returncode == 0:
+        return head
+    tree = subprocess.check_output(["git", "rev-parse", f"{head}^{{tree}}"], cwd=cwd).strip().decode()
+    trees = subprocess.check_output(["git", "log", "--first-parent", "--format=%T", main], cwd=cwd).decode().splitlines()
+    # Squash merges change commit identity. Compare the whole tree, not selected files or
+    # individual patches; later main commits may have changed those sources again.
+    if tree in trees:
+        return head
+    raise ValueError("worktree has commits not in main; squash-merge its complete sources before removal")
+
+
 def _remove(cwd, name):
     common = common_dir(cwd)
     if common is None:
@@ -186,6 +202,9 @@ def _remove(cwd, name):
         raise ValueError("only worktrees created by this tool can be removed")
     item = registry[name]
     destination = Path(item["path"])
+    branch = subprocess.check_output(["git", "branch", "--show-current"], cwd=destination).strip().decode()
+    if branch != item["branch"]:
+        raise ValueError("worktree is on a different branch; preserve it before removal")
     if subprocess.check_output(["git", "status", "--porcelain"], cwd=destination).strip():
         raise ValueError("worktree has local changes; preserve or commit them before removal")
     ignored = subprocess.check_output(["git", "ls-files", "--others", "--ignored", "--exclude-standard", "-z"], cwd=destination)
@@ -198,17 +217,21 @@ def _remove(cwd, name):
         if len(relative.parts) > 1 and relative.parts[0] == "target" and relative.parts[1].startswith("test-scratch-"):
             continue
         raise ValueError(f"preserve ignored output before removal: {relative}")
-    if subprocess.run(["git", "merge-base", "--is-ancestor", item["branch"], "main"], cwd=cwd).returncode:
-        raise ValueError("worktree has commits not in main; merge or preserve its branch before removal")
+    head = merged_head(cwd, item["branch"])
     from jobs import entries, locked
     from resources import resource_dir
     resources = resource_dir()
     with locked(resources):
         if any(Path(job["cwd"]).resolve().is_relative_to(destination.resolve()) for job in entries(resources)):
             raise ValueError("worktree has queued or running jobs")
+        if subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=destination).strip().decode() != head:
+            raise ValueError("worktree branch changed during removal; preserve it and retry")
         subprocess.run(["git", "worktree", "remove", str(destination)], cwd=cwd, check=True)
         registry.pop(name)
         _save(path, registry)
+        # A squash branch is not an ancestor, so `branch -d` cannot prove it merged. The
+        # tree proof above permits deletion; the expected old ref preserves a raced commit.
+        subprocess.run(["git", "update-ref", "-d", f"refs/heads/{item['branch']}", head], cwd=cwd, check=True)
 
 
 def main():

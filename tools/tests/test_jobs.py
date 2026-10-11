@@ -294,8 +294,87 @@ class StorageTests(Processes):
             with self.assertRaisesRegex(ValueError, "preserve ignored output"):
                 worktrees.remove(self.root, "one")
             self.assertEqual((first / "target/capture.png").read_bytes(), b"evidence")
+            self.assertEqual(subprocess.check_output(["git", "branch", "--list", "codex/one"], cwd=self.root).strip(), b"+ codex/one")
             worktrees.remove(self.root, "two")
             self.assertFalse(second.exists())
+            self.assertFalse(subprocess.check_output(["git", "branch", "--list", "codex/two"], cwd=self.root).strip())
+            self.assertNotIn("two", worktrees._registry(self.root / ".git")[1])
+
+    def test_squash_removal_deletes_branch_after_main_advances(self):
+        self.init_repo()
+        with patch.dict(os.environ, self.env):
+            tree = worktrees.create(self.root, "squashed")
+            (tree / "source").write_text("merged source")
+            subprocess.run(["git", "add", "source"], cwd=tree, check=True)
+            subprocess.run(["git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "branch work"], cwd=tree, check=True)
+            subprocess.run(["git", "merge", "--squash", "codex/squashed"], cwd=self.root, check=True, capture_output=True)
+            subprocess.run(["git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "squash"], cwd=self.root, check=True)
+            (self.root / "source").write_text("later main work")
+            subprocess.run(["git", "add", "source"], cwd=self.root, check=True)
+            subprocess.run(["git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "advance main"], cwd=self.root, check=True)
+            self.assertEqual(subprocess.run(["git", "merge-base", "--is-ancestor", "codex/squashed", "main"], cwd=self.root).returncode, 1)
+            worktrees.remove(self.root, "squashed")
+            self.assertFalse(tree.exists())
+            self.assertFalse(subprocess.check_output(["git", "branch", "--list", "codex/squashed"], cwd=self.root).strip())
+            self.assertFalse(worktrees._registry(self.root / ".git")[1])
+            self.assertEqual((self.root / "source").read_text(), "later main work")
+
+    def test_squash_removal_preserves_followup_commits(self):
+        self.init_repo()
+        with patch.dict(os.environ, self.env):
+            tree = worktrees.create(self.root, "followup")
+            for source in ("merged source", "unmerged followup"):
+                (tree / "source").write_text(source)
+                subprocess.run(["git", "add", "source"], cwd=tree, check=True)
+                subprocess.run(["git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", source], cwd=tree, check=True)
+                if source == "merged source":
+                    subprocess.run(["git", "merge", "--squash", "codex/followup"], cwd=self.root, check=True, capture_output=True)
+                    subprocess.run(["git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "squash"], cwd=self.root, check=True)
+            head = subprocess.check_output(["git", "rev-parse", "codex/followup"], cwd=self.root)
+            with self.assertRaisesRegex(ValueError, "commits not in main"):
+                worktrees.remove(self.root, "followup")
+            self.assertTrue(tree.exists())
+            self.assertEqual(subprocess.check_output(["git", "rev-parse", "codex/followup"], cwd=self.root), head)
+            self.assertIn("followup", worktrees._registry(self.root / ".git")[1])
+
+    def test_removal_preserves_worktree_on_another_branch(self):
+        self.init_repo()
+        with patch.dict(os.environ, self.env):
+            tree = worktrees.create(self.root, "switched")
+            subprocess.run(["git", "switch", "-qc", "other"], cwd=tree, check=True)
+            (tree / "source").write_text("other branch work")
+            subprocess.run(["git", "add", "source"], cwd=tree, check=True)
+            subprocess.run(["git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "other branch"], cwd=tree, check=True)
+            with self.assertRaisesRegex(ValueError, "different branch"):
+                worktrees.remove(self.root, "switched")
+            self.assertTrue(tree.exists())
+            self.assertEqual((tree / "source").read_text(), "other branch work")
+            self.assertTrue(subprocess.check_output(["git", "branch", "--list", "codex/switched"], cwd=self.root).strip())
+
+    def test_removal_preserves_commit_racing_branch_deletion(self):
+        self.init_repo()
+        with patch.dict(os.environ, self.env):
+            tree = worktrees.create(self.root, "raced")
+            head = subprocess.check_output(["git", "rev-parse", "codex/raced"], cwd=self.root).strip().decode()
+            (self.root / "source").write_text("concurrent followup")
+            subprocess.run(["git", "add", "source"], cwd=self.root, check=True)
+            future_tree = subprocess.check_output(["git", "write-tree"], cwd=self.root).strip().decode()
+            future = subprocess.check_output(["git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit-tree", future_tree, "-p", head], cwd=self.root, input=b"followup\n").strip().decode()
+            run = subprocess.run
+
+            def advance_after_removal(command, **kwargs):
+                result = run(command, **kwargs)
+                if command[:3] == ["git", "worktree", "remove"]:
+                    run(["git", "update-ref", "refs/heads/codex/raced", future, head], cwd=self.root, check=True)
+                return result
+
+            with patch.object(worktrees.subprocess, "run", side_effect=advance_after_removal):
+                with self.assertRaises(subprocess.CalledProcessError):
+                    worktrees.remove(self.root, "raced")
+            self.assertFalse(tree.exists())
+            self.assertEqual(subprocess.check_output(["git", "rev-parse", "codex/raced"], cwd=self.root).strip().decode(), future)
+            self.assertEqual(subprocess.check_output(["git", "show", "codex/raced:source"], cwd=self.root), b"concurrent followup")
+            self.assertNotIn("raced", worktrees._registry(self.root / ".git")[1])
 
     def test_removal_refuses_unmerged_commits_and_live_jobs(self):
         self.init_repo()
@@ -308,12 +387,16 @@ class StorageTests(Processes):
                 record.write_text(json.dumps({"cwd": str(tree), "id": "test", "state": "queued"}))
                 with self.assertRaisesRegex(ValueError, "queued or running"):
                     worktrees.remove(self.root, "busy")
+                self.assertTrue(tree.exists())
+                self.assertTrue(subprocess.check_output(["git", "branch", "--list", "codex/busy"], cwd=self.root).strip())
                 record.unlink()
             (tree / "source").write_text("new commit")
             subprocess.run(["git", "add", "source"], cwd=tree, check=True)
             subprocess.run(["git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "unmerged"], cwd=tree, check=True)
             with self.assertRaisesRegex(ValueError, "commits not in main"):
                 worktrees.remove(self.root, "busy")
+            self.assertTrue(tree.exists())
+            self.assertEqual((tree / "source").read_text(), "new commit")
 
     def test_scratch_pruning_requires_old_age_and_dead_owner(self):
         for name, pid in (("live", os.getpid()), ("dead", 2147483647), ("unknown", None)):
