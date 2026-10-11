@@ -295,9 +295,9 @@ fn read_file<T>(
 pub struct Host {
     /// Always a program, but while a hot reload swaps it ([`Host::reload`]).
     program: Option<Program<Gpu>>,
-    wasm_hash: u64,
-    /// The build's directory and how it was loaded: what a hot reload loads the next build
-    /// with.
+    /// The running build, and its directory and how it was loaded: what a hot reload loads the
+    /// next build with, and what starts again when a hand-over fails.
+    build: Build,
     dir: PathBuf,
     options: Options,
     /// The builds the program got ready to hand over to (`std::reload::prepare`).
@@ -312,6 +312,30 @@ impl Host {
         self.program.as_mut().expect("the host has a program")
     }
 
+    /// `build`, in `dir`, started in the place of the program `carried` comes from, on its
+    /// device (`build`'s pipelines taken from the spares where they can be): given what it
+    /// kept, its unread input and, if it has any, its ticks to run again. `run_init` runs its
+    /// `init` too.
+    fn start_carrying(
+        &self,
+        build: &Build,
+        dir: &Path,
+        mut carried: program::Retired<Gpu>,
+        run_init: bool,
+    ) -> Result<Program<Gpu>> {
+        program::Executor::reload(&mut carried.executor, &build.manifest, &build.shaders)?;
+        let mut program = Program::instantiate_carrying(
+            &build.compiled,
+            &build.manifest,
+            carried,
+            self.options.io(dir),
+            workers(self.options.workers),
+            run_init,
+        )?;
+        program.hand_over_here();
+        Ok(program)
+    }
+
     /// Hot reload: replaces the running program with the build in `dir` (by default the one
     /// it was loaded from, rebuilt), in this process, on the same device. The new build starts
     /// with `init`; what the old one kept (`std::reload::keep`) is what its `kept()` gives;
@@ -324,19 +348,8 @@ impl Host {
         let dir = dir.map_or_else(|| self.dir.clone(), Path::to_path_buf);
         let build = compile_build(&dir, None)?;
         let old = self.program.take().expect("the host has a program");
-        let mut carried = old.retire();
-        program::Executor::reload(&mut carried.executor, &build.manifest, &build.shaders)?;
-        let mut program = Program::instantiate_carrying(
-            &build.compiled,
-            &build.manifest,
-            carried,
-            self.options.io(&dir),
-            workers(self.options.workers),
-            true,
-        )?;
-        program.hand_over_here();
-        self.program = Some(program);
-        self.wasm_hash = build.wasm_hash;
+        self.program = Some(self.start_carrying(&build, &dir, old.retire(), true)?);
+        self.build = build;
         self.dir = dir;
         Ok(())
     }
@@ -386,13 +399,13 @@ impl Host {
         let dir = dir.as_ref();
         let options = &options.homed(dir);
         // Everything that can be checked without the GPU is, before taking it.
-        let Build { manifest, shaders, wasm_hash, compiled } = compile_build(dir, None)?;
+        let build = compile_build(dir, None)?;
         let lock = lock::GpuLock::acquire(&format!("wrela-host {}", dir.display()))?;
-        let gpu = Gpu::new(&manifest, &shaders, options.timing, options.counts)?;
+        let gpu = Gpu::new(&build.manifest, &build.shaders, options.timing, options.counts)?;
         let n = workers(options.workers);
         let mut program = Program::instantiate_with(
-            &compiled,
-            &manifest,
+            &build.compiled,
+            &build.manifest,
             gpu,
             options.io(dir),
             options.record,
@@ -405,7 +418,7 @@ impl Host {
         program.hand_over_here();
         Ok(Host {
             program: Some(program),
-            wasm_hash,
+            build,
             dir: dir.to_path_buf(),
             options: options.clone(),
             prepared: handover::PreparedBuilds::new(),
@@ -455,7 +468,7 @@ impl Host {
         self.p().executor().set_screen(width, height)?;
         let mut log = if log {
             self.p().want_hashes(true);
-            let hash = self.wasm_hash;
+            let hash = self.build.wasm_hash;
             Some(self.p().tick_log(hash)?)
         } else {
             None

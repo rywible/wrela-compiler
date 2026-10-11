@@ -55,12 +55,12 @@ export function pathProblem(path: string): string | undefined {
 
 /**
  * What's wrong with the path of a build to hand over to, if anything: as `pathProblem`'s, except
- * that it may start with `..` parts, so a build can name one beside it.
+ * that it may start with one `..` part, so a build can name one beside it (runtime/abi's
+ * `build_path_problem`).
  */
 export function buildPathProblem(path: string): string | undefined {
-  let rest = path;
-  while (rest.startsWith("../")) rest = rest.slice(3);
-  if (rest === "..") return "names no build: it ends in `..`";
+  const rest = path.startsWith("../") ? path.slice(3) : path;
+  if (rest === ".." || rest.startsWith("../")) return "climbs more than one directory: a build names its own or one beside it";
   return pathProblem(rest);
 }
 

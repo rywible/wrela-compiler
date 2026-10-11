@@ -31,6 +31,8 @@ export interface Asked {
 interface Preparing {
   ready: Promise<Ready>;
   pipelines: PipelineCache | null;
+  /** Rejected when the program lets the build go: the `prepare` requests still waiting fail. */
+  letGo: PromiseWithResolvers<never>;
 }
 
 /** The builds the running program got ready, and the hand-over it asked for. */
@@ -56,12 +58,17 @@ export class HandOvers implements Builds {
   }
 
   prepare(path: string): Promise<void> {
-    return this.ready(this.baseOf(path)).then(() => {});
+    const base = this.baseOf(path);
+    const ready = this.ready(base);
+    return Promise.race([ready, this.#prepared.get(base)!.letGo.promise]).then(() => {});
   }
 
   unprepare(path: string): void {
-    // A build still on its way ends all the same; nothing keeps what it built.
-    this.#prepared.delete(this.baseOf(path));
+    // A build still on its way ends all the same; nothing keeps what it built, and the requests
+    // waiting on it fail, as in the native host.
+    const base = this.baseOf(path);
+    this.#prepared.get(base)?.letGo.reject(new Error(`the build at ${base} was let go before it was ready`));
+    this.#prepared.delete(base);
   }
 
   handOver(path: string): Promise<void> {
@@ -87,7 +94,9 @@ export class HandOvers implements Builds {
       const entry = { pipelines: null as PipelineCache | null };
       const ready = this.#getReady(base, (started) => (entry.pipelines = started));
       ready.catch(() => {});
-      p = Object.assign(entry, { ready });
+      const letGo = Promise.withResolvers<never>();
+      letGo.promise.catch(() => {});
+      p = Object.assign(entry, { ready, letGo });
       this.#prepared.set(base, p);
     }
     return p.ready;

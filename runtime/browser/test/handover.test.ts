@@ -66,6 +66,13 @@ test("a build let go is got ready again from the start", async () => {
   expect(requested.filter((p) => p === "/tower/second/manifest.json")).toHaveLength(2);
 });
 
+test("a build let go before it's ready fails the requests waiting on it", async () => {
+  const { handOvers } = await running();
+  const waiting = handOvers.prepare("../second");
+  handOvers.unprepare("../second");
+  await expect(waiting).rejects.toThrow("the build at http://localhost/tower/second/ was let go before it was ready");
+});
+
 test("the last hand-over asked for is the one made", async () => {
   const { handOvers } = await running();
   expect(handOvers.takeAsked()).toBeNull();

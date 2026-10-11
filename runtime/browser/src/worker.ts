@@ -446,15 +446,54 @@ async function readTexture(device: GPUDevice, texture: GPUTexture): Promise<Uint
   return out;
 }
 
+/** What a test records as it runs, for its results. */
+interface TestRecord {
+  /** What the program printed (`results/log.txt`), and the frame each line came in. */
+  printed: string[];
+  printed_in: number[];
+  /** Each frame's CPU time (the program's `frame` and its batch's checks and encoding, up to
+   * its submission), and when it began (ms since the epoch): `results/frames.json`. */
+  cpu: number[];
+  began_ms: number[];
+  /** The latency test: when each frame started, and which events (by when they were sent) it got. */
+  latency: { frames: number[]; delivered: { sent: number; frame: number }[] };
+  /** How long the pipelines took to build. */
+  pipelinesMs: number | null;
+}
+
+/** The program a test runs, and the frame its ticks count from: a build handed over to starts
+ * its own, a hot reload's carries on. */
+interface Running {
+  program: Program;
+  executor: GpuExecutor;
+  hz: number;
+  tickFrom: number;
+}
+
+/** `program`, running with its ticks counted from frame `tickFrom`. */
+function runningFrom(program: Program, tickFrom: number): Running {
+  const executor = program.executor as GpuExecutor;
+  executor.built.catch(fatal);
+  return { program, executor, hz: program.ticker?.hz ?? 0, tickFrom };
+}
+
+/** `program` in the place of the one that ran, its ticker going on `schedule`. */
+function runNext(program: Program, tickFrom: number, schedule: number): Running {
+  const r = runningFrom(program, tickFrom);
+  if (r.hz > 0) ticker.control.go(schedule);
+  return r;
+}
+
 async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build, params: TestParams, live: Live | null): Promise<void> {
   const { frames, width, height, fps } = params;
-  // What the program printed (`results/log.txt`), and each frame's CPU time: the program's
-  // `frame` and its batch's checks and encoding, up to its submission (`results/frames.json`).
-  const printed: string[] = [];
-  const cpu: number[] = [];
-  // When each frame began (ms since the epoch), and the frame each printed line came in.
-  const began_ms: number[] = [];
-  const printed_in: number[] = [];
+  const record: TestRecord = {
+    printed: [],
+    printed_in: [],
+    cpu: [],
+    began_ms: [],
+    latency: { frames: [], delivered: [] },
+    pipelinesMs: null,
+  };
   let frameNow = 0;
   canvas.width = width;
   canvas.height = height;
@@ -472,10 +511,9 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
   const hashes = params.nohash === 0;
   // The tick log needs only the ticks' hashes (the sim's state, cheap), not the frames'.
   const tickHashes = hashes || params.ticklog > 0;
-  let pipelinesMs: number | null = null;
   const print = (line: string) => {
-    printed.push(line);
-    printed_in.push(frameNow);
+    record.printed.push(line);
+    record.printed_in.push(frameNow);
   };
   hostLine = print;
   const salted = params.salt > 0 ? salt(build, params.salt) : build;
@@ -510,27 +548,20 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
       {
         timing,
         onPipelines: (ms) => {
-          pipelinesMs = ms;
+          record.pipelinesMs = ms;
         },
         cache: pipelineCache,
       },
     );
   running = salted;
-  let program = await start(salted, null);
-  let executor = program.executor as GpuExecutor;
-  executor.built.catch(fatal);
-  if (timing !== "off" && !executor.timed) throw new GpuError("the test asks for timestamps, but this device has no timestamp queries");
-  let hz = program.ticker?.hz ?? 0;
-  // The frame the running program's ticks count from: a build handed over to starts its own.
-  let tickFrom = 0;
+  let r = runningFrom(await start(salted, null), 0);
+  if (timing !== "off" && !r.executor.timed) throw new GpuError("the test asks for timestamps, but this device has no timestamp queries");
   const schedule = params.paced > 0 ? TickerMode.CLOCK : TickerMode.LOCKSTEP;
-  // The latency test: when each frame started, and which events (by when they were sent) it got.
-  const latency = { frames: [] as number[], delivered: [] as { sent: number; frame: number }[] };
   if (params.latency > 0 || params.keylatency > 0) {
     self.postMessage({ type: "latency-start", ms: ((frames - 2) * 1000) / fps } satisfies FromWorker);
   }
   const began0 = performance.now();
-  if (hz > 0) {
+  if (r.hz > 0) {
     clock.startAt(epochNow());
     ticker.control.go(schedule);
   }
@@ -547,38 +578,35 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
     // them, as when the game runs.
     if (params.saturate === 0) await sleepUntil(began0 + (i * 1000) / fps);
     // Hot reload: a new build replaces the program before this frame.
-    const next = live?.take(program) ?? null;
+    const next = live?.take(r.program) ?? null;
     if (next !== null) {
-      program = await swap(program, next, i, start);
-      executor = program.executor as GpuExecutor;
-      executor.built.catch(fatal);
-      hz = program.ticker?.hz ?? 0;
-      if (hz > 0) ticker.control.go(schedule);
+      r = runNext(await swap(r.program, next, i, start), r.tickFrom, schedule);
       live!.swapped();
     }
     const control = ticker.control;
-    executor.frame = i;
+    r.executor.frame = i;
     control.framesStarted(i + 1);
-    if (hz > 0 && params.paced === 0) {
+    if (r.hz > 0 && params.paced === 0) {
       // Lockstep: the ticks before this frame run first, as on the native host.
-      const target = lockstepTicks(i - tickFrom, hz, fps);
-      control.runTo(target);
-      await control.ranTo(target);
+      const ticks = lockstepTicks(i - r.tickFrom, r.hz, fps);
+      control.runTo(ticks);
+      await control.ranTo(ticks);
       // The ticker's thread reports its trap (`tickerStarter`).
       if (control.failed) return;
     }
-    for (const e of frameEvents.get(i) ?? []) program.queueInput(e);
+    for (const e of frameEvents.get(i) ?? []) r.program.queueInput(e);
     if (params.clip > 0 && i === params.clipfrom) self.postMessage({ type: "clip-start" } satisfies FromWorker);
     if (params.clip > 0 && i === params.clipfrom + params.clip) self.postMessage({ type: "clip-stop" } satisfies FromWorker);
-    latency.frames.push(epochNow());
-    for (const sent of deliverInput(program)) latency.delivered.push({ sent, frame: i });
+    record.latency.frames.push(epochNow());
+    for (const sent of deliverInput(r.program)) record.latency.delivered.push({ sent, frame: i });
     const began = performance.now();
     frameNow = i;
-    began_ms.push(performance.timeOrigin + began);
+    record.began_ms.push(performance.timeOrigin + began);
+    const { program, executor } = r;
     await scoped(device, () => {
       program.frame(frameTime(i, fps), width, height);
       if (params.framedelay > 0) holdFor(params.framedelay);
-      cpu.push(performance.now() - began);
+      record.cpu.push(performance.now() - began);
     });
     // The frame's commands that wait for a pipeline being built run once it is.
     await executor.caughtUp();
@@ -601,20 +629,28 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
     if (params.snap > 0 && i >= params.snapfrom && (i - params.snapfrom) % params.snap === 0) {
       await putResult(base, `snap-${i}.png`, encodePng(width, height, await readTexture(device, screen)));
     }
+    // A hand-over the frame asked for: the build handed over to starts its ticks from the next.
     const asked = handOvers!.takeAsked();
     if (asked !== null) {
       const p = await handOver(program, asked, i + 1, start);
-      if (p !== program) {
-        program = p;
-        executor = program.executor as GpuExecutor;
-        executor.built.catch(fatal);
-        hz = program.ticker?.hz ?? 0;
-        tickFrom = i + 1;
-        if (hz > 0) ticker.control.go(schedule);
-      }
+      if (p !== program) r = runNext(p, i + 1, schedule);
     }
   }
   await draining;
+  await saveResults(device, build, params, r, screen, timing, record);
+}
+
+/** A test's results, once its frames have run (`results/`), then `DONE`. */
+async function saveResults(
+  device: GPUDevice,
+  build: Build,
+  params: TestParams,
+  { program, executor, hz }: Running,
+  screen: GPUTexture,
+  timing: Timing,
+  record: TestRecord,
+): Promise<void> {
+  const { frames, width, height } = params;
   // Where the pipelines' time went: each built again alone, from code no cache has seen.
   const again = params.salt > 0 ? salt(build, params.salt + 7919) : null;
   const each = again ? await timeEachPipeline(device, again.manifest, again.shaders) : [];
@@ -634,12 +670,13 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
   }
   if (params.latency > 0 || params.keylatency > 0) {
     await latencySent.promise;
-    await putResult(base, "latency.json", JSON.stringify(latency));
+    await putResult(base, "latency.json", JSON.stringify(record.latency));
   }
   if (params.clip > 0) {
     if (params.clipfrom + params.clip >= frames) self.postMessage({ type: "clip-stop" } satisfies FromWorker);
     await clipSaved.promise;
   }
+  const { printed, cpu, began_ms, printed_in, pipelinesMs } = record;
   // The audio and ticker threads' print messages precede their completion messages, so their
   // lines are in the program's print sink before its log is serialized here.
   await Promise.all([

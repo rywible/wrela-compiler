@@ -139,6 +139,18 @@ fn letting_a_build_go_drops_its_pipelines() {
     assert_eq!(host.pipelines_built(), built + 1, "its own pipeline, let go, was built again");
 }
 
+#[test]
+#[ignore = "needs a GPU"]
+fn a_build_let_go_before_it_is_ready_fails_the_request() {
+    let mut host = Host::load(builds()).expect("load");
+    frames(&mut host, 1);
+    // Both are carried out after the next frame, in order: the build is still on its way.
+    host.call_export("get_ready", &[Value::I32(1)]).expect("get_ready");
+    host.call_export("let_go", &[Value::I32(1)]).expect("let_go");
+    frames(&mut host, 2);
+    assert_eq!(report(&mut host)[2], 2.0, "getting it ready failed");
+}
+
 /// What `tour` prints on its tour (compiler/tests/handover/tour), with the host's line about the
 /// failed hand-over left out (it names a path, which the hosts write their own ways).
 const TOUR: [&str; 8] = [

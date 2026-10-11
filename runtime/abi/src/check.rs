@@ -71,15 +71,13 @@ pub fn path_problem(path: &str) -> Option<&'static str> {
 }
 
 /// What's wrong with the path of a build to hand over to, if anything: as [`path_problem`]'s,
-/// except that it may start with `..` parts, so a build can name one beside it (a game's builds
-/// sit side by side under one origin).
+/// except that it may start with one `..` part, so a build can name one beside it (a game's
+/// builds sit side by side under one origin). One at most: each hand-over then climbs one
+/// directory and goes down at least one, so no build is reached above the first one's site.
 pub fn build_path_problem(path: &str) -> Option<&'static str> {
-    let mut rest = path;
-    while let Some(r) = rest.strip_prefix("../") {
-        rest = r;
-    }
-    if rest == ".." {
-        return Some("names no build: it ends in `..`");
+    let rest = path.strip_prefix("../").unwrap_or(path);
+    if rest == ".." || rest.starts_with("../") {
+        return Some("climbs more than one directory: a build names its own or one beside it");
     }
     path_problem(rest)
 }

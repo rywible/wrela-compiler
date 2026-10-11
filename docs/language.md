@@ -1368,7 +1368,7 @@ A game can be several builds, each its own program: a tower of floors, each buil
                        init fails ──▶ the old build starts again, with what it kept
 ```
 
-- **A build's path** names its directory from the running build's: relative, and its `..` parts may climb out of the build's directory but not off its site (`"../floor-2"`, built beside it). A path that breaks this is an invalid command.
+- **A build's path** names its directory from the running build's: relative, and it may start with one `..` part, to name a build beside it (`"../floor-2"`). It climbs no further, so a chain of hand-overs never reaches a directory above the first build's site. A path that breaks this is an invalid command.
 - **`std::reload::prepare(path)`** gets the build ready while the program runs: its files fetched, its WASM compiled, and the pipelines the device doesn't hold yet built (one whose WGSL and manifest entry are those of a pipeline the device holds is shared). It answers when the build is ready, or fails with why; asked again, it gives the same answer. **`unprepare(path)`** lets go of what was got ready.
 - **`hand_over(path)`** gives the program's place to the build after the call that asked (the last asked in a call; an earlier one fails). The host gets it ready if it isn't (the frames wait for it), then stops the program and starts the build with `init`:
   - **`kept()`** gives what the old program kept (`keep`), and input it hadn't read is the new one's.

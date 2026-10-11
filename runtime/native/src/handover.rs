@@ -12,8 +12,8 @@
 //!   kept: the screen never goes black.
 
 use crate::gpu::{Builder, Gpu, Ready, pipeline_key};
-use crate::program::{Handing, Program};
-use crate::{Build, Host, Result, compile_build, workers};
+use crate::program::Handing;
+use crate::{Build, Host, Result, compile_build};
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::thread::JoinHandle;
@@ -89,9 +89,20 @@ impl Host {
                 }
                 Handing::Unprepare { path } => {
                     let dir = beside(&self.dir, &path);
-                    // A thread still going is left to end; what it built is dropped with it.
-                    if let Some(Prepared::Ready(_, keys)) = self.prepared.remove(&dir) {
-                        self.p().executor().let_go(&keys);
+                    match self.prepared.remove(&dir) {
+                        Some(Prepared::Ready(_, keys)) => self.p().executor().let_go(&keys),
+                        // The thread is left to end, and what it builds is dropped with it;
+                        // the requests waiting on it fail, as in the browser.
+                        Some(Prepared::Going(_, waiting)) => {
+                            let why = format!(
+                                "the build in {} was let go before it was ready",
+                                dir.display()
+                            );
+                            for r in waiting {
+                                self.p().answer(r, Err(why.clone()));
+                            }
+                        }
+                        Some(Prepared::Failed(_)) | None => {}
                     }
                 }
                 Handing::HandOver { request, path } => {
@@ -170,17 +181,7 @@ impl Host {
         };
         let kept = self.p().keeping().to_vec();
         let old = self.program.take().expect("the host has a program");
-        let mut carried = old.retire().handed_over();
-        program_reload(&mut carried.executor, &build)?;
-        let mut program = Program::instantiate_carrying(
-            &build.compiled,
-            &build.manifest,
-            carried,
-            self.options.io(&dir),
-            workers(self.options.workers),
-            false,
-        )?;
-        program.hand_over_here();
+        let mut program = self.start_carrying(&build, &dir, old.retire().handed_over(), false)?;
         if let Err(e) = program.run_init() {
             // Its `init` failed: the build that handed over starts again, with what it kept.
             let mut carried = program.retire().keeping(kept);
@@ -189,29 +190,12 @@ impl Host {
                 dir.display(),
                 self.dir.display()
             ));
-            let again = compile_build(&self.dir, None)?;
-            program_reload(&mut carried.executor, &again)?;
-            let mut program = Program::instantiate_carrying(
-                &again.compiled,
-                &again.manifest,
-                carried,
-                self.options.io(&self.dir),
-                workers(self.options.workers),
-                true,
-            )?;
-            program.hand_over_here();
-            self.program = Some(program);
+            self.program = Some(self.start_carrying(&self.build, &self.dir, carried, true)?);
             return Ok(());
         }
         self.program = Some(program);
-        self.wasm_hash = build.wasm_hash;
+        self.build = build;
         self.dir = dir;
         Ok(())
     }
-}
-
-/// The executor's resources forgotten and `build`'s pipelines taken (from the spares where it
-/// can).
-fn program_reload(gpu: &mut Gpu, build: &Build) -> Result<()> {
-    crate::program::Executor::reload(gpu, &build.manifest, &build.shaders)
 }

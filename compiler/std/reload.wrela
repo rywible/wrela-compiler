@@ -73,19 +73,23 @@ pub fn hand_over(path: str) -> Pending<u8> {
 }
 
 /// What's wrong with the path of a build, if anything: as a fetched URL's, but it may start
-/// with `..` parts, to name a build beside this one (the hosts check the same).
+/// with one `..` part, to name a build beside this one, and climbs no further (the hosts check
+/// the same).
 fn build_path_problem(path: str) -> Option<Text> {
-    var start = 0
-    while start + 3 <= path.len() &&
-        path.byte(start) == 46 &&
-        path.byte(start + 1) == 46 &&
-        path.byte(start + 2) == 47 {
-        start += 3
-    }
-    if start + 2 == path.len() && path.byte(start) == 46 && path.byte(start + 1) == 46 {
-        return Some("names no build: it ends in `..`")
+    let start = if starts_up(path, 0) { 3 } else { 0 }
+    if starts_up(path, start) ||
+        start + 2 == path.len() && path.byte(start) == 46 && path.byte(start + 1) == 46 {
+        return Some("climbs more than one directory: a build names its own or one beside it")
     }
     path_problem(path.slice(start, path.len()))
+}
+
+/// Whether `path` has `../` at byte `at`.
+fn starts_up(path: str, at: u32) -> bool {
+    at + 3 <= path.len() &&
+        path.byte(at) == 46 &&
+        path.byte(at + 1) == 46 &&
+        path.byte(at + 2) == 47
 }
 
 fn check_build_path(what: Text, path: str) {
@@ -102,3 +106,10 @@ fn unprepare_command(path: str) {}
 
 @intrinsic
 fn hand_over_command(request: u32, path: str) {}
+
+@test
+fn a_build_path_climbs_one_directory_at_most() {
+    assert(build_path_problem("../floor-2").is_none() && build_path_problem("floors/2").is_none())
+    assert(build_path_problem("../../x").is_some() && build_path_problem("../..").is_some())
+    assert(build_path_problem("..").is_some() && build_path_problem("a/../b").is_some())
+}

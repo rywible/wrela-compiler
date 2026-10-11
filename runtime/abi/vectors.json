@@ -1257,13 +1257,21 @@
       {
         "bytes": "5752435309000000140000001b0000000c000000050000002e2e2f2e2e000000",
         "error": {
-          "message": "Unprepare failed: the build path `../..` names no build: it ends in `..`",
+          "message": "Unprepare failed: the build path `../..` climbs more than one directory: a build names its own or one beside it",
           "opcode": "Unprepare"
         },
         "name": "a build path of `..` alone"
       },
       {
-        "bytes": "5752435309000000480000001a0000001000000001000000080000002e2e2f666c6f6f721b0000000c000000080000002e2e2f666c6f6f721c0000001400000002000000090000002e2e2f2e2e2f782f79000000",
+        "bytes": "5752435309000000180000001c0000001000000001000000070000002e2e2f2e2e2f7800",
+        "error": {
+          "message": "HandOver failed: the build path `../../x` climbs more than one directory: a build names its own or one beside it",
+          "opcode": "HandOver"
+        },
+        "name": "a build path that climbs two directories"
+      },
+      {
+        "bytes": "5752435309000000440000001a0000001000000001000000080000002e2e2f666c6f6f721b0000000c000000080000002e2e2f666c6f6f721c0000001000000002000000060000002e2e2f782f790000",
         "error": null,
         "name": "builds beside this one, named rightly"
       },

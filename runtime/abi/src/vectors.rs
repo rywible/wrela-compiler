@@ -993,12 +993,17 @@ fn checks() -> Value {
         ),
         check("a build path of `..` alone", &m, &Encoder::new().unprepare("../..").finish()),
         check(
+            "a build path that climbs two directories",
+            &m,
+            &Encoder::new().hand_over(1, "../../x").finish(),
+        ),
+        check(
             "builds beside this one, named rightly",
             &m,
             &Encoder::new()
                 .prepare(1, "../floor")
                 .unprepare("../floor")
-                .hand_over(2, "../../x/y")
+                .hand_over(2, "../x/y")
                 .finish(),
         ),
         check(
