@@ -45,9 +45,16 @@ fi
 echo "premerge: $(git log --oneline -1 HEAD | cut -c1-70) with origin/main ($(git rev-parse --short origin/main))"
 
 cd "$work/tree"
-start=$SECONDS
-cargo check -q --workspace --all-targets
-echo "  cargo check: $((SECONDS - start))s"
+# The Rust builds from the Rust sources, the manifests and the files they embed (std, the browser
+# runtime's dist, the grammar's spec, fixtures). A branch that changed none of them leaves the
+# merge's Rust main's: nothing of the branch's for cargo to check.
+if git -C "$root" diff --name-only "$base" HEAD | grep -qE '\.rs$|(^|/)Cargo\.(toml|lock)$|^(compiler|runtime|spec|fixtures|\.cargo)/|^rust-toolchain'; then
+  start=$SECONDS
+  cargo check -q --workspace --all-targets
+  echo "  cargo check: $((SECONDS - start))s"
+else
+  echo "  cargo check: the branch changed nothing the Rust builds from"
+fi
 
 # Every package that reads a file either side changed (since the two diverged).
 start=$SECONDS
