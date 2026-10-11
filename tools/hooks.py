@@ -168,8 +168,9 @@ def bash(event):
 LIMIT = 9000
 
 
-# A Claude project's shared folder: every thread's machine sees it.
-SHARED = "/mnt/project-files"
+# A Claude project's shared folder: every thread's machine sees it. Its tests name another.
+def shared_folder():
+    return os.environ.get("WRELA_SHARED_FOLDER") or "/mnt/project-files"
 
 
 # What a session on a cloud machine is told.
@@ -190,8 +191,9 @@ def cloud(root, source):
     env = dict(line.partition("=")[::2] for line in out.splitlines())
     # In a Claude project, one constants cache for every thread's checkouts: a fresh one reads
     # the floor's bake another made (compiler/driver/src/const_cache.rs).
-    if os.path.isdir(SHARED) and os.access(SHARED, os.W_OK):
-        env.setdefault("WRELA_CONST_CACHE", os.path.join(SHARED, ".wrela-consts"))
+    shared = shared_folder()
+    if os.path.isdir(shared) and os.access(shared, os.W_OK):
+        env.setdefault("WRELA_CONST_CACHE", os.path.join(shared, ".wrela-consts"))
     path = os.environ.get("CLAUDE_ENV_FILE")
     if path:
         with open(path, "a", encoding="utf-8") as f:
