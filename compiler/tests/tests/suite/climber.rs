@@ -1,8 +1,8 @@
 //! The climber's fight with the wolf (#30; examples/climber, drawn by examples/climber-arena): the
-//! package's own tests (its frame data, hits, the blink, the sword's sweep); and a scripted fight
-//! (examples/climber/fight.json, the package's test bot's presses on a pad), recorded, replays
-//! to the same state hash at every tick; played in Chrome, its tick log replays on the native
-//! host, with no GPU, the same.
+//! package's own tests (its frame data, hits, the blink, the sword's sweep, the cape, the
+//! darkness); and a scripted fight (examples/climber/fight.json, the package's test bot's presses
+//! on a pad), recorded, replays to the same state hash at every tick; played in Chrome, its tick
+//! log replays on the native host, with no GPU, the same.
 //!
 //! `tools/check.sh --long climber::`.
 
@@ -20,7 +20,7 @@ fn script() -> String {
 #[test]
 #[ignore = "long: builds the fight and plays two minutes of it"]
 fn the_fights_own_tests_pass() {
-    assert_eq!(super::tests_pass(&repo_root().join("examples/climber")), 7);
+    assert_eq!(super::tests_pass(&repo_root().join("examples/climber")), 12);
 }
 
 /// The fight recorded natively replays to the same hashes: the same presses, the same fight.
