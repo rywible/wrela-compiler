@@ -500,12 +500,12 @@ pub fn frame(time: f32, width: u32, height: u32) {
 /// trunks as drawn, and its camera over the floor's walk; the floor's walk walked to its end;
 /// AC7's wildwood tiles matching the wider wood; AC12's trunks that differ (a fork per tree);
 /// its sound (each place its own, changing as smoothly as the place: the outside audit's point
-/// 6); and its first frames on the GPU.
+/// 6); the fight at the ring's glade (encounter.wrela); and its first frames on the GPU.
 #[test]
 #[ignore = "long: bakes the floor (minutes when the constants' cache is cold)"]
 fn the_floors_own_tests_pass() {
     let _ = floor();
-    assert_eq!(super::tests_pass(&repo_root().join("examples/last-green")), 21);
+    assert_eq!(super::tests_pass(&repo_root().join("examples/last-green")), 25);
 }
 
 /// The body of WGSL function `name` in `text` (to its closing brace at the line's start).
